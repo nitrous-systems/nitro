@@ -183,6 +183,13 @@ impl Writer {
 
     /// Append a `str`: `u32` byte length then UTF-8, no NUL terminator.
     ///
+    /// **NULs are stripped.** [`Reader::get_str`] rejects an embedded NUL,
+    /// so encoding one would hand the peer a message it must treat as a
+    /// fatal protocol error — a client that puts a NUL in a window title
+    /// would be killed by the server for it. Dropping the NUL keeps the
+    /// failure local and harmless. Callers that care should reject the
+    /// string themselves before it gets here.
+    ///
     /// A string longer than [`MAX_PAYLOAD`] is truncated at a char
     /// boundary; the frame it belongs to then almost certainly fails with
     /// [`EncodeError::TooLarge`], which is the intended outcome.
@@ -194,6 +201,12 @@ impl Writer {
                 end -= 1;
             }
             bytes = &bytes[..end];
+        }
+        if bytes.contains(&0) {
+            let cleaned: Vec<u8> = bytes.iter().copied().filter(|&b| b != 0).collect();
+            self.put_u32(cleaned.len() as u32);
+            self.buf.extend_from_slice(&cleaned);
+            return;
         }
         self.put_u32(bytes.len() as u32);
         self.buf.extend_from_slice(bytes);

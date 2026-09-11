@@ -3,7 +3,7 @@
 use nitro_wire::codec::{FdQueue, Writer};
 use nitro_wire::msg::{ClientMsg, Commit, CreateBuffer, SetBounds};
 use nitro_wire::types::{BufferId, NodeId, format};
-use nitro_wire::{DecodeError, Framer, MAX_PAYLOAD, header};
+use nitro_wire::{DecodeError, Framer, MAX_PAYLOAD, MAX_PENDING_FDS, header};
 
 mod common;
 use common::{identity, memfd};
@@ -216,4 +216,95 @@ fn split_frames(bytes: &[u8]) -> Vec<Vec<u8>> {
         off = end;
     }
     out
+}
+
+#[test]
+fn unclaimed_fds_cannot_accumulate_without_bound() {
+    // The DoS: a peer attaches a descriptor to every `sendmsg` but never
+    // declares one in a header. The frames decode fine, so nothing ever
+    // errors — without a cap the receiver parks one open fd per call and
+    // eventually hits EMFILE, taking every other client down with it.
+    let mut f = Framer::new();
+    let mut framed = 0;
+    let mut err = None;
+
+    for i in 0..(MAX_PENDING_FDS * 2) {
+        let mut w = Writer::new();
+        ClientMsg::from(Commit { serial: i as u32 })
+            .encode(&mut w)
+            .unwrap();
+        let (bytes, _) = w.take();
+        // One unclaimed fd per chunk, exactly as a hostile peer would.
+        f.feed(&bytes, [memfd("flood", 64)]);
+        match f.next_frame() {
+            Ok(Some(_)) => framed += 1,
+            Ok(None) => {}
+            Err(e) => {
+                err = Some(e);
+                break;
+            }
+        }
+        assert!(
+            f.pending_fds() <= MAX_PENDING_FDS,
+            "pending fds grew past the cap at iteration {i}"
+        );
+    }
+
+    assert_eq!(
+        err,
+        Some(DecodeError::UnexpectedFd),
+        "the flood must be rejected, not absorbed (framed {framed} frames)"
+    );
+    // And the error is latched: the connection is finished.
+    assert_eq!(f.next_frame().unwrap_err(), DecodeError::UnexpectedFd);
+}
+
+#[test]
+fn a_legitimate_burst_of_fds_is_not_mistaken_for_a_flood() {
+    // Several fd-carrying frames in one chunk is normal and must pass.
+    let mut w = Writer::new();
+    let count = 8;
+    let mut ids = Vec::new();
+    for i in 0..count {
+        let fd = memfd("burst", u64::from(i + 1) * 4096);
+        ids.push(identity(&fd));
+        ClientMsg::from(CreateBuffer {
+            id: BufferId(i + 1),
+            width: 1,
+            height: 1,
+            stride: 4,
+            format: format::XR24,
+            size: (i + 1) * 4096,
+            fd,
+        })
+        .encode(&mut w)
+        .unwrap();
+    }
+    let (bytes, fds) = w.take();
+    assert_eq!(fds.len() as u32, count);
+
+    let mut f = Framer::new();
+    f.feed(&bytes, fds);
+    for (i, want) in ids.iter().enumerate() {
+        let frame = f.next_frame().unwrap().expect("frame");
+        let mut q = FdQueue::from_vec(frame.fds);
+        let msg = ClientMsg::decode(frame.op, &frame.payload, &mut q).unwrap();
+        let ClientMsg::CreateBuffer(buf) = msg else {
+            panic!("expected CreateBuffer");
+        };
+        assert_eq!(identity(&buf.fd), *want, "buffer {i} kept its own fd");
+    }
+}
+
+#[test]
+fn the_poison_error_is_the_original_one() {
+    // A latched framer must report what actually went wrong, not a
+    // generic `Truncated`, or the server logs the wrong cause.
+    let mut f = Framer::new();
+    let mut h = header::encode(0, Commit::OP, 0);
+    h[7] = 0x40; // reserved flag
+    f.feed(&h, []);
+    assert_eq!(f.next_frame().unwrap_err(), DecodeError::BadFlags);
+    assert_eq!(f.next_frame().unwrap_err(), DecodeError::BadFlags);
+    assert_eq!(f.next_frame().unwrap_err(), DecodeError::BadFlags);
 }

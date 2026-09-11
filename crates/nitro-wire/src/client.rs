@@ -3,10 +3,11 @@
 //! buffer.
 
 use std::os::fd::BorrowedFd;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use nitro_core::{Color, IRect, Rect, Size, Transform};
 
+use crate::VERSION;
 use crate::codec::{FdQueue, Writer};
 use crate::error::Error;
 use crate::framing::Framer;
@@ -17,25 +18,9 @@ use crate::msg::{
     SetCorners, SetFill, SetImage, SetOpacity, SetTransform, SetVisible, SetWindowTitle,
 };
 use crate::types::{BufferId, Layer, NodeId, NodeKind};
-use crate::{DEFAULT_SOCKET_NAME, SOCKET_ENV, SOCKET_SUBDIR, VERSION};
 
-/// Where the wire socket lives, honouring `NITRO_SOCKET` and falling back
-/// to `$XDG_RUNTIME_DIR/nitro/wire.sock`, then `/tmp/nitro-<uid>/wire.sock`
-/// when the runtime dir is unset.
-#[must_use]
-pub fn socket_path() -> PathBuf {
-    if let Some(p) = std::env::var_os(SOCKET_ENV) {
-        return PathBuf::from(p);
-    }
-    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-        let dir = PathBuf::from(dir);
-        if dir.is_absolute() {
-            return dir.join(SOCKET_SUBDIR).join(DEFAULT_SOCKET_NAME);
-        }
-    }
-    let uid = rustix::process::getuid().as_raw();
-    PathBuf::from(format!("/tmp/nitro-{uid}")).join(DEFAULT_SOCKET_NAME)
-}
+/// Where the wire socket lives; see [`crate::socket_path`].
+pub use crate::socket_path;
 
 /// A connected, handshaken client.
 ///
@@ -199,22 +184,29 @@ impl Connection {
     /// *after* everything it sent before closing: the call that drains the
     /// last message succeeds, and the next one returns [`Error::Closed`].
     ///
+    /// Like [`ClientStream::read`](crate::server::ClientStream::read) this
+    /// stops after roughly [`READ_BUDGET`](crate::server::READ_BUDGET)
+    /// bytes so a flood cannot hold the caller's event loop; frames are
+    /// decoded each pass, so nothing is left buffered unnecessarily. The
+    /// socket stays readable and the next wakeup continues.
+    ///
     /// # Errors
     /// [`Error::Closed`] on hangup, [`Error::Decode`] on a malformed
     /// frame — both fatal.
     pub fn poll(&mut self, out: &mut Vec<ServerMsg>) -> Result<usize, Error> {
         let before = out.len();
+        let mut read = 0usize;
         // Drain everything already framed, then read more until EAGAIN.
         loop {
             while let Some(frame) = self.framer.next_frame()? {
                 let mut fds = FdQueue::from_vec(frame.fds);
                 out.push(ServerMsg::decode(frame.op, &frame.payload, &mut fds)?);
             }
-            if self.closed {
+            if self.closed || read >= crate::server::READ_BUDGET {
                 break;
             }
             match self.socket.recv_into(&mut self.framer) {
-                Ok(Some(_)) => {}
+                Ok(Some(n)) => read += n,
                 Ok(None) => break,
                 Err(Error::Closed) => self.closed = true,
                 Err(e) => return Err(e),

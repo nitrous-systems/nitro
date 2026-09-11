@@ -19,7 +19,7 @@ use zerocopy::byteorder::little_endian::{U16, U32};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use crate::error::DecodeError;
-use crate::{MAX_FDS, MAX_PAYLOAD};
+use crate::{MAX_FDS, MAX_PAYLOAD, MAX_PENDING_FDS};
 
 /// Frame header: the exact 8 bytes on the wire.
 pub mod header {
@@ -119,9 +119,17 @@ pub struct Frame {
 /// to the frame whose header byte offset is at or after the start of that
 /// chunk. Concretely, the framer records "at stream offset X, N fds
 /// arrived"; when it finishes a header that started at offset H, it claims
-/// every fd recorded at an offset `<= H + header::SIZE`. That is exactly
+/// every fd recorded at an offset `< H + header::SIZE`, i.e. every fd that
+/// arrived no later than the chunk completing that header. That is exactly
 /// the sender's rule — attach the fds to the `sendmsg` carrying the header
 /// — read back on the receiving side.
+///
+/// **Bounded.** A peer that attaches descriptors to every `sendmsg` while
+/// declaring `fds: 0` in every header would otherwise park an `OwnedFd`
+/// per call here forever and walk the process into `EMFILE`, taking every
+/// other client down with it. The pending queue is therefore capped at
+/// [`MAX_PENDING_FDS`]; exceeding it is a fatal
+/// [`DecodeError::UnexpectedFd`].
 #[derive(Debug, Default)]
 pub struct Framer {
     /// Unconsumed bytes.
@@ -130,12 +138,14 @@ pub struct Framer {
     start: usize,
     /// Stream offset of `buf[0]`.
     base: u64,
-    /// Fds, each tagged with the stream offset at which its chunk ended.
+    /// Fds, each tagged with the stream offset of the chunk it arrived in.
     fds: VecDeque<(u64, OwnedFd)>,
     /// Total bytes fed, for tagging incoming fds.
     fed: u64,
-    /// Set once a decode error was returned; the stream is dead.
-    poisoned: bool,
+    /// Set when more fds arrived than any frame can claim.
+    fd_flood: bool,
+    /// The error that poisoned the stream, if any.
+    poison: Option<DecodeError>,
 }
 
 impl Framer {
@@ -146,11 +156,22 @@ impl Framer {
     }
 
     /// Append received bytes and the descriptors that came with them.
+    ///
+    /// Descriptors beyond [`MAX_PENDING_FDS`] are dropped (closed) and the
+    /// framer is marked so the next [`Framer::next_frame`] fails: a peer
+    /// cannot make us hold an unbounded number of open descriptors.
     pub fn feed(&mut self, bytes: &[u8], fds: impl IntoIterator<Item = OwnedFd>) {
         // Tag fds with the offset of the *first* byte of this chunk: they
-        // belong to the frame whose header starts at or after it.
+        // belong to the frame whose header completes within it.
         let at = self.fed;
         for fd in fds {
+            if self.fds.len() >= MAX_PENDING_FDS {
+                // Dropping closes it, which is what we want: the peer is
+                // about to be disconnected anyway.
+                self.fd_flood = true;
+                drop(fd);
+                continue;
+            }
             self.fds.push_back((at, fd));
         }
         self.buf.extend_from_slice(bytes);
@@ -176,24 +197,46 @@ impl Framer {
         self.fds.len()
     }
 
+    /// Whether a complete frame is already buffered, or the framer has an
+    /// error to report.
+    ///
+    /// Exact, not a byte-count heuristic: a *partial* trailing frame must
+    /// not count, or a peer that hangs up mid-frame would leave the
+    /// receiver believing there is always something left to decode.
+    #[must_use]
+    pub fn has_frame(&self) -> bool {
+        if self.poison.is_some() || self.fd_flood {
+            return true;
+        }
+        let avail = &self.buf[self.start..];
+        match header::decode(avail) {
+            Ok(h) => avail.len() >= header::SIZE + h.len as usize,
+            // A malformed header is a complete frame's worth of bad news.
+            Err(DecodeError::Truncated) => false,
+            Err(_) => true,
+        }
+    }
+
     /// Pull the next complete frame.
     ///
     /// Returns `Ok(None)` when more bytes are needed.
     ///
     /// # Errors
     /// [`DecodeError::TooLarge`] for an oversize `len` or fd count,
-    /// [`DecodeError::BadFlags`] for a reserved flag, and
+    /// [`DecodeError::BadFlags`] for a reserved flag,
     /// [`DecodeError::MissingFd`] when a frame declares more descriptors
-    /// than arrived with it. Any error poisons the framer: every later
-    /// call returns it again, because a stream that desynchronised cannot
-    /// be resynchronised.
+    /// than arrived with it, and [`DecodeError::UnexpectedFd`] when the
+    /// peer sent more unclaimed descriptors than [`MAX_PENDING_FDS`].
+    /// Any error poisons the framer: every later call returns that same
+    /// error, because a stream that desynchronised cannot be
+    /// resynchronised.
     pub fn next_frame(&mut self) -> Result<Option<Frame>, DecodeError> {
-        if self.poisoned {
-            return Err(DecodeError::Truncated);
+        if let Some(e) = self.poison {
+            return Err(e);
         }
         match self.try_next() {
             Err(e) => {
-                self.poisoned = true;
+                self.poison = Some(e);
                 Err(e)
             }
             ok => ok,
@@ -201,6 +244,9 @@ impl Framer {
     }
 
     fn try_next(&mut self) -> Result<Option<Frame>, DecodeError> {
+        if self.fd_flood {
+            return Err(DecodeError::UnexpectedFd);
+        }
         let avail = &self.buf[self.start..];
         if avail.len() < header::SIZE {
             return Ok(None);

@@ -10,32 +10,23 @@
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
+use crate::VERSION;
 use crate::codec::{FdQueue, Writer};
 use crate::error::{DecodeError, Error};
 use crate::framing::Framer;
 use crate::io::{self, Socket};
 use crate::msg::{self, ClientMsg, Hello, ServerMsg, Welcome};
 use crate::types::ErrorCode;
-use crate::{DEFAULT_SOCKET_NAME, SOCKET_ENV, SOCKET_SUBDIR, VERSION};
 
-/// Where the server should bind, honouring `NITRO_SOCKET`.
-///
-/// Same resolution as the client's [`socket_path`](crate::client::socket_path),
-/// so a client started in the same environment finds the server.
-#[must_use]
-pub fn socket_path() -> PathBuf {
-    if let Some(p) = std::env::var_os(SOCKET_ENV) {
-        return PathBuf::from(p);
-    }
-    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-        let dir = PathBuf::from(dir);
-        if dir.is_absolute() {
-            return dir.join(SOCKET_SUBDIR).join(DEFAULT_SOCKET_NAME);
-        }
-    }
-    let uid = rustix::process::getuid().as_raw();
-    PathBuf::from(format!("/tmp/nitro-{uid}")).join(DEFAULT_SOCKET_NAME)
-}
+/// Bytes one [`ClientStream::read`] takes before yielding to the event
+/// loop. Large enough that an ordinary burst of mutations arrives in one
+/// wakeup, small enough that no single client can monopolise the loop.
+pub const READ_BUDGET: usize = 1024 * 1024;
+
+/// Where the server should bind; see [`crate::socket_path`]. The client
+/// resolves through the same function, so a client started in the same
+/// environment finds the server.
+pub use crate::socket_path;
 
 /// A bound, non-blocking listening socket that unlinks its path on drop.
 #[derive(Debug)]
@@ -150,35 +141,46 @@ impl ClientStream {
         self.closed
     }
 
-    /// Read whatever is readable into the framer.
+    /// Read what is readable into the framer, up to a bounded budget.
     ///
     /// Returns the number of bytes read (0 when the socket had nothing).
+    ///
+    /// **Bounded on purpose.** This stops after roughly
+    /// [`READ_BUDGET`] bytes even if the socket still has more, so one
+    /// busy client cannot starve the server's event loop or grow the
+    /// framer's buffer without limit. The socket stays readable, so the
+    /// next epoll wakeup continues where this left off — which is the
+    /// fairness the loop wants anyway.
+    ///
     /// A hangup is remembered rather than raised at once, so the bytes
     /// that arrived before it can still be decoded; [`Error::Closed`] is
-    /// returned by the read *after* the buffer has been drained.
+    /// returned once the framer has nothing left either.
     ///
     /// # Errors
     /// [`Error::Closed`] on hangup with nothing left to decode.
     pub fn read(&mut self) -> Result<usize, Error> {
-        if self.closed {
-            return Err(Error::Closed);
-        }
         let mut total = 0;
-        loop {
+        while !self.closed && total < READ_BUDGET {
             match self.socket.recv_into(&mut self.framer) {
                 Ok(Some(n)) => total += n,
                 Ok(None) => break,
-                Err(Error::Closed) => {
-                    self.closed = true;
-                    break;
-                }
+                Err(Error::Closed) => self.closed = true,
                 Err(e) => return Err(e),
             }
         }
-        if total == 0 && self.closed {
+        // Only report the hangup once nothing decodable is left: a caller
+        // that drains one message per loop iteration must not lose what
+        // already arrived.
+        if total == 0 && self.closed && !self.has_frames() {
             return Err(Error::Closed);
         }
         Ok(total)
+    }
+
+    /// Whether the framer holds at least one complete, undecoded frame
+    /// (or an error to report).
+    fn has_frames(&self) -> bool {
+        self.framer.has_frame()
     }
 
     /// Take the next decoded message, or `None` if more bytes are needed.

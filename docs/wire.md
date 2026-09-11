@@ -563,6 +563,64 @@ first, or where a name was ambiguous. Every difference:
 8. **Op codes leave gaps**: `0x0003..0x000f` inside the session block,
    `0x0013..0x00ff` after the window ops, and so on, so each block can
    grow.
+9. **No separate `Sender` type.** The sketch asked for `ClientStream` plus
+   a `Sender` for `ServerMsg`; sending is instead `ClientStream::send` /
+   `flush` on the same object. A `Sender` would have to own or share the
+   socket *and* the outgoing buffer, which is precisely what `ClientStream`
+   already is; splitting them buys a second borrow to juggle in the epoll
+   loop and no separation. If the server ever needs to hand a send handle
+   to another component, that is the point to introduce one.
+10. **`Writer::put_str` strips embedded NULs** rather than encoding them.
+    `Reader::get_str` rejects a NUL as a protocol error, so encoding one
+    would let a client kill itself by putting a NUL in a window title;
+    stripping keeps the failure local.
+
+## Receive-side limits
+
+The decode path is a hostile boundary, so the receiver bounds every
+resource a peer can make it hold:
+
+| limit | value | what it stops |
+|---|---|---|
+| `MAX_PAYLOAD` | 16 MiB | one oversize frame |
+| `MAX_FDS` | 8 | descriptors declared by one frame |
+| `MAX_PENDING_FDS` | 64 | **unclaimed** descriptors held by the framer |
+| `READ_BUDGET` | 1 MiB | bytes one `read`/`poll` call takes before yielding |
+
+`MAX_PENDING_FDS` is the subtle one. Descriptors are bound to frames by
+byte position, so a receiver legitimately holds a few before the frame
+claiming them is complete. Without a cap, a peer that attaches an
+`SCM_RIGHTS` descriptor to every `sendmsg` while declaring `fds: 0` in
+every header parks one open descriptor per call forever — every frame
+decodes fine and nothing errors, until the process hits `EMFILE` and, on a
+server, takes every other client down with it. Exceeding the cap is a
+fatal `UnexpectedFd`.
+
+`READ_BUDGET` stops one busy client from monopolising a single-threaded
+event loop: a receive loop that ran until `EAGAIN` would let a peer that
+keeps writing hold the loop indefinitely while the framer's buffer grows.
+The socket stays readable, so the next epoll wakeup simply continues.
+
+A hangup is reported only once nothing decodable is left, so a loop that
+handles one message per wakeup does not lose what already arrived. The
+"is anything left?" test is exact rather than a byte count — a peer that
+dies mid-frame leaves a partial trailing frame, and counting bytes would
+spin forever on it.
+
+## Allocation
+
+`Frame::payload` is a fresh `Vec<u8>` per frame. The task offered either a
+borrowed slice or a `Vec`, and v1 takes the `Vec` deliberately: it makes
+frame lifetimes independent of the framer's buffer, which is what lets a
+receiver hold a decoded message across further reads without fighting the
+borrow checker. It is the one allocation per message, and mutations arrive
+in the thousands per frame, so it is the first thing to revisit if
+profiling says so. The borrow path stays open — `next_frame` could gain a
+sibling returning a borrowed frame over the framer's buffer without any
+wire change, because the byte layout does not depend on it. Everything
+else on the hot path reuses buffers: the `Writer`'s bytes, the `Framer`'s
+receive buffer, and the caller-owned `Vec<ServerMsg>` that `poll` appends
+to.
 
 ## Versioning policy
 

@@ -4,7 +4,7 @@
 use nitro_core::Rect;
 use nitro_wire::codec::{FdQueue, Writer};
 use nitro_wire::io::{Socket, pair};
-use nitro_wire::msg::{BufferDamage, ClientMsg, Commit, CreateBuffer, SetBounds};
+use nitro_wire::msg::{BufferDamage, ClientMsg, Commit, CreateBuffer, Hello, SetBounds};
 use nitro_wire::types::{BufferId, NodeId, format};
 use nitro_wire::{Framer, MAX_PAYLOAD};
 
@@ -253,4 +253,149 @@ fn fds_reach_the_right_messages_under_write_pressure() {
         }
     }
     assert_eq!(seen as u32, N);
+}
+
+#[test]
+fn one_busy_client_cannot_starve_the_read_loop() {
+    // The starvation case: a client that keeps writing must not make a
+    // single `read()` loop until EAGAIN, growing the framer's buffer and
+    // holding the server's event loop hostage.
+    use nitro_wire::server::{ClientStream, READ_BUDGET};
+
+    let (mut writer_sock, server_sock) = pair().expect("socketpair");
+    // Room for far more than one budget's worth in flight.
+    rustix::net::sockopt::set_socket_send_buffer_size(writer_sock.as_fd(), 8 * 1024 * 1024)
+        .expect("SO_SNDBUF");
+    rustix::net::sockopt::set_socket_recv_buffer_size(server_sock.as_fd(), 8 * 1024 * 1024)
+        .expect("SO_RCVBUF");
+
+    // Queue several budgets' worth of messages.
+    let mut w = Writer::new();
+    let rects: Vec<IRect> = (0..8192).map(|i| IRect::new(i, 0, 1, 1)).collect();
+    while w.len() < READ_BUDGET * 4 {
+        ClientMsg::from(BufferDamage {
+            id: BufferId(1),
+            rects: rects.clone(),
+        })
+        .encode(&mut w)
+        .unwrap();
+    }
+    // Push as much as the socket will take without blocking.
+    let _ = writer_sock.send_all(&mut w).expect("send");
+
+    let mut stream = ClientStream::new(server_sock);
+    let first = stream.read().expect("read");
+    assert!(first > 0, "something arrived");
+    assert!(
+        first <= READ_BUDGET + RECV_SLACK,
+        "one read took {first} bytes, past the {READ_BUDGET}-byte budget"
+    );
+    // The socket is still readable, so the loop simply comes back.
+    let second = stream.read().expect("read");
+    assert!(second > 0, "the rest is still there for the next wakeup");
+}
+
+/// One `recvmsg` may overshoot the budget by at most its chunk size.
+const RECV_SLACK: usize = 64 * 1024;
+
+#[test]
+fn a_hangup_does_not_discard_already_received_messages() {
+    // A server that reads and drains one message per loop iteration (the
+    // normal backpressure shape) must not lose messages because the peer
+    // closed: `Closed` is only correct once nothing decodable is left.
+    use nitro_wire::server::ClientStream;
+
+    let (mut client_sock, server_sock) = pair().expect("socketpair");
+    let mut w = Writer::new();
+    ClientMsg::from(Hello {
+        version: nitro_wire::VERSION,
+        name: "bye".to_owned(),
+    })
+    .encode(&mut w)
+    .unwrap();
+    for i in 0..4 {
+        ClientMsg::from(Commit { serial: i })
+            .encode(&mut w)
+            .unwrap();
+    }
+    assert!(client_sock.send_all(&mut w).expect("send"));
+    drop(client_sock); // hang up with everything still in flight
+
+    let mut stream = ClientStream::new(server_sock);
+    let mut got = Vec::new();
+    // Read first, then handle exactly one message per iteration. This is
+    // the fair/backpressure shape, and it is the one that breaks if
+    // `read` reports the hangup before the framer is drained.
+    loop {
+        match stream.read() {
+            Ok(_) => {}
+            Err(nitro_wire::Error::Closed) => break,
+            Err(e) => panic!("read: {e:?}"),
+        }
+        match stream.next_msg() {
+            Ok(Some(m)) => got.push(m),
+            Ok(None) => {}
+            Err(e) => panic!("decode: {e:?}"),
+        }
+    }
+    // No post-loop drain on purpose: if `read` reported `Closed` while
+    // messages were still framed, they are simply lost, and the count
+    // below catches it.
+    assert_eq!(got.len(), 5, "every message sent before the close arrived");
+    assert!(matches!(got[0], ClientMsg::Hello(_)));
+}
+
+#[test]
+fn a_hangup_mid_frame_terminates_instead_of_spinning() {
+    // A peer that dies halfway through a frame leaves a partial trailing
+    // frame. If "is anything buffered?" were a byte-count heuristic, the
+    // receiver would believe there is always something left to decode and
+    // `read()` would return Ok(0) forever — a live-lock in the event loop.
+    use nitro_wire::server::ClientStream;
+
+    let (client_sock, server_sock) = pair().expect("socketpair");
+    let mut w = Writer::new();
+    ClientMsg::from(Hello {
+        version: nitro_wire::VERSION,
+        name: "half".to_owned(),
+    })
+    .encode(&mut w)
+    .unwrap();
+    ClientMsg::from(Commit { serial: 1 })
+        .encode(&mut w)
+        .unwrap();
+    let (bytes, _) = w.take();
+
+    // Send everything but the last three bytes: the final frame is torn.
+    // Written straight to the fd, since a `Writer` only holds whole frames.
+    let torn = &bytes[..bytes.len() - 3];
+    let mut off = 0;
+    while off < torn.len() {
+        off += rustix::net::send(
+            client_sock.as_fd(),
+            &torn[off..],
+            rustix::net::SendFlags::empty(),
+        )
+        .expect("send");
+    }
+    drop(client_sock);
+
+    let mut stream = ClientStream::new(server_sock);
+    let mut got = Vec::new();
+    let mut reads = 0;
+    loop {
+        reads += 1;
+        assert!(reads < 1000, "read() spun without making progress");
+        match stream.read() {
+            Ok(_) => {}
+            Err(nitro_wire::Error::Closed) => break,
+            Err(e) => panic!("read: {e:?}"),
+        }
+        while let Ok(Some(m)) = stream.next_msg() {
+            got.push(m);
+        }
+    }
+    // The complete frame survived; the torn one is simply gone.
+    assert_eq!(got.len(), 1);
+    assert!(matches!(got[0], ClientMsg::Hello(_)));
 }

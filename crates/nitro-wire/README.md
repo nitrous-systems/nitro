@@ -97,6 +97,16 @@ message must be `Hello` with a matching version. Any error it returns is
 fatal — answer with `client.fail(serial, server::code_for(&err), "…")` and
 drop the client.
 
+Sending goes through the same object (`send`/`flush`) rather than a
+separate `Sender`: it already owns the socket and the outgoing buffer, so
+splitting them would only add a second borrow to juggle in the epoll loop.
+This is a deliberate deviation from the M1 sketch, recorded in
+[`docs/wire.md`](../../docs/wire.md#deviations-from-the-m1-sketch).
+
+`read()` is bounded (`READ_BUDGET`) so one busy client cannot starve the
+event loop, and a hangup is only reported once nothing decodable is left —
+the socket stays readable, so the next wakeup continues where it stopped.
+
 ## Buffers
 
 Pixels never cross the stream. A client creates a memfd, passes it once
@@ -115,3 +125,10 @@ fd binding across chunk boundaries, a memfd surviving a `socketpair`
 round trip (verified by inode), the partial-write path with a 4 KiB
 `SO_SNDBUF`, and a real handshake over a Unix socket including the
 version-mismatch path.
+
+The hostile-peer cases have their own tests, each verified to fail when
+the guard is removed: unclaimed descriptors cannot accumulate
+(`MAX_PENDING_FDS`, or the server leaks fds to `EMFILE`), one client
+cannot monopolise a `read` (`READ_BUDGET`), a hangup does not discard
+already-received messages, and a peer that dies mid-frame terminates the
+loop instead of spinning.

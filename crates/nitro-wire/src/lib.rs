@@ -96,6 +96,21 @@ pub const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
 /// and bounds the receiver's ancillary buffer.
 pub const MAX_FDS: usize = 8;
 
+/// Largest number of *unclaimed* descriptors a [`Framer`] will hold.
+///
+/// Descriptors arrive out of band and are bound to frames by byte
+/// position, so a receiver legitimately holds a few before the frame that
+/// claims them is complete — one `recvmsg` can deliver several frames'
+/// worth, and the last header may be split. This caps that window.
+///
+/// Without it, a peer attaching a descriptor to every `sendmsg` while
+/// declaring `fds: 0` in every header would park one open fd per call in
+/// the receiver forever: the frames decode fine, nothing errors, and the
+/// process walks into `EMFILE` — on a server, taking every other client
+/// with it. Exceeding the cap is a fatal
+/// [`DecodeError::UnexpectedFd`](crate::DecodeError::UnexpectedFd).
+pub const MAX_PENDING_FDS: usize = 64;
+
 /// Environment variable overriding the socket path.
 pub const SOCKET_ENV: &str = "NITRO_SOCKET";
 
@@ -104,3 +119,29 @@ pub const SOCKET_SUBDIR: &str = "nitro";
 
 /// Default socket file name.
 pub const DEFAULT_SOCKET_NAME: &str = "wire.sock";
+
+/// Where the wire socket lives.
+///
+/// `NITRO_SOCKET` overrides the whole path; otherwise
+/// `$XDG_RUNTIME_DIR/nitro/wire.sock`, falling back to
+/// `/tmp/nitro-<uid>/wire.sock` when the runtime directory is unset or
+/// relative.
+///
+/// Client and server both resolve through this one function — they must
+/// agree, so there is deliberately only one copy. It is re-exported as
+/// [`client::socket_path`] and [`server::socket_path`].
+#[must_use]
+pub fn socket_path() -> std::path::PathBuf {
+    use std::path::PathBuf;
+    if let Some(p) = std::env::var_os(SOCKET_ENV) {
+        return PathBuf::from(p);
+    }
+    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+        let dir = PathBuf::from(dir);
+        if dir.is_absolute() {
+            return dir.join(SOCKET_SUBDIR).join(DEFAULT_SOCKET_NAME);
+        }
+    }
+    let uid = rustix::process::getuid().as_raw();
+    PathBuf::from(format!("/tmp/nitro-{uid}")).join(DEFAULT_SOCKET_NAME)
+}
