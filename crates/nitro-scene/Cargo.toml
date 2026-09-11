@@ -1,0 +1,13 @@
+[package]
+name = "nitro-scene"
+description = "Retained scene graph: arena nodes, exact damage, paint list and hit testing. No I/O, no rendering."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+nitro-core = { workspace = true }
+
+[lints]
+workspace = true
