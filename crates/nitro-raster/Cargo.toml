@@ -1,0 +1,21 @@
+[package]
+name = "nitro-raster"
+description = "CPU 2-D rasterizer: anti-aliased rounded rects, gradients and image blits painted into an XRGB8888 back buffer, clipped to a damage rect."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+nitro-core = { workspace = true }
+
+[lints]
+workspace = true
+
+# Criterion-free: a plain `main()` that times N iterations of five scenes.
+# `test = false` keeps `cargo test` from running the benchmark; `just build`
+# still compiles it via `--all-targets`.
+[[bench]]
+name = "raster"
+harness = false
+test = false
