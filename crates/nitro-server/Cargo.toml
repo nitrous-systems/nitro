@@ -1,0 +1,18 @@
+[package]
+name = "nitro-server"
+description = "The nitro display server: seat + KMS event loop with a control socket"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+nitro-seat = { path = "../nitro-seat" }
+nitro-kms = { path = "../nitro-kms" }
+rustix = { version = "1", features = ["event", "fs", "net", "process", "time"] }
+# Self-pipe for SIGTERM/SIGINT without `unsafe` in our tree. Default
+# features (iterator/channel) are off; only `low_level::pipe` is used.
+signal-hook = { version = "0.4", default-features = false }

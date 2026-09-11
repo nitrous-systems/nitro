@@ -15,6 +15,19 @@ test:
     cargo test --workspace
 
 # ---------------------------------------------------------------------------
+# Headless (the CI-able path)
+# ---------------------------------------------------------------------------
+fake_size := env_var_or_default("NITRO_FAKE_SIZE", "1280x720")
+
+# Run the server locally on the fake backend (Ctrl-C to stop).
+fake:
+    NITRO_BACKEND=fake NITRO_FAKE_SIZE={{fake_size}} cargo run -p nitro-server
+
+# Grab a PNG from a locally running `just fake` server.
+fake-shot out="tmp/fake-shot.png":
+    mkdir -p tmp && cargo run -q -p nitro-shot -- -o {{out}} && echo "wrote {{out}}"
+
+# ---------------------------------------------------------------------------
 # Test box (see docs/testbox.md)
 # ---------------------------------------------------------------------------
 box := env_var_or_default("NITRO_BOX", "kaspar@192.168.1.204")
