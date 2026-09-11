@@ -587,14 +587,40 @@ resource a peer can make it hold:
 | `MAX_PENDING_FDS` | 64 | **unclaimed** descriptors held by the framer |
 | `READ_BUDGET` | 1 MiB | bytes one `read`/`poll` call takes before yielding |
 
-`MAX_PENDING_FDS` is the subtle one. Descriptors are bound to frames by
-byte position, so a receiver legitimately holds a few before the frame
-claiming them is complete. Without a cap, a peer that attaches an
-`SCM_RIGHTS` descriptor to every `sendmsg` while declaring `fds: 0` in
-every header parks one open descriptor per call forever — every frame
+`MAX_PENDING_FDS` is the subtle one, and the two receive limits are
+**coupled** — anyone tuning either needs to know why.
+
+Descriptors are claimed only when the frame declaring them is decoded, so
+what this cap really bounds is *how many descriptors can arrive between
+two drains*, not how many fit in one `recvmsg`. The byte budget does not
+bound them: the kernel does not coalesce skbs carrying `SCM_RIGHTS`, so
+each `recvmsg` returns exactly one `sendmsg`'s worth. A batch of 65
+`CreateBuffer`s is 65 reads of ~32 bytes — about 2 KB, nowhere near a
+megabyte, yet 65 unclaimed descriptors.
+
+So a receive loop that reads without draining must **yield** when the
+pending count reaches the cap, letting the caller decode and continue on
+the next wakeup. It must not read on and let the framer hit the cap
+internally, because that is fatal. The check belongs *before* each
+`recvmsg`: once the overflow has been seen the connection is already
+poisoned.
+
+Yielding alone is not enough either. Yielding is progress only while the
+caller has something to drain; at the cap with *nothing decodable left*
+the pending descriptors belong to no frame and never will, so a loop that
+kept yielding would spin at 100% CPU and never report the attack — worse
+than the kill it was meant to avoid. Both halves are needed.
+
+Together they are the only honest test: **do pending descriptors survive a
+drain?** A glyph atlas, a tiled surface or a toolkit re-uploading
+per-window buffers on an output change all send far more than 64 buffers
+in a batch, and all drop to zero pending the moment frames are decoded —
+so the receiver yields, the caller drains, and the batch arrives intact. A
+peer attaching a descriptor to every `sendmsg` while declaring `fds: 0`
+never does: it parks one open descriptor per call forever — every frame
 decodes fine and nothing errors, until the process hits `EMFILE` and, on a
-server, takes every other client down with it. Exceeding the cap is a
-fatal `UnexpectedFd`.
+server, takes every other client down with it. That case, and only that
+case, is a fatal `UnexpectedFd`.
 
 `READ_BUDGET` stops one busy client from monopolising a single-threaded
 event loop: a receive loop that ran until `EAGAIN` would let a peer that

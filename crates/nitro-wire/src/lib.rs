@@ -98,17 +98,36 @@ pub const MAX_FDS: usize = 8;
 
 /// Largest number of *unclaimed* descriptors a [`Framer`] will hold.
 ///
-/// Descriptors arrive out of band and are bound to frames by byte
-/// position, so a receiver legitimately holds a few before the frame that
-/// claims them is complete — one `recvmsg` can deliver several frames'
-/// worth, and the last header may be split. This caps that window.
+/// Descriptors arrive out of band and are claimed only when the frame that
+/// declares them is decoded, so the real quantity this bounds is **how
+/// many descriptors can arrive between two drains** — not how many fit in
+/// one `recvmsg`. The kernel does not coalesce skbs carrying `SCM_RIGHTS`,
+/// so each `recvmsg` yields one `sendmsg`'s worth; a receiver that reads
+/// repeatedly without decoding accumulates one per call regardless of how
+/// few bytes each carries.
 ///
-/// Without it, a peer attaching a descriptor to every `sendmsg` while
+/// That makes this constant **coupled to the receive loop**: a loop that
+/// reads without draining must yield when it reaches this cap (see
+/// [`server::ClientStream::read`]) rather than let [`Framer::feed`] hit
+/// it, or a legitimate batch of buffers is killed as a flood. Tune one and
+/// you must look at the other.
+///
+/// Yielding alone is not enough, though: yielding is progress only while
+/// the caller has something to drain. At the cap with *nothing decodable
+/// left* the pending descriptors belong to no frame and never will, so a
+/// loop that kept yielding would spin at 100% CPU and never report the
+/// attack. Both halves are needed, and together they are the real test:
+/// **do pending descriptors survive a drain?**
+///
+/// Without the cap, a peer attaching a descriptor to every `sendmsg` while
 /// declaring `fds: 0` in every header would park one open fd per call in
 /// the receiver forever: the frames decode fine, nothing errors, and the
 /// process walks into `EMFILE` — on a server, taking every other client
-/// with it. Exceeding the cap is a fatal
-/// [`DecodeError::UnexpectedFd`](crate::DecodeError::UnexpectedFd).
+/// with it. The honest distinction between that and a large legitimate
+/// batch is whether the pending count survives a drain: legitimate traffic
+/// drops to zero as soon as frames are decoded, the flood never does.
+/// Exceeding the cap — or sitting at it with nothing left to decode — is a
+/// fatal [`DecodeError::UnexpectedFd`](crate::DecodeError::UnexpectedFd).
 pub const MAX_PENDING_FDS: usize = 64;
 
 /// Environment variable overriding the socket path.

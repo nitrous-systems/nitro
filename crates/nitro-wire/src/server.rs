@@ -10,13 +10,13 @@
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
-use crate::VERSION;
 use crate::codec::{FdQueue, Writer};
 use crate::error::{DecodeError, Error};
 use crate::framing::Framer;
 use crate::io::{self, Socket};
 use crate::msg::{self, ClientMsg, Hello, ServerMsg, Welcome};
 use crate::types::ErrorCode;
+use crate::{MAX_PENDING_FDS, VERSION};
 
 /// Bytes one [`ClientStream::read`] takes before yielding to the event
 /// loop. Large enough that an ordinary burst of mutations arrives in one
@@ -145,22 +145,58 @@ impl ClientStream {
     ///
     /// Returns the number of bytes read (0 when the socket had nothing).
     ///
-    /// **Bounded on purpose.** This stops after roughly
-    /// [`READ_BUDGET`] bytes even if the socket still has more, so one
-    /// busy client cannot starve the server's event loop or grow the
-    /// framer's buffer without limit. The socket stays readable, so the
-    /// next epoll wakeup continues where this left off — which is the
-    /// fairness the loop wants anyway.
+    /// **Bounded on purpose, twice over.** The loop stops after roughly
+    /// [`READ_BUDGET`] bytes, and *also* once the framer is holding
+    /// [`MAX_PENDING_FDS`] unclaimed descriptors. Either way the socket
+    /// stays readable, so the caller drains what arrived and the next
+    /// epoll wakeup continues where this left off — which is the fairness
+    /// the loop wants anyway.
+    ///
+    /// The fd check is the one that is easy to get wrong. Descriptors are
+    /// claimed in [`ClientStream::next_msg`], not here, so they
+    /// accumulate across every `recvmsg` in one call — and the *byte*
+    /// budget does not bound them, because the kernel does not coalesce
+    /// skbs carrying `SCM_RIGHTS`: each `recvmsg` returns one `sendmsg`'s
+    /// worth, so 65 `CreateBuffer`s are 65 reads of ~32 bytes, nowhere
+    /// near a megabyte. So at the cap this yields to the caller — whose
+    /// drain is what claims them — instead of letting [`Framer::feed`]
+    /// hit its own cap, which is fatal. That is what keeps a legitimate
+    /// batch of buffers (a glyph atlas, a tiled surface) alive.
+    ///
+    /// Yielding is only correct while the caller can actually drain,
+    /// though: at the cap with *nothing decodable left*, the pending
+    /// descriptors belong to no frame and never will, and yielding
+    /// forever would spin the event loop instead of killing the peer.
+    /// That case is the flood and returns
+    /// [`DecodeError::UnexpectedFd`]. The two together are the real
+    /// test — do pending descriptors survive a drain? — and it is why
+    /// the check sits *before* each `recvmsg`: once `feed` has seen the
+    /// overflow the connection is already poisoned.
     ///
     /// A hangup is remembered rather than raised at once, so the bytes
     /// that arrived before it can still be decoded; [`Error::Closed`] is
     /// returned once the framer has nothing left either.
     ///
     /// # Errors
-    /// [`Error::Closed`] on hangup with nothing left to decode.
+    /// [`Error::Closed`] on hangup with nothing left to decode, or
+    /// [`DecodeError::UnexpectedFd`] when the peer sent descriptors that
+    /// no frame claims.
     pub fn read(&mut self) -> Result<usize, Error> {
         let mut total = 0;
         while !self.closed && total < READ_BUDGET {
+            if self.framer.pending_fds() >= MAX_PENDING_FDS {
+                // At the cap. Yielding is only progress if the caller has
+                // something to drain: decoding those frames is what claims
+                // the descriptors. If nothing decodable is left, these fds
+                // belong to no frame and never will — reading on would
+                // accumulate more, and yielding forever would spin the
+                // event loop at 100% without ever erroring. That is the
+                // flood, and it is fatal.
+                if self.framer.has_frame() {
+                    break;
+                }
+                return Err(Error::Decode(DecodeError::UnexpectedFd));
+            }
             match self.socket.recv_into(&mut self.framer) {
                 Ok(Some(n)) => total += n,
                 Ok(None) => break,

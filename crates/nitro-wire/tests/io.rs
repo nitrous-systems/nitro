@@ -6,7 +6,7 @@ use nitro_wire::codec::{FdQueue, Writer};
 use nitro_wire::io::{Socket, pair};
 use nitro_wire::msg::{BufferDamage, ClientMsg, Commit, CreateBuffer, Hello, SetBounds};
 use nitro_wire::types::{BufferId, NodeId, format};
-use nitro_wire::{Framer, MAX_PAYLOAD};
+use nitro_wire::{DecodeError, Framer, MAX_PAYLOAD, MAX_PENDING_FDS};
 
 mod common;
 use common::{identity, memfd};
@@ -398,4 +398,182 @@ fn a_hangup_mid_frame_terminates_instead_of_spinning() {
     // The complete frame survived; the torn one is simply gone.
     assert_eq!(got.len(), 1);
     assert!(matches!(got[0], ClientMsg::Hello(_)));
+}
+
+#[test]
+fn a_large_legitimate_batch_of_buffers_is_not_mistaken_for_a_flood() {
+    // The interaction between the two receive-side guards. Descriptors are
+    // claimed in `next_msg`, not in `read`, so they accumulate across every
+    // `recvmsg` inside one `read` call — and READ_BUDGET does not bound
+    // them, because the kernel does not coalesce skbs carrying SCM_RIGHTS:
+    // each `recvmsg` returns one `sendmsg`'s worth, so N CreateBuffers are
+    // N reads of ~32 bytes, nowhere near a megabyte.
+    //
+    // A client sending MAX_PENDING_FDS + 1 buffers in one batch (a glyph
+    // atlas, a tiled surface, per-window re-upload on an output change) is
+    // doing something completely legitimate and must not be killed for it.
+    // `read` therefore yields when pending fds reach the cap so the caller
+    // can drain; the flood case never drains, which is the real
+    // distinction.
+    use nitro_wire::server::ClientStream;
+
+    const COUNT: u32 = MAX_PENDING_FDS as u32 * 2 + 1;
+
+    let (mut client_sock, server_sock) = pair().expect("socketpair");
+    let mut w = Writer::new();
+    ClientMsg::from(Hello {
+        version: nitro_wire::VERSION,
+        name: "atlas".to_owned(),
+    })
+    .encode(&mut w)
+    .unwrap();
+    let mut want = Vec::new();
+    for i in 0..COUNT {
+        let fd = memfd(&format!("batch-{i}"), u64::from(i + 1) * 4096);
+        want.push(identity(&fd));
+        ClientMsg::from(CreateBuffer {
+            id: BufferId(i + 1),
+            width: i + 1,
+            height: 1,
+            stride: (i + 1) * 4,
+            format: format::XR24,
+            size: (i + 1) * 4096,
+            fd,
+        })
+        .encode(&mut w)
+        .unwrap();
+    }
+
+    let mut stream = ClientStream::new(server_sock);
+    let mut got = Vec::new();
+    let mut spins = 0;
+    // Drive both sides: the sender's socket buffer is finite, so writing
+    // and draining interleave exactly as a real server's epoll loop does.
+    while !w.is_empty() || got.len() as u32 <= COUNT {
+        spins += 1;
+        assert!(spins < 100_000, "made no progress");
+        if !w.is_empty() {
+            client_sock.send_all(&mut w).expect("send");
+        }
+        stream.read().expect("read");
+        while let Some(msg) = stream.next_msg().expect("a legitimate batch must decode") {
+            got.push(msg);
+        }
+        if w.is_empty() && got.len() as u32 == COUNT + 1 {
+            break;
+        }
+    }
+
+    assert_eq!(got.len() as u32, COUNT + 1, "Hello + every buffer arrived");
+    let mut seen = 0usize;
+    for msg in &got {
+        if let ClientMsg::CreateBuffer(buf) = msg {
+            assert_eq!(buf.id, BufferId(seen as u32 + 1));
+            assert_eq!(
+                identity(&buf.fd),
+                want[seen],
+                "buffer {seen} kept its own descriptor"
+            );
+            seen += 1;
+        }
+    }
+    assert_eq!(seen as u32, COUNT);
+}
+
+/// Send `bytes` as one `sendmsg` per frame, attaching an undeclared
+/// descriptor to each — a hostile peer's `fds: 0` flood.
+fn send_frames_with_stray_fds(sock: &Socket, bytes: &[u8]) -> usize {
+    use std::mem::MaybeUninit;
+    use std::os::fd::AsFd as _;
+
+    let mut off = 0;
+    let mut sent = 0;
+    while off < bytes.len() {
+        let h = nitro_wire::header::decode(&bytes[off..]).expect("our own header");
+        let end = off + nitro_wire::header::SIZE + h.len as usize;
+        let stray = memfd("stray", 64);
+        let fds = [stray.as_fd()];
+        let mut space = [MaybeUninit::uninit(); 64];
+        let mut ctl = rustix::net::SendAncillaryBuffer::new(&mut space);
+        ctl.push(rustix::net::SendAncillaryMessage::ScmRights(&fds));
+        let iov = [rustix::io::IoSlice::new(&bytes[off..end])];
+        match rustix::net::sendmsg(
+            sock.as_fd(),
+            &iov,
+            &mut ctl,
+            rustix::net::SendFlags::NOSIGNAL,
+        ) {
+            Ok(_) => {
+                sent += 1;
+                off = end;
+            }
+            Err(rustix::io::Errno::AGAIN) => break,
+            Err(e) => panic!("sendmsg: {e:?}"),
+        }
+    }
+    sent
+}
+
+#[test]
+fn an_fd_flood_through_the_read_loop_is_fatal_not_a_spin() {
+    // The counterpart to the legitimate-batch test, and the case that
+    // makes the "yield at the cap" rule subtle: a peer that attaches a
+    // descriptor to every `sendmsg` while declaring `fds: 0` in every
+    // header. Nothing ever claims those fds, so pending never falls after
+    // a drain.
+    //
+    // Yielding unconditionally at the cap would spin here — `read` returns
+    // Ok(0) forever, the caller has nothing to drain, and the event loop
+    // burns 100% CPU without ever erroring, which is worse than the kill
+    // it replaced. At the cap with nothing decodable left, the flood must
+    // be fatal.
+    use nitro_wire::server::ClientStream;
+
+    let (client_sock, server_sock) = pair().expect("socketpair");
+    let mut w = Writer::new();
+    ClientMsg::from(Hello {
+        version: nitro_wire::VERSION,
+        name: "flood".to_owned(),
+    })
+    .encode(&mut w)
+    .unwrap();
+    for i in 0..(MAX_PENDING_FDS as u32 * 4) {
+        ClientMsg::from(Commit { serial: i })
+            .encode(&mut w)
+            .unwrap();
+    }
+    let (bytes, _) = w.take();
+    let sent = send_frames_with_stray_fds(&client_sock, &bytes);
+    assert!(
+        sent > MAX_PENDING_FDS,
+        "need more stray fds than the cap to trigger it (sent {sent})"
+    );
+
+    let mut stream = ClientStream::new(server_sock);
+    let mut zero_reads = 0;
+    for round in 0..1000 {
+        match stream.read() {
+            Ok(0) => {
+                zero_reads += 1;
+                assert!(
+                    zero_reads < 50,
+                    "read() spun {zero_reads} times without progress or error \
+                     (round {round}): the flood must be fatal, not a live-lock"
+                );
+            }
+            Ok(_) => {}
+            Err(nitro_wire::Error::Decode(DecodeError::UnexpectedFd)) => return,
+            Err(e) => panic!("expected UnexpectedFd, got {e:?}"),
+        }
+        // Drain exactly as a well-behaved server would.
+        loop {
+            match stream.next_msg() {
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(nitro_wire::Error::Decode(DecodeError::UnexpectedFd)) => return,
+                Err(e) => panic!("expected UnexpectedFd, got {e:?}"),
+            }
+        }
+    }
+    panic!("the flood was never rejected");
 }

@@ -103,9 +103,15 @@ splitting them would only add a second borrow to juggle in the epoll loop.
 This is a deliberate deviation from the M1 sketch, recorded in
 [`docs/wire.md`](../../docs/wire.md#deviations-from-the-m1-sketch).
 
-`read()` is bounded (`READ_BUDGET`) so one busy client cannot starve the
-event loop, and a hangup is only reported once nothing decodable is left —
-the socket stays readable, so the next wakeup continues where it stopped.
+`read()` is bounded twice over — by bytes (`READ_BUDGET`) so one busy
+client cannot starve the event loop, and by unclaimed descriptors
+(`MAX_PENDING_FDS`) because fds are claimed when you decode, not when you
+read. Both yield rather than fail: the socket stays readable and the next
+wakeup continues, so a large legitimate batch of buffers is drained rather
+than mistaken for a flood. The exception is a peer sending descriptors no
+frame claims — at the cap with nothing left to decode, yielding would spin
+forever, so that is a fatal `UnexpectedFd`. A hangup is only reported once
+nothing decodable is left.
 
 ## Buffers
 
