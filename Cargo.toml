@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["tmp/depcheck"]
+members = ["crates/*"]
 
 [workspace.package]
 edition = "2024"
