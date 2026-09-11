@@ -198,9 +198,15 @@ D-Bus client is allowed.
 
 ## Milestones
 
-- **M0** — `nitro-wire` + `nitro-server` boot on KMS via libseat, clear the
-  screen, take a screenshot over SSH, survive VT switch. Headless fake-KMS
-  backend and PNG output in CI.
+- **M0** — **done.** `nitro-server` boots on KMS via libseat, shows a
+  gradient + frame + vblank-paced bar, takes a screenshot over SSH
+  (`nitro-shot`, own PNG encoder), survives VT switch. Headless fake-KMS
+  backend and PNG output in CI. (`nitro-wire` moved to M1 — the M0 control
+  socket is a throwaway line protocol.) Measured on the test box
+  (Pentium G3240, i915, 1920×1080@60): idle CPU 0.0 % with no context
+  switches, RSS 3.4 MB, flip interval 16.666 ms mean (16.65–16.68 ms),
+  moving-bar mode 6–7 % CPU, 10 VT round-trips clean, `systemctl stop`
+  exits 0 and returns tty1.
 - **M1** — Scene graph, damage, CPU raster of rects and text; one client
   drawing a moving box via mutations; measured input-to-photon latency.
 - **M2** — `nitro-ui` with arena, passes, `WidgetMut`, six widgets, layout,

@@ -31,7 +31,6 @@ pub mod signals;
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
-use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -310,33 +309,61 @@ pub fn run(config: Config) -> Result<(), Error> {
     result
 }
 
+/// An epoll event buffer. `epoll::Event` has no `Default`, so build one.
+fn event_buffer<const N: usize>() -> [epoll::Event; N] {
+    [epoll::Event {
+        flags: EventFlags::empty(),
+        data: EventData::new_u64(0),
+    }; N]
+}
+
+/// `epoll_wait` that retries on `EINTR`: the signal handler interrupts it
+/// (the kernel never restarts `epoll_wait`), and the self-pipe is what
+/// should end the loop, not the interruption. Returns the ready count.
+fn wait(epoll: &OwnedFd, buf: &mut [epoll::Event]) -> Result<usize, Error> {
+    loop {
+        match epoll::wait(epoll, &mut *buf, None) {
+            Ok(n) => return Ok(n),
+            Err(rustix::io::Errno::INTR) => {}
+            Err(e) => return Err(errno("epoll_wait")(e)),
+        }
+    }
+}
+
 fn add(epoll: &OwnedFd, fd: &impl AsFd, token: u64) -> Result<(), Error> {
     epoll::add(epoll, fd, EventData::new_u64(token), EventFlags::IN).map_err(errno("epoll_ctl add"))
 }
 
 /// Block until the seat reports active. Returns `false` if a signal
 /// arrived first (only possible when handlers are installed).
+///
+/// libseat queues the initial `Enable` inside `open_seat` without making
+/// the fd readable, so dispatch once before waiting on epoll.
 fn wait_active(epoll: &OwnedFd, seat: &mut Seat, signals: bool) -> Result<bool, Error> {
-    let mut buf = [MaybeUninit::<epoll::Event>::uninit(); 8];
+    let mut buf = event_buffer::<8>();
+    drain_seat(seat)?;
     while !seat.is_active() {
         info!("waiting for the seat to become active");
-        let (ready, _) = epoll::wait(epoll, &mut buf, None).map_err(errno("epoll_wait"))?;
-        for ev in ready.iter() {
+        let n = wait(epoll, &mut buf)?;
+        for ev in &buf[..n] {
             match ev.data.u64() {
                 TOK_SIGNALS if signals => return Ok(false),
-                TOK_SEAT => {
-                    for e in seat.dispatch()? {
-                        info!("seat event {e:?} (before device open)");
-                        if e == SeatEvent::Disable {
-                            seat.ack_disable()?;
-                        }
-                    }
-                }
+                TOK_SEAT => drain_seat(seat)?,
                 _ => {}
             }
         }
     }
     Ok(true)
+}
+
+fn drain_seat(seat: &mut Seat) -> Result<(), Error> {
+    for e in seat.dispatch()? {
+        info!("seat event {e:?} (before device open)");
+        if e == SeatEvent::Disable {
+            seat.ack_disable()?;
+        }
+    }
+    Ok(())
 }
 
 /// DRM device candidates: the override or `/dev/dri/card*` sorted.
@@ -501,11 +528,10 @@ impl Server {
     }
 
     fn event_loop(&mut self) -> Result<(), Error> {
-        let mut buf = [MaybeUninit::<epoll::Event>::uninit(); 32];
+        let mut buf = event_buffer::<32>();
         while !self.quit {
-            let (ready, _) =
-                epoll::wait(&self.epoll, &mut buf, None).map_err(errno("epoll_wait"))?;
-            for ev in ready.iter() {
+            let n = wait(&self.epoll, &mut buf)?;
+            for ev in &buf[..n] {
                 let (token, flags) = (ev.data.u64(), ev.flags);
                 match token {
                     TOK_SEAT => self.on_seat()?,
