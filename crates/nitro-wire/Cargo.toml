@@ -1,0 +1,20 @@
+[package]
+name = "nitro-wire"
+description = "The nitro client/server protocol: framing, messages, fd passing and non-blocking socket io"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+nitro-core = { workspace = true }
+# Sockets, `SCM_RIGHTS`, `poll`, `memfd_create`: the whole kernel ABI surface
+# of this crate, with no `unsafe` in our tree.
+rustix = { version = "1", features = ["event", "fs", "net", "process"] }
+# `repr(C)` + byteorder types = the wire layout, with validated zero-copy
+# decode (`ref_from_bytes`) and `as_bytes()` encode. No hand-rolled pointer
+# casts, no `unsafe`.
+zerocopy = { version = "0.8", features = ["derive"] }
