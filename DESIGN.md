@@ -187,6 +187,14 @@ D-Bus client is allowed.
   `nitro-shot` asks the live server for a readback of the front buffer.
 - **No global allocator churn in the frame path.** Scene and arena nodes
   are pooled; transactions are parsed in place.
+- **No `unsafe`.** `unsafe_code = "deny"` workspace-wide. Exceptions are
+  explicit `#[allow(unsafe_code)]` on the smallest possible item, carry a
+  `// SAFETY:` comment, and are confined to the ABI shims (ioctls, fd
+  passing, mmap). The rest of the tree — scene, raster, toolkit, apps — is
+  100% safe Rust.
+- **Clippy pedantic, deny.** Workspace lints in `Cargo.toml`; every crate
+  sets `[lints] workspace = true`. Per-lint allows are workspace-level with
+  a stated reason, not sprinkled through the code.
 
 ## Milestones
 
