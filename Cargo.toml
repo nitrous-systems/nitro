@@ -1,12 +1,29 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# Standalone comparison harnesses live outside the workspace.
+exclude = ["crates/nitro-raster/compare"]
 
 [workspace.package]
 edition = "2024"
 version = "0.0.1"
 license = "Apache-2.0"
 publish = false
+
+# Pin external versions once; crates use `{ workspace = true }`.
+[workspace.dependencies]
+nitro-core   = { path = "crates/nitro-core" }
+nitro-wire   = { path = "crates/nitro-wire" }
+nitro-scene  = { path = "crates/nitro-scene" }
+nitro-raster = { path = "crates/nitro-raster" }
+nitro-seat   = { path = "crates/nitro-seat" }
+nitro-kms    = { path = "crates/nitro-kms" }
+rustix       = { version = "1", default-features = false, features = ["std"] }
+drm          = "0.15"
+libseat      = { version = "0.2", default-features = false }
+signal-hook  = { version = "0.3", default-features = false }
+input        = "0.10"
+xkbcommon    = "0.9"
 
 [profile.release]
 lto = "fat"
