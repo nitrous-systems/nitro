@@ -24,6 +24,7 @@ libseat      = { version = "0.2", default-features = false }
 signal-hook  = { version = "0.3", default-features = false }
 input        = "0.10"
 xkbcommon    = "0.9"
+zerocopy     = { version = "0.8", features = ["derive"] }
 
 [profile.release]
 lto = "fat"

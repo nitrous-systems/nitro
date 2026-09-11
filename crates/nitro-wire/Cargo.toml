@@ -17,4 +17,4 @@ rustix = { version = "1", features = ["event", "fs", "net", "process"] }
 # `repr(C)` + byteorder types = the wire layout, with validated zero-copy
 # decode (`ref_from_bytes`) and `as_bytes()` encode. No hand-rolled pointer
 # casts, no `unsafe`.
-zerocopy = { version = "0.8", features = ["derive"] }
+zerocopy = { workspace = true }
