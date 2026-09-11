@@ -738,3 +738,201 @@ fn deeply_nested_transforms_compose() {
         IRect::new(19, 38, 10, 10)
     );
 }
+
+// --------------------------------------------------------------------------
+// Inherited recomposition: a node dragged along by an ancestor carries no
+// dirty flags of its own, so the damage test must compare cached world state.
+// These are regression tests for a bug where fading a group repainted
+// nothing.
+// --------------------------------------------------------------------------
+
+#[test]
+fn a_group_opacity_change_damages_its_children() {
+    let mut s = scene();
+    let (_, root) = window(&mut s);
+    let g = group(&mut s, root, Rect::new(0.0, 0.0, 100.0, 100.0));
+    let r = rect(&mut s, g, Rect::new(0.0, 0.0, 20.0, 20.0));
+    settle(&mut s);
+
+    // A partial fade moves nothing and changes no property of the child.
+    s.set_opacity(CLIENT, g, 0.5).unwrap();
+    assert_eq!(damage(&mut s).rects(), &[IRect::new(0, 0, 20, 20)]);
+    assert!((s.node(r).unwrap().world_opacity() - 0.5).abs() < 1e-6);
+
+    // Every further step of the fade damages it again.
+    for (step, expected) in [(0.75_f32, 0.75_f32), (0.25, 0.25), (1.0, 1.0)] {
+        s.set_opacity(CLIENT, g, step).unwrap();
+        assert_eq!(
+            damage(&mut s).rects(),
+            &[IRect::new(0, 0, 20, 20)],
+            "opacity {step}"
+        );
+        assert!((s.node(r).unwrap().world_opacity() - expected).abs() < 1e-6);
+    }
+}
+
+#[test]
+fn nested_group_opacities_multiply_and_damage_the_leaf() {
+    let mut s = scene();
+    let (_, root) = window(&mut s);
+    let outer = group(&mut s, root, Rect::new(0.0, 0.0, 200.0, 200.0));
+    let inner = group(&mut s, outer, Rect::new(0.0, 0.0, 100.0, 100.0));
+    let r = rect(&mut s, inner, Rect::new(0.0, 0.0, 20.0, 20.0));
+    s.set_opacity(CLIENT, r, 0.5).unwrap();
+    settle(&mut s);
+    assert!((s.node(r).unwrap().world_opacity() - 0.5).abs() < 1e-6);
+
+    // Fading the outermost group reaches two levels down.
+    s.set_opacity(CLIENT, outer, 0.5).unwrap();
+    assert_eq!(damage(&mut s).rects(), &[IRect::new(0, 0, 20, 20)]);
+    assert!((s.node(r).unwrap().world_opacity() - 0.25).abs() < 1e-6);
+
+    // And so does the middle one: 0.5 * 0.5 * 0.5.
+    s.set_opacity(CLIENT, inner, 0.5).unwrap();
+    assert_eq!(damage(&mut s).rects(), &[IRect::new(0, 0, 20, 20)]);
+    assert!((s.node(r).unwrap().world_opacity() - 0.125).abs() < 1e-6);
+    assert!(s.node(r).unwrap().painted());
+}
+
+#[test]
+fn a_group_opacity_change_damages_every_child_in_its_subtree() {
+    let mut s = scene();
+    let (_, root) = window(&mut s);
+    let g = group(&mut s, root, Rect::new(0.0, 0.0, 400.0, 300.0));
+    rect(&mut s, g, Rect::new(0.0, 0.0, 20.0, 20.0));
+    rect(&mut s, g, Rect::new(200.0, 200.0, 20.0, 20.0));
+    // A sibling outside the group must not be disturbed.
+    rect(&mut s, root, Rect::new(350.0, 0.0, 20.0, 20.0));
+    settle(&mut s);
+
+    s.set_opacity(CLIENT, g, 0.5).unwrap();
+    let d = damage(&mut s);
+    assert!(d.intersects(&IRect::new(0, 0, 20, 20)));
+    assert!(d.intersects(&IRect::new(200, 200, 20, 20)));
+    assert!(
+        !d.intersects(&IRect::new(350, 0, 20, 20)),
+        "sibling untouched"
+    );
+}
+
+#[test]
+fn a_transform_that_preserves_the_bounding_box_still_damages() {
+    let mut s = scene();
+    let (_, root) = window(&mut s);
+    let g = group(&mut s, root, Rect::new(100.0, 100.0, 100.0, 100.0));
+    // A square, so a quarter turn about its centre leaves the bbox identical.
+    let r = rect(&mut s, g, Rect::new(-20.0, -20.0, 40.0, 40.0));
+    settle(&mut s);
+    let before = s.node(r).unwrap().world_bounds();
+    assert_eq!(before, IRect::new(80, 80, 40, 40));
+
+    // 90 degrees about the group origin, which is the square's centre.
+    let quarter_turn = Transform {
+        a: 0.0,
+        b: 1.0,
+        c: -1.0,
+        d: 0.0,
+        e: 0.0,
+        f: 0.0,
+    };
+    s.set_transform(CLIENT, g, quarter_turn).unwrap();
+    let d = damage(&mut s);
+    // The bounding box is unchanged...
+    assert_eq!(s.node(r).unwrap().world_bounds(), before);
+    // ...but the pixels are not, so it must be repainted.
+    assert_eq!(d.rects(), &[before], "a rotation in place must damage");
+}
+
+#[test]
+fn a_mirror_transform_damages_even_though_the_box_is_identical() {
+    let mut s = scene();
+    let (_, root) = window(&mut s);
+    let g = group(&mut s, root, Rect::new(100.0, 100.0, 100.0, 100.0));
+    let r = rect(&mut s, g, Rect::new(-30.0, -10.0, 60.0, 20.0));
+    // A gradient makes the mirror visible; a solid fill would not care.
+    s.set_fill(
+        CLIENT,
+        r,
+        Fill::Linear {
+            start: Point::ZERO,
+            end: Point::new(60.0, 0.0),
+            c0: Color::BLACK,
+            c1: Color::WHITE,
+        },
+    )
+    .unwrap();
+    settle(&mut s);
+    let before = s.node(r).unwrap().world_bounds();
+
+    s.set_transform(CLIENT, g, Transform::scale(-1.0, 1.0))
+        .unwrap();
+    let d = damage(&mut s);
+    assert_eq!(s.node(r).unwrap().world_bounds(), before, "same box");
+    assert_eq!(d.rects(), &[before], "mirroring must still damage");
+}
+
+#[test]
+fn an_identity_transform_reset_damages_nothing_extra() {
+    // The flip side: recomposition that genuinely changes nothing is free.
+    let mut s = scene();
+    let (_, root) = window(&mut s);
+    let g = group(&mut s, root, Rect::new(0.0, 0.0, 100.0, 100.0));
+    rect(&mut s, g, Rect::new(0.0, 0.0, 20.0, 20.0));
+    settle(&mut s);
+
+    // Setting the transform it already has is a no-op at the mutation level.
+    s.set_transform(CLIENT, g, Transform::IDENTITY).unwrap();
+    let (d, stats) = update(&mut s);
+    assert!(d.is_empty());
+    assert_eq!(stats.visited_nodes, 0);
+
+    // A round trip away and back does damage (twice), but ends up clean.
+    s.set_transform(CLIENT, g, Transform::translate(5.0, 0.0))
+        .unwrap();
+    assert!(!damage(&mut s).is_empty());
+    s.set_transform(CLIENT, g, Transform::IDENTITY).unwrap();
+    assert!(!damage(&mut s).is_empty());
+    let (d, stats) = update(&mut s);
+    assert!(d.is_empty());
+    assert_eq!(stats.visited_nodes, 0);
+}
+
+#[test]
+fn moving_a_window_between_outputs_damages_each_within_its_own_rect() {
+    let mut s = Scene::new();
+    s.add_output(OUT, IRect::new(0, 0, 800, 600), 1.0);
+    s.add_output(OUT2, IRect::new(800, 0, 800, 600), 1.0);
+    let win = s.create_window(CLIENT, "w", Size::new(100.0, 100.0), Layer::Normal);
+    s.place_window(win, Some(OUT), Point::new(10.0, 10.0))
+        .unwrap();
+    let root = s.window_info(win).unwrap().root();
+    let r = rect(&mut s, root, Rect::new(0.0, 0.0, 20.0, 20.0));
+
+    let mut d0 = Damage::new();
+    let mut d1 = Damage::new();
+    s.update(&mut DamageSink::new(&mut [(OUT, &mut d0), (OUT2, &mut d1)]));
+    d0.clear();
+    d1.clear();
+
+    // Move it to the second output.
+    s.place_window(win, Some(OUT2), Point::new(5.0, 5.0))
+        .unwrap();
+    s.update(&mut DamageSink::new(&mut [(OUT, &mut d0), (OUT2, &mut d1)]));
+
+    // The vacated rect belongs to the output it left...
+    assert_eq!(d0.bounds(), IRect::new(10, 10, 20, 20));
+    // ...and the new rect to the one it arrived on.
+    assert_eq!(d1.bounds(), IRect::new(805, 5, 20, 20));
+    assert_eq!(
+        s.node(r).unwrap().world_bounds(),
+        IRect::new(805, 5, 20, 20)
+    );
+
+    // Neither region contains a pixel its own output cannot draw.
+    for rect in d0.rects() {
+        assert!(IRect::new(0, 0, 800, 600).contains_rect(rect));
+    }
+    for rect in d1.rects() {
+        assert!(IRect::new(800, 0, 800, 600).contains_rect(rect));
+    }
+}

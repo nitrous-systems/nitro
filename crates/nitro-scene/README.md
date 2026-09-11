@@ -133,6 +133,15 @@ The damage rule is **old ∪ new**:
 Both rectangles are already narrowed by the clips in force, so a clip group
 bounds the damage of everything inside it — however far its children stick out.
 
+"Changed" is decided by comparing the node's **cached world state** against what
+the walk just computed — device bounds, whether it paints at all, accumulated
+opacity, inherited visibility, and the world transform — *not* by consulting
+the node's own dirty flags. That distinction is load-bearing: a descendant
+dragged along by an ancestor's opacity, visibility or transform change carries
+no flags of its own, so a flag-based test misses it. It also catches the cases
+where the bounding box is unchanged but the pixels are not — fading a group,
+rotating a square through 90°, mirroring a gradient.
+
 That covers every mutation whose old rectangle is still reachable when `update`
 runs. The mutations that *destroy* the old rectangle before then — `destroy_node`,
 `reparent`, unplacing a window, restacking, moving an output — bank it in a
@@ -149,6 +158,10 @@ Consequences worth stating:
 - An update with nothing dirty visits zero nodes and adds zero rects.
 - Damage is accumulated into the caller's `Damage` regions and never cleared by
   the scene, so several updates can pile up before a frame is drawn.
+- Every rect is clipped to the owning output's device rect on the way in, so a
+  region never contains pixels that output cannot draw. This is what keeps a
+  window moving *between* outputs honest: the rectangle it vacated is damaged
+  on the output it left, the new one on the output it arrived on.
 - `DamageSink` only carries the outputs the caller passed. Damage for an output
   that is not in the sink is dropped, which is what the server wants when it is
   redrawing one screen — the scene still ends up clean either way.
@@ -183,9 +196,16 @@ its accumulated opacity, and its clipped device bounds — everything the
 rasterizer needs, with no pointer back into the tree. `out` is appended to,
 never cleared.
 
-`PaintItem::opaque_cover()` reports whether an item is an axis-aligned, fully
-opaque, square-cornered solid rect, so the rasterizer can skip what is behind
-it. Images never qualify: the scene cannot see their alpha.
+`PaintItem::opaque_cover()` is the occlusion hint: the device rect an item is
+*guaranteed* to fill with fully opaque pixels, so a rasterizer can skip what is
+behind it. It is deliberately conservative, because only under-reporting is
+sound here — over-reporting would let a caller drop content that is in fact
+visible. An item qualifies only when it is a fully opaque, square-cornered,
+axis-aligned solid rect *whose device rect lands on exact pixel boundaries*:
+`bounds` is rounded outward, so a rect on a half-pixel edge covers its boundary
+pixels only partially and reports `None`. Rounded corners, a translucent fill
+or border, accumulated opacity below 1.0 and rotation all disqualify it too.
+Images never qualify: the scene cannot see their alpha.
 
 **`hit_test(output, point)`** returns the topmost window, deepest node, and the
 point in that node's local coordinates (via `Transform::invert`, so rotation and
@@ -197,6 +217,10 @@ is not hit in the corners of its bounding box.
 
 `windows(output)` iterates z-order back to front; `windows_front_to_back` is the
 reverse; `window_info(key)` returns the metadata.
+
+Both traversals treat a z-order entry that no longer resolves the same way —
+they skip it rather than abandoning the walk. The invariant should make that
+unreachable; the point is that the two agree if it ever is not.
 
 ## Ownership and errors
 
@@ -241,7 +265,7 @@ leaves its buffer alone.
 
 ## Testing
 
-97 tests, all pure and fast (no I/O, no sleeps, no globals):
+108 tests, all pure and fast (no I/O, no sleeps, no globals):
 
 - `tests/tree.rs` — shape, and every error path.
 - `tests/damage.rs` — damage exactness, clips, outputs, scale, configures.

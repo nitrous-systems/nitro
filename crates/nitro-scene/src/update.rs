@@ -2,10 +2,13 @@
 //! change into exact per-output damage.
 //!
 //! The rule is *old ∪ new*. For every node whose device-pixel footprint,
-//! visibility or appearance changed, both the rectangle it used to occupy and
-//! the one it occupies now are damaged: the first so whatever was behind it
-//! gets repainted, the second so the node itself appears. Clean nodes are
-//! never visited, so an idle scene costs nothing.
+//! visibility, opacity, world transform or appearance changed, both the
+//! rectangle it used to occupy and the one it occupies now are damaged: the
+//! first so whatever was behind it gets repainted, the second so the node
+//! itself appears. "Changed" is decided by comparing cached world state, not
+//! the node's own dirty flags — a descendant dragged along by an ancestor
+//! carries no flags of its own. Clean nodes are never visited, so an idle
+//! scene costs nothing.
 
 use nitro_core::{Damage, IRect, Rect, Transform};
 
@@ -32,6 +35,11 @@ pub struct UpdateResult {
 /// The server owns one [`Damage`] per output and passes them in; the scene
 /// adds to them and never clears them, so damage can accumulate across several
 /// updates before a frame is drawn.
+///
+/// [`Scene::update`] clips every rect to the owning output's device rect on
+/// the way in, so a region never contains pixels that output cannot draw. That
+/// matters when something moves between outputs: the rectangle it vacated
+/// belongs to the output it left, not to the one it arrived on.
 pub struct DamageSink<'a> {
     outputs: &'a mut [(OutputId, &'a mut Damage)],
 }
@@ -46,7 +54,10 @@ impl<'a> DamageSink<'a> {
         Self { outputs }
     }
 
-    /// Add a device-pixel rect to one output's region.
+    /// Add a device-pixel rect to one output's region, as given.
+    ///
+    /// [`Scene::update`] clips to the output before calling this; a caller
+    /// adding damage by hand is trusted to pass a rect on that output.
     pub fn add(&mut self, id: OutputId, rect: IRect) {
         if rect.is_empty() {
             return;
@@ -58,6 +69,19 @@ impl<'a> DamageSink<'a> {
             }
         }
     }
+
+    /// Add a rect after clipping it to `bounds` (the output's device rect).
+    fn add_clipped(&mut self, id: OutputId, rect: IRect, bounds: IRect) {
+        self.add(id, rect.intersect(&bounds));
+    }
+}
+
+/// The output a walk is emitting damage for.
+#[derive(Clone, Copy)]
+struct Target {
+    id: OutputId,
+    /// The output's device rect; every emitted rect is clipped to it.
+    rect: IRect,
 }
 
 /// State carried down the recursive walk.
@@ -73,16 +97,24 @@ impl Scene {
     /// Recompute every dirty subtree and add the resulting damage to `sink`.
     ///
     /// Damage is *old ∪ new*: the pixels a changed node used to cover plus the
-    /// ones it covers now, both already narrowed by the clips in force. A
-    /// second call with nothing dirty adds nothing and visits nothing.
+    /// ones it covers now, both already narrowed by the clips in force and by
+    /// the owning output's rect. A second call with nothing dirty adds nothing
+    /// and visits nothing.
     pub fn update(&mut self, sink: &mut DamageSink<'_>) -> UpdateResult {
         self.stats = UpdateStats::default();
 
         // Damage banked by mutations whose cached bounds were about to become
         // unreachable (a destroyed node, an unplaced or restacked window).
+        // Each entry names the output it belongs to, so clipping it to that
+        // output drops anything that output could not draw anyway.
         let mut pending = std::mem::take(&mut self.pending);
         for (id, rect) in pending.drain(..) {
-            sink.add(id, rect);
+            let bounds = self
+                .outputs
+                .iter()
+                .find(|o| o.id == id)
+                .map_or(IRect::EMPTY, |o| o.rect);
+            sink.add_clipped(id, rect, bounds);
             self.stats.damaged_nodes += 1;
         }
         if self.pending.is_empty() {
@@ -102,7 +134,10 @@ impl Scene {
             let window = self.node_ref(root).window;
             match self.root_placement(window) {
                 Some((index, transform, clip)) => {
-                    let id = self.outputs[index].id;
+                    let target = Target {
+                        id: self.outputs[index].id,
+                        rect: self.outputs[index].rect,
+                    };
                     let inherited = Inherited {
                         transform,
                         clip,
@@ -113,7 +148,7 @@ impl Scene {
                     // whether its subtree is revisited. Passing `true` here
                     // would cascade to every descendant and walk the whole
                     // tree on any change at all.
-                    self.visit(root, &inherited, id, sink, false);
+                    self.visit(root, &inherited, target, sink, false);
                 }
                 None => {
                     // Off-screen: keep the caches coherent but damage nothing.
@@ -142,7 +177,7 @@ impl Scene {
         &mut self,
         key: NodeKey,
         inherited: &Inherited,
-        output: OutputId,
+        target: Target,
         sink: &mut DamageSink<'_>,
         force: bool,
     ) -> IRect {
@@ -153,6 +188,9 @@ impl Scene {
 
         let old_bounds = node.world_bounds;
         let old_painted = node.painted;
+        let old_transform = node.world_transform;
+        let old_opacity = node.world_opacity;
+        let old_visible = node.world_visible;
 
         // World transform: parent space, then this node's offset within it,
         // then (for groups) the node's own transform.
@@ -194,11 +232,26 @@ impl Scene {
         // account for themselves, and the mutations that make a cached
         // rectangle unreachable (destroy, reparent, unplace, restack) bank it
         // before it is lost.
+        //
+        // The test is on the *cached world state*, not on this node's own
+        // dirty flags: a descendant dragged along by an ancestor's opacity,
+        // visibility or transform change carries no flags of its own, so
+        // asking `dirty` would miss it. Comparing what was actually painted
+        // last time against what will be painted now catches every case —
+        // including the ones that leave the bounding box alone, such as
+        // fading a group or rotating a square through 90°.
         if self_changed && (old_painted || paints) {
-            let moved = old_bounds != world_bounds || old_painted != paints;
-            if moved || dirty.any(Dirty::PAINT.union(Dirty::INHERIT)) {
-                sink.add(output, old_bounds);
-                sink.add(output, world_bounds);
+            let moved = old_bounds != world_bounds;
+            let appeared = old_painted != paints;
+            let recomposed = old_opacity.to_bits() != opacity.to_bits()
+                || old_visible != visible
+                || old_transform != world_transform;
+            if moved || appeared || recomposed || dirty.any(Dirty::PAINT) {
+                // `old_bounds` was clipped to whichever output the node was on
+                // last time, which need not be this one; clip both to the
+                // output actually being damaged.
+                sink.add_clipped(target.id, old_bounds, target.rect);
+                sink.add_clipped(target.id, world_bounds, target.rect);
                 self.stats.damaged_nodes += 1;
             }
         }
@@ -216,7 +269,7 @@ impl Scene {
         for child in &children {
             let child_dirty = self.node_ref(*child).dirty;
             if descend_all || !child_dirty.is_clean() {
-                let extent = self.visit(*child, &child_inherited, output, sink, descend_all);
+                let extent = self.visit(*child, &child_inherited, target, sink, descend_all);
                 subtree = subtree.union(&extent);
             } else {
                 subtree = subtree.union(&self.node_ref(*child).subtree_bounds);

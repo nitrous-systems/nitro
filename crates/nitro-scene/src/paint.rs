@@ -4,7 +4,7 @@
 //! two can run on different threads and the scene can be mutated again while a
 //! frame is being drawn.
 
-use nitro_core::{IRect, Point, Transform};
+use nitro_core::{IRect, Point, Rect, Transform};
 
 use crate::{
     BufferKey, Fill, NodeKey, OutputId, Scene, WindowKey,
@@ -61,8 +61,18 @@ pub struct PaintItem {
 }
 
 impl PaintItem {
-    /// Whether the item is an opaque solid rect covering `r` exactly — the
-    /// occlusion hint a rasterizer uses to skip what is behind it.
+    /// The device-pixel rect this item is guaranteed to cover with fully
+    /// opaque pixels — the occlusion hint a rasterizer uses to skip whatever
+    /// is behind it.
+    ///
+    /// Deliberately conservative: it is only ever sound to *under*-report
+    /// here, since over-reporting would let a caller skip content that is in
+    /// fact visible through a partially covered pixel. An item qualifies only
+    /// when it is a fully opaque, square-cornered, axis-aligned solid rect
+    /// whose device rect lands on exact pixel boundaries; anything else —
+    /// rounded corners, a translucent fill or border, accumulated opacity
+    /// below 1.0, rotation, or a fractional edge — reports `None`. Images
+    /// never qualify: the scene cannot see their alpha.
     #[must_use]
     pub fn opaque_cover(&self) -> Option<IRect> {
         if self.opacity < 1.0 {
@@ -70,21 +80,30 @@ impl PaintItem {
         }
         match self.kind {
             PaintKind::Rect {
+                size,
                 fill: Fill::Solid(c),
                 corner_radius,
                 border,
-                ..
             } => {
                 let border_opaque = border.is_none_or(|b| !b.is_visible() || b.color.is_opaque());
-                if c.is_opaque()
+                if !(c.is_opaque()
                     && corner_radius <= 0.0
                     && border_opaque
-                    && self.transform.is_axis_aligned()
+                    && self.transform.is_axis_aligned())
                 {
-                    Some(self.bounds)
-                } else {
-                    None
+                    return None;
                 }
+                // `bounds` is rounded *outward*, so its edge pixels may only
+                // be partially covered. Report a cover only when the exact
+                // device rect is pixel-aligned, in which case the two agree.
+                let exact = self
+                    .transform
+                    .apply_rect(&Rect::new(0.0, 0.0, size.0, size.1));
+                let aligned = exact.x.fract() == 0.0
+                    && exact.y.fract() == 0.0
+                    && exact.w.fract() == 0.0
+                    && exact.h.fract() == 0.0;
+                if aligned { Some(self.bounds) } else { None }
             }
             _ => None,
         }
@@ -194,7 +213,12 @@ impl Scene {
         let index = self.output_index(output)?;
         let ids: Vec<WindowKey> = self.output_at(index).z_order().collect();
         for win in ids.into_iter().rev() {
-            let window = self.windows.get(win)?;
+            // Defensive: the z-order should only name live windows. Skip a
+            // stale entry rather than abandoning the whole hit test, matching
+            // what `paint_list` does.
+            let Some(window) = self.windows.get(win) else {
+                continue;
+            };
             let root = window.root;
             if let Some(hit) = self.hit_node(root, point) {
                 return Some(hit);

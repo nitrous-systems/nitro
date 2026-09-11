@@ -495,3 +495,106 @@ fn hit_test_edges_are_half_open() {
     assert!(s.hit_test(OUT, Point::new(30.0, 20.0)).is_none());
     assert!(s.hit_test(OUT, Point::new(9.9, 20.0)).is_none());
 }
+
+#[test]
+fn opaque_cover_is_refused_on_a_fractional_edge() {
+    // `bounds` is rounded outward, so a rect on a half-pixel boundary covers
+    // its edge pixels only partially. Reporting it as an opaque cover would
+    // let a rasterizer skip content genuinely visible through those pixels.
+    let mut s = scene();
+    let (_, root) = window(&mut s);
+    let aligned = rect_colored(&mut s, root, Rect::new(0.0, 0.0, 20.0, 20.0), Color::BLACK);
+    settle(&mut s);
+    let items = paint(&s, ALL);
+    let item = items.iter().find(|i| i.node == aligned).unwrap();
+    assert_eq!(item.opaque_cover(), Some(IRect::new(0, 0, 20, 20)));
+
+    // Shift it by half a pixel: same outward-rounded bounds, no longer a cover.
+    s.set_bounds(CLIENT, aligned, Rect::new(0.5, 0.0, 20.0, 20.0))
+        .unwrap();
+    settle(&mut s);
+    let items = paint(&s, ALL);
+    let item = items.iter().find(|i| i.node == aligned).unwrap();
+    assert_eq!(item.bounds, IRect::new(0, 0, 21, 20), "rounded outward");
+    assert_eq!(
+        item.opaque_cover(),
+        None,
+        "a partially covered edge pixel is not an opaque cover"
+    );
+
+    // A fractional size is refused for the same reason.
+    s.set_bounds(CLIENT, aligned, Rect::new(0.0, 0.0, 20.5, 20.0))
+        .unwrap();
+    settle(&mut s);
+    let items = paint(&s, ALL);
+    assert_eq!(items[0].opaque_cover(), None);
+}
+
+#[test]
+fn opaque_cover_survives_an_integer_scale() {
+    // A 2x output keeps everything pixel-aligned, so the cover still holds.
+    let mut s = Scene::new();
+    s.add_output(OUT, IRect::new(0, 0, 1600, 1200), 2.0);
+    let win = s.create_window(CLIENT, "w", Size::new(200.0, 200.0), Layer::Normal);
+    s.place_window(win, Some(OUT), Point::new(10.0, 10.0))
+        .unwrap();
+    let root = s.window_info(win).unwrap().root();
+    rect_colored(&mut s, root, Rect::new(0.0, 0.0, 20.0, 20.0), Color::BLACK);
+    settle(&mut s);
+
+    let mut items = Vec::new();
+    s.paint_list(OUT, &IRect::new(0, 0, 1600, 1200), &mut items);
+    assert_eq!(items[0].opaque_cover(), Some(IRect::new(20, 20, 40, 40)));
+}
+
+#[test]
+fn opaque_cover_is_refused_under_rotation() {
+    let mut s = scene();
+    let (_, root) = window(&mut s);
+    let g = group(&mut s, root, Rect::new(100.0, 100.0, 100.0, 100.0));
+    rect_colored(&mut s, g, Rect::new(0.0, 0.0, 40.0, 40.0), Color::BLACK);
+    settle(&mut s);
+    assert!(paint(&s, ALL)[0].opaque_cover().is_some());
+
+    let k = std::f32::consts::FRAC_1_SQRT_2;
+    s.set_transform(
+        CLIENT,
+        g,
+        Transform {
+            a: k,
+            b: k,
+            c: -k,
+            d: k,
+            e: 0.0,
+            f: 0.0,
+        },
+    )
+    .unwrap();
+    settle(&mut s);
+    assert_eq!(paint(&s, ALL)[0].opaque_cover(), None);
+}
+
+#[test]
+fn a_destroyed_window_is_skipped_by_both_traversals() {
+    // Both traversals must survive a z-order entry that no longer resolves in
+    // the same (defensive) way: skip it, do not abandon the walk.
+    let mut s = scene();
+    let (back, back_root) = window_at(&mut s, Point::ZERO, Size::new(200.0, 200.0));
+    let b = rect(&mut s, back_root, Rect::new(0.0, 0.0, 200.0, 200.0));
+    let (front, front_root) = window_at(&mut s, Point::ZERO, Size::new(200.0, 200.0));
+    rect(&mut s, front_root, Rect::new(0.0, 0.0, 200.0, 200.0));
+    settle(&mut s);
+    assert_eq!(
+        s.hit_test(OUT, Point::new(50.0, 50.0)).unwrap().window,
+        front
+    );
+
+    // Destroying the front window drops it from the z-order entirely...
+    s.destroy_window(CLIENT, front).unwrap();
+    settle(&mut s);
+    // ...and the window behind it answers, rather than the hit test failing.
+    let hit = s.hit_test(OUT, Point::new(50.0, 50.0)).unwrap();
+    assert_eq!(hit.window, back);
+    assert_eq!(hit.node, b);
+    assert_eq!(painted_nodes(&s, ALL), vec![b]);
+}
