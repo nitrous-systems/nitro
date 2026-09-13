@@ -381,7 +381,9 @@ fn widgets_report_their_role_and_accessible_record() {
 
     let a = h.ui().accessible(kids[1]).unwrap();
     assert_eq!(a.name.as_deref(), Some("OK"));
-    assert_eq!(a.actions, ["activate"]);
+    // `click` first, because it is what the introspection protocol and
+    // `hey` say; `activate` is the AT-SPI spelling of the same thing.
+    assert_eq!(a.actions, ["click", "activate", "focus"]);
     let l = h.ui().accessible(kids[0]).unwrap();
     assert_eq!(l.value.as_deref(), Some("Name:"));
     // The container's name comes from the framework state, not the
@@ -684,7 +686,7 @@ fn the_introspect_pass_walks_the_whole_tree() {
     assert!(!nodes[1].focusable, "a label is not in the Tab order");
 
     assert_eq!(nodes[2].role, nitro_ui::Role::Button);
-    assert_eq!(nodes[2].access.actions, ["activate"]);
+    assert_eq!(nodes[2].access.actions, ["click", "activate", "focus"]);
     assert!(nodes[2].focusable);
     assert!(!nodes[2].focused);
     // Bounds are in window coordinates, so an outside process can point

@@ -1,0 +1,29 @@
+[package]
+name = "nitro-hey"
+description = "hey: drive any nitro app from the command line over its introspection socket"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# std and `rustix` only, deliberately: `hey` is the tool you reach for when
+# something is wrong, and it must build and run with nothing else present.
+# It does not depend on `nitro-ui` either — that would link the whole
+# toolkit into a CLI that only needs to open a socket and read lines.
+rustix = { workspace = true, features = ["process"] }
+
+[[bin]]
+name = "hey"
+path = "src/main.rs"
+
+[dev-dependencies]
+# End-to-end only. A dev-dependency is not linked into the shipped `hey`
+# binary, so the "std and rustix only" rule above still holds: this is
+# how the test gets a real app with a real widget tree to drive, rather
+# than a mock that would prove nothing about the protocol.
+nitro-ui = { path = "../nitro-ui", features = ["test-support"] }
+nitro-core = { workspace = true }

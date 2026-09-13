@@ -502,11 +502,16 @@ Fatal: the connection closes after it.
 |---|---|---|
 | `window` | `NodeId` | |
 | `size` | `Size` | logical size the server gave it |
+| `position` | `Point` | top-left corner on the output, logical units |
 | `scale` | `f32` | output scale factor |
 | `output` | `u32` | which output |
 
 Sent when a window is placed, resized or rescaled. The client lays out for
 `size` and commits; the new size takes effect at that commit.
+
+`position` is the window's content origin in the output's logical
+coordinate space, so a client holding a screenshot of the whole output can
+crop it to `size` at `position` to get just itself.
 
 ### `Frame` — 0x8102
 

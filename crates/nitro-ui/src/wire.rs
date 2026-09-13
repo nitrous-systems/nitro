@@ -16,11 +16,11 @@
 
 use std::collections::HashMap;
 
-use nitro_core::{Color, Rect, Size};
+use nitro_core::{Color, Rect, Size, Transform};
 use nitro_wire::client::Connection;
 use nitro_wire::msg::{
     self, ClientMsg, CreateNode, DestroyNode, Fill, Reparent, ServerMsg, SetBorder, SetBounds,
-    SetCorners, SetFill, SetImage, SetText,
+    SetClip, SetCorners, SetFill, SetImage, SetText, SetTransform,
 };
 use nitro_wire::types::{BufferId, Layer, NodeId, NodeKind, caps};
 
@@ -56,7 +56,6 @@ pub struct TextMetrics {
     /// Number of laid-out lines.
     pub line_count: u32,
 }
-
 impl TextMetrics {
     /// The measured block as a size.
     #[must_use]
@@ -94,6 +93,10 @@ impl MeasureKey {
 #[derive(Debug, Default)]
 pub(crate) struct TextMeasureCache {
     map: HashMap<MeasureKey, TextMetrics>,
+    /// Cursor positions from the same round trips, kept separately
+    /// because only a text field ever asks for them and they are a
+    /// `Vec` per string rather than six floats.
+    cursors: HashMap<MeasureKey, Vec<(u32, f32)>>,
 }
 
 /// Where a paint slot's node belongs in the scene: under `parent`,
@@ -119,8 +122,31 @@ pub(crate) struct PaintSlot {
     border: (f32, Color),
     text: Option<SetText>,
     image: Option<(BufferId, nitro_core::IRect)>,
+    /// Group slots only: the transform applied to the slot's children,
+    /// and whether they are clipped to its bounds.
+    pub(crate) transform: Transform,
+    clip: bool,
     /// Whether this slot was emitted by the paint that is running.
     used: bool,
+}
+
+impl PaintSlot {
+    /// An empty slot: no node, no cached values.
+    fn empty(kind: NodeKind) -> Self {
+        Self {
+            node: NodeId::NONE,
+            kind,
+            bounds: Rect::EMPTY,
+            fill: Fill::None,
+            radius: 0.0,
+            border: (0.0, Color::TRANSPARENT),
+            text: None,
+            image: None,
+            transform: Transform::IDENTITY,
+            clip: false,
+            used: false,
+        }
+    }
 }
 
 /// The client half of the scene: one connection, the node-id allocator
@@ -140,6 +166,8 @@ pub(crate) struct Wire {
     /// Server messages picked up while waiting for a `TextMeasured`.
     pub(crate) stray: Vec<ServerMsg>,
     next_request: u32,
+    /// Next never-used buffer id. `BufferId(0)` is "no buffer".
+    next_buffer: u32,
     pub(crate) text_cache: TextMeasureCache,
 }
 
@@ -155,6 +183,7 @@ impl Wire {
             tap: None,
             stray: Vec::new(),
             next_request: 1,
+            next_buffer: 1,
             text_cache: TextMeasureCache::default(),
         }
     }
@@ -292,6 +321,42 @@ impl Wire {
         self.send(&ClientMsg::Reparent(Reparent { id, parent, before }), id)
     }
 
+    /// Create a `Rect` under `parent`, before `before` (or appended).
+    /// Used for the window backdrop, which is not a widget's paint slot.
+    pub(crate) fn create_rect(
+        &mut self,
+        id: NodeId,
+        parent: NodeId,
+        before: NodeId,
+    ) -> Result<(), Error> {
+        self.send(
+            &ClientMsg::CreateNode(CreateNode {
+                id,
+                kind: NodeKind::Rect,
+                parent,
+                before,
+            }),
+            id,
+        )
+    }
+
+    /// Size and fill the window backdrop.
+    pub(crate) fn set_backdrop(
+        &mut self,
+        id: NodeId,
+        rect: Rect,
+        color: Color,
+    ) -> Result<(), Error> {
+        self.set_bounds(id, rect)?;
+        self.send(
+            &ClientMsg::SetFill(SetFill {
+                id,
+                fill: Fill::Solid(color),
+            }),
+            id,
+        )
+    }
+
     pub(crate) fn set_bounds(&mut self, id: NodeId, rect: Rect) -> Result<(), Error> {
         self.send(&ClientMsg::SetBounds(SetBounds { id, rect }), id)
     }
@@ -344,6 +409,41 @@ impl Wire {
         Ok(metrics)
     }
 
+    /// The x of every cursor position inside `text`, as the server
+    /// shaped it: `(byte offset, x)` in increasing offset order.
+    ///
+    /// A text field needs this to place a caret, and it cannot compute
+    /// it: the client has no fonts. It rides the same `MeasureText`
+    /// round trip and the same cache, so a caret move in a string the
+    /// field has already measured costs nothing.
+    ///
+    /// With no `TEXT` capability the positions are estimated from the
+    /// font size, which is what keeps a fontless server usable.
+    pub(crate) fn cursor_positions(
+        &mut self,
+        text: &str,
+        style: &TextStyle,
+    ) -> Result<Vec<(u32, f32)>, Error> {
+        let key = MeasureKey::new(text, style, 0.0);
+        if let Some(c) = self.text_cache.cursors.get(&key) {
+            return Ok(c.clone());
+        }
+        if self.has_text() {
+            let metrics = self.round_trip(text, style, 0.0)?;
+            self.text_cache.map.insert(key.clone(), metrics);
+        } else {
+            self.text_cache
+                .cursors
+                .insert(key.clone(), estimate_cursors(text, style));
+        }
+        Ok(self
+            .text_cache
+            .cursors
+            .get(&key)
+            .cloned()
+            .unwrap_or_default())
+    }
+
     fn round_trip(
         &mut self,
         text: &str,
@@ -371,6 +471,13 @@ impl Wire {
             for m in batch.drain(..) {
                 match m {
                     ServerMsg::TextMeasured(t) if t.request == request => {
+                        // The cursor vector rides along: it is measured
+                        // at the same time, and a text field asking for
+                        // it later must not cost a second round trip.
+                        self.text_cache.cursors.insert(
+                            MeasureKey::new(text, style, max_width),
+                            t.cursor_x.iter().map(|c| (c.offset, c.x)).collect(),
+                        );
                         found = Some(TextMetrics {
                             width: t.width,
                             height: t.height,
@@ -493,6 +600,87 @@ impl Wire {
         Ok(())
     }
 
+    /// Emit a group slot — a `Group` node of this widget's own, with an
+    /// optional clip and transform — and return its node, so the widget
+    /// can paint further slots *inside* it.
+    ///
+    /// This is what a scrolling widget is built out of: the content hangs
+    /// under a clipping group whose transform is the scroll offset, so
+    /// scrolling is one `SetTransform` and nothing underneath repaints.
+    pub(crate) fn paint_group(
+        &mut self,
+        slots: &mut Vec<PaintSlot>,
+        at: SlotAt,
+        rect: Rect,
+        clip: bool,
+        transform: Transform,
+    ) -> Result<NodeId, Error> {
+        let index = at.index;
+        let fresh = self.ensure_slot(slots, at, NodeKind::Group)?;
+        let slot = &mut slots[index];
+        slot.used = true;
+        let node = slot.node;
+        let changed_bounds = fresh || slot.bounds != rect;
+        let changed_clip = fresh || slot.clip != clip;
+        let changed_transform = fresh || slot.transform != transform;
+        slot.bounds = rect;
+        slot.clip = clip;
+        slot.transform = transform;
+        if changed_bounds {
+            self.set_bounds(node, rect)?;
+        }
+        if changed_clip {
+            self.send(&ClientMsg::SetClip(SetClip { id: node, clip }), node)?;
+        }
+        if changed_transform {
+            self.set_transform(node, transform)?;
+        }
+        Ok(node)
+    }
+
+    pub(crate) fn set_clip(&mut self, id: NodeId, clip: bool) -> Result<(), Error> {
+        self.send(&ClientMsg::SetClip(SetClip { id, clip }), id)
+    }
+
+    pub(crate) fn set_transform(&mut self, id: NodeId, transform: Transform) -> Result<(), Error> {
+        self.send(&ClientMsg::SetTransform(SetTransform { id, transform }), id)
+    }
+
+    /// Put `pixels` in a memfd, hand the descriptor to the server and
+    /// return the buffer id.
+    ///
+    /// `pwrite` rather than `mmap`: mapping would need `unsafe`, which
+    /// this tree denies, and an image's pixels are written once.
+    pub(crate) fn create_buffer(
+        &mut self,
+        width: u32,
+        height: u32,
+        alpha: bool,
+        pixels: &[u8],
+    ) -> Result<BufferId, Error> {
+        let fd = memfd(pixels)?;
+        let id = BufferId(self.next_buffer);
+        self.next_buffer += 1;
+        let stride = width * 4;
+        self.send(
+            &ClientMsg::CreateBuffer(msg::CreateBuffer {
+                id,
+                width,
+                height,
+                stride,
+                format: if alpha {
+                    nitro_wire::types::format::AR24
+                } else {
+                    nitro_wire::types::format::XR24
+                },
+                size: pixels.len() as u32,
+                fd,
+            }),
+            NodeId::NONE,
+        )?;
+        Ok(id)
+    }
+
     /// Emit an image slot, sending only what changed.
     pub(crate) fn paint_image(
         &mut self,
@@ -542,17 +730,7 @@ impl Wire {
             index,
         } = at;
         while slots.len() <= index {
-            slots.push(PaintSlot {
-                node: NodeId::NONE,
-                kind,
-                bounds: Rect::EMPTY,
-                fill: Fill::None,
-                radius: 0.0,
-                border: (0.0, Color::TRANSPARENT),
-                text: None,
-                image: None,
-                used: false,
-            });
+            slots.push(PaintSlot::empty(kind));
         }
         // A slot that changed kind is a different node; drop the old one.
         if !slots[index].node.is_none() && slots[index].kind != kind {
@@ -573,14 +751,8 @@ impl Wire {
             )?;
             slots[index] = PaintSlot {
                 node,
-                kind,
-                bounds: Rect::EMPTY,
-                fill: Fill::None,
-                radius: 0.0,
-                border: (0.0, Color::TRANSPARENT),
-                text: None,
-                image: None,
                 used: true,
+                ..PaintSlot::empty(kind)
             };
             return Ok(true);
         }
@@ -618,6 +790,23 @@ impl Wire {
     }
 }
 
+/// Put `pixels` in a fresh memfd and hand back its descriptor.
+fn memfd(pixels: &[u8]) -> Result<std::os::fd::OwnedFd, Error> {
+    use rustix::io::Errno;
+    let fd = rustix::fs::memfd_create("nitro-ui-image", rustix::fs::MemfdFlags::CLOEXEC)?;
+    rustix::fs::ftruncate(&fd, pixels.len() as u64)?;
+    let mut done = 0usize;
+    while done < pixels.len() {
+        match rustix::io::pwrite(&fd, &pixels[done..], done as u64) {
+            Ok(0) => return Err(Errno::IO.into()),
+            Ok(n) => done += n,
+            Err(Errno::INTR) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(fd)
+}
+
 /// Rough metrics for a server with no fonts: enough for a layout that
 /// does not collapse to nothing.
 fn estimate(text: &str, style: &TextStyle) -> TextMetrics {
@@ -629,6 +818,20 @@ fn estimate(text: &str, style: &TextStyle) -> TextMetrics {
         descent: style.size_px * 0.2,
         line_count: 1,
     }
+}
+
+/// Rough cursor positions for a server with no fonts, from the same
+/// per-character estimate [`estimate`] uses.
+fn estimate_cursors(text: &str, style: &TextStyle) -> Vec<(u32, f32)> {
+    let advance = style.size_px * 0.55;
+    let mut out = Vec::with_capacity(text.chars().count() + 1);
+    let mut x = 0.0;
+    out.push((0u32, 0.0));
+    for (i, c) in text.char_indices() {
+        x += advance;
+        out.push(((i + c.len_utf8()) as u32, x));
+    }
+    out
 }
 
 /// Block until `fd` is ready for `events`.

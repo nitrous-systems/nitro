@@ -61,14 +61,24 @@ into numbered slots that diff against the last values sent, so a repaint
 producing the same values costs nothing.
 
 `introspect` is the fifth pass: `Ui::introspect` fills a `Vec<Node>` with
-id, role, name/value/actions and bounds. The socket that serves it is the
-next task.
+id, role, name/value/actions and bounds, walking the same arena every
+other pass walks. `crate::introspect` serves it over a per-app Unix
+socket — see below.
 
 ## Widgets
 
-`Flex` (`column()`, `row()`), `Panel`, `Label`, `Button`, `Spacer`. Each
-has a builder and a `WidgetMut` impl with setters. Colours, sizes, radius
-and padding come from a [`Theme`], overridable at `App` level.
+`Flex` (`column()`, `row()`), `Panel`, `Label`, `Button`, `TextField`,
+`Checkbox`, `Slider`, `Scroll`, `Separator`, `Image`, `Spacer`. Each has
+a builder, a `WidgetMut` impl with setters, and `role`/`accessible`/
+`action` so the introspection socket can read and drive it. Colours,
+sizes, radius and padding come from a [`Theme`], overridable at `App`
+level.
+
+Two cost claims worth knowing, both checked by the harness: a
+`TextField`'s size comes from its *font*, not its contents, so typing
+repaints one widget and lays out nothing; and `Scroll` scrolls by
+translating its content group, so scrolling is exactly one
+`SetTransform` with no relayout and no repaint.
 
 Layout is a flex subset — direction, main/cross alignment, gap, padding,
 margin, `Auto`/`Px`/`Percent` sizes with min/max clamps, grow and shrink.
@@ -79,6 +89,32 @@ sizes, unit-tested without a server.
 shape its string and waits, because the server owns the fonts. The result
 is cached by `(text, style, max_width)`, so a settled UI does no round
 trips. Reasoning and the async path in `docs/ui.md`.
+
+## Introspection
+
+Every app opens `$XDG_RUNTIME_DIR/nitro/apps/<name>.<pid>.sock` and
+answers a line protocol on it: `list`, `get`, `set`, `do`, `watch`,
+`shot`. Through it another process can read the widget tree, change it,
+invoke its actions and screenshot the window, with no cooperation from
+the app's own code.
+
+```text
+$ hey                                    # which apps are up
+$ hey dialog list                        # the tree, one line per widget
+$ hey dialog do window/ok click          # runs the real callback
+$ hey dialog get window/message value
+$ hey dialog shot -o window.png
+```
+
+Requests are served by the app's own `epoll` loop **between events**, so
+a scripted click runs the same callback with the same `&mut S` a real
+click would, and no request can see a half-laid-out tree. That is the
+BeOS property: IPC and the app share one message loop, so being
+scriptable costs neither a thread nor a lock.
+
+`App::introspect(false)` turns it off. The protocol, the path grammar and
+what it costs are in [`docs/introspection.md`](../../docs/introspection.md)
+and the *Measured* section of `docs/ui.md`.
 
 ## Testing
 
@@ -92,11 +128,21 @@ assert that a text change cost exactly one commit and one `SetText`.
 `WidgetMut` → one commit, `Configure` relayout, zero traffic while idle,
 stale/busy/wrong-type errors, Tab order, hover and press visuals, hit
 testing, scroll routing, the introspection tree, fd hooks and timers.
+`tests/widgets.rs` covers the M2 widget set — typing, selection,
+toggling, dragging, scrolling (asserting the one-`SetTransform` claim by
+counting mutations), and the window backdrop. `tests/introspect.rs`
+drives the socket end to end, and `nitro-hey`'s `tests/end_to_end.rs`
+does the same through the real `hey` binary as a child process.
 
 ## Example
 
 `examples/hello_dialog.rs` — title, message, Cancel/OK, `q` quits, in 31
-lines of app code. Release, stripped, against a fake server: **444 KB**
-binary, **2.4 MB** RSS, one thread, **zero context switches over 5 s
+lines of app code. Release, stripped, against a fake server: **522 KB**
+binary, **2.6 MB** RSS, one thread, **zero context switches over 5 s
 idle**, and `ldd` shows only libc. No font library, no rasterizer, no
 compositor: a label is a string on the wire.
+
+Of that binary, ~68 KB is the introspection protocol, which is
+monomorphised per app-state type; the de-monomorphisation that would
+share one copy across the program is argued under *Measured* in
+`docs/ui.md` and is M3.

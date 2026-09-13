@@ -53,6 +53,8 @@ pub struct Harness<S> {
     /// coordinates, so a test that says "click this widget" needs it.
     origin: Point,
     time_ns: u64,
+    /// The app's introspection socket, once a test has asked for one.
+    socket: Option<crate::introspect::Socket>,
 }
 
 impl<S: 'static> Harness<S> {
@@ -89,6 +91,21 @@ impl<S: 'static> Harness<S> {
         theme: Theme,
         build: impl FnOnce(&mut Ui<S>) -> WidgetId,
     ) -> Self {
+        Self::with_options(name, state, size, theme, true, build)
+    }
+
+    /// As [`Harness::with`], with the window backdrop under control too.
+    ///
+    /// # Panics
+    /// As [`Harness::new`].
+    pub fn with_options(
+        name: &str,
+        state: S,
+        size: Option<Size>,
+        theme: Theme,
+        backdrop: bool,
+        build: impl FnOnce(&mut Ui<S>) -> WidgetId,
+    ) -> Self {
         let server = TestServer::start(name, OUTPUT.0, OUTPUT.1);
         // Park the pointer in a corner: the server puts it in the middle
         // of the output, where it would contaminate every pixel
@@ -100,6 +117,9 @@ impl<S: 'static> Harness<S> {
         });
         let conn = Connection::connect(server.wire_path(), name).expect("wire connect");
         let mut app = App::with_connection(conn, name).theme(theme);
+        if !backdrop {
+            app = app.transparent();
+        }
         if let Some(s) = size {
             app = app.size(s);
         }
@@ -110,7 +130,13 @@ impl<S: 'static> Harness<S> {
             state,
             origin: Point::ZERO,
             time_ns: 2_000_000,
+            socket: None,
         };
+        // `shot` over the introspection socket screenshots *this*
+        // harness's server, not whatever `$NITRO_CONTROL` happens to
+        // name in the test runner's environment.
+        let control = h.server.control_path().to_path_buf();
+        h.ui.set_control_path(control);
         h.settle();
         // Keys only reach a focused window, and focus follows the click.
         // A harness runs one window and a test that sends a key means
@@ -161,6 +187,68 @@ impl<S: 'static> Harness<S> {
         self.ui.has_text()
     }
 
+    /// Open this app's introspection socket in a fresh directory and
+    /// return its path.
+    ///
+    /// The harness runs the `Ui` on the test thread, so the socket is
+    /// served by [`Harness::settle`] the way the app loop serves it:
+    /// between events, with the tree settled. A test therefore drives
+    /// `hey` (or a raw socket) from *another* thread and pumps here.
+    ///
+    /// # Panics
+    /// If the socket cannot be bound.
+    pub fn open_socket(&mut self, name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "nitro-hey-test-{}-{name}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join(format!("{name}.{}.sock", std::process::id()));
+        let socket = crate::introspect::Socket::bind_at(&path).expect("bind app socket");
+        self.socket = Some(socket);
+        path
+    }
+
+    /// The directory [`Harness::open_socket`] put the socket in, which is
+    /// what `hey` would be pointed at with `NITRO_APPS_DIR`.
+    #[must_use]
+    pub fn socket_dir(&self) -> Option<std::path::PathBuf> {
+        self.socket
+            .as_ref()
+            .and_then(|s| s.path().parent().map(std::path::Path::to_path_buf))
+    }
+
+    /// Accept and serve one round of introspection requests, exactly as
+    /// the app loop does.
+    pub fn serve_socket(&mut self) {
+        if let Some(s) = &mut self.socket {
+            s.accept();
+            s.serve(&mut self.ui, &mut self.state);
+        }
+    }
+
+    /// Pump the tree and the introspection socket until `f` is true or
+    /// ten seconds pass.
+    ///
+    /// A test that drives the socket from another thread needs this: the
+    /// request only runs when this thread serves it.
+    ///
+    /// # Panics
+    /// On timeout.
+    pub fn pump_socket_until(&mut self, what: &str, mut f: impl FnMut(&mut Self) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !f(self) {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            self.pump();
+            self.serve_socket();
+            let _ = self.ui.flush().expect("flush");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // One last round, so the reply the condition observed is written.
+        self.serve_socket();
+    }
+
     /// Drain the socket, dispatch events and flush the tree, until
     /// nothing more arrives and the server has gone quiet.
     ///
@@ -169,6 +257,7 @@ impl<S: 'static> Harness<S> {
     pub fn settle(&mut self) {
         for _ in 0..64 {
             self.pump();
+            self.serve_socket();
             let sent = self.ui.flush().expect("flush");
             if !sent && !self.drain_pending() {
                 break;
@@ -176,6 +265,7 @@ impl<S: 'static> Harness<S> {
         }
         self.server.settle();
         self.pump();
+        self.serve_socket();
         let _ = self.ui.flush().expect("flush");
         self.server.settle();
         self.locate_window();
@@ -278,6 +368,22 @@ impl<S: 'static> Harness<S> {
         self.settle();
     }
 
+    /// Scroll the wheel by `notches` where the pointer is; positive is
+    /// up, as the wire reports it.
+    ///
+    /// # Panics
+    /// On a wire failure.
+    pub fn wheel(&mut self, notches: f32) {
+        self.time_ns += 1_000_000;
+        self.server.push_input(InputEvent::PointerAxis {
+            dx: 0.0,
+            dy: notches,
+            source: nitro_wire::types::AxisSource::Wheel,
+            time_ns: self.time_ns,
+        });
+        self.settle();
+    }
+
     /// Press and release an evdev keycode.
     ///
     /// # Panics
@@ -352,6 +458,7 @@ impl<S: 'static> Harness<S> {
         let msg = nitro_wire::msg::ServerMsg::Configure(nitro_wire::msg::Configure {
             window: crate::ui::WINDOW,
             size,
+            position: nitro_core::Point::ZERO,
             scale: self.ui.scale(),
             output: 0,
         });

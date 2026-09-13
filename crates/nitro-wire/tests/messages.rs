@@ -240,6 +240,8 @@ fn server_messages() -> Vec<ServerMsg> {
         Configure {
             window: NodeId(1),
             size: Size::new(1920.0, 1080.0),
+            position: Point::new(64.0, 48.0),
+
             scale: 1.5,
             output: 2,
         }

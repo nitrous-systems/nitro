@@ -127,6 +127,11 @@ impl std::ops::BitOr for Dirty {
 /// read it for every widget on every pass, and a widget that forgot to
 /// expose one of these would simply not work.
 #[derive(Debug)]
+// Five flags, not a state machine: `focusable`, `hovered`, `focused`
+// and the two content-group bits are independent facts about a widget,
+// and folding any pair into an enum would invent a state that cannot
+// occur to describe two that can.
+#[allow(clippy::struct_excessive_bools)]
 pub struct WidgetState {
     /// Parent, or `None` for the root.
     pub parent: Option<WidgetId>,
@@ -154,6 +159,12 @@ pub struct WidgetState {
     /// Inner `Group` holding the children's groups, created on demand
     /// *after* this widget's own painted nodes so those stay underneath.
     pub(crate) content: Option<NodeId>,
+    /// The clip and transform last sent for the content group, so a
+    /// scroll that changes nothing costs nothing. The transform is what
+    /// makes scrolling one mutation: the children move without being
+    /// laid out or painted again.
+    pub(crate) content_clip: bool,
+    pub(crate) content_transform: nitro_core::Transform,
     /// Where this widget's group was last attached: `(parent, before)`.
     /// Compared before sending a `Reparent`, so a stable tree costs
     /// nothing.
@@ -178,6 +189,8 @@ impl Default for WidgetState {
             flags: Dirty::LAYOUT | Dirty::PAINT | Dirty::TREE,
             node: None,
             content: None,
+            content_clip: false,
+            content_transform: nitro_core::Transform::IDENTITY,
             attached: None,
             slots: Vec::new(),
         }

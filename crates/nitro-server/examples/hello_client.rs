@@ -404,10 +404,12 @@ fn describe(msg: &ServerMsg) -> String {
             m.serial, m.output, m.seq, m.time_ns
         ),
         ServerMsg::Configure(m) => format!(
-            "Configure window={} size={}x{} scale={} output={}",
+            "Configure window={} size={}x{} pos={},{} scale={} output={}",
             m.window.raw(),
             m.size.w,
             m.size.h,
+            m.position.x,
+            m.position.y,
             m.scale,
             m.output
         ),

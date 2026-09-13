@@ -330,6 +330,7 @@ fn a_client_window_is_configured_presented_and_painted_where_the_cascade_put_it(
         _ => None,
     });
     assert_eq!(configure.size, size);
+    assert_eq!(configure.position, Point::new(0.0, 0.0));
     assert!((configure.scale - 1.0).abs() < f32::EPSILON);
 
     // And reports the commit as presented once the frame lands.
@@ -483,10 +484,11 @@ fn a_click_focuses_and_raises_over_another_window() {
         Color::rgb(0xFF, 0, 0),
         1,
     );
-    expect(&mut first, &mut seen1, "Configure", |m| match m {
+    let c1 = expect(&mut first, &mut seen1, "Configure", |m| match m {
         ServerMsg::Configure(c) if c.window == w1.root => Some(*c),
         _ => None,
     });
+    assert_eq!(c1.position, Point::new(0.0, 0.0));
 
     let mut second = h_.client("second");
     let mut seen2 = Vec::new();
@@ -497,10 +499,12 @@ fn a_click_focuses_and_raises_over_another_window() {
         Color::rgb(0, 0xFF, 0),
         1,
     );
-    expect(&mut second, &mut seen2, "Configure", |m| match m {
+    let c2 = expect(&mut second, &mut seen2, "Configure", |m| match m {
         ServerMsg::Configure(c) if c.window == w2.root => Some(*c),
         _ => None,
     });
+    // The second window is one cascade step down and to the right.
+    assert_eq!(c2.position, Point::new(CASCADE_STEP, CASCADE_STEP));
 
     // The second window cascaded over the first; where they overlap, the
     // newest is on top.

@@ -60,6 +60,30 @@ pub mod key {
     pub const LEFT_SHIFT: u32 = 42;
     /// Right shift.
     pub const RIGHT_SHIFT: u32 = 54;
+    /// Left control.
+    pub const LEFT_CTRL: u32 = 29;
+    /// `Backspace`.
+    pub const BACKSPACE: u32 = 14;
+    /// `Delete`.
+    pub const DELETE: u32 = 111;
+    /// Left arrow.
+    pub const LEFT: u32 = 105;
+    /// Right arrow.
+    pub const RIGHT: u32 = 106;
+    /// Up arrow.
+    pub const UP: u32 = 103;
+    /// Down arrow.
+    pub const DOWN: u32 = 108;
+    /// `Home`.
+    pub const HOME: u32 = 102;
+    /// `End`.
+    pub const END: u32 = 107;
+    /// `Page Up`.
+    pub const PAGE_UP: u32 = 104;
+    /// `Page Down`.
+    pub const PAGE_DOWN: u32 = 109;
+    /// The letter `a`, for `Ctrl-A`.
+    pub const A: u32 = 30;
 }
 
 /// One input event.
@@ -135,6 +159,16 @@ impl KeyEvent {
     pub fn shift(&self) -> bool {
         self.mods & 1 != 0
     }
+
+    /// Whether a control modifier was held.
+    ///
+    /// Bit 2 is `Control` in the canonical xkb modifier list (`Shift`,
+    /// `Lock`, `Control`, `Mod1`…), the same reasoning as
+    /// [`KeyEvent::shift`].
+    #[must_use]
+    pub fn ctrl(&self) -> bool {
+        self.mods & 4 != 0
+    }
 }
 
 #[cfg(test)]
@@ -158,6 +192,21 @@ mod tests {
             text: String::new(),
         };
         assert!(k.shift());
-        assert!(!KeyEvent { mods: 4, ..k }.shift());
+        assert!(!k.ctrl());
+        assert!(
+            !KeyEvent {
+                mods: 4,
+                ..k.clone()
+            }
+            .shift()
+        );
+        assert!(
+            KeyEvent {
+                mods: 4,
+                ..k.clone()
+            }
+            .ctrl()
+        );
+        assert!(KeyEvent { mods: 5, ..k }.ctrl());
     }
 }

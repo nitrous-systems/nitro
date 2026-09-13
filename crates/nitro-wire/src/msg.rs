@@ -985,6 +985,12 @@ fixed_msg! {
         window: NodeId,
         /// Size in logical pixels.
         size: Size,
+        /// Top-left corner of the window in the output's logical coordinate
+        /// space. This is the position of the window's content origin, so a
+        /// client can crop a screenshot of the whole output down to just
+        /// itself using `position` and `size`.
+        position: Point,
+
         /// Output scale factor (1.0, 2.0, 1.5, …).
         scale: f32,
         /// Output the window is on.

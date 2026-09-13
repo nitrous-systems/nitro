@@ -36,6 +36,16 @@ pub enum Role {
     Button,
     /// An editable line of text.
     TextField,
+    /// A two-state box.
+    Checkbox,
+    /// A scrollable viewport.
+    Scroll,
+    /// A value picked from a range.
+    Slider,
+    /// A dividing line.
+    Separator,
+    /// A picture.
+    Image,
     /// Empty space.
     Spacer,
     /// Anything else.
@@ -51,9 +61,34 @@ impl Role {
             Role::Label => "label",
             Role::Button => "button",
             Role::TextField => "textfield",
+            Role::Checkbox => "checkbox",
+            Role::Scroll => "scroll",
+            Role::Slider => "slider",
+            Role::Separator => "separator",
+            Role::Image => "image",
             Role::Spacer => "spacer",
             Role::Other => "other",
         }
+    }
+
+    /// The role named by `name`, for a protocol path segment.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        [
+            Role::Container,
+            Role::Label,
+            Role::Button,
+            Role::TextField,
+            Role::Checkbox,
+            Role::Scroll,
+            Role::Slider,
+            Role::Separator,
+            Role::Image,
+            Role::Spacer,
+            Role::Other,
+        ]
+        .into_iter()
+        .find(|r| r.name() == name)
     }
 }
 
@@ -116,6 +151,33 @@ pub trait Widget<S: 'static>: 'static {
     /// What this widget is.
     fn role(&self) -> Role {
         Role::Other
+    }
+
+    /// Whether the widget reacts to input at all.
+    ///
+    /// Part of the introspection surface rather than a convention,
+    /// because "is this button greyed out?" is a question an
+    /// accessibility client and a test both have to be able to ask of a
+    /// widget whose concrete type they do not know.
+    fn enabled(&self) -> bool {
+        true
+    }
+
+    /// Invoke a named action — `click`, `toggle`, `set_value`, … — and
+    /// answer [`Handled::Yes`] if this widget knows it.
+    ///
+    /// This is the introspection socket's `do`, and it is on the trait
+    /// next to `event` on purpose: it runs through the same take-out
+    /// dispatch, so `cx.state` and `cx.ui` are the real ones and a
+    /// scripted `click` fires exactly the callback a real click fires,
+    /// with exactly the same invalidation. A widget that answers
+    /// [`Handled::No`] reports `err unknown action`; it never panics.
+    ///
+    /// The names a widget answers to should be the ones it lists in
+    /// [`Widget::accessible`]'s `actions`.
+    fn action(&mut self, cx: &mut EventCx<'_, S>, action: &str, arg: Option<&str>) -> Handled {
+        let _ = (cx, action, arg);
+        Handled::No
     }
 
     /// The accessibility record. The default derives it from the role.
@@ -192,6 +254,19 @@ impl<S: 'static> MeasureCx<'_, S> {
         max_width: f32,
     ) -> Result<TextMetrics, Error> {
         self.ui.measure_text(text, style, max_width)
+    }
+
+    /// Where every cursor position inside `text` sits, as the server
+    /// shaped it. See [`Ui::cursor_positions`](crate::Ui::cursor_positions).
+    ///
+    /// # Errors
+    /// If the connection failed.
+    pub fn cursor_positions(
+        &mut self,
+        text: &str,
+        style: &TextStyle,
+    ) -> Result<Vec<(u32, f32)>, Error> {
+        self.ui.cursor_positions(text, style)
     }
 }
 
@@ -362,6 +437,103 @@ impl<S: 'static> PaintCx<'_, S> {
         self.note(r);
     }
 
+    /// Draw a **group** in `slot`: a node of this widget's own that can
+    /// clip and translate what is painted inside it, and whose node id
+    /// is returned so later slots can be parented to it.
+    ///
+    /// This is how a scrolling or clipping widget is built: put the
+    /// content in a clipping group and scroll it by moving the group's
+    /// transform, and the content underneath never repaints. A group
+    /// slot's transform can be changed on its own with
+    /// [`WidgetMut::set_slot_transform`](crate::WidgetMut::set_slot_transform),
+    /// which is one `SetTransform` and nothing else.
+    ///
+    /// Returns [`NodeId::NONE`] if the slot could not be created; the
+    /// error is reported by the pass.
+    pub fn group(
+        &mut self,
+        slot: u8,
+        rect: Rect,
+        clip: bool,
+        transform: nitro_core::Transform,
+    ) -> NodeId {
+        let at = self.slot_at(slot);
+        match self
+            .ui
+            .wire_mut()
+            .paint_group(&mut self.slots, at, rect, clip, transform)
+        {
+            Ok(n) => n,
+            Err(e) => {
+                self.note(Err(e));
+                NodeId::NONE
+            }
+        }
+    }
+
+    /// Draw a rect in `slot`, parented to a group slot's node rather
+    /// than to the widget's own group.
+    pub fn rect_in(
+        &mut self,
+        parent: NodeId,
+        slot: u8,
+        rect: Rect,
+        fill: Fill,
+        radius: f32,
+        border: (f32, Color),
+    ) {
+        let at = crate::wire::SlotAt {
+            parent,
+            before: NodeId::NONE,
+            index: slot as usize,
+        };
+        let r = self
+            .ui
+            .wire_mut()
+            .paint_rect(&mut self.slots, at, rect, fill, radius, border);
+        self.note(r);
+    }
+
+    /// Draw text in `slot`, parented to a group slot's node.
+    pub fn text_in(&mut self, parent: NodeId, slot: u8, rect: Rect, text: &str, run: TextRun<'_>) {
+        let at = crate::wire::SlotAt {
+            parent,
+            before: NodeId::NONE,
+            index: slot as usize,
+        };
+        let r = self
+            .ui
+            .wire_mut()
+            .paint_text(&mut self.slots, at, rect, text, run);
+        self.note(r);
+    }
+
+    /// Register `pixels` with the server as a buffer and return its id.
+    ///
+    /// The pixels go into a memfd and the descriptor is passed over the
+    /// wire, so the server maps them rather than copying: an image costs
+    /// one page-table entry per side, not two copies of the picture.
+    /// `None` if the memfd or the send failed.
+    pub fn upload_image(
+        &mut self,
+        width: u32,
+        height: u32,
+        alpha: bool,
+        pixels: &[u8],
+    ) -> Option<BufferId> {
+        match self
+            .ui
+            .wire_mut()
+            .create_buffer(width, height, alpha, pixels)
+        {
+            Ok(id) => Some(id),
+            Err(e) => {
+                self.note(Err(e));
+                None
+            }
+        }
+    }
+
     /// Where slot `slot`'s node goes: under this widget's group, in
     /// front of its content group so children paint on top.
     fn slot_at(&self, slot: u8) -> crate::wire::SlotAt {
@@ -416,6 +588,18 @@ impl<S: 'static> EventCx<'_, S> {
         self.ui.is_focused(self.id)
     }
 
+    /// Announce that this widget did the thing it exists to do — a
+    /// button was clicked, a menu item chosen.
+    ///
+    /// A value change is visible to a watcher by diffing the
+    /// introspection tree; an activation is not, because a button that
+    /// ran its callback looks exactly like one that did not. This is how
+    /// it becomes a `click` event on the introspection socket, and it
+    /// costs nothing when nothing is watching.
+    pub fn report_activation(&mut self) {
+        self.ui.report_activation(self.id);
+    }
+
     /// Whether the pointer is over this widget.
     #[must_use]
     pub fn is_hovered(&self) -> bool {
@@ -460,6 +644,23 @@ mod tests {
         assert_eq!(Role::TextField.name(), "textfield");
         assert_eq!(Role::Spacer.name(), "spacer");
         assert_eq!(Role::Other.name(), "other");
+        assert_eq!(Role::from_name("slider"), Some(Role::Slider));
+        assert_eq!(Role::from_name("nope"), None);
+        for r in [
+            Role::Container,
+            Role::Label,
+            Role::Button,
+            Role::TextField,
+            Role::Checkbox,
+            Role::Scroll,
+            Role::Slider,
+            Role::Separator,
+            Role::Image,
+            Role::Spacer,
+            Role::Other,
+        ] {
+            assert_eq!(Role::from_name(r.name()), Some(r), "{r:?}");
+        }
     }
 
     #[test]

@@ -175,6 +175,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nitro-hey"
+version = "0.0.1"
+dependencies = [
+ "nitro-core",
+ "nitro-ui",
+ "rustix",
+]
+
+[[package]]
 name = "nitro-kms"
 version = "0.0.1"
 dependencies = [

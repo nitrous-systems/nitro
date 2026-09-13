@@ -34,6 +34,18 @@ pub struct Theme {
     pub border: Color,
     /// Focus ring.
     pub focus: Color,
+    /// Background of an editable field.
+    pub field: Color,
+    /// Text selection highlight.
+    pub selection: Color,
+    /// The caret in a text field.
+    pub caret: Color,
+    /// Placeholder text in an empty field.
+    pub placeholder: Color,
+    /// Filled part of a slider track, and a checked checkbox.
+    pub accent: Color,
+    /// Unfilled part of a slider track, and a separator line.
+    pub track: Color,
     /// Default font family: a name, or one of `sans`, `serif`, `mono`.
     pub font_family: String,
     /// Default font size in logical pixels.
@@ -48,6 +60,14 @@ pub struct Theme {
     pub panel_padding: f32,
     /// Default gap between the children of a flex container.
     pub gap: f32,
+    /// Edge length of a checkbox's box.
+    pub checkbox_size: f32,
+    /// Height of a slider's track.
+    pub slider_track: f32,
+    /// Diameter of a slider's knob.
+    pub slider_knob: f32,
+    /// Thickness of a separator line.
+    pub separator_width: f32,
 }
 
 impl Default for Theme {
@@ -66,6 +86,12 @@ impl Default for Theme {
             button_text: Color::rgb(0x12, 0x12, 0x16),
             border: Color::rgb(0xc2, 0xc2, 0xc8),
             focus: Color::rgb(0x33, 0x88, 0xff),
+            field: Color::rgb(0xff, 0xff, 0xff),
+            selection: Color::rgb(0xb3, 0xd4, 0xff),
+            caret: Color::rgb(0x1a, 0x1a, 0x1a),
+            placeholder: Color::rgb(0x9a, 0x9a, 0x9a),
+            accent: Color::rgb(0x33, 0x88, 0xff),
+            track: Color::rgb(0xd4, 0xd4, 0xda),
             font_family: "sans".to_owned(),
             font_size: 14.0,
             radius: 4.0,
@@ -73,6 +99,10 @@ impl Default for Theme {
             button_padding: (14.0, 7.0),
             panel_padding: 8.0,
             gap: 8.0,
+            checkbox_size: 16.0,
+            slider_track: 4.0,
+            slider_knob: 14.0,
+            separator_width: 1.0,
         }
     }
 }
@@ -127,6 +157,12 @@ mod tests {
         let t = Theme::default();
         assert!(t.font_size > 0.0);
         assert_ne!(t.text, t.background);
+        // Every widget's own colours have to be distinguishable from the
+        // surface they sit on, or the widget is invisible.
+        assert_ne!(t.field, t.border);
+        assert_ne!(t.accent, t.track);
+        assert_ne!(t.caret, t.field);
+        assert!(t.checkbox_size > 0.0 && t.slider_knob > t.slider_track);
         assert_eq!(
             TextStyle::from_theme(&t).size_px.to_bits(),
             t.font_size.to_bits()

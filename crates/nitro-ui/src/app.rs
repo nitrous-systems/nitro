@@ -36,6 +36,9 @@ pub struct App {
     title: String,
     theme: Theme,
     size: Option<Size>,
+    backdrop: bool,
+    introspect: bool,
+    name: String,
 }
 
 impl App {
@@ -51,6 +54,9 @@ impl App {
             title: name.to_owned(),
             theme: Theme::default(),
             size: None,
+            backdrop: true,
+            introspect: true,
+            name: name.to_owned(),
         })
     }
 
@@ -62,7 +68,35 @@ impl App {
             title: title.to_owned(),
             theme: Theme::default(),
             size: None,
+            backdrop: true,
+            introspect: true,
+            name: title.to_owned(),
         }
+    }
+
+    /// Do not paint the theme's background behind the tree.
+    ///
+    /// By default the window root paints one, because the root widget
+    /// paints nothing of its own and a transparent window puts the
+    /// theme's dark text straight onto the desktop. An app that wants
+    /// the desktop to show through — a HUD, a shaped window — asks for
+    /// it here.
+    #[must_use]
+    pub fn transparent(mut self) -> Self {
+        self.backdrop = false;
+        self
+    }
+
+    /// Turn the introspection socket on or off (default: on).
+    ///
+    /// See `docs/introspection.md`: the socket is what makes an app
+    /// scriptable from outside, and it is on by default because an app
+    /// that has to opt in is an app nothing can drive. Turning it off
+    /// costs the app its `hey` interface and, later, its accessibility.
+    #[must_use]
+    pub fn introspect(mut self, on: bool) -> Self {
+        self.introspect = on;
+        self
     }
 
     /// Set the window title (default: the app's name).
@@ -102,8 +136,12 @@ impl App {
             title,
             theme,
             size,
+            backdrop,
+            introspect: _,
+            name: _,
         } = self;
         let mut ui = Ui::new(conn, theme);
+        ui.set_backdrop(backdrop);
         let root = build(&mut ui);
         ui.set_root(root)?;
         ui.open_window(&title, size)?;
@@ -121,20 +159,50 @@ impl App {
         mut state: S,
         build: impl FnOnce(&mut Ui<S>) -> WidgetId,
     ) -> Result<(), Error> {
+        let (want_socket, name) = (self.introspect, self.name.clone());
         let mut ui = self.build(build)?;
-        event_loop(&mut ui, &mut state)
+        // The socket is best-effort: an app whose runtime directory is
+        // unwritable is still an app, and refusing to start because
+        // nothing can script it would be the wrong trade.
+        let socket = if want_socket {
+            crate::introspect::Socket::bind(&name).ok()
+        } else {
+            None
+        };
+        event_loop_with(&mut ui, &mut state, socket)
     }
 }
 
 /// Token for the connection fd in the epoll set. App fds use their own
 /// raw number, which cannot collide: fd 0 is stdin and never registered.
 const CONN_TOKEN: u64 = u64::MAX;
+/// Token for the introspection listener.
+const INTROSPECT_TOKEN: u64 = u64::MAX - 1;
 
 /// Run `ui` until it quits.
 ///
 /// # Errors
 /// Any wire or `epoll` failure.
 pub fn event_loop<S: 'static>(ui: &mut Ui<S>, state: &mut S) -> Result<(), Error> {
+    event_loop_with(ui, state, None)
+}
+
+/// Run `ui` until it quits, serving `socket` alongside it.
+///
+/// The introspection listener and its clients live in the **same**
+/// `epoll` set as the connection, and a request is executed between
+/// events by this loop — never concurrently with the app's own code.
+/// That is the `BeOS` property the design asks for: IPC and the app share
+/// one message loop, so being scriptable costs neither a thread nor a
+/// lock.
+///
+/// # Errors
+/// Any wire or `epoll` failure.
+pub fn event_loop_with<S: 'static>(
+    ui: &mut Ui<S>,
+    state: &mut S,
+    socket: Option<crate::introspect::Socket>,
+) -> Result<(), Error> {
     let epfd = epoll::create(epoll::CreateFlags::CLOEXEC)?;
     epoll::add(
         &epfd,
@@ -142,6 +210,15 @@ pub fn event_loop<S: 'static>(ui: &mut Ui<S>, state: &mut S) -> Result<(), Error
         EventData::new_u64(CONN_TOKEN),
         EventFlags::IN,
     )?;
+    let mut socket = socket;
+    if let Some(s) = &socket {
+        epoll::add(
+            &epfd,
+            s.as_fd(),
+            EventData::new_u64(INTROSPECT_TOKEN),
+            EventFlags::IN,
+        )?;
+    }
     let mut registered: Vec<RawFd> = Vec::new();
     // `epoll::Event` has no `Default`, so the buffer is built by hand.
     let mut events = [epoll::Event {
@@ -150,7 +227,17 @@ pub fn event_loop<S: 'static>(ui: &mut Ui<S>, state: &mut S) -> Result<(), Error
     }; 16];
     while !ui.should_quit() {
         sync_fds(&epfd, ui, &mut registered)?;
-        let timeout = ui.next_timeout().map(|ms| rustix::time::Timespec {
+        // A connected introspection client is polled by the same loop,
+        // so its readability has to be part of the wait. Registering
+        // each client stream in the epoll set would mean tracking tokens
+        // for sockets that come and go every second; the client count is
+        // tiny and bounded, so they are polled with a short timeout
+        // instead, and only while at least one is connected.
+        let mut timeout = ui.next_timeout();
+        if socket.as_ref().is_some_and(crate::introspect::Socket::busy) {
+            timeout = Some(timeout.unwrap_or(10).min(10));
+        }
+        let timeout = timeout.map(|ms| rustix::time::Timespec {
             tv_sec: (ms / 1000).cast_signed(),
             tv_nsec: ((ms % 1000) * 1_000_000).cast_signed(),
         });
@@ -163,11 +250,18 @@ pub fn event_loop<S: 'static>(ui: &mut Ui<S>, state: &mut S) -> Result<(), Error
             let token = e.data.u64();
             if token == CONN_TOKEN {
                 ui.pump(state)?;
+            } else if token == INTROSPECT_TOKEN {
+                if let Some(s) = &mut socket {
+                    s.accept();
+                }
             } else {
                 ui.run_fd(state, crate::ui::FdToken::from_raw(token as RawFd));
             }
         }
         ui.run_timers(state);
+        if let Some(s) = &mut socket {
+            s.serve(ui, state);
+        }
         ui.flush()?;
     }
     Ok(())

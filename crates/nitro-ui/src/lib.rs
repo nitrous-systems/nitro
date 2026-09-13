@@ -66,11 +66,13 @@
 //! | module | what is in it |
 //! |--------|---------------|
 //! | [`widget`] | the [`Widget`] trait and the pass contexts |
-//! | [`widgets`] | `Flex`, `Panel`, `Label`, `Button`, `Spacer` |
+//! | [`widgets`] | `Flex`, `Panel`, `Label`, `Button`, `TextField`, `Checkbox`, `Scroll`, `Slider`, `Separator`, `Image`, `Spacer` |
 //! | [`build`] | the builder traits |
 //! | [`layout`] | the flex model, as pure functions |
 //! | [`event`] | [`Event`], [`Handled`] and the key/button codes |
 //! | [`theme`] | [`Theme`] and [`TextStyle`] |
+//! | [`introspect`] | the per-app socket: `list`/`get`/`set`/`do`/`watch`/`shot` |
+//! | [`shot`] | screenshot one window, by cropping the server's |
 //! | [`test`] | the in-process harness (feature `test-support`) |
 
 pub mod app;
@@ -78,7 +80,9 @@ pub mod arena;
 pub mod build;
 pub mod error;
 pub mod event;
+pub mod introspect;
 pub mod layout;
+pub mod shot;
 pub mod theme;
 pub mod ui;
 pub mod widget;

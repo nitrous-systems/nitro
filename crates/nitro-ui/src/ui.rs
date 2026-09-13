@@ -104,7 +104,24 @@ pub struct Ui<S> {
     wire: Wire,
     window_open: bool,
     window_size: Size,
+    /// Where the server put the window on its output, from the last
+    /// `Configure`. The introspection socket's `shot` needs it to crop
+    /// an output screenshot down to this window.
+    window_position: Point,
     scale: f32,
+    /// The window's background: a `Rect` node under everything, filled
+    /// with the theme's `background`. `None` for a transparent window
+    /// ([`App::transparent`](crate::App::transparent)).
+    ///
+    /// The root widget paints nothing by default, so without this a
+    /// dialog's dark text lands on whatever the desktop is showing.
+    backdrop: Option<NodeId>,
+    backdrop_wanted: bool,
+    /// The colour and size the backdrop was last sent, so a resize or a
+    /// theme change costs one mutation and an idle tree costs none.
+    backdrop_sent: Option<(Size, nitro_core::Color)>,
+    /// Override for the server control socket `shot` talks to.
+    control_path: Option<std::path::PathBuf>,
     focused: Option<WidgetId>,
     /// Focus changes waiting to be reported, oldest first.
     ///
@@ -114,6 +131,14 @@ pub struct Ui<S> {
     /// [`Ui::deliver_focus_events`] once the batch is done.
     pending_focus: Vec<(WidgetId, bool)>,
     hover_chain: Vec<WidgetId>,
+    /// Widgets activated since the last drain, oldest first.
+    ///
+    /// A value change is visible by diffing the introspection tree, but
+    /// an *activation* leaves no trace in it: a button that runs a
+    /// callback looks exactly like a button that did not. Widgets whose
+    /// whole purpose is to be activated therefore say so, and
+    /// [`Ui::take_activations`] is where a watcher collects them.
+    activations: Vec<WidgetId>,
     quit: bool,
     // Scratch pools. Layout recurses, so one vector is not enough; these
     // are stacks of reusable ones, which is what keeps a flush free of
@@ -159,10 +184,16 @@ impl<S: 'static> Ui<S> {
             wire: Wire::new(conn),
             window_open: false,
             window_size: Size::ZERO,
+            window_position: Point::ZERO,
             scale: 1.0,
+            backdrop: None,
+            backdrop_wanted: true,
+            backdrop_sent: None,
+            control_path: None,
             focused: None,
             pending_focus: Vec::new(),
             hover_chain: Vec::new(),
+            activations: Vec::new(),
             quit: false,
             id_pool: Vec::new(),
             item_pool: Vec::new(),
@@ -340,6 +371,8 @@ impl<S: 'static> Ui<S> {
     /// Replace the theme and repaint everything.
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
+        // The backdrop is not a widget, so no widget's repaint covers it.
+        self.backdrop_sent = None;
         let ids: Vec<WidgetId> = self.all_ids();
         for id in ids {
             self.mark(id, Dirty::LAYOUT | Dirty::PAINT);
@@ -402,6 +435,52 @@ impl<S: 'static> Ui<S> {
     #[must_use]
     pub fn scale(&self) -> f32 {
         self.scale
+    }
+
+    /// Where the server placed this window on its output, in logical
+    /// pixels, from the last `Configure`.
+    ///
+    /// The introspection socket's `shot` needs it: the server screenshots
+    /// a whole output, and this is what crops it to one window.
+    #[must_use]
+    pub fn window_position(&self) -> Point {
+        self.window_position
+    }
+
+    /// Where this window's introspection `shot` asks for pixels.
+    ///
+    /// Normally the server's control socket as the environment names it;
+    /// the test harness overrides it, because its server is one of
+    /// several in the same process tree and `$NITRO_CONTROL` is
+    /// process-wide state a test must not fight over.
+    #[must_use]
+    pub fn control_path(&self) -> std::path::PathBuf {
+        self.control_path
+            .clone()
+            .unwrap_or_else(crate::shot::control_path)
+    }
+
+    /// Point `shot` at a specific control socket.
+    pub fn set_control_path(&mut self, path: impl Into<std::path::PathBuf>) {
+        self.control_path = Some(path.into());
+    }
+
+    /// Whether the window paints the theme's background behind the tree.
+    #[must_use]
+    pub fn has_backdrop(&self) -> bool {
+        self.backdrop_wanted
+    }
+
+    /// Paint (or stop painting) the theme's `background` colour behind
+    /// the whole tree.
+    ///
+    /// On by default: the root widget paints nothing of its own, so a
+    /// transparent window puts the theme's dark text straight onto the
+    /// desktop, where it is barely readable. An app that wants the
+    /// desktop to show through turns it off — see
+    /// [`App::transparent`](crate::App::transparent).
+    pub fn set_backdrop(&mut self, on: bool) {
+        self.backdrop_wanted = on;
     }
 
     /// Whether [`Ui::quit`] has been called.
@@ -506,6 +585,44 @@ impl<S: 'static> Ui<S> {
         })
     }
 
+    /// Where every cursor position inside `text` sits, in logical pixels
+    /// from its left edge: `(byte offset, x)` in increasing order.
+    ///
+    /// A text field has to place a caret and it cannot compute this
+    /// itself — the client has no fonts. It rides the same round trip
+    /// and the same cache as [`Ui::measure_text`].
+    ///
+    /// # Errors
+    /// If the connection failed.
+    pub fn cursor_positions(
+        &mut self,
+        text: &str,
+        style: &TextStyle,
+    ) -> Result<Vec<(u32, f32)>, Error> {
+        self.wire.cursor_positions(text, style)
+    }
+
+    /// Take the widgets activated since the last call.
+    ///
+    /// Recorded by [`EventCx::report_activation`](crate::EventCx::report_activation),
+    /// which a widget calls when it does the thing it exists to do. The
+    /// introspection socket's `watch` drains this to emit `click`
+    /// events; an app with no watcher drains it too, so the list cannot
+    /// grow without bound.
+    pub fn take_activations(&mut self, out: &mut Vec<WidgetId>) {
+        out.clear();
+        out.append(&mut self.activations);
+    }
+
+    /// Record that `id` was activated. See [`Ui::take_activations`].
+    pub(crate) fn report_activation(&mut self, id: WidgetId) {
+        // Bounded: a burst of clicks between two drains is a handful of
+        // ids, and a drain happens every loop turn.
+        if self.activations.len() < 64 {
+            self.activations.push(id);
+        }
+    }
+
     /// The widget's role, for introspection.
     ///
     /// # Errors
@@ -513,6 +630,89 @@ impl<S: 'static> Ui<S> {
     pub fn role(&self, id: WidgetId) -> Result<crate::widget::Role, Error> {
         let slot = self.arena.slot(id).ok_or(Error::StaleWidget)?;
         Ok(slot.widget.as_ref().ok_or(Error::Busy)?.role())
+    }
+
+    /// The widget's **addressing** name: the one `.name("ok")` set, and
+    /// only that.
+    ///
+    /// Deliberately not the accessible name. A label's accessible name
+    /// is its text — a sentence — and a path built out of it would move
+    /// every time the text did. The two are separate fields so
+    /// `window/message` stays `window/message`.
+    #[must_use]
+    pub fn address_name(&self, id: WidgetId) -> Option<String> {
+        self.arena.slot(id).and_then(|s| s.state.name.clone())
+    }
+
+    /// The widget's accessible name: what it calls itself, falling back
+    /// to its addressing name.
+    #[must_use]
+    pub fn name(&self, id: WidgetId) -> Option<String> {
+        let slot = self.arena.slot(id)?;
+        if let Some(n) = slot.widget.as_ref()?.accessible().name {
+            return Some(n);
+        }
+        slot.state.name.clone()
+    }
+
+    /// Whether the widget reacts to input; see
+    /// [`Widget::enabled`](crate::Widget::enabled).
+    #[must_use]
+    pub fn is_enabled(&self, id: WidgetId) -> bool {
+        self.arena
+            .slot(id)
+            .and_then(|s| s.widget.as_ref())
+            .is_some_and(|w| w.enabled())
+    }
+
+    /// Invoke a named action on a widget, as the introspection socket's
+    /// `do` does.
+    ///
+    /// It goes through the same take-out dispatch a real event does, so
+    /// the widget's callbacks run with the app's own `&mut S` and the
+    /// whole tree, and the invalidation is identical.
+    ///
+    /// # Errors
+    /// [`Error::StaleWidget`] for a dead id, [`Error::Busy`] if the
+    /// widget is already out of its slot.
+    pub fn action(
+        &mut self,
+        state: &mut S,
+        id: WidgetId,
+        action: &str,
+        arg: Option<&str>,
+    ) -> Result<Handled, Error> {
+        // Framework-level actions first: they work on any widget, and a
+        // widget cannot implement them (focus lives in the tree).
+        match action {
+            "focus" => {
+                self.focus(id);
+                self.deliver_focus_events(state);
+                return Ok(Handled::Yes);
+            }
+            "set_name" => {
+                if let Some(slot) = self.arena.slot_mut(id) {
+                    slot.state.name = arg.map(str::to_owned);
+                    return Ok(Handled::Yes);
+                }
+                return Err(Error::StaleWidget);
+            }
+            _ => {}
+        }
+        let bounds = self.arena.slot(id).ok_or(Error::StaleWidget)?.state.bounds;
+        let mut widget = self.take(id)?;
+        let handled = {
+            let mut cx = EventCx {
+                ui: self,
+                state,
+                id,
+                bounds,
+            };
+            widget.action(&mut cx, action, arg)
+        };
+        self.untake(id, widget);
+        self.deliver_focus_events(state);
+        Ok(handled)
     }
 
     /// The widget's accessibility record.
@@ -559,11 +759,13 @@ impl<S: 'static> Ui<S> {
     /// Walk the whole tree in paint order, appending one [`Node`] per
     /// widget.
     ///
-    /// This is the `introspect` pass. M2 stops here: the socket that
-    /// serves it, and the `hey`-style CLI that drives it, are the next
-    /// task, and this is the shape they read. A widget that is out of
-    /// its slot (one running a callback that asked to introspect) is
-    /// skipped rather than failing the walk.
+    /// This is the `introspect` pass, and it is what the introspection
+    /// socket serves (`crate::introspect`, `docs/introspection.md`) and
+    /// what an AT-SPI bridge will read. It is a plain walk over the same
+    /// arena every other pass uses, because the point of goal 5 is that
+    /// there is *one* tree, not a shadow one maintained alongside it. A
+    /// widget that is out of its slot (one running a callback that asked
+    /// to introspect) is skipped rather than failing the walk.
     pub fn introspect(&self, out: &mut Vec<Node>) {
         out.clear();
         if let Some(root) = self.root {
@@ -610,6 +812,56 @@ impl<S: 'static> Ui<S> {
             }
             cur = slot.state.parent;
         }
+    }
+
+    /// Clip a widget's children to its own bounds.
+    ///
+    /// The clip is set on the widget's **content group**, the node its
+    /// children's groups hang under, so it costs one `SetClip` and
+    /// nothing repaints. A widget with no children yet remembers the
+    /// request and applies it when the group appears.
+    pub fn set_content_clip(&mut self, id: WidgetId, clip: bool) {
+        let Some(slot) = self.arena.slot_mut(id) else {
+            return;
+        };
+        if slot.state.content_clip == clip {
+            return;
+        }
+        slot.state.content_clip = clip;
+        if let Some(node) = slot.state.content {
+            let _ = self.wire.set_clip(node, clip);
+        }
+    }
+
+    /// Translate (or otherwise transform) a widget's children without
+    /// laying them out or painting them again.
+    ///
+    /// This is the mechanism behind [`Scroll`](crate::widgets::Scroll)
+    /// and the reason scrolling is cheap: the children hang under one
+    /// content group, and moving that group is exactly one
+    /// `SetTransform` on the wire. Nothing inside is re-measured,
+    /// re-placed or repainted.
+    pub fn set_content_transform(&mut self, id: WidgetId, transform: nitro_core::Transform) {
+        let Some(slot) = self.arena.slot_mut(id) else {
+            return;
+        };
+        if slot.state.content_transform == transform {
+            return;
+        }
+        slot.state.content_transform = transform;
+        if let Some(node) = slot.state.content {
+            let _ = self.wire.set_transform(node, transform);
+        }
+    }
+
+    /// The transform currently applied to a widget's children.
+    #[must_use]
+    pub fn content_transform(&self, id: WidgetId) -> nitro_core::Transform {
+        self.arena
+            .slot(id)
+            .map_or(nitro_core::Transform::IDENTITY, |s| {
+                s.state.content_transform
+            })
     }
 
     /// A widget's style, as the layout pass reads it.
@@ -694,7 +946,48 @@ impl<S: 'static> Ui<S> {
         self.pass_tree(root)?;
         self.pass_layout(root)?;
         self.pass_paint(root)?;
+        self.pass_backdrop()?;
         self.wire.commit()
+    }
+
+    /// The window background: one `Rect` node, created before anything
+    /// else under the window root so it is behind the whole tree, and
+    /// re-sent only when the size or the theme colour changed.
+    fn pass_backdrop(&mut self) -> Result<(), Error> {
+        if !self.backdrop_wanted {
+            if let Some(node) = self.backdrop.take() {
+                self.backdrop_sent = None;
+                self.wire.destroy_node(node)?;
+            }
+            return Ok(());
+        }
+        let color = self.theme.background;
+        let size = self.window_size;
+        if self.backdrop_sent == Some((size, color)) {
+            return Ok(());
+        }
+        let rect = Rect::new(0.0, 0.0, size.w, size.h);
+        let node = if let Some(n) = self.backdrop {
+            n
+        } else {
+            {
+                let n = self.wire.alloc_node();
+                // `before` is the root widget's group, which the TREE
+                // pass created first: the backdrop goes in front of it in
+                // sibling order, which is *behind* it on screen.
+                let before = self
+                    .root
+                    .and_then(|r| self.arena.slot(r))
+                    .and_then(|s| s.state.node)
+                    .unwrap_or(NodeId::NONE);
+                self.wire.create_rect(n, WINDOW, before)?;
+                self.backdrop = Some(n);
+                n
+            }
+        };
+        self.wire.set_backdrop(node, rect, color)?;
+        self.backdrop_sent = Some((size, color));
+        Ok(())
     }
 
     /// TREE: create, reparent and destroy the scene groups of
@@ -758,6 +1051,21 @@ impl<S: 'static> Ui<S> {
             self.wire.create_group(node, parent, NodeId::NONE)?;
             if let Some(slot) = self.arena.slot_mut(id) {
                 slot.state.content = Some(node);
+            }
+            // A clip or transform asked for before the group existed is
+            // applied now, so the order of `set_content_clip` and the
+            // first child does not matter.
+            let (clip, transform) = self
+                .arena
+                .slot(id)
+                .map_or((false, nitro_core::Transform::IDENTITY), |s| {
+                    (s.state.content_clip, s.state.content_transform)
+                });
+            if clip {
+                self.wire.set_clip(node, true)?;
+            }
+            if transform != nitro_core::Transform::IDENTITY {
+                self.wire.set_transform(node, transform)?;
             }
             node
         };
@@ -1016,6 +1324,7 @@ impl<S: 'static> Ui<S> {
         match msg {
             ServerMsg::Configure(c) => {
                 self.scale = c.scale;
+                self.window_position = c.position;
                 self.resize(c.size);
             }
             ServerMsg::Closed(_) => self.quit = true,
@@ -1066,12 +1375,19 @@ impl<S: 'static> Ui<S> {
                 break;
             }
         }
-        chain.clear();
+        // The chain is **kept**, not returned to the scratch pool: it is
+        // where a later `PointerDown` learns the position inside each
+        // widget (`local_pos`), and the button that arrives after the
+        // move is a separate message. Clearing it here is why an early
+        // version reported every press at the widget's top-left corner,
+        // which no widget noticed until one cared *where* it was
+        // clicked. `hit_chain` clears it on the next move.
         self.chain = chain;
     }
 
     /// The pointer left the window.
     pub fn pointer_leave(&mut self, state: &mut S) {
+        self.chain.clear();
         let old = std::mem::take(&mut self.hover_chain);
         for id in old.iter().rev() {
             self.set_hovered(*id, false);
@@ -1567,6 +1883,30 @@ impl<W: Widget<S>, S: 'static> WidgetMut<'_, W, S> {
         if let Some(slot) = self.ui.arena.slot_mut(self.id) {
             slot.state.focusable = focusable;
         }
+    }
+
+    /// Move a **group** paint slot's children by `transform`, without a
+    /// repaint.
+    ///
+    /// This is what makes scrolling cheap: the widget's content hangs
+    /// under a group node, and shifting that group is exactly one
+    /// `SetTransform` on the wire — no relayout, no repaint of anything
+    /// inside it. Nothing happens if the slot does not exist yet or is
+    /// not a group; the next paint creates it.
+    pub fn set_slot_transform(&mut self, slot: u8, transform: nitro_core::Transform) {
+        let index = slot as usize;
+        let Some(state) = self.ui.arena.slot_mut(self.id).map(|s| &mut s.state) else {
+            return;
+        };
+        let Some(paint) = state.slots.get_mut(index) else {
+            return;
+        };
+        if paint.node.is_none() || paint.transform == transform {
+            return;
+        }
+        paint.transform = transform;
+        let node = paint.node;
+        let _ = self.ui.wire.set_transform(node, transform);
     }
 }
 

@@ -13,7 +13,7 @@ workspace = true
 nitro-core = { workspace = true }
 nitro-wire = { workspace = true }
 # `poll(2)` for the synchronous text measurement, `epoll` for the app loop.
-rustix = { workspace = true, features = ["event", "time"] }
+rustix = { workspace = true, features = ["event", "fs", "process", "time"] }
 # Only for `test::Harness`, which runs a server in-process. Optional so an
 # app binary never links the compositor (or libinput, or drm).
 nitro-server = { path = "../nitro-server", optional = true }

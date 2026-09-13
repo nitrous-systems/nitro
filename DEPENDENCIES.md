@@ -69,6 +69,15 @@ its `test-support` feature, which only its own test harness turns on — an
 app binary links no compositor. It moved the figure from 60 to 61, and
 that line is `nitro-ui` itself.
 
+`nitro-hey` (M2's CLI for the introspection socket) is `std` and `rustix`
+and nothing else — not even `nitro-ui`, whose `introspect` module it
+could have shared a path resolver and an escaping function with. It is
+the tool you reach for when something is already wrong, so it should
+build and run when as little as possible is working; two dozen lines
+duplicated is the price, and the tests on both sides pin the shared
+format. Its PNG writer is a copy of `nitro-shot`'s for the reason the
+next paragraph gives.
+
 The M1 rise from 58 to 60 was the same kind of non-event: one line is
 `nitro-demo`, a workspace crate, and the other is a second
 `signal-hook v0.4.4 (*)` line — cargo's marker for a subtree it has
@@ -81,7 +90,11 @@ new workspace crate reuses an existing dependency.
 Planned (M3+): nothing currently. `parley` sits behind swash as the
 upgrade path if bidi, font fallback or rich text ever become requirements.
 Rejected: `serde` (hand-written wire), `png` (own stored-deflate encoder in
-`nitro-shot`), `tokio`/`async-*` (single-threaded epoll loop), `winit`,
+`nitro-shot`, copied verbatim into `nitro-hey` — moving it into
+`nitro-core` would put a PNG encoder in the dependency graph of the
+server, the toolkit and every app, to save 120 lines of pure arithmetic
+that two CLIs use; revisit at a third consumer), `tokio`/`async-*`
+(single-threaded epoll loop), `winit`,
 `wgpu`, `smithay`, `libudev` (a `read_dir` and a netlink socket do what we
 need of it), `fontconfig` (a `read_dir` and three alias tables do what we
 need of it), `parley` and `rustybuzz` (see above).
@@ -97,7 +110,8 @@ the syscall families it uses.
 | `nitro-server` | `event`, `fs`, `net`, `process`, `time` | epoll loop, control socket, signals, timers; `pread` to copy client buffers out of their memfds, and `eventfd` for the test input source |
 | `nitro-kms` | `event`, `fs`, `mm`, `net`, `time` | DRM fds, `mmap` of dumb buffers, udev netlink |
 | `nitro-demo` | `event`, `fs`, `process`, `time` | `poll` for the event loop; `memfd_create`/`ftruncate`/`pwrite` for the image buffer; `getuid` for the `/tmp` fallback of the control-socket path; `clock_gettime` for the delivery-leg breakdown |
-| `nitro-ui` | `event`, `time` | `epoll` for the app loop, `poll` for the synchronous text measurement, and `Timespec` for `ui.set_timer` |
+| `nitro-ui` | `event`, `fs`, `process`, `time` | `epoll` for the app loop, `poll` for the synchronous text measurement, `Timespec` for `ui.set_timer`; `memfd_create`/`ftruncate`/`pwrite` for an `Image` widget's pixel buffer; `getuid`/`getpid` for the introspection socket's path |
+| `nitro-hey` | `process` | `getuid` for the `/tmp` fallback of the app-socket directory |
 
 ## `unsafe` exceptions
 

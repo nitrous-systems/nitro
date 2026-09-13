@@ -10,6 +10,15 @@
 //! * Tab and Shift-Tab walk the two buttons; Space or Enter activates the
 //!   focused one.
 //!
+//! The three interesting widgets carry a `.name()`, which is what gives
+//! them a stable path on the introspection socket — so the same dialog
+//! is drivable from a shell without changing a line of it:
+//!
+//! ```text
+//! hey hello-dialog do window/ok click
+//! hey hello-dialog get window/message value
+//! ```
+//!
 //! Run it against a server (`just fake` in one terminal):
 //!
 //! ```text
@@ -28,14 +37,14 @@ struct State {
 
 fn main() -> Result<(), Error> {
     App::new("hello-dialog")?.run(State { ok: false }, |ui: &mut Ui<State>| {
-        let message = ui.build(label("Nothing has happened yet."));
-        let ok = ui.build(
-            button("OK").on_click(move |s: &mut State, ui: &mut Ui<State>| {
+        let message = ui.build(label("Nothing has happened yet.").name("message"));
+        let ok = ui.build(button("OK").name("ok").on_click(
+            move |s: &mut State, ui: &mut Ui<State>| {
                 s.ok = !s.ok;
                 let text = if s.ok { "OK pressed." } else { "Toggled back." };
                 ui.widget_mut::<Label>(message).unwrap().set_text(text);
-            }),
-        );
+            },
+        ));
         let root = ui.build(
             column()
                 .gap(12.0)
@@ -45,10 +54,11 @@ fn main() -> Result<(), Error> {
         );
         let buttons = ui.build(
             // The spacer is what pushes the pair to the right edge.
-            row()
-                .gap(8.0)
-                .child(spacer())
-                .child(button("Cancel").on_click(|_: &mut State, ui: &mut Ui<State>| ui.quit())),
+            row().gap(8.0).child(spacer()).child(
+                button("Cancel")
+                    .name("cancel")
+                    .on_click(|_: &mut State, ui: &mut Ui<State>| ui.quit()),
+            ),
         );
         ui.attach(buttons, ok).unwrap();
         ui.attach(root, message).unwrap();

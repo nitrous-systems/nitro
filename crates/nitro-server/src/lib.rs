@@ -777,13 +777,11 @@ impl Server {
         // naming output 0 for it would be a lie the client has no way to
         // detect. It is configured by `place_new_window` the moment it
         // lands on a screen, which is the honest moment to say where.
-        let Some((scale, output)) = self
-            .scene
-            .window_info(win)
-            .ok()
-            .and_then(nitro_scene::Window::output)
-            .and_then(|id| self.scene.output_info(id).map(|(_, s)| (s, id.0)))
-        else {
+        let Some((position, scale, output)) = self.scene.window_info(win).ok().and_then(|w| {
+            let id = w.output()?;
+            let (_, s) = self.scene.output_info(id)?;
+            Some((w.position(), s, id.0))
+        }) else {
             return;
         };
         for client in self.wire_clients.values_mut() {
@@ -791,6 +789,7 @@ impl Server {
                 client.send(&ServerMsg::Configure(msg::Configure {
                     window,
                     size,
+                    position,
                     scale,
                     output,
                 }));
@@ -2119,6 +2118,7 @@ impl Server {
         client.send(&ServerMsg::Configure(msg::Configure {
             window: node_id,
             size,
+            position,
             scale,
             output: scene_id.0,
         }));

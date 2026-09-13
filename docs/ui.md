@@ -3,7 +3,7 @@
 `nitro-ui` is the client-side half of nitro: a **retained widget tree in
 an arena** that maps widgets to scene nodes and sends only mutations for
 what changed. It is the layer an app is written against, and the reason
-an app binary is 444 KB with no font library in it.
+an app binary is 522 KB with no font library in it.
 
 This document is the architecture and the reasoning. The API reference is
 the rustdoc; the crate README is the two-minute version.
@@ -166,10 +166,24 @@ a flush allocates nothing beyond the wire buffer.
 
 `introspect` is the fifth pass and is a plain walk over the same arena —
 `Ui::introspect` fills a `Vec<Node>` with id, role, `Access`, window
-bounds, focusable and focused. M2 stops there; the socket that serves it
-and the `hey`-style CLI are the next task, and this is the shape they
-read. The point of goal 5 is that there is *one* tree, not a shadow one
-maintained alongside it.
+bounds, focusable and focused. The point of goal 5 is that there is *one*
+tree, not a shadow one maintained alongside it.
+
+**Where the socket hooks in.** `crate::introspect::Socket` is owned by
+the app loop, its listener sits in the same `epoll` set as the
+connection, and `Socket::serve` runs *after* the event batch and *before*
+`flush` — so a request sees a settled tree and its effects are carried by
+the same commit the next real event would have used. A `do … click`
+routes through `Ui::action`, which is the same take-out dispatch
+`Ui::dispatch` uses for a real click: the widget leaves its slot, gets a
+full `&mut Ui<S>` and the app's `&mut S`, and its callback cannot tell
+the two apart. `set` goes through the widget's `set_<prop>` action, which
+is the `WidgetMut` setter, so invalidation is identical too.
+
+That placement is the whole reason the design works without a lock: IPC
+and the application share one message loop, which is what BeOS did and
+what `DESIGN.md` goal 5 asks for. The protocol, the path grammar and the
+roles/actions table are in `docs/introspection.md`.
 
 ## Mapping widgets to scene nodes
 
@@ -210,6 +224,61 @@ changed node kind is a different node and is replaced.
 The consequence worth stating: **a moved widget costs one mutation and no
 repaint of its content**, because the move is a `SetBounds` on the group
 and the content hangs underneath it.
+
+## The widget set
+
+| widget | role | value | actions | notes |
+|---|---|---|---|---|
+| `Flex` (`column()`, `row()`) | `container` | — | — | draws nothing; everything is its `LayoutStyle` |
+| `Panel` | `container` | — | — | background, radius, border, each `None` = the theme's |
+| `Label` | `label` | its text | `set_value` | remembers the width it was measured at |
+| `Button` | `button` | — | `click`, `activate`, `focus` | hover/pressed/focused faces |
+| `TextField` | `textfield` | its contents | `set_value`, `submit`, `clear`, `focus` | caret, selection, click-to-place, h-scroll |
+| `Checkbox` | `checkbox` | `true`/`false` | `toggle`, `set_value`, `focus` | Space toggles |
+| `Slider` | `slider` | the number | `set_value`, `focus` | drag, arrows, Home/End, optional step |
+| `Scroll` | `scroll` | the offset | `scroll_to`, `scroll_by`, `focus` | wheel, arrows, PgUp/PgDn, Home/End |
+| `Separator` | `separator` | — | — | spans its container on the other axis |
+| `Image` | `image` | `WxH` | — | an `ARGB` buffer, uploaded once in a memfd |
+| `Spacer` | `spacer` | — | — | `.grow(1.0)` and nothing else |
+
+Three of them are worth a paragraph, because each makes a claim about
+cost that the rest of the design has to hold up.
+
+**`TextField` does not re-measure the tree on a keystroke.** Its
+`measure` is a function of the *font* and its width style, never of its
+contents, so typing repaints one widget and lays out nothing. The one
+measurement it genuinely needs is where the caret goes, and that is
+`Ui::cursor_positions` — the `cursor_x` table `TextMeasured` already
+carries, cached by the same `(text, style, width)` key as the extent, so
+a caret move inside a string the field has already measured is free. This
+is also why the synchronous measurement of `docs/ui.md`'s M2 decision
+does not bite here: a text field was the widget that argument was worried
+about, and it turns out not to need a round trip per keystroke after all,
+only per *new string* — which is one, on the way in.
+
+Its overflow scrolls **by composition**: the text node hangs under a
+clipping group whose transform is the scroll offset, so a caret past the
+right edge sends one `SetTransform` and no `SetText`.
+
+**`Scroll` is the same trick one level up, and it uses no extra node at
+all.** A widget's children already hang under its *content group*; the
+scroller clips that group (`Ui::set_content_clip`) and translates it
+(`Ui::set_content_transform`). Scrolling is therefore exactly one
+`SetTransform` — no relayout, no repaint of anything inside — and the
+harness test `scrolling_is_one_set_transform_and_nothing_else` asserts
+that from the outside by counting mutations, because a cost claim nothing
+checks stops being true. A scroll that would change nothing (already at
+the end) sends nothing at all.
+
+**`Checkbox` draws its tick as an inset rect, not a glyph.** The server
+draws rectangles and text, and a checkmark string would need a font that
+has one — which is exactly the assumption a toolkit that ships no fonts
+must not make.
+
+Every one of them answers `role()`, `accessible()` and `action()`, which
+is what the introspection socket serves and what an AT-SPI bridge will
+read. `action()` is not optional in spirit: it is the difference between
+a widget a script can drive and one it can only look at.
 
 ## Layout
 
@@ -359,8 +428,10 @@ Checklist for a new widget:
   space (`cx.bounds` is `(0, 0, w, h)`).
 * Setters pick `request_paint` over `request_layout` when the change
   cannot move anything.
-* `role` and `accessible` are not optional in spirit: they are what the
-  introspection socket serves.
+* `role`, `accessible` and `action` are not optional in spirit: they are
+  what the introspection socket serves, and `action` is what makes the
+  widget drivable from outside. A widget whose `action` answers
+  `Handled::No` to everything can be read but not used.
 * If it wants pointer events, it must paint something.
 
 ## The test harness
@@ -405,13 +476,13 @@ an early version of every pointer test saw no hover at all.
 
 `examples/hello_dialog.rs`, release, stripped, against a fake server:
 
-| what | value |
-|---|---|
-| binary | **444 608 bytes** (444 KB) |
-| RSS | **2 436 kB** |
-| threads | 1 |
-| context switches over 5 s idle | **0** (client and server both) |
-| `ldd` | `libc`, `libgcc_s`, vdso — nothing else |
+| what | value | at the end of #3682 |
+|---|---|---|
+| binary | **522 032 bytes** (522 KB) | 444 608 (444 KB) |
+| RSS / HWM | **2 580 kB** | 2 500 kB |
+| threads | 1 | 1 |
+| context switches over 5 s idle | **0** (client and server both) | 0 |
+| `ldd` | `libc`, `libgcc_s`, vdso — nothing else | same |
 
 The binary contains no font library, no rasterizer and no compositor: a
 label is a string on the wire. That asymmetry is the whole reason the
@@ -419,6 +490,61 @@ toolkit is this small, and it is what makes the remote case cost what the
 local one does.
 
 App code in `main`: 31 lines as rustfmt wraps it.
+
+### What the introspection socket cost, and why it is not small
+
+The spec expected the introspection code to be a small delta, and asked
+for the reason if it was not. It is **+77 424 bytes of binary (+17 %)
+and +80 kB of RSS**, and the honest attribution is that essentially all
+of it is the socket rather than the widgets. Building the same example
+three ways:
+
+| build | binary | delta |
+|---|---|---|
+| this tree | 522 032 | — |
+| `App::run` never binding the socket (`introspect(false)` hard-coded) | 514 952 | −7 080 |
+| the `introspect` and `shot` modules removed from the crate | 453 600 | −68 432 |
+
+Summing the symbol sizes of an unstripped build agrees: `nitro_ui::
+introspect::*` is **39 322 bytes** of text and `nitro_ui::shot::*` 1 001,
+against 10 960 for *all eleven* widgets — only 558 more than the five
+that were there before this task. `TextField`, `Checkbox`, `Slider`,
+`Scroll`, `Separator` and `Image` are nearly free because they share the
+paint, measure and theme helpers the earlier widgets already had.
+
+Two reasons the socket is as big as it is, and one of them is fixable:
+
+1. **It is monomorphised per app-state type.** `Socket::serve<S>`,
+   `list<S>`, `get<S>`, `invoke<S>` and `path_of<S>` are all generic over
+   `S` because they hold a `&mut Ui<S>`, so every generic function in the
+   module is instantiated afresh for each app. `Socket::serve` alone is
+   the largest single symbol in the binary at 24 335 bytes. Routing the
+   protocol through a small `dyn` interface over a `&mut dyn
+   IntrospectTree` would collapse that to one copy for the whole program,
+   at the cost of one virtual call per request — a request rate measured
+   in tens per second. **That is the M3 change**, and it is a mechanical
+   one: the protocol code already touches the tree through eight methods.
+2. **Text formatting is not free.** The protocol prints numbers, and
+   `core::fmt`'s float path (`flt2dec`, 16 997 bytes) is linked whether
+   or not anything formats a float — it is in the baseline binary too, so
+   it is not part of the delta, but it is why the `format_number` helper
+   avoids `{:?}` and the `{:.4}`-then-trim form is the only float
+   formatting the protocol does.
+
+The RSS delta (+80 kB, roughly the binary growth) is entirely
+resident text: the socket allocates nothing until something connects, and
+its `snapshot` vector is freed the moment the last watcher goes away —
+`Socket::serve` shrinks it to fit, so an app nobody is watching pays for
+the code and not the data.
+
+Whether 77 KB is worth it is a product question rather than a technical
+one, and the answer this milestone takes is **yes, on by default**: an
+app that has to opt in to being scriptable is an app that nothing can
+drive, and goal 5 is that *every* nitro app is scriptable with one
+mechanism. `App::introspect(false)` is there for the app that disagrees,
+and it saves the 7 KB of binding code but not the 68 KB of protocol —
+until the M3 de-monomorphisation, at which point the whole thing should
+fall to roughly the size of one instantiation.
 
 ## Deviations and limitations
 
@@ -447,8 +573,36 @@ regrets:
   widget yet (M3, and it is a widget, not a new mechanism).
 * **`Ui` owns exactly one window.** Multi-window is a shell concern and
   M3; nothing in the arena assumes one window, only `open_window` does.
-* **`introspect` produces the tree but serves nothing.** The socket is
-  the next task.
+* **The introspection protocol is monomorphised per app-state type**, so
+  it costs ~68 KB of binary in each app rather than being shared. The
+  `dyn`-interface fix is argued under *Measured* above and is M3.
+* **`watch` detects a value or focus change by diffing snapshots**, not
+  by being told. That is why it reports a change however it was made —
+  the app's own code, real input or another client all look identical —
+  but it means a value that changes and changes back within one loop
+  turn is not reported, and the diff is O(widgets) per turn *while a
+  watcher is connected*. An unwatched app does no work at all.
+  Activation (`click`) is the exception and *is* announced, by
+  `EventCx::report_activation`, because running a callback leaves no
+  trace in the tree to diff.
+* **`shot` screenshots the whole output and crops.** The window's
+  position comes from `Configure`; a window that has moved without the
+  client being told would crop the wrong rectangle. The server always
+  sends a `Configure` on a move, so this is a statement about what the
+  code relies on rather than a known bug.
+* **Security is the socket directory's mode**, `0700`, and nothing else:
+  any process of the same user can drive any app completely. Same
+  boundary as the X11 socket or `$XDG_RUNTIME_DIR/wayland-0`; a per-app
+  allow policy is M3+ and belongs with the session manager that would
+  issue the tokens.
+* **`TextField` is single-line, and has no clipboard, no undo and no
+  IME.** Each is a real feature rather than a missing case, and each
+  wants a server-side concept (a selection owner, a text-input protocol)
+  that M2 does not have.
+* **`Scroll` is vertical only** and scrolls by translating its content
+  group, so its child is laid out at full height. A list of ten thousand
+  rows therefore costs ten thousand widgets; virtualisation is M3 and is
+  a widget, not a new mechanism.
 * **`Button::on_click` is `Fn`, not `FnMut`** — it is taken out of the
   button for the call (same trick as the arena), and a `FnMut` would need
   either a second take-out or interior mutability. `&mut S` is where the

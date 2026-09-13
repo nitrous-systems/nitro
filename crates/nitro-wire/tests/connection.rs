@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 
-use nitro_core::{Color, Rect, Size};
+use nitro_core::{Color, Point, Rect, Size};
 use nitro_wire::client::Connection;
 use nitro_wire::io::Socket;
 use nitro_wire::msg::{ClientMsg, Commit, Configure, Hello, Presented, ServerMsg};
@@ -118,6 +118,7 @@ fn handshake_and_a_transaction() {
             .send(&ServerMsg::Configure(Configure {
                 window: NodeId(1),
                 size: Size::new(400.0, 300.0),
+                position: Point::new(10.0, 20.0),
                 scale: 2.0,
                 output: 0,
             }))
