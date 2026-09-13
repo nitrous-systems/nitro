@@ -7,10 +7,10 @@ boring. The implementation is `crates/nitro-wire`; the byte layout is
 defined by the `#[repr(C)]` structs in `msg.rs` and `wire.rs`, and this
 document describes them.
 
-**Status.** v1, frozen at M2. Until then, changes are made here and in the
-code together. After M2, v1 does not change: additions go in as new op
-codes guarded by a capability bit, and only an incompatible change bumps
-`VERSION`.
+**Status.** v1, **frozen** (M2 done, commit 84f7ed3, 2026-09-13). v1 does
+not change: additions go in as new op codes guarded by a capability bit,
+and only an incompatible change bumps `VERSION`. The last in-place change
+was `Configure.position` (task #3683).
 
 ## Transport
 
