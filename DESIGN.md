@@ -224,19 +224,19 @@ D-Bus client is allowed.
   switches**, RSS 7.5 MB (client 3.2 MB), flip interval 16.666 ms mean
   (16.653–16.680), paint 0.19 ms mean per pointer-move frame (a
   full-screen repaint is the 13 ms maximum). **Input-to-photon, measured
-  end to end by `nitro-demo` over 202 samples: median 25.2 ms, p95
-  33.4 ms** — one and a half refreshes, so the "within one refresh"
-  budget is **missed by one frame**. The cause is understood and is not
-  performance: 0.3 ms of that 25 is work, the rest is waiting, because a
-  pointer move damages the cursor and flips *before* the client's answer
-  arrives, so the client's pixels ride the following flip. The server's
-  own i2p is inside budget ([1.2, 17.6] ms) whenever inputs do not
-  collide with an in-flight flip. Full method, distributions and the
-  proposed scheduler fix in `docs/latency.md`; sizes and RSS in
-  `docs/budget.md`. Three VT round trips with a client connected are
-  clean and input still routes afterwards. Text was the one thing the
-  milestone promised and did not deliver — M1 shipped rects and images
-  only — and M2-pre below has since closed that gap.
+  end to end by `nitro-demo` over 202 samples: median 9.3 ms, p95
+  17.1 ms, min 1.3 ms** — inside one refresh, so the "within one refresh
+  at 60 Hz" budget is **met**. It was missed by exactly one frame
+  (median 25.2 ms) until the frame scheduler stopped flipping cursor-only
+  damage while the client under the pointer still owed an answer: the
+  cursor and the client's content now ride the same flip, bounded by a
+  timerfd deadline so a client that never answers cannot stall the arrow
+  (issue #529). Full method, before/after, the rate sweep and the
+  saturation trap that hid the improvement are in `docs/latency.md`;
+  sizes and RSS in `docs/budget.md`. Three VT round trips with a client
+  connected are clean and input still routes afterwards. Text was the one
+  thing the milestone promised and did not deliver — M1 shipped rects and
+  images only — and M2-pre below has since closed that gap.
 - **M2-pre** — **done.** Text end to end. `nitro-text` (swash) does font
   discovery, shaping, layout, measurement and an A8 glyph atlas *in the
   server*; `nitro-wire` grows `SetText`/`MeasureText` and

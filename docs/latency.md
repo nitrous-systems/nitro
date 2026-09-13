@@ -4,12 +4,19 @@ Measured on the test box (Pentium G3240, i915, HDMI-A-1 1920×1080@60,
 `docs/testbox.md`) with `nitro-demo --follow`, which is the M1 exit
 criterion: an input-to-photon number that was *measured*, not assumed.
 
-**Headline: median 25.2 ms, p95 33.4 ms, min 17.5 ms, max 34.2 ms over 202
-samples** — between one and two refresh periods, against a budget of one.
-The budget is **missed, by one frame**, and the cause is understood,
-localised to four lines of the server, and not a performance problem: the
-machine spends 0.3 ms of the 25 working. Section 4 has the verdict and
-section 3 the diagnosis.
+**Headline: median 9.3 ms, p95 17.1 ms, min 1.3 ms, max 19.2 ms over 202
+samples** — inside one refresh period, against a budget of one. The
+budget is **met**.
+
+It was not, when this document was first written. The original
+measurement is kept below in full, because the diagnosis it made is the
+reason the number moved and a before/after is worth more than an
+after: **median 25.2 ms, p95 33.4 ms, min 17.5 ms** — one and a half
+refreshes, missed by exactly one frame, with 0.3 ms of work in it. The
+cause was a cursor-only flip going out before the client under the
+pointer could answer (section 3.2), and the fix was to defer that flip
+(issue #529, now closed). Section 4 has the before/after and the one
+methodological trap that hid it.
 
 ## 1. What the numbers mean
 
@@ -64,18 +71,18 @@ the metric is defined at the timestamps it is defined at.
 XDG_RUNTIME_DIR=/run/user/1000 nitro-demo --follow --stats --seconds 22
 ```
 
-and, from a second shell, 200 paced pointer moves at ~100 Hz:
+and, from a second shell, 200 paced pointer moves:
 
 ```sh
-ydotool mousemove -- -10000 -10000; sleep 0.2   # slam to a known corner
-ydotool mousemove -- 200 150; sleep 0.4         # into the window
+ydotool mousemove -- -10000 -10000; sleep 0.3   # slam to a known corner
+ydotool mousemove -- 200 150; sleep 0.5         # into the window
 for i in $(seq 100); do
-  ydotool mousemove -- 4 3;  sleep 0.01
-  ydotool mousemove -- -4 -3; sleep 0.01
+  ydotool mousemove -- 4 3;  sleep 0.03
+  ydotool mousemove -- -4 -3; sleep 0.03
 done
 ```
 
-Three things about that recipe are load-bearing:
+Four things about that recipe are load-bearing:
 
 - **The corner slam.** libinput's pointer acceleration is non-linear for
   `ydotool` (`docs/testbox.md`), so a relative move of *n* does not travel
@@ -86,13 +93,38 @@ Three things about that recipe are load-bearing:
   flip and measures queueing delay rather than latency. The first run of
   this experiment did exactly that and reported a mean of 25.7 ms with
   moves backlogged three deep — the same number for the wrong reason.
-  `sleep 0.01` keeps every input independent.
+- **`sleep 0.03`, not `sleep 0.01`.** This changed, and it is the single
+  most important line in the file. `sleep 0.01` plus `ydotool`'s own
+  overhead comes out at ~65 moves/s, and each move costs **two** flips
+  under the age-2 cursor rule, so it demands ~130 flips/s from a display
+  that can retire 60. The server pins at exactly 60.0 flips/s and the
+  number stops being a latency at all. Measured, at that pacing:
+
+  | pacing | build | flips/s | client median |
+  |---|---|---|---|
+  | `sleep 0.01` (65 moves/s) | before the fix | 60.0 | 25.0 ms |
+  | `sleep 0.01` (65 moves/s) | after the fix | 59.9 | 24.9 ms |
+  | `sleep 0.03` (28 moves/s) | before the fix | 60.0 | 25.1 ms |
+  | `sleep 0.03` (28 moves/s) | after the fix | 56.1 | **9.3 ms** |
+
+  Both builds are saturated on the first two rows, and they agree there
+  — which is the proof that the row is measuring the queue and not the
+  pipeline. The original headline in this document was taken at
+  `sleep 0.01`, and it was only luck that the mechanism it diagnosed was
+  real: the number it quoted was one a saturated display would have
+  produced anyway. **A run whose `flips/s` is 60.0 is measuring the
+  display, not the compositor.** `nitro-shot --stats` reports `frames`;
+  divide by the wall time of the loop.
 - **Moves must land inside a window.** A pointer over the desktop damages
   only the cursor, so the *server* records i2p samples and the *client*
   records none. A run that reports `i2p[5s] no samples yet` next to a
   healthy `server i2p:` line is measuring nothing: the pointer missed.
 
-## 3. The numbers
+## 3. The numbers, as they were before the fix
+
+Everything in this section is the **original** measurement, kept because
+its diagnosis is what section 4 acts on. The after-numbers are in
+section 4.
 
 ### `--follow`, 202 samples, one window
 
@@ -129,7 +161,7 @@ Meanwhile the work itself is nothing:
 waiting for a vblank, not computing.** No amount of making the rasterizer
 faster will move this number.
 
-### Why the floor is a whole frame
+### 3.2 Why the floor is a whole frame
 
 The server paints only when a flip completes (`Server::paint` returns
 early while `backend.flip_pending(id)`), and a pointer move damages the
@@ -156,6 +188,13 @@ nothing is queued:
 the old and new cursor rects are damaged, and the back buffer is two
 frames stale, so the region is repainted into both buffers.)
 
+This count is the load-bearing evidence, and unlike the headline number it
+could not have been produced by a saturated display: the moves are one per
+second. It is also the assertion the fake-backend integration test now
+makes — 4 answered motions cost 8 flips with the deferral and 12 without,
+i.e. exactly this 2-vs-3 — so the regression is caught in CI rather than
+only on the box.
+
 The rate experiment is the control. Same 200 moves, only the spacing
 changes:
 
@@ -171,6 +210,12 @@ this is the proof. The client's stays at ~26 ms regardless. That constant
 one-frame offset between the two, invariant under input rate, is the
 signature of a structural extra flip rather than of load, queueing or
 backpressure.
+
+And that offset is what section 4 closes: with the flip deferred, the
+client's median follows the server's down to ~9 ms at every one of these
+rates. (The `~50 Hz` row is above the saturation threshold of section
+4.4 — 100 moves/s of demand against 60 flips/s — which is why its client
+figure does not move even after the fix.)
 
 ### `--animate`, 12 s
 
@@ -199,6 +244,7 @@ that reason, and warns only if commits outrun callbacks in an interval.
 |---|---|---|
 | idle, no client | **0.0 %** | — |
 | idle, demo connected, no input | **0.0 %** (0 frames in 5 s) | **0.0 %** |
+| idle, 5 s *after* a deferred flip | **0.0 %** (0 frames, `voluntary_ctxt_switches` flat) | **0.0 %** |
 | `--animate` (60 Hz) | 1.5 % | 0.3 % |
 | `--follow` under 100 Hz input | 2.2 % | 0.5 % |
 
@@ -246,56 +292,117 @@ They are the *client's* claim, drawn from the numbers it sent, so a
 mismatch between them and what the server actually repainted would show up
 as a smear outside an outline.
 
-## 4. Verdict against the budget
+## 4. Verdict against the budget, and the fix
 
 `DESIGN.md` sets "input → photon within one refresh at 60 Hz". The
-measured median is **25.2 ms, or 1.5 refreshes. The budget is missed by
-one frame.**
+measured median is **9.3 ms, or 0.56 refreshes. The budget is met.**
 
-It is worth being precise about what is and is not wrong, because the two
-halves point in opposite directions:
+It was 25.2 ms when section 3 was written. What changed is one scheduling
+decision, described below; nothing was made faster, and the 0.3 ms of
+work per frame is the same 0.3 ms.
 
-- **The compositor meets its own budget.** The server's i2p drops to
-  [1.2, 17.6] ms — inside one refresh — the moment inputs stop colliding
-  with in-flight flips. Paint is 0.19 ms on a 2014 Pentium with no AVX2
-  and damage is 1 560 px. Nothing here is slow.
-- **The pipeline does not**, because a client's response is structurally
-  one flip behind the cursor that provoked it. The server paints the
-  cursor as soon as the pointer moves, and that flip blocks the frame the
-  client's answer wants.
+### 4.1 Before and after
 
-So this is a scheduling bug, not a performance one, and the fix is a
-scheduling change: **do not start a flip for cursor-only damage while a
-client has been told about the input and has not yet answered.** Waiting
-the few hundred microseconds for the client's commit (it takes 0.12 ms to
-reach it and it answers within one wakeup) would let cursor and content
-ride the *same* flip and put the median at roughly 9 ms, comfortably
-inside one refresh. The risk is the opposite failure — a client that never
-answers must not stall the cursor — so it needs a deadline, which is
-precisely what `frame::frame_deadline` already computes.
+Both runs: 202 samples, one window, `nitro-demo --follow --stats`, pointer
+paced at 28 moves/s (section 2 explains why not faster). `sha256sum` of
+both binaries verified immediately before *and* after each run, in the
+same ssh session. The `nitro-demo` binary is byte-identical across the
+two — same instrument, one variable.
 
-That is a change to the server's frame scheduler, not to the demo, and it
-wants its own task and its own before/after numbers from this same
-harness. M1's deliverable is the measurement and the diagnosis; the fix
-belongs to whoever owns the scheduler next. Filed as **issue #529** rather
-than smuggled into this task.
+| view | | min | median | p95 | max | mean |
+|---|---|---|---|---|---|---|
+| **client (input → photon)** | before | 17 502 | **25 132** | 33 119 | 34 060 | 25 466 |
+| | after | 1 287 | **9 290** | 17 134 | 19 216 | 9 594 |
+| server (`i2p_*`) | before | 11 869 | — | — | 31 849 | 23 057 |
+| | after | 1 287 | — | — | 17 788 | 9 459 |
 
-Three further things this run establishes, none of which were in doubt but
-all of which are now measured rather than assumed:
+All microseconds. The distribution moved down by very close to one whole
+refresh period at every point of it — median −15.8 ms, p95 −16.0 ms,
+min −16.2 ms against a 16.67 ms frame — which is the signature of a
+structural flip being removed rather than of anything getting faster. The
+**minimum is the tell**: it was 17.5 ms, a whole frame, which no fast path
+produces by accident; it is now 1.3 ms.
+
+The two views also agree now to 0.2 ms rather than differing by a frame,
+because the thing that separated them was exactly the extra flip.
+
+### 4.2 The change
+
+**Do not start a flip for cursor-only damage while a client has been told
+about the input and has not yet answered.** The client's commit takes
+0.12 ms to arrive and comes back within one wakeup, so cursor and content
+ride the *same* flip instead of consecutive ones.
+
+The opposite failure — a client that never answers stalling the cursor —
+is bounded by a deadline, `frame::frame_deadline`, the same next-vblank
+minus margin a frame callback is given. That is implemented as one
+`CLOCK_MONOTONIC` timerfd in the epoll set, armed only while a flip is
+actually held. The full rule, and what each of its four conditions is
+protecting, is in `crates/nitro-server/README.md` under "Deferring a
+cursor-only flip"; the mechanism is `crates/nitro-server/src/defer.rs`.
+
+Two `stats` keys report it: `flips_deferred` and `defer_timeouts`.
+
+### 4.3 The other three properties, re-measured
+
+The fix must not have bought latency with anything else, so:
+
+| property | measured |
+|---|---|
+| **Cursor over the bare desktop** | 16 flips for 8 isolated moves = **2 per move, unchanged**, and `flips_deferred` 0. Nobody to wait for, so the fast path is not even entered. |
+| **A wedged client** (`nitro-demo` under `SIGSTOP`, hovered) | cursor keeps moving at **60.0 flips/s** — 183 flips in 3.05 s — and `defer_timeouts` climbs 0 → 96. The deadline is doing exactly its job. |
+| **Idle** | 5 s after a deferral: **0 frames, 0 CPU ticks of 500, `voluntary_ctxt_switches` 205 → 205**. The timer is disarmed when nothing is held, so "idle is zero wakeups" survives adding a timer to the loop. |
+
+### 4.4 The rate sweep, and the trap in the old recipe
+
+The fix is invisible at the pacing the original headline used, and that is
+a fact about the *measurement*, not the fix. Each pointer move costs two
+flips (the age-2 cursor rule), so *m* moves/s demands 2*m* flips/s from a
+display that retires 60.
+
+| gap | moves/s | flips demanded | before | after | deferred / timed out |
+|---|---|---|---|---|---|
+| 0.01 | 65 | 130 | 25.0 ms | 24.9 ms | 3 / 0 |
+| 0.02 | 41 | 82 | 25.6 ms | 24.7 ms | 5 / 0 |
+| 0.03 | 28 | 56 | 25.1 ms | **9.3 ms** | 202 / 3 |
+| 0.04 | 21 | 42 | — | **8.7 ms** | 82 / 0 |
+| 0.05 | 17 | 34 | 26.8 ms | **9.6 ms** | 124 / 0 |
+| 0.10 | 10 | 20 | 25.6 ms | **9.8 ms** | 86 / 0 |
+
+The threshold is sharp and it is where the arithmetic says it should be:
+between 41 and 28 moves/s, i.e. where demand crosses 60 flips/s. Above it
+the server is pinned at the hardware cap — measured 60.0 flips/s before
+and 59.9 after — every input arrives with a flip in flight, and the
+deferral has nothing to defer (3 episodes in a whole run, against 202
+below the threshold). The number that comes out is queue depth.
+
+The control that makes this airtight is that **both builds report the same
+~25 ms there**. If the old recipe had been measuring the pipeline, the
+fixed build would have moved; it does not, because at 65 moves/s neither
+build is measuring the pipeline.
+
+Which means the original section 3 headline was, strictly, a saturated
+number that happened to agree with the unsaturated one — the extra flip
+was real, and section 3.2's flip count proved it directly, but the 25.2 ms
+figure could not have distinguished the two causes. The rate experiment in
+section 3 was already pointing at this: it showed the *server's* i2p
+dropping to [1.2, 17.6] ms as the rate fell while the *client's* stayed at
+26 ms. That gap was the extra flip, and it is now closed at every rate the
+display can service.
+
+Three further things, unchanged and re-confirmed:
 
 - **Idle really is zero.** Not "low" — zero frames in five seconds with a
-  client connected and visible.
-- **Frame pacing is exact.** 16 666 µs mean over 719 callbacks, one commit
-  each, no double-commits.
-- **The two views of latency agree**, to 1.2 ms. Neither instrument is
-  lying, which is what makes the diagnosis above trustworthy.
+  client connected and visible, and now also with a timerfd in the loop.
+- **Frame pacing is exact.** 16 666 µs mean, min 16 654, max 16 675.
+- **The two views of latency agree**, now to 0.2 ms.
 
 ## 5. Reproducing
 
 ```sh
 just deploy                                   # includes nitro-demo
 ssh box 'XDG_RUNTIME_DIR=/run/user/1000 ~/nitro-bin/nitro-demo --follow --stats --seconds 22'
-# in another shell: the ydotool loop from section 2
+# in another shell: the ydotool loop from section 2 (mind the pacing)
 just size                                     # sizes and RSS (docs/budget.md)
 ```
 
@@ -304,13 +411,26 @@ and the cross-check; `--damage` outlines the damage rects; `--save-small
 FILE` writes the downscaled PNG used above, with no ImageMagick needed on
 the box.
 
-Two cautions learned here, both of which produced a wrong number first:
+Three cautions learned here, each of which produced a wrong number first:
 
 - **Check which binary you measured.** Another task deploys to this box
   too. The headline run above verifies `sha256sum` of `nitro-server` and
   `nitro-demo` immediately before *and* after the measurement, in the same
   session; an earlier run of these numbers was taken minutes before the
-  binary was replaced underneath it.
+  binary was replaced underneath it. For a before/after, check that the
+  *demo* binary is byte-identical across the pair as well: it is the
+  instrument, and a differing one makes the comparison meaningless.
 - **Check the client got samples.** `i2p[total] no samples` next to a
   populated `server i2p:` means the pointer never entered a window and the
   run measured the cursor, not the pipeline.
+- **Check the display was not saturated** (section 2, and section 4.4 for
+  what it costs). Divide `frames` from `nitro-shot --stats` by the wall
+  time of the input loop: 60.0 flips/s on a 60 Hz panel means the queue
+  was full and the run measured backlog, not latency. This one is the
+  worst of the three, because it produces a plausible number that is
+  stable across runs and even across builds — it hid a 16 ms improvement
+  completely.
+
+A before/after wants both builds measured in the same sitting, alternating
+if possible. The box is shared and its thermal and scheduler state drift;
+two runs a day apart are not a controlled comparison.

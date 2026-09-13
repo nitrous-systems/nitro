@@ -81,17 +81,22 @@ runs it locally, `just fake-shot` grabs a PNG from it.
 
 ## Event loop
 
-Level-triggered epoll, no timers. An idle server never wakes: with
-nothing changing there is no damage, so no frame is painted, so no flip
-completes, so nothing becomes readable. `top` shows 0.0 % and
+Level-triggered epoll, and exactly one timer. An idle server never
+wakes: with nothing changing there is no damage, so no frame is painted,
+so no flip completes, so nothing becomes readable. `top` shows 0.0 % and
 `voluntary_ctxt_switches` stops counting — including with a client
-connected and its window on screen.
+connected and its window on screen. The one timer is the deferred-flip
+deadline below, and it is armed **only** while a flip is actually being
+held, so it does not cost the idle case anything: measured on the box,
+five seconds of idle after a deferral is 0 frames, 0 CPU ticks and
+`voluntary_ctxt_switches` flat.
 
 | fd                        | on readable                                                              |
 |---------------------------|--------------------------------------------------------------------------|
 | seat                      | `Seat::dispatch`; `Disable` → suspend input, `backend.pause()`, `ack_disable()`; `Enable` → resume backend and input, reset xkb, full repaint |
 | backend `poll_fds()`      | `Backend::dispatch`; `Flipped` → `Presented`/`Frame` to clients, then paint the next frame; `Hotplug` → `rescan()`, re-register fds, place unplaced windows, repaint |
 | libinput                  | dispatch, convert to `InputEvent`, route, then update the scene and paint if anything moved |
+| defer timer               | a held cursor-only flip's deadline passed: count a `defer_timeouts` and paint without the client's answer |
 | signal self-pipe          | SIGTERM/SIGINT → orderly shutdown (`signal-hook`'s `low_level::pipe` on a `UnixDatagram` pair) |
 | control listener          | accept, register the client                                              |
 | wire listener             | accept, allocate a `ClientId`, register the client                       |
@@ -278,6 +283,81 @@ that `nitro-kms::resume()` now clears flip-pending for every output
 (issue #520): a flip abandoned by a VT switch is never completed, and an
 output that still believed a flip was in flight would never paint again.
 
+### Deferring a cursor-only flip (issue #529)
+
+Step 1 hides a scheduling decision that is worth a frame of latency, and
+for a while cost one. **A pointer move damages the cursor immediately** —
+before the client under the pointer has heard anything — so the obvious
+schedule paints and flips a cursor-only frame at once. The client's
+answering commit arrives 0.12 ms later, by which time a flip is in flight
+and `paint` cannot start another, so the client's pixels ride the
+*following* vblank: content always one whole refresh behind the arrow
+that provoked it. Measured end to end that was a median input-to-photon
+of 25.2 ms against a one-frame budget, with 0.3 ms of work in it.
+
+So when the damage on a wakeup is **cursor-only** and an input was just
+routed to a client, the flip waits (`Server::paint_or_defer`). It is
+released by whichever comes first:
+
+* **the client's commit** — the next wakeup, usually — which adds content
+  damage, so one flip carries cursor *and* content;
+* **the deadline**, `frame::frame_deadline`: the next expected vblank
+  minus `FRAME_MARGIN_NS`. A client that never answers therefore costs
+  nothing at all, because 2 ms is ten paint passes on the test box — the
+  cursor still reaches that same vblank.
+
+Four conditions all have to hold, and each of the last three is a way of
+saying "nobody is already waiting for these pixels":
+
+* a client was told about an input and has not answered. Cursor movement
+  over the bare **desktop** has nobody to wait for and stays on the
+  untouched fast path — measured, 2 flips per isolated move either way;
+* something is paintable *now*. An output whose flip is still in flight
+  is not being deferred, it is simply not being painted; that wakeup
+  comes back through `on_flip`, which goes through the same decision;
+* every output that wants a frame wants it for the cursor alone
+  (`OutputState::cursor_only`). Content damage or a commit retry both
+  disqualify it. The **age-2 carry deliberately does not**: those pixels
+  are already on screen and the repaint only brings the *other* buffer up
+  to date, so nobody is waiting for them. Counting them would be actively
+  wrong — a pointer over a client that answers every motion produces
+  content damage on alternate frames, so every second frame would refuse
+  to wait and put the next answer a flip behind again;
+* the timer arms. If it will not, the server paints: a frame nothing
+  would ever wake it for is far worse than a frame one refresh early.
+
+The deadline is one `CLOCK_MONOTONIC` timerfd in the epoll set, armed
+only while a flip is held and disarmed on the way into every paint —
+including the paths that never consult the deferral (a resume, a hotplug,
+startup), which is what makes "idle is zero wakeups" unconditionally
+true. `flips_deferred` and `defer_timeouts` in `stats` are the two
+numbers to look at: a `defer_timeouts` that tracks `flips_deferred` is a
+client that is not answering, and the cursor is fine — it is reaching
+every vblank — but nothing is riding with it.
+
+One subtlety in the bookkeeping: disarming the timer and forgetting *who*
+is being waited for are separate steps. A wakeup that wanted to paint and
+could not (a flip still in flight) keeps the wait alive for the wakeup
+that can; clearing it there would lose the answer in exactly the
+saturating-input case, where every motion arrives mid-flip.
+
+The measured effect, and the one number that matters, is in
+`docs/latency.md` §4: **median 25.1 ms → 9.3 ms** over 202 samples, with
+the minimum falling from 17.5 ms (a whole frame — the signature of the
+structural flip) to 1.3 ms.
+
+**How this generalises.** Nothing in the mechanism assumes the trigger
+was an input event: `DeferredFlip` holds a set of clients and a deadline,
+and the release condition is "one of them committed, or the deadline
+passed". To hold a flip briefly for a client that is *known to be
+responding* — an animator that has committed on each of the last N frames
+— only the predicate that populates that set would change, from "was just
+sent an input" to "has a commit streak". The deadline, the timer, the
+counters and the cursor-only guard all stay as they are. What should not
+change is the bound: it must remain the vblank the frame was going to
+reach anyway, so that a wrong guess about a client costs nothing rather
+than a dropped frame.
+
 ## Text
 
 **Clients send strings, the server draws glyphs.** That is the whole
@@ -435,6 +515,8 @@ looking for.
 | `flip_interval_mean_us`  | Mean interval between flips, in microseconds.                            |
 | `flip_interval_min_us`   | Shortest interval seen.                                                  |
 | `flip_interval_max_us`   | Longest interval seen. Intervals longer than four refresh periods are **not counted**: an idle server deliberately stops flipping, and that gap is the absence of frames, not a slow one — counting it would measure how long the desktop sat still. |
+| `flips_deferred`         | Cursor-only flips held back for a client's answer, counted once per episode (a burst of motion inside one frame period is one). See the frame path above. |
+| `defer_timeouts`         | How many of those ended at the deadline instead of at a commit — the client did not answer. Tracking `flips_deferred` means a wedged client: the cursor is still reaching every vblank, but nothing is riding with it. |
 | `paint_us_min`           | Rasterization time per frame, over the last 120 frames (two seconds at 60 Hz). Paint only, not the commit. |
 | `paint_us_mean`          | Mean of the same window.                                                 |
 | `paint_us_max`           | Max of the same window — in practice a full-screen repaint.              |
@@ -531,6 +613,13 @@ limit of 1024 — but real.
   14. No cursor is drawn until a pointer device reports something: a bare
       desktop is background everywhere, and the arrow appears on the first
       motion.
+  15. Deferred flips, four ways: a client that answers a motion rides the
+      *same* flip as the cursor (8 flips for 4 isolated answered motions,
+      2 per move — 12 without the deferral, which is the bug); a client
+      that never answers still gets a flip, with `defer_timeouts`
+      climbing; cursor movement over the desktop is never deferred and
+      still costs exactly 2 flips per move; and a settled server after a
+      deferral makes no further frames, so the timer is really disarmed.
 - `src/test_support.rs`, behind the **`test-support`** feature, is
   `tests/fake_loop.rs`'s harness factored out so another crate can use it:
   `TestServer::start` runs the real loop on a thread with a fake backend
@@ -552,35 +641,39 @@ limit of 1024 — but real.
 ## Measured on the test box
 
 Pentium G3240, i915, 1920×1080@60, with `nitro-demo --follow` connected
-and the pointer being driven at ~100 Hz. Full method and distributions in
-`docs/latency.md`; sizes and RSS in `docs/budget.md`.
+and the pointer being driven at ~28 moves/s — the fastest pacing a 60 Hz
+display can actually service, which is the rate the latency figures below
+are taken at and why (see `docs/latency.md` §2 and §4). Sizes and RSS in
+`docs/budget.md`.
 
 | what                     | value                                                     |
 |--------------------------|-----------------------------------------------------------|
-| idle CPU                 | 0.0 %, zero frames in 5 s with a client connected and visible |
+| idle CPU                 | 0.0 %, zero frames in 5 s with a client connected and visible — including 5 s after a deferral, with `voluntary_ctxt_switches` flat |
 | CPU under load           | 1.5 % animating at 60 Hz, 2.2 % under 100 Hz pointer input |
 | RSS                      | server **19.7 MB** (19.8 MB with 5 windows), `nitro-demo` 3.1 MB. The server was 7.5 MB before M2-pre; `FontDb` holding every face's bytes is +12.2 MB and puts it 2.5× over the ≤ 8 MB budget — issue #528 |
-| flip interval            | mean 16 666 µs, min 16 653, max 16 680                    |
-| `paint_us`               | min 142, mean 189, max 323 per pointer-move frame (13 459 on a full repaint) |
+| flip interval            | mean 16 666 µs, min 16 654, max 16 675                    |
+| `paint_us`               | min 142, mean 201, max 323 per pointer-move frame (13 459 on a full repaint) |
 | `damage_px_mean`         | 1 560 of 2 073 600 in steady state                        |
-| server input-to-photon   | min 17 421 µs, mean 24 165 µs, max 32 035 µs under saturating input; **1 162–17 678 µs when inputs do not collide with an in-flight flip** |
-| client input-to-photon   | median 25 213 µs, p95 33 394 µs over 202 samples          |
+| server input-to-photon   | min 1 287 µs, mean 9 459 µs, max 17 788 µs                 |
+| client input-to-photon   | **median 9 290 µs, p95 17 134 µs, min 1 287 µs** over 202 samples — inside one refresh, so the `DESIGN.md` budget is met (was median 25 132, min 17 502 before the deferred-flip fix) |
+| cursor over the desktop  | 2 flips per isolated move, unchanged, and nothing deferred |
+| wedged client (SIGSTOP)  | cursor still 60.0 flips/s; `defer_timeouts` climbs         |
 | VT switches              | 3 round trips with a client connected: clean, input still routed |
 
 Two things need reading carefully.
 
-**The `i2p_*` window depends on the input rate**, which is why two rows
-above disagree. Under saturating input almost every event arrives while a
-flip is in flight and must wait for it, so the minimum is a whole frame.
-Drop the rate below the refresh rate and the same server reports
-1.2–17.7 ms — inside one refresh. The fast path is fast; the number
-measures how often it is reachable.
+**Latency is only measurable below the display's own rate.** Above about
+30 moves/s the demand for flips (two per move, the age-2 cursor cost)
+exceeds the 60 Hz the hardware can retire, and the server pins at exactly
+60.0 flips/s. Both this build and the one before the deferred-flip fix do
+— measured, 60.0 vs 59.9 flips/s at 65 moves/s — so at that pacing the
+number reports queue depth, not input-to-photon, and both builds report
+~25 ms for that reason. `docs/latency.md` §4 has the rate sweep.
 
-**The server's figure is not the one to quote.** It ends at the vblank of
-the frame that consumed the input, and for a *client's* response that is
-one flip too early: a pointer move damages the cursor and flips
-immediately, before the client has answered, so the client's pixels ride
-the following flip. `nitro-demo`'s end-to-end median of 25.2 ms is the
-honest figure, it is 1.5 refreshes, and it misses the `DESIGN.md` budget
-by one frame. The cause is structural rather than slow — 0.3 ms of those
-25 is work — and the proposed scheduler fix is issue #529.
+**The two views agree now, which they did not before.** The server's
+figure ends at the vblank of the frame that consumed the input; the
+client's spans the whole round trip. They used to differ by a whole frame
+because a pointer move damaged the cursor and flipped before the client
+had answered (issue #529). With that flip deferred, both land at ~9.3 ms
+and the gap between them is the client's own reaction time, which is what
+it should have been measuring all along.
