@@ -399,8 +399,6 @@ struct Server {
         OwnedFd,
         nitro_scene::BufferDesc,
     )>,
-    /// Windows created so far, for the cascade.
-    windows_created: u32,
     /// Windows created while no output existed, waiting for one.
     unplaced: Vec<(ClientId, WindowKey)>,
     /// Newest input timestamp not yet consumed by a frame; see
@@ -562,7 +560,6 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         touch_targets: HashMap::new(),
         buffer_sources: HashMap::new(),
         pending_fds: Vec::new(),
-        windows_created: 0,
         unplaced: Vec::new(),
         pending_input_ns: 0,
         defer: defer::DeferredFlip::new().map_err(errno("create the deferred-flip timer"))?,
@@ -3283,7 +3280,6 @@ impl Server {
         };
         let (size, frame) = (info.size(), info.frame_size());
         let position = wm::place(self.wm.next_placement(), frame, area);
-        self.windows_created += 1;
         if let Err(e) = self.scene.place_window(win, Some(scene_id), position) {
             warn!("place window: {e}");
             return;

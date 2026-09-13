@@ -1278,9 +1278,9 @@ fn set_text_answers_with_metrics_and_puts_glyphs_on_screen() {
 
     h_.settle();
     let img = h_.shot(None).unwrap();
-    // This is the server's first window, so the cascade puts it at the
-    // output origin (see `cascade_position(0, ..)`) and a node's local
-    // coordinates are its device ones.
+    // `bx`/`by` came from this window's own `Configure`, so they are
+    // already the content's device origin whatever the window manager did
+    // with the frame around it.
     assert_eq!(configure.size, Size::new(300.0, 120.0));
     let origin = (bx as u32, (by + 6.0) as u32);
 

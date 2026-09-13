@@ -31,7 +31,7 @@
 use std::collections::HashMap;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
-use nitro_core::{IRect, Point, Rect, Size};
+use nitro_core::{IRect, Rect, Size};
 use nitro_scene::{
     Border, BufferDesc, BufferKey, ClientId, Error as SceneError, Fill as SceneFill, ImageRef,
     NodeKey, NodeKind as SceneNodeKind, Scene, TextAlign, TextRef, WindowFlags, WindowKey,
@@ -60,31 +60,6 @@ pub const MAX_NODES_PER_CLIENT: usize = 20_000;
 
 /// Bytes per pixel of every format the server accepts.
 const BYTES_PER_PIXEL: u32 = 4;
-
-/// How a window is placed when it is created: each window lands
-/// [`CASCADE_STEP`] pixels right and down from the previous one, wrapping
-/// once it would leave the output.
-pub const CASCADE_STEP: f32 = 32.0;
-
-/// How far into the output the cascade may walk before wrapping.
-pub const CASCADE_LIMIT: f32 = 320.0;
-
-/// The next cascade position for a window of `size` on an output of
-/// `output` logical units, given how many windows were placed before it.
-///
-/// Deliberately arithmetic rather than stateful: the placement of window
-/// `n` depends only on `n`, so it is predictable in a test and identical
-/// after a restart.
-#[must_use]
-pub fn cascade_position(index: u32, size: Size, output: Size) -> Point {
-    let steps = f32::from(u16::try_from(index % 16).unwrap_or(0));
-    let offset = (steps * CASCADE_STEP) % CASCADE_LIMIT.max(CASCADE_STEP);
-    // Never push a window so far that its top-left corner leaves the
-    // output: a window the user cannot reach is worse than an overlap.
-    let max_x = (output.w - size.w).max(0.0);
-    let max_y = (output.h - size.h).max(0.0);
-    Point::new(offset.min(max_x), offset.min(max_y))
-}
 
 /// A buffered mutation, kept until the client's `Commit`.
 #[derive(Debug)]
@@ -883,22 +858,6 @@ mod tests {
             size,
             fd: create_buffer(width, height, stride, size, format),
         }
-    }
-
-    #[test]
-    fn cascade_walks_and_wraps_inside_the_output() {
-        let size = Size::new(200.0, 100.0);
-        let output = Size::new(1920.0, 1080.0);
-        assert_eq!(cascade_position(0, size, output), Point::new(0.0, 0.0));
-        assert_eq!(cascade_position(1, size, output), Point::new(32.0, 32.0));
-        assert_eq!(cascade_position(2, size, output), Point::new(64.0, 64.0));
-        // Wraps once past the limit rather than walking off the screen.
-        let far = cascade_position(10, size, output);
-        assert!(far.x < CASCADE_LIMIT, "{far:?}");
-        assert_eq!(cascade_position(10, size, output), Point::new(0.0, 0.0));
-        // A window as big as the output is pinned to the origin.
-        let full = cascade_position(3, output, output);
-        assert_eq!(full, Point::new(0.0, 0.0));
     }
 
     #[test]

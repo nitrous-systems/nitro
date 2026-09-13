@@ -621,9 +621,14 @@ limit of 1024 — but real.
 
 - Unit tests per module: protocol parsing and replies, the `OutputState`
   age-2 rule and deadline maths, the statistics windows, control
-  buffering, cascade placement, buffer validation, pointer clamping and
-  hit-testing, keyboard resolution and hotkeys, the cursor bitmap,
-  logging, signals (skipped when the sandbox blocks SIGTERM).
+  buffering, buffer validation, pointer clamping and hit-testing,
+  keyboard resolution and hotkeys, the cursor bitmap, logging, signals
+  (skipped when the sandbox blocks SIGTERM), and — in `wm.rs` — the
+  whole of the window-management *policy*: frame hit regions, resize
+  arithmetic against a client's limits, centred-cascade placement,
+  tiling, the MRU order and the `Alt+Tab` cycle, double-click detection.
+  Policy is pure functions on purpose, so it is testable without a
+  server at all.
 - `tests/fake_loop.rs` runs `run(Config::fake(..))` on a thread with a
   fake input source — the real event loop, no seat and no evdev node —
   and covers fourteen things:
@@ -631,10 +636,12 @@ limit of 1024 — but real.
      `shot` by name and the error for an unknown one, `err` for a bad
      request, that an idle server stops flipping entirely, and that `quit`
      stops the thread and removes both socket files.
-  2. A client window: `Configure` with the size and scale it got,
-     `Presented` for its commit serial, the window's pixels where the
-     cascade put it (the first at the origin, the second one
-     `CASCADE_STEP` down and right), and non-zero `paint_us`/`damage_px`.
+  2. A client window: `Configure` with the size, scale and *content*
+     position it got, `Presented` for its commit serial, the window's
+     pixels where the window manager put it, and non-zero
+     `paint_us`/`damage_px`. Placement policy itself — the first window
+     centred, each later one a step down and right, all of them on screen
+     — is asserted against `wm::place` rather than re-derived.
   3. Pointer motion: `PointerEnter` naming the rect node with
      window-local coordinates, a second move inside producing
      `PointerMotion` rather than another enter, `PointerLeave` on the way
@@ -678,6 +685,21 @@ limit of 1024 — but real.
       climbing; cursor movement over the desktop is never deferred and
       still costs exactly 2 flips per move; and a settled server after a
       deferral makes no further frames, so the timer is really disarmed.
+- `tests/wm.rs` drives the M3 window manager through the same real loop:
+  a decorated window's title bar painted above its content and an
+  undecorated one with no frame at all; a title-bar drag moving the frame
+  by exactly the drag delta while the damage stays proportional to the
+  window; an edge drag resizing it and `Configure`-ing the client, and
+  the client's own `SetWindowLimits` clamping both ends of it; the close
+  and maximize buttons; `Super`-drag moving and resizing an *undecorated*
+  window; `Alt+Tab` walking three windows in MRU order and holding its
+  place across repeated Tabs; a minimized window gone from the screen and
+  from the hit test but still reachable with `Alt+Tab`; `Super+Q`/`M`/
+  arrows; a client asking for `Fullscreen` and being told what it got; a
+  `FIXED_SIZE` window silently refusing to maximize; a second output via
+  `plug`, a window dragged onto it changing `Configure.output`, and
+  `unplug` migrating it back; and a scale-2 output drawing twice the
+  device pixels for the same logical window.
 - `src/test_support.rs`, behind the **`test-support`** feature, is
   `tests/fake_loop.rs`'s harness factored out so another crate can use it:
   `TestServer::start` runs the real loop on a thread with a fake backend
