@@ -681,6 +681,16 @@ impl Wire {
         Ok(id)
     }
 
+    /// Release a buffer id. The server drops its mapping at the next
+    /// commit, so the id must not be reused before then — and it is not:
+    /// `next_buffer` is monotonic.
+    pub(crate) fn destroy_buffer(&mut self, id: BufferId) -> Result<(), Error> {
+        self.send(
+            &ClientMsg::DestroyBuffer(msg::DestroyBuffer { id }),
+            NodeId::NONE,
+        )
+    }
+
     /// Emit an image slot, sending only what changed.
     pub(crate) fn paint_image(
         &mut self,

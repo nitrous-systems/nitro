@@ -384,6 +384,14 @@ close its own copy and the loop never has to reconstruct a `BorrowedFd`
 from a raw number (which would need `unsafe`, which this tree does not
 use).
 
+The introspection listener joins the same set, and `Socket::serve` runs
+after the timers and before the flush. One caveat to the "blocks in
+`epoll_wait`" claim above: **connected** introspection clients are not
+registered in the set, only the listener is, so while one is attached the
+loop clamps its timeout to 10 ms and wakes 100×/s. With nothing connected
+— the normal case — the app blocks indefinitely exactly as before. See
+`docs/introspection.md`; registering the client streams is M3.
+
 ## Writing a widget
 
 A widget is a plain struct with a `Widget<S>` impl. Every method has a
@@ -478,8 +486,8 @@ an early version of every pointer test saw no hover at all.
 
 | what | value | at the end of #3682 |
 |---|---|---|
-| binary | **522 032 bytes** (522 KB) | 444 608 (444 KB) |
-| RSS / HWM | **2 580 kB** | 2 500 kB |
+| binary | **522 112 bytes** (522 KB) | 444 608 (444 KB) |
+| RSS / HWM | **2 576 kB** | 2 500 kB |
 | threads | 1 | 1 |
 | context switches over 5 s idle | **0** (client and server both) | 0 |
 | `ldd` | `libc`, `libgcc_s`, vdso — nothing else | same |
@@ -494,16 +502,16 @@ App code in `main`: 31 lines as rustfmt wraps it.
 ### What the introspection socket cost, and why it is not small
 
 The spec expected the introspection code to be a small delta, and asked
-for the reason if it was not. It is **+77 424 bytes of binary (+17 %)
-and +80 kB of RSS**, and the honest attribution is that essentially all
+for the reason if it was not. It is **+77 504 bytes of binary (+17 %)
+and +76 kB of RSS**, and the honest attribution is that essentially all
 of it is the socket rather than the widgets. Building the same example
 three ways:
 
 | build | binary | delta |
 |---|---|---|
-| this tree | 522 032 | — |
-| `App::run` never binding the socket (`introspect(false)` hard-coded) | 514 952 | −7 080 |
-| the `introspect` and `shot` modules removed from the crate | 453 600 | −68 432 |
+| this tree | 522 112 | — |
+| `App::run` never binding the socket (`introspect(false)` hard-coded) | 514 952 | −7 160 |
+| the `introspect` and `shot` modules removed from the crate | 453 600 | −68 512 |
 
 Summing the symbol sizes of an unstripped build agrees: `nitro_ui::
 introspect::*` is **39 322 bytes** of text and `nitro_ui::shot::*` 1 001,
@@ -531,7 +539,7 @@ Two reasons the socket is as big as it is, and one of them is fixable:
    avoids `{:?}` and the `{:.4}`-then-trim form is the only float
    formatting the protocol does.
 
-The RSS delta (+80 kB, roughly the binary growth) is entirely
+The RSS delta (+76 kB, roughly the binary growth) is entirely
 resident text: the socket allocates nothing until something connects, and
 its `snapshot` vector is freed the moment the last watcher goes away —
 `Socket::serve` shrinks it to fit, so an app nobody is watching pays for
@@ -585,6 +593,11 @@ regrets:
   Activation (`click`) is the exception and *is* announced, by
   `EventCx::report_activation`, because running a callback leaves no
   trace in the tree to diff.
+* **An `Image` holds two server-side buffers across a replacement.**
+  `set_pixels` cannot release the old one itself (a setter has no
+  connection), so the release is deferred to the next paint. A widget
+  that replaces its pixels and is never painted again keeps one buffer
+  alive until it is dropped.
 * **`shot` screenshots the whole output and crops.** The window's
   position comes from `Configure`; a window that has moved without the
   client being told would crop the wrong rectangle. The server always
@@ -603,6 +616,18 @@ regrets:
   group, so its child is laid out at full height. A list of ten thousand
   rows therefore costs ten thousand widgets; virtualisation is M3 and is
   a widget, not a new mechanism.
+* **Scrolling under a stationary pointer does not re-hover.** Hit testing
+  and `window_bounds` *do* account for a content transform — a scrolled
+  button is clicked and reported where it is drawn — but the hover chain
+  is only recomputed on a pointer event. Scroll a list under a still
+  pointer and the widget that was under it stays hovered until the
+  pointer moves. Re-running the hover walk after a transform change is
+  the fix and it is M3; it needs `&mut S` to deliver the enter/leave
+  events, which `set_content_transform` does not have.
+* **Only the translation of a content transform is honoured** by hit
+  testing and `window_bounds` (`e` and `f`). M2 produces nothing else —
+  `Scroll` is the only caller — but a widget that rotated or scaled its
+  children would be hit-tested as though it had not.
 * **`Button::on_click` is `Fn`, not `FnMut`** — it is taken out of the
   button for the call (same trick as the arena), and a `FnMut` would need
   either a second take-out or interior mutability. `&mut S` is where the

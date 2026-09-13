@@ -401,13 +401,20 @@ impl<S: 'static> Ui<S> {
     }
 
     /// A widget's bounds in window coordinates.
+    ///
+    /// Each ancestor contributes its origin **and its content
+    /// transform**: a widget inside a scrolled [`Scroll`](crate::widgets::Scroll)
+    /// has not moved in its parent's coordinate space — that is what
+    /// makes scrolling one mutation — but it has moved on screen, and
+    /// this is the rectangle an outside process points at.
     #[must_use]
     pub fn window_bounds(&self, id: WidgetId) -> Rect {
         let mut r = self.bounds(id);
         let mut cur = self.parent(id);
         while let Some(p) = cur {
             let b = self.bounds(p);
-            r = r.translate(b.x, b.y);
+            let t = self.content_transform(p);
+            r = r.translate(b.x + t.e, b.y + t.f);
             cur = self.parent(p);
         }
         r
@@ -600,6 +607,14 @@ impl<S: 'static> Ui<S> {
         style: &TextStyle,
     ) -> Result<Vec<(u32, f32)>, Error> {
         self.wire.cursor_positions(text, style)
+    }
+
+    /// Release a server-side buffer.
+    ///
+    /// Ids are monotonic and never recycled, so a released id cannot
+    /// come back naming something else.
+    pub fn release_buffer(&mut self, buffer: nitro_wire::types::BufferId) {
+        let _ = self.wire.destroy_buffer(buffer);
     }
 
     /// Take the widgets activated since the last call.
@@ -1487,6 +1502,12 @@ impl<S: 'static> Ui<S> {
 
     /// The chain of widgets under `pos`, outermost first, each with the
     /// position in its own coordinate space.
+    ///
+    /// A widget's **content transform** is applied on the way down: a
+    /// scrolled viewport leaves its children's bounds alone and moves
+    /// the group they hang under, so the point has to travel the same
+    /// way the pixels did or a scrolled row is clickable where it used
+    /// to be.
     fn hit_chain(&self, pos: Point, out: &mut Vec<(WidgetId, Point)>) {
         out.clear();
         let Some(root) = self.root else { return };
@@ -1502,12 +1523,17 @@ impl<S: 'static> Ui<S> {
                 return;
             }
             out.push((id, local));
+            // Children are positioned inside the content group, so the
+            // point enters their space with the group's transform undone.
+            // M2 only ever produces a translation.
+            let t = slot.state.content_transform;
+            let inner = Point::new(local.x - t.e, local.y - t.f);
             // Later children are on top, so the deepest hit is found by
             // walking backwards.
             let mut next = None;
             for c in slot.state.children.iter().rev() {
                 if let Some(cs) = self.arena.slot(*c)
-                    && cs.state.bounds.contains(local)
+                    && cs.state.bounds.contains(inner)
                 {
                     next = Some(*c);
                     break;
@@ -1516,7 +1542,7 @@ impl<S: 'static> Ui<S> {
             match next {
                 Some(c) => {
                     id = c;
-                    p = local;
+                    p = inner;
                 }
                 None => return,
             }

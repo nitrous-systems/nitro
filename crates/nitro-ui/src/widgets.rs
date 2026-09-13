@@ -2588,6 +2588,13 @@ pub struct Image {
     buffer: Option<BufferId>,
     /// Pixels waiting to be registered, `ARGB` as `[b, g, r, a]` rows.
     pending: Option<Vec<u8>>,
+    /// A buffer replaced by `set_pixels` and not yet released.
+    ///
+    /// The release is deferred to the next paint because that is where
+    /// the widget has a connection to send on; a setter has only itself
+    /// and the tree. Holding exactly one keeps a widget that replaces
+    /// its pixels every frame at two live buffers rather than N.
+    stale: Option<BufferId>,
     /// Whether the pixels have an alpha channel worth blending.
     alpha: bool,
 }
@@ -2617,6 +2624,13 @@ impl<S: 'static> Widget<S> for Image {
             // widget is built before it has a connection to send on, and
             // the `Ui` is only reachable from a pass context.
             self.buffer = cx.upload_image(self.width, self.height, self.alpha, &px);
+        }
+        // The buffer the new pixels replaced is released here, after the
+        // node has stopped pointing at it, for the same reason: a setter
+        // has no connection. Without this an app that replaces its image
+        // leaks one server-side buffer per replacement.
+        if let Some(old) = self.stale.take() {
+            cx.release_image(old);
         }
         let Some(buffer) = self.buffer else {
             return;
@@ -2648,6 +2662,10 @@ impl<S: 'static> WidgetMut<'_, Image, S> {
     /// Replace the pixels. `pixels` is `width * height * 4` bytes,
     /// `[b, g, r, a]` per pixel, rows tightly packed.
     ///
+    /// The buffer being replaced is released at the next paint, so an
+    /// app that updates its image repeatedly holds two server-side
+    /// buffers, not one per update.
+    ///
     /// # Panics
     /// Never; a wrongly sized buffer is ignored and the old image stays.
     pub fn set_pixels(&mut self, width: u32, height: u32, pixels: Vec<u8>) {
@@ -2657,7 +2675,14 @@ impl<S: 'static> WidgetMut<'_, Image, S> {
         self.width = width;
         self.height = height;
         self.pending = Some(pixels);
-        self.buffer = None;
+        // A replacement that arrives before the previous one was ever
+        // painted has nothing new to retire, so the older `stale` (if
+        // any) is kept rather than overwritten and leaked.
+        if let Some(old) = self.buffer.take()
+            && let Some(older) = self.stale.replace(old)
+        {
+            self.ui().release_buffer(older);
+        }
         self.request_layout();
     }
 }
@@ -2707,6 +2732,7 @@ pub fn image<S: 'static>(width: u32, height: u32, pixels: Vec<u8>) -> ImageBuild
             height: if ok { height } else { 0 },
             buffer: None,
             pending: ok.then_some(pixels),
+            stale: None,
             alpha: true,
         },
     }

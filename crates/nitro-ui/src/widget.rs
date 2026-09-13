@@ -534,6 +534,15 @@ impl<S: 'static> PaintCx<'_, S> {
         }
     }
 
+    /// Release a server-side buffer this widget allocated.
+    ///
+    /// The server frees its mapping at the next commit. Client-side ids
+    /// are monotonic and never recycled, so there is no window in which
+    /// a released id could name something else.
+    pub fn release_image(&mut self, buffer: BufferId) {
+        let _ = self.ui.wire_mut().destroy_buffer(buffer);
+    }
+
     /// Where slot `slot`'s node goes: under this widget's group, in
     /// front of its content group so children paint on top.
     fn slot_at(&self, slot: u8) -> crate::wire::SlotAt {

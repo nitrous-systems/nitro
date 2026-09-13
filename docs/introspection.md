@@ -93,18 +93,34 @@ socket at all calls `App::introspect(false)`.
 
 ## The loop it runs on
 
-The listener and every connected client are registered in the app's own
-`epoll` set, and requests are executed **between events, on the app
-thread**, by the same loop that runs the app's callbacks. Nothing is
-locked, nothing is cloned, no request can observe a half-laid-out tree,
-and a callback triggered by `do` runs with exactly the `&mut S` and
-`&mut Ui<S>` a real click would give it.
+The **listener** is registered in the app's own `epoll` set, and requests
+are executed **between events, on the app thread**, by the same loop that
+runs the app's callbacks. Nothing is locked, nothing is cloned, no
+request can observe a half-laid-out tree, and a callback triggered by
+`do` runs with exactly the `&mut S` and `&mut Ui<S>` a real click would
+give it.
 
 That is the BeOS property: IPC and the application share one message
 loop, so "scriptable" costs neither a thread nor a lock.
 
 After a batch of requests the app flushes as usual, so a `set` or a `do`
 produces exactly the mutations the equivalent user input would.
+
+**Connected clients are polled, not registered**, and that is a wart
+worth stating plainly. Only the listener has an `epoll` token; while at
+least one client is connected the loop clamps its `epoll_wait` timeout to
+10 ms and calls `Socket::serve` on each turn. So an app with a `hey
+watch` attached wakes **100 times a second** — which is in direct tension
+with the "blocks in `epoll_wait` and no bytes move" property `docs/ui.md`
+claims a few sections away, and the claim holds only while nothing is
+connected. An idle app with no client registers nothing extra, waits
+exactly as before and wakes not at all.
+
+The reason is bookkeeping rather than principle: clients come and go
+constantly, and each would need an `epoll` token allocated, tracked and
+deleted, in a loop whose token space is currently three constants and a
+raw fd. Registering each client stream (and reverting the timeout clamp)
+is a contained change and the right one; it is M3.
 
 ## The protocol
 
@@ -213,6 +229,17 @@ into `click` events. One click on a button with a callback produces two
 events in one batch: the `click`, then whatever `value` the callback
 changed.
 
+### A note on bounds
+
+`bounds` is the rectangle the widget is **drawn** at, in window
+coordinates: ancestors contribute their origin *and* their content
+transform, so a widget inside a scrolled viewport reports where it
+currently is, not where it would be unscrolled. That is what makes
+`bounds` usable for "point at this widget" and what lets it stand in for
+AT-SPI's `Component::getExtents`. A widget scrolled out of its viewport
+reports a rectangle outside the viewport rather than being hidden — the
+clip is a paint-time fact, and `list` does not filter by visibility.
+
 ### `shot`
 
 `ok <w> <h> <stride>` and then `stride × h` bytes of `XRGB8888`: the
@@ -256,12 +283,12 @@ Measured on `examples/hello_dialog.rs`, release, stripped:
 
 | build | binary | delta |
 |---|---|---|
-| with the socket (the default) | 522 032 | — |
-| `App::run` never binding it | 514 952 | −7 080 |
-| the `introspect` and `shot` modules removed | 453 600 | −68 432 |
+| with the socket (the default) | 522 112 | — |
+| `App::run` never binding it | 514 952 | −7 160 |
+| the `introspect` and `shot` modules removed | 453 600 | −68 512 |
 
-So the socket costs **+77 424 bytes (+17 %)** over the toolkit without
-it, and **+80 kB of RSS** — which is resident text, not data: nothing is
+So the socket costs **+77 504 bytes (+17 %)** over the toolkit without
+it, and **+76 kB of RSS** — which is resident text, not data: nothing is
 allocated until a client connects, and the `watch` snapshot is freed when
 the last watcher goes.
 

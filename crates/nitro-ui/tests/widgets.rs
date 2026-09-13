@@ -390,3 +390,120 @@ fn tab_reaches_every_new_widget_and_focus_shows() {
     h.key(key::TAB);
     assert_eq!(h.ui().focused(), Some(order[0]));
 }
+
+#[test]
+fn a_scrolled_child_is_clicked_and_reported_where_it_now_is() {
+    // `Scroll` moves its children with a transform and never touches
+    // their bounds — that is what makes scrolling one mutation. Hit
+    // testing and `window_bounds` must therefore account for it, or a
+    // scrolled button is clickable where it *used* to be and `hey` reports
+    // a rectangle that is no longer on screen.
+    struct S {
+        hits: Vec<u32>,
+    }
+    let mut h = Harness::sized(
+        "scrollhit",
+        S { hits: Vec::new() },
+        Size::new(200.0, 120.0),
+        |ui: &mut Ui<S>| {
+            let inner = ui.build(column().gap(0.0).children((0..6).map(|i| {
+                button(format!("b{i}"))
+                    .name(format!("b{i}"))
+                    .height(20.0)
+                    .on_click(move |s: &mut S, _ui: &mut Ui<S>| s.hits.push(i))
+            })));
+            let view = ui.build(scroll().height(60.0).name("view"));
+            ui.attach(view, inner).unwrap();
+            let root = ui.build(panel().background(Color::WHITE).padding(0.0));
+            ui.attach(root, view).unwrap();
+            root
+        },
+    );
+    let view = kids(&mut h)[0];
+    let inner = h.ui().children(view)[0];
+    let rows = h.ui().children(inner);
+    assert_eq!(rows.len(), 6);
+
+    // Unscrolled: the top row is at the top of the viewport.
+    let top = h.bounds(rows[0]);
+    h.click_at(Point::new(top.x + 5.0, top.y + 5.0));
+    assert_eq!(h.state().hits, [0], "unscrolled, the first row is on top");
+
+    // Scroll by two rows. Row 2 is now where row 0 was.
+    h.ui().widget_mut::<Scroll>(view).unwrap().scroll_to(40.0);
+    h.settle();
+    same(h.widget::<Scroll>(view).offset(), 40.0);
+
+    assert_eq!(
+        h.bounds(rows[2]),
+        top,
+        "a scrolled child reports the rectangle it is actually drawn at"
+    );
+    // The pointer has to actually move for the hover chain to be walked
+    // again: scrolling moves the content under a stationary pointer, and
+    // nothing re-hit-tests until the next pointer event. That is a real
+    // limitation (recorded in docs/ui.md), not an artefact of the test —
+    // without this line the click would still be routed to row 0.
+    h.move_pointer(Point::new(top.x + 5.0, top.y + 15.0));
+    h.click_at(Point::new(top.x + 5.0, top.y + 5.0));
+    assert_eq!(
+        h.state().hits,
+        [0, 2],
+        "the click lands on the row that is now under the pointer"
+    );
+
+    // And the row scrolled off the top is no longer hit at all.
+    assert!(
+        h.bounds(rows[0]).y < top.y,
+        "row 0 moved up out of the viewport: {:?}",
+        h.bounds(rows[0])
+    );
+}
+
+#[test]
+fn replacing_an_image_releases_the_buffer_it_replaced() {
+    // Without the release, an app that updates one image per frame leaks
+    // a server-side buffer per frame for its whole lifetime. Counting
+    // mutations is how that claim is checked from outside.
+    let red: Vec<u8> = (0..8 * 8).flat_map(|_| [0u8, 0, 255, 255]).collect();
+    let blue: Vec<u8> = (0..8 * 8).flat_map(|_| [255u8, 0, 0, 255]).collect();
+    let mut h = Harness::sized("imgswap", (), Size::new(80.0, 80.0), |ui: &mut Ui<()>| {
+        let img = ui.build(nitro_ui::widgets::image(8, 8, red.clone()));
+        let root = ui.build(panel().background(Color::WHITE).padding(8.0));
+        ui.attach(root, img).unwrap();
+        root
+    });
+    let img = kids(&mut h)[0];
+    let first = h
+        .widget::<nitro_ui::widgets::Image>(img)
+        .buffer()
+        .expect("the first buffer was uploaded");
+
+    h.tap();
+    h.clear_tap();
+    h.ui()
+        .widget_mut::<nitro_ui::widgets::Image>(img)
+        .unwrap()
+        .set_pixels(8, 8, blue.clone());
+    h.settle();
+
+    let ops: Vec<&str> = h.mutations().iter().map(|m| m.op).collect();
+    assert!(
+        ops.contains(&"CreateBuffer"),
+        "the new pixels were uploaded: {ops:?}"
+    );
+    assert!(
+        ops.contains(&"DestroyBuffer"),
+        "the replaced buffer was released: {ops:?}"
+    );
+    let second = h
+        .widget::<nitro_ui::widgets::Image>(img)
+        .buffer()
+        .expect("the second buffer");
+    assert_ne!(second, first, "a replacement is a new buffer id");
+
+    // The new pixels really are on screen.
+    let b = h.bounds(img);
+    let px = h.shot().pixel(b.x as u32 + 4, b.y as u32 + 4);
+    assert_eq!(px & 0x00ff_ffff, 0x0000_00ff, "the blue block is drawn");
+}
