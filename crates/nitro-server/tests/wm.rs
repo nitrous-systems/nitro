@@ -983,6 +983,54 @@ fn a_client_asks_for_a_state_and_is_told_what_it_got() {
 }
 
 #[test]
+fn maximizing_from_minimized_still_remembers_where_the_window_was() {
+    // `Minimized` keeps a window's geometry, so a client may legally
+    // minimize and then maximize. If the restore rectangle were only taken
+    // on the way out of `Normal`, that path would lose it and the window
+    // could never get its own size back.
+    let mut h = Harness::start("restore", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("restore");
+    let mut win = make_window(&mut conn, &mut inbox, 1, "restore", WIN, RED, 0, 1);
+    park(&mut h);
+    let before = (win.pos, win.size);
+
+    conn.tx()
+        .set_window_state(win.root, WindowState::Minimized)
+        .commit(2)
+        .unwrap();
+    conn.flush().unwrap();
+    h.settle();
+    assert_eq!(h.stat("minimized"), 1);
+
+    conn.tx()
+        .set_window_state(win.root, WindowState::Maximized)
+        .commit(3)
+        .unwrap();
+    conn.flush().unwrap();
+    h.settle();
+    await_configure(&mut conn, &mut inbox, &mut win, "maximize");
+    assert_ne!((win.pos, win.size), before, "it did maximize");
+
+    conn.tx()
+        .set_window_state(win.root, WindowState::Normal)
+        .commit(4)
+        .unwrap();
+    conn.flush().unwrap();
+    h.settle();
+    await_configure(&mut conn, &mut inbox, &mut win, "back to normal");
+    assert_eq!(
+        (win.pos, win.size),
+        before,
+        "the pre-minimize rectangle survived the detour"
+    );
+
+    drop(conn);
+    h.quit();
+}
+
+
+#[test]
 fn a_fixed_size_window_cannot_be_maximized_and_has_no_maximize_button() {
     let h = Harness::start("fixed", OUT.0, OUT.1);
     let mut inbox = Inbox::default();

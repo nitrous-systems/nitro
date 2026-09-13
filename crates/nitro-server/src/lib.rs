@@ -1661,10 +1661,10 @@ impl Server {
         let output = input::output_at(&self.scene, point);
         self.pointer.output = output;
         // A drag in flight owns every motion: the window follows the
-        // pointer and the client hears nothing at all, which is what makes
-        // a drag zero round trips. A resize does send one `Configure` per
-        // motion, and the frame scheduler already throttles those to one
-        // per frame.
+        // pointer and the client is never consulted, which is what makes a
+        // drag zero round trips. Both a move and a resize do send one
+        // one-way `Configure` per motion, and the frame scheduler already
+        // throttles those to one per frame.
         if let Some(drag) = self.wm.drag()
             && self.drive_drag(drag)
         {
@@ -2392,16 +2392,23 @@ impl Server {
     /// logical units each one starts where the previous ended, at its own
     /// scale, so a 2x output takes half as much desktop width as its
     /// device width.
+    ///
+    /// The ordering is taken from the *device* rectangles `sync_outputs`
+    /// assigned (which are in connector order), not from `Scene::outputs`'s
+    /// iteration order, which is the order outputs were first added:
+    /// unplugging a connector and plugging one that sorts earlier would
+    /// otherwise leave desktop space arranged differently from device
+    /// space, and a window would jump as a drag crossed an output edge.
     fn desktop_origin(&self, id: SceneOutputId) -> Point {
+        let Some((_, mine, _)) = self.scene.outputs().find(|(out, _, _)| *out == id) else {
+            return Point::ZERO;
+        };
         let mut x = 0.0;
-        for (out, rect, scale) in self.scene.outputs() {
-            if out == id {
-                return Point::new(x, 0.0);
-            }
+        for (_, rect, scale) in self.scene.outputs().filter(|(_, r, _)| r.x < mine.x) {
             let s = if scale > 0.0 { scale } else { 1.0 };
             x += rect.w as f32 / s;
         }
-        Point::ZERO
+        Point::new(x, 0.0)
     }
 
     /// A window's frame rectangle in desktop coordinates.
@@ -2535,8 +2542,19 @@ impl Server {
         {
             return;
         }
-        let was_normal = info.state() == WindowState::Normal;
-        if was_normal && matches!(state, WindowState::Maximized | WindowState::Fullscreen) {
+        // The restore rectangle is taken whenever a window *enters* the
+        // enlarged states from outside them — not just from `Normal`.
+        // `Minimized` keeps a window's geometry (it is not a soft close),
+        // so minimize → maximize must remember the pre-maximize rectangle
+        // too, or `Normal` would have nowhere to put the window back and it
+        // would be stuck at the maximized size for good. Going the other
+        // way, `Maximized` → `Fullscreen` must *not* overwrite it: what is
+        // remembered there is already the normal rectangle.
+        let was_enlarged = matches!(
+            info.state(),
+            WindowState::Maximized | WindowState::Fullscreen
+        );
+        if !was_enlarged && matches!(state, WindowState::Maximized | WindowState::Fullscreen) {
             // Remembered in *desktop* coordinates, like every other
             // window-manager rectangle: the window may come back out of
             // maximize on a different output than it went in on.

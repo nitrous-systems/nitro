@@ -12,9 +12,10 @@ Two decisions shape everything below, and both were made deliberately:
   bar, the border and the buttons, as scene nodes it owns. A client that
   wants its own passes `UNDECORATED` and gets a bare group.
 * **The server moves and resizes windows with zero client round-trips.** A
-  drag is a transform update per motion event and *no protocol traffic at
-  all*; a resize is one `Configure` per motion, which the frame scheduler
-  already throttles to one per frame.
+  drag is one scene mutation per motion event plus one *one-way*
+  `Configure` telling the client where it now is; nothing is ever asked of
+  the client and nothing is waited for. The frame scheduler already
+  throttles those `Configure`s to one per frame.
 
 ## Frame groups
 
@@ -94,8 +95,10 @@ M3.
   corner — on any window, decorated or not. That is the whole of what an
   undecorated window loses by opting out.
 * A drag in flight owns every motion: the window follows the pointer and
-  the client hears nothing. A move sends no protocol message at all; a
-  resize sends one `Configure` per motion.
+  the client is never consulted. Both a move and a resize send one
+  one-way `Configure` per motion — a move because `Configure.position` is
+  what a client crops a screenshot with, so a pure move still changes what
+  it must be told. Neither blocks on a reply.
 * Dragging a maximized window by its title bar restores it first, under
   the cursor, so the restore rectangle is not silently discarded.
 

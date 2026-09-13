@@ -15,9 +15,11 @@
 //!   and two buttons. A client that sets `UNDECORATED` gets no frame and
 //!   still gets server move/resize through the `Super` modifier.
 //! * **The server moves and resizes windows with zero client round-trips.**
-//!   A move is one transform update per motion event and no protocol
-//!   traffic at all; a resize is one `Configure` per motion, which the
-//!   frame scheduler already throttles to one per frame.
+//!   A drag is one scene mutation per motion event plus one
+//!   *one-way* `Configure` (a move changes `Configure.position`, which is
+//!   what a client crops a screenshot with); the client is never asked
+//!   anything and nothing waits for it. The frame scheduler throttles
+//!   those `Configure`s to one per frame.
 //! * **Focus follows the raise**, the raise follows the click, and the MRU
 //!   list is what `Alt+Tab` walks.
 //!
