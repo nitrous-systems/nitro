@@ -266,11 +266,32 @@ pub struct Pointer {
     pub over: Option<WindowKey>,
     /// The output the position falls on.
     pub output: Option<OutputId>,
-    /// Whether any pointer device exists (no device: no cursor drawn).
+    /// Whether the initial position has been chosen (the middle of the
+    /// first output, once there is one).
+    pub placed: bool,
+    /// Whether a pointer device has ever reported anything, which is what
+    /// decides whether the cursor is drawn.
+    ///
+    /// Derived from events rather than from the device scan: libinput
+    /// classifies a device's capabilities, but a machine can have a
+    /// touchpad that is disabled, or a "pointer" that is really a lid
+    /// switch, and the honest test of whether there is a pointer on this
+    /// desk is whether one has moved. A keyboard-only box therefore draws
+    /// no arrow, which is the right answer and is also what the
+    /// screenshots of a headless server should show.
     pub present: bool,
 }
 
 impl Pointer {
+    /// Note that a pointer device reported something: from now on the
+    /// cursor is drawn. Returns whether this was the first time, which
+    /// damages the cursor rect that just appeared.
+    pub fn seen(&mut self) -> bool {
+        let first = !self.present;
+        self.present = true;
+        first
+    }
+
     /// Position as a scene point.
     #[must_use]
     pub fn position(&self) -> Point {
@@ -457,6 +478,13 @@ impl input::LibinputInterface for SeatInterface {
         {
             warn!("closing an input device: {e}");
         }
+        // Note: on this libseat build `close_device` returns success but
+        // does *not* close the descriptor it handed out, so a VT switch
+        // leaks one fd per device. That is a `nitro-seat` bug (issue
+        // #525), not one this module can fix: the fd lives inside the
+        // `libseat::Device` that `close_device` consumes, so we no longer
+        // hold it, and closing it from here would become a double-close
+        // the moment the layer below starts closing it properly.
         // A failed borrow means we are inside a seat dispatch, which
         // cannot happen from libinput; `device` then closes through its
         // own `Drop`, which routes to the same place.

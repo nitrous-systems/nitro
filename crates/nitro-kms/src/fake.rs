@@ -16,7 +16,8 @@
 //!   as idle as a fresh one.
 //! - Damage passed to `commit` is recorded verbatim in `damage_log()`.
 //! - Hotplug is simulated with `plug()` / `unplug()`: they queue an
-//!   `Event::Hotplug`; the change takes effect on `rescan`.
+//!   `Event::Hotplug` **and make the poll fd readable**, so an idle
+//!   server wakes for it; the change takes effect on `rescan`.
 
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -165,14 +166,32 @@ impl FakeBackend {
     /// output appears after `rescan`.
     pub fn plug(&mut self, spec: FakeOutputSpec) {
         self.pending_specs.push(spec);
-        self.hotplug_queued = true;
+        self.queue_hotplug();
     }
 
     /// Simulate unplugging: queues `Event::Hotplug`; the output vanishes
     /// after `rescan`.
     pub fn unplug(&mut self, output: OutputId) {
         self.pending_removals.push(output);
+        self.queue_hotplug();
+    }
+
+    /// Queue a hotplug **and make the poll fd readable**, so a server
+    /// sitting in `epoll_wait` actually wakes up for it.
+    ///
+    /// Without the second half the event is only delivered if something
+    /// else happens to fire the timer, which on an idle desktop — or one
+    /// with no output at all, which is exactly when a hotplug matters most
+    /// — is never. The real backend gets this for free: its uevent socket
+    /// becomes readable on its own.
+    fn queue_hotplug(&mut self) {
         self.hotplug_queued = true;
+        if let Err(e) = self.arm() {
+            // The only failure mode is a broken timerfd, which would have
+            // shown up long before this; there is nothing useful to do
+            // with it here and the caller is a test.
+            debug_assert!(false, "arming the fake timer for a hotplug: {e}");
+        }
     }
 
     /// Every `(output, damage)` passed to `commit`, oldest first.
@@ -302,6 +321,11 @@ impl FakeBackend {
 }
 
 impl Backend for FakeBackend {
+    fn simulate_plug(&mut self, width: u32, height: u32) -> bool {
+        self.plug(FakeOutputSpec::new(width, height));
+        true
+    }
+
     fn outputs(&self) -> &[OutputInfo] {
         &self.infos
     }

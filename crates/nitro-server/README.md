@@ -43,6 +43,7 @@ tests.
 | `outputs`            | `ok\n`, one `name WxH@refresh_mhz\n` per output, blank line            |
 | `stats`              | `ok\n`, one `key value` line per statistic (see below), blank line     |
 | `quit`               | `ok\n`, then orderly shutdown                                          |
+| `plug WxH`           | `ok\n`; fake backend only — hotplugs an output in, so a test can drive the "no output yet" state. Refused on DRM, where an output exists because a connector says so. |
 | anything else        | `err <message>\n`                                                     |
 
 Several requests per connection are fine; a request line longer than 256
@@ -154,17 +155,56 @@ changed: only the damaged *rows* are re-read, one `pread` per row band,
 because a row is contiguous and damage rectangles are usually wide.
 Revisit with sealing when a client pushes video.
 
-**Placement and timing.** A new window is cascaded onto the primary
-output — `CASCADE_STEP` pixels right and down from the previous one,
-wrapping, and never so far that its top-left corner leaves the output.
-The placement is arithmetic in the window's index rather than stateful, so
-it is predictable in a test and identical after a restart. The client is
-then told what it got with `Configure` (size, scale, output); a later
-resize the server or the client's own `SetBounds` decides on produces
-another. A commit is reported with `Presented` when the frame carrying it
-reaches the screen, and a `RequestFrame` is answered with `Frame` *after*
-the flip, not at commit time — the deadline it carries is only meaningful
-once the vblank it is extrapolated from has actually happened.
+`DestroyBuffer` releases the descriptor as well as the pixels. The scene
+forgets the bytes on its own, but the fd is the server's, and a client
+that cycles buffers — create, damage, destroy, once per frame, which is
+the obvious way to push changing images — would otherwise leak one
+descriptor per frame until it hit the process limit.
+
+**Placement.** A new window is cascaded onto the primary output —
+`CASCADE_STEP` pixels right and down from the previous one, wrapping, and
+never so far that its top-left corner leaves the output. The placement is
+arithmetic in the window's index rather than stateful, so it is
+predictable in a test and identical after a restart. The client is then
+told what it got with `Configure` (size, scale, output); a later resize
+the server or the client's own `SetBounds` decides on produces another.
+
+A window created while there is *no* output — every connector unplugged,
+or a hotplug still in flight — is held in a pending list instead. It is a
+real window owning real nodes; it simply has nowhere to be, and it is
+placed and configured the moment an output appears. No `Configure` is
+sent before then: an unplaced window has no size, scale or output to
+report, and naming output 0 for it would be a lie the client cannot
+detect.
+
+**Presentation and frame callbacks.** A commit is reported with
+`Presented` when the frame carrying it reaches the screen, and a
+`RequestFrame` is answered with `Frame` *after* the flip, because the
+deadline it carries is only meaningful once the vblank it is extrapolated
+from has actually happened.
+
+Both of those need a second path, though, and the reason is the design
+itself: **the server only flips when something changed**, so "wait for the
+next flip" is not a promise it can keep to a client that changed nothing.
+Two cases would otherwise hang:
+
+* A commit that damages no pixel — a hidden subtree, a property set to the
+  value it already had, a bare `RequestFrame`. The serial is the client's
+  flow control, so it is acknowledged from the last vblank we saw rather
+  than held for a frame that will never carry it. Holding it would stall
+  any client that waits for `Presented` before sending the next frame, and
+  would grow the pending list without bound.
+* A `RequestFrame` from a quiescent desktop — which is exactly how a
+  client *starts* an animation. If the answer waited for a flip, and the
+  flip waited for damage, and the damage was going to be the client's
+  response to the answer, nothing would ever happen. It is answered
+  immediately from the extrapolated vblank clock, which
+  `frame::frame_deadline` computes with or without a flip having happened.
+
+A commit is stamped only onto the outputs its own windows are on, so the
+same serial is never reported twice on a multi-output desktop, and frame
+callbacks are answered only by the vblank of the output the requesting
+window is actually on.
 
 ## Frame path
 
@@ -207,6 +247,14 @@ a screenshot taken by dumping the back buffer; every visual test run over
 SSH would lose the pointer exactly when it matters. The cursor is a 24×24
 ARGB image blitted like anything else, inside the frame's damage clip, and
 a pointer move damages the old and the new cursor rect.
+
+It is drawn only once a pointer device has actually reported something,
+not merely because an output exists. Whether there is a pointer on this
+desk is a question libinput's capability bits answer badly — a machine can
+have a disabled touchpad, or a "pointer" that is really a lid switch — and
+the honest test is whether one has moved. A keyboard-only box therefore
+shows no arrow, which is also what a headless server's screenshots should
+show.
 
 A commit that fails keeps its damage and sets a retry flag, so the next
 event repaints the same region instead of stranding the output until the
@@ -275,11 +323,20 @@ Routing:
   wander off while dragging and the client still owns the gesture until it
   lifts.
 
-Each input event that produced work stamps the outputs that actually need
-a repaint with its timestamp; when that frame flips, the difference is one
-input-to-photon sample. Input that changes no pixel is deliberately not
-stamped — otherwise the timestamp would sit there until some unrelated
-frame minutes later reported the whole gap as latency.
+Every input event's timestamp is remembered, and handed to whichever
+outputs are about to paint at the *next scene update* — which is the first
+moment the damage it caused is visible to the server. That indirection
+matters: a pointer move damages the cursor immediately, but a click or a
+key does not. The pixels answering those are the client's, and they arrive
+in a later wakeup as a commit. Stamping only what was already dirty would
+quietly reduce the histogram to a cursor-motion histogram; carrying the
+timestamp until a frame actually consumes it measures the thing the metric
+is named after, click-to-photon included.
+
+The carry is bounded to 200 ms. An input nothing ever responds to must not
+sit waiting to be reported as a multi-second latency by some unrelated
+frame later on — which is precisely what an earlier version did, once
+reporting 33 seconds.
 
 ## Statistics
 
@@ -326,6 +383,12 @@ guess and dropping it is the only honest option), invalidate every output
 and repaint fully. Three round trips on the test box with a client
 connected: clean, and input is still routed to the client afterwards.
 
+One known wart: each round trip leaks one descriptor per input device,
+because `libseat_close_device` reports success without closing the fd it
+handed out. The fix belongs in `nitro-seat`, which owns that value; issue
+#525 tracks it. Bounded and slow — five fds per switch against a default
+limit of 1024 — but real.
+
 ## Testing
 
 - Unit tests per module: protocol parsing and replies, the `OutputState`
@@ -335,7 +398,7 @@ connected: clean, and input is still routed to the client afterwards.
   logging, signals (skipped when the sandbox blocks SIGTERM).
 - `tests/fake_loop.rs` runs `run(Config::fake(..))` on a thread with a
   fake input source — the real event loop, no seat and no evdev node —
-  and covers nine things:
+  and covers fourteen things:
   1. `outputs`, exact `shot` pixels against `render::background_color`,
      `shot` by name and the error for an unknown one, `err` for a bad
      request, that an idle server stops flipping entirely, and that `quit`
@@ -363,6 +426,21 @@ connected: clean, and input is still routed to the client afterwards.
   8. Eight control clients sending partial lines, and two requests on one
      connection.
   9. The desktop frame still painted under everything.
+  10. A client cycling 64 buffers (create, damage, destroy) leaks no
+      descriptors, counted from `/proc/self/fd` — the server runs on a
+      thread of the test process, so its leaks are the test's to see.
+  11. A commit that changes no pixel is still `Presented`, four times in a
+      row, so a client using the serial as flow control cannot stall.
+  12. A `RequestFrame` from a settled, idle server is answered with a
+      `Frame` carrying a usable deadline, without waiting for a flip that
+      would never come.
+  13. A window created before any output exists gets no `Configure` while
+      there is nowhere to put it, then is placed and configured when one
+      is hotplugged in (`plug WxH`), and appears at the cascade's first
+      position.
+  14. No cursor is drawn until a pointer device reports something: a bare
+      desktop is background everywhere, and the arrow appears on the first
+      motion.
 - Hardware: `just deploy`, `just shot`, `just box-chvt 1|2`, `just
   box-stop` (see `docs/testbox.md`), plus the demo client:
   `ssh box 'XDG_RUNTIME_DIR=/run/user/1000 ~/nitro-bin/hello_client'`,

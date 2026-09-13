@@ -94,6 +94,11 @@ pub enum BackendKind {
         /// Output height.
         height: u32,
     },
+    /// Headless [`FakeBackend`] with **no** output, which a test plugs one
+    /// into later. The state a real server is in between "started" and
+    /// "the connector reported a mode", and the only way to exercise a
+    /// window created before there is anywhere to put it.
+    FakeHeadless,
 }
 
 /// Everything [`run`] needs.
@@ -202,6 +207,12 @@ const TOK_LISTENER: u64 = 2;
 const TOK_BACKEND: u64 = 3;
 const TOK_WIRE_LISTENER: u64 = 4;
 const TOK_INPUT: u64 = 5;
+/// How long an unanswered input keeps waiting for a frame to claim it.
+/// Beyond this the number would not be a latency any more: nothing
+/// responded to the event, and attributing the next unrelated frame to it
+/// is how the histogram once reported 33 seconds.
+const INPUT_STAMP_MAX_AGE_NS: u64 = 200_000_000;
+
 const TOK_CLIENT_BASE: u64 = 1 << 32;
 const TOK_WIRE_BASE: u64 = 1 << 33;
 
@@ -303,6 +314,11 @@ struct Server {
     )>,
     /// Windows created so far, for the cascade.
     windows_created: u32,
+    /// Windows created while no output existed, waiting for one.
+    unplaced: Vec<(ClientId, WindowKey)>,
+    /// Newest input timestamp not yet consumed by a frame; see
+    /// [`Server::note_input`].
+    pending_input_ns: u64,
 
     next_client: u64,
     next_wire: u64,
@@ -341,6 +357,10 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         BackendKind::Fake { width, height } => {
             info!("fake backend {width}x{height}");
             Box::new(FakeBackend::single(*width, *height).map_err(io_err("create fake backend"))?)
+        }
+        BackendKind::FakeHeadless => {
+            info!("fake backend with no outputs");
+            Box::new(FakeBackend::new(&[]).map_err(io_err("create fake backend"))?)
         }
         BackendKind::Drm { card } => {
             let mut s = Seat::open()?;
@@ -424,6 +444,8 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         buffer_sources: HashMap::new(),
         pending_fds: Vec::new(),
         windows_created: 0,
+        unplaced: Vec::new(),
+        pending_input_ns: 0,
         next_client: 0,
         next_wire: 0,
         next_client_id: 1,
@@ -470,6 +492,14 @@ fn wait(epoll: &OwnedFd, buf: &mut [epoll::Event]) -> Result<usize, Error> {
             Err(e) => return Err(errno("epoll_wait")(e)),
         }
     }
+}
+
+/// `CLOCK_MONOTONIC` now, in nanoseconds — the same clock libinput stamps
+/// its events with and KMS reports vblanks on, so the three are directly
+/// comparable and the latency figures mean what they say.
+fn monotonic_ns() -> u64 {
+    let t = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    u64::try_from(t.tv_sec).unwrap_or(0) * 1_000_000_000 + u64::try_from(t.tv_nsec).unwrap_or(0)
 }
 
 fn add(epoll: &OwnedFd, fd: &impl AsFd, token: u64) -> Result<(), Error> {
@@ -646,10 +676,38 @@ impl Server {
                 info.refresh_mhz,
             ));
         }
-        // Put the pointer somewhere sensible the first time an output
-        // appears; without this it would sit at (0, 0) under the frame.
-        if !self.pointer.present && !self.outputs.is_empty() {
-            self.pointer.present = true;
+        // Windows created while there was no output can be placed now.
+        // `place_new_window` re-queues any that still cannot be, so an
+        // output list that went empty again leaves them waiting rather
+        // than dropping them.
+        if !self.outputs.is_empty() && !self.unplaced.is_empty() {
+            let waiting = std::mem::take(&mut self.unplaced);
+            info!("placing {} window(s) held for an output", waiting.len());
+            for (client_id, win) in waiting {
+                let Some(token) = self
+                    .wire_clients
+                    .iter()
+                    .find(|(_, c)| c.id == client_id)
+                    .map(|(t, _)| *t)
+                else {
+                    continue;
+                };
+                let Some(mut client) = self.wire_clients.remove(&token) else {
+                    continue;
+                };
+                if let Some(node_id) = client.window_id(win) {
+                    self.place_new_window(&mut client, node_id, win);
+                }
+                self.wire_clients.insert(token, client);
+            }
+            self.flush_wire_clients();
+        }
+        // Park the pointer in the middle of the first output, so its first
+        // motion starts somewhere sensible rather than at (0, 0) under the
+        // desktop frame. It is not *drawn* until a device actually reports
+        // something — see `Pointer::present`.
+        if !self.pointer.placed && !self.outputs.is_empty() {
+            self.pointer.placed = true;
             let o = &self.outputs[0];
             self.pointer.x = f64::from(o.width / 2);
             self.pointer.y = f64::from(o.height / 2);
@@ -695,13 +753,19 @@ impl Server {
     }
 
     fn send_configure(&mut self, win: WindowKey, size: Size) {
-        let (scale, output) = self
+        // An unplaced window has no size, scale or output to report, and
+        // naming output 0 for it would be a lie the client has no way to
+        // detect. It is configured by `place_new_window` the moment it
+        // lands on a screen, which is the honest moment to say where.
+        let Some((scale, output)) = self
             .scene
             .window_info(win)
             .ok()
             .and_then(nitro_scene::Window::output)
             .and_then(|id| self.scene.output_info(id).map(|(_, s)| (s, id.0)))
-            .unwrap_or((1.0, 0));
+        else {
+            return;
+        };
         for client in self.wire_clients.values_mut() {
             if let Some(window) = client.window_id(win) {
                 client.send(&ServerMsg::Configure(msg::Configure {
@@ -794,7 +858,80 @@ impl Server {
     /// committed, which is what keeps a quiet server at zero wakeups.
     fn settle(&mut self) {
         self.update_scene();
+        self.claim_input_stamp();
         self.paint_all();
+        self.answer_idle_clients();
+        self.flush_wire_clients();
+    }
+
+    /// Answer the clients whose commit or frame request will not be
+    /// carried by any frame, because there is no frame to carry it.
+    ///
+    /// The server only flips when something changed, which is the whole
+    /// design — but it means "wait for the next flip" is not a promise it
+    /// can keep to a client that changed nothing. Two cases need closing:
+    /// a commit whose output has no paint pending (nothing it did was
+    /// visible), and a `RequestFrame` from a quiescent desktop, which is
+    /// exactly how a client starts an animation. Both are answered from
+    /// the extrapolated vblank clock, which `frame::frame_deadline` can
+    /// compute with or without a flip ever having happened.
+    fn answer_idle_clients(&mut self) {
+        // An output with a paint pending will flip, and `on_flip` is the
+        // right place to answer everything riding on that frame.
+        if self.outputs.iter().any(frame::OutputState::needs_paint)
+            || self
+                .backend
+                .outputs()
+                .iter()
+                .any(|o| self.backend.flip_pending(o.id))
+        {
+            return;
+        }
+        let now_ns = monotonic_ns();
+        let (deadline_ns, refresh_ns, output, time_ns, seq) =
+            self.outputs.first().map_or((0, 0, 0, 0, 0), |o| {
+                (
+                    o.frame_deadline_ns(now_ns),
+                    o.refresh_ns,
+                    o.scene_id.0,
+                    o.last_vblank_ns,
+                    o.last_sequence,
+                )
+            });
+        // Serials stamped onto an output that then painted nothing: the
+        // transaction was applied and is as visible as it is ever going to
+        // be, so acknowledge it instead of growing the list for ever.
+        let stale: Vec<(u32, u32)> = self
+            .outputs
+            .iter_mut()
+            .flat_map(|o| o.painting.drain(..))
+            .collect();
+        for (client_key, serial) in stale {
+            let Some(client) = self
+                .wire_clients
+                .values_mut()
+                .find(|c| c.id.0 == client_key)
+            else {
+                continue;
+            };
+            client.unpresented.retain(|s| *s != serial);
+            client.send(&ServerMsg::Presented(msg::Presented {
+                serial,
+                output,
+                time_ns,
+                seq,
+            }));
+        }
+        for client in self.wire_clients.values_mut() {
+            let requests = std::mem::take(&mut client.frame_requests);
+            for window in requests {
+                client.send(&ServerMsg::Frame(msg::Frame {
+                    window,
+                    deadline_ns,
+                    refresh_ns,
+                }));
+            }
+        }
     }
 
     fn event_loop(&mut self) -> Result<(), Error> {
@@ -947,10 +1084,26 @@ impl Server {
         }
         // Frame callbacks are answered after the flip, not at commit time:
         // the deadline is only meaningful once we know when this vblank
-        // actually happened.
-        for client in self.wire_clients.values_mut() {
-            let requests = std::mem::take(&mut client.frame_requests);
-            for window in requests {
+        // actually happened. Only requests for windows on *this* output
+        // are answered here — another output's vblank says nothing about
+        // when this one will scan out.
+        let mut answered: Vec<(u64, NodeId)> = Vec::new();
+        for (token, client) in &mut self.wire_clients {
+            client.frame_requests.retain(|window| {
+                let on_output = client
+                    .windows
+                    .get(window)
+                    .and_then(|win| self.scene.window_info(*win).ok())
+                    .and_then(nitro_scene::Window::output)
+                    == Some(scene_id);
+                if on_output {
+                    answered.push((*token, *window));
+                }
+                !on_output
+            });
+        }
+        for (token, window) in answered {
+            if let Some(client) = self.wire_clients.get_mut(&token) {
                 client.send(&ServerMsg::Frame(msg::Frame {
                     window,
                     deadline_ns,
@@ -1081,7 +1234,11 @@ impl Server {
     fn move_pointer(&mut self, x: f64, y: f64, time_ns: u64) {
         let bounds = input::output_union(&self.scene);
         let (old_x, old_y) = self.pointer.device();
-        if !self.pointer.move_to(x, y, bounds) {
+        let appeared = self.pointer.seen();
+        if appeared {
+            self.damage_global(Cursor::rect(old_x, old_y));
+        }
+        if !self.pointer.move_to(x, y, bounds) && !appeared {
             return;
         }
         let (new_x, new_y) = self.pointer.device();
@@ -1269,20 +1426,44 @@ impl Server {
         Point::new((x * w) as f32, (y * h) as f32)
     }
 
-    /// Record that this input event's effect is going into the next frame,
-    /// which is what closes the input-to-photon loop when that frame lands.
+    /// Remember when this input arrived, so the frame that eventually
+    /// shows its effect can be timed against it.
     ///
-    /// Only outputs that actually have something to repaint are stamped.
-    /// Input that changes no pixel — a button press a client ignores, a
-    /// motion inside one node — produces no frame, and stamping it anyway
-    /// would leave the timestamp sitting there until some unrelated frame
-    /// minutes later reported the whole gap as latency. The measurement
-    /// has to be "this input, that frame", or it is not a measurement.
+    /// The stamp is *not* applied to an output here, because at this point
+    /// there is usually nothing to apply it to. A pointer move damages the
+    /// cursor immediately, but a click or a key does not: the pixels that
+    /// answer it are the client's, and they arrive in a later wakeup as a
+    /// commit. Stamping only what is already dirty would quietly reduce
+    /// the histogram to a cursor-motion histogram; carrying the timestamp
+    /// until a frame actually consumes it measures the thing the metric is
+    /// named after, click-to-photon included.
+    ///
+    /// The carry is bounded — see [`Server::claim_input_stamp`]. An input
+    /// nothing ever responds to must not sit here waiting to be reported
+    /// as a multi-second latency by some unrelated frame later on.
     fn note_input(&mut self, time_ns: u64) {
+        self.pending_input_ns = self.pending_input_ns.max(time_ns);
+    }
+
+    /// Hand the pending input timestamp to whichever outputs are about to
+    /// paint, or drop it once it is too old to be anyone's latency.
+    ///
+    /// Called after the scene update, which is the first moment the damage
+    /// a client produced in response to the input is visible to us.
+    fn claim_input_stamp(&mut self) {
+        if self.pending_input_ns == 0 {
+            return;
+        }
+        let mut claimed = false;
         for output in &mut self.outputs {
             if output.needs_paint() {
-                output.painting_input_ns = output.painting_input_ns.max(time_ns);
+                output.painting_input_ns = output.painting_input_ns.max(self.pending_input_ns);
+                claimed = true;
             }
+        }
+        if claimed || monotonic_ns().saturating_sub(self.pending_input_ns) > INPUT_STAMP_MAX_AGE_NS
+        {
+            self.pending_input_ns = 0;
         }
     }
 
@@ -1411,6 +1592,7 @@ impl Server {
                 self.quit = true;
                 protocol::ok_reply()
             }
+            Ok(Request::Plug(w, h)) => self.plug(w, h),
         };
         client.send(reply);
     }
@@ -1573,6 +1755,14 @@ impl Server {
         for (key, rects) in outcome.buffer_damage {
             self.refresh_damaged_buffer(client.id, key, &rects);
         }
+        // `DestroyBuffer` promises the server drops its mapping. The scene
+        // forgets the pixels itself; the descriptor is ours, and this is
+        // the only place it can be released before the client goes — a
+        // client cycling one buffer per frame would otherwise leak an fd
+        // per frame until it hit the process limit.
+        for key in outcome.destroyed_buffers {
+            self.buffer_sources.remove(&(client.id, key));
+        }
         for (node_id, win) in outcome.new_windows {
             self.place_new_window(&mut client, node_id, win);
         }
@@ -1586,15 +1776,63 @@ impl Server {
             }
             self.touch_targets.retain(|_, (w, _)| *w != win);
         }
-        // The commit is presented when the frame carrying it flips; until
-        // then it rides along with whatever output is painted next.
-        client.unpresented.push(serial);
+        // Which outputs this commit can actually reach: the ones its
+        // windows are on. Stamping every output would report the same
+        // serial once per flip on a multi-output desktop, and `Presented`
+        // means "this transaction is on screen", not "a screen flipped".
         let client_key = client.id.0;
-        for output in &mut self.outputs {
-            output.painting.push((client_key, serial));
+        let mut touched: Vec<SceneOutputId> = Vec::new();
+        for win in client.windows.values() {
+            if let Some(id) = self
+                .scene
+                .window_info(*win)
+                .ok()
+                .and_then(nitro_scene::Window::output)
+                && !touched.contains(&id)
+            {
+                touched.push(id);
+            }
+        }
+        client.unpresented.push(serial);
+        if touched.is_empty() {
+            // A client with no placed window has nowhere for its commit to
+            // appear. Answer at once rather than holding the serial for a
+            // frame that will never carry it.
+            self.present_now(token, serial);
+        } else {
+            for output in &mut self.outputs {
+                if touched.contains(&output.scene_id) {
+                    output.painting.push((client_key, serial));
+                }
+            }
         }
         self.wire_clients.insert(token, client);
         true
+    }
+
+    /// Report a commit as presented without a frame behind it.
+    ///
+    /// A transaction that changes no pixel still has to be acknowledged:
+    /// the serial is the client's flow control, and holding it until some
+    /// unrelated damage happens to produce a flip would stall a client that
+    /// waits for `Presented` before sending the next frame — possibly for
+    /// ever, on a desktop where nothing else is moving. The timestamp is
+    /// the last vblank we saw, which is the truthful answer to "when was
+    /// this on screen": it already was, because nothing changed.
+    fn present_now(&mut self, token: u64, serial: u32) {
+        let (output, time_ns, seq) = self.outputs.first().map_or((0, 0, 0), |o| {
+            (o.scene_id.0, o.last_vblank_ns, o.last_sequence)
+        });
+        let Some(client) = self.wire_clients.get_mut(&token) else {
+            return;
+        };
+        client.unpresented.retain(|s| *s != serial);
+        client.send(&ServerMsg::Presented(msg::Presented {
+            serial,
+            output,
+            time_ns,
+            seq,
+        }));
     }
 
     /// Move the fds that came with this transaction's `CreateBuffer`s into
@@ -1625,8 +1863,11 @@ impl Server {
     /// and tell the client the size, scale and output it got.
     fn place_new_window(&mut self, client: &mut WireClient, node_id: NodeId, win: WindowKey) {
         let Some(output) = self.outputs.first() else {
-            // No output yet: the window stays unplaced and is placed by the
-            // next hotplug, which re-runs this for every unplaced window.
+            // No output yet (every connector unplugged, or a hotplug still
+            // in flight). The window is real and owns its nodes; it simply
+            // has nowhere to be. `sync_outputs` drains this list when an
+            // output appears, so the client gets its `Configure` then.
+            self.unplaced.push((client.id, win));
             return;
         };
         let scene_id = output.scene_id;
@@ -1763,6 +2004,22 @@ impl Server {
         if let Err(e) = clients::reread_damage(fd, desc, rects, data) {
             warn!("re-reading buffer damage: {}", e.detail);
         }
+    }
+
+    /// Hotplug an output into the fake backend.
+    ///
+    /// Test-only, and refused on a real backend: on DRM an output exists
+    /// because a connector reports a mode, and inventing one would mean
+    /// lying to the modesetting code. It exists so a test can drive the
+    /// "server with no output yet" state, which is otherwise unreachable
+    /// in-process and is exactly where the deferred window placement
+    /// lives.
+    fn plug(&mut self, width: u32, height: u32) -> Vec<u8> {
+        if !self.backend.simulate_plug(width, height) {
+            return protocol::err_reply("`plug` is only available on the fake backend");
+        }
+        info!("plug {width}x{height} requested");
+        protocol::ok_reply()
     }
 
     fn shot(&mut self, name: Option<&str>) -> Vec<u8> {

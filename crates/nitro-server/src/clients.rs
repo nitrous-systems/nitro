@@ -246,6 +246,11 @@ pub struct ApplyOutcome {
     /// learns *which nodes* to repaint; the pixels are the server's job,
     /// because only it holds the descriptor.
     pub buffer_damage: Vec<(BufferKey, Vec<IRect>)>,
+    /// Buffers released, so the server can drop the descriptor it kept for
+    /// re-reading them. The scene owns the pixels and forgets them on its
+    /// own; the *fd* is the server's, and nothing else would ever close it
+    /// before the client disconnects.
+    pub destroyed_buffers: Vec<BufferKey>,
 }
 
 /// Apply one client's buffered mutations to the scene, atomically as far as
@@ -464,6 +469,7 @@ fn apply_msg(
         ClientMsg::DestroyBuffer(m) => {
             let key = buffer_key(client, m.id)?;
             client.buffers.remove(&m.id);
+            outcome.destroyed_buffers.push(key);
             scene
                 .destroy_buffer(client.id, key)
                 .map_err(|e| scene_err("DestroyBuffer", e))

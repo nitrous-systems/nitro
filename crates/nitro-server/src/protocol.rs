@@ -10,6 +10,7 @@
 //! | `outputs`            | `ok\n` + one `name WxH@refresh_mhz\n` per output + `\n`       |
 //! | `stats`              | `ok\n` + `key value\n` lines + `\n`                           |
 //! | `quit`               | `ok\n`, then the server shuts down                           |
+//! | `plug WxH`           | `ok\n`; fake backend only — hotplugs an output in, for tests |
 //!
 //! This module only parses and formats; it never touches a socket.
 
@@ -28,6 +29,9 @@ pub enum Request {
     Stats,
     /// Orderly shutdown.
     Quit,
+    /// Plug a `WxH` output into the fake backend. Test-only: on a real
+    /// backend outputs come from connectors, and this is refused.
+    Plug(u32, u32),
 }
 
 /// Parse one request line (without or with its trailing newline).
@@ -46,6 +50,15 @@ pub fn parse(line: &str) -> Result<Request, String> {
     }
     match (cmd, arg) {
         ("shot", name) => Ok(Request::Shot(name.map(str::to_owned))),
+        ("plug", Some(size)) => {
+            let (w, h) = size
+                .split_once(['x', 'X'])
+                .ok_or_else(|| format!("`plug` wants WxH, got `{size}`"))?;
+            let w = w.parse().map_err(|_| format!("bad width `{w}`"))?;
+            let h = h.parse().map_err(|_| format!("bad height `{h}`"))?;
+            Ok(Request::Plug(w, h))
+        }
+        ("plug", None) => Err("`plug` needs a WxH size".to_owned()),
         ("outputs", None) => Ok(Request::Outputs),
         ("stats", None) => Ok(Request::Stats),
         ("quit", None) => Ok(Request::Quit),
@@ -121,6 +134,17 @@ mod tests {
         assert_eq!(parse("  outputs  "), Ok(Request::Outputs));
         assert_eq!(parse("stats"), Ok(Request::Stats));
         assert_eq!(parse("quit\n"), Ok(Request::Quit));
+        assert_eq!(parse("plug 640x480"), Ok(Request::Plug(640, 480)));
+    }
+
+    #[test]
+    fn plug_needs_a_size() {
+        assert_eq!(parse("plug"), Err("`plug` needs a WxH size".to_owned()));
+        assert_eq!(
+            parse("plug wide"),
+            Err("`plug` wants WxH, got `wide`".to_owned())
+        );
+        assert!(parse("plug 12x").is_err());
     }
 
     #[test]

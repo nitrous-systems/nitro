@@ -18,7 +18,7 @@ use nitro_server::clients::CASCADE_STEP;
 use nitro_server::cursor::CURSOR_SIZE;
 use nitro_server::input::{FakeInput, InputEvent};
 use nitro_server::render::{FRAME, background_color};
-use nitro_server::{Config, run};
+use nitro_server::{BackendKind, Config, run};
 use nitro_wire::client::Connection;
 use nitro_wire::msg::ServerMsg;
 use nitro_wire::types::{ButtonState, Layer, NodeId};
@@ -43,10 +43,21 @@ struct Harness {
 
 impl Harness {
     fn start(name: &str, width: u32, height: u32) -> Self {
+        Self::start_with(name, BackendKind::Fake { width, height })
+    }
+
+    /// A server with no output at all, which a test plugs one into later
+    /// with the `plug` control request.
+    fn start_headless(name: &str) -> Self {
+        Self::start_with(name, BackendKind::FakeHeadless)
+    }
+
+    fn start_with(name: &str, backend: BackendKind) -> Self {
         let dir = std::env::temp_dir().join(format!("nitro-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("nitro").join("control.sock");
-        let mut config = Config::fake(width, height, &path);
+        let mut config = Config::fake(1, 1, &path);
+        config.backend = backend;
         let input = FakeInput::new().expect("eventfd");
         config.fake_input = Some(input.clone());
         let wire_path = config.wire_path.clone();
@@ -73,6 +84,17 @@ impl Harness {
 
     fn client(&self, name: &str) -> Connection {
         Connection::connect(&self.wire_path, name).expect("wire connect")
+    }
+
+    /// Send a request whose reply is a bare status line with no body:
+    /// `quit` and `plug`. `request_text` would block waiting for the blank
+    /// line that terminates a *body*, and these have none.
+    fn request_line(&self, req: &str) -> String {
+        let mut c = self.connect();
+        c.get_mut().write_all(req.as_bytes()).unwrap();
+        let mut line = String::new();
+        c.read_line(&mut line).unwrap();
+        line.trim_end_matches('\n').to_owned()
     }
 
     fn request_text(&self, req: &str) -> Vec<String> {
@@ -711,5 +733,262 @@ fn the_desktop_frame_is_still_painted_under_everything() {
         background_color(FRAME - 1, 50, w, h)
     );
     assert_ne!(img.pixel(0, 50), img.pixel(FRAME + 1, 50));
+    h_.quit();
+}
+
+#[test]
+fn cycling_buffers_does_not_leak_the_clients_descriptors() {
+    use nitro_wire::msg::CreateBuffer;
+    use nitro_wire::types::{BufferId, format};
+    use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
+
+    // A client that pushes changing pixels does create → damage → destroy
+    // once per frame. The server keeps each buffer's fd so `BufferDamage`
+    // can re-read rows, and `DestroyBuffer` is what must give it back:
+    // without that it leaks one descriptor per frame until the process
+    // hits its fd limit.
+    let h_ = Harness::start("bufcycle", 200, 120);
+    let mut conn = h_.client("cycler");
+    let mut seen = Vec::new();
+
+    let root = NodeId(1);
+    let image = NodeId(2);
+    conn.tx()
+        .create_window(root, "cycle", Size::new(64.0, 64.0), Layer::Normal)
+        .create_image(image, root, Rect::new(0.0, 0.0, 32.0, 32.0))
+        .commit(1)
+        .unwrap();
+    conn.flush().unwrap();
+    expect(&mut conn, &mut seen, "Configure", |m| match m {
+        ServerMsg::Configure(c) if c.window == root => Some(*c),
+        _ => None,
+    });
+
+    let before = open_fds();
+    let (bw, bh, stride) = (8u32, 8u32, 8u32 * 4);
+    for i in 0..64u32 {
+        let id = BufferId(i + 1);
+        let fd = memfd_create("nitro-cycle", MemfdFlags::CLOEXEC).unwrap();
+        ftruncate(&fd, u64::from(stride) * u64::from(bh)).unwrap();
+        conn.tx()
+            .create_buffer(CreateBuffer {
+                id,
+                width: bw,
+                height: bh,
+                stride,
+                format: format::XR24,
+                size: stride * bh,
+                fd,
+            })
+            .image(image, id, IRect::new(0, 0, 8, 8))
+            .buffer_damage(id, vec![IRect::new(0, 0, 8, 8)])
+            .commit(i + 2)
+            .unwrap();
+        conn.flush().unwrap();
+        // Detach and release it, exactly as a client reusing a slot would.
+        conn.tx()
+            .image(image, BufferId::NONE, IRect::new(0, 0, 8, 8))
+            .destroy_buffer(id)
+            .commit(i + 200)
+            .unwrap();
+        conn.flush().unwrap();
+        // Let the server work through it before queueing the next one.
+        h_.request_text("stats\n");
+    }
+    h_.settle();
+
+    let after = open_fds();
+    assert!(
+        after <= before + 4,
+        "leaked descriptors over 64 buffer cycles: {before} -> {after}"
+    );
+    h_.quit();
+}
+
+/// How many descriptors this process has open. The server runs on a
+/// thread of this same process, so its leaks are ours to count.
+fn open_fds() -> usize {
+    std::fs::read_dir("/proc/self/fd").map_or(0, std::iter::Iterator::count)
+}
+
+#[test]
+fn a_commit_that_changes_no_pixels_is_still_presented() {
+    // `Presented` is the client's flow control. A transaction that damages
+    // nothing — a hidden subtree, a no-op property write — still has to be
+    // acknowledged, or a client that waits for it before sending the next
+    // frame stalls for ever on a desktop where nothing else moves.
+    let h_ = Harness::start("nodamage", 200, 120);
+    let mut conn = h_.client("quiet");
+    let mut seen = Vec::new();
+    let win = make_window(
+        &mut conn,
+        1,
+        Size::new(80.0, 50.0),
+        Color::rgb(0, 0, 0xFF),
+        1,
+    );
+    expect(&mut conn, &mut seen, "Configure", |m| match m {
+        ServerMsg::Configure(c) if c.window == win.root => Some(*c),
+        _ => None,
+    });
+    expect(
+        &mut conn,
+        &mut seen,
+        "Presented for serial 1",
+        |m| match m {
+            ServerMsg::Presented(p) if p.serial == 1 => Some(*p),
+            _ => None,
+        },
+    );
+    h_.settle();
+
+    // Now commit something that cannot change a pixel: setting a property
+    // to the value it already has.
+    for serial in 2..6u32 {
+        conn.tx().visible(win.rect, true).commit(serial).unwrap();
+        conn.flush().unwrap();
+        expect(
+            &mut conn,
+            &mut seen,
+            "Presented for a no-op commit",
+            |m| match m {
+                ServerMsg::Presented(p) if p.serial == serial => Some(*p),
+                _ => None,
+            },
+        );
+    }
+    h_.quit();
+}
+
+#[test]
+fn a_frame_request_from_a_quiescent_desktop_is_answered() {
+    // How a client starts an animation: ask for a frame, get a deadline,
+    // draw for it. If the answer waited for a flip, and a flip waited for
+    // damage, and the damage was going to be the client's response to the
+    // answer, nothing would ever happen.
+    let h_ = Harness::start("framereq", 200, 120);
+    let mut conn = h_.client("animator");
+    let mut seen = Vec::new();
+    let win = make_window(
+        &mut conn,
+        1,
+        Size::new(80.0, 50.0),
+        Color::rgb(0, 0xFF, 0),
+        1,
+    );
+    expect(&mut conn, &mut seen, "Configure", |m| match m {
+        ServerMsg::Configure(c) if c.window == win.root => Some(*c),
+        _ => None,
+    });
+    // Let everything settle, so the next commit starts from a genuinely
+    // idle server with no flip pending and nothing to paint.
+    h_.settle();
+    seen.clear();
+
+    conn.tx().request_frame(win.root).commit(99).unwrap();
+    conn.flush().unwrap();
+    let frame = expect(&mut conn, &mut seen, "Frame", |m| match m {
+        ServerMsg::Frame(f) => Some(*f),
+        _ => None,
+    });
+    assert_eq!(frame.window, win.root);
+    assert!(frame.refresh_ns > 0);
+    assert!(
+        frame.deadline_ns > 0,
+        "the deadline comes from the extrapolated vblank clock"
+    );
+    h_.quit();
+}
+
+#[test]
+fn a_window_created_before_any_output_is_placed_when_one_appears() {
+    // The state a real server is in between starting and the connector
+    // reporting a mode. A window created here is real and owns its nodes;
+    // it simply has nowhere to be, and the client must still get its
+    // `Configure` once somewhere exists — otherwise it waits for ever for
+    // a size it will never be told.
+    let h_ = Harness::start_headless("nooutput");
+    assert_eq!(h_.request_text("outputs\n"), ["ok"]);
+
+    let mut conn = h_.client("early");
+    let mut seen = Vec::new();
+    let win = make_window(
+        &mut conn,
+        1,
+        Size::new(100.0, 60.0),
+        Color::rgb(0xFF, 0, 0),
+        1,
+    );
+
+    // Nothing to configure against yet, but the window exists.
+    wait_for("the window to reach the scene", || {
+        stat(&h_.request_text("stats\n"), "windows") == 1
+    });
+    let mut out = Vec::new();
+    let _ = conn.poll(&mut out);
+    assert!(
+        !out.iter().any(|m| matches!(m, ServerMsg::Configure(_))),
+        "nothing to configure against: {out:?}"
+    );
+    seen.extend(out);
+
+    // Plug a screen in.
+    assert_eq!(h_.request_line("plug 200x120\n"), "ok");
+    wait_for("the output to appear", || {
+        h_.request_text("outputs\n").len() > 1
+    });
+
+    let configure = expect(
+        &mut conn,
+        &mut seen,
+        "Configure after the hotplug",
+        |m| match m {
+            ServerMsg::Configure(c) if c.window == win.root => Some(*c),
+            _ => None,
+        },
+    );
+    assert_eq!(configure.size, Size::new(100.0, 60.0));
+
+    // And it is actually on screen, at the cascade's first position.
+    h_.settle();
+    let img = h_.shot(None).unwrap();
+    assert_eq!(img.pixel(10, 10), 0x00FF_0000);
+    h_.quit();
+}
+
+#[test]
+fn no_cursor_is_drawn_until_a_pointer_device_reports_something() {
+    // A keyboard-only machine should not show an arrow the user cannot
+    // move. The cursor appears the first time a pointer event arrives,
+    // not merely because an output exists.
+    let (w, h) = (128, 96);
+    let h_ = Harness::start("nopointer", w, h);
+    h_.settle();
+
+    let img = h_.shot(None).unwrap();
+    for y in 0..h {
+        for x in 0..w {
+            assert_eq!(
+                img.pixel(x, y),
+                background_color(x, y, w, h),
+                "({x},{y}) is not the bare desktop, so something drew a cursor"
+            );
+        }
+    }
+
+    // One motion, and it appears.
+    h_.input.push(InputEvent::PointerAbsolute {
+        x: 0.5,
+        y: 0.5,
+        time_ns: 1_000_000,
+    });
+    h_.settle();
+    let img = h_.shot(None).unwrap();
+    let (cx, cy) = (w / 2, h / 2);
+    assert_ne!(
+        img.pixel(cx, cy),
+        background_color(cx, cy, w, h),
+        "the cursor should be drawn once a pointer has reported"
+    );
     h_.quit();
 }

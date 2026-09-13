@@ -348,6 +348,22 @@ pub trait Backend {
     /// # Errors
     /// [`Error::NoSuchOutput`] for a stale id.
     fn read_front(&mut self, output: OutputId) -> Result<Image, Error>;
+
+    /// Simulate a connector appearing, for a backend that can.
+    ///
+    /// Returns `false` on a real backend, where an output exists because
+    /// a connector reports a mode and inventing one would mean lying to
+    /// the modesetting code. [`FakeBackend`](crate::fake::FakeBackend)
+    /// implements it, which is what lets a server test drive the "no
+    /// output yet, then one appears" state in-process.
+    ///
+    /// A narrow hook rather than an `Any` downcast on purpose: the DRM
+    /// backend borrows its device, so it is not `'static` and cannot be
+    /// downcast at all, and a one-method escape hatch is easier to reason
+    /// about than a general one.
+    fn simulate_plug(&mut self, _width: u32, _height: u32) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
