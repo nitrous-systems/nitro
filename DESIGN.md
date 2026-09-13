@@ -207,8 +207,25 @@ D-Bus client is allowed.
   switches, RSS 3.4 MB, flip interval 16.666 ms mean (16.65–16.68 ms),
   moving-bar mode 6–7 % CPU, 10 VT round-trips clean, `systemctl stop`
   exits 0 and returns tty1.
-- **M1** — Scene graph, damage, CPU raster of rects and text; one client
-  drawing a moving box via mutations; measured input-to-photon latency.
+- **M1** — **done.** Scene graph, exact damage, CPU raster of rects and
+  images; `nitro-wire` v1; clients drawing through mutations; libinput and
+  xkbcommon input routed by hit test; measured input-to-photon latency.
+  The server is a compositor: clients connect on
+  `$XDG_RUNTIME_DIR/nitro/wire.sock`, their transactions land in the scene
+  at `Commit`, damage drives the rasterizer into the KMS back buffer under
+  the age-2 rule (the region painted is `damage(n) ∪ damage(n-1)`, because
+  the back buffer is two frames stale), and input is routed back to the
+  window under the pointer with window-local coordinates. A software
+  cursor keeps screenshots honest until the hardware plane arrives in M3.
+  Measured on the test box (Pentium G3240, i915, 1920×1080@60) with a
+  client connected: idle **0.0 % CPU with zero voluntary context
+  switches**, RSS 7.5 MB (client 2.9 MB), flip interval 16.665 ms mean
+  (16.659–16.673), paint 50 µs–15.8 ms per frame (mean 3.7 ms; the maximum
+  is a full-screen repaint, a pointer move is tens of µs),
+  **input-to-photon 2.2–17.3 ms, mean 8.7 ms** — under one frame on
+  average. Three VT round trips with a client connected are clean and
+  input still routes afterwards. Text is still M2, which is the one thing
+  the milestone promised and did not deliver: rects and images only.
 - **M2** — `nitro-ui` with arena, passes, `WidgetMut`, six widgets, layout,
   introspection socket, `hey`-style CLI. `nitro-calc` as the first app.
 - **M3** — Shell: bar, launcher, window management (focus, move, resize,
@@ -227,7 +244,12 @@ being re-read against the goals above.
 
 ## Open questions
 
-- Own rasterizer vs `vello_cpu`: decide by benchmark at M1.
+- Own rasterizer vs `vello_cpu`: **decided at M1 — our own.** It is 2.9×
+  faster on the damage-rect UI frame, which is the scene that describes the
+  server's job, and carries two dependencies against forty-nine. We lose on
+  raw per-pixel throughput (1.5× on alpha rrects, 1.8× on scaled blits),
+  which is what their hand-written SIMD buys on a no-AVX2 CPU. Full numbers
+  in `crates/nitro-raster/compare/RESULTS.md`.
 - Text: `parley`+`skrifa` is the plan; how much of parley we actually need
   (bidi, rich text) determines whether a smaller shaper suffices.
 - Scene-graph vocabulary: how rich before it stops being "primitive"? Rule
