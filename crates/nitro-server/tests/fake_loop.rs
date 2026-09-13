@@ -1277,3 +1277,232 @@ fn text_runs_are_released_with_their_node_and_their_client() {
 
     h_.quit();
 }
+
+// ------------------------------------------------------- deferred flips
+
+/// One flip carries the cursor **and** the client's answer to the motion
+/// that moved it — the whole point of issue #529.
+///
+/// Counted from the frame counter rather than from anything internal: an
+/// isolated motion into a window whose client answers it produced *three*
+/// flips before this change (the cursor's own two under the age-2 rule,
+/// plus one for the content that arrived too late for them) and produces
+/// two now, which is what a bare cursor costs anyway.
+#[test]
+fn a_client_that_answers_a_motion_rides_the_same_flip_as_the_cursor() {
+    let (w, h) = (320, 200);
+    let h_ = Harness::start("defer-together", w, h);
+    let mut conn = h_.client("answers");
+    let mut seen = Vec::new();
+    let win = make_window(
+        &mut conn,
+        1,
+        Size::new(120.0, 80.0),
+        Color::rgb(0, 0, 0xFF),
+        1,
+    );
+    expect(&mut conn, &mut seen, "Configure", |m| match m {
+        ServerMsg::Configure(c) if c.window == win.root => Some(*c),
+        _ => None,
+    });
+
+    // Park the cursor inside the window and let everything settle, so the
+    // motion under test is genuinely isolated: no flip in flight, no
+    // damage owed to either buffer, and the client already entered.
+    h_.input.push(InputEvent::PointerAbsolute {
+        x: 20.0 / f64::from(w),
+        y: 20.0 / f64::from(h),
+        time_ns: 1_000_000,
+    });
+    expect(&mut conn, &mut seen, "PointerEnter", |m| match m {
+        ServerMsg::PointerEnter(e) => Some(*e),
+        _ => None,
+    });
+    conn.tx()
+        .bounds(win.rect, Rect::new(0.0, 0.0, 120.0, 80.0))
+        .commit(2)
+        .unwrap();
+    conn.flush().unwrap();
+    h_.settle();
+    seen.clear();
+
+    let before = h_.frames();
+    for (serial, step) in (10..).zip(0..4u32) {
+        // One motion, and the client answers it the way `nitro-demo
+        // --follow` does: a commit that moves a follower rect.
+        h_.input.push(InputEvent::PointerAbsolute {
+            x: f64::from(30 + step * 8) / f64::from(w),
+            y: 30.0 / f64::from(h),
+            time_ns: u64::from(2 + step) * 1_000_000,
+        });
+        let motion = expect(&mut conn, &mut seen, "PointerMotion", |m| match m {
+            ServerMsg::PointerMotion(m) => Some(*m),
+            _ => None,
+        });
+        seen.retain(|m| !matches!(m, ServerMsg::PointerMotion(_)));
+        conn.tx()
+            .bounds(
+                win.rect,
+                Rect::new(motion.pos.x - 10.0, motion.pos.y - 10.0, 20.0, 20.0),
+            )
+            .commit(serial)
+            .unwrap();
+        conn.flush().unwrap();
+        expect(&mut conn, &mut seen, "Presented", |m| match m {
+            ServerMsg::Presented(p) if p.serial == serial => Some(*p),
+            _ => None,
+        });
+        h_.settle();
+    }
+    let flips = h_.frames() - before;
+
+    // Two per move is the age-2 cost of the cursor alone (old rect and new
+    // rect, into both buffers). Three would mean the content missed the
+    // cursor's flip and needed one of its own — the bug.
+    // Measured: 8 with the deferral, 12 without it — three flips per
+    // motion instead of two, which is exactly the ratio issue #529
+    // counted on the box.
+    assert_eq!(
+        flips, 8,
+        "expected 2 flips per answered motion (the age-2 cursor cost); \
+         {flips} means the content is not riding the cursor's flip"
+    );
+
+    // And the server says it held them back, without ever timing out: the
+    // client answered every time.
+    let s = h_.request_text("stats\n");
+    assert!(stat(&s, "flips_deferred") > 0, "{s:?}");
+    assert_eq!(
+        stat(&s, "defer_timeouts"),
+        0,
+        "a client that answers must never hit the deadline: {s:?}"
+    );
+    h_.quit();
+}
+
+/// A client that is told about the motion and never answers must not stall
+/// the cursor: the deadline fires and the frame goes in without it.
+#[test]
+fn a_client_that_never_answers_still_gets_a_flip_at_the_deadline() {
+    let (w, h) = (320, 200);
+    let h_ = Harness::start("defer-timeout", w, h);
+    let mut conn = h_.client("mute");
+    let mut seen = Vec::new();
+    let win = make_window(
+        &mut conn,
+        1,
+        Size::new(120.0, 80.0),
+        Color::rgb(0, 0xFF, 0),
+        1,
+    );
+    expect(&mut conn, &mut seen, "Configure", |m| match m {
+        ServerMsg::Configure(c) if c.window == win.root => Some(*c),
+        _ => None,
+    });
+    h_.input.push(InputEvent::PointerAbsolute {
+        x: 20.0 / f64::from(w),
+        y: 20.0 / f64::from(h),
+        time_ns: 1_000_000,
+    });
+    expect(&mut conn, &mut seen, "PointerEnter", |m| match m {
+        ServerMsg::PointerEnter(e) => Some(*e),
+        _ => None,
+    });
+    h_.settle();
+
+    // From here the client reads nothing and commits nothing — the wedged
+    // client of the acceptance criteria, without needing SIGSTOP.
+    let before = h_.frames();
+    for step in 0..5u32 {
+        h_.input.push(InputEvent::PointerAbsolute {
+            x: f64::from(30 + step * 8) / f64::from(w),
+            y: 30.0 / f64::from(h),
+            time_ns: u64::from(2 + step) * 1_000_000,
+        });
+        h_.settle();
+    }
+    assert!(
+        h_.frames() > before,
+        "a wedged client must not stop the cursor"
+    );
+    let s = h_.request_text("stats\n");
+    assert!(stat(&s, "flips_deferred") > 0, "{s:?}");
+    assert!(
+        stat(&s, "defer_timeouts") > 0,
+        "the deadline is what released those flips: {s:?}"
+    );
+    h_.quit();
+}
+
+/// Cursor movement over the bare desktop has nobody to wait for, so it
+/// must stay on the untouched fast path: two flips per isolated move (the
+/// age-2 cost of old rect ∪ new rect) and nothing deferred.
+#[test]
+fn cursor_movement_over_the_desktop_is_never_deferred() {
+    let (w, h) = (320, 200);
+    let h_ = Harness::start("defer-desktop", w, h);
+    h_.input.push(InputEvent::PointerAbsolute {
+        x: 0.1,
+        y: 0.1,
+        time_ns: 1_000_000,
+    });
+    h_.settle();
+
+    let before = h_.frames();
+    for step in 0..4u32 {
+        h_.input.push(InputEvent::PointerAbsolute {
+            x: f64::from(40 + step * 10) / f64::from(w),
+            y: 0.5,
+            time_ns: u64::from(2 + step) * 1_000_000,
+        });
+        h_.settle();
+    }
+    assert_eq!(
+        h_.frames() - before,
+        8,
+        "two flips per isolated move, exactly as before the change"
+    );
+    let s = h_.request_text("stats\n");
+    assert_eq!(stat(&s, "flips_deferred"), 0, "nobody to wait for: {s:?}");
+    assert_eq!(stat(&s, "defer_timeouts"), 0, "{s:?}");
+    h_.quit();
+}
+
+/// A deferral must never leave a timer armed behind it: once everything
+/// has settled the server is back to zero wakeups, which is the property
+/// the whole design exists for.
+#[test]
+fn a_deferral_leaves_no_timer_behind_and_the_server_goes_idle() {
+    let (w, h) = (320, 200);
+    let h_ = Harness::start("defer-idle", w, h);
+    let mut conn = h_.client("idler");
+    let mut seen = Vec::new();
+    let win = make_window(&mut conn, 1, Size::new(120.0, 80.0), Color::WHITE, 1);
+    expect(&mut conn, &mut seen, "Configure", |m| match m {
+        ServerMsg::Configure(c) if c.window == win.root => Some(*c),
+        _ => None,
+    });
+    h_.input.push(InputEvent::PointerAbsolute {
+        x: 20.0 / f64::from(w),
+        y: 20.0 / f64::from(h),
+        time_ns: 1_000_000,
+    });
+    h_.input.push(InputEvent::PointerAbsolute {
+        x: 40.0 / f64::from(w),
+        y: 30.0 / f64::from(h),
+        time_ns: 2_000_000,
+    });
+    h_.settle();
+
+    // Nothing is happening any more. If the deferral timer were still
+    // armed — or re-armed by its own expiry — the frame counter would keep
+    // moving, and `voluntary_ctxt_switches` on the box would too.
+    let before = h_.frames();
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        h_.frames(),
+        before,
+        "a settled server after a deferral still makes no frames"
+    );
+    h_.quit();
+}

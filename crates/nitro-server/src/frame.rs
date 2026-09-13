@@ -28,7 +28,19 @@
 //! [`frame_deadline`] extrapolates from the last vblank timestamp and the
 //! output's refresh interval, minus a margin that is the client's share of
 //! the frame. Missing the deadline costs a frame, so the margin is
-//! deliberately generous.
+//! deliberately generous. The same deadline bounds a *deferred* flip —
+//! see [`crate::defer`].
+//!
+//! # Cursor damage is tracked apart from everything else
+//!
+//! Damage arrives from two places that mean very different things to the
+//! scheduler: the scene (a client's pixels, a window moving, the desktop)
+//! and the software cursor, which the server damages itself the instant
+//! the pointer moves. [`OutputState::damage_content`] and
+//! [`OutputState::damage_cursor`] add to the same region but keep that
+//! distinction, because [`OutputState::cursor_only`] — "this frame would
+//! put nothing on screen but a moved arrow" — is what decides whether the
+//! flip can wait for the client that was just told about the input.
 
 use std::time::Duration;
 
@@ -59,8 +71,12 @@ pub struct OutputState {
     pub width: u32,
     /// Output size in device pixels.
     pub height: u32,
-    /// Damage accumulated since the last painted frame.
-    pub damage: Damage,
+    /// Damage accumulated since the last painted frame. Private, because
+    /// every addition has to say whether it is content or the cursor:
+    /// [`OutputState::damage_content`] and [`OutputState::damage_cursor`].
+    damage: Damage,
+    /// Whether any of that damage is something other than the cursor.
+    content_damage: bool,
     /// The damage the previous frame consumed — the *damage*, not the
     /// region painted. Those differ: the region painted is already this
     /// frame's damage unioned with the last one's, and feeding that back
@@ -105,6 +121,7 @@ impl OutputState {
             width,
             height,
             damage,
+            content_damage: true,
             previous: Vec::new(),
             retry: false,
             refresh_ns: refresh_ns(refresh_mhz),
@@ -137,6 +154,52 @@ impl OutputState {
         self.previous.clear();
         self.damage.clear();
         self.damage.add(self.bounds());
+        self.content_damage = true;
+    }
+
+    /// Add damage from the scene: a client's pixels, a window that moved,
+    /// the desktop under one that closed. A frame carrying any of this is
+    /// never deferred.
+    pub fn damage_content(&mut self, rect: IRect) {
+        self.damage.add(rect);
+        self.content_damage = true;
+    }
+
+    /// Add damage the server made for its own software cursor.
+    ///
+    /// Kept apart from [`OutputState::damage_content`] only so that
+    /// [`OutputState::cursor_only`] can tell them apart; the region
+    /// painted is the union either way.
+    pub fn damage_cursor(&mut self, rect: IRect) {
+        self.damage.add(rect);
+    }
+
+    /// Whether a frame painted now would put nothing new on screen but a
+    /// moved cursor.
+    ///
+    /// Two things disqualify it, and each is a frame somebody is already
+    /// waiting for: content damage of its own, and a failed commit that
+    /// has to be retried.
+    ///
+    /// The age-2 carry in [`OutputState::previous`] deliberately does
+    /// *not*. Those pixels are already on screen — they are in the front
+    /// buffer, and the repaint only brings the *other* buffer up to date —
+    /// so nobody is waiting for them and holding the frame back costs
+    /// nothing. Counting them would be worse than pointless: a pointer
+    /// moving over a client that answers every motion produces content
+    /// damage on alternate frames, so every second frame would refuse to
+    /// wait and put the client's next answer a flip behind again, which is
+    /// exactly the bug this is here to fix.
+    #[must_use]
+    pub fn cursor_only(&self) -> bool {
+        !self.content_damage && !self.retry
+    }
+
+    /// Whether there is damage waiting for a frame at all (ignoring the
+    /// age-2 history and the retry flag). Tests and assertions only.
+    #[must_use]
+    pub fn has_damage(&self) -> bool {
+        !self.damage.is_empty()
     }
 
     /// Whether a frame would put anything new on screen.
@@ -176,6 +239,7 @@ impl OutputState {
     /// a window that flickers away every other frame.
     pub fn committed(&mut self) {
         self.previous = self.damage.take();
+        self.content_damage = false;
         self.damage.clear();
         self.retry = false;
         self.in_flight = std::mem::take(&mut self.painting);
@@ -526,7 +590,7 @@ mod tests {
         let mut s = state();
         assert_eq!(frame(&mut s), [s.bounds()]);
         let window = IRect::new(0, 0, 40, 30);
-        s.damage.add(window);
+        s.damage_content(window);
         assert_eq!(
             frame(&mut s),
             [s.bounds()],
@@ -546,7 +610,7 @@ mod tests {
         frame(&mut s);
         frame(&mut s);
         let moved = IRect::new(10, 10, 4, 4);
-        s.damage.add(moved);
+        s.damage_content(moved);
         // The frame that draws it, and the one after (whose buffer is two
         // frames stale), both repaint exactly that rect — and no more.
         assert_eq!(frame(&mut s), [moved]);
@@ -560,9 +624,10 @@ mod tests {
     fn the_repaint_region_is_this_frame_plus_the_last() {
         let mut s = state();
         s.damage.clear();
+        s.content_damage = false;
         s.previous = vec![IRect::new(0, 0, 10, 10)];
         let fresh = IRect::new(60, 30, 10, 10);
-        s.damage.add(fresh);
+        s.damage_content(fresh);
         let region = s.repaint_region();
         assert!(region.contains(&IRect::new(0, 0, 10, 10)), "{region:?}");
         assert!(region.contains(&fresh), "{region:?}");
@@ -570,7 +635,7 @@ mod tests {
         // The history kept is this frame's damage alone, so the next frame
         // repaints `fresh` and not the rect inherited from the one before.
         assert_eq!(s.previous, [fresh]);
-        assert!(s.damage.is_empty());
+        assert!(!s.has_damage());
         assert_eq!(s.repaint_region(), [fresh]);
         s.committed();
         assert!(!s.needs_paint(), "and then it is done");
@@ -599,6 +664,51 @@ mod tests {
         assert_eq!(frame(&mut s), [s.bounds()]);
         assert_eq!(frame(&mut s), [s.bounds()], "both buffers were unknown");
         assert!(!s.needs_paint());
+    }
+
+    /// A settled output where only the cursor moved is the one case a
+    /// flip may be held back for a client's answer.
+    #[test]
+    fn cursor_only_is_true_only_when_nothing_else_is_pending() {
+        let mut s = state();
+        // A fresh output is a full repaint, which is content.
+        assert!(!s.cursor_only());
+        frame(&mut s);
+        frame(&mut s);
+        assert!(!s.needs_paint());
+        // Settled and quiet: vacuously cursor-only, but `needs_paint` is
+        // false so nothing is deferred either.
+        assert!(s.cursor_only());
+
+        s.damage_cursor(IRect::new(4, 4, 24, 24));
+        assert!(s.needs_paint());
+        assert!(s.cursor_only(), "a moved arrow and nothing else");
+
+        // A client's pixels in the same frame: not deferrable.
+        s.damage_content(IRect::new(40, 10, 10, 10));
+        assert!(!s.cursor_only());
+
+        // The frame after that one still repaints the content under the
+        // age-2 rule, but those pixels are already on screen — only the
+        // other buffer lacks them — so nobody is waiting and the frame is
+        // still deferrable.
+        frame(&mut s);
+        s.damage_cursor(IRect::new(8, 4, 24, 24));
+        assert!(
+            s.cursor_only(),
+            "an age-2 carry is already on screen; nobody waits for it"
+        );
+    }
+
+    /// A commit that failed has to be retried now, not at some deadline.
+    #[test]
+    fn a_retry_is_never_cursor_only() {
+        let mut s = state();
+        frame(&mut s);
+        frame(&mut s);
+        s.commit_failed(&[IRect::new(0, 0, 4, 4)]);
+        s.damage_cursor(IRect::new(4, 4, 24, 24));
+        assert!(!s.cursor_only());
     }
 
     #[test]

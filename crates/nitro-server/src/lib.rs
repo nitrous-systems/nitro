@@ -35,6 +35,7 @@
 pub mod clients;
 pub mod control;
 pub mod cursor;
+pub mod defer;
 pub mod frame;
 pub mod input;
 pub mod keyboard;
@@ -73,6 +74,7 @@ use rustix::event::epoll::{self, EventData, EventFlags};
 use crate::clients::{ApplyError, BufferSource, Pending, WireClient};
 use crate::control::{Client, ReadOutcome};
 use crate::cursor::Cursor;
+use crate::defer::DeferredFlip;
 use crate::frame::{CursorState, OutputState};
 use crate::input::{InputEvent, InputSource, LibinputSource, Pointer};
 use crate::keyboard::{Hotkey, Keyboard};
@@ -212,6 +214,8 @@ const TOK_LISTENER: u64 = 2;
 const TOK_BACKEND: u64 = 3;
 const TOK_WIRE_LISTENER: u64 = 4;
 const TOK_INPUT: u64 = 5;
+/// The one timerfd that bounds a deferred flip; see [`defer`].
+const TOK_DEFER: u64 = 6;
 /// How long an unanswered input keeps waiting for a frame to claim it.
 /// Beyond this the number would not be a latency any more: nothing
 /// responded to the event, and attributing the next unrelated frame to it
@@ -326,6 +330,9 @@ struct Server {
     /// Newest input timestamp not yet consumed by a frame; see
     /// [`Server::note_input`].
     pending_input_ns: u64,
+    /// The clients whose answer a cursor-only flip is waiting for, and the
+    /// timer that bounds the wait. See [`defer`].
+    defer: DeferredFlip,
 
     next_client: u64,
     next_wire: u64,
@@ -454,6 +461,7 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         windows_created: 0,
         unplaced: Vec::new(),
         pending_input_ns: 0,
+        defer: defer::DeferredFlip::new().map_err(errno("create the deferred-flip timer"))?,
         next_client: 0,
         next_wire: 0,
         next_client_id: 1,
@@ -468,6 +476,10 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         paint_items: Vec::new(),
     };
     server.register_backend()?;
+    // The deferral timer stays in the epoll set for the whole run. It is
+    // disarmed unless a flip is actually being held, so a registered fd
+    // that never fires costs an idle server nothing.
+    add(&server.epoll, &server.defer.as_fd(), TOK_DEFER)?;
     server.sync_outputs();
     server.paint_all();
     let result = server.event_loop();
@@ -750,7 +762,7 @@ impl Server {
                 .output_info(id)
                 .map_or((0, 0), |(rect, _)| (rect.x, rect.y));
             for r in damage.rects() {
-                output.damage.add(r.translate(-origin.0, -origin.1));
+                output.damage_content(r.translate(-origin.0, -origin.1));
             }
         }
         // A resize the server decided on (or a client's own `SetBounds` on
@@ -787,19 +799,22 @@ impl Server {
     }
 
     /// Paint and commit one output if it is writable and has anything new.
-    fn paint(&mut self, id: KmsOutputId) {
+    ///
+    /// Returns whether a commit went in, which
+    /// [`Server::paint_all`] uses to tell "nothing to do" from "held".
+    fn paint(&mut self, id: KmsOutputId) -> bool {
         if !self.active || self.backend.flip_pending(id) {
-            return;
+            return false;
         }
         let Some(index) = self.outputs.iter().position(|o| o.kms_id == id) else {
-            return;
+            return false;
         };
         if !self.outputs[index].needs_paint() {
-            return;
+            return false;
         }
         let region = self.outputs[index].repaint_region();
         if region.is_empty() {
-            return;
+            return false;
         }
         let scene_id = self.outputs[index].scene_id;
         let cursor_state = self.cursor_state(scene_id);
@@ -808,7 +823,7 @@ impl Server {
                 Ok(b) => b,
                 Err(e) => {
                     warn!("{id}: back buffer: {e}");
-                    return;
+                    return false;
                 }
             };
             frame::paint_region(
@@ -834,12 +849,14 @@ impl Server {
                 self.stats.paint_us.push(paint_us);
                 self.stats.damage_px.push(damage_px);
                 self.outputs[index].committed();
+                true
             }
             Err(e) => {
                 warn!("{id}: commit: {e}");
                 // Keep the damage so the next event retries; otherwise the
                 // output stalls until the next resume or hotplug.
                 self.outputs[index].commit_failed(&region);
+                false
             }
         }
     }
@@ -858,11 +875,118 @@ impl Server {
         }
     }
 
+    /// Paint every output that wants it, unconditionally, disarming any
+    /// deferral first.
+    ///
+    /// Every caller that is *not* the ordinary settle pass (a resume, a
+    /// hotplug, startup) goes through here rather than
+    /// [`Server::paint_or_defer`], because none of those frames is a
+    /// cursor a client is answering — and disarming even on those paths is
+    /// what keeps "idle is zero wakeups" unconditionally true.
     fn paint_all(&mut self) {
-        let ids: Vec<KmsOutputId> = self.outputs.iter().map(|o| o.kms_id).collect();
-        for id in ids {
-            self.paint(id);
+        // Disarm first: the frame is going in now, and the timer would
+        // otherwise wake a server with nothing left to do.
+        if let Err(e) = self.defer.disarm() {
+            warn!("disarming the deferred-flip timer: {e}");
         }
+        let ids: Vec<KmsOutputId> = self.outputs.iter().map(|o| o.kms_id).collect();
+        let mut painted = false;
+        for id in ids {
+            painted |= self.paint(id);
+        }
+        // The frame those clients would have ridden has gone. A wakeup
+        // that wanted to paint and could not (a flip still in flight)
+        // deliberately keeps the wait alive for the wakeup that can, or
+        // the saturating-input case — every motion arriving mid-flip —
+        // would lose the answer it was holding for.
+        if painted {
+            self.defer.forget_all();
+        }
+    }
+
+    /// Paint, unless the only thing this frame would show is a cursor that
+    /// a client is about to answer for.
+    ///
+    /// The whole latency fix is here, and it is a scheduling decision, not
+    /// a faster anything: a pointer move damages the *cursor* immediately,
+    /// so painting at once puts a flip in flight that the client's own
+    /// commit — 0.12 ms behind it — then has to wait out, and the content
+    /// lands one whole refresh after the arrow. Holding that flip for the
+    /// few hundred microseconds it takes the answer to arrive lets both
+    /// ride the same vblank.
+    ///
+    /// It is deferred only when every one of these holds:
+    ///
+    /// * a client was just told about an input and has not answered
+    ///   ([`Server::note_client_input`]) — cursor movement over the bare
+    ///   desktop has nobody to wait for and stays on the fast path;
+    /// * every output that wants a frame wants it for the cursor alone
+    ///   ([`frame::OutputState::cursor_only`]) — content damage or a
+    ///   commit retry both mean somebody is already waiting for those
+    ///   pixels;
+    /// * the timer arms. If it will not, paint: a frame nothing would ever
+    ///   wake us for is far worse than a frame one refresh early.
+    ///
+    /// The bound is [`frame::OutputState::frame_deadline_ns`], the same
+    /// next-vblank-minus-margin a client asking for a frame callback is
+    /// given, so a client that never answers costs exactly nothing: the
+    /// cursor still reaches that vblank, with a whole margin (ten paint
+    /// passes on the test box) left to rasterize in.
+    fn paint_or_defer(&mut self) {
+        if self.should_defer() {
+            let now_ns = monotonic_ns();
+            let deadline_ns = self
+                .outputs
+                .iter()
+                .filter(|o| o.needs_paint())
+                .map(|o| o.frame_deadline_ns(now_ns))
+                .min()
+                .unwrap_or(now_ns);
+            match self.defer.hold_until(deadline_ns) {
+                Ok(()) => {
+                    debug!(
+                        "cursor-only flip held {} us for a client's answer",
+                        deadline_ns.saturating_sub(now_ns) / 1_000
+                    );
+                    return;
+                }
+                // A timer that will not arm is the one failure that must
+                // not be absorbed silently: nothing else would ever wake
+                // the loop for this frame.
+                Err(e) => warn!("arming the deferred-flip timer: {e}"),
+            }
+        }
+        self.paint_all();
+    }
+
+    /// Whether this wakeup's frame should wait for a client's answer. See
+    /// [`Server::paint_or_defer`] for what each clause protects.
+    fn should_defer(&self) -> bool {
+        if !self.active || !self.defer.awaiting() {
+            return false;
+        }
+        let mut paintable = false;
+        for output in &self.outputs {
+            // An output with nothing to paint has nothing to hold back,
+            // and one whose flip is still in flight is not being painted
+            // either — that wakeup comes back through `on_flip`.
+            if !output.needs_paint() || self.backend.flip_pending(output.kms_id) {
+                continue;
+            }
+            if !output.cursor_only() {
+                return false;
+            }
+            paintable = true;
+        }
+        paintable
+    }
+
+    /// The deferral deadline passed: the client did not answer in time, so
+    /// paint the cursor on its own after all. `defer_timeouts` counts it.
+    fn on_defer_deadline(&mut self) {
+        self.defer.expired();
+        debug!("deferred flip timed out");
+        self.settle();
     }
 
     /// The update-then-paint pass every event that could have changed the
@@ -871,7 +995,7 @@ impl Server {
     fn settle(&mut self) {
         self.update_scene();
         self.claim_input_stamp();
-        self.paint_all();
+        self.paint_or_defer();
         self.answer_idle_clients();
         self.flush_wire_clients();
     }
@@ -964,6 +1088,7 @@ impl Server {
                     TOK_WIRE_LISTENER => self.on_wire_accept()?,
                     TOK_BACKEND => self.on_backend()?,
                     TOK_INPUT => self.on_input(),
+                    TOK_DEFER => self.on_defer_deadline(),
                     t if t >= TOK_WIRE_BASE => self.on_wire_client(t, flags),
                     t if t >= TOK_CLIENT_BASE => self.on_client(t, flags),
                     t => warn!("unknown epoll token {t}"),
@@ -1124,7 +1249,12 @@ impl Server {
             }
         }
         self.flush_wire_clients();
-        self.paint(id);
+        // Through the deferral, not straight to `paint`: this is the
+        // wakeup a saturated input rate arrives on — the motion landed
+        // while this very flip was in flight, so its cursor damage is
+        // sitting here waiting and the client's answer may still be a
+        // wakeup away. Same rule, same deadline.
+        self.paint_or_defer();
     }
 
     fn on_accept(&mut self) -> Result<(), Error> {
@@ -1215,7 +1345,7 @@ impl Server {
                 let Some(window) = self.pointer.over else {
                     return;
                 };
-                self.send_to_window(window, |id| {
+                let sent_to = self.send_to_window(window, |id| {
                     ServerMsg::PointerAxis(msg::PointerAxis {
                         window: id,
                         dx,
@@ -1224,6 +1354,7 @@ impl Server {
                         time_ns,
                     })
                 });
+                self.note_client_input(sent_to);
                 self.note_input(time_ns);
             }
             InputEvent::Key {
@@ -1266,17 +1397,21 @@ impl Server {
         let now_over = target.map(|t| t.window);
         if now_over != self.pointer.over {
             if let Some(left) = self.pointer.over {
-                self.send_to_window(left, |id| {
+                let sent_to = self.send_to_window(left, |id| {
                     ServerMsg::PointerLeave(msg::PointerLeave {
                         window: id,
                         time_ns,
                     })
                 });
+                // A leave is an input the client will very plausibly
+                // answer — an un-highlight — so it is worth the same wait
+                // as the motion that caused it.
+                self.note_client_input(sent_to);
             }
             self.pointer.over = now_over;
             if let Some(t) = target {
                 let node = self.node_id_for(t.window, t.hit.node);
-                self.send_to_window(t.window, |id| {
+                let sent_to = self.send_to_window(t.window, |id| {
                     ServerMsg::PointerEnter(msg::PointerEnter {
                         window: id,
                         node,
@@ -1284,10 +1419,11 @@ impl Server {
                         time_ns,
                     })
                 });
+                self.note_client_input(sent_to);
             }
         } else if let Some(t) = target {
             let node = self.node_id_for(t.window, t.hit.node);
-            self.send_to_window(t.window, |id| {
+            let sent_to = self.send_to_window(t.window, |id| {
                 ServerMsg::PointerMotion(msg::PointerMotion {
                     window: id,
                     node,
@@ -1295,6 +1431,7 @@ impl Server {
                     time_ns,
                 })
             });
+            self.note_client_input(sent_to);
         }
         self.note_input(time_ns);
     }
@@ -1321,7 +1458,7 @@ impl Server {
             }
             self.set_focus(Some(window));
         }
-        self.send_to_window(window, |id| {
+        let sent_to = self.send_to_window(window, |id| {
             ServerMsg::PointerButton(msg::PointerButton {
                 window: id,
                 button,
@@ -1329,6 +1466,7 @@ impl Server {
                 time_ns,
             })
         });
+        self.note_client_input(sent_to);
         self.note_input(time_ns);
     }
 
@@ -1368,7 +1506,7 @@ impl Server {
         };
         let utf8 = resolved.utf8.clone();
         let (keysym, mods) = (resolved.keysym, resolved.mods);
-        self.send_to_window(window, |id| {
+        let sent_to = self.send_to_window(window, |id| {
             ServerMsg::Key(msg::Key {
                 window: id,
                 keycode,
@@ -1379,6 +1517,7 @@ impl Server {
                 utf8: utf8.clone(),
             })
         });
+        self.note_client_input(sent_to);
         self.note_input(time_ns);
     }
 
@@ -1414,7 +1553,7 @@ impl Server {
         let Some((win, pos)) = target else {
             return;
         };
-        self.send_to_window(win, |window| {
+        let sent_to = self.send_to_window(win, |window| {
             ServerMsg::Touch(msg::Touch {
                 window,
                 id: touch_id,
@@ -1423,6 +1562,7 @@ impl Server {
                 time_ns,
             })
         });
+        self.note_client_input(sent_to);
         self.note_input(time_ns);
     }
 
@@ -1480,7 +1620,9 @@ impl Server {
     }
 
     /// Damage a device-pixel rect in global coordinates on whichever
-    /// outputs it touches.
+    /// outputs it touches — the software cursor's rect, and nothing else.
+    /// Scene damage goes through [`Server::update_scene`], which is what
+    /// keeps [`frame::OutputState::cursor_only`] able to tell them apart.
     fn damage_global(&mut self, rect: nitro_core::IRect) {
         for output in &mut self.outputs {
             let Some((origin, _)) = self.scene.output_info(output.scene_id) else {
@@ -1490,22 +1632,39 @@ impl Server {
                 .translate(-origin.x, -origin.y)
                 .intersect(&output.bounds());
             if !local.is_empty() {
-                output.damage.add(local);
+                output.damage_cursor(local);
             }
         }
     }
 
     /// Send a message to whichever client owns `win`, naming the window
-    /// with that client's own node id.
-    fn send_to_window<F>(&mut self, win: WindowKey, build: F)
+    /// with that client's own node id. Returns the client's epoll token
+    /// when one owned it, so an input event can note whose answer it is
+    /// now worth waiting for.
+    fn send_to_window<F>(&mut self, win: WindowKey, build: F) -> Option<u64>
     where
         F: Fn(NodeId) -> ServerMsg,
     {
-        for client in self.wire_clients.values_mut() {
+        let mut sent_to = None;
+        for (token, client) in &mut self.wire_clients {
             if let Some(id) = client.window_id(win) {
                 let msg = build(id);
                 client.send(&msg);
+                sent_to = Some(*token);
             }
+        }
+        sent_to
+    }
+
+    /// An input event has just been sent to a client: its answer is worth
+    /// holding a cursor-only flip for. See [`Server::paint_or_defer`].
+    ///
+    /// A `None` token — the pointer is over the desktop, or over a window
+    /// whose client has gone — records nothing, which is exactly how
+    /// cursor movement over an empty desktop stays on the fast path.
+    fn note_client_input(&mut self, token: Option<u64>) {
+        if let Some(token) = token {
+            self.defer.expect(token);
         }
     }
 
@@ -1628,6 +1787,14 @@ impl Server {
                 self.flips.min.map_or(0, |d| d.as_micros() as u64),
             ),
             ("flip_interval_max_us", self.flips.max.as_micros() as u64),
+            // The deferral counters sit next to the flip statistics
+            // because that is what they describe: how often a flip was
+            // held for a client's answer, and how often that answer never
+            // came. A `defer_timeouts` that tracks `flips_deferred` is a
+            // client that is not responding — the cursor is fine, it is
+            // reaching every vblank, but nothing is riding with it.
+            ("flips_deferred", self.defer.deferred),
+            ("defer_timeouts", self.defer.timeouts),
         ];
         self.stats.write_pairs(&mut pairs);
         self.text.write_pairs(&mut pairs);
@@ -1796,6 +1963,11 @@ impl Server {
 
     /// Apply a client's transaction. Returns whether the client survives.
     fn commit(&mut self, token: u64, serial: u32) -> bool {
+        // This is the answer a deferred flip was waiting for. Noted before
+        // the transaction is applied rather than after: the client has
+        // spoken either way, and a transaction that turns out to be fatal
+        // must not leave the cursor held hostage to a dead connection.
+        self.defer.forget(token);
         let Some(mut client) = self.wire_clients.remove(&token) else {
             return false;
         };
@@ -2005,6 +2177,9 @@ impl Server {
     /// covered are damaged by the scene as it removes them, so the area
     /// repaints without them on the next frame.
     fn disconnect(&mut self, token: u64, failure: Option<(u32, ErrorCode, String)>) {
+        // A client that is gone will never answer, and a flip held for it
+        // would sit out its whole deadline for nothing.
+        self.defer.forget(token);
         let Some(mut client) = self.wire_clients.remove(&token) else {
             return;
         };
