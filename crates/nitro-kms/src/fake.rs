@@ -11,6 +11,9 @@
 //!   the same tick, `period` after the first commit.
 //! - `tick()` flips synchronously without the timer, for tests that don't
 //!   want to poll. `Flipped.time` is `CLOCK_MONOTONIC` either way.
+//! - `resume()` abandons any flip in flight — no output is flip-pending
+//!   afterwards — and disarms the timer, so a paused-then-resumed fake is
+//!   as idle as a fresh one.
 //! - Damage passed to `commit` is recorded verbatim in `damage_log()`.
 //! - Hotplug is simulated with `plug()` / `unplug()`: they queue an
 //!   `Event::Hotplug`; the change takes effect on `rescan`.
@@ -218,6 +221,40 @@ impl FakeBackend {
         Ok(())
     }
 
+    /// Stop the vblank timer and swallow an expiration it has already
+    /// queued, so a disarmed fake really makes no wakeups.
+    fn disarm(&mut self) -> Result<(), Error> {
+        let spec = Itimerspec {
+            it_interval: Timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            it_value: Timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+        };
+        timerfd_settime(&self.timer, TimerfdTimerFlags::empty(), &spec).map_err(|e| Error::Io {
+            op: "disarm fake vblank timer",
+            source: e.into(),
+        })?;
+        // Disarming does not clear an expiration that already happened, and
+        // the fd would stay readable and wake every poll of an idle backend.
+        // The fd is non-blocking, so this read just drains that count.
+        let mut buf = [0u8; 8];
+        match rustix::io::read(&self.timer, &mut buf[..]) {
+            Ok(_) | Err(rustix::io::Errno::AGAIN) => {}
+            Err(e) => {
+                return Err(Error::Io {
+                    op: "read fake vblank timer",
+                    source: e.into(),
+                });
+            }
+        }
+        self.armed = false;
+        Ok(())
+    }
+
     /// Complete every in-flight commit now, as if a vblank happened,
     /// appending `Flipped` events. Also delivers a queued `Hotplug`.
     pub fn tick(&mut self, events: &mut Vec<Event>) {
@@ -348,11 +385,27 @@ impl Backend for FakeBackend {
 
     fn pause(&mut self) {
         self.paused = true;
+        // Like the DRM backend, pausing keeps every bit of state: a flip in
+        // flight stays pending and `tick` or `dispatch` may still retire it.
+        // Nothing has to be undone here, because `resume` clears the pending
+        // flag unconditionally.
     }
 
     fn resume(&mut self) -> Result<(), Error> {
         self.paused = false;
-        Ok(())
+        // Abandon any flip that was in flight, matching the DRM backend's
+        // contract: after a resume no output has a pending flip and the
+        // caller repaints fully. `commit` already moved `front` to the
+        // committed buffer, so clearing the flag without swapping leaves
+        // `front` as what is being scanned out; the back buffer's contents
+        // are then stale, which the full repaint covers.
+        for o in &mut self.outputs {
+            o.pending = false;
+        }
+        // With nothing in flight there is no flip left to report, so the
+        // timer must go too: an idle paused-then-resumed fake makes no
+        // wakeups, as the module docs promise.
+        self.disarm()
     }
 
     fn read_front(&mut self, output: OutputId) -> Result<Image, Error> {
@@ -509,6 +562,54 @@ mod tests {
         assert!(b.rescan().unwrap());
         assert_eq!(b.outputs().len(), 1);
         assert!(matches!(b.commit(id, &[]), Err(Error::NoSuchOutput(_))));
+    }
+
+    #[test]
+    fn resume_abandons_pending_flip() {
+        let (mut b, id) = fake();
+        b.commit(id, &[]).unwrap();
+        assert!(b.flip_pending(id));
+        b.pause();
+        // Pausing on its own leaves the flip in flight, as documented.
+        assert!(b.flip_pending(id));
+        b.resume().unwrap();
+        assert!(!b.flip_pending(id));
+        // The buffers are usable again straight away, without waiting for a
+        // flip completion that is never going to come.
+        assert!(b.back_buffer(id).is_ok());
+        b.commit(id, &[]).unwrap();
+    }
+
+    #[test]
+    fn resume_disarms_the_timer() {
+        let (mut b, id) = fake();
+        b.commit(id, &[]).unwrap();
+        b.pause();
+        b.resume().unwrap();
+        // The abandoned flip must not leave a wakeup behind: poll the timer
+        // for well over one 60 Hz period and expect no readiness.
+        let fds = b.poll_fds();
+        let mut pfd = [rustix::event::PollFd::new(
+            &fds[0],
+            rustix::event::PollFlags::IN,
+        )];
+        let n = rustix::event::poll(
+            &mut pfd,
+            Some(&Timespec {
+                tv_sec: 0,
+                tv_nsec: 50_000_000,
+            }),
+        )
+        .unwrap();
+        assert_eq!(n, 0);
+        let mut ev = Vec::new();
+        b.dispatch(&mut ev).unwrap();
+        assert!(ev.is_empty());
+        // A later commit re-arms it normally.
+        b.commit(id, &[]).unwrap();
+        assert!(b.flip_pending(id));
+        b.tick(&mut ev);
+        assert!(matches!(ev.as_slice(), [Event::Flipped { .. }]));
     }
 
     #[test]

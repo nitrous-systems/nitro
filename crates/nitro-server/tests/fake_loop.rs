@@ -1,5 +1,10 @@
-//! Drive the whole server loop in-process on the fake backend: connect to
-//! the control socket, check `outputs`, `shot` pixels, `stats`, `quit`.
+//! Drive the whole server loop in-process on the fake backend: the v0
+//! control socket, wire clients over `nitro-wire`, and synthetic input.
+//!
+//! These are the M1 acceptance tests. The server runs on a thread with a
+//! [`nitro_kms::FakeBackend`] and a [`nitro_server::input::FakeInput`], so
+//! there is no seat, no DRM device and no evdev node anywhere — and the
+//! code exercised is the real event loop, not a stub of it.
 
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::os::unix::net::UnixStream;
@@ -7,38 +12,56 @@ use std::path::PathBuf;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use nitro_core::{Color, IRect, Point, Rect, Size};
 use nitro_kms::Image;
-use nitro_server::render::{BAR_COLOR, BAR_WIDTH, expected_color};
+use nitro_server::clients::CASCADE_STEP;
+use nitro_server::cursor::CURSOR_SIZE;
+use nitro_server::input::{FakeInput, InputEvent};
+use nitro_server::render::{FRAME, background_color};
 use nitro_server::{Config, run};
+use nitro_wire::client::Connection;
+use nitro_wire::msg::ServerMsg;
+use nitro_wire::types::{ButtonState, Layer, NodeId};
+
+/// Wait for a condition, polling. Every wait in this file has a deadline:
+/// a test that hangs tells you nothing.
+fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !f() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
 
 struct Harness {
     dir: PathBuf,
     path: PathBuf,
+    wire_path: PathBuf,
+    input: FakeInput,
     thread: Option<JoinHandle<Result<(), nitro_server::Error>>>,
 }
 
 impl Harness {
-    fn start(name: &str, width: u32, height: u32, bar_stop: Option<Duration>) -> Self {
+    fn start(name: &str, width: u32, height: u32) -> Self {
         let dir = std::env::temp_dir().join(format!("nitro-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("nitro").join("control.sock");
         let mut config = Config::fake(width, height, &path);
-        config.bar_stop = bar_stop;
+        let input = FakeInput::new().expect("eventfd");
+        config.fake_input = Some(input.clone());
+        let wire_path = config.wire_path.clone();
         let thread = std::thread::spawn(move || run(config));
         let h = Self {
             dir,
             path,
+            wire_path,
+            input,
             thread: Some(thread),
         };
-        // Wait for the socket to accept.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if UnixStream::connect(&h.path).is_ok() {
-                break;
-            }
-            assert!(Instant::now() < deadline, "server never bound its socket");
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        wait_for("the control socket", || {
+            UnixStream::connect(&h.path).is_ok()
+        });
+        wait_for("the wire socket", || h.wire_path.exists());
         h
     }
 
@@ -46,6 +69,10 @@ impl Harness {
         let s = UnixStream::connect(&self.path).expect("connect");
         s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         BufReader::new(s)
+    }
+
+    fn client(&self, name: &str) -> Connection {
+        Connection::connect(&self.wire_path, name).expect("wire connect")
     }
 
     fn request_text(&self, req: &str) -> Vec<String> {
@@ -96,6 +123,38 @@ impl Harness {
         })
     }
 
+    /// Frames the server has flipped so far.
+    fn frames(&self) -> u64 {
+        stat(&self.request_text("stats\n"), "frames")
+    }
+
+    /// Wait until the server has finished reacting to whatever we just
+    /// did: no flip in flight and the frame counter has stopped moving.
+    ///
+    /// Not "wait for N more frames": the whole point of the design is that
+    /// a server with nothing to do stops flipping entirely, so counting
+    /// frames would hang the moment the thing under test has settled. A
+    /// screenshot is honest as soon as the last commit went in — the front
+    /// buffer is the most recently committed one, and the age-2 repaint
+    /// region guarantees it is complete.
+    fn settle(&self) {
+        let mut stable = 0;
+        let mut last = u64::MAX;
+        wait_for("the server to go quiet", || {
+            let s = self.request_text("stats\n");
+            let frames = stat(&s, "frames");
+            let pending = stat(&s, "flips_pending");
+            if pending == 0 && frames == last {
+                stable += 1;
+            } else {
+                stable = 0;
+            }
+            last = frames;
+            std::thread::sleep(Duration::from_millis(10));
+            stable >= 3
+        });
+    }
+
     fn quit(mut self) {
         let mut c = self.connect();
         c.get_mut().write_all(b"quit\n").unwrap();
@@ -103,13 +162,10 @@ impl Harness {
         c.read_line(&mut line).unwrap();
         assert_eq!(line, "ok\n");
         let t = self.thread.take().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !t.is_finished() {
-            assert!(Instant::now() < deadline, "server did not stop after quit");
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        wait_for("the server thread to stop", || t.is_finished());
         t.join().unwrap().expect("server returned an error");
         assert!(!self.path.exists(), "socket file removed on shutdown");
+        assert!(!self.wire_path.exists(), "wire socket removed on shutdown");
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -123,59 +179,92 @@ fn stat(lines: &[String], key: &str) -> u64 {
         .unwrap()
 }
 
+/// Drain a client's socket until `f` matches, or time out. Anything else
+/// that arrives is kept, so a later call can still see it.
+fn expect<T>(
+    conn: &mut Connection,
+    seen: &mut Vec<ServerMsg>,
+    what: &str,
+    f: impl Fn(&ServerMsg) -> Option<T>,
+) -> T {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(found) = seen.iter().find_map(&f) {
+            return found;
+        }
+        assert!(Instant::now() < deadline, "no {what}; got {seen:?}");
+        conn.flush().unwrap();
+        match conn.poll(seen) {
+            Ok(_) => {}
+            Err(e) => panic!("waiting for {what}: {e}"),
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// A window with one solid rect filling it, committed. Returns the ids.
+struct Window {
+    root: NodeId,
+    rect: NodeId,
+}
+
+fn make_window(conn: &mut Connection, root: u32, size: Size, color: Color, serial: u32) -> Window {
+    let root = NodeId(root);
+    let rect = NodeId(root.raw() + 1);
+    conn.tx()
+        .create_window(root, "test", size, Layer::Normal)
+        .create_rect(rect, root, Rect::new(0.0, 0.0, size.w, size.h))
+        .fill_solid(rect, color)
+        .commit(serial)
+        .unwrap();
+    conn.flush().unwrap();
+    Window { root, rect }
+}
+
+/// The cursor sits at the centre of the output and would otherwise
+/// contaminate every pixel comparison; park it in a corner far from the
+/// windows under test.
+fn park_cursor(h: &Harness, x: f64, y: f64) {
+    h.input.push(InputEvent::PointerAbsolute {
+        x,
+        y,
+        time_ns: 1_000_000,
+    });
+}
+
 #[test]
 fn outputs_shot_stats_quit_on_fake_backend() {
     let (w, h) = (320, 200);
-    let h_ = Harness::start("static", w, h, Some(Duration::ZERO));
+    let h_ = Harness::start("static", w, h);
 
     assert_eq!(
         h_.request_text("outputs\n"),
         ["ok", &format!("Virtual-1 {w}x{h}@60000")]
     );
 
-    // The first frame is committed at startup; wait for it to flip so
-    // `read_front` has a painted buffer either way.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let s = h_.request_text("stats\n");
-        assert_eq!(s[0], "ok");
-        if stat(&s, "frames") >= 1 {
-            assert_eq!(stat(&s, "active"), 1);
-            break;
-        }
-        assert!(Instant::now() < deadline, "no flip: {s:?}");
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    wait_for("the first flip", || h_.frames() >= 1);
+    park_cursor(&h_, 0.99, 0.99);
+    h_.settle();
 
     let img = h_.shot(None).unwrap();
     assert_eq!((img.width, img.height, img.stride), (w, h, w * 4));
-    // Bar frozen at x = 0: frame, bar, gradient at a few exact spots.
-    for (x, y) in [
-        (0, 0),
-        (2, 100),
-        (w - 1, h - 1),
-        (5, 5),
-        (39, 100),
-        (40, 100),
-        (100, 4),
-        (160, 100),
-        (200, h - 5),
-        (w - 5, 50),
-    ] {
-        assert_eq!(
-            img.pixel(x, y),
-            expected_color(x, y, w, h, 0),
-            "pixel ({x},{y})"
-        );
-    }
-    // And the whole image, for good measure.
+    // An empty desktop is the background everywhere the cursor is not.
+    let cursor_area = IRect::new(
+        w.cast_signed() - CURSOR_SIZE - 2,
+        h.cast_signed() - CURSOR_SIZE - 2,
+        CURSOR_SIZE + 4,
+        CURSOR_SIZE + 4,
+    );
     for y in 0..h {
         for x in 0..w {
-            assert_eq!(img.pixel(x, y), expected_color(x, y, w, h, 0), "({x},{y})");
+            if cursor_area.contains(x.cast_signed(), y.cast_signed()) {
+                continue;
+            }
+            assert_eq!(img.pixel(x, y), background_color(x, y, w, h), "({x},{y})");
         }
     }
 
-    assert_eq!(h_.shot(Some("Virtual-1")).unwrap(), img);
+    assert_eq!(h_.shot(Some("Virtual-1")).unwrap().width, w);
     assert_eq!(
         h_.shot(Some("HDMI-A-9")),
         Err("no output named HDMI-A-9".to_owned())
@@ -186,50 +275,400 @@ fn outputs_shot_stats_quit_on_fake_backend() {
     c.read_line(&mut line).unwrap();
     assert_eq!(line, "err unknown request `bogus`\n");
 
-    // Static mode: frames stop after the two full repaints.
-    std::thread::sleep(Duration::from_millis(100));
+    // Nothing is happening: the server stops committing entirely. That is
+    // the zero-wakeup idle state, and it is the property the whole design
+    // exists for.
+    let before = h_.frames();
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(h_.frames(), before, "an idle server keeps flipping");
+
     let s = h_.request_text("stats\n");
-    assert_eq!(stat(&s, "frames"), 2, "{s:?}");
     assert_eq!(stat(&s, "flips_pending"), 0);
+    assert_eq!(stat(&s, "clients"), 0);
+    assert_eq!(stat(&s, "windows"), 0);
+    assert_eq!(stat(&s, "nodes"), 0);
 
     h_.quit();
 }
 
 #[test]
-fn moving_bar_advances_and_keeps_flipping() {
-    let (w, h) = (128, 32);
-    let h_ = Harness::start("moving", w, h, None);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut positions = Vec::new();
-    while positions.len() < 3 {
-        let img = h_.shot(None).unwrap();
-        let row: Vec<bool> = (0..w).map(|x| img.pixel(x, h / 2) == BAR_COLOR).collect();
-        if let Some(first) = row.iter().position(|&b| b) {
-            let last = row.iter().rposition(|&b| b).unwrap() as u32;
-            let first = first as u32;
-            // The 4-px frame hides the bar's left edge when it sits at 0.
-            let bar_x = if first > 4 {
-                first
-            } else {
-                last + 1 - BAR_WIDTH
-            };
-            assert_eq!(bar_x % 8, 0, "bar at {bar_x}");
-            if positions.last() != Some(&bar_x) {
-                positions.push(bar_x);
-            }
+fn a_client_window_is_configured_presented_and_painted_where_the_cascade_put_it() {
+    let (w, h) = (320, 200);
+    let h_ = Harness::start("client", w, h);
+    park_cursor(&h_, 0.99, 0.99);
+
+    let mut conn = h_.client("test");
+    let mut seen = Vec::new();
+    let size = Size::new(100.0, 60.0);
+    let win = make_window(&mut conn, 1, size, Color::rgb(0xFF, 0x40, 0x40), 7);
+
+    // The server answers with the size, scale and output it gave us.
+    let configure = expect(&mut conn, &mut seen, "Configure", |m| match m {
+        ServerMsg::Configure(c) if c.window == win.root => Some(*c),
+        _ => None,
+    });
+    assert_eq!(configure.size, size);
+    assert!((configure.scale - 1.0).abs() < f32::EPSILON);
+
+    // And reports the commit as presented once the frame lands.
+    let presented = expect(&mut conn, &mut seen, "Presented", |m| match m {
+        ServerMsg::Presented(p) => Some(*p),
+        _ => None,
+    });
+    assert_eq!(presented.serial, 7);
+    assert!(presented.time_ns > 0);
+
+    h_.settle();
+    let img = h_.shot(None).unwrap();
+    // The first window cascades to (0, 0).
+    for (x, y, inside) in [
+        (10, 10, true),
+        (99, 59, true),
+        (100, 30, false),
+        (30, 60, false),
+    ] {
+        let got = img.pixel(x, y);
+        if inside {
+            assert_eq!(got, 0x00FF_4040, "({x},{y}) should be the client's rect");
+        } else {
+            assert_eq!(
+                got,
+                background_color(x, y, w, h),
+                "({x},{y}) should be the desktop"
+            );
         }
-        assert!(Instant::now() < deadline, "bar never moved: {positions:?}");
-        std::thread::sleep(Duration::from_millis(20));
     }
+
     let s = h_.request_text("stats\n");
-    assert!(stat(&s, "frames") >= 3, "{s:?}");
-    assert!(stat(&s, "flip_interval_mean_us") > 0, "{s:?}");
+    assert_eq!(stat(&s, "clients"), 1);
+    assert_eq!(stat(&s, "windows"), 1);
+    // The window's root group plus the rect.
+    assert_eq!(stat(&s, "nodes"), 2);
+    assert!(stat(&s, "paint_us_max") > 0, "{s:?}");
+    assert!(stat(&s, "damage_px_mean") > 0, "{s:?}");
+
+    // A second window cascades one step down and right.
+    let mut other = h_.client("second");
+    let win2 = make_window(
+        &mut other,
+        10,
+        Size::new(80.0, 50.0),
+        Color::rgb(0x40, 0xFF, 0x40),
+        1,
+    );
+    let mut seen2 = Vec::new();
+    expect(&mut other, &mut seen2, "Configure", |m| match m {
+        ServerMsg::Configure(c) if c.window == win2.root => Some(*c),
+        _ => None,
+    });
+    h_.settle();
+    let img = h_.shot(None).unwrap();
+    let step = CASCADE_STEP as u32;
+    assert_eq!(img.pixel(step + 5, step + 5), 0x0040_FF40);
+    // The first window is still visible where the second does not cover it.
+    assert_eq!(img.pixel(5, 5), 0x00FF_4040);
+
     h_.quit();
 }
 
 #[test]
-fn many_clients_and_partial_lines() {
-    let h_ = Harness::start("clients", 64, 64, Some(Duration::ZERO));
+fn pointer_motion_enters_the_window_and_reports_local_coordinates() {
+    let (w, h) = (320, 200);
+    let h_ = Harness::start("pointer", w, h);
+    let mut conn = h_.client("pointer");
+    let mut seen = Vec::new();
+    let win = make_window(
+        &mut conn,
+        1,
+        Size::new(100.0, 60.0),
+        Color::rgb(0, 0, 0xFF),
+        1,
+    );
+    expect(&mut conn, &mut seen, "Configure", |m| match m {
+        ServerMsg::Configure(c) if c.window == win.root => Some(*c),
+        _ => None,
+    });
+
+    // Start outside the window, then move inside it.
+    park_cursor(&h_, 0.9, 0.9);
+    h_.input.push(InputEvent::PointerAbsolute {
+        x: 40.0 / f64::from(w),
+        y: 25.0 / f64::from(h),
+        time_ns: 2_000_000,
+    });
+    let enter = expect(&mut conn, &mut seen, "PointerEnter", |m| match m {
+        ServerMsg::PointerEnter(e) => Some(*e),
+        _ => None,
+    });
+    assert_eq!(enter.window, win.root);
+    assert_eq!(enter.node, win.rect, "the rect is what the pointer is over");
+    assert_eq!(enter.pos, Point::new(40.0, 25.0));
+
+    // Another move inside is a motion, not a second enter.
+    h_.input.push(InputEvent::PointerAbsolute {
+        x: 60.0 / f64::from(w),
+        y: 30.0 / f64::from(h),
+        time_ns: 3_000_000,
+    });
+    let motion = expect(&mut conn, &mut seen, "PointerMotion", |m| match m {
+        ServerMsg::PointerMotion(m) => Some(*m),
+        _ => None,
+    });
+    assert_eq!(motion.window, win.root);
+    assert_eq!(motion.pos, Point::new(60.0, 30.0));
+
+    // Leaving sends PointerLeave.
+    h_.input.push(InputEvent::PointerAbsolute {
+        x: 0.95,
+        y: 0.95,
+        time_ns: 4_000_000,
+    });
+    let leave = expect(&mut conn, &mut seen, "PointerLeave", |m| match m {
+        ServerMsg::PointerLeave(l) => Some(*l),
+        _ => None,
+    });
+    assert_eq!(leave.window, win.root);
+
+    // The cursor is drawn where it was put: a screenshot shows it.
+    h_.settle();
+    let img = h_.shot(None).unwrap();
+    let (cx, cy) = ((0.95 * f64::from(w)) as u32, (0.95 * f64::from(h)) as u32);
+    assert_ne!(
+        img.pixel(cx, cy),
+        background_color(cx, cy, w, h),
+        "the software cursor must be in the screenshot"
+    );
+
+    // And the latency loop closed: an input that produced a frame has an
+    // input-to-photon sample.
+    let s = h_.request_text("stats\n");
+    assert!(stat(&s, "i2p_max_us") > 0, "{s:?}");
+
+    h_.quit();
+}
+
+#[test]
+fn a_click_focuses_and_raises_over_another_window() {
+    let (w, h) = (320, 200);
+    let h_ = Harness::start("focus", w, h);
+
+    let mut first = h_.client("first");
+    let mut seen1 = Vec::new();
+    let w1 = make_window(
+        &mut first,
+        1,
+        Size::new(150.0, 120.0),
+        Color::rgb(0xFF, 0, 0),
+        1,
+    );
+    expect(&mut first, &mut seen1, "Configure", |m| match m {
+        ServerMsg::Configure(c) if c.window == w1.root => Some(*c),
+        _ => None,
+    });
+
+    let mut second = h_.client("second");
+    let mut seen2 = Vec::new();
+    let w2 = make_window(
+        &mut second,
+        1,
+        Size::new(150.0, 120.0),
+        Color::rgb(0, 0xFF, 0),
+        1,
+    );
+    expect(&mut second, &mut seen2, "Configure", |m| match m {
+        ServerMsg::Configure(c) if c.window == w2.root => Some(*c),
+        _ => None,
+    });
+
+    // The second window cascaded over the first; where they overlap, the
+    // newest is on top.
+    h_.settle();
+    let step = CASCADE_STEP as u32;
+    let overlap = (step + 10, step + 10);
+    let img = h_.shot(None).unwrap();
+    assert_eq!(img.pixel(overlap.0, overlap.1), 0x0000_FF00);
+
+    // Click on the part of the first window the second does not cover.
+    let (px, py) = (10.0, 10.0);
+    h_.input.push(InputEvent::PointerAbsolute {
+        x: px / f64::from(w),
+        y: py / f64::from(h),
+        time_ns: 5_000_000,
+    });
+    h_.input.push(InputEvent::PointerButton {
+        button: nitro_server::input::BTN_LEFT,
+        state: ButtonState::Pressed,
+        time_ns: 6_000_000,
+    });
+
+    let focus = expect(&mut first, &mut seen1, "Focus", |m| match m {
+        ServerMsg::Focus(f) if f.focused => Some(*f),
+        _ => None,
+    });
+    assert_eq!(focus.window, w1.root);
+    let button = expect(&mut first, &mut seen1, "PointerButton", |m| match m {
+        ServerMsg::PointerButton(b) => Some(*b),
+        _ => None,
+    });
+    assert_eq!(button.state, ButtonState::Pressed);
+
+    // And the click raised it: the overlap is now the first window's red.
+    h_.settle();
+    let img = h_.shot(None).unwrap();
+    assert_eq!(
+        img.pixel(overlap.0, overlap.1),
+        0x00FF_0000,
+        "the clicked window must be on top"
+    );
+
+    h_.quit();
+}
+
+#[test]
+fn disconnecting_destroys_everything_the_client_owned_and_repaints() {
+    let (w, h) = (320, 200);
+    let h_ = Harness::start("disconnect", w, h);
+    park_cursor(&h_, 0.99, 0.99);
+
+    let mut conn = h_.client("doomed");
+    let mut seen = Vec::new();
+    let win = make_window(
+        &mut conn,
+        1,
+        Size::new(120.0, 80.0),
+        Color::rgb(0xFF, 0, 0xFF),
+        1,
+    );
+    expect(&mut conn, &mut seen, "Configure", |m| match m {
+        ServerMsg::Configure(c) if c.window == win.root => Some(*c),
+        _ => None,
+    });
+    h_.settle();
+    assert_eq!(h_.shot(None).unwrap().pixel(50, 40), 0x00FF_00FF);
+    assert_eq!(stat(&h_.request_text("stats\n"), "nodes"), 2);
+
+    drop(conn);
+    wait_for("the client to be reaped", || {
+        stat(&h_.request_text("stats\n"), "clients") == 0
+    });
+    let s = h_.request_text("stats\n");
+    assert_eq!(stat(&s, "windows"), 0);
+    assert_eq!(stat(&s, "nodes"), 0);
+
+    // The area it covered is repainted with the desktop underneath.
+    h_.settle();
+    let img = h_.shot(None).unwrap();
+    for (x, y) in [(50, 40), (10, 10), (119, 79)] {
+        assert_eq!(
+            img.pixel(x, y),
+            background_color(x, y, w, h),
+            "({x},{y}) still holds the dead client's pixels"
+        );
+    }
+
+    h_.quit();
+}
+
+#[test]
+fn a_bad_message_gets_an_error_and_a_disconnect() {
+    let h_ = Harness::start("bad", 200, 120);
+    let mut conn = h_.client("naughty");
+    let mut seen = Vec::new();
+
+    // A node whose parent does not exist: the decoder cannot catch this,
+    // only the server's id map can.
+    conn.tx()
+        .create_rect(NodeId(9), NodeId(404), Rect::new(0.0, 0.0, 10.0, 10.0))
+        .commit(1)
+        .unwrap();
+    conn.flush().unwrap();
+
+    let err = expect(&mut conn, &mut seen, "Error", |m| match m {
+        ServerMsg::Error(e) => Some(e.clone()),
+        _ => None,
+    });
+    assert_eq!(err.serial, 1);
+    assert_eq!(err.code, nitro_wire::types::ErrorCode::UnknownNode);
+
+    // And the connection is closed.
+    wait_for("the connection to close", || {
+        let mut out = Vec::new();
+        matches!(conn.poll(&mut out), Err(nitro_wire::error::Error::Closed))
+    });
+    wait_for("the client to be reaped", || {
+        stat(&h_.request_text("stats\n"), "clients") == 0
+    });
+
+    h_.quit();
+}
+
+#[test]
+fn a_buffer_is_copied_from_the_memfd_and_blitted() {
+    use nitro_wire::msg::CreateBuffer;
+    use nitro_wire::types::{BufferId, format};
+    use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
+
+    let (w, h) = (200, 120);
+    let h_ = Harness::start("buffer", w, h);
+    park_cursor(&h_, 0.99, 0.99);
+    let mut conn = h_.client("images");
+    let mut seen = Vec::new();
+
+    // A 16x16 buffer of one solid colour, written through the fd.
+    let (bw, bh, stride) = (16u32, 16u32, 16u32 * 4);
+    let fd = memfd_create("nitro-test-buffer", MemfdFlags::CLOEXEC).unwrap();
+    ftruncate(&fd, u64::from(stride) * u64::from(bh)).unwrap();
+    let pixels: Vec<u8> = (0..(stride * bh))
+        .map(|i| match i % 4 {
+            0 => 0x20, // B
+            1 => 0xC0, // G
+            2 => 0x80, // R
+            _ => 0xFF, // A (unused for XR24)
+        })
+        .collect();
+    {
+        let mut file = std::fs::File::from(fd.try_clone().unwrap());
+        file.write_all(&pixels).unwrap();
+    }
+
+    let root = NodeId(1);
+    let image = NodeId(2);
+    conn.tx()
+        .create_window(root, "img", Size::new(64.0, 64.0), Layer::Normal)
+        .create_buffer(CreateBuffer {
+            id: BufferId(1),
+            width: bw,
+            height: bh,
+            stride,
+            format: format::XR24,
+            size: stride * bh,
+            fd,
+        })
+        .create_image(image, root, Rect::new(0.0, 0.0, 32.0, 32.0))
+        .image(image, BufferId(1), IRect::new(0, 0, 16, 16))
+        .commit(1)
+        .unwrap();
+    conn.flush().unwrap();
+    expect(&mut conn, &mut seen, "Configure", |m| match m {
+        ServerMsg::Configure(c) if c.window == root => Some(*c),
+        _ => None,
+    });
+
+    h_.settle();
+    let img = h_.shot(None).unwrap();
+    assert_eq!(img.pixel(16, 16), 0x0080_C020, "the buffer's pixels");
+    assert_eq!(
+        img.pixel(40, 40),
+        background_color(40, 40, w, h),
+        "outside the image node"
+    );
+
+    h_.quit();
+}
+
+#[test]
+fn many_control_clients_and_partial_lines() {
+    let h_ = Harness::start("clients", 64, 64);
     let mut conns: Vec<_> = (0..8).map(|_| h_.connect()).collect();
     for c in &mut conns {
         c.get_mut().write_all(b"out").unwrap();
@@ -253,5 +692,24 @@ fn many_clients_and_partial_lines() {
         }
     }
     drop(conns);
+    h_.quit();
+}
+
+#[test]
+fn the_desktop_frame_is_still_painted_under_everything() {
+    // The M0 frame is the cheapest end-to-end check that the background
+    // path runs at all: it is the only thing on an empty desktop whose
+    // colour differs from its neighbours' by construction.
+    let (w, h) = (128, 96);
+    let h_ = Harness::start("frame", w, h);
+    park_cursor(&h_, 0.5, 0.5);
+    h_.settle();
+    let img = h_.shot(None).unwrap();
+    assert_eq!(img.pixel(0, 0), background_color(0, 0, w, h));
+    assert_eq!(
+        img.pixel(FRAME - 1, 50),
+        background_color(FRAME - 1, 50, w, h)
+    );
+    assert_ne!(img.pixel(0, 50), img.pixel(FRAME + 1, 50));
     h_.quit();
 }

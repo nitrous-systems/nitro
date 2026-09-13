@@ -851,10 +851,29 @@ impl Backend for DrmBackend<'_> {
 
     fn pause(&mut self) {
         self.paused = true;
+        // Nothing else is needed here: a flip in flight stays pending and, if
+        // the kernel does deliver its completion event while we are away,
+        // `dispatch` retires it in the usual way. Should it never arrive,
+        // `resume` clears the flag unconditionally, so no state can be
+        // stranded by pausing.
     }
 
     fn resume(&mut self) -> Result<(), Error> {
         self.paused = false;
+        for o in &mut self.outputs {
+            // Abandon any flip that was in flight when the session went away
+            // instead of waiting for its completion event: DRM master was
+            // revoked in between, and correctness should not depend on the
+            // kernel still delivering page-flip events on the fd afterwards
+            // (it does today, but that is not a promise we want to rely on).
+            // Clearing the flag without swapping buffers is the right
+            // bookkeeping, because `commit` already recorded the flipped-to
+            // buffer as `front` optimistically and the modeset below scans
+            // out exactly that buffer. The back buffer's contents are
+            // therefore unknown from here on, which is harmless: the caller
+            // repaints fully after a resume.
+            o.pending = false;
+        }
         self.modeset_all()
     }
 

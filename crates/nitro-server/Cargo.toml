@@ -10,9 +10,21 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+nitro-core = { path = "../nitro-core" }
+nitro-wire = { version = "0.0.1", path = "../nitro-wire" }
+nitro-scene = { path = "../nitro-scene" }
+nitro-raster = { path = "../nitro-raster" }
 nitro-seat = { path = "../nitro-seat" }
 nitro-kms = { path = "../nitro-kms" }
 rustix = { version = "1", features = ["event", "fs", "net", "process", "time"] }
 # Self-pipe for SIGTERM/SIGINT without `unsafe` in our tree. Default
 # features (iterator/channel) are off; only `low_level::pipe` is used.
 signal-hook = { version = "0.4", default-features = false }
+# libinput, without the udev backend: devices are opened through
+# `nitro-seat` and added by path, so no `libudev` enters the tree.
+input = { version = "0.10", default-features = false, features = ["libinput_1_21"] }
+# Keymaps and keysym/UTF-8 resolution. The FFI `unsafe` lives in the crate.
+xkbcommon = "0.9"
+
+[[example]]
+name = "hello_client"

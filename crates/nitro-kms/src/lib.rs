@@ -334,7 +334,9 @@ pub trait Backend {
 
     /// The session is active again. Re-modesets every output (DRM master
     /// may have been revoked and re-granted; CRTC state does not survive
-    /// that, buffers do).
+    /// that, buffers do). Any flip in flight is abandoned:
+    /// [`Backend::flip_pending`] is false for every output afterwards, and
+    /// the caller must repaint fully.
     ///
     /// # Errors
     /// [`Error::Io`] if the modeset is rejected.

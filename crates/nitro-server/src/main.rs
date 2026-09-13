@@ -2,14 +2,18 @@
 //!
 //! - `NITRO_BACKEND=fake` (`NITRO_FAKE_SIZE=WxH`, default 1280x720) or
 //!   `drm` (default; `NITRO_DRM_CARD` picks the device).
-//! - `NITRO_DEMO=static` (default: bar stops after 3 s) or `moving`.
 //! - `NITRO_CONTROL` overrides the control socket path; otherwise
 //!   `$XDG_RUNTIME_DIR/nitro/control.sock`.
+//! - `NITRO_SOCKET` overrides the wire socket path; otherwise
+//!   `$XDG_RUNTIME_DIR/nitro/wire.sock` (the path `nitro-wire` clients
+//!   resolve to on their own, so the two agree without being told).
+//! - `NITRO_INPUT_DIR` overrides where `event*` devices are looked for
+//!   (default `/dev/input`); `NITRO_INPUT=off` disables input entirely,
+//!   which is what a headless test wants.
 //! - `NITRO_LOG=error|warn|info|debug`.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Duration;
 
 use nitro_server::{BackendKind, Config, control, error, info, warn};
 
@@ -35,11 +39,6 @@ fn config_from_env() -> Result<Config, String> {
         },
         Ok(other) => return Err(format!("NITRO_BACKEND={other:?}: want drm or fake")),
     };
-    let bar_stop = match std::env::var("NITRO_DEMO").as_deref() {
-        Ok("static") | Err(_) => Some(Duration::from_secs(3)),
-        Ok("moving") => None,
-        Ok(other) => return Err(format!("NITRO_DEMO={other:?}: want static or moving")),
-    };
     let socket = control::resolve(
         std::env::var_os("NITRO_CONTROL")
             .map(PathBuf::from)
@@ -51,11 +50,27 @@ fn config_from_env() -> Result<Config, String> {
     if let Some(w) = socket.warning {
         warn!("{w}");
     }
+    // `nitro-wire` resolves the same path from the same variables, so a
+    // client started in this environment finds this server without being
+    // configured; `NITRO_SOCKET` overrides both ends at once.
+    let wire_path =
+        std::env::var_os("NITRO_SOCKET").map_or_else(nitro_wire::socket_path, PathBuf::from);
+    // Input is on unless asked otherwise, and never on the fake backend,
+    // which has no seat to open devices through.
+    let input_dir = match std::env::var("NITRO_INPUT").as_deref() {
+        Ok("off") => None,
+        _ => Some(
+            std::env::var_os("NITRO_INPUT_DIR")
+                .map_or_else(|| PathBuf::from("/dev/input"), PathBuf::from),
+        ),
+    };
     Ok(Config {
         backend,
-        bar_stop,
         control_path: socket.path,
+        wire_path,
         handle_signals: true,
+        fake_input: None,
+        input_dir,
     })
 }
 
