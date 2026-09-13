@@ -920,6 +920,9 @@ impl Server {
     /// * a client was just told about an input and has not answered
     ///   ([`Server::note_client_input`]) — cursor movement over the bare
     ///   desktop has nobody to wait for and stays on the fast path;
+    /// * something is paintable *now*. An output whose flip is still in
+    ///   flight is not deferred, it is simply not being painted; that
+    ///   wakeup comes back through [`Server::on_flip`], which asks again;
     /// * every output that wants a frame wants it for the cursor alone
     ///   ([`frame::OutputState::cursor_only`]) — content damage or a
     ///   commit retry both mean somebody is already waiting for those
