@@ -84,6 +84,33 @@ pub mod key {
     pub const PAGE_DOWN: u32 = 109;
     /// The letter `a`, for `Ctrl-A`.
     pub const A: u32 = 30;
+    /// The letter `q`, for the conventional quit shortcut.
+    pub const Q: u32 = 16;
+}
+
+/// Modifier bits of an xkb modifier mask, for [`KeyEvent::mods`] and
+/// [`Ui::set_shortcut`](crate::Ui::set_shortcut).
+///
+/// The numbers are the canonical xkb modifier list (`Shift`, `Lock`,
+/// `Control`, `Mod1`…), which every layout shares — the same reasoning
+/// as [`KeyEvent::shift`].
+pub mod mods {
+    /// No modifier at all.
+    pub const NONE: u32 = 0;
+    /// Either shift key.
+    pub const SHIFT: u32 = 1;
+    /// Either control key.
+    pub const CTRL: u32 = 4;
+    /// Either alt key (`Mod1`).
+    pub const ALT: u32 = 8;
+    /// The logo/super key (`Mod4`).
+    pub const LOGO: u32 = 64;
+    /// The bits a shortcut is compared on.
+    ///
+    /// Everything else — `Lock`, `NumLock`, the layout's own group
+    /// modifiers — is masked out, so a shortcut does not stop working
+    /// because Caps Lock is on.
+    pub const MASK: u32 = SHIFT | CTRL | ALT | LOGO;
 }
 
 /// One input event.

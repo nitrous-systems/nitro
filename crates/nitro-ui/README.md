@@ -130,7 +130,10 @@ stale/busy/wrong-type errors, Tab order, hover and press visuals, hit
 testing, scroll routing, the introspection tree, fd hooks and timers.
 `tests/widgets.rs` covers the M2 widget set — typing, selection,
 toggling, dragging, scrolling (asserting the one-`SetTransform` claim by
-counting mutations), and the window backdrop. `tests/introspect.rs`
+counting mutations), and the window backdrop. `tests/shortcuts.rs`
+covers the app-level key handlers: a focused `TextField` keeps its `q`,
+Escape reaches the shortcut past a focused button, modifiers match
+exactly, and handlers run in registration order. `tests/introspect.rs`
 drives the socket end to end, and `nitro-hey`'s `tests/end_to_end.rs`
 does the same through the real `hey` binary as a child process.
 

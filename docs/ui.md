@@ -349,9 +349,29 @@ positions already **widget-local**:
   tree has already overtaken is dropped rather than delivered stale. An
   app driving `Ui` by hand should call it too.
 * **Keys** go to the focused widget and bubble to the root. A `KeyDown`
-  nobody consumed that produced text is re-offered as `Event::Text`,
-  which is how an app gets a global shortcut with no filter list — see
-  `QuitOnQ` in the example.
+  nobody consumed that produced text is re-offered as `Event::Text`, so a
+  widget matches on characters rather than on keycodes and layouts.
+* **App-level key handlers run last.** `ui.on_key(|state, ui, key| ..)`
+  registers a handler that is offered every **press** the focused chain
+  declined — both the `KeyDown` and the `Event::Text` it produced — in
+  registration order, until one answers `Handled::Yes`. Releases are not
+  offered: a shortcut that fired on the press and again on the release
+  would run twice, and the signature has no way to tell the two apart.
+  `ui.set_shortcut(mods, keycode, |state, ui| ..)` is sugar over it for
+  the common case, matching the modifier bits in `mods::MASK` exactly
+  (so `Ctrl-Q` does not fire a plain `Q`, and Caps Lock changes
+  nothing).
+
+  A handler is handed `&mut S` and `&mut Ui<S>`, exactly like a button's
+  `on_click`, so it edits the tree rather than only setting a flag.
+
+  This is a filter list and says so. The alternative — a zero-sized
+  widget hung off the root — cannot work: keys bubble *upward* from the
+  focused widget, so a sibling of the root's other children is on
+  nobody's ancestor chain and is never offered anything (#535). The
+  ordering is what makes both halves true at once: a focused `TextField`
+  types a `q`, and the app's `q` quits everywhere else.
+  `crates/nitro-ui/tests/shortcuts.rs` asserts each of those.
 * **Tab** is the framework's and is never offered to a widget:
   `focus_next` walks the focusable widgets in pre-order and wraps.
   Shift-Tab walks back.

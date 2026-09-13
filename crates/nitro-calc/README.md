@@ -139,9 +139,13 @@ server, no window, no toolkit.
 
 ## A note for the next app
 
-The root widget implements `Widget::event` itself, rather than attaching
-a zero-sized handler as a child of a `column()` root the way
-`docs/ui.md` and `examples/hello_dialog.rs` suggest. That pattern does
-not work — keys bubble *upward*, so a sibling of the root's children is
-never on the path — and the cost of working around it here is a
-hand-written `measure` that reimplements `Flex`'s. Issue **#535**.
+The keyboard is `ui.set_shortcut(..)` and `ui.on_key(..)` — app-level
+handlers, offered every press the focused widget's chain declined, in
+registration order. The root is a plain `column()`.
+
+It was not always: keys bubble *upward* from the focused widget, so the
+zero-sized-child pattern `docs/ui.md` and `examples/hello_dialog.rs`
+once documented could never fire (issue **#535**), and the workaround
+here was to make the root widget itself the key handler — which cost a
+hand-written `measure` reimplementing `Flex`'s. Both are gone: the
+toolkit grew the hook, and this app spends no widget on its keyboard.

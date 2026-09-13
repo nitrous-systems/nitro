@@ -33,7 +33,7 @@ use nitro_wire::types::{ButtonState, NodeId};
 use crate::arena::{Arena, Dirty, WidgetId};
 use crate::build::IntoWidget;
 use crate::error::Error;
-use crate::event::{Event, Handled, KeyEvent, key};
+use crate::event::{Event, Handled, KeyEvent, key, mods};
 use crate::layout::{Constraints, FlexItem, LayoutStyle};
 use crate::theme::{TextStyle, Theme};
 use crate::widget::{AnyWidget, EventCx, LayoutCx, MeasureCx, PaintCx, Widget};
@@ -150,6 +150,12 @@ pub struct Ui<S> {
     fds: Vec<FdHook<S>>,
     timers: Vec<Timer<S>>,
     next_timer: u64,
+    /// App-level key handlers, in registration order; see [`Ui::on_key`].
+    ///
+    /// `Option` for the same reason a widget leaves its arena slot: a
+    /// handler is handed `&mut Ui<S>`, so it must not be reachable
+    /// through the tree it is holding.
+    key_handlers: Vec<Option<KeyHandler<S>>>,
 }
 
 /// An app callback: it is handed the state and the whole tree, exactly
@@ -158,6 +164,9 @@ type Callback<S> = Box<dyn FnMut(&mut S, &mut Ui<S>)>;
 
 /// A one-shot app callback, for timers.
 type OnceCallback<S> = Box<dyn FnOnce(&mut S, &mut Ui<S>)>;
+
+/// An app-level key handler; see [`Ui::on_key`].
+type KeyHandler<S> = Box<dyn FnMut(&mut S, &mut Ui<S>, &KeyEvent) -> Handled>;
 
 struct FdHook<S> {
     /// A `dup` of the descriptor the app handed us. Owning a duplicate
@@ -202,6 +211,7 @@ impl<S: 'static> Ui<S> {
             fds: Vec::new(),
             timers: Vec::new(),
             next_timer: 1,
+            key_handlers: Vec::new(),
         }
     }
 
@@ -1426,8 +1436,22 @@ impl<S: 'static> Ui<S> {
         }
     }
 
-    /// Route a key to the focused widget, bubbling to the root. `Tab` is
-    /// the framework's: it moves focus and is never offered to a widget.
+    /// Route a key to the focused widget, bubbling to the root, then to
+    /// the app's own handlers. `Tab` is the framework's: it moves focus
+    /// and is never offered to a widget.
+    ///
+    /// The order for a press is the whole of the key contract:
+    ///
+    /// 1. `KeyDown` from the focused widget (or the root, with nothing
+    ///    focused) up through its ancestors;
+    /// 2. if nobody took it and the key produced text, `Event::Text` the
+    ///    same way — which is how a text field types a `q` that an app
+    ///    also uses as a shortcut;
+    /// 3. only then the handlers registered with [`Ui::on_key`] and
+    ///    [`Ui::set_shortcut`], in registration order.
+    ///
+    /// A widget therefore always wins over an app shortcut, and an app
+    /// shortcut always gets the keys no widget wanted.
     pub fn key(&mut self, state: &mut S, k: &nitro_wire::msg::Key) {
         let pressed = k.state == ButtonState::Pressed;
         let ev = KeyEvent {
@@ -1441,15 +1465,125 @@ impl<S: 'static> Ui<S> {
             return;
         }
         let target = self.focused.or(self.root);
-        let Some(target) = target else { return };
-        let handled = if pressed {
-            self.bubble(state, target, &Event::KeyDown(ev.clone()))
-        } else {
-            self.bubble(state, target, &Event::KeyUp(ev.clone()))
-        };
-        if pressed && !handled.is_handled() && !ev.text.is_empty() {
-            self.bubble(state, target, &Event::Text { text: ev.text });
+        let mut handled = Handled::No;
+        if let Some(target) = target {
+            handled = if pressed {
+                self.bubble(state, target, &Event::KeyDown(ev.clone()))
+            } else {
+                self.bubble(state, target, &Event::KeyUp(ev.clone()))
+            };
+            if pressed && !handled.is_handled() && !ev.text.is_empty() {
+                handled = self.bubble(
+                    state,
+                    target,
+                    &Event::Text {
+                        text: ev.text.clone(),
+                    },
+                );
+            }
         }
+        // Releases are not offered: a shortcut that fired on the press
+        // and again on the release would run twice, and the handler
+        // signature has no way to tell the two apart.
+        if pressed && !handled.is_handled() {
+            self.run_key_handlers(state, &ev);
+        }
+    }
+
+    /// Register an app-level key handler.
+    ///
+    /// It is offered every press **no widget took** — after the focused
+    /// chain has declined both the `KeyDown` and the `Event::Text` it
+    /// produced (see [`Ui::key`]) — and handlers run in registration
+    /// order until one answers [`Handled::Yes`].
+    ///
+    /// This is what a global shortcut is: keys bubble *upward* from the
+    /// focused widget, so no widget in the tree can see a key the focused
+    /// subtree never passed on, and an app that needs one is not asking
+    /// about a widget at all.
+    ///
+    /// ```no_run
+    /// # use nitro_ui::event::{Handled, KeyEvent, key};
+    /// # use nitro_ui::Ui;
+    /// # fn demo<S: 'static>(ui: &mut Ui<S>) {
+    /// ui.on_key(|_s: &mut S, ui: &mut Ui<S>, k: &KeyEvent| {
+    ///     if k.text == "q" || k.keycode == key::ESC {
+    ///         ui.quit();
+    ///         return Handled::Yes;
+    ///     }
+    ///     Handled::No
+    /// });
+    /// # }
+    /// ```
+    pub fn on_key(
+        &mut self,
+        handler: impl FnMut(&mut S, &mut Ui<S>, &KeyEvent) -> Handled + 'static,
+    ) {
+        self.key_handlers.push(Some(Box::new(handler)));
+    }
+
+    /// Register an app-level shortcut: one modifier combination, one
+    /// keycode, one callback.
+    ///
+    /// Sugar over [`Ui::on_key`] with the same ordering. `modifiers` is
+    /// an exact match over [`mods::MASK`](crate::event::mods::MASK), so
+    /// `mods::NONE` means *no* modifier and `Ctrl-Q` does not fire a
+    /// plain `Q` shortcut; the bits outside the mask (`Lock`, `NumLock`,
+    /// the layout's group) are ignored, so Caps Lock does not disable an
+    /// app's shortcuts.
+    ///
+    /// ```no_run
+    /// # use nitro_ui::event::{key, mods};
+    /// # use nitro_ui::Ui;
+    /// # fn demo<S: 'static>(ui: &mut Ui<S>) {
+    /// ui.set_shortcut(mods::NONE, key::ESC, |_s: &mut S, ui: &mut Ui<S>| ui.quit());
+    /// ui.set_shortcut(mods::CTRL, key::Q, |_s: &mut S, ui: &mut Ui<S>| ui.quit());
+    /// # }
+    /// ```
+    pub fn set_shortcut(
+        &mut self,
+        modifiers: u32,
+        keycode: u32,
+        mut handler: impl FnMut(&mut S, &mut Ui<S>) + 'static,
+    ) {
+        let wanted = modifiers & mods::MASK;
+        self.on_key(move |s, ui, k| {
+            if k.keycode == keycode && k.mods & mods::MASK == wanted {
+                handler(s, ui);
+                Handled::Yes
+            } else {
+                Handled::No
+            }
+        });
+    }
+
+    /// How many app-level key handlers are registered.
+    #[must_use]
+    pub fn key_handler_count(&self) -> usize {
+        self.key_handlers.len()
+    }
+
+    /// Offer a key to the app-level handlers, in registration order.
+    fn run_key_handlers(&mut self, state: &mut S, ev: &KeyEvent) -> Handled {
+        let mut i = 0;
+        // By index rather than over an iterator: a handler holds `&mut
+        // Ui<S>` and may register another one, and handlers are never
+        // removed, so an index stays valid across the call.
+        while i < self.key_handlers.len() {
+            // Out of its slot for the duration, for the reason a widget
+            // is: it cannot be reachable through the tree it is handed.
+            let Some(mut h) = self.key_handlers[i].take() else {
+                i += 1;
+                continue;
+            };
+            let handled = h(state, self, ev);
+            self.key_handlers[i] = Some(h);
+            if handled.is_handled() {
+                return Handled::Yes;
+            }
+            i += 1;
+        }
+        Handled::No
     }
 
     /// Offer an event to `id` and then to each ancestor until one takes

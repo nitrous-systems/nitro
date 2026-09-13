@@ -6,7 +6,9 @@
 //! a string on the wire, and the server owns the glyphs.
 //!
 //! * **OK** toggles the message label between two strings.
-//! * **Cancel** and **q** quit.
+//! * **Cancel**, **q** and **Escape** quit — the last two through
+//!   `ui.on_key` / `ui.set_shortcut`, which are offered every press the
+//!   focused widget's chain declined.
 //! * Tab and Shift-Tab walk the two buttons; Space or Enter activates the
 //!   focused one.
 //!
@@ -26,9 +28,9 @@
 //! ```
 
 use nitro_ui::build::{ContainerBuilder as _, StyleBuilder as _};
-use nitro_ui::event::{Event, Handled, key};
+use nitro_ui::event::{Handled, KeyEvent, key, mods};
 use nitro_ui::widgets::{Label, button, column, label, row, spacer};
-use nitro_ui::{App, Built, Error, Ui, Widget};
+use nitro_ui::{App, Error, Ui};
 
 /// Everything the dialog remembers.
 struct State {
@@ -63,31 +65,20 @@ fn main() -> Result<(), Error> {
         ui.attach(buttons, ok).unwrap();
         ui.attach(root, message).unwrap();
         ui.attach(root, buttons).unwrap();
-        let quit = ui.build(Built::new(QuitOnQ));
-        ui.attach(root, quit).unwrap();
+        // App-level shortcuts: they see every press no widget took,
+        // whatever has the focus. Escape is a fixed key, so it goes
+        // through `set_shortcut`; `q` is a *character*, so it matches on
+        // the text the server's keymap produced and works on any layout.
+        ui.set_shortcut(mods::NONE, key::ESC, |_: &mut State, ui: &mut Ui<State>| {
+            ui.quit();
+        });
+        ui.on_key(|_: &mut State, ui: &mut Ui<State>, k: &KeyEvent| {
+            if k.text == "q" {
+                ui.quit();
+                return Handled::Yes;
+            }
+            Handled::No
+        });
         root
     })
-}
-
-/// A zero-size widget that turns `q` into a quit.
-///
-/// A key that no focused widget consumed bubbles to the root, so an
-/// invisible child of the root is all an app needs for a global
-/// shortcut — no event filter, no hook list.
-struct QuitOnQ;
-
-impl Widget<State> for QuitOnQ {
-    fn event(&mut self, cx: &mut nitro_ui::EventCx<'_, State>, ev: &Event) -> Handled {
-        match ev {
-            Event::Text { text } if text == "q" => {
-                cx.ui.quit();
-                Handled::Yes
-            }
-            Event::KeyDown(k) if k.keycode == key::ESC => {
-                cx.ui.quit();
-                Handled::Yes
-            }
-            _ => Handled::No,
-        }
-    }
 }

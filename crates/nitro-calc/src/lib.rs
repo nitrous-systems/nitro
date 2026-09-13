@@ -49,12 +49,9 @@ pub mod engine;
 
 use engine::{Engine, Key, Op};
 use nitro_ui::build::{ContainerBuilder as _, StyleBuilder as _};
-use nitro_ui::event::{Event, Handled, key};
-use nitro_ui::widgets::{Label, button, label, row};
-use nitro_ui::{
-    Align, App, Built, Constraints, Error, EventCx, FlexItem, MeasureCx, Role, Size, Ui, Widget,
-    WidgetId,
-};
+use nitro_ui::event::{Handled, KeyEvent, key, mods};
+use nitro_ui::widgets::{Label, button, column, label, row};
+use nitro_ui::{Align, App, Error, Ui, WidgetId};
 
 /// The app's state: the calculator, and nothing else.
 ///
@@ -103,10 +100,10 @@ impl Default for Calc {
 /// The two labels a key press writes to.
 ///
 /// `Copy`, so the same handle goes into every button's `on_click` *and*
-/// into the [`Keyboard`] widget — which is how a typed `7` and a clicked
-/// `7` end up running the identical three lines of [`Screen::press`].
-/// Keeping the ids here rather than in [`Calc`] is what lets the state be
-/// built before the tree it will drive.
+/// into the app-level key handlers — which is how a typed `7` and a
+/// clicked `7` end up running the identical three lines of
+/// [`Screen::press`]. Keeping the ids here rather than in [`Calc`] is
+/// what lets the state be built before the tree it will drive.
 #[derive(Debug, Clone, Copy)]
 struct Screen {
     /// The big right-aligned number.
@@ -214,14 +211,10 @@ pub fn build(ui: &mut Ui<Calc>) -> WidgetId {
     );
     let screen = Screen { display, history };
 
-    // The root *is* the keyboard handler; see [`Keypad`].
-    let mut root = Built::new(Keypad { screen });
-    {
-        let style = &mut root.state_mut().style;
-        style.gap = GAP;
-        style.padding = nitro_ui::Edges::all(GAP * 2.0);
-    }
-    let root = ui.build(root);
+    // A plain `column()` root: the keyboard is handled by app-level key
+    // handlers below, not by a widget, so nothing here reimplements a
+    // container's `measure`.
+    let root = ui.build(column().gap(GAP).padding(GAP * 2.0));
     ui.attach(root, history).unwrap();
     ui.attach(root, display).unwrap();
 
@@ -246,90 +239,45 @@ pub fn build(ui: &mut Ui<Calc>) -> WidgetId {
         }
         ui.attach(root, r).unwrap();
     }
+
+    install_keyboard(ui, screen);
     root
 }
 
-/// The root: a column that also reads the keyboard.
+/// The keyboard, as app-level handlers.
 ///
-/// It holds the same [`Screen`] the buttons hold, so `7` on the keyboard
-/// and `7` on the screen run the same code with the same invalidation.
+/// A key no widget took is offered to these, in registration order, so
+/// the toolkit's own bindings are untouched: `Tab` never reaches a
+/// handler at all, `Space` on a focused button is consumed by the button,
+/// and a text field added to this tree later would keep its own digits.
 ///
-/// **Why the root and not an invisible child.** A key goes to the focused
-/// widget and bubbles *upward* to the root, so the last widget to see an
-/// unclaimed key is the root itself — a sibling of the root's other
-/// children is never on that path and would never be offered anything.
-/// (`docs/ui.md` and `examples/hello_dialog.rs` show the shortcut as a
-/// zero-sized child instead; that is issue-worthy and is filed, but a
-/// calculator whose digits do not type is not the place to find out.)
-///
-/// Handling keys here rather than filtering them is also what leaves the
-/// toolkit's own bindings alone: `Tab` never reaches a widget at all, and
-/// `Space` on a focused button is consumed by the button long before it
-/// bubbles this far.
-struct Keypad {
-    screen: Screen,
-}
-
-impl Widget<Calc> for Keypad {
-    /// A column's intrinsic size: the flex solver's own arithmetic over
-    /// the children, which is exactly what [`Flex`](nitro_ui::widgets::Flex)
-    /// does. The default `layout` already lays children out with the
-    /// solver, so this is the only pass a container has to write.
-    fn measure(&mut self, cx: &mut MeasureCx<'_, Calc>, constraints: Constraints) -> Size {
-        let style = cx.ui.style(cx.id);
-        let inner = constraints.loosen().deflate(style.padding);
-        let mut items = Vec::new();
-        for c in cx.children() {
-            let cstyle = cx.ui.style(c);
-            let basis = cx.measure_child(c, inner.deflate(cstyle.margin));
-            items.push(FlexItem::new(cstyle, basis));
-        }
-        let main = nitro_ui::layout::intrinsic_main(&style, &items);
-        let cross = nitro_ui::layout::intrinsic_cross(&style, &items);
-        let size = style.direction.size(main, cross);
-        constraints.constrain(Size::new(
-            size.w + style.padding.horizontal(),
-            size.h + style.padding.vertical(),
-        ))
+/// The digits match on `ev.text` — the characters the press produced —
+/// because the server has already applied the keymap, so one arm covers
+/// every layout. Enter, Backspace and Escape produce no text worth
+/// matching on, so they are [`Ui::set_shortcut`]s on their keycodes.
+fn install_keyboard(ui: &mut Ui<Calc>, screen: Screen) {
+    for (code, k) in [
+        (key::ENTER, Key::Equals),
+        (key::BACKSPACE, Key::Backspace),
+        (key::ESC, Key::Clear),
+    ] {
+        ui.set_shortcut(mods::NONE, code, move |s: &mut Calc, ui: &mut Ui<Calc>| {
+            screen.press(s, ui, k);
+        });
     }
-
-    fn event(&mut self, cx: &mut EventCx<'_, Calc>, ev: &Event) -> Handled {
-        match ev {
-            // A printing character comes back as `Text` once no widget
-            // took the `KeyDown`, which is how one arm covers every
-            // keyboard layout: the server has already applied the keymap.
-            Event::Text { text } => {
-                if text == "q" {
-                    cx.ui.quit();
-                    return Handled::Yes;
-                }
-                match Key::from_text(text) {
-                    Some(k) => {
-                        self.screen.press(cx.state, cx.ui, k);
-                        Handled::Yes
-                    }
-                    None => Handled::No,
-                }
-            }
-            // Enter, Backspace and Escape produce no text worth matching
-            // on, so they go by keycode.
-            Event::KeyDown(k) => {
-                let pressed = match k.keycode {
-                    key::ENTER => Key::Equals,
-                    key::BACKSPACE => Key::Backspace,
-                    key::ESC => Key::Clear,
-                    _ => return Handled::No,
-                };
-                self.screen.press(cx.state, cx.ui, pressed);
+    ui.on_key(move |s: &mut Calc, ui: &mut Ui<Calc>, ev: &KeyEvent| {
+        if ev.text == "q" {
+            ui.quit();
+            return Handled::Yes;
+        }
+        match Key::from_text(&ev.text) {
+            Some(k) => {
+                screen.press(s, ui, k);
                 Handled::Yes
             }
-            _ => Handled::No,
+            None => Handled::No,
         }
-    }
-
-    fn role(&self) -> Role {
-        Role::Container
-    }
+    });
 }
 
 /// Connect, open the window and run until the app quits.
