@@ -1,14 +1,16 @@
 # nitro-server
 
-The display server. M1 shape: one thread, one epoll, a seat
-(`nitro-seat`), a KMS backend (`nitro-kms`), a real scene graph
-(`nitro-scene`) painted with `nitro-raster`, clients over `nitro-wire`,
-and input from libinput and xkbcommon. `lib.rs` exposes `run(Config)`;
-`main.rs` only turns environment variables into a `Config`, so the
-integration tests drive the whole loop in-process on the fake backend with
-a fake input source — no seat, no DRM device and no evdev node anywhere.
-The M0 demo is gone: there is no moving bar, and the only pixels the
-server paints for itself are the desktop background under the clients.
+The display server. One thread, one epoll, a seat (`nitro-seat`), a KMS
+backend (`nitro-kms`), a real scene graph (`nitro-scene`) painted with
+`nitro-raster`, clients over `nitro-wire`, input from libinput and
+xkbcommon, and — since M3 — **window management**: server-side
+decorations, move/resize/focus/MRU, window states and multi-output
+layout (`docs/wm.md`). `lib.rs` exposes `run(Config)`; `main.rs` only
+turns environment variables into a `Config`, so the integration tests
+drive the whole loop in-process on the fake backend with a fake input
+source — no seat, no DRM device and no evdev node anywhere. The M0 demo
+is gone: the pixels the server paints for itself are the desktop
+background under the clients and the frames around them.
 
 ## Sockets
 
@@ -21,19 +23,21 @@ relative). Client and server resolve that path through the *same*
 function in `nitro-wire`, so a client started in the server's environment
 finds it without being configured. A connection opens with `Hello`
 (version plus a name for the logs) and is answered with `Welcome`
-(version, capability bits, server name). One capability bit is set in
-M2 — `TEXT` (bit 1), and only when the startup font scan actually found a
-face, because the bit is a promise that a `Text` node will draw something.
-Note what it does *not* gate: `Text` nodes and `SetText` are accepted
-either way, and a fontless server shapes to an empty run and answers a
-well-formed `TextMetrics` of zero width. Killing the connection over a
-missing font would make "no fonts installed" a fatal error for every
-client on the box; the bit instead answers the question a client can act
-on — is it worth laying out for text at all? Direct scanout and dma-buf
-surfaces remain M3/M5 work, and there a zero bit *is* the protocol's way
-of saying "this does not exist yet": a client that asks for a `Surface`
-node gets `WrongKind` and the connection closes, rather than discovering
-at runtime that the feature silently did nothing.
+(version, capability bits, server name). Two capability bits are set:
+`WM` (bit 4) **unconditionally** — the server always manages windows, so
+a client may always send the M3 window ops — and `TEXT` (bit 1) only when
+the startup font scan actually found a face, because that bit is a promise
+that a `Text` node will draw something. Note what `TEXT` does *not* gate:
+`Text` nodes and `SetText` are accepted either way, and a fontless server
+shapes to an empty run and answers a well-formed `TextMetrics` of zero
+width. Killing the connection over a missing font would make "no fonts
+installed" a fatal error for every client on the box; the bit instead
+answers the question a client can act on — is it worth laying out for text
+at all? Direct scanout and dma-buf surfaces remain later work, and there a
+zero bit *is* the protocol's way of saying "this does not exist yet": a
+client that asks for a `Surface` node gets `WrongKind` and the connection
+closes, rather than discovering at runtime that the feature silently did
+nothing.
 
 The **control socket** is the v0 line protocol and stays as the server's
 own test and debug channel — it is what `nitro-shot` and the integration
@@ -69,6 +73,7 @@ on shutdown.
 | `NITRO_SOCKET`    | socket path                      | `$XDG_RUNTIME_DIR/nitro/wire.sock` (resolved by `nitro-wire`, so clients agree) |
 | `NITRO_INPUT`     | `off`                            | input enabled                  |
 | `NITRO_INPUT_DIR` | directory scanned for `event*`   | `/dev/input`                   |
+| `NITRO_SCALE`     | `<connector>=<f32>,…` per-output scale override, e.g. `HDMI-A-1=2` | EDID-derived: 2 at ≥ 192 dpi, else 1. See `docs/wm.md`. |
 | `NITRO_FONT_DIRS` | colon-separated font directories | `/usr/share/fonts:/usr/local/share/fonts:~/.local/share/fonts` (read by `nitro-text`) |
 | `NITRO_FONT_CACHE_MB` | cap on resident font-file bytes | `8` (read by `nitro-text`; `0` keeps only the file currently in use — the file that overran the cap is never its own victim, so a too-small cap does not turn into one disk read per glyph) |
 | `NITRO_FONT_INDEX_CACHE` | path of the font index cache, or `off` | `$XDG_CACHE_HOME/nitro/fonts.idx` (read by `nitro-text`) |
@@ -98,6 +103,7 @@ five seconds of idle after a deferral is 0 frames, 0 CPU ticks and
 | seat                      | `Seat::dispatch`; `Disable` → suspend input, `backend.pause()`, `ack_disable()`; `Enable` → resume backend and input, reset xkb, full repaint |
 | backend `poll_fds()`      | `Backend::dispatch`; `Flipped` → `Presented`/`Frame` to clients, then paint the next frame; `Hotplug` → `rescan()`, re-register fds, place unplaced windows, repaint |
 | libinput                  | dispatch, convert to `InputEvent`, route, then update the scene and paint if anything moved |
+| input uevent socket       | a device appeared or went away: rescan `NITRO_INPUT_DIR`, add/remove libinput paths, register any new fd, reset xkb if a device left |
 | defer timer               | a held cursor-only flip's deadline passed: count a `defer_timeouts` and paint without the client's answer |
 | signal self-pipe          | SIGTERM/SIGINT → orderly shutdown (`signal-hook`'s `low_level::pipe` on a `UnixDatagram` pair) |
 | control listener          | accept, register the client                                              |
@@ -138,6 +144,12 @@ which is cheaper and harder to get wrong than an ownership check on every
 call. The reverse map is safe because scene keys are generational: a
 stale key can never be confused with a recycled one.
 
+A window's id names the client's **content** group, which is what the
+server's decorations are wrapped *around*: framing a window mints a new
+root above that node and leaves the node itself alone, so a client can
+never create a node on top of its own title bar, and every coordinate it
+is given or sends is in its own content's space.
+
 **Transactions.** Nothing a client sends touches the scene until its
 `Commit`. Mutations are buffered in arrival order and applied in one
 pass, so a frame never shows half a batch. The one exception is
@@ -177,13 +189,17 @@ that cycles buffers — create, damage, destroy, once per frame, which is
 the obvious way to push changing images — would otherwise leak one
 descriptor per frame until it hit the process limit.
 
-**Placement.** A new window is cascaded onto the primary output —
-`CASCADE_STEP` pixels right and down from the previous one, wrapping, and
-never so far that its top-left corner leaves the output. The placement is
-arithmetic in the window's index rather than stateful, so it is
-predictable in a test and identical after a restart. The client is then
-told what it got with `Configure` (size, scale, output); a later resize
-the server or the client's own `SetBounds` decides on produces another.
+**Placement and decoration.** A new window is **decorated** unless it
+passed `UNDECORATED`: the server wraps its group in a frame group it owns
+and draws a title bar, a border and two buttons into it. It is then
+placed **centred-cascade** in the primary output's work area — the first
+window centred, each later one 28 px down and right, clamped inside the
+area and rounded to whole logical pixels. The client is told what it got
+with `Configure` (content size, content position, scale, output); a later
+resize the server or the client's own `SetBounds` decides on produces
+another, and so does a pure *move*, because `position` is what a client
+crops a screenshot with. `docs/wm.md` is the whole model: hit regions,
+states, focus, MRU, shortcuts, multi-output policy and scale.
 
 A window created while there is *no* output — every connector unplugged,
 or a hotplug still in flight — is held in a pending list instead. It is a
@@ -458,9 +474,17 @@ through the seat**, which matters more than it looks: libinput hands back
 only the raw descriptor, so the `Device` it belongs to must be findable
 from that number, and libseat refuses to reopen a device it still has
 open — leaving one behind is exactly what makes `Libinput::resume` fail
-after a VT switch. Input-device hotplug is M3; the uevent socket already
-carries the notifications, but acting on them means re-scanning and
-diffing, which is not worth the code before the shell exists.
+after a VT switch.
+
+**Device hotplug** (deferred from M1, landed in M3) rides the *same*
+kernel uevent socket `nitro-kms` uses for DRM, on the `input` subsystem.
+On an `add`/`remove` the server re-scans `NITRO_INPUT_DIR`, diffs it
+against the paths libinput already has, and adds or removes the
+difference — the path backend has no idea devices come and go, so the
+scan is ours. A new fd joins the epoll set; a device leaving resets the
+xkb state, because it may have been holding a modifier whose release will
+never arrive. Failure to open the socket is logged, not fatal: a sandbox
+with no netlink loses hotplug, not the keyboard it already has.
 
 Everything above `input.rs` speaks `InputEvent`, a small enum with no
 libinput in it. That `InputSource` seam is what makes the whole input
@@ -475,9 +499,12 @@ resolved against the state *before* it is applied (so pressing Shift does
 not retroactively shift itself). If no keymap compiles the server logs a
 warning and runs on: the evdev keycode still reaches the focused client,
 without keysym or text, which is a far better failure mode for a display
-server than refusing to start. Two chords never reach a client, because
-they are the compositor's: **Ctrl+Alt+Backspace** quits, and
-**Ctrl+Alt+F1..F12** switches VT through the seat.
+server than refusing to start. The chords that never reach a client are
+the compositor's, and `docs/wm.md` has the whole table: **Ctrl+Alt** for
+the console escape hatches (Backspace quits, F1..F12 switch VT),
+**Alt+Tab** for the MRU focus cycle, and **Super** for the
+window-management shortcuts (`Q` close, `M` maximize, `F` fullscreen,
+`H` minimize, `←`/`→` tile, `Enter` reserved for the launcher).
 
 Routing:
 
@@ -499,6 +526,11 @@ Routing:
   cannot pull a panel out from under a menu) and focuses it; a press on
   the desktop drops focus, which is how a client learns it stopped
   receiving keys.
+* A press that lands on a window's **frame** — title bar, button, resize
+  band — or anywhere at all with `Super` held is the *server's*, and the
+  client hears nothing about it: it starts a move or resize drag, or arms
+  a title-bar button. While a drag is in flight every motion drives the
+  window and no pointer event reaches any client. See `docs/wm.md`.
 * A touch sequence belongs to the window it started on: the finger may
   wander off while dragging and the client still owns the gesture until it
   lifts.
@@ -552,7 +584,11 @@ looking for.
 | `shape_us_mean`          | Mean microseconds per shaping call, over the last 120 (shapes *and* measurements — they run the same layout). |
 | `clients`                | Connected wire clients.                                                  |
 | `windows`                | Windows in the scene.                                                    |
-| `nodes`                  | Nodes in the scene, across every window.                                 |
+| `nodes`                  | Nodes in the scene, across every window — the server's own frame nodes included. |
+| `outputs`                | Outputs currently connected.                                             |
+| `decorated`              | Windows carrying a server-drawn frame. `windows - decorated` is how many opted out with `UNDECORATED`. |
+| `minimized`              | Windows hidden by `Minimized`. They are still in `windows` and still in the `Alt+Tab` order. |
+| `dragging`               | 1 while a move or resize drag is in flight. A drag that is still 1 with nothing on the desk is a stuck grab. |
 
 The key naming is inconsistent on purpose — `paint_us_min` but
 `i2p_min_us` — because that is what the protocol spec says, and the wire

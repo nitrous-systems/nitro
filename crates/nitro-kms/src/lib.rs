@@ -364,6 +364,16 @@ pub trait Backend {
     fn simulate_plug(&mut self, _width: u32, _height: u32) -> bool {
         false
     }
+
+    /// Simulate a connector disappearing, for a backend that can.
+    ///
+    /// The other half of [`Backend::simulate_plug`], and the one a window
+    /// manager cares about more: output *removal* is what orphans windows
+    /// and forces them to migrate. Returns `false` on a real backend, and
+    /// on a fake one with no outputs to remove.
+    fn simulate_unplug(&mut self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

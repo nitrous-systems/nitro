@@ -322,7 +322,18 @@ impl FakeBackend {
 
 impl Backend for FakeBackend {
     fn simulate_plug(&mut self, width: u32, height: u32) -> bool {
-        self.plug(FakeOutputSpec::new(width, height));
+        // Distinct connector names, so a test can ask for a scale
+        // override by name and so the log is readable with two outputs.
+        let name = format!("Virtual-{}", self.next_id);
+        self.plug(FakeOutputSpec::new(width, height).named(&name));
+        true
+    }
+
+    fn simulate_unplug(&mut self) -> bool {
+        let Some(last) = self.outputs.last().map(|o| o.info.id) else {
+            return false;
+        };
+        self.unplug(last);
         true
     }
 

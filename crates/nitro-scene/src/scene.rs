@@ -331,21 +331,13 @@ impl Scene {
         let size = window.size;
         // The old root keeps its own bounds (the content's size) and simply
         // gains a parent; the frame takes over as the window's root.
-        let frame = self.nodes.insert(Node::new(
-            NodeKind::Group,
-            ClientId::SERVER,
-            win,
-            0,
-        ));
+        let frame = self
+            .nodes
+            .insert(Node::new(NodeKind::Group, ClientId::SERVER, win, 0));
         {
             let node = self.node_mut_ref(frame);
             node.children.push(content);
-            node.bounds = Rect::new(
-                0.0,
-                0.0,
-                size.w + inset.width(),
-                size.h + inset.height(),
-            );
+            node.bounds = Rect::new(0.0, 0.0, size.w + inset.width(), size.h + inset.height());
         }
         {
             let node = self.node_mut_ref(content);
@@ -871,8 +863,12 @@ impl Scene {
                 let node = self.node_mut_ref(key);
                 node.bounds.x = inset.left;
                 node.bounds.y = inset.top;
-                let frame =
-                    Rect::new(0.0, 0.0, bounds.w + inset.width(), bounds.h + inset.height());
+                let frame = Rect::new(
+                    0.0,
+                    0.0,
+                    bounds.w + inset.width(),
+                    bounds.h + inset.height(),
+                );
                 let node = self.node_mut_ref(root);
                 if node.bounds != frame {
                     node.bounds = frame;

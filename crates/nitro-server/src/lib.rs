@@ -65,9 +65,7 @@ use nitro_kms::{
     Backend, DrmBackend, DrmOptions, Error as KmsError, Event, FakeBackend,
     OutputId as KmsOutputId, OutputInfo, Rect as KmsRect,
 };
-use nitro_scene::{
-    ClientId, DamageSink, OutputId as SceneOutputId, Scene, WindowKey, WindowState,
-};
+use nitro_scene::{ClientId, DamageSink, OutputId as SceneOutputId, Scene, WindowKey, WindowState};
 use nitro_seat::{Device, Seat, SeatEvent};
 use nitro_wire::msg::{self, ClientMsg, ServerMsg};
 use nitro_wire::server::Listener as WireListener;
@@ -128,6 +126,11 @@ pub struct Config {
     pub input_dir: Option<PathBuf>,
     /// A test's injection point, used instead of libinput when set.
     pub fake_input: Option<input::FakeInput>,
+    /// Per-output scale overrides by connector name. `main.rs` fills this
+    /// from `NITRO_SCALE`; a test sets it directly, because the
+    /// environment is process-global and the tests run in threads of one
+    /// process.
+    pub scales: HashMap<String, f32>,
 }
 
 impl Config {
@@ -144,6 +147,7 @@ impl Config {
             handle_signals: false,
             input_dir: None,
             fake_input: None,
+            scales: HashMap::new(),
         }
     }
 }
@@ -211,18 +215,18 @@ fn errno(op: &'static str) -> impl FnOnce(rustix::io::Errno) -> Error {
     }
 }
 
-/// Per-output scale overrides from `NITRO_SCALE=<name>=<f32>,…`.
+/// Parse per-output scale overrides, `<name>=<f32>,…`.
 ///
 /// A stop-gap: the persistent, user-editable output layout (position,
 /// rotation and scale per connector) belongs to the settings app, which is
 /// M4. Until then an environment variable is the honest way to say "this
 /// panel is `HiDPI`" without inventing a config format that will be thrown
-/// away.
-fn scale_overrides() -> HashMap<String, f32> {
+/// away. `main.rs` reads `NITRO_SCALE` and passes it here; a test fills
+/// [`Config::scales`] directly, because the environment is process-global
+/// and the tests run in threads of one process.
+#[must_use]
+pub fn parse_scales(spec: &str) -> HashMap<String, f32> {
     let mut out = HashMap::new();
-    let Ok(spec) = std::env::var("NITRO_SCALE") else {
-        return out;
-    };
     for entry in spec.split(',').filter(|e| !e.trim().is_empty()) {
         let Some((name, value)) = entry.split_once('=') else {
             warn!("NITRO_SCALE: {entry:?} is not name=scale");
@@ -379,6 +383,9 @@ struct Server {
     input_dir: Option<PathBuf>,
     /// The window with keyboard focus, if any.
     focus: Option<WindowKey>,
+    /// A window placed this wakeup that should take focus once its
+    /// client is back in `wire_clients`; see `place_new_window`.
+    pending_focus: Option<WindowKey>,
     /// Which window each live touch point started on, and where it is in
     /// that window's coordinates.
     touch_targets: HashMap<i32, (WindowKey, Point)>,
@@ -547,10 +554,11 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         wm: WindowManager::new(),
         decorations: HashMap::new(),
         frame_titles: HashMap::new(),
-        scale_overrides: scale_overrides(),
+        scale_overrides: std::mem::take(&mut config.scales),
         input_hotplug,
         input_dir: config.input_dir.clone(),
         focus: None,
+        pending_focus: None,
         touch_targets: HashMap::new(),
         buffer_sources: HashMap::new(),
         pending_fds: Vec::new(),
@@ -882,14 +890,22 @@ impl Server {
         if orphans.is_empty() {
             return;
         }
-        info!("migrating {} window(s) to the primary output", orphans.len());
+        info!(
+            "migrating {} window(s) to the primary output",
+            orphans.len()
+        );
         for win in orphans {
             let Ok(info) = self.scene.window_info(win) else {
                 continue;
             };
             let (size, position, state) = (info.frame_size(), info.position(), info.state());
+            // The orphan's position is in its departed output's space, so
+            // it is only a hint; clamping it into the primary's work area
+            // is what keeps a window that was near an edge near an edge.
+            let origin = self.desktop_origin(primary);
             let pos = wm::clamp_into(position, size, area);
-            if let Err(e) = self.scene.place_window(win, Some(primary), pos) {
+            let local = Point::new(pos.x - origin.x, pos.y - origin.y);
+            if let Err(e) = self.scene.place_window(win, Some(primary), local) {
                 warn!("migrating a window: {e}");
                 continue;
             }
@@ -1179,6 +1195,12 @@ impl Server {
     /// scene ends with. Idle means both are no-ops and nothing is
     /// committed, which is what keeps a quiet server at zero wakeups.
     fn settle(&mut self) {
+        // A window placed during this wakeup wants the focus — which is
+        // what makes a launched app typable without a click — but could
+        // not take it while its own client was lifted out of the map.
+        if let Some(win) = self.pending_focus.take() {
+            self.focus_window(Some(win));
+        }
         self.update_scene();
         self.claim_input_stamp();
         self.paint_or_defer();
@@ -1559,7 +1581,9 @@ impl Server {
         }
         // A keyboard that went away may have been holding a modifier we
         // will never see released.
-        if removed > 0 && let Some(kb) = self.keyboard.as_mut() {
+        if removed > 0
+            && let Some(kb) = self.keyboard.as_mut()
+        {
             kb.reset();
         }
     }
@@ -1707,8 +1731,8 @@ impl Server {
                 // A button fires on release *inside itself*, which is what
                 // lets a user change their mind by sliding off it.
                 let still_on = self
-                    .pointer_logical()
-                    .and_then(|(out, p)| self.frame_hit(out, p))
+                    .pointer_desktop()
+                    .and_then(|p| self.frame_hit(p))
                     .is_some_and(|(w, r)| w == window && r == region);
                 if still_on {
                     match region {
@@ -1727,7 +1751,7 @@ impl Server {
             .as_ref()
             .map_or_else(Mods::default, Keyboard::named_mods);
         if state == ButtonState::Pressed
-            && let Some((output, point)) = self.pointer_logical()
+            && let Some(point) = self.pointer_desktop()
         {
             // Super + drag: the server moves and resizes any window,
             // decorated or not. Checked before the frame regions so it
@@ -1735,7 +1759,7 @@ impl Server {
             if mods.logo
                 && !mods.ctrl
                 && !mods.alt
-                && let Some((win, _)) = self.frame_hit(output, point)
+                && let Some((win, _)) = self.frame_hit(point)
             {
                 self.raise_and_focus(win);
                 if button == input::BTN_LEFT {
@@ -1750,7 +1774,7 @@ impl Server {
                 }
             }
             if button == input::BTN_LEFT
-                && let Some((win, region)) = self.frame_hit(output, point)
+                && let Some((win, region)) = self.frame_hit(point)
                 && region != Region::Content
             {
                 self.raise_and_focus(win);
@@ -1766,7 +1790,10 @@ impl Server {
                         self.begin_resize(win, edges, point);
                     }
                     Region::Close | Region::Maximize => {
-                        self.wm.begin_drag(Drag::Button { window: win, region });
+                        self.wm.begin_drag(Drag::Button {
+                            window: win,
+                            region,
+                        });
                     }
                     Region::Content => unreachable!("guarded above"),
                 }
@@ -1818,16 +1845,12 @@ impl Server {
         {
             self.set_state(win, WindowState::Normal);
         }
-        let Ok(info) = self.scene.window_info(win) else {
-            return;
-        };
-        let origin = info.position();
-        let size = info.frame_size();
+        let rect = self.desktop_rect(win);
         // Keep the grab inside the frame even after a restore shrank it,
         // so the window does not jump out from under the pointer.
         let grab = Point::new(
-            (point.x - origin.x).clamp(0.0, size.w.max(0.0)),
-            (point.y - origin.y).clamp(0.0, size.h.max(0.0)),
+            (point.x - rect.x).clamp(0.0, rect.w.max(0.0)),
+            (point.y - rect.y).clamp(0.0, rect.h.max(0.0)),
         );
         self.wm.begin_drag(Drag::Move { window: win, grab });
     }
@@ -1837,13 +1860,10 @@ impl Server {
         if !self.resizable(win) {
             return;
         }
-        let Ok(info) = self.scene.window_info(win) else {
-            return;
-        };
         self.wm.begin_drag(Drag::Resize {
             window: win,
             edges,
-            start: info.frame_rect(),
+            start: self.desktop_rect(win),
             origin: point,
         });
     }
@@ -1851,10 +1871,7 @@ impl Server {
     /// Start a resize drag from whichever corner the pointer is nearest,
     /// which is what `Super`+right-drag does anywhere in a window.
     fn begin_corner_resize(&mut self, win: WindowKey, point: Point) {
-        let Ok(info) = self.scene.window_info(win) else {
-            return;
-        };
-        let rect = info.frame_rect();
+        let rect = self.desktop_rect(win);
         let edges = Edges::corner(
             point.x >= rect.x + rect.w / 2.0,
             point.y >= rect.y + rect.h / 2.0,
@@ -2306,10 +2323,7 @@ impl Server {
             return;
         };
         let title = info.title().to_owned();
-        let width = self
-            .scene
-            .node(nodes.title)
-            .map_or(0.0, |n| n.bounds().w);
+        let width = self.scene.node(nodes.title).map_or(0.0, |n| n.bounds().w);
         let focused = self.focus == Some(win);
         let request = StyleRequest::new(
             "sans",
@@ -2330,7 +2344,10 @@ impl Server {
             color: wm::title_color(focused),
             align: nitro_scene::TextAlign::Left,
         };
-        match self.scene.set_text(ClientId::SERVER, nodes.title, Some(reference)) {
+        match self
+            .scene
+            .set_text(ClientId::SERVER, nodes.title, Some(reference))
+        {
             Ok(()) => {
                 // The node's previous run is unreachable now.
                 let old = self.frame_titles.insert(win, key);
@@ -2343,7 +2360,8 @@ impl Server {
         }
     }
 
-    /// The work area of the output a window is on (or the primary one).
+    /// The work area of the output a window is on (or the primary one),
+    /// in **desktop** coordinates — see [`Server::desktop_area`].
     fn window_area(&self, win: WindowKey) -> Rect {
         let output = self
             .scene
@@ -2351,21 +2369,104 @@ impl Server {
             .ok()
             .and_then(nitro_scene::Window::output)
             .or_else(|| self.outputs.first().map(|o| o.scene_id));
-        output.map_or(Rect::EMPTY, |id| wm::work_area(&self.scene, id))
+        output.map_or(Rect::EMPTY, |id| self.desktop_area(id))
     }
 
-    /// Move a window's frame to `position` on its own output, without
-    /// changing its size. One scene mutation and one `Configure`; no
-    /// round trip, which is the whole point of server-side moves.
+    /// An output's work area in **desktop** coordinates.
+    ///
+    /// The scene positions a window in its *own output's* logical space,
+    /// with the origin at that output's top-left corner — which is right
+    /// for the scene, and useless for a window manager the moment there
+    /// are two outputs: a drag crosses between them, and two windows on
+    /// different screens can have the same position and not be in the same
+    /// place. So every rectangle in the window manager is in one desktop
+    /// space: each output's logical area, offset by
+    /// [`Server::desktop_origin`]. The conversion happens at exactly two
+    /// boundaries — here on the way out, and `place_window` on the way in.
+    fn desktop_area(&self, id: SceneOutputId) -> Rect {
+        let area = wm::work_area(&self.scene, id);
+        let origin = self.desktop_origin(id);
+        Rect::new(origin.x, origin.y, area.w, area.h)
+    }
+
+    /// Where an output's logical space starts in the desktop space.
+    ///
+    /// Outputs are laid out left to right in *device* pixels; in desktop
+    /// logical units each one starts where the previous ended, at its own
+    /// scale, so a 2x output takes half as much desktop width as its
+    /// device width.
+    fn desktop_origin(&self, id: SceneOutputId) -> Point {
+        let mut x = 0.0;
+        for (out, rect, scale) in self.scene.outputs() {
+            if out == id {
+                return Point::new(x, 0.0);
+            }
+            let s = if scale > 0.0 { scale } else { 1.0 };
+            x += rect.w as f32 / s;
+        }
+        Point::ZERO
+    }
+
+    /// A window's frame rectangle in desktop coordinates.
+    fn desktop_rect(&self, win: WindowKey) -> Rect {
+        let Ok(info) = self.scene.window_info(win) else {
+            return Rect::EMPTY;
+        };
+        let origin = info
+            .output()
+            .map_or(Point::ZERO, |id| self.desktop_origin(id));
+        let r = info.frame_rect();
+        Rect::new(r.x + origin.x, r.y + origin.y, r.w, r.h)
+    }
+
+    /// The output a desktop-space point falls on, and that point in the
+    /// output's own logical space.
+    fn output_for(&self, point: Point) -> Option<(SceneOutputId, Point)> {
+        for (id, rect, scale) in self.scene.outputs() {
+            let s = if scale > 0.0 { scale } else { 1.0 };
+            let origin = self.desktop_origin(id);
+            let (w, h) = (rect.w as f32 / s, rect.h as f32 / s);
+            if point.x >= origin.x
+                && point.y >= origin.y
+                && point.x < origin.x + w
+                && point.y < origin.y + h
+            {
+                return Some((id, Point::new(point.x - origin.x, point.y - origin.y)));
+            }
+        }
+        None
+    }
+
+    /// Move a window's frame to a **desktop**-space position, without
+    /// changing its size, re-homing it onto whichever output now contains
+    /// its centre.
+    ///
+    /// One scene mutation and one `Configure`; no round trip, which is the
+    /// whole point of server-side moves.
     fn move_window(&mut self, win: WindowKey, position: Point) {
         let Ok(info) = self.scene.window_info(win) else {
             return;
         };
-        if info.position() == position {
+        let size = info.frame_size();
+        let current = info.output();
+        // "The output containing its centre" is the rule a user can
+        // predict: a window is on the screen it mostly is on, and dragging
+        // it more than halfway across hands it over.
+        let centre = Point::new(position.x + size.w / 2.0, position.y + size.h / 2.0);
+        // Off every screen — only reachable while a hotplug is in flight.
+        // Keep the window where it is rather than unplacing it.
+        let Some((output, _)) = self
+            .output_for(centre)
+            .or_else(|| self.output_for(position))
+        else {
+            return;
+        };
+        let origin = self.desktop_origin(output);
+        let local = Point::new(position.x - origin.x, position.y - origin.y);
+        if current == Some(output) && info.position() == local {
             return;
         }
-        let output = info.output();
-        if let Err(e) = self.scene.place_window(win, output, position) {
+        if let Err(e) = self.scene.place_window(win, Some(output), local) {
             warn!("moving a window: {e}");
             return;
         }
@@ -2379,23 +2480,28 @@ impl Server {
             return;
         };
         let inset = info.inset();
-        let output = info.output();
+        // A resize never changes which output a window is on: it is the
+        // opposite edge that moves, and handing a window over mid-resize
+        // would be a surprise. So it keeps its current output and only its
+        // position within it is recomputed.
+        let output = info
+            .output()
+            .or_else(|| self.outputs.first().map(|o| o.scene_id));
+        let origin = output.map_or(Point::ZERO, |id| self.desktop_origin(id));
         let content = Size::new(
             (rect.w - inset.width()).max(0.0),
             (rect.h - inset.height()).max(0.0),
         );
         let content = self.scene.clamp_to_limits(win, content);
-        if let Err(e) = self
-            .scene
-            .set_window_size(ClientId::SERVER, win, content)
-        {
+        if let Err(e) = self.scene.set_window_size(ClientId::SERVER, win, content) {
             warn!("resizing a window: {e}");
             return;
         }
-        if let Err(e) = self
-            .scene
-            .place_window(win, output, Point::new(rect.x, rect.y))
-        {
+        if let Err(e) = self.scene.place_window(
+            win,
+            output,
+            Point::new(rect.x - origin.x, rect.y - origin.y),
+        ) {
             warn!("placing a resized window: {e}");
         }
         self.relayout_frame(win);
@@ -2434,7 +2540,11 @@ impl Server {
         }
         let was_normal = info.state() == WindowState::Normal;
         if was_normal && matches!(state, WindowState::Maximized | WindowState::Fullscreen) {
-            let restore = (info.position(), info.size());
+            // Remembered in *desktop* coordinates, like every other
+            // window-manager rectangle: the window may come back out of
+            // maximize on a different output than it went in on.
+            let rect = self.desktop_rect(win);
+            let restore = (Point::new(rect.x, rect.y), info.size());
             let _ = self.scene.set_window_restore(win, Some(restore));
         }
         if let Err(e) = self.scene.set_window_state(win, state) {
@@ -2469,11 +2579,14 @@ impl Server {
         let output = info.output();
         let framed = info.is_framed();
         let area = self.window_area(win);
+        // Fullscreen covers the whole output, work area or not — in
+        // desktop coordinates, like everything else here.
         let full = output
-            .and_then(|id| self.scene.output_info(id))
-            .map_or(area, |(rect, scale)| {
+            .and_then(|id| self.scene.output_info(id).map(|i| (id, i)))
+            .map_or(area, |(id, (rect, scale))| {
                 let s = if scale > 0.0 { scale } else { 1.0 };
-                Rect::new(0.0, 0.0, rect.w as f32 / s, rect.h as f32 / s)
+                let origin = self.desktop_origin(id);
+                Rect::new(origin.x, origin.y, rect.w as f32 / s, rect.h as f32 / s)
             });
         match state {
             WindowState::Minimized => {}
@@ -2578,19 +2691,18 @@ impl Server {
         }
     }
 
-    /// The pointer position in the logical coordinates of the output it is
-    /// over, which is the space every window rectangle lives in.
-    fn pointer_logical(&self) -> Option<(SceneOutputId, Point)> {
+    /// The pointer in **desktop** coordinates — the space every window
+    /// rectangle in the window manager lives in. See
+    /// [`Server::desktop_area`].
+    fn pointer_desktop(&self) -> Option<Point> {
         let point = self.pointer.position();
         let id = input::output_at(&self.scene, point)?;
         let (rect, scale) = self.scene.output_info(id)?;
         let s = if scale > 0.0 { scale } else { 1.0 };
-        Some((
-            id,
-            Point::new(
-                (point.x - rect.x as f32) / s,
-                (point.y - rect.y as f32) / s,
-            ),
+        let origin = self.desktop_origin(id);
+        Some(Point::new(
+            (point.x - rect.x as f32) / s + origin.x,
+            (point.y - rect.y as f32) / s + origin.y,
         ))
     }
 
@@ -2601,29 +2713,38 @@ impl Server {
     /// separate walk from the scene's own hit test (that one only knows
     /// about *painted* nodes and would never see a resize band outside the
     /// window at all).
-    fn frame_hit(&self, output: SceneOutputId, point: Point) -> Option<(WindowKey, Region)> {
-        for win in self.scene.windows_front_to_back(output) {
-            let Ok(info) = self.scene.window_info(win) else {
-                continue;
-            };
-            if info.state() == WindowState::Minimized {
-                continue;
-            }
-            if !info.is_framed() {
-                // Undecorated: it is all content, and the scene's own hit
-                // test decides whether the click lands in it.
-                if wm::contains(info.frame_rect(), point) {
-                    return Some((win, Region::Content));
+    fn frame_hit(&self, point: Point) -> Option<(WindowKey, Region)> {
+        // The pointer decides which output's stack to walk, but the
+        // *resize bands* reach outside a window, so a grab just past a
+        // screen edge has to find the window on the other side of it: walk
+        // every output, frontmost stack first.
+        let outputs: Vec<SceneOutputId> = self.outputs.iter().map(|o| o.scene_id).collect();
+        for id in outputs {
+            let origin = self.desktop_origin(id);
+            let local = Point::new(point.x - origin.x, point.y - origin.y);
+            for win in self.scene.windows_front_to_back(id) {
+                let Ok(info) = self.scene.window_info(win) else {
+                    continue;
+                };
+                if info.state() == WindowState::Minimized {
+                    continue;
                 }
-                continue;
-            }
-            if let Some(region) = wm::hit_frame(
-                info.frame_rect(),
-                info.inset(),
-                point,
-                info.flags().fixed_size,
-            ) {
-                return Some((win, region));
+                if !info.is_framed() {
+                    // Undecorated: it is all content, and the scene's own
+                    // hit test decides whether the click lands in it.
+                    if wm::contains(info.frame_rect(), local) {
+                        return Some((win, Region::Content));
+                    }
+                    continue;
+                }
+                if let Some(region) = wm::hit_frame(
+                    info.frame_rect(),
+                    info.inset(),
+                    local,
+                    info.flags().fixed_size,
+                ) {
+                    return Some((win, region));
+                }
             }
         }
         None
@@ -2633,7 +2754,7 @@ impl Server {
     /// Returns whether anything moved (so the caller can skip the client
     /// event it would otherwise send).
     fn drive_drag(&mut self, drag: Drag) -> bool {
-        let Some((_, point)) = self.pointer_logical() else {
+        let Some(point) = self.pointer_desktop() else {
             return true;
         };
         match drag {
@@ -2648,9 +2769,9 @@ impl Server {
                 // A dragged window may cross onto another output; the
                 // clamp is to the *union* of the outputs, not to one of
                 // them, or a window could never leave its own screen.
+                // `move_window` re-homes it once its centre lands there.
                 let pos = self.clamp_to_desktop(want, size, area);
                 self.move_window(window, pos);
-                self.reoutput(window);
                 true
             }
             Drag::Resize {
@@ -2676,12 +2797,7 @@ impl Server {
     fn clamp_to_desktop(&self, pos: Point, size: Size, fallback: Rect) -> Point {
         let mut union: Option<Rect> = None;
         for (id, _, _) in self.scene.outputs() {
-            let area = wm::work_area(&self.scene, id);
-            // Outputs are laid out left to right in the *device* space; in
-            // logical space each starts where the previous one ended,
-            // which `origin_of` recovers.
-            let origin = self.logical_origin(id);
-            let area = Rect::new(origin.x, origin.y, area.w, area.h);
+            let area = self.desktop_area(id);
             union = Some(match union {
                 Some(u) => Rect::from_corners(
                     Point::new(u.x.min(area.x), u.y.min(area.y)),
@@ -2699,67 +2815,12 @@ impl Server {
         // there is nothing left to grab.
         let min_visible = wm::TITLE_H.min(size.w).max(1.0);
         Point::new(
-            pos.x
-                .clamp(area.x - (size.w - min_visible).max(0.0), area.x + area.w - min_visible),
+            pos.x.clamp(
+                area.x - (size.w - min_visible).max(0.0),
+                area.x + area.w - min_visible,
+            ),
             pos.y.clamp(area.y, area.y + area.h - min_visible),
         )
-    }
-
-    /// The logical-space origin of an output: its device origin divided by
-    /// its own scale, which is where windows on it are positioned from.
-    fn logical_origin(&self, id: SceneOutputId) -> Point {
-        self.scene.output_info(id).map_or(Point::ZERO, |(r, s)| {
-            let s = if s > 0.0 { s } else { 1.0 };
-            Point::new(r.x as f32 / s, r.y as f32 / s)
-        })
-    }
-
-    /// Re-home a window onto whichever output contains its centre, and
-    /// `Configure` it if that changed.
-    ///
-    /// "The output containing its centre" is the rule a user can predict:
-    /// a window is on the screen it mostly is on, and dragging it more than
-    /// halfway across hands it over.
-    fn reoutput(&mut self, win: WindowKey) {
-        let Ok(info) = self.scene.window_info(win) else {
-            return;
-        };
-        let Some(current) = info.output() else {
-            return;
-        };
-        let size = info.frame_size();
-        let origin = self.logical_origin(current);
-        let centre_logical = Point::new(
-            info.position().x + size.w / 2.0,
-            info.position().y + size.h / 2.0,
-        );
-        // Back into the global device space, which is what outputs are
-        // laid out in.
-        let scale = self.scene.output_info(current).map_or(1.0, |(_, s)| s);
-        let s = if scale > 0.0 { scale } else { 1.0 };
-        let device = Point::new(
-            (centre_logical.x - origin.x) * s
-                + self.scene.output_info(current).map_or(0.0, |(r, _)| r.x as f32),
-            (centre_logical.y - origin.y) * s
-                + self.scene.output_info(current).map_or(0.0, |(r, _)| r.y as f32),
-        );
-        let Some(target) = input::output_at(&self.scene, device) else {
-            return;
-        };
-        if target == current {
-            return;
-        }
-        // The position is in the *new* output's logical space now.
-        let new_origin = self.logical_origin(target);
-        let pos = Point::new(
-            info.position().x - origin.x + new_origin.x,
-            info.position().y - origin.y + new_origin.y,
-        );
-        if let Err(e) = self.scene.place_window(win, Some(target), pos) {
-            warn!("moving a window between outputs: {e}");
-            return;
-        }
-        self.configure(win);
     }
 
     fn on_client(&mut self, token: u64, flags: EventFlags) {
@@ -2827,6 +2888,7 @@ impl Server {
                 protocol::ok_reply()
             }
             Ok(Request::Plug(w, h)) => self.plug(w, h),
+            Ok(Request::Unplug) => self.unplug(),
             Ok(Request::Focus) => self.focus_topmost(),
         };
         client.send(reply);
@@ -2864,6 +2926,23 @@ impl Server {
         pairs.push(("clients", self.wire_clients.len() as u64));
         pairs.push(("windows", self.scene.window_count() as u64));
         pairs.push(("nodes", self.scene.node_count() as u64));
+        pairs.push(("outputs", self.outputs.len() as u64));
+        // The window-management view: how many windows carry a
+        // server-drawn frame, how many are hidden, and whether a drag is
+        // in flight. `decorated` under `windows` is the opt-out count.
+        pairs.push(("decorated", self.decorations.len() as u64));
+        let minimized = self
+            .wm
+            .mru()
+            .iter()
+            .filter(|w| {
+                self.scene
+                    .window_info(**w)
+                    .is_ok_and(|i| i.state() == WindowState::Minimized)
+            })
+            .count();
+        pairs.push(("minimized", minimized as u64));
+        pairs.push(("dragging", u64::from(self.wm.drag().is_some())));
         protocol::stats_reply(&pairs)
     }
 
@@ -3202,11 +3281,12 @@ impl Server {
             return;
         }
         self.wm.add(win);
-        // A new window on the Normal layer takes focus, which is what makes
-        // a launched app typable without a click. `NO_FOCUS` windows never
-        // do, and neither does a panel on another layer.
+        // Focus is *deferred*, not taken here: this runs with the owning
+        // client lifted out of `wire_clients` (a commit holds it), so a
+        // `Focus` sent now would find no client to send it to. `settle`
+        // applies it on the way out, with every client back in the map.
         if self.focusable(win) {
-            self.focus_window(Some(win));
+            self.pending_focus = Some(win);
         }
         let content = self
             .scene
@@ -3355,6 +3435,19 @@ impl Server {
             return protocol::err_reply("`plug` is only available on the fake backend");
         }
         info!("plug {width}x{height} requested");
+        protocol::ok_reply()
+    }
+
+    /// Unplug the last output from the fake backend.
+    ///
+    /// Test-only, like [`Server::plug`], and the half that matters to the
+    /// window manager: removing an output orphans its windows, and
+    /// migrating them is the behaviour under test.
+    fn unplug(&mut self) -> Vec<u8> {
+        if !self.backend.simulate_unplug() {
+            return protocol::err_reply("`unplug` needs the fake backend and an output to remove");
+        }
+        info!("unplug requested");
         protocol::ok_reply()
     }
 

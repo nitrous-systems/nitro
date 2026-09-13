@@ -14,11 +14,11 @@ use crate::framing::Framer;
 use crate::io::Socket;
 use crate::msg::{
     BufferDamage, ClientMsg, Commit, CreateBuffer, CreateNode, CreateWindow, DestroyBuffer,
-    DestroyNode, Fill, Hello, MeasureText, Reparent, RequestFrame, ServerMsg, SetBorder, SetBounds,
-    SetClip, SetCorners, SetFill, SetImage, SetOpacity, SetText, SetTransform, SetVisible,
-    SetWindowTitle,
+    DestroyNode, Fill, Hello, MeasureText, Reparent, RequestFrame, ServerMsg, SetAppId, SetBorder,
+    SetBounds, SetClip, SetCorners, SetFill, SetImage, SetOpacity, SetText, SetTransform,
+    SetVisible, SetWindowLimits, SetWindowState, SetWindowTitle,
 };
-use crate::types::{Align, BufferId, Layer, NodeId, NodeKind};
+use crate::types::{Align, BufferId, Layer, NodeId, NodeKind, WindowState};
 
 /// Where the wire socket lives; see [`crate::socket_path`].
 pub use crate::socket_path;
@@ -306,15 +306,55 @@ macro_rules! push {
 impl Transaction<'_> {
     /// Create a top-level window.
     #[must_use]
-    pub fn create_window(mut self, id: NodeId, title: &str, size: Size, layer: Layer) -> Self {
+    pub fn create_window(self, id: NodeId, title: &str, size: Size, layer: Layer) -> Self {
+        self.create_window_with(id, title, size, layer, 0)
+    }
+
+    /// Create a top-level window with explicit
+    /// [`window_flags`](crate::types::window_flags) bits.
+    #[must_use]
+    pub fn create_window_with(
+        mut self,
+        id: NodeId,
+        title: &str,
+        size: Size,
+        layer: Layer,
+        flags: u32,
+    ) -> Self {
         push!(
             self,
             CreateWindow {
                 id,
                 size,
                 layer,
-                flags: 0,
+                flags,
                 title: title.to_owned(),
+            }
+        )
+    }
+
+    /// Ask the server to put a window into a state (needs `caps::WM`).
+    #[must_use]
+    pub fn set_window_state(mut self, window: NodeId, state: WindowState) -> Self {
+        push!(self, SetWindowState { window, state })
+    }
+
+    /// Declare a window's content size limits; a zero component means "no
+    /// limit" (needs `caps::WM`).
+    #[must_use]
+    pub fn set_window_limits(mut self, window: NodeId, min: Size, max: Size) -> Self {
+        push!(self, SetWindowLimits { window, min, max })
+    }
+
+    /// Set a window's application id, for the shell's window list (needs
+    /// `caps::WM`).
+    #[must_use]
+    pub fn set_app_id(mut self, window: NodeId, app_id: &str) -> Self {
+        push!(
+            self,
+            SetAppId {
+                window,
+                app_id: app_id.to_owned(),
             }
         )
     }

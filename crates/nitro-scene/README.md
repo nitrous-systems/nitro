@@ -17,7 +17,8 @@ proportional to what changed, not to what is on screen.**
 ```
 Scene
 ├── outputs: Vec<Output>          OutputId, device rect, scale, z-order per layer
-├── windows: Arena<WindowKey>     root node + title, layer, size, output, position
+├── windows: Arena<WindowKey>     root + content nodes, title, app id, layer,
+│                                 size, output, position, state, limits
 ├── nodes:   Arena<NodeKey>       the tree
 └── buffers: Arena<BufferKey>     client pixels, owned by the scene
 ```
@@ -37,13 +38,36 @@ mechanism; they cannot be mixed up.
 ### Windows
 
 A window is a **separate table entry**, not a node kind: a `Window` holds the
-metadata the shell needs (title, layer, requested size, output, position) plus
-the `NodeKey` of its root, which is an ordinary `Group`. That split keeps
-`Node` uniform — the traversals never branch on "is this a window?" — while
-letting the shell list and restack windows without touching the tree.
+metadata the shell needs (title, app id, layer, requested size, output,
+position, state, limits) plus the `NodeKey` of its root, which is an ordinary
+`Group`. That split keeps `Node` uniform — the traversals never branch on "is
+this a window?" — while letting the shell list and restack windows without
+touching the tree.
 
-A window's root node cannot be reparented or destroyed on its own
-(`Error::RootNode`); it lives and dies with the window.
+A window has **two** node handles, which are the same node until the server
+decorates it:
+
+* `root()` is the whole window, frame included. It is what the z-order
+  stacks and what a `place_window` positions.
+* `content()` is the group the owning *client* attached its nodes to.
+
+`frame_window(win, insets)` mints a new root owned by `ClientId::SERVER`
+*above* the existing group, makes that group its last child and offsets it by
+the insets. The client's key is untouched, so an id a client already holds
+still names its own content and nothing it creates can land on top of the
+decorations. `Window::size()` and `Configure` are always the **content's**
+size; `frame_size()` adds the insets, and `content_position()` is what a
+client crops a screenshot with. The policy — what a frame looks like, what
+the insets are, which state implies which rectangle — is the server's, in
+`nitro-server`'s `wm` module; this crate only holds the structure.
+
+Neither a window's root nor its content group can be reparented or destroyed
+on its own (`Error::RootNode`); they live and die with the window.
+
+`WindowState` is stored but not interpreted, with one exception: `Minimized`
+hides the root, because "invisible" is a scene fact rather than a policy one.
+Which rectangle `Maximized` means depends on the work area, and the work area
+is the server's business.
 
 ### Nodes
 

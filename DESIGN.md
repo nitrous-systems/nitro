@@ -273,6 +273,13 @@ D-Bus client is allowed.
   method in `docs/budget.md`.
 - **M3** — Shell: bar, launcher, window management (focus, move, resize,
   z-order), keyboard layouts, multi-output.
+  - **M3-A done.** Server-side window management: decorations (opt-out per
+    window), server move/resize with zero client round-trips, focus and an
+    MRU `Alt+Tab` cycle, `Normal`/`Maximized`/`Fullscreen`/`Minimized`
+    states with size limits, a centred-cascade placement inside a per-output
+    work area, multi-output layout with per-output scale, output and
+    input-device hotplug. The wire grew the `WM` capability bit and four ops
+    behind it; v1's byte layout is unchanged. Model in `docs/wm.md`.
 - **M4** — Terminal, settings (display/audio), file manager; remote view;
   phone build.
 - **M5** — Wayland adapter; GPU backend.

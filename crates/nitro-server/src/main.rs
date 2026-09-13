@@ -10,6 +10,8 @@
 //! - `NITRO_INPUT_DIR` overrides where `event*` devices are looked for
 //!   (default `/dev/input`); `NITRO_INPUT=off` disables input entirely,
 //!   which is what a headless test wants.
+//! - `NITRO_SCALE=<connector>=<f32>,…` overrides an output's scale; see
+//!   `docs/wm.md`.
 //! - `NITRO_LOG=error|warn|info|debug`.
 
 use std::path::PathBuf;
@@ -71,6 +73,9 @@ fn config_from_env() -> Result<Config, String> {
         handle_signals: true,
         fake_input: None,
         input_dir,
+        scales: std::env::var("NITRO_SCALE")
+            .map(|s| nitro_server::parse_scales(&s))
+            .unwrap_or_default(),
     })
 }
 

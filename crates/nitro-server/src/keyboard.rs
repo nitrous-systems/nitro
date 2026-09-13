@@ -413,10 +413,7 @@ mod tests {
         assert_eq!(hotkey(xkb::keysyms::KEY_Tab, none), None);
         // Ctrl+Super is not a window-management chord: an application may
         // reasonably want it, and the Super table must not swallow it.
-        let ctrl_logo = Mods {
-            ctrl: true,
-            ..LOGO
-        };
+        let ctrl_logo = Mods { ctrl: true, ..LOGO };
         assert_eq!(hotkey(xkb::keysyms::KEY_q, ctrl_logo), None);
     }
 
@@ -433,7 +430,10 @@ mod tests {
             Some(Hotkey::ToggleFullscreen)
         );
         assert_eq!(hotkey(xkb::keysyms::KEY_h, LOGO), Some(Hotkey::Minimize));
-        assert_eq!(hotkey(xkb::keysyms::KEY_Left, LOGO), Some(Hotkey::Tile(true)));
+        assert_eq!(
+            hotkey(xkb::keysyms::KEY_Left, LOGO),
+            Some(Hotkey::Tile(true))
+        );
         assert_eq!(
             hotkey(xkb::keysyms::KEY_Right, LOGO),
             Some(Hotkey::Tile(false))

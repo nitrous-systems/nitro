@@ -11,6 +11,7 @@
 //! | `stats`              | `ok\n` + `key value\n` lines + `\n`                           |
 //! | `quit`               | `ok\n`, then the server shuts down                           |
 //! | `plug WxH`           | `ok\n`; fake backend only — hotplugs an output in, for tests |
+//! | `unplug`             | `ok\n`; fake backend only — removes the last output          |
 //! | `focus`              | `ok\n`; focuses the topmost window, for tests                |
 //!
 //! This module only parses and formats; it never touches a socket.
@@ -33,6 +34,10 @@ pub enum Request {
     /// Plug a `WxH` output into the fake backend. Test-only: on a real
     /// backend outputs come from connectors, and this is refused.
     Plug(u32, u32),
+    /// Unplug the last fake output. Test-only, and the other half of
+    /// [`Request::Plug`]: output *removal* is where window migration
+    /// lives, and on a real backend it means pulling a cable out.
+    Unplug,
     /// Give keyboard focus to the topmost window.
     ///
     /// Test-only, and it exists because focus normally *follows the
@@ -67,11 +72,12 @@ pub fn parse(line: &str) -> Result<Request, String> {
             Ok(Request::Plug(w, h))
         }
         ("plug", None) => Err("`plug` needs a WxH size".to_owned()),
+        ("unplug", None) => Ok(Request::Unplug),
         ("outputs", None) => Ok(Request::Outputs),
         ("stats", None) => Ok(Request::Stats),
         ("quit", None) => Ok(Request::Quit),
         ("focus", None) => Ok(Request::Focus),
-        ("outputs" | "stats" | "quit" | "focus", Some(_)) => {
+        ("outputs" | "stats" | "quit" | "focus" | "unplug", Some(_)) => {
             Err(format!("`{cmd}` takes no argument"))
         }
         _ => Err(format!("unknown request `{cmd}`")),
@@ -146,6 +152,11 @@ mod tests {
         assert_eq!(parse("stats"), Ok(Request::Stats));
         assert_eq!(parse("quit\n"), Ok(Request::Quit));
         assert_eq!(parse("plug 640x480"), Ok(Request::Plug(640, 480)));
+        assert_eq!(parse("unplug\n"), Ok(Request::Unplug));
+        assert_eq!(
+            parse("unplug all"),
+            Err("`unplug` takes no argument".to_owned())
+        );
         assert_eq!(parse("focus\n"), Ok(Request::Focus));
         assert_eq!(
             parse("focus now"),

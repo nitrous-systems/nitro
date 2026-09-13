@@ -25,9 +25,7 @@
 //! multi-output layout. See `docs/wm.md`.
 
 use nitro_core::{Color, Point, Rect, Size};
-use nitro_scene::{
-    ClientId, Insets, Layer, OutputId, Scene, WindowKey,
-};
+use nitro_scene::{ClientId, Insets, Layer, OutputId, Scene, WindowKey};
 
 /// Title-bar height in logical pixels.
 pub const TITLE_H: f32 = 28.0;
@@ -174,9 +172,9 @@ impl Drag {
     #[must_use]
     pub fn window(&self) -> WindowKey {
         match *self {
-            Self::Move { window, .. } | Self::Resize { window, .. } | Self::Button { window, .. } => {
-                window
-            }
+            Self::Move { window, .. }
+            | Self::Resize { window, .. }
+            | Self::Button { window, .. } => window,
         }
     }
 }
@@ -326,10 +324,12 @@ pub fn resize_rect(
 /// zones, and this is the one function that will need to know about them.
 #[must_use]
 pub fn work_area(scene: &Scene, output: OutputId) -> Rect {
-    scene.output_info(output).map_or(Rect::EMPTY, |(rect, scale)| {
-        let s = if scale > 0.0 { scale } else { 1.0 };
-        Rect::new(0.0, 0.0, rect.w as f32 / s, rect.h as f32 / s)
-    })
+    scene
+        .output_info(output)
+        .map_or(Rect::EMPTY, |(rect, scale)| {
+            let s = if scale > 0.0 { scale } else { 1.0 };
+            Rect::new(0.0, 0.0, rect.w as f32 / s, rect.h as f32 / s)
+        })
 }
 
 /// Where a new window of `size` (frame included) goes inside `area`.
@@ -652,7 +652,12 @@ pub fn layout_frame(
     scene.set_bounds(
         s,
         nodes.title,
-        Rect::new(BUTTON_GAP, (TITLE_H - TITLE_SIZE_LINE) / 2.0, title_w, TITLE_SIZE_LINE),
+        Rect::new(
+            BUTTON_GAP,
+            (TITLE_H - TITLE_SIZE_LINE) / 2.0,
+            title_w,
+            TITLE_SIZE_LINE,
+        ),
     )?;
     let frame = Rect::new(0.0, 0.0, size.w, size.h);
     for (region, rect) in buttons(frame, fixed) {

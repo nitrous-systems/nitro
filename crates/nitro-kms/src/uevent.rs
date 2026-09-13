@@ -171,7 +171,8 @@ mod tests {
     #[test]
     fn recognises_an_input_device_appearing_and_leaving() {
         let add = b"add@/devices/virtual/input/input7/event9\0ACTION=add\0SUBSYSTEM=input\0DEVNAME=input/event9\0";
-        let remove = b"remove@/devices/virtual/input/input7/event9\0ACTION=remove\0SUBSYSTEM=input\0";
+        let remove =
+            b"remove@/devices/virtual/input/input7/event9\0ACTION=remove\0SUBSYSTEM=input\0";
         assert!(is_device_change(add, b"input"));
         assert!(is_device_change(remove, b"input"));
         // An input device appearing is not a DRM hotplug.
