@@ -592,10 +592,10 @@ mod tests {
 
         // And the loop's idle release hands them straight back: a face is
         // needed to shape and to rasterize a new glyph, neither of which a
-        // settled desktop does. Two frames, because a face touched during
-        // frame N is still "this frame's" at N+1 — a run being painted must
-        // not have its font pulled out from under the next glyph.
-        engine.next_frame();
+        // settled desktop does. One frame bump is enough: the loop bumps at
+        // the start of a paint and releases at the block point after it, so
+        // a face the paint did not touch goes right then — not two paints
+        // later, which a screen that has gone quiet would never deliver.
         engine.next_frame();
         engine.release_idle_fonts();
         pairs.clear();

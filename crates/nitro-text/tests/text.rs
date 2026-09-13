@@ -546,6 +546,11 @@ fn eviction_under_a_tiny_cap_keeps_the_atlas_working() {
         "a 1-byte cap must evict: {:?}",
         db.loads()
     );
+    assert_eq!(
+        db.releases(),
+        0,
+        "nothing went idle: the cap's counter, not the sweep's"
+    );
     let largest = files.iter().map(file_len).max().unwrap_or(0) as usize;
     assert!(
         db.loaded_bytes() <= largest,
@@ -707,13 +712,18 @@ fn an_idle_release_returns_the_bytes_and_keeps_every_mask() {
     // A face used *this* frame is not released: a run mid-paint keeps its font.
     db.release_idle();
     assert!(db.loaded_bytes() > 0, "the current frame's face stays");
+    assert_eq!(db.releases(), 0);
 
-    // One frame later, with nothing having asked for it, it goes.
-    db.next_frame();
+    // Exactly one frame later, with nothing having asked for it, it goes.
+    // One bump, not two: the server bumps at the start of a paint and
+    // releases at the block point after it, and a screen that paints once
+    // more and then goes quiet must not keep the bytes for the session.
     db.next_frame();
     db.release_idle();
     assert_eq!(db.loaded_bytes(), 0, "an idle face is released");
     assert_eq!(db.loaded_files(), 0);
+    assert!(db.releases() > 0, "counted as a release");
+    assert_eq!(db.evictions(), 0, "and not as a cap eviction");
 
     // The masks are all still there: redrawing renders nothing and reads
     // nothing. That is what makes the release free.
@@ -734,8 +744,8 @@ fn an_idle_release_returns_the_bytes_and_keeps_every_mask() {
     atlas.get(&db, GlyphKey::new(font, 200, 33.0, 0.0));
     assert_eq!(db.loads(), loads + 1, "exactly one re-read");
     eprintln!(
-        "idle release: {masks} masks kept, {} loads, {} evictions",
+        "idle release: {masks} masks kept, {} loads, {} releases",
         db.loads(),
-        db.evictions()
+        db.releases()
     );
 }

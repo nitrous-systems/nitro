@@ -141,18 +141,6 @@ const SERIF_PREFS: &[&str] = &[
 /// Default byte cap of the face cache, overridden by `NITRO_FONT_CACHE_MB`.
 const DEFAULT_CACHE_MB: f64 = 8.0;
 
-/// How many frame stamps a face may go untouched before
-/// [`release_idle`](FontDb::release_idle) drops it, whatever the cap says.
-///
-/// One. A face is needed to *shape* a run and to *rasterize* a glyph the atlas
-/// has not seen; once a label is on screen neither happens again, so holding
-/// the file is holding megabytes against a re-read that costs tens of
-/// microseconds (measured: 20 µs to shape a warm line, 53 µs when the face has
-/// to be read back first — 0.2 % of a 16 ms frame, and only when a *new* glyph
-/// appears). The cap still governs the working set *within* a frame, which is
-/// what stops a run alternating between faces thrashing.
-const IDLE_FRAMES: u64 = 1;
-
 /// One font file's bytes plus the face index inside them.
 ///
 /// Cloning is an `Arc` bump: several faces of one `.ttc` share the bytes, and
@@ -201,14 +189,17 @@ struct Cache {
     bytes: usize,
     /// Byte cap. Soft in exactly one way: the file that triggered the trim is
     /// never the victim, so a cap smaller than a single font file degrades to
-    /// "cache nothing" rather than to "read the file and immediately drop it".
+    /// "keep only the file in use" rather than to "read the file and
+    /// immediately drop it".
     limit: usize,
     /// Frame stamp, bumped by [`FontDb::next_frame`].
     frame: u64,
     /// Files read from disk since startup (the miss counter).
     loads: u64,
-    /// Files dropped by the cap.
+    /// Files dropped by the cap in [`trim`](Self::trim).
     evictions: u64,
+    /// Files dropped by the idle sweep in [`sweep_idle`](Self::sweep_idle).
+    releases: u64,
 }
 
 impl Default for Cache {
@@ -220,6 +211,7 @@ impl Default for Cache {
             frame: 0,
             loads: 0,
             evictions: 0,
+            releases: 0,
         }
     }
 }
@@ -508,17 +500,30 @@ impl FontDb {
         self.cache.borrow_mut().frame += 1;
     }
 
-    /// Drop every face untouched for [`IDLE_FRAMES`] frames, **regardless of
+    /// Drop every face the current frame has not touched, **regardless of
     /// the cap**.
     ///
     /// This, not the cap, is what actually keeps the server's resident set
     /// small: on a box whose fonts fit inside `NITRO_FONT_CACHE_MB` the cap
     /// never fires at all, and a desktop that has finished drawing its labels
     /// would hold every font file it ever touched for the rest of the session.
-    /// The atlas keeps the rendered masks, so the only cost of being wrong is
-    /// one `read(2)` the next time a genuinely new glyph turns up, and a face
-    /// a caller is still using is untouched by this — [`FaceData`] owns an
-    /// `Arc` to the bytes.
+    /// A face is needed to *shape* a run and to *rasterize* a glyph the atlas
+    /// has not seen; once a label is on screen neither happens again, so
+    /// holding the file is holding megabytes against a re-read that costs
+    /// tens of microseconds (measured: 20 µs to shape a warm line, 53 µs when
+    /// the face has to be read back first — 0.2 % of a 16 ms frame, and only
+    /// when a *new* glyph appears). The cap still governs the working set
+    /// *within* a frame, which is what stops a run alternating between faces
+    /// thrashing.
+    ///
+    /// A face stamped with the current frame is kept — a run mid-paint must
+    /// not lose its font — and everything older goes. Because the server
+    /// bumps [`next_frame`](Self::next_frame) at the start of each paint,
+    /// anything with an older stamp is by definition something that paint did
+    /// not touch, so the release never waits on a *future* frame: a screen
+    /// that paints once more and then goes quiet hands its bytes back at the
+    /// next block point, not two paints later. Dropping a face a caller is
+    /// still using is safe — [`FaceData`] owns an `Arc` to the bytes.
     ///
     /// Called from the server's event loop at the end of a turn, because a
     /// settled desktop stops painting: hanging the release off
@@ -548,10 +553,21 @@ impl FontDb {
         self.cache.borrow().loads
     }
 
-    /// Files dropped by the cap since startup.
+    /// Files dropped by the cap since startup — `trim` only, never the idle
+    /// sweep. Non-zero means the working set of a single frame genuinely did
+    /// not fit in `NITRO_FONT_CACHE_MB`, which is a different and more
+    /// alarming fact than an ordinary idle release.
     #[must_use]
     pub fn evictions(&self) -> u64 {
         self.cache.borrow().evictions
+    }
+
+    /// Files handed back by [`release_idle`](Self::release_idle) since
+    /// startup. Rising steadily is the normal rhythm of a desktop that paints
+    /// now and then; it says nothing about the cap.
+    #[must_use]
+    pub fn releases(&self) -> u64 {
+        self.cache.borrow().releases
     }
 
     /// The cache's byte cap.
@@ -657,7 +673,7 @@ impl FontDb {
 }
 
 impl Cache {
-    /// Drop every face untouched for [`IDLE_FRAMES`] frames.
+    /// Drop every face whose stamp is older than the current frame.
     fn sweep_idle(&mut self) {
         if self.entries.is_empty() {
             return;
@@ -665,7 +681,7 @@ impl Cache {
         let frame = self.frame;
         let mut freed = 0u64;
         self.entries.retain(|_, entry| {
-            let idle = frame.saturating_sub(entry.last_used) > IDLE_FRAMES;
+            let idle = entry.last_used < frame;
             if idle {
                 freed += 1;
             }
@@ -673,7 +689,7 @@ impl Cache {
         });
         if freed > 0 {
             self.bytes = self.entries.values().map(|e| e.bytes.len()).sum();
-            self.evictions += freed;
+            self.releases += freed;
         }
     }
 
@@ -934,6 +950,7 @@ mod tests {
         assert!(!cache.entries.contains_key(&0), "oldest goes first");
         assert!(cache.entries.contains_key(&2), "the newcomer stays");
         assert_eq!(cache.evictions, 1);
+        assert_eq!(cache.releases, 0, "the cap's counter, not the sweep's");
 
         // A cap below one file's size keeps only the file just read, so the
         // caller that asked for it is not immediately made to read it again.
@@ -945,5 +962,36 @@ mod tests {
         cache.trim(None);
         assert!(cache.entries.is_empty());
         assert_eq!(cache.bytes, 0);
+    }
+
+    #[test]
+    fn the_idle_sweep_keeps_this_frame_and_drops_everything_older() {
+        let mut cache = Cache::default();
+        for (file, last_used) in [(0u32, 0u64), (1, 1), (2, 2)] {
+            cache.entries.insert(
+                file,
+                CacheEntry {
+                    bytes: Arc::new(vec![0; 50]),
+                    last_used,
+                },
+            );
+            cache.bytes += 50;
+        }
+        // A sweep within the frame the newest face was stamped in keeps it
+        // and drops the rest — no waiting on a later frame.
+        cache.frame = 2;
+        cache.sweep_idle();
+        assert_eq!(cache.entries.len(), 1);
+        assert!(cache.entries.contains_key(&2), "this frame's face stays");
+        assert_eq!(cache.bytes, 50);
+        assert_eq!(cache.releases, 2);
+        assert_eq!(cache.evictions, 0, "the sweep is not the cap");
+        // One bump later it goes too.
+        cache.frame += 1;
+        cache.sweep_idle();
+        assert!(cache.entries.is_empty());
+        assert_eq!(cache.bytes, 0);
+        assert_eq!(cache.releases, 3);
+        assert_eq!(cache.evictions, 0);
     }
 }

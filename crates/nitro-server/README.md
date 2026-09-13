@@ -70,7 +70,7 @@ on shutdown.
 | `NITRO_INPUT`     | `off`                            | input enabled                  |
 | `NITRO_INPUT_DIR` | directory scanned for `event*`   | `/dev/input`                   |
 | `NITRO_FONT_DIRS` | colon-separated font directories | `/usr/share/fonts:/usr/local/share/fonts:~/.local/share/fonts` (read by `nitro-text`) |
-| `NITRO_FONT_CACHE_MB` | cap on resident font-file bytes | `8` (read by `nitro-text`; 0 caches nothing) |
+| `NITRO_FONT_CACHE_MB` | cap on resident font-file bytes | `8` (read by `nitro-text`; `0` keeps only the file currently in use — the file that overran the cap is never its own victim, so a too-small cap does not turn into one disk read per glyph) |
 | `NITRO_FONT_INDEX_CACHE` | path of the font index cache, or `off` | `$XDG_CACHE_HOME/nitro/fonts.idx` (read by `nitro-text`) |
 | `NITRO_LOG`       | `error`, `warn`, `info`, `debug` | `info`                         |
 
@@ -387,7 +387,11 @@ neither of which a settled desktop does, so the cost is one `read(2)` the
 next time a genuinely new glyph appears. This is what got the server from
 20.4 MB back under its 8 MB RSS budget on the box; `stats`' `fonts_loaded`
 and `font_bytes` are the counters, and `crates/nitro-text/README.md` has
-the measurements.
+the measurements. The cap is a backstop for a frame whose faces do not fit,
+not the mechanism that keeps the steady state small — `nitro-text` keeps
+separate `evictions` (cap) and `releases` (idle) counters, and a non-zero
+`evictions` means a single frame's working set genuinely overran
+`NITRO_FONT_CACHE_MB`.
 
 **`SetText`** is an ordinary mutation: buffered, applied at the client's
 `Commit`, shaped there, and the resulting run stored under the client's

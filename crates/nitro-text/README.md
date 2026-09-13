@@ -167,8 +167,13 @@ of a 16 ms frame. No glyph is ever re-rendered and nothing on screen changes.
 What the server reports: `fonts` (faces indexed), `fonts_loaded` (font files
 resident *now*) and `font_bytes` (their total size). On the test box with text
 on screen those are `47 / 0 / 0` in the settled state and `47 / 3 / 1.9 MB`
-mid-paint. `FontDb::loads()` and `FontDb::evictions()` are the counters behind
-them.
+mid-paint. `FontDb::loads()`, `FontDb::releases()` and `FontDb::evictions()`
+are the counters behind them: loads is the miss counter, releases counts
+files handed back by the idle sweep — rising steadily is the normal rhythm of
+a desktop that paints now and then — and evictions counts files the *cap*
+dropped mid-frame. A non-zero `evictions` means the working set of a single
+frame genuinely did not fit in `NITRO_FONT_CACHE_MB`, a distinct and more
+alarming fact than an ordinary idle release.
 
 A shape only loads the faces it needs: the fallback chain is a list of *ids*,
 and the faces after the primary are read only when the primary cannot map a
