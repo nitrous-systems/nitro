@@ -193,7 +193,11 @@ Two cases would otherwise hang:
   flow control, so it is acknowledged from the last vblank we saw rather
   than held for a frame that will never carry it. Holding it would stall
   any client that waits for `Presented` before sending the next frame, and
-  would grow the pending list without bound.
+  would grow the pending list without bound. There are two shapes of this:
+  a client with no *placed* window — nothing it commits can reach a screen
+  — is answered inline at commit time, and one whose windows are placed
+  but whose transaction produced no damage is answered once the update
+  pass has confirmed there is nothing to paint.
 * A `RequestFrame` from a quiescent desktop — which is exactly how a
   client *starts* an animation. If the answer waited for a flip, and the
   flip waited for damage, and the damage was going to be the client's
@@ -434,10 +438,12 @@ limit of 1024 — but real.
   12. A `RequestFrame` from a settled, idle server is answered with a
       `Frame` carrying a usable deadline, without waiting for a flip that
       would never come.
-  13. A window created before any output exists gets no `Configure` while
-      there is nowhere to put it, then is placed and configured when one
-      is hotplugged in (`plug WxH`), and appears at the cascade's first
-      position.
+  13. A window created before any output exists: its commit is still
+      acknowledged with `Presented` (nothing it drew can reach a screen,
+      so no frame will ever carry that serial), it gets no `Configure`
+      while there is nowhere to put it, and it is placed and configured
+      when an output is hotplugged in (`plug WxH`), appearing at the
+      cascade's first position.
   14. No cursor is drawn until a pointer device reports something: a bare
       desktop is background everywhere, and the arrow appears on the first
       motion.

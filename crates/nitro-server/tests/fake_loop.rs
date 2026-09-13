@@ -924,6 +924,22 @@ fn a_window_created_before_any_output_is_placed_when_one_appears() {
     wait_for("the window to reach the scene", || {
         stat(&h_.request_text("stats\n"), "windows") == 1
     });
+
+    // The commit still has to be acknowledged. Its pixels have nowhere to
+    // appear, so no frame will ever carry the serial; holding it would
+    // stall a client that waits for `Presented` before sending the next
+    // transaction, and would grow the pending list for ever.
+    let presented = expect(
+        &mut conn,
+        &mut seen,
+        "Presented for serial 1",
+        |m| match m {
+            ServerMsg::Presented(p) if p.serial == 1 => Some(*p),
+            _ => None,
+        },
+    );
+    assert_eq!(presented.serial, 1);
+
     let mut out = Vec::new();
     let _ = conn.poll(&mut out);
     assert!(

@@ -1793,13 +1793,24 @@ impl Server {
                 touched.push(id);
             }
         }
-        client.unpresented.push(serial);
         if touched.is_empty() {
             // A client with no placed window has nowhere for its commit to
             // appear. Answer at once rather than holding the serial for a
-            // frame that will never carry it.
-            self.present_now(token, serial);
+            // frame that will never carry it. Built against `client`
+            // directly: it is out of the map for the length of this
+            // function, so anything that looks the client up by token
+            // would silently find nothing.
+            let (output, time_ns, seq) = self.outputs.first().map_or((0, 0, 0), |o| {
+                (o.scene_id.0, o.last_vblank_ns, o.last_sequence)
+            });
+            client.send(&ServerMsg::Presented(msg::Presented {
+                serial,
+                output,
+                time_ns,
+                seq,
+            }));
         } else {
+            client.unpresented.push(serial);
             for output in &mut self.outputs {
                 if touched.contains(&output.scene_id) {
                     output.painting.push((client_key, serial));
@@ -1808,31 +1819,6 @@ impl Server {
         }
         self.wire_clients.insert(token, client);
         true
-    }
-
-    /// Report a commit as presented without a frame behind it.
-    ///
-    /// A transaction that changes no pixel still has to be acknowledged:
-    /// the serial is the client's flow control, and holding it until some
-    /// unrelated damage happens to produce a flip would stall a client that
-    /// waits for `Presented` before sending the next frame — possibly for
-    /// ever, on a desktop where nothing else is moving. The timestamp is
-    /// the last vblank we saw, which is the truthful answer to "when was
-    /// this on screen": it already was, because nothing changed.
-    fn present_now(&mut self, token: u64, serial: u32) {
-        let (output, time_ns, seq) = self.outputs.first().map_or((0, 0, 0), |o| {
-            (o.scene_id.0, o.last_vblank_ns, o.last_sequence)
-        });
-        let Some(client) = self.wire_clients.get_mut(&token) else {
-            return;
-        };
-        client.unpresented.retain(|s| *s != serial);
-        client.send(&ServerMsg::Presented(msg::Presented {
-            serial,
-            output,
-            time_ns,
-            seq,
-        }));
     }
 
     /// Move the fds that came with this transaction's `CreateBuffer`s into
