@@ -221,13 +221,22 @@ D-Bus client is allowed.
   cursor keeps screenshots honest until the hardware plane arrives in M3.
   Measured on the test box (Pentium G3240, i915, 1920×1080@60) with a
   client connected: idle **0.0 % CPU with zero voluntary context
-  switches**, RSS 7.5 MB (client 2.9 MB), flip interval 16.665 ms mean
-  (16.659–16.673), paint 50 µs–15.8 ms per frame (mean 3.7 ms; the maximum
-  is a full-screen repaint, a pointer move is tens of µs),
-  **input-to-photon 2.2–17.3 ms, mean 8.7 ms** — under one frame on
-  average. Three VT round trips with a client connected are clean and
-  input still routes afterwards. Text is still M2, which is the one thing
-  the milestone promised and did not deliver: rects and images only.
+  switches**, RSS 7.5 MB (client 3.2 MB), flip interval 16.666 ms mean
+  (16.653–16.680), paint 0.19 ms mean per pointer-move frame (a
+  full-screen repaint is the 13 ms maximum). **Input-to-photon, measured
+  end to end by `nitro-demo` over 202 samples: median 25.2 ms, p95
+  33.4 ms** — one and a half refreshes, so the "within one refresh"
+  budget is **missed by one frame**. The cause is understood and is not
+  performance: 0.3 ms of that 25 is work, the rest is waiting, because a
+  pointer move damages the cursor and flips *before* the client's answer
+  arrives, so the client's pixels ride the following flip. The server's
+  own i2p is inside budget ([1.2, 17.6] ms) whenever inputs do not
+  collide with an in-flight flip. Full method, distributions and the
+  proposed scheduler fix in `docs/latency.md`; sizes and RSS in
+  `docs/budget.md`. Three VT round trips with a client connected are
+  clean and input still routes afterwards. Text was the one thing the
+  milestone promised and did not deliver — M1 shipped rects and images
+  only — and M2-pre below has since closed that gap.
 - **M2-pre** — **done.** Text end to end. `nitro-text` (swash) does font
   discovery, shaping, layout, measurement and an A8 glyph atlas *in the
   server*; `nitro-wire` grows `SetText`/`MeasureText` and
@@ -237,7 +246,6 @@ D-Bus client is allowed.
   rather than any font type; and `nitro-raster` learns `blit_mask`. A
   client sends a *string*, never a glyph, which is what keeps the remote
   link thin and every app binary small.
-
 - **M2** — `nitro-ui` with arena, passes, `WidgetMut`, six widgets, layout,
   introspection socket, `hey`-style CLI. `nitro-calc` as the first app.
 - **M3** — Shell: bar, launcher, window management (focus, move, resize,

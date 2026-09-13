@@ -531,28 +531,47 @@ limit of 1024 — but real.
       desktop is background everywhere, and the arrow appears on the first
       motion.
 - Hardware: `just deploy`, `just shot`, `just box-chvt 1|2`, `just
-  box-stop` (see `docs/testbox.md`), plus the demo client:
-  `ssh box 'XDG_RUNTIME_DIR=/run/user/1000 ~/nitro-bin/hello_client'`,
-  which opens a gradient-and-rounded-rects window with an image node and
-  prints every `ServerMsg` it receives.
+  box-stop` (see `docs/testbox.md`), plus two clients:
+  `hello_client`, which opens a gradient-and-rounded-rects window with an
+  image node and prints every `ServerMsg` it receives, and **`nitro-demo`**
+  (`crates/nitro-demo/README.md`), which is the measurement instrument:
+  it follows the pointer, keeps its own input-to-photon histogram from
+  `PointerMotion` to `Presented`, and cross-checks it against this
+  server's `i2p_*` over the control socket. `ssh box
+  'XDG_RUNTIME_DIR=/run/user/1000 ~/nitro-bin/nitro-demo --follow --stats'`.
 
 ## Measured on the test box
 
-Pentium G3240, i915, 1920×1080@60, with `hello_client` connected:
+Pentium G3240, i915, 1920×1080@60, with `nitro-demo --follow` connected
+and the pointer being driven at ~100 Hz. Full method and distributions in
+`docs/latency.md`; sizes and RSS in `docs/budget.md`.
 
 | what                     | value                                                     |
 |--------------------------|-----------------------------------------------------------|
-| idle CPU                 | 0.0 %, zero voluntary context switches over 10 s          |
-| RSS                      | server 7.5 MB, `hello_client` 2.9 MB                      |
-| flip interval            | mean 16 665 µs, min 16 659, max 16 673                    |
-| `paint_us`               | min 50, mean 3 663, max 15 791                            |
-| `damage_px_mean`         | 611 406 of 2 073 600                                      |
-| input-to-photon          | min 2 223 µs, mean 8 745 µs, max 17 328 µs                |
+| idle CPU                 | 0.0 %, zero frames in 5 s with a client connected and visible |
+| CPU under load           | 1.5 % animating at 60 Hz, 2.2 % under 100 Hz pointer input |
+| RSS                      | server 7.5 MB (7.6 MB with 5 windows), `nitro-demo` 3.2 MB |
+| flip interval            | mean 16 666 µs, min 16 653, max 16 680                    |
+| `paint_us`               | min 142, mean 189, max 323 per pointer-move frame (13 459 on a full repaint) |
+| `damage_px_mean`         | 1 560 of 2 073 600 in steady state                        |
+| server input-to-photon   | min 17 421 µs, mean 24 165 µs, max 32 035 µs under saturating input; **1 162–17 678 µs when inputs do not collide with an in-flight flip** |
+| client input-to-photon   | median 25 213 µs, p95 33 394 µs over 202 samples          |
 | VT switches              | 3 round trips with a client connected: clean, input still routed |
 
-The paint figures need reading with the workload in mind: the maximum is a
-full-screen repaint, while a pointer move costs tens of microseconds, and
-the damage mean is dominated by the startup full repaints rather than by
-steady state. Input-to-photon averaging under one 16.7 ms frame is the
-number that matters, and it is what the age-2 rule plus "paint only on
-`Flipped`" is supposed to buy.
+Two things need reading carefully.
+
+**The `i2p_*` window depends on the input rate**, which is why two rows
+above disagree. Under saturating input almost every event arrives while a
+flip is in flight and must wait for it, so the minimum is a whole frame.
+Drop the rate below the refresh rate and the same server reports
+1.2–17.7 ms — inside one refresh. The fast path is fast; the number
+measures how often it is reachable.
+
+**The server's figure is not the one to quote.** It ends at the vblank of
+the frame that consumed the input, and for a *client's* response that is
+one flip too early: a pointer move damages the cursor and flips
+immediately, before the client has answered, so the client's pixels ride
+the following flip. `nitro-demo`'s end-to-end median of 25.2 ms is the
+honest figure, it is 1.5 refreshes, and it misses the `DESIGN.md` budget
+by one frame. The cause is structural rather than slow — 0.3 ms of those
+25 is work — and the proposed scheduler fix is issue #529.

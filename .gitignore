@@ -1,4 +1,11 @@
 /target
 /tmp
+# Screenshots are build output, not source: `just shot` and `just
+# fake-shot` drop multi-megabyte readbacks wherever they are run.
 *.png
 !assets/**/*.png
+# Except the ones that are documentation. `docs/*.png` is checked in
+# deliberately (see docs/latency.md) and is kept small on purpose: written
+# by `nitro-demo --save-small`, which downscales to <= 960 px wide and
+# ~40 KB rather than committing a 6 MB full-resolution frame.
+!docs/*.png

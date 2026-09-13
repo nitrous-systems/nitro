@@ -1,0 +1,29 @@
+[package]
+name = "nitro-demo"
+description = "Demo/benchmark client for nitro-server: draws a real scene and measures input-to-photon latency from the client side"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+nitro-core = { workspace = true }
+nitro-wire = { workspace = true }
+# `poll` for the event loop, `memfd_create`/`pwrite` for the image buffer,
+# `clock_gettime` for the client-side clock and `getuid` for the /tmp
+# fallback of the control-socket path. Same crate the rest of the tree uses.
+rustix = { version = "1", features = ["event", "fs", "process", "time"] }
+# SIGINT → a readable fd, so Ctrl-C prints the latency summary instead of
+# killing the process mid-histogram. Already in the tree (nitro-server);
+# `default-features = false` keeps it to `low_level::pipe`.
+signal-hook = { version = "0.4", default-features = false }
+
+[dev-dependencies]
+# The integration test drives the real server loop in-process on the fake
+# backend, exactly as `crates/nitro-server/tests/fake_loop.rs` does.
+nitro-server = { path = "../nitro-server" }
+# For `Image`, the shape a `shot` readback comes back in.
+nitro-kms = { workspace = true }

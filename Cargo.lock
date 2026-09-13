@@ -163,6 +163,18 @@ name = "nitro-core"
 version = "0.0.1"
 
 [[package]]
+name = "nitro-demo"
+version = "0.0.1"
+dependencies = [
+ "nitro-core",
+ "nitro-kms",
+ "nitro-server",
+ "nitro-wire",
+ "rustix",
+ "signal-hook",
+]
+
+[[package]]
 name = "nitro-kms"
 version = "0.0.1"
 dependencies = [

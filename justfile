@@ -28,10 +28,19 @@ fake-shot out="tmp/fake-shot.png":
     mkdir -p tmp && cargo run -q -p nitro-shot -- -o {{out}} && echo "wrote {{out}}"
 
 # ---------------------------------------------------------------------------
+# Budget (see docs/budget.md)
+# ---------------------------------------------------------------------------
+
+# Binary sizes and RSS/HWM of every shipped binary, release build.
+# `just size 5` measures the server with five windows open.
+size windows="1":
+    bash deploy/size.sh {{windows}}
+
+# ---------------------------------------------------------------------------
 # Test box (see docs/testbox.md)
 # ---------------------------------------------------------------------------
 box := env_var_or_default("NITRO_BOX", "kaspar@192.168.1.204")
-box_bins := "nitro-server nitro-shot hello_client"
+box_bins := "nitro-server nitro-shot nitro-demo hello_client"
 
 # Build release, rsync binaries to the box, restart the dev server.
 deploy: (deploy-bins) 
@@ -40,7 +49,7 @@ deploy: (deploy-bins)
 deploy-bins:
     # `--examples` on its own does not build the binaries, so ask for both.
     cargo build --release --workspace --bins --examples
-    cd target/release && rsync -az nitro-server nitro-shot {{box}}:nitro-bin/
+    cd target/release && rsync -az nitro-server nitro-shot nitro-demo {{box}}:nitro-bin/
     cd target/release/examples && rsync -az hello_client {{box}}:nitro-bin/
 
 # Install/refresh the systemd unit on the box (needs sudo there).
