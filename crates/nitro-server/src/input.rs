@@ -30,9 +30,11 @@
 //! Buttons and axis events go to the window the pointer is over, not to the
 //! focused one — the focus follows the click, not the other way round.
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use nitro_core::Point;
@@ -406,12 +408,19 @@ impl std::fmt::Debug for LibinputSource {
 /// the process is forbidden to open `/dev/input/*`; this is the one place,
 /// and it delegates to [`nitro_seat::Seat`], so the fds are the session's
 /// and are revoked on a VT switch like any other.
+///
+/// The bookkeeping matters more than it looks. libinput hands back only
+/// the raw descriptor on close, so the [`nitro_seat::Device`] it belongs to
+/// has to be findable from that number — and it has to be *closed through
+/// the seat*, not merely dropped on the floor. Leaving it open is what
+/// makes `Libinput::resume` fail after a VT switch: libinput closed its
+/// copies at suspend and asks for the same paths again, and libseat
+/// refuses a device it still has open.
 struct SeatInterface {
-    seat: std::rc::Rc<std::cell::RefCell<nitro_seat::Seat>>,
-    /// Devices opened, keyed by the raw fd libinput will hand back on
-    /// close. The `Device` must outlive the fd, and libinput only gives us
-    /// the descriptor, so the map is how we find the right one again.
-    open: std::rc::Rc<std::cell::RefCell<Vec<nitro_seat::Device>>>,
+    seat: Rc<RefCell<nitro_seat::Seat>>,
+    /// Devices currently open, paired with the raw descriptor libinput
+    /// was given for each.
+    open: Vec<(RawFd, nitro_seat::Device)>,
 }
 
 impl input::LibinputInterface for SeatInterface {
@@ -423,27 +432,40 @@ impl input::LibinputInterface for SeatInterface {
             .seat
             .borrow_mut()
             .open_device(path)
-            .map_err(|e| e.raw_os_error().unwrap_or(libc_eacces()))?;
+            .map_err(|e| e.raw_os_error().unwrap_or(EACCES))?;
         let fd = device
             .as_fd()
             .try_clone_to_owned()
-            .map_err(|e| e.raw_os_error().unwrap_or(libc_eacces()))?;
-        self.open.borrow_mut().push(device);
+            .map_err(|e| e.raw_os_error().unwrap_or(EACCES))?;
+        self.open.push((fd.as_raw_fd(), device));
         Ok(fd)
     }
 
     fn close_restricted(&mut self, fd: OwnedFd) {
-        // Dropping the dup closes libinput's copy; the seat's own fd goes
-        // when the `Device` is dropped, which happens when this source is.
+        let raw = fd.as_raw_fd();
+        // Drop libinput's copy first, then give the seat's own fd back, so
+        // the device is genuinely closed and can be reopened at resume.
         drop(fd);
+        let Some(index) = self.open.iter().position(|(r, _)| *r == raw) else {
+            // A descriptor we never handed out: nothing to close, and
+            // nothing that can be done about it either.
+            return;
+        };
+        let (_, device) = self.open.remove(index);
+        if let Ok(mut seat) = self.seat.try_borrow_mut()
+            && let Err(e) = seat.close_device(device)
+        {
+            warn!("closing an input device: {e}");
+        }
+        // A failed borrow means we are inside a seat dispatch, which
+        // cannot happen from libinput; `device` then closes through its
+        // own `Drop`, which routes to the same place.
     }
 }
 
 /// `EACCES`, the errno to report when we have nothing better. Spelling it
 /// out avoids a `libc` dependency for one constant.
-const fn libc_eacces() -> i32 {
-    13
-}
+const EACCES: i32 = 13;
 
 /// Devices found under `/dev/input`, sorted, without udev.
 ///
@@ -484,14 +506,10 @@ impl LibinputSource {
     /// Devices that fail to open are logged and skipped: one broken node
     /// must not cost the user their keyboard.
     #[must_use]
-    pub fn open(
-        seat: std::rc::Rc<std::cell::RefCell<nitro_seat::Seat>>,
-        dir: &Path,
-        devices: std::rc::Rc<std::cell::RefCell<Vec<nitro_seat::Device>>>,
-    ) -> Self {
+    pub fn open(seat: Rc<RefCell<nitro_seat::Seat>>, dir: &Path) -> Self {
         let mut context = input::Libinput::new_from_path(SeatInterface {
             seat,
-            open: devices,
+            open: Vec::new(),
         });
         let mut added = Vec::new();
         for path in event_devices(dir) {

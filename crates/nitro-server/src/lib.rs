@@ -215,14 +215,25 @@ struct FlipStats {
     max: Duration,
 }
 
+/// Intervals longer than this many refresh periods are not counted: the
+/// server deliberately stops flipping when nothing changes, so the gap
+/// across an idle stretch is the *absence* of frames, not a slow one.
+/// Including it would make the figure measure how long the desktop sat
+/// still rather than how evenly it paces when it is painting.
+const FLIP_INTERVAL_MAX_PERIODS: u32 = 4;
+
 impl FlipStats {
-    fn record(&mut self, t: Duration) {
+    fn record(&mut self, t: Duration, refresh_ns: u32) {
         if let Some(prev) = self.last {
             let iv = t.saturating_sub(prev);
-            self.count += 1;
-            self.sum += iv;
-            self.min = Some(self.min.map_or(iv, |m| m.min(iv)));
-            self.max = self.max.max(iv);
+            let cap =
+                Duration::from_nanos(u64::from(refresh_ns) * u64::from(FLIP_INTERVAL_MAX_PERIODS));
+            if iv <= cap {
+                self.count += 1;
+                self.sum += iv;
+                self.min = Some(self.min.map_or(iv, |m| m.min(iv)));
+                self.max = self.max.max(iv);
+            }
         }
         self.last = Some(t);
     }
@@ -261,11 +272,10 @@ struct Server {
     // Held for its drop side effect only; the wire listener unlinks itself.
     _socket_file: SocketFile,
     signals: Option<signals::Signals>,
+    /// Input, which owns the seat `Device`s behind libinput's interface;
+    /// dropping it closes them through the seat, so it must come before
+    /// the seat in this struct's field order.
     input: Box<dyn InputSource>,
-    /// Input device handles, closed through the seat when dropped. They
-    /// must outlive `input`, which holds dups of their descriptors — that
-    /// is the whole reason the field exists, so nothing ever reads it.
-    _input_devices: Rc<RefCell<Vec<Device>>>,
     backend: Box<dyn Backend>,
     _device: Option<Device>,
     seat: Option<Rc<RefCell<Seat>>>,
@@ -347,7 +357,6 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         }
     };
 
-    let input_devices = Rc::new(RefCell::new(Vec::new()));
     let input: Box<dyn InputSource> = match (&seat, config.input_dir.as_deref()) {
         (_, _) if config.fake_input.is_some() => {
             let Some(handle) = config.fake_input.take() else {
@@ -357,7 +366,7 @@ pub fn run(mut config: Config) -> Result<(), Error> {
             Box::new(input::FakeSource::new(handle))
         }
         (Some(seat), Some(dir)) => {
-            let src = LibinputSource::open(Rc::clone(seat), dir, Rc::clone(&input_devices));
+            let src = LibinputSource::open(Rc::clone(seat), dir);
             if src.is_empty() {
                 warn!("no input devices in {}", dir.display());
             }
@@ -401,7 +410,6 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         _socket_file: SocketFile(config.control_path.clone()),
         signals,
         input,
-        _input_devices: input_devices,
         backend,
         _device: device,
         seat,
@@ -749,7 +757,7 @@ impl Server {
             Ok(()) => {
                 self.stats.paint_us.push(paint_us);
                 self.stats.damage_px.push(damage_px);
-                self.outputs[index].committed(region);
+                self.outputs[index].committed();
             }
             Err(e) => {
                 warn!("{id}: commit: {e}");
@@ -872,7 +880,12 @@ impl Server {
                     time,
                 } => {
                     self.frames += 1;
-                    self.flips.record(time);
+                    let refresh_ns = self
+                        .outputs
+                        .iter()
+                        .find(|o| o.kms_id == output)
+                        .map_or(16_666_667, |o| o.refresh_ns);
+                    self.flips.record(time, refresh_ns);
                     debug!("{output} flipped seq={sequence} t={time:?}");
                     self.on_flip(output, sequence, time);
                 }
@@ -1258,9 +1271,18 @@ impl Server {
 
     /// Record that this input event's effect is going into the next frame,
     /// which is what closes the input-to-photon loop when that frame lands.
+    ///
+    /// Only outputs that actually have something to repaint are stamped.
+    /// Input that changes no pixel — a button press a client ignores, a
+    /// motion inside one node — produces no frame, and stamping it anyway
+    /// would leave the timestamp sitting there until some unrelated frame
+    /// minutes later reported the whole gap as latency. The measurement
+    /// has to be "this input, that frame", or it is not a measurement.
     fn note_input(&mut self, time_ns: u64) {
         for output in &mut self.outputs {
-            output.painting_input_ns = output.painting_input_ns.max(time_ns);
+            if output.needs_paint() {
+                output.painting_input_ns = output.painting_input_ns.max(time_ns);
+            }
         }
     }
 
@@ -1770,17 +1792,35 @@ impl Server {
 mod tests {
     use super::*;
 
+    /// 60 Hz, the rate every interval below is measured against.
+    const HZ60: u32 = 16_666_667;
+
     #[test]
     fn flip_stats_track_intervals() {
         let mut s = FlipStats::default();
-        s.record(Duration::from_millis(100));
+        s.record(Duration::from_millis(100), HZ60);
         assert_eq!(s.mean_us(), 0);
-        s.record(Duration::from_millis(116));
-        s.record(Duration::from_millis(134));
+        s.record(Duration::from_millis(116), HZ60);
+        s.record(Duration::from_millis(134), HZ60);
         assert_eq!(s.count, 2);
         assert_eq!(s.min, Some(Duration::from_millis(16)));
         assert_eq!(s.max, Duration::from_millis(18));
         assert_eq!(s.mean_us(), 17_000);
+    }
+
+    #[test]
+    fn an_idle_gap_is_not_a_slow_frame() {
+        let mut s = FlipStats::default();
+        s.record(Duration::from_millis(100), HZ60);
+        s.record(Duration::from_millis(116), HZ60);
+        // The desktop sat still for a minute, then something moved. That
+        // minute is not a flip interval, and counting it would swamp every
+        // real sample.
+        s.record(Duration::from_mins(1), HZ60);
+        s.record(Duration::from_millis(60_016), HZ60);
+        assert_eq!(s.count, 2, "the idle gap was skipped");
+        assert_eq!(s.max, Duration::from_millis(16));
+        assert_eq!(s.mean_us(), 16_000);
     }
 
     #[test]

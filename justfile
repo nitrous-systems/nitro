@@ -31,15 +31,17 @@ fake-shot out="tmp/fake-shot.png":
 # Test box (see docs/testbox.md)
 # ---------------------------------------------------------------------------
 box := env_var_or_default("NITRO_BOX", "kaspar@192.168.1.204")
-box_bins := "nitro-server nitro-shot"
+box_bins := "nitro-server nitro-shot hello_client"
 
 # Build release, rsync binaries to the box, restart the dev server.
 deploy: (deploy-bins) 
     ssh {{box}} 'sudo systemctl restart nitro-dev' && just box-status
 
 deploy-bins:
-    cargo build --release --workspace
-    cd target/release && rsync -az {{box_bins}} {{box}}:nitro-bin/
+    # `--examples` on its own does not build the binaries, so ask for both.
+    cargo build --release --workspace --bins --examples
+    cd target/release && rsync -az nitro-server nitro-shot {{box}}:nitro-bin/
+    cd target/release/examples && rsync -az hello_client {{box}}:nitro-bin/
 
 # Install/refresh the systemd unit on the box (needs sudo there).
 box-install:

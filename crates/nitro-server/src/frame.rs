@@ -60,10 +60,11 @@ pub struct OutputState {
     pub height: u32,
     /// Damage accumulated since the last painted frame.
     pub damage: Damage,
-    /// The region painted into the *other* buffer one frame ago.
+    /// The damage the previous frame consumed — the *damage*, not the
+    /// region painted. Those differ: the region painted is already this
+    /// frame's damage unioned with the last one's, and feeding that back
+    /// would fold every frame's region into the next and never converge.
     pub previous: Vec<IRect>,
-    /// Frames that must still repaint everything (both buffers unknown).
-    pub full_left: u8,
     /// Set when `commit` failed: the damage was kept and the next event
     /// must retry, or this output would stall until the next resume.
     pub retry: bool,
@@ -95,14 +96,15 @@ impl OutputState {
         height: u32,
         refresh_mhz: u32,
     ) -> Self {
+        let mut damage = Damage::new();
+        damage.add(IRect::new(0, 0, width.cast_signed(), height.cast_signed()));
         Self {
             kms_id,
             scene_id,
             width,
             height,
-            damage: Damage::new(),
+            damage,
             previous: Vec::new(),
-            full_left: 2,
             retry: false,
             refresh_ns: refresh_ns(refresh_mhz),
             last_vblank_ns: 0,
@@ -121,9 +123,16 @@ impl OutputState {
     }
 
     /// Both buffers hold unknown pixels (first frame, resume, modeset):
-    /// repaint everything for the next two frames.
+    /// repaint everything.
+    ///
+    /// One rect of damage is all this takes, and it is worth seeing why:
+    /// the whole output becomes this frame's damage, so this frame paints
+    /// everything *and* hands "everything" to the next frame as its
+    /// history — which is exactly the second full repaint the other buffer
+    /// needs. A separate "repaint fully for N frames" counter would say
+    /// the same thing twice, and get it subtly wrong the moment a client
+    /// commits in between the two.
     pub fn invalidate(&mut self) {
-        self.full_left = 2;
         self.previous.clear();
         self.damage.clear();
         self.damage.add(self.bounds());
@@ -132,16 +141,19 @@ impl OutputState {
     /// Whether a frame would put anything new on screen.
     #[must_use]
     pub fn needs_paint(&self) -> bool {
-        self.full_left > 0 || self.retry || !self.damage.is_empty()
+        self.retry || !self.damage.is_empty() || !self.previous.is_empty()
     }
 
-    /// The region to paint into the (age-2) back buffer: this frame's
-    /// damage plus the region painted one frame ago.
+    /// The region to paint into the (age-2) back buffer.
+    ///
+    /// The buffer about to be painted was last on screen two frames ago,
+    /// so what it must be brought up to date with is everything that
+    /// changed since: `damage(n) ∪ damage(n-1)`. Not the *region painted*
+    /// at `n-1` — that was itself a union of two frames' damage, and
+    /// feeding it back would make every frame at least as large as the one
+    /// before it and never shrink again.
     #[must_use]
     pub fn repaint_region(&self) -> Vec<IRect> {
-        if self.full_left > 0 {
-            return vec![self.bounds()];
-        }
         let mut region = Damage::new();
         for r in self.damage.rects() {
             region.add(*r);
@@ -152,10 +164,17 @@ impl OutputState {
         region.take()
     }
 
-    /// Note that a frame covering `region` was painted and committed.
-    pub fn committed(&mut self, region: Vec<IRect>) {
-        self.full_left = self.full_left.saturating_sub(1);
-        self.previous = region;
+    /// Note that the frame just painted was committed.
+    ///
+    /// The history kept is the damage this frame consumed, unconditionally
+    /// — including on a full repaint, where it is the whole output. It has
+    /// to be: a client that commits between the two invalidation frames
+    /// changes the image between them, and that change belongs to the
+    /// second buffer's next repaint. Dropping it leaves one of the two
+    /// buffers permanently missing that client's pixels, which shows up as
+    /// a window that flickers away every other frame.
+    pub fn committed(&mut self) {
+        self.previous = self.damage.take();
         self.damage.clear();
         self.retry = false;
         self.in_flight = std::mem::take(&mut self.painting);
@@ -439,40 +458,91 @@ mod tests {
         assert!(d > late);
     }
 
+    /// Paint one frame and report the region it covered.
+    fn frame(s: &mut OutputState) -> Vec<IRect> {
+        let region = s.repaint_region();
+        s.committed();
+        region
+    }
+
     #[test]
-    fn a_fresh_output_repaints_fully_twice() {
+    fn a_fresh_output_repaints_fully_twice_then_stops() {
         let mut s = state();
         assert!(s.needs_paint());
-        assert_eq!(s.repaint_region(), [s.bounds()]);
-        s.committed(vec![s.bounds()]);
-        assert_eq!(s.full_left, 1);
-        assert_eq!(s.repaint_region(), [s.bounds()]);
-        s.committed(vec![s.bounds()]);
-        assert_eq!(s.full_left, 0);
+        assert_eq!(frame(&mut s), [s.bounds()]);
+        assert_eq!(frame(&mut s), [s.bounds()]);
+        // Both buffers now hold the same correct image, so a third frame
+        // has nothing to do at all. Carrying the *painted region* forward
+        // instead of the damage is what used to repaint the whole screen
+        // for ever after.
         assert!(!s.needs_paint());
+        assert!(s.repaint_region().is_empty());
+    }
+
+    #[test]
+    fn damage_arriving_between_the_two_full_frames_still_reaches_both_buffers() {
+        // The regression the fake-backend integration test caught: a client
+        // that commits after the first full frame but before the second.
+        // Its pixels are in the second buffer because that frame was full;
+        // they reach the first only if the damage is carried forward.
+        let mut s = state();
+        assert_eq!(frame(&mut s), [s.bounds()]);
+        let window = IRect::new(0, 0, 40, 30);
+        s.damage.add(window);
+        assert_eq!(
+            frame(&mut s),
+            [s.bounds()],
+            "the second frame is still full"
+        );
+        assert!(s.needs_paint(), "the other buffer still lacks the window");
+        // And it costs exactly the window, not another full screen: the
+        // first buffer was already repainted in full, so the window is the
+        // only thing that changed since.
+        assert_eq!(frame(&mut s), [window]);
+        assert!(!s.needs_paint());
+    }
+
+    #[test]
+    fn a_small_change_repaints_a_small_region_for_two_frames_then_nothing() {
+        let mut s = state();
+        frame(&mut s);
+        frame(&mut s);
+        let moved = IRect::new(10, 10, 4, 4);
+        s.damage.add(moved);
+        // The frame that draws it, and the one after (whose buffer is two
+        // frames stale), both repaint exactly that rect — and no more.
+        assert_eq!(frame(&mut s), [moved]);
+        assert_eq!(frame(&mut s), [moved]);
+        // Both buffers are now current again.
+        assert!(!s.needs_paint());
+        assert!(s.repaint_region().is_empty());
     }
 
     #[test]
     fn the_repaint_region_is_this_frame_plus_the_last() {
         let mut s = state();
-        s.full_left = 0;
+        s.damage.clear();
         s.previous = vec![IRect::new(0, 0, 10, 10)];
-        s.damage.add(IRect::new(60, 30, 10, 10));
+        let fresh = IRect::new(60, 30, 10, 10);
+        s.damage.add(fresh);
         let region = s.repaint_region();
         assert!(region.contains(&IRect::new(0, 0, 10, 10)), "{region:?}");
-        assert!(region.contains(&IRect::new(60, 30, 10, 10)), "{region:?}");
-        s.committed(region);
-        // The new frame's history is what it just painted, and the damage
-        // is spent.
-        assert_eq!(s.previous.len(), 2);
+        assert!(region.contains(&fresh), "{region:?}");
+        s.committed();
+        // The history kept is this frame's damage alone, so the next frame
+        // repaints `fresh` and not the rect inherited from the one before.
+        assert_eq!(s.previous, [fresh]);
         assert!(s.damage.is_empty());
-        assert!(!s.needs_paint());
+        assert_eq!(s.repaint_region(), [fresh]);
+        s.committed();
+        assert!(!s.needs_paint(), "and then it is done");
     }
 
     #[test]
     fn a_failed_commit_keeps_the_region_and_asks_for_a_retry() {
         let mut s = state();
-        s.full_left = 0;
+        s.damage.clear();
+        s.previous.clear();
         let region = vec![IRect::new(4, 4, 8, 8)];
         s.commit_failed(&region);
         assert!(s.retry);
@@ -481,14 +551,16 @@ mod tests {
     }
 
     #[test]
-    fn invalidate_forces_a_full_repaint() {
+    fn invalidate_forces_two_full_repaints() {
         let mut s = state();
-        s.full_left = 0;
-        s.previous = vec![IRect::new(0, 0, 4, 4)];
+        frame(&mut s);
+        frame(&mut s);
+        assert!(!s.needs_paint());
         s.invalidate();
-        assert_eq!(s.full_left, 2);
         assert!(s.previous.is_empty());
-        assert_eq!(s.repaint_region(), [s.bounds()]);
+        assert_eq!(frame(&mut s), [s.bounds()]);
+        assert_eq!(frame(&mut s), [s.bounds()], "both buffers were unknown");
+        assert!(!s.needs_paint());
     }
 
     #[test]
