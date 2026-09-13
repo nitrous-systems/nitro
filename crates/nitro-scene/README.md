@@ -68,6 +68,15 @@ tree, tests included. Storing the measured size alongside the handle is what
 lets `paint_list` place a centred or right-aligned block without ever
 consulting the store.
 
+One rule the rasterizer must uphold for text, and only for text: **a run is
+clipped to its node's bounds**. Every other kind's geometry *is* its bounds,
+so it cannot paint outside them; a shaped run's extent is whatever the shaper
+produced, and it may well overflow the box the client laid out. Since damage
+is computed from the bounds alone, a pixel drawn outside them is a pixel
+nothing will ever repaint — it survives the next `set_text`, the node's
+destruction and the window's close, as a ghost. The node's bounds are the
+box, in the ordinary typographic sense, and overflow is clipped.
+
 Every node carries the common properties (`bounds`, `opacity`, `visible`), its
 `ClientId` for ownership checks, its parent and its ordered children. Children
 are stored **back to front**: later children paint on top and win hit tests,

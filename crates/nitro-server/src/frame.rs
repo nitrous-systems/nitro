@@ -389,6 +389,22 @@ fn paint_item(
             // The glyphs themselves live in the text engine's atlas; the
             // scene knows only the handle, the already-aligned origin and
             // the colour. Everything about fonts stops here.
+            //
+            // Narrowed to `item.bounds` — the node's box — and that is a
+            // correctness requirement, not tidiness. Every other kind's
+            // geometry *is* its bounds, so it cannot paint outside them;
+            // a text run's is not. A run wider or taller than the box it
+            // was given (a long unwrapped label, a descender below a tight
+            // `bounds.h`) would otherwise put pixels outside the rectangle
+            // the scene damaged for it — and since the *next* mutation
+            // damages only that same rectangle, the spill would never be
+            // repainted and would sit on screen as a ghost. Clipping to
+            // the box is what keeps the damage contract true, and it is
+            // what the node's bounds are for.
+            let clip = clip.intersect(&item.bounds);
+            if clip.is_empty() {
+                return;
+            }
             text.paint(
                 canvas,
                 &clip,
@@ -592,5 +608,93 @@ mod tests {
             106
         );
         assert_eq!(region_area(&[]), 0);
+    }
+
+    /// A shaped run that overflows its node's bounds must not paint outside
+    /// them.
+    ///
+    /// Text is the first node kind that *can* break the damage contract:
+    /// every other kind's geometry is its bounds, so it cannot paint outside
+    /// them, but a run's extent is whatever the shaper produced. The scene
+    /// damages `world_bounds` — computed from `node.bounds` alone — so a
+    /// pixel drawn outside the box is a pixel nothing will ever repaint: it
+    /// survives the next `SetText`, the node's destruction and the window's
+    /// close, as a ghost.
+    ///
+    /// Tested here, on `paint_item` directly, rather than through the fake
+    /// backend, because a screenshot cannot see it. The backend double
+    /// buffers: the frame that draws the overflowing run and the frame that
+    /// replaces it land in *different* buffers, and a shot returns whichever
+    /// is on the front — so the spill is real, is in a buffer, and is
+    /// invisible to `shot` until the buffers happen to rotate. One canvas and
+    /// one call have no such ambiguity.
+    #[test]
+    fn a_text_run_is_clipped_to_its_nodes_bounds() {
+        let db = nitro_text::FontDb::scan();
+        if db.is_empty() {
+            eprintln!("skipping: no fonts on this box");
+            return;
+        }
+        let mut engine = crate::text::TextEngine::new();
+        if !engine.has_fonts() {
+            eprintln!("skipping: no fonts on this box");
+            return;
+        }
+
+        // A long unwrapped run in a deliberately small box.
+        let request = crate::text::StyleRequest::new("sans", 20.0, 400, false, 0.0, false);
+        let (key, shaped) = engine.shape(1, &request, "wwwwwwwwwwwwwwwwwwwwwwwwwwwwww");
+        let (block_w, block_h) = (shaped.width, shaped.height);
+        let bounds = IRect::new(20, 20, 40, 18);
+        assert!(
+            block_w > bounds.w as f32,
+            "the test needs an overflowing run: {block_w} vs {}",
+            bounds.w
+        );
+
+        // A canvas far larger than the box, so a spill has somewhere to land.
+        let (w, h) = (320u32, 64u32);
+        let stride = w * 4;
+        let mut data = vec![0u8; (stride * h) as usize];
+        let mut canvas = Canvas::new(&mut data, w, h, stride);
+        let surface = canvas.bounds();
+
+        let item = PaintItem {
+            node: nitro_scene::NodeKey::from_parts(0, 0),
+            window: nitro_scene::WindowKey::from_parts(0, 0),
+            kind: PaintKind::Text {
+                key: key.0,
+                origin: nitro_core::Point::new(0.0, 0.0),
+                color: Color::WHITE,
+            },
+            transform: nitro_core::Transform::translate(bounds.x as f32, bounds.y as f32),
+            // The clip the frame path would hand it: the whole damage rect.
+            clip: surface,
+            opacity: 1.0,
+            // What the scene damaged, and therefore the only pixels that may
+            // be touched.
+            bounds,
+        };
+        paint_item(&mut canvas, &surface, &item, &Scene::new(), &mut engine);
+
+        let mut inside = 0u32;
+        for y in 0..h {
+            for x in 0..w {
+                let o = (y * stride + x * 4) as usize;
+                let lit = data[o] != 0 || data[o + 1] != 0 || data[o + 2] != 0;
+                let in_bounds = bounds.contains(x.cast_signed(), y.cast_signed());
+                assert!(
+                    !lit || in_bounds,
+                    "glyph pixel at ({x},{y}), outside the node's bounds {bounds:?}"
+                );
+                if lit {
+                    inside += 1;
+                }
+            }
+        }
+        assert!(
+            inside > 10,
+            "expected glyphs inside the box, found {inside} (block {block_w}x{block_h})"
+        );
     }
 }

@@ -42,6 +42,15 @@ pub enum PaintKind {
     /// applied, so the painter only has to walk the run's lines and glyphs
     /// and offset them by this point. The colour is the node's; the item's
     /// `opacity` applies on top of it as for every other kind.
+    ///
+    /// **The painter must clip the run to the item's `bounds`.** This is the
+    /// one kind whose content can exceed the rectangle it was given: `Rect`
+    /// and `Image` are defined *by* their bounds, but a run's extent is
+    /// whatever the shaper produced, and a long unwrapped label or a
+    /// descender below a tight `bounds.h` overflows. Damage is computed from
+    /// the bounds alone, so a pixel outside them is a pixel nothing will
+    /// ever repaint: it would survive the next `set_text`, the node's
+    /// destruction and the window's close, as a ghost.
     Text {
         /// Handle into the text store that owns the shaped run.
         key: u32,

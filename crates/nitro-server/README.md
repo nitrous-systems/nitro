@@ -24,10 +24,16 @@ finds it without being configured. A connection opens with `Hello`
 (version, capability bits, server name). One capability bit is set in
 M2 — `TEXT` (bit 1), and only when the startup font scan actually found a
 face, because the bit is a promise that a `Text` node will draw something.
-Direct scanout and dma-buf surfaces remain M3/M5 work, and a zero bit is
-the protocol's way of saying "this does not exist yet": a client that
-asks for a `Surface` node gets `WrongKind` and the connection closes,
-rather than discovering at runtime that the feature silently did nothing.
+Note what it does *not* gate: `Text` nodes and `SetText` are accepted
+either way, and a fontless server shapes to an empty run and answers a
+well-formed `TextMetrics` of zero width. Killing the connection over a
+missing font would make "no fonts installed" a fatal error for every
+client on the box; the bit instead answers the question a client can act
+on — is it worth laying out for text at all? Direct scanout and dma-buf
+surfaces remain M3/M5 work, and there a zero bit *is* the protocol's way
+of saying "this does not exist yet": a client that asks for a `Surface`
+node gets `WrongKind` and the connection closes, rather than discovering
+at runtime that the feature silently did nothing.
 
 The **control socket** is the v0 line protocol and stays as the server's
 own test and debug channel — it is what `nitro-shot` and the integration
@@ -308,7 +314,12 @@ boundary, which is exactly what a caret needs.
 **Painting.** `PaintKind::Text` reaches `TextEngine::paint`, which
 resolves each glyph to an atlas mask (rasterizing on a miss) and blits it
 with `Canvas::blit_mask` — A8 coverage times the node's colour,
-source-over, inside the damage clip like every other item. Glyphs are
+source-over, inside the damage clip like every other item, **and inside
+the node's bounds**, which is the one rule text adds. Every other kind's
+geometry is its bounds and so cannot escape them; a run's is whatever the
+shaper produced. Damage is computed from the bounds, so a glyph pixel
+outside them is one nothing will ever repaint — it would outlive the next
+`SetText`, the node and the window, as a ghost. Glyphs are
 rasterized at the **device** size: the engine reads the scale out of the
 paint item's world transform, so a 2x output gets real 2x glyphs rather
 than a magnified 1x bitmap, and neither the scene nor the rasterizer has

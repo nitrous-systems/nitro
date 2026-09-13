@@ -1313,6 +1313,61 @@ fn mask_sub_rect_in_the_middle_of_a_page() {
 }
 
 #[test]
+fn mask_at_the_bottom_right_of_a_page_is_valid_and_blits() {
+    // The regression this guards. A glyph packed onto an atlas page's last
+    // shelf, at `y + h == PAGE` and `x > 0`, is followed by `PAGE * h - x`
+    // bytes — fewer than `stride * h`. Demanding a full final row rejected
+    // exactly those glyphs, and rejected them *silently*: `blit_mask`
+    // returned early and they simply never appeared.
+    const PAGE: u32 = 32;
+    let mut rng = Rng::new(0x0BAD_5EED_0BAD_5EED);
+    let page = mask_page(PAGE, PAGE, PAGE, &mut rng);
+    let (gw, gh) = (5u32, 4u32);
+    // Bottom-right corner: the last row of the glyph is the last row of the
+    // page, and there is nothing at all after its last pixel.
+    let (gx, gy) = (PAGE - gw, PAGE - gh);
+    let tail = &page[(gy * PAGE + gx) as usize..];
+    assert_eq!(
+        tail.len() as u32,
+        (gh - 1) * PAGE + gw,
+        "the slice is exactly the documented minimum"
+    );
+    let mask = mask_of(tail, gw, gh, PAGE);
+    assert!(
+        mask.is_valid(),
+        "a mask ending flush with the page must be valid"
+    );
+
+    let mut s = Surface::new(12, 8);
+    let clip = s.canvas().bounds();
+    s.canvas().fill_irect(&clip, &clip, Color::BLACK);
+    s.canvas().blit_mask(&clip, 1, 1, &mask, Color::WHITE, 1.0);
+    for y in 0..gh {
+        for x in 0..gw {
+            let want = page[((gy + y) * PAGE + gx + x) as usize];
+            let (px, py) = ((1 + x).cast_signed(), (1 + y).cast_signed());
+            assert_eq!(s.bgr(px, py).0, want, "({x},{y})");
+        }
+    }
+
+    // One byte short of that minimum is still invalid, and still a no-op.
+    let short = mask_of(&tail[..tail.len() - 1], gw, gh, PAGE);
+    assert!(!short.is_valid());
+    let mut t = Surface::new(12, 8);
+    t.canvas().fill_irect(&clip, &clip, Color::BLACK);
+    t.canvas().blit_mask(&clip, 1, 1, &short, Color::WHITE, 1.0);
+    for y in 0..8 {
+        for x in 0..12 {
+            assert_eq!(
+                t.bgr(x, y),
+                (0, 0, 0),
+                "a truncated mask must paint nothing ({x},{y})"
+            );
+        }
+    }
+}
+
+#[test]
 fn mask_degenerate_inputs_are_no_ops() {
     let data = mask_flat(8, 8, 255);
     let mut s = Surface::new(12, 8);

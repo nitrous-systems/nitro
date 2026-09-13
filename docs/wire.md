@@ -123,7 +123,7 @@ containing the transaction reached the screen.
 | bit | name | meaning |
 |---|---|---|
 | 0 | `DIRECT_SCANOUT` | the server can scan a client buffer out without compositing |
-| 1 | `TEXT` | `Text` nodes are accepted (M2) |
+| 1 | `TEXT` | the server has fonts, so `Text` nodes will actually draw (M2) |
 | 2 | `DMABUF` | `Surface` nodes backed by dma-bufs are accepted (M5) |
 | 3 | `REMOTE` | the link is remote: buffers are expensive, text is cheap |
 
@@ -157,10 +157,13 @@ logs and is never parsed.
 | `Fill` tag | `None` 0, `Solid` 1, `Linear` 2 |
 
 A value outside the list is a decode error, not a silently-ignored
-unknown. `Text` and `Surface` decode but are rejected by a v1 server
-unless the matching capability bit is set. `Text` is **no longer
-reserved**: it is accepted when the `TEXT` capability bit is set, and its
-content and style are given by `SetText`.
+unknown. `Surface` decodes but is rejected by the server, which
+advertises no `DMABUF` capability. `Text` is **no longer reserved**: the
+node kind is accepted unconditionally and `SetText` always applies. What
+the `TEXT` capability bit reports is whether the server found a font to
+draw with — a client that ignores the bit gets working, well-formed
+metrics for an empty run and paints nothing, rather than a dead
+connection. Check the bit before you rely on text being *visible*.
 
 `window_flags`: `UNDECORATED` 1, `FULLSCREEN` 2, `OPAQUE` 4. Unknown bits
 are reserved and must be zero.
@@ -194,8 +197,8 @@ Assigned in blocks of 0x100 so a block can grow without renumbering.
 | `0x0203` | `SetFill` | style |
 | `0x0204` | `SetCorners` | style |
 | `0x0205` | `SetBorder` | style |
-| `0x0206` | `SetText` | style (needs `TEXT`) |
-| `0x0207` | `MeasureText` | style (needs `TEXT`) |
+| `0x0206` | `SetText` | style (see `TEXT`) |
+| `0x0207` | `MeasureText` | style (see `TEXT`) |
 | `0x0301` | `CreateBuffer` | buffers |
 | `0x0302` | `DestroyBuffer` | buffers |
 | `0x0303` | `BufferDamage` | buffers |
@@ -390,8 +393,12 @@ Fixed head 21 bytes (`4+4+2+1+4+1+1+4`), then `family`, then `text`.
 Applies at the next `Commit`, like every other mutation. The server does
 the shaping — clients send strings and style, never glyph pixels — and
 answers with one `TextMetrics` for **each node it (re)shaped in that
-commit**. Requires the `TEXT` capability bit; on a node that is not a
-`Text` node it is a `WrongKind` error.
+commit**. On a node that is not a `Text` node it is a `WrongKind` error.
+
+The `TEXT` capability bit does **not** gate acceptance: a server with no
+fonts still applies `SetText` and still answers `TextMetrics`, for an
+empty run of zero width. The bit tells a client whether text will be
+*visible*, which is the question a client can actually act on.
 
 Text is **LTR-only in M2**: no bidi, no rich text, one style per node.
 
@@ -415,7 +422,8 @@ Answered **immediately on receipt**, not at the next commit, with a
 request/response pair in the protocol: a text field needs a measurement
 before it can lay itself out, so making it wait for a commit would
 deadlock the layout it is part of. It creates no node and mutates
-nothing. Requires the `TEXT` capability bit.
+nothing. Answered whether or not the `TEXT` bit is set; without fonts the
+answer is an empty measurement rather than an error.
 
 ### `CreateBuffer` — 0x0301 — **carries 1 fd**
 
@@ -597,9 +605,14 @@ Same fields as `PointerEnter`.
 | `descent` | `f32` | descent of the last line below its baseline |
 | `line_count` | `u32` | number of laid-out lines |
 
-Sent for every node the server (re)shaped in a commit — the answer to
-`SetText`, and also to anything else that forces a reshape (a new
-`SetBounds` with wrapping on, a scale change).
+Sent for every node the server (re)shaped in a commit — that is, one per
+`SetText` that was applied. Nothing else triggers a reshape in M2: the
+wrap width comes only from `SetText`, so a later `SetBounds` re-*places*
+the existing block (and re-aligns it inside the new box) without
+re-shaping it, and an output scale change re-rasterizes the glyphs at the
+new device size without changing the layout. Reshaping on a bounds or
+scale change is a later decision, and would need this sentence to change
+with it.
 
 ### `TextMeasured` — 0x8302
 

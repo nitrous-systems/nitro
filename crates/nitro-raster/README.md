@@ -138,10 +138,20 @@ Coverage combines with the tint's alpha and the opacity through the same
 blend is the crate's one blend; `mask_blend_matches_float_reference` checks
 it against the float reference on random coverage/colour/opacity.
 
-An empty or invalid mask (`!Mask::is_valid()` — zero extent, `stride < w`, or
-`data` shorter than `stride * h`), a transparent colour, `opacity <= 0` and an
-empty clip are all no-ops. Coverage 0 skips the pixel; with an opaque colour
-at opacity 1, coverage 255 *stores* instead of blending.
+An empty or invalid mask, a transparent colour, `opacity <= 0` and an empty
+clip are all no-ops. Coverage 0 skips the pixel; with an opaque colour at
+opacity 1, coverage 255 *stores* instead of blending.
+
+`Mask::is_valid()` wants a non-zero extent, `stride >= w`, and
+`(h - 1) * stride + w` bytes — **not** `stride * h`. That difference is the
+point of the type. A mask is a strided *view* into somebody else's buffer,
+and a glyph packed flush against the bottom of an atlas page has no bytes at
+all after its last pixel: a full final row exists only if the glyph is not
+at the page's edge. Demanding one rejected exactly those glyphs, and
+rejected them silently — `blit_mask` returned early and they were never
+drawn, with no error and no counter moving. `(h - 1) * stride + w` is the
+last byte the blit loop can touch, so it is the honest requirement;
+`mask_at_the_bottom_right_of_a_page_is_valid_and_blits` pins it.
 
 `blit_masks` is exactly `blit_mask` in a loop (asserted byte-identical in
 `mask_batch_equals_a_loop_of_single_blits`) with the per-call setup — the

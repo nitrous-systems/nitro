@@ -237,10 +237,13 @@ impl Image<'_> {
 /// An 8-bit coverage mask: one byte of alpha per pixel.
 ///
 /// Rows are `stride` bytes apart, so a sub-rectangle of a bigger atlas page
-/// can be blitted without a copy.
+/// can be blitted without a copy — which is exactly how the glyph painter
+/// uses it: `data` starts at the sub-rect's first byte and runs to the end
+/// of the page, so the *last* row is `w` bytes, not `stride`.
 #[derive(Debug, Clone, Copy)]
 pub struct Mask<'a> {
-    /// Coverage bytes, `stride * h` at least.
+    /// Coverage bytes. At least `(h - 1) * stride + w` of them; see
+    /// [`Mask::is_valid`].
     pub data: &'a [u8],
     /// Width in pixels.
     pub w: u32,
@@ -251,14 +254,25 @@ pub struct Mask<'a> {
 }
 
 impl Mask<'_> {
-    /// Whether the mask is usable: non-zero extent, stride covering the
-    /// width, and enough data for `stride * h`.
+    /// Whether the mask is usable: non-zero extent, a stride covering the
+    /// width, and enough data to reach the last pixel.
+    ///
+    /// The bound is `(h - 1) * stride + w`, **not** `stride * h`, and the
+    /// difference is the whole point of the type. A mask is a strided view
+    /// into somebody else's buffer, and when it sits at the bottom of an
+    /// atlas page the bytes after its last pixel simply do not exist: a
+    /// glyph packed at `y + h == PAGE` with `x > 0` leaves only
+    /// `PAGE * h - x` bytes behind it. Requiring a full final row rejected
+    /// exactly those glyphs, and rejected them *silently* — they stopped
+    /// being drawn with no counter moving and no error anywhere. The blit
+    /// loop never reads past `(h - 1) * stride + w`, so that is the honest
+    /// requirement.
     #[must_use]
     pub fn is_valid(&self) -> bool {
         if self.w == 0 || self.h == 0 || self.stride < self.w {
             return false;
         }
-        let need = u64::from(self.stride) * u64::from(self.h);
+        let need = u64::from(self.h - 1) * u64::from(self.stride) + u64::from(self.w);
         self.data.len() as u64 >= need
     }
 }

@@ -111,10 +111,10 @@ tag_enum! {
         Rect = 2,
         /// A region of a client buffer.
         Image = 3,
-        /// Shaped text run; accepted when the server reports
-        /// [`caps::TEXT`]. The client sends the string and its style with
+        /// Shaped text run. The client sends the string and its style with
         /// [`SetText`](crate::msg::SetText) and the server does the
-        /// shaping.
+        /// shaping. Always accepted; [`caps::TEXT`] reports whether the
+        /// server has a font, and so whether the text will be *visible*.
         Text = 4,
         /// External surface (dma-buf, Wayland adapter). Reserved for M5.
         Surface = 5,
@@ -229,7 +229,13 @@ pub mod caps {
     /// The server can scan out client buffers directly (no copy) when a
     /// node covers a whole output.
     pub const DIRECT_SCANOUT: u32 = 1 << 0;
-    /// The server accepts `Text` nodes (M2).
+    /// The server found at least one font, so `Text` nodes will actually
+    /// draw (M2).
+    ///
+    /// `Text` nodes and `SetText` are accepted either way — a fontless
+    /// server shapes to an empty run rather than killing the connection.
+    /// The bit answers the question a client can act on: is it worth
+    /// laying out for text at all?
     pub const TEXT: u32 = 1 << 1;
     /// The server accepts `Surface` nodes backed by dma-bufs (M5).
     pub const DMABUF: u32 = 1 << 2;

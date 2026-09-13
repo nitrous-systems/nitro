@@ -10,8 +10,13 @@ use crate::layout::ShapedText;
 
 /// Handle to a [`ShapedText`] in a [`TextStore`].
 ///
-/// Keys are never reused: the counter is monotonic, so a key that outlives its
-/// entry misses rather than aliasing a later one.
+/// Keys are handed out from a counter that only ever counts up, so a key that
+/// outlives its entry misses rather than aliasing a later one. The counter
+/// wraps at `u32::MAX` — after four billion `SetText`s in one session it
+/// could in principle collide with a key still in use, which needs a client
+/// re-setting text every frame for a couple of years. Worth knowing about,
+/// not worth a wider key: the failure mode is a label drawing the wrong
+/// string, not memory unsafety.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TextKey(pub u32);
 

@@ -444,4 +444,74 @@ mod tests {
         assert!(long.starts_with(cut));
         assert!(cut.chars().all(|c| c == 'é'));
     }
+
+    /// Every mask the atlas hands out must be blittable, including the ones
+    /// packed flush against a page's bottom or right edge.
+    ///
+    /// This is the end of a chain that used to fail *silently*: the atlas
+    /// legitimately places a glyph at `y + h == PAGE`, the paint path slices
+    /// the page from that glyph's first byte, and a `Mask` validity rule that
+    /// demanded a whole final row rejected the slice — so `blit_mask`
+    /// returned early and the glyph was never drawn, with no error and no
+    /// counter moving. Nothing above the rasterizer could notice, which is
+    /// exactly why the check belongs here, on the real page geometry.
+    #[test]
+    fn every_atlas_mask_is_blittable_including_the_last_shelf() {
+        use nitro_raster::Mask;
+        use nitro_text::{Atlas, FontDb, GlyphKey};
+
+        let db = FontDb::scan();
+        if db.is_empty() {
+            eprintln!("skipping: no fonts on this box");
+            return;
+        }
+        let style = nitro_text::TextStyle::default();
+        let Some(font) = db.select(&style) else {
+            eprintln!("skipping: no face selected");
+            return;
+        };
+
+        // Push enough distinct keys through to fill at least one page, so the
+        // last shelf of a full page is actually exercised.
+        let mut atlas = Atlas::new();
+        let mut checked = 0u32;
+        let mut edge = 0u32;
+        let mut glyph = 1u16;
+        while atlas.page_count() < 2 && glyph < 3000 {
+            for subpx in 0..4u8 {
+                let key = GlyphKey::new(font, glyph, 24.0, f32::from(subpx) * 0.25);
+                let Some(info) = atlas.get(&db, key) else {
+                    continue;
+                };
+                let page = atlas.page(info.page).expect("the page the atlas named");
+                assert!(
+                    info.x + info.w <= Atlas::PAGE && info.y + info.h <= Atlas::PAGE,
+                    "mask {info:?} leaves its page"
+                );
+                let offset = (info.y * Atlas::PAGE + info.x) as usize;
+                let data = page.get(offset..).expect("offset inside the page");
+                let mask = Mask {
+                    data,
+                    w: info.w,
+                    h: info.h,
+                    stride: Atlas::PAGE,
+                };
+                assert!(
+                    mask.is_valid(),
+                    "atlas handed out an unblittable mask: {info:?} (slice {} bytes)",
+                    data.len()
+                );
+                if info.y + info.h == Atlas::PAGE || info.x + info.w == Atlas::PAGE {
+                    edge += 1;
+                }
+                checked += 1;
+            }
+            glyph = glyph.wrapping_add(1).max(1);
+        }
+        assert!(checked > 0, "no glyph produced a mask");
+        eprintln!(
+            "checked {checked} masks over {} page(s), {edge} flush with an edge",
+            atlas.page_count()
+        );
+    }
 }
