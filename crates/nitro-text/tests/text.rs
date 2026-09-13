@@ -288,7 +288,9 @@ fn an_empty_db_selects_nothing_and_shapes_nothing() {
     assert!(db.select(&style()).is_none());
     assert!(db.fallbacks(&style()).is_empty());
     assert!(db.family_name(FontId(0)).is_none());
-    assert!(db.face_data(FontId(0)).is_none());
+    assert!(db.face(FontId(0)).is_none());
+    assert!(db.face_path(FontId(0)).is_none());
+    assert_eq!(db.loaded_bytes(), 0);
 
     let mut layout = Layout::new();
     let shaped = layout.shape(&db, "Hello", &style(), Some(100.0), true);
@@ -351,10 +353,11 @@ fn timings() {
     let db = FontDb::scan();
     let wall = start.elapsed();
     eprintln!(
-        "FontDb::scan: {:?} (self-reported {:?}), {} faces",
+        "FontDb::scan: {:?} (self-reported {:?}), {} faces, index cache {}",
         wall,
         db.scan_time(),
-        db.len()
+        db.len(),
+        if db.used_index_cache() { "hit" } else { "miss" }
     );
     if db.is_empty() {
         eprintln!("skipping shape timing: no fonts found");
@@ -404,5 +407,335 @@ fn timings() {
         start.elapsed(),
         atlas.renders(),
         atlas.page_count()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Lazy face loading (issue #528)
+// ---------------------------------------------------------------------------
+
+/// A directory holding real font files, for the lazy-loading tests: the
+/// system's font dirs are scanned for the largest few files and those are
+/// taken as-is. `None` when the box has no fonts, like [`db()`].
+fn font_files(count: usize) -> Option<Vec<std::path::PathBuf>> {
+    fn walk(dir: &std::path::Path, depth: u32, out: &mut Vec<std::path::PathBuf>) {
+        if depth > 6 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, depth + 1, out);
+            } else if path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("ttf") || e.eq_ignore_ascii_case("otf"))
+            {
+                out.push(path);
+            }
+        }
+    }
+    let dirs: Vec<std::path::PathBuf> = match std::env::var("NITRO_FONT_DIRS") {
+        Ok(v) => v
+            .split(':')
+            .filter(|s| !s.is_empty())
+            .map(Into::into)
+            .collect(),
+        Err(_) => vec!["/usr/share/fonts".into(), "/usr/local/share/fonts".into()],
+    };
+    let mut found = Vec::new();
+    for dir in &dirs {
+        walk(dir, 0, &mut found);
+    }
+    found.sort();
+    found.dedup();
+    if found.len() < count {
+        eprintln!("skipping: need {count} font files, found {}", found.len());
+        return None;
+    }
+    found.truncate(count);
+    Some(found)
+}
+
+/// Size of a file on disk, 0 when it cannot be stat'ed.
+fn file_len(path: &std::path::PathBuf) -> u64 {
+    std::fs::metadata(path).map_or(0, |m| m.len())
+}
+
+/// Copy `files` into a fresh temp directory, so a test owns its font dir.
+fn temp_font_dir(tag: &str, files: &[std::path::PathBuf]) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("nitro-text-{tag}-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).expect("temp font dir");
+    for (i, src) in files.iter().enumerate() {
+        let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("ttf");
+        std::fs::copy(src, dir.join(format!("f{i}.{ext}"))).expect("copy a font file");
+    }
+    dir
+}
+
+/// The headline property of the lazy db: a scan indexes the faces and holds
+/// **no font bytes**; the first shape loads exactly the file it needs.
+#[test]
+fn a_scan_holds_no_bytes_until_a_face_is_used() {
+    let Some(files) = font_files(4) else { return };
+    let dir = temp_font_dir("lazy", &files);
+    let db = FontDb::scan_dirs(&[&dir]);
+    assert!(!db.is_empty(), "the copied fonts must index");
+
+    assert_eq!(db.loaded_bytes(), 0, "a scan retains no font bytes");
+    assert_eq!(db.loaded_files(), 0);
+    assert_eq!(db.loads(), 0);
+
+    let mut layout = Layout::new();
+    let shaped = layout.shape(&db, "Hello", &style(), None, false);
+    assert!(!shaped.lines.is_empty(), "shaping must produce glyphs");
+    assert!(db.loaded_bytes() > 0, "the first shape loads a face");
+    assert_eq!(db.loaded_files(), 1, "and exactly one file for Latin text");
+    assert_eq!(db.loads(), 1);
+
+    // Shaping the same style again is free: the file is already resident.
+    layout.shape(&db, "Hello again", &style(), None, false);
+    assert_eq!(db.loads(), 1, "a cached face is not re-read");
+
+    // The whole point, in one number: far less than the directory holds.
+    let on_disk: u64 = files.iter().map(file_len).sum();
+    eprintln!(
+        "lazy db: {} faces indexed, {} of {on_disk} bytes resident",
+        db.len(),
+        db.loaded_bytes()
+    );
+    assert!(
+        (db.loaded_bytes() as u64) < on_disk,
+        "a subset of the font files must be resident"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Eviction under a cap smaller than the working set: faces are dropped, the
+/// atlas keeps every mask it rendered, and a repeat draw costs no new render.
+#[test]
+fn eviction_under_a_tiny_cap_keeps_the_atlas_working() {
+    let Some(files) = font_files(3) else { return };
+    let dir = temp_font_dir("evict", &files);
+    let db = FontDb::scan_dirs(&[&dir]);
+    if db.len() < 2 {
+        eprintln!("skipping: need two faces, got {}", db.len());
+        std::fs::remove_dir_all(&dir).ok();
+        return;
+    }
+
+    // One byte: every load immediately over-runs the cap.
+    db.set_cache_limit(1);
+    let mut atlas = Atlas::new();
+    let ids: Vec<FontId> = (0..db.len() as u32).map(FontId).collect();
+
+    // Render one glyph per face, alternating, so each load evicts the last.
+    for id in &ids {
+        for glyph in 20u16..30 {
+            atlas.get(&db, GlyphKey::new(*id, glyph, 14.0, 0.0));
+        }
+    }
+    let renders = atlas.renders();
+    let cached = atlas.glyph_count();
+    assert!(cached > 0, "the atlas must have cached something");
+    assert!(
+        db.evictions() > 0,
+        "a 1-byte cap must evict: {:?}",
+        db.loads()
+    );
+    let largest = files.iter().map(file_len).max().unwrap_or(0) as usize;
+    assert!(
+        db.loaded_bytes() <= largest,
+        "at most one file stays resident under a 1-byte cap"
+    );
+
+    // Every mask is still there: re-asking renders nothing and reads nothing.
+    let loads = db.loads();
+    for id in &ids {
+        for glyph in 20u16..30 {
+            atlas.get(&db, GlyphKey::new(*id, glyph, 14.0, 0.0));
+        }
+    }
+    assert_eq!(
+        atlas.renders(),
+        renders,
+        "a cached mask is never re-rendered"
+    );
+    assert_eq!(atlas.glyph_count(), cached);
+    assert_eq!(db.loads(), loads, "and needs no face at all");
+    eprintln!(
+        "tiny cap: {} loads, {} evictions, {} masks, {} renders",
+        db.loads(),
+        db.evictions(),
+        cached,
+        renders
+    );
+
+    // Raising the cap stops the churn.
+    db.set_cache_limit(64 * 1024 * 1024);
+    for id in &ids {
+        atlas.get(&db, GlyphKey::new(*id, 31, 14.0, 0.0));
+    }
+    let evictions = db.evictions();
+    for id in &ids {
+        atlas.get(&db, GlyphKey::new(*id, 32, 14.0, 0.0));
+    }
+    assert_eq!(db.evictions(), evictions, "a roomy cap evicts nothing");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The on-disk index cache: a second scan of the same directory reproduces
+/// the same index without reading a font file, and any change invalidates it.
+#[test]
+fn the_index_cache_round_trips_and_invalidates() {
+    let Some(files) = font_files(3) else { return };
+    let dir = temp_font_dir("idx", &files);
+    // The cache lives *outside* the scanned directory: writing it inside
+    // would bump the directory's own mtime and invalidate what was just
+    // written. The real cache is in `$XDG_CACHE_HOME/nitro`, never a font dir.
+    let cache_dir =
+        std::env::temp_dir().join(format!("nitro-text-idxcache-{}", std::process::id()));
+    std::fs::create_dir_all(&cache_dir).expect("cache dir");
+    let cache = cache_dir.join("fonts.idx");
+
+    let cold = FontDb::scan_dirs_with_cache(&[&dir], Some(&cache));
+    assert!(
+        !cold.used_index_cache(),
+        "the first scan has no cache to use"
+    );
+    assert!(cache.exists(), "the first scan writes one");
+    assert_eq!(cold.loaded_bytes(), 0, "writing the cache retains no bytes");
+
+    let warm = FontDb::scan_dirs_with_cache(&[&dir], Some(&cache));
+    assert!(warm.used_index_cache(), "the second scan uses it");
+    assert_eq!(warm.len(), cold.len(), "same faces");
+    for id in (0..cold.len() as u32).map(FontId) {
+        assert_eq!(warm.family_name(id), cold.family_name(id));
+        assert_eq!(warm.face_path(id), cold.face_path(id));
+    }
+    assert_eq!(warm.select(&style()), cold.select(&style()));
+    eprintln!(
+        "index cache: cold {:?}, warm {:?}, {} faces",
+        cold.scan_time(),
+        warm.scan_time(),
+        warm.len()
+    );
+
+    // A font added to the directory invalidates the cache.
+    std::fs::copy(&files[0], dir.join("extra.ttf")).expect("copy");
+    let changed = FontDb::scan_dirs_with_cache(&[&dir], Some(&cache));
+    assert!(!changed.used_index_cache(), "a new file invalidates");
+    assert!(changed.len() > cold.len(), "and the new face is indexed");
+    // ...and the rewritten cache is good again.
+    let again = FontDb::scan_dirs_with_cache(&[&dir], Some(&cache));
+    assert!(again.used_index_cache());
+    assert_eq!(again.len(), changed.len());
+
+    // A corrupt cache is discarded rather than trusted.
+    std::fs::write(&cache, b"not an index").expect("clobber");
+    let rescan = FontDb::scan_dirs_with_cache(&[&dir], Some(&cache));
+    assert!(!rescan.used_index_cache());
+    assert_eq!(
+        rescan.len(),
+        changed.len(),
+        "a rescan agrees with the cache"
+    );
+
+    // A missing cache path is a miss, not a failure.
+    std::fs::remove_file(&cache).ok();
+    let nocache = FontDb::scan_dirs_with_cache(&[&dir], Some(&cache));
+    assert!(!nocache.used_index_cache());
+    assert_eq!(nocache.len(), changed.len());
+
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&cache_dir).ok();
+}
+
+/// Shaping plain Latin text must not drag the fallback chain off disk: the
+/// chain is a list of ids, and only the faces a character actually needs are
+/// read. This is what keeps the resident cost at one file on a normal desktop.
+#[test]
+fn the_fallback_chain_is_not_loaded_for_text_the_primary_covers() {
+    let Some(db) = db() else { return };
+    let chain = db.fallbacks(&style());
+    if chain.len() < 2 {
+        eprintln!("skipping: only {} face(s) in the chain", chain.len());
+        return;
+    }
+    assert_eq!(db.loaded_files(), 0, "listing the chain reads nothing");
+    let mut layout = Layout::new();
+    layout.shape(&db, "The quick brown fox", &style(), None, false);
+    assert_eq!(
+        db.loaded_files(),
+        1,
+        "Latin text needs the primary face only, chain of {}",
+        chain.len()
+    );
+}
+
+/// The idle release: once a frame has passed with nothing needing a face, the
+/// bytes go back, and the atlas's masks are untouched by it. This is the step
+/// that gets the *steady state* down, not just the startup number — a cap
+/// larger than the box's fonts never fires at all.
+#[test]
+fn an_idle_release_returns_the_bytes_and_keeps_every_mask() {
+    let Some(db) = db() else { return };
+    let style = style();
+    let Some(font) = db.select(&style) else {
+        eprintln!("skipping: no face selected");
+        return;
+    };
+    let mut atlas = Atlas::new();
+    let mut layout = Layout::new();
+    let shaped = layout.shape(&db, "Hello, nitro", &style, None, false);
+    for line in &shaped.lines {
+        for glyph in &line.glyphs {
+            atlas.get(
+                &db,
+                GlyphKey::new(glyph.font, glyph.id, shaped.size_px, glyph.x),
+            );
+        }
+    }
+    assert!(db.loaded_bytes() > 0, "drawing loads the face");
+    let masks = atlas.glyph_count();
+    let renders = atlas.renders();
+    assert!(masks > 0);
+
+    // A face used *this* frame is not released: a run mid-paint keeps its font.
+    db.release_idle();
+    assert!(db.loaded_bytes() > 0, "the current frame's face stays");
+
+    // One frame later, with nothing having asked for it, it goes.
+    db.next_frame();
+    db.next_frame();
+    db.release_idle();
+    assert_eq!(db.loaded_bytes(), 0, "an idle face is released");
+    assert_eq!(db.loaded_files(), 0);
+
+    // The masks are all still there: redrawing renders nothing and reads
+    // nothing. That is what makes the release free.
+    let loads = db.loads();
+    for line in &shaped.lines {
+        for glyph in &line.glyphs {
+            atlas.get(
+                &db,
+                GlyphKey::new(glyph.font, glyph.id, shaped.size_px, glyph.x),
+            );
+        }
+    }
+    assert_eq!(atlas.glyph_count(), masks, "no mask was lost");
+    assert_eq!(atlas.renders(), renders, "and none was re-rendered");
+    assert_eq!(db.loads(), loads, "a cached mask needs no face");
+
+    // A *new* glyph does pay one re-read, and then works normally.
+    atlas.get(&db, GlyphKey::new(font, 200, 33.0, 0.0));
+    assert_eq!(db.loads(), loads + 1, "exactly one re-read");
+    eprintln!(
+        "idle release: {masks} masks kept, {} loads, {} evictions",
+        db.loads(),
+        db.evictions()
     );
 }

@@ -212,8 +212,11 @@ impl Atlas {
             entry.last_used = frame;
             return entry.info;
         }
-        let (data, index) = db.face_data(key.font)?;
-        let font = FontRef::from_index(data, index as usize)?;
+        // A miss is the *only* thing that touches the font db's byte cache:
+        // once a glyph is packed, redrawing it never needs the face again, so
+        // an evicted face costs a re-read only when a new glyph turns up.
+        let data = db.face(key.font)?;
+        let font = data.font_ref()?;
         let info = self.render(&font, key);
         self.entries.insert(
             key,

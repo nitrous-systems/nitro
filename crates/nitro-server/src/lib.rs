@@ -1075,6 +1075,13 @@ impl Server {
     fn event_loop(&mut self) -> Result<(), Error> {
         let mut buf = event_buffer::<32>();
         while !self.quit {
+            // About to block: hand back any font file nothing needed this
+            // turn. This is the state `VmRSS` is measured in — a desktop with
+            // its labels drawn and nothing to do — and the font bytes are the
+            // largest thing the server can give back there. The atlas keeps
+            // the masks, so no glyph is re-rendered and nothing on screen
+            // moves; a new glyph costs one re-read. See `docs/budget.md`.
+            self.text.release_idle_fonts();
             let n = wait(&self.epoll, &mut buf)?;
             for ev in &buf[..n] {
                 let (token, flags) = (ev.data.u64(), ev.flags);

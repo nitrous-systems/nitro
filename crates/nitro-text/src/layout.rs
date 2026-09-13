@@ -8,7 +8,7 @@ use swash::shape::ShapeContext;
 use swash::text::{Script, analyze};
 use swash::{FontRef, Metrics as FontMetrics};
 
-use crate::db::{FontDb, FontId, TextStyle};
+use crate::db::{FaceData, FontDb, FontId, TextStyle};
 
 /// Tab stop, in spaces. Tabs are expanded before shaping.
 const TAB_SPACES: usize = 4;
@@ -162,16 +162,22 @@ impl Layout {
         want_cursor: bool,
     ) -> (ShapedText, Vec<(u32, f32)>) {
         let chain = db.fallbacks(style);
-        let Some(primary) = chain.first().copied() else {
-            return (ShapedText::default(), Vec::new());
-        };
-        let fonts: Vec<(FontId, FontRef<'_>)> = chain
-            .iter()
-            .filter_map(|id| db.font_ref(*id).map(|f| (*id, f)))
-            .collect();
-        if fonts.is_empty() {
+        if chain.is_empty() {
             return (ShapedText::default(), Vec::new());
         }
+        // Only the faces this string actually needs are read off disk; see
+        // `load_chain`. `loaded` owns the bytes for the rest of the call, so an
+        // eviction mid-shape cannot invalidate a `FontRef` built from them.
+        let loaded = load_chain(db, &chain, text);
+        let fonts: Vec<(FontId, FontRef<'_>)> = loaded
+            .iter()
+            .filter_map(|(id, data)| data.font_ref().map(|f| (*id, f)))
+            .collect();
+        // The first face that actually loaded leads: a primary whose file has
+        // gone missing since the scan must not take the whole string with it.
+        let Some(primary) = fonts.first().map(|(id, _)| *id) else {
+            return (ShapedText::default(), Vec::new());
+        };
         let size = style.size_px.max(1.0);
         let script = detect_script(text);
         let default_metrics = fonts[0].1.metrics(&[]).scale(size);
@@ -282,6 +288,64 @@ impl Layout {
         }
         (clusters, metrics)
     }
+}
+
+/// Load the faces of a fallback chain that this string might need.
+///
+/// The primary face is always loaded — the string is going to be shaped with
+/// it. The rest are loaded **only if the primary cannot map every character**,
+/// and then stop as soon as the remaining unmapped set is empty: the common
+/// case, Latin text in the UI font, touches exactly one font file, which is
+/// the whole point of the lazy db. A face that fails to load is skipped, so a
+/// font deleted since the scan costs a fallback rather than a blank label.
+fn load_chain(db: &FontDb, chain: &[FontId], text: &str) -> Vec<(FontId, FaceData)> {
+    let mut out: Vec<(FontId, FaceData)> = Vec::new();
+    let mut rest = chain.iter();
+    // Walk to the first face that loads; that one is the primary.
+    for id in rest.by_ref() {
+        if let Some(data) = db.face(*id) {
+            out.push((*id, data));
+            break;
+        }
+    }
+    let Some((_, primary)) = out.first() else {
+        return out;
+    };
+    let Some(font) = primary.font_ref() else {
+        return out;
+    };
+    // The characters the primary has no glyph for. Whitespace and controls
+    // never force a fallback (`split_runs` says so), so they are not counted.
+    let charmap = font.charmap();
+    let mut missing: Vec<char> = text
+        .chars()
+        .filter(|c| !c.is_whitespace() && !c.is_control() && charmap.map(*c) == 0)
+        .collect();
+    if missing.is_empty() {
+        return out;
+    }
+    missing.sort_unstable();
+    missing.dedup();
+    for id in rest {
+        let Some(data) = db.face(*id) else {
+            continue;
+        };
+        let Some(font) = data.font_ref() else {
+            continue;
+        };
+        let charmap = font.charmap();
+        if !missing.iter().any(|c| charmap.map(*c) != 0) {
+            // Covers nothing this string is short of. `split_runs` would never
+            // pick it, so loading it would be a disk read for nothing.
+            continue;
+        }
+        missing.retain(|c| charmap.map(*c) == 0);
+        out.push((*id, data));
+        if missing.is_empty() {
+            break;
+        }
+    }
+    out
 }
 
 /// One shaped cluster, before line breaking.

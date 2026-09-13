@@ -1118,6 +1118,20 @@ fn set_text_answers_with_metrics_and_puts_glyphs_on_screen() {
     assert!(stat(&stats, "text_runs") >= 1, "{stats:?}");
     assert!(stat(&stats, "fonts") > 0, "{stats:?}");
 
+    // The font db is lazy (#528) and hands its bytes back when the loop goes
+    // idle, which is exactly the state a `stats` request observes: the glyphs
+    // are cached, the face that drew them is not. `fonts` (faces *indexed*)
+    // stays whatever the box has installed; `font_bytes` is what is resident.
+    assert!(stat(&stats, "fonts") > 0, "{stats:?}");
+    assert_eq!(
+        stat(&stats, "font_bytes"),
+        0,
+        "a settled server holds no font bytes: {stats:?}"
+    );
+    assert_eq!(stat(&stats, "fonts_loaded"), 0, "{stats:?}");
+    // The masks survive the release — that is what makes it free.
+    assert!(stat(&stats, "glyphs_cached") > 0, "{stats:?}");
+
     h_.quit();
 }
 

@@ -15,7 +15,10 @@
 //!
 //! * **`FontDb`** is scanned once at startup and never again. Fonts are not
 //!   hot-reloaded: a font installed while the server runs is picked up at the
-//!   next restart, which is what every other display server does too.
+//!   next restart, which is what every other display server does too. The
+//!   scan builds an *index* — no font file's bytes are resident until a face
+//!   is actually shaped with, and a capped LRU drops the ones that fall out
+//!   of use (`stats`' `fonts_loaded` and `font_bytes`).
 //! * **`TextStore`** owns the shaped runs. The scene deliberately does not:
 //!   it holds a `TextRef` carrying an opaque `u32` key plus the measured
 //!   size, so `nitro-scene` never sees a glyph or a font. Runs are keyed by
@@ -132,11 +135,19 @@ pub struct TextEngine {
 impl TextEngine {
     /// Scan the font directories and build an empty store and atlas.
     ///
-    /// Logs the face count and how long the scan took: it is the one startup
-    /// cost that depends on what is installed on the box rather than on
-    /// anything nitro controls, so it is worth seeing in the journal. A box
-    /// with no fonts at all is a warning, not a failure — the server still
-    /// runs, text nodes simply draw nothing.
+    /// Logs the face count, how long the scan took and whether the on-disk
+    /// index cache was used: it is the one startup cost that depends on what
+    /// is installed on the box rather than on anything nitro controls, so it
+    /// is worth seeing in the journal. A box with no fonts at all is a
+    /// warning, not a failure — the server still runs, text nodes simply draw
+    /// nothing.
+    ///
+    /// **No font file is read here.** The scan records each face's family and
+    /// attributes and the (path, index) pair it lives at; the bytes are read
+    /// by the first shape or glyph render that needs them and held in a capped
+    /// LRU (`NITRO_FONT_CACHE_MB`, default 8 MB). A box with forty faces
+    /// installed therefore costs the two or three a desktop actually draws
+    /// with — which is what got the server back inside its RSS budget.
     #[must_use]
     pub fn new() -> Self {
         let db = FontDb::scan();
@@ -144,7 +155,15 @@ impl TextEngine {
         if db.is_empty() {
             warn!("no fonts found ({ms:.1} ms scan); text nodes will draw nothing");
         } else {
-            info!("fonts: {} faces in {ms:.1} ms", db.len());
+            // No byte count here on purpose: the scan loads no font bytes at
+            // all any more. `stats`' `font_bytes` is the number to watch, and
+            // it is zero until something is actually drawn.
+            let source = if db.used_index_cache() {
+                "index cache"
+            } else {
+                "full scan"
+            };
+            info!("fonts: {} faces in {ms:.1} ms ({source})", db.len());
         }
         Self {
             db,
@@ -231,8 +250,24 @@ impl TextEngine {
     }
 
     /// Advance the atlas's frame stamp; called once per painted frame.
+    ///
+    /// The font db's face LRU rides the same stamp: the two caches count on
+    /// the same clock, and both are bumped here so a caller cannot forget one.
     pub fn next_frame(&mut self) {
         self.atlas.next_frame();
+        self.db.next_frame();
+    }
+
+    /// Hand back the font bytes nothing has needed for a frame.
+    ///
+    /// Called when the event loop is about to block — the state the memory
+    /// budget is measured in. A face is read to shape a run and to rasterize a
+    /// glyph the atlas has not seen; a desktop whose labels are on screen does
+    /// neither, so the megabytes go back and cost one re-read the next time a
+    /// new glyph appears. The atlas keeps every mask, so nothing on screen
+    /// changes and no glyph is re-rendered.
+    pub fn release_idle_fonts(&mut self) {
+        self.db.release_idle();
     }
 
     /// Look up a stored run.
@@ -335,6 +370,8 @@ impl TextEngine {
     /// Append the `key value` pairs for the `stats` reply.
     pub fn write_pairs(&self, out: &mut Vec<(&'static str, u64)>) {
         out.push(("fonts", self.db.len() as u64));
+        out.push(("fonts_loaded", self.db.loaded_files() as u64));
+        out.push(("font_bytes", self.db.loaded_bytes() as u64));
         out.push(("glyphs_cached", self.atlas.glyph_count() as u64));
         out.push(("glyph_renders", self.atlas.renders()));
         out.push(("atlas_pages", self.atlas.page_count() as u64));
@@ -357,6 +394,8 @@ impl std::fmt::Debug for TextEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TextEngine")
             .field("fonts", &self.db.len())
+            .field("fonts_loaded", &self.db.loaded_files())
+            .field("font_bytes", &self.db.loaded_bytes())
             .field("runs", &self.store.len())
             .field("atlas_pages", &self.atlas.page_count())
             .finish()
@@ -513,5 +552,59 @@ mod tests {
             "checked {checked} masks over {} page(s), {edge} flush with an edge",
             atlas.page_count()
         );
+    }
+
+    /// The engine must start with an index and no font bytes, and pick up
+    /// exactly what it draws with. This is the server-side half of #528: the
+    /// RSS win is not "the db is smaller", it is "the db is empty until a
+    /// label exists".
+    #[test]
+    fn the_engine_holds_no_font_bytes_until_something_is_shaped() {
+        let mut engine = super::TextEngine::new();
+        if !engine.has_fonts() {
+            eprintln!("skipping: no fonts on this box");
+            return;
+        }
+
+        let mut pairs: Vec<(&'static str, u64)> = Vec::new();
+        engine.write_pairs(&mut pairs);
+        let get = |pairs: &[(&'static str, u64)], key: &str| {
+            pairs.iter().find(|(k, _)| *k == key).map_or_else(
+                || panic!("stats key {key} is missing: {pairs:?}"),
+                |(_, v)| *v,
+            )
+        };
+        assert!(get(&pairs, "fonts") > 0, "faces are indexed at startup");
+        assert_eq!(get(&pairs, "fonts_loaded"), 0, "but no file is resident");
+        assert_eq!(get(&pairs, "font_bytes"), 0);
+
+        let request = super::StyleRequest::new("sans", 14.0, 400, false, 0.0, false);
+        engine.shape(1, &request, "Hello");
+
+        pairs.clear();
+        engine.write_pairs(&mut pairs);
+        assert_eq!(get(&pairs, "fonts_loaded"), 1, "one face, not the lot");
+        assert!(get(&pairs, "font_bytes") > 0);
+        assert!(
+            get(&pairs, "font_bytes") <= 8 * 1024 * 1024,
+            "the default 8 MB cap holds: {pairs:?}"
+        );
+
+        // And the loop's idle release hands them straight back: a face is
+        // needed to shape and to rasterize a new glyph, neither of which a
+        // settled desktop does. Two frames, because a face touched during
+        // frame N is still "this frame's" at N+1 — a run being painted must
+        // not have its font pulled out from under the next glyph.
+        engine.next_frame();
+        engine.next_frame();
+        engine.release_idle_fonts();
+        pairs.clear();
+        engine.write_pairs(&mut pairs);
+        assert_eq!(get(&pairs, "fonts_loaded"), 0, "idle gives the bytes back");
+        assert_eq!(get(&pairs, "font_bytes"), 0);
+
+        // Shaping again after the release still works; it costs one re-read.
+        let (_, shaped) = engine.shape(1, &request, "Hello");
+        assert!(!shaped.lines.is_empty(), "a released face reloads on use");
     }
 }

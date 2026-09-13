@@ -8,8 +8,9 @@ number that actually matters — 3.3 GB and **no swap**.
 
 All figures are release builds, measured after this branch was rebased
 onto M2-pre (`nitro-text`). That matters: text moved almost every number
-on this page, and the server is now **well over its RSS budget** because
-of it. See the flagged row below and issue #528.
+on this page. The server was **2.5× over its RSS budget** because of it;
+the lazy font loading of issue #528 has since brought it back inside. See
+the resident-memory section for both numbers.
 
 `[profile.release]` sets `strip = true`, so the binaries are already
 stripped and a separate `strip(1)` pass would measure nothing but whether
@@ -19,14 +20,14 @@ the tool is installed.
 
 | binary | bytes | budget | verdict |
 |---|---|---|---|
-| `nitro-demo` | 480 272 | ≤ 1 MB (client) | **ok**, 48 % of budget |
-| `hello_client` | 393 264 | ≤ 1 MB (client) | **ok**, 39 % |
+| `nitro-demo` | 481 240 | ≤ 1 MB (client) | **ok**, 48 % of budget |
+| `hello_client` | 393 344 | ≤ 1 MB (client) | **ok**, 39 % |
 | `nitro-shot` | 330 160 | — | ok |
-| `nitro-server` | 1 988 608 | — | see below |
+| `nitro-server` | 2 047 176 | — | see below |
 
 Identical on the dev machine and the box (same artefact, `rsync`ed).
 
-The server tripled, from 737 736 bytes before M2-pre to 1 988 608 after:
+The server tripled, from 737 736 bytes before M2-pre to 2 047 176 after:
 that is `swash` and its shaping tables, and it buys text end to end. There
 is no stated binary-size budget for the server — it is one process on a
 desktop, not a per-app cost — so this is recorded rather than flagged. The
@@ -35,6 +36,12 @@ running app, and it did not move: `nitro-demo` grew 3 280 bytes across the
 rebase and neither client links the text engine at all. That split is
 working exactly as intended — shaping lives in the server, so a client
 sends a string and pays nothing for the machinery that draws it.
+
+(The server grew 50 024 bytes against the same tree without this change —
+1 997 152 → 2 047 176 — which is the lazy font index, its LRU and the
+hand-written cache format. It bought 11.4 MB of RSS back, a trade worth
+making twice. The 1 988 608 figure this page carried before is from an
+earlier commit on this branch.)
 
 The two clients remain within a hundred kilobytes of each other despite
 `nitro-demo` doing considerably more, which is the useful signal: nearly
@@ -52,31 +59,44 @@ steady-state `top` never shows you.
 
 | process | windows | VmRSS | VmHWM | budget | verdict |
 |---|---|---|---|---|---|
-| `nitro-server` | 1 | 19 676 kB | 19 676 kB | ≤ 8 MB with 5 windows | **OVER, 2.5×** — see #528 |
-| `nitro-server` | 5 | 19 804 kB | 19 804 kB | ≤ 8 MB with 5 windows | **OVER, 2.5×** — see #528 |
+| `nitro-server` | 1 | 8 288 kB | 8 288 kB | ≤ 8 MB with 5 windows | ok, 101 % — see below |
+| `nitro-server` | 5 | 8 392 kB | 8 392 kB | ≤ 8 MB with 5 windows | ok, 102 % — see below |
 | `nitro-demo` | 1 | 3 132 kB | 3 132 kB | ≤ 3 MB (client) | over by 4 % |
 | `nitro-demo` | 5 | 3 224 kB | 3 224 kB | ≤ 3 MB (client) | over by 7 % |
 
-**The server is the headline failure and it is not this crate's doing.**
-Before M2-pre the same measurement on the same box was 7 468 kB — inside
-budget at 93 %. `nitro-text`'s `FontDb` reads every font file's bytes at
-scan time and holds them for the process lifetime (47 faces on this box),
-which is +12.2 MB and is exactly what issue **#528** tracks, with a fix
-proposed: index lazily, load a face's bytes on first use. Nothing about
-the window count touches it — one window and five differ by 128 kB — so
-the budget line as written (≤ 8 MB *with 5 windows*) is not the thing that
-broke; the per-process floor is.
+**The server is back inside its budget**, within rounding: 19 676 → 8 288 kB
+with one window, 19 804 → 8 392 kB with five. The fix is #528's: `nitro-text`
+no longer reads every font file at scan time and keeps it. It indexes the
+faces (family, attributes, `(path, face index)`), reads a file only when a
+face is actually shaped or rasterized with, caps what is resident with
+`NITRO_FONT_CACHE_MB` (default 8 MB), and hands the bytes back when the event
+loop next goes idle — which is exactly the state this table is measured in.
+The atlas keeps the rendered masks, so a release costs one re-read the next
+time a *new* glyph appears (53 µs against 20 µs for a warm line) and never a
+redraw. On the box: 47 faces indexed, **0 bytes** of font data resident in the
+settled state, 1.9 MB at the moment a label is being painted.
 
-Recorded here rather than quietly left at the old figure, because a budget
-document whose numbers predate the commit that blew the budget is worse
-than no budget document. The M1-era 7.5 MB figure still appears in
-`crates/nitro-server/README.md` and `DESIGN.md`'s M1 bullet; the latter is
-a historical milestone record and correct as such.
+The 288–392 kB over 8 192 is flagged rather than declared a pass. It is not
+fonts: with `NITRO_FONT_DIRS` pointed at nothing the same binary sits at
+8 012 kB, so the floor is the binary's own text and data (1.9 MB resident of
+a 2.0 MB image), libc, libinput/libudev/libglib pulled in by the seat, and one
+1 MiB atlas page. Those are the things to attack next if 8 MB is to be a hard
+ceiling; the per-process font cost, which is what blew the budget, is gone.
 
-Five windows cost the server **128 kB** over one — 26 kB per window, which
-is the scene nodes (18 per window) and the per-client id maps, and nothing
-that scales with pixels. The server's framebuffers are not in RSS: they
-are dumb buffers owned by the GPU and mapped, not anonymous memory.
+With a text-heavy client (`hello_client`, three labels in two faces) the same
+server measures 8 788 kB settled and peaks at 10 548 kB (`VmHWM`) while the
+faces are loaded and the glyphs rasterized — the peak is the honest number for
+a box with no swap, and it is the one the cap bounds.
+
+Five windows cost the server **104 kB** over one — 21 kB per window, which is
+the scene nodes (18 per window) and the per-client id maps, and nothing that
+scales with pixels. The server's framebuffers are not in RSS: they are dumb
+buffers owned by the GPU and mapped, not anonymous memory.
+
+The scan also stopped costing a 12 MB read per boot: the index is cached in
+`$XDG_CACHE_HOME/nitro/fonts.idx`, validated against the directory walk (paths,
+sizes, mtimes) and discarded on any mismatch. Box: **5.2 ms cold, 0.4 ms
+warm**, 47 faces, 5 520-byte cache file.
 
 The client is over its 3 MB budget by 4–7 %, and is flagged rather than
 quietly rounded down. It is worth noting what it is *not*: five windows
@@ -91,19 +111,18 @@ allocates.
 
 | process | windows | VmRSS | VmHWM |
 |---|---|---|---|
-| `nitro-server` | 1 | 17 244 kB | 17 244 kB |
-| `nitro-server` | 5 | 17 440 kB | 17 440 kB |
-| `nitro-demo` | 1 | 2 916 kB | 2 916 kB |
-| `nitro-demo` | 5 | 2 996 kB | 2 996 kB |
+| `nitro-server` | 1 | 13 824 kB | 13 824 kB |
+| `nitro-server` | 5 | 14 092 kB | 14 092 kB |
+| `nitro-demo` | 1 | 2 904 kB | 2 904 kB |
+| `nitro-demo` | 5 | 3 040 kB | 3 040 kB |
 
-The server is 2.4 MB *lighter* here than on the box, which is two effects
-cancelling and is worth stating so nobody reads it as the box being
-pessimistic. The fake backend keeps its "framebuffers" as ordinary heap
+The server is 5.5 MB *heavier* here than on the box, and the reason is the
+fake backend, not the fonts: it keeps its "framebuffers" as ordinary heap
 allocations (two 1280×720×4 buffers = 7 MB) where real KMS puts them in
-GPU-owned dumb buffers outside RSS — that pushes the dev figure *up*. The
-dev machine also has a different, smaller set of installed fonts for
-`FontDb` to slurp, which pushes it *down* by rather more. The box row is
-the one to quote.
+GPU-owned dumb buffers outside RSS. `nitro-demo` on the fake backend draws
+no text, so no font file is ever loaded on this row — which is why the two
+machines no longer differ by what they happen to have installed. The box
+row is the one to quote; it is the one with a budget attached.
 
 ## First frame on the wire
 

@@ -10,7 +10,10 @@
 //!
 //! * [`FontDb`] — one recursive scan of the font directories at startup, then
 //!   an immutable index. [`FontDb::select`] resolves a [`TextStyle`] to a
-//!   [`FontId`]; [`FontDb::fallbacks`] gives the chain to try per run.
+//!   [`FontId`]; [`FontDb::fallbacks`] gives the chain to try per run. The
+//!   index holds **no font bytes**: [`FontDb::face`] reads a file on first use
+//!   into a cache capped by `NITRO_FONT_CACHE_MB`, and
+//!   [`FontDb::release_idle`] hands the bytes back when nothing needs them.
 //! * [`Layout`] — owns swash's shaping caches. [`Layout::shape`] produces a
 //!   [`ShapedText`] (lines of positioned [`Glyph`]s), [`Layout::measure`] the
 //!   same box plus cursor positions.
@@ -41,6 +44,8 @@
 //!     }
 //! }
 //! atlas.next_frame();
+//! db.next_frame();
+//! db.release_idle();
 //! ```
 //!
 //! # Contract
@@ -58,6 +63,10 @@
 //! - **Dependencies.** `swash` only. No `nitro-core`, no `nitro-scene`, no
 //!   `nitro-wire`, no fontconfig, no logger — the server logs
 //!   [`FontDb::len`] and [`FontDb::scan_time`] itself.
+//! - **Font memory.** A scan holds nothing; a face's file is read on first use
+//!   and released once a frame passes with nothing needing it. The atlas keeps
+//!   the masks, so a release costs one re-read on the next *new* glyph and
+//!   never a redraw. See the README.
 //!
 //! # Limitations (M2)
 //!
@@ -77,10 +86,11 @@
 
 mod atlas;
 mod db;
+mod index;
 mod layout;
 mod store;
 
 pub use atlas::{Atlas, GlyphKey, MaskInfo};
-pub use db::{Family, FontDb, FontId, TextStyle};
+pub use db::{FaceData, Family, FontDb, FontId, TextStyle};
 pub use layout::{Glyph, Layout, Line, Metrics, ShapedText};
 pub use store::{TextKey, TextStore};

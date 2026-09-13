@@ -70,6 +70,8 @@ on shutdown.
 | `NITRO_INPUT`     | `off`                            | input enabled                  |
 | `NITRO_INPUT_DIR` | directory scanned for `event*`   | `/dev/input`                   |
 | `NITRO_FONT_DIRS` | colon-separated font directories | `/usr/share/fonts:/usr/local/share/fonts:~/.local/share/fonts` (read by `nitro-text`) |
+| `NITRO_FONT_CACHE_MB` | cap on resident font-file bytes | `8` (read by `nitro-text`; 0 caches nothing) |
+| `NITRO_FONT_INDEX_CACHE` | path of the font index cache, or `off` | `$XDG_CACHE_HOME/nitro/fonts.idx` (read by `nitro-text`) |
 | `NITRO_LOG`       | `error`, `warn`, `info`, `debug` | `info`                         |
 
 The keyboard layout comes from the `XKB_DEFAULT_{RULES,MODEL,LAYOUT,VARIANT,OPTIONS}`
@@ -369,11 +371,23 @@ cache, which is what `nitro-text` is; `text.rs` assembles them into the
 one `TextEngine` the event loop holds.
 
 **Startup.** `FontDb::scan()` walks `NITRO_FONT_DIRS` (or the three
-default directories) once and logs the face count and how long it took.
-Fonts are not hot-reloaded: one installed while the server runs is picked
-up at the next restart. A box with no fonts is a warning, not a failure —
-the server runs, the `TEXT` capability bit stays clear, and text nodes
-draw nothing.
+default directories) once and logs the face count, how long it took and
+whether it came off the index cache. Fonts are not hot-reloaded: one
+installed while the server runs is picked up at the next restart. A box
+with no fonts is a warning, not a failure — the server runs, the `TEXT`
+capability bit stays clear, and text nodes draw nothing.
+
+**No font file's bytes are resident until a face is drawn with**, and they
+are handed back when the loop next goes idle. The scan builds an index —
+family, attributes, `(path, face index)` — and `FontDb::face` reads the
+file on demand into a cache capped by `NITRO_FONT_CACHE_MB` (default 8
+MB). Releasing is free because the atlas keeps the rendered masks: a face
+is needed to shape a run and to rasterize a glyph the atlas has not seen,
+neither of which a settled desktop does, so the cost is one `read(2)` the
+next time a genuinely new glyph appears. This is what got the server from
+20.4 MB back under its 8 MB RSS budget on the box; `stats`' `fonts_loaded`
+and `font_bytes` are the counters, and `crates/nitro-text/README.md` has
+the measurements.
 
 **`SetText`** is an ordinary mutation: buffered, applied at the client's
 `Commit`, shaped there, and the resulting run stored under the client's
@@ -525,6 +539,8 @@ looking for.
 | `i2p_mean_us`            | Mean of the same window.                                                 |
 | `i2p_max_us`             | Max of the same window.                                                  |
 | `fonts`                  | Font faces the startup scan indexed. 0 means no `TEXT` capability.        |
+| `fonts_loaded`           | Font **files** whose bytes are resident right now — not faces indexed. The db loads a file on first use and releases it when the loop next goes idle, so a settled desktop reports 0 with its glyphs still on screen. |
+| `font_bytes`             | Total size of those files. This is the number `docs/budget.md` cares about; it was the whole of the server's RSS overrun (#528). Capped by `NITRO_FONT_CACHE_MB` (default 8 MB). |
 | `glyphs_cached`          | Distinct glyph masks in the atlas (font, glyph, quantized size, subpixel bucket). |
 | `glyph_renders`          | Masks actually rasterized since startup. It stops rising once a UI's glyphs are all cached; a number that keeps climbing on a static screen means the cache key is churning. |
 | `atlas_pages`            | 1024x1024 A8 pages allocated, 1 MiB each.                                |
@@ -650,7 +666,7 @@ are taken at and why (see `docs/latency.md` §2 and §4). Sizes and RSS in
 |--------------------------|-----------------------------------------------------------|
 | idle CPU                 | 0.0 %, zero frames in 5 s with a client connected and visible — including 5 s after a deferral, with `voluntary_ctxt_switches` flat |
 | CPU under load           | 1.5 % animating at 60 Hz, 2.2 % under 100 Hz pointer input |
-| RSS                      | server **19.7 MB** (19.8 MB with 5 windows), `nitro-demo` 3.1 MB. The server was 7.5 MB before M2-pre; `FontDb` holding every face's bytes is +12.2 MB and puts it 2.5× over the ≤ 8 MB budget — issue #528 |
+| RSS                      | server **8.3 MB** (8.4 MB with 5 windows), `nitro-demo` 3.1 MB. Was 19.7 MB: `FontDb` used to hold every indexed face's bytes, which is the whole of the +12.2 MB over the pre-M2 7.5 MB. Lazy loading (issue #528) gives it back — 0 font bytes resident in the settled state, 8.8 MB with a text-heavy client on screen and a 10.5 MB `VmHWM` peak while it paints |
 | flip interval            | mean 16 666 µs, min 16 654, max 16 675                    |
 | `paint_us`               | min 142, mean 201, max 323 per pointer-move frame (13 459 on a full repaint) |
 | `damage_px_mean`         | 1 560 of 2 073 600 in steady state                        |
