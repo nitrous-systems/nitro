@@ -51,7 +51,7 @@ face already in the index. And swash is pure safe Rust, so a malformed
 table is a panic or a wrong glyph, not memory corruption. Revisit if the
 server ever accepts a font over the wire, which it should not.
 
-Crate count: `cargo tree -e normal --prefix none | sort -u | wc -l` = **60**.
+Crate count: `cargo tree -e normal --prefix none | sort -u | wc -l` = **61**.
 `input` and `xkbcommon` cost five of those between them (themselves plus
 `input-sys`, `xkeysym`, `memmap2`); `swash` costs seven more (M2 text);
 the rest of the rise since M0 is the server now depending on every other
@@ -63,11 +63,17 @@ already here. Its `--save-small` PNG writer is its own small deflate
 encoder rather than the `png` crate, for the same reason `nitro-shot` has
 one.
 
-It still moved the figure from 58 to 60, and neither of those two lines is
-a dependency: one is `nitro-demo` itself, a workspace crate, and the other
-is a second `signal-hook v0.4.4 (*)` line — cargo's marker for a subtree it
-has already printed — which `sort -u` counts as distinct from the first.
-Counting distinct external crate *names* gives **35** either way. The line
+`nitro-ui` (M2's toolkit) is the same story: `nitro-core`, `nitro-wire`
+and `rustix`, all already here, plus an *optional* `nitro-server` behind
+its `test-support` feature, which only its own test harness turns on — an
+app binary links no compositor. It moved the figure from 60 to 61, and
+that line is `nitro-ui` itself.
+
+The M1 rise from 58 to 60 was the same kind of non-event: one line is
+`nitro-demo`, a workspace crate, and the other is a second
+`signal-hook v0.4.4 (*)` line — cargo's marker for a subtree it has
+already printed — which `sort -u` counts as distinct from the first.
+Counting distinct external crate *names* gives **35** throughout. The line
 count is still the number we watch, because it is cheap and moves when
 something real is added; it just wants reading with that caveat whenever a
 new workspace crate reuses an existing dependency.
@@ -91,6 +97,7 @@ the syscall families it uses.
 | `nitro-server` | `event`, `fs`, `net`, `process`, `time` | epoll loop, control socket, signals, timers; `pread` to copy client buffers out of their memfds, and `eventfd` for the test input source |
 | `nitro-kms` | `event`, `fs`, `mm`, `net`, `time` | DRM fds, `mmap` of dumb buffers, udev netlink |
 | `nitro-demo` | `event`, `fs`, `process`, `time` | `poll` for the event loop; `memfd_create`/`ftruncate`/`pwrite` for the image buffer; `getuid` for the `/tmp` fallback of the control-socket path; `clock_gettime` for the delivery-leg breakdown |
+| `nitro-ui` | `event`, `time` | `epoll` for the app loop, `poll` for the synchronous text measurement, and `Timespec` for `ui.set_timer` |
 
 ## `unsafe` exceptions
 

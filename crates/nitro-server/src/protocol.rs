@@ -11,6 +11,7 @@
 //! | `stats`              | `ok\n` + `key value\n` lines + `\n`                           |
 //! | `quit`               | `ok\n`, then the server shuts down                           |
 //! | `plug WxH`           | `ok\n`; fake backend only — hotplugs an output in, for tests |
+//! | `focus`              | `ok\n`; focuses the topmost window, for tests                |
 //!
 //! This module only parses and formats; it never touches a socket.
 
@@ -32,6 +33,13 @@ pub enum Request {
     /// Plug a `WxH` output into the fake backend. Test-only: on a real
     /// backend outputs come from connectors, and this is refused.
     Plug(u32, u32),
+    /// Give keyboard focus to the topmost window.
+    ///
+    /// Test-only, and it exists because focus normally *follows the
+    /// click*: a toolkit test that wants to check Tab traversal would
+    /// otherwise have to synthesise a click on some widget first, which
+    /// changes the very state it is about to assert on.
+    Focus,
 }
 
 /// Parse one request line (without or with its trailing newline).
@@ -62,7 +70,10 @@ pub fn parse(line: &str) -> Result<Request, String> {
         ("outputs", None) => Ok(Request::Outputs),
         ("stats", None) => Ok(Request::Stats),
         ("quit", None) => Ok(Request::Quit),
-        ("outputs" | "stats" | "quit", Some(_)) => Err(format!("`{cmd}` takes no argument")),
+        ("focus", None) => Ok(Request::Focus),
+        ("outputs" | "stats" | "quit" | "focus", Some(_)) => {
+            Err(format!("`{cmd}` takes no argument"))
+        }
         _ => Err(format!("unknown request `{cmd}`")),
     }
 }
@@ -135,6 +146,11 @@ mod tests {
         assert_eq!(parse("stats"), Ok(Request::Stats));
         assert_eq!(parse("quit\n"), Ok(Request::Quit));
         assert_eq!(parse("plug 640x480"), Ok(Request::Plug(640, 480)));
+        assert_eq!(parse("focus\n"), Ok(Request::Focus));
+        assert_eq!(
+            parse("focus now"),
+            Err("`focus` takes no argument".to_owned())
+        );
     }
 
     #[test]

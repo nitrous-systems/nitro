@@ -27,5 +27,11 @@ input = { version = "0.10", default-features = false, features = ["libinput_1_21
 # Keymaps and keysym/UTF-8 resolution. The FFI `unsafe` lives in the crate.
 xkbcommon = "0.9"
 
+[features]
+# A `pub` module that starts the whole server on the fake backend from
+# another crate's test: `nitro-ui`'s harness is the consumer. Off by
+# default so nothing links the control-socket client code in production.
+test-support = []
+
 [[example]]
 name = "hello_client"

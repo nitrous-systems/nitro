@@ -51,6 +51,7 @@ tests.
 | `stats`              | `ok\n`, one `key value` line per statistic (see below), blank line     |
 | `quit`               | `ok\n`, then orderly shutdown                                          |
 | `plug WxH`           | `ok\n`; fake backend only — hotplugs an output in, so a test can drive the "no output yet" state. Refused on DRM, where an output exists because a connector says so. |
+| `focus`              | `ok\n`; gives keyboard focus to the topmost window. Test-only, and it exists because focus otherwise *follows the click*: a toolkit test of Tab traversal would have to synthesise a click to get focus, which moves the focus to whatever widget was under the pointer — the very state it is about to assert on. `err no windows` when there are none. |
 | anything else        | `err <message>\n`                                                     |
 
 Several requests per connection are fine; a request line longer than 256
@@ -530,6 +531,14 @@ limit of 1024 — but real.
   14. No cursor is drawn until a pointer device reports something: a bare
       desktop is background everywhere, and the arrow appears on the first
       motion.
+- `src/test_support.rs`, behind the **`test-support`** feature, is
+  `tests/fake_loop.rs`'s harness factored out so another crate can use it:
+  `TestServer::start` runs the real loop on a thread with a fake backend
+  and a fake input source, and offers control requests, `stat`, `shot`,
+  `settle`, `focus_window` and synthetic input. `nitro-ui`'s test harness
+  is the consumer. It is a feature because it pulls a control-socket
+  client and a thread into anything that links it, and no shipped binary
+  wants either.
 - Hardware: `just deploy`, `just shot`, `just box-chvt 1|2`, `just
   box-stop` (see `docs/testbox.md`), plus two clients:
   `hello_client`, which opens a gradient-and-rounded-rects window with an

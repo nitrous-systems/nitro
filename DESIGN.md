@@ -248,6 +248,17 @@ D-Bus client is allowed.
   link thin and every app binary small.
 - **M2** — `nitro-ui` with arena, passes, `WidgetMut`, six widgets, layout,
   introspection socket, `hey`-style CLI. `nitro-calc` as the first app.
+  The toolkit core is in: widgets in a generational arena, take-out
+  dispatch so a callback gets `&mut State` *and* `&mut Ui`, `WidgetMut` as
+  the only mutation door, TREE/LAYOUT/PAINT driven by dirty flags into one
+  `Commit`, a flex subset with pure-function tests, `Flex`/`Panel`/
+  `Label`/`Button`/`Spacer`, an epoll app loop, and a harness that runs a
+  real server in-process and asserts on pixels *and* on the mutations sent.
+  `hello_dialog` is 444 KB stripped and 2.4 MB RSS against a fake server,
+  one thread, zero context switches over 5 s idle, `ldd` showing only
+  libc. Text measurement is a synchronous round trip in M2 (cached; see
+  `docs/ui.md`). The introspection *tree* exists (`Ui::introspect`); the
+  socket and the CLI are the next task.
 - **M3** — Shell: bar, launcher, window management (focus, move, resize,
   z-order), keyboard layouts, multi-output.
 - **M4** — Terminal, settings (display/audio), file manager; remote view;

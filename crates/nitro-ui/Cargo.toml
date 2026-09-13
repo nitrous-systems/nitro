@@ -1,0 +1,32 @@
+[package]
+name = "nitro-ui"
+description = "The nitro toolkit: a retained widget tree that maps widgets to scene nodes"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+nitro-core = { workspace = true }
+nitro-wire = { workspace = true }
+# `poll(2)` for the synchronous text measurement, `epoll` for the app loop.
+rustix = { workspace = true, features = ["event", "time"] }
+# Only for `test::Harness`, which runs a server in-process. Optional so an
+# app binary never links the compositor (or libinput, or drm).
+nitro-server = { path = "../nitro-server", optional = true }
+
+[features]
+# The in-process test harness. Off by default: it pulls the whole server in.
+test-support = ["dep:nitro-server", "nitro-server/test-support"]
+
+[dev-dependencies]
+# Self-dependency so the crate's own tests and examples see `nitro_ui::test`.
+nitro-ui = { path = ".", features = ["test-support"] }
+# Tests inject synthetic input and name wire enumerations directly.
+nitro-server = { path = "../nitro-server", features = ["test-support"] }
+
+[[example]]
+name = "hello_dialog"

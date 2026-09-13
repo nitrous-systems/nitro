@@ -1,0 +1,683 @@
+//! The bridge to the scene: node-id allocation, the per-widget paint-slot
+//! cache, synchronous text measurement, and the mutation tap.
+//!
+//! Everything a widget draws goes through here, and everything here goes
+//! through one [`Connection`]. Two properties are worth stating because
+//! the rest of the toolkit is built on them:
+//!
+//! * **A mutation is only sent when the value actually changed.** Each
+//!   paint slot caches the last value sent for every property, so a
+//!   repaint that produces the same rect and the same fill costs nothing
+//!   on the wire — which is what makes "repaint the dirty widget" cheap
+//!   enough to be the only strategy.
+//! * **Nothing is sent outside a commit.** [`Wire::commit`] is called once
+//!   per [`Ui::flush`](crate::Ui::flush), and only if that flush produced
+//!   any mutation at all, so an idle app puts zero bytes on the socket.
+
+use std::collections::HashMap;
+
+use nitro_core::{Color, Rect, Size};
+use nitro_wire::client::Connection;
+use nitro_wire::msg::{
+    self, ClientMsg, CreateNode, DestroyNode, Fill, Reparent, ServerMsg, SetBorder, SetBounds,
+    SetCorners, SetFill, SetImage, SetText,
+};
+use nitro_wire::types::{Align, BufferId, Layer, NodeId, NodeKind, caps};
+
+use crate::error::Error;
+use crate::theme::TextStyle;
+
+/// One mutation, as the tap records it.
+///
+/// Only recorded while [`Ui::tap`](crate::Ui::tap) is on, which is a test
+/// facility: a test asserts *which* nodes were touched and how many
+/// messages a change cost, and that is the only honest way to check the
+/// "work is proportional to what changed" claim from the outside.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mutation {
+    /// The message name, e.g. `SetText`.
+    pub op: &'static str,
+    /// The node it applies to, or [`NodeId::NONE`] for `Commit`.
+    pub node: NodeId,
+}
+
+/// Measured extent of a shaped string.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct TextMetrics {
+    /// Width of the longest line, in logical pixels.
+    pub width: f32,
+    /// Total height of all lines.
+    pub height: f32,
+    /// Ascent of the first line above its baseline.
+    pub ascent: f32,
+    /// Descent of the last line below its baseline.
+    pub descent: f32,
+    /// Number of laid-out lines.
+    pub line_count: u32,
+}
+
+impl TextMetrics {
+    /// The measured block as a size.
+    #[must_use]
+    pub fn size(self) -> Size {
+        Size::new(self.width, self.height)
+    }
+}
+
+/// Cache key for a measurement: the string, its style and the wrap width.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MeasureKey {
+    text: String,
+    family: String,
+    size_bits: u32,
+    weight: u16,
+    italic: bool,
+    max_width_bits: u32,
+}
+
+impl MeasureKey {
+    fn new(text: &str, style: &TextStyle, max_width: f32) -> Self {
+        Self {
+            text: text.to_owned(),
+            family: style.family.clone(),
+            size_bits: style.size_px.to_bits(),
+            weight: style.weight,
+            italic: style.italic,
+            max_width_bits: max_width.to_bits(),
+        }
+    }
+}
+
+/// Memo of [`Wire::measure_text`]; see the module docs for why the
+/// measurement is synchronous.
+#[derive(Debug, Default)]
+pub(crate) struct TextMeasureCache {
+    map: HashMap<MeasureKey, TextMetrics>,
+}
+
+/// How a run of text is drawn, as a paint slot takes it: the style, the
+/// colour and the alignment inside its box.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TextPaint<'a> {
+    pub(crate) style: &'a TextStyle,
+    pub(crate) color: Color,
+    pub(crate) align: Align,
+}
+
+/// Where a paint slot's node belongs in the scene: under `parent`,
+/// before `before`, at slot number `index`.
+///
+/// The three travel together through every `paint_*` call, so they are
+/// one argument rather than three.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SlotAt {
+    pub(crate) parent: NodeId,
+    pub(crate) before: NodeId,
+    pub(crate) index: usize,
+}
+
+/// What a paint slot last drew, so the next paint can diff against it.
+#[derive(Debug)]
+pub(crate) struct PaintSlot {
+    pub(crate) node: NodeId,
+    kind: NodeKind,
+    bounds: Rect,
+    fill: Fill,
+    radius: f32,
+    border: (f32, Color),
+    text: Option<SetText>,
+    image: Option<(BufferId, nitro_core::IRect)>,
+    /// Whether this slot was emitted by the paint that is running.
+    used: bool,
+}
+
+/// The client half of the scene: one connection, the node-id allocator
+/// and the mutation counters.
+pub(crate) struct Wire {
+    conn: Connection,
+    /// Next never-used node id. `NodeId(1)` is the window root.
+    next_node: u32,
+    free_nodes: Vec<NodeId>,
+    serial: u32,
+    /// Mutations queued since the last commit. Zero means no commit is
+    /// sent, which is what makes idle free.
+    pending: u32,
+    /// Total commits sent, for tests and stats.
+    pub(crate) commits: u32,
+    tap: Option<Vec<Mutation>>,
+    /// Server messages picked up while waiting for a `TextMeasured`.
+    pub(crate) stray: Vec<ServerMsg>,
+    next_request: u32,
+    pub(crate) text_cache: TextMeasureCache,
+}
+
+impl Wire {
+    pub(crate) fn new(conn: Connection) -> Self {
+        Self {
+            conn,
+            next_node: 2,
+            free_nodes: Vec::new(),
+            serial: 1,
+            pending: 0,
+            commits: 0,
+            tap: None,
+            stray: Vec::new(),
+            next_request: 1,
+            text_cache: TextMeasureCache::default(),
+        }
+    }
+
+    pub(crate) fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    pub(crate) fn conn_mut(&mut self) -> &mut Connection {
+        &mut self.conn
+    }
+
+    /// Turn the mutation tap on or off, clearing whatever it holds.
+    pub(crate) fn set_tap(&mut self, on: bool) {
+        self.tap = if on { Some(Vec::new()) } else { None };
+    }
+
+    /// The mutations recorded since the tap was turned on.
+    pub(crate) fn taped(&self) -> &[Mutation] {
+        self.tap.as_deref().unwrap_or(&[])
+    }
+
+    pub(crate) fn clear_tap(&mut self) {
+        if let Some(t) = &mut self.tap {
+            t.clear();
+        }
+    }
+
+    /// Allocate a scene node id.
+    pub(crate) fn alloc_node(&mut self) -> NodeId {
+        if let Some(id) = self.free_nodes.pop() {
+            return id;
+        }
+        let id = NodeId(self.next_node);
+        self.next_node += 1;
+        id
+    }
+
+    /// Give a node id back. Safe only after a `DestroyNode` for it has
+    /// been queued: the server frees the id at the next commit.
+    fn free_node(&mut self, id: NodeId) {
+        self.free_nodes.push(id);
+    }
+
+    fn send(&mut self, msg: &ClientMsg, node: NodeId) -> Result<(), Error> {
+        if let Some(t) = &mut self.tap {
+            t.push(Mutation {
+                op: msg.name(),
+                node,
+            });
+        }
+        self.pending += 1;
+        self.conn.send(msg)?;
+        Ok(())
+    }
+
+    /// End the transaction and push it at the socket. Does nothing when
+    /// no mutation was queued — an idle app sends no bytes at all.
+    pub(crate) fn commit(&mut self) -> Result<bool, Error> {
+        if self.pending == 0 {
+            return Ok(false);
+        }
+        self.pending = 0;
+        let serial = self.serial;
+        self.serial = self.serial.wrapping_add(1).max(1);
+        if let Some(t) = &mut self.tap {
+            t.push(Mutation {
+                op: "Commit",
+                node: NodeId::NONE,
+            });
+        }
+        self.conn.commit(serial)?;
+        self.commits += 1;
+        self.flush_all()?;
+        Ok(true)
+    }
+
+    /// Write everything queued, waiting for writability as needed.
+    ///
+    /// A toolkit flush happens outside the frame path (it *is* the frame
+    /// path) and the alternative — carrying a half-written transaction
+    /// across event-loop turns — would mean the scene could show a torn
+    /// batch. The socket only fills up if the server has stopped reading,
+    /// which is fatal anyway.
+    pub(crate) fn flush_all(&mut self) -> Result<(), Error> {
+        while !self.conn.flush()? {
+            wait(self.conn.as_fd(), rustix::event::PollFlags::OUT)?;
+        }
+        Ok(())
+    }
+
+    /// Create the one top-level window.
+    pub(crate) fn create_window(
+        &mut self,
+        id: NodeId,
+        title: &str,
+        size: Size,
+    ) -> Result<(), Error> {
+        self.send(
+            &ClientMsg::CreateWindow(msg::CreateWindow {
+                id,
+                size,
+                layer: Layer::Normal,
+                flags: 0,
+                title: title.to_owned(),
+            }),
+            id,
+        )
+    }
+
+    /// Create a `Group` under `parent`, before `before` (or appended).
+    pub(crate) fn create_group(
+        &mut self,
+        id: NodeId,
+        parent: NodeId,
+        before: NodeId,
+    ) -> Result<(), Error> {
+        self.send(
+            &ClientMsg::CreateNode(CreateNode {
+                id,
+                kind: NodeKind::Group,
+                parent,
+                before,
+            }),
+            id,
+        )
+    }
+
+    pub(crate) fn reparent(
+        &mut self,
+        id: NodeId,
+        parent: NodeId,
+        before: NodeId,
+    ) -> Result<(), Error> {
+        self.send(&ClientMsg::Reparent(Reparent { id, parent, before }), id)
+    }
+
+    pub(crate) fn set_bounds(&mut self, id: NodeId, rect: Rect) -> Result<(), Error> {
+        self.send(&ClientMsg::SetBounds(SetBounds { id, rect }), id)
+    }
+
+    pub(crate) fn destroy_node(&mut self, id: NodeId) -> Result<(), Error> {
+        self.send(&ClientMsg::DestroyNode(DestroyNode { id }), id)?;
+        self.free_node(id);
+        Ok(())
+    }
+
+    /// Whether the server can actually draw text.
+    pub(crate) fn has_text(&self) -> bool {
+        self.conn.has_caps(caps::TEXT)
+    }
+
+    /// Measure a string, synchronously.
+    ///
+    /// **This blocks on a round trip**, and that is an M2 decision rather
+    /// than an oversight. A label cannot say how big it is until the
+    /// server — which owns the fonts — has shaped its string, and every
+    /// alternative (measure asynchronously and re-lay-out when the answer
+    /// arrives, or ship a font library in every client) is a larger
+    /// change than M2 can carry. The cost is bounded by the cache: a
+    /// string is measured once per `(text, style, max_width)`, so a
+    /// settled UI does no round trips at all, and a `MeasureText` is
+    /// answered on receipt rather than at a commit, so the wait is one
+    /// socket turnaround and not one frame. The async path — measure
+    /// optimistically, lay out on `TextMeasured` — is the M3 answer once
+    /// there is a widget whose text changes every keystroke.
+    ///
+    /// With no `TEXT` capability there is nothing to ask, and the answer
+    /// is an estimate from the font size so a fontless server still lays
+    /// out a plausible tree.
+    pub(crate) fn measure_text(
+        &mut self,
+        text: &str,
+        style: &TextStyle,
+        max_width: f32,
+    ) -> Result<TextMetrics, Error> {
+        let key = MeasureKey::new(text, style, max_width);
+        if let Some(m) = self.text_cache.map.get(&key) {
+            return Ok(*m);
+        }
+        let metrics = if self.has_text() {
+            self.round_trip(text, style, max_width)?
+        } else {
+            estimate(text, style)
+        };
+        self.text_cache.map.insert(key, metrics);
+        Ok(metrics)
+    }
+
+    fn round_trip(
+        &mut self,
+        text: &str,
+        style: &TextStyle,
+        max_width: f32,
+    ) -> Result<TextMetrics, Error> {
+        let request = self.next_request;
+        self.next_request = self.next_request.wrapping_add(1).max(1);
+        self.conn.measure_text(msg::MeasureText {
+            request,
+            size_px: style.size_px,
+            weight: style.weight,
+            italic: style.italic,
+            max_width,
+            wrap: max_width > 0.0,
+            family: style.family.clone(),
+            text: text.to_owned(),
+        })?;
+        self.flush_all()?;
+        let mut batch = Vec::new();
+        loop {
+            batch.clear();
+            self.conn.poll(&mut batch)?;
+            let mut found = None;
+            for m in batch.drain(..) {
+                match m {
+                    ServerMsg::TextMeasured(t) if t.request == request => {
+                        found = Some(TextMetrics {
+                            width: t.width,
+                            height: t.height,
+                            ascent: t.ascent,
+                            descent: t.descent,
+                            line_count: t.line_count,
+                        });
+                    }
+                    // Anything else that arrived while we waited is a real
+                    // event: keep it for the caller's next drain rather
+                    // than dropping a keystroke on the floor.
+                    other => self.stray.push(other),
+                }
+            }
+            if let Some(m) = found {
+                return Ok(m);
+            }
+            wait(self.conn.as_fd(), rustix::event::PollFlags::IN)?;
+        }
+    }
+
+    /// Emit a rect slot, sending only the properties that changed.
+    pub(crate) fn paint_rect(
+        &mut self,
+        slots: &mut Vec<PaintSlot>,
+        at: SlotAt,
+        rect: Rect,
+        fill: Fill,
+        radius: f32,
+        border: (f32, Color),
+    ) -> Result<(), Error> {
+        let index = at.index;
+        let fresh = self.ensure_slot(slots, at, NodeKind::Rect)?;
+        let slot = &mut slots[index];
+        slot.used = true;
+        let (node, changed_bounds) = (slot.node, fresh || slot.bounds != rect);
+        let changed_fill = fresh || slot.fill != fill;
+        // Exact comparison is the right one: the question is whether the
+        // value we would send differs from the one we sent, not whether
+        // two computed floats are near each other.
+        let changed_radius = fresh || slot.radius.to_bits() != radius.to_bits();
+        let changed_border =
+            fresh || slot.border.0.to_bits() != border.0.to_bits() || slot.border.1 != border.1;
+        slot.bounds = rect;
+        slot.fill = fill;
+        slot.radius = radius;
+        slot.border = border;
+        if changed_bounds {
+            self.set_bounds(node, rect)?;
+        }
+        if changed_fill {
+            self.send(&ClientMsg::SetFill(SetFill { id: node, fill }), node)?;
+        }
+        if changed_radius {
+            self.send(
+                &ClientMsg::SetCorners(SetCorners { id: node, radius }),
+                node,
+            )?;
+        }
+        if changed_border {
+            self.send(
+                &ClientMsg::SetBorder(SetBorder {
+                    id: node,
+                    width: border.0,
+                    color: border.1,
+                }),
+                node,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Emit a text slot, sending only what changed.
+    pub(crate) fn paint_text(
+        &mut self,
+        slots: &mut Vec<PaintSlot>,
+        at: SlotAt,
+        rect: Rect,
+        text: &str,
+        paint: TextPaint<'_>,
+    ) -> Result<(), Error> {
+        let TextPaint {
+            style,
+            color,
+            align,
+        } = paint;
+        let index = at.index;
+        let fresh = self.ensure_slot(slots, at, NodeKind::Text)?;
+        let slot = &mut slots[index];
+        slot.used = true;
+        let node = slot.node;
+        let want = SetText {
+            node,
+            size_px: style.size_px,
+            weight: style.weight,
+            italic: style.italic,
+            max_width: 0.0,
+            wrap: false,
+            align,
+            color,
+            family: style.family.clone(),
+            text: text.to_owned(),
+        };
+        let changed_bounds = fresh || slot.bounds != rect;
+        let changed_text = fresh || slot.text.as_ref() != Some(&want);
+        slot.bounds = rect;
+        if changed_text {
+            slot.text = Some(want.clone());
+        }
+        if changed_bounds {
+            self.set_bounds(node, rect)?;
+        }
+        if changed_text {
+            self.send(&ClientMsg::SetText(want), node)?;
+        }
+        Ok(())
+    }
+
+    /// Emit an image slot, sending only what changed.
+    pub(crate) fn paint_image(
+        &mut self,
+        slots: &mut Vec<PaintSlot>,
+        at: SlotAt,
+        rect: Rect,
+        buffer: BufferId,
+        src: nitro_core::IRect,
+    ) -> Result<(), Error> {
+        let index = at.index;
+        let fresh = self.ensure_slot(slots, at, NodeKind::Image)?;
+        let slot = &mut slots[index];
+        slot.used = true;
+        let node = slot.node;
+        let changed_bounds = fresh || slot.bounds != rect;
+        let changed_image = fresh || slot.image != Some((buffer, src));
+        slot.bounds = rect;
+        slot.image = Some((buffer, src));
+        if changed_bounds {
+            self.set_bounds(node, rect)?;
+        }
+        if changed_image {
+            self.send(
+                &ClientMsg::SetImage(SetImage {
+                    id: node,
+                    buffer,
+                    src,
+                }),
+                node,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Make sure slot `index` exists with the right node kind. Returns
+    /// whether the node was just created, which forces every property to
+    /// be sent.
+    fn ensure_slot(
+        &mut self,
+        slots: &mut Vec<PaintSlot>,
+        at: SlotAt,
+        kind: NodeKind,
+    ) -> Result<bool, Error> {
+        let SlotAt {
+            parent,
+            before,
+            index,
+        } = at;
+        while slots.len() <= index {
+            slots.push(PaintSlot {
+                node: NodeId::NONE,
+                kind,
+                bounds: Rect::EMPTY,
+                fill: Fill::None,
+                radius: 0.0,
+                border: (0.0, Color::TRANSPARENT),
+                text: None,
+                image: None,
+                used: false,
+            });
+        }
+        // A slot that changed kind is a different node; drop the old one.
+        if !slots[index].node.is_none() && slots[index].kind != kind {
+            let old = slots[index].node;
+            self.destroy_node(old)?;
+            slots[index].node = NodeId::NONE;
+        }
+        if slots[index].node.is_none() {
+            let node = self.alloc_node();
+            self.send(
+                &ClientMsg::CreateNode(CreateNode {
+                    id: node,
+                    kind,
+                    parent,
+                    before,
+                }),
+                node,
+            )?;
+            slots[index] = PaintSlot {
+                node,
+                kind,
+                bounds: Rect::EMPTY,
+                fill: Fill::None,
+                radius: 0.0,
+                border: (0.0, Color::TRANSPARENT),
+                text: None,
+                image: None,
+                used: true,
+            };
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Clear the `used` marks before a widget paints.
+    pub(crate) fn begin_paint(slots: &mut [PaintSlot]) {
+        for s in slots {
+            s.used = false;
+        }
+    }
+
+    /// Destroy the nodes of slots the paint did not emit this time.
+    pub(crate) fn end_paint(&mut self, slots: &mut Vec<PaintSlot>) -> Result<(), Error> {
+        for i in (0..slots.len()).rev() {
+            if slots[i].used {
+                continue;
+            }
+            if !slots[i].node.is_none() {
+                let node = slots[i].node;
+                self.destroy_node(node)?;
+            }
+            // Only trailing slots can be removed; a hole would renumber
+            // the ones after it.
+            if i + 1 == slots.len() {
+                slots.pop();
+            } else {
+                slots[i].node = NodeId::NONE;
+                slots[i].text = None;
+                slots[i].image = None;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Rough metrics for a server with no fonts: enough for a layout that
+/// does not collapse to nothing.
+fn estimate(text: &str, style: &TextStyle) -> TextMetrics {
+    let chars = text.chars().count() as f32;
+    TextMetrics {
+        width: chars * style.size_px * 0.55,
+        height: style.size_px * 1.25,
+        ascent: style.size_px * 0.8,
+        descent: style.size_px * 0.2,
+        line_count: 1,
+    }
+}
+
+/// Block until `fd` is ready for `events`.
+fn wait(fd: std::os::fd::BorrowedFd<'_>, events: rustix::event::PollFlags) -> Result<(), Error> {
+    let mut fds = [rustix::event::PollFd::new(&fd, events)];
+    loop {
+        match rustix::event::poll(&mut fds, None) {
+            Ok(_) => return Ok(()),
+            Err(rustix::io::Errno::INTR) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_estimate_grows_with_the_string() {
+        let style = TextStyle::new("sans", 20.0);
+        let a = estimate("ab", &style);
+        let b = estimate("abcd", &style);
+        assert!(b.width > a.width);
+        assert_eq!(a.height.to_bits(), b.height.to_bits());
+        assert_eq!(a.line_count, 1);
+        assert_eq!(a.size().w.to_bits(), a.width.to_bits());
+    }
+
+    #[test]
+    fn measure_keys_distinguish_style_and_width() {
+        let s = TextStyle::new("sans", 14.0);
+        let bold = TextStyle {
+            weight: 700,
+            ..s.clone()
+        };
+        assert_ne!(MeasureKey::new("x", &s, 0.0), MeasureKey::new("y", &s, 0.0));
+        assert_ne!(
+            MeasureKey::new("x", &s, 0.0),
+            MeasureKey::new("x", &bold, 0.0)
+        );
+        assert_ne!(
+            MeasureKey::new("x", &s, 0.0),
+            MeasureKey::new("x", &s, 100.0)
+        );
+        assert_eq!(MeasureKey::new("x", &s, 0.0), MeasureKey::new("x", &s, 0.0));
+    }
+}

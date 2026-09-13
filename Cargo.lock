@@ -232,6 +232,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nitro-ui"
+version = "0.0.1"
+dependencies = [
+ "nitro-core",
+ "nitro-server",
+ "nitro-ui",
+ "nitro-wire",
+ "rustix",
+]
+
+[[package]]
 name = "nitro-wire"
 version = "0.0.1"
 dependencies = [

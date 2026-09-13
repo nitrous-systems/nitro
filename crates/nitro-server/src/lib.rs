@@ -43,6 +43,9 @@ pub mod protocol;
 pub mod render;
 pub mod signals;
 pub mod stats;
+/// In-process server for another crate's tests; see the module docs.
+#[cfg(feature = "test-support")]
+pub mod test_support;
 pub mod text;
 
 use std::cell::RefCell;
@@ -1602,6 +1605,7 @@ impl Server {
                 protocol::ok_reply()
             }
             Ok(Request::Plug(w, h)) => self.plug(w, h),
+            Ok(Request::Focus) => self.focus_topmost(),
         };
         client.send(reply);
     }
@@ -2075,6 +2079,27 @@ impl Server {
             return protocol::err_reply("`plug` is only available on the fake backend");
         }
         info!("plug {width}x{height} requested");
+        protocol::ok_reply()
+    }
+
+    /// Focus the topmost window on the first output, for a test.
+    ///
+    /// Focus normally follows a click, which is the right policy for a
+    /// desktop and the wrong one for a toolkit test: synthesising a
+    /// click to get focus would move the focus to whatever widget was
+    /// under the pointer, which is exactly the state a focus test is
+    /// about to assert on.
+    fn focus_topmost(&mut self) -> Vec<u8> {
+        let Some(output) = self.backend.outputs().first().map(|o| o.id) else {
+            return protocol::err_reply("no outputs");
+        };
+        // Scene output ids mirror the backend's, one for one; see where
+        // outputs are registered in `rescan`.
+        let scene_output = SceneOutputId(output.0);
+        let Some(window) = self.scene.windows_front_to_back(scene_output).next() else {
+            return protocol::err_reply("no windows");
+        };
+        self.set_focus(Some(window));
         protocol::ok_reply()
     }
 
