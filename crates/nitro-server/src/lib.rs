@@ -2566,21 +2566,48 @@ impl Server {
     /// made a pure geometry function need the shell's state and the scene's
     /// window table; putting it at every call site would have let one forget.
     ///
-    /// A **minimized** bar reserves nothing: hiding a panel has to give its
-    /// strip back, or a shell would have to remember to release the zone
-    /// first and a crashed one would leave the desktop permanently short.
+    /// A bar that is not **showing** reserves nothing — see
+    /// [`Server::showing`]: hiding a panel has to give its strip back, or a
+    /// shell would have to remember to release the zone first and a crashed
+    /// one would leave the desktop permanently short.
     fn local_work_area(&self, id: SceneOutputId) -> Rect {
         let area = wm::work_area(&self.scene, id);
         if self.zones.is_empty() {
             return area;
         }
         self.zones.work_area(area, id, |win| {
+            if !self.showing(win) {
+                return None;
+            }
             self.scene
                 .window_info(win)
                 .ok()
-                .filter(|i| i.state() != WindowState::Minimized)
                 .and_then(nitro_scene::Window::output)
         })
+    }
+
+    /// Whether a window is actually on screen: live, not `Minimized`, and
+    /// its content subtree visible.
+    ///
+    /// The one predicate behind two shell promises that used to be tested
+    /// differently, which is how they drifted: an exclusive zone is released
+    /// when its bar stops showing, and a keyboard grab is dropped when its
+    /// overlay does. Both matter for the same reason — the launcher hides
+    /// itself with `SetVisible(false)` on Escape, and a shell that had to
+    /// send an explicit release as well would swallow the keyboard, or keep
+    /// a strip of the desktop, for the whole session on one forgotten
+    /// message.
+    ///
+    /// `Minimized` is checked as well as node visibility because they are
+    /// different things: the scene hides a minimized window's *root* without
+    /// touching the client's own `visible` flag on the content group.
+    fn showing(&self, win: WindowKey) -> bool {
+        self.scene
+            .window_info(win)
+            .ok()
+            .filter(|i| i.state() != WindowState::Minimized)
+            .and_then(|i| self.scene.node(i.content()).ok())
+            .is_some_and(nitro_scene::Node::visible)
     }
 
     /// Where an output's logical space starts in the desktop space.
@@ -3535,23 +3562,14 @@ impl Server {
 
     /// The window a live keyboard grab points at, if any.
     ///
-    /// A grab on a window that is no longer *visible* does not count, and is
-    /// dropped here rather than tracked: the launcher hides itself with
-    /// `SetVisible(false)` on Escape, and requiring it to send an explicit
-    /// `GrabKeyboard { on: false }` too would mean one forgotten message
-    /// swallows the keyboard for the whole session. Checked lazily because
-    /// the scene does not report visibility changes and polling one node on
-    /// each key is cheaper than watching every commit.
+    /// A grab on a window that is no longer *showing* does not count, and is
+    /// dropped here rather than tracked: see [`Server::showing`] for why
+    /// both this and the exclusive zone hang on that one predicate. Checked
+    /// lazily because the scene does not report visibility changes and
+    /// polling one node on each key is cheaper than watching every commit.
     fn grab_target(&mut self) -> Option<WindowKey> {
         let win = self.grab?;
-        let live = self
-            .scene
-            .window_info(win)
-            .ok()
-            .filter(|i| i.state() != WindowState::Minimized)
-            .and_then(|i| self.scene.node(i.content()).ok())
-            .is_some_and(nitro_scene::Node::visible);
-        if !live {
+        if !self.showing(win) {
             self.grab = None;
             return None;
         }
@@ -3839,6 +3857,7 @@ impl Server {
         }
         let relisted = outcome.relisted;
         let shell_ops = outcome.shell_ops;
+        let visibility_changed = outcome.visibility_changed;
         // State requests are applied last, after every geometry mutation
         // in the batch: `Maximized` has to win over the client's own
         // `SetBounds`, not race it. `set_state` reaches the owning client
@@ -3857,6 +3876,14 @@ impl Server {
         }
         for (win, state) in outcome.state_requests {
             self.set_state(win, state);
+        }
+        // A window that showed or hid may have been a bar holding a strip of
+        // the desktop, and a zone is released the moment its bar stops
+        // showing (`Server::showing`). Guarded on the zone map so a desktop
+        // with no shell running pays one `is_empty` per transaction that
+        // touched visibility at all.
+        if visibility_changed && !self.zones.is_empty() {
+            self.reflow_work_area();
         }
         // Announced with every client back in the map, because a watcher is
         // a *different* client than the one that committed: notifying while

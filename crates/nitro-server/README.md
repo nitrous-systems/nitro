@@ -535,8 +535,11 @@ A **shell** client's bindings sit between those and the focused client:
 after the compositor's, which are not negotiable, and before any
 application's, because a global hotkey the focused application could also
 see would be a keylogger and an ambiguity at once. A `GrabKeyboard` from a
-shell client outranks both the focus and its own bindings — the launcher's
-Escape must not be swallowed by whatever the shell bound.
+shell client replaces the **focus** as the destination of key events, but
+does *not* outrank either binding table: a bound chord pressed under a grab
+arrives as a `HotKey`, not as a `Key` to the grabbing window. That is what
+lets a launcher opened by a bare-Super tap be closed by a second tap while
+it holds the grab — see `docs/shell.md`.
 
 Routing:
 
@@ -736,7 +739,7 @@ limit of 1024 — but real.
   `unplug` migrating it back; and a scale-2 output drawing twice the
   device pixels for the same logical window.
 - `tests/shell.rs` drives the M3-B shell socket through the same real loop,
-  26 cases: the two sockets' capability bits and three shell clients at
+  28 cases: the two sockets' capability bits and three shell clients at
   once; **every one of the eleven shell ops** refused with `Protocol` on the
   ordinary socket, one connection each and *without a commit* — the
   privilege check is on receipt (a check that covered ten would look
@@ -745,7 +748,9 @@ limit of 1024 — but real.
   the hardware probe caught the first implementation getting wrong; a 32-px
   top exclusive zone shortening a maximized window's `Configure` by exactly
   32
-  and offsetting it by 32, released by `px: 0` and by minimizing the bar; a
+  and offsetting it by 32, released by `px: 0`, by minimizing the bar and by
+  hiding it with `SetVisible(false)` — and taken back when it shows again,
+  since a hidden zone is skipped rather than forgotten; a
   zone moving a newly *placed* window, asserted against `wm::place` on the
   shrunken area; a `Top` bar painted over a maximized window in a
   screenshot; `SetLayer{Normal}`, reserved anchor bits and a foreign
@@ -759,8 +764,10 @@ limit of 1024 — but real.
   firing once and cancelled by another key and by a second modifier; unbind
   and disconnect both giving a chord back; a compositor chord refused; two
   clients contesting a chord; a grab routing keys to a `NO_FOCUS` overlay
-  and back with no `Focus` event either way, and released by hiding the
-  window; `Super`-drag still moving a window with a shell connected and not
+  and back with no `Focus` event either way, released by hiding the window,
+  and **not** outranking a bound chord — which arrives as a `HotKey` rather
+  than a `Key`, while the bare-Super tap still fires under the grab, so a
+  launcher can close itself the way it opened; `Super`-drag still moving a window with a shell connected and not
   looking like a tap; outputs listed, hotplugged and unplugged; an anchored
   bar re-spanning after a hotplug.
 - `src/test_support.rs`, behind the **`test-support`** feature, is

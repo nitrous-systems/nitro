@@ -1554,6 +1554,97 @@ fn a_keyboard_grab_routes_keys_to_a_no_focus_overlay_and_back() {
 }
 
 #[test]
+fn a_bound_chord_under_a_grab_fires_as_a_hotkey_not_a_key() {
+    // The order the review asked to have pinned down. A grab replaces
+    // *focus*, not the bindings: the compositor's chords and the shell's own
+    // `BindKey`s still run first, so a bound chord pressed while a grab is
+    // held arrives as a `HotKey` and is **not** also delivered as a `Key` to
+    // the grabbing window.
+    //
+    // This is the behaviour a launcher needs rather than an accident: one
+    // opened by a bare-Super tap has to be closable by a second tap *while*
+    // it holds the grab, and if the grab outranked bindings that tap would
+    // arrive as an ordinary key and the launcher would have to reimplement
+    // tap detection. The cost — do not bind a chord you also want as a key —
+    // is stated in `docs/wire.md` and `docs/shell.md`.
+    let mut h = Harness::start("grab-vs-bind", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut shell = h.shell("launcher");
+    // Two bindings: a chord and the bare-Super tap the launcher toggles on.
+    shell.bind_key(7, mod_mask::SUPER, XK_A).unwrap();
+    shell.bind_key(9, mod_mask::SUPER, 0).unwrap();
+    shell.flush().unwrap();
+    wait_for("the bindings", || h.stat("hotkeys") == 2);
+
+    let overlay = make_window(
+        &mut shell,
+        &mut inbox,
+        10,
+        "launcher",
+        Size::new(400.0, 300.0),
+        BAR_BLUE,
+        window_flags::UNDECORATED | window_flags::NO_FOCUS,
+        Layer::Overlay,
+        1,
+    );
+    shell
+        .tx()
+        .grab_keyboard(overlay.root, true)
+        .commit(2)
+        .unwrap();
+    shell.flush().unwrap();
+    wait_for("the grab", || h.stat("grabbed") == 1);
+
+    // An *unbound* key reaches the grab holder, which is the grab working.
+    h.key(KEY_ESC, true);
+    h.key(KEY_ESC, false);
+    h.settle();
+    expect(&mut shell, &mut inbox.0, "the unbound key", |m| match m {
+        ServerMsg::Key(k) if k.keycode == KEY_ESC && k.window == overlay.root => Some(()),
+        _ => None,
+    });
+
+    // The *bound* chord does not: it comes back as a HotKey instead.
+    h.super_chord(KEY_A);
+    let mut chords = Vec::new();
+    wait_for("the chord's HotKey", || {
+        pump(&mut shell, &mut inbox);
+        chords = inbox
+            .0
+            .iter()
+            .filter_map(|m| match m {
+                ServerMsg::HotKey(k) if k.id == 7 => Some(k.pressed),
+                _ => None,
+            })
+            .collect();
+        chords.len() == 2
+    });
+    assert_eq!(chords, vec![true, false], "press and release");
+    assert!(
+        !inbox
+            .0
+            .iter()
+            .any(|m| matches!(m, ServerMsg::Key(k) if k.keycode == KEY_A)),
+        "a bound chord is a HotKey, never also a Key to the grab holder"
+    );
+
+    // And the tap still fires under the grab, which is the whole point of
+    // this ordering: the launcher can close itself the way it opened.
+    h.super_tap();
+    wait_for("the tap under the grab", || {
+        pump(&mut shell, &mut inbox);
+        inbox
+            .0
+            .iter()
+            .any(|m| matches!(m, ServerMsg::HotKey(k) if k.id == 9))
+    });
+    assert_eq!(h.stat("grabbed"), 1, "and the grab is still held");
+
+    drop(shell);
+    h.quit();
+}
+
+#[test]
 fn hiding_a_grabbing_window_releases_the_grab() {
     // The launcher hides itself on Escape. Requiring an explicit
     // `GrabKeyboard { on: false }` as well would mean one forgotten message
@@ -1838,6 +1929,79 @@ fn a_minimized_bar_gives_its_strip_back() {
     h.settle();
     await_configure(&mut conn, &mut inbox, &mut win, "the bar hiding");
     assert_eq!(win.size.h, OUT.1 as f32, "the strip came back");
+
+    // And un-minimizing takes it again: the zone is *skipped* while the bar
+    // is not showing, not forgotten, so the shell does not have to re-send
+    // `SetExclusiveZone` to get its strip back.
+    shell
+        .tx()
+        .set_window_state(bar.root, WindowState::Normal)
+        .commit(4)
+        .unwrap();
+    shell.flush().unwrap();
+    h.settle();
+    await_configure(&mut conn, &mut inbox, &mut win, "the bar returning");
+    assert_eq!(win.size.h, OUT.1 as f32 - ZONE as f32);
+
+    drop((conn, shell));
+    h.quit();
+}
+
+#[test]
+fn a_bar_hidden_with_set_visible_gives_its_strip_back() {
+    // The *other* way a panel goes away, and the one the review caught: the
+    // zone used to check only `Minimized`, so a bar that hid itself with
+    // `SetVisible(false)` — which is what a toggling panel actually does,
+    // and what the launcher does on Escape — kept its strip reserved. Both
+    // now go through the one `Server::showing` predicate.
+    let h = Harness::start("zone-hide", OUT.0, OUT.1);
+    let mut shell_inbox = Inbox::default();
+    let mut shell = h.shell("bar");
+    let bar = make_bar(&h, &mut shell, &mut shell_inbox, 1);
+
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("app");
+    let mut win = make_window(
+        &mut conn,
+        &mut inbox,
+        1,
+        "app",
+        WIN,
+        RED,
+        window_flags::UNDECORATED,
+        Layer::Normal,
+        1,
+    );
+    conn.tx()
+        .set_window_state(win.root, WindowState::Maximized)
+        .commit(2)
+        .unwrap();
+    conn.flush().unwrap();
+    await_configure(&mut conn, &mut inbox, &mut win, "the maximize");
+    assert_eq!(win.size.h, OUT.1 as f32 - ZONE as f32);
+    assert_eq!(h.stat("exclusive_zones"), 1);
+
+    shell.tx().visible(bar.root, false).commit(3).unwrap();
+    shell.flush().unwrap();
+    h.settle();
+    await_configure(&mut conn, &mut inbox, &mut win, "the bar hiding");
+    assert_eq!(win.size.h, OUT.1 as f32, "the strip came back");
+    // Still *held*, just not honoured: the bar has not released anything.
+    assert_eq!(
+        h.stat("exclusive_zones"),
+        1,
+        "a hidden zone is skipped, not forgotten"
+    );
+
+    shell.tx().visible(bar.root, true).commit(4).unwrap();
+    shell.flush().unwrap();
+    h.settle();
+    await_configure(&mut conn, &mut inbox, &mut win, "the bar returning");
+    assert_eq!(
+        win.size.h,
+        OUT.1 as f32 - ZONE as f32,
+        "and showing again takes it back"
+    );
 
     drop((conn, shell));
     h.quit();

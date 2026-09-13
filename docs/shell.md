@@ -143,13 +143,27 @@ strip. Addition is the only rule that composes: `max` would silently make
 the second bar's reservation depend on the first's, and a shell cannot see
 the other shell's zone to work around it.
 
-**A zone is released by more than `px: 0`.** Also by the window becoming
-`Minimized`, by it closing, and by its client disconnecting. This matters
-more than it looks: a panel that hides itself on a keystroke must hand its
-strip back, and requiring it to send `SetExclusiveZone { px: 0 }` first
-means one forgotten message leaves the desktop permanently short — and a
-*crashed* bar leaves it short with no message coming at all. So visibility
-is consulted when the work area is computed, and `forget_window` drops the
+**A zone is released by more than `px: 0`.** Also whenever the window stops
+**showing** — hidden with `SetVisible(false)`, `Minimized`, closed, or its
+client gone. This matters more than it looks: a panel that hides itself on
+a keystroke must hand its strip back, and requiring it to send
+`SetExclusiveZone { px: 0 }` first means one forgotten message leaves the
+desktop permanently short — and a *crashed* bar leaves it short with no
+message coming at all.
+
+"Showing" is one predicate, `Server::showing`: alive, not `Minimized`, and
+its content subtree visible. Both this and the keyboard grab hang on it,
+and that is deliberate — they used to test it *differently* (the zone
+checked only `Minimized`, the grab checked node visibility too), which is
+exactly how two copies of one rule drift. A hidden bar's zone is skipped
+when the work area is computed rather than deleted, so unhiding restores it
+without the shell re-sending anything; `forget_window` is the permanent
+drop, for a window that is gone.
+
+Both halves need a reflow, and they arrive differently: a zone change goes
+through `apply_shell_op`, a `Minimized` through `set_state`, and a
+`SetVisible` through `ApplyOutcome::visibility_changed` — which exists only
+because `clients.rs` cannot know whether the window it just hid holds a
 zone.
 
 **The reflow is immediate and proportional.** When a zone changes,
@@ -207,7 +221,9 @@ Three priorities, in this order, in `Server::key`:
    wedged shell, and `Alt+Tab` is how you leave an application that has
    taken the keyboard.
 2. **The shell's bindings.**
-3. **The focused client**, or the grab holder.
+3. **The focused client**, or the grab holder — a grab replaces focus at
+   *this* step, which is why it does not outrank step 2. See
+   [Keyboard grabs](#keyboard-grabs).
 
 `mods` is a `mod_mask` bitmask (`SHIFT`/`CTRL`/`ALT`/`SUPER`), *not* the
 xkb mask `Key.mods` carries. xkb's serialized mask is an opaque bitmap
@@ -265,19 +281,34 @@ taking focus would make the window behind it look inactive and would move
 the MRU order. So it reads the keyboard through
 `GrabKeyboard { window, on }` instead.
 
-While granted, every key goes to the grabbing window instead of the focused
-one, **bound hotkeys included** — the launcher's own Escape must not be
-swallowed by whatever the shell bound. The focused window is never told it
-lost anything: it stays focused, keeps its active frame, and simply stops
-receiving keys.
+A grab replaces **focus** as the destination of key events: while it is
+held, keys go to the grabbing window rather than to the focused one. The
+focused window is never told it lost anything — it stays focused, keeps its
+active frame, and simply stops receiving keys.
 
-Released by `on: false`, by hiding the window, by closing it, or by the
-client disconnecting. The "by hiding" part is the one worth arguing:
-`Server::grab_target` checks the window's visibility on each key rather
-than watching commits. Lazily, because the scene does not report
-visibility changes and polling one node per key is cheaper than inspecting
-every commit — and it has to be checked at all because the launcher hides
-itself on Escape, and requiring an explicit release as well means one
+**A grab does not outrank the bindings.** The priority list above is the
+whole truth: compositor chords, then the shell's `BindKey` bindings, then
+the grab holder or the focused window. A chord that fires is reported as a
+`HotKey` and is *not* also delivered as a `Key` to the grab holder.
+
+That is the behaviour a launcher actually needs, which is why it is this way
+round rather than the other: a launcher opened by a bare-Super tap has to be
+closable by a second tap *while it holds the grab*, and if the grab
+outranked bindings the second tap would arrive as an ordinary key event and
+the launcher would have to reimplement tap detection itself. The cost is one
+rule a shell has to know, stated in `docs/wire.md` too: **do not bind a
+chord you also want delivered as a key to your grabbing window.** Escape,
+the key a launcher most wants, is nobody's chord, so this is not a
+constraint in practice.
+`a_bound_chord_under_a_grab_fires_as_a_hotkey_not_a_key` pins the order
+down.
+
+Released by `on: false`, by the window ceasing to **show**, by closing it,
+or by the client disconnecting. "Ceasing to show" is `Server::showing`,
+checked on each key rather than watched for: lazily, because the scene does
+not report visibility changes and polling one node per key is cheaper than
+inspecting every commit — and checked at all because the launcher hides
+itself on Escape, so requiring an explicit release as well would mean one
 forgotten message swallows the keyboard for the whole session.
 
 One grab at a time: a second replaces the first, whose owner is simply no
@@ -388,14 +419,16 @@ not working":
 * `src/lib.rs` unit-tests the two things the privilege check is made of:
   that only shell tokens read as privileged, and that `is_shell_op`
   classifies every shell op and no ordinary one.
-* `tests/shell.rs` drives 26 cases through the real event loop on the fake
+* `tests/shell.rs` drives 28 cases through the real event loop on the fake
   backend: the two sockets' capability bits and three shell clients at
   once; **every** shell op refused on the wire socket, one connection
   each, and refused *without a commit*; a bar creating, anchoring and
   reserving in **one transaction** (the probe's regression); a 32-px top
   zone shortening a maximized window's `Configure` by
-  exactly 32 and offsetting it by 32, released by `px: 0` and by
-  minimizing the bar; a zone moving a newly *placed* window, asserted
+  exactly 32 and offsetting it by 32, released by `px: 0`, by minimizing
+  the bar and by hiding it with `SetVisible(false)` — and taken back when
+  it shows again, since a hidden zone is skipped rather than forgotten; a
+  zone moving a newly *placed* window, asserted
   against `wm::place` on the shrunken area; a `Top` bar painted over a
   maximized window in a screenshot; `SetLayer{Normal}`, reserved anchor
   bits and a foreign `NodeId` each closing the connection with the right
@@ -408,8 +441,10 @@ not working":
   once and cancelled by another key and by a second modifier; unbind and
   disconnect both giving the chord back; a compositor chord refused; two
   clients contesting a chord; a grab routing keys to a `NO_FOCUS` overlay
-  and back without a `Focus` event, and released by hiding the window;
-  `Super`-drag still working with a shell connected and not looking like a
+  and back without a `Focus` event, released by hiding the window, and
+  **not** outranking a bound chord (which arrives as a `HotKey`, while the
+  tap still fires under the grab); `Super`-drag still working with a shell
+  connected and not looking like a
   tap; outputs listed, hotplugged and unplugged; and an anchored bar
   re-spanning after a hotplug.
 * `examples/shell_probe.rs` is the hardware probe: a `Top` bar with a 32-px

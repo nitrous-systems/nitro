@@ -269,6 +269,12 @@ pub struct ApplyOutcome {
     /// window the commit has not created yet. The privilege check is still
     /// on receipt, so an unprivileged client never gets this far.
     pub shell_ops: Vec<(WindowKey, shell::WindowOp)>,
+    /// Whether this transaction showed or hid one of the client's windows.
+    ///
+    /// A window that reserves an exclusive zone stops reserving it when it
+    /// stops showing, so the server has to recompute the work area — and it
+    /// is the server, not this module, that knows which windows hold zones.
+    pub visibility_changed: bool,
 }
 
 /// Apply one client's buffered mutations to the scene, atomically as far as
@@ -479,6 +485,14 @@ fn apply_msg(
         }
         ClientMsg::SetVisible(m) => {
             let key = node_key(client, m.id)?;
+            // Hiding a window that reserves screen space changes the work
+            // area, so the server has to reflow. Flagged rather than acted
+            // on, because only the server knows whether this window holds a
+            // zone at all; `window_of` would reject a non-window node, so the
+            // lookup is the tolerant one.
+            if client.windows.contains_key(&m.id) {
+                outcome.visibility_changed = true;
+            }
             scene
                 .set_visible(client.id, key, m.visible)
                 .map_err(|e| scene_err("SetVisible", e))

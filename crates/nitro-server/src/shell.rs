@@ -129,11 +129,13 @@ impl Zones {
         self.anchors.iter().map(|(w, a)| (*w, *a))
     }
 
-    /// Forget everything about a window: it closed, hid, or its client went.
+    /// Forget everything about a window: it closed, stopped showing, or its
+    /// client went.
     ///
-    /// Releasing the zone on *hide* as well as on close is what makes a bar
-    /// that toggles itself off give the space back without having to
-    /// remember to send `SetExclusiveZone { px: 0 }` first.
+    /// Whether a window is *showing* is the server's question (it owns the
+    /// scene), so a hidden bar's zone is skipped by the work-area
+    /// computation rather than removed here; this is the permanent
+    /// forgetting, for a window that is gone.
     pub fn forget(&mut self, win: WindowKey) {
         self.zones.remove(&win);
         self.anchors.remove(&win);

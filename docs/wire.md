@@ -855,9 +855,12 @@ maximize.
 
 Zones on one edge **add** (two bars docked to the top each get a strip),
 and a zone larger than the area collapses that axis to zero rather than
-going negative. A zone is released by `px: 0`, by the window becoming
-`Minimized`, by the window closing, or by the client disconnecting — so a
-crashed bar cannot leave the desktop permanently short.
+going negative. A zone is released by `px: 0`, and also whenever the window
+stops **showing** — hidden with `SetVisible { false }`, `Minimized`,
+closed, or its client gone — so a bar that toggles itself off hands the
+strip back without sending `px: 0` first, and a crashed bar cannot leave the
+desktop permanently short. Unhiding restores the zone: it is skipped while
+hidden, not forgotten.
 
 The server does **not** place the window for you; `SetAnchor` does. A
 shell may legitimately want a zone larger or smaller than the window it
@@ -935,16 +938,25 @@ binding of a client is released when it disconnects.
 | `window` | `u32` (`NodeId`) | one of the sender's own windows |
 | `on` | `bool` | whether to hold the grab |
 
-While granted, every key goes to this window instead of the focused one,
-**bound hotkeys included** — the launcher's own Escape must not be
-swallowed by whatever the shell bound. It is how a `NO_FOCUS` `Overlay`
-reads the keyboard without taking focus: the window that was focused stays
-focused, keeps its active frame, and is never told it lost anything. It
-simply stops receiving keys.
+A grab replaces **focus** as the destination of key events: while it is
+held, keys go to this window rather than to the focused one. It is how a
+`NO_FOCUS` `Overlay` reads the keyboard without taking focus — the window
+that was focused stays focused, keeps its active frame, and is never told
+it lost anything. It simply stops receiving keys.
 
-Released by `on: false`, by hiding the window (`SetVisible { false }` or
-`Minimized`), by closing it, or by the client disconnecting. One grab at a
-time: a second replaces the first.
+A grab does **not** outrank the bindings that run before delivery. The
+full order in the server is: the compositor's own chords, then any
+`BindKey` binding, then the grab holder or the focused window. So a chord
+that fires is reported as a `HotKey` and is *not* delivered as a `Key` to
+the grab holder — which is what lets a launcher opened by a bare-Super tap
+be closed by a second tap while it holds the grab. The consequence for a
+shell is concrete: **do not bind a chord you also want delivered as a key
+to your grabbing window**, because you will get the `HotKey` and not the
+`Key`.
+
+Released by `on: false`, by the window ceasing to show (`SetVisible
+{ false }` or `Minimized`), by closing it, or by the client disconnecting.
+One grab at a time: a second replaces the first.
 
 ### `WindowList` — 0x0407
 

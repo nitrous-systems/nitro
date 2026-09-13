@@ -1029,8 +1029,13 @@ fixed_msg! {
     /// The reservation comes off that output's **work area**, which is what
     /// `Maximized` fills and what new windows are placed into, so a 32-px
     /// top zone moves every maximized window 32 px down and makes it 32 px
-    /// shorter. `px` 0 releases the zone. The zone is released
-    /// automatically when the window is hidden, closed or the client goes.
+    /// shorter. `px` 0 releases the zone.
+    ///
+    /// The zone is also released automatically whenever the window stops
+    /// **showing** — hidden with [`SetVisible`], `Minimized`, closed, or its
+    /// client gone. A panel that hides itself on a keystroke therefore hands
+    /// its strip back without having to remember to send `px: 0` first, and
+    /// a panel that *crashes* cannot leave the desktop permanently short.
     ///
     /// Zones are additive per edge: two bars on the same edge reserve the
     /// sum. The server does not place the window for you — use
@@ -1105,14 +1110,23 @@ fixed_msg! {
     /// Take or release a keyboard grab on one of this client's windows
     /// (shell only; needs [`caps::SHELL`](crate::types::caps::SHELL)).
     ///
-    /// While granted, **every** key goes to this window instead of the
-    /// focused one, bound hotkeys included — the launcher's own Escape must
-    /// not be swallowed by whatever the shell bound. It is how a
-    /// `NO_FOCUS` overlay reads the keyboard without taking focus, so the
-    /// window that was focused stays focused and keeps its active styling.
+    /// A grab replaces **focus** as the destination of key events: while it
+    /// is held, keys go to this window rather than to the focused one. It is
+    /// how a `NO_FOCUS` overlay reads the keyboard without taking focus, so
+    /// the window that was focused stays focused, keeps its active styling,
+    /// and is never told it lost anything — it simply stops receiving keys.
     ///
-    /// Released by `on: false`, by hiding the window
-    /// ([`SetVisible`]), by closing it, or by the client disconnecting.
+    /// A grab does **not** outrank the bindings that run before delivery:
+    /// the compositor's own chords and any [`BindKey`] binding still fire
+    /// first, and a chord that fires is reported as a [`HotKey`] instead of
+    /// being delivered as a [`Key`] to the grab holder. That is what lets a
+    /// launcher opened by a bare-Super tap be closed by a second tap while
+    /// it holds the grab. The consequence for a shell is concrete: do not
+    /// bind a chord you also want delivered as a key to your grabbing
+    /// window, because you will get the `HotKey` and not the `Key`.
+    ///
+    /// Released by `on: false`, by the window ceasing to show ([`SetVisible`]
+    /// or `Minimized`), by closing it, or by the client disconnecting.
     /// One grab at a time: a second one replaces the first, whose owner is
     /// simply no longer receiving keys.
     GrabKeyboard {
