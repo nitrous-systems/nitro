@@ -875,8 +875,10 @@ fn a_minimized_window_leaves_the_screen_but_not_the_alt_tab_order() {
         "a minimized window must not swallow a click"
     );
 
-    // But Alt+Tab still reaches it, which is the whole reason it stays in
-    // the list — and reaching it brings it back.
+    // One Alt+Tab brings it back. Found on the box: minimizing used to
+    // leave the window at the *front* of the MRU list, so the first
+    // Alt+Tab landed on the window that had just inherited the focus and
+    // appeared to do nothing at all.
     h.key(KEY_LEFTALT, true);
     h.key(KEY_TAB, true);
     h.key(KEY_TAB, false);

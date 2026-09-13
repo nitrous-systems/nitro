@@ -2553,16 +2553,23 @@ impl Server {
         }
         self.apply_state_geometry(win, state);
         self.announce_state(win, state);
-        if state == WindowState::Minimized && self.focus == Some(win) {
-            // The focus has to go somewhere reachable, or the keyboard is
-            // lost until the user clicks.
-            let next = self
-                .wm
-                .mru()
-                .iter()
-                .copied()
-                .find(|w| *w != win && self.focusable(*w));
-            self.set_focus(next);
+        if state == WindowState::Minimized {
+            // Putting a window away makes it the *least* recently used, not
+            // the most: leaving it at the front is what makes the first
+            // `Alt+Tab` after a minimize land on the window that already
+            // has focus and appear to do nothing at all.
+            self.wm.demote(win);
+            if self.focus == Some(win) {
+                // The focus has to go somewhere reachable, or the keyboard
+                // is lost until the user clicks.
+                let next = self
+                    .wm
+                    .mru()
+                    .iter()
+                    .copied()
+                    .find(|w| *w != win && self.focusable(*w));
+                self.set_focus(next);
+            }
         }
     }
 
@@ -2943,6 +2950,7 @@ impl Server {
             .count();
         pairs.push(("minimized", minimized as u64));
         pairs.push(("dragging", u64::from(self.wm.drag().is_some())));
+        pairs.push(("focused", u64::from(self.focus.is_some())));
         protocol::stats_reply(&pairs)
     }
 

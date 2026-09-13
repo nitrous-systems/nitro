@@ -55,6 +55,7 @@ tests.
 | `stats`              | `ok\n`, one `key value` line per statistic (see below), blank line     |
 | `quit`               | `ok\n`, then orderly shutdown                                          |
 | `plug WxH`           | `ok\n`; fake backend only — hotplugs an output in, so a test can drive the "no output yet" state. Refused on DRM, where an output exists because a connector says so. |
+| `unplug`             | `ok\n`; fake backend only — removes the last output, which is the half that matters to the window manager: removing an output orphans its windows, and migrating them is the behaviour under test. |
 | `focus`              | `ok\n`; gives keyboard focus to the topmost window. Test-only, and it exists because focus otherwise *follows the click*: a toolkit test of Tab traversal would have to synthesise a click to get focus, which moves the focus to whatever widget was under the pointer — the very state it is about to assert on. `err no windows` when there are none. |
 | anything else        | `err <message>\n`                                                     |
 
@@ -589,6 +590,7 @@ looking for.
 | `decorated`              | Windows carrying a server-drawn frame. `windows - decorated` is how many opted out with `UNDECORATED`. |
 | `minimized`              | Windows hidden by `Minimized`. They are still in `windows` and still in the `Alt+Tab` order. |
 | `dragging`               | 1 while a move or resize drag is in flight. A drag that is still 1 with nothing on the desk is a stuck grab. |
+| `focused`                | 1 when some window has keyboard focus. 0 with windows on screen means every one of them is `NO_FOCUS` or minimized — or that the focus was dropped and not handed on, which is a bug. |
 
 The key naming is inconsistent on purpose — `paint_us_min` but
 `i2p_min_us` — because that is what the protocol spec says, and the wire
@@ -716,7 +718,42 @@ are taken at and why (see `docs/latency.md` §2 and §4). Sizes and RSS in
 | wedged client (SIGSTOP)  | cursor still 60.0 flips/s; `defer_timeouts` climbs         |
 | VT switches              | 3 round trips with a client connected: clean, input still routed |
 
-Two things need reading carefully.
+### M3-A: window management
+
+Measured on the same box against `nitro-calc` and `hello_dialog`, both
+server-decorated, driven with `ydotool`.
+
+| what | value |
+|---|---|
+| idle CPU, 6 decorated windows | **0 frames and 0 CPU ticks in 5 s** — decoration costs the idle case nothing, because a frame that does not change contributes no damage |
+| RSS, 5 `nitro-calc` windows | **11 336 kB**, against **10 604 kB** for the same test on `main`: window management costs **+732 kB**. Both are over the 8.5 MB line, which `main` was already missing; see below |
+| title-bar drag, 40 motions | `dragging 1` throughout, `damage_px_mean` **125 785** against a 225 × 363 frame (81 675 px), i.e. **1.5× the window** and 6 % of the 2 073 600-pixel screen |
+| drag input-to-photon | min 6 518 µs, **mean 14 533 µs**, max 22 568 µs, `paint_us_mean` 4 441 |
+| `Super+M`, `Super+H`, `Alt+Tab` | all act on the focused window; `Alt+Tab` after `Super+H` brings the minimized window back |
+| focus styling | focused and unfocused frames measurably differ in the screenshot (bar and border colours) |
+| VGA-1 | **disconnected on the box**, so the two-monitor case is covered by the fake backend's `plug`/`unplug` in `tests/wm.rs`, not on real hardware |
+
+Three of those need reading carefully.
+
+**The drag damage is the whole point of the scene's damage contract.** A
+move damages *old ∪ new bounds*, so dragging a window across a 1080p
+desktop costs about twice its own area per frame — measured at 1.5×,
+because consecutive motions inside one frame period coalesce. A
+compositor that repainted the screen per motion would report 2 073 600.
+
+**Drag latency is above the 9.3 ms pointer figure, and honestly so.** A
+resize sends a `Configure` per motion and the client answers it, so the
+number spans a full round trip including the toolkit's relayout; a move,
+which sends nothing at all, is the fast path. 14.5 ms is still inside one
+refresh at 60 Hz, which is the budget.
+
+**RSS is over, and was already over.** The A/B above is the useful number:
+window management adds 732 kB (the frame nodes, their shaped titles and
+the atlas pages those pull in), on top of a baseline that had already
+drifted from the 8 240 kB `docs/budget.md` records. Attributing the rest
+is a budget task, not this one.
+
+Two more things need reading carefully.
 
 **Latency is only measurable below the display's own rate.** Above about
 30 moves/s the demand for flips (two per move, the age-2 cursor cost)

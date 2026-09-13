@@ -479,6 +479,21 @@ impl WindowManager {
         }
     }
 
+    /// Move a window to the *back* of the MRU order without removing it.
+    ///
+    /// What minimizing does. A minimized window is still in the list — that
+    /// is what lets `Alt+Tab` bring it back — but it is emphatically not
+    /// the most recently used one any more: the user just put it away.
+    /// Leaving it at the front is what makes the first `Alt+Tab` after a
+    /// minimize land on the window that already has focus and appear to do
+    /// nothing at all.
+    pub fn demote(&mut self, window: WindowKey) {
+        if self.mru.contains(&window) {
+            self.mru.retain(|w| *w != window);
+            self.mru.push(window);
+        }
+    }
+
     /// Forget a window entirely (it closed).
     pub fn remove(&mut self, window: WindowKey) {
         self.mru.retain(|w| *w != window);
@@ -943,6 +958,26 @@ mod tests {
 
     fn key(n: u32) -> WindowKey {
         WindowKey::from_parts(n, 1)
+    }
+
+    #[test]
+    fn minimizing_demotes_a_window_without_losing_it() {
+        let mut wm = WindowManager::new();
+        wm.add(key(1));
+        wm.add(key(2));
+        wm.touch(key(2));
+        assert_eq!(wm.mru(), [key(2), key(1)]);
+        // Put the front window away: it stays reachable, at the back.
+        wm.demote(key(2));
+        assert_eq!(wm.mru(), [key(1), key(2)]);
+        // One Alt+Tab from the window that inherited the focus reaches it
+        // again, which is the behaviour a user expects and the whole
+        // reason `demote` exists rather than leaving it at the front.
+        let all = wm.mru().to_vec();
+        assert_eq!(wm.cycle_next(&all, true), Some(key(2)));
+        // Demoting something that is not in the list is a no-op.
+        wm.demote(key(9));
+        assert_eq!(wm.mru(), [key(1), key(2)]);
     }
 
     #[test]

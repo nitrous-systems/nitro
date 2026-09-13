@@ -287,6 +287,30 @@ else.
 `Minimized` is `visible = false` on the frame group, which is one
 `INHERIT` mutation and damages exactly the rectangle the window covered.
 
+## Measured
+
+On the test box (Pentium G3240, i915, HDMI-A-1 1920x1080@60), against
+`nitro-calc` and `hello_dialog`, both decorated, driven with `ydotool`.
+The `nitro-server` README has the full table; the three numbers that
+matter to this document:
+
+* **Idle stays zero.** Six decorated windows, 0 frames and 0 CPU ticks
+  over 5 s. Decoration costs the idle case nothing, because a title bar
+  that did not change contributes no damage.
+* **A drag damages the window, not the screen.** 40 motions dragging a
+  225 x 363 frame: `damage_px_mean` 125 785, which is 1.5x the window's
+  own 81 675 pixels (consecutive motions inside one frame period
+  coalesce) and 6 % of the 2 073 600-pixel screen.
+* **Drag input-to-photon is 14.5 ms mean**, inside one 16.7 ms refresh.
+
+RSS with five windows is 11 336 kB against 10 604 kB for the same test on
+`main`: window management costs **+732 kB** — the frame nodes, their
+shaped titles, and the atlas pages those pull in.
+
+The box has VGA-1 **disconnected**, so the multi-output paths are covered
+by the fake backend's `plug`/`unplug` in `crates/nitro-server/tests/wm.rs`
+rather than on real hardware.
+
 ## What is deferred
 
 * **Workspaces / virtual desktops.** Not in M3 at all. The MRU list and
