@@ -120,7 +120,12 @@ convention).
 | `Super+F` | toggle fullscreen |
 | `Super+H` | minimize |
 | `Super+←` / `Super+→` | tile to that half of the work area |
-| `Super+Enter` | **reserved** for the launcher/terminal (M3-B) |
+
+`Super+Enter` was **reserved** here in M3-A for "the launcher", and is no
+longer a compositor chord: M3-B's shell socket lets the launcher claim it
+with `BindKey`, and a chord this table still claimed could never reach the
+shell. A shell client's bindings sit between this table and the focused
+client — see `docs/shell.md`.
 
 `Ctrl+Super+…` is deliberately *not* a window-management chord: an
 application may reasonably want it, and the `Super` table must not swallow
@@ -197,9 +202,12 @@ client that declares nothing still cannot be resized into nothing.
 ## Work area and placement
 
 The **work area** is a per-output rectangle in logical units: everything a
-maximized or newly placed window may use. In M3-A it is the whole output.
-M3-B subtracts the shell's exclusive zones, and `wm::work_area` is the one
-function that will need to know about them.
+maximized or newly placed window may use. `wm::work_area` gives the
+output's own logical rectangle; since M3-B the shell's **exclusive zones**
+are subtracted from it, in exactly one place — `Server::local_work_area`,
+which every window-manager call site goes through. `wm::work_area` stays a
+pure function of the scene, and `docs/shell.md` has the zone rules (they
+add per edge, and a hidden or dead bar's zone is released).
 
 New windows are placed **centred-cascade**: the first window's frame is
 centred in the work area, each later one steps 28 px down and right, and
@@ -324,8 +332,6 @@ rather than on real hardware.
 * **A persistent output layout.** Position, rotation and scale per
   connector, edited by the user and remembered across reboots: the
   settings app, M4. `NITRO_SCALE` is the stop-gap.
-* **Exclusive zones.** The work area is the whole output until M3-B adds
-  the shell socket.
 * **Window snapping / edge tiling by drag.** `Super+←`/`→` tile; dragging
   a window to a screen edge does not.
 * **Per-window opacity and shadows.** The scene supports opacity; the

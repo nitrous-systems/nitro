@@ -5,7 +5,10 @@ backend (`nitro-kms`), a real scene graph (`nitro-scene`) painted with
 `nitro-raster`, clients over `nitro-wire`, input from libinput and
 xkbcommon, and — since M3 — **window management**: server-side
 decorations, move/resize/focus/MRU, window states and multi-output
-layout (`docs/wm.md`). `lib.rs` exposes `run(Config)`; `main.rs` only
+layout (`docs/wm.md`), plus a second, **privileged socket** the shell
+connects to for layers, exclusive zones, anchors, global hotkeys, the
+window list and output enumeration (`docs/shell.md`). `lib.rs` exposes
+`run(Config)`; `main.rs` only
 turns environment variables into a `Config`, so the integration tests
 drive the whole loop in-process on the fake backend with a fake input
 source — no seat, no DRM device and no evdev node anywhere. The M0 demo
@@ -14,7 +17,7 @@ background under the clients and the frames around them.
 
 ## Sockets
 
-Two, and they do different jobs.
+Three, and they do different jobs.
 
 The **wire socket** is the one clients use: `nitro-wire` v1, at
 `$XDG_RUNTIME_DIR/nitro/wire.sock` unless `NITRO_SOCKET` says otherwise
@@ -39,6 +42,22 @@ client that asks for a `Surface` node gets `WrongKind` and the connection
 closes, rather than discovering at runtime that the feature silently did
 nothing.
 
+The **shell socket** — since M3-B — is the same protocol at
+`$XDG_RUNTIME_DIR/nitro/shell.sock` (`NITRO_SHELL_SOCKET`), and a
+connection accepted there gets `SHELL` (bit 5) on top of the usual bits.
+That bit is the whole privilege model: the bar, the launcher and the
+wallpaper are ordinary `nitro-ui` clients that are allowed to set layers,
+reserve screen space, bind global hotkeys, grab the keyboard, list and
+control other clients' windows and enumerate outputs *because of where
+they connected*, not because of anything they sent. Same framing, same
+handshake, same decoder, same event-loop arm; the difference is one `if`
+against the epoll token range, in one place, before any shell op is looked
+at. An unprivileged client sending one gets `Error { Protocol }` and is
+disconnected. Several shell clients at once are fine (three processes),
+and both sockets live in the same `0700` directory, so the grant is
+precisely "a process running as this user" — `docs/shell.md` states what
+that is worth, what it is not, and what a finer model would need.
+
 The **control socket** is the v0 line protocol and stays as the server's
 own test and debug channel — it is what `nitro-shot` and the integration
 tests speak, and it deliberately has nothing to do with the client
@@ -60,8 +79,8 @@ tests.
 | anything else        | `err <message>\n`                                                     |
 
 Several requests per connection are fine; a request line longer than 256
-bytes without a newline drops the client. Both socket files are unlinked
-on shutdown.
+bytes without a newline drops the client. All three socket files are
+unlinked on shutdown.
 
 ## Environment
 
@@ -72,6 +91,7 @@ on shutdown.
 | `NITRO_FAKE_SIZE` | `WxH` (fake only)                | `1280x720`                     |
 | `NITRO_CONTROL`   | socket path                      | `$XDG_RUNTIME_DIR/nitro/control.sock`, else `/tmp/nitro-<uid>/control.sock` (with a warning) |
 | `NITRO_SOCKET`    | socket path                      | `$XDG_RUNTIME_DIR/nitro/wire.sock` (resolved by `nitro-wire`, so clients agree) |
+| `NITRO_SHELL_SOCKET` | privileged socket path        | `$XDG_RUNTIME_DIR/nitro/shell.sock` (same resolution; see `docs/shell.md`) |
 | `NITRO_INPUT`     | `off`                            | input enabled                  |
 | `NITRO_INPUT_DIR` | directory scanned for `event*`   | `/dev/input`                   |
 | `NITRO_SCALE`     | `<connector>=<f32>,…` per-output scale override, e.g. `HDMI-A-1=2` | EDID-derived: 2 at ≥ 192 dpi, else 1. See `docs/wm.md`. |
@@ -109,6 +129,7 @@ five seconds of idle after a deferral is 0 frames, 0 CPU ticks and
 | signal self-pipe          | SIGTERM/SIGINT → orderly shutdown (`signal-hook`'s `low_level::pipe` on a `UnixDatagram` pair) |
 | control listener          | accept, register the client                                              |
 | wire listener             | accept, allocate a `ClientId`, register the client                       |
+| shell listener            | the same, from the privileged token range: the accepted client's `Welcome` gets `caps::SHELL` |
 | wire client               | read, decode, buffer mutations, apply on `Commit`; `OUT` interest only while bytes are queued |
 | control client            | read lines, answer, drop on hangup; `OUT` interest only while a reply is queued |
 
@@ -505,7 +526,17 @@ the compositor's, and `docs/wm.md` has the whole table: **Ctrl+Alt** for
 the console escape hatches (Backspace quits, F1..F12 switch VT),
 **Alt+Tab** for the MRU focus cycle, and **Super** for the
 window-management shortcuts (`Q` close, `M` maximize, `F` fullscreen,
-`H` minimize, `←`/`→` tile, `Enter` reserved for the launcher).
+`H` minimize, `←`/`→` tile). `Super+Enter` was reserved for the launcher
+in M3-A and is no longer a compositor chord: a shell client binds it with
+`BindKey` on the shell socket, which is why the table had to give it up
+(`docs/shell.md`).
+
+A **shell** client's bindings sit between those and the focused client:
+after the compositor's, which are not negotiable, and before any
+application's, because a global hotkey the focused application could also
+see would be a keylogger and an ambiguity at once. A `GrabKeyboard` from a
+shell client outranks both the focus and its own bindings — the launcher's
+Escape must not be swallowed by whatever the shell bound.
 
 Routing:
 
@@ -591,6 +622,10 @@ looking for.
 | `minimized`              | Windows hidden by `Minimized`. They are still in `windows` and still in the `Alt+Tab` order. |
 | `dragging`               | 1 while a move or resize drag is in flight. A drag that is still 1 with nothing on the desk is a stuck grab. |
 | `focused`                | 1 when some window has keyboard focus. 0 with windows on screen means every one of them is `NO_FOCUS` or minimized — or that the focus was dropped and not handed on, which is a bug. |
+| `shell_clients`          | Connections on the **privileged** shell socket. The first key to look at when a bar "is not working": zero means it never got there. |
+| `hotkeys`                | Live `BindKey` bindings held by shell clients. |
+| `exclusive_zones`        | Windows reserving screen space off an output edge. |
+| `grabbed`                | 1 while a shell client holds a keyboard grab. A 1 with no launcher on screen is a stuck grab. |
 
 The key naming is inconsistent on purpose — `paint_us_min` but
 `i2p_min_us` — because that is what the protocol spec says, and the wire
@@ -700,6 +735,30 @@ limit of 1024 — but real.
   `plug`, a window dragged onto it changing `Configure.output`, and
   `unplug` migrating it back; and a scale-2 output drawing twice the
   device pixels for the same logical window.
+- `tests/shell.rs` drives the M3-B shell socket through the same real loop,
+  25 cases: the two sockets' capability bits and three shell clients at
+  once; **every one of the eleven shell ops** refused with `Protocol` on the
+  ordinary socket, one connection each (a check that covered ten would look
+  exactly like a working one until someone found the eleventh); a 32-px top
+  exclusive zone shortening a maximized window's `Configure` by exactly 32
+  and offsetting it by 32, released by `px: 0` and by minimizing the bar; a
+  zone moving a newly *placed* window, asserted against `wm::place` on the
+  shrunken area; a `Top` bar painted over a maximized window in a
+  screenshot; `SetLayer{Normal}`, reserved anchor bits and a foreign
+  `NodeId` each closing the connection with the right code; centred and
+  margin-inset anchors; the window list over three windows following a
+  retitle, a focus change, a state change and a close, with `WindowGone`
+  and a retired ref; `FocusWindow`/`SetWindowStateFor`/`CloseWindow` on
+  another client's window, and a stale ref being silently ignored rather
+  than fatal; `Super+Return` firing `HotKey` twice and reaching the focused
+  client *never*, while unbound `Super+A` still does; the bare-Super tap
+  firing once and cancelled by another key and by a second modifier; unbind
+  and disconnect both giving a chord back; a compositor chord refused; two
+  clients contesting a chord; a grab routing keys to a `NO_FOCUS` overlay
+  and back with no `Focus` event either way, and released by hiding the
+  window; `Super`-drag still moving a window with a shell connected and not
+  looking like a tap; outputs listed, hotplugged and unplugged; an anchored
+  bar re-spanning after a hotplug.
 - `src/test_support.rs`, behind the **`test-support`** feature, is
   `tests/fake_loop.rs`'s harness factored out so another crate can use it:
   `TestServer::start` runs the real loop on a thread with a fake backend
@@ -709,9 +768,14 @@ limit of 1024 — but real.
   client and a thread into anything that links it, and no shipped binary
   wants either.
 - Hardware: `just deploy`, `just shot`, `just box-chvt 1|2`, `just
-  box-stop` (see `docs/testbox.md`), plus two clients:
+  box-stop` (see `docs/testbox.md`), plus three clients:
   `hello_client`, which opens a gradient-and-rounded-rects window with an
-  image node and prints every `ServerMsg` it receives, and **`nitro-demo`**
+  image node and prints every `ServerMsg` it receives; **`shell_probe`**,
+  the M3-B probe for the privileged socket — a `Top` bar with a 32-px
+  exclusive zone and a `TOP|LEFT|RIGHT` anchor, `Super+Return` and the
+  bare-Super tap bound, and every `WindowInfo`/`OutputInfo`/`HotKey`
+  printed as it arrives (`ssh box 'XDG_RUNTIME_DIR=/run/user/1000
+  ~/nitro-bin/shell_probe'`); and **`nitro-demo`**
   (`crates/nitro-demo/README.md`), which is the measurement instrument:
   it follows the pointer, keeps its own input-to-photon histogram from
   `PointerMotion` to `Presented`, and cross-checks it against this
