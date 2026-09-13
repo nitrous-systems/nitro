@@ -77,7 +77,13 @@ fn harness() -> (Harness<S>, std::path::PathBuf) {
             typed: String::new(),
             message: None,
         },
-        Some(Size::new(280.0, 220.0)),
+        // The window has to fit the harness's 320x240 output *with its
+        // decorations on*: since M3 the server frames a window with a 28 px
+        // title bar and a 1 px border, so a 280x220 window is a 282x249
+        // thing on screen and its bottom rows fall off the output --
+        // which would make `shot` return a clipped crop rather than the
+        // whole window.
+        Some(Size::new(280.0, 200.0)),
         nitro_ui::Theme::default(),
         build,
     );

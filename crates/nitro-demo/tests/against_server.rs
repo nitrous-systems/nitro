@@ -19,6 +19,12 @@
 //! 3. `--animate` commits exactly once per `Frame` callback.
 //! 4. The damage outlines appear in a screenshot when they are on.
 //! 5. `--windows N` opens N windows and the cascade separates them.
+//!
+//! Since M3 the server places a window itself — decorated, and centred in
+//! the output's work area rather than at its origin — so none of the pixel
+//! assertions below may assume a window coordinate *is* an output
+//! coordinate. Every one of them goes through the window's own
+//! `Configure.position`, which is what [`Demo`] records.
 
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::os::unix::net::UnixStream;
@@ -26,13 +32,14 @@ use std::path::PathBuf;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use nitro_core::Point;
 use nitro_demo::app::{App, keys};
 use nitro_demo::args::{Args, Mode};
 use nitro_demo::geom::FOLLOWER_SIZE;
 use nitro_demo::scene::{Ids, WINDOW_SIZE};
 use nitro_kms::Image;
 use nitro_server::input::{FakeInput, InputEvent};
-use nitro_server::{BackendKind, Config, run};
+use nitro_server::{BackendKind, Config, run, wm};
 use nitro_wire::client::Connection;
 use nitro_wire::msg::ServerMsg;
 use nitro_wire::types::ButtonState;
@@ -47,11 +54,18 @@ fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
     }
 }
 
+/// The demo's own node count per window: root + background + 4 cards +
+/// image + mover + trail + follower + 8 outlines. The server's frame adds
+/// its own nodes on top, which the client neither creates nor owns.
+const DEMO_NODES: u64 = 18;
+
 struct Harness {
     dir: PathBuf,
     path: PathBuf,
     wire_path: PathBuf,
     input: FakeInput,
+    /// The output's device size: absolute input is a fraction of it.
+    out: (u32, u32),
     thread: Option<JoinHandle<Result<(), nitro_server::Error>>>,
 }
 
@@ -72,6 +86,7 @@ impl Harness {
             path,
             wire_path,
             input,
+            out: (width, height),
             thread: Some(thread),
         };
         wait_for("the control socket", || {
@@ -82,9 +97,21 @@ impl Harness {
     }
 
     /// The demo, connected to this server, with `args`.
-    fn demo(&self, args: Args) -> App {
+    fn demo(&self, args: Args) -> Demo {
         let conn = Connection::connect(&self.wire_path, "nitro-demo").expect("wire connect");
-        App::with_connection(conn, args).expect("demo start")
+        Demo::new(App::with_connection(conn, args).expect("demo start"))
+    }
+
+    /// Put the pointer at `p`, in output device coordinates.
+    ///
+    /// An absolute device reports in the output's unit square, so a test
+    /// that means "this pixel of the output" divides by the mode.
+    fn point_at(&self, p: Point, time_ns: u64) {
+        self.input.push(InputEvent::PointerAbsolute {
+            x: f64::from(p.x) / f64::from(self.out.0),
+            y: f64::from(p.y) / f64::from(self.out.1),
+            time_ns,
+        });
     }
 
     fn connect(&self) -> BufReader<UnixStream> {
@@ -187,16 +214,72 @@ fn stat(lines: &[String], key: &str) -> u64 {
         .unwrap()
 }
 
+/// The demo plus where the server put each of its windows.
+///
+/// The `App` itself does not keep `Configure.position` — it has no need
+/// for it, its scene is in window coordinates throughout — so the test
+/// records it as the messages go past. Every pixel assertion here is then
+/// expressed relative to a window's content origin rather than to the
+/// output's, which is what makes it independent of the placement policy.
+struct Demo {
+    app: App,
+    origins: Vec<Point>,
+}
+
+impl Demo {
+    fn new(app: App) -> Self {
+        let origins = vec![Point::ZERO; app.windows.len()];
+        Self { app, origins }
+    }
+
+    /// Where window `i`'s content starts on the output.
+    fn origin(&self, i: usize) -> Point {
+        self.origins[i]
+    }
+
+    /// `p`, a window-`i`-local point, in output coordinates.
+    fn on_output(&self, i: usize, p: Point) -> Point {
+        let o = self.origin(i);
+        Point::new(o.x + p.x, o.y + p.y)
+    }
+
+    /// One `App::tick`, recording every `Configure` that goes past.
+    fn tick(&mut self, timeout: Duration, events: &mut Vec<ServerMsg>) {
+        self.app.tick(Some(timeout), events).expect("tick");
+        for msg in events.iter() {
+            if let ServerMsg::Configure(c) = msg
+                && let Some(i) = Ids::window_index(c.window)
+                && let Some(slot) = self.origins.get_mut(i as usize)
+            {
+                *slot = c.position;
+            }
+        }
+    }
+}
+
+impl std::ops::Deref for Demo {
+    type Target = App;
+
+    fn deref(&self) -> &App {
+        &self.app
+    }
+}
+
+impl std::ops::DerefMut for Demo {
+    fn deref_mut(&mut self) -> &mut App {
+        &mut self.app
+    }
+}
+
 /// Pump the demo until `f` is satisfied, or time out. Everything the
 /// server sends goes through the demo's own `handle`, so the demo reacts
 /// exactly as the binary would.
-fn pump(app: &mut App, what: &str, mut f: impl FnMut(&App) -> bool) {
+fn pump(demo: &mut Demo, what: &str, mut f: impl FnMut(&App) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut events = Vec::new();
-    while !f(app) {
+    while !f(demo) {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        app.tick(Some(Duration::from_millis(20)), &mut events)
-            .expect("tick");
+        demo.tick(Duration::from_millis(20), &mut events);
     }
 }
 
@@ -242,11 +325,17 @@ fn the_demo_scene_is_accepted_and_painted_where_it_asked() {
     harness.settle();
     let img = harness.shot();
 
-    // The window cascades to (0, 0), so window coordinates are device
-    // coordinates. The gradient backdrop is dark at the top and lighter at
-    // the bottom, and neither is the desktop's own background.
-    let top = img.pixel(400, 4);
-    let bottom = img.pixel(400, WINDOW_SIZE.h as u32 - 4);
+    // Window coordinates are no longer output coordinates: the server
+    // decorates the window and centres it, so everything below is sampled
+    // relative to the content origin it reported. The gradient backdrop is
+    // dark at the top and lighter at the bottom, and neither is the
+    // desktop's own background.
+    let at = |p: Point| {
+        let d = app.on_output(0, p);
+        img.pixel(d.x as u32, d.y as u32)
+    };
+    let top = at(Point::new(400.0, 4.0));
+    let bottom = at(Point::new(400.0, WINDOW_SIZE.h - 4.0));
     assert_ne!(top, bottom, "the backdrop gradient is flat");
     let blue = |p: u32| p & 0xFF;
     assert!(blue(bottom) > blue(top), "gradient runs the wrong way");
@@ -255,15 +344,21 @@ fn the_demo_scene_is_accepted_and_painted_where_it_asked() {
     // away from the corners the radius rounds off.
     let cards = nitro_demo::scene::cards(WINDOW_SIZE);
     let c = cards[0];
-    let px = img.pixel((c.x + c.w / 2.0) as u32, (c.y + c.h / 2.0) as u32);
+    let px = at(Point::new(c.x + c.w / 2.0, c.y + c.h / 2.0));
     assert_eq!(px & 0x00FF_FFFF, 0x0033_88FF, "card 0 is not its colour");
 
     // The stats agree that a client with a real tree is connected.
     let s = harness.request_text("stats\n");
     assert_eq!(stat(&s, "clients"), 1);
     assert_eq!(stat(&s, "windows"), 1);
-    // Root + background + 4 cards + image + mover + trail + follower + 8 outlines.
-    assert_eq!(stat(&s, "nodes"), 18);
+    assert_eq!(stat(&s, "decorated"), 1);
+    // The demo's own nodes, plus the frame the server hung around them:
+    // the absolute count is no longer the client's alone, so what is
+    // asserted is that the client's whole tree arrived.
+    assert!(
+        stat(&s, "nodes") >= DEMO_NODES,
+        "the demo's {DEMO_NODES} nodes must all be in the scene: {s:?}"
+    );
 
     harness.quit();
 }
@@ -277,8 +372,9 @@ fn a_pointer_move_produces_a_latency_sample_measured_end_to_end() {
     pump(&mut app, "the first Presented", |a| a.presented > 0);
 
     // Walk the pointer across the window. Absolute motion in the fake
-    // backend's unit square; the window is at the origin, 800x500 of a
-    // 1280x720 output, so these all land inside it.
+    // backend's unit square; since M3 the window is wherever the window
+    // manager put it, so the walk is expressed in *window* coordinates and
+    // shifted onto the output by the content origin the server reported.
     //
     // The timestamps must be *now*, not a synthetic constant: the whole
     // measurement is `Presented.time_ns - input.time_ns` against the
@@ -288,13 +384,12 @@ fn a_pointer_move_produces_a_latency_sample_measured_end_to_end() {
     // reason. Stamping from the same clock is what makes the number mean
     // anything, and this test is the place that proves the units line up.
     let commits_before = app.frames_committed;
-    for i in 1..=20u64 {
-        let t = i as f64 / 40.0;
-        harness.input.push(InputEvent::PointerAbsolute {
-            x: 0.1 + t * 0.3,
-            y: 0.1 + t * 0.3,
-            time_ns: nitro_demo::monotonic_ns(),
-        });
+    for i in 1..=20u32 {
+        let step = i as f32 * 10.0;
+        harness.point_at(
+            app.on_output(0, Point::new(step, step)),
+            nitro_demo::monotonic_ns(),
+        );
         pump(&mut app, "the motion to be answered", |a| {
             a.frames_committed > commits_before && !a.hist.is_empty()
         });
@@ -328,14 +423,16 @@ fn a_pointer_move_produces_a_latency_sample_measured_end_to_end() {
 
     harness.settle();
     let img = harness.shot();
-    let f = app.windows[0].follower;
+    let follower = app.windows[0].follower;
     // Sample the follower's *upper-left* quadrant, not its centre: the
     // follower is centred on the pointer and the software cursor is drawn
     // from the pointer down and to the right, so the centre pixel belongs
     // to the arrow. (The cursor is composited into the framebuffer on
     // purpose — a KMS cursor plane would not appear in a screenshot at
-    // all — which is exactly why it lands in this assertion.)
-    let px = img.pixel(f.x as u32 + 6, f.y as u32 + 6);
+    // all — which is exactly why it lands in this assertion.) The
+    // follower's rect is in window coordinates, hence the shift.
+    let at = app.on_output(0, Point::new(follower.x + 6.0, follower.y + 6.0));
+    let px = img.pixel(at.x as u32, at.y as u32);
     assert_eq!(
         px & 0x00FF_FFFF,
         0x00FF_E040,
@@ -396,14 +493,15 @@ fn damage_outlines_are_drawn_when_they_are_on() {
     });
     pump(&mut app, "Configure", |a| a.windows[0].configured);
 
-    // Two motions: the first has nothing to leave behind, the second
-    // damages the rect it left and the one it arrived at.
-    for (i, (x, y)) in [(0.15, 0.15), (0.35, 0.35)].into_iter().enumerate() {
-        harness.input.push(InputEvent::PointerAbsolute {
-            x,
-            y,
-            time_ns: 20_000_000 + i as u64 * 5_000_000,
-        });
+    // Two motions inside the window: the first has nothing to leave
+    // behind, the second damages the rect it left and the one it arrived
+    // at. Aimed through the content origin, since the window is no longer
+    // at the output's.
+    for (i, (x, y)) in [(200.0, 120.0), (450.0, 260.0)].into_iter().enumerate() {
+        harness.point_at(
+            app.on_output(0, Point::new(x, y)),
+            20_000_000 + i as u64 * 5_000_000,
+        );
         let before = app.frames_committed;
         pump(&mut app, "the motion to be answered", |a| {
             a.frames_committed > before
@@ -415,7 +513,8 @@ fn damage_outlines_are_drawn_when_they_are_on() {
     // The outline is drawn around the follower's own rect, so its top edge
     // is the outline colour rather than the follower's yellow.
     let f = app.windows[0].follower;
-    let edge = img.pixel((f.x + f.w / 2.0) as u32, f.y as u32 + 1);
+    let p = app.on_output(0, Point::new(f.x + f.w / 2.0, f.y + 1.0));
+    let edge = img.pixel(p.x as u32, p.y as u32);
     assert_eq!(
         edge & 0x00FF_FFFF,
         0x00FF_3030,
@@ -439,7 +538,12 @@ fn several_windows_are_cascaded_and_each_gets_its_own_ids() {
 
     let s = harness.request_text("stats\n");
     assert_eq!(stat(&s, "windows"), 3);
-    assert_eq!(stat(&s, "nodes"), 3 * 18);
+    assert_eq!(stat(&s, "decorated"), 3);
+    // Each window's own tree, plus the frame the server drew around it.
+    assert!(
+        stat(&s, "nodes") >= 3 * DEMO_NODES,
+        "every window's tree must be in the scene: {s:?}"
+    );
 
     // Ids do not collide: each window's root is `STRIDE` apart, and the
     // server accepted all three (a collision would have been a fatal
@@ -448,19 +552,43 @@ fn several_windows_are_cascaded_and_each_gets_its_own_ids() {
         assert_eq!(w.ids, Ids::for_window(i as u32));
     }
 
+    // The windows are separated, and by the *cascade step* the window
+    // manager uses: since M3 the walk starts from the centre of the work
+    // area rather than from the origin, so the invariant is the difference
+    // between consecutive placements, not any absolute coordinate. The step
+    // itself is measured off `wm::place` rather than named, because it is
+    // private to the window manager.
+    let inset = wm::frame_insets();
+    let frame = nitro_core::Size::new(
+        WINDOW_SIZE.w + inset.width(),
+        WINDOW_SIZE.h + inset.height(),
+    );
+    let area = nitro_core::Rect::new(0.0, 0.0, 1280.0, 720.0);
+    let (first, second) = (wm::place(0, frame, area), wm::place(1, frame, area));
+    let step = (second.x - first.x, second.y - first.y);
+    assert!(
+        step.0 > 0.0 && step.1 > 0.0,
+        "the cascade must actually step at this size, or the loop below is vacuous: {step:?}"
+    );
+    for i in 1..app.windows.len() {
+        let (prev, this) = (app.origin(i - 1), app.origin(i));
+        assert_eq!(
+            (this.x - prev.x, this.y - prev.y),
+            step,
+            "window {i} did not cascade off window {}",
+            i - 1
+        );
+    }
+
     harness.settle();
     let img = harness.shot();
-    // The cascade puts each window CASCADE_STEP px down and right of the
-    // last, so window 2's card 3 is two steps off window 0's. Sampling at
-    // the *cascaded* position is the test: at the un-shifted coordinate
-    // there is only window 0's backdrop, which is exactly the bug a fixed
-    // coordinate would hide.
-    let step = nitro_server::clients::CASCADE_STEP * 2.0;
+    // Sampling at the *topmost* window's own position is the test: at
+    // window 0's coordinate there is only window 0's backdrop, which is
+    // exactly the bug a fixed coordinate would hide.
+    let top = app.windows.len() - 1;
     let c = nitro_demo::scene::cards(WINDOW_SIZE)[3];
-    let px = img.pixel(
-        (c.x + c.w / 2.0 + step) as u32,
-        (c.y + c.h / 2.0 + step) as u32,
-    );
+    let p = app.on_output(top, Point::new(c.x + c.w / 2.0, c.y + c.h / 2.0));
+    let px = img.pixel(p.x as u32, p.y as u32);
     assert_eq!(px & 0x00FF_FFFF, 0x00E0_3B8B, "card 3 of the top window");
 
     harness.quit();
@@ -485,8 +613,7 @@ fn an_idle_demo_leaves_the_server_flipping_nothing() {
     // And the demo itself is blocked, not spinning: a poll with a short
     // timeout returns having read nothing.
     let mut events: Vec<ServerMsg> = Vec::new();
-    app.tick(Some(Duration::from_millis(50)), &mut events)
-        .unwrap();
+    app.tick(Duration::from_millis(50), &mut events);
     assert!(events.is_empty(), "an idle server sent {events:?}");
 
     harness.quit();
@@ -504,12 +631,12 @@ fn toggling_damage_outlines_redraws_the_last_damage_both_ways() {
     let mut app = harness.demo(follow_args());
     pump(&mut app, "Configure", |a| a.windows[0].configured);
 
-    for (i, (x, y)) in [(0.15, 0.15), (0.30, 0.28)].into_iter().enumerate() {
-        harness.input.push(InputEvent::PointerAbsolute {
-            x,
-            y,
-            time_ns: nitro_demo::monotonic_ns() + i as u64,
-        });
+    // Two motions inside the window, aimed through its content origin.
+    for (i, (x, y)) in [(200.0, 120.0), (380.0, 200.0)].into_iter().enumerate() {
+        harness.point_at(
+            app.on_output(0, Point::new(x, y)),
+            nitro_demo::monotonic_ns() + i as u64,
+        );
         let before = app.frames_committed;
         pump(&mut app, "the motion to be answered", |a| {
             a.frames_committed > before
@@ -526,7 +653,8 @@ fn toggling_damage_outlines_redraws_the_last_damage_both_ways() {
     harness.settle();
     let img = harness.shot();
     let f = app.windows[0].follower;
-    let edge = img.pixel((f.x + f.w / 2.0) as u32, f.y as u32 + 1);
+    let p = app.on_output(0, Point::new(f.x + f.w / 2.0, f.y + 1.0));
+    let edge = img.pixel(p.x as u32, p.y as u32);
     assert_eq!(
         edge & 0x00FF_FFFF,
         0x00FF_3030,
@@ -538,7 +666,7 @@ fn toggling_damage_outlines_redraws_the_last_damage_both_ways() {
     assert!(!app.show_damage);
     harness.settle();
     let img = harness.shot();
-    let edge = img.pixel((f.x + f.w / 2.0) as u32, f.y as u32 + 1);
+    let edge = img.pixel(p.x as u32, p.y as u32);
     assert_ne!(
         edge & 0x00FF_FFFF,
         0x00FF_3030,

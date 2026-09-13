@@ -14,13 +14,12 @@ use std::time::{Duration, Instant};
 
 use nitro_core::{Color, IRect, Point, Rect, Size};
 use nitro_kms::Image;
-use nitro_server::clients::CASCADE_STEP;
 use nitro_server::cursor::CURSOR_SIZE;
 use nitro_server::input::{FakeInput, InputEvent};
 use nitro_server::render::{FRAME, background_color};
-use nitro_server::{BackendKind, Config, run};
+use nitro_server::{BackendKind, Config, run, wm};
 use nitro_wire::client::Connection;
-use nitro_wire::msg::ServerMsg;
+use nitro_wire::msg::{Configure, ServerMsg};
 use nitro_wire::types::{ButtonState, Layer, NodeId};
 
 /// Wait for a condition, polling. Every wait in this file has a deadline:
@@ -38,6 +37,9 @@ struct Harness {
     path: PathBuf,
     wire_path: PathBuf,
     input: FakeInput,
+    /// The output's device size, which absolute input is expressed in
+    /// fractions of. `(0, 0)` until a headless server is plugged into.
+    out: (u32, u32),
     thread: Option<JoinHandle<Result<(), nitro_server::Error>>>,
 }
 
@@ -61,12 +63,17 @@ impl Harness {
         let input = FakeInput::new().expect("eventfd");
         config.fake_input = Some(input.clone());
         let wire_path = config.wire_path.clone();
+        let out = match config.backend {
+            BackendKind::Fake { width, height } => (width, height),
+            _ => (0, 0),
+        };
         let thread = std::thread::spawn(move || run(config));
         let h = Self {
             dir,
             path,
             wire_path,
             input,
+            out,
             thread: Some(thread),
         };
         wait_for("the control socket", || {
@@ -84,6 +91,23 @@ impl Harness {
 
     fn client(&self, name: &str) -> Connection {
         Connection::connect(&self.wire_path, name).expect("wire connect")
+    }
+
+    /// Aim the pointer at `local`, a coordinate inside the *content* of the
+    /// window `c` describes.
+    ///
+    /// An absolute device reports in the output's unit square, and since M3
+    /// a window is wherever the window manager put it — decorated, and
+    /// centred rather than at the origin. So a test that means "point at
+    /// this spot in the window" has to go through the window's own
+    /// `Configure`, which is the position of its content.
+    fn point_at(&self, c: &Configure, local: Point, time_ns: u64) {
+        let (w, h) = self.out;
+        self.input.push(InputEvent::PointerAbsolute {
+            x: f64::from(c.position.x + local.x) / f64::from(w),
+            y: f64::from(c.position.y + local.y) / f64::from(h),
+            time_ns,
+        });
     }
 
     /// Send a request whose reply is a bare status line with no body:
@@ -243,6 +267,54 @@ fn make_window(conn: &mut Connection, root: u32, size: Size, color: Color, seria
     Window { root, rect }
 }
 
+/// Where the window manager puts window number `index` of content `size`
+/// on an unoccupied output of `out` device pixels at scale 1: the frame
+/// rect and the content origin the client is told about.
+///
+/// This is the M3 placement model spelled out. The server wraps a window
+/// in a frame it owns (a title bar and a border), places that *frame* by a
+/// centred cascade in the output's work area, and reports the *content*
+/// origin in `Configure.position`. Everything goes through `wm::place`
+/// rather than re-deriving the policy: a test that reimplemented it would
+/// only be asserting that two copies of the same arithmetic agree.
+fn placement(index: u32, size: Size, out: (u32, u32)) -> (Rect, Point) {
+    // At scale 1 the work area is the whole output; M3-A subtracts nothing
+    // from it yet.
+    let area = Rect::new(0.0, 0.0, out.0 as f32, out.1 as f32);
+    let inset = wm::frame_insets();
+    let frame = Size::new(size.w + inset.width(), size.h + inset.height());
+    let at = wm::place(index, frame, area);
+    (
+        Rect::new(at.x, at.y, frame.w, frame.h),
+        Point::new(at.x + inset.left, at.y + inset.top),
+    )
+}
+
+/// The centre of `area` a frame of `size` would sit at, before any cascade
+/// step: the position `wm::place` gives the very first window.
+///
+/// Rounded, because placement is: a window on a half pixel puts every edge
+/// and every glyph in it between device pixels.
+fn centred(size: Size, out: (u32, u32)) -> Point {
+    Point::new(
+        ((out.0 as f32 - size.w) / 2.0).round(),
+        ((out.1 as f32 - size.h) / 2.0).round(),
+    )
+}
+
+/// One cascade step for a window of content `size` on `out`, measured off
+/// `wm::place` rather than named.
+///
+/// The step is private to the window manager, so a test that hard-coded
+/// its current value would be pinning a coincidence rather than the
+/// policy. Measuring it keeps the assertion "consecutive windows step down
+/// and right by whatever the cascade's step is", which is the invariant
+/// that actually matters.
+fn cascade_step(size: Size, out: (u32, u32)) -> (f32, f32) {
+    let (first, second) = (placement(0, size, out).0, placement(1, size, out).0);
+    (second.x - first.x, second.y - first.y)
+}
+
 /// The cursor sits at the centre of the output and would otherwise
 /// contaminate every pixel comparison; park it in a corner far from the
 /// windows under test.
@@ -314,7 +386,14 @@ fn outputs_shot_stats_quit_on_fake_backend() {
 }
 
 #[test]
-fn a_client_window_is_configured_presented_and_painted_where_the_cascade_put_it() {
+fn a_client_window_is_configured_presented_and_painted_where_the_wm_put_it() {
+    // M3 moved placement out from under this test twice over: the server
+    // now wraps the window in a frame it owns, and puts that frame in the
+    // *centre* of the work area rather than at the output's origin. So the
+    // assertion is no longer "the pixels are at (0, 0)" but "the pixels are
+    // where the server said they are" — `Configure.position` is the content
+    // origin, and every coordinate below is relative to it. Placement
+    // policy itself is checked against `wm::place`, once.
     let (w, h) = (320, 200);
     let h_ = Harness::start("client", w, h);
     park_cursor(&h_, 0.99, 0.99);
@@ -330,7 +409,16 @@ fn a_client_window_is_configured_presented_and_painted_where_the_cascade_put_it(
         _ => None,
     });
     assert_eq!(configure.size, size);
-    assert_eq!(configure.position, Point::new(0.0, 0.0));
+    let (frame, content) = placement(0, size, (w, h));
+    assert_eq!(
+        configure.position, content,
+        "the position is the content origin: the frame's origin plus the insets"
+    );
+    assert_eq!(
+        frame.origin(),
+        centred(frame.size(), (w, h)),
+        "the first window's frame is centred in the work area"
+    );
     assert!((configure.scale - 1.0).abs() < f32::EPSILON);
 
     // And reports the commit as presented once the frame lands.
@@ -343,53 +431,113 @@ fn a_client_window_is_configured_presented_and_painted_where_the_cascade_put_it(
 
     h_.settle();
     let img = h_.shot(None).unwrap();
-    // The first window cascades to (0, 0).
-    for (x, y, inside) in [
-        (10, 10, true),
-        (99, 59, true),
-        (100, 30, false),
-        (30, 60, false),
+    // Inside the *content* is the client's rect; just outside it is either
+    // the server's own frame or the desktop, and the frame is the server's
+    // business, so only the content and the desktop beyond the frame are
+    // asserted on here.
+    let at = |dx: f32, dy: f32| ((content.x + dx) as u32, (content.y + dy) as u32);
+    for (dx, dy) in [(10.0, 10.0), (size.w - 1.0, size.h - 1.0)] {
+        let (x, y) = at(dx, dy);
+        assert_eq!(
+            img.pixel(x, y),
+            0x00FF_4040,
+            "({x},{y}) should be the client's rect"
+        );
+    }
+    for (dx, dy) in [
+        (size.w + wm::BORDER + 1.0, 30.0),
+        (30.0, size.h + wm::BORDER + 1.0),
     ] {
-        let got = img.pixel(x, y);
-        if inside {
-            assert_eq!(got, 0x00FF_4040, "({x},{y}) should be the client's rect");
-        } else {
-            assert_eq!(
-                got,
-                background_color(x, y, w, h),
-                "({x},{y}) should be the desktop"
-            );
-        }
+        let (x, y) = at(dx, dy);
+        assert_eq!(
+            img.pixel(x, y),
+            background_color(x, y, w, h),
+            "({x},{y}) is beyond the frame, so it should be the desktop"
+        );
     }
 
     let s = h_.request_text("stats\n");
     assert_eq!(stat(&s, "clients"), 1);
     assert_eq!(stat(&s, "windows"), 1);
-    // The window's root group plus the rect.
-    assert_eq!(stat(&s, "nodes"), 2);
+    assert_eq!(stat(&s, "decorated"), 1, "the window is server-decorated");
+    // The client owns exactly two nodes (its content group and the rect);
+    // the rest of the count is the frame the server drew around them, which
+    // is why this is no longer the flat `2` of M1.
+    let client_nodes = 2;
+    assert!(
+        stat(&s, "nodes") > client_nodes,
+        "a decorated window has the client's nodes plus the server's: {s:?}"
+    );
     assert!(stat(&s, "paint_us_max") > 0, "{s:?}");
     assert!(stat(&s, "damage_px_mean") > 0, "{s:?}");
 
-    // A second window cascades one step down and right.
+    h_.quit();
+}
+
+/// The placement *policy*, which used to be half of the test above: the
+/// cascade steps down and right from the centred first window, never off
+/// screen, and each window keeps its own pixels where the next does not
+/// cover them.
+#[test]
+fn a_second_window_cascades_off_the_first_and_stays_on_screen() {
+    let (w, h) = (320, 200);
+    let h_ = Harness::start("cascade", w, h);
+    park_cursor(&h_, 0.99, 0.99);
+
+    let mut first = h_.client("first");
+    let mut seen = Vec::new();
+    let size = Size::new(100.0, 60.0);
+    let win = make_window(&mut first, 1, size, Color::rgb(0xFF, 0x40, 0x40), 1);
+    let configure = expect(&mut first, &mut seen, "Configure", |m| match m {
+        ServerMsg::Configure(c) if c.window == win.root => Some(*c),
+        _ => None,
+    });
+    let content = placement(0, size, (w, h)).1;
+    assert_eq!(configure.position, content);
+
     let mut other = h_.client("second");
-    let win2 = make_window(
-        &mut other,
-        10,
-        Size::new(80.0, 50.0),
-        Color::rgb(0x40, 0xFF, 0x40),
-        1,
-    );
     let mut seen2 = Vec::new();
-    expect(&mut other, &mut seen2, "Configure", |m| match m {
+    let size2 = Size::new(80.0, 50.0);
+    let win2 = make_window(&mut other, 10, size2, Color::rgb(0x40, 0xFF, 0x40), 1);
+    let configure2 = expect(&mut other, &mut seen2, "Configure", |m| match m {
         ServerMsg::Configure(c) if c.window == win2.root => Some(*c),
         _ => None,
     });
+    let (frame2, content2) = placement(1, size2, (w, h));
+    assert_eq!(configure2.position, content2);
+
+    let centre2 = centred(frame2.size(), (w, h));
+    let step2 = cascade_step(size2, (w, h));
+    assert!(
+        step2.0 > 0.0 && step2.1 > 0.0,
+        "the cascade must actually step here, or the assertion below is vacuous: {step2:?}"
+    );
+    assert_eq!(
+        (frame2.x - centre2.x, frame2.y - centre2.y),
+        step2,
+        "the second window steps down and right of the centred first one"
+    );
+    assert!(
+        frame2.x >= 0.0
+            && frame2.y >= 0.0
+            && frame2.right() <= w as f32
+            && frame2.bottom() <= h as f32,
+        "a placed window stays inside the output: {frame2:?}"
+    );
+
     h_.settle();
     let img = h_.shot(None).unwrap();
-    let step = CASCADE_STEP as u32;
-    assert_eq!(img.pixel(step + 5, step + 5), 0x0040_FF40);
-    // The first window is still visible where the second does not cover it.
-    assert_eq!(img.pixel(5, 5), 0x00FF_4040);
+    assert_eq!(
+        img.pixel((content2.x + 5.0) as u32, (content2.y + 5.0) as u32),
+        0x0040_FF40
+    );
+    // The first window is still visible where the second does not cover it:
+    // its own top-left content corner is above and left of the second's
+    // frame, because the cascade only ever steps down and right.
+    assert_eq!(
+        img.pixel((content.x + 1.0) as u32, (content.y + 1.0) as u32),
+        0x00FF_4040
+    );
 
     h_.quit();
 }
@@ -407,18 +555,17 @@ fn pointer_motion_enters_the_window_and_reports_local_coordinates() {
         Color::rgb(0, 0, 0xFF),
         1,
     );
-    expect(&mut conn, &mut seen, "Configure", |m| match m {
+    let configure = expect(&mut conn, &mut seen, "Configure", |m| match m {
         ServerMsg::Configure(c) if c.window == win.root => Some(*c),
         _ => None,
     });
 
-    // Start outside the window, then move inside it.
+    // Start outside the window, then move inside it. The coordinates a
+    // client is told are relative to its *content* group, which decoration
+    // does not move — so the assertions below are unchanged, but the
+    // absolute point aimed at has to go through `Configure.position`.
     park_cursor(&h_, 0.9, 0.9);
-    h_.input.push(InputEvent::PointerAbsolute {
-        x: 40.0 / f64::from(w),
-        y: 25.0 / f64::from(h),
-        time_ns: 2_000_000,
-    });
+    h_.point_at(&configure, Point::new(40.0, 25.0), 2_000_000);
     let enter = expect(&mut conn, &mut seen, "PointerEnter", |m| match m {
         ServerMsg::PointerEnter(e) => Some(*e),
         _ => None,
@@ -428,11 +575,7 @@ fn pointer_motion_enters_the_window_and_reports_local_coordinates() {
     assert_eq!(enter.pos, Point::new(40.0, 25.0));
 
     // Another move inside is a motion, not a second enter.
-    h_.input.push(InputEvent::PointerAbsolute {
-        x: 60.0 / f64::from(w),
-        y: 30.0 / f64::from(h),
-        time_ns: 3_000_000,
-    });
+    h_.point_at(&configure, Point::new(60.0, 30.0), 3_000_000);
     let motion = expect(&mut conn, &mut seen, "PointerMotion", |m| match m {
         ServerMsg::PointerMotion(m) => Some(*m),
         _ => None,
@@ -477,50 +620,51 @@ fn a_click_focuses_and_raises_over_another_window() {
 
     let mut first = h_.client("first");
     let mut seen1 = Vec::new();
-    let w1 = make_window(
-        &mut first,
-        1,
-        Size::new(150.0, 120.0),
-        Color::rgb(0xFF, 0, 0),
-        1,
-    );
+    // Small enough that the centred cascade has room for a step: on a
+    // 320x200 output a 150x120 frame is already so close to the edges that
+    // `wm::place` clamps every window onto the same spot, and then there is
+    // no overlap to raise anything over.
+    let size = Size::new(100.0, 60.0);
+    let w1 = make_window(&mut first, 1, size, Color::rgb(0xFF, 0, 0), 1);
     let c1 = expect(&mut first, &mut seen1, "Configure", |m| match m {
         ServerMsg::Configure(c) if c.window == w1.root => Some(*c),
         _ => None,
     });
-    assert_eq!(c1.position, Point::new(0.0, 0.0));
+    assert_eq!(c1.position, placement(0, size, (w, h)).1);
 
     let mut second = h_.client("second");
     let mut seen2 = Vec::new();
-    let w2 = make_window(
-        &mut second,
-        1,
-        Size::new(150.0, 120.0),
-        Color::rgb(0, 0xFF, 0),
-        1,
-    );
+    let w2 = make_window(&mut second, 1, size, Color::rgb(0, 0xFF, 0), 1);
     let c2 = expect(&mut second, &mut seen2, "Configure", |m| match m {
         ServerMsg::Configure(c) if c.window == w2.root => Some(*c),
         _ => None,
     });
-    // The second window is one cascade step down and to the right.
-    assert_eq!(c2.position, Point::new(CASCADE_STEP, CASCADE_STEP));
+    // Since M3 the cascade is centred rather than run from the origin, so
+    // "one step down and right" is a statement about the *difference*
+    // between the two positions, not about either one's absolute value.
+    let step = cascade_step(size, (w, h));
+    assert!(
+        step.0 > 0.0 && step.1 > 0.0,
+        "the cascade must actually step here, or there is no overlap to raise: {step:?}"
+    );
+    assert_eq!(
+        (c2.position.x - c1.position.x, c2.position.y - c1.position.y),
+        step,
+        "the second window is one cascade step down and to the right"
+    );
 
     // The second window cascaded over the first; where they overlap, the
-    // newest is on top.
+    // newest is on top. The overlap is inside both windows' *content*,
+    // which is what the clients painted.
     h_.settle();
-    let step = CASCADE_STEP as u32;
-    let overlap = (step + 10, step + 10);
+    let overlap = ((c2.position.x + 10.0) as u32, (c2.position.y + 10.0) as u32);
     let img = h_.shot(None).unwrap();
     assert_eq!(img.pixel(overlap.0, overlap.1), 0x0000_FF00);
 
-    // Click on the part of the first window the second does not cover.
-    let (px, py) = (10.0, 10.0);
-    h_.input.push(InputEvent::PointerAbsolute {
-        x: px / f64::from(w),
-        y: py / f64::from(h),
-        time_ns: 5_000_000,
-    });
+    // Click on the part of the first window the second does not cover: the
+    // top-left of its content, a step above and left of the second window.
+    let local = Point::new(10.0, 10.0);
+    h_.point_at(&c1, local, 5_000_000);
     h_.input.push(InputEvent::PointerButton {
         button: nitro_server::input::BTN_LEFT,
         state: ButtonState::Pressed,
@@ -558,20 +702,28 @@ fn disconnecting_destroys_everything_the_client_owned_and_repaints() {
 
     let mut conn = h_.client("doomed");
     let mut seen = Vec::new();
-    let win = make_window(
-        &mut conn,
-        1,
-        Size::new(120.0, 80.0),
-        Color::rgb(0xFF, 0, 0xFF),
-        1,
-    );
-    expect(&mut conn, &mut seen, "Configure", |m| match m {
+    let size = Size::new(120.0, 80.0);
+    let win = make_window(&mut conn, 1, size, Color::rgb(0xFF, 0, 0xFF), 1);
+    let configure = expect(&mut conn, &mut seen, "Configure", |m| match m {
         ServerMsg::Configure(c) if c.window == win.root => Some(*c),
         _ => None,
     });
     h_.settle();
-    assert_eq!(h_.shot(None).unwrap().pixel(50, 40), 0x00FF_00FF);
-    assert_eq!(stat(&h_.request_text("stats\n"), "nodes"), 2);
+    let at = |dx: f32, dy: f32| {
+        (
+            (configure.position.x + dx) as u32,
+            (configure.position.y + dy) as u32,
+        )
+    };
+    let middle = at(50.0, 40.0);
+    assert_eq!(
+        h_.shot(None).unwrap().pixel(middle.0, middle.1),
+        0x00FF_00FF
+    );
+    // The client owns its content group and one rect; the count also holds
+    // the frame the server drew, which is not the client's to destroy.
+    let with_client = stat(&h_.request_text("stats\n"), "nodes");
+    assert!(with_client >= 2);
 
     drop(conn);
     wait_for("the client to be reaped", || {
@@ -579,16 +731,22 @@ fn disconnecting_destroys_everything_the_client_owned_and_repaints() {
     });
     let s = h_.request_text("stats\n");
     assert_eq!(stat(&s, "windows"), 0);
-    assert_eq!(stat(&s, "nodes"), 0);
+    assert_eq!(
+        stat(&s, "nodes"),
+        0,
+        "the client's nodes *and* the frame the server hung on them are gone"
+    );
+    assert_eq!(stat(&s, "decorated"), 0);
 
     // The area it covered is repainted with the desktop underneath.
     h_.settle();
     let img = h_.shot(None).unwrap();
-    for (x, y) in [(50, 40), (10, 10), (119, 79)] {
+    for (dx, dy) in [(50.0, 40.0), (10.0, 10.0), (size.w - 1.0, size.h - 1.0)] {
+        let (px, py) = at(dx, dy);
         assert_eq!(
-            img.pixel(x, y),
-            background_color(x, y, w, h),
-            "({x},{y}) still holds the dead client's pixels"
+            img.pixel(px, py),
+            background_color(px, py, w, h),
+            "({px},{py}) still holds the dead client's pixels"
         );
     }
 
@@ -675,18 +833,39 @@ fn a_buffer_is_copied_from_the_memfd_and_blitted() {
         .commit(1)
         .unwrap();
     conn.flush().unwrap();
-    expect(&mut conn, &mut seen, "Configure", |m| match m {
+    let configure = expect(&mut conn, &mut seen, "Configure", |m| match m {
         ServerMsg::Configure(c) if c.window == root => Some(*c),
         _ => None,
     });
 
     h_.settle();
     let img = h_.shot(None).unwrap();
-    assert_eq!(img.pixel(16, 16), 0x0080_C020, "the buffer's pixels");
+    // The image node sits at the content's origin, wherever the window
+    // manager put the window; the desktop is only visible *outside the
+    // frame*, since the server's own frame background fills the rest of it.
+    let (x, y) = (
+        (configure.position.x + 16.0) as u32,
+        (configure.position.y + 16.0) as u32,
+    );
+    assert_eq!(img.pixel(x, y), 0x0080_C020, "the buffer's pixels");
+    // The image node is 32x32 in a 64x64 window, so the rest of the content
+    // is not the buffer. It is no longer the *desktop* either: the server's
+    // frame background is behind the client's nodes now, so the honest
+    // assertion is "not the buffer's pixels" inside the window, and "the
+    // desktop" only beyond the frame.
+    let (ix, iy) = (
+        (configure.position.x + 40.0) as u32,
+        (configure.position.y + 40.0) as u32,
+    );
+    assert_ne!(img.pixel(ix, iy), 0x0080_C020, "outside the image node");
+    let (ox, oy) = (
+        (configure.position.x + configure.size.w + wm::BORDER + 2.0) as u32,
+        (configure.position.y + configure.size.h + wm::BORDER + 2.0) as u32,
+    );
     assert_eq!(
-        img.pixel(40, 40),
-        background_color(40, 40, w, h),
-        "outside the image node"
+        img.pixel(ox, oy),
+        background_color(ox, oy, w, h),
+        "outside the window's frame"
     );
 
     h_.quit();
@@ -969,10 +1148,20 @@ fn a_window_created_before_any_output_is_placed_when_one_appears() {
     );
     assert_eq!(configure.size, Size::new(100.0, 60.0));
 
-    // And it is actually on screen, at the cascade's first position.
+    // And it is actually on screen, where the hotplug placed it: the first
+    // window of the freshly-plugged output, so `Configure.position` is the
+    // content origin of a centred, decorated frame.
     h_.settle();
     let img = h_.shot(None).unwrap();
-    assert_eq!(img.pixel(10, 10), 0x00FF_0000);
+    assert_eq!(
+        configure.position,
+        placement(0, configure.size, (200, 120)).1
+    );
+    let (x, y) = (
+        (configure.position.x + 10.0) as u32,
+        (configure.position.y + 10.0) as u32,
+    );
+    assert_eq!(img.pixel(x, y), 0x00FF_0000);
     h_.quit();
 }
 
@@ -1246,35 +1435,54 @@ fn text_runs_are_released_with_their_node_and_their_client() {
     let label = NodeId(2);
     conn.tx()
         .create_window(root, "t", Size::new(120.0, 60.0), Layer::Normal)
+        .commit(1)
+        .unwrap();
+    conn.flush().unwrap();
+    expect(&mut conn, &mut seen, "Configure", |m| match m {
+        ServerMsg::Configure(c) if c.window == root => Some(*c),
+        _ => None,
+    });
+    // Since M3 the server shapes a run of its own per decorated window (the
+    // title in its bar), so the absolute count is not the client's alone.
+    // Measure the *delta* across the client's actions instead: that is what
+    // this test is about, and it does not care how many runs the shell
+    // happens to own.
+    let base = stat(&h_.request_text("stats\n"), "text_runs");
+    assert!(
+        base >= 1,
+        "a decorated window carries the server's title run"
+    );
+
+    conn.tx()
         .create_node(label, NodeKind::Text, root)
         .bounds(label, Rect::new(0.0, 0.0, 120.0, 20.0))
         .set_text(label, "sans", 14.0, Color::WHITE, "one")
-        .commit(1)
+        .commit(2)
         .unwrap();
     conn.flush().unwrap();
     expect(&mut conn, &mut seen, "TextMetrics", |m| match m {
         ServerMsg::TextMetrics(t) if t.node == label => Some(*t),
         _ => None,
     });
-    assert_eq!(stat(&h_.request_text("stats\n"), "text_runs"), 1);
+    assert_eq!(stat(&h_.request_text("stats\n"), "text_runs"), base + 1);
 
     // Re-setting the text replaces the run rather than accumulating one.
-    for (serial, s) in [(2u32, "two"), (3, "three"), (4, "four")] {
+    for (serial, s) in [(3u32, "two"), (4, "three"), (5, "four")] {
         conn.tx()
             .set_text(label, "sans", 14.0, Color::WHITE, s)
             .commit(serial)
             .unwrap();
         conn.flush().unwrap();
         wait_for("the reshape", || {
-            stat(&h_.request_text("stats\n"), "text_runs") == 1
+            stat(&h_.request_text("stats\n"), "text_runs") == base + 1
         });
     }
 
-    // Destroying the node frees its run.
-    conn.tx().destroy_node(label).commit(5).unwrap();
+    // Destroying the node frees its run, and only its run.
+    conn.tx().destroy_node(label).commit(6).unwrap();
     conn.flush().unwrap();
     wait_for("the run to be released", || {
-        stat(&h_.request_text("stats\n"), "text_runs") == 0
+        stat(&h_.request_text("stats\n"), "text_runs") == base
     });
 
     // And a disconnect frees everything the client owned.
@@ -1282,13 +1490,15 @@ fn text_runs_are_released_with_their_node_and_their_client() {
         .create_node(NodeId(3), NodeKind::Text, root)
         .bounds(NodeId(3), Rect::new(0.0, 0.0, 120.0, 20.0))
         .set_text(NodeId(3), "sans", 14.0, Color::WHITE, "gone soon")
-        .commit(6)
+        .commit(7)
         .unwrap();
     conn.flush().unwrap();
     wait_for("the second run", || {
-        stat(&h_.request_text("stats\n"), "text_runs") == 1
+        stat(&h_.request_text("stats\n"), "text_runs") == base + 1
     });
     drop(conn);
+    // Everything goes, the server's title run included: the window it
+    // titled died with the client.
     wait_for("the client to be reaped", || {
         stat(&h_.request_text("stats\n"), "text_runs") == 0
     });
@@ -1319,19 +1529,17 @@ fn a_client_that_answers_a_motion_rides_the_same_flip_as_the_cursor() {
         Color::rgb(0, 0, 0xFF),
         1,
     );
-    expect(&mut conn, &mut seen, "Configure", |m| match m {
+    let configure = expect(&mut conn, &mut seen, "Configure", |m| match m {
         ServerMsg::Configure(c) if c.window == win.root => Some(*c),
         _ => None,
     });
 
     // Park the cursor inside the window and let everything settle, so the
     // motion under test is genuinely isolated: no flip in flight, no
-    // damage owed to either buffer, and the client already entered.
-    h_.input.push(InputEvent::PointerAbsolute {
-        x: 20.0 / f64::from(w),
-        y: 20.0 / f64::from(h),
-        time_ns: 1_000_000,
-    });
+    // damage owed to either buffer, and the client already entered. The
+    // window is wherever the window manager put it, so aim at it through
+    // its own `Configure`.
+    h_.point_at(&configure, Point::new(20.0, 20.0), 1_000_000);
     expect(&mut conn, &mut seen, "PointerEnter", |m| match m {
         ServerMsg::PointerEnter(e) => Some(*e),
         _ => None,
@@ -1348,15 +1556,16 @@ fn a_client_that_answers_a_motion_rides_the_same_flip_as_the_cursor() {
     for (serial, step) in (10..).zip(0..4u32) {
         // One motion, and the client answers it the way `nitro-demo
         // --follow` does: a commit that moves a follower rect.
-        h_.input.push(InputEvent::PointerAbsolute {
-            x: f64::from(30 + step * 8) / f64::from(w),
-            y: 30.0 / f64::from(h),
-            time_ns: u64::from(2 + step) * 1_000_000,
-        });
+        h_.point_at(
+            &configure,
+            Point::new(30.0 + step as f32 * 8.0, 30.0),
+            u64::from(2 + step) * 1_000_000,
+        );
         let motion = expect(&mut conn, &mut seen, "PointerMotion", |m| match m {
             ServerMsg::PointerMotion(m) => Some(*m),
             _ => None,
         });
+
         seen.retain(|m| !matches!(m, ServerMsg::PointerMotion(_)));
         conn.tx()
             .bounds(
@@ -1413,30 +1622,30 @@ fn a_client_that_never_answers_still_gets_a_flip_at_the_deadline() {
         Color::rgb(0, 0xFF, 0),
         1,
     );
-    expect(&mut conn, &mut seen, "Configure", |m| match m {
+    let configure = expect(&mut conn, &mut seen, "Configure", |m| match m {
         ServerMsg::Configure(c) if c.window == win.root => Some(*c),
         _ => None,
     });
-    h_.input.push(InputEvent::PointerAbsolute {
-        x: 20.0 / f64::from(w),
-        y: 20.0 / f64::from(h),
-        time_ns: 1_000_000,
-    });
+    // Aim at the window through its own `Configure`: since M3 it is
+    // decorated and centred, not at the output's origin.
+    h_.point_at(&configure, Point::new(20.0, 20.0), 1_000_000);
     expect(&mut conn, &mut seen, "PointerEnter", |m| match m {
         ServerMsg::PointerEnter(e) => Some(*e),
         _ => None,
     });
+
     h_.settle();
 
     // From here the client reads nothing and commits nothing — the wedged
     // client of the acceptance criteria, without needing SIGSTOP.
     let before = h_.frames();
     for step in 0..5u32 {
-        h_.input.push(InputEvent::PointerAbsolute {
-            x: f64::from(30 + step * 8) / f64::from(w),
-            y: 30.0 / f64::from(h),
-            time_ns: u64::from(2 + step) * 1_000_000,
-        });
+        h_.point_at(
+            &configure,
+            Point::new(30.0 + step as f32 * 8.0, 30.0),
+            u64::from(2 + step) * 1_000_000,
+        );
+
         h_.settle();
     }
     assert!(
