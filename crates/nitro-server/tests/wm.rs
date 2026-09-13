@@ -1029,7 +1029,6 @@ fn maximizing_from_minimized_still_remembers_where_the_window_was() {
     h.quit();
 }
 
-
 #[test]
 fn a_fixed_size_window_cannot_be_maximized_and_has_no_maximize_button() {
     let h = Harness::start("fixed", OUT.0, OUT.1);
