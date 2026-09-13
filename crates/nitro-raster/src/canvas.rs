@@ -4,8 +4,8 @@ use nitro_core::{Color, IRect, Point, Rect};
 
 use crate::blend::{div255, effective_alpha, over_premul, over_straight, unit_u8};
 use crate::paint::{
-    RowPaint, blend_mask_row, blend_mask_row_opaque, blend_pixel, paint_cov, paint_full,
-    store_solid,
+    RowPaint, blend_mask_row, blend_mask_row_opaque, blend_pixel, blend_solid, mix, paint_cov,
+    paint_full, store_solid,
 };
 use crate::shape::RRect;
 
@@ -53,6 +53,95 @@ impl MaskSetup {
             opaque: color.is_opaque() && opacity == 255,
         })
     }
+}
+
+/// Maximum columns of one stroke band the pre-resolved fast path handles.
+///
+/// A band is the vertical (or, at the top and bottom, horizontal) side of a
+/// border, so its width is the stroke width plus at most one partial pixel at
+/// each end. 16 covers every border a UI draws; a thicker one falls back to
+/// the general two-coverage walk, which is not the case this exists for.
+const BAND_MAX: usize = 16;
+
+/// One vertical band of a stroke, pre-resolved for every corner-free row.
+///
+/// Away from the corner arcs a stroke row is the same two runs of columns
+/// with the same per-column coverage, row after row: the geometry does not
+/// depend on `y` at all. So the blend is resolved all the way down to its
+/// operands once — not just the coverage, but the *premultiplied source* the
+/// blend adds and the `255 - a` it scales the destination by. Each row then
+/// costs three multiply-adds per column and nothing else.
+#[derive(Debug, Clone, Copy)]
+struct Band {
+    /// First device column.
+    x0: i32,
+    /// Number of columns; 0 means the band is clipped away entirely.
+    n: usize,
+    /// Per column: `[b, g, r] * a + 128` (the rounding term folded in) and
+    /// `255 - a`, exactly the four values [`blend_solid`] hoists out of its
+    /// row loop — here hoisted out of the whole band.
+    premul: [[u32; 4]; BAND_MAX],
+}
+
+impl Band {
+    /// A band that paints nothing.
+    const EMPTY: Self = Self {
+        x0: 0,
+        n: 0,
+        premul: [[0; 4]; BAND_MAX],
+    };
+
+    /// The columns of the interval `[a, b]` visible in `[cx0, cx1)`, each with
+    /// its blend resolved from `round(color.a * coverage * opacity / 255²)`.
+    ///
+    /// `None` means "no fast path": the band spans more than [`BAND_MAX`]
+    /// columns, so the table would not fit.
+    fn new(a: f32, b: f32, cx0: i32, cx1: i32, color: Color, opacity: u8) -> Option<Self> {
+        if b <= a || !(b - a).is_finite() {
+            return Some(Self::EMPTY);
+        }
+        let (fa, cb) = (a.floor() as i32, b.ceil() as i32);
+        if (cb - fa) as usize > BAND_MAX {
+            return None;
+        }
+        let x0 = fa.max(cx0);
+        let x1 = cb.min(cx1);
+        if x0 >= x1 {
+            return Some(Self::EMPTY);
+        }
+        let mut band = Self {
+            x0,
+            n: (x1 - x0) as usize,
+            premul: [[0; 4]; BAND_MAX],
+        };
+        for (slot, px) in band.premul.iter_mut().zip(x0..x1) {
+            let cov = (b.min(px as f32 + 1.0) - a.max(px as f32)).clamp(0.0, 1.0);
+            let alpha = u32::from(effective_alpha(color.a, unit_u8(cov), opacity));
+            *slot = [
+                u32::from(color.b) * alpha + 128,
+                u32::from(color.g) * alpha + 128,
+                u32::from(color.r) * alpha + 128,
+                255 - alpha,
+            ];
+        }
+        Some(band)
+    }
+
+    /// One past the last column, for the overlap check.
+    fn end(&self) -> i32 {
+        self.x0 + i32::try_from(self.n).unwrap_or(i32::MAX)
+    }
+}
+
+/// The corner-free rows of a stroke and the bands they paint.
+#[derive(Debug, Clone, Copy)]
+struct Straight {
+    /// First row free of every corner arc, and vertically inside both shapes.
+    y0: i32,
+    /// One past the last such row.
+    y1: i32,
+    /// The left and right bands; either may be empty.
+    bands: [Band; 2],
 }
 
 /// `u32 -> i32` for pixel dimensions, which are far below `i32::MAX`.
@@ -382,7 +471,7 @@ impl<'a> Canvas<'a> {
             }
         } else {
             for y in r.y..r.bottom() {
-                crate::paint::blend_solid(self.row(y, x0, x1), color, color.a);
+                blend_solid(self.row(y, x0, x1), color, color.a);
             }
         }
     }
@@ -468,6 +557,13 @@ impl<'a> Canvas<'a> {
     /// `rrect(rect.inset(width), corner_radius - width)`; coverage is the
     /// difference of the two analytic coverages, so the ring is anti-aliased
     /// on both sides and never doubles up.
+    ///
+    /// Away from the corner arcs the ring is two vertical bands whose column
+    /// geometry does not depend on `y` at all, and those rows are almost the
+    /// whole of a thin border in a large rect. They take a fast path that
+    /// resolves the columns and their blend alphas *once* and then does one
+    /// blend per column — see [`Canvas::straight_rows`]. Only the `r`-tall
+    /// corner rows walk the two coverages.
     pub fn stroke_rect_inside(
         &mut self,
         clip: &IRect,
@@ -476,6 +572,36 @@ impl<'a> Canvas<'a> {
         color: Color,
         corner_radius: f32,
         opacity: f32,
+    ) {
+        self.stroke_impl(clip, rect, width, color, corner_radius, opacity, true);
+    }
+
+    /// [`Canvas::stroke_rect_inside`] with the straight-row fast path forced
+    /// off, so the tests can assert the two paths agree byte for byte.
+    #[cfg(test)]
+    pub(crate) fn stroke_rect_inside_general(
+        &mut self,
+        clip: &IRect,
+        rect: &Rect,
+        width: f32,
+        color: Color,
+        corner_radius: f32,
+        opacity: f32,
+    ) {
+        self.stroke_impl(clip, rect, width, color, corner_radius, opacity, false);
+    }
+
+    #[allow(clippy::too_many_arguments)] // the public wrapper is the API; this
+    // is it plus one test-only switch
+    fn stroke_impl(
+        &mut self,
+        clip: &IRect,
+        rect: &Rect,
+        width: f32,
+        color: Color,
+        corner_radius: f32,
+        opacity: f32,
+        fast: bool,
     ) {
         let opacity = unit_u8(opacity);
         if opacity == 0 || color.is_transparent() || width <= 0.0 {
@@ -507,6 +633,21 @@ impl<'a> Canvas<'a> {
         }
 
         let paint = RowPaint::Solid(color);
+        // The straight (corner-free) rows are almost all of a thin border in a
+        // large rect, and their geometry is the same on every one of them:
+        // resolve the two bands once and blend them straight in.
+        let straight = if fast {
+            Self::straight_rows(&outer, inner.as_ref(), cx0, cx1, color, opacity)
+        } else {
+            None
+        };
+        if let Some(st) = straight {
+            let sy0 = st.y0.max(y0);
+            let sy1 = st.y1.min(y1);
+            if sy0 < sy1 {
+                self.stroke_straight_rows(sy0, sy1, &st.bands);
+            }
+        }
         // Rows whose whole visible run falls inside the inner shape's
         // full-coverage core paint nothing. A thin border inside a large rect
         // is the common case (window chrome), and this early-out skips the
@@ -520,6 +661,13 @@ impl<'a> Canvas<'a> {
             )
         });
         for y in y0..y1 {
+            // Already painted by the fast path above.
+            if let Some(st) = straight
+                && y >= st.y0
+                && y < st.y1
+            {
+                continue;
+            }
             if let Some((kx0, kx1, ky0, ky1)) = core
                 && y >= ky0
                 && y < ky1
@@ -528,41 +676,173 @@ impl<'a> Canvas<'a> {
             {
                 continue;
             }
-            let os = outer.row_spans(y);
-            if os.is_empty() {
+            self.stroke_row(y, &outer, inner.as_ref(), cx0, cx1, color, &paint, opacity);
+        }
+    }
+
+    /// One row of the general (two-coverage) stroke path.
+    ///
+    /// The coverage is `outer - inner`, evaluated per column, except for the
+    /// long constant-coverage run the top and bottom bands have.
+    #[allow(clippy::too_many_arguments)] // the row's share of `stroke_impl`'s
+    // state; bundling it into a struct would only move the list
+    fn stroke_row(
+        &mut self,
+        y: i32,
+        outer: &RRect,
+        inner: Option<&RRect>,
+        cx0: i32,
+        cx1: i32,
+        color: Color,
+        paint: &RowPaint,
+        opacity: u8,
+    ) {
+        let os = outer.row_spans(y);
+        if os.is_empty() {
+            return;
+        }
+        let is = inner.map(|i| i.row_spans(y));
+        let lo = os.first_px().max(cx0);
+        let hi = os.last_px().min(cx1);
+        if lo >= hi {
+            return;
+        }
+        // Columns fully inside the inner shape contribute nothing; split
+        // the run so the hollow middle is skipped entirely.
+        let hole = is
+            .filter(|s| !s.is_empty() && s.is_full_height())
+            .map_or((hi, hi), |s| {
+                let a = s.full_start().max(lo);
+                let b = s.full_end().min(hi);
+                if a < b { (a, b) } else { (hi, hi) }
+            });
+        let cov = |x: i32| {
+            let c = os.cov(x) - is.map_or(0.0, |s| s.cov(x));
+            unit_u8(c)
+        };
+        if hole.0 < hole.1 {
+            if lo < hole.0 {
+                let row = self.row(y, lo, hole.0);
+                paint_cov(row, lo, paint, opacity, cov);
+            }
+            if hole.1 < hi {
+                let row = self.row(y, hole.1, hi);
+                paint_cov(row, hole.1, paint, opacity, cov);
+            }
+            return;
+        }
+        // The inner shape does not reach this row at all, so the row is one
+        // run of the *outer* shape: the top and bottom bands of the border.
+        // Their middle columns — everything between the two corner arcs —
+        // share one coverage, because every sub-scanline covers them
+        // completely and the inner subtracts nothing.
+        //
+        // That run is long (a border is far wider than it is thick, so these
+        // rows carry most of the painted pixels: 37 px per row against the
+        // vertical bands' 1, on the benchmark's window chrome) and a constant
+        // alpha over a contiguous run is exactly what `blend_solid` is for —
+        // one hoisted multiply-add per channel in a loop the compiler
+        // vectorizes, instead of a coverage evaluation and a `blend_pixel`
+        // per column.
+        let (cs, ce) = if is.is_none_or(|s| s.is_empty()) {
+            (os.full_start().max(lo), os.full_end().min(hi))
+        } else {
+            (hi, hi)
+        };
+        if cs >= ce {
+            let row = self.row(y, lo, hi);
+            paint_cov(row, lo, paint, opacity, cov);
+            return;
+        }
+        if lo < cs {
+            let row = self.row(y, lo, cs);
+            paint_cov(row, lo, paint, opacity, cov);
+        }
+        let a = effective_alpha(color.a, cov(cs), opacity);
+        if a != 0 {
+            blend_solid(self.row(y, cs, ce), color, a);
+        }
+        if ce < hi {
+            let row = self.row(y, ce, hi);
+            paint_cov(row, ce, paint, opacity, cov);
+        }
+    }
+
+    /// The corner-free rows of a stroke, with their two bands pre-resolved.
+    ///
+    /// A row is "straight" when neither the outer nor the inner shape crosses
+    /// a corner arc anywhere in it, so both reduce to a single sub-scanline
+    /// spanning the full pixel height. The painted columns are then exactly
+    /// `[outer.x0, inner.x0]` and `[inner.x1, outer.x1]`, with the same
+    /// coverage on every such row — which is why one table serves them all.
+    ///
+    /// `None` when there is no worthwhile straight region: no inner shape (a
+    /// stroke wider than the rect is a plain fill), fewer than two straight
+    /// rows, or a band too wide for the [`BAND_MAX`] table.
+    fn straight_rows(
+        outer: &RRect,
+        inner: Option<&RRect>,
+        cx0: i32,
+        cx1: i32,
+        color: Color,
+        opacity: u8,
+    ) -> Option<Straight> {
+        let inner = inner?;
+        // A row is corner-free for a shape when `y >= shape.y0 + r` and
+        // `y + 1 <= shape.y1 - r`; it is then also full-height, since the row
+        // lies strictly inside `[y0, y1]`. Both shapes must qualify. The
+        // inner bound is usually the tighter one, but not always: `RRect::new`
+        // clamps the radius to half the shorter side, and the inner shape is
+        // the shorter one, so take the max/min rather than assuming.
+        let y0 = (outer.y0 + outer.r).max(inner.y0 + inner.r).ceil() as i32;
+        let y1 = (outer.y1 - outer.r).min(inner.y1 - inner.r).floor() as i32;
+        if y1 - y0 < 2 {
+            return None;
+        }
+        let left = Band::new(outer.x0, inner.x0, cx0, cx1, color, opacity)?;
+        let right = Band::new(inner.x1, outer.x1, cx0, cx1, color, opacity)?;
+        // Overlapping bands would blend the shared column twice, breaking the
+        // "exactly one blend per pixel" contract that makes a translucent
+        // border look right. It takes an inner shape narrower than a pixel,
+        // which a non-empty inner rect makes unlikely rather than impossible
+        // — and the check is one comparison.
+        if left.n > 0 && right.n > 0 && left.end() > right.x0 {
+            return None;
+        }
+        Some(Straight {
+            y0,
+            y1,
+            bands: [left, right],
+        })
+    }
+
+    /// Blend the pre-resolved bands into rows `[y0, y1)`.
+    ///
+    /// Three multiply-adds per column, straight out of the band's table: no
+    /// coverage evaluation, no sub-scanline spans, no premultiply, no per-row
+    /// setup beyond slicing the row. Bands are the outer loop so an empty one
+    /// is skipped once rather than per row.
+    fn stroke_straight_rows(&mut self, y0: i32, y1: i32, bands: &[Band; 2]) {
+        let stride = self.stride as usize;
+        for band in bands {
+            if band.n == 0 {
                 continue;
             }
-            let is = inner.map(|i| i.row_spans(y));
-            let lo = os.first_px().max(cx0);
-            let hi = os.last_px().min(cx1);
-            if lo >= hi {
-                continue;
-            }
-            // Columns fully inside the inner shape contribute nothing; split
-            // the run so the hollow middle is skipped entirely.
-            let hole = is
-                .filter(|s| !s.is_empty() && s.is_full_height())
-                .map_or((hi, hi), |s| {
-                    let a = s.full_start().max(lo);
-                    let b = s.full_end().min(hi);
-                    if a < b { (a, b) } else { (hi, hi) }
-                });
-            let cov = |x: i32| {
-                let c = os.cov(x) - is.map_or(0.0, |s| s.cov(x));
-                unit_u8(c)
-            };
-            if hole.0 < hole.1 {
-                if lo < hole.0 {
-                    let row = self.row(y, lo, hole.0);
-                    paint_cov(row, lo, &paint, opacity, cov);
+            let premul = &band.premul[..band.n];
+            let len = band.n * BYTES_PER_PIXEL;
+            let mut start = y0 as usize * stride + band.x0 as usize * BYTES_PER_PIXEL;
+            for _ in y0..y1 {
+                let row = &mut self.data[start..start + len];
+                for (d, p) in row.chunks_exact_mut(4).zip(premul) {
+                    let out = [
+                        mix(p[0], d[0], p[3]),
+                        mix(p[1], d[1], p[3]),
+                        mix(p[2], d[2], p[3]),
+                        0,
+                    ];
+                    d.copy_from_slice(&out);
                 }
-                if hole.1 < hi {
-                    let row = self.row(y, hole.1, hi);
-                    paint_cov(row, hole.1, &paint, opacity, cov);
-                }
-            } else {
-                let row = self.row(y, lo, hi);
-                paint_cov(row, lo, &paint, opacity, cov);
+                start += stride;
             }
         }
     }

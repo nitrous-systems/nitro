@@ -91,8 +91,11 @@ pub(crate) fn store_solid(row: &mut [u8], c: Color) {
 
 /// One channel of [`blend_solid`]: `round((premul + dst * inv) / 255)` with
 /// the `+128` already folded into `premul`.
+///
+/// Also the whole of a stroke band's inner loop, which pre-resolves the same
+/// `premul`/`inv` pair per column instead of per row.
 #[inline]
-fn mix(premul: u32, dst: u8, inv: u32) -> u8 {
+pub(crate) fn mix(premul: u32, dst: u8, inv: u32) -> u8 {
     let t = premul + u32::from(dst) * inv;
     ((t + (t >> 8)) >> 8) as u8
 }

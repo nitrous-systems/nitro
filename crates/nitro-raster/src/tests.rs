@@ -657,6 +657,75 @@ fn stroke_hollow_early_out_is_exact() {
 }
 
 #[test]
+fn stroke_fast_path_is_byte_identical_to_the_general_walk() {
+    // The straight-row fast path resolves the two bands once instead of
+    // walking two coverages per row. It must be *exactly* the general path,
+    // not merely close: a border that shifts by one level between the corner
+    // rows and the straight ones is a visible seam. Sweep geometry that
+    // exercises fractional edges, fractional widths, every radius regime
+    // (sharp, small, larger than the width, clamped) and clips that cut the
+    // bands in half.
+    let mut cases = 0;
+    for x in [0.0_f32, 0.25, 0.5, 3.5, 7.75] {
+        for radius in [0.0_f32, 1.0, 4.0, 7.5, 60.0] {
+            for width in [0.5_f32, 1.0, 1.5, 3.0, 9.0] {
+                for opacity in [1.0_f32, 0.35] {
+                    for clip in [
+                        IRect::new(0, 0, 48, 40),
+                        IRect::new(6, 4, 20, 30),
+                        IRect::new(0, 9, 48, 3),
+                        IRect::new(30, 0, 5, 40),
+                    ] {
+                        let rect = Rect::new(x, x * 0.5, 38.0, 31.5);
+                        let color = Color::rgba(9, 200, 30, 190);
+                        let mut fast = Surface::new(48, 40);
+                        let mut slow = Surface::new(48, 40);
+                        let all = IRect::new(0, 0, 48, 40);
+                        fast.canvas().fill_irect(&all, &all, Color::BLACK);
+                        slow.canvas().fill_irect(&all, &all, Color::BLACK);
+                        fast.canvas()
+                            .stroke_rect_inside(&clip, &rect, width, color, radius, opacity);
+                        slow.canvas().stroke_rect_inside_general(
+                            &clip, &rect, width, color, radius, opacity,
+                        );
+                        assert_eq!(
+                            fast.data, slow.data,
+                            "x={x} r={radius} w={width} op={opacity} clip={clip:?}"
+                        );
+                        cases += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(cases, 5 * 5 * 5 * 2 * 4);
+}
+
+#[test]
+fn stroke_fast_path_still_blends_each_pixel_once() {
+    // The band pair must not overlap: the straight rows of a translucent
+    // border are exactly one blend deep, same as the corner rows.
+    let mut s = Surface::new(32, 24);
+    let clip = s.canvas().bounds();
+    s.canvas().fill_irect(&clip, &clip, Color::BLACK);
+    s.canvas().stroke_rect_inside(
+        &clip,
+        &Rect::new(0.0, 0.0, 32.0, 24.0),
+        2.0,
+        Color::rgba(255, 255, 255, 128),
+        6.0,
+        1.0,
+    );
+    // Row 12 is a straight row (r = 6, so rows 6..18 are corner-free).
+    for x in [0, 1, 30, 31] {
+        let (b, _, _) = s.bgr(x, 12);
+        assert!(b.abs_diff(128) <= 1, "col {x} got {b}, want one 50 % blend");
+    }
+    // And the hole between the bands is untouched.
+    assert_eq!(s.bgr(16, 12), (0, 0, 0));
+}
+
+#[test]
 fn zero_width_stroke_paints_nothing() {
     let mut s = Surface::new(8, 8);
     let clip = s.canvas().bounds();
