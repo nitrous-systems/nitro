@@ -106,6 +106,12 @@ All microseconds. The two views agree to 1.2 ms, well inside the one-frame
 tolerance the demo cross-checks against — which is the check that says
 neither is lying.
 
+Re-run after `nitro-text` (M2-pre) landed and this branch was rebased onto
+it, since that work changed the server's paint path: median 25 430 µs, p95
+32 880 µs, mean 25 601 µs over 202 samples, with `shape_us_mean 0` (the
+demo draws no text). Within noise of the table above, so the conclusion
+below is unaffected by it.
+
 The distribution is the diagnosis. Latency is spread almost uniformly over
 **[17.4 ms, 34.2 ms]** — that is exactly [1 frame, 2 frames] at 16.67 ms,
 and a *floor* of one full frame is not something a fast path produces by
