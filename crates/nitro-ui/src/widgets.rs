@@ -18,7 +18,7 @@ use crate::event::{Event, Handled, button, key};
 use crate::layout::{Constraints, CrossAlign, Direction, MainAlign};
 use crate::theme::TextStyle;
 use crate::ui::{Ui, WidgetMut};
-use crate::widget::{Access, EventCx, MeasureCx, PaintCx, Role, Widget};
+use crate::widget::{Access, EventCx, MeasureCx, PaintCx, Role, TextRun, Widget};
 
 // ---------------------------------------------------------------------
 // Flex
@@ -214,6 +214,11 @@ pub struct Label {
     /// The measurement the last `measure` produced, so `paint` can place
     /// the baseline box without asking the server again.
     metrics: crate::wire::TextMetrics,
+    /// The wrap width that measurement was taken at, which `paint` must
+    /// reuse: the server learns a wrap width only from `SetText`, so
+    /// measuring wrapped and painting unwrapped would reserve two lines
+    /// and draw one overflowing line.
+    wrap_width: f32,
 }
 
 impl Label {
@@ -245,11 +250,15 @@ impl Label {
 impl<S: 'static> Widget<S> for Label {
     fn measure(&mut self, cx: &mut MeasureCx<'_, S>, constraints: Constraints) -> Size {
         let style = self.resolved_style(cx.theme());
+        // A finite width offered by the parent is a wrap width; an
+        // unbounded one means "as wide as you like", which is 0 on the
+        // wire.
         let max = if constraints.max.w.is_finite() {
             constraints.max.w
         } else {
             0.0
         };
+        self.wrap_width = max;
         self.metrics = cx.measure_text(&self.text, &style, max).unwrap_or_default();
         constraints.constrain(self.metrics.size())
     }
@@ -259,7 +268,10 @@ impl<S: 'static> Widget<S> for Label {
         let color = self.color.unwrap_or(theme.text);
         let style = self.resolved_style(theme);
         let bounds = cx.bounds;
-        cx.text(0, bounds, &self.text.clone(), &style, color, self.align);
+        let run = TextRun::new(&style, color)
+            .align(self.align)
+            .wrap_at(self.wrap_width);
+        cx.text(0, bounds, &self.text.clone(), run);
     }
 
     fn role(&self) -> Role {
@@ -389,6 +401,7 @@ pub fn label<S: 'static>(text: impl Into<String>) -> LabelBuilder<S> {
         color: None,
         align: Align::Left,
         metrics: crate::wire::TextMetrics::default(),
+        wrap_width: 0.0,
     };
     LabelBuilder {
         built: Built::new(Flex),
@@ -506,14 +519,10 @@ impl<S: 'static> Widget<S> for Button<S> {
         let h = self.metrics.height.max(1.0);
         let y = ((bounds.h - h) / 2.0).max(0.0);
         let text_box = Rect::new(0.0, y, bounds.w, h);
-        cx.text(
-            1,
-            text_box,
-            &self.text.clone(),
-            &style,
-            text_color,
-            Align::Center,
-        );
+        // A button's label is measured unwrapped and the button is sized
+        // around it, so it never wraps.
+        let run = TextRun::new(&style, text_color).align(Align::Center);
+        cx.text(1, text_box, &self.text.clone(), run);
     }
 
     fn event(&mut self, cx: &mut EventCx<'_, S>, ev: &Event) -> Handled {
@@ -550,10 +559,19 @@ impl<S: 'static> Widget<S> for Button<S> {
                 }
                 Handled::Yes
             }
+            // There is no pointer grab in M2, so a release that happens
+            // after the pointer has wandered off is never routed here.
+            // Dropping `pressed` on the way out is what keeps a button
+            // from being left painted active for ever.
+            Event::PointerLeave => {
+                self.pressed = false;
+                cx.request_paint();
+                Handled::No
+            }
             // Hover and focus change the face, so each needs a repaint —
-            // but none of them is *consumed*: an ancestor may want to
-            // react to the same pointer crossing it.
-            Event::PointerEnter { .. } | Event::PointerLeave | Event::FocusChanged { .. } => {
+            // but neither is *consumed*: an ancestor may want to react to
+            // the same pointer crossing it.
+            Event::PointerEnter { .. } | Event::FocusChanged { .. } => {
                 cx.request_paint();
                 Handled::No
             }

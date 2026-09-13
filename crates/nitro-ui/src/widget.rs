@@ -227,6 +227,54 @@ impl<S: 'static> LayoutCx<'_, S> {
     }
 }
 
+/// How a run of text is drawn: style, colour, alignment and wrap width.
+///
+/// `max_width` is the one field that is not merely cosmetic. It **must**
+/// be the width the run was measured at (see
+/// [`MeasureCx::measure_text`]), because `SetText` is the only place the
+/// server learns a wrap width: measuring wrapped and painting unwrapped
+/// reserves two lines of height and draws one overflowing line, and
+/// measure and paint disagreeing is the one thing a retained tree cannot
+/// tolerate. `0.0` means no wrapping.
+#[derive(Debug, Clone, Copy)]
+pub struct TextRun<'a> {
+    /// Family, size, weight and slant.
+    pub style: &'a TextStyle,
+    /// Text colour.
+    pub color: Color,
+    /// Horizontal alignment inside the node's box.
+    pub align: Align,
+    /// Wrap width in logical pixels; `0.0` = no limit.
+    pub max_width: f32,
+}
+
+impl<'a> TextRun<'a> {
+    /// An unwrapped, left-aligned run in `style`.
+    #[must_use]
+    pub fn new(style: &'a TextStyle, color: Color) -> Self {
+        Self {
+            style,
+            color,
+            align: Align::Left,
+            max_width: 0.0,
+        }
+    }
+
+    /// Set the alignment.
+    #[must_use]
+    pub fn align(mut self, align: Align) -> Self {
+        self.align = align;
+        self
+    }
+
+    /// Set the wrap width; it must match the measurement.
+    #[must_use]
+    pub fn wrap_at(mut self, max_width: f32) -> Self {
+        self.max_width = max_width;
+        self
+    }
+}
+
 /// Context for [`Widget::paint`]: the mapping from a widget to its scene
 /// nodes.
 ///
@@ -291,28 +339,16 @@ impl<S: 'static> PaintCx<'_, S> {
         );
     }
 
-    /// Draw a run of text in `slot`, aligned inside `rect`.
-    pub fn text(
-        &mut self,
-        slot: u8,
-        rect: Rect,
-        text: &str,
-        style: &TextStyle,
-        color: Color,
-        align: Align,
-    ) {
+    /// Draw a run of text in `slot`, aligned and wrapped as `run` says.
+    ///
+    /// See [`TextRun`] for why the wrap width has to be the one the run
+    /// was measured at.
+    pub fn text(&mut self, slot: u8, rect: Rect, text: &str, run: TextRun<'_>) {
         let at = self.slot_at(slot);
-        let r = self.ui.wire_mut().paint_text(
-            &mut self.slots,
-            at,
-            rect,
-            text,
-            crate::wire::TextPaint {
-                style,
-                color,
-                align,
-            },
-        );
+        let r = self
+            .ui
+            .wire_mut()
+            .paint_text(&mut self.slots, at, rect, text, run);
         self.note(r);
     }
 

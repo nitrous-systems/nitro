@@ -98,5 +98,5 @@ pub use layout::{
 };
 pub use theme::{TextStyle, Theme};
 pub use ui::{FdToken, Node, TimerId, Ui, WidgetMut};
-pub use widget::{Access, EventCx, LayoutCx, MeasureCx, PaintCx, Role, Widget};
+pub use widget::{Access, EventCx, LayoutCx, MeasureCx, PaintCx, Role, TextRun, Widget};
 pub use wire::{Mutation, TextMetrics};

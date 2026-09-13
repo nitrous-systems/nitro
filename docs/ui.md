@@ -186,9 +186,18 @@ because the slot number is what the framework diffs against.
 ```rust,ignore
 fn paint(&mut self, cx: &mut PaintCx<'_, S>) {
     cx.rect(0, cx.bounds, Fill::Solid(face), radius, border);
-    cx.text(1, text_box, &self.text, &style, color, Align::Center);
+    cx.text(1, text_box, &self.text, TextRun::new(&style, color).align(Align::Center));
 }
 ```
+
+`cx.text` takes a [`TextRun`] — style, colour, alignment and **wrap
+width**. The wrap width must be the one the run was measured at:
+`SetText` is the only place the server learns a wrap width, so measuring
+wrapped and painting unwrapped would reserve two lines of height and draw
+one overflowing line, and measure/paint disagreeing is the one thing a
+retained model cannot tolerate. `Label` remembers the width its `measure`
+used and hands it back (`.wrap_at(self.wrap_width)`); `Button` measures
+unwrapped, because it is sized around its label.
 
 The first paint of a slot sends `CreateNode` under the widget's group;
 later ones **diff against a per-slot cache of the last values sent** and
@@ -262,6 +271,14 @@ positions already **widget-local**:
   bubble up until one answers `Handled::Yes`. Enter/leave is computed
   from the difference between the old and new hover chains, so a widget
   gets exactly one `PointerEnter` per crossing.
+* **Focus changes are queued, not delivered inline.** `Ui::focus` is
+  reachable from `EventCx::request_focus`, i.e. from inside a widget's
+  own `event` — where that widget is out of its slot and the app state is
+  already borrowed, so it could not receive the notification anyway.
+  `pump` drains the queue through `Ui::deliver_focus_events` once the
+  batch is done and every widget is back in place; a notification the
+  tree has already overtaken is dropped rather than delivered stale. An
+  app driving `Ui` by hand should call it too.
 * **Keys** go to the focused widget and bubble to the root. A `KeyDown`
   nobody consumed that produced text is re-offered as `Event::Text`,
   which is how an app gets a global shortcut with no filter list — see
@@ -390,8 +407,8 @@ an early version of every pointer test saw no hover at all.
 
 | what | value |
 |---|---|
-| binary | **444 200 bytes** (444 KB) |
-| RSS | **2 440 kB** |
+| binary | **444 608 bytes** (444 KB) |
+| RSS | **2 436 kB** |
 | threads | 1 |
 | context switches over 5 s idle | **0** (client and server both) |
 | `ldd` | `libc`, `libgcc_s`, vdso — nothing else |
@@ -416,6 +433,16 @@ regrets:
 * **The flex solver clamps min/max once** rather than iterating as CSS
   does, so a child whose clamp releases free space does not give it back
   to its siblings.
+* **No pointer grab.** A press followed by a release outside the widget
+  is not routed back to it, so `Button` drops its pressed state on
+  `PointerLeave` instead. A real grab is a server-side concept and M3.
+* **`Ui::remove` does not recycle the node ids under the destroyed
+  subtree.** One `DestroyNode` on the outermost group frees them
+  server-side; reusing them locally would mean proving that commit had
+  been applied. Ids are a monotonic `u32` per client.
+* **`set_theme` re-marks the root's subtree**, so a widget built but not
+  yet attached keeps the old theme's measurements until it is attached
+  (which marks it anyway).
 * **No wrapping, no `order`, no baselines** in layout; no `Adaptive`
   widget yet (M3, and it is a widget, not a new mechanism).
 * **`Ui` owns exactly one window.** Multi-window is a shell concern and

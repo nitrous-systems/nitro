@@ -287,6 +287,21 @@ impl<S: 'static> Harness<S> {
         self.key_up(keycode);
     }
 
+    /// Inject a key press **without** settling.
+    ///
+    /// [`Harness::key`] pumps until everything has been consumed, which
+    /// is what a test usually wants; this is for a test that needs to
+    /// look at the tree between the event arriving and the dust
+    /// settling.
+    pub fn send_key(&mut self, keycode: u32) {
+        self.time_ns += 1_000_000;
+        self.server.push_input(InputEvent::Key {
+            keycode,
+            pressed: true,
+            time_ns: self.time_ns,
+        });
+    }
+
     /// Press a key.
     ///
     /// # Panics

@@ -106,6 +106,13 @@ pub struct Ui<S> {
     window_size: Size,
     scale: f32,
     focused: Option<WidgetId>,
+    /// Focus changes waiting to be reported, oldest first.
+    ///
+    /// [`Ui::focus`] can be called from inside a widget's own `event`,
+    /// where that widget is out of its slot and the app state is already
+    /// borrowed — so the notification is queued and delivered by
+    /// [`Ui::deliver_focus_events`] once the batch is done.
+    pending_focus: Vec<(WidgetId, bool)>,
     hover_chain: Vec<WidgetId>,
     quit: bool,
     // Scratch pools. Layout recurses, so one vector is not enough; these
@@ -154,6 +161,7 @@ impl<S: 'static> Ui<S> {
             window_size: Size::ZERO,
             scale: 1.0,
             focused: None,
+            pending_focus: Vec::new(),
             hover_chain: Vec::new(),
             quit: false,
             id_pool: Vec::new(),
@@ -214,6 +222,11 @@ impl<S: 'static> Ui<S> {
             slot.state.children.push(id);
         }
         self.mark(parent, Dirty::TREE | Dirty::LAYOUT);
+        // The new subtree's own slots are born dirty, but a flag with no
+        // `SUB_` trail above it is invisible to the passes: on a settled
+        // tree `pass_paint` stops at the clean root and the child is
+        // never painted. Marking it lights the trail.
+        self.mark(id, Dirty::TREE | Dirty::LAYOUT | Dirty::PAINT);
         Ok(id)
     }
 
@@ -265,8 +278,12 @@ impl<S: 'static> Ui<S> {
             self.root = None;
         }
         // One `DestroyNode` on the subtree's outermost group takes the
-        // whole scene subtree with it; the ids below it are reclaimed
-        // locally.
+        // whole scene subtree with it. The ids underneath it are *not*
+        // returned to the free list: the server frees them with the
+        // subtree, and reusing one would need us to prove the commit
+        // carrying the destroy has been applied. Ids are a monotonic
+        // `u32` per client, so leaking them costs nothing a real app
+        // would ever reach.
         let node = self.arena.slot(id).and_then(|s| s.state.node);
         let mut doomed = Vec::new();
         self.collect_subtree(id, &mut doomed);
@@ -277,6 +294,7 @@ impl<S: 'static> Ui<S> {
             self.arena.remove(*d);
         }
         self.hover_chain.retain(|h| !doomed.contains(h));
+        self.pending_focus.retain(|(id, _)| !doomed.contains(id));
         if let Some(n) = node {
             self.wire.destroy_node(n)?;
         }
@@ -984,7 +1002,12 @@ impl<S: 'static> Ui<S> {
         for msg in batch.drain(..) {
             self.dispatch(state, &msg);
         }
-        self.wire.stray = batch;
+        // Append rather than assign: a handler may have called
+        // `measure_text`, and the round trip parks whatever else arrived
+        // while it waited in `stray`. Overwriting it here would drop the
+        // very keystroke the queue exists to keep.
+        self.wire.stray.append(&mut batch);
+        self.deliver_focus_events(state);
         Ok(n)
     }
 
@@ -1204,11 +1227,15 @@ impl<S: 'static> Ui<S> {
         self.focused
     }
 
-    /// Move the focus to `id`, without an app state to notify.
+    /// Move the focus to `id`.
     ///
-    /// Used from `EventCx::request_focus`, where the state is already
-    /// borrowed; the `FocusChanged` events are delivered by the pass that
-    /// owns the state.
+    /// Callable without an `&mut S`, which is what
+    /// [`EventCx::request_focus`](crate::EventCx::request_focus) needs:
+    /// the state is already borrowed there, and the widget asking is out
+    /// of its slot. The `FocusChanged` events are therefore **queued**
+    /// and delivered by [`Ui::deliver_focus_events`], which `pump` calls
+    /// once the dispatch that caused them has finished and every widget
+    /// is back in its slot.
     pub fn focus(&mut self, id: WidgetId) {
         if self.focused == Some(id) {
             return;
@@ -1217,14 +1244,35 @@ impl<S: 'static> Ui<S> {
             && let Some(slot) = self.arena.slot_mut(old)
         {
             slot.state.focused = false;
-            slot.state.flags.insert(Dirty::PAINT);
             self.mark(old, Dirty::PAINT);
+            self.pending_focus.push((old, false));
         }
         self.focused = Some(id);
         if let Some(slot) = self.arena.slot_mut(id) {
             slot.state.focused = true;
         }
         self.mark(id, Dirty::PAINT);
+        self.pending_focus.push((id, true));
+    }
+
+    /// Deliver the [`Event::FocusChanged`] events queued by [`Ui::focus`].
+    ///
+    /// Separate from `focus` because focus is most often taken from
+    /// inside a widget's own `event`, where that widget is out of its
+    /// slot and could not receive the notification. `pump` drains the
+    /// queue after each batch; an app driving `Ui` by hand should too.
+    pub fn deliver_focus_events(&mut self, state: &mut S) {
+        while !self.pending_focus.is_empty() {
+            let queued = std::mem::take(&mut self.pending_focus);
+            for (id, focused) in queued {
+                // Skip a notification the tree has already overtaken:
+                // focus may have moved again before we got here.
+                if self.is_focused(id) != focused {
+                    continue;
+                }
+                self.bubble_one(state, id, &Event::FocusChanged { focused });
+            }
+        }
     }
 
     /// Drop the focus entirely.
@@ -1266,6 +1314,7 @@ impl<S: 'static> Ui<S> {
             self.bubble_one(state, old, &Event::FocusChanged { focused: false });
         }
         self.focused = Some(target);
+        self.pending_focus.retain(|(id, _)| *id != target);
         if let Some(slot) = self.arena.slot_mut(target) {
             slot.state.focused = true;
         }

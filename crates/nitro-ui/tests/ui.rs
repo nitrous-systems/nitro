@@ -742,3 +742,330 @@ fn an_app_owned_fd_gets_its_callback() {
     assert_eq!(state, 2, "a removed hook does not fire");
     h.quit();
 }
+
+#[test]
+fn a_child_added_to_a_settled_tree_is_painted() {
+    // Regression: `add_child` marked only the parent, so the new slot's
+    // own PAINT flag had no `SUB_PAINT` trail above it. On a settled tree
+    // `pass_paint` stopped at the clean root and the child got a group
+    // and bounds but was never painted — invisible until some unrelated
+    // change happened to repaint an ancestor.
+    let mut h = Harness::sized("addchild", (), Size::new(200.0, 120.0), |ui: &mut Ui<()>| {
+        ui.build(column().padding(8.0).gap(4.0))
+    });
+    let root = h.ui().root().unwrap();
+    h.settle();
+    assert_eq!(h.ui().children(root).len(), 0);
+
+    h.tap();
+    h.clear_tap();
+    let added = h
+        .ui()
+        .add_child(
+            root,
+            panel()
+                .background(nitro_core::Color::rgb(0x20, 0x80, 0x40))
+                .radius(0.0)
+                .border(0.0, nitro_core::Color::TRANSPARENT)
+                .width(60.0)
+                .height(40.0),
+        )
+        .unwrap();
+    h.settle();
+
+    let ops: Vec<&str> = h.mutations().iter().map(|m| m.op).collect();
+    assert!(ops.contains(&"CreateNode"), "the child got a node: {ops:?}");
+    assert!(
+        ops.contains(&"SetFill"),
+        "and it painted, which is the regression: {ops:?}"
+    );
+    let b = h.bounds(added);
+    assert!(!b.is_empty(), "and it was laid out: {b:?}");
+    assert_eq!(
+        background_at(&h, b.x as u32 + 30, b.y as u32 + 20) & 0x00ff_ffff,
+        0x0020_8040,
+        "its pixels really reached the screen"
+    );
+
+    // A stale parent is still an error, not a panic.
+    assert!(matches!(
+        h.ui().add_child(added, label("x")).err(),
+        None | Some(Error::StaleWidget)
+    ));
+    h.ui().remove(added).unwrap();
+    assert!(matches!(
+        h.ui().add_child(added, label("x")).err(),
+        Some(Error::StaleWidget)
+    ));
+    h.quit();
+}
+
+#[test]
+fn a_label_is_painted_at_the_width_it_was_measured_at() {
+    // Regression: `measure` asked for a wrap width but `paint` hardcoded
+    // `max_width: 0.0, wrap: false`, so a label narrower than its string
+    // reserved two lines of height and drew one overflowing line.
+    let long = "wrapping is decided once and used twice";
+    let mut h = Harness::sized("wrap", (), Size::new(120.0, 200.0), |ui: &mut Ui<()>| {
+        let l = ui.build(label(long));
+        let root = ui.build(
+            panel()
+                .background(nitro_core::Color::WHITE)
+                .radius(0.0)
+                .border(0.0, nitro_core::Color::TRANSPARENT)
+                .padding(4.0),
+        );
+        ui.attach(root, l).unwrap();
+        root
+    });
+    if !h.has_text() {
+        h.quit();
+        return;
+    }
+    let root = h.ui().root().unwrap();
+    let l = h.ui().children(root)[0];
+    let b = h.bounds(l);
+
+    // The window is narrow, so the string must have wrapped: more than
+    // one line of height, and no wider than the content box.
+    assert!(b.w <= 112.01, "the label fits its parent: {b:?}");
+    assert!(b.h > 20.0, "and wrapped to more than one line: {b:?}");
+
+    // The painted run agrees: ink stays inside the measured box. If the
+    // label were painted unwrapped it would be one long line escaping to
+    // the right, and the server clips a run to its node bounds — so the
+    // give-away is the *bottom* half of the box being empty.
+    let lower = Rect::new(b.x, b.y + b.h / 2.0, b.w, b.h / 2.0);
+    assert!(
+        h.has_ink(lower, 0x00ff_ffff),
+        "the second line was actually drawn: {lower:?}"
+    );
+    h.quit();
+}
+
+#[test]
+fn a_button_does_not_stay_pressed_when_the_pointer_leaves() {
+    // Regression: `pressed` was cleared only by `PointerUp`, which is
+    // routed to the hover chain — so press, drag off, release left the
+    // button painted active for ever (there is no pointer grab in M2).
+    let mut h = Harness::sized(
+        "stuck",
+        0u32,
+        Size::new(200.0, 120.0),
+        |ui: &mut Ui<u32>| {
+            let b = ui.build(button("Hold me").on_click(|s: &mut u32, _| *s += 1));
+            let root = ui.build(column().padding(10.0));
+            ui.attach(root, b).unwrap();
+            root
+        },
+    );
+    let root = h.ui().root().unwrap();
+    let btn = h.ui().children(root)[0];
+    let b = h.bounds(btn);
+
+    h.move_pointer(Point::new(b.x + 2.0, b.y + 2.0));
+    h.press(nitro_ui::event::button::LEFT);
+    assert!(h.widget::<Button<u32>>(btn).is_pressed());
+
+    // Drag off the button and release out there.
+    h.move_pointer(Point::new(b.x + b.w + 20.0, b.y + b.h + 20.0));
+    assert!(
+        !h.widget::<Button<u32>>(btn).is_pressed(),
+        "leaving clears the pressed state"
+    );
+    h.release(nitro_ui::event::button::LEFT);
+    assert_eq!(*h.state(), 0, "and no click was delivered");
+    assert!(!h.widget::<Button<u32>>(btn).is_pressed());
+
+    // The button still works normally afterwards.
+    h.click(btn);
+    assert_eq!(*h.state(), 1);
+    h.quit();
+}
+
+#[test]
+fn focus_changes_are_reported_however_the_focus_moved() {
+    /// Records the `FocusChanged` events it is given.
+    #[derive(Default)]
+    struct Watcher {
+        events: Vec<bool>,
+    }
+    impl nitro_ui::Widget<()> for Watcher {
+        fn measure(
+            &mut self,
+            _cx: &mut nitro_ui::MeasureCx<'_, ()>,
+            c: nitro_ui::Constraints,
+        ) -> Size {
+            c.constrain(Size::new(60.0, 30.0))
+        }
+        fn paint(&mut self, cx: &mut nitro_ui::PaintCx<'_, ()>) {
+            let b = cx.bounds;
+            cx.fill_rect(0, b, nitro_core::Color::rgb(0x40, 0x40, 0x40));
+        }
+        fn event(
+            &mut self,
+            cx: &mut nitro_ui::EventCx<'_, ()>,
+            ev: &nitro_ui::Event,
+        ) -> nitro_ui::Handled {
+            match ev {
+                nitro_ui::Event::FocusChanged { focused } => {
+                    self.events.push(*focused);
+                    nitro_ui::Handled::No
+                }
+                // Taking focus on a click is what `request_focus` is for,
+                // and it is the path that used to report nothing.
+                nitro_ui::Event::PointerDown { .. } => {
+                    cx.request_focus();
+                    nitro_ui::Handled::Yes
+                }
+                _ => nitro_ui::Handled::No,
+            }
+        }
+    }
+
+    let mut h = Harness::sized("focusev", (), Size::new(200.0, 140.0), |ui: &mut Ui<()>| {
+        let w = ui.build(nitro_ui::Built::new(Watcher::default()));
+        let b = ui.build(button("B").on_click(|(), _| {}));
+        let root = ui.build(column().padding(10.0).gap(6.0));
+        ui.attach(root, w).unwrap();
+        ui.attach(root, b).unwrap();
+        root
+    });
+    let root = h.ui().root().unwrap();
+    let kids = h.ui().children(root);
+    let (watcher, btn) = (kids[0], kids[1]);
+    assert!(h.widget::<Watcher>(watcher).events.is_empty());
+
+    // Click it: `request_focus` runs inside the widget's own `event`, so
+    // the notification has to be queued and delivered afterwards.
+    h.click(watcher);
+    assert!(h.ui().is_focused(watcher));
+    assert_eq!(
+        h.widget::<Watcher>(watcher).events,
+        [true],
+        "a click-taken focus is reported"
+    );
+
+    // Tab away: the watcher is told it lost the focus.
+    h.key(key::TAB);
+    assert!(h.ui().is_focused(btn));
+    assert_eq!(
+        h.widget::<Watcher>(watcher).events,
+        [true, false],
+        "and so is losing it"
+    );
+    h.quit();
+}
+
+#[test]
+fn a_measurement_taken_while_handling_an_event_keeps_the_other_messages() {
+    // Regression: `pump` did `self.wire.stray = batch` after draining it,
+    // overwriting anything `measure_text`'s round trip had parked there
+    // during dispatch — dropping real server messages on the floor.
+    //
+    // Making that deterministic needs a message guaranteed to arrive
+    // *while* the handler is blocked, so the handler commits a text
+    // change first: the server answers every node it reshaped with a
+    // `TextMetrics`, which then lands in the round trip's poll and is
+    // parked. With the bug it is dropped; with the fix the next `pump`
+    // delivers it.
+    struct S {
+        label: Option<WidgetId>,
+        keys: u32,
+        measured: f32,
+    }
+    struct Measurer;
+    impl nitro_ui::Widget<S> for Measurer {
+        fn measure(
+            &mut self,
+            _cx: &mut nitro_ui::MeasureCx<'_, S>,
+            c: nitro_ui::Constraints,
+        ) -> Size {
+            c.constrain(Size::new(80.0, 40.0))
+        }
+        fn paint(&mut self, cx: &mut nitro_ui::PaintCx<'_, S>) {
+            let b = cx.bounds;
+            cx.fill_rect(0, b, nitro_core::Color::rgb(0x50, 0x50, 0x50));
+        }
+        fn event(
+            &mut self,
+            cx: &mut nitro_ui::EventCx<'_, S>,
+            ev: &nitro_ui::Event,
+        ) -> nitro_ui::Handled {
+            let nitro_ui::Event::KeyDown(_) = ev else {
+                return nitro_ui::Handled::No;
+            };
+            cx.state.keys += 1;
+            // Reshape a label and push it, so a `TextMetrics` is on its
+            // way back to us...
+            if let Some(l) = cx.state.label {
+                let text = format!("reshaped {}", cx.state.keys);
+                if let Ok(mut label) = cx.ui.widget_mut::<Label>(l) {
+                    label.set_text(text);
+                }
+                let _ = cx.ui.flush();
+            }
+            // ...and then block on a measurement, whose round trip is
+            // what picks that `TextMetrics` up and parks it.
+            let style = nitro_ui::TextStyle::new("sans", 14.0);
+            let unique = format!("measured mid-event {}", cx.state.keys);
+            if let Ok(m) = cx.ui.measure_text(&unique, &style, 0.0) {
+                cx.state.measured = m.width;
+            }
+            nitro_ui::Handled::Yes
+        }
+    }
+
+    let mut h = Harness::sized(
+        "straykeep",
+        S {
+            label: None,
+            keys: 0,
+            measured: 0.0,
+        },
+        Size::new(200.0, 120.0),
+        |ui: &mut Ui<S>| {
+            let m = ui.build(nitro_ui::Built::new(Measurer));
+            let l = ui.build(label("before"));
+            let root = ui.build(column().padding(6.0).gap(4.0));
+            ui.attach(root, m).unwrap();
+            ui.attach(root, l).unwrap();
+            root
+        },
+    );
+    if !h.has_text() {
+        h.quit();
+        return;
+    }
+    let root = h.ui().root().unwrap();
+    let kids = h.ui().children(root);
+    let (measurer, text) = (kids[0], kids[1]);
+    h.state_mut().label = Some(text);
+    h.ui().focus(measurer);
+    h.settle();
+
+    // Deliver one key by hand so the parked message is still queued when
+    // we look: `Harness::key` would settle and consume it.
+    h.send_key(key::SPACE);
+    h.wait_for("the key to be dispatched", |h| {
+        h.pump();
+        h.state().keys >= 1
+    });
+    assert_eq!(h.state().keys, 1, "the handler ran");
+    assert!(h.state().measured > 0.0, "and its measurement came back");
+
+    // The `TextMetrics` the handler's own commit provoked was parked
+    // mid-round-trip. With the bug it was overwritten by the empty
+    // drained buffer; with the fix the next pump still has it.
+    assert!(
+        h.pump() > 0,
+        "the message parked during dispatch survived the pump"
+    );
+
+    // And the whole thing still works end to end.
+    h.settle();
+    assert_eq!(h.widget::<Label>(text).text(), "reshaped 1");
+    h.key(key::SPACE);
+    assert_eq!(h.state().keys, 2, "no keystroke was dropped");
+    h.quit();
+}

@@ -78,10 +78,16 @@ impl Dirty {
     /// A descendant has [`Dirty::TREE`].
     pub const SUB_TREE: Self = Self(1 << 5);
 
-    /// The `SUB_` flag matching a own-widget flag.
+    /// The `SUB_` flag matching an own-widget flag.
+    ///
+    /// Only the three own-widget bits have a `SUB_` counterpart, so the
+    /// input is masked to them first: `SUB_LAYOUT.to_sub()` is
+    /// [`Dirty::NONE`], not a pair of bits that mean nothing. `mark` and
+    /// the constants are both public, so this has to be total rather
+    /// than merely unused.
     #[must_use]
     pub const fn to_sub(self) -> Self {
-        Self(self.0 << 3)
+        Self((self.0 & 0b111) << 3)
     }
 
     /// Whether any of `other`'s bits are set.
@@ -293,6 +299,14 @@ mod tests {
         assert_eq!(Dirty::LAYOUT.to_sub(), Dirty::SUB_LAYOUT);
         assert_eq!(Dirty::PAINT.to_sub(), Dirty::SUB_PAINT);
         assert_eq!(Dirty::TREE.to_sub(), Dirty::SUB_TREE);
+        // A `SUB_` flag has no counterpart of its own, so it maps to
+        // nothing rather than to a bit outside the set.
+        assert_eq!(Dirty::SUB_LAYOUT.to_sub(), Dirty::NONE);
+        assert_eq!(Dirty::SUB_TREE.to_sub(), Dirty::NONE);
+        assert_eq!(
+            (Dirty::LAYOUT | Dirty::SUB_PAINT).to_sub(),
+            Dirty::SUB_LAYOUT
+        );
     }
 
     #[test]

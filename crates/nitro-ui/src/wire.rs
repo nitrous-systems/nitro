@@ -22,10 +22,11 @@ use nitro_wire::msg::{
     self, ClientMsg, CreateNode, DestroyNode, Fill, Reparent, ServerMsg, SetBorder, SetBounds,
     SetCorners, SetFill, SetImage, SetText,
 };
-use nitro_wire::types::{Align, BufferId, Layer, NodeId, NodeKind, caps};
+use nitro_wire::types::{BufferId, Layer, NodeId, NodeKind, caps};
 
 use crate::error::Error;
 use crate::theme::TextStyle;
+use crate::widget::TextRun;
 
 /// One mutation, as the tap records it.
 ///
@@ -93,15 +94,6 @@ impl MeasureKey {
 #[derive(Debug, Default)]
 pub(crate) struct TextMeasureCache {
     map: HashMap<MeasureKey, TextMetrics>,
-}
-
-/// How a run of text is drawn, as a paint slot takes it: the style, the
-/// colour and the alignment inside its box.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct TextPaint<'a> {
-    pub(crate) style: &'a TextStyle,
-    pub(crate) color: Color,
-    pub(crate) align: Align,
 }
 
 /// Where a paint slot's node belongs in the scene: under `parent`,
@@ -458,12 +450,13 @@ impl Wire {
         at: SlotAt,
         rect: Rect,
         text: &str,
-        paint: TextPaint<'_>,
+        paint: TextRun<'_>,
     ) -> Result<(), Error> {
-        let TextPaint {
+        let TextRun {
             style,
             color,
             align,
+            max_width,
         } = paint;
         let index = at.index;
         let fresh = self.ensure_slot(slots, at, NodeKind::Text)?;
@@ -475,8 +468,11 @@ impl Wire {
             size_px: style.size_px,
             weight: style.weight,
             italic: style.italic,
-            max_width: 0.0,
-            wrap: false,
+            max_width,
+            // `wrap` only bites with a non-zero `max_width`, and the two
+            // are decided together so the painted run matches the
+            // measured one exactly.
+            wrap: max_width > 0.0,
             align,
             color,
             family: style.family.clone(),
