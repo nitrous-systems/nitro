@@ -31,7 +31,7 @@
 //! focused one — the focus follows the click, not the other way round.
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -41,7 +41,7 @@ use nitro_core::Point;
 use nitro_scene::{Hit, OutputId, Scene, WindowKey};
 use nitro_wire::types::{AxisSource, ButtonState, TouchPhase};
 
-use crate::{debug, warn};
+use crate::{debug, info, warn};
 
 /// Evdev code of the left mouse button — the one that raises and focuses.
 pub const BTN_LEFT: u32 = 0x110;
@@ -144,6 +144,15 @@ pub trait InputSource {
 
     /// Human-readable device summary for the startup log.
     fn describe(&self) -> String;
+
+    /// Re-scan `dir` for `event*` nodes, adding the ones that appeared and
+    /// dropping the ones that went away. Returns `(added, removed)`.
+    ///
+    /// The default is "no devices, nothing to do", which is exactly right
+    /// for the fake source.
+    fn rescan(&mut self, _dir: &Path) -> (usize, usize) {
+        (0, 0)
+    }
 }
 
 /// A handle a test uses to inject input into a running server.
@@ -388,10 +397,15 @@ pub fn hit(scene: &Scene, output: OutputId, point: Point) -> Option<PointerTarge
 }
 
 /// A device point in a window's own coordinate space.
+///
+/// "Its own" means the **client's** space: for a decorated window that is
+/// the content group inside the frame, not the frame itself, so a client
+/// compares the coordinate against the layout it sent and the title bar
+/// does not shift every pointer event by its own height.
 #[must_use]
 pub fn window_local(scene: &Scene, win: WindowKey, point: Point) -> Option<Point> {
-    let root = scene.window_info(win).ok()?.root();
-    let node = scene.node(root).ok()?;
+    let content = scene.window_info(win).ok()?.content();
+    let node = scene.node(content).ok()?;
     node.world_transform().invert().map(|t| t.apply(point))
 }
 
@@ -409,8 +423,12 @@ pub fn time_ns(time_usec: u64) -> u64 {
 /// them through the seat exactly like the DRM device.
 pub struct LibinputSource {
     context: input::Libinput,
-    /// Paths added at startup, for the log and for `resume`.
+    /// Paths currently open, for the log, for `resume` and for the hotplug
+    /// rescan's "is this one already mine?" test.
     devices: Vec<PathBuf>,
+    /// libinput's handle for each open path, which is what
+    /// `path_remove_device` wants when a device goes away.
+    open_devices: HashMap<PathBuf, input::Device>,
     suspended: bool,
 }
 
@@ -540,11 +558,13 @@ impl LibinputSource {
             open: Vec::new(),
         });
         let mut added = Vec::new();
+        let mut open_devices = HashMap::new();
         for path in event_devices(dir) {
             let Some(name) = path.to_str() else {
                 continue;
             };
-            if context.path_add_device(name).is_some() {
+            if let Some(device) = context.path_add_device(name) {
+                open_devices.insert(path.clone(), device);
                 added.push(path);
             } else {
                 debug!("{}: not an input device libinput wants", path.display());
@@ -553,6 +573,7 @@ impl LibinputSource {
         Self {
             context,
             devices: added,
+            open_devices,
             suspended: false,
         }
     }
@@ -599,6 +620,52 @@ impl InputSource for LibinputSource {
 
     fn describe(&self) -> String {
         format!("libinput with {} device(s)", self.devices.len())
+    }
+
+    /// Add every `event*` node in `dir` that is not open yet and drop every
+    /// one that is gone.
+    ///
+    /// libinput's *path* backend has no idea devices come and go — that is
+    /// what its udev backend is for, and udev is a dependency this tree
+    /// deliberately does not have — so the directory scan is ours. Adding
+    /// a path libinput already has would double every event from it, which
+    /// is why the open set is tracked rather than re-derived.
+    fn rescan(&mut self, dir: &Path) -> (usize, usize) {
+        let found = event_devices(dir);
+        let mut added = 0;
+        let mut removed = 0;
+        // Gone: tell libinput, which closes the fd through the seat.
+        let stale: Vec<PathBuf> = self
+            .devices
+            .iter()
+            .filter(|p| !found.contains(p))
+            .cloned()
+            .collect();
+        for path in stale {
+            if let Some(device) = self.open_devices.remove(&path) {
+                self.context.path_remove_device(device);
+            }
+            self.devices.retain(|p| *p != path);
+            removed += 1;
+            info!("input device {} removed", path.display());
+        }
+        for path in found {
+            if self.devices.contains(&path) {
+                continue;
+            }
+            let Some(name) = path.to_str() else {
+                continue;
+            };
+            if let Some(device) = self.context.path_add_device(name) {
+                self.open_devices.insert(path.clone(), device);
+                self.devices.push(path.clone());
+                added += 1;
+                info!("input device {} added", path.display());
+            } else {
+                debug!("{}: not an input device libinput wants", path.display());
+            }
+        }
+        (added, removed)
     }
 }
 

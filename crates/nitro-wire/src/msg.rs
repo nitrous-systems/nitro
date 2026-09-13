@@ -37,6 +37,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use crate::codec::{FdQueue, Reader, Writer};
 use crate::error::{DecodeError, EncodeError};
+use crate::types::WindowState as WindowStateValue;
 use crate::types::{
     Align, AxisSource, BufferId, ButtonState, CursorPos, ErrorCode, Layer, NodeId, NodeKind,
     TouchPhase,
@@ -294,6 +295,35 @@ impl Body for SetWindowTitle {
         Ok(Self {
             window: r.get()?,
             title: r.get_str()?,
+        })
+    }
+}
+
+/// Give a window a stable application identifier.
+///
+/// `app_id` identifies the *application* the window belongs to
+/// (`"org.nitro.calc"`), as opposed to [`SetWindowTitle`], which names the
+/// document. The shell uses it for its window list and for icon lookup.
+/// It is free-form: the server does not validate or interpret it. Requires
+/// the [`caps::WM`](crate::types::caps::WM) capability bit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetAppId {
+    /// The window's node id.
+    pub window: NodeId,
+    /// Application identifier, e.g. `"org.nitro.calc"`.
+    pub app_id: String,
+}
+
+impl Body for SetAppId {
+    fn encode_body(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.put(self.window);
+        w.put_str(&self.app_id);
+        Ok(())
+    }
+    fn decode_body(r: &mut Reader<'_>, _fds: &mut FdQueue) -> Result<Self, DecodeError> {
+        Ok(Self {
+            window: r.get()?,
+            app_id: r.get_str()?,
         })
     }
 }
@@ -646,6 +676,39 @@ fixed_msg! {
         window: NodeId,
     }
 
+    /// Ask the server to put a window into a state.
+    ///
+    /// The server answers with a [`WindowState`] event once it has. It may
+    /// refuse — a window with
+    /// [`FIXED_SIZE`](crate::types::window_flags::FIXED_SIZE) cannot
+    /// maximize, for instance — in which case no event is sent. Requires
+    /// the [`caps::WM`](crate::types::caps::WM) capability bit.
+    ///
+    /// [`Minimized`](crate::types::WindowState::Minimized) keeps the
+    /// window alive and in the focus-cycling order; only [`Closed`] ends a
+    /// window.
+    SetWindowState {
+        /// The window.
+        window: NodeId,
+        /// State to put it in.
+        state: WindowStateValue,
+    }
+
+    /// Set the minimum and maximum logical content size the server will
+    /// resize this window to.
+    ///
+    /// A zero component means "no limit" on that axis. A `max` below `min`
+    /// is clamped by the server, never an error. Requires the
+    /// [`caps::WM`](crate::types::caps::WM) capability bit.
+    SetWindowLimits {
+        /// The window.
+        window: NodeId,
+        /// Smallest logical content size; a zero component means no limit.
+        min: Size,
+        /// Largest logical content size; a zero component means no limit.
+        max: Size,
+    }
+
     /// Create a scene node under `parent`.
     CreateNode {
         /// Node id, allocated by the client. Must be unused and non-zero.
@@ -765,6 +828,12 @@ msg_enum! {
         SetWindowTitle = 0x0011,
         /// Ask for the next frame deadline.
         RequestFrame = 0x0012,
+        /// Ask the server to change a window's state (needs `caps::WM`).
+        SetWindowState = 0x0013,
+        /// Constrain a window's resizable range (needs `caps::WM`).
+        SetWindowLimits = 0x0014,
+        /// Give a window an application id (needs `caps::WM`).
+        SetAppId = 0x0015,
         /// Create a node.
         CreateNode = 0x0101,
         /// Destroy a node and its subtree.
@@ -1022,6 +1091,19 @@ fixed_msg! {
         window: NodeId,
     }
 
+    /// A window's state actually changed.
+    ///
+    /// Either because the client asked with [`SetWindowState`] or because
+    /// the user did — a shortcut, the maximize button, a double-click on
+    /// the title bar. [`Configure`] carries the resulting size and
+    /// position, as always.
+    WindowState {
+        /// The window.
+        window: NodeId,
+        /// The state it is now in.
+        state: WindowStateValue,
+    }
+
     /// The pointer entered a window.
     PointerEnter {
         /// The window.
@@ -1129,6 +1211,8 @@ msg_enum! {
         Focus = 0x8103,
         /// Window closed.
         Closed = 0x8104,
+        /// A window's state changed (needs `caps::WM`).
+        WindowState = 0x8105,
         /// Pointer entered.
         PointerEnter = 0x8201,
         /// Pointer left.

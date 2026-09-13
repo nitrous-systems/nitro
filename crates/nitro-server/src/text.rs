@@ -237,6 +237,54 @@ impl TextEngine {
         metrics
     }
 
+    /// Shorten `text` so it fits in `width` logical pixels, appending an
+    /// ellipsis when anything was dropped.
+    ///
+    /// Used by the window frames: a title bar is one line, and a title
+    /// longer than it is elided rather than clipped, so the user can see
+    /// that there is more rather than reading a word cut in half.
+    ///
+    /// The search is a binary one over char boundaries and costs
+    /// `log(len)` measurements, which for a title is a handful; the
+    /// alternative — measuring every prefix — is what makes naive elision
+    /// show up in a profile.
+    pub fn elide(&mut self, request: &StyleRequest, text: &str, width: f32) -> String {
+        /// What a truncated string ends with.
+        const ELLIPSIS: &str = "\u{2026}";
+
+        if width <= 0.0 {
+            return String::new();
+        }
+        if self.measure(request, text).width <= width {
+            return text.to_owned();
+        }
+        // Char-boundary indices, so no candidate ever splits a code point.
+        let bounds: Vec<usize> = text
+            .char_indices()
+            .map(|(i, _)| i)
+            .chain(std::iter::once(text.len()))
+            .collect();
+        // Largest prefix whose text + ellipsis still fits. `lo` is always
+        // known to fit (the empty prefix does, or nothing can) and `hi` is
+        // always known not to.
+        let (mut lo, mut hi) = (0usize, bounds.len() - 1);
+        while lo + 1 < hi {
+            let mid = lo + (hi - lo) / 2;
+            let candidate = format!("{}{ELLIPSIS}", &text[..bounds[mid]]);
+            if self.measure(request, &candidate).width <= width {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo == 0 {
+            // Not even one character plus an ellipsis fits; an ellipsis on
+            // its own is still more honest than a clipped glyph.
+            return ELLIPSIS.to_owned();
+        }
+        format!("{}{ELLIPSIS}", &text[..bounds[lo]])
+    }
+
     /// Drop a stored run. A `None` key (a node that had no text) is a no-op.
     pub fn release(&mut self, key: Option<TextKey>) {
         if let Some(key) = key {

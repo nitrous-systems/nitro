@@ -292,13 +292,16 @@ impl<S: 'static> Harness<S> {
         false
     }
 
-    /// Find where the server placed our window, by asking for the
-    /// cascade's first slot: the harness runs one client with one window,
-    /// so it is the origin.
+    /// Find where the server placed our window.
+    ///
+    /// Since M3 the server decorates windows and places them
+    /// centred-cascade inside the work area, so "the first window is at
+    /// the origin" is no longer true — and the harness's coordinates are
+    /// *window* coordinates, which have to be shifted onto the output. The
+    /// server tells us exactly where the content landed in every
+    /// `Configure`, so use that rather than re-deriving the policy here.
     fn locate_window(&mut self) {
-        // The server cascades from (0, 0) for the first window of the
-        // first client, which is what this harness always is.
-        self.origin = Point::ZERO;
+        self.origin = self.ui.window_position();
     }
 
     // -- input --------------------------------------------------------
@@ -468,12 +471,46 @@ impl<S: 'static> Harness<S> {
 
     // -- observation --------------------------------------------------
 
-    /// A screenshot of the whole output.
+    /// A screenshot of this harness's **window**, cropped out of the
+    /// output: pixel `(0, 0)` is the window's top-left content corner, so
+    /// a test's coordinates are window coordinates everywhere.
+    ///
+    /// Since M3 the server decorates windows and places them
+    /// centred-cascade, so the window is no longer at the output's origin
+    /// and a raw output screenshot would make every pixel assertion depend
+    /// on the placement policy. [`Harness::output_shot`] is still there for
+    /// a test that wants the desktop around the window.
     ///
     /// # Panics
     /// If the control socket answers with an error.
     #[must_use]
     pub fn shot(&self) -> Image {
+        let img = self.output_shot();
+        let size = self.ui.window_size();
+        let x0 = self.origin.x.max(0.0) as u32;
+        let y0 = self.origin.y.max(0.0) as u32;
+        let w = (size.w.max(0.0) as u32).min(img.width.saturating_sub(x0));
+        let h = (size.h.max(0.0) as u32).min(img.height.saturating_sub(y0));
+        let stride = w * 4;
+        let mut data = Vec::with_capacity((stride * h) as usize);
+        for y in 0..h {
+            let src = ((y + y0) * img.stride + x0 * 4) as usize;
+            data.extend_from_slice(&img.data[src..src + stride as usize]);
+        }
+        Image {
+            width: w,
+            height: h,
+            stride,
+            data,
+        }
+    }
+
+    /// A screenshot of the whole output, decorations and desktop included.
+    ///
+    /// # Panics
+    /// If the control socket answers with an error.
+    #[must_use]
+    pub fn output_shot(&self) -> Image {
         self.server.shot()
     }
 
@@ -485,24 +522,7 @@ impl<S: 'static> Harness<S> {
     /// If the screenshot cannot be taken.
     #[must_use]
     pub fn has_ink(&self, rect: Rect, background: u32) -> bool {
-        let img = self.shot();
-        let r = rect
-            .translate(self.origin.x, self.origin.y)
-            .round_out()
-            .intersect(&nitro_core::IRect::new(
-                0,
-                0,
-                img.width.cast_signed(),
-                img.height.cast_signed(),
-            ));
-        for y in r.y..r.bottom() {
-            for x in r.x..r.right() {
-                if img.pixel(x as u32, y as u32) & 0x00ff_ffff != background & 0x00ff_ffff {
-                    return true;
-                }
-            }
-        }
-        false
+        self.ink_count(rect, background) > 0
     }
 
     /// Count the pixels inside `rect` that differ from `background`.
@@ -512,15 +532,12 @@ impl<S: 'static> Harness<S> {
     #[must_use]
     pub fn ink_count(&self, rect: Rect, background: u32) -> usize {
         let img = self.shot();
-        let r = rect
-            .translate(self.origin.x, self.origin.y)
-            .round_out()
-            .intersect(&nitro_core::IRect::new(
-                0,
-                0,
-                img.width.cast_signed(),
-                img.height.cast_signed(),
-            ));
+        let r = rect.round_out().intersect(&nitro_core::IRect::new(
+            0,
+            0,
+            img.width.cast_signed(),
+            img.height.cast_signed(),
+        ));
         let mut n = 0;
         for y in r.y..r.bottom() {
             for x in r.x..r.right() {

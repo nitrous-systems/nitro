@@ -13,7 +13,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 use crate::error::DecodeError;
 use crate::types::{
     Align, AxisSource, BufferId, ButtonState, CursorPos, ErrorCode, Layer, NodeId, NodeKind,
-    TouchPhase,
+    TouchPhase, WindowState,
 };
 
 /// A type with a fixed-size, little-endian wire representation.
@@ -105,6 +105,7 @@ plain_tag!(NodeKind, u8, u8);
 plain_tag!(ButtonState, u8, u8);
 plain_tag!(AxisSource, u8, u8);
 plain_tag!(TouchPhase, u8, u8);
+plain_tag!(WindowState, u8, u8);
 plain_tag!(ErrorCode, u16, U16);
 
 /// `impl Plain` for the id newtypes.

@@ -40,6 +40,33 @@ pub fn is_drm_hotplug(msg: &[u8]) -> bool {
     subsystem_drm && hotplug
 }
 
+/// True when `msg` is a kernel uevent adding or removing a device on
+/// `subsystem` (`b"input"`, `b"drm"`, …).
+///
+/// Unlike [`is_drm_hotplug`] this does not look for `HOTPLUG=1`: that flag
+/// is the DRM core's way of saying "a connector changed state on a device
+/// that is already here", and what an input device does instead is
+/// *appear* and *disappear*, which is `ACTION=add` / `ACTION=remove`.
+#[must_use]
+pub fn is_device_change(msg: &[u8], subsystem: &[u8]) -> bool {
+    if msg.starts_with(b"libudev") {
+        return false;
+    }
+    let mut want_subsystem = Vec::with_capacity(10 + subsystem.len());
+    want_subsystem.extend_from_slice(b"SUBSYSTEM=");
+    want_subsystem.extend_from_slice(subsystem);
+    let mut matched = false;
+    let mut action = false;
+    for field in msg.split(|&b| b == 0) {
+        if field == want_subsystem.as_slice() {
+            matched = true;
+        } else if field == b"ACTION=add" || field == b"ACTION=remove" {
+            action = true;
+        }
+    }
+    matched && action
+}
+
 /// A non-blocking socket subscribed to kernel uevents.
 pub struct UeventSocket {
     fd: OwnedFd,
@@ -73,11 +100,24 @@ impl UeventSocket {
     /// # Errors
     /// A receive failure other than "would block".
     pub fn drain(&mut self) -> io::Result<bool> {
+        self.drain_with(is_drm_hotplug)
+    }
+
+    /// Drain every queued message; returns whether any was an add or a
+    /// remove on `subsystem`. Never blocks.
+    ///
+    /// # Errors
+    /// A receive failure other than "would block".
+    pub fn drain_subsystem(&mut self, subsystem: &[u8]) -> io::Result<bool> {
+        self.drain_with(|msg| is_device_change(msg, subsystem))
+    }
+
+    fn drain_with(&mut self, mut interesting: impl FnMut(&[u8]) -> bool) -> io::Result<bool> {
         let mut hotplug = false;
         loop {
             match recv(&self.fd, &mut self.buf[..], RecvFlags::empty()) {
                 Ok((n, _)) => {
-                    if is_drm_hotplug(&self.buf[..n]) {
+                    if interesting(&self.buf[..n]) {
                         hotplug = true;
                     }
                 }
@@ -125,6 +165,28 @@ mod tests {
         msg.extend_from_slice(&[0xfe, 0xed, 0xca, 0xfe, 0, 0, 0, 0]);
         msg.extend_from_slice(b"SUBSYSTEM=drm\0HOTPLUG=1\0");
         assert!(!is_drm_hotplug(&msg));
+        assert!(!is_device_change(&msg, b"drm"));
+    }
+
+    #[test]
+    fn recognises_an_input_device_appearing_and_leaving() {
+        let add = b"add@/devices/virtual/input/input7/event9\0ACTION=add\0SUBSYSTEM=input\0DEVNAME=input/event9\0";
+        let remove = b"remove@/devices/virtual/input/input7/event9\0ACTION=remove\0SUBSYSTEM=input\0";
+        assert!(is_device_change(add, b"input"));
+        assert!(is_device_change(remove, b"input"));
+        // An input device appearing is not a DRM hotplug.
+        assert!(!is_drm_hotplug(add));
+        // Another subsystem's add is not ours.
+        assert!(!is_device_change(add, b"drm"));
+        // A `change` on a device already present is neither.
+        let change = b"change@/devices/x\0ACTION=change\0SUBSYSTEM=input\0";
+        assert!(!is_device_change(change, b"input"));
+        // A prefix must not match.
+        assert!(!is_device_change(
+            b"add@/x\0ACTION=add\0SUBSYSTEM=input_foo\0",
+            b"input"
+        ));
+        assert!(!is_device_change(b"", b"input"));
     }
 
     #[test]

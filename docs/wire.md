@@ -126,6 +126,7 @@ containing the transaction reached the screen.
 | 1 | `TEXT` | the server has fonts, so `Text` nodes will actually draw (M2) |
 | 2 | `DMABUF` | `Surface` nodes backed by dma-bufs are accepted (M5) |
 | 3 | `REMOTE` | the link is remote: buffers are expensive, text is cheap |
+| 4 | `WM` | the server manages windows: decorations, states, limits, app ids (M3) |
 
 ## Errors
 
@@ -154,6 +155,7 @@ logs and is never parsed.
 | `AxisSource` | `Wheel` 0, `Finger` 1, `Continuous` 2, `WheelTilt` 3 |
 | `TouchPhase` | `Down` 0, `Move` 1, `Up` 2, `Cancel` 3 |
 | `Align` | `Left` 0, `Center` 1, `Right` 2 |
+| `WindowState` | `Normal` 0, `Maximized` 1, `Fullscreen` 2, `Minimized` 3 |
 | `Fill` tag | `None` 0, `Solid` 1, `Linear` 2 |
 
 A value outside the list is a decode error, not a silently-ignored
@@ -165,8 +167,17 @@ draw with — a client that ignores the bit gets working, well-formed
 metrics for an empty run and paints nothing, rather than a dead
 connection. Check the bit before you rely on text being *visible*.
 
-`window_flags`: `UNDECORATED` 1, `FULLSCREEN` 2, `OPAQUE` 4. Unknown bits
-are reserved and must be zero.
+`window_flags`: `UNDECORATED` 1 (the server draws no frame around this
+window), `FIXED_SIZE` 2 (the window is not user-resizable: no resize
+bands, no maximize), `NO_FOCUS` 4 (the window never takes keyboard focus —
+a launcher, a bar). Unknown bits are reserved and must be zero.
+
+**Errata (M3).** Bits 1 and 2 used to be documented as `FULLSCREEN` and
+`OPAQUE`. Both were placeholders that no implementation ever honoured:
+fullscreen is now a window *state* (`SetWindowState`, `WindowState`) rather
+than a creation flag, and the opacity hint is deferred until there is a
+compositor optimisation to feed it to. No byte layout changed — only the
+meaning of two bits nothing read — so `VERSION` stays 1.
 
 Buffer formats are DRM fourcc codes: `XR24` (`0x34325258`, 32 bpp
 `[b,g,r,x]`) and `AR24` (`0x34325241`, `[b,g,r,a]`, straight alpha).
@@ -186,6 +197,9 @@ Assigned in blocks of 0x100 so a block can grow without renumbering.
 | `0x0010` | `CreateWindow` | session |
 | `0x0011` | `SetWindowTitle` | session |
 | `0x0012` | `RequestFrame` | session |
+| `0x0013` | `SetWindowState` | session (see `WM`) |
+| `0x0014` | `SetWindowLimits` | session (see `WM`) |
+| `0x0015` | `SetAppId` | session (see `WM`) |
 | `0x0101` | `CreateNode` | tree |
 | `0x0102` | `DestroyNode` | tree |
 | `0x0103` | `Reparent` | tree |
@@ -215,6 +229,7 @@ Assigned in blocks of 0x100 so a block can grow without renumbering.
 | `0x8102` | `Frame` | windows |
 | `0x8103` | `Focus` | windows |
 | `0x8104` | `Closed` | windows |
+| `0x8105` | `WindowState` | windows (see `WM`) |
 | `0x8201` | `PointerEnter` | input |
 | `0x8202` | `PointerLeave` | input |
 | `0x8203` | `PointerMotion` | input |
@@ -273,6 +288,60 @@ created with `CreateNode { parent: id }`.
 
 The server answers with one `Frame` carrying the deadline for the next
 flip. One request, one answer: there are no free-running render loops.
+
+### `SetWindowState` — 0x0013
+
+| field | type | meaning |
+|---|---|---|
+| `window` | `NodeId` | the window |
+| `state` | `WindowState` | state to put it in |
+
+Asks the server to put the window into that state. The server answers with
+a `WindowState` event once it has. It may refuse — a window created with
+`FIXED_SIZE` cannot maximize, for instance — in which case **no event is
+sent** and nothing changes; there is no per-request error.
+
+`Configure` carries the resulting size and position, as always: a client
+lays out for what `Configure` gives it, not for what it asked for.
+
+`Minimized` keeps the window alive, in the window list and in the
+focus-cycling order; it is not a soft close. Only `Closed` ends a window.
+
+Requires the `WM` capability bit.
+
+### `SetWindowLimits` — 0x0014
+
+| field | type | meaning |
+|---|---|---|
+| `window` | `NodeId` | the window |
+| `min` | `Size` | smallest logical content size |
+| `max` | `Size` | largest logical content size |
+
+The minimum and maximum logical content size the server will resize this
+window to. A zero component means **no limit** on that axis, so
+`min = {0, 0}`, `max = {0, 0}` is "resize me freely" — the default.
+
+A `max` below `min` is clamped by the server, never an error: limits are a
+hint the window manager applies, not a request that can fail.
+
+Requires the `WM` capability bit.
+
+### `SetAppId` — 0x0015
+
+| field | type | meaning |
+|---|---|---|
+| `window` | `NodeId` | the window |
+| `app_id` | `str` | application identifier |
+
+A stable identifier for the window's *application* (`"org.nitro.calc"`), as
+opposed to `SetWindowTitle`, which names the document. The shell uses it
+for its window list and for icon lookup. It is free-form: the server does
+not validate or interpret it.
+
+Fixed head 4 bytes (`window`), then the string — the same shape as
+`SetWindowTitle`.
+
+Requires the `WM` capability bit.
 
 ### `CreateNode` — 0x0101
 
@@ -538,6 +607,22 @@ The answer to one `RequestFrame`. Commit before `deadline_ns`.
 
 The window is gone; its node id is invalid from here on.
 
+### `WindowState` — 0x8105
+
+| field | type | meaning |
+|---|---|---|
+| `window` | `NodeId` | the window |
+| `state` | `WindowState` | the state it is now in |
+
+The window's state actually changed — either because the client asked with
+`SetWindowState` or because the user did: a shortcut, the maximize button,
+a double-click on the title bar. A request the server refuses produces no
+event, so receiving one is the only confirmation a state took effect.
+
+`Configure` carries the resulting size and position, as always.
+
+Sent only to clients that were told the `WM` capability bit.
+
 ### `PointerEnter` — 0x8201
 
 | field | type | meaning |
@@ -664,8 +749,8 @@ first, or where a name was ambiguous. Every difference:
 7. **`Fill` is `PartialEq` but not `Eq`**, because it contains `Point`
    (`f32`).
 8. **Op codes leave gaps**: `0x0003..0x000f` inside the session block,
-   `0x0013..0x00ff` after the window ops, and so on, so each block can
-   grow.
+   `0x0016..0x00ff` after the window ops (M3 took `0x0013..0x0015`), and
+   so on, so each block can grow.
 9. **No separate `Sender` type.** The sketch asked for `ClientStream` plus
    a `Sender` for `ServerMsg`; sending is instead `ClientStream::send` /
    `flush` on the same object. A `Sender` would have to own or share the
@@ -774,6 +859,19 @@ to.
   sanctioned path: four **new op codes** in a gap and a new block,
   guarded by the **existing `TEXT` capability bit** (bit 1). No field of
   any pre-existing message changed, so `VERSION` stays **1**.
+* The M3 window-management ops — `SetWindowState` 0x0013,
+  `SetWindowLimits` 0x0014, `SetAppId` 0x0015 and `WindowState` 0x8105 —
+  are the same sanctioned path again: four **new op codes** in the gaps
+  after the existing window ops, guarded by the **new `WM` capability
+  bit** (bit 4). No field of any pre-existing message changed, so
+  `VERSION` stays **1**.
+* The one thing M3 does change is the *meaning* of `window_flags` bits 1
+  and 2, documented as `FULLSCREEN` and `OPAQUE` and now `FIXED_SIZE` and
+  `NO_FOCUS` (see the errata under `window_flags`). No byte layout moved
+  and no implementation ever honoured either bit, so this too leaves
+  `VERSION` at **1**. A renaming like that is only safe while nothing
+  reads the bit; once the toolkit does, the bits are frozen with
+  everything else.
 * `VERSION` is bumped only for a change that is not expressible that way —
   a different framing, a changed field, a removed op. A version mismatch is
   fatal at handshake: there is no negotiation and no compatibility shim.

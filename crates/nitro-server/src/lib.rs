@@ -48,6 +48,7 @@ pub mod stats;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 pub mod text;
+pub mod wm;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -59,12 +60,14 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use nitro_core::{Damage, Point, Size};
+use nitro_core::{Damage, Point, Rect, Size};
 use nitro_kms::{
     Backend, DrmBackend, DrmOptions, Error as KmsError, Event, FakeBackend,
     OutputId as KmsOutputId, OutputInfo, Rect as KmsRect,
 };
-use nitro_scene::{ClientId, DamageSink, OutputId as SceneOutputId, Scene, WindowKey};
+use nitro_scene::{
+    ClientId, DamageSink, OutputId as SceneOutputId, Scene, WindowKey, WindowState,
+};
 use nitro_seat::{Device, Seat, SeatEvent};
 use nitro_wire::msg::{self, ClientMsg, ServerMsg};
 use nitro_wire::server::Listener as WireListener;
@@ -77,10 +80,11 @@ use crate::cursor::Cursor;
 use crate::defer::DeferredFlip;
 use crate::frame::{CursorState, OutputState};
 use crate::input::{InputEvent, InputSource, LibinputSource, Pointer};
-use crate::keyboard::{Hotkey, Keyboard};
+use crate::keyboard::{Hotkey, Keyboard, Mods};
 use crate::protocol::Request;
 use crate::stats::FrameStats;
 use crate::text::{StyleRequest, TextEngine};
+use crate::wm::{Drag, Edges, FrameNodes, Region, WindowManager};
 
 /// Server name reported in `Welcome`.
 pub const SERVER_NAME: &str = "nitro";
@@ -207,6 +211,56 @@ fn errno(op: &'static str) -> impl FnOnce(rustix::io::Errno) -> Error {
     }
 }
 
+/// Per-output scale overrides from `NITRO_SCALE=<name>=<f32>,…`.
+///
+/// A stop-gap: the persistent, user-editable output layout (position,
+/// rotation and scale per connector) belongs to the settings app, which is
+/// M4. Until then an environment variable is the honest way to say "this
+/// panel is `HiDPI`" without inventing a config format that will be thrown
+/// away.
+fn scale_overrides() -> HashMap<String, f32> {
+    let mut out = HashMap::new();
+    let Ok(spec) = std::env::var("NITRO_SCALE") else {
+        return out;
+    };
+    for entry in spec.split(',').filter(|e| !e.trim().is_empty()) {
+        let Some((name, value)) = entry.split_once('=') else {
+            warn!("NITRO_SCALE: {entry:?} is not name=scale");
+            continue;
+        };
+        match value.trim().parse::<f32>() {
+            Ok(s) if s.is_finite() && s > 0.0 => {
+                out.insert(name.trim().to_owned(), s);
+            }
+            _ => warn!("NITRO_SCALE: {value:?} is not a positive scale"),
+        }
+    }
+    out
+}
+
+/// The scale an output gets when nothing overrides it.
+///
+/// Derived from the EDID physical size: a panel at 192 dpi or more is a
+/// `HiDPI` panel and gets 2×, everything else 1×. Deliberately a step
+/// function rather than a continuous ratio — fractional scaling makes
+/// every rectangle in the tree land between pixels, and the whole damage
+/// contract is built on exact device rects.
+#[must_use]
+fn default_scale(info: &OutputInfo) -> f32 {
+    /// Millimetres per inch, times ten, so the arithmetic stays integral.
+    const MM_PER_INCH_10: u32 = 254;
+    /// The dpi at which a panel is treated as `HiDPI`.
+    const HIDPI: u32 = 192;
+    let (mm_w, mm_h) = info.phys_mm;
+    if mm_w == 0 || mm_h == 0 {
+        return 1.0;
+    }
+    // dpi = pixels / (mm / 25.4); computed as an integer to avoid a float
+    // comparison deciding a discrete question.
+    let dpi = info.width * MM_PER_INCH_10 / (mm_w * 10);
+    if dpi >= HIDPI { 2.0 } else { 1.0 }
+}
+
 // epoll tokens
 const TOK_SEAT: u64 = 0;
 const TOK_SIGNALS: u64 = 1;
@@ -216,6 +270,8 @@ const TOK_WIRE_LISTENER: u64 = 4;
 const TOK_INPUT: u64 = 5;
 /// The one timerfd that bounds a deferred flip; see [`defer`].
 const TOK_DEFER: u64 = 6;
+/// The uevent socket watching for input devices being plugged in and out.
+const TOK_INPUT_HOTPLUG: u64 = 7;
 /// How long an unanswered input keeps waiting for a frame to claim it.
 /// Beyond this the number would not be a latency any more: nothing
 /// responded to the event, and attributing the next unrelated frame to it
@@ -308,6 +364,19 @@ struct Server {
     keyboard: Option<Keyboard>,
     cursor: Cursor,
     pointer: Pointer,
+    /// Window-management policy: MRU, focus, drags, placement.
+    wm: WindowManager,
+    /// The decoration nodes of each framed window.
+    decorations: HashMap<WindowKey, FrameNodes>,
+    /// The shaped title run of each framed window, so a retitle can release
+    /// the old one.
+    frame_titles: HashMap<WindowKey, nitro_text::TextKey>,
+    /// Per-output scale overrides from `NITRO_SCALE`, by connector name.
+    scale_overrides: HashMap<String, f32>,
+    /// Watches `/sys` for input devices appearing and disappearing.
+    input_hotplug: Option<nitro_kms::uevent::UeventSocket>,
+    /// Where `event*` devices live, for the hotplug rescan.
+    input_dir: Option<PathBuf>,
     /// The window with keyboard focus, if any.
     focus: Option<WindowKey>,
     /// Which window each live touch point started on, and where it is in
@@ -419,6 +488,27 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         add(&epoll, &fd, TOK_INPUT)?;
     }
 
+    // Input-device hotplug, deferred from M1: the same kernel uevent
+    // socket the DRM backend uses, on the `input` subsystem. It is opened
+    // only when input is real — a fake source has no devices to add — and
+    // a failure is not fatal: a sandbox with no netlink loses hotplug, not
+    // the keyboard it already has.
+    let input_hotplug = if config.input_dir.is_some() && seat.is_some() {
+        match nitro_kms::uevent::UeventSocket::open() {
+            Ok(s) => {
+                add(&epoll, &s, TOK_INPUT_HOTPLUG)?;
+                info!("input hotplug via the kernel uevent socket");
+                Some(s)
+            }
+            Err(e) => {
+                warn!("input hotplug disabled: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let keyboard = Keyboard::new();
     match &keyboard {
         Some(kb) => info!("xkb keymap: {}", kb.layout_names().join(", ")),
@@ -454,6 +544,12 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         keyboard,
         cursor: Cursor::new(),
         pointer: Pointer::default(),
+        wm: WindowManager::new(),
+        decorations: HashMap::new(),
+        frame_titles: HashMap::new(),
+        scale_overrides: scale_overrides(),
+        input_hotplug,
+        input_dir: config.input_dir.clone(),
         focus: None,
         touch_targets: HashMap::new(),
         buffer_sources: HashMap::new(),
@@ -653,25 +749,41 @@ impl Server {
     }
 
     /// Bring the scene's outputs and the per-output frame state in line
-    /// with the backend's, side by side along the x axis. Multi-output
-    /// layout is M3; a row is the arrangement that needs no policy.
+    /// with the backend's, laid out **left to right in connector order**.
+    ///
+    /// A row is the arrangement that needs no policy, and connector order
+    /// is the only ordering the kernel gives us; a persistent layout the
+    /// user can rearrange belongs to the settings app (M4). The scale of
+    /// each output is `NITRO_SCALE` if it names that connector, else the
+    /// EDID-derived default.
+    ///
+    /// Removing an output orphans its windows — the scene unplaces them —
+    /// so they are migrated onto the primary output afterwards rather than
+    /// left invisible with no way back.
     fn sync_outputs(&mut self) {
         let infos: Vec<OutputInfo> = self.backend.outputs().to_vec();
+        let mut lost = false;
         self.outputs.retain(|o| {
             let keep = infos.iter().any(|i| i.id == o.kms_id);
             if !keep {
                 info!("{} gone", o.kms_id);
                 self.scene.remove_output(o.scene_id);
+                lost = true;
             }
             keep
         });
         let mut x = 0;
         for info in &infos {
             let scene_id = SceneOutputId(info.id.0);
+            let scale = self
+                .scale_overrides
+                .get(&info.name)
+                .copied()
+                .unwrap_or_else(|| default_scale(info));
             let rect =
                 nitro_core::IRect::new(x, 0, info.width.cast_signed(), info.height.cast_signed());
             x += info.width.cast_signed();
-            self.scene.add_output(scene_id, rect, 1.0);
+            self.scene.add_output(scene_id, rect, scale);
             if let Some(existing) = self.outputs.iter_mut().find(|o| o.kms_id == info.id) {
                 existing.width = info.width;
                 existing.height = info.height;
@@ -680,7 +792,7 @@ impl Server {
                 continue;
             }
             info!(
-                "{} {}: {}x{}@{}.{:03} Hz",
+                "{} {}: {}x{}@{}.{:03} Hz, scale {scale}",
                 info.id,
                 info.name,
                 info.width,
@@ -695,6 +807,9 @@ impl Server {
                 info.height,
                 info.refresh_mhz,
             ));
+        }
+        if lost {
+            self.migrate_orphans();
         }
         // Windows created while there was no output can be placed now.
         // `place_new_window` re-queues any that still cannot be, so an
@@ -732,6 +847,58 @@ impl Server {
             self.pointer.x = f64::from(o.width / 2);
             self.pointer.y = f64::from(o.height / 2);
             self.pointer.output = Some(o.scene_id);
+        }
+        // The pointer may be standing where an output used to be.
+        if lost && let Some(bounds) = input::output_union(&self.scene) {
+            let (x, y) = (self.pointer.x, self.pointer.y);
+            self.pointer.move_to(x, y, Some(bounds));
+            self.pointer.output = input::output_at(&self.scene, self.pointer.position());
+        }
+    }
+
+    /// Move every window the scene unplaced (its output went away) onto the
+    /// primary output, clamped into its work area.
+    ///
+    /// A window that is simply left unplaced is invisible and unreachable:
+    /// it is not in any z-order, so no click and no `Alt+Tab` raise can get
+    /// it back. Migrating is the only behaviour that does not lose work.
+    fn migrate_orphans(&mut self) {
+        let Some(primary) = self.outputs.first().map(|o| o.scene_id) else {
+            // Every output is gone; the windows wait, exactly as they do
+            // between startup and the first connector.
+            return;
+        };
+        let area = wm::work_area(&self.scene, primary);
+        let orphans: Vec<WindowKey> = self
+            .wire_clients
+            .values()
+            .flat_map(|c| c.windows.values().copied())
+            .filter(|w| {
+                self.scene
+                    .window_info(*w)
+                    .is_ok_and(|i| i.output().is_none())
+            })
+            .collect();
+        if orphans.is_empty() {
+            return;
+        }
+        info!("migrating {} window(s) to the primary output", orphans.len());
+        for win in orphans {
+            let Ok(info) = self.scene.window_info(win) else {
+                continue;
+            };
+            let (size, position, state) = (info.frame_size(), info.position(), info.state());
+            let pos = wm::clamp_into(position, size, area);
+            if let Err(e) = self.scene.place_window(win, Some(primary), pos) {
+                warn!("migrating a window: {e}");
+                continue;
+            }
+            // A maximized or fullscreen window's geometry is the old
+            // output's; re-derive it for the new one.
+            if state != WindowState::Normal && state != WindowState::Minimized {
+                self.apply_state_geometry(win, state);
+            }
+            self.configure(win);
         }
     }
 
@@ -780,7 +947,10 @@ impl Server {
         let Some((position, scale, output)) = self.scene.window_info(win).ok().and_then(|w| {
             let id = w.output()?;
             let (_, s) = self.scene.output_info(id)?;
-            Some((w.position(), s, id.0))
+            // A client is told where its *content* is, not where its frame
+            // is: `position` plus `size` must crop a screenshot down to
+            // exactly the pixels the client drew.
+            Some((w.content_position(), s, id.0))
         }) else {
             return;
         };
@@ -795,6 +965,20 @@ impl Server {
                 }));
             }
         }
+    }
+
+    /// Send the current `Configure` for a window: what the server just did
+    /// to its geometry, whether or not its size changed.
+    ///
+    /// The scene's own `Configure` stream only fires on a *size* change, so
+    /// a pure move — a drag, a migration, a tile that happens to preserve
+    /// the size — would otherwise leave the client believing it is still
+    /// where it was, and `position` is what it crops screenshots with.
+    fn configure(&mut self, win: WindowKey) {
+        let Ok(size) = self.scene.window_info(win).map(nitro_scene::Window::size) else {
+            return;
+        };
+        self.send_configure(win, size);
     }
 
     /// Paint and commit one output if it is writable and has anything new.
@@ -1097,6 +1281,7 @@ impl Server {
                     TOK_WIRE_LISTENER => self.on_wire_accept()?,
                     TOK_BACKEND => self.on_backend()?,
                     TOK_INPUT => self.on_input(),
+                    TOK_INPUT_HOTPLUG => self.on_input_hotplug(),
                     TOK_DEFER => self.on_defer_deadline(),
                     t if t >= TOK_WIRE_BASE => self.on_wire_client(t, flags),
                     t if t >= TOK_CLIENT_BASE => self.on_client(t, flags),
@@ -1327,6 +1512,58 @@ impl Server {
         self.settle();
     }
 
+    /// A kernel uevent arrived on the `input` subsystem: a keyboard or
+    /// mouse was plugged in or pulled out.
+    ///
+    /// Deferred from M1, and the same socket the DRM backend already uses.
+    /// libinput's path backend does not watch `/dev/input` on its own —
+    /// that is what the udev backend is for, and the udev backend is a
+    /// dependency this tree does not want — so the server rescans the
+    /// directory itself and tells libinput which paths appeared and
+    /// disappeared.
+    fn on_input_hotplug(&mut self) {
+        let changed = match self.input_hotplug.as_mut() {
+            Some(socket) => match socket.drain_subsystem(b"input") {
+                Ok(changed) => changed,
+                Err(e) => {
+                    warn!("reading the input uevent socket: {e}");
+                    false
+                }
+            },
+            None => false,
+        };
+        if !changed {
+            return;
+        }
+        let Some(dir) = self.input_dir.clone() else {
+            return;
+        };
+        let (added, removed) = self.input.rescan(&dir);
+        if added == 0 && removed == 0 {
+            return;
+        }
+        info!("input hotplug: +{added} -{removed} device(s)");
+        // A new device brings a new fd, which has to join the epoll set;
+        // re-adding one already there is `EEXIST`, which is not an error
+        // worth reporting.
+        for fd in self.input.poll_fds() {
+            if let Err(e) = epoll::add(
+                &self.epoll,
+                fd,
+                EventData::new_u64(TOK_INPUT),
+                EventFlags::IN,
+            ) && e != rustix::io::Errno::EXIST
+            {
+                warn!("epoll_ctl add input fd: {e}");
+            }
+        }
+        // A keyboard that went away may have been holding a modifier we
+        // will never see released.
+        if removed > 0 && let Some(kb) = self.keyboard.as_mut() {
+            kb.reset();
+        }
+    }
+
     /// One input event: update the pointer or the keyboard, then send the
     /// protocol event to whoever owns what it landed on.
     fn route_input(&mut self, event: &InputEvent) {
@@ -1402,6 +1639,17 @@ impl Server {
         let point = self.pointer.position();
         let output = input::output_at(&self.scene, point);
         self.pointer.output = output;
+        // A drag in flight owns every motion: the window follows the
+        // pointer and the client hears nothing at all, which is what makes
+        // a drag zero round trips. A resize does send one `Configure` per
+        // motion, and the frame scheduler already throttles those to one
+        // per frame.
+        if let Some(drag) = self.wm.drag()
+            && self.drive_drag(drag)
+        {
+            self.note_input(time_ns);
+            return;
+        }
         let target = output.and_then(|id| input::hit(&self.scene, id, point));
         let now_over = target.map(|t| t.window);
         if now_over != self.pointer.over {
@@ -1446,6 +1694,87 @@ impl Server {
     }
 
     fn pointer_button(&mut self, button: u32, state: ButtonState, time_ns: u64) {
+        /// Linux evdev `BTN_RIGHT`.
+        const BTN_RIGHT: u32 = 0x111;
+
+        // A release always ends whatever drag was in flight, whether or not
+        // the pointer is still over the window it started on: a drag that
+        // survived the button coming up would follow the pointer for ever.
+        if state == ButtonState::Released
+            && let Some(drag) = self.wm.end_drag()
+        {
+            if let Drag::Button { window, region } = drag {
+                // A button fires on release *inside itself*, which is what
+                // lets a user change their mind by sliding off it.
+                let still_on = self
+                    .pointer_logical()
+                    .and_then(|(out, p)| self.frame_hit(out, p))
+                    .is_some_and(|(w, r)| w == window && r == region);
+                if still_on {
+                    match region {
+                        Region::Close => self.close_window(window),
+                        Region::Maximize => self.toggle_maximize(window),
+                        _ => {}
+                    }
+                }
+            }
+            self.note_input(time_ns);
+            return;
+        }
+
+        let mods = self
+            .keyboard
+            .as_ref()
+            .map_or_else(Mods::default, Keyboard::named_mods);
+        if state == ButtonState::Pressed
+            && let Some((output, point)) = self.pointer_logical()
+        {
+            // Super + drag: the server moves and resizes any window,
+            // decorated or not. Checked before the frame regions so it
+            // works over a client's own content too.
+            if mods.logo
+                && !mods.ctrl
+                && !mods.alt
+                && let Some((win, _)) = self.frame_hit(output, point)
+            {
+                self.raise_and_focus(win);
+                if button == input::BTN_LEFT {
+                    self.begin_move(win, point);
+                    self.note_input(time_ns);
+                    return;
+                }
+                if button == BTN_RIGHT && self.resizable(win) {
+                    self.begin_corner_resize(win, point);
+                    self.note_input(time_ns);
+                    return;
+                }
+            }
+            if button == input::BTN_LEFT
+                && let Some((win, region)) = self.frame_hit(output, point)
+                && region != Region::Content
+            {
+                self.raise_and_focus(win);
+                match region {
+                    Region::TitleBar => {
+                        if self.wm.title_click(win, time_ns) {
+                            self.toggle_maximize(win);
+                        } else {
+                            self.begin_move(win, point);
+                        }
+                    }
+                    Region::Resize(edges) => {
+                        self.begin_resize(win, edges, point);
+                    }
+                    Region::Close | Region::Maximize => {
+                        self.wm.begin_drag(Drag::Button { window: win, region });
+                    }
+                    Region::Content => unreachable!("guarded above"),
+                }
+                self.note_input(time_ns);
+                return;
+            }
+        }
+
         let Some(window) = self.pointer.over else {
             // A click on the desktop drops focus, which is what lets a
             // client know it stopped receiving keys.
@@ -1455,17 +1784,7 @@ impl Server {
             return;
         };
         if state == ButtonState::Pressed && button == input::BTN_LEFT {
-            // Raise within the Normal layer only: a click must not pull a
-            // panel out from under a menu, or a menu below its panel.
-            if self
-                .scene
-                .window_info(window)
-                .is_ok_and(|w| w.layer() == nitro_scene::Layer::Normal)
-                && let Err(e) = self.scene.raise(window)
-            {
-                warn!("raise: {e}");
-            }
-            self.set_focus(Some(window));
+            self.raise_and_focus(window);
         }
         let sent_to = self.send_to_window(window, |id| {
             ServerMsg::PointerButton(msg::PointerButton {
@@ -1479,6 +1798,114 @@ impl Server {
         self.note_input(time_ns);
     }
 
+    /// Whether a window may be resized by a drag.
+    fn resizable(&self, win: WindowKey) -> bool {
+        self.scene.window_info(win).is_ok_and(|i| {
+            !i.flags().fixed_size
+                && matches!(i.state(), WindowState::Normal | WindowState::Maximized)
+        })
+    }
+
+    /// Start a move drag, holding the pointer's offset into the frame.
+    fn begin_move(&mut self, win: WindowKey, point: Point) {
+        // Dragging a maximized window restores it first, under the cursor,
+        // which is what every desktop does and the only behaviour that does
+        // not silently discard the restore rectangle.
+        if self
+            .scene
+            .window_info(win)
+            .is_ok_and(|i| i.state() == WindowState::Maximized)
+        {
+            self.set_state(win, WindowState::Normal);
+        }
+        let Ok(info) = self.scene.window_info(win) else {
+            return;
+        };
+        let origin = info.position();
+        let size = info.frame_size();
+        // Keep the grab inside the frame even after a restore shrank it,
+        // so the window does not jump out from under the pointer.
+        let grab = Point::new(
+            (point.x - origin.x).clamp(0.0, size.w.max(0.0)),
+            (point.y - origin.y).clamp(0.0, size.h.max(0.0)),
+        );
+        self.wm.begin_drag(Drag::Move { window: win, grab });
+    }
+
+    /// Start a resize drag on the named edges.
+    fn begin_resize(&mut self, win: WindowKey, edges: Edges, point: Point) {
+        if !self.resizable(win) {
+            return;
+        }
+        let Ok(info) = self.scene.window_info(win) else {
+            return;
+        };
+        self.wm.begin_drag(Drag::Resize {
+            window: win,
+            edges,
+            start: info.frame_rect(),
+            origin: point,
+        });
+    }
+
+    /// Start a resize drag from whichever corner the pointer is nearest,
+    /// which is what `Super`+right-drag does anywhere in a window.
+    fn begin_corner_resize(&mut self, win: WindowKey, point: Point) {
+        let Ok(info) = self.scene.window_info(win) else {
+            return;
+        };
+        let rect = info.frame_rect();
+        let edges = Edges::corner(
+            point.x >= rect.x + rect.w / 2.0,
+            point.y >= rect.y + rect.h / 2.0,
+        );
+        self.begin_resize(win, edges, point);
+    }
+
+    /// Toggle a window between `Maximized` and `Normal`.
+    fn toggle_maximize(&mut self, win: WindowKey) {
+        let Ok(state) = self.scene.window_info(win).map(nitro_scene::Window::state) else {
+            return;
+        };
+        let next = if state == WindowState::Maximized {
+            WindowState::Normal
+        } else {
+            WindowState::Maximized
+        };
+        self.set_state(win, next);
+    }
+
+    /// Toggle a window between `Fullscreen` and `Normal`.
+    fn toggle_fullscreen(&mut self, win: WindowKey) {
+        let Ok(state) = self.scene.window_info(win).map(nitro_scene::Window::state) else {
+            return;
+        };
+        let next = if state == WindowState::Fullscreen {
+            WindowState::Normal
+        } else {
+            WindowState::Fullscreen
+        };
+        self.set_state(win, next);
+    }
+
+    /// Tile a window to the left or right half of its work area.
+    fn tile(&mut self, win: WindowKey, left: bool) {
+        if !self.resizable(win) {
+            return;
+        }
+        // Tiling is a `Normal` geometry, so a maximized window leaves that
+        // state first rather than ending up half-maximized.
+        if self
+            .scene
+            .window_info(win)
+            .is_ok_and(|i| i.state() != WindowState::Normal)
+        {
+            self.set_state(win, WindowState::Normal);
+        }
+        let area = self.window_area(win);
+        self.set_frame_rect(win, wm::tile_rect(area, left));
+    }
+
     fn key(&mut self, keycode: u32, pressed: bool, time_ns: u64) {
         // Without a keymap the key still reaches the focused client, with
         // no keysym and no text: the evdev code is the part that never
@@ -1487,22 +1914,24 @@ impl Server {
             .keyboard
             .as_mut()
             .map_or_else(keyboard::KeyResolution::none, |kb| kb.key(keycode, pressed));
-        if pressed && let Some(hotkey) = keyboard::hotkey(resolved.keysym, resolved.ctrl_alt) {
-            match hotkey {
-                Hotkey::Quit => {
-                    info!("Ctrl+Alt+Backspace: quitting");
-                    self.quit = true;
-                }
-                Hotkey::SwitchVt(vt) => {
-                    info!("Ctrl+Alt+F{vt}: switching session");
-                    if let Some(seat) = self.seat.as_ref()
-                        && let Err(e) = seat.borrow_mut().switch_session(vt)
-                    {
-                        warn!("switch to VT {vt}: {e}");
-                    }
+        if pressed && let Some(hotkey) = keyboard::hotkey(resolved.keysym, resolved.named) {
+            self.hotkey(hotkey);
+            // A hotkey is the compositor's, not the client's.
+            self.note_input(time_ns);
+            return;
+        }
+        // Releasing Alt ends an `Alt+Tab` cycle: the window it landed on
+        // is raised and becomes the most recently used, so the *next*
+        // Alt+Tab starts from there.
+        if !pressed && keyboard::is_alt(resolved.keysym) && self.wm.cycling() {
+            self.wm.end_cycle();
+            if let Some(win) = self.focus {
+                self.wm.touch(win);
+                if let Err(e) = self.scene.raise(win) {
+                    warn!("raise: {e}");
                 }
             }
-            // A hotkey is the compositor's, not the client's.
+            self.note_input(time_ns);
             return;
         }
         let Some(window) = self.focus else {
@@ -1528,6 +1957,102 @@ impl Server {
         });
         self.note_client_input(sent_to);
         self.note_input(time_ns);
+    }
+
+    /// Act on one compositor hotkey.
+    ///
+    /// Every window-management chord acts on the *focused* window, which
+    /// is the one thing the user can always see; a chord with nothing
+    /// focused is a no-op rather than a guess.
+    fn hotkey(&mut self, hotkey: Hotkey) {
+        match hotkey {
+            Hotkey::Quit => {
+                info!("Ctrl+Alt+Backspace: quitting");
+                self.quit = true;
+            }
+            Hotkey::SwitchVt(vt) => {
+                info!("Ctrl+Alt+F{vt}: switching session");
+                if let Some(seat) = self.seat.as_ref()
+                    && let Err(e) = seat.borrow_mut().switch_session(vt)
+                {
+                    warn!("switch to VT {vt}: {e}");
+                }
+            }
+            Hotkey::CycleFocus(forward) => self.cycle_focus(forward),
+            Hotkey::Close => {
+                if let Some(win) = self.focus {
+                    self.close_window(win);
+                }
+            }
+            Hotkey::ToggleMaximize => {
+                if let Some(win) = self.focus {
+                    self.toggle_maximize(win);
+                }
+            }
+            Hotkey::ToggleFullscreen => {
+                if let Some(win) = self.focus {
+                    self.toggle_fullscreen(win);
+                }
+            }
+            Hotkey::Minimize => {
+                if let Some(win) = self.focus {
+                    self.set_state(win, WindowState::Minimized);
+                }
+            }
+            Hotkey::Tile(left) => {
+                if let Some(win) = self.focus {
+                    self.tile(win, left);
+                }
+            }
+            // The launcher and the terminal are M3-B; the chord is
+            // reserved here so no client can claim it in the meantime.
+            Hotkey::Launch => debug!("Super+Enter is reserved for the launcher"),
+        }
+    }
+
+    /// Walk the MRU order one step. The focus moves at once — so the user
+    /// sees where they are — but the MRU list is only reordered when Alt
+    /// comes up, which is what makes repeated Tabs walk further back
+    /// instead of bouncing between two windows.
+    fn cycle_focus(&mut self, forward: bool) {
+        let candidates = wm::cycle_candidates(&self.scene, self.wm.mru());
+        let Some(win) = self.wm.cycle_next(&candidates, forward) else {
+            return;
+        };
+        // Cycling onto a minimized window brings it back: it stayed in the
+        // MRU list precisely so this would work.
+        if self
+            .scene
+            .window_info(win)
+            .is_ok_and(|i| i.state() == WindowState::Minimized)
+        {
+            self.set_state(win, WindowState::Normal);
+        }
+        self.set_focus(Some(win));
+    }
+
+    /// Drop every scrap of window-management state a closed window left
+    /// behind: its frame's shaped title, its decoration node ids, its
+    /// place in the MRU order and any drag holding it.
+    ///
+    /// The decoration *nodes* go with the window's subtree, which the
+    /// scene destroys; the shaped run does not — it lives in the text
+    /// store, keyed by owner, and this is the only place it can be freed.
+    fn forget_window(&mut self, win: WindowKey) {
+        self.decorations.remove(&win);
+        let title = self.frame_titles.remove(&win);
+        self.text.release(title);
+        self.wm.remove(win);
+        if self.focus == Some(win) {
+            self.focus = None;
+            // The focus goes to the next window in the MRU order rather
+            // than nowhere: closing the top window should hand the
+            // keyboard on, not drop it on the floor.
+            let next = self.wm.mru().iter().copied().find(|w| self.focusable(*w));
+            if next.is_some() {
+                self.focus_window(next);
+            }
+        }
     }
 
     fn touch(
@@ -1696,8 +2221,10 @@ impl Server {
                     focused: false,
                 })
             });
+            self.restyle(old, false);
         }
         self.focus = window;
+        self.wm.set_focus(window);
         if let Some(new) = window {
             self.send_to_window(new, |id| {
                 ServerMsg::Focus(msg::Focus {
@@ -1705,7 +2232,534 @@ impl Server {
                     focused: true,
                 })
             });
+            self.restyle(new, true);
         }
+    }
+
+    // ------------------------------------------------------ window management
+
+    /// Whether a window may take keyboard focus: a `NO_FOCUS` window never
+    /// does (that is what the launcher and the bar are for), and neither
+    /// does a minimized one.
+    fn focusable(&self, win: WindowKey) -> bool {
+        self.scene.window_info(win).is_ok_and(|i| {
+            i.flags().focusable && i.state() != WindowState::Minimized && i.output().is_some()
+        })
+    }
+
+    /// Focus a window and mark it most-recently-used.
+    fn focus_window(&mut self, window: Option<WindowKey>) {
+        if let Some(win) = window {
+            self.wm.touch(win);
+        }
+        self.set_focus(window);
+    }
+
+    /// Wrap a window in a server-owned frame group, unless it opted out.
+    ///
+    /// Called once, when the window is first placed: a frame is structural,
+    /// so adding or removing one later would move every node under it.
+    /// Fullscreen hides the decorations instead (see
+    /// [`Server::apply_state_geometry`]).
+    fn decorate(&mut self, win: WindowKey) {
+        let Ok(info) = self.scene.window_info(win) else {
+            return;
+        };
+        if !info.flags().decorated || info.is_framed() {
+            return;
+        }
+        let fixed = info.flags().fixed_size;
+        if let Err(e) = self.scene.frame_window(win, wm::frame_insets()) {
+            warn!("framing a window: {e}");
+            return;
+        }
+        let nodes = match wm::build_frame(&mut self.scene, win, fixed) {
+            Ok(n) => n,
+            Err(e) => {
+                warn!("building a frame: {e}");
+                return;
+            }
+        };
+        self.decorations.insert(win, nodes);
+        self.restyle(win, self.focus == Some(win));
+    }
+
+    /// Restyle a window's frame for a focus change, and re-shape its title
+    /// in the matching colour.
+    fn restyle(&mut self, win: WindowKey, focused: bool) {
+        let Some(nodes) = self.decorations.get(&win).copied() else {
+            return;
+        };
+        if let Err(e) = wm::style_frame(&mut self.scene, &nodes, focused) {
+            warn!("styling a frame: {e}");
+        }
+        self.retitle(win);
+    }
+
+    /// (Re)shape a framed window's title text, eliding it to the space
+    /// between the left border and the buttons.
+    fn retitle(&mut self, win: WindowKey) {
+        let Some(nodes) = self.decorations.get(&win).copied() else {
+            return;
+        };
+        let Ok(info) = self.scene.window_info(win) else {
+            return;
+        };
+        let title = info.title().to_owned();
+        let width = self
+            .scene
+            .node(nodes.title)
+            .map_or(0.0, |n| n.bounds().w);
+        let focused = self.focus == Some(win);
+        let request = StyleRequest::new(
+            "sans",
+            wm::theme::TITLE_SIZE_PX,
+            600,
+            false,
+            // No wrapping: a title bar is one line, and a title too long
+            // for it is elided, not folded.
+            0.0,
+            false,
+        );
+        let elided = self.text.elide(&request, &title, width);
+        let (key, shaped) = self.text.shape(ClientId::SERVER.0, &request, &elided);
+        let reference = nitro_scene::TextRef {
+            key: key.0,
+            size: Size::new(shaped.width, shaped.height),
+            ascent: shaped.ascent,
+            color: wm::title_color(focused),
+            align: nitro_scene::TextAlign::Left,
+        };
+        match self.scene.set_text(ClientId::SERVER, nodes.title, Some(reference)) {
+            Ok(()) => {
+                // The node's previous run is unreachable now.
+                let old = self.frame_titles.insert(win, key);
+                self.text.release(old);
+            }
+            Err(e) => {
+                warn!("setting a title: {e}");
+                self.text.release(Some(key));
+            }
+        }
+    }
+
+    /// The work area of the output a window is on (or the primary one).
+    fn window_area(&self, win: WindowKey) -> Rect {
+        let output = self
+            .scene
+            .window_info(win)
+            .ok()
+            .and_then(nitro_scene::Window::output)
+            .or_else(|| self.outputs.first().map(|o| o.scene_id));
+        output.map_or(Rect::EMPTY, |id| wm::work_area(&self.scene, id))
+    }
+
+    /// Move a window's frame to `position` on its own output, without
+    /// changing its size. One scene mutation and one `Configure`; no
+    /// round trip, which is the whole point of server-side moves.
+    fn move_window(&mut self, win: WindowKey, position: Point) {
+        let Ok(info) = self.scene.window_info(win) else {
+            return;
+        };
+        if info.position() == position {
+            return;
+        }
+        let output = info.output();
+        if let Err(e) = self.scene.place_window(win, output, position) {
+            warn!("moving a window: {e}");
+            return;
+        }
+        self.configure(win);
+    }
+
+    /// Set a window's **frame** rectangle: position and content size at
+    /// once, with the content size clamped to the client's limits.
+    fn set_frame_rect(&mut self, win: WindowKey, rect: Rect) {
+        let Ok(info) = self.scene.window_info(win) else {
+            return;
+        };
+        let inset = info.inset();
+        let output = info.output();
+        let content = Size::new(
+            (rect.w - inset.width()).max(0.0),
+            (rect.h - inset.height()).max(0.0),
+        );
+        let content = self.scene.clamp_to_limits(win, content);
+        if let Err(e) = self
+            .scene
+            .set_window_size(ClientId::SERVER, win, content)
+        {
+            warn!("resizing a window: {e}");
+            return;
+        }
+        if let Err(e) = self
+            .scene
+            .place_window(win, output, Point::new(rect.x, rect.y))
+        {
+            warn!("placing a resized window: {e}");
+        }
+        self.relayout_frame(win);
+        self.configure(win);
+    }
+
+    /// Re-lay a window's decorations for its current size.
+    fn relayout_frame(&mut self, win: WindowKey) {
+        let Some(nodes) = self.decorations.get(&win).copied() else {
+            return;
+        };
+        if let Err(e) = wm::layout_frame(&mut self.scene, win, &nodes) {
+            warn!("laying out a frame: {e}");
+            return;
+        }
+        // The title's box changed width, so its elision did too.
+        self.retitle(win);
+    }
+
+    /// Put a window into a state and give it the geometry that state
+    /// implies, remembering where it was so `Normal` can put it back.
+    fn set_state(&mut self, win: WindowKey, state: WindowState) {
+        let Ok(info) = self.scene.window_info(win) else {
+            return;
+        };
+        if info.state() == state {
+            return;
+        }
+        // A window that cannot be resized cannot be maximized or made
+        // fullscreen either; refusing is silent, exactly as `docs/wire.md`
+        // says (there is no per-request error in this protocol).
+        if info.flags().fixed_size
+            && matches!(state, WindowState::Maximized | WindowState::Fullscreen)
+        {
+            return;
+        }
+        let was_normal = info.state() == WindowState::Normal;
+        if was_normal && matches!(state, WindowState::Maximized | WindowState::Fullscreen) {
+            let restore = (info.position(), info.size());
+            let _ = self.scene.set_window_restore(win, Some(restore));
+        }
+        if let Err(e) = self.scene.set_window_state(win, state) {
+            warn!("setting a window state: {e}");
+            return;
+        }
+        self.apply_state_geometry(win, state);
+        self.announce_state(win, state);
+        if state == WindowState::Minimized && self.focus == Some(win) {
+            // The focus has to go somewhere reachable, or the keyboard is
+            // lost until the user clicks.
+            let next = self
+                .wm
+                .mru()
+                .iter()
+                .copied()
+                .find(|w| *w != win && self.focusable(*w));
+            self.set_focus(next);
+        }
+    }
+
+    /// Give a window the geometry its state implies, on its current output.
+    ///
+    /// `Fullscreen` covers the whole output and hides the decorations;
+    /// `Maximized` fills the work area and keeps them; `Normal` goes back
+    /// to the remembered rectangle; `Minimized` does not move anything, so
+    /// un-minimizing lands where it was.
+    fn apply_state_geometry(&mut self, win: WindowKey, state: WindowState) {
+        let Ok(info) = self.scene.window_info(win) else {
+            return;
+        };
+        let output = info.output();
+        let framed = info.is_framed();
+        let area = self.window_area(win);
+        let full = output
+            .and_then(|id| self.scene.output_info(id))
+            .map_or(area, |(rect, scale)| {
+                let s = if scale > 0.0 { scale } else { 1.0 };
+                Rect::new(0.0, 0.0, rect.w as f32 / s, rect.h as f32 / s)
+            });
+        match state {
+            WindowState::Minimized => {}
+            WindowState::Maximized => {
+                if framed {
+                    let _ = self.scene.set_window_inset(win, wm::frame_insets());
+                }
+                self.set_frame_rect(win, area);
+            }
+            WindowState::Fullscreen => {
+                // Decorations are hidden rather than destroyed: the frame
+                // group stays, its insets go to zero, and leaving
+                // fullscreen simply puts them back.
+                if framed {
+                    let _ = self.scene.set_window_inset(win, nitro_scene::Insets::NONE);
+                    self.set_frame_visible(win, false);
+                }
+                self.set_frame_rect(win, full);
+            }
+            WindowState::Normal => {
+                if framed {
+                    let _ = self.scene.set_window_inset(win, wm::frame_insets());
+                    self.set_frame_visible(win, true);
+                }
+                let inset = wm::frame_insets();
+                let restore = self
+                    .scene
+                    .window_info(win)
+                    .ok()
+                    .and_then(nitro_scene::Window::restore);
+                if let Some((pos, size)) = restore {
+                    let frame = if framed {
+                        Size::new(size.w + inset.width(), size.h + inset.height())
+                    } else {
+                        size
+                    };
+                    let pos = wm::clamp_into(pos, frame, area);
+                    self.set_frame_rect(win, Rect::new(pos.x, pos.y, frame.w, frame.h));
+                }
+                let _ = self.scene.set_window_restore(win, None);
+            }
+        }
+    }
+
+    /// Show or hide a framed window's decorations (fullscreen).
+    fn set_frame_visible(&mut self, win: WindowKey, visible: bool) {
+        let Some(nodes) = self.decorations.get(&win).copied() else {
+            return;
+        };
+        let s = ClientId::SERVER;
+        for key in [
+            Some(nodes.background),
+            Some(nodes.bar),
+            Some(nodes.title),
+            Some(nodes.close),
+            nodes.maximize,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Err(e) = self.scene.set_visible(s, key, visible) {
+                warn!("hiding a decoration: {e}");
+            }
+        }
+    }
+
+    /// Tell the owning client its window changed state.
+    fn announce_state(&mut self, win: WindowKey, state: WindowState) {
+        let wire = clients::wire_state(state);
+        self.send_to_window(win, |window| {
+            ServerMsg::WindowState(msg::WindowState {
+                window,
+                state: wire,
+            })
+        });
+    }
+
+    /// Close a window the way a user asks for it: the client is told, and
+    /// the window goes when the client destroys its root.
+    ///
+    /// The server does not tear the window down itself — a `Closed` the
+    /// client has not acted on is a chance to save, and a client that
+    /// ignores it keeps a window that is still on screen and still honest.
+    fn close_window(&mut self, win: WindowKey) {
+        self.send_to_window(win, |window| ServerMsg::Closed(msg::Closed { window }));
+    }
+
+    /// Raise a window within its layer and focus it, if it may be focused.
+    fn raise_and_focus(&mut self, win: WindowKey) {
+        // Raise within the Normal layer only: a click must not pull a
+        // panel out from under a menu, or a menu below its panel.
+        if self
+            .scene
+            .window_info(win)
+            .is_ok_and(|w| w.layer() == nitro_scene::Layer::Normal)
+            && let Err(e) = self.scene.raise(win)
+        {
+            warn!("raise: {e}");
+        }
+        if self.focusable(win) {
+            self.focus_window(Some(win));
+        }
+    }
+
+    /// The pointer position in the logical coordinates of the output it is
+    /// over, which is the space every window rectangle lives in.
+    fn pointer_logical(&self) -> Option<(SceneOutputId, Point)> {
+        let point = self.pointer.position();
+        let id = input::output_at(&self.scene, point)?;
+        let (rect, scale) = self.scene.output_info(id)?;
+        let s = if scale > 0.0 { scale } else { 1.0 };
+        Some((
+            id,
+            Point::new(
+                (point.x - rect.x as f32) / s,
+                (point.y - rect.y as f32) / s,
+            ),
+        ))
+    }
+
+    /// Which window's frame the pointer is over, and where in it.
+    ///
+    /// Front to back through the z-order, skipping minimized windows: a
+    /// hidden window must not swallow a click, which is also why this is a
+    /// separate walk from the scene's own hit test (that one only knows
+    /// about *painted* nodes and would never see a resize band outside the
+    /// window at all).
+    fn frame_hit(&self, output: SceneOutputId, point: Point) -> Option<(WindowKey, Region)> {
+        for win in self.scene.windows_front_to_back(output) {
+            let Ok(info) = self.scene.window_info(win) else {
+                continue;
+            };
+            if info.state() == WindowState::Minimized {
+                continue;
+            }
+            if !info.is_framed() {
+                // Undecorated: it is all content, and the scene's own hit
+                // test decides whether the click lands in it.
+                if wm::contains(info.frame_rect(), point) {
+                    return Some((win, Region::Content));
+                }
+                continue;
+            }
+            if let Some(region) = wm::hit_frame(
+                info.frame_rect(),
+                info.inset(),
+                point,
+                info.flags().fixed_size,
+            ) {
+                return Some((win, region));
+            }
+        }
+        None
+    }
+
+    /// Advance whatever drag is in flight to the pointer's position.
+    /// Returns whether anything moved (so the caller can skip the client
+    /// event it would otherwise send).
+    fn drive_drag(&mut self, drag: Drag) -> bool {
+        let Some((_, point)) = self.pointer_logical() else {
+            return true;
+        };
+        match drag {
+            Drag::Button { .. } => false,
+            Drag::Move { window, grab } => {
+                let area = self.window_area(window);
+                let Ok(info) = self.scene.window_info(window) else {
+                    return true;
+                };
+                let size = info.frame_size();
+                let want = Point::new(point.x - grab.x, point.y - grab.y);
+                // A dragged window may cross onto another output; the
+                // clamp is to the *union* of the outputs, not to one of
+                // them, or a window could never leave its own screen.
+                let pos = self.clamp_to_desktop(want, size, area);
+                self.move_window(window, pos);
+                self.reoutput(window);
+                true
+            }
+            Drag::Resize {
+                window,
+                edges,
+                start,
+                origin,
+            } => {
+                let Ok(info) = self.scene.window_info(window) else {
+                    return true;
+                };
+                let (inset, min, max) = (info.inset(), info.min_size(), info.max_size());
+                let rect = wm::resize_rect(start, origin, point, edges, inset, min, max);
+                self.set_frame_rect(window, rect);
+                true
+            }
+        }
+    }
+
+    /// Clamp a frame origin so the window stays reachable: inside the
+    /// union of every output's logical area, with at least a title bar's
+    /// worth of it on screen.
+    fn clamp_to_desktop(&self, pos: Point, size: Size, fallback: Rect) -> Point {
+        let mut union: Option<Rect> = None;
+        for (id, _, _) in self.scene.outputs() {
+            let area = wm::work_area(&self.scene, id);
+            // Outputs are laid out left to right in the *device* space; in
+            // logical space each starts where the previous one ended,
+            // which `origin_of` recovers.
+            let origin = self.logical_origin(id);
+            let area = Rect::new(origin.x, origin.y, area.w, area.h);
+            union = Some(match union {
+                Some(u) => Rect::from_corners(
+                    Point::new(u.x.min(area.x), u.y.min(area.y)),
+                    Point::new(
+                        (u.x + u.w).max(area.x + area.w),
+                        (u.y + u.h).max(area.y + area.h),
+                    ),
+                ),
+                None => area,
+            });
+        }
+        let area = union.unwrap_or(fallback);
+        // The whole title bar must stay grabbable: the window may hang off
+        // the right and bottom edges, but never so far up or left that
+        // there is nothing left to grab.
+        let min_visible = wm::TITLE_H.min(size.w).max(1.0);
+        Point::new(
+            pos.x
+                .clamp(area.x - (size.w - min_visible).max(0.0), area.x + area.w - min_visible),
+            pos.y.clamp(area.y, area.y + area.h - min_visible),
+        )
+    }
+
+    /// The logical-space origin of an output: its device origin divided by
+    /// its own scale, which is where windows on it are positioned from.
+    fn logical_origin(&self, id: SceneOutputId) -> Point {
+        self.scene.output_info(id).map_or(Point::ZERO, |(r, s)| {
+            let s = if s > 0.0 { s } else { 1.0 };
+            Point::new(r.x as f32 / s, r.y as f32 / s)
+        })
+    }
+
+    /// Re-home a window onto whichever output contains its centre, and
+    /// `Configure` it if that changed.
+    ///
+    /// "The output containing its centre" is the rule a user can predict:
+    /// a window is on the screen it mostly is on, and dragging it more than
+    /// halfway across hands it over.
+    fn reoutput(&mut self, win: WindowKey) {
+        let Ok(info) = self.scene.window_info(win) else {
+            return;
+        };
+        let Some(current) = info.output() else {
+            return;
+        };
+        let size = info.frame_size();
+        let origin = self.logical_origin(current);
+        let centre_logical = Point::new(
+            info.position().x + size.w / 2.0,
+            info.position().y + size.h / 2.0,
+        );
+        // Back into the global device space, which is what outputs are
+        // laid out in.
+        let scale = self.scene.output_info(current).map_or(1.0, |(_, s)| s);
+        let s = if scale > 0.0 { scale } else { 1.0 };
+        let device = Point::new(
+            (centre_logical.x - origin.x) * s
+                + self.scene.output_info(current).map_or(0.0, |(r, _)| r.x as f32),
+            (centre_logical.y - origin.y) * s
+                + self.scene.output_info(current).map_or(0.0, |(r, _)| r.y as f32),
+        );
+        let Some(target) = input::output_at(&self.scene, device) else {
+            return;
+        };
+        if target == current {
+            return;
+        }
+        // The position is in the *new* output's logical space now.
+        let new_origin = self.logical_origin(target);
+        let pos = Point::new(
+            info.position().x - origin.x + new_origin.x,
+            info.position().y - origin.y + new_origin.y,
+        );
+        if let Err(e) = self.scene.place_window(win, Some(target), pos) {
+            warn!("moving a window between outputs: {e}");
+            return;
+        }
+        self.configure(win);
     }
 
     fn on_client(&mut self, token: u64, flags: EventFlags) {
@@ -1957,17 +3011,18 @@ impl Server {
 
     /// Capability bits reported in `Welcome`.
     ///
-    /// `TEXT` is set only when a font was actually found: the bit means
-    /// "you may send `Text` nodes", and on a box with no fonts at all that
-    /// would be a promise the server cannot keep. `DIRECT_SCANOUT` and
-    /// `DMABUF` remain later milestones, and a zero bit is the protocol's
-    /// way of saying "do not use this".
+    /// `WM` is unconditional: the server always manages windows, so a
+    /// client may always send the M3 window ops. `TEXT` is set only when a
+    /// font was actually found: the bit means "you may send `Text` nodes",
+    /// and on a box with no fonts at all that would be a promise the server
+    /// cannot keep. `DIRECT_SCANOUT` and `DMABUF` remain later milestones,
+    /// and a zero bit is the protocol's way of saying "do not use this".
     fn caps(&self) -> u32 {
+        let mut caps = nitro_wire::types::caps::WM;
         if self.text.has_fonts() {
-            nitro_wire::types::caps::TEXT
-        } else {
-            0
+            caps |= nitro_wire::types::caps::TEXT;
         }
+        caps
     }
 
     /// Apply a client's transaction. Returns whether the client survives.
@@ -2024,7 +3079,30 @@ impl Server {
                 self.pointer.over = None;
             }
             self.touch_targets.retain(|_, (w, _)| *w != win);
+            self.forget_window(win);
         }
+        // The title bar is the server's, so a retitle is a repaint the
+        // client never asks for and never sees.
+        for win in outcome.retitled {
+            self.retitle(win);
+        }
+        // State requests are applied last, after every geometry mutation
+        // in the batch: `Maximized` has to win over the client's own
+        // `SetBounds`, not race it. `set_state` reaches the owning client
+        // by token, so the client goes back in the map first and the rest
+        // of this function works through it.
+        let has_states = !outcome.state_requests.is_empty();
+        self.wire_clients.insert(token, client);
+        for (win, state) in outcome.state_requests {
+            self.set_state(win, state);
+        }
+        let Some(mut client) = self.wire_clients.remove(&token) else {
+            // Only reachable if a state change disconnected the client,
+            // which nothing in `set_state` does; be total rather than
+            // clever about it.
+            debug_assert!(has_states, "the client vanished without a state request");
+            return false;
+        };
         // Which outputs this commit can actually reach: the ones its
         // windows are on. Stamping every output would report the same
         // serial once per flip on a multi-output desktop, and `Presented`
@@ -2094,8 +3172,9 @@ impl Server {
         }
     }
 
-    /// Place a newly created window: cascade it onto the primary output
-    /// and tell the client the size, scale and output it got.
+    /// Place a newly created window: decorate it, centred-cascade it into
+    /// the primary output's work area and tell the client the size, scale
+    /// and output it got.
     fn place_new_window(&mut self, client: &mut WireClient, node_id: NodeId, win: WindowKey) {
         let Some(output) = self.outputs.first() else {
             // No output yet (every connector unplugged, or a hotplug still
@@ -2106,26 +3185,37 @@ impl Server {
             return;
         };
         let scene_id = output.scene_id;
-        let (scale, logical) = self
-            .scene
-            .output_info(scene_id)
-            .map_or((1.0, Size::ZERO), |(r, s)| {
-                (s, Size::new(r.w as f32 / s, r.h as f32 / s))
-            });
-        let size = self
-            .scene
-            .window_info(win)
-            .map_or(Size::ZERO, nitro_scene::Window::size);
-        let position = clients::cascade_position(self.windows_created, size, logical);
+        // Decorate before placing: the frame changes the window's outer
+        // size, and the placement has to know it to centre the thing the
+        // user actually sees.
+        self.decorate(win);
+        let area = wm::work_area(&self.scene, scene_id);
+        let scale = self.scene.output_info(scene_id).map_or(1.0, |(_, s)| s);
+        let Ok(info) = self.scene.window_info(win) else {
+            return;
+        };
+        let (size, frame) = (info.size(), info.frame_size());
+        let position = wm::place(self.wm.next_placement(), frame, area);
         self.windows_created += 1;
         if let Err(e) = self.scene.place_window(win, Some(scene_id), position) {
             warn!("place window: {e}");
             return;
         }
+        self.wm.add(win);
+        // A new window on the Normal layer takes focus, which is what makes
+        // a launched app typable without a click. `NO_FOCUS` windows never
+        // do, and neither does a panel on another layer.
+        if self.focusable(win) {
+            self.focus_window(Some(win));
+        }
+        let content = self
+            .scene
+            .window_info(win)
+            .map_or(position, nitro_scene::Window::content_position);
         client.send(&ServerMsg::Configure(msg::Configure {
             window: node_id,
             size,
-            position,
+            position: content,
             scale,
             output: scene_id.0,
         }));
@@ -2209,6 +3299,7 @@ impl Server {
             if let Err(e) = self.scene.destroy_window(id, win) {
                 warn!("destroying window of client {}: {e}", id.0);
             }
+            self.forget_window(win);
         }
         for key in client.buffers.values().copied().collect::<Vec<_>>() {
             let _ = self.scene.destroy_buffer(id, key);

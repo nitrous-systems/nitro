@@ -35,6 +35,34 @@ pub struct Keyboard {
     state: xkb::State,
 }
 
+/// The modifier keys held when an event happened.
+///
+/// xkb's serialized mask is an opaque bitmap whose bit positions depend on
+/// the keymap, so it cannot be compared against a constant; this is the
+/// same information in a form the window manager can act on.
+// Four independent modifier keys, not a state machine: any subset can be
+// held at once, and naming the sixteen combinations would say less.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Mods {
+    /// Shift.
+    pub shift: bool,
+    /// Control.
+    pub ctrl: bool,
+    /// Alt (Mod1).
+    pub alt: bool,
+    /// Super / Logo / Windows (Mod4).
+    pub logo: bool,
+}
+
+impl Mods {
+    /// Whether Ctrl and Alt are both down (the compositor's escape hatch).
+    #[must_use]
+    pub fn ctrl_alt(self) -> bool {
+        self.ctrl && self.alt
+    }
+}
+
 /// What one key event resolved to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyResolution {
@@ -44,6 +72,8 @@ pub struct KeyResolution {
     pub utf8: String,
     /// Effective modifier mask, as xkb serializes it.
     pub mods: u32,
+    /// The named modifiers held, for the window manager's shortcuts.
+    pub named: Mods,
     /// Whether Ctrl and Alt are both down (the compositor's escape hatch).
     pub ctrl_alt: bool,
 }
@@ -58,6 +88,7 @@ impl KeyResolution {
             keysym: 0,
             utf8: String::new(),
             mods: 0,
+            named: Mods::default(),
             ctrl_alt: false,
         }
     }
@@ -148,18 +179,30 @@ impl Keyboard {
         // event: a Ctrl press must report Ctrl as held, otherwise the
         // Ctrl+Alt escape hatch would lag a keystroke behind.
         let mods = self.state.serialize_mods(xkb::STATE_MODS_EFFECTIVE);
-        let ctrl_alt = self
-            .state
-            .mod_name_is_active(xkb::MOD_NAME_CTRL, xkb::STATE_MODS_EFFECTIVE)
-            && self
-                .state
-                .mod_name_is_active(xkb::MOD_NAME_ALT, xkb::STATE_MODS_EFFECTIVE);
+        let named = self.named_mods();
 
         KeyResolution {
             keysym,
             utf8,
             mods,
-            ctrl_alt,
+            named,
+            ctrl_alt: named.ctrl_alt(),
+        }
+    }
+
+    /// The named modifiers currently held. Pointer events need them too,
+    /// and they never pass through [`Keyboard::key`].
+    #[must_use]
+    pub fn named_mods(&self) -> Mods {
+        let active = |name| {
+            self.state
+                .mod_name_is_active(name, xkb::STATE_MODS_EFFECTIVE)
+        };
+        Mods {
+            shift: active(xkb::MOD_NAME_SHIFT),
+            ctrl: active(xkb::MOD_NAME_CTRL),
+            alt: active(xkb::MOD_NAME_ALT),
+            logo: active(xkb::MOD_NAME_LOGO),
         }
     }
 
@@ -219,34 +262,91 @@ pub enum Hotkey {
     Quit,
     /// Ctrl+Alt+F1..F12: switch to that VT.
     SwitchVt(i32),
+    /// Alt+Tab / Alt+Shift+Tab: walk the MRU order. `true` = forward, to
+    /// the less recently used.
+    CycleFocus(bool),
+    /// Super+Q: close the focused window.
+    Close,
+    /// Super+M: toggle maximize.
+    ToggleMaximize,
+    /// Super+F: toggle fullscreen.
+    ToggleFullscreen,
+    /// Super+H: minimize.
+    Minimize,
+    /// Super+Left / Super+Right: tile to that half of the work area.
+    /// `true` = left.
+    Tile(bool),
+    /// Super+Enter: reserved for the launcher/terminal (M3-B).
+    Launch,
 }
 
-/// Map a keysym to a compositor hotkey, given Ctrl+Alt are both held.
-/// Returns None for anything else. A pure function — unit-test it.
+/// Map a keysym and the modifiers held to a compositor hotkey.
+///
+/// A pure function, and deliberately the *only* place the shortcut table
+/// lives — unit-test it rather than an event loop.
+///
+/// The compositor's own chords are Ctrl+Alt (the VT and quit escape
+/// hatches, which every Linux console user already knows), Alt+Tab (which
+/// no application may have, because it is how you leave one) and Super
+/// (which is reserved for the desktop by convention, so no client loses a
+/// binding it could reasonably expect).
 #[must_use]
-pub fn hotkey(keysym: u32, ctrl_alt: bool) -> Option<Hotkey> {
-    if !ctrl_alt {
+pub fn hotkey(keysym: u32, mods: Mods) -> Option<Hotkey> {
+    if mods.ctrl_alt() {
+        // `terminate:ctrl_alt_bksp` rewrites the chord to `Terminate_Server`
+        // in the keymap itself, so the same physical keys arrive as one
+        // keysym or the other depending on the user's xkb options.
+        if keysym == xkb::keysyms::KEY_BackSpace || keysym == xkb::keysyms::KEY_Terminate_Server {
+            return Some(Hotkey::Quit);
+        }
+        // F1..F12 are consecutive keysyms, so the VT number is an offset.
+        if (xkb::keysyms::KEY_F1..=xkb::keysyms::KEY_F12).contains(&keysym) {
+            // The subtraction cannot underflow inside the range, and the
+            // result is 1..=12, so the conversion cannot fail either.
+            let n = i32::try_from(keysym - xkb::keysyms::KEY_F1 + 1).ok()?;
+            return Some(Hotkey::SwitchVt(n));
+        }
         return None;
     }
-    // `terminate:ctrl_alt_bksp` rewrites the chord to `Terminate_Server`
-    // in the keymap itself, so the same physical keys arrive as one
-    // keysym or the other depending on the user's xkb options.
-    if keysym == xkb::keysyms::KEY_BackSpace || keysym == xkb::keysyms::KEY_Terminate_Server {
-        return Some(Hotkey::Quit);
+    // Alt+Tab, with or without Shift. With Shift held the keymap reports
+    // `ISO_Left_Tab` rather than `Tab` on most layouts, so accept both and
+    // let the Shift bit decide the direction.
+    if mods.alt
+        && !mods.logo
+        && (keysym == xkb::keysyms::KEY_Tab || keysym == xkb::keysyms::KEY_ISO_Left_Tab)
+    {
+        return Some(Hotkey::CycleFocus(!mods.shift));
     }
-    // F1..F12 are consecutive keysyms, so the VT number is an offset.
-    if (xkb::keysyms::KEY_F1..=xkb::keysyms::KEY_F12).contains(&keysym) {
-        // The subtraction cannot underflow inside the range, and the
-        // result is 1..=12, so the conversion cannot fail either.
-        let n = i32::try_from(keysym - xkb::keysyms::KEY_F1 + 1).ok()?;
-        return Some(Hotkey::SwitchVt(n));
+    if !mods.logo || mods.alt || mods.ctrl {
+        return None;
     }
-    None
+    // Super chords. Matched on the *unshifted* letter too, because a
+    // keymap may hand us either level depending on what else is held.
+    match keysym {
+        xkb::keysyms::KEY_q | xkb::keysyms::KEY_Q => Some(Hotkey::Close),
+        xkb::keysyms::KEY_m | xkb::keysyms::KEY_M => Some(Hotkey::ToggleMaximize),
+        xkb::keysyms::KEY_f | xkb::keysyms::KEY_F => Some(Hotkey::ToggleFullscreen),
+        xkb::keysyms::KEY_h | xkb::keysyms::KEY_H => Some(Hotkey::Minimize),
+        xkb::keysyms::KEY_Left => Some(Hotkey::Tile(true)),
+        xkb::keysyms::KEY_Right => Some(Hotkey::Tile(false)),
+        xkb::keysyms::KEY_Return | xkb::keysyms::KEY_KP_Enter => Some(Hotkey::Launch),
+        _ => None,
+    }
+}
+
+/// Whether a keysym is one of the `Alt` keys, which is what ends an
+/// `Alt+Tab` cycle when released.
+#[must_use]
+pub fn is_alt(keysym: u32) -> bool {
+    matches!(
+        keysym,
+        xkb::keysyms::KEY_Alt_L | xkb::keysyms::KEY_Alt_R | xkb::keysyms::KEY_Meta_L
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Hotkey, Keyboard, hotkey};
+    use super::{Hotkey, Keyboard, Mods, hotkey, is_alt};
     use xkbcommon::xkb;
 
     /// evdev `KEY_A`, from `linux/input-event-codes.h`.
@@ -254,14 +354,33 @@ mod tests {
     /// evdev `KEY_LEFTSHIFT`.
     const EVDEV_LEFTSHIFT: u32 = 42;
 
+    const CTRL_ALT: Mods = Mods {
+        shift: false,
+        ctrl: true,
+        alt: true,
+        logo: false,
+    };
+    const LOGO: Mods = Mods {
+        shift: false,
+        ctrl: false,
+        alt: false,
+        logo: true,
+    };
+    const ALT: Mods = Mods {
+        shift: false,
+        ctrl: false,
+        alt: true,
+        logo: false,
+    };
+
     #[test]
     fn hotkey_quit() {
         assert_eq!(
-            hotkey(xkb::keysyms::KEY_BackSpace, true),
+            hotkey(xkb::keysyms::KEY_BackSpace, CTRL_ALT),
             Some(Hotkey::Quit)
         );
         assert_eq!(
-            hotkey(xkb::keysyms::KEY_Terminate_Server, true),
+            hotkey(xkb::keysyms::KEY_Terminate_Server, CTRL_ALT),
             Some(Hotkey::Quit)
         );
     }
@@ -269,26 +388,77 @@ mod tests {
     #[test]
     fn hotkey_vt_switch() {
         assert_eq!(
-            hotkey(xkb::keysyms::KEY_F1, true),
+            hotkey(xkb::keysyms::KEY_F1, CTRL_ALT),
             Some(Hotkey::SwitchVt(1))
         );
         assert_eq!(
-            hotkey(xkb::keysyms::KEY_F12, true),
+            hotkey(xkb::keysyms::KEY_F12, CTRL_ALT),
             Some(Hotkey::SwitchVt(12))
         );
     }
 
     #[test]
     fn hotkey_ignores_other_keysyms() {
-        assert_eq!(hotkey(xkb::keysyms::KEY_a, true), None);
-        assert_eq!(hotkey(xkb::keysyms::KEY_F12 + 1, true), None);
-        assert_eq!(hotkey(0, true), None);
+        assert_eq!(hotkey(xkb::keysyms::KEY_a, CTRL_ALT), None);
+        assert_eq!(hotkey(xkb::keysyms::KEY_F12 + 1, CTRL_ALT), None);
+        assert_eq!(hotkey(0, CTRL_ALT), None);
     }
 
     #[test]
-    fn hotkey_needs_ctrl_alt() {
-        assert_eq!(hotkey(xkb::keysyms::KEY_BackSpace, false), None);
-        assert_eq!(hotkey(xkb::keysyms::KEY_F1, false), None);
+    fn hotkey_needs_its_modifiers() {
+        let none = Mods::default();
+        assert_eq!(hotkey(xkb::keysyms::KEY_BackSpace, none), None);
+        assert_eq!(hotkey(xkb::keysyms::KEY_F1, none), None);
+        assert_eq!(hotkey(xkb::keysyms::KEY_q, none), None);
+        assert_eq!(hotkey(xkb::keysyms::KEY_Tab, none), None);
+        // Ctrl+Super is not a window-management chord: an application may
+        // reasonably want it, and the Super table must not swallow it.
+        let ctrl_logo = Mods {
+            ctrl: true,
+            ..LOGO
+        };
+        assert_eq!(hotkey(xkb::keysyms::KEY_q, ctrl_logo), None);
+    }
+
+    #[test]
+    fn the_window_management_chords() {
+        assert_eq!(hotkey(xkb::keysyms::KEY_q, LOGO), Some(Hotkey::Close));
+        assert_eq!(
+            hotkey(xkb::keysyms::KEY_M, LOGO),
+            Some(Hotkey::ToggleMaximize),
+            "the shifted level of the same key"
+        );
+        assert_eq!(
+            hotkey(xkb::keysyms::KEY_f, LOGO),
+            Some(Hotkey::ToggleFullscreen)
+        );
+        assert_eq!(hotkey(xkb::keysyms::KEY_h, LOGO), Some(Hotkey::Minimize));
+        assert_eq!(hotkey(xkb::keysyms::KEY_Left, LOGO), Some(Hotkey::Tile(true)));
+        assert_eq!(
+            hotkey(xkb::keysyms::KEY_Right, LOGO),
+            Some(Hotkey::Tile(false))
+        );
+        assert_eq!(hotkey(xkb::keysyms::KEY_Return, LOGO), Some(Hotkey::Launch));
+    }
+
+    #[test]
+    fn alt_tab_cycles_both_ways() {
+        assert_eq!(
+            hotkey(xkb::keysyms::KEY_Tab, ALT),
+            Some(Hotkey::CycleFocus(true))
+        );
+        let shift_alt = Mods { shift: true, ..ALT };
+        assert_eq!(
+            hotkey(xkb::keysyms::KEY_Tab, shift_alt),
+            Some(Hotkey::CycleFocus(false))
+        );
+        // Shift+Tab usually arrives as ISO_Left_Tab instead.
+        assert_eq!(
+            hotkey(xkb::keysyms::KEY_ISO_Left_Tab, shift_alt),
+            Some(Hotkey::CycleFocus(false))
+        );
+        assert!(is_alt(xkb::keysyms::KEY_Alt_L));
+        assert!(!is_alt(xkb::keysyms::KEY_Tab));
     }
 
     /// Skipped, not failed, on a machine with no xkb keymap data.
@@ -316,6 +486,7 @@ mod tests {
         // Shift resolves to itself, not to a shifted level of itself.
         assert_eq!(shift.keysym, xkb::keysyms::KEY_Shift_L);
         assert_ne!(shift.mods, 0, "shift must be effective after its press");
+        assert!(shift.named.shift);
 
         let r = kb.key(EVDEV_A, true);
         assert_eq!(r.keysym, xkb::keysyms::KEY_A);
@@ -341,6 +512,7 @@ mod tests {
         let r = kb.key(EVDEV_A, true);
         assert_eq!(r.utf8, "a");
         assert_eq!(r.mods, 0);
+        assert!(!r.named.shift);
     }
 
     #[test]

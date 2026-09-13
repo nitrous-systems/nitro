@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use nitro_core::{IRect, Point, Rect, Size, Transform};
 
 use crate::{
-    Border, Buffer, BufferDesc, BufferKey, ClientId, Configure, Error, Fill, ImageRef, Layer, Node,
-    NodeKey, NodeKind, OutputId, TextRef, Window, WindowKey,
+    Border, Buffer, BufferDesc, BufferKey, ClientId, Configure, Error, Fill, ImageRef, Insets,
+    Layer, Node, NodeKey, NodeKind, OutputId, TextRef, Window, WindowFlags, WindowKey, WindowState,
     key::Arena,
     node::{ALL_DIRTY, Dirty, NodeData},
     window::Output,
@@ -254,8 +254,10 @@ impl Scene {
 
     /// Create a top-level window and its root [`Group`](NodeKind::Group) node.
     ///
-    /// The window starts unplaced: nothing is painted and nothing can be hit
-    /// until [`place_window`](Scene::place_window) puts it on an output.
+    /// The window starts unplaced and undecorated: nothing is painted and
+    /// nothing can be hit until [`place_window`](Scene::place_window) puts it
+    /// on an output, and its content group *is* its root until
+    /// [`frame_window`](Scene::frame_window) wraps one around it.
     pub fn create_window(
         &mut self,
         client: ClientId,
@@ -263,18 +265,38 @@ impl Scene {
         size: Size,
         layer: Layer,
     ) -> WindowKey {
+        self.create_window_with(client, title, size, layer, WindowFlags::default())
+    }
+
+    /// [`create_window`](Scene::create_window) with explicit flags.
+    pub fn create_window_with(
+        &mut self,
+        client: ClientId,
+        title: impl Into<String>,
+        size: Size,
+        layer: Layer,
+        flags: WindowFlags,
+    ) -> WindowKey {
         let root = self
             .nodes
             .insert(Node::new(NodeKind::Group, client, WindowKey::NONE, 0));
         let win = self.windows.insert(Window {
             root,
+            content: root,
             client,
             title: title.into(),
+            app_id: String::new(),
             layer,
             size,
             configured: Size::ZERO,
             output: None,
             position: Point::ZERO,
+            inset: Insets::NONE,
+            state: WindowState::Normal,
+            flags,
+            min: Size::ZERO,
+            max: Size::ZERO,
+            restore: None,
         });
         self.note_resized(win);
         let node = self.node_mut_ref(root);
@@ -282,6 +304,192 @@ impl Scene {
         node.bounds = Rect::new(0.0, 0.0, size.w, size.h);
         self.mark(root, ALL_DIRTY);
         win
+    }
+
+    /// Wrap a window's content in a **frame group** owned by the server.
+    ///
+    /// A new root [`Group`](NodeKind::Group) owned by
+    /// [`ClientId::SERVER`] is inserted above the client's group, the client's
+    /// group becomes its *last* child — so decorations created before it are
+    /// painted behind, and ones created after are painted on top — and the
+    /// content is offset by `inset`. Every rectangle the client sees is
+    /// unchanged: its own group keeps its bounds, and the frame grows around
+    /// it.
+    ///
+    /// Only the server may call this in practice; a client cannot name
+    /// another client's window at all.
+    ///
+    /// # Errors
+    /// [`Error::StaleKey`] for a dead window; [`Error::BadParent`] if the
+    /// window is already framed.
+    pub fn frame_window(&mut self, win: WindowKey, inset: Insets) -> Result<NodeKey, Error> {
+        let window = self.windows.get(win).ok_or(Error::StaleKey)?;
+        if window.content != window.root {
+            return Err(Error::BadParent);
+        }
+        let content = window.content;
+        let size = window.size;
+        // The old root keeps its own bounds (the content's size) and simply
+        // gains a parent; the frame takes over as the window's root.
+        let frame = self.nodes.insert(Node::new(
+            NodeKind::Group,
+            ClientId::SERVER,
+            win,
+            0,
+        ));
+        {
+            let node = self.node_mut_ref(frame);
+            node.children.push(content);
+            node.bounds = Rect::new(
+                0.0,
+                0.0,
+                size.w + inset.width(),
+                size.h + inset.height(),
+            );
+        }
+        {
+            let node = self.node_mut_ref(content);
+            node.parent = Some(frame);
+            node.bounds.x = inset.left;
+            node.bounds.y = inset.top;
+        }
+        // The whole subtree moved one level down.
+        self.rewrite_subtree(content, 1, win);
+        let window = self.window_mut_unchecked(win);
+        window.root = frame;
+        window.inset = inset;
+        // The old root was a dirty root in its own right; the frame is the
+        // one now, and `mark` walks up to it.
+        self.dirty_roots.retain(|r| *r != content);
+        self.node_mut_ref(content).queued = false;
+        self.mark(frame, ALL_DIRTY);
+        self.mark(content, ALL_DIRTY);
+        Ok(frame)
+    }
+
+    /// Set a framed window's inset, moving the content and resizing the
+    /// frame to match. A no-op on an unframed window.
+    ///
+    /// # Errors
+    /// [`Error::StaleKey`].
+    pub fn set_window_inset(&mut self, win: WindowKey, inset: Insets) -> Result<(), Error> {
+        let window = self.windows.get(win).ok_or(Error::StaleKey)?;
+        if window.content == window.root || window.inset == inset {
+            return Ok(());
+        }
+        let (content, root, size) = (window.content, window.root, window.size);
+        self.window_mut_unchecked(win).inset = inset;
+        let node = self.node_mut_ref(content);
+        node.bounds.x = inset.left;
+        node.bounds.y = inset.top;
+        self.mark(content, Dirty::BOUNDS);
+        let node = self.node_mut_ref(root);
+        node.bounds.w = size.w + inset.width();
+        node.bounds.h = size.h + inset.height();
+        self.mark(root, Dirty::BOUNDS);
+        Ok(())
+    }
+
+    /// Set a window's application id (`"org.nitro.calc"`), for the shell's
+    /// window list.
+    ///
+    /// # Errors
+    /// [`Error::StaleKey`], [`Error::NotOwner`].
+    pub fn set_app_id(
+        &mut self,
+        client: ClientId,
+        win: WindowKey,
+        app_id: impl Into<String>,
+    ) -> Result<(), Error> {
+        let window = self.windows.get_mut(win).ok_or(Error::StaleKey)?;
+        if !client.may_touch(window.client) {
+            return Err(Error::NotOwner);
+        }
+        window.app_id = app_id.into();
+        Ok(())
+    }
+
+    /// Set the content size limits the server will respect when resizing.
+    /// A zero component means "no limit"; a `max` below `min` is clamped up
+    /// rather than refused.
+    ///
+    /// # Errors
+    /// [`Error::StaleKey`], [`Error::NotOwner`].
+    pub fn set_window_limits(
+        &mut self,
+        client: ClientId,
+        win: WindowKey,
+        min: Size,
+        max: Size,
+    ) -> Result<(), Error> {
+        let window = self.windows.get_mut(win).ok_or(Error::StaleKey)?;
+        if !client.may_touch(window.client) {
+            return Err(Error::NotOwner);
+        }
+        let sane = |v: f32| if v.is_finite() && v > 0.0 { v } else { 0.0 };
+        let min = Size::new(sane(min.w), sane(min.h));
+        let max = Size::new(sane(max.w), sane(max.h));
+        window.min = min;
+        window.max = Size::new(
+            if max.w > 0.0 { max.w.max(min.w) } else { 0.0 },
+            if max.h > 0.0 { max.h.max(min.h) } else { 0.0 },
+        );
+        Ok(())
+    }
+
+    /// Clamp a content size to a window's limits.
+    #[must_use]
+    pub fn clamp_to_limits(&self, win: WindowKey, size: Size) -> Size {
+        let Some(w) = self.windows.get(win) else {
+            return size;
+        };
+        let axis = |v: f32, min: f32, max: f32| {
+            let v = if min > 0.0 { v.max(min) } else { v };
+            if max > 0.0 { v.min(max) } else { v }
+        };
+        Size::new(
+            axis(size.w, w.min.w, w.max.w),
+            axis(size.h, w.min.h, w.max.h),
+        )
+    }
+
+    /// Set a window's state, hiding it when it becomes
+    /// [`Minimized`](WindowState::Minimized) and showing it again otherwise.
+    ///
+    /// Geometry is not touched: a maximized window is *placed* and *resized*
+    /// by the caller, which is the only thing that knows the work area.
+    ///
+    /// # Errors
+    /// [`Error::StaleKey`].
+    pub fn set_window_state(&mut self, win: WindowKey, state: WindowState) -> Result<(), Error> {
+        let window = self.windows.get_mut(win).ok_or(Error::StaleKey)?;
+        if window.state == state {
+            return Ok(());
+        }
+        window.state = state;
+        let root = window.root;
+        let visible = state != WindowState::Minimized;
+        let node = self.node_mut_ref(root);
+        if node.visible != visible {
+            node.visible = visible;
+            self.mark(root, Dirty::INHERIT);
+        }
+        Ok(())
+    }
+
+    /// Remember (or forget, with `None`) the frame position and content size
+    /// to return to when a window leaves `Maximized`/`Fullscreen`.
+    ///
+    /// # Errors
+    /// [`Error::StaleKey`].
+    pub fn set_window_restore(
+        &mut self,
+        win: WindowKey,
+        restore: Option<(Point, Size)>,
+    ) -> Result<(), Error> {
+        let window = self.windows.get_mut(win).ok_or(Error::StaleKey)?;
+        window.restore = restore;
+        Ok(())
     }
 
     /// Destroy a window and its whole node tree. Buffers survive.
@@ -325,7 +533,8 @@ impl Scene {
         Ok(())
     }
 
-    /// Resize a window: its root node's bounds and its requested size.
+    /// Resize a window: its content group's bounds and its requested size.
+    /// A framed window's root grows by the frame's insets.
     ///
     /// The next [`update`](Scene::update) reports a [`Configure`] for it.
     ///
@@ -342,15 +551,23 @@ impl Scene {
             return Err(Error::NotOwner);
         }
         window.size = size;
-        let root = window.root;
+        let (root, content, inset) = (window.root, window.content, window.inset);
         self.note_resized(win);
-        let node = self.node_mut_ref(root);
-        if node.bounds.size() == size {
-            return Ok(());
+        let node = self.node_mut_ref(content);
+        if node.bounds.size() != size {
+            node.bounds.w = size.w;
+            node.bounds.h = size.h;
+            self.mark(content, Dirty::BOUNDS);
         }
-        node.bounds.w = size.w;
-        node.bounds.h = size.h;
-        self.mark(root, Dirty::BOUNDS);
+        if root != content {
+            let frame = Size::new(size.w + inset.width(), size.h + inset.height());
+            let node = self.node_mut_ref(root);
+            if node.bounds.size() != frame {
+                node.bounds.w = frame.w;
+                node.bounds.h = frame.h;
+                self.mark(root, Dirty::BOUNDS);
+            }
+        }
         Ok(())
     }
 
@@ -540,6 +757,18 @@ impl Scene {
         if !client.may_touch(node.client) {
             return Err(Error::NotOwner);
         }
+        // A window's root and its content group both belong to the window,
+        // not to whoever holds a key to them: destroying either is closing
+        // the window, and `destroy_window` is the call that says so. A framed
+        // window's content *has* a parent, so the parent check alone is no
+        // longer enough.
+        if self
+            .windows
+            .get(node.window)
+            .is_some_and(|w| w.root == key || w.content == key)
+        {
+            return Err(Error::RootNode);
+        }
         let Some(parent) = node.parent else {
             return Err(Error::RootNode);
         };
@@ -568,6 +797,13 @@ impl Scene {
         let node = self.nodes.get(key).ok_or(Error::StaleKey)?;
         if !client.may_touch(node.client) {
             return Err(Error::NotOwner);
+        }
+        if self
+            .windows
+            .get(node.window)
+            .is_some_and(|w| w.root == key || w.content == key)
+        {
+            return Err(Error::RootNode);
         }
         let Some(old_parent) = node.parent else {
             return Err(Error::RootNode);
@@ -614,11 +850,35 @@ impl Scene {
         }
         node.bounds = bounds;
         let win = node.window;
-        let is_root = node.parent.is_none();
         self.mark(key, Dirty::BOUNDS);
-        if is_root && let Some(window) = self.windows.get_mut(win) {
+        // A client resizing its own top-level group is a resize request:
+        // the *content* group is the one that means it, which is the root
+        // itself for an undecorated window and the frame's child otherwise.
+        if self.windows.get(win).is_some_and(|w| w.content == key) {
+            let (inset, root) = {
+                let w = self.window_ref(win);
+                (w.inset, w.root)
+            };
+            let window = self.window_mut_unchecked(win);
             window.size = bounds.size();
             self.note_resized(win);
+            if root != key {
+                // The content's *origin* inside the frame belongs to the
+                // frame, not to the client: a client that sends its own
+                // window bounds as `(0, 0, w, h)` — which every toolkit
+                // does — must not slide its content out from under the
+                // title bar.
+                let node = self.node_mut_ref(key);
+                node.bounds.x = inset.left;
+                node.bounds.y = inset.top;
+                let frame =
+                    Rect::new(0.0, 0.0, bounds.w + inset.width(), bounds.h + inset.height());
+                let node = self.node_mut_ref(root);
+                if node.bounds != frame {
+                    node.bounds = frame;
+                    self.mark(root, Dirty::BOUNDS);
+                }
+            }
         }
         Ok(())
     }

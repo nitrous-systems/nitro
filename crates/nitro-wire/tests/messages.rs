@@ -11,13 +11,13 @@ use nitro_wire::msg::{
     BufferDamage, ClientMsg, Closed, Commit, Configure, CreateBuffer, CreateNode, CreateWindow,
     DestroyBuffer, DestroyNode, Error as ErrorMsg, Fill, Focus, Frame, Hello, Key, MeasureText,
     PointerAxis, PointerButton, PointerEnter, PointerLeave, PointerMotion, Presented, Reparent,
-    RequestFrame, ServerMsg, SetBorder, SetBounds, SetClip, SetCorners, SetFill, SetImage,
-    SetOpacity, SetText, SetTransform, SetVisible, SetWindowTitle, TextMeasured, TextMetrics,
-    Touch, Welcome,
+    RequestFrame, ServerMsg, SetAppId, SetBorder, SetBounds, SetClip, SetCorners, SetFill,
+    SetImage, SetOpacity, SetText, SetTransform, SetVisible, SetWindowLimits, SetWindowState,
+    SetWindowTitle, TextMeasured, TextMetrics, Touch, Welcome, WindowState,
 };
 use nitro_wire::types::{
     Align, AxisSource, BufferId, ButtonState, CursorPos, ErrorCode, Layer, NodeId, NodeKind,
-    TouchPhase, caps, format, window_flags,
+    TouchPhase, WindowState as WindowStateValue, caps, format, window_flags,
 };
 use nitro_wire::{DecodeError, VERSION, header};
 
@@ -42,7 +42,7 @@ fn client_messages() -> Vec<ClientMsg> {
             id: NodeId(0x0102_0304),
             size: Size::new(1280.5, 720.25),
             layer: Layer::Overlay,
-            flags: window_flags::UNDECORATED | window_flags::OPAQUE,
+            flags: window_flags::UNDECORATED | window_flags::NO_FOCUS,
             title: "Tîtle — ünicode".to_owned(),
         }
         .into(),
@@ -53,6 +53,27 @@ fn client_messages() -> Vec<ClientMsg> {
         .into(),
         RequestFrame {
             window: NodeId(0xffff_fffe),
+        }
+        .into(),
+        SetWindowState {
+            window: NodeId(0x0043_2100),
+            state: WindowStateValue::Fullscreen,
+        }
+        .into(),
+        SetWindowState {
+            window: NodeId(37),
+            state: WindowStateValue::Minimized,
+        }
+        .into(),
+        SetWindowLimits {
+            window: NodeId(38),
+            min: Size::new(320.5, 240.25),
+            max: Size::new(1920.75, 1080.125),
+        }
+        .into(),
+        SetAppId {
+            window: NodeId(39),
+            app_id: "org.nitro.calc".to_owned(),
         }
         .into(),
         CreateNode {
@@ -258,6 +279,11 @@ fn server_messages() -> Vec<ServerMsg> {
         }
         .into(),
         Closed { window: NodeId(4) }.into(),
+        WindowState {
+            window: NodeId(0x0055_00aa),
+            state: WindowStateValue::Maximized,
+        }
+        .into(),
         PointerEnter {
             window: NodeId(5),
             node: NodeId(6),
@@ -558,6 +584,7 @@ fn garbage_frames_never_panic_through_the_framer() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn payload_layouts_are_frozen() {
     // Golden byte strings: if a field is reordered or resized, this breaks.
     // Update it only together with `docs/wire.md` and a version bump.
@@ -595,6 +622,44 @@ fn payload_layouts_are_frozen() {
             0x01, 0x00, 0x00, 0x00, // version
             0x02, 0x00, 0x00, 0x00, // name length
             b'a', b'b',
+        ]
+    );
+
+    let mut w = Writer::new();
+    ClientMsg::from(SetWindowState {
+        window: NodeId(0x0102_0304),
+        state: WindowStateValue::Fullscreen,
+    })
+    .encode(&mut w)
+    .unwrap();
+    assert_eq!(
+        w.bytes(),
+        &[
+            // header: len=5, op=0x0013, fds=0, flags=0
+            0x05, 0x00, 0x00, 0x00, 0x13, 0x00, 0x00, 0x00, //
+            0x04, 0x03, 0x02, 0x01, // window
+            0x02, // state Fullscreen
+        ]
+    );
+
+    let mut w = Writer::new();
+    ClientMsg::from(SetWindowLimits {
+        window: NodeId(0x0102_0304),
+        min: Size::new(1.0, 2.0),
+        max: Size::new(3.0, 4.0),
+    })
+    .encode(&mut w)
+    .unwrap();
+    assert_eq!(
+        w.bytes(),
+        &[
+            // header: len=20, op=0x0014, fds=0, flags=0
+            0x14, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, //
+            0x04, 0x03, 0x02, 0x01, // window
+            0x00, 0x00, 0x80, 0x3f, // min.w 1.0
+            0x00, 0x00, 0x00, 0x40, // min.h 2.0
+            0x00, 0x00, 0x40, 0x40, // max.w 3.0
+            0x00, 0x00, 0x80, 0x40, // max.h 4.0
         ]
     );
 

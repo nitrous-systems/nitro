@@ -122,6 +122,21 @@ tag_enum! {
 }
 
 tag_enum! {
+    /// What a top-level window is doing: its geometry mode.
+    WindowState: u8 {
+        /// Floating at its own size and position.
+        Normal = 0,
+        /// Filling the output's work area.
+        Maximized = 1,
+        /// Covering the whole output, decorations hidden.
+        Fullscreen = 2,
+        /// Hidden, but still in the window list and the focus-cycling
+        /// order.
+        Minimized = 3,
+    }
+}
+
+tag_enum! {
     /// Horizontal alignment of a text node's lines inside its bounds.
     Align: u8 {
         /// Lines start at the left edge.
@@ -241,6 +256,9 @@ pub mod caps {
     pub const DMABUF: u32 = 1 << 2;
     /// The connection is remote: buffers are expensive, text is cheap.
     pub const REMOTE: u32 = 1 << 3;
+    /// Server-side window management: decorations, states, limits, app ids
+    /// (M3).
+    pub const WM: u32 = 1 << 4;
 }
 
 /// Pixel formats for [`CreateBuffer`](crate::msg::CreateBuffer), as DRM
@@ -262,12 +280,12 @@ pub mod format {
 /// Window flags for [`CreateWindow`](crate::msg::CreateWindow). Unknown
 /// bits are reserved and must be zero.
 pub mod window_flags {
-    /// The window has no decorations and is not managed (splash, overlay).
+    /// The server draws no frame around this window (splash, overlay).
     pub const UNDECORATED: u32 = 1 << 0;
-    /// The window would like to start fullscreen on its output.
-    pub const FULLSCREEN: u32 = 1 << 1;
-    /// The window is opaque over its whole bounds (an optimisation hint).
-    pub const OPAQUE: u32 = 1 << 2;
+    /// The window is not user-resizable: no resize bands, no maximize.
+    pub const FIXED_SIZE: u32 = 1 << 1;
+    /// The window never takes keyboard focus (launcher, bar).
+    pub const NO_FOCUS: u32 = 1 << 2;
 }
 
 #[cfg(test)]
@@ -286,6 +304,14 @@ mod tests {
         assert_eq!(TouchPhase::from_raw(3), Ok(TouchPhase::Cancel));
         assert_eq!(ErrorCode::from_raw(7), Ok(ErrorCode::Version));
         assert_eq!(ErrorCode::from_raw(0), Err(DecodeError::BadValue));
+        assert_eq!(
+            WindowState::from_raw(WindowState::Normal.raw()),
+            Ok(WindowState::Normal)
+        );
+        assert_eq!(WindowState::from_raw(1), Ok(WindowState::Maximized));
+        assert_eq!(WindowState::from_raw(2), Ok(WindowState::Fullscreen));
+        assert_eq!(WindowState::from_raw(3), Ok(WindowState::Minimized));
+        assert_eq!(WindowState::from_raw(4), Err(DecodeError::BadValue));
     }
 
     #[test]
@@ -295,5 +321,10 @@ mod tests {
         assert!(BufferId::default().is_none());
         assert_eq!(format::XR24, 0x3432_5258);
         assert_eq!(format::AR24, 0x3432_5241);
+        assert_eq!(caps::WM, 0x10);
+        assert_eq!(
+            window_flags::UNDECORATED | window_flags::FIXED_SIZE | window_flags::NO_FOCUS,
+            0b111
+        );
     }
 }

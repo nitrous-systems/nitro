@@ -34,13 +34,17 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use nitro_core::{IRect, Point, Rect, Size};
 use nitro_scene::{
     Border, BufferDesc, BufferKey, ClientId, Error as SceneError, Fill as SceneFill, ImageRef,
-    NodeKey, NodeKind as SceneNodeKind, Scene, TextAlign, TextRef, WindowKey,
+    NodeKey, NodeKind as SceneNodeKind, Scene, TextAlign, TextRef, WindowFlags, WindowKey,
+    WindowState,
 };
 use nitro_text::TextKey;
 use nitro_wire::error::Error as WireError;
 use nitro_wire::msg::{self, ClientMsg, ServerMsg};
 use nitro_wire::server::{ClientStream, code_for};
-use nitro_wire::types::{Align, BufferId, ErrorCode, Layer, NodeId, NodeKind, format};
+use nitro_wire::types::{
+    Align, BufferId, ErrorCode, Layer, NodeId, NodeKind, WindowState as WireWindowState, format,
+    window_flags,
+};
 
 use crate::text::{StyleRequest, TextEngine};
 use crate::{debug, warn};
@@ -268,6 +272,13 @@ pub struct ApplyOutcome {
     /// the measured size back at the commit, which is how a toolkit lays a
     /// label out without a separate `MeasureText` round trip.
     pub text_metrics: Vec<(NodeId, msg::TextMetrics)>,
+    /// Windows whose client asked for a state change, in arrival order. The
+    /// scene does not act on these: which rectangle `Maximized` means is
+    /// the window manager's business, and it is the one thing in a
+    /// transaction that needs the work area.
+    pub state_requests: Vec<(WindowKey, WindowState)>,
+    /// Windows whose title changed, so the server can redraw the title bar.
+    pub retitled: Vec<WindowKey>,
 }
 
 /// Apply one client's buffered mutations to the scene, atomically as far as
@@ -363,12 +374,23 @@ fn apply_msg(
                 return Err(ApplyError::new(ErrorCode::Limit, "too many nodes"));
             }
             let size = sane_size(m.size)?;
-            let win = scene.create_window(client.id, m.title, size, scene_layer(m.layer));
-            let root = scene
+            let win = scene.create_window_with(
+                client.id,
+                m.title,
+                size,
+                scene_layer(m.layer),
+                scene_flags(m.flags),
+            );
+            let content = scene
                 .window_info(win)
                 .map_err(|e| scene_err("CreateWindow", e))?
-                .root();
-            client.bind_node(m.id, root);
+                .content();
+            // The client's id names its *content* group, which survives the
+            // server wrapping a frame around it: `frame_window` mints a new
+            // root above this node and leaves this key alone, so every
+            // `CreateNode { parent: id }` still lands inside the client's
+            // own group rather than on top of the decorations.
+            client.bind_node(m.id, content);
             client.windows.insert(m.id, win);
             client.window_ids.insert(win, m.id);
             outcome.new_windows.push((m.id, win));
@@ -378,7 +400,27 @@ fn apply_msg(
             let win = window_of(client, m.window)?;
             scene
                 .set_window_title(client.id, win, m.title)
-                .map_err(|e| scene_err("SetWindowTitle", e))
+                .map_err(|e| scene_err("SetWindowTitle", e))?;
+            outcome.retitled.push(win);
+            Ok(())
+        }
+        ClientMsg::SetAppId(m) => {
+            let win = window_of(client, m.window)?;
+            scene
+                .set_app_id(client.id, win, m.app_id)
+                .map_err(|e| scene_err("SetAppId", e))
+        }
+        ClientMsg::SetWindowLimits(m) => {
+            let win = window_of(client, m.window)?;
+            let (min, max) = (sane_size(m.min)?, sane_size(m.max)?);
+            scene
+                .set_window_limits(client.id, win, min, max)
+                .map_err(|e| scene_err("SetWindowLimits", e))
+        }
+        ClientMsg::SetWindowState(m) => {
+            let win = window_of(client, m.window)?;
+            outcome.state_requests.push((win, scene_state(m.state)));
+            Ok(())
         }
         ClientMsg::RequestFrame(m) => {
             window_of(client, m.window)?;
@@ -764,6 +806,39 @@ pub struct BufferSource {
 #[must_use]
 pub fn wire_code(err: &WireError) -> ErrorCode {
     code_for(err)
+}
+
+/// The scene's window state for a wire one, and back. Two enums with the
+/// same shape, deliberately: the scene must not depend on the protocol.
+#[must_use]
+pub fn scene_state(state: WireWindowState) -> WindowState {
+    match state {
+        WireWindowState::Normal => WindowState::Normal,
+        WireWindowState::Maximized => WindowState::Maximized,
+        WireWindowState::Fullscreen => WindowState::Fullscreen,
+        WireWindowState::Minimized => WindowState::Minimized,
+    }
+}
+
+/// The wire's window state for a scene one.
+#[must_use]
+pub fn wire_state(state: WindowState) -> WireWindowState {
+    match state {
+        WindowState::Normal => WireWindowState::Normal,
+        WindowState::Maximized => WireWindowState::Maximized,
+        WindowState::Fullscreen => WireWindowState::Fullscreen,
+        WindowState::Minimized => WireWindowState::Minimized,
+    }
+}
+
+/// The scene's window flags for a `CreateWindow`'s bits.
+#[must_use]
+pub fn scene_flags(flags: u32) -> WindowFlags {
+    WindowFlags {
+        decorated: flags & window_flags::UNDECORATED == 0,
+        fixed_size: flags & window_flags::FIXED_SIZE != 0,
+        focusable: flags & window_flags::NO_FOCUS == 0,
+    }
 }
 
 /// The layer a window asked for, as the scene sees it. The wire and scene
