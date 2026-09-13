@@ -261,7 +261,7 @@ D-Bus client is allowed.
   nitro-calc do window/7 click` runs the real callback with the real
   `&mut S`, and being scriptable costs neither a thread nor a lock.
   **`nitro-calc` is the exit criterion, measured on the box**: 489 lines
-  of app source excluding tests, a **560 KB** stripped binary, **2 760 kB**
+  of app source excluding tests, a **560 KB** stripped binary, **2 752 kB**
   RSS, one thread, **0.0 % idle CPU with zero context switches** in the
   app *and* the server, **one keypress is exactly two mutations
   (`SetText`, `Commit`)**, and keypress-to-photon of **1.9 ms min /
