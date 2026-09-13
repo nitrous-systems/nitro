@@ -237,6 +237,10 @@ fn kind_mismatches_are_rejected() {
             Error::WrongKind
         );
     }
+    // Text-only properties.
+    for key in [g, r, image] {
+        assert_eq!(s.set_text(CLIENT, key, None).unwrap_err(), Error::WrongKind);
+    }
     // The common properties work on every kind.
     for key in [g, r, image, text] {
         s.set_bounds(CLIENT, key, Rect::new(1.0, 1.0, 2.0, 2.0))

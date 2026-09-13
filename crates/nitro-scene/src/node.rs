@@ -1,6 +1,6 @@
 //! Nodes: kinds, properties, cached world state and dirty flags.
 
-use nitro_core::{Color, IRect, Point, Rect, Transform};
+use nitro_core::{Color, IRect, Point, Rect, Size, Transform};
 
 use crate::{BufferKey, ClientId, WindowKey, key::define_key};
 
@@ -11,10 +11,9 @@ define_key!(
 
 /// What a node is.
 ///
-/// `Text` and `Surface` are reserved: the scene stores the kind and the common
-/// properties, produces no paint item and no damage for them, and grows a
-/// payload when the rasterizer (text runs) and the Wayland adapter (external
-/// buffers) need one.
+/// `Surface` is reserved: the scene stores the kind and the common properties,
+/// produces no paint item and no damage for it, and grows a payload when the
+/// Wayland adapter needs one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NodeKind {
     /// A container: transform, clip and opacity for its children.
@@ -23,7 +22,7 @@ pub enum NodeKind {
     Rect,
     /// A rectangle textured from a region of a buffer.
     Image,
-    /// Reserved: a shaped text run.
+    /// A shaped text run, held outside the scene and named by a [`TextRef`].
     Text,
     /// Reserved: an externally-provided surface (dma-buf).
     Surface,
@@ -99,6 +98,53 @@ impl ImageRef {
     }
 }
 
+/// Where a [`NodeKind::Text`] node's lines sit inside its bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum TextAlign {
+    /// Lines start at the left edge.
+    #[default]
+    Left,
+    /// Lines are centred.
+    Center,
+    /// Lines end at the right edge.
+    Right,
+}
+
+/// What a [`NodeKind::Text`] node draws: a handle to a shaped run someone
+/// else owns, plus the paint properties the node itself holds.
+///
+/// The scene deliberately does **not** own the shaping. Glyph ids, font
+/// handles and atlas keys are the text engine's vocabulary, and dragging it
+/// in would put a font library behind `nitro-scene`'s API for every consumer
+/// of the tree — including the tests, which must stay able to build a scene
+/// with no fonts on the box at all. `key` is an opaque `u32` into whatever
+/// store the server keeps; the scene only ever compares it for equality.
+///
+/// `size` is the shaped block's measured extent in local units. It is *not*
+/// the node's bounds: the bounds are the box the client laid out, and the
+/// block is aligned inside them. Storing both is what lets `Center` and
+/// `Right` be computed without consulting the store.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TextRef {
+    /// Handle into the server's text store.
+    pub key: u32,
+    /// Measured size of the shaped block, in local units.
+    pub size: Size,
+    /// Baseline of the first line, measured down from the block's top.
+    pub ascent: f32,
+    /// Colour every glyph is tinted with.
+    pub color: Color,
+    /// Where the block sits horizontally inside the node's bounds.
+    pub align: TextAlign,
+}
+
+impl TextRef {
+    /// Whether this run can put any pixel on screen.
+    pub fn is_visible(self) -> bool {
+        !self.color.is_transparent() && self.size.w > 0.0 && self.size.h > 0.0
+    }
+}
+
 /// Paint properties of a [`NodeKind::Rect`].
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct RectData {
@@ -118,7 +164,7 @@ pub(crate) enum NodeData {
     Group,
     Rect(RectData),
     Image(Option<ImageRef>),
-    Text,
+    Text(Option<TextRef>),
     Surface,
 }
 
@@ -128,7 +174,7 @@ impl NodeData {
             Self::Group => NodeKind::Group,
             Self::Rect(_) => NodeKind::Rect,
             Self::Image(_) => NodeKind::Image,
-            Self::Text => NodeKind::Text,
+            Self::Text(_) => NodeKind::Text,
             Self::Surface => NodeKind::Surface,
         }
     }
@@ -138,7 +184,7 @@ impl NodeData {
             NodeKind::Group => Self::Group,
             NodeKind::Rect => Self::Rect(RectData::default()),
             NodeKind::Image => Self::Image(None),
-            NodeKind::Text => Self::Text,
+            NodeKind::Text => Self::Text(None),
             NodeKind::Surface => Self::Surface,
         }
     }
@@ -346,6 +392,14 @@ impl Node {
         }
     }
 
+    /// Text reference; `None` unless this is a `Text` node with a run.
+    pub fn text(&self) -> Option<TextRef> {
+        match self.data {
+            NodeData::Text(t) => t,
+            _ => None,
+        }
+    }
+
     /// Transform from the node's local space (origin at its top-left corner)
     /// to device pixels. Cached; valid after `update`.
     pub fn world_transform(&self) -> Transform {
@@ -407,8 +461,9 @@ impl Node {
         match self.data {
             NodeData::Rect(r) => r.fill.is_visible() || r.border.is_some_and(Border::is_visible),
             NodeData::Image(i) => i.is_some(),
-            // Reserved kinds store nothing, so they paint nothing.
-            NodeData::Group | NodeData::Text | NodeData::Surface => false,
+            NodeData::Text(t) => t.is_some_and(TextRef::is_visible),
+            // The reserved kind stores nothing, so it paints nothing.
+            NodeData::Group | NodeData::Surface => false,
         }
     }
 }

@@ -93,6 +93,7 @@ All integers little-endian. No padding anywhere.
 | `Transform` | 24 | `a, b, c, d, e, f: f32`, mapping `(x,y)` to `(ax+cy+e, bx+dy+f)` |
 | `NodeId` | 4 | `u32`; **0 = none** |
 | `BufferId` | 4 | `u32`; **0 = none** |
+| `CursorPos` | 8 | `offset: u32` (byte offset into the text), `x: f32` (logical pixels from the text's left edge) |
 
 A declared length larger than `MAX_PAYLOAD` is rejected before anything is
 allocated, so a hostile count cannot make the peer reserve gigabytes.
@@ -148,15 +149,18 @@ logs and is never parsed.
 | type | values |
 |---|---|
 | `Layer` | `Background` 0, `Normal` 1, `Top` 2, `Overlay` 3 |
-| `NodeKind` | `Group` 1, `Rect` 2, `Image` 3, `Text` 4 *(reserved)*, `Surface` 5 *(reserved)* |
+| `NodeKind` | `Group` 1, `Rect` 2, `Image` 3, `Text` 4, `Surface` 5 *(reserved)* |
 | `ButtonState` | `Released` 0, `Pressed` 1 |
 | `AxisSource` | `Wheel` 0, `Finger` 1, `Continuous` 2, `WheelTilt` 3 |
 | `TouchPhase` | `Down` 0, `Move` 1, `Up` 2, `Cancel` 3 |
+| `Align` | `Left` 0, `Center` 1, `Right` 2 |
 | `Fill` tag | `None` 0, `Solid` 1, `Linear` 2 |
 
 A value outside the list is a decode error, not a silently-ignored
 unknown. `Text` and `Surface` decode but are rejected by a v1 server
-unless the matching capability bit is set.
+unless the matching capability bit is set. `Text` is **no longer
+reserved**: it is accepted when the `TEXT` capability bit is set, and its
+content and style are given by `SetText`.
 
 `window_flags`: `UNDECORATED` 1, `FULLSCREEN` 2, `OPAQUE` 4. Unknown bits
 are reserved and must be zero.
@@ -190,6 +194,8 @@ Assigned in blocks of 0x100 so a block can grow without renumbering.
 | `0x0203` | `SetFill` | style |
 | `0x0204` | `SetCorners` | style |
 | `0x0205` | `SetBorder` | style |
+| `0x0206` | `SetText` | style (needs `TEXT`) |
+| `0x0207` | `MeasureText` | style (needs `TEXT`) |
 | `0x0301` | `CreateBuffer` | buffers |
 | `0x0302` | `DestroyBuffer` | buffers |
 | `0x0303` | `BufferDamage` | buffers |
@@ -213,6 +219,8 @@ Assigned in blocks of 0x100 so a block can grow without renumbering.
 | `0x8205` | `PointerAxis` | input |
 | `0x8206` | `Key` | input |
 | `0x8207` | `Touch` | input |
+| `0x8301` | `TextMetrics` | text |
+| `0x8302` | `TextMeasured` | text |
 
 ## Messages, client → server
 
@@ -361,6 +369,53 @@ space. Applies to `Rect` nodes.
 | `id` | `NodeId` | |
 | `width` | `f32` | border width, drawn inside the bounds; 0 = none |
 | `color` | `Color` | |
+
+### `SetText` — 0x0206
+
+| field | type | meaning |
+|---|---|---|
+| `node` | `NodeId` | the `Text` node |
+| `size_px` | `f32` | font size in logical pixels |
+| `weight` | `u16` | CSS-style weight (400 regular, 700 bold) |
+| `italic` | `bool` | select an italic face |
+| `max_width` | `f32` | wrapping/alignment width; **0 = no limit** |
+| `wrap` | `bool` | wrap lines at `max_width`; no effect when `max_width` is 0 |
+| `align` | `Align` | horizontal alignment of the lines |
+| `color` | `Color` | text colour |
+| `family` | `str` | family name, or `sans` / `serif` / `mono` |
+| `text` | `str` | the string, UTF-8 |
+
+Fixed head 21 bytes (`4+4+2+1+4+1+1+4`), then `family`, then `text`.
+
+Applies at the next `Commit`, like every other mutation. The server does
+the shaping — clients send strings and style, never glyph pixels — and
+answers with one `TextMetrics` for **each node it (re)shaped in that
+commit**. Requires the `TEXT` capability bit; on a node that is not a
+`Text` node it is a `WrongKind` error.
+
+Text is **LTR-only in M2**: no bidi, no rich text, one style per node.
+
+### `MeasureText` — 0x0207
+
+| field | type | meaning |
+|---|---|---|
+| `request` | `u32` | client-chosen; echoed back in `TextMeasured` |
+| `size_px` | `f32` | font size in logical pixels |
+| `weight` | `u16` | CSS-style weight |
+| `italic` | `bool` | select an italic face |
+| `max_width` | `f32` | wrapping width; **0 = no limit** |
+| `wrap` | `bool` | wrap lines at `max_width`; no effect when `max_width` is 0 |
+| `family` | `str` | family name, or `sans` / `serif` / `mono` |
+| `text` | `str` | the string to measure, UTF-8 |
+
+Fixed head 16 bytes (`4+4+2+1+4+1`), then `family`, then `text`.
+
+Answered **immediately on receipt**, not at the next commit, with a
+`TextMeasured` carrying the same `request`. This is the one
+request/response pair in the protocol: a text field needs a measurement
+before it can lay itself out, so making it wait for a commit would
+deadlock the layout it is part of. It creates no node and mutates
+nothing. Requires the `TEXT` capability bit.
 
 ### `CreateBuffer` — 0x0301 — **carries 1 fd**
 
@@ -531,6 +586,36 @@ Same fields as `PointerEnter`.
 | `pos` | `Point` | |
 | `time_ns` | `u64` | |
 
+### `TextMetrics` — 0x8301
+
+| field | type | meaning |
+|---|---|---|
+| `node` | `NodeId` | the `Text` node that was shaped |
+| `width` | `f32` | width of the longest line, logical pixels |
+| `height` | `f32` | total height of all lines |
+| `ascent` | `f32` | ascent of the first line above its baseline |
+| `descent` | `f32` | descent of the last line below its baseline |
+| `line_count` | `u32` | number of laid-out lines |
+
+Sent for every node the server (re)shaped in a commit — the answer to
+`SetText`, and also to anything else that forces a reshape (a new
+`SetBounds` with wrapping on, a scale change).
+
+### `TextMeasured` — 0x8302
+
+| field | type | meaning |
+|---|---|---|
+| `request` | `u32` | the `request` of the `MeasureText` this answers |
+| `width` | `f32` | width of the longest line, logical pixels |
+| `height` | `f32` | total height of all lines |
+| `ascent` | `f32` | ascent of the first line above its baseline |
+| `descent` | `f32` | descent of the last line below its baseline |
+| `line_count` | `u32` | number of laid-out lines |
+| `cursor_x` | `vec<CursorPos>` | cursor positions, in increasing `offset` order |
+
+Fixed head 24 bytes, then the vector. Sent on receipt of the
+`MeasureText`, not at a commit. `cursor_x` may be empty.
+
 ## Deviations from the M1 sketch
 
 The task's sketch is followed except where a fixed-size head had to come
@@ -574,6 +659,16 @@ first, or where a name was ambiguous. Every difference:
     `Reader::get_str` rejects a NUL as a protocol error, so encoding one
     would let a client kill itself by putting a NUL in a window title;
     stripping keeps the failure local.
+11. **The text ops use strict types, not raw bytes.** `SetText.italic`,
+    `SetText.wrap` and `MeasureText.italic`, `MeasureText.wrap` are
+    `bool`s, and `SetText.align` is an `Align` tag, rather than the `u8`s
+    the sketch had: any other byte is a decode error, matching the rest
+    of v1.
+12. **`SetText` and `MeasureText` have two variable tails.** Their fixed
+    heads (21 and 16 bytes) come first as one packed `repr(C)` struct,
+    then `family`, then `text`, in that order. The "at most one variable
+    tail" rule becomes "the head is still one `repr(C)` struct"; the
+    strings are read back to back after it.
 
 ## Receive-side limits
 
@@ -656,6 +751,11 @@ to.
   guarded by a **new capability bit** in `Welcome`. A client that does not
   see the bit must not send the op; a server that receives an op it does
   not know answers `Error { Protocol }`.
+* The M2 text ops — `SetText` 0x0206, `MeasureText` 0x0207,
+  `TextMetrics` 0x8301, `TextMeasured` 0x8302 — are exactly that
+  sanctioned path: four **new op codes** in a gap and a new block,
+  guarded by the **existing `TEXT` capability bit** (bit 1). No field of
+  any pre-existing message changed, so `VERSION` stays **1**.
 * `VERSION` is bumped only for a change that is not expressible that way —
   a different framing, a changed field, a removed op. A version mismatch is
   fatal at handshake: there is no negotiation and no compatibility shim.

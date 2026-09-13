@@ -74,8 +74,10 @@
 //! - No gamma-correct blending (see above).
 //! - Linear gradients are axis-aligned: a gradient whose axis is diagonal is
 //!   projected onto its dominant component. The scene never asks for one.
-//! - No text; glyph blitting from the server-side atlas arrives with the text
-//!   work and will reuse [`Canvas::blit`]'s coverage path.
+//! - Glyphs are drawn as A8 coverage masks tinted with one colour
+//!   ([`Canvas::blit_mask`], [`Canvas::blit_masks`]); shaping, rasterizing
+//!   and the atlas live outside this crate. There is no text layout here and
+//!   no font dependency.
 //! - No radial/sweep gradients, no blur, no blend modes other than
 //!   source-over.
 
@@ -86,7 +88,7 @@ mod canvas;
 mod paint;
 mod shape;
 
-pub use canvas::{BYTES_PER_PIXEL, Canvas, Fill, Image, PixelFormat};
+pub use canvas::{BYTES_PER_PIXEL, Canvas, Fill, Image, Mask, PixelFormat};
 
 #[cfg(test)]
 mod tests;

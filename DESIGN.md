@@ -97,7 +97,8 @@ Sub-modules, each a contained blob behind a narrow trait:
   (works everywhere, zero Mesa); a `gpu` feature adds Vulkan (`ash`) images
   exported as dma-bufs behind the same `Buffer + Fence → Plane` interface.
 - **scene** — the retained tree. Node kinds: `Group{transform, clip,
-  opacity}`, `Rect{rrect, fill, border}`, `Text{run_id, pos}`, `Image{buf,
+  opacity}`, `Rect{rrect, fill, border}`, `Text{run, colour, align}`, `Image{buf,
+
   src_rect}`, `Surface{external dma-buf}`. Each node caches its
   world-space bounds; a mutation marks the old and new bounds damaged.
   Windows are just top-level groups with a client owner and a z-order.
@@ -105,8 +106,9 @@ Sub-modules, each a contained blob behind a narrow trait:
   the back buffer. Anti-aliased rects/rounded-rects, solid/linear fills,
   glyph blitting from a server-side atlas, image scaling. Candidate: own
   minimal rasterizer; measure against `vello_cpu` before deciding. Text
-  shaping/layout (`parley` + `skrifa`) lives here so clients send text
-  *runs*, not glyph pixels — this is what keeps the remote link thin.
+  shaping/layout (`swash`, in `nitro-text`) lives server-side so clients
+  send *strings*, not glyph pixels — this is what keeps the remote link
+  thin and every app binary small.
 - **planes** — decides per frame whether a node can be scanned out directly
   (fullscreen surface, video, cursor) instead of composited. Zero-copy
   scanout is the single largest power win on phones.
@@ -226,6 +228,16 @@ D-Bus client is allowed.
   average. Three VT round trips with a client connected are clean and
   input still routes afterwards. Text is still M2, which is the one thing
   the milestone promised and did not deliver: rects and images only.
+- **M2-pre** — **done.** Text end to end. `nitro-text` (swash) does font
+  discovery, shaping, layout, measurement and an A8 glyph atlas *in the
+  server*; `nitro-wire` grows `SetText`/`MeasureText` and
+  `TextMetrics`/`TextMeasured` behind the `TEXT` capability bit (v1 is not
+  bumped — new ops, new bit, exactly as the versioning policy prescribes);
+  `nitro-scene`'s `Text` kind becomes live, holding an opaque store handle
+  rather than any font type; and `nitro-raster` learns `blit_mask`. A
+  client sends a *string*, never a glyph, which is what keeps the remote
+  link thin and every app binary small.
+
 - **M2** — `nitro-ui` with arena, passes, `WidgetMut`, six widgets, layout,
   introspection socket, `hey`-style CLI. `nitro-calc` as the first app.
 - **M3** — Shell: bar, launcher, window management (focus, move, resize,
@@ -250,10 +262,18 @@ being re-read against the goals above.
   raw per-pixel throughput (1.5× on alpha rrects, 1.8× on scaled blits),
   which is what their hand-written SIMD buys on a no-AVX2 CPU. Full numbers
   in `crates/nitro-raster/compare/RESULTS.md`.
-- Text: `parley`+`skrifa` is the plan; how much of parley we actually need
-  (bidi, rich text) determines whether a smaller shaper suffices.
+- Text: **decided at M2-pre — `swash`.** Shaping, scaling and hinted glyph
+  rendering in one pure-Rust crate for seven net dependencies, against
+  roughly thirty for `parley`, whose shaper *is* swash. What parley adds
+  over it — bidi, font fallback, rich text — is not M2 work, and layering
+  it on later costs nothing that has been decided here. Font discovery is
+  ours (`NITRO_FONT_DIRS`, no fontconfig). Reasoning in `DEPENDENCIES.md`,
+  limitations in `crates/nitro-text/README.md`.
 - Scene-graph vocabulary: how rich before it stops being "primitive"? Rule
   of thumb: if a client would need more than ~10 nodes for a button, add a
   node kind; if a node needs per-frame updates to animate, add a property.
-- Client-side vs server-side glyph cache for the remote case.
+- Client-side vs server-side glyph cache for the remote case: **decided at
+  M2-pre — server-side.** Clients send strings and a style and never see a
+  glyph, so nothing about text depends on the link being local; the atlas
+  is shared across clients, because a glyph is a glyph.
 - Security model between clients (who may introspect whom).

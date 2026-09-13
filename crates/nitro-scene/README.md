@@ -52,12 +52,21 @@ A window's root node cannot be reparented or destroyed on its own
 | `Group`   | transform, clip (both apply to children)    |
 | `Rect`    | fill, corner radius, border                 |
 | `Image`   | buffer key + source rect                    |
-| `Text`    | reserved — stores nothing but the kind      |
+| `Text`    | text-store handle, measured size, colour, alignment |
 | `Surface` | reserved — stores nothing but the kind      |
 
-The reserved kinds are accepted, stored and traversed, but produce no paint
-item and no damage. They grow a payload when the rasterizer needs text runs and
-the Wayland adapter needs external buffers.
+The reserved kind is accepted, stored and traversed, but produces no paint
+item and no damage. It grows a payload when the Wayland adapter needs external
+buffers.
+
+`Text` is deliberately *not* self-contained: the scene holds a `TextRef` — an
+opaque `u32` handle into whatever store the server keeps, plus the measured
+size of the shaped block, its first baseline, a colour and an alignment. Glyph
+ids and font handles are the text engine's vocabulary, and putting them here
+would drag a font library behind this crate's API for every consumer of the
+tree, tests included. Storing the measured size alongside the handle is what
+lets `paint_list` place a centred or right-aligned block without ever
+consulting the store.
 
 Every node carries the common properties (`bounds`, `opacity`, `visible`), its
 `ClientId` for ownership checks, its parent and its ordered children. Children
@@ -65,8 +74,8 @@ are stored **back to front**: later children paint on top and win hit tests,
 and `before: None` means "topmost".
 
 `transform` and `clip` are `Group`-only; the fill properties are `Rect`-only;
-`image` is `Image`-only. Setting one on the wrong kind is `Error::WrongKind`
-rather than a silently ignored write.
+`image` is `Image`-only; `text` is `Text`-only. Setting one on the wrong kind is
+`Error::WrongKind` rather than a silently ignored write.
 
 ### Coordinate spaces
 

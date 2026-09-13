@@ -3,7 +3,10 @@
 use nitro_core::{Color, IRect, Point, Rect};
 
 use crate::blend::{div255, effective_alpha, over_premul, over_straight, unit_u8};
-use crate::paint::{RowPaint, blend_pixel, paint_cov, paint_full, store_solid};
+use crate::paint::{
+    RowPaint, blend_mask_row, blend_mask_row_opaque, blend_pixel, paint_cov, paint_full,
+    store_solid,
+};
 use crate::shape::RRect;
 
 /// A source pixel: `b`/`g`/`r` plus straight or premultiplied alpha,
@@ -23,6 +26,33 @@ struct BlitBounds {
     y1: i32,
     cx0: i32,
     cx1: i32,
+}
+
+/// The loop-invariant part of a mask blit: the tint and its source alpha.
+#[derive(Debug, Clone, Copy)]
+struct MaskSetup {
+    /// The tint, straight alpha.
+    color: Color,
+    /// `color.a * opacity` in `0..=65_025`, the hoisted half of
+    /// [`effective_alpha`](crate::blend::effective_alpha).
+    ca: u32,
+    /// Coverage 255 means "replace the pixel": store instead of blend.
+    opaque: bool,
+}
+
+impl MaskSetup {
+    /// `None` when the blit would paint nothing at all.
+    fn new(color: Color, opacity: f32) -> Option<Self> {
+        let opacity = unit_u8(opacity);
+        if opacity == 0 || color.is_transparent() {
+            return None;
+        }
+        Some(Self {
+            color,
+            ca: u32::from(color.a) * u32::from(opacity),
+            opaque: color.is_opaque() && opacity == 255,
+        })
+    }
 }
 
 /// `u32 -> i32` for pixel dimensions, which are far below `i32::MAX`.
@@ -201,6 +231,35 @@ impl Image<'_> {
             r: u32::from(px[2]),
             a: alpha,
         }
+    }
+}
+
+/// An 8-bit coverage mask: one byte of alpha per pixel.
+///
+/// Rows are `stride` bytes apart, so a sub-rectangle of a bigger atlas page
+/// can be blitted without a copy.
+#[derive(Debug, Clone, Copy)]
+pub struct Mask<'a> {
+    /// Coverage bytes, `stride * h` at least.
+    pub data: &'a [u8],
+    /// Width in pixels.
+    pub w: u32,
+    /// Height in pixels.
+    pub h: u32,
+    /// Bytes per row.
+    pub stride: u32,
+}
+
+impl Mask<'_> {
+    /// Whether the mask is usable: non-zero extent, stride covering the
+    /// width, and enough data for `stride * h`.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        if self.w == 0 || self.h == 0 || self.stride < self.w {
+            return false;
+        }
+        let need = u64::from(self.stride) * u64::from(self.h);
+        self.data.len() as u64 >= need
     }
 }
 
@@ -723,6 +782,100 @@ impl<'a> Canvas<'a> {
                     ];
                     d.copy_from_slice(&out);
                 }
+            }
+        }
+    }
+
+    /// Blit an A8 coverage mask at device pixel `(x, y)`, tinted `color`,
+    /// source-over, never writing outside `clip`.
+    ///
+    /// `(x, y)` is the device pixel the mask's top-left corner lands on —
+    /// the caller (the glyph painter) has already applied the glyph's
+    /// placement offsets. No scaling and no filtering: a glyph mask is
+    /// rendered at its final size by the atlas.
+    ///
+    /// An empty or invalid mask, a transparent colour, `opacity <= 0` and an
+    /// empty clip are all no-ops.
+    pub fn blit_mask(
+        &mut self,
+        clip: &IRect,
+        x: i32,
+        y: i32,
+        mask: &Mask<'_>,
+        color: Color,
+        opacity: f32,
+    ) {
+        let Some(setup) = MaskSetup::new(color, opacity) else {
+            return;
+        };
+        let clip = self.clip_to_surface(clip);
+        if clip.is_empty() {
+            return;
+        }
+        self.blit_mask_clipped(&clip, x, y, mask, &setup);
+    }
+
+    /// Blit several masks that share a colour and an opacity.
+    ///
+    /// Same result as calling [`Canvas::blit_mask`] once per entry; the
+    /// batch hoists the per-call setup (clip intersection with the surface,
+    /// the effective source alpha, the premultiplied colour) out of the
+    /// loop, which is what a run of glyphs actually wants.
+    pub fn blit_masks(
+        &mut self,
+        clip: &IRect,
+        color: Color,
+        opacity: f32,
+        masks: &[(i32, i32, Mask<'_>)],
+    ) {
+        let Some(setup) = MaskSetup::new(color, opacity) else {
+            return;
+        };
+        let clip = self.clip_to_surface(clip);
+        if clip.is_empty() {
+            return;
+        }
+        for (x, y, mask) in masks {
+            self.blit_mask_clipped(&clip, *x, *y, mask, &setup);
+        }
+    }
+
+    /// One mask blit with `clip` already intersected with the surface and the
+    /// colour setup already computed.
+    fn blit_mask_clipped(
+        &mut self,
+        clip: &IRect,
+        x: i32,
+        y: i32,
+        mask: &Mask<'_>,
+        setup: &MaskSetup,
+    ) {
+        if !mask.is_valid() {
+            return;
+        }
+        // i64 throughout: the placement of a glyph inside a scrolled document
+        // can be far outside the surface, and `x + mask.w` must not wrap.
+        let (mx, my) = (i64::from(x), i64::from(y));
+        let x0 = mx.max(i64::from(clip.x));
+        let x1 = (mx + i64::from(mask.w)).min(i64::from(clip.right()));
+        let y0 = my.max(i64::from(clip.y));
+        let y1 = (my + i64::from(mask.h)).min(i64::from(clip.bottom()));
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        // Every value below is inside the clip, which is inside the surface.
+        let run = (x1 - x0) as usize;
+        let mask_x = (x0 - mx) as usize;
+        let mask_stride = mask.stride as usize;
+        let (dx0, dx1) = (x0 as i32, x1 as i32);
+        for dy in y0..y1 {
+            let mo = (dy - my) as usize * mask_stride + mask_x;
+            let cov = &mask.data[mo..mo + run];
+            let row = self.row(dy as i32, dx0, dx1);
+            if setup.opaque {
+                blend_mask_row_opaque(row, cov, setup.color);
+            } else {
+                blend_mask_row(row, cov, setup.color, setup.ca);
             }
         }
     }

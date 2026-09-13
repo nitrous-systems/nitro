@@ -43,6 +43,7 @@ pub mod protocol;
 pub mod render;
 pub mod signals;
 pub mod stats;
+pub mod text;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -74,6 +75,7 @@ use crate::input::{InputEvent, InputSource, LibinputSource, Pointer};
 use crate::keyboard::{Hotkey, Keyboard};
 use crate::protocol::Request;
 use crate::stats::FrameStats;
+use crate::text::{StyleRequest, TextEngine};
 
 /// Server name reported in `Welcome`.
 pub const SERVER_NAME: &str = "nitro";
@@ -293,6 +295,8 @@ struct Server {
     epoll: OwnedFd,
 
     scene: Scene,
+    /// Fonts, the shaper, the glyph atlas and every shaped run on screen.
+    text: TextEngine,
     outputs: Vec<OutputState>,
     keyboard: Option<Keyboard>,
     cursor: Cursor,
@@ -435,6 +439,7 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         seat,
         epoll,
         scene: Scene::new(),
+        text: TextEngine::new(),
         outputs: Vec::new(),
         keyboard,
         cursor: Cursor::new(),
@@ -806,12 +811,16 @@ impl Server {
             frame::paint_region(
                 &mut buf,
                 &self.scene,
+                &mut self.text,
                 scene_id,
                 &region,
                 (&self.cursor, cursor_state),
                 &mut self.paint_items,
             )
         };
+        // One frame stamp per painted frame: the atlas's LRU counts frames,
+        // not glyphs.
+        self.text.next_frame();
         let damage_px = frame::region_area(&region);
         let kms_damage: Vec<KmsRect> = region
             .iter()
@@ -1617,6 +1626,7 @@ impl Server {
             ("flip_interval_max_us", self.flips.max.as_micros() as u64),
         ];
         self.stats.write_pairs(&mut pairs);
+        self.text.write_pairs(&mut pairs);
         pairs.push(("clients", self.wire_clients.len() as u64));
         pairs.push(("windows", self.scene.window_count() as u64));
         pairs.push(("nodes", self.scene.node_count() as u64));
@@ -1692,17 +1702,48 @@ impl Server {
     fn handle_wire_msg(&mut self, token: u64, message: ClientMsg) -> bool {
         match message {
             ClientMsg::Hello(hello) => {
+                let caps = self.caps();
                 let Some(client) = self.wire_clients.get_mut(&token) else {
                     return false;
                 };
                 info!("wire client {} is {:?}", client.id.0, hello.name);
-                // No capability bits in v1: direct scanout, text and
-                // dma-buf are all later milestones, and a zero bit is the
-                // protocol's way of saying "do not use this".
-                if let Err(e) = client.stream.welcome(SERVER_NAME, 0) {
+                if let Err(e) = client.stream.welcome(SERVER_NAME, caps) {
                     warn!("welcome: {e}");
                     return false;
                 }
+                true
+            }
+            ClientMsg::MeasureText(m) => {
+                // Answered on receipt, not at the commit. Every other
+                // message is a mutation and waits its turn; this one is a
+                // *question*, and a text field that had to commit before it
+                // could learn how wide its own content is would need a
+                // frame per keystroke.
+                let request = StyleRequest::new(
+                    &m.family,
+                    m.size_px,
+                    m.weight,
+                    m.italic,
+                    m.max_width,
+                    m.wrap,
+                );
+                let metrics = self.text.measure(&request, &m.text);
+                let Some(client) = self.wire_clients.get_mut(&token) else {
+                    return false;
+                };
+                client.send(&ServerMsg::TextMeasured(msg::TextMeasured {
+                    request: m.request,
+                    width: metrics.width,
+                    height: metrics.height,
+                    ascent: metrics.ascent,
+                    descent: metrics.descent,
+                    line_count: metrics.line_count,
+                    cursor_x: metrics
+                        .cursor_x
+                        .into_iter()
+                        .map(|(offset, x)| nitro_wire::types::CursorPos { offset, x })
+                        .collect(),
+                }));
                 true
             }
             ClientMsg::Commit(commit) => self.commit(token, commit.serial),
@@ -1734,6 +1775,21 @@ impl Server {
         }
     }
 
+    /// Capability bits reported in `Welcome`.
+    ///
+    /// `TEXT` is set only when a font was actually found: the bit means
+    /// "you may send `Text` nodes", and on a box with no fonts at all that
+    /// would be a promise the server cannot keep. `DIRECT_SCANOUT` and
+    /// `DMABUF` remain later milestones, and a zero bit is the protocol's
+    /// way of saying "do not use this".
+    fn caps(&self) -> u32 {
+        if self.text.has_fonts() {
+            nitro_wire::types::caps::TEXT
+        } else {
+            0
+        }
+    }
+
     /// Apply a client's transaction. Returns whether the client survives.
     fn commit(&mut self, token: u64, serial: u32) -> bool {
         let Some(mut client) = self.wire_clients.remove(&token) else {
@@ -1741,7 +1797,7 @@ impl Server {
         };
         // The buffer descriptors arrived with their messages; hand them to
         // the client's map once the scene has minted the keys.
-        let result = clients::apply(&mut client, &mut self.scene, serial);
+        let result = clients::apply(&mut client, &mut self.scene, &mut self.text, serial);
         let outcome = match result {
             Ok(o) => o,
             Err(ApplyError { code, detail }) => {
@@ -1762,6 +1818,14 @@ impl Server {
         // per frame until it hit the process limit.
         for key in outcome.destroyed_buffers {
             self.buffer_sources.remove(&(client.id, key));
+        }
+        // Every node this transaction (re)shaped gets its measured size
+        // back. Sent after the batch was applied, so a client that set the
+        // text of several nodes in one commit sees one message per node and
+        // in the order it asked for them.
+        for (node, metrics) in outcome.text_metrics {
+            debug_assert_eq!(metrics.node, node);
+            client.send(&ServerMsg::TextMetrics(metrics));
         }
         for (node_id, win) in outcome.new_windows {
             self.place_new_window(&mut client, node_id, win);
@@ -1962,6 +2026,12 @@ impl Server {
             self.buffer_sources.remove(&(id, key));
         }
         self.pending_fds.retain(|(t, _, _, _)| *t != token);
+        // Every shaped run the client's nodes held. The scene's destroy
+        // walk drops the nodes, but the runs live in the text store, which
+        // knows them only by owner — so this is the one place they are
+        // freed, and a shell that restarts its clients would otherwise leak
+        // a glyph vector per label per restart.
+        self.text.release_owner(id.0);
         for output in &mut self.outputs {
             output.painting.retain(|(c, _)| *c != id.0);
             output.in_flight.retain(|(c, _)| *c != id.0);

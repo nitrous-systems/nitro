@@ -11,8 +11,8 @@
 //! |---|---|---|
 //! | `0x_0xx` | session and windows | session |
 //! | `0x_1xx` | tree | windows |
-//! | `0x_2xx` | style | input |
-//! | `0x_3xx` | buffers | — |
+//! | `0x_2xx` | style (including text style) | input |
+//! | `0x_3xx` | buffers | text |
 //!
 //! # Layout
 //!
@@ -24,6 +24,11 @@
 //! variable part last, so the same trick applies to the head. Where that
 //! reorders the fields relative to the task's sketch, `docs/wire.md`
 //! records it.
+//!
+//! [`SetText`] and [`MeasureText`] are the only messages with *two*
+//! variable tails (`family` then `text`); the rule that matters — the
+//! fixed head is one packed `repr(C)` struct — still holds, and the
+//! strings are read back to back after it.
 
 use std::os::fd::{AsFd as _, OwnedFd};
 
@@ -33,7 +38,8 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 use crate::codec::{FdQueue, Reader, Writer};
 use crate::error::{DecodeError, EncodeError};
 use crate::types::{
-    AxisSource, BufferId, ButtonState, ErrorCode, Layer, NodeId, NodeKind, TouchPhase,
+    Align, AxisSource, BufferId, ButtonState, CursorPos, ErrorCode, Layer, NodeId, NodeKind,
+    TouchPhase,
 };
 use crate::wire::Plain;
 
@@ -377,6 +383,157 @@ impl Body for SetFill {
     }
 }
 
+/// Set a text node's string and the style it is shaped with.
+///
+/// Applies at the next [`Commit`], like every other mutation; the server
+/// shapes the text and answers with [`TextMetrics`] for each node it
+/// (re)shaped in that commit. Requires the
+/// [`caps::TEXT`](crate::types::caps::TEXT) capability bit.
+///
+/// `max_width` 0 means "no limit"; `wrap` only has an effect with a
+/// non-zero `max_width`. `family` is a font family name or one of the
+/// generic aliases `sans`, `serif`, `mono`. Text is left-to-right only in
+/// M2: no bidi, no rich text.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetText {
+    /// The `Text` node.
+    pub node: NodeId,
+    /// Font size in logical pixels.
+    pub size_px: f32,
+    /// CSS-style weight (400 regular, 700 bold).
+    pub weight: u16,
+    /// Whether to select an italic face.
+    pub italic: bool,
+    /// Wrapping/alignment width in logical pixels; 0 = no limit.
+    pub max_width: f32,
+    /// Whether lines wrap at `max_width`. No effect when `max_width` is 0.
+    pub wrap: bool,
+    /// Horizontal alignment of the lines.
+    pub align: Align,
+    /// Text colour.
+    pub color: Color,
+    /// Font family name, or one of `sans`, `serif`, `mono`.
+    pub family: String,
+    /// The text itself, UTF-8.
+    pub text: String,
+}
+
+/// The fixed part of [`SetText`] — everything but the two strings.
+#[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct SetTextFixed {
+    node: <NodeId as Plain>::Wire,
+    size_px: <f32 as Plain>::Wire,
+    weight: <u16 as Plain>::Wire,
+    italic: <bool as Plain>::Wire,
+    max_width: <f32 as Plain>::Wire,
+    wrap: <bool as Plain>::Wire,
+    align: <Align as Plain>::Wire,
+    color: <Color as Plain>::Wire,
+}
+
+impl Body for SetText {
+    fn encode_body(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.put_struct(&SetTextFixed {
+            node: Plain::to_wire(self.node),
+            size_px: Plain::to_wire(self.size_px),
+            weight: Plain::to_wire(self.weight),
+            italic: Plain::to_wire(self.italic),
+            max_width: Plain::to_wire(self.max_width),
+            wrap: Plain::to_wire(self.wrap),
+            align: Plain::to_wire(self.align),
+            color: Plain::to_wire(self.color),
+        });
+        w.put_str(&self.family);
+        w.put_str(&self.text);
+        Ok(())
+    }
+    fn decode_body(r: &mut Reader<'_>, _fds: &mut FdQueue) -> Result<Self, DecodeError> {
+        let f = r.get_struct::<SetTextFixed>()?;
+        Ok(Self {
+            node: Plain::from_wire(f.node)?,
+            size_px: Plain::from_wire(f.size_px)?,
+            weight: Plain::from_wire(f.weight)?,
+            italic: Plain::from_wire(f.italic)?,
+            max_width: Plain::from_wire(f.max_width)?,
+            wrap: Plain::from_wire(f.wrap)?,
+            align: Plain::from_wire(f.align)?,
+            color: Plain::from_wire(f.color)?,
+            family: r.get_str()?,
+            text: r.get_str()?,
+        })
+    }
+}
+
+/// Ask the server to measure a string without creating a node.
+///
+/// Unlike every other client message this is answered **immediately on
+/// receipt**, not at the next [`Commit`]: it is the protocol's one
+/// request/response pair, because a text field needs a measurement before
+/// it can lay itself out. The answer is a [`TextMeasured`] carrying the
+/// same `request`. Requires the [`caps::TEXT`](crate::types::caps::TEXT)
+/// capability bit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MeasureText {
+    /// Client-chosen request id, echoed in [`TextMeasured`].
+    pub request: u32,
+    /// Font size in logical pixels.
+    pub size_px: f32,
+    /// CSS-style weight (400 regular, 700 bold).
+    pub weight: u16,
+    /// Whether to select an italic face.
+    pub italic: bool,
+    /// Wrapping width in logical pixels; 0 = no limit.
+    pub max_width: f32,
+    /// Whether lines wrap at `max_width`. No effect when `max_width` is 0.
+    pub wrap: bool,
+    /// Font family name, or one of `sans`, `serif`, `mono`.
+    pub family: String,
+    /// The text to measure, UTF-8.
+    pub text: String,
+}
+
+/// The fixed part of [`MeasureText`] — everything but the two strings.
+#[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct MeasureTextFixed {
+    request: <u32 as Plain>::Wire,
+    size_px: <f32 as Plain>::Wire,
+    weight: <u16 as Plain>::Wire,
+    italic: <bool as Plain>::Wire,
+    max_width: <f32 as Plain>::Wire,
+    wrap: <bool as Plain>::Wire,
+}
+
+impl Body for MeasureText {
+    fn encode_body(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.put_struct(&MeasureTextFixed {
+            request: Plain::to_wire(self.request),
+            size_px: Plain::to_wire(self.size_px),
+            weight: Plain::to_wire(self.weight),
+            italic: Plain::to_wire(self.italic),
+            max_width: Plain::to_wire(self.max_width),
+            wrap: Plain::to_wire(self.wrap),
+        });
+        w.put_str(&self.family);
+        w.put_str(&self.text);
+        Ok(())
+    }
+    fn decode_body(r: &mut Reader<'_>, _fds: &mut FdQueue) -> Result<Self, DecodeError> {
+        let f = r.get_struct::<MeasureTextFixed>()?;
+        Ok(Self {
+            request: Plain::from_wire(f.request)?,
+            size_px: Plain::from_wire(f.size_px)?,
+            weight: Plain::from_wire(f.weight)?,
+            italic: Plain::from_wire(f.italic)?,
+            max_width: Plain::from_wire(f.max_width)?,
+            wrap: Plain::from_wire(f.wrap)?,
+            family: r.get_str()?,
+            text: r.get_str()?,
+        })
+    }
+}
+
 /// Register a shared-memory buffer, passing its descriptor with this
 /// frame.
 ///
@@ -630,6 +787,10 @@ msg_enum! {
         SetCorners = 0x0204,
         /// Set a node's border.
         SetBorder = 0x0205,
+        /// Set a text node's content and style (needs `caps::TEXT`).
+        SetText = 0x0206,
+        /// Measure a string; answered at once with `TextMeasured`.
+        MeasureText = 0x0207,
         /// Register a buffer (carries one fd).
         CreateBuffer = 0x0301,
         /// Release a buffer.
@@ -738,6 +899,67 @@ impl Body for Key {
             keysym: r.get_u32()?,
             time_ns: r.get_u64()?,
             utf8: r.get_str()?,
+        })
+    }
+}
+
+/// Answer to a [`MeasureText`], carrying its `request` back.
+///
+/// Sent as soon as the request is received, independently of any commit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextMeasured {
+    /// The `request` of the [`MeasureText`] this answers.
+    pub request: u32,
+    /// Width of the longest line, in logical pixels.
+    pub width: f32,
+    /// Total height of all lines, in logical pixels.
+    pub height: f32,
+    /// Ascent of the first line above its baseline.
+    pub ascent: f32,
+    /// Descent of the last line below its baseline.
+    pub descent: f32,
+    /// Number of laid-out lines.
+    pub line_count: u32,
+    /// Cursor positions inside the measured text, in increasing `offset`
+    /// order. Empty when the server reports none.
+    pub cursor_x: Vec<CursorPos>,
+}
+
+/// The fixed part of [`TextMeasured`] — everything but the cursor vector.
+#[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct TextMeasuredFixed {
+    request: <u32 as Plain>::Wire,
+    width: <f32 as Plain>::Wire,
+    height: <f32 as Plain>::Wire,
+    ascent: <f32 as Plain>::Wire,
+    descent: <f32 as Plain>::Wire,
+    line_count: <u32 as Plain>::Wire,
+}
+
+impl Body for TextMeasured {
+    fn encode_body(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.put_struct(&TextMeasuredFixed {
+            request: Plain::to_wire(self.request),
+            width: Plain::to_wire(self.width),
+            height: Plain::to_wire(self.height),
+            ascent: Plain::to_wire(self.ascent),
+            descent: Plain::to_wire(self.descent),
+            line_count: Plain::to_wire(self.line_count),
+        });
+        w.put_vec(&self.cursor_x);
+        Ok(())
+    }
+    fn decode_body(r: &mut Reader<'_>, _fds: &mut FdQueue) -> Result<Self, DecodeError> {
+        let f = r.get_struct::<TextMeasuredFixed>()?;
+        Ok(Self {
+            request: Plain::from_wire(f.request)?,
+            width: Plain::from_wire(f.width)?,
+            height: Plain::from_wire(f.height)?,
+            ascent: Plain::from_wire(f.ascent)?,
+            descent: Plain::from_wire(f.descent)?,
+            line_count: Plain::from_wire(f.line_count)?,
+            cursor_x: r.get_vec()?,
         })
     }
 }
@@ -852,6 +1074,23 @@ fixed_msg! {
         time_ns: u64,
     }
 
+    /// The result of shaping a text node, sent for every node the server
+    /// (re)shaped in a commit. The answer to [`SetText`].
+    TextMetrics {
+        /// The `Text` node that was shaped.
+        node: NodeId,
+        /// Width of the longest line, in logical pixels.
+        width: f32,
+        /// Total height of all lines, in logical pixels.
+        height: f32,
+        /// Ascent of the first line above its baseline.
+        ascent: f32,
+        /// Descent of the last line below its baseline.
+        descent: f32,
+        /// Number of laid-out lines.
+        line_count: u32,
+    }
+
     /// A touch point changed.
     Touch {
         /// The window.
@@ -898,6 +1137,10 @@ msg_enum! {
         Key = 0x8206,
         /// Touch point.
         Touch = 0x8207,
+        /// Metrics of a text node the server just shaped.
+        TextMetrics = 0x8301,
+        /// Answer to a `MeasureText`.
+        TextMeasured = 0x8302,
     }
 }
 

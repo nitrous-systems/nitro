@@ -9,14 +9,15 @@ use nitro_core::{Color, IRect, Point, Rect, Size, Transform};
 use nitro_wire::codec::{FdQueue, Writer};
 use nitro_wire::msg::{
     BufferDamage, ClientMsg, Closed, Commit, Configure, CreateBuffer, CreateNode, CreateWindow,
-    DestroyBuffer, DestroyNode, Error as ErrorMsg, Fill, Focus, Frame, Hello, Key, PointerAxis,
-    PointerButton, PointerEnter, PointerLeave, PointerMotion, Presented, Reparent, RequestFrame,
-    ServerMsg, SetBorder, SetBounds, SetClip, SetCorners, SetFill, SetImage, SetOpacity,
-    SetTransform, SetVisible, SetWindowTitle, Touch, Welcome,
+    DestroyBuffer, DestroyNode, Error as ErrorMsg, Fill, Focus, Frame, Hello, Key, MeasureText,
+    PointerAxis, PointerButton, PointerEnter, PointerLeave, PointerMotion, Presented, Reparent,
+    RequestFrame, ServerMsg, SetBorder, SetBounds, SetClip, SetCorners, SetFill, SetImage,
+    SetOpacity, SetText, SetTransform, SetVisible, SetWindowTitle, TextMeasured, TextMetrics,
+    Touch, Welcome,
 };
 use nitro_wire::types::{
-    AxisSource, BufferId, ButtonState, ErrorCode, Layer, NodeId, NodeKind, TouchPhase, caps,
-    format, window_flags,
+    Align, AxisSource, BufferId, ButtonState, CursorPos, ErrorCode, Layer, NodeId, NodeKind,
+    TouchPhase, caps, format, window_flags,
 };
 use nitro_wire::{DecodeError, VERSION, header};
 
@@ -129,6 +130,54 @@ fn client_messages() -> Vec<ClientMsg> {
             id: NodeId(26),
             width: 2.25,
             color: Color::rgba(9, 8, 7, 6),
+        }
+        .into(),
+        SetText {
+            node: NodeId(33),
+            size_px: 14.5,
+            weight: 700,
+            italic: true,
+            max_width: 320.25,
+            wrap: true,
+            align: Align::Center,
+            color: Color::rgba(0x21, 0x43, 0x65, 0x87),
+            family: "sans".to_owned(),
+            text: "Grüße, wörld \u{1f600}".to_owned(),
+        }
+        .into(),
+        SetText {
+            node: NodeId(34),
+            size_px: 11.0,
+            weight: 400,
+            italic: false,
+            max_width: 0.0,
+            wrap: false,
+            align: Align::Right,
+            color: Color::BLACK,
+            family: String::new(),
+            text: String::new(),
+        }
+        .into(),
+        MeasureText {
+            request: 0x00c0_ffee,
+            size_px: 9.75,
+            weight: 300,
+            italic: true,
+            max_width: 64.5,
+            wrap: false,
+            family: "mono".to_owned(),
+            text: "mesuré ✓".to_owned(),
+        }
+        .into(),
+        MeasureText {
+            request: 1,
+            size_px: 16.0,
+            weight: 400,
+            italic: false,
+            max_width: 0.0,
+            wrap: true,
+            family: String::new(),
+            text: String::new(),
         }
         .into(),
         CreateBuffer {
@@ -267,6 +316,40 @@ fn server_messages() -> Vec<ServerMsg> {
             phase: TouchPhase::Cancel,
             pos: Point::new(5.0, 6.0),
             time_ns: 106,
+        }
+        .into(),
+        TextMetrics {
+            node: NodeId(14),
+            width: 123.5,
+            height: 34.25,
+            ascent: 12.75,
+            descent: -3.5,
+            line_count: 3,
+        }
+        .into(),
+        TextMeasured {
+            request: 0x00c0_ffee,
+            width: 200.5,
+            height: 18.25,
+            ascent: 14.0,
+            descent: 4.25,
+            line_count: 1,
+            cursor_x: vec![
+                CursorPos::new(0, 0.0),
+                CursorPos::new(1, 8.5),
+                CursorPos::new(4, 21.75),
+                CursorPos::new(u32::MAX, -1.5),
+            ],
+        }
+        .into(),
+        TextMeasured {
+            request: 2,
+            width: 0.0,
+            height: 0.0,
+            ascent: 0.0,
+            descent: 0.0,
+            line_count: 0,
+            cursor_x: Vec::new(),
         }
         .into(),
     ]
@@ -512,4 +595,183 @@ fn payload_layouts_are_frozen() {
             b'a', b'b',
         ]
     );
+
+    let mut w = Writer::new();
+    ClientMsg::from(SetText {
+        node: NodeId(0x0102_0304),
+        size_px: 16.0,
+        weight: 700,
+        italic: true,
+        max_width: 320.0,
+        wrap: true,
+        align: Align::Center,
+        color: Color::rgba(0x11, 0x22, 0x33, 0x44),
+        family: "sans".to_owned(),
+        text: "hi".to_owned(),
+    })
+    .encode(&mut w)
+    .unwrap();
+    assert_eq!(w.bytes(), &GOLDEN_SET_TEXT);
+
+    let mut w = Writer::new();
+    ClientMsg::from(MeasureText {
+        request: 0x0a0b_0c0d,
+        size_px: 16.0,
+        weight: 400,
+        italic: false,
+        max_width: 0.0,
+        wrap: true,
+        family: "mono".to_owned(),
+        text: "hi".to_owned(),
+    })
+    .encode(&mut w)
+    .unwrap();
+    assert_eq!(w.bytes(), &GOLDEN_MEASURE_TEXT);
+
+    let mut w = Writer::new();
+    ServerMsg::from(TextMetrics {
+        node: NodeId(0x0102_0304),
+        width: 1.0,
+        height: 2.0,
+        ascent: 3.0,
+        descent: 4.0,
+        line_count: 5,
+    })
+    .encode(&mut w)
+    .unwrap();
+    assert_eq!(w.bytes(), &GOLDEN_TEXT_METRICS);
+
+    let mut w = Writer::new();
+    ServerMsg::from(TextMeasured {
+        request: 0x0a0b_0c0d,
+        width: 1.0,
+        height: 2.0,
+        ascent: 3.0,
+        descent: 4.0,
+        line_count: 5,
+        cursor_x: vec![CursorPos::new(0, 0.0), CursorPos::new(2, 1.0)],
+    })
+    .encode(&mut w)
+    .unwrap();
+    assert_eq!(w.bytes(), &GOLDEN_TEXT_MEASURED);
 }
+
+#[test]
+fn a_bad_align_byte_is_rejected() {
+    // A `SetText` payload whose `align` byte is 3 (Left/Center/Right only).
+    let mut bytes = GOLDEN_SET_TEXT[header::SIZE..].to_vec();
+    bytes[ALIGN_OFFSET] = 3;
+    let mut q = FdQueue::new();
+    assert_eq!(
+        ClientMsg::decode(SetText::OP, &bytes, &mut q),
+        Err(DecodeError::BadValue)
+    );
+}
+
+#[test]
+fn a_bad_bool_byte_is_rejected() {
+    let mut bytes = GOLDEN_SET_TEXT[header::SIZE..].to_vec();
+    bytes[ITALIC_OFFSET] = 2;
+    let mut q = FdQueue::new();
+    assert_eq!(
+        ClientMsg::decode(SetText::OP, &bytes, &mut q),
+        Err(DecodeError::BadValue)
+    );
+
+    let mut bytes = GOLDEN_SET_TEXT[header::SIZE..].to_vec();
+    bytes[WRAP_OFFSET] = 0xff;
+    let mut q = FdQueue::new();
+    assert_eq!(
+        ClientMsg::decode(SetText::OP, &bytes, &mut q),
+        Err(DecodeError::BadValue)
+    );
+}
+
+#[test]
+fn a_hostile_cursor_count_is_truncated_not_allocated() {
+    // `TextMeasured` head (24 bytes) then a count of 2^32-1 cursors with
+    // no items behind it: `Reader::get_vec` validates the count against
+    // the bytes actually available *before* reserving anything.
+    let mut bytes = GOLDEN_TEXT_MEASURED[header::SIZE..GOLDEN_TEXT_MEASURED.len() - 16].to_vec();
+    assert_eq!(bytes.len(), 28, "24-byte head plus the u32 count");
+    bytes[24..28].copy_from_slice(&u32::MAX.to_le_bytes());
+    let mut q = FdQueue::new();
+    assert_eq!(
+        ServerMsg::decode(TextMeasured::OP, &bytes, &mut q),
+        Err(DecodeError::Truncated)
+    );
+
+    // One item short of the declared count is truncated too.
+    let mut bytes = GOLDEN_TEXT_MEASURED[header::SIZE..].to_vec();
+    bytes[24..28].copy_from_slice(&3u32.to_le_bytes());
+    let mut q = FdQueue::new();
+    assert_eq!(
+        ServerMsg::decode(TextMeasured::OP, &bytes, &mut q),
+        Err(DecodeError::Truncated)
+    );
+}
+
+/// Offset of `SetText::italic` inside its payload: after `node` + `size_px`
+/// + `weight`.
+const ITALIC_OFFSET: usize = 4 + 4 + 2;
+/// Offset of `SetText::wrap`: after `italic` + `max_width`.
+const WRAP_OFFSET: usize = ITALIC_OFFSET + 1 + 4;
+/// Offset of `SetText::align`: right after `wrap`.
+const ALIGN_OFFSET: usize = WRAP_OFFSET + 1;
+
+/// Golden frame for a fixed [`SetText`]; see `payload_layouts_are_frozen`.
+const GOLDEN_SET_TEXT: [u8; 8 + 21 + 8 + 6] = [
+    // header: len=35, op=0x0206, fds=0, flags=0
+    0x23, 0x00, 0x00, 0x00, 0x06, 0x02, 0x00, 0x00, //
+    0x04, 0x03, 0x02, 0x01, // node
+    0x00, 0x00, 0x80, 0x41, // size_px 16.0
+    0xbc, 0x02, // weight 700
+    0x01, // italic
+    0x00, 0x00, 0xa0, 0x43, // max_width 320.0
+    0x01, // wrap
+    0x01, // align Center
+    0x11, 0x22, 0x33, 0x44, // color
+    0x04, 0x00, 0x00, 0x00, b's', b'a', b'n', b's', // family
+    0x02, 0x00, 0x00, 0x00, b'h', b'i', // text
+];
+
+/// Golden frame for a fixed [`MeasureText`].
+const GOLDEN_MEASURE_TEXT: [u8; 8 + 16 + 8 + 6] = [
+    // header: len=30, op=0x0207, fds=0, flags=0
+    0x1e, 0x00, 0x00, 0x00, 0x07, 0x02, 0x00, 0x00, //
+    0x0d, 0x0c, 0x0b, 0x0a, // request
+    0x00, 0x00, 0x80, 0x41, // size_px 16.0
+    0x90, 0x01, // weight 400
+    0x00, // italic
+    0x00, 0x00, 0x00, 0x00, // max_width 0.0
+    0x01, // wrap
+    0x04, 0x00, 0x00, 0x00, b'm', b'o', b'n', b'o', // family
+    0x02, 0x00, 0x00, 0x00, b'h', b'i', // text
+];
+
+/// Golden frame for a fixed [`TextMetrics`].
+const GOLDEN_TEXT_METRICS: [u8; 8 + 24] = [
+    // header: len=24, op=0x8301, fds=0, flags=0
+    0x18, 0x00, 0x00, 0x00, 0x01, 0x83, 0x00, 0x00, //
+    0x04, 0x03, 0x02, 0x01, // node
+    0x00, 0x00, 0x80, 0x3f, // width 1.0
+    0x00, 0x00, 0x00, 0x40, // height 2.0
+    0x00, 0x00, 0x40, 0x40, // ascent 3.0
+    0x00, 0x00, 0x80, 0x40, // descent 4.0
+    0x05, 0x00, 0x00, 0x00, // line_count 5
+];
+
+/// Golden frame for a fixed [`TextMeasured`] with two cursor positions.
+const GOLDEN_TEXT_MEASURED: [u8; 8 + 24 + 4 + 16] = [
+    // header: len=44, op=0x8302, fds=0, flags=0
+    0x2c, 0x00, 0x00, 0x00, 0x02, 0x83, 0x00, 0x00, //
+    0x0d, 0x0c, 0x0b, 0x0a, // request
+    0x00, 0x00, 0x80, 0x3f, // width 1.0
+    0x00, 0x00, 0x00, 0x40, // height 2.0
+    0x00, 0x00, 0x40, 0x40, // ascent 3.0
+    0x00, 0x00, 0x80, 0x40, // descent 4.0
+    0x05, 0x00, 0x00, 0x00, // line_count 5
+    0x02, 0x00, 0x00, 0x00, // cursor_x count
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // {0, 0.0}
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x3f, // {2, 1.0}
+];

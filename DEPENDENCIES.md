@@ -16,17 +16,54 @@ number we watch.
 | `libseat` (+ `libseat-sys`) | seat | Bindings to the C libseat: one interface over logind / seatd / raw VT for DRM master + input fds without root. The single deliberate C dependency. | + `errno`, `libc`, `log`. `default-features = false`: the `custom_logger` feature builds a C shim (`cc`) to route libseat's log lines through `log`; we do not log. |
 | `input` (+ `input-sys`) | server | Bindings to libinput, which is the only sane way to read evdev: tap detection, pointer acceleration, scroll-source classification and touchpad state are thousands of lines of hard-won device quirks we are not going to re-derive. `default-features = false, features = ["libinput_1_21"]` — the `udev` feature is **off**, so `libudev` never enters the tree: the server finds devices by reading `/dev/input` and opens them through `nitro-seat`. | + `libc` (already there via `libseat`). The FFI `unsafe` lives in the dependency; `LibinputInterface` is a safe trait we implement. Input-device hotplug is M3: it needs the netlink uevent socket `nitro-kms` already has, plus a directory diff. |
 | `xkbcommon` | server | Keycode → keysym → UTF-8 with the user's own layout, dead keys, levels and modifier semantics. The alternative is shipping a keymap format and a compose engine, which is a project, not a dependency. It reads `XKB_DEFAULT_*`, so it honours whatever the user already configured. | + `xkeysym`, `memmap2`. The FFI `unsafe` (and the `mmap` of the keymap file) lives **inside the `xkbcommon` crate**, not in ours; our tree stays `unsafe`-free. |
+| `swash` | text | OpenType shaping, scaling and hinted glyph rasterization in one pure-Rust crate. Text is the one part of a display server nobody should write twice: the shaper alone is the OpenType GSUB/GPOS state machines, script itemization and mark attachment. Clients never see any of it — the server shapes, so the wire carries strings. | **+7 net crates** (`swash`, `skrifa`, `read-fonts`, `font-types`, `yazi`, `zeno`, `once_cell`); the other five of its seventeen (`bytemuck`, `syn`, `proc-macro2`, `quote`, `unicode-ident`) are already in our tree. **The one place untrusted bytes are parsed by a dependency** — see below. |
 
-Crate count: `cargo tree -e normal --prefix none | sort -u | wc -l` = **48**.
+### Why `swash` and not the alternatives
+
+`parley` is the obvious candidate and was measured first: it costs roughly
+thirty crates (fontique, peniko, kurbo, the unicode tables, …) against
+seven, and what it buys over its own shaper is bidi, font fallback and
+rich text — none of which M2 needs. **Its shaper *is* swash**, so parley
+remains a layer we can add on top later without re-deciding anything: the
+door stays open, we just have not paid for it yet.
+
+`rustybuzz` + `ab_glyph_rasterizer` lands at a similar crate count and
+gives up hinting and colour bitmaps to get there, which is the wrong trade
+for 13-px UI text on a 96-dpi panel.
+
+Font *discovery* is ours, not fontconfig's: `nitro-text` scans
+`NITRO_FONT_DIRS` (three sensible defaults) and reads family, weight and
+style straight out of each face with swash's own `FontRef`. Fontconfig
+would be a C dependency, a config language and a cache format to solve a
+`read_dir` and three alias tables.
+
+### The untrusted-bytes note
+
+Font files are the one input where a dependency parses bytes we did not
+produce. Everything else in the tree that touches hostile input — the
+wire decoder, client buffers — is code we wrote and bounded ourselves;
+here the parsing lives in `read-fonts`/`skrifa` and the rasterization in
+`zeno`. Two things limit the exposure. The files come from the system
+font directories, so reading a hostile one already implies an attacker who
+can write to `/usr/share/fonts` — and a client cannot make the server open
+a file at all: it names a *family*, and an unknown family falls back to a
+face already in the index. And swash is pure safe Rust, so a malformed
+table is a panic or a wrong glyph, not memory corruption. Revisit if the
+server ever accepts a font over the wire, which it should not.
+
+Crate count: `cargo tree -e normal --prefix none | sort -u | wc -l` = **58**.
 `input` and `xkbcommon` cost five of those between them (themselves plus
-`input-sys`, `xkeysym`, `memmap2`); the rest of the rise since M0 is the
-server now depending on every other nitro crate.
+`input-sys`, `xkeysym`, `memmap2`); `swash` costs seven more (M2 text);
+the rest of the rise since M0 is the server now depending on every other
+nitro crate.
 
-Planned (M2+): `parley` + `skrifa` (text shaping and layout).
+Planned (M3+): nothing currently. `parley` sits behind swash as the
+upgrade path if bidi, font fallback or rich text ever become requirements.
 Rejected: `serde` (hand-written wire), `png` (own stored-deflate encoder in
 `nitro-shot`), `tokio`/`async-*` (single-threaded epoll loop), `winit`,
 `wgpu`, `smithay`, `libudev` (a `read_dir` and a netlink socket do what we
-need of it).
+need of it), `fontconfig` (a `read_dir` and three alias tables do what we
+need of it), `parley` and `rustybuzz` (see above).
 
 ## `rustix` features by crate
 

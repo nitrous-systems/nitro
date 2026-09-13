@@ -37,7 +37,7 @@
 use std::time::{Duration, Instant};
 
 use nitro_core::{Color, IRect, Point, Rect};
-use nitro_raster::{Canvas, Fill, Image, PixelFormat};
+use nitro_raster::{Canvas, Fill, Image, Mask, PixelFormat};
 
 const WIDTH: u32 = 1920;
 const HEIGHT: u32 = 1080;
@@ -208,6 +208,64 @@ fn scene_blits(c: &mut Canvas<'_>, img: &Image<'_>) {
     }
 }
 
+const GLYPH_W: u32 = 8;
+const GLYPH_H: u32 = 12;
+const GLYPHS_PER_RUN: i32 = 50;
+const GLYPH_RUNS: u32 = 40;
+const TEXT_COLOR: Color = Color::rgb(0xE0, 0xE4, 0xEC);
+
+/// One 8×12 A8 glyph-ish mask: a rounded blob with anti-aliased edges, so the
+/// coverage bytes are a realistic mix of 0, 255 and partials. Built once,
+/// outside the timed loop.
+fn make_glyph_mask() -> Vec<u8> {
+    let mut out = vec![0u8; (GLYPH_W * GLYPH_H) as usize];
+    for y in 0..GLYPH_H {
+        for x in 0..GLYPH_W {
+            // Distance from a vertical bar plus a bowl: enough structure to
+            // give interior 255s, edge partials and exterior 0s.
+            let fx = x as f32 + 0.5;
+            let fy = y as f32 + 0.5;
+            let bar = (fx - 2.0).abs();
+            let bowl = ((fx - 4.5).powi(2) + (fy - 6.0).powi(2)).sqrt() - 3.0;
+            let d = bar.min(bowl.abs());
+            let cov = (1.5 - d).clamp(0.0, 1.0);
+            out[(y * GLYPH_W + x) as usize] = (cov * 255.0 + 0.5) as u8;
+        }
+    }
+    out
+}
+
+/// The positions of one run of glyphs, advancing like a line of text.
+fn glyph_run_positions(run: u32) -> Vec<(i32, i32)> {
+    let y = 20 + (run.cast_signed() % 20) * 24;
+    (0..GLYPHS_PER_RUN).map(|i| (30 + i * 9, y)).collect()
+}
+
+/// (f) 40 runs × 50 glyphs, one [`Canvas::blit_mask`] call per glyph.
+fn scene_glyphs_loop(c: &mut Canvas<'_>, mask: &Mask<'_>) {
+    let clip = full_clip();
+    for run in 0..GLYPH_RUNS {
+        for (x, y) in glyph_run_positions(run) {
+            c.blit_mask(&clip, x, y, mask, TEXT_COLOR, 1.0);
+        }
+    }
+}
+
+/// (g) the identical work as (f), one [`Canvas::blit_masks`] call per run.
+fn scene_glyphs_batch(c: &mut Canvas<'_>, mask: &Mask<'_>) {
+    let clip = full_clip();
+    let mut entries: Vec<(i32, i32, Mask<'_>)> = Vec::with_capacity(GLYPHS_PER_RUN as usize);
+    for run in 0..GLYPH_RUNS {
+        entries.clear();
+        entries.extend(
+            glyph_run_positions(run)
+                .into_iter()
+                .map(|(x, y)| (x, y, *mask)),
+        );
+        c.blit_masks(&clip, TEXT_COLOR, 1.0, &entries);
+    }
+}
+
 const DAMAGE_COUNT: usize = 20;
 const DAMAGE_W: f32 = 200.0;
 const DAMAGE_H: f32 = 150.0;
@@ -312,7 +370,7 @@ struct SceneSpec {
     default_iters: u32,
 }
 
-const SCENES: [SceneSpec; 5] = [
+const SCENES: [SceneSpec; 7] = [
     SceneSpec {
         letter: 'a',
         name: "solid_fill",
@@ -337,6 +395,16 @@ const SCENES: [SceneSpec; 5] = [
         letter: 'e',
         name: "ui_frame",
         default_iters: 100,
+    },
+    SceneSpec {
+        letter: 'f',
+        name: "glyphs_loop",
+        default_iters: 2000,
+    },
+    SceneSpec {
+        letter: 'g',
+        name: "glyphs_batch",
+        default_iters: 2000,
     },
 ];
 
@@ -381,6 +449,13 @@ fn main() {
         format: PixelFormat::Argb8888,
     };
     let damage = damage_rects();
+    let glyph = make_glyph_mask();
+    let glyph_mask = Mask {
+        data: &glyph,
+        w: GLYPH_W,
+        h: GLYPH_H,
+        stride: GLYPH_W,
+    };
 
     for spec in &SCENES {
         let iters = iters_override.unwrap_or(spec.default_iters).max(1);
@@ -394,7 +469,9 @@ fn main() {
                     'b' => scene_rrects_alpha(&mut c),
                     'c' => scene_gradient(&mut c),
                     'd' => scene_blits(&mut c, &img),
-                    _ => scene_ui_frame(&mut c, &damage),
+                    'e' => scene_ui_frame(&mut c, &damage),
+                    'f' => scene_glyphs_loop(&mut c, &glyph_mask),
+                    _ => scene_glyphs_batch(&mut c, &glyph_mask),
                 }
             }
             let dt = t0.elapsed();

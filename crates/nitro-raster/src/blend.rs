@@ -47,8 +47,19 @@ pub(crate) const fn over_premul(src_premul: u32, dst: u32, alpha: u32) -> u8 {
 /// single 0..=255 alpha the blend uses: `round(a * cov * opacity / 255^2)`.
 #[inline]
 pub(crate) fn effective_alpha(a: u8, cov: u8, opacity: u8) -> u8 {
-    let v = u32::from(a) * u32::from(cov) * u32::from(opacity);
-    ((v + 32_512) / 65_025) as u8
+    effective_alpha_cov(u32::from(a) * u32::from(opacity), cov)
+}
+
+/// [`effective_alpha`] with the source alpha and the opacity already
+/// multiplied together: `round(ca * cov / 255^2)` with `ca = a * opacity`.
+///
+/// A mask blit knows `ca` before the loop starts, so the per-pixel cost is
+/// one multiply and one division by a constant. The result is bit-identical
+/// to `effective_alpha(a, cov, opacity)` — it is the same expression with
+/// the same single rounding step.
+#[inline]
+pub(crate) fn effective_alpha_cov(ca: u32, cov: u8) -> u8 {
+    ((ca * u32::from(cov) + 32_512) / 65_025) as u8
 }
 
 /// Quantise a value in `[0, 1]` (coverage or opacity) to `0..=255`.
@@ -59,7 +70,9 @@ pub(crate) fn unit_u8(v: f32) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{div255, effective_alpha, over_premul, over_straight, unit_u8};
+    use super::{
+        div255, effective_alpha, effective_alpha_cov, over_premul, over_straight, unit_u8,
+    };
 
     #[test]
     fn div255_is_exact_rounding() {
@@ -112,5 +125,21 @@ mod tests {
         assert_eq!(unit_u8(0.5), 128);
         assert_eq!(unit_u8(-3.0), 0);
         assert_eq!(unit_u8(3.0), 255);
+    }
+
+    #[test]
+    fn hoisted_alpha_matches_effective_alpha() {
+        for a in [0u8, 1, 7, 128, 254, 255] {
+            for opacity in [0u8, 1, 33, 128, 255] {
+                let ca = u32::from(a) * u32::from(opacity);
+                for cov in 0..=255u8 {
+                    assert_eq!(
+                        effective_alpha_cov(ca, cov),
+                        effective_alpha(a, cov, opacity),
+                        "a={a} cov={cov} opacity={opacity}"
+                    );
+                }
+            }
+        }
     }
 }

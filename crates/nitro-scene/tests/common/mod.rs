@@ -8,7 +8,8 @@
 
 use nitro_core::{Color, Damage, IRect, Point, Rect, Size};
 use nitro_scene::{
-    ClientId, DamageSink, Fill, Layer, NodeKey, NodeKind, OutputId, Scene, UpdateStats, WindowKey,
+    ClientId, DamageSink, Fill, Layer, NodeKey, NodeKind, OutputId, Scene, TextAlign, TextRef,
+    UpdateStats, WindowKey,
 };
 
 pub const OUT: OutputId = OutputId(0);
@@ -80,4 +81,34 @@ pub fn update(scene: &mut Scene) -> (Damage, UpdateStats) {
     let mut d = Damage::new();
     let result = scene.update(&mut DamageSink::new(&mut [(OUT, &mut d)]));
     (d, result.stats)
+}
+
+/// A text node child of `parent`: `bounds` is the box, `block` the measured
+/// size of the shaped run the (fake) store holds under `key`.
+pub fn text(
+    scene: &mut Scene,
+    parent: NodeKey,
+    bounds: Rect,
+    key: u32,
+    block: Size,
+    align: TextAlign,
+) -> NodeKey {
+    let node = scene
+        .create_node(CLIENT, NodeKind::Text, parent, None)
+        .unwrap();
+    scene.set_bounds(CLIENT, node, bounds).unwrap();
+    scene
+        .set_text(
+            CLIENT,
+            node,
+            Some(TextRef {
+                key,
+                size: block,
+                ascent: block.h * 0.8,
+                color: Color::WHITE,
+                align,
+            }),
+        )
+        .unwrap();
+    node
 }

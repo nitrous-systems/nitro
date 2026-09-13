@@ -40,6 +40,7 @@ use nitro_wire::types::format;
 
 use crate::cursor::Cursor;
 use crate::render::paint_background;
+use crate::text::TextEngine;
 
 /// How long before the next vblank a client should have committed, so the
 /// server still has a whole rasterization pass left. Two milliseconds is
@@ -269,6 +270,7 @@ pub struct CursorState {
 pub fn paint_region(
     buf: &mut BufferMut<'_>,
     scene: &Scene,
+    text: &mut TextEngine,
     output: OutputId,
     region: &[IRect],
     cursor: (&Cursor, CursorState),
@@ -300,7 +302,7 @@ pub fn paint_region(
             paint_background(&mut canvas, &clip, width, height);
         }
         for item in &items[first..] {
-            paint_item(&mut canvas, &clip, item, scene);
+            paint_item(&mut canvas, &clip, item, scene, text);
         }
         if cursor_state.visible {
             cursor_image.paint(&mut canvas, &clip, cursor_state.x, cursor_state.y);
@@ -325,7 +327,13 @@ fn duration_us(d: Duration) -> u64 {
 }
 
 /// Draw one paint item, already clipped by the caller to a damage rect.
-fn paint_item(canvas: &mut Canvas<'_>, clip: &IRect, item: &PaintItem, scene: &Scene) {
+fn paint_item(
+    canvas: &mut Canvas<'_>,
+    clip: &IRect,
+    item: &PaintItem,
+    scene: &Scene,
+    text: &mut TextEngine,
+) {
     let clip = clip.intersect(&item.clip);
     if clip.is_empty() {
         return;
@@ -376,6 +384,20 @@ fn paint_item(canvas: &mut Canvas<'_>, clip: &IRect, item: &PaintItem, scene: &S
                 .transform
                 .apply_rect(&Rect::new(0.0, 0.0, size.0, size.1));
             canvas.blit(&clip, &device, &image, &src, item.opacity);
+        }
+        PaintKind::Text { key, origin, color } => {
+            // The glyphs themselves live in the text engine's atlas; the
+            // scene knows only the handle, the already-aligned origin and
+            // the colour. Everything about fonts stops here.
+            text.paint(
+                canvas,
+                &clip,
+                &item.transform,
+                key,
+                origin,
+                color,
+                item.opacity,
+            );
         }
     }
 }

@@ -6,7 +6,7 @@ use nitro_core::{IRect, Point, Rect, Size, Transform};
 
 use crate::{
     Border, Buffer, BufferDesc, BufferKey, ClientId, Configure, Error, Fill, ImageRef, Layer, Node,
-    NodeKey, NodeKind, OutputId, Window, WindowKey,
+    NodeKey, NodeKind, OutputId, TextRef, Window, WindowKey,
     key::Arena,
     node::{ALL_DIRTY, Dirty, NodeData},
     window::Output,
@@ -762,6 +762,36 @@ impl Scene {
             return Ok(());
         }
         data.border = border;
+        self.mark(key, Dirty::PAINT);
+        Ok(())
+    }
+
+    /// Point a text node at a shaped run, or clear it with `None`.
+    ///
+    /// The scene does not shape anything: `text.key` is an opaque handle into
+    /// the caller's store and `text.size` the extent that store measured. Both
+    /// the handle and the measured size are part of the node's appearance, so
+    /// a re-shape that changes either is a repaint — and, because the measured
+    /// size decides where an aligned block lands inside the bounds, changing
+    /// it moves pixels even when the bounds did not change.
+    ///
+    /// # Errors
+    /// [`Error::StaleKey`], [`Error::NotOwner`], [`Error::WrongKind`] on
+    /// anything but a text node.
+    pub fn set_text(
+        &mut self,
+        client: ClientId,
+        key: NodeKey,
+        text: Option<TextRef>,
+    ) -> Result<(), Error> {
+        let node = self.check_mut(client, key)?;
+        let NodeData::Text(slot) = &mut node.data else {
+            return Err(Error::WrongKind);
+        };
+        if *slot == text {
+            return Ok(());
+        }
+        *slot = text;
         self.mark(key, Dirty::PAINT);
         Ok(())
     }

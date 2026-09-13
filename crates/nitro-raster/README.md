@@ -87,6 +87,72 @@ and never double-blends where the two edges meet — a translucent border is
 exactly one blend per pixel, asserted in
 `stroke_does_not_double_blend_translucently`.
 
+### Drawing operations
+
+| call | what it paints |
+|---|---|
+| `fill_irect` | an integer rect in one colour; opaque colours are stored, not blended |
+| `fill_rect` | a rounded rect, anti-aliased, `Fill::Solid` or `Fill::Linear` |
+| `stroke_rect_inside` | a rounded-rect border lying entirely inside the rect |
+| `blit` | an `Image` (XRGB8888 or straight-alpha ARGB8888), 1:1 or bilinear-scaled |
+| `blit_mask` | an A8 coverage `Mask` tinted with one colour, source-over |
+| `blit_masks` | a batch of masks sharing a colour and an opacity |
+| `blend_pixel_at` | one pixel; for tests and debug markers |
+
+### Glyph masks
+
+Text is drawn as **A8 coverage masks tinted with one colour** — shaping, glyph
+rasterization and the atlas live outside this crate, which keeps the font
+dependency out of it.
+
+```rust
+use nitro_core::{Color, IRect};
+use nitro_raster::{Canvas, Mask};
+
+let mut buf = vec![0u8; 256 * 64 * 4];
+let mut canvas = Canvas::new(&mut buf, 256, 64, 256 * 4);
+let damage = IRect::new(0, 0, 256, 64);
+
+// A glyph somewhere inside a bigger atlas page: `stride` is the page's
+// pitch, so the sub-rectangle is blitted without a copy.
+let page = vec![0u8; 512 * 128];
+let glyph = Mask {
+    data: &page[(7 * 512 + 3)..], // top-left of the glyph in the page
+    w: 8,
+    h: 12,
+    stride: 512,
+};
+
+canvas.blit_mask(&damage, 40, 20, &glyph, Color::rgb(0xE0, 0xE4, 0xEC), 1.0);
+
+// A whole run of glyphs sharing a colour:
+let run = [(40, 20, glyph), (49, 20, glyph), (58, 20, glyph)];
+canvas.blit_masks(&damage, Color::rgb(0xE0, 0xE4, 0xEC), 1.0, &run);
+```
+
+`(x, y)` is the device pixel the mask's top-left corner lands on — the caller
+has already applied the glyph's placement offsets. There is **no scaling and
+no filtering**: a glyph mask is rasterized at its final size by the atlas.
+Coverage combines with the tint's alpha and the opacity through the same
+`a = round(color.a * coverage * opacity / 255²)` as every other call, so the
+blend is the crate's one blend; `mask_blend_matches_float_reference` checks
+it against the float reference on random coverage/colour/opacity.
+
+An empty or invalid mask (`!Mask::is_valid()` — zero extent, `stride < w`, or
+`data` shorter than `stride * h`), a transparent colour, `opacity <= 0` and an
+empty clip are all no-ops. Coverage 0 skips the pixel; with an opaque colour
+at opacity 1, coverage 255 *stores* instead of blending.
+
+`blit_masks` is exactly `blit_mask` in a loop (asserted byte-identical in
+`mask_batch_equals_a_loop_of_single_blits`) with the per-call setup — the
+clip∩surface intersection, the effective source alpha, the opaque-path
+decision — hoisted out. It is a **small** win, and honestly so: on a tight
+micro-benchmark of 50 8×12 glyphs it saves ~3 % (2.44 → 2.36 µs per run,
+`mask_batch_and_loop_timing`), and on the full-screen bench scenes (f) vs (g)
+it is inside the noise (0.235 vs 0.234 ms). The per-call setup is a handful
+of integer ops; the batch exists because a run of glyphs is the natural call
+shape for the text painter, not because it unlocks a faster inner loop.
+
 ### Colour space
 
 sRGB **bytes are blended as-is, with no linearization**. This is a
@@ -119,8 +185,9 @@ SSE4.2-only test box.
 - **No gamma-correct blending** (see above).
 - **Linear gradients are axis-aligned.** A gradient whose axis is diagonal
   is projected onto its dominant component. The scene never asks for one.
-- **No text.** Glyph blitting from the server-side atlas arrives with the
-  text work and will reuse the blit coverage path.
+- **No text layout, shaping or font handling.** Glyphs arrive as A8 coverage
+  masks from a server-side atlas and are drawn with `blit_mask` /
+  `blit_masks`; everything upstream of the mask lives in another crate.
 - No radial/sweep gradients, no blur, no blend modes other than source-over.
 
 ## Benchmark
@@ -145,6 +212,12 @@ buffer and the source image are allocated outside it.
 | **c** `gradient` | full-screen vertical linear gradient, opaque |
 | **d** `blits` | background + 200 blits of a 64×64 straight-alpha ARGB image scaled 1.5× (bilinear) |
 | **e** `ui_frame` | 20 damage rects of 200×150; per rect, 20 windows × (rounded-rect background + 30 alpha rrects + 10 stroked borders), bbox-culled |
+| **f** `glyphs_loop` | 40 runs × 50 8×12 A8 glyph masks, one `blit_mask` per glyph |
+| **g** `glyphs_batch` | identical work to (f), one `blit_masks` per 50-glyph run |
+
+Scenes (f) and (g) are new with the mask work and are not part of the
+vello comparison below (which predates them); on this dev box both run at
+**0.235 ms / 0.234 ms** for 2000 glyphs per frame.
 
 ### Results
 
@@ -296,3 +369,8 @@ follow-up.
   copied per row and got bigger.
 - Splitting the blit row into edge/interior runs: slower, the extra branching
   costs more than the coverage calls it skips.
+- **Run-detection in the opaque mask path** (scan `cov` for maximal runs of
+  255 and `store_solid` each one, instead of a per-pixel store): **35 % slower**
+  on bench scene (f) — 0.312 vs 0.231 ms. A glyph is a few pixels wide with
+  anti-aliased edges, so the runs are 1–3 px long and the scan costs more than
+  the wide store saves. The per-pixel store stayed.

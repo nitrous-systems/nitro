@@ -12,7 +12,8 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use crate::error::DecodeError;
 use crate::types::{
-    AxisSource, BufferId, ButtonState, ErrorCode, Layer, NodeId, NodeKind, TouchPhase,
+    Align, AxisSource, BufferId, ButtonState, CursorPos, ErrorCode, Layer, NodeId, NodeKind,
+    TouchPhase,
 };
 
 /// A type with a fixed-size, little-endian wire representation.
@@ -98,6 +99,7 @@ macro_rules! plain_tag {
     };
 }
 
+plain_tag!(Align, u8, u8);
 plain_tag!(Layer, u8, u8);
 plain_tag!(NodeKind, u8, u8);
 plain_tag!(ButtonState, u8, u8);
@@ -183,6 +185,16 @@ pub struct WireColor {
     pub b: u8,
     /// Alpha.
     pub a: u8,
+}
+
+/// Wire twin of [`CursorPos`]: a `u32` byte offset then an `f32` x.
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+pub struct WireCursorPos {
+    /// Byte offset into the measured string.
+    pub offset: U32,
+    /// Horizontal position in logical pixels.
+    pub x: F32,
 }
 
 /// Wire twin of [`Transform`]: `a, b, c, d, e, f` as `f32`.
@@ -274,6 +286,19 @@ impl Plain for Color {
     }
 }
 
+impl Plain for CursorPos {
+    type Wire = WireCursorPos;
+    fn to_wire(self) -> WireCursorPos {
+        WireCursorPos {
+            offset: U32::new(self.offset),
+            x: F32::new(self.x),
+        }
+    }
+    fn from_wire(w: WireCursorPos) -> Result<Self, DecodeError> {
+        Ok(Self::new(w.offset.get(), w.x.get()))
+    }
+}
+
 impl Plain for Transform {
     type Wire = WireTransform;
     fn to_wire(self) -> WireTransform {
@@ -310,6 +335,7 @@ mod tests {
         assert_eq!(size_of::<WireIRect>(), 16);
         assert_eq!(size_of::<WireColor>(), 4);
         assert_eq!(size_of::<WireTransform>(), 24);
+        assert_eq!(size_of::<WireCursorPos>(), 8);
     }
 
     #[test]
@@ -330,5 +356,13 @@ mod tests {
         assert_eq!(<bool as Plain>::from_wire(0), Ok(false));
         assert_eq!(<bool as Plain>::from_wire(1), Ok(true));
         assert_eq!(<bool as Plain>::from_wire(2), Err(DecodeError::BadValue));
+    }
+
+    #[test]
+    fn align_tags_round_trip() {
+        for a in [Align::Left, Align::Center, Align::Right] {
+            assert_eq!(<Align as Plain>::from_wire(Plain::to_wire(a)), Ok(a));
+        }
+        assert_eq!(<Align as Plain>::from_wire(3), Err(DecodeError::BadValue));
     }
 }

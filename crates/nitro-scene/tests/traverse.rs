@@ -2,9 +2,11 @@
 
 mod common;
 
-use common::{CLIENT, OUT, group, rect, rect_colored, scene, settle, window, window_at};
+use common::{CLIENT, OUT, group, rect, rect_colored, scene, settle, text, window, window_at};
 use nitro_core::{Color, IRect, Point, Rect, Size, Transform};
-use nitro_scene::{Border, Fill, Layer, NodeKey, PaintItem, PaintKind, Scene};
+use nitro_scene::{
+    Border, Fill, Layer, NodeKey, NodeKind, PaintItem, PaintKind, Scene, TextAlign, TextRef,
+};
 
 fn paint(scene: &Scene, clip: IRect) -> Vec<PaintItem> {
     let mut out = Vec::new();
@@ -597,4 +599,105 @@ fn a_destroyed_window_is_skipped_by_both_traversals() {
     assert_eq!(hit.window, back);
     assert_eq!(hit.node, b);
     assert_eq!(painted_nodes(&s, ALL), vec![b]);
+}
+
+#[test]
+fn a_text_node_paints_its_run_with_the_alignment_applied() {
+    let mut s = scene();
+    let (_, root) = window(&mut s);
+    // A 200-wide box holding a 60-wide block, once per alignment.
+    let block = Size::new(60.0, 16.0);
+    let left = text(
+        &mut s,
+        root,
+        Rect::new(10.0, 10.0, 200.0, 16.0),
+        7,
+        block,
+        TextAlign::Left,
+    );
+    let centre = text(
+        &mut s,
+        root,
+        Rect::new(10.0, 40.0, 200.0, 16.0),
+        8,
+        block,
+        TextAlign::Center,
+    );
+    let right = text(
+        &mut s,
+        root,
+        Rect::new(10.0, 70.0, 200.0, 16.0),
+        9,
+        block,
+        TextAlign::Right,
+    );
+    settle(&mut s);
+
+    let items = paint(&s, ALL);
+    assert_eq!(
+        items.iter().map(|i| i.node).collect::<Vec<_>>(),
+        vec![left, centre, right]
+    );
+    let origins: Vec<(u32, f32)> = items
+        .iter()
+        .map(|i| match i.kind {
+            PaintKind::Text { key, origin, color } => {
+                assert_eq!(color, Color::WHITE);
+                (key, origin.x)
+            }
+            other => panic!("expected a text item, got {other:?}"),
+        })
+        .collect();
+    // The slack is 200 - 60 = 140.
+    assert_eq!(origins, vec![(7, 0.0), (8, 70.0), (9, 140.0)]);
+    // The item's transform places the node; the origin is local to it.
+    let t = items[0].transform;
+    assert_eq!(
+        (t.e.to_bits(), t.f.to_bits()),
+        (10.0f32.to_bits(), 10.0f32.to_bits())
+    );
+}
+
+#[test]
+fn a_text_node_with_no_run_or_no_colour_paints_nothing() {
+    let mut s = scene();
+    let (_, root) = window(&mut s);
+    let bare = s.create_node(CLIENT, NodeKind::Text, root, None).unwrap();
+    s.set_bounds(CLIENT, bare, Rect::new(0.0, 0.0, 100.0, 20.0))
+        .unwrap();
+    let clear = text(
+        &mut s,
+        root,
+        Rect::new(0.0, 30.0, 100.0, 20.0),
+        1,
+        Size::new(50.0, 16.0),
+        TextAlign::Left,
+    );
+    s.set_text(
+        CLIENT,
+        clear,
+        Some(TextRef {
+            key: 1,
+            size: Size::new(50.0, 16.0),
+            ascent: 12.0,
+            color: Color::TRANSPARENT,
+            align: TextAlign::Left,
+        }),
+    )
+    .unwrap();
+    // An empty block is nothing to draw either.
+    let empty = text(
+        &mut s,
+        root,
+        Rect::new(0.0, 60.0, 100.0, 20.0),
+        2,
+        Size::new(0.0, 0.0),
+        TextAlign::Left,
+    );
+    settle(&mut s);
+
+    assert!(painted_nodes(&s, ALL).is_empty());
+    for key in [bare, clear, empty] {
+        assert!(!s.node(key).unwrap().painted());
+    }
 }

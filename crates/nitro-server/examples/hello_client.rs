@@ -1,5 +1,5 @@
 //! Throwaway demo client for the nitro wire protocol — the M1 hardware
-//! smoke test.
+//! smoke test, grown a text section for M2.
 //!
 //! It opens one 640x400 `Normal`-layer window titled "hello" containing:
 //!
@@ -9,14 +9,25 @@
 //!   be drawn as asked),
 //! * three rounded rects with solid fills and a translucent white border,
 //! * a 64x64 `Image` node showing a checkerboard with a radial alpha blob,
-//!   uploaded as an `AR24` client buffer backed by a memfd.
+//!   uploaded as an `AR24` client buffer backed by a memfd,
+//! * and, when the server reports the `TEXT` capability: a `sans` 16 px
+//!   title, a button-like rounded rect with a centred `sans` 14 px "OK",
+//!   and a `mono` 13 px line. The client sends *strings*, never glyphs —
+//!   shaping, the font and the atlas are all the server's.
+//!
+//! Before it commits the scene it also fires one `MeasureText` for the
+//! button's label and prints the answer, which is the protocol's one
+//! request/response pair: a `TextMeasured` arrives without a commit ever
+//! being sent, and a real toolkit uses exactly that to size a button around
+//! its text.
 //!
 //! After the first commit it sits in a `poll(2)` on the connection fd — 0%
 //! CPU while idle — and prints every `ServerMsg` it receives as one compact
 //! line, flushed, so the hardware test can grep the output for
-//! `Configure`, `Focus`, `Presented`, `PointerEnter`, `PointerMotion` and
-//! `Key`. A `Configure` is answered by resizing the background rect (and
-//! restretching its gradient) and committing again.
+//! `Configure`, `Focus`, `Presented`, `PointerEnter`, `PointerMotion`,
+//! `Key`, `TextMeasured` and `TextMetrics`. A `Configure` is answered by
+//! resizing the background rect (and restretching its gradient) and
+//! committing again.
 //!
 //! There is no signal handling on purpose: SIGINT keeps its default
 //! disposition, so Ctrl-C simply kills the process and the kernel closes
@@ -38,9 +49,9 @@ use std::os::fd::{BorrowedFd, OwnedFd};
 
 use nitro_core::{Color, IRect, Point, Rect, Size};
 use nitro_wire::Error as WireError;
-use nitro_wire::client::Connection;
-use nitro_wire::msg::{CreateBuffer, Fill, ServerMsg};
-use nitro_wire::types::{BufferId, Layer, NodeId, format};
+use nitro_wire::client::{Connection, Transaction};
+use nitro_wire::msg::{CreateBuffer, Fill, MeasureText, ServerMsg, SetText};
+use nitro_wire::types::{Align, BufferId, Layer, NodeId, NodeKind, caps, format};
 use rustix::event::{PollFd, PollFlags};
 use rustix::io::Errno;
 
@@ -52,8 +63,28 @@ const BACKGROUND: NodeId = NodeId(2);
 const CARDS: [NodeId; 3] = [NodeId(3), NodeId(4), NodeId(5)];
 /// Image node sampling the memfd buffer.
 const IMAGE: NodeId = NodeId(6);
+/// Title label across the top.
+const TITLE: NodeId = NodeId(7);
+/// The button-like rect and the label centred in it.
+const BUTTON: NodeId = NodeId(8);
+/// The button's label.
+const BUTTON_LABEL: NodeId = NodeId(9);
+/// A monospaced line, to prove the `mono` alias resolves to a different
+/// face than `sans`.
+const MONO_LINE: NodeId = NodeId(10);
 /// Id of the one client buffer.
 const BUFFER: BufferId = BufferId(1);
+/// Request id of the one `MeasureText` we send.
+const MEASURE_REQUEST: u32 = 0x4f4b;
+
+/// The button's bounds; its label is centred inside them.
+const BUTTON_RECT: Rect = Rect::new(40.0, 300.0, 140.0, 44.0);
+/// Font size of the title.
+const TITLE_PX: f32 = 22.0;
+/// Font size of the button label.
+const LABEL_PX: f32 = 14.0;
+/// Font size of the monospaced line.
+const MONO_PX: f32 = 13.0;
 
 /// Size we ask for; the server answers with a `Configure`.
 const INITIAL: Size = Size::new(640.0, 400.0);
@@ -75,7 +106,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Serials are the client's own counter; the server echoes them back in
     // `Presented`, which is how the test sees a frame reach the screen.
     let mut serial: u32 = 1;
-    build_scene(&mut conn, shared_buffer(&checker_blob())?, serial)?;
+    // One `MeasureText` before anything is committed. The answer comes back
+    // on its own — no commit, no frame — which is the whole point of the
+    // op: this is how a toolkit sizes a button around its label.
+    let text_ok = conn.has_caps(caps::TEXT);
+    if text_ok {
+        conn.measure_text(MeasureText {
+            request: MEASURE_REQUEST,
+            size_px: LABEL_PX,
+            weight: 600,
+            italic: false,
+            max_width: 0.0,
+            wrap: false,
+            family: "sans".to_owned(),
+            text: "OK".to_owned(),
+        })?;
+    } else {
+        emit("no TEXT capability: the server found no fonts, skipping labels")?;
+    }
+    build_scene(&mut conn, shared_buffer(&checker_blob())?, text_ok, serial)?;
     flush_blocking(&mut conn)?;
 
     let mut events = Vec::new();
@@ -121,7 +170,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Build the whole scene in one transaction and commit it.
-fn build_scene(conn: &mut Connection, fd: OwnedFd, serial: u32) -> Result<(), WireError> {
+fn build_scene(
+    conn: &mut Connection,
+    fd: OwnedFd,
+    text: bool,
+    serial: u32,
+) -> Result<(), WireError> {
     let mut tx = conn
         .tx()
         .create_window(WINDOW, "hello", INITIAL, Layer::Normal)
@@ -139,7 +193,8 @@ fn build_scene(conn: &mut Connection, fd: OwnedFd, serial: u32) -> Result<(), Wi
             .corners(node, 18.0)
             .border(node, 2.0, Color::rgba(255, 255, 255, 96));
     }
-    tx.create_image(IMAGE, WINDOW, Rect::new(452.0, 232.0, 128.0, 128.0))
+    tx = tx
+        .create_image(IMAGE, WINDOW, Rect::new(452.0, 232.0, 128.0, 128.0))
         .create_buffer(CreateBuffer {
             id: BUFFER,
             width: IMG_EDGE,
@@ -153,8 +208,66 @@ fn build_scene(conn: &mut Connection, fd: OwnedFd, serial: u32) -> Result<(), Wi
             IMAGE,
             BUFFER,
             IRect::new(0, 0, IMG_EDGE.cast_signed(), IMG_EDGE.cast_signed()),
+        );
+    if text {
+        tx = add_labels(tx);
+    }
+    tx.commit(serial)
+}
+
+/// The three text nodes: a title, a button with a centred label, and a
+/// monospaced line.
+///
+/// Note what the client sends: a family name, a size and a string. No
+/// glyph, no font file, no atlas — that is the whole reason this is a few
+/// hundred bytes on the wire and works the same over SSH.
+fn add_labels(tx: Transaction<'_>) -> Transaction<'_> {
+    tx
+        // Title: left-aligned across the top.
+        .create_node(TITLE, NodeKind::Text, WINDOW)
+        .bounds(TITLE, Rect::new(40.0, 8.0, 560.0, 30.0))
+        .set_text(TITLE, "sans", TITLE_PX, Color::WHITE, "Hello, nitro")
+        // A button-like rect …
+        .create_rect(BUTTON, WINDOW, BUTTON_RECT)
+        .fill_solid(BUTTON, Color::rgb(0x2b, 0x3b, 0x5c))
+        .corners(BUTTON, 8.0)
+        .border(BUTTON, 1.0, Color::rgba(255, 255, 255, 140))
+        // … with its label centred in it. The label's bounds are the
+        // button's, in window coordinates, and `Align::Center` is what puts
+        // the block in the middle — the client never computes a glyph
+        // position, because it does not know the metrics.
+        .create_node(BUTTON_LABEL, NodeKind::Text, WINDOW)
+        .bounds(
+            BUTTON_LABEL,
+            Rect::new(
+                BUTTON_RECT.x,
+                BUTTON_RECT.y + 13.0,
+                BUTTON_RECT.w,
+                LABEL_PX * 1.4,
+            ),
         )
-        .commit(serial)
+        .set_text_full(SetText {
+            node: BUTTON_LABEL,
+            size_px: LABEL_PX,
+            weight: 600,
+            italic: false,
+            max_width: 0.0,
+            wrap: false,
+            align: Align::Center,
+            color: Color::WHITE,
+            family: "sans".to_owned(),
+            text: "OK".to_owned(),
+        })
+        // A monospaced line, so a screenshot shows two different faces.
+        .create_node(MONO_LINE, NodeKind::Text, WINDOW)
+        .bounds(MONO_LINE, Rect::new(200.0, 310.0, 400.0, 20.0))
+        .set_text(
+            MONO_LINE,
+            "mono",
+            MONO_PX,
+            Color::rgb(0x9f, 0xe8, 0xc0),
+            "mono: 0123456789 il1 O0",
+        )
 }
 
 /// Answer a `Configure`: restretch the background over the new size.
@@ -306,6 +419,24 @@ fn describe(msg: &ServerMsg) -> String {
         ),
         ServerMsg::Focus(m) => format!("Focus window={} focused={}", m.window.raw(), m.focused),
         ServerMsg::Closed(m) => format!("Closed window={}", m.window.raw()),
+        ServerMsg::TextMetrics(m) => format!(
+            "TextMetrics node={} size={:.1}x{:.1} ascent={:.1} descent={:.1} lines={}",
+            m.node.raw(),
+            m.width,
+            m.height,
+            m.ascent,
+            m.descent,
+            m.line_count
+        ),
+        ServerMsg::TextMeasured(m) => format!(
+            "TextMeasured request={:#x} size={:.1}x{:.1} ascent={:.1} lines={} cursors={}",
+            m.request,
+            m.width,
+            m.height,
+            m.ascent,
+            m.line_count,
+            m.cursor_x.len()
+        ),
         // Split in two only to keep each function short enough for
         // clippy's `too_many_lines`.
         other => describe_input(other),

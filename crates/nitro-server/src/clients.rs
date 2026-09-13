@@ -34,13 +34,15 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use nitro_core::{IRect, Point, Rect, Size};
 use nitro_scene::{
     Border, BufferDesc, BufferKey, ClientId, Error as SceneError, Fill as SceneFill, ImageRef,
-    NodeKey, NodeKind as SceneNodeKind, Scene, WindowKey,
+    NodeKey, NodeKind as SceneNodeKind, Scene, TextAlign, TextRef, WindowKey,
 };
+use nitro_text::TextKey;
 use nitro_wire::error::Error as WireError;
 use nitro_wire::msg::{self, ClientMsg, ServerMsg};
 use nitro_wire::server::{ClientStream, code_for};
-use nitro_wire::types::{BufferId, ErrorCode, Layer, NodeId, NodeKind, format};
+use nitro_wire::types::{Align, BufferId, ErrorCode, Layer, NodeId, NodeKind, format};
 
+use crate::text::{StyleRequest, TextEngine};
 use crate::{debug, warn};
 
 /// Biggest client buffer the server will copy, in bytes. A 4K ARGB frame
@@ -115,6 +117,11 @@ pub struct WireClient {
     pub frame_requests: Vec<NodeId>,
     /// Commit serials applied but not yet presented.
     pub unpresented: Vec<u32>,
+    /// The shaped run each of this client's text nodes currently holds, so
+    /// a re-`SetText` can release the old one and a destroyed node can
+    /// release its own. The scene stores only the opaque key; this map is
+    /// what turns that key back into something the store can drop.
+    pub texts: HashMap<NodeKey, TextKey>,
 }
 
 impl WireClient {
@@ -132,6 +139,7 @@ impl WireClient {
             window_ids: HashMap::new(),
             frame_requests: Vec::new(),
             unpresented: Vec::new(),
+            texts: HashMap::new(),
         }
     }
 
@@ -175,8 +183,11 @@ impl WireClient {
     }
 
     /// Forget a node and, recursively, its scene descendants — the scene
-    /// destroyed them, so the maps must not keep naming them.
-    fn unbind_subtree(&mut self, scene: &Scene, key: NodeKey) {
+    /// destroyed them, so the maps must not keep naming them. Any shaped
+    /// runs they held go back to the text store in the same walk: the keys
+    /// are unreachable the moment the nodes are, and nothing else would
+    /// ever free them.
+    fn unbind_subtree(&mut self, scene: &Scene, text: &mut TextEngine, key: NodeKey) {
         let mut stack = vec![key];
         while let Some(k) = stack.pop() {
             if let Ok(node) = scene.node(k) {
@@ -185,6 +196,7 @@ impl WireClient {
             if let Some(id) = self.node_ids.remove(&k) {
                 self.nodes.remove(&id);
             }
+            text.release(self.texts.remove(&k));
         }
     }
 }
@@ -251,6 +263,11 @@ pub struct ApplyOutcome {
     /// own; the *fd* is the server's, and nothing else would ever close it
     /// before the client disconnects.
     pub destroyed_buffers: Vec<BufferKey>,
+    /// Text nodes (re)shaped by this transaction, with the metrics the
+    /// client is told in a `TextMetrics`. A client that asked for text gets
+    /// the measured size back at the commit, which is how a toolkit lays a
+    /// label out without a separate `MeasureText` round trip.
+    pub text_metrics: Vec<(NodeId, msg::TextMetrics)>,
 }
 
 /// Apply one client's buffered mutations to the scene, atomically as far as
@@ -264,6 +281,7 @@ pub struct ApplyOutcome {
 pub fn apply(
     client: &mut WireClient,
     scene: &mut Scene,
+    text: &mut TextEngine,
     serial: u32,
 ) -> Result<ApplyOutcome, ApplyError> {
     let mut outcome = ApplyOutcome::default();
@@ -287,7 +305,7 @@ pub fn apply(
                     .map_err(|e| scene_err("CreateBuffer", e))?;
                 client.buffers.insert(id, key);
             }
-            Pending::Msg(msg) => apply_msg(client, scene, *msg, &mut outcome)?,
+            Pending::Msg(msg) => apply_msg(client, scene, text, *msg, &mut outcome)?,
         }
     }
     Ok(outcome)
@@ -324,6 +342,7 @@ fn buffer_key(client: &WireClient, id: BufferId) -> Result<BufferKey, ApplyError
 fn apply_msg(
     client: &mut WireClient,
     scene: &mut Scene,
+    text: &mut TextEngine,
     msg: ClientMsg,
     outcome: &mut ApplyOutcome,
 ) -> Result<(), ApplyError> {
@@ -392,14 +411,14 @@ fn apply_msg(
                 scene
                     .destroy_window(client.id, win)
                     .map_err(|e| scene_err("DestroyNode", e))?;
-                client.unbind_subtree(scene, key);
+                client.unbind_subtree(scene, text, key);
                 client.windows.remove(&m.id);
                 client.window_ids.remove(&win);
                 client.frame_requests.retain(|w| *w != m.id);
                 outcome.closed_windows.push(win);
                 return Ok(());
             }
-            client.unbind_subtree(scene, key);
+            client.unbind_subtree(scene, text, key);
             scene
                 .destroy_node(client.id, key)
                 .map_err(|e| scene_err("DestroyNode", e))
@@ -460,6 +479,51 @@ fn apply_msg(
             scene
                 .set_border(client.id, key, border)
                 .map_err(|e| scene_err("SetBorder", e))
+        }
+        ClientMsg::SetText(m) => {
+            let key = node_key(client, m.node)?;
+            let request = StyleRequest::new(
+                &m.family,
+                m.size_px,
+                m.weight,
+                m.italic,
+                m.max_width,
+                m.wrap,
+            );
+            let (text_key, shaped) = text.shape(client.id.0, &request, &m.text);
+            let reference = TextRef {
+                key: text_key.0,
+                size: Size::new(shaped.width, shaped.height),
+                ascent: shaped.ascent,
+                color: m.color,
+                align: scene_align(m.align),
+            };
+            let metrics = msg::TextMetrics {
+                node: m.node,
+                width: shaped.width,
+                height: shaped.height,
+                ascent: shaped.ascent,
+                descent: shaped.descent,
+                line_count: shaped.lines.len() as u32,
+            };
+            // Attach first: a `WrongKind` here must not leave the freshly
+            // shaped run orphaned in the store.
+            match scene.set_text(client.id, key, Some(reference)) {
+                Ok(()) => {}
+                Err(e) => {
+                    text.release(Some(text_key));
+                    return Err(scene_err("SetText", e));
+                }
+            }
+            // The node's previous run is unreachable now.
+            text.release(client.texts.insert(key, text_key));
+            outcome.text_metrics.push((m.node, metrics));
+            Ok(())
+        }
+        ClientMsg::MeasureText(_) => {
+            // Answered on receipt, never buffered: a measurement a client
+            // has to commit for is a measurement it cannot lay out with.
+            Ok(())
         }
         ClientMsg::CreateBuffer(_) => {
             // Turned into `Pending::Buffer` when it arrived; the fd cannot
@@ -529,22 +593,30 @@ fn sane_rect(rect: Rect) -> Result<Rect, ApplyError> {
     Ok(rect)
 }
 
-/// The scene's node kind for a wire kind. `Text` and `Surface` are
-/// reserved: the server advertises neither capability, so a client asking
-/// for one is using a feature it was told does not exist.
+/// The scene's node kind for a wire kind. `Surface` is reserved: the server
+/// advertises no `DMABUF` capability, so a client asking for one is using a
+/// feature it was told does not exist. `Text` is live from M2 and gated by
+/// the `TEXT` capability bit, which the server only sets when it found a
+/// font to draw with.
 fn scene_kind(kind: NodeKind) -> Result<SceneNodeKind, ApplyError> {
     match kind {
         NodeKind::Group => Ok(SceneNodeKind::Group),
         NodeKind::Rect => Ok(SceneNodeKind::Rect),
         NodeKind::Image => Ok(SceneNodeKind::Image),
-        NodeKind::Text => Err(ApplyError::new(
-            ErrorCode::WrongKind,
-            "Text nodes are M2; the server does not advertise the TEXT capability",
-        )),
+        NodeKind::Text => Ok(SceneNodeKind::Text),
         NodeKind::Surface => Err(ApplyError::new(
             ErrorCode::WrongKind,
             "Surface nodes are M5; the server does not advertise the DMABUF capability",
         )),
+    }
+}
+
+/// The scene's alignment for a wire one.
+fn scene_align(align: Align) -> TextAlign {
+    match align {
+        Align::Left => TextAlign::Left,
+        Align::Center => TextAlign::Center,
+        Align::Right => TextAlign::Right,
     }
 }
 
@@ -832,18 +904,22 @@ mod tests {
     }
 
     #[test]
-    fn reserved_node_kinds_are_refused() {
+    fn text_is_live_and_surface_is_still_reserved() {
         assert_eq!(scene_kind(NodeKind::Group).unwrap(), SceneNodeKind::Group);
         assert_eq!(scene_kind(NodeKind::Rect).unwrap(), SceneNodeKind::Rect);
         assert_eq!(scene_kind(NodeKind::Image).unwrap(), SceneNodeKind::Image);
-        assert_eq!(
-            scene_kind(NodeKind::Text).unwrap_err().code,
-            ErrorCode::WrongKind
-        );
+        assert_eq!(scene_kind(NodeKind::Text).unwrap(), SceneNodeKind::Text);
         assert_eq!(
             scene_kind(NodeKind::Surface).unwrap_err().code,
             ErrorCode::WrongKind
         );
+    }
+
+    #[test]
+    fn alignments_cross_the_boundary_unchanged() {
+        assert_eq!(scene_align(Align::Left), TextAlign::Left);
+        assert_eq!(scene_align(Align::Center), TextAlign::Center);
+        assert_eq!(scene_align(Align::Right), TextAlign::Right);
     }
 
     #[test]

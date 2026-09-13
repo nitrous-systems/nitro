@@ -7,7 +7,7 @@
 
 use nitro_core::{Color, IRect, Point, Rect};
 
-use crate::{BYTES_PER_PIXEL, Canvas, Fill, Image, PixelFormat};
+use crate::{BYTES_PER_PIXEL, Canvas, Fill, Image, Mask, PixelFormat};
 
 const SENTINEL: u32 = 0x00FF_00FF;
 
@@ -1082,4 +1082,349 @@ fn painting_a_damage_rect_grid_covers_the_surface_exactly_once() {
             assert_eq!(s.bgr(x, y), rgb(c), "({x},{y})");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Mask blits
+// ---------------------------------------------------------------------------
+
+/// A `w × h` mask of pseudo-random coverage, laid into a page of `stride`
+/// bytes per row; the padding is filled with a poison value so a stride bug
+/// shows up as a wrong pixel rather than a plausible one.
+fn mask_page(w: u32, h: u32, stride: u32, rng: &mut Rng) -> Vec<u8> {
+    let mut out = vec![0xAAu8; (stride * h) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            out[(y * stride + x) as usize] = rng.byte();
+        }
+    }
+    out
+}
+
+/// A `w × h` mask of one coverage value, tightly packed.
+fn mask_flat(w: u32, h: u32, cov: u8) -> Vec<u8> {
+    vec![cov; (w * h) as usize]
+}
+
+fn mask_of(data: &[u8], w: u32, h: u32, stride: u32) -> Mask<'_> {
+    Mask { data, w, h, stride }
+}
+
+#[test]
+fn mask_blend_matches_float_reference() {
+    let mut rng = Rng::new(0x1234_5678_9ABC_DEF1);
+    let (w, h) = (5u32, 3u32);
+    for _ in 0..400 {
+        let cov = mask_page(w, h, w, &mut rng);
+        let mask = mask_of(&cov, w, h, w);
+        let color = Color::rgba(rng.byte(), rng.byte(), rng.byte(), rng.byte());
+        let op_u8 = rng.byte();
+        let opacity = f32::from(op_u8) / 255.0;
+        // Random destination pixels, one per mask pixel.
+        let mut dst = Vec::with_capacity((w * h) as usize);
+        let mut s = Surface::new(w, h);
+        let clip = s.canvas().bounds();
+        for y in 0..iw(h) {
+            for x in 0..iw(w) {
+                let under = Color::rgb(rng.byte(), rng.byte(), rng.byte());
+                dst.push(under);
+                s.canvas().fill_irect(&clip, &IRect::new(x, y, 1, 1), under);
+            }
+        }
+        s.canvas().blit_mask(&clip, 0, 0, &mask, color, opacity);
+        for y in 0..iw(h) {
+            for x in 0..iw(w) {
+                let frac = f32::from(cov[(y * iw(w) + x) as usize]) / 255.0;
+                // The library quantises opacity to a byte first; do the same.
+                let op = f32::from(super::blend::unit_u8(opacity)) / 255.0;
+                let under = dst[(y * iw(w) + x) as usize];
+                let want = reference_over(color, rgb(under), frac * op);
+                let got = s.bgr(x, y);
+                for (g, wv) in [(got.0, want.0), (got.1, want.1), (got.2, want.2)] {
+                    assert!(
+                        g.abs_diff(wv) <= 1,
+                        "({x},{y}) color {color:?} op {op_u8} cov {frac}: got {got:?} want {want:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn mask_never_writes_outside_clip() {
+    let mut rng = Rng::new(0x0F0F_0F0F_1111_2222);
+    let cov = mask_page(24, 20, 24, &mut rng);
+    let mask = mask_of(&cov, 24, 20, 24);
+    let color = Color::rgba(0x10, 0x20, 0x30, 200);
+    // A clip that is strictly inside the surface, with the mask hanging off
+    // all four of its edges.
+    let mut s = Surface::new(40, 30);
+    let clip = IRect::new(8, 6, 10, 9);
+    for (x, y) in [(0, 0), (-6, -7), (14, 11), (-3, 10), (16, -5)] {
+        s.canvas().blit_mask(&clip, x, y, &mask, color, 1.0);
+    }
+    s.assert_untouched_outside(&clip);
+    assert_ne!(
+        s.px(12, 10),
+        SENTINEL,
+        "nothing was painted inside the clip"
+    );
+
+    // A clip larger than the surface, with the mask hanging off every surface
+    // edge: partial blits, no panic, nothing outside the surface (which the
+    // borrow checker guarantees) and nothing outside the surface∩clip.
+    let mut s = Surface::new(16, 12);
+    let big = IRect::new(-100, -100, 1000, 1000);
+    for (x, y) in [(-10, -8), (-10, 5), (10, -8), (10, 5), (-30, 0), (0, -40)] {
+        s.canvas().blit_mask(&big, x, y, &mask, color, 1.0);
+    }
+    // Far off in both directions: pure no-ops.
+    let mut s2 = Surface::new(16, 12);
+    for (x, y) in [(1000, 0), (0, 1000), (-1000, 0), (0, -1000)] {
+        s2.canvas().blit_mask(&big, x, y, &mask, color, 1.0);
+    }
+    s2.assert_untouched_outside(&IRect::EMPTY);
+    // An empty clip paints nothing.
+    let mut s3 = Surface::new(16, 12);
+    s3.canvas()
+        .blit_mask(&IRect::new(4, 4, 0, 8), 0, 0, &mask, color, 1.0);
+    s3.canvas()
+        .blit_mask(&IRect::new(100, 100, 8, 8), 0, 0, &mask, color, 1.0);
+    s3.assert_untouched_outside(&IRect::EMPTY);
+    // The clipped-off blits above did paint something in `s`.
+    assert_ne!(s.px(0, 5), SENTINEL);
+}
+
+#[test]
+fn mask_partial_blit_at_negative_coords_is_the_right_sub_rect() {
+    let mut rng = Rng::new(0x5151_5151_7777_0001);
+    let cov = mask_page(8, 6, 8, &mut rng);
+    let mask = mask_of(&cov, 8, 6, 8);
+    let color = Color::rgb(0xFF, 0xFF, 0xFF);
+    let mut s = Surface::new(8, 6);
+    let clip = s.canvas().bounds();
+    s.canvas().fill_irect(&clip, &clip, Color::BLACK);
+    // Place the mask at (-3, -2): device (0, 0) shows mask texel (3, 2).
+    s.canvas().blit_mask(&clip, -3, -2, &mask, color, 1.0);
+    for y in 0..4 {
+        for x in 0..5 {
+            let want = cov[((y + 2) * 8 + (x + 3)) as usize];
+            assert_eq!(s.bgr(x, y).0, want, "({x},{y})");
+        }
+    }
+    // Beyond the mask's extent: still black.
+    assert_eq!(s.bgr(5, 0), (0, 0, 0));
+    assert_eq!(s.bgr(0, 4), (0, 0, 0));
+}
+
+#[test]
+fn mask_full_coverage_equals_fill_irect() {
+    let c = Color::rgb(0x12, 0x34, 0x56);
+    let cov = mask_flat(9, 7, 255);
+    let mask = mask_of(&cov, 9, 7, 9);
+    let mut a = Surface::new(20, 16);
+    let mut b = Surface::new(20, 16);
+    let clip = IRect::new(0, 0, 20, 16);
+    a.canvas().blit_mask(&clip, 3, 2, &mask, c, 1.0);
+    b.canvas().fill_irect(&clip, &IRect::new(3, 2, 9, 7), c);
+    assert_eq!(a.data, b.data, "all-255 mask differs from fill_irect");
+}
+
+#[test]
+fn mask_full_coverage_translucent_equals_fill_irect() {
+    // The non-opaque path must agree with the blended fill too.
+    let c = Color::rgba(0x12, 0x34, 0x56, 137);
+    let cov = mask_flat(9, 7, 255);
+    let mask = mask_of(&cov, 9, 7, 9);
+    let mut a = Surface::new(20, 16);
+    let mut b = Surface::new(20, 16);
+    let clip = IRect::new(0, 0, 20, 16);
+    a.canvas().fill_irect(&clip, &clip, Color::BLACK);
+    b.canvas().fill_irect(&clip, &clip, Color::BLACK);
+    a.canvas().blit_mask(&clip, 3, 2, &mask, c, 1.0);
+    b.canvas().fill_irect(&clip, &IRect::new(3, 2, 9, 7), c);
+    assert_eq!(a.data, b.data);
+}
+
+#[test]
+fn mask_zero_coverage_changes_nothing() {
+    let cov = mask_flat(9, 7, 0);
+    let mask = mask_of(&cov, 9, 7, 9);
+    let mut s = Surface::new(20, 16);
+    let clip = IRect::new(0, 0, 20, 16);
+    s.canvas().blit_mask(&clip, 3, 2, &mask, Color::WHITE, 1.0);
+    s.assert_untouched_outside(&IRect::EMPTY);
+}
+
+#[test]
+fn mask_sub_rect_of_a_page_uses_the_stride() {
+    // A 32-byte-wide atlas page holding a 5×4 glyph at its top-left, with the
+    // rest of the page poisoned; blitting w=5,h=4,stride=32 must read only the
+    // glyph.
+    let mut rng = Rng::new(0xDEAD_BEEF_CAFE_0001);
+    let page = mask_page(5, 4, 32, &mut rng);
+    let mask = mask_of(&page, 5, 4, 32);
+    assert!(mask.is_valid());
+    let mut s = Surface::new(12, 8);
+    let clip = s.canvas().bounds();
+    s.canvas().fill_irect(&clip, &clip, Color::BLACK);
+    s.canvas().blit_mask(&clip, 2, 1, &mask, Color::WHITE, 1.0);
+    for y in 0..4 {
+        for x in 0..5 {
+            let want = page[(y * 32 + x) as usize];
+            assert_eq!(s.bgr(2 + x, 1 + y).0, want, "({x},{y})");
+        }
+    }
+    // The poison bytes were not read: the surrounding pixels are still black.
+    for x in 0..12 {
+        assert_eq!(s.bgr(x, 0), (0, 0, 0), "row above ({x})");
+        assert_eq!(s.bgr(x, 5), (0, 0, 0), "row below ({x})");
+    }
+    for y in 0..8 {
+        assert_eq!(s.bgr(7, y), (0, 0, 0), "column right ({y})");
+        assert_eq!(s.bgr(1, y), (0, 0, 0), "column left ({y})");
+    }
+}
+
+#[test]
+fn mask_sub_rect_in_the_middle_of_a_page() {
+    // Blit the glyph at page offset (3, 2) by slicing `data` — the documented
+    // way to address a sub-rectangle of an atlas page.
+    let mut rng = Rng::new(0x1010_2020_3030_4040);
+    let page = mask_page(16, 12, 16, &mut rng);
+    let sub = Mask {
+        data: &page[(2 * 16 + 3)..],
+        w: 6,
+        h: 5,
+        stride: 16,
+    };
+    assert!(sub.is_valid());
+    let mut s = Surface::new(16, 12);
+    let clip = s.canvas().bounds();
+    s.canvas().fill_irect(&clip, &clip, Color::BLACK);
+    s.canvas().blit_mask(&clip, 0, 0, &sub, Color::WHITE, 1.0);
+    for y in 0..5 {
+        for x in 0..6 {
+            let want = page[((y + 2) * 16 + (x + 3)) as usize];
+            assert_eq!(s.bgr(x, y).0, want, "({x},{y})");
+        }
+    }
+}
+
+#[test]
+fn mask_degenerate_inputs_are_no_ops() {
+    let data = mask_flat(8, 8, 255);
+    let mut s = Surface::new(12, 8);
+    let clip = s.canvas().bounds();
+    let bad = [
+        mask_of(&data, 0, 4, 4),  // zero width
+        mask_of(&data, 4, 0, 4),  // zero height
+        mask_of(&data, 8, 4, 4),  // stride < w
+        mask_of(&data, 8, 20, 8), // data too short
+        mask_of(&[], 4, 4, 4),    // no data at all
+    ];
+    for m in &bad {
+        assert!(!m.is_valid());
+        s.canvas().blit_mask(&clip, 0, 0, m, Color::WHITE, 1.0);
+        s.canvas()
+            .blit_masks(&clip, Color::WHITE, 1.0, &[(0, 0, *m)]);
+    }
+    // Valid mask, but nothing to paint with.
+    let ok = mask_of(&data, 8, 8, 8);
+    assert!(ok.is_valid());
+    s.canvas()
+        .blit_mask(&clip, 0, 0, &ok, Color::TRANSPARENT, 1.0);
+    s.canvas().blit_mask(&clip, 0, 0, &ok, Color::WHITE, 0.0);
+    s.canvas().blit_mask(&clip, 0, 0, &ok, Color::WHITE, -1.0);
+    s.canvas()
+        .blit_masks(&clip, Color::WHITE, 0.0, &[(0, 0, ok)]);
+    // An empty batch.
+    s.canvas().blit_masks(&clip, Color::WHITE, 1.0, &[]);
+    s.assert_untouched_outside(&IRect::EMPTY);
+}
+
+/// `N` glyph-sized masks at pseudo-random positions — the batch workload.
+fn glyph_run(
+    rng: &mut Rng,
+    count: usize,
+    gw: u32,
+    gh: u32,
+    span: i32,
+) -> (Vec<u8>, Vec<(i32, i32)>) {
+    let cov = mask_page(gw, gh, gw, rng);
+    let mut at = Vec::with_capacity(count);
+    for _ in 0..count {
+        let px = (rng.next_u32() % span.unsigned_abs()).cast_signed() - span / 3;
+        let py = (rng.next_u32() % span.unsigned_abs()).cast_signed() - span / 3;
+        at.push((px, py));
+    }
+    (cov, at)
+}
+
+#[test]
+fn mask_batch_equals_a_loop_of_single_blits() {
+    for (color, opacity) in [
+        (Color::rgb(0xE0, 0xE4, 0xEC), 1.0_f32),
+        (Color::rgba(0xE0, 0x40, 0x20, 190), 0.6),
+    ] {
+        let mut rng = Rng::new(0x7777_1111_2222_3333);
+        let (cov, at) = glyph_run(&mut rng, 40, 8, 12, 48);
+        let mask = mask_of(&cov, 8, 12, 8);
+        let entries: Vec<(i32, i32, Mask<'_>)> = at.iter().map(|&(x, y)| (x, y, mask)).collect();
+
+        let mut a = Surface::new(48, 32);
+        let mut b = Surface::new(48, 32);
+        let clip = IRect::new(2, 1, 40, 28);
+        let surf = IRect::new(0, 0, 48, 32);
+        a.canvas().fill_irect(&surf, &clip, Color::BLACK);
+        b.canvas().fill_irect(&surf, &clip, Color::BLACK);
+        for &(x, y) in &at {
+            a.canvas().blit_mask(&clip, x, y, &mask, color, opacity);
+        }
+        b.canvas().blit_masks(&clip, color, opacity, &entries);
+        assert_eq!(a.data, b.data, "batch differs from a loop of single blits");
+    }
+}
+
+#[test]
+fn mask_batch_and_loop_timing() {
+    // Not an assertion about speed — a number for the README. Run with
+    // `cargo test -p nitro-raster -- --nocapture mask_batch_and_loop_timing`.
+    use std::time::Instant;
+
+    const GLYPHS: usize = 50;
+
+    let mut rng = Rng::new(0x2545_F491_4F6C_DD1D);
+    let (cov, at) = glyph_run(&mut rng, GLYPHS, 8, 12, 300);
+    let mask = mask_of(&cov, 8, 12, 8);
+    let entries: Vec<(i32, i32, Mask<'_>)> = at.iter().map(|&(x, y)| (x, y, mask)).collect();
+    let mut s = Surface::new(400, 64);
+    let clip = s.canvas().bounds();
+    let color = Color::rgb(0xE0, 0xE4, 0xEC);
+
+    let reps = 2000;
+    let mut loop_best = f64::MAX;
+    let mut batch_best = f64::MAX;
+    for _ in 0..5 {
+        let t0 = Instant::now();
+        for _ in 0..reps {
+            for &(x, y) in &at {
+                s.canvas().blit_mask(&clip, x, y, &mask, color, 1.0);
+            }
+        }
+        loop_best = loop_best.min(t0.elapsed().as_secs_f64());
+        let t1 = Instant::now();
+        for _ in 0..reps {
+            s.canvas().blit_masks(&clip, color, 1.0, &entries);
+        }
+        batch_best = batch_best.min(t1.elapsed().as_secs_f64());
+    }
+    let per = f64::from(reps);
+    println!(
+        "{GLYPHS} glyphs of 8x12: loop {:.2} us/run, batch {:.2} us/run ({:.1}% saved)",
+        loop_best / per * 1e6,
+        batch_best / per * 1e6,
+        (loop_best - batch_best) / loop_best * 100.0,
+    );
 }

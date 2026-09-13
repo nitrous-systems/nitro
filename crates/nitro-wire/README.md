@@ -23,6 +23,10 @@ table, error codes and the versioning policy — is in
   atomically.
 * The server sends configuration, input and frame timing back.
 * Errors are **fatal**: the server sends `Error` and closes.
+* **Text is shaped server-side**: clients send a string plus a style with
+  `SetText` and get `TextMetrics` back; `MeasureText`/`TextMeasured` is
+  the one request/response pair, answered on receipt rather than at a
+  commit. Both need the `TEXT` capability bit.
 
 ## Client
 
@@ -119,6 +123,36 @@ Pixels never cross the stream. A client creates a memfd, passes it once
 with `CreateBuffer` (one `SCM_RIGHTS` descriptor on that frame), points an
 `Image` node at a region with `SetImage`, and announces changes with
 `BufferDamage`. The server maps the descriptor read-only.
+
+## Text
+
+Glyph pixels never cross the stream either. A `Text` node carries a
+string and a style (`family`, `size_px`, `weight`, `italic`, `max_width`,
+`wrap`, `align`, `color`) set with `SetText`; the server shapes it and
+replies with `TextMetrics` for every node it reshaped in the commit. A
+client that must measure before it can lay out sends `MeasureText` and
+gets a `TextMeasured` back at once, outside any transaction, carrying the
+same `request` id and optional `cursor_x` positions. `max_width` 0 means
+no limit, `wrap` only bites with a non-zero `max_width`, and `family` may
+be a family name or one of `sans`, `serif`, `mono`. M2 is LTR-only: no
+bidi, no rich text.
+
+```rust,no_run
+# use nitro_core::Color;
+# use nitro_wire::client::Connection;
+# use nitro_wire::types::{NodeId, NodeKind, caps};
+# fn main() -> Result<(), nitro_wire::Error> {
+# let mut conn = Connection::connect_default("demo")?;
+# let win = NodeId(1);
+let label = NodeId(3);
+if conn.has_caps(caps::TEXT) {
+    conn.tx()
+        .create_node(label, NodeKind::Text, win)
+        .set_text(label, "sans", 14.0, Color::BLACK, "hello")
+        .commit(2)?;
+}
+# Ok(()) }
+```
 
 ## Layout and tests
 

@@ -14,6 +14,7 @@ nitro-core = { path = "../nitro-core" }
 nitro-wire = { version = "0.0.1", path = "../nitro-wire" }
 nitro-scene = { path = "../nitro-scene" }
 nitro-raster = { path = "../nitro-raster" }
+nitro-text = { path = "../nitro-text" }
 nitro-seat = { path = "../nitro-seat" }
 nitro-kms = { path = "../nitro-kms" }
 rustix = { version = "1", features = ["event", "fs", "net", "process", "time"] }

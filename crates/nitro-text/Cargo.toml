@@ -1,0 +1,13 @@
+[package]
+name = "nitro-text"
+description = "Server-side text: font discovery, shaping and layout, measurement, and an A8 glyph atlas. swash only, no scene or wire dependency."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+swash = { workspace = true }
+
+[lints]
+workspace = true

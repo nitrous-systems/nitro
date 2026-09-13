@@ -14,10 +14,11 @@ use crate::framing::Framer;
 use crate::io::Socket;
 use crate::msg::{
     BufferDamage, ClientMsg, Commit, CreateBuffer, CreateNode, CreateWindow, DestroyBuffer,
-    DestroyNode, Fill, Hello, Reparent, RequestFrame, ServerMsg, SetBorder, SetBounds, SetClip,
-    SetCorners, SetFill, SetImage, SetOpacity, SetTransform, SetVisible, SetWindowTitle,
+    DestroyNode, Fill, Hello, MeasureText, Reparent, RequestFrame, ServerMsg, SetBorder, SetBounds,
+    SetClip, SetCorners, SetFill, SetImage, SetOpacity, SetText, SetTransform, SetVisible,
+    SetWindowTitle,
 };
-use crate::types::{BufferId, Layer, NodeId, NodeKind};
+use crate::types::{Align, BufferId, Layer, NodeId, NodeKind};
 
 /// Where the wire socket lives; see [`crate::socket_path`].
 pub use crate::socket_path;
@@ -28,6 +29,12 @@ pub use crate::socket_path;
 /// buffer and [`Connection::flush`] pushes it at the socket. Receiving is
 /// non-blocking: [`Connection::poll`] appends whatever has arrived to a
 /// caller-owned `Vec`, so the event loop owns all the allocation.
+///
+/// Mutations go through [`Connection::tx`]; the one thing that does not is
+/// [`Connection::measure_text`], which is a request answered at once
+/// rather than at a commit. Both text ops need the server to have
+/// reported the `TEXT` capability — check
+/// [`has_caps(caps::TEXT)`](Connection::has_caps).
 #[derive(Debug)]
 pub struct Connection {
     socket: Socket,
@@ -150,6 +157,19 @@ impl Connection {
         self.send(&ClientMsg::Commit(Commit { serial }))
     }
 
+    /// Ask the server to measure a string; the answer is a
+    /// [`TextMeasured`](crate::msg::TextMeasured) with the same
+    /// `request`, and it is NOT tied to a commit.
+    ///
+    /// Needs the `TEXT` capability
+    /// ([`has_caps(caps::TEXT)`](Connection::has_caps)).
+    ///
+    /// # Errors
+    /// As [`Connection::send`].
+    pub fn measure_text(&mut self, m: MeasureText) -> Result<(), Error> {
+        self.send(&ClientMsg::MeasureText(m))
+    }
+
     /// Push queued bytes at the socket.
     ///
     /// Returns `true` when everything was written; `false` means the
@@ -260,6 +280,11 @@ fn wait(fd: BorrowedFd<'_>, events: rustix::event::PollFlags) -> Result<(), Erro
 /// socket). The builder holds no tree state: ids are the caller's, exactly
 /// as the protocol intends. An encode error is remembered and returned by
 /// [`Transaction::commit`] or [`Transaction::finish`].
+///
+/// It covers the whole mutation vocabulary: windows, the node tree,
+/// style, buffers, and — when the server reports the `TEXT` capability
+/// ([`Connection::has_caps`] with [`caps::TEXT`](crate::types::caps::TEXT))
+/// — text content and style through [`Transaction::set_text`].
 #[derive(Debug)]
 pub struct Transaction<'a> {
     conn: &'a mut Connection,
@@ -410,6 +435,45 @@ impl Transaction<'_> {
     #[must_use]
     pub fn border(mut self, id: NodeId, width: f32, color: Color) -> Self {
         push!(self, SetBorder { id, width, color })
+    }
+
+    /// Set a text node's content and style.
+    ///
+    /// Fills in the rest of [`SetText`]: weight 400, upright, no width
+    /// limit, no wrapping, [`Align::Left`]. Use
+    /// [`Transaction::set_text_full`] for the other fields. Needs the
+    /// `TEXT` capability.
+    #[must_use]
+    pub fn set_text(
+        mut self,
+        id: NodeId,
+        family: &str,
+        size_px: f32,
+        color: Color,
+        text: &str,
+    ) -> Self {
+        push!(
+            self,
+            SetText {
+                node: id,
+                size_px,
+                weight: 400,
+                italic: false,
+                max_width: 0.0,
+                wrap: false,
+                align: Align::Left,
+                color,
+                family: family.to_owned(),
+                text: text.to_owned(),
+            }
+        )
+    }
+
+    /// Full form: every field of [`SetText`], built with struct literal
+    /// syntax.
+    #[must_use]
+    pub fn set_text_full(mut self, m: SetText) -> Self {
+        push!(self, m)
     }
 
     /// Register a shared-memory buffer, passing `fd`.

@@ -1008,3 +1008,272 @@ fn no_cursor_is_drawn_until_a_pointer_device_reports_something() {
     );
     h_.quit();
 }
+
+/// Whether the server found any font at all. Without one there is nothing
+/// to shape and nothing to draw, and the text tests say so and stop rather
+/// than failing on a box that simply has no fonts installed.
+fn has_text(conn: &Connection) -> bool {
+    use nitro_wire::types::caps;
+    if conn.has_caps(caps::TEXT) {
+        return true;
+    }
+    eprintln!("skipping: the server reports no TEXT capability (no fonts on this box)");
+    false
+}
+
+#[test]
+fn set_text_answers_with_metrics_and_puts_glyphs_on_screen() {
+    use nitro_wire::msg::SetText;
+    use nitro_wire::types::{Align, NodeKind};
+
+    let (w, h) = (320, 200);
+    let h_ = Harness::start("text", w, h);
+    park_cursor(&h_, 0.99, 0.99);
+    let mut conn = h_.client("text");
+    if !has_text(&conn) {
+        h_.quit();
+        return;
+    }
+    let mut seen = Vec::new();
+
+    // A window with a dark rect under a white label, so a glyph pixel is
+    // unmistakably different from both the background and the rect.
+    let root = NodeId(1);
+    let panel = NodeId(2);
+    let label = NodeId(3);
+    let (bx, by, bw, bh) = (10.0f32, 10.0f32, 240.0f32, 40.0f32);
+    conn.tx()
+        .create_window(root, "text", Size::new(300.0, 120.0), Layer::Normal)
+        .create_rect(panel, root, Rect::new(bx, by, bw, bh))
+        .fill_solid(panel, Color::rgb(0x10, 0x10, 0x10))
+        .create_node(label, NodeKind::Text, root)
+        .bounds(label, Rect::new(bx, by + 6.0, bw, 28.0))
+        .set_text_full(SetText {
+            node: label,
+            size_px: 20.0,
+            weight: 400,
+            italic: false,
+            max_width: 0.0,
+            wrap: false,
+            align: Align::Left,
+            color: Color::WHITE,
+            family: "sans".to_owned(),
+            text: "Hello".to_owned(),
+        })
+        .commit(1)
+        .unwrap();
+    conn.flush().unwrap();
+
+    let configure = expect(&mut conn, &mut seen, "Configure", |m| match m {
+        ServerMsg::Configure(c) if c.window == root => Some(*c),
+        _ => None,
+    });
+    // The commit that shaped the node answers with its measured size.
+    let metrics = expect(&mut conn, &mut seen, "TextMetrics", |m| match m {
+        ServerMsg::TextMetrics(t) if t.node == label => Some(*t),
+        _ => None,
+    });
+    assert!(metrics.width > 0.0, "a shaped label has a width");
+    assert!(metrics.height > 0.0);
+    assert!(metrics.ascent > 0.0);
+    assert_eq!(metrics.line_count, 1);
+    assert!(
+        metrics.width <= bw,
+        "\"Hello\" at 20 px fits in {bw} units: {}",
+        metrics.width
+    );
+
+    h_.settle();
+    let img = h_.shot(None).unwrap();
+    // This is the server's first window, so the cascade puts it at the
+    // output origin (see `cascade_position(0, ..)`) and a node's local
+    // coordinates are its device ones.
+    assert_eq!(configure.size, Size::new(300.0, 120.0));
+    let origin = (bx as u32, (by + 6.0) as u32);
+
+    // Somewhere in the text's box there must be a pixel that is neither the
+    // panel's colour nor the desktop behind it: that is a glyph.
+    let mut lit = 0u32;
+    for y in origin.1..origin.1 + 24 {
+        for x in origin.0..origin.0 + metrics.width as u32 {
+            let px = img.pixel(x, y);
+            if px != 0x0010_1010 && px != background_color(x, y, w, h) {
+                lit += 1;
+            }
+        }
+    }
+    assert!(
+        lit > 20,
+        "expected glyph pixels inside the label's bounds, found {lit}"
+    );
+
+    // And the atlas actually cached them.
+    let stats = h_.request_text("stats\n");
+    assert!(stat(&stats, "glyphs_cached") > 0, "{stats:?}");
+    assert!(stat(&stats, "atlas_pages") >= 1, "{stats:?}");
+    assert!(stat(&stats, "text_runs") >= 1, "{stats:?}");
+    assert!(stat(&stats, "fonts") > 0, "{stats:?}");
+
+    h_.quit();
+}
+
+#[test]
+fn measure_text_is_answered_before_any_commit() {
+    use nitro_wire::msg::MeasureText;
+
+    let h_ = Harness::start("measure", 160, 120);
+    let mut conn = h_.client("measure");
+    if !has_text(&conn) {
+        h_.quit();
+        return;
+    }
+    let mut seen = Vec::new();
+
+    // No window, no node, no commit: just a question.
+    conn.measure_text(MeasureText {
+        request: 0x1234,
+        size_px: 16.0,
+        weight: 400,
+        italic: false,
+        max_width: 0.0,
+        wrap: false,
+        family: "sans".to_owned(),
+        text: "Hello".to_owned(),
+    })
+    .unwrap();
+    conn.flush().unwrap();
+
+    let m = expect(&mut conn, &mut seen, "TextMeasured", |m| match m {
+        ServerMsg::TextMeasured(t) if t.request == 0x1234 => Some(t.clone()),
+        _ => None,
+    });
+    assert!(m.width > 0.0);
+    assert!(m.height > 0.0);
+    assert_eq!(m.line_count, 1);
+    // One cursor position per cluster boundary plus the end of the string.
+    assert!(
+        m.cursor_x.len() >= 5,
+        "\"Hello\" has five clusters: {:?}",
+        m.cursor_x
+    );
+    assert_eq!(m.cursor_x[0].offset, 0);
+    assert!(
+        m.cursor_x.windows(2).all(|w| w[0].x <= w[1].x),
+        "cursor x is monotonic: {:?}",
+        m.cursor_x
+    );
+    // Nothing was committed, so the scene is still empty.
+    assert_eq!(stat(&h_.request_text("stats\n"), "nodes"), 0);
+    // And nothing was stored either: a measurement is not a run.
+    assert_eq!(stat(&h_.request_text("stats\n"), "text_runs"), 0);
+
+    h_.quit();
+}
+
+#[test]
+fn a_wrapped_label_reports_several_lines_and_respects_its_width() {
+    use nitro_wire::msg::MeasureText;
+
+    let h_ = Harness::start("wrap", 160, 120);
+    let mut conn = h_.client("wrap");
+    if !has_text(&conn) {
+        h_.quit();
+        return;
+    }
+    let mut seen = Vec::new();
+
+    conn.measure_text(MeasureText {
+        request: 1,
+        size_px: 14.0,
+        weight: 400,
+        italic: false,
+        max_width: 80.0,
+        wrap: true,
+        family: "sans".to_owned(),
+        text: "the quick brown fox jumps over the lazy dog".to_owned(),
+    })
+    .unwrap();
+    conn.flush().unwrap();
+
+    let m = expect(&mut conn, &mut seen, "TextMeasured", |m| match m {
+        ServerMsg::TextMeasured(t) if t.request == 1 => Some(t.clone()),
+        _ => None,
+    });
+    assert!(
+        m.line_count >= 2,
+        "wrapping produced {} line(s)",
+        m.line_count
+    );
+    assert!(
+        m.width <= 80.5,
+        "no line exceeds the wrap width: {}",
+        m.width
+    );
+    h_.quit();
+}
+
+#[test]
+fn text_runs_are_released_with_their_node_and_their_client() {
+    use nitro_wire::types::NodeKind;
+
+    let h_ = Harness::start("textlife", 160, 120);
+    let mut conn = h_.client("textlife");
+    if !has_text(&conn) {
+        h_.quit();
+        return;
+    }
+    let mut seen = Vec::new();
+
+    let root = NodeId(1);
+    let label = NodeId(2);
+    conn.tx()
+        .create_window(root, "t", Size::new(120.0, 60.0), Layer::Normal)
+        .create_node(label, NodeKind::Text, root)
+        .bounds(label, Rect::new(0.0, 0.0, 120.0, 20.0))
+        .set_text(label, "sans", 14.0, Color::WHITE, "one")
+        .commit(1)
+        .unwrap();
+    conn.flush().unwrap();
+    expect(&mut conn, &mut seen, "TextMetrics", |m| match m {
+        ServerMsg::TextMetrics(t) if t.node == label => Some(*t),
+        _ => None,
+    });
+    assert_eq!(stat(&h_.request_text("stats\n"), "text_runs"), 1);
+
+    // Re-setting the text replaces the run rather than accumulating one.
+    for (serial, s) in [(2u32, "two"), (3, "three"), (4, "four")] {
+        conn.tx()
+            .set_text(label, "sans", 14.0, Color::WHITE, s)
+            .commit(serial)
+            .unwrap();
+        conn.flush().unwrap();
+        wait_for("the reshape", || {
+            stat(&h_.request_text("stats\n"), "text_runs") == 1
+        });
+    }
+
+    // Destroying the node frees its run.
+    conn.tx().destroy_node(label).commit(5).unwrap();
+    conn.flush().unwrap();
+    wait_for("the run to be released", || {
+        stat(&h_.request_text("stats\n"), "text_runs") == 0
+    });
+
+    // And a disconnect frees everything the client owned.
+    conn.tx()
+        .create_node(NodeId(3), NodeKind::Text, root)
+        .bounds(NodeId(3), Rect::new(0.0, 0.0, 120.0, 20.0))
+        .set_text(NodeId(3), "sans", 14.0, Color::WHITE, "gone soon")
+        .commit(6)
+        .unwrap();
+    conn.flush().unwrap();
+    wait_for("the second run", || {
+        stat(&h_.request_text("stats\n"), "text_runs") == 1
+    });
+    drop(conn);
+    wait_for("the client to be reaped", || {
+        stat(&h_.request_text("stats\n"), "text_runs") == 0
+    });
+
+    h_.quit();
+}

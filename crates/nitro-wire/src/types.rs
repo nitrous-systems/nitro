@@ -111,10 +111,48 @@ tag_enum! {
         Rect = 2,
         /// A region of a client buffer.
         Image = 3,
-        /// Shaped text run. Reserved for M2; the server rejects it in v1.
+        /// Shaped text run; accepted when the server reports
+        /// [`caps::TEXT`]. The client sends the string and its style with
+        /// [`SetText`](crate::msg::SetText) and the server does the
+        /// shaping.
         Text = 4,
         /// External surface (dma-buf, Wayland adapter). Reserved for M5.
         Surface = 5,
+    }
+}
+
+tag_enum! {
+    /// Horizontal alignment of a text node's lines inside its bounds.
+    Align: u8 {
+        /// Lines start at the left edge.
+        Left = 0,
+        /// Lines are centred.
+        Center = 1,
+        /// Lines end at the right edge.
+        Right = 2,
+    }
+}
+
+/// One cursor position: a byte offset into the text and the x it sits at.
+///
+/// Reported by [`TextMeasured`](crate::msg::TextMeasured) so a text field
+/// can place a caret or a selection edge without shaping the string
+/// itself. `offset` is a byte offset into the measured string (always on
+/// a UTF-8 character boundary) and `x` is in logical pixels from the
+/// text's left edge.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CursorPos {
+    /// Byte offset into the measured string.
+    pub offset: u32,
+    /// Horizontal position in logical pixels.
+    pub x: f32,
+}
+
+impl CursorPos {
+    /// A cursor at `offset`, sitting at `x`.
+    #[must_use]
+    pub const fn new(offset: u32, x: f32) -> Self {
+        Self { offset, x }
     }
 }
 

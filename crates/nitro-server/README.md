@@ -21,12 +21,13 @@ relative). Client and server resolve that path through the *same*
 function in `nitro-wire`, so a client started in the server's environment
 finds it without being configured. A connection opens with `Hello`
 (version plus a name for the logs) and is answered with `Welcome`
-(version, capability bits, server name). The capability word is **0** in
-v1, deliberately: direct scanout, `Text` nodes and dma-buf surfaces are
-M2/M5 work, and a zero bit is the protocol's way of saying "this does not
-exist yet" — a client that asks for a `Text` or `Surface` node gets
-`WrongKind` and the connection closes, rather than discovering at runtime
-that the feature silently did nothing.
+(version, capability bits, server name). One capability bit is set in
+M2 — `TEXT` (bit 1), and only when the startup font scan actually found a
+face, because the bit is a promise that a `Text` node will draw something.
+Direct scanout and dma-buf surfaces remain M3/M5 work, and a zero bit is
+the protocol's way of saying "this does not exist yet": a client that
+asks for a `Surface` node gets `WrongKind` and the connection closes,
+rather than discovering at runtime that the feature silently did nothing.
 
 The **control socket** is the v0 line protocol and stays as the server's
 own test and debug channel — it is what `nitro-shot` and the integration
@@ -61,6 +62,7 @@ on shutdown.
 | `NITRO_SOCKET`    | socket path                      | `$XDG_RUNTIME_DIR/nitro/wire.sock` (resolved by `nitro-wire`, so clients agree) |
 | `NITRO_INPUT`     | `off`                            | input enabled                  |
 | `NITRO_INPUT_DIR` | directory scanned for `event*`   | `/dev/input`                   |
+| `NITRO_FONT_DIRS` | colon-separated font directories | `/usr/share/fonts:/usr/local/share/fonts:~/.local/share/fonts` (read by `nitro-text`) |
 | `NITRO_LOG`       | `error`, `warn`, `info`, `debug` | `info`                         |
 
 The keyboard layout comes from the `XKB_DEFAULT_{RULES,MODEL,LAYOUT,VARIANT,OPTIONS}`
@@ -269,6 +271,70 @@ that `nitro-kms::resume()` now clears flip-pending for every output
 (issue #520): a flip abandoned by a VT switch is never completed, and an
 output that still believed a flip was in flight would never paint again.
 
+## Text
+
+**Clients send strings, the server draws glyphs.** That is the whole
+shape of it, and it is a deliberate asymmetry: a label is a few dozen
+bytes on the wire whatever the font, an app binary carries no font
+library, and the remote case costs exactly what the local one does. The
+price is that the server owns a font database, a shaper and a glyph
+cache, which is what `nitro-text` is; `text.rs` assembles them into the
+one `TextEngine` the event loop holds.
+
+**Startup.** `FontDb::scan()` walks `NITRO_FONT_DIRS` (or the three
+default directories) once and logs the face count and how long it took.
+Fonts are not hot-reloaded: one installed while the server runs is picked
+up at the next restart. A box with no fonts is a warning, not a failure —
+the server runs, the `TEXT` capability bit stays clear, and text nodes
+draw nothing.
+
+**`SetText`** is an ordinary mutation: buffered, applied at the client's
+`Commit`, shaped there, and the resulting run stored under the client's
+id. The scene gets a `TextRef` — an opaque `u32` key plus the measured
+block size, first baseline, colour and alignment — so `nitro-scene` never
+sees a glyph or a font, and `paint_list` can place a centred block without
+consulting the store. Every node the commit (re)shaped is answered with a
+`TextMetrics` carrying its measured size, which is how a toolkit lays a
+label out without a separate round trip.
+
+**`MeasureText`** is the one exception to "everything waits for the
+commit", and it is answered the moment it is decoded. A text field cannot
+lay itself out until it knows how wide its content is, and making it wait
+a frame for that would put a round trip in the middle of every keystroke.
+It stores nothing and mutates nothing: the answer, a `TextMeasured`,
+carries the block metrics plus one `(byte offset, x)` pair per cluster
+boundary, which is exactly what a caret needs.
+
+**Painting.** `PaintKind::Text` reaches `TextEngine::paint`, which
+resolves each glyph to an atlas mask (rasterizing on a miss) and blits it
+with `Canvas::blit_mask` — A8 coverage times the node's colour,
+source-over, inside the damage clip like every other item. Glyphs are
+rasterized at the **device** size: the engine reads the scale out of the
+paint item's world transform, so a 2x output gets real 2x glyphs rather
+than a magnified 1x bitmap, and neither the scene nor the rasterizer has
+to know that text has a resolution at all. The pen's fractional x is not
+thrown away: it selects one of four subpixel buckets in the cache key, so
+a run's glyphs land where shaping put them.
+
+**Lifetime.** A shaped run outlives the message that made it, so
+something has to free it. Three places do, and between them they cover
+every way a run can become unreachable: re-`SetText` on a node releases
+the run it replaces, destroying a node (or a window, or a subtree)
+releases every run under it, and a disconnect drops everything the client
+owned by owner id. A shell that restarts its clients would otherwise leak
+a glyph vector per label per restart.
+
+**Hostile input stops at the boundary.** A non-finite size or wrap width
+is replaced rather than passed to the shaper (a NaN would poison the line
+breaker), sizes are clamped to 1..=256 px so one glyph cannot ask for an
+atlas page of its own, and a string longer than 64 KiB is truncated at a
+char boundary rather than killing the connection — an over-long label is a
+client bug, and a label that is merely cut off is a far more debuggable
+symptom than a disconnect.
+
+Limitations are `nitro-text`'s and are listed in its README: LTR only, no
+bidi, no rich text, per-run font fallback, no colour emoji.
+
 ## Input
 
 libinput is created with `new_from_path`, not `new_with_udev`: the udev
@@ -364,6 +430,12 @@ looking for.
 | `i2p_min_us`             | Input-to-photon latency, over the last 100 samples: from the libinput event timestamp to the vblank of the frame carrying its effect. |
 | `i2p_mean_us`            | Mean of the same window.                                                 |
 | `i2p_max_us`             | Max of the same window.                                                  |
+| `fonts`                  | Font faces the startup scan indexed. 0 means no `TEXT` capability.        |
+| `glyphs_cached`          | Distinct glyph masks in the atlas (font, glyph, quantized size, subpixel bucket). |
+| `glyph_renders`          | Masks actually rasterized since startup. It stops rising once a UI's glyphs are all cached; a number that keeps climbing on a static screen means the cache key is churning. |
+| `atlas_pages`            | 1024x1024 A8 pages allocated, 1 MiB each.                                |
+| `text_runs`              | Shaped runs held in the text store: one per text node with content. A `MeasureText` stores nothing, so it never moves this. |
+| `shape_us_mean`          | Mean microseconds per shaping call, over the last 120 (shapes *and* measurements — they run the same layout). |
 | `clients`                | Connected wire clients.                                                  |
 | `windows`                | Windows in the scene.                                                    |
 | `nodes`                  | Nodes in the scene, across every window.                                 |

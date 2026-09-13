@@ -4,11 +4,11 @@
 //! two can run on different threads and the scene can be mutated again while a
 //! frame is being drawn.
 
-use nitro_core::{IRect, Point, Rect, Transform};
+use nitro_core::{Color, IRect, Point, Rect, Transform};
 
 use crate::{
     BufferKey, Fill, NodeKey, OutputId, Scene, WindowKey,
-    node::{Border, NodeData},
+    node::{Border, NodeData, TextAlign, TextRef},
     update::device_rect,
 };
 
@@ -34,6 +34,21 @@ pub enum PaintKind {
         buffer: BufferKey,
         /// Source region in buffer pixels.
         src: IRect,
+    },
+    /// A shaped text run, drawn from the caller's text store.
+    ///
+    /// `origin` is the top-left corner of the *shaped block* in the node's
+    /// local space — the alignment inside the node's bounds is already
+    /// applied, so the painter only has to walk the run's lines and glyphs
+    /// and offset them by this point. The colour is the node's; the item's
+    /// `opacity` applies on top of it as for every other kind.
+    Text {
+        /// Handle into the text store that owns the shaped run.
+        key: u32,
+        /// Top-left corner of the block in local units.
+        origin: Point,
+        /// Tint of every glyph.
+        color: Color,
     },
 }
 
@@ -110,6 +125,23 @@ impl PaintItem {
     }
 }
 
+/// Where a text node's shaped block starts inside bounds `width` units wide.
+///
+/// Vertical placement is deliberately *not* aligned: a text node's box is its
+/// line box, and a client that wants the block centred vertically sets the
+/// bounds it wants. Horizontal alignment is the one the toolkit actually needs
+/// per label, and computing it here keeps the rasterizer free of any notion of
+/// alignment at all.
+fn text_origin(text: TextRef, width: f32) -> Point {
+    let slack = width - text.size.w;
+    let x = match text.align {
+        TextAlign::Left => 0.0,
+        TextAlign::Center => slack / 2.0,
+        TextAlign::Right => slack,
+    };
+    Point::new(x, 0.0)
+}
+
 impl Scene {
     /// Append the items needed to redraw `clip` on `output`, in painter's
     /// order: layers back to front, windows back to front within a layer,
@@ -165,6 +197,11 @@ impl Scene {
                         size,
                         buffer: image.buffer,
                         src: image.src,
+                    }),
+                    NodeData::Text(Some(text)) => Some(PaintKind::Text {
+                        key: text.key,
+                        origin: text_origin(text, node.bounds.w),
+                        color: text.color,
                     }),
                     _ => None,
                 };

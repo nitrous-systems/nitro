@@ -16,6 +16,7 @@ nitro-core   = { path = "crates/nitro-core" }
 nitro-wire   = { path = "crates/nitro-wire" }
 nitro-scene  = { path = "crates/nitro-scene" }
 nitro-raster = { path = "crates/nitro-raster" }
+nitro-text   = { path = "crates/nitro-text" }
 nitro-seat   = { path = "crates/nitro-seat" }
 nitro-kms    = { path = "crates/nitro-kms" }
 rustix       = { version = "1", default-features = false, features = ["std"] }
@@ -25,6 +26,7 @@ signal-hook  = { version = "0.3", default-features = false }
 input        = "0.10"
 xkbcommon    = "0.9"
 zerocopy     = { version = "0.8", features = ["derive"] }
+swash        = "0.2"
 
 [profile.release]
 lto = "fat"
