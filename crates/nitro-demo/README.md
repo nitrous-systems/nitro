@@ -39,7 +39,8 @@ paths; `NITRO_DEMO_SHOW_DAMAGE=1` presets `--damage`.
 Keys (matched on **evdev keycodes**, not keysyms, so the demo behaves the
 same on any layout and on a server running without a compiled keymap):
 `q` quits, `d` toggles damage outlines, `Esc` closes the window, `n`/`p`
-select the next/previous window.
+select the next/previous window (tinting its follower — v1 has no
+client-initiated stacking message, so a client cannot raise itself).
 
 ## The two modes
 

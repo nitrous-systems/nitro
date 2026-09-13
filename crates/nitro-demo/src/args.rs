@@ -70,14 +70,16 @@ usage: nitro-demo [--follow | --animate] [--windows N] [--damage] [--stats]
 
   --follow           commit only on input (default); idle costs zero frames
   --animate          move a rect one step per Frame callback
-  --windows N        open N windows; `n`/`p` raise the next/previous one
+  --windows N        open N windows; `n`/`p` select the next/previous one
   --damage           outline the rects each commit damages
   --stats            also print the server's own i2p figures (control socket)
   --seconds S        quit after S seconds
   --save-small FILE  write a downscaled PNG of the demo image and exit
 
 Environment: NITRO_SOCKET, NITRO_CONTROL, NITRO_DEMO_SHOW_DAMAGE=1.
-Keys: q quit, d toggle damage outlines, Esc close the window, n/p raise.";
+Keys: q quit, d toggle damage outlines, Esc close the window, n/p select.
+Selecting tints a window's follower: v1 has no client-initiated stacking
+message, so a client cannot raise itself (the server raises on a click).";
 
 /// Parse `args` (without the program name).
 ///

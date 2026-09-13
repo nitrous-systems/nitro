@@ -49,7 +49,11 @@ use crate::latency::{Histogram, Ledger};
 use crate::scene::{self, ANIMATE_STEP, IMG_EDGE, Ids, WINDOW_SIZE};
 
 /// evdev keycodes the demo acts on (`KEY_*` in `linux/input-event-codes.h`).
-mod keys {
+///
+/// Public so a test can press a key without hard-coding the number it is
+/// also asserting on — a test that repeats the constant proves only that
+/// two copies of a typo agree.
+pub mod keys {
     /// `KEY_ESC`.
     pub const ESC: u32 = 1;
     /// `KEY_Q`.
@@ -74,6 +78,12 @@ pub struct Window {
     pub size: Size,
     /// Where the follower is now; empty until the first motion.
     pub follower: Rect,
+    /// The damage rects of the last follow move, kept so toggling the
+    /// outlines with `d` can redraw them without waiting for the pointer
+    /// to move again. Without it `d` would be immediate when switching
+    /// *off* (hiding needs no geometry) and a silent no-op when switching
+    /// *on*, which is the more confusing half.
+    pub last_damage: Vec<Rect>,
     /// Animation phase in logical pixels, and its direction.
     pub phase: (f32, f32),
     /// Whether the server has told us this window exists on an output.
@@ -90,6 +100,7 @@ impl Window {
             ids: Ids::for_window(i),
             size: WINDOW_SIZE,
             follower: Rect::EMPTY,
+            last_damage: Vec::new(),
             phase: (0.0, ANIMATE_STEP),
             configured: false,
             closed: false,
@@ -384,6 +395,7 @@ impl App {
                 batch.extend(msgs);
                 batch.extend(scene::damage_outlines(win.ids, &damage, self.show_damage));
                 self.windows[i].follower = to;
+                self.windows[i].last_damage = damage;
                 // The newest input in the batch is the one the frame
                 // answers; see the module docs.
                 input_ns = Some(input_ns.map_or(ns, |old: u64| old.max(ns)));
@@ -419,7 +431,12 @@ impl App {
         // before that commit would bake the in-flight one into the offset
         // and report a constant startup violation forever; marking here
         // makes the offset cancel between any two marks.
-        if self.frames_received == 1 && self.pacing_mark == (0, 0) {
+        //
+        // `>= 1`, not `== 1`: with several windows a single wakeup can
+        // deliver one `Frame` per window and take the counter straight
+        // from 0 to N, and an equality test would then never fire at all,
+        // silently degenerating `pacing_since_mark` into raw totals.
+        if self.frames_received >= 1 && self.pacing_mark == (0, 0) {
             self.mark_pacing();
         }
         Ok(events.len())
@@ -431,12 +448,16 @@ impl App {
             keys::Q => self.done = true,
             keys::D => {
                 self.show_damage = !self.show_damage;
-                // Redraw the outlines at their current state right away,
-                // so `d` is visible without moving the pointer.
+                // Redraw the *last* damage rects at the new state right
+                // away, so `d` is visible without moving the pointer.
+                // Passing an empty list would resolve every slot to
+                // `None` and hide all eight, which makes switching on a
+                // no-op until the next motion.
+                let show = self.show_damage;
                 let batch: Vec<ClientMsg> = self
                     .windows
                     .iter()
-                    .flat_map(|w| scene::damage_outlines(w.ids, &[], self.show_damage))
+                    .flat_map(|w| scene::damage_outlines(w.ids, &w.last_damage, show))
                     .collect();
                 self.commit(&batch, None)?;
                 self.flush_blocking()?;

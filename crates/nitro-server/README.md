@@ -550,7 +550,7 @@ and the pointer being driven at ~100 Hz. Full method and distributions in
 |--------------------------|-----------------------------------------------------------|
 | idle CPU                 | 0.0 %, zero frames in 5 s with a client connected and visible |
 | CPU under load           | 1.5 % animating at 60 Hz, 2.2 % under 100 Hz pointer input |
-| RSS                      | server 7.5 MB (7.6 MB with 5 windows), `nitro-demo` 3.2 MB |
+| RSS                      | server **19.7 MB** (19.8 MB with 5 windows), `nitro-demo` 3.1 MB. The server was 7.5 MB before M2-pre; `FontDb` holding every face's bytes is +12.2 MB and puts it 2.5× over the ≤ 8 MB budget — issue #528 |
 | flip interval            | mean 16 666 µs, min 16 653, max 16 680                    |
 | `paint_us`               | min 142, mean 189, max 323 per pointer-move frame (13 459 on a full repaint) |
 | `damage_px_mean`         | 1 560 of 2 073 600 in steady state                        |

@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use nitro_demo::app::App;
+use nitro_demo::app::{App, keys};
 use nitro_demo::args::{Args, Mode};
 use nitro_demo::geom::FOLLOWER_SIZE;
 use nitro_demo::scene::{Ids, WINDOW_SIZE};
@@ -35,6 +35,7 @@ use nitro_server::input::{FakeInput, InputEvent};
 use nitro_server::{BackendKind, Config, run};
 use nitro_wire::client::Connection;
 use nitro_wire::msg::ServerMsg;
+use nitro_wire::types::ButtonState;
 
 /// Wait for a condition, polling. Every wait here has a deadline: a test
 /// that hangs tells you nothing.
@@ -205,6 +206,24 @@ fn follow_args() -> Args {
         seconds: 0,
         ..Args::default()
     }
+}
+
+/// A key-press message aimed at the demo's first window.
+///
+/// Built here rather than injected through `FakeInput` because a key only
+/// reaches a client that has keyboard focus, and focus follows a click:
+/// routing a real key would mean synthesising a button press first, which
+/// tests the server's focus path rather than the demo's key handling.
+fn key_press(keycode: u32) -> ServerMsg {
+    ServerMsg::Key(nitro_wire::msg::Key {
+        window: Ids::for_window(0).window,
+        keycode,
+        state: ButtonState::Pressed,
+        mods: 0,
+        keysym: 0,
+        time_ns: nitro_demo::monotonic_ns(),
+        utf8: String::new(),
+    })
 }
 
 #[test]
@@ -469,6 +488,93 @@ fn an_idle_demo_leaves_the_server_flipping_nothing() {
     app.tick(Some(Duration::from_millis(50)), &mut events)
         .unwrap();
     assert!(events.is_empty(), "an idle server sent {events:?}");
+
+    harness.quit();
+}
+
+/// `d` must be symmetric: switching the outlines *on* has to redraw the
+/// last damage rects immediately, not wait for the pointer to move again.
+///
+/// The bug this pins was exactly half-working — hiding needs no geometry,
+/// so switching off looked fine while switching on was a silent no-op.
+#[test]
+fn toggling_damage_outlines_redraws_the_last_damage_both_ways() {
+    let harness = Harness::start("toggle", 1280, 720);
+    // Start with the outlines OFF, so the first toggle is the "on" case.
+    let mut app = harness.demo(follow_args());
+    pump(&mut app, "Configure", |a| a.windows[0].configured);
+
+    for (i, (x, y)) in [(0.15, 0.15), (0.30, 0.28)].into_iter().enumerate() {
+        harness.input.push(InputEvent::PointerAbsolute {
+            x,
+            y,
+            time_ns: nitro_demo::monotonic_ns() + i as u64,
+        });
+        let before = app.frames_committed;
+        pump(&mut app, "the motion to be answered", |a| {
+            a.frames_committed > before
+        });
+    }
+    assert!(
+        !app.windows[0].last_damage.is_empty(),
+        "the move recorded no damage to redraw"
+    );
+
+    // Press `d`: the outlines come on, using the remembered rects.
+    app.handle(&[key_press(keys::D)]).unwrap();
+    assert!(app.show_damage);
+    harness.settle();
+    let img = harness.shot();
+    let f = app.windows[0].follower;
+    let edge = img.pixel((f.x + f.w / 2.0) as u32, f.y as u32 + 1);
+    assert_eq!(
+        edge & 0x00FF_FFFF,
+        0x00FF_3030,
+        "`d` did not draw the outline without a further pointer move"
+    );
+
+    // And `d` again takes them away, equally without moving the pointer.
+    app.handle(&[key_press(keys::D)]).unwrap();
+    assert!(!app.show_damage);
+    harness.settle();
+    let img = harness.shot();
+    let edge = img.pixel((f.x + f.w / 2.0) as u32, f.y as u32 + 1);
+    assert_ne!(
+        edge & 0x00FF_FFFF,
+        0x00FF_3030,
+        "`d` did not hide the outline"
+    );
+
+    harness.quit();
+}
+
+/// With several windows one wakeup can deliver every window's `Frame` at
+/// once, taking `frames_received` from 0 straight past 1. The pacing mark
+/// must still be taken, or `pacing_since_mark` silently becomes totals.
+#[test]
+fn the_pacing_mark_survives_several_frame_callbacks_in_one_wakeup() {
+    let harness = Harness::start("pacing-multi", 1280, 720);
+    harness.park_cursor(0.99, 0.99);
+    let mut app = harness.demo(Args {
+        mode: Mode::Animate,
+        windows: 3,
+        ..Args::default()
+    });
+
+    pump(&mut app, "frame callbacks on every window", |a| {
+        a.frames_received >= 6
+    });
+    // The mark was taken, so the interval is smaller than the run.
+    let (commits, callbacks) = app.pacing_since_mark();
+    assert!(
+        commits < app.frames_committed,
+        "the pacing mark never fired: {commits} == total {}",
+        app.frames_committed
+    );
+    assert!(
+        commits <= callbacks,
+        "{commits} commits for {callbacks} callbacks"
+    );
 
     harness.quit();
 }
