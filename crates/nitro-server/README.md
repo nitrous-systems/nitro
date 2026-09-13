@@ -666,7 +666,7 @@ are taken at and why (see `docs/latency.md` §2 and §4). Sizes and RSS in
 |--------------------------|-----------------------------------------------------------|
 | idle CPU                 | 0.0 %, zero frames in 5 s with a client connected and visible — including 5 s after a deferral, with `voluntary_ctxt_switches` flat |
 | CPU under load           | 1.5 % animating at 60 Hz, 2.2 % under 100 Hz pointer input |
-| RSS                      | server **8.3 MB** (8.4 MB with 5 windows), `nitro-demo` 3.1 MB. Was 19.7 MB: `FontDb` used to hold every indexed face's bytes, which is the whole of the +12.2 MB over the pre-M2 7.5 MB. Lazy loading (issue #528) gives it back — 0 font bytes resident in the settled state, 8.8 MB with a text-heavy client on screen and a 10.5 MB `VmHWM` peak while it paints |
+| RSS                      | server **8.2 MB** (8.3 MB with 5 windows), `nitro-demo` 3.1 MB. Was 19.7 MB: `FontDb` used to hold every indexed face's bytes, which is the whole of the +12.2 MB over the pre-M2 7.5 MB. Lazy loading (issue #528) gives it back — 0 font bytes resident in the settled state, 8.8 MB with a text-heavy client on screen and a 10.6 MB `VmHWM` peak while it paints |
 | flip interval            | mean 16 666 µs, min 16 654, max 16 675                    |
 | `paint_us`               | min 142, mean 201, max 323 per pointer-move frame (13 459 on a full repaint) |
 | `damage_px_mean`         | 1 560 of 2 073 600 in steady state                        |
