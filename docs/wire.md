@@ -803,6 +803,31 @@ The ops that act on one of the sender's *own* windows (`SetLayer`,
 `NodeId`, like every other window op. Naming a window the sender does not
 own is `Error { UnknownNode }`.
 
+### When a shell op takes effect
+
+The split follows what each op *is*, and it is not uniform:
+
+* The four that name the sender's own window — `SetLayer`,
+  `SetExclusiveZone`, `SetAnchor`, `GrabKeyboard` — are **buffered and
+  applied at the sender's `Commit`**, exactly like `SetBounds` or
+  `SetWindowState`. They have to be: a bar sends `CreateWindow` and
+  `SetAnchor` in one transaction, and an anchor applied on receipt would be
+  looking for a window the commit has not created yet.
+* The other seven are answered **on receipt**. `WindowList` and `Outputs`
+  are questions, like `MeasureText`; `BindKey`/`UnbindKey` are
+  registrations; and the three `WindowRef` ops act on *another* client's
+  window, which the sender's own commit has nothing to do with.
+
+The **privilege check is always on receipt**, whichever group an op is in:
+an unprivileged client is disconnected whether or not it ever commits.
+
+Within a commit the four run after every ordinary mutation and *before* the
+batch's `SetWindowState` requests, for the same reason state requests come
+last: an anchor decides a window's whole rectangle, so it must win over the
+client's own `SetBounds` in that batch — and a `Maximized` asked for in the
+same batch must win over the anchor, which is the shell deliberately handing
+its window to the window manager.
+
 ### `SetLayer` — 0x0401
 
 | field | type | meaning |

@@ -63,6 +63,10 @@ const HOTKEY_TAP: u32 = 2;
 /// X11 `Return`.
 const XK_RETURN: u32 = 0xff0d;
 
+/// The bar's gradient, top and bottom.
+const BAR_TOP: Color = Color::rgb(0x2C, 0x3E, 0x55);
+const BAR_BOTTOM: Color = Color::rgb(0x1A, 0x22, 0x30);
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut conn = Connection::connect_shell("shell-probe")?;
     emit(&format!(
@@ -95,8 +99,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Fill::Linear {
                 start: Point::new(0.0, 0.0),
                 end: Point::new(0.0, BAR_H),
-                c0: Color::rgb(0x2C, 0x3E, 0x55),
-                c1: Color::rgb(0x1A, 0x22, 0x30),
+                c0: BAR_TOP,
+                c1: BAR_BOTTOM,
             },
         )
         // Span the top edge, and reserve the strip. Anchor *and* zone,
@@ -105,6 +109,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .set_anchor(BAR, anchor::TOP | anchor::LEFT | anchor::RIGHT, 0)
         .set_exclusive_zone(BAR, Edge::Top, BAR_H as u32)
         .commit(1)?;
+    // The serial is the client's own counter; `Configure`s are answered with
+    // later ones below.
+    let mut serial: u32 = 1;
     flush_blocking(&mut conn)?;
 
     // The window list and the output list. Both are answered on receipt and
@@ -135,9 +142,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         for msg in &events {
             emit(&describe(msg))?;
-            if let ServerMsg::Closed(_) = msg {
-                emit("the bar was closed; exiting")?;
-                return Ok(());
+            match msg {
+                // Answer the anchor's `Configure` the way a real bar must:
+                // the server decided the window's size, and the client's own
+                // nodes do not resize themselves. Without this the bar keeps
+                // painting its original width and the desktop shows through
+                // the rest of the strip — which is exactly what the first
+                // run of this probe showed.
+                ServerMsg::Configure(c) if c.window == BAR => {
+                    serial += 1;
+                    conn.tx()
+                        .bounds(BAR_FILL, Rect::new(0.0, 0.0, c.size.w, c.size.h))
+                        .fill(
+                            BAR_FILL,
+                            Fill::Linear {
+                                start: Point::new(0.0, 0.0),
+                                end: Point::new(0.0, c.size.h),
+                                c0: BAR_TOP,
+                                c1: BAR_BOTTOM,
+                            },
+                        )
+                        .commit(serial)?;
+                }
+                ServerMsg::Closed(_) => {
+                    emit("the bar was closed; exiting")?;
+                    return Ok(());
+                }
+                _ => {}
             }
         }
         flush_blocking(&mut conn)?;

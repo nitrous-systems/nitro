@@ -31,6 +31,41 @@ use nitro_wire::types::{Edge, WindowRef, anchor, mod_mask};
 
 use crate::keyboard::Mods;
 
+/// One window-targeting shell op, with its target already resolved.
+///
+/// These four are the shell ops that name the sender's **own** window and
+/// change what is on screen, so unlike the rest they are *buffered* and
+/// applied at the client's `Commit`, exactly like `SetBounds` or
+/// `SetWindowState`. The reason is ordering, and the hardware probe found it
+/// the hard way: a bar naturally sends `CreateWindow`, `SetAnchor` and
+/// `SetExclusiveZone` in one transaction, and an op answered on receipt
+/// would be looking for a window the commit has not created yet.
+///
+/// The *privilege* check still happens on receipt — see
+/// `Server::handle_wire_msg` — so an unprivileged client is disconnected
+/// whether or not it ever commits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowOp {
+    /// `SetLayer`: move between stacking layers.
+    Layer(nitro_scene::Layer),
+    /// `SetExclusiveZone`: reserve (or with `px: 0` release) screen space.
+    Zone {
+        /// Which edge of the output the space comes off.
+        edge: Edge,
+        /// Logical pixels to reserve; 0 releases.
+        px: u32,
+    },
+    /// `SetAnchor`: stick to the output's edges.
+    Anchor {
+        /// Edge bitmask from [`anchor`](nitro_wire::types::anchor).
+        edges: u8,
+        /// Gap held on each anchored edge.
+        margin: u32,
+    },
+    /// `GrabKeyboard`: take or release the keyboard.
+    Grab(bool),
+}
+
 /// One window's reservation along one output edge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Zone {

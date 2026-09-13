@@ -42,10 +42,11 @@ use nitro_wire::error::Error as WireError;
 use nitro_wire::msg::{self, ClientMsg, ServerMsg};
 use nitro_wire::server::{ClientStream, code_for};
 use nitro_wire::types::{
-    Align, BufferId, ErrorCode, Layer, NodeId, NodeKind, WindowState as WireWindowState, format,
-    window_flags,
+    Align, BufferId, ErrorCode, Layer, NodeId, NodeKind, WindowState as WireWindowState, anchor,
+    format, window_flags,
 };
 
+use crate::shell;
 use crate::text::{StyleRequest, TextEngine};
 use crate::{debug, warn};
 
@@ -260,6 +261,14 @@ pub struct ApplyOutcome {
     /// the bar its list entry moved". An app id change is the second
     /// without the first.
     pub relisted: Vec<WindowKey>,
+    /// Shell ops naming one of this client's own windows, in arrival order.
+    ///
+    /// Buffered rather than answered on receipt for one reason the hardware
+    /// probe found: a bar sends `CreateWindow` and `SetAnchor` in the same
+    /// transaction, and an anchor applied on receipt would be looking for a
+    /// window the commit has not created yet. The privilege check is still
+    /// on receipt, so an unprivileged client never gets this far.
+    pub shell_ops: Vec<(WindowKey, shell::WindowOp)>,
 }
 
 /// Apply one client's buffered mutations to the scene, atomically as far as
@@ -582,16 +591,68 @@ fn apply_msg(
                 .set_image(client.id, key, image)
                 .map_err(|e| scene_err("SetImage", e))
         }
-        // The shell ops are answered on receipt, never buffered: they are
-        // not scene mutations a frame has to show atomically. `Server` keeps
-        // the privilege check and the handling together in one place; see
-        // `Server::handle_shell_msg`.
-        ClientMsg::SetLayer(_)
-        | ClientMsg::SetExclusiveZone(_)
-        | ClientMsg::SetAnchor(_)
-        | ClientMsg::BindKey(_)
+        // The shell ops that name one of the *sender's own* windows are
+        // buffered like every other mutation, so a bar can create a window
+        // and anchor it in one transaction. The privilege check happened on
+        // receipt (`Server::handle_wire_msg`), so reaching here means the
+        // client is allowed to send these.
+        ClientMsg::SetLayer(m) => {
+            let win = window_of(client, m.window)?;
+            if m.layer == Layer::Normal {
+                // Not a no-op: a shell surface asking to be an ordinary
+                // window has misunderstood the op, and obliging silently
+                // would put a bar into the window-management z-order where a
+                // click could raise a document over it.
+                return Err(ApplyError::new(
+                    ErrorCode::Protocol,
+                    "SetLayer: Normal is not a shell layer",
+                ));
+            }
+            outcome
+                .shell_ops
+                .push((win, shell::WindowOp::Layer(scene_layer(m.layer))));
+            Ok(())
+        }
+        ClientMsg::SetExclusiveZone(m) => {
+            let win = window_of(client, m.window)?;
+            outcome.shell_ops.push((
+                win,
+                shell::WindowOp::Zone {
+                    edge: m.edge,
+                    px: m.px,
+                },
+            ));
+            Ok(())
+        }
+        ClientMsg::SetAnchor(m) => {
+            let win = window_of(client, m.window)?;
+            if m.edges & anchor::ALL != m.edges {
+                return Err(ApplyError::new(
+                    ErrorCode::Protocol,
+                    format!("SetAnchor: reserved edge bits in {:#x}", m.edges),
+                ));
+            }
+            outcome.shell_ops.push((
+                win,
+                shell::WindowOp::Anchor {
+                    edges: m.edges,
+                    margin: m.margin,
+                },
+            ));
+            Ok(())
+        }
+        ClientMsg::GrabKeyboard(m) => {
+            let win = window_of(client, m.window)?;
+            outcome.shell_ops.push((win, shell::WindowOp::Grab(m.on)));
+            Ok(())
+        }
+        // The rest of the shell ops are answered on receipt: they are not
+        // scene mutations a frame has to show atomically. `WindowList` is a
+        // question, `BindKey` a registration, and the three `WindowRef` ops
+        // act on *another* client's window, which this client's commit has
+        // nothing to do with. See `Server::handle_shell_msg`.
+        ClientMsg::BindKey(_)
         | ClientMsg::UnbindKey(_)
-        | ClientMsg::GrabKeyboard(_)
         | ClientMsg::WindowList(_)
         | ClientMsg::FocusWindow(_)
         | ClientMsg::CloseWindow(_)

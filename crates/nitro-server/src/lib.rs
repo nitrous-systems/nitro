@@ -3404,15 +3404,11 @@ impl Server {
             return false;
         }
         match msg {
-            ClientMsg::SetLayer(m) => self.shell_set_layer(token, m),
-            ClientMsg::SetExclusiveZone(m) => self.shell_set_zone(token, m),
-            ClientMsg::SetAnchor(m) => self.shell_set_anchor(token, m),
             ClientMsg::BindKey(m) => self.shell_bind_key(token, m),
             ClientMsg::UnbindKey(m) => {
                 self.hotkeys.unbind(token, m.id);
                 true
             }
-            ClientMsg::GrabKeyboard(m) => self.shell_grab_keyboard(token, m),
             ClientMsg::WindowList(_) => {
                 if !self.window_watchers.contains(&token) {
                     self.window_watchers.push(token);
@@ -3451,72 +3447,63 @@ impl Server {
                 }
                 true
             }
+            // The four that name the sender's *own* window are buffered and
+            // applied at its `Commit`, by `Server::apply_shell_op`: a bar
+            // sends `CreateWindow` and `SetAnchor` in one transaction, so an
+            // anchor applied here would be looking for a window that does not
+            // exist yet. Only the privilege check belongs on receipt.
             other => {
-                debug_assert!(false, "{} is not a shell op", other.name());
+                debug_assert!(
+                    matches!(
+                        other,
+                        ClientMsg::SetLayer(_)
+                            | ClientMsg::SetExclusiveZone(_)
+                            | ClientMsg::SetAnchor(_)
+                            | ClientMsg::GrabKeyboard(_)
+                    ),
+                    "{} is not a shell op",
+                    other.name()
+                );
+                let Some(client) = self.wire_clients.get_mut(&token) else {
+                    return false;
+                };
+                client.pending.push(Pending::Msg(Box::new(other)));
                 true
             }
         }
     }
 
-    /// `SetLayer`: move one of this client's own windows between layers.
-    fn shell_set_layer(&mut self, token: u64, m: msg::SetLayer) -> bool {
-        // `Normal` is refused rather than accepted as a no-op: a shell
-        // surface asking to be an ordinary window has misunderstood what
-        // this op is for, and silently obliging would leave a bar in the
-        // window-management z-order where a click could raise a document
-        // over it.
-        if m.layer == nitro_wire::types::Layer::Normal {
-            self.disconnect(
-                token,
-                Some((
-                    0,
-                    ErrorCode::Protocol,
-                    "SetLayer: Normal is not a shell layer".to_owned(),
-                )),
-            );
-            return false;
+    /// Apply one buffered shell op at its client's commit.
+    ///
+    /// The window was resolved by `clients::apply_msg`, which is also where
+    /// a bad `NodeId` or a reserved bit aborted the batch — so by the time
+    /// this runs the op is known-good and cannot fail the transaction.
+    fn apply_shell_op(&mut self, win: WindowKey, op: shell::WindowOp) {
+        match op {
+            shell::WindowOp::Layer(layer) => {
+                if let Err(e) = self.scene.set_layer(win, layer) {
+                    warn!("SetLayer: {e}");
+                }
+            }
+            shell::WindowOp::Zone { edge, px } => {
+                self.zones.set_zone(win, edge, px);
+                // The work area just changed, so every window *sized by* it
+                // has to be re-sized: a maximized window must give the bar
+                // its strip immediately, not at the next maximize.
+                self.reflow_work_area();
+            }
+            shell::WindowOp::Anchor { edges, margin } => {
+                self.zones.set_anchor(win, edges, margin);
+                self.apply_anchor(win);
+            }
+            shell::WindowOp::Grab(on) => {
+                if on {
+                    self.grab = Some(win);
+                } else if self.grab == Some(win) {
+                    self.grab = None;
+                }
+            }
         }
-        let Some(win) = self.shell_window(token, m.window, "SetLayer") else {
-            return false;
-        };
-        if let Err(e) = self.scene.set_layer(win, clients::scene_layer(m.layer)) {
-            warn!("SetLayer: {e}");
-        }
-        true
-    }
-
-    /// `SetExclusiveZone`: reserve, or release, space along an output edge.
-    fn shell_set_zone(&mut self, token: u64, m: msg::SetExclusiveZone) -> bool {
-        let Some(win) = self.shell_window(token, m.window, "SetExclusiveZone") else {
-            return false;
-        };
-        self.zones.set_zone(win, m.edge, m.px);
-        // The work area just changed, so every window that is *sized by* it
-        // has to be re-sized: a maximized window must give the bar its strip
-        // immediately, not at the next maximize.
-        self.reflow_work_area();
-        true
-    }
-
-    /// `SetAnchor`: stick a window to its output's edges.
-    fn shell_set_anchor(&mut self, token: u64, m: msg::SetAnchor) -> bool {
-        if m.edges & !nitro_wire::types::anchor::ALL != 0 {
-            self.disconnect(
-                token,
-                Some((
-                    0,
-                    ErrorCode::Protocol,
-                    format!("SetAnchor: reserved edge bits in {:#x}", m.edges),
-                )),
-            );
-            return false;
-        }
-        let Some(win) = self.shell_window(token, m.window, "SetAnchor") else {
-            return false;
-        };
-        self.zones.set_anchor(win, m.edges, m.margin);
-        self.apply_anchor(win);
-        true
     }
 
     /// `BindKey`: claim a server-global chord.
@@ -3546,19 +3533,6 @@ impl Server {
         }
     }
 
-    /// `GrabKeyboard`: route every key to one of this client's windows.
-    fn shell_grab_keyboard(&mut self, token: u64, m: msg::GrabKeyboard) -> bool {
-        let Some(win) = self.shell_window(token, m.window, "GrabKeyboard") else {
-            return false;
-        };
-        if m.on {
-            self.grab = Some(win);
-        } else if self.grab == Some(win) {
-            self.grab = None;
-        }
-        true
-    }
-
     /// The window a live keyboard grab points at, if any.
     ///
     /// A grab on a window that is no longer *visible* does not count, and is
@@ -3582,30 +3556,6 @@ impl Server {
             return None;
         }
         Some(win)
-    }
-
-    /// Resolve one of the *sender's own* windows, disconnecting it if the id
-    /// is not one of its windows.
-    ///
-    /// `UnknownNode` and a close, not a silent ignore: a shell that named a
-    /// window it does not own has lost track of its own tree, which is
-    /// exactly the reasoning behind every other fatal error here.
-    fn shell_window(&mut self, token: u64, id: NodeId, what: &str) -> Option<WindowKey> {
-        let found = self
-            .wire_clients
-            .get(&token)
-            .and_then(|c| c.windows.get(&id).copied());
-        if found.is_none() {
-            self.disconnect(
-                token,
-                Some((
-                    0,
-                    ErrorCode::UnknownNode,
-                    format!("{what}: no window with id {}", id.raw()),
-                )),
-            );
-        }
-        found
     }
 
     /// Put an anchored window where its anchor says, resizing it if the
@@ -3888,6 +3838,7 @@ impl Server {
             self.retitle(win);
         }
         let relisted = outcome.relisted;
+        let shell_ops = outcome.shell_ops;
         // State requests are applied last, after every geometry mutation
         // in the batch: `Maximized` has to win over the client's own
         // `SetBounds`, not race it. `set_state` reaches the owning client
@@ -3895,6 +3846,15 @@ impl Server {
         // of this function works through it.
         let has_states = !outcome.state_requests.is_empty();
         self.wire_clients.insert(token, client);
+        // The shell ops go *before* the state requests and after everything
+        // else, for the same reason `SetWindowState` is last: an anchor
+        // decides a window's whole rectangle, so it has to win over the
+        // client's own `SetBounds` in the same batch — and a `Maximized`
+        // asked for in that batch has to win over the anchor, which is the
+        // shell deliberately handing its window to the window manager.
+        for (win, op) in shell_ops {
+            self.apply_shell_op(win, op);
+        }
         for (win, state) in outcome.state_requests {
             self.set_state(win, state);
         }

@@ -736,11 +736,15 @@ limit of 1024 — but real.
   `unplug` migrating it back; and a scale-2 output drawing twice the
   device pixels for the same logical window.
 - `tests/shell.rs` drives the M3-B shell socket through the same real loop,
-  25 cases: the two sockets' capability bits and three shell clients at
+  26 cases: the two sockets' capability bits and three shell clients at
   once; **every one of the eleven shell ops** refused with `Protocol` on the
-  ordinary socket, one connection each (a check that covered ten would look
-  exactly like a working one until someone found the eleventh); a 32-px top
-  exclusive zone shortening a maximized window's `Configure` by exactly 32
+  ordinary socket, one connection each and *without a commit* — the
+  privilege check is on receipt (a check that covered ten would look
+  exactly like a working one until someone found the eleventh); a bar
+  creating, anchoring and reserving in **one transaction**, which is what
+  the hardware probe caught the first implementation getting wrong; a 32-px
+  top exclusive zone shortening a maximized window's `Configure` by exactly
+  32
   and offsetting it by 32, released by `px: 0` and by minimizing the bar; a
   zone moving a newly *placed* window, asserted against `wm::place` on the
   shrunken area; a `Top` bar painted over a maximized window in a
@@ -856,3 +860,41 @@ because a pointer move damaged the cursor and flipped before the client
 had answered (issue #529). With that flip deferred, both land at ~9.3 ms
 and the gap between them is the client's own reaction time, which is what
 it should have been measuring all along.
+
+### M3-B: the shell socket
+
+Measured on the same box with `examples/shell_probe` (a `Top` bar, a 32-px
+top exclusive zone, a `TOP|LEFT|RIGHT` anchor, `Super+Return` and the
+bare-Super tap bound) and two `nitro-calc` windows, driven with `ydotool`.
+
+| what | value |
+|---|---|
+| sockets | `wire.sock`, `shell.sock` and `control.sock` in one `0700` directory; the probe's `Welcome` is `caps=0x32` (`TEXT|WM|SHELL`) and an ordinary client's is `0x12` |
+| anchor | asked for 400 px wide, `Configure`d to **1920×32 at (0,0)** and re-`Configure`d after answering — a bar that ignores that `Configure` paints its original width, which is how the probe found the bug below |
+| exclusive zone | a maximized `nitro-calc`'s own title bar starts at **y=33**, with the bar owning y=0..31; the strip is **given back** when the probe is killed (title bar back at y=0..27) |
+| layers | the bar's pixels win over the maximized window's throughout its strip, which is the `Top`-over-`Normal` ordering |
+| hotkeys | `Super+Return` → `HotKey id=1` press *and* release; bare Super tap → one `HotKey id=2 pressed=false`; **`Super+M` still maximizes** (`WindowInfo state=Maximized`) rather than reaching the shell |
+| window list | live: a second `nitro-calc` produced a new `WindowInfo`, and the focus change produced one for *each* window |
+| outputs | `OutputInfo id=1 1920x1080@60.000Hz scale=1 at 0,0 name="HDMI-A-1"` |
+| disconnect | `pkill shell_probe` → `shell_clients 0`, `hotkeys 0`, `exclusive_zones 0`; nothing leaks |
+| idle CPU, bar + 2 windows | **0 frames, 0 CPU ticks and +2 voluntary context switches in 5 s**, `top` 0.0 % |
+| RSS | **10 992 kB** with the bar and two `nitro-calc` windows (`VmHWM` 24 908 kB), against the 11 336 kB M3-A measured for five `nitro-calc` windows — the shell state is a handful of hash maps |
+
+Two of those need reading carefully.
+
+**A zone costs the idle case nothing, and that is not an accident.** The
+work-area subtraction happens only when something *asks* for the work area
+(a maximize, a placement), and a zone change reflows only `Maximized`
+windows. So the bar's strip is not a per-frame cost, and the 0-frames-in-5s
+result holds with it up.
+
+**The probe earned its keep twice.** First, the four window-targeting shell
+ops were originally answered on receipt, and the probe sent the transaction
+a real bar sends — `CreateWindow`, `SetAnchor`, `SetExclusiveZone` in one
+commit — and got `UnknownNode` for a window `Commit` had not created yet.
+They are buffered now (`docs/shell.md`), with
+`a_bar_can_create_anchor_and_reserve_in_one_transaction` as the regression
+test. Second, the probe itself did not answer the `Configure` its anchor
+produced, so the bar painted 400 of its 1920 px and the desktop showed
+through the rest — a client-side bug, but exactly the one a real bar makes,
+so the probe now answers it and says why.

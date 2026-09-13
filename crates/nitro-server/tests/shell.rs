@@ -533,6 +533,12 @@ fn every_shell_op_is_refused_on_the_ordinary_socket() {
     // that *no* op leaks through: a privilege check that covered ten of
     // eleven messages would look exactly like a working one until someone
     // found the eleventh.
+    //
+    // Note the `finish()` rather than `commit()` on the four buffered ops:
+    // the privilege check is on **receipt**, so an unprivileged client is
+    // disconnected whether or not it ever commits. Requiring a commit first
+    // would let a client that never sends one sit there having spoken an op
+    // it may not use.
     let h = Harness::start("nopriv-all", OUT.0, OUT.1);
     for (name, op) in [
         ("SetLayer", 0u8),
@@ -594,6 +600,59 @@ fn every_shell_op_is_refused_on_the_ordinary_socket() {
         drop(conn);
         wait_for("the client to be gone", || h.stat("clients") == 0);
     }
+    h.quit();
+}
+
+#[test]
+fn a_bar_can_create_anchor_and_reserve_in_one_transaction() {
+    // The shape a real bar actually sends, and the bug the hardware probe
+    // found: `CreateWindow`, `SetAnchor` and `SetExclusiveZone` in *one*
+    // commit. The four window-targeting shell ops are buffered like every
+    // other mutation precisely so this works — an anchor applied on receipt
+    // would be looking for a window the commit has not created yet, and the
+    // probe got `UnknownNode` and a dead connection.
+    let h = Harness::start("one-tx", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut shell = h.shell("bar");
+    let root = NodeId(1);
+    let fill = NodeId(2);
+    shell
+        .tx()
+        .create_window_with(
+            root,
+            "bar",
+            Size::new(100.0, ZONE as f32),
+            Layer::Top,
+            window_flags::UNDECORATED | window_flags::NO_FOCUS,
+        )
+        .create_rect(fill, root, Rect::new(0.0, 0.0, 100.0, ZONE as f32))
+        .fill_solid(fill, BAR_BLUE)
+        .set_anchor(root, anchor::TOP | anchor::LEFT | anchor::RIGHT, 0)
+        .set_exclusive_zone(root, Edge::Top, ZONE)
+        .commit(1)
+        .unwrap();
+    shell.flush().unwrap();
+    h.settle();
+
+    // Not disconnected, and the anchor took: the bar spans the top edge at
+    // the size the anchor decided, not the 100 px it asked for.
+    assert!(!shell.is_closed(), "one transaction must be enough");
+    let (pos, size) = expect(
+        &mut shell,
+        &mut inbox.0,
+        "the anchored Configure",
+        |m| match m {
+            ServerMsg::Configure(c) if c.window == root && c.size.w == OUT.0 as f32 => {
+                Some((c.position, c.size))
+            }
+            _ => None,
+        },
+    );
+    assert_eq!(pos, nitro_core::Point::new(0.0, 0.0));
+    assert_eq!(size, Size::new(OUT.0 as f32, ZONE as f32));
+    assert_eq!(h.stat("exclusive_zones"), 1, "and so did the zone");
+
+    drop(shell);
     h.quit();
 }
 
@@ -801,10 +860,13 @@ fn setting_the_normal_layer_from_the_shell_is_a_protocol_error() {
         Layer::Top,
         1,
     );
+    // Committed, because the four window-targeting shell ops are buffered
+    // like every other mutation — a bar creates a window and anchors it in
+    // one transaction, so they have to be.
     shell
         .tx()
         .set_layer(win.root, Layer::Normal)
-        .finish()
+        .commit(2)
         .unwrap();
     shell.flush().unwrap();
     let code = expect(&mut shell, &mut inbox.0, "an Error", |m| match m {
@@ -895,7 +957,7 @@ fn reserved_anchor_bits_are_a_protocol_error() {
         Layer::Top,
         1,
     );
-    shell.tx().set_anchor(win.root, 0xf0, 0).finish().unwrap();
+    shell.tx().set_anchor(win.root, 0xf0, 0).commit(2).unwrap();
     shell.flush().unwrap();
     let code = expect(&mut shell, &mut inbox.0, "an Error", |m| match m {
         ServerMsg::Error(e) => Some(e.code),
@@ -932,7 +994,7 @@ fn a_shell_op_naming_someone_elses_window_is_an_unknown_node() {
     shell
         .tx()
         .set_exclusive_zone(app_win.root, Edge::Top, 8)
-        .finish()
+        .commit(1)
         .unwrap();
     shell.flush().unwrap();
     let code = expect(&mut shell, &mut inbox.0, "an Error", |m| match m {

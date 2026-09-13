@@ -61,7 +61,36 @@ not have has misunderstood its own situation, and everything it sends
 afterwards is guesswork. `tests/shell.rs` asserts this for **every one of
 the eleven ops**, one connection each, because a check that covered ten of
 them would look exactly like a working one until someone found the
-eleventh.
+eleventh. It also asserts it *without a commit*, which matters for the four
+buffered ops below: the check is on receipt, so a client that never commits
+is still disconnected rather than sitting there having spoken an op it may
+not use.
+
+### Buffered or immediate
+
+The shell ops do **not** all take effect at the same moment, and the split
+follows what each one is:
+
+| ops | when | why |
+|---|---|---|
+| `SetLayer`, `SetExclusiveZone`, `SetAnchor`, `GrabKeyboard` | at the sender's `Commit` | they name the sender's **own** window, and a bar sends `CreateWindow` and `SetAnchor` in one transaction |
+| `BindKey`, `UnbindKey`, `WindowList`, `Outputs`, `FocusWindow`, `CloseWindow`, `SetWindowStateFor` | on receipt | questions and registrations, or ops on *another* client's window — none of which the sender's commit has anything to do with |
+
+The first row is the hardware probe's finding, and worth recording because
+the first implementation got it wrong in a way no unit test caught: the
+four ops were answered on receipt, `shell_probe` sent the obvious
+transaction, and `SetAnchor` got `UnknownNode` for a window `Commit` had
+not created yet. `clients::apply_msg` now resolves the window (so a bad
+`NodeId` or a reserved bit still aborts the batch, fatally) and pushes a
+`shell::WindowOp` into `ApplyOutcome`; `Server::apply_shell_op` applies it
+at the commit. `a_bar_can_create_anchor_and_reserve_in_one_transaction` is
+the regression test.
+
+Within a commit the four run after every ordinary mutation and *before* the
+batch's state requests. An anchor decides a window's whole rectangle, so it
+has to win over the client's own `SetBounds` in that batch — and a
+`Maximized` asked for in the same batch has to win over the anchor, which is
+the shell deliberately handing its window to the window manager.
 
 ### What this model is worth, and what it is not
 
@@ -359,10 +388,12 @@ not working":
 * `src/lib.rs` unit-tests the two things the privilege check is made of:
   that only shell tokens read as privileged, and that `is_shell_op`
   classifies every shell op and no ordinary one.
-* `tests/shell.rs` drives 25 cases through the real event loop on the fake
+* `tests/shell.rs` drives 26 cases through the real event loop on the fake
   backend: the two sockets' capability bits and three shell clients at
   once; **every** shell op refused on the wire socket, one connection
-  each; a 32-px top zone shortening a maximized window's `Configure` by
+  each, and refused *without a commit*; a bar creating, anchoring and
+  reserving in **one transaction** (the probe's regression); a 32-px top
+  zone shortening a maximized window's `Configure` by
   exactly 32 and offsetting it by 32, released by `px: 0` and by
   minimizing the bar; a zone moving a newly *placed* window, asserted
   against `wm::place` on the shrunken area; a `Top` bar painted over a
@@ -383,7 +414,11 @@ not working":
   re-spanning after a hotplug.
 * `examples/shell_probe.rs` is the hardware probe: a `Top` bar with a 32-px
   exclusive zone, `WindowInfo` events printed as they arrive, and
-  `Super+Return` bound. Throwaway, not a shipped binary.
+  `Super+Return` bound. Throwaway, not a shipped binary. The numbers it
+  produced are in the server README's "M3-B: the shell socket" table, and
+  it found two real bugs — the buffered-op ordering above, and that a bar
+  which ignores the `Configure` its own anchor produces paints its original
+  width.
 
 ## Deferred
 
