@@ -155,32 +155,46 @@ fn dividing_by_zero_shows_error_and_clear_recovers() {
 
 #[test]
 fn one_keypress_is_one_set_text() {
-    // The cost claim, asserted from outside by counting mutations. A
-    // digit changes the display's string and nothing else: no button
-    // repaints, no node is created, and the history line is untouched
-    // because its text did not change.
+    // The cost claim, asserted from outside by counting mutations.
+    //
+    // A *keyboard* digit is the clean measurement: it changes the
+    // display's string and touches nothing else, where a click also
+    // repaints the button it hit (pressed, released, hovered), which is
+    // the button's own business rather than the app's.
     let mut h = harness();
-    click_all(&mut h, &["7"]);
+    type_text(&mut h, "7");
 
     h.tap();
     h.clear_tap();
     let commits = h.commits();
-    let five = named(&mut h, "5");
-    h.click(five);
+    type_text(&mut h, "5");
     h.settle();
 
     let ops: Vec<&str> = h.mutations().iter().map(|m| m.op).collect();
-    let set_texts = ops.iter().filter(|o| **o == "SetText").count();
     assert_eq!(display(&mut h), "75");
-    assert_eq!(set_texts, 1, "exactly one SetText: {ops:?}");
-    assert!(!ops.contains(&"CreateNode"), "no node was created: {ops:?}");
-    // A click also repaints the button it hit (pressed, then released,
-    // then hovered), which is the button's own business; what matters is
-    // that the *text* of exactly one node moved and that the whole thing
-    // rode on a bounded number of commits.
-    assert!(
-        h.commits() - commits <= 3,
-        "a click is a handful of commits, not a redraw: {ops:?}"
+    assert_eq!(
+        ops,
+        ["SetText", "Commit"],
+        "a keypress is one SetText and the commit that carries it"
+    );
+    assert_eq!(h.commits() - commits, 1, "and exactly one commit");
+
+    // And the converse: `=` here settles `75` to `75`, so the *display*
+    // is the label that does not move and only the history line is sent.
+    // One `SetText`, not two — which is the no-op setter earning its
+    // keep, since `press` offers both labels a string every time.
+    h.clear_tap();
+    let equals = named(&mut h, "equals");
+    h.click(equals);
+    h.settle();
+    let set_texts = h.mutations().iter().filter(|m| m.op == "SetText").count();
+    assert_eq!(display(&mut h), "75", "the display did not change");
+    assert_eq!(history(&mut h), "75 =", "but the history did");
+    assert_eq!(
+        set_texts,
+        1,
+        "only the label whose text actually changed was sent: {:?}",
+        h.mutations()
     );
     h.quit();
 }

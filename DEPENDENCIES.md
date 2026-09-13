@@ -78,6 +78,14 @@ duplicated is the price, and the tests on both sides pin the shared
 format. Its PNG writer is a copy of `nitro-shot`'s for the reason the
 next paragraph gives.
 
+`nitro-calc` (M2's first application) adds **zero** external
+dependencies, and that is the number the milestone was after: a complete
+app — widget tree, state machine, formatter, scriptable socket — whose
+entire dependency list is `nitro-ui`. It is the demonstration that
+writing an app on this stack costs an app author nothing beyond the
+toolkit. The four lines the tree count rose by are its own `nitro-calc`
+and `nitro-ui (*)` entries, not new crates.
+
 The M1 rise from 58 to 60 was the same kind of non-event: one line is
 `nitro-demo`, a workspace crate, and the other is a second
 `signal-hook v0.4.4 (*)` line — cargo's marker for a subtree it has

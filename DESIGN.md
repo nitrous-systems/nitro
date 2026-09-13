@@ -246,19 +246,31 @@ D-Bus client is allowed.
   rather than any font type; and `nitro-raster` learns `blit_mask`. A
   client sends a *string*, never a glyph, which is what keeps the remote
   link thin and every app binary small.
-- **M2** — `nitro-ui` with arena, passes, `WidgetMut`, six widgets, layout,
-  introspection socket, `hey`-style CLI. `nitro-calc` as the first app.
+- **M2** — **done.** `nitro-ui` with arena, passes, `WidgetMut`, eleven
+  widgets, layout, introspection socket, the `hey` CLI, and `nitro-calc`
+  as the first app.
   The toolkit core is in: widgets in a generational arena, take-out
   dispatch so a callback gets `&mut State` *and* `&mut Ui`, `WidgetMut` as
   the only mutation door, TREE/LAYOUT/PAINT driven by dirty flags into one
   `Commit`, a flex subset with pure-function tests, `Flex`/`Panel`/
-  `Label`/`Button`/`Spacer`, an epoll app loop, and a harness that runs a
-  real server in-process and asserts on pixels *and* on the mutations sent.
-  `hello_dialog` is 444 KB stripped and 2.4 MB RSS against a fake server,
-  one thread, zero context switches over 5 s idle, `ldd` showing only
-  libc. Text measurement is a synchronous round trip in M2 (cached; see
-  `docs/ui.md`). The introspection *tree* exists (`Ui::introspect`); the
-  socket and the CLI are the next task.
+  `Label`/`Button`/`TextField`/`Checkbox`/`Slider`/`Scroll`/`Separator`/
+  `Image`/`Spacer`, an epoll app loop, and a harness that runs a real
+  server in-process and asserts on pixels *and* on the mutations sent.
+  Every app opens an introspection socket and answers `list`/`get`/`set`/
+  `do`/`watch`/`shot` on the app's own loop, between events — so `hey
+  nitro-calc do window/7 click` runs the real callback with the real
+  `&mut S`, and being scriptable costs neither a thread nor a lock.
+  **`nitro-calc` is the exit criterion, measured on the box**: 489 lines
+  of app source excluding tests, a **560 KB** stripped binary, **2 760 kB**
+  RSS, one thread, **0.0 % idle CPU with zero context switches** in the
+  app *and* the server, **one keypress is exactly two mutations
+  (`SetText`, `Commit`)**, and keypress-to-photon of **1.9 ms min /
+  ~12–14 ms mean** by the server's `i2p` counters. The mean sits above
+  `nitro-demo`'s 9.3 ms pointer figure because every new digit is a new
+  string, and text measurement is a synchronous round trip in M2
+  (cached; `docs/ui.md`) — the first measurement to put a price on that
+  decision, and the argument for making it async in M3. Numbers and
+  method in `docs/budget.md`.
 - **M3** — Shell: bar, launcher, window management (focus, move, resize,
   z-order), keyboard layouts, multi-output.
 - **M4** — Terminal, settings (display/audio), file manager; remote view;
