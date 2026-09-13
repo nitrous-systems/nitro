@@ -13,13 +13,17 @@ use crate::error::Error;
 use crate::framing::Framer;
 use crate::io::Socket;
 use crate::msg::{
-    BufferDamage, ClientMsg, Commit, CreateBuffer, CreateNode, CreateWindow, DestroyBuffer,
-    DestroyNode, Fill, Hello, MeasureText, Reparent, RequestFrame, ServerMsg, SetAppId, SetBorder,
-    SetBounds, SetClip, SetCorners, SetFill, SetImage, SetOpacity, SetText, SetTransform,
-    SetVisible, SetWindowLimits, SetWindowState, SetWindowTitle,
+    BindKey, BufferDamage, ClientMsg, CloseWindow, Commit, CreateBuffer, CreateNode, CreateWindow,
+    DestroyBuffer, DestroyNode, Fill, FocusWindow, GrabKeyboard, Hello, MeasureText, Outputs,
+    Reparent, RequestFrame, ServerMsg, SetAnchor, SetAppId, SetBorder, SetBounds, SetClip,
+    SetCorners, SetExclusiveZone, SetFill, SetImage, SetLayer, SetOpacity, SetText, SetTransform,
+    SetVisible, SetWindowLimits, SetWindowState, SetWindowStateFor, SetWindowTitle, UnbindKey,
+    WindowList,
 };
-use crate::types::{Align, BufferId, Layer, NodeId, NodeKind, WindowState};
+use crate::types::{Align, BufferId, Edge, Layer, NodeId, NodeKind, WindowRef, WindowState};
 
+/// Where the shell socket lives; see [`crate::shell_socket_path`].
+pub use crate::shell_socket_path;
 /// Where the wire socket lives; see [`crate::socket_path`].
 pub use crate::socket_path;
 
@@ -56,6 +60,20 @@ impl Connection {
     /// with [`Error`](crate::msg::Error).
     pub fn connect_default(name: &str) -> Result<Self, Error> {
         Self::connect(&socket_path(), name)
+    }
+
+    /// Connect to the default **shell** socket path and run the handshake.
+    ///
+    /// A connection made here is privileged: the `Welcome` carries
+    /// [`caps::SHELL`](crate::types::caps::SHELL) and the shell ops are
+    /// accepted. See `docs/shell.md`.
+    ///
+    /// # Errors
+    /// As [`Connection::connect`]. In particular, a server that is not
+    /// running — or one whose shell socket the caller cannot open — fails
+    /// here rather than silently downgrading to an unprivileged connection.
+    pub fn connect_shell(name: &str) -> Result<Self, Error> {
+        Self::connect(&shell_socket_path(), name)
     }
 
     /// Connect to `path` and run the handshake.
@@ -155,6 +173,80 @@ impl Connection {
     /// As [`Connection::send`].
     pub fn commit(&mut self, serial: u32) -> Result<(), Error> {
         self.send(&ClientMsg::Commit(Commit { serial }))
+    }
+
+    /// Bind a server-global hotkey (needs `caps::SHELL`).
+    ///
+    /// `mods` is a [`mod_mask`](crate::types::mod_mask) bitmask; `keysym` 0
+    /// asks for the bare-modifier tap. Answered with [`HotKey`] events, not
+    /// with an acknowledgement — a refusal is a fatal `Error`, like every
+    /// other protocol error.
+    ///
+    /// # Errors
+    /// As [`Connection::send`].
+    pub fn bind_key(&mut self, id: u32, mods: u32, keysym: u32) -> Result<(), Error> {
+        self.send(&ClientMsg::BindKey(BindKey { id, mods, keysym }))
+    }
+
+    /// Release a hotkey binding (needs `caps::SHELL`).
+    ///
+    /// # Errors
+    /// As [`Connection::send`].
+    pub fn unbind_key(&mut self, id: u32) -> Result<(), Error> {
+        self.send(&ClientMsg::UnbindKey(UnbindKey { id }))
+    }
+
+    /// Ask for the window list and subscribe to its changes (needs
+    /// `caps::SHELL`).
+    ///
+    /// The answer is one [`WindowInfo`](crate::msg::WindowInfo) per window
+    /// then a [`WindowListEnd`](crate::msg::WindowListEnd); afterwards
+    /// changes arrive unasked.
+    ///
+    /// # Errors
+    /// As [`Connection::send`].
+    pub fn window_list(&mut self) -> Result<(), Error> {
+        self.send(&ClientMsg::WindowList(WindowList))
+    }
+
+    /// Ask for the output list and subscribe to hotplug (needs
+    /// `caps::SHELL`).
+    ///
+    /// # Errors
+    /// As [`Connection::send`].
+    pub fn outputs(&mut self) -> Result<(), Error> {
+        self.send(&ClientMsg::Outputs(Outputs))
+    }
+
+    /// Give keyboard focus to another client's window (needs `caps::SHELL`).
+    ///
+    /// # Errors
+    /// As [`Connection::send`].
+    pub fn focus_window(&mut self, window: WindowRef) -> Result<(), Error> {
+        self.send(&ClientMsg::FocusWindow(FocusWindow { window }))
+    }
+
+    /// Ask another client's window to close (needs `caps::SHELL`).
+    ///
+    /// # Errors
+    /// As [`Connection::send`].
+    pub fn close_window(&mut self, window: WindowRef) -> Result<(), Error> {
+        self.send(&ClientMsg::CloseWindow(CloseWindow { window }))
+    }
+
+    /// Put another client's window into a state (needs `caps::SHELL`).
+    ///
+    /// # Errors
+    /// As [`Connection::send`].
+    pub fn set_window_state_for(
+        &mut self,
+        window: WindowRef,
+        state: WindowState,
+    ) -> Result<(), Error> {
+        self.send(&ClientMsg::SetWindowStateFor(SetWindowStateFor {
+            window,
+            state,
+        }))
     }
 
     /// Ask the server to measure a string; the answer is a
@@ -357,6 +449,41 @@ impl Transaction<'_> {
                 app_id: app_id.to_owned(),
             }
         )
+    }
+
+    /// Move one of this client's windows to another stacking layer (needs
+    /// `caps::SHELL`).
+    #[must_use]
+    pub fn set_layer(mut self, window: NodeId, layer: Layer) -> Self {
+        push!(self, SetLayer { window, layer })
+    }
+
+    /// Reserve `px` logical pixels along `edge` of the window's output
+    /// (needs `caps::SHELL`); `px` 0 releases the zone.
+    #[must_use]
+    pub fn set_exclusive_zone(mut self, window: NodeId, edge: Edge, px: u32) -> Self {
+        push!(self, SetExclusiveZone { window, edge, px })
+    }
+
+    /// Anchor a window to its output's edges (needs `caps::SHELL`).
+    /// `edges` is a bitmask from [`anchor`](crate::types::anchor).
+    #[must_use]
+    pub fn set_anchor(mut self, window: NodeId, edges: u8, margin: u32) -> Self {
+        push!(
+            self,
+            SetAnchor {
+                window,
+                edges,
+                margin,
+            }
+        )
+    }
+
+    /// Take or release a keyboard grab on one of this client's windows
+    /// (needs `caps::SHELL`).
+    #[must_use]
+    pub fn grab_keyboard(mut self, window: NodeId, on: bool) -> Self {
+        push!(self, GrabKeyboard { window, on })
     }
 
     /// Retitle a window.

@@ -13,6 +13,7 @@
 //! | `0x_1xx` | tree | windows |
 //! | `0x_2xx` | style (including text style) | input |
 //! | `0x_3xx` | buffers | text |
+//! | `0x_4xx` | shell (caps `SHELL`) | shell (caps `SHELL`) |
 //!
 //! # Layout
 //!
@@ -39,8 +40,8 @@ use crate::codec::{FdQueue, Reader, Writer};
 use crate::error::{DecodeError, EncodeError};
 use crate::types::WindowState as WindowStateValue;
 use crate::types::{
-    Align, AxisSource, BufferId, ButtonState, CursorPos, ErrorCode, Layer, NodeId, NodeKind,
-    TouchPhase,
+    Align, AxisSource, BufferId, ButtonState, CursorPos, Edge, ErrorCode, Layer, NodeId, NodeKind,
+    TouchPhase, WindowRef,
 };
 use crate::wire::Plain;
 
@@ -667,6 +668,196 @@ impl Body for BufferDamage {
     }
 }
 
+/// Ask for the window list (shell only; needs
+/// [`caps::SHELL`](crate::types::caps::SHELL)).
+///
+/// Answered at once, not at the next [`Commit`]: one [`WindowInfo`] per
+/// window the server knows about, then one [`WindowListEnd`]. Afterwards
+/// the connection is **subscribed**: every change produces another
+/// `WindowInfo` and every window that goes a [`WindowGone`], so a bar never
+/// polls. Asking twice re-sends the snapshot; the subscription is
+/// idempotent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowList;
+
+impl Body for WindowList {
+    fn encode_body(&self, _w: &mut Writer) -> Result<(), EncodeError> {
+        Ok(())
+    }
+    fn decode_body(_r: &mut Reader<'_>, _fds: &mut FdQueue) -> Result<Self, DecodeError> {
+        Ok(Self)
+    }
+}
+
+/// Ask for the output list (shell only; needs
+/// [`caps::SHELL`](crate::types::caps::SHELL)).
+///
+/// Answered at once with one [`OutputInfo`] per connected output and an
+/// [`OutputsEnd`], and subscribes the connection to hotplug: an output that
+/// appears, changes mode or scale produces another `OutputInfo`, and one
+/// that goes an [`OutputGone`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Outputs;
+
+impl Body for Outputs {
+    fn encode_body(&self, _w: &mut Writer) -> Result<(), EncodeError> {
+        Ok(())
+    }
+    fn decode_body(_r: &mut Reader<'_>, _fds: &mut FdQueue) -> Result<Self, DecodeError> {
+        Ok(Self)
+    }
+}
+
+/// One window in the shell's window list.
+///
+/// Sent for each window in answer to [`WindowList`], and again whenever
+/// anything in it changes. `window` is a **server-global**
+/// [`WindowRef`](crate::types::WindowRef), not the owning client's
+/// `NodeId`: a shell names other clients' windows, and client ids are
+/// namespaced per connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowInfo {
+    /// Server-global window id.
+    pub window: WindowRef,
+    /// What the window is doing.
+    pub state: WindowStateValue,
+    /// Whether it holds keyboard focus.
+    pub focused: bool,
+    /// The output it is on, or `u32::MAX` when it is on none (created
+    /// before any output existed, or its output was unplugged).
+    pub output: u32,
+    /// Application id from [`SetAppId`], empty when the client set none.
+    pub app_id: String,
+    /// Window title.
+    pub title: String,
+}
+
+/// The fixed part of [`WindowInfo`] — everything but the two strings.
+#[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct WindowInfoFixed {
+    window: <WindowRef as Plain>::Wire,
+    state: <WindowStateValue as Plain>::Wire,
+    focused: <bool as Plain>::Wire,
+    output: <u32 as Plain>::Wire,
+}
+
+impl Body for WindowInfo {
+    fn encode_body(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.put_struct(&WindowInfoFixed {
+            window: Plain::to_wire(self.window),
+            state: Plain::to_wire(self.state),
+            focused: Plain::to_wire(self.focused),
+            output: Plain::to_wire(self.output),
+        });
+        w.put_str(&self.app_id);
+        w.put_str(&self.title);
+        Ok(())
+    }
+    fn decode_body(r: &mut Reader<'_>, _fds: &mut FdQueue) -> Result<Self, DecodeError> {
+        let f = r.get_struct::<WindowInfoFixed>()?;
+        Ok(Self {
+            window: Plain::from_wire(f.window)?,
+            state: Plain::from_wire(f.state)?,
+            focused: Plain::from_wire(f.focused)?,
+            output: Plain::from_wire(f.output)?,
+            app_id: r.get_str()?,
+            title: r.get_str()?,
+        })
+    }
+}
+
+/// End of the [`WindowList`] snapshot: every window has been sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowListEnd;
+
+impl Body for WindowListEnd {
+    fn encode_body(&self, _w: &mut Writer) -> Result<(), EncodeError> {
+        Ok(())
+    }
+    fn decode_body(_r: &mut Reader<'_>, _fds: &mut FdQueue) -> Result<Self, DecodeError> {
+        Ok(Self)
+    }
+}
+
+/// End of the [`Outputs`] snapshot: every output has been sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputsEnd;
+
+impl Body for OutputsEnd {
+    fn encode_body(&self, _w: &mut Writer) -> Result<(), EncodeError> {
+        Ok(())
+    }
+    fn decode_body(_r: &mut Reader<'_>, _fds: &mut FdQueue) -> Result<Self, DecodeError> {
+        Ok(Self)
+    }
+}
+
+/// One output, in answer to [`Outputs`] or on a hotplug.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutputInfo {
+    /// The server's output id, the same number [`Configure::output`] and
+    /// [`Presented::output`] carry.
+    pub id: u32,
+    /// Width in device pixels.
+    pub w: u32,
+    /// Height in device pixels.
+    pub h: u32,
+    /// Scale factor (1.0, 2.0, …).
+    pub scale: f32,
+    /// Left edge in the global device-pixel space.
+    pub x: i32,
+    /// Top edge in the global device-pixel space.
+    pub y: i32,
+    /// Refresh rate in millihertz (60 000 for 60 Hz).
+    pub refresh_mhz: u32,
+    /// Connector name (`"HDMI-A-1"`), last on the wire being
+    /// variable-length.
+    pub name: String,
+}
+
+/// The fixed part of [`OutputInfo`] — everything but the name.
+#[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct OutputInfoFixed {
+    id: <u32 as Plain>::Wire,
+    w: <u32 as Plain>::Wire,
+    h: <u32 as Plain>::Wire,
+    scale: <f32 as Plain>::Wire,
+    x: <i32 as Plain>::Wire,
+    y: <i32 as Plain>::Wire,
+    refresh_mhz: <u32 as Plain>::Wire,
+}
+
+impl Body for OutputInfo {
+    fn encode_body(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.put_struct(&OutputInfoFixed {
+            id: Plain::to_wire(self.id),
+            w: Plain::to_wire(self.w),
+            h: Plain::to_wire(self.h),
+            scale: Plain::to_wire(self.scale),
+            x: Plain::to_wire(self.x),
+            y: Plain::to_wire(self.y),
+            refresh_mhz: Plain::to_wire(self.refresh_mhz),
+        });
+        w.put_str(&self.name);
+        Ok(())
+    }
+    fn decode_body(r: &mut Reader<'_>, _fds: &mut FdQueue) -> Result<Self, DecodeError> {
+        let f = r.get_struct::<OutputInfoFixed>()?;
+        Ok(Self {
+            id: Plain::from_wire(f.id)?,
+            w: Plain::from_wire(f.w)?,
+            h: Plain::from_wire(f.h)?,
+            scale: Plain::from_wire(f.scale)?,
+            x: Plain::from_wire(f.x)?,
+            y: Plain::from_wire(f.y)?,
+            refresh_mhz: Plain::from_wire(f.refresh_mhz)?,
+            name: r.get_str()?,
+        })
+    }
+}
+
 fixed_msg! {
     /// Ask for a frame callback on this window: the server answers with
     /// [`Frame`] carrying the deadline for the next flip. One request,
@@ -813,6 +1004,153 @@ fixed_msg! {
         /// Source rectangle in buffer pixels.
         src: IRect,
     }
+
+    // ----------------------------------------------------- shell (SHELL)
+
+    /// Move one of *this* client's windows to another stacking layer
+    /// (shell only; needs [`caps::SHELL`](crate::types::caps::SHELL)).
+    ///
+    /// A wallpaper takes `Background`, a bar `Top`, a launcher `Overlay`.
+    /// `Normal` is refused with [`ErrorCode::Protocol`]: a shell surface
+    /// that wanted to be an ordinary window should have been created as
+    /// one. On a connection *without* the bit — an ordinary client on the
+    /// wire socket — the whole message is `Protocol` and the connection
+    /// closes, like every other error in this protocol.
+    SetLayer {
+        /// The window, by the sender's own node id.
+        window: NodeId,
+        /// Layer to move it to.
+        layer: Layer,
+    }
+
+    /// Reserve `px` logical pixels along `edge` of the window's output
+    /// (shell only; needs [`caps::SHELL`](crate::types::caps::SHELL)).
+    ///
+    /// The reservation comes off that output's **work area**, which is what
+    /// `Maximized` fills and what new windows are placed into, so a 32-px
+    /// top zone moves every maximized window 32 px down and makes it 32 px
+    /// shorter. `px` 0 releases the zone. The zone is released
+    /// automatically when the window is hidden, closed or the client goes.
+    ///
+    /// Zones are additive per edge: two bars on the same edge reserve the
+    /// sum. The server does not place the window for you — use
+    /// [`SetAnchor`] for that — because a shell may legitimately want a
+    /// zone larger or smaller than the window it belongs to.
+    SetExclusiveZone {
+        /// The window, by the sender's own node id.
+        window: NodeId,
+        /// Which edge of the output the zone is taken off.
+        edge: Edge,
+        /// Logical pixels to reserve; 0 releases.
+        px: u32,
+    }
+
+    /// Anchor a window to its output's edges (shell only; needs
+    /// [`caps::SHELL`](crate::types::caps::SHELL)).
+    ///
+    /// `edges` is a bitmask from [`anchor`](crate::types::anchor). Opposite
+    /// edges together mean "span that axis", so the window is resized to
+    /// fit; neither means "centre on it". A bar is
+    /// `TOP | LEFT | RIGHT`, a centred launcher is `edges: 0`. `margin` is
+    /// a gap in logical pixels held on every anchored edge.
+    ///
+    /// Anchoring is against the output's **full** logical rectangle, not
+    /// its work area: a bar must not be pushed off the screen by its own
+    /// exclusive zone. Re-applied whenever the output's mode or scale
+    /// changes, so a bar keeps spanning after a hotplug.
+    SetAnchor {
+        /// The window, by the sender's own node id.
+        window: NodeId,
+        /// Edge bitmask from [`anchor`](crate::types::anchor).
+        edges: u8,
+        /// Gap in logical pixels on each anchored edge.
+        margin: u32,
+    }
+
+    /// Bind a server-global hotkey (shell only; needs
+    /// [`caps::SHELL`](crate::types::caps::SHELL)).
+    ///
+    /// While bound, the chord is **not** delivered to the focused client as
+    /// a [`Key`]: a global hotkey the focused application could also see
+    /// would be a keylogger and an ambiguity at once. It arrives as a
+    /// [`HotKey`] carrying `id`, which is the shell's own number for it.
+    ///
+    /// `mods` is a [`mod_mask`](crate::types::mod_mask) bitmask, *not* the
+    /// xkb mask [`Key::mods`] carries. `keysym` is an X11 keysym, and
+    /// `keysym: 0` is the **bare-modifier tap**: the binding fires when the
+    /// modifier in `mods` is pressed and released with no other key in
+    /// between, which is the launcher's Super trigger. A bare-modifier
+    /// binding must name exactly one modifier.
+    ///
+    /// Re-binding the same `id` replaces it. A chord already bound by
+    /// another shell client, or one of the compositor's own
+    /// (`Ctrl+Alt+*`, `Alt+Tab`), is refused with [`ErrorCode::Protocol`].
+    BindKey {
+        /// The shell's id for this binding, echoed in [`HotKey`].
+        id: u32,
+        /// Modifier bitmask from [`mod_mask`](crate::types::mod_mask).
+        mods: u32,
+        /// X11 keysym, or 0 for a bare-modifier tap.
+        keysym: u32,
+    }
+
+    /// Release a binding made with [`BindKey`] (shell only). Unbinding an
+    /// `id` that is not bound is a no-op, not an error: a shell shutting
+    /// down should not have to remember what it managed to bind.
+    UnbindKey {
+        /// The `id` given to [`BindKey`].
+        id: u32,
+    }
+
+    /// Take or release a keyboard grab on one of this client's windows
+    /// (shell only; needs [`caps::SHELL`](crate::types::caps::SHELL)).
+    ///
+    /// While granted, **every** key goes to this window instead of the
+    /// focused one, bound hotkeys included — the launcher's own Escape must
+    /// not be swallowed by whatever the shell bound. It is how a
+    /// `NO_FOCUS` overlay reads the keyboard without taking focus, so the
+    /// window that was focused stays focused and keeps its active styling.
+    ///
+    /// Released by `on: false`, by hiding the window
+    /// ([`SetVisible`]), by closing it, or by the client disconnecting.
+    /// One grab at a time: a second one replaces the first, whose owner is
+    /// simply no longer receiving keys.
+    GrabKeyboard {
+        /// The window, by the sender's own node id.
+        window: NodeId,
+        /// Whether to hold the grab.
+        on: bool,
+    }
+
+    /// Give keyboard focus to another client's window (shell only).
+    /// A window that cannot take focus — `NO_FOCUS`, minimized, unplaced —
+    /// is silently refused, exactly as a click on it would be.
+    FocusWindow {
+        /// Server-global window id from a [`WindowInfo`].
+        window: WindowRef,
+    }
+
+    /// Ask another client's window to close (shell only).
+    ///
+    /// The same request the title bar's close button makes: the owning
+    /// client gets [`Closed`] and decides. The server does not tear the
+    /// window down, so a client with unsaved work can still refuse.
+    CloseWindow {
+        /// Server-global window id from a [`WindowInfo`].
+        window: WindowRef,
+    }
+
+    /// Put another client's window into a state (shell only).
+    ///
+    /// [`SetWindowState`] for someone else's window — what a bar's window
+    /// list needs to minimize or restore an entry. Refused silently on the
+    /// same terms: a `FIXED_SIZE` window still cannot maximize.
+    SetWindowStateFor {
+        /// Server-global window id from a [`WindowInfo`].
+        window: WindowRef,
+        /// State to put it in.
+        state: WindowStateValue,
+    }
 }
 
 msg_enum! {
@@ -868,6 +1206,29 @@ msg_enum! {
         BufferDamage = 0x0303,
         /// Attach a buffer region to an image node.
         SetImage = 0x0304,
+        /// Move one of this client's windows to another layer (needs
+        /// `caps::SHELL`).
+        SetLayer = 0x0401,
+        /// Reserve screen space along an output edge (needs `caps::SHELL`).
+        SetExclusiveZone = 0x0402,
+        /// Anchor a window to its output's edges (needs `caps::SHELL`).
+        SetAnchor = 0x0403,
+        /// Bind a server-global hotkey (needs `caps::SHELL`).
+        BindKey = 0x0404,
+        /// Release a hotkey binding (needs `caps::SHELL`).
+        UnbindKey = 0x0405,
+        /// Take or release a keyboard grab (needs `caps::SHELL`).
+        GrabKeyboard = 0x0406,
+        /// Ask for the window list and subscribe (needs `caps::SHELL`).
+        WindowList = 0x0407,
+        /// Focus another client's window (needs `caps::SHELL`).
+        FocusWindow = 0x0408,
+        /// Ask another client's window to close (needs `caps::SHELL`).
+        CloseWindow = 0x0409,
+        /// Set another client's window state (needs `caps::SHELL`).
+        SetWindowStateFor = 0x040a,
+        /// Ask for the output list and subscribe (needs `caps::SHELL`).
+        Outputs = 0x040b,
     }
 }
 
@@ -1192,6 +1553,36 @@ fixed_msg! {
         /// Event time, `CLOCK_MONOTONIC` nanoseconds.
         time_ns: u64,
     }
+
+    // ----------------------------------------------------- shell (SHELL)
+
+    /// A hotkey bound with [`BindKey`] fired (shell only).
+    ///
+    /// Sent for the press and again for the release, so a shell can
+    /// implement press-and-hold. A **bare-modifier tap** (`keysym: 0`) is
+    /// reported once, `pressed: false`, when the modifier comes back up
+    /// with nothing pressed in between: there is no press event to report,
+    /// because until the release the server cannot know it was a tap.
+    HotKey {
+        /// The `id` given to [`BindKey`].
+        id: u32,
+        /// Whether the chord went down (`true`) or came up (`false`).
+        pressed: bool,
+        /// Event time, `CLOCK_MONOTONIC` nanoseconds.
+        time_ns: u64,
+    }
+
+    /// A window in the shell's list went away (shell only).
+    WindowGone {
+        /// Server-global window id that is no longer valid.
+        window: WindowRef,
+    }
+
+    /// An output was unplugged (shell only).
+    OutputGone {
+        /// The output id that is no longer valid.
+        id: u32,
+    }
 }
 
 msg_enum! {
@@ -1231,6 +1622,20 @@ msg_enum! {
         TextMetrics = 0x8301,
         /// Answer to a `MeasureText`.
         TextMeasured = 0x8302,
+        /// A bound hotkey fired (needs `caps::SHELL`).
+        HotKey = 0x8401,
+        /// One window of the shell's list (needs `caps::SHELL`).
+        WindowInfo = 0x8402,
+        /// End of the `WindowList` snapshot (needs `caps::SHELL`).
+        WindowListEnd = 0x8403,
+        /// A listed window went away (needs `caps::SHELL`).
+        WindowGone = 0x8404,
+        /// One output (needs `caps::SHELL`).
+        OutputInfo = 0x8405,
+        /// End of the `Outputs` snapshot (needs `caps::SHELL`).
+        OutputsEnd = 0x8406,
+        /// An output was unplugged (needs `caps::SHELL`).
+        OutputGone = 0x8407,
     }
 }
 

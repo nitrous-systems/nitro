@@ -35,3 +35,7 @@ test-support = []
 
 [[example]]
 name = "hello_client"
+
+# Throwaway M3-B hardware probe for the shell socket; see `docs/shell.md`.
+[[example]]
+name = "shell_probe"

@@ -51,6 +51,36 @@ impl BufferId {
     }
 }
 
+/// A **server-global** window id, allocated by the server.
+///
+/// Distinct from [`NodeId`], which is a client's own id for its own node:
+/// ids are namespaced per client, so two clients may both use `NodeId(1)`.
+/// A shell talks *about* other clients' windows, so it needs a name that is
+/// unique across the whole server, and this is it. It appears only in the
+/// shell messages (caps [`SHELL`](caps::SHELL)) and a shell only ever
+/// learns one from a [`WindowInfo`](crate::msg::WindowInfo).
+///
+/// `WindowRef(0)` is [`WindowRef::NONE`]: "no window".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct WindowRef(pub u32);
+
+impl WindowRef {
+    /// The "no window" id.
+    pub const NONE: Self = Self(0);
+
+    /// Whether this is [`WindowRef::NONE`].
+    #[must_use]
+    pub const fn is_none(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The raw wire value.
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+}
+
 /// Macro for the small `u8`-tagged enumerations: one `repr(u8)` enum plus a
 /// checked `from_u8`.
 macro_rules! tag_enum {
@@ -133,6 +163,23 @@ tag_enum! {
         /// Hidden, but still in the window list and the focus-cycling
         /// order.
         Minimized = 3,
+    }
+}
+
+tag_enum! {
+    /// An edge of an output, for a shell window's exclusive zone.
+    ///
+    /// See [`SetExclusiveZone`](crate::msg::SetExclusiveZone): the zone is
+    /// taken off *this* edge of the output's work area.
+    Edge: u8 {
+        /// The top edge (a bar).
+        Top = 0,
+        /// The bottom edge (a dock).
+        Bottom = 1,
+        /// The left edge.
+        Left = 2,
+        /// The right edge.
+        Right = 3,
     }
 }
 
@@ -259,6 +306,52 @@ pub mod caps {
     /// Server-side window management: decorations, states, limits, app ids
     /// (M3).
     pub const WM: u32 = 1 << 4;
+    /// The connection is **privileged**: it arrived on the shell socket, so
+    /// it may send the shell ops (layers, exclusive zones, anchors, global
+    /// hotkeys, the window list, output enumeration) — see `docs/shell.md`.
+    ///
+    /// Bit 5, not bit 3: bit 3 (value 8) is [`REMOTE`] and was taken in M1.
+    /// A privilege is granted by *which socket* a client connected to, and
+    /// this bit is only how the server reports the grant.
+    pub const SHELL: u32 = 1 << 5;
+}
+
+/// Modifier mask for [`BindKey`](crate::msg::BindKey), by *name*.
+///
+/// Deliberately not xkb's serialized mask, which [`Key::mods`](crate::msg::Key)
+/// carries: that bitmap's positions depend on the keymap, so it cannot be
+/// compared against a constant and a shell could not express "Super+Return"
+/// in it at all. These four bits are the modifiers a desktop shortcut is
+/// made of; unknown bits are reserved and must be zero.
+pub mod mod_mask {
+    /// Shift.
+    pub const SHIFT: u32 = 1 << 0;
+    /// Control.
+    pub const CTRL: u32 = 1 << 1;
+    /// Alt (Mod1).
+    pub const ALT: u32 = 1 << 2;
+    /// Super / Logo / Windows (Mod4).
+    pub const SUPER: u32 = 1 << 3;
+    /// Every bit defined; anything outside this mask is reserved.
+    pub const ALL: u32 = SHIFT | CTRL | ALT | SUPER;
+}
+
+/// Edge bitmask for [`SetAnchor`](crate::msg::SetAnchor).
+///
+/// Opposite edges together mean "span that axis"; neither means "centre on
+/// it". A bar is `TOP | LEFT | RIGHT`, a centred launcher is 0. Unknown
+/// bits are reserved and must be zero.
+pub mod anchor {
+    /// Stick to the top edge.
+    pub const TOP: u8 = 1 << 0;
+    /// Stick to the bottom edge.
+    pub const BOTTOM: u8 = 1 << 1;
+    /// Stick to the left edge.
+    pub const LEFT: u8 = 1 << 2;
+    /// Stick to the right edge.
+    pub const RIGHT: u8 = 1 << 3;
+    /// Every bit defined; anything outside this mask is reserved.
+    pub const ALL: u8 = TOP | BOTTOM | LEFT | RIGHT;
 }
 
 /// Pixel formats for [`CreateBuffer`](crate::msg::CreateBuffer), as DRM
@@ -312,16 +405,27 @@ mod tests {
         assert_eq!(WindowState::from_raw(2), Ok(WindowState::Fullscreen));
         assert_eq!(WindowState::from_raw(3), Ok(WindowState::Minimized));
         assert_eq!(WindowState::from_raw(4), Err(DecodeError::BadValue));
+        assert_eq!(Edge::from_raw(Edge::Top.raw()), Ok(Edge::Top));
+        assert_eq!(Edge::from_raw(3), Ok(Edge::Right));
+        assert_eq!(Edge::from_raw(4), Err(DecodeError::BadValue));
     }
 
     #[test]
     fn ids_and_formats() {
+        assert!(WindowRef::NONE.is_none());
+        assert!(!WindowRef(7).is_none());
+        assert_eq!(WindowRef(7).raw(), 7);
         assert!(NodeId::NONE.is_none());
         assert!(!NodeId(1).is_none());
         assert!(BufferId::default().is_none());
         assert_eq!(format::XR24, 0x3432_5258);
         assert_eq!(format::AR24, 0x3432_5241);
         assert_eq!(caps::WM, 0x10);
+        assert_eq!(caps::SHELL, 0x20);
+        // The shell bit is a *new* bit, not a reuse of `REMOTE`.
+        assert_eq!(caps::SHELL & caps::REMOTE, 0);
+        assert_eq!(mod_mask::ALL, 0b1111);
+        assert_eq!(anchor::ALL, 0b1111);
         assert_eq!(
             window_flags::UNDECORATED | window_flags::FIXED_SIZE | window_flags::NO_FOCUS,
             0b111

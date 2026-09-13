@@ -7,6 +7,9 @@
 //! - `NITRO_SOCKET` overrides the wire socket path; otherwise
 //!   `$XDG_RUNTIME_DIR/nitro/wire.sock` (the path `nitro-wire` clients
 //!   resolve to on their own, so the two agree without being told).
+//! - `NITRO_SHELL_SOCKET` overrides the **shell** socket path; otherwise
+//!   `$XDG_RUNTIME_DIR/nitro/shell.sock`. A client that connects there is
+//!   privileged (`docs/shell.md`).
 //! - `NITRO_INPUT_DIR` overrides where `event*` devices are looked for
 //!   (default `/dev/input`); `NITRO_INPUT=off` disables input entirely,
 //!   which is what a headless test wants.
@@ -57,6 +60,12 @@ fn config_from_env() -> Result<Config, String> {
     // configured; `NITRO_SOCKET` overrides both ends at once.
     let wire_path =
         std::env::var_os("NITRO_SOCKET").map_or_else(nitro_wire::socket_path, PathBuf::from);
+    // The privileged socket, resolved the same way: `nitro-wire`'s
+    // `shell_socket_path` reads `NITRO_SHELL_SOCKET` and otherwise sits next
+    // to the wire socket, so a shell client started in this environment
+    // finds it without being configured either. See `docs/shell.md`.
+    let shell_path = std::env::var_os("NITRO_SHELL_SOCKET")
+        .map_or_else(nitro_wire::shell_socket_path, PathBuf::from);
     // Input is on unless asked otherwise, and never on the fake backend,
     // which has no seat to open devices through.
     let input_dir = match std::env::var("NITRO_INPUT").as_deref() {
@@ -70,6 +79,7 @@ fn config_from_env() -> Result<Config, String> {
         backend,
         control_path: socket.path,
         wire_path,
+        shell_path,
         handle_signals: true,
         fake_input: None,
         input_dir,

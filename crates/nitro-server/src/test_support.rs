@@ -40,6 +40,7 @@ pub struct TestServer {
     dir: PathBuf,
     control_path: PathBuf,
     wire_path: PathBuf,
+    shell_path: PathBuf,
     input: FakeInput,
     thread: Option<JoinHandle<Result<(), crate::Error>>>,
 }
@@ -66,11 +67,13 @@ impl TestServer {
         let input = FakeInput::new().expect("eventfd");
         config.fake_input = Some(input.clone());
         let wire_path = config.wire_path.clone();
+        let shell_path = config.shell_path.clone();
         let thread = std::thread::spawn(move || run(config));
         let s = Self {
             dir,
             control_path,
             wire_path,
+            shell_path,
             input,
             thread: Some(thread),
         };
@@ -78,6 +81,7 @@ impl TestServer {
             UnixStream::connect(&s.control_path).is_ok()
         });
         wait_for("the wire socket", || s.wire_path.exists());
+        wait_for("the shell socket", || s.shell_path.exists());
         s
     }
 
@@ -85,6 +89,13 @@ impl TestServer {
     #[must_use]
     pub fn wire_path(&self) -> &Path {
         &self.wire_path
+    }
+
+    /// The privileged shell socket. A client that connects here is granted
+    /// `caps::SHELL`; see `docs/shell.md`.
+    #[must_use]
+    pub fn shell_path(&self) -> &Path {
+        &self.shell_path
     }
 
     /// The control socket path.

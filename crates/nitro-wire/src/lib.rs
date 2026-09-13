@@ -78,7 +78,7 @@ pub use error::{DecodeError, EncodeError, Error};
 pub use framing::{Frame, Framer, Head, header};
 pub use io::Socket;
 pub use msg::{ClientMsg, Fill, ServerMsg};
-pub use types::{BufferId, ErrorCode, Layer, NodeId, NodeKind};
+pub use types::{BufferId, Edge, ErrorCode, Layer, NodeId, NodeKind, WindowRef};
 
 /// Protocol version. Bumped only for an incompatible change; v1 is frozen
 /// at M2 and grows only through new ops guarded by capability bits.
@@ -133,11 +133,17 @@ pub const MAX_PENDING_FDS: usize = 64;
 /// Environment variable overriding the socket path.
 pub const SOCKET_ENV: &str = "NITRO_SOCKET";
 
+/// Environment variable overriding the **shell** socket path.
+pub const SHELL_SOCKET_ENV: &str = "NITRO_SHELL_SOCKET";
+
 /// Subdirectory of `$XDG_RUNTIME_DIR` holding the socket.
 pub const SOCKET_SUBDIR: &str = "nitro";
 
 /// Default socket file name.
 pub const DEFAULT_SOCKET_NAME: &str = "wire.sock";
+
+/// Default **shell** socket file name; see [`shell_socket_path`].
+pub const DEFAULT_SHELL_SOCKET_NAME: &str = "shell.sock";
 
 /// Where the wire socket lives.
 ///
@@ -151,16 +157,38 @@ pub const DEFAULT_SOCKET_NAME: &str = "wire.sock";
 /// [`client::socket_path`] and [`server::socket_path`].
 #[must_use]
 pub fn socket_path() -> std::path::PathBuf {
+    resolve_socket(SOCKET_ENV, DEFAULT_SOCKET_NAME)
+}
+
+/// Where the **shell** socket lives.
+///
+/// `NITRO_SHELL_SOCKET` overrides the whole path; otherwise
+/// `$XDG_RUNTIME_DIR/nitro/shell.sock`, falling back to
+/// `/tmp/nitro-<uid>/shell.sock` on the same terms as [`socket_path`].
+///
+/// This second socket **is** the privilege: a client that can connect to it
+/// is granted [`caps::SHELL`](types::caps::SHELL) and may send the shell
+/// ops. The directory is `0700`, so the grant is "the user's own
+/// processes" and nothing finer; per-app allow lists are deferred (see
+/// `docs/shell.md`).
+#[must_use]
+pub fn shell_socket_path() -> std::path::PathBuf {
+    resolve_socket(SHELL_SOCKET_ENV, DEFAULT_SHELL_SOCKET_NAME)
+}
+
+/// The shared resolution both socket paths use: an explicit override, else
+/// the runtime directory, else a per-uid directory under `/tmp`.
+fn resolve_socket(env: &str, name: &str) -> std::path::PathBuf {
     use std::path::PathBuf;
-    if let Some(p) = std::env::var_os(SOCKET_ENV) {
+    if let Some(p) = std::env::var_os(env) {
         return PathBuf::from(p);
     }
     if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
         let dir = PathBuf::from(dir);
         if dir.is_absolute() {
-            return dir.join(SOCKET_SUBDIR).join(DEFAULT_SOCKET_NAME);
+            return dir.join(SOCKET_SUBDIR).join(name);
         }
     }
     let uid = rustix::process::getuid().as_raw();
-    PathBuf::from(format!("/tmp/nitro-{uid}")).join(DEFAULT_SOCKET_NAME)
+    PathBuf::from(format!("/tmp/nitro-{uid}")).join(name)
 }

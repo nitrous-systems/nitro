@@ -42,6 +42,7 @@ pub mod keyboard;
 pub mod logging;
 pub mod protocol;
 pub mod render;
+pub mod shell;
 pub mod signals;
 pub mod stats;
 /// In-process server for another crate's tests; see the module docs.
@@ -119,6 +120,10 @@ pub struct Config {
     pub control_path: PathBuf,
     /// Wire socket path; clients find it through `NITRO_SOCKET`.
     pub wire_path: PathBuf,
+    /// **Shell** socket path; privileged clients find it through
+    /// `NITRO_SHELL_SOCKET`. A connection accepted here is granted
+    /// `caps::SHELL` — the socket *is* the privilege (`docs/shell.md`).
+    pub shell_path: PathBuf,
     /// Install SIGTERM/SIGINT handlers. Tests turn this off.
     pub handle_signals: bool,
     /// Directory scanned for `event*` devices. `None` disables input
@@ -140,10 +145,12 @@ impl Config {
     pub fn fake(width: u32, height: u32, path: impl Into<PathBuf>) -> Self {
         let control_path: PathBuf = path.into();
         let wire_path = control_path.with_file_name("wire.sock");
+        let shell_path = control_path.with_file_name("shell.sock");
         Self {
             backend: BackendKind::Fake { width, height },
             control_path,
             wire_path,
+            shell_path,
             handle_signals: false,
             input_dir: None,
             fake_input: None,
@@ -276,6 +283,8 @@ const TOK_INPUT: u64 = 5;
 const TOK_DEFER: u64 = 6;
 /// The uevent socket watching for input devices being plugged in and out.
 const TOK_INPUT_HOTPLUG: u64 = 7;
+/// The privileged shell socket's listener; see [`shell`].
+const TOK_SHELL_LISTENER: u64 = 8;
 /// How long an unanswered input keeps waiting for a frame to claim it.
 /// Beyond this the number would not be a latency any more: nothing
 /// responded to the event, and attributing the next unrelated frame to it
@@ -284,6 +293,9 @@ const INPUT_STAMP_MAX_AGE_NS: u64 = 200_000_000;
 
 const TOK_CLIENT_BASE: u64 = 1 << 32;
 const TOK_WIRE_BASE: u64 = 1 << 33;
+/// Shell clients get their own token range, so a token says which socket a
+/// client arrived on even before its `WireClient` is looked up.
+const TOK_SHELL_BASE: u64 = 1 << 34;
 
 /// Flip-interval statistics for `stats` and the log.
 #[derive(Debug, Default)]
@@ -348,6 +360,9 @@ struct Server {
     wire_clients: HashMap<u64, WireClient>,
     clients: HashMap<u64, Client>,
     wire_listener: WireListener,
+    /// The privileged listener. Held next to the wire one and dropped with
+    /// it, so both socket files go at shutdown.
+    shell_listener: WireListener,
     listener: UnixListener,
     // Held for its drop side effect only; the wire listener unlinks itself.
     _socket_file: SocketFile,
@@ -408,8 +423,26 @@ struct Server {
     /// timer that bounds the wait. See [`defer`].
     defer: DeferredFlip,
 
+    /// Exclusive zones and anchors set by shell clients; see [`shell`].
+    zones: shell::Zones,
+    /// Server-global hotkey bindings.
+    hotkeys: shell::HotKeys,
+    /// Server-global window ids, minted for the shell's window list.
+    window_refs: shell::WindowRefs,
+    /// Shell clients subscribed to the window list, by token.
+    window_watchers: Vec<u64>,
+    /// Shell clients subscribed to output hotplug, by token.
+    output_watchers: Vec<u64>,
+    /// The window holding an explicit keyboard grab: every key goes there
+    /// instead of to the focused window. See
+    /// [`GrabKeyboard`](nitro_wire::msg::GrabKeyboard).
+    grab: Option<WindowKey>,
+
     next_client: u64,
     next_wire: u64,
+    /// Shell tokens are allocated from their own counter, so a shell client
+    /// and a wire client can never share a token.
+    next_shell: u64,
     next_client_id: u32,
     active: bool,
     quit: bool,
@@ -531,10 +564,22 @@ pub fn run(mut config: Config) -> Result<(), Error> {
     add(&epoll, &wire_listener.as_fd(), TOK_WIRE_LISTENER)?;
     info!("wire socket at {}", config.wire_path.display());
 
+    // The second socket. Same framing, same handshake; the difference is
+    // that a `Welcome` sent here carries `caps::SHELL`. Both sockets live in
+    // the same `0700` directory, so "can open it" means "is this user", which
+    // is the whole of the privilege model in M3 (`docs/shell.md`).
+    let shell_listener = WireListener::bind(&config.shell_path).map_err(|e| Error::Io {
+        op: "bind shell socket",
+        source: io::Error::other(e.to_string()),
+    })?;
+    add(&epoll, &shell_listener.as_fd(), TOK_SHELL_LISTENER)?;
+    info!("shell socket at {}", config.shell_path.display());
+
     let mut server = Server {
         wire_clients: HashMap::new(),
         clients: HashMap::new(),
         wire_listener,
+        shell_listener,
         listener,
         _socket_file: SocketFile(config.control_path.clone()),
         signals,
@@ -563,8 +608,15 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         unplaced: Vec::new(),
         pending_input_ns: 0,
         defer: defer::DeferredFlip::new().map_err(errno("create the deferred-flip timer"))?,
+        zones: shell::Zones::new(),
+        hotkeys: shell::HotKeys::new(),
+        window_refs: shell::WindowRefs::new(),
+        window_watchers: Vec::new(),
+        output_watchers: Vec::new(),
+        grab: None,
         next_client: 0,
         next_wire: 0,
+        next_shell: 0,
         next_client_id: 1,
         active: true,
         quit: false,
@@ -621,6 +673,28 @@ fn wait(epoll: &OwnedFd, buf: &mut [epoll::Event]) -> Result<usize, Error> {
 fn monotonic_ns() -> u64 {
     let t = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
     u64::try_from(t.tv_sec).unwrap_or(0) * 1_000_000_000 + u64::try_from(t.tv_nsec).unwrap_or(0)
+}
+
+/// Whether a message is one of the shell ops, i.e. needs `caps::SHELL`.
+///
+/// A `match` over the shell variants rather than an op-code range test: a
+/// range would keep compiling after someone put a new op in the 0x4xx block,
+/// which is exactly when a privilege check must not keep compiling.
+fn is_shell_op(msg: &ClientMsg) -> bool {
+    matches!(
+        msg,
+        ClientMsg::SetLayer(_)
+            | ClientMsg::SetExclusiveZone(_)
+            | ClientMsg::SetAnchor(_)
+            | ClientMsg::BindKey(_)
+            | ClientMsg::UnbindKey(_)
+            | ClientMsg::GrabKeyboard(_)
+            | ClientMsg::WindowList(_)
+            | ClientMsg::FocusWindow(_)
+            | ClientMsg::CloseWindow(_)
+            | ClientMsg::SetWindowStateFor(_)
+            | ClientMsg::Outputs(_)
+    )
 }
 
 fn add(epoll: &OwnedFd, fd: &impl AsFd, token: u64) -> Result<(), Error> {
@@ -768,11 +842,13 @@ impl Server {
     fn sync_outputs(&mut self) {
         let infos: Vec<OutputInfo> = self.backend.outputs().to_vec();
         let mut lost = false;
+        let mut gone: Vec<u32> = Vec::new();
         self.outputs.retain(|o| {
             let keep = infos.iter().any(|i| i.id == o.kms_id);
             if !keep {
                 info!("{} gone", o.kms_id);
                 self.scene.remove_output(o.scene_id);
+                gone.push(o.scene_id.0);
                 lost = true;
             }
             keep
@@ -859,6 +935,13 @@ impl Server {
             self.pointer.move_to(x, y, Some(bounds));
             self.pointer.output = input::output_at(&self.scene, self.pointer.position());
         }
+        // A bar has to keep spanning the edge it anchored to after a mode
+        // change, a scale change or a hotplug, and the desktop width it
+        // spans just changed. Re-applied unconditionally rather than only
+        // when something differs: `set_frame_rect` is idempotent and an
+        // anchor that silently stopped holding is the harder bug.
+        self.reflow_anchors();
+        self.notify_outputs(&gone);
     }
 
     /// Move every window the scene unplaced (its output went away) onto the
@@ -873,7 +956,7 @@ impl Server {
             // between startup and the first connector.
             return;
         };
-        let area = wm::work_area(&self.scene, primary);
+        let area = self.local_work_area(primary);
         let orphans: Vec<WindowKey> = self
             .wire_clients
             .values()
@@ -1298,10 +1381,16 @@ impl Server {
                     }
                     TOK_LISTENER => self.on_accept()?,
                     TOK_WIRE_LISTENER => self.on_wire_accept()?,
+                    TOK_SHELL_LISTENER => self.on_shell_accept()?,
                     TOK_BACKEND => self.on_backend()?,
                     TOK_INPUT => self.on_input(),
                     TOK_INPUT_HOTPLUG => self.on_input_hotplug(),
                     TOK_DEFER => self.on_defer_deadline(),
+                    // Shell tokens sort above wire tokens, so this arm has
+                    // to come first; both end up in `on_wire_client`,
+                    // because a shell client *is* a wire client with an
+                    // extra capability bit.
+                    t if t >= TOK_SHELL_BASE => self.on_wire_client(t, flags),
                     t if t >= TOK_WIRE_BASE => self.on_wire_client(t, flags),
                     t if t >= TOK_CLIENT_BASE => self.on_client(t, flags),
                     t => warn!("unknown epoll token {t}"),
@@ -1340,10 +1429,13 @@ impl Server {
                     }
                     self.input.resume();
                     // Key releases that happened on the other VT were never
-                    // seen, so the modifier state is a guess: drop it.
+                    // seen, so the modifier state is a guess: drop it. The
+                    // shell's armed tap goes with it for the same reason —
+                    // the release that would complete it never arrived.
                     if let Some(kb) = self.keyboard.as_mut() {
                         kb.reset();
                     }
+                    self.hotkeys.reset();
                     for output in &mut self.outputs {
                         output.invalidate();
                     }
@@ -1519,6 +1611,32 @@ impl Server {
         }
     }
 
+    /// A client connected to the **privileged** socket.
+    ///
+    /// Identical to [`Server::on_wire_accept`] but for the token range, and
+    /// that is the point: the privilege is not a different transport or a
+    /// different state machine, it is one bit in the `Welcome` decided by
+    /// which listener accepted the socket. `docs/shell.md` argues why.
+    fn on_shell_accept(&mut self) -> Result<(), Error> {
+        loop {
+            let stream = match self.shell_listener.accept() {
+                Ok(Some(s)) => s,
+                Ok(None) => return Ok(()),
+                Err(e) => {
+                    warn!("shell accept: {e}");
+                    return Ok(());
+                }
+            };
+            let id = ClientId(self.next_client_id);
+            self.next_client_id += 1;
+            let token = TOK_SHELL_BASE + self.next_shell;
+            self.next_shell += 1;
+            add(&self.epoll, &stream.as_fd(), token)?;
+            debug!("shell client {} connected", id.0);
+            self.wire_clients.insert(token, WireClient::new(stream, id));
+        }
+    }
+
     fn on_input(&mut self) {
         let mut events = std::mem::take(&mut self.input_events);
         events.clear();
@@ -1582,6 +1700,9 @@ impl Server {
             && let Some(kb) = self.keyboard.as_mut()
         {
             kb.reset();
+        }
+        if removed > 0 {
+            self.hotkeys.reset();
         }
     }
 
@@ -1717,6 +1838,15 @@ impl Server {
     fn pointer_button(&mut self, button: u32, state: ButtonState, time_ns: u64) {
         /// Linux evdev `BTN_RIGHT`.
         const BTN_RIGHT: u32 = 0x111;
+
+        // A click while a modifier is held is not a bare-modifier tap. This
+        // is what keeps `Super`-drag (`docs/wm.md`) and the launcher's
+        // bare-Super trigger from being the same gesture: a drag ends with
+        // Super released and no key in between, which is exactly a tap's
+        // shape, and the button is the only thing that distinguishes them.
+        if state == ButtonState::Pressed {
+            self.hotkeys.cancel_tap();
+        }
 
         // A release always ends whatever drag was in flight, whether or not
         // the pointer is still over the window it started on: a drag that
@@ -1934,6 +2064,26 @@ impl Server {
             self.note_input(time_ns);
             return;
         }
+        // A shell's own bindings come next: after the compositor's, which are
+        // not negotiable, and before any client's, because a global hotkey
+        // the focused application could also see would be both a keylogger
+        // and an ambiguity. `HotKeys::key` is fed every key, hotkey or not,
+        // because the bare-modifier tap is decided by what did *not* happen
+        // while a modifier was held.
+        let fired = self.hotkeys.key(resolved.keysym, pressed, resolved.named);
+        if !fired.is_empty() {
+            for (binding, down) in fired {
+                if let Some(client) = self.wire_clients.get_mut(&binding.token) {
+                    client.send(&ServerMsg::HotKey(msg::HotKey {
+                        id: binding.id,
+                        pressed: down,
+                        time_ns,
+                    }));
+                }
+            }
+            self.note_input(time_ns);
+            return;
+        }
         // Releasing Alt ends an `Alt+Tab` cycle: the window it landed on
         // is raised and becomes the most recently used, so the *next*
         // Alt+Tab starts from there.
@@ -1948,7 +2098,10 @@ impl Server {
             self.note_input(time_ns);
             return;
         }
-        let Some(window) = self.focus else {
+        // A keyboard grab wins over focus: it is how a `NO_FOCUS` overlay
+        // reads the keyboard without taking focus away, so the window that
+        // was focused stays focused and keeps its active frame.
+        let Some(window) = self.grab_target().or(self.focus) else {
             return;
         };
         let state = if pressed {
@@ -2018,9 +2171,6 @@ impl Server {
                     self.tile(win, left);
                 }
             }
-            // The launcher and the terminal are M3-B; the chord is
-            // reserved here so no client can claim it in the meantime.
-            Hotkey::Launch => debug!("Super+Enter is reserved for the launcher"),
         }
     }
 
@@ -2057,6 +2207,18 @@ impl Server {
         let title = self.frame_titles.remove(&win);
         self.text.release(title);
         self.wm.remove(win);
+        // Everything the shell knew about this window goes with it: its
+        // exclusive zone (or the desktop would stay short of the strip a
+        // dead bar reserved), its anchor, its grab and its server-global id.
+        let had_zone = !self.zones.is_empty();
+        self.zones.forget(win);
+        if self.grab == Some(win) {
+            self.grab = None;
+        }
+        self.notify_window_gone(win);
+        if had_zone {
+            self.reflow_work_area();
+        }
         if self.focus == Some(win) {
             self.focus = None;
             // The focus goes to the next window in the MRU order rather
@@ -2237,6 +2399,7 @@ impl Server {
             });
             self.restyle(old, false);
         }
+        let old = self.focus;
         self.focus = window;
         self.wm.set_focus(window);
         if let Some(new) = window {
@@ -2247,6 +2410,15 @@ impl Server {
                 })
             });
             self.restyle(new, true);
+        }
+        // The shell's window list carries `focused`, so both ends of the
+        // change are announced — a bar highlighting the active window needs
+        // to un-highlight the old one.
+        if let Some(old) = old {
+            self.notify_window(old);
+        }
+        if let Some(new) = window {
+            self.notify_window(new);
         }
     }
 
@@ -2381,9 +2553,34 @@ impl Server {
     /// [`Server::desktop_origin`]. The conversion happens at exactly two
     /// boundaries — here on the way out, and `place_window` on the way in.
     fn desktop_area(&self, id: SceneOutputId) -> Rect {
-        let area = wm::work_area(&self.scene, id);
+        let area = self.local_work_area(id);
         let origin = self.desktop_origin(id);
-        Rect::new(origin.x, origin.y, area.w, area.h)
+        Rect::new(origin.x + area.x, origin.y + area.y, area.w, area.h)
+    }
+
+    /// An output's work area in that **output's own** logical space: the
+    /// scene's rectangle minus the shell's exclusive zones.
+    ///
+    /// The subtraction lives here, at the one place the window manager asks
+    /// "what may a window use?". Putting it in `wm::work_area` would have
+    /// made a pure geometry function need the shell's state and the scene's
+    /// window table; putting it at every call site would have let one forget.
+    ///
+    /// A **minimized** bar reserves nothing: hiding a panel has to give its
+    /// strip back, or a shell would have to remember to release the zone
+    /// first and a crashed one would leave the desktop permanently short.
+    fn local_work_area(&self, id: SceneOutputId) -> Rect {
+        let area = wm::work_area(&self.scene, id);
+        if self.zones.is_empty() {
+            return area;
+        }
+        self.zones.work_area(area, id, |win| {
+            self.scene
+                .window_info(win)
+                .ok()
+                .filter(|i| i.state() != WindowState::Minimized)
+                .and_then(nitro_scene::Window::output)
+        })
     }
 
     /// Where an output's logical space starts in the desktop space.
@@ -2568,6 +2765,13 @@ impl Server {
         }
         self.apply_state_geometry(win, state);
         self.announce_state(win, state);
+        // A window with an exclusive zone that became (or stopped being)
+        // hidden changed the work area, and every maximized window has to be
+        // re-sized for it. Guarded on the zone map being non-empty, so a
+        // desktop with no shell running pays one `is_empty` per state change.
+        if !self.zones.is_empty() {
+            self.reflow_work_area();
+        }
         if state == WindowState::Minimized {
             // Putting a window away makes it the *least* recently used, not
             // the most: leaving it at the front is what makes the first
@@ -2684,6 +2888,10 @@ impl Server {
                 state: wire,
             })
         });
+        // The shell's window list carries the state too, and a bar's
+        // minimize/restore button has to reflect what actually happened
+        // rather than what it asked for: `set_state` may have refused.
+        self.notify_window(win);
     }
 
     /// Close a window the way a user asks for it: the client is told, and
@@ -2966,6 +3174,18 @@ impl Server {
         pairs.push(("minimized", minimized as u64));
         pairs.push(("dragging", u64::from(self.wm.drag().is_some())));
         pairs.push(("focused", u64::from(self.focus.is_some())));
+        // The shell's view. `shell_clients` counts connections on the
+        // privileged socket, which is the number to look at when a bar is
+        // "not working": zero means it never got there.
+        let shell_clients = self
+            .wire_clients
+            .keys()
+            .filter(|t| Self::is_shell(**t))
+            .count();
+        pairs.push(("shell_clients", shell_clients as u64));
+        pairs.push(("hotkeys", self.hotkeys.len() as u64));
+        pairs.push(("exclusive_zones", self.zones.zone_count() as u64));
+        pairs.push(("grabbed", u64::from(self.grab.is_some())));
         protocol::stats_reply(&pairs)
     }
 
@@ -3038,11 +3258,17 @@ impl Server {
     fn handle_wire_msg(&mut self, token: u64, message: ClientMsg) -> bool {
         match message {
             ClientMsg::Hello(hello) => {
-                let caps = self.caps();
+                let shell = Self::is_shell(token);
+                let caps = self.caps(shell);
                 let Some(client) = self.wire_clients.get_mut(&token) else {
                     return false;
                 };
-                info!("wire client {} is {:?}", client.id.0, hello.name);
+                info!(
+                    "{} client {} is {:?}",
+                    if shell { "shell" } else { "wire" },
+                    client.id.0,
+                    hello.name
+                );
                 if let Err(e) = client.stream.welcome(SERVER_NAME, caps) {
                     warn!("welcome: {e}");
                     return false;
@@ -3102,6 +3328,17 @@ impl Server {
                 true
             }
             other => {
+                // The shell ops are answered on receipt rather than buffered
+                // for the commit. They are not scene mutations a frame must
+                // show atomically: `WindowList` is a *question*, `BindKey` a
+                // registration, and a bar that had to commit to arm its
+                // launcher key would be arming it a frame late for no gain.
+                // `SetLayer`/`SetExclusiveZone`/`SetAnchor` do change what is
+                // on screen, and go through the same `settle` pass every
+                // other wakeup ends with.
+                if is_shell_op(&other) {
+                    return self.handle_shell_msg(token, other);
+                }
                 let Some(client) = self.wire_clients.get_mut(&token) else {
                     return false;
                 };
@@ -3119,12 +3356,474 @@ impl Server {
     /// and on a box with no fonts at all that would be a promise the server
     /// cannot keep. `DIRECT_SCANOUT` and `DMABUF` remain later milestones,
     /// and a zero bit is the protocol's way of saying "do not use this".
-    fn caps(&self) -> u32 {
+    ///
+    /// `SHELL` is set for, and only for, a connection accepted on the shell
+    /// socket — which is what `shell` says. It is reported rather than
+    /// negotiated: the grant already happened when the client managed to
+    /// open that path.
+    fn caps(&self, shell: bool) -> u32 {
         let mut caps = nitro_wire::types::caps::WM;
         if self.text.has_fonts() {
             caps |= nitro_wire::types::caps::TEXT;
         }
+        if shell {
+            caps |= nitro_wire::types::caps::SHELL;
+        }
         caps
+    }
+
+    /// Whether a token names a client that arrived on the shell socket.
+    ///
+    /// The token range *is* the answer, which is why shell clients get their
+    /// own: a per-client boolean would be a second copy of the same fact,
+    /// and the two could drift.
+    const fn is_shell(token: u64) -> bool {
+        token >= TOK_SHELL_BASE
+    }
+
+    // ---------------------------------------------------------- shell ops
+
+    /// Handle one shell op, or kill the connection that had no business
+    /// sending it. Returns whether the client survives.
+    ///
+    /// The privilege check is here and nowhere else: one `if` against the
+    /// token range, before any of the ops is looked at. Spreading it over
+    /// eleven message handlers is how a capability check gets forgotten in
+    /// the twelfth.
+    fn handle_shell_msg(&mut self, token: u64, msg: ClientMsg) -> bool {
+        if !Self::is_shell(token) {
+            let name = msg.name();
+            self.disconnect(
+                token,
+                Some((
+                    0,
+                    ErrorCode::Protocol,
+                    format!("{name} needs caps::SHELL: connect to the shell socket"),
+                )),
+            );
+            return false;
+        }
+        match msg {
+            ClientMsg::SetLayer(m) => self.shell_set_layer(token, m),
+            ClientMsg::SetExclusiveZone(m) => self.shell_set_zone(token, m),
+            ClientMsg::SetAnchor(m) => self.shell_set_anchor(token, m),
+            ClientMsg::BindKey(m) => self.shell_bind_key(token, m),
+            ClientMsg::UnbindKey(m) => {
+                self.hotkeys.unbind(token, m.id);
+                true
+            }
+            ClientMsg::GrabKeyboard(m) => self.shell_grab_keyboard(token, m),
+            ClientMsg::WindowList(_) => {
+                if !self.window_watchers.contains(&token) {
+                    self.window_watchers.push(token);
+                }
+                self.send_window_list(token);
+                true
+            }
+            ClientMsg::Outputs(_) => {
+                if !self.output_watchers.contains(&token) {
+                    self.output_watchers.push(token);
+                }
+                self.send_output_list(token);
+                true
+            }
+            ClientMsg::FocusWindow(m) => {
+                // Silently refused for a window that cannot take focus, on
+                // exactly the terms a click on it would be: a shell's window
+                // list showing a `NO_FOCUS` overlay must not be able to
+                // wedge the keyboard by clicking it.
+                if let Some(win) = self.window_refs.key_for(m.window)
+                    && self.focusable(win)
+                {
+                    self.raise_and_focus(win);
+                }
+                true
+            }
+            ClientMsg::CloseWindow(m) => {
+                if let Some(win) = self.window_refs.key_for(m.window) {
+                    self.close_window(win);
+                }
+                true
+            }
+            ClientMsg::SetWindowStateFor(m) => {
+                if let Some(win) = self.window_refs.key_for(m.window) {
+                    self.set_state(win, clients::scene_state(m.state));
+                }
+                true
+            }
+            other => {
+                debug_assert!(false, "{} is not a shell op", other.name());
+                true
+            }
+        }
+    }
+
+    /// `SetLayer`: move one of this client's own windows between layers.
+    fn shell_set_layer(&mut self, token: u64, m: msg::SetLayer) -> bool {
+        // `Normal` is refused rather than accepted as a no-op: a shell
+        // surface asking to be an ordinary window has misunderstood what
+        // this op is for, and silently obliging would leave a bar in the
+        // window-management z-order where a click could raise a document
+        // over it.
+        if m.layer == nitro_wire::types::Layer::Normal {
+            self.disconnect(
+                token,
+                Some((
+                    0,
+                    ErrorCode::Protocol,
+                    "SetLayer: Normal is not a shell layer".to_owned(),
+                )),
+            );
+            return false;
+        }
+        let Some(win) = self.shell_window(token, m.window, "SetLayer") else {
+            return false;
+        };
+        if let Err(e) = self.scene.set_layer(win, clients::scene_layer(m.layer)) {
+            warn!("SetLayer: {e}");
+        }
+        true
+    }
+
+    /// `SetExclusiveZone`: reserve, or release, space along an output edge.
+    fn shell_set_zone(&mut self, token: u64, m: msg::SetExclusiveZone) -> bool {
+        let Some(win) = self.shell_window(token, m.window, "SetExclusiveZone") else {
+            return false;
+        };
+        self.zones.set_zone(win, m.edge, m.px);
+        // The work area just changed, so every window that is *sized by* it
+        // has to be re-sized: a maximized window must give the bar its strip
+        // immediately, not at the next maximize.
+        self.reflow_work_area();
+        true
+    }
+
+    /// `SetAnchor`: stick a window to its output's edges.
+    fn shell_set_anchor(&mut self, token: u64, m: msg::SetAnchor) -> bool {
+        if m.edges & !nitro_wire::types::anchor::ALL != 0 {
+            self.disconnect(
+                token,
+                Some((
+                    0,
+                    ErrorCode::Protocol,
+                    format!("SetAnchor: reserved edge bits in {:#x}", m.edges),
+                )),
+            );
+            return false;
+        }
+        let Some(win) = self.shell_window(token, m.window, "SetAnchor") else {
+            return false;
+        };
+        self.zones.set_anchor(win, m.edges, m.margin);
+        self.apply_anchor(win);
+        true
+    }
+
+    /// `BindKey`: claim a server-global chord.
+    fn shell_bind_key(&mut self, token: u64, m: msg::BindKey) -> bool {
+        match self.hotkeys.bind(token, m.id, m.mods, m.keysym) {
+            Ok(()) => true,
+            Err(e) => {
+                let detail = match e {
+                    shell::BindError::ReservedBits => {
+                        format!("BindKey: reserved modifier bits in {:#x}", m.mods)
+                    }
+                    shell::BindError::BadTap => {
+                        "BindKey: a bare-modifier tap must name exactly one modifier".to_owned()
+                    }
+                    shell::BindError::Reserved => format!(
+                        "BindKey: keysym {:#x} with mods {:#x} is a compositor chord",
+                        m.keysym, m.mods
+                    ),
+                    shell::BindError::Taken => format!(
+                        "BindKey: keysym {:#x} with mods {:#x} is already bound",
+                        m.keysym, m.mods
+                    ),
+                };
+                self.disconnect(token, Some((0, ErrorCode::Protocol, detail)));
+                false
+            }
+        }
+    }
+
+    /// `GrabKeyboard`: route every key to one of this client's windows.
+    fn shell_grab_keyboard(&mut self, token: u64, m: msg::GrabKeyboard) -> bool {
+        let Some(win) = self.shell_window(token, m.window, "GrabKeyboard") else {
+            return false;
+        };
+        if m.on {
+            self.grab = Some(win);
+        } else if self.grab == Some(win) {
+            self.grab = None;
+        }
+        true
+    }
+
+    /// The window a live keyboard grab points at, if any.
+    ///
+    /// A grab on a window that is no longer *visible* does not count, and is
+    /// dropped here rather than tracked: the launcher hides itself with
+    /// `SetVisible(false)` on Escape, and requiring it to send an explicit
+    /// `GrabKeyboard { on: false }` too would mean one forgotten message
+    /// swallows the keyboard for the whole session. Checked lazily because
+    /// the scene does not report visibility changes and polling one node on
+    /// each key is cheaper than watching every commit.
+    fn grab_target(&mut self) -> Option<WindowKey> {
+        let win = self.grab?;
+        let live = self
+            .scene
+            .window_info(win)
+            .ok()
+            .filter(|i| i.state() != WindowState::Minimized)
+            .and_then(|i| self.scene.node(i.content()).ok())
+            .is_some_and(nitro_scene::Node::visible);
+        if !live {
+            self.grab = None;
+            return None;
+        }
+        Some(win)
+    }
+
+    /// Resolve one of the *sender's own* windows, disconnecting it if the id
+    /// is not one of its windows.
+    ///
+    /// `UnknownNode` and a close, not a silent ignore: a shell that named a
+    /// window it does not own has lost track of its own tree, which is
+    /// exactly the reasoning behind every other fatal error here.
+    fn shell_window(&mut self, token: u64, id: NodeId, what: &str) -> Option<WindowKey> {
+        let found = self
+            .wire_clients
+            .get(&token)
+            .and_then(|c| c.windows.get(&id).copied());
+        if found.is_none() {
+            self.disconnect(
+                token,
+                Some((
+                    0,
+                    ErrorCode::UnknownNode,
+                    format!("{what}: no window with id {}", id.raw()),
+                )),
+            );
+        }
+        found
+    }
+
+    /// Put an anchored window where its anchor says, resizing it if the
+    /// anchor spans an axis.
+    ///
+    /// Against the output's **full** logical rectangle, not its work area:
+    /// a bar that anchored into the work area would be pushed off the screen
+    /// by its own exclusive zone.
+    fn apply_anchor(&mut self, win: WindowKey) {
+        let Some(a) = self.zones.anchor(win) else {
+            return;
+        };
+        let Ok(info) = self.scene.window_info(win) else {
+            return;
+        };
+        let size = info.frame_size();
+        let output = info
+            .output()
+            .or_else(|| self.outputs.first().map(|o| o.scene_id));
+        let Some(output) = output else {
+            // No output yet; `sync_outputs` re-applies anchors when one
+            // appears, so the window simply waits where it is.
+            return;
+        };
+        let Some((rect, scale)) = self.scene.output_info(output) else {
+            return;
+        };
+        let s = if scale > 0.0 { scale } else { 1.0 };
+        let origin = self.desktop_origin(output);
+        let full = Rect::new(origin.x, origin.y, rect.w as f32 / s, rect.h as f32 / s);
+        let target = shell::anchor_rect(full, size, a);
+        self.set_frame_rect(win, target);
+    }
+
+    /// Re-apply every anchor. Called when an output's geometry changes, so a
+    /// bar keeps spanning across a mode change or a hotplug.
+    fn reflow_anchors(&mut self) {
+        let anchored: Vec<WindowKey> = self.zones.anchored().map(|(w, _)| w).collect();
+        for win in anchored {
+            self.apply_anchor(win);
+        }
+    }
+
+    /// Re-apply the geometry of every window whose rectangle is *derived*
+    /// from the work area, after an exclusive zone changed it.
+    ///
+    /// Only `Maximized` windows: a floating window is where the user put it,
+    /// and a fullscreen one covers the output work area or not. This is also
+    /// why a zone is cheap — the reflow is proportional to the number of
+    /// maximized windows, not to the number of windows.
+    fn reflow_work_area(&mut self) {
+        let maximized: Vec<WindowKey> = self
+            .wire_clients
+            .values()
+            .flat_map(|c| c.windows.values().copied())
+            .filter(|w| {
+                self.scene
+                    .window_info(*w)
+                    .is_ok_and(|i| i.state() == WindowState::Maximized)
+            })
+            .collect();
+        for win in maximized {
+            self.apply_state_geometry(win, WindowState::Maximized);
+        }
+    }
+
+    // ------------------------------------------------ the window list
+
+    /// Build one window's `WindowInfo`, minting its server-global id.
+    fn window_info_msg(&mut self, win: WindowKey) -> Option<msg::WindowInfo> {
+        let id = self.window_refs.id_for(win);
+        let focused = self.focus == Some(win);
+        let info = self.scene.window_info(win).ok()?;
+        Some(msg::WindowInfo {
+            window: id,
+            state: clients::wire_state(info.state()),
+            focused,
+            // `u32::MAX` rather than 0 for "nowhere": output 0 is a real
+            // output, and a shell must be able to tell an unplaced window
+            // from one on the primary screen.
+            output: info.output().map_or(u32::MAX, |o| o.0),
+            app_id: info.app_id().to_owned(),
+            title: info.title().to_owned(),
+        })
+    }
+
+    /// Every window the server knows about, in a stable order.
+    ///
+    /// Ordered by the clients' own window maps rather than by z-order: a
+    /// bar's task list should not reshuffle itself every time the user
+    /// raises a window, and a shell that wants stacking order can ask for
+    /// it when there is a reason to.
+    fn all_windows(&self) -> Vec<WindowKey> {
+        let mut out: Vec<WindowKey> = self
+            .wire_clients
+            .values()
+            .flat_map(|c| c.windows.values().copied())
+            .collect();
+        out.sort_unstable_by_key(|w| (w.index(), w.generation()));
+        out
+    }
+
+    /// Answer a `WindowList`: a snapshot, then `WindowListEnd`.
+    fn send_window_list(&mut self, token: u64) {
+        let windows = self.all_windows();
+        let infos: Vec<msg::WindowInfo> = windows
+            .into_iter()
+            .filter_map(|w| self.window_info_msg(w))
+            .collect();
+        let Some(client) = self.wire_clients.get_mut(&token) else {
+            return;
+        };
+        for info in infos {
+            client.send(&ServerMsg::WindowInfo(info));
+        }
+        client.send(&ServerMsg::WindowListEnd(msg::WindowListEnd));
+    }
+
+    /// Tell every subscribed shell client that a window changed.
+    ///
+    /// Called from the places that change something in a `WindowInfo`:
+    /// focus, state, title, app id, placement. The fast path is the first
+    /// line — a desktop with no shell running pays one `is_empty`.
+    fn notify_window(&mut self, win: WindowKey) {
+        if self.window_watchers.is_empty() {
+            return;
+        }
+        let Some(info) = self.window_info_msg(win) else {
+            return;
+        };
+        for token in self.window_watchers.clone() {
+            if let Some(client) = self.wire_clients.get_mut(&token) {
+                client.send(&ServerMsg::WindowInfo(info.clone()));
+            }
+        }
+    }
+
+    /// Tell every subscribed shell client that a window is gone, and retire
+    /// its id.
+    fn notify_window_gone(&mut self, win: WindowKey) {
+        let Some(id) = self.window_refs.forget(win) else {
+            // Never named to any shell, so nothing to retract.
+            return;
+        };
+        for token in self.window_watchers.clone() {
+            if let Some(client) = self.wire_clients.get_mut(&token) {
+                client.send(&ServerMsg::WindowGone(msg::WindowGone { window: id }));
+            }
+        }
+    }
+
+    // ---------------------------------------------------------- outputs
+
+    /// Every connected output as an `OutputInfo`, in device-x order — the
+    /// same left-to-right order `sync_outputs` laid them out in.
+    fn output_infos(&self) -> Vec<msg::OutputInfo> {
+        let kms = self.backend.outputs();
+        let mut out: Vec<msg::OutputInfo> = self
+            .outputs
+            .iter()
+            .filter_map(|o| {
+                let (rect, scale) = self.scene.output_info(o.scene_id)?;
+                // Name and refresh come from the backend's own description:
+                // `OutputState` keeps the refresh as a *period*, and turning
+                // it back into millihertz would round the number the client
+                // is told away from the mode the kernel actually set.
+                let info = kms.iter().find(|i| i.id == o.kms_id);
+                Some(msg::OutputInfo {
+                    id: o.scene_id.0,
+                    w: o.width,
+                    h: o.height,
+                    scale,
+                    x: rect.x,
+                    y: rect.y,
+                    refresh_mhz: info.map_or(0, |i| i.refresh_mhz),
+                    name: info.map_or_else(String::new, |i| i.name.clone()),
+                })
+            })
+            .collect();
+        out.sort_unstable_by_key(|o| o.x);
+        out
+    }
+
+    /// Answer an `Outputs`: a snapshot, then `OutputsEnd`.
+    fn send_output_list(&mut self, token: u64) {
+        let infos = self.output_infos();
+        let Some(client) = self.wire_clients.get_mut(&token) else {
+            return;
+        };
+        for info in infos {
+            client.send(&ServerMsg::OutputInfo(info));
+        }
+        client.send(&ServerMsg::OutputsEnd(msg::OutputsEnd));
+    }
+
+    /// Tell every subscribed shell client the output list changed.
+    ///
+    /// A hotplug sends the *whole* list rather than a diff: outputs are few,
+    /// their positions are relative to each other (unplugging the left one
+    /// moves every other), and a diff a shell had to reassemble would be a
+    /// second source of truth about the layout.
+    fn notify_outputs(&mut self, gone: &[u32]) {
+        if self.output_watchers.is_empty() {
+            return;
+        }
+        let infos = self.output_infos();
+        for token in self.output_watchers.clone() {
+            let Some(client) = self.wire_clients.get_mut(&token) else {
+                continue;
+            };
+            for id in gone {
+                client.send(&ServerMsg::OutputGone(msg::OutputGone { id: *id }));
+            }
+            for info in &infos {
+                client.send(&ServerMsg::OutputInfo(info.clone()));
+            }
+            client.send(&ServerMsg::OutputsEnd(msg::OutputsEnd));
+        }
     }
 
     /// Apply a client's transaction. Returns whether the client survives.
@@ -3188,6 +3887,7 @@ impl Server {
         for win in outcome.retitled {
             self.retitle(win);
         }
+        let relisted = outcome.relisted;
         // State requests are applied last, after every geometry mutation
         // in the batch: `Maximized` has to win over the client's own
         // `SetBounds`, not race it. `set_state` reaches the owning client
@@ -3197,6 +3897,14 @@ impl Server {
         self.wire_clients.insert(token, client);
         for (win, state) in outcome.state_requests {
             self.set_state(win, state);
+        }
+        // Announced with every client back in the map, because a watcher is
+        // a *different* client than the one that committed: notifying while
+        // this one was lifted out would be fine, but notifying after also
+        // reports the state changes above, and a bar wants one message with
+        // the final truth rather than two with a transient.
+        for win in relisted {
+            self.notify_window(win);
         }
         let Some(mut client) = self.wire_clients.remove(&token) else {
             // Only reachable if a state change disconnected the client,
@@ -3291,7 +3999,7 @@ impl Server {
         // size, and the placement has to know it to centre the thing the
         // user actually sees.
         self.decorate(win);
-        let area = wm::work_area(&self.scene, scene_id);
+        let area = self.local_work_area(scene_id);
         let scale = self.scene.output_info(scene_id).map_or(1.0, |(_, s)| s);
         let Ok(info) = self.scene.window_info(win) else {
             return;
@@ -3321,6 +4029,10 @@ impl Server {
             scale,
             output: scene_id.0,
         }));
+        // A new window is a new entry in every shell's list. Announced here
+        // rather than at creation because this is the first moment it has an
+        // output and a place to report.
+        self.notify_window(win);
     }
 
     /// Push queued bytes at every client, dropping the ones whose socket
@@ -3419,6 +4131,13 @@ impl Server {
             output.in_flight.retain(|(c, _)| *c != id.0);
         }
         debug!("wire client {} disconnected", id.0);
+        // Whatever this client held as a *shell*: its hotkey bindings (or the
+        // launcher's Super would stay swallowed after the launcher died), its
+        // subscriptions, and any grab it still had. Its windows' zones and
+        // anchors went with `forget_window` above.
+        self.hotkeys.forget_client(token);
+        self.window_watchers.retain(|t| *t != token);
+        self.output_watchers.retain(|t| *t != token);
         // Dropping the stream removes it from the epoll set.
     }
 
@@ -3574,11 +4293,104 @@ mod tests {
     }
 
     #[test]
-    fn the_fake_config_puts_both_sockets_in_one_directory() {
+    fn the_fake_config_puts_all_three_sockets_in_one_directory() {
         let c = Config::fake(320, 200, "/run/x/nitro/control.sock");
         assert_eq!(c.control_path, PathBuf::from("/run/x/nitro/control.sock"));
         assert_eq!(c.wire_path, PathBuf::from("/run/x/nitro/wire.sock"));
+        assert_eq!(c.shell_path, PathBuf::from("/run/x/nitro/shell.sock"));
         assert!(!c.handle_signals);
         assert!(c.input_dir.is_none());
+    }
+
+    #[test]
+    fn only_shell_tokens_are_privileged() {
+        // The token range *is* the capability check, so it is worth an
+        // assertion of its own: a wire token must never read as a shell one,
+        // however many clients have connected.
+        assert!(Server::is_shell(TOK_SHELL_BASE));
+        assert!(Server::is_shell(TOK_SHELL_BASE + 9_999));
+        assert!(!Server::is_shell(TOK_WIRE_BASE));
+        assert!(!Server::is_shell(TOK_WIRE_BASE + 9_999));
+        assert!(!Server::is_shell(TOK_CLIENT_BASE));
+        assert!(!Server::is_shell(TOK_WIRE_LISTENER));
+        assert!(!Server::is_shell(TOK_SHELL_LISTENER));
+    }
+
+    #[test]
+    fn every_shell_op_is_recognised_as_one() {
+        use nitro_wire::types::{Edge, Layer, WindowRef};
+        let shell: Vec<ClientMsg> = vec![
+            msg::SetLayer {
+                window: NodeId(1),
+                layer: Layer::Top,
+            }
+            .into(),
+            msg::SetExclusiveZone {
+                window: NodeId(1),
+                edge: Edge::Top,
+                px: 1,
+            }
+            .into(),
+            msg::SetAnchor {
+                window: NodeId(1),
+                edges: 0,
+                margin: 0,
+            }
+            .into(),
+            msg::BindKey {
+                id: 1,
+                mods: 0,
+                keysym: 1,
+            }
+            .into(),
+            msg::UnbindKey { id: 1 }.into(),
+            msg::GrabKeyboard {
+                window: NodeId(1),
+                on: true,
+            }
+            .into(),
+            msg::WindowList.into(),
+            msg::Outputs.into(),
+            msg::FocusWindow {
+                window: WindowRef(1),
+            }
+            .into(),
+            msg::CloseWindow {
+                window: WindowRef(1),
+            }
+            .into(),
+            msg::SetWindowStateFor {
+                window: WindowRef(1),
+                state: nitro_wire::types::WindowState::Normal,
+            }
+            .into(),
+        ];
+        for m in &shell {
+            assert!(is_shell_op(m), "{} must need caps::SHELL", m.name());
+            assert_eq!(
+                m.op() & 0xff00,
+                0x0400,
+                "{} is in the shell op block",
+                m.name()
+            );
+        }
+        // And the ordinary ops are not: a false positive here would make the
+        // whole unprivileged protocol unusable on the wire socket.
+        for m in [
+            ClientMsg::from(msg::Commit { serial: 1 }),
+            msg::DestroyNode { id: NodeId(1) }.into(),
+            msg::SetWindowState {
+                window: NodeId(1),
+                state: nitro_wire::types::WindowState::Normal,
+            }
+            .into(),
+            msg::SetAppId {
+                window: NodeId(1),
+                app_id: String::new(),
+            }
+            .into(),
+        ] {
+            assert!(!is_shell_op(&m), "{} is not a shell op", m.name());
+        }
     }
 }

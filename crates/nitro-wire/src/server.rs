@@ -23,6 +23,9 @@ use crate::{MAX_PENDING_FDS, VERSION};
 /// wakeup, small enough that no single client can monopolise the loop.
 pub const READ_BUDGET: usize = 1024 * 1024;
 
+/// Where the server should bind its **shell** socket; see
+/// [`crate::shell_socket_path`].
+pub use crate::shell_socket_path;
 /// Where the server should bind; see [`crate::socket_path`]. The client
 /// resolves through the same function, so a client started in the same
 /// environment finds the server.
@@ -55,6 +58,20 @@ impl Listener {
     /// As [`Listener::bind`].
     pub fn bind_default() -> Result<Self, Error> {
         Self::bind(&socket_path())
+    }
+
+    /// Bind at the path from [`shell_socket_path`].
+    ///
+    /// Same socket type, same framing, same handshake; the *only* thing
+    /// that differs is which capability bits the server puts in its
+    /// `Welcome`. Keeping the listener code identical is deliberate — the
+    /// privilege must live in one place (which path a client reached), not
+    /// in a second, subtly different transport.
+    ///
+    /// # Errors
+    /// As [`Listener::bind`].
+    pub fn bind_shell_default() -> Result<Self, Error> {
+        Self::bind(&shell_socket_path())
     }
 
     /// The path bound.

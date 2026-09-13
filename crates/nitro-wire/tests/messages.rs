@@ -8,16 +8,20 @@
 use nitro_core::{Color, IRect, Point, Rect, Size, Transform};
 use nitro_wire::codec::{FdQueue, Writer};
 use nitro_wire::msg::{
-    BufferDamage, ClientMsg, Closed, Commit, Configure, CreateBuffer, CreateNode, CreateWindow,
-    DestroyBuffer, DestroyNode, Error as ErrorMsg, Fill, Focus, Frame, Hello, Key, MeasureText,
-    PointerAxis, PointerButton, PointerEnter, PointerLeave, PointerMotion, Presented, Reparent,
-    RequestFrame, ServerMsg, SetAppId, SetBorder, SetBounds, SetClip, SetCorners, SetFill,
-    SetImage, SetOpacity, SetText, SetTransform, SetVisible, SetWindowLimits, SetWindowState,
-    SetWindowTitle, TextMeasured, TextMetrics, Touch, Welcome, WindowState,
+    BindKey, BufferDamage, ClientMsg, CloseWindow, Closed, Commit, Configure, CreateBuffer,
+    CreateNode, CreateWindow, DestroyBuffer, DestroyNode, Error as ErrorMsg, Fill, Focus,
+    FocusWindow, Frame, GrabKeyboard, Hello, HotKey, Key, MeasureText, OutputGone, OutputInfo,
+    Outputs, OutputsEnd, PointerAxis, PointerButton, PointerEnter, PointerLeave, PointerMotion,
+    Presented, Reparent, RequestFrame, ServerMsg, SetAnchor, SetAppId, SetBorder, SetBounds,
+    SetClip, SetCorners, SetExclusiveZone, SetFill, SetImage, SetLayer, SetOpacity, SetText,
+    SetTransform, SetVisible, SetWindowLimits, SetWindowState, SetWindowStateFor, SetWindowTitle,
+    TextMeasured, TextMetrics, Touch, UnbindKey, Welcome, WindowGone, WindowInfo, WindowList,
+    WindowListEnd, WindowState,
 };
 use nitro_wire::types::{
-    Align, AxisSource, BufferId, ButtonState, CursorPos, ErrorCode, Layer, NodeId, NodeKind,
-    TouchPhase, WindowState as WindowStateValue, caps, format, window_flags,
+    Align, AxisSource, BufferId, ButtonState, CursorPos, Edge, ErrorCode, Layer, NodeId, NodeKind,
+    TouchPhase, WindowRef, WindowState as WindowStateValue, anchor, caps, format, mod_mask,
+    window_flags,
 };
 use nitro_wire::{DecodeError, VERSION, header};
 
@@ -232,6 +236,79 @@ fn client_messages() -> Vec<ClientMsg> {
             src: IRect::new(1, 2, 3, 4),
         }
         .into(),
+        // Shell ops (caps::SHELL).
+        SetLayer {
+            window: NodeId(40),
+            layer: Layer::Top,
+        }
+        .into(),
+        SetLayer {
+            window: NodeId(41),
+            layer: Layer::Background,
+        }
+        .into(),
+        SetExclusiveZone {
+            window: NodeId(42),
+            edge: Edge::Top,
+            px: 32,
+        }
+        .into(),
+        SetExclusiveZone {
+            window: NodeId(43),
+            edge: Edge::Right,
+            px: 0,
+        }
+        .into(),
+        SetAnchor {
+            window: NodeId(44),
+            edges: anchor::TOP | anchor::LEFT | anchor::RIGHT,
+            margin: 6,
+        }
+        .into(),
+        SetAnchor {
+            window: NodeId(45),
+            edges: 0,
+            margin: 0,
+        }
+        .into(),
+        BindKey {
+            id: 0x0bad_f00d,
+            mods: mod_mask::SUPER | mod_mask::SHIFT,
+            keysym: 0xff0d,
+        }
+        .into(),
+        BindKey {
+            id: 2,
+            mods: mod_mask::SUPER,
+            keysym: 0,
+        }
+        .into(),
+        UnbindKey { id: 0x0bad_f00d }.into(),
+        GrabKeyboard {
+            window: NodeId(46),
+            on: true,
+        }
+        .into(),
+        GrabKeyboard {
+            window: NodeId(47),
+            on: false,
+        }
+        .into(),
+        WindowList.into(),
+        Outputs.into(),
+        FocusWindow {
+            window: WindowRef(0x00de_0001),
+        }
+        .into(),
+        CloseWindow {
+            window: WindowRef::NONE,
+        }
+        .into(),
+        SetWindowStateFor {
+            window: WindowRef(0x00de_0002),
+            state: WindowStateValue::Minimized,
+        }
+        .into(),
     ]
 }
 
@@ -380,6 +457,66 @@ fn server_messages() -> Vec<ServerMsg> {
             cursor_x: Vec::new(),
         }
         .into(),
+        // Shell events (caps::SHELL).
+        HotKey {
+            id: 0x0bad_f00d,
+            pressed: true,
+            time_ns: 0x0123_4567_89ab_cdef,
+        }
+        .into(),
+        HotKey {
+            id: 2,
+            pressed: false,
+            time_ns: 1,
+        }
+        .into(),
+        WindowInfo {
+            window: WindowRef(0x00de_0001),
+            state: WindowStateValue::Maximized,
+            focused: true,
+            output: 3,
+            app_id: "org.nitro.calc".to_owned(),
+            title: "Calculator — ünicode".to_owned(),
+        }
+        .into(),
+        WindowInfo {
+            window: WindowRef(7),
+            state: WindowStateValue::Normal,
+            focused: false,
+            output: u32::MAX,
+            app_id: String::new(),
+            title: String::new(),
+        }
+        .into(),
+        WindowListEnd.into(),
+        WindowGone {
+            window: WindowRef(0x00de_0002),
+        }
+        .into(),
+        OutputInfo {
+            id: 2,
+            w: 2560,
+            h: 1440,
+            scale: 1.5,
+            x: -1920,
+            y: 0,
+            refresh_mhz: 59_951,
+            name: "HDMI-A-1".to_owned(),
+        }
+        .into(),
+        OutputInfo {
+            id: 0,
+            w: 0,
+            h: 0,
+            scale: 0.0,
+            x: 0,
+            y: 0,
+            refresh_mhz: 0,
+            name: String::new(),
+        }
+        .into(),
+        OutputsEnd.into(),
+        OutputGone { id: 9 }.into(),
     ]
 }
 
@@ -721,6 +858,194 @@ fn payload_layouts_are_frozen() {
     .encode(&mut w)
     .unwrap();
     assert_eq!(w.bytes(), &GOLDEN_TEXT_MEASURED);
+
+    let mut w = Writer::new();
+    ClientMsg::from(SetExclusiveZone {
+        window: NodeId(0x0102_0304),
+        edge: Edge::Bottom,
+        px: 32,
+    })
+    .encode(&mut w)
+    .unwrap();
+    assert_eq!(
+        w.bytes(),
+        &[
+            // header: len=9, op=0x0402, fds=0, flags=0
+            0x09, 0x00, 0x00, 0x00, 0x02, 0x04, 0x00, 0x00, //
+            0x04, 0x03, 0x02, 0x01, // window
+            0x01, // edge Bottom
+            0x20, 0x00, 0x00, 0x00, // px 32
+        ]
+    );
+
+    let mut w = Writer::new();
+    ClientMsg::from(BindKey {
+        id: 0x0102_0304,
+        mods: mod_mask::SUPER,
+        keysym: 0xff0d,
+    })
+    .encode(&mut w)
+    .unwrap();
+    assert_eq!(
+        w.bytes(),
+        &[
+            // header: len=12, op=0x0404, fds=0, flags=0
+            0x0c, 0x00, 0x00, 0x00, 0x04, 0x04, 0x00, 0x00, //
+            0x04, 0x03, 0x02, 0x01, // id
+            0x08, 0x00, 0x00, 0x00, // mods SUPER
+            0x0d, 0xff, 0x00, 0x00, // keysym Return
+        ]
+    );
+
+    // The three empty-bodied shell requests are a bare header.
+    for (msg, op) in [
+        (ClientMsg::from(WindowList), 0x0407u16),
+        (ClientMsg::from(Outputs), 0x040b),
+    ] {
+        let mut w = Writer::new();
+        msg.encode(&mut w).unwrap();
+        assert_eq!(
+            w.bytes(),
+            &[
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                (op & 0xff) as u8,
+                (op >> 8) as u8,
+                0x00,
+                0x00
+            ]
+        );
+    }
+
+    let mut w = Writer::new();
+    ServerMsg::from(HotKey {
+        id: 0x0102_0304,
+        pressed: true,
+        time_ns: 0x0102_0304_0506_0708,
+    })
+    .encode(&mut w)
+    .unwrap();
+    assert_eq!(
+        w.bytes(),
+        &[
+            // header: len=13, op=0x8401, fds=0, flags=0
+            0x0d, 0x00, 0x00, 0x00, 0x01, 0x84, 0x00, 0x00, //
+            0x04, 0x03, 0x02, 0x01, // id
+            0x01, // pressed
+            0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // time_ns
+        ]
+    );
+
+    let mut w = Writer::new();
+    ServerMsg::from(WindowInfo {
+        window: WindowRef(0x0102_0304),
+        state: WindowStateValue::Maximized,
+        focused: true,
+        output: 2,
+        app_id: "ab".to_owned(),
+        title: "cd".to_owned(),
+    })
+    .encode(&mut w)
+    .unwrap();
+    assert_eq!(
+        w.bytes(),
+        &[
+            // header: len=22, op=0x8402, fds=0, flags=0
+            0x16, 0x00, 0x00, 0x00, 0x02, 0x84, 0x00, 0x00, //
+            0x04, 0x03, 0x02, 0x01, // window
+            0x01, // state Maximized
+            0x01, // focused
+            0x02, 0x00, 0x00, 0x00, // output
+            0x02, 0x00, 0x00, 0x00, b'a', b'b', // app_id
+            0x02, 0x00, 0x00, 0x00, b'c', b'd', // title
+        ]
+    );
+
+    let mut w = Writer::new();
+    ServerMsg::from(OutputInfo {
+        id: 1,
+        w: 1920,
+        h: 1080,
+        scale: 2.0,
+        x: -1,
+        y: 0,
+        refresh_mhz: 60_000,
+        name: "ab".to_owned(),
+    })
+    .encode(&mut w)
+    .unwrap();
+    assert_eq!(
+        w.bytes(),
+        &[
+            // header: len=34, op=0x8405, fds=0, flags=0
+            0x22, 0x00, 0x00, 0x00, 0x05, 0x84, 0x00, 0x00, //
+            0x01, 0x00, 0x00, 0x00, // id
+            0x80, 0x07, 0x00, 0x00, // w 1920
+            0x38, 0x04, 0x00, 0x00, // h 1080
+            0x00, 0x00, 0x00, 0x40, // scale 2.0
+            0xff, 0xff, 0xff, 0xff, // x -1
+            0x00, 0x00, 0x00, 0x00, // y 0
+            0x60, 0xea, 0x00, 0x00, // refresh_mhz 60000
+            0x02, 0x00, 0x00, 0x00, b'a', b'b', // name
+        ]
+    );
+}
+
+#[test]
+fn a_bad_edge_byte_is_rejected() {
+    let mut w = Writer::new();
+    ClientMsg::from(SetExclusiveZone {
+        window: NodeId(1),
+        edge: Edge::Top,
+        px: 1,
+    })
+    .encode(&mut w)
+    .unwrap();
+    let mut bytes = w.bytes()[header::SIZE..].to_vec();
+    bytes[4] = 4; // Top/Bottom/Left/Right only
+    let mut q = FdQueue::new();
+    assert_eq!(
+        ClientMsg::decode(SetExclusiveZone::OP, &bytes, &mut q),
+        Err(DecodeError::BadValue)
+    );
+}
+
+#[test]
+fn the_shell_ops_live_in_their_own_block() {
+    // 0x_4xx client, 0x84xx server: a block of its own, so the unprivileged
+    // protocol can keep growing without colliding with it.
+    for op in [
+        SetLayer::OP,
+        SetExclusiveZone::OP,
+        SetAnchor::OP,
+        BindKey::OP,
+        UnbindKey::OP,
+        GrabKeyboard::OP,
+        WindowList::OP,
+        FocusWindow::OP,
+        CloseWindow::OP,
+        SetWindowStateFor::OP,
+        Outputs::OP,
+    ] {
+        assert_eq!(op & 0xff00, 0x0400, "client shell op {op:#06x}");
+        assert!(ClientMsg::is_op(op));
+        assert!(!ServerMsg::is_op(op));
+    }
+    for op in [
+        HotKey::OP,
+        WindowInfo::OP,
+        WindowListEnd::OP,
+        WindowGone::OP,
+        OutputInfo::OP,
+        OutputsEnd::OP,
+        OutputGone::OP,
+    ] {
+        assert_eq!(op & 0xff00, 0x8400, "server shell op {op:#06x}");
+        assert!(ServerMsg::is_op(op));
+        assert!(!ClientMsg::is_op(op));
+    }
 }
 
 #[test]

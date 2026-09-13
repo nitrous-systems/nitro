@@ -22,6 +22,13 @@ local or on `SOCK_SEQPACKET` — the same bytes run over TCP or an SSH
 channel for the remote case, where file-descriptor passing is simply not
 available and clients must not use the buffer ops.
 
+There is a **second** socket, `$XDG_RUNTIME_DIR/nitro/shell.sock`
+(`NITRO_SHELL_SOCKET`), with identical framing and handshake. The only
+difference is that a connection accepted there is granted the `SHELL`
+capability and may send the ops in the [Shell](#shell-caps-shell)
+section. **The socket is the privilege**: see that section and
+`docs/shell.md`.
+
 Both directions are non-blocking. A client that cannot write blocks
 nobody: the unsent bytes stay queued and go out when the socket drains.
 
@@ -127,6 +134,11 @@ containing the transaction reached the screen.
 | 2 | `DMABUF` | `Surface` nodes backed by dma-bufs are accepted (M5) |
 | 3 | `REMOTE` | the link is remote: buffers are expensive, text is cheap |
 | 4 | `WM` | the server manages windows: decorations, states, limits, app ids (M3) |
+| 5 | `SHELL` | the connection arrived on the **shell socket** and may send the shell ops (M3) |
+
+`SHELL` is bit 5, not bit 3: bit 3 is `REMOTE` and was taken in M1. It is
+*reported*, never negotiated — a client cannot ask for it. See
+[Shell](#shell-caps-shell).
 
 ## Errors
 
@@ -156,6 +168,7 @@ logs and is never parsed.
 | `TouchPhase` | `Down` 0, `Move` 1, `Up` 2, `Cancel` 3 |
 | `Align` | `Left` 0, `Center` 1, `Right` 2 |
 | `WindowState` | `Normal` 0, `Maximized` 1, `Fullscreen` 2, `Minimized` 3 |
+| `Edge` | `Top` 0, `Bottom` 1, `Left` 2, `Right` 3 *(M3, shell)* |
 | `Fill` tag | `None` 0, `Solid` 1, `Linear` 2 |
 
 A value outside the list is a decode error, not a silently-ignored
@@ -171,6 +184,16 @@ connection. Check the bit before you rely on text being *visible*.
 window), `FIXED_SIZE` 2 (the window is not user-resizable: no resize
 bands, no maximize), `NO_FOCUS` 4 (the window never takes keyboard focus —
 a launcher, a bar). Unknown bits are reserved and must be zero.
+
+`mod_mask` (M3, shell): `SHIFT` 1, `CTRL` 2, `ALT` 4, `SUPER` 8. Used by
+`BindKey`, and deliberately **not** the same thing as `Key.mods`: that is
+xkb's serialized mask, whose bit positions depend on the compiled keymap,
+so it cannot be compared against a constant and a shell could not express
+"Super+Return" in it at all. Unknown bits are reserved and must be zero.
+
+`anchor` (M3, shell): `TOP` 1, `BOTTOM` 2, `LEFT` 4, `RIGHT` 8. Used by
+`SetAnchor`. Opposite edges together mean "span that axis"; neither means
+"centre on it". Unknown bits are reserved and must be zero.
 
 **Errata (M3).** Bits 1 and 2 used to be documented as `FULLSCREEN` and
 `OPAQUE`. Both were placeholders that no implementation ever honoured:
@@ -217,6 +240,17 @@ Assigned in blocks of 0x100 so a block can grow without renumbering.
 | `0x0302` | `DestroyBuffer` | buffers |
 | `0x0303` | `BufferDamage` | buffers |
 | `0x0304` | `SetImage` | buffers |
+| `0x0401` | `SetLayer` | shell (see `SHELL`) |
+| `0x0402` | `SetExclusiveZone` | shell (see `SHELL`) |
+| `0x0403` | `SetAnchor` | shell (see `SHELL`) |
+| `0x0404` | `BindKey` | shell (see `SHELL`) |
+| `0x0405` | `UnbindKey` | shell (see `SHELL`) |
+| `0x0406` | `GrabKeyboard` | shell (see `SHELL`) |
+| `0x0407` | `WindowList` | shell (see `SHELL`) |
+| `0x0408` | `FocusWindow` | shell (see `SHELL`) |
+| `0x0409` | `CloseWindow` | shell (see `SHELL`) |
+| `0x040a` | `SetWindowStateFor` | shell (see `SHELL`) |
+| `0x040b` | `Outputs` | shell (see `SHELL`) |
 
 ### Server → client
 
@@ -239,6 +273,13 @@ Assigned in blocks of 0x100 so a block can grow without renumbering.
 | `0x8207` | `Touch` | input |
 | `0x8301` | `TextMetrics` | text |
 | `0x8302` | `TextMeasured` | text |
+| `0x8401` | `HotKey` | shell (see `SHELL`) |
+| `0x8402` | `WindowInfo` | shell (see `SHELL`) |
+| `0x8403` | `WindowListEnd` | shell (see `SHELL`) |
+| `0x8404` | `WindowGone` | shell (see `SHELL`) |
+| `0x8405` | `OutputInfo` | shell (see `SHELL`) |
+| `0x8406` | `OutputsEnd` | shell (see `SHELL`) |
+| `0x8407` | `OutputGone` | shell (see `SHELL`) |
 
 ## Messages, client → server
 
@@ -719,6 +760,295 @@ with it.
 Fixed head 24 bytes, then the vector. Sent on receipt of the
 `MeasureText`, not at a commit. `cursor_x` may be empty.
 
+## Shell (caps `SHELL`)
+
+The bar, the launcher and the wallpaper are ordinary `nitro-ui` clients.
+They are not privileged because of anything they *send* — they are
+privileged because of **where they connected**.
+
+### The socket rule
+
+* The server listens on **two** sockets with identical framing, handshake
+  and op decoding: `$XDG_RUNTIME_DIR/nitro/wire.sock` and
+  `$XDG_RUNTIME_DIR/nitro/shell.sock` (`NITRO_SOCKET` /
+  `NITRO_SHELL_SOCKET`; `/tmp/nitro-<uid>/…` is the fallback for both).
+  Both live in a `0700` directory.
+* A connection accepted on the shell socket is answered with
+  `Welcome { caps: … | WM | SHELL }`. One accepted on the wire socket never
+  has `SHELL` set.
+* Every op in this section requires that bit. Sending one without it is
+  `Error { Protocol }` and the connection closes — like every other error
+  in this protocol, and for the same reason: a client that asked for
+  something it may not have has misunderstood its own situation.
+* Several shell clients are allowed at once (bar, launcher, wallpaper are
+  three processes), and they are all the same user.
+* There is no `Spawn` op and no way to acquire the bit at runtime. A shell
+  client forks and execs on its own.
+
+What this is *not*: a per-message capability negotiation, a per-app allow
+list, or an authentication protocol. `docs/shell.md` states the model, the
+threat it does and does not address, and what is deferred.
+
+### Server-global window ids
+
+The ops that act on *another client's* window take a `WindowRef`, a `u32`
+id the **server** allocates. It is neither a scene key (internal,
+generational) nor a `NodeId` (namespaced per client, so two clients may
+both own `NodeId(1)`). A shell only ever learns one from a `WindowInfo`,
+and ids are **never reused** — a stale `WindowRef` names nothing, rather
+than naming somebody else's window. `WindowRef(0)` is "no window".
+
+The ops that act on one of the sender's *own* windows (`SetLayer`,
+`SetExclusiveZone`, `SetAnchor`, `GrabKeyboard`) take the sender's own
+`NodeId`, like every other window op. Naming a window the sender does not
+own is `Error { UnknownNode }`.
+
+### `SetLayer` — 0x0401
+
+| field | type | meaning |
+|---|---|---|
+| `window` | `u32` (`NodeId`) | one of the sender's own windows |
+| `layer` | `u8` (`Layer`) | `Background`, `Top` or `Overlay` |
+
+`Normal` is `Error { Protocol }`: a shell surface asking to be an ordinary
+window has misunderstood the op, and obliging silently would put a bar into
+the window-management z-order where a click could raise a document over it.
+
+### `SetExclusiveZone` — 0x0402
+
+| field | type | meaning |
+|---|---|---|
+| `window` | `u32` (`NodeId`) | one of the sender's own windows |
+| `edge` | `u8` (`Edge`) | which edge of the output the space comes off |
+| `px` | `u32` | logical pixels to reserve; 0 releases |
+
+The reservation comes off that output's **work area** — what `Maximized`
+fills and what new windows are placed into. A 32-px top zone makes every
+maximized window 32 px shorter and moves it 32 px down, *immediately*: a
+maximized window is re-sized when the zone changes, not at its next
+maximize.
+
+Zones on one edge **add** (two bars docked to the top each get a strip),
+and a zone larger than the area collapses that axis to zero rather than
+going negative. A zone is released by `px: 0`, by the window becoming
+`Minimized`, by the window closing, or by the client disconnecting — so a
+crashed bar cannot leave the desktop permanently short.
+
+The server does **not** place the window for you; `SetAnchor` does. A
+shell may legitimately want a zone larger or smaller than the window it
+belongs to (a bar with a shadow, a dock that only reserves its resting
+height).
+
+### `SetAnchor` — 0x0403
+
+| field | type | meaning |
+|---|---|---|
+| `window` | `u32` (`NodeId`) | one of the sender's own windows |
+| `edges` | `u8` | bitmask from `anchor` |
+| `margin` | `u32` | gap in logical pixels on each anchored edge |
+
+Opposite edges together mean "span that axis", so the window is **resized**
+to fit; neither means "centre on it", rounded to a whole logical pixel. A
+bar is `TOP|LEFT|RIGHT`, a dock `BOTTOM|LEFT|RIGHT`, a centred launcher
+`edges: 0`. A reserved bit is `Error { Protocol }`.
+
+Anchoring is against the output's **full** logical rectangle, not its work
+area: a bar anchored into the work area would be pushed off the screen by
+its own exclusive zone, and a launcher centred in the work area would jump
+every time a panel appeared. Anchors are re-applied on every output
+change, so a bar keeps spanning after a mode change, a scale change or a
+hotplug.
+
+The answer is a `Configure`, like any other server-decided geometry.
+
+### `BindKey` — 0x0404
+
+| field | type | meaning |
+|---|---|---|
+| `id` | `u32` | the shell's own id for this binding, echoed in `HotKey` |
+| `mods` | `u32` | bitmask from `mod_mask` |
+| `keysym` | `u32` | X11 keysym, or 0 for a bare-modifier tap |
+
+While bound, the chord is **not** delivered to the focused client as a
+`Key` — a global hotkey the focused application could also see would be a
+keylogger and an ambiguity at once. It arrives as a `HotKey`.
+
+`keysym: 0` is the **bare-modifier tap**: the binding fires when the
+modifier named in `mods` is pressed and released with *nothing else pressed
+in between*, which is the launcher's Super trigger. It must name exactly
+one modifier — "Super+Shift tapped" has no single press to detect — and
+anything else is `Error { Protocol }`.
+
+Refused with `Error { Protocol }`:
+
+* a reserved bit in `mods`;
+* a malformed tap (zero or several modifiers with `keysym: 0`);
+* one of the **compositor's own** chords (`Ctrl+Alt+*`, `Alt+Tab`,
+  `Super+Q/M/F/H/←/→` — `docs/wm.md` has the table). Those are not
+  negotiable: `Ctrl+Alt+F2` must switch VT with a wedged shell, and
+  `Alt+Tab` is how you leave an application that took the keyboard;
+* a chord **another** shell client already holds.
+
+Re-binding the same `id` from the same client replaces it. `Super+Return`
+is *not* a compositor chord in M3-B — the launcher binds it here, which is
+why `keyboard::hotkey` no longer claims it.
+
+### `UnbindKey` — 0x0405
+
+| field | type |
+|---|---|
+| `id` | `u32` |
+
+Unbinding an `id` that is not bound is a **no-op**, not an error: a shell
+shutting down should not have to remember what it managed to bind. Every
+binding of a client is released when it disconnects.
+
+### `GrabKeyboard` — 0x0406
+
+| field | type | meaning |
+|---|---|---|
+| `window` | `u32` (`NodeId`) | one of the sender's own windows |
+| `on` | `bool` | whether to hold the grab |
+
+While granted, every key goes to this window instead of the focused one,
+**bound hotkeys included** — the launcher's own Escape must not be
+swallowed by whatever the shell bound. It is how a `NO_FOCUS` `Overlay`
+reads the keyboard without taking focus: the window that was focused stays
+focused, keeps its active frame, and is never told it lost anything. It
+simply stops receiving keys.
+
+Released by `on: false`, by hiding the window (`SetVisible { false }` or
+`Minimized`), by closing it, or by the client disconnecting. One grab at a
+time: a second replaces the first.
+
+### `WindowList` — 0x0407
+
+Empty payload. Answered **on receipt**, not at a commit: it is a question,
+like `MeasureText`. One `WindowInfo` per window the server knows about,
+then one `WindowListEnd`.
+
+It also **subscribes** the connection: afterwards every change produces
+another `WindowInfo` and every window that goes a `WindowGone`, so a bar
+never polls. Asking again re-sends the snapshot; the subscription is
+idempotent.
+
+### `FocusWindow` — 0x0408
+
+| field | type |
+|---|---|
+| `window` | `u32` (`WindowRef`) |
+
+Raises and focuses another client's window. **Silently refused** for a
+window that cannot take focus — `NO_FOCUS`, minimized, unplaced — on
+exactly the terms a click on it would be, and for a stale `WindowRef`.
+There is no per-request error in this protocol, and a shell's window list
+must not be able to wedge the keyboard.
+
+### `CloseWindow` — 0x0409
+
+| field | type |
+|---|---|
+| `window` | `u32` (`WindowRef`) |
+
+The same *request* the title bar's close button makes: the owning client
+gets `Closed` and decides. The server does not tear the window down, so a
+client with unsaved work can still refuse.
+
+### `SetWindowStateFor` — 0x040a
+
+| field | type |
+|---|---|
+| `window` | `u32` (`WindowRef`) |
+| `state` | `u8` (`WindowState`) |
+
+`SetWindowState` for someone else's window — what a bar's window list needs
+to minimize and restore an entry. Refused silently on the same terms: a
+`FIXED_SIZE` window still cannot maximize. The owning client is told with
+a `WindowState` event, so it learns what actually happened.
+
+### `Outputs` — 0x040b
+
+Empty payload. Answered on receipt with one `OutputInfo` per connected
+output and an `OutputsEnd`, and subscribes the connection to hotplug.
+
+### `HotKey` — 0x8401
+
+| field | type | meaning |
+|---|---|---|
+| `id` | `u32` | the `id` given to `BindKey` |
+| `pressed` | `bool` | the chord went down (`true`) or came up (`false`) |
+| `time_ns` | `u64` | event time, `CLOCK_MONOTONIC` |
+
+A chord fires on its press and again on its release, so a shell can
+implement press-and-hold. A **bare-modifier tap** is reported *once*, with
+`pressed: false`, when the modifier comes back up: until the release the
+server cannot know it was a tap rather than the start of a chord, so there
+is no press event to report.
+
+### `WindowInfo` — 0x8402
+
+| field | type | meaning |
+|---|---|---|
+| `window` | `u32` (`WindowRef`) | server-global window id |
+| `state` | `u8` (`WindowState`) | what the window is doing |
+| `focused` | `bool` | whether it holds keyboard focus |
+| `output` | `u32` | the output it is on, or `u32::MAX` for none |
+| `app_id` | `str` | from `SetAppId`; empty when the client set none |
+| `title` | `str` | window title |
+
+Fixed head 10 bytes, then the two strings. `output` is `u32::MAX` rather
+than 0 for "nowhere": output 0 is a real output, and a shell must be able
+to tell an unplaced window from one on the primary screen.
+
+Sent for each window in answer to `WindowList`, and again whenever
+anything in it changes — a retitle, an app id, a focus change (on **both**
+windows), a state change, or a new window being placed.
+
+### `WindowListEnd` — 0x8403
+
+Empty payload. Every window of the snapshot has been sent.
+
+### `WindowGone` — 0x8404
+
+| field | type |
+|---|---|
+| `window` | `u32` (`WindowRef`) |
+
+The id is retired and will never be issued again.
+
+### `OutputInfo` — 0x8405
+
+| field | type | meaning |
+|---|---|---|
+| `id` | `u32` | the output id `Configure.output` and `Presented.output` carry |
+| `w` | `u32` | width in device pixels |
+| `h` | `u32` | height in device pixels |
+| `scale` | `f32` | scale factor |
+| `x` | `i32` | left edge in the global device-pixel space |
+| `y` | `i32` | top edge in the global device-pixel space |
+| `refresh_mhz` | `u32` | refresh rate in millihertz (60 000 = 60 Hz) |
+| `name` | `str` | connector name (`"HDMI-A-1"`) |
+
+Fixed head 28 bytes, then the name. Outputs are reported in device-x
+order, which is the left-to-right connector order the server lays them out
+in (`docs/wm.md`).
+
+### `OutputsEnd` — 0x8406
+
+Empty payload. Every output of the snapshot has been sent.
+
+### `OutputGone` — 0x8407
+
+| field | type |
+|---|---|
+| `id` | `u32` |
+
+A hotplug sends `OutputGone` for whatever vanished and then the **whole**
+remaining list, rather than a diff: outputs are few, their positions are
+relative to each other (unplugging the left one moves every other), and a
+diff a shell had to reassemble would be a second source of truth about the
+layout.
+
 ## Deviations from the M1 sketch
 
 The task's sketch is followed except where a fixed-size head had to come
@@ -750,7 +1080,8 @@ first, or where a name was ambiguous. Every difference:
    (`f32`).
 8. **Op codes leave gaps**: `0x0003..0x000f` inside the session block,
    `0x0016..0x00ff` after the window ops (M3 took `0x0013..0x0015`), and
-   so on, so each block can grow.
+   so on, so each block can grow. M3-B added a whole new block,
+   `0x_4xx`/`0x84xx`, for the shell ops.
 9. **No separate `Sender` type.** The sketch asked for `ClientStream` plus
    a `Sender` for `ServerMsg`; sending is instead `ClientStream::send` /
    `flush` on the same object. A `Sender` would have to own or share the
@@ -865,6 +1196,18 @@ to.
   after the existing window ops, guarded by the **new `WM` capability
   bit** (bit 4). No field of any pre-existing message changed, so
   `VERSION` stays **1**.
+* The M3-B shell ops — `0x0401..0x040b` and `0x8401..0x8407` — are the
+  path once more, in a **new block** of their own and guarded by the **new
+  `SHELL` capability bit** (bit 5). Two things about them are worth
+  spelling out: the bit is granted by *which socket* a client connected to
+  rather than asked for, and the block is separate so the unprivileged
+  protocol can keep growing in `0x_0xx..0x_3xx` without ever colliding
+  with a privileged op. `VERSION` stays **1**.
+* M3-B also **removes a compositor chord**: `Super+Return` was reserved
+  for "the launcher" in M3-A and is now bindable through `BindKey`,
+  because the launcher exists and binds it. Nothing on the wire changed —
+  the chord was never a message — but a client could observe the
+  difference, so it is recorded here.
 * The one thing M3 does change is the *meaning* of `window_flags` bits 1
   and 2, documented as `FULLSCREEN` and `OPAQUE` and now `FIXED_SIZE` and
   `NO_FOCUS` (see the errata under `window_flags`). No byte layout moved

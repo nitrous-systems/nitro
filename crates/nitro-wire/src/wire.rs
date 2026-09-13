@@ -12,8 +12,8 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use crate::error::DecodeError;
 use crate::types::{
-    Align, AxisSource, BufferId, ButtonState, CursorPos, ErrorCode, Layer, NodeId, NodeKind,
-    TouchPhase, WindowState,
+    Align, AxisSource, BufferId, ButtonState, CursorPos, Edge, ErrorCode, Layer, NodeId, NodeKind,
+    TouchPhase, WindowRef, WindowState,
 };
 
 /// A type with a fixed-size, little-endian wire representation.
@@ -106,6 +106,7 @@ plain_tag!(ButtonState, u8, u8);
 plain_tag!(AxisSource, u8, u8);
 plain_tag!(TouchPhase, u8, u8);
 plain_tag!(WindowState, u8, u8);
+plain_tag!(Edge, u8, u8);
 plain_tag!(ErrorCode, u16, U16);
 
 /// `impl Plain` for the id newtypes.
@@ -125,6 +126,7 @@ macro_rules! plain_id {
 
 plain_id!(NodeId);
 plain_id!(BufferId);
+plain_id!(WindowRef);
 
 /// Wire twin of [`Point`]: `x, y` as `f32`.
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]

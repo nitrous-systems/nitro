@@ -61,6 +61,46 @@ impl Mods {
     pub fn ctrl_alt(self) -> bool {
         self.ctrl && self.alt
     }
+
+    /// The same four modifiers as a protocol [`mod_mask`] bitmask.
+    ///
+    /// [`Mods`] is the compositor's shape and the mask is the wire's; a
+    /// shell's [`BindKey`](nitro_wire::msg::BindKey) arrives as a mask and
+    /// has to be compared against what a key event resolved to, so the
+    /// conversion lives here rather than at the two call sites.
+    ///
+    /// [`mod_mask`]: nitro_wire::types::mod_mask
+    #[must_use]
+    pub fn mask(self) -> u32 {
+        use nitro_wire::types::mod_mask;
+        let mut m = 0;
+        if self.shift {
+            m |= mod_mask::SHIFT;
+        }
+        if self.ctrl {
+            m |= mod_mask::CTRL;
+        }
+        if self.alt {
+            m |= mod_mask::ALT;
+        }
+        if self.logo {
+            m |= mod_mask::SUPER;
+        }
+        m
+    }
+
+    /// A [`mod_mask`](nitro_wire::types::mod_mask) bitmask as `Mods`.
+    /// Unknown bits are ignored; the caller rejects them.
+    #[must_use]
+    pub fn from_mask(mask: u32) -> Self {
+        use nitro_wire::types::mod_mask;
+        Self {
+            shift: mask & mod_mask::SHIFT != 0,
+            ctrl: mask & mod_mask::CTRL != 0,
+            alt: mask & mod_mask::ALT != 0,
+            logo: mask & mod_mask::SUPER != 0,
+        }
+    }
 }
 
 /// What one key event resolved to.
@@ -276,8 +316,6 @@ pub enum Hotkey {
     /// Super+Left / Super+Right: tile to that half of the work area.
     /// `true` = left.
     Tile(bool),
-    /// Super+Enter: reserved for the launcher/terminal (M3-B).
-    Launch,
 }
 
 /// Map a keysym and the modifiers held to a compositor hotkey.
@@ -329,7 +367,27 @@ pub fn hotkey(keysym: u32, mods: Mods) -> Option<Hotkey> {
         xkb::keysyms::KEY_h | xkb::keysyms::KEY_H => Some(Hotkey::Minimize),
         xkb::keysyms::KEY_Left => Some(Hotkey::Tile(true)),
         xkb::keysyms::KEY_Right => Some(Hotkey::Tile(false)),
-        xkb::keysyms::KEY_Return | xkb::keysyms::KEY_KP_Enter => Some(Hotkey::Launch),
+        _ => None,
+    }
+}
+
+/// Which [`mod_mask`](nitro_wire::types::mod_mask) bit a keysym *is*, if it
+/// is a modifier key at all.
+///
+/// Needed for the bare-modifier tap a shell binds with `keysym: 0`: the
+/// server has to recognise "the Super key itself went down" as distinct
+/// from "a key went down with Super held", and the modifier *state* cannot
+/// tell those apart.
+#[must_use]
+pub fn mod_of_keysym(keysym: u32) -> Option<u32> {
+    use nitro_wire::types::mod_mask;
+    match keysym {
+        xkb::keysyms::KEY_Shift_L | xkb::keysyms::KEY_Shift_R => Some(mod_mask::SHIFT),
+        xkb::keysyms::KEY_Control_L | xkb::keysyms::KEY_Control_R => Some(mod_mask::CTRL),
+        xkb::keysyms::KEY_Alt_L | xkb::keysyms::KEY_Alt_R | xkb::keysyms::KEY_Meta_L => {
+            Some(mod_mask::ALT)
+        }
+        xkb::keysyms::KEY_Super_L | xkb::keysyms::KEY_Super_R => Some(mod_mask::SUPER),
         _ => None,
     }
 }
@@ -346,7 +404,7 @@ pub fn is_alt(keysym: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Hotkey, Keyboard, Mods, hotkey, is_alt};
+    use super::{Hotkey, Keyboard, Mods, hotkey, is_alt, mod_of_keysym};
     use xkbcommon::xkb;
 
     /// evdev `KEY_A`, from `linux/input-event-codes.h`.
@@ -438,7 +496,44 @@ mod tests {
             hotkey(xkb::keysyms::KEY_Right, LOGO),
             Some(Hotkey::Tile(false))
         );
-        assert_eq!(hotkey(xkb::keysyms::KEY_Return, LOGO), Some(Hotkey::Launch));
+        // Super+Return is *not* a compositor chord any more: the launcher
+        // binds it through `BindKey`, and a chord the table still claimed
+        // could never reach the shell.
+        assert_eq!(hotkey(xkb::keysyms::KEY_Return, LOGO), None);
+    }
+
+    #[test]
+    fn modifier_keysyms_name_their_mask_bit() {
+        use nitro_wire::types::mod_mask;
+        assert_eq!(
+            mod_of_keysym(xkb::keysyms::KEY_Super_L),
+            Some(mod_mask::SUPER)
+        );
+        assert_eq!(
+            mod_of_keysym(xkb::keysyms::KEY_Super_R),
+            Some(mod_mask::SUPER)
+        );
+        assert_eq!(mod_of_keysym(xkb::keysyms::KEY_Alt_L), Some(mod_mask::ALT));
+        assert_eq!(
+            mod_of_keysym(xkb::keysyms::KEY_Shift_R),
+            Some(mod_mask::SHIFT)
+        );
+        // A plain letter is not a modifier, however it is held.
+        assert_eq!(mod_of_keysym(xkb::keysyms::KEY_a), None);
+        assert_eq!(mod_of_keysym(0), None);
+    }
+
+    #[test]
+    fn mods_and_masks_round_trip() {
+        use nitro_wire::types::mod_mask;
+        assert_eq!(LOGO.mask(), mod_mask::SUPER);
+        assert_eq!(CTRL_ALT.mask(), mod_mask::CTRL | mod_mask::ALT);
+        assert_eq!(Mods::default().mask(), 0);
+        for m in [LOGO, CTRL_ALT, ALT, Mods::default()] {
+            assert_eq!(Mods::from_mask(m.mask()), m);
+        }
+        // Reserved bits are ignored here; `BindKey` rejects them.
+        assert_eq!(Mods::from_mask(mod_mask::SUPER | 0x8000), LOGO);
     }
 
     #[test]

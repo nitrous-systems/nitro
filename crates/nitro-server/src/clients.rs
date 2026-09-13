@@ -254,6 +254,12 @@ pub struct ApplyOutcome {
     pub state_requests: Vec<(WindowKey, WindowState)>,
     /// Windows whose title changed, so the server can redraw the title bar.
     pub retitled: Vec<WindowKey>,
+    /// Windows something in the shell's `WindowInfo` changed on — a title,
+    /// an app id. Separate from `retitled` because the two answer different
+    /// questions: `retitled` is "reshape the title bar", and this is "tell
+    /// the bar its list entry moved". An app id change is the second
+    /// without the first.
+    pub relisted: Vec<WindowKey>,
 }
 
 /// Apply one client's buffered mutations to the scene, atomically as far as
@@ -377,10 +383,12 @@ fn apply_msg(
                 .set_window_title(client.id, win, m.title)
                 .map_err(|e| scene_err("SetWindowTitle", e))?;
             outcome.retitled.push(win);
+            outcome.relisted.push(win);
             Ok(())
         }
         ClientMsg::SetAppId(m) => {
             let win = window_of(client, m.window)?;
+            outcome.relisted.push(win);
             scene
                 .set_app_id(client.id, win, m.app_id)
                 .map_err(|e| scene_err("SetAppId", e))
@@ -574,6 +582,21 @@ fn apply_msg(
                 .set_image(client.id, key, image)
                 .map_err(|e| scene_err("SetImage", e))
         }
+        // The shell ops are answered on receipt, never buffered: they are
+        // not scene mutations a frame has to show atomically. `Server` keeps
+        // the privilege check and the handling together in one place; see
+        // `Server::handle_shell_msg`.
+        ClientMsg::SetLayer(_)
+        | ClientMsg::SetExclusiveZone(_)
+        | ClientMsg::SetAnchor(_)
+        | ClientMsg::BindKey(_)
+        | ClientMsg::UnbindKey(_)
+        | ClientMsg::GrabKeyboard(_)
+        | ClientMsg::WindowList(_)
+        | ClientMsg::FocusWindow(_)
+        | ClientMsg::CloseWindow(_)
+        | ClientMsg::SetWindowStateFor(_)
+        | ClientMsg::Outputs(_) => Ok(()),
     }
 }
 
