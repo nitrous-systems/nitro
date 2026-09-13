@@ -1,0 +1,30 @@
+[package]
+name = "nitro-calc"
+description = "A calculator: the first application written against nitro-ui, and scriptable through `hey`"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The toolkit, and nothing else. An app on nitro is a widget tree and a
+# state struct: no font library, no rasterizer, no compositor, and no
+# third-party crate to pull any of them in.
+nitro-ui = { workspace = true }
+
+[lib]
+name = "nitro_calc"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nitro-calc"
+path = "src/main.rs"
+
+[dev-dependencies]
+# The in-process harness: a real server on the fake backend, a real
+# client, real pixels. Off in the shipped binary, which is why it is a
+# dev-dependency and why `just deploy` builds with `--bins` only.
+nitro-ui = { workspace = true, features = ["test-support"] }

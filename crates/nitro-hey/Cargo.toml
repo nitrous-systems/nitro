@@ -27,3 +27,9 @@ path = "src/main.rs"
 # than a mock that would prove nothing about the protocol.
 nitro-ui = { path = "../nitro-ui", features = ["test-support"] }
 nitro-core = { workspace = true }
+# `tests/calc_end_to_end.rs` drives the real calculator, because the
+# commands in `nitro-calc`'s README are a promise and an untested promise
+# goes stale. It lives here rather than in `nitro-calc` because
+# `CARGO_BIN_EXE_hey` — the path to the binary under test — is only set
+# for tests in the crate that declares that binary.
+nitro-calc = { path = "../nitro-calc" }

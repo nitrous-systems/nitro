@@ -113,6 +113,17 @@ fn segment_of<S: 'static>(ui: &Ui<S>, parent: WidgetId, child: WidgetId) -> Opti
 /// An empty path, `window` and `/` all name the root. Names are matched
 /// before `role[i]` segments, so `window/ok` finds the widget named `ok`
 /// whatever its role index would have been.
+///
+/// A segment that matches no child is then looked for **anywhere in that
+/// child's subtree, by name, provided the name occurs exactly once**. So
+/// `window/ok` finds the button named `ok` even when it sits three
+/// containers down, and an app does not have to spell out
+/// `window/container[1]/container[0]/ok` — a path that names the
+/// *layout* rather than the widget, and that a refactor of the layout
+/// silently breaks. Ambiguity is refused rather than guessed: a name
+/// used twice resolves to neither, and the caller gets `no such widget`
+/// rather than a coin flip. An explicit `role[i]` segment always wins,
+/// so nothing that resolved before resolves differently now.
 #[must_use]
 pub fn resolve<S: 'static>(ui: &Ui<S>, path: &str) -> Option<WidgetId> {
     let root = ui.root()?;
@@ -127,12 +138,37 @@ pub fn resolve<S: 'static>(ui: &Ui<S>, path: &str) -> Option<WidgetId> {
     let mut cur = if first == ROOT {
         root
     } else {
-        child_by_segment(ui, root, first)?
+        child_by_segment(ui, root, first).or_else(|| unique_in_subtree(ui, root, first))?
     };
     for seg in segments {
-        cur = child_by_segment(ui, cur, seg)?;
+        cur = child_by_segment(ui, cur, seg).or_else(|| unique_in_subtree(ui, cur, seg))?;
     }
     Some(cur)
+}
+
+/// The one widget under `from` whose addressing name is `name`, or
+/// `None` when there is no such widget **or more than one**.
+///
+/// Pre-order, and it keeps walking after a hit rather than returning the
+/// first: the whole value of the rule is that it refuses an ambiguous
+/// name, and a search that stopped early could not know whether the name
+/// was ambiguous.
+fn unique_in_subtree<S: 'static>(ui: &Ui<S>, from: WidgetId, name: &str) -> Option<WidgetId> {
+    if !addressable(name) {
+        return None;
+    }
+    let mut found = None;
+    let mut stack = ui.children(from);
+    while let Some(id) = stack.pop() {
+        if ui.address_name(id).as_deref() == Some(name) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(id);
+        }
+        stack.extend(ui.children(id));
+    }
+    found
 }
 
 fn child_by_segment<S: 'static>(ui: &Ui<S>, parent: WidgetId, seg: &str) -> Option<WidgetId> {

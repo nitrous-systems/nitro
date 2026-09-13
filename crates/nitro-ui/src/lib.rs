@@ -94,12 +94,19 @@ pub mod test;
 
 pub use app::App;
 pub use arena::{Dirty, WidgetId, WidgetState};
+// The geometry, colour and alignment types this crate's own API is
+// written in. Re-exported so an app depends on `nitro-ui` and nothing
+// else: `label(..).align(Align::Right)` should not require the caller to
+// name — and version-match — the crate the toolkit happens to get its
+// `Align` from.
 pub use build::{Built, ContainerBuilder, IntoWidget, StyleBuilder};
 pub use error::Error;
 pub use event::{Event, Handled, KeyEvent};
 pub use layout::{
     Constraints, CrossAlign, Direction, Edges, FlexItem, LayoutStyle, Length, MainAlign,
 };
+pub use nitro_core::{Color, Point, Rect, Size, Transform};
+pub use nitro_wire::types::Align;
 pub use theme::{TextStyle, Theme};
 pub use ui::{FdToken, Node, TimerId, Ui, WidgetMut};
 pub use widget::{Access, EventCx, LayoutCx, MeasureCx, PaintCx, Role, TextRun, Widget};

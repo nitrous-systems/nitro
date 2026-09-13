@@ -159,6 +159,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nitro-calc"
+version = "0.0.1"
+dependencies = [
+ "nitro-ui",
+]
+
+[[package]]
 name = "nitro-core"
 version = "0.0.1"
 
@@ -178,6 +185,7 @@ dependencies = [
 name = "nitro-hey"
 version = "0.0.1"
 dependencies = [
+ "nitro-calc",
  "nitro-core",
  "nitro-ui",
  "rustix",

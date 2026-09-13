@@ -296,6 +296,47 @@ fn list_names_every_widget_with_a_stable_path() {
 }
 
 #[test]
+fn a_unique_name_resolves_without_naming_the_layout() {
+    // `ok` lives inside a row, so its canonical path is
+    // `window/container[0]/ok` — a path that names the *layout* and that
+    // rearranging the dialog would break. A name unique in the subtree
+    // is therefore also addressed directly from above it.
+    let (mut h, path) = harness();
+    let c = Client::connect(&path);
+
+    let short = c.ask(&mut h, "get window/ok value");
+    assert_eq!(short.status, "ok");
+    assert_eq!(short.body, ["OK"]);
+
+    // It is the same widget the spelled-out path names, and the
+    // canonical path is what `get path` still reports: the shortcut is
+    // an addressing convenience, not a second identity.
+    let full = c.ask(&mut h, "get window/container[0]/ok value");
+    assert_eq!(full.body, short.body);
+    assert_eq!(
+        c.ask(&mut h, "get window/ok path").body,
+        ["window/container[0]/ok"]
+    );
+
+    // And it drives the real callback, which is the point of having it.
+    assert_eq!(c.ask(&mut h, "do window/ok click").status, "ok");
+    h.settle();
+    assert_eq!(h.state().clicks, 1);
+
+    // A name that is not in the subtree is still an error rather than a
+    // guess, and an explicit `role[i]` segment is matched before any
+    // search: nothing that resolved before resolves differently.
+    assert_eq!(
+        c.ask(&mut h, "get window/nowhere").status,
+        "err no such widget"
+    );
+    assert_eq!(
+        c.ask(&mut h, "get window/container[0] path").body,
+        ["window/container[0]"]
+    );
+}
+
+#[test]
 fn get_reports_properties_and_one_of_them() {
     let (mut harness, path) = harness();
     let client = Client::connect(&path);
