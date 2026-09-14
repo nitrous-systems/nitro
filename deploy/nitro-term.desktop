@@ -3,6 +3,18 @@ Type=Application
 Name=Terminal
 GenericName=Terminal Emulator
 Comment=A terminal on nitro-ui
+# No `Exec=` path prefix is written here on purpose, and this file is
+# **not** installed by `just deploy`. See the comment in the justfile:
+# on the test box the binaries live in `~/nitro-bin`, which is not on the
+# session's `PATH`, so a bare `Exec=nitro-term` fails with ENOENT — and a
+# `.desktop` file *shadows* the launcher's built-in entry, which does use
+# an absolute path. Installing this one therefore replaced something that
+# worked with something that did not.
+#
+# It is kept for a packager: on a system where `nitro-term` is installed
+# into `/usr/bin`, this is the file to ship, and `Exec=nitro-term` is
+# then correct. `crates/nitro-launcher/README.md` describes the built-in
+# fallback that covers the box.
 Exec=nitro-term
 Icon=utilities-terminal
 Terminal=false

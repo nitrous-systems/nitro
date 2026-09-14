@@ -57,12 +57,13 @@ deploy-bins:
     cargo build --release --workspace --bins --examples
     cd target/release && rsync -az {{box_bins}} {{box}}:nitro-bin/
     cd target/release/examples && rsync -az {{box_examples}} {{box}}:nitro-bin/
-    # The launcher reads `~/.local/share/applications` like any XDG
-    # client, and its built-in list is only the fallback for a box with
-    # no `.desktop` files at all. Installing the real one is what makes
-    # the launcher show "Terminal" rather than the built-in's name.
-    ssh {{box}} 'mkdir -p ~/.local/share/applications'
-    rsync -az deploy/nitro-term.desktop {{box}}:.local/share/applications/
+    # `deploy/nitro-term.desktop` is deliberately NOT installed here.
+    # The launcher's built-in entry spawns `~/nitro-bin/nitro-term` by
+    # absolute path; a `.desktop` file shadows that built-in, and its
+    # `Exec=nitro-term` is a bare name that the session's `PATH` does not
+    # resolve — so installing it replaced a working entry with
+    # "spawn: No such file or directory". The file is for a packager who
+    # puts the binary in `/usr/bin`; the box is covered by the built-in.
 
 # Install/refresh the systemd unit on the box (needs sudo there).
 box-install:
