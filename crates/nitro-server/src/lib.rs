@@ -957,6 +957,19 @@ fn add(epoll: &OwnedFd, fd: &impl AsFd, token: u64) -> Result<(), Error> {
 /// There is no output, no window and no keymap to re-apply yet, and the
 /// configuration is read in full a few lines further on — so the reload the
 /// caller wanted happens anyway, and happens later than the signal.
+///
+/// # Not reachable on the test box, which is worth knowing before you try
+///
+/// The spin above is real by inspection and is pinned by
+/// `signals::tests::a_drained_reload_fd_stops_being_readable`, but an
+/// attempt to reproduce it on the M4-C test box failed four times in a
+/// row: **libseat queues the initial `Enable` at open even for a session
+/// logind reports `Active=no`** — under the logind backend and under
+/// `LIBSEAT_BACKEND=seatd` alike — so `seat.is_active()` is already true
+/// and this loop's body never iterates there. A hardware repro needs a
+/// seat that really does stay inactive (a VT switch away *after* open, or
+/// a backend that does not auto-enable); on that box the honest status is
+/// "fixed and unit-tested, hardware path does not occur".
 fn wait_active(
     epoll: &OwnedFd,
     seat: &mut Seat,
