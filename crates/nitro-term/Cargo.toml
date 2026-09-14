@@ -1,0 +1,38 @@
+[package]
+name = "nitro-term"
+description = "A terminal emulator on nitro-ui: a pty, a VT grid, and per-run damage"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The toolkit, as every nitro app.
+nitro-ui = { workspace = true }
+# `openpt`/`grantpt`/`unlockpt`/`ptsname` for the pty, `tcsetwinsize` for
+# the resize, `read`/`write` for the byte stream. The same crate that
+# keeps the rest of the tree `unsafe`-free does it here too: the
+# alternative is `libc` plus our own ioctl shims.
+rustix = { workspace = true, features = ["pty", "termios", "process", "fs", "stdio"] }
+# The VT state machine (Paul Williams' DEC ANSI parser). See
+# DEPENDENCIES.md: it is +2 crates (`arrayvec`, `memchr`), no serde, and
+# it is the one part of a terminal whose edge cases are not worth
+# re-deriving. Meaning is entirely ours — `vte` assigns none.
+vte = { workspace = true }
+
+[lib]
+name = "nitro_term"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nitro-term"
+path = "src/main.rs"
+
+[dev-dependencies]
+# The in-process harness: a real server on the fake backend, a real
+# client, a real pty and a real `/bin/sh`. A dev-dependency, so the
+# shipped binary never links the compositor.
+nitro-ui = { workspace = true, features = ["test-support"] }

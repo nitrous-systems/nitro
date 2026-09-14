@@ -230,6 +230,19 @@ impl<S: 'static> Harness<S> {
         &mut self.state
     }
 
+    /// The tree and the state at once.
+    ///
+    /// An app's own loop functions take `(&mut S, &mut Ui<S>)` — that is
+    /// the signature of every callback the toolkit hands out — so a test
+    /// that wants to call one needs both halves simultaneously, which
+    /// [`Harness::ui`] and [`Harness::state_mut`] cannot give it. A test
+    /// without this ends up moving the state out and back around every
+    /// call, which is noise at best and, for a state that owns a
+    /// descriptor, a different object at worst.
+    pub fn parts(&mut self) -> (&mut Ui<S>, &mut S) {
+        (&mut self.ui, &mut self.state)
+    }
+
     /// The server, for control requests and statistics.
     pub fn server(&self) -> &TestServer {
         &self.server
@@ -393,6 +406,23 @@ impl<S: 'static> Harness<S> {
             y: f64::from(self.origin.y + pos.y) / f64::from(OUTPUT.1),
             time_ns: self.time_ns,
         });
+        self.settle();
+    }
+
+    /// Deliver a frame callback to the app's [`Ui::on_frame`] handlers,
+    /// as the server's `Frame` would.
+    ///
+    /// A test that wants the real path uses [`Harness::settle`], which
+    /// pumps whatever the server sends; this is for a test that needs to
+    /// say *when* the frame lands — the whole point of frame pacing is
+    /// that the app absorbs many changes between two of them, and a test
+    /// that could not choose the moment could not assert it.
+    pub fn frame(&mut self) {
+        let f = crate::ui::Frame {
+            deadline_ns: self.time_ns + 16_666_667,
+            refresh_ns: 16_666_667,
+        };
+        self.ui.dispatch_frame(&mut self.state, f);
         self.settle();
     }
 

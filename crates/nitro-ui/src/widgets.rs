@@ -951,15 +951,15 @@ impl<S> std::fmt::Debug for TextField<S> {
 /// inside it, the selection behind the text, and the caret.
 mod field_slot {
     /// The field's background and border.
-    pub(super) const BACKGROUND: u8 = 0;
+    pub(super) const BACKGROUND: crate::widget::Slot = 0;
     /// The clipping group holding everything that scrolls.
-    pub(super) const VIEW: u8 = 1;
+    pub(super) const VIEW: crate::widget::Slot = 1;
     /// Selection highlight, inside the view.
-    pub(super) const SELECTION: u8 = 2;
+    pub(super) const SELECTION: crate::widget::Slot = 2;
     /// The text itself, inside the view.
-    pub(super) const TEXT: u8 = 3;
+    pub(super) const TEXT: crate::widget::Slot = 3;
     /// The caret, inside the view.
-    pub(super) const CARET: u8 = 4;
+    pub(super) const CARET: crate::widget::Slot = 4;
 }
 
 impl<S> TextField<S> {

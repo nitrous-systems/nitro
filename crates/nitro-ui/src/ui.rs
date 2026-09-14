@@ -97,6 +97,7 @@ pub struct TimerId(u64);
 ///
 /// One `Ui` owns one window. It is generic over the app's state type `S`,
 /// which is what callbacks are handed alongside the tree itself.
+#[allow(clippy::struct_excessive_bools)] // Independent facts about one window, not a state machine: `quit`, `window_open`, `backdrop_wanted` and `frame_requested` have no shared vocabulary to collapse into.
 pub struct Ui<S> {
     arena: Arena<S>,
     root: Option<WidgetId>,
@@ -170,10 +171,45 @@ pub struct Ui<S> {
     /// handler is handed `&mut Ui<S>`, so it must not be reachable
     /// through the tree it is holding.
     shell_handlers: Vec<Option<ShellHandler<S>>>,
+    /// Frame-callback handlers, in registration order; see
+    /// [`Ui::on_frame`].
+    ///
+    /// `Option` for the same reason a widget leaves its arena slot: a
+    /// handler is handed `&mut Ui<S>`, so it must not be reachable
+    /// through the tree it is holding.
+    frame_handlers: Vec<Option<FrameHandler<S>>>,
+    /// Whether a `RequestFrame` is outstanding, so asking twice in one
+    /// turn does not put two requests on the wire.
+    frame_requested: bool,
+    /// The window title last sent, so an unchanged title costs nothing.
+    /// A terminal re-sends one per OSC and a shell prompt that carries
+    /// one sends the same string on every line.
+    window_title: String,
+    /// The size limits last sent; `None` until something set them.
+    window_limits: Option<(Size, Size)>,
 }
 
 /// A shell-event handler; see [`Ui::on_shell`].
 type ShellHandler<S> = Box<dyn FnMut(&mut S, &mut Ui<S>, &crate::shell::ShellEvent)>;
+
+/// A frame-callback handler; see [`Ui::on_frame`].
+type FrameHandler<S> = Box<dyn FnMut(&mut S, &mut Ui<S>, Frame)>;
+
+/// What the server says when it answers a [`Ui::request_frame`].
+///
+/// The deadline is the target presentation time of the next flip, on
+/// `CLOCK_MONOTONIC`, and `refresh_ns` is the output's refresh interval.
+/// An app that produces output faster than the screen can show it uses
+/// them to do exactly one scene update per frame rather than one per
+/// change — which is the difference between `yes | head -100000` costing
+/// one commit per frame and one commit per line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Frame {
+    /// Target presentation time, `CLOCK_MONOTONIC` nanoseconds.
+    pub deadline_ns: u64,
+    /// The output's refresh interval in nanoseconds.
+    pub refresh_ns: u32,
+}
 
 /// An app callback: it is handed the state and the whole tree, exactly
 /// like a widget's own.
@@ -232,6 +268,10 @@ impl<S: 'static> Ui<S> {
             surface: None,
             app_id: String::new(),
             shell_handlers: Vec::new(),
+            frame_handlers: Vec::new(),
+            frame_requested: false,
+            window_title: String::new(),
+            window_limits: None,
         }
     }
 
@@ -1035,6 +1075,17 @@ impl<S: 'static> Ui<S> {
             }
         }
         self.window_open = true;
+        // Limits set before the window existed ride its first commit, for
+        // the reason the anchor above does: a window that appeared
+        // without them could be resized below its minimum in the frame
+        // between.
+        if let Some((min, max)) = self.window_limits {
+            self.wire.set_window_limits(WINDOW, min, max)?;
+        }
+        // The window was created with `title`, so record it rather than
+        // re-sending it: that is what makes the first `set_window_title`
+        // with the same string free.
+        title.clone_into(&mut self.window_title);
         self.mark(root, Dirty::LAYOUT | Dirty::PAINT | Dirty::TREE);
         Ok(())
     }
@@ -1044,6 +1095,138 @@ impl<S: 'static> Ui<S> {
     /// the app was constructed with.
     pub fn set_app_id(&mut self, app_id: impl Into<String>) {
         self.app_id = app_id.into();
+    }
+
+    /// Change the window's title — what a bar's window list and the
+    /// server's decoration show.
+    ///
+    /// Queued as a mutation, so it rides the next commit like everything
+    /// else, and **an unchanged title sends nothing**. That last part is
+    /// not an optimisation for its own sake: a shell that prints its
+    /// working directory in an OSC sequence sets the same title on every
+    /// prompt, and a terminal that forwarded each one would put a
+    /// `SetWindowTitle` and a commit on the wire for every command the
+    /// user runs — and make the server relist its windows each time.
+    ///
+    /// # Errors
+    /// A wire failure, which is fatal.
+    pub fn set_window_title(&mut self, title: impl Into<String>) -> Result<(), Error> {
+        let title = title.into();
+        if title == self.window_title {
+            return Ok(());
+        }
+        self.window_title = title;
+        if !self.window_open {
+            // The title the window is *created* with is `open_window`'s
+            // argument; setting one before there is a window would name
+            // a node the server has not seen.
+            return Ok(());
+        }
+        self.wire.set_window_title(WINDOW, &self.window_title)
+    }
+
+    /// The title last set with [`Ui::set_window_title`].
+    #[must_use]
+    pub fn window_title(&self) -> &str {
+        &self.window_title
+    }
+
+    /// Tell the server the smallest and largest content size this window
+    /// can usefully be resized to. A zero component means "no limit".
+    ///
+    /// A terminal is the motivating case: a grid below about 20×5 cells
+    /// is not a terminal any more, and the server is the only thing that
+    /// can refuse the drag — a client that merely clamped its own layout
+    /// would draw a letterbox inside a window the user is still
+    /// shrinking. Repeating the same limits sends nothing.
+    ///
+    /// # Errors
+    /// A wire failure, which is fatal.
+    pub fn set_window_limits(&mut self, min: Size, max: Size) -> Result<(), Error> {
+        if self.window_limits == Some((min, max)) {
+            return Ok(());
+        }
+        self.window_limits = Some((min, max));
+        if !self.window_open {
+            return Ok(());
+        }
+        self.wire.set_window_limits(WINDOW, min, max)
+    }
+
+    /// Ask the server for a frame callback: it answers with one
+    /// [`Frame`] carrying the deadline for the next flip.
+    ///
+    /// One request, one answer, no free-running loop — this is the
+    /// toolkit's half of `RequestFrame` (`docs/wire.md`), and it is what
+    /// an app uses when its *input* is faster than the screen. The
+    /// widget model's normal rule is "a change marks the widget dirty
+    /// and the next flush sends it"; an app draining a pty at 20 MB/s
+    /// wants the opposite — absorb everything into its own model now,
+    /// and touch the scene once per frame. So it asks for a frame, and
+    /// updates the tree in the handler.
+    ///
+    /// Asking twice before the answer arrives sends one request: the
+    /// second is folded into the first, because two callbacks per frame
+    /// is precisely the free-running loop this exists to avoid.
+    ///
+    /// # Errors
+    /// A wire failure, which is fatal.
+    pub fn request_frame(&mut self) -> Result<(), Error> {
+        if self.frame_requested || !self.window_open {
+            return Ok(());
+        }
+        self.frame_requested = true;
+        self.wire
+            .send_now(&nitro_wire::msg::ClientMsg::RequestFrame(
+                nitro_wire::msg::RequestFrame { window: WINDOW },
+            ))
+    }
+
+    /// Whether a frame callback is outstanding.
+    #[must_use]
+    pub fn frame_pending(&self) -> bool {
+        self.frame_requested
+    }
+
+    /// Register a handler for frame callbacks; see [`Ui::request_frame`].
+    ///
+    /// A handler is handed `&mut S` and `&mut Ui<S>`, exactly like a
+    /// button's `on_click`, so it edits the tree rather than only
+    /// setting a flag — a terminal's handler is where the grid's damage
+    /// becomes `SetText`s. It is a list rather than a widget hung off the
+    /// root for the same reason [`Ui::on_shell`] is: a frame deadline is
+    /// news about the *output*, with no position to hit-test and no
+    /// focus to follow. Every handler sees every frame; there is nothing
+    /// to consume.
+    pub fn on_frame(&mut self, handler: impl FnMut(&mut S, &mut Ui<S>, Frame) + 'static) {
+        self.frame_handlers.push(Some(Box::new(handler)));
+    }
+
+    /// How many frame handlers are registered.
+    #[must_use]
+    pub fn frame_handler_count(&self) -> usize {
+        self.frame_handlers.len()
+    }
+
+    /// Offer a frame callback to the handlers, oldest first.
+    ///
+    /// Public because an app driving `Ui` by hand — and the test harness
+    /// — dispatches messages itself; [`Ui::dispatch`] calls it for a real
+    /// `Frame`.
+    pub fn dispatch_frame(&mut self, state: &mut S, frame: Frame) {
+        self.frame_requested = false;
+        for i in 0..self.frame_handlers.len() {
+            // Out of the list for the call, for the same reason a widget
+            // leaves its slot: the handler is handed the `Ui` the list
+            // lives in.
+            let Some(mut h) = self.frame_handlers.get_mut(i).and_then(Option::take) else {
+                continue;
+            };
+            h(state, self, frame);
+            if let Some(slot) = self.frame_handlers.get_mut(i) {
+                *slot = Some(h);
+            }
+        }
     }
 
     /// Open this window as a shell surface: a bar, dock, launcher or
@@ -1557,6 +1740,13 @@ impl<S: 'static> Ui<S> {
                 }
             }
             ServerMsg::Key(k) => self.key(state, k),
+            ServerMsg::Frame(f) => self.dispatch_frame(
+                state,
+                Frame {
+                    deadline_ns: f.deadline_ns,
+                    refresh_ns: f.refresh_ns,
+                },
+            ),
             ServerMsg::Focus(f) if !f.focused => self.blur(state),
             // The shell socket's news. Not input, so not routed to a
             // widget: offered to the handlers `on_shell` registered.
@@ -2440,7 +2630,11 @@ impl<W: Widget<S>, S: 'static> WidgetMut<'_, W, S> {
     /// `SetTransform` on the wire — no relayout, no repaint of anything
     /// inside it. Nothing happens if the slot does not exist yet or is
     /// not a group; the next paint creates it.
-    pub fn set_slot_transform(&mut self, slot: u8, transform: nitro_core::Transform) {
+    pub fn set_slot_transform(
+        &mut self,
+        slot: crate::widget::Slot,
+        transform: nitro_core::Transform,
+    ) {
         let index = slot as usize;
         let Some(state) = self.ui.arena.slot_mut(self.id).map(|s| &mut s.state) else {
             return;

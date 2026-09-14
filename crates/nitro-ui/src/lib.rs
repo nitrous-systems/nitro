@@ -116,6 +116,6 @@ pub use nitro_wire::types::Align;
 pub use nitro_wire::msg::Fill;
 pub use shell::{Anchor, ShellEvent, Surface};
 pub use theme::{TextStyle, Theme};
-pub use ui::{FdToken, Node, TimerId, Ui, WidgetMut};
-pub use widget::{Access, EventCx, LayoutCx, MeasureCx, PaintCx, Role, TextRun, Widget};
+pub use ui::{FdToken, Frame, Node, TimerId, Ui, WidgetMut};
+pub use widget::{Access, EventCx, LayoutCx, MeasureCx, PaintCx, Role, Slot, TextRun, Widget};
 pub use wire::{Mutation, TextMetrics};

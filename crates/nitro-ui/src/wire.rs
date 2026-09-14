@@ -324,6 +324,40 @@ impl Wire {
         )
     }
 
+    /// Change the window's title, as a queued mutation.
+    ///
+    /// Queued rather than sent at once: it is a property of the window
+    /// and belongs in the same transaction as whatever else changed with
+    /// it — a terminal that clears the screen and sets a new title in one
+    /// escape sequence should not show the new title over the old screen
+    /// for a frame.
+    pub(crate) fn set_window_title(&mut self, id: NodeId, title: &str) -> Result<(), Error> {
+        self.send(
+            &ClientMsg::SetWindowTitle(msg::SetWindowTitle {
+                window: id,
+                title: title.to_owned(),
+            }),
+            id,
+        )
+    }
+
+    /// Set the window's min/max content size, as a queued mutation.
+    pub(crate) fn set_window_limits(
+        &mut self,
+        id: NodeId,
+        min: Size,
+        max: Size,
+    ) -> Result<(), Error> {
+        self.send(
+            &ClientMsg::SetWindowLimits(msg::SetWindowLimits {
+                window: id,
+                min,
+                max,
+            }),
+            id,
+        )
+    }
+
     /// Anchor the window to its output's edges (needs `caps::SHELL`).
     ///
     /// Queued as a mutation rather than sent at once, so it rides the
@@ -917,6 +951,19 @@ impl Wire {
             }
         }
         Ok(())
+    }
+}
+
+/// Mark a slot as unchanged, so [`Wire::end_paint`] neither diffs nor
+/// destroys it. See [`PaintCx::keep`](crate::PaintCx::keep) for why a
+/// widget would want that.
+pub(crate) fn keep_slot(slots: &mut [PaintSlot], index: usize) -> bool {
+    match slots.get_mut(index) {
+        Some(s) if !s.node.is_none() => {
+            s.used = true;
+            true
+        }
+        _ => false,
     }
 }
 

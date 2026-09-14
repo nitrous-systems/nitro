@@ -42,6 +42,15 @@ pub enum Role {
     Scroll,
     /// A value picked from a range.
     Slider,
+    /// A terminal emulator's screen.
+    ///
+    /// Its value is the text on the screen, which is what makes
+    /// `hey nitro-term get grid text` a screen dump. The vocabulary is
+    /// AT-SPI's, which has had a terminal role since the beginning for
+    /// the same reason: a screen reader has to know that this widget's
+    /// text is a *screen* — rewritten in place, addressed by row and
+    /// column — rather than a document that grows.
+    Terminal,
     /// A dividing line.
     Separator,
     /// A picture.
@@ -64,6 +73,7 @@ impl Role {
             Role::Checkbox => "checkbox",
             Role::Scroll => "scroll",
             Role::Slider => "slider",
+            Role::Terminal => "terminal",
             Role::Separator => "separator",
             Role::Image => "image",
             Role::Spacer => "spacer",
@@ -82,6 +92,7 @@ impl Role {
             Role::Checkbox,
             Role::Scroll,
             Role::Slider,
+            Role::Terminal,
             Role::Separator,
             Role::Image,
             Role::Spacer,
@@ -302,6 +313,22 @@ impl<S: 'static> LayoutCx<'_, S> {
     }
 }
 
+/// A paint-slot number.
+///
+/// A widget's painted nodes are numbered, and the number is what the
+/// framework diffs a repaint against, so it has to be stable between
+/// paints — slot 0 is *this* widget's background every time.
+///
+/// It is a `u16` rather than a `u8` because a slot number is not always
+/// a name for one of a widget's parts. A widget whose slots *are* its
+/// content needs as many as the content has pieces: `nitro-term` gives
+/// every same-style run on every row its own slot, which is what lets an
+/// unchanged row send nothing, and a wide terminal holds well over 256
+/// of them. Nothing else in the tree needs more than five, so the cost
+/// of the wider index is two bytes in a struct that already holds a
+/// rectangle and a colour.
+pub type Slot = u16;
+
 /// How a run of text is drawn: style, colour, alignment and wrap width.
 ///
 /// `max_width` is the one field that is not merely cosmetic. It **must**
@@ -359,6 +386,13 @@ impl<'a> TextRun<'a> {
 /// framework diffs against. The first paint creates the node; later ones
 /// send only the properties that changed, so a repaint that produces the
 /// same values costs nothing on the wire.
+///
+/// The slot number is a [`Slot`] (a `u16`), not a `u8`. Every built-in
+/// widget uses fewer than five, but a widget whose slots are its
+/// *content* rather than its parts needs many more: `nitro-term`'s grid
+/// gives every style run on every row a slot of its own, which is what
+/// lets a row that did not change send nothing at all, and a 200-column
+/// terminal can hold more than 256 of them on a single row.
 pub struct PaintCx<'a, S> {
     /// The whole tree, minus the widget being painted.
     pub ui: &'a mut Ui<S>,
@@ -393,8 +427,26 @@ impl<S: 'static> PaintCx<'_, S> {
         self.ui.has_text()
     }
 
+    /// Keep slot `slot` exactly as it was last painted.
+    ///
+    /// A slot the paint does not emit has its node destroyed — which is
+    /// right for a widget whose slots are its *parts* (a button that
+    /// stopped drawing a focus ring wants the ring gone) and wrong for a
+    /// widget whose slots are its *content*. `nitro-term` gives every
+    /// style run on every row a slot; on a frame where two rows changed,
+    /// re-emitting the other fifty rows would cost a string comparison
+    /// per run to send nothing, and *not* emitting them would delete the
+    /// screen. This is the third answer: say the slot is unchanged, and
+    /// the framework neither diffs it nor destroys it.
+    ///
+    /// Returns whether the slot exists; a slot never painted answers
+    /// `false` and nothing happens.
+    pub fn keep(&mut self, slot: Slot) -> bool {
+        crate::wire::keep_slot(&mut self.slots, slot as usize)
+    }
+
     /// Draw a (rounded, optionally bordered) rectangle in `slot`.
-    pub fn rect(&mut self, slot: u8, rect: Rect, fill: Fill, radius: f32, border: (f32, Color)) {
+    pub fn rect(&mut self, slot: Slot, rect: Rect, fill: Fill, radius: f32, border: (f32, Color)) {
         let at = self.slot_at(slot);
         let r = self
             .ui
@@ -404,7 +456,7 @@ impl<S: 'static> PaintCx<'_, S> {
     }
 
     /// Draw a solid rectangle: the common case of [`PaintCx::rect`].
-    pub fn fill_rect(&mut self, slot: u8, rect: Rect, color: Color) {
+    pub fn fill_rect(&mut self, slot: Slot, rect: Rect, color: Color) {
         self.rect(
             slot,
             rect,
@@ -418,7 +470,7 @@ impl<S: 'static> PaintCx<'_, S> {
     ///
     /// See [`TextRun`] for why the wrap width has to be the one the run
     /// was measured at.
-    pub fn text(&mut self, slot: u8, rect: Rect, text: &str, run: TextRun<'_>) {
+    pub fn text(&mut self, slot: Slot, rect: Rect, text: &str, run: TextRun<'_>) {
         let at = self.slot_at(slot);
         let r = self
             .ui
@@ -428,7 +480,7 @@ impl<S: 'static> PaintCx<'_, S> {
     }
 
     /// Draw a region of a client buffer in `slot`.
-    pub fn image(&mut self, slot: u8, rect: Rect, buffer: BufferId, src: nitro_core::IRect) {
+    pub fn image(&mut self, slot: Slot, rect: Rect, buffer: BufferId, src: nitro_core::IRect) {
         let at = self.slot_at(slot);
         let r = self
             .ui
@@ -452,7 +504,7 @@ impl<S: 'static> PaintCx<'_, S> {
     /// error is reported by the pass.
     pub fn group(
         &mut self,
-        slot: u8,
+        slot: Slot,
         rect: Rect,
         clip: bool,
         transform: nitro_core::Transform,
@@ -476,7 +528,7 @@ impl<S: 'static> PaintCx<'_, S> {
     pub fn rect_in(
         &mut self,
         parent: NodeId,
-        slot: u8,
+        slot: Slot,
         rect: Rect,
         fill: Fill,
         radius: f32,
@@ -495,7 +547,14 @@ impl<S: 'static> PaintCx<'_, S> {
     }
 
     /// Draw text in `slot`, parented to a group slot's node.
-    pub fn text_in(&mut self, parent: NodeId, slot: u8, rect: Rect, text: &str, run: TextRun<'_>) {
+    pub fn text_in(
+        &mut self,
+        parent: NodeId,
+        slot: Slot,
+        rect: Rect,
+        text: &str,
+        run: TextRun<'_>,
+    ) {
         let at = crate::wire::SlotAt {
             parent,
             before: NodeId::NONE,
@@ -545,7 +604,7 @@ impl<S: 'static> PaintCx<'_, S> {
 
     /// Where slot `slot`'s node goes: under this widget's group, in
     /// front of its content group so children paint on top.
-    fn slot_at(&self, slot: u8) -> crate::wire::SlotAt {
+    fn slot_at(&self, slot: Slot) -> crate::wire::SlotAt {
         crate::wire::SlotAt {
             parent: self.group,
             before: self.before,
