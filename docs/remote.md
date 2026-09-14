@@ -56,12 +56,16 @@ server, and a display server that grows its own key exchange, its own
 cipher negotiation and its own account model is a display server with
 three new attack surfaces and no reviewers.
 
-A non-loopback bind — `0.0.0.0:7700` — logs a `warn` once, saying exactly
-this. It is for **measurement on a trusted LAN**, which is how the
-numbers below were taken, and it should not be left on. Nothing in the
-tree enables it, and `remote.listen` is absent by default, so a desktop
-that does not want remote clients has no TCP socket at all: no bind, no
-epoll registration, no accept path.
+A non-loopback bind — `0.0.0.0:7700` — logs a `warn` **at every bind**,
+saying exactly this. (At every bind, not literally once per process: a
+reload that changes the address rebinds and warns again, which is what
+you want — the warning is about the address in force, and the reload
+that introduced it is the moment to say so.) It is for **measurement on
+a trusted LAN**, which is how the numbers below were taken, and it
+should not be left on. Nothing in the tree enables it, and
+`remote.listen` is absent by default, so a desktop that does not want
+remote clients has no TCP socket at all: no bind, no epoll registration,
+no accept path.
 
 If a future milestone wants real remote access without ssh, the shape is
 TLS with a client certificate, or a token in the handshake — a new
@@ -92,29 +96,59 @@ So it is refused, in three places, each doing a different job:
 
 1. **`Connection::send`** returns `Error::RemoteNoFds` for an
    fd-carrying message on a remote link, **before encoding**. Nothing is
-   queued and nothing is written, so the connection is exactly as it was
-   — the app reports "no images over a remote link" and carries on
-   drawing everything else.
+   queued and nothing is written, so the connection is exactly as it was.
 2. **`Socket::send_once`** refuses again if one somehow got queued. A
    frame whose header declares descriptors that never arrive leaves the
    receiver waiting for bytes that do not exist, and a desynchronised
    stream is a dead connection. This is the backstop that makes the
    invariant "no half-frame ever reaches the wire" true rather than
    merely intended.
-3. **The server** answers a remote `CreateBuffer` with
+3. **The server** answers a remote buffer op with
    `Error { BadBuffer, "buffers are not available on a remote link" }`
    and **keeps the client**. A client that ignored `caps::REMOTE` is
    better served by an explanation than by a dead socket; only its image
    is missing.
 
+**All three buffer ops, not just the one carrying a descriptor.** Only
+`CreateBuffer` passes an fd; `BufferDamage` and `SetImage` merely *name*
+a buffer — but a remote client can never have registered one, so all
+three are equally impossible and all three get the same sentence. An app
+does not send `CreateBuffer` alone: it sends the buffer, then the
+`SetImage` naming it, then `BufferDamage` when the pixels change. If
+only the first were survivable, a client would hear the clear
+explanation and then be disconnected two messages later by `no buffer
+with id 1` — the worse error, arriving after the recoverable one.
+
+The one exception is `SetImage` naming `BufferId::NONE`, which is how an
+image node is **cleared**: it names no buffer, needs none, and is the
+one op in this group a remote app may legitimately send. The check looks
+at the field, not just the op code.
+
 A frame that *declares* descriptors on a remote link is a different
 thing and stays fatal (`DecodeError::MissingFd`): the peer and the
 receiver disagree about the byte stream, and there is no way back.
 
-`nitro-ui` acts on the bit for you: `Ui::is_remote()` is true, and
-`upload_image` fails before it creates the memfd, so a remote app that
+`nitro-ui` acts on the bit for you, and the shape of that is the point:
+`Ui::is_remote()` is true, and `PaintCx::upload_image` returns **`None`,
+not an error** — before it creates the memfd, so a remote app that
 paints an image every frame does not allocate one every frame to throw
-away. `nitro-calc`, `nitro-term`, `nitro-files` and `nitro-settings` run
+away. An `Image` widget already draws nothing for `None`, so the app
+**carries on drawing everything else** and only loses its picture.
+
+That distinction is load-bearing rather than stylistic. Routing the
+refusal through `PaintCx::note` like an ordinary error would fail the
+paint pass, and a failed paint pass ends `Ui::flush`, which ends
+`App::run`: a remote app with one `Image` anywhere in its tree would
+**exit on its first paint** instead of drawing the rest. "There is no
+buffer here" is a permanent property of the connection, not something
+that went wrong, and it is reported the way the toolkit already reports
+the absence of a buffer. Every *other* failure — a memfd that will not
+open, a broken socket — still goes through `note` and still fails the
+pass. `a_remote_app_with_an_image_keeps_running_and_draws_the_rest` in
+`crates/nitro-ui/tests/remote.rs` pins it, with a local control beside
+it so the test means "remote" and not "images are broken".
+
+`nitro-calc`, `nitro-term`, `nitro-files` and `nitro-settings` run
 remotely **unmodified** — none of them draws an image.
 
 `nitro-wallpaper` is the one app that cannot run remotely, and it is

@@ -759,19 +759,37 @@ D-Bus client is allowed.
     wire, and answered by the server with an `Error` that **keeps the
     client connected** — the one error in the protocol that is not fatal,
     because a client that ignored the capability bit is better served by
-    an explanation than a dead socket. `nitro-calc`, `nitro-term`,
-    `nitro-files` and `nitro-settings` run remotely **unmodified**; the
-    wallpaper cannot and says so, because it *is* an image. The shell
-    socket is never TCP: `caps::SHELL` is granted for having opened a
-    `0700` path, and a port proves nothing of the sort.
+    an explanation than a dead socket. All *three* buffer ops are refused
+    on those terms, not just the one carrying the descriptor: an app
+    sends `CreateBuffer`, then the `SetImage` naming it, then
+    `BufferDamage`, and refusing only the first would hand the client a
+    clear sentence and then disconnect it two messages later with `no
+    buffer with id 1`.
+
+    In the toolkit the refusal is **not an error value at all**, and that
+    is the difference between a feature and a footgun: `upload_image`
+    answers `None`, which an `Image` widget already handles by drawing
+    nothing, so a remote app **carries on drawing everything else**.
+    Routing it through the pass's error channel instead would fail the
+    paint, and a failed paint ends `Ui::flush` and so `App::run` — a
+    remote app with one image anywhere in its tree would exit on its
+    first paint. "There is no buffer here" is a permanent property of
+    the connection, not a fault, and is reported as such; a real failure
+    (a memfd that will not open) still fails the pass.
+
+    `nitro-calc`, `nitro-term`, `nitro-files` and `nitro-settings` run
+    remotely **unmodified**; the wallpaper cannot and says so, because it
+    *is* an image. The shell socket is never TCP: `caps::SHELL` is
+    granted for having opened a `0700` path, and a port proves nothing of
+    the sort.
 
     **There is no authentication, and the documentation leads with that.**
     The supported configuration is loopback plus `ssh -L`, which puts
     authentication in sshd — which already has an answer to who you are
-    and what the transport encryption is. A non-loopback bind warns once,
-    loudly, and is for measurement. `remote.listen` is absent by default,
-    and absent means no socket at all: no bind, no epoll registration, no
-    accept path.
+    and what the transport encryption is. A non-loopback bind warns
+    loudly on every bind, and is for measurement. `remote.listen` is
+    absent by default, and absent means no socket at all: no bind, no
+    epoll registration, no accept path.
 
     Measured on the box (Pentium G3240) as A, the dev box as B, 1 Gb LAN:
 

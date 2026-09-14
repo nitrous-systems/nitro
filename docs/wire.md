@@ -51,9 +51,18 @@ resynchronised.
 
 In v1 exactly one message carries a descriptor, `CreateBuffer`, so the
 rule in practice is: **no buffers, and therefore no `Image` content, on
-a remote link.** The server answers a remote `CreateBuffer` with
+a remote link.** The server answers a remote **buffer op** with
 `Error { BadBuffer }` but keeps the client connected, which is the one
 place an error is not fatal to the connection.
+
+That covers all three of `CreateBuffer`, `BufferDamage` and `SetImage`,
+not only the one carrying the fd: the other two merely *name* a buffer,
+but a remote client can never have registered one, so all three are
+equally impossible and get the same message. Refusing only the first
+would leave a client disconnected by the `SetImage` that follows it,
+with the worse error arriving after the recoverable one. `SetImage`
+naming `BufferId::NONE` is exempt — it *clears* an image node, names no
+buffer, and is the one op here a remote client may legitimately send.
 
 A remote receive does `recvmsg` with **no ancillary buffer** at all: a
 TCP socket cannot produce an `SCM_RIGHTS` cmsg, so asking for one would

@@ -381,6 +381,131 @@ fn a_buffer_from_a_remote_client_is_refused_and_the_client_survives() {
     h.quit();
 }
 
+/// The **follow-up** ops, which is the half a client that ignores
+/// `caps::REMOTE` actually meets.
+///
+/// `CreateBuffer` is the one carrying a descriptor, so it is the one the
+/// sender refuses. But an app does not send it alone: it sends
+/// `CreateBuffer`, then `SetImage` naming that buffer, then
+/// `BufferDamage` when the pixels change. If only the first is
+/// survivable, the client hears a clear sentence and is then
+/// disconnected two messages later with `no buffer with id 1` — the
+/// worse error, arriving after the recoverable one. All three are
+/// refused on the same terms.
+#[test]
+fn the_other_buffer_ops_are_refused_on_the_same_terms() {
+    let h = Harness::start("bufferops", "remote.listen = 127.0.0.1:0\n");
+    let mut conn = h.remote_client("remote-ops");
+    let mut seen = Vec::new();
+    make_window(&mut conn, &mut seen, 1, 1);
+    h.settle();
+
+    // Exactly the sequence a toolkit emits for an image, minus the
+    // `CreateBuffer` the client-side check already stopped.
+    conn.send(&ClientMsg::SetImage(nitro_wire::msg::SetImage {
+        id: NodeId(2),
+        buffer: BufferId(1),
+        src: nitro_core::IRect::new(0, 0, 32, 32),
+    }))
+    .expect("it encodes: no descriptor on this one");
+    conn.send(&ClientMsg::BufferDamage(nitro_wire::msg::BufferDamage {
+        id: BufferId(1),
+        rects: vec![nitro_core::IRect::new(0, 0, 32, 32)],
+    }))
+    .expect("and this one");
+    conn.flush().expect("both go out: neither carries an fd");
+
+    // Two refusals, both the same sentence, and the client is still here.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut refusals: Vec<String> = Vec::new();
+    while refusals.len() < 2 {
+        assert!(Instant::now() < deadline, "only got {refusals:?}");
+        conn.flush().unwrap();
+        conn.poll(&mut seen).expect("the connection is still alive");
+        refusals = seen
+            .iter()
+            .filter_map(|m| match m {
+                ServerMsg::Error(e) => Some(e.msg.clone()),
+                _ => None,
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    for msg in &refusals {
+        assert!(msg.contains("not available on a remote link"), "{msg}");
+    }
+
+    h.settle();
+    assert_eq!(h.stat("remote_clients"), 1, "the client survived both");
+    assert_eq!(h.stat("windows"), 1);
+
+    // And it still paints afterwards.
+    conn.tx()
+        .fill_solid(NodeId(2), Color::rgb(0x00, 0xFF, 0x00))
+        .commit(3)
+        .unwrap();
+    conn.flush().unwrap();
+    h.settle();
+    assert_eq!(
+        pixel(&h.shot(), OUT.0 / 2, OUT.1 / 2),
+        (0x00, 0xFF, 0x00),
+        "still painting after two refusals"
+    );
+    h.quit();
+}
+
+/// Clearing an image is **not** a buffer op: it names no buffer.
+///
+/// The one member of the group a remote client may legitimately send,
+/// and the reason the check looks at the field rather than only the op
+/// code — a remote app that hides its image should not be refused for
+/// tidying up.
+#[test]
+fn clearing_an_image_is_allowed_on_a_remote_link() {
+    let h = Harness::start("clearimg", "remote.listen = 127.0.0.1:0\n");
+    let mut conn = h.remote_client("remote-clear");
+    let mut seen = Vec::new();
+    let root = make_window(&mut conn, &mut seen, 1, 1);
+    h.settle();
+
+    // A real `Image` node to clear — `SetImage` on a `Rect` is a
+    // legitimate `WrongKind` and would pass this test for the wrong
+    // reason.
+    let img = NodeId(10);
+    conn.tx()
+        .create_image(img, root, Rect::new(4.0, 40.0, 32.0, 32.0))
+        .commit(2)
+        .unwrap();
+    conn.flush().unwrap();
+    h.settle();
+
+    conn.send(&ClientMsg::SetImage(nitro_wire::msg::SetImage {
+        id: img,
+        buffer: BufferId::default(),
+        src: nitro_core::IRect::new(0, 0, 0, 0),
+    }))
+    .expect("encodes");
+    conn.tx()
+        .fill_solid(NodeId(2), Color::rgb(0x00, 0xFF, 0x00))
+        .commit(3)
+        .unwrap();
+    conn.flush().unwrap();
+    h.settle();
+    let _ = conn.poll(&mut seen);
+
+    assert!(
+        !seen.iter().any(|m| matches!(m, ServerMsg::Error(_))),
+        "clearing an image is not refused: {seen:?}"
+    );
+    assert_eq!(h.stat("remote_clients"), 1);
+    assert_eq!(
+        pixel(&h.shot(), OUT.0 / 2, OUT.1 / 2),
+        (0x00, 0xFF, 0x00),
+        "and the commit that carried it was applied"
+    );
+    h.quit();
+}
+
 /// A message that *declares* descriptors is the fatal case: the far end
 /// would be waiting for bytes that can never arrive, so the connection
 /// goes. A client built on `nitro-wire` cannot produce one (the sender

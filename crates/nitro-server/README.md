@@ -75,7 +75,8 @@ served by an explanation than by a dead socket. Everything else — node
 ownership, damage, window management, decorations, input — is the
 identical code path. **There is no authentication**; the documented
 model is loopback plus an SSH port-forward, and a non-loopback bind
-warns once saying so. `docs/remote.md` has the model and the numbers.
+warns on every bind saying so. `docs/remote.md` has the model and the
+numbers.
 
 The **control socket** is the v0 line protocol and stays as the server's
 own test and debug channel — it is what `nitro-shot` and the integration

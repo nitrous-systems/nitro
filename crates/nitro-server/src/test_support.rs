@@ -55,6 +55,29 @@ impl TestServer {
     /// the server does not come up within ten seconds.
     #[must_use]
     pub fn start(name: &str, width: u32, height: u32) -> Self {
+        Self::start_with_remote(name, width, height, false)
+    }
+
+    /// As [`TestServer::start`], but also binding the **remote** (TCP)
+    /// listener on `127.0.0.1:0` and waiting for it to come up.
+    ///
+    /// The port is the kernel's, read back out of `stats remote_listen`
+    /// by [`TestServer::remote_addr`] — a test must never pick a number,
+    /// or two developers on one box race each other.
+    ///
+    /// It goes through a temporary `server.conf` rather than a new
+    /// `Config` field, because `remote.listen` *is* the interface: a
+    /// second way to switch the listener on would be a second thing that
+    /// can disagree with the file.
+    ///
+    /// # Panics
+    /// As [`TestServer::start`], plus if the listener does not appear.
+    #[must_use]
+    pub fn start_remote(name: &str, width: u32, height: u32) -> Self {
+        Self::start_with_remote(name, width, height, true)
+    }
+
+    fn start_with_remote(name: &str, width: u32, height: u32, remote: bool) -> Self {
         let dir = std::env::temp_dir().join(format!(
             "nitro-ui-test-{}-{name}-{:?}",
             std::process::id(),
@@ -66,6 +89,12 @@ impl TestServer {
         config.backend = BackendKind::Fake { width, height };
         let input = FakeInput::new().expect("eventfd");
         config.fake_input = Some(input.clone());
+        if remote {
+            let config_path = dir.join("config").join(crate::config::FILE_NAME);
+            std::fs::create_dir_all(config_path.parent().expect("a parent")).expect("config dir");
+            std::fs::write(&config_path, "remote.listen = 127.0.0.1:0\n").expect("server.conf");
+            config.config_path = Some(config_path);
+        }
         let wire_path = config.wire_path.clone();
         let shell_path = config.shell_path.clone();
         let thread = std::thread::spawn(move || run(config));
@@ -82,7 +111,27 @@ impl TestServer {
         });
         wait_for("the wire socket", || s.wire_path.exists());
         wait_for("the shell socket", || s.shell_path.exists());
+        if remote {
+            wait_for("the remote listener", || s.remote_addr().is_some());
+        }
         s
+    }
+
+    /// The address the **remote** listener bound, or `None` when there is
+    /// none.
+    ///
+    /// The bound one, with the port the kernel chose — which is the only
+    /// way a test that configured `:0` can connect to it.
+    #[must_use]
+    pub fn remote_addr(&self) -> Option<String> {
+        let lines = self.request("stats\n");
+        match lines
+            .iter()
+            .find_map(|l| l.strip_prefix("remote_listen "))?
+        {
+            "off" => None,
+            addr => Some(addr.to_owned()),
+        }
     }
 
     /// The wire socket clients connect to.

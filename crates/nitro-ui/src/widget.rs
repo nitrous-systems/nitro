@@ -601,6 +601,21 @@ impl<S: 'static> PaintCx<'_, S> {
     /// wire, so the server maps them rather than copying: an image costs
     /// one page-table entry per side, not two copies of the picture.
     /// `None` if the memfd or the send failed.
+    ///
+    /// **A remote link is `None`, not an error.** A buffer is a file
+    /// descriptor and a descriptor cannot cross TCP
+    /// ([`caps::REMOTE`](nitro_wire::types::caps::REMOTE)), which is a
+    /// permanent property of the connection rather than something that
+    /// went wrong — so it is reported the way "there is no buffer" is
+    /// already reported, and the widget draws nothing.
+    ///
+    /// Routing it through [`PaintCx::note`] like any other error would
+    /// fail the paint pass, and a failed paint pass ends
+    /// [`Ui::flush`](crate::Ui::flush), which ends the app's event loop:
+    /// a remote app with one `Image` in its tree would **exit on its
+    /// first paint** instead of drawing the rest of the tree. Everything
+    /// else — a failed memfd, a broken socket — is a real failure and
+    /// still goes through `note`.
     pub fn upload_image(
         &mut self,
         width: u32,
@@ -614,6 +629,7 @@ impl<S: 'static> PaintCx<'_, S> {
             .create_buffer(width, height, alpha, pixels)
         {
             Ok(id) => Some(id),
+            Err(Error::Wire(nitro_wire::Error::RemoteNoFds)) => None,
             Err(e) => {
                 self.note(Err(e));
                 None

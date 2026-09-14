@@ -94,6 +94,15 @@ use crate::wm::{Drag, Edges, FrameNodes, Region, WindowManager};
 /// Server name reported in `Welcome`.
 pub const SERVER_NAME: &str = "nitro";
 
+/// What a **remote** client is told when it sends a buffer op.
+///
+/// One constant because it is sent from two places — the decoder's
+/// refusal of an fd-carrying `CreateBuffer`, and the check on the two
+/// ops that only *name* a buffer — and a client that meets both should
+/// not get two different explanations of one rule.
+const REMOTE_NO_BUFFERS: &str = "buffers are not available on a remote link: \
+     file descriptors cannot be passed over TCP (caps::REMOTE, docs/remote.md)";
+
 /// Which display backend to run on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendKind {
@@ -2199,10 +2208,13 @@ impl Server {
         match (want, self.remote_listener.as_ref()) {
             (Some(addr), Some(current)) if current.satisfies(addr) => {}
             (Some(addr), _) => {
-                // Drop the old one *first*: rebinding the same address
-                // while the previous socket is open would fail, and the
-                // ordinary reload is "the same address with one field
-                // changed elsewhere in the file".
+                // Drop the old one *first*. Not for the same-address
+                // case — `satisfies` caught that in the arm above and
+                // there is nothing to rebind — but for the **overlapping**
+                // one: `0.0.0.0:7700` → `127.0.0.1:7700` is a changed
+                // value whose two sockets cannot be bound at once, and
+                // binding the new one before releasing the old would fail
+                // with `EADDRINUSE` and leave the user with neither.
                 self.drop_remote_listener();
                 match remote::RemoteListener::bind(addr) {
                     Ok(listener) => {
@@ -4143,10 +4155,7 @@ impl Server {
                     client.send(&ServerMsg::Error(msg::Error {
                         serial: 0,
                         code: ErrorCode::BadBuffer,
-                        msg: "buffers are not available on a remote link: \
-                              file descriptors cannot be passed over TCP \
-                              (caps::REMOTE, docs/remote.md)"
-                            .to_owned(),
+                        msg: REMOTE_NO_BUFFERS.to_owned(),
                     }));
                     continue;
                 }
@@ -4157,6 +4166,22 @@ impl Server {
                     return false;
                 }
             };
+            if Self::is_remote(token) && Self::refuse_remote_buffer_op(&msg) {
+                let Some(client) = self.wire_clients.get_mut(&token) else {
+                    return false;
+                };
+                warn!(
+                    "remote client {}: {} is not available on a remote link",
+                    client.id.0,
+                    msg.name()
+                );
+                client.send(&ServerMsg::Error(msg::Error {
+                    serial: 0,
+                    code: ErrorCode::BadBuffer,
+                    msg: REMOTE_NO_BUFFERS.to_owned(),
+                }));
+                continue;
+            }
             if !self.handle_wire_msg(token, msg) {
                 return false;
             }
@@ -4334,6 +4359,30 @@ impl Server {
     /// Whether a token names a client that arrived over TCP.
     const fn is_remote(token: u64) -> bool {
         token >= TOK_REMOTE_BASE
+    }
+
+    /// Whether this message from a **remote** client is a buffer op that
+    /// cannot mean anything, and should be refused without killing the
+    /// connection.
+    ///
+    /// All three buffer ops, not just the one carrying a descriptor.
+    /// `BufferDamage` and `SetImage` merely *name* a buffer, but a remote
+    /// client can never have registered one, so honouring them is
+    /// impossible for the same reason. Refusing only `CreateBuffer` would
+    /// hand a client that ignored `caps::REMOTE` a clear sentence and
+    /// then disconnect it two messages later on the `SetImage` that
+    /// follows, with `no buffer with id 1` — the worse error, arriving
+    /// after the recoverable one, which is the shape of a bug report
+    /// nobody can read.
+    ///
+    /// `SetImage` with [`BufferId::NONE`] is *allowed through*: that is
+    /// how an image node is cleared, it names no buffer, and it is the
+    /// one op in this group a remote client may legitimately send.
+    fn refuse_remote_buffer_op(msg: &ClientMsg) -> bool {
+        match msg {
+            ClientMsg::SetImage(m) => !m.buffer.is_none(),
+            other => nitro_wire::server::is_buffer_op(other.op()),
+        }
     }
 
     // ---------------------------------------------------------- shell ops
@@ -5278,6 +5327,20 @@ mod tests {
         assert!(!Server::is_shell(TOK_CLIENT_BASE));
         assert!(!Server::is_shell(TOK_WIRE_LISTENER));
         assert!(!Server::is_shell(TOK_SHELL_LISTENER));
+        // A **remote** token sorts above the shell range, so `is_shell`
+        // is a window and not a threshold. Asserted rather than assumed:
+        // a remote client reading as privileged would hand `caps::SHELL`
+        // — layers, hotkeys, other clients' windows — to anything that
+        // can open a TCP port, which is the whole thing `docs/remote.md`
+        // promises cannot happen.
+        assert!(!Server::is_shell(TOK_REMOTE_BASE));
+        assert!(!Server::is_shell(TOK_REMOTE_BASE + 9_999));
+        assert!(!Server::is_shell(TOK_REMOTE_LISTENER));
+        assert!(Server::is_remote(TOK_REMOTE_BASE));
+        assert!(Server::is_remote(TOK_REMOTE_BASE + 9_999));
+        assert!(!Server::is_remote(TOK_SHELL_BASE));
+        assert!(!Server::is_remote(TOK_WIRE_BASE));
+        assert!(!Server::is_remote(TOK_CLIENT_BASE));
     }
 
     #[test]

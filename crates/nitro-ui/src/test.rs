@@ -53,6 +53,9 @@ struct Options {
     theme: Theme,
     backdrop: bool,
     surface: Option<crate::shell::Surface>,
+    /// Connect over **TCP** rather than the Unix socket; see
+    /// [`Harness::remote`].
+    remote: bool,
 }
 
 impl Options {
@@ -63,6 +66,7 @@ impl Options {
             theme,
             backdrop,
             surface: None,
+            remote: false,
         }
     }
 }
@@ -154,6 +158,22 @@ impl<S: 'static> Harness<S> {
         Self::build_with(opts, state, build)
     }
 
+    /// A harness on a **remote** (TCP) connection: the server binds
+    /// `127.0.0.1:0`, the client connects to the port the kernel chose,
+    /// and the `Welcome` carries `caps::REMOTE`.
+    ///
+    /// Loopback TCP is still a remote link in every way the toolkit can
+    /// observe — no `SCM_RIGHTS`, the capability bit set — so it tests
+    /// what a real remote app meets without needing a second machine.
+    ///
+    /// # Panics
+    /// As [`Harness::new`].
+    pub fn remote(name: &str, state: S, build: impl FnOnce(&mut Ui<S>) -> WidgetId) -> Self {
+        let mut opts = Options::new(name, None, Theme::default(), true);
+        opts.remote = true;
+        Self::build_with(opts, state, build)
+    }
+
     /// The one constructor the others funnel through.
     fn build_with(opts: Options, state: S, build: impl FnOnce(&mut Ui<S>) -> WidgetId) -> Self {
         let Options {
@@ -162,8 +182,13 @@ impl<S: 'static> Harness<S> {
             theme,
             backdrop,
             surface,
+            remote,
         } = opts;
-        let server = TestServer::start(&name, OUTPUT.0, OUTPUT.1);
+        let server = if remote {
+            TestServer::start_remote(&name, OUTPUT.0, OUTPUT.1)
+        } else {
+            TestServer::start(&name, OUTPUT.0, OUTPUT.1)
+        };
         // Park the pointer in a corner: the server puts it in the middle
         // of the output, where it would contaminate every pixel
         // assertion and hover every widget under it.
@@ -174,13 +199,24 @@ impl<S: 'static> Harness<S> {
         });
         // The socket *is* the capability: a shell surface connects to
         // `shell.sock`, and that is the only difference between the two
-        // paths here — same handshake, same client, same loop.
-        let path = if surface.is_some() {
-            server.shell_path()
+        // paths here — same handshake, same client, same loop. A remote
+        // harness is the same story one step further out: a different
+        // endpoint, and `caps::REMOTE` follows from having reached it.
+        let conn = if remote {
+            let addr = server
+                .remote_addr()
+                .expect("the remote listener is up: `start_remote` waited for it");
+            let endpoint = nitro_wire::Endpoint::parse(&format!("tcp://{addr}"))
+                .expect("the address the server itself reported");
+            Connection::connect_endpoint(&endpoint, &name).expect("tcp connect")
         } else {
-            server.wire_path()
+            let path = if surface.is_some() {
+                server.shell_path()
+            } else {
+                server.wire_path()
+            };
+            Connection::connect(path, &name).expect("connect")
         };
-        let conn = Connection::connect(path, &name).expect("connect");
         let mut app = App::with_connection(conn, &name).theme(theme);
         if !backdrop {
             app = app.transparent();

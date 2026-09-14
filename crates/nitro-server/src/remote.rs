@@ -28,7 +28,7 @@
 //!
 //! which puts authentication where there already is some — in sshd — and
 //! leaves nitro with one job. A non-loopback bind is for measurement on a
-//! trusted LAN and warns once, loudly, saying exactly this.
+//! trusted LAN and warns loudly on every bind, saying exactly this.
 
 use std::net::SocketAddr;
 

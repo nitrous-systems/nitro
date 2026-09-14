@@ -177,6 +177,21 @@ impl Socket {
     }
 
     /// Connect one address, blocking, then go non-blocking.
+    ///
+    /// `EINTR` needs real handling rather than a retry loop, and this is
+    /// the one place in the crate where that is true. On Linux a
+    /// blocking `connect` interrupted by a signal **continues
+    /// asynchronously**: the connection attempt is still in flight, and
+    /// calling `connect` again on the same descriptor answers `EALREADY`
+    /// (or `EISCONN` once it has completed), not "retrying". So the
+    /// obvious loop turns an interrupted connect into a spurious
+    /// failure, which is worse than not handling it at all — it looks
+    /// like it works.
+    ///
+    /// What the kernel wants instead is what a non-blocking connect
+    /// wants: **wait for the descriptor to become writable, then read
+    /// `SO_ERROR`**, which is where the result of an asynchronous
+    /// connect is delivered.
     fn connect_one_tcp(addr: SocketAddr) -> Result<Self, Error> {
         let fd = rustix::net::socket_with(
             family_of(addr),
@@ -184,12 +199,10 @@ impl Socket {
             SocketFlags::CLOEXEC,
             Some(rustix::net::ipproto::TCP),
         )?;
-        loop {
-            match rustix::net::connect(&fd, &addr) {
-                Ok(()) => break,
-                Err(Errno::INTR) => {}
-                Err(e) => return Err(e.into()),
-            }
+        match rustix::net::connect(&fd, &addr) {
+            Ok(()) => {}
+            Err(Errno::INTR) => finish_interrupted_connect(&fd)?,
+            Err(e) => return Err(e.into()),
         }
         Self::from_tcp(fd)
     }
@@ -494,6 +507,34 @@ pub fn pair() -> Result<(Socket, Socket), Error> {
         None,
     )?;
     Ok((Socket::from_fd(a)?, Socket::from_fd(b)?))
+}
+
+/// Wait out a `connect` that a signal interrupted, and report its real
+/// outcome.
+///
+/// See [`Socket::connect_one_tcp`]: the attempt is still in flight, so
+/// the answer arrives the way a non-blocking connect's does — the
+/// descriptor becomes writable and `SO_ERROR` holds the verdict.
+/// `EISCONN` is success by another name (it completed between the signal
+/// and the check) and `EALREADY` means it is still going, so the wait
+/// resumes.
+fn finish_interrupted_connect(fd: &OwnedFd) -> Result<(), Error> {
+    loop {
+        let mut fds = [rustix::event::PollFd::new(
+            fd,
+            rustix::event::PollFlags::OUT,
+        )];
+        match rustix::event::poll(&mut fds, None) {
+            Ok(_) => {}
+            Err(Errno::INTR) => continue,
+            Err(e) => return Err(e.into()),
+        }
+        return match sockopt::socket_error(fd)? {
+            Ok(()) | Err(Errno::ISCONN) => Ok(()),
+            Err(Errno::ALREADY | Errno::INPROGRESS) => continue,
+            Err(e) => Err(e.into()),
+        };
+    }
 }
 
 /// The address family a socket address needs.

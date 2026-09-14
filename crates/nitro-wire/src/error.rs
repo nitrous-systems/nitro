@@ -121,8 +121,14 @@ pub enum Error {
     /// header declares descriptors and whose descriptors never arrive is
     /// a desynchronised stream, so the honest failure is here and not at
     /// the far end. It is *not* fatal to the connection — nothing was
-    /// written — which is what lets a toolkit report "no images over a
-    /// remote link" and carry on drawing everything else.
+    /// written and nothing was queued, so the connection is exactly as
+    /// it was.
+    ///
+    /// That is what lets a caller treat it as "there is no buffer here"
+    /// rather than as a failure: `nitro-ui` turns it into a `None` from
+    /// `upload_image` and carries on drawing the rest of the tree. A
+    /// caller that instead propagates it will stop, which for a paint
+    /// pass means the app exits — see `docs/remote.md`.
     RemoteNoFds,
     /// `NITRO_SOCKET` (or `remote.listen`) named something unusable.
     BadEndpoint(String),

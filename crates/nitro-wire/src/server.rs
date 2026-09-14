@@ -397,6 +397,28 @@ pub fn needs_fd(op: u16) -> bool {
     op == msg::CreateBuffer::OP
 }
 
+/// Whether an op is about a **buffer**, and so cannot mean anything on a
+/// remote link.
+///
+/// A superset of [`needs_fd`], and the distinction matters. Only
+/// `CreateBuffer` carries a descriptor; `BufferDamage` and `SetImage`
+/// merely *name* a buffer. But a remote client can never have registered
+/// one, so all three are equally impossible — and a client that ignored
+/// `caps::REMOTE` should hear the same clear sentence for each, rather
+/// than surviving its `CreateBuffer` and then being disconnected by the
+/// `SetImage` that follows it two messages later with "no buffer with
+/// id 1".
+///
+/// `SetImage` naming [`BufferId::NONE`](crate::types::BufferId) is
+/// **not** included: that is how an image node is *cleared*, it needs no
+/// buffer, and it is the one thing in this group a remote client may
+/// legitimately want to do. The caller checks the field; this function
+/// only classifies the op.
+#[must_use]
+pub fn is_buffer_op(op: u16) -> bool {
+    op == msg::CreateBuffer::OP || op == msg::BufferDamage::OP || op == msg::SetImage::OP
+}
+
 /// The [`ErrorCode`] to report for a protocol-level failure.
 ///
 /// Everything the decoder rejects is a `Protocol` error except an oversize
