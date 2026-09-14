@@ -941,6 +941,13 @@ fn payload_layouts_are_frozen() {
     );
 
     let mut w = Writer::new();
+    // `layer` was added in place in M3 (task #3697), moving this head from
+    // 10 to 11 bytes. That is a layout change without a `VERSION` bump,
+    // which the comment at the top of this test would normally forbid:
+    // the exemption is argued in `docs/wire.md` under Versioning policy
+    // (`WindowInfo` is `SHELL`-gated, so no unprivileged client can
+    // observe the layout). Anything in the unprivileged blocks still
+    // needs the bump.
     ServerMsg::from(WindowInfo {
         window: WindowRef(0x0102_0304),
         state: WindowStateValue::Maximized,

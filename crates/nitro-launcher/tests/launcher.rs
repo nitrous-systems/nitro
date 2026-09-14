@@ -980,23 +980,46 @@ fn the_result_rows_are_painted() {
     let r = h.bounds(id);
     assert!(r.w > 1.0 && r.h > 1.0, "the row has a rect: {r:?}");
 
-    // The row's own fill is the button's surface, which is a different
-    // colour from the panel behind it, so "is the row there at all"
-    // and "is its text there" are two separate questions.
+    // Two separate questions, and they need two different reference
+    // colours. "Is the row there at all" is the row's fill against the
+    // panel behind it; "is its label there" is the glyphs against the
+    // row's own fill.
+    //
+    // The row is painted **most** of the rect, not a hairline: a button
+    // clipped away to nothing still leaves a sliver of border, so a bare
+    // `> 0` would pass on the bug this test exists for.
     let bg = h.ui().theme().background.to_u32() >> 8;
     let painted = h.ink_count(r, bg);
+    let area = (r.w * r.h) as usize;
     assert!(
-        painted > 0,
-        "the result row painted nothing inside {r:?} (panel bg {bg:06x})"
+        painted > area / 2,
+        "the result row is clipped away inside {r:?}: {painted} of {area} \
+         pixels differ from the panel background {bg:06x}"
     );
 
-    // And the label: against the row's *own* background, so a plain
-    // filled rectangle with no glyphs still fails.
-    let surface = h.ui().theme().surface.to_u32() >> 8;
-    assert!(
-        h.ink_count(r, surface) > 0,
-        "the result row's text painted nothing inside {r:?}"
-    );
+    // And the label. The reference is `theme.button` — the enabled,
+    // unhovered, unpressed face a result row actually paints — **not**
+    // `theme.surface`: they are different colours (0xe4e4e8 vs 0xffffff),
+    // and measuring against `surface` would count every pixel of a
+    // glyphless fill as ink, making this a weaker restatement of the
+    // assertion above rather than a test of the text.
+    //
+    // Skipped on a server with no fonts, which draws no glyphs at all;
+    // everything above still holds there.
+    if h.has_text() {
+        let face = h.ui().theme().button.to_u32() >> 8;
+        let glyphs = h.ink_count(r, face);
+        assert!(
+            glyphs > 0,
+            "the result row's text painted nothing inside {r:?} \
+             (row face {face:06x})"
+        );
+        assert!(
+            glyphs < area,
+            "every pixel differs from the row's own face {face:06x}, so \
+             {glyphs} is the fill rather than the glyphs"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
     h.quit();

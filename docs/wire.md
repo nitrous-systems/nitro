@@ -10,7 +10,8 @@ document describes them.
 **Status.** v1, **frozen** (M2 done, commit 84f7ed3, 2026-09-13). v1 does
 not change: additions go in as new op codes guarded by a capability bit,
 and only an incompatible change bumps `VERSION`. The last in-place change
-was `Configure.position` (task #3683).
+was `WindowInfo.layer` (task #3697), in the `SHELL` block; before that,
+`Configure.position` (task #3683).
 
 ## Transport
 
@@ -1261,6 +1262,32 @@ to.
   `VERSION` at **1**. A renaming like that is only safe while nothing
   reads the bit; once the toolkit does, the bits are frozen with
   everything else.
+* M3 adds a field **in place** to an existing message: `WindowInfo`
+  (0x8402) grew `layer`, moving its fixed head from 10 to 11 bytes
+  (task #3697). This is the one deviation on this list that really does
+  move bytes in a message that already existed, so it needs its own
+  argument rather than the "new op code" one above.
+
+  It is acceptable **here** because `WindowInfo` is a post-M2-freeze
+  M3-B op living in the `SHELL` block, and that block is reachable only
+  through `shell.sock`: the capability is granted by which socket a
+  client connected to, so no unprivileged client can send `WindowList`,
+  can receive a `WindowInfo`, or can observe the layout at all. The
+  readers are shell clients — the bar, the launcher, `shell_probe` —
+  which are built from this tree and ship with the server. There is no
+  client that can see the old layout and the new server at once.
+
+  The reason it could not be a new op code: a task list must filter
+  *every* window it is told about, so the layer has to be on the message
+  that reports a window, not on a second message a shell might not ask
+  for. A parallel `WindowLayer` op would mean a window is briefly listed
+  with an unknown layer, which is the bug being fixed.
+
+  `VERSION` therefore stays **1**. Had `WindowInfo` been an unprivileged
+  op, or had any non-tree client existed, this would have been a bump.
+  The same reasoning does **not** extend to the `0x_0xx..0x_3xx` blocks:
+  a field added in place to any message an ordinary client can receive
+  is a `VERSION` bump.
 * `VERSION` is bumped only for a change that is not expressible that way —
   a different framing, a changed field, a removed op. A version mismatch is
   fatal at handshake: there is no negotiation and no compatibility shim.
