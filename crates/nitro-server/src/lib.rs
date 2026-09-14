@@ -434,6 +434,24 @@ impl ConfigWatch {
             .file_name()
             .unwrap_or_else(|| std::ffi::OsStr::new(config::FILE_NAME))
             .to_owned();
+        // Create the directory if it is not there, because otherwise the
+        // watch cannot be placed and the very first write from a settings
+        // app — the one that creates the file — is the one event that is
+        // missed. That is not an edge case: it is the state **every fresh
+        // installation is in**, and it is exactly how this was found, on a
+        // box whose `~/.config/nitro` did not exist. `add_watch` needs an
+        // existing inode, and there is no "watch this path when it appears"
+        // short of walking up to the first extant ancestor and re-arming on
+        // every intermediate `CREATE` — much more machinery than `mkdir -p`
+        // of a directory the server already owns the name of.
+        //
+        // A failure here is not returned: it is almost always a read-only
+        // or unwritable home, and the watch attempt below will fail with a
+        // better message than the `mkdir` would give. The caller warns and
+        // runs on, unwatched.
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            debug!("creating {}: {e}", dir.display());
+        }
         let fd = inotify::init(inotify::CreateFlags::CLOEXEC | inotify::CreateFlags::NONBLOCK)?;
         // `CLOSE_WRITE` catches an in-place overwrite, `MOVED_TO` the
         // atomic rename, `CREATE` the first appearance of a file that was

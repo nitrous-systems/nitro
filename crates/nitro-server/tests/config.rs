@@ -73,16 +73,39 @@ impl Harness {
         Self::start_with(name, conf, |_| {})
     }
 
+    /// A server whose configuration **directory does not exist**, and which
+    /// is never given a file at all.
+    ///
+    /// The state every fresh installation is in, and the one
+    /// [`Harness::start`] cannot produce because it creates the directory
+    /// and writes the file before the server starts. That convenience is
+    /// precisely why the whole suite missed the defect this pins: the
+    /// watch is placed on the file's *parent directory*, so a home with no
+    /// `~/.config/nitro` had nothing to watch, and the very first write
+    /// from a settings app — the one that creates the file — was the one
+    /// event that could never be seen.
+    fn start_without_config_dir(name: &str) -> Self {
+        Self::start_with_options(name, None, |_| {})
+    }
+
     /// The same, with a last look at the [`Config`] — which is how a test
     /// sets `NITRO_SCALE`'s effect without touching the environment.
     fn start_with(name: &str, conf: &str, tweak: impl FnOnce(&mut Config)) -> Self {
+        Self::start_with_options(name, Some(conf), tweak)
+    }
+
+    /// The one constructor the others funnel through. `conf` of `None`
+    /// leaves both the directory and the file absent.
+    fn start_with_options(name: &str, conf: Option<&str>, tweak: impl FnOnce(&mut Config)) -> Self {
         let dir = std::env::temp_dir().join(format!("nitro-conf-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("nitro").join("control.sock");
         let config_dir = dir.join("config");
-        std::fs::create_dir_all(&config_dir).expect("config dir");
         let config_path = config_dir.join("server.conf");
-        std::fs::write(&config_path, conf).expect("write server.conf");
+        if let Some(text) = conf {
+            std::fs::create_dir_all(&config_dir).expect("config dir");
+            std::fs::write(&config_path, text).expect("write server.conf");
+        }
 
         let mut config = Config::fake(OUT.0, OUT.1, &path);
         config.config_path = Some(config_path.clone());
@@ -513,6 +536,43 @@ fn an_atomic_write_into_the_watched_directory_reloads_on_its_own() {
         h.stat("config_reloads") > before
     });
     assert_eq!(h.output_field("Virtual-1", "scale"), "1");
+
+    drop(conn);
+    h.quit();
+}
+
+#[test]
+fn a_config_that_does_not_exist_yet_is_still_watched() {
+    // The fresh-installation case, and a defect this suite could not see
+    // until it had a harness that leaves the directory out: on a box whose
+    // `~/.config/nitro` did not exist, the watch could not be placed (it
+    // goes on the *parent directory*, which has to exist), nothing ever
+    // retried it, and so the first file a settings app wrote — the one
+    // that creates it — was the single event guaranteed to be missed.
+    //
+    // Found by running it on the test box, where `Apply` wrote a correct
+    // file, the server sat at `config_reloads 0`, and the app honestly
+    // reported "server rejected: see log".
+    let h = Harness::start_without_config_dir("fresh");
+    let mut seen = Vec::new();
+    let mut conn = h.client("fresh");
+    let root = make_window(&mut conn, &mut seen, 1, 1);
+    // Nothing configured: the EDID default, which is 1 on a fake output.
+    assert_eq!(configure(&mut conn, &mut seen, root).scale, 1.0);
+    h.settle();
+    let before = h.stat("config_reloads");
+
+    // Now be a settings app on a machine that has never been configured:
+    // create the file for the first time, atomically.
+    h.rewrite_config("output.Virtual-1.scale = 2\n");
+
+    // No control request, no restart — this can only pass if the server
+    // created the directory it was told to watch and armed the watch on it.
+    await_scale(&mut conn, &mut seen, root, 2.0);
+    wait_for("the first-ever config write to be noticed", || {
+        h.stat("config_reloads") > before
+    });
+    assert_eq!(h.output_field("Virtual-1", "scale"), "2");
 
     drop(conn);
     h.quit();
