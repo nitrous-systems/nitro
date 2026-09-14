@@ -731,6 +731,98 @@ D-Bus client is allowed.
 
     Role table, config keys, wire op, lint rule and how to add a role:
     `docs/theme.md`.
+  - **M4-E1 done.** **Remote apps: the same wire over TCP.** An app runs
+    on machine B, connects to the server on machine A, and its window is
+    on A's screen — decorated, focusable, `Alt+Tab`-able, driven by A's
+    keyboard and pointer. `NITRO_SOCKET=tcp://host:port` on the client,
+    `remote.listen = <addr>:<port>` in A's `server.conf`, and nothing
+    else. `docs/remote.md`.
+
+    The point of the milestone is how little code it is, and *why*.
+    `docs/wire.md` has said since M1 that the framing does not depend on
+    the socket being local, and `caps::REMOTE` — "the link is remote:
+    buffers are expensive, text is cheap" — has been bit 3 since M1. This
+    is the first time either claim was **tested**, and they held: the
+    messages are little-endian `repr(C)` bodies behind an 8-byte header,
+    so a stream socket is a stream socket. The endianness claim is now
+    pinned against a byte literal rather than assumed, so a field that
+    ever becomes native-endian fails on the machine that built it rather
+    than on someone's ARM laptop.
+
+    What did **not** come for free is the descriptor channel, and that is
+    the whole design of the feature. An image's pixels ride on
+    `SCM_RIGHTS`; TCP has no equivalent and there is no honest fallback
+    (16 MiB of inline pixels on the one link that is slow). So a
+    descriptor-carrying message is refused **before it is encoded**
+    (`Error::RemoteNoFds`, nothing queued, connection untouched), refused
+    again at the socket as a backstop so no half-frame can ever reach the
+    wire, and answered by the server with an `Error` that **keeps the
+    client connected** — the one error in the protocol that is not fatal,
+    because a client that ignored the capability bit is better served by
+    an explanation than a dead socket. `nitro-calc`, `nitro-term`,
+    `nitro-files` and `nitro-settings` run remotely **unmodified**; the
+    wallpaper cannot and says so, because it *is* an image. The shell
+    socket is never TCP: `caps::SHELL` is granted for having opened a
+    `0700` path, and a port proves nothing of the sort.
+
+    **There is no authentication, and the documentation leads with that.**
+    The supported configuration is loopback plus `ssh -L`, which puts
+    authentication in sshd — which already has an answer to who you are
+    and what the transport encryption is. A non-loopback bind warns once,
+    loudly, and is for measurement. `remote.listen` is absent by default,
+    and absent means no socket at all: no bind, no epoll registration, no
+    accept path.
+
+    Measured on the box (Pentium G3240) as A, the dev box as B, 1 Gb LAN:
+
+    | | measured |
+    |---|---|
+    | i2p median, remote over LAN | **9.2–10.6 ms** (local, same evening: 8.7 ms) |
+    | `nitro-term` `seq 1 1000000`: **bytes on the wire** | **43 185 B** for **6 888 896 B** of output — **0.63 %** |
+    | `nitro-files` first paint of `/usr/share` | remote **9.2 ms** (local on the box 10–23 ms) |
+    | server RSS with the listener idle | **below this box's resolution** |
+    | `nitro-server` binary | +19.8 KB (+0.92 %) |
+    | remote app `SIGKILL`ed | window gone within one loop turn |
+    | link blackholed (a yanked cable) | **17 s**, via `SO_KEEPALIVE` 10/5/3 |
+
+    The wire-byte ratio is the number that says something about the link,
+    and it is the design working: a million lines of terminal output
+    become about thirty frames of `SetText`, because the mutation stream
+    describes what the screen should look like and a screen overwritten
+    33 000 times only has to be described once per frame. That is why
+    this forwards usefully where pixels would not. The `seq` *wall* times
+    are deliberately **not** quoted as a comparison — the VT parsing
+    happens on whichever machine the app runs on, so they measure the two
+    CPUs.
+
+    **The `TCP_NODELAY` A/B is a negative result, and it is reported as
+    one.** `NITRO_TCP_NODELAY=0` exists so the claim behind the sockopt
+    could be measured with one option flipped rather than asserted. Five
+    interleaved pairs came back with **mixed signs** — the first pair had
+    Nagle *faster*, which is exactly how a 10 % "win" gets published off
+    one run — and the mechanism says why: `--follow` commits 4.7 times a
+    second, so every write is alone on the wire with nothing to coalesce.
+    Nagle holds a *second* small write; a protocol that sends one and
+    waits never meets it. The option stays on, because the one burst that
+    does exist shows it: connect-to-first-`Presented` is 8.7–21.6 ms with
+    it against 18.8–31.3 ms without, same direction in four of five pairs.
+
+    Two traps from the box run are recorded because they generalise.
+    Killing an ssh forward is **not** a yanked cable — it is a clean FIN
+    and takes 0.6 s, i.e. the close path the RST test already covers; the
+    17 s figure needed the packets actually *dropped*. And `nc -q1 -U`
+    silently returns nothing for a large fraction of control requests on
+    that box, which reads exactly like "the key is absent": the first
+    reading after enabling the listener looked like a broken reload while
+    `ss -ltnp` showed the port LISTENing. Two defects in `nitro-demo`
+    came out of running it remotely, and the second is the transferable
+    one: **dropping a node from a scene is two edits, not one.** The demo
+    built its scene without the image and then died on the first
+    `Configure` with `UnknownNode`, because the re-layout still laid out a
+    node the build had never created — in a path that only runs when the
+    window is resized, so it survived 61 passing tests. Zero new external
+    crates: `rustix`'s `net` already covers TCP sockets and socket
+    options.
 
 - **M5** — Wayland adapter; GPU backend.
 

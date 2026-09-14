@@ -486,7 +486,75 @@ frame, so a server with nothing to do does nothing with it either.
 which is `1920 × 1080 × 4` to the byte. `docs/budget.md` records it as
 the deliberate trade it is.
 
-## 5. Reproducing
+## 5. Remote: the same measurement over TCP (M4-E1)
+
+An app on the dev box, its window on the test box, over a 1 Gb LAN
+(`docs/remote.md` has the model and the security model). The question
+this section answers is narrow: **what does putting the wire on TCP cost
+the input-to-photon figure?**
+
+The method is section 2's, unchanged — `nitro-demo --follow`, 120 real
+`ydotool` pointer moves on the box, the client's own `i2p[total]` line
+— with `NITRO_SOCKET=tcp://192.168.1.204:7700` and
+`remote.listen = 0.0.0.0:7700` on the server. The local baseline was
+taken **the same evening, on the same box**, because this box's numbers
+drift day to day.
+
+| | i2p median | p95 |
+|---|---|---|
+| **local** (box, same evening) | **8 664 µs** | 17 272 |
+| **remote**, `TCP_NODELAY` on, five runs | 9 232 / 9 496 / 9 802 / 10 205 / 10 629 µs | 15.6–18.8 ms |
+| **remote**, Nagle on, four runs | 10 253 / 10 300 / 10 790 / 11 424 µs | 15.6–17.6 ms |
+
+So a remote window costs roughly **1–2 ms of median latency**, on a
+figure whose budget is one 16.7 ms refresh period. It is still inside
+the budget, which is the headline: remote apps are not a degraded mode.
+
+### The `TCP_NODELAY` A/B is a negative result
+
+The option is a latency claim, and a latency claim with no measurement
+behind it is a comment. `NITRO_TCP_NODELAY=0` turns it off so the A/B is
+the **same binary, same window, same machine pair, one sockopt flipped**
+— not "TCP vs Unix", which differs in far more than one option, and this
+is the shape of control section 4's history argues for.
+
+**Five interleaved pairs, mixed signs.** The first pair had Nagle
+*faster*. Reported as "not resolvable in this workload", and the
+mechanism says why it never could be: `--follow` commits about 4.7 times
+a second, so every write is alone on the wire with nothing to coalesce
+and the previous one long since acknowledged. Nagle holds a *second*
+small write pending an ACK; a protocol that sends one and waits never
+meets it.
+
+The option stays set. It costs nothing, and the one burst in the demo's
+life — the handshake and first transaction, which *are* back-to-back
+small writes — does show it:
+
+| | connect → first `Presented` |
+|---|---|
+| `TCP_NODELAY` on | **8.7, 9.2, 12.3, 21.6, 31.3 ms** |
+| Nagle on | 18.8, 19.0, 20.1, 25.7, 31.3 ms |
+
+Same direction in four of five pairs.
+
+### Two cautions specific to a remote run
+
+- **The `delivery` line is meaningless across machines.** It is the one
+  figure taken against the *client's* own clock (section 1), so over a
+  remote link it carries the full `CLOCK_MONOTONIC` skew between two
+  machines — it reported `median=1496007485384 µs`, i.e. 17 days. The
+  headline `i2p` figure is immune, because both its endpoints are
+  stamped by the server. That is not a new caveat: `App::delivery`'s own
+  doc comment predicted it, and this is the run that made it true.
+- **Do not compare `seq 1 1000000` wall times.** The VT parsing happens
+  on whichever machine the *app* runs on, so remote (0.35 s, 128-core
+  dev box) against local (0.55 s, Pentium G3240) measures the two CPUs
+  and says nothing about the link. The figure that *is* about the link
+  is bytes on the wire: **43 185 B for 6 888 896 B of terminal output,
+  0.63 %**, taken from the server socket's own `ss -ti` counters either
+  side of the run.
+
+## 6. Reproducing
 
 ```sh
 just deploy                                   # includes nitro-demo
@@ -523,3 +591,18 @@ Three cautions learned here, each of which produced a wrong number first:
 A before/after wants both builds measured in the same sitting, alternating
 if possible. The box is shared and its thermal and scheduler state drift;
 two runs a day apart are not a controlled comparison.
+
+For a **remote** run (section 5), the client is on the other machine and
+the `NITRO_SOCKET` goes with it:
+
+```sh
+box$  echo 'remote.listen = 127.0.0.1:7700' >> ~/.config/nitro/server.conf
+dev$  ssh -L 7700:127.0.0.1:7700 box -N &
+dev$  NITRO_SOCKET=tcp://127.0.0.1:7700 ./target/release/nitro-demo --follow --seconds 26
+# and the ydotool loop on the *box*, as ever: the input is the box's
+NITRO_TCP_NODELAY=0 ...   # the same run with Nagle, for the A/B
+```
+
+`--stats` is **not** useful remotely: it reads the server's control
+socket, which is a Unix socket on the other machine. Read the server's
+own figures there instead, with `nitro-shot --stats` on the box.

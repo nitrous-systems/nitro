@@ -243,6 +243,33 @@ The whole-workspace figure is **74** lines and **37 distinct external
 crate names** with M4-C in — both unchanged from M4-A, which is the
 number this section exists to report.
 
+## M4-E1: remote apps over TCP
+
+**Zero new crates, and that was the expectation going in.** A remote
+client is the *same* wire over a different socket, so the whole addition
+is a TCP socket, four socket options and an address parser:
+
+- `rustix::net` was **already** a `nitro-wire` feature (Unix sockets,
+  `SCM_RIGHTS`, `sendmsg`/`recvmsg`), and it covers `AF_INET`/`AF_INET6`
+  and `sockopt` — `set_tcp_nodelay`, `set_socket_keepalive`,
+  `set_tcp_keepidle`/`keepintvl`/`keepcnt`, `set_socket_reuseaddr` —
+  with no new feature flag and no new crate. `nitro-server` likewise
+  already had `net` for the control socket.
+- Name resolution is `std::net::ToSocketAddrs`, i.e. the platform
+  resolver. A DNS crate would be a permanent dependency for one call
+  that runs at most once per process start, and it would answer a
+  *different* question from the one the rest of the system answers — a
+  client that resolves a name differently from `ssh` to the same host is
+  a support case nobody can reproduce.
+- No TLS. There is no authentication and the documented model is
+  loopback plus an SSH forward (`docs/remote.md`), precisely so that a
+  display server does not grow a key exchange, a cipher negotiation and
+  an account model — three attack surfaces with no reviewers. `rustls`
+  alone would roughly double the external crate count of the workspace.
+
+The figure is therefore still **74** lines and **37 distinct external
+crate names** with M4-E1 in.
+
 Planned (M3+): nothing currently. `parley` sits behind swash as the
 upgrade path if bidi, font fallback or rich text ever become requirements.
 Rejected: `serde` (hand-written wire), `png` (own stored-deflate encoder in
@@ -262,7 +289,7 @@ the syscall families it uses.
 
 | crate | features | used for |
 |---|---|---|
-| `nitro-wire` | `event`, `fs`, `net`, `process` | `poll` for the blocking handshake; `memfd_create`/`fstat`/`ftruncate` (tests) and `unlinkat`/`mkdir` for the socket path; `socket`/`bind`/`listen`/`accept`/`sendmsg`/`recvmsg` + `SCM_RIGHTS`; `getuid` for the `/tmp` fallback path |
+| `nitro-wire` | `event`, `fs`, `net`, `process` | `poll` for the blocking handshake; `memfd_create`/`fstat`/`ftruncate` (tests) and `unlinkat`/`mkdir` for the socket path; `socket`/`bind`/`listen`/`accept`/`sendmsg`/`recvmsg` + `SCM_RIGHTS`; **TCP sockets and `sockopt` (`TCP_NODELAY`, `SO_KEEPALIVE` + the three keepalive timers, `SO_REUSEADDR`) for the remote transport — the same feature, not a new one**; `getuid` for the `/tmp` fallback path |
 | `nitro-server` | `event`, `fs`, `net`, `process`, `time` | epoll loop, control socket, signals, timers; `pread` to copy client buffers out of their memfds, and `eventfd` for the test input source |
 | `nitro-kms` | `event`, `fs`, `mm`, `net`, `time` | DRM fds, `mmap` of dumb buffers, udev netlink |
 | `nitro-demo` | `event`, `fs`, `process`, `time` | `poll` for the event loop; `memfd_create`/`ftruncate`/`pwrite` for the image buffer; `getuid` for the `/tmp` fallback of the control-socket path; `clock_gettime` for the delivery-leg breakdown |

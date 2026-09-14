@@ -63,6 +63,7 @@ broken desktop and a text console.
 | `keyboard.options` | xkb options, e.g. `ctrl:nocaps` | none |
 | `theme.scheme` | `light` or `dark` — the desktop's colour scheme | `light` |
 | `theme.<role>` | `#rrggbb` or `#rrggbbaa`, overriding one role on top of the scheme | the scheme's value |
+| `remote.listen` | `<addr>:<port>` — bind a **TCP** listener for remote apps | absent: no TCP socket at all |
 
 `<connector>` is the name the kernel gives the connector — `HDMI-A-1`,
 `VGA-1`, `DP-1.2` — which is exactly what `nitro-shot --outputs` prints.
@@ -72,6 +73,44 @@ reports `DP-1.2`), so the field is taken after the **last** dot.
 An explicit empty value is not the same as an absent key:
 `keyboard.variant =` means "no variant", where saying nothing lets
 `XKB_DEFAULT_VARIANT` or xkbcommon's own default decide.
+
+### `remote.listen`
+
+```text
+remote.listen = 127.0.0.1:7700
+```
+
+Binds a second wire listener over TCP, so an app on another machine can
+put a window on this screen (`docs/remote.md`). **Absent by default, and
+absent means no socket at all** — no bind, no epoll registration, no
+accept path — so a desktop that does not want remote clients pays
+nothing for the feature existing.
+
+The value is an **IP literal** and a port: `127.0.0.1:7700`,
+`[::1]:7700`, `0.0.0.0:7700`. Not a hostname — a listener resolved
+through DNS is a foot-gun, because the name may move and the address the
+server bound is then not the one the file names. Port `0` is legal and
+means "ask the kernel"; the port it chose is reported by `stats` as
+`remote_listen`.
+
+> **There is no authentication.** Anyone who can reach the port can put
+> windows on your screen. The supported configuration is the loopback
+> address plus an SSH port-forward (`ssh -L 7700:127.0.0.1:7700 host`),
+> which puts authentication in sshd where there already is some. A
+> non-loopback bind logs a `warn` saying exactly this and is for
+> measurement on a trusted LAN.
+
+An empty value (`remote.listen =`) means "off", like the other keys: it
+is how a settings app disables the listener without deleting the line.
+
+On **reload** (below), the key behaves as you would want:
+
+| the file now says | what happens |
+|---|---|
+| the same address | **nothing** — no rebind, and connected remote clients are undisturbed |
+| a different address | rebind |
+| nothing (key removed) | the listener closes; **clients already connected keep working**, because a connection lives on the socket it was accepted on |
+| something unusable | a `warn` and no listener — a typo must not cost you your desktop |
 
 ### `keyboard.repeat` is deliberately absent
 

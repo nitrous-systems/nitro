@@ -17,7 +17,8 @@ background under the clients and the frames around them.
 
 ## Sockets
 
-Three, and they do different jobs.
+Four, and they do different jobs — though the fourth is optional and off
+unless configured.
 
 The **wire socket** is the one clients use: `nitro-wire` v1, at
 `$XDG_RUNTIME_DIR/nitro/wire.sock` unless `NITRO_SOCKET` says otherwise
@@ -58,6 +59,24 @@ and both sockets live in the same `0700` directory, so the grant is
 precisely "a process running as this user" — `docs/shell.md` states what
 that is worth, what it is not, and what a finer model would need.
 
+The **remote listener** — since M4-E1 — is the same protocol again, over
+**TCP**, and it is the one socket that does not exist unless asked for:
+`server.conf`'s `remote.listen = <addr>:<port>` binds it, absence means
+no socket at all (no bind, no epoll registration, no accept path), and a
+reload may create, move or close it without disturbing a connected
+client. A connection accepted there gets `REMOTE` (bit 3) on top of the
+usual bits and **never `SHELL`** — the shell privilege is having opened a
+`0700` path, and a port proves nothing of the sort. It also cannot carry
+file descriptors, so `CreateBuffer` is answered with
+`Error { BadBuffer, "buffers are not available on a remote link" }` and
+the client is *kept*: this is the one error that does not close the
+connection, because a client that missed the capability bit is better
+served by an explanation than by a dead socket. Everything else — node
+ownership, damage, window management, decorations, input — is the
+identical code path. **There is no authentication**; the documented
+model is loopback plus an SSH port-forward, and a non-loopback bind
+warns once saying so. `docs/remote.md` has the model and the numbers.
+
 The **control socket** is the v0 line protocol and stays as the server's
 own test and debug channel — it is what `nitro-shot` and the integration
 tests speak, and it deliberately has nothing to do with the client
@@ -82,8 +101,9 @@ tests.
 | anything else        | `err <message>\n`                                                     |
 
 Several requests per connection are fine; a request line longer than 256
-bytes without a newline drops the client. All three socket files are
-unlinked on shutdown.
+bytes without a newline drops the client. All three Unix socket files are
+unlinked on shutdown; the TCP listener, when there is one, is simply
+closed.
 
 ## Environment
 
@@ -251,6 +271,7 @@ five seconds of idle after a deferral is 0 frames, 0 CPU ticks and
 | control listener          | accept, register the client                                              |
 | wire listener             | accept, allocate a `ClientId`, register the client                       |
 | shell listener            | the same, from the privileged token range: the accepted client's `Welcome` gets `caps::SHELL` |
+| **remote listener**       | the same again, from a third token range, and **only when `server.conf`'s `remote.listen` asked for one**: a TCP accept whose `Welcome` gets `caps::REMOTE` and never `SHELL`. Absent from the epoll set entirely when the key is absent, which is the default (`docs/remote.md`) |
 | wire client               | read, decode, buffer mutations, apply on `Commit`; `OUT` interest only while bytes are queued |
 | control client            | read lines, answer, drop on hangup; `OUT` interest only while a reply is queued |
 
@@ -774,6 +795,8 @@ looking for.
 | `dragging`               | 1 while a move or resize drag is in flight. A drag that is still 1 with nothing on the desk is a stuck grab. |
 | `focused`                | 1 when some window has keyboard focus. 0 with windows on screen means every one of them is `NO_FOCUS` or minimized — or that the focus was dropped and not handed on, which is a bug. |
 | `shell_clients`          | Connections on the **privileged** shell socket. The first key to look at when a bar "is not working": zero means it never got there. |
+| `remote_clients`         | Connections that arrived over **TCP** (`docs/remote.md`). Counted separately from `clients`, which is the total: a remote client is an ordinary client in every other respect, and this is the one fact about it that is not visible anywhere else. |
+| `remote_listen`          | The address the remote listener bound, or `off`. The **bound** one, with the port the kernel chose for a configured `:0` — which is the answer someone who wrote `remote.listen = 127.0.0.1:0` is actually asking for, and what the integration tests connect to. The one statistic whose value is text rather than a number; the line format is unchanged, so a reader that parses the rest as an integer skips it. |
 | `hotkeys`                | Live `BindKey` bindings held by shell clients. |
 | `exclusive_zones`        | Windows reserving screen space off an output edge. |
 | `grabbed`                | 1 while a shell client holds a keyboard grab. A 1 with no launcher on screen is a stuck grab. |

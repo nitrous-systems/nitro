@@ -20,16 +20,64 @@ A Unix `SOCK_STREAM` socket, by default
 `$XDG_RUNTIME_DIR/nitro/wire.sock` (`NITRO_SOCKET` overrides the whole
 path; `/tmp/nitro-<uid>/wire.sock` is the fallback when the runtime
 directory is unset). Nothing in the framing depends on the socket being
-local or on `SOCK_SEQPACKET` — the same bytes run over TCP or an SSH
-channel for the remote case, where file-descriptor passing is simply not
-available and clients must not use the buffer ops.
+local or on `SOCK_SEQPACKET`.
+
+Since M4-E1 that is demonstrated rather than asserted: `NITRO_SOCKET`
+also takes **`tcp://host:port`**, and the same bytes run over TCP to a
+server on another machine. A connection accepted there is granted
+`REMOTE` (bit 3) and never `SHELL`, and **file descriptors cannot be
+passed on it** — see [caps](#handshake) and `docs/remote.md` for the
+model, the security model (loopback plus an SSH forward; there is no
+authentication) and the measured numbers.
+
+The endpoint forms are:
+
+| `NITRO_SOCKET` | meaning |
+|---|---|
+| anything without a `tcp://` prefix | a **path**, verbatim — including one containing colons |
+| `tcp://127.0.0.1:7700` | IPv4 literal |
+| `tcp://[::1]:7700` | IPv6 literal, **bracketed**; unbracketed is an error, not a guess |
+| `tcp://box.local:7700` | a name, resolved with the platform resolver; every address is tried in order |
+
+### Descriptors on a remote link
+
+Sending a frame that carries descriptors on a remote socket is a
+**client-side error** (`Error::RemoteNoFds`), raised before the message
+is encoded: nothing is queued and no bytes reach the wire. Receiving a
+frame that *declares* descriptors on a remote socket is a protocol error
+that disconnects — the descriptors can never arrive, so the two ends
+disagree about the byte stream, and a desynchronised stream cannot be
+resynchronised.
+
+In v1 exactly one message carries a descriptor, `CreateBuffer`, so the
+rule in practice is: **no buffers, and therefore no `Image` content, on
+a remote link.** The server answers a remote `CreateBuffer` with
+`Error { BadBuffer }` but keeps the client connected, which is the one
+place an error is not fatal to the connection.
+
+A remote receive does `recvmsg` with **no ancillary buffer** at all: a
+TCP socket cannot produce an `SCM_RIGHTS` cmsg, so asking for one would
+be asking a question with one possible answer.
+
+### Endianness
+
+Every field on the wire is an explicit little-endian type
+(`zerocopy::byteorder`), with no padding and no alignment requirement,
+so a **mixed x86-64/aarch64 pair is fine**. This is pinned by
+`the_wire_image_is_little_endian_and_pinned` in
+`crates/nitro-wire/tests/tcp.rs`, which compares an encoded `SetBounds`
+against a byte literal — a field that ever became native-endian, or was
+reordered or padded, fails there on the machine that built it rather
+than on someone's ARM laptop.
 
 There is a **second** socket, `$XDG_RUNTIME_DIR/nitro/shell.sock`
 (`NITRO_SHELL_SOCKET`), with identical framing and handshake. The only
 difference is that a connection accepted there is granted the `SHELL`
 capability and may send the ops in the [Shell](#shell-caps-shell)
 section. **The socket is the privilege**: see that section and
-`docs/shell.md`.
+`docs/shell.md`. It is therefore **never TCP** — a `tcp://` in
+`NITRO_SHELL_SOCKET` is an error, because a port cannot prove what a
+`0700` path proves.
 
 Both directions are non-blocking. A client that cannot write blocks
 nobody: the unsent bytes stay queued and go out when the socket drains.
@@ -149,6 +197,15 @@ bit rather than an assumption, because it is what tells a client whether
 to *wait* for colours or fall back to its built-in ones — and because a
 future non-desktop server (a remote view, a test fixture) may honestly
 not have a palette to push.
+
+`REMOTE` is **granted since M4-E1**, for and only for a connection
+accepted on the TCP listener (`remote.listen` in `server.conf`). It is
+reported on the same terms: the fact is which socket the client reached,
+and the bit is how the server says so. A client that sees it must not
+use `CreateBuffer`, `BufferDamage` or `SetImage` — see
+[Descriptors on a remote link](#descriptors-on-a-remote-link) and
+`docs/remote.md`. `REMOTE` and `SHELL` never appear together: a TCP port
+cannot prove what a `0700` path proves.
 
 ## Errors
 
