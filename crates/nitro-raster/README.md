@@ -356,7 +356,46 @@ preconditions trivially true.
 ### Against the targets
 
 The spec set two targets on the box: **(a) < 1.5 ms** and **(e) < 4 ms**; a
-later round added **(d) < 10 ms**.
+later round added **(d) < 10 ms**. Two of the three were missed, and after
+#3693 and #3702 had exhausted the dispatch-level levers the remaining gap was
+shown to be per-pixel blend throughput — a SIMD or pixel-format decision.
+
+**That decision was taken (2026-09-14, issue #522): accept the measured
+numbers and retarget.** The targets on this page are now
+
+| scene | target | measured (box) |
+|---|---|---|
+| (a) `solid_fill` | at memory speed | 1.83 ms (within 1 % of `memset`-class floor) |
+| (e) `ui_frame` | **≤ 5.3 ms** | 5.22 ms |
+| (d) `blits` | **≤ 37 ms** | 36.09 ms |
+
+The reasoning, in full, because a retarget that is not argued is just a
+missed target with the evidence deleted:
+
+1. **The running compositor no longer pays this.** Since the shadow buffer
+   (#3695) the server paints roughly **0.4 ms of damage per frame**. `ui_frame`
+   is a *full-frame synthetic* — 1.77 M pixels over 20 clip rects, 85 % of the
+   screen — and the 4 ms target predates the lever that made a full-frame
+   repaint stop happening. The target was calibrated against a world where the
+   worst case was the common case.
+2. **The only remaining lever needs `unsafe` or nightly.** Explicit SIMD means
+   `std::arch` intrinsics (an `unsafe` exception in a crate whose entire point
+   is `#![forbid(unsafe_code)]`) or `std::simd` (nightly; the tree is on
+   stable). The packed-`u32` two-channels-at-a-time blend is the one
+   `unsafe`-free trick left, and the instrumented breakdown below says it does
+   not reach 4 ms on (e) and gets nowhere near 10 ms on (d).
+3. **Scene (d) stresses a path the desktop barely uses.** The instrumented
+   server does six scaled blits per run — **0.288 % of painted pixels** reach
+   `blit_scaled`. Of the two, (e) is the one that would matter if either did.
+4. **There is a natural time to revisit.** M5's Wayland adapter and dma-buf
+   import decide whether full-screen image blits go through the CPU rasterizer
+   at all. If they do not, this crate's blit path stops being on the hot path
+   for good; if they do, the decision is re-made with the real workload in
+   hand rather than against a synthetic.
+
+The measured history below is unchanged — the *target* line moved, the
+measurements did not.
+
 
 - **(a) is 1.86 ms — missed, but it is at the hardware floor.** A
   micro-benchmark on the box (`tmp/fillbench.rs`, not committed) writing the
@@ -378,23 +417,26 @@ later round added **(d) < 10 ms**.
   is. (Also worth noting: the real compositor rarely repaints the full screen
   — that is what the damage rects are for.)
 
-- **(e) is 5.22 ms — missed by 1.3×, down from 9.36 ms (1.79× faster).** The
-  scene is deliberately brutal: after culling it still paints **1.77 M pixels
-  per frame**, i.e. 85 % of a full screen spread over 20 clip rectangles,
-  most of it 1.5 px-wide anti-aliased stroke bands. A realistic UI frame
-  redraws far less. What is left is per-pixel blend throughput, not setup:
-  see [the thin-border fast path](#the-thin-border-fast-path) for the two
-  levers that produced the 1.79× and the measurement that says the remaining
-  gap is not another dispatch trick.
+- **(e) is 5.22 ms, down from 9.36 ms (1.79× faster), and is now the
+  target.** The scene is deliberately brutal: after culling it still paints
+  **1.77 M pixels per frame**, i.e. 85 % of a full screen spread over 20 clip
+  rectangles, most of it 1.5 px-wide anti-aliased stroke bands. A realistic UI
+  frame redraws far less, and since #3695 the server's actual per-frame paint
+  is ~0.4 ms. What is left is per-pixel blend throughput, not setup: see [the
+  thin-border fast path](#the-thin-border-fast-path) for the two levers that
+  produced the 1.79× and the measurement that says the remaining gap is not
+  another dispatch trick. The original 4 ms would need SIMD; see the retarget
+  rationale above.
 
-- **(d) is 36.09 ms on the box, down from 38.08 — and the 10 ms target is
-  still not reachable in scalar code.** The row split that #3693 measured and
+- **(d) is 36.09 ms on the box, down from 38.08 — and the old 10 ms target was
+  never reachable in scalar code, which is why it is now 37 ms.** The row
+  split that #3693 measured and
   then reverted has been **re-taken**: 27.31 → 24.17 ms dev, 38.05 → 36.09 ms
   box. It was reverted because it lost on the write-combined DRM dumb buffer;
   #539 moved the rasterizer's destination to a heap shadow, which removed that
   objection. See [the blit row split](#the-blit-row-split).
 
-  The target is still out of reach, and by a margin the split cannot close.
+  The old target was out of reach by a margin the split cannot close.
   An instrumented breakdown of one 96×96 bilinear blit, dev, 200 blits:
 
   | inner loop | |
@@ -414,7 +456,8 @@ later round added **(d) < 10 ms**.
   speedup over a loop already within 2× of a plain nearest-neighbour blend;
   **on an SSE4.2-only CPU with no explicit SIMD that is not available**, and
   the honest restatement is "blits are the one scene where the no-SIMD
-  constraint costs us, by about 1.7× against vello".
+  constraint costs us, by about 1.7× against vello" — which is what the 37 ms
+  target now says.
 
 ### The benchmark lies about blits
 
@@ -763,18 +806,20 @@ recommendation on the numbers:
 4. Where we lose — per-pixel throughput on alpha fills and bilinear blits —
    the gap is explained (their SIMD kernels vs our autovectorized scalar
    loops) and is *bounded*: the blit breakdown above says even an alpha-free
-   bilinear would not reach the 10 ms target on this CPU, so this is the
+   bilinear would not reach the old 10 ms target on this CPU, so this is the
    no-SIMD constraint's price, not a missing optimization.
 
 The honest caveats: **vello_cpu is the better renderer** in the abstract —
 paths, rotation, text, strokes with joins and caps, and faster raw pixel
 throughput. The moment the scene needs arbitrary paths or rotation, this
 crate does not cover it and that decision should be revisited rather than
-grown into a path rasterizer by accident. And scene (e) still misses its 4 ms
-target (5.22 ms, from 9.36) even though it now beats vello by 5.2× — the
+grown into a path rasterizer by accident. And scene (e) missed its original
+4 ms target (5.22 ms, from 9.36) even though it now beats vello by 5.2× — the
 thin-border fast path was the named follow-up and it is done; what remains is
 per-pixel blend throughput on 1.77 M painted pixels, which is the same
-no-SIMD ceiling scene (d) runs into.
+no-SIMD ceiling scene (d) runs into. That is the gap issue #522 closed by
+retargeting rather than by adding SIMD; see [against the
+targets](#against-the-targets).
 
 ### Things measured and rejected
 
