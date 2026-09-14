@@ -9,10 +9,10 @@ number we watch.
 
 | crate | used by | why | cost / notes |
 |---|---|---|---|
-| `rustix` | seat, kms, server, wire, demo | Safe Linux syscalls (epoll, mmap, sockets + `SCM_RIGHTS`, timerfd, netlink) with no libc. The one crate that lets the rest of the tree be `unsafe`-free. | + `bitflags`, `linux-raw-sys` |
+| `rustix` | seat, kms, server, wire, demo, session | Safe Linux syscalls (epoll, mmap, sockets + `SCM_RIGHTS`, timerfd, netlink) with no libc. The one crate that lets the rest of the tree be `unsafe`-free. | + `bitflags`, `linux-raw-sys` |
 | `zerocopy` (+ `zerocopy-derive`) | wire | The wire format *is* `#[repr(C)]` layout: `U32<LittleEndian>`/`F32<LE>`/… give guaranteed little-endian fields, `Unaligned` lets a payload be decoded in place from any `&[u8]`, and `ref_from_bytes`/`as_bytes` replace the pointer casts we would otherwise write by hand. Validated, total, and `unsafe`-free in our tree. | +3 crates: `zerocopy`, `zerocopy-derive`, and **`syn` 2.x**. Note `drm` → `bytemuck_derive` pins `syn` **3.x**, so the two do *not* share a build: syn is compiled twice. Revisit if compile time hurts. |
 | `drm` (+ `drm-ffi`, `drm-sys`, `drm-fourcc`) | kms | Safe wrappers over the ~30 DRM/KMS ioctls (atomic commit, dumb buffers, AddFB2, properties, events). Hand-rolling them is precisely the `unsafe` we forbid. | pulls `bytemuck` + `bytemuck_derive` → `syn` (proc-macro, compile time). Revisit if it hurts. |
-| `signal-hook` (+ `signal-hook-registry`) | server, demo | SIGTERM/SIGINT → self-pipe without `unsafe` in our tree: `sigaction` and an async-signal-safe handler are exactly the shim we would otherwise have to write ourselves. `default-features = false` (no iterator/channel). The demo uses it so Ctrl-C prints its latency summary instead of killing the process mid-histogram. | + `libc` (already pulled by `libseat`). Only `low_level::pipe::register` is used. |
+| `signal-hook` (+ `signal-hook-registry`) | server, demo, session | SIGTERM/SIGINT → self-pipe without `unsafe` in our tree: `sigaction` and an async-signal-safe handler are exactly the shim we would otherwise have to write ourselves. `default-features = false` (no iterator/channel). The demo uses it so Ctrl-C prints its latency summary instead of killing the process mid-histogram. `nitro-session` uses it for the same reason the server does, and it is the crate's third consumer rather than a new dependency. | + `libc` (already pulled by `libseat`). Only `low_level::pipe::register` is used. |
 | `libseat` (+ `libseat-sys`) | seat | Bindings to the C libseat: one interface over logind / seatd / raw VT for DRM master + input fds without root. The single deliberate C dependency. | + `errno`, `libc`, `log`. `default-features = false`: the `custom_logger` feature builds a C shim (`cc`) to route libseat's log lines through `log`; we do not log. |
 | `input` (+ `input-sys`) | server | Bindings to libinput, which is the only sane way to read evdev: tap detection, pointer acceleration, scroll-source classification and touchpad state are thousands of lines of hard-won device quirks we are not going to re-derive. `default-features = false, features = ["libinput_1_21"]` — the `udev` feature is **off**, so `libudev` never enters the tree: the server finds devices by reading `/dev/input` and opens them through `nitro-seat`. | + `libc` (already there via `libseat`). The FFI `unsafe` lives in the dependency; `LibinputInterface` is a safe trait we implement. Input-device hotplug is M3: it needs the netlink uevent socket `nitro-kms` already has, plus a directory diff. |
 | `xkbcommon` | server | Keycode → keysym → UTF-8 with the user's own layout, dead keys, levels and modifier semantics. The alternative is shipping a keymap format and a compose engine, which is a project, not a dependency. It reads `XKB_DEFAULT_*`, so it honours whatever the user already configured. | + `xkeysym`, `memmap2`. The FFI `unsafe` (and the `mmap` of the keymap file) lives **inside the `xkbcommon` crate**, not in ours; our tree stays `unsafe`-free. |
@@ -107,6 +107,31 @@ argues the other half is a controlling terminal neither process has).
 `cargo tree -e normal --prefix none | sort -u | wc -l` is unchanged at
 **67** across the three of them.
 
+`nitro-session` (M3-E) adds **zero** too, and it is the one where the
+temptation was real. It is the "one place a D-Bus client is allowed"
+that `DESIGN.md` names — and it still does not speak D-Bus, because
+`zbus` is **~40 crates against a tree of 35** and `systemctl suspend`
+*is* a logind call with the same polkit check and the same inhibitor
+handling. What D-Bus would buy over a fork/exec is *events*
+(`PrepareForSleep`, `Lock`/`Unlock`, an inhibitor fd held across a
+suspend), and the one action that needs them — `lock` — is the one
+action M3 does not implement. So the permission is still unspent, and
+`crates/nitro-session/README.md` records what would spend it.
+
+The whole-workspace count with the session in is **70** lines and still
+**35 distinct external crate names** — the rise from 67 is three
+`(*)`/workspace lines, not three crates.
+
+The session is `rustix` + `nitro-wire` + `signal-hook`. Its spec allowed
+only the first two; `signal-hook` is the addition, and it adds no crate
+to the tree. The alternative inside `rustix` is
+`runtime::kernel_sigaction`, which is `unsafe`, `doc(hidden)` and
+documented as unusable in a process that has a libc — which this one
+does, transitively. Its logging module is a copy of the server's rather
+than a dependency on `nitro-server`, which would link libseat, libinput,
+xkbcommon and the whole compositor into the process whose job is to
+`fork`, `exec` and `poll`.
+
 The wallpaper is where a dependency would have been easiest to justify
 and was still refused: it reads images, and it reads **P6 PPM only**
 rather than linking a PNG or JPEG decoder. A decoder is a parser for
@@ -142,6 +167,7 @@ the syscall families it uses.
 | `nitro-hey` | `process` | `getuid` for the `/tmp` fallback of the app-socket directory |
 | `nitro-bar` | `time` | `clock_gettime` for the wall clock |
 | `nitro-launcher` | `process` (**dev only**) | `getpgrp`, in the one test that checks a launched process left the launcher's process group |
+| `nitro-session` | `event`, `process` | `poll` over the pidfds, the session socket and the signal pipe; `pidfd_open` so a child's exit is a descriptor rather than a timer tick, `kill_process_group` for teardown, `getuid` for the `/tmp` fallback of the socket path |
 
 ## `unsafe` exceptions
 

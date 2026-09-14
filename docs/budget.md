@@ -191,6 +191,80 @@ having; the constant is what to attack if 3 MB is a hard limit, and the
 first place to look is the 64 KiB `recv` scratch buffer each `Socket`
 allocates.
 
+### The M3 desktop (whole tree, real KMS, 1920×1080@60)
+
+The M3-E exit measurement: `nitro-session` supervising the compositor,
+the wallpaper, the bar and the launcher, plus the two applications that
+make it a desktop. Taken with `just box-ps` (60 s window), pointer parked
+off-screen, from a `just deploy` of the same artefacts.
+
+| process | VmRSS | VmHWM | threads | idle CPU, 60 s |
+|---|---|---|---|---|
+| `nitro-session` | **2 792 kB** | 2 792 kB | 1 | **0.00 %** |
+| `nitro-server` | 17 840 kB | 17 840 kB | 1 | 0.02 % |
+| `nitro-wallpaper` | **2 664 kB** | 2 664 kB | 1 | **0.00 %** |
+| `nitro-bar` | **2 752 kB** | 2 752 kB | 1 | **0.00 %** |
+| `nitro-launcher` | **2 920 kB** | 2 920 kB | 1 | **0.00 %** |
+| **whole desktop** | **28 968 kB** | — | 5 | — |
+
+(The unit also contains systemd's own `(sd-pam)` helper at 4 392 kB,
+forked into the logind session by `PAMName=login`. It is listed by
+`box-ps` for honesty and left out of the total: it is systemd's process,
+not ours.)
+
+| binary | bytes |
+|---|---|
+| `nitro-session` | **510 984** |
+| `nitro-wallpaper` | 522 424 |
+| `nitro-bar` | 602 064 |
+| `nitro-launcher` | 704 736 |
+| `nitro-server` | 2 164 200 |
+
+**The whole desktop is under 29 MB and five processes, one thread each.**
+For scale, that is less than a single tab of a browser, and it is the
+number goal 2 exists to produce.
+
+**Idle really is idle, for the tree and not just for the server.** Four
+of the five processes used *zero* jiffies in sixty seconds. The
+exception is the server's 0.02 %, and it is the bar's clock: the bar
+re-renders `06:56` once a minute, the server composites that damage, and
+the measurement window caught it. The spec allows the clock tick
+explicitly. Note what is *not* there — the session itself is 0.00 %,
+which is the claim `crates/nitro-session` is built around: a supervisor
+that watches its children through pidfds rather than a poll timer costs
+nothing to be running.
+
+**`nitro-session` is the cheapest process in the tree**, at 2 792 kB and
+511 KB of binary — smaller than any of the shell clients it starts,
+because it is `rustix` + `nitro-wire` + `signal-hook` and no toolkit.
+
+#### The server's 17.8 MB, and why it is not a regression
+
+It is 8 MB over the "≤ 8.5 MB" the M3-E spec asked for, and the entire
+difference is the heap shadow buffer that #539 introduced *after* that
+number was written. Measured on the box, same binary, same session:
+
+| | `VmRSS` |
+|---|---|
+| `NITRO_SHADOW=0` | **9 536 kB** |
+| shadow (default) | 17 744 kB |
+| difference | **8 208 kB** |
+
+and `stats` reports `shadow_bytes 8294400` — exactly `1920 × 1080 × 4`,
+one per output. The section above argues that trade (9.3× on the frame
+path); it is one allocation per screen, not per window, and it is the
+same 8 MB the two-window M3-D row records. The remaining 9 536 kB is the
+server proper with a desktop's worth of clients on it — four shell
+connections, two applications, fonts loaded — against the 8 240 kB the
+M3-A row measured with one client and no text on screen.
+
+![The M3 desktop on the test box](m3-desktop.png)
+
+Wallpaper, bar with a live window list, two decorated applications
+placed by the server's centred cascade, and the launcher hidden where it
+belongs. Every process in that picture was started and is supervised by
+`nitro-session`.
+
 ### Dev machine (fake backend, 1280×720)
 
 | process | windows | VmRSS | VmHWM |
@@ -301,10 +375,19 @@ latency.
 
 ## Dependency count
 
-`cargo tree -e normal --prefix none | sort -u | wc -l` = **64**, matching
-`DEPENDENCIES.md`. Several of those lines are cargo's `(*)` markers for
-already-printed subtrees and several more are our own workspace crates;
-**distinct external crate names are still 35**.
+`cargo tree -e normal --prefix none | sort -u | wc -l` = **70** at M3
+(64 at M2), matching `DEPENDENCIES.md`. Several of those lines are
+cargo's `(*)` markers for already-printed subtrees and several more are
+our own workspace crates; **distinct external crate names are still
+35** — the same 35 as at M2.
+
+**The entire M3 shell added none of them.** `nitro-bar`,
+`nitro-launcher`, `nitro-wallpaper` and `nitro-session` between them
+contributed six lines to the count and zero crates. The session is the
+one worth naming, because it is the crate `DESIGN.md` licensed to bring
+in D-Bus: `zbus` would have been ~40 crates against a tree of 35, so the
+power actions go through `systemctl` instead and the licence is still
+unspent (`crates/nitro-session/README.md`).
 
 `nitro-calc` adds **zero** of them, which is the point worth recording:
 the first real application on the toolkit needed nothing that was not

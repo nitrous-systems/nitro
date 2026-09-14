@@ -271,8 +271,31 @@ D-Bus client is allowed.
   (cached; `docs/ui.md`) — the first measurement to put a price on that
   decision, and the argument for making it async in M3. Numbers and
   method in `docs/budget.md`.
-- **M3** — Shell: bar, launcher, window management (focus, move, resize,
-  z-order), keyboard layouts, multi-output.
+- **M3** — **done.** Shell: bar, launcher, wallpaper, window management
+  (focus, move, resize, z-order), the privileged shell socket, and a
+  session that starts and supervises all of it. **The exit criterion is
+  a desktop on the test box**, and the measurement is the whole tree
+  rather than the compositor alone:
+
+  | | |
+  |---|---|
+  | processes / threads | **5 / 5** (session, server, wallpaper, bar, launcher), one thread each |
+  | whole-desktop RSS | **28 968 kB** |
+  | idle CPU over 60 s | **0.00 %** for four of five; 0.02 % on the server, which is the bar's once-a-minute clock |
+  | `nitro-session` | 2 792 kB RSS, **511 KB** binary, 0.00 % idle |
+  | `nitro-server` | 17 840 kB, of which **8 208 kB is #539's shadow buffer** (9 536 kB with `NITRO_SHADOW=0`) |
+  | bar killed → back | **1.11 s** (budget 2 s), and it re-reads the window list on its own |
+  | restart backoff, measured | 1 → 2 → 4 → 8 → 16 s, reset to 1 s by a 43.1 s run |
+  | 3 × VT round trip | same pids throughout; input still routes, Super still opens the launcher |
+  | `systemctl stop` | **0.49 s**, `Result=success`, exit 0, no processes left, tty1 back |
+
+  The acceptance run drove the real thing with `ydotool`: Super tap →
+  launcher → type `calc` → Enter → `nitro-calc` appears decorated;
+  `hello_dialog` beside it; a titlebar drag moved a window by −400,−158
+  against −400,−160 asked; a corner drag resized 223×334 → 454×508 with
+  the top-left pinned; `Alt+Tab` cycled MRU focus both ways. Numbers,
+  method and the picture are in `docs/budget.md` §"The M3 desktop".
+
   - **M3-A done.** Server-side window management: decorations (opt-out per
     window), server move/resize with zero client round-trips, focus and an
     MRU `Alt+Tab` cycle, `Normal`/`Maximized`/`Fullscreen`/`Minimized`
@@ -280,6 +303,43 @@ D-Bus client is allowed.
     work area, multi-output layout with per-output scale, output and
     input-device hotplug. The wire grew the `WM` capability bit and four ops
     behind it; v1's byte layout is unchanged. Model in `docs/wm.md`.
+  - **M3-B done.** The **shell socket**: a second `nitro-wire` listener
+    whose connections carry `caps::SHELL`. *The socket is the
+    capability* — a client is privileged because of where it connected,
+    not because of anything it sent — and the whole check is one `if`
+    against a token range. Layers, anchors, exclusive zones, keyboard
+    grabs, the global hotkey table and the Super-tap state machine.
+    `docs/shell.md`.
+  - **M3-C done.** `nitro-bar`: window list, clock, battery/load/memory,
+    on an exclusive zone the server subtracts from every other window's
+    work area.
+  - **M3-D done.** `nitro-launcher` (a Super-tap overlay that searches
+    `.desktop` files and spawns what you pick) and `nitro-wallpaper`
+    (the smallest possible shell client: one surface, painted once,
+    silent thereafter).
+  - **M3-E done.** `nitro-session`: starts the server, waits for it to
+    really answer, starts the shell, supervises it, and answers the
+    power actions on `$XDG_RUNTIME_DIR/nitro/session.sock`. A shell
+    piece that dies is restarted with backoff; the *server* exiting ends
+    the session with the server's code; `SIGTERM` tears down in reverse
+    order inside one deadline. Power actions go through `systemctl`
+    rather than D-Bus — `zbus` is ~40 crates against a tree of 35, and
+    `systemctl suspend` *is* a logind call. `lock` is the one action
+    that needs what only D-Bus provides (an inhibitor held across the
+    suspend, so a lock screen can paint first), and it is the one action
+    deferred to M4. Reasoning in `crates/nitro-session/README.md`.
+
+  Two user-visible defects were found by running the thing rather than
+  testing it, and both are worth recording because of *why* the tests
+  missed them. A launcher whose result rows had bounds, labels and
+  working clicks painted nothing (a clipping group sized `EMPTY`;
+  #3697), and the launcher was **on screen from boot** because its
+  start-up `hide()` returned early on a `visible` flag that was already
+  `false` — the flag and the server disagreed, and every test asked the
+  flag. Both now have pixel-level tests; the second one
+  (`the_launcher_is_not_on_screen_before_the_first_tap`) compares whole
+  screenshots, because the compositor's backdrop is a gradient and no
+  single colour is "the background".
 - **M4** — Terminal, settings (display/audio), file manager; remote view;
   phone build.
 - **M5** — Wayland adapter; GPU backend.
