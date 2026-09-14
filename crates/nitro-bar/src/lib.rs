@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! ┌──────────────────────────────────────────────────────────────────┐
-//! │ ☰  Calculator │ hello-dialog          09:41          87%+ 0.42 1.2/3.3G │
+//! │ ☰  Calculator │ hello-dialog          09:41          87%+ 0.4 1.2/3.3G │
 //! └──────────────────────────────────────────────────────────────────┘
 //!    launcher  ── windows ──            clock        battery load  mem
 //! ```
@@ -36,10 +36,20 @@
 //! * the clock's timer is **aligned to the minute boundary**, so it fires
 //!   at :00 rather than every second to check whether the minute rolled
 //!   over ([`clock::ms_to_next_minute`]);
-//! * the sensors poll every 5 s but write to the tree **only when the
-//!   formatted string differs** — and a `Label`'s setter returns early on
-//!   an unchanged string, so an unchanged reading costs no mutation, no
-//!   commit and no wakeup beyond the timer itself.
+//! * the sensors poll every 30 s and write to the tree **only when the
+//!   formatted string differs** — the poll's [`Readings`] are compared
+//!   against the last ones before the tree is touched at all, so an
+//!   unchanged reading costs no mutation, no commit and no wakeup beyond
+//!   the timer itself.
+//!
+//! The sensors' half of that is a rule, not an accident: **a sensor may
+//! only repaint when its *rendered* string changes, and no sensor renders
+//! more often than every 30 s**. Both halves are needed. The load average
+//! moves on almost every read — 0.17, 0.23, 0.21 — so rendering it
+//! verbatim at 5 s flipped the display six times per ten idle seconds on
+//! a box whose CPU was doing nothing; one decimal ([`sensors::format_load`])
+//! turns most of that motion back into the same string, and 30 s caps
+//! what is left at two repaints a minute.
 //!
 //! `a_settled_bar_is_silent_between_clock_ticks` in `tests/bar.rs`
 //! asserts it from the outside, by counting commits over a window in
@@ -79,12 +89,22 @@ pub const APP_NAME: &str = "nitro-bar";
 /// `NITRO_BAR_HEIGHT`.
 pub const DEFAULT_HEIGHT: f32 = 32.0;
 
-/// How often the battery, load and memory readouts are re-read.
+/// How often the battery, load and memory readouts are re-read, and so
+/// the fastest any of them can repaint.
 ///
-/// Five seconds is the spec's number and a defensible one: these are
-/// three small virtual files, and a user reading a load average does not
-/// need it fresher than the kernel's own 1-minute smoothing.
-pub const POLL_MS: u64 = 5_000;
+/// Thirty seconds, not the spec's five. Reading the files is free; what
+/// is not free is what a *changed* reading costs — a `SetText`, a commit
+/// and a server-side repaint of that label's region. The load average
+/// changes on nearly every read, so a 5 s poll repainted the bar six
+/// times per ten seconds on an idle desktop: motion the user did not ask
+/// for, in the widget least worth watching, and the thing that would
+/// defeat panel self-refresh later.
+///
+/// Thirty seconds also loses nothing real: the kernel's own 1-minute
+/// smoothing means a load average read twice a minute is as fresh as the
+/// number can be, and memory in tenths of a GiB does not move faster than
+/// that either.
+pub const POLL_MS: u64 = 30_000;
 
 /// Font size of the bar's text. Smaller than the toolkit default, because
 /// a 32 px strip has to fit a line of text with air around it.
@@ -205,8 +225,10 @@ pub struct Bar {
     /// Where the readouts come from; the real `/proc` and `/sys` outside
     /// the tests. See [`SensorSource`].
     source: SensorSource,
-    /// The last readings pushed into the three labels, so a poll that
-    /// finds the same numbers can be seen to have changed nothing.
+    /// The last readings pushed into the three labels. Load-bearing:
+    /// [`poll_sensors`] compares against it and leaves the tree alone
+    /// when nothing moved, so "an unchanged poll costs nothing" is
+    /// visible here rather than resting on a setter in another crate.
     last: Readings,
 }
 
@@ -503,7 +525,7 @@ pub fn build(ui: &mut Ui<Bar>) -> WidgetId {
 ///
 /// Everything the bar *does* is registered here, and all of it is
 /// event-driven: a subscription rather than a poll for the window list, a
-/// minute-aligned timer for the clock, and a 5 s timer for the sensors
+/// minute-aligned timer for the clock, and a 30 s timer for the sensors
 /// that writes to the tree only when a string actually changed.
 fn install(ui: &mut Ui<Bar>, ids: Ids) {
     ui.on_shell(
@@ -531,7 +553,7 @@ fn install(ui: &mut Ui<Bar>, ids: Ids) {
     }
 
     tick_clock(ui, ids);
-    arm_sensors(ui, ids, true);
+    arm_first_sensor_poll(ui, ids);
 }
 
 /// The label a window-list button shows: the window's label, with a
@@ -619,6 +641,11 @@ fn upsert(s: &mut Bar, ui: &mut Ui<Bar>, ids: Ids, info: &WindowInfo) {
             }),
     );
     if ui.attach(ids.windows, id).is_err() {
+        // Unreachable while `ids.windows` outlives the tree, which it
+        // does — but a button left in the arena with no parent and
+        // nothing pointing at it would be a leak that never announced
+        // itself. The widget is dropped on the way out.
+        let _ = ui.remove(id);
         return;
     }
     s.entries.push(Entry {
@@ -683,19 +710,15 @@ fn apply_clock(s: &mut Bar, ui: &mut Ui<Bar>, ids: Ids) {
     });
 }
 
-/// Arm the sensor poll.
+/// Arm the **first** sensor poll, which is immediate: a bar that came up
+/// with three blank readouts for half a minute would look broken.
 ///
-/// The first poll is immediate — a bar that came up with three blank
-/// readouts for five seconds would look broken — and the interval comes
-/// from the state so a test can shorten it.
-fn arm_sensors(ui: &mut Ui<Bar>, ids: Ids, first: bool) {
-    if first {
-        ui.set_timer(0, move |s: &mut Bar, ui: &mut Ui<Bar>| {
-            poll_sensors(s, ui, ids);
-        });
-        return;
-    }
-    ui.set_timer(POLL_MS, move |s: &mut Bar, ui: &mut Ui<Bar>| {
+/// Every later poll is re-armed from inside [`poll_sensors`] itself,
+/// where `s.poll_ms` is reachable — so a test that shortens the interval
+/// is obeyed from the next poll on, and there is no second arming path
+/// reading the [`POLL_MS`] constant behind the state's back.
+fn arm_first_sensor_poll(ui: &mut Ui<Bar>, ids: Ids) {
+    ui.set_timer(0, move |s: &mut Bar, ui: &mut Ui<Bar>| {
         poll_sensors(s, ui, ids);
     });
 }
@@ -703,25 +726,30 @@ fn arm_sensors(ui: &mut Ui<Bar>, ids: Ids, first: bool) {
 /// Re-read the three sensors and push whatever changed.
 ///
 /// The readings are compared as **strings**, not as numbers: the string
-/// is what is drawn, so two loads that round to `0.42` are the same
-/// reading as far as the bar is concerned, and a `Label`'s setter returns
-/// early on an unchanged string. That is the whole reason a 5 s poll
-/// costs nothing on the wire — the poll happens, the tree does not move,
-/// and `flush` sends no commit.
+/// is what is drawn, so two loads that both render `0.4` are the same
+/// reading as far as the bar is concerned. The comparison happens *here*,
+/// against [`Bar::last`], before the tree is touched at all — a `Label`'s
+/// setter also returns early on an unchanged string, but that is a second
+/// line of defence in another crate, and the bar's own claim should be
+/// legible in the bar's own code. That is the whole reason a poll costs
+/// nothing on the wire: the poll happens, the tree does not move, and
+/// `flush` sends no commit.
 fn poll_sensors(s: &mut Bar, ui: &mut Ui<Bar>, ids: Ids) {
     let now = (s.source)();
-    for (id, reading) in [
-        (ids.battery, &now.battery),
-        (ids.load, &now.load),
-        (ids.mem, &now.mem),
-    ] {
-        let text = reading.clone().unwrap_or_default();
-        if let Ok(mut l) = ui.widget_mut::<Label>(id) {
-            l.set_text(text);
-        }
-    }
-    s.last = now;
     s.polls += 1;
+    if now != s.last {
+        for (id, reading) in [
+            (ids.battery, &now.battery),
+            (ids.load, &now.load),
+            (ids.mem, &now.mem),
+        ] {
+            let text = reading.clone().unwrap_or_default();
+            if let Ok(mut l) = ui.widget_mut::<Label>(id) {
+                l.set_text(text);
+            }
+        }
+        s.last = now;
+    }
     // Re-armed from inside the callback with the *current* interval, so a
     // test that shortens it is obeyed from the next poll on.
     let ms = s.poll_ms;

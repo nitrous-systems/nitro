@@ -1322,6 +1322,28 @@ impl<S: 'static> Ui<S> {
         self.surface
     }
 
+    /// Whether a widget that takes focus when it is clicked should be
+    /// allowed to.
+    ///
+    /// False in a `NO_FOCUS` window — a bar, a dock, a wallpaper, a
+    /// launcher overlay. Such a window never receives a key, so toolkit
+    /// focus inside it buys nothing and costs something visible: the
+    /// clicked button keeps a focus ring afterwards, and `hey … list`
+    /// reports it `focused`, which is a lie about a surface the server
+    /// will not focus. The click still *acts* — this suppresses the
+    /// focus, not the activation.
+    ///
+    /// It gates [`EventCx::request_focus`](crate::EventCx::request_focus)
+    /// only, which is how a widget asks for focus from inside its own
+    /// event handling. [`Ui::focus`] is unchanged and deliberate: the
+    /// launcher is `NO_FOCUS` and still focuses its query field, because
+    /// it reads the keyboard through a grab rather than through focus.
+    #[must_use]
+    pub fn click_takes_focus(&self) -> bool {
+        self.surface
+            .is_none_or(|s| s.flags & nitro_wire::types::window_flags::NO_FOCUS == 0)
+    }
+
     /// Whether this connection may send the shell ops, i.e. whether it
     /// arrived on `shell.sock`.
     ///
@@ -2545,8 +2567,16 @@ impl<S: 'static> Ui<S> {
     /// the relative order of the timers and fires exactly the ones that
     /// the elapsed time would have.
     pub fn advance_timers(&mut self, by: Duration) {
+        // Saturating, because `Instant` arithmetic panics on underflow and
+        // this is a public test-support API: fast-forwarding an hour on a
+        // process that has been up for a minute means "fire everything",
+        // not "abort". A saturated deadline is `now`, which is due on the
+        // next `run_timers` — exactly what the elapsed time would have
+        // done, and the relative order of the timers that did *not*
+        // saturate is untouched.
+        let floor = Instant::now();
         for t in &mut self.timers {
-            t.deadline -= by;
+            t.deadline = t.deadline.checked_sub(by).unwrap_or(floor);
         }
     }
 

@@ -1193,3 +1193,112 @@ fn a_measurement_taken_while_handling_an_event_keeps_the_other_messages() {
     assert_eq!(h.state().keys, 2, "no keystroke was dropped");
     h.quit();
 }
+
+#[test]
+fn a_click_in_a_no_focus_window_activates_without_taking_focus() {
+    // Every shell surface is `NO_FOCUS`, and the server will never route
+    // a key to one. So the focus a button takes on click buys nothing
+    // there and costs something visible: a focus ring on whatever was
+    // last clicked, and `hey … list` reporting it `focused` — a lie about
+    // a window that cannot be focused.
+    //
+    // The claim is precisely "activates without focusing": the callback
+    // still runs, and only the focus move is dropped.
+    let mut h = Harness::shell(
+        "nofocus-bar",
+        0u32,
+        nitro_ui::shell::Surface::bar(32),
+        Some(Size::new(320.0, 32.0)),
+        |ui: &mut Ui<u32>| {
+            let b = ui.build(
+                button("press")
+                    .name("press")
+                    .on_click(|s: &mut u32, _ui: &mut Ui<u32>| *s += 1),
+            );
+            let root = ui.build(row().padding(4.0));
+            ui.attach(root, b).unwrap();
+            root
+        },
+    );
+    h.settle();
+    let root = h.ui().root().unwrap();
+    let b = h.ui().children(root)[0];
+
+    h.click(b);
+    h.settle();
+    assert_eq!(*h.state(), 1, "the click still ran the callback");
+    assert_eq!(h.ui().focused(), None, "and took no focus");
+    assert!(!h.ui().is_focused(b));
+
+    // What a script sees, which is where this was reported from: the
+    // button must not come back `focused` in the introspection listing.
+    let props = nitro_ui::introspect::get_prop(h.ui(), "window/press", "focused")
+        .expect("the button is addressable");
+    assert_eq!(props, "false", "hey would report a focus ring");
+
+    // The suppression is about focus a *click* takes on the user's
+    // behalf. An app that places focus deliberately still can — the
+    // launcher is NO_FOCUS and focuses its query field, because it reads
+    // the keyboard through a grab rather than through focus.
+    h.ui().focus(b);
+    h.settle();
+    assert_eq!(
+        h.ui().focused(),
+        Some(b),
+        "Ui::focus is not gated, only request_focus"
+    );
+    h.quit();
+}
+
+#[test]
+fn a_click_in_an_ordinary_window_still_takes_focus() {
+    // The other side of the rule, so the gate cannot be "no widget ever
+    // focuses on click" by accident: the same tree in an ordinary window
+    // focuses exactly as before.
+    let mut h = Harness::sized(
+        "focusable-app",
+        0u32,
+        Size::new(200.0, 60.0),
+        |ui: &mut Ui<u32>| {
+            let b = ui.build(button("press").on_click(|s: &mut u32, _ui: &mut Ui<u32>| *s += 1));
+            let root = ui.build(row().padding(4.0));
+            ui.attach(root, b).unwrap();
+            root
+        },
+    );
+    h.settle();
+    let root = h.ui().root().unwrap();
+    let b = h.ui().children(root)[0];
+    h.click(b);
+    h.settle();
+    assert_eq!(*h.state(), 1);
+    assert_eq!(
+        h.ui().focused(),
+        Some(b),
+        "an ordinary window focuses on click"
+    );
+    h.quit();
+}
+
+#[test]
+fn advancing_the_timers_past_the_clock_origin_saturates_rather_than_panicking() {
+    // `advance_timers` is public test support, and `Instant` arithmetic
+    // panics on underflow: a caller fast-forwarding a year on a process
+    // that has been up for a second means "fire everything", not "abort".
+    let mut h = Harness::sized(
+        "saturate",
+        0u32,
+        Size::new(120.0, 40.0),
+        |ui: &mut Ui<u32>| {
+            ui.set_timer(60_000, |s: &mut u32, _ui: &mut Ui<u32>| *s += 1);
+            ui.build(panel())
+        },
+    );
+    h.settle();
+    assert_eq!(*h.state(), 0, "not due yet");
+
+    h.advance_timers(60 * 60 * 24 * 365 * 1000);
+    h.run_timers();
+    assert_eq!(*h.state(), 1, "a saturated deadline is simply due");
+    h.quit();
+}

@@ -595,6 +595,25 @@ window that existed without one would appear in a bar as an anonymous
 row — and the bar could not recognise and skip its own window, which is
 exactly the bug the first version of it had.
 
+**A click in a `NO_FOCUS` window acts without focusing.** Every shell
+surface is `NO_FOCUS` — a bar, a dock, a launcher overlay, a wallpaper —
+and the server will never route a key to one. Toolkit focus inside such
+a window therefore buys nothing and costs something visible: the clicked
+button keeps its focus ring, and `hey nitro-bar list` reported a
+window-list entry as `focused,hovered` after a click, which is a lie
+about a surface that cannot be focused. So `EventCx::request_focus` — how
+a widget asks for focus from inside its own event handling, and the
+reason clicking a button focuses it at all — is a **no-op** when the
+window's flags carry `NO_FOCUS`. The click still activates the widget;
+only the focus move is dropped. `Ui::click_takes_focus` is the predicate,
+and widget code needs no `if` for it.
+
+`Ui::focus` itself is *not* gated, deliberately: the launcher is
+`NO_FOCUS` and still focuses its query field, because it reads the
+keyboard through a grab rather than through focus, and a toolkit that
+refused would have broken it. The rule is about focus a *click* takes on
+the user's behalf, not about focus an app places on purpose.
+
 ## Writing a widget
 
 A widget is a plain struct with a `Widget<S>` impl. Every method has a
@@ -708,7 +727,9 @@ a fatal protocol error, so this is not a convenience but the only way in.
 Timers are part of what the harness runs, because they are part of what
 the app loop runs: `settle` and `assert_idle` both fire due timers, so a
 test sees the tree the real app has rather than one whose clock never
-ticks. `advance_timers(ms)` fast-forwards every pending deadline. That
+ticks. `advance_timers(ms)` fast-forwards every pending deadline (it
+saturates rather than panicking on an `Instant` underflow, so an
+over-large fast-forward means "fire everything"). That
 last one exists because a timer's deadline is an `Instant` from the
 **monotonic** clock, which no amount of faking an app's *wall* clock
 moves — so a test of a minute-aligned tick would otherwise have to wait a

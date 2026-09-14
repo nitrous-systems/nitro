@@ -5,7 +5,7 @@ The desktop's **top bar**, and the first program written against the
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────┐
-│ ☰  ▸ Calculator │ hello-dialog      09:41        87%+  0.42  1.2/3.3G  │
+│ ☰  ▸ Calculator │ hello-dialog      09:41        87%+  0.4   1.2/3.3G  │
 └────────────────────────────────────────────────────────────────────────┘
   launcher   ─── window list ───      clock       battery load  memory
 ```
@@ -35,7 +35,7 @@ reserves). `NITRO_SHELL_SOCKET` overrides the socket path.
 | window list | `windows` | one button per window: click focuses, **middle-click closes** |
 | clock | `clock` | local `HH:MM`, one update per minute |
 | battery | `battery` | `/sys/class/power_supply/*`, e.g. `87%+` |
-| load | `load` | the 1-minute average from `/proc/loadavg` |
+| load | `load` | the 1-minute average from `/proc/loadavg`, one decimal |
 | memory | `mem` | used/total from `/proc/meminfo`, e.g. `1.2/3.3G` |
 
 The window list is **subscribed, not polled**: `WindowList` is answered
@@ -60,15 +60,49 @@ clock ticks**, and the clock ticks once a minute. Three mechanisms:
   from inside its own callback, so it fires at `:00` rather than every
   second to check whether the minute rolled over — and it cannot drift,
   because the interval is recomputed each time;
-* the sensors are polled every 5 s but written to the tree **only when
-  the formatted string differs**. A `Label`'s setter returns early on an
-  unchanged string, so an unchanged reading costs no mutation and no
-  commit.
+* the sensors are polled every 30 s and the poll's readings are compared
+  against the last ones **before the tree is touched at all**, so an
+  unchanged reading costs no mutation and no commit. (A `Label`'s setter
+  also returns early on an unchanged string; that is a second line of
+  defence, not the mechanism.)
 
-`a_settled_bar_is_silent_while_nothing_changes` asserts that from the
-outside, over a window containing a dozen sensor polls, and
-`a_sensor_that_changes_costs_one_set_text` asserts the other half: when a
-reading does change, it costs exactly one `SetText`.
+### The sensor rule
+
+> A sensor may only repaint when its **rendered** string changes, and no
+> sensor renders more often than every **30 s**.
+
+Both halves are load-bearing, and the second one was learned the
+expensive way. At the 5 s poll the spec asked for, with the load average
+rendered verbatim as the kernel's `%.2f`, an idle desktop painted **six
+frames per ten seconds**: the load moved 0.17 → 0.23 → 0.21 while the CPU
+did nothing, and every one of those was a `SetText`, a commit and a
+server-side repaint of the label's region. Work proportional to change is
+the right rule only when the change is one the user asked for.
+
+So the load is rendered with **one decimal** (`0.17`, `0.23` and `0.21`
+all become `0.2`) and every sensor polls at **30 s** — battery, load and
+memory alike. Rounding narrows the noise rather than abolishing it — two
+readings either side of a boundary still differ — which is why the 30 s
+cap is the other half rather than a belt-and-braces addition. Nothing
+real is lost either way: the kernel smooths the load average over a
+minute, so twice a minute is as fresh as that number can be, and memory
+in tenths of a GiB does not move faster. Together the two halves cap an
+idle bar at what the clock costs, and leave the door open to panel
+self-refresh, which a display flipping twice every ten seconds would
+defeat.
+
+The clock is **not** on that 30 s budget: it is minute-aligned, so it
+repaints at `:00` and at no other time.
+
+`a_settled_bar_is_silent_while_nothing_changes` asserts the first half
+from the outside, over a window containing a dozen sensor polls;
+`a_poll_that_finds_the_same_readings_does_not_touch_the_tree` asserts the
+mechanism rather than the symptom; `a_sensor_that_changes_costs_one_set_text`
+asserts that a reading which *does* change costs exactly one `SetText`;
+and `the_sensors_render_no_more_often_than_every_thirty_seconds` pins the
+interval, which the idle test cannot see because it shortens it to 20 ms.
+The rendering half is `sensors.rs`'s own
+`the_second_decimal_of_the_load_is_dropped_rather_than_drawn`.
 
 ## Driving it with `hey`
 
@@ -78,7 +112,7 @@ talking to the introspection socket every nitro app opens.
 ```console
 $ hey nitro-bar list                       # the whole bar, one line per widget
 $ hey nitro-bar get clock value            # 09:41
-$ hey nitro-bar get load value             # 0.42
+$ hey nitro-bar get load value             # 0.4
 $ hey nitro-bar do launcher click
 $ hey nitro-bar do windows/win3 click      # focus window 3
 $ hey nitro-bar do windows/win3 alt_click  # ask it to close
@@ -88,6 +122,12 @@ Window-list entries are named `win<N>` after the server's own
 `WindowRef`, which is never reused — so the path a script holds names the
 same window for that window's whole life, and a stale one resolves to
 nothing rather than to somebody else's window.
+
+A clicked entry is **not** left `focused` in that listing. The bar's
+window is `NO_FOCUS`, so the toolkit suppresses the focus a button takes
+on click: the click still focuses the *window it names*, but nothing in
+the bar draws a focus ring for a surface the server will never give keys
+to. `docs/ui.md` §Shell surfaces has the toolkit half.
 
 ## One bar, on the primary output
 
@@ -129,6 +169,10 @@ rather than an empty button nothing can be clicked on.
 text and **thin readers** that only open the file. That split is what
 makes the parsers testable: a test that needed a real battery would only
 ever run on somebody's laptop.
+
+Every formatter **quantises** — the load to one decimal, memory to tenths
+of a GiB, the battery to whole percent — because a readout is rendered no
+finer than it is worth repainting for. See the sensor rule above.
 
 Every reading is `Option<String>`, and `None` means *leave the widget
 empty* rather than draw a zero. A bar that said `0%` on a desktop would

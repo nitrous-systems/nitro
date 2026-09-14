@@ -646,7 +646,21 @@ impl<S: 'static> EventCx<'_, S> {
     }
 
     /// Give this widget the keyboard focus.
+    ///
+    /// **Ignored in a `NO_FOCUS` window** — a bar, a dock, a launcher
+    /// overlay, a wallpaper. That window never receives a key, so focus
+    /// inside it buys nothing and costs a focus ring on whatever was last
+    /// clicked, plus a `focused` flag in `hey … list` that is a lie about
+    /// a surface the server will not focus. A click still activates the
+    /// widget; only the focus move is dropped. See
+    /// [`Ui::click_takes_focus`](crate::Ui::click_takes_focus), and use
+    /// [`Ui::focus`](crate::Ui::focus) directly for the deliberate case
+    /// (the launcher's query field, which reads the keyboard through a
+    /// grab).
     pub fn request_focus(&mut self) {
+        if !self.ui.click_takes_focus() {
+            return;
+        }
         self.ui.focus(self.id);
     }
 

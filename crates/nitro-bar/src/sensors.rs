@@ -23,9 +23,20 @@
 //! `None`, and none of them panic.
 //!
 //! Reading is `std`-only (`std::fs::read_to_string` plus `read_dir`). These
-//! are small virtual files polled once every five seconds, so the blocking
-//! read and the `String` allocation are free at this rate, and staying off
-//! the kernel-ABI crates keeps the bar's dependency list honest.
+//! are small virtual files polled once every thirty seconds, so the
+//! blocking read and the `String` allocation are free at this rate, and
+//! staying off the kernel-ABI crates keeps the bar's dependency list
+//! honest.
+//!
+//! # A readout is rendered no finer than it is worth repainting
+//!
+//! Every formatter here quantises: the load to one decimal, memory to
+//! tenths of a GiB, the battery to whole percent. That is not about
+//! screen width — it is the bar's repaint discipline, since a label
+//! repaints exactly when its *rendered* string changes. A load average
+//! rendered as the kernel's own `%.2f` changes on nearly every read, so
+//! it repainted the bar six times per ten idle seconds to report noise.
+//! See `crates/nitro-bar/README.md` §"Idle costs nothing".
 
 use std::fs;
 use std::num::NonZeroU64;
@@ -86,7 +97,7 @@ pub fn battery() -> Option<String> {
     None
 }
 
-/// The 1-minute CPU load average, e.g. `"0.42"`.
+/// The 1-minute CPU load average, e.g. `"0.4"`.
 ///
 /// `None` if `/proc/loadavg` is unreadable or does not start with a number.
 #[must_use]
@@ -115,22 +126,40 @@ fn read_field(dir: &Path, name: &str) -> Option<String> {
     }
 }
 
-/// Format the contents of `/proc/loadavg`: the 1-minute average, e.g. `"0.42"`.
+/// Format the contents of `/proc/loadavg`: the 1-minute average rounded
+/// to **one decimal**, e.g. `"0.4"`.
 ///
-/// The field is passed through *verbatim* rather than parsed to a float and
-/// re-printed: the kernel already writes it as `%.2f`, so reprinting can
-/// only lose information (`1.00` would come back as `1`) and would make the
-/// readout's width depend on float formatting.
+/// The kernel writes the field as `%.2f`, and the bar used to pass it
+/// through verbatim. That was the honest rendering of the number and the
+/// wrong rendering for a panel: the second decimal is noise on an idle
+/// machine (0.17 → 0.23 → 0.21 between polls), so the label repainted on
+/// nearly every poll to tell the user nothing. One decimal renders all
+/// three of those as `0.2` — which is what makes "a sensor only repaints
+/// when its rendered string changes" worth anything in practice.
+///
+/// It narrows the noise rather than abolishing it: two readings either
+/// side of a boundary still differ. The other half of the rule — no
+/// sensor renders more often than every [`POLL_MS`](crate::POLL_MS) — is
+/// what caps what is left.
+///
+/// The field is still *validated* as a plain decimal before it is
+/// parsed, so a garbage or truncated file yields `None` rather than
+/// something drawn on the bar; and a non-finite result (an absurdly long
+/// digit string) is `None` too, because `inf` is not a load average.
 #[must_use]
 pub fn format_load(loadavg: &str) -> Option<String> {
     let field = loadavg.split_whitespace().next()?;
-    // Verbatim pass-through still has to be *validated*, or a garbage or
-    // truncated file would end up drawn on the bar as-is.
-    if is_decimal(field) {
-        Some(field.to_owned())
-    } else {
-        None
+    // Validated before parsing, not after: `parse::<f64>` accepts `inf`,
+    // `NaN`, `1e3` and a leading sign, none of which `/proc/loadavg`
+    // writes and none of which should reach the bar.
+    if !is_decimal(field) {
+        return None;
     }
+    let value = field.parse::<f64>().ok()?;
+    if !value.is_finite() {
+        return None;
+    }
+    Some(format!("{value:.1}"))
 }
 
 /// Format the contents of `/proc/meminfo` as used/total, e.g. `"1.2/3.3G"`.
@@ -275,25 +304,49 @@ Active:          1122304 kB
     const LOADAVG: &str = "0.42 0.31 0.28 2/412 30518\n";
 
     #[test]
-    fn a_loadavg_line_yields_its_first_field_verbatim() {
-        assert_eq!(format_load(LOADAVG).as_deref(), Some("0.42"));
+    fn a_loadavg_line_yields_its_first_field_at_one_decimal() {
+        assert_eq!(format_load(LOADAVG).as_deref(), Some("0.4"));
     }
 
     #[test]
-    fn a_whole_load_keeps_its_trailing_zeroes() {
-        // The point of passing the field through: re-printing a parsed
-        // float would render this as "1".
+    fn the_second_decimal_of_the_load_is_dropped_rather_than_drawn() {
+        // The point of rounding. These four are consecutive reads on an
+        // idle box — four different strings at the kernel's own `%.2f`,
+        // and so four repaints — which one decimal collapses to one.
+        for line in [
+            "0.17 0.31 0.28\n",
+            "0.23 0.31 0.28\n",
+            "0.21 0.31 0.28\n",
+            "0.18 0.31 0.28\n",
+        ] {
+            assert_eq!(format_load(line).as_deref(), Some("0.2"), "{line:?}");
+        }
+        // Rounding narrows the noise; it does not abolish it, and
+        // claiming otherwise would be the wrong reason to believe the
+        // idle contract. A reading either side of a boundary still moves
+        // the string — which is why the other half of the rule is that no
+        // sensor renders more often than every 30 s.
+        assert_eq!(format_load("0.26 0.31 0.28\n").as_deref(), Some("0.3"));
+    }
+
+    #[test]
+    fn a_whole_load_keeps_its_decimal() {
+        // One decimal is a *fixed* width, so a whole number is `1.0`
+        // rather than `1`: a readout that changed width as the load
+        // crossed an integer would shuffle the bar's right-hand section.
         assert_eq!(
             format_load("1.00 0.98 0.71 1/400 9\n").as_deref(),
-            Some("1.00")
+            Some("1.0")
         );
     }
 
     #[test]
-    fn a_load_above_ten_is_still_just_the_field() {
+    fn a_load_above_ten_keeps_all_of_its_integer_part() {
+        // Rounding is of the *fraction*: a busy machine is the one case
+        // where the number matters, and `13.4` must not become `13`.
         assert_eq!(
             format_load("13.37 9.00 4.20 8/500 1\n").as_deref(),
-            Some("13.37")
+            Some("13.4")
         );
     }
 
@@ -310,13 +363,14 @@ Active:          1122304 kB
         assert_eq!(format_load("-0.42 0.31 0.28\n"), None);
         assert_eq!(format_load("1e3 0.31 0.28\n"), None);
         assert_eq!(format_load("NaN 0.31 0.28\n"), None);
+        assert_eq!(format_load("inf 0.31 0.28\n"), None);
     }
 
     #[test]
     fn a_loadavg_truncated_mid_line_still_yields_the_first_field() {
         // A partial read is a real possibility and the first field, once
         // followed by a space, is complete.
-        assert_eq!(format_load("0.42 0.3").as_deref(), Some("0.42"));
+        assert_eq!(format_load("0.42 0.3").as_deref(), Some("0.4"));
     }
 
     #[test]

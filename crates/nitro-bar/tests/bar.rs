@@ -306,6 +306,20 @@ fn clicking_a_window_list_button_focuses_that_window() {
         h.state().focused_window() == Some(first)
     });
 
+    // And the button itself is **not** left focused. The bar's window is
+    // `NO_FOCUS`, so a click acts without taking toolkit focus: a focus
+    // ring on a surface the server will never give keys to is a lie, and
+    // this is exactly what `hey nitro-bar list` reported as
+    // `focused,hovered` before the toolkit gate. The path asserted here
+    // is the one a script reads.
+    let path = format!("window/{}/{}", names::WINDOWS, nitro_bar::entry_name(first));
+    assert_eq!(
+        nitro_ui::introspect::get_prop(h.ui(), &path, "focused").as_deref(),
+        Ok("false"),
+        "a clicked window-list button must not show a focus ring"
+    );
+    assert_eq!(h.ui().focused(), None, "nothing in the bar took focus");
+
     drop((a, b));
     h.quit();
 }
@@ -402,20 +416,29 @@ fn the_clock_updates_exactly_once_at_the_minute_boundary() {
 fn a_settled_bar_is_silent_while_nothing_changes() {
     // The contract: with nothing changing, zero wire traffic between
     // clock ticks — even though the sensors are polled throughout. The
-    // poll happens, the strings do not change, and an unchanged `Label`
-    // sends nothing.
+    // poll happens, the readings match the last ones, and the tree is
+    // never touched.
     //
     // The fake clock is pinned inside a minute, so no tick is due; the
     // sensors are polled every 20 ms so that 300 ms of "idle" contains a
-    // dozen polls; and the readings are **fixed**, because the claim
-    // under test is "a poll that finds the same numbers costs nothing".
-    // Polling the real `/proc` would be asserting that this machine's
-    // load average held still for 300 ms, which is neither the claim nor
-    // reliably true — it is what made an earlier version of this test
-    // fail about one run in six.
+    // dozen polls (the real interval is 30 s — see the README's sensor
+    // rule — and a test cannot spend half a minute per poll); and the
+    // readings are **fixed**, because the claim under test is "a poll
+    // that finds the same numbers costs nothing". Polling the real
+    // `/proc` would be asserting that this machine's load average held
+    // still for 300 ms, which is neither the claim nor reliably true — it
+    // is what made an earlier version of this test fail about one run in
+    // six.
+    //
+    // That is only half the rule. The other half — no sensor *renders*
+    // more often than every 30 s, so what a real `/proc` does between
+    // polls cannot reach the screen more than twice a minute — is
+    // `POLL_MS` itself, and
+    // `the_sensors_render_no_more_often_than_every_thirty_seconds`
+    // asserts it.
     let readings = nitro_bar::Readings {
         battery: Some("87%".to_owned()),
-        load: Some("0.42".to_owned()),
+        load: Some("0.4".to_owned()),
         mem: Some("1.2/3.3G".to_owned()),
     };
     let mut h = bar(Bar::new()
@@ -426,7 +449,7 @@ fn a_settled_bar_is_silent_while_nothing_changes() {
     let polls = h.state().polls();
     // The readings really are on screen, so what follows is "unchanged",
     // not "never arrived".
-    assert_eq!(label_text(&mut h, names::LOAD), "0.42");
+    assert_eq!(label_text(&mut h, names::LOAD), "0.4");
     assert_eq!(label_text(&mut h, names::MEM), "1.2/3.3G");
     assert_eq!(label_text(&mut h, names::BATTERY), "87%");
 
@@ -533,6 +556,86 @@ fn the_bar_paints_across_its_whole_output() {
         (h.ui().window_size().h - BAR_H).abs() < 1.0,
         "and kept the bar's height: {:?}",
         h.ui().window_size()
+    );
+    h.quit();
+}
+
+#[test]
+fn the_sensors_render_no_more_often_than_every_thirty_seconds() {
+    // The second half of the bar's sensor rule, and the half the idle
+    // test above cannot see: it shortens the interval to 20 ms so that
+    // 300 ms contains a dozen polls, which means nothing in it would
+    // notice the shipped interval going back to 5 s.
+    //
+    // 30 s, not 5, because the load average moves on nearly every read —
+    // an idle box measured six painted frames per ten seconds, all of
+    // them the load label flipping between values the user did not ask
+    // for. With a minute-aligned clock, a 30 s cap is the coarsest budget
+    // that still lets a reading appear within a clock tick of its change.
+    assert_eq!(
+        nitro_bar::POLL_MS,
+        30_000,
+        "no sensor may render more often than every 30 s"
+    );
+
+    // And the shipped interval is the one a bar that was not configured
+    // by a test actually arms, rather than a constant nothing reads.
+    let mut h = harness();
+    h.settle();
+    let polls = h.state().polls();
+    assert_eq!(
+        polls, 1,
+        "the first poll is immediate, so the bar is never blank"
+    );
+    // Well short of 30 s: no second poll is due.
+    h.advance_timers(5_000);
+    h.run_timers();
+    h.settle();
+    assert_eq!(
+        h.state().polls(),
+        polls,
+        "a 5 s interval would have polled again here"
+    );
+    // Past it: exactly one more.
+    h.advance_timers(25_001);
+    h.run_timers();
+    h.settle();
+    assert_eq!(h.state().polls(), polls + 1, "and one poll at 30 s");
+    h.quit();
+}
+
+#[test]
+fn a_poll_that_finds_the_same_readings_does_not_touch_the_tree() {
+    // The bar's own half of "an unchanged poll costs nothing". The idle
+    // test asserts it from the outside, by counting commits; this asserts
+    // the mechanism, because the outside test would still pass if the bar
+    // pushed every reading into every label and leaned entirely on
+    // `Label::set_text`'s early return — a setter in another crate, which
+    // is not where the bar's contract should live.
+    let readings = nitro_bar::Readings {
+        battery: Some("87%".to_owned()),
+        load: Some("0.4".to_owned()),
+        mem: Some("1.2/3.3G".to_owned()),
+    };
+    let mut h = bar(Bar::new()
+        .with_fake_time_ms((9 * 3600 + 41 * 60 + 5) * 1000)
+        .with_poll_ms(20)
+        .with_sensors(move || readings.clone()));
+    h.settle();
+    assert_eq!(label_text(&mut h, names::LOAD), "0.4");
+
+    let polls = h.state().polls();
+    h.tap();
+    h.clear_tap();
+    h.advance_timers(21);
+    h.run_timers();
+    h.settle();
+    assert!(h.state().polls() > polls, "the sensors were polled");
+    assert_eq!(
+        h.mutations().len(),
+        0,
+        "an unchanged poll produced no mutation at all: {:?}",
+        h.mutations()
     );
     h.quit();
 }
