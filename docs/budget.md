@@ -84,9 +84,15 @@ steady-state `top` never shows you.
 |---|---|---|---|---|---|
 | `nitro-server` | 1 | 8 240 kB | 8 240 kB | ≤ 8 MB with 5 windows | over by 1 % — see below |
 | `nitro-server` | 5 | 8 344 kB | 8 344 kB | ≤ 8 MB with 5 windows | over by 2 % — see below |
+| `nitro-server` **+ shadow (#539)** | 2 | **15 888 kB** | 18 460 kB | — | **deliberately over; see "The 8 MB the shadow buffer costs"** |
 | `nitro-calc` | 1 | **2 752 kB** | **2 752 kB** | ≤ 3 MB (client) | **ok**, 92 % |
 | `nitro-demo` | 1 | 3 132 kB | 3 132 kB | ≤ 3 MB (client) | over by 4 % |
 | `nitro-demo` | 5 | 3 224 kB | 3 224 kB | ≤ 3 MB (client) | over by 7 % |
+
+The first two `nitro-server` rows are the pre-#539 measurement and are
+kept as the floor they establish: they are what the process costs
+*without* the shadow buffer, which is still exactly what it costs today
+under `NITRO_SHADOW=0`.
 
 **The first app is inside the client budget**, at 2 752 kB against 3 MB,
 and it stays there: 2 776 kB after 120 keypresses, so typing allocates
@@ -123,8 +129,53 @@ a box with no swap, and it is the one the cap bounds.
 
 Five windows cost the server **104 kB** over one — 21 kB per window, which is
 the scene nodes (18 per window) and the per-client id maps, and nothing that
-scales with pixels. The server's framebuffers are not in RSS: they are dumb
-buffers owned by the GPU and mapped, not anonymous memory.
+scales with pixels. The server's *scanout* framebuffers are not in RSS: they
+are dumb buffers owned by the GPU and mapped, not anonymous memory. Its
+shadow buffers are — see the next section, which is the one exception to
+"nothing scales with pixels".
+
+### The 8 MB the shadow buffer costs, and what it buys
+
+Since #539 each output owns a heap-resident shadow buffer, and unlike the
+dumb buffers it **is** anonymous memory and **is** in RSS. Measured on the
+box, same binary, `NITRO_SHADOW=0` against the default, two decorated
+windows (`hello_client` + `hello_dialog`), two runs each:
+
+| | `NITRO_SHADOW=0` | shadow (default) | delta |
+|---|---|---|---|
+| `VmRSS`, no client | 7 800 / 7 688 kB | 15 888 / 15 844 kB | **+8 072 kB** |
+| `VmRSS`, two windows | 10 428 / 10 296 kB | 18 460 / 18 396 kB | +8 064 kB |
+| per-window cost | 2 628 / 2 608 kB | 2 572 / 2 552 kB | unchanged |
+| `shadow_bytes` (reported by `stats`) | 0 | 8 294 400 | — |
+
+The overhead is **exactly `1920 × 1080 × 4` = 8 294 400 bytes**, once per
+output, and it does not move with the number of windows. On this box that
+roughly **doubles the server's resident set**, from 7.7 MB to 15.9 MB.
+
+That is a large number against an 8 MB budget and it is recorded here
+rather than explained away. Three things make it the right trade:
+
+- **What it buys is 9.3× on the frame path**: 6233 µs of paint becomes
+  418 µs of paint plus 251 µs of copy (`docs/latency.md` §4.5). Nothing
+  else available to us moves a compositor number by that factor, and the
+  alternative — asking for a non-write-combined mapping of a dumb buffer
+  — is not something userspace can request.
+- **It scales with screens, not with work.** One allocation per output,
+  made when the output appears and freed when it goes; a desktop with
+  fifty windows pays the same 8 MB as one with none. It is the only thing
+  in the server that is proportional to pixels, and pixels are a property
+  of the hardware, not of what the user is doing.
+- **It is one environment variable away from being given back.**
+  `NITRO_SHADOW=0` restores the pre-#539 numbers exactly, which is what
+  the first two rows of the table above are. A build for a
+  memory-constrained target has the lever without a code change.
+
+The 8 MB server budget was written for a process whose framebuffers lived
+in GPU memory. It should be restated for M4 as **"≤ 8 MB plus one
+scanout-sized buffer per output"**, which is a budget that says what the
+process actually is; the part of it that is under the server's control —
+fonts, scene, atlas, wire buffers — has not moved, and is still the 8 240 kB
+the rows above measure.
 
 The scan also stopped costing a 12 MB read per boot: the index is cached in
 `$XDG_CACHE_HOME/nitro/fonts.idx`, validated against the directory walk (paths,

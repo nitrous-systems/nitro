@@ -397,6 +397,95 @@ Three further things, unchanged and re-confirmed:
 - **Frame pacing is exact.** 16 666 µs mean, min 16 654, max 16 675.
 - **The two views of latency agree**, now to 0.2 ms.
 
+## 4.5 Where the paint time went: the heap shadow buffer (#539)
+
+Everything above is about *scheduling* — which vblank a frame catches.
+This section is about the other half, the work inside the frame, and it
+is the larger number of the two: until #539 the server spent **6.2 ms**
+rasterizing a frame on the box, i.e. more than a third of a refresh
+period, against a scene that costs 0.4 ms of actual arithmetic.
+
+The diagnosis came out of #3693's A/B rounds and is stated in full in
+`crates/nitro-raster/README.md`: the same server, same scene, same
+damage, painting into a DRM dumb buffer took 5883 µs and into heap memory
+758 µs. **~87 % of `paint_us` was framebuffer traffic, not raster work.**
+The mechanism is that a dumb buffer is mapped write-combined — writes are
+cheap and coalesced, reads are uncached — and source-over is
+read-modify-write: the rasterizer reads every destination pixel it
+blends.
+
+The fix is the one every CPU compositor arrives at. Each output owns a
+heap-resident **shadow buffer** of the same format and stride as the
+scanout buffer; the rasterizer paints into that, and the damage rects are
+then streamed into the dumb buffer with sequential, write-only
+`copy_from_slice` row copies. Nothing reads write-combined memory any
+more. `frame.rs`'s module documentation has the design; the one
+non-obvious consequence is that the age-2 union moves *off* the paint — a
+shadow is never stale, so the rasterizer is given `damage(n)` alone and
+only the copy needs `damage(n) ∪ damage(n-1)`.
+
+### Measured
+
+Same binary both ways, `NITRO_SHADOW=0` against the default, through a
+systemd drop-in; #3693's protocol (30 `hello_client` cycles filling the
+120-frame window), six interleaved pairs with the order flipped for pairs
+4–6, every run valid at `frames=122 ∧ damage_px_mean=275418`.
+
+| per frame | `NITRO_SHADOW=0` | shadow (default) |
+|---|---|---|
+| `paint_us_mean` | 6233 µs | **418 µs** |
+| `paint_us_min` | 119 µs | 0 µs |
+| `paint_us_max` | 15 815 µs | 4349 µs |
+| `copy_us_mean` | — (no copy) | 251 µs |
+| **paint + copy, mean** | **6233 µs** | **669 µs** |
+
+**9.3× on the whole frame path.** The paired difference on `paint_us` is
+5815 µs with a standard deviation of 73 µs across the six pairs
+(t(5) = 196): this is not a measurement that needs statistics, it needs
+reporting. The two halves are counted separately on purpose —
+`paint_us` is now CPU and cached memory, `copy_us` is the write-combined
+mapping — because they respond to completely different changes, and
+folding them back together would re-hide exactly what #3693 spent a round
+digging out.
+
+Note `paint_us_min` = 0: with the shadow the age-2 carry frame
+rasterizes *nothing at all*. It has no new damage, the shadow already
+holds the previous frame's, and all that is left is the copy. Before,
+every such frame repainted the union.
+
+### What it does not buy
+
+**Input-to-photon is unchanged in the middle.** Three pairs of 60 paced
+`nitro-calc` keypresses, the server's own `i2p_*` window:
+
+| | shadow | `NITRO_SHADOW=0` |
+|---|---|---|
+| `i2p_mean_us` | 12 854 / 12 412 / 13 073 | 12 022 / 13 936 / 13 452 |
+| `i2p_max_us` | 21 375 / 22 450 / 22 398 | 36 717 / 39 163 / 22 214 |
+
+That is the right answer and worth stating plainly: **latency is set by
+which vblank you catch, not by how much of the interval you use.** 6.2 ms
+of paint fits inside a 16.7 ms refresh, so removing 5.5 ms of it does not
+move a median that is quantised to the refresh in the first place. What
+it moves is the *tail* — two of the three `NITRO_SHADOW=0` runs show a
+max near 37–39 ms, a missed frame, and none of the shadow runs does.
+That is what 5.5 ms of headroom is for: the frames that used to be one
+slow client or one scheduler hiccup away from missing their vblank now
+have a whole refresh period of margin instead of two thirds of one.
+
+The honest summary is that #539 buys **margin, not median**. The median
+was already inside budget (section 4.1); the margin is what keeps it
+there when the scene gets more expensive, which is the direction every
+remaining milestone points.
+
+**Idle is still exactly zero** — 0 frames and 0 CPU ticks over 5 s with
+two decorated windows, both variants. The shadow is touched only on a
+frame, so a server with nothing to do does nothing with it either.
+
+**It costs 8 MB per output**, resident: 7.7 MB RSS → 15.9 MB on the box,
+which is `1920 × 1080 × 4` to the byte. `docs/budget.md` records it as
+the deliberate trade it is.
+
 ## 5. Reproducing
 
 ```sh

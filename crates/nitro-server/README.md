@@ -69,7 +69,8 @@ tests.
 
 | request              | reply                                                                 |
 |----------------------|-----------------------------------------------------------------------|
-| `shot [output-name]` | `ok <width> <height> <stride>\n` + `stride*height` bytes `XRGB8888` (`read_front`) |
+| `shot [output-name]` | `ok <width> <height> <stride>\n` + `stride*height` bytes `XRGB8888`. Read from the output's **shadow buffer** when there is one — cheaper (no uncached reads back out of write-combined memory) and, if anything, more honest: the shadow is complete by construction, where the front buffer is complete only because the age-2 rule says so. It falls back to `read_front` under `NITRO_SHADOW=0` and for the moments before a shadow has been painted into. The two are byte-identical once a frame has settled, which `tests/shadow.rs` pins. |
+| `shot-front [name]`  | The same, read off the **scanout** buffer whatever the shadow holds. Test-only: with the shadow on, an ordinary `shot` cannot see whether the copy out of the shadow put the right bytes where the display reads them, so a shadow test would be unable to fail. |
 | `outputs`            | `ok\n`, one `name WxH@refresh_mhz\n` per output, blank line            |
 | `stats`              | `ok\n`, one `key value` line per statistic (see below), blank line     |
 | `quit`               | `ok\n`, then orderly shutdown                                          |
@@ -95,6 +96,7 @@ unlinked on shutdown.
 | `NITRO_INPUT`     | `off`                            | input enabled                  |
 | `NITRO_INPUT_DIR` | directory scanned for `event*`   | `/dev/input`                   |
 | `NITRO_SCALE`     | `<connector>=<f32>,…` per-output scale override, e.g. `HDMI-A-1=2` | EDID-derived: 2 at ≥ 192 dpi, else 1. See `docs/wm.md`. |
+| `NITRO_SHADOW`    | `0` to paint straight into the scanout buffer | enabled: each output gets a heap shadow buffer (one scanout-sized allocation, ~8 MB at 1080p) that the rasterizer paints into, with only the damage rects streamed out to the write-combined dumb buffer. Worth 9.3× on the frame path and 8 MB of RSS per output (`docs/latency.md` §4.5, `docs/budget.md`); `0` is the A/B lever, not a supported configuration. |
 | `NITRO_FONT_DIRS` | colon-separated font directories | `/usr/share/fonts:/usr/local/share/fonts:~/.local/share/fonts` (read by `nitro-text`) |
 | `NITRO_FONT_CACHE_MB` | cap on resident font-file bytes | `8` (read by `nitro-text`; `0` keeps only the file currently in use — the file that overran the cap is never its own victim, so a too-small cap does not turn into one disk read per glyph) |
 | `NITRO_FONT_INDEX_CACHE` | path of the font index cache, or `off` | `$XDG_CACHE_HOME/nitro/fonts.idx` (read by `nitro-text`) |
@@ -273,38 +275,57 @@ anything:
    output's damage (global device pixels, shifted back to the output's own
    origin) into that output's `OutputState`. Any `Configure` it produces
    is sent to the owning client.
-2. `repaint_region()` computes the region to paint. The backend owns two
-   buffers per output and alternates them strictly, so the buffer handed
-   out at frame `n` is the one that was on screen at frame `n - 2`.
-   Painting only this frame's damage would leave the previous frame's
-   changes stale in it, so the region painted is **`damage(n) ∪
-   damage(n-1)`** — the *age-2 rule*. What is carried forward is the
-   previous frame's **damage**, not the region it painted: the painted
-   region was itself a union of two frames' damage, and feeding it back
-   would make every frame at least as large as the one before and never
-   shrink again. One consequence worth stating: after a resume, a modeset
-   or a new output, `invalidate()` simply sets the damage to the whole
-   output, and the rule produces the two full frames both unknown buffers
-   need, with no separate "repaint fully for N frames" counter to get
-   subtly wrong when a client commits between them.
-3. For each rect of that region: the server's background first — the
-   vertical gradient inside its 4-px frame, one `fill_irect` per row —
+2. `repaint_region()` computes the region the *scanout buffer* is behind
+   by. The backend owns two buffers per output and alternates them
+   strictly, so the buffer handed out at frame `n` is the one that was on
+   screen at frame `n - 2`. Bringing only this frame's damage up to date
+   would leave the previous frame's changes stale in it, so the region is
+   **`damage(n) ∪ damage(n-1)`** — the *age-2 rule*. What is carried
+   forward is the previous frame's **damage**, not the region it painted:
+   the painted region was itself a union of two frames' damage, and
+   feeding it back would make every frame at least as large as the one
+   before and never shrink again. One consequence worth stating: after a
+   resume, a modeset or a new output, `invalidate()` simply sets the
+   damage to the whole output, and the rule produces the two full frames
+   both unknown buffers need, with no separate "repaint fully for N
+   frames" counter to get subtly wrong when a client commits between them.
+3. The rasterizer is pointed at the output's **shadow buffer** — a
+   heap-resident, scanout-sized `XRGB8888` copy of what the output must
+   show — and given `rasterize_region()`, which is `damage(n)` *alone*.
+   The shadow is never stale, so nothing older needs re-drawing; the age-2
+   union applies to the copy in step 5, not to the paint. Under
+   `NITRO_SHADOW=0` there is no shadow, the rasterizer writes the scanout
+   mapping directly and is given the union for both.
+
+   The reason for the indirection is the destination. A dumb buffer is
+   mapped write-combined — writes coalesce, reads are uncached — and
+   source-over reads every destination pixel it blends, which measured out
+   at ~87 % of `paint_us` on the test box. Painting into cached heap and
+   streaming the result back is 9.3× on the whole frame path, for one
+   scanout-sized allocation per output (`docs/latency.md` §4.5, #539).
+4. For each rect of the rasterize region: the server's background first —
+   the vertical gradient inside its 4-px frame, one `fill_irect` per row —
    unless an opaque client rect covers the whole clip, which the scene
    promises conservatively; then the scene's paint list clipped to the
    rect, one `nitro-raster` call per item; then the software cursor last.
    The rasterizer never writes outside the clip it was given, so one rect
    cannot smear into another.
-4. `commit` with the same region as `FB_DAMAGE_CLIPS` — it is exactly the
+5. The age-2 region is streamed out of the shadow into the back buffer,
+   one `copy_from_slice` per row (one for the whole block when the region
+   spans full rows): sequential and **write-only**, which is what
+   write-combined memory wants. Nothing reads the mapping.
+6. `commit` with the same region as `FB_DAMAGE_CLIPS` — it is exactly the
    set of pixels that differ between what this buffer holds and what must
-   be on screen — and the paint time and damage area go into the rolling
-   statistics.
+   be on screen — and the paint time, the copy time and the damage area go
+   into the rolling statistics.
 
 There is no hardware cursor plane. A KMS cursor is composited by the
 display engine rather than into the framebuffer, so it does not appear in
 a screenshot taken by dumping the back buffer; every visual test run over
 SSH would lose the pointer exactly when it matters. The cursor is a 24×24
-ARGB image blitted like anything else, inside the frame's damage clip, and
-a pointer move damages the old and the new cursor rect.
+ARGB image blitted like anything else, inside the frame's damage clip —
+into the shadow, like everything else — and a pointer move damages the old
+and the new cursor rect.
 
 It is drawn only once a pointer device has actually reported something,
 not merely because an output exists. Whether there is a pointer on this
@@ -602,9 +623,12 @@ looking for.
 | `flip_interval_max_us`   | Longest interval seen. Intervals longer than four refresh periods are **not counted**: an idle server deliberately stops flipping, and that gap is the absence of frames, not a slow one — counting it would measure how long the desktop sat still. |
 | `flips_deferred`         | Cursor-only flips held back for a client's answer, counted once per episode (a burst of motion inside one frame period is one). See the frame path above. |
 | `defer_timeouts`         | How many of those ended at the deadline instead of at a commit — the client did not answer. Tracking `flips_deferred` means a wedged client: the cursor is still reaching every vblank, but nothing is riding with it. |
-| `paint_us_min`           | Rasterization time per frame, over the last 120 frames (two seconds at 60 Hz). Paint only, not the commit. |
+| `paint_us_min`           | Rasterization time per frame, over the last 120 frames (two seconds at 60 Hz). Paint only — not the copy to the scanout buffer (`copy_us_*`) and not the commit. With the shadow on, a min of 0 is normal and correct: the age-2 carry frame has no new damage to draw, only pixels to copy. |
 | `paint_us_mean`          | Mean of the same window.                                                 |
 | `paint_us_max`           | Max of the same window — in practice a full-screen repaint.              |
+| `copy_us_min`            | Microseconds spent streaming the shadow buffer's damage rects into the scanout buffer, same 120-frame window. Always 0 under `NITRO_SHADOW=0`, where there is no copy. Kept apart from `paint_us` because the two measure different hardware — cached heap versus the write-combined mapping — and respond to different changes. |
+| `copy_us_mean`           | Mean of the same window.                                                 |
+| `copy_us_max`            | Max of the same window.                                                  |
 | `damage_px_mean`         | Mean damaged device pixels repainted per frame, same 120-frame window.   |
 | `i2p_min_us`             | Input-to-photon latency, over the last 100 samples: from the libinput event timestamp to the vblank of the frame carrying its effect. |
 | `i2p_mean_us`            | Mean of the same window.                                                 |
@@ -621,6 +645,7 @@ looking for.
 | `windows`                | Windows in the scene.                                                    |
 | `nodes`                  | Nodes in the scene, across every window — the server's own frame nodes included. |
 | `outputs`                | Outputs currently connected.                                             |
+| `shadow_bytes`           | Heap held by the shadow buffers, summed over the outputs: one scanout-sized `XRGB8888` buffer each (8 294 400 bytes at 1080p), 0 under `NITRO_SHADOW=0`. It is the server's one allocation proportional to pixels rather than to work, and `docs/budget.md` argues for it explicitly rather than leaving it to be inferred from `outputs`. |
 | `decorated`              | Windows carrying a server-drawn frame. `windows - decorated` is how many opted out with `UNDECORATED`. |
 | `minimized`              | Windows hidden by `Minimized`. They are still in `windows` and still in the `Alt+Tab` order. |
 | `dragging`               | 1 while a move or resize drag is in flight. A drag that is still 1 with nothing on the desk is a stuck grab. |
@@ -723,6 +748,26 @@ limit of 1024 — but real.
       climbing; cursor movement over the desktop is never deferred and
       still costs exactly 2 flips per move; and a settled server after a
       deferral makes no further frames, so the timer is really disarmed.
+- `tests/shadow.rs` covers the #539 heap shadow buffer through the same
+  real loop, five cases, all of them whole-buffer comparisons rather than
+  spot checks — a shadow that drifts from what a full repaint would
+  produce can drift anywhere: five successive partial damages leave the
+  *scanout* buffer byte-identical to the same server forced to repaint
+  everything; the age-2 carry still reaches the second buffer, checked
+  through `shot-front` because an ordinary `shot` reads the shadow and so
+  could not fail; `NITRO_SHADOW=0` and the default paint the same pixels
+  (two servers, one process, compared pixel for pixel — which is what
+  makes the A/B on the box a measurement of speed and nothing else), and
+  `shot` agrees with the scanout buffer either way; `shadow_bytes` appears
+  with an output, doubles with a second, and goes to 0 when the last is
+  unplugged; and `copy_us` is non-zero with a shadow and exactly zero
+  without one.
+
+  On the fake backend the shadow buys nothing — that backend's buffers are
+  heap already, so it is a pure extra `memcpy` per frame. It is left
+  enabled by default there anyway, so the tests exercise the path that
+  ships; the alternative is a test suite that never runs the production
+  code.
 - `tests/wm.rs` drives the M3 window manager through the same real loop:
   a decorated window's title bar painted above its content and an
   undecorated one with no frame at all; a title-bar drag moving the frame
@@ -905,3 +950,47 @@ test. Second, the probe itself did not answer the `Configure` its anchor
 produced, so the bar painted 400 of its 1920 px and the desktop showed
 through the rest — a client-side bug, but exactly the one a real bar makes,
 so the probe now answers it and says why.
+
+### #539: the heap shadow buffer
+
+Measured on the same box, same binary throughout, `NITRO_SHADOW=0`
+against the default through a systemd drop-in; #3693's protocol (30
+`hello_client` cycles filling the 120-frame window), six interleaved pairs
+with the order flipped for pairs 4–6, every run valid at `frames=122 ∧
+damage_px_mean=275418`.
+
+| what | `NITRO_SHADOW=0` | shadow (default) |
+|---|---|---|
+| `paint_us_mean` | 6 233 µs | **418 µs** |
+| `paint_us_min` / `_max` | 119 / 15 815 µs | 0 / 4 349 µs |
+| `copy_us_mean` | 0 (no copy) | 251 µs |
+| **paint + copy** | **6 233 µs** | **669 µs — 9.3×** |
+| `nitro-calc` keypress i2p, mean | 12.0 / 13.9 / 13.5 ms | 12.9 / 12.4 / 13.1 ms |
+|          max | 36.7 / 39.2 / 22.2 ms | 21.4 / 22.5 / 22.4 ms |
+| idle, 2 decorated windows | 0 frames, 0 CPU ticks in 5 s | 0 frames, 0 CPU ticks in 5 s |
+| RSS, no client | 7 800 / 7 688 kB | 15 888 / 15 844 kB |
+| `shadow_bytes` | 0 | 8 294 400 |
+| `cargo bench -p nitro-raster` | unchanged (zero diff in that crate) | |
+
+The paired difference on `paint_us` is 5 815 µs with a standard deviation
+of 73 µs over the six pairs (t(5) = 196) — a result that needs reporting
+rather than statistics. Three of those rows need reading carefully.
+
+**`paint_us_min` of 0 is correct, not a broken counter.** With the shadow
+the age-2 carry frame rasterizes *nothing*: it has no new damage, the
+shadow already holds the previous frame's, and all that is left is the
+copy. Every such frame used to repaint the union.
+
+**The i2p median did not move, and should not have.** Latency is set by
+which vblank a frame catches, not by how much of the interval it uses:
+6.2 ms of paint already fitted inside a 16.7 ms refresh. What moved is the
+tail — two of the three `NITRO_SHADOW=0` runs show a max near 37–39 ms, a
+missed frame, and none of the shadow runs does. #539 buys **margin, not
+median**, and margin is what keeps the median inside budget as scenes get
+more expensive.
+
+**The 8 MB is real and is in RSS**, unlike the dumb buffers, which the GPU
+owns. It roughly doubles the server's resident set on this box, it is
+exactly `1920 × 1080 × 4` per output, and it does not move with the number
+of windows (the two-window delta is 2.6 MB either way). `docs/budget.md`
+argues the trade rather than hiding it.

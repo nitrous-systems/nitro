@@ -947,11 +947,11 @@ fn cycling_buffers_does_not_leak_the_clients_descriptors() {
         _ => None,
     });
 
-    let before = open_fds();
+    let before = open_buffer_fds();
     let (bw, bh, stride) = (8u32, 8u32, 8u32 * 4);
     for i in 0..64u32 {
         let id = BufferId(i + 1);
-        let fd = memfd_create("nitro-cycle", MemfdFlags::CLOEXEC).unwrap();
+        let fd = memfd_create(BUFFER_MEMFD_NAME, MemfdFlags::CLOEXEC).unwrap();
         ftruncate(&fd, u64::from(stride) * u64::from(bh)).unwrap();
         conn.tx()
             .create_buffer(CreateBuffer {
@@ -980,19 +980,49 @@ fn cycling_buffers_does_not_leak_the_clients_descriptors() {
     }
     h_.settle();
 
-    let after = open_fds();
+    let after = open_buffer_fds();
     assert!(
         after <= before + 4,
-        "leaked descriptors over 64 buffer cycles: {before} -> {after}"
+        "leaked buffer descriptors over 64 cycles: {before} -> {after}"
     );
     h_.quit();
 }
 
-/// How many descriptors this process has open. The server runs on a
-/// thread of this same process, so its leaks are ours to count.
-fn open_fds() -> usize {
-    std::fs::read_dir("/proc/self/fd").map_or(0, std::iter::Iterator::count)
+/// How many of *this test's* buffer descriptors the process holds.
+///
+/// The server runs on a thread of this same process, so its leaks are
+/// ours to see — but so is every other test's, and the tests in this file
+/// run in parallel by default. A plain count of `/proc/self/fd` therefore
+/// measures the whole process: a sibling test whose server happens to be
+/// starting (sockets, an epoll, an eventfd, a timerfd) moves it by half a
+/// dozen, and this test would report a leak that is somebody else's
+/// server doing its job. That failure was observed at roughly one run in
+/// five, and it never reproduced when the file was run single-threaded,
+/// which is the signature of exactly this.
+///
+/// So count the thing under test instead. The descriptors at stake are
+/// the `memfd`s the client passes with `CreateBuffer`, and a memfd's
+/// `/proc/self/fd` link carries the name it was created with —
+/// `/memfd:nitro-cycle (deleted)`. Counting those by name is immune to
+/// anything another test is doing, and it is also a *sharper* assertion:
+/// a leak of 64 buffer descriptors now shows up as 64 rather than being
+/// diluted into a process-wide total in the hundreds.
+fn open_buffer_fds() -> usize {
+    let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|e| {
+            std::fs::read_link(e.path())
+                .is_ok_and(|target| target.to_string_lossy().contains(BUFFER_MEMFD_NAME))
+        })
+        .count()
 }
+
+/// The name `cycling_buffers_does_not_leak_the_clients_descriptors` gives
+/// its memfds, and the string `open_buffer_fds` recognises them by.
+const BUFFER_MEMFD_NAME: &str = "nitro-cycle";
 
 #[test]
 fn a_commit_that_changes_no_pixels_is_still_presented() {

@@ -390,11 +390,30 @@ later round added **(d) < 10 ms**.
 
 ### The benchmark lies about blits
 
+**Superseded as of #539 — it no longer does, and the reason is worth
+keeping.** Everything below was true and load-bearing when the server
+rasterized straight into the DRM dumb buffer. It now paints into a
+heap-resident *shadow buffer* and streams the damage rects out to the
+dumb buffer with write-only row copies (`crates/nitro-server/src/frame.rs`,
+`docs/latency.md` §4.5), so **the destination the rasterizer writes is
+ordinary cached heap memory — exactly what this benchmark measures.** The
+benchmark and the server agree again.
+
+So the rules at the end of this section have changed weight: the first
+one is now a caution rather than a veto, and the second is a good idea
+rather than a law. The data is kept in full, because it is the evidence
+that produced the shadow buffer, and because it is the cleanest example
+in this repository of a benchmark being right about the CPU and wrong
+about the machine.
+
+---
+
 This benchmark paints into a `Vec<u8>` — ordinary cached heap memory. The
-server paints into a **DRM dumb buffer, which is write-combined**: writes are
-cheap and coalesced, but every *read* is uncached. Source-over is
-read-modify-write, so the two destinations have materially different cost
-models, and a change can win here and lose there.
+server *used to* paint into a **DRM dumb buffer, which is
+write-combined**: writes are cheap and coalesced, but every *read* is
+uncached. Source-over is read-modify-write, so the two destinations had
+materially different cost models, and a change could win here and lose
+there.
 
 That is not hypothetical. The blit row split — hoisting the per-pixel clamp
 and the early-`continue`s out of the interior run so it vectorizes — was
@@ -422,22 +441,52 @@ switching only the backend:
 
 On the heap the split is 13 % **faster** — the benchmark was right about the
 CPU work. On the real framebuffer it is 6 % slower, and the framebuffer is
-what ships. Note also the scale: **~87 % of `paint_us` is framebuffer traffic**,
-not raster arithmetic (758 vs 5883 µs for identical work), so `paint_us_mean`
-is largely a memory-bandwidth instrument — its noise floor is ~±100 µs, which
-cannot resolve the ~90 µs the stroke work saves.
+what ships. Note also the scale: **~87 % of `paint_us` was framebuffer
+traffic**, not raster arithmetic (758 vs 5883 µs for identical work), so
+`paint_us_mean` was largely a memory-bandwidth instrument — its noise floor
+was ~±100 µs, which could not resolve the ~90 µs the stroke work saves.
+
+That last row is what issue #539 was filed on, and it is why the split was
+the *right* revert at the time and the wrong lesson to generalise from.
+The problem was never the write pattern; it was that the destination was
+the wrong kind of memory to be reading at all. With the shadow buffer in
+place the same measurement on the same box reads:
+
+| per frame, same scene and damage | before #539 | after #539 |
+|---|---|---|
+| `paint_us_mean` (rasterizer) | 6233 µs | **418 µs** |
+| `copy_us_mean` (stream to the dumb buffer) | — | 251 µs |
+| total | 6233 µs | **669 µs**, 9.3× |
+
+Six interleaved pairs, same binary, `NITRO_SHADOW=0` against the default;
+`docs/latency.md` §4.5 has the full run. `paint_us_mean` is now within a
+factor of the fake backend's 758 µs, which is the point: **it measures
+this crate again**, and its noise floor is small enough to resolve the
+~90 µs of stroke work that used to disappear into it.
 
 The rules that follow, for anyone optimizing this crate:
 
-- **`cargo bench` is necessary, not sufficient.** It measures CPU cost
-  faithfully and destination cost not at all. Anything that changes *how*
-  pixels are written — order, width, how many times a line is revisited —
-  must also be checked against the server on hardware.
+- **`cargo bench` is now representative — but check `paint_us` anyway.**
+  The destination is heap on both sides, so a change that wins here should
+  win there. "Should" is doing real work in that sentence: the box is a
+  Haswell with a different cache hierarchy from any dev machine, and
+  `copy_us` is still write-combined and still sensitive to the *shape* of
+  the damage region. A one-line check of `paint_us_mean` on hardware costs
+  30 seconds and has been right and surprising before.
 - **Write each destination pixel once, sequentially.** It is the one rule
-  that holds on both memory types, and it is why the surviving stroke work is
-  safe: it changes the arithmetic per pixel, never the write pattern.
-- The 16-byte-store and `copy_within` entries in the rejected list below are
-  the same lesson found earlier from the other direction.
+  that held on both memory types even when they disagreed about everything
+  else, and it is why the surviving stroke work is safe: it changes the
+  arithmetic per pixel, never the write pattern. It is also, now, the rule
+  the shadow-to-framebuffer copy is built out of.
+- **The blit row split should be re-tried.** It was 13 % faster on the
+  heap and was reverted for a destination the server no longer has. It is
+  not re-applied here because #539 was a server change and re-landing a
+  raster change under it would confound both measurements — but it is now
+  a straightforward win to go and take, on a benchmark that no longer
+  lies.
+- The 16-byte-store and `copy_within` entries in the rejected list below
+  were the same lesson found earlier from the other direction; they were
+  rejected on the heap benchmark too, so they stay rejected.
 
 ### vello_cpu comparison
 
