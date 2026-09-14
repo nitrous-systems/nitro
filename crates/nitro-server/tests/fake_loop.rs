@@ -1155,11 +1155,17 @@ fn a_window_created_before_any_output_is_placed_when_one_appears() {
 
     let mut out = Vec::new();
     let _ = conn.poll(&mut out);
-    assert!(
-        !out.iter().any(|m| matches!(m, ServerMsg::Configure(_))),
-        "nothing to configure against: {out:?}"
-    );
     seen.extend(out);
+    // Against `seen`, not just this last poll: `expect` above drained the
+    // socket into `seen`, so a wrongly-sent `Configure` would have landed
+    // there and a check of `out` alone would pass regardless.
+    assert!(
+        !seen.iter().any(|m| matches!(m, ServerMsg::Configure(_))),
+        "nothing to configure against: {seen:?}"
+    );
+    // From here on only messages *after* this point may be inspected for a
+    // `Configure`; the post-hotplug `expect` below does exactly that.
+    seen.clear();
 
     // Plug a screen in.
     assert_eq!(h_.request_line("plug 200x120\n"), "ok");
