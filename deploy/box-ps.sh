@@ -16,7 +16,9 @@
 #     the logind session scope (`user-1000.slice/session-N.scope`), so
 #     `system.slice/nitro-dev.service/cgroup.procs` is **empty** while
 #     the desktop runs. That is also why the unit's `MemoryMax=1G` does
-#     not actually bind — see docs/testbox.md.
+#     not actually bind: it applies to that empty cgroup while the scope
+#     the processes are in inherits `max`. See docs/testbox.md and the
+#     comment beside the setting in deploy/nitro-dev.service.
 #   * Idle CPU is measured as **jiffies over an interval**, not as `top`'s
 #     instantaneous percentage. The claim in DESIGN.md is "0.0 %", and the
 #     only way to show that honestly is to read utime+stime before and

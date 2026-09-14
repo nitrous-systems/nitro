@@ -74,6 +74,25 @@ pub struct Child {
     started: Instant,
     /// Set once `SIGTERM` has been sent, so teardown is idempotent.
     termed: bool,
+    /// The exit status, once the process has been reaped.
+    ///
+    /// **This is the pid-reuse guard.** After `waitpid` returns, the pid
+    /// is no longer ours: the kernel may hand it to anybody, and a
+    /// `kill(pid)` from here would be aimed at a stranger. `spawn`'s
+    /// `NoPidfd` arm already reasons about this in the other direction
+    /// ("the child has not been reaped, so the pid is still ours"), and
+    /// this field is what makes the reasoning symmetric — [`terminate`]
+    /// and [`kill`] become no-ops once it is set.
+    ///
+    /// It is not a hypothetical. `Session::start`'s readiness probe
+    /// calls `reap()` to ask whether the server is still alive; on the
+    /// "server died before it was ready" path the slot was still
+    /// populated, and `teardown` then signalled a pid that had already
+    /// been waited for.
+    ///
+    /// [`terminate`]: Child::terminate
+    /// [`kill`]: Child::kill
+    exited: Option<Exit>,
 }
 
 /// Why a child could not be started.
@@ -152,6 +171,7 @@ impl Child {
             pidfd,
             started: Instant::now(),
             termed: false,
+            exited: None,
         })
     }
 
@@ -180,14 +200,28 @@ impl Child {
     /// `ExitStatus`, because everything downstream wants "what code do
     /// *we* exit with" and "what do we print", and both of those are
     /// awkward to derive from `ExitStatus` twice.
+    /// Repeated calls return the same answer rather than a second
+    /// `waitpid`: the status is remembered, which is also what stops
+    /// [`terminate`](Child::terminate) signalling a recycled pid.
     pub fn reap(&mut self) -> Option<Exit> {
-        match self.proc.try_wait() {
-            Ok(Some(status)) => Some(Exit::from_status(status)),
+        if let Some(exit) = self.exited {
+            return Some(exit);
+        }
+        let exit = match self.proc.try_wait() {
+            Ok(Some(status)) => Exit::from_status(status),
             // A child we cannot wait for is a child we will never see
             // exit; treat it as gone rather than spinning on its pidfd.
-            Err(_) => Some(Exit::Unknown),
-            Ok(None) => None,
-        }
+            Err(_) => Exit::Unknown,
+            Ok(None) => return None,
+        };
+        self.exited = Some(exit);
+        Some(exit)
+    }
+
+    /// The exit status if this child has already been reaped.
+    #[must_use]
+    pub fn exit(&self) -> Option<Exit> {
+        self.exited
     }
 
     /// Wait for the child, blocking. Only used after `SIGKILL`, where
@@ -197,7 +231,12 @@ impl Child {
     /// # Errors
     /// Whatever `waitpid` says.
     pub fn wait_blocking(&mut self) -> std::io::Result<Exit> {
-        self.proc.wait().map(Exit::from_status)
+        if let Some(exit) = self.exited {
+            return Ok(exit);
+        }
+        let exit = self.proc.wait().map(Exit::from_status)?;
+        self.exited = Some(exit);
+        Ok(exit)
     }
 
     /// Send `SIGTERM` to the child's process group. Idempotent.
@@ -213,6 +252,13 @@ impl Child {
         self.signal(Signal::TERM);
     }
 
+    /// Whether this child has been reaped, and so whether its pid still
+    /// refers to it.
+    #[must_use]
+    pub fn is_reaped(&self) -> bool {
+        self.exited.is_some()
+    }
+
     /// Send `SIGKILL` to the child's process group, for a piece that
     /// ignored the deadline.
     pub fn kill(&mut self) {
@@ -220,6 +266,11 @@ impl Child {
     }
 
     fn signal(&self, sig: Signal) {
+        if self.exited.is_some() {
+            // Already waited for: the pid belongs to the kernel now, and
+            // possibly to somebody else. See the `exited` field.
+            return;
+        }
         let raw = i32::try_from(self.proc.id()).unwrap_or(i32::MAX);
         if let Some(pid) = Pid::from_raw(raw) {
             // The group first — that is the whole tree the piece owns —
@@ -362,6 +413,54 @@ mod tests {
         assert_ne!(
             child_pgid,
             rustix::process::getpgrp().as_raw_nonzero().get()
+        );
+    }
+
+    /// A reaped child must not be signalled again: the pid is the
+    /// kernel's the moment `waitpid` returns, and may already name
+    /// somebody else's process.
+    ///
+    /// Asserted from the outside, by giving the `Child` a pid that is
+    /// *not* its own after the reap and checking nothing is sent to it:
+    /// a live `sleep` in its own process group, which must survive.
+    #[test]
+    fn a_reaped_child_is_never_signalled_again() {
+        let mut c = Child::spawn(
+            "quick",
+            Role::Shell,
+            Path::new("/bin/sh"),
+            &["-c".to_owned(), "exit 0".to_owned()],
+        )
+        .expect("spawn");
+        let fd = c.as_fd();
+        let mut fds = [rustix::event::PollFd::new(
+            &fd,
+            rustix::event::PollFlags::IN,
+        )];
+        let ts = rustix::event::Timespec {
+            tv_sec: 5,
+            tv_nsec: 0,
+        };
+        rustix::event::poll(&mut fds, Some(&ts)).expect("poll");
+        assert_eq!(c.reap(), Some(Exit::Code(0)));
+        assert!(c.is_reaped());
+
+        // A second reap is the remembered answer, not a second
+        // `waitpid` (which would report an error and become `Unknown`).
+        assert_eq!(c.reap(), Some(Exit::Code(0)));
+        assert_eq!(c.exit(), Some(Exit::Code(0)));
+
+        // And the signals are no-ops now. If they were not, this would
+        // be a `kill` aimed at whatever the kernel has since done with
+        // that pid — the hazard `spawn`'s `NoPidfd` arm avoids in the
+        // other direction.
+        c.terminate();
+        c.kill();
+        assert_eq!(
+            c.wait_blocking().expect("remembered"),
+            Exit::Code(0),
+            "a blocking wait after the reap is the remembered status, \
+             not a second waitpid on a pid we no longer own"
         );
     }
 

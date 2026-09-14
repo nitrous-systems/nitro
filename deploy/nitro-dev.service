@@ -40,11 +40,33 @@ Environment=RUST_BACKTRACE=1
 Environment=NITRO_LOG=info
 Restart=no
 # 3.3 GB box, no swap: a runaway desktop must die before the box does.
-# The limit now covers the whole tree (session + server + three shell
-# clients) rather than the server alone, because `KillMode=control-group`
-# is the default and every piece is in this unit's cgroup. Measured at
-# M3: ~19 MB resident for all five, so 1 G is still two orders of
-# magnitude of headroom rather than a budget anyone is near.
+#
+# ⚠ THIS LIMIT DOES NOT CURRENTLY BIND ANYTHING, and the reason is two
+# lines above it. `PAMName=login` makes pam_systemd move the session —
+# and therefore every process in it — into the **logind session scope**,
+# `user.slice/user-1000.slice/session-N.scope`. So
+# `system.slice/nitro-dev.service/cgroup.procs` is empty while the
+# desktop runs, this `MemoryMax` applies to that empty cgroup, and the
+# scope the processes are actually in inherits `max` from
+# `user-1000.slice`. Verified on the box at M3-E: unit `memory.max` =
+# 1073741824, scope `memory.max` = max, with all five processes in the
+# scope.
+#
+# It is kept rather than deleted because it is correct for a session
+# started *without* `PAMName` (a `just fake` run under systemd-run, say),
+# and because deleting it would leave nothing here to explain the trap.
+#
+# To make it real, put the limit where the processes are — on the user
+# slice, which the scope inherits from:
+#
+#     sudo systemctl set-property user-1000.slice MemoryMax=1G
+#
+# (checked on the box: the scope's effective limit becomes 1 G). That is
+# a box-wide policy rather than a unit setting, which is why it is a note
+# here and not a drop-in: it would also cap the developer's ssh session.
+# The M3 desktop measures ~29 MB resident for all five processes, so
+# nothing is near the number either way — the guard is against a runaway,
+# and the box has needed a power cycle after one before (docs/testbox.md).
 MemoryMax=1G
 # The session's own teardown deadline is 3 s (nitro-session's
 # `TEARDOWN_TIMEOUT`), deliberately **inside** this one: the session must

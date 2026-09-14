@@ -45,7 +45,5 @@ path = "src/main.rs"
 [[example]]
 name = "stub_child"
 
-[dev-dependencies]
-# `tests/session.rs` talks to the stub server's sockets and to the
-# session socket; the wire crate is already a dependency, and the tests
-# need nothing else.
+# No `[dev-dependencies]`: `tests/session.rs` and `examples/stub_child.rs`
+# use `rustix` and `nitro-wire`, which are already dependencies above.

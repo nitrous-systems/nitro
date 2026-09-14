@@ -139,15 +139,18 @@ struct Slot {
     restart_at: Option<Instant>,
 }
 
-/// How the session ended.
+/// How a *running* session ended.
+///
+/// There is deliberately no `StartFailed`: a session that never started
+/// has no outcome to report, and [`Session::start`] returns `Err` for
+/// that case. A variant nothing constructs is a state a reader has to
+/// wonder about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     /// A signal, or a `logout` command: exit 0.
     Stopped,
     /// The server exited; its status is ours.
     ServerExited(Exit),
-    /// The session could not start at all.
-    StartFailed,
 }
 
 impl Outcome {
@@ -157,7 +160,6 @@ impl Outcome {
         match self {
             Self::Stopped => 0,
             Self::ServerExited(e) => e.code(),
-            Self::StartFailed => 1,
         }
     }
 }
@@ -193,18 +195,30 @@ pub struct Session {
 }
 
 impl Session {
-    /// Start the server, wait for it, start the shell, bind the socket.
+    /// Bind the session socket, start the server, wait for it, start the
+    /// shell.
     ///
-    /// The session socket is bound **last**, and that ordering is a
-    /// promise the tests rely on: a client that can connect to
-    /// `session.sock` is talking to a session whose desktop is up. A
-    /// socket bound first would accept a `poweroff` from a session that
-    /// then failed to start, which is the worst possible time to be
-    /// reachable.
+    /// The socket is bound **first**, and the reason is that binding is
+    /// the one step that can fail for a reason nothing else can fix: a
+    /// second session already running, or a runtime directory that is
+    /// not writable. Discovering that *after* starting a compositor
+    /// would mean taking the VT, painting a desktop, and then tearing it
+    /// all down again.
+    ///
+    /// Binding early is safe because binding is not *answering*.
+    /// Nothing is accepted until [`Session::run`] polls the listener, so
+    /// there is no window in which a half-started session could be told
+    /// to `poweroff`: a client that connects during start-up simply
+    /// waits, and if start-up fails its connection dies with the
+    /// listener. Every failure path here unlinks the socket file — the
+    /// `Err` returns drop the local `Listener` (whose `Drop` removes
+    /// it), and the not-ready path hands it to a `Session` that tears
+    /// down and unlinks. `a_server_that_never_answers_fails_the_start_\
+    /// and_leaves_nothing_behind` asserts exactly that.
     ///
     /// # Errors
-    /// The server failing to start or to become ready, or the session
-    /// socket failing to bind. Anything already started is torn down
+    /// The session socket failing to bind, or the server failing to
+    /// start or to become ready. Anything already started is torn down
     /// first, so a failed `start` leaves no processes behind.
     pub fn start(config: Config) -> Result<Self, String> {
         let listener = socket::Listener::bind(&config.session_path)
@@ -221,18 +235,14 @@ impl Session {
             .collect();
 
         // The server first, on its own, because everything after it
-        // depends on it answering.
-        let mut started: Vec<usize> = Vec::new();
-        for (i, slot) in slots.iter_mut().enumerate() {
+        // depends on it answering. Nothing has been started yet, so a
+        // failure here needs no teardown — only the listener, which the
+        // `?` drops and whose `Drop` unlinks the socket.
+        for slot in &mut slots {
             if slot.piece.role != Role::Server {
                 continue;
             }
-            match spawn_slot(slot, &config) {
-                Ok(()) => started.push(i),
-                Err(e) => {
-                    return Err(format!("{}: {e}", slot.piece.program));
-                }
-            }
+            spawn_slot(slot, &config).map_err(|e| format!("{}: {e}", slot.piece.program))?;
         }
 
         // Then the health check, which is a real client handshake.
@@ -645,8 +655,20 @@ impl Session {
     pub fn teardown(&mut self) {
         for slot in self.slots.iter_mut().rev() {
             if let Some(child) = slot.child.as_mut() {
-                info!("stopping {} (pid {})", slot.piece.program, child.pid());
-                child.terminate();
+                if child.is_reaped() {
+                    // Already exited and waited for — the readiness
+                    // probe reaps the server to ask whether it is still
+                    // alive, so this is the `WaitError::Died` path.
+                    // `terminate` would be a no-op (see `Child::exited`),
+                    // but logging "stopping" for a process that is
+                    // already gone is the kind of line that sends a
+                    // reader looking for a bug that is not there.
+                    debug!("{} was already gone", slot.piece.program);
+                    slot.child = None;
+                } else {
+                    info!("stopping {} (pid {})", slot.piece.program, child.pid());
+                    child.terminate();
+                }
             }
             slot.restart_at = None;
         }

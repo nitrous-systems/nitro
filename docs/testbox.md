@@ -96,8 +96,19 @@ $ just box-session suspend    # systemctl suspend, via the session
   desktop runs. Two consequences: `journalctl -u nitro-dev` shows only
   systemd's own lines (use `journalctl -t nitro-session` or
   `_PID=`), and the unit's `MemoryMax=1G` **does not actually bind** the
-  processes. `deploy/box-ps.sh` therefore walks down from the unit's
-  `MainPID` instead of reading the cgroup.
+  processes — it applies to an empty cgroup while the scope they are in
+  inherits `max`. `deploy/box-ps.sh` therefore walks down from the unit's
+  `MainPID` instead of reading the cgroup, and `deploy/nitro-dev.service`
+  carries the same warning next to the setting. To make the limit real,
+  put it where the processes are:
+
+  ```console
+  $ sudo systemctl set-property user-1000.slice MemoryMax=1G
+  ```
+
+  which the session scope inherits. That is a box-wide policy — it caps
+  your ssh session too — so it is a note rather than something the
+  repo installs.
 - **No ImageMagick on the box.** `nitro-shot --raw` gives the readback
   unencoded, which is what the scripts here parse; `magick` is only
   available on the dev machine, for looking at the PNGs afterwards.
