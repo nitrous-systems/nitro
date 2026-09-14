@@ -26,7 +26,8 @@ table, error codes and the versioning policy — is in
 * **Text is shaped server-side**: clients send a string plus a style with
   `SetText` and get `TextMetrics` back; `MeasureText`/`TextMeasured` is
   the one request/response pair, answered on receipt rather than at a
-  commit. Both need the `TEXT` capability bit.
+  commit. Both are accepted whether or not the server reports the `TEXT`
+  capability bit; the bit says whether the text will be *visible*.
 
 ## Client
 

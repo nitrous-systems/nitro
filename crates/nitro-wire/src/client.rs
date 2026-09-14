@@ -36,9 +36,10 @@ pub use crate::socket_path;
 ///
 /// Mutations go through [`Connection::tx`]; the one thing that does not is
 /// [`Connection::measure_text`], which is a request answered at once
-/// rather than at a commit. Both text ops need the server to have
-/// reported the `TEXT` capability — check
-/// [`has_caps(caps::TEXT)`](Connection::has_caps).
+/// rather than at a commit. Both text ops are accepted whether or not the
+/// server reported the `TEXT` capability; the bit
+/// ([`has_caps(caps::TEXT)`](Connection::has_caps)) tells you whether the
+/// text will actually be visible, not whether you may send it.
 #[derive(Debug)]
 pub struct Connection {
     socket: Socket,
@@ -254,8 +255,10 @@ impl Connection {
     /// [`TextMeasured`](crate::msg::TextMeasured) with the same
     /// `request`, and it is NOT tied to a commit.
     ///
-    /// Needs the `TEXT` capability
-    /// ([`has_caps(caps::TEXT)`](Connection::has_caps)).
+    /// Always accepted: a server without the `TEXT` capability
+    /// ([`has_caps(caps::TEXT)`](Connection::has_caps)) answers a
+    /// well-formed zero-width measurement. The bit tells you whether text
+    /// would be visible, i.e. whether it is worth laying out for.
     ///
     /// # Errors
     /// As [`Connection::send`].
@@ -375,9 +378,11 @@ fn wait(fd: BorrowedFd<'_>, events: rustix::event::PollFlags) -> Result<(), Erro
 /// [`Transaction::commit`] or [`Transaction::finish`].
 ///
 /// It covers the whole mutation vocabulary: windows, the node tree,
-/// style, buffers, and — when the server reports the `TEXT` capability
-/// ([`Connection::has_caps`] with [`caps::TEXT`](crate::types::caps::TEXT))
-/// — text content and style through [`Transaction::set_text`].
+/// style, buffers, and text content and style through
+/// [`Transaction::set_text`] — which is accepted whether or not the server
+/// reports [`caps::TEXT`](crate::types::caps::TEXT)
+/// ([`Connection::has_caps`]); that bit says whether the text will be
+/// visible.
 #[derive(Debug)]
 pub struct Transaction<'a> {
     conn: &'a mut Connection,
@@ -609,8 +614,9 @@ impl Transaction<'_> {
     ///
     /// Fills in the rest of [`SetText`]: weight 400, upright, no width
     /// limit, no wrapping, [`Align::Left`]. Use
-    /// [`Transaction::set_text_full`] for the other fields. Needs the
-    /// `TEXT` capability.
+    /// [`Transaction::set_text_full`] for the other fields. Always
+    /// accepted: without the `TEXT` capability the server shapes to an
+    /// empty run, so the bit says whether the text will be visible.
     #[must_use]
     pub fn set_text(
         mut self,

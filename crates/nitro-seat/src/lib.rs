@@ -197,7 +197,7 @@ impl Seat {
     /// # Errors
     ///
     /// [`ErrorKind::Open`] if libseat cannot open a seat, or if the backend
-    /// exposes no pollable fd (the `noop` backend does not).
+    /// exposes no pollable fd.
     pub fn open() -> Result<Self, Error> {
         let shared = Rc::new(RefCell::new(Shared::default()));
         let sink = Rc::clone(&shared);

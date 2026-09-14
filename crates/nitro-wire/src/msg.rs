@@ -418,8 +418,9 @@ impl Body for SetFill {
 ///
 /// Applies at the next [`Commit`], like every other mutation; the server
 /// shapes the text and answers with [`TextMetrics`] for each node it
-/// (re)shaped in that commit. Requires the
-/// [`caps::TEXT`](crate::types::caps::TEXT) capability bit.
+/// (re)shaped in that commit. Always accepted: a server without the
+/// [`caps::TEXT`](crate::types::caps::TEXT) bit shapes to an empty run
+/// rather than refusing. The bit says whether the text will be *visible*.
 ///
 /// `max_width` 0 means "no limit"; `wrap` only has an effect with a
 /// non-zero `max_width`. `family` is a font family name or one of the
@@ -502,8 +503,9 @@ impl Body for SetText {
 /// receipt**, not at the next [`Commit`]: it is the protocol's one
 /// request/response pair, because a text field needs a measurement before
 /// it can lay itself out. The answer is a [`TextMeasured`] carrying the
-/// same `request`. Requires the [`caps::TEXT`](crate::types::caps::TEXT)
-/// capability bit.
+/// same `request`. Always accepted: a server without the
+/// [`caps::TEXT`](crate::types::caps::TEXT) bit answers a well-formed
+/// zero-width measurement. The bit says whether text will be *visible*.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MeasureText {
     /// Client-chosen request id, echoed in [`TextMeasured`].
