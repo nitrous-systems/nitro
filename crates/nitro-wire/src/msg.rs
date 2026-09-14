@@ -726,6 +726,14 @@ pub struct WindowInfo {
     /// The output it is on, or `u32::MAX` when it is on none (created
     /// before any output existed, or its output was unplugged).
     pub output: u32,
+    /// The stacking layer the window was created on.
+    ///
+    /// Only [`Layer::Normal`] windows are *applications*: a task list
+    /// filters on this, or it lists the wallpaper and the launcher as
+    /// windows — which is what a bar did before this field existed. It is
+    /// carried rather than filtered at the server because a pager or a
+    /// dock wants the full picture.
+    pub layer: Layer,
     /// Application id from [`SetAppId`], empty when the client set none.
     pub app_id: String,
     /// Window title.
@@ -740,6 +748,7 @@ struct WindowInfoFixed {
     state: <WindowStateValue as Plain>::Wire,
     focused: <bool as Plain>::Wire,
     output: <u32 as Plain>::Wire,
+    layer: <Layer as Plain>::Wire,
 }
 
 impl Body for WindowInfo {
@@ -749,6 +758,7 @@ impl Body for WindowInfo {
             state: Plain::to_wire(self.state),
             focused: Plain::to_wire(self.focused),
             output: Plain::to_wire(self.output),
+            layer: Plain::to_wire(self.layer),
         });
         w.put_str(&self.app_id);
         w.put_str(&self.title);
@@ -761,6 +771,7 @@ impl Body for WindowInfo {
             state: Plain::from_wire(f.state)?,
             focused: Plain::from_wire(f.focused)?,
             output: Plain::from_wire(f.output)?,
+            layer: Plain::from_wire(f.layer)?,
             app_id: r.get_str()?,
             title: r.get_str()?,
         })

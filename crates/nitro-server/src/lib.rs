@@ -3733,6 +3733,10 @@ impl Server {
             // output, and a shell must be able to tell an unplaced window
             // from one on the primary screen.
             output: info.output().map_or(u32::MAX, |o| o.0),
+            // The layer a task list filters on: only `Normal` windows are
+            // applications, and a bar that does not filter lists the
+            // wallpaper and the launcher as windows.
+            layer: clients::wire_layer(info.layer()),
             app_id: info.app_id().to_owned(),
             title: info.title().to_owned(),
         })

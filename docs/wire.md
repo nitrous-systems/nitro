@@ -1030,12 +1030,21 @@ is no press event to report.
 | `state` | `u8` (`WindowState`) | what the window is doing |
 | `focused` | `bool` | whether it holds keyboard focus |
 | `output` | `u32` | the output it is on, or `u32::MAX` for none |
+| `layer` | `u8` (`Layer`) | the stacking layer it was created on |
 | `app_id` | `str` | from `SetAppId`; empty when the client set none |
 | `title` | `str` | window title |
 
-Fixed head 10 bytes, then the two strings. `output` is `u32::MAX` rather
+Fixed head 11 bytes, then the two strings. `output` is `u32::MAX` rather
 than 0 for "nowhere": output 0 is a real output, and a shell must be able
 to tell an unplaced window from one on the primary screen.
+
+`layer` is what separates applications from furniture. A wallpaper, a dock
+and a launcher are windows like any other as far as the server is
+concerned, so a **task list must filter on `layer == Normal`** or it lists
+the shell itself — which is exactly what `nitro-bar` did before this field
+existed. It is carried rather than filtered server-side because a pager or
+a dock wants the full picture; the server reports every window and the
+consumer decides.
 
 Sent for each window in answer to `WindowList`, and again whenever
 anything in it changes — a retitle, an app id, a focus change (on **both**

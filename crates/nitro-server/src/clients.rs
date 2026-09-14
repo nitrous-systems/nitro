@@ -625,6 +625,10 @@ fn apply_msg(
             outcome
                 .shell_ops
                 .push((win, shell::WindowOp::Layer(scene_layer(m.layer))));
+            // The layer is part of `WindowInfo`, and a task list filters
+            // on it: a window that becomes a shell surface has to leave
+            // the bar's list, so the watchers are told.
+            outcome.relisted.push(win);
             Ok(())
         }
         ClientMsg::SetExclusiveZone(m) => {
@@ -924,6 +928,18 @@ pub fn scene_layer(layer: Layer) -> nitro_scene::Layer {
         Layer::Normal => nitro_scene::Layer::Normal,
         Layer::Top => nitro_scene::Layer::Top,
         Layer::Overlay => nitro_scene::Layer::Overlay,
+    }
+}
+
+/// The wire's layer for a scene one: [`scene_layer`] the other way round,
+/// for the `WindowInfo` a shell reads.
+#[must_use]
+pub fn wire_layer(layer: nitro_scene::Layer) -> Layer {
+    match layer {
+        nitro_scene::Layer::Background => Layer::Background,
+        nitro_scene::Layer::Normal => Layer::Normal,
+        nitro_scene::Layer::Top => Layer::Top,
+        nitro_scene::Layer::Overlay => Layer::Overlay,
     }
 }
 

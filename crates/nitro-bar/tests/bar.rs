@@ -57,9 +57,23 @@ fn label_text(h: &mut Harness<Bar>, name: &str) -> String {
 /// return the connection plus its node id. It is a real second client, so
 /// the bar learns about it exactly as it would on a desktop.
 fn open_window(h: &Harness<Bar>, title: &str, size: Size) -> Connection {
-    let mut conn = Connection::connect(h.server().wire_path(), title).expect("wire connect");
+    open_layer_window(h, title, size, Layer::Normal)
+}
+
+/// As [`open_window`], on a chosen layer.
+///
+/// A non-`Normal` layer needs the **shell** socket: the layer is part of
+/// `CreateWindow`, and asking for a shell one on the ordinary wire socket
+/// is a fatal protocol error rather than a refusal.
+fn open_layer_window(h: &Harness<Bar>, title: &str, size: Size, layer: Layer) -> Connection {
+    let path = if layer == Layer::Normal {
+        h.server().wire_path()
+    } else {
+        h.server().shell_path()
+    };
+    let mut conn = Connection::connect(path, title).expect("connect");
     conn.tx()
-        .create_window(NodeId(1), title, size, Layer::Normal)
+        .create_window(NodeId(1), title, size, layer)
         .create_rect(NodeId(2), NodeId(1), Rect::new(0.0, 0.0, size.w, size.h))
         .fill_solid(NodeId(2), nitro_core::Color::rgb(0x40, 0x80, 0xC0))
         .set_app_id(NodeId(1), title)
@@ -219,6 +233,55 @@ fn the_bar_does_not_list_itself() {
     until(&mut h, "the window", |h| h.state().window_count() == 1);
     assert_eq!(h.state().window_labels(), vec!["only-one".to_owned()]);
     drop(conn);
+    h.quit();
+}
+
+#[test]
+fn a_shell_surface_is_not_a_window_in_the_task_list() {
+    // The M3 defect: with the wallpaper and the launcher running, the
+    // bar's window list showed `nitro-wallpaper` and `nitro-launcher` as
+    // entries. They *are* windows — the server makes no distinction — but
+    // a task list lists applications, and every one of these is as
+    // unfocusable as the bar itself.
+    //
+    // Filtering on the bar's own app id was not enough: it only ever hid
+    // this bar. The layer is what separates furniture from applications,
+    // so the server carries it in `WindowInfo` and the bar filters on it.
+    let mut h = harness();
+    h.settle();
+
+    // One of each shell layer, and one real application.
+    let wallpaper = open_layer_window(
+        &h,
+        "nitro-wallpaper",
+        Size::new(320.0, 240.0),
+        Layer::Background,
+    );
+    let launcher = open_layer_window(&h, "nitro-launcher", Size::new(120.0, 90.0), Layer::Overlay);
+    let dock = open_layer_window(&h, "some-dock", Size::new(120.0, 24.0), Layer::Top);
+    let app = open_window(&h, "an-application", Size::new(120.0, 90.0));
+
+    until(&mut h, "the application", |h| h.state().window_count() == 1);
+    // And it stays at one: settle well past the point where the three
+    // shell surfaces' `WindowInfo`s have all arrived, or this would pass
+    // by racing them.
+    for _ in 0..20 {
+        h.settle();
+    }
+    assert_eq!(
+        h.state().window_labels(),
+        vec!["an-application".to_owned()],
+        "only the Normal-layer window is listed"
+    );
+    // Not just absent from the model — no button either.
+    for name in ["nitro-wallpaper", "nitro-launcher", "some-dock"] {
+        assert!(
+            !h.state().window_labels().iter().any(|l| l == name),
+            "{name} got a button"
+        );
+    }
+
+    drop((wallpaper, launcher, dock, app));
     h.quit();
 }
 

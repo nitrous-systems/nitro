@@ -475,6 +475,7 @@ fn server_messages() -> Vec<ServerMsg> {
             state: WindowStateValue::Maximized,
             focused: true,
             output: 3,
+            layer: Layer::Normal,
             app_id: "org.nitro.calc".to_owned(),
             title: "Calculator — ünicode".to_owned(),
         }
@@ -484,6 +485,7 @@ fn server_messages() -> Vec<ServerMsg> {
             state: WindowStateValue::Normal,
             focused: false,
             output: u32::MAX,
+            layer: Layer::Background,
             app_id: String::new(),
             title: String::new(),
         }
@@ -944,6 +946,7 @@ fn payload_layouts_are_frozen() {
         state: WindowStateValue::Maximized,
         focused: true,
         output: 2,
+        layer: Layer::Top,
         app_id: "ab".to_owned(),
         title: "cd".to_owned(),
     })
@@ -952,12 +955,13 @@ fn payload_layouts_are_frozen() {
     assert_eq!(
         w.bytes(),
         &[
-            // header: len=22, op=0x8402, fds=0, flags=0
-            0x16, 0x00, 0x00, 0x00, 0x02, 0x84, 0x00, 0x00, //
+            // header: len=23, op=0x8402, fds=0, flags=0
+            0x17, 0x00, 0x00, 0x00, 0x02, 0x84, 0x00, 0x00, //
             0x04, 0x03, 0x02, 0x01, // window
             0x01, // state Maximized
             0x01, // focused
             0x02, 0x00, 0x00, 0x00, // output
+            0x02, // layer Top
             0x02, 0x00, 0x00, 0x00, b'a', b'b', // app_id
             0x02, 0x00, 0x00, 0x00, b'c', b'd', // title
         ]

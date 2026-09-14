@@ -68,7 +68,7 @@ pub mod clock;
 pub mod sensors;
 
 use nitro_ui::build::{ContainerBuilder as _, StyleBuilder as _};
-use nitro_ui::shell::{ShellEvent, Surface, WindowInfo, WindowRef};
+use nitro_ui::shell::{Layer, ShellEvent, Surface, WindowInfo, WindowRef};
 use nitro_ui::widgets::{Button, Label, button as button_widget, label, row, spacer};
 use nitro_ui::{App, Error, Size, Ui, WidgetId};
 
@@ -559,12 +559,26 @@ pub fn button_text(label: &str, focused: bool) -> String {
 /// the id and upserting is one code path where "added vs changed" would
 /// be two that must agree.
 ///
-/// The bar's own window is **skipped**. It is a window like any other as
-/// far as the server is concerned, and listing itself would give the user
-/// a button that focuses a `NO_FOCUS` panel — a row that does nothing,
-/// which is worse than no row.
+/// Two kinds of window are **skipped**.
+///
+/// The bar's own, by app id. It is a window like any other as far as the
+/// server is concerned, and listing itself would give the user a button
+/// that focuses a `NO_FOCUS` panel — a row that does nothing, which is
+/// worse than no row.
+///
+/// And every window that is not on the `Normal` layer. A task list lists
+/// *applications*; the wallpaper (`Background`), a dock or another bar
+/// (`Top`) and the launcher (`Overlay`) are furniture, and every one of
+/// them is as unfocusable as the bar itself. Filtering on the app id
+/// alone was not enough — it only ever hid *this* bar, so with the
+/// wallpaper and the launcher running the list showed `nitro-wallpaper`
+/// and `nitro-launcher` as windows.
 fn upsert(s: &mut Bar, ui: &mut Ui<Bar>, ids: Ids, info: &WindowInfo) {
-    if info.app_id == APP_NAME {
+    if info.app_id == APP_NAME || info.layer != Layer::Normal {
+        // A window can change layer, so this is a *removal*, not just a
+        // skip: an application that became a shell surface after it was
+        // listed would otherwise keep its button forever.
+        remove(s, ui, info.window);
         return;
     }
     let text = entry_label(info);

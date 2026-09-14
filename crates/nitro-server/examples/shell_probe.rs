@@ -231,7 +231,7 @@ fn describe(msg: &ServerMsg) -> String {
             }
         ),
         ServerMsg::WindowInfo(m) => format!(
-            "WindowInfo window={} state={:?} focused={} output={} app_id={:?} title={:?}",
+            "WindowInfo window={} state={:?} focused={} output={} layer={:?} app_id={:?} title={:?}",
             m.window.raw(),
             m.state,
             m.focused,
@@ -242,6 +242,8 @@ fn describe(msg: &ServerMsg) -> String {
             } else {
                 m.output.to_string()
             },
+            // Only `Normal` is an application; a task list filters on this.
+            m.layer,
             m.app_id,
             m.title
         ),

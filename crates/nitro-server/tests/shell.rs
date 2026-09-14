@@ -1097,6 +1097,125 @@ fn the_window_list_reflects_three_windows_and_follows_title_focus_and_close() {
 }
 
 #[test]
+fn the_window_list_carries_each_windows_layer() {
+    // A task list lists *applications*. The wallpaper, a dock and the
+    // launcher are windows as far as the server is concerned, so without
+    // this a bar cannot tell them apart — and the M3 bar listed
+    // `nitro-wallpaper` and `nitro-launcher` as if they were programs the
+    // user had opened.
+    //
+    // The layer is *carried*, not filtered here: a pager or a dock wants
+    // the full picture, so the server reports every window and the
+    // consumer decides. `nitro-bar`'s
+    // `a_shell_surface_is_not_a_window_in_the_task_list` is the other
+    // half.
+    let h = Harness::start("listlayer", OUT.0, OUT.1);
+    let mut shell_inbox = Inbox::default();
+    let mut shell = h.shell("bar");
+
+    // The ordinary client can only make `Normal` windows — a shell layer
+    // on the wire socket is a fatal protocol error — so the shell
+    // surfaces come from a second privileged connection, which is how a
+    // real wallpaper and launcher arrive too.
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("app");
+    make_window(
+        &mut conn,
+        &mut inbox,
+        1,
+        "app",
+        WIN,
+        RED,
+        0,
+        Layer::Normal,
+        1,
+    );
+
+    let mut shell_inbox2 = Inbox::default();
+    let mut surfaces = h.shell("furniture");
+    make_window(
+        &mut surfaces,
+        &mut shell_inbox2,
+        1,
+        "wallpaper",
+        WIN,
+        RED,
+        0,
+        Layer::Background,
+        1,
+    );
+    make_window(
+        &mut surfaces,
+        &mut shell_inbox2,
+        3,
+        "dock",
+        WIN,
+        RED,
+        0,
+        Layer::Top,
+        2,
+    );
+    h.settle();
+
+    shell.window_list().unwrap();
+    shell.flush().unwrap();
+    let map = await_window_count(&mut shell, &mut shell_inbox, 3, "the snapshot");
+
+    let layer_of = |title: &str| {
+        map.values()
+            .find(|i| i.title == title)
+            .unwrap_or_else(|| panic!("no window titled {title}: {map:?}"))
+            .layer
+    };
+    assert_eq!(layer_of("app"), Layer::Normal);
+    assert_eq!(layer_of("wallpaper"), Layer::Background);
+    assert_eq!(layer_of("dock"), Layer::Top);
+
+    // And a layer *change* is announced, not just the layer a window was
+    // born on. A bar filters its task list on the layer, so a window that
+    // becomes a shell surface has to leave that list — which it can only
+    // do if the change reaches the watchers at all.
+    let app_ref = *map
+        .iter()
+        .find(|(_, i)| i.title == "app")
+        .expect("the application")
+        .0;
+    surfaces
+        .tx()
+        .create_window(NodeId(5), "promoted", WIN, Layer::Normal)
+        .commit(3)
+        .unwrap();
+    surfaces.flush().unwrap();
+    h.settle();
+    let map = await_window_count(&mut shell, &mut shell_inbox, 4, "the fourth window");
+    assert_eq!(
+        map.values()
+            .find(|i| i.title == "promoted")
+            .expect("promoted")
+            .layer,
+        Layer::Normal
+    );
+
+    surfaces
+        .tx()
+        .set_layer(NodeId(5), Layer::Top)
+        .commit(4)
+        .unwrap();
+    surfaces.flush().unwrap();
+    h.settle();
+    let map = await_windows(&mut shell, &mut shell_inbox, "the layer change", |m| {
+        m.values()
+            .any(|i| i.title == "promoted" && i.layer == Layer::Top)
+    });
+    assert_eq!(map.len(), 4, "a layer change does not add an entry");
+    // The other windows are untouched by it.
+    assert_eq!(map[&app_ref].layer, Layer::Normal);
+
+    drop((conn, surfaces, shell));
+    h.quit();
+}
+
+#[test]
 fn a_shell_can_focus_minimize_and_close_another_clients_window() {
     let h = Harness::start("control", OUT.0, OUT.1);
     let mut shell_inbox = Inbox::default();

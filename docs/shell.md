@@ -330,6 +330,27 @@ retitle or an app id. The last two are why `ApplyOutcome` grew a
 `retitled` is "reshape the title bar", `relisted` is "tell the bar its
 entry moved" — and an app id change is the second without the first.
 
+### Only `Normal` windows are applications
+
+The list is **every** window, shell surfaces included: a wallpaper, a dock
+and a launcher are windows like any other as far as the server is
+concerned. So `WindowInfo` carries the window's `layer`, and a task list
+filters on `layer == Normal`.
+
+That is not a detail a consumer can skip. `nitro-bar` filtered only on its
+own app id, which hid the bar and nothing else, and a desktop running the
+wallpaper and the launcher showed `nitro-wallpaper` and `nitro-launcher`
+as entries in the task list — buttons that focus `NO_FOCUS` surfaces and
+therefore do nothing.
+
+The filtering is the **consumer's**, not the server's, because the layer
+is information a future dock or pager wants: "which bars are up" is a
+reasonable question, and a server that answered `WindowList` with only
+applications could not be asked it. A bar that lists a window whose layer
+later changes must also *remove* it, so the filter belongs on the same
+upsert path as everything else rather than at the point a window is first
+seen.
+
 ### Server-global window ids
 
 `WindowInfo.window` is a `WindowRef`, a dense `u32` the server mints. It is
