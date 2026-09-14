@@ -299,6 +299,18 @@ fn a_remote_client_gets_remote_wm_and_text_but_never_shell() {
         conn.caps()
     );
     assert!(conn.is_remote());
+    // `THEME` too, and the `Theme` that follows the `Welcome`. M4-F
+    // pushes the palette on the shared `Hello` path, so a remote client
+    // gets it for free — but "for free" is exactly the kind of claim
+    // that stops being true when two milestones land in the same week,
+    // and neither suite covered the pair. A remote app painting its
+    // first frame in built-in colours and then flashing to the user's is
+    // the defect this rules out.
+    assert!(
+        conn.has_caps(caps::THEME),
+        "a remote client is still themed: caps = {:#x}",
+        conn.caps()
+    );
     // `TEXT` follows the font scan, exactly as it does locally — a box
     // with no fonts is a legitimate configuration, so the assertion is
     // that the two agree rather than that the bit is set.
@@ -313,6 +325,21 @@ fn a_remote_client_gets_remote_wm_and_text_but_never_shell() {
     wait_for("both clients to be counted", || {
         h.stat("remote_clients") == 1 && h.stat("clients") == 2
     });
+
+    // And the palette really arrives, not just the bit promising it.
+    // The bit is a promise; the `Theme` behind the `Welcome` is the
+    // delivery, and only one of the two would fail if the push were
+    // wired to the Unix path alone.
+    let mut conn = conn;
+    let mut seen = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !seen.iter().any(|m| matches!(m, ServerMsg::Theme(_))) {
+        assert!(Instant::now() < deadline, "no Theme arrived: {seen:?}");
+        conn.flush().unwrap();
+        conn.poll(&mut seen).expect("the connection is alive");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
     drop(local);
     drop(conn);
     h.quit();
