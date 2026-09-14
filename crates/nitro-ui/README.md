@@ -70,9 +70,15 @@ socket — see below.
 `Flex` (`column()`, `row()`), `Panel`, `Label`, `Button`, `TextField`,
 `Checkbox`, `Slider`, `Scroll`, `Separator`, `Image`, `Spacer`. Each has
 a builder, a `WidgetMut` impl with setters, and `role`/`accessible`/
-`action` so the introspection socket can read and drive it. Colours,
-sizes, radius and padding come from a [`Theme`], overridable at `App`
-level.
+`action` so the introspection socket can read and drive it. Sizes, radius
+and padding come from a `Theme`, overridable at `App` level.
+
+**Colours do not.** They come from the desktop's palette, which the
+server owns and pushes: `Theme` is a *view* on it, so a built-in widget
+follows the user's `theme.scheme` with no code. A custom widget asks for
+a role — `cx.color(ColorRole::Surface)` — and a label takes one with
+`.color_role(ColorRole::TextDim)`; writing a colour down is a build
+failure (`deploy/lint-colors.sh`). See `docs/theme.md`.
 
 Two cost claims worth knowing, both checked by the harness: a
 `TextField`'s size comes from its *font*, not its contents, so typing

@@ -141,6 +141,18 @@ impl App {
     }
 
     /// Override the theme.
+    ///
+    /// Apps do not normally call this. Colours come from the **server**:
+    /// it owns the palette, pushes it right behind the `Welcome`, and
+    /// `Ui` re-derives the theme from it — so a scheme switch reaches an
+    /// app that never mentions a theme at all. Setting one here is for
+    /// an app that wants its own *metrics* (font size, radius,
+    /// paddings), which are not colours and which a palette change
+    /// leaves alone; `nitro-term` is the one caller in this tree, and it
+    /// overrides two colour fields on purpose (see
+    /// `nitro_term::term_theme`).
+    ///
+    /// It is also what a test uses to pin a look without a server.
     #[must_use]
     pub fn theme(mut self, theme: Theme) -> Self {
         self.theme = theme;
