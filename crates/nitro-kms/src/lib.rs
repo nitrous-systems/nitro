@@ -329,14 +329,28 @@ pub trait Backend {
     fn rescan(&mut self) -> Result<bool, Error>;
 
     /// The session went inactive (VT switch). Stop committing; keep all
-    /// state. A flip already in flight will still complete and report.
+    /// state, including a flip already in flight: it stays pending here,
+    /// and if the kernel does deliver its completion while the session is
+    /// away, [`Backend::dispatch`] retires it in the usual way. Nothing is
+    /// stranded if it never arrives, because [`Backend::resume`] clears
+    /// the flag unconditionally.
     fn pause(&mut self);
 
     /// The session is active again. Re-modesets every output (DRM master
     /// may have been revoked and re-granted; CRTC state does not survive
-    /// that, buffers do). Any flip in flight is abandoned:
-    /// [`Backend::flip_pending`] is false for every output afterwards, and
-    /// the caller must repaint fully.
+    /// that, buffers do).
+    ///
+    /// **Post-condition:** any flip in flight is abandoned, so
+    /// [`Backend::flip_pending`] is false for every output afterwards and
+    /// the caller must repaint fully. This is a promise, not an
+    /// observation about the kernel: correctness must not depend on a
+    /// page-flip event still being delivered on the fd after DRM master
+    /// was revoked and re-granted. Today's kernel does deliver it, which
+    /// is exactly why the guarantee is worth stating — without it the
+    /// server's next paint would be turned away with
+    /// [`Error::FlipPending`] for a completion that may never come, and
+    /// the output would stall until the next resume or hotplug. A stale
+    /// event arriving later finds nothing pending and retires nothing.
     ///
     /// # Errors
     /// [`Error::Io`] if the modeset is rejected.

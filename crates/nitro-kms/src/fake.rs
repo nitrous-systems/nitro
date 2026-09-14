@@ -440,7 +440,15 @@ impl Backend for FakeBackend {
         // With nothing in flight there is no flip left to report, so the
         // timer must go too: an idle paused-then-resumed fake makes no
         // wakeups, as the module docs promise.
-        self.disarm()
+        let r = self.disarm();
+        // The same post-condition the DRM backend asserts, checked here
+        // too so a test backend cannot drift from the contract it stands
+        // in for.
+        debug_assert!(
+            !self.outputs.iter().any(|o| o.pending),
+            "resume must leave no output flip-pending"
+        );
+        r
     }
 
     fn read_front(&mut self, output: OutputId) -> Result<Image, Error> {

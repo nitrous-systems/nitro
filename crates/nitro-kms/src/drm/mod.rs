@@ -874,7 +874,18 @@ impl Backend for DrmBackend<'_> {
             // repaints fully after a resume.
             o.pending = false;
         }
-        self.modeset_all()
+        let r = self.modeset_all();
+        // The post-condition `Backend::resume` promises its caller, checked
+        // rather than merely described: nothing is flip-pending, so the
+        // server's next paint pass is never turned away by `FlipPending`
+        // for a flip whose completion event may never arrive. A stale
+        // event that *does* arrive afterwards finds no matching pending
+        // output and retires nothing.
+        debug_assert!(
+            !self.outputs.iter().any(|o| o.pending),
+            "resume must leave no output flip-pending"
+        );
+        r
     }
 
     fn read_front(&mut self, output: OutputId) -> Result<Image, Error> {

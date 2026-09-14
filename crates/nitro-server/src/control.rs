@@ -126,6 +126,18 @@ impl Client {
     }
 
     /// Drain everything readable into `input`.
+    ///
+    /// The buffer is capped whether or not it holds a newline. The
+    /// obvious guard — "too long *and* no newline yet" — only catches a
+    /// client that never sends one: `"outputs\n"` followed by unbounded
+    /// junk in the same read pass keeps a newline present, so the check
+    /// never trips and the buffer grows until the pass ends. The real
+    /// invariant is that no *line* may exceed [`MAX_LINE`], and what
+    /// bounds the buffer is the unterminated tail after the last newline,
+    /// since everything before it is about to be drained by
+    /// [`take_line`](crate::protocol::take_line).
+    ///
+    /// [`MAX_LINE`]: crate::protocol::MAX_LINE
     pub fn read(&mut self) -> ReadOutcome {
         let mut buf = [0u8; 1024];
         loop {
@@ -133,8 +145,7 @@ impl Client {
                 Ok(0) => return ReadOutcome::Closed,
                 Ok(n) => {
                     self.input.extend_from_slice(&buf[..n]);
-                    if self.input.len() > crate::protocol::MAX_LINE && !self.input.contains(&b'\n')
-                    {
+                    if self.overflowed() {
                         return ReadOutcome::Overflow;
                     }
                 }
@@ -143,6 +154,26 @@ impl Client {
                 Err(_) => return ReadOutcome::Closed,
             }
         }
+    }
+
+    /// Whether the buffer holds a line that can never be accepted: a
+    /// complete one over [`crate::protocol::MAX_LINE`], or an unterminated
+    /// tail that has already passed it.
+    fn overflowed(&self) -> bool {
+        let max = crate::protocol::MAX_LINE;
+        let mut start = 0;
+        for i in self
+            .input
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| (*b == b'\n').then_some(i))
+        {
+            if i - start > max {
+                return true;
+            }
+            start = i + 1;
+        }
+        self.input.len() - start > max
     }
 
     /// Queue a reply.
@@ -247,5 +278,59 @@ mod tests {
         peer.write_all(&vec![b'x'; crate::protocol::MAX_LINE + 1])
             .unwrap();
         assert_eq!(client.read(), ReadOutcome::Overflow);
+    }
+
+    /// The guard used to be "too long *and* no newline anywhere", which a
+    /// client could sidestep by sending one valid line first: the newline
+    /// was present, so the check never tripped and the junk after it grew
+    /// the buffer for the rest of the read pass.
+    #[test]
+    fn client_overflow_behind_a_complete_line() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let mut client = Client::new(a).unwrap();
+        let mut peer = b;
+        let mut msg = b"outputs\n".to_vec();
+        msg.extend(std::iter::repeat_n(b'x', crate::protocol::MAX_LINE + 1));
+        peer.write_all(&msg).unwrap();
+        assert_eq!(client.read(), ReadOutcome::Overflow);
+    }
+
+    /// And a *complete* over-long line is refused too: it could never be
+    /// accepted, so there is no reason to buffer the rest of it.
+    #[test]
+    fn client_overflow_on_a_complete_over_long_line() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let mut client = Client::new(a).unwrap();
+        let mut peer = b;
+        let mut msg = vec![b'x'; crate::protocol::MAX_LINE + 1];
+        msg.push(b'\n');
+        peer.write_all(&msg).unwrap();
+        assert_eq!(client.read(), ReadOutcome::Overflow);
+    }
+
+    /// Many lines, none of them over the cap, is not an overflow however
+    /// much it adds up to: the buffer is drained a line at a time.
+    #[test]
+    fn many_short_lines_are_not_an_overflow() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let mut client = Client::new(a).unwrap();
+        let mut peer = b;
+        let msg = b"stats\n".repeat(crate::protocol::MAX_LINE);
+        peer.write_all(&msg).unwrap();
+        assert_eq!(client.read(), ReadOutcome::Open);
+        assert_eq!(client.input.len(), msg.len());
+    }
+
+    /// A line of exactly `MAX_LINE` bytes is accepted; the cap is a
+    /// maximum, not an exclusive bound.
+    #[test]
+    fn a_line_exactly_at_the_cap_is_accepted() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let mut client = Client::new(a).unwrap();
+        let mut peer = b;
+        let mut msg = vec![b'x'; crate::protocol::MAX_LINE];
+        msg.push(b'\n');
+        peer.write_all(&msg).unwrap();
+        assert_eq!(client.read(), ReadOutcome::Open);
     }
 }
