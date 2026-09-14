@@ -594,9 +594,25 @@ store — which is the shape the autovectorizer wants.
 
 Two of the early-`continue`s are deliberately **not** carried into the
 interior. Skipping a fully transparent texel and blending it write the same
-bytes, so those branches bought nothing and cost the vectorizer everything.
-That was the lesson of the *first* attempt at this split, which kept them and
-was slower.
+RGB bytes, so those branches bought nothing and cost the vectorizer
+everything. That was the lesson of the *first* attempt at this split, which
+kept them and was slower.
+
+**One observable difference comes out of that, and it is deliberate**
+(issue #553). The old loop's `continue` on a transparent texel left the
+destination pixel *entirely* untouched, including byte 3 — the unused X byte
+of XRGB8888. The interior run has no early-out and always stores `0` there.
+That is the crate's contract, not a regression: **every** write path in
+`nitro-raster` stores 0 in the X byte (`fill_irect`, `blit_1to1`, the stroke
+band loop, the mask paths), nothing in the tree or in scanout ever reads it,
+and a destination painted by this crate already holds 0 there before the blit
+runs — so the output is identical for every in-tree caller. The odd one out
+was the `continue`, not the store. The tests cannot see the difference (the
+golden-hash sweep paints its background with `fill_irect` first, which has
+already zeroed byte 3), which is exactly why it is written down here and in
+`blend_texel_unguarded`'s doc comment: if byte 3 should ever be *preserved*,
+that is a crate-wide decision about the pixel-format contract, not a blit
+detail, and it must not be "fixed" at one of the two runs.
 
 **The third one is not like the other two, and dropping it was a bug.** See
 [the guard that looks redundant](#the-guard-that-looks-redundant) — it is the

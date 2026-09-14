@@ -1243,6 +1243,13 @@ impl RowSampler<'_> {
 /// columns are one contiguous run and finding its ends is two divisions
 /// rather than a per-pixel comparison. Outside it the sample edge-extends and
 /// the pair has to be assembled by hand; inside, the row is two 8-byte slices.
+///
+/// The two subtractions from `base` saturate: a pathological `dst` (sub-pixel
+/// width straddling a column boundary) can drive `base` to `i64::MIN`, and
+/// `first - base` would then overflow. Unreachable from the scene, which
+/// clamps rects long before this, and not a regression — the pre-split
+/// `fixed += step` overflowed on the same input — but free to close here
+/// (issue #553).
 fn texels_in_range(
     base: i64,
     step: i64,
@@ -1261,14 +1268,14 @@ fn texels_in_range(
     // Smallest `k >= 0` with `base + k * step >= first`, i.e. the ceiling
     // division `(first - base) / step` (`i64::div_ceil` is still unstable).
     let k0 = if first > base {
-        let d = first - base;
+        let d = first.saturating_sub(base);
         d / step + i64::from(d % step != 0)
     } else {
         0
     };
     // Largest `k` with `base + k * step < last`, plus one.
     let k1 = if last > base {
-        (last - base - 1).div_euclid(step) + 1
+        (last.saturating_sub(base) - 1).div_euclid(step) + 1
     } else {
         0
     };
@@ -1423,6 +1430,21 @@ fn blend_texel(d: &mut [u8], t: &Texel, extra: u32) {
 /// all-zero `t` -- either because `t` came straight from [`bilinear`] and
 /// `extra >= 128` (see [`blit_run_inner`]), or because `extra` has already
 /// been zeroed. Everywhere else, use [`blend_texel`].
+///
+/// # The X byte (issue #553)
+///
+/// This run stores `0` into byte 3 for **every** destination pixel it touches,
+/// including fully transparent texels. The pre-split general loop `continue`d
+/// on `t.a == 0` and so left the pixel — X byte included — entirely alone.
+/// The store is the deliberate behaviour and the `continue` was the anomaly:
+/// the crate's contract is that every write path stores 0 in the X byte of
+/// XRGB8888 (`fill_irect`, `blit_1to1`, the stroke band loop and the mask
+/// paths all do), the byte is never read by anything in the tree or by the
+/// scanout hardware, and a destination painted by this crate therefore already
+/// holds 0 there before a blit runs. Output is identical for every in-tree
+/// caller. Preserving byte 3 instead would be a crate-wide decision about the
+/// pixel-format contract, not a blit detail — do not "fix" the two runs into
+/// agreement in that direction.
 #[inline]
 fn blend_texel_unguarded(d: &mut [u8], t: &Texel, extra: u32) {
     let alpha = div255(t.a * extra);
