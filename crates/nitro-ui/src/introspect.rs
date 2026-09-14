@@ -969,6 +969,21 @@ fn flags<S: 'static>(ui: &Ui<S>, node: &Node) -> String {
     }
 }
 
+/// One introspection property of one widget, as `hey … get <path>
+/// <prop>` serves it.
+///
+/// The protocol's own `get` is private because it formats a reply; this
+/// is the same lookup without the framing, so a test can assert on the
+/// property a script would actually read rather than on the widget's
+/// `Access` — which is a different thing, and the box run for M4-A found
+/// exactly that gap: `value` was right and `text` was empty.
+///
+/// # Errors
+/// `no such widget` for an unresolvable path, or `unknown property`.
+pub fn get_prop<S: 'static>(ui: &Ui<S>, path: &str, prop: &str) -> Result<String, String> {
+    get(ui, path, Some(prop)).map(|s| s.trim_end_matches('\n').to_owned())
+}
+
 /// `get`: every property, or one.
 fn get<S: 'static>(ui: &Ui<S>, path: &str, prop: Option<&str>) -> Result<String, String> {
     let id = resolve(ui, path).ok_or("no such widget")?;
@@ -979,7 +994,16 @@ fn get<S: 'static>(ui: &Ui<S>, path: &str, prop: Option<&str>) -> Result<String,
         .address_name(id)
         .filter(|n| addressable(n))
         .unwrap_or_default();
-    let text = if matches!(node.role, Role::Label | Role::Button | Role::TextField) {
+    // `text` is the value of the widgets whose value *is* text, which
+    // is what lets a caller ask "what does this read" without knowing
+    // the role. A terminal's screen belongs in that set for the same
+    // reason a label's string does — and it is the whole of how
+    // `nitro-term` is driven from outside, since reading the screen as
+    // text is what replaces a font, a screenshot and an OCR step.
+    let text = if matches!(
+        node.role,
+        Role::Label | Role::Button | Role::TextField | Role::Terminal
+    ) {
         value.clone()
     } else {
         String::new()

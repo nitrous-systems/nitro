@@ -257,14 +257,19 @@ fn hey_addresses_the_grid_by_name() {
     });
 
     // And reading it back is a screen dump, with no font and no
-    // screenshot involved.
-    let dump = h
-        .ui()
-        .accessible(grid)
-        .expect("accessible")
-        .value
-        .unwrap_or_default();
-    assert!(dump.contains("scripted"), "get grid value dumps the screen");
+    // screenshot involved. Both spellings: `value` is what every widget
+    // answers, and `text` is what a caller asks when it wants "what does
+    // this read" without knowing the role — the box run found that one
+    // returning nothing, because `Role::Terminal` was not in the set the
+    // `text` property is derived for.
+    for prop in ["value", "text"] {
+        let dump = nitro_ui::introspect::get_prop(h.ui(), &format!("window/{GRID_NAME}"), prop)
+            .expect("get");
+        assert!(
+            dump.contains("scripted"),
+            "get grid {prop} should dump the screen, got {dump:?}"
+        );
+    }
     h.quit();
 }
 
