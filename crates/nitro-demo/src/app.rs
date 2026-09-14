@@ -170,6 +170,14 @@ pub struct App {
     pacing_mark: (u64, u64),
     /// When the last periodic summary went out.
     last_summary: Instant,
+    /// Whether this connection's windows actually carry the image node.
+    ///
+    /// False over a **remote** link, where the image's buffer cannot be
+    /// passed. Recorded rather than re-derived from `caps` at each use
+    /// so there is one answer: a `reconfigure` that laid out a node the
+    /// build never created is a fatal `UnknownNode`, and that asymmetry
+    /// is precisely the bug this field exists to prevent.
+    has_image: bool,
 }
 
 impl App {
@@ -210,6 +218,7 @@ impl App {
             started: now,
             pacing_mark: (0, 0),
             last_summary: now,
+            has_image: false,
         };
         app.build()?;
         Ok(app)
@@ -222,11 +231,28 @@ impl App {
     }
 
     /// Build every window's scene and commit it as one transaction.
+    ///
+    /// Over a **remote** connection the image is left out: its pixels
+    /// ride on a file descriptor, which TCP cannot carry, and the server
+    /// says so in `Welcome` with `caps::REMOTE`. Checking the bit is why
+    /// the demo runs remotely at all — without it the first transaction
+    /// dies with "file descriptors cannot be passed over a remote link"
+    /// and there is no latency to measure. See `docs/remote.md`.
     fn build(&mut self) -> Result<(), Error> {
-        let pixels = scene::checker(IMG_EDGE);
+        let remote = self.conn.has_caps(nitro_wire::types::caps::REMOTE);
+        self.has_image = !remote;
+        let pixels = if remote {
+            Vec::new()
+        } else {
+            scene::checker(IMG_EDGE)
+        };
         let mut batch = Vec::new();
         for (i, win) in self.windows.iter().enumerate() {
-            let fd = scene::memfd(&pixels)?;
+            let fd = if remote {
+                None
+            } else {
+                Some(scene::memfd(&pixels)?)
+            };
             let title = format!("nitro-demo {}", i + 1);
             batch.extend(scene::build(win.ids, win.size, &title, fd));
         }
@@ -387,7 +413,11 @@ impl App {
         for i in 0..self.windows.len() {
             if let Some(size) = reconfigured[i] {
                 self.windows[i].size = size;
-                batch.extend(scene::reconfigure(self.windows[i].ids, size));
+                batch.extend(scene::reconfigure(
+                    self.windows[i].ids,
+                    size,
+                    self.has_image,
+                ));
             }
             if let Some((pos, ns)) = motions[i] {
                 let win = &self.windows[i];

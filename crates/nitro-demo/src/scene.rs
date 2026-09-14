@@ -195,9 +195,17 @@ pub fn backdrop(size: Size) -> Fill {
 /// Build one window's whole scene, ready to commit.
 ///
 /// `fd` is the image buffer's descriptor; the server `pread`s the pixels
-/// out of it when the message arrives.
+/// out of it when the message arrives. `None` — which is what a
+/// **remote** connection gets — builds the same scene **without** the
+/// image node and its buffer: a buffer is a file descriptor, and a
+/// descriptor cannot cross TCP (`caps::REMOTE`, `docs/remote.md`).
+///
+/// Skipping the node rather than sending an empty one is deliberate: an
+/// `Image` with no buffer is a hole in the scene, and the demo's job
+/// over a remote link is to measure the latency of everything that
+/// *does* work.
 #[must_use]
-pub fn build(ids: Ids, size: Size, title: &str, fd: OwnedFd) -> Vec<ClientMsg> {
+pub fn build(ids: Ids, size: Size, title: &str, fd: Option<OwnedFd>) -> Vec<ClientMsg> {
     let mut out = Vec::with_capacity(64);
     out.push(
         CreateWindow {
@@ -210,7 +218,9 @@ pub fn build(ids: Ids, size: Size, title: &str, fd: OwnedFd) -> Vec<ClientMsg> {
         .into(),
     );
     build_backdrop(&mut out, ids, size);
-    build_image(&mut out, ids, size, fd);
+    if let Some(fd) = fd {
+        build_image(&mut out, ids, size, fd);
+    }
     build_mover(&mut out, ids, size);
     build_follower(&mut out, ids);
     build_outlines(&mut out, ids);
@@ -393,8 +403,14 @@ fn rect(out: &mut Vec<ClientMsg>, id: NodeId, parent: NodeId, bounds: Rect) {
 }
 
 /// Re-lay-out a window for a new size, in answer to a `Configure`.
+///
+/// `has_image` says whether this window's scene actually contains the
+/// image node. A **remote** window does not ([`build`] with `None`), and
+/// naming a node that was never created is a fatal `UnknownNode` — which
+/// is exactly how this was found: the remote demo came up, painted, and
+/// died on the first `Configure`.
 #[must_use]
-pub fn reconfigure(ids: Ids, size: Size) -> Vec<ClientMsg> {
+pub fn reconfigure(ids: Ids, size: Size, has_image: bool) -> Vec<ClientMsg> {
     let mut out = Vec::with_capacity(8);
     out.push(
         SetBounds {
@@ -421,13 +437,15 @@ pub fn reconfigure(ids: Ids, size: Size) -> Vec<ClientMsg> {
             .into(),
         );
     }
-    out.push(
-        SetBounds {
-            id: ids.image,
-            rect: image_rect(size),
-        }
-        .into(),
-    );
+    if has_image {
+        out.push(
+            SetBounds {
+                id: ids.image,
+                rect: image_rect(size),
+            }
+            .into(),
+        );
+    }
     out
 }
 
@@ -682,7 +700,7 @@ mod tests {
     fn a_build_creates_the_window_first_and_every_node_once() {
         let ids = Ids::for_window(0);
         let fd = memfd(&checker(IMG_EDGE)).unwrap();
-        let msgs = build(ids, WINDOW_SIZE, "demo", fd);
+        let msgs = build(ids, WINDOW_SIZE, "demo", Some(fd));
         assert!(matches!(msgs.first(), Some(ClientMsg::CreateWindow(_))));
         let mut created: Vec<u32> = msgs
             .iter()
@@ -711,7 +729,7 @@ mod tests {
     fn the_buffer_is_created_before_it_is_used() {
         let ids = Ids::for_window(0);
         let fd = memfd(&checker(IMG_EDGE)).unwrap();
-        let msgs = build(ids, WINDOW_SIZE, "demo", fd);
+        let msgs = build(ids, WINDOW_SIZE, "demo", Some(fd));
         let create = msgs
             .iter()
             .position(|m| matches!(m, ClientMsg::CreateBuffer(_)))
@@ -723,13 +741,99 @@ mod tests {
         assert!(create < set);
     }
 
+    /// A **remote** connection gets the same scene without the image:
+    /// its pixels ride on a descriptor, and TCP has no way to carry one.
+    /// Everything else — backdrop, cards, mover, follower, outlines — is
+    /// byte-for-byte what a local client sends, which is what makes the
+    /// remote latency figures comparable to the local ones.
+    #[test]
+    fn a_remote_build_drops_the_image_and_keeps_everything_else() {
+        let ids = Ids::for_window(0);
+        let local = build(
+            ids,
+            WINDOW_SIZE,
+            "demo",
+            Some(memfd(&checker(IMG_EDGE)).unwrap()),
+        );
+        let remote = build(ids, WINDOW_SIZE, "demo", None);
+        assert!(
+            !remote
+                .iter()
+                .any(|m| matches!(m, ClientMsg::CreateBuffer(_) | ClientMsg::SetImage(_))),
+            "a remote scene carries no buffer and no image"
+        );
+        let nodes = |msgs: &[ClientMsg]| -> Vec<u32> {
+            msgs.iter()
+                .filter_map(|m| match m {
+                    ClientMsg::CreateNode(c) => Some(c.id.raw()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let (l, r) = (nodes(&local), nodes(&remote));
+        assert_eq!(r.len(), l.len() - 1, "exactly one node fewer");
+        assert!(!r.contains(&ids.image.raw()));
+        assert!(
+            l.iter().filter(|id| **id != ids.image.raw()).eq(r.iter()),
+            "and the rest, in the same order"
+        );
+        // The window still comes first, so the scene is still buildable.
+        assert!(matches!(remote.first(), Some(ClientMsg::CreateWindow(_))));
+    }
+
+    /// A remote window's `reconfigure` must not name the image node.
+    ///
+    /// The bug this pins was found on the box and not by any of the 61
+    /// tests above: the remote demo connected, built a scene without the
+    /// image, painted — and died on the **first `Configure`** with
+    /// `UnknownNode: no node with id 7`, because the re-layout still laid
+    /// out a node the build had never created. Dropping a node from a
+    /// scene is not one edit, it is two, and the second one is in a code
+    /// path that only runs when the window is resized.
+    #[test]
+    fn a_remote_reconfigure_lays_out_only_nodes_that_exist() {
+        let ids = Ids::for_window(0);
+        let built: Vec<u32> = build(ids, WINDOW_SIZE, "demo", None)
+            .iter()
+            .filter_map(|m| match m {
+                ClientMsg::CreateNode(c) => Some(c.id.raw()),
+                _ => None,
+            })
+            .collect();
+        let laid_out: Vec<u32> = reconfigure(ids, Size::new(800.0, 600.0), false)
+            .iter()
+            .filter_map(|m| match m {
+                ClientMsg::SetBounds(b) => Some(b.id.raw()),
+                ClientMsg::SetFill(f) => Some(f.id.raw()),
+                _ => None,
+            })
+            .collect();
+        for id in &laid_out {
+            assert!(
+                built.contains(id) || *id == ids.window.raw(),
+                "reconfigure names node {id}, which a remote build never created"
+            );
+        }
+        assert!(!laid_out.contains(&ids.image.raw()));
+        // And the local form still does lay the image out, or the local
+        // window would stop resizing its picture.
+        let local: Vec<u32> = reconfigure(ids, Size::new(800.0, 600.0), true)
+            .iter()
+            .filter_map(|m| match m {
+                ClientMsg::SetBounds(b) => Some(b.id.raw()),
+                _ => None,
+            })
+            .collect();
+        assert!(local.contains(&ids.image.raw()));
+    }
+
     /// The trail must be created before the follower, or the ghost would
     /// paint over the thing it is a ghost of.
     #[test]
     fn the_follower_is_above_its_trail() {
         let ids = Ids::for_window(0);
         let fd = memfd(&checker(IMG_EDGE)).unwrap();
-        let msgs = build(ids, WINDOW_SIZE, "demo", fd);
+        let msgs = build(ids, WINDOW_SIZE, "demo", Some(fd));
         let at = |id: NodeId| {
             msgs.iter().position(|m| match m {
                 ClientMsg::CreateNode(c) => c.id == id,

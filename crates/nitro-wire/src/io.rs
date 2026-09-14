@@ -67,6 +67,23 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 /// Unanswered probes before the connection is declared dead.
 const KEEPALIVE_COUNT: u32 = 3;
 
+/// Environment variable that turns `TCP_NODELAY` off, for measurement.
+///
+/// See [`Socket::from_tcp`]: the point of the option is a latency claim,
+/// and a latency claim with no measurement behind it is a comment.
+pub const NODELAY_ENV: &str = "NITRO_TCP_NODELAY";
+
+/// Whether to set `TCP_NODELAY` — true unless `NITRO_TCP_NODELAY=0`.
+///
+/// Only the exact string `0` disables it. A variable set to anything
+/// else (including empty, or a typo) leaves the latency-correct default
+/// in place: the failure mode of a fuzzy match here is a desktop that is
+/// mysteriously slow, and nobody would connect that to an environment
+/// variable they misspelled.
+fn nodelay_wanted() -> bool {
+    std::env::var_os(NODELAY_ENV).is_none_or(|v| v != "0")
+}
+
 /// A non-blocking `SOCK_STREAM` connection with `SCM_RIGHTS` fd passing.
 ///
 /// The same type serves both directions: the client wraps the socket it
@@ -110,12 +127,20 @@ impl Socket {
     /// Nagle's algorithm holds back waiting for more to coalesce.
     /// `docs/remote.md` has the measured difference.
     ///
+    /// `NITRO_TCP_NODELAY=0` turns it off. It exists so the claim above
+    /// can be *measured* rather than asserted — the same binary, the same
+    /// window, the same machine pair, one socket option flipped, which is
+    /// the only A/B that isolates Nagle from everything else that differs
+    /// between a local and a remote run. It is read on every connection
+    /// rather than cached, so a measurement script can flip it between
+    /// runs, and nothing in the tree sets it.
+    ///
     /// # Errors
     /// If the descriptor cannot be made non-blocking, or the socket
     /// option cannot be set.
     pub fn from_tcp(fd: OwnedFd) -> Result<Self, Error> {
         rustix::io::ioctl_fionbio(&fd, true)?;
-        sockopt::set_tcp_nodelay(&fd, true)?;
+        sockopt::set_tcp_nodelay(&fd, nodelay_wanted())?;
         Ok(Self {
             fd,
             scratch: vec![0; RECV_CHUNK],
