@@ -679,6 +679,45 @@ about: **1.7 flips/s** over the typing run, nowhere near the 60.0 that
 would mean the queue was full and the number was backlog rather than
 latency.
 
+## Rasterizer time budget
+
+The other half of "small" is how long a frame takes to paint. The
+`nitro-raster` benchmark's targets live in `crates/nitro-raster/README.md`
+("Against the targets"); the milestone-level statement belongs here, because
+the targets were **revised at M4 on a human decision** (issue #522) rather
+than met.
+
+| scene (box, 1920×1080, single-threaded) | old target | **target** | measured |
+|---|---|---|---|
+| (a) `solid_fill` | < 1.5 ms | at memory speed | 1.83 ms |
+| (e) `ui_frame` | < 4 ms | **≤ 5.3 ms** | 5.22 ms |
+| (d) `blits` | < 10 ms | **≤ 37 ms** | 36.09 ms |
+
+The measurements are unchanged and their history is kept in full in the
+raster README — what moved is the line drawn against them. Four reasons,
+recorded so a future milestone can re-open the decision on the same terms:
+
+1. **The running compositor does not pay `ui_frame`.** Since the shadow
+   buffer (#539/#3695) the server paints ~**0.4 ms of damage per frame**
+   (§4.5 of `docs/latency.md`); `ui_frame` is a *full-frame synthetic*
+   painting 1.77 M pixels, 85 % of the screen, over 20 clip rects. The 4 ms
+   target was set when a full-screen repaint was the plausible worst case.
+2. **Nothing but SIMD closes the remaining gap.** Two rounds (#3693, #3702)
+   took `ui_frame` 9.36 → 5.22 ms and blits 38.05 → 36.09 ms, and both ended
+   at the same wall: per-pixel blend throughput on an SSE4.2-only CPU. An
+   instrumented breakdown puts an *alpha-free* bilinear blit at 11.4 ms on the
+   **faster** machine, i.e. above the old 10 ms blit target as a pure bound.
+   Explicit SIMD means `std::arch` — an `unsafe` exception in a crate whose
+   point is `#![forbid(unsafe_code)]` — or `std::simd`, which is nightly.
+   Neither is worth it here; see `DEPENDENCIES.md` on the `unsafe` rule.
+3. **The blit scene stresses a path the desktop barely uses.** Instrumented,
+   the whole running desktop sends **0.288 % of its painted pixels** through
+   `blit_scaled`.
+4. **There is a natural time to revisit**: M5's Wayland adapter and dma-buf
+   import decide whether full-screen image blits go through the CPU rasterizer
+   at all. If they do, the decision gets re-made against the real workload.
+
+
 ## Dependency count
 
 `cargo tree -e normal --prefix none | sort -u | wc -l` = **74** at M4-A
