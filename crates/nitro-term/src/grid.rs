@@ -380,7 +380,24 @@ pub struct Grid {
     /// The primary screen while the alternate one is active.
     saved_lines: Option<Vec<Vec<Cell>>>,
     /// Finished lines pushed off the top of the primary screen.
+    /// Finished lines, oldest first, **trimmed of trailing default
+    /// blanks**.
+    ///
+    /// A scrollback line is immutable history: nothing will ever write
+    /// to column 60 of a line that ended at column 12, so the 68 blank
+    /// cells after it are 1 088 bytes recording that nothing is there.
+    /// Storing them cost 12.8 MB of the 29.4 MB RSS the first box run
+    /// measured with a full 10 000-line buffer, which is why this is a
+    /// `Vec` of *varying* length while `lines` (the live screen, which
+    /// is written to everywhere) is not.
+    ///
+    /// [`Grid::display_row`] still hands out a full-width row — see
+    /// [`Grid::pad`] — so nothing outside this module sees the
+    /// difference.
     history: VecDeque<Vec<Cell>>,
+    /// A full row of blanks, to pad a trimmed history line back to width
+    /// without allocating on every read. Resized with the grid.
+    pad_row: Vec<Cell>,
     /// Ring capacity; zero means no scrollback at all.
     history_max: usize,
     /// How many lines back the view is scrolled, 0 = live.
@@ -416,6 +433,7 @@ impl Grid {
             lines: vec![blank_line(cols); rows],
             saved_lines: None,
             history: VecDeque::new(),
+            pad_row: vec![Cell::blank(); cols],
             history_max: scrollback,
             view_offset: 0,
             cursor: Cursor::default(),
@@ -471,6 +489,12 @@ impl Grid {
             }
         }
         self.cols = cols;
+        // The pad row follows the width. History lines are deliberately
+        // *not* resized: they are trimmed already, and a narrowing that
+        // rewrote ten thousand of them would be the reflow this design
+        // explicitly does not do (`docs/term.md`). A history line longer
+        // than the new width is clipped where it is read.
+        self.pad_row = vec![Cell::blank(); cols];
         self.fit_rows(rows);
         self.rows = rows;
         self.scroll_top = 0;
@@ -505,13 +529,44 @@ impl Grid {
     // --- what a viewer reads -------------------------------------
 
     /// Row `i` of what is on screen *now*, honouring the scrollback
-    /// offset.
+    /// offset, **padded to the full width**.
+    ///
+    /// A scrollback line is stored trimmed of its trailing blanks (see
+    /// the `history` field), so this returns one of two slices: the live
+    /// row itself, or a trimmed history row — and for the short case the
+    /// caller is handed [`Grid::pad`] to finish it. Callers that only
+    /// look at the significant cells (`row_runs`, `row_text`, which
+    /// trim anyway) can use [`Grid::display_row_raw`] and skip the
+    /// question entirely.
     ///
     /// # Panics
     ///
     /// If `i` is not a valid row index.
     #[must_use]
-    pub fn display_row(&self, i: usize) -> &[Cell] {
+    pub fn display_row(&self, i: usize) -> std::borrow::Cow<'_, [Cell]> {
+        let row = self.display_row_raw(i);
+        if row.len() >= self.cols {
+            return std::borrow::Cow::Borrowed(&row[..self.cols]);
+        }
+        let mut out = Vec::with_capacity(self.cols);
+        out.extend_from_slice(row);
+        out.extend_from_slice(&self.pad_row[row.len()..self.cols]);
+        std::borrow::Cow::Owned(out)
+    }
+
+    /// Row `i` as it is stored: the live row at full width, or a
+    /// scrollback row trimmed of its trailing default blanks.
+    ///
+    /// This is the allocation-free form, and the one the widget's paint
+    /// path uses — every caller inside this module trims the row before
+    /// looking at it anyway, so the padding [`Grid::display_row`] adds
+    /// would be built only to be ignored.
+    ///
+    /// # Panics
+    ///
+    /// If `i` is not a valid row index.
+    #[must_use]
+    pub fn display_row_raw(&self, i: usize) -> &[Cell] {
         assert!(i < self.rows, "row {i} out of range");
         // The view is a window over `history ++ lines`, anchored
         // `view_offset` rows above the bottom of `lines`.
@@ -535,7 +590,7 @@ impl Grid {
     ///
     /// If `i` is not a valid row index.
     pub fn row_runs(&self, i: usize, out: &mut Vec<Run>) {
-        let cells = self.display_row(i);
+        let cells = self.display_row_raw(i);
         let end = trimmed_len(cells);
         let mut col = 0;
         while col < end {
@@ -564,7 +619,7 @@ impl Grid {
     /// If `i` is not a valid row index.
     #[must_use]
     pub fn row_text(&self, i: usize) -> String {
-        let cells = self.display_row(i);
+        let cells = self.display_row_raw(i);
         let end = trimmed_len(cells);
         cells[..end]
             .iter()
@@ -1131,6 +1186,13 @@ impl Grid {
         if self.history.len() == self.history_max {
             self.history.pop_front();
         }
+        // Trim on the way in: see the field's docs. `shrink_to_fit` is
+        // what actually returns the memory — a `truncate` alone leaves
+        // the full-width allocation attached to the `Vec`, which is the
+        // whole thing being paid for here.
+        let mut line = line;
+        line.truncate(trimmed_len(&line));
+        line.shrink_to_fit();
         self.history.push_back(line);
         self.view_offset = self.view_offset.min(self.history.len());
     }
@@ -2026,6 +2088,58 @@ mod tests {
         assert_eq!(g.row_text(0), "你", "a wide char in one column is narrowed");
         g.resize(0, 0);
         assert_eq!((g.cols(), g.rows()), (1, 1));
+    }
+
+    #[test]
+    fn scrollback_lines_are_stored_trimmed_but_read_back_full_width() {
+        // The box run measured 29.4 MB of RSS with a full 10 000-line
+        // buffer against a 6 MB target, and the arithmetic said why:
+        // 10 000 rows x 80 cells x 16 bytes is 12.8 MB, nearly all of it
+        // recording that nothing is there. A scrollback line is
+        // immutable, so its trailing blanks carry no information.
+        //
+        // Both halves matter: the storage is short, and every reader
+        // still sees a full-width row.
+        let mut g = Grid::new(80, 2, 10);
+        for _ in 0..5 {
+            put(&mut g, "hi");
+            g.carriage_return();
+            g.line_feed();
+        }
+        assert!(g.scrollback_len() >= 3);
+        // A live row is full width: it is written to everywhere, so
+        // there is nothing safe to trim. Check that before scrolling,
+        // because at offset 0 the display *is* the live screen.
+        assert_eq!(g.display_row_raw(0).len(), g.cols());
+
+        // Now bring the history into view. Row 0 is then a stored
+        // scrollback line, and it is stored short...
+        g.scroll_up(2);
+        assert_eq!(
+            g.display_row_raw(0).len(),
+            2,
+            "a scrollback row keeps only its significant cells"
+        );
+        // ...and read back full width, with the same text.
+        assert_eq!(g.display_row(0).len(), g.cols());
+        assert_eq!(g.row_text(0), "hi");
+        assert!(g.display_row(0)[40].is_blank());
+        assert_consistent(&g);
+    }
+
+    #[test]
+    fn a_narrowed_grid_clips_its_history_rather_than_reflowing_it() {
+        // No rewrap of scrollback is a documented limitation; what must
+        // not happen is a row that reads back wider than the grid.
+        let mut g = Grid::new(20, 2, 10);
+        put(&mut g, "0123456789abcdef");
+        g.carriage_return();
+        g.line_feed();
+        g.resize(8, 2);
+        g.scroll_up(1);
+        assert_eq!(g.display_row(0).len(), 8);
+        assert_eq!(g.row_text(0), "01234567");
+        assert_consistent(&g);
     }
 
     #[test]
