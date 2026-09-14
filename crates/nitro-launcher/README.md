@@ -182,11 +182,11 @@ with the wallpaper, the bar, the launcher and `nitro-calc` all running:
 
 | | binary | RSS | HWM | idle CPU over 30 s |
 |---|---|---|---|---|
-| `nitro-launcher` | 702 936 | 2 912 kB | 2 912 kB | **0.00 %** |
-| `nitro-wallpaper` | 521 976 | 2 656 kB | 2 656 kB | **0.00 %** |
-| `nitro-bar` | 601 152 | 2 768 kB | 2 768 kB | **0.00 %** |
-| `nitro-calc` | 566 984 | 2 752 kB | 2 752 kB | **0.00 %** |
-| `nitro-server` | 2 157 704 | 10 540 kB | 27 160 kB | **0.00 %** |
+| `nitro-launcher` | 704 544 | 2 928 kB | 2 928 kB | **0.00 %** |
+| `nitro-wallpaper` | 521 880 | 2 608 kB | 2 608 kB | **0.00 %** |
+| `nitro-bar` | 601 152 | 2 780 kB | 2 780 kB | **0.00 %** |
+| `nitro-calc` | 566 984 | 2 756 kB | 2 756 kB | **0.00 %** |
+| `nitro-server` | 2 164 024 | 19 200 kB | 35 308 kB | **0.00 %** |
 
 Zero jiffies of CPU across thirty seconds for every one of the five,
 and the server's frame counter is flat over ten seconds of idle (the
@@ -194,7 +194,9 @@ only two frames in the window are the two screenshots' own readbacks).
 That is the whole point of the epoll loops: four programs on screen and
 nothing running.
 
-The launcher is ~102 KB bigger than the bar, and the attribution is
+The server's row is bigger than the M3-C table said because `main` grew
+a heap shadow buffer per output (#539) in between; none of the four
+clients moved. The launcher is ~103 KB bigger than the bar, and the attribution is
 mundane: `std::process::Command` and its `posix_spawn` path, plus the
 `.desktop` parser and the sort. Nothing here links a font library or a
 rasterizer, which is the asymmetry `docs/ui.md` describes.

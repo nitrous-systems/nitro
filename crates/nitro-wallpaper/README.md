@@ -135,8 +135,8 @@ running alongside the bar, the launcher and `nitro-calc`:
 
 | | value |
 |---|---|
-| binary | **521 976 bytes** (522 KB) |
-| RSS / HWM | **2 656 kB** / 2 656 kB |
+| binary | **521 880 bytes** (522 KB) |
+| RSS / HWM | **2 608 kB** / 2 608 kB |
 | idle CPU over 30 s | **0.00 %** (zero jiffies) |
 | timers armed | none |
 
