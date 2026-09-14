@@ -16,7 +16,36 @@ number we watch.
 | `libseat` (+ `libseat-sys`) | seat | Bindings to the C libseat: one interface over logind / seatd / raw VT for DRM master + input fds without root. The single deliberate C dependency. | + `errno`, `libc`, `log`. `default-features = false`: the `custom_logger` feature builds a C shim (`cc`) to route libseat's log lines through `log`; we do not log. |
 | `input` (+ `input-sys`) | server | Bindings to libinput, which is the only sane way to read evdev: tap detection, pointer acceleration, scroll-source classification and touchpad state are thousands of lines of hard-won device quirks we are not going to re-derive. `default-features = false, features = ["libinput_1_21"]` — the `udev` feature is **off**, so `libudev` never enters the tree: the server finds devices by reading `/dev/input` and opens them through `nitro-seat`. | + `libc` (already there via `libseat`). The FFI `unsafe` lives in the dependency; `LibinputInterface` is a safe trait we implement. Input-device hotplug is M3: it needs the netlink uevent socket `nitro-kms` already has, plus a directory diff. |
 | `xkbcommon` | server | Keycode → keysym → UTF-8 with the user's own layout, dead keys, levels and modifier semantics. The alternative is shipping a keymap format and a compose engine, which is a project, not a dependency. It reads `XKB_DEFAULT_*`, so it honours whatever the user already configured. | + `xkeysym`, `memmap2`. The FFI `unsafe` (and the `mmap` of the keymap file) lives **inside the `xkbcommon` crate**, not in ours; our tree stays `unsafe`-free. |
+| `vte` | term | The VT/ANSI escape-sequence **state machine** (Paul Williams' DEC parser), which is a table of transitions nobody should transcribe twice: C0, CSI with its parameters and intermediates, OSC with both terminators, DCS, and UTF-8 decode across buffer boundaries. Crucially it assigns **no meaning** — it hands back `print`/`execute`/`csi_dispatch`/`osc_dispatch` and every escape sequence's *effect* is ours, in `nitro-term`'s own `vt.rs`, where it is tested. No `serde`, no allocator tricks, `default-features = false`. | **+2 crates** (`arrayvec`, `memchr`); `memchr` was already in the tree via nothing else, so it is genuinely two. The alternative is roughly 600 lines of state table and the bugs that come with hand-rolling one — and the failure mode of a wrong transition is a terminal that garbles output on a rare sequence, months later. |
 | `swash` | text | OpenType shaping, scaling and hinted glyph rasterization in one pure-Rust crate. Text is the one part of a display server nobody should write twice: the shaper alone is the OpenType GSUB/GPOS state machines, script itemization and mark attachment. Clients never see any of it — the server shapes, so the wire carries strings. | **+7 net crates** (`swash`, `skrifa`, `read-fonts`, `font-types`, `yazi`, `zeno`, `once_cell`); the other five of its seventeen (`bytemuck`, `syn`, `proc-macro2`, `quote`, `unicode-ident`) are already in our tree. **The one place untrusted bytes are parsed by a dependency** — see below. |
+
+### Why `vte`, and where the line is drawn
+
+It is worth being precise about what this dependency does and does not
+buy, because "a terminal library" would be the wrong thing to take.
+
+`vte` is the **lexer**, not the terminal. It does not know what `CSI 2 J`
+means, has no grid, no scrollback, no colours and no cursor; it turns a
+byte stream into dispatch callbacks and stops. Everything that makes a
+terminal a terminal — the cell model, the damage tracking, the scroll
+region, the alternate screen, the SGR colour table, the key encodings —
+is `nitro-term`'s, which is why `grid.rs` and `vt.rs` carry a hundred
+unit tests between them.
+
+That split is the reason it passes the bar. The parser is a
+specification transcribed into a table: there is one right answer, it is
+tedious, and getting a transition wrong produces a terminal that garbles
+rare sequences long after anyone would connect the two. The semantics are
+the opposite — they are what this application *is*, and vendoring
+somebody's opinion about them (`alacritty_terminal`, say, which is what
+sits above `vte` in Alacritty) would be taking the app rather than a
+dependency.
+
+Writing our own parser was the alternative considered, and it is a real
+option: about 600 lines. It was refused for two crates because the UTF-8
+handling is the part that would bite — a multi-byte character split
+across two `read`s has to resume, not reset, and that is exactly the bug
+that only shows up under load.
 
 ### Why `swash` and not the alternatives
 
@@ -129,6 +158,19 @@ suspend), and the one action that needs them — `lock` — is the one
 action M3 does not implement. So the permission is still unspent, and
 `crates/nitro-session/README.md` records what would spend it.
 
+`nitro-term` (M4-A) is the first workspace crate since M0 to add an
+external dependency, and it adds **two**: `vte`, plus `arrayvec` and
+`memchr` behind it (three lines, two of which are `vte`'s). The
+whole-workspace figure moves **70 → 74** lines and **35 → 38 distinct
+external crate names**. The argument for spending it is above; what is
+worth recording here is the shape of the app around it, because it is the
+shape `nitro-calc` established. `nitro-term` is `nitro-ui` + `rustix` +
+`vte`, and everything that makes a terminal a terminal — the grid, the
+damage tracking, the colour table, the key encodings — is *in* the crate
+rather than under it. A 646 KB binary containing a VT parser, a cell
+model and a scrollback ring, against `nitro-calc`'s 560 KB for a
+calculator, is what that costs: 86 KB, and no third-party terminal.
+
 The whole-workspace count with the session in is **70** lines and still
 **34 distinct external crate names** — the rise from 67 is three
 `(*)`/workspace lines, not three crates.
@@ -179,6 +221,7 @@ the syscall families it uses.
 | `nitro-bar` | `time` | `clock_gettime` for the wall clock |
 | `nitro-launcher` | `process` (**dev only**) | `getpgrp`, in the one test that checks a launched process left the launcher's process group |
 | `nitro-session` | `event`, `process` | `poll` over the pidfds, the session socket and the signal pipe; `pidfd_open` so a child's exit is a descriptor rather than a timer tick, `kill_process_group` for teardown, `getuid` for the `/tmp` fallback of the socket path |
+| `nitro-term` | `pty`, `termios`, `process`, `fs`, `stdio` | `openpt`/`grantpt`/`unlockpt`/`ptsname` for the pseudoterminal; `tcsetwinsize` (`TIOCSWINSZ`) so a resize reaches the child as `SIGWINCH`; `kill_process_group`/`waitpid` to take the shell down with the window; `open` for the slave and `fcntl_setfl` to make the master non-blocking |
 
 ## `unsafe` exceptions
 
@@ -209,3 +252,22 @@ safe mapping needs either enforced `F_SEAL_SHRINK` or a signal handler, and
 `mmap` of a foreign fd is `unsafe` in our tree besides. `BufferDamage`
 keeps the copy proportional to what actually changed. Revisit with sealing
 when a client pushes video.
+
+A second deliberate non-use, and the one that cost a **binary**
+dependency rather than a crate. A terminal's child needs its own session
+and the pty as its controlling terminal, which are two syscalls that can
+only happen between the `fork` and the `exec` — i.e. in
+`CommandExt::pre_exec`, which is `unsafe` because the closure runs in a
+forked child where almost nothing is async-signal-safe. `nitro-term`
+therefore spawns **`setsid --ctty $SHELL`** (util-linux) and lets a
+program that already does those two syscalls do them. The cost is honest
+and is documented in `crates/nitro-term/README.md`: `setsid` is a
+run-time dependency, and without it the terminal runs without job
+control and says so.
+
+It is worth noting beside `nitro-launcher`, which faced the same question
+and answered it differently: `std`'s `process_group(0)` is the safe half
+of `setsid`, and a launcher needs only that half because neither it nor
+what it starts has a controlling terminal to worry about
+(`crates/nitro-launcher/src/spawn.rs`). A terminal is precisely the case
+where the other half matters, so it is the one place that pays.

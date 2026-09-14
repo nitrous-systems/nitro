@@ -343,6 +343,63 @@ D-Bus client is allowed.
   single colour is "the background".
 - **M4** — Terminal, settings (display/audio), file manager; remote view;
   phone build.
+
+  - **M4-A done.** `nitro-term`: a terminal emulator on `nitro-ui` — a
+    pty, a VT parser, a cell grid with scrollback and an alternate
+    screen, and a widget that draws one `Text` node per same-style run.
+
+    It is here because it is **the hardest test of goal 1**. Every app
+    up to now changed a label or a clock; a terminal's output is
+    produced by a program that has never heard of a display server, so
+    "work proportional to change" either survives `yes | head -100000`
+    or it was a claim about toy workloads. Three mechanisms keep it, and
+    `docs/term.md` has the reasoning: a stable paint slot per run (so an
+    unchanged run costs zero bytes), a per-row damage bit consulted
+    *before* the row is split into runs (so a clean row is not walked at
+    all), and `RequestFrame` pacing (so the scene is touched once per
+    frame rather than once per line).
+
+    Measured from outside by counting mutations: a keystroke into an
+    existing row is **two** mutations — one `SetText` for the run, one
+    `SetBounds` for the cursor — and twenty thousand lines of `seq`
+    cost no more commits than there were frames. An idle terminal at a
+    prompt schedules no timer, requests no frame and sends nothing.
+
+    Two findings are worth recording because both came from running the
+    thing rather than testing it. **Frame pacing has a trap**: "read the
+    pty until `WouldBlock`, then take a frame" never comes back while
+    the writer is faster than the reader, so `cat` of a 5 MB file was
+    consumed in one drain and one commit — a perfect score by the letter
+    of the claim, describing a terminal that showed nothing for two and
+    a half seconds and then jumped to the end. A drain is now capped at
+    256 KiB. And **a text node's box is sized to the row, not to its
+    run**: the width is invisible (runs are left-aligned and unwrapped)
+    but it is *diffed*, so a box sized to the run grew by a cell per
+    typed character and put a `SetBounds` next to every `SetText`. That
+    one is the difference between a keystroke costing two mutations and
+    three.
+
+    The toolkit gained only general things: frame callbacks
+    (`request_frame`/`on_frame`), `SetWindowTitle`/`SetWindowLimits`, a
+    `u16` paint-slot index, `PaintCx::keep` ("this slot is unchanged" —
+    the third answer beside emit and omit, for a widget whose slots are
+    its content rather than its parts), and `Role::Terminal`. All are in
+    `docs/ui.md`.
+
+    The one `unsafe` this app would have needed is bought with a
+    dependency instead: a child needs `setsid` + `TIOCSCTTY` between
+    fork and exec, which is `pre_exec`, so the shell is started as
+    `setsid --ctty $SHELL` and the terminal degrades honestly (no job
+    control, and it says so) where util-linux is missing. It is the
+    mirror of `nitro-launcher`'s conclusion that `process_group(0)` is
+    the half a launcher needs — same question, different answer, and a
+    terminal is the case where the other half matters.
+
+    `vte` is the first external dependency a workspace crate has added
+    since M0: +2 crates, for the DEC parser state table and nothing
+    else. It assigns no meaning — the grid, the damage, the colours and
+    the key encodings are all `nitro-term`'s, which is why `grid.rs` and
+    `vt.rs` carry a hundred unit tests. Argued in `DEPENDENCIES.md`.
 - **M5** — Wayland adapter; GPU backend.
 
 ## What we take from the old repo

@@ -254,6 +254,13 @@ and the content hangs underneath it.
 | `Image` | `image` | `WxH` | — | an `ARGB` buffer, uploaded once in a memfd |
 | `Spacer` | `spacer` | — | — | `.grow(1.0)` and nothing else |
 
+`Role::Terminal` exists too, and has no widget in this crate: it is what
+`nitro-term`'s grid answers, and it is here because the role vocabulary
+is the introspection protocol's rather than the widget set's. A screen
+reader has to know that this widget's text is a *screen* — rewritten in
+place, addressed by row and column — rather than a document that grows,
+which is why AT-SPI has had the role since the beginning.
+
 Three of them are worth a paragraph, because each makes a claim about
 cost that the rest of the design has to hold up.
 
@@ -425,6 +432,54 @@ loop clamps its timeout to 10 ms and wakes 100×/s. With nothing connected
 — the normal case — the app blocks indefinitely exactly as before. See
 `docs/introspection.md`; registering the client streams is M3.
 
+### Frame callbacks, for an app whose input outruns the screen
+
+The loop above assumes the normal shape: something changes, the widget is
+marked dirty, the next flush sends it. An app whose *input* arrives
+faster than the screen can show it wants the opposite, and `nitro-term`
+(M4-A) is the case that made this real — a pty delivers a line every
+microsecond and does not care that a compositor exists.
+
+`ui.request_frame()` asks the server for one `Frame` callback carrying
+the deadline for the next flip; `ui.on_frame(|s, ui, frame| ..)`
+registers the handler, which is handed `&mut S` and `&mut Ui<S>` exactly
+like a button's `on_click`. The app absorbs everything into its own model
+as it arrives and touches the *tree* only in the handler — so a hundred
+thousand lines of output cost one commit per refresh rather than one per
+line, each showing the state as it stood at that moment.
+
+Three properties make it safe to build on:
+
+* **One request, one answer.** Asking twice before the answer arrives
+  sends one request; two callbacks per frame is exactly the free-running
+  loop this exists to avoid. `ui.frame_pending()` is the flag.
+* **Asking is conditional, so idle stays free.** An app that requests a
+  frame only when its model is dirty — which is what `nitro-term`'s
+  `request_frame_if_dirty` does — has nothing outstanding when nothing is
+  happening, and blocks in `epoll_wait` with no timer. That is the same
+  idle contract every other app has, kept by the loudest client on the
+  machine.
+* **It is a handler list, not a widget**, for the same reason `on_key`
+  and `on_shell` are: a frame deadline is news about the *output*, with
+  no position to hit-test and no focus to follow. Every handler sees
+  every frame; there is nothing to consume.
+
+In a test, `Harness::frame()` delivers one, so a test can choose the
+moment — the whole point of pacing is that many changes happen between
+two frames, and a test that could not say when a frame lands could not
+assert that.
+
+### Two window properties
+
+`ui.set_window_title(s)` and `ui.set_window_limits(min, max)` are queued
+mutations like everything else, and both **drop an unchanged value**.
+That matters more than it sounds for the title: a shell whose prompt
+carries an OSC sequence sets the same string on every command, and a
+terminal that forwarded each one would commit — and make the server
+relist its windows — once per command the user runs. Limits set before
+the window exists ride its first commit, for the reason a shell surface's
+anchor does.
+
 ## Shell surfaces
 
 A bar, a dock, a launcher and a wallpaper are `nitro-ui` apps like any
@@ -545,6 +600,39 @@ Checklist for a new widget:
   `Handled::No` to everything can be read but not used.
 * If it wants pointer events, it must paint something.
 
+### Slots that are content rather than parts
+
+The paragraphs above describe a widget whose slots are its **parts** —
+slot 0 the background, slot 1 the label — and for those, "a slot the
+paint did not emit is destroyed" is exactly right: a button that stops
+drawing its focus ring wants the ring gone.
+
+`nitro-term` (M4-A) is the first widget whose slots are its **content**.
+It gives every same-style run on every row a slot of its own, so the
+per-slot cache does the diffing and a run whose bytes did not change
+costs nothing. That needed two things the toolkit did not have, and both
+are general rather than terminal-shaped:
+
+* **`cx.keep(slot)`** — a third answer beside emit and omit:
+  *unchanged*. It marks the slot used without diffing it, so a widget can
+  skip re-deriving a part of itself it knows did not change. A terminal
+  asks `Grid::row_dirty` and calls `keep` for a clean row, which is
+  forty-nine rows out of fifty on a keystroke. Without it the choice
+  would be to re-derive every row's runs on every paint (a string
+  comparison per run, in order to send nothing) or to omit them, which
+  deletes the screen.
+* **The slot index is a `Slot` (`u16`), not a `u8`.** Five is plenty for
+  a widget's parts; a 200-column row can hold more than 256 runs.
+
+A widget defined **outside `nitro-ui`** cannot write `impl WidgetMut<'_,
+W, S>` — an inherent `impl` has to live where the type does. Declare a
+local trait carrying the setters and implement it for `WidgetMut<'_, W,
+S>` instead (`nitro_term::widget::TermGridMut` is the worked example).
+The contract is unchanged, which is the point: `WidgetMut`'s `DerefMut`
+gives the trait methods their `&mut W`, and each still calls
+`request_paint` or `request_layout`, so invalidation still cannot be
+forgotten. The caller pays one `use`.
+
 ## The test harness
 
 `nitro_ui::test::Harness` (feature `test-support`) starts a real
@@ -581,6 +669,15 @@ last one exists because a timer's deadline is an `Instant` from the
 moves — so a test of a minute-aligned tick would otherwise have to wait a
 real minute to see it. Shifting the deadlines preserves the timers'
 relative order and fires exactly the ones the elapsed time would have.
+
+`Harness::frame()` delivers one frame callback, and `Harness::parts()`
+hands out `(&mut Ui<S>, &mut S)` together. The second one exists because
+an app's own loop functions take exactly that pair — it is the signature
+of every callback the toolkit hands out — so a test that wants to call
+one cannot get there through `ui()` and `state_mut()` separately. Without
+it a test ends up moving the state out and back around every call, which
+is noise at best and, for a state that owns a descriptor, a different
+object at worst.
 
 Two things it needs from `nitro-server`, both behind its `test-support`
 feature:
