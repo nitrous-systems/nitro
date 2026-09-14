@@ -241,36 +241,50 @@ full output below.
 
 | scene | nitro dev | vello dev | nitro **box** | vello **box** | box speedup |
 |---|---|---|---|---|---|
-| a `solid_fill` | **0.17 ms** | 0.33 ms | **1.85 ms** | 2.21 ms | 1.19× |
-| b `rrects_alpha` | **5.20 ms** | 3.55 ms | **11.79 ms** | 8.02 ms | 0.68× |
-| c `gradient` | **0.18 ms** | 1.84 ms | **1.85 ms** | 5.48 ms | 2.96× |
-| d `blits` | **27.26 ms** | 9.29 ms | **38.08 ms** | 21.19 ms | 0.56× |
-| e `ui_frame` | **3.02 ms** | 14.68 ms | **5.22 ms** | 27.23 ms | 5.22× |
+| a `solid_fill` | **0.17 ms** | 0.33 ms | **1.82 ms** | 2.21 ms | 1.21× |
+| b `rrects_alpha` | **5.47 ms** | 3.55 ms | **11.73 ms** | 8.02 ms | 0.68× |
+| c `gradient` | **0.18 ms** | 1.84 ms | **1.82 ms** | 5.48 ms | 3.01× |
+| d `blits` | **24.21 ms** | 9.29 ms | **35.49 ms** | 21.19 ms | 0.60× |
+| e `ui_frame` | **2.98 ms** | 14.68 ms | **5.22 ms** | 27.23 ms | 5.22× |
 
-Only (e) changed by design — see [the thin-border fast path](#the-thin-border-fast-path).
-(a), (c) and (d) are untouched code; (b) drifted down ~4 % on dev with the
-same source, which is the scale of this machine's run-to-run variation.
+Only (d) changed by design — see [the blit row split](#the-blit-row-split),
+re-taken now that the server paints into a heap shadow. (a), (b), (c), (e)
+and the glyph scenes are untouched code, and the small movements in them are
+**code layout, not work**: the split adds ~170 lines of blit code to the
+binary and shifts everything after it. That is not a guess — a control binary
+containing the split but never taking it reproduces those movements exactly,
+while (d) stays at the baseline. The effect is real enough to invert between
+machines: on dev it costs (b) 5.2 → 5.47 ms, on the box it *gains* (a)/(b)/(c)
+about 1–7 %. See [measuring this crate](#measuring-this-crate).
 
 Raw output:
 
 ```
 # dev, --iters 40 (min of 3 runs; run-to-run spread < 0.5 %)
-scene a  solid_fill    min=0.171ms  median=0.172ms
-scene b  rrects_alpha  min=5.195ms  median=5.218ms
+scene a  solid_fill    min=0.170ms  median=0.171ms
+scene b  rrects_alpha  min=5.466ms  median=5.495ms
 scene c  gradient      min=0.175ms  median=0.176ms
-scene d  blits         min=27.258ms median=27.303ms
-scene e  ui_frame      min=3.016ms  median=3.020ms
+scene d  blits         min=24.202ms median=24.278ms
+scene e  ui_frame      min=2.978ms  median=2.988ms
+scene f  glyphs_loop   min=0.228ms  median=0.231ms
+scene g  glyphs_batch  min=0.227ms  median=0.230ms
 
 # box (ssh kaspar@192.168.1.204), --iters 25 (min of 3 runs)
-scene a  solid_fill    min=1.854ms  median=1.892ms
-scene b  rrects_alpha  min=11.791ms median=11.851ms
-scene c  gradient      min=1.851ms  median=1.898ms
-scene d  blits         min=38.079ms median=38.144ms
-scene e  ui_frame      min=5.211ms  median=5.218ms
+scene a  solid_fill    min=1.823ms  median=1.878ms
+scene b  rrects_alpha  min=11.732ms median=11.793ms
+scene c  gradient      min=1.823ms  median=1.878ms
+scene d  blits         min=35.485ms median=35.557ms
+scene e  ui_frame      min=5.219ms  median=5.225ms
+scene f  glyphs_loop   min=0.314ms  median=0.315ms
+scene g  glyphs_batch  min=0.316ms  median=0.317ms
 ```
 
+(d) on the box is the noisiest number here: three interleaved pairs gave
+35.11 / 35.49 / 36.15 ms against a baseline pinned at 38.30 ± 0.01, so the
+win is 6–8 % and the spread is the box's, not the change's.
+
 Before this round of work, scene (e) measured **5.18 ms on dev and 9.36 ms on
-the box**.
+the box**, and scene (d) **27.26 / 38.08 ms**.
 
 ### The thin-border fast path
 
@@ -304,9 +318,11 @@ the absolute figures here do not match the final table — the *deltas* are the
 point).
 
 Both levers change only the arithmetic per pixel, never the order or width of
-the writes. That is deliberate, and it is why they survive on the server's
-write-combined framebuffer where the blit split did not — see
-[the benchmark lies about blits](#the-benchmark-lies-about-blits).
+the writes. That was deliberate, and it is why they survived on the server's
+write-combined framebuffer when the blit split did not — see [the benchmark
+lies about blits](#the-benchmark-lies-about-blits) for that episode, and [the
+blit row split](#the-blit-row-split) for the lever's return once the
+destination stopped being write-combined.
 
 The fast path is a pure optimization, and the tests hold it to that:
 `stroke_fast_path_is_byte_identical_to_the_general_walk` runs 1000 geometry
@@ -359,15 +375,15 @@ later round added **(d) < 10 ms**.
   levers that produced the 1.79× and the measurement that says the remaining
   gap is not another dispatch trick.
 
-- **(d) is 38.08 ms — unchanged, and the 10 ms target is not reachable in
-  scalar code.** A row split *was* implemented and measured a solid win on
-  the benchmark (28.47 → 24.21 ms dev, 38.08 → 35.90 box) — and was then
-  **reverted, because it made the real server slower**. That story is in
-  [the benchmark lies about blits](#the-benchmark-lies-about-blits) below; it
-  is the most useful thing this round produced.
+- **(d) is 35.49 ms on the box, down from 38.08 — and the 10 ms target is
+  still not reachable in scalar code.** The row split that #3693 measured and
+  then reverted has been **re-taken**: 27.31 → 24.21 ms dev, 38.30 → 35.49 ms
+  box. It was reverted because it lost on the write-combined DRM dumb buffer;
+  #539 moved the rasterizer's destination to a heap shadow, which removed that
+  objection. See [the blit row split](#the-blit-row-split).
 
-  Even had it stood, the target was out of reach. An instrumented breakdown
-  of one 96×96 bilinear blit, dev, 200 blits:
+  The target is still out of reach, and by a margin the split cannot close.
+  An instrumented breakdown of one 96×96 bilinear blit, dev, 200 blits:
 
   | inner loop | |
   |---|---|
@@ -386,7 +402,7 @@ later round added **(d) < 10 ms**.
   speedup over a loop already within 2× of a plain nearest-neighbour blend;
   **on an SSE4.2-only CPU with no explicit SIMD that is not available**, and
   the honest restatement is "blits are the one scene where the no-SIMD
-  constraint costs us, by about 1.8× against vello".
+  constraint costs us, by about 1.7× against vello".
 
 ### The benchmark lies about blits
 
@@ -400,8 +416,9 @@ ordinary cached heap memory — exactly what this benchmark measures.** The
 benchmark and the server agree again.
 
 So the rules at the end of this section have changed weight: the first
-one is now a caution rather than a veto, and the second is a good idea
-rather than a law. The data is kept in full, because it is the evidence
+one has been replaced outright (`cargo bench` is the instrument now; see
+[measuring this crate](#measuring-this-crate)), and the second is a good
+idea rather than a law. The data is kept in full, because it is the evidence
 that produced the shadow buffer, and because it is the cleanest example
 in this repository of a benchmark being right about the CPU and wrong
 about the machine.
@@ -460,33 +477,158 @@ place the same measurement on the same box reads:
 
 Six interleaved pairs, same binary, `NITRO_SHADOW=0` against the default;
 `docs/latency.md` §4.5 has the full run. `paint_us_mean` is now within a
-factor of the fake backend's 758 µs, which is the point: **it measures
-this crate again**, and its noise floor is small enough to resolve the
-~90 µs of stroke work that used to disappear into it.
+factor of the fake backend's 758 µs, which is the point: **it is no longer
+mostly framebuffer traffic**.
+
+It is tempting to conclude from that last table that `paint_us_mean` became a
+rasterizer instrument. **It did not**, and the sentence that used to stand
+here — "its noise floor is small enough to resolve the ~90 µs of stroke work
+that used to disappear into it" — was wrong. Dropping from 6233 to ~300 µs
+removed the bandwidth floor and exposed a *different* one: at that scale the
+measurement resolves binary code layout, which moves it by ±35 µs for code
+that never runs. [Measuring this crate](#measuring-this-crate) has the
+control that shows it.
 
 The rules that follow, for anyone optimizing this crate:
 
-- **`cargo bench` is now representative — but check `paint_us` anyway.**
-  The destination is heap on both sides, so a change that wins here should
-  win there. "Should" is doing real work in that sentence: the box is a
-  Haswell with a different cache hierarchy from any dev machine, and
-  `copy_us` is still write-combined and still sensitive to the *shape* of
-  the damage region. A one-line check of `paint_us_mean` on hardware costs
-  30 seconds and has been right and surprising before.
+- **`cargo bench` is now representative — and it is the instrument.** The
+  destination is heap on both sides, so a change that wins here wins there.
+  The old advice in this slot was "check `paint_us_mean` on hardware anyway";
+  that has been tried properly and **`paint_us_mean` can no longer resolve a
+  change to this crate** — see [measuring this
+  crate](#measuring-this-crate) for the measurement that retired it.
 - **Write each destination pixel once, sequentially.** It is the one rule
   that held on both memory types even when they disagreed about everything
-  else, and it is why the surviving stroke work is safe: it changes the
-  arithmetic per pixel, never the write pattern. It is also, now, the rule
-  the shadow-to-framebuffer copy is built out of.
-- **The blit row split should be re-tried.** It was 13 % faster on the
-  heap and was reverted for a destination the server no longer has. It is
-  not re-applied here because #539 was a server change and re-landing a
-  raster change under it would confound both measurements — but it is now
-  a straightforward win to go and take, on a benchmark that no longer
-  lies.
+  else, and it is why the stroke work is safe: it changes the arithmetic per
+  pixel, never the write pattern. It is also, now, the rule the
+  shadow-to-framebuffer copy is built out of. The blit row split obeys it
+  too — it splits a row into runs but still writes each pixel once, left to
+  right.
+- **The blit row split has been re-taken.** It was 13 % faster on the heap
+  and was reverted for a destination the server no longer has. It is back,
+  with the byte-identity test it never had: [the blit row
+  split](#the-blit-row-split).
 - The 16-byte-store and `copy_within` entries in the rejected list below
   were the same lesson found earlier from the other direction; they were
   rejected on the heap benchmark too, so they stay rejected.
+
+### The blit row split
+
+The scaled blit walks one destination row at a time. The original loop did,
+per pixel: a bounds test on the texel pair, a coverage evaluation, and three
+early-`continue`s (transparent texel, zero coverage, zero alpha). None of
+that vectorizes — a loop the compiler cannot prove uniform stays scalar.
+
+The split hoists the conditions out of the pixel and into the *run*. Two
+facts make a contiguous interior run possible:
+
+- **Coverage is constant across the interior.** Only the first and last
+  column of a destination row can be partially covered, so between
+  `full_start()` and `full_end()` the coverage is exactly 1 (on a
+  full-height row) and the whole `effective_alpha` fold collapses to one
+  value hoisted out of the loop.
+- **The clamp is a range, not a per-pixel test.** The source x mapping is
+  monotonic, so the columns whose texel pair `[ix, ix+1]` lies inside the
+  source rect form **one contiguous run**, and its ends are two divisions
+  (`texels_in_range`) instead of a comparison per pixel.
+
+Intersect the two and the row becomes at most three runs: a leading edge, an
+interior, a trailing edge. The edges keep the fully general loop; the
+interior (`blit_run_inner`) is branch-free — loads, multiplies, one 4-byte
+store — which is the shape the autovectorizer wants.
+
+The early-`continue`s are deliberately **not** carried into the interior.
+Skipping a fully transparent texel and blending it write the same bytes, so
+the branch bought nothing and cost the vectorizer everything. That was the
+lesson of the *first* attempt at this split, which kept them and was slower.
+
+| | dev | box |
+|---|---|---|
+| without the split | 27.31 ms | 38.30 ms |
+| with the split | **24.21 ms** | **35.49 ms** |
+| | −11.4 % | −7.4 % |
+
+Four interleaved pairs on dev, three on the box, non-overlapping on both.
+
+**It is held to byte identity**, the same bar as the thin-border fast path:
+`blit_split_is_byte_identical_to_the_general_walk` runs 320 geometry
+combinations — scales above and below 1:1 and non-integer ones, fractional
+destination origins (which move the coverage's partial columns and the 16.16
+phase independently), sub-rects that put the source-clamp boundary inside the
+row, both pixel formats, and clips that cut a row down to two columns so it is
+*all* edge and has no interior at all — against a test-only `blit_general`
+that forces every column through the edge run. Exact equality is the right
+bar: an interior that rounded differently from its edges would be a seam down
+both sides of every scaled image.
+
+This is the lever #3693 measured, kept, and then reverted because it lost on
+the write-combined DRM dumb buffer. #539 moved the rasterizer's destination to
+a heap shadow, which removed the reason for the revert; re-taking it was this
+round's job.
+
+### Measuring this crate
+
+**Use `cargo bench`. Do not use the server's `paint_us_mean`.** That is a
+change from the previous advice, and it was established by measurement rather
+than by preference.
+
+The temptation is obvious: #539 took `paint_us_mean` from 6233 µs to ~300 µs,
+so it stopped being a memory-bandwidth instrument. It did not thereby become
+a rasterizer instrument. Re-taking the blit row split was the test case.
+
+First, the server barely does the thing at all. Instrumented, the whole
+desktop — wallpaper, bar, launcher, a client cycling 30 times — performs
+**6 scaled blits per run**: the 128×128 wallpaper from a 64×64 source, 98 304
+pixels against ~34 M painted per run. **0.288 % of painted pixels reach
+`blit_scaled`**, the only function the split touches. Ceiling on the effect:
+**~0.07 µs** of a ~300 µs mean.
+
+Measured anyway, on the box, with the shadow on, six interleaved pairs and the
+order flipped mid-series:
+
+| | `paint_us_mean` |
+|---|---|
+| without the split | 316.5 µs (sd 15.1) |
+| with the split | **291.0 µs** (sd 15.1) |
+| paired diff | **−25.5 µs**, t = 3.38, all six pairs the same sign |
+
+A textbook-significant result — and **350× larger than the mechanism
+permits**. So a third binary was built: the split code compiled in, but never
+taken (`blit_impl(split=false)`), which executes byte-identical instructions
+to the baseline on every scene.
+
+| | `paint_us_mean` | vs baseline |
+|---|---|---|
+| baseline | 306.7 µs | — |
+| **control — split code present, never executed** | **341.6 µs** | **+34.9 µs** |
+| split | 291.0 µs | −15.7 µs |
+
+**The control moved more than the change did, and in the opposite
+direction.** At ~0.3 ms, `paint_us_mean` resolves *binary layout* — code
+alignment, branch-predictor aliasing, i-cache placement — not sub-µs raster
+work. `copy_us_mean` stayed flat throughout (169.5 vs 168.7 µs), which is the
+control that *should* not move: the split changes arithmetic, not the write
+pattern.
+
+The same effect is visible in the benchmark table above, which is why it is
+called out there: scenes with **no blit calls at all** move by up to 5 % when
+blit code is added to the binary, downward on the box and upward on dev.
+
+So, concretely:
+
+- **Build the never-taken control.** A variant containing your code on a path
+  that is never entered costs one binary and separates "my change is faster"
+  from "my change moved the code". Six same-sign interleaved pairs at t = 3.4
+  were not enough without it.
+- **Check the mechanism against the size of the claim.** Work out what
+  fraction of the work your change can possibly touch *before* measuring. A
+  delta 350× larger than the mechanism allows is a bug in the measurement, no
+  matter how good its statistics are.
+- **`paint_us_mean` still answers server-level questions** — it is how #539
+  was measured, a 15× effect. It is the wrong instrument for a 1 % change in
+  one rasterizer function, and it will produce a confident, reproducible,
+  wrong answer if asked.
+
 
 ### vello_cpu comparison
 
@@ -512,14 +654,15 @@ it is not part of ours, and the workspace `Cargo.toml` already excludes it).
   worst — 27 ms for a frame that touches 29 % of the screen, more than 3× its
   own full-screen 1000-rrect frame, even with the harness doing the culling.
 - `vello_cpu` is **1.5× faster on 1000 alpha rounded rects (b)** and
-  **1.8× faster on scaled bilinear blits (d)**. Both are pure per-pixel
+  **1.7× faster on scaled bilinear blits (d)**. Both are pure per-pixel
   throughput, which is exactly what its hand-written SIMD kernels buy and
   what our autovectorized scalar loops cannot match on a no-AVX2 CPU.
 
 **Is our rasterizer > 2× slower than `vello_cpu` on (b) or (e)?** No. On (e)
-we are 5.2× *faster*. On (b) we are 1.47× slower (11.79 vs 8.02 ms) — the
+we are 5.2× *faster*. On (b) we are 1.47× slower (11.73 vs 8.02 ms) — the
 spec's "more than 2× slower" threshold is not crossed. The only scene where
-we lose badly in absolute terms is (d), blits, at 1.8× slower.
+we lose badly in absolute terms is (d), blits, at 1.7× slower (35.49 vs
+21.19 ms) — down from 1.8× with the row split re-taken.
 
 ### Recommendation
 
@@ -535,7 +678,7 @@ recommendation on the numbers:
    PNG codec we do not want, and a 34 s release build (on 128 cores) versus
    0.34 s. Goal 2 says a dependency has to earn its place; on the one
    workload that matters it is slower, so it does not.
-3. It is ~880 lines of `unsafe`-free code (plus ~1460 lines of tests) with
+3. It is ~1050 lines of `unsafe`-free code (plus ~1670 lines of tests) with
    an exhaustively-tested blend and an analytic AA whose error is measured
    against a supersampled reference. That is the "contained complexity behind
    a tiny surface" goal 3 asks for.
@@ -569,31 +712,46 @@ no-SIMD ceiling scene (d) runs into.
   slightly worse on the box.
 - Caching the per-row column extents in `RowSpans`: slower — the struct is
   copied per row and got bigger.
-- **Splitting the blit row into edge/interior runs.** Tried twice. The first
-  attempt split on *coverage* alone and kept the per-pixel clamp and the
-  early-`continue`s, so the interior loop still could not be vectorized:
-  slower. The second split on coverage **and** on "the texel pair needs no
-  clamp" (a contiguous column range from `texels_in_range`, two divisions
-  instead of a comparison per pixel) and dropped the early-outs inside the
-  run — skipping a fully transparent texel and blending it write the same
-  bytes, so the branch bought nothing and cost the vectorizer everything.
-  That version **won the benchmark and lost the server**: 28.47 → 24.21 ms on
-  dev, but `paint_us_mean` on the box 5883 → 6230 µs. Reverted; the full
-  measurement is in [the benchmark lies about blits](#the-benchmark-lies-about-blits).
-  Two lessons, not one: a run split only pays if the run is
-  *unconditionally* uniform, **and** a blit win measured only against heap
-  memory is not a win.
+- **Splitting the blit row into edge/interior runs** — **re-taken, no longer
+  rejected.** Tried twice in #3693. The first attempt split on *coverage*
+  alone and kept the per-pixel clamp and the early-`continue`s, so the
+  interior loop still could not be vectorized: slower, and that version stays
+  rejected. The second split on coverage **and** on "the texel pair needs no
+  clamp" and dropped the early-outs inside the run; it won the benchmark
+  (28.47 → 24.21 ms dev) and lost the server (`paint_us_mean` 5883 → 6230 µs
+  on the write-combined DRM dumb buffer), and was reverted for it. Since #539
+  the rasterizer's destination is a heap shadow, so the reason for the revert
+  is gone and the lever is back: see [the blit row
+  split](#the-blit-row-split) for the current numbers and the byte-identity
+  test it now carries. The surviving lesson is the first one only — **a run
+  split only pays if the run is *unconditionally* uniform**. The second
+  lesson ("a blit win measured only against heap memory is not a win") was
+  true of a server that read back from write-combined memory and is not true
+  of this one; what replaced it is in [measuring this
+  crate](#measuring-this-crate).
 - **A separable (two-pass) bilinear resample for blits**, with source rows
-  premultiplied and horizontally filtered once into a fixed-size stack
-  scratch, so each destination row is a contiguous two-tap vertical lerp:
-  **24.21 → 25.34 ms, i.e. slower**, and it stayed slower at every chunk
-  width from 64 to 512 columns. A standalone probe of the same algorithm
-  writing a tight 96×96 buffer said it *should* win (24.7 → 18.7 ms); the win
-  vanished against a real 1920-pixel destination stride, where the second
-  pass re-walks destination rows that have already fallen out of L1. Reverted
-  — and a reminder that a kernel probe on a small buffer is not a measurement
-  of the same kernel in the frame. (In hindsight this was the same
-  destination-memory effect that later killed the run split, seen first.)
+  premultiplied and horizontally filtered into a fixed-size stack scratch, so
+  each destination row is a contiguous two-tap vertical lerp. **Re-measured
+  this round under the re-taken split, and it splits in two:**
+  - *Filtering both source rows per destination row* (the form #3693 tried):
+    **24.21 → 34.05 ms, far slower**, and slower at every chunk width from 64
+    to 512 columns (34.7 / 34.1 / 34.7 / 36.0). The original rejection is
+    confirmed, and the margin is much larger than the 25.34 ms first
+    recorded — the horizontal pass is redone for every destination row, so at
+    a scale near 1:1 it nearly doubles the filtering work.
+  - *Caching the filtered rows across destination rows* (keyed on the source
+    row index and the 16.16 phase, so each source row is filtered once per
+    blit) is the strongest form of the lever, and it **does win: 24.22 →
+    23.23 ms, −4.1 %**, with a never-taken control sitting exactly on
+    baseline (24.22 ms), so the win is real work and not code layout.
+    **Not taken**, for two reasons that outweigh 4 %: it is **not
+    byte-identical** to the exact path (the two-pass rounding differs by ±1 on
+    2.5 % of bytes — diffuse, not a seam, but still a second answer to the
+    same question), and it needs a **16 KB stack scratch** in a crate whose
+    stated contract is zero allocation and small fixed-size stack state. A 4 %
+    scene-(d) win is not worth giving up exact equality with the general walk;
+    revisit if blits ever dominate a real frame, which [measuring this
+    crate](#measuring-this-crate) shows they do not.
 - **Premultiplying the source once per blit** (the whole 64×64 image into a
   scratch, or two rows at a time): **22.9 / 21.8 ms against 23.7 ms** for the
   current per-pixel fold in an isolated probe — a real but small win that did
@@ -601,6 +759,9 @@ no-SIMD ceiling scene (d) runs into.
   separable path. The per-pixel alpha fold folds each texel's alpha into its
   bilinear *weight*, which costs one multiply per texel and no extra pass, so
   there is less to save here than the phrase "premultiply once" suggests.
+  (This was rejected on the heap benchmark, not on the framebuffer, so #539
+  does not reopen it; the cached separable above is the same idea taken
+  further and measured again, and it is the one that wins — by 4 %.)
 - **Specialising the one-column stroke band** (hoisting the single pixel out
   of the band's inner loop, since a 1–2 px border makes `n == 1` the typical
   case): **2.98 → 3.10 ms on scene (e), slower.** The generic loop over a
@@ -618,3 +779,10 @@ no-SIMD ceiling scene (d) runs into.
   (`blit_1to1`), and it is 10× faster than the bilinear one (2.8 vs 26.3 ms
   for 200 blits). Adding a third path for 2×/3× would be speculative: no
   caller asks for it. Worth revisiting if HiDPI scaling ever lands.
+
+  The instrumentation in [measuring this crate](#measuring-this-crate)
+  sharpens this: the running desktop performs **6 scaled blits per run**, all
+  of them the wallpaper, and **0.288 % of painted pixels** reach
+  `blit_scaled` at all. Everything else is `blit_1to1`, fills, strokes and
+  glyph masks. Scene (d) is a stress test of a path the compositor barely
+  uses — worth keeping honest, not worth contorting the code for.
