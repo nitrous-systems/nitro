@@ -1526,3 +1526,79 @@ fn super_arrows_tile_the_focused_window_to_half_the_work_area() {
     drop(conn);
     h.quit();
 }
+
+/// The server's own contribution to `nodes`, per decorated window.
+///
+/// #538 measured ~50 nodes per decorated window on the box and asked what
+/// a frame actually contains. It is six — the frame group, the background,
+/// the bar, the title text and two buttons — and the rest of that number
+/// was the client's own tree, which the server does not choose. Pinned
+/// here because `nodes` is what `docs/budget.md` multiplies by the 240
+/// bytes a `Node` costs: a frame that quietly grew to twenty nodes would
+/// move the budget line without anyone noticing.
+#[test]
+fn a_frame_costs_six_scene_nodes_and_a_fixed_window_five() {
+    let mut h = Harness::start("framecost", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("framecost");
+
+    let empty = h.stat("nodes");
+    assert_eq!(empty, 0, "an empty desktop holds no nodes of its own");
+
+    // One client window of exactly two nodes: a root group and one rect.
+    let _win = make_window(&mut conn, &mut inbox, 1, "Hello", WIN, RED, 0, 1);
+    park(&mut h);
+    assert_eq!(h.stat("decorated"), 1);
+    assert_eq!(
+        h.stat("nodes") - empty,
+        8,
+        "two client nodes plus a six-node frame"
+    );
+
+    // A FIXED_SIZE window has no maximize button, so its frame is five.
+    let mut c2 = h.client("framecost2");
+    let mut in2 = Inbox::default();
+    let _fixed = make_window(
+        &mut c2,
+        &mut in2,
+        10,
+        "Fixed",
+        WIN,
+        GREEN,
+        window_flags::FIXED_SIZE,
+        1,
+    );
+    park(&mut h);
+    assert_eq!(h.stat("decorated"), 2);
+    assert_eq!(
+        h.stat("nodes") - empty,
+        8 + 7,
+        "the second window adds two of its own plus a five-node frame"
+    );
+
+    // An undecorated window pays nothing: the server adds no node at all.
+    let mut c3 = h.client("framecost3");
+    let mut in3 = Inbox::default();
+    let _bare = make_window(
+        &mut c3,
+        &mut in3,
+        20,
+        "Bare",
+        WIN,
+        BLUE,
+        window_flags::UNDECORATED,
+        1,
+    );
+    park(&mut h);
+    assert_eq!(h.stat("decorated"), 2, "the third window opted out");
+    assert_eq!(
+        h.stat("nodes") - empty,
+        8 + 7 + 2,
+        "an undecorated window is its own two nodes and nothing else"
+    );
+
+    drop(conn);
+    drop(c2);
+    drop(c3);
+    h.quit();
+}

@@ -90,10 +90,21 @@ The M1 rise from 58 to 60 was the same kind of non-event: one line is
 `nitro-demo`, a workspace crate, and the other is a second
 `signal-hook v0.4.4 (*)` line — cargo's marker for a subtree it has
 already printed — which `sort -u` counts as distinct from the first.
-Counting distinct external crate *names* gives **35** throughout. The line
+Counting distinct external crate *names* gives **34** throughout. The line
 count is still the number we watch, because it is cheap and moves when
 something real is added; it just wants reading with that caveat whenever a
 new workspace crate reuses an existing dependency.
+
+**Count the names with `awk 'NF'`, not a bare `awk '{print $1}'`:**
+`cargo tree` separates each root's subtree with a blank line, the bare
+form turns every blank into an empty string, and `sort -u` keeps one — so
+it reports 35 for 34 crates. That off-by-one is where the "35" this file
+and `docs/budget.md` both used to carry came from; the figure was never
+35 (#530). A `Cargo.lock` count is a third number again, **37**, because
+the lock file also carries `pkg-config`, `windows-sys` and
+`windows-link` — one build dependency and two `cfg(windows)` entries no
+Linux build ever compiles. `docs/budget.md` §"Dependency count" has the
+per-milestone decomposition.
 
 M3's shell crates add **zero** external dependencies between them, and
 that is the number worth reporting. `nitro-bar` is `nitro-ui` plus
@@ -110,7 +121,7 @@ argues the other half is a controlling terminal neither process has).
 `nitro-session` (M3-E) adds **zero** too, and it is the one where the
 temptation was real. It is the "one place a D-Bus client is allowed"
 that `DESIGN.md` names — and it still does not speak D-Bus, because
-`zbus` is **~40 crates against a tree of 35** and `systemctl suspend`
+`zbus` is **~40 crates against a tree of 34** and `systemctl suspend`
 *is* a logind call with the same polkit check and the same inhibitor
 handling. What D-Bus would buy over a fork/exec is *events*
 (`PrepareForSleep`, `Lock`/`Unlock`, an inhibitor fd held across a
@@ -119,7 +130,7 @@ action M3 does not implement. So the permission is still unspent, and
 `crates/nitro-session/README.md` records what would spend it.
 
 The whole-workspace count with the session in is **70** lines and still
-**35 distinct external crate names** — the rise from 67 is three
+**34 distinct external crate names** — the rise from 67 is three
 `(*)`/workspace lines, not three crates.
 
 The session is `rustix` + `nitro-wire` + `signal-hook`. Its spec allowed

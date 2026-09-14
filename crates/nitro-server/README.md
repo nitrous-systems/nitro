@@ -636,14 +636,18 @@ looking for.
 | `fonts`                  | Font faces the startup scan indexed. 0 means no `TEXT` capability.        |
 | `fonts_loaded`           | Font **files** whose bytes are resident right now — not faces indexed. The db loads a file on first use and releases it when the loop next goes idle, so a settled desktop reports 0 with its glyphs still on screen. |
 | `font_bytes`             | Total size of those files. This is the number `docs/budget.md` cares about; it was the whole of the server's RSS overrun (#528). Capped by `NITRO_FONT_CACHE_MB` (default 8 MB). |
+| `font_loads`             | Font files read from disk since startup — the miss counter. |
+| `font_releases`          | Files handed back by the **idle sweep** since startup. `font_bytes` is an instant and cannot tell "the sweep is working" from "no face was ever loaded": both settle at 0. `font_releases` tracking `font_loads` is the sweep doing its job, and a `font_loads` far ahead of it is the leak the sweep exists to prevent (#538). |
+| `font_evictions`         | Files dropped by the **cap** (`NITRO_FONT_CACHE_MB`), never by the sweep. Non-zero means one frame's working set genuinely overran the cap — a distinct and more alarming fact than an ordinary idle release. |
 | `glyphs_cached`          | Distinct glyph masks in the atlas (font, glyph, quantized size, subpixel bucket). |
 | `glyph_renders`          | Masks actually rasterized since startup. It stops rising once a UI's glyphs are all cached; a number that keeps climbing on a static screen means the cache key is churning. |
 | `atlas_pages`            | 1024x1024 A8 pages allocated, 1 MiB each.                                |
+| `atlas_bytes`            | What those pages cost the resident set: `atlas_pages × 1 MiB`. A page is allocated whole and never shrinks, so this is the real cost whatever fraction is packed. Reported rather than left as a multiplication for the reader of `docs/budget.md`. |
 | `text_runs`              | Shaped runs held in the text store: one per text node with content. A `MeasureText` stores nothing, so it never moves this. |
 | `shape_us_mean`          | Mean microseconds per shaping call, over the last 120 (shapes *and* measurements — they run the same layout). |
 | `clients`                | Connected wire clients.                                                  |
 | `windows`                | Windows in the scene.                                                    |
-| `nodes`                  | Nodes in the scene, across every window — the server's own frame nodes included. |
+| `nodes`                  | Nodes in the scene, across every window — the server's own frame nodes included. A decorated window costs the server **six** of them (the frame group, the background, the title bar, the title text and two buttons; five on a `FIXED_SIZE` window, which has no maximize), pinned by `tests/wm.rs::a_frame_costs_six_scene_nodes_and_a_fixed_window_five`. Everything above that in the count is the client's own tree. |
 | `outputs`                | Outputs currently connected.                                             |
 | `shadow_bytes`           | Heap held by the shadow buffers, summed over the outputs: one scanout-sized `XRGB8888` buffer each (8 294 400 bytes at 1080p), 0 under `NITRO_SHADOW=0`. It is the server's one allocation proportional to pixels rather than to work, and `docs/budget.md` argues for it explicitly rather than leaving it to be inferred from `outputs`. |
 | `decorated`              | Windows carrying a server-drawn frame. `windows - decorated` is how many opted out with `UNDECORATED`. |

@@ -78,16 +78,38 @@ floor.
 — the peak is what matters on a box with no swap, and it is the number a
 steady-state `top` never shows you.
 
+`VmRSS` is also **two different things added together**, which is why this
+section now splits them everywhere (#538). `RssAnon` is the heap: private
+to the process, unreclaimable on a box with no swap, and the only half
+that moves when a window opens. `RssFile` is page-cache — the binary's own
+text and rodata plus every shared library — shared with every other
+process mapping the same file and reclaimable under pressure. A budget
+written against the sum cannot tell "we allocated a megabyte" from "we
+linked another library", which is how the server's "≤ 8 MB" line survived
+as long as it did. The server's current, audited line is in
+**"The server's 17.8 MB, audited"**; `just box-ps` prints both columns.
+
 ### Test box (real KMS, 1920×1080@60)
 
 | process | windows | VmRSS | VmHWM | budget | verdict |
 |---|---|---|---|---|---|
-| `nitro-server` | 1 | 8 240 kB | 8 240 kB | ≤ 8 MB with 5 windows | over by 1 % — see below |
-| `nitro-server` | 5 | 8 344 kB | 8 344 kB | ≤ 8 MB with 5 windows | over by 2 % — see below |
+| `nitro-server` | 1 | 8 240 kB | 8 240 kB | ≤ 8 MB with 5 windows | over by 1 % — superseded, see below |
+| `nitro-server` | 5 | 8 344 kB | 8 344 kB | ≤ 8 MB with 5 windows | over by 2 % — superseded, see below |
 | `nitro-server` **+ shadow (#539)** | 2 | **15 888 kB** | 18 460 kB | — | **deliberately over; see "The 8 MB the shadow buffer costs"** |
+| `nitro-server`, **anon only**, `NITRO_SHADOW=0` (#538) | 0 | **2 424 kB** | — | `RssAnon` ≤ 2.5 MB | **ok**, 97 % |
+| `nitro-server`, **anon only**, `NITRO_SHADOW=0` (#538) | 5 | **3 980 kB** | — | + 100 kB/window → 2.9 MB | over — the #547 allocator ratchet, see below |
+| `nitro-server`, **file-backed** (#538) | 0–5 | **7 252 kB** | — | `RssFile` ≤ 7.5 MB | **ok**, and flat in windows |
 | `nitro-calc` | 1 | **2 752 kB** | **2 752 kB** | ≤ 3 MB (client) | **ok**, 92 % |
 | `nitro-demo` | 1 | 3 132 kB | 3 132 kB | ≤ 3 MB (client) | over by 4 % |
 | `nitro-demo` | 5 | 3 224 kB | 3 224 kB | ≤ 3 MB (client) | over by 7 % |
+
+The last three `nitro-server` rows are the #538 audit and are the ones
+with a live budget attached; the first two are the M3-A measurement, kept
+because the paragraphs below describe them. The five-window anon row is
+**over**, and it is left flagged rather than adjusted: the overrun is
+1 556 kB of released font bytes that glibc keeps (#547), not per-window
+growth. With that allocator behaviour pinned out, the same five windows
+measure 2 112 kB, inside the line.
 
 The first two `nitro-server` rows are the pre-#539 measurement and are
 kept as the floor they establish: they are what the process costs
@@ -134,6 +156,13 @@ are dumb buffers owned by the GPU and mapped, not anonymous memory. Its
 shadow buffers are — see the next section, which is the one exception to
 "nothing scales with pixels".
 
+(Both figures in that paragraph were superseded by the #538 audit, and it
+is kept because the M2 row above is the measurement it describes. A
+decorated window costs **86 kB**, not 21 kB, and the frame is **6** scene
+nodes, not 18 — the 18 was the client's own tree counted as the server's.
+The dominant term is neither: it is the 64 KiB receive buffer `nitro-wire`
+allocates per *connection*. See "The server's 17.8 MB, audited".)
+
 ### The 8 MB the shadow buffer costs, and what it buys
 
 Since #539 each output owns a heap-resident shadow buffer, and unlike the
@@ -171,11 +200,13 @@ rather than explained away. Three things make it the right trade:
   memory-constrained target has the lever without a code change.
 
 The 8 MB server budget was written for a process whose framebuffers lived
-in GPU memory. It should be restated for M4 as **"≤ 8 MB plus one
-scanout-sized buffer per output"**, which is a budget that says what the
-process actually is; the part of it that is under the server's control —
-fonts, scene, atlas, wire buffers — has not moved, and is still the 8 240 kB
-the rows above measure.
+in GPU memory. This section proposed restating it for M4 as "≤ 8 MB plus
+one scanout-sized buffer per output"; the #538 audit went further, because
+"8 MB" does not say whether it means anon or total and so cannot tell "we
+allocated a megabyte" from "we linked another library". The line that
+replaces it is in **"The revised budget line"** below, and it is split:
+`RssAnon` ≤ 2.5 MB + 100 kB per decorated window, plus one shadow buffer
+per output; `RssFile` ≤ 7.5 MB and not a per-window cost.
 
 The scan also stopped costing a 12 MB read per boot: the index is cached in
 `$XDG_CACHE_HOME/nitro/fonts.idx`, validated against the directory walk (paths,
@@ -198,14 +229,25 @@ the wallpaper, the bar and the launcher, plus the two applications that
 make it a desktop. Taken with `just box-ps` (60 s window), pointer parked
 off-screen, from a `just deploy` of the same artefacts.
 
-| process | VmRSS | VmHWM | threads | idle CPU, 60 s |
-|---|---|---|---|---|
-| `nitro-session` | **2 792 kB** | 2 792 kB | 1 | **0.00 %** |
-| `nitro-server` | 17 840 kB | 17 840 kB | 1 | 0.02 % |
-| `nitro-wallpaper` | **2 664 kB** | 2 664 kB | 1 | **0.00 %** |
-| `nitro-bar` | **2 752 kB** | 2 752 kB | 1 | **0.00 %** |
-| `nitro-launcher` | **2 920 kB** | 2 920 kB | 1 | **0.00 %** |
-| **whole desktop** | **28 968 kB** | — | 5 | — |
+| process | VmRSS | RssAnon | RssFile | threads | idle CPU, 60 s |
+|---|---|---|---|---|---|
+| `nitro-session` | **2 792 kB** | **212 kB** | 2 580 kB | 1 | **0.00 %** |
+| `nitro-server` | 17 840 kB | 11 296 kB | 7 212 kB | 1 | 0.02 % |
+| `nitro-wallpaper` | **2 664 kB** | **200 kB** | 2 472 kB | 1 | **0.00 %** |
+| `nitro-bar` | **2 752 kB** | **252 kB** | 2 520 kB | 1 | **0.00 %** |
+| `nitro-launcher` | **2 920 kB** | **252 kB** | 2 668 kB | 1 | **0.00 %** |
+| **whole desktop** | **28 968 kB** | **12 212 kB** | 17 452 kB | 5 | — |
+
+The anon/file columns are the #538 addition, and they change how this
+table reads. **The four shell processes are ~250 kB of private memory
+each**; 90 % of each one's `VmRSS` is file-backed — the same libc and the
+same `nitro-ui` text, mapped four times and counted four times. So the
+17 452 kB `RssFile` total is an *upper bound*, not a cost: summing it
+across the tree double-counts every shared page. The `RssAnon` column is
+the one that is genuinely additive, and it says the whole desktop's
+private memory is **12.2 MB, of which 8.1 MB is the server's one shadow
+buffer**. Four shell clients, a supervisor and a compositor come to about
+4 MB of private memory between them.
 
 (The unit also contains systemd's own `(sd-pam)` helper at 4 392 kB,
 forked into the logind session by `PAMName=login`. It is listed by
@@ -238,25 +280,169 @@ nothing to be running.
 511 KB of binary — smaller than any of the shell clients it starts,
 because it is `rustix` + `nitro-wire` + `signal-hook` and no toolkit.
 
-#### The server's 17.8 MB, and why it is not a regression
+#### The server's 17.8 MB, audited (#538)
 
-It is 8 MB over the "≤ 8.5 MB" the M3-E spec asked for, and the entire
-difference is the heap shadow buffer that #539 introduced *after* that
-number was written. Measured on the box, same binary, same session:
+It is 9 MB over the "≤ 8.5 MB" the M3-E spec asked for, and the note that
+used to sit here blamed the whole gap on #539's shadow buffer and called
+the rest "the server proper" without saying what that was. The audit
+behind #538 took the number apart. It splits four ways, and only the last
+one is a defect.
 
-| | `VmRSS` |
-|---|---|
-| `NITRO_SHADOW=0` | **9 536 kB** |
-| shadow (default) | 17 744 kB |
-| difference | **8 208 kB** |
+All rows below are the same binary on the box, `nitro-session` with
+wallpaper, bar and launcher up, plus *N* `hello_dialog` windows, settled
+(the state the idle sweep has run in). `RssAnon` and `RssFile` are read
+from `/proc/<pid>/status`; `just box-ps` now prints both.
 
-and `stats` reports `shadow_bytes 8294400` — exactly `1920 × 1080 × 4`,
-one per output. The section above argues that trade (9.3× on the frame
-path); it is one allocation per screen, not per window, and it is the
-same 8 MB the two-window M3-D row records. The remaining 9 536 kB is the
-server proper with a desktop's worth of clients on it — four shell
-connections, two applications, fonts loaded — against the 8 240 kB the
-M3-A row measured with one client and no text on screen.
+| | `VmRSS` | `RssAnon` | `RssFile` |
+|---|---|---|---|
+| desktop, shadow on (as shipped) | 17 764 kB | 10 532 kB | 7 232 kB |
+| desktop, `NITRO_SHADOW=0` | **9 676 kB** | **2 424 kB** | 7 252 kB |
+| difference | 8 088 kB | 8 108 kB | ~0 |
+
+**First: 7.2 MB of the 17.8 is file-backed, and it is not the server's
+heap at all.** `RssFile` does not move when a window opens, is shared with
+every other process mapping the same library, and is reclaimable under
+pressure — on a box with no swap that is the difference between memory
+that can be given back and memory that cannot. Top mappings by `Rss`, from
+`/proc/<pid>/smaps` with five windows open:
+
+| `Rss` | `Anon` | mapping |
+|---|---|---|
+| 1 696 kB | 0 | `nitro-bin/nitro-server` (`r-xp`, its own text) |
+| 1 248 kB | 0 | `libc.so.6` (`r-xp`) |
+| 512 kB | 0 | `libglib-2.0.so.0` (`r-xp`) |
+| 424 kB | 16 kB | `libc.so.6` (`r--p`, rodata + relro) |
+| 368 kB | 48 kB | `nitro-bin/nitro-server` (`r--p`) |
+| 344 kB | 0 | `libm.so.6` (`r-xp`) |
+| 260 kB | 4 kB | `libglib-2.0.so.0` (`r--p`) |
+| 220 kB | 0 | `libgobject-2.0.so.0` (`r-xp`) |
+| 200 kB | 0 | `libinput.so.10` (`r-xp`) |
+| 192 kB | 8 kB | `libxkbcommon.so.0` (`r--p`) |
+
+So it is the binary's own 2.0 MB image (1.7 MB of it resident), libc, and
+the libinput/libglib/libgobject/libxkbcommon stack the seat drags in.
+`glib` is there because `libinput` links it; we do not call it. **No font
+file appears in this list**, which is worth stating plainly: `nitro-text`
+reads faces with `std::fs::read` into the heap, so font bytes are *anon*,
+not file-backed, and the "font files mmapped" guess in #538 is wrong.
+
+**Second: 8.1 MB is the shadow buffer**, exactly `1920 × 1080 × 4` =
+8 294 400 bytes, and `stats` reports it as `shadow_bytes`. The section
+above argues that trade (9.3× on the frame path); it is one allocation per
+*screen*, not per window, and `NITRO_SHADOW=0` hands it back.
+
+**Third: what is left is 2 424 kB of anon** — the server proper, with four
+shell connections, six windows and every glyph on screen. Of that:
+
+| | bytes | how it is known |
+|---|---|---|
+| glyph atlas | **1 048 576** | `atlas_bytes`, one 1024×1024 A8 page |
+| scene nodes | 206 × 240 = **49 440** | `nodes` × `size_of::<Node>()` |
+| per wire connection | ~**66 000** each | `nitro-wire`'s 64 KiB `RECV_CHUNK` receive scratch, allocated in `Socket::from_fd` before the handshake; measured by opening 5 idle sockets that never send a byte (+332 kB) |
+| font bytes, settled | **0** | `font_bytes`; see below |
+
+**The atlas is 43 % of the server's anonymous memory**, and one page is
+enough: the whole desktop, the calculator and the launcher together
+rasterize 115 masks, and the full printable ASCII range at the three sizes
+a nitro desktop uses (13 px title bar, 14 px UI, 20 px heading) in all
+four subpixel buckets still fits one page — pinned by
+`text.rs::a_ui_worth_of_glyphs_fits_in_one_atlas_page`. A page is
+allocated whole and never shrinks, so `atlas_bytes` is its real cost
+whatever fraction is packed.
+
+**Font residency is working, and now provably so.** #538 asked whether
+the idle sweep releases what it should. `font_bytes` alone cannot answer
+it: a settled server reports 0 both when the sweep is doing its job and
+when no face was ever loaded. `stats` therefore now carries `font_loads`,
+`font_releases` and `font_evictions`. On the box, every configuration
+measured, at every window count: **`font_loads == font_releases`, and
+`font_evictions` is 0**. The sweep hands back every file it reads, and the
+8 MB cap never fires — it is the sweep that keeps the steady state small,
+exactly as `crates/nitro-text/README.md` claims.
+
+#### Fourth: the 1.6 MB the allocator keeps, which is a real defect
+
+With the fonts released and `font_bytes` at 0, the server's `RssAnon`
+**still ratchets up 1 556 kB over the first two decorated windows and
+never comes back down** — not when the windows close, not after any
+number of open/close cycles. Ten cycles of one `hello_dialog`, settling
+between each, hold `RssAnon` flat at the post-first-window figure: the
+process is not leaking, it has ratcheted once.
+
+The cause is glibc, not our code. `FontDb::load` reads a whole font file
+in one `malloc` — DejaVuSans is 759 720 bytes. glibc serves an allocation
+that large with `mmap` and unmaps it on `free`, so the *first* such file
+costs nothing lasting. But glibc also **raises its `mmap` threshold to the
+size of any mmap'd block it frees**, so the *second* font file of that
+size is served from the main arena instead — and an arena only shrinks
+from the top. The sweep's `free` is honest and the bytes never leave the
+process. The counters agree it released them; `RssAnon` disagrees.
+
+Pinning the threshold (`MALLOC_MMAP_THRESHOLD_=131072`, which only
+disables the *dynamic adjustment*) is enough to show that is the whole
+story. Same binary, same desktop, `NITRO_SHADOW=0`, `RssAnon` in kB:
+
+| windows | 0 | 1 | 2 | 3 | 4 | 5 |
+|---|---|---|---|---|---|---|
+| glibc default | 2 424 | 3 240 | 3 980 | 3 980 | 3 980 | 3 980 |
+| threshold pinned | **1 684** | 1 804 | 1 864 | 1 972 | 2 040 | **2 112** |
+
+The default row is not a per-window cost at all: it is two font files
+ratcheting in, after which five windows cost **nothing measurable**. The
+pinned row is what a decorated window actually costs — **428 kB over five
+windows, 86 kB each** (deltas 120/60/108/68/72 kB), which is the ~66 kB
+wire receive buffer plus 6 scene nodes plus the shaped title. And the
+floor drops from 2 424 kB to **1 684 kB**, a 740 kB saving on an idle
+desktop.
+
+The arithmetic closes exactly: with the shadow on and the threshold
+pinned, `RssAnon` at zero dialogs is 9 784 kB, and 9 784 − 8 100 (the
+1080p shadow) = **1 684 kB**, identical to the no-shadow floor.
+`MALLOC_TRIM_THRESHOLD_` alone does the same work, because it is the same
+dynamic-adjustment machinery; setting both is no better than either.
+
+**This is recorded, not fixed, and deliberately so.** The fix is either an
+environment variable in the unit — which does not travel with the binary
+and which `docs/testbox.md` would have to carry as a footgun — or reading
+font files into an allocation that does not go through the general
+allocator at all, which means `mmap` in `nitro-text` and a new `unsafe`
+exception, or the `memmap2` already in the tree via `xkbcommon` becoming a
+direct dependency. Both are real changes with a real review cost, and
+neither belongs in an audit. Filed as #547 with these numbers.
+
+### The revised budget line
+
+The old line — "server RSS ≤ 8 MB" — was written for a process whose
+framebuffers lived in GPU memory and before the shadow buffer existed. It
+is unmeasurable against today's server in the sense that matters: it does
+not say whether it means anon or total, so it cannot distinguish "we
+allocated a megabyte" from "we linked another library", and the biggest
+single term in it is a hardware constant. The replacement:
+
+> **Server: `RssAnon` ≤ 2.5 MB + 100 kB per decorated window, plus one
+> scanout-sized shadow buffer per output. `RssFile` ≤ 7.5 MB, and is not
+> a per-window cost.**
+
+Measured against the box today (`NITRO_SHADOW=0`, glibc as it actually
+ships, so the allocator ratchet is *inside* the number rather than
+excused): floor **2 424 kB**, five windows **3 980 kB**, `RssFile`
+**7 252 kB**, shadow **8 100 kB**. Nothing here is rounded down: 2.5 MB is
+above the measured 2 424 kB floor, and the 100 kB/window is above the
+86 kB measured with the allocator behaving, chosen so the line still holds
+when the ratchet is fixed and the floor drops to 1 684 kB.
+
+What the 9.5 MB of a real, shipped, shadow-on server with a desktop on it
+consists of, in one paragraph: **7.2 MB is file-backed** — the server's
+own 2.0 MB binary plus libc, libinput, libglib, libgobject and
+libxkbcommon, shared with every process that maps them and reclaimable —
+and **2.4 MB is anonymous**, of which 1.0 MB is the single glyph atlas
+page, 0.4 MB is wire receive buffers at 64 KiB per connected client, 0.05
+MB is the 206 scene nodes at 240 bytes each, 0.7 MB is font-file bytes the
+idle sweep released and glibc kept, and the remainder is the xkb keymap,
+the libinput device state and the event-loop scratch. Zero of it is font
+data the server still thinks it needs; `font_loads == font_releases` on
+every measurement taken. The 8.1 MB shadow buffer sits on top of that and
+is a property of the screen, not of the workload.
 
 ![The M3 desktop on the test box](m3-desktop.png)
 
@@ -376,16 +562,74 @@ latency.
 ## Dependency count
 
 `cargo tree -e normal --prefix none | sort -u | wc -l` = **70** at M3
-(64 at M2), matching `DEPENDENCIES.md`. Several of those lines are
-cargo's `(*)` markers for already-printed subtrees and several more are
-our own workspace crates; **distinct external crate names are still
-35** — the same 35 as at M2.
+(60 at M2, 48 at M1), matching `DEPENDENCIES.md`. **Distinct external
+crate names are 34.**
+
+That line count is three different kinds of line added together, which is
+what makes it easy to quote wrongly:
+
+| | M1 `7e9be25` | M2 `6d79420` | M3 `329faf3` |
+|---|---|---|---|
+| total lines | 48 | 60 | **70** |
+| external package entries | 29 | 36 | 37 |
+| our workspace crates | 8 | 10 | 17 |
+| cargo `(*)` dedup markers | 10 | 13 | 15 |
+| blank separator line | 1 | 1 | 1 |
+| **distinct external crate names** | — | 34 | **34** |
+
+The first four rows are disjoint and sum to the total at every commit
+(29 + 8 + 10 + 1 = 48; 36 + 10 + 13 + 1 = 60; 37 + 17 + 15 + 1 = 70) —
+which is the property the old paragraph lacked. Each column is a `sort -u`
+of the tree at that commit, re-measured for this table rather than carried
+forward. Note the blank line is a real row: `cargo tree` separates each
+root's subtree with one, and `sort -u` keeps it.
+
+So **48 → 60** across M2-pre decomposes as **+7 external package entries**
+(`swash` and its six transitive crates: `skrifa`, `read-fonts`,
+`font-types`, `yazi`, `zeno`, `once_cell`), **+2 workspace crates** that
+are not dependencies at all (`nitro-text` and `nitro-demo`), and **+3
+`(*)` marker lines**, cargo's "subtree already printed above" notation
+that `sort -u` counts as distinct — two external, one for the second
+`nitro-text` line. 7 + 2 + 3 = 12, and 48 + 12 = 60. The sentence this
+replaces put it as "`swash` and its seven transitive crates, plus the
+`nitro-demo` and second `signal-hook (*)` lines" and summed to 58 (#530):
+`swash` brings six, not seven, and the second `signal-hook` line arrived
+at M3 rather than M2.
+
+**60 → 70** across M3 is **+1 external package entry** (a second
+`signal-hook` *version*, not a new crate name — `nitro-session` takes 0.3
+where the server takes 0.4), **+7 workspace crates** (`nitro-bar`,
+`nitro-launcher`, `nitro-wallpaper`, `nitro-session`, `nitro-ui`,
+`nitro-calc`, `nitro-hey`) and **+2 `(*)` markers**. 1 + 7 + 2 = 10.
+Zero new crate names: 34 at M2 and 34 at M3.
+
+Verify with:
+
+```sh
+cargo tree -e normal --prefix none | sort -u | wc -l                    # 70
+cargo tree -e normal --prefix none | sort -u | grep -c '(\*)'           # 15
+cargo tree -e normal --prefix none | sort -u | grep -c '^nitro-'        # 24 lines,
+                                                                        # 17 crates
+                                                                        # + 7 markers
+cargo tree -e normal --prefix none | awk 'NF{print $1}' |
+    grep -v '^nitro-' | sort -u | wc -l                                 # 34
+```
+
+**`awk 'NF'`, not a bare `awk '{print $1}'`**, in the last one:
+`cargo tree` separates each root's subtree with a **blank line**, the bare
+form turns every blank into an empty string, and `sort -u` keeps one — so
+it reports **35** for 34 crates. That off-by-one is where the "35 distinct
+external crate names" this page and `DEPENDENCIES.md` both used to carry
+came from; the figure was never 35, at M2 or at M3. A `Cargo.lock` count
+is a third number again — **37** — because the lock file also carries
+`pkg-config`, `windows-sys` and `windows-link`: one build dependency and
+two `cfg(windows)` entries that no Linux build ever compiles.
 
 **The entire M3 shell added none of them.** `nitro-bar`,
 `nitro-launcher`, `nitro-wallpaper` and `nitro-session` between them
 contributed six lines to the count and zero crates. The session is the
 one worth naming, because it is the crate `DESIGN.md` licensed to bring
-in D-Bus: `zbus` would have been ~40 crates against a tree of 35, so the
+in D-Bus: `zbus` would have been ~40 crates against a tree of 34, so the
 power actions go through `systemctl` instead and the licence is still
 unspent (`crates/nitro-session/README.md`).
 
@@ -399,7 +643,5 @@ alone.
 `nitro-demo` adds **zero** of them: it uses `nitro-wire`, `nitro-core`,
 `rustix` and `signal-hook`, all of which the tree already carried. Its PNG
 writer for `--save-small` is a small deflate encoder rather than the `png`
-crate, for the same reason `nitro-shot` has one. The rise from 48 at M1 to
-60 is `swash` and its seven transitive crates (M2-pre text), plus the
-`nitro-demo` and second `signal-hook (*)` lines that branch added;
-`DEPENDENCIES.md` has the per-crate justification for each.
+crate, for the same reason `nitro-shot` has one. `DEPENDENCIES.md` has the
+per-crate justification for every external name in the table above.

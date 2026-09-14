@@ -291,6 +291,19 @@ impl Atlas {
         self.pages.len()
     }
 
+    /// Bytes the pages hold: `page_count() * PAGE * PAGE`, one A8 byte per
+    /// pixel.
+    ///
+    /// A page is allocated whole and never shrinks, so this is the atlas's
+    /// real cost to the resident set whatever fraction of it is packed —
+    /// which is why the server reports it rather than leaving a reader of
+    /// `docs/budget.md` to multiply `atlas_pages` by a constant documented
+    /// somewhere else.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.pages.len() * (Self::PAGE as usize) * (Self::PAGE as usize)
+    }
+
     /// Number of cached entries, including glyphs that rasterized to nothing.
     #[must_use]
     pub fn glyph_count(&self) -> usize {

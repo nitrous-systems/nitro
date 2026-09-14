@@ -420,9 +420,23 @@ impl TextEngine {
         out.push(("fonts", self.db.len() as u64));
         out.push(("fonts_loaded", self.db.loaded_files() as u64));
         out.push(("font_bytes", self.db.loaded_bytes() as u64));
+        // The three counters behind `font_bytes`, which is an instant and
+        // says nothing about how it got there. A settled desktop reports
+        // `font_bytes 0` whether the sweep is working or no face was ever
+        // loaded, and #538 was exactly that ambiguity: the question "is
+        // the idle sweep releasing what it should?" had no answer from
+        // outside the process. `font_releases` rising with `font_loads`
+        // is the sweep doing its job; `font_loads` far ahead of it is the
+        // bug the sweep exists to prevent.
+        out.push(("font_loads", self.db.loads()));
+        out.push(("font_releases", self.db.releases()));
+        out.push(("font_evictions", self.db.evictions()));
         out.push(("glyphs_cached", self.atlas.glyph_count() as u64));
         out.push(("glyph_renders", self.atlas.renders()));
         out.push(("atlas_pages", self.atlas.page_count() as u64));
+        // Bytes the atlas pages hold, so the budget does not have to
+        // multiply `atlas_pages` by a page size documented elsewhere.
+        out.push(("atlas_bytes", self.atlas.bytes() as u64));
         out.push(("text_runs", self.store.len() as u64));
         out.push(("shape_us_mean", self.shape_us.mean()));
     }
@@ -654,5 +668,126 @@ mod tests {
         // Shaping again after the release still works; it costs one re-read.
         let (_, shaped) = engine.shape(1, &request, "Hello");
         assert!(!shaped.lines.is_empty(), "a released face reloads on use");
+    }
+
+    /// #538 asked "with the desktop idle, is the sweep releasing what it
+    /// should?" and found the question unanswerable from outside: a
+    /// settled server reports `font_bytes 0` both when the sweep is doing
+    /// its job and when no face was ever loaded. These are the counters
+    /// that tell the two apart, and this pins what each one means.
+    #[test]
+    fn the_sweep_counters_say_what_the_instantaneous_bytes_cannot() {
+        let mut engine = super::TextEngine::new();
+        if !engine.has_fonts() {
+            return;
+        }
+        let mut pairs: Vec<(&'static str, u64)> = Vec::new();
+        let get = |pairs: &[(&'static str, u64)], key: &str| {
+            pairs.iter().find(|(k, _)| *k == key).map_or_else(
+                || panic!("stats key {key} is missing: {pairs:?}"),
+                |(_, v)| *v,
+            )
+        };
+
+        engine.write_pairs(&mut pairs);
+        assert_eq!(get(&pairs, "font_loads"), 0, "nothing read at startup");
+        assert_eq!(get(&pairs, "font_releases"), 0);
+        assert_eq!(get(&pairs, "font_evictions"), 0);
+        // `font_bytes 0` here and `font_bytes 0` after a sweep look
+        // identical; only the counters distinguish them.
+        assert_eq!(get(&pairs, "font_bytes"), 0);
+
+        let request = super::StyleRequest::new("sans", 14.0, 400, false, 0.0, false);
+        engine.shape(1, &request, "Title bar");
+        pairs.clear();
+        engine.write_pairs(&mut pairs);
+        let loads = get(&pairs, "font_loads");
+        assert!(loads > 0, "shaping read a file: {pairs:?}");
+        assert_eq!(get(&pairs, "font_releases"), 0, "and has not let go yet");
+
+        engine.next_frame();
+        engine.release_idle_fonts();
+        pairs.clear();
+        engine.write_pairs(&mut pairs);
+        assert_eq!(get(&pairs, "font_bytes"), 0);
+        assert_eq!(
+            get(&pairs, "font_releases"),
+            loads,
+            "the sweep handed back every file the shape read: {pairs:?}"
+        );
+        assert_eq!(
+            get(&pairs, "font_evictions"),
+            0,
+            "the 8 MB cap never fired — the sweep did the work, not the cap"
+        );
+
+        // Sweeping again releases nothing, because there is nothing left:
+        // a `font_releases` that keeps climbing on an idle desktop would
+        // mean faces are being reloaded behind the sweep's back.
+        engine.next_frame();
+        engine.release_idle_fonts();
+        pairs.clear();
+        engine.write_pairs(&mut pairs);
+        assert_eq!(get(&pairs, "font_releases"), loads, "idempotent when idle");
+    }
+
+    /// The desktop, the calculator and the launcher all fit in one atlas
+    /// page, and `atlas_bytes` is what that page costs the resident set.
+    ///
+    /// #538 asked whether one page is enough. A page is allocated whole
+    /// and never shrinks, so the answer is worth a *byte* figure rather
+    /// than a count the reader has to multiply by a constant.
+    #[test]
+    fn a_ui_worth_of_glyphs_fits_in_one_atlas_page() {
+        use nitro_text::{Atlas, FontDb, GlyphKey};
+
+        let db = FontDb::scan();
+        if db.is_empty() {
+            eprintln!("skipping: no fonts on this box");
+            return;
+        }
+        let style = nitro_text::TextStyle::default();
+        let Some(font) = db.select(&style) else {
+            eprintln!("skipping: no face selected");
+            return;
+        };
+
+        // Every printable ASCII glyph at the three sizes a nitro desktop
+        // actually uses — the 13 px title bar, the 14 px UI default and
+        // the 20 px heading `hello_dialog` opens with — in all four
+        // subpixel buckets, which is the worst case the key can produce.
+        // That is a superset of what the box's desktop, calculator and
+        // launcher put on screen together (measured there: 115 masks).
+        let mut atlas = Atlas::new();
+        let mut cached = 0u32;
+        let data = db.face(font).expect("the face the db selected");
+        let font_ref = data.font_ref().expect("a parsable face");
+        let charmap = font_ref.charmap();
+        for size in [13.0f32, 14.0, 20.0] {
+            for ch in ' '..='~' {
+                let glyph = charmap.map(ch);
+                if glyph == 0 {
+                    continue;
+                }
+                for subpx in 0..4u8 {
+                    let key = GlyphKey::new(font, glyph, size, f32::from(subpx) * 0.25);
+                    if atlas.get(&db, key).is_some() {
+                        cached += 1;
+                    }
+                }
+            }
+        }
+        assert!(cached > 100, "the run really did rasterize: {cached} masks");
+        assert_eq!(
+            atlas.page_count(),
+            1,
+            "three sizes of the full ASCII range in four subpixel buckets \
+             still fit one page ({cached} masks)"
+        );
+        assert_eq!(
+            atlas.bytes(),
+            1024 * 1024,
+            "and one page is exactly 1 MiB of A8"
+        );
     }
 }
