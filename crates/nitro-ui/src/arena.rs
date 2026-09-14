@@ -90,10 +90,26 @@ impl Dirty {
         Self((self.0 & 0b111) << 3)
     }
 
-    /// Whether any of `other`'s bits are set.
+    /// Whether **any** of `other`'s bits are set.
+    ///
+    /// The passes want this one: `has(PAINT | SUB_PAINT)` asks "is there
+    /// anything to paint in here?", where either bit is a yes.
     #[must_use]
     pub const fn has(self, other: Self) -> bool {
         self.0 & other.0 != 0
+    }
+
+    /// Whether **every** one of `other`'s bits is set.
+    ///
+    /// [`Ui::mark`](crate::Ui::mark)'s early stop wants this one, and the
+    /// difference is not academic: a mark of `LAYOUT | PAINT` walks up
+    /// setting `SUB_LAYOUT | SUB_PAINT`, and stopping at the first
+    /// ancestor that already had *one* of them left the other unset all
+    /// the way to the root — so the paint pass skipped a subtree that
+    /// held a `PAINT` widget and the change never reached the screen.
+    #[must_use]
+    pub const fn has_all(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
     }
 
     /// Whether nothing is set.
@@ -320,6 +336,25 @@ mod tests {
             (Dirty::LAYOUT | Dirty::SUB_PAINT).to_sub(),
             Dirty::SUB_LAYOUT
         );
+    }
+
+    #[test]
+    fn has_is_any_and_has_all_is_every() {
+        // The distinction `Ui::mark` turns on, and the bug it caused when
+        // the two were the same function: a combined mark's early stop
+        // must ask "does this ancestor already carry *both* sub flags?",
+        // not "does it carry either?".
+        let mut d = Dirty::NONE;
+        d.insert(Dirty::SUB_LAYOUT);
+        let both = Dirty::SUB_LAYOUT | Dirty::SUB_PAINT;
+        assert!(d.has(both), "one of the two is set");
+        assert!(!d.has_all(both), "but not both");
+        d.insert(Dirty::SUB_PAINT);
+        assert!(d.has_all(both));
+        // Everything has all of nothing, which is what makes the walk
+        // terminate rather than loop on an empty mark.
+        assert!(Dirty::NONE.has_all(Dirty::NONE));
+        assert!(!Dirty::NONE.has(Dirty::PAINT));
     }
 
     #[test]

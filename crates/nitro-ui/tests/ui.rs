@@ -803,6 +803,80 @@ fn a_child_added_to_a_settled_tree_is_painted() {
 }
 
 #[test]
+fn a_combined_mark_lights_every_sub_flag_on_the_way_up() {
+    // Regression, found by the launcher (#3691). `Ui::mark` walks up
+    // setting the matching `SUB_` flags and stops "as soon as one is
+    // already lit" — but the stop tested whether *any* of the wanted bits
+    // was present, not all of them. So a `LAYOUT | PAINT` mark on a
+    // widget whose ancestor already carried `SUB_LAYOUT` (from an earlier
+    // layout-only change) stopped there and never set `SUB_PAINT`, all
+    // the way to the root.
+    //
+    // `pass_paint` then skipped the subtree, and the symptom was the
+    // nastiest kind: the tree said one thing and the screen said another,
+    // with no error anywhere. The launcher's selection marker moved in
+    // `Button::text()` and never reached a pixel.
+    //
+    // The shape below is exactly that: two siblings deep in a tree, one
+    // marked layout-only (which lights `SUB_LAYOUT` on every ancestor),
+    // then the other's text changed — `Button::set_text` marks
+    // `LAYOUT | PAINT`.
+    struct S {
+        a: Option<WidgetId>,
+        b: Option<WidgetId>,
+    }
+    let mut h = Harness::sized(
+        "submark",
+        S { a: None, b: None },
+        Size::new(240.0, 120.0),
+        |ui: &mut Ui<S>| {
+            let a = ui.build(button("aaa"));
+            let b = ui.build(button("bbb"));
+            // Three containers deep, so the `SUB_` walk has somewhere to
+            // stop early.
+            let inner = ui.build(row().gap(4.0));
+            ui.attach(inner, a).unwrap();
+            ui.attach(inner, b).unwrap();
+            let middle = ui.build(column().gap(4.0));
+            ui.attach(middle, inner).unwrap();
+            let root = ui.build(column().padding(8.0));
+            ui.attach(root, middle).unwrap();
+            root
+        },
+    );
+    // The ids, fished back out the way a test must: by walking, since the
+    // builder closure cannot write to a state it does not have.
+    let root = h.ui().root().unwrap();
+    let middle = h.ui().children(root)[0];
+    let inner = h.ui().children(middle)[0];
+    let (a, b) = (h.ui().children(inner)[0], h.ui().children(inner)[1]);
+    h.state_mut().a = Some(a);
+    h.state_mut().b = Some(b);
+    h.settle();
+
+    // One widget marked LAYOUT-only: every ancestor now carries
+    // `SUB_LAYOUT` and none carries `SUB_PAINT`.
+    h.ui().mark(a, nitro_ui::Dirty::LAYOUT);
+    // …and now the sibling's text changes, which is `LAYOUT | PAINT`.
+    h.tap();
+    h.clear_tap();
+    h.ui().widget_mut::<Button<S>>(b).unwrap().set_text("zzz");
+    h.settle();
+
+    let ops: Vec<&str> = h.mutations().iter().map(|m| m.op).collect();
+    assert!(
+        ops.contains(&"SetText"),
+        "the repaint reached the wire: {ops:?}"
+    );
+    assert_eq!(
+        h.widget::<Button<S>>(b).text(),
+        "zzz",
+        "and the tree agrees with it"
+    );
+    h.quit();
+}
+
+#[test]
 fn a_label_is_painted_at_the_width_it_was_measured_at() {
     // Regression: `measure` asked for a wrap width but `paint` hardcoded
     // `max_width: 0.0, wrap: false`, so a label narrower than its string

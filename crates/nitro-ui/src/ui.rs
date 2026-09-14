@@ -846,7 +846,15 @@ impl<S: 'static> Ui<S> {
             let Some(slot) = self.arena.slot_mut(p) else {
                 break;
             };
-            if slot.state.flags.has(sub) {
+            // `has_all`, not `has`: a mark of `LAYOUT | PAINT` needs
+            // *both* `SUB_` bits on the ancestor chain, and stopping at
+            // the first ancestor that already carried one of them left
+            // the other unset for the whole chain above it. The paint
+            // pass then skipped a subtree holding a `PAINT` widget, and
+            // the symptom was a change that took effect in the tree and
+            // never reached the screen — `a_combined_mark_lights_every_sub_flag`
+            // in this file is the regression.
+            if slot.state.flags.has_all(sub) {
                 break;
             }
             slot.state.flags.insert(sub);
@@ -1021,6 +1029,53 @@ impl<S: 'static> Ui<S> {
     #[must_use]
     pub fn is_shell(&self) -> bool {
         self.wire.conn().has_caps(nitro_wire::types::caps::SHELL)
+    }
+
+    /// Show or hide the whole window, without destroying anything.
+    ///
+    /// This is what a launcher uses to come and go: the tree is built
+    /// once and hidden, so showing it again is **one** mutation rather
+    /// than a rebuild — and everything under it (its measurements, its
+    /// scene nodes, its text) survives the round trip. Hiding also
+    /// releases what the server hangs on a window *showing*: an exclusive
+    /// zone and a keyboard grab (`docs/shell.md`).
+    ///
+    /// A no-op change sends nothing, so a hide of an already-hidden
+    /// window costs no commit.
+    ///
+    /// # Errors
+    /// A wire failure, which is fatal.
+    pub fn set_window_visible(&mut self, visible: bool) -> Result<(), Error> {
+        self.wire.set_visible(WINDOW, visible)
+    }
+
+    /// Whether the window is currently shown; `true` until something
+    /// hides it.
+    #[must_use]
+    pub fn window_visible(&self) -> bool {
+        self.wire.window_visible()
+    }
+
+    /// Take or release the keyboard grab on this window.
+    ///
+    /// A grab replaces **focus** as the destination of key events, which
+    /// is how a `NO_FOCUS` overlay reads the keyboard without making the
+    /// window behind it look inactive. It does **not** outrank the shell's
+    /// own [`bind_key`](Ui::bind_key) bindings: a bound chord arrives as a
+    /// `HotKey` and is not also delivered here, which is what lets a
+    /// launcher opened by a Super tap be closed by a second one.
+    ///
+    /// Queued as a mutation rather than sent at once, so it rides the
+    /// same commit as an un-hide: the server drops a grab on a window
+    /// that is not showing, so taking one in an earlier transaction than
+    /// the `SetVisible` that shows the window would be dropped again
+    /// immediately.
+    ///
+    /// # Errors
+    /// A wire failure. On an unprivileged connection the server closes
+    /// the connection instead — check [`Ui::is_shell`].
+    pub fn grab_keyboard(&mut self, on: bool) -> Result<(), Error> {
+        self.wire.grab_keyboard(WINDOW, on)
     }
 
     /// Resize the window's content area; the next flush re-lays out.

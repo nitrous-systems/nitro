@@ -1,0 +1,36 @@
+[package]
+name = "nitro-launcher"
+description = "The nitro application launcher: a Super-tap overlay that searches .desktop files and spawns what you pick"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The toolkit, and `rustix` for the one thing the toolkit does not do:
+# `setsid`, which is what detaches a launched application from the
+# launcher's session so closing the launcher cannot take it down.
+nitro-ui = { workspace = true }
+rustix = { workspace = true, features = ["process"] }
+
+[lib]
+name = "nitro_launcher"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nitro-launcher"
+path = "src/main.rs"
+
+[dev-dependencies]
+# The in-process harness: a real server on the fake backend, a real shell
+# connection, real pixels, real keys. A dev-dependency, so the shipped
+# binary never links the compositor.
+nitro-ui = { workspace = true, features = ["test-support"] }
+# `tests/launcher.rs` opens a second, ordinary client so there is a window
+# for the focus-loss rule to notice. That is raw wire, so the test names
+# the wire crate; the shipped launcher does not.
+nitro-wire = { workspace = true }
+nitro-core = { workspace = true }

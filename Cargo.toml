@@ -17,6 +17,8 @@ nitro-wire   = { path = "crates/nitro-wire" }
 nitro-scene  = { path = "crates/nitro-scene" }
 nitro-ui     = { path = "crates/nitro-ui" }
 nitro-bar    = { path = "crates/nitro-bar" }
+nitro-launcher = { path = "crates/nitro-launcher" }
+nitro-wallpaper = { path = "crates/nitro-wallpaper" }
 nitro-raster = { path = "crates/nitro-raster" }
 nitro-text   = { path = "crates/nitro-text" }
 nitro-seat   = { path = "crates/nitro-seat" }

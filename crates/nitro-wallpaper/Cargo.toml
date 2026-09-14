@@ -1,0 +1,29 @@
+[package]
+name = "nitro-wallpaper"
+description = "The nitro wallpaper: a Background-layer surface per output, painting a gradient, a colour or a PPM image"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The toolkit and nothing else. A wallpaper is a rectangle with a fill on
+# it; every pixel decision it makes is one the toolkit already exposes.
+nitro-ui = { workspace = true }
+
+[lib]
+name = "nitro_wallpaper"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nitro-wallpaper"
+path = "src/main.rs"
+
+[dev-dependencies]
+# The in-process harness: a real server on the fake backend, real pixels.
+# A dev-dependency, so the shipped binary never links the compositor.
+nitro-ui = { workspace = true, features = ["test-support"] }
+nitro-core = { workspace = true }

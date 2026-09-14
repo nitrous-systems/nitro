@@ -40,7 +40,7 @@ size windows="1":
 # Test box (see docs/testbox.md)
 # ---------------------------------------------------------------------------
 box := env_var_or_default("NITRO_BOX", "kaspar@192.168.1.204")
-box_bins := "nitro-server nitro-shot nitro-demo nitro-calc nitro-bar hey hello_client hello_dialog shell_probe"
+box_bins := "nitro-server nitro-shot nitro-demo nitro-calc nitro-bar nitro-launcher nitro-wallpaper hey hello_client hello_dialog shell_probe"
 
 # Build release, rsync binaries to the box, restart the dev server.
 deploy: (deploy-bins) 
@@ -49,7 +49,7 @@ deploy: (deploy-bins)
 deploy-bins:
     # `--examples` on its own does not build the binaries, so ask for both.
     cargo build --release --workspace --bins --examples
-    cd target/release && rsync -az nitro-server nitro-shot nitro-demo nitro-calc nitro-bar hey {{box}}:nitro-bin/
+    cd target/release && rsync -az nitro-server nitro-shot nitro-demo nitro-calc nitro-bar nitro-launcher nitro-wallpaper hey {{box}}:nitro-bin/
     cd target/release/examples && rsync -az hello_client hello_dialog shell_probe {{box}}:nitro-bin/
 
 # Install/refresh the systemd unit on the box (needs sudo there).

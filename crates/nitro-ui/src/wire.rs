@@ -169,6 +169,9 @@ pub(crate) struct Wire {
     /// Next never-used buffer id. `BufferId(0)` is "no buffer".
     next_buffer: u32,
     pub(crate) text_cache: TextMeasureCache,
+    /// Whether the window's subtree is shown, so an unchanged
+    /// [`Wire::set_visible`] costs no mutation and therefore no commit.
+    window_visible: bool,
 }
 
 impl Wire {
@@ -185,6 +188,7 @@ impl Wire {
             next_request: 1,
             next_buffer: 1,
             text_cache: TextMeasureCache::default(),
+            window_visible: true,
         }
     }
 
@@ -433,6 +437,48 @@ impl Wire {
 
     pub(crate) fn set_bounds(&mut self, id: NodeId, rect: Rect) -> Result<(), Error> {
         self.send(&ClientMsg::SetBounds(SetBounds { id, rect }), id)
+    }
+
+    /// Show or hide a node and its subtree.
+    ///
+    /// Queued as a mutation, so it rides the next commit. That is what
+    /// makes a launcher's hide cost **one** message: the tree underneath
+    /// is untouched, so nothing else is dirty and the commit carries this
+    /// and nothing more.
+    ///
+    /// The window's own last-sent value is cached here rather than in
+    /// [`Ui`](crate::Ui), because this is the layer that already answers
+    /// "has this property changed?" for every paint slot — a second copy
+    /// of the same question upstairs is how the two drift.
+    pub(crate) fn set_visible(&mut self, id: NodeId, visible: bool) -> Result<(), Error> {
+        if id == crate::ui::WINDOW {
+            if self.window_visible == visible {
+                return Ok(());
+            }
+            self.window_visible = visible;
+        }
+        self.send(&ClientMsg::SetVisible(msg::SetVisible { id, visible }), id)
+    }
+
+    /// Whether the window is currently shown.
+    pub(crate) fn window_visible(&self) -> bool {
+        self.window_visible
+    }
+
+    /// Take or release the keyboard grab on one of this client's windows
+    /// (needs `caps::SHELL`).
+    ///
+    /// Buffered to the commit like the other three window-naming shell
+    /// ops, which is also why it is queued rather than sent now: a
+    /// launcher un-hides itself and re-takes the grab in **one**
+    /// transaction, and a grab answered on receipt would be looking at a
+    /// window the commit has not un-hidden yet — the server drops a grab
+    /// on a window that is not showing.
+    pub(crate) fn grab_keyboard(&mut self, id: NodeId, on: bool) -> Result<(), Error> {
+        self.send(
+            &ClientMsg::GrabKeyboard(msg::GrabKeyboard { window: id, on }),
+            id,
+        )
     }
 
     pub(crate) fn destroy_node(&mut self, id: NodeId) -> Result<(), Error> {

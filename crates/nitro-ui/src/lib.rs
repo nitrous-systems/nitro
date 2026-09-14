@@ -109,6 +109,11 @@ pub use layout::{
 };
 pub use nitro_core::{Color, Point, Rect, Size, Transform};
 pub use nitro_wire::types::Align;
+// A custom widget's `paint` takes a `Fill` ([`PaintCx::rect`]), so a
+// crate that writes one — `nitro-wallpaper`'s gradient backdrop is the
+// first — must be able to name it. Re-exported for the same reason
+// `Align` is: an app depends on `nitro-ui` and nothing else.
+pub use nitro_wire::msg::Fill;
 pub use shell::{Anchor, ShellEvent, Surface};
 pub use theme::{TextStyle, Theme};
 pub use ui::{FdToken, Node, TimerId, Ui, WidgetMut};

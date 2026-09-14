@@ -1,0 +1,732 @@
+//! The launcher, driven through a real server on the shell socket.
+//!
+//! Every test here builds the tree the binary builds
+//! ([`nitro_launcher::build`]) and drives it the way the desktop does: a
+//! real `Overlay` window on `shell.sock`, real key events travelling
+//! evdev → server → grab → widget, and a real `fork`/`exec` at the end of
+//! the launch path. Nothing pokes the state directly to set up a case the
+//! wire would not produce.
+//!
+//! The two things that *are* faked are the `.desktop` search path
+//! (`Launcher::with_dirs`, pointed at a fixture directory) and the
+//! built-in entries (`Launcher::with_builtins`) — because the alternative
+//! is a test that asserts on whatever applications the machine running it
+//! happens to have installed, which is neither the claim nor reliably
+//! true.
+
+use std::path::PathBuf;
+
+use nitro_launcher::desktop::{Entry, Source};
+use nitro_launcher::{Launcher, build, names};
+use nitro_ui::event::key;
+use nitro_ui::shell::Surface;
+use nitro_ui::test::Harness;
+use nitro_ui::widgets::{Button, Label, TextField};
+use nitro_ui::{Size, WidgetId};
+use nitro_wire::client::Connection;
+use nitro_wire::types::{Layer, NodeId};
+
+/// Evdev keycode of the left Super key: the launcher's trigger.
+const KEY_LEFTMETA: u32 = 125;
+
+/// A launcher whose search path is `dirs` and whose built-ins are
+/// `builtins`.
+fn launcher(dirs: Vec<PathBuf>, builtins: Vec<Entry>) -> Harness<Launcher> {
+    Harness::shell(
+        "nitro-launcher",
+        Launcher::new().with_dirs(dirs).with_builtins(builtins),
+        Surface::overlay(),
+        // Smaller than the real 600×400: the harness runs a 320×240
+        // output, and a window bigger than the output is cropped by
+        // `shot` and clicked at coordinates the server clamps. The tree
+        // is the binary's either way — this is the awkward case, not a
+        // soft one.
+        Some(Size::new(300.0, 220.0)),
+        build,
+    )
+}
+
+/// A launcher over a fresh fixture directory of `.desktop` files.
+fn with_files(name: &str, files: &[(&str, &str)]) -> (Harness<Launcher>, PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+        "nitro-launcher-test-{}-{name}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("fixture dir");
+    for (file, text) in files {
+        std::fs::write(dir.join(file), text).expect("fixture file");
+    }
+    let mut h = launcher(vec![dir.clone()], Vec::new());
+    h.settle();
+    (h, dir)
+}
+
+/// A `.desktop` file's text.
+fn entry_text(name: &str, exec: &str) -> String {
+    format!("[Desktop Entry]\nType=Application\nName={name}\nExec={exec}\n")
+}
+
+/// The three applications most tests use.
+fn three() -> Vec<(&'static str, String)> {
+    vec![
+        ("calc.desktop", entry_text("Calculator", "/bin/true calc")),
+        ("mail.desktop", entry_text("Mail", "/bin/true mail")),
+        ("term.desktop", entry_text("Terminal", "/bin/true term")),
+    ]
+}
+
+/// A harness over [`three`].
+fn harness() -> (Harness<Launcher>, PathBuf) {
+    let owned = three();
+    let files: Vec<(&str, &str)> = owned.iter().map(|(f, t)| (*f, t.as_str())).collect();
+    with_files("three", &files)
+}
+
+/// The widget named `path`, found the way `hey` finds it.
+fn named(h: &mut Harness<Launcher>, path: &str) -> Option<WidgetId> {
+    nitro_ui::introspect::resolve(h.ui(), &format!("window/{path}"))
+}
+
+/// The label of result row `n`, as `hey get results/<n> value` would show
+/// it.
+fn row(h: &mut Harness<Launcher>, n: usize) -> String {
+    let id = named(h, &format!("{}/{n}", names::RESULTS)).unwrap_or_else(|| panic!("no row {n}"));
+    h.widget::<Button<Launcher>>(id).text().to_owned()
+}
+
+/// Open the launcher with a real bare-Super tap: press and release with
+/// nothing in between, which is what the server's tap state machine is
+/// looking for.
+fn super_tap(h: &mut Harness<Launcher>) {
+    h.key_down(KEY_LEFTMETA);
+    h.key_up(KEY_LEFTMETA);
+    h.settle();
+}
+
+/// Open an ordinary client window on the harness's **wire** socket.
+///
+/// A real second client, so the focus it takes is the focus a desktop
+/// would give it — which is the only way to tell "the launcher got the
+/// key through its grab" from "the launcher happened to be focused".
+fn open_window(h: &Harness<Launcher>, title: &str, size: Size) -> Connection {
+    let mut conn = Connection::connect(h.server().wire_path(), title).expect("wire connect");
+    conn.tx()
+        .create_window(NodeId(1), title, size, Layer::Normal)
+        .create_rect(
+            NodeId(2),
+            NodeId(1),
+            nitro_core::Rect::new(0.0, 0.0, size.w, size.h),
+        )
+        .fill_solid(NodeId(2), nitro_core::Color::rgb(0x40, 0x80, 0xC0))
+        .set_app_id(NodeId(1), title)
+        .commit(1)
+        .expect("commit");
+    while !conn.flush().expect("flush") {}
+    conn
+}
+
+/// Pump until `f` holds, so the server's notifications have time to
+/// arrive.
+fn until(h: &mut Harness<Launcher>, what: &str, f: impl Fn(&Harness<Launcher>) -> bool) {
+    for _ in 0..400 {
+        if f(h) {
+            return;
+        }
+        h.settle();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("timed out waiting for {what}");
+}
+
+#[test]
+fn a_bare_super_tap_shows_the_launcher_and_a_second_hides_it() {
+    // The headline. The trigger is the *server's* — a `BindKey` with
+    // `keysym: 0` — so what this really asserts is that the binding
+    // landed, that the tap fired once on the release, and that the same
+    // binding closes it while the launcher holds the keyboard.
+    let (mut h, dir) = harness();
+    assert!(!h.state().is_visible(), "hidden until something asks");
+    assert_eq!(h.server().stat("hotkeys"), 2, "the tap and the chord");
+
+    super_tap(&mut h);
+    until(&mut h, "the launcher to show", |h| h.state().is_visible());
+    assert_eq!(h.state().shows(), 1);
+    assert_eq!(h.server().stat("grabbed"), 1, "and it took the keyboard");
+
+    super_tap(&mut h);
+    until(&mut h, "the launcher to hide", |h| !h.state().is_visible());
+
+    // The grab goes with the window — the server drops a grab whose
+    // window stops **showing**, so hiding is a complete release and the
+    // launcher sends no second message. It is dropped **lazily**, on the
+    // next key rather than on the commit that hid the window
+    // (`docs/shell.md` §Keyboard grabs), so the statistic is read after
+    // one: a test that waited for it to fall on its own would wait for
+    // ever, which is what the first version of this did.
+    h.key(46); // c
+    h.settle();
+    assert_eq!(
+        h.server().stat("grabbed"),
+        0,
+        "hiding released the grab, with no message from the launcher"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}
+
+#[test]
+fn the_grab_is_what_delivers_keys_and_hiding_gives_it_back() {
+    // The launcher is `NO_FOCUS`, so keys reach it *only* through the
+    // grab. That cannot be seen with the launcher alone — the harness
+    // focuses its single window so ordinary key tests work at all — so
+    // this opens a second, ordinary client to hold the focus. Then the
+    // question is sharp: with somebody else focused, does the launcher
+    // still get the keys while it is shown, and stop when it is hidden?
+    let (mut h, dir) = harness();
+    let conn = open_window(&h, "victim", Size::new(120.0, 90.0));
+    // A newly placed window takes focus, so the launcher is definitely
+    // not the focused window from here on.
+    until(&mut h, "the other window", |h| {
+        h.server().stat("windows") >= 2
+    });
+    h.settle();
+
+    super_tap(&mut h);
+    until(&mut h, "the show", |h| h.state().is_visible());
+    assert_eq!(h.server().stat("grabbed"), 1);
+    h.key(46); // c
+    h.settle();
+    assert_eq!(
+        h.state().query(),
+        "c",
+        "the grab delivered the key past the focused window"
+    );
+
+    // And the focused window never saw it: a global overlay that also
+    // leaked keystrokes into the window behind it would be a keylogger.
+    h.key(key::ESC);
+    until(&mut h, "the hide", |h| !h.state().is_visible());
+    h.key(48); // b
+    h.settle();
+    assert_eq!(h.state().query(), "c", "a hidden launcher receives nothing");
+    assert_eq!(h.server().stat("grabbed"), 0, "and the grab went with it");
+
+    drop(conn);
+    let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}
+
+#[test]
+fn showing_and_hiding_is_one_mutation_each() {
+    // The cost claim the whole design rests on: the tree is built once,
+    // so coming and going is one `SetVisible` and not a rebuild. A
+    // launcher that re-created its window would pay a `CreateWindow`, a
+    // measurement round trip per string and a first paint while the user
+    // is already typing.
+    let (mut h, dir) = harness();
+    super_tap(&mut h);
+    until(&mut h, "the first show", |h| h.state().is_visible());
+    // The first show is the expensive one (it clears the query and
+    // re-ranks), so measure the *second*, which is the steady state.
+    super_tap(&mut h);
+    until(&mut h, "the hide", |h| !h.state().is_visible());
+
+    h.tap();
+    h.clear_tap();
+    super_tap(&mut h);
+    until(&mut h, "the second show", |h| h.state().is_visible());
+    let visibles = h
+        .mutations()
+        .iter()
+        .filter(|m| m.op == "SetVisible")
+        .count();
+    assert_eq!(visibles, 1, "one SetVisible: {:?}", h.mutations());
+    assert!(
+        !h.mutations().iter().any(|m| m.op == "CreateWindow"),
+        "nothing was rebuilt: {:?}",
+        h.mutations()
+    );
+
+    h.clear_tap();
+    super_tap(&mut h);
+    until(&mut h, "the second hide", |h| !h.state().is_visible());
+    let ops: Vec<&str> = h.mutations().iter().map(|m| m.op).collect();
+    assert_eq!(
+        ops,
+        vec!["SetVisible", "Commit"],
+        "hiding is exactly one mutation and its commit"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}
+
+#[test]
+fn escape_hides_the_launcher() {
+    // Escape is nobody's chord, which is why the launcher can have it:
+    // it arrives as an ordinary key through the grab, and the app-level
+    // handler takes it because the focused text field declined it.
+    let (mut h, dir) = harness();
+    super_tap(&mut h);
+    until(&mut h, "the show", |h| h.state().is_visible());
+
+    h.key(key::ESC);
+    until(&mut h, "the hide", |h| !h.state().is_visible());
+    until(&mut h, "the grab to go", |h| {
+        h.server().stat("grabbed") == 0
+    });
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}
+
+#[test]
+fn the_launcher_never_takes_focus() {
+    // `NO_FOCUS` is not decoration: a launcher that took focus would make
+    // the window behind it look inactive and would move the MRU order
+    // every time the user glanced at it. So the keyboard arrives through
+    // the *grab* instead, which is what the test above exercises — this
+    // one pins down that focus really did not move.
+    let (mut h, dir) = harness();
+    super_tap(&mut h);
+    until(&mut h, "the show", |h| h.state().is_visible());
+    assert_eq!(
+        h.server().stat("grabbed"),
+        1,
+        "it reads the keyboard through a grab"
+    );
+    // The overlay is on the Overlay layer and reserves nothing: a
+    // launcher that reserved space would shrink the desktop every time it
+    // opened.
+    assert_eq!(h.server().stat("exclusive_zones"), 0);
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}
+
+#[test]
+fn typing_narrows_the_list_and_the_best_match_is_first() {
+    // The search path end to end: real key presses into the field, the
+    // field's `on_change`, the ranking, and the rows the ranking
+    // produced.
+    let (mut h, dir) = harness();
+    super_tap(&mut h);
+    until(&mut h, "the show", |h| h.state().is_visible());
+    assert_eq!(
+        h.state().match_count(),
+        3,
+        "an empty query shows everything: {:?}",
+        h.state().match_names()
+    );
+
+    // `KEY_C`, `KEY_A`, `KEY_L`: evdev codes for c, a, l.
+    for code in [46u32, 30, 38] {
+        h.key(code);
+    }
+    h.settle();
+    assert_eq!(h.state().query(), "cal");
+    assert_eq!(h.state().match_names(), vec!["Calculator".to_owned()]);
+    assert!(row(&mut h, 0).contains("Calculator"));
+    assert!(named(&mut h, "results/1").is_none(), "the other rows went");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}
+
+#[test]
+fn arrows_move_the_selection_and_wrap() {
+    // ↑/↓ are app-level handlers rather than the field's, because the
+    // field has its own use for Left/Right and none for Up/Down, and the
+    // selection is a property of the *list*.
+    let (mut h, dir) = harness();
+    super_tap(&mut h);
+    until(&mut h, "the show", |h| h.state().is_visible());
+    assert_eq!(h.state().selected(), 0);
+    assert!(row(&mut h, 0).starts_with('▸'), "the first is marked");
+
+    h.key(key::DOWN);
+    h.settle();
+    assert_eq!(h.state().selected(), 1);
+    assert!(row(&mut h, 1).starts_with('▸'));
+    assert!(!row(&mut h, 0).starts_with('▸'), "and the first is not");
+
+    // Up from the top wraps to the bottom: the list is short, and a user
+    // pressing ↑ at the top means "the last one" far more often than they
+    // mean "do nothing".
+    h.key(key::UP);
+    h.key(key::UP);
+    h.settle();
+    assert_eq!(h.state().selected(), h.state().match_count() - 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}
+
+#[test]
+fn moving_the_selection_costs_two_set_texts() {
+    // The marker is in the label rather than in a colour, so a move is
+    // two strings: the row that lost it and the row that gained it. A
+    // restyle that rewrote every row would be O(list) per arrow press.
+    let (mut h, dir) = harness();
+    super_tap(&mut h);
+    until(&mut h, "the show", |h| h.state().is_visible());
+
+    assert!(row(&mut h, 0).starts_with('▸'));
+
+    h.tap();
+    h.clear_tap();
+    h.key(key::DOWN);
+    h.settle();
+    assert_eq!(h.state().selected(), 1);
+    let texts = h.mutations().iter().filter(|m| m.op == "SetText").count();
+    assert_eq!(
+        texts,
+        2,
+        "two rows changed, not the whole list: {:?}",
+        h.mutations()
+    );
+    // And the strings really moved, which is what the count would not
+    // catch on its own: an earlier toolkit bug had `mark` stop the
+    // `SUB_PAINT` walk at an ancestor that already carried `SUB_LAYOUT`,
+    // so the tree said "▸ Mail" and the screen still said "▸ Calculator".
+    assert!(row(&mut h, 1).starts_with('▸'));
+    assert!(!row(&mut h, 0).starts_with('▸'));
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}
+
+#[test]
+fn enter_launches_the_selected_entry_and_hides() {
+    // The keyboard path all the way to a real process: the marker file is
+    // what "the application started" means, and a launch that silently
+    // did nothing would pass every assertion about the tree.
+    let dir = std::env::temp_dir().join(format!("nitro-launcher-enter-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("fixture dir");
+    let marker = dir.join("launched");
+    std::fs::write(
+        dir.join("stub.desktop"),
+        entry_text(
+            "Stub",
+            &format!("/bin/sh -c \"echo ok > {}\"", marker.display()),
+        ),
+    )
+    .expect("fixture");
+
+    let mut h = launcher(vec![dir.clone()], Vec::new());
+    h.settle();
+    super_tap(&mut h);
+    until(&mut h, "the show", |h| h.state().is_visible());
+    assert_eq!(h.state().match_count(), 1, "the stub is the only entry");
+
+    h.key(key::ENTER);
+    until(&mut h, "the launch", |h| h.state().launches() == 1);
+    assert!(
+        !h.state().is_visible(),
+        "and the launcher got out of the way"
+    );
+
+    until(&mut h, "the process to run", |_| marker.exists());
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap_or_default().trim(),
+        "ok"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}
+
+#[test]
+fn clicking_a_row_launches_that_row() {
+    // The pointer path, and the one bug a launcher must not have: row 0
+    // shows a different application after every keystroke, so its
+    // *callback* has to be replaced along with its label.
+    let dir = std::env::temp_dir().join(format!("nitro-launcher-click-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("fixture dir");
+    let alpha = dir.join("alpha-ran");
+    let beta = dir.join("beta-ran");
+    std::fs::write(
+        dir.join("alpha.desktop"),
+        entry_text(
+            "Alpha",
+            &format!("/bin/sh -c \"echo a > {}\"", alpha.display()),
+        ),
+    )
+    .expect("fixture");
+    std::fs::write(
+        dir.join("beta.desktop"),
+        entry_text(
+            "Beta",
+            &format!("/bin/sh -c \"echo b > {}\"", beta.display()),
+        ),
+    )
+    .expect("fixture");
+
+    let mut h = launcher(vec![dir.clone()], Vec::new());
+    h.settle();
+    super_tap(&mut h);
+    until(&mut h, "the show", |h| h.state().is_visible());
+    assert_eq!(
+        h.state().match_names(),
+        vec!["Alpha".to_owned(), "Beta".to_owned()]
+    );
+
+    // Narrow to Beta, so row 0 is now a *different* application than it
+    // was a moment ago, and click it. `KEY_B` is 48.
+    h.key(48);
+    h.settle();
+    assert_eq!(h.state().match_names(), vec!["Beta".to_owned()]);
+
+    let id = named(&mut h, "results/0").expect("row 0");
+    h.click(id);
+    until(&mut h, "the launch", |h| h.state().launches() == 1);
+    assert_eq!(h.state().last_launch(), Some("/bin/sh"));
+    until(&mut h, "the process", |_| beta.exists());
+    assert!(!alpha.exists(), "row 0's callback followed its label");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}
+
+#[test]
+fn a_query_that_matches_nothing_says_so() {
+    // An empty list with no explanation looks exactly like a launcher
+    // that has broken.
+    let (mut h, dir) = harness();
+    super_tap(&mut h);
+    until(&mut h, "the show", |h| h.state().is_visible());
+
+    // `KEY_Z` is 44.
+    h.key(44);
+    h.key(44);
+    h.settle();
+    assert_eq!(h.state().match_count(), 0);
+    let id = named(&mut h, names::EMPTY).expect("the empty label");
+    let text = h.widget::<Label>(id).text().to_owned();
+    assert!(text.contains("No matches"), "{text:?}");
+    assert!(
+        text.contains("zz"),
+        "and it says what was searched: {text:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}
+
+#[test]
+fn a_terminal_entry_is_shown_marked_and_refused() {
+    // M3 has no terminal to run one in. Showing it and refusing is the
+    // honest failure; hiding it would be "htop is missing", and running
+    // it would be a process the user can neither see nor type at.
+    let text = format!(
+        "{}Terminal=true\n",
+        entry_text("Monitor", "/bin/true monitor")
+    );
+    let (mut h, dir) = with_files("terminal", &[("mon.desktop", &text)]);
+    super_tap(&mut h);
+    until(&mut h, "the show", |h| h.state().is_visible());
+    assert!(row(&mut h, 0).contains("(terminal)"), "{}", row(&mut h, 0));
+
+    h.key(key::ENTER);
+    h.settle();
+    assert_eq!(h.state().launches(), 0, "nothing was started");
+    assert!(
+        h.state()
+            .last_error()
+            .is_some_and(|e| e.contains("terminal")),
+        "and the reason is on screen: {:?}",
+        h.state().last_error()
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}
+
+#[test]
+fn a_launch_that_fails_brings_the_launcher_back_with_the_reason() {
+    // A launch that failed silently is indistinguishable from a launcher
+    // that is broken — and the program not being on `PATH` is the common
+    // case, because a `.desktop` file can name anything.
+    let text = entry_text("Ghost", "nitro-no-such-binary-ever");
+    let (mut h, dir) = with_files("missing", &[("ghost.desktop", &text)]);
+    super_tap(&mut h);
+    until(&mut h, "the show", |h| h.state().is_visible());
+
+    h.key(key::ENTER);
+    until(&mut h, "the failure", |h| h.state().last_error().is_some());
+    assert_eq!(h.state().launches(), 0);
+    assert!(h.state().is_visible(), "it came back rather than vanishing");
+    let id = named(&mut h, names::EMPTY).expect("the empty label");
+    assert!(
+        h.widget::<Label>(id).text().contains("Ghost"),
+        "the reason names the entry: {:?}",
+        h.widget::<Label>(id).text()
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}
+
+#[test]
+fn opening_the_launcher_clears_the_previous_query() {
+    // A launcher that came back showing the last search would need the
+    // user to clear it before typing, every single time.
+    let (mut h, dir) = harness();
+    super_tap(&mut h);
+    until(&mut h, "the show", |h| h.state().is_visible());
+    h.key(46); // c
+    h.settle();
+    assert_eq!(h.state().query(), "c");
+
+    super_tap(&mut h);
+    until(&mut h, "the hide", |h| !h.state().is_visible());
+    super_tap(&mut h);
+    until(&mut h, "the second show", |h| h.state().is_visible());
+    assert_eq!(h.state().query(), "", "the query was cleared");
+    let id = named(&mut h, names::QUERY).expect("the field");
+    assert_eq!(
+        h.widget::<TextField<Launcher>>(id).text(),
+        "",
+        "and so was the field, not just the state"
+    );
+    assert_eq!(h.state().match_count(), 3, "the whole list is back");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}
+
+#[test]
+fn an_application_installed_since_start_up_appears_on_the_next_show() {
+    // The rescan-on-show rule. Re-reading every `.desktop` file on each
+    // keystroke would be a few hundred syscalls per character; never
+    // re-reading them would mean restarting the launcher after every
+    // install.
+    let (mut h, dir) = harness();
+    super_tap(&mut h);
+    until(&mut h, "the show", |h| h.state().is_visible());
+    assert_eq!(h.state().match_count(), 3);
+    super_tap(&mut h);
+    until(&mut h, "the hide", |h| !h.state().is_visible());
+
+    // The directory mtime has to move, and the clock's resolution is not
+    // the filesystem's.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(
+        dir.join("new.desktop"),
+        entry_text("Newcomer", "/bin/true new"),
+    )
+    .expect("install");
+
+    super_tap(&mut h);
+    until(&mut h, "the rescan", |h| h.state().match_count() == 4);
+    assert!(
+        h.state().match_names().contains(&"Newcomer".to_owned()),
+        "{:?}",
+        h.state().match_names()
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}
+
+#[test]
+fn a_builtin_is_launchable_with_no_desktop_files_at_all() {
+    // The test box's state: a freshly rsynced `~/nitro-bin` and nothing
+    // in `/usr/share/applications`. The launcher lists its own siblings
+    // so the box works anyway.
+    let dir = std::env::temp_dir().join(format!("nitro-launcher-builtin-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let marker = dir.join("ran");
+    std::fs::create_dir_all(&dir).expect("dir");
+    let mut h = launcher(
+        vec![dir.join("no-such-applications")],
+        vec![Entry {
+            name: "Calculator".to_owned(),
+            argv: vec![
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                format!("echo ok > {}", marker.display()),
+            ],
+            terminal: false,
+            source: Source::Builtin,
+        }],
+    );
+    h.settle();
+    super_tap(&mut h);
+    until(&mut h, "the show", |h| h.state().is_visible());
+    assert_eq!(h.state().match_names(), vec!["Calculator".to_owned()]);
+
+    h.key(key::ENTER);
+    until(&mut h, "the launch", |h| h.state().launches() == 1);
+    until(&mut h, "the process", |_| marker.exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}
+
+#[test]
+fn every_part_is_addressable_for_hey() {
+    // `hey nitro-launcher list` is the smoke test, and it can only find
+    // what is named. `results/0` in particular is the agentic path's
+    // whole address.
+    let (mut h, dir) = harness();
+    super_tap(&mut h);
+    until(&mut h, "the show", |h| h.state().is_visible());
+    for path in [names::QUERY, names::RESULTS, names::EMPTY, "results/0"] {
+        assert!(named(&mut h, path).is_some(), "no widget at {path}");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}
+
+#[test]
+fn a_hidden_launcher_is_silent_while_idle() {
+    // The toolkit's idle contract, which a launcher has to keep too: it
+    // sits in `epoll_wait` between taps, and the hotkey that wakes it is
+    // the server's rather than a poll of anything.
+    let (mut h, dir) = harness();
+    assert!(!h.state().is_visible());
+    assert_eq!(h.next_timeout(), None, "nothing is armed");
+    h.assert_idle(200);
+
+    // And a *shown* launcher is idle too: the tree settles and then
+    // nothing moves until a key arrives.
+    super_tap(&mut h);
+    until(&mut h, "the show", |h| h.state().is_visible());
+    h.assert_idle(200);
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}
+
+#[test]
+fn the_overlay_paints_where_the_anchor_put_it() {
+    // A centred anchor is the absence of both edges on both axes, and the
+    // launcher is the only surface in the tree that uses it. The window
+    // keeps its own size — unlike a bar, which is resized by spanning —
+    // so what this asserts is that the anchor did not silently span.
+    let (mut h, dir) = harness();
+    super_tap(&mut h);
+    until(&mut h, "the show", |h| h.state().is_visible());
+    let size = h.ui().window_size();
+    assert!(
+        (size.w - 300.0).abs() < 1.0 && (size.h - 220.0).abs() < 1.0,
+        "a centred anchor does not resize: {size:?}"
+    );
+    // And there really are pixels there: the panel, the field and the
+    // rows, against the theme's background.
+    let bg = h.ui().theme().background.to_u32() >> 8;
+    assert!(
+        h.has_ink(nitro_core::Rect::new(0.0, 0.0, size.w, size.h), bg),
+        "the overlay painted something"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}

@@ -36,6 +36,12 @@
 use nitro_wire::types::{anchor, window_flags};
 
 pub use nitro_wire::msg::{OutputInfo, WindowInfo};
+/// Modifier bits for [`Ui::bind_key`](crate::Ui::bind_key), by **name**.
+///
+/// Re-exported here so a shell does not have to name the wire crate for
+/// the one constant it needs. Deliberately *not* the xkb mask a
+/// [`KeyEvent`](crate::KeyEvent) carries — see `Ui::bind_key`.
+pub use nitro_wire::types::mod_mask;
 pub use nitro_wire::types::{Edge, Layer, WindowRef, WindowState};
 
 /// Which edges a surface sticks to, and how far from them.
