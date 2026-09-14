@@ -96,9 +96,6 @@ pub struct Config {
     pub ready_timeout: Duration,
     /// Restart policy for the shell pieces.
     pub backoff: Backoff,
-    /// Install SIGTERM/SIGINT handlers. Tests that run in-process turn
-    /// this off; the shipped binary does not.
-    pub handle_signals: bool,
     /// How long every piece together gets to answer `SIGTERM` before the
     /// session resorts to `SIGKILL`. Default [`TEARDOWN_TIMEOUT`].
     pub teardown_timeout: Duration,
@@ -118,7 +115,6 @@ impl Config {
             session_path,
             ready_timeout: crate::wait::DEFAULT_TIMEOUT,
             backoff: Backoff::default(),
-            handle_signals: true,
             teardown_timeout: TEARDOWN_TIMEOUT,
         }
     }
@@ -409,10 +405,12 @@ impl Session {
                 }
             }
             if revents.contains(PollFlags::OUT) {
-                let done = self.clients[k].flush();
-                if matches!(done, Ok(true) | Err(_)) && self.clients[k].close_after_flush {
-                    self.clients.remove(k);
-                }
+                // A client whose reply could not be written in one go:
+                // push the rest. Every path that answers *and then* drops
+                // a client flushes it blocking (`flush_blocking`) before
+                // returning, so there is nothing to close here — this arm
+                // exists for the ordinary client that stays connected.
+                let _ = self.clients[k].flush();
             }
         }
 

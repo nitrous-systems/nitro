@@ -170,10 +170,6 @@ pub struct Client {
     pub input: Vec<u8>,
     output: Vec<u8>,
     written: usize,
-    /// Set when the reply queued is the last one: the client is dropped
-    /// once it has been written. `logout` and a protocol error both use
-    /// it, so a caller sees its answer before the socket goes away.
-    pub close_after_flush: bool,
 }
 
 impl Client {
@@ -188,7 +184,6 @@ impl Client {
             input: Vec::new(),
             output: Vec::new(),
             written: 0,
-            close_after_flush: false,
         })
     }
 

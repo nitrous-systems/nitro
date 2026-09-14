@@ -121,7 +121,6 @@ impl Env {
         c.bin_dir = Some(self.dir.join("bin"));
         c.args = args;
         c.ready_timeout = Duration::from_secs(10);
-        c.handle_signals = false;
         // Short enough that a test can watch two restarts, long enough
         // that the doubling is visible: 100 ms → 200 ms → 400 ms, capped.
         c.backoff = Backoff::new(Duration::from_millis(100), Duration::from_millis(400));
