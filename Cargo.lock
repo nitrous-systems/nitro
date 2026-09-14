@@ -188,7 +188,7 @@ dependencies = [
  "nitro-server",
  "nitro-wire",
  "rustix",
- "signal-hook",
+ "signal-hook 0.4.4",
 ]
 
 [[package]]
@@ -253,8 +253,17 @@ dependencies = [
  "nitro-text",
  "nitro-wire",
  "rustix",
- "signal-hook",
+ "signal-hook 0.4.4",
  "xkbcommon",
+]
+
+[[package]]
+name = "nitro-session"
+version = "0.0.1"
+dependencies = [
+ "nitro-wire",
+ "rustix",
+ "signal-hook 0.3.18",
 ]
 
 [[package]]
@@ -348,6 +357,16 @@ dependencies = [
  "libc",
  "linux-raw-sys 0.12.1",
  "windows-sys",
+]
+
+[[package]]
+name = "signal-hook"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d881a16cf4426aa584979d30bd82cb33429027e42122b169753d6ef1085ed6e2"
+dependencies = [
+ "libc",
+ "signal-hook-registry",
 ]
 
 [[package]]

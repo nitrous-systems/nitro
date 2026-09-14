@@ -1,0 +1,51 @@
+[package]
+name = "nitro-session"
+description = "The nitro session: starts and supervises the server and the shell, and answers power actions on its own socket"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# `poll`, `pidfd_open`, `kill`, `getuid`: the whole kernel ABI surface of
+# this crate. A supervisor is a `poll` loop over descriptors, and a pidfd
+# is what makes "a child exited" one of those descriptors rather than a
+# timer tick — see `src/child.rs`.
+rustix = { workspace = true, features = ["event", "process"] }
+# The health check, and nothing else: "the server is up" means a client
+# can connect to `wire.sock` *and* to `shell.sock` and be handshaken —
+# not that a socket file exists. See `src/wait.rs`.
+nitro-wire = { workspace = true }
+# SIGTERM → a readable fd, exactly as `nitro-server` does it. The spec
+# for this crate said "rustix + nitro-wire only"; this is the one
+# addition, and it adds **no new crate to the tree** (`nitro-server` and
+# `nitro-demo` already carry it). The alternative inside rustix is
+# `runtime::kernel_sigaction`, which is `unsafe`, `doc(hidden)` and
+# documented as unusable in a process that has a libc — which this one
+# does, through `libseat`'s side of the tree. `default-features = false`
+# keeps it to `low_level::pipe::register`.
+signal-hook = { workspace = true }
+
+[lib]
+name = "nitro_session"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nitro-session"
+path = "src/main.rs"
+
+# The integration tests' stand-in for a real server and a real shell
+# piece: it binds the two wire sockets (or does not), records when it was
+# started and when it was asked to stop, and crashes on request. An
+# example rather than a `[[bin]]`, so `cargo build --release --bins`
+# never produces a test helper next to the shipped binaries.
+[[example]]
+name = "stub_child"
+
+[dev-dependencies]
+# `tests/session.rs` talks to the stub server's sockets and to the
+# session socket; the wire crate is already a dependency, and the tests
+# need nothing else.

@@ -1,13 +1,20 @@
-# nitro dev server on the test box. Runs the freshly deployed
-# ~/nitro-bin/nitro-server as the developer user on tty2, inside a
-# proper logind session (PAMName) so libseat's logind backend hands it
-# the seat without root. `just deploy` rsyncs binaries and restarts it.
+# nitro dev session on the test box. Runs the freshly deployed
+# ~/nitro-bin/nitro-session as the developer user on tty2, inside a
+# proper logind session (PAMName) so libseat's logind backend hands the
+# compositor the seat without root. `just deploy` rsyncs binaries and
+# restarts it.
 #
-# Install: sudo cp deploy/nitro-dev.service /etc/systemd/system/ &&
-#          sudo systemctl daemon-reload
+# The unit runs **nitro-session**, not nitro-server: the session starts
+# the compositor, waits for its sockets, then starts the wallpaper, the
+# bar and the launcher, and supervises all four (M3-E). A shell piece
+# that dies is restarted with backoff; the *server* exiting ends the
+# session with the server's exit code, which is what systemd reports.
+# `systemctl status nitro-dev` therefore shows the whole tree.
+#
+# Install: just box-install
 # Logs:    journalctl -u nitro-dev -f
 [Unit]
-Description=nitro dev server (tty2)
+Description=nitro dev session (tty2)
 After=systemd-user-sessions.service systemd-logind.service
 Conflicts=getty@tty2.service
 
@@ -27,11 +34,21 @@ UtmpMode=user
 # Make tty2 the foreground VT so logind marks the session active and
 # libseat receives `enable` immediately.
 ExecStartPre=+/usr/bin/chvt 2
-ExecStart=/home/kaspar/nitro-bin/nitro-server
+ExecStart=/home/kaspar/nitro-bin/nitro-session
 ExecStopPost=+/usr/bin/chvt 1
 Environment=RUST_BACKTRACE=1
 Environment=NITRO_LOG=info
 Restart=no
-# 3.3 GB box, no swap: a runaway server must die before the box does.
+# 3.3 GB box, no swap: a runaway desktop must die before the box does.
+# The limit now covers the whole tree (session + server + three shell
+# clients) rather than the server alone, because `KillMode=control-group`
+# is the default and every piece is in this unit's cgroup. Measured at
+# M3: ~19 MB resident for all five, so 1 G is still two orders of
+# magnitude of headroom rather than a budget anyone is near.
 MemoryMax=1G
+# The session's own teardown deadline is 3 s (nitro-session's
+# `TEARDOWN_TIMEOUT`), deliberately **inside** this one: the session must
+# finish stopping its children and give the VT back before systemd loses
+# patience and SIGKILLs it, because a SIGKILLed session leaves the
+# compositor holding DRM master with nothing left to release it.
 TimeoutStopSec=5

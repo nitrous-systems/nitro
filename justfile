@@ -40,25 +40,41 @@ size windows="1":
 # Test box (see docs/testbox.md)
 # ---------------------------------------------------------------------------
 box := env_var_or_default("NITRO_BOX", "kaspar@192.168.1.204")
-box_bins := "nitro-server nitro-shot nitro-demo nitro-calc nitro-bar nitro-launcher nitro-wallpaper hey hello_client hello_dialog shell_probe"
+# Everything the box needs for a desktop. `nitro-session` is what the
+# unit runs; it finds the other four next to itself in ~/nitro-bin, which
+# is why they are deployed together and in one rsync — a session that
+# started yesterday's bar next to today's server is the failure mode the
+# sibling lookup exists to prevent.
+box_bins := "nitro-server nitro-session nitro-shot nitro-demo nitro-calc nitro-bar nitro-launcher nitro-wallpaper hey"
+box_examples := "hello_client hello_dialog shell_probe"
 
-# Build release, rsync binaries to the box, restart the dev server.
+# Build release, rsync binaries to the box, restart the dev session.
 deploy: (deploy-bins) 
     ssh {{box}} 'sudo systemctl restart nitro-dev' && just box-status
 
 deploy-bins:
     # `--examples` on its own does not build the binaries, so ask for both.
     cargo build --release --workspace --bins --examples
-    cd target/release && rsync -az nitro-server nitro-shot nitro-demo nitro-calc nitro-bar nitro-launcher nitro-wallpaper hey {{box}}:nitro-bin/
-    cd target/release/examples && rsync -az hello_client hello_dialog shell_probe {{box}}:nitro-bin/
+    cd target/release && rsync -az {{box_bins}} {{box}}:nitro-bin/
+    cd target/release/examples && rsync -az {{box_examples}} {{box}}:nitro-bin/
 
 # Install/refresh the systemd unit on the box (needs sudo there).
 box-install:
+    # `daemon-reload` picks up a changed unit; disabling getty@tty2 frees
+    # the VT the session takes. tty1 keeps its getty for rescue.
     scp deploy/nitro-dev.service {{box}}:/tmp/nitro-dev.service
     ssh {{box}} 'sudo install -m 644 /tmp/nitro-dev.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl disable --now getty@tty2 2>/dev/null; true'
 
 box-status:
     ssh {{box}} 'systemctl status nitro-dev --no-pager -n 20 || true'
+
+# Talk to the running session: `status`, `lock`, `suspend`, `logout`.
+box-session cmd="status":
+    ssh {{box}} 'printf "{{cmd}}\n" | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/nitro/session.sock 2>/dev/null || printf "{{cmd}}\n" | nc -U $XDG_RUNTIME_DIR/nitro/session.sock'
+
+# RSS/idle-CPU table for the whole desktop tree, for docs/budget.md.
+box-ps:
+    ssh {{box}} 'bash -s' < deploy/box-ps.sh
 
 box-log:
     ssh {{box}} 'journalctl -u nitro-dev -f -o cat'
