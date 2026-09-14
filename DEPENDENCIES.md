@@ -10,8 +10,8 @@ number we watch.
 | crate | used by | why | cost / notes |
 |---|---|---|---|
 | `rustix` | seat, kms, server, wire, demo, session, launcher, files | Safe Linux syscalls (epoll, mmap, sockets + `SCM_RIGHTS`, timerfd, netlink) with no libc. The one crate that lets the rest of the tree be `unsafe`-free. | + `bitflags`, `linux-raw-sys` |
-| `zerocopy` (+ `zerocopy-derive`) | wire | The wire format *is* `#[repr(C)]` layout: `U32<LittleEndian>`/`F32<LE>`/… give guaranteed little-endian fields, `Unaligned` lets a payload be decoded in place from any `&[u8]`, and `ref_from_bytes`/`as_bytes` replace the pointer casts we would otherwise write by hand. Validated, total, and `unsafe`-free in our tree. | +3 crates: `zerocopy`, `zerocopy-derive`, and **`syn` 2.x**. Note `drm` → `bytemuck_derive` pins `syn` **3.x**, so the two do *not* share a build: syn is compiled twice. Revisit if compile time hurts. |
-| `drm` (+ `drm-ffi`, `drm-sys`, `drm-fourcc`) | kms | Safe wrappers over the ~30 DRM/KMS ioctls (atomic commit, dumb buffers, AddFB2, properties, events). Hand-rolling them is precisely the `unsafe` we forbid. | pulls `bytemuck` + `bytemuck_derive` → `syn` (proc-macro, compile time). Revisit if it hurts. |
+| `zerocopy` (+ `zerocopy-derive`) | wire | The wire format *is* `#[repr(C)]` layout: `U32<LittleEndian>`/`F32<LE>`/… give guaranteed little-endian fields, `Unaligned` lets a payload be decoded in place from any `&[u8]`, and `ref_from_bytes`/`as_bytes` replace the pointer casts we would otherwise write by hand. Validated, total, and `unsafe`-free in our tree. | +3 crates: `zerocopy`, `zerocopy-derive`, and **`syn` 2.x**. Note `drm` → `bytemuck_derive` pins `syn` **3.x**, so the two do *not* share a build: syn is compiled twice. **Measured and left alone** — see "`syn` is compiled twice" below; deduplicating it makes the wall-clock build *slower* on a many-core box. |
+| `drm` (+ `drm-ffi`, `drm-sys`, `drm-fourcc`) | kms | Safe wrappers over the ~30 DRM/KMS ioctls (atomic commit, dumb buffers, AddFB2, properties, events). Hand-rolling them is precisely the `unsafe` we forbid. | pulls `bytemuck` + `bytemuck_derive` → `syn` 3.x (proc-macro, compile time). `bytemuck_derive` is a *direct* dependency of `drm`, so `default-features = false` cannot drop it. Measured: see "`syn` is compiled twice" below. |
 | `signal-hook` (+ `signal-hook-registry`) | server, demo, session | SIGTERM/SIGINT → self-pipe without `unsafe` in our tree: `sigaction` and an async-signal-safe handler are exactly the shim we would otherwise have to write ourselves. `default-features = false` (no iterator/channel). The demo uses it so Ctrl-C prints its latency summary instead of killing the process mid-histogram. `nitro-session` uses it for the same reason the server does, and it is the crate's third consumer rather than a new dependency. | + `libc` (already pulled by `libseat`). Only `low_level::pipe::register` is used. |
 | `libseat` (+ `libseat-sys`) | seat | Bindings to the C libseat: one interface over logind / seatd / raw VT for DRM master + input fds without root. The single deliberate C dependency. | + `errno`, `libc`, `log`. `default-features = false`: the `custom_logger` feature builds a C shim (`cc`) to route libseat's log lines through `log`; we do not log. |
 | `input` (+ `input-sys`) | server | Bindings to libinput, which is the only sane way to read evdev: tap detection, pointer acceleration, scroll-source classification and touchpad state are thousands of lines of hard-won device quirks we are not going to re-derive. `default-features = false, features = ["libinput_1_21"]` — the `udev` feature is **off**, so `libudev` never enters the tree: the server finds devices by reading `/dev/input` and opens them through `nitro-seat`. | + `libc` (already there via `libseat`). The FFI `unsafe` lives in the dependency; `LibinputInterface` is a safe trait we implement. Input-device hotplug is M3: it needs the netlink uevent socket `nitro-kms` already has, plus a directory diff. |
@@ -269,6 +269,55 @@ is a TCP socket, four socket options and an address parser:
 
 The figure is therefore still **74** lines and **37 distinct external
 crate names** with M4-E1 in.
+
+## `syn` is compiled twice, and it stays that way (#521)
+
+Two proc-macro crates in the tree want different major versions of `syn`:
+
+- `zerocopy-derive` 0.8 → **`syn` 2.x** (`nitro-wire`, the wire format)
+- `bytemuck_derive` 1.12 → **`syn` 3.x** (`bytemuck` → `drm` → `nitro-kms`)
+
+So `syn` is built twice on a cold build. Proc-macro only, so there is no
+runtime or binary-size cost; the question was purely compile time.
+
+**Measured, and closed as not worth doing.** Neither upstream offers a
+version that resolves it: `drm` 0.15 (latest) requires
+`bytemuck/derive` unconditionally — `bytemuck_derive` is a *direct*
+dependency of `drm`, not an optional feature, so `default-features = false`
+cannot reach it — and the only `zerocopy` on syn 3 is `0.9.0-alpha.0`,
+which is not something the wire format should sit on.
+
+The one lever that *does* work from our side is pinning
+`bytemuck_derive` down to **1.10.2**, the last release on syn 2; that
+collapses the two builds into one, keeps the workspace at 37 distinct
+external crates, and the whole suite passes. It was measured and
+**rejected**. Cold `cargo build --release --workspace`, alternating the two
+lockfiles so both see the same machine state, on a 128-core box:
+
+| | wall | user CPU |
+|---|---|---|
+| syn twice (as shipped) | 29.53 / 29.40 / 29.22 s | 121.46 / 121.69 s |
+| syn once (`bytemuck_derive` 1.10.2) | 29.66 / 29.72 / 29.72 s | 120.08 / 120.54 s |
+
+**Wall time is 0.3–0.5 s *worse*, in all three pairs, and the direction is
+not noise** (the two clusters do not overlap). The ~1.2 s of user CPU the
+second `syn` really does cost is **off the critical path**: the two
+proc-macro chains build in parallel with each other and with the rest of
+the graph, so removing one shortens no path and the extra scheduling makes
+the build marginally longer. The issue's "~10–20 s of build time" estimate
+assumed the work was serial. On a 2-core machine the trade would look
+different — and that is worth re-measuring if anyone builds this on one.
+
+It is also the wrong *kind* of change: pinning a transitive proc-macro
+backwards is a lock-file pin that any `cargo update` silently undoes, so
+the repo would carry a constraint nothing enforces, to buy a regression in
+the number it was supposed to improve.
+
+**The upstream condition that resolves it for free:** `zerocopy-derive`
+reaching syn 3 in a stable release (0.9 is heading there), or `drm` making
+`bytemuck`'s `derive` optional. Either removes the duplicate with no pin
+and no measurement needed — whichever lands first, the duplicate
+disappears on the next `cargo update`.
 
 Planned (M3+): nothing currently. `parley` sits behind swash as the
 upgrade path if bidi, font fallback or rich text ever become requirements.
