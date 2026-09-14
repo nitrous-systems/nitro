@@ -78,16 +78,21 @@ floor.
 — the peak is what matters on a box with no swap, and it is the number a
 steady-state `top` never shows you.
 
-`VmRSS` is also **two different things added together**, which is why this
-section now splits them everywhere (#538). `RssAnon` is the heap: private
-to the process, unreclaimable on a box with no swap, and the only half
-that moves when a window opens. `RssFile` is page-cache — the binary's own
-text and rodata plus every shared library — shared with every other
-process mapping the same file and reclaimable under pressure. A budget
-written against the sum cannot tell "we allocated a megabyte" from "we
-linked another library", which is how the server's "≤ 8 MB" line survived
+`VmRSS` is also **three things added together**, which is why this section
+now splits them everywhere (#538): `VmRSS = RssAnon + RssFile +
+RssShmem`, and every table below closes on that identity. `RssAnon` is the
+heap: private to the process, unreclaimable on a box with no swap, and the
+only part that moves when a window opens. `RssFile` is page-cache — the
+binary's own text and rodata plus every shared library — shared with every
+other process mapping the same file and reclaimable under pressure.
+`RssShmem` is resident *shared* memory (tmpfs, shmem, shared-anon), and is
+0 everywhere here because the server copies client buffers rather than
+mapping them; the reason is under the M3 desktop table, and it is the
+column that would move if that ever changed. A budget written against the
+sum cannot tell "we allocated a megabyte" from "we linked another
+library", which is how the server's "≤ 8 MB" line survived
 as long as it did. The server's current, audited line is in
-**"The server's 17.8 MB, audited"**; `just box-ps` prints both columns.
+**"The server's 17.8 MB, audited"**; `just box-ps` prints all three.
 
 ### Test box (real KMS, 1920×1080@60)
 
@@ -249,14 +254,29 @@ M3-E one: `nitro-session` with wallpaper, bar and launcher, plus
 `hello_client` and `hello_dialog` as the two applications, settled — six
 windows, three decorated.)
 
-**`RssShmem` is 0 for every process**, which is worth stating rather than
-omitting because the server is the one process that maps memory it did not
-allocate. Client buffers arrive as memfd mappings accounted to the **file**
-half, and the scanout buffers are GPU-owned dumb buffers outside the
-resident set entirely — so the third column is structurally zero on this
-workload, not merely small. It is carried in the table and in
-`just box-ps` so that a future workload which *does* put something there
-shows up instead of quietly inflating `RssFile`.
+**`RssShmem` is 0 for every process**, and the reason is worth stating
+precisely, because it is the column's whole justification. `RssShmem`
+counts resident **shared** mappings — tmpfs, shmem, shared-anon — and the
+server makes none. A client's buffer arrives as a memfd, and the server
+**copies** it: `clients::read_buffer` `pread`s the pixels into a `Vec<u8>`
+and `reread_damage` re-`pread`s the damaged rows, because a client can
+shrink a memfd under a live mapping and turn the server's reads into
+`SIGBUS`. So a client buffer is **anon** in the server, not shared and not
+file-backed — and `MAX_BUFFER_BYTES` is 64 MB apiece, which is the one
+term in the anon breakdown that could dwarf everything else if a client
+pushed video. The scanout buffers *are* mapped — `nitro-kms` calls
+`map_dumb_buffer` and keeps the mapping for the life of the output — but a
+DRM dumb-buffer mapping is a device mapping (`VM_PFNMAP`/`VM_IO`) that the
+kernel does not account to any RSS bucket at all.
+
+So the third column is zero **because the server never makes a shared
+mapping**, not because nothing is mapped. That is what makes it worth
+carrying rather than dropping: the day someone takes the zero-copy path
+for client buffers — sealing plus `mmap`, the revisit
+`clients::read_buffer` already names — the bytes move out of `RssAnon` and
+into **`RssShmem`**, and this is the column that would show it. A reader
+watching only `VmRSS` would see a large improvement and a large
+regression cancel to nothing.
 
 The anon/file split is the #538 addition, and it changes how this table
 reads. **The four shell processes are ~230 kB of private memory each**;
@@ -289,9 +309,19 @@ not ours.)
 | `nitro-launcher` | 704 736 |
 | `nitro-server` | 2 164 200 |
 
-**The whole desktop is under 29 MB and five processes, one thread each.**
-For scale, that is less than a single tab of a browser, and it is the
-number goal 2 exists to produce.
+**The whole desktop is 30.7 MB across five processes, one thread each —
+and 13.4 MB of that is private.** For scale, the resident total is less
+than a single tab of a browser, and it is the number goal 2 exists to
+produce. The private figure is the stricter one and the one that scales:
+8.1 MB of it is the server's single shadow buffer, so a supervisor, a
+compositor and four shell clients hold about 5 MB of private memory
+between them.
+
+(This row set supersedes the "under 29 MB" the M3-E exit run reported. The
+difference is not a regression: that sample had two fewer windows on
+screen, and the #547 allocator ratchet accounts for most of the server's
+share. It is quoted at the re-measured figure because every column here
+comes from one sample and closes — see the table above.)
 
 **Idle really is idle, for the tree and not just for the server.** Four
 of the five processes used *zero* jiffies in sixty seconds. The
@@ -303,7 +333,7 @@ which is the claim `crates/nitro-session` is built around: a supervisor
 that watches its children through pidfds rather than a poll timer costs
 nothing to be running.
 
-**`nitro-session` is the cheapest process in the tree**, at 2 792 kB and
+**`nitro-session` is the cheapest process in the tree**, at 2 788 kB and
 511 KB of binary — smaller than any of the shell clients it starts,
 because it is `rustix` + `nitro-wire` + `signal-hook` and no toolkit.
 
@@ -318,7 +348,7 @@ one is a defect.
 All rows below are the same binary on the box, `nitro-session` with
 wallpaper, bar and launcher up, plus *N* `hello_dialog` windows, settled
 (the state the idle sweep has run in). `RssAnon` and `RssFile` are read
-from `/proc/<pid>/status`; `just box-ps` now prints both.
+from `/proc/<pid>/status`; `just box-ps` now prints all three.
 
 | | `VmRSS` | `RssAnon` | `RssFile` | `RssShmem` |
 |---|---|---|---|---|
@@ -327,11 +357,13 @@ from `/proc/<pid>/status`; `just box-ps` now prints both.
 | difference | 8 088 kB | 8 108 kB | ~0 | 0 |
 
 `RssShmem` is **0** in every sample taken for this audit, and the column
-is carried rather than dropped because the server is the one process that
-maps memory it did not allocate: client buffers arrive as memfd mappings
-accounted to the *file* half, and the scanout buffers are GPU-owned dumb
-buffers outside the resident set entirely. So the third term is
-structurally zero here, not merely small — and `VmRSS = RssAnon +
+is carried rather than dropped because it is the one that would move if
+the server ever stopped copying. `RssShmem` counts resident **shared**
+mappings, and the server makes none: client buffers are `pread` into a
+`Vec<u8>` (anon), and the scanout buffers, though genuinely `mmap`ed by
+`nitro-kms`, are device mappings the kernel accounts to no RSS bucket. The
+mechanism is spelled out under the M3 desktop table above. So the third
+term is structurally zero here, not merely small — and `VmRSS = RssAnon +
 RssFile + RssShmem` means the two columns that are non-zero must account
 for the whole of `VmRSS`, which is the check every table on this page is
 meant to survive.
@@ -376,6 +408,7 @@ shell connections, six windows and every glyph on screen. Of that:
 | glyph atlas | **1 048 576** | `atlas_bytes`, one 1024×1024 A8 page |
 | scene nodes | 206 × 240 = **49 440** | `nodes` × `size_of::<Node>()` |
 | per wire connection | ~**66 000** each | `nitro-wire`'s 64 KiB `RECV_CHUNK` receive scratch, allocated in `Socket::from_fd` before the handshake; measured by opening 5 idle sockets that never send a byte (+332 kB) |
+| client buffer pixels | one `Vec<u8>` per buffer | `clients::read_buffer` `pread`s each memfd into the heap rather than mapping it, so a client's pixels are the server's **anon**. Small here — the shell clients are a wallpaper and two thin bars — but `MAX_BUFFER_BYTES` is **64 MB** apiece, so this is the term that would dominate everything above it the day a client pushes video. |
 | font bytes, settled | **0** | `font_bytes`; see below |
 
 **The atlas is 43 % of the server's anonymous memory**, and one page is

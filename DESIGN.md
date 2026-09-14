@@ -280,9 +280,9 @@ D-Bus client is allowed.
   | | |
   |---|---|
   | processes / threads | **5 / 5** (session, server, wallpaper, bar, launcher), one thread each |
-  | whole-desktop RSS | **28 968 kB**, of which **12 212 kB is anonymous** — the rest is shared file-backed pages counted once per process (#538) |
+  | whole-desktop RSS | **28 968 kB** at the M3-E exit run. Re-measured later with the anon/file split and two more windows: **30 700 kB, of which 13 372 kB is private** — `docs/budget.md` §"The M3 desktop" carries that row, and it is the one to quote for a memory claim. |
   | idle CPU over 60 s | **0.00 %** for four of five; 0.02 % on the server, which is the bar's once-a-minute clock |
-  | `nitro-session` | 2 792 kB RSS (**212 kB anon**), **511 KB** binary, 0.00 % idle |
+  | `nitro-session` | 2 792 kB RSS, **511 KB** binary, 0.00 % idle |
   | `nitro-server` | 17 840 kB, of which **8 208 kB is #539's shadow buffer** (9 536 kB with `NITRO_SHADOW=0`) |
   | **server budget, revised** (#538) | **`RssAnon` ≤ 2.5 MB + 100 kB per decorated window, plus one scanout-sized shadow buffer per output; `RssFile` ≤ 7.5 MB and flat in windows.** Measured: 2 424 kB floor, 3 980 kB with five windows, 7 252 kB file, 8 100 kB shadow. The old "≤ 8 MB RSS" line did not say anon or total, so it could not tell an allocation from a linked library. |
   | bar killed → back | **1.11 s** (budget 2 s), and it re-reads the window list on its own |

@@ -113,11 +113,17 @@ printf '%-16s %8s %8s kB %8s kB %8s kB %8s kB   (nitro processes only)\n' \
 # samples and the arithmetic then silently fails to add up.
 #
 # `RssShmem` is structurally 0 on this workload rather than merely small,
-# and is printed so that stops being an assumption: client buffers reach
-# the server as memfd mappings accounted to the *file* half, and the
-# scanout buffers are GPU-owned dumb buffers outside the resident set
-# entirely. A future shared-memory buffer pool would land here instead of
-# quietly inflating RssFile.
+# and is printed so that stops being an assumption. It counts resident
+# *shared* mappings, and the server makes none: a client's buffer is
+# `pread` into a `Vec<u8>` (`clients::read_buffer` — copied, because a
+# client can shrink a memfd under a live mapping and turn our reads into
+# SIGBUS), so it lands in RssAnon; and the scanout buffers, which
+# `nitro-kms` really does `mmap` and hold for the life of the output, are
+# DRM dumb-buffer device mappings (VM_PFNMAP/VM_IO) that the kernel
+# accounts to no RSS bucket at all. The day the zero-copy path for client
+# buffers arrives (sealing + mmap), those bytes move from RssAnon to
+# *this* column — which is why it is worth a column rather than a
+# footnote.
 #
 # The file-backed half is shared: the five processes map the same libc,
 # and `nitro-bar`/`nitro-launcher`/`nitro-wallpaper` are three copies of
