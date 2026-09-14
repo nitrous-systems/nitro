@@ -451,6 +451,17 @@ pub fn run() -> Result<(), Error> {
     let mut ui = App::new(APP_NAME)?
         .title(APP_NAME)
         .size(Size::new(720.0, 420.0))
+        // The window's backdrop has to be the terminal's *own* default
+        // background, and this line is what makes that true. The widget
+        // paints no rect for a run whose background is the default
+        // (`TermGrid::bg_of` answers `None`) precisely because the
+        // backdrop is already that colour — which is most of the screen,
+        // and the reason ordinary text costs one node per run instead of
+        // two. Without this the toolkit's light `#f2f2f2` shows through
+        // and the palette's light-on-dark ANSI colours are illegible on
+        // it, which is exactly what a screenshot of a bare shell prompt
+        // showed on the box.
+        .theme(term_theme())
         .build(build)?;
     let grid = grid_of(&ui).ok_or(Error::NoRoot)?;
     install(&mut ui, &mut state, grid)?;
@@ -461,6 +472,23 @@ pub fn run() -> Result<(), Error> {
     sync_size(&mut state, &mut ui);
     let socket = nitro_ui::introspect::Socket::bind(APP_NAME).ok();
     nitro_ui::app::event_loop_with(&mut ui, &mut state, socket)
+}
+
+/// The toolkit theme a terminal window wants: the default one, with its
+/// background replaced by the palette's.
+///
+/// Only `background` matters — it is what [`Ui`] paints the window
+/// backdrop with, and the grid's default-background runs rely on it
+/// being their colour. The rest of the theme describes buttons and
+/// fields, of which a terminal has none.
+#[must_use]
+pub fn term_theme() -> nitro_ui::Theme {
+    let palette = crate::theme::Palette::default();
+    nitro_ui::Theme {
+        background: palette.background,
+        text: palette.foreground,
+        ..nitro_ui::Theme::default()
+    }
 }
 
 /// Tell the server the smallest useful window: [`MIN_CELLS`] at the

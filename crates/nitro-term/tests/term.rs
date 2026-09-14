@@ -34,10 +34,17 @@ const DEADLINE: Duration = Duration::from_secs(10);
 /// and a test about cell counts should not be a test about clipping.
 fn harness_running(argv: &[&str]) -> (Harness<TermApp>, WidgetId) {
     let pty = Pty::spawn_command(argv, 80, 24).expect("pty");
-    let mut h = Harness::sized(
+    // `term_theme()`, the same one `run()` passes: the window backdrop
+    // *is* the terminal's default background, and the grid paints no
+    // rect for a default-background run because of it. A harness on the
+    // toolkit's default light theme would be a different terminal, and
+    // the one class of bug it could not see is precisely the one that
+    // shipped — a light backdrop under a dark palette.
+    let mut h = Harness::with(
         "nitro-term",
         TermApp::new(pty),
-        Size::new(640.0, 400.0),
+        Some(Size::new(640.0, 400.0)),
+        nitro_term::term_theme(),
         nitro_term::build,
     );
     let grid = nitro_term::grid_of(h.ui()).expect("the grid");
@@ -388,6 +395,47 @@ fn a_scripted_send_types_rather_than_pastes() {
     assert!(
         !text.contains("200~") && !text.contains("201~"),
         "a scripted send must not be bracketed; the child echoed {text:?}"
+    );
+    h.quit();
+}
+
+#[test]
+fn the_window_backdrop_is_the_terminals_own_background() {
+    // A pixel test, and the only kind that could have caught this.
+    //
+    // `TermGrid::bg_of` answers `None` for a run whose background is the
+    // default, so no rect is painted for it — which is most of the
+    // screen, and the reason ordinary text costs one node per run rather
+    // than two. That optimisation is only correct if the window's
+    // backdrop is already the terminal's background colour, and nothing
+    // made it so: the app took the toolkit's default light theme, and a
+    // bare shell prompt on the box was dark text on `#f2f2f2` with the
+    // light-on-dark ANSI palette illegible over it.
+    //
+    // Every existing test passed, because they all assert on the grid
+    // model or on mutation counts. The screenshots were of `vim` and
+    // `htop`, which set their own background and so hid it.
+    let (mut h, grid) = harness_running(&["/bin/sh", "-c", "sleep 30"]);
+    h.ui()
+        .widget_mut::<TermGrid>(grid)
+        .expect("grid")
+        .feed(b"x");
+    h.frame();
+    h.settle();
+
+    // `Color::to_u32` packs RGBA, but a screenshot pixel is 0xAARRGGBB,
+    // so the comparison is built from the components rather than by
+    // masking one into the other.
+    let bg = nitro_term::theme::Palette::default().background;
+    let want = (u32::from(bg.r) << 16) | (u32::from(bg.g) << 8) | u32::from(bg.b);
+    let shot = h.shot();
+    // A point well away from the one glyph, in the middle of the window.
+    let (x, y) = (shot.width / 2, shot.height / 2);
+    let got = shot.pixel(x, y) & 0x00ff_ffff;
+    assert_eq!(
+        got, want,
+        "the backdrop at ({x},{y}) is #{got:06x}, not the palette's #{want:06x}; \
+         default-background runs paint no rect and rely on this"
     );
     h.quit();
 }
