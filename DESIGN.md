@@ -569,29 +569,54 @@ D-Bus client is allowed.
     spawn. Zero new external crates — `nitro-ui`, `nitro-launcher`,
     `rustix` (`fs`, `pipe`, `event`, `process`).
 
-    Measured on a **dev box against the fake backend** (the test-box run
-    is pending):
+    Measured on the **test box** (Pentium G3240, no AVX2, 1920×1080),
+    release, driven through `hey` and real `ydotool` input:
 
     | | nitro-files | budget |
     |---|---|---|
-    | RSS, `/usr/bin` listed (1 765 entries) | **3 628 kB** | ≤ 4 MB |
-    | RSS, 50 000-entry directory listed | **1 984 kB** | — |
-    | binary, release, stripped | **816 192 bytes** | ≤ 800 KB — **2 % over** |
-    | context switches, 5 s idle with the inotify watch armed | **0** | 0 |
-    | 50 000 entries listed end to end | **0.18 s** | < 1 s |
+    | RSS, `/usr/bin` listed (1 860 entries) | **3 592 kB** | ≤ 4 MB |
+    | binary, release, stripped | **817 352 bytes** | ≤ 800 KB — **2 % over** |
+    | idle 60 s, `/usr/bin` listed, watch armed | **0 CPU ticks, 1 ctxt switch, +2 server frames** | 0 |
+    | the same minute with the app killed (control) | **+2 server frames** | — |
+    | Page Down over `/usr/share`: pixels changed | **704×408 = 287 232** | ≈ the list, not the 2 073 600 px screen |
+    | `/usr/bin`, `set path value` → rows | **25 / 35 / 25 ms** | — |
+    | 50 000 entries listed end to end (dev box) | **0.18 s** | < 1 s |
     | threads | **1** | — |
 
-    Two of those are the milestone's actual claims. **The UI answers
-    `hey` while a 50 000-entry scan is in flight**, which is the whole
-    point of doing the read off the loop; and **idle is zero with
-    inotify armed** — the watch adds a descriptor to the `epoll` set and
-    no wakeups, with neither context-switch counter moving over five
-    seconds. The binary is **16 KB over budget and the attribution is
-    known**: the app links the toolkit's ~68 KB introspection protocol,
-    monomorphised per app-state type, and the `dyn`-interface fix
-    `docs/ui.md` already records would more than cover the overrun. The
-    test-box run, the damage figures for a wheel notch and a Page Down,
-    and the `.txt`-opens-`nitro-term` check are still pending.
+    Three of those are the milestone's actual claims, and each was
+    taken with the instrument that could contradict it. **The damage is
+    settled on pixels**, not on `stats`: `damage_px` is the server's own
+    opinion about what it repainted, which is the thing under test, so
+    the number above is the bounding box of the pixels that actually
+    differ between two framebuffer readbacks either side of one Page
+    Down — 704×408, the list's bounds exactly. `damage_px_mean` agrees to
+    the pixel. **Idle is zero with inotify armed**, and the two frames
+    the server did advance are the bar's minute clock rather than this
+    app: the same minute with `nitro-files` killed advances the same
+    two. **The UI answers `hey` while a 50 000-entry scan is in flight**,
+    which is the whole point of doing the read off the loop. The binary
+    is **17 KB over budget and the attribution is known**: the app links
+    the toolkit's ~68 KB introspection protocol, monomorphised per
+    app-state type, and the `dyn`-interface fix `docs/ui.md` already
+    records would more than cover the overrun.
+
+    **The box found three defects the whole suite could not**, and the
+    first is the toolkit's. `Ui::add_fd`'s token *was* the raw fd of the
+    toolkit's own `dup`; descriptor numbers are recycled the instant
+    they are closed, so a hook removed and another added in the same
+    turn took the same token and the app loop — which keys its
+    already-registered list on it — never put the new one in the `epoll`
+    set. A file manager that re-arms its watch on every navigation
+    therefore refreshed the first directory and no directory
+    afterwards, with nothing returning an error and every test passing,
+    because the tests call `Ui::run_fd` directly and `run_fd` was fine:
+    only the loop was wrong. `FdToken` is now an opaque monotonic `u64`
+    (`a_re_armed_fd_hook_gets_a_fresh_token`). The other two were this
+    app's: a `Delete` confirmation whose `y`/`n` was eaten by the list's
+    type-ahead — so the answer depended on the file names in the
+    directory, and a pending question now takes the keyboard — and
+    `EXDEV` reaching the status line as "os error 18" instead of a
+    sentence.
 
     Limitations are recorded where a reader will find them
     (`docs/files.md`): no drag and drop and no cross-process clipboard

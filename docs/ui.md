@@ -512,6 +512,30 @@ close its own copy and the loop never has to reconstruct a `BorrowedFd`
 from a raw number (which would need `unsafe`, which this tree does not
 use).
 
+**The token is an opaque id that is never reused, not the descriptor
+number**, and the difference cost a box run to find. The obvious
+implementation is the raw fd of our duplicate: unique among live hooks,
+and already what the loop's `epoll` set is keyed on, so the two cannot
+drift. What it is not is unique over *time*. Closing a descriptor
+returns its number to the kernel, which hands out the lowest free one —
+so a hook removed and another added in the same turn take the **same
+number**, which is precisely what re-arming looks like. The loop keeps a
+list of what it has registered so it does not `epoll_ctl` on every
+wakeup; keyed on the number, that list said "already registered" about a
+descriptor that had been closed (and so silently dropped from the set)
+and replaced. The new hook existed, was never in the `epoll` set, and
+never fired.
+
+The app that found it was `nitro-files`, which re-arms an inotify watch
+on every navigation: it refreshed its listing in the first directory and
+in no directory afterwards, with nothing anywhere returning an error.
+Nothing in the test suite could see it either, because tests drive
+`Ui::run_fd` directly and `run_fd` was correct — only the loop was
+wrong. `FdToken` is now a monotonic `u64`, `Ui::hook_fds` hands the loop
+the id *and* the descriptor, and
+`a_re_armed_fd_hook_gets_a_fresh_token` in `tests/ui.rs` fails against
+the old scheme.
+
 The introspection listener joins the same set, and `Socket::serve` runs
 after the timers and before the flush. One caveat to the "blocks in
 `epoll_wait`" claim above: **connected** introspection clients are not

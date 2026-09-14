@@ -649,15 +649,14 @@ bar has always meant. The reasoning is in the comment at the
 
 ## Measured
 
-Two runs, and it matters which is which. The numbers below are from a
-**dev-box, fake-backend run**: a release build, `nitro-server` on the
-fake backend (`NITRO_BACKEND=fake NITRO_FAKE_SIZE=1280x720`) on the
-development machine, a real `nitro-files` client, driven through `hey`.
-The **test-box run is still pending** (Pentium G3240, 2 cores, no AVX2,
-HDMI 1920×1080 @60; `docs/testbox.md`), and the rows that need real
-hardware — damage areas for a wheel scroll and a Page Down, and the
-`.txt`-opens-`nitro-term` check that needs a terminal on screen — are
-marked as such rather than guessed at.
+Two runs, and it matters which is which. The first table is a **dev-box,
+fake-backend run**: a release build, `nitro-server` on the fake backend
+(`NITRO_BACKEND=fake NITRO_FAKE_SIZE=1280x720`) on the development
+machine, a real `nitro-files` client, driven through `hey`. The second
+is the **test box** — real hardware, real input, real pixels
+(`docs/testbox.md`), which is where the damage and idle claims are
+settled, because both are statements about a compositor driving a
+screen.
 
 ### Dev box, fake backend
 
@@ -727,17 +726,112 @@ So the number is over, the cause is known, the fix is already written
 down somewhere else, and none of that makes 816 KB anything other than
 816 KB today.
 
-### Test box, pending
+### Test box, real hardware
 
-| what | value | budget |
+Pentium G3240 (2 cores, no AVX2), 3.3 GB, HDMI 1920×1080 @60
+(`docs/testbox.md`), release build deployed with `just deploy`, driven
+through `hey` and real `ydotool` input.
+
+| what | measured | budget |
 |---|---|---|
-| RSS with `/usr/bin` listed | _(box run pending)_ | ≤ 4 MB |
-| idle 30 s, watch armed | _(box run pending)_ | 0 frames, 0 wakeups |
-| `damage_px` for one wheel notch | _(box run pending)_ | — |
-| `damage_px` for a Page Down | _(box run pending)_ | — |
-| a `.txt` with no handler opens `nitro-term` | _(box run pending)_ | — |
-| server RSS, before / after | _(box run pending)_ | — |
-| `atlas_pages` | _(box run pending)_ | — |
+| RSS / HWM, `/usr/bin` listed (1 860 entries) | **3 592 kB** | ≤ 4 MB — **ok** |
+| binary | **817 352 bytes** | ≤ 800 KB — **2 % over** |
+| idle 60 s, `/usr/bin` listed, watch armed | **0 app CPU ticks, 1 voluntary context switch, +2 server frames** | 0 |
+| the same 60 s with the app **killed** (control) | **+2 server frames** | — |
+| Page Down over `/usr/share`: pixels that changed | bbox **704×408 = 287 232 px** | ≈ the list area, not the 2 073 600 px screen |
+| one Down (a selection move) | bbox 121×401 = 48 521 px | — |
+| `damage_px_mean` over 120 frames of pure scrolling | **287 232** | agrees with the pixels |
+| `paint_us_mean` while scrolling | **200 µs** | — |
+| `/usr/bin` (1 860 entries), `set path value` → rows | **25 / 35 / 25 ms** | time to first paint |
+| a `.txt` with no handler | `nitro-term -e vi …/notes.txt` spawned | opens a terminal |
+| #555: the child after it exits | `ps --ppid` empty, **no zombie**, no second spawn | reaped |
+
+Four of those rows are the milestone's claims rather than statistics.
+
+**The damage claim is settled on pixels, not on `stats`.** `damage_px`
+is *the server's own opinion about what it repainted*, which is exactly
+the thing under test — quoting it alone would be marking one's own
+homework. So the headline number is the bounding box of the pixels that
+actually differ between two `nitro-shot --raw` framebuffer readbacks
+taken either side of one Page Down, and `damage_px_mean` is the
+corroborating instrument. They agree to the pixel: **704×408, which is
+the list's bounds exactly**, out of a 1920×1080 screen. Scrolling a
+directory of thousands of entries repaints the list and nothing else —
+not the path bar, not the status line, not the bar at the top of the
+screen.
+
+**The idle claim has a control, and the control is why the number is
+readable.** Sixty seconds with `/usr/bin` listed and the watch armed
+cost the app zero CPU ticks and one voluntary context switch, while the
+server advanced **two** frames. Two frames is not nothing, and the
+tempting report is "0 app ticks, 2 frames". Running the same minute with
+`nitro-files` killed gives **the same two frames**: they are the bar's
+minute clock, not this app. A measurement with no control could not have
+told those apart.
+
+**The 25 ms for `/usr/bin` is the inline path, deliberately.** At 1 860
+entries it is under the `BIG_DIR` threshold, so it is read on the loop —
+and 25 ms is the answer to "is that acceptable?", measured rather than
+assumed. The threshold is where it is because 2 000 entries is roughly
+where that number starts to be felt.
+
+**`nitro-term` really is spawned, and it really does ignore `-e`.** The
+process table shows `nitro-term -e vi /…/notes.txt`, which is the argv
+this app builds and hands to `nitro_launcher::spawn`; the window that
+appears is a shell rather than `vi`, because `-e` is not implemented
+yet. Both halves are the documented state, and the first half is the
+half this app owns.
+
+### Three defects the test suite could not see
+
+Recorded because the *why* is transferable, and because all three were
+found by running the program on hardware after every test in the
+workspace passed.
+
+**1. A descriptor hook's token was a recycled descriptor number.** The
+symptom was this app: the listing refreshed itself in the first
+directory and in **no directory afterwards**. `hey get list text` was
+correct, `relist` worked, nothing logged anything. `nitro-files` re-arms
+its inotify watch on every navigation — drop one hook, add the next —
+and `nitro_ui::FdToken` *was* the raw fd of the toolkit's own `dup`. A
+descriptor number is recycled the instant it is closed and the kernel
+hands back the lowest free one, so the new hook took the retired one's
+number, and the app loop's list of what it had already registered with
+`epoll` concluded it was already in the set. It was not: closing a
+descriptor removes it from every epoll set. A hook that existed, was
+never registered, and could never fire. `FdToken` is now an opaque
+monotonic `u64`; `a_re_armed_fd_hook_gets_a_fresh_token` in
+`crates/nitro-ui/tests/ui.rs` is the regression. It was invisible to
+every test because the tests call `Ui::run_fd` directly and `run_fd`
+worked perfectly — only the loop was wrong.
+
+**2. A confirmation whose answer depended on the file names in the
+directory.** `Delete` asks in the status line and the next key decides.
+App-level key handlers are offered only what the focused chain declined,
+and a focused `List` consumes any printable key as type-ahead — so `n`
+was not "no", it was "jump to the first row starting with `n`", and the
+file under the cursor was called `notes.txt`. `y` worked only because no
+row happened to begin with `y`. A pending question now takes the
+keyboard: `ask` drops the focus, answering restores it.
+
+**3. `EXDEV` reached the user as "Invalid cross-device link (os error
+18)".** Accurate and useless. Trashing a file under `/tmp` on a box
+whose home is a different filesystem is the ordinary case, and the
+behaviour is deliberate — so the fix was to say so in words rather than
+to change it.
+
+Two measurement traps this run walked into, in the spirit of the notes
+in `docs/testbox.md`:
+
+* **`damage_px_mean` is a rolling mean over `PAINT_WINDOW = 120` frames,
+  not a cumulative total.** Computing an interval's damage as
+  `mean₁·frames₁ − mean₀·frames₀` produces a *negative* number, which is
+  how this was discovered. To measure one kind of frame, fill the window
+  with that kind of frame and read the mean.
+* **`pgrep -f nitro-files` matches the ssh command line that contains
+  the string**, so a control that was supposed to run with the app
+  absent reported "still up" three times while the app was in fact gone.
+  `pgrep -x` on the binary name.
 
 ## Limitations
 
