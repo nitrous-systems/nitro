@@ -1309,6 +1309,45 @@ fn texels_in_range(
 /// non-transparent the branch costs more than the blend.
 #[inline]
 fn blit_run_inner(row: &mut [u8], s: &RowSampler<'_>, extra: u32) {
+    // `extra` is constant across the whole run, so the `alpha == 0` guard is
+    // resolved once here rather than per pixel.
+    //
+    // For `extra >= 128` the guard is provably dead: `div255(t.a * extra)` is
+    // zero only when `t.a` is zero (128 is the exact threshold -- at 127,
+    // `t.a = 1` still rounds to 0), and `bilinear` returns an all-zero texel
+    // when its alpha is zero, so the blend is the identity anyway. That is the
+    // case a UI frame is made of: full coverage at full opacity is
+    // `extra = 255`.
+    //
+    // Worth the duplicated loop: a per-pixel select sits in the dependency
+    // chain of every channel and costs 2.1 ms of the 3.1 ms this split saves
+    // on scene (d).
+    if extra < 128 {
+        blit_run_inner_guarded(row, s, extra);
+        return;
+    }
+    let mut fixed = s.base;
+    for d in row.chunks_exact_mut(4) {
+        let o = (fixed >> 16) as usize * BYTES_PER_PIXEL;
+        let tx = ((fixed >> 8) & 0xFF) as u32;
+        fixed += s.step;
+        let t = bilinear(&s.srow0[o..o + 8], &s.srow1[o..o + 8], tx, s.ty, s.opaque);
+        blend_texel_unguarded(d, &t, extra);
+    }
+}
+
+/// The interior run for a faint `extra`, where the `alpha == 0` guard is load
+/// bearing (see [`blend_texel`]).
+///
+/// Deliberately **not** inlined into [`blit_run_inner`]. It is the rare case --
+/// `extra < 128` means coverage times opacity below ~50 %, which a UI frame
+/// mostly does not do -- and letting it share a function with the hot loop
+/// costs 1.6 ms on scene (d) even when this code never runs, purely through
+/// the pressure two copies of the loop put on inlining and layout. Splitting
+/// it out puts the hot path back at full speed.
+#[cold]
+#[inline(never)]
+fn blit_run_inner_guarded(row: &mut [u8], s: &RowSampler<'_>, extra: u32) {
     let mut fixed = s.base;
     for d in row.chunks_exact_mut(4) {
         let o = (fixed >> 16) as usize * BYTES_PER_PIXEL;
@@ -1369,8 +1408,38 @@ fn blit_run_edge(
 /// the same `extra / 255` (the coverage-times-opacity factor) keeps it
 /// premultiplied by the effective alpha, so there is no per-pixel division by
 /// a varying quantity.
+///
+/// The `alpha == 0` case is a **correctness** requirement, not an
+/// optimization. The general loop this was split out of skipped such a pixel
+/// with a `continue`. That looks redundant — zero alpha, nothing to blend —
+/// but it is not: `over_premul(c, dst, 0)` is `c + dst`, so a non-zero
+/// premultiplied channel is *added* to the destination. And `c` can be
+/// non-zero while `alpha` is zero, because the two are rounded separately:
+/// [`bilinear`] can return `t.b > t.a` by one step (e.g. `t.a = 1, t.b = 128,
+/// extra = 1` — 637 such triples exist), and then `div255(t.a * extra)` is 0
+/// while `div255(t.b * extra)` is 1. Dropping the check brightened exactly one
+/// pixel in a 3600-case sweep against the pre-split code, which is precisely
+/// the kind of once-in-a-frame artefact that never gets diagnosed.
+///
+/// The guard zeroes the *scale* rather than each scaled channel, so it is one
+/// select outside the three channel expressions rather than three inside
+/// them. `blit_run_inner` avoids paying even that on the hot path by proving
+/// the guard dead for `extra >= 128`.
 #[inline]
 fn blend_texel(d: &mut [u8], t: &Texel, extra: u32) {
+    let alpha = div255(t.a * extra);
+    let extra = extra * u32::from(alpha != 0);
+    blend_texel_unguarded(d, t, extra);
+}
+
+/// [`blend_texel`] without the `alpha == 0` guard.
+///
+/// Only correct where the caller has established that `alpha == 0` implies an
+/// all-zero `t` -- either because `t` came straight from [`bilinear`] and
+/// `extra >= 128` (see [`blit_run_inner`]), or because `extra` has already
+/// been zeroed. Everywhere else, use [`blend_texel`].
+#[inline]
+fn blend_texel_unguarded(d: &mut [u8], t: &Texel, extra: u32) {
     let alpha = div255(t.a * extra);
     let out = [
         over_premul(div255(t.b * extra), u32::from(d[0]), alpha),
@@ -1447,5 +1516,111 @@ fn bilinear(row0: &[u8], row1: &[u8], tx: u32, ty: u32, opaque: bool) -> Texel {
         g: div255(ch(row0, row1, 1, wa)),
         r: div255(ch(row0, row1, 2, wa)),
         a: alpha,
+    }
+}
+
+#[cfg(test)]
+mod blend_texel_tests {
+    use super::{Texel, blend_texel};
+    use crate::blend::div255;
+
+    #[test]
+    fn the_unguarded_fast_path_threshold_is_exactly_128() {
+        // `blit_run_inner` skips the `alpha == 0` guard when `extra >= 128`,
+        // on the claim that above that threshold `alpha == 0` implies
+        // `t.a == 0`. Both halves are checked here, because the whole
+        // correctness of the hot loop rests on them.
+        //
+        // 1. At and above 128 there is no `t.a > 0` that rounds to zero.
+        for extra in 128..=255u32 {
+            for ta in 1..=255u32 {
+                assert_ne!(
+                    div255(ta * extra),
+                    0,
+                    "extra={extra} t.a={ta} would need the guard"
+                );
+            }
+        }
+        // 2. 127 is not good enough -- the threshold is tight, not arbitrary.
+        assert_eq!(div255(127), 0, "127 must still need the guard");
+    }
+
+    #[test]
+    fn bilinear_returns_an_all_zero_texel_when_its_alpha_is_zero() {
+        // The other half of the unguarded path's premise: with `t.a == 0` the
+        // channels must be zero too, or the blend would add them to the
+        // destination. `bilinear` early-returns a zeroed texel in that case;
+        // this pins it, since a future change to that early-out would silently
+        // brighten pixels.
+        let mut rows = [[0u8; 8]; 2];
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % 256) as u8
+        };
+        for _ in 0..2000 {
+            for r in &mut rows {
+                for (i, b) in r.iter_mut().enumerate() {
+                    // Colour channels random, alpha bytes (3 and 7) zero.
+                    *b = if i % 4 == 3 { 0 } else { next() };
+                }
+            }
+            let t = super::bilinear(
+                &rows[0],
+                &rows[1],
+                u32::from(next()),
+                u32::from(next()),
+                false,
+            );
+            assert_eq!((t.a, t.b, t.g, t.r), (0, 0, 0, 0));
+        }
+    }
+
+    #[test]
+    fn a_zero_effective_alpha_leaves_the_destination_alone() {
+        // The `alpha == 0` case of `blend_texel` is a correctness requirement,
+        // not an optimization: `over_premul(c, dst, 0) == c + dst`, so a
+        // non-zero premultiplied channel would be *added* to the destination.
+        //
+        // The trap is that `c` can be non-zero while `alpha` is zero. The
+        // channel and the alpha are rounded separately, so `bilinear` can
+        // return `t.b > t.a`, and then `div255(t.a * extra) == 0` while
+        // `div255(t.b * extra) == 1`. Sweeping every such combination is
+        // cheap, so sweep it rather than trusting the argument.
+        let dst = [0x40u8, 0x80, 0xC0, 0];
+        let mut found = 0;
+        for ta in 0..=255u32 {
+            for extra in 0..=255u32 {
+                if div255(ta * extra) != 0 {
+                    continue;
+                }
+                for tb in 0..=255u32 {
+                    let t = Texel {
+                        b: tb,
+                        g: tb,
+                        r: tb,
+                        a: ta,
+                    };
+                    let mut d = dst;
+                    blend_texel(&mut d, &t, extra);
+                    assert_eq!(
+                        [d[0], d[1], d[2]],
+                        [dst[0], dst[1], dst[2]],
+                        "alpha==0 must not write: t.a={ta} t.b={tb} extra={extra}"
+                    );
+                    if div255(tb * extra) != 0 {
+                        found += 1;
+                    }
+                }
+            }
+        }
+        // If this ever reaches zero the test has stopped covering the case it
+        // exists for -- the bug it pins is only reachable through these.
+        assert!(
+            found > 0,
+            "no (t.a, t.b, extra) with alpha==0 but a non-zero channel"
+        );
     }
 }
