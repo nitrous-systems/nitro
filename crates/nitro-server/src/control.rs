@@ -214,6 +214,8 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    use std::net::Shutdown;
+
     use super::*;
 
     #[test]
@@ -266,7 +268,15 @@ mod tests {
         peer.read_exact(&mut got).unwrap();
         assert_eq!(&got, b"ok\n");
 
-        drop(peer);
+        // `shutdown(2)`, not `drop` -- pre-emptively, see issue #554 and the
+        // same line in `nitro-session`'s `socket.rs`, where this shape was a
+        // live ~3 % flake. EOF on a socketpair needs every descriptor for the
+        // peer end closed, so a concurrent test that forks between the
+        // `pair()` and the `drop` leaves the socket open through the child's
+        // fork-to-exec window and `read` reports `Open`. This crate's unit
+        // tests do not fork today, which is an incidental property rather than
+        // a guaranteed one. A shutdown is per-socket, not per-descriptor.
+        peer.shutdown(Shutdown::Both).unwrap();
         assert_eq!(client.read(), ReadOutcome::Closed);
     }
 

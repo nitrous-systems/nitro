@@ -294,6 +294,8 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    use std::net::Shutdown;
+
     use super::*;
 
     #[test]
@@ -348,7 +350,15 @@ mod tests {
         peer.read_exact(&mut got).unwrap();
         assert_eq!(&got, b"ok\n");
 
-        drop(peer);
+        // `shutdown(2)`, not `drop`: EOF on a socketpair needs *every*
+        // descriptor for the peer end closed, and a test elsewhere in this
+        // binary that forks (`child.rs` spawns processes, unserialised) hands
+        // its child an inherited duplicate for the length of the fork-to-exec
+        // window. `drop` closes our copy only, so the read would see EAGAIN
+        // and report `Open` -- a ~3 % flake under load (issue #554). A
+        // shutdown acts on the socket rather than on the descriptor, so no
+        // duplicate anywhere can mask it.
+        peer.shutdown(Shutdown::Both).unwrap();
         assert_eq!(client.read(), ReadOutcome::Closed);
     }
 
