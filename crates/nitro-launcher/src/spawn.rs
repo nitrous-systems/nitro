@@ -27,12 +27,30 @@
 //! # Reaping
 //!
 //! The child is not orphaned while the launcher lives, so the launcher
-//! reaps it: [`Children::reap`] runs a non-blocking `try_wait` over the
-//! outstanding children before every spawn, and the launcher's own exit
-//! hands the rest to init. The cost of getting this wrong is a zombie —
-//! a task-table entry and nothing else — and the cost of *not* tracking
-//! the children at all would be one per launch for the whole session.
-//! The double-fork that avoids both needs the `fork` above.
+//! reaps it — and it does so **when the child exits**, not when the user
+//! next launches something. [`Children::spawn`] opens a pidfd
+//! ([`rustix::process::pidfd_open`]) for every child, and
+//! [`Children::watch`] registers that descriptor with the app loop
+//! through [`Ui::add_fd`]: a pidfd becomes readable when the process it
+//! names exits, so "the program the user started has finished" arrives
+//! the same way a key does, as a wakeup on a descriptor the loop already
+//! had. The launcher is an ordinary toolkit app sitting in `epoll_wait`,
+//! and that is the only kind of event it can be told about.
+//!
+//! The alternative — `SIGCHLD`, a self-pipe and a `waitpid(-1)` loop —
+//! would cost a signal-handling crate and would answer a question we did
+//! not ask ("*some* child changed state") where the pidfd answers the one
+//! we did ("*this* child exited"). `nitro-session`'s `child.rs` argues
+//! the same choice at length for a supervisor; the launcher is the
+//! smaller case of it.
+//!
+//! [`Children::reap`] — a non-blocking `try_wait` over the outstanding
+//! children before every spawn — stays as the fallback for a child whose
+//! pidfd could not be opened at all, and the launcher's own exit hands
+//! the rest to init. The cost of getting this wrong is a zombie — a
+//! task-table entry and nothing else — and the cost of *not* tracking the
+//! children at all would be one per launch for the whole session. The
+//! double-fork that avoids both needs the `fork` above.
 //!
 //! # Environment and stdio
 //!
@@ -56,9 +74,12 @@
 //! `println!` would otherwise land in the launcher's own stdout, which on
 //! the test box is the compositor unit's journal.
 
+use std::os::fd::{AsFd as _, OwnedFd};
 use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+
+use nitro_ui::{FdToken, Ui};
 
 /// Everything a spawn can go wrong at, as one value.
 #[derive(Debug)]
@@ -85,13 +106,30 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// One launched process, as this module has to hold it.
+#[derive(Debug)]
+struct Live {
+    /// The process itself, for `try_wait`.
+    proc: Child,
+    /// Readable once the process exits, and `None` if `pidfd_open`
+    /// failed — which puts this child back on the reap-before-spawn
+    /// path rather than losing it.
+    pidfd: Option<OwnedFd>,
+    /// Names the loop hook watching `pidfd`, once [`Children::watch`]
+    /// has registered one. It is what the hook is removed by, so it is
+    /// kept next to the child it belongs to.
+    token: Option<FdToken>,
+}
+
 /// Reaps the children a launcher has started.
 ///
-/// Held by the launcher's state so `try_wait` can be called on the next
-/// launch; see the module docs for what this does and does not promise.
+/// Held by the launcher's state, which is also how the loop reaches it:
+/// each child's pidfd is registered with [`Children::watch`], and the
+/// callback finds this set again through the accessor it was given. See
+/// the module docs for what this does and does not promise.
 #[derive(Debug, Default)]
 pub struct Children {
-    live: Vec<Child>,
+    live: Vec<Live>,
 }
 
 impl Children {
@@ -114,12 +152,101 @@ impl Children {
         self.live.is_empty()
     }
 
-    /// Reap whatever has exited. Called before every spawn, so the list
-    /// is bounded by the number of launches that are still running rather
-    /// than by the number ever made.
+    /// Reap whatever has exited and is not being watched by the loop.
+    /// Called before every spawn, so the list is bounded by the number of
+    /// launches that are still running rather than by the number ever
+    /// made.
+    ///
+    /// A **watched** child is deliberately left alone here: reaping it
+    /// would drop the entry, and with it the only record of the
+    /// [`FdToken`] naming its loop hook — leaving a hook registered on a
+    /// descriptor that is readable for ever, which is the spin
+    /// [`Children::watch`] explains. Its exit belongs to the loop, which
+    /// notices it long before the next launch. What is left for this is
+    /// the child whose `pidfd_open` failed, which is the case it now
+    /// exists for.
     pub fn reap(&mut self) {
         self.live
-            .retain_mut(|c| !matches!(c.try_wait(), Ok(Some(_))));
+            .retain_mut(|c| c.token.is_some() || !matches!(c.proc.try_wait(), Ok(Some(_))));
+    }
+
+    /// Reap every child that has exited, and report the loop hooks of the
+    /// ones that were being watched so the caller can unregister them.
+    ///
+    /// Private because the unregistering is not optional — see
+    /// [`Children::watch`] — and the only caller that can do it is the
+    /// callback that hook installs.
+    fn reap_exited(&mut self) -> Vec<FdToken> {
+        let mut done = Vec::new();
+        self.live.retain_mut(|c| {
+            if matches!(c.proc.try_wait(), Ok(Some(_))) {
+                if let Some(token) = c.token {
+                    done.push(token);
+                }
+                false
+            } else {
+                true
+            }
+        });
+        done
+    }
+
+    /// Register every not-yet-watched child's pidfd with the loop, so its
+    /// exit is reaped on the spot rather than at the next spawn.
+    ///
+    /// `get` is how the callback finds this set again inside the app's
+    /// state (`|s: &mut Launcher| &mut s.children`). A closure that had
+    /// captured `&mut self` could not be it: the state owns the set, and
+    /// the loop hands the callback that state.
+    ///
+    /// The callback reaps whatever exited and then **removes the
+    /// [`FdToken`] of every child it reaped**, with [`Ui::remove_fd`].
+    /// That second half is load-bearing rather than tidy: the app loop's
+    /// `epoll` is **level-triggered**, and an exited process's pidfd
+    /// stays readable for as long as the descriptor exists. A hook left
+    /// registered would therefore be dispatched on every turn of the
+    /// loop, for ever — a launcher sitting at 100 % CPU with nothing on
+    /// screen, which is exactly what the toolkit's "idle costs nothing"
+    /// contract forbids.
+    ///
+    /// A child whose `pidfd_open` failed has no descriptor to watch and
+    /// is skipped here; [`Children::reap`] still collects it before the
+    /// next spawn, which is what this module did before the pidfd
+    /// existed. So is a registration that fails: the child keeps no
+    /// token, so a later `watch` tries again and `reap` still knows about
+    /// it.
+    pub fn watch<S: 'static>(&mut self, ui: &mut Ui<S>, get: fn(&mut S) -> &mut Children) {
+        for child in &mut self.live {
+            if child.token.is_some() {
+                continue;
+            }
+            let Some(pidfd) = child.pidfd.as_ref() else {
+                continue;
+            };
+            let hook = move |s: &mut S, ui: &mut Ui<S>| {
+                for token in get(s).reap_exited() {
+                    ui.remove_fd(token);
+                }
+            };
+            if let Ok(token) = ui.add_fd(pidfd.as_fd(), hook) {
+                child.token = Some(token);
+            }
+        }
+    }
+
+    /// Every watched child, as its pidfd and the [`FdToken`] naming the
+    /// hook registered on it.
+    ///
+    /// For the tests, which have no real `epoll` under them: a test polls
+    /// the descriptor itself and then calls [`Ui::run_fd`] with the
+    /// token, which is exactly the pair of steps the app loop takes on a
+    /// wakeup.
+    #[must_use]
+    pub fn watched(&self) -> Vec<(std::os::fd::BorrowedFd<'_>, FdToken)> {
+        self.live
+            .iter()
+            .filter_map(|c| Some((c.pidfd.as_ref()?.as_fd(), c.token?)))
+            .collect()
     }
 
     /// Start `argv` detached, and remember the child so it can be reaped.
@@ -133,7 +260,25 @@ impl Children {
         let (program, rest) = argv.split_first().ok_or(Error::Empty)?;
         let child = command(program, rest).spawn().map_err(Error::Spawn)?;
         let pid = child.id();
-        self.live.push(child);
+        // The descriptor that will say "this one exited". It is opened
+        // here rather than in [`Children::watch`] so it is taken while
+        // the child is certainly still ours — before anything can have
+        // reaped it and let the kernel hand the pid to somebody else.
+        //
+        // A failure is not fatal and must not lose the child: it is
+        // remembered without a pidfd, and [`Children::reap`] collects it
+        // before the next spawn, exactly as every child was collected
+        // before this existed.
+        let pidfd = rustix::process::pidfd_open(
+            rustix::process::Pid::from_child(&child),
+            rustix::process::PidfdFlags::NONBLOCK,
+        )
+        .ok();
+        self.live.push(Live {
+            proc: child,
+            pidfd,
+            token: None,
+        });
         Ok(pid)
     }
 }

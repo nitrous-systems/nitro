@@ -783,6 +783,9 @@ fn launch_index(s: &mut Launcher, ui: &mut Ui<Launcher>, index: usize) {
     hide(s, ui);
     match s.children.spawn(&entry.argv) {
         Ok(_) => {
+            // The child's pidfd joins the loop, so its exit is reaped the
+            // moment it happens rather than at the next launch.
+            s.children.watch(ui, |s: &mut Launcher| &mut s.children);
             s.launches += 1;
             s.last_launch = Some(entry.program().to_owned());
             s.last_error = None;

@@ -18,12 +18,13 @@ use std::path::PathBuf;
 
 use nitro_kms::Image;
 use nitro_launcher::desktop::{Entry, Source};
+use nitro_launcher::spawn::Children;
 use nitro_launcher::{Launcher, build, names};
 use nitro_ui::event::key;
 use nitro_ui::shell::Surface;
 use nitro_ui::test::Harness;
-use nitro_ui::widgets::{Button, Label, TextField};
-use nitro_ui::{Size, WidgetId};
+use nitro_ui::widgets::{Button, Label, TextField, column};
+use nitro_ui::{Size, Ui, WidgetId};
 use nitro_wire::client::Connection;
 use nitro_wire::types::{Layer, NodeId};
 
@@ -1110,5 +1111,90 @@ fn the_launcher_is_not_on_screen_before_the_first_tap() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}
+
+/// The state for the reaping test: a `Children` and nothing else, which
+/// is all the hook the launcher registers ever touches.
+struct Reaper {
+    children: Children,
+}
+
+#[test]
+fn a_launched_process_is_reaped_the_moment_it_exits() {
+    // Issue #555: before this, a launched program stayed a zombie until
+    // the user launched something else, because the only `try_wait` was
+    // the one at the start of the next spawn. Now every child carries a
+    // pidfd, the pidfd is registered with the loop, and the exit is a
+    // wakeup like any other.
+    //
+    // The harness does not run the real `epoll` loop, so **only the
+    // wakeup is faked**: the test polls the pidfd itself, exactly as the
+    // loop's `epoll_wait` would, and then calls `Ui::run_fd` with the
+    // token — which is precisely the call the app loop makes when
+    // `epoll` names that descriptor. Everything after that point is the
+    // shipped dispatch path.
+    let mut h = Harness::new(
+        "reap",
+        Reaper {
+            children: Children::new(),
+        },
+        |ui: &mut Ui<Reaper>| ui.build(column()),
+    );
+
+    let (ui, state) = h.parts();
+    state
+        .children
+        .spawn(&["/bin/sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()])
+        .expect("spawn");
+    assert_eq!(state.children.len(), 1, "the child is remembered");
+    state.children.watch(ui, |s: &mut Reaper| &mut s.children);
+    let watched = state.children.watched();
+    assert_eq!(watched.len(), 1, "and its pidfd joined the loop");
+    let (fd, token) = watched[0];
+
+    // The wakeup the loop would have had. A timeout rather than a
+    // blocking poll, so a launcher that never opened a usable pidfd
+    // fails this test instead of hanging it.
+    let mut fds = [rustix::event::PollFd::new(
+        &fd,
+        rustix::event::PollFlags::IN,
+    )];
+    let ts = rustix::event::Timespec {
+        tv_sec: 5,
+        tv_nsec: 0,
+    };
+    let n = rustix::event::poll(&mut fds, Some(&ts)).expect("poll");
+    assert_eq!(n, 1, "the pidfd became readable when the child exited");
+
+    // And the dispatch, with no second spawn anywhere: this is the whole
+    // fix.
+    let (ui, state) = h.parts();
+    ui.run_fd(state, token);
+    assert_eq!(
+        h.state().children.len(),
+        0,
+        "the exited child was reaped on its own exit, not at the next launch"
+    );
+
+    // The other half of the fix, and the regression that would cost a
+    // core: the hook must have been *removed*. `epoll` is
+    // level-triggered and an exited process's pidfd stays readable for
+    // ever, so a hook left registered would be dispatched on every turn
+    // of the loop and spin the launcher at 100 % CPU. A second `run_fd`
+    // with the same token is the observable form of that: with the hook
+    // gone it is a harmless no-op.
+    let (ui, state) = h.parts();
+    ui.run_fd(state, token);
+    assert_eq!(
+        h.state().children.len(),
+        0,
+        "a second wakeup on the same token does nothing"
+    );
+    assert!(
+        h.state().children.watched().is_empty(),
+        "and no hook is left watching a descriptor that is readable for ever"
+    );
+
     h.quit();
 }

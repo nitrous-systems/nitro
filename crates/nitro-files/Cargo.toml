@@ -1,0 +1,42 @@
+[package]
+name = "nitro-files"
+description = "The nitro file manager: a virtualised list over a directory, opening files with the .desktop handler that claims them"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The toolkit, as every nitro app.
+nitro-ui = { workspace = true }
+# The `.desktop` reader and the spawn path, both already written and
+# already argued (`crates/nitro-launcher/src/desktop.rs`,
+# `src/spawn.rs`). A file manager that opens a file has exactly the
+# launcher's problem — parse an entry, strip the field codes, start the
+# program detached — and a second copy of that parser would be a second
+# place for the `Name[de]` and `[Desktop Action …]` bugs to live.
+nitro-launcher = { workspace = true }
+# `inotify` for the live refresh of the directory on screen (`fs`),
+# `pipe` for the background scan's wakeup descriptor, `event` for
+# `poll` (the scan's own tests, and draining the wakeup), `process` for
+# `getuid`/`getpid` in the temporary-path fallbacks. No new crate: this
+# is the same syscall crate the rest of the tree uses, with the feature
+# set narrowed to what this one needs.
+rustix = { workspace = true, features = ["fs", "pipe", "event", "process"] }
+
+[lib]
+name = "nitro_files"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nitro-files"
+path = "src/main.rs"
+
+[dev-dependencies]
+# The in-process harness: a real server on the fake backend, a real
+# client, real pixels. A dev-dependency, so the shipped binary never
+# links the compositor.
+nitro-ui = { workspace = true, features = ["test-support"] }

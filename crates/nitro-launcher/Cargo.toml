@@ -10,14 +10,21 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-# The toolkit, and nothing else.
+# The toolkit, and nothing else of the tree's own.
 #
 # The spec allowed `rustix` too, for `fork`/`setsid` in the spawn path.
 # It turned out not to be needed: `std::process::Command` already has
 # `process_group(0)`, which is the safe half of `setsid` and the half a
-# launcher actually needs (see `src/spawn.rs`). So the shipped launcher
-# is `nitro-ui` and `std`, like `nitro-calc`.
+# launcher actually needs (see `src/spawn.rs`).
 nitro-ui = { workspace = true }
+# `pidfd_open`, so a launched application's exit is a descriptor the app
+# loop can wait on rather than something noticed at the next launch. The
+# alternative is `SIGCHLD` and a self-pipe, which costs a signal crate
+# and answers a vaguer question; `src/spawn.rs` §Reaping argues it, and
+# `nitro-session`'s `src/child.rs` argues the same choice for a
+# supervisor. `getpgrp`, for the test that checks a launched process left
+# the launcher's process group, comes with the same feature.
+rustix = { workspace = true, features = ["process"] }
 
 [lib]
 name = "nitro_launcher"
@@ -32,10 +39,6 @@ path = "src/main.rs"
 # connection, real pixels, real keys. A dev-dependency, so the shipped
 # binary never links the compositor.
 nitro-ui = { workspace = true, features = ["test-support"] }
-# `getpgrp`, for the one test that asserts a launched process really did
-# leave the launcher's process group. A dev-dependency because that is
-# the only use: the spawn path itself needs no syscall crate.
-rustix = { workspace = true, features = ["process"] }
 # `tests/launcher.rs` opens a second, ordinary client: one to hold the
 # keyboard focus (so "the grab delivered this key" can be told apart from
 # "the launcher happened to be focused"), and one to *take* focus, which
