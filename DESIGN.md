@@ -518,6 +518,7 @@ D-Bus client is allowed.
     mean implying a precision it does not have.
 
     Zero new dependencies.
+
   - **M4-D done.** `nitro-files`: a file manager on `nitro-ui` — a
     virtualised list over a directory, an editable path bar, a
     status-line confirm instead of dialogs, and the freedesktop trash,
@@ -617,6 +618,28 @@ D-Bus client is allowed.
     directory, and a pending question now takes the keyboard — and
     `EXDEV` reaching the status line as "os error 18" instead of a
     sentence.
+
+    **A fourth defect came out of the integration tests, and it is the
+    toolkit's too.** Take-out dispatch means the one widget a callback
+    cannot reach is itself — `widget_mut` answers `Error::Busy`, a value
+    rather than a panic. That is the right design and it is fine for a
+    button, whose `on_click` changes something else. It is not fine for
+    a list, where "activate this row" means "show different rows
+    **here**": `nitro-files` wrote the new rows with `if let Ok(mut l) =
+    …`, the `Err` went into the `if let`, and the path bar updated while
+    the rows on screen did not — with nothing anywhere returning an
+    error anybody read, and a direct call to the same function working
+    perfectly. `Ui::defer` queues such work until every widget is back
+    in its slot, which is not a new mechanism but the one `Ui::focus`
+    has always used for the identical reason. Every swallowed
+    `Error::Busy` in the app is now a reported one.
+
+    That is three bugs found by running the program and one by writing
+    tests against it, none by the 78 that already passed — and all four
+    share a shape worth naming: **the instrument agreed with the code
+    because it was measuring the layer below the broken one.**
+    `hey get path value` read the app's state, not the widget's; the
+    tests called `Ui::run_fd` directly, not the loop that dispatches it.
 
     Limitations are recorded where a reader will find them
     (`docs/files.md`): no drag and drop and no cross-process clipboard

@@ -592,68 +592,61 @@ fn a_text_file_nobody_claims_falls_back_to_an_editor() {
 
 #[test]
 fn delete_asks_first_and_n_leaves_the_file_where_it_is() {
+    // The file the prompt is about, named so its first letter is also the
+    // key that answers the question. That collision is the whole point of
+    // this test rather than a detail of it, so it is stated as a premise
+    // rather than buried in a literal: rename it to `list.txt` and every
+    // assertion below still passes while the test has silently stopped
+    // testing anything.
+    const VICTIM: &str = "notes.txt";
+
     // A delete key that deleted would be the one destructive key in the
     // program with no way back. The question lives in the status line and
     // the next key answers it; `n` must leave the file alone.
     //
-    // The file is called `notes.txt` **on purpose**, and that is the
-    // whole point of this test rather than a detail of it: app-level key
-    // handlers are offered only what the focused chain declined, and a
-    // focused `List` consumes any printable key as type-ahead. With the
-    // list still focused, `n` would not be "no" — it would be "jump to
-    // the first row starting with n", which is this one — and the
-    // question would eat its own answer. A pending confirm therefore
-    // takes the keyboard (`nitro_files::ask` blurs), and this asserts
-    // that property from the outside: against the version without the
-    // blur, the file is trashed on the next `y` and this test fails.
-    let (root, dir) = fixture("confirm-no");
-    write(&dir.join("notes.txt"), "still here");
-    write(&dir.join("keep.txt"), "untouched");
-    // The guard that keeps this test honest. Everything below only
-    // exercises the type-ahead collision because the file's name begins
-    // with the letter that answers the question; rename the fixture to
-    // `list.txt` and every assertion still passes while the test has
-    // silently stopped testing anything. So state the premise.
-    const VICTIM: &str = "notes.txt";
+    // Why the name matters: app-level key handlers are offered only what
+    // the focused chain declined, and a focused `List` consumes any
+    // printable key as type-ahead. With the list still focused, `n` would
+    // not be "no" — it would be "jump to the first row starting with n",
+    // which is this one — and the question would eat its own answer. A
+    // pending confirm therefore takes the keyboard (`nitro_files::ask`
+    // blurs), and this asserts that property from the outside: against
+    // the version without the blur, the file is trashed on the next `y`
+    // and this test fails.
     assert!(
         VICTIM.starts_with('n'),
         "this test is about `n` being both an answer and a type-ahead prefix; \
          a fixture whose name does not start with `n` makes it vacuous"
     );
+    let (root, dir) = fixture("confirm-no");
+    write(&dir.join(VICTIM), "still here");
+    write(&dir.join("keep.txt"), "untouched");
     let (mut h, ids) = app(&dir, &root.join("xdg"));
     assert_eq!(names_of(&h, ids), ["keep.txt", VICTIM]);
 
-    // Select the file whose name starts with the answer.
-    //
-    // Guarded rather than assumed: this is a test of the
-    // confirm-versus-type-ahead conflict only while the selected row
-    // really does begin with the letter that answers the question. A
-    // future rename of the fixture to something not starting with `n`
-    // would leave every assertion below passing and the property
-    // untested, which is the quiet way a regression test stops being
-    // one.
+    // Select it — and check that the row really is the one the premise is
+    // about, rather than trusting the sort order to have put it here.
     h.key(key::DOWN);
     h.settle();
     let selected = h
         .state()
         .path_at(h.widget::<List<Files>>(ids.list).cursor())
         .expect("a row under the cursor");
-    assert!(
-        selected
-            .file_name()
-            .is_some_and(|n| n.to_string_lossy().starts_with('n')),
-        "this test needs the selected row to start with `n`, the key that \
-         answers the prompt; it is {selected:?}"
+    assert_eq!(
+        selected,
+        dir.join(VICTIM),
+        "the cursor is on the file the prompt will be about"
     );
+
     h.key(key::DELETE);
     h.settle();
     assert_eq!(
         h.state().pending_confirm(),
-        Some(&Confirm::Trash(vec![dir.join("notes.txt")])),
+        Some(&Confirm::Trash(vec![dir.join(VICTIM)])),
         "Delete asks about the row under the cursor"
     );
     assert!(
-        status(&h, ids).contains("Move notes.txt to the trash? [y/n]"),
+        status(&h, ids).contains(&format!("Move {VICTIM} to the trash? [y/n]")),
         "and asks it in the status line: {:?}",
         status(&h, ids)
     );
@@ -667,11 +660,11 @@ fn delete_asks_first_and_n_leaves_the_file_where_it_is() {
     h.settle();
     assert!(
         h.state().pending_confirm().is_none(),
-        "`n` answered the question rather than jumping to notes.txt"
+        "`n` answered the question rather than jumping to {VICTIM}"
     );
-    assert!(dir.join("notes.txt").exists(), "and the file is still here");
+    assert!(dir.join(VICTIM).exists(), "and the file is still here");
     assert_eq!(h.state().message(), Some("cancelled"));
-    assert_eq!(names_of(&h, ids), ["keep.txt", "notes.txt"]);
+    assert_eq!(names_of(&h, ids), ["keep.txt", VICTIM]);
     assert_eq!(
         h.ui().focused(),
         Some(ids.list),

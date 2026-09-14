@@ -601,6 +601,50 @@ first. That is what makes `y` an answer to a confirm only when the path
 bar is not the thing being typed into, and the toolkit's ordering gives
 it for free.
 
+**And it is what made the first version of the confirm answer the wrong
+question.** A focused `List` consumes any printable key as type-ahead,
+so with the list focused `n` was not "no" — it was "jump to the first
+row beginning with `n`", and the file being deleted was called
+`notes.txt`. `y` worked only because no row happened to begin with `y`:
+a confirmation whose meaning depended on the file names in the
+directory. A pending question therefore **takes the keyboard** — `ask`
+drops the focus, answering gives it back — so the keys bubble from the
+root and reach the app handler first. That is the whole of what makes a
+one-line prompt behave like a dialog without being one, and
+`delete_asks_first_and_n_leaves_the_file_where_it_is` pins it, including
+that the focus is *borrowed* rather than kept.
+
+## A callback that changes its own widget has to defer
+
+One more thing this app had to learn, and it is general enough that
+`docs/ui.md` now carries the rule.
+
+The toolkit's take-out dispatch moves a widget out of its arena slot for
+the duration of its own callback — which is what makes `Fn(&mut S, &mut
+Ui<S>)` possible at all — so the one widget a callback cannot reach is
+itself: `widget_mut` answers `Error::Busy`, a value rather than a panic.
+For a button that is invisible, because `on_click` changes something
+else. For a list it is the common case: *activating a row means showing
+different rows in that same list*.
+
+The first version of this app wrote the new rows straight from
+`on_activate`, with `if let Ok(mut l) = ui.widget_mut(list)`. The `Err`
+went into the `if let`. `cwd` moved, the path bar updated, the **rows on
+screen stayed as they were**, and nothing anywhere returned an error
+anybody read — while calling the same function directly worked
+perfectly, because directly is not through the widget. The same shape
+hid three more: a path bar that did not normalise what it showed, and a
+rename box that stayed open holding the name you had just used.
+
+So every callback here that writes back to its own widget goes through
+`Ui::defer`, which runs it once dispatch is over and the tree is whole;
+and every `widget_mut` in this file reports a failure (`complain`)
+instead of dropping it. A write in this app always goes to a widget the
+app built and still owns, so a failure is a bug in this file rather than
+a condition to handle: be loud in the journal and carry on. Not
+`unwrap` — a file manager should not die because a label did not update
+— and not silence, which is the bug that started this.
+
 ## Everything is addressable
 
 ```text
@@ -782,11 +826,11 @@ appears is a shell rather than `vi`, because `-e` is not implemented
 yet. Both halves are the documented state, and the first half is the
 half this app owns.
 
-### Three defects the test suite could not see
+### Four defects that 78 passing tests could not see
 
-Recorded because the *why* is transferable, and because all three were
-found by running the program on hardware after every test in the
-workspace passed.
+Recorded because the *why* is transferable. Three were found by running
+the program on hardware after every test in the workspace passed, and
+the fourth by writing integration tests against it afterwards.
 
 **1. A descriptor hook's token was a recycled descriptor number.** The
 symptom was this app: the listing refreshed itself in the first
@@ -819,6 +863,22 @@ keyboard: `ask` drops the focus, answering restores it.
 whose home is a different filesystem is the ordinary case, and the
 behaviour is deliberate — so the fix was to say so in words rather than
 to change it.
+
+**4. A callback wrote to its own widget and the refusal went in the
+bin.** Argued in full under *A callback that changes its own widget has
+to defer* above; the short version is that `on_activate` navigated and
+then wrote the new rows into an `Error::Busy` an `if let Ok(…)` threw
+away, so `cwd` and the path bar moved and the rows did not. Found by
+`crates/nitro-files/tests/files.rs` — the one of the four a test caught,
+and only because the test asserted on *the rows the widget is showing*
+rather than on the app's own state.
+
+All four share a shape worth naming: **the instrument agreed with the
+code because it was measuring the layer below the broken one.** `hey get
+path value` reads the app's state and not the widget's. The fd tests
+call `Ui::run_fd` directly and not the loop that dispatches to it. A
+model can be perfect while the glass is wrong, which is `docs/term.md`'s
+lesson arriving again in a third costume.
 
 Two measurement traps this run walked into, in the spirit of the notes
 in `docs/testbox.md`:

@@ -91,6 +91,45 @@ A widget destroyed while it was out has nowhere to go back to and is
 simply dropped, so a callback may legally remove the widget that is
 running it.
 
+### `ui.defer`, for the callback that really does mean itself
+
+"To change yourself, use the `&mut self` you already have" is the right
+answer for a widget's own `event` and `action`, where there *is* a `&mut
+self`. It is not available in the third place a callback runs: an **app**
+callback like `on_click` or `on_activate` is handed `&mut S` and `&mut
+Ui<S>` and no `self` at all, because it is the app's code rather than the
+widget's.
+
+Most of the time that is fine, because such a callback changes something
+else. A list is where it is not. "Activate this row" means "show
+different rows **here**", and `nitro-files` (M4-D) shipped exactly that:
+its `on_activate` navigated, wrote the new rows with `if let Ok(mut l) =
+ui.widget_mut(list)`, and the `Err(Busy)` went into the `if let`. The
+path bar updated, the rows on screen did not, and **nothing anywhere
+returned an error anybody read**. The tests passed; a test that called
+the same function directly saw it work, because directly is not through
+the widget.
+
+`ui.defer(|s, ui| ..)` queues the work and `Ui::run_deferred` runs it
+once dispatch is over and every widget is back in its slot. It is not a
+new mechanism: `Ui::focus` has always queued its `FocusChanged` for
+precisely this reason — a widget out of its slot cannot receive a
+notification either — so this is that answer generalised rather than a
+second one invented beside it. The queue drains wherever
+`deliver_focus_events` does (after an event batch, after an introspection
+action) and also after `run_timers` and `run_fd`, since a timer and a
+descriptor hook are app code with the same rights. A deferred callback
+may defer again — a navigation that triggers a re-listing does — and the
+chain drains in the same pass, bounded by `MAX_DEFER_ROUNDS` so a
+callback that re-queues itself unconditionally is cut off with a message
+instead of hanging the loop.
+
+The rule is one sentence: **if an app callback needs to change the widget
+whose callback it is, defer it.**
+`a_widget_callback_changes_that_widget_by_deferring` in `tests/ui.rs`
+asserts both halves — that the reach-yourself case really is `Busy`, and
+that deferring really does land.
+
 ## WidgetMut
 
 `WidgetMut<'_, W, S>` is the only door to a widget's properties. Taking
