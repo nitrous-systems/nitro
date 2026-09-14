@@ -403,9 +403,10 @@ fn program_file_name(entry: &Entry) -> &str {
 /// compositor would be worse than offering nothing.
 #[must_use]
 pub fn builtins() -> Vec<Entry> {
-    const KNOWN: [(&str, &str); 4] = [
+    const KNOWN: [(&str, &str); 5] = [
         ("nitro-calc", "Calculator"),
         ("nitro-term", "Terminal"),
+        ("nitro-settings", "Settings"),
         ("hello_dialog", "Hello Dialog"),
         ("nitro-demo", "Nitro Demo"),
     ];

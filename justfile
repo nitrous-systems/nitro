@@ -45,7 +45,7 @@ box := env_var_or_default("NITRO_BOX", "kaspar@192.168.1.204")
 # is why they are deployed together and in one rsync — a session that
 # started yesterday's bar next to today's server is the failure mode the
 # sibling lookup exists to prevent.
-box_bins := "nitro-server nitro-session nitro-shot nitro-demo nitro-calc nitro-term nitro-bar nitro-launcher nitro-wallpaper hey"
+box_bins := "nitro-server nitro-session nitro-shot nitro-demo nitro-calc nitro-term nitro-bar nitro-launcher nitro-wallpaper nitro-settings hey"
 box_examples := "hello_client hello_dialog shell_probe"
 
 # Build release, rsync binaries to the box, restart the dev session.

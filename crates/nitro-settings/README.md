@@ -1,0 +1,195 @@
+# nitro-settings
+
+**Displays, keyboard and audio**, in one decorated window. It is the app
+that writes the compositor's own configuration file — `server.conf`, the
+one `nitro-server` watches with inotify and reloads — and so the first
+nitro app whose output something else reads back.
+
+```text
+┌──────────────────────────────────────────────────────┐
+│ Displays                                             │
+│ HDMI-A-1 1920×1080 @ 60 Hz [==o===] 2 ☑ primary 0   0 │
+│ VGA-1    1280×1024 @ 60 Hz [o=====] 1 ☐ primary 1920 0│
+│ Positions are typed; drag-arrange is not in M4.       │
+│ ────────────────────────────────────────────────────  │
+│ Keyboard                                             │
+│ Layout [de    ] Variant [      ] Options [ctrl:nocaps]│
+│ Test here [                                         ] │
+│ ────────────────────────────────────────────────────  │
+│ Audio                                                │
+│ Volume [======o===] 65 %  ☐ mute                      │
+│ via wpctl                                            │
+│ ────────────────────────────────────────────────────  │
+│ [Apply] [Revert]                            applied   │
+└──────────────────────────────────────────────────────┘
+```
+
+Run it against a server (`just fake` in another terminal):
+
+```console
+$ cargo run -p nitro-settings
+$ NITRO_CONFIG=/tmp/server.conf cargo run -p nitro-settings
+```
+
+## What Apply writes
+
+The whole file, rendered from the widgets and `rename(2)`d into place:
+
+```text
+# nitro server configuration — written by nitro-settings.
+# Plain `key = value` lines; see docs/settings.md.
+
+output.HDMI-A-1.scale = 2
+output.HDMI-A-1.position = 0,0
+output.HDMI-A-1.primary = true
+
+output.VGA-1.scale = 1
+output.VGA-1.position = 1920,0
+
+keyboard.layout = de
+keyboard.variant =
+keyboard.options = ctrl:nocaps
+```
+
+Outputs sorted by connector, `scale`/`position`/`primary` within each,
+`primary` only when true, a blank line between blocks, and the three
+keyboard lines always. `apply_writes_exactly_the_expected_file` compares
+the whole string, because a file format nothing pins is a file format
+that drifts.
+
+The **rename is the point**. The server watches the config *directory*,
+so a rename makes the new file appear atomically: a reader sees the old
+file or the new one, never a half-written one. Writing in place would let
+the compositor reload three lines, apply a scale of 1 to the primary
+output and re-apply the real one a millisecond later.
+
+## Limitations, and they are real
+
+**The file is rewritten wholesale.** Comments you typed and keys this app
+does not know about are **lost** on Apply. Round-tripping them would mean
+keeping the whole file's token stream; the answer for now is: edit the
+file *or* use the app, not both.
+
+**No drag-arrange.** Output positions are typed into two fields, in
+desktop logical pixels. A drag-to-arrange canvas needs a widget
+`nitro-ui` does not have and a preview the server cannot render yet; the
+dialog says so in a label rather than pretending.
+
+**The scale slider offers 1–3 in steps of 0.25.** The *file* allows
+0.5–8 and the server enforces that, but the panels that exist live in
+1–3, and a knob whose useful travel is its leftmost eighth is a worse
+control than one that cannot express a scale nobody has. A file outside
+the range is clamped into it visibly — and reversibly, by not pressing
+Apply.
+
+**The volume is read once.** No daemon, no D-Bus, no polling timer: a
+volume changed by a media key while the window is open is stale until you
+press Revert. That is what the idle contract costs, and it is why
+`nothing_is_sent_while_it_sits_there` can assert that a settled dialog
+leaves no timer armed at all.
+
+## Validation is the server's job
+
+Apply does not check your keyboard layout, and that is deliberate: the
+compositor owns xkbcommon, and a settings app that re-implemented the
+check would eventually disagree with the thing it configures. So Apply
+writes the file and then **asks** — the control socket's `stats` carries
+a `config_reloads` counter, and the status line reports what it did:
+
+| status | means |
+|---|---|
+| `applied` | the counter moved: the server read the file and took it |
+| `server rejected: see log` | it did not move within 1.5 s; the compositor's log says why |
+| `saved to …` | there is no server to ask. Written and correct, confirmed by nothing |
+
+The third is not the second. A file nothing confirmed is not a file
+something refused, and drawing them the same way would teach the user to
+ignore the message.
+
+**"Test here"** is a scratch text field for exactly this: after Apply,
+type in it and see whether the new layout took.
+
+## Where the display list comes from
+
+The **shell socket**. `App::shell` connects to `shell.sock`,
+`Ui::outputs()` subscribes, and each output arrives as a `ShellEvent`.
+It is a subscription, not a poll — plug a monitor in and a row appears.
+
+The window is nevertheless an **ordinary decorated window**: the app
+never calls `App::surface`, and a shell connection with no shell surface
+is exactly that. The socket *is* the capability (`docs/shell.md`), so the
+privilege buys the output list and costs nothing else;
+`a_shell_connection_still_opens_an_ordinary_window` asserts the window is
+decorated and focusable rather than a `NO_FOCUS` panel.
+
+Without a shell socket — an older server, or a client started outside
+the session — the dialog falls back to the ordinary socket, builds its
+rows from `server.conf` alone, and **says so in the note under the
+rows**. A dialog showing two of your four monitors with no explanation is
+worse than one that admits what it is working from.
+
+## Audio is a remote control
+
+There is no audio in nitro and there is not going to be: PipeWire is the
+sound server, and a display server that also owned the mixer would be two
+daemons in one process. So the audio section runs `wpctl`, falls back to
+`pactl`, and shows **"no audio backend found"** when neither is on
+`PATH`, with the slider and checkbox disabled rather than absent.
+
+| | read | write |
+|---|---|---|
+| `wpctl` | `get-volume @DEFAULT_AUDIO_SINK@` | `set-volume … 65%`, `set-mute … 1\|0` |
+| `pactl` | `get-sink-volume @DEFAULT_SINK@`, `get-sink-mute` | `set-sink-volume`, `set-sink-mute` |
+
+`wpctl`'s output format is **not a contract**, so it is parsed by shape:
+a decimal fraction anywhere in the text, and `MUTED` anywhere in it. Not
+"the first number" — the first number in `Sink 42 volume: 0.50` is the
+sink id, and reading it as a volume would set the machine to maximum on a
+format this parser was meant to tolerate.
+
+## Driving it with `hey`
+
+Every widget carries a `.name()`, and the names are published as
+`nitro_settings::names` constants. A display row is named by its
+**connector**, which is what the server, the file and the monitor's EDID
+all call it:
+
+```console
+$ hey nitro-settings list
+$ hey nitro-settings do displays/HDMI-A-1/primary click
+$ hey nitro-settings set displays/HDMI-A-1/scale value 2
+$ hey nitro-settings set displays/HDMI-A-1/x value 0
+$ hey nitro-settings get displays/HDMI-A-1/scale_value value   # 2
+$ hey nitro-settings set keyboard/layout value de
+$ hey nitro-settings do apply click
+$ hey nitro-settings get status value                          # applied
+```
+
+The short paths work because a segment naming no direct child is looked
+for by name in the subtree, and refused if it is not unique — which is
+why the captions in front of the fields are deliberately **unnamed**: a
+label called `layout` beside the field called `layout` would make
+`keyboard/layout` ambiguous and break every command above.
+
+## Why there is a second copy of the config parser
+
+`src/conf.rs` renders and parses the same format as
+`nitro_server::config`, and does **not** depend on it. Depending on the
+compositor crate would link libinput, drm, xkbcommon and the rasterizer
+into a binary whose job is to render nine lines of text, for the benefit
+of forty lines of parser.
+
+What keeps the two honest is a test, not a comment:
+`the_server_parser_reads_back_what_we_write` feeds this crate's output to
+the server's real parser — through a dev-dependency, where the compositor
+may be linked — and asserts that every value survives with no warnings.
+A divergence in either direction fails there, which is the only place it
+can be caught without shipping the compositor to the user.
+
+## Environment
+
+| | |
+|---|---|
+| `$NITRO_CONFIG` | the file to read and write; else `$XDG_CONFIG_HOME/nitro/server.conf`, else `$HOME/.config/nitro/server.conf` |
+| `$NITRO_CONTROL` | the server's control socket, for the `applied` verdict; resolved exactly as `nitro-shot` does |
+| `$PATH` | where `wpctl` and `pactl` are looked for |

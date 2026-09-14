@@ -280,6 +280,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "nitro-settings"
+version = "0.0.1"
+dependencies = [
+ "nitro-server",
+ "nitro-ui",
+]
+
+[[package]]
 name = "nitro-shot"
 version = "0.0.1"
 

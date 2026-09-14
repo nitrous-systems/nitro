@@ -1,0 +1,39 @@
+[package]
+name = "nitro-settings"
+description = "Display, keyboard and audio settings: the app that writes the server's server.conf"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The toolkit, and nothing else — the same rule `nitro-calc` states.
+#
+# In particular **not** `nitro-server`, even though this app reads and
+# writes the compositor's own configuration file: depending on it would
+# link the whole compositor (libinput, drm, xkbcommon, the rasterizer)
+# into a 700 KB budget binary to reuse forty lines of parser. `conf.rs`
+# renders and parses the format instead, and a round-trip test against
+# the server's real parser is what keeps the two copies honest.
+nitro-ui = { workspace = true }
+
+[lib]
+name = "nitro_settings"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nitro-settings"
+path = "src/main.rs"
+
+[dev-dependencies]
+# The in-process harness: a real server on the fake backend, a real
+# client, real pixels. A dev-dependency, so the shipped binary never
+# links the compositor.
+nitro-ui = { workspace = true, features = ["test-support"] }
+# The server's own `config::parse`, for the round-trip test: what this
+# app writes is what the compositor reads, asserted rather than assumed.
+# A dev-dependency and nothing more — see the note on `[dependencies]`.
+nitro-server = { path = "../nitro-server", features = ["test-support"] }
