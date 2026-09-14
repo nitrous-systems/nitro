@@ -628,6 +628,22 @@ impl<S: 'static> Ui<S> {
         self.wire.has_text()
     }
 
+    /// Whether this app is talking to the server over a **remote** link
+    /// (the `REMOTE` capability).
+    ///
+    /// What it costs is one thing: images. A buffer is passed as a file
+    /// descriptor and a descriptor cannot cross TCP, so
+    /// [`PaintCx::upload_image`](crate::widget::PaintCx::upload_image)
+    /// returns `None` and an `Image` widget draws nothing. Everything
+    /// else — rects, text, borders, layout, input — is unchanged, which
+    /// is what makes an ordinary app remote-capable without knowing it.
+    /// An app that *is* its pixels (the wallpaper) should check this and
+    /// say so rather than come up blank; see `docs/remote.md`.
+    #[must_use]
+    pub fn is_remote(&self) -> bool {
+        self.wire.is_remote()
+    }
+
     /// The window's current size in logical pixels.
     #[must_use]
     pub fn window_size(&self) -> Size {

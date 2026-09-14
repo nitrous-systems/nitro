@@ -65,6 +65,7 @@
 
 pub mod client;
 pub mod codec;
+pub mod endpoint;
 pub mod error;
 pub mod framing;
 pub mod io;
@@ -74,6 +75,7 @@ pub mod types;
 pub mod wire;
 
 pub use codec::{FdQueue, Reader, Writer};
+pub use endpoint::{Endpoint, endpoint, shell_endpoint};
 pub use error::{DecodeError, EncodeError, Error};
 pub use framing::{Frame, Framer, Head, header};
 pub use io::Socket;
@@ -131,6 +133,10 @@ pub const MAX_FDS: usize = 8;
 pub const MAX_PENDING_FDS: usize = 64;
 
 /// Environment variable overriding the socket path.
+///
+/// Since M4-E1 it may also name a **remote** server as
+/// `tcp://host:port`; see [`endpoint`] and `docs/remote.md`. Anything
+/// without that prefix is a path, exactly as before.
 pub const SOCKET_ENV: &str = "NITRO_SOCKET";
 
 /// Environment variable overriding the **shell** socket path.

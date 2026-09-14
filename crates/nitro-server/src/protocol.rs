@@ -217,8 +217,25 @@ pub fn outputs_reply(outputs: &[OutputLine]) -> Vec<u8> {
 
 /// `ok\n`, one `key value` line per pair, blank line.
 pub fn stats_reply(pairs: &[(&str, u64)]) -> Vec<u8> {
+    stats_reply_with(pairs, &[])
+}
+
+/// The same, plus trailing pairs whose value is **text**.
+///
+/// Every statistic was a `u64` until M4-E1, and almost all of them still
+/// are — a counter is the right shape for "how many" and it parses in one
+/// line. `remote_listen` is not a count: it is the address the remote
+/// listener bound, or `off`, and the question a caller asks of it ("which
+/// port did `:0` resolve to?") has no numeric answer. The line format is
+/// unchanged, `key value`, so a reader that splits on the first space and
+/// parses the rest as a number simply skips it — which is exactly what
+/// `nitro-demo`'s parser already does with a line it cannot use.
+pub fn stats_reply_with(pairs: &[(&str, u64)], text: &[(&str, String)]) -> Vec<u8> {
     let mut s = String::from("ok\n");
     for (k, v) in pairs {
+        let _ = writeln!(s, "{k} {v}");
+    }
+    for (k, v) in text {
         let _ = writeln!(s, "{k} {v}");
     }
     s.push('\n');

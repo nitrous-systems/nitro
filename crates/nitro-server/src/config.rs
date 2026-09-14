@@ -22,6 +22,8 @@
 //!
 //! theme.scheme = dark
 //! theme.accent = #6ca8f0
+//!
+//! remote.listen    = 127.0.0.1:7700
 //! ```
 //!
 //! # Why `key = value` and not TOML
@@ -58,6 +60,7 @@
 //! | keyboard | `XKB_DEFAULT_*` | `keyboard.*` | the `us` layout |
 //! | colour scheme | — | `theme.scheme` | `light` |
 //! | one colour | — | `theme.<role>` | the scheme's value |
+//! | remote listener | — | `remote.listen` | off |
 //!
 //! The environment wins because it is the *development* channel — a
 //! `NITRO_SCALE=HDMI-A-1=2 just fake` must not be silently overridden by
@@ -177,6 +180,33 @@ impl ThemeSettings {
     }
 }
 
+/// What the `remote.*` keys say.
+///
+/// One key so far. It is a section rather than a bare `remote_listen`
+/// because the next thing a remote link will want (an allow list, a
+/// connection limit) belongs next to it, and a flat key would have to be
+/// renamed to get there.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoteSettings {
+    /// `remote.listen = <addr>:<port>`, e.g. `127.0.0.1:7700`,
+    /// `[::1]:7700`, `0.0.0.0:7700`. Absent means **no TCP listener at
+    /// all**, which is the default and costs a server that does not want
+    /// remote clients exactly nothing.
+    ///
+    /// A literal address, never a name: a listener resolved through DNS
+    /// is a foot-gun, because the name may move and the address the
+    /// server bound is then not the one the file names.
+    pub listen: Option<std::net::SocketAddr>,
+}
+
+impl RemoteSettings {
+    /// Whether the file says anything about remote clients.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.listen.is_none()
+    }
+}
+
 /// A parsed `server.conf`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Settings {
@@ -186,6 +216,8 @@ pub struct Settings {
     pub keyboard: KeyboardSettings,
     /// The colour section.
     pub theme: ThemeSettings,
+    /// The remote section.
+    pub remote: RemoteSettings,
     /// Every line that was skipped, and why. The caller logs these; they
     /// are not errors, because a configuration file cannot be allowed to
     /// stop a running compositor.
@@ -223,6 +255,7 @@ impl Settings {
     pub fn is_empty(&self) -> bool {
         self.keyboard.is_empty()
             && self.theme.is_empty()
+            && self.remote.is_empty()
             && self.outputs.values().all(OutputSettings::is_empty)
     }
 
@@ -403,6 +436,22 @@ pub fn parse(text: &str) -> Settings {
             "keyboard.layout" => settings.keyboard.layout = Some(value.to_owned()),
             "keyboard.variant" => settings.keyboard.variant = Some(value.to_owned()),
             "keyboard.options" => settings.keyboard.options = Some(value.to_owned()),
+            // `remote.listen =` with nothing after it is "no listener",
+            // not a parse failure: it is how a settings app turns the
+            // feature off without deleting the line, and the same shape
+            // `keyboard.variant =` already has.
+            "remote.listen" => {
+                if value.is_empty() {
+                    settings.remote.listen = None;
+                } else {
+                    match nitro_wire::endpoint::parse_listen(value) {
+                        Ok(addr) => settings.remote.listen = Some(addr),
+                        Err(e) => settings
+                            .warnings
+                            .push(format!("line {number}: remote.listen {value:?}: {e}")),
+                    }
+                }
+            }
             // Named explicitly rather than falling into "unknown key",
             // because it is the one key a reader expects to find and it is
             // deliberately absent: nothing in this stack repeats keys.
@@ -679,6 +728,11 @@ mod tests {
             "output.X.rotation = 90",
             "keyboard = de",
             "keyboard.repeat = 300,25",
+            "remote.listen",
+            "remote.listen = ",
+            "remote.listen = :",
+            "remote.listen = 1.2.3.4.5:1",
+            "remote = 127.0.0.1:7700",
             "nonsense",
             "\0\0\0",
             "key = \u{1f4a9}",
@@ -707,6 +761,58 @@ mod tests {
                 .output("X")
                 .is_none_or(|o| o.scale.is_none())
         );
+    }
+
+    #[test]
+    fn remote_listen_takes_a_literal_and_nothing_else() {
+        let s = parse("remote.listen = 127.0.0.1:7700\n");
+        assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+        assert_eq!(
+            s.remote.listen,
+            Some("127.0.0.1:7700".parse().expect("literal"))
+        );
+        assert!(!s.is_empty());
+        // v6 and the wildcard, which is what a LAN measurement run uses.
+        assert_eq!(
+            parse("remote.listen = [::1]:7700\n").remote.listen,
+            Some("[::1]:7700".parse().expect("literal"))
+        );
+        assert_eq!(
+            parse("remote.listen = 0.0.0.0:7700\n").remote.listen,
+            Some("0.0.0.0:7700".parse().expect("literal"))
+        );
+        // Port 0 is legal: the kernel picks one, which is how the tests
+        // run without choosing a number.
+        assert_eq!(
+            parse("remote.listen = 127.0.0.1:0\n").remote.listen,
+            Some("127.0.0.1:0".parse().expect("literal"))
+        );
+        // An empty value is "off", not a warning: that is how a settings
+        // app disables the listener without deleting the line.
+        let off = parse("remote.listen =\n");
+        assert!(off.warnings.is_empty(), "{:?}", off.warnings);
+        assert_eq!(off.remote.listen, None);
+        assert!(off.is_empty());
+    }
+
+    #[test]
+    fn a_bad_remote_listen_is_a_warning_and_no_listener() {
+        for bad in [
+            "7700",
+            "localhost:7700",
+            "nitro.example.com:7700",
+            "127.0.0.1",
+            "127.0.0.1:",
+            "127.0.0.1:nope",
+            "127.0.0.1:99999",
+            "::1:7700",
+            "tcp://127.0.0.1:7700",
+        ] {
+            let s = parse(&format!("remote.listen = {bad}\n"));
+            assert_eq!(s.remote.listen, None, "{bad}");
+            assert_eq!(s.warnings.len(), 1, "{bad}: {:?}", s.warnings);
+            assert!(s.warnings[0].contains("remote.listen"), "{bad}");
+        }
     }
 
     #[test]

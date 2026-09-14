@@ -101,6 +101,52 @@ impl Drop for Listener {
     }
 }
 
+/// A bound, non-blocking **TCP** listener: the remote half of the wire.
+///
+/// Separate from [`Listener`] because the two differ in exactly the
+/// places a shared type would have to branch anyway — there is no path to
+/// unlink, there *is* a bound address to report, and every socket it
+/// accepts is marked remote. What is deliberately *not* different is
+/// everything downstream: it yields the same [`ClientStream`], so the
+/// server's read/decode/flush arms are the ones it already had.
+#[derive(Debug)]
+pub struct TcpListener {
+    fd: OwnedFd,
+    addr: std::net::SocketAddr,
+}
+
+impl TcpListener {
+    /// Bind at `addr`. A port of 0 asks the kernel for one; the address
+    /// actually bound is then [`TcpListener::addr`].
+    ///
+    /// # Errors
+    /// Any `socket`/`bind`/`listen` failure.
+    pub fn bind(addr: std::net::SocketAddr) -> Result<Self, Error> {
+        let (fd, addr) = io::listen_tcp(addr)?;
+        Ok(Self { fd, addr })
+    }
+
+    /// The address bound, with the port the kernel chose resolved.
+    #[must_use]
+    pub fn addr(&self) -> std::net::SocketAddr {
+        self.addr
+    }
+
+    /// The descriptor, for `epoll`.
+    #[must_use]
+    pub fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+
+    /// Accept one pending connection, or `None`.
+    ///
+    /// # Errors
+    /// Any `accept` failure other than `EAGAIN`.
+    pub fn accept(&self) -> Result<Option<ClientStream>, Error> {
+        Ok(io::accept_tcp(&self.fd)?.map(ClientStream::new))
+    }
+}
+
 /// One connected client as the server sees it: socket, incoming framer,
 /// outgoing buffer, and the handshake state machine.
 #[derive(Debug)]
@@ -143,6 +189,13 @@ impl ClientStream {
     #[must_use]
     pub fn is_ready(&self) -> bool {
         self.name.is_some()
+    }
+
+    /// Whether the peer is on a remote link — no descriptors, in either
+    /// direction.
+    #[must_use]
+    pub fn is_remote(&self) -> bool {
+        self.socket.is_remote()
     }
 
     /// Whether bytes are waiting to be written.
@@ -251,10 +304,24 @@ impl ClientStream {
     /// version mismatch, [`Error::Unexpected`] when a message arrives
     /// before `Hello` or a second `Hello` arrives. Every one is fatal:
     /// answer with [`ClientStream::fail`] and drop the client.
+    ///
+    /// The **one exception** is [`Error::RemoteNoFds`], which is not
+    /// fatal: it means a remote peer sent an op that needs a descriptor
+    /// (`CreateBuffer`) with none declared. The frame was consumed whole,
+    /// so the stream is still synchronised and the caller may keep the
+    /// client and carry on — which is what the server does, because a
+    /// client that ignored `caps::REMOTE` deserves an explanation and not
+    /// a dead socket. A frame that *declares* descriptors on a remote
+    /// link is a different thing and stays fatal: the descriptors can
+    /// never arrive, so the peer and the receiver disagree about the byte
+    /// stream, and that is [`DecodeError::MissingFd`].
     pub fn next_msg(&mut self) -> Result<Option<ClientMsg>, Error> {
         let Some(frame) = self.framer.next_frame()? else {
             return Ok(None);
         };
+        if self.socket.is_remote() && needs_fd(frame.op) {
+            return Err(Error::RemoteNoFds);
+        }
         let mut fds = FdQueue::from_vec(frame.fds);
         let msg = ClientMsg::decode(frame.op, &frame.payload, &mut fds)?;
         match (&msg, self.name.is_some()) {
@@ -317,6 +384,17 @@ impl ClientStream {
     pub fn flush(&mut self) -> Result<bool, Error> {
         self.socket.send_all(&mut self.out)
     }
+}
+
+/// Whether an op can only be honoured with a file descriptor attached.
+///
+/// One op in v1. It is a function rather than a `matches!` at the call
+/// site so that adding a second fd-carrying message is a change in one
+/// place, and so the rule is greppable from the remote code that depends
+/// on it.
+#[must_use]
+pub fn needs_fd(op: u16) -> bool {
+    op == msg::CreateBuffer::OP
 }
 
 /// The [`ErrorCode`] to report for a protocol-level failure.

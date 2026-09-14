@@ -9,6 +9,7 @@ use nitro_core::{Color, IRect, Rect, Size, Transform};
 
 use crate::VERSION;
 use crate::codec::{FdQueue, Writer};
+use crate::endpoint::Endpoint;
 use crate::error::Error;
 use crate::framing::Framer;
 use crate::io::Socket;
@@ -56,11 +57,31 @@ pub struct Connection {
 impl Connection {
     /// Connect to the default socket path and run the handshake.
     ///
+    /// Since M4-E1 the "path" may be a **remote** endpoint: a
+    /// `NITRO_SOCKET` of `tcp://host:port` connects over TCP and the
+    /// server's `Welcome` carries [`caps::REMOTE`](crate::types::caps::REMOTE).
+    /// Nothing else about the connection differs, except that a message
+    /// carrying a file descriptor cannot be sent on it
+    /// ([`Error::RemoteNoFds`]) — see `docs/remote.md`.
+    ///
     /// # Errors
-    /// Connection failure, a version mismatch, or a server that answered
-    /// with [`Error`](crate::msg::Error).
+    /// Connection failure, an unusable `NITRO_SOCKET`, a version
+    /// mismatch, or a server that answered with
+    /// [`Error`](crate::msg::Error).
     pub fn connect_default(name: &str) -> Result<Self, Error> {
-        Self::connect(&socket_path(), name)
+        Self::connect_endpoint(&crate::endpoint()?, name)
+    }
+
+    /// Connect to `endpoint` and run the handshake.
+    ///
+    /// # Errors
+    /// As [`Connection::connect`].
+    pub fn connect_endpoint(endpoint: &Endpoint, name: &str) -> Result<Self, Error> {
+        let socket = match endpoint {
+            Endpoint::Unix(path) => Socket::connect(path)?,
+            Endpoint::Tcp(addrs) => Socket::connect_tcp(addrs)?,
+        };
+        Self::with_socket(socket, name)
     }
 
     /// Connect to the default **shell** socket path and run the handshake.
@@ -69,12 +90,17 @@ impl Connection {
     /// [`caps::SHELL`](crate::types::caps::SHELL) and the shell ops are
     /// accepted. See `docs/shell.md`.
     ///
+    /// **Never remote.** A `tcp://` in `NITRO_SHELL_SOCKET` is an error,
+    /// not a connection: the privilege comes from having opened a `0700`
+    /// path, and a TCP port proves nothing of the sort.
+    ///
     /// # Errors
-    /// As [`Connection::connect`]. In particular, a server that is not
+    /// As [`Connection::connect`], plus [`Error::BadEndpoint`] for a
+    /// `tcp://` shell socket. In particular, a server that is not
     /// running — or one whose shell socket the caller cannot open — fails
     /// here rather than silently downgrading to an unprivileged connection.
     pub fn connect_shell(name: &str) -> Result<Self, Error> {
-        Self::connect(&shell_socket_path(), name)
+        Self::connect(&crate::shell_endpoint()?, name)
     }
 
     /// Connect to `path` and run the handshake.
@@ -145,6 +171,19 @@ impl Connection {
         self.caps & bits == bits
     }
 
+    /// Whether this connection is remote — the socket is TCP.
+    ///
+    /// The *transport's* answer, which is the one a sender needs before
+    /// it builds a frame with a descriptor in it. The server's
+    /// [`caps::REMOTE`](crate::types::caps::REMOTE) bit says the same
+    /// thing from the other end, and the two agree; a client that trusts
+    /// only the capability bit would still be right, but would not know
+    /// until after the handshake.
+    #[must_use]
+    pub fn is_remote(&self) -> bool {
+        self.socket.is_remote()
+    }
+
     /// The socket descriptor, for `epoll`.
     #[must_use]
     pub fn as_fd(&self) -> BorrowedFd<'_> {
@@ -162,8 +201,21 @@ impl Connection {
     /// [`flush`]: Connection::flush
     ///
     /// # Errors
-    /// [`Error::Encode`] for a message that cannot be represented.
+    /// [`Error::Encode`] for a message that cannot be represented, or
+    /// [`Error::RemoteNoFds`] for a message that needs a file descriptor
+    /// on a **remote** connection.
+    ///
+    /// The remote refusal happens *here*, before the message is encoded,
+    /// and that placement is the whole point: nothing is queued, nothing
+    /// is written, and the connection is exactly as it was. A frame whose
+    /// header declares descriptors that can never arrive would leave the
+    /// receiver waiting for bytes that do not exist — a desynchronised
+    /// stream is a dead connection, and "your image did not upload" is a
+    /// much better outcome than that.
     pub fn send(&mut self, msg: &ClientMsg) -> Result<(), Error> {
+        if self.socket.is_remote() && crate::server::needs_fd(msg.op()) {
+            return Err(Error::RemoteNoFds);
+        }
         msg.encode(&mut self.out)?;
         Ok(())
     }

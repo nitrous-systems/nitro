@@ -44,6 +44,7 @@ pub mod input;
 pub mod keyboard;
 pub mod logging;
 pub mod protocol;
+pub mod remote;
 pub mod render;
 pub mod shell;
 pub mod signals;
@@ -85,6 +86,7 @@ use crate::frame::{CursorState, OutputState};
 use crate::input::{InputEvent, InputSource, LibinputSource, Pointer};
 use crate::keyboard::{Hotkey, Keyboard, Mods};
 use crate::protocol::Request;
+use crate::remote::RemoteListener;
 use crate::stats::FrameStats;
 use crate::text::{StyleRequest, TextEngine};
 use crate::wm::{Drag, Edges, FrameNodes, Region, WindowManager};
@@ -341,6 +343,10 @@ const TOK_SHELL_LISTENER: u64 = 8;
 /// they sit next to each other and end in the same call.
 const TOK_CONFIG: u64 = 9;
 const TOK_SIGHUP: u64 = 10;
+/// The **remote** listener, when `remote.listen` asked for one. Absent
+/// from the epoll set entirely when it did not, which is why the feature
+/// costs an ordinary desktop nothing (see [`remote`]).
+const TOK_REMOTE_LISTENER: u64 = 11;
 /// How long an unanswered input keeps waiting for a frame to claim it.
 /// Beyond this the number would not be a latency any more: nothing
 /// responded to the event, and attributing the next unrelated frame to it
@@ -352,6 +358,11 @@ const TOK_WIRE_BASE: u64 = 1 << 33;
 /// Shell clients get their own token range, so a token says which socket a
 /// client arrived on even before its `WireClient` is looked up.
 const TOK_SHELL_BASE: u64 = 1 << 34;
+/// Remote clients get their own range too, for exactly the same reason:
+/// the token *is* the answer to "did this client arrive over TCP?", so
+/// `caps::REMOTE` and the buffer refusal are decided from one fact rather
+/// than from a per-client flag that could drift from it.
+const TOK_REMOTE_BASE: u64 = 1 << 35;
 
 /// Flip-interval statistics for `stats` and the log.
 #[derive(Debug, Default)]
@@ -548,6 +559,11 @@ struct Server {
     /// The privileged listener. Held next to the wire one and dropped with
     /// it, so both socket files go at shutdown.
     shell_listener: WireListener,
+    /// The **remote** listener, when `server.conf`'s `remote.listen` asked
+    /// for one. `None` — the default — means no TCP socket exists at all.
+    /// A reload may create it, replace it or drop it; see
+    /// [`Server::apply_remote_listen`].
+    remote_listener: Option<RemoteListener>,
     listener: UnixListener,
     // Held for its drop side effect only; the wire listener unlinks itself.
     _socket_file: SocketFile,
@@ -663,6 +679,8 @@ struct Server {
     /// Shell tokens are allocated from their own counter, so a shell client
     /// and a wire client can never share a token.
     next_shell: u64,
+    /// Remote tokens, from their own counter for the same reason.
+    next_remote: u64,
     next_client_id: u32,
     active: bool,
     quit: bool,
@@ -834,6 +852,7 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         clients: HashMap::new(),
         wire_listener,
         shell_listener,
+        remote_listener: None,
         listener,
         _socket_file: SocketFile(config.control_path.clone()),
         signals,
@@ -879,6 +898,7 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         next_client: 0,
         next_wire: 0,
         next_shell: 0,
+        next_remote: 0,
         next_client_id: 1,
         active: true,
         quit: false,
@@ -895,6 +915,10 @@ pub fn run(mut config: Config) -> Result<(), Error> {
     // disarmed unless a flip is actually being held, so a registered fd
     // that never fires costs an idle server nothing.
     add(&server.epoll, &server.defer.as_fd(), TOK_DEFER)?;
+    // The third listener, and the only one that is optional. Applied here
+    // through the same function the reload path uses, so "what
+    // `remote.listen` means" has exactly one implementation.
+    server.apply_remote_listen();
     server.sync_outputs();
     server.paint_all();
     let result = server.event_loop();
@@ -1869,6 +1893,7 @@ impl Server {
                     TOK_CONFIG => self.on_config_event(),
                     TOK_WIRE_LISTENER => self.on_wire_accept()?,
                     TOK_SHELL_LISTENER => self.on_shell_accept()?,
+                    TOK_REMOTE_LISTENER => self.on_remote_accept()?,
                     TOK_BACKEND => self.on_backend()?,
                     TOK_INPUT => self.on_input(),
                     TOK_INPUT_HOTPLUG => self.on_input_hotplug(),
@@ -1876,7 +1901,9 @@ impl Server {
                     // Shell tokens sort above wire tokens, so this arm has
                     // to come first; both end up in `on_wire_client`,
                     // because a shell client *is* a wire client with an
-                    // extra capability bit.
+                    // extra capability bit. Remote tokens sort above both,
+                    // for the same reason and with the same answer.
+                    t if t >= TOK_REMOTE_BASE => self.on_wire_client(t, flags),
                     t if t >= TOK_SHELL_BASE => self.on_wire_client(t, flags),
                     t if t >= TOK_WIRE_BASE => self.on_wire_client(t, flags),
                     t if t >= TOK_CLIENT_BASE => self.on_client(t, flags),
@@ -2124,6 +2151,101 @@ impl Server {
         }
     }
 
+    /// A client connected over **TCP**.
+    ///
+    /// Identical to [`Server::on_wire_accept`] but for the token range,
+    /// and again that is the point: a remote client is not a different
+    /// kind of client, it is one whose token says its link cannot carry
+    /// descriptors. `docs/remote.md` argues the model.
+    fn on_remote_accept(&mut self) -> Result<(), Error> {
+        loop {
+            let Some(listener) = self.remote_listener.as_ref() else {
+                return Ok(());
+            };
+            let stream = match listener.listener().accept() {
+                Ok(Some(s)) => s,
+                Ok(None) => return Ok(()),
+                Err(e) => {
+                    warn!("remote accept: {e}");
+                    return Ok(());
+                }
+            };
+            let id = ClientId(self.next_client_id);
+            self.next_client_id += 1;
+            let token = TOK_REMOTE_BASE + self.next_remote;
+            self.next_remote += 1;
+            add(&self.epoll, &stream.as_fd(), token)?;
+            info!("remote client {} connected", id.0);
+            self.wire_clients.insert(token, WireClient::new(stream, id));
+        }
+    }
+
+    /// Bring the remote listener in line with `remote.listen`.
+    ///
+    /// The one place the key is turned into a socket, called from startup
+    /// and from every reload. Three cases, and the third is the one worth
+    /// stating: a value that has **not changed** leaves the existing
+    /// listener alone, so a reload that moved a monitor does not rebind
+    /// the port — and every connected remote client keeps its connection,
+    /// because a connection lives on the socket it was accepted on, not
+    /// on the listener.
+    ///
+    /// A bind that fails is a warning and no listener, never a fatal
+    /// error: a typo in `remote.listen` must not take the desktop down,
+    /// and "the port is in use" is a thing a person fixes while looking
+    /// at their running session.
+    fn apply_remote_listen(&mut self) {
+        let want = self.settings.remote.listen;
+        match (want, self.remote_listener.as_ref()) {
+            (Some(addr), Some(current)) if current.satisfies(addr) => {}
+            (Some(addr), _) => {
+                // Drop the old one *first*: rebinding the same address
+                // while the previous socket is open would fail, and the
+                // ordinary reload is "the same address with one field
+                // changed elsewhere in the file".
+                self.drop_remote_listener();
+                match remote::RemoteListener::bind(addr) {
+                    Ok(listener) => {
+                        if let Err(e) = add(
+                            &self.epoll,
+                            &listener.listener().as_fd(),
+                            TOK_REMOTE_LISTENER,
+                        ) {
+                            warn!("registering the remote listener: {e}");
+                            return;
+                        }
+                        info!("remote wire socket at tcp://{}", listener.addr());
+                        self.remote_listener = Some(listener);
+                    }
+                    Err(e) => warn!("remote.listen {addr}: {e}"),
+                }
+            }
+            (None, Some(_)) => {
+                self.drop_remote_listener();
+                info!("remote listener closed (remote.listen removed)");
+            }
+            (None, None) => {}
+        }
+    }
+
+    /// Close the remote listener, if any, and take it out of the epoll
+    /// set.
+    ///
+    /// The `epoll_ctl(DEL)` is explicit rather than left to the close:
+    /// closing a descriptor does remove it, but the listener is dropped
+    /// after this returns, and a `DEL` on a live fd is the version that
+    /// cannot race a wakeup already queued for it.
+    ///
+    /// Connected remote clients are deliberately **not** touched. They
+    /// are on their own sockets; a listener going away means "no new
+    /// connections", which is what removing the key asks for.
+    fn drop_remote_listener(&mut self) {
+        let Some(listener) = self.remote_listener.take() else {
+            return;
+        };
+        let _ = epoll::delete(&self.epoll, listener.listener().as_fd());
+    }
+
     fn on_input(&mut self) {
         let mut events = std::mem::take(&mut self.input_events);
         events.clear();
@@ -2337,6 +2459,12 @@ impl Server {
         // the one place that decides them; it re-`Configure`s the clients
         // of any output whose scale moved and `invalidate`s every output.
         self.sync_outputs();
+        // The remote listener, which may appear, move or go away. Done
+        // unconditionally like everything else here, and idempotent: an
+        // unchanged `remote.listen` is a comparison and nothing more, so
+        // a reload that touched only the keyboard never disturbs a
+        // connected remote client.
+        self.apply_remote_listen();
         // `invalidate` only marks. A scale change repaints the whole
         // screen, so drive it now rather than waiting for the next thing
         // that happens to damage something.
@@ -3926,6 +4054,15 @@ impl Server {
             .filter(|t| Self::is_shell(**t))
             .count();
         pairs.push(("shell_clients", shell_clients as u64));
+        // And the remote one. `remote_clients` counts connections that
+        // arrived over TCP; `remote_listen` is reported separately,
+        // below, because it is an address and not a number.
+        let remote_clients = self
+            .wire_clients
+            .keys()
+            .filter(|t| Self::is_remote(**t))
+            .count();
+        pairs.push(("remote_clients", remote_clients as u64));
         pairs.push(("hotkeys", self.hotkeys.len() as u64));
         pairs.push(("exclusive_zones", self.zones.zone_count() as u64));
         pairs.push(("grabbed", u64::from(self.grab.is_some())));
@@ -3934,7 +4071,12 @@ impl Server {
         // what a caller wants to know is "did the server pick my edit up",
         // not which of the three doors it came through.
         pairs.push(("config_reloads", self.config_reloads));
-        protocol::stats_reply(&pairs)
+        // The remote listener's address, with the port the kernel chose
+        // for a configured `:0`, or `off`. Text rather than a number
+        // because an address is not a count; see
+        // [`protocol::stats_reply_with`].
+        let remote_listen = remote::listen_text(self.remote_listener.as_ref());
+        protocol::stats_reply_with(&pairs, &[("remote_listen", remote_listen)])
     }
 
     // -------------------------------------------------------- wire clients
@@ -3983,6 +4125,31 @@ impl Server {
                 Ok(Some(m)) => m,
                 Ok(None) => break,
                 Err(nitro_wire::error::Error::Closed) => return false,
+                // A remote client that sent a buffer op anyway. Not
+                // fatal: the frame was consumed whole, so the stream is
+                // still in step, and a client that missed `caps::REMOTE`
+                // is better served by an explanation than by a dead
+                // socket. It keeps its windows and its connection; only
+                // the image is missing, which is exactly what "no pixels
+                // cross the link" means (`docs/remote.md`).
+                Err(nitro_wire::error::Error::RemoteNoFds) => {
+                    let Some(client) = self.wire_clients.get_mut(&token) else {
+                        return false;
+                    };
+                    warn!(
+                        "remote client {}: buffers are not available on a remote link",
+                        client.id.0
+                    );
+                    client.send(&ServerMsg::Error(msg::Error {
+                        serial: 0,
+                        code: ErrorCode::BadBuffer,
+                        msg: "buffers are not available on a remote link: \
+                              file descriptors cannot be passed over TCP \
+                              (caps::REMOTE, docs/remote.md)"
+                            .to_owned(),
+                    }));
+                    continue;
+                }
                 Err(e) => {
                     let code = clients::wire_code(&e);
                     let detail = e.to_string();
@@ -4007,13 +4174,20 @@ impl Server {
         match message {
             ClientMsg::Hello(hello) => {
                 let shell = Self::is_shell(token);
-                let caps = self.caps(shell);
+                let remote = Self::is_remote(token);
+                let caps = self.caps(shell, remote);
                 let Some(client) = self.wire_clients.get_mut(&token) else {
                     return false;
                 };
                 info!(
                     "{} client {} is {:?}",
-                    if shell { "shell" } else { "wire" },
+                    if shell {
+                        "shell"
+                    } else if remote {
+                        "remote"
+                    } else {
+                        "wire"
+                    },
                     client.id.0,
                     hello.name
                 );
@@ -4123,13 +4297,23 @@ impl Server {
     /// `THEME` is unconditional for the same reason `WM` is: the server
     /// always owns a palette and always pushes it, so every client may
     /// rely on the `Theme` that follows its `Welcome`.
-    fn caps(&self, shell: bool) -> u32 {
+    ///
+    /// `REMOTE` is the same shape of fact from the other direction: a
+    /// connection accepted on the TCP listener cannot carry descriptors,
+    /// so the bit tells the client "buffers are expensive, text is cheap"
+    /// *before* it tries to allocate one. A remote client never gets
+    /// `SHELL`: the shell socket is a `0700` path and the privilege is
+    /// having opened it, which a TCP port cannot prove.
+    fn caps(&self, shell: bool, remote: bool) -> u32 {
         let mut caps = nitro_wire::types::caps::WM | nitro_wire::types::caps::THEME;
         if self.text.has_fonts() {
             caps |= nitro_wire::types::caps::TEXT;
         }
         if shell {
             caps |= nitro_wire::types::caps::SHELL;
+        }
+        if remote {
+            caps |= nitro_wire::types::caps::REMOTE;
         }
         caps
     }
@@ -4139,8 +4323,17 @@ impl Server {
     /// The token range *is* the answer, which is why shell clients get their
     /// own: a per-client boolean would be a second copy of the same fact,
     /// and the two could drift.
+    ///
+    /// Remote tokens sort *above* the shell range, so the check is a
+    /// window and not a threshold — a remote client is emphatically not a
+    /// shell client.
     const fn is_shell(token: u64) -> bool {
-        token >= TOK_SHELL_BASE
+        token >= TOK_SHELL_BASE && token < TOK_REMOTE_BASE
+    }
+
+    /// Whether a token names a client that arrived over TCP.
+    const fn is_remote(token: u64) -> bool {
+        token >= TOK_REMOTE_BASE
     }
 
     // ---------------------------------------------------------- shell ops

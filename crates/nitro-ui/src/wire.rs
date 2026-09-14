@@ -526,6 +526,11 @@ impl Wire {
         self.conn.has_caps(caps::TEXT)
     }
 
+    /// Whether the link to the server is remote: no buffers, no images.
+    pub(crate) fn is_remote(&self) -> bool {
+        self.conn.has_caps(caps::REMOTE)
+    }
+
     /// Measure a string, synchronously.
     ///
     /// **This blocks on a round trip**, and that is an M2 decision rather
@@ -805,6 +810,15 @@ impl Wire {
     ///
     /// `pwrite` rather than `mmap`: mapping would need `unsafe`, which
     /// this tree denies, and an image's pixels are written once.
+    ///
+    /// **Refused on a remote link.** A buffer *is* a descriptor, and a
+    /// descriptor cannot cross TCP; the server says so in `Welcome` with
+    /// [`caps::REMOTE`], and this is where the toolkit acts on it. The
+    /// refusal happens before the memfd is created, so a remote app that
+    /// paints an image every frame does not allocate one every frame to
+    /// throw away — and the error is a value, so the app reports it and
+    /// keeps drawing everything else. `docs/remote.md` says which apps
+    /// this costs (the wallpaper) and why.
     pub(crate) fn create_buffer(
         &mut self,
         width: u32,
@@ -812,6 +826,9 @@ impl Wire {
         alpha: bool,
         pixels: &[u8],
     ) -> Result<BufferId, Error> {
+        if self.conn.has_caps(caps::REMOTE) {
+            return Err(Error::Wire(nitro_wire::Error::RemoteNoFds));
+        }
         let fd = memfd(pixels)?;
         let id = BufferId(self.next_buffer);
         self.next_buffer += 1;

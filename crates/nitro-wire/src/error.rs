@@ -114,6 +114,18 @@ pub enum Error {
         /// Human-readable detail; never interpreted.
         msg: String,
     },
+    /// A message carrying file descriptors was about to go out on a
+    /// **remote** socket, which cannot carry them.
+    ///
+    /// Raised on the sending side, before any byte leaves: a frame whose
+    /// header declares descriptors and whose descriptors never arrive is
+    /// a desynchronised stream, so the honest failure is here and not at
+    /// the far end. It is *not* fatal to the connection — nothing was
+    /// written — which is what lets a toolkit report "no images over a
+    /// remote link" and carry on drawing everything else.
+    RemoteNoFds,
+    /// `NITRO_SOCKET` (or `remote.listen`) named something unusable.
+    BadEndpoint(String),
 }
 
 impl fmt::Display for Error {
@@ -128,6 +140,10 @@ impl fmt::Display for Error {
             }
             Self::Unexpected(what) => write!(f, "unexpected message: {what}"),
             Self::Rejected { code, msg } => write!(f, "server error {code:?}: {msg}"),
+            Self::RemoteNoFds => {
+                f.write_str("file descriptors cannot be passed over a remote link")
+            }
+            Self::BadEndpoint(what) => write!(f, "bad endpoint: {what}"),
         }
     }
 }
