@@ -329,6 +329,53 @@ fn twenty_thousand_lines_cost_no_more_commits_than_frames() {
 }
 
 #[test]
+fn a_scripted_send_types_rather_than_pastes() {
+    // The box run's second finding, and the subtlest of the three.
+    //
+    // `send` used to wrap its bytes in the bracketed-paste markers when
+    // the program had asked for them (DECSET 2004). bash 5.1 and later
+    // turn that on by default — and the whole *purpose* of the markers
+    // is to tell readline that what follows is data, not keystrokes, so
+    // the newline was inserted as a literal character and every scripted
+    // command sat on the prompt unrun. The screen looked perfect; the
+    // command never executed.
+    //
+    // A script driving a terminal is a keyboard, not a clipboard. The
+    // assertion is on the bytes the pty received, because "it typed it"
+    // and "it pasted it" produce the same screen and differ only there.
+    let (mut h, grid) = harness_running(&[
+        "/bin/sh",
+        "-c",
+        // `cat` echoes its input back, so what the child received is
+        // observable from the screen without a second channel.
+        "printf '\\033[?2004h'; cat",
+    ]);
+    pump_until(&mut h, "the terminal to accept 2004", |h| {
+        h.widget::<TermGrid>(grid).term().bracketed_paste()
+    });
+
+    let (ui, state) = h.parts();
+    nitro_ui::introspect::invoke(
+        ui,
+        state,
+        &format!("window/{GRID_NAME}"),
+        "send",
+        Some("hello\\n"),
+    )
+    .expect("send");
+    pump_until(&mut h, "the echoed text", |h| {
+        screen(h, grid).contains("hello")
+    });
+
+    let text = screen(&mut h, grid);
+    assert!(
+        !text.contains("200~") && !text.contains("201~"),
+        "a scripted send must not be bracketed; the child echoed {text:?}"
+    );
+    h.quit();
+}
+
+#[test]
 fn a_fast_writer_does_not_starve_the_screen() {
     // The bug this test exists for: `drain_pty` used to read until
     // `WouldBlock`, which never comes while the writer is faster than

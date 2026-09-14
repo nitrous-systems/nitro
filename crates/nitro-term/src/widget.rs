@@ -515,7 +515,7 @@ impl<S: 'static> Widget<S> for TermGrid {
         Access {
             name: Some("grid".to_owned()),
             value: Some(self.term.grid().text()),
-            actions: vec!["send", "scroll_to_bottom", "focus"],
+            actions: vec!["send", "paste_text", "scroll_to_bottom", "focus"],
         }
     }
 
@@ -533,7 +533,30 @@ impl<S: 'static> Widget<S> for TermGrid {
             // purpose is to run a command, and a newline cannot be typed
             // on a command line any other way. `\e` reaches `vim`, too.
             // See `keys::unescape` for why the rule is narrow.
+            //
+            // The bytes are **typed, not pasted**, and that distinction
+            // cost a box run to find. Wrapping them in the bracketed
+            // paste markers is what a real paste would do — but bash 5.1
+            // and later enable bracketed paste by default, and the
+            // entire purpose of the markers is to tell readline *not* to
+            // execute what arrives: the newline was inserted as a
+            // literal character and every scripted command sat on the
+            // prompt unrun. A script driving a terminal is a keyboard,
+            // not a clipboard. `paste_text` below is the action for the
+            // day there is a real clipboard.
             "send" | "set_value" | "set_text" => {
+                let text = crate::keys::unescape(arg.unwrap_or_default());
+                self.term.grid_mut().scroll_to_bottom();
+                self.write_input(text.as_bytes());
+                cx.request_paint();
+                Handled::Yes
+            }
+            // A genuine paste: bracketed when the program asked for it,
+            // so an editor can tell it from typing and not auto-indent
+            // it. Nothing produces one yet — there is no clipboard — but
+            // the plumbing is here and tested, and it is the action a
+            // clipboard would call.
+            "paste_text" => {
                 let text = crate::keys::unescape(arg.unwrap_or_default());
                 let bytes = crate::keys::paste(&text, self.term.bracketed_paste());
                 self.term.grid_mut().scroll_to_bottom();
