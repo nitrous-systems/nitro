@@ -685,6 +685,109 @@ fn delete_asks_first_and_n_leaves_the_file_where_it_is() {
 }
 
 #[test]
+fn a_pending_confirm_swallows_the_ctrl_shortcuts() {
+    // Issue #559, the other door into the room the confirm-blur closed.
+    // `install()` registers the five `Ctrl+…` shortcuts *before*
+    // `on_key(app_key)`, and `nitro-ui` offers app-level handlers in
+    // registration order — so a shortcut outranks the pending-confirm
+    // swallow. The four-step repro from the issue:
+    //
+    //   1. Delete   → confirm pending, focus dropped, prompt in the status line
+    //   2. Ctrl+N   → (was) the new-folder field opens and takes the focus
+    //   3. a name + Enter → commit_edit → cancel_edit hands focus to the list
+    //   4. y/n      → eaten by the focused list as type-ahead; the prompt is
+    //                 now unanswerable, and the file is in limbo
+    //
+    // Nothing is destroyed either way, which is why this was a review nit
+    // rather than a bug report — but a question on screen that cannot be
+    // answered is exactly what the blur exists to prevent.
+    const VICTIM: &str = "notes.txt";
+    let (root, dir) = fixture("confirm-shortcut");
+    write(&dir.join(VICTIM), "still here");
+    let (mut h, ids) = app(&dir, &root.join("xdg"));
+
+    h.key(key::DELETE);
+    h.settle();
+    assert_eq!(
+        h.state().pending_confirm(),
+        Some(&Confirm::Trash(vec![dir.join(VICTIM)])),
+        "Delete asks first"
+    );
+    assert_eq!(h.ui().focused(), None, "and the question took the keyboard");
+
+    // Step 2: the shortcut must do nothing at all.
+    h.key_with(key::LEFT_CTRL, key::N);
+    h.settle();
+    assert_eq!(
+        h.state().editing(),
+        &Editing::None,
+        "Ctrl+N must not open the new-folder field while a question is pending"
+    );
+    assert_eq!(
+        h.ui().focused(),
+        None,
+        "and must not give the keyboard away: that is what strands the prompt"
+    );
+    assert_eq!(
+        h.state().pending_confirm(),
+        Some(&Confirm::Trash(vec![dir.join(VICTIM)])),
+        "the question is still the same question"
+    );
+
+    // The other four, for the same reason and in one sweep: none may act,
+    // and none may move the focus. Ctrl+H would toggle hidden files, Ctrl+S
+    // would re-sort, Ctrl+C would copy the selection, Ctrl+V would paste.
+    let hidden = h.state().shows_hidden();
+    for k in [key::H, key::S, key::C, key::V] {
+        h.key_with(key::LEFT_CTRL, k);
+        h.settle();
+        assert_eq!(h.ui().focused(), None, "a shortcut gave the keyboard away");
+        assert!(
+            h.state().pending_confirm().is_some(),
+            "a shortcut cleared the pending question"
+        );
+    }
+    assert_eq!(
+        h.state().shows_hidden(),
+        hidden,
+        "and Ctrl+H specifically did nothing"
+    );
+
+    // And the question is still answerable, which is the whole point.
+    h.key(key::N);
+    h.settle();
+    assert!(h.state().pending_confirm().is_none(), "`n` cancelled it");
+    assert_eq!(h.state().message(), Some("cancelled"));
+    assert!(dir.join(VICTIM).exists(), "and the file is still here");
+    assert_eq!(
+        h.ui().focused(),
+        Some(ids.list),
+        "the keyboard went back to the list"
+    );
+
+    // With nothing pending the shortcuts work exactly as before: the
+    // early-return is conditional, not a disablement. (The alternative fix
+    // — registering `app_key` first — would have changed the ordering for
+    // every key, which is why this assertion is here in either case.)
+    h.key_with(key::LEFT_CTRL, key::H);
+    h.settle();
+    assert!(
+        h.state().shows_hidden() != hidden,
+        "with no question pending, Ctrl+H toggles hidden files again"
+    );
+    h.key_with(key::LEFT_CTRL, key::N);
+    h.settle();
+    assert_eq!(
+        h.state().editing(),
+        &Editing::NewFolder,
+        "and Ctrl+N opens the new-folder field again"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    h.quit();
+}
+
+#[test]
 fn answering_y_moves_the_file_into_the_trash_with_its_info_file() {
     // The trash is only a trash if what it holds can be put back, which
     // means `files/<name>` and `info/<name>.trashinfo` both exist. A move

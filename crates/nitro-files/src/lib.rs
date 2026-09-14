@@ -594,11 +594,31 @@ pub fn build(ui: &mut Ui<Files>) -> WidgetId {
 /// harness-built tree rather than a copy of them — the bug that idiom
 /// prevents is a shortcut that works in the app and not in the test, or
 /// the reverse.
+///
+/// # A pending confirm swallows the shortcuts too
+///
+/// Every `Ctrl+…` closure below early-returns while `s.confirm.is_some()`
+/// (issue #559). `nitro-ui` offers app-level handlers in **registration
+/// order**, and the shortcuts are registered ahead of [`app_key`], which is
+/// where the pending-confirm swallow lives — so without this a `Ctrl+N` with
+/// a delete confirm on screen would open the new-folder field, focus it, and
+/// on commit hand focus back to the list, where `y`/`n` are eaten as
+/// type-ahead and the question can no longer be answered. That is the same
+/// bug the confirm-blur fixed, through the other door.
+///
+/// The alternative was to register `ui.on_key(app_key)` **first** so the
+/// swallow outranks the shortcuts. It is two lines rather than five, and it
+/// was not taken: it changes the app-level ordering for *every* key, not just
+/// while a confirm is pending, so it trades a narrow fix for a global
+/// behaviour change in the handler this file relies on seeing keys last.
 fn install(ui: &mut Ui<Files>) {
     ui.set_shortcut(
         mods::CTRL,
         key::H,
         move |s: &mut Files, ui: &mut Ui<Files>| {
+            if s.confirm.is_some() {
+                return;
+            }
             s.hidden = !s.hidden;
             refresh_rows(s, ui);
         },
@@ -607,6 +627,9 @@ fn install(ui: &mut Ui<Files>) {
         mods::CTRL,
         key::S,
         move |s: &mut Files, ui: &mut Ui<Files>| {
+            if s.confirm.is_some() {
+                return;
+            }
             s.sort = s.sort.next();
             dir::sort(&mut s.entries, s.sort);
             s.message = Some(format!("sorted by {}", sort_name(s.sort)));
@@ -617,6 +640,9 @@ fn install(ui: &mut Ui<Files>) {
         mods::CTRL,
         key::N,
         move |s: &mut Files, ui: &mut Ui<Files>| {
+            if s.confirm.is_some() {
+                return;
+            }
             start_edit(s, ui, Editing::NewFolder, "");
         },
     );
@@ -624,6 +650,9 @@ fn install(ui: &mut Ui<Files>) {
         mods::CTRL,
         key::C,
         move |s: &mut Files, ui: &mut Ui<Files>| {
+            if s.confirm.is_some() {
+                return;
+            }
             copy_selection(s, ui);
         },
     );
@@ -631,6 +660,9 @@ fn install(ui: &mut Ui<Files>) {
         mods::CTRL,
         key::V,
         move |s: &mut Files, ui: &mut Ui<Files>| {
+            if s.confirm.is_some() {
+                return;
+            }
             paste(s, ui);
         },
     );
