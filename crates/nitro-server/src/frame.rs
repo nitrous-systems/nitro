@@ -150,9 +150,16 @@ impl Shadow {
         if self.width == width && self.height == height && self.stride == stride {
             return false;
         }
-        *self = Self::new(width, height);
-        self.stride = stride;
-        self.data = vec![0; (stride as usize) * (height as usize)];
+        // Built here rather than via `Shadow::new` + a fix-up, so the one
+        // allocation made is the one kept: `new` assumes a tight stride and
+        // the scanout buffer's is often padded.
+        *self = Self {
+            width,
+            height,
+            stride,
+            data: vec![0; (stride as usize) * (height as usize)],
+            complete: false,
+        };
         true
     }
 

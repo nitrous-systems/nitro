@@ -884,15 +884,11 @@ impl Server {
                 existing.width = info.width;
                 existing.height = info.height;
                 existing.refresh_ns = frame::refresh_ns(info.refresh_mhz);
-                // A mode change resizes the shadow, which clears it; the
-                // `invalidate` below is what repaints into it, so the two
-                // belong together.
+                // A resized shadow is blank again; the `invalidate` below
+                // is what repaints into it, so the two belong together.
                 if let Some(shadow) = existing.shadow.as_mut()
                     && (shadow.width() != info.width || shadow.height() != info.height)
                 {
-                    // A resized shadow is blank again; the `invalidate`
-                    // below is what repaints into it, so the two belong
-                    // together.
                     *shadow = frame::Shadow::new(info.width, info.height);
                 }
                 existing.invalidate();
