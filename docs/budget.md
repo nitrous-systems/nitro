@@ -27,6 +27,7 @@ the tool is installed.
 |---|---|---|---|
 | `nitro-calc` | 560 360 | ≤ 1 MB (client) | **ok**, 56 % of budget |
 | `nitro-term` | 650 136 | ≤ 900 KB (M4-A) | **ok**, 72 % |
+| `nitro-settings` | 719 240 | ≤ 700 KB (M4-C) | **over by 2.7 %**, see below |
 | `nitro-demo` | 481 240 | ≤ 1 MB (client) | **ok**, 48 % |
 | `hello_client` | 393 344 | ≤ 1 MB (client) | **ok**, 39 % |
 | `hey` | 368 008 | — | ok |
@@ -50,6 +51,22 @@ the arena, eleven widgets, the flex solver, the passes and the socket,
 against `nitro-demo` building its scene by hand. Buying a widget toolkit
 for 79 KB over talking to the wire directly is the trade goal 2 asks
 for, and it is the reason the toolkit exists.
+
+**`nitro-settings` is the first binary to miss its budget**, at 719 240
+bytes against 700 KB — 2.7 % over, 19 KB. It is recorded rather than
+rounded away, and it is not a regression in anything: the app is three
+sections (displays, keyboard, audio) against `nitro-calc`'s one keypad,
+and it carries a `server.conf` renderer and parser, a control-socket
+client and a subprocess audio backend that no previous app needed. The
+budget was set before any of those were specified.
+
+The lever is already known and is not specific to this app: ~68 KB of
+every one of these binaries is the introspection protocol, monomorphised
+per app-state type (see `nitro-calc` above). De-monomorphising it — one
+shared copy per program instead of one per `S` — would take roughly a
+tenth off every client in this table at once and put `nitro-settings`
+comfortably inside its budget. That is the fix to make when it is worth
+making, rather than shaving a section off an app to hit a round number.
 
 The server tripled, from 737 736 bytes before M2-pre to 2 047 016 after:
 that is `swash` and its shaping tables, and it buys text end to end. There
@@ -117,6 +134,7 @@ as long as it did. The server's current, audited line is in
 | `nitro-server`, **anon only**, `NITRO_SHADOW=0` (#538) | 5 | **3 980 kB** | — | + 100 kB/window → 2.9 MB | over — the #547 allocator ratchet, see below |
 | `nitro-server`, **file-backed** (#538) | 0–5 | **7 252 kB** | — | `RssFile` ≤ 7.5 MB | **ok**, and flat in windows |
 | `nitro-calc` | 1 | **2 752 kB** | **2 752 kB** | ≤ 3 MB (client) | **ok**, 92 % |
+| `nitro-settings` (M4-C) | 1 | **2 872 kB** | **2 872 kB** | ≤ 3.5 MB (M4-C) | **ok**, 82 % |
 | `nitro-demo` | 1 | 3 132 kB | 3 132 kB | ≤ 3 MB (client) | over by 4 % |
 | `nitro-demo` | 5 | 3 224 kB | 3 224 kB | ≤ 3 MB (client) | over by 7 % |
 
@@ -141,6 +159,26 @@ a 16 kB image and keeps two frames of scratch. One thread, and no second
 one anywhere — the introspection socket is served by the app's own
 `epoll` loop between events, which is what makes "scriptable" cost
 neither a thread nor a lock.
+
+**`nitro-settings` costs the server nothing measurable to watch its
+file.** The claim under test for M4-C was that an inotify watch plus a
+parsed config are free, and the honest answer is that they are **below
+what this box can resolve**. Three interleaved A/B pairs — the same
+desktop with no `server.conf` at all, then with one present and watched —
+gave **+68, +744 and +36 kB**, against an A-side spread of ~110 kB within
+that series and 668 kB in an earlier one. Two of the three agree with
+what the mechanism predicts (one fd, one 4 KiB drain buffer, a struct of
+three `Option`s); the 744 kB outlier is larger than the effect being
+measured. So no mean is quoted: a number here would imply a precision a
+3.3 GB box with no swap does not offer. The interleaving matters for the
+reason `docs/latency.md` and M4-B4 both record — a block design would
+confound the difference with drift across the series.
+
+The idle half is unambiguous, because it is a count rather than a
+difference: **30 s with the watch armed and nothing happening is 0 CPU
+ticks**, for the server and for `nitro-settings` alike. An inotify fd
+with no queued event is simply not readable, so it never wakes the loop —
+the same bargain the defer timerfd and the uevent socket make.
 
 **The server is back inside its budget**, within rounding: 19 676 → 8 240 kB
 with one window, 19 804 → 8 344 kB with five. The fix is #528's: `nitro-text`

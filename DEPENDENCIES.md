@@ -197,6 +197,30 @@ exactly the exposure the untrusted-bytes note below is careful about for
 fonts; `magick in.png out.ppm` is the answer, and the decoder it avoids
 is seventy readable lines. Same reasoning as `png` under Rejected.
 
+`nitro-settings` (M4-C) adds **zero** external dependencies, and the
+place that was tested is its own configuration file. The obvious move for
+`server.conf` is a TOML crate; it was refused because the format has no
+tables, no arrays and no types beyond a float, an integer pair and a
+string — `key = value` with `#` comments is a 40-line parser, and the key
+*is* the path a table would have spelled. The server's copy lives in
+`crates/nitro-server/src/config.rs` and the app has its own renderer and
+parser in `crates/nitro-settings/src/conf.rs`, because an app must not
+link the compositor to write nine lines of text; a round-trip test feeds
+this crate's output to the server's own parser, so the two copies cannot
+drift without a test failing.
+
+The inotify watch is `rustix::fs::inotify` — already a dependency, and
+the feature (`fs`) was already enabled. Audio shells out to `wpctl` with
+a `pactl` fallback rather than linking a PipeWire or D-Bus client: the
+whole interaction is three commands and their output, and a sound-server
+client library would be a permanent dependency for a section that is idle
+whenever nobody is dragging the volume slider. `nitro-settings` is
+`nitro-ui` and `std`, like `nitro-calc`.
+
+The whole-workspace figure is **74** lines and **37 distinct external
+crate names** with M4-C in — both unchanged from M4-A, which is the
+number this section exists to report.
+
 Planned (M3+): nothing currently. `parley` sits behind swash as the
 upgrade path if bidi, font fallback or rich text ever become requirements.
 Rejected: `serde` (hand-written wire), `png` (own stored-deflate encoder in

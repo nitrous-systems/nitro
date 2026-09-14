@@ -449,6 +449,75 @@ D-Bus client is allowed.
     else. It assigns no meaning — the grid, the damage, the colours and
     the key encodings are all `nitro-term`'s, which is why `grid.rs` and
     `vt.rs` carry a hundred unit tests. Argued in `DEPENDENCIES.md`.
+
+  - **M4-C done.** `nitro-settings` and **`server.conf`**: the display
+    server's configuration stopped being an environment variable.
+    Per-connector scale, position and primary, plus the keyboard layout,
+    now live in `$XDG_CONFIG_HOME/nitro/server.conf` — read at startup,
+    watched with inotify, and re-applied without a restart. It is what
+    `docs/wm.md` deferred in M3 under "a persistent output layout";
+    `NITRO_SCALE` survives, demoted from stop-gap to dev override.
+
+    The **file is the contract and the app is one editor for it**. That
+    ordering decided the format: plain `key = value` lines with `#`
+    comments, a 40-line parser and no TOML dependency, because there are
+    no tables, no arrays and no types beyond a float, an integer pair and
+    a string. It survives `sed`, a settings app, and a person with a
+    broken desktop and a text console.
+
+    **Nothing in that file can fail.** It is user input that arrives
+    while the compositor is running, so a bad line is a logged warning
+    and a skipped line — never a stopped desktop. Scales are clamped to
+    0.5–8 rather than trusted: `scale = 20` would render the desktop at
+    twenty times and leave nothing clickable with which to undo it,
+    including the settings app. `keyboard.repeat` is refused **by name**
+    rather than falling into "unknown key", because nothing in nitro
+    repeats keys yet and a setting that appears to work and changes
+    nothing costs a user an afternoon.
+
+    A configured position moves the output in **both** spaces — the
+    desktop layout windows are placed in and the device rectangle the
+    pointer is clamped to. Half-doing it would make the pointer cross
+    between screens somewhere other than a dragged window does.
+
+    On the box: scale 2 and back, layout `de` → `y` types `z`, both by
+    reload with no restart. `nitro-settings` is **2 872 kB RSS** (budget
+    3.5 MB) and **0 CPU ticks over 30 s idle**, as is the server with the
+    watch armed — an inotify fd with nothing queued is not readable, so
+    it never wakes the loop. The binary is **719 240 B against a 700 KB
+    budget, 2.7 % over**, and is recorded that way rather than rounded:
+    three sections, a config renderer, a control-socket client and a
+    subprocess audio backend against `nitro-calc`'s one keypad, on a
+    budget set before any of them were specified.
+
+    **The defect that mattered was found by running it, not by thirteen
+    passing integration tests** — the M3 and M4-A lesson a third time.
+    The inotify watch goes on the file's *parent directory*, because a
+    crash-safe save is a rename and a rename replaces the inode. That
+    directory has to exist for `inotify_add_watch`, and on a machine that
+    has never been configured it does not — so the watch was never armed,
+    never retried, and the one event guaranteed to be missed was the
+    first file a settings app ever writes. Every fresh installation is in
+    that state. The suite could not see it because **the harness created
+    the config directory before starting the server**: the convenience
+    was the hiding place, and the fix came with a constructor that leaves
+    it out and a test that fails without it.
+
+    Two measurement notes, in the discipline M4-B4 established. The scale
+    claim is settled on **pixels** — the bar's strip measures 32 device
+    rows at 1× and 64 at 2× — because `stats` and a config file would
+    both be satisfied by a desktop that never re-laid out, and
+    `hey get window bounds` reports the same numbers at either scale,
+    logical geometry being scale-invariant by design. And the keyboard
+    test carries a control: the same evdev keycode yields `z` under `de`
+    and `y` under `us`, without which it could not tell "the layout
+    applied" from "that key is z". The server's RSS cost for the config
+    and the watch came out **below what a 3.3 GB box can resolve**
+    (+68, +744, +36 kB over three interleaved pairs against a
+    ~110–668 kB A-side spread), and is reported as that rather than as a
+    mean implying a precision it does not have.
+
+    Zero new dependencies.
 - **M5** — Wayland adapter; GPU backend.
 
 ## What we take from the old repo

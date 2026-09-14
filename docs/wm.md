@@ -227,10 +227,21 @@ them up against the edge.
 
 ## Multi-output
 
-Outputs are laid out **left to right in connector order**. A row is the
-arrangement that needs no policy, and connector order is the only ordering
-the kernel offers. A persistent, user-rearrangeable layout belongs to the
-settings app and is deferred to M4.
+Outputs are laid out **left to right in connector order** unless the user
+says otherwise. A row is the arrangement that needs no policy, and
+connector order is the only ordering the kernel offers, so it is the
+default; since M4-C `output.<connector>.position` in `server.conf`
+overrides it per connector, and an output the file does not mention is
+placed after the last positioned one, in connector order. See
+`docs/settings.md`.
+
+A configured position moves the output in **both** spaces — the desktop
+(logical) layout windows are placed in, and the device-pixel rectangle
+the pointer is clamped to and hit-tested against. Half-doing it would be
+worse than not doing it at all: with the desktop layout following the
+file while the device layout stayed in connector order, the pointer would
+cross between screens somewhere other than a dragged window does. Both
+are computed in one pass so they cannot diverge.
 
 * The pointer moves across freely: it is clamped to the *union* of the
   outputs, not to one of them.
@@ -249,11 +260,16 @@ physical size works out to 192 dpi or more. Fractional scaling is not
 offered, because every rectangle in the tree would land between device
 pixels and the whole damage contract is built on exact device rects.
 
-`NITRO_SCALE=<connector>=<f32>,…` overrides it per connector
-(`NITRO_SCALE=HDMI-A-1=2`). A stop-gap: the persistent output layout —
-position, rotation and scale per connector — belongs to the settings app,
-and inventing a config format now that will be thrown away then is worse
-than an environment variable that is obviously temporary.
+Two things override it, in this order: `NITRO_SCALE=<connector>=<f32>,…`
+(`NITRO_SCALE=HDMI-A-1=2`) and then `output.<connector>.scale` in
+`server.conf`. The environment stays on top because it is the
+*development* channel — a `NITRO_SCALE=… just fake` must not be silently
+overridden by whatever the box's own config says — and the file beats the
+EDID because it is the user's explicit answer to the EDID's guess.
+
+The file is what M3 deferred and M4-C delivered: the persistent output
+layout is no longer an environment variable that is obviously temporary.
+`NITRO_SCALE` remains, demoted from stop-gap to dev override.
 
 A window's logical geometry does not change with the scale; the output
 scale lives in the window root's transform, so the rasterizer never needs
@@ -262,10 +278,12 @@ the same logical rectangle.
 
 ### Hotplug
 
-* **A new output** is appended to the right of the row.
+* **A new output** takes the position `server.conf` gives it, or is
+  appended to the right of the row when the file does not name it.
 * **A removed output** orphans its windows — the scene unplaces them — so
-  they are **migrated onto the primary output**, clamped into its work
-  area, and re-`Configure`d. A maximized or fullscreen window has its
+  they are **migrated onto the primary output** (`output.<c>.primary`,
+  else the first connector), clamped into its work area, and
+  re-`Configure`d. A maximized or fullscreen window has its
   geometry re-derived for the new output. Leaving them unplaced would be
   much worse than it sounds: an unplaced window is in no z-order at all,
   so no click and no `Alt+Tab` could ever get it back.
@@ -333,9 +351,12 @@ rather than on real hardware.
   only ever one set of them, so this is an addition rather than a rework.
 * **Cursor shapes.** The arrow stays an arrow over a resize band and a
   title bar. M4, together with the cursor theme.
-* **A persistent output layout.** Position, rotation and scale per
-  connector, edited by the user and remembered across reboots: the
-  settings app, M4. `NITRO_SCALE` is the stop-gap.
+* **Rotation.** Position, scale and the primary flag per connector are
+  persistent since M4-C (`server.conf`, `docs/settings.md`); rotation is
+  not, because nothing in the scene applies one yet.
+* **Drag-arranging the monitor layout.** Positions are persistent and
+  editable, but they are *typed* — in `nitro-settings` or in the file.
+  Dragging a monitor rectangle into place is not in M4.
 * **Window snapping / edge tiling by drag.** `Super+←`/`→` tile; dragging
   a window to a screen edge does not.
 * **Per-window opacity and shadows.** The scene supports opacity; the
