@@ -135,22 +135,22 @@ impl Harness {
 
     /// The `theme` reply: the status line, and the role table as pairs.
     fn theme(&self) -> (String, Vec<(String, String)>) {
-        let mut c = self.connect();
-        c.get_mut().write_all(b"theme\n").unwrap();
+        let mut stream = self.connect();
+        stream.get_mut().write_all(b"theme\n").unwrap();
         let mut status = String::new();
-        c.read_line(&mut status).unwrap();
+        stream.read_line(&mut status).unwrap();
         let mut rows = Vec::new();
         let mut line = String::new();
         loop {
             line.clear();
-            let n = c.read_line(&mut line).unwrap();
-            assert!(n > 0, "connection closed mid-reply");
-            let l = line.trim_end_matches('\n');
-            if l.is_empty() {
+            let read = stream.read_line(&mut line).unwrap();
+            assert!(read > 0, "connection closed mid-reply");
+            let trimmed = line.trim_end_matches('\n');
+            if trimmed.is_empty() {
                 break;
             }
-            let (k, v) = l.split_once(' ').expect("`role #rrggbb`");
-            rows.push((k.to_owned(), v.to_owned()));
+            let (key, value) = trimmed.split_once(' ').expect("`role #rrggbb`");
+            rows.push((key.to_owned(), value.to_owned()));
         }
         (status.trim_end_matches('\n').to_owned(), rows)
     }
@@ -167,6 +167,8 @@ impl Harness {
     }
 
     fn shot(&self) -> Image {
+        use std::io::Read as _;
+
         let mut c = self.connect();
         c.get_mut().write_all(b"shot\n").unwrap();
         let mut status = String::new();
@@ -177,7 +179,6 @@ impl Harness {
         let h: u32 = words.next().unwrap().parse().unwrap();
         let stride: u32 = words.next().unwrap().parse().unwrap();
         let mut data = vec![0u8; (stride * h) as usize];
-        use std::io::Read as _;
         c.read_exact(&mut data).unwrap();
         Image {
             width: w,

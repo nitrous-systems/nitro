@@ -763,14 +763,17 @@ mod tests {
         // The two anchors every WCAG implementation is checked against.
         assert!((contrast(Color::BLACK, Color::WHITE) - 21.0).abs() < 0.01);
         assert!((contrast(Color::WHITE, Color::WHITE) - 1.0).abs() < 1e-6);
-        // Symmetric, and alpha is ignored.
+        // Symmetric, and alpha is ignored. Bit equality rather than an
+        // epsilon: both sides are the *same* arithmetic on the same two
+        // luminances, so anything but an exact match would mean the
+        // function is not the pure computation it looks like.
         assert_eq!(
-            contrast(Color::BLACK, Color::WHITE),
-            contrast(Color::WHITE, Color::BLACK)
+            contrast(Color::BLACK, Color::WHITE).to_bits(),
+            contrast(Color::WHITE, Color::BLACK).to_bits()
         );
         assert_eq!(
-            contrast(Color::WHITE.with_alpha(3), Color::BLACK),
-            contrast(Color::WHITE, Color::BLACK)
+            contrast(Color::WHITE.with_alpha(3), Color::BLACK).to_bits(),
+            contrast(Color::WHITE, Color::BLACK).to_bits()
         );
     }
 

@@ -262,10 +262,12 @@ mod tests {
 
     #[test]
     fn with_palette_keeps_the_apps_metrics() {
-        let mut t = Theme::default();
-        t.font_size = 22.0;
-        t.font_family = "mono".to_owned();
-        t.radius = 0.0;
+        let t = Theme {
+            font_size: 22.0,
+            font_family: "mono".to_owned(),
+            radius: 0.0,
+            ..Theme::default()
+        };
         let dark = t.with_palette(&Palette::dark());
         assert_eq!(dark.font_size.to_bits(), 22.0f32.to_bits());
         assert_eq!(dark.font_family, "mono");
