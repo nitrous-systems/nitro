@@ -456,6 +456,37 @@ pub fn build(ui: &mut Ui<Files>) -> WidgetId {
             .on_submit(|s: &mut Files, ui: &mut Ui<Files>, text: &str| {
                 let to = dir::resolve(text, &s.cwd.clone());
                 navigate(s, ui, to);
+            })
+            // A change navigates **only when the field is not focused**,
+            // and that distinction is what makes `hey nitro-files set
+            // path value /tmp` work without breaking typing.
+            //
+            // `set <prop>` goes through the widget's `set_<prop>` action,
+            // which is the `WidgetMut` setter, which fires `on_change` —
+            // the same callback a keystroke fires, because the toolkit's
+            // whole point is that a script and a user take one path.
+            // Navigating on every change would therefore navigate on
+            // every letter: typing `/home/kaspar` would jump to `/home`
+            // at the fifth character and rewrite the field underneath the
+            // caret. Refusing to navigate at all would mean a path bar a
+            // script cannot drive, which the spec asks for by name.
+            //
+            // Focus is the honest discriminator, not a heuristic: a user
+            // typing has the caret in this field by definition, and a
+            // `set` from outside moves no focus (`Ui::action` runs the
+            // setter and nothing else). So the field navigates when it is
+            // written to from outside, and waits for Enter when it is
+            // being typed into.
+            .on_change(|s: &mut Files, ui: &mut Ui<Files>, text: &str| {
+                let Some(ids) = s.ids else { return };
+                if ui.focused() == Some(ids.path) {
+                    return;
+                }
+                let to = dir::resolve(text, &s.cwd.clone());
+                if to == s.cwd {
+                    return;
+                }
+                navigate(s, ui, to);
             }),
     );
     let up = ui.build(
