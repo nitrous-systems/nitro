@@ -140,7 +140,7 @@ fn pid_alive(pid: u32) -> bool {
 /// but becomes invisible and unreachable until it restarts. Keeping a ghost
 /// one round longer is the cheaper mistake.
 ///
-/// Deliberately not handled: `connect(2)` on AF_UNIX *blocks* against an app
+/// Deliberately not handled: `connect(2)` on `AF_UNIX` *blocks* against an app
 /// whose backlog is full, so one wedged app could hang every `hey`
 /// invocation — `prune` connects to every socket in the directory. See
 /// `docs/introspection.md`.

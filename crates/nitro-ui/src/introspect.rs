@@ -374,7 +374,7 @@ pub fn pid_alive(pid: u32) -> bool {
 /// toward keeping a ghost one round longer is already the principle
 /// [`sweep_dead`] documents for its pid-only check.
 ///
-/// One thing this deliberately does **not** handle: `connect(2)` on AF_UNIX
+/// One thing this deliberately does **not** handle: `connect(2)` on `AF_UNIX`
 /// *blocks* against a live-but-not-serving app whose backlog is full (128
 /// queued connections against a peer that has stopped calling `accept`), so
 /// one wedged app could hang a caller that walks the whole directory. The fix
