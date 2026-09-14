@@ -609,12 +609,42 @@ fn delete_asks_first_and_n_leaves_the_file_where_it_is() {
     let (root, dir) = fixture("confirm-no");
     write(&dir.join("notes.txt"), "still here");
     write(&dir.join("keep.txt"), "untouched");
+    // The guard that keeps this test honest. Everything below only
+    // exercises the type-ahead collision because the file's name begins
+    // with the letter that answers the question; rename the fixture to
+    // `list.txt` and every assertion still passes while the test has
+    // silently stopped testing anything. So state the premise.
+    const VICTIM: &str = "notes.txt";
+    assert!(
+        VICTIM.starts_with('n'),
+        "this test is about `n` being both an answer and a type-ahead prefix; \
+         a fixture whose name does not start with `n` makes it vacuous"
+    );
     let (mut h, ids) = app(&dir, &root.join("xdg"));
-    assert_eq!(names_of(&h, ids), ["keep.txt", "notes.txt"]);
+    assert_eq!(names_of(&h, ids), ["keep.txt", VICTIM]);
 
     // Select the file whose name starts with the answer.
+    //
+    // Guarded rather than assumed: this is a test of the
+    // confirm-versus-type-ahead conflict only while the selected row
+    // really does begin with the letter that answers the question. A
+    // future rename of the fixture to something not starting with `n`
+    // would leave every assertion below passing and the property
+    // untested, which is the quiet way a regression test stops being
+    // one.
     h.key(key::DOWN);
     h.settle();
+    let selected = h
+        .state()
+        .path_at(h.widget::<List<Files>>(ids.list).cursor())
+        .expect("a row under the cursor");
+    assert!(
+        selected
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with('n')),
+        "this test needs the selected row to start with `n`, the key that \
+         answers the prompt; it is {selected:?}"
+    );
     h.key(key::DELETE);
     h.settle();
     assert_eq!(
