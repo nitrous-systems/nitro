@@ -111,6 +111,14 @@ pub use layout::{
 };
 pub use list::{List, ListModel, Row, list};
 pub use nitro_core::{Color, Point, Rect, Size, Transform};
+// The semantic colour palette. `nitro_core::Role` is re-exported as
+// `ColorRole` because this crate already has a `Role` — the
+// *accessibility* role of a widget ([`widget::Role`]), which predates it
+// and is what `Widget::role` returns. Two unrelated things called `Role`
+// in one prelude would be a trap for every app that imported both, and
+// renaming the accessibility one would churn every widget in the tree for
+// the sake of the newer concept.
+pub use nitro_core::{Palette, Role as ColorRole, Scheme};
 pub use nitro_wire::types::Align;
 // A custom widget's `paint` takes a `Fill` ([`PaintCx::rect`]), so a
 // crate that writes one — `nitro-wallpaper`'s gradient backdrop is the

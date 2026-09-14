@@ -15,6 +15,7 @@
 //! | `plug WxH`           | `ok\n`; fake backend only — hotplugs an output in, for tests |
 //! | `unplug`             | `ok\n`; fake backend only — removes the last output          |
 //! | `focus`              | `ok\n`; focuses the topmost window, for tests                |
+//! | `theme`              | `ok <scheme> <serial>\n` + `role #rrggbb[aa]\n` lines + `\n` |
 //!
 //! This module only parses and formats; it never touches a socket.
 
@@ -64,6 +65,13 @@ pub enum Request {
     /// otherwise have to synthesise a click on some widget first, which
     /// changes the very state it is about to assert on.
     Focus,
+    /// Print the current colour scheme and every role's colour.
+    ///
+    /// Read-only, and the cheap way to answer "what colour is the
+    /// desktop actually using" without a client, a screenshot or a
+    /// `hey`: the palette is server state, so the server is the only
+    /// thing that can say.
+    Theme,
 }
 
 /// Parse one request line (without or with its trailing newline).
@@ -98,7 +106,8 @@ pub fn parse(line: &str) -> Result<Request, String> {
         ("quit", None) => Ok(Request::Quit),
         ("reload", None) => Ok(Request::Reload),
         ("focus", None) => Ok(Request::Focus),
-        ("outputs" | "stats" | "quit" | "reload" | "focus" | "unplug", Some(_)) => {
+        ("theme", None) => Ok(Request::Theme),
+        ("outputs" | "stats" | "quit" | "reload" | "focus" | "unplug" | "theme", Some(_)) => {
             Err(format!("`{cmd}` takes no argument"))
         }
         _ => Err(format!("unknown request `{cmd}`")),
@@ -211,6 +220,33 @@ pub fn stats_reply(pairs: &[(&str, u64)]) -> Vec<u8> {
     let mut s = String::from("ok\n");
     for (k, v) in pairs {
         let _ = writeln!(s, "{k} {v}");
+    }
+    s.push('\n');
+    s.into_bytes()
+}
+
+/// The `theme` reply: a status line naming the scheme and the palette's
+/// serial, then one `role #rrggbb[aa]` line per role, then a blank line.
+///
+/// The role names are [`Role::key`]'s, which are also the `server.conf`
+/// keys — so a line of this output, with `theme.` in front of it, *is*
+/// the configuration that would pin that colour. That is the point:
+/// reading a colour out and writing it back must not need a translation
+/// table.
+#[must_use]
+pub fn theme_reply(
+    scheme: nitro_core::Scheme,
+    serial: u32,
+    palette: &nitro_core::Palette,
+) -> Vec<u8> {
+    let mut s = format!("ok {} {serial}\n", scheme.name());
+    for (role, color) in palette.iter() {
+        let _ = writeln!(
+            s,
+            "{} {}",
+            role.key(),
+            nitro_core::palette::format_color(color)
+        );
     }
     s.push('\n');
     s.into_bytes()

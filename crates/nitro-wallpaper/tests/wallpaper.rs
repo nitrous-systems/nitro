@@ -12,7 +12,7 @@
 use nitro_core::Rect;
 use nitro_ui::shell::Surface;
 use nitro_ui::test::Harness;
-use nitro_ui::{Color, Size};
+use nitro_ui::{Color, ColorRole, Palette, Size};
 use nitro_wallpaper::{BACKDROP, Paint, Wallpaper, build_with, default_gradient, ppm};
 
 /// The harness's output size.
@@ -58,9 +58,13 @@ fn the_wallpaper_covers_the_whole_output() {
     // compositor's own background — except the bottom-right, where the
     // harness parks the pointer and the software cursor is composited
     // over whatever is underneath.
-    let Paint::Gradient(top, bottom) = default_gradient() else {
-        panic!("the default is a gradient");
-    };
+    // The two stops the *palette* names, since the gradient no longer
+    // owns any colours of its own.
+    let palette = Palette::default();
+    let (top, bottom) = (
+        palette.get(ColorRole::DesktopTop),
+        palette.get(ColorRole::DesktopBottom),
+    );
     for (x, y) in [(0, 0), (319, 0), (0, 239), (160, 120), (60, 200)] {
         let px = output_pixel(&h, x, y);
         assert_ne!(px, 0x0000_0000, "nothing at ({x}, {y})");

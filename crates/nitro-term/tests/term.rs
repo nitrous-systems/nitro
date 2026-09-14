@@ -20,7 +20,7 @@ use nitro_term::widget::{TermGrid, TermGridMut as _};
 use nitro_term::{GRID_NAME, TermApp};
 use nitro_ui::event::key;
 use nitro_ui::test::Harness;
-use nitro_ui::{Size, WidgetId};
+use nitro_ui::{ColorRole, Palette, Size, WidgetId};
 
 /// How long a test will wait for a shell to say something before giving
 /// up. Generous: a loaded CI box forks slowly, and a flaky timeout in a
@@ -44,7 +44,7 @@ fn harness_running(argv: &[&str]) -> (Harness<TermApp>, WidgetId) {
         "nitro-term",
         TermApp::new(pty),
         Some(Size::new(640.0, 400.0)),
-        nitro_term::term_theme(),
+        nitro_term::term_theme(&Palette::default()),
         nitro_term::build,
     );
     let grid = nitro_term::grid_of(h.ui()).expect("the grid");
@@ -384,7 +384,7 @@ fn the_window_backdrop_is_the_terminals_own_background() {
     // `Color::to_u32` packs RGBA, but a screenshot pixel is 0xAARRGGBB,
     // so the comparison is built from the components rather than by
     // masking one into the other.
-    let bg = nitro_term::theme::Palette::default().background;
+    let bg = Palette::default().get(ColorRole::TerminalBackground);
     let want = (u32::from(bg.r) << 16) | (u32::from(bg.g) << 8) | u32::from(bg.b);
     let shot = h.shot();
     // A point well away from the one glyph, in the middle of the window.

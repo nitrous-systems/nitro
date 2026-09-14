@@ -19,6 +19,9 @@
 //! keyboard.layout  = de
 //! keyboard.variant =
 //! keyboard.options = ctrl:nocaps
+//!
+//! theme.scheme = dark
+//! theme.accent = #6ca8f0
 //! ```
 //!
 //! # Why `key = value` and not TOML
@@ -53,6 +56,8 @@
 //! | output position | — | `output.<c>.position` | left-to-right in connector order |
 //! | primary output | — | `output.<c>.primary` | the first connector |
 //! | keyboard | `XKB_DEFAULT_*` | `keyboard.*` | the `us` layout |
+//! | colour scheme | — | `theme.scheme` | `light` |
+//! | one colour | — | `theme.<role>` | the scheme's value |
 //!
 //! The environment wins because it is the *development* channel — a
 //! `NITRO_SCALE=HDMI-A-1=2 just fake` must not be silently overridden by
@@ -61,6 +66,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+use nitro_core::{Palette, Role, Scheme, palette};
 
 /// The file's name inside the configuration directory.
 pub const FILE_NAME: &str = "server.conf";
@@ -125,6 +132,51 @@ impl KeyboardSettings {
     }
 }
 
+/// What the `theme.*` keys say.
+///
+/// A scheme plus a sparse list of per-role overrides, which is the whole
+/// shape of the "central switch" this file is for: `theme.scheme` moves
+/// every colour on the desktop at once, and a `theme.<role>` line moves
+/// exactly one and leaves the rest following the scheme.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ThemeSettings {
+    /// `theme.scheme`: `light` or `dark`. `None` means the file said
+    /// nothing, and the built-in default ([`Scheme::Light`]) applies.
+    pub scheme: Option<Scheme>,
+    /// `theme.<role>`: per-role `#rrggbb[aa]` overrides, applied on top
+    /// of the scheme in role order rather than file order, so two lines
+    /// for the same role resolve the same way a repeated `scale` does
+    /// (the last one wins, because it overwrote the entry).
+    pub overrides: Vec<(Role, nitro_core::Color)>,
+}
+
+impl ThemeSettings {
+    /// Whether the file says anything about colours.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.scheme.is_none() && self.overrides.is_empty()
+    }
+
+    /// The palette this section describes: the scheme, then the
+    /// overrides on top.
+    #[must_use]
+    pub fn palette(&self) -> Palette {
+        let mut p = self.scheme.unwrap_or_default().palette();
+        for (role, color) in &self.overrides {
+            p.set(*role, *color);
+        }
+        p
+    }
+
+    /// Record an override, replacing any earlier one for the same role.
+    fn set(&mut self, role: Role, color: nitro_core::Color) {
+        match self.overrides.iter_mut().find(|(r, _)| *r == role) {
+            Some(slot) => slot.1 = color,
+            None => self.overrides.push((role, color)),
+        }
+    }
+}
+
 /// A parsed `server.conf`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Settings {
@@ -132,6 +184,8 @@ pub struct Settings {
     pub outputs: HashMap<String, OutputSettings>,
     /// The keyboard section.
     pub keyboard: KeyboardSettings,
+    /// The colour section.
+    pub theme: ThemeSettings,
     /// Every line that was skipped, and why. The caller logs these; they
     /// are not errors, because a configuration file cannot be allowed to
     /// stop a running compositor.
@@ -167,7 +221,16 @@ impl Settings {
     /// entirely comments).
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.keyboard.is_empty() && self.outputs.values().all(OutputSettings::is_empty)
+        self.keyboard.is_empty()
+            && self.theme.is_empty()
+            && self.outputs.values().all(OutputSettings::is_empty)
+    }
+
+    /// The palette the file asks for: the scheme it names (or the
+    /// built-in default) with its per-role overrides applied.
+    #[must_use]
+    pub fn palette(&self) -> Palette {
+        self.theme.palette()
     }
 }
 
@@ -177,16 +240,46 @@ impl Settings {
 /// whitespace, so a value may contain one (`keyboard.options = foo#bar`)
 /// without being truncated — the rule every `.conf` in `/etc` uses, and the
 /// one that does not surprise someone pasting an xkb option string.
+///
+/// # The colour exception
+///
+/// `theme.accent = #6ca8f0` puts a `#` exactly where the rule above says
+/// a comment starts, and it is the spelling every person and every other
+/// program writes a colour in. So a `#` followed by **six or eight hex
+/// digits and then nothing but whitespace** is a value, not a comment.
+/// The alternatives were worse: demanding `accent = 6ca8f0` breaks
+/// copy-paste from anywhere colours are written, and recognising `#` only
+/// at the start of a line would silently swallow every trailing comment
+/// this file already documents.
+///
+/// A trailing comment still works after a colour (`= #6ca8f0  # blue`),
+/// because `# blue` is not hex digits. The one thing it costs is a
+/// comment whose entire text is six or eight hex characters —
+/// `scale = 2 #beefed` keeps the `#beefed`, which then fails to parse as
+/// a scale and is warned about. That is the price, and it is written
+/// down here because it is the kind of thing that is otherwise found
+/// once, by someone, at the worst moment.
 fn strip_comment(line: &str) -> &str {
     let bytes = line.as_bytes();
     let mut prev_space = true;
     for (i, b) in bytes.iter().enumerate() {
-        if *b == b'#' && prev_space {
+        if *b == b'#' && prev_space && !is_colour_literal(&line[i..]) {
             return &line[..i];
         }
         prev_space = b.is_ascii_whitespace();
     }
     line
+}
+
+/// Whether `rest` starts with a `#rrggbb`/`#rrggbbaa` **token** — a `#`,
+/// six or eight hex digits, and then whitespace or the end of the line.
+/// See [`strip_comment`].
+fn is_colour_literal(rest: &str) -> bool {
+    let token = rest.split_ascii_whitespace().next().unwrap_or("");
+    let Some(hex) = token.strip_prefix('#') else {
+        return false;
+    };
+    (hex.len() == 6 || hex.len() == 8) && hex.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Parse a `true`/`false` value, tolerating the spellings a person
@@ -278,6 +371,34 @@ pub fn parse(text: &str) -> Settings {
             }
             continue;
         }
+        // `theme.<role>` and `theme.scheme`. The role names are the
+        // `Role::key()` table in `nitro-core`, so there is exactly one
+        // list of them and a role added there is configurable the same
+        // day.
+        if let Some(field) = key.strip_prefix("theme.") {
+            if field == "scheme" {
+                match Scheme::from_name(value) {
+                    Some(s) => settings.theme.scheme = Some(s),
+                    None => settings.warnings.push(format!(
+                        "line {number}: scheme {value:?} is not `light` or `dark`"
+                    )),
+                }
+                continue;
+            }
+            let Some(role) = Role::from_key(field) else {
+                settings.warnings.push(format!(
+                    "line {number}: unknown colour role `{field}` (see docs/theme.md)"
+                ));
+                continue;
+            };
+            match palette::parse_color(value) {
+                Some(c) => settings.theme.set(role, c),
+                None => settings.warnings.push(format!(
+                    "line {number}: colour {value:?} is not `#rrggbb` or `#rrggbbaa`"
+                )),
+            }
+            continue;
+        }
         match key {
             "keyboard.layout" => settings.keyboard.layout = Some(value.to_owned()),
             "keyboard.variant" => settings.keyboard.variant = Some(value.to_owned()),
@@ -355,6 +476,129 @@ pub fn load(path: &Path) -> Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_colour_literal_survives_the_comment_rule() {
+        // `#rrggbb` is where a `#` is a value, not a comment. See
+        // `strip_comment`.
+        let s = parse("theme.accent = #6ca8f0  # the dark scheme's blue\n");
+        assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+        assert_eq!(
+            s.palette().get(Role::Accent),
+            nitro_core::Color::rgb(0x6c, 0xa8, 0xf0)
+        );
+        // Eight digits too, and with no trailing comment.
+        let s = parse("theme.modal_background = #08090cb0\n");
+        assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+        assert_eq!(
+            s.palette().get(Role::ModalBackground),
+            nitro_core::Color::rgba(0x08, 0x09, 0x0c, 0xb0)
+        );
+        // A comment that is *not* hex is still a comment, and a
+        // whole-line comment still is one whatever it contains.
+        assert!(parse("# theme.accent = #ff0000\n").is_empty());
+        let s = parse("theme.accent = #ff0000 # was #00ff00 last week\n");
+        assert_eq!(
+            s.palette().get(Role::Accent),
+            nitro_core::Color::rgb(0xff, 0, 0)
+        );
+    }
+
+    #[test]
+    fn the_theme_section_parses() {
+        let s = parse(
+            "theme.scheme = dark\n\
+             theme.accent = #6ca8f0\n\
+             theme.modal_background = #0809 0c\n\
+             theme.ansi1 = cc333c\n",
+        );
+        assert_eq!(s.theme.scheme, Some(Scheme::Dark));
+        // The bad line is a warning, and only that line is lost.
+        assert_eq!(s.warnings.len(), 1, "{:?}", s.warnings);
+        let p = s.palette();
+        assert_eq!(
+            p.get(Role::Accent),
+            nitro_core::Color::rgb(0x6c, 0xa8, 0xf0)
+        );
+        assert_eq!(p.get(Role::Ansi1), nitro_core::Color::rgb(0xcc, 0x33, 0x3c));
+        // Everything not overridden follows the scheme.
+        assert_eq!(p.get(Role::Text), Palette::dark().get(Role::Text));
+        assert_eq!(
+            p.get(Role::ModalBackground),
+            Palette::dark().get(Role::ModalBackground)
+        );
+        assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn no_theme_section_is_the_light_scheme() {
+        // The documented default, and the one every screenshot in
+        // `docs/` was taken on.
+        let s = parse("keyboard.layout = de\n");
+        assert_eq!(s.theme.scheme, None);
+        assert_eq!(s.palette(), Palette::light());
+        assert!(s.theme.is_empty());
+        assert_eq!(Settings::default().palette(), Palette::light());
+    }
+
+    #[test]
+    fn an_override_survives_a_scheme_change_and_the_last_one_wins() {
+        // Order-independence: the override applies on top of whatever
+        // scheme the file names, wherever the two lines sit.
+        let s = parse("theme.accent = #ff0000\ntheme.scheme = dark\n");
+        assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+        assert_eq!(
+            s.palette().get(Role::Accent),
+            nitro_core::Color::rgb(255, 0, 0)
+        );
+        assert_eq!(s.palette().get(Role::Text), Palette::dark().get(Role::Text));
+        let s = parse("theme.accent = #ff0000\ntheme.accent = #00ff00\n");
+        assert_eq!(s.theme.overrides.len(), 1);
+        assert_eq!(
+            s.palette().get(Role::Accent),
+            nitro_core::Color::rgb(0, 255, 0)
+        );
+    }
+
+    #[test]
+    fn a_malformed_colour_or_scheme_is_warned_and_ignored() {
+        for (text, role) in [
+            ("theme.accent = blue\n", Role::Accent),
+            ("theme.accent = #ff88\n", Role::Accent),
+            ("theme.accent =\n", Role::Accent),
+            ("theme.ansi1 = ##cc333c\n", Role::Ansi1),
+        ] {
+            let s = parse(text);
+            assert_eq!(s.warnings.len(), 1, "{text:?}");
+            assert!(s.theme.overrides.is_empty(), "{text:?}");
+            assert_eq!(s.palette().get(role), Palette::light().get(role));
+        }
+        let s = parse("theme.scheme = solarized\n");
+        assert_eq!(s.warnings.len(), 1);
+        assert_eq!(s.theme.scheme, None);
+        // A key that names no role at all says so, rather than reading as
+        // a generic "unknown key".
+        let s = parse("theme.chartreuse = #ff0000\n");
+        assert_eq!(s.warnings.len(), 1);
+        assert!(s.warnings[0].contains("colour role"), "{:?}", s.warnings);
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn every_role_is_configurable_by_its_key() {
+        // The table in `nitro-core` and the parser cannot drift: a role
+        // added there is settable here the same day, or this fails.
+        for role in Role::ALL {
+            let s = parse(&format!("theme.{} = #010203\n", role.key()));
+            assert!(s.warnings.is_empty(), "{}: {:?}", role.key(), s.warnings);
+            assert_eq!(
+                s.palette().get(*role),
+                nitro_core::Color::rgb(1, 2, 3),
+                "{}",
+                role.key()
+            );
+        }
+    }
 
     #[test]
     fn the_documented_example_parses() {
@@ -439,6 +683,14 @@ mod tests {
             "\0\0\0",
             "key = \u{1f4a9}",
             "output.X.scale = 1 = 2",
+            "theme",
+            "theme.",
+            "theme.=1",
+            "theme. = #ff0000",
+            "theme.scheme",
+            "theme.scheme =",
+            "theme.accent = #",
+            "theme.accent = \u{1f4a9}\u{1f4a9}\u{1f4a9}",
         ] {
             let s = parse(text);
             // Whatever it decided, it decided without panicking; and a line

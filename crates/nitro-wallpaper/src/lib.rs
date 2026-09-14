@@ -54,8 +54,8 @@ use nitro_ui::build::{Built, IntoWidget, StyleBuilder};
 use nitro_ui::shell::Surface;
 use nitro_ui::widgets::{column, image};
 use nitro_ui::{
-    App, Color, Constraints, Error, Fill, MeasureCx, PaintCx, Point, Role, Size, Ui, Widget,
-    WidgetId,
+    App, Color, ColorRole, Constraints, Error, Fill, MeasureCx, PaintCx, Palette, Point, Role,
+    Size, Ui, Widget, WidgetId,
 };
 
 /// The name the wallpaper registers under, and so the first argument to
@@ -68,24 +68,30 @@ pub const BACKDROP: &str = "backdrop";
 /// What the wallpaper paints.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Paint {
-    /// A vertical gradient between two colours: the default.
-    Gradient(Color, Color),
-    /// One colour everywhere.
+    /// A vertical gradient between the desktop roles: the default.
+    ///
+    /// Carries no colours, because it does not own any: the two stops
+    /// are [`ColorRole::DesktopTop`] and [`ColorRole::DesktopBottom`],
+    /// read at paint time from whatever palette the server last pushed.
+    /// That is what makes `theme.scheme = dark` change the wallpaper as
+    /// well as everything on top of it — and it is why this variant is a
+    /// unit variant where `Solid` is not: `--color` is the user
+    /// overriding the desktop, and an override *is* a literal colour.
+    Gradient,
+    /// One colour everywhere, from `--color`.
     Solid(Color),
     /// An image, stretched to the output.
     Image(ppm::Pixels),
 }
 
-/// The default gradient: a dark blue-grey, lighter at the top.
+/// The themed gradient: the desktop roles, whatever they currently are.
 ///
-/// Dark rather than bright, because a wallpaper is behind everything else
-/// for the whole session and a bright backdrop makes every window edge
-/// and every panel border harder to see. The two colours are close
-/// together on purpose: a gradient you can *see* as a gradient is a
-/// gradient you get tired of.
+/// A function rather than a constant so the call sites read the same as
+/// they did when it *was* two colours, and so there is one name to grep
+/// for "what does a bare `nitro-wallpaper` paint".
 #[must_use]
 pub fn default_gradient() -> Paint {
-    Paint::Gradient(Color::rgb(0x2a, 0x30, 0x3c), Color::rgb(0x15, 0x18, 0x20))
+    Paint::Gradient
 }
 
 /// What the command line asked for.
@@ -176,13 +182,14 @@ pub fn parse_color(s: &str) -> Result<Color, String> {
 /// A custom widget rather than a `Panel`, because a `Panel`'s background
 /// is one solid colour and a gradient is the default. It is also the
 /// smallest possible example of writing one: a `measure` that takes
-/// whatever it is offered, and a `paint` that emits a single node.
+/// whatever it is offered, and a `paint` that emits a single node — and
+/// of reading colours from *roles* rather than owning them, which is why
+/// the gradient case stores nothing at all.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Backdrop {
-    /// The two gradient stops, or the one solid colour twice.
-    top: Color,
-    bottom: Color,
-    gradient: bool,
+    /// The one solid colour, when there is one. `None` is the themed
+    /// gradient, whose stops come from the palette at paint time.
+    solid: Option<Color>,
 }
 
 impl Backdrop {
@@ -195,34 +202,24 @@ impl Backdrop {
     #[must_use]
     pub fn new(paint: &Paint) -> Self {
         match paint {
-            Paint::Gradient(top, bottom) => Self {
-                top: *top,
-                bottom: *bottom,
-                gradient: true,
-            },
-            Paint::Solid(c) => Self {
-                top: *c,
-                bottom: *c,
-                gradient: false,
-            },
+            Paint::Gradient => Self { solid: None },
+            Paint::Solid(c) => Self { solid: Some(*c) },
             // An image is a different widget; black is what this would
             // paint if one were somehow asked for here, and black is the
             // right "something went wrong" for a backdrop.
             Paint::Image(_) => Self {
-                top: Color::BLACK,
-                bottom: Color::BLACK,
-                gradient: false,
+                solid: Some(Color::BLACK),
             },
         }
     }
 
-    /// The fill it would paint at `height`. Public for the tests, which
-    /// assert on the fill rather than only on pixels — a gradient that
-    /// came out as a solid colour still covers the screen.
+    /// The fill it would paint at `height` under `palette`. Public for
+    /// the tests, which assert on the fill rather than only on pixels — a
+    /// gradient that came out as a solid colour still covers the screen.
     #[must_use]
-    pub fn fill_at(&self, height: f32) -> Fill {
-        if !self.gradient {
-            return Fill::Solid(self.top);
+    pub fn fill_at(&self, height: f32, palette: &Palette) -> Fill {
+        if let Some(c) = self.solid {
+            return Fill::Solid(c);
         }
         Fill::Linear {
             // In the **node's own** space, from its top edge to its
@@ -231,8 +228,8 @@ impl Backdrop {
             // caused and nothing more.
             start: Point::new(0.0, 0.0),
             end: Point::new(0.0, height),
-            c0: self.top,
-            c1: self.bottom,
+            c0: palette.get(ColorRole::DesktopTop),
+            c1: palette.get(ColorRole::DesktopBottom),
         }
     }
 }
@@ -246,7 +243,7 @@ impl<S: 'static> Widget<S> for Backdrop {
 
     fn paint(&mut self, cx: &mut PaintCx<'_, S>) {
         let bounds = cx.bounds;
-        let fill = self.fill_at(bounds.h);
+        let fill = self.fill_at(bounds.h, cx.palette());
         cx.rect(0, bounds, fill, 0.0, (0.0, Color::TRANSPARENT));
     }
 
@@ -321,7 +318,7 @@ impl Wallpaper {
     #[must_use]
     pub fn new(paint: &Paint) -> Self {
         let kind = match paint {
-            Paint::Gradient(..) => Kind::Gradient,
+            Paint::Gradient => Kind::Gradient,
             Paint::Solid(_) => Kind::Solid,
             Paint::Image(px) => Kind::Image(px.width, px.height),
         };
@@ -450,7 +447,7 @@ mod tests {
     fn no_arguments_is_the_themed_gradient() {
         let o = parse_args(&[], no_files).expect("the default");
         assert_eq!(o.paint, default_gradient());
-        assert!(matches!(o.paint, Paint::Gradient(..)));
+        assert!(matches!(o.paint, Paint::Gradient));
     }
 
     #[test]
@@ -553,7 +550,7 @@ mod tests {
         // would have to be re-sent by the client on every mode change,
         // and the wallpaper's whole claim is that it sends nothing.
         let b = Backdrop::new(&default_gradient());
-        let Fill::Linear { start, end, c0, c1 } = b.fill_at(1080.0) else {
+        let Fill::Linear { start, end, c0, c1 } = b.fill_at(1080.0, &Palette::default()) else {
             panic!("the default is a gradient");
         };
         assert_eq!(start, Point::new(0.0, 0.0));
@@ -561,7 +558,7 @@ mod tests {
         assert_ne!(c0, c1, "two distinguishable stops");
         // And it follows the node: a taller window gets a taller
         // gradient, not a stretched copy of a short one.
-        let Fill::Linear { end, .. } = b.fill_at(240.0) else {
+        let Fill::Linear { end, .. } = b.fill_at(240.0, &Palette::default()) else {
             panic!("still a gradient");
         };
         assert_eq!(end, Point::new(0.0, 240.0));
@@ -571,7 +568,10 @@ mod tests {
     fn a_solid_colour_is_a_solid_fill_at_any_size() {
         let b = Backdrop::new(&Paint::Solid(Color::rgb(1, 2, 3)));
         for h in [1.0, 240.0, 4096.0] {
-            assert_eq!(b.fill_at(h), Fill::Solid(Color::rgb(1, 2, 3)));
+            assert_eq!(
+                b.fill_at(h, &Palette::default()),
+                Fill::Solid(Color::rgb(1, 2, 3))
+            );
         }
     }
 }

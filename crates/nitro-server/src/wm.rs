@@ -26,7 +26,7 @@
 //! What is *not* here: workspaces, cursor shapes and a persistent
 //! multi-output layout. See `docs/wm.md`.
 
-use nitro_core::{Color, Point, Rect, Size};
+use nitro_core::{Color, Palette, Point, Rect, Role, Size};
 use nitro_scene::{ClientId, Insets, Layer, OutputId, Scene, WindowKey};
 
 /// Title-bar height in logical pixels.
@@ -53,26 +53,14 @@ pub fn frame_insets() -> Insets {
     Insets::new(BORDER, TITLE_H, BORDER, BORDER)
 }
 
-/// Colours of the frame, focused and unfocused.
+/// Non-colour constants of the frame's look.
+///
+/// The colours used to live here as `const`s and now come from the
+/// server's [`Palette`] — `TitleBarActive`, `WindowBorderInactive` and
+/// the rest — so that the user's `theme.scheme` reaches the decorations
+/// like it reaches everything else. What is left is the one number that
+/// is a *metric*, not a colour, and so is not a palette role.
 pub mod theme {
-    use nitro_core::Color;
-
-    /// Title bar of the focused window.
-    pub const BAR_ACTIVE: Color = Color::rgb(0x2C, 0x3E, 0x55);
-    /// Title bar of an unfocused window.
-    pub const BAR_INACTIVE: Color = Color::rgb(0x23, 0x2A, 0x33);
-    /// Border of the focused window.
-    pub const BORDER_ACTIVE: Color = Color::rgb(0x5A, 0x8D, 0xC8);
-    /// Border of an unfocused window.
-    pub const BORDER_INACTIVE: Color = Color::rgb(0x3A, 0x42, 0x4C);
-    /// Title text of the focused window.
-    pub const TITLE_ACTIVE: Color = Color::rgb(0xF0, 0xF4, 0xF8);
-    /// Title text of an unfocused window.
-    pub const TITLE_INACTIVE: Color = Color::rgb(0x9A, 0xA4, 0xB0);
-    /// The close button.
-    pub const CLOSE: Color = Color::rgb(0xD9, 0x5B, 0x4E);
-    /// The maximize button.
-    pub const MAXIMIZE: Color = Color::rgb(0x62, 0xA8, 0x5C);
     /// Title font size in logical pixels.
     pub const TITLE_SIZE_PX: f32 = 13.0;
 }
@@ -608,6 +596,7 @@ pub fn build_frame(
     scene: &mut Scene,
     win: WindowKey,
     fixed: bool,
+    palette: &Palette,
 ) -> Result<FrameNodes, nitro_scene::Error> {
     let root = scene.window_info(win)?.root();
     let content = scene.window_info(win)?.content();
@@ -627,9 +616,17 @@ pub fn build_frame(
     if let Some(m) = maximize {
         scene.set_corner_radius(s, m, BUTTON / 2.0)?;
     }
-    scene.set_fill(s, close, nitro_scene::Fill::Solid(theme::CLOSE))?;
+    scene.set_fill(
+        s,
+        close,
+        nitro_scene::Fill::Solid(palette.get(Role::TitleClose)),
+    )?;
     if let Some(m) = maximize {
-        scene.set_fill(s, m, nitro_scene::Fill::Solid(theme::MAXIMIZE))?;
+        scene.set_fill(
+            s,
+            m,
+            nitro_scene::Fill::Solid(palette.get(Role::TitleMaximize)),
+        )?;
     }
     let nodes = FrameNodes {
         root,
@@ -694,7 +691,12 @@ pub fn layout_frame(
 /// descender of the 13 px face without measuring it.
 pub const TITLE_SIZE_LINE: f32 = 18.0;
 
-/// Restyle a frame for its focus state.
+/// Restyle a frame for its focus state and the current palette.
+///
+/// Every colour a decoration has is set here — including the two button
+/// faces, which do not depend on focus but do depend on the palette — so
+/// that a `theme.scheme` change is one call per frame and needs no second
+/// path for "the colours moved but the focus did not".
 ///
 /// # Errors
 /// Anything the scene refuses.
@@ -702,12 +704,19 @@ pub fn style_frame(
     scene: &mut Scene,
     nodes: &FrameNodes,
     focused: bool,
+    palette: &Palette,
 ) -> Result<(), nitro_scene::Error> {
     let s = ClientId::SERVER;
     let (bar, border) = if focused {
-        (theme::BAR_ACTIVE, theme::BORDER_ACTIVE)
+        (
+            palette.get(Role::TitleBarActive),
+            palette.get(Role::WindowBorderActive),
+        )
     } else {
-        (theme::BAR_INACTIVE, theme::BORDER_INACTIVE)
+        (
+            palette.get(Role::TitleBarInactive),
+            palette.get(Role::WindowBorderInactive),
+        )
     };
     scene.set_fill(s, nodes.background, nitro_scene::Fill::Solid(bar))?;
     scene.set_border(
@@ -716,16 +725,28 @@ pub fn style_frame(
         Some(nitro_scene::Border::new(BORDER, border)),
     )?;
     scene.set_fill(s, nodes.bar, nitro_scene::Fill::Solid(bar))?;
+    scene.set_fill(
+        s,
+        nodes.close,
+        nitro_scene::Fill::Solid(palette.get(Role::TitleClose)),
+    )?;
+    if let Some(m) = nodes.maximize {
+        scene.set_fill(
+            s,
+            m,
+            nitro_scene::Fill::Solid(palette.get(Role::TitleMaximize)),
+        )?;
+    }
     Ok(())
 }
 
 /// The title colour for a focus state.
 #[must_use]
-pub fn title_color(focused: bool) -> Color {
+pub fn title_color(focused: bool, palette: &Palette) -> Color {
     if focused {
-        theme::TITLE_ACTIVE
+        palette.get(Role::TitleTextActive)
     } else {
-        theme::TITLE_INACTIVE
+        palette.get(Role::TitleTextInactive)
     }
 }
 

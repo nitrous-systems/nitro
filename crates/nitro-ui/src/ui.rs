@@ -136,6 +136,12 @@ pub struct Ui<S> {
     arena: Arena<S>,
     root: Option<WidgetId>,
     theme: Theme,
+    /// The colours the server pushed, which `theme` is a view on.
+    ///
+    /// Held whole rather than only as the `Theme` projection, because a
+    /// custom widget — the terminal grid, the bar's clock — reads roles
+    /// the built-in widgets have no field for.
+    palette: nitro_core::Palette,
     wire: Wire,
     window_open: bool,
     window_size: Size,
@@ -234,6 +240,9 @@ pub struct Ui<S> {
     /// handler is handed `&mut Ui<S>`, so it must not be reachable
     /// through the tree it is holding.
     resize_handlers: Vec<Option<ResizeHandler<S>>>,
+    /// Palette-change handlers, in registration order; see
+    /// [`Ui::on_theme`]. `Option` for the same reason the others are.
+    theme_handlers: Vec<Option<ThemeHandler<S>>>,
     /// Whether a `RequestFrame` is outstanding, so asking twice in one
     /// turn does not put two requests on the wire.
     frame_requested: bool,
@@ -253,6 +262,9 @@ type FrameHandler<S> = Box<dyn FnMut(&mut S, &mut Ui<S>, Frame)>;
 
 /// A window-resize handler; see [`Ui::on_resize`].
 type ResizeHandler<S> = Box<dyn FnMut(&mut S, &mut Ui<S>, Size)>;
+
+/// A palette-change handler; see [`Ui::on_theme`].
+type ThemeHandler<S> = Box<dyn FnMut(&mut S, &mut Ui<S>)>;
 
 /// What the server says when it answers a [`Ui::request_frame`].
 ///
@@ -307,6 +319,7 @@ impl<S: 'static> Ui<S> {
             arena: Arena::default(),
             root: None,
             theme,
+            palette: nitro_core::Palette::default(),
             wire: Wire::new(conn),
             window_open: false,
             window_size: Size::ZERO,
@@ -336,6 +349,7 @@ impl<S: 'static> Ui<S> {
             shell_handlers: Vec::new(),
             frame_handlers: Vec::new(),
             resize_handlers: Vec::new(),
+            theme_handlers: Vec::new(),
             frame_requested: false,
             window_title: String::new(),
             window_limits: None,
@@ -506,6 +520,10 @@ impl<S: 'static> Ui<S> {
     }
 
     /// Replace the theme and repaint everything.
+    ///
+    /// Apps do not normally call this: colours come from the server (see
+    /// [`Ui::set_palette`]). It stays for tests and for the app that
+    /// really does want its own metrics.
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
         // The backdrop is not a widget, so no widget's repaint covers it.
@@ -514,6 +532,40 @@ impl<S: 'static> Ui<S> {
         for id in ids {
             self.mark(id, Dirty::LAYOUT | Dirty::PAINT);
         }
+    }
+
+    /// The desktop's colours, as the server last pushed them.
+    #[must_use]
+    pub fn palette(&self) -> &nitro_core::Palette {
+        &self.palette
+    }
+
+    /// The colour of one [`Role`](nitro_core::Role).
+    ///
+    /// What a custom widget uses instead of writing a colour down: the
+    /// terminal grid asks for `Role::Ansi1`, the bar for `Role::TextDim`.
+    /// A role that does not exist yet is added to `nitro_core::palette`,
+    /// not worked around — see `docs/theme.md`.
+    #[must_use]
+    pub fn color(&self, role: nitro_core::Role) -> nitro_core::Color {
+        self.palette.get(role)
+    }
+
+    /// Adopt a palette the server pushed: re-derive the theme from it,
+    /// keeping this app's own metrics, and mark everything for repaint.
+    ///
+    /// The repaint is exactly one commit, because marking is not
+    /// sending: every widget is flagged here and the next
+    /// [`Ui::flush`] turns the whole lot into one transaction. An
+    /// unchanged palette is dropped without marking anything, so a
+    /// server that re-sends its palette costs a settled app nothing.
+    pub fn set_palette(&mut self, palette: nitro_core::Palette) {
+        if palette == self.palette {
+            return;
+        }
+        self.palette = palette;
+        let theme = self.theme.with_palette(&self.palette);
+        self.set_theme(theme);
     }
 
     /// A widget's children, in paint order.
@@ -1397,6 +1449,43 @@ impl<S: 'static> Ui<S> {
         }
     }
 
+    /// Register a handler called after the server pushed a new palette.
+    ///
+    /// The tree has already been re-themed and marked for repaint by the
+    /// time a handler runs, so a handler is only for what the framework
+    /// *cannot* know: a widget holding derived pixels — `nitro-term`'s
+    /// grid caches per-cell colours — has to rebuild them, and an app
+    /// that painted into an image buffer has to repaint it.
+    ///
+    /// A list rather than a widget hook, for the same reason
+    /// [`Ui::on_resize`] is: a palette is news about the *desktop*, with
+    /// no position to hit-test and no focus to follow.
+    pub fn on_theme(&mut self, handler: impl FnMut(&mut S, &mut Ui<S>) + 'static) {
+        self.theme_handlers.push(Some(Box::new(handler)));
+    }
+
+    /// How many theme handlers are registered.
+    #[must_use]
+    pub fn theme_handler_count(&self) -> usize {
+        self.theme_handlers.len()
+    }
+
+    /// Tell the theme handlers the palette moved, oldest first.
+    ///
+    /// Public for the same reason [`Ui::dispatch_resize`] is: a test and
+    /// an app driving `Ui` by hand dispatch messages themselves.
+    pub fn dispatch_theme(&mut self, state: &mut S) {
+        for i in 0..self.theme_handlers.len() {
+            let Some(mut h) = self.theme_handlers.get_mut(i).and_then(Option::take) else {
+                continue;
+            };
+            h(state, self);
+            if let Some(slot) = self.theme_handlers.get_mut(i) {
+                *slot = Some(h);
+            }
+        }
+    }
+
     /// Open this window as a shell surface: a bar, dock, launcher or
     /// wallpaper rather than an ordinary application window.
     ///
@@ -1926,6 +2015,14 @@ impl<S: 'static> Ui<S> {
                 }
             }
             ServerMsg::Closed(_) => self.quit = true,
+            // The desktop's colours changed (or arrived for the first
+            // time, right behind the `Welcome`). Not routed to a widget:
+            // every widget is affected, so this marks the whole tree and
+            // the next flush pays for it once.
+            ServerMsg::Theme(t) => {
+                self.set_palette(t.palette());
+                self.dispatch_theme(state);
+            }
             ServerMsg::PointerEnter(e) => self.pointer_move(state, e.pos),
             ServerMsg::PointerMotion(e) => self.pointer_move(state, e.pos),
             ServerMsg::PointerLeave(_) => self.pointer_leave(state),

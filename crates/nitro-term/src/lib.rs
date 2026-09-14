@@ -81,13 +81,12 @@
 pub mod grid;
 pub mod keys;
 pub mod pty;
-pub mod theme;
 pub mod vt;
 pub mod widget;
 
 use nitro_ui::build::StyleBuilder as _;
 use nitro_ui::event::{Handled, KeyEvent, mods};
-use nitro_ui::{App, Error, Size, Ui, WidgetId};
+use nitro_ui::{App, ColorRole, Error, Palette, Size, Ui, WidgetId};
 
 use crate::pty::Pty;
 use crate::widget::{TermGrid, TermGridMut as _};
@@ -412,6 +411,21 @@ pub fn install(ui: &mut Ui<TermApp>, state: &mut TermApp, grid: WidgetId) -> Res
     // stays wrong, which is exactly the state this app was in until a
     // review caught that only the *test* called `sync_size`.
     ui.on_resize(|s: &mut TermApp, ui: &mut Ui<TermApp>, _size| sync_size(s, ui));
+    // The desktop's colours changed. The toolkit re-themed the tree
+    // already, but the grid's own colour table is a *different* table —
+    // the sixteen ANSI colours and the terminal's own default
+    // background — so it has to be handed the new palette and the
+    // window's backdrop re-pointed at `TerminalBackground`. Without
+    // this a `theme.scheme = dark` would leave the grid painting light
+    // text on a dark window, which is the one combination worse than
+    // either scheme.
+    ui.on_theme(move |_s: &mut TermApp, ui: &mut Ui<TermApp>| {
+        let palette = *ui.palette();
+        ui.set_theme(term_theme(&palette));
+        if let Ok(mut g) = ui.widget_mut::<TermGrid>(grid) {
+            g.set_palette(palette);
+        }
+    });
     // Ctrl-Shift-Q, not Ctrl-Q: a terminal must not steal a chord the
     // program inside it might want, and Ctrl-Q is XON.
     ui.set_shortcut(
@@ -461,16 +475,16 @@ pub fn run() -> Result<(), Error> {
         .title(APP_NAME)
         .size(Size::new(720.0, 420.0))
         // The window's backdrop has to be the terminal's *own* default
-        // background, and this line is what makes that true. The widget
-        // paints no rect for a run whose background is the default
-        // (`TermGrid::bg_of` answers `None`) precisely because the
-        // backdrop is already that colour — which is most of the screen,
-        // and the reason ordinary text costs one node per run instead of
-        // two. Without this the toolkit's light `#f2f2f2` shows through
-        // and the palette's light-on-dark ANSI colours are illegible on
-        // it, which is exactly what a screenshot of a bare shell prompt
-        // showed on the box.
-        .theme(term_theme())
+        // background, and `term_theme` is what makes that true. The
+        // widget paints no rect for a run whose background is the
+        // default (`TermGrid::bg_of` answers `None`) precisely because
+        // the backdrop is already that colour — which is most of the
+        // screen, and the reason ordinary text costs one node per run
+        // instead of two. Without it the toolkit's window background
+        // shows through and the ANSI colours are illegible on it, which
+        // is exactly what a screenshot of a bare shell prompt showed on
+        // the box.
+        .theme(term_theme(&Palette::default()))
         .build(build)?;
     let grid = grid_of(&ui).ok_or(Error::NoRoot)?;
     install(&mut ui, &mut state, grid)?;
@@ -483,20 +497,24 @@ pub fn run() -> Result<(), Error> {
     nitro_ui::app::event_loop_with(&mut ui, &mut state, socket)
 }
 
-/// The toolkit theme a terminal window wants: the default one, with its
-/// background replaced by the palette's.
+/// The toolkit theme a terminal window wants: the palette's, with the
+/// *terminal's* background and foreground rather than the window's.
 ///
-/// Only `background` matters — it is what [`Ui`] paints the window
-/// backdrop with, and the grid's default-background runs rely on it
-/// being their colour. The rest of the theme describes buttons and
+/// Only those two matter — the background is what [`Ui`] paints the
+/// window backdrop with, and the grid's default-background runs rely on
+/// it being their colour. The rest of the theme describes buttons and
 /// fields, of which a terminal has none.
+///
+/// It is the one place an app deliberately overrides a role mapping, and
+/// it is legitimate: `TerminalBackground` exists precisely because a
+/// terminal's canvas is not a window background. Both come from the
+/// palette, so a scheme change still moves both.
 #[must_use]
-pub fn term_theme() -> nitro_ui::Theme {
-    let palette = crate::theme::Palette::default();
+pub fn term_theme(palette: &Palette) -> nitro_ui::Theme {
     nitro_ui::Theme {
-        background: palette.background,
-        text: palette.foreground,
-        ..nitro_ui::Theme::default()
+        background: palette.get(ColorRole::TerminalBackground),
+        text: palette.get(ColorRole::TerminalText),
+        ..nitro_ui::Theme::from_palette(palette)
     }
 }
 

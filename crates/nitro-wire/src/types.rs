@@ -314,6 +314,17 @@ pub mod caps {
     /// A privilege is granted by *which socket* a client connected to, and
     /// this bit is only how the server reports the grant.
     pub const SHELL: u32 = 1 << 5;
+    /// The server owns the colour palette and pushes it: the client will
+    /// receive a [`Theme`](crate::msg::Theme) right after its
+    /// [`Welcome`](crate::msg::Welcome), and another one every time the
+    /// palette changes (M4).
+    ///
+    /// A client that sees this bit must **not** hard-code colours: the
+    /// user's light/dark switch and every per-role override in
+    /// `server.conf` arrive through that message and nowhere else. A
+    /// client that does not understand the bit keeps its built-in
+    /// defaults, which is why the message is behind a bit at all.
+    pub const THEME: u32 = 1 << 6;
 }
 
 /// Modifier mask for [`BindKey`](crate::msg::BindKey), by *name*.
@@ -422,6 +433,18 @@ mod tests {
         assert_eq!(format::AR24, 0x3432_5241);
         assert_eq!(caps::WM, 0x10);
         assert_eq!(caps::SHELL, 0x20);
+        assert_eq!(caps::THEME, 0x40);
+        // A new bit, not a reuse of any taken one.
+        assert_eq!(
+            caps::THEME
+                & (caps::DIRECT_SCANOUT
+                    | caps::TEXT
+                    | caps::DMABUF
+                    | caps::REMOTE
+                    | caps::WM
+                    | caps::SHELL),
+            0
+        );
         // The shell bit is a *new* bit, not a reuse of `REMOTE`.
         assert_eq!(caps::SHELL & caps::REMOTE, 0);
         assert_eq!(mod_mask::ALL, 0b1111);

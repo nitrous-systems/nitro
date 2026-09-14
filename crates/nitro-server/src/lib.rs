@@ -455,15 +455,29 @@ impl ConfigWatch {
         let fd = inotify::init(inotify::CreateFlags::CLOEXEC | inotify::CreateFlags::NONBLOCK)?;
         // `CLOSE_WRITE` catches an in-place overwrite, `MOVED_TO` the
         // atomic rename, `CREATE` the first appearance of a file that was
-        // not there when the server started. `DELETE` is deliberately not
-        // watched: a file that goes away leaves the last configuration in
-        // force, which is what a half-finished `mv` should do.
+        // not there when the server started, and `DELETE`/`MOVED_FROM`
+        // its removal.
+        //
+        // Watching the removal is not obvious and was originally left
+        // out, on the theory that a file that goes away should leave the
+        // last configuration in force so a half-finished `mv` does not
+        // flicker the desktop. That was wrong, and issue #558 is what it
+        // cost: `rm ~/.config/nitro/server.conf` is the documented way to
+        // get back to defaults, and without these flags a `theme.scheme`
+        // or a `keyboard.layout` from a file that no longer exists stayed
+        // in force until something else triggered a reload. A `mv`'s
+        // intermediate state is answered by the reload path instead,
+        // which reads whatever is on disk *now*: the `MOVED_TO` of the
+        // replacement arrives in the same drain as the `MOVED_FROM` of
+        // the original, so the pair costs one reload, not two.
         inotify::add_watch(
             &fd,
             dir,
             inotify::WatchFlags::CLOSE_WRITE
                 | inotify::WatchFlags::MOVED_TO
-                | inotify::WatchFlags::CREATE,
+                | inotify::WatchFlags::CREATE
+                | inotify::WatchFlags::DELETE
+                | inotify::WatchFlags::MOVED_FROM,
         )?;
         Ok(Self { fd, file_name })
     }
@@ -576,6 +590,17 @@ struct Server {
     /// when there is no file, which is what makes every rule below read
     /// the same whether a file exists or not.
     settings: config::Settings,
+    /// The desktop's colours, derived from `settings.theme`: the scheme
+    /// it names with its per-role overrides on top.
+    ///
+    /// Held rather than re-derived per use because it is read on every
+    /// decoration restyle and sent to every client that connects, and
+    /// because the *identity* of the current palette is what decides
+    /// whether a reload has anything to push.
+    palette: nitro_core::Palette,
+    /// Bumped on every palette change and carried in the `Theme`
+    /// message, so a client can tell a re-send from a real change.
+    theme_serial: u32,
     /// Where that file lives, and `None` when there is none.
     config_path: Option<PathBuf>,
     /// The inotify watch on its directory; `None` when there is no file or
@@ -828,6 +853,8 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         frame_titles: HashMap::new(),
         scale_overrides: std::mem::take(&mut config.scales),
         origins: Vec::new(),
+        palette: settings.palette(),
+        theme_serial: 1,
         settings,
         config_path: config.config_path.clone(),
         config_watch,
@@ -2178,16 +2205,50 @@ impl Server {
         }
     }
 
+    /// Adopt a new palette: restyle every decoration, tell every client,
+    /// and mark the screen for repaint.
+    ///
+    /// Everything a palette change costs happens here, in one place and
+    /// in one wakeup: the decorations are restyled in the scene (the
+    /// damage is the title bars and borders, nothing else), and every
+    /// connected client — wire and shell — is sent one `Theme`. The
+    /// clients' own repaints arrive as their ordinary commits, so the
+    /// whole desktop changes colour in a single frame without the server
+    /// waiting for anybody.
+    ///
+    /// The caller is responsible for the diff: this always does the work.
+    fn set_palette(&mut self, palette: nitro_core::Palette) {
+        self.palette = palette;
+        self.theme_serial = self.theme_serial.wrapping_add(1);
+        // The decorations are server-drawn, so nothing else will repaint
+        // them. `restyle` also re-shapes the title in its new colour.
+        let framed: Vec<WindowKey> = self.decorations.keys().copied().collect();
+        for win in framed {
+            self.restyle(win, self.focus == Some(win));
+        }
+        let theme = msg::Theme::from_palette(self.theme_serial, &self.palette);
+        for client in self.wire_clients.values_mut() {
+            client.send(&ServerMsg::Theme(theme.clone()));
+        }
+        info!(
+            "palette {} ({} scheme, {} override(s))",
+            self.theme_serial,
+            self.settings.theme.scheme.unwrap_or_default().name(),
+            self.settings.theme.overrides.len()
+        );
+    }
+
     /// Re-read `server.conf` and apply it: the one place all three reload
     /// triggers — inotify, SIGHUP and the control socket's `reload` — end
     /// up.
     ///
-    /// Everything is re-applied unconditionally rather than diffed. The
-    /// work is one file read, one keymap compile and one `sync_outputs`,
-    /// all of which the server already does at startup; a diff would be a
-    /// second description of what the settings mean, and the failure mode
-    /// of a wrong diff is a desktop that ignores the file until the next
-    /// reboot.
+    /// Everything is re-applied unconditionally rather than diffed — with
+    /// two exceptions that earn it, the keyboard and the palette, both
+    /// noted below. The work is one file read, one keymap compile and one
+    /// `sync_outputs`, all of which the server already does at startup; a
+    /// diff would be a second description of what the settings mean, and
+    /// the failure mode of a wrong diff is a desktop that ignores the
+    /// file until the next reboot.
     ///
     /// A file that will not parse cannot stop the server: [`config::load`]
     /// never fails, and a line it could not use is a warning and a skipped
@@ -2207,7 +2268,19 @@ impl Server {
             warn!("{}: {w}", path.display());
         }
         let keyboard_changed = settings.keyboard != self.settings.keyboard;
+        let palette = settings.palette();
         self.settings = settings;
+        // The palette *is* diffed, unlike everything else here, and for a
+        // reason the rest does not have: applying it is not idempotent
+        // from the outside. It restyles every decoration, repaints every
+        // client and puts a `Theme` on every socket, so a `reload` that
+        // changed only `keyboard.layout` would otherwise cost a full
+        // desktop repaint and a wire message per client. An equal palette
+        // is therefore silence — which is exactly what the
+        // `nothing_is_sent_when_the_palette_did_not_change` test asserts.
+        if palette != self.palette {
+            self.set_palette(palette);
+        }
 
         // The keyboard, only when its section actually changed: compiling
         // a keymap costs tens of milliseconds and resetting the state
@@ -2997,7 +3070,7 @@ impl Server {
             warn!("framing a window: {e}");
             return;
         }
-        let nodes = match wm::build_frame(&mut self.scene, win, fixed) {
+        let nodes = match wm::build_frame(&mut self.scene, win, fixed, &self.palette) {
             Ok(n) => n,
             Err(e) => {
                 warn!("building a frame: {e}");
@@ -3014,7 +3087,7 @@ impl Server {
         let Some(nodes) = self.decorations.get(&win).copied() else {
             return;
         };
-        if let Err(e) = wm::style_frame(&mut self.scene, &nodes, focused) {
+        if let Err(e) = wm::style_frame(&mut self.scene, &nodes, focused, &self.palette) {
             warn!("styling a frame: {e}");
         }
         self.retitle(win);
@@ -3048,7 +3121,7 @@ impl Server {
             key: key.0,
             size: Size::new(shaped.width, shaped.height),
             ascent: shaped.ascent,
-            color: wm::title_color(focused),
+            color: wm::title_color(focused, &self.palette),
             align: nitro_scene::TextAlign::Left,
         };
         match self
@@ -3704,6 +3777,11 @@ impl Server {
             }
             Ok(Request::Unplug) => self.unplug(),
             Ok(Request::Focus) => self.focus_topmost(),
+            Ok(Request::Theme) => protocol::theme_reply(
+                self.settings.theme.scheme.unwrap_or_default(),
+                self.theme_serial,
+                &self.palette,
+            ),
         };
         client.send(reply);
     }
@@ -3914,6 +3992,16 @@ impl Server {
                     warn!("welcome: {e}");
                     return false;
                 }
+                // The palette, immediately behind the `Welcome` and in
+                // the same batch, so a client's very first paint already
+                // has the user's colours: a client that had to wait for
+                // a second round trip would paint one frame in its
+                // built-in defaults and then flash.
+                let theme = msg::Theme::from_palette(self.theme_serial, &self.palette);
+                let Some(client) = self.wire_clients.get_mut(&token) else {
+                    return false;
+                };
+                client.send(&ServerMsg::Theme(theme));
                 true
             }
             ClientMsg::MeasureText(m) => {
@@ -4002,8 +4090,12 @@ impl Server {
     /// socket — which is what `shell` says. It is reported rather than
     /// negotiated: the grant already happened when the client managed to
     /// open that path.
+    ///
+    /// `THEME` is unconditional for the same reason `WM` is: the server
+    /// always owns a palette and always pushes it, so every client may
+    /// rely on the `Theme` that follows its `Welcome`.
     fn caps(&self, shell: bool) -> u32 {
-        let mut caps = nitro_wire::types::caps::WM;
+        let mut caps = nitro_wire::types::caps::WM | nitro_wire::types::caps::THEME;
         if self.text.has_fonts() {
             caps |= nitro_wire::types::caps::TEXT;
         }

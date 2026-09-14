@@ -432,6 +432,23 @@ impl<S: 'static> PaintCx<'_, S> {
         self.ui.theme()
     }
 
+    /// The desktop's colours.
+    #[must_use]
+    pub fn palette(&self) -> &nitro_core::Palette {
+        self.ui.palette()
+    }
+
+    /// The colour of one [`ColorRole`](nitro_core::Role).
+    ///
+    /// What a custom widget paints with instead of a literal: the
+    /// wallpaper asks for `DesktopTop`, the terminal grid for `Ansi1`.
+    /// A colour with no role yet gets one added to `nitro_core::palette`
+    /// rather than written down here — see `docs/theme.md`.
+    #[must_use]
+    pub fn color(&self, role: nitro_core::Role) -> nitro_core::Color {
+        self.ui.color(role)
+    }
+
     /// Whether the server can draw text at all.
     #[must_use]
     pub fn has_text(&self) -> bool {

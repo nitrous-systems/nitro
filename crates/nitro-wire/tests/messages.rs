@@ -5,7 +5,7 @@
 //! decoding either produces the message that was encoded or a
 //! `DecodeError` — never a panic, never a silent misread.
 
-use nitro_core::{Color, IRect, Point, Rect, Size, Transform};
+use nitro_core::{Color, IRect, Palette, Point, Rect, Role, Size, Transform};
 use nitro_wire::codec::{FdQueue, Writer};
 use nitro_wire::msg::{
     BindKey, BufferDamage, ClientMsg, CloseWindow, Closed, Commit, Configure, CreateBuffer,
@@ -15,8 +15,8 @@ use nitro_wire::msg::{
     Presented, Reparent, RequestFrame, ServerMsg, SetAnchor, SetAppId, SetBorder, SetBounds,
     SetClip, SetCorners, SetExclusiveZone, SetFill, SetImage, SetLayer, SetOpacity, SetText,
     SetTransform, SetVisible, SetWindowLimits, SetWindowState, SetWindowStateFor, SetWindowTitle,
-    TextMeasured, TextMetrics, Touch, UnbindKey, Welcome, WindowGone, WindowInfo, WindowList,
-    WindowListEnd, WindowState,
+    TextMeasured, TextMetrics, Theme, Touch, UnbindKey, Welcome, WindowGone, WindowInfo,
+    WindowList, WindowListEnd, WindowState,
 };
 use nitro_wire::types::{
     Align, AxisSource, BufferId, ButtonState, CursorPos, Edge, ErrorCode, Layer, NodeId, NodeKind,
@@ -519,6 +519,25 @@ fn server_messages() -> Vec<ServerMsg> {
         .into(),
         OutputsEnd.into(),
         OutputGone { id: 9 }.into(),
+        // The palette, at a serial and a table length that are both
+        // deliberately *not* the built-in ones: a `Theme` that only ever
+        // carried `Role::COUNT` colours would hide a decoder that
+        // ignored the count.
+        Theme {
+            serial: 0x0102_0304,
+            colors: vec![
+                Color::rgba(0x11, 0x22, 0x33, 0x44),
+                Color::rgb(1, 2, 3),
+                Color::TRANSPARENT,
+            ],
+        }
+        .into(),
+        Theme {
+            serial: 0,
+            colors: Vec::new(),
+        }
+        .into(),
+        Theme::from_palette(7, &Palette::dark()).into(),
     ]
 }
 
@@ -881,6 +900,25 @@ fn payload_layouts_are_frozen() {
     );
 
     let mut w = Writer::new();
+    ServerMsg::from(Theme {
+        serial: 0x0102_0304,
+        colors: vec![Color::rgba(0x11, 0x22, 0x33, 0x44), Color::rgb(1, 2, 3)],
+    })
+    .encode(&mut w)
+    .unwrap();
+    assert_eq!(
+        w.bytes(),
+        &[
+            // header: len=16, op=0x8004, fds=0, flags=0
+            0x10, 0x00, 0x00, 0x00, 0x04, 0x80, 0x00, 0x00, //
+            0x04, 0x03, 0x02, 0x01, // serial
+            0x02, 0x00, 0x00, 0x00, // colour count
+            0x11, 0x22, 0x33, 0x44, // r, g, b, a
+            0x01, 0x02, 0x03, 0xff, //
+        ]
+    );
+
+    let mut w = Writer::new();
     ClientMsg::from(BindKey {
         id: 0x0102_0304,
         mods: mod_mask::SUPER,
@@ -1112,6 +1150,55 @@ fn a_hostile_cursor_count_is_truncated_not_allocated() {
         ServerMsg::decode(TextMeasured::OP, &bytes, &mut q),
         Err(DecodeError::Truncated)
     );
+}
+
+#[test]
+fn a_theme_message_carries_a_whole_palette() {
+    for palette in [Palette::light(), Palette::dark()] {
+        let msg = Theme::from_palette(3, &palette);
+        assert_eq!(msg.colors.len(), Role::COUNT);
+        assert_eq!(msg.palette(), palette);
+        // And through the bytes, which is the path that matters.
+        let mut w = Writer::new();
+        ServerMsg::from(msg).encode(&mut w).unwrap();
+        let (op, payload, _) = encode(nitro_wire::msg::Theme::OP, &w);
+        let back = ServerMsg::decode(op, &payload, &mut FdQueue::new()).expect("decodes");
+        let ServerMsg::Theme(back) = back else {
+            panic!("decoded as something else");
+        };
+        assert_eq!(back.serial, 3);
+        assert_eq!(back.palette(), palette);
+    }
+}
+
+#[test]
+fn a_short_or_long_theme_table_is_not_an_error() {
+    // The forward-compatibility rule the `N`-on-the-wire layout exists
+    // for: a peer one release behind sends fewer roles, one release
+    // ahead sends more. Neither may kill the connection.
+    let short = Theme {
+        serial: 1,
+        colors: vec![Color::rgb(1, 2, 3)],
+    };
+    let p = short.palette();
+    assert_eq!(
+        p.get(Role::from_index(0).expect("role 0")),
+        Color::rgb(1, 2, 3)
+    );
+    // Everything it did not carry keeps the built-in default.
+    assert_eq!(p.get(Role::Ansi15), Palette::default().get(Role::Ansi15));
+
+    let mut colors = Palette::dark().colors().to_vec();
+    colors.push(Color::rgb(9, 9, 9));
+    colors.push(Color::rgb(8, 8, 8));
+    let long = Theme { serial: 2, colors };
+    assert_eq!(long.palette(), Palette::dark());
+    // And the long form survives the wire too, rather than being
+    // rejected for trailing bytes.
+    let mut w = Writer::new();
+    ServerMsg::from(long).encode(&mut w).unwrap();
+    let (op, payload, _) = encode(nitro_wire::msg::Theme::OP, &w);
+    assert!(ServerMsg::decode(op, &payload, &mut FdQueue::new()).is_ok());
 }
 
 /// Offset of `SetText::italic` inside its payload: after `node` + `size_px`

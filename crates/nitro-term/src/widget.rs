@@ -52,8 +52,8 @@ use nitro_ui::build::{IntoWidget, StyleBuilder};
 use nitro_ui::event::{Event, Handled, button, key, mods};
 use nitro_ui::widget::Slot;
 use nitro_ui::{
-    Access, Built, Color, Constraints, EventCx, Fill, MeasureCx, PaintCx, Rect, Role, Size,
-    TextRun, TextStyle, Ui, Widget, WidgetMut,
+    Access, Built, Color, ColorRole, Constraints, EventCx, Fill, MeasureCx, PaintCx, Palette, Rect,
+    Role, Size, TextRun, TextStyle, Ui, Widget, WidgetMut,
 };
 
 use crate::grid::{CellColor, Run, Style};
@@ -61,7 +61,6 @@ use crate::grid::{CellColor, Run, Style};
 // reached through `Term`, so this import exists for rustdoc alone.
 #[allow(unused_imports)]
 use crate::grid::Grid;
-use crate::theme::Palette;
 use crate::vt::Term;
 
 /// Paint slots reserved for one row.
@@ -118,8 +117,9 @@ pub struct TermGrid {
     cell: Size,
     /// The font, from which the cell size came.
     style: TextStyle,
-    /// Colour table: the sixteen ANSI colours, the default foreground
-    /// and background.
+    /// Colour table: the sixteen ANSI colours and the terminal's own
+    /// default foreground, background and cursor, read from the
+    /// [`ColorRole`] table the server pushed.
     palette: Palette,
     /// A `dup` of the pty master, so a key or a scripted `send` reaches
     /// the child in the turn it happened.
@@ -253,11 +253,15 @@ impl TermGrid {
             // the hardware could not do both, and every program still
             // assumes it: `ls --color` writes bold blue for a directory
             // and expects the readable one.
-            CellColor::Indexed(i) if style.attrs.bold() && i < 8 => self.palette.indexed(i + 8),
-            CellColor::Indexed(i) => self.palette.indexed(i),
+            CellColor::Indexed(i) if style.attrs.bold() && i < 8 => {
+                self.palette.ansi_indexed(i + 8)
+            }
+            CellColor::Indexed(i) => self.palette.ansi_indexed(i),
             CellColor::Rgb(r, g, b) => Color::rgb(r, g, b),
-            CellColor::Default if style.attrs.inverse() => self.palette.background,
-            CellColor::Default => self.palette.foreground,
+            CellColor::Default if style.attrs.inverse() => {
+                self.palette.get(ColorRole::TerminalBackground)
+            }
+            CellColor::Default => self.palette.get(ColorRole::TerminalText),
         }
     }
 
@@ -270,9 +274,11 @@ impl TermGrid {
             style.bg
         };
         match bg {
-            CellColor::Indexed(i) => Some(self.palette.indexed(i)),
+            CellColor::Indexed(i) => Some(self.palette.ansi_indexed(i)),
             CellColor::Rgb(r, g, b) => Some(Color::rgb(r, g, b)),
-            CellColor::Default if style.attrs.inverse() => Some(self.palette.foreground),
+            CellColor::Default if style.attrs.inverse() => {
+                Some(self.palette.get(ColorRole::TerminalText))
+            }
             CellColor::Default => None,
         }
     }
@@ -371,7 +377,7 @@ impl TermGrid {
             cx.rect(
                 cursor_slot(self.term.grid().rows()),
                 rect,
-                Fill::Solid(self.palette.cursor),
+                Fill::Solid(self.palette.get(ColorRole::TerminalCursor)),
                 0.0,
                 (0.0, Color::TRANSPARENT),
             );
@@ -381,7 +387,7 @@ impl TermGrid {
                 rect,
                 Fill::None,
                 0.0,
-                (1.0, self.palette.cursor),
+                (1.0, self.palette.get(ColorRole::TerminalCursor)),
             );
         }
     }

@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use nitro_core::{Color, Point, Rect, Size};
+use nitro_core::{Color, Palette, Point, Rect, Role, Size};
 use nitro_kms::Image;
 use nitro_server::input::{BTN_LEFT, FakeInput, InputEvent};
 use nitro_server::wm;
@@ -440,6 +440,24 @@ fn to_rgb(c: Color) -> u32 {
     u32::from(c.r) << 16 | u32::from(c.g) << 8 | u32::from(c.b)
 }
 
+/// A decoration colour from the palette a server with no `server.conf`
+/// runs on — the default scheme. Tests that assert on title-bar pixels
+/// go through this rather than naming a colour, which is the whole point
+/// of M4-F: the constants they used to read no longer exist, because the
+/// colours are the user's to change.
+fn role(r: Role) -> Color {
+    Palette::default().get(r)
+}
+
+/// The title-bar colour for a focus state.
+fn bar(focused: bool) -> Color {
+    role(if focused {
+        Role::TitleBarActive
+    } else {
+        Role::TitleBarInactive
+    })
+}
+
 /// Park the pointer in a corner, where it cannot contaminate a pixel
 /// assertion or hover a window under test.
 fn park(h: &mut Harness) {
@@ -480,13 +498,13 @@ fn a_decorated_window_gets_a_title_bar_above_its_content() {
     let img = h.shot();
     // Pixels in the title bar: the bar is painted, and it is not the
     // desktop and not the client's red.
-    let bar = img.pixel(
+    let bar_px = img.pixel(
         (frame.x + frame.w / 2.0) as u32,
         (frame.y + wm::TITLE_H / 2.0) as u32,
     );
     assert_eq!(
-        rgb(bar),
-        to_rgb(wm::theme::BAR_ACTIVE),
+        rgb(bar_px),
+        to_rgb(bar(true)),
         "the focused title bar is painted"
     );
     // The client's own pixels are untouched by the frame.
@@ -500,7 +518,7 @@ fn a_decorated_window_gets_a_title_bar_above_its_content() {
             (close.x + close.w / 2.0) as u32,
             (close.y + close.h / 2.0) as u32
         )),
-        to_rgb(wm::theme::CLOSE),
+        to_rgb(role(Role::TitleClose)),
     );
 
     drop(conn);
@@ -538,7 +556,7 @@ fn an_undecorated_window_gets_no_frame_at_all() {
     // And one pixel above it is still the desktop, not a title bar.
     assert_ne!(
         rgb(img.pixel(win.pos.x as u32, win.pos.y as u32 - 1)),
-        to_rgb(wm::theme::BAR_ACTIVE)
+        to_rgb(bar(true))
     );
 
     drop(conn);
@@ -985,7 +1003,7 @@ fn a_client_asks_for_a_state_and_is_told_what_it_got() {
             (win.pos.x + win.size.w / 2.0) as u32,
             (win.pos.y - wm::TITLE_H / 2.0) as u32
         )),
-        to_rgb(wm::theme::BAR_ACTIVE),
+        to_rgb(bar(true)),
         "the title bar is back"
     );
 
@@ -1210,13 +1228,10 @@ fn clicking_a_window_raises_and_focuses_it_and_restyles_both_frames() {
     // The drag focused `a`, so `b`'s bar is the inactive one now.
     park(&mut h);
     let img = h.shot();
-    assert_eq!(
-        rgb(img.pixel(a_bar.0, a_bar.1)),
-        to_rgb(wm::theme::BAR_ACTIVE)
-    );
+    assert_eq!(rgb(img.pixel(a_bar.0, a_bar.1)), to_rgb(bar(true)));
     assert_eq!(
         rgb(img.pixel(b_bar.0, b_bar.1)),
-        to_rgb(wm::theme::BAR_INACTIVE),
+        to_rgb(bar(false)),
         "an unfocused frame is drawn differently"
     );
 
@@ -1230,14 +1245,8 @@ fn clicking_a_window_raises_and_focuses_it_and_restyles_both_frames() {
     park(&mut h);
 
     let img = h.shot();
-    assert_eq!(
-        rgb(img.pixel(b_bar.0, b_bar.1)),
-        to_rgb(wm::theme::BAR_ACTIVE)
-    );
-    assert_eq!(
-        rgb(img.pixel(a_bar.0, a_bar.1)),
-        to_rgb(wm::theme::BAR_INACTIVE)
-    );
+    assert_eq!(rgb(img.pixel(b_bar.0, b_bar.1)), to_rgb(bar(true)));
+    assert_eq!(rgb(img.pixel(a_bar.0, a_bar.1)), to_rgb(bar(false)));
 
     drop(conn);
     h.quit();

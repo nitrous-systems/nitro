@@ -33,7 +33,7 @@
 
 use std::os::fd::{AsFd as _, OwnedFd};
 
-use nitro_core::{Color, IRect, Point, Rect, Size, Transform};
+use nitro_core::{Color, IRect, Palette, Point, Rect, Role, Size, Transform};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use crate::codec::{FdQueue, Reader, Writer};
@@ -790,6 +790,75 @@ impl Body for WindowListEnd {
     }
     fn decode_body(_r: &mut Reader<'_>, _fds: &mut FdQueue) -> Result<Self, DecodeError> {
         Ok(Self)
+    }
+}
+
+/// The desktop's colour palette (needs
+/// [`caps::THEME`](crate::types::caps::THEME)).
+///
+/// Sent to every client — wire and shell — immediately after
+/// [`Welcome`], and again whenever the server's palette changes. The
+/// server owns the scheme (`theme.scheme` in `server.conf`); a client
+/// never chooses colours, it is told them. See `docs/theme.md`.
+///
+/// # Layout
+///
+/// `serial: u32`, then the table as a `vec<Color>`: a `u32` count
+/// followed by that many 4-byte colours, in [`Role`] order. The count is
+/// [`Role::COUNT`] at the *server's* protocol time, which is what makes
+/// appending a role a compatible change in both directions:
+/// [`Theme::palette`] fills anything a shorter message did not carry
+/// from the built-in default and ignores anything past the end of the
+/// table it knows. A client one release behind therefore renders the
+/// roles it understands rather than refusing the connection, which is
+/// the whole reason the count is on the wire instead of being implied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Theme {
+    /// Increments on every change; a client may use it to tell a
+    /// re-send from a real change, and the tests do.
+    pub serial: u32,
+    /// One colour per [`Role`], in role order.
+    pub colors: Vec<Color>,
+}
+
+impl Theme {
+    /// The message carrying `palette` at `serial`.
+    #[must_use]
+    pub fn from_palette(serial: u32, palette: &Palette) -> Self {
+        Self {
+            serial,
+            colors: palette.colors().to_vec(),
+        }
+    }
+
+    /// The palette this message describes.
+    ///
+    /// Roles the message did not carry keep their value from
+    /// [`Palette::default`]; colours past the last role this build knows
+    /// are dropped. Neither is an error — see the layout note above.
+    #[must_use]
+    pub fn palette(&self) -> Palette {
+        let mut p = Palette::default();
+        for (i, c) in self.colors.iter().enumerate() {
+            if let Some(role) = Role::from_index(i) {
+                p.set(role, *c);
+            }
+        }
+        p
+    }
+}
+
+impl Body for Theme {
+    fn encode_body(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.put_u32(self.serial);
+        w.put_vec(&self.colors);
+        Ok(())
+    }
+    fn decode_body(r: &mut Reader<'_>, _fds: &mut FdQueue) -> Result<Self, DecodeError> {
+        Ok(Self {
+            serial: r.get_u32()?,
+            colors: r.get_vec()?,
+        })
     }
 }
 
@@ -1621,6 +1690,8 @@ msg_enum! {
         Error = 0x8002,
         /// A commit reached the screen.
         Presented = 0x8003,
+        /// The desktop's colour palette (needs `caps::THEME`).
+        Theme = 0x8004,
         /// Window placed, resized or rescaled.
         Configure = 0x8101,
         /// Frame deadline.
