@@ -192,17 +192,30 @@ impl Socket {
 ///
 /// **The path appears only once the socket accepts.** `bind` creates the
 /// file immediately, but a socket does not queue connections until `listen`
-/// has run, so a peer that raced into that window got `ECONNREFUSED` from a
-/// path that already existed. That is not hypothetical: it is a ~1-in-25
-/// flake in the integration tests, whose harnesses wait for the socket file
-/// and then connect. So the bind happens on a temporary name in the same
-/// directory and is `rename`d into place after `listen` — `rename(2)` within
-/// one directory is atomic, so the path either does not exist or names a
-/// socket that is already accepting. The temporary is unlinked on any
-/// failure rather than left behind.
+/// has run, so a peer that lands in that window gets `ECONNREFUSED` from a
+/// path that plainly exists. Every test harness in this tree waits for the
+/// socket *file* and then connects, which is exactly how to land in it. Not
+/// hypothetical: it was **observed** failing on `main` at `3efa468`. It is
+/// rare, and deliberately not quantified here — no defensible rate was
+/// measured, and the mechanism is the whole argument.
+///
+/// So the bind happens on a temporary name in the same directory and is
+/// `rename`d into place after `listen` — `rename(2)` within one directory is
+/// atomic, so the path either does not exist or names a socket that is
+/// already accepting. The temporary is unlinked on any failure rather than
+/// left behind. Two servers racing one path still resolve last-writer-wins,
+/// exactly as the previous unlink-then-bind did.
+///
+/// One consequence worth knowing: the *staged* name is the length-limiting
+/// one, since it adds about 17 bytes (`.` plus `.<pid>.staging`) to the file
+/// name. A path within ~17 bytes of `sun_path`'s 108-byte limit therefore
+/// fails here where a direct bind would have fitted. It fails cleanly, as an
+/// error from [`SocketAddrUnix::new`] at startup, and the runtime-directory
+/// paths this crate resolves are nowhere near the limit.
 ///
 /// # Errors
-/// Any `mkdir`/`bind`/`listen`/`rename` failure.
+/// Any `mkdir`/`bind`/`listen`/`rename` failure, including a socket path so
+/// long that the staged name exceeds `sun_path`.
 pub fn listen(path: &Path) -> Result<OwnedFd, Error> {
     use rustix::fs::{Mode, unlinkat};
     if let Some(dir) = path.parent() {

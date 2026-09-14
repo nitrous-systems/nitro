@@ -178,7 +178,8 @@ impl Connection {
     /// Bind a server-global hotkey (needs `caps::SHELL`).
     ///
     /// `mods` is a [`mod_mask`](crate::types::mod_mask) bitmask; `keysym` 0
-    /// asks for the bare-modifier tap. Answered with [`HotKey`] events, not
+    /// asks for the bare-modifier tap. Answered with
+    /// [`HotKey`](crate::msg::HotKey) events, not
     /// with an acknowledgement — a refusal is a fatal `Error`, like every
     /// other protocol error.
     ///

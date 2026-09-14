@@ -581,24 +581,27 @@ fn an_fd_flood_through_the_read_loop_is_fatal_not_a_spin() {
 /// A path that exists must already accept: `listen` publishes the socket
 /// only after `listen(2)`.
 ///
-/// The flake this was written for: `bind(2)` creates the socket file at
-/// once, but a socket queues no connections until `listen(2)` has run, so a
-/// peer that waited for the file and then connected could get
-/// `ECONNREFUSED` from a path that plainly existed — about one integration
-/// run in twenty-five, in `nitro-demo`'s harness and `nitro-server`'s.
-/// Binding on a staging name and `rename`ing it into place closes the
-/// window, because a rename within one directory is atomic: the path either
-/// does not exist or names an accepting socket.
+/// The race this was written for: `bind(2)` creates the socket file at once,
+/// but a socket queues no connections until `listen(2)` has run, so a peer
+/// that waits for the file and then connects can land in that window and get
+/// `ECONNREFUSED` from a path that plainly exists. Both `nitro-demo`'s test
+/// harness and `nitro-server`'s do exactly that wait-then-connect, and the
+/// failure was **observed** on `main` at `3efa468`. It is rare; no
+/// defensible rate was measured, and none is quoted here on purpose — the
+/// mechanism is the argument. Binding on a staging name and `rename`ing it
+/// into place closes the window, because a rename within one directory is
+/// atomic: the path either does not exist or names an accepting socket.
 ///
 /// **What this test does and does not prove.** It asserts the property — as
 /// soon as the path exists, a connect succeeds — over 200 rounds, and it
 /// checks the staging file is never left behind. It is *not* a regression
 /// test in the strict sense: the unfixed window is a couple of instructions
 /// wide, so reverting the fix does not make this fail, and no in-process
-/// racer can reliably land inside it. The evidence for the fix is the
-/// integration soak (see the commit message), not this. What this pins is
-/// the invariant and the cleanup, so a future change that publishes the path
-/// early or leaks a `.staging` file is caught.
+/// racer can reliably land inside it (checked, rather than assumed). The
+/// argument for the fix is therefore the mechanism plus that one observed
+/// failure on `main`, not this test and not a measured rate. What this pins
+/// is the invariant and the cleanup, so a future change that publishes the
+/// path early or leaks a `.staging` file is caught.
 #[test]
 fn a_socket_path_never_exists_before_it_accepts() {
     use std::sync::mpsc;

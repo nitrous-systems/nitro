@@ -712,7 +712,7 @@ impl Body for Outputs {
 ///
 /// Sent for each window in answer to [`WindowList`], and again whenever
 /// anything in it changes. `window` is a **server-global**
-/// [`WindowRef`](crate::types::WindowRef), not the owning client's
+/// [`crate::types::WindowRef`], not the owning client's
 /// `NodeId`: a shell names other clients' windows, and client ids are
 /// namespaced per connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
