@@ -707,10 +707,25 @@ pub fn show(s: &mut Launcher, ui: &mut Ui<Launcher>) {
 /// server releases a grab whose window stops showing, so there is no
 /// second message and nothing to forget. The tree is left exactly as it
 /// is — the next show is one mutation, not a rebuild.
+///
+/// **Unconditional**, and that is the whole of issue "launcher on screen
+/// at boot" (found on the box during the M3-E acceptance run). The
+/// obvious early return — `if !s.visible { return }` — is wrong for
+/// exactly one caller, and it is the most important one: the start-up
+/// hide in [`install`]. A window is created **visible** (the protocol has
+/// no "create hidden" flag), so at that moment `s.visible` is `false`
+/// while the window is on screen: the bool and the server disagree, and
+/// the early return resolved the disagreement in favour of the bool. The
+/// launcher then sat over the wallpaper for the whole session, believing
+/// it was hidden, and every test passed because they all asked the bool.
+///
+/// Sending the mutation unconditionally costs a `SetVisible` on a hide
+/// that was already a hide — 4 bytes, once, on a path a user reaches by
+/// pressing Escape at an already-closed launcher. Tracking "what does the
+/// server think?" precisely enough to skip it would be a second copy of
+/// a fact the server already owns, and this is what the second copy
+/// drifting looks like.
 pub fn hide(s: &mut Launcher, ui: &mut Ui<Launcher>) {
-    if !s.visible {
-        return;
-    }
     s.visible = false;
     let _ = ui.set_window_visible(false);
 }

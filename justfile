@@ -70,7 +70,9 @@ box-status:
 
 # Talk to the running session: `status`, `lock`, `suspend`, `logout`.
 box-session cmd="status":
-    ssh {{box}} 'printf "{{cmd}}\n" | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/nitro/session.sock 2>/dev/null || printf "{{cmd}}\n" | nc -U $XDG_RUNTIME_DIR/nitro/session.sock'
+    # `-q1`: the session keeps the connection open after most replies, so
+    # nc is told to leave one second after its own stdin ends.
+    ssh {{box}} 'printf "{{cmd}}\n" | nc -q1 -U /run/user/$(id -u)/nitro/session.sock'
 
 # RSS/idle-CPU table for the whole desktop tree, for docs/budget.md.
 box-ps:

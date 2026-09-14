@@ -16,6 +16,7 @@
 
 use std::path::PathBuf;
 
+use nitro_kms::Image;
 use nitro_launcher::desktop::{Entry, Source};
 use nitro_launcher::{Launcher, build, names};
 use nitro_ui::event::key;
@@ -1020,6 +1021,93 @@ fn the_result_rows_are_painted() {
              {glyphs} is the fill rather than the glyphs"
         );
     }
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}
+
+/// How many pixels of two same-sized screenshots differ.
+///
+/// The comparison `the_launcher_is_not_on_screen_before_the_first_tap`
+/// is built on: "does the screen look like this other screen", which is
+/// the only question that can be asked about a compositor whose backdrop
+/// is a gradient (no single colour is "the background").
+fn differing(a: &Image, b: &Image) -> usize {
+    assert_eq!((a.width, a.height), (b.width, b.height));
+    let mut n = 0;
+    for y in 0..a.height {
+        for x in 0..a.width {
+            if a.pixel(x, y) & 0x00ff_ffff != b.pixel(x, y) & 0x00ff_ffff {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+#[test]
+fn the_launcher_is_not_on_screen_before_the_first_tap() {
+    // Found on the test box during the M3-E acceptance run: with the
+    // session starting all three shell pieces, the launcher panel was on
+    // screen from boot, over the wallpaper, before anything had tapped
+    // Super. `hey nitro-launcher list` showed the rows, `is_visible()`
+    // said false, and the screen said otherwise.
+    //
+    // That gap is why this assertion is about **pixels on the output**
+    // and not about the launcher's own bool. Every other hide/show test
+    // here asserts `!h.state().is_visible()`, which was true the whole
+    // time: the bool starts `false`, `hide()` used to return early when
+    // it was already `false`, and so the start-up hide never sent the
+    // `SetVisible(false)` the window needed. The launcher believed it
+    // was hidden and the server had never been told.
+    //
+    // The comparison is **differential** rather than against a
+    // reference colour, because what is behind the overlay is the
+    // compositor's gradient: no single colour is "the background", so a
+    // `!= background` count would report the whole rectangle as ink
+    // whether the launcher was there or not (it did, at 300x220 = 66000,
+    // which is what sent this test through three wrong versions).
+    //
+    // So the question is asked as: **does the screen at boot look like
+    // the screen with the launcher definitely hidden?** The reference is
+    // produced by a show and a hide, which is the path that certainly
+    // sends both mutations.
+    let (mut h, dir) = harness();
+    for _ in 0..20 {
+        h.settle();
+    }
+    assert!(
+        !h.state().is_visible(),
+        "the launcher believes it is hidden"
+    );
+    let at_boot = h.output_shot();
+
+    super_tap(&mut h);
+    until(&mut h, "the show", |h| h.state().is_visible());
+    let shown = h.output_shot();
+
+    super_tap(&mut h);
+    until(&mut h, "the hide", |h| !h.state().is_visible());
+    let hidden = h.output_shot();
+
+    // The positive control first, because it is what makes the real
+    // assertion mean anything: showing the launcher *does* change the
+    // screen. Without it, a launcher whose window had been deleted
+    // outright would satisfy everything below.
+    let shown_vs_hidden = differing(&shown, &hidden);
+    assert!(
+        shown_vs_hidden > 1000,
+        "showing the overlay changed only {shown_vs_hidden} pixels; \
+         this test cannot see the launcher at all"
+    );
+
+    // And the claim: at boot the screen already looked like this.
+    let boot_vs_hidden = differing(&at_boot, &hidden);
+    assert_eq!(
+        boot_vs_hidden, 0,
+        "the launcher is on screen before anybody asked for it: {boot_vs_hidden} \
+         pixels differ from the same desktop with the overlay explicitly hidden"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
     h.quit();

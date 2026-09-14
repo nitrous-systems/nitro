@@ -4,11 +4,19 @@
 #
 # Two things it is careful about, both learned the hard way:
 #
-#   * The processes are found through **systemd's cgroup**, not `pgrep`.
-#     A `pgrep nitro` would also match a stray `nitro-shot` from a
-#     screenshot, an ssh session's editor, or yesterday's orphan — and
-#     the number that matters is "what does the running desktop cost",
-#     which is exactly the set systemd is holding.
+#   * The processes are found by **walking down from the unit's MainPID**,
+#     not by `pgrep nitro`. A pattern match would also catch a stray
+#     `nitro-shot` from a screenshot, an orphan from yesterday, or an
+#     editor with the word in its command line; what matters is "what
+#     does the running desktop cost", which is exactly the session's own
+#     children.
+#
+#     The unit's *cgroup* would have been the obvious source and is not
+#     usable: `PAMName=login` makes pam_systemd move the whole tree into
+#     the logind session scope (`user-1000.slice/session-N.scope`), so
+#     `system.slice/nitro-dev.service/cgroup.procs` is **empty** while
+#     the desktop runs. That is also why the unit's `MemoryMax=1G` does
+#     not actually bind — see docs/testbox.md.
 #   * Idle CPU is measured as **jiffies over an interval**, not as `top`'s
 #     instantaneous percentage. The claim in DESIGN.md is "0.0 %", and the
 #     only way to show that honestly is to read utime+stime before and
@@ -22,12 +30,20 @@ set -euo pipefail
 secs="${1:-60}"
 hz=$(getconf CLK_TCK)
 
-cgroup=/sys/fs/cgroup/system.slice/nitro-dev.service/cgroup.procs
-if [[ ! -r $cgroup ]]; then
-    echo "nitro-dev is not running (no $cgroup)" >&2
+main=$(systemctl show nitro-dev -p MainPID --value)
+if [[ -z $main || $main == 0 ]]; then
+    echo "nitro-dev is not running" >&2
     exit 1
 fi
-mapfile -t pids < "$cgroup"
+# The session and its children. One level is enough: the session starts
+# the four pieces directly and nothing else in the tree forks.
+pids=("$main")
+for c in $(cat "/proc/$main/task/$main/children" 2>/dev/null); do
+    # `(sd-pam)` is pam_systemd's own helper, forked into the session by
+    # `PAMName=login`. It is systemd's process, not the desktop's, so it
+    # is listed for honesty but left out of the total.
+    pids+=("$c")
+done
 
 name_of() { tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null | awk '{print $1}' | xargs -r basename; }
 field()   { awk -v k="$2:" '$1==k {print $2}' "/proc/$1/status" 2>/dev/null; }
@@ -56,8 +72,10 @@ for p in "${pids[@]}"; do
     pct=$(awk -v j="$used" -v hz="$hz" -v s="$secs" 'BEGIN{printf "%.2f", 100*j/hz/s}')
     rss=$(field "$p" VmRSS)
     hwm=$(field "$p" VmHWM)
-    total_rss=$(( total_rss + ${rss:-0} ))
+    if [[ $(name_of "$p") != "(sd-pam)" ]]; then
+        total_rss=$(( total_rss + ${rss:-0} ))
+    fi
     printf '%-16s %8s %8s kB %8s kB %10s %8s\n' \
         "$(name_of "$p")" "$p" "${rss:-?}" "${hwm:-?}" "$(field "$p" Threads)" "$pct"
 done
-printf '%-16s %8s %8s kB\n' TOTAL "" "$total_rss"
+printf '%-16s %8s %8s kB   (nitro processes only)\n' TOTAL "" "$total_rss"

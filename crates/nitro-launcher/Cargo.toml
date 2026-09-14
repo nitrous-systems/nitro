@@ -43,3 +43,7 @@ rustix = { workspace = true, features = ["process"] }
 # wire crate; the shipped launcher does not.
 nitro-wire = { workspace = true }
 nitro-core = { workspace = true }
+# `Image`, the shape a whole-output `shot` readback comes back in. One
+# test compares two of them pixel for pixel (the launcher must not be on
+# screen before the first Super tap), which is the only use.
+nitro-kms = { workspace = true }
