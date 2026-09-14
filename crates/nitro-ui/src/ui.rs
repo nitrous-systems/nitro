@@ -554,14 +554,6 @@ impl<S: 'static> Ui<S> {
     /// Adopt a palette the server pushed: re-derive the theme from it,
     /// keeping this app's own metrics, and mark everything for repaint.
     ///
-    /// The repaint is exactly one commit, because marking is not
-    /// sending: every widget is flagged here and the next
-    /// [`Ui::flush`] turns the whole lot into one transaction. An
-    /// unchanged palette is dropped without marking anything, so a
-    /// server that re-sends its palette costs a settled app nothing.
-    /// Adopt a palette the server pushed: re-derive the theme from it,
-    /// keeping this app's own metrics, and mark everything for repaint.
-    ///
     /// Returns whether the palette actually moved.
     ///
     /// The repaint is exactly one commit, because marking is not
