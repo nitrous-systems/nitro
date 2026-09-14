@@ -577,3 +577,78 @@ fn an_fd_flood_through_the_read_loop_is_fatal_not_a_spin() {
     }
     panic!("the flood was never rejected");
 }
+
+/// A path that exists must already accept: `listen` publishes the socket
+/// only after `listen(2)`.
+///
+/// The flake this was written for: `bind(2)` creates the socket file at
+/// once, but a socket queues no connections until `listen(2)` has run, so a
+/// peer that waited for the file and then connected could get
+/// `ECONNREFUSED` from a path that plainly existed — about one integration
+/// run in twenty-five, in `nitro-demo`'s harness and `nitro-server`'s.
+/// Binding on a staging name and `rename`ing it into place closes the
+/// window, because a rename within one directory is atomic: the path either
+/// does not exist or names an accepting socket.
+///
+/// **What this test does and does not prove.** It asserts the property — as
+/// soon as the path exists, a connect succeeds — over 200 rounds, and it
+/// checks the staging file is never left behind. It is *not* a regression
+/// test in the strict sense: the unfixed window is a couple of instructions
+/// wide, so reverting the fix does not make this fail, and no in-process
+/// racer can reliably land inside it. The evidence for the fix is the
+/// integration soak (see the commit message), not this. What this pins is
+/// the invariant and the cleanup, so a future change that publishes the path
+/// early or leaks a `.staging` file is caught.
+#[test]
+fn a_socket_path_never_exists_before_it_accepts() {
+    use std::sync::mpsc;
+
+    let dir = std::env::temp_dir().join(format!("nitro-listen-race-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+
+    for round in 0..200 {
+        // A fresh path per round, so a round can never reach the previous
+        // round's socket and report that as the bug.
+        let path = dir.join(format!("wire-{round}.sock"));
+        let p = path.clone();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let binder = std::thread::spawn(move || {
+            let fd = nitro_wire::io::listen(&p).expect("listen");
+            // Hold the listening socket until the connector says it is done:
+            // dropping it earlier would leave a path with nothing listening,
+            // which is `ECONNREFUSED` for the test's own reason.
+            let _ = done_rx.recv();
+            drop(fd);
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let result = loop {
+            if path.exists() {
+                break nitro_wire::io::Socket::connect(&path);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "round {round}: the socket never appeared"
+            );
+        };
+        let outcome = result.map(|_| ());
+        let _ = done_tx.send(());
+        binder.join().expect("binder thread");
+        if let Err(e) = outcome {
+            panic!("round {round}: path existed but connect failed: {e}");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // No staging file left behind, on any of the 200 rounds.
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .expect("read the socket dir")
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "listen left files behind: {leftovers:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

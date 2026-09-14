@@ -190,8 +190,19 @@ impl Socket {
 /// The parent directory is created `0700` if missing and a stale socket
 /// file is unlinked first.
 ///
+/// **The path appears only once the socket accepts.** `bind` creates the
+/// file immediately, but a socket does not queue connections until `listen`
+/// has run, so a peer that raced into that window got `ECONNREFUSED` from a
+/// path that already existed. That is not hypothetical: it is a ~1-in-25
+/// flake in the integration tests, whose harnesses wait for the socket file
+/// and then connect. So the bind happens on a temporary name in the same
+/// directory and is `rename`d into place after `listen` — `rename(2)` within
+/// one directory is atomic, so the path either does not exist or names a
+/// socket that is already accepting. The temporary is unlinked on any
+/// failure rather than left behind.
+///
 /// # Errors
-/// Any `mkdir`/`bind`/`listen` failure.
+/// Any `mkdir`/`bind`/`listen`/`rename` failure.
 pub fn listen(path: &Path) -> Result<OwnedFd, Error> {
     use rustix::fs::{Mode, unlinkat};
     if let Some(dir) = path.parent() {
@@ -200,20 +211,51 @@ pub fn listen(path: &Path) -> Result<OwnedFd, Error> {
             Err(e) => return Err(e.into()),
         }
     }
-    match unlinkat(rustix::fs::CWD, path, rustix::fs::AtFlags::empty()) {
-        Ok(()) | Err(Errno::NOENT) => {}
-        Err(e) => return Err(e.into()),
+    // Same directory, so the rename below is a rename and not a copy. The
+    // pid keeps two servers racing to the same path from colliding on the
+    // temporary itself.
+    let staging = staging_path(path);
+    for p in [path, staging.as_path()] {
+        match unlinkat(rustix::fs::CWD, p, rustix::fs::AtFlags::empty()) {
+            Ok(()) | Err(Errno::NOENT) => {}
+            Err(e) => return Err(e.into()),
+        }
     }
-    let addr = SocketAddrUnix::new(path)?;
+    let addr = SocketAddrUnix::new(&staging)?;
     let fd = rustix::net::socket_with(
         AddressFamily::UNIX,
         SocketType::STREAM,
         SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
         None,
     )?;
-    rustix::net::bind(&fd, &addr)?;
-    rustix::net::listen(&fd, 64)?;
-    Ok(fd)
+    // From here on a failure must not leave the staging file behind, so each
+    // step cleans up before returning.
+    let publish = || -> Result<(), Errno> {
+        rustix::net::bind(&fd, &addr)?;
+        rustix::net::listen(&fd, 64)?;
+        rustix::fs::renameat(rustix::fs::CWD, &staging, rustix::fs::CWD, path)
+    };
+    match publish() {
+        Ok(()) => Ok(fd),
+        Err(e) => {
+            let _ = unlinkat(rustix::fs::CWD, &staging, rustix::fs::AtFlags::empty());
+            Err(e.into())
+        }
+    }
+}
+
+/// The temporary name [`listen`] binds before publishing, next to `path`.
+fn staging_path(path: &Path) -> std::path::PathBuf {
+    let pid = rustix::process::getpid().as_raw_nonzero().get();
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("socket");
+    let staged = format!(".{name}.{pid}.staging");
+    match path.parent() {
+        Some(dir) => dir.join(staged),
+        None => std::path::PathBuf::from(staged),
+    }
 }
 
 /// Accept one pending connection from a listener created by [`listen`].

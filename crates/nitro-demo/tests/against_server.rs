@@ -612,7 +612,29 @@ fn an_idle_demo_leaves_the_server_flipping_nothing() {
 
     // And the demo itself is blocked, not spinning: a poll with a short
     // timeout returns having read nothing.
+    //
+    // Drain first. `pump` above returned on the *first* `Presented`, and
+    // `settle` waits for the server to go quiet rather than for this
+    // socket to be empty — so the startup frames' `Presented`s can still
+    // be sitting in the receive buffer, unread. Asserting straight away
+    // therefore tested "the client has read everything the server ever
+    // sent", which is not the property this test is named for and which
+    // failed under load, when the server settles across more frames than a
+    // single `tick` consumed. Drain until a tick genuinely blocks, then
+    // assert that the *next* one does too: that is "nothing new arrives",
+    // which is the claim.
     let mut events: Vec<ServerMsg> = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        app.tick(Duration::from_millis(50), &mut events);
+        if events.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the server never stopped sending: {events:?}"
+        );
+    }
     app.tick(Duration::from_millis(50), &mut events);
     assert!(events.is_empty(), "an idle server sent {events:?}");
 
