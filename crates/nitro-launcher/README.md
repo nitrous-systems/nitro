@@ -68,13 +68,37 @@ the window-list subscription already reports as a `WindowInfo` with
 keyboard grab until Escape, which is the one failure mode a launcher
 really must not have.
 
-Two windows are ignored: our own (the server may report the overlay
+**The trigger is a change of window *identity*, not the `focused` flag.**
+That distinction is the whole of the difficulty here. The server sends a
+`WindowInfo` whenever **anything** about a window changes — `clients.rs`
+relists on `SetWindowTitle` and `SetAppId`, `announce_state` on a
+minimize or maximize, placement on a new window — and `focused` in it
+carries the *current truth* rather than a transition. So the
+already-focused window merely changing its title also arrives saying
+`focused: true`.
+
+Acting on the flag alone makes the launcher vanish mid-word for no
+visible reason, and it is not an exotic case: a shell sets its terminal's
+title on every prompt, a browser on every page load, a clock-in-title app
+on a timer. The launcher therefore remembers which `WindowRef` holds
+focus and acts only when that changes;
+`the_focused_window_retitling_itself_is_not_a_focus_change` retitles the
+focused window three times over an open launcher and asserts it is still
+up with what was typed still in it.
+
+Two windows are then ignored: our own (the server may report the overlay
 itself, and hiding on that would close the launcher the moment it
-opened), and everything at all while the launcher is already hidden —
-which is every ordinary focus change on the desktop, and must cost
-nothing. `an_ordinary_focus_change_costs_a_hidden_launcher_nothing`
-asserts the second half by counting commits while two windows open and
-steal focus from each other.
+opened), and everything while the launcher is already hidden — which is
+every ordinary focus change on the desktop, and must cost nothing.
+`an_ordinary_focus_change_costs_a_hidden_launcher_nothing` asserts that
+by counting commits while two windows steal focus from each other.
+
+The identity bookkeeping happens **before** both of those returns, and
+the ordering is load-bearing: a focus change seen while hidden still has
+to be recorded, or the first change after the next show is compared
+against a stale id.
+`focus_is_tracked_while_hidden_so_the_next_show_is_not_stale` fails if
+the two are swapped.
 
 This is the one place the launcher subscribes to anything. It is a
 subscription rather than a poll, and a failure to establish it is not
@@ -300,10 +324,12 @@ environment subtraction, the process group, a real child writing a real
 marker file, and reaping).
 
 `tests/launcher.rs` drives the tree the binary builds through a real
-server on the shell socket, 22 cases: the bare-Super tap showing and
+server on the shell socket, 24 cases: the bare-Super tap showing and
 hiding it; the grab delivering keys past a focused second client and
-releasing on hide; **another window taking focus hiding it**, and an
-ordinary focus change costing a hidden launcher nothing; show and hide
+releasing on hide; **another window taking focus hiding it**, the focused window
+*retitling* itself **not** hiding it, focus tracked while hidden so the
+next show is not stale, and an ordinary focus change costing a hidden
+launcher nothing; show and hide
 costing one mutation each; Escape; typing narrowing the list; a keystroke
 sending nothing for a row whose text did not change; the arrows wrapping
 and costing two `SetText`s; Enter and a real click each launching a real

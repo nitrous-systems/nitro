@@ -254,6 +254,114 @@ fn another_window_taking_focus_hides_the_launcher() {
 }
 
 #[test]
+fn the_focused_window_retitling_itself_is_not_a_focus_change() {
+    // The server sends a `WindowInfo` whenever *anything* about a window
+    // changes, and `focused` in it reports the current truth rather than
+    // a transition. `clients.rs` pushes to `relisted` on `SetWindowTitle`
+    // and `SetAppId`, so the already-focused window merely changing its
+    // title produces `WindowInfo { focused: true }`.
+    //
+    // Treating that as "somebody took focus" makes the launcher vanish
+    // while the user is typing into it, for no visible reason — and it is
+    // not exotic: a shell sets its terminal's title on every prompt, a
+    // browser on every page load, a clock-in-title app on a timer.
+    let (mut h, dir) = harness();
+    let mut conn = open_window(&h, "victim", Size::new(120.0, 90.0));
+    until(&mut h, "the other window", |h| {
+        h.server().stat("windows") >= 2
+    });
+    h.settle();
+
+    // The launcher opens over it. The other window keeps the focus: a
+    // hotkey does not move it, which is the whole point of `NO_FOCUS`.
+    super_tap(&mut h);
+    until(&mut h, "the show", |h| h.state().is_visible());
+    h.key(46); // c
+    h.settle();
+    assert_eq!(h.state().query(), "c", "typing into the launcher");
+
+    // Now the focused window retitles itself, repeatedly, the way a
+    // terminal does on every prompt.
+    for (serial, title) in [(10u32, "victim: ls"), (11, "victim: vim"), (12, "victim")] {
+        conn.tx()
+            .set_window_title(NodeId(1), title)
+            .commit(serial)
+            .expect("retitle");
+        while !conn.flush().expect("flush") {}
+        h.settle();
+    }
+    // Give the notifications every chance to arrive and be mishandled.
+    for _ in 0..20 {
+        h.settle();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    assert_eq!(
+        h.state().focus_hides(),
+        0,
+        "a retitle is not a focus change"
+    );
+    assert!(
+        h.state().is_visible(),
+        "the launcher stayed up while the focused window retitled itself"
+    );
+    assert_eq!(h.state().query(), "c", "and kept what was typed");
+
+    drop(conn);
+    let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}
+
+#[test]
+fn focus_is_tracked_while_hidden_so_the_next_show_is_not_stale() {
+    // The ordering inside `focus_moved`: the bookkeeping runs *before*
+    // the "are we visible?" return. If it did not, focus changes that
+    // happened while the launcher was hidden would never be recorded,
+    // and the first change after the next show would be compared against
+    // a stale window id — so the launcher would either hide immediately
+    // (stale id differs) or, worse, fail to hide for the one window that
+    // happened to match.
+    let (mut h, dir) = harness();
+    assert!(!h.state().is_visible());
+    assert_eq!(h.state().focused_window(), None, "nothing focused yet");
+
+    // Two windows open and take focus in turn, all while hidden.
+    let a = open_window(&h, "first", Size::new(120.0, 90.0));
+    until(&mut h, "the first window", |h| {
+        h.state().focused_window().is_some()
+    });
+    let first = h.state().focused_window();
+    let b = open_window(&h, "second", Size::new(120.0, 90.0));
+    until(&mut h, "the second window to take focus", |h| {
+        h.state().focused_window() != first
+    });
+    let second = h.state().focused_window();
+    assert_ne!(
+        second, first,
+        "the launcher tracked the change while hidden"
+    );
+    assert_eq!(h.state().focus_hides(), 0, "and hid nothing doing it");
+
+    // Now show it: the currently focused window is already known, so the
+    // launcher stays up rather than hiding on a restatement of it.
+    super_tap(&mut h);
+    until(&mut h, "the show", |h| h.state().is_visible());
+    for _ in 0..10 {
+        h.settle();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(
+        h.state().is_visible(),
+        "it stayed up over the settled focus"
+    );
+    assert_eq!(h.state().focus_hides(), 0);
+
+    drop((a, b));
+    let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}
+
+#[test]
 fn an_ordinary_focus_change_costs_a_hidden_launcher_nothing() {
     // The other half of the rule, and the one that would make a desktop
     // unusable if it were wrong: while the launcher is hidden, every

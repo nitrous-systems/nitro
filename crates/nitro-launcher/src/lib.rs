@@ -167,6 +167,10 @@ pub struct Launcher {
     /// How many times another window taking focus has hidden the
     /// overlay, for the tests and for `hey`.
     focus_hides: u64,
+    /// Which window currently holds focus, so a `WindowInfo` that merely
+    /// restates it — a retitle, a state change, an app id — is not
+    /// mistaken for a focus change. See [`focus_moved`].
+    focused: Option<nitro_ui::shell::WindowRef>,
     /// The directory mtimes the last scan saw; a change means rescan.
     fingerprint: (u64, usize),
     /// Launched processes, so they can be reaped.
@@ -201,6 +205,7 @@ impl Launcher {
             query: String::new(),
             visible: false,
             focus_hides: 0,
+            focused: None,
             fingerprint: (0, 0),
             children: spawn::Children::new(),
             launches: 0,
@@ -250,6 +255,12 @@ impl Launcher {
     #[must_use]
     pub fn focus_hides(&self) -> u64 {
         self.focus_hides
+    }
+
+    /// Which window the launcher believes holds focus. For the tests.
+    #[must_use]
+    pub fn focused_window(&self) -> Option<nitro_ui::shell::WindowRef> {
+        self.focused
     }
 
     /// Everything the launcher could launch, in scan order.
@@ -521,6 +532,7 @@ fn install(ui: &mut Ui<Launcher>, ids: Ids) {
             // See [`focus_moved`] for why it is somebody *else* taking
             // focus rather than this window losing it.
             ShellEvent::Window(info) if info.focused => focus_moved(s, ui, info),
+            ShellEvent::WindowGone(w) => focus_gone(s, *w),
             _ => {}
         },
     );
@@ -600,25 +612,62 @@ pub fn toggle(s: &mut Launcher, ui: &mut Ui<Launcher>) {
 /// window, and waiting for one is how the first version of this ended up
 /// holding the keyboard grab until Escape.
 ///
-/// So the observable event is somebody *else* gaining focus, which the
-/// window-list subscription already reports as a `WindowInfo` with
-/// `focused: true`. Two windows are ignored:
+/// So the observable event is somebody *else* gaining focus. The server
+/// reports that as a `WindowInfo` with `focused: true` — but it reports a
+/// `WindowInfo` whenever **anything** about a window changes, with
+/// `focused` carrying the *current truth* rather than a transition.
+/// `clients.rs` relists a window on `SetWindowTitle` and `SetAppId`,
+/// `announce_state` on a minimize or maximize, and placement on a new
+/// window. So the already-focused window merely changing its title also
+/// arrives here saying `focused: true`.
+///
+/// Acting on that is a launcher that vanishes mid-word for no visible
+/// reason, and it is not an exotic case: a shell sets its terminal's
+/// title on every prompt, a browser on every page load, a clock-in-title
+/// app on a timer. **So the trigger is a change of
+/// [`WindowRef`](nitro_ui::shell::WindowRef) identity**, not the flag —
+/// `the_focused_window_retitling_itself_is_not_a_focus_change` is the
+/// regression.
+///
+/// Two more windows are ignored:
 ///
 /// * **our own**, because the server may report the overlay itself and
 ///   hiding on that would close the launcher the moment it opened;
 /// * anything while we are already hidden, which is every ordinary focus
 ///   change on the desktop and must cost nothing.
 ///
+/// The bookkeeping happens **before** both of those returns, and that
+/// ordering is load-bearing: a focus change observed while hidden still
+/// has to be recorded, or the first change after the next show would be
+/// compared against a stale value and be missed.
+///
 /// The launcher is opened by a hotkey rather than by a click, so this
 /// does not race its own opening: the tap does not move focus, and the
-/// window that had focus before the tap still has it afterwards — no new
-/// `WindowInfo { focused: true }` is produced by showing the overlay.
+/// window that had focus before the tap still has it afterwards.
 fn focus_moved(s: &mut Launcher, ui: &mut Ui<Launcher>, info: &WindowInfo) {
+    if s.focused == Some(info.window) {
+        // The same window, saying something else about itself changed.
+        return;
+    }
+    s.focused = Some(info.window);
     if !s.visible || info.app_id == APP_NAME {
         return;
     }
     s.focus_hides += 1;
     hide(s, ui);
+}
+
+/// A window is gone: forget it if it was the focused one.
+///
+/// Belt and braces rather than a fix for anything observable — a
+/// `WindowRef` is retired and never reused (`docs/shell.md`), so a stale
+/// one cannot come back and match. But "the focused window closed" is a
+/// real state, and leaving the id behind would mean the launcher
+/// believed something dead still held focus.
+fn focus_gone(s: &mut Launcher, window: nitro_ui::shell::WindowRef) {
+    if s.focused == Some(window) {
+        s.focused = None;
+    }
 }
 
 /// Put the overlay on screen: rescan if anything changed, clear the
