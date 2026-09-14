@@ -12,10 +12,14 @@ use std::path::PathBuf;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use rustix::event::{PollFd, PollFlags, poll};
+use rustix::time::{ClockId, Timespec, clock_gettime};
+
 use nitro_core::{Color, IRect, Point, Rect, Size};
 use nitro_kms::Image;
 use nitro_server::cursor::CURSOR_SIZE;
 use nitro_server::input::{FakeInput, InputEvent};
+use nitro_server::frame::FRAME_MARGIN_NS;
 use nitro_server::render::{FRAME, background_color};
 use nitro_server::{BackendKind, Config, run, wm};
 use nitro_wire::client::Connection;
@@ -227,6 +231,11 @@ fn stat(lines: &[String], key: &str) -> u64 {
 
 /// Drain a client's socket until `f` matches, or time out. Anything else
 /// that arrives is kept, so a later call can still see it.
+///
+/// Between polls it waits on the connection fd rather than sleeping a flat
+/// interval, so an answer is picked up as soon as it lands. That matters
+/// for the deferral tests, where the thing being measured *is* how quickly
+/// the client answers.
 fn expect<T>(
     conn: &mut Connection,
     seen: &mut Vec<ServerMsg>,
@@ -244,8 +253,79 @@ fn expect<T>(
             Ok(_) => {}
             Err(e) => panic!("waiting for {what}: {e}"),
         }
-        std::thread::sleep(Duration::from_millis(2));
+        if seen.iter().any(|m| f(m).is_some()) {
+            continue;
+        }
+        let fd = conn.as_fd();
+        let mut pfd = [PollFd::new(&fd, PollFlags::IN)];
+        let _ = poll(
+            &mut pfd,
+            Some(&Timespec {
+                tv_sec: 0,
+                tv_nsec: 2_000_000,
+            }),
+        );
     }
+}
+
+/// `CLOCK_MONOTONIC` nanoseconds, the clock the server's frame deadlines
+/// are expressed in.
+fn monotonic_ns() -> u64 {
+    let t = clock_gettime(ClockId::Monotonic);
+    t.tv_sec.cast_unsigned() * 1_000_000_000 + t.tv_nsec.cast_unsigned()
+}
+
+/// Block until the server's frame clock has just rolled over, so a motion
+/// injected next has most of a refresh period of deferral budget.
+///
+/// **Why a test needs this.** A held flip is bounded by
+/// `frame::frame_deadline`: the next *extrapolated* vblank minus
+/// [`FRAME_MARGIN_NS`]. The grid it extrapolates on is anchored at the last
+/// real flip, so after a `settle()` the test sits at an arbitrary phase of
+/// it — budgets measured across consecutive runs of the deferral test
+/// ranged from 2.6 ms to 16.1 ms. Inject a motion with 2 ms left and the
+/// client has 2 ms to answer; on a loaded box it does not, the deadline
+/// fires, the cursor flips alone and the content takes a flip of its own.
+/// That is the documented fallback, not a lost batch — but in a flip
+/// *count* the two are indistinguishable, which is exactly what made
+/// `a_client_that_answers_a_motion_rides_the_same_flip_as_the_cursor`
+/// flaky (#532, #545: 9 flips instead of 8, ~1 in 7 under load).
+///
+/// **Why this is honest.** The property under test is "the client's answer
+/// rides the cursor's flip", which presumes the client *can* answer inside
+/// the budget. Gating on the phase fixes the budget rather than widening
+/// the assertion, so a genuinely unbatched frame still fails.
+///
+/// `RequestFrame` on a quiescent server is answered off that same clock, so
+/// `Frame.deadline_ns` *is* the budget a motion injected now would get, and
+/// `deadline_ns + FRAME_MARGIN_NS` is the grid point it was derived from.
+/// Ask; if the budget is already at least half a period, go; otherwise
+/// sleep past that grid point and ask again.
+fn at_frame_start(conn: &mut Connection, seen: &mut Vec<ServerMsg>, window: NodeId, serial: u32) {
+    for attempt in 0..20 {
+        conn.tx()
+            .request_frame(window)
+            .commit(serial + attempt)
+            .unwrap();
+        conn.flush().unwrap();
+        let frame = expect(conn, seen, "Frame", |m| match m {
+            ServerMsg::Frame(f) if f.window == window => Some(*f),
+            _ => None,
+        });
+        seen.retain(|m| !matches!(m, ServerMsg::Frame(_)));
+        let budget_ns = frame.deadline_ns.saturating_sub(monotonic_ns());
+        if budget_ns >= u64::from(frame.refresh_ns) / 2 {
+            return;
+        }
+        // Sleep past the grid point the deadline was derived from; the
+        // next ask then starts a fresh period. A wakeup can be late but
+        // never early, so the loop converges from below.
+        let vblank_ns = frame.deadline_ns + FRAME_MARGIN_NS;
+        while monotonic_ns() <= vblank_ns {
+            std::thread::sleep(Duration::from_micros(200));
+        }
+    }
+    panic!("never caught the start of a frame period");
 }
 
 /// A window with one solid rect filling it, committed. Returns the ids.
@@ -1590,6 +1670,12 @@ fn a_client_that_answers_a_motion_rides_the_same_flip_as_the_cursor() {
 
     let before = h_.frames();
     for (serial, step) in (10..).zip(0..4u32) {
+        // Start the motion at the top of a frame period. Without this the
+        // deferral budget is whatever is left of the current one — as
+        // little as the 2 ms margin — and a loaded box makes the client
+        // miss it, which costs a flip and is what made this test flaky.
+        // See `at_frame_start`.
+        at_frame_start(&mut conn, &mut seen, win.root, 100 + step * 32);
         // One motion, and the client answers it the way `nitro-demo
         // --follow` does: a commit that moves a follower rect.
         h_.point_at(
