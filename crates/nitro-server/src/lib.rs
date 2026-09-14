@@ -33,6 +33,7 @@
 //! device → seat; the `Server` fields are declared in exactly that order.
 
 pub mod clients;
+pub mod config;
 pub mod control;
 pub mod cursor;
 pub mod defer;
