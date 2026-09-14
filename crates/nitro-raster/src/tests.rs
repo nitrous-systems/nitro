@@ -1048,31 +1048,6 @@ fn image_texel_edge_extends() {
     assert_eq!(xi.texel(0, 0).a, 255);
 }
 
-/// An ARGB source with structure in every channel and a full alpha sweep,
-/// so the split's interior run and its edges see transparent, translucent
-/// and opaque texels.
-fn noisy_argb_image(w: u32, h: u32, seed: u64) -> Vec<u8> {
-    let stride = (w * 4).div_ceil(64) * 64;
-    let mut out = vec![0u8; (stride * h) as usize];
-    let mut rng = Rng::new(seed);
-    for y in 0..h {
-        for x in 0..w {
-            let o = (y * stride + x * 4) as usize;
-            out[o] = rng.byte();
-            out[o + 1] = rng.byte();
-            out[o + 2] = rng.byte();
-            // Include 0 and 255 often: the transparent texel is the case the
-            // interior run deliberately stops branching on.
-            out[o + 3] = match rng.next_u32() % 4 {
-                0 => 0,
-                1 => 255,
-                _ => rng.byte(),
-            };
-        }
-    }
-    out
-}
-
 #[test]
 fn blit_split_is_byte_identical_to_the_general_walk() {
     // The scaled blit splits each destination row into an interior run --
@@ -1088,7 +1063,7 @@ fn blit_split_is_byte_identical_to_the_general_walk() {
     // sub-rects that put the source-clamp boundary inside the destination
     // row, both source formats, and clips that cut a row down to a couple of
     // columns -- i.e. rows that are *all* edge and have no interior at all.
-    let argb = noisy_argb_image(16, 16, 0x9E37_79B9_7F4A_7C15);
+    let argb = noisy_argb(16, 16, 0x9E37_79B9_7F4A_7C15);
     let mut cases = 0;
     for format in [PixelFormat::Argb8888, PixelFormat::Xrgb8888] {
         let img = image_of(&argb, 16, 16, format);
@@ -1140,7 +1115,7 @@ fn blit_split_is_byte_identical_to_the_general_walk() {
 fn blit_split_never_writes_outside_clip() {
     // The split hands each run a sub-slice of the row it computed itself, so
     // the clip contract is re-asserted against the split specifically.
-    let argb = noisy_argb_image(16, 16, 0x1234_5678_9ABC_DEF0);
+    let argb = noisy_argb(16, 16, 0x1234_5678_9ABC_DEF0);
     let img = image_of(&argb, 16, 16, PixelFormat::Argb8888);
     for clip in [
         IRect::new(7, 5, 19, 13),
@@ -1666,7 +1641,15 @@ fn mask_batch_and_loop_timing() {
 
 /// A noisy ARGB source: structure in every channel, and a deliberate excess of
 /// alpha 0 and 255, so a blit sweep sees transparent, translucent and opaque
-/// texels.
+/// texels — including the transparent one, which is the case the split's
+/// interior run deliberately stops branching on.
+///
+/// One generator for both the split's byte-identity sweep and the golden-hash
+/// sweep (issue #552 folded the second copy in). **The byte-generation order
+/// is load bearing**: `blit_output_matches_the_golden_hash` pins a hard-coded
+/// hash of this generator's output run through the blit, so changing the
+/// argument order, the `% 4` alpha distribution or the order of the `byte()`
+/// calls moves the hash and fails that test.
 fn noisy_argb(w: u32, h: u32, seed: u64) -> Vec<u8> {
     let stride = (w * 4).div_ceil(64) * 64;
     let mut out = vec![0u8; (stride * h) as usize];
