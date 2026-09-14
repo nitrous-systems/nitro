@@ -66,6 +66,7 @@ use nitro_kms::{
     Backend, DrmBackend, DrmOptions, Error as KmsError, Event, FakeBackend,
     OutputId as KmsOutputId, OutputInfo, Rect as KmsRect,
 };
+use nitro_raster::Canvas;
 use nitro_scene::{ClientId, DamageSink, OutputId as SceneOutputId, Scene, WindowKey, WindowState};
 use nitro_seat::{Device, Seat, SeatEvent};
 use nitro_wire::msg::{self, ClientMsg, ServerMsg};
@@ -136,6 +137,14 @@ pub struct Config {
     /// environment is process-global and the tests run in threads of one
     /// process.
     pub scales: HashMap<String, f32>,
+    /// Paint into a heap shadow buffer per output and stream the damage
+    /// into the scanout buffer, rather than rasterizing straight into it.
+    ///
+    /// On by default — it is ~4× on real (write-combined) framebuffers,
+    /// see `crates/nitro-server/src/frame.rs`. `NITRO_SHADOW=0` turns it
+    /// off so the two can be measured against each other on hardware; a
+    /// test sets it directly, for the same reason `scales` is a field.
+    pub shadow: bool,
 }
 
 impl Config {
@@ -155,6 +164,7 @@ impl Config {
             input_dir: None,
             fake_input: None,
             scales: HashMap::new(),
+            shadow: true,
         }
     }
 }
@@ -392,6 +402,10 @@ struct Server {
     frame_titles: HashMap<WindowKey, nitro_text::TextKey>,
     /// Per-output scale overrides from `NITRO_SCALE`, by connector name.
     scale_overrides: HashMap<String, f32>,
+    /// Whether each output gets a heap shadow buffer to paint into
+    /// (`NITRO_SHADOW`). Read when an output is added; see
+    /// [`frame::Shadow`].
+    shadow: bool,
     /// Watches `/sys` for input devices appearing and disappearing.
     input_hotplug: Option<nitro_kms::uevent::UeventSocket>,
     /// Where `event*` devices live, for the hotplug rescan.
@@ -598,6 +612,7 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         decorations: HashMap::new(),
         frame_titles: HashMap::new(),
         scale_overrides: std::mem::take(&mut config.scales),
+        shadow: config.shadow,
         input_hotplug,
         input_dir: config.input_dir.clone(),
         focus: None,
@@ -869,6 +884,17 @@ impl Server {
                 existing.width = info.width;
                 existing.height = info.height;
                 existing.refresh_ns = frame::refresh_ns(info.refresh_mhz);
+                // A mode change resizes the shadow, which clears it; the
+                // `invalidate` below is what repaints into it, so the two
+                // belong together.
+                if let Some(shadow) = existing.shadow.as_mut()
+                    && (shadow.width() != info.width || shadow.height() != info.height)
+                {
+                    // A resized shadow is blank again; the `invalidate`
+                    // below is what repaints into it, so the two belong
+                    // together.
+                    *shadow = frame::Shadow::new(info.width, info.height);
+                }
                 existing.invalidate();
                 continue;
             }
@@ -887,6 +913,7 @@ impl Server {
                 info.width,
                 info.height,
                 info.refresh_mhz,
+                self.shadow,
             ));
         }
         if lost {
@@ -1079,6 +1106,14 @@ impl Server {
 
     /// Paint and commit one output if it is writable and has anything new.
     ///
+    /// With a shadow buffer this is two steps with two different cost
+    /// models: rasterize **this frame's damage** into heap memory, then
+    /// stream `damage(n) ∪ damage(n-1)` — the age-2 region the back buffer
+    /// is behind by — out of the shadow into the write-combined scanout
+    /// mapping with write-only row copies. Without one (`NITRO_SHADOW=0`)
+    /// the rasterizer is given the union and writes it straight out, which
+    /// is what the server did before #539.
+    ///
     /// Returns whether a commit went in, which
     /// [`Server::paint_all`] uses to tell "nothing to do" from "held".
     fn paint(&mut self, id: KmsOutputId) -> bool {
@@ -1097,7 +1132,7 @@ impl Server {
         }
         let scene_id = self.outputs[index].scene_id;
         let cursor_state = self.cursor_state(scene_id);
-        let paint_us = {
+        let (paint_us, copy_us) = {
             let mut buf = match self.backend.back_buffer(id) {
                 Ok(b) => b,
                 Err(e) => {
@@ -1105,15 +1140,46 @@ impl Server {
                     return false;
                 }
             };
-            frame::paint_region(
-                &mut buf,
-                &self.scene,
-                &mut self.text,
-                scene_id,
-                &region,
-                (&self.cursor, cursor_state),
-                &mut self.paint_items,
-            )
+            let output = &mut self.outputs[index];
+            let bounds = output.bounds();
+            let mut rasterize = output.rasterize_region();
+            if let Some(shadow) = output.shadow.as_mut() {
+                // A stride or geometry the shadow was not built for means
+                // its contents are gone, and a partial copy out of a blank
+                // shadow would put black on screen. Repaint everything
+                // instead — the same answer `invalidate` gives, for the
+                // same reason. (The first frame of every output takes this
+                // branch on a backend whose pitch is not `width * 4`, and
+                // is a full repaint already.)
+                if shadow.ensure(buf.width, buf.height, buf.stride) {
+                    rasterize = vec![bounds];
+                }
+                let paint_us = frame::paint_region(
+                    &mut shadow.canvas(),
+                    &self.scene,
+                    &mut self.text,
+                    scene_id,
+                    &rasterize,
+                    (&self.cursor, cursor_state),
+                    &mut self.paint_items,
+                );
+                shadow.note_painted(&rasterize);
+                let copy_us = frame::copy_region(shadow, &mut buf, &region);
+                (paint_us, copy_us)
+            } else {
+                let (width, height, stride) = (buf.width, buf.height, buf.stride);
+                let mut canvas = Canvas::new(buf.data, width, height, stride);
+                let paint_us = frame::paint_region(
+                    &mut canvas,
+                    &self.scene,
+                    &mut self.text,
+                    scene_id,
+                    &region,
+                    (&self.cursor, cursor_state),
+                    &mut self.paint_items,
+                );
+                (paint_us, 0)
+            }
         };
         // One frame stamp per painted frame: the atlas's LRU counts frames,
         // not glyphs.
@@ -1126,6 +1192,7 @@ impl Server {
         match self.backend.commit(id, &kms_damage) {
             Ok(()) => {
                 self.stats.paint_us.push(paint_us);
+                self.stats.copy_us.push(copy_us);
                 self.stats.damage_px.push(damage_px);
                 self.outputs[index].committed();
                 true
@@ -1133,7 +1200,9 @@ impl Server {
             Err(e) => {
                 warn!("{id}: commit: {e}");
                 // Keep the damage so the next event retries; otherwise the
-                // output stalls until the next resume or hotplug.
+                // output stalls until the next resume or hotplug. The
+                // shadow keeps what was painted into it — it is never
+                // stale — so the retry only has to copy again.
                 self.outputs[index].commit_failed(&region);
                 false
             }
@@ -3139,6 +3208,7 @@ impl Server {
             Ok(Request::Outputs) => protocol::outputs_reply(self.backend.outputs()),
             Ok(Request::Stats) => self.stats_reply(),
             Ok(Request::Shot(name)) => self.shot(name.as_deref()),
+            Ok(Request::ShotFront(name)) => self.shot_front(name.as_deref()),
             Ok(Request::Quit) => {
                 info!("quit requested");
                 self.quit = true;
@@ -3184,6 +3254,18 @@ impl Server {
         pairs.push(("windows", self.scene.window_count() as u64));
         pairs.push(("nodes", self.scene.node_count() as u64));
         pairs.push(("outputs", self.outputs.len() as u64));
+        // Heap the shadow buffers hold, summed over the outputs: ~8 MB per
+        // 1080p screen, 0 under `NITRO_SHADOW=0`. It is the one deliberate
+        // memory-for-speed trade in the server (`docs/budget.md`), so it
+        // is reported rather than left to be inferred from `outputs`.
+        pairs.push((
+            "shadow_bytes",
+            self.outputs
+                .iter()
+                .filter_map(|o| o.shadow.as_ref())
+                .map(frame::Shadow::bytes)
+                .sum(),
+        ));
         // The window-management view: how many windows carry a
         // server-drawn frame, how many are hidden, and whether a drag is
         // in flight. `decorated` under `windows` is the opt-out count.
@@ -4200,7 +4282,59 @@ impl Server {
         protocol::ok_reply()
     }
 
+    /// Answer a `shot`: the pixels of one output, `XRGB8888`.
+    ///
+    /// Taken from the shadow when there is one. That is both cheaper (no
+    /// uncached reads back out of the write-combined mapping) and *more*
+    /// honest: the shadow is complete by construction, whereas the front
+    /// buffer is only complete because the age-2 rule says so. The two are
+    /// byte-identical once a frame has settled, which
+    /// `tests/shadow.rs` pins.
+    ///
+    /// A shadow that has never been painted into would be black, so it is
+    /// only trusted after the first commit — before that the front buffer
+    /// is the one with real pixels in it.
     fn shot(&mut self, name: Option<&str>) -> Vec<u8> {
+        let id = match self.shot_output(name) {
+            Ok(id) => id,
+            Err(reply) => return reply,
+        };
+        if let Some(shadow) = self
+            .outputs
+            .iter()
+            .find(|o| o.kms_id == id)
+            .and_then(|o| o.shadow.as_ref())
+            .filter(|s| s.is_complete())
+        {
+            return protocol::shot_reply(&shadow.image());
+        }
+        match self.backend.read_front(id) {
+            Ok(img) => protocol::shot_reply(&img),
+            Err(e) => protocol::err_reply(&e.to_string()),
+        }
+    }
+
+    /// Answer a `shot-front`: the same pixels, read off the scanout buffer
+    /// whatever the shadow says.
+    ///
+    /// Test-only. It is the only way to check that the copy out of the
+    /// shadow put the right bytes in the buffer the display scans, which
+    /// an ordinary `shot` would answer out of the shadow and therefore
+    /// could not fail.
+    fn shot_front(&mut self, name: Option<&str>) -> Vec<u8> {
+        let id = match self.shot_output(name) {
+            Ok(id) => id,
+            Err(reply) => return reply,
+        };
+        match self.backend.read_front(id) {
+            Ok(img) => protocol::shot_reply(&img),
+            Err(e) => protocol::err_reply(&e.to_string()),
+        }
+    }
+
+    /// Which output a `shot`-shaped request names, or the `err` reply to
+    /// send instead.
+    fn shot_output(&self, name: Option<&str>) -> Result<KmsOutputId, Vec<u8>> {
         let id = match name {
             Some(n) => self
                 .backend
@@ -4210,16 +4344,12 @@ impl Server {
                 .map(|o| o.id),
             None => self.backend.outputs().first().map(|o| o.id),
         };
-        let Some(id) = id else {
-            return protocol::err_reply(&match name {
+        id.ok_or_else(|| {
+            protocol::err_reply(&match name {
                 Some(n) => format!("no output named {n}"),
                 None => "no outputs".to_owned(),
-            });
-        };
-        match self.backend.read_front(id) {
-            Ok(img) => protocol::shot_reply(&img),
-            Err(e) => protocol::err_reply(&e.to_string()),
-        }
+            })
+        })
     }
 }
 

@@ -141,6 +141,9 @@ pub const I2P_WINDOW: usize = 100;
 pub struct FrameStats {
     /// Microseconds spent rasterizing, per frame.
     pub paint_us: Window,
+    /// Microseconds spent streaming the shadow into the scanout buffer,
+    /// per frame; always 0 under `NITRO_SHADOW=0`, where there is no copy.
+    pub copy_us: Window,
     /// Damaged device pixels repainted, per frame.
     pub damage_px: Window,
     /// Input-to-photon latency in microseconds.
@@ -153,6 +156,7 @@ impl FrameStats {
     pub fn new() -> Self {
         Self {
             paint_us: Window::new(PAINT_WINDOW),
+            copy_us: Window::new(PAINT_WINDOW),
             damage_px: Window::new(PAINT_WINDOW),
             i2p_us: Window::new(I2P_WINDOW),
         }
@@ -172,6 +176,13 @@ impl FrameStats {
         out.push(("paint_us_min", self.paint_us.min()));
         out.push(("paint_us_mean", self.paint_us.mean()));
         out.push(("paint_us_max", self.paint_us.max()));
+        // The copy keys sit next to the paint ones and are spelled the
+        // same way, because they are the other half of the same frame:
+        // `paint_us` is the rasterizer in cached heap memory,
+        // `copy_us` the write-combined stream out to the scanout buffer.
+        out.push(("copy_us_min", self.copy_us.min()));
+        out.push(("copy_us_mean", self.copy_us.mean()));
+        out.push(("copy_us_max", self.copy_us.max()));
         out.push(("damage_px_mean", self.damage_px.mean()));
         out.push(("i2p_min_us", self.i2p_us.min()));
         out.push(("i2p_mean_us", self.i2p_us.mean()));
@@ -291,10 +302,12 @@ mod tests {
         let mut s = FrameStats::new();
         for i in 0..(PAINT_WINDOW + I2P_WINDOW) as u64 {
             s.paint_us.push(i);
+            s.copy_us.push(i);
             s.damage_px.push(i);
             s.i2p_us.push(i);
         }
         assert_eq!(s.paint_us.len(), PAINT_WINDOW);
+        assert_eq!(s.copy_us.len(), PAINT_WINDOW);
         assert_eq!(s.damage_px.len(), PAINT_WINDOW);
         assert_eq!(s.i2p_us.len(), I2P_WINDOW);
     }
@@ -304,6 +317,9 @@ mod tests {
         let mut s = FrameStats::default();
         for v in [10, 20, 60] {
             s.paint_us.push(v);
+        }
+        for v in [1, 2, 3] {
+            s.copy_us.push(v);
         }
         for v in [100, 300] {
             s.damage_px.push(v);
@@ -320,6 +336,9 @@ mod tests {
                 ("paint_us_min", 10),
                 ("paint_us_mean", 30),
                 ("paint_us_max", 60),
+                ("copy_us_min", 1),
+                ("copy_us_mean", 2),
+                ("copy_us_max", 3),
                 ("damage_px_mean", 200),
                 ("i2p_min_us", 5),
                 ("i2p_mean_us", 6),
@@ -332,7 +351,7 @@ mod tests {
     fn write_pairs_on_empty_stats_is_all_zeros() {
         let mut out = Vec::new();
         FrameStats::new().write_pairs(&mut out);
-        assert_eq!(out.len(), 7);
+        assert_eq!(out.len(), 10);
         assert!(out.iter().all(|&(_, v)| v == 0));
     }
 
@@ -340,7 +359,7 @@ mod tests {
     fn write_pairs_appends_rather_than_replaces() {
         let mut out = vec![("frames", 42)];
         FrameStats::new().write_pairs(&mut out);
-        assert_eq!(out.len(), 8);
+        assert_eq!(out.len(), 11);
         assert_eq!(out[0], ("frames", 42));
     }
 }

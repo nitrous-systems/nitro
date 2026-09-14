@@ -15,6 +15,9 @@
 //!   which is what a headless test wants.
 //! - `NITRO_SCALE=<connector>=<f32>,…` overrides an output's scale; see
 //!   `docs/wm.md`.
+//! - `NITRO_SHADOW=0` paints straight into the scanout buffer instead of
+//!   into a per-output heap shadow (the default). For A/B measurement on
+//!   real hardware; see `crates/nitro-server/src/frame.rs`.
 //! - `NITRO_LOG=error|warn|info|debug`.
 
 use std::path::PathBuf;
@@ -86,6 +89,10 @@ fn config_from_env() -> Result<Config, String> {
         scales: std::env::var("NITRO_SCALE")
             .map(|s| nitro_server::parse_scales(&s))
             .unwrap_or_default(),
+        // Anything but `0` leaves the shadow on: this is a measurement
+        // escape hatch, not a configuration surface, and the default is
+        // the one that ships.
+        shadow: std::env::var("NITRO_SHADOW").as_deref() != Ok("0"),
     })
 }
 

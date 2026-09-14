@@ -7,6 +7,7 @@
 //! | request              | reply                                                        |
 //! |----------------------|--------------------------------------------------------------|
 //! | `shot [output-name]` | `ok <w> <h> <stride>\n` + `stride*h` bytes `XRGB8888`         |
+//! | `shot-front [name]`  | the same, read off the **scanout** buffer; for tests          |
 //! | `outputs`            | `ok\n` + one `name WxH@refresh_mhz\n` per output + `\n`       |
 //! | `stats`              | `ok\n` + `key value\n` lines + `\n`                           |
 //! | `quit`               | `ok\n`, then the server shuts down                           |
@@ -23,8 +24,18 @@ use nitro_kms::{Image, OutputInfo};
 /// A parsed request line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
-    /// Front-buffer readback of one output (the first when unnamed).
+    /// Readback of one output (the first when unnamed): the shadow buffer
+    /// when there is one, else the front buffer. Both hold the same image;
+    /// the shadow is simply cheaper to read.
     Shot(Option<String>),
+    /// Readback of the **scanout** buffer specifically, bypassing the
+    /// shadow.
+    ///
+    /// Test-only, like [`Request::Plug`], and it exists because the shadow
+    /// makes [`Request::Shot`] unable to see the one thing a shadow test
+    /// has to check: that the right pixels were streamed *out* of the
+    /// shadow into the buffer the display actually scans.
+    ShotFront(Option<String>),
     /// List outputs.
     Outputs,
     /// Frame counters.
@@ -63,6 +74,7 @@ pub fn parse(line: &str) -> Result<Request, String> {
     }
     match (cmd, arg) {
         ("shot", name) => Ok(Request::Shot(name.map(str::to_owned))),
+        ("shot-front", name) => Ok(Request::ShotFront(name.map(str::to_owned))),
         ("plug", Some(size)) => {
             let (w, h) = size
                 .split_once(['x', 'X'])
@@ -147,6 +159,11 @@ mod tests {
         assert_eq!(
             parse("shot HDMI-A-1\r\n"),
             Ok(Request::Shot(Some("HDMI-A-1".to_owned())))
+        );
+        assert_eq!(parse("shot-front\n"), Ok(Request::ShotFront(None)));
+        assert_eq!(
+            parse("shot-front HDMI-A-1"),
+            Ok(Request::ShotFront(Some("HDMI-A-1".to_owned())))
         );
         assert_eq!(parse("  outputs  "), Ok(Request::Outputs));
         assert_eq!(parse("stats"), Ok(Request::Stats));
