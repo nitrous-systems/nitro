@@ -244,7 +244,7 @@ full output below.
 | a `solid_fill` | **0.17 ms** | 0.33 ms | **1.82 ms** | 2.21 ms | 1.21× |
 | b `rrects_alpha` | **5.47 ms** | 3.55 ms | **11.73 ms** | 8.02 ms | 0.68× |
 | c `gradient` | **0.18 ms** | 1.84 ms | **1.82 ms** | 5.48 ms | 3.01× |
-| d `blits` | **24.21 ms** | 9.29 ms | **35.49 ms** | 21.19 ms | 0.60× |
+| d `blits` | **24.17 ms** | 9.29 ms | **35.49 ms** | 21.19 ms | 0.60× |
 | e `ui_frame` | **2.98 ms** | 14.68 ms | **5.22 ms** | 27.23 ms | 5.22× |
 
 Only (d) changed by design — see [the blit row split](#the-blit-row-split),
@@ -262,12 +262,12 @@ Raw output:
 ```
 # dev, --iters 40 (min of 3 runs; run-to-run spread < 0.5 %)
 scene a  solid_fill    min=0.170ms  median=0.171ms
-scene b  rrects_alpha  min=5.466ms  median=5.495ms
-scene c  gradient      min=0.175ms  median=0.176ms
-scene d  blits         min=24.202ms median=24.278ms
-scene e  ui_frame      min=2.978ms  median=2.988ms
-scene f  glyphs_loop   min=0.228ms  median=0.231ms
-scene g  glyphs_batch  min=0.227ms  median=0.230ms
+scene b  rrects_alpha  min=5.450ms  median=5.473ms
+scene c  gradient      min=0.176ms  median=0.178ms
+scene d  blits         min=24.169ms median=24.272ms
+scene e  ui_frame      min=2.971ms  median=2.978ms
+scene f  glyphs_loop   min=0.227ms  median=0.229ms
+scene g  glyphs_batch  min=0.225ms  median=0.227ms
 
 # box (ssh kaspar@192.168.1.204), --iters 25 (min of 3 runs)
 scene a  solid_fill    min=1.823ms  median=1.878ms
@@ -377,7 +377,7 @@ later round added **(d) < 10 ms**.
 
 - **(d) is 35.49 ms on the box, down from 38.08 — and the 10 ms target is
   still not reachable in scalar code.** The row split that #3693 measured and
-  then reverted has been **re-taken**: 27.31 → 24.21 ms dev, 38.30 → 35.49 ms
+  then reverted has been **re-taken**: 27.31 → 24.17 ms dev, 38.30 → 35.49 ms
   box. It was reverted because it lost on the write-combined DRM dumb buffer;
   #539 moved the rasterizer's destination to a heap shadow, which removed that
   objection. See [the blit row split](#the-blit-row-split).
@@ -537,16 +537,22 @@ interior, a trailing edge. The edges keep the fully general loop; the
 interior (`blit_run_inner`) is branch-free — loads, multiplies, one 4-byte
 store — which is the shape the autovectorizer wants.
 
-The early-`continue`s are deliberately **not** carried into the interior.
-Skipping a fully transparent texel and blending it write the same bytes, so
-the branch bought nothing and cost the vectorizer everything. That was the
-lesson of the *first* attempt at this split, which kept them and was slower.
+Two of the early-`continue`s are deliberately **not** carried into the
+interior. Skipping a fully transparent texel and blending it write the same
+bytes, so those branches bought nothing and cost the vectorizer everything.
+That was the lesson of the *first* attempt at this split, which kept them and
+was slower.
+
+**The third one is not like the other two, and dropping it was a bug.** See
+[the guard that looks redundant](#the-guard-that-looks-redundant) — it is the
+most useful thing this round produced after the measurement section, because
+of how nearly it shipped.
 
 | | dev | box |
 |---|---|---|
 | without the split | 27.31 ms | 38.30 ms |
-| with the split | **24.21 ms** | **35.49 ms** |
-| | −11.4 % | −7.4 % |
+| with the split | **24.17 ms** | **35.49 ms** |
+| | −11.5 % | −7.4 % |
 
 Four interleaved pairs on dev, three on the box, non-overlapping on both.
 
@@ -561,10 +567,68 @@ that forces every column through the edge run. Exact equality is the right
 bar: an interior that rounded differently from its edges would be a seam down
 both sides of every scaled image.
 
+**That test is necessary and it is not sufficient** — see below.
+
 This is the lever #3693 measured, kept, and then reverted because it lost on
 the write-combined DRM dumb buffer. #539 moved the rasterizer's destination to
 a heap shadow, which removed the reason for the revert; re-taking it was this
 round's job.
+
+### The guard that looks redundant
+
+The interior run drops the general loop's three early-`continue`s. Two of
+them — a fully transparent texel, a zero coverage — really are redundant:
+blending them writes the destination's own bytes back. The third is
+`alpha == 0`, and it is **load bearing**:
+
+```rust
+over_premul(src_premul, dst, 0) == src_premul + dst
+```
+
+With zero alpha the destination is not preserved — the premultiplied source
+channel is *added* to it. That is harmless only if a zero alpha implies zero
+channels, and it does not always, because the channel and the alpha are
+**rounded separately**. `bilinear` can return `t.b > t.a` by one step, and
+then `div255(t.a * extra)` is 0 while `div255(t.b * extra)` is 1. There are
+637 such `(t.a, t.b, extra)` triples.
+
+The visible effect was **one pixel, one channel, off by one**, in a sweep of
+3600 blit configurations. A blit that brightens a single pixel by 1/255 does
+not get reported as a bug and does not get found by looking.
+
+**Why the byte-identity test did not catch it.**
+`blit_split_is_byte_identical_to_the_general_walk` compares the split against
+`blit_general` — but `blit_general` forces every column through the *edge*
+run, and the edge run is part of the same new code. Both sides of the
+comparison dropped the guard together, so both agreed, byte for byte, on the
+wrong answer. **Byte-identity to yourself is not correctness**, and that is
+the trap: the test is a genuinely strong check on the split *boundary*, and it
+is worth nothing against a mistake in the code the two paths share.
+
+What found it was comparing against **the previous revision** rather than
+against a sibling path: hash the output of a blit sweep through the public API
+on this branch and on `329faf3`, diff the hashes, bisect to the case, dump the
+pixels. `blit_output_matches_the_golden_hash` now pins that value permanently,
+so the next change to this code is checked against what shipped before it, not
+against its own reflection.
+
+**Restoring the guard was not free**, which is why the shape of the fix is
+worth recording. Putting it back per pixel cost **2.1 ms of the 3.1 ms the
+split saves** — it sits in the dependency chain of all three channels and
+stops the loop vectorizing. But `extra` is *constant across a run*, and the
+guard is provably dead when `extra >= 128`: above that threshold
+`div255(t.a * extra)` is zero only when `t.a` is zero, and `bilinear` returns
+an all-zero texel in that case. (128 is exact, not a round number — at 127,
+`t.a = 1` still rounds to zero.) So it is resolved **once per run**, and the
+faint-`extra` loop is `#[cold]` and `#[inline(never)]`, because merely letting
+it share a function with the hot loop cost **1.6 ms even when it never ran**.
+Scene (d) is back to 24.17 ms and the sweep hash matches `329faf3` exactly.
+
+Three tests pin the reasoning rather than just the outcome: the `alpha == 0`
+sweep over every `(t.a, t.b, extra)`, the threshold being exactly 128, and
+`bilinear` zeroing its channels when its alpha is zero. If any of those three
+facts stops being true, the fast path is unsound, and one of them is in
+another function — which is exactly the sort of coupling that rots silently.
 
 ### Measuring this crate
 
