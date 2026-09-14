@@ -191,8 +191,8 @@ the spawn path, which is reuse rather than a dependency in the sense this
 file counts. `cargo tree -e normal -p nitro-files --prefix none | sort -u`
 is `rustix` (+ `bitflags`, `linux-raw-sys`), `zerocopy` (+ its derive and
 the `syn` chain) and the nitro crates: every one of them already in the
-tree. The whole-workspace figure moves **74 → 76** lines and stays at
-**37 distinct external crate names** — the two new lines are
+tree. The whole-workspace figure moves **75 → 77** lines and stays at
+**41 distinct external crate names** — the two new lines are
 `nitro-files` itself and a second `nitro-launcher (*)`, cargo's marker
 for a subtree it has already printed.
 
