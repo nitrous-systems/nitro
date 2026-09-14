@@ -104,24 +104,36 @@ what "a slot the paint did not emit is destroyed" gives it. A terminal's
 slots are its *content*, and it needs a third answer: not "emit" and not
 "omit" but "unchanged". See `docs/ui.md`.
 
-**3. The scene is touched once per frame, not once per wakeup.** Bytes
-are drained from the pty the moment they arrive — the child must never
-block on a full pipe — but they go only into the grid: `feed` marks the
-*grid*, which records its own damage, and deliberately does **not** mark
-the widget. `paint_dirty_rows` does, and the app calls it from its frame
-callback (`Ui::request_frame`, also new).
+**3. A commit carries a screenful, not a line.** Bytes are drained from
+the pty the moment they arrive — the child must never block on a full
+pipe — and a single drain reads at most `DRAIN_CHUNK`, 256 KiB or about
+four screenfuls, before handing the loop back. That bound is what paces
+the scene: `seq 1 1000000` is ~6.9 MB and costs a few dozen commits, not
+a million.
 
-That split is the whole mechanism, and it is worth stating precisely
-because it is easy to undo by accident. `App`'s loop flushes after
-**every** wakeup, and a flush paints whatever is marked — so whichever of
-the two marks the widget decides the commit rate. Marking in `feed` also
-*looks* right and measures fine on a bulk writer like `seq`, because the
-256 KiB drain cap already bounds it to about thirty commits; the case
-that separates the two designs is a slow chatty writer, a build log at a
-few hundred small writes a second, where marking on arrival is hundreds
-of commits against sixty frames.
-`the_scene_is_touched_once_per_frame_not_once_per_wakeup` is that writer,
-and it fails if `feed` marks the widget.
+The *upper* bound is the server's rather than ours. It coalesces flips,
+so however many commits arrive the glass changes at most once per
+refresh, and the intermediate grids were never visible to anybody.
+
+A frame callback is still requested and counted — it is how the app knows
+how often the screen really changed — but it is deliberately **not**
+load-bearing for painting, and that is a correction the hardware forced
+rather than a preference. The tidier design, and the one this document
+claimed until the box contradicted it, is to mark the widget for paint
+*only* from the frame callback, so that the scene is touched exactly once
+per `Frame`. It freezes the screen. A `RequestFrame` is one-in-flight
+(`Ui::request_frame` early-returns while one is outstanding), so painting
+becomes strictly dependent on the answer arriving — and a server
+coalescing flips under load is precisely when it does not. Measured:
+**four frames in twelve seconds** of steady output, with consecutive
+framebuffer readbacks byte-identical while `hey … get grid text` showed
+the model advancing. The grid moved; the display did not.
+
+The lesson is worth more than the paragraph it cost. "Once per frame" is
+a claim about the *display*, and the display is the server's to pace; a
+client that tries to enforce it a second time is adding a dependency, not
+a guarantee. `a_commit_carries_a_screenful_not_a_line` asserts the bound
+the client actually provides.
 
 And when nothing is happening, nothing is asked for: no frame is
 requested when the grid has no damage, so the app sits in `epoll_wait`

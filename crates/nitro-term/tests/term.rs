@@ -441,63 +441,51 @@ fn the_window_backdrop_is_the_terminals_own_background() {
 }
 
 #[test]
-fn the_scene_is_touched_once_per_frame_not_once_per_wakeup() {
-    // The claim `docs/term.md` makes and this test is the only thing
-    // that holds to it: bytes arriving mark the *grid*, and only the
-    // frame callback marks the *widget*, so the scene is committed once
-    // per frame however many wakeups delivered the bytes.
+fn a_commit_carries_a_screenful_not_a_line() {
+    // What actually bounds the commit rate, asserted on the real loop
+    // sequence (drain, then flush — `event_loop_with` flushes after every
+    // wakeup).
     //
-    // The writer here is deliberately **slow and chatty** rather than
-    // fast and bulky, because that is where the two possible designs
-    // come apart. A bulk writer like `seq` is paced into ~30 commits by
-    // the 256 KiB drain cap whether or not frame pacing exists, so it
-    // cannot tell them apart — which is exactly how an earlier version
-    // of this crate shipped with `feed` marking the widget directly and
-    // still measured a plausible commit count. A build log emitting a
-    // few hundred small writes a second wakes the loop on each one; with
-    // pacing that is still one commit per frame, without it it is one
-    // commit per wakeup.
-    let (mut h, grid) = harness_running(&[
-        "/bin/sh",
-        "-c",
-        // ~40 separate writes, each its own wakeup, no two in one drain.
-        "i=0; while [ $i -lt 40 ]; do printf 'line %s\\n' $i; i=$((i+1)); \
-         sleep 0.02; done; printf 'CHATDONE\\n'",
-    ]);
-
+    // The claim is about **bytes per commit**, not frames per commit, and
+    // that is a correction the box forced. The tidier design — mark paint
+    // only from the frame callback, so the scene is touched once per
+    // `Frame` — froze the screen: a `RequestFrame` is one-in-flight, so
+    // painting became dependent on an answer that a server coalescing
+    // flips under load does not send. Four frames in twelve seconds, with
+    // consecutive framebuffer readbacks byte-identical while output
+    // flowed.
+    //
+    // So `DRAIN_CHUNK` is the bound: at most 256 KiB of pty output per
+    // commit. A megabyte of `seq` is a few dozen commits rather than a
+    // million, and the server's flip coalescing keeps the *glass* at one
+    // change per refresh however many commits arrive.
+    let (mut h, grid) = harness_running(&["/bin/sh", "-c", "seq 1 200000"]);
     h.tap();
     h.clear_tap();
     let before = h.commits();
-    let mut wakeups = 0u32;
-    let mut frames = 0u32;
 
     let deadline = Instant::now() + DEADLINE;
-    while !screen(&mut h, grid).contains("CHATDONE") {
-        // One turn of the real loop: drain the descriptor, then flush —
-        // `drain_only` does both, as `event_loop_with` does.
+    while !screen(&mut h, grid).contains("200000") {
         drain_only(&mut h);
-        wakeups += 1;
-        // A frame only every fourth turn, so "per wakeup" and "per
-        // frame" are far enough apart to be unambiguous.
-        if wakeups.is_multiple_of(4) {
-            h.frame();
-            frames += 1;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for the chatty writer"
-        );
-        std::thread::sleep(Duration::from_millis(5));
+        assert!(Instant::now() < deadline, "timed out waiting for seq");
     }
     let commits = h.commits() - before;
+    let bytes = h.state().bytes_read();
 
-    // The frames granted, plus a little slack for the settle inside
-    // `h.frame()` and for the final partial batch. The number that must
-    // *not* appear is one per wakeup.
+    // 200 000 lines is ~1.3 MB: six 256 KiB chunks, plus slack for the
+    // partial reads a pipe delivers. The number that must not appear is
+    // anything approaching one per line.
+    let floor = bytes as usize / (256 * 1024);
     assert!(
-        commits <= frames + 4,
-        "{commits} commits for {frames} frames over {wakeups} wakeups; \
-         the scene is being touched per wakeup, not per frame"
+        commits < 200,
+        "{commits} commits for {bytes} bytes ({} lines); chunking should \
+         give roughly {floor}, and one-per-line would be 200 000",
+        200_000
+    );
+    assert!(
+        commits >= 2,
+        "{commits} commits for {bytes} bytes — the screen cannot be \
+         keeping up with a burst it only drew once"
     );
     h.quit();
 }

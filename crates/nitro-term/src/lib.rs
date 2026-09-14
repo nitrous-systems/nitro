@@ -50,17 +50,17 @@
 //! The loop below is the reason `seq 1 1000000` does not melt the
 //! compositor. Bytes are drained from the pty the instant they arrive —
 //! the child must never block on a full pipe — but they go only into the
-//! grid, and [`widget::TermGridMut::feed`] deliberately does **not**
-//! mark the widget for paint. [`widget::paint_dirty_rows`] does, from
-//! the frame callback ([`Ui::request_frame`]).
+//! grid, and a commit carries **at most [`DRAIN_CHUNK`] of pty output**
+//! — 256 KiB, about four screenfuls — rather than one line.
 //!
-//! The split matters because [`App`]'s loop flushes after *every*
-//! wakeup and a flush paints whatever is marked: marking on arrival
-//! would commit once per epoll wakeup that carried data, which for a
-//! chatty writer is hundreds a second against sixty frames. Marking in
-//! the callback makes it one commit per refresh, each showing the grid
-//! as it stands at that moment — the intermediate states were never
-//! visible and did not need to be drawn.
+//! That bound, not the frame callback, is what paces the scene, and the
+//! distinction was settled on hardware rather than argued: making the
+//! frame callback the only thing that could paint froze the screen,
+//! because a `RequestFrame` is one-in-flight and a server coalescing
+//! flips under load is precisely when its answer does not come. The
+//! server's own flip coalescing supplies the upper bound a frame
+//! callback was meant to: however many commits arrive, the glass
+//! changes at most once per refresh. See `docs/term.md`.
 //!
 //! And when nothing is happening, nothing is asked for: no frame is
 //! requested when the grid has no damage, so the app sits in
@@ -381,20 +381,24 @@ pub fn install(ui: &mut Ui<TermApp>, state: &mut TermApp, grid: WidgetId) -> Res
             ui.quit();
         }
     })?;
-    // The frame callback is the only place output touches the scene, and
-    // this is where that is made true rather than merely claimed:
-    // `feed` marks the *grid*, and `paint_dirty_rows` marks the
-    // *widget*. The app loop flushes after every wakeup, so whichever of
-    // the two marks the widget decides the commit rate — per wakeup if
-    // `feed` did it, per frame if this does.
+    // The frame callback counts frames and re-arms; it is deliberately
+    // *not* the only thing that can paint.
     //
-    // Asking for the next frame *after* marking keeps exactly one
-    // request outstanding: if the grid is still dirty (it will not be,
-    // since the flush after this handler draws it) or becomes dirty
-    // again before the flip, the next drain asks.
+    // Making it so was the tidier design and it froze the screen: a
+    // `RequestFrame` is one-in-flight, so painting became dependent on
+    // the answer arriving — and during a sustained burst the server is
+    // coalescing flips, which is exactly when it does not. Four frames
+    // in twelve seconds on the box, with consecutive framebuffer
+    // readbacks byte-identical while output flowed. See
+    // `TermGridMut::feed` for the full reasoning and `docs/term.md` for
+    // what bounds the commit rate instead.
+    //
+    // Re-arming here keeps one request outstanding while output is
+    // flowing, which is what makes `frames` a usable measure of how
+    // often the screen actually changed.
     ui.on_frame(move |s: &mut TermApp, ui: &mut Ui<TermApp>, _f| {
         s.frames += 1;
-        crate::widget::paint_dirty_rows(ui, grid);
+        let _ = crate::widget::request_frame_if_dirty(ui, grid);
     });
     // The window's size is the grid's size, and nothing else will tell
     // us it changed. This is the hook that makes a dragged window a

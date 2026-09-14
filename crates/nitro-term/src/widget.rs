@@ -23,26 +23,28 @@
 //! row's slots are unchanged without re-deriving their contents. On a
 //! keystroke that is one row out of fifty.
 //!
-//! **The scene is updated once per frame, not once per wakeup.** Bytes
-//! are drained from the pty the moment they arrive (so the child never
-//! blocks on a full pipe), but they go into the [`Grid`] only: `feed`
-//! marks the *grid*, which records its own damage, and deliberately
-//! does **not** mark the widget. The widget is marked by
-//! [`paint_dirty_rows`], which the app calls from its frame callback
-//! ([`Ui::request_frame`]).
+//! **A commit carries a screenful, not a line.** Bytes are drained from
+//! the pty the moment they arrive (so the child never blocks on a full
+//! pipe) and go into the [`Grid`]; a single drain reads at most
+//! `DRAIN_CHUNK` — 256 KiB, about four screenfuls — before handing the
+//! loop back. That bound is what paces the scene: `seq 1 1000000` is
+//! ~6.9 MB and costs about thirty commits, not a million.
 //!
-//! That split is the whole mechanism, and it is load-bearing in a way
-//! that is easy to undo: `App`'s loop flushes after *every* wakeup and a
-//! flush paints whatever is marked, so whichever of the two marks the
-//! widget decides the commit rate. Marking in `feed` costs one commit
-//! per epoll wakeup that carried data — for a build log writing a few
-//! hundred small lines a second, hundreds of commits against sixty
-//! frames.
+//! The upper bound is the **server's**, not ours: it coalesces flips, so
+//! however many commits arrive the glass changes at most once per
+//! refresh, and the intermediate grids were never visible.
 //!
-//! So `seq 1 1000000` costs one commit per frame rather than one per
-//! line, and the grid each frame draws is the one the terminal had
-//! reached by then — the intermediate states were never on screen
-//! anyway.
+//! It is worth saying why this is not `RequestFrame` pacing, since that
+//! is the obvious design and was tried. Making the frame callback the
+//! only thing that marks the widget for paint is tidier and **froze the
+//! screen**: a `RequestFrame` is one-in-flight, so painting becomes
+//! dependent on the answer arriving, and a server coalescing flips under
+//! load is exactly when it does not. Four frames in twelve seconds on
+//! the box, with consecutive framebuffer readbacks byte-identical while
+//! output flowed — the grid advanced and the display did not. The frame
+//! callback is still asked for and counted, because it is how the app
+//! knows how often the screen really changed; it is not load-bearing for
+//! painting.
 
 use std::os::fd::{AsFd as _, OwnedFd};
 
@@ -649,20 +651,27 @@ impl<S: 'static> TermGridMut for WidgetMut<'_, TermGrid, S> {
         self.term.feed(bytes);
         let replies = self.term.take_replies();
         self.write_input(&replies);
-        // Deliberately **not** `request_paint`. The bytes go into the
-        // grid, which records its own damage; the widget is marked for
-        // paint by `paint_dirty_rows`, called from the frame callback.
+        // Marking paint here — on arrival — is deliberate, and it is the
+        // second answer to a question review asked and hardware settled.
         //
-        // That split is the whole of the frame pacing, and it is worth
-        // stating where it is easy to undo. `App`'s loop flushes after
-        // *every* wakeup, and a flush paints whatever is marked — so a
-        // `request_paint` here would put a commit on the wire once per
-        // epoll wakeup that carried pty data, which for a chatty writer
-        // is hundreds a second against sixty frames. Marking here also
-        // *looks* right and measures fine on a fast bulk writer like
-        // `seq`, because the drain cap already bounds it; it is the
-        // 200-small-writes-a-second build log where the two designs
-        // come apart, which is exactly the case pacing exists for.
+        // The first answer was to mark only from the frame callback, so
+        // that the scene was literally touched once per `Frame`. It is
+        // the tidier story and it **froze the screen**: a `RequestFrame`
+        // is one-in-flight (`Ui::request_frame` early-returns while one
+        // is outstanding), so painting became strictly dependent on the
+        // answer arriving — and during a sustained burst the server is
+        // deferring flips, so the answer is exactly what does not come.
+        // Measured on the box: four frames in twelve seconds, and
+        // consecutive framebuffer readbacks byte-identical while output
+        // was flowing. The grid advanced; the glass did not.
+        //
+        // So arrival marks paint, and what bounds the commit rate is
+        // `DRAIN_CHUNK` — at most 256 KiB of pty output per commit —
+        // plus the server's own flip coalescing, which never exceeds the
+        // refresh rate however many commits arrive. `docs/term.md` says
+        // so in those words rather than claiming a per-frame guarantee
+        // the code does not make.
+        self.request_paint();
     }
 
     fn resize_grid(&mut self, cols: usize, rows: usize) {
@@ -768,26 +777,6 @@ pub fn term_grid<S: 'static>() -> TermGridBuilder<S> {
         size_px: DEFAULT_FONT_SIZE,
         palette: Palette::default(),
     }
-}
-
-/// Mark the widget for paint if its grid has damage the scene has not
-/// drawn yet, and report whether it did.
-///
-/// This is the other half of the pacing split described on
-/// [`TermGridMut::feed`]: bytes arriving mark the *grid*, and this marks
-/// the *widget*. It is called from the frame callback, so the scene is
-/// touched once per frame however many wakeups delivered the bytes.
-///
-/// # Errors
-/// Never; the signature matches its sibling for symmetry at call sites.
-pub fn paint_dirty_rows<S: 'static>(ui: &mut Ui<S>, grid: nitro_ui::WidgetId) -> bool {
-    let dirty = ui
-        .widget::<TermGrid>(grid)
-        .is_ok_and(|g| g.term.grid().dirty());
-    if dirty && let Ok(mut g) = ui.widget_mut::<TermGrid>(grid) {
-        g.request_paint();
-    }
-    dirty
 }
 
 /// Ask the toolkit for a frame callback, if the grid has anything to

@@ -448,17 +448,21 @@ as it arrives and touches the *tree* only in the handler — so a hundred
 thousand lines of output cost one commit per refresh rather than one per
 line, each showing the state as it stood at that moment.
 
-**"Only in the handler" is the load-bearing half**, and it is a rule
-about `request_paint`, not about intent. The app loop flushes after
-**every** wakeup and a flush paints whatever is marked, so an app that
-marks a widget dirty as the data arrives commits once per wakeup no
-matter how carefully it also registered a frame handler. The frame
-callback has to be the thing that calls `request_paint`; arrival updates
-the model and nothing else. `nitro-term` splits it exactly that way —
-`feed` marks its grid, `paint_dirty_rows` marks the widget — and shipped
-briefly with the mark in the wrong place, measuring plausibly the whole
-time, because a bulk writer is bounded by its read chunk either way. A
-slow chatty writer is what tells the two apart.
+**Do not make the callback the only thing that can paint.** The
+temptation, once the hook exists, is to move `request_paint` into the
+handler so the scene is touched exactly once per `Frame`. `nitro-term`
+tried it and **froze its screen**: `request_frame` is one-in-flight, so
+painting then depends on the answer arriving, and a server coalescing
+flips under load is exactly when it does not. Four frames in twelve
+seconds of steady output, with consecutive framebuffer readbacks
+byte-identical.
+
+The rule that survives contact is narrower. Use the callback to *pace
+work you would otherwise do per input event* — recompute a model, rebuild
+a list — and bound the input itself (`nitro-term` reads at most 256 KiB
+of pty per turn). "At most one change per refresh" is the **server's**
+guarantee, delivered by its flip coalescing, and a client that tries to
+enforce it a second time adds a dependency rather than a guarantee.
 
 Three properties make it safe to build on:
 
@@ -471,6 +475,10 @@ Three properties make it safe to build on:
   happening, and blocks in `epoll_wait` with no timer. That is the same
   idle contract every other app has, kept by the loudest client on the
   machine.
+* **An answer is not guaranteed promptly.** One request is outstanding at
+  a time and the server answers after a flip, so under load the gap
+  between callbacks is the *flip* rate, not the refresh rate. Anything
+  that must happen while output is flowing cannot be parked behind it.
 * **It is a handler list, not a widget**, for the same reason `on_key`
   and `on_shell` are: a frame deadline is news about the *output*, with
   no position to hit-test and no focus to follow. Every handler sees
