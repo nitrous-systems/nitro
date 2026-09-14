@@ -20,9 +20,12 @@ output.VGA-1.position    = 1920,0
 keyboard.layout  = de
 keyboard.variant =
 keyboard.options = ctrl:nocaps
+
+theme.scheme = dark
+theme.accent = #6ca8f0
 ```
 
-Save it and the desktop re-lays out. No restart, no `systemctl`, no
+Save it and the desktop re-lays out and re-colours. No restart, no `systemctl`, no
 logout — the server watches the file and applies what changed.
 
 ## The format
@@ -32,6 +35,14 @@ or after whitespace, so a value may contain a `#` without being
 truncated. Whitespace around the `=` is insignificant. The **last**
 assignment to a key wins, which makes appending a line a working way to
 override one.
+
+One exception, and it is there for the colours: a `#` followed by **six
+or eight hex digits and then whitespace** is a value, not a comment, so
+`theme.accent = #6ca8f0` means what it looks like. A trailing comment
+after a colour still works (`# blue` is not hex digits). The cost is a
+comment whose entire text is six or eight hex characters —
+`scale = 2 #beefed` keeps the `#beefed`, which then fails to parse and is
+warned about.
 
 That is the whole grammar. It is deliberately not TOML: there are no
 tables, no arrays and no types beyond a float, a pair of integers and a
@@ -50,6 +61,8 @@ broken desktop and a text console.
 | `keyboard.layout` | an xkb layout, e.g. `us`, `de`, `us,de` | `us` |
 | `keyboard.variant` | an xkb variant, e.g. `nodeadkeys` | none |
 | `keyboard.options` | xkb options, e.g. `ctrl:nocaps` | none |
+| `theme.scheme` | `light` or `dark` — the desktop's colour scheme | `light` |
+| `theme.<role>` | `#rrggbb` or `#rrggbbaa`, overriding one role on top of the scheme | the scheme's value |
 
 `<connector>` is the name the kernel gives the connector — `HDMI-A-1`,
 `VGA-1`, `DP-1.2` — which is exactly what `nitro-shot --outputs` prints.
@@ -71,6 +84,32 @@ between. A `keyboard.repeat = 300,25` would therefore be a promise with
 nothing behind it — a setting that appears to work, changes nothing, and
 costs a user an afternoon. When key repeat is implemented this key is
 where it goes.
+
+### Colours: `theme.scheme` and `theme.<role>`
+
+`theme.scheme` picks one of two built-in palettes; each `theme.<role>`
+line overrides exactly that one role on top of it. The role names are
+`window_background`, `accent`, `title_bar_active`, `ansi1` — the full
+table is in **`docs/theme.md`**, which is also where the wire op, the
+lint rule and "how to add a role" live.
+
+```text
+theme.scheme = dark
+theme.accent = #6ca8f0
+theme.terminal_background = #141418
+```
+
+A reload re-derives the palette and the server pushes it to every
+connected client, so the whole desktop — decorations, bar, terminal,
+wallpaper, dialogs — changes colour within a frame, with nothing
+restarted. A reload that leaves the palette unchanged sends nothing.
+
+The default is **light**, deliberately: every screenshot in `docs/` was
+taken on it, and a desktop that changes its appearance because a file is
+missing is one that cannot be supported over the phone.
+
+A key naming no role, or a value that is not six or eight hex digits, is
+warned about and skipped like any other bad line.
 
 ## Nothing in this file can fail
 
@@ -97,6 +136,8 @@ leave nothing clickable with which to fix it — including this app.
 | output position | — | `output.<c>.position` | left-to-right in connector order |
 | primary output | — | `output.<c>.primary` | the first connector |
 | keyboard | `XKB_DEFAULT_*` | `keyboard.*` | the `us` layout |
+| colour scheme | — | `theme.scheme` | `light` |
+| one colour | — | `theme.<role>` | the scheme's value |
 
 The environment wins because it is the **development** channel: a
 `NITRO_SCALE=HDMI-A-1=2 just fake` must not be silently overridden by
@@ -116,6 +157,18 @@ Three doors, one `Server::reload_config`:
 `stats` counts completed reloads in `config_reloads`, whichever door they
 came through: what a caller wants to know is "did the server pick my edit
 up", not which mechanism told it.
+
+**A missing file means defaults.** Deleting `server.conf` is a reload
+like any other, and everything it used to say falls back to the
+environment, the EDID or the built-in default — a `theme.scheme = dark`
+in a file you just removed does not stay in force. The watch asks for
+`DELETE` and `MOVED_FROM` as well as the write and rename events, which
+it did not until issue #558: `rm server.conf` was silently not an event,
+so a stale setting survived until something else triggered a reload. A
+half-finished `mv` is answered by the reload path reading whatever is on
+disk *now* — the `MOVED_TO` of the replacement arrives in the same drain
+as the `MOVED_FROM` of the original, so the pair costs one reload, not
+two.
 
 On reload the server re-applies the scales (a change sends a `Configure`
 to that output's windows and repaints it in full), re-lays out the
@@ -189,7 +242,9 @@ deliberately unnamed: a label named `layout` beside the field named
 
 **Apply rewrites the file wholesale.** Hand-written comments and keys the
 app does not know about are not preserved. If you maintain the file by
-hand and value its comments, do not press Apply.
+hand and value its comments, do not press Apply. The one carve-out is the
+`theme.*` block, which is carried over from disk verbatim — see
+*Appearance* below.
 
 What Apply does *not* do is invent opinions. A connector the file says
 nothing about gets no `scale` line unless you actually move its slider:
@@ -213,6 +268,22 @@ pointer in the shared strip belongs to whichever output is found first.
 The fix is to choose device positions rather than derive them, which
 belongs with drag-arrange; until then a typed position is taken at face
 value. See `docs/wm.md`.
+
+### Appearance
+
+One checkbox, **Dark**, writing `theme.scheme`. Unlike every other
+control in the window it does not wait for Apply: it saves on the spot,
+and the desktop changes colour within a frame. A colour scheme is the one
+setting you judge by looking at it, so asking the user to confirm
+something they can already see would be theatre.
+
+Per-role overrides (`theme.accent`) have no widget — thirty-odd colour
+pickers for a thing done once, where the file is the better interface —
+but they are **preserved**: Apply carries the whole `theme.*` block over
+from disk rather than rendering it from the widgets. That is the one
+exception to "Apply rewrites the file wholesale" above, and it earns it,
+because the alternative is a save button that silently deletes a colour
+the user hand-picked.
 
 ### Audio
 

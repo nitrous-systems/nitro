@@ -77,6 +77,7 @@ tests.
 | `reload`             | `ok\n`; re-reads `server.conf` and applies it. Synchronous — the `ok` comes back after the reload was applied — which is what makes it the reload a test can use, where SIGHUP and the inotify watch are races against the loop noticing. `config_reloads` counts it. |
 | `plug WxH`           | `ok\n`; fake backend only — hotplugs an output in, so a test can drive the "no output yet" state. Refused on DRM, where an output exists because a connector says so. |
 | `unplug`             | `ok\n`; fake backend only — removes the last output, which is the half that matters to the window manager: removing an output orphans its windows, and migrating them is the behaviour under test. |
+| `theme`              | `ok <scheme> <serial>\n`, one `role #rrggbb[aa]` line per colour role, blank line. Read-only, and the cheap way to answer "what colour is the desktop actually using" with no client and no screenshot: the palette is server state, so the server is the only thing that can say. The role names are the `server.conf` keys, so any line of the output is one `theme.` prefix away from being the config that pins it. See `docs/theme.md`. |
 | `focus`              | `ok\n`; gives keyboard focus to the topmost window. Test-only, and it exists because focus otherwise *follows the click*: a toolkit test of Tab traversal would have to synthesise a click to get focus, which moves the focus to whatever widget was under the pointer — the very state it is about to assert on. `err no windows` when there are none. |
 | anything else        | `err <message>\n`                                                     |
 
@@ -125,6 +126,9 @@ output.VGA-1.position    = 1920,0
 
 keyboard.layout  = de
 keyboard.options = ctrl:nocaps
+
+theme.scheme = dark
+theme.accent = #6ca8f0
 ```
 
 ### Precedence
@@ -141,6 +145,8 @@ because it is the user's explicit answer to the EDID's guess.
 | output position | — | `output.<c>.position`, in **desktop** (logical) units | placed after the last positioned output, in connector order |
 | primary output | — | `output.<c>.primary = true` | the first connector |
 | keyboard | `XKB_DEFAULT_{RULES,MODEL,LAYOUT,VARIANT,OPTIONS}` | `keyboard.layout\|variant\|options` | the `us` layout |
+| colour scheme | — | `theme.scheme` (`light`\|`dark`) | `light` |
+| one colour | — | `theme.<role>` = `#rrggbb[aa]` | the scheme's value |
 
 The scale rule lives in one function (`resolve_scale`) so it cannot drift
 between startup, a reload and a hotplug — all three go through
@@ -180,9 +186,24 @@ Three doors, one `Server::reload_config`:
 * **`reload`** on the control socket, which is synchronous and therefore
   the one a test uses.
 
-A reload re-applies everything rather than diffing: the work is one file
-read, one `sync_outputs` and (only when the `keyboard.*` section actually
-changed) one keymap compile, all of which startup already does. A keymap
+The watch asks for `CLOSE_WRITE`, `MOVED_TO`, `CREATE`, `DELETE` and
+`MOVED_FROM`. The last two were missing until issue #558, on the theory
+that a file which goes away should leave the last configuration in force
+so a half-finished `mv` does not flicker the desktop — which was wrong:
+`rm server.conf` is the documented way back to defaults, and without them
+a `theme.scheme` from a file that no longer existed stayed in force. A
+`mv`'s intermediate state is answered by the reload path reading whatever
+is on disk *now*, and the pair of events arrives in one drain, so it
+costs one reload rather than two.
+
+A reload re-applies everything rather than diffing, with two exceptions
+that earn it: the work is one file read, one `sync_outputs` and (only
+when the `keyboard.*` section actually changed) one keymap compile, all
+of which startup already does. The **palette** is the other exception,
+and for a different reason — applying it is not idempotent from the
+outside, since it restyles every decoration, repaints every client and
+puts a `Theme` on every socket. An unchanged palette is therefore
+silence, so a reload that only moved `keyboard.layout` costs nothing. A keymap
 swap resets the xkb state and the hotkey table, because the modifiers a
 user is holding belong to keys that no longer mean what they did — the
 same reasoning the VT-switch and input-hotplug paths use. A scale change

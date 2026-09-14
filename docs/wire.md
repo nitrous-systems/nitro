@@ -11,7 +11,8 @@ document describes them.
 not change: additions go in as new op codes guarded by a capability bit,
 and only an incompatible change bumps `VERSION`. The last in-place change
 was `WindowInfo.layer` (task #3697), in the `SHELL` block; before that,
-`Configure.position` (task #3683).
+`Configure.position` (task #3683). The last *addition* was `Theme`
+(0x8004) behind the `THEME` bit (task #3706, M4).
 
 ## Transport
 
@@ -136,10 +137,18 @@ containing the transaction reached the screen.
 | 3 | `REMOTE` | the link is remote: buffers are expensive, text is cheap |
 | 4 | `WM` | the server manages windows: decorations, states, limits, app ids (M3) |
 | 5 | `SHELL` | the connection arrived on the **shell socket** and may send the shell ops (M3) |
+| 6 | `THEME` | the server owns the colour palette and pushes it (M4); see [`Theme`](#theme--0x8004) |
 
 `SHELL` is bit 5, not bit 3: bit 3 is `REMOTE` and was taken in M1. It is
 *reported*, never negotiated — a client cannot ask for it. See
 [Shell](#shell-caps-shell).
+
+`THEME` is set unconditionally by the current server, for the reason `WM`
+is: the server always owns a palette and always pushes it. It is still a
+bit rather than an assumption, because it is what tells a client whether
+to *wait* for colours or fall back to its built-in ones — and because a
+future non-desktop server (a remote view, a test fixture) may honestly
+not have a palette to push.
 
 ## Errors
 
@@ -260,6 +269,7 @@ Assigned in blocks of 0x100 so a block can grow without renumbering.
 | `0x8001` | `Welcome` | session |
 | `0x8002` | `Error` | session |
 | `0x8003` | `Presented` | session |
+| `0x8004` | `Theme` | session (see `THEME`) |
 | `0x8101` | `Configure` | windows |
 | `0x8102` | `Frame` | windows |
 | `0x8103` | `Focus` | windows |
@@ -606,6 +616,50 @@ Fatal: the connection closes after it.
 | `output` | `u32` | which output |
 | `time_ns` | `u64` | presentation time, `CLOCK_MONOTONIC` |
 | `seq` | `u64` | output frame sequence (vblank count) |
+
+### `Theme` — 0x8004
+
+The desktop's colour palette. Requires `THEME`.
+
+| field | type | meaning |
+|---|---|---|
+| `serial` | `u32` | increments on every change |
+| `colors` | `vec<Color>` | one colour per **role**, in role order |
+
+Sent **immediately after `Welcome`**, on both the wire and the shell
+socket, and again whenever the server's palette changes. A client does
+not ask for it and cannot refuse it: the server owns the scheme
+(`theme.scheme` in `server.conf`) and the per-role overrides, and the
+client is told. See `docs/theme.md` for the role table and the
+configuration keys.
+
+Sending it before anything else is deliberate. A client's first paint
+happens before its first `Configure` comes back, so a palette that
+arrived one round trip later would mean every app on the desktop shows
+one frame of its built-in defaults and then flashes.
+
+**Why the count is on the wire.** `colors` is a `vec<Color>`, so the
+length is a `u32` in the payload rather than a constant both sides must
+agree on. The roles are a dense, append-only enumeration
+(`nitro_core::palette::Role`), and the count is `Role::COUNT` *at the
+sender's build time*. That makes appending a role a compatible change in
+both directions:
+
+* a **newer server, older client** sends more colours than the client
+  knows roles; the extra tail is dropped;
+* an **older server, newer client** sends fewer; the roles it did not
+  carry keep their value from the client's own built-in default.
+
+Neither is an error, and neither closes the connection. This is the same
+"grow in place within the block" rule `WindowInfo` follows — appending a
+role does not need a new op, a new bit or a version bump, and a desktop
+running a mixed set of binaries during an upgrade renders rather than
+refusing to start.
+
+Roles are therefore **only ever appended**: a role's position is its wire
+index, so inserting one in the middle would silently renumber every
+colour after it. `keys_and_indices_round_trip` in
+`crates/nitro-core/src/palette.rs` pins the order.
 
 ### `Configure` — 0x8101
 

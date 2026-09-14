@@ -649,6 +649,89 @@ D-Bus client is allowed.
     single selection by pointer — `PointerDown` carries no modifier
     mask, so multi-selection is keyboard-only.
 
+  - **M4-F done.** **Colours are roles; the server is the switch.** One
+    semantic palette in `nitro_core::palette` — `Role` names a *meaning*
+    (`Accent`, `TextDim`, `TitleBarActive`, `Ansi1`), `Palette` answers
+    with a `Color` — the server owns which palette is in force
+    (`theme.scheme = light|dark` plus per-role overrides in
+    `server.conf`), and it **pushes** it to every client over a new
+    `Theme` op behind caps `THEME`. One line in a file re-colours the
+    whole desktop in a frame, with nothing restarted.
+
+    It is here because the alternative was already failing. `nitro-term`
+    shipped its own sixteen ANSI colours, the window manager its own
+    `BAR_ACTIVE`, the wallpaper its own gradient: three palettes, three
+    opinions about "dark", and no place to put a switch — because a
+    central colour setting needs a central place colours come *from*,
+    and a `Theme` struct each app copies and tweaks is not one. A role
+    fixes the three failure modes at once (drift, colours no setting can
+    reach, and nowhere for the switch to live) because it is a name for
+    a meaning rather than a value.
+
+    `nitro_ui::Theme` survives as a **view** on the palette, so a
+    `Button` needed no changes; what changed is that its colours are a
+    projection and its metrics (font, radius, paddings) are not, so a
+    scheme switch moves the first and leaves the second alone. A palette
+    push costs **one commit** per client and the tree is silent
+    afterwards — asserted from outside by counting commits, because a
+    switch that repainted per widget would look identical and cost a
+    commit per label.
+
+    The claim is enforced rather than remembered: `deploy/lint-colors.sh`
+    fails the build on a `Color::rgb(` or a bare `0xRRGGBB` outside a
+    short allow-list, and it runs from `just clippy` and the default
+    recipe. Two lines in the tree carry an explicit exemption, and both
+    are the same honest case: a colour that is **the program's or the
+    user's**, not the desktop's — a truecolor `SGR 38;2;r;g;b`, which is
+    content, and `nitro-wallpaper --color`, which is an override. The
+    256-colour cube stays xterm's arithmetic for the same reason.
+
+    Two things the wire design had to get right. The colour **count is
+    on the wire** (`vec<Color>`, not a fixed `N`), so appending a role is
+    compatible in both directions — a short table leaves the rest at
+    defaults, a long one has its tail ignored — which is what lets a
+    desktop mid-upgrade render instead of refusing to start; roles are
+    therefore only ever *appended*, since a role's position is its wire
+    index. And the `Theme` arrives **immediately after `Welcome`**,
+    before the first `Configure`, because a client's first paint happens
+    before its first round trip and a palette one trip later means every
+    app on the desktop flashes its built-in defaults for a frame.
+
+    The tests hold both schemes to **WCAG AA** — 4.5:1 for every
+    text/background pair, 3:1 for secondary text and for the twelve
+    chromatic ANSI colours against their own terminal background — with
+    the contrast formula implemented in twenty lines rather than
+    eyeballed, so a "nicer" grey that quietly makes a label unreadable
+    fails the build. The light scheme's ANSI colours are *darkened*,
+    which is not taste: the familiar saturated sixteen are chosen for a
+    dark background, and `ls --color`'s blue directory on paper is
+    genuinely unreadable.
+
+    **Two defects came out of writing the settings tests**, and both are
+    the same shape as M4-D's: the instrument agreed with the code
+    because the two parsers of one format disagreed quietly.
+    `nitro-settings` has a second implementation of `server.conf` (so a
+    settings dialog does not link libinput and drm), and `#` starts a
+    comment exactly where a colour literal's `#` sits — so its parser ate
+    `theme.accent = #6ca8f0`, and Apply, which rewrites the file
+    wholesale, would have **silently deleted a colour the user
+    hand-picked**. Both parsers now make the same narrow exception (a `#`
+    followed by six or eight hex digits is a value) and both have a test
+    pinning it. The second was Apply rendering the whole file from the
+    widgets, which dropped the `theme.*` block entirely; it is now
+    carried over from disk verbatim, overrides included — the one
+    carve-out to "Apply rewrites the file wholesale", and it earns it.
+
+    Folded in on the way through: **issue #558**. The config watch asked
+    for `CLOSE_WRITE|MOVED_TO|CREATE` only, so `rm server.conf` was not
+    an event at all and a `theme.scheme` or `keyboard.layout` from a file
+    that no longer existed stayed in force until something else triggered
+    a reload. Deleting the file is the documented way back to defaults,
+    so it has to be one.
+
+    Role table, config keys, wire op, lint rule and how to add a role:
+    `docs/theme.md`.
+
 - **M5** — Wayland adapter; GPU backend.
 
 ## What we take from the old repo

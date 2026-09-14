@@ -830,6 +830,44 @@ keyboard through a grab rather than through focus, and a toolkit that
 refused would have broken it. The rule is about focus a *click* takes on
 the user's behalf, not about focus an app places on purpose.
 
+## Colours come from roles
+
+A widget never writes a colour down. It asks for a **role** — a name for
+a *meaning* (`Accent`, `TextDim`, `Surface`) — and the server, which owns
+the desktop's palette, decides what colour that is.
+
+```rust,ignore
+fn paint(&mut self, cx: &mut PaintCx<'_, S>) {
+    cx.fill_rect(0, cx.bounds, cx.color(ColorRole::Surface));
+}
+```
+
+`Theme` is still there and still what the built-in widgets read, but it
+is now a **view** on the palette: `Theme::from_palette` maps roles onto
+its colour fields, and its non-colour fields (font, radius, paddings)
+stay app state that a scheme switch leaves alone. So a `Button` needs no
+changes to follow the user's scheme, and `ui.theme().accent` is still the
+right thing to read inside one.
+
+What is *not* right is `.color(ui.theme().text_disabled)` on a label.
+That reads the palette **once, at build time**, and freezes the answer —
+so the label keeps its light-scheme grey for ever. Use
+`.color_role(ColorRole::TextDim)`, which resolves at paint time.
+
+A palette push costs **one commit**: `Ui::set_palette` marks every widget
+and the next flush sends the lot as one transaction. An app that was idle
+before a switch is idle again after it, and an unchanged palette is
+dropped without marking anything. `ui.on_theme(..)` is for a widget that
+caches something *derived* from a colour — `nitro-term` rebuilds its
+per-cell table there.
+
+The rule is enforced, not remembered: `deploy/lint-colors.sh` fails the
+build on a `Color::rgb(` or a bare `0xRRGGBB` outside a short allow-list,
+and it runs from `just clippy` and the default recipe. **If a colour you
+need has no role, add one** to `nitro_core::palette` — do not work around
+it. See `docs/theme.md` for the role table, the `server.conf` keys and
+how to add one.
+
 ## Writing a widget
 
 A widget is a plain struct with a `Widget<S>` impl. Every method has a
@@ -878,6 +916,9 @@ Checklist for a new widget:
   what the introspection socket serves, and `action` is what makes the
   widget drivable from outside. A widget whose `action` answers
   `Handled::No` to everything can be read but not used.
+* Colours come from `cx.color(ColorRole::X)` or the theme, never from a
+  literal — see above, and `deploy/lint-colors.sh`, which fails the build
+  for one.
 * If it wants pointer events, it must paint something.
 
 ### Slots that are content rather than parts
