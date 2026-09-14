@@ -491,7 +491,6 @@ struct Ids {
     mute: WidgetId,
     audio_status: WidgetId,
     dark: WidgetId,
-    appearance_note: WidgetId,
     status: WidgetId,
 }
 
@@ -647,7 +646,6 @@ pub fn build(ui: &mut Ui<Settings>) -> WidgetId {
         mute,
         audio_status,
         dark,
-        appearance_note,
         status,
     };
     let apply_button = ui.build(
