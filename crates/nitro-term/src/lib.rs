@@ -221,31 +221,12 @@ pub fn drain_pty(state: &mut TermApp, ui: &mut Ui<TermApp>) -> bool {
         }
     }
     state.buf = buf;
-    flush_to_pty(state, ui);
     // The title and the frame request ride the same drain: an OSC that
     // arrived in this batch should reach the window in the commit the
     // batch produces, not the one after.
     sync_title(state, ui);
     let _ = crate::widget::request_frame_if_dirty(ui, grid);
     closed
-}
-
-/// Write whatever the widget queued — typed keys, pasted text, DSR
-/// replies — to the pty.
-///
-/// A failed write is dropped rather than propagated. The one thing that
-/// makes it fail is a child that has exited, which the loop notices on
-/// the next read as an EOF; turning it into an error here would race
-/// that and report a broken terminal instead of a finished one.
-pub fn flush_to_pty(state: &mut TermApp, ui: &mut Ui<TermApp>) {
-    let Some(grid) = state.grid else { return };
-    let bytes = ui
-        .widget_mut::<TermGrid>(grid)
-        .map(|mut g| g.take_input())
-        .unwrap_or_default();
-    if !bytes.is_empty() {
-        let _ = state.pty.write(&bytes);
-    }
 }
 
 /// Push an OSC title through to the window, if one arrived.
@@ -382,6 +363,17 @@ pub const DEFAULT_SCROLLBACK: usize = 10_000;
 /// If the pty's descriptor cannot be registered.
 pub fn install(ui: &mut Ui<TermApp>, state: &mut TermApp, grid: WidgetId) -> Result<(), Error> {
     state.grid = Some(grid);
+    // The widget writes to the pty itself, through its own `dup` of the
+    // master. Handing it the descriptor rather than a queue for the app
+    // to drain is what makes a key, a paste and a scripted
+    // `hey set grid value` all take the same path: the bytes are written
+    // in the turn they were produced, with no entry point left to
+    // remember a flush. See `TermGrid::pty`.
+    if let Ok(fd) = state.pty.dup_master()
+        && let Ok(mut g) = ui.widget_mut::<TermGrid>(grid)
+    {
+        g.set_pty_fd(fd);
+    }
     let fd = state.pty.as_fd();
     ui.add_fd(fd, |s: &mut TermApp, ui: &mut Ui<TermApp>| {
         if drain_pty(s, ui) {
@@ -408,12 +400,11 @@ pub fn install(ui: &mut Ui<TermApp>, state: &mut TermApp, grid: WidgetId) -> Res
     // only has focus once something has clicked or tabbed into it, and a
     // terminal whose first keystroke went nowhere would look broken.
     ui.on_key(
-        move |s: &mut TermApp, ui: &mut Ui<TermApp>, ev: &KeyEvent| {
+        move |_s: &mut TermApp, ui: &mut Ui<TermApp>, ev: &KeyEvent| {
             let sent = ui
                 .widget_mut::<TermGrid>(grid)
                 .is_ok_and(|mut g| g.type_key(ev));
             if sent {
-                flush_to_pty(s, ui);
                 let _ = crate::widget::request_frame_if_dirty(ui, grid);
                 Handled::Yes
             } else {

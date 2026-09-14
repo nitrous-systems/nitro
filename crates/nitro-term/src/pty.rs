@@ -217,11 +217,22 @@ impl Pty {
     /// # Errors
     /// `WouldBlock` if the child stopped reading for a whole
     /// [`WRITE_DEADLINE`], or any other write error.
-    pub fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+    /// Write `bytes` to `fd`, retrying partial writes.
+    ///
+    /// Free-standing because two things write to the master: this type,
+    /// and the widget, which holds a `dup` of it so that a key or a
+    /// scripted `send` reaches the child *immediately* rather than
+    /// queueing for someone to notice. Sharing the loop is what keeps
+    /// the retry rules — and the deadline — in one place.
+    ///
+    /// # Errors
+    /// `WouldBlock` if the far end stopped reading for a whole
+    /// [`WRITE_DEADLINE`], or any other write error.
+    pub fn write_all(fd: BorrowedFd<'_>, bytes: &[u8]) -> std::io::Result<()> {
         let deadline = Instant::now() + WRITE_DEADLINE;
         let mut rest = bytes;
         while !rest.is_empty() {
-            match rustix::io::write(&self.master, rest) {
+            match rustix::io::write(fd, rest) {
                 Ok(0) => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::WriteZero,
@@ -240,6 +251,33 @@ impl Pty {
             }
         }
         Ok(())
+    }
+
+    /// Write to the child's stdin, retrying partial writes.
+    ///
+    /// The instance form of [`Pty::write_all`], for a caller that has
+    /// the `Pty` rather than a duplicate of its descriptor.
+    ///
+    /// # Errors
+    /// As [`Pty::write_all`].
+    pub fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        Self::write_all(self.master.as_fd(), bytes)
+    }
+
+    /// A `dup` of the master, for a second writer.
+    ///
+    /// The widget takes one so that a keystroke or a scripted `send`
+    /// reaches the child in the same turn it happened, without the app
+    /// having to remember to drain a queue after every possible entry
+    /// point — which is exactly the bug the box run found: `hey set grid
+    /// value` filled a queue that only the descriptor hook emptied, so a
+    /// scripted command sat there until the child happened to say
+    /// something.
+    ///
+    /// # Errors
+    /// If the descriptor cannot be duplicated.
+    pub fn dup_master(&self) -> std::io::Result<OwnedFd> {
+        Ok(rustix::io::dup(&self.master)?)
     }
 
     /// `TIOCSWINSZ`, so the child gets `SIGWINCH` and `$COLUMNS` is

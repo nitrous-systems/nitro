@@ -100,12 +100,13 @@ fn screen(h: &mut Harness<TermApp>, grid: WidgetId) -> String {
 
 /// Type `text` into the pty, as `hey … set grid value` does.
 fn type_text(h: &mut Harness<TermApp>, grid: WidgetId, text: &str) {
+    // Straight to the pty: the widget holds its own `dup` of the
+    // master, so there is no queue for a test (or the app) to remember
+    // to flush.
     h.ui()
         .widget_mut::<TermGrid>(grid)
         .expect("grid")
         .send_bytes(text.as_bytes());
-    let (ui, state) = h.parts();
-    nitro_term::flush_to_pty(state, ui);
 }
 
 // ---------------------------------------------------------------------
@@ -250,8 +251,14 @@ fn hey_addresses_the_grid_by_name() {
         "echo scripted\n",
     )
     .expect("set value");
-    nitro_term::flush_to_pty(state, ui);
 
+    // The bug the box run found, and the reason this assertion is here
+    // rather than folded into the loop below: `set value` used to fill a
+    // queue that only the *descriptor hook* emptied, so a scripted
+    // command sat unsent until the child happened to say something on
+    // its own. Nothing here drains anything — the widget writes to its
+    // own `dup` of the master — so the only way `scripted` reaches the
+    // screen is if `set` really wrote it.
     pump_until(&mut h, "the scripted command", |h| {
         screen(h, grid).contains("scripted")
     });

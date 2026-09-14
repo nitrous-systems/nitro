@@ -32,6 +32,8 @@
 //! draws is the one the terminal had reached by then — the intermediate
 //! states were never on screen anyway.
 
+use std::os::fd::{AsFd as _, OwnedFd};
+
 use nitro_ui::build::{IntoWidget, StyleBuilder};
 use nitro_ui::event::{Event, Handled, button, key, mods};
 use nitro_ui::widget::Slot;
@@ -89,9 +91,21 @@ pub struct TermGrid {
     /// Colour table: the sixteen ANSI colours, the default foreground
     /// and background.
     palette: Palette,
-    /// Bytes the widget owes the pty: key encodings and DSR replies.
-    /// Drained by the app, which owns the descriptor.
-    pending_input: Vec<u8>,
+    /// A `dup` of the pty master, so a key or a scripted `send` reaches
+    /// the child in the turn it happened.
+    ///
+    /// `None` until the app hands one over (and in a unit test, which
+    /// has no pty), in which case input is silently dropped — there is
+    /// nowhere for it to go, and a terminal with no child is not a
+    /// terminal.
+    ///
+    /// It is a descriptor rather than a `Vec<u8>` queue because the
+    /// queue was a bug: `hey set grid value` filled it and only the
+    /// descriptor hook emptied it, so a scripted command sat there until
+    /// the child happened to say something on its own. A queue drained
+    /// by \"whoever remembers\" has to be drained at every entry point,
+    /// and the box run found the one that was missed.
+    pty: Option<OwnedFd>,
     /// Whether the window has keyboard focus, which is the difference
     /// between a filled cursor block and a hollow one.
     focused: bool,
@@ -124,7 +138,7 @@ impl TermGrid {
             // monospaced face the machine has.
             style: TextStyle::new("mono", size_px),
             palette: Palette::default(),
-            pending_input: Vec::new(),
+            pty: None,
             focused: true,
             runs: Vec::new(),
         }
@@ -170,19 +184,30 @@ impl TermGrid {
         )
     }
 
-    /// Take the bytes the widget owes the pty.
+    /// Write `bytes` to the pty, if the widget has one.
     ///
-    /// The widget encodes keys and the terminal queues DSR replies, but
-    /// neither holds the descriptor — the app does, because the app is
-    /// what the event loop hands the write error to. So the bytes queue
-    /// here and the app drains them after every event.
-    pub fn take_input(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.pending_input)
+    /// Errors are dropped rather than reported. The one thing that makes
+    /// a pty write fail is a child that has exited, which the app loop
+    /// notices as an EOF on the *read* side; surfacing it here would
+    /// race that and report a broken terminal instead of a finished one.
+    pub fn write_input(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        if let Some(fd) = &self.pty {
+            let _ = crate::pty::Pty::write_all(fd.as_fd(), bytes);
+        }
     }
 
-    /// Queue bytes for the pty, as a key or a paste would.
-    pub fn send(&mut self, bytes: &[u8]) {
-        self.pending_input.extend_from_slice(bytes);
+    /// Give the widget the descriptor it writes keys to.
+    pub fn set_pty(&mut self, fd: OwnedFd) {
+        self.pty = Some(fd);
+    }
+
+    /// Whether the widget has a pty to write to.
+    #[must_use]
+    pub fn has_pty(&self) -> bool {
+        self.pty.is_some()
     }
 
     /// The colour a cell's foreground resolves to.
@@ -354,7 +379,7 @@ impl TermGrid {
         // scrolled-back screen and watching nothing appear is the single
         // most confusing thing a terminal can do.
         self.term.grid_mut().scroll_to_bottom();
-        self.pending_input.extend_from_slice(&bytes);
+        self.write_input(&bytes);
         true
     }
 }
@@ -506,7 +531,7 @@ impl<S: 'static> Widget<S> for TermGrid {
                 let text = arg.unwrap_or_default();
                 let bytes = crate::keys::paste(text, self.term.bracketed_paste());
                 self.term.grid_mut().scroll_to_bottom();
-                self.pending_input.extend_from_slice(&bytes);
+                self.write_input(&bytes);
                 cx.request_paint();
                 Handled::Yes
             }
@@ -550,11 +575,14 @@ pub trait TermGridMut {
     /// rare enough that the cost is invisible.
     fn resize_grid(&mut self, cols: usize, rows: usize);
 
-    /// Queue bytes for the pty.
+    /// Write bytes to the pty, as a paste would.
     fn send_bytes(&mut self, bytes: &[u8]);
 
-    /// Take the bytes owed to the pty.
-    fn take_input(&mut self) -> Vec<u8>;
+    /// Give the widget the descriptor it writes keys to.
+    ///
+    /// Not a paint- or layout-affecting setter, so it marks nothing:
+    /// what the widget writes *to* is invisible on screen.
+    fn set_pty_fd(&mut self, fd: OwnedFd);
 
     /// The title OSC 0/2 set since the last call, if it changed.
     fn take_title(&mut self) -> Option<String>;
@@ -567,9 +595,7 @@ impl<S: 'static> TermGridMut for WidgetMut<'_, TermGrid, S> {
     fn feed(&mut self, bytes: &[u8]) {
         self.term.feed(bytes);
         let replies = self.term.take_replies();
-        if !replies.is_empty() {
-            self.pending_input.extend_from_slice(&replies);
-        }
+        self.write_input(&replies);
         self.request_paint();
     }
 
@@ -583,11 +609,11 @@ impl<S: 'static> TermGridMut for WidgetMut<'_, TermGrid, S> {
     }
 
     fn send_bytes(&mut self, bytes: &[u8]) {
-        self.pending_input.extend_from_slice(bytes);
+        self.write_input(bytes);
     }
 
-    fn take_input(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.pending_input)
+    fn set_pty_fd(&mut self, fd: OwnedFd) {
+        self.set_pty(fd);
     }
 
     fn take_title(&mut self) -> Option<String> {
