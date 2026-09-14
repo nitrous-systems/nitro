@@ -281,33 +281,63 @@ pub fn backdrop<S: 'static>(paint: &Paint) -> BackdropBuilder<S> {
     }
 }
 
-/// The wallpaper's state: what it was asked to paint, and nothing else.
+/// The wallpaper's state, which is **deliberately almost empty**.
 ///
-/// There genuinely is no other state. No input, no timers, no
+/// It records what kind of thing is on screen, and specifically *not*
+/// the pixels of it. That is not tidiness: an `--image` wallpaper's
+/// pixels are `w * h * 4` bytes — 8 MB at 1920x1080 — and they are handed
+/// to the toolkit's [`Image`](nitro_ui::widgets::Image) widget, which
+/// uploads them into a memfd and drops its own copy. A state that also
+/// held a `Paint::Image` would keep a second copy resident **for the
+/// whole session**, for nothing: no callback reads it, because a
+/// wallpaper has no callbacks.
+///
+/// So [`Kind`] is what survives the build, and it is three words wide.
+/// There is no other state either — no input, no timers, no
 /// subscriptions, nothing that changes — which is what makes "zero
 /// traffic after the first commit" achievable rather than aspirational.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Wallpaper {
-    paint: Paint,
+    kind: Kind,
+}
+
+/// What a wallpaper is showing, without the pixels. See [`Wallpaper`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// A gradient between two colours.
+    Gradient,
+    /// One solid colour.
+    Solid,
+    /// An image, of this size in pixels.
+    Image(u32, u32),
 }
 
 impl Wallpaper {
-    /// A wallpaper painting `paint`.
+    /// A wallpaper showing `paint`.
+    ///
+    /// Takes the paint by reference and keeps only its [`Kind`]: the
+    /// caller still owns the pixels and hands them to the tree, which is
+    /// the only place they belong.
     #[must_use]
-    pub fn new(paint: Paint) -> Self {
-        Self { paint }
+    pub fn new(paint: &Paint) -> Self {
+        let kind = match paint {
+            Paint::Gradient(..) => Kind::Gradient,
+            Paint::Solid(_) => Kind::Solid,
+            Paint::Image(px) => Kind::Image(px.width, px.height),
+        };
+        Self { kind }
     }
 
-    /// What it paints.
+    /// What it is showing.
     #[must_use]
-    pub fn paint(&self) -> &Paint {
-        &self.paint
+    pub fn kind(&self) -> Kind {
+        self.kind
     }
 }
 
 impl Default for Wallpaper {
     fn default() -> Self {
-        Self::new(default_gradient())
+        Self::new(&default_gradient())
     }
 }
 
@@ -324,6 +354,11 @@ impl Default for Wallpaper {
 pub fn build_with<S: 'static>(ui: &mut Ui<S>, paint: &Paint) -> WidgetId {
     let inner = match paint {
         Paint::Image(px) => ui.build(
+            // One clone, and it is unavoidable: the widget takes the
+            // pixels by value because it owns them until the upload. It
+            // drops them at the first paint, which is why the resident
+            // cost of an image wallpaper is the server's mapping and not
+            // a copy in this process. See [`Wallpaper`].
             image(px.width, px.height, px.data.clone())
                 // No alpha: a wallpaper is opaque by definition, and
                 // saying so lets the server skip blending every pixel of
@@ -378,6 +413,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         }
     };
     let paint = options.paint;
+    let state = Wallpaper::new(&paint);
     App::shell(APP_NAME)?
         .title("nitro-wallpaper")
         .surface(Surface::wallpaper())
@@ -388,9 +424,11 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         // toolkit's own window background underneath it would be a second
         // full-screen rect, re-sent on every resize and never seen.
         .transparent()
-        .run(Wallpaper::new(paint.clone()), move |ui| {
-            build_with(ui, &paint)
-        })
+        // `paint` is **moved** into the builder and dropped with it, so
+        // an image's pixels exist in this process exactly twice — once in
+        // the decoded `Paint` and once in the widget's pending buffer —
+        // and neither outlives the first paint. See [`Wallpaper`].
+        .run(state, move |ui| build_with(ui, &paint))
 }
 
 /// Read a file, as a `String` error rather than an `io::Error`.
@@ -476,6 +514,37 @@ mod tests {
         })
         .expect_err("garbage");
         assert!(e.starts_with("bg.ppm:"), "{e}");
+    }
+
+    /// Compiles only for a `Copy` type; see the test below.
+    fn assert_copy<T: Copy>(_: &T) {}
+
+    #[test]
+    fn the_state_does_not_keep_a_copy_of_the_pixels() {
+        // The bug this prevents is invisible on a gradient and 8 MB on a
+        // 1920x1080 image: the state is handed to `App::run` and lives
+        // for the whole session, so a `Paint::Image` in it would be a
+        // second resident copy of the picture that nothing ever reads —
+        // a wallpaper has no callbacks to read it *with*.
+        let mut ppm = b"P6\n2 2\n255\n".to_vec();
+        ppm.extend_from_slice(&[0; 12]);
+        let px = ppm::parse_ppm(&ppm).expect("a P6 file");
+        let w = Wallpaper::new(&Paint::Image(px));
+        assert_eq!(w.kind(), Kind::Image(2, 2));
+        // `Copy` is the structural proof: a type holding a `Vec` cannot
+        // be one, so this stops compiling the moment somebody puts the
+        // pixels back into the state.
+        assert_copy(&w);
+        assert_eq!(
+            std::mem::size_of::<Wallpaper>(),
+            std::mem::size_of::<Kind>(),
+            "the state is its kind and nothing else"
+        );
+        assert_eq!(Wallpaper::new(&default_gradient()).kind(), Kind::Gradient);
+        assert_eq!(
+            Wallpaper::new(&Paint::Solid(Color::BLACK)).kind(),
+            Kind::Solid
+        );
     }
 
     #[test]

@@ -130,11 +130,24 @@ does:
 | `SUB_LAYOUT`, `SUB_PAINT`, `SUB_TREE` | a descendant has the matching flag |
 
 Marking a widget lights its own flag and then the matching `SUB_` flag on
-every ancestor, **stopping as soon as one is already lit** — so marking
-the thousandth widget in a settled tree is O(depth) the first time and
-O(1) afterwards. A pass that sees neither `X` nor `SUB_X` on a node skips
-the entire subtree without walking it. That is the whole mechanism behind
-"work is proportional to what changed".
+every ancestor, **stopping as soon as every one of them is already lit** —
+so marking the thousandth widget in a settled tree is O(depth) the first
+time and O(1) afterwards. A pass that sees neither `X` nor `SUB_X` on a
+node skips the entire subtree without walking it. That is the whole
+mechanism behind "work is proportional to what changed".
+
+The word *every* in that sentence is load-bearing, and it cost a bug to
+find out (#3691). A mark is usually a **pair** — `set_text` is
+`LAYOUT | PAINT` — so the walk is setting `SUB_LAYOUT | SUB_PAINT`, and
+the early stop has to ask whether the ancestor already carries **both**.
+Stopping at the first ancestor that carried *one* of them (an earlier
+layout-only change had lit `SUB_LAYOUT` all the way up) left `SUB_PAINT`
+unset to the root: `pass_paint` then skipped a subtree holding a `PAINT`
+widget, and the symptom was the nastiest kind there is — the tree said
+one thing, the screen said another, and nothing anywhere returned an
+error. `Dirty::has` is "any" for the passes, `Dirty::has_all` is "every"
+for the mark, and `a_combined_mark_lights_every_sub_flag_on_the_way_up`
+in `tests/ui.rs` fails without the distinction.
 
 ## The passes
 
@@ -457,6 +470,23 @@ because they are not mutations: queuing them would make the next flush
 commit, and a shell that merely asked a question would break the idle
 contract. Nothing here polls — `WindowList` and `Outputs` subscribe — so
 a bar with nothing changing sits in `epoll_wait` like any other app.
+
+**Hiding is a mutation, and that is what makes a launcher cheap.**
+`Ui::set_window_visible` and `Ui::grab_keyboard` are *queued* rather than
+sent at once, unlike the questions above, because they are exactly the
+opposite kind of thing: they change the window's state, and the two have
+to arrive **together**. The server drops a keyboard grab on a window that
+is not showing (`docs/shell.md`), so a launcher that un-hid itself in one
+transaction and grabbed in the next would have the grab taken away again
+between them.
+
+That pairing is what lets `crates/nitro-launcher` (M3-D) be built once
+and hidden rather than rebuilt: showing it is one `SetVisible` plus the
+grab in a single commit, and hiding it is one `SetVisible` that releases
+the grab and any exclusive zone with it — no second message to forget.
+An unchanged `set_window_visible` sends nothing, so the flag is cached
+next to the paint-slot cache in `wire.rs` rather than in `Ui`, where it
+would have been a fourth `bool` and a second copy of the same fact.
 
 The toolkit also sends `SetAppId` for every app now, from the name it was
 constructed with, in the window's own first commit. The app id is what a

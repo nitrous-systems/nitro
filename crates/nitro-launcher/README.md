@@ -175,6 +175,58 @@ Each is a decision, not an oversight.
   use is a good feature and a stateful one; a calculator mode is
   `nitro-calc`'s job. Neither is M3.
 
+## Measured
+
+On the test box (Pentium G3240, 1920x1080, `i915`), release, stripped,
+with the wallpaper, the bar, the launcher and `nitro-calc` all running:
+
+| | binary | RSS | HWM | idle CPU over 30 s |
+|---|---|---|---|---|
+| `nitro-launcher` | 702 936 | 2 912 kB | 2 912 kB | **0.00 %** |
+| `nitro-wallpaper` | 521 976 | 2 656 kB | 2 656 kB | **0.00 %** |
+| `nitro-bar` | 601 152 | 2 768 kB | 2 768 kB | **0.00 %** |
+| `nitro-calc` | 566 984 | 2 752 kB | 2 752 kB | **0.00 %** |
+| `nitro-server` | 2 157 704 | 10 540 kB | 27 160 kB | **0.00 %** |
+
+Zero jiffies of CPU across thirty seconds for every one of the five,
+and the server's frame counter is flat over ten seconds of idle (the
+only two frames in the window are the two screenshots' own readbacks).
+That is the whole point of the epoll loops: four programs on screen and
+nothing running.
+
+The launcher is ~102 KB bigger than the bar, and the attribution is
+mundane: `std::process::Command` and its `posix_spawn` path, plus the
+`.desktop` parser and the sort. Nothing here links a font library or a
+rasterizer, which is the asymmetry `docs/ui.md` describes.
+
+Its dependency list is **`nitro-ui` and nothing else**, like
+`nitro-calc`'s. The spec allowed `rustix` for `fork`/`setsid`; it turned
+out not to be needed, because `Command::process_group(0)` is the safe
+half of `setsid` and the half a launcher actually needs. `rustix` is a
+dev-dependency, for the one test that checks a launched process really
+left the launcher's process group.
+
+### The box path, end to end
+
+```console
+$ ydotool key 125:1 125:0          # bare Super tap -> grabbed 1
+$ ydotool key 46:1 46:0 30:1 30:0 38:1 38:0 46:1 46:0   # c a l c
+$ hey nitro-launcher get results/0 value
+▸ Calculator
+$ ydotool key 28:1 28:0            # Enter -> nitro-calc starts
+```
+
+and the agentic path, which is the same path with no keyboard:
+
+```console
+$ hey nitro-launcher set query value calc
+$ hey nitro-launcher do results/0 click     # a new nitro-calc pid
+```
+
+Both were run on the box against real `.desktop` files (the launcher
+found `Foot`, `Foot Client` and the rest of what is installed alongside
+its own built-ins).
+
 ## Tests
 
 `src/desktop.rs`, `src/search.rs` and `src/spawn.rs` unit-test the parts

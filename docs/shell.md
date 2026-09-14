@@ -454,6 +454,20 @@ not working":
   it found two real bugs — the buffered-op ordering above, and that a bar
   which ignores the `Configure` its own anchor produces paints its original
   width.
+* The **consumers** test the model from the other side, and that is where
+  the remaining surprises live. `crates/nitro-launcher` (M3-D) is the
+  first client of the grab and of the bare-modifier tap, and its
+  `tests/launcher.rs` pins down two things this document asserts but
+  `tests/shell.rs` cannot show: that a bare-Super tap opens an overlay
+  and a **second one closes it while the overlay holds the keyboard** —
+  the whole reason a grab does not outrank the bindings — and that keys
+  reach a `NO_FOCUS` overlay *past a focused ordinary client*, which
+  needs a second real client to be visible at all. It also exercises the
+  lazy release: a grab whose window stops showing is dropped on the next
+  key rather than at the commit, so `stats.grabbed` reads 1 until
+  something is typed. That is correct and documented above, and it is
+  exactly the kind of thing a consumer's test discovers by waiting for a
+  statistic that was never going to move.
 
 ## Deferred
 
@@ -489,6 +503,14 @@ screen, which is worse than one bar. Closing this needs the `output`
 field on `SetAnchor` *and* a way to place the window there to begin with;
 the bar's README states the limitation where a reader of the bar will
 find it.
+
+`crates/nitro-wallpaper` (M3-D) hits the same wall and answers it the
+same way, which is worth recording because a wallpaper is the surface
+where "one per output" is most obviously wanted: N wallpaper windows
+would all land on the primary output — N stacked backdrops on one screen
+and none on the others. So it opens one, and its README says plainly that
+the primary output is covered and a second output shows the compositor's
+own background.
 
 **Stacking order in the window list.** The list is ordered by window
 identity. A shell that wants z-order, or the MRU order for a task

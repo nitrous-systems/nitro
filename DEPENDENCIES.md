@@ -95,6 +95,26 @@ count is still the number we watch, because it is cheap and moves when
 something real is added; it just wants reading with that caveat whenever a
 new workspace crate reuses an existing dependency.
 
+M3's shell crates add **zero** external dependencies between them, and
+that is the number worth reporting. `nitro-bar` is `nitro-ui` plus
+`rustix` (the wall clock and `/sys`); `nitro-launcher` and
+`nitro-wallpaper` are `nitro-ui` and `std` and nothing else, like
+`nitro-calc`. The launcher's spec allowed `rustix` for `fork`/`setsid`
+in its spawn path and it turned out not to be needed:
+`std::process::Command::process_group(0)` is the safe half of `setsid`
+and the half a launcher actually needs (`crates/nitro-launcher/src/spawn.rs`
+argues the other half is a controlling terminal neither process has).
+`cargo tree -e normal --prefix none | sort -u | wc -l` is unchanged at
+**67** across the three of them.
+
+The wallpaper is where a dependency would have been easiest to justify
+and was still refused: it reads images, and it reads **P6 PPM only**
+rather than linking a PNG or JPEG decoder. A decoder is a parser for
+untrusted bytes in a process that runs for the whole session, which is
+exactly the exposure the untrusted-bytes note below is careful about for
+fonts; `magick in.png out.ppm` is the answer, and the decoder it avoids
+is seventy readable lines. Same reasoning as `png` under Rejected.
+
 Planned (M3+): nothing currently. `parley` sits behind swash as the
 upgrade path if bidi, font fallback or rich text ever become requirements.
 Rejected: `serde` (hand-written wire), `png` (own stored-deflate encoder in
@@ -120,6 +140,8 @@ the syscall families it uses.
 | `nitro-demo` | `event`, `fs`, `process`, `time` | `poll` for the event loop; `memfd_create`/`ftruncate`/`pwrite` for the image buffer; `getuid` for the `/tmp` fallback of the control-socket path; `clock_gettime` for the delivery-leg breakdown |
 | `nitro-ui` | `event`, `fs`, `process`, `time` | `epoll` for the app loop, `poll` for the synchronous text measurement, `Timespec` for `ui.set_timer`; `memfd_create`/`ftruncate`/`pwrite` for an `Image` widget's pixel buffer; `getuid`/`getpid` for the introspection socket's path |
 | `nitro-hey` | `process` | `getuid` for the `/tmp` fallback of the app-socket directory |
+| `nitro-bar` | `time` | `clock_gettime` for the wall clock |
+| `nitro-launcher` | `process` (**dev only**) | `getpgrp`, in the one test that checks a launched process left the launcher's process group |
 
 ## `unsafe` exceptions
 

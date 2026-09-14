@@ -128,6 +128,37 @@ every other nitro app has.
   the scene's layer ordering puts every `Normal` window above it. That is
   correct for a wallpaper and would be surprising for anything else.
 
+## Measured
+
+On the test box (Pentium G3240, 1920x1080, `i915`), release, stripped,
+running alongside the bar, the launcher and `nitro-calc`:
+
+| | value |
+|---|---|
+| binary | **521 976 bytes** (522 KB) |
+| RSS / HWM | **2 656 kB** / 2 656 kB |
+| idle CPU over 30 s | **0.00 %** (zero jiffies) |
+| timers armed | none |
+
+It is the smallest of the four shipped `nitro-ui` binaries, and within a
+kilobyte of `hello_dialog` — which is the honest summary of what a
+wallpaper is: the toolkit, one widget, and no application.
+
+The RSS figure is worth a paragraph, because writing this table is what
+caught the one real bug in the crate. A 1920x1080 `--image` wallpaper is
+8 MB of pixels; they reach the server in a memfd and the `Image` widget
+drops its copy at the first paint, so the resident cost is the server's
+mapping rather than a picture in both processes. But the first version
+also handed the whole `Paint` to `App::run` as the app's *state* — which
+lives for the session — so an image wallpaper kept a second 8 MB copy
+that nothing ever read, because a wallpaper has no callbacks to read it
+with.
+
+The state is now `Kind`: `Gradient`, `Solid`, or `Image(w, h)`. It is
+`Copy`, and `the_state_does_not_keep_a_copy_of_the_pixels` asserts that —
+a type holding a `Vec` cannot be `Copy`, so the test stops compiling the
+moment somebody puts the pixels back.
+
 ## Tests
 
 `src/ppm.rs` unit-tests the decoder against the cases that produce a

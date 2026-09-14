@@ -19,7 +19,7 @@ use nitro_wallpaper::{BACKDROP, Paint, Wallpaper, build_with, default_gradient, 
 const OUT: (f32, f32) = (320.0, 240.0);
 
 /// A wallpaper painting `paint`, on the shell socket.
-fn wallpaper(paint: Paint) -> Harness<Wallpaper> {
+fn wallpaper(paint: &Paint) -> Harness<Wallpaper> {
     let for_build = paint.clone();
     Harness::shell(
         "nitro-wallpaper",
@@ -41,7 +41,7 @@ fn the_wallpaper_covers_the_whole_output() {
     // resized by the server to the output's own rectangle, so the
     // assertion is on the *output* screenshot rather than on the window
     // crop: what matters is that there is no desktop showing anywhere.
-    let mut h = wallpaper(default_gradient());
+    let mut h = wallpaper(&default_gradient());
     h.settle();
     let size = h.ui().window_size();
     assert!(
@@ -81,7 +81,7 @@ fn the_wallpaper_covers_the_whole_output() {
 fn the_gradient_really_is_a_gradient() {
     // A gradient that came out as a solid colour would still cover the
     // screen and pass every other test here.
-    let mut h = wallpaper(default_gradient());
+    let mut h = wallpaper(&default_gradient());
     h.settle();
     let top = output_pixel(&h, 160, 2);
     let bottom = output_pixel(&h, 160, 237);
@@ -101,7 +101,7 @@ fn a_solid_colour_is_painted_exactly() {
     // no blending and no gradient interpolation, so any difference at all
     // would be a colour-space bug rather than rounding.
     let want = Color::rgb(0x20, 0x24, 0x30);
-    let mut h = wallpaper(Paint::Solid(want));
+    let mut h = wallpaper(&Paint::Solid(want));
     h.settle();
     // Not the bottom-right corner: the harness parks the pointer there
     // and the software cursor is composited over it.
@@ -129,7 +129,7 @@ fn an_image_is_uploaded_once_and_stretched_to_the_output() {
         0xff, 0xff, 0x00, // bottom-right yellow
     ]);
     let px = ppm::parse_ppm(&file).expect("a P6 file");
-    let mut h = wallpaper(Paint::Image(px));
+    let mut h = wallpaper(&Paint::Image(px));
     h.settle();
 
     // Sampled well inside each quadrant, so the bilinear filter at the
@@ -156,7 +156,7 @@ fn a_settled_wallpaper_sends_nothing_at_all() {
     // the entire session and costs nothing to be there. There is nothing
     // to subscribe to and nothing to poll, so "idle" here is stronger
     // than the bar's — not even a timer is armed.
-    let mut h = wallpaper(default_gradient());
+    let mut h = wallpaper(&default_gradient());
     h.settle();
     assert_eq!(h.next_timeout(), None, "nothing is armed at all");
     let commits = h.commits();
@@ -172,7 +172,7 @@ fn a_mode_change_resizes_it_without_it_subscribing_to_anything() {
     // ever tells a client about its own geometry — a `Configure`. So the
     // wallpaper follows a mode change by doing nothing special at all,
     // which is the point.
-    let mut h = wallpaper(Paint::Solid(Color::rgb(0x20, 0x24, 0x30)));
+    let mut h = wallpaper(&Paint::Solid(Color::rgb(0x20, 0x24, 0x30)));
     h.settle();
     h.tap();
     h.clear_tap();
@@ -202,7 +202,7 @@ fn the_backdrop_is_addressable_for_hey() {
     // `hey nitro-wallpaper list` is how you find out whether the
     // wallpaper is running at all, which on a box with a black screen is
     // exactly the question.
-    let mut h = wallpaper(default_gradient());
+    let mut h = wallpaper(&default_gradient());
     h.settle();
     assert!(
         nitro_ui::introspect::resolve(h.ui(), &format!("window/{BACKDROP}")).is_some(),
