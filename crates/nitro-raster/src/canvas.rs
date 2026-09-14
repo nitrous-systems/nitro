@@ -4,8 +4,8 @@ use nitro_core::{Color, IRect, Point, Rect};
 
 use crate::blend::{div255, effective_alpha, over_premul, over_straight, unit_u8};
 use crate::paint::{
-    RowPaint, blend_mask_row, blend_mask_row_opaque, blend_pixel, blend_solid, mix, paint_cov,
-    paint_full, store_solid,
+    RowPaint, blend_mask_row, blend_mask_row_opaque, blend_pixel, blend_solid, lerp_color, mix,
+    paint_cov, paint_full, store_solid,
 };
 use crate::shape::{RRect, RowSpans};
 
@@ -228,26 +228,11 @@ impl Fill {
                     }
                 } else {
                     let t = ((py as f32 + 0.5) - start.y) / dy;
-                    RowPaint::Solid(lerp_row_color(c0, c1, t.clamp(0.0, 1.0)))
+                    RowPaint::Solid(lerp_color(c0, c1, t.clamp(0.0, 1.0)))
                 }
             }
         }
     }
-}
-
-#[inline]
-fn lerp_row_color(a: Color, b: Color, t: f32) -> Color {
-    #[inline]
-    fn ch(a: u8, b: u8, t: f32) -> u8 {
-        let a = f32::from(a);
-        (a + (f32::from(b) - a) * t + 0.5) as u8
-    }
-    Color::rgba(
-        ch(a.r, b.r, t),
-        ch(a.g, b.g, t),
-        ch(a.b, b.b, t),
-        ch(a.a, b.a, t),
-    )
 }
 
 /// Byte layout of a source [`Image`].

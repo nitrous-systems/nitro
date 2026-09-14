@@ -55,8 +55,13 @@ impl RowPaint {
 /// Channel-wise linear interpolation with round-to-nearest.
 ///
 /// Exact at the endpoints: `t == 0` yields `a`, `t == 1` yields `b`.
+///
+/// The single implementation: `canvas.rs` calls it for the vertical-gradient
+/// case (one colour per row) and `RowPaint::color_at` for the horizontal one
+/// (one colour per pixel). There used to be a byte-identical copy here and in
+/// `canvas.rs` (`lerp_row_color`); see issue #524.
 #[inline]
-fn lerp_color(a: Color, b: Color, t: f32) -> Color {
+pub(crate) fn lerp_color(a: Color, b: Color, t: f32) -> Color {
     #[inline]
     fn ch(a: u8, b: u8, t: f32) -> u8 {
         let a = f32::from(a);
