@@ -1663,3 +1663,115 @@ fn mask_batch_and_loop_timing() {
         (loop_best - batch_best) / loop_best * 100.0,
     );
 }
+
+/// A noisy ARGB source: structure in every channel, and a deliberate excess of
+/// alpha 0 and 255, so a blit sweep sees transparent, translucent and opaque
+/// texels.
+fn noisy_argb(w: u32, h: u32, seed: u64) -> Vec<u8> {
+    let stride = (w * 4).div_ceil(64) * 64;
+    let mut out = vec![0u8; (stride * h) as usize];
+    let mut r = Rng::new(seed);
+    for y in 0..h {
+        for x in 0..w {
+            let o = (y * stride + x * 4) as usize;
+            out[o] = r.byte();
+            out[o + 1] = r.byte();
+            out[o + 2] = r.byte();
+            out[o + 3] = match r.next_u32() % 4 {
+                0 => 0,
+                1 => 255,
+                _ => r.byte(),
+            };
+        }
+    }
+    out
+}
+
+/// FNV-1a over every byte a blit sweep produces. Public API only, so the same
+/// sweep can be run against another revision and the two hashes compared.
+fn blit_sweep_hash() -> (u32, u64) {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let argb = noisy_argb(16, 16, 0x9E37_79B9_7F4A_7C15);
+    let mut cases = 0;
+    for format in [PixelFormat::Argb8888, PixelFormat::Xrgb8888] {
+        let img = image_of(&argb, 16, 16, format);
+        for (dw, dh) in [
+            (24.0_f32, 24.0_f32),
+            (40.0, 17.0),
+            (9.0, 33.0),
+            (7.5, 7.5),
+            (32.0, 32.0),
+            (61.0, 3.5),
+        ] {
+            for (ox, oy) in [
+                (0.0_f32, 0.0_f32),
+                (0.3, 0.0),
+                (2.5, 1.25),
+                (-3.75, -2.5),
+                (17.125, 9.875),
+            ] {
+                for src_rect in [
+                    IRect::new(0, 0, 16, 16),
+                    IRect::new(3, 2, 9, 11),
+                    IRect::new(0, 0, 1, 16),
+                    IRect::new(11, 11, 5, 5),
+                ] {
+                    for opacity in [1.0_f32, 0.45, 0.02] {
+                        for clip in [
+                            IRect::new(0, 0, 48, 40),
+                            IRect::new(5, 3, 30, 24),
+                            IRect::new(11, 0, 2, 40),
+                            IRect::new(0, 17, 48, 1),
+                            IRect::new(46, 38, 2, 2),
+                        ] {
+                            let mut s = Surface::new(48, 40);
+                            let all = IRect::new(0, 0, 48, 40);
+                            s.canvas().fill_irect(&all, &all, Color::rgb(20, 90, 160));
+                            s.canvas().blit(
+                                &clip,
+                                &Rect::new(ox, oy, dw, dh),
+                                &img,
+                                &src_rect,
+                                opacity,
+                            );
+                            for b in &s.data {
+                                hash ^= u64::from(*b);
+                                hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+                            }
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (cases, hash)
+}
+
+#[test]
+fn blit_output_matches_the_golden_hash() {
+    // A pinned hash of 3600 blit configurations, through the public API only.
+    //
+    // This exists because the *other* blit test cannot catch a whole class of
+    // bug. `blit_split_is_byte_identical_to_the_general_walk` compares the
+    // split against `blit_general` -- but both run the same edge code, so a
+    // mistake made in the code they share is invisible to it, and one was:
+    // the split dropped the general loop's `alpha == 0` check, which is load
+    // bearing (see `blend_texel`), and both sides of the comparison dropped
+    // it together. Byte-identity to yourself is not correctness.
+    //
+    // The hash was taken from the pre-split implementation at 329faf3 by
+    // running this same sweep there, so it pins this crate's blit output to
+    // what shipped before the split, not to what the split happens to do.
+    //
+    // If a deliberate change to blit output lands, this value must be
+    // updated -- and the update should be justified in the commit message,
+    // because every other blit test passing does not mean the output is the
+    // same.
+    let (cases, hash) = blit_sweep_hash();
+    assert_eq!(cases, 3600);
+    assert_eq!(
+        hash, 0x40b4_4566_be88_3bec,
+        "blit output changed against the pre-split reference (329faf3)"
+    );
+}
