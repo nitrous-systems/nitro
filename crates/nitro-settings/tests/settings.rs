@@ -237,6 +237,57 @@ keyboard.options = ctrl:nocaps
 }
 
 #[test]
+fn an_untouched_scale_is_not_pinned_into_the_file() {
+    // A row whose connector the file never mentioned is seeded from the
+    // *live* scale — the EDID default, or a `NITRO_SCALE` dev override.
+    // Writing that back would be the app inventing an opinion the user
+    // never expressed: today's EDID answer frozen in, so a replaced
+    // monitor stops being measured, and a `NITRO_SCALE=…` meant for one
+    // `just fake` run made permanent.
+    //
+    // So Apply writes no `scale` line for a slider still sitting where it
+    // was seeded, and does write one the moment the user moves it.
+    let dir = scratch("untouched-scale");
+    let path = dir.join(conf::FILE_NAME);
+    // A file that positions the output but says nothing about its scale.
+    std::fs::write(&path, "output.HDMI-A-1.position = 0,0\n").expect("seed");
+    let mut h = Harness::sized(
+        "nitro-settings",
+        Settings::new()
+            .with_config_path(path.clone())
+            .with_audio_dirs(Vec::new())
+            .with_reload_wait(Duration::from_millis(50)),
+        WINDOW,
+        build,
+    );
+    h.settle();
+
+    do_action(&mut h, names::APPLY, "click");
+    let written = std::fs::read_to_string(&path).expect("the file Apply wrote");
+    assert!(
+        !written.contains("output.HDMI-A-1.scale"),
+        "an untouched slider must not pin a scale the file never had:\n{written}"
+    );
+    // The rest of the row is still written: this is about the one line.
+    assert!(
+        written.contains("output.HDMI-A-1.position = 0,0"),
+        "{written}"
+    );
+
+    // Now move it, and the user's choice is persisted.
+    set_value(&mut h, "displays/HDMI-A-1/scale", "2");
+    do_action(&mut h, names::APPLY, "click");
+    let written = std::fs::read_to_string(&path).expect("the file Apply wrote");
+    assert!(
+        written.contains("output.HDMI-A-1.scale = 2"),
+        "a moved slider is the user's opinion and is written:\n{written}"
+    );
+
+    h.quit();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn the_server_parser_reads_back_what_we_write() {
     // The test that keeps `conf.rs` and `nitro_server::config` honest: a
     // second implementation of a format is only safe if something asserts

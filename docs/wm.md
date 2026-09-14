@@ -243,6 +243,18 @@ file while the device layout stayed in connector order, the pointer would
 cross between screens somewhere other than a dragged window does. Both
 are computed in one pass so they cannot diverge.
 
+The device rect is the position times *that output's own* scale, so the
+two layouts are a faithful image of each other **when the outputs share a
+scale** — every single-monitor desk, and every uniform-DPI multi-monitor
+one. Mixing scales *and* typing explicit positions can overlap them in
+device space: a 1920-wide output at 2× is 960 logical units across, so a
+neighbour configured at `position = 960,0` at 1× puts its device rect
+inside the first's. A pointer in the overlapping strip belongs to
+whichever output is found first. Packing scaled outputs without gaps or
+overlaps means *choosing* device positions rather than deriving them,
+which is a job for drag-arrange — where the user can see what they are
+arranging — and is deferred with it.
+
 * The pointer moves across freely: it is clamped to the *union* of the
   outputs, not to one of them.
 * A window belongs to the output containing its **centre**. That is the
@@ -356,7 +368,10 @@ rather than on real hardware.
   not, because nothing in the scene applies one yet.
 * **Drag-arranging the monitor layout.** Positions are persistent and
   editable, but they are *typed* — in `nitro-settings` or in the file.
-  Dragging a monitor rectangle into place is not in M4.
+  Dragging a monitor rectangle into place is not in M4, and it is where
+  the device-space packing above gets solved: mixed scales with explicit
+  positions can overlap in device pixels, and the fix is to choose those
+  positions rather than derive them from logical ones.
 * **Window snapping / edge tiling by drag.** `Super+←`/`→` tile; dragging
   a window to a screen edge does not.
 * **Per-window opacity and shadows.** The scene supports opacity; the

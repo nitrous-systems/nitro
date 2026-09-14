@@ -79,6 +79,12 @@
 //! limitation of the design, it is in the README too, and the rule it
 //! implies is: edit the file or use the app, not both.
 //!
+//! What it does *not* do is write down opinions nobody expressed. A
+//! connector the file said nothing about gets no `scale` line unless its
+//! slider actually moves — see `Row::seeded_scale`: the slider is seeded
+//! from the live scale, and writing that back would pin today's EDID
+//! answer into the file and make a `NITRO_SCALE` dev override permanent.
+//!
 //! # What "applied" means
 //!
 //! Validation belongs to the compositor — it owns xkbcommon and it owns
@@ -267,6 +273,20 @@ struct Row {
     /// The server's output id, which is what `OutputGone` names. `None`
     /// for a row built from the file, which no hotplug can retire.
     output: Option<u32>,
+    /// The scale this row was seeded with when the file said nothing about
+    /// it — i.e. the live scale the server reported, which is the EDID
+    /// default or a `NITRO_SCALE` dev override.
+    ///
+    /// Apply skips the `scale` line for a row still sitting on this value,
+    /// so opening the app and pressing Apply does not silently pin a scale
+    /// the file never had. Without it an untouched row would freeze
+    /// today's EDID answer into the config — so a replaced monitor would
+    /// no longer be measured — and, worse, persist a `NITRO_SCALE=…` meant
+    /// for one `just fake` run into the user's permanent file.
+    ///
+    /// `None` when the file *did* carry a scale for this connector: the
+    /// user has an explicit value, and it is written back unconditionally.
+    seeded_scale: Option<f32>,
     /// The row container, removed when the output goes away.
     container: WidgetId,
     /// The scale slider.
@@ -902,6 +922,12 @@ fn add_row(
     s.rows.push(Row {
         connector: connector.to_owned(),
         output: info.map(|i| i.id),
+        // Only when the file said nothing: a file that names a scale gives
+        // the user an explicit value, which Apply always writes back.
+        seeded_scale: match saved.and_then(|o| o.scale) {
+            Some(_) => None,
+            None => Some(scale),
+        },
         container,
         scale: scale_slider,
         scale_value,
@@ -978,11 +1004,21 @@ fn collect(s: &Settings, ui: &Ui<Settings>, ids: Ids) -> (Conf, Vec<String>) {
             .widget::<Slider<Settings>>(r.scale)
             .map(Slider::value)
             .ok();
+        // A row the user never moved, on a connector the file never
+        // mentioned, writes no `scale` line at all: persisting the live
+        // value would pin today's EDID answer (so a replaced monitor stops
+        // being measured) and would bake a `NITRO_SCALE` dev override into
+        // the user's permanent file. Moving the slider off the seeded
+        // value is what makes it the user's opinion.
+        let scale = match (value, r.seeded_scale) {
+            (Some(v), Some(seed)) if v.to_bits() == seed.to_bits() => None,
+            (v, _) => v,
+        };
         let primary = ui
             .widget::<Checkbox<Settings>>(r.primary)
             .is_ok_and(Checkbox::is_checked);
         let out = conf.output_mut(&r.connector);
-        out.scale = value;
+        out.scale = scale;
         out.position = position;
         out.primary = primary;
     }

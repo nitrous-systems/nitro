@@ -658,7 +658,7 @@ struct Server {
 #[allow(clippy::too_many_lines)] // Startup is a sequence, not a structure: splitting it would only scatter the ordering rules it enforces.
 pub fn run(mut config: Config) -> Result<(), Error> {
     let epoll = epoll::create(epoll::CreateFlags::CLOEXEC).map_err(errno("epoll_create"))?;
-    let signals = if config.handle_signals {
+    let mut signals = if config.handle_signals {
         let s = signals::Signals::install().map_err(io_err("install signal handlers"))?;
         add(&epoll, &s.quit_fd(), TOK_SIGNALS)?;
         add(&epoll, &s.reload_fd(), TOK_SIGHUP)?;
@@ -683,7 +683,7 @@ pub fn run(mut config: Config) -> Result<(), Error> {
             let mut s = Seat::open()?;
             info!("seat {:?} opened, active={}", s.name(), s.is_active());
             add(&epoll, &s, TOK_SEAT)?;
-            if !wait_active(&epoll, &mut s, signals.is_some())? {
+            if !wait_active(&epoll, &mut s, signals.as_mut())? {
                 info!("interrupted while waiting for the seat; exiting");
                 return Ok(());
             }
@@ -941,7 +941,27 @@ fn add(epoll: &OwnedFd, fd: &impl AsFd, token: u64) -> Result<(), Error> {
 ///
 /// libseat queues the initial `Enable` inside `open_seat` without making
 /// the fd readable, so dispatch once before waiting on epoll.
-fn wait_active(epoll: &OwnedFd, seat: &mut Seat, signals: bool) -> Result<bool, Error> {
+///
+/// # Why SIGHUP is drained here rather than ignored
+///
+/// The reload fd is in the epoll set before this function runs, and it is
+/// **level-triggered**: an unread datagram keeps it readable forever. So a
+/// SIGHUP delivered while the server is waiting for an inactive VT — which
+/// is precisely the situation this function exists for — would make every
+/// `wait` return immediately, spinning at 100 % CPU and logging a line per
+/// iteration until the VT happened to become active. Draining it is what
+/// makes the wait a wait again; it is the same rule `ConfigWatch::drain`
+/// states for inotify, applied to the one fd that reaches this loop.
+///
+/// A reload asked for now is *answered by doing nothing*, deliberately.
+/// There is no output, no window and no keymap to re-apply yet, and the
+/// configuration is read in full a few lines further on — so the reload the
+/// caller wanted happens anyway, and happens later than the signal.
+fn wait_active(
+    epoll: &OwnedFd,
+    seat: &mut Seat,
+    mut signals: Option<&mut signals::Signals>,
+) -> Result<bool, Error> {
     let mut buf = event_buffer::<8>();
     drain_seat(seat)?;
     while !seat.is_active() {
@@ -949,8 +969,17 @@ fn wait_active(epoll: &OwnedFd, seat: &mut Seat, signals: bool) -> Result<bool, 
         let n = wait(epoll, &mut buf)?;
         for ev in &buf[..n] {
             match ev.data.u64() {
-                TOK_SIGNALS if signals => return Ok(false),
+                TOK_SIGNALS if signals.is_some() => return Ok(false),
                 TOK_SEAT => drain_seat(seat)?,
+                TOK_SIGHUP => {
+                    if let Some(s) = signals.as_mut()
+                        && s.drain_reload()
+                    {
+                        info!(
+                            "SIGHUP before the seat is active; the config is read at startup anyway"
+                        );
+                    }
+                }
                 _ => {}
             }
         }
@@ -1092,6 +1121,29 @@ impl Server {
     /// point is on. So both spaces are computed here, in one pass, and
     /// [`Server::desktop_origin`] does nothing but read the table this
     /// leaves behind.
+    ///
+    /// # Where that correspondence stops being exact
+    ///
+    /// The device rect is `position × that output's own scale`, so the two
+    /// layouts are a faithful image of each other **when the outputs share
+    /// a scale** — which is every case the tests cover and every case a
+    /// single-monitor or uniform-DPI desk is in. Mix scales *and* give
+    /// explicit positions and they can come apart: a 1920-wide output at
+    /// scale 2 is 960 logical units across, so a neighbour configured at
+    /// `position = 960,0` with scale 1 lands its device rect at x = 960 —
+    /// inside the first output's 0..1920 device span. Device space is
+    /// global, so that is a real overlap, not a cosmetic gap: a pointer in
+    /// the shared strip hit-tests to whichever output `output_at` finds
+    /// first.
+    ///
+    /// It is recorded rather than fixed because there is no honest fix at
+    /// this layer — a device layout that packs scaled outputs without gaps
+    /// or overlaps is a different allocation pass (it has to *choose*
+    /// device positions rather than derive them), and that belongs with
+    /// drag-arrange, where the user can see what they are arranging. Until
+    /// then the file's position is taken at face value, which is what a
+    /// user typing coordinates expects. `docs/wm.md` says the same to a
+    /// reader who is not in the source.
     ///
     /// Removing an output orphans its windows — the scene unplaces them —
     /// so they are migrated onto the primary output afterwards rather than

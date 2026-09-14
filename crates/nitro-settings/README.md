@@ -70,10 +70,23 @@ does not know about are **lost** on Apply. Round-tripping them would mean
 keeping the whole file's token stream; the answer for now is: edit the
 file *or* use the app, not both.
 
+It does not, however, invent settings. A connector the file never
+mentioned gets no `scale` line unless you move its slider: the slider is
+seeded from the *live* scale, and persisting that would pin today's EDID
+answer (so a replaced monitor stops being measured) and would make a
+`NITRO_SCALE=…` dev override permanent.
+
 **No drag-arrange.** Output positions are typed into two fields, in
 desktop logical pixels. A drag-to-arrange canvas needs a widget
 `nitro-ui` does not have and a preview the server cannot render yet; the
 dialog says so in a label rather than pretending.
+
+A typed position is logical, and the server turns it into device pixels
+with that output's own scale — so the two agree exactly when the outputs
+share a scale, and can overlap in device space when they do not (a
+1920-wide output at 2× is 960 logical units wide, so a neighbour at
+`960,0` at 1× sits inside it). Choosing device positions instead of
+deriving them is drag-arrange's job. See `docs/settings.md`.
 
 **The scale slider offers 1–3 in steps of 0.25.** The *file* allows
 0.5–8 and the server enforces that, but the panels that exist live in

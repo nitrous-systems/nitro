@@ -157,4 +157,42 @@ mod tests {
         assert!(!s.drain(), "SIGHUP must not look like SIGTERM");
         drop(s);
     }
+
+    #[test]
+    fn a_drained_reload_fd_stops_being_readable() {
+        // The property a level-triggered epoll set depends on, and whose
+        // absence is a 100 % CPU spin rather than a wrong answer.
+        //
+        // The reload fd is registered before `wait_active` runs, and that
+        // loop waits for an inactive VT. An undrained datagram keeps the fd
+        // readable forever, so a SIGHUP arriving there made every `wait`
+        // return immediately — spinning, and logging a line per iteration,
+        // until the VT happened to become active. `wait_active` therefore
+        // drains this fd, and this pins the half that makes draining work.
+        let mut s = Signals::install().unwrap();
+        if blocked(SIGHUP) {
+            eprintln!("SIGHUP is blocked in this environment; skipping delivery check");
+            return;
+        }
+        raise_and_wait(rustix::process::Signal::HUP, || s.drain_reload());
+        assert!(!s.drain_reload(), "a drained fd has nothing left to report");
+
+        // And it is genuinely not readable any more, which is what epoll
+        // asks and what `drain_reload`'s `bool` does not answer.
+        let fd = s.reload_fd();
+        let mut fds = [rustix::event::PollFd::new(
+            &fd,
+            rustix::event::PollFlags::IN,
+        )];
+        let ready = rustix::event::poll(
+            &mut fds,
+            Some(&rustix::time::Timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            }),
+        )
+        .unwrap();
+        assert_eq!(ready, 0, "a drained reload fd must not wake epoll again");
+        drop(s);
+    }
 }

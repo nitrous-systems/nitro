@@ -185,16 +185,34 @@ across reboots and hotplugs. The captions in front of the fields are
 deliberately unnamed: a label named `layout` beside the field named
 `layout` would make the short path ambiguous.
 
-### Two limitations, stated rather than discovered
+### Three limitations, stated rather than discovered
 
 **Apply rewrites the file wholesale.** Hand-written comments and keys the
 app does not know about are not preserved. If you maintain the file by
 hand and value its comments, do not press Apply.
 
+What Apply does *not* do is invent opinions. A connector the file says
+nothing about gets no `scale` line unless you actually move its slider:
+the slider is seeded from the live scale, and writing that back would
+freeze today's EDID answer into the file (so a replaced monitor would
+stop being measured) and would make a `NITRO_SCALE=…` meant for one dev
+run permanent.
+
 **Positions are typed, not dragged.** Drag-arrange of a monitor layout is
 not in M4. The fields are desktop-space logical pixels, which is the same
 space `nitro-shot --outputs` prints in, so the numbers can be read off
 and typed back.
+
+**Mixed scales with explicit positions can overlap.** A position is
+logical, and the device rectangle the pointer is clamped to is that
+position times *that output's own* scale — so the two layouts match
+exactly when the outputs share a scale, and can come apart when they do
+not. A 1920-wide output at 2× is 960 logical units across, so a
+neighbour placed at `960,0` at 1× overlaps it in device pixels, and a
+pointer in the shared strip belongs to whichever output is found first.
+The fix is to choose device positions rather than derive them, which
+belongs with drag-arrange; until then a typed position is taken at face
+value. See `docs/wm.md`.
 
 ### Audio
 
