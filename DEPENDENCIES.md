@@ -167,9 +167,9 @@ worth recording here is the shape of the app around it, because it is the
 shape `nitro-calc` established. `nitro-term` is `nitro-ui` + `rustix` +
 `vte`, and everything that makes a terminal a terminal — the grid, the
 damage tracking, the colour table, the key encodings — is *in* the crate
-rather than under it. A 646 KB binary containing a VT parser, a cell
+rather than under it. A 650 KB binary containing a VT parser, a cell
 model and a scrollback ring, against `nitro-calc`'s 560 KB for a
-calculator, is what that costs: 86 KB, and no third-party terminal.
+calculator, is what that costs: 90 KB, and no third-party terminal.
 
 The whole-workspace count with the session in is **70** lines and still
 **34 distinct external crate names** — the rise from 67 is three

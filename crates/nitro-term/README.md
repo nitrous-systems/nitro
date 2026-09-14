@@ -70,6 +70,20 @@ $ hey nitro-term do grid scroll_to_bottom
 $ hey nitro-term shot -o tmp/term.png
 ```
 
+The `\n` is a **literal backslash-n**, and it matters: the value's
+C-style escapes (`\n`, `\r`, `\t`, `\e`, `\0`, `\\`) are interpreted by
+the terminal, because a control character cannot be written on a command
+line any other way and a terminal's scripted input is mostly control
+characters. An unknown escape keeps both of its characters.
+
+The bytes are **typed, not pasted** — even when the program has asked
+for bracketed paste. bash 5.1 and later ask by default, and the entire
+purpose of those markers is to tell readline that what follows is data
+rather than keystrokes, so a bracketed `ls\n` sits on the prompt unrun.
+A script driving a terminal is a keyboard, not a clipboard;
+`do grid paste_text` is the bracketed form, for the day there is a real
+clipboard.
+
 `set grid value` and `do grid send` feed the **pty**, not the grid.
 Writing into the screen behind the program's back would desynchronise the
 two immediately: the shell would not know a command had been typed, and

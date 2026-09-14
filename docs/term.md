@@ -156,37 +156,170 @@ box is identical on every repaint and only the string moves.
 
 ## The numbers
 
-Measured on the test box (Pentium G3240, `docs/testbox.md`).
+Measured on the test box (Pentium G3240, 2 cores, no AVX2, HDMI 1920×1080
+@60; `docs/testbox.md`), against `nitro-dev` running the full desktop.
 
-> **Pending the box run.** The box was claimed by task 3702 when this
-> branch was finished; the numbers below are filled in by the acceptance
-> run and this note is removed with them. Everything above is asserted by
-> the test suite on the dev machine and does not depend on them.
+### Throughput
 
-| | nitro-term | Linux console (reference) |
+The terminal is 80×24 in a 720×420 window. The console reference is the
+same command on tty1 (`chvt 1`), at the same 1920×1080, which is the
+honest comparison: the kernel's own terminal, drawing the same text with
+no compositor in the way.
+
+| | nitro-term | Linux console (tty1) |
 |---|---|---|
-| `time seq 1 1000000` | — | — |
-| `time cat` (5 MB) | — | — |
-| frames during it | — | — |
-| `paint_us_mean` | — | — |
-| `damage_px_mean` | — | — |
+| `time seq 1 1000000` | **0.44 s** | 129.5 s |
+| lines/s | **≈ 2 260 000** | ≈ 7 700 |
+| `time cat` (5 MB, 88 235 lines) | **0.11 s** | 4.14 s |
+| MB/s | **≈ 47** | ≈ 1.2 |
+| frames the server drew during `seq` | 30 | — |
+| `paint_us_mean` during it | 520 µs | — |
+| `damage_px_mean` during it | 255 746 px | — |
+
+**nitro-term is ~290× faster than the Linux console on `seq` and ~38×
+on `cat`**, and the reason is the whole point of the design rather than
+anything clever in the terminal: the console draws every line, and
+nitro-term draws **thirty frames**. A million lines scroll past in 0.44 s
+because 999 970 of them were never rasterized — they were parsed into the
+grid, overwritten by the next line, and the screen was sampled at the
+refresh rate. The console has no such freedom: it is the thing doing the
+drawing, so its throughput *is* its draw rate, and it spent 129 seconds at
+99 % CPU proving it.
+
+That also means the honest way to read "2.26 M lines/s" is as a
+**parse-and-discard** rate, not a draw rate. What the user sees is 30
+frames of legible text; what the child experiences is a terminal that
+never makes it wait.
+
+### Keystroke input-to-photon
+
+`docs/latency.md`'s method: `ydotool` at ~4 keys/s into `cat`, which
+echoes each character, so the measured interval covers the whole loop —
+key → server → client → pty → `cat` → pty → grid → `SetText` → raster →
+flip. All 60 keystrokes echoed.
 
 | | |
 |---|---|
-| keystroke i2p, median / p95 | — |
-| idle, 30 s at a prompt | — frames, — ticks |
-| `htop` running | — frames/s, `damage_px` — |
-| RSS, 10 000 lines of scrollback | — |
-| binary | **646 664 bytes** (dev machine), budget ≤ 900 KB |
-| server RSS before / after | — |
-| `atlas_pages` | — |
+| i2p mean | **12.6 ms** |
+| i2p min | 1.8 ms |
+| i2p max | 22.7 ms |
+| frames for 60 keys | 124 |
+| `paint_us_mean` | 21 µs |
+| `damage_px_mean` | 13 203 px |
 
-The binary is the one number that is a property of the code rather than
-the hardware, so it is quoted now: **646 KB against a 900 KB budget**,
-with a VT parser, a grid model, a scrollback ring and a pty in it. The
-comparison worth making is `nitro-calc` at 560 KB — a terminal is 86 KB
-more application than a calculator, because both are "a widget tree and a
-state struct" and neither contains a font, a rasterizer or a compositor.
+Inside one 16.7 ms refresh at the mean, under two at the maximum. It sits
+next to `nitro-calc`'s 12–14 ms (`docs/budget.md`) — and it should, since
+both are one small text change per key; the terminal adds a pty round
+trip through `cat` and a shell, which is most of the gap to
+`nitro-demo`'s 9.3 ms pointer figure.
+
+One methodological note, because it cost three runs. The server's `i2p_*`
+counters are **cumulative min/mean/max with no reset**, so anything else
+that generated input pollutes them permanently. The closed-loop pointer
+move used to focus the window costs about a second of `ydotool` round
+trips, and it landed in the same counters — reporting a 1 051 ms
+"keystroke". The fix is to restart the server so the keystrokes are the
+only input it has ever seen, and to skip the click entirely: the server
+focuses a window it has just placed, which is what makes a launched app
+typable without one.
+
+### Idle
+
+| | |
+|---|---|
+| 30 s at a shell prompt | **0 frames, 0 CPU ticks** (server: 0 ticks) |
+| threads | 1 |
+| voluntary / involuntary context switches over the window | 18 / 7 |
+
+Zero, not "nearly zero": no frame is requested when the grid has no
+damage, so the app is in `epoll_wait` with no timer and no callback
+pending. The desktop around it was also at 0 frames for the same 30 s.
+
+With **`htop -d 10` running** (2 refreshes/s):
+
+| | |
+|---|---|
+| frames over 20 s | **54** (htop asked for ~40) |
+| `damage_px_mean` | 219 148 px, against 302 400 px of window |
+| `paint_us_mean` | 1 151 µs |
+| `text_runs` | 239 |
+
+Frames track **htop's refresh rate, not the display's** — 2.7/s against a
+60 Hz screen. The damage is 72 % of the window because htop really does
+rewrite almost all of it (every CPU meter, every row's CPU%/MEM%/TIME+),
+so this is the honest number rather than a flattering one; the per-row
+damage bit earns its keep on a shell prompt, not under htop.
+
+### Memory and size
+
+| | | budget |
+|---|---|---|
+| RSS, fresh 80×24 | **3 324 kB** | — |
+| RSS, 10 000 scrollback lines filled | **4 212 kB** | ≤ 6 MB — **ok**, 70 % |
+| of which `RssAnon` | 1 628 kB | |
+| binary | **650 136 bytes** | ≤ 900 KB — **ok**, 72 % |
+| server RSS, before / after | 18 416 / 18 852 kB | |
+| `atlas_pages` | **1**, before and after | |
+| `glyphs_cached` | 100 → 176 | |
+
+The scrollback costs **0.9 MB for 10 000 lines** and the whole process
+sits at 4.2 MB against a 6 MB target. For scale, `nitro-calc` is 2.7 MB,
+so a terminal with a full 10 000-line history is 1.5 MB more app than a
+calculator.
+
+**A terminal barely moves the server**, which is the answer to the
+question this milestone actually asked: 18.4 → 18.9 MB, and
+**`atlas_pages` stays at 1**. A terminal is the heaviest text client
+there is, and it added 76 glyphs to a cache that already had 100 — because
+a terminal draws the *same* ASCII repeatedly, at one size, in one family.
+The per-run `SetText` design puts no pressure on the atlas at all: the
+run count is what grows (239 under htop), and a run is a string, not a
+glyph.
+
+### Where the numbers moved, and why
+
+Four defects were found by running it on the box and none by the test
+suite, which is worth recording as honestly as the numbers:
+
+| what | before | after |
+|---|---|---|
+| RSS with 10 000 scrollback lines | 29 436 kB | **4 212 kB** |
+| — of that, the cursor slot at `Slot::MAX` | 11 780 kB | 0 |
+| — of that, untrimmed scrollback rows | 12 800 kB | 900 kB |
+| idle, 30 s at a prompt | 12 frames | **0 frames** |
+| `hey nitro-term get grid text` | empty | the screen |
+| `hey nitro-term set grid value 'ls\n'` | nothing happened | runs `ls` |
+
+The two memory bugs are the instructive pair, because the second hid
+behind the first and both were invisible to a unit test. Parking the
+cursor's paint slot at `Slot::MAX` made the framework's **dense** slot
+vector allocate 65 536 entries — 11.8 MB, present even with
+`--scrollback 0`, which is what finally cleared the scrollback of
+suspicion. And a scrollback row trimmed *in place* with `shrink_to_fit`
+left the allocator holding a full-width hole that the next blank row, one
+cell longer, could not reuse: every row was two cells long and RSS still
+grew by a full row per line. Only a measurement of the process could tell
+those apart, which is why
+`a_full_scrollback_costs_what_its_text_costs` reads `/proc/self/status`.
+
+### Screenshots
+
+`vim` on a shell script and `htop`, both cropped to the window.
+
+![vim in nitro-term](img-term-vim.png)
+
+![htop in nitro-term](img-term-htop.png)
+
+Both are visually correct. vim shows syntax highlighting (comments,
+strings and keywords in distinct colours), the status line, the `~`
+end-of-buffer column and the ruler; the alternate screen enters and
+leaves cleanly, restoring the shell's scrollback underneath. htop shows
+its CPU and memory meters, the inverse-video column header, per-row
+colours and the function-key bar — which between them exercise inverse,
+bold, 256-colour foregrounds and backgrounds, and a scroll region.
+
+The server draws the window decoration and the titlebar (`kaspar@ubuntu:
+~`), which is the OSC 0/2 title arriving from the shell.
 
 ## Dependencies
 
@@ -232,3 +365,39 @@ regrets.
   drawn.
 * **No reflow of the cursor's logical line on resize**, and no
   `SIGWINCH`-time redraw beyond what the child chooses to send.
+* **A scripted `send` types; it does not paste.** `hey … set grid value`
+  writes the bytes as keystrokes even when the program has asked for
+  bracketed paste, because the markers tell readline "this is data, do
+  not execute it" — which made every scripted command sit unrun on the
+  prompt under bash 5.1+. The `paste_text` action keeps the bracketed
+  path for the day there is a real clipboard.
+* **`hey`'s value argument takes C-style escapes** (`\n`, `\t`, `\e`,
+  `\0`, `\\`), because a control character cannot be written on a
+  command line any other way and a terminal's scripted input is mostly
+  control characters. An unknown escape keeps both of its characters.
+
+## Was the per-run `SetText` the bottleneck?
+
+The spec asked for this to be measured and, if it were, for an issue
+proposing a cell-grid wire op behind a caps bit. **It is not**, so no
+issue is filed and the wire is unchanged.
+
+The worst case available is htop, which rewrites nearly the whole screen
+twice a second in colour: **239 text runs**, `paint_us_mean` 1 151 µs,
+2.7 frames/s. A frame's worth of `SetText`s costs the server about a
+millisecond of paint on a Haswell Pentium, against a 16 667 µs budget —
+7 % of a refresh. The atlas is untouched (`atlas_pages` 1, 76 new glyphs
+for the whole session), because a terminal draws the same ASCII over and
+over at one size in one family.
+
+The number that would justify a cell-grid op is a frame where the
+`SetText` count itself dominates, and the measurement says the opposite:
+at 47 MB/s of throughput the terminal is limited by how fast the *child*
+can write, and the scene update is 30 commits for a million lines. A
+wire op that traded strings for a cell array would save marshalling that
+is not on the critical path, at the cost of a second text representation
+in the protocol and a capability bit to negotiate it.
+
+Worth revisiting if a full-screen 24-bit colour program (a TUI with a
+gradient, `cmatrix -b`) pushes the run count past ~1 000 per frame, since
+the cost is linear in runs and this measurement stops at 239.

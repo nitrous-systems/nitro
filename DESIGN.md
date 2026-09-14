@@ -365,8 +365,57 @@ D-Bus client is allowed.
     cost no more commits than there were frames. An idle terminal at a
     prompt schedules no timer, requests no frame and sends nothing.
 
-    Two findings are worth recording because both came from running the
-    thing rather than testing it. **Frame pacing has a trap**: "read the
+    On the box, against the kernel's own terminal on tty1:
+
+    | | nitro-term | Linux console |
+    |---|---|---|
+    | `seq 1 1000000` | **0.44 s** | 129.5 s |
+    | `cat` 5 MB | **0.11 s** (47 MB/s) | 4.14 s |
+    | keystroke i2p (mean / max) | **12.6 / 22.7 ms** | — |
+    | idle, 30 s at a prompt | **0 frames, 0 ticks** | — |
+    | RSS, 10 000 scrollback lines | **4.2 MB** (budget 6) | — |
+    | binary | **650 KB** (budget 900) | — |
+
+    The ~290× on `seq` is not cleverness in the terminal, it is the
+    design: the console draws every line and nitro-term draws **thirty
+    frames**, so 999 970 lines were parsed into the grid and overwritten
+    without ever being rasterized. Read "2.26 M lines/s" as a
+    parse-and-discard rate; what the user sees is thirty legible frames
+    and a child that never waits.
+
+    **A terminal barely moves the server** — 18.4 → 18.9 MB, and
+    `atlas_pages` stays at 1 — which is the question the milestone
+    actually asked of the per-run `SetText` design. The heaviest text
+    client there is added 76 glyphs to the atlas, because a terminal
+    draws the same ASCII over and over at one size in one family. The
+    spec asked for a cell-grid wire op to be proposed if per-run text
+    turned out to be the bottleneck; it measured 239 runs and ~1 ms of
+    paint per frame under `htop`, 7 % of a refresh, so **no issue was
+    filed and the wire is unchanged**.
+
+    **Four defects were found by running it on the box and none by the
+    test suite**, which is the M3 lesson repeating and is worth the same
+    honesty. Two were memory, and the second hid behind the first:
+    parking the cursor's paint slot at `Slot::MAX` made the framework's
+    *dense* slot vector allocate 65 536 entries — 11.8 MB, present even
+    with `--scrollback 0`, which is what finally cleared the scrollback
+    of suspicion — and a scrollback row trimmed *in place* left the
+    allocator a full-width hole the next blank row could not reuse, so
+    every row was two cells long and RSS still grew by a full row per
+    line. Only a measurement of the process could separate them, which
+    is why `a_full_scrollback_costs_what_its_text_costs` reads
+    `/proc/self/status`. Together: **29.4 MB → 4.2 MB**.
+
+    The other two were scripting, and both made `hey` look like it
+    worked: `get grid text` returned nothing because `Role::Terminal`
+    was not in the set that property is derived for, and
+    `set grid value 'ls\n'` wrapped its bytes in the bracketed-paste
+    markers — whose entire purpose is to tell readline *not* to execute
+    what arrives, so under bash 5.1+ every scripted command sat unrun on
+    the prompt. A script driving a terminal is a keyboard, not a
+    clipboard.
+
+    Two more came from the same place. **Frame pacing has a trap**: "read the
     pty until `WouldBlock`, then take a frame" never comes back while
     the writer is faster than the reader, so `cat` of a 5 MB file was
     consumed in one drain and one commit — a perfect score by the letter

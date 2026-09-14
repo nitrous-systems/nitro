@@ -26,6 +26,7 @@ the tool is installed.
 | binary | bytes | budget | verdict |
 |---|---|---|---|
 | `nitro-calc` | 560 360 | ≤ 1 MB (client) | **ok**, 56 % of budget |
+| `nitro-term` | 650 136 | ≤ 900 KB (M4-A) | **ok**, 72 % |
 | `nitro-demo` | 481 240 | ≤ 1 MB (client) | **ok**, 48 % |
 | `hello_client` | 393 344 | ≤ 1 MB (client) | **ok**, 39 % |
 | `hey` | 368 008 | — | ok |
@@ -71,6 +72,17 @@ The two clients remain within a hundred kilobytes of each other despite
 all of a client's size is `nitro-wire` plus the Rust runtime and panic
 machinery, not its own code. A toolkit client starts from about the same
 floor.
+
+**`nitro-term` is the M4-A number**, and it is the same story one
+milestone on: **650 136 bytes** against a 900 KB budget, for an
+application containing a VT escape-sequence parser, a cell grid with a
+10 000-line scrollback ring and an alternate screen, an xterm key
+encoder, a 256-colour palette and a pty. That is **90 KB more than the
+calculator** — the whole cost of being a terminal rather than a keypad —
+because both are a widget tree and a state struct on the same toolkit,
+and neither contains a font, a rasterizer or a compositor. The only
+external dependency in it is `vte`, whose contribution is a parser state
+table.
 
 ## Resident memory
 
