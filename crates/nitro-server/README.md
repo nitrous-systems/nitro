@@ -171,6 +171,18 @@ where a dragged window does. `desktop_origin` therefore does nothing but
 read the table `sync_outputs` left behind — which also keeps it cheap, and
 it is called from every hit test, every drag motion and every clamp.
 
+### The desktop background is the palette's too
+
+The uncovered desktop — the gradient inside the white frame — reads
+`theme.desktop_top`/`theme.desktop_bottom`, the **same two roles**
+`nitro-wallpaper` paints. That is the point: on a box with no wallpaper
+running, or in the moment before it has painted, what shows through is
+the colour it is about to be covered with rather than a second opinion
+about what a backdrop looks like. The white frame is *not* a role — it is
+an M0 debugging aid that makes a screenshot of an empty desktop
+recognisably this server's, and it has to stay legible against both
+schemes rather than follow either.
+
 ### Reloading
 
 Three doors, one `Server::reload_config`:

@@ -83,7 +83,7 @@
 
 use std::time::Duration;
 
-use nitro_core::{Color, Damage, IRect, Rect};
+use nitro_core::{Color, Damage, IRect, Palette, Rect};
 use nitro_kms::{BufferMut, Image, OutputId as KmsOutputId};
 use nitro_raster::{Canvas, Image as RasterImage, PixelFormat};
 use nitro_scene::{Fill as SceneFill, OutputId, PaintItem, PaintKind, Scene};
@@ -570,6 +570,7 @@ pub struct CursorState {
 ///
 /// Returns the microseconds spent, which is what the `paint_us` statistic
 /// records: it covers the rasterization only, not the copy or the commit.
+#[allow(clippy::too_many_arguments)] // One paint call's inputs, not a structure: bundling them would be a struct built per frame to satisfy a lint.
 pub fn paint_region(
     canvas: &mut Canvas<'_>,
     scene: &Scene,
@@ -578,6 +579,7 @@ pub fn paint_region(
     region: &[IRect],
     cursor: (&Cursor, CursorState),
     items: &mut Vec<PaintItem>,
+    palette: &Palette,
 ) -> u64 {
     let start = std::time::Instant::now();
     let (width, height) = (canvas.width(), canvas.height());
@@ -601,7 +603,7 @@ pub fn paint_region(
             })
             .unwrap_or(0);
         if first == 0 && !covers_all(items.first(), &clip) {
-            paint_background(canvas, &clip, width, height);
+            paint_background(canvas, &clip, width, height, palette);
         }
         for item in &items[first..] {
             paint_item(canvas, &clip, item, scene, text);

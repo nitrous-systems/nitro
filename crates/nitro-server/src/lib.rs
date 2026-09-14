@@ -1567,6 +1567,7 @@ impl Server {
                     &rasterize,
                     (&self.cursor, cursor_state),
                     &mut self.paint_items,
+                    &self.palette,
                 );
                 shadow.note_painted(&rasterize);
                 let copy_us = frame::copy_region(shadow, &mut buf, &region);
@@ -1582,6 +1583,7 @@ impl Server {
                     &region,
                     (&self.cursor, cursor_state),
                     &mut self.paint_items,
+                    &self.palette,
                 );
                 (paint_us, 0)
             }

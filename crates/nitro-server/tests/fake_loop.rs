@@ -21,6 +21,19 @@ use nitro_server::cursor::CURSOR_SIZE;
 use nitro_server::frame::FRAME_MARGIN_NS;
 use nitro_server::input::{FakeInput, InputEvent};
 use nitro_server::render::{FRAME, background_color};
+
+/// The background colour at `(x, y)` as the `0x00RRGGBB` word a
+/// screenshot pixel carries.
+///
+/// The palette is the default one, which is what a server with no
+/// `server.conf` runs on — and every harness here is such a server. The
+/// desktop gradient follows `theme.scheme` since M4-F, so a test that
+/// named colours instead of asking would be asserting the scheme rather
+/// than the compositing.
+fn background_word(x: u32, y: u32, width: u32, height: u32) -> u32 {
+    let px = background_color(x, y, width, height, &nitro_core::Palette::default());
+    (u32::from(px.r) << 16) | (u32::from(px.g) << 8) | u32::from(px.b)
+}
 use nitro_server::{BackendKind, Config, run, wm};
 use nitro_wire::client::Connection;
 use nitro_wire::msg::{Configure, ServerMsg};
@@ -440,7 +453,7 @@ fn outputs_shot_stats_quit_on_fake_backend() {
             if cursor_area.contains(x.cast_signed(), y.cast_signed()) {
                 continue;
             }
-            assert_eq!(img.pixel(x, y), background_color(x, y, w, h), "({x},{y})");
+            assert_eq!(img.pixel(x, y), background_word(x, y, w, h), "({x},{y})");
         }
     }
 
@@ -537,7 +550,7 @@ fn a_client_window_is_configured_presented_and_painted_where_the_wm_put_it() {
         let (x, y) = at(dx, dy);
         assert_eq!(
             img.pixel(x, y),
-            background_color(x, y, w, h),
+            background_word(x, y, w, h),
             "({x},{y}) is beyond the frame, so it should be the desktop"
         );
     }
@@ -687,7 +700,7 @@ fn pointer_motion_enters_the_window_and_reports_local_coordinates() {
     let (cx, cy) = ((0.95 * f64::from(w)) as u32, (0.95 * f64::from(h)) as u32);
     assert_ne!(
         img.pixel(cx, cy),
-        background_color(cx, cy, w, h),
+        background_word(cx, cy, w, h),
         "the software cursor must be in the screenshot"
     );
 
@@ -831,7 +844,7 @@ fn disconnecting_destroys_everything_the_client_owned_and_repaints() {
         let (px, py) = at(dx, dy);
         assert_eq!(
             img.pixel(px, py),
-            background_color(px, py, w, h),
+            background_word(px, py, w, h),
             "({px},{py}) still holds the dead client's pixels"
         );
     }
@@ -950,7 +963,7 @@ fn a_buffer_is_copied_from_the_memfd_and_blitted() {
     );
     assert_eq!(
         img.pixel(ox, oy),
-        background_color(ox, oy, w, h),
+        background_word(ox, oy, w, h),
         "outside the window's frame"
     );
 
@@ -996,10 +1009,10 @@ fn the_desktop_frame_is_still_painted_under_everything() {
     park_cursor(&h_, 0.5, 0.5);
     h_.settle();
     let img = h_.shot(None).unwrap();
-    assert_eq!(img.pixel(0, 0), background_color(0, 0, w, h));
+    assert_eq!(img.pixel(0, 0), background_word(0, 0, w, h));
     assert_eq!(
         img.pixel(FRAME - 1, 50),
-        background_color(FRAME - 1, 50, w, h)
+        background_word(FRAME - 1, 50, w, h)
     );
     assert_ne!(img.pixel(0, 50), img.pixel(FRAME + 1, 50));
     h_.quit();
@@ -1301,7 +1314,7 @@ fn no_cursor_is_drawn_until_a_pointer_device_reports_something() {
         for x in 0..w {
             assert_eq!(
                 img.pixel(x, y),
-                background_color(x, y, w, h),
+                background_word(x, y, w, h),
                 "({x},{y}) is not the bare desktop, so something drew a cursor"
             );
         }
@@ -1318,7 +1331,7 @@ fn no_cursor_is_drawn_until_a_pointer_device_reports_something() {
     let (cx, cy) = (w / 2, h / 2);
     assert_ne!(
         img.pixel(cx, cy),
-        background_color(cx, cy, w, h),
+        background_word(cx, cy, w, h),
         "the cursor should be drawn once a pointer has reported"
     );
     h_.quit();
@@ -1412,7 +1425,7 @@ fn set_text_answers_with_metrics_and_puts_glyphs_on_screen() {
     for y in origin.1..origin.1 + 24 {
         for x in origin.0..origin.0 + metrics.width as u32 {
             let px = img.pixel(x, y);
-            if px != 0x0010_1010 && px != background_color(x, y, w, h) {
+            if px != 0x0010_1010 && px != background_word(x, y, w, h) {
                 lit += 1;
             }
         }
