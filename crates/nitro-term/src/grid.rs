@@ -520,7 +520,9 @@ impl Grid {
         let from_top = drop.min(self.cursor.row.saturating_sub(rows - 1));
         for _ in 0..from_top {
             let line = self.lines.remove(0);
-            self.push_history(line);
+            self.push_history(&line);
+            // `line` is dropped here, full width: that is what the blank
+            // row appended below reuses.
         }
         self.cursor.row -= from_top;
         self.lines.truncate(rows);
@@ -1145,14 +1147,18 @@ impl Grid {
         let keep = to_history && !self.alt && top == 0 && bot == self.rows - 1;
         for _ in 0..n {
             let mut line = self.lines.remove(top);
-            if keep {
-                self.push_history(line);
-            } else {
+            if !keep {
                 line.fill(Cell::blank());
                 self.lines.insert(bot, line);
                 continue;
             }
-            self.lines.insert(bot, blank_line(self.cols));
+            self.push_history(&line);
+            // The row goes back to the bottom blanked rather than being
+            // freed and re-allocated: it is already the right width, and
+            // recycling it is what keeps a scrolling terminal from
+            // churning one full-width allocation per line.
+            line.fill(Cell::blank());
+            self.lines.insert(bot, line);
         }
         self.damage_scroll(top, bot);
     }
@@ -1179,21 +1185,27 @@ impl Grid {
     /// scrolled back moves the content under them rather than pinning it.
     /// That matches what the scroll keys mean ("show me `n` lines back")
     /// and keeps the invariant that offset 0 is always the live screen.
-    fn push_history(&mut self, line: Vec<Cell>) {
+    fn push_history(&mut self, line: &[Cell]) {
         if self.history_max == 0 {
             return;
         }
         if self.history.len() == self.history_max {
             self.history.pop_front();
         }
-        // Trim on the way in: see the field's docs. `shrink_to_fit` is
-        // what actually returns the memory — a `truncate` alone leaves
-        // the full-width allocation attached to the `Vec`, which is the
-        // whole thing being paid for here.
-        let mut line = line;
-        line.truncate(trimmed_len(&line));
-        line.shrink_to_fit();
-        self.history.push_back(line);
+        // Trim on the way in: see the field's docs.
+        //
+        // The copy is deliberate, and the first version of this got it
+        // wrong in a way only the box could show. Truncating the row in
+        // place and calling `shrink_to_fit` leaves the allocator holding
+        // a full-width hole that the *next* blank row, being one cell
+        // longer than the trimmed one, cannot reuse — so RSS still grew
+        // by a full row per line (1.44 kB at 90 columns) even though
+        // every stored row was two cells long. Allocating a right-sized
+        // copy and letting the full-width original go back to the free
+        // list reuses it for the blank row that replaces it, which is
+        // the whole point.
+        let keep = trimmed_len(line);
+        self.history.push_back(line[..keep].to_vec());
         self.view_offset = self.view_offset.min(self.history.len());
     }
 
@@ -2125,6 +2137,57 @@ mod tests {
         assert_eq!(g.row_text(0), "hi");
         assert!(g.display_row(0)[40].is_blank());
         assert_consistent(&g);
+    }
+
+    #[test]
+    fn a_full_scrollback_costs_what_its_text_costs() {
+        // The number the box run put a price on. 10 000 lines of a few
+        // characters each must cost about what those characters cost —
+        // not 10 000 full-width rows.
+        //
+        // This is a *resident memory* assertion, which is unusual in a
+        // unit test and is here because the bug it pins was invisible to
+        // every other kind. The rows really were trimmed, and RSS still
+        // grew by a full row per line: `shrink_to_fit` left the
+        // allocator holding a full-width hole that the next blank row,
+        // one cell longer than the trimmed one, could not reuse. Only a
+        // measurement of the process could tell the two apart.
+        fn rss_kb() -> usize {
+            std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find(|l| l.starts_with("VmRSS"))?
+                        .split_whitespace()
+                        .nth(1)?
+                        .parse()
+                        .ok()
+                })
+                .unwrap_or(0)
+        }
+        if rss_kb() == 0 {
+            return; // not Linux, or no procfs: nothing to assert on.
+        }
+        let before = rss_kb();
+        let mut g = Grid::new(90, 24, 10_000);
+        for i in 1..=10_000u32 {
+            for c in i.to_string().chars() {
+                g.put_char(c);
+            }
+            g.carriage_return();
+            g.line_feed();
+        }
+        let grown = rss_kb().saturating_sub(before);
+        assert!(g.scrollback_len() > 9_000, "the buffer really filled");
+        // Full-width storage is 90 x 16 x 10 000 = 14 MB. The text is
+        // well under 1 MB. The threshold sits between the two, far
+        // enough from both that allocator noise cannot reach it.
+        assert!(
+            grown < 4_000,
+            "10 000 short lines grew RSS by {grown} kB; trimmed storage \
+             should cost about a tenth of that, and full-width rows \
+             would cost 14 MB"
+        );
     }
 
     #[test]
