@@ -271,3 +271,48 @@ fn a_theme_built_from_a_palette_is_what_the_widgets_read() {
     assert_eq!(t.accent, p.get(Role::Accent));
     assert_eq!(t.track, p.get(Role::Track));
 }
+
+#[test]
+fn a_re_sent_palette_runs_no_theme_handler() {
+    // The other half of `an_unchanged_palette_is_not_a_commit`, and the
+    // half that is not free: a handler may do real work — `nitro-term`'s
+    // damages its whole grid and asks for a repaint — so dispatching it
+    // for a `Theme` that said nothing would make "an unchanged palette
+    // costs a settled app nothing" true of the toolkit and false of
+    // every app with a hook. Raised in review.
+    struct S {
+        runs: usize,
+    }
+    let mut h = Harness::sized(
+        "resend",
+        S { runs: 0 },
+        Size::new(160.0, 80.0),
+        |ui: &mut Ui<S>| {
+            ui.on_theme(|s: &mut S, _ui: &mut Ui<S>| s.runs += 1);
+            let l = ui.build(label("hi"));
+            let root = ui.build(panel());
+            ui.attach(root, l).unwrap();
+            root
+        },
+    );
+    h.settle();
+    let before = h.state().runs;
+
+    // The message path, not the setter: this is what the server sends.
+    let current = *h.ui().palette();
+    let msg = nitro_wire::msg::Theme::from_palette(9, &current);
+    let (ui, state) = h.parts();
+    ui.dispatch(state, &nitro_wire::msg::ServerMsg::Theme(msg));
+    h.settle();
+
+    assert_eq!(h.state().runs, before, "a re-sent palette runs no handler");
+
+    // And a real change still does.
+    let msg = nitro_wire::msg::Theme::from_palette(10, &Palette::dark());
+    let (ui, state) = h.parts();
+    ui.dispatch(state, &nitro_wire::msg::ServerMsg::Theme(msg));
+    h.settle();
+    assert_eq!(h.state().runs, before + 1, "a real change does");
+    assert_eq!(*h.ui().palette(), Palette::dark());
+    h.quit();
+}

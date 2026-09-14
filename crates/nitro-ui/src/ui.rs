@@ -559,13 +559,28 @@ impl<S: 'static> Ui<S> {
     /// [`Ui::flush`] turns the whole lot into one transaction. An
     /// unchanged palette is dropped without marking anything, so a
     /// server that re-sends its palette costs a settled app nothing.
-    pub fn set_palette(&mut self, palette: nitro_core::Palette) {
+    /// Adopt a palette the server pushed: re-derive the theme from it,
+    /// keeping this app's own metrics, and mark everything for repaint.
+    ///
+    /// Returns whether the palette actually moved.
+    ///
+    /// The repaint is exactly one commit, because marking is not
+    /// sending: every widget is flagged here and the next
+    /// [`Ui::flush`] turns the whole lot into one transaction. An
+    /// unchanged palette is dropped without marking anything, so a
+    /// server that re-sends its palette costs a settled app nothing —
+    /// and the `bool` is what lets [`Ui::dispatch`] hold the same
+    /// promise for an app with an [`Ui::on_theme`] handler, whose hook
+    /// may legitimately do expensive work (`nitro-term`'s damages its
+    /// whole grid).
+    pub fn set_palette(&mut self, palette: nitro_core::Palette) -> bool {
         if palette == self.palette {
-            return;
+            return false;
         }
         self.palette = palette;
         let theme = self.theme.with_palette(&self.palette);
         self.set_theme(theme);
+        true
     }
 
     /// A widget's children, in paint order.
@@ -1460,6 +1475,11 @@ impl<S: 'static> Ui<S> {
     /// A list rather than a widget hook, for the same reason
     /// [`Ui::on_resize`] is: a palette is news about the *desktop*, with
     /// no position to hit-test and no focus to follow.
+    ///
+    /// It fires only when the palette **actually changed** — a server
+    /// re-sending the palette a client already has runs nothing — so a
+    /// handler may do real work without costing a settled app a repaint
+    /// for a message that said nothing.
     pub fn on_theme(&mut self, handler: impl FnMut(&mut S, &mut Ui<S>) + 'static) {
         self.theme_handlers.push(Some(Box::new(handler)));
     }
@@ -2020,8 +2040,14 @@ impl<S: 'static> Ui<S> {
             // every widget is affected, so this marks the whole tree and
             // the next flush pays for it once.
             ServerMsg::Theme(t) => {
-                self.set_palette(t.palette());
-                self.dispatch_theme(state);
+                // Only when it moved: a handler may do real work (the
+                // terminal's damages its whole grid), so a server that
+                // re-sent an unchanged palette would otherwise cost a
+                // settled app a full repaint. `set_palette` answers
+                // whether anything changed.
+                if self.set_palette(t.palette()) {
+                    self.dispatch_theme(state);
+                }
             }
             ServerMsg::PointerEnter(e) => self.pointer_move(state, e.pos),
             ServerMsg::PointerMotion(e) => self.pointer_move(state, e.pos),

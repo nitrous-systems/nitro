@@ -2219,6 +2219,10 @@ impl Server {
     /// waiting for anybody.
     ///
     /// The caller is responsible for the diff: this always does the work.
+    ///
+    /// A client that has not finished its handshake is **skipped**, and
+    /// that is load-bearing rather than tidy — see the comment on the
+    /// loop below.
     fn set_palette(&mut self, palette: nitro_core::Palette) {
         self.palette = palette;
         self.theme_serial = self.theme_serial.wrapping_add(1);
@@ -2230,7 +2234,30 @@ impl Server {
         }
         let theme = msg::Theme::from_palette(self.theme_serial, &self.palette);
         for client in self.wire_clients.values_mut() {
-            client.send(&ServerMsg::Theme(theme.clone()));
+            // Not before the handshake. `wire_clients` holds a client
+            // from `accept` onward, which is *earlier* than its `Hello`
+            // — the two land on different epoll wakeups, and a reload
+            // (inotify, SIGHUP, or a control-socket `reload`) can be
+            // dispatched in between. A `Theme` queued in that window
+            // reaches the socket ahead of the `Welcome`, and
+            // `Connection::with_socket` requires `Welcome` to be the
+            // first message: the client dies with
+            // `Unexpected("Theme")` before it has drawn anything.
+            //
+            // Not hypothetical in the case this feature exists for:
+            // ticking "Dark" in nitro-settings rewrites `server.conf`
+            // while the session is still launching clients.
+            //
+            // Nothing is lost by skipping: the handshake path sends the
+            // current palette itself, right behind the `Welcome`, so a
+            // client that connects during a reload gets the *new*
+            // palette a moment later rather than the old one now. This
+            // is the only unconditional broadcast in this file; every
+            // other one is gated by ownership or a subscription, which
+            // is why it was the only one exposed.
+            if client.stream.is_ready() {
+                client.send(&ServerMsg::Theme(theme.clone()));
+            }
         }
         info!(
             "palette {} ({} scheme, {} override(s))",

@@ -630,3 +630,182 @@ fn the_control_socket_prints_every_role_in_config_syntax() {
     }
     h.quit();
 }
+
+#[test]
+fn a_reload_does_not_send_a_theme_to_a_client_that_has_not_said_hello_yet() {
+    // Review found this, and it is a real ordering window rather than a
+    // theoretical one.
+    //
+    // `wire_clients` holds a client from `accept` onward, which is
+    // *earlier* than its `Hello`: the two land on different epoll
+    // wakeups. A reload dispatched in between used to queue a `Theme`
+    // to every entry unconditionally — so the socket carried `Theme`
+    // first, and `Connection::with_socket` requires `Welcome` to be the
+    // first message. The client dies with `Unexpected("Theme")` before
+    // it has drawn anything.
+    //
+    // The scenario is the one the feature ships for: ticking "Dark" in
+    // nitro-settings rewrites `server.conf` while the session is still
+    // launching clients.
+    //
+    // Driven with a raw socket rather than a `Connection`, because a
+    // `Connection` sends its `Hello` inside `connect` and so cannot be
+    // held in the window under test.
+    use std::io::Read as _;
+
+    let h = Harness::start("pre-hello", "");
+    // Let the existing client settle so the reload below is the only
+    // thing in flight.
+    h.settle();
+
+    let mut raw = UnixStream::connect(&h.wire_path).expect("raw connect");
+    raw.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    // The server has to have *accepted* it, or the window is not open.
+    wait_for("the server to accept the silent client", || {
+        h.stat("clients") >= 1
+    });
+
+    // Now change the palette while that client is accepted and silent.
+    h.rewrite_config("theme.scheme = dark\n");
+    assert_eq!(h.request_line("reload\n"), "ok");
+    wait_for("the reload to be applied", || h.stat("config_reloads") > 0);
+
+    // Only now does it say `Hello`.
+    let mut hello = Vec::new();
+    let name = b"pre-hello";
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&nitro_wire::VERSION.to_le_bytes());
+    payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    payload.extend_from_slice(name);
+    hello.extend_from_slice(&nitro_wire::header::encode(
+        payload.len() as u32,
+        nitro_wire::msg::Hello::OP,
+        0,
+    ));
+    hello.extend_from_slice(&payload);
+    raw.write_all(&hello).expect("send Hello");
+
+    // The first frame back must be the `Welcome`. A `Theme` here is the
+    // defect, and it is fatal to every real client.
+    let mut head = [0u8; nitro_wire::header::SIZE];
+    raw.read_exact(&mut head).expect("a first frame");
+    let first = nitro_wire::header::decode(&head).expect("a valid header");
+    assert_eq!(
+        first.op,
+        nitro_wire::msg::Welcome::OP,
+        "the first frame a client sees must be the Welcome, not op {:#06x}",
+        first.op
+    );
+
+    // And the `Theme` that follows carries the *new* palette, not the
+    // one that was in force when the socket was accepted: nothing is
+    // lost by skipping the broadcast, which is the other half of the
+    // argument for skipping it.
+    let mut body = vec![0u8; first.len as usize];
+    raw.read_exact(&mut body).expect("the Welcome body");
+    let mut head = [0u8; nitro_wire::header::SIZE];
+    raw.read_exact(&mut head).expect("a second frame");
+    let second = nitro_wire::header::decode(&head).expect("a valid header");
+    assert_eq!(second.op, nitro_wire::msg::Theme::OP, "the Theme follows");
+    let mut body = vec![0u8; second.len as usize];
+    raw.read_exact(&mut body).expect("the Theme body");
+    let theme = ServerMsg::decode(second.op, &body, &mut nitro_wire::FdQueue::new())
+        .expect("the Theme decodes");
+    let ServerMsg::Theme(theme) = theme else {
+        panic!("decoded as something else");
+    };
+    assert_eq!(
+        theme.palette(),
+        Palette::dark(),
+        "a client that handshakes after a reload gets the new palette"
+    );
+
+    drop(raw);
+    h.quit();
+}
+
+#[test]
+fn a_scheme_switch_damages_the_decorations_and_the_desktop_but_not_the_client() {
+    // The spec's §2 assertion, raised in review as missing: a palette
+    // change must repaint the title bars and borders, *not* every window
+    // on the screen. The server does not repaint a client's content —
+    // the client does, on its own commit — so a `set_palette` that
+    // invalidated whole outputs would be doing work it cannot know is
+    // needed and would show up here.
+    //
+    // Settled on **pixels**, not on `damage_px_mean`: that statistic is
+    // the server's own opinion about what it repainted, which is the
+    // thing under test, and (per @3705's box run) it is a rolling mean
+    // over a 120-frame window rather than a per-frame figure. Two raw
+    // readbacks and a diff cannot be marking their own homework.
+    let h = Harness::start("decoration-damage", "");
+    let mut seen = Vec::new();
+    let mut conn = h.client("decoration-damage");
+    let root = make_window(&mut conn, &mut seen, 1, 1);
+    let c = configure(&mut conn, &mut seen, root);
+    let first = theme_of(&mut conn, &mut seen);
+    h.settle();
+
+    let before = h.shot();
+    h.rewrite_config("theme.scheme = dark\n");
+    assert_eq!(h.request_line("reload\n"), "ok");
+    await_theme(&mut conn, &mut seen, first.serial);
+    h.settle();
+    let after = h.shot();
+
+    // The client never committed — it is a raw `Connection` with no
+    // toolkit behind it, so nothing repainted its rect. Its pixels must
+    // therefore be untouched, which is what "the server repaints the
+    // decorations, the client repaints itself" means from outside.
+    let insets = wm::frame_insets();
+    let (cx, cy) = (
+        (c.position.x + WIN.w / 2.0) as u32,
+        (c.position.y + WIN.h / 2.0) as u32,
+    );
+    assert_eq!(
+        rgb(before.pixel(cx, cy)),
+        to_rgb(RED),
+        "the client's own content before"
+    );
+    assert_eq!(
+        rgb(after.pixel(cx, cy)),
+        to_rgb(RED),
+        "a palette change does not repaint a client's content: that is \
+         the client's own commit, and the server must not invent one"
+    );
+
+    // The title bar did change, so the test is not passing because
+    // nothing happened at all.
+    assert_ne!(
+        title_bar_pixel(&before, &c),
+        title_bar_pixel(&after, &c),
+        "the decoration did follow the scheme"
+    );
+
+    // And the changed pixels are the frame plus the desktop behind it —
+    // never the window's interior. Walk the client rect and assert not
+    // one pixel of it moved.
+    let x0 = c.position.x as u32;
+    let y0 = c.position.y as u32;
+    let mut moved = 0u32;
+    for y in (y0..y0 + WIN.h as u32).step_by(4) {
+        for x in (x0..x0 + WIN.w as u32).step_by(4) {
+            if rgb(before.pixel(x, y)) != rgb(after.pixel(x, y)) {
+                moved += 1;
+            }
+        }
+    }
+    assert_eq!(moved, 0, "{moved} pixels of the client's content repainted");
+
+    // The frame *around* it did, on all four sides: the title bar above
+    // and the border below, which is the region the spec names.
+    let below = (c.position.y + WIN.h + insets.bottom / 2.0) as u32;
+    assert_ne!(
+        rgb(before.pixel(cx, below)),
+        rgb(after.pixel(cx, below)),
+        "the bottom border followed the scheme too"
+    );
+
+    drop(conn);
+    h.quit();
+}
