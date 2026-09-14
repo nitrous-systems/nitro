@@ -33,6 +33,7 @@ use nitro_wire::types::{ButtonState, Layer, NodeId, WindowState, caps, window_fl
 const BTN_RIGHT: u32 = 0x111;
 
 // evdev keycodes, from `linux/input-event-codes.h`.
+const KEY_A: u32 = 30;
 const KEY_Q: u32 = 16;
 const KEY_M: u32 = 50;
 const KEY_H: u32 = 35;
@@ -56,6 +57,7 @@ struct Harness {
     dir: PathBuf,
     path: PathBuf,
     wire_path: PathBuf,
+    shell_path: PathBuf,
     input: FakeInput,
     /// Monotonically increasing, so every injected event has a distinct
     /// timestamp — a double click is decided by the gap between two of
@@ -79,11 +81,13 @@ impl Harness {
         config.fake_input = Some(input.clone());
         tweak(&mut config);
         let wire_path = config.wire_path.clone();
+        let shell_path = config.shell_path.clone();
         let thread = std::thread::spawn(move || run(config));
         let h = Self {
             dir,
             path,
             wire_path,
+            shell_path,
             input,
             time_ns: 1_000_000,
             thread: Some(thread),
@@ -92,6 +96,7 @@ impl Harness {
             UnixStream::connect(&h.path).is_ok()
         });
         wait_for("the wire socket", || h.wire_path.exists());
+        wait_for("the shell socket", || h.shell_path.exists());
         h
     }
 
@@ -103,6 +108,12 @@ impl Harness {
 
     fn client(&self, name: &str) -> Connection {
         Connection::connect(&self.wire_path, name).expect("wire connect")
+    }
+
+    /// A privileged client on the shell socket, which is the only one that
+    /// may put a window on a shell layer.
+    fn shell(&self, name: &str) -> Connection {
+        Connection::connect(&self.shell_path, name).expect("shell connect")
     }
 
     fn request_line(&self, req: &str) -> String {
@@ -1284,6 +1295,157 @@ fn a_no_focus_window_never_takes_the_keyboard() {
     );
 
     drop(conn);
+    h.quit();
+}
+
+#[test]
+fn a_click_on_the_empty_desktop_keeps_the_focus() {
+    // The desktop is not a focus target. Dropping focus on a click that hit
+    // nothing would leave a screen full of windows with the keyboard going
+    // nowhere until the next Alt+Tab — `focused 0` with windows on screen,
+    // which the server README calls a bug outright.
+    let mut h = Harness::start("desktop-click", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("desktop-click");
+    let win = make_window(&mut conn, &mut inbox, 1, "a", WIN, RED, 0, 1);
+    h.settle();
+    await_focus(&mut conn, &mut inbox, win.root, "the new window has focus");
+
+    // The top-left corner: the window is centred, so this is bare desktop,
+    // well clear of even the resize band's six pixels of outward slop.
+    h.point_at(4.0, 4.0, OUT);
+    h.settle();
+    h.button(BTN_LEFT, ButtonState::Pressed);
+    h.button(BTN_LEFT, ButtonState::Released);
+    h.settle();
+
+    assert_eq!(
+        h.stat("focused"),
+        1,
+        "a click on nothing must not drop the focus"
+    );
+    conn.flush().unwrap();
+    let _ = conn.poll(&mut inbox.0);
+    assert!(
+        !inbox
+            .0
+            .iter()
+            .any(|m| matches!(m, ServerMsg::Focus(f) if f.window == win.root && !f.focused)),
+        "and must not tell the window it lost it"
+    );
+
+    // The real test of "still focused": a key still arrives.
+    h.key(KEY_A, true);
+    h.key(KEY_A, false);
+    h.settle();
+    let got = expect(&mut conn, &mut inbox.0, "a Key", |m| match m {
+        ServerMsg::Key(k) if k.keycode == KEY_A => Some(k.window),
+        _ => None,
+    });
+    assert_eq!(got, win.root, "keys still reach the focused window");
+
+    drop(conn);
+    h.quit();
+}
+
+#[test]
+fn a_click_on_a_no_focus_shell_window_keeps_the_focus_too() {
+    // Same rule one step further in: a window that refused the keyboard is
+    // no more a focus target than the desktop is, so clicking a bar or a
+    // launcher must not park the focus on nothing either. The click itself
+    // still reaches it — that is how a bar's buttons work.
+    let mut h = Harness::start("panel-click", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("panel-click");
+    let win = make_window(&mut conn, &mut inbox, 1, "a", WIN, RED, 0, 1);
+
+    // A shell client, because the `Top` layer is the shell socket's alone.
+    let mut shell_inbox = Inbox::default();
+    let mut shell = h.shell("panel");
+    let panel_root = NodeId(11);
+    let panel_rect = NodeId(12);
+    let panel_size = Size::new(120.0, 40.0);
+    shell
+        .tx()
+        .create_window_with(
+            panel_root,
+            "panel",
+            panel_size,
+            Layer::Top,
+            window_flags::UNDECORATED | window_flags::NO_FOCUS,
+        )
+        .create_rect(
+            panel_rect,
+            panel_root,
+            Rect::new(0.0, 0.0, panel_size.w, panel_size.h),
+        )
+        .fill_solid(panel_rect, GREEN)
+        .commit(1)
+        .unwrap();
+    shell.flush().unwrap();
+    let (panel_pos, panel_size) =
+        expect(&mut shell, &mut shell_inbox.0, "Configure", |m| match m {
+            ServerMsg::Configure(c) if c.window == panel_root => Some((c.position, c.size)),
+            _ => None,
+        });
+    h.settle();
+
+    // The panel took no focus when it appeared; the ordinary window has it.
+    await_focus(
+        &mut conn,
+        &mut inbox,
+        win.root,
+        "the focusable window has it",
+    );
+
+    h.point_at(
+        panel_pos.x + panel_size.w / 2.0,
+        panel_pos.y + panel_size.h / 2.0,
+        OUT,
+    );
+    h.settle();
+    h.button(BTN_LEFT, ButtonState::Pressed);
+    h.button(BTN_LEFT, ButtonState::Released);
+    h.settle();
+
+    assert_eq!(
+        h.stat("focused"),
+        1,
+        "clicking a NO_FOCUS window must not drop the focus"
+    );
+
+    // The click still reached the panel: that is how a bar's buttons work.
+    shell.flush().unwrap();
+    let _ = shell.poll(&mut shell_inbox.0);
+    assert!(
+        shell_inbox
+            .0
+            .iter()
+            .any(|m| matches!(m, ServerMsg::PointerButton(p) if p.window == panel_root)),
+        "the NO_FOCUS window still receives the click"
+    );
+    assert!(
+        !shell_inbox
+            .0
+            .iter()
+            .any(|m| matches!(m, ServerMsg::Focus(f) if f.window == panel_root && f.focused)),
+        "but never the focus"
+    );
+
+    // And the keyboard never left the window that had it.
+    h.key(KEY_A, true);
+    h.key(KEY_A, false);
+    h.settle();
+    let got = expect(&mut conn, &mut inbox.0, "a Key", |m| match m {
+        ServerMsg::Key(k) if k.keycode == KEY_A => Some(k.window),
+        _ => None,
+    });
+    assert_eq!(
+        got, win.root,
+        "keys still reach the previously focused window"
+    );
+
+    drop((conn, shell));
     h.quit();
 }
 

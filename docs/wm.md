@@ -91,6 +91,10 @@ M3.
 
 * Click anywhere in a window raises it (within the `Normal` layer only —
   a click must not pull a panel out from under a menu) and focuses it.
+* A click on nothing changes nothing: a press that hit-tests to no window
+  — bare desktop, or a `NO_FOCUS` one that cannot take the keyboard —
+  leaves the focus and the MRU exactly where they were. Focus is only ever
+  handed on, never dropped on the floor.
 * `Super` + left-drag moves, `Super` + right-drag resizes from the nearest
   corner — on any window, decorated or not. That is the whole of what an
   undecorated window loses by opting out.

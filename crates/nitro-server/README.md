@@ -579,9 +579,9 @@ Routing:
 * Buttons and scroll go to the window the pointer is **over**, not the
   focused one — focus follows the click, not the other way round. A left
   press raises that window (within the `Normal` layer only, so a click
-  cannot pull a panel out from under a menu) and focuses it; a press on
-  the desktop drops focus, which is how a client learns it stopped
-  receiving keys.
+  cannot pull a panel out from under a menu) and focuses it; a press that
+  hits no window at all — bare desktop, or a `NO_FOCUS` window — leaves
+  the focus where it was, because focus is only ever handed on.
 * A press that lands on a window's **frame** — title bar, button, resize
   band — or anywhere at all with `Super` held is the *server's*, and the
   client hears nothing about it: it starts a move or resize drag, or arms

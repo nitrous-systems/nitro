@@ -1995,11 +1995,11 @@ impl Server {
         }
 
         let Some(window) = self.pointer.over else {
-            // A click on the desktop drops focus, which is what lets a
-            // client know it stopped receiving keys.
-            if state == ButtonState::Pressed {
-                self.set_focus(None);
-            }
+            // A click on nothing changes nothing: the desktop is not a
+            // focus target, so the keyboard stays where it was. Dropping
+            // focus here would leave a screen full of windows and nowhere
+            // for keys to go until the next Alt+Tab — `docs/wm.md` is
+            // explicit that focus is only ever handed on, never dropped.
             return;
         };
         if state == ButtonState::Pressed && button == input::BTN_LEFT {
