@@ -23,16 +23,19 @@
 //! path is `drop(device)` or the explicit [`Seat::close_device`] (which
 //! also reports the libseat error). A `Seat` must outlive its devices: in
 //! debug builds dropping a `Seat` with live devices panics; in release
-//! builds the devices' fds are orphaned (libseat has already freed them)
-//! and using such a `Device` is an I/O-safety bug. Keep the seat at the
-//! root of the ownership tree and this never comes up.
+//! builds such a `Device` still closes its own fd, but libseat is never
+//! told, so keep the seat at the root of the ownership tree and this never
+//! comes up.
+//!
+//! The fd itself is closed by this crate, not by libseat — see
+//! [`Seat::close_device`].
 //!
 //! This crate never logs; it returns data and the server decides what to
 //! say.
 
 use std::cell::RefCell;
 use std::fmt;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 
@@ -293,10 +296,14 @@ impl Seat {
     /// Closes a device through the seat. Prefer this over `drop(dev)` when
     /// the error matters; the fd is invalid afterwards either way.
     ///
+    /// The descriptor is closed by *this crate*: `libseat_close_device`
+    /// closes the device on the seat but leaves the fd it handed out open
+    /// (see [`close_device_fd`]).
+    ///
     /// # Errors
     ///
     /// [`ErrorKind::CloseDevice`] when libseat rejects the close. The device
-    /// is consumed regardless.
+    /// is consumed, and its fd closed, regardless.
     pub fn close_device(&mut self, mut dev: Device) -> Result<(), Error> {
         // `dev` came from this seat, or from one that is already gone (in
         // which case `take()` below leaves nothing for `Drop` to do either).
@@ -312,10 +319,19 @@ impl Seat {
         // Release the Weak before the device is dropped so `open_devices`
         // is accurate immediately after this call.
         dev.seat = Weak::new();
-        self.inner
+        // `close_device` consumes `inner`, so read the fd out first.
+        let raw = inner.as_fd().as_raw_fd();
+        let res = self
+            .inner
             .borrow_mut()
             .close_device(inner)
-            .map_err(|e| Error::new(ErrorKind::CloseDevice, e))
+            .map_err(|e| Error::new(ErrorKind::CloseDevice, e));
+        // After libseat is done with the device, never before: a backend
+        // that revokes rather than closes may still touch the fd inside
+        // the call. An error is not a reason to keep the fd: libseat has
+        // handed ownership over either way.
+        close_device_fd(raw);
+        res
     }
 
     /// Asks libseat to switch to session `vt`. For VT-bound seats this is a
@@ -355,9 +371,10 @@ impl Drop for Seat {
 /// An open device fd owned by a [`Seat`].
 ///
 /// Use [`AsFd`] to hand the fd to DRM/libinput. Closing goes through the
-/// seat: either [`Seat::close_device`] or simply dropping the `Device`,
-/// which closes it if the seat is still alive and silently gives up
-/// otherwise (see the drop-order rule in the [crate docs](crate)).
+/// seat: either [`Seat::close_device`] or simply dropping the `Device`.
+/// The fd is closed by this crate either way, even if the seat is already
+/// gone (see the drop-order rule in the [crate docs](crate)); libseat only
+/// learns about the close while the seat is alive.
 #[derive(Debug)]
 #[must_use = "dropping a Device closes it"]
 pub struct Device {
@@ -388,20 +405,47 @@ impl AsFd for Device {
     }
 }
 
+/// Closes a descriptor libseat handed out for a device.
+///
+/// libseat's contract for the fd is undocumented: `libseat_close_device`
+/// is specified only as "closes a device that has been opened on the seat
+/// using the `device_id`", and on the builds we test against (libseat 0.9,
+/// logind and `noop` backends) it leaves the descriptor open. Nor does the
+/// `libseat` crate close it: its `Device` is `{ id, fd }` with no `Drop`,
+/// and `close_device` consumes it, dropping the raw fd on the floor. So
+/// the caller owns it, and the server leaked one fd per device per VT
+/// round trip until this closed it.
+///
+/// Taking the fd back into an [`OwnedFd`] is how the close happens without
+/// `unsafe` in this crate: `OwnedFd`'s own `Drop` issues the `close(2)`.
+/// The safety condition is the one the callers uphold — the fd came from
+/// `libseat_open_device`, has just been released by `libseat_close_device`
+/// (or its seat is gone), and nothing else holds it.
+fn close_device_fd(raw: RawFd) {
+    // SAFETY: `raw` is a live descriptor that libseat opened for this
+    // device and has finished with; the `libseat::Device` that named it
+    // has been consumed, so this is the only owner.
+    #[allow(unsafe_code)]
+    let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+    drop(owned);
+}
+
 impl Drop for Device {
     fn drop(&mut self) {
         let Some(inner) = self.inner.take() else {
             return;
         };
+        let raw = inner.as_fd().as_raw_fd();
         // Seat gone (or currently dispatching — impossible for a caller to
-        // arrange, but harmless): nothing we can safely do; the fd is
-        // orphaned. Errors from libseat are ignored: use
+        // arrange, but harmless): libseat cannot be told, but the fd is
+        // still ours to close. Errors from libseat are ignored: use
         // `Seat::close_device` to observe them.
         if let Some(seat) = self.seat.upgrade()
             && let Ok(mut seat) = seat.try_borrow_mut()
         {
             let _ = seat.close_device(inner);
         }
+        close_device_fd(raw);
     }
 }
 

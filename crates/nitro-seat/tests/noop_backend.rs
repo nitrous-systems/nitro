@@ -36,6 +36,11 @@ fn noop_drop_seat_with_live_device() {
 }
 
 #[test]
+fn noop_device_fds_do_not_leak() {
+    rerun_with_noop("noop_device_fds_do_not_leak_inner");
+}
+
+#[test]
 #[ignore = "run via noop_roundtrip"]
 fn noop_roundtrip_inner() {
     assert_eq!(std::env::var("LIBSEAT_BACKEND").as_deref(), Ok("noop"));
@@ -93,6 +98,41 @@ fn noop_roundtrip_inner() {
     let err = seat.switch_session(2).unwrap_err();
     assert_eq!(err.kind(), &ErrorKind::Switch);
     assert!(err.to_string().starts_with("switching session: "), "{err}");
+}
+
+#[test]
+#[ignore = "run via noop_device_fds_do_not_leak"]
+fn noop_device_fds_do_not_leak_inner() {
+    // libseat does not close the descriptor it handed out (see
+    // `close_device_fd` in the crate), so without the crate closing it
+    // this loop grew the process fd table by one per iteration — the leak
+    // measured on the test box as five fds per VT round trip.
+    fn open_fds() -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .expect("/proc/self/fd")
+            .count()
+    }
+
+    let mut seat = Seat::open().expect("open noop seat");
+    seat.dispatch().unwrap();
+
+    // One round trip first, so any one-off allocation the backend makes is
+    // already paid for before the baseline is taken.
+    let warmup = seat.open_device(Path::new("/dev/null")).unwrap();
+    seat.close_device(warmup).unwrap();
+    let base = open_fds();
+
+    for _ in 0..16 {
+        let dev = seat.open_device(Path::new("/dev/null")).unwrap();
+        seat.close_device(dev).unwrap();
+    }
+    assert_eq!(open_fds(), base, "Seat::close_device leaked an fd");
+
+    for _ in 0..16 {
+        drop(seat.open_device(Path::new("/dev/null")).unwrap());
+    }
+    assert_eq!(open_fds(), base, "dropping a Device leaked an fd");
+    assert_eq!(seat.open_devices(), 0);
 }
 
 #[test]

@@ -182,7 +182,21 @@ the syscall families it uses.
 
 ## `unsafe` exceptions
 
-None in our code. The FFI-binding crates above (`libseat-sys`, `drm-ffi`,
+One, in `nitro-seat`: `close_device_fd` reclaims a device descriptor with
+`OwnedFd::from_raw_fd` so the `OwnedFd`'s own `Drop` closes it. libseat
+hands out a raw fd from `libseat_open_device` and `libseat_close_device`
+does **not** close it (measured on libseat 0.9, logind and `noop`
+backends); the `libseat` crate's `Device` has no `Drop` and consumes the
+fd on close, so the caller owns it and the server leaked one fd per input
+device per VT round trip. There is no safe way to turn a `RawFd` we did
+not open into an owned one, and `rustix::io::close` is `unsafe` too. The
+safety condition is narrow and local: the fd came from
+`libseat_open_device`, libseat has just been told to close the device,
+and the `libseat::Device` naming it has been consumed — so this is the
+only owner. `tests/noop_backend.rs` asserts the process fd count is flat
+across 16 open/close and 16 open/drop cycles.
+
+The FFI-binding crates above (`libseat-sys`, `drm-ffi`,
 `input-sys`, `xkbcommon`) contain their own, which is exactly why each is
 listed here: it buys a kernel or C ABI we would otherwise have to write
 `unsafe` ourselves to reach.
