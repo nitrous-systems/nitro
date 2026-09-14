@@ -113,6 +113,31 @@ the kernel whether or not the app is currently in `accept`, so a busy app
 is never mistaken for a dead one, and `ECONNREFUSED` means there is no
 listener at all.
 
+**Only refusal and absence prove staleness.** A `false` from `responds()`
+means the file gets *unlinked*, so the test is deliberately asymmetric
+(issue #548): `ECONNREFUSED` and `ENOENT` are proof of death, and **every
+other error is "don't know"** — the answer is "live" and the file is left
+alone. `EMFILE`/`ENFILE` from a caller that has run out of descriptors,
+`EACCES` on the directory, or any transient failure would otherwise make a
+*healthy* app's socket disappear: the app keeps running and keeps its
+listener, but becomes invisible and unreachable until it restarts. Keeping
+a ghost one round longer is the cheaper mistake, and it is the same
+principle `Socket::bind`'s pid-only sweep already follows. Both copies of
+`responds()` — `crates/nitro-hey/src/main.rs` and
+`crates/nitro-ui/src/introspect.rs`, which stay in step because `hey`
+deliberately does not depend on `nitro-ui` — carry a unit test that a
+socket in an unreadable directory (EACCES) is **not** pruned.
+
+**Known and not fixed: `connect(2)` on AF_UNIX can block.** A
+live-but-not-serving app whose listen backlog is full makes `connect`
+block rather than fail, and `hey` connects to *every* socket in the
+directory before it decides anything — so one wedged app could in
+principle hang every `hey` invocation, not just one aimed at it. Getting
+there needs 128 queued connections against an app that has stopped calling
+`accept`, which is a long way from anything seen. The fix would be a
+non-blocking connect with a short timeout; that is a fair amount of
+machinery for the risk, so this is **recorded rather than fixed**.
+
 Leftovers are pruned at the two moments that matter:
 
 * **`nitro_ui::introspect::Socket::bind`** sweeps the sibling

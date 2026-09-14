@@ -363,9 +363,30 @@ pub fn pid_alive(pid: u32) -> bool {
 /// but no open fds. The connection is dropped immediately; the app
 /// accepts it, reads nothing and closes it, which costs it one loop
 /// turn.
+///
+/// **Only `ECONNREFUSED` and `ENOENT` prove staleness** (issue #548). A
+/// `false` here means "stale", and stale means the file gets *unlinked*, so
+/// every other error — `EMFILE`/`ENFILE` from a process that has run out of
+/// descriptors, `EACCES` on the directory, anything transient — is "don't
+/// know", and the answer is `true`: leave the file alone. Otherwise a loaded
+/// caller unlinks the sockets of healthy apps, and a live app that keeps its
+/// listener becomes invisible and unreachable until it restarts. Erring
+/// toward keeping a ghost one round longer is already the principle
+/// [`sweep_dead`] documents for its pid-only check.
+///
+/// One thing this deliberately does **not** handle: `connect(2)` on AF_UNIX
+/// *blocks* against a live-but-not-serving app whose backlog is full (128
+/// queued connections against a peer that has stopped calling `accept`), so
+/// one wedged app could hang a caller that walks the whole directory. The fix
+/// is a non-blocking connect with a timeout, which is a fair amount of
+/// machinery for a case a long way from anything seen; recorded in
+/// `docs/introspection.md` rather than fixed.
 #[must_use]
 pub fn responds(path: &Path) -> bool {
-    UnixStream::connect(path).is_ok()
+    match UnixStream::connect(path) {
+        Ok(_) => true,
+        Err(e) => !matches!(e.kind(), ErrorKind::ConnectionRefused | ErrorKind::NotFound),
+    }
 }
 
 /// Whether `sock` is a leftover rather than a running app.
@@ -1174,6 +1195,51 @@ mod tests {
         assert_eq!(parse_indexed("label"), Some(("label", 0)));
         assert_eq!(parse_indexed("button[x]"), None);
         assert_eq!(parse_indexed("button[2"), None);
+    }
+
+    #[test]
+    fn an_unreadable_directory_is_not_proof_of_death() {
+        // Issue #548: only ECONNREFUSED and ENOENT prove staleness. Any other
+        // errno is "don't know" and the socket file must be left alone --
+        // `stale()` feeding `list_apps`/`sweep_dead` is what *unlinks* it, so
+        // a wrong `false` here makes a healthy app invisible and unreachable
+        // until it restarts. The trigger to watch for is a long-running
+        // in-process caller of `list_apps`, where EMFILE stops being
+        // theoretical.
+        //
+        // EACCES is the one reproducible without privileges: chmod the
+        // containing directory to 000 and `connect` cannot reach the inode.
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let me = rustix::process::getpid().as_raw_nonzero().get() as u32;
+        let dir = std::env::temp_dir().join(format!("nitro-eacces-{me}-{:?}", {
+            std::thread::current().id()
+        }));
+        let _ = std::fs::remove_dir_all(&dir);
+        let locked = dir.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        let sock = locked.join(format!("ghost.{me}.sock"));
+        let listener = UnixListener::bind(&sock).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let verdict = responds(&sock);
+        let err = UnixStream::connect(&sock).map(|_| ()).err();
+
+        // Undo before asserting, so a failure still leaves a removable tree.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        match err.map(|e| e.kind()) {
+            Some(ErrorKind::PermissionDenied) => assert!(
+                verdict,
+                "EACCES is not proof of death: the socket must be left alone"
+            ),
+            // Root, or a filesystem that ignores the mode: the connect
+            // succeeded, which `responds` must also report as live.
+            None => assert!(verdict, "a connect that succeeded is a live app"),
+            other => panic!("unexpected connect error {other:?}"),
+        }
     }
 
     #[test]

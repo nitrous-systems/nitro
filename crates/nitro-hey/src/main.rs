@@ -130,8 +130,32 @@ fn pid_alive(pid: u32) -> bool {
 /// which means a leftover file. It is not a liveness *timeout* either:
 /// `listen(2)` queues the connection in the kernel whether or not the
 /// app is in `accept`, so a busy app is never mistaken for a dead one.
+///
+/// **Only `ECONNREFUSED` and `ENOENT` prove staleness** (issue #548). A
+/// `false` here means "stale", and [`prune`] *unlinks* what is stale, so
+/// every other error — `EMFILE`/`ENFILE` from a process out of descriptors,
+/// `EACCES` on the directory, anything transient — is "don't know", and the
+/// answer is `true`: leave the file alone. Otherwise a loaded caller unlinks
+/// the socket of a healthy app, which keeps running and keeps its listener
+/// but becomes invisible and unreachable until it restarts. Keeping a ghost
+/// one round longer is the cheaper mistake.
+///
+/// Deliberately not handled: `connect(2)` on AF_UNIX *blocks* against an app
+/// whose backlog is full, so one wedged app could hang every `hey`
+/// invocation — `prune` connects to every socket in the directory. See
+/// `docs/introspection.md`.
+///
+/// This is a copy of `nitro_ui::introspect::responds` and the two must stay
+/// in step; `hey` deliberately does not depend on `nitro-ui` (see this
+/// crate's README).
 fn responds(path: &Path) -> bool {
-    UnixStream::connect(path).is_ok()
+    match UnixStream::connect(path) {
+        Ok(_) => true,
+        Err(e) => !matches!(
+            e.kind(),
+            io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+        ),
+    }
 }
 
 /// Drop, and unlink, every socket that is not a running app.
@@ -731,6 +755,50 @@ mod tests {
 
         child.wait().expect("reap");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unreadable_directory_is_not_proof_of_death() {
+        // Issue #548: only ECONNREFUSED and ENOENT prove staleness. Any other
+        // errno is "don't know", and `prune` must leave the file alone --
+        // otherwise a loaded or unlucky caller unlinks a healthy app's socket
+        // and the app stays running but invisible until it restarts.
+        //
+        // EACCES is the one that can be produced without privileges: chmod
+        // the containing directory to 000 and `connect` cannot even reach the
+        // inode. `list_apps` reads the parent, so the socket goes in a
+        // subdirectory and the path is built by hand.
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let me = std::process::id();
+        let dir = std::env::temp_dir().join(format!("hey-eacces-{me}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let locked = dir.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        let sock = locked.join(format!("bar.{me}.sock"));
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let verdict = responds(&sock);
+        let err = std::os::unix::net::UnixStream::connect(&sock)
+            .map(|_| ())
+            .err();
+
+        // Undo before asserting, so a failure still leaves a removable tree.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        match err.map(|e| e.kind()) {
+            Some(io::ErrorKind::PermissionDenied) => assert!(
+                verdict,
+                "EACCES is not proof of death: the socket must be left alone"
+            ),
+            // Running as root, or on a filesystem that ignores the mode: the
+            // connect succeeded, which `responds` must also report as live.
+            None => assert!(verdict, "a connect that succeeded is a live app"),
+            other => panic!("unexpected connect error {other:?}"),
+        }
     }
 
     #[test]
