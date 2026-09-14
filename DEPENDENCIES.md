@@ -159,10 +159,14 @@ action M3 does not implement. So the permission is still unspent, and
 `crates/nitro-session/README.md` records what would spend it.
 
 `nitro-term` (M4-A) is the first workspace crate since M0 to add an
-external dependency, and it adds **two**: `vte`, plus `arrayvec` and
-`memchr` behind it (three lines, two of which are `vte`'s). The
-whole-workspace figure moves **70 → 74** lines and **35 → 38 distinct
-external crate names**. The argument for spending it is above; what is
+external dependency, and it adds **three crate names**: `vte`, plus
+`arrayvec` and `memchr` behind it. The whole-workspace figure moves
+**70 → 74** lines and **34 → 37 distinct external crate names** — and
+unlike every rise since M0, this one moves the *name* count too, which
+is the figure that means something. (`docs/budget.md` decomposes the
+line count and explains why 34 rather than the 35 this file used to
+carry: a bare `awk '{print $1}'` turns `cargo tree`'s blank separator
+line into an empty string that `sort -u` keeps.) The argument for spending it is above; what is
 worth recording here is the shape of the app around it, because it is the
 shape `nitro-calc` established. `nitro-term` is `nitro-ui` + `rustix` +
 `vte`, and everything that makes a terminal a terminal — the grid, the

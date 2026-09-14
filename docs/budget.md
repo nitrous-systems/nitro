@@ -643,24 +643,25 @@ latency.
 
 ## Dependency count
 
-`cargo tree -e normal --prefix none | sort -u | wc -l` = **70** at M3
-(60 at M2, 48 at M1), matching `DEPENDENCIES.md`. **Distinct external
-crate names are 34.**
+`cargo tree -e normal --prefix none | sort -u | wc -l` = **74** at M4-A
+(70 at M3, 60 at M2, 48 at M1), matching `DEPENDENCIES.md`. **Distinct
+external crate names are 37.**
 
 That line count is three different kinds of line added together, which is
 what makes it easy to quote wrongly:
 
-| | M1 `7e9be25` | M2 `6d79420` | M3 `329faf3` |
-|---|---|---|---|
-| total lines | 48 | 60 | **70** |
-| external package entries | 29 | 36 | 37 |
-| our workspace crates | 8 | 10 | 17 |
-| cargo `(*)` dedup markers | 10 | 13 | 15 |
-| blank separator line | 1 | 1 | 1 |
-| **distinct external crate names** | — | 34 | **34** |
+| | M1 `7e9be25` | M2 `6d79420` | M3 `329faf3` | M4-A |
+|---|---|---|---|---|
+| total lines | 48 | 60 | 70 | **74** |
+| external package entries | 29 | 36 | 37 | 40 |
+| our workspace crates | 8 | 10 | 17 | 18 |
+| cargo `(*)` dedup markers | 10 | 13 | 15 | 15 |
+| blank separator line | 1 | 1 | 1 | 1 |
+| **distinct external crate names** | — | 34 | 34 | **37** |
 
 The first four rows are disjoint and sum to the total at every commit
-(29 + 8 + 10 + 1 = 48; 36 + 10 + 13 + 1 = 60; 37 + 17 + 15 + 1 = 70) —
+(29 + 8 + 10 + 1 = 48; 36 + 10 + 13 + 1 = 60; 37 + 17 + 15 + 1 = 70;
+40 + 18 + 15 + 1 = 74) —
 which is the property the old paragraph lacked. Each column is a `sort -u`
 of the tree at that commit, re-measured for this table rather than carried
 forward. Note the blank line is a real row: `cargo tree` separates each
@@ -694,27 +695,40 @@ distinct from the M2 event above: M2 added a second *line* for one
 version, M3 added a second *version*. Neither is a new crate **name**,
 which is why that figure is 34 at both.
 
+**70 → 74** across M4-A is the first rise since M0 that is *actually new
+crates*: **+3 external package entries** (`vte`, and `arrayvec` and
+`memchr` behind it) and **+1 workspace crate** (`nitro-term`), with no
+new `(*)` markers. 3 + 1 = 4. So the distinct-name figure moves too, 34 →
+**37**, which is the honest signal this count exists to give — the three
+previous milestones all moved the line count without moving it.
+
+`nitro-term` is where that budget went, and `DEPENDENCIES.md` argues it:
+`vte` is the DEC ANSI parser's transition table and assigns no meaning to
+what it parses, so the grid, the damage tracking, the colour table and
+the key encodings are all in `nitro-term` rather than under it.
+
 Verify with:
 
 ```sh
-cargo tree -e normal --prefix none | sort -u | wc -l                    # 70
+cargo tree -e normal --prefix none | sort -u | wc -l                    # 74
 cargo tree -e normal --prefix none | sort -u | grep -c '(\*)'           # 15
-cargo tree -e normal --prefix none | sort -u | grep -c '^nitro-'        # 24 lines,
-                                                                        # 17 crates
+cargo tree -e normal --prefix none | sort -u | grep -c '^nitro-'        # 25 lines,
+                                                                        # 18 crates
                                                                         # + 7 markers
 cargo tree -e normal --prefix none | awk 'NF{print $1}' |
-    grep -v '^nitro-' | sort -u | wc -l                                 # 34
+    grep -v '^nitro-' | sort -u | wc -l                                 # 37
 ```
 
 **`awk 'NF'`, not a bare `awk '{print $1}'`**, in the last one:
 `cargo tree` separates each root's subtree with a **blank line**, the bare
 form turns every blank into an empty string, and `sort -u` keeps one — so
-it reports **35** for 34 crates. That off-by-one is where the "35 distinct
-external crate names" this page and `DEPENDENCIES.md` both used to carry
-came from; the figure was never 35, at M2 or at M3. A `Cargo.lock` count
-is a third number again — **37** — because the lock file also carries
-`pkg-config`, `windows-sys` and `windows-link`: one build dependency and
-two `cfg(windows)` entries that no Linux build ever compiles.
+it reports one more than there are crates (**38** for 37 at M4-A). That
+off-by-one is where the "35 distinct external crate names" this page and
+`DEPENDENCIES.md` both used to carry came from; the figure was never 35,
+at M2 or at M3. A `Cargo.lock` count is a third number again — **40** at
+M4-A — because the lock file also carries `pkg-config`, `windows-sys` and
+`windows-link`: one build dependency and two `cfg(windows)` entries that
+no Linux build ever compiles.
 
 **The entire M3 shell added none of them.** `nitro-bar`,
 `nitro-launcher`, `nitro-wallpaper` and `nitro-session` between them
