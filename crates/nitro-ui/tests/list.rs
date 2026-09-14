@@ -84,7 +84,7 @@ fn a_hundred_thousand_rows_create_a_screenful_of_nodes() {
     // The whole reason the widget exists. The model is enormous; the
     // scene holds the rows that fit plus the two spare ones that make a
     // one-row scroll free, and not one node more.
-    let (mut h, id) = list_of(100_000, 200.0);
+    let (h, id) = list_of(100_000, 200.0);
     let fits = h.widget::<List<Vec<usize>>>(id).rows_that_fit();
     let made = h.widget::<List<Vec<usize>>>(id).materialised();
     assert!(fits > 0, "the viewport shows something");
@@ -112,7 +112,7 @@ fn the_node_count_does_not_depend_on_the_models_length() {
     // materialises the same number of rows. Two harnesses would be two
     // servers in one test, so the two halves are compared by the number
     // rather than by sharing a process.
-    let (mut small, small_id) = list_of(100, 200.0);
+    let (small, small_id) = list_of(100, 200.0);
     let made = small.widget::<List<Vec<usize>>>(small_id).materialised();
     let fits = small.widget::<List<Vec<usize>>>(small_id).rows_that_fit();
     assert_eq!(made, fits + 2);

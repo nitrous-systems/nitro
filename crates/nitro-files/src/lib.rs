@@ -609,10 +609,25 @@ fn sort_name(sort: Sort) -> &'static str {
 
 /// Keys the focused widget did not want: the confirm answer, `F2`,
 /// `Delete`, and `Escape`.
+///
+/// # Why the confirm arm can be reached at all
+///
+/// App-level handlers are offered only what the focused chain declined,
+/// which is the right order for everything else in this file and was
+/// very nearly fatal here. The list answers `Handled::Yes` to any
+/// printable key it can type-ahead with, so with the list focused an
+/// `n` is *not* "no" — it is a jump to the first row beginning with
+/// `n`. On the box the prompt "Move notes.txt to the trash? [y/n]" ate
+/// its own `n` (the file starts with one) and would have accepted `y`
+/// only because no row happened to start with `y`: a confirmation whose
+/// meaning depended on the file names in the directory.
+///
+/// So a pending confirm **takes the keyboard**, by dropping the focus
+/// when the question is asked ([`ask`]) and giving it back when it is
+/// answered. With nothing focused, keys bubble from the root and reach
+/// this handler first, which is what makes a one-line prompt behave
+/// like a dialog without being one.
 fn app_key(s: &mut Files, ui: &mut Ui<Files>, k: &KeyEvent) -> Handled {
-    // A pending confirm swallows everything until it is answered, which
-    // is what makes a one-line prompt behave like a dialog without being
-    // one.
     if s.confirm.is_some() {
         return match k.keycode {
             key::Y => {
@@ -620,11 +635,13 @@ fn app_key(s: &mut Files, ui: &mut Ui<Files>, k: &KeyEvent) -> Handled {
                 if let Some(c) = c {
                     run_confirm(s, ui, &c);
                 }
+                restore_focus(s, ui);
                 Handled::Yes
             }
             key::N | key::ESC => {
                 s.confirm = None;
                 s.message = Some("cancelled".to_owned());
+                restore_focus(s, ui);
                 show_status(s, ui);
                 Handled::Yes
             }
@@ -659,8 +676,7 @@ fn app_key(s: &mut Files, ui: &mut Ui<Files>, k: &KeyEvent) -> Handled {
             if paths.is_empty() {
                 return Handled::No;
             }
-            s.confirm = Some(Confirm::Trash(paths));
-            show_status(s, ui);
+            ask(s, ui, Confirm::Trash(paths));
             Handled::Yes
         }
         key::ESC if s.editing != Editing::None => {
@@ -668,6 +684,25 @@ fn app_key(s: &mut Files, ui: &mut Ui<Files>, k: &KeyEvent) -> Handled {
             Handled::Yes
         }
         _ => Handled::No,
+    }
+}
+
+/// Ask a question in the status line, and take the keyboard while it is
+/// unanswered.
+///
+/// Dropping the focus is the whole mechanism: see [`app_key`] for the
+/// box run that found out what happens without it.
+pub fn ask(s: &mut Files, ui: &mut Ui<Files>, what: Confirm) {
+    s.confirm = Some(what);
+    ui.blur(s);
+    show_status(s, ui);
+}
+
+/// Give the keyboard back to the list once a question is answered.
+fn restore_focus(s: &mut Files, ui: &mut Ui<Files>) {
+    if let Some(ids) = s.ids {
+        ui.focus(ids.list);
+        ui.deliver_focus_events(s);
     }
 }
 
@@ -695,7 +730,7 @@ fn run_confirm(s: &mut Files, ui: &mut Ui<Files>, what: &Confirm) {
             for p in paths {
                 match s.trash.send(p) {
                     Ok(_) => done += 1,
-                    Err(e) => failure = Some(format!("{}: {e}", short(p))),
+                    Err(e) => failure = Some(format!("{}: {}", short(p), trash_error(&e))),
                 }
             }
             s.message = Some(match failure {
@@ -706,6 +741,24 @@ fn run_confirm(s: &mut Files, ui: &mut Ui<Files>, what: &Confirm) {
             relist(s, ui);
         }
     }
+}
+
+/// A trash failure as a sentence rather than as an errno.
+///
+/// `EXDEV` is the one that needs translating, and the box run is why it
+/// is here: trashing a file under `/tmp` on a box whose home is a
+/// different filesystem put "Invalid cross-device link (os error 18)"
+/// in the status line — an accurate message that tells a user nothing
+/// about what happened or what to do about it. The behaviour is
+/// deliberate (see [`trash::Trash::send`]: copy-then-delete wearing the
+/// same name is a different operation, and the spec's answer is a trash
+/// on the other filesystem, which this does not have), so the fix is to
+/// say so rather than to change it.
+fn trash_error(e: &std::io::Error) -> String {
+    if e.raw_os_error() == Some(18) {
+        return "on another filesystem; only the home trash is supported".to_owned();
+    }
+    e.to_string()
 }
 
 /// A path's file name, for a one-line message.

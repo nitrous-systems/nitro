@@ -250,6 +250,7 @@ and the content hangs underneath it.
 | `Checkbox` | `checkbox` | `true`/`false` | `toggle`, `set_value`, `focus` | Space toggles |
 | `Slider` | `slider` | the number | `set_value`, `focus` | drag, arrows, Home/End, optional step |
 | `Scroll` | `scroll` | the offset | `scroll_to`, `scroll_by`, `focus` | wheel, arrows, PgUp/PgDn, Home/End |
+| `List` | `list` | the **visible** rows, one per line | `activate`, `select`, `scroll_to`, `scroll_by`, `focus` | virtualised: `visible + 2` rows materialised, whatever the model holds |
 | `Separator` | `separator` | — | — | spans its container on the other axis |
 | `Image` | `image` | `WxH` | — | an `ARGB` buffer, uploaded once in a memfd |
 | `Spacer` | `spacer` | — | — | `.grow(1.0)` and nothing else |
@@ -262,7 +263,9 @@ place, addressed by row and column — rather than a document that grows,
 which is why AT-SPI has had the role since the beginning.
 
 Three of them are worth a paragraph, because each makes a claim about
-cost that the rest of the design has to hold up.
+cost that the rest of the design has to hold up — and a fourth, `List`,
+wants a section of its own, because its claim is the one this document
+spent two milestones deferring.
 
 **`TextField` does not re-measure the tree on a keystroke.** Its
 `measure` is a function of the *font* and its width style, never of its
@@ -294,6 +297,91 @@ the end) sends nothing at all.
 draws rectangles and text, and a checkmark string would need a font that
 has one — which is exactly the assumption a toolkit that ships no fonts
 must not make.
+
+### `List`, the one widget that is not the size of what it shows
+
+Every other widget in this crate is the size of its content. A list is
+the first that is not: a directory of a hundred thousand files is a
+hundred thousand rows, and a toolkit that turned each into a widget would
+allocate a hundred thousand arena slots, measure them all, and hand the
+server a hundred thousand scene nodes in order to draw a screenful of
+text. This document used to carry that under *Deviations* as a known
+cost — "a list of ten thousand rows costs ten thousand widgets;
+virtualisation is M3 and is a widget, not a new mechanism" — and `List`
+is that widget. `nitro-files` (M4-D) is the app that needed it, because a
+directory is the only model whose size the user chooses and nothing
+bounds; `docs/files.md` has that argument.
+
+Its rows are **data, not widgets**: a `Row` is an optional glyph, a
+primary text and a right-aligned secondary text, and the widget owns the
+model. There is no per-row widget, no per-row callback and no per-row
+state — a row is addressed by its index, and that index is what
+`on_activate` and `on_select` are handed. An app with a model of its own
+pays for the `Vec<Row>` it hands over, which is the deliberate trade: a
+borrowed model would have to be reachable from `paint`, which sees
+`&mut Ui<S>` and not `&mut S`, so the alternative is interior mutability
+in the one place this crate has none. `ListModel` is the door left open
+for an app that would rather generate a row than store it; `row(i)` is
+called only for the rows that are materialised, which is a screenful.
+
+Three cost claims, each named with the test that checks it, because a
+cost claim nothing checks stops being true.
+
+**The scene holds a screenful, whatever the model holds.** The widget
+materialises `visible + 2` rows into paint slots of its own — using the
+`PaintCx::keep` mechanism `nitro-term` introduced, which is what
+*Slots that are content rather than parts* below is about — so a
+100 000-row model and a 100-row model create the same number of nodes.
+`a_hundred_thousand_rows_create_a_screenful_of_nodes` asserts that a
+200 px viewport over 100 000 rows materialises `rows_that_fit() + 2` and
+fewer than thirty rows in total, *and* that the rows are really drawn —
+a virtualisation that drew nothing would pass every count on its own.
+`the_node_count_does_not_depend_on_the_models_length` makes the same
+assertion over a hundred rows, which is the other half of the claim.
+
+**A scroll that does not change the visible set is one `SetTransform`.**
+The rows hang under a clipping group of the widget's own and the group's
+transform is the scroll offset, so scrolling inside the two spare rows
+costs one mutation and no repaint at all — the same trick `Scroll` plays
+one level up, and the reason the spare rows exist at all.
+`scrolling_one_row_is_one_set_transform` counts the mutations from
+outside and demands exactly `[SetTransform, Commit]`.
+
+**A row that did not change sends nothing.** Slots are addressed
+`row_index % ring_len` rather than `row_index - first_row`, so
+re-anchoring the materialised window moves only the rows that actually
+changed: a full page down re-emits a page, and a single row of
+re-anchoring re-emits a single row.
+`scrolling_a_page_repaints_only_the_rows_that_changed` jumps five
+thousand rows and asserts that the `SetText` count is bounded by the ring
+rather than by the distance travelled, with **zero** `CreateNode` and
+zero `DestroyNode` — the ring is reused, so scrolling costs mutations and
+not allocations. `replacing_the_model_costs_a_screenful_not_a_model`
+makes the same assertion for a wholesale model replacement, which is what
+a directory refresh is.
+
+Two smaller decisions follow from the same reasoning. **Selection is the
+row's background and nothing else**, so moving it is exactly two
+`SetFill`s — one for the row that lost it, one for the row that gained it
+(`moving_the_selection_is_two_set_fills`). Tinting the text as well would
+have been prettier and would have cost a `SetText` per run per row on
+every arrow key, which in a toolkit whose whole claim is that work is
+proportional to change is the wrong kind of pretty. And the **type-ahead
+prefix expires by elapsed time checked on the next key, not by a timer**,
+because a list that armed a timer on every keystroke would wake the loop
+half a second after the user stopped typing in order to do nothing;
+`a_settled_list_sends_nothing_while_idle` asserts `next_timeout() ==
+None` and then that the app is silent.
+
+Its introspection value is the **visible** rows, one per line, with the
+detail column tab-separated, which is the honest answer rather than a
+convenient one: a hundred thousand rows down a socket is not a value
+anybody wanted, and the widget genuinely does not draw them.
+`the_visible_rows_are_what_a_script_reads` checks the line count against
+`rows_that_fit()` and the role against `list`, and
+`a_script_can_select_and_activate_a_row_by_index` drives `select` and
+`activate` through the socket and checks that an index past the end is an
+error value rather than a panic.
 
 Every one of them answers `role()`, `accessible()` and `action()`, which
 is what the introspection socket serves and what an AT-SPI bridge will
@@ -488,6 +576,71 @@ In a test, `Harness::frame()` delivers one, so a test can choose the
 moment — the whole point of pacing is that many changes happen between
 two frames, and a test that could not say when a frame lands could not
 assert that.
+
+### Long work off the loop
+
+The frame callback above paces work that arrives *too fast*. The
+opposite problem is work that takes *too long*, and it arrived with
+`nitro-files` (M4-D): reading a directory is a `read_dir` plus a `stat`
+each, against a disk, an NFS mount or an automounter that has gone to
+sleep. `/usr/bin` is two thousand entries; a directory on a sleeping
+mount is a call that returns in thirty seconds. Done between two
+`epoll_wait`s it does not make the window slow, it **freezes** it: no
+repaint, no keystroke, no answer to the server, for as long as the kernel
+takes.
+
+The toolkit has **no thread integration**, and it does not need one. A
+descriptor is already something the loop waits on, so the whole pattern
+is a worker thread, a pipe and `Ui::add_fd`:
+
+```text
+  worker thread                          app loop
+  ─────────────                          ────────
+  result = the long thing
+  tx.send(result)          ── channel ──►  take()        the payload
+  write(pipe_w, [1])       ── pipe ─────►  epoll wakeup  the fact there is one
+```
+
+**A channel *and* a pipe, because neither half can do the other's job.**
+A `std::sync::mpsc` channel alone cannot wake a process sleeping in
+`epoll_wait`, so the result would sit there until the user happened to
+move the mouse. A pipe alone would mean pushing the payload through a
+descriptor, which means choosing a serialisation — and a serialisation
+between two threads of one process is work done for nobody. So the
+channel carries the data and the pipe is a **doorbell**: one byte,
+written *after* the result is in the channel, so a wakeup never arrives
+ahead of its payload.
+
+The hook registered with `add_fd` runs from exactly where a wire message
+is handled — between events, with the tree settled, holding the same
+`&mut S` and `&mut Ui<S>` every callback gets — so the code that applies
+the result is ordinary app code and not a special case.
+`nitro-files`'s `dir::Scan` is the worked example: it reads *and sorts*
+on the thread (sorting fifty thousand rows is the same kind of work as
+reading them), remembers which directory it was reading so a result for a
+directory the user has already left can be dropped, and keeps its read
+end non-blocking so a spurious wakeup costs an `EAGAIN` rather than a
+stall. Measured on a dev box: a 50 000-entry directory is listed in
+0.18 s and the app answers its introspection socket throughout, which is
+the only observable difference that matters.
+
+**A hook whose descriptor stays readable must be removed.** This is the
+hazard of the pattern, and it is not optional. The app loop's `epoll` is
+**level-triggered**, so a descriptor that remains readable dispatches its
+hook on every turn of the loop, for ever — an app at 100 % CPU with
+nothing on screen, which is exactly what the "idle costs nothing"
+contract forbids. A pipe holding an unread byte is readable for ever, so
+`nitro-files` calls `Ui::remove_fd` the moment a scan's result is taken.
+An exited process's pidfd is readable for ever too, which is the same
+hazard one crate over: `nitro-launcher`'s reaping hook removes the token
+of every child it reaps (`crates/nitro-launcher/src/spawn.rs`
+§Reaping). And a descriptor that is *kept* — `nitro-files`'s inotify
+watch lives as long as the directory is on screen — must have its events
+**drained** on every wakeup for the same reason, even when the app does
+not care what they say.
+
+The rule, then, is one sentence: a hook is registered for as long as its
+descriptor can go quiet, and removed the moment it cannot.
 
 ### Two window properties
 
@@ -894,9 +1047,25 @@ regrets:
   wants a server-side concept (a selection owner, a text-input protocol)
   that M2 does not have.
 * **`Scroll` is vertical only** and scrolls by translating its content
-  group, so its child is laid out at full height. A list of ten thousand
-  rows therefore costs ten thousand widgets; virtualisation is M3 and is
-  a widget, not a new mechanism.
+  group, so its child is laid out at full height and a list of ten
+  thousand rows put *inside a `Scroll`* still costs ten thousand widgets.
+  **`List` is the answer to that** and is argued above: it holds
+  `visible + 2` rows in the scene however long its model is, a scroll
+  inside the spare rows is one `SetTransform`, a re-anchor re-emits only
+  the rows that changed, and a selection move is two `SetFill`s. What it
+  costs is that its rows are *data it owns* rather than widgets — a
+  `Vec<Row>`, three small allocations a row — and that a row therefore
+  has no per-row callbacks or per-row state, only an index. A screenful
+  of arbitrary widgets is still a screenful of widgets; `List` virtualises
+  rows, not the tree.
+* **A pointer event carries no modifier mask.** `Event::PointerDown` has
+  a position and a button and nothing else, so Ctrl-click and
+  Shift-click cannot be distinguished from a plain click. A `List`'s
+  multi-selection is therefore **keyboard-only** (`Ctrl+Space`, Shift and
+  the arrows), and a pointer selects exactly one row. Fixing it means
+  carrying the mask on every pointer event on the wire, which is a
+  protocol change made for one widget's two extra gestures; it is worth
+  doing when a second widget wants it.
 * **Scrolling under a stationary pointer does not re-hover.** Hit testing
   and `window_bounds` *do* account for a content transform — a scrolled
   button is clicked and reported where it is drawn — but the hover chain

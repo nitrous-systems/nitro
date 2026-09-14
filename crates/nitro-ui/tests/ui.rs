@@ -784,7 +784,8 @@ fn an_app_owned_fd_gets_its_callback() {
     // The hook owns a `dup`, so the app may drop its own end; and an
     // unknown token is ignored rather than panicking.
     drop(read);
-    h.ui().run_fd(&mut state, nitro_ui::FdToken::from_raw(-1));
+    h.ui()
+        .run_fd(&mut state, nitro_ui::FdToken::from_raw(u64::MAX));
     assert_eq!(state, 2);
 
     h.ui().remove_fd(token);
@@ -1300,5 +1301,65 @@ fn advancing_the_timers_past_the_clock_origin_saturates_rather_than_panicking() 
     h.advance_timers(60 * 60 * 24 * 365 * 1000);
     h.run_timers();
     assert_eq!(*h.state(), 1, "a saturated deadline is simply due");
+    h.quit();
+}
+
+#[test]
+fn a_re_armed_fd_hook_gets_a_fresh_token() {
+    // Regression, found on the box rather than here (#M4-D): a hook's
+    // token used to be the raw descriptor number of the `Ui`'s own
+    // duplicate. Descriptor numbers are recycled the instant they are
+    // closed and the kernel hands back the lowest free one, so removing
+    // one hook and adding another in the same turn produced the **same
+    // token** — and the app loop, which keeps a list of what it has
+    // already registered with `epoll` so it does not `epoll_ctl` every
+    // wakeup, concluded the new hook was already in the set. It was not:
+    // closing a descriptor removes it from every epoll set. The hook
+    // existed, was never registered, and never fired.
+    //
+    // The symptom on the box was a file manager whose inotify watch
+    // refreshed the first directory and no directory afterwards — it
+    // re-arms the watch on every navigation — with nothing anywhere
+    // returning an error. What makes it invisible from inside `Ui` is
+    // that `run_fd` still worked; only the *loop* was wrong.
+    use std::io::Write as _;
+    use std::os::fd::AsFd as _;
+
+    let mut h = Harness::sized("rearm", 0u32, Size::new(100.0, 50.0), |ui: &mut Ui<u32>| {
+        ui.build(column())
+    });
+    let (read_a, _write_a) = std::os::unix::net::UnixStream::pair().unwrap();
+    let first = h
+        .ui()
+        .add_fd(read_a.as_fd(), |s: &mut u32, _| *s += 1)
+        .unwrap();
+
+    // Drop the hook and its descriptor, then arm a new one — the shape
+    // of "the watch moved to another directory". The kernel will hand
+    // the new `dup` the number the old one just freed.
+    h.ui().remove_fd(first);
+    drop(read_a);
+    let (read_b, mut write_b) = std::os::unix::net::UnixStream::pair().unwrap();
+    let second = h
+        .ui()
+        .add_fd(read_b.as_fd(), |s: &mut u32, _| *s += 10)
+        .unwrap();
+
+    assert_ne!(
+        first, second,
+        "a re-armed hook must not reuse the retired hook's token"
+    );
+
+    // And the token the loop would read out of its epoll event still
+    // finds the right hook.
+    write_b.write_all(b"x").unwrap();
+    let mut state = 0u32;
+    h.ui()
+        .run_fd(&mut state, nitro_ui::FdToken::from_raw(second.raw()));
+    assert_eq!(state, 10, "the new hook fired, not the retired one");
+
+    // The retired token is dead rather than aliasing the live hook.
+    h.ui().run_fd(&mut state, first);
+    assert_eq!(state, 10, "the retired token names nothing");
     h.quit();
 }

@@ -22,7 +22,7 @@
 //! in. Moving a widget is therefore one `SetBounds` on its group and no
 //! repaint of anything inside it.
 
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
+use std::os::fd::{AsFd, BorrowedFd};
 use std::time::{Duration, Instant};
 
 use nitro_core::{Point, Rect, Size};
@@ -69,22 +69,46 @@ pub struct Node {
 
 /// A handle to a descriptor hook registered with [`Ui::add_fd`].
 ///
-/// It names our *duplicate* of the app's descriptor, which is the number
-/// the app loop uses as its `epoll` token, so the two cannot drift.
+/// A token is an **opaque id that is never reused**, not the descriptor
+/// number, and that distinction cost a box run to find.
+///
+/// The obvious implementation is the raw fd of our duplicate: it is
+/// already unique among live hooks and it is already what the app
+/// loop's `epoll` set is keyed on, so the two cannot drift. What it is
+/// not is unique over *time*. Closing a descriptor returns its number
+/// to the kernel's free list, and the kernel hands out the lowest free
+/// number — so a hook removed and another added in the same turn get
+/// the **same number**, which is exactly what re-arming looks like:
+/// `nitro-files` moves its inotify watch to the directory it just
+/// navigated to by dropping one hook and adding the next.
+///
+/// The app loop keeps a list of what it has registered so it does not
+/// `epoll_ctl` on every wakeup. Keyed on the number, that list said
+/// "already registered" about a descriptor that had been closed (and so
+/// silently removed from the set) and replaced. The result was a hook
+/// that existed in the `Ui`, was never in the `epoll` set, and
+/// therefore never fired: on the box, the file list refreshed itself in
+/// the first directory and in no directory afterwards, with nothing
+/// anywhere returning an error.
+///
+/// A monotonic `u64` cannot do that. `Ui::hook_fds` hands the loop the
+/// id *and* the descriptor, so the set is still keyed on something the
+/// two agree about, and a re-armed hook is a new id and a new
+/// registration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FdToken(RawFd);
+pub struct FdToken(u64);
 
 impl FdToken {
-    /// The raw descriptor, as the app loop's `epoll` token.
+    /// The raw id, as the app loop's `epoll` token.
     #[must_use]
-    pub fn raw(self) -> RawFd {
+    pub fn raw(self) -> u64 {
         self.0
     }
 
     /// Rebuild a token from an `epoll` token.
     #[must_use]
-    pub fn from_raw(fd: RawFd) -> Self {
-        Self(fd)
+    pub fn from_raw(id: u64) -> Self {
+        Self(id)
     }
 }
 
@@ -149,6 +173,10 @@ pub struct Ui<S> {
     rect_pool: Vec<Vec<Rect>>,
     chain: Vec<(WidgetId, Point)>,
     fds: Vec<FdHook<S>>,
+    /// Next never-used descriptor-hook id. Monotonic, because a
+    /// descriptor *number* is recycled the moment it is closed; see
+    /// [`FdToken`].
+    next_fd_token: u64,
     timers: Vec<Timer<S>>,
     next_timer: u64,
     /// App-level key handlers, in registration order; see [`Ui::on_key`].
@@ -233,6 +261,10 @@ type OnceCallback<S> = Box<dyn FnOnce(&mut S, &mut Ui<S>)>;
 type KeyHandler<S> = Box<dyn FnMut(&mut S, &mut Ui<S>, &KeyEvent) -> Handled>;
 
 struct FdHook<S> {
+    /// The hook's id: unique for the life of the process, so a
+    /// descriptor number recycled by the kernel cannot make a new hook
+    /// look like an old one. See [`FdToken`].
+    id: u64,
     /// A `dup` of the descriptor the app handed us. Owning a duplicate
     /// is what lets the loop re-borrow it for `epoll` without `unsafe`
     /// and without the app promising anything about lifetimes.
@@ -273,6 +305,7 @@ impl<S: 'static> Ui<S> {
             rect_pool: Vec::new(),
             chain: Vec::new(),
             fds: Vec::new(),
+            next_fd_token: 1,
             timers: Vec::new(),
             next_timer: 1,
             key_handlers: Vec::new(),
@@ -2548,8 +2581,11 @@ impl<S: 'static> Ui<S> {
         callback: impl FnMut(&mut S, &mut Ui<S>) + 'static,
     ) -> Result<FdToken, Error> {
         let owned = rustix::io::dup(fd)?;
-        let token = FdToken(owned.as_raw_fd());
+        let id = self.next_fd_token;
+        self.next_fd_token += 1;
+        let token = FdToken(id);
         self.fds.push(FdHook {
+            id,
             fd: owned,
             callback: Some(Box::new(callback)),
         });
@@ -2559,7 +2595,7 @@ impl<S: 'static> Ui<S> {
     /// Drop a descriptor hook. Closing our duplicate also removes it
     /// from the app loop's `epoll` set.
     pub fn remove_fd(&mut self, token: FdToken) {
-        self.fds.retain(|h| h.fd.as_raw_fd() != token.0);
+        self.fds.retain(|h| h.id != token.0);
     }
 
     /// Call `callback` once, `ms` milliseconds from now.
@@ -2585,11 +2621,8 @@ impl<S: 'static> Ui<S> {
 
     /// The descriptors registered with [`Ui::add_fd`], with a borrow of
     /// each so the loop can hand them to `epoll`.
-    pub(crate) fn hook_fds(&self) -> Vec<(RawFd, BorrowedFd<'_>)> {
-        self.fds
-            .iter()
-            .map(|h| (h.fd.as_raw_fd(), h.fd.as_fd()))
-            .collect()
+    pub(crate) fn hook_fds(&self) -> Vec<(u64, BorrowedFd<'_>)> {
+        self.fds.iter().map(|h| (h.id, h.fd.as_fd())).collect()
     }
 
     /// Bring every pending timer `by` closer to firing, as though that
@@ -2652,8 +2685,8 @@ impl<S: 'static> Ui<S> {
     /// ignored, because a hook may have been removed between the wakeup
     /// and the dispatch.
     pub fn run_fd(&mut self, state: &mut S, token: FdToken) {
-        let fd = token.0;
-        let Some(i) = self.fds.iter().position(|h| h.fd.as_raw_fd() == fd) else {
+        let id = token.0;
+        let Some(i) = self.fds.iter().position(|h| h.id == id) else {
             return;
         };
         // Take the callback out for the same reason a widget leaves its
@@ -2662,7 +2695,7 @@ impl<S: 'static> Ui<S> {
             return;
         };
         cb(state, self);
-        if let Some(h) = self.fds.iter_mut().find(|h| h.fd.as_raw_fd() == fd) {
+        if let Some(h) = self.fds.iter_mut().find(|h| h.id == id) {
             h.callback = Some(cb);
         }
     }

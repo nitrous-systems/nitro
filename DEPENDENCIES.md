@@ -9,7 +9,7 @@ number we watch.
 
 | crate | used by | why | cost / notes |
 |---|---|---|---|
-| `rustix` | seat, kms, server, wire, demo, session, launcher | Safe Linux syscalls (epoll, mmap, sockets + `SCM_RIGHTS`, timerfd, netlink) with no libc. The one crate that lets the rest of the tree be `unsafe`-free. | + `bitflags`, `linux-raw-sys` |
+| `rustix` | seat, kms, server, wire, demo, session, launcher, files | Safe Linux syscalls (epoll, mmap, sockets + `SCM_RIGHTS`, timerfd, netlink) with no libc. The one crate that lets the rest of the tree be `unsafe`-free. | + `bitflags`, `linux-raw-sys` |
 | `zerocopy` (+ `zerocopy-derive`) | wire | The wire format *is* `#[repr(C)]` layout: `U32<LittleEndian>`/`F32<LE>`/… give guaranteed little-endian fields, `Unaligned` lets a payload be decoded in place from any `&[u8]`, and `ref_from_bytes`/`as_bytes` replace the pointer casts we would otherwise write by hand. Validated, total, and `unsafe`-free in our tree. | +3 crates: `zerocopy`, `zerocopy-derive`, and **`syn` 2.x**. Note `drm` → `bytemuck_derive` pins `syn` **3.x**, so the two do *not* share a build: syn is compiled twice. Revisit if compile time hurts. |
 | `drm` (+ `drm-ffi`, `drm-sys`, `drm-fourcc`) | kms | Safe wrappers over the ~30 DRM/KMS ioctls (atomic commit, dumb buffers, AddFB2, properties, events). Hand-rolling them is precisely the `unsafe` we forbid. | pulls `bytemuck` + `bytemuck_derive` → `syn` (proc-macro, compile time). Revisit if it hurts. |
 | `signal-hook` (+ `signal-hook-registry`) | server, demo, session | SIGTERM/SIGINT → self-pipe without `unsafe` in our tree: `sigaction` and an async-signal-safe handler are exactly the shim we would otherwise have to write ourselves. `default-features = false` (no iterator/channel). The demo uses it so Ctrl-C prints its latency summary instead of killing the process mid-histogram. `nitro-session` uses it for the same reason the server does, and it is the crate's third consumer rather than a new dependency. | + `libc` (already pulled by `libseat`). Only `low_level::pipe::register` is used. |
@@ -175,6 +175,28 @@ rather than under it. A 650 KB binary containing a VT parser, a cell
 model and a scrollback ring, against `nitro-calc`'s 560 KB for a
 calculator, is what that costs: 90 KB, and no third-party terminal.
 
+`nitro-files` (M4-D) adds **zero** external crates, and it is the one
+where the temptation was a whole family of them. A file manager wants a
+timezone database for its date column, a MIME database, a glob engine, an
+image decoder for thumbnails and an icon-theme loader; it takes none of
+them. The dates are arithmetic (Howard Hinnant's days-from-civil, in
+UTC, and the limitation is stated in `docs/files.md`), the MIME table is
+the system's own `globs2` with a thirty-line built-in fallback for a bare
+rootfs, the glob engine is refused by keeping only the `*.ext` shape of
+rule, and there are no thumbnails and no icon theme for the reason
+`nitro-wallpaper` reads P6 PPM only: a decoder is a parser for untrusted
+bytes in a long-lived process. What it *does* take is two workspace
+crates — `nitro-ui`, and `nitro-launcher` for the `.desktop` parser and
+the spawn path, which is reuse rather than a dependency in the sense this
+file counts. `cargo tree -e normal -p nitro-files --prefix none | sort -u`
+is `rustix` (+ `bitflags`, `linux-raw-sys`), `zerocopy` (+ its derive and
+the `syn` chain) and the nitro crates: every one of them already in the
+tree. The whole-workspace figure moves **74 → 76** lines and stays at
+**37 distinct external crate names** — the two new lines are
+`nitro-files` itself and a second `nitro-launcher (*)`, cargo's marker
+for a subtree it has already printed.
+
+
 The whole-workspace count with the session in is **70** lines and still
 **34 distinct external crate names** — the rise from 67 is three
 `(*)`/workspace lines, not three crates.
@@ -247,7 +269,8 @@ the syscall families it uses.
 | `nitro-ui` | `event`, `fs`, `process`, `time` | `epoll` for the app loop, `poll` for the synchronous text measurement, `Timespec` for `ui.set_timer`; `memfd_create`/`ftruncate`/`pwrite` for an `Image` widget's pixel buffer; `getuid`/`getpid` for the introspection socket's path |
 | `nitro-hey` | `process` | `getuid` for the `/tmp` fallback of the app-socket directory |
 | `nitro-bar` | `time` | `clock_gettime` for the wall clock |
-| `nitro-launcher` | `process` (**dev only**) | `getpgrp`, in the one test that checks a launched process left the launcher's process group |
+| `nitro-launcher` | `process` | `pidfd_open` so a launched child's exit is a descriptor the app loop can wait on rather than a thing noticed at the next spawn (#555), and `getpgrp` in the test that checks a launched process left the launcher's process group |
+| `nitro-files` | `fs`, `pipe`, `event`, `process` | `inotify` for the live refresh of the directory on screen; `pipe` for the background scan's doorbell descriptor; `poll` for draining it and for the scan's own tests; `getuid`/`getpid` for the temporary-path fallbacks |
 | `nitro-session` | `event`, `process` | `poll` over the pidfds, the session socket and the signal pipe; `pidfd_open` so a child's exit is a descriptor rather than a timer tick, `kill_process_group` for teardown, `getuid` for the `/tmp` fallback of the socket path |
 | `nitro-term` | `pty`, `termios`, `process`, `fs`, `stdio` | `openpt`/`grantpt`/`unlockpt`/`ptsname` for the pseudoterminal; `tcsetwinsize` (`TIOCSWINSZ`) so a resize reaches the child as `SIGWINCH`; `kill_process_group`/`waitpid` to take the shell down with the window; `open` for the slave and `fcntl_setfl` to make the master non-blocking |
 

@@ -7,7 +7,7 @@
 //! events it calls [`Ui::flush`], which sends a commit only if a pass
 //! produced a mutation.
 
-use std::os::fd::{AsFd, RawFd};
+use std::os::fd::AsFd;
 
 use nitro_core::Size;
 use nitro_wire::client::Connection;
@@ -258,7 +258,7 @@ pub fn event_loop_with<S: 'static>(
             EventFlags::IN,
         )?;
     }
-    let mut registered: Vec<RawFd> = Vec::new();
+    let mut registered: Vec<u64> = Vec::new();
     // `epoll::Event` has no `Default`, so the buffer is built by hand.
     let mut events = [epoll::Event {
         flags: EventFlags::empty(),
@@ -294,7 +294,7 @@ pub fn event_loop_with<S: 'static>(
                     s.accept();
                 }
             } else {
-                ui.run_fd(state, crate::ui::FdToken::from_raw(token as RawFd));
+                ui.run_fd(state, crate::ui::FdToken::from_raw(token));
             }
         }
         ui.run_timers(state);
@@ -307,26 +307,29 @@ pub fn event_loop_with<S: 'static>(
 }
 
 /// Bring the epoll set in line with the app's registered fds.
+///
+/// `registered` is keyed on the hook's **token**, not on its descriptor
+/// number, and that is load-bearing: a descriptor number is recycled the
+/// moment it is closed, so a hook removed and another added in the same
+/// turn would take the same number and this function would decide it was
+/// already in the set. It would not be — closing a descriptor removes it
+/// from every `epoll` set — and the new hook would never fire. See
+/// [`FdToken`](crate::FdToken) for the box run that found it.
 fn sync_fds<S: 'static>(
     epfd: &impl AsFd,
     ui: &Ui<S>,
-    registered: &mut Vec<RawFd>,
+    registered: &mut Vec<u64>,
 ) -> Result<(), Error> {
     let want = ui.hook_fds();
-    for (raw, borrowed) in &want {
-        if !registered.contains(raw) {
-            epoll::add(
-                epfd,
-                *borrowed,
-                EventData::new_u64(*raw as u64),
-                EventFlags::IN,
-            )?;
-            registered.push(*raw);
+    for (id, borrowed) in &want {
+        if !registered.contains(id) {
+            epoll::add(epfd, *borrowed, EventData::new_u64(*id), EventFlags::IN)?;
+            registered.push(*id);
         }
     }
     // A hook that went away took its owned descriptor with it, and
     // closing a descriptor removes it from every epoll set: there is
     // nothing left to delete, only bookkeeping to drop.
-    registered.retain(|raw| want.iter().any(|(r, _)| r == raw));
+    registered.retain(|id| want.iter().any(|(i, _)| i == id));
     Ok(())
 }

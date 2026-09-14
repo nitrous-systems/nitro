@@ -218,6 +218,16 @@ free on a warm cache and starts being a visible pause on a cold one, and
 directory people open when they want to know whether a file manager is
 slow.
 
+"About there" is the honest phrasing rather than a hedge: the dev box's
+`/usr/bin` is **1 765 entries**, so it comes in just *under* the
+threshold and is read inline, with no perceptible pause. That is the
+threshold working rather than missing — the synchronous path is the
+simpler one and should be taken whenever it is safe — but it does mean
+the directory people reach for first is not the one that exercises the
+thread. The 50 000-entry measurement below is, and it exists precisely
+because the obvious test case turned out to be on the other side of the
+line.
+
 Deciding which path to take must itself be cheap, which is what
 `dir::count_at_most` is for: names only, no `stat`, nothing but the
 `getdents` the kernel is doing anyway, and **capped** at `BIG_DIR + 1`.
@@ -616,37 +626,118 @@ is not on screen, the window into it is. A script that wants a specific
 row scrolls to it (`do list scroll_to`, `do list select N`) and reads
 again, which is what a user does too.
 
+### Why `set path value` navigates and typing does not
+
+The first line of that block is subtler than it looks, and the subtlety
+is the toolkit's doing rather than this app's. `set <prop>` runs the
+widget's setter — the `WidgetMut` one — which fires `on_change`, *the
+same callback a keystroke fires*, because the whole point of the design
+is that a script and a user take one path through the app rather than
+two. So a path bar that navigated on every change would navigate on
+every letter: typing `/home/kaspar` would jump to `/home` at the fifth
+character and rewrite the field underneath the caret. A path bar that
+never navigated on change would be one no script can drive, which is a
+thing the spec asks for by name.
+
+**Focus is the discriminator**, and it is an honest one rather than a
+heuristic. A user typing has the caret in the field by definition; a
+`set` from outside runs the setter and moves no focus. So `on_change`
+navigates only when the field is *not* focused, and a person typing
+navigates on Enter, through `on_submit`, which is what Enter in a path
+bar has always meant. The reasoning is in the comment at the
+`text_field(start)` builder in `build()`, next to the code it explains.
+
 ## Measured
 
-Measured on the test box (Pentium G3240, 2 cores, no AVX2, HDMI
-1920×1080 @60; `docs/testbox.md`), against `nitro-dev` running the full
-desktop.
+Two runs, and it matters which is which. The numbers below are from a
+**dev-box, fake-backend run**: a release build, `nitro-server` on the
+fake backend (`NITRO_BACKEND=fake NITRO_FAKE_SIZE=1280x720`) on the
+development machine, a real `nitro-files` client, driven through `hey`.
+The **test-box run is still pending** (Pentium G3240, 2 cores, no AVX2,
+HDMI 1920×1080 @60; `docs/testbox.md`), and the rows that need real
+hardware — damage areas for a wheel scroll and a Page Down, and the
+`.txt`-opens-`nitro-term` check that needs a terminal on screen — are
+marked as such rather than guessed at.
 
-**The box run has not been done yet. Every number below is a
-placeholder and none of them is an estimate.**
+### Dev box, fake backend
 
-| | value | budget |
+| what | measured | spec target |
 |---|---|---|
-| RSS, fresh, home directory listed | _(box run pending)_ | — |
-| RSS, `/usr/bin` listed (~2 000 entries) | _(box run pending)_ | ≤ 4 MB |
-| of which `RssAnon` | _(box run pending)_ | — |
-| binary, release, stripped | _(box run pending)_ | ≤ 800 KB |
-| threads, idle | _(box run pending)_ | 1 |
-| threads, during a background scan | _(box run pending)_ | 2 |
-| idle 30 s with the inotify watch armed | _(box run pending)_ | **0 frames, 0 wakeups** |
-| context switches over that window | _(box run pending)_ | — |
-| time to list `/usr/bin` (cold cache) | _(box run pending)_ | — |
-| time to list `/usr/bin` (warm cache) | _(box run pending)_ | — |
-| `SetText` mutations for one such listing | _(box run pending)_ | a screenful |
+| binary, release, stripped | **816 192 bytes** (816 KB) | ≤ 800 KB — **2 % over** |
+| RSS / HWM, `/usr/bin` listed (1 765 entries) | **3 628 kB** | ≤ 4 MB — **ok**, 91 % |
+| RSS / HWM, 50 000-entry directory listed | **1 984 kB** | — |
+| threads | **1** | — |
+| `ldd` | `libc`, `libgcc_s`, vdso — nothing else | — |
+| context switches, 5 s idle, `/usr/bin` listed, watch armed | **0** (voluntary and non-voluntary both) | 0 — **ok** |
+| 50 000 entries: `hey set path value` → all 50 000 rows counted in the status line | **0.18 s** | < 1 s — **ok** |
+| `/usr/bin` (1 765 entries) | listed **inline**, under the 2 000 threshold, no perceptible pause | — |
+
+Three of those rows are the milestone's actual claims rather than
+statistics, and each was verified live rather than reasoned about.
+
+**The UI answers `hey` while a 50 000-entry scan is in flight.**
+`get status value` replied throughout the read, which is the whole point
+of doing it off the loop: the thread is reading and sorting fifty
+thousand entries while the loop is still in `epoll_wait`, still
+answering the introspection socket, and still able to repaint. A
+synchronous read would have had the socket time out.
+
+**Idle really is zero with inotify armed.** The watch adds a descriptor
+to the `epoll` set and *no wakeups*: over five seconds with `/usr/bin`
+listed and the watch live, neither the voluntary nor the non-voluntary
+context-switch counter moved at all. That is the row to read first,
+because it is the claim the watch puts at risk — a level-triggered
+`epoll` over a descriptor that stays readable is a spin, and the drain in
+`watch_fired` is the only thing standing between this app and a busy loop
+with nothing on screen. Zero is the expected answer and anything else
+would be a defect, not a tolerance.
+
+**One thread, not two.** The scan thread is joined as soon as its result
+is taken, so a session's worth of directory changes does not accumulate
+detached threads and a settled app is single-threaded like every other
+nitro client.
+
+The **50 000-entry figure being *smaller* than the `/usr/bin` one** is
+not a typo and is worth a sentence: the 50 000 rows in that test are
+synthetic names in a scratch directory, short and uniform, while
+`/usr/bin`'s are longer and more varied — and in both cases the *scene*
+holds a screenful, so what is left is the `Vec<Entry>` and the `Vec<Row>`
+and their strings. The model is the memory, which is exactly what
+virtualisation was supposed to leave standing.
+
+### The binary is 2 % over budget
+
+816 192 bytes against a 800 KB target: **16 KB over, 2 %**. Stating it
+rather than rounding it, because the honest attribution is available and
+is not flattering to hide.
+
+The app links the toolkit, which carries the introspection protocol —
+~68 KB of it, **monomorphised per app-state type**, as `docs/ui.md`
+§Measured argues at length and lists under *Deviations* as an M3 fix.
+On top of that this app links `nitro-launcher` for the `.desktop` parser
+and the spawn path, which is the reuse argued above and is cheaper than
+the second copy it replaces but is not free. The de-monomorphisation
+`docs/ui.md` already records as the fix — routing the protocol through a
+small `dyn` interface, at the cost of one virtual call per request
+against a request rate measured in tens per second — would collapse that
+68 KB to one instantiation for the whole program and **more than cover
+the overrun** on its own.
+
+So the number is over, the cause is known, the fix is already written
+down somewhere else, and none of that makes 816 KB anything other than
+816 KB today.
+
+### Test box, pending
+
+| what | value | budget |
+|---|---|---|
+| RSS with `/usr/bin` listed | _(box run pending)_ | ≤ 4 MB |
+| idle 30 s, watch armed | _(box run pending)_ | 0 frames, 0 wakeups |
+| `damage_px` for one wheel notch | _(box run pending)_ | — |
+| `damage_px` for a Page Down | _(box run pending)_ | — |
+| a `.txt` with no handler opens `nitro-term` | _(box run pending)_ | — |
 | server RSS, before / after | _(box run pending)_ | — |
 | `atlas_pages` | _(box run pending)_ | — |
-
-The idle row is the one to read first, because it is the claim the
-inotify watch puts at risk: a level-triggered `epoll` over a descriptor
-that stays readable is a spin, and the drain in `watch_fired` is the only
-thing standing between this app and a busy loop with nothing on screen.
-Zero is the expected answer and anything else is a defect, not a
-tolerance.
 
 ## Limitations
 
