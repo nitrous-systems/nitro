@@ -954,3 +954,50 @@ fn the_overlay_paints_where_the_anchor_put_it() {
     let _ = std::fs::remove_dir_all(&dir);
     h.quit();
 }
+
+#[test]
+fn the_result_rows_are_painted() {
+    // The defect this test exists for: `hey list` showed
+    // `results/container[0]/0  button  0  ▸ Calculator  12,71,576,28` —
+    // a row with a rect, enabled, clickable, launching the right thing —
+    // and the screenshot showed an empty panel below the query field.
+    // The model was right and the pixels were missing, so the assertion
+    // has to be about pixels: ink **inside the first row's rect**, not
+    // ink somewhere in the window.
+    let (mut h, dir) = harness();
+    super_tap(&mut h);
+    until(&mut h, "the show", |h| h.state().is_visible());
+
+    // `KEY_C`, `KEY_A`, `KEY_L`: one match, so row 0 is Calculator and
+    // there is nothing else in the list to confuse a rect with.
+    for code in [46u32, 30, 38] {
+        h.key(code);
+    }
+    h.settle();
+    assert!(row(&mut h, 0).contains("Calculator"), "{}", row(&mut h, 0));
+
+    let id = named(&mut h, "results/0").expect("row 0");
+    let r = h.bounds(id);
+    assert!(r.w > 1.0 && r.h > 1.0, "the row has a rect: {r:?}");
+
+    // The row's own fill is the button's surface, which is a different
+    // colour from the panel behind it, so "is the row there at all"
+    // and "is its text there" are two separate questions.
+    let bg = h.ui().theme().background.to_u32() >> 8;
+    let painted = h.ink_count(r, bg);
+    assert!(
+        painted > 0,
+        "the result row painted nothing inside {r:?} (panel bg {bg:06x})"
+    );
+
+    // And the label: against the row's *own* background, so a plain
+    // filled rectangle with no glyphs still fails.
+    let surface = h.ui().theme().surface.to_u32() >> 8;
+    assert!(
+        h.ink_count(r, surface) > 0,
+        "the result row's text painted nothing inside {r:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}

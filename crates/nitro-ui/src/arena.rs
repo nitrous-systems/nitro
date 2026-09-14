@@ -181,6 +181,15 @@ pub struct WidgetState {
     /// laid out or painted again.
     pub(crate) content_clip: bool,
     pub(crate) content_transform: nitro_core::Transform,
+    /// The bounds last sent for the content group.
+    ///
+    /// A group is created empty and paints nothing, so its bounds are
+    /// normally irrelevant — **except** when it clips, because the scene
+    /// clips a group's children to the group's own rect and an empty rect
+    /// clips away everything. So the rect is sent only while
+    /// `content_clip` is on, and this remembers what went, so a relayout
+    /// that did not resize the widget costs nothing.
+    pub(crate) content_bounds: Rect,
     /// Where this widget's group was last attached: `(parent, before)`.
     /// Compared before sending a `Reparent`, so a stable tree costs
     /// nothing.
@@ -207,6 +216,7 @@ impl Default for WidgetState {
             content: None,
             content_clip: false,
             content_transform: nitro_core::Transform::IDENTITY,
+            content_bounds: Rect::EMPTY,
             attached: None,
             slots: Vec::new(),
         }

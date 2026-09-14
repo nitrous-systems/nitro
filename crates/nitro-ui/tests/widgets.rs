@@ -461,6 +461,172 @@ fn a_scrolled_child_is_clicked_and_reported_where_it_now_is() {
 }
 
 #[test]
+fn a_scroll_actually_paints_its_children() {
+    // The M3 launcher bug, at the level it really lived: the rows were
+    // in the tree, had bounds, were enabled and launched the right
+    // application when clicked — and the screen below the query field
+    // was blank.
+    //
+    // A `Scroll` is a viewport, so it asks the scene to clip its content
+    // group. A group is *created* at `Rect::EMPTY` and a bare group
+    // paints nothing, so nothing ever sent its bounds — and a clip to an
+    // empty rectangle clips every child away. Everything downstream of
+    // the clip was right, which is exactly why `hey list` and a
+    // screenshot disagreed.
+    //
+    // Pixels are the only assertion that would have caught it: the model
+    // was correct throughout.
+    let mut h =
+        Harness::sized(
+            "scrollink",
+            (),
+            Size::new(200.0, 120.0),
+            |ui: &mut Ui<()>| {
+                let inner = ui.build(column().gap(2.0).width_percent(1.0).children((0..3).map(
+                    |i| {
+                        button::<()>(format!("row {i}"))
+                            .name(format!("r{i}"))
+                            .height(28.0)
+                            .width_percent(1.0)
+                    },
+                )));
+                let view = ui.build(scroll().name("view").grow(1.0).width_percent(1.0));
+                ui.attach(view, inner).unwrap();
+                let root = ui.build(panel().background(Color::WHITE).padding(8.0));
+                ui.attach(root, view).unwrap();
+                root
+            },
+        );
+    let view = kids(&mut h)[0];
+    let inner = h.ui().children(view)[0];
+    let rows = h.ui().children(inner);
+    assert_eq!(rows.len(), 3);
+
+    let white = Color::WHITE.to_u32() >> 8;
+    for (i, row) in rows.iter().enumerate() {
+        let r = h.bounds(*row);
+        assert!(r.w > 1.0 && r.h > 1.0, "row {i} has a rect: {r:?}");
+        assert!(
+            h.ink_count(r, white) > 0,
+            "row {i} is in the tree at {r:?} and painted nothing"
+        );
+    }
+}
+
+#[test]
+fn a_child_added_to_a_scroll_later_paints_too() {
+    // The launcher builds its tree once and fills the list afterwards —
+    // the rows arrive on a timer, then on every keystroke. So the clip
+    // has to be right when the content group is created *after* the
+    // clip was asked for, which is the order an empty `Scroll` produces:
+    // `paint` asks for the clip on the first flush, when there is no
+    // content group yet to put it on, and the group appears on the flush
+    // that attaches the first child.
+    //
+    // So the viewport is built with **no children at all** — attaching
+    // one in the builder would create the group early and quietly test
+    // the other order.
+    let mut view: Option<WidgetId> = None;
+    let mut h = Harness::sized(
+        "scrolllate",
+        (),
+        Size::new(200.0, 200.0),
+        |ui: &mut Ui<()>| {
+            let v = ui.build(scroll().name("view").height(100.0).width_percent(1.0));
+            let root = ui.build(panel().background(Color::WHITE).padding(0.0));
+            ui.attach(root, v).unwrap();
+            view = Some(v);
+            root
+        },
+    );
+    h.settle();
+    let view = view.expect("the viewport");
+
+    let inner = h.ui().build(column().gap(0.0).width_percent(1.0));
+    h.ui().attach(view, inner).unwrap();
+    let row = h.ui().build(
+        button::<()>("late")
+            .name("late")
+            .height(28.0)
+            .width_percent(1.0),
+    );
+    h.ui().attach(inner, row).unwrap();
+    h.settle();
+
+    let r = h.bounds(row);
+    // Against a reference: a row clipped to an empty rectangle still
+    // shows a hairline of border, so "some ink" is not enough — it has
+    // to be most of the row.
+    let white = Color::WHITE.to_u32() >> 8;
+    let painted = h.ink_count(r, white);
+    assert!(
+        painted > (r.w * r.h) as usize / 2,
+        "a row added after the first flush is clipped away at {r:?}: {painted} pixels"
+    );
+}
+
+#[test]
+fn a_viewport_clips_to_the_size_it_has_now() {
+    // The clip rectangle is the widget's own, so it has to follow the
+    // widget: a viewport that grew would otherwise go on clipping to the
+    // rectangle it had when the clip was first asked for, and the rows
+    // that arrived in the new space would be invisible in exactly the
+    // way the launcher's were.
+    //
+    // The window is bigger than the viewport throughout, so the crop
+    // `Harness::shot` takes is not itself doing the clipping — without
+    // that the assertion would pass for the wrong reason.
+    let mut h =
+        Harness::sized(
+            "scrollresize",
+            (),
+            Size::new(200.0, 200.0),
+            |ui: &mut Ui<()>| {
+                let inner = ui.build(column().gap(0.0).width_percent(1.0).children((0..4).map(
+                    |i| {
+                        button::<()>(format!("row {i}"))
+                            .name(format!("r{i}"))
+                            .height(28.0)
+                            .width_percent(1.0)
+                    },
+                )));
+                let view = ui.build(scroll().name("view").height(60.0).width_percent(1.0));
+                ui.attach(view, inner).unwrap();
+                let root = ui.build(panel().background(Color::WHITE).padding(0.0));
+                ui.attach(root, view).unwrap();
+                root
+            },
+        );
+    let view = kids(&mut h)[0];
+    let inner = h.ui().children(view)[0];
+    let rows = h.ui().children(inner);
+    let white = Color::WHITE.to_u32() >> 8;
+
+    // 60px of viewport over 4×28px of content: the last row is entirely
+    // past the fold, and a viewport that clips shows none of it.
+    let last = h.bounds(rows[3]);
+    assert!(last.y >= 60.0, "the last row is past the fold: {last:?}");
+    let clipped = h.ink_count(last, white);
+    let full = h.ink_count(h.bounds(rows[0]), white);
+    assert!(
+        clipped * 8 < full,
+        "the row past the fold is clipped: {clipped} of {full} pixels"
+    );
+
+    // Grow the viewport past the content. The clip has to grow with it,
+    // or the row stays as invisible as it was.
+    let mut style = h.ui().style(view);
+    style.height = nitro_ui::layout::Length::Px(140.0);
+    h.ui().set_style(view, style);
+    h.settle();
+    let last = h.bounds(rows[3]);
+    assert!(
+        h.ink_count(last, white) >= full,
+        "a row inside the grown viewport is still clipped at {last:?}"
+    );
+}
+
+#[test]
 fn replacing_an_image_releases_the_buffer_it_replaced() {
     // Without the release, an app that updates one image per frame leaks
     // a server-side buffer per frame for its whole lifetime. Counting

@@ -884,6 +884,49 @@ impl<S: 'static> Ui<S> {
         if let Some(node) = slot.state.content {
             let _ = self.wire.set_clip(node, clip);
         }
+        // A clipping group needs a rectangle to clip *to*. See
+        // [`Ui::sync_content_bounds`].
+        self.sync_content_bounds(id);
+    }
+
+    /// Give a clipping content group the widget's own rectangle.
+    ///
+    /// A content group is a bare `Group`: it paints nothing, so its
+    /// bounds normally do not matter and nothing ever sent them. A group
+    /// that **clips**, though, clips its children to its own device rect,
+    /// and a group created at `Rect::EMPTY` clips every child away to
+    /// nothing.
+    ///
+    /// That was the launcher's "the rows exist, have rects, are clickable
+    /// and are not on screen" bug: the rows hung under a [`Scroll`]'s
+    /// content group, the `Scroll` asked for the clip that makes a
+    /// viewport a viewport, and the scene dutifully clipped the whole
+    /// list to an empty rectangle. Only the size is sent — the origin
+    /// stays at zero, because the group is already inside the widget's
+    /// own group and shifting it would move the children twice.
+    ///
+    /// Sent only while the clip is on, so a widget that does not clip
+    /// costs nothing, and cached, so a relayout that did not resize the
+    /// widget costs nothing either.
+    fn sync_content_bounds(&mut self, id: WidgetId) {
+        let Some(slot) = self.arena.slot(id) else {
+            return;
+        };
+        if !slot.state.content_clip {
+            return;
+        }
+        let Some(node) = slot.state.content else {
+            return;
+        };
+        let b = slot.state.bounds;
+        let rect = Rect::new(0.0, 0.0, b.w, b.h);
+        if slot.state.content_bounds == rect {
+            return;
+        }
+        if let Some(slot) = self.arena.slot_mut(id) {
+            slot.state.content_bounds = rect;
+        }
+        let _ = self.wire.set_bounds(node, rect);
     }
 
     /// Translate (or otherwise transform) a widget's children without
@@ -1199,6 +1242,7 @@ impl<S: 'static> Ui<S> {
         }
         // The content group holds children only, and is created after the
         // widget's own paint nodes so those stay underneath.
+        let mut clipped = false;
         let content = if let Some(c) = self.arena.slot(id).and_then(|s| s.state.content) {
             c
         } else {
@@ -1223,12 +1267,18 @@ impl<S: 'static> Ui<S> {
                 });
             if clip {
                 self.wire.set_clip(node, true)?;
+                clipped = true;
             }
             if transform != nitro_core::Transform::IDENTITY {
                 self.wire.set_transform(node, transform)?;
             }
             node
         };
+        // A group that clips needs a rectangle to clip *to*, and it was
+        // just created empty. See [`Ui::sync_content_bounds`].
+        if clipped {
+            self.sync_content_bounds(id);
+        }
         // Walk backwards so `before` always names a sibling already in
         // place: creating or moving a node in front of the one that
         // follows it is enough to reproduce the whole order.
@@ -1294,6 +1344,11 @@ impl<S: 'static> Ui<S> {
             && let Some(n) = node
         {
             self.wire.set_bounds(n, rect)?;
+        }
+        // A clipping content group is sized with the widget, or a
+        // resized viewport would go on clipping to its old rectangle.
+        if resized {
+            self.sync_content_bounds(id);
         }
         if !flags.has(Dirty::LAYOUT | Dirty::SUB_LAYOUT) {
             return Ok(());
