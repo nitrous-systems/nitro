@@ -248,7 +248,11 @@ fn hey_addresses_the_grid_by_name() {
         state,
         &format!("window/{GRID_NAME}"),
         "value",
-        "echo scripted\n",
+        // The literal two-character `\n` a shell would pass, not a real
+        // newline: interpreting it is the widget's job, and asserting on
+        // the already-interpreted form would skip the half of the path
+        // the box run found broken.
+        "echo scripted\\n",
     )
     .expect("set value");
 

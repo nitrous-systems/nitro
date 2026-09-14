@@ -527,9 +527,15 @@ impl<S: 'static> Widget<S> for TermGrid {
             // the pty rather than the grid, because writing into the
             // screen behind the program's back would desynchronise the
             // two immediately.
+            //
+            // The argument's C-style escapes are interpreted, which is
+            // what makes the action usable at all: a script's whole
+            // purpose is to run a command, and a newline cannot be typed
+            // on a command line any other way. `\e` reaches `vim`, too.
+            // See `keys::unescape` for why the rule is narrow.
             "send" | "set_value" | "set_text" => {
-                let text = arg.unwrap_or_default();
-                let bytes = crate::keys::paste(text, self.term.bracketed_paste());
+                let text = crate::keys::unescape(arg.unwrap_or_default());
+                let bytes = crate::keys::paste(&text, self.term.bracketed_paste());
                 self.term.grid_mut().scroll_to_bottom();
                 self.write_input(&bytes);
                 cx.request_paint();

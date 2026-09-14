@@ -162,6 +162,55 @@ pub fn encode(key: &KeyEvent, modes: Modes) -> Option<Vec<u8>> {
     Some(body)
 }
 
+/// Interpret the C-style escapes a shell argument can carry: `\\n`,
+/// `\\r`, `\\t`, `\\e`/`\\E` (escape), `\\0` (NUL) and `\\\\`.
+///
+/// This exists for one reason: **a terminal's scripted input needs
+/// control characters**, and there is no other way to put one on a
+/// command line. `hey nitro-term set grid value 'ls\\n'` has to run a
+/// command rather than type five characters and wait, and `\\e` is how a
+/// script sends Escape to `vim`. The box run for M4-A found exactly
+/// this: the bytes reached the pty and the shell sat there, because the
+/// newline was a backslash and an `n`.
+///
+/// It is deliberately narrow. An unknown escape keeps **both**
+/// characters (`\\q` stays `\\q`), and a trailing backslash stays a
+/// backslash, so nothing is silently lost and a Windows path pasted by
+/// accident is not quietly mangled. `hey` does its own `\\n` unescaping
+/// on the *protocol* line, which is a different layer solving a
+/// different problem — that one keeps a newline from looking like the
+/// end of a request; this one is about what the child receives.
+#[must_use]
+pub fn unescape(text: &str) -> String {
+    if !text.contains('\\') {
+        return text.to_owned();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('e' | 'E') => out.push('\x1b'),
+            Some('0') => out.push('\0'),
+            // A doubled backslash is one, and a trailing one is itself:
+            // both end up as a single backslash, from opposite causes.
+            Some('\\') | None => out.push('\\'),
+            // Unknown: keep both characters rather than guess.
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+        }
+    }
+    out
+}
+
 /// Wrap `text` in the bracketed-paste markers when the terminal asked
 /// for them (DECSET 2004), else return it unchanged.
 ///
@@ -349,6 +398,25 @@ impl IntoBytesWith for String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_escape_becomes_the_control_character_it_names() {
+        use super::unescape;
+        assert_eq!(unescape("ls\\n"), "ls\n");
+        assert_eq!(unescape("a\\tb"), "a\tb");
+        assert_eq!(unescape("\\r"), "\r");
+        assert_eq!(unescape("\\e[A"), "\x1b[A");
+        assert_eq!(unescape("\\E[A"), "\x1b[A");
+        assert_eq!(unescape("\\0"), "\0");
+        assert_eq!(unescape("a\\\\n"), "a\\n");
+        // Nothing to do is the cheap path and must not change anything.
+        assert_eq!(unescape("plain text"), "plain text");
+        // An unknown escape keeps both characters, and a trailing
+        // backslash keeps itself: silently eating either would corrupt a
+        // path somebody pasted.
+        assert_eq!(unescape("\\q"), "\\q");
+        assert_eq!(unescape("trailing\\"), "trailing\\");
+    }
+
     use super::*;
 
     /// A key event as the toolkit would deliver it.
