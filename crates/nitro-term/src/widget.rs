@@ -57,6 +57,10 @@ use nitro_ui::{
 };
 
 use crate::grid::{CellColor, Run, Style};
+// The module docs above link to `Grid`'s methods; the type itself is
+// reached through `Term`, so this import exists for rustdoc alone.
+#[allow(unused_imports)]
+use crate::grid::Grid;
 use crate::theme::Palette;
 use crate::vt::Term;
 
@@ -614,13 +618,19 @@ impl<S: 'static> Widget<S> for TermGrid {
 /// these calls `request_paint` or `request_layout`, and `WidgetMut`'s
 /// `DerefMut` is what gives them the `&mut TermGrid` to work on.
 pub trait TermGridMut {
-    /// Feed bytes from the pty into the grid.
+    /// Feed bytes from the pty into the grid, and mark the widget for
+    /// paint.
     ///
-    /// It marks the widget paint-dirty but does **not** touch the scene:
-    /// the caller updates the scene in its frame callback, which is what
-    /// keeps a megabyte of output to one commit per frame. It does not
-    /// snap the view to the bottom either — a user reading scrollback
-    /// while a build runs stays where they are.
+    /// What bounds the resulting commit rate is **how much the caller
+    /// reads per turn**, not this call: `nitro-term` drains at most
+    /// [`DRAIN_CHUNK`](crate::DRAIN_CHUNK) of pty output before handing
+    /// the loop back, so a commit carries about four screenfuls rather
+    /// than a line. The upper bound on what the *display* shows is the
+    /// server's flip coalescing. See the implementation for why pacing
+    /// this from a frame callback instead was tried and reverted.
+    ///
+    /// It does not snap the view to the bottom — a user reading
+    /// scrollback while a build runs stays where they are.
     fn feed(&mut self, bytes: &[u8]);
 
     /// Resize the grid to `cols` by `rows`, as a window resize does.

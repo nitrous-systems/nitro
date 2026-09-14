@@ -1,6 +1,6 @@
 //! A pseudoterminal, and the child shell on the far end of it.
 //!
-//! The sibling argument to [`nitro_launcher::spawn`]: that module had to
+//! The sibling argument to `nitro-launcher`'s `spawn` module: that had to
 //! start a program and *detach* it, this one has to start a program and
 //! *attach* it — to a terminal, as its session leader — and both have to
 //! do it in a tree where `unsafe_code = "deny"`.

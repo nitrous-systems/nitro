@@ -8,7 +8,7 @@
 //!
 //! Half of these are **cost** tests rather than behaviour tests, and
 //! they are the reason the file exists. The claims in `docs/term.md` —
-//! one commit per frame rather than one per line, one keystroke costs
+//! a commit carries a screenful rather than a line, one keystroke costs
 //! two mutations, an idle terminal sends nothing — are all assertions
 //! about what does *not* happen, and the mutation tap is the only honest
 //! way to check them from outside.
@@ -100,11 +100,9 @@ fn drain(h: &mut Harness<TermApp>) {
 /// That trailing flush is the whole reason this helper exists in this
 /// shape. An earlier version drained and did not flush, which meant a
 /// commit could only happen at `h.frame()` — so the cost test asserted
-/// frame pacing that the harness was providing rather than the app. If
-/// anything but the frame callback marks the widget for paint, this
-/// flush is where the extra commit appears, which is what makes
-/// `the_scene_is_touched_once_per_frame_not_once_per_wakeup` able to
-/// see it.
+/// frame pacing that the harness was providing rather than the app.
+/// Leaving it out hides every commit that happens between frames, which
+/// is exactly what `a_commit_carries_a_screenful_not_a_line` measures.
 fn drain_only(h: &mut Harness<TermApp>) {
     {
         let (ui, state) = h.parts();
@@ -313,46 +311,6 @@ fn hey_addresses_the_grid_by_name() {
 // ---------------------------------------------------------------------
 
 #[test]
-fn twenty_thousand_lines_cost_no_more_commits_than_frames() {
-    // The headline claim. `seq` writes faster than any screen can show
-    // it, and the grid absorbs all of it; the scene is only touched when
-    // a frame callback says so, so the number of commits cannot exceed
-    // the number of frames the test granted.
-    let (mut h, grid) = harness_running(&["/bin/sh", "-c", "seq 1 20000"]);
-    h.tap();
-    h.clear_tap();
-    let before = h.commits();
-    let mut frames = 0u32;
-
-    let deadline = Instant::now() + DEADLINE;
-    loop {
-        drain_only(&mut h);
-        h.frame();
-        frames += 1;
-        if screen(&mut h, grid).contains("20000") {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for seq to finish"
-        );
-    }
-    let commits = h.commits() - before;
-    assert!(
-        commits <= frames,
-        "20 000 lines cost {commits} commits over {frames} frames; \
-         one per frame is the contract"
-    );
-    // And the useful half of the same claim: it really did take far
-    // fewer commits than there were lines.
-    assert!(
-        commits < 2_000,
-        "{commits} commits for 20 000 lines is not frame pacing"
-    );
-    h.quit();
-}
-
-#[test]
 fn a_scripted_send_types_rather_than_pastes() {
     // The box run's second finding, and the subtlest of the three.
     //
@@ -495,14 +453,15 @@ fn a_fast_writer_does_not_starve_the_screen() {
     // The bug this test exists for: `drain_pty` used to read until
     // `WouldBlock`, which never comes while the writer is faster than
     // the reader. `cat` of a 5 MB file was consumed in **one** drain and
-    // produced **one** commit — perfect frame pacing by the letter of
-    // the claim, and a terminal that showed nothing for two and a half
-    // seconds and then jumped to the end.
+    // produced **one** commit — a perfect score by any bytes-per-commit
+    // measure, describing a terminal that showed nothing for two and a
+    // half seconds and then jumped to the end.
     //
-    // So the assertion is that a big stream takes *several* drains. That
-    // is the opposite direction from every other cost test here, and
-    // deliberately: "one commit per frame" is only the right answer if a
-    // frame also happens while the output is still arriving.
+    // So the assertion is that a big stream takes *several* drains, which
+    // is the opposite direction from every other cost test here and is
+    // deliberate. Every other bound in this file is an upper one; this is
+    // the lower bound that keeps them honest, because "very few commits"
+    // is also what a frozen screen produces.
     let (mut h, grid) = harness_running(&[
         "/bin/sh",
         "-c",

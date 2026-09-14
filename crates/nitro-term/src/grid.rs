@@ -536,7 +536,7 @@ impl Grid {
     /// A scrollback line is stored trimmed of its trailing blanks (see
     /// the `history` field), so this returns one of two slices: the live
     /// row itself, or a trimmed history row — and for the short case the
-    /// caller is handed [`Grid::pad`] to finish it. Callers that only
+    /// short case is padded with blanks on the way out. Callers that only
     /// look at the significant cells (`row_runs`, `row_text`, which
     /// trim anyway) can use [`Grid::display_row_raw`] and skip the
     /// question entirely.

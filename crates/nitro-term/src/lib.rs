@@ -45,7 +45,7 @@
 //! per row, each in its own paint slot, so the toolkit's per-slot diff
 //! drops everything that did not change. `docs/term.md` has the numbers.
 //!
-//! # One commit per frame, not one per line
+//! # One commit per screenful, not one per line
 //!
 //! The loop below is the reason `seq 1 1000000` does not melt the
 //! compositor. Bytes are drained from the pty the instant they arrive —
@@ -166,23 +166,28 @@ impl TermApp {
     }
 }
 
-/// The most a single drain will read before handing the loop back.
+/// The most a single drain will read before handing the loop back, and
+/// so **the bound on how much output one commit carries**.
 ///
-/// Without a cap this loop is unbounded, and the cap is not a tuning
-/// knob: a writer that is faster than we are — `cat` of a large file is
-/// exactly that — refills the pty as fast as we empty it, so "read until
-/// `WouldBlock`" never comes back. The first measurement of `cat` of a
-/// 5 MB file consumed the whole file in **one** drain and produced
-/// **one** commit: perfect frame pacing by the letter of the claim, and
-/// a terminal that showed nothing at all for two and a half seconds and
-/// then jumped to the end.
+/// Public because it is the pacing mechanism rather than an
+/// implementation detail: a commit is at most this many bytes of pty
+/// output — about four screens of dense text at 80×24 — and the upper
+/// bound on what the *display* shows is the server's flip coalescing,
+/// not anything this client does.
 ///
-/// 256 KiB is about four screens of dense output at 80×24, so a frame
-/// always has more than it can show and the pacing argument is
-/// untouched; what changes is that the *screen* keeps up with the
-/// stream instead of waiting for it to end. The loop is
-/// level-triggered, so whatever is left wakes us again immediately.
-const DRAIN_CHUNK: usize = 256 * 1024;
+/// The cap is not a tuning knob. Without it the drain loop is unbounded:
+/// a writer faster than we are — `cat` of a large file is exactly that —
+/// refills the pty as fast as we empty it, so "read until `WouldBlock`"
+/// never comes back. Measured, before the cap existed: `cat` of a 5 MB
+/// file was consumed in **one** drain and produced **one** commit, which
+/// is a perfect score by the letter of the pacing claim and describes a
+/// terminal that showed nothing for two and a half seconds and then
+/// jumped to the end.
+///
+/// The loop is level-triggered, so whatever is left over wakes us again
+/// immediately and the screen keeps up with the stream rather than
+/// waiting for it to end.
+pub const DRAIN_CHUNK: usize = 256 * 1024;
 
 /// Drain what the pty has, feed it to the grid, and write back whatever
 /// the grid owes.

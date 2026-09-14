@@ -210,9 +210,10 @@ type ResizeHandler<S> = Box<dyn FnMut(&mut S, &mut Ui<S>, Size)>;
 /// The deadline is the target presentation time of the next flip, on
 /// `CLOCK_MONOTONIC`, and `refresh_ns` is the output's refresh interval.
 /// An app that produces output faster than the screen can show it uses
-/// them to do exactly one scene update per frame rather than one per
-/// change — which is the difference between `yes | head -100000` costing
-/// one commit per frame and one commit per line.
+/// them to pace work it would otherwise repeat per input event —
+/// rebuilding a list, recomputing a model — rather than as the gate on
+/// painting at all; see [`Ui::request_frame`] for why that distinction
+/// is load-bearing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Frame {
     /// Target presentation time, `CLOCK_MONOTONIC` nanoseconds.
@@ -1169,12 +1170,21 @@ impl<S: 'static> Ui<S> {
     ///
     /// One request, one answer, no free-running loop — this is the
     /// toolkit's half of `RequestFrame` (`docs/wire.md`), and it is what
-    /// an app uses when its *input* is faster than the screen. The
-    /// widget model's normal rule is "a change marks the widget dirty
-    /// and the next flush sends it"; an app draining a pty at 20 MB/s
-    /// wants the opposite — absorb everything into its own model now,
-    /// and touch the scene once per frame. So it asks for a frame, and
-    /// updates the tree in the handler.
+    /// an app uses when its *input* is faster than the screen: absorb
+    /// everything into its own model as it arrives, and do the expensive
+    /// tree work once per callback instead of once per event.
+    ///
+    /// **Do not make the callback the only thing that can paint.** One
+    /// request is outstanding at a time and the server answers after a
+    /// flip, so an app that only marks widgets dirty inside the handler
+    /// has made painting depend on an answer that a server coalescing
+    /// flips under load does not send. `nitro-term` tried it and froze
+    /// its screen: four frames in twelve seconds of steady output, with
+    /// consecutive framebuffer readbacks byte-identical while its model
+    /// advanced normally. Bound the *input* instead (it reads at most
+    /// 256 KiB of pty per turn) and let the server's flip coalescing
+    /// supply "at most one change per refresh", which is its job. The
+    /// worked reasoning is in `docs/ui.md`.
     ///
     /// Asking twice before the answer arrives sends one request: the
     /// second is folded into the first, because two callbacks per frame
