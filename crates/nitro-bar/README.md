@@ -94,6 +94,39 @@ defeat.
 The clock is **not** on that 30 s budget: it is minute-aligned, so it
 repaints at `:00` and at no other time.
 
+### Measured on the box
+
+Test box (2-core Pentium, 1920×1080), the shell plus one application up,
+pointer parked off the bar, `frames` from `nitro-shot --stats` over a
+fixed wall interval. A frame counter is the right instrument here:
+"does the display move at all" is a counting question, and `paint_us_mean`
+at ~0.3 µs resolution answers a different one.
+
+| | frames |
+|---|---|
+| 45 s containing **no** minute boundary | **0** |
+| 4 minutes, sampled every 5 s | **2 per `:00` and at no other time** |
+| whole desktop tree, 60 s idle (`just box-ps`) | **0.00 % CPU**, every process |
+
+The sensor labels did not move once in those four minutes.
+
+The before/after is the part worth keeping, because the first attempt to
+measure it was wrong. On a quiet box the 1-minute load average sits at a
+flat `0.00`, so even `%.2f` renders the same string every poll and the
+old bar also shows 0 frames — a green number that says nothing about the
+fix. Re-run against a small background load that keeps the average
+jittering in its second decimal (the condition #543 reported), swapping
+only the bar binary:
+
+| 120 s, second-decimal jitter | frames | per 10 s |
+|---|---|---|
+| 5 s poll, load as `%.2f` | 52 | ~4.3 |
+| 30 s poll, load at one decimal | 6 | 0.5 |
+
+In the first row the label moved on *every* poll — 0.14, 0.13, 0.12,
+0.11, 0.10, 0.09, 0.16 — at about two frames each. In the second the
+same underlying readings render one string.
+
 `a_settled_bar_is_silent_while_nothing_changes` asserts the first half
 from the outside, over a window containing a dozen sensor polls;
 `a_poll_that_finds_the_same_readings_does_not_touch_the_tree` asserts the
@@ -128,6 +161,13 @@ window is `NO_FOCUS`, so the toolkit suppresses the focus a button takes
 on click: the click still focuses the *window it names*, but nothing in
 the bar draws a focus ring for a surface the server will never give keys
 to. `docs/ui.md` §Shell surfaces has the toolkit half.
+
+Checking that from a script needs a **real pointer click**, not `hey … do
+windows/winN click`. A scripted `click` runs the widget's `activate`,
+which is deliberately the input path's destination rather than the input
+path itself — it never touched focus, so it answers `false` whether the
+suppression is there or not. Focus, hover and press state can only be
+checked by moving the pointer and pressing it.
 
 ## One bar, on the primary output
 
