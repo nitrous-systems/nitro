@@ -229,25 +229,52 @@ the wallpaper, the bar and the launcher, plus the two applications that
 make it a desktop. Taken with `just box-ps` (60 s window), pointer parked
 off-screen, from a `just deploy` of the same artefacts.
 
-| process | VmRSS | RssAnon | RssFile | threads | idle CPU, 60 s |
-|---|---|---|---|---|---|
-| `nitro-session` | **2 792 kB** | **212 kB** | 2 580 kB | 1 | **0.00 %** |
-| `nitro-server` | 17 840 kB | 11 296 kB | 7 212 kB | 1 | 0.02 % |
-| `nitro-wallpaper` | **2 664 kB** | **200 kB** | 2 472 kB | 1 | **0.00 %** |
-| `nitro-bar` | **2 752 kB** | **252 kB** | 2 520 kB | 1 | **0.00 %** |
-| `nitro-launcher` | **2 920 kB** | **252 kB** | 2 668 kB | 1 | **0.00 %** |
-| **whole desktop** | **28 968 kB** | **12 212 kB** | 17 452 kB | 5 | — |
+| process | VmRSS | RssAnon | RssFile | RssShmem | threads | idle CPU, 60 s |
+|---|---|---|---|---|---|---|
+| `nitro-session` | **2 788 kB** | **212 kB** | 2 576 kB | 0 | 1 | **0.00 %** |
+| `nitro-server` | 19 620 kB | 12 444 kB | 7 176 kB | 0 | 1 | 0.02 % |
+| `nitro-wallpaper` | **2 616 kB** | **208 kB** | 2 408 kB | 0 | 1 | **0.00 %** |
+| `nitro-bar` | **2 780 kB** | **248 kB** | 2 532 kB | 0 | 1 | **0.00 %** |
+| `nitro-launcher` | **2 896 kB** | **260 kB** | 2 636 kB | 0 | 1 | **0.00 %** |
+| **whole desktop** | **30 700 kB** | **13 372 kB** | 17 328 kB | 0 | 5 | — |
 
-The anon/file columns are the #538 addition, and they change how this
-table reads. **The four shell processes are ~250 kB of private memory
-each**; 90 % of each one's `VmRSS` is file-backed — the same libc and the
-same `nitro-ui` text, mapped four times and counted four times. So the
-17 452 kB `RssFile` total is an *upper bound*, not a cost: summing it
-across the tree double-counts every shared page. The `RssAnon` column is
-the one that is genuinely additive, and it says the whole desktop's
-private memory is **12.2 MB, of which 8.1 MB is the server's one shadow
-buffer**. Four shell clients, a supervisor and a compositor come to about
-4 MB of private memory between them.
+All four memory columns are read from the **same** `/proc/<pid>/status`
+sample, so `VmRSS = RssAnon + RssFile + RssShmem` closes on every row and
+down the total — check it. (An earlier draft of this table paired the
+28 968 kB `VmRSS` column from the M3-E exit run with a split measured
+later, which made anon+file *exceed* `VmRSS` by 696 kB. A table whose
+arithmetic does not close is exactly what this page exists not to be, so
+the whole row set was re-measured in one pass. The configuration is the
+M3-E one: `nitro-session` with wallpaper, bar and launcher, plus
+`hello_client` and `hello_dialog` as the two applications, settled — six
+windows, three decorated.)
+
+**`RssShmem` is 0 for every process**, which is worth stating rather than
+omitting because the server is the one process that maps memory it did not
+allocate. Client buffers arrive as memfd mappings accounted to the **file**
+half, and the scanout buffers are GPU-owned dumb buffers outside the
+resident set entirely — so the third column is structurally zero on this
+workload, not merely small. It is carried in the table and in
+`just box-ps` so that a future workload which *does* put something there
+shows up instead of quietly inflating `RssFile`.
+
+The anon/file split is the #538 addition, and it changes how this table
+reads. **The four shell processes are ~230 kB of private memory each**;
+over 90 % of each one's `VmRSS` is file-backed — the same libc and the
+same `nitro-ui` text, mapped once per process and counted once per
+process. So the 17 328 kB `RssFile` total is an *upper bound*, not a cost:
+summing it across the tree double-counts every shared page. The `RssAnon`
+column is the one that is genuinely additive, and it says the whole
+desktop's private memory is **13.4 MB, of which 8.1 MB is the server's one
+shadow buffer**. A supervisor, a compositor and four shell clients come to
+about 5 MB of private memory between them.
+
+(The server's 12 444 kB anon here against the 10 532 kB in the audit
+table's "desktop, shadow on" row is not a discrepancy: this row has two
+applications on screen and three decorated windows where that one has
+none, and the #547 allocator ratchet has had more font files pass through
+it. Both are honest samples of different workloads; neither is the floor,
+which is the 2 424 kB `NITRO_SHADOW=0` figure.)
 
 (The unit also contains systemd's own `(sd-pam)` helper at 4 392 kB,
 forked into the logind session by `PAMName=login`. It is listed by
@@ -293,11 +320,21 @@ wallpaper, bar and launcher up, plus *N* `hello_dialog` windows, settled
 (the state the idle sweep has run in). `RssAnon` and `RssFile` are read
 from `/proc/<pid>/status`; `just box-ps` now prints both.
 
-| | `VmRSS` | `RssAnon` | `RssFile` |
-|---|---|---|---|
-| desktop, shadow on (as shipped) | 17 764 kB | 10 532 kB | 7 232 kB |
-| desktop, `NITRO_SHADOW=0` | **9 676 kB** | **2 424 kB** | 7 252 kB |
-| difference | 8 088 kB | 8 108 kB | ~0 |
+| | `VmRSS` | `RssAnon` | `RssFile` | `RssShmem` |
+|---|---|---|---|---|
+| desktop, shadow on (as shipped) | 17 764 kB | 10 532 kB | 7 232 kB | 0 |
+| desktop, `NITRO_SHADOW=0` | **9 676 kB** | **2 424 kB** | 7 252 kB | 0 |
+| difference | 8 088 kB | 8 108 kB | ~0 | 0 |
+
+`RssShmem` is **0** in every sample taken for this audit, and the column
+is carried rather than dropped because the server is the one process that
+maps memory it did not allocate: client buffers arrive as memfd mappings
+accounted to the *file* half, and the scanout buffers are GPU-owned dumb
+buffers outside the resident set entirely. So the third term is
+structurally zero here, not merely small — and `VmRSS = RssAnon +
+RssFile + RssShmem` means the two columns that are non-zero must account
+for the whole of `VmRSS`, which is the check every table on this page is
+meant to survive.
 
 **First: 7.2 MB of the 17.8 is file-backed, and it is not the server's
 heap at all.** `RssFile` does not move when a window opens, is shared with
@@ -589,19 +626,28 @@ So **48 → 60** across M2-pre decomposes as **+7 external package entries**
 `font-types`, `yazi`, `zeno`, `once_cell`), **+2 workspace crates** that
 are not dependencies at all (`nitro-text` and `nitro-demo`), and **+3
 `(*)` marker lines**, cargo's "subtree already printed above" notation
-that `sort -u` counts as distinct — two external, one for the second
-`nitro-text` line. 7 + 2 + 3 = 12, and 48 + 12 = 60. The sentence this
-replaces put it as "`swash` and its seven transitive crates, plus the
-`nitro-demo` and second `signal-hook (*)` lines" and summed to 58 (#530):
-`swash` brings six, not seven, and the second `signal-hook` line arrived
-at M3 rather than M2.
+that `sort -u` counts as distinct — `bytemuck (*)`, `signal-hook v0.4.4
+(*)` and `nitro-text (*)`. 7 + 2 + 3 = 12, and 48 + 12 = 60.
 
-**60 → 70** across M3 is **+1 external package entry** (a second
-`signal-hook` *version*, not a new crate name — `nitro-session` takes 0.3
-where the server takes 0.4), **+7 workspace crates** (`nitro-bar`,
-`nitro-launcher`, `nitro-wallpaper`, `nitro-session`, `nitro-ui`,
-`nitro-calc`, `nitro-hey`) and **+2 `(*)` markers**. 1 + 7 + 2 = 10.
-Zero new crate names: 34 at M2 and 34 at M3.
+The sentence this replaces — "`swash` and its seven transitive crates,
+plus the `nitro-demo` and second `signal-hook (*)` lines" — named the
+right arrivals and mis-stated the arithmetic, which is how it summed to
+58 (#530). Two corrections: `swash` brings **six** transitive crates, not
+seven; and its "plus" clause names two of the five remaining lines
+(`nitro-demo` and `signal-hook v0.4.4 (*)`), silently omitting
+`nitro-text`, its `(*)` marker, and `bytemuck (*)`. That gives 7 + 2 = 9
+where the true total is 7 + 2 + 3 = 12. The second `signal-hook v0.4.4
+(*)` line **does** arrive at M2 with `nitro-demo`, exactly as it said.
+
+**60 → 70** across M3 is **+1 external package entry**, **+7 workspace
+crates** (`nitro-bar`, `nitro-launcher`, `nitro-wallpaper`,
+`nitro-session`, `nitro-ui`, `nitro-calc`, `nitro-hey`) and **+2 `(*)`
+markers**. 1 + 7 + 2 = 10. The one external entry is a second
+`signal-hook` **version** — `0.3.18`, which `nitro-session` takes from the
+workspace pin where the server takes `0.4.4` — and it is worth keeping
+distinct from the M2 event above: M2 added a second *line* for one
+version, M3 added a second *version*. Neither is a new crate **name**,
+which is why that figure is 34 at both.
 
 Verify with:
 

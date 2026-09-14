@@ -324,7 +324,7 @@ D-Bus client is allowed.
     piece that dies is restarted with backoff; the *server* exiting ends
     the session with the server's code; `SIGTERM` tears down in reverse
     order inside one deadline. Power actions go through `systemctl`
-    rather than D-Bus — `zbus` is ~40 crates against a tree of 35, and
+    rather than D-Bus — `zbus` is ~40 crates against a tree of 34, and
     `systemctl suspend` *is* a logind call. `lock` is the one action
     that needs what only D-Bus provides (an inhibitor held across the
     suspend, so a lock screen can paint first), and it is the one action
