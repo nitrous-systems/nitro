@@ -263,3 +263,100 @@ fn hey_reports_an_error_reply_as_exit_1_and_a_missing_app_as_exit_2() {
     let out = run(&mut h, &dir, &["dialog", "list"]);
     assert_eq!(out.status.code(), Some(0), "and a good request is exit 0");
 }
+
+#[test]
+fn a_stale_socket_next_to_a_live_app_is_pruned_rather_than_ambiguous() {
+    // #536/#544: a SIGTERMed or SIGKILLed app never unlinks its socket,
+    // and `nitro-session` restarts the piece that died — so after a few
+    // crashes the directory holds one live socket and several ghosts,
+    // and `hey nitro-bar list` refuses to run because the name is
+    // "ambiguous" between apps that do not exist.
+    //
+    // The ghosts are planted rather than killed for real, and there are
+    // two kinds, because the check has two halves:
+    //
+    //   * a pid far above the kernel's maximum — `/proc/<pid>` absent,
+    //     which is the common case and the cheap half;
+    //   * pid 1, which is alive by definition, whose socket is a plain
+    //     file nothing listens on — which refuses the connection with
+    //     ECONNREFUSED, and is the pid-reuse case the `connect` half
+    //     exists to catch.
+    const DEAD: u32 = u32::MAX - 11;
+    let (mut h, dir) = harness();
+    let live = dir.join(format!("dialog.{}.sock", std::process::id()));
+    assert!(live.exists(), "the app under test is listening");
+
+    let ghost = dir.join(format!("dialog.{DEAD}.sock"));
+    std::fs::write(&ghost, b"").unwrap();
+    let refused = dir.join("dialog.1.sock");
+    std::fs::write(&refused, b"").unwrap();
+
+    // The name resolves to the one live app: no "ambiguous", exit 0.
+    let out = run(&mut h, &dir, &["dialog", "get", "window/message", "value"]);
+    assert!(
+        out.status.success(),
+        "stale sockets made the name ambiguous: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(stdout(&out).trim(), "before");
+
+    // And the ghosts are gone, so the directory heals rather than
+    // accumulating until someone notices.
+    assert!(!ghost.exists(), "a dead pid's socket is unlinked");
+    assert!(!refused.exists(), "and so is one nothing answers on");
+    assert!(live.exists(), "the live app's socket is untouched");
+
+    // A bare `hey` lists what is actually running, which is the same
+    // truth in the other direction.
+    std::fs::write(&ghost, b"").unwrap();
+    let out = run(&mut h, &dir, &[]);
+    let listing = stdout(&out);
+    assert_eq!(
+        listing.lines().count(),
+        1,
+        "only the live app is listed:\n{listing}"
+    );
+    assert!(!listing.contains(&DEAD.to_string()), "{listing}");
+    assert!(!ghost.exists(), "and listing pruned it too");
+}
+
+#[test]
+fn two_live_copies_are_ambiguous_and_name_dot_pid_picks_one() {
+    // The other side of the coin: pruning must not make `hey` guess
+    // between apps that really are both there. Two copies of one name
+    // are still an error — and the error now tells you the selector
+    // that resolves it.
+    let (mut h, dir) = harness();
+    let mine = std::process::id();
+    // A second *live* `dialog`: a real listener owned by pid 1, which
+    // is alive by definition, so both halves of the liveness test pass.
+    // It need not speak the protocol; `find` decides before anything is
+    // sent.
+    let twin = dir.join("dialog.1.sock");
+    let twin_listener = std::os::unix::net::UnixListener::bind(&twin).unwrap();
+
+    let out = run(&mut h, &dir, &["dialog", "list"]);
+    assert_eq!(out.status.code(), Some(2), "two live apps is no such app");
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(err.contains("ambiguous"), "{err}");
+    assert!(
+        err.contains(&format!("dialog.{mine}")),
+        "and names them as selectors: {err}"
+    );
+
+    // Which is then usable verbatim.
+    let out = run(
+        &mut h,
+        &dir,
+        &[&format!("dialog.{mine}"), "get", "window/message", "value"],
+    );
+    assert!(
+        out.status.success(),
+        "`name.pid` picks one: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(stdout(&out).trim(), "before");
+
+    drop(twin_listener);
+    let _ = std::fs::remove_file(&twin);
+}

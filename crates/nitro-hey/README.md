@@ -15,6 +15,7 @@ hey <app> tree [path]                  the same, indented for humans
 hey <app> get <path> [prop]            one widget's properties
 hey <app> set <path> <prop> <value>    change one
 hey <app> do <path> <action> [arg]     invoke an action
+                                       e.g. hey calc do window/container[1]/7 click
 hey <app> watch [path|*]               stream changes until Ctrl-C
 hey <app> shot [-o FILE] [--raw]       screenshot that window
 hey <app> quit                         ask the app to exit
@@ -44,8 +45,9 @@ The columns are single tabs on the wire; they are aligned above for
 reading. The fields are path, role, addressing name, value, `x,y,w,h`
 and flags.
 
-`<app>` matches by **pid**, by **exact name**, or by a **unique name
-prefix** — an ambiguous prefix is an error rather than a guess, because a
+`<app>` matches by **pid**, by **exact name**, by a **unique name
+prefix**, or by **`<name>.<pid>`** when two copies of one app are
+running — an ambiguous prefix is an error rather than a guess, because a
 tool that silently picked one of two apps would be worse than one that
 refused.
 
@@ -75,6 +77,34 @@ The directory is `0700`, which is the whole of M2's security model: any
 process of the same user can drive any app completely, exactly as with
 the X11 socket. A per-app allow policy is M3+.
 
+## Sockets of apps that are gone
+
+An app killed with `SIGTERM` or `SIGKILL` never unlinks its socket, and
+`nitro-session` restarts a shell piece that dies — so the ghosts used to
+pile up until `hey nitro-bar list` refused to run, calling the name
+"ambiguous" between one live bar and seven corpses (#536, #544).
+
+So `hey` prunes on every invocation, before it decides anything. A
+socket is a live app only when `/proc/<pid>` exists **and** a `connect`
+succeeds; the pid is the cheap filter and the `connect` catches the pid
+that has been reused since. Anything failing either test is unlinked,
+best effort and silently, and dropped — before ambiguity is judged and
+before a listing is printed, because a listing that names dead apps is
+the same lie in a friendlier voice.
+
+What is left really is ambiguous when two copies of one app are up, and
+then the error names the selector that resolves it:
+
+```text
+$ hey nitro-bar list
+hey: `nitro-bar` is ambiguous: nitro-bar.217436, nitro-bar.218864; name one, e.g. `hey nitro-bar.217436 …`
+```
+
+The app side does its half in `nitro_ui::introspect::Socket::bind`,
+which sweeps the dead siblings of its own name before binding — so a
+restarted app buries its own corpse without anyone running `hey`. See
+`docs/introspection.md`.
+
 ## Testing
 
 `tests/end_to_end.rs` runs a real app on a real server (the `nitro-ui`
@@ -84,3 +114,9 @@ it, `set` changes a text field, `watch` sees a change another client
 made, and `shot` writes a PNG whose IHDR dimensions equal the window's.
 Nothing in that test reaches into the app — every assertion is made by
 asking `hey`, which is the claim the socket exists to support.
+
+It also plants the two kinds of leftover — a pid that cannot exist, and
+a bound-but-unlistening file whose pid is alive — next to the real app,
+and asserts that the name resolves to the live one, that both files are
+gone afterwards, and that two *live* copies are still ambiguous with
+`<name>.<pid>` picking one.

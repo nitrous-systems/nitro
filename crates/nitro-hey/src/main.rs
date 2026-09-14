@@ -17,8 +17,9 @@
 //! hey <app> quit                         ask the app to exit
 //! ```
 //!
-//! `<app>` matches by name prefix or by pid. Exit codes: 0 ok, 1 the app
-//! answered `err` (or something else went wrong), 2 no such app.
+//! `<app>` matches by name prefix, by pid, or by `<name>.<pid>` when two
+//! copies of the same app are up. Exit codes: 0 ok, 1 the app answered
+//! `err` (or something else went wrong), 2 no such app.
 //!
 //! It depends on `std` and `rustix` and nothing else, on purpose: this
 //! is the tool you reach for when something is wrong.
@@ -40,11 +41,13 @@ usage: hey                                       list running apps
        hey <app> get <path> [prop]               one widget's properties
        hey <app> set <path> <prop> <value>       change one
        hey <app> do <path> <action> [arg]        invoke an action
+                 e.g. hey calc do window/container[1]/7 click
        hey <app> watch [path|*]                  stream changes
        hey <app> shot [-o FILE]                  screenshot the window
        hey <app> quit                            ask the app to exit
 
-<app> matches by name prefix or pid. Exit: 0 ok, 1 error, 2 no such app.";
+<app> matches by name prefix, pid, or <name>.<pid> when two copies of
+the same app are up. Exit: 0 ok, 1 error, 2 no such app.";
 
 // ---------------------------------------------------------------------
 // finding apps
@@ -85,7 +88,10 @@ fn parse_socket_name(file: &str) -> Option<(String, u32)> {
     Some((name.to_owned(), pid.parse().ok()?))
 }
 
-/// Every app socket in `dir`, sorted by name then pid.
+/// Every app socket in `dir`, sorted by name then pid — live or not.
+///
+/// [`prune`] is what separates the two, and every caller that is about
+/// to *decide* something runs it first.
 fn list_apps(dir: &Path) -> Vec<App> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -106,12 +112,74 @@ fn list_apps(dir: &Path) -> Vec<App> {
     out
 }
 
-/// Find the app `want` names: an exact name, a pid, or a unique name
-/// prefix.
+/// Whether a process with `pid` still exists.
+///
+/// `/proc/<pid>` rather than `kill(pid, 0)`: nothing is signalled, no
+/// permission is needed, and there is no signal number to get wrong.
+fn pid_alive(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// Whether anything is listening on the socket at `path`.
+///
+/// The half of the test a pid check cannot do: an app that died and
+/// whose pid has since been handed to something else still has a
+/// `/proc` entry, and only a `connect` tells the difference.
+/// `ECONNREFUSED` means no listener, which means a leftover file. It is
+/// not a liveness *timeout* either — `listen(2)` queues the connection
+/// in the kernel whether or not the app is in `accept` — so a busy app
+/// is never mistaken for a dead one.
+fn responds(path: &Path) -> bool {
+    UnixStream::connect(path).is_ok()
+}
+
+/// Drop, and unlink, every socket that is not a running app.
+///
+/// An app killed with `SIGTERM` or `SIGKILL` never runs its cleanup and
+/// leaves its socket behind. Under `nitro-session`, which *restarts* a
+/// shell piece that dies, those accumulate by themselves, and `hey
+/// nitro-bar list` then refuses to run — "`nitro-bar` is ambiguous"
+/// between one live bar and seven ghosts (#536, #544). The tool you
+/// reach for when the bar has misbehaved must not be the tool that
+/// stops working once it has.
+///
+/// So the ghosts go here, before anything is decided: before ambiguity
+/// is judged, and before a listing is printed, because a listing that
+/// names dead apps is the same lie in a friendlier voice. Unlinking is
+/// best effort and silent — a ghost that will not unlink is still
+/// excluded, which is the part that matters.
+fn prune(apps: Vec<App>) -> Vec<App> {
+    let mut out = Vec::with_capacity(apps.len());
+    for a in apps {
+        if pid_alive(a.pid) && responds(&a.path) {
+            out.push(a);
+        } else {
+            let _ = std::fs::remove_file(&a.path);
+        }
+    }
+    out
+}
+
+/// Find the app `want` names: `<name>.<pid>`, a pid, an exact name, or
+/// a unique name prefix.
 ///
 /// Ambiguity is an error rather than "the first one": `hey n do …` that
-/// silently picked one of two apps would be the worst kind of tool.
+/// silently picked one of two apps would be the worst kind of tool. The
+/// candidates are the live ones — [`prune`] has already dropped the
+/// leftovers — so two hits really are two apps, and `<name>.<pid>`,
+/// which is what the error prints, is how you pick between them.
 fn find<'a>(apps: &'a [App], want: &str) -> Result<&'a App, String> {
+    // `<name>.<pid>`: the socket's own file name minus `.sock`, and the
+    // one selector that can never be ambiguous. Tried first, but only
+    // as an exact hit, so an app actually *named* `a.1` still wins by
+    // the name rules below.
+    if let Some((name, pid)) = want.rsplit_once('.')
+        && let Ok(pid) = pid.parse::<u32>()
+        && !apps.iter().any(|a| a.name == want)
+        && let Some(a) = apps.iter().find(|a| a.name == name && a.pid == pid)
+    {
+        return Ok(a);
+    }
     if let Ok(pid) = want.parse::<u32>()
         && let Some(a) = apps.iter().find(|a| a.pid == pid)
     {
@@ -121,16 +189,27 @@ fn find<'a>(apps: &'a [App], want: &str) -> Result<&'a App, String> {
     if exact.len() == 1 {
         return Ok(exact[0]);
     }
-    let hits: Vec<&App> = apps.iter().filter(|a| a.name.starts_with(want)).collect();
+    // Two copies of one app are ambiguous between *themselves*, not
+    // against every app the prefix would also have caught: naming one
+    // of them exactly has already said which name you meant.
+    let hits: Vec<&App> = if exact.is_empty() {
+        apps.iter().filter(|a| a.name.starts_with(want)).collect()
+    } else {
+        exact
+    };
     match hits.len() {
         0 => Err(format!("no app matching `{want}`")),
         1 => Ok(hits[0]),
         _ => {
             let names: Vec<String> = hits
                 .iter()
-                .map(|a| format!("{}({})", a.name, a.pid))
+                .map(|a| format!("{}.{}", a.name, a.pid))
                 .collect();
-            Err(format!("`{want}` is ambiguous: {}", names.join(", ")))
+            Err(format!(
+                "`{want}` is ambiguous: {}; name one, e.g. `hey {} …`",
+                names.join(", "),
+                names[0]
+            ))
         }
     }
 }
@@ -279,7 +358,10 @@ fn parse(args: &[String]) -> Result<Command, String> {
                 return Err("set needs a path, a property and a value".to_owned());
             }
             if verb == "do" && rest.len() < 2 {
-                return Err("do needs a path and an action".to_owned());
+                return Err(
+                    "do needs a path and an action, e.g. `hey calc do window/container[1]/7 click`"
+                        .to_owned(),
+                );
             }
             // The app takes everything after `set <path> <prop>` (or
             // `do <path> <action>`) verbatim, so a value with spaces in
@@ -342,7 +424,9 @@ fn write_out(file: Option<&PathBuf>, bytes: &[u8]) -> io::Result<()> {
 
 fn run(cmd: Command) -> Result<(), (u8, String)> {
     let dir = socket_dir();
-    let apps = list_apps(&dir);
+    // Pruned before anything is decided: the leftovers of killed apps
+    // are neither listed nor counted towards ambiguity. See [`prune`].
+    let apps = prune(list_apps(&dir));
     let fail = |e: io::Error| (1u8, e.to_string());
     match cmd {
         Command::Apps => {
@@ -539,6 +623,60 @@ mod tests {
         assert!(find(&apps, "ca").is_err(), "ambiguous prefix");
         assert!(find(&apps, "nope").is_err());
         assert!(find(&apps, "999").is_err());
+    }
+
+    #[test]
+    fn two_copies_of_one_app_are_told_apart_by_name_dot_pid() {
+        let apps = [app("bar", 10), app("bar", 11), app("editor", 12)];
+        assert_eq!(find(&apps, "bar.11").unwrap().pid, 11);
+        assert_eq!(find(&apps, "bar.10").unwrap().pid, 10);
+        // And the error says so, rather than leaving you to guess that
+        // the thing in the parentheses is usable.
+        let e = find(&apps, "bar").unwrap_err();
+        assert!(e.contains("bar.10, bar.11"), "{e}");
+        assert!(e.contains("hey bar.10"), "{e}");
+        // A pid that belongs to another app is not a `bar`.
+        assert!(find(&apps, "bar.12").is_err());
+        assert!(find(&apps, "bar.999").is_err());
+        // An app really named `a.1` is matched by its name, not read as
+        // a selector for an app `a` with pid 1.
+        let dotted = [app("a.1", 5), app("a", 1)];
+        assert_eq!(find(&dotted, "a.1").unwrap().pid, 5);
+    }
+
+    #[test]
+    fn a_dead_app_is_pruned_and_stops_making_a_name_ambiguous() {
+        // A pid that cannot exist: far above the kernel's maximum, so
+        // `/proc/<pid>` is certainly absent.
+        const DEAD: u32 = u32::MAX - 7;
+        let me = std::process::id();
+        let dir = std::env::temp_dir().join(format!("hey-prune-{me}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A live app, a ghost of the same name, and a socket whose pid
+        // is alive but which nothing listens on — pid 1, which is alive
+        // by definition, so only the `connect` can tell. That is the
+        // pid-reuse case: a plain file refuses with ECONNREFUSED.
+        let live = dir.join(format!("bar.{me}.sock"));
+        let _listener = std::os::unix::net::UnixListener::bind(&live).unwrap();
+        let ghost = dir.join(format!("bar.{DEAD}.sock"));
+        std::fs::write(&ghost, b"").unwrap();
+        let reused = dir.join("bar.1.sock");
+        std::fs::write(&reused, b"").unwrap();
+        assert!(pid_alive(1), "pid 1 is alive, so only `connect` can tell");
+
+        assert_eq!(list_apps(&dir).len(), 3, "all three are files");
+        let apps = prune(list_apps(&dir));
+        assert_eq!(apps.len(), 1, "but only one is an app: {apps:?}");
+        assert_eq!(apps[0].pid, me);
+        assert!(!ghost.exists(), "the ghost's socket is unlinked");
+        assert!(!reused.exists(), "and so is the one nothing answers on");
+        assert!(live.exists(), "the live one is left alone");
+        // Which is the whole point: the name resolves again.
+        assert_eq!(find(&apps, "bar").unwrap().pid, me);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

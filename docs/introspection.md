@@ -82,6 +82,66 @@ outside `[A-Za-z0-9._-]` replaced by `_`; the pid disambiguates two
 copies of the same app. The socket is unlinked when the app exits
 normally.
 
+### Sockets that outlive their app
+
+A `SIGTERM` or a `SIGKILL` does not run the app's cleanup, so the socket
+file stays. `nitro-session` *restarts* a shell piece that dies, so those
+leftovers used to accumulate by themselves, and the directory would end
+up holding one live bar and seven ghosts — at which point `hey nitro-bar
+list` refused to run, because the name was "ambiguous" between apps that
+no longer existed (#536, #544). The debugging tool you reach for when the
+bar misbehaves must not be the tool that stops working once it has.
+
+A socket is a **live app** when both halves hold:
+
+| test | catches |
+|---|---|
+| `/proc/<pid>` exists | the ordinary case: the app is gone |
+| `connect()` succeeds | the app is gone and its pid was reused |
+
+Neither alone is enough. The pid is in the file name, so it is the cheap
+first filter; but a pid is reused, and then only a `connect` tells a live
+app from a dead one's namesake. `connect` is not a timeout, either:
+`listen(2)` queues the connection in the kernel whether or not the app is
+currently in `accept`, so a busy app is never mistaken for a dead one,
+and `ECONNREFUSED` means there is no listener at all.
+
+Leftovers are pruned at the two moments that matter:
+
+* **`nitro_ui::introspect::Socket::bind`** sweeps the sibling
+  `<name>.*.sock` whose pid is dead before binding its own. A restarted
+  app therefore buries its own corpse, and the box recovers without
+  anyone running anything. Only the pid is consulted here — there is no
+  listener to ask yet — and only sockets of the same name, because
+  another app's leftovers are not this app's business.
+* **`hey`**, on every invocation, before it decides anything: before a
+  name is judged ambiguous, and before a listing is printed, since a
+  listing that names dead apps is the same lie in a friendlier voice.
+  Both halves of the test run here, and a socket that fails either is
+  unlinked (best effort, silently) and dropped from the set.
+  `nitro_ui::introspect::list_apps` does the same for in-process
+  readers.
+
+So a name is only **ambiguous** when two apps of that name are genuinely
+running, and then `hey` says which selector picks one:
+
+```text
+$ hey nitro-bar list
+hey: `nitro-bar` is ambiguous: nitro-bar.217436, nitro-bar.218864; name one, e.g. `hey nitro-bar.217436 …`
+$ hey nitro-bar.218864 list
+```
+
+`<name>.<pid>` — the socket's own file name without `.sock` — is accepted
+wherever an app is named, alongside a bare pid, an exact name and a
+unique name prefix.
+
+The toolkit installs **no signal handler**: an app killed with `SIGKILL`
+can never clean up after itself, so the reader has to be robust anyway,
+and once it is, a handler would only make the tidy case tidier at the
+cost of a signal handler in every app that links the toolkit. The
+leftover of a killed app is removed by that app's next start, or by the
+next `hey`, whichever comes first.
+
 **Security in M2 is the directory mode and nothing else**: any process of
 the same user that can open the socket can drive the app completely. That
 is the same trust boundary as the X11 socket, `$XDG_RUNTIME_DIR/wayland-0`
@@ -200,7 +260,13 @@ the callbacks fire:
 | `scroll` | `scroll_to <offset>`, `scroll_by <delta>` |
 | any | `set_name <text>` |
 
-An unknown action is `err unknown action`, never a panic.
+An unknown action is `err unknown action`, never a panic, and a `do`
+without both a path and an action says what one looks like:
+
+```text
+$ hey calc do 7
+do needs a path and an action, e.g. `hey calc do window/container[1]/7 click`
+```
 
 ### `watch <path|*>`
 

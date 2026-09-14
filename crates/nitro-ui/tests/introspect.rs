@@ -614,6 +614,67 @@ fn the_socket_is_removed_when_the_app_goes_away() {
 }
 
 #[test]
+fn a_stale_socket_is_swept_by_the_next_bind_and_never_listed() {
+    // The bug behind #536/#544: an app killed with SIGTERM or SIGKILL
+    // never runs its `Drop`, so its socket file outlives it. After a
+    // few restarts — which `nitro-session` now does by itself — the
+    // directory holds one live socket and several ghosts, and `hey
+    // <name>` calls the name ambiguous between them.
+    //
+    // The ghosts are planted rather than killed for real, because the
+    // fix has to work for the process that cannot clean up at all: a
+    // pid far above the kernel's maximum, so `/proc/<pid>` is certainly
+    // absent, and pid 1, which is alive by definition but whose socket
+    // here is a plain file nothing listens on — so only the `connect`
+    // can tell, which is the pid-reuse case it exists to catch.
+    const DEAD: u32 = u32::MAX - 11;
+    let me = std::process::id();
+    let (mut h, path) = harness();
+    let dir = h.socket_dir().unwrap();
+
+    let ghost = dir.join(format!("dialog.{DEAD}.sock"));
+    std::fs::write(&ghost, b"").unwrap();
+    let refused = dir.join("dialog.1.sock");
+    std::fs::write(&refused, b"").unwrap();
+    let other = dir.join(format!("calc.{DEAD}.sock"));
+    std::fs::write(&other, b"").unwrap();
+
+    // Neither ghost is an app, so neither is listed — and listing is
+    // what unlinks them, so any reader of the directory heals it.
+    let apps = nitro_ui::introspect::list_apps(&dir);
+    assert_eq!(apps.len(), 1, "only the live app is listed: {apps:?}");
+    assert_eq!(apps[0].pid, me);
+    assert_eq!(apps[0].path, path);
+    assert!(!ghost.exists(), "a dead pid's socket is gone");
+    assert!(!refused.exists(), "and so is one nothing answers on");
+    assert!(!other.exists(), "whichever app it belonged to");
+    assert!(path.exists(), "the live app's socket is untouched");
+
+    // And the app still works afterwards: the sweep touched files, not
+    // the listener.
+    let c = Client::connect(&path);
+    assert_eq!(c.ask(&mut h, "get window role").body, ["container"]);
+    drop(c);
+
+    // The other half: binding sweeps the dead siblings of its own name,
+    // which is what lets a restarted app clean up after its own corpse
+    // without anyone running `hey` at all.
+    std::fs::write(&ghost, b"").unwrap();
+    std::fs::write(&other, b"").unwrap();
+    let fresh =
+        nitro_ui::introspect::Socket::bind_at(&dir.join(format!("dialog.{}.sock", DEAD - 1)))
+            .unwrap();
+    assert!(!ghost.exists(), "bind swept the dead `dialog` socket");
+    assert!(
+        other.exists(),
+        "but not another app's, which is not its business"
+    );
+    assert!(path.exists(), "nor the live one's");
+    drop(fresh);
+    let _ = std::fs::remove_file(&other);
+}
+
+#[test]
 fn paths_survive_a_label_changing_its_text() {
     // A label's *accessible* name is its text, which is not addressable
     // (it has spaces). Its path must therefore not change when the text

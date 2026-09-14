@@ -342,11 +342,85 @@ pub fn parse_socket_name(file: &str) -> Option<(String, u32)> {
     Some((name.to_owned(), pid.parse().ok()?))
 }
 
-/// Every app socket in `dir`, sorted by name then pid.
+/// Whether a process with `pid` still exists.
 ///
-/// A socket whose process is gone is still a file; the caller finds out
-/// by failing to connect, which is the only honest test (a pid check
-/// races with reuse).
+/// `/proc/<pid>` rather than `kill(pid, 0)`: nothing is signalled and no
+/// permission is needed. It races with pid reuse — a dead app's number
+/// handed to something else reads as alive — which is why it is only
+/// ever half the test; [`responds`] is the other half.
+#[must_use]
+pub fn pid_alive(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// Whether anything is listening on the socket at `path`.
+///
+/// The honest test, and the complement of [`pid_alive`]: `listen(2)`
+/// queues the connection whether or not the app ever calls `accept`, so
+/// a `connect` that succeeds proves a live listener rather than a
+/// prompt one, and a `connect` that is refused proves the file is a
+/// leftover. The connection is dropped immediately; the app accepts it,
+/// reads nothing and closes it, which costs it one loop turn.
+#[must_use]
+pub fn responds(path: &Path) -> bool {
+    UnixStream::connect(path).is_ok()
+}
+
+/// Whether `sock` is a leftover rather than a running app.
+///
+/// The pid check is the cheap one and runs first; the `connect` catches
+/// the case it cannot — a dead app whose pid has since been reused.
+#[must_use]
+pub fn stale(sock: &AppSocket) -> bool {
+    !pid_alive(sock.pid) || !responds(&sock.path)
+}
+
+/// Unlink every `<name>.<pid>.sock` in `dir` whose process is gone, and
+/// report how many went.
+///
+/// Called on [`Socket::bind`], which is the cheapest place to notice: an
+/// app killed with `SIGKILL` — or with `SIGTERM`, since the toolkit
+/// installs no handler — never runs its `Drop` and leaves its socket
+/// behind, and after a few restarts `hey <name>` is ambiguous between
+/// one live app and several ghosts (#536, #544). Restarting the app is
+/// exactly when that stops being true.
+///
+/// Only the pid is consulted, because there is no listener to ask yet
+/// and a `connect` to each sibling would be a syscall per ghost for no
+/// extra truth: `hey` does the `connect` half (see [`stale`]) and is
+/// the only reader that has to be right about pid reuse.
+///
+/// Best effort: a file that will not unlink (another copy of the app
+/// sweeping the same directory, say) is skipped silently. This is
+/// hygiene, not a transaction.
+pub fn sweep_dead(dir: &Path, name: &str) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for e in entries.flatten() {
+        let file = e.file_name();
+        let Some(file) = file.to_str() else { continue };
+        let Some((got, pid)) = parse_socket_name(file) else {
+            continue;
+        };
+        if got == name && !pid_alive(pid) && std::fs::remove_file(e.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Every **live** app socket in `dir`, sorted by name then pid; the
+/// leftovers of apps that are gone are unlinked on the way past.
+///
+/// A socket whose process is gone, or whose file nothing is listening
+/// on, is not an app — it is what a killed app left behind. Returning
+/// it would make `hey <name>` call a name ambiguous between one app and
+/// three ghosts, which is what `nitro-session` restarting the shell
+/// automatically turned from a curiosity into a daily failure (#544).
+/// Pruning here rather than at every call site is what makes *every*
+/// reader of the directory truthful, listings included.
 #[must_use]
 pub fn list_apps(dir: &Path) -> Vec<AppSocket> {
     let mut out = Vec::new();
@@ -357,11 +431,16 @@ pub fn list_apps(dir: &Path) -> Vec<AppSocket> {
         let file = e.file_name();
         let Some(file) = file.to_str() else { continue };
         if let Some((name, pid)) = parse_socket_name(file) {
-            out.push(AppSocket {
+            let sock = AppSocket {
                 name,
                 pid,
                 path: e.path(),
-            });
+            };
+            if stale(&sock) {
+                let _ = std::fs::remove_file(&sock.path);
+                continue;
+            }
+            out.push(sock);
         }
     }
     out.sort_by(|a, b| a.name.cmp(&b.name).then(a.pid.cmp(&b.pid)));
@@ -406,8 +485,9 @@ struct Client {
 }
 
 impl Socket {
-    /// Create the socket directory (`0700`), unlink a stale socket and
-    /// bind a non-blocking listener for `name`.
+    /// Create the socket directory (`0700`), sweep the sockets earlier
+    /// runs of this app left behind and bind a non-blocking listener
+    /// for `name`.
     ///
     /// # Errors
     /// Directory creation or bind failure.
@@ -431,6 +511,17 @@ impl Socket {
                 Err(e) => return Err(e),
             }
         }
+        // The sockets of *earlier* runs of this app, whose processes are
+        // gone. A restart is the cheapest moment to notice, and the one
+        // that makes the box recover on its own rather than accumulating
+        // ghosts until someone runs `hey` and is told a name is
+        // ambiguous. See [`sweep_dead`].
+        if let (Some(dir), Some(file)) = (path.parent(), path.file_name().and_then(|f| f.to_str()))
+            && let Some((name, _)) = parse_socket_name(file)
+        {
+            sweep_dead(dir, &name);
+        }
+        // And our own path, if a previous process with our pid left one.
         match std::fs::remove_file(path) {
             Ok(()) => {}
             Err(e) if e.kind() == ErrorKind::NotFound => {}
@@ -591,7 +682,9 @@ impl Socket {
             }
             "do" => {
                 let (Some(path), Some(action)) = (words.next(), words.next()) else {
-                    return err("do needs a path and an action");
+                    return err(
+                        "do needs a path and an action, e.g. `do window/container[1]/7 click`",
+                    );
                 };
                 let arg = rest_after(line, &[cmd, path, action]);
                 let arg = unescape(&arg);
@@ -1046,6 +1139,88 @@ mod tests {
         assert_eq!(parse_indexed("label"), Some(("label", 0)));
         assert_eq!(parse_indexed("button[x]"), None);
         assert_eq!(parse_indexed("button[2"), None);
+    }
+
+    #[test]
+    fn a_socket_whose_process_is_gone_is_stale() {
+        // A pid that cannot exist: the kernel's maximum is far below
+        // this, so `/proc/<pid>` is certainly absent.
+        const DEAD: u32 = u32::MAX - 7;
+        assert!(!pid_alive(DEAD));
+        let me = rustix::process::getpid().as_raw_nonzero().get() as u32;
+        assert!(pid_alive(me), "this process is running");
+
+        let dir = std::env::temp_dir().join(format!("nitro-stale-{me}-{:?}", {
+            std::thread::current().id()
+        }));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A leftover of a dead app, and a real listener of a live one.
+        let dead = dir.join(format!("ghost.{DEAD}.sock"));
+        std::fs::write(&dead, b"").unwrap();
+        let live = dir.join(format!("ghost.{me}.sock"));
+        let _listener = UnixListener::bind(&live).unwrap();
+
+        assert!(stale(&AppSocket {
+            name: "ghost".to_owned(),
+            pid: DEAD,
+            path: dead.clone(),
+        }));
+        assert!(!stale(&AppSocket {
+            name: "ghost".to_owned(),
+            pid: me,
+            path: live.clone(),
+        }));
+
+        // A file with a *live* pid that nothing listens on is stale too:
+        // that is the pid-reuse case the `connect` exists to catch.
+        let reused = dir.join(format!("other.{me}.sock"));
+        std::fs::write(&reused, b"").unwrap();
+        assert!(!responds(&reused));
+        assert!(stale(&AppSocket {
+            name: "other".to_owned(),
+            pid: me,
+            path: reused.clone(),
+        }));
+
+        // `list_apps` drops both and unlinks them.
+        let apps = list_apps(&dir);
+        assert_eq!(apps.len(), 1, "only the live app: {apps:?}");
+        assert_eq!(apps[0].pid, me);
+        assert!(!dead.exists(), "the ghost's socket is unlinked");
+        assert!(!reused.exists(), "and so is the one nothing answers on");
+        assert!(live.exists(), "the live one is left alone");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn binding_sweeps_the_dead_siblings_of_the_same_name() {
+        const DEAD: u32 = u32::MAX - 9;
+        let me = rustix::process::getpid().as_raw_nonzero().get() as u32;
+        let dir = std::env::temp_dir().join(format!("nitro-sweep-{me}-{:?}", {
+            std::thread::current().id()
+        }));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ghost = dir.join(format!("bar.{DEAD}.sock"));
+        std::fs::write(&ghost, b"").unwrap();
+        // Another app's ghost, and a file that is not a socket name at
+        // all: neither is ours to remove.
+        let other = dir.join(format!("calc.{DEAD}.sock"));
+        std::fs::write(&other, b"").unwrap();
+        let notes = dir.join("notes.txt");
+        std::fs::write(&notes, b"").unwrap();
+
+        let socket = Socket::bind_at(&dir.join(format!("bar.{me}.sock"))).unwrap();
+        assert!(!ghost.exists(), "the dead bar's socket is swept on bind");
+        assert!(other.exists(), "another app's socket is not ours to sweep");
+        assert!(notes.exists());
+        assert!(socket.path().exists());
+
+        drop(socket);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
