@@ -742,3 +742,56 @@ fn a_server_that_dies_during_startup_is_noticed_at_once() {
         "the wait ended when the server died, not at the timeout: {took:?}"
     );
 }
+
+/// A client that half-closes after its request still gets the reply.
+///
+/// Found on the box: `printf 'status\n' | nc -U …/session.sock` printed
+/// nothing, while a client that kept its socket open was answered fine.
+/// `nc` shuts its write end down the instant stdin ends, so the request
+/// line and the EOF arrive in the same wakeup — and the first version of
+/// `service_client` returned on the hangup before parsing the bytes that
+/// had already arrived.
+///
+/// It matters beyond `nc`: "send a request, half-close, read the reply"
+/// is the most natural way to write a one-shot client, and `just
+/// box-session status` is exactly that. The session must answer what it
+/// received before it honours a hangup, which is the rule `nitro-wire`'s
+/// own reader already follows.
+#[test]
+fn a_client_that_half_closes_after_its_request_still_gets_the_reply() {
+    let env = Env::new("half-close");
+    let mut config = env.config(vec![("nitro-server".to_owned(), server_args(&env))]);
+    config.pieces = vec![Piece {
+        program: "nitro-server",
+        role: Role::Server,
+    }];
+    let mut session = Session::start(config).expect("the session starts");
+
+    let mut sock = connect(session.socket_path());
+    pump(&mut session, Duration::from_secs(2), |_| true);
+    sock.write_all(b"status\n").unwrap();
+    // Exactly what `nc` does at stdin EOF.
+    sock.shutdown(std::net::Shutdown::Write).unwrap();
+
+    sock.set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let mut got = String::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !got.ends_with("\n\n") {
+        session.poll_once_for(None, Some(Duration::from_millis(10)));
+        let mut buf = [0u8; 1024];
+        match sock.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => got.push_str(&String::from_utf8_lossy(&buf[..n])),
+            Err(_) => {}
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a half-closed client was never answered: got {got:?}"
+        );
+    }
+    assert!(got.starts_with("ok\n"), "{got:?}");
+    assert!(got.contains("nitro-server "), "{got:?}");
+
+    session.teardown();
+}

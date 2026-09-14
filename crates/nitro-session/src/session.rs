@@ -559,15 +559,29 @@ impl Session {
     /// Read and answer one client's requests. Returns whether the client
     /// should be dropped.
     fn service_client(&mut self, k: usize) -> bool {
-        match self.clients[k].read() {
-            ReadOutcome::Closed => return true,
+        // A hangup is remembered rather than acted on, because the bytes
+        // that arrived *before* it are still requests. `nc -U sock`
+        // half-closes its write end the moment stdin ends, so
+        // `printf 'status\n' | nc -U session.sock` delivers the line and
+        // the EOF in the same wakeup: a loop that returned on `Closed`
+        // answered neither, and the socket looked dead from the one
+        // client every operator reaches for first. It did, until this
+        // comment.
+        //
+        // This is the same rule `nitro-wire`'s `ClientStream::read`
+        // follows for the same reason ("a hangup is remembered rather
+        // than raised at once, so the bytes that arrived before it can
+        // still be decoded"), and the line protocol has no excuse to be
+        // different.
+        let hung_up = match self.clients[k].read() {
+            ReadOutcome::Closed => true,
             ReadOutcome::Overflow => {
                 self.clients[k].send(power::err("request too long"));
                 self.clients[k].flush_blocking(REPLY_TIMEOUT);
                 return true;
             }
-            ReadOutcome::Open => {}
-        }
+            ReadOutcome::Open => false,
+        };
         while let Some(line) = self.clients[k].next_line() {
             match Command::parse(&line) {
                 Ok(cmd) => {
@@ -591,6 +605,13 @@ impl Session {
                     return true;
                 }
             }
+        }
+        if hung_up {
+            // Everything that arrived has been answered; now honour the
+            // hangup. The flush is blocking because the peer may already
+            // be waiting on the reply with nothing left to send.
+            self.clients[k].flush_blocking(REPLY_TIMEOUT);
+            return true;
         }
         let _ = self.clients[k].flush();
         false
