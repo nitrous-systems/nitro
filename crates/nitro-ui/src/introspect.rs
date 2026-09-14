@@ -345,9 +345,9 @@ pub fn parse_socket_name(file: &str) -> Option<(String, u32)> {
 /// Whether a process with `pid` still exists.
 ///
 /// `/proc/<pid>` rather than `kill(pid, 0)`: nothing is signalled and no
-/// permission is needed. It races with pid reuse — a dead app's number
-/// handed to something else reads as alive — which is why it is only
-/// ever half the test; [`responds`] is the other half.
+/// permission is needed. It is only ever half the test — a zombie and a
+/// reused pid both read as alive here, and [`responds`] is what catches
+/// them.
 #[must_use]
 pub fn pid_alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
@@ -359,8 +359,10 @@ pub fn pid_alive(pid: u32) -> bool {
 /// queues the connection whether or not the app ever calls `accept`, so
 /// a `connect` that succeeds proves a live listener rather than a
 /// prompt one, and a `connect` that is refused proves the file is a
-/// leftover. The connection is dropped immediately; the app accepts it,
-/// reads nothing and closes it, which costs it one loop turn.
+/// leftover — including for a zombie, which still has a `/proc` entry
+/// but no open fds. The connection is dropped immediately; the app
+/// accepts it, reads nothing and closes it, which costs it one loop
+/// turn.
 #[must_use]
 pub fn responds(path: &Path) -> bool {
     UnixStream::connect(path).is_ok()
@@ -369,7 +371,11 @@ pub fn responds(path: &Path) -> bool {
 /// Whether `sock` is a leftover rather than a running app.
 ///
 /// The pid check is the cheap one and runs first; the `connect` catches
-/// the case it cannot — a dead app whose pid has since been reused.
+/// the two cases it cannot. A **zombie** — a dead app not yet reaped by
+/// its parent — still has a `/proc/<pid>` entry but has closed its fds,
+/// so only the `connect` refuses it; that is every app killed under a
+/// supervisor, for as long as the reap takes. **Pid reuse** is the
+/// other: a dead app's number handed to something else.
 #[must_use]
 pub fn stale(sock: &AppSocket) -> bool {
     !pid_alive(sock.pid) || !responds(&sock.path)
@@ -385,10 +391,12 @@ pub fn stale(sock: &AppSocket) -> bool {
 /// one live app and several ghosts (#536, #544). Restarting the app is
 /// exactly when that stops being true.
 ///
-/// Only the pid is consulted, because there is no listener to ask yet
-/// and a `connect` to each sibling would be a syscall per ghost for no
-/// extra truth: `hey` does the `connect` half (see [`stale`]) and is
-/// the only reader that has to be right about pid reuse.
+/// Only the pid is consulted, because there is no listener to ask yet.
+/// That makes the sweep deliberately conservative: a sibling that is
+/// still a zombie, or whose pid has been reused, is left alone here and
+/// removed by the next [`list_apps`] or `hey`, both of which do the
+/// `connect` half too (see [`stale`]). Leaving a ghost one round too
+/// long is harmless; unlinking a live app's socket would not be.
 ///
 /// Best effort: a file that will not unlink (another copy of the app
 /// sweeping the same directory, say) is skipped silently. This is

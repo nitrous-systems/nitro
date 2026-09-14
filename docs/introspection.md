@@ -97,14 +97,21 @@ A socket is a **live app** when both halves hold:
 | test | catches |
 |---|---|
 | `/proc/<pid>` exists | the ordinary case: the app is gone |
-| `connect()` succeeds | the app is gone and its pid was reused |
+| `connect()` succeeds | the app is gone but its pid still resolves |
 
 Neither alone is enough. The pid is in the file name, so it is the cheap
-first filter; but a pid is reused, and then only a `connect` tells a live
-app from a dead one's namesake. `connect` is not a timeout, either:
-`listen(2)` queues the connection in the kernel whether or not the app is
-currently in `accept`, so a busy app is never mistaken for a dead one,
-and `ECONNREFUSED` means there is no listener at all.
+first filter; but two cases get past it, and only a `connect` sees them:
+
+* a **zombie** — a dead app whose parent has not reaped it yet keeps its
+  `/proc/<pid>` entry, so the pid check calls it alive. Its fds are
+  closed, so the `connect` is refused. This is the common case, not the
+  exotic one: every app killed under a supervisor is briefly a zombie.
+* **pid reuse** — a dead app's number handed to something else.
+
+`connect` is not a liveness timeout: `listen(2)` queues the connection in
+the kernel whether or not the app is currently in `accept`, so a busy app
+is never mistaken for a dead one, and `ECONNREFUSED` means there is no
+listener at all.
 
 Leftovers are pruned at the two moments that matter:
 

@@ -122,13 +122,14 @@ fn pid_alive(pid: u32) -> bool {
 
 /// Whether anything is listening on the socket at `path`.
 ///
-/// The half of the test a pid check cannot do: an app that died and
-/// whose pid has since been handed to something else still has a
-/// `/proc` entry, and only a `connect` tells the difference.
-/// `ECONNREFUSED` means no listener, which means a leftover file. It is
-/// not a liveness *timeout* either — `listen(2)` queues the connection
-/// in the kernel whether or not the app is in `accept` — so a busy app
-/// is never mistaken for a dead one.
+/// The half of the test a pid check cannot do. Two cases get past the
+/// pid: a **zombie** — a dead app not yet reaped keeps its `/proc/<pid>`
+/// entry but has closed its fds, which is every app killed under a
+/// supervisor for as long as the reap takes — and **pid reuse**. Both
+/// refuse the connection with `ECONNREFUSED`, which means no listener,
+/// which means a leftover file. It is not a liveness *timeout* either:
+/// `listen(2)` queues the connection in the kernel whether or not the
+/// app is in `accept`, so a busy app is never mistaken for a dead one.
 fn responds(path: &Path) -> bool {
     UnixStream::connect(path).is_ok()
 }
@@ -676,6 +677,59 @@ mod tests {
         // Which is the whole point: the name resolves again.
         assert_eq!(find(&apps, "bar").unwrap().pid, me);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_zombie_is_pruned_although_its_proc_entry_survives() {
+        // The case the pid check cannot see, and the common one rather
+        // than the exotic one: a killed app is a zombie until its
+        // parent reaps it, and a zombie keeps `/proc/<pid>` while having
+        // closed every fd. So the pid says "alive" and only the
+        // `connect` — refused, because the listener is gone with the
+        // process — tells the truth. Every app killed under a
+        // supervisor passes through this state.
+        //
+        // Reproduced exactly rather than simulated: fork a child that
+        // exits, and simply never wait for it.
+        let me = std::process::id();
+        let dir = std::env::temp_dir().join(format!("hey-zombie-{me}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn a child to zombify");
+        let zpid = child.id();
+        // Wait for it to die without reaping it: `try_wait` would reap,
+        // so poll `/proc/<pid>/stat` for the `Z` state instead.
+        let mut zombie = false;
+        for _ in 0..200 {
+            if let Ok(stat) = std::fs::read_to_string(format!("/proc/{zpid}/stat"))
+                && stat
+                    .rsplit(')')
+                    .next()
+                    .is_some_and(|s| s.split_whitespace().next() == Some("Z"))
+            {
+                zombie = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(zombie, "child {zpid} never became a zombie");
+        assert!(
+            pid_alive(zpid),
+            "a zombie keeps its /proc entry, so the pid check alone is fooled"
+        );
+
+        let ghost = dir.join(format!("bar.{zpid}.sock"));
+        std::fs::write(&ghost, b"").unwrap();
+        let apps = prune(list_apps(&dir));
+        assert!(apps.is_empty(), "the zombie is not an app: {apps:?}");
+        assert!(!ghost.exists(), "and its socket is unlinked");
+
+        child.wait().expect("reap");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
