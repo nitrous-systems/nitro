@@ -38,6 +38,42 @@ ExecStart=/home/kaspar/nitro-bin/nitro-session
 ExecStopPost=+/usr/bin/chvt 1
 Environment=RUST_BACKTRACE=1
 Environment=NITRO_LOG=info
+# ⚠ BOX-ONLY MITIGATION for issue #547, not a fix. It does not travel with
+# the binary: a server run outside this unit does not get it, which is the
+# footgun docs/testbox.md and docs/budget.md both record.
+#
+# `nitro-text`'s `FontDb::load` reads a whole font file in one `malloc`
+# (DejaVuSans is 759 720 bytes). glibc serves an allocation that large with
+# `mmap` and unmaps it on `free` — but it also *raises its mmap threshold to
+# the size of any mmap'd block it frees*, so the second font file of that
+# size comes out of the main arena instead, and an arena only shrinks from
+# the top. Our `free` is honest (`stats` reports `font_bytes 0` and
+# `font_loads == font_releases` at every sample); the bytes simply never
+# leave the process.
+#
+# This variable disables only the *dynamic adjustment*, pinning the
+# threshold at its 128 kB default. Measured on the box, `RssAnon` in kB,
+# shadow on, N `hello_dialog` windows:
+#
+#     windows           0       1       2       3
+#     glibc default  9 800  11 360  12 096  12 096   ← ratchets, never returns
+#     pinned         9 800   9 928   9 992  10 060   ← 64–128 kB per window
+#
+# 2 036 kB of idle floor, and the default row also *hides* the real
+# per-window cost: it looks like "two expensive windows then free ones" when
+# a decorated window actually costs ~86 kB (the ~66 kB wire receive buffer,
+# 6 scene nodes and the shaped title).
+#
+# The real fix is to make the font bytes file-backed rather than anonymous —
+# `mmap` the file in `nitro-text`. That is option 3 of #547 and it is NOT
+# available under this tree's lints: `memmap2`'s `Mmap::map` is an `unsafe
+# fn`, so it would need an `unsafe_code` exception, and `unsafe_code =
+# "deny"` with exactly one sanctioned exception (nitro-seat) is a rule worth
+# more than 2 MB on one test box. `mallopt(M_MMAP_THRESHOLD, …)` (option 2)
+# is libc FFI and the same problem, for a knob that is a no-op on musl.
+# Revisit if a memmap2 release offers a safe file mapping, or if the server
+# ever gains a sanctioned `unsafe` boundary for its own reasons.
+Environment=MALLOC_MMAP_THRESHOLD_=131072
 Restart=no
 # 3.3 GB box, no swap: a runaway desktop must die before the box does.
 #

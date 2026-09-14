@@ -132,6 +132,7 @@ as long as it did. The server's current, audited line is in
 | `nitro-server` **+ shadow (#539)** | 2 | **15 888 kB** | 18 460 kB | — | **deliberately over; see "The 8 MB the shadow buffer costs"** |
 | `nitro-server`, **anon only**, `NITRO_SHADOW=0` (#538) | 0 | **2 424 kB** | — | `RssAnon` ≤ 2.5 MB | **ok**, 97 % |
 | `nitro-server`, **anon only**, `NITRO_SHADOW=0` (#538) | 5 | **3 980 kB** | — | + 100 kB/window → 2.9 MB | over — the #547 allocator ratchet, see below |
+| `nitro-server`, **anon only**, unit's `MALLOC_MMAP_THRESHOLD_` (#547) | 3 | **10 060 kB** shadow on, i.e. **1 960 kB** anon | — | + 100 kB/window → 2.8 MB | **ok** — the ratchet mitigated, 64–128 kB per window |
 | `nitro-server`, **file-backed** (#538) | 0–5 | **7 252 kB** | — | `RssFile` ≤ 7.5 MB | **ok**, and flat in windows |
 | `nitro-calc` | 1 | **2 752 kB** | **2 752 kB** | ≤ 3 MB (client) | **ok**, 92 % |
 | `nitro-settings` (M4-C) | 1 | **2 872 kB** | **2 872 kB** | ≤ 3.5 MB (M4-C) | **ok**, 82 % |
@@ -521,14 +522,55 @@ pinned, `RssAnon` at zero dialogs is 9 784 kB, and 9 784 − 8 100 (the
 `MALLOC_TRIM_THRESHOLD_` alone does the same work, because it is the same
 dynamic-adjustment machinery; setting both is no better than either.
 
-**This is recorded, not fixed, and deliberately so.** The fix is either an
-environment variable in the unit — which does not travel with the binary
-and which `docs/testbox.md` would have to carry as a footgun — or reading
-font files into an allocation that does not go through the general
-allocator at all, which means `mmap` in `nitro-text` and a new `unsafe`
-exception, or the `memmap2` already in the tree via `xkbcommon` becoming a
-direct dependency. Both are real changes with a real review cost, and
-neither belongs in an audit. Filed as #547 with these numbers.
+**Mitigated on the box, not fixed in the product** (issue #547, resolved by
+the M4 hygiene pass). `deploy/nitro-dev.service` now sets
+`MALLOC_MMAP_THRESHOLD_=131072`, and the unit carries the full reasoning
+beside the line. Re-measured with the shadow **on** (as shipped), `RssAnon`
+in kB, `nitro-session` desktop plus N `hello_dialog` windows, settled:
+
+| windows | 0 | 1 | 2 | 3 |
+|---|---|---|---|---|
+| glibc default | 9 800 | 11 360 | 12 096 | 12 096 |
+| **threshold pinned** | **9 800** | **9 928** | 9 992 | **10 060** |
+| per-window delta, pinned | — | 128 | 64 | 68 |
+
+Two runs of each, the pinned pair identical to within 4 kB. Subtracting the
+8 100 kB shadow, the pinned floor is **1 700 kB** against the 1 684 kB the
+no-shadow measurement predicted — the ratchet is gone, and the residual
+16 kB is one page-rounded allocation, not a third mechanism. The default
+row ratchets **2 296 kB** over two windows and never returns; the pinned row
+shows what a decorated window really costs, ~86 kB, which is the ~66 kB wire
+receive buffer plus 6 scene nodes plus the shaped title. `stats` at every
+sample: `font_bytes 0`, `font_loads == font_releases` (11/11),
+`font_evictions 0` — the sweep is doing its job and the residue is entirely
+the allocator's.
+
+**It is a mitigation because it does not travel with the binary.** A server
+started outside the unit still ratchets, which is a footgun
+`docs/testbox.md` now carries: two `RssAnon` numbers taken inside and
+outside the unit differ by ~2 MB and are not comparable.
+
+**The real fix is option 3 of the issue — make the font bytes file-backed —
+and it is not available under this tree's lints.** `FontDb::load` would
+`mmap` the file instead of `std::fs::read`-ing it, which is what a font file
+wants anyway (read-only, page-aligned, shareable between processes, and
+evictable by the kernel) and is what the #538 audit assumed was already
+happening. Promoting `memmap2` — already in the tree transitively via
+`xkbcommon`, so no new external crate — to a direct dependency of
+`nitro-text` was the preferred route and **does not work**: every
+file-mapping entry point it offers is an `unsafe fn` (`Mmap::map`,
+`MmapOptions::map`, `map_copy_read_only`; `map_raw` is safe but hands back
+a raw pointer that needs `unsafe` to read). The `unsafe` genuinely is at
+*our* call site, not inside the dependency, because the hazard is real: a
+mapped file truncated under us is a SIGBUS, and only the caller can promise
+it will not be. `mallopt(M_MMAP_THRESHOLD, …)` (option 2) is libc FFI and
+the same problem, for a glibc-specific knob that is a no-op on musl.
+
+So the trade is: **2 MB of resident memory on one test box against the
+`unsafe_code = "deny"` rule with its single sanctioned exception.** The rule
+is worth more. Revisit if `memmap2` ever offers a safe file mapping, or if
+the server acquires a sanctioned `unsafe` boundary for some other reason —
+at which point option 3 is a small change and the right one.
 
 ### The revised budget line
 
@@ -549,7 +591,15 @@ excused): floor **2 424 kB**, five windows **3 980 kB**, `RssFile`
 **7 252 kB**, shadow **8 100 kB**. Nothing here is rounded down: 2.5 MB is
 above the measured 2 424 kB floor, and the 100 kB/window is above the
 86 kB measured with the allocator behaving, chosen so the line still holds
-when the ratchet is fixed and the floor drops to 1 684 kB.
+when the ratchet is mitigated and the floor drops to ~1 700 kB.
+
+It now is, under the unit: with `MALLOC_MMAP_THRESHOLD_` set the same box
+reads **1 700 kB** at the floor and **1 960 kB** at three windows (shadow
+on, minus the 8 100 kB shadow), so both halves of the line have room. The
+figures above are kept as the *unmitigated* measurement, because the
+mitigation is a property of the unit rather than of the binary — see the
+#547 section — and a budget that quotes only the lucky configuration is the
+kind of number this page exists to avoid.
 
 What the 9.5 MB of a real, shipped, shadow-on server with a desktop on it
 consists of, in one paragraph: **7.2 MB is file-backed** — the server's

@@ -61,6 +61,18 @@ $ just box-session suspend    # systemctl suspend, via the session
 - **No swap, 3.3 GB.** Never run overlapping `perf record`s; cap
   `--call-graph=dwarf,N` at N ≤ 8192 or use `fp`. The unit has
   `MemoryMax=1G`. The box once needed a power cycle after a perf pile-up.
+- **The unit sets `MALLOC_MMAP_THRESHOLD_=131072`, and that is a
+  box-only mitigation rather than a product fix** (issue #547). Without it
+  glibc's dynamic mmap threshold ratchets up when the second font file is
+  freed, and ~2 MB of released font bytes stay resident in the server for
+  the life of the process. **A server you start by hand does not get it**,
+  so a `RssAnon` measured outside the unit is ~2 MB higher than one taken
+  under it, and the two are not comparable — say which you measured. The
+  effect is also what makes a decorated window *look* like it costs
+  ~740 kB and then nothing: pinned, it costs ~86 kB every time. The real
+  fix is file-backed font bytes in `nitro-text`, which needs an `unsafe`
+  exception this tree does not grant; `docs/budget.md` has the numbers and
+  the argument.
 - **HW cursor is not in screenshots** (composited at scan-out). If a test
   needs the cursor, draw a software cursor in a debug mode.
 - **libinput pointer acceleration is non-linear** for `ydotool`, in
