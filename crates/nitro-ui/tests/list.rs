@@ -488,3 +488,63 @@ fn a_script_can_select_and_activate_a_row_by_index() {
         nitro_ui::introspect::invoke(ui, state, "window/rows", "select", Some("99999")).is_err()
     );
 }
+
+#[test]
+fn a_palette_change_repaints_every_row() {
+    // Found on the box, and invisible to every other test in this file.
+    //
+    // `List`'s per-slot cache answers "unchanged" from the row index,
+    // the model generation and the selection — all three of which are
+    // still true after a desktop-wide scheme switch, when every colour
+    // has moved. So a settled list answered `cx.keep` for every row and
+    // went on painting the *old* scheme's text: on screen, a file list
+    // in dark-scheme grey on a light window, with `hey get rows text`
+    // reporting perfectly correct content. The instrument agreeing with
+    // the code because it was measuring the layer below the broken one,
+    // for the fourth time in this milestone.
+    let (mut h, id) = list_of(1_000, 200.0);
+    let visible = h.widget::<List<Vec<usize>>>(id).visible_rows().len();
+    assert!(visible > 1, "the list materialises rows to repaint");
+
+    // Settled: the next flush sends nothing at all.
+    h.tap();
+    h.clear_tap();
+    h.settle();
+    assert_eq!(ops(&h), Vec::<&str>::new(), "the list really is settled");
+
+    h.ui().set_palette(nitro_core::Palette::dark());
+    h.settle();
+
+    // Every materialised row re-emitted its text, not just the ones a
+    // selection touched. Two runs per row (label and detail), so the
+    // count is a lower bound rather than an equality — what matters is
+    // that it scales with the rows on screen instead of being zero.
+    let texts = count(&h, "SetText");
+    assert!(
+        texts >= visible,
+        "a scheme switch repaints every materialised row: {texts} SetTexts for {visible} rows"
+    );
+
+    // And it is still one commit, because the whole point is that a
+    // switch costs one transaction per client.
+    assert_eq!(count(&h, "Commit"), 1, "one commit for the whole switch");
+
+    // Idle again afterwards: a widget that marked itself dirty and never
+    // cleared the flag would repaint for ever.
+    h.clear_tap();
+    h.settle();
+    assert_eq!(
+        ops(&h),
+        Vec::<&str>::new(),
+        "settled again after the switch"
+    );
+
+    // The same palette twice is not a change.
+    h.ui().set_palette(nitro_core::Palette::dark());
+    h.settle();
+    assert_eq!(
+        ops(&h),
+        Vec::<&str>::new(),
+        "an unchanged palette is silence"
+    );
+}

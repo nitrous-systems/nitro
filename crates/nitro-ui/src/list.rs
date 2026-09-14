@@ -237,6 +237,20 @@ pub struct List<S> {
     /// the row height, the model), so the next paint re-emits them all
     /// rather than trusting the per-slot cache.
     dirty_rows: bool,
+    /// The colours and style the rows currently on screen were painted
+    /// with, so a paint can tell whether the *look* changed as well as
+    /// the content.
+    ///
+    /// The per-slot cache keys on "is this the same row, selected the
+    /// same way" — which is exactly right for a model change and
+    /// exactly wrong for a theme change, because every one of those
+    /// answers is still true when every colour has moved. Without this
+    /// field a desktop-wide scheme switch left a settled list painting
+    /// the old scheme's text for ever: `Ui::set_palette` marked the
+    /// widget, the widget re-ran `paint`, and `paint` answered
+    /// `cx.keep` for every row. Found on the box, with a file list in
+    /// dark-scheme grey on a light window.
+    painted_with: Option<RowPaint>,
     /// Invoked on Enter or a double-click.
     on_activate: Option<IndexFn<S>>,
     /// Invoked whenever the cursor lands on a different row.
@@ -275,6 +289,7 @@ impl<S: 'static> Default for List<S> {
             prefix_at: None,
             last_click: None,
             dirty_rows: true,
+            painted_with: None,
             on_activate: None,
             on_select: None,
         }
@@ -618,6 +633,11 @@ impl<S: 'static> List<S> {
 
 /// The colours one paint of a list draws with, resolved from the theme
 /// once rather than per row.
+///
+/// Compared between paints as well as used by them: a row whose *style*
+/// changed is not an unchanged row, however unchanged its text is. See
+/// [`List::paint`].
+#[derive(Clone, PartialEq)]
 struct RowPaint {
     style: TextStyle,
     text: Color,
@@ -793,6 +813,15 @@ impl<S: 'static> Widget<S> for List<S> {
             detail: theme.text_disabled,
             selection: theme.selection,
         };
+        // A colour or font change invalidates every materialised row,
+        // and nothing else here would notice: the per-slot cache keys on
+        // the row index, the generation and the selection, all three of
+        // which are unchanged when the desktop switches scheme. See
+        // `painted_with`.
+        if self.painted_with.as_ref() != Some(&paint) {
+            self.dirty_rows = true;
+            self.painted_with = Some(paint.clone());
+        }
         // A widget that paints nothing is not hit-tested by the server,
         // so an empty list would never see a click. One rect fixes that
         // and costs one node.
