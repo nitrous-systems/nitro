@@ -367,7 +367,26 @@ fn the_clock_updates_exactly_once_at_the_minute_boundary() {
     // 1970-01-01 09:41:30 UTC, so the boundary is 30 s away. Pinned
     // before the tree is built, because the clock's first timer is armed
     // from it as the tree is built.
-    let mut h = bar(Bar::new().with_fake_time_ms((9 * 3600 + 41 * 60 + 30) * 1000));
+    //
+    // The sensors are pinned to a constant reading for the reason
+    // `SensorSource` gives: this test advances the timers a cumulative
+    // 30 001 ms, and since M4-B2 took `POLL_MS` from 5 s to 30 s that
+    // crosses a sensor poll, which lands in the *same* `run_timers` batch
+    // as the clock tick. With the real `/proc` behind it the load average
+    // moves on a busy machine, the load label repaints, and the "exactly
+    // one SetText" assertion below counts two — a failure that says only
+    // that the test host was loaded. Reproduced on a 128-core box at
+    // roughly 1 run in 12 with eight spinners running, on `main` as well
+    // as here, which is what identified it as this test's bug rather than
+    // a regression in whatever branch happened to hit it.
+    let steady = nitro_bar::Readings {
+        battery: Some("87%".to_owned()),
+        load: Some("0.4".to_owned()),
+        mem: Some("1.2/3.3G".to_owned()),
+    };
+    let mut h = bar(Bar::new()
+        .with_fake_time_ms((9 * 3600 + 41 * 60 + 30) * 1000)
+        .with_sensors(move || steady.clone()));
     h.settle();
     let before = h.state().ticks();
     let shown = h.state().clock_text().to_owned();
