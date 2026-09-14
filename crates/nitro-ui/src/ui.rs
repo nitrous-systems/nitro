@@ -178,6 +178,13 @@ pub struct Ui<S> {
     /// handler is handed `&mut Ui<S>`, so it must not be reachable
     /// through the tree it is holding.
     frame_handlers: Vec<Option<FrameHandler<S>>>,
+    /// Window-resize handlers, in registration order; see
+    /// [`Ui::on_resize`].
+    ///
+    /// `Option` for the same reason a widget leaves its arena slot: a
+    /// handler is handed `&mut Ui<S>`, so it must not be reachable
+    /// through the tree it is holding.
+    resize_handlers: Vec<Option<ResizeHandler<S>>>,
     /// Whether a `RequestFrame` is outstanding, so asking twice in one
     /// turn does not put two requests on the wire.
     frame_requested: bool,
@@ -194,6 +201,9 @@ type ShellHandler<S> = Box<dyn FnMut(&mut S, &mut Ui<S>, &crate::shell::ShellEve
 
 /// A frame-callback handler; see [`Ui::on_frame`].
 type FrameHandler<S> = Box<dyn FnMut(&mut S, &mut Ui<S>, Frame)>;
+
+/// A window-resize handler; see [`Ui::on_resize`].
+type ResizeHandler<S> = Box<dyn FnMut(&mut S, &mut Ui<S>, Size)>;
 
 /// What the server says when it answers a [`Ui::request_frame`].
 ///
@@ -269,6 +279,7 @@ impl<S: 'static> Ui<S> {
             app_id: String::new(),
             shell_handlers: Vec::new(),
             frame_handlers: Vec::new(),
+            resize_handlers: Vec::new(),
             frame_requested: false,
             window_title: String::new(),
             window_limits: None,
@@ -1229,6 +1240,61 @@ impl<S: 'static> Ui<S> {
         }
     }
 
+    /// Register a handler for window resizes.
+    ///
+    /// Called after a `Configure` has been applied — the window size and
+    /// scale are already the new ones and the tree is marked for layout
+    /// — and handed `&mut S` and `&mut Ui<S>` like every other callback,
+    /// so it can do the work a *resize* implies rather than the work a
+    /// re-layout implies.
+    ///
+    /// Those are different things, which is why this hook exists at all.
+    /// Laying the tree out again is the framework's job and needs no
+    /// help. But an app whose content is measured in its own units — a
+    /// terminal's cells, a canvas's tiles — has to *recompute how much
+    /// content fits*, and may have to tell something outside the process
+    /// about it: `nitro-term` turns the new pixel size into a column and
+    /// row count, reflows its grid and sends `TIOCSWINSZ` so the child
+    /// gets `SIGWINCH`. None of that can be expressed as a `measure`,
+    /// because `measure` answers "how big would you like to be" and this
+    /// is "you are this big now, deal with it".
+    ///
+    /// A list rather than a widget hook, for the same reason
+    /// [`Ui::on_frame`] and [`Ui::on_shell`] are: a new window size is
+    /// news about the *window*, with no position to hit-test and no
+    /// focus to follow. Every handler sees every resize; there is
+    /// nothing to consume. A `Configure` that does not change the size
+    /// fires nothing.
+    pub fn on_resize(&mut self, handler: impl FnMut(&mut S, &mut Ui<S>, Size) + 'static) {
+        self.resize_handlers.push(Some(Box::new(handler)));
+    }
+
+    /// How many resize handlers are registered.
+    #[must_use]
+    pub fn resize_handler_count(&self) -> usize {
+        self.resize_handlers.len()
+    }
+
+    /// Offer a new window size to the resize handlers, oldest first.
+    ///
+    /// Public for the same reason [`Ui::dispatch_frame`] is: an app
+    /// driving `Ui` by hand, and the test harness, dispatch messages
+    /// themselves. [`Ui::dispatch`] calls it for a real `Configure`.
+    pub fn dispatch_resize(&mut self, state: &mut S, size: Size) {
+        for i in 0..self.resize_handlers.len() {
+            // Out of the list for the call, for the same reason a widget
+            // leaves its slot: the handler is handed the `Ui` the list
+            // lives in.
+            let Some(mut h) = self.resize_handlers.get_mut(i).and_then(Option::take) else {
+                continue;
+            };
+            h(state, self, size);
+            if let Some(slot) = self.resize_handlers.get_mut(i) {
+                *slot = Some(h);
+            }
+        }
+    }
+
     /// Open this window as a shell surface: a bar, dock, launcher or
     /// wallpaper rather than an ordinary application window.
     ///
@@ -1723,7 +1789,16 @@ impl<S: 'static> Ui<S> {
             ServerMsg::Configure(c) => {
                 self.scale = c.scale;
                 self.window_position = c.position;
+                let changed = self.window_size != c.size;
                 self.resize(c.size);
+                // After the resize, so a handler sees the new size in
+                // `window_size` and can mark the tree itself; and only
+                // when the size actually moved, because the server also
+                // sends a `Configure` for a move or a scale change and
+                // an app should not reflow its content for those.
+                if changed {
+                    self.dispatch_resize(state, c.size);
+                }
             }
             ServerMsg::Closed(_) => self.quit = true,
             ServerMsg::PointerEnter(e) => self.pointer_move(state, e.pos),

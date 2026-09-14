@@ -104,13 +104,24 @@ what "a slot the paint did not emit is destroyed" gives it. A terminal's
 slots are its *content*, and it needs a third answer: not "emit" and not
 "omit" but "unchanged". See `docs/ui.md`.
 
-**3. The scene is touched once per frame, not once per byte.** Bytes are
-drained from the pty the moment they arrive — the child must never block
-on a full pipe — but they go only into the grid, which marks the widget
-dirty. The *scene* catches up in the app's frame callback
-(`Ui::request_frame`, also new). So a hundred thousand lines cost one
-commit per refresh, each showing the grid as it stood at that moment. The
-intermediate states were never visible and did not need to be drawn.
+**3. The scene is touched once per frame, not once per wakeup.** Bytes
+are drained from the pty the moment they arrive — the child must never
+block on a full pipe — but they go only into the grid: `feed` marks the
+*grid*, which records its own damage, and deliberately does **not** mark
+the widget. `paint_dirty_rows` does, and the app calls it from its frame
+callback (`Ui::request_frame`, also new).
+
+That split is the whole mechanism, and it is worth stating precisely
+because it is easy to undo by accident. `App`'s loop flushes after
+**every** wakeup, and a flush paints whatever is marked — so whichever of
+the two marks the widget decides the commit rate. Marking in `feed` also
+*looks* right and measures fine on a bulk writer like `seq`, because the
+256 KiB drain cap already bounds it to about thirty commits; the case
+that separates the two designs is a slow chatty writer, a build log at a
+few hundred small writes a second, where marking on arrival is hundreds
+of commits against sixty frames.
+`the_scene_is_touched_once_per_frame_not_once_per_wakeup` is that writer,
+and it fails if `feed` marks the widget.
 
 And when nothing is happening, nothing is asked for: no frame is
 requested when the grid has no damage, so the app sits in `epoll_wait`

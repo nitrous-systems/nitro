@@ -409,6 +409,24 @@ impl<S: 'static> Harness<S> {
         self.settle();
     }
 
+    /// Run the tree's passes and commit if anything is dirty, exactly as
+    /// the app loop does at the end of every wakeup.
+    ///
+    /// [`Harness::settle`] flushes too, but it also pumps until quiet;
+    /// this is the single unconditional flush `event_loop_with` performs
+    /// after *every* turn, which is the thing a test simulating one turn
+    /// of the real loop has to reproduce. Leaving it out is how a cost
+    /// test ends up asserting pacing the harness supplied rather than
+    /// pacing the app implements.
+    ///
+    /// Returns whether a commit was sent.
+    ///
+    /// # Panics
+    /// On a wire failure.
+    pub fn flush(&mut self) -> bool {
+        self.ui.flush().expect("flush")
+    }
+
     /// Deliver a frame callback to the app's [`Ui::on_frame`] handlers,
     /// as the server's `Frame` would.
     ///

@@ -448,6 +448,18 @@ as it arrives and touches the *tree* only in the handler — so a hundred
 thousand lines of output cost one commit per refresh rather than one per
 line, each showing the state as it stood at that moment.
 
+**"Only in the handler" is the load-bearing half**, and it is a rule
+about `request_paint`, not about intent. The app loop flushes after
+**every** wakeup and a flush paints whatever is marked, so an app that
+marks a widget dirty as the data arrives commits once per wakeup no
+matter how carefully it also registered a frame handler. The frame
+callback has to be the thing that calls `request_paint`; arrival updates
+the model and nothing else. `nitro-term` splits it exactly that way —
+`feed` marks its grid, `paint_dirty_rows` marks the widget — and shipped
+briefly with the mark in the wrong place, measuring plausibly the whole
+time, because a bulk writer is bounded by its read chunk either way. A
+slow chatty writer is what tells the two apart.
+
 Three properties make it safe to build on:
 
 * **One request, one answer.** Asking twice before the answer arrives
@@ -479,6 +491,31 @@ terminal that forwarded each one would commit — and make the server
 relist its windows — once per command the user runs. Limits set before
 the window exists ride its first commit, for the reason a shell surface's
 anchor does.
+
+### Resizes, for an app whose content has its own units
+
+`ui.on_resize(|s, ui, size| ..)` is offered every `Configure` that
+actually changed the window's size, after it has been applied — so the
+handler sees the new `window_size` and a tree already marked for layout.
+
+Laying the tree out again is the framework's job and needs no hook. This
+one exists for the *other* thing a resize can mean: an app whose content
+is measured in its own units has to recompute how much content fits, and
+may have to tell something outside the process. `nitro-term` turns the
+new pixel size into a column and row count, reflows its grid, and sends
+`TIOCSWINSZ` so the child gets `SIGWINCH` — none of which is expressible
+as a `measure`, because `measure` answers "how big would you like to be"
+and a resize says "you are this big now".
+
+A handler list rather than a widget hook, for the reason `on_frame` and
+`on_shell` are: a new size is news about the *window*, with no position
+to hit-test and no focus to follow. A `Configure` that only moved the
+window or changed its scale fires nothing, so an app does not reflow its
+content because the user dragged its titlebar.
+
+In a test, `Harness::configure(size)` goes through the ordinary dispatch
+path, so it fires the hook — which is what lets a resize test assert that
+*a resize* works rather than that the app's resize function works.
 
 ## Shell surfaces
 

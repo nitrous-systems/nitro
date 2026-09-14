@@ -50,11 +50,17 @@
 //! The loop below is the reason `seq 1 1000000` does not melt the
 //! compositor. Bytes are drained from the pty the instant they arrive —
 //! the child must never block on a full pipe — but they go only into the
-//! grid. Touching the *scene* waits for a frame callback
-//! ([`Ui::request_frame`]), so a hundred thousand lines produce one
-//! commit per refresh, each showing the grid as it stands at that
-//! moment. The intermediate states were never visible and did not need
-//! to be drawn.
+//! grid, and [`widget::TermGridMut::feed`] deliberately does **not**
+//! mark the widget for paint. [`widget::paint_dirty_rows`] does, from
+//! the frame callback ([`Ui::request_frame`]).
+//!
+//! The split matters because [`App`]'s loop flushes after *every*
+//! wakeup and a flush paints whatever is marked: marking on arrival
+//! would commit once per epoll wakeup that carried data, which for a
+//! chatty writer is hundreds a second against sixty frames. Marking in
+//! the callback makes it one commit per refresh, each showing the grid
+//! as it stands at that moment — the intermediate states were never
+//! visible and did not need to be drawn.
 //!
 //! And when nothing is happening, nothing is asked for: no frame is
 //! requested when the grid has no damage, so the app sits in
@@ -276,11 +282,6 @@ pub fn sync_size(state: &mut TermApp, ui: &mut Ui<TermApp>) {
     let _ = state.pty.resize(cols as u16, rows as u16);
 }
 
-/// Build the tree: one grid widget, filling the window.
-///
-/// # Panics
-/// Never in practice: the only `attach` names an id built one line
-/// above, and a fresh id cannot be stale.
 /// Build the tree: a container holding the grid, which fills it.
 ///
 /// The container is not decoration. `hey nitro-term get grid text` has
@@ -380,15 +381,28 @@ pub fn install(ui: &mut Ui<TermApp>, state: &mut TermApp, grid: WidgetId) -> Res
             ui.quit();
         }
     })?;
-    // The frame callback is the only place the scene is touched by
-    // output. The widget is already paint-dirty by the time we get here
-    // (`feed` marked it), so all this does is let `flush` happen — and
-    // then ask for the *next* frame if the grid moved on while this one
-    // was in flight, which keeps exactly one request outstanding.
+    // The frame callback is the only place output touches the scene, and
+    // this is where that is made true rather than merely claimed:
+    // `feed` marks the *grid*, and `paint_dirty_rows` marks the
+    // *widget*. The app loop flushes after every wakeup, so whichever of
+    // the two marks the widget decides the commit rate — per wakeup if
+    // `feed` did it, per frame if this does.
+    //
+    // Asking for the next frame *after* marking keeps exactly one
+    // request outstanding: if the grid is still dirty (it will not be,
+    // since the flush after this handler draws it) or becomes dirty
+    // again before the flip, the next drain asks.
     ui.on_frame(move |s: &mut TermApp, ui: &mut Ui<TermApp>, _f| {
         s.frames += 1;
-        let _ = crate::widget::request_frame_if_dirty(ui, grid);
+        crate::widget::paint_dirty_rows(ui, grid);
     });
+    // The window's size is the grid's size, and nothing else will tell
+    // us it changed. This is the hook that makes a dragged window a
+    // reflowed grid and a `SIGWINCH` for the child; without it the
+    // terminal keeps its start-up geometry for ever and `stty size`
+    // stays wrong, which is exactly the state this app was in until a
+    // review caught that only the *test* called `sync_size`.
+    ui.on_resize(|s: &mut TermApp, ui: &mut Ui<TermApp>, _size| sync_size(s, ui));
     // Ctrl-Shift-Q, not Ctrl-Q: a terminal must not steal a chord the
     // program inside it might want, and Ctrl-Q is XON.
     ui.set_shortcut(

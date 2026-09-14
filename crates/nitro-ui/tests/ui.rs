@@ -161,6 +161,54 @@ fn clicking_a_button_runs_the_callback_and_the_repaint_is_one_commit() {
 }
 
 #[test]
+fn a_resize_handler_sees_the_new_size_and_a_move_fires_nothing() {
+    // `on_resize` is for the work a resize implies that a re-layout does
+    // not: an app whose content has its own units (a terminal's cells)
+    // has to recompute how much of it fits, and may have to tell
+    // something outside the process — `nitro-term` sends `TIOCSWINSZ`
+    // from here.
+    //
+    // Two properties, and the second is why the hook filters rather than
+    // forwarding every `Configure`: the handler sees the *new* size
+    // already applied, and a `Configure` that only moved the window
+    // fires nothing, so an app does not reflow because the user dragged
+    // its titlebar.
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let seen: Rc<RefCell<Vec<Size>>> = Rc::new(RefCell::new(Vec::new()));
+    let mut h = Harness::sized("onresize", (), Size::new(200.0, 100.0), |ui: &mut Ui<()>| {
+        ui.build(column().child(label("hi")))
+    });
+    {
+        let seen = Rc::clone(&seen);
+        h.ui()
+            .on_resize(move |_s: &mut (), ui: &mut Ui<()>, size: Size| {
+                // The size is both the argument and already in `window_size`.
+                assert_eq!(ui.window_size(), size);
+                seen.borrow_mut().push(size);
+            });
+    }
+    assert_eq!(h.ui().resize_handler_count(), 1);
+
+    h.configure(Size::new(320.0, 120.0));
+    assert_eq!(
+        seen.borrow().as_slice(),
+        [Size::new(320.0, 120.0)],
+        "a real resize reaches the handler, with the new size"
+    );
+
+    // The same size again is not a resize.
+    h.configure(Size::new(320.0, 120.0));
+    assert_eq!(
+        seen.borrow().len(),
+        1,
+        "a Configure that changed nothing fires nothing"
+    );
+    h.quit();
+}
+
+#[test]
 fn a_configure_relayouts_the_tree() {
     let mut h = Harness::sized("resize", (), Size::new(200.0, 100.0), |ui: &mut Ui<()>| {
         let left = ui.build(label("left"));

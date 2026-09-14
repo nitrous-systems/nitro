@@ -23,14 +23,26 @@
 //! row's slots are unchanged without re-deriving their contents. On a
 //! keystroke that is one row out of fifty.
 //!
-//! **The scene is updated once per frame, not once per byte.** Bytes are
-//! drained from the pty the moment they arrive (so the child never
-//! blocks on a full pipe), but they go into the [`Grid`] only. The
-//! widget is marked dirty, and the *scene* catches up in the app's frame
-//! callback ([`Ui::request_frame`]). So `seq 1 1000000` costs one commit
-//! per frame at 60 Hz rather than one per line, and the grid the frame
-//! draws is the one the terminal had reached by then — the intermediate
-//! states were never on screen anyway.
+//! **The scene is updated once per frame, not once per wakeup.** Bytes
+//! are drained from the pty the moment they arrive (so the child never
+//! blocks on a full pipe), but they go into the [`Grid`] only: `feed`
+//! marks the *grid*, which records its own damage, and deliberately
+//! does **not** mark the widget. The widget is marked by
+//! [`paint_dirty_rows`], which the app calls from its frame callback
+//! ([`Ui::request_frame`]).
+//!
+//! That split is the whole mechanism, and it is load-bearing in a way
+//! that is easy to undo: `App`'s loop flushes after *every* wakeup and a
+//! flush paints whatever is marked, so whichever of the two marks the
+//! widget decides the commit rate. Marking in `feed` costs one commit
+//! per epoll wakeup that carried data — for a build log writing a few
+//! hundred small lines a second, hundreds of commits against sixty
+//! frames.
+//!
+//! So `seq 1 1000000` costs one commit per frame rather than one per
+//! line, and the grid each frame draws is the one the terminal had
+//! reached by then — the intermediate states were never on screen
+//! anyway.
 
 use std::os::fd::{AsFd as _, OwnedFd};
 
@@ -224,12 +236,12 @@ impl TermGrid {
 
     /// The colour a cell's foreground resolves to.
     fn fg_of(&self, style: Style) -> Color {
-        let (fg, bg) = if style.attrs.inverse() {
-            (style.bg, style.fg)
+        // Inverse swaps the two, which is the whole of what it means.
+        let fg = if style.attrs.inverse() {
+            style.bg
         } else {
-            (style.fg, style.bg)
+            style.fg
         };
-        let _ = bg;
         match fg {
             // Bold has meant "bright" on a sixteen-colour terminal since
             // the hardware could not do both, and every program still
@@ -271,9 +283,9 @@ impl TermGrid {
 
     /// Paint one row's runs into its slice of the slot space.
     ///
-    /// Returns the number of slots the row used, so the caller can leave
-    /// the rest for `end_paint` to destroy — a row that shrank from six
-    /// runs to two gives four nodes back.
+    /// A row that shrank from six runs to two simply stops emitting the
+    /// last four slots, and `end_paint` destroys their nodes — which is
+    /// the framework's default and the reason this returns nothing.
     fn paint_row<S: 'static>(&self, cx: &mut PaintCx<'_, S>, row: usize, runs: &[Run]) {
         let base = (row * SLOTS_PER_ROW) as Slot;
         let y = row as f32 * self.cell.h;
@@ -637,7 +649,20 @@ impl<S: 'static> TermGridMut for WidgetMut<'_, TermGrid, S> {
         self.term.feed(bytes);
         let replies = self.term.take_replies();
         self.write_input(&replies);
-        self.request_paint();
+        // Deliberately **not** `request_paint`. The bytes go into the
+        // grid, which records its own damage; the widget is marked for
+        // paint by `paint_dirty_rows`, called from the frame callback.
+        //
+        // That split is the whole of the frame pacing, and it is worth
+        // stating where it is easy to undo. `App`'s loop flushes after
+        // *every* wakeup, and a flush paints whatever is marked — so a
+        // `request_paint` here would put a commit on the wire once per
+        // epoll wakeup that carried pty data, which for a chatty writer
+        // is hundreds a second against sixty frames. Marking here also
+        // *looks* right and measures fine on a fast bulk writer like
+        // `seq`, because the drain cap already bounds it; it is the
+        // 200-small-writes-a-second build log where the two designs
+        // come apart, which is exactly the case pacing exists for.
     }
 
     fn resize_grid(&mut self, cols: usize, rows: usize) {
@@ -743,6 +768,26 @@ pub fn term_grid<S: 'static>() -> TermGridBuilder<S> {
         size_px: DEFAULT_FONT_SIZE,
         palette: Palette::default(),
     }
+}
+
+/// Mark the widget for paint if its grid has damage the scene has not
+/// drawn yet, and report whether it did.
+///
+/// This is the other half of the pacing split described on
+/// [`TermGridMut::feed`]: bytes arriving mark the *grid*, and this marks
+/// the *widget*. It is called from the frame callback, so the scene is
+/// touched once per frame however many wakeups delivered the bytes.
+///
+/// # Errors
+/// Never; the signature matches its sibling for symmetry at call sites.
+pub fn paint_dirty_rows<S: 'static>(ui: &mut Ui<S>, grid: nitro_ui::WidgetId) -> bool {
+    let dirty = ui
+        .widget::<TermGrid>(grid)
+        .is_ok_and(|g| g.term.grid().dirty());
+    if dirty && let Ok(mut g) = ui.widget_mut::<TermGrid>(grid) {
+        g.request_paint();
+    }
+    dirty
 }
 
 /// Ask the toolkit for a frame callback, if the grid has anything to

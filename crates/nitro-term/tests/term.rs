@@ -86,11 +86,24 @@ fn drain(h: &mut Harness<TermApp>) {
     h.frame();
 }
 
-/// Drain without taking a frame, for a test measuring what one frame
-/// costs.
+/// One turn of the **real** app loop that carried pty data: drain the
+/// descriptor, then flush — because `App`'s `event_loop_with` calls
+/// `ui.flush()` at the end of every wakeup, unconditionally.
+///
+/// That trailing flush is the whole reason this helper exists in this
+/// shape. An earlier version drained and did not flush, which meant a
+/// commit could only happen at `h.frame()` — so the cost test asserted
+/// frame pacing that the harness was providing rather than the app. If
+/// anything but the frame callback marks the widget for paint, this
+/// flush is where the extra commit appears, which is what makes
+/// `the_scene_is_touched_once_per_frame_not_once_per_wakeup` able to
+/// see it.
 fn drain_only(h: &mut Harness<TermApp>) {
-    let (ui, state) = h.parts();
-    nitro_term::drain_pty(state, ui);
+    {
+        let (ui, state) = h.parts();
+        nitro_term::drain_pty(state, ui);
+    }
+    h.flush();
 }
 
 /// The screen, as text.
@@ -197,9 +210,17 @@ fn the_alt_screen_is_entered_and_left_without_losing_the_primary() {
 
 #[test]
 fn a_resize_reaches_the_shell() {
-    // The resize path end to end: a `Configure` changes the window, the
-    // cell metric turns that into a cell count, `TIOCSWINSZ` tells the
-    // child, and the child reports what it was told.
+    // The resize path end to end, **through the app's own hook**: a
+    // `Configure` arrives, `Ui` fires `on_resize`, the terminal turns
+    // the new pixel size into a cell count, reflows, and `TIOCSWINSZ`
+    // tells the child — which then reports what it was told.
+    //
+    // The `h.configure(...)` below is the *only* thing this test does to
+    // cause all of that, and that is the point. An earlier version
+    // called `nitro_term::sync_size` by hand right after it, which meant
+    // it asserted that `sync_size` works rather than that a resize
+    // works — and the binary, which had no resize hook at all, kept its
+    // start-up geometry for ever while this test passed.
     let (mut h, grid) = harness_shell();
     let cell = h.widget::<TermGrid>(grid).cell_size();
     assert!(
@@ -214,10 +235,6 @@ fn a_resize_reaches_the_shell() {
         cell.w * want_cols as f32,
         cell.h * want_rows as f32,
     ));
-    let (ui, state) = h.parts();
-    nitro_term::sync_size(state, ui);
-    h.settle();
-
     assert_eq!(h.widget::<TermGrid>(grid).term().grid().cols(), want_cols);
     assert_eq!(h.widget::<TermGrid>(grid).term().grid().rows(), want_rows);
 
@@ -371,6 +388,68 @@ fn a_scripted_send_types_rather_than_pastes() {
     assert!(
         !text.contains("200~") && !text.contains("201~"),
         "a scripted send must not be bracketed; the child echoed {text:?}"
+    );
+    h.quit();
+}
+
+#[test]
+fn the_scene_is_touched_once_per_frame_not_once_per_wakeup() {
+    // The claim `docs/term.md` makes and this test is the only thing
+    // that holds to it: bytes arriving mark the *grid*, and only the
+    // frame callback marks the *widget*, so the scene is committed once
+    // per frame however many wakeups delivered the bytes.
+    //
+    // The writer here is deliberately **slow and chatty** rather than
+    // fast and bulky, because that is where the two possible designs
+    // come apart. A bulk writer like `seq` is paced into ~30 commits by
+    // the 256 KiB drain cap whether or not frame pacing exists, so it
+    // cannot tell them apart — which is exactly how an earlier version
+    // of this crate shipped with `feed` marking the widget directly and
+    // still measured a plausible commit count. A build log emitting a
+    // few hundred small writes a second wakes the loop on each one; with
+    // pacing that is still one commit per frame, without it it is one
+    // commit per wakeup.
+    let (mut h, grid) = harness_running(&[
+        "/bin/sh",
+        "-c",
+        // ~40 separate writes, each its own wakeup, no two in one drain.
+        "i=0; while [ $i -lt 40 ]; do printf 'line %s\\n' $i; i=$((i+1)); \
+         sleep 0.02; done; printf 'CHATDONE\\n'",
+    ]);
+
+    h.tap();
+    h.clear_tap();
+    let before = h.commits();
+    let mut wakeups = 0u32;
+    let mut frames = 0u32;
+
+    let deadline = Instant::now() + DEADLINE;
+    while !screen(&mut h, grid).contains("CHATDONE") {
+        // One turn of the real loop: drain the descriptor, then flush —
+        // `drain_only` does both, as `event_loop_with` does.
+        drain_only(&mut h);
+        wakeups += 1;
+        // A frame only every fourth turn, so "per wakeup" and "per
+        // frame" are far enough apart to be unambiguous.
+        if wakeups.is_multiple_of(4) {
+            h.frame();
+            frames += 1;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the chatty writer"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let commits = h.commits() - before;
+
+    // The frames granted, plus a little slack for the settle inside
+    // `h.frame()` and for the final partial batch. The number that must
+    // *not* appear is one per wakeup.
+    assert!(
+        commits <= frames + 4,
+        "{commits} commits for {frames} frames over {wakeups} wakeups; \
+         the scene is being touched per wakeup, not per frame"
     );
     h.quit();
 }
