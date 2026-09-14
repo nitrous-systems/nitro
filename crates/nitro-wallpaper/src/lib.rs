@@ -162,19 +162,21 @@ where
 
 /// Parse `RRGGBB`, with or without a leading `#`.
 ///
+/// Six digits, not eight: a wallpaper is opaque by definition, and a
+/// translucent one would show the compositor's own background through
+/// it. The digits themselves are handed to `nitro_core`'s parser rather
+/// than decoded again here — there is one colour syntax on this desktop,
+/// and `server.conf` and `--color` have to agree about it.
+///
 /// # Errors
 /// A message naming what was wrong.
 pub fn parse_color(s: &str) -> Result<Color, String> {
     let hex = s.trim().trim_start_matches('#');
-    if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+    if hex.len() != 6 {
         return Err(format!("`{s}` is not RRGGBB (six hex digits)"));
     }
-    let v = u32::from_str_radix(hex, 16).map_err(|e| e.to_string())?;
-    Ok(Color::rgb(
-        ((v >> 16) & 0xff) as u8,
-        ((v >> 8) & 0xff) as u8,
-        (v & 0xff) as u8,
-    ))
+    nitro_ui::palette::parse_color(hex)
+        .ok_or_else(|| format!("`{s}` is not RRGGBB (six hex digits)"))
 }
 
 /// The widget that *is* the wallpaper: one rectangle, filled.

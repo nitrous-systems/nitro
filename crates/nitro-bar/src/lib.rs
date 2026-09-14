@@ -80,7 +80,7 @@ pub mod sensors;
 use nitro_ui::build::{ContainerBuilder as _, StyleBuilder as _};
 use nitro_ui::shell::{Layer, ShellEvent, Surface, WindowInfo, WindowRef};
 use nitro_ui::widgets::{Button, Label, button as button_widget, label, row, spacer};
-use nitro_ui::{App, Error, Size, Ui, WidgetId};
+use nitro_ui::{App, ColorRole, Error, Size, Ui, WidgetId};
 
 /// The name the bar registers under, and so the first argument to `hey`.
 pub const APP_NAME: &str = "nitro-bar";
@@ -453,7 +453,6 @@ pub fn elide(s: &str, max: usize) -> String {
 /// created, and a fresh id cannot be stale.
 pub fn build(ui: &mut Ui<Bar>) -> WidgetId {
     let h = height();
-    let dim = ui.theme().text_disabled;
 
     // -- left: the launcher button and the window list ----------------
     //
@@ -484,9 +483,24 @@ pub fn build(ui: &mut Ui<Bar>) -> WidgetId {
     );
 
     // -- right: battery, load, memory ---------------------------------
-    let battery = ui.build(label("").name(names::BATTERY).size(TEXT_SIZE).color(dim));
-    let load = ui.build(label("").name(names::LOAD).size(TEXT_SIZE).color(dim));
-    let mem = ui.build(label("").name(names::MEM).size(TEXT_SIZE).color(dim));
+    let battery = ui.build(
+        label("")
+            .name(names::BATTERY)
+            .size(TEXT_SIZE)
+            .color_role(ColorRole::TextDim),
+    );
+    let load = ui.build(
+        label("")
+            .name(names::LOAD)
+            .size(TEXT_SIZE)
+            .color_role(ColorRole::TextDim),
+    );
+    let mem = ui.build(
+        label("")
+            .name(names::MEM)
+            .size(TEXT_SIZE)
+            .color_role(ColorRole::TextDim),
+    );
 
     // One row, with a spacer on each side of the clock: that is what
     // keeps the clock centred *on the bar* rather than centred in

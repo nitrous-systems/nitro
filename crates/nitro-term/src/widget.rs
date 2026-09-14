@@ -240,8 +240,15 @@ impl TermGrid {
         self.pty.is_some()
     }
 
-    /// The colour a cell's foreground resolves to.
-    fn fg_of(&self, style: Style) -> Color {
+    /// The colour a cell's foreground resolves to, under the current
+    /// palette.
+    ///
+    /// Public so a test can assert that `SGR 31` really is the
+    /// palette's `Ansi1` and follows a scheme switch — the resolution
+    /// happens here and nowhere else, so asserting on pixels alone
+    /// would be asserting on the rasteriser too.
+    #[must_use]
+    pub fn fg_of(&self, style: Style) -> Color {
         // Inverse swaps the two, which is the whole of what it means.
         let fg = if style.attrs.inverse() {
             style.bg
@@ -257,6 +264,9 @@ impl TermGrid {
                 self.palette.ansi_indexed(i + 8)
             }
             CellColor::Indexed(i) => self.palette.ansi_indexed(i),
+            // lint-colors: allow — `SGR 38;2;r;g;b` is the *program's*
+            // own colour. Content, not chrome: a desktop theme has no
+            // business overriding what `bat` chose for a keyword.
             CellColor::Rgb(r, g, b) => Color::rgb(r, g, b),
             CellColor::Default if style.attrs.inverse() => {
                 self.palette.get(ColorRole::TerminalBackground)
@@ -267,7 +277,10 @@ impl TermGrid {
 
     /// The colour a cell's background resolves to, or `None` when it is
     /// the window's own — which is the case that costs no rect at all.
-    fn bg_of(&self, style: Style) -> Option<Color> {
+    ///
+    /// Public for the same reason [`TermGrid::fg_of`] is.
+    #[must_use]
+    pub fn bg_of(&self, style: Style) -> Option<Color> {
         let bg = if style.attrs.inverse() {
             style.fg
         } else {
@@ -275,6 +288,7 @@ impl TermGrid {
         };
         match bg {
             CellColor::Indexed(i) => Some(self.palette.ansi_indexed(i)),
+            // lint-colors: allow — truecolor background, same reason.
             CellColor::Rgb(r, g, b) => Some(Color::rgb(r, g, b)),
             CellColor::Default if style.attrs.inverse() => {
                 Some(self.palette.get(ColorRole::TerminalText))

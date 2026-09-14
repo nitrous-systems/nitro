@@ -119,6 +119,13 @@ pub use nitro_core::{Color, Point, Rect, Size, Transform};
 // renaming the accessibility one would churn every widget in the tree for
 // the sake of the newer concept.
 pub use nitro_core::{Palette, Role as ColorRole, Scheme};
+// The palette's free functions: `parse_color`/`format_color` for an app
+// that reads a colour from *its own* command line or config, and the
+// WCAG pair for one that checks a contrast. Re-exported as a module so
+// `nitro_ui::palette::parse_color` reads the same as it does in
+// `nitro-core`, and so an app still depends on `nitro-ui` and nothing
+// else.
+pub use nitro_core::palette;
 pub use nitro_wire::types::Align;
 // A custom widget's `paint` takes a `Fill` ([`PaintCx::rect`]), so a
 // crate that writes one — `nitro-wallpaper`'s gradient backdrop is the

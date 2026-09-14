@@ -77,7 +77,7 @@ use nitro_ui::shell::{ShellEvent, Surface, WindowInfo};
 use nitro_ui::widgets::{
     Button, Label, TextField, button as button_widget, column, label, scroll, text_field,
 };
-use nitro_ui::{App, Error, Size, Ui, WidgetId};
+use nitro_ui::{App, ColorRole, Error, Size, Ui, WidgetId};
 
 use desktop::{Entry, Source};
 
@@ -454,8 +454,6 @@ struct Ids {
 /// Never in practice — every `attach` names an id this function has just
 /// created, and a fresh id cannot be stale.
 pub fn build(ui: &mut Ui<Launcher>) -> WidgetId {
-    let dim = ui.theme().text_disabled;
-
     let query = ui.build(
         text_field("")
             .name(names::QUERY)
@@ -483,7 +481,7 @@ pub fn build(ui: &mut Ui<Launcher>) -> WidgetId {
         label("No matches")
             .name(names::EMPTY)
             .size(TEXT_SIZE)
-            .color(dim),
+            .color_role(ColorRole::TextDim),
     );
     let results = ui.build(scroll().name(names::RESULTS).grow(1.0).width_percent(1.0));
     ui.attach(results, list).unwrap();

@@ -1,6 +1,6 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
-default: fmt build test
+default: fmt build test lint-colors
 
 fmt:
     cargo fmt --all -- --check
@@ -8,8 +8,17 @@ fmt:
 build:
     cargo build --workspace --all-targets
 
-clippy:
+clippy: lint-colors
     cargo clippy --workspace --all-targets -- -D warnings
+
+# Fail on a hard-coded colour outside the palette. See the script's
+# header and docs/theme.md: colours come from roles, so that one
+# `theme.scheme` switch moves the whole desktop.
+lint-colors:
+    bash deploy/lint-colors.sh
+
+# Everything a merge checks that is not a compile or a test.
+lint: lint-colors clippy
 
 test:
     cargo test --workspace

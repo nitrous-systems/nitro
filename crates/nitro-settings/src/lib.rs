@@ -118,7 +118,7 @@ use nitro_ui::widgets::{
     Checkbox, FlexBuilder, Label, LabelBuilder, Slider, TextField, TextFieldBuilder, button,
     checkbox, column, label, row, separator, slider, spacer, text_field,
 };
-use nitro_ui::{App, Color, CrossAlign, Error, Size, Ui, WidgetId};
+use nitro_ui::{App, ColorRole, CrossAlign, Error, Size, Ui, WidgetId};
 
 use audio::Backend;
 use conf::{Conf, KeyboardConf};
@@ -475,9 +475,6 @@ struct Ids {
 // same reason.
 #[allow(clippy::too_many_lines)]
 pub fn build(ui: &mut Ui<Settings>) -> WidgetId {
-    let dim = ui.theme().text_disabled;
-    let ink = ui.theme().text;
-
     // -- displays ------------------------------------------------------
     //
     // An empty column: the rows arrive from the shell socket, or from the
@@ -488,7 +485,7 @@ pub fn build(ui: &mut Ui<Settings>) -> WidgetId {
         label(NOTE_LIVE)
             .name(names::DISPLAYS_NOTE)
             .size(TEXT_SIZE)
-            .color(dim),
+            .color_role(ColorRole::TextDim),
     );
 
     // -- keyboard ------------------------------------------------------
@@ -503,12 +500,12 @@ pub fn build(ui: &mut Ui<Settings>) -> WidgetId {
         ("Variant", variant),
         ("Options", options),
     ] {
-        let c = ui.build(caption(caption_text, dim));
+        let c = ui.build(caption(caption_text));
         ui.attach(kb_row, c).unwrap();
         ui.attach(kb_row, id).unwrap();
     }
     let test_row = ui.build(control_row());
-    let test_caption = ui.build(caption("Test here", dim));
+    let test_caption = ui.build(caption("Test here"));
     ui.attach(test_row, test_caption).unwrap();
     ui.attach(test_row, test).unwrap();
     ui.attach(keyboard, kb_row).unwrap();
@@ -530,7 +527,7 @@ pub fn build(ui: &mut Ui<Settings>) -> WidgetId {
         label("")
             .name(names::AUDIO_STATUS)
             .size(TEXT_SIZE)
-            .color(dim),
+            .color_role(ColorRole::TextDim),
     );
     let volume = ui.build(
         slider(0.0)
@@ -561,13 +558,18 @@ pub fn build(ui: &mut Ui<Settings>) -> WidgetId {
         },
     ));
     let audio = ui.build(control_row().name(names::AUDIO));
-    let volume_caption = ui.build(caption("Volume", dim));
+    let volume_caption = ui.build(caption("Volume"));
     for child in [volume_caption, volume, volume_value, mute] {
         ui.attach(audio, child).unwrap();
     }
 
     // -- apply / revert ------------------------------------------------
-    let status = ui.build(label("").name(names::STATUS).size(TEXT_SIZE).color(dim));
+    let status = ui.build(
+        label("")
+            .name(names::STATUS)
+            .size(TEXT_SIZE)
+            .color_role(ColorRole::TextDim),
+    );
     let ids = Ids {
         displays,
         displays_note,
@@ -600,9 +602,9 @@ pub fn build(ui: &mut Ui<Settings>) -> WidgetId {
 
     // -- the window ----------------------------------------------------
     let root = ui.build(column().gap(GAP).padding(PAD).width_percent(1.0));
-    let h_displays = ui.build(heading("Displays", ink));
-    let h_keyboard = ui.build(heading("Keyboard", ink));
-    let h_audio = ui.build(heading("Audio", ink));
+    let h_displays = ui.build(heading("Displays"));
+    let h_keyboard = ui.build(heading("Keyboard"));
+    let h_audio = ui.build(heading("Audio"));
     let sep_a = ui.build(separator().width_percent(1.0));
     let sep_b = ui.build(separator().width_percent(1.0));
     let sep_c = ui.build(separator().width_percent(1.0));
@@ -637,16 +639,19 @@ fn control_row() -> FlexBuilder<Settings> {
 }
 
 /// A section heading.
-fn heading(text: &str, color: Color) -> LabelBuilder<Settings> {
-    label(text).size(HEADING_SIZE).weight(600).color(color)
+fn heading(text: &str) -> LabelBuilder<Settings> {
+    label(text)
+        .size(HEADING_SIZE)
+        .weight(600)
+        .color_role(ColorRole::Text)
 }
 
 /// A label in front of a control.
 ///
 /// Deliberately **unnamed**: it is furniture, and naming it would put a
 /// second `layout` in the keyboard row for `hey` to be ambiguous about.
-fn caption(text: &str, color: Color) -> LabelBuilder<Settings> {
-    label(text).size(TEXT_SIZE).color(color)
+fn caption(text: &str) -> LabelBuilder<Settings> {
+    label(text).size(TEXT_SIZE).color_role(ColorRole::TextDim)
 }
 
 /// A named text field with a placeholder.
@@ -829,7 +834,6 @@ fn add_row(
     info: Option<&OutputInfo>,
     conf: &Conf,
 ) {
-    let dim = ui.theme().text_disabled;
     let saved = conf.output(connector);
     let scale = saved
         .and_then(|o| o.scale)
@@ -862,7 +866,7 @@ fn add_row(
         label(info.map_or_else(|| "—".to_owned(), mode_text))
             .name(names::OUTPUT_MODE)
             .size(TEXT_SIZE)
-            .color(dim)
+            .color_role(ColorRole::TextDim)
             .min_width(96.0),
     );
     let scale_value = ui.build(

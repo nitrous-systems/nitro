@@ -51,7 +51,7 @@ use engine::{Engine, Key, Op};
 use nitro_ui::build::{ContainerBuilder as _, StyleBuilder as _};
 use nitro_ui::event::{Handled, KeyEvent, key, mods};
 use nitro_ui::widgets::{Label, button, column, label, row};
-use nitro_ui::{Align, App, Error, Ui, WidgetId};
+use nitro_ui::{Align, App, ColorRole, Error, Ui, WidgetId};
 
 /// The app's state: the calculator, and nothing else.
 ///
@@ -191,12 +191,11 @@ const KEYPAD: [[(&str, &str, Key); 4]; 5] = [
 /// Never in practice — every `attach` names an id this function has just
 /// created, and a fresh id cannot be stale.
 pub fn build(ui: &mut Ui<Calc>) -> WidgetId {
-    let dim = ui.theme().text_disabled;
     let history = ui.build(
         label("")
             .name("history")
             .size(HISTORY_SIZE)
-            .color(dim)
+            .color_role(ColorRole::TextDim)
             .align(Align::Right)
             .width_percent(1.0),
     );

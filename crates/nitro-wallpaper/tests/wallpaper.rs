@@ -214,3 +214,71 @@ fn the_backdrop_is_addressable_for_hey() {
     );
     h.quit();
 }
+
+#[test]
+fn the_gradient_follows_the_scheme() {
+    // The wallpaper is the largest surface on the desktop, so a scheme
+    // switch that did not reach it would be the most visible failure
+    // there is: dark windows on a light backdrop. The gradient carries
+    // no colours of its own precisely so that this cannot happen — it
+    // reads `DesktopTop`/`DesktopBottom` at paint time.
+    let mut h = wallpaper(&default_gradient());
+    h.settle();
+    let want = |c: Color| u32::from(c.r) << 16 | u32::from(c.g) << 8 | u32::from(c.b);
+    // Two rows near the ends, but not *at* them: the gradient is
+    // interpolated, so the exact stop is only at y=0 and y=h-1 and a
+    // one-pixel rounding difference there would make this flaky.
+    let top_row = 0;
+    let bottom_row = 239;
+
+    let light = Palette::light();
+    assert_eq!(
+        output_pixel(&h, 160, top_row),
+        want(light.get(ColorRole::DesktopTop)),
+        "the light scheme's top stop"
+    );
+    assert_eq!(
+        output_pixel(&h, 160, bottom_row),
+        want(light.get(ColorRole::DesktopBottom)),
+        "the light scheme's bottom stop"
+    );
+
+    h.ui().set_palette(Palette::dark());
+    h.settle();
+
+    let dark = Palette::dark();
+    assert_eq!(
+        output_pixel(&h, 160, top_row),
+        want(dark.get(ColorRole::DesktopTop)),
+        "the dark scheme's top stop"
+    );
+    assert_eq!(
+        output_pixel(&h, 160, bottom_row),
+        want(dark.get(ColorRole::DesktopBottom)),
+        "the dark scheme's bottom stop"
+    );
+    // And it is still silent afterwards, which is the wallpaper's whole
+    // reason for existing in the form it has.
+    h.assert_idle(60);
+    h.quit();
+}
+
+#[test]
+fn an_explicit_colour_does_not_follow_the_scheme() {
+    // `--color` is the user overriding the desktop. An override that the
+    // desktop then overrode back would be no override at all.
+    let chosen = Color::rgb(0x20, 0x24, 0x30);
+    let mut h = wallpaper(&Paint::Solid(chosen));
+    h.settle();
+    let want = u32::from(chosen.r) << 16 | u32::from(chosen.g) << 8 | u32::from(chosen.b);
+    assert_eq!(output_pixel(&h, 160, 120), want);
+
+    h.ui().set_palette(Palette::dark());
+    h.settle();
+    assert_eq!(
+        output_pixel(&h, 160, 120),
+        want,
+        "`--color` is the user's own choice and outranks the scheme"
+    );
+    h.quit();
+}

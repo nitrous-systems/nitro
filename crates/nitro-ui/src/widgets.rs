@@ -210,6 +210,16 @@ pub struct Label {
     text: String,
     style: Option<TextStyle>,
     color: Option<Color>,
+    /// A colour named by *role* rather than by value.
+    ///
+    /// Separate from `color` and checked first, because the two are
+    /// different promises: a literal is "this exact colour whatever the
+    /// desktop does", a role is "whatever the desktop calls this". A
+    /// label built with `.color(ui.theme().text_disabled)` freezes the
+    /// colour the palette had *at build time* and then never moves
+    /// again — which is exactly the bug `.color_role(ColorRole::TextDim)`
+    /// exists to stop, and why every app in this tree uses the latter.
+    color_role: Option<nitro_core::Role>,
     align: Align,
     /// The measurement the last `measure` produced, so `paint` can place
     /// the baseline box without asking the server again.
@@ -240,6 +250,12 @@ impl Label {
         self.color
     }
 
+    /// The colour role, if one was set.
+    #[must_use]
+    pub fn color_role(&self) -> Option<nitro_core::Role> {
+        self.color_role
+    }
+
     fn resolved_style(&self, theme: &crate::Theme) -> TextStyle {
         self.style
             .clone()
@@ -264,9 +280,12 @@ impl<S: 'static> Widget<S> for Label {
     }
 
     fn paint(&mut self, cx: &mut PaintCx<'_, S>) {
-        let theme = cx.theme();
-        let color = self.color.unwrap_or(theme.text);
-        let style = self.resolved_style(theme);
+        let color = match (self.color, self.color_role) {
+            (Some(c), _) => c,
+            (None, Some(role)) => cx.color(role),
+            (None, None) => cx.theme().text,
+        };
+        let style = self.resolved_style(cx.theme());
         let bounds = cx.bounds;
         let run = TextRun::new(&style, color)
             .align(self.align)
@@ -324,6 +343,14 @@ impl<S: 'static> WidgetMut<'_, Label, S> {
         self.request_paint();
     }
 
+    /// Take the colour from a palette role instead of a literal, so it
+    /// follows the desktop's scheme.
+    pub fn set_color_role(&mut self, role: nitro_core::Role) {
+        self.color = None;
+        self.color_role = Some(role);
+        self.request_paint();
+    }
+
     /// Replace the horizontal alignment inside the label's box.
     pub fn set_align(&mut self, align: Align) {
         self.align = align;
@@ -374,10 +401,27 @@ impl<S: 'static> LabelBuilder<S> {
         self
     }
 
-    /// Set the colour (default: the theme's `text`).
+    /// Set the colour to a literal (default: the theme's `text`).
+    ///
+    /// Prefer [`LabelBuilder::color_role`]: a literal does not follow
+    /// the desktop's scheme, and `deploy/lint-colors.sh` will not let
+    /// you write one down in the first place.
     #[must_use]
     pub fn color(mut self, color: Color) -> Self {
         self.label.color = Some(color);
+        self
+    }
+
+    /// Take the colour from a palette role, so it follows the scheme.
+    ///
+    /// This is what `.color(ui.theme().text_disabled)` should have been:
+    /// that call reads the palette **once**, at build time, and the
+    /// resulting label keeps its light-scheme grey for ever. A role is
+    /// resolved at paint time instead, so a `theme.scheme` switch moves
+    /// it with everything else.
+    #[must_use]
+    pub fn color_role(mut self, role: nitro_core::Role) -> Self {
+        self.label.color_role = Some(role);
         self
     }
 
@@ -413,6 +457,7 @@ pub fn label<S: 'static>(text: impl Into<String>) -> LabelBuilder<S> {
         text: text.into(),
         style: None,
         color: None,
+        color_role: None,
         align: Align::Left,
         metrics: crate::wire::TextMetrics::default(),
         wrap_width: 0.0,

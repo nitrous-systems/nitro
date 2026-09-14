@@ -650,3 +650,91 @@ fn scrolling_back_and_typing_snaps_to_the_bottom() {
     );
     h.quit();
 }
+
+#[test]
+fn ansi_red_is_the_palettes_ansi1_and_follows_a_scheme_switch() {
+    // The terminal's own claim under M4-F: `SGR 31` means "the colour
+    // this desktop calls ANSI 1", not a colour nitro-term chose. Two
+    // halves, because either alone would pass a wrong implementation: a
+    // grid that hard-coded the old dark table would match `Ansi1` on the
+    // dark scheme, and a grid that ignored the palette entirely would
+    // still resolve *some* red.
+    let (mut h, grid) = harness_running(&["/bin/sh", "-c", "sleep 30"]);
+    h.ui()
+        .widget_mut::<TermGrid>(grid)
+        .expect("grid")
+        .feed(b"\x1b[31mred\x1b[0m\r\n");
+    h.frame();
+    h.settle();
+
+    // The run the VT produced, and the colour the widget resolves it to.
+    let style = {
+        let g = h.widget::<TermGrid>(grid);
+        let mut runs = Vec::new();
+        g.term().grid().row_runs(0, &mut runs);
+        let run = runs.first().expect("a run on the first row").clone();
+        assert_eq!(run.text, "red");
+        run.style
+    };
+    assert_eq!(
+        h.widget::<TermGrid>(grid).fg_of(style),
+        Palette::default().get(ColorRole::Ansi1),
+        "SGR 31 resolves through the palette"
+    );
+
+    // Now switch the scheme, exactly as the app's `on_theme` hook does.
+    h.ui().set_palette(Palette::dark());
+    let (ui, state) = h.parts();
+    ui.dispatch_theme(state);
+    h.settle();
+
+    assert_eq!(
+        h.widget::<TermGrid>(grid).fg_of(style),
+        Palette::dark().get(ColorRole::Ansi1),
+        "and it followed the scheme"
+    );
+    assert_ne!(
+        Palette::default().get(ColorRole::Ansi1),
+        Palette::dark().get(ColorRole::Ansi1),
+        "the two schemes really disagree about ANSI 1, or this proves nothing"
+    );
+    h.quit();
+}
+
+#[test]
+fn a_scheme_switch_repaints_the_backdrop_in_the_new_terminal_background() {
+    // The pixel half. The window backdrop is the terminal's *own*
+    // background (`term_theme`), so a scheme switch has to re-point it:
+    // a hook that only handed the grid its new table would leave dark
+    // text on a light window, which is worse than either scheme.
+    let (mut h, grid) = harness_running(&["/bin/sh", "-c", "sleep 30"]);
+    h.ui()
+        .widget_mut::<TermGrid>(grid)
+        .expect("grid")
+        .feed(b"x");
+    h.frame();
+    h.settle();
+
+    let want = |c: nitro_ui::Color| u32::from(c.r) << 16 | u32::from(c.g) << 8 | u32::from(c.b);
+    let middle = |h: &Harness<TermApp>| {
+        let shot = h.shot();
+        shot.pixel(shot.width / 2, shot.height / 2) & 0x00ff_ffff
+    };
+    assert_eq!(
+        middle(&h),
+        want(Palette::default().get(ColorRole::TerminalBackground))
+    );
+
+    h.ui().set_palette(Palette::dark());
+    let (ui, state) = h.parts();
+    ui.dispatch_theme(state);
+    h.frame();
+    h.settle();
+
+    assert_eq!(
+        middle(&h),
+        want(Palette::dark().get(ColorRole::TerminalBackground)),
+        "the backdrop followed the scheme"
+    );
+    h.quit();
+}
