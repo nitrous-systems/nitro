@@ -62,9 +62,21 @@ const RUNS_PER_ROW: usize = 32;
 /// Slots one row occupies: a background rect and a text node per run.
 const SLOTS_PER_ROW: usize = RUNS_PER_ROW * 2;
 
-/// Slot of the cursor rect. It sits above every row's slots, so adding a
-/// row never moves it.
-const CURSOR_SLOT: Slot = Slot::MAX;
+/// Slot of the cursor rect: just above the rows a grid this tall uses.
+///
+/// It is computed from the row count rather than parked at `Slot::MAX`,
+/// and that is not tidiness — the framework's paint slots are a **dense
+/// `Vec` indexed by slot number**, so a cursor at `Slot::MAX` makes
+/// every terminal allocate 65 536 slots. On the box that was **11.8 MB
+/// of resident memory in a process whose target is 6**, present even
+/// with `--scrollback 0`, which is what finally identified it: the
+/// scrollback was innocent all along.
+///
+/// A grid that grows re-bases the cursor, which costs the cursor node
+/// one destroy-and-recreate on a resize and nothing at all otherwise.
+fn cursor_slot(rows: usize) -> Slot {
+    (rows * SLOTS_PER_ROW) as Slot
+}
 
 /// The default font size, in logical pixels.
 pub const DEFAULT_FONT_SIZE: f32 = 13.0;
@@ -339,7 +351,7 @@ impl TermGrid {
         // which one the keyboard is talking to.
         if self.focused {
             cx.rect(
-                CURSOR_SLOT,
+                cursor_slot(self.term.grid().rows()),
                 rect,
                 Fill::Solid(self.palette.cursor),
                 0.0,
@@ -347,7 +359,7 @@ impl TermGrid {
             );
         } else {
             cx.rect(
-                CURSOR_SLOT,
+                cursor_slot(self.term.grid().rows()),
                 rect,
                 Fill::None,
                 0.0,
