@@ -73,7 +73,7 @@ pub mod search;
 pub mod spawn;
 
 use nitro_ui::build::{ContainerBuilder as _, StyleBuilder as _};
-use nitro_ui::shell::{ShellEvent, Surface};
+use nitro_ui::shell::{ShellEvent, Surface, WindowInfo};
 use nitro_ui::widgets::{
     Button, Label, TextField, button as button_widget, column, label, scroll, text_field,
 };
@@ -164,6 +164,9 @@ pub struct Launcher {
     query: String,
     /// Whether the overlay is on screen.
     visible: bool,
+    /// How many times another window taking focus has hidden the
+    /// overlay, for the tests and for `hey`.
+    focus_hides: u64,
     /// The directory mtimes the last scan saw; a change means rescan.
     fingerprint: (u64, usize),
     /// Launched processes, so they can be reaped.
@@ -197,6 +200,7 @@ impl Launcher {
             selected: 0,
             query: String::new(),
             visible: false,
+            focus_hides: 0,
             fingerprint: (0, 0),
             children: spawn::Children::new(),
             launches: 0,
@@ -240,6 +244,12 @@ impl Launcher {
     #[must_use]
     pub fn shows(&self) -> u64 {
         self.shows
+    }
+
+    /// How many times another window taking focus has hidden it.
+    #[must_use]
+    pub fn focus_hides(&self) -> u64 {
+        self.focus_hides
     }
 
     /// Everything the launcher could launch, in scan order.
@@ -507,9 +517,29 @@ fn install(ui: &mut Ui<Launcher>, ids: Ids) {
             ShellEvent::HotKey { id, pressed } if *id == HOTKEY_CHORD && *pressed => {
                 toggle(s, ui);
             }
+            // Focus loss, as near as a `NO_FOCUS` overlay can observe it.
+            // See [`focus_moved`] for why it is somebody *else* taking
+            // focus rather than this window losing it.
+            ShellEvent::Window(info) if info.focused => focus_moved(s, ui, info),
             _ => {}
         },
     );
+
+    // The window list, which is what makes the rule above possible. It is
+    // a subscription, not a poll: asking once is the only request the
+    // launcher ever makes about windows, and everything after it arrives
+    // unasked. A launcher on an unprivileged connection would be
+    // *disconnected* for sending this, so the capability is checked
+    // rather than assumed.
+    if ui.is_shell()
+        && let Err(e) = ui.window_list()
+    {
+        // Not fatal: a launcher that cannot watch the window list still
+        // opens, searches and launches — it just keeps the overlay up
+        // until Escape or a second tap. Dying here would trade a small
+        // missing behaviour for no launcher at all.
+        eprintln!("nitro-launcher: window list: {e}");
+    }
 
     // Escape hides. An app-level handler rather than a widget's, because
     // the focused widget is the text field and a field that consumed
@@ -560,6 +590,35 @@ pub fn toggle(s: &mut Launcher, ui: &mut Ui<Launcher>) {
     } else {
         show(s, ui);
     }
+}
+
+/// Somebody else's window took focus: get out of the way.
+///
+/// This is the spec's "focus-loss hides it", and it has to be written
+/// backwards because a `NO_FOCUS` overlay **cannot lose focus** — it never
+/// had any. There is no `Focus { focused: false }` coming for this
+/// window, and waiting for one is how the first version of this ended up
+/// holding the keyboard grab until Escape.
+///
+/// So the observable event is somebody *else* gaining focus, which the
+/// window-list subscription already reports as a `WindowInfo` with
+/// `focused: true`. Two windows are ignored:
+///
+/// * **our own**, because the server may report the overlay itself and
+///   hiding on that would close the launcher the moment it opened;
+/// * anything while we are already hidden, which is every ordinary focus
+///   change on the desktop and must cost nothing.
+///
+/// The launcher is opened by a hotkey rather than by a click, so this
+/// does not race its own opening: the tap does not move focus, and the
+/// window that had focus before the tap still has it afterwards — no new
+/// `WindowInfo { focused: true }` is produced by showing the overlay.
+fn focus_moved(s: &mut Launcher, ui: &mut Ui<Launcher>, info: &WindowInfo) {
+    if !s.visible || info.app_id == APP_NAME {
+        return;
+    }
+    s.focus_hides += 1;
+    hide(s, ui);
 }
 
 /// Put the overlay on screen: rescan if anything changed, clear the
@@ -701,7 +760,22 @@ fn refresh(s: &mut Launcher, ui: &mut Ui<Launcher>) {
     let rows = ui.children(ids.list);
 
     for (n, (index, text)) in wanted.iter().enumerate() {
-        let text = text.clone();
+        // Decorated **here**, rather than written bare and then
+        // overwritten by a `restyle_rows` pass immediately afterwards.
+        //
+        // What that costs is worth being exact about, because the
+        // obvious claim is wrong: it is **not** a wire saving. Two
+        // `set_text` calls on one widget between flushes produce **one**
+        // `SetText`, because the paint slot caches the last value sent
+        // and only the final value is ever painted (`docs/ui.md`). The
+        // double write cost a redundant `String`, a redundant
+        // layout+paint mark and a second walk of every row, and zero
+        // extra bytes. Writing it once is simply the honest shape of
+        // "the row's label is its name plus its marker".
+        //
+        // `rerank` resets the selection to 0, so the row selected here is
+        // the one being written rather than a stale index.
+        let text = decorate(text, n == s.selected);
         let index = *index;
         if let Some(id) = rows.get(n).copied() {
             if let Ok(mut b) = ui.widget_mut::<Button<Launcher>>(id) {
@@ -753,7 +827,10 @@ fn refresh(s: &mut Launcher, ui: &mut Ui<Launcher>) {
     if let Ok(mut l) = ui.widget_mut::<Label>(ids.empty) {
         l.set_text(note);
     }
-    restyle_rows(s, ui);
+    // Not `restyle_rows` here: every row above was written already
+    // decorated, so a second pass would re-mark each one to produce the
+    // string it already has. It stays the *selection-move* path's job,
+    // where nothing else has rewritten the labels.
 }
 
 /// Mark the selected row, and only that one.

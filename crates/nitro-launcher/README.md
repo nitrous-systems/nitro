@@ -54,6 +54,33 @@ and would move the MRU order. `the_grab_is_what_delivers_keys_and_hiding_gives_i
 opens a second, ordinary client to hold the focus, so the test can tell
 "the grab delivered it" from "the launcher happened to be focused".
 
+## What closes it
+
+Escape, a second Super tap (or `Super+Space`), a successful launch, and
+**another window taking focus**.
+
+That last one is the spec's "focus-loss hides it", and it has to be
+written backwards: a `NO_FOCUS` overlay cannot *lose* focus, because it
+never had any — no `Focus { focused: false }` is ever coming for this
+window. So the observable event is somebody **else** gaining focus, which
+the window-list subscription already reports as a `WindowInfo` with
+`focused: true`. Without it the launcher sits on screen holding the
+keyboard grab until Escape, which is the one failure mode a launcher
+really must not have.
+
+Two windows are ignored: our own (the server may report the overlay
+itself, and hiding on that would close the launcher the moment it
+opened), and everything at all while the launcher is already hidden —
+which is every ordinary focus change on the desktop, and must cost
+nothing. `an_ordinary_focus_change_costs_a_hidden_launcher_nothing`
+asserts the second half by counting commits while two windows open and
+steal focus from each other.
+
+This is the one place the launcher subscribes to anything. It is a
+subscription rather than a poll, and a failure to establish it is not
+fatal: a launcher that cannot watch the window list still opens,
+searches and launches, it just keeps the overlay up until Escape.
+
 ## Driving it with `hey`
 
 Nothing below cooperates with the launcher's code — `hey` is a separate
@@ -93,6 +120,27 @@ The search path is rescanned on **show**, and only when a directory's
 mtime moved. Re-reading a few hundred files on every keystroke would be
 hundreds of syscalls per character; never re-reading them would mean
 restarting the launcher after every install.
+
+### Precedence, which is reversed on the way in
+
+`XDG_DATA_DIRS` is most-important-**first** ("the first directory listed
+is the most important"), and the Desktop Entry spec resolves a
+desktop-file ID to the *first* file found along it. `scan` implements
+precedence the other way round — it walks the list overwriting as it
+goes, so the **last** directory wins — which means the list handed to it
+has to be reversed. `dirs_from` does that with one `.rev()`, and
+`$XDG_DATA_HOME` is appended *after* the reversal so a user's own file
+outranks every system one.
+
+Getting this backwards is silent and wrong in a way nobody reports:
+`/usr/share/applications` would shadow `/usr/local/share/applications`,
+so a locally installed program is hidden by the distribution's copy of
+the same file. `the_search_path_is_most_specific_last` pins the order
+down *and* checks it against `scan` itself with real files on disk, so
+the two halves cannot drift apart. It is a separate pure function
+precisely so it can be tested: `search_dirs` reads the process
+environment, and a test that set it would race every other test in the
+binary.
 
 ### The parser, and what it honours
 
@@ -171,6 +219,16 @@ Each is a decision, not an oversight.
   file in the directory changes: the rescan trigger is the *directory's*
   mtime, and editing a file does not move it. Packages replace files
   rather than editing them, so this self-corrects on the next install.
+* **Only the top level of each `applications` directory is read.** The
+  Desktop Entry spec allows nested entries, whose desktop-file ID is
+  `subdir-name.desktop`; `scan` does not recurse, so those are invisible.
+  Rare in practice, and the fix is a `read_dir` recursion plus the `-`
+  joining rule for the ID.
+* **Focus-loss hiding is "somebody else took focus"**, not a focus event
+  of our own — see *What closes it*. The difference shows if a focused
+  window closes without anything taking focus after it: the launcher
+  stays up, because no `WindowInfo { focused: true }` arrives. Escape and
+  a second tap still close it.
 * **No history, no frecency, no modes.** A launcher that learns what you
   use is a good feature and a stateful one; a calculator mode is
   `nitro-calc`'s job. Neither is M3.
@@ -233,21 +291,26 @@ its own built-ins).
 
 `src/desktop.rs`, `src/search.rs` and `src/spawn.rs` unit-test the parts
 that need no server at all: the parser (field codes, quoting, localized
-names, action groups, `NoDisplay`/`Hidden`, directory precedence, the
-mtime fingerprint), the ranking (subsequence, prefix order, word starts,
-tight runs, the limit), and the spawn (the environment subtraction, the
-process group, a real child writing a real marker file, and reaping).
+names, action groups, `NoDisplay`/`Hidden`, the mtime fingerprint), the
+**search-path precedence** (most-specific last, the home directory
+outranking everything, ragged and empty `XDG_DATA_DIRS`, and the order
+checked against `scan` with real files), the ranking (subsequence, prefix
+order, word starts, tight runs, the limit), and the spawn (the
+environment subtraction, the process group, a real child writing a real
+marker file, and reaping).
 
 `tests/launcher.rs` drives the tree the binary builds through a real
-server on the shell socket, 19 cases: the bare-Super tap showing and
+server on the shell socket, 22 cases: the bare-Super tap showing and
 hiding it; the grab delivering keys past a focused second client and
-releasing on hide; show and hide costing one mutation each; Escape;
-typing narrowing the list; the arrows wrapping and costing two `SetText`s;
-Enter and a real click each launching a real process (asserted with a
-marker file, and with row 0's *callback* following its label after a
-keystroke); a query that matches nothing saying so; a terminal entry
-refused; a failed launch coming back with the reason; the query being
-cleared on reopen; an application installed since start-up appearing; a
-built-in launchable with no `.desktop` files at all; every part
-addressable for `hey`; idle silence both hidden and shown; and the
-centred anchor leaving the window its own size.
+releasing on hide; **another window taking focus hiding it**, and an
+ordinary focus change costing a hidden launcher nothing; show and hide
+costing one mutation each; Escape; typing narrowing the list; a keystroke
+sending nothing for a row whose text did not change; the arrows wrapping
+and costing two `SetText`s; Enter and a real click each launching a real
+process (asserted with a marker file, and with row 0's *callback*
+following its label after a keystroke); a query that matches nothing
+saying so; a terminal entry refused; a failed launch coming back with the
+reason; the query being cleared on reopen; an application installed since
+start-up appearing; a built-in launchable with no `.desktop` files at
+all; every part addressable for `hey`; idle silence both hidden and
+shown; and the centred anchor leaving the window its own size.

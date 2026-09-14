@@ -36,8 +36,10 @@ nitro-ui = { workspace = true, features = ["test-support"] }
 # leave the launcher's process group. A dev-dependency because that is
 # the only use: the spawn path itself needs no syscall crate.
 rustix = { workspace = true, features = ["process"] }
-# `tests/launcher.rs` opens a second, ordinary client so there is a window
-# for the focus-loss rule to notice. That is raw wire, so the test names
-# the wire crate; the shipped launcher does not.
+# `tests/launcher.rs` opens a second, ordinary client: one to hold the
+# keyboard focus (so "the grab delivered this key" can be told apart from
+# "the launcher happened to be focused"), and one to *take* focus, which
+# is what the launcher hides on. That is raw wire, so the test names the
+# wire crate; the shipped launcher does not.
 nitro-wire = { workspace = true }
 nitro-core = { workspace = true }

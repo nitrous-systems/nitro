@@ -278,17 +278,32 @@ fn strip_field_codes(arg: &str) -> Option<String> {
     Some(trimmed.to_owned())
 }
 
-/// The directories `.desktop` files are looked for in, most-specific
-/// last.
+/// The directories `.desktop` files are looked for in, **most-specific
+/// last** — which is the reverse of the order `XDG_DATA_DIRS` is written
+/// in, and the reversal is the whole subtlety here.
 ///
-/// `$XDG_DATA_DIRS` plus `$XDG_DATA_HOME`, each with `applications`
-/// appended, which is what the spec says and what every other launcher
-/// does. The defaults are the spec's: `/usr/local/share:/usr/share` for
-/// `XDG_DATA_DIRS` and `~/.local/share` for `XDG_DATA_HOME`.
+/// The XDG base-directory spec says "the first directory listed is the
+/// most important", and the Desktop Entry spec resolves a desktop-file
+/// ID to the **first** file found along that path. [`scan`] implements
+/// precedence the other way round — later directory wins, because it
+/// overwrites as it goes — so the two only agree if the list handed to it
+/// is reversed. Hence [`dirs_from`]'s `.rev()`.
+///
+/// Getting this backwards is not a theoretical complaint: it makes
+/// `/usr/share/applications` shadow `/usr/local/share/applications`, so a
+/// locally installed program is hidden by the distribution's copy of the
+/// same file — exactly backwards, and silent.
+///
+/// The defaults are the spec's: `/usr/local/share:/usr/share` for
+/// `XDG_DATA_DIRS` and `~/.local/share` for `XDG_DATA_HOME`. The home
+/// directory is appended **after** the reversal, so it outranks every
+/// system directory.
 ///
 /// `NITRO_LAUNCHER_DIRS` overrides the whole list, which is how the tests
 /// point the launcher at a fixture directory instead of at whatever the
-/// machine running them happens to have installed.
+/// machine running them happens to have installed. It is taken in the
+/// order written, because it is not `XDG_DATA_DIRS` and a test that has
+/// to reason about a reversal is a test about the wrong thing.
 #[must_use]
 pub fn search_dirs() -> Vec<PathBuf> {
     if let Some(over) = env_nonempty("NITRO_LAUNCHER_DIRS") {
@@ -302,13 +317,29 @@ pub fn search_dirs() -> Vec<PathBuf> {
         env_nonempty("XDG_DATA_DIRS").unwrap_or_else(|| "/usr/local/share:/usr/share".to_owned());
     let home = env_nonempty("XDG_DATA_HOME")
         .or_else(|| env_nonempty("HOME").map(|h| format!("{h}/.local/share")));
+    dirs_from(&data_dirs, home.as_deref())
+}
+
+/// The pure half of [`search_dirs`]: the search path for a given
+/// `XDG_DATA_DIRS` and `XDG_DATA_HOME`, most-specific last.
+///
+/// Split out so the precedence rule can be **tested**. `search_dirs`
+/// reads the process environment, and a test that set it would race every
+/// other test in the binary — so the earlier version of this test asserted
+/// on a `Vec` it built itself, which is to say it asserted nothing and
+/// missed the inverted order this function now pins down.
+#[must_use]
+pub fn dirs_from(data_dirs: &str, data_home: Option<&str>) -> Vec<PathBuf> {
+    // `.rev()`: `XDG_DATA_DIRS` is most-important-**first** and `scan`
+    // wants most-important-last. See [`search_dirs`].
     let mut out: Vec<PathBuf> = data_dirs
         .split(':')
-        .filter(|s| !s.is_empty())
-        .map(|d| Path::new(d).join("applications"))
+        .filter(|s| !s.trim().is_empty())
+        .map(|d| Path::new(d.trim()).join("applications"))
+        .rev()
         .collect();
-    if let Some(h) = home {
-        out.push(Path::new(&h).join("applications"));
+    if let Some(h) = data_home.map(str::trim).filter(|h| !h.is_empty()) {
+        out.push(Path::new(h).join("applications"));
     }
     out
 }
@@ -642,16 +673,95 @@ mod tests {
     }
 
     #[test]
-    fn the_search_path_follows_the_environment() {
-        // Not via `search_dirs`, which reads the process environment and
-        // would make this test order-dependent with every other test in
-        // the binary: the shape being asserted is the one the doc
-        // comment promises.
-        let dirs = ["/usr/local/share", "/usr/share"]
-            .iter()
-            .map(|d| Path::new(d).join("applications"))
-            .collect::<Vec<_>>();
-        assert_eq!(dirs[0], PathBuf::from("/usr/local/share/applications"));
-        assert_eq!(dirs[1], PathBuf::from("/usr/share/applications"));
+    fn the_search_path_is_most_specific_last() {
+        // The regression for an inverted precedence, and the reason
+        // `dirs_from` exists as a separate function at all: the earlier
+        // version of this test built a `Vec` locally and asserted that
+        // `Path::join` works, which is to say it asserted nothing — and
+        // missed the bug.
+        //
+        // `XDG_DATA_DIRS` is most-important-**first** (XDG basedir: "the
+        // first directory listed is the most important"), and `scan`
+        // gives precedence to the **last** directory it reads. So the
+        // list has to come out reversed, or `/usr/share` shadows
+        // `/usr/local/share` and a locally installed program is hidden by
+        // the distribution's copy of the same file.
+        let dirs = dirs_from("/usr/local/share:/usr/share", Some("/home/u/.local/share"));
+        assert_eq!(
+            dirs,
+            vec![
+                PathBuf::from("/usr/share/applications"),
+                PathBuf::from("/usr/local/share/applications"),
+                PathBuf::from("/home/u/.local/share/applications"),
+            ],
+            "most-specific last: /usr/local/share must outrank /usr/share"
+        );
+
+        // And that really is what `scan` reads as precedence — asserted
+        // against `scan` itself rather than restated here, so the two
+        // cannot drift apart.
+        let root = std::env::temp_dir().join(format!("nitro-launcher-prec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (sys, local) = (root.join("usr/share"), root.join("usr/local/share"));
+        for (dir, name) in [(&sys, "System"), (&local, "Local")] {
+            let apps = dir.join("applications");
+            std::fs::create_dir_all(&apps).unwrap();
+            std::fs::write(
+                apps.join("prog.desktop"),
+                format!("[Desktop Entry]\nName={name}\nExec=prog\n"),
+            )
+            .unwrap();
+        }
+        let path = dirs_from(&format!("{}:{}", local.display(), sys.display()), None);
+        let found = scan(&path);
+        assert_eq!(
+            found.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            vec!["Local"],
+            "the earlier entry in XDG_DATA_DIRS wins, as the spec says"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_home_directory_outranks_every_system_directory() {
+        // A user's own `.desktop` file replaces the system's, whatever
+        // `XDG_DATA_DIRS` holds — which is why the home directory is
+        // appended *after* the reversal rather than being part of it.
+        let dirs = dirs_from("/a:/b:/c", Some("/home/u/.local/share"));
+        assert_eq!(
+            dirs.last(),
+            Some(&PathBuf::from("/home/u/.local/share/applications"))
+        );
+        // Reversed, so `/a` (the most important) is the latest of the
+        // three system directories.
+        assert_eq!(
+            dirs[..3].to_vec(),
+            vec![
+                PathBuf::from("/c/applications"),
+                PathBuf::from("/b/applications"),
+                PathBuf::from("/a/applications"),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_absent_or_ragged_data_dirs_does_not_produce_junk_paths() {
+        // No home is not an error: a daemon with no `HOME` still has a
+        // system search path.
+        assert_eq!(
+            dirs_from("/usr/share", None),
+            vec![PathBuf::from("/usr/share/applications")]
+        );
+        // Empty entries (a trailing `:`, a `::`) are dropped rather than
+        // becoming `applications` relative to the working directory,
+        // which is a real directory on somebody's machine.
+        assert_eq!(
+            dirs_from(":/usr/share::", None),
+            vec![PathBuf::from("/usr/share/applications")]
+        );
+        assert!(dirs_from("", None).is_empty());
+        assert!(dirs_from("  ", None).is_empty());
+        // And an empty `XDG_DATA_HOME` is "unset", not "the root".
+        assert!(dirs_from("", Some("")).is_empty());
     }
 }

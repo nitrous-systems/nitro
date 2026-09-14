@@ -220,6 +220,78 @@ fn the_grab_is_what_delivers_keys_and_hiding_gives_it_back() {
 }
 
 #[test]
+fn another_window_taking_focus_hides_the_launcher() {
+    // The spec's "focus-loss hides it", which has to be written
+    // backwards: a `NO_FOCUS` overlay cannot *lose* focus because it
+    // never had any, so the observable event is somebody else gaining
+    // it. Without this the launcher sits on screen holding the keyboard
+    // grab until Escape or a second tap.
+    let (mut h, dir) = harness();
+    super_tap(&mut h);
+    until(&mut h, "the show", |h| h.state().is_visible());
+    assert_eq!(h.server().stat("grabbed"), 1);
+    assert_eq!(h.state().focus_hides(), 0);
+
+    // A real second client opening a real window, which takes focus when
+    // the server places it — exactly what happens when a user starts
+    // something, or clicks another window.
+    let conn = open_window(&h, "interloper", Size::new(120.0, 90.0));
+    until(&mut h, "the launcher to get out of the way", |h| {
+        !h.state().is_visible()
+    });
+    assert_eq!(h.state().focus_hides(), 1, "hidden by the focus change");
+
+    // And the grab went with it, so the new window's own keys reach the
+    // new window: the launcher must not keep swallowing the keyboard.
+    h.key(46); // c
+    h.settle();
+    assert_eq!(h.state().query(), "", "a hidden launcher receives nothing");
+    assert_eq!(h.server().stat("grabbed"), 0, "and the grab was released");
+
+    drop(conn);
+    let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}
+
+#[test]
+fn an_ordinary_focus_change_costs_a_hidden_launcher_nothing() {
+    // The other half of the rule, and the one that would make a desktop
+    // unusable if it were wrong: while the launcher is hidden, every
+    // focus change on the machine arrives as a `WindowInfo` and must do
+    // nothing at all — no mutation, no commit, no wakeup beyond the
+    // message itself.
+    let (mut h, dir) = harness();
+    assert!(!h.state().is_visible());
+    let a = open_window(&h, "first", Size::new(120.0, 90.0));
+    until(&mut h, "the first window", |h| {
+        h.server().stat("windows") >= 2
+    });
+    h.settle();
+
+    h.tap();
+    h.clear_tap();
+    let commits = h.commits();
+    // A second window opening takes focus from the first: two focus
+    // changes, both reported, neither of interest.
+    let b = open_window(&h, "second", Size::new(120.0, 90.0));
+    until(&mut h, "the second window", |h| {
+        h.server().stat("windows") >= 3
+    });
+    h.settle();
+    assert_eq!(h.state().focus_hides(), 0, "nothing to hide");
+    assert_eq!(
+        h.commits(),
+        commits,
+        "a focus change under a hidden launcher costs no commit: {:?}",
+        h.mutations()
+    );
+
+    drop((a, b));
+    let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}
+
+#[test]
 fn showing_and_hiding_is_one_mutation_each() {
     // The cost claim the whole design rests on: the tree is built once,
     // so coming and going is one `SetVisible` and not a rebuild. A
@@ -360,6 +432,50 @@ fn arrows_move_the_selection_and_wrap() {
     h.key(key::UP);
     h.settle();
     assert_eq!(h.state().selected(), h.state().match_count() - 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}
+
+#[test]
+fn a_keystroke_costs_nothing_for_a_row_that_did_not_change() {
+    // "Work is proportional to what changed", on the keystroke path.
+    //
+    // Typing `c` narrows Calculator/Mail/Terminal to Calculator alone:
+    // row 0 already said "▸ Calculator" and must cost **no** `SetText`
+    // at all, while the other two rows are destroyed. The only string
+    // that moved is the query field's own.
+    //
+    // Worth stating what this does *not* prove, because the obvious
+    // reading is wrong: writing a row's label twice between flushes is
+    // also one `SetText`, since the paint slot caches the last value
+    // sent. The cost of a redundant write is a `String`, a mark and a
+    // walk — not bytes. What is asserted here is the stronger and more
+    // useful property: a row whose text is unchanged sends nothing.
+    let (mut h, dir) = harness();
+    super_tap(&mut h);
+    until(&mut h, "the show", |h| h.state().is_visible());
+    assert_eq!(h.state().match_count(), 3);
+    assert_eq!(row(&mut h, 0), "▸ Calculator");
+
+    h.tap();
+    h.clear_tap();
+    h.key(46); // KEY_C
+    h.settle();
+    assert_eq!(h.state().match_names(), vec!["Calculator".to_owned()]);
+    assert_eq!(row(&mut h, 0), "▸ Calculator", "row 0 is unchanged");
+
+    let texts: Vec<&nitro_ui::Mutation> =
+        h.mutations().iter().filter(|m| m.op == "SetText").collect();
+    assert_eq!(
+        texts.len(),
+        1,
+        "only the query field's own text moved; the unchanged row sent \
+         nothing: {:?}",
+        h.mutations()
+    );
+    // And the two rows that went were destroyed rather than rewritten.
+    assert!(named(&mut h, "results/1").is_none());
 
     let _ = std::fs::remove_dir_all(&dir);
     h.quit();

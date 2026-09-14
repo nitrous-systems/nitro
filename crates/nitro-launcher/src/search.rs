@@ -41,8 +41,8 @@
 const EXACT: i32 = 1_000;
 /// The query is a prefix of the name.
 const PREFIX: i32 = 400;
-/// A matched character that starts a word (first character, or after a
-/// space, `-`, `_`, `.` or `/`).
+/// A matched character that starts a word (the first character, or one
+/// after a space, `-`, `_`, `.`, `/` or `:`).
 const WORD_START: i32 = 60;
 /// A matched character immediately after the previous match.
 const CONSECUTIVE: i32 = 25;
