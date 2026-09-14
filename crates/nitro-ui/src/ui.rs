@@ -43,6 +43,16 @@ use crate::wire::{Mutation, TextMetrics, Wire};
 /// first id; [`Wire`] hands out everything from 2 up.
 pub(crate) const WINDOW: NodeId = NodeId(1);
 
+/// How many times [`Ui::run_deferred`] drains a queue that keeps
+/// refilling itself before giving up.
+///
+/// A deferred callback may legitimately defer again (a navigation that
+/// triggers a re-listing), so one pass is not enough; a callback that
+/// queues itself unconditionally is a bug, and an unbounded loop would
+/// turn that bug into a hang with no output. Sixteen is far more than
+/// any real chain and far less than forever.
+pub const MAX_DEFER_ROUNDS: usize = 16;
+
 /// One widget as the introspection tree sees it.
 ///
 /// Produced by [`Ui::introspect`]. Everything an outside process needs
@@ -155,6 +165,17 @@ pub struct Ui<S> {
     /// borrowed — so the notification is queued and delivered by
     /// [`Ui::deliver_focus_events`] once the batch is done.
     pending_focus: Vec<(WidgetId, bool)>,
+    /// Callbacks queued with [`Ui::defer`], oldest first.
+    ///
+    /// The sibling of `pending_focus`, and it exists for the identical
+    /// reason one step further out. Dispatch **takes a widget out of its
+    /// arena slot** for the duration of its own callback, so inside that
+    /// callback `ui.widget_mut(that_id)` is [`Error::Busy`] — which is
+    /// exactly what a list's `on_activate` wants to do when activating a
+    /// row means "show a different directory in this list". Queuing the
+    /// work and running it once every widget is back in place is the
+    /// same answer `focus` already takes for the same reason.
+    pending_deferred: Vec<OnceCallback<S>>,
     hover_chain: Vec<WidgetId>,
     /// Widgets activated since the last drain, oldest first.
     ///
@@ -297,6 +318,7 @@ impl<S: 'static> Ui<S> {
             control_path: None,
             focused: None,
             pending_focus: Vec::new(),
+            pending_deferred: Vec::new(),
             hover_chain: Vec::new(),
             activations: Vec::new(),
             quit: false,
@@ -842,6 +864,7 @@ impl<S: 'static> Ui<S> {
         };
         self.untake(id, widget);
         self.deliver_focus_events(state);
+        self.run_deferred(state);
         Ok(handled)
     }
 
@@ -1881,6 +1904,7 @@ impl<S: 'static> Ui<S> {
         // very keystroke the queue exists to keep.
         self.wire.stray.append(&mut batch);
         self.deliver_focus_events(state);
+        self.run_deferred(state);
         Ok(n)
     }
 
@@ -2468,6 +2492,72 @@ impl<S: 'static> Ui<S> {
         self.pending_focus.push((id, true));
     }
 
+    /// Run `callback` once the current dispatch is over and every widget
+    /// is back in its arena slot.
+    ///
+    /// **This is how a widget's callback changes that same widget.**
+    /// Take-out dispatch moves a widget out of its slot for the duration
+    /// of its own `event`, `action` or app callback, which is what makes
+    /// `Fn(&mut S, &mut Ui<S>)` possible at all — and it means the one
+    /// widget the callback cannot reach is itself: `widget_mut` answers
+    /// [`Error::Busy`], a value rather than a panic or a second mutable
+    /// borrow. For most widgets that is the end of it, because the
+    /// callback changes something *else*.
+    ///
+    /// A list is the case where it is not. "Activate this row" means
+    /// "show a different directory **in this list**", and a file manager
+    /// that wrote the new rows from inside `on_activate` wrote them into
+    /// an `Err` it never looked at: the path bar updated, the rows did
+    /// not, and nothing anywhere returned an error anybody read
+    /// (`crates/nitro-files/tests/files.rs` is where that was caught).
+    ///
+    /// So: queue it. The callback is handed `&mut S` and `&mut Ui<S>`
+    /// like every other, and runs from [`Ui::run_deferred`] with the
+    /// tree whole. This is the same mechanism [`Ui::focus`] has always
+    /// used for the same reason — a focus notification cannot be
+    /// delivered to a widget that is out of its slot either — rather
+    /// than a second one invented alongside it.
+    ///
+    /// Deferring from *inside* a deferred callback is allowed and drains
+    /// in the same pass, bounded by [`Ui::MAX_DEFER_ROUNDS`] so a
+    /// callback that re-queues itself for ever is cut off rather than
+    /// hanging the loop.
+    pub fn defer(&mut self, callback: impl FnOnce(&mut S, &mut Ui<S>) + 'static) {
+        self.pending_deferred.push(Box::new(callback));
+    }
+
+    /// Run everything queued with [`Ui::defer`].
+    ///
+    /// Called wherever [`Ui::deliver_focus_events`] is — after an event
+    /// batch, after an introspection action, and by the app loop — so
+    /// app code never has to know the queue exists.
+    pub fn run_deferred(&mut self, state: &mut S) {
+        for _ in 0..MAX_DEFER_ROUNDS {
+            if self.pending_deferred.is_empty() {
+                return;
+            }
+            for cb in std::mem::take(&mut self.pending_deferred) {
+                cb(state, self);
+            }
+        }
+        // Still refilling after sixteen rounds: something re-queues
+        // itself unconditionally. Drop what is left rather than spin,
+        // and say so, because silence here is a UI that stops updating
+        // for no visible reason.
+        if !self.pending_deferred.is_empty() {
+            self.pending_deferred.clear();
+            eprintln!(
+                "nitro-ui: deferred callbacks still queuing after {MAX_DEFER_ROUNDS} rounds; dropped the rest"
+            );
+        }
+    }
+
+    /// How many callbacks are waiting, for tests.
+    #[must_use]
+    pub fn deferred_count(&self) -> usize {
+        self.pending_deferred.len()
+    }
+
     /// Deliver the [`Event::FocusChanged`] events queued by [`Ui::focus`].
     ///
     /// Separate from `focus` because focus is most often taken from
@@ -2678,6 +2768,9 @@ impl<S: 'static> Ui<S> {
                 cb(state, self);
             }
         }
+        // A timer's callback is app code with the same rights as a
+        // button's, so it may defer too.
+        self.run_deferred(state);
     }
 
     /// Run the callback registered for `token`. The app loop calls it
@@ -2698,6 +2791,10 @@ impl<S: 'static> Ui<S> {
         if let Some(h) = self.fds.iter_mut().find(|h| h.id == id) {
             h.callback = Some(cb);
         }
+        // Same as a timer: a descriptor hook is app code, and
+        // `nitro-files`'s scan hook writes rows into the very list whose
+        // callback started the scan.
+        self.run_deferred(state);
     }
 
     // -- scratch ------------------------------------------------------

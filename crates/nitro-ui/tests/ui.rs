@@ -1363,3 +1363,96 @@ fn a_re_armed_fd_hook_gets_a_fresh_token() {
     assert_eq!(state, 10, "the retired token names nothing");
     h.quit();
 }
+
+#[test]
+fn a_widget_callback_changes_that_widget_by_deferring() {
+    // Take-out dispatch is what makes `Fn(&mut S, &mut Ui<S>)` possible,
+    // and its one cost is that the widget running a callback is the one
+    // widget that callback cannot reach: `widget_mut` answers
+    // `Error::Busy`, a value rather than a panic.
+    //
+    // For most widgets that is the end of it, because a callback changes
+    // something else. A list is the case where it is not — "activate
+    // this row" means "show different rows *here*" — and `nitro-files`
+    // shipped the bug this test exists to prevent: the write went into
+    // an `Err` nobody read, the path bar updated, and the rows on screen
+    // stayed as they were, with no error reported anywhere.
+    //
+    // `Ui::defer` is the answer, and it is the same one `Ui::focus` has
+    // always used for the same reason.
+    let mut h = Harness::sized("defer", (), Size::new(200.0, 80.0), |ui: &mut Ui<()>| {
+        let root = ui.build(column());
+        let label = ui.build(label("before").name("l"));
+        ui.attach(root, label).unwrap();
+        root
+    });
+    let root = h.ui().root().unwrap();
+    let target = h.ui().children(root)[0];
+
+    // First the negative, observed where it actually bites: a button
+    // whose `on_click` tries to reach **itself**. The framework has that
+    // button out of its slot for the duration of the call, so
+    // `widget_mut` answers `Error::Busy` — a value, not a panic — and an
+    // app that ignored it would write nothing and never know.
+    let clicks: std::rc::Rc<std::cell::Cell<bool>> = std::rc::Rc::new(std::cell::Cell::new(false));
+    let seen = std::rc::Rc::clone(&clicks);
+    let btn = h.ui().build(
+        button("b")
+            .name("b")
+            .on_click(move |_s: &mut (), ui: &mut Ui<()>| {
+                let me = nitro_ui::introspect::resolve(ui, "b").expect("the button");
+                seen.set(ui.widget_mut::<Button<()>>(me).is_err());
+            }),
+    );
+    h.ui().attach(root, btn).unwrap();
+    h.settle();
+    h.click(btn);
+    h.settle();
+    assert!(
+        clicks.get(),
+        "a widget cannot reach itself from inside its own callback — `Error::Busy`, by design"
+    );
+
+    // And the cure, in the shape the app uses: the callback queues the
+    // work instead, and it runs with the tree whole.
+    let done = std::rc::Rc::new(std::cell::Cell::new(false));
+    let flag = std::rc::Rc::clone(&done);
+    {
+        let (ui, _state) = h.parts();
+        ui.defer(move |_s: &mut (), ui: &mut Ui<()>| {
+            ui.widget_mut::<Label>(target)
+                .expect("the widget is back in its slot when a deferred callback runs")
+                .set_text("after");
+            flag.set(true);
+        });
+        assert_eq!(ui.deferred_count(), 1, "queued, not run");
+    }
+    {
+        let (ui, state) = h.parts();
+        ui.run_deferred(state);
+    }
+    h.settle();
+    assert!(done.get(), "the deferred callback ran");
+    assert_eq!(h.widget::<Label>(target).text(), "after");
+    assert_eq!(h.ui().deferred_count(), 0, "the queue drained");
+
+    // A deferred callback may defer again — a navigation that triggers a
+    // re-listing is the real case — and both run in the same pass.
+    {
+        let (ui, _state) = h.parts();
+        ui.defer(move |_s: &mut (), ui: &mut Ui<()>| {
+            ui.defer(move |_s: &mut (), ui: &mut Ui<()>| {
+                if let Ok(mut l) = ui.widget_mut::<Label>(target) {
+                    l.set_text("nested");
+                }
+            });
+        });
+    }
+    {
+        let (ui, state) = h.parts();
+        ui.run_deferred(state);
+    }
+    h.settle();
+    assert_eq!(h.widget::<Label>(target).text(), "nested");
+    h.quit();
+}

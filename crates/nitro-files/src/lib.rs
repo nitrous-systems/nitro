@@ -342,6 +342,31 @@ impl Files {
     pub fn scanning(&self) -> bool {
         self.scan.is_some()
     }
+    /// The background scan's wakeup descriptor and its hook, if one is
+    /// in flight.
+    ///
+    /// For a test driving the loop by hand: the harness runs the `Ui` on
+    /// the test thread and has no `epoll`, so a test `poll`s this
+    /// descriptor exactly as `epoll_wait` would and then calls
+    /// [`nitro_ui::Ui::run_fd`] with the token — the same pair of steps
+    /// the app loop takes on a wakeup, with the shipped dispatch after
+    /// it. Without it a test could only fake the *whole* handoff, which
+    /// is the half that is worth asserting.
+    #[must_use]
+    pub fn scan_hook(&self) -> Option<(std::os::fd::BorrowedFd<'_>, nitro_ui::FdToken)> {
+        self.scan
+            .as_ref()
+            .map(|(scan, token)| (scan.as_fd(), *token))
+    }
+
+    /// The inotify watch's descriptor and its hook, if the watch is
+    /// armed. Driven by a test exactly as [`Files::scan_hook`] is.
+    #[must_use]
+    pub fn watch_hook(&self) -> Option<(std::os::fd::BorrowedFd<'_>, nitro_ui::FdToken)> {
+        use std::os::fd::AsFd as _;
+
+        self.watch.as_ref().map(|(fd, token)| (fd.as_fd(), *token))
+    }
 
     /// The full path of the row at `index` of the *shown* rows.
     #[must_use]
@@ -454,8 +479,13 @@ pub fn build(ui: &mut Ui<Files>) -> WidgetId {
             .placeholder("Path")
             .grow(1.0)
             .on_submit(|s: &mut Files, ui: &mut Ui<Files>, text: &str| {
+                // Deferred, like every callback in this file that writes
+                // back to the widget it came from: `navigate` rewrites
+                // this very field with the normalised path, and a write
+                // from inside the field's own dispatch would land in an
+                // `Error::Busy` nobody reads. See `Ui::defer`.
                 let to = dir::resolve(text, &s.cwd.clone());
-                navigate(s, ui, to);
+                ui.defer(move |s: &mut Files, ui: &mut Ui<Files>| navigate(s, ui, to));
             })
             // A change navigates **only when the field is not focused**,
             // and that distinction is what makes `hey nitro-files set
@@ -486,7 +516,7 @@ pub fn build(ui: &mut Ui<Files>) -> WidgetId {
                 if to == s.cwd {
                     return;
                 }
-                navigate(s, ui, to);
+                ui.defer(move |s: &mut Files, ui: &mut Ui<Files>| navigate(s, ui, to));
             }),
     );
     let up = ui.build(
@@ -507,7 +537,17 @@ pub fn build(ui: &mut Ui<Files>) -> WidgetId {
             .grow(1.0)
             .width_percent(1.0)
             .on_activate(|s: &mut Files, ui: &mut Ui<Files>, index: usize| {
-                activate(s, ui, index);
+                // **Deferred, and this is the one that proves the rule.**
+                // Activating a row means "show a different directory in
+                // this list", so the work writes rows into the very
+                // widget whose callback is running — which take-out
+                // dispatch has moved out of its slot. Called inline it
+                // updated the path bar and left the old rows on screen,
+                // because `widget_mut` answered `Error::Busy` and the
+                // app dropped it. `Ui::defer` runs it a moment later
+                // with the tree whole.
+                let _ = s;
+                ui.defer(move |s: &mut Files, ui: &mut Ui<Files>| activate(s, ui, index));
             }),
     );
 
@@ -523,7 +563,12 @@ pub fn build(ui: &mut Ui<Files>) -> WidgetId {
             .width_percent(1.0)
             .height(0.0)
             .on_submit(|s: &mut Files, ui: &mut Ui<Files>, text: &str| {
-                commit_edit(s, ui, text);
+                // Deferred: `commit_edit` closes this field (clears it
+                // and takes its height back to zero), which is this
+                // field writing to itself.
+                let _ = s;
+                let text = text.to_owned();
+                ui.defer(move |s: &mut Files, ui: &mut Ui<Files>| commit_edit(s, ui, &text));
             }),
     );
 
@@ -797,10 +842,17 @@ pub fn navigate(s: &mut Files, ui: &mut Ui<Files>, to: PathBuf) {
     s.cwd = to;
     s.message = None;
     cancel_edit(s, ui);
-    if let Some(ids) = s.ids
-        && let Ok(mut f) = ui.widget_mut::<TextField<Files>>(ids.path)
-    {
-        f.set_text(s.cwd.display().to_string());
+    // Rewrite the path bar with the **normalised** path, whatever the
+    // user typed: submitting `~/src/../src/` should leave `/home/…/src`
+    // in the bar, because the bar is a statement about where you are
+    // rather than a record of what you pressed. The setter drops an
+    // unchanged string, so navigating from the list costs nothing here.
+    if let Some(ids) = s.ids {
+        let shown = s.cwd.display().to_string();
+        match ui.widget_mut::<TextField<Files>>(ids.path) {
+            Ok(mut f) => f.set_text(shown),
+            Err(e) => complain("the path bar", &e),
+        }
     }
     relist(s, ui);
 }
@@ -992,14 +1044,37 @@ fn watch_fired(s: &mut Files, ui: &mut Ui<Files>) {
 /// costs is a screenful: [`List::set_rows`](nitro_ui::List) bumps a
 /// generation and the next paint re-emits the rows that are materialised
 /// — a few dozen — whatever the directory holds.
+///
+/// **A write that fails is reported, not dropped.** The failure this
+/// guards against has already happened once: called from inside the
+/// list's own `on_activate`, the list is out of its arena slot and
+/// `widget_mut` answers [`nitro_ui::Error::Busy`] — so an `if let
+/// Ok(…)` here left the previous directory's rows on screen while the
+/// path bar said something else, with nothing anywhere returning an
+/// error anybody read. The callbacks now defer (see `Ui::defer`), so
+/// this should not be reachable; [`complain`] is what makes the next
+/// one audible instead of invisible.
 pub fn refresh_rows(s: &mut Files, ui: &mut Ui<Files>) {
     let rows = s.rows();
-    if let Some(ids) = s.ids
-        && let Ok(mut l) = ui.widget_mut::<List<Files>>(ids.list)
-    {
-        l.set_rows(rows);
+    if let Some(ids) = s.ids {
+        match ui.widget_mut::<List<Files>>(ids.list) {
+            Ok(mut l) => l.set_rows(rows),
+            Err(e) => complain("the file list", &e),
+        }
     }
     show_status(s, ui);
+}
+
+/// Say that a write to the tree failed, once, on stderr.
+///
+/// Every write in this file goes to a widget the app built and still
+/// owns, so a failure is a bug in this file rather than a condition to
+/// handle: the honest response is to be loud in the journal and carry
+/// on. Not `unwrap` — a file manager should not die because a label did
+/// not update — and not silence, which is the bug this exists because
+/// of.
+fn complain(what: &str, e: &nitro_ui::Error) {
+    eprintln!("nitro-files: could not update {what}: {e}");
 }
 
 /// Write the status line: the confirm prompt, the last message, or the
@@ -1017,8 +1092,9 @@ pub fn show_status(s: &mut Files, ui: &mut Ui<Files>) {
         t if t.is_empty() => counts,
         t => format!("{counts} — {t}"),
     };
-    if let Ok(mut l) = ui.widget_mut::<Label>(ids.status) {
-        l.set_text(text);
+    match ui.widget_mut::<Label>(ids.status) {
+        Ok(mut l) => l.set_text(text),
+        Err(e) => complain("the status line", &e),
     }
 }
 
@@ -1079,12 +1155,15 @@ pub fn open(s: &mut Files, ui: &mut Ui<Files>, path: &Path) {
 fn start_edit(s: &mut Files, ui: &mut Ui<Files>, what: Editing, initial: &str) {
     let Some(ids) = s.ids else { return };
     s.editing = what;
-    if let Ok(mut f) = ui.widget_mut::<TextField<Files>>(ids.edit) {
-        f.set_text(initial);
-        f.select_all();
-        let mut style = f.ui().style(ids.edit);
-        style.height = nitro_ui::Length::Auto;
-        f.set_style(style);
+    match ui.widget_mut::<TextField<Files>>(ids.edit) {
+        Ok(mut f) => {
+            f.set_text(initial);
+            f.select_all();
+            let mut style = f.ui().style(ids.edit);
+            style.height = nitro_ui::Length::Auto;
+            f.set_style(style);
+        }
+        Err(e) => complain("the edit field", &e),
     }
     ui.focus(ids.edit);
     s.message = Some(match &s.editing {
@@ -1102,11 +1181,14 @@ fn cancel_edit(s: &mut Files, ui: &mut Ui<Files>) {
     }
     s.editing = Editing::None;
     let Some(ids) = s.ids else { return };
-    if let Ok(mut f) = ui.widget_mut::<TextField<Files>>(ids.edit) {
-        f.set_text("");
-        let mut style = f.ui().style(ids.edit);
-        style.height = nitro_ui::Length::Px(0.0);
-        f.set_style(style);
+    match ui.widget_mut::<TextField<Files>>(ids.edit) {
+        Ok(mut f) => {
+            f.set_text("");
+            let mut style = f.ui().style(ids.edit);
+            style.height = nitro_ui::Length::Px(0.0);
+            f.set_style(style);
+        }
+        Err(e) => complain("the edit field", &e),
     }
     ui.focus(ids.list);
     show_status(s, ui);

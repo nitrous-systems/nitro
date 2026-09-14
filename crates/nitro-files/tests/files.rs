@@ -229,7 +229,7 @@ fn a_directory_lists_its_folders_first_then_its_files_by_name() {
     std::fs::create_dir_all(dir.join("Beta")).expect("a subdirectory");
     std::fs::write(dir.join("notes.txt"), vec![b'x'; 912]).expect("a file");
     write(&dir.join("Photo.png"), "not really a png");
-    let (mut h, ids) = app(&dir, &root.join("xdg"));
+    let (h, ids) = app(&dir, &root.join("xdg"));
 
     let rows = rows(&h, ids);
     assert_eq!(
@@ -306,6 +306,26 @@ fn a_path_submitted_in_the_bar_navigates_and_a_bad_one_only_complains() {
     write(&sub.join("inner.txt"), "inner");
     write(&dir.join("outer.txt"), "outer");
     let (mut h, ids) = app(&dir, &root.join("xdg"));
+
+    // A path the user typed loosely is normalised, and the *field* is
+    // rewritten with the answer — `navigate` writes the path bar on every
+    // navigation, and this one arrives from inside that same field's
+    // `on_submit`. What a user sees if it does not: they typed
+    // `~/src/../src/`, they are in `~/src`, and the bar still shows the
+    // detour, so the next Enter re-resolves a path that no longer means
+    // what is on screen.
+    let messy = format!("{}/sub/../sub/", dir.display());
+    submit_path(&mut h, ids, &messy);
+    assert_eq!(h.state().cwd(), sub, "the messy path resolved to sub");
+    assert_eq!(
+        path_text(&h, ids),
+        sub.display().to_string(),
+        "and the path bar was rewritten with the path it actually went to"
+    );
+    assert_eq!(names_of(&h, ids), ["inner.txt"]);
+
+    submit_path(&mut h, ids, &dir.display().to_string());
+    assert_eq!(h.state().cwd(), dir);
 
     submit_path(&mut h, ids, &sub.display().to_string());
     assert_eq!(h.state().cwd(), sub, "a typed path navigates");
@@ -575,33 +595,67 @@ fn delete_asks_first_and_n_leaves_the_file_where_it_is() {
     // A delete key that deleted would be the one destructive key in the
     // program with no way back. The question lives in the status line and
     // the next key answers it; `n` must leave the file alone.
+    //
+    // The file is called `notes.txt` **on purpose**, and that is the
+    // whole point of this test rather than a detail of it: app-level key
+    // handlers are offered only what the focused chain declined, and a
+    // focused `List` consumes any printable key as type-ahead. With the
+    // list still focused, `n` would not be "no" — it would be "jump to
+    // the first row starting with n", which is this one — and the
+    // question would eat its own answer. A pending confirm therefore
+    // takes the keyboard (`nitro_files::ask` blurs), and this asserts
+    // that property from the outside: against the version without the
+    // blur, the file is trashed on the next `y` and this test fails.
     let (root, dir) = fixture("confirm-no");
-    write(&dir.join("doomed.txt"), "still here");
+    write(&dir.join("notes.txt"), "still here");
     write(&dir.join("keep.txt"), "untouched");
     let (mut h, ids) = app(&dir, &root.join("xdg"));
+    assert_eq!(names_of(&h, ids), ["keep.txt", "notes.txt"]);
 
+    // Select the file whose name starts with the answer.
+    h.key(key::DOWN);
+    h.settle();
     h.key(key::DELETE);
     h.settle();
     assert_eq!(
         h.state().pending_confirm(),
-        Some(&Confirm::Trash(vec![dir.join("doomed.txt")])),
+        Some(&Confirm::Trash(vec![dir.join("notes.txt")])),
         "Delete asks about the row under the cursor"
     );
     assert!(
-        status(&h, ids).contains("Move doomed.txt to the trash? [y/n]"),
+        status(&h, ids).contains("Move notes.txt to the trash? [y/n]"),
         "and asks it in the status line: {:?}",
         status(&h, ids)
     );
+    assert_eq!(
+        h.ui().focused(),
+        None,
+        "a pending question takes the keyboard, or the list types the answer"
+    );
 
-    // `n`: no row starts with an `n`, so the list's type-ahead declines
-    // the key and the app's handler is the one that sees it — which is
-    // the ordering `install` relies on.
     h.key(key::N);
     h.settle();
-    assert!(h.state().pending_confirm().is_none(), "the question is gone");
-    assert!(dir.join("doomed.txt").exists(), "and the file is still here");
+    assert!(
+        h.state().pending_confirm().is_none(),
+        "`n` answered the question rather than jumping to notes.txt"
+    );
+    assert!(dir.join("notes.txt").exists(), "and the file is still here");
     assert_eq!(h.state().message(), Some("cancelled"));
-    assert_eq!(names_of(&h, ids), ["doomed.txt", "keep.txt"]);
+    assert_eq!(names_of(&h, ids), ["keep.txt", "notes.txt"]);
+    assert_eq!(
+        h.ui().focused(),
+        Some(ids.list),
+        "and the keyboard went back to the list"
+    );
+    // The list is live again: type-ahead works, which is the other half
+    // of "the confirm borrowed the focus" rather than kept it.
+    h.key(key::N);
+    h.settle();
+    assert_eq!(
+        h.widget::<List<Files>>(ids.list).cursor(),
+        1,
+        "with no question pending, `n` is type-ahead again"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
     h.quit();
@@ -613,6 +667,13 @@ fn answering_y_moves_the_file_into_the_trash_with_its_info_file() {
     // means `files/<name>` and `info/<name>.trashinfo` both exist. A move
     // that wrote one without the other would look right in the file
     // manager and be unrecoverable from anywhere else.
+    //
+    // Both halves of the move are under `std::env::temp_dir()` — the
+    // directory and the trash root — because the move is a `rename` and a
+    // trash on another filesystem is an `EXDEV` by design (the app says
+    // "on another filesystem; only the home trash is supported" and does
+    // not copy). A fixture that straddled two filesystems would be
+    // testing that message instead of the trash.
     let (root, dir) = fixture("confirm-yes");
     let xdg = root.join("xdg");
     write(&dir.join("doomed.txt"), "goodbye");
@@ -625,6 +686,11 @@ fn answering_y_moves_the_file_into_the_trash_with_its_info_file() {
     h.settle();
 
     assert!(h.state().pending_confirm().is_none());
+    assert_eq!(
+        h.state().message(),
+        Some("moved 1 item to the trash"),
+        "the move succeeded rather than reporting a cross-device rename"
+    );
     assert!(!dir.join("doomed.txt").exists(), "the file left the folder");
     let trash = xdg.join("Trash");
     assert_eq!(
@@ -642,7 +708,6 @@ fn answering_y_moves_the_file_into_the_trash_with_its_info_file() {
         info.contains(&dir.join("doomed.txt").display().to_string()),
         "and records where it came from: {info:?}"
     );
-    assert_eq!(h.state().message(), Some("moved 1 item to the trash"));
     assert_eq!(
         names_of(&h, ids),
         ["keep.txt"],
@@ -687,6 +752,28 @@ fn f2_renames_the_row_under_the_cursor_and_the_list_follows() {
     h.settle();
 
     assert_eq!(h.state().editing(), &Editing::None, "the field closed");
+    // The *widget* closed too, not just the state that describes it.
+    // `commit_edit` calls `cancel_edit`, which empties the field and
+    // collapses it back to `height: Px(0.0)` — and it runs from inside
+    // that same field's `on_submit`. What a user sees if the write is
+    // dropped: the rename worked, the list refreshed, and an edit box is
+    // still sitting under the list holding the name they just committed,
+    // with no way to tell it is no longer live.
+    assert_eq!(
+        h.widget::<TextField<Files>>(ids.edit).text(),
+        "",
+        "the edit field emptied itself after committing"
+    );
+    assert_eq!(
+        h.ui().style(ids.edit).height,
+        nitro_ui::Length::Px(0.0),
+        "and collapsed back out of the layout"
+    );
+    assert_eq!(
+        h.ui().focused(),
+        Some(ids.list),
+        "with the keyboard back on the list"
+    );
     assert!(!dir.join("old.txt").exists());
     assert_eq!(
         std::fs::read_to_string(dir.join("new.txt")).expect("the renamed file"),
@@ -811,20 +898,32 @@ fn ctrl_c_then_ctrl_v_copies_the_file_into_the_new_directory() {
 }
 
 #[test]
-fn a_file_created_behind_our_back_appears_through_the_watch() {
+fn the_watch_follows_the_directory_on_screen_across_navigations() {
     // A `touch` in a terminal shows up here with no refresh key, no poll
     // and no timer. Only the wakeup is faked: the inotify descriptor is
     // polled the way `epoll_wait` would poll it, and the dispatch is the
     // app's own hook.
+    //
+    // Three directories, not one, and that is the point of the test.
+    // `relist` re-arms the watch on every navigation — it removes the old
+    // hook and adds a new one in the same turn — and a toolkit whose
+    // `FdToken` was the raw descriptor number handed the new hook the
+    // token the closed one had just freed, so the app loop's registered
+    // set concluded it was already in the `epoll` set. The visible
+    // failure was a file manager that refreshed in the directory it
+    // started in and in no directory afterwards, which a single-directory
+    // test passes happily. Walking A → B → A is what catches it.
     let (root, dir) = fixture("inotify");
-    write(&dir.join("first.txt"), "one");
-    let (mut h, ids) = app(&dir, &root.join("xdg"));
+    let a = dir.join("a");
+    let b = dir.join("b");
+    write(&a.join("first.txt"), "one");
+    write(&b.join("other.txt"), "other");
+    let (mut h, ids) = app(&a, &root.join("xdg"));
     assert_eq!(names_of(&h, ids), ["first.txt"]);
     let listings = h.state().listings();
 
-    write(&dir.join("second.txt"), "two");
-    drive_watch(&mut h, "a file created in the listed directory");
-
+    write(&a.join("second.txt"), "two");
+    drive_watch(&mut h, "a file created in the first directory");
     assert_eq!(
         names_of(&h, ids),
         ["first.txt", "second.txt"],
@@ -833,6 +932,31 @@ fn a_file_created_behind_our_back_appears_through_the_watch() {
     assert!(
         h.state().listings() > listings,
         "and it appeared because the directory was re-read"
+    );
+
+    // Navigate, which re-arms the watch on the new directory.
+    submit_path(&mut h, ids, &b.display().to_string());
+    assert_eq!(h.state().cwd(), b);
+    assert_eq!(names_of(&h, ids), ["other.txt"]);
+    write(&b.join("fresh.txt"), "three");
+    drive_watch(&mut h, "a file created after navigating");
+    assert_eq!(
+        names_of(&h, ids),
+        ["fresh.txt", "other.txt"],
+        "the re-armed watch fires in the second directory too"
+    );
+
+    // And back: the watch must follow again rather than having been
+    // spent, and a change in the directory we *left* must not be
+    // reported as a change in this one.
+    submit_path(&mut h, ids, &a.display().to_string());
+    assert_eq!(h.state().cwd(), a);
+    write(&a.join("third.txt"), "four");
+    drive_watch(&mut h, "a file created after navigating back");
+    assert_eq!(
+        names_of(&h, ids),
+        ["first.txt", "second.txt", "third.txt"],
+        "and again in the directory we came back to"
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -896,8 +1020,25 @@ fn every_part_is_addressable_the_way_hey_addresses_it() {
     h.settle();
     assert_eq!(h.state().cwd(), dir);
 
+    // The other side of that discriminator: typing into the field fires
+    // the *same* `on_change`, and must not navigate on every letter — a
+    // path bar that jumped to `/home` at the fifth character of
+    // `/home/kaspar` would rewrite the field under the caret.
+    h.ui().focus(ids.path);
+    h.ui()
+        .widget_mut::<TextField<Files>>(ids.path)
+        .expect("the path bar")
+        .set_text(sub.display().to_string());
+    type_text(&mut h, "x");
+    assert_eq!(
+        h.state().cwd(),
+        dir,
+        "typing navigates on Enter, not on every keystroke"
+    );
+
     // `get list text` is the *visible* rows, one per line, tab-separated
     // within a row — and the protocol escapes the newlines.
+    submit_path(&mut h, ids, &dir.display().to_string());
     let text = nitro_ui::introspect::get_prop(h.ui(), &format!("window/{}", names::LIST), "text")
         .expect("the list's text");
     let text = nitro_ui::introspect::unescape(&text);
@@ -909,8 +1050,14 @@ fn every_part_is_addressable_the_way_hey_addresses_it() {
     // `do list activate` enters the selected row.
     {
         let (ui, state) = h.parts();
-        nitro_ui::introspect::invoke(ui, state, &format!("window/{}", names::LIST), "activate", None)
-            .expect("activate the row");
+        nitro_ui::introspect::invoke(
+            ui,
+            state,
+            &format!("window/{}", names::LIST),
+            "activate",
+            None,
+        )
+        .expect("activate the row");
     }
     h.settle();
     assert_eq!(h.state().cwd(), sub, "activate entered the directory");
@@ -923,8 +1070,9 @@ fn every_part_is_addressable_the_way_hey_addresses_it() {
 
     // `get status value` is the counts, and the confirm or message after
     // them.
-    let said = nitro_ui::introspect::get_prop(h.ui(), &format!("window/{}", names::STATUS), "value")
-        .expect("the status line");
+    let said =
+        nitro_ui::introspect::get_prop(h.ui(), &format!("window/{}", names::STATUS), "value")
+            .expect("the status line");
     assert_eq!(said, "1 items, 0 selected");
 
     let _ = std::fs::remove_dir_all(&root);
