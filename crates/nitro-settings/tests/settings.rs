@@ -840,3 +840,118 @@ fn ask(h: &mut Harness<Settings>, socket: &Path, request: &str) -> Vec<String> {
     handle.join().expect("the client thread");
     out.expect("a reply")
 }
+
+#[test]
+fn the_dark_checkbox_writes_the_scheme_at_once() {
+    // The appearance section's whole behaviour: no Apply. Ticking the box
+    // writes `server.conf`, the server's inotify watch picks it up and
+    // the palette reaches every client — including this one, which is
+    // why the test can also assert the dialog's own colours moved.
+    let dir = scratch("scheme");
+    let path = dir.join(conf::FILE_NAME);
+    let mut h = harness(&dir);
+    let before = h.state().applies();
+
+    do_action(&mut h, names::DARK, "toggle");
+
+    let text = std::fs::read_to_string(&path).expect("the file was written");
+    assert!(
+        text.contains("theme.scheme = dark"),
+        "the file says dark:\n{text}"
+    );
+    // And it is the file the *server* would accept, not merely one that
+    // contains the right substring.
+    let parsed = nitro_server::config::parse(&text);
+    assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+    assert_eq!(parsed.theme.scheme, Some(nitro_ui::Scheme::Dark));
+    assert_eq!(
+        h.state().applies(),
+        before,
+        "Apply was not involved: the scheme saves on its own"
+    );
+    assert_eq!(status(&mut h), "scheme: dark");
+
+    // Untick: back to light, written out explicitly rather than by
+    // deleting the key — the user asked for light, and a file that said
+    // nothing would follow whatever the default becomes.
+    do_action(&mut h, names::DARK, "toggle");
+    let text = std::fs::read_to_string(&path).expect("read back");
+    assert!(
+        text.contains("theme.scheme = light"),
+        "the file says light:\n{text}"
+    );
+    h.quit();
+}
+
+#[test]
+fn the_checkbox_starts_on_what_the_file_says() {
+    let dir = scratch("scheme-start");
+    std::fs::write(dir.join(conf::FILE_NAME), "theme.scheme = dark\n").expect("write");
+    let mut h = harness(&dir);
+    let dark = named(&mut h, names::DARK);
+    assert!(
+        h.widget::<Checkbox<Settings>>(dark).is_checked(),
+        "the box reflects the file it opened on"
+    );
+    h.quit();
+}
+
+#[test]
+fn apply_keeps_a_scheme_and_the_per_role_overrides_it_cannot_edit() {
+    // The rule that stops Apply being destructive. `theme.accent` has no
+    // widget in this dialog at all, and the file is rewritten wholesale
+    // — so without the carry-over in `collect`, pressing Apply would
+    // silently delete a colour the user hand-picked.
+    let dir = scratch("scheme-keep");
+    let path = dir.join(conf::FILE_NAME);
+    std::fs::write(
+        &path,
+        "theme.scheme = dark\ntheme.accent = #ff0000\nkeyboard.layout = us\n",
+    )
+    .expect("write");
+    let mut h = harness(&dir);
+
+    set_value(&mut h, names::LAYOUT, "de");
+    do_action(&mut h, names::APPLY, "click");
+
+    let text = std::fs::read_to_string(&path).expect("read back");
+    assert!(text.contains("keyboard.layout = de"), "{text}");
+    assert!(
+        text.contains("theme.scheme = dark"),
+        "the scheme survived Apply:\n{text}"
+    );
+    assert!(
+        text.contains("theme.accent = #ff0000"),
+        "an override this dialog cannot edit survived Apply:\n{text}"
+    );
+    let parsed = nitro_server::config::parse(&text);
+    assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+    h.quit();
+}
+
+#[test]
+fn revert_puts_the_checkbox_back_without_writing() {
+    let dir = scratch("scheme-revert");
+    let path = dir.join(conf::FILE_NAME);
+    std::fs::write(&path, "theme.scheme = light\n").expect("write");
+    let mut h = harness(&dir);
+
+    // Edit the file behind the dialog's back, then Revert: the checkbox
+    // has to follow what is on disk, and the ticking must not itself
+    // write — a Revert that saves is not a revert.
+    std::fs::write(&path, "theme.scheme = dark\n").expect("rewrite");
+    let writes = h.state().scheme_writes();
+    do_action(&mut h, names::REVERT, "click");
+
+    let dark = named(&mut h, names::DARK);
+    assert!(
+        h.widget::<Checkbox<Settings>>(dark).is_checked(),
+        "Revert showed what the file says"
+    );
+    assert_eq!(
+        h.state().scheme_writes(),
+        writes,
+        "setting the checkbox from Revert did not write the file back"
+    );
+    h.quit();
+}

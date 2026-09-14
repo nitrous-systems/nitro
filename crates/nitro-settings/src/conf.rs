@@ -38,6 +38,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use nitro_ui::Scheme;
+
 /// The file's name inside the configuration directory. Must agree with
 /// `nitro_server::config::FILE_NAME`.
 pub const FILE_NAME: &str = "server.conf";
@@ -86,6 +88,33 @@ pub struct KeyboardConf {
     pub options: String,
 }
 
+/// What the `theme.*` keys say, as far as this app models them.
+///
+/// The scheme and nothing else. Per-role overrides (`theme.accent =
+/// #6ca8f0`) are a real `server.conf` feature and this app deliberately
+/// does **not** offer them: a colour picker per role is thirty-odd
+/// controls for a thing a user does once, and the file is the better
+/// interface for it. Which makes the round-trip rule below load-bearing
+/// — see [`ThemeConf::overrides`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ThemeConf {
+    /// `theme.scheme`. `None` means the file said nothing, and the
+    /// server's default (light) applies.
+    pub scheme: Option<Scheme>,
+    /// Every `theme.<role> = <colour>` line the file carried, verbatim
+    /// and in file order.
+    ///
+    /// Kept and written back **unchanged** although nothing in the UI
+    /// can edit them. This is the one exception to "the file is
+    /// rewritten wholesale", and it earns it: the alternative is that
+    /// pressing Apply silently deletes a user's hand-picked accent
+    /// colour, which is a destructive surprise from a button whose whole
+    /// promise is "save what I typed". Unknown *keys* are still lost —
+    /// that limitation stands — but a key this app understands well
+    /// enough to name is not thrown away for want of a widget.
+    pub overrides: Vec<(String, String)>,
+}
+
 /// A whole `server.conf`, as this app models it.
 ///
 /// The outputs are a [`BTreeMap`] rather than a `HashMap` for one
@@ -98,6 +127,8 @@ pub struct Conf {
     pub outputs: BTreeMap<String, OutputConf>,
     /// The keyboard section.
     pub keyboard: KeyboardConf,
+    /// The colour section.
+    pub theme: ThemeConf,
 }
 
 impl Conf {
@@ -149,10 +180,11 @@ pub fn format_scale(scale: f32) -> String {
 ///
 /// The layout is pinned by `apply_writes_exactly_the_expected_file`: two
 /// header comment lines, a blank line, one block per output in connector
-/// order with a blank line between blocks, a blank line, and the three
-/// keyboard lines. Within an output the order is scale, position,
-/// primary — biggest effect first, and `primary` last because it is the
-/// one line that may be missing.
+/// order with a blank line between blocks, a blank line, the three
+/// keyboard lines, and — when there is anything to say about colours — a
+/// blank line and the `theme.*` block. Within an output the order is
+/// scale, position, primary — biggest effect first, and `primary` last
+/// because it is the one line that may be missing.
 #[must_use]
 pub fn render(conf: &Conf) -> String {
     use std::fmt::Write as _;
@@ -178,6 +210,21 @@ pub fn render(conf: &Conf) -> String {
     out.push_str(&keyboard_line("keyboard.layout", &k.layout));
     out.push_str(&keyboard_line("keyboard.variant", &k.variant));
     out.push_str(&keyboard_line("keyboard.options", &k.options));
+    // The theme block is written only when there is something to say,
+    // unlike the keyboard's three always-present lines. A `theme.scheme`
+    // line the user never asked for would pin today's default into the
+    // file, and the default is the one thing that should stay free to
+    // change in a later release.
+    let t = &conf.theme;
+    if t.scheme.is_some() || !t.overrides.is_empty() {
+        out.push('\n');
+        if let Some(scheme) = t.scheme {
+            let _ = writeln!(out, "theme.scheme = {}", scheme.name());
+        }
+        for (role, value) in &t.overrides {
+            let _ = writeln!(out, "theme.{role} = {value}");
+        }
+    }
     out
 }
 
@@ -259,28 +306,58 @@ pub fn parse(text: &str) -> Conf {
             "keyboard.layout" => value.clone_into(&mut conf.keyboard.layout),
             "keyboard.variant" => value.clone_into(&mut conf.keyboard.variant),
             "keyboard.options" => value.clone_into(&mut conf.keyboard.options),
-            _ => {}
+            "theme.scheme" => conf.theme.scheme = Scheme::from_name(value),
+            // Any other `theme.<something>` is a per-role override. It is
+            // not validated here: this app cannot render it and does not
+            // need to understand it, it only has to hand it back
+            // unchanged. The server warns about a role it does not know,
+            // which is the right place for that judgement.
+            other => {
+                if let Some(role) = other.strip_prefix("theme.")
+                    && !role.is_empty()
+                {
+                    conf.theme
+                        .overrides
+                        .push((role.to_owned(), value.to_owned()));
+                }
+            }
         }
     }
     conf
 }
 
 /// Strip a `#` comment, counting a `#` as one only at the start of the
-/// line or after whitespace.
+/// line or after whitespace — and never when it begins a colour literal.
 ///
-/// The server's rule exactly, and for the server's reason: `ctrl:nocaps`
-/// is not the only xkb option string with punctuation in it, and a value
-/// truncated at an inner `#` would be a setting that silently changed
-/// meaning between the app and the compositor.
+/// The server's rule exactly, and for the server's reasons, both of
+/// them: `ctrl:nocaps` is not the only xkb option string with
+/// punctuation in it, so an inner `#` is not a comment; and
+/// `theme.accent = #6ca8f0` puts a `#` exactly where a comment would
+/// start, so a `#` followed by six or eight hex digits and then
+/// whitespace is a value. See `nitro_server::config::strip_comment`,
+/// which this has to agree with byte for byte: a value truncated here
+/// but not there is a setting that silently changes meaning between the
+/// app and the compositor — and, in this app's case, one that Apply
+/// would then delete from the file.
 fn strip_comment(line: &str) -> &str {
     let mut prev_space = true;
     for (i, b) in line.as_bytes().iter().enumerate() {
-        if *b == b'#' && prev_space {
+        if *b == b'#' && prev_space && !is_colour_literal(&line[i..]) {
             return &line[..i];
         }
         prev_space = b.is_ascii_whitespace();
     }
     line
+}
+
+/// Whether `rest` starts with a `#rrggbb`/`#rrggbbaa` token. The
+/// server's rule; see [`strip_comment`].
+fn is_colour_literal(rest: &str) -> bool {
+    let token = rest.split_ascii_whitespace().next().unwrap_or("");
+    let Some(hex) = token.strip_prefix('#') else {
+        return false;
+    };
+    (hex.len() == 6 || hex.len() == 8) && hex.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Parse an `x,y` position.
@@ -592,5 +669,57 @@ keyboard.options = ctrl:nocaps
         let missing = std::env::temp_dir().join("nitro-settings-no-such-file.conf");
         let _ = std::fs::remove_file(&missing);
         assert_eq!(load(&missing), Conf::new());
+    }
+
+    #[test]
+    fn the_theme_section_round_trips_including_the_overrides() {
+        // The round trip that stops Apply from being destructive: this
+        // app has no widget for `theme.accent`, so the only way the key
+        // survives a rewrite is by being carried verbatim.
+        let text = "theme.scheme = dark\n\
+                    theme.accent = #6ca8f0\n\
+                    theme.terminal_background = #14141880\n\
+                    keyboard.layout = de\n";
+        let c = parse(text);
+        assert_eq!(c.theme.scheme, Some(Scheme::Dark));
+        assert_eq!(
+            c.theme.overrides,
+            vec![
+                ("accent".to_owned(), "#6ca8f0".to_owned()),
+                ("terminal_background".to_owned(), "#14141880".to_owned()),
+            ]
+        );
+        let back = parse(&render(&c));
+        assert_eq!(back.theme, c.theme);
+        assert_eq!(back.keyboard.layout, "de");
+    }
+
+    #[test]
+    fn a_colour_literal_is_not_a_comment() {
+        // The `#` in `#6ca8f0` sits exactly where a comment starts. The
+        // server makes the same exception; if these two ever disagree,
+        // Apply silently deletes the user's colour.
+        let c = parse("theme.accent = #6ca8f0  # the blue one\n");
+        assert_eq!(
+            c.theme.overrides,
+            vec![("accent".to_owned(), "#6ca8f0".to_owned())]
+        );
+        // And a comment that is not hex is still a comment.
+        assert!(
+            parse("# theme.accent = #ff0000\n")
+                .theme
+                .overrides
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn no_theme_section_writes_no_theme_lines() {
+        // A `theme.scheme` nobody asked for would pin today's default
+        // into the file, and the default is the one thing that should
+        // stay free to change.
+        let text = render(&example());
+        assert!(!text.contains("theme."), "{text}");
+        assert_eq!(parse(&text).theme, ThemeConf::default());
     }
 }

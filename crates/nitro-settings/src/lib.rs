@@ -118,7 +118,7 @@ use nitro_ui::widgets::{
     Checkbox, FlexBuilder, Label, LabelBuilder, Slider, TextField, TextFieldBuilder, button,
     checkbox, column, label, row, separator, slider, spacer, text_field,
 };
-use nitro_ui::{App, ColorRole, CrossAlign, Error, Size, Ui, WidgetId};
+use nitro_ui::{App, ColorRole, CrossAlign, Error, Scheme, Size, Ui, WidgetId};
 
 use audio::Backend;
 use conf::{Conf, KeyboardConf};
@@ -199,6 +199,15 @@ const NOTE_NO_SHELL: &str =
 /// What it says when the server has outputs but told us about none.
 const NOTE_NO_OUTPUTS: &str = "The server reported no outputs.";
 
+/// What the appearance note says.
+///
+/// It states the one thing about this section that differs from every
+/// other control in the window — no Apply — because a user who ticked it
+/// and then pressed Apply out of habit should not wonder whether the
+/// first action took.
+const NOTE_APPEARANCE: &str =
+    "The scheme is saved and applied at once; per-colour overrides live in server.conf.";
+
 /// The `hey`-addressable names of every widget in the dialog.
 ///
 /// Published as constants for the reason `nitro-bar` publishes its own:
@@ -250,6 +259,13 @@ pub mod names {
     pub const MUTE: &str = "mute";
     /// Which backend was found, or that none was.
     pub const AUDIO_STATUS: &str = "audio_status";
+
+    /// The appearance section's row.
+    pub const APPEARANCE: &str = "appearance";
+    /// The dark-scheme checkbox: `theme.scheme`.
+    pub const DARK: &str = "dark";
+    /// The line saying which scheme is in force and that it is live.
+    pub const APPEARANCE_NOTE: &str = "appearance_note";
 
     /// The Apply button.
     pub const APPLY: &str = "apply";
@@ -337,6 +353,13 @@ pub struct Settings {
     /// What the status line last said, so a test can read the verdict
     /// without going through a widget lookup.
     status: String,
+    /// How many times the scheme checkbox has written the file.
+    ///
+    /// Counted for the same reason `applies` is: the appearance section
+    /// writes outside the Apply path, so a test needs a way to say "that
+    /// click really did reach the disk" that is not "read the file and
+    /// hope".
+    scheme_writes: u64,
 }
 
 impl Settings {
@@ -354,6 +377,7 @@ impl Settings {
             applies: 0,
             reverts: 0,
             status: String::new(),
+            scheme_writes: 0,
         }
     }
 
@@ -427,6 +451,16 @@ impl Settings {
         self.reverts
     }
 
+    /// How many times the scheme checkbox has written `server.conf`.
+    ///
+    /// The appearance section saves outside the Apply path, so this is
+    /// how a test says "that click reached the disk" — and, more
+    /// usefully, "that one did *not*".
+    #[must_use]
+    pub fn scheme_writes(&self) -> u64 {
+        self.scheme_writes
+    }
+
     /// What the status line last said.
     #[must_use]
     pub fn status(&self) -> &str {
@@ -456,6 +490,8 @@ struct Ids {
     volume_value: WidgetId,
     mute: WidgetId,
     audio_status: WidgetId,
+    dark: WidgetId,
+    appearance_note: WidgetId,
     status: WidgetId,
 }
 
@@ -563,13 +599,43 @@ pub fn build(ui: &mut Ui<Settings>) -> WidgetId {
         ui.attach(audio, child).unwrap();
     }
 
-    // -- apply / revert ------------------------------------------------
+    // -- appearance ----------------------------------------------------
+    //
+    // One checkbox, because there are two schemes. A pair of radio
+    // buttons would say the same thing in twice the space, and a
+    // drop-down would promise a list that does not exist.
+    //
+    // Unlike every other control in this window, this one **does not
+    // wait for Apply**: it writes `server.conf` on the spot. A colour
+    // scheme is the one setting whose result you judge by looking at it,
+    // and the server pushes the new palette to every client within a
+    // frame — so "tick it and watch the desktop change" is the whole
+    // interaction. Making the user press Apply afterwards would be
+    // asking them to confirm something they can already see.
+    //
+    // The status label is built *before* the checkbox because the
+    // toggle's callback writes to it, and a builder's callback can only
+    // capture ids that already exist — the same ordering the audio
+    // section uses for `audio_status`.
     let status = ui.build(
         label("")
             .name(names::STATUS)
             .size(TEXT_SIZE)
             .color_role(ColorRole::TextDim),
     );
+    let dark = ui.build(checkbox("Dark").name(names::DARK).on_toggle(
+        move |s: &mut Settings, ui: &mut Ui<Settings>, on: bool| {
+            set_scheme(s, ui, status, on);
+        },
+    ));
+    let appearance_note = ui.build(
+        label(NOTE_APPEARANCE)
+            .name(names::APPEARANCE_NOTE)
+            .size(TEXT_SIZE)
+            .color_role(ColorRole::TextDim),
+    );
+
+    // -- apply / revert ------------------------------------------------
     let ids = Ids {
         displays,
         displays_note,
@@ -580,6 +646,8 @@ pub fn build(ui: &mut Ui<Settings>) -> WidgetId {
         volume_value,
         mute,
         audio_status,
+        dark,
+        appearance_note,
         status,
     };
     let apply_button = ui.build(
@@ -605,9 +673,16 @@ pub fn build(ui: &mut Ui<Settings>) -> WidgetId {
     let h_displays = ui.build(heading("Displays"));
     let h_keyboard = ui.build(heading("Keyboard"));
     let h_audio = ui.build(heading("Audio"));
+    let h_appearance = ui.build(heading("Appearance"));
+    let appearance = ui.build(control_row().name(names::APPEARANCE));
+    let scheme_caption = ui.build(caption("Colour scheme"));
+    for child in [scheme_caption, dark] {
+        ui.attach(appearance, child).unwrap();
+    }
     let sep_a = ui.build(separator().width_percent(1.0));
     let sep_b = ui.build(separator().width_percent(1.0));
     let sep_c = ui.build(separator().width_percent(1.0));
+    let sep_d = ui.build(separator().width_percent(1.0));
     for child in [
         h_displays,
         displays,
@@ -620,6 +695,10 @@ pub fn build(ui: &mut Ui<Settings>) -> WidgetId {
         audio,
         audio_status,
         sep_c,
+        h_appearance,
+        appearance,
+        appearance_note,
+        sep_d,
         buttons,
     ] {
         ui.attach(root, child).unwrap();
@@ -705,6 +784,7 @@ fn init(s: &mut Settings, ui: &mut Ui<Settings>, ids: Ids) {
 
     let conf = load_conf(s);
     fill_keyboard(ui, ids, &conf.keyboard);
+    fill_appearance(ui, ids, &conf.theme);
 
     // Asking for the outputs *subscribes*, so this is the only request
     // the dialog ever makes about them: everything after it arrives
@@ -1031,6 +1111,15 @@ fn collect(s: &Settings, ui: &Ui<Settings>, ids: Ids) -> (Conf, Vec<String>) {
         variant: field_text(ui, ids.variant),
         options: field_text(ui, ids.options),
     };
+    // The colour section is carried over from the file rather than
+    // rendered from the widgets, and it is the one place this dialog
+    // does that. The scheme checkbox already wrote it (`set_scheme`
+    // saves on the spot), and the per-role overrides have no widget at
+    // all — so the only honest thing Apply can do with `theme.*` is hand
+    // back what is on disk. Collecting it from the tree would mean Apply
+    // deleting a user's hand-picked `theme.accent`, from a button that
+    // promises to save.
+    conf.theme = load_conf(s).theme;
     (conf, unreadable)
 }
 
@@ -1093,6 +1182,7 @@ fn revert(s: &mut Settings, ui: &mut Ui<Settings>, ids: Ids) {
     s.reverts += 1;
     let conf = load_conf(s);
     fill_keyboard(ui, ids, &conf.keyboard);
+    fill_appearance(ui, ids, &conf.theme);
     for r in s.rows.clone() {
         let saved = conf.output(&r.connector);
         let scale = saved
@@ -1125,6 +1215,60 @@ fn fill_keyboard(ui: &mut Ui<Settings>, ids: Ids, k: &KeyboardConf) {
     set_field(ui, ids.layout, &k.layout);
     set_field(ui, ids.variant, &k.variant);
     set_field(ui, ids.options, &k.options);
+}
+
+/// Put the appearance section back to what the file says.
+fn fill_appearance(ui: &mut Ui<Settings>, ids: Ids, t: &conf::ThemeConf) {
+    let dark = t.scheme.unwrap_or_default() == Scheme::Dark;
+    if let Ok(mut c) = ui.widget_mut::<Checkbox<Settings>>(ids.dark) {
+        // `set_checked` does not fire `on_change`, which is what makes
+        // this safe to call from Revert: a setter that re-entered
+        // `set_scheme` would write the file back out on every Revert,
+        // and a Revert that writes is not a revert.
+        c.set_checked(dark);
+    }
+}
+
+/// Write the scheme to `server.conf` and let the server push it.
+///
+/// The odd one out in this window: it saves immediately rather than
+/// waiting for Apply. See the comment on the checkbox in [`build`].
+///
+/// Everything else in the file is preserved, because the rest of the
+/// dialog is *not* collected here: the file is re-read, one key is
+/// changed, and it goes back. Rendering from the widgets instead would
+/// mean ticking "Dark" silently committed a half-edited keyboard layout
+/// the user had not pressed Apply for.
+fn set_scheme(s: &mut Settings, ui: &mut Ui<Settings>, status: WidgetId, dark: bool) {
+    s.scheme_writes += 1;
+    let say = |s: &mut Settings, ui: &mut Ui<Settings>, text: String| {
+        text.clone_into(&mut s.status);
+        set_label(ui, status, &text);
+    };
+    let Some(path) = s.path.clone() else {
+        say(
+            s,
+            ui,
+            "no config path: set $HOME or $NITRO_CONFIG".to_owned(),
+        );
+        return;
+    };
+    let mut conf = load_conf(s);
+    conf.theme.scheme = Some(if dark { Scheme::Dark } else { Scheme::Light });
+    if let Err(e) = conf::write(&path, &conf) {
+        say(s, ui, format!("could not save the scheme: {e}"));
+        return;
+    }
+    // No `wait_for_reload` here, unlike Apply. The confirmation a user
+    // wants for a colour scheme is the screen changing colour, which
+    // happens on its own within a frame; blocking the click for up to
+    // `RELOAD_WAIT` to be able to write "applied" in a status line would
+    // make the one instant control in the window the slowest.
+    say(
+        s,
+        ui,
+        format!("scheme: {}", if dark { "dark" } else { "light" }),
+    );
 }
 
 /// Write the status line and remember what it says.
