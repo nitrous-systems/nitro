@@ -712,6 +712,16 @@ no-SIMD ceiling scene (d) runs into.
   slightly worse on the box.
 - Caching the per-row column extents in `RowSpans`: slower — the struct is
   copied per row and got bigger.
+
+  Those three, plus `zerocopy` above, were **re-checked this round** against
+  the question "was this rejected because the destination was
+  write-combined?". None of them was: every one was measured on this
+  benchmark, i.e. against heap memory, which is what the server now paints
+  into. #539 gives no reason to revisit them, and they stay rejected on their
+  original numbers. The blit row split was the only entry in this list whose
+  rejection turned on the destination's memory type — the premultiply-caching
+  entry below reads as if it might be a second one, and is not: it was
+  rejected on a heap measurement too.
 - **Splitting the blit row into edge/interior runs** — **re-taken, no longer
   rejected.** Tried twice in #3693. The first attempt split on *coverage*
   alone and kept the per-pixel clamp and the early-`continue`s, so the
