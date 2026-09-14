@@ -7,7 +7,7 @@ use crate::paint::{
     RowPaint, blend_mask_row, blend_mask_row_opaque, blend_pixel, blend_solid, mix, paint_cov,
     paint_full, store_solid,
 };
-use crate::shape::RRect;
+use crate::shape::{RRect, RowSpans};
 
 /// A source pixel: `b`/`g`/`r` plus straight or premultiplied alpha,
 /// depending on who produced it (see each function's docs).
@@ -860,6 +860,35 @@ impl<'a> Canvas<'a> {
         src_rect: &IRect,
         opacity: f32,
     ) {
+        self.blit_impl(clip, dst, src, src_rect, opacity, true);
+    }
+
+    /// [`Canvas::blit`] with the scaled blit's run split forced off, so the
+    /// tests can assert the split and the general walk agree byte for byte.
+    #[cfg(test)]
+    pub(crate) fn blit_general(
+        &mut self,
+        clip: &IRect,
+        dst: &Rect,
+        src: &Image<'_>,
+        src_rect: &IRect,
+        opacity: f32,
+    ) {
+        self.blit_impl(clip, dst, src, src_rect, opacity, false);
+    }
+
+    /// [`Canvas::blit`] plus the test-only switch that disables the run split.
+    #[allow(clippy::too_many_arguments)] // the public wrapper is the API; this
+    // is it plus one test-only switch
+    fn blit_impl(
+        &mut self,
+        clip: &IRect,
+        dst: &Rect,
+        src: &Image<'_>,
+        src_rect: &IRect,
+        opacity: f32,
+        split: bool,
+    ) {
         let opacity = unit_u8(opacity);
         if opacity == 0 || !src.is_valid() {
             return;
@@ -908,10 +937,24 @@ impl<'a> Canvas<'a> {
             &sr,
             &shape,
             opacity,
+            split,
         );
     }
 
     /// The general (scaled) blit: bilinear, one destination row at a time.
+    ///
+    /// Each row is split into up to three runs: an interior where the
+    /// destination coverage is constant *and* every sampled texel pair lies
+    /// inside the source rect, and the leading/trailing columns where one or
+    /// both fail. The interior is the overwhelming majority of every blit and
+    /// gets a branch-free loop ([`blit_run_inner`]); the edges keep the fully
+    /// general one ([`blit_run_edge`]).
+    ///
+    /// `split == false` (tests only) routes every column through the edge run,
+    /// which is the pre-split loop verbatim — that is what
+    /// `blit_split_is_byte_identical_to_the_general_walk` compares against.
+    #[allow(clippy::too_many_arguments)] // a private path already carrying a
+    // bounds struct; the switch is test-only
     fn blit_scaled(
         &mut self,
         b: BlitBounds,
@@ -920,10 +963,19 @@ impl<'a> Canvas<'a> {
         sr: &IRect,
         shape: &RRect,
         opacity: u8,
+        split: bool,
     ) {
         let BlitBounds { y0, y1, cx0, cx1 } = b;
         let scale_x = sr.w as f32 / dst.w;
         let scale_y = sr.h as f32 / dst.h;
+        // Step the source x in 16.16 fixed point instead of recomputing a
+        // float and a `floor()` per pixel: two integer adds per pixel.
+        let step = (scale_x * 65536.0) as i64;
+        let (src_first, src_last) = (sr.x, sr.right() - 1);
+        let opaque_src = src.format.is_opaque();
+        let src_pitch = src.stride as usize;
+        let full_extra = u32::from(effective_alpha(255, 255, opacity));
+        let stride = self.stride as usize;
         for y in y0..y1 {
             let spans = shape.row_spans(y);
             if spans.is_empty() {
@@ -943,79 +995,56 @@ impl<'a> Canvas<'a> {
             // Hoist the two source rows the whole destination row samples
             // from: the inner loop then indexes two slices instead of doing
             // four independent clamped address computations per pixel.
-            let src_pitch = src.stride as usize;
             let iy0 = iy.clamp(sr.y, sr.bottom() - 1) as usize;
             let iy1 = (iy + 1).clamp(sr.y, sr.bottom() - 1) as usize;
-            let srow0 = &src.data[iy0 * src_pitch..];
-            let srow1 = &src.data[iy1 * src_pitch..];
-            // Step the source x in 16.16 fixed point instead of recomputing a
-            // float and a `floor()` per pixel: two integer adds per pixel.
             let sx0 = (lo as f32 + 0.5 - dst.x) * scale_x + sr.x as f32 - 0.5;
-            let step = (scale_x * 65536.0) as i64;
             let base = (sx0 * 65536.0).floor() as i64;
-            // Clamp the horizontal source range so the interior of the row
-            // needs no per-pixel clamp at all: for `x` in `[in_lo, in_hi)` the
-            // texel pair `[ix, ix+1]` is guaranteed inside `sr`.
-            let (src_first, src_last) = (sr.x, sr.right() - 1);
-            let opaque_src = src.format.is_opaque();
-            let stride = self.stride as usize;
+            let sampler = RowSampler {
+                srow0: &src.data[iy0 * src_pitch..],
+                srow1: &src.data[iy1 * src_pitch..],
+                ty,
+                base,
+                step,
+                opaque: opaque_src,
+            };
+            // The interior run: constant coverage (only the first and last
+            // column of the destination can be partially covered) intersected
+            // with the columns whose texel pair needs no clamp.
+            let (in_lo, in_hi) = texels_in_range(base, step, lo, hi, src_first, src_last);
+            let (fast_lo, fast_hi) = if split && spans.is_full_height() {
+                (
+                    spans.full_start().max(lo).max(in_lo),
+                    spans.full_end().min(hi).min(in_hi),
+                )
+            } else {
+                (lo, lo)
+            };
+            let (fast_lo, fast_hi) = if fast_lo < fast_hi {
+                (fast_lo, fast_hi)
+            } else {
+                (lo, lo)
+            };
             let start = y as usize * stride + lo as usize * BYTES_PER_PIXEL;
             let len = (hi - lo) as usize * BYTES_PER_PIXEL;
             let row = &mut self.data[start..start + len];
-            // Only the first and last column of the row can have fractional
-            // destination-edge coverage; the interior skips the coverage call.
-            let full_lo = spans.full_start().max(lo);
-            let full_hi = spans.full_end().min(hi);
-            let row_full = spans.is_full_height();
-            let full_extra = u32::from(effective_alpha(255, 255, opacity));
-            let mut fixed = base;
-            for (x, d) in (lo..).zip(row.chunks_exact_mut(4)) {
-                let ix = (fixed >> 16) as i32;
-                let tx = ((fixed >> 8) & 0xFF) as u32;
-                fixed += step;
-                // Fetch each row's texel *pair* as one 8-byte slice when the
-                // pair is in range (the overwhelmingly common case): two
-                // bounds checks per pixel instead of four.
-                let t = if ix >= src_first && ix < src_last {
-                    let o = ix as usize * BYTES_PER_PIXEL;
-                    bilinear(&srow0[o..o + 8], &srow1[o..o + 8], tx, ty, opaque_src)
-                } else {
-                    // Edge-extend: build the pair by hand.
-                    let a = ix.clamp(src_first, src_last) as usize * BYTES_PER_PIXEL;
-                    let b = (ix + 1).clamp(src_first, src_last) as usize * BYTES_PER_PIXEL;
-                    let mut p0 = [0u8; 8];
-                    let mut p1 = [0u8; 8];
-                    p0[..4].copy_from_slice(&srow0[a..a + 4]);
-                    p0[4..].copy_from_slice(&srow0[b..b + 4]);
-                    p1[..4].copy_from_slice(&srow1[a..a + 4]);
-                    p1[4..].copy_from_slice(&srow1[b..b + 4]);
-                    bilinear(&p0, &p1, tx, ty, opaque_src)
-                };
-                if t.a == 0 {
-                    continue;
-                }
-                // `t` is premultiplied by `t.a`; scaling it by the extra
-                // `coverage * opacity` factor keeps it premultiplied by the
-                // effective alpha, with no per-pixel division.
-                let extra = if row_full && x >= full_lo && x < full_hi {
-                    full_extra
-                } else {
-                    u32::from(effective_alpha(255, unit_u8(spans.cov(x)), opacity))
-                };
-                if extra == 0 {
-                    continue;
-                }
-                let alpha = div255(t.a * extra);
-                if alpha == 0 {
-                    continue;
-                }
-                let out = [
-                    over_premul(div255(t.b * extra), u32::from(d[0]), alpha),
-                    over_premul(div255(t.g * extra), u32::from(d[1]), alpha),
-                    over_premul(div255(t.r * extra), u32::from(d[2]), alpha),
-                    0,
-                ];
-                d.copy_from_slice(&out);
+            let (head, rest) = row.split_at_mut((fast_lo - lo) as usize * BYTES_PER_PIXEL);
+            let (mid, tail) = rest.split_at_mut((fast_hi - fast_lo) as usize * BYTES_PER_PIXEL);
+            let src_range = (src_first, src_last);
+            if !head.is_empty() {
+                blit_run_edge(head, &sampler, lo, &spans, opacity, src_range);
+            }
+            if !mid.is_empty() {
+                blit_run_inner(mid, &sampler.at(lo, fast_lo), full_extra);
+            }
+            if !tail.is_empty() {
+                blit_run_edge(
+                    tail,
+                    &sampler.at(lo, fast_hi),
+                    fast_hi,
+                    &spans,
+                    opacity,
+                    src_range,
+                );
             }
         }
     }
@@ -1186,6 +1215,170 @@ impl<'a> Canvas<'a> {
         let o = y as usize * self.stride as usize + x as usize * BYTES_PER_PIXEL;
         blend_pixel(&mut self.data[o..o + 4], color, a);
     }
+}
+
+/// The source-sampling state one destination row of a scaled blit needs.
+///
+/// The two source rows the row interpolates between, the vertical weight, and
+/// the horizontal 16.16 stepping. Built once per destination row and shared
+/// by the interior and edge runs.
+#[derive(Debug, Clone, Copy)]
+struct RowSampler<'a> {
+    /// The upper source row, sliced to start at its first byte.
+    srow0: &'a [u8],
+    /// The lower source row; equal to `srow0` when the sample lands on an
+    /// edge row.
+    srow1: &'a [u8],
+    /// Vertical interpolation weight in `0..=255`.
+    ty: u32,
+    /// Source x in 16.16 fixed point at the run's first column.
+    base: i64,
+    /// Source x increment per destination column, 16.16.
+    step: i64,
+    /// Whether the source format has no alpha channel to filter.
+    opaque: bool,
+}
+
+impl RowSampler<'_> {
+    /// The same sampler with its origin moved to destination column `x`.
+    ///
+    /// `x0` is the column `base` currently refers to.
+    fn at(&self, x0: i32, x: i32) -> Self {
+        Self {
+            base: self.base + i64::from(x - x0) * self.step,
+            ..*self
+        }
+    }
+}
+
+/// The destination columns of `[lo, hi)` whose bilinear texel pair
+/// `[ix, ix+1]` lies wholly inside `[src_first, src_last]`.
+///
+/// The mapping is monotonic (`step >= 0` for any real scale), so the in-range
+/// columns are one contiguous run and finding its ends is two divisions
+/// rather than a per-pixel comparison. Outside it the sample edge-extends and
+/// the pair has to be assembled by hand; inside, the row is two 8-byte slices.
+fn texels_in_range(
+    base: i64,
+    step: i64,
+    lo: i32,
+    hi: i32,
+    src_first: i32,
+    src_last: i32,
+) -> (i32, i32) {
+    if step <= 0 {
+        // A degenerate or reversed mapping: no interior worth splitting out.
+        return (lo, lo);
+    }
+    // `ix(x) = (base + (x - lo) * step) >> 16`, wanted in `[src_first, src_last)`.
+    let first = i64::from(src_first) << 16;
+    let last = i64::from(src_last) << 16;
+    // Smallest `k >= 0` with `base + k * step >= first`, i.e. the ceiling
+    // division `(first - base) / step` (`i64::div_ceil` is still unstable).
+    let k0 = if first > base {
+        let d = first - base;
+        d / step + i64::from(d % step != 0)
+    } else {
+        0
+    };
+    // Largest `k` with `base + k * step < last`, plus one.
+    let k1 = if last > base {
+        (last - base - 1).div_euclid(step) + 1
+    } else {
+        0
+    };
+    let in_lo = (i64::from(lo) + k0).clamp(i64::from(lo), i64::from(hi)) as i32;
+    let in_hi = (i64::from(lo) + k1).clamp(i64::from(lo), i64::from(hi)) as i32;
+    if in_lo < in_hi {
+        (in_lo, in_hi)
+    } else {
+        (lo, lo)
+    }
+}
+
+/// The interior run of a scaled blit row: constant coverage, every texel pair
+/// in range.
+///
+/// Branch-free by construction — the caller has already established that the
+/// coverage is the same for every column and that no sample needs clamping —
+/// so the loop body is a straight sequence of loads, multiplies and one
+/// 4-byte store, which is the shape the autovectorizer wants. The
+/// early-`continue`s of the general path are deliberately *not* here: a fully
+/// transparent texel composites to the destination unchanged, so skipping it
+/// and blending it write the same bytes, and on a source that is mostly
+/// non-transparent the branch costs more than the blend.
+#[inline]
+fn blit_run_inner(row: &mut [u8], s: &RowSampler<'_>, extra: u32) {
+    let mut fixed = s.base;
+    for d in row.chunks_exact_mut(4) {
+        let o = (fixed >> 16) as usize * BYTES_PER_PIXEL;
+        let tx = ((fixed >> 8) & 0xFF) as u32;
+        fixed += s.step;
+        let t = bilinear(&s.srow0[o..o + 8], &s.srow1[o..o + 8], tx, s.ty, s.opaque);
+        blend_texel(d, &t, extra);
+    }
+}
+
+/// The leading/trailing run of a scaled blit row: per-column coverage and
+/// edge-extended sampling.
+fn blit_run_edge(
+    row: &mut [u8],
+    s: &RowSampler<'_>,
+    x0: i32,
+    spans: &RowSpans,
+    opacity: u8,
+    src: (i32, i32),
+) {
+    let (src_first, src_last) = src;
+    let mut fixed = s.base;
+    for (x, d) in (x0..).zip(row.chunks_exact_mut(4)) {
+        let ix = (fixed >> 16) as i32;
+        let tx = ((fixed >> 8) & 0xFF) as u32;
+        fixed += s.step;
+        // Fetch each row's texel *pair* as one 8-byte slice when the pair is
+        // in range: two bounds checks instead of four.
+        let t = if ix >= src_first && ix < src_last {
+            let o = ix as usize * BYTES_PER_PIXEL;
+            bilinear(&s.srow0[o..o + 8], &s.srow1[o..o + 8], tx, s.ty, s.opaque)
+        } else {
+            // Edge-extend: build the pair by hand.
+            let a = ix.clamp(src_first, src_last) as usize * BYTES_PER_PIXEL;
+            let b = (ix + 1).clamp(src_first, src_last) as usize * BYTES_PER_PIXEL;
+            let mut p0 = [0u8; 8];
+            let mut p1 = [0u8; 8];
+            p0[..4].copy_from_slice(&s.srow0[a..a + 4]);
+            p0[4..].copy_from_slice(&s.srow0[b..b + 4]);
+            p1[..4].copy_from_slice(&s.srow1[a..a + 4]);
+            p1[4..].copy_from_slice(&s.srow1[b..b + 4]);
+            bilinear(&p0, &p1, tx, s.ty, s.opaque)
+        };
+        if t.a == 0 {
+            continue;
+        }
+        let extra = u32::from(effective_alpha(255, unit_u8(spans.cov(x)), opacity));
+        if extra == 0 {
+            continue;
+        }
+        blend_texel(d, &t, extra);
+    }
+}
+
+/// Source-over one already-premultiplied [`Texel`], scaled by `extra`.
+///
+/// `t` is premultiplied by `t.a`; scaling every channel *and* the alpha by
+/// the same `extra / 255` (the coverage-times-opacity factor) keeps it
+/// premultiplied by the effective alpha, so there is no per-pixel division by
+/// a varying quantity.
+#[inline]
+fn blend_texel(d: &mut [u8], t: &Texel, extra: u32) {
+    let alpha = div255(t.a * extra);
+    let out = [
+        over_premul(div255(t.b * extra), u32::from(d[0]), alpha),
+        over_premul(div255(t.g * extra), u32::from(d[1]), alpha),
+        over_premul(div255(t.r * extra), u32::from(d[2]), alpha),
+        0,
+    ];
+    d.copy_from_slice(&out);
 }
 
 /// One channel of a [`bilinear`] blend.

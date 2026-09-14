@@ -1048,6 +1048,117 @@ fn image_texel_edge_extends() {
     assert_eq!(xi.texel(0, 0).a, 255);
 }
 
+/// An ARGB source with structure in every channel and a full alpha sweep,
+/// so the split's interior run and its edges see transparent, translucent
+/// and opaque texels.
+fn noisy_argb_image(w: u32, h: u32, seed: u64) -> Vec<u8> {
+    let stride = (w * 4).div_ceil(64) * 64;
+    let mut out = vec![0u8; (stride * h) as usize];
+    let mut rng = Rng::new(seed);
+    for y in 0..h {
+        for x in 0..w {
+            let o = (y * stride + x * 4) as usize;
+            out[o] = rng.byte();
+            out[o + 1] = rng.byte();
+            out[o + 2] = rng.byte();
+            // Include 0 and 255 often: the transparent texel is the case the
+            // interior run deliberately stops branching on.
+            out[o + 3] = match rng.next_u32() % 4 {
+                0 => 0,
+                1 => 255,
+                _ => rng.byte(),
+            };
+        }
+    }
+    out
+}
+
+#[test]
+fn blit_split_is_byte_identical_to_the_general_walk() {
+    // The scaled blit splits each destination row into an interior run --
+    // constant coverage, no texel pair needing a clamp -- and the leading and
+    // trailing columns where one or both fail. The split is a pure
+    // optimization, so it must be *exactly* the general walk: a blit whose
+    // interior rounded differently from its edges would be a visible seam
+    // down both sides of every scaled image.
+    //
+    // The sweep hits what the split's preconditions are made of: scales above
+    // and below 1 and non-integer ones, fractional destination origins (which
+    // move the coverage partial columns and the 16.16 phase independently),
+    // sub-rects that put the source-clamp boundary inside the destination
+    // row, both source formats, and clips that cut a row down to a couple of
+    // columns -- i.e. rows that are *all* edge and have no interior at all.
+    let argb = noisy_argb_image(16, 16, 0x9E37_79B9_7F4A_7C15);
+    let mut cases = 0;
+    for format in [PixelFormat::Argb8888, PixelFormat::Xrgb8888] {
+        let img = image_of(&argb, 16, 16, format);
+        for (dw, dh) in [
+            (24.0_f32, 24.0_f32), // 1.5x up
+            (40.0, 17.0),         // wide, non-integer both axes
+            (9.0, 33.0),          // down in x, up in y
+            (7.5, 7.5),           // below 1:1, fractional extent
+            (32.0, 32.0),         // exact 2x
+        ] {
+            for (ox, oy) in [(0.0_f32, 0.0_f32), (0.3, 0.0), (2.5, 1.25), (-3.75, -2.5)] {
+                for src_rect in [IRect::new(0, 0, 16, 16), IRect::new(3, 2, 9, 11)] {
+                    for opacity in [1.0_f32, 0.45] {
+                        for clip in [
+                            IRect::new(0, 0, 48, 40),
+                            IRect::new(5, 3, 30, 24),
+                            IRect::new(11, 0, 2, 40), // two columns: no interior
+                            IRect::new(0, 17, 48, 1),
+                        ] {
+                            let dst = Rect::new(ox, oy, dw, dh);
+                            let mut fast = Surface::new(48, 40);
+                            let mut slow = Surface::new(48, 40);
+                            let all = IRect::new(0, 0, 48, 40);
+                            // A non-uniform destination, so a wrong blend
+                            // cannot hide in a flat background.
+                            fast.canvas()
+                                .fill_irect(&all, &all, Color::rgb(20, 90, 160));
+                            slow.canvas()
+                                .fill_irect(&all, &all, Color::rgb(20, 90, 160));
+                            fast.canvas().blit(&clip, &dst, &img, &src_rect, opacity);
+                            slow.canvas()
+                                .blit_general(&clip, &dst, &img, &src_rect, opacity);
+                            assert_eq!(
+                                fast.data, slow.data,
+                                "fmt={format:?} dst={dst:?} src={src_rect:?} \
+                                 op={opacity} clip={clip:?}"
+                            );
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(cases, 2 * 5 * 4 * 2 * 2 * 4);
+}
+
+#[test]
+fn blit_split_never_writes_outside_clip() {
+    // The split hands each run a sub-slice of the row it computed itself, so
+    // the clip contract is re-asserted against the split specifically.
+    let argb = noisy_argb_image(16, 16, 0x1234_5678_9ABC_DEF0);
+    let img = image_of(&argb, 16, 16, PixelFormat::Argb8888);
+    for clip in [
+        IRect::new(7, 5, 19, 13),
+        IRect::new(0, 0, 1, 40),
+        IRect::new(40, 30, 8, 10),
+    ] {
+        let mut s = Surface::new(48, 40);
+        s.canvas().blit(
+            &clip,
+            &Rect::new(-2.5, -1.25, 55.0, 47.0),
+            &img,
+            &img.bounds(),
+            0.8,
+        );
+        s.assert_untouched_outside(&clip);
+    }
+}
+
 #[test]
 fn blit_rejects_invalid_images() {
     let data = [0u8; 16];
