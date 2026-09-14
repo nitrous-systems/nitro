@@ -413,7 +413,13 @@ fn outputs_shot_stats_quit_on_fake_backend() {
 
     assert_eq!(
         h_.request_text("outputs\n"),
-        ["ok", &format!("Virtual-1 {w}x{h}@60000")]
+        [
+            "ok",
+            // Scale, desktop-space origin and the primary flag are part of
+            // the line since the configuration file could set all three;
+            // with no file they are the defaults, and this pins them.
+            &format!("Virtual-1 {w}x{h}@60000 scale=1 pos=0,0 primary=1")
+        ]
     );
 
     wait_for("the first flip", || h_.frames() >= 1);

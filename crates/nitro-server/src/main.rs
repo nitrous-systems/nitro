@@ -14,7 +14,12 @@
 //!   (default `/dev/input`); `NITRO_INPUT=off` disables input entirely,
 //!   which is what a headless test wants.
 //! - `NITRO_SCALE=<connector>=<f32>,…` overrides an output's scale; see
-//!   `docs/wm.md`.
+//!   `docs/wm.md`. It beats `server.conf`, which beats the EDID.
+//! - `NITRO_CONFIG` overrides where `server.conf` is read from; otherwise
+//!   `$XDG_CONFIG_HOME/nitro/server.conf`, else
+//!   `$HOME/.config/nitro/server.conf`. With neither variable set there is
+//!   no file and no watch, and the server runs on its defaults. See
+//!   `crates/nitro-server/src/config.rs` and `docs/settings.md`.
 //! - `NITRO_SHADOW=0` paints straight into the scanout buffer instead of
 //!   into a per-output heap shadow (the default). For A/B measurement on
 //!   real hardware; see `crates/nitro-server/src/frame.rs`.
@@ -93,6 +98,10 @@ fn config_from_env() -> Result<Config, String> {
         // escape hatch, not a configuration surface, and the default is
         // the one that ships.
         shadow: std::env::var("NITRO_SHADOW").as_deref() != Ok("0"),
+        // `NITRO_CONFIG`, else the XDG path. `None` — a service with
+        // neither `$XDG_CONFIG_HOME` nor `$HOME` — means no file and no
+        // watch rather than a guessed path the user cannot find.
+        config_path: nitro_server::config::path(),
     })
 }
 

@@ -71,9 +71,10 @@ tests.
 |----------------------|-----------------------------------------------------------------------|
 | `shot [output-name]` | `ok <width> <height> <stride>\n` + `stride*height` bytes `XRGB8888`. Read from the output's **shadow buffer** when there is one — cheaper (no uncached reads back out of write-combined memory) and, if anything, more honest: the shadow is complete by construction, where the front buffer is complete only because the age-2 rule says so. It falls back to `read_front` under `NITRO_SHADOW=0` and for the moments before a shadow has been painted into. The two are byte-identical once a frame has settled, which `tests/shadow.rs` pins. |
 | `shot-front [name]`  | The same, read off the **scanout** buffer whatever the shadow holds. Test-only: with the shadow on, an ordinary `shot` cannot see whether the copy out of the shadow put the right bytes where the display reads them, so a shadow test would be unable to fail. |
-| `outputs`            | `ok\n`, one `name WxH@refresh_mhz\n` per output, blank line            |
+| `outputs`            | `ok\n`, one `name WxH@refresh_mhz scale=<s> pos=<x>,<y> primary=<0\|1>\n` per output, blank line. `pos` is the output's origin in **desktop** (logical) space — the number a window position on that output is relative to, which is what someone debugging a two-monitor layout is asking for; the device rectangle is `WxH` at `pos × scale`, so both spaces are recoverable from the one line. `scale` prints without a trailing `.0` (`scale=2`, `scale=1.25`), which is also how the configuration file that produced it spells it. |
 | `stats`              | `ok\n`, one `key value` line per statistic (see below), blank line     |
 | `quit`               | `ok\n`, then orderly shutdown                                          |
+| `reload`             | `ok\n`; re-reads `server.conf` and applies it. Synchronous — the `ok` comes back after the reload was applied — which is what makes it the reload a test can use, where SIGHUP and the inotify watch are races against the loop noticing. `config_reloads` counts it. |
 | `plug WxH`           | `ok\n`; fake backend only — hotplugs an output in, so a test can drive the "no output yet" state. Refused on DRM, where an output exists because a connector says so. |
 | `unplug`             | `ok\n`; fake backend only — removes the last output, which is the half that matters to the window manager: removing an output orphans its windows, and migrating them is the behaviour under test. |
 | `focus`              | `ok\n`; gives keyboard focus to the topmost window. Test-only, and it exists because focus otherwise *follows the click*: a toolkit test of Tab traversal would have to synthesise a click to get focus, which moves the focus to whatever widget was under the pointer — the very state it is about to assert on. `err no windows` when there are none. |
@@ -95,7 +96,8 @@ unlinked on shutdown.
 | `NITRO_SHELL_SOCKET` | privileged socket path        | `$XDG_RUNTIME_DIR/nitro/shell.sock` (same resolution; see `docs/shell.md`) |
 | `NITRO_INPUT`     | `off`                            | input enabled                  |
 | `NITRO_INPUT_DIR` | directory scanned for `event*`   | `/dev/input`                   |
-| `NITRO_SCALE`     | `<connector>=<f32>,…` per-output scale override, e.g. `HDMI-A-1=2` | EDID-derived: 2 at ≥ 192 dpi, else 1. See `docs/wm.md`. |
+| `NITRO_SCALE`     | `<connector>=<f32>,…` per-output scale override, e.g. `HDMI-A-1=2` | `server.conf`'s `output.<c>.scale`, else EDID-derived: 2 at ≥ 192 dpi, else 1. See `docs/wm.md` and the precedence table below. |
+| `NITRO_CONFIG`    | path of `server.conf`            | `$XDG_CONFIG_HOME/nitro/server.conf`, else `$HOME/.config/nitro/server.conf`. With neither variable set there is **no file and no watch** and the server runs on its defaults — the state a system service with an empty environment is in. See `docs/settings.md`. |
 | `NITRO_SHADOW`    | `0` to paint straight into the scanout buffer | enabled: each output gets a heap shadow buffer (one scanout-sized allocation, ~8 MB at 1080p) that the rasterizer paints into, with only the damage rects streamed out to the write-combined dumb buffer. Worth 9.3× on the frame path and 8 MB of RSS per output (`docs/latency.md` §4.5, `docs/budget.md`); `0` is the A/B lever, not a supported configuration. |
 | `NITRO_FONT_DIRS` | colon-separated font directories | `/usr/share/fonts:/usr/local/share/fonts:~/.local/share/fonts` (read by `nitro-text`) |
 | `NITRO_FONT_CACHE_MB` | cap on resident font-file bytes | `8` (read by `nitro-text`; `0` keeps only the file currently in use — the file that overran the cap is never its own victim, so a too-small cap does not turn into one disk read per glyph) |
@@ -104,7 +106,89 @@ unlinked on shutdown.
 
 The keyboard layout comes from the `XKB_DEFAULT_{RULES,MODEL,LAYOUT,VARIANT,OPTIONS}`
 variables — the same ones every other libinput-based compositor and
-`setxkbmap` use — with a fallback to the `us` layout.
+`setxkbmap` use — then `server.conf`'s `keyboard.*` section, with a
+fallback to the `us` layout.
+
+## Configuration: `server.conf`
+
+The persistent half of the display configuration is one plain text file,
+`$XDG_CONFIG_HOME/nitro/server.conf`, parsed by `src/config.rs` (which is
+also where the file format and the "nothing here fails" rule are argued).
+It is read at startup and re-read on every reload; `docs/settings.md` is
+the user-facing description.
+
+```text
+output.HDMI-A-1.scale    = 2
+output.HDMI-A-1.position = 0,0
+output.HDMI-A-1.primary  = true
+output.VGA-1.position    = 1920,0
+
+keyboard.layout  = de
+keyboard.options = ctrl:nocaps
+```
+
+### Precedence
+
+Environment beats file beats EDID/default, and nothing else is ever
+consulted. The environment wins because it is the *development* channel —
+a `NITRO_SCALE=HDMI-A-1=2 just fake` must not be silently overridden by
+whatever the box's own config says — and the file wins over the EDID
+because it is the user's explicit answer to the EDID's guess.
+
+| setting | wins | then | then |
+|---|---|---|---|
+| output scale | `NITRO_SCALE=<c>=<f32>` | `output.<c>.scale` | EDID dpi step: 2 at ≥ 192 dpi, else 1 |
+| output position | — | `output.<c>.position`, in **desktop** (logical) units | placed after the last positioned output, in connector order |
+| primary output | — | `output.<c>.primary = true` | the first connector |
+| keyboard | `XKB_DEFAULT_{RULES,MODEL,LAYOUT,VARIANT,OPTIONS}` | `keyboard.layout\|variant\|options` | the `us` layout |
+
+The scale rule lives in one function (`resolve_scale`) so it cannot drift
+between startup, a reload and a hotplug — all three go through
+`sync_outputs`, and a replugged monitor coming back a different size from
+the one the user configured is exactly the bug a second copy of the rule
+would produce. `primary_output()` is the same idea for the primary: every
+"the first output" in the window manager reads it.
+
+### Position: one layout, two spaces
+
+Every output has a **device** rect (scanout pixels; what the pointer is
+clamped to and what `output_at` hit-tests) and a **desktop** origin
+(logical units; what every window rectangle in the window manager is
+relative to). A configured `position` is a *logical* one, so it is
+multiplied back by the output's scale to give the device rect, and both
+spaces are computed in one pass in `sync_outputs`.
+
+Doing only half of that would be worse than doing neither: with the
+desktop layout following the file and the device layout still in connector
+order, the pointer would cross between screens at a different place from
+where a dragged window does. `desktop_origin` therefore does nothing but
+read the table `sync_outputs` left behind — which also keeps it cheap, and
+it is called from every hit test, every drag motion and every clamp.
+
+### Reloading
+
+Three doors, one `Server::reload_config`:
+
+* **inotify** on the *directory* the file is in. A settings app writes a
+  temp file and renames it over the top, which replaces the inode, so a
+  watch on the file itself would follow the old one into oblivion and
+  never fire again; events are filtered to the file's own name. A watch
+  that cannot be created is a warning, not a failure — the same rule the
+  input-hotplug uevent socket follows.
+* **SIGHUP**, on its own self-pipe with its own epoll token, so a reload
+  can never be mistaken for a request to shut the desktop down.
+* **`reload`** on the control socket, which is synchronous and therefore
+  the one a test uses.
+
+A reload re-applies everything rather than diffing: the work is one file
+read, one `sync_outputs` and (only when the `keyboard.*` section actually
+changed) one keymap compile, all of which startup already does. A keymap
+swap resets the xkb state and the hotkey table, because the modifiers a
+user is holding belong to keys that no longer mean what they did — the
+same reasoning the VT-switch and input-hotplug paths use. A scale change
+sends every window on that output a `Configure` (whose `scale` field is
+how a client learns how many device pixels its logical rectangle is worth)
+and repaints the output in full.
 
 `fake` needs no seat at all and never opens input devices: `just fake`
 runs it locally, `just fake-shot` grabs a PNG from it.
@@ -128,7 +212,9 @@ five seconds of idle after a deferral is 0 frames, 0 CPU ticks and
 | libinput                  | dispatch, convert to `InputEvent`, route, then update the scene and paint if anything moved |
 | input uevent socket       | a device appeared or went away: rescan `NITRO_INPUT_DIR`, add/remove libinput paths, register any new fd, reset xkb if a device left |
 | defer timer               | a held cursor-only flip's deadline passed: count a `defer_timeouts` and paint without the client's answer |
+| config inotify            | something changed in the directory `server.conf` lives in: drain the queue, and if our file was named, reload the configuration. An inotify fd with nothing queued is simply not readable, so a desktop nobody is configuring pays one fd in the set and **zero wakeups** — the same bargain the defer timerfd and the uevent socket make |
 | signal self-pipe          | SIGTERM/SIGINT → orderly shutdown (`signal-hook`'s `low_level::pipe` on a `UnixDatagram` pair) |
+| SIGHUP self-pipe          | re-read and apply `server.conf`. A **second** datagram pair with its own fd and token, because a self-pipe carries no payload: with one pair the loop would learn that *a* signal arrived and could not tell "reload" from "shut down" |
 | control listener          | accept, register the client                                              |
 | wire listener             | accept, allocate a `ClientId`, register the client                       |
 | shell listener            | the same, from the privileged token range: the accepted client's `Welcome` gets `caps::SHELL` |
@@ -658,6 +744,7 @@ looking for.
 | `hotkeys`                | Live `BindKey` bindings held by shell clients. |
 | `exclusive_zones`        | Windows reserving screen space off an output edge. |
 | `grabbed`                | 1 while a shell client holds a keyboard grab. A 1 with no launcher on screen is a stuck grab. |
+| `config_reloads`         | Completed `server.conf` reloads since startup, whatever triggered them — the `reload` request, SIGHUP and the inotify watch all land in this one counter, because what a caller wants to know is "did the server pick my edit up", not which of the three doors it came through. A reload of a file that will not parse still counts: the file *was* re-read, and every line it could not use was warned about and skipped. |
 
 The key naming is inconsistent on purpose — `paint_us_min` but
 `i2p_min_us` — because that is what the protocol spec says, and the wire
@@ -819,6 +906,36 @@ limit of 1024 — but real.
   launcher can close itself the way it opened; `Super`-drag still moving a window with a shell connected and not
   looking like a tap; outputs listed, hotplugged and unplugged; an anchored
   bar re-spanning after a hotplug.
+- `tests/config.rs` drives `server.conf` through the same real loop, with
+  each harness owning a configuration directory of its own (the
+  environment is process-global and these run in threads of one process,
+  which is also why `Config::fake` leaves `config_path` at `None` — a test
+  must never read the developer's own `~/.config/nitro/server.conf`).
+  Thirteen cases: a startup `output.Virtual-1.scale = 2` reaching the client
+  as `Configure.scale` *and* the `outputs` reply as `scale=2`; the whole
+  precedence ladder, env > file > EDID, in both directions; a `reload`
+  over the control socket applying `scale = 1`, incrementing
+  `config_reloads` and actually repainting the output; the same edit
+  picked up by the **inotify** path with no request at all — written the
+  way a settings app writes it, temp file plus rename, which is the write
+  the directory watch exists for — polled to a deadline because it is
+  asynchronous; two outputs with explicit `position`s laying the desktop
+  out against connector order (the second one placed to the *left*, so
+  connector order could not produce the result) and a window dragged onto
+  it; a scaled output's device and desktop origins agreeing, checked by
+  driving the pointer in device pixels across an edge the desktop
+  coordinates place elsewhere; `output.Virtual-2.primary = true` taking
+  the orphans when the output they were on is unplugged; a `de` layout
+  from the file turning evdev 21 into keysym `z` (and a reload from `us`
+  to `de` doing it live), skipped with a message where the box has no
+  `xkeyboard-config` data, the way the pixel tests skip on `has_fonts()`;
+  and a file of pure garbage leaving the server running, answering and
+  correctly configured, followed by a mostly-garbage file whose one good
+  line still applies. Plus the idle claim the watch makes: an unrelated
+  file written *into the watched directory* is drained and ignored, with
+  the frame counter and `config_reloads` both still where they were —
+  draining is what keeps the level-triggered fd from spinning, ignoring
+  is what keeps an editor's swap file from reloading the desktop.
 - `src/test_support.rs`, behind the **`test-support`** feature, is
   `tests/fake_loop.rs`'s harness factored out so another crate can use it:
   `TestServer::start` runs the real loop on a thread with a fake backend

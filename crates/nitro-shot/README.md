@@ -7,7 +7,7 @@ zlib stream of *stored* deflate blocks, CRC-32 table, Adler-32).
 ```text
 nitro-shot [-o FILE] [--raw] [--output NAME]   screenshot as PNG (stdout or FILE)
 nitro-shot --raw                                XRGB8888 bytes exactly as the server sent them
-nitro-shot --outputs                            list outputs: `name WxH@refresh_mhz`
+nitro-shot --outputs                            list outputs: `name WxH@refresh_mhz scale=S pos=X,Y primary=0|1`
 nitro-shot --stats                              frame counters
 nitro-shot --quit                               orderly server shutdown
 ```

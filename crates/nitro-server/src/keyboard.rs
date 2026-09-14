@@ -6,8 +6,9 @@
 //! xkbcommon already does for every other Linux compositor. We do not
 //! reimplement it: the keymap is compiled once from the `XKB_DEFAULT_*`
 //! environment variables (the same ones libinput-based compositors and
-//! `setxkbmap` write), and one [`xkb::State`] is fed every press and
-//! release.
+//! `setxkbmap` write) with `server.conf`'s `keyboard.*` section filling in
+//! what they leave unset ([`Keyboard::with_settings`]), and one
+//! [`xkb::State`] is fed every press and release.
 //!
 //! Two conversions live in here so callers never have to think about
 //! them. First, keycodes: X11 reserved codes 0..7, so an XKB keymap
@@ -148,16 +149,35 @@ impl Keyboard {
     /// falling back to the `us` layout. Returns None when compilation fails
     /// (the caller logs and runs without keyboard translation).
     pub fn new() -> Option<Self> {
+        Self::with_settings(&crate::config::KeyboardSettings::default())
+    }
+
+    /// The same, with `server.conf`'s `keyboard.*` section filling in what
+    /// the environment does not say.
+    ///
+    /// Precedence is `XKB_DEFAULT_*` > file > `us`, which is the rule the
+    /// whole configuration follows (`crates/nitro-server/src/config.rs`):
+    /// the environment is the *development* channel and must not be
+    /// silently overridden by the box's own config, and the file is the
+    /// user's explicit answer where the environment says nothing.
+    ///
+    /// `Some("")` in the settings is not `None`: an explicit
+    /// `keyboard.variant =` means "no variant", which is a different
+    /// instruction from saying nothing about it.
+    pub fn with_settings(settings: &crate::config::KeyboardSettings) -> Option<Self> {
         let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
         // An empty name means "take the context default", which
         // libxkbcommon reads from the matching `XKB_DEFAULT_*` variable.
         // We read them ourselves only so the fallback can replace the
-        // layout alone and keep the user's rules, model and options.
+        // layout alone and keep the user's rules, model and options — and,
+        // since the file exists, so the file can fill in what is unset.
         let rules = env_name("XKB_DEFAULT_RULES");
         let model = env_name("XKB_DEFAULT_MODEL");
-        let layout = env_name("XKB_DEFAULT_LAYOUT");
-        let variant = env_name("XKB_DEFAULT_VARIANT");
-        let options = std::env::var("XKB_DEFAULT_OPTIONS").ok();
+        let layout = env_or("XKB_DEFAULT_LAYOUT", settings.layout.as_deref());
+        let variant = env_or("XKB_DEFAULT_VARIANT", settings.variant.as_deref());
+        let options = std::env::var("XKB_DEFAULT_OPTIONS")
+            .ok()
+            .or_else(|| settings.options.clone());
 
         let keymap = compile(&context, &rules, &model, &layout, &variant, options.clone())
             .or_else(|| {
@@ -265,6 +285,19 @@ impl Keyboard {
 /// empty string, which tells libxkbcommon to use its own default.
 fn env_name(var: &str) -> String {
     std::env::var(var).unwrap_or_default()
+}
+
+/// The same, with the configuration file's value as the middle step.
+///
+/// An *empty* environment variable counts as unset — that is how
+/// libxkbcommon already reads it, and a `XKB_DEFAULT_VARIANT=` left over in
+/// a session script should not veto the file. The empty string returned
+/// when neither says anything is what tells xkb to use its own default.
+fn env_or(var: &str, from_file: Option<&str>) -> String {
+    match std::env::var(var) {
+        Ok(v) if !v.is_empty() => v,
+        _ => from_file.unwrap_or_default().to_owned(),
+    }
 }
 
 /// Compile one RMLVO combination, or `None` when xkb rejects it.

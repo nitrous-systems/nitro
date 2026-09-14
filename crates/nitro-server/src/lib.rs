@@ -16,6 +16,8 @@
 //! | backend `poll_fds` | `Backend::dispatch`: `Flipped` → present + paint the next frame, `Hotplug` → rescan |
 //! | libinput           | dispatch, convert, route, paint if anything moved   |
 //! | signal self-pipe   | SIGTERM/SIGINT → orderly shutdown                    |
+//! | SIGHUP self-pipe   | re-read `server.conf` and apply it                   |
+//! | config inotify     | the configuration directory changed → the same reload |
 //! | control listener   | accept, register client (v0 line protocol)           |
 //! | wire listener      | accept, register client (`nitro-wire` v1)            |
 //! | wire client        | read, buffer mutations, apply on `Commit`            |
@@ -146,11 +148,22 @@ pub struct Config {
     /// off so the two can be measured against each other on hardware; a
     /// test sets it directly, for the same reason `scales` is a field.
     pub shadow: bool,
+    /// Where `server.conf` lives (see [`config`]). `None` means there is
+    /// no file and no watch, which is what a test wants and what a service
+    /// with neither `$XDG_CONFIG_HOME` nor `$HOME` gets. `main.rs` fills
+    /// it from [`config::path`].
+    pub config_path: Option<PathBuf>,
 }
 
 impl Config {
     /// The fake backend at `width × height`, sockets next to `path`, no
-    /// signal handlers and no input devices. What tests want.
+    /// signal handlers, no input devices and **no configuration file**.
+    /// What tests want.
+    ///
+    /// `config_path: None` rather than the real one: a test must not read
+    /// the developer's own `~/.config/nitro/server.conf`, which would make
+    /// its result depend on the box it runs on. A configuration test sets
+    /// the field to a file in its own temporary directory.
     #[must_use]
     pub fn fake(width: u32, height: u32, path: impl Into<PathBuf>) -> Self {
         let control_path: PathBuf = path.into();
@@ -166,6 +179,7 @@ impl Config {
             fake_input: None,
             scales: HashMap::new(),
             shadow: true,
+            config_path: None,
         }
     }
 }
@@ -283,6 +297,32 @@ fn default_scale(info: &OutputInfo) -> f32 {
     if dpi >= HIDPI { 2.0 } else { 1.0 }
 }
 
+/// The scale an output gets, after everything has had its say.
+///
+/// One function so the precedence cannot drift between startup, a reload
+/// and a hotplug — all three go through [`Server::sync_outputs`], and all
+/// three must agree or a replugged monitor comes back a different size
+/// from the one the user configured.
+///
+/// `NITRO_SCALE` beats the file beats the EDID default, because the
+/// environment is the *development* channel (`just fake` must not be
+/// overridden by the box's own config) and the file is the user's explicit
+/// answer to the EDID's guess. Argued in `crates/nitro-server/src/config.rs`.
+#[must_use]
+fn resolve_scale(
+    info: &OutputInfo,
+    overrides: &HashMap<String, f32>,
+    settings: &config::Settings,
+) -> f32 {
+    if let Some(s) = overrides.get(&info.name) {
+        return *s;
+    }
+    if let Some(s) = settings.output(&info.name).and_then(|o| o.scale) {
+        return s;
+    }
+    default_scale(info)
+}
+
 // epoll tokens
 const TOK_SEAT: u64 = 0;
 const TOK_SIGNALS: u64 = 1;
@@ -296,6 +336,11 @@ const TOK_DEFER: u64 = 6;
 const TOK_INPUT_HOTPLUG: u64 = 7;
 /// The privileged shell socket's listener; see [`shell`].
 const TOK_SHELL_LISTENER: u64 = 8;
+/// The inotify fd watching the directory `server.conf` lives in, and the
+/// SIGHUP self-pipe. Both mean exactly one thing — re-read the file — so
+/// they sit next to each other and end in the same call.
+const TOK_CONFIG: u64 = 9;
+const TOK_SIGHUP: u64 = 10;
 /// How long an unanswered input keeps waiting for a frame to claim it.
 /// Beyond this the number would not be a latency any more: nothing
 /// responded to the event, and attributing the next unrelated frame to it
@@ -347,6 +392,103 @@ impl FlipStats {
         } else {
             (self.sum.as_micros() / u128::from(self.count)) as u64
         }
+    }
+}
+
+/// An inotify watch on the directory `server.conf` lives in.
+///
+/// # Why the directory and not the file
+///
+/// A watch is on an *inode*, and the way a settings app writes a
+/// configuration file safely is `write temp + rename` — which is what
+/// `nitro-settings` does, and what `sed -i` does, and what every editor
+/// with a crash-safe save does. That replaces the inode, so a watch on the
+/// file follows the old one into oblivion and never fires again. Watching
+/// the directory and filtering on the file's own name sees the rename, the
+/// plain overwrite and the first creation of a file that did not exist.
+///
+/// # Why this costs an idle server nothing
+///
+/// An inotify fd with no queued event is simply not readable, so it never
+/// wakes epoll. Registering it adds one fd to the set and zero wakeups to a
+/// desktop nobody is configuring — the same bargain the defer timerfd and
+/// the uevent socket make.
+struct ConfigWatch {
+    fd: OwnedFd,
+    /// The file name to filter events on (`server.conf`), as bytes,
+    /// because that is what inotify reports.
+    file_name: std::ffi::OsString,
+}
+
+impl ConfigWatch {
+    /// Watch the directory `path` sits in.
+    ///
+    /// # Errors
+    /// The directory does not exist or inotify is unavailable. Not fatal:
+    /// the caller warns and runs without a watch, exactly as it does for
+    /// the input-hotplug uevent socket.
+    fn open(path: &Path) -> Result<Self, rustix::io::Errno> {
+        use rustix::fs::inotify;
+        let dir = path.parent().unwrap_or(Path::new("."));
+        let file_name = path
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new(config::FILE_NAME))
+            .to_owned();
+        let fd = inotify::init(inotify::CreateFlags::CLOEXEC | inotify::CreateFlags::NONBLOCK)?;
+        // `CLOSE_WRITE` catches an in-place overwrite, `MOVED_TO` the
+        // atomic rename, `CREATE` the first appearance of a file that was
+        // not there when the server started. `DELETE` is deliberately not
+        // watched: a file that goes away leaves the last configuration in
+        // force, which is what a half-finished `mv` should do.
+        inotify::add_watch(
+            &fd,
+            dir,
+            inotify::WatchFlags::CLOSE_WRITE
+                | inotify::WatchFlags::MOVED_TO
+                | inotify::WatchFlags::CREATE,
+        )?;
+        Ok(Self { fd, file_name })
+    }
+
+    /// Drain the queue and report whether *our* file was among the events.
+    ///
+    /// Every event is drained whatever it named: an undrained inotify fd
+    /// stays readable, and a level-triggered epoll would then spin at
+    /// 100 % on the first unrelated file written into the configuration
+    /// directory.
+    fn drain(&mut self) -> bool {
+        use rustix::fs::inotify;
+        use std::mem::MaybeUninit;
+        use std::os::unix::ffi::OsStrExt as _;
+        let mut buf = [MaybeUninit::uninit(); 4096];
+        let mut reader = inotify::Reader::new(&self.fd, &mut buf);
+        let mut ours = false;
+        loop {
+            match reader.next() {
+                Ok(event) => {
+                    ours |= event
+                        .file_name()
+                        .is_some_and(|n| n.to_bytes() == self.file_name.as_bytes());
+                }
+                // The end of the queue, which is where every healthy
+                // drain finishes.
+                Err(rustix::io::Errno::AGAIN) => return ours,
+                // Anything else is a broken watch. Stopping the drain is
+                // the only way not to spin on it, and it is worth saying
+                // out loud: from here on the file is only reloaded when
+                // something asks.
+                Err(e) => {
+                    warn!("reading the config inotify fd: {e}");
+                    return ours;
+                }
+            }
+        }
+    }
+}
+
+impl AsFd for ConfigWatch {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.fd.as_fd()
     }
 }
 
@@ -403,6 +545,26 @@ struct Server {
     frame_titles: HashMap<WindowKey, nitro_text::TextKey>,
     /// Per-output scale overrides from `NITRO_SCALE`, by connector name.
     scale_overrides: HashMap<String, f32>,
+    /// Where each output's logical space starts in the desktop space, by
+    /// scene id, in the order `sync_outputs` laid them out.
+    ///
+    /// A table rather than a computation: [`Server::desktop_origin`] is
+    /// called from many hot paths (every hit test, every drag motion,
+    /// every clamp) and the answer now depends on the configuration file,
+    /// so re-deriving it per call would be both slower and a second place
+    /// for the rule to live.
+    origins: Vec<(SceneOutputId, Point)>,
+    /// The parsed `server.conf`, re-read on every reload. Empty settings
+    /// when there is no file, which is what makes every rule below read
+    /// the same whether a file exists or not.
+    settings: config::Settings,
+    /// Where that file lives, and `None` when there is none.
+    config_path: Option<PathBuf>,
+    /// The inotify watch on its directory; `None` when there is no file or
+    /// the watch could not be created (a warning, never fatal).
+    config_watch: Option<ConfigWatch>,
+    /// Completed configuration reloads, however triggered. `stats`.
+    config_reloads: u64,
     /// Whether each output gets a heap shadow buffer to paint into
     /// (`NITRO_SHADOW`). Read when an output is added; see
     /// [`frame::Shadow`].
@@ -480,7 +642,8 @@ pub fn run(mut config: Config) -> Result<(), Error> {
     let epoll = epoll::create(epoll::CreateFlags::CLOEXEC).map_err(errno("epoll_create"))?;
     let signals = if config.handle_signals {
         let s = signals::Signals::install().map_err(io_err("install signal handlers"))?;
-        add(&epoll, &s, TOK_SIGNALS)?;
+        add(&epoll, &s.quit_fd(), TOK_SIGNALS)?;
+        add(&epoll, &s.reload_fd(), TOK_SIGHUP)?;
         Some(s)
     } else {
         None
@@ -562,7 +725,40 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         None
     };
 
-    let keyboard = Keyboard::new();
+    // The configuration file, before the keyboard: its `keyboard.*`
+    // section is an input to the keymap, and a keymap compiled without it
+    // would be thrown away one line later.
+    let settings = match config.config_path.as_deref() {
+        Some(path) => {
+            let s = config::load(path);
+            info!("configuration from {}", path.display());
+            for w in &s.warnings {
+                warn!("{}: {w}", path.display());
+            }
+            s
+        }
+        None => config::Settings::default(),
+    };
+    // The watch is opened even when the file itself is absent — the
+    // directory is what is watched, so a `server.conf` created after the
+    // server started is picked up. A missing *directory* is the ordinary
+    // state of a fresh install and is not worth more than a debug line.
+    let config_watch = match config.config_path.as_deref() {
+        Some(path) => match ConfigWatch::open(path) {
+            Ok(w) => {
+                add(&epoll, &w, TOK_CONFIG)?;
+                info!("watching {} for changes", path.display());
+                Some(w)
+            }
+            Err(e) => {
+                warn!("not watching {}: {e}", path.display());
+                None
+            }
+        },
+        None => None,
+    };
+
+    let keyboard = Keyboard::with_settings(&settings.keyboard);
     match &keyboard {
         Some(kb) => info!("xkb keymap: {}", kb.layout_names().join(", ")),
         None => warn!("no xkb keymap compiled; keys carry no keysym or text"),
@@ -613,6 +809,11 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         decorations: HashMap::new(),
         frame_titles: HashMap::new(),
         scale_overrides: std::mem::take(&mut config.scales),
+        origins: Vec::new(),
+        settings,
+        config_path: config.config_path.clone(),
+        config_watch,
+        config_reloads: 0,
         shadow: config.shadow,
         input_hotplug,
         input_dir: config.input_dir.clone(),
@@ -844,13 +1045,35 @@ impl Server {
     }
 
     /// Bring the scene's outputs and the per-output frame state in line
-    /// with the backend's, laid out **left to right in connector order**.
+    /// with the backend's.
     ///
-    /// A row is the arrangement that needs no policy, and connector order
-    /// is the only ordering the kernel gives us; a persistent layout the
-    /// user can rearrange belongs to the settings app (M4). The scale of
-    /// each output is `NITRO_SCALE` if it names that connector, else the
-    /// EDID-derived default.
+    /// The layout is **left to right in connector order**, except where
+    /// `server.conf` says otherwise: a connector with an explicit
+    /// `output.<c>.position` is put there, and one without is placed after
+    /// whatever came before it, which is the row the server laid out
+    /// before the file existed. A row is the arrangement that needs no
+    /// policy, and connector order is the only ordering the kernel gives
+    /// us. The scale is [`resolve_scale`]: `NITRO_SCALE`, then the file,
+    /// then the EDID.
+    ///
+    /// # Device rects and desktop origins are kept in step
+    ///
+    /// Every output has two origins: a **device** rect (in scanout pixels,
+    /// which the pointer is clamped to and [`input::output_at`] hit-tests)
+    /// and a **desktop** origin (in logical units, which every window
+    /// rectangle in the window manager is relative to). The configured
+    /// position is a *logical* one — that is the space a user thinks in,
+    /// and the one the file documents — so it is multiplied back by the
+    /// scale to produce the device rect.
+    ///
+    /// Doing only half of that would be worse than doing neither: with the
+    /// desktop layout following the file and the device layout still in
+    /// connector order, the pointer would cross from one screen to the
+    /// next at a different place from where a dragged window does, and
+    /// `output_at` would disagree with `output_for` about which output a
+    /// point is on. So both spaces are computed here, in one pass, and
+    /// [`Server::desktop_origin`] does nothing but read the table this
+    /// leaves behind.
     ///
     /// Removing an output orphans its windows — the scene unplaces them —
     /// so they are migrated onto the primary output afterwards rather than
@@ -869,50 +1092,7 @@ impl Server {
             }
             keep
         });
-        let mut x = 0;
-        for info in &infos {
-            let scene_id = SceneOutputId(info.id.0);
-            let scale = self
-                .scale_overrides
-                .get(&info.name)
-                .copied()
-                .unwrap_or_else(|| default_scale(info));
-            let rect =
-                nitro_core::IRect::new(x, 0, info.width.cast_signed(), info.height.cast_signed());
-            x += info.width.cast_signed();
-            self.scene.add_output(scene_id, rect, scale);
-            if let Some(existing) = self.outputs.iter_mut().find(|o| o.kms_id == info.id) {
-                existing.width = info.width;
-                existing.height = info.height;
-                existing.refresh_ns = frame::refresh_ns(info.refresh_mhz);
-                // A resized shadow is blank again; the `invalidate` below
-                // is what repaints into it, so the two belong together.
-                if let Some(shadow) = existing.shadow.as_mut()
-                    && (shadow.width() != info.width || shadow.height() != info.height)
-                {
-                    *shadow = frame::Shadow::new(info.width, info.height);
-                }
-                existing.invalidate();
-                continue;
-            }
-            info!(
-                "{} {}: {}x{}@{}.{:03} Hz, scale {scale}",
-                info.id,
-                info.name,
-                info.width,
-                info.height,
-                info.refresh_mhz / 1000,
-                info.refresh_mhz % 1000
-            );
-            self.outputs.push(OutputState::new(
-                info.id,
-                scene_id,
-                info.width,
-                info.height,
-                info.refresh_mhz,
-                self.shadow,
-            ));
-        }
+        let rescaled = self.layout_outputs(&infos);
         if lost {
             self.migrate_orphans();
         }
@@ -965,7 +1145,125 @@ impl Server {
         // when something differs: `set_frame_rect` is idempotent and an
         // anchor that silently stopped holding is the harder bug.
         self.reflow_anchors();
+        self.reconfigure_rescaled(&rescaled);
         self.notify_outputs(&gone);
+    }
+
+    /// Give every connected output its scale, its device rect and its
+    /// desktop origin, creating the [`OutputState`] of any that is new.
+    /// Returns the outputs whose scale *changed*, which is what
+    /// [`Server::reconfigure_rescaled`] needs.
+    ///
+    /// The layout rule, and the reason the two spaces are computed
+    /// together, are in [`Server::sync_outputs`]'s doc comment; this is
+    /// only the loop.
+    fn layout_outputs(&mut self, infos: &[OutputInfo]) -> Vec<SceneOutputId> {
+        // The two cursors: where the next unpositioned output starts, in
+        // each space. A *positioned* output moves them too, so "after the
+        // last one" means after whatever was actually placed last.
+        let mut device_x = 0;
+        let mut desktop_x = 0.0f32;
+        let mut origins: Vec<(SceneOutputId, Point)> = Vec::with_capacity(infos.len());
+        let mut rescaled: Vec<SceneOutputId> = Vec::new();
+        for info in infos {
+            let scene_id = SceneOutputId(info.id.0);
+            let scale = resolve_scale(info, &self.scale_overrides, &self.settings);
+            let (w, h) = (info.width.cast_signed(), info.height.cast_signed());
+            let (rect, origin) = match self.settings.output(&info.name).and_then(|o| o.position) {
+                Some((px, py)) => {
+                    let origin = Point::new(px as f32, py as f32);
+                    let device = nitro_core::IRect::new(
+                        (origin.x * scale).round() as i32,
+                        (origin.y * scale).round() as i32,
+                        w,
+                        h,
+                    );
+                    (device, origin)
+                }
+                None => (
+                    nitro_core::IRect::new(device_x, 0, w, h),
+                    Point::new(desktop_x, 0.0),
+                ),
+            };
+            device_x = rect.x + w;
+            desktop_x = origin.x + info.width as f32 / if scale > 0.0 { scale } else { 1.0 };
+            origins.push((scene_id, origin));
+            let was = self.scene.output_info(scene_id).map(|(_, s)| s);
+            self.scene.add_output(scene_id, rect, scale);
+            #[allow(clippy::float_cmp)] // Exact: "did this number change", not "are these near".
+            if was.is_some_and(|s| s != scale) {
+                rescaled.push(scene_id);
+            }
+            if let Some(existing) = self.outputs.iter_mut().find(|o| o.kms_id == info.id) {
+                existing.width = info.width;
+                existing.height = info.height;
+                existing.refresh_ns = frame::refresh_ns(info.refresh_mhz);
+                // A resized shadow is blank again; the `invalidate` below
+                // is what repaints into it, so the two belong together.
+                if let Some(shadow) = existing.shadow.as_mut()
+                    && (shadow.width() != info.width || shadow.height() != info.height)
+                {
+                    *shadow = frame::Shadow::new(info.width, info.height);
+                }
+                existing.invalidate();
+                continue;
+            }
+            info!(
+                "{} {}: {}x{}@{}.{:03} Hz, scale {scale}, at {},{}",
+                info.id,
+                info.name,
+                info.width,
+                info.height,
+                info.refresh_mhz / 1000,
+                info.refresh_mhz % 1000,
+                origin.x,
+                origin.y
+            );
+            self.outputs.push(OutputState::new(
+                info.id,
+                scene_id,
+                info.width,
+                info.height,
+                info.refresh_mhz,
+                self.shadow,
+            ));
+        }
+        self.origins = origins;
+        rescaled
+    }
+
+    /// Tell every window on a rescaled output about its new scale.
+    ///
+    /// A scale change reaches the clients only as a `Configure`: the scene
+    /// marks the window roots `Dirty::TRANSFORM` so the *pixels* are
+    /// re-transformed, but a client sizing its buffers from
+    /// `Configure.scale` would keep drawing at the old one. The outputs
+    /// themselves are `invalidate`d by [`Server::layout_outputs`], so the
+    /// repaint is already queued; this is the half the clients need.
+    fn reconfigure_rescaled(&mut self, rescaled: &[SceneOutputId]) {
+        if rescaled.is_empty() {
+            return;
+        }
+        let windows: Vec<WindowKey> = self
+            .wire_clients
+            .values()
+            .flat_map(|c| c.windows.values().copied())
+            .filter(|w| {
+                self.scene
+                    .window_info(*w)
+                    .ok()
+                    .and_then(nitro_scene::Window::output)
+                    .is_some_and(|id| rescaled.contains(&id))
+            })
+            .collect();
+        info!(
+            "scale changed on {} output(s); reconfiguring {} window(s)",
+            rescaled.len(),
+            windows.len()
+        );
+        for win in windows {
+            self.configure(win);
+        }
     }
 
     /// Move every window the scene unplaced (its output went away) onto the
@@ -975,7 +1273,7 @@ impl Server {
     /// it is not in any z-order, so no click and no `Alt+Tab` raise can get
     /// it back. Migrating is the only behaviour that does not lose work.
     fn migrate_orphans(&mut self) {
-        let Some(primary) = self.outputs.first().map(|o| o.scene_id) else {
+        let Some(primary) = self.primary_output() else {
             // Every output is gone; the windows wait, exactly as they do
             // between startup and the first connector.
             return;
@@ -1446,6 +1744,17 @@ impl Server {
                         }
                     }
                     TOK_LISTENER => self.on_accept()?,
+                    TOK_SIGHUP => {
+                        if self
+                            .signals
+                            .as_mut()
+                            .is_some_and(signals::Signals::drain_reload)
+                        {
+                            info!("SIGHUP");
+                            self.reload_config();
+                        }
+                    }
+                    TOK_CONFIG => self.on_config_event(),
                     TOK_WIRE_LISTENER => self.on_wire_accept()?,
                     TOK_SHELL_LISTENER => self.on_shell_accept()?,
                     TOK_BACKEND => self.on_backend()?,
@@ -1770,6 +2079,86 @@ impl Server {
         if removed > 0 {
             self.hotkeys.reset();
         }
+    }
+
+    /// The configuration directory changed. Reload if it was our file.
+    ///
+    /// The queue is drained whatever it named — an undrained inotify fd
+    /// stays readable, and a level-triggered epoll would then spin — but
+    /// only an event naming `server.conf` costs a reload, so an editor's
+    /// swap file appearing next to it is one read and nothing else.
+    fn on_config_event(&mut self) {
+        let ours = self.config_watch.as_mut().is_some_and(ConfigWatch::drain);
+        if ours {
+            info!("server.conf changed on disk");
+            self.reload_config();
+        }
+    }
+
+    /// Re-read `server.conf` and apply it: the one place all three reload
+    /// triggers — inotify, SIGHUP and the control socket's `reload` — end
+    /// up.
+    ///
+    /// Everything is re-applied unconditionally rather than diffed. The
+    /// work is one file read, one keymap compile and one `sync_outputs`,
+    /// all of which the server already does at startup; a diff would be a
+    /// second description of what the settings mean, and the failure mode
+    /// of a wrong diff is a desktop that ignores the file until the next
+    /// reboot.
+    ///
+    /// A file that will not parse cannot stop the server: [`config::load`]
+    /// never fails, and a line it could not use is a warning and a skipped
+    /// line, so everything the file still says stays in force and
+    /// everything it no longer says falls back to the environment or the
+    /// EDID exactly as it did at startup.
+    fn reload_config(&mut self) {
+        let Some(path) = self.config_path.clone() else {
+            // No file: `reload` is still a valid request, it simply has
+            // nothing to read. Counted anyway, so the caller can tell the
+            // request was handled rather than dropped.
+            self.config_reloads += 1;
+            return;
+        };
+        let settings = config::load(&path);
+        for w in &settings.warnings {
+            warn!("{}: {w}", path.display());
+        }
+        let keyboard_changed = settings.keyboard != self.settings.keyboard;
+        self.settings = settings;
+
+        // The keyboard, only when its section actually changed: compiling
+        // a keymap costs tens of milliseconds and resetting the state
+        // drops the modifiers the user is holding, neither of which a
+        // reload that only moved a monitor should cost.
+        if keyboard_changed {
+            match Keyboard::with_settings(&self.settings.keyboard) {
+                Some(kb) => {
+                    info!("xkb keymap: {}", kb.layout_names().join(", "));
+                    self.keyboard = Some(kb);
+                }
+                None => warn!("no xkb keymap compiled; keeping the previous one"),
+            }
+            // A keymap swap invalidates every held modifier — the releases
+            // belong to keys that no longer mean what they did — which is
+            // the same reasoning the VT-switch and input-hotplug paths
+            // use. The shell's armed tap goes with it.
+            if let Some(kb) = self.keyboard.as_mut() {
+                kb.reset();
+            }
+            self.hotkeys.reset();
+        }
+
+        // Scale, position and primary all land in `sync_outputs`, which is
+        // the one place that decides them; it re-`Configure`s the clients
+        // of any output whose scale moved and `invalidate`s every output.
+        self.sync_outputs();
+        // `invalidate` only marks. A scale change repaints the whole
+        // screen, so drive it now rather than waiting for the next thing
+        // that happens to damage something.
+        self.paint_all();
+        self.settle();
+        self.config_reloads += 1;
+        info!("configuration reloaded from {}", path.display());
     }
 
     /// One input event: update the pointer or the keyboard, then send the
@@ -2603,7 +2992,7 @@ impl Server {
             .window_info(win)
             .ok()
             .and_then(nitro_scene::Window::output)
-            .or_else(|| self.outputs.first().map(|o| o.scene_id));
+            .or_else(|| self.primary_output());
         output.map_or(Rect::EMPTY, |id| self.desktop_area(id))
     }
 
@@ -2678,27 +3067,43 @@ impl Server {
 
     /// Where an output's logical space starts in the desktop space.
     ///
-    /// Outputs are laid out left to right in *device* pixels; in desktop
-    /// logical units each one starts where the previous ended, at its own
-    /// scale, so a 2x output takes half as much desktop width as its
-    /// device width.
+    /// A lookup in the table [`Server::sync_outputs`] built, which is what
+    /// keeps this cheap and total: it is called from every hit test, every
+    /// drag motion and every clamp, and an output it does not know about
+    /// is the origin (the state between "a window exists" and "a connector
+    /// reported a mode").
     ///
-    /// The ordering is taken from the *device* rectangles `sync_outputs`
-    /// assigned (which are in connector order), not from `Scene::outputs`'s
-    /// iteration order, which is the order outputs were first added:
-    /// unplugging a connector and plugging one that sorts earlier would
-    /// otherwise leave desktop space arranged differently from device
-    /// space, and a window would jump as a drag crossed an output edge.
+    /// The table says either what `output.<c>.position` asked for or, for
+    /// a connector the file does not position, where the previous output
+    /// ended — outputs laid out left to right in connector order, each
+    /// taking its *logical* width, so a 2× output takes half as much
+    /// desktop width as it has device pixels.
     fn desktop_origin(&self, id: SceneOutputId) -> Point {
-        let Some((_, mine, _)) = self.scene.outputs().find(|(out, _, _)| *out == id) else {
-            return Point::ZERO;
-        };
-        let mut x = 0.0;
-        for (_, rect, scale) in self.scene.outputs().filter(|(_, r, _)| r.x < mine.x) {
-            let s = if scale > 0.0 { scale } else { 1.0 };
-            x += rect.w as f32 / s;
+        self.origins
+            .iter()
+            .find(|(out, _)| *out == id)
+            .map_or(Point::ZERO, |(_, origin)| *origin)
+    }
+
+    /// The primary output: where orphaned windows migrate, and what a
+    /// window with no output of its own is measured against.
+    ///
+    /// `output.<c>.primary = true` in `server.conf` names it; with nothing
+    /// marked (or the marked connector unplugged) it is the first output,
+    /// exactly as it was before the file existed. One function so the two
+    /// dozen call sites cannot each pick a different answer.
+    fn primary_output(&self) -> Option<SceneOutputId> {
+        if let Some(name) = self.settings.primary() {
+            let kms = self.backend.outputs();
+            let by_name = self
+                .outputs
+                .iter()
+                .find(|o| kms.iter().any(|i| i.id == o.kms_id && i.name == name));
+            if let Some(o) = by_name {
+                return Some(o.scene_id);
+            }
         }
-        Point::new(x, 0.0)
+        self.outputs.first().map(|o| o.scene_id)
     }
 
     /// A window's frame rectangle in desktop coordinates.
@@ -2778,9 +3183,7 @@ impl Server {
         // opposite edge that moves, and handing a window over mid-resize
         // would be a surprise. So it keeps its current output and only its
         // position within it is recomputed.
-        let output = info
-            .output()
-            .or_else(|| self.outputs.first().map(|o| o.scene_id));
+        let output = info.output().or_else(|| self.primary_output());
         let origin = output.map_or(Point::ZERO, |id| self.desktop_origin(id));
         let content = Size::new(
             (rect.w - inset.width()).max(0.0),
@@ -3202,7 +3605,7 @@ impl Server {
         debug!("request {line:?}");
         let reply = match protocol::parse(line) {
             Err(msg) => protocol::err_reply(&msg),
-            Ok(Request::Outputs) => protocol::outputs_reply(self.backend.outputs()),
+            Ok(Request::Outputs) => self.outputs_reply(),
             Ok(Request::Stats) => self.stats_reply(),
             Ok(Request::Shot(name)) => self.shot(name.as_deref()),
             Ok(Request::ShotFront(name)) => self.shot_front(name.as_deref()),
@@ -3212,10 +3615,54 @@ impl Server {
                 protocol::ok_reply()
             }
             Ok(Request::Plug(w, h)) => self.plug(w, h),
+            Ok(Request::Reload) => {
+                self.reload_config();
+                protocol::ok_reply()
+            }
             Ok(Request::Unplug) => self.unplug(),
             Ok(Request::Focus) => self.focus_topmost(),
         };
         client.send(reply);
+    }
+
+    /// The `outputs` reply: one line per output with its mode, the scale
+    /// in force, its desktop-space origin and whether it is the primary.
+    ///
+    /// Assembled here rather than in [`protocol`] because everything past
+    /// the mode is the *server's* view — the scene's scale, the origin
+    /// table `sync_outputs` built and `server.conf`'s primary — and none
+    /// of it is in an [`OutputInfo`].
+    ///
+    /// Sorted left to right in **desktop** space, which is the space the
+    /// line's `pos` is in. (The wire's `OutputInfo` sorts by *device* x
+    /// instead, because its `x`/`y` are the device rect; the two orders
+    /// coincide for every layout anyone writes, and each reply is at
+    /// least ordered in the space it reports.)
+    fn outputs_reply(&self) -> Vec<u8> {
+        let primary = self.primary_output();
+        let mut lines: Vec<protocol::OutputLine> = self
+            .backend
+            .outputs()
+            .iter()
+            .map(|info| {
+                let scene_id = SceneOutputId(info.id.0);
+                let origin = self.desktop_origin(scene_id);
+                protocol::OutputLine {
+                    name: info.name.clone(),
+                    width: info.width,
+                    height: info.height,
+                    refresh_mhz: info.refresh_mhz,
+                    scale: self
+                        .scene
+                        .output_info(scene_id)
+                        .map_or(1.0, |(_, scale)| scale),
+                    position: (origin.x as i32, origin.y as i32),
+                    primary: primary == Some(scene_id),
+                }
+            })
+            .collect();
+        lines.sort_unstable_by_key(|o| o.position);
+        protocol::outputs_reply(&lines)
     }
 
     fn stats_reply(&self) -> Vec<u8> {
@@ -3292,6 +3739,11 @@ impl Server {
         pairs.push(("hotkeys", self.hotkeys.len() as u64));
         pairs.push(("exclusive_zones", self.zones.zone_count() as u64));
         pairs.push(("grabbed", u64::from(self.grab.is_some())));
+        // Completed reloads, however triggered: the control request,
+        // SIGHUP and the inotify watch all land in one counter, because
+        // what a caller wants to know is "did the server pick my edit up",
+        // not which of the three doors it came through.
+        pairs.push(("config_reloads", self.config_reloads));
         protocol::stats_reply(&pairs)
     }
 
@@ -3669,9 +4121,7 @@ impl Server {
             return;
         };
         let size = info.frame_size();
-        let output = info
-            .output()
-            .or_else(|| self.outputs.first().map(|o| o.scene_id));
+        let output = info.output().or_else(|| self.primary_output());
         let Some(output) = output else {
             // No output yet; `sync_outputs` re-applies anchors when one
             // appears, so the window simply waits where it is.
@@ -4056,7 +4506,7 @@ impl Server {
     /// the primary output's work area and tell the client the size, scale
     /// and output it got.
     fn place_new_window(&mut self, client: &mut WireClient, node_id: NodeId, win: WindowKey) {
-        let Some(output) = self.outputs.first() else {
+        let Some(scene_id) = self.primary_output() else {
             // No output yet (every connector unplugged, or a hotplug still
             // in flight). The window is real and owns its nodes; it simply
             // has nowhere to be. `sync_outputs` drains this list when an
@@ -4064,7 +4514,6 @@ impl Server {
             self.unplaced.push((client.id, win));
             return;
         };
-        let scene_id = output.scene_id;
         // Decorate before placing: the frame changes the window's outer
         // size, and the placement has to know it to centre the thing the
         // user actually sees.

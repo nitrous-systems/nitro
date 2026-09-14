@@ -230,9 +230,7 @@ pub fn parse(text: &str) -> Settings {
         let key = key.trim();
         let value = value.trim();
         if key.is_empty() {
-            settings
-                .warnings
-                .push(format!("line {number}: empty key"));
+            settings.warnings.push(format!("line {number}: empty key"));
             continue;
         }
         // `output.<connector>.<field>`: the connector name is whatever is
@@ -452,7 +450,11 @@ mod tests {
         assert_eq!(parse("nonsense").warnings.len(), 1);
         // `1 = 2` splits at the first `=`, so the value is `1 = 2`, which
         // is not a number: one warning, no panic, no half-applied scale.
-        assert!(parse("output.X.scale = 1 = 2").output("X").is_none_or(|o| o.scale.is_none()));
+        assert!(
+            parse("output.X.scale = 1 = 2")
+                .output("X")
+                .is_none_or(|o| o.scale.is_none())
+        );
     }
 
     #[test]
@@ -470,7 +472,11 @@ mod tests {
         // warning has to say *why* it does nothing rather than imply a typo.
         let s = parse("keyboard.repeat = 300,25\n");
         assert_eq!(s.warnings.len(), 1);
-        assert!(s.warnings[0].contains("not implemented"), "{:?}", s.warnings);
+        assert!(
+            s.warnings[0].contains("not implemented"),
+            "{:?}",
+            s.warnings
+        );
         assert!(s.is_empty());
     }
 
@@ -484,7 +490,9 @@ mod tests {
 
     #[test]
     fn the_last_assignment_wins() {
-        let s = parse("keyboard.layout = us\nkeyboard.layout = de\noutput.X.scale = 1\noutput.X.scale = 2\n");
+        let s = parse(
+            "keyboard.layout = us\nkeyboard.layout = de\noutput.X.scale = 1\noutput.X.scale = 2\n",
+        );
         assert_eq!(s.keyboard.layout.as_deref(), Some("de"));
         assert_eq!(s.output("X").expect("X").scale, Some(2.0));
     }
@@ -513,8 +521,14 @@ mod tests {
 
     #[test]
     fn scale_bounds_are_enforced_because_a_typo_locks_the_desktop() {
-        assert_eq!(parse("output.X.scale = 0.5").output("X").expect("X").scale, Some(0.5));
-        assert_eq!(parse("output.X.scale = 8").output("X").expect("X").scale, Some(8.0));
+        assert_eq!(
+            parse("output.X.scale = 0.5").output("X").expect("X").scale,
+            Some(0.5)
+        );
+        assert_eq!(
+            parse("output.X.scale = 8").output("X").expect("X").scale,
+            Some(8.0)
+        );
         for bad in ["0.4", "8.1", "-2", "0"] {
             let s = parse(&format!("output.X.scale = {bad}\n"));
             assert_eq!(s.output("X").expect("X").scale, None, "{bad}");
