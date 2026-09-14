@@ -224,10 +224,23 @@ impl App {
     }
 }
 
-/// Token for the connection fd in the epoll set. App fds use their own
-/// raw number, which cannot collide: fd 0 is stdin and never registered.
+/// Token for the connection fd in the epoll set.
+///
+/// The two sentinels sit at the top of the `u64` range and cannot collide
+/// with an app's fd hooks, whose ids are a **monotonic `u64` counting from
+/// 1** ([`FdToken`](crate::FdToken)) — reaching `u64::MAX - 1` would take
+/// more re-arms than a process can perform.
+///
+/// This used to say "app fds use their own raw number, which cannot collide:
+/// fd 0 is stdin and never registered". The conclusion survived but the
+/// reasoning did not: descriptor numbers are recycled on close, so a hook
+/// removed and another added in the same turn took the same number and the
+/// re-armed hook was silently never registered with `epoll`. See `FdToken`'s
+/// own doc comment, [`sync_fds`], and
+/// `a_re_armed_fd_hook_gets_a_fresh_token` in `crates/nitro-ui/tests/ui.rs`.
 const CONN_TOKEN: u64 = u64::MAX;
-/// Token for the introspection listener.
+/// Token for the introspection listener. Reserved alongside [`CONN_TOKEN`],
+/// and unreachable from an app's hook ids for the same reason.
 const INTROSPECT_TOKEN: u64 = u64::MAX - 1;
 
 /// Run `ui` until it quits.

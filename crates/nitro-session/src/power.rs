@@ -8,10 +8,11 @@
 //! daemon, and it still does not speak D-Bus — the *permission* was
 //! spent, not the requirement. Three reasons, in order of weight:
 //!
-//! 1. **`zbus` is ~40 crates.** The whole tree is 35 distinct external
-//!    crates today (`DEPENDENCIES.md`). Doubling it to send four method
-//!    calls a user makes twice a day is the single worst dependency trade
-//!    available in this repo.
+//! 1. **`zbus` is ~40 crates.** The whole tree is 37 distinct external
+//!    crates today (`DEPENDENCIES.md`; 34 when this was written, and
+//!    never the 35 an `awk` without `NF` used to report). Doubling it to
+//!    send four method calls a user makes twice a day is the single worst
+//!    dependency trade available in this repo.
 //! 2. **`systemctl` is already there.** It is part of the same systemd
 //!    that owns logind; a box that has logind has it. `systemctl suspend`
 //!    *is* a logind call — it goes to `org.freedesktop.login1.Manager`,

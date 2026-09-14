@@ -1290,7 +1290,8 @@ msg_enum! {
         SetCorners = 0x0204,
         /// Set a node's border.
         SetBorder = 0x0205,
-        /// Set a text node's content and style (needs `caps::TEXT`).
+        /// Set a text node's content and style. Always accepted; the
+        /// `caps::TEXT` bit reports visibility, not permission.
         SetText = 0x0206,
         /// Measure a string; answered at once with `TextMeasured`.
         MeasureText = 0x0207,

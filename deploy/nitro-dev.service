@@ -64,9 +64,12 @@ Restart=no
 # (checked on the box: the scope's effective limit becomes 1 G). That is
 # a box-wide policy rather than a unit setting, which is why it is a note
 # here and not a drop-in: it would also cap the developer's ssh session.
-# The M3 desktop measures ~29 MB resident for all five processes, so
-# nothing is near the number either way — the guard is against a runaway,
-# and the box has needed a power cycle after one before (docs/testbox.md).
+# The M3 desktop measures ~31 MB resident for all five processes — 30 700
+# kB re-measured by the #538 audit, of which 13 372 kB is private and the
+# rest shared file-backed pages counted once per process (docs/budget.md
+# §"The M3 desktop") — so nothing is near the number either way. The guard
+# is against a runaway, and the box has needed a power cycle after one
+# before (docs/testbox.md).
 MemoryMax=1G
 # The session's own teardown deadline is 3 s (nitro-session's
 # `TEARDOWN_TIMEOUT`), deliberately **inside** this one: the session must

@@ -714,9 +714,11 @@ fn sane_rect(rect: Rect) -> Result<Rect, ApplyError> {
 
 /// The scene's node kind for a wire kind. `Surface` is reserved: the server
 /// advertises no `DMABUF` capability, so a client asking for one is using a
-/// feature it was told does not exist. `Text` is live from M2 and gated by
-/// the `TEXT` capability bit, which the server only sets when it found a
-/// font to draw with.
+/// feature it was told does not exist. `Text` is live from M2 and is **always
+/// accepted** — the `TEXT` capability bit reports whether the text will be
+/// *visible* (i.e. whether the server found a font to draw with), not whether
+/// the node may be created. A server without it shapes to an empty run rather
+/// than refusing, which is why the match below takes `Text` unconditionally.
 fn scene_kind(kind: NodeKind) -> Result<SceneNodeKind, ApplyError> {
     match kind {
         NodeKind::Group => Ok(SceneNodeKind::Group),

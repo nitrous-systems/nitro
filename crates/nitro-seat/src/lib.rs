@@ -440,6 +440,39 @@ impl Drop for Device {
         // arrange, but harmless): libseat cannot be told, but the fd is
         // still ours to close. Errors from libseat are ignored: use
         // `Seat::close_device` to observe them.
+        //
+        // On the seat-gone branch specifically, this closes an fd that
+        // libseat was never told about. That is the documented-illegal drop
+        // order (`Seat::drop` `debug_assert`s against it, so a debug build
+        // panics first) and it is better than leaking, but it is worth
+        // recording what would make it *worse* than leaking: if a future
+        // libseat closed device fds inside `libseat_close_seat`, this would
+        // close a descriptor *number* that may already have been handed out
+        // again — a cross-close, which is far nastier than a leak.
+        //
+        // Measured behaviour today (libseat 0.9, logind and noop backends)
+        // is that libseat closes the fd neither on `close_device` nor,
+        // apparently, on `close_seat`, so there is nothing to fix.
+        //
+        // An `fcntl(F_GETFD)` probe before the close was considered for this
+        // path only (issue #551.2) and **not taken**, for two reasons:
+        //
+        //   1. It is not safe Rust here. `rustix::io::fcntl_getfd` is safe,
+        //      but it takes an `AsFd`, and the only way to get one from a
+        //      bare `RawFd` is `BorrowedFd::borrow_raw`, which is an `unsafe
+        //      fn`. It would need the same `#[allow(unsafe_code)]` the close
+        //      below carries, and the tree's rule is that a new `unsafe` site
+        //      has to earn its place.
+        //   2. More importantly it would not answer the question. `F_GETFD`
+        //      succeeds for *any* open descriptor at that number, including
+        //      one some other part of the process opened after libseat closed
+        //      ours — which is exactly the case the probe would exist to
+        //      catch. Distinguishing "still ours" from "reused" needs an
+        //      identity the fd number does not carry.
+        //
+        // The real fix, if libseat's behaviour ever changes, is to stop
+        // owning the number: keep the fd as an `OwnedFd` from the moment
+        // libseat hands it over.
         if let Some(seat) = self.seat.upgrade()
             && let Ok(mut seat) = seat.try_borrow_mut()
         {

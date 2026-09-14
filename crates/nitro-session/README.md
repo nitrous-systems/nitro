@@ -128,9 +128,17 @@ daemon and that it "is the only place a D-Bus client is allowed". This is
 that daemon, and it still does not speak D-Bus. The permission was
 spent, not the requirement:
 
-1. **`zbus` is ~40 crates.** The tree is 35 distinct external crates
-   today. Doubling it to send four method calls a user makes twice a day
-   is the worst dependency trade available in this repo.
+1. **`zbus` is ~40 crates.** The tree is 37 distinct external crates
+   today, and was 34 when this argument was written — it was never 35.
+   That figure came from counting with a bare
+   `awk '{print $1}'` over `cargo tree`, which turns the blank line
+   separating each root's subtree into an empty string that `sort -u`
+   then keeps: one too many. The right command is
+   `cargo tree -e normal --prefix none | awk 'NF{print $1}' | grep -v '^nitro-' | sort -u | wc -l`
+   (`docs/budget.md` has the full decomposition). Either way, doubling the
+   tree to send four method calls a user makes twice a day is the worst
+   dependency trade available in this repo — "~40 against 37" is the same
+   argument.
 2. **`systemctl` is already there**, and it *is* a logind call:
    `systemctl suspend` goes to `org.freedesktop.login1.Manager` with the
    same polkit check, the same inhibitor handling and the same "another

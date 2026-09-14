@@ -51,7 +51,7 @@
 //! turns most of that motion back into the same string, and 30 s caps
 //! what is left at two repaints a minute.
 //!
-//! `a_settled_bar_is_silent_between_clock_ticks` in `tests/bar.rs`
+//! `a_settled_bar_is_silent_while_nothing_changes` in `tests/bar.rs`
 //! asserts it from the outside, by counting commits over a window in
 //! which the sensors are polled several times.
 //!
