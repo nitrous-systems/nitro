@@ -313,6 +313,44 @@ fn twenty_thousand_lines_cost_no_more_commits_than_frames() {
 }
 
 #[test]
+fn a_fast_writer_does_not_starve_the_screen() {
+    // The bug this test exists for: `drain_pty` used to read until
+    // `WouldBlock`, which never comes while the writer is faster than
+    // the reader. `cat` of a 5 MB file was consumed in **one** drain and
+    // produced **one** commit — perfect frame pacing by the letter of
+    // the claim, and a terminal that showed nothing for two and a half
+    // seconds and then jumped to the end.
+    //
+    // So the assertion is that a big stream takes *several* drains. That
+    // is the opposite direction from every other cost test here, and
+    // deliberately: "one commit per frame" is only the right answer if a
+    // frame also happens while the output is still arriving.
+    let (mut h, grid) = harness_running(&[
+        "/bin/sh",
+        "-c",
+        "yes 'the quick brown fox jumps over the lazy dog' | head -c 3000000",
+    ]);
+    let mut drains = 0u32;
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        drain_only(&mut h);
+        h.frame();
+        drains += 1;
+        if h.state().bytes_read() >= 3_000_000 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "timed out reading 3 MB");
+    }
+    assert!(
+        drains > 4,
+        "3 MB arrived in {drains} drain(s); a screen that only updates \
+         when the writer stops is not keeping up"
+    );
+    let _ = grid;
+    h.quit();
+}
+
+#[test]
 fn one_keystroke_costs_two_mutations() {
     // The steady-state cost claim, and the word *steady* is doing real
     // work. A key echoed by an idle shell changes two things: the run of

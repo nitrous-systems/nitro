@@ -45,7 +45,7 @@ box := env_var_or_default("NITRO_BOX", "kaspar@192.168.1.204")
 # is why they are deployed together and in one rsync — a session that
 # started yesterday's bar next to today's server is the failure mode the
 # sibling lookup exists to prevent.
-box_bins := "nitro-server nitro-session nitro-shot nitro-demo nitro-calc nitro-bar nitro-launcher nitro-wallpaper hey"
+box_bins := "nitro-server nitro-session nitro-shot nitro-demo nitro-calc nitro-term nitro-bar nitro-launcher nitro-wallpaper hey"
 box_examples := "hello_client hello_dialog shell_probe"
 
 # Build release, rsync binaries to the box, restart the dev session.
@@ -57,6 +57,12 @@ deploy-bins:
     cargo build --release --workspace --bins --examples
     cd target/release && rsync -az {{box_bins}} {{box}}:nitro-bin/
     cd target/release/examples && rsync -az {{box_examples}} {{box}}:nitro-bin/
+    # The launcher reads `~/.local/share/applications` like any XDG
+    # client, and its built-in list is only the fallback for a box with
+    # no `.desktop` files at all. Installing the real one is what makes
+    # the launcher show "Terminal" rather than the built-in's name.
+    ssh {{box}} 'mkdir -p ~/.local/share/applications'
+    rsync -az deploy/nitro-term.desktop {{box}}:.local/share/applications/
 
 # Install/refresh the systemd unit on the box (needs sudo there).
 box-install:

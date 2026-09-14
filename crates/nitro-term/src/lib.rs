@@ -160,20 +160,39 @@ impl TermApp {
     }
 }
 
-/// Drain everything the pty has, feed it to the grid, and write back
-/// whatever the grid owes.
+/// The most a single drain will read before handing the loop back.
+///
+/// Without a cap this loop is unbounded, and the cap is not a tuning
+/// knob: a writer that is faster than we are — `cat` of a large file is
+/// exactly that — refills the pty as fast as we empty it, so "read until
+/// `WouldBlock`" never comes back. The first measurement of `cat` of a
+/// 5 MB file consumed the whole file in **one** drain and produced
+/// **one** commit: perfect frame pacing by the letter of the claim, and
+/// a terminal that showed nothing at all for two and a half seconds and
+/// then jumped to the end.
+///
+/// 256 KiB is about four screens of dense output at 80×24, so a frame
+/// always has more than it can show and the pacing argument is
+/// untouched; what changes is that the *screen* keeps up with the
+/// stream instead of waiting for it to end. The loop is
+/// level-triggered, so whatever is left wakes us again immediately.
+const DRAIN_CHUNK: usize = 256 * 1024;
+
+/// Drain what the pty has, feed it to the grid, and write back whatever
+/// the grid owes.
 ///
 /// Called from the descriptor hook, so it runs whenever `epoll` says the
-/// master is readable. It reads **until `WouldBlock`** rather than once:
-/// a level-triggered loop would wake again anyway, but doing it here
-/// keeps one wakeup to one frame, which is the whole pacing argument.
-/// It deliberately does not touch the scene — see the module docs.
+/// master is readable. It reads until `WouldBlock` **or [`DRAIN_CHUNK`]
+/// bytes**, whichever comes first — see that constant for why the second
+/// half of that sentence is load-bearing. It deliberately does not touch
+/// the scene; see the module docs.
 ///
 /// Returns whether the child is gone, which is what ends the app.
 pub fn drain_pty(state: &mut TermApp, ui: &mut Ui<TermApp>) -> bool {
     let Some(grid) = state.grid else { return false };
     let mut buf = std::mem::take(&mut state.buf);
     let mut closed = false;
+    let mut drained = 0usize;
     loop {
         match state.pty.read(&mut buf) {
             Ok(0) => {
@@ -182,8 +201,12 @@ pub fn drain_pty(state: &mut TermApp, ui: &mut Ui<TermApp>) -> bool {
             }
             Ok(n) => {
                 state.bytes_read += n as u64;
+                drained += n;
                 if let Ok(mut g) = ui.widget_mut::<TermGrid>(grid) {
                     g.feed(&buf[..n]);
+                }
+                if drained >= DRAIN_CHUNK {
+                    break;
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
