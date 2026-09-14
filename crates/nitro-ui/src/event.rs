@@ -84,8 +84,23 @@ pub mod key {
     pub const PAGE_DOWN: u32 = 109;
     /// The letter `a`, for `Ctrl-A`.
     pub const A: u32 = 30;
+    /// The letter `c`, for `Ctrl-C`.
+    pub const C: u32 = 46;
+    /// The letter `h`, for `Ctrl-H`.
+    pub const H: u32 = 35;
+    /// The letter `n`, for `Ctrl-N` and for answering "no".
+    pub const N: u32 = 49;
+    /// The letter `s`, for `Ctrl-S`.
+    pub const S: u32 = 31;
+    /// The letter `v`, for `Ctrl-V`.
+    pub const V: u32 = 47;
+    /// The letter `y`, for answering "yes".
+    pub const Y: u32 = 21;
     /// The letter `q`, for the conventional quit shortcut.
     pub const Q: u32 = 16;
+    /// `F2`, which every file manager since the Norton Commander has
+    /// used to rename.
+    pub const F2: u32 = 60;
 }
 
 /// Modifier bits of an xkb modifier mask, for [`KeyEvent::mods`] and
