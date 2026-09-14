@@ -999,10 +999,13 @@ fn get<S: 'static>(ui: &Ui<S>, path: &str, prop: Option<&str>) -> Result<String,
     // the role. A terminal's screen belongs in that set for the same
     // reason a label's string does — and it is the whole of how
     // `nitro-term` is driven from outside, since reading the screen as
-    // text is what replaces a font, a screenshot and an OCR step.
+    // text is what replaces a font, a screenshot and an OCR step. A
+    // list is the same shape one dimension down: its value is the rows
+    // it is showing, one per line, which is how `hey nitro-files get
+    // list text` reads a directory without a screenshot.
     let text = if matches!(
         node.role,
-        Role::Label | Role::Button | Role::TextField | Role::Terminal
+        Role::Label | Role::Button | Role::TextField | Role::Terminal | Role::List
     ) {
         value.clone()
     } else {

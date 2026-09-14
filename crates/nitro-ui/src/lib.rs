@@ -67,6 +67,7 @@
 //! |--------|---------------|
 //! | [`widget`] | the [`Widget`] trait and the pass contexts |
 //! | [`widgets`] | `Flex`, `Panel`, `Label`, `Button`, `TextField`, `Checkbox`, `Scroll`, `Slider`, `Separator`, `Image`, `Spacer` |
+//! | [`list`] | `List`: a **virtualised** list, `visible + 2` nodes for any model |
 //! | [`build`] | the builder traits |
 //! | [`layout`] | the flex model, as pure functions |
 //! | [`event`] | [`Event`], [`Handled`] and the key/button codes |
@@ -83,6 +84,7 @@ pub mod error;
 pub mod event;
 pub mod introspect;
 pub mod layout;
+pub mod list;
 pub mod shell;
 pub mod shot;
 pub mod theme;
@@ -107,6 +109,7 @@ pub use event::{Event, Handled, KeyEvent};
 pub use layout::{
     Constraints, CrossAlign, Direction, Edges, FlexItem, LayoutStyle, Length, MainAlign,
 };
+pub use list::{List, ListModel, Row, list};
 pub use nitro_core::{Color, Point, Rect, Size, Transform};
 pub use nitro_wire::types::Align;
 // A custom widget's `paint` takes a `Fill` ([`PaintCx::rect`]), so a

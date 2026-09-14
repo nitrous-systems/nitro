@@ -1002,6 +1002,42 @@ impl<S: 'static> Ui<S> {
         }
     }
 
+    /// Move a **group** paint slot's children by `transform`, without a
+    /// repaint — the same operation as
+    /// [`WidgetMut::set_slot_transform`], reachable from a plain
+    /// `&mut Ui`.
+    ///
+    /// Both doors exist because a widget needs this from two places. A
+    /// setter has a `WidgetMut`; a widget's own `event` and `action` do
+    /// not — they are handed `cx.ui`, a full `&mut Ui<S>`, precisely
+    /// *because* the widget is out of its slot and cannot be taken
+    /// again. `List` scrolls from both, and a version that only had the
+    /// `WidgetMut` form would have had to ask for itself and get
+    /// [`Error::Busy`].
+    ///
+    /// Nothing happens if the slot does not exist yet or is not a
+    /// group; the next paint creates it.
+    pub fn set_slot_transform(
+        &mut self,
+        id: WidgetId,
+        slot: crate::widget::Slot,
+        transform: nitro_core::Transform,
+    ) {
+        let index = slot as usize;
+        let Some(state) = self.arena.slot_mut(id).map(|s| &mut s.state) else {
+            return;
+        };
+        let Some(paint) = state.slots.get_mut(index) else {
+            return;
+        };
+        if paint.node.is_none() || paint.transform == transform {
+            return;
+        }
+        paint.transform = transform;
+        let node = paint.node;
+        let _ = self.wire.set_transform(node, transform);
+    }
+
     /// The transform currently applied to a widget's children.
     #[must_use]
     pub fn content_transform(&self, id: WidgetId) -> nitro_core::Transform {
@@ -2750,19 +2786,8 @@ impl<W: Widget<S>, S: 'static> WidgetMut<'_, W, S> {
         slot: crate::widget::Slot,
         transform: nitro_core::Transform,
     ) {
-        let index = slot as usize;
-        let Some(state) = self.ui.arena.slot_mut(self.id).map(|s| &mut s.state) else {
-            return;
-        };
-        let Some(paint) = state.slots.get_mut(index) else {
-            return;
-        };
-        if paint.node.is_none() || paint.transform == transform {
-            return;
-        }
-        paint.transform = transform;
-        let node = paint.node;
-        let _ = self.ui.wire.set_transform(node, transform);
+        let id = self.id;
+        self.ui.set_slot_transform(id, slot, transform);
     }
 }
 

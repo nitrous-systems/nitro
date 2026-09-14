@@ -40,6 +40,15 @@ pub enum Role {
     Checkbox,
     /// A scrollable viewport.
     Scroll,
+    /// A list of rows, of which only the visible ones exist as nodes.
+    ///
+    /// Its value is the **visible** rows as text, which is what makes
+    /// `hey nitro-files get list text` a screenful rather than a
+    /// hundred thousand lines: the widget genuinely does not draw the
+    /// rest, and reporting them would be a claim about the screen that
+    /// is not true. AT-SPI has had the role since the beginning, for the
+    /// same reason it has a terminal: a list is addressed by row.
+    List,
     /// A value picked from a range.
     Slider,
     /// A terminal emulator's screen.
@@ -72,6 +81,7 @@ impl Role {
             Role::TextField => "textfield",
             Role::Checkbox => "checkbox",
             Role::Scroll => "scroll",
+            Role::List => "list",
             Role::Slider => "slider",
             Role::Terminal => "terminal",
             Role::Separator => "separator",
@@ -91,6 +101,7 @@ impl Role {
             Role::TextField,
             Role::Checkbox,
             Role::Scroll,
+            Role::List,
             Role::Slider,
             Role::Terminal,
             Role::Separator,
