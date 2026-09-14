@@ -439,6 +439,8 @@ pub struct Button<S> {
     pressed: bool,
     style: Option<TextStyle>,
     on_click: Option<ClickFn<S>>,
+    /// The **middle**-button callback; see [`ButtonBuilder::on_alt_click`].
+    on_alt_click: Option<ClickFn<S>>,
     metrics: crate::wire::TextMetrics,
 }
 
@@ -492,6 +494,24 @@ impl<S: 'static> Button<S> {
         };
         cb(cx.state, cx.ui);
         self.on_click = Some(cb);
+    }
+
+    /// Run the middle-button callback, if there is one.
+    ///
+    /// Not reported as an activation: `report_activation` is what a
+    /// watcher sees as "this button was pressed", and a middle click is a
+    /// different act with a different meaning (in a task list, *close*
+    /// rather than *focus*). Reporting both as the same event would tell
+    /// a watcher a lie that is impossible to unpick.
+    fn alt_activate(&mut self, cx: &mut EventCx<'_, S>) {
+        if !self.enabled {
+            return;
+        }
+        let Some(cb) = self.on_alt_click.take() else {
+            return;
+        };
+        cb(cx.state, cx.ui);
+        self.on_alt_click = Some(cb);
     }
 }
 
@@ -560,6 +580,24 @@ impl<S: 'static> Widget<S> for Button<S> {
                 }
                 Handled::Yes
             }
+            // The middle button is claimed only when something is
+            // listening for it. A button with no `on_alt_click` must let
+            // it bubble: an ancestor (a scroller, a list) may want it,
+            // and silently swallowing a button nobody handles is how a
+            // widget breaks a gesture it has never heard of.
+            Event::PointerDown { button, .. }
+                if *button == button::MIDDLE && self.on_alt_click.is_some() =>
+            {
+                Handled::Yes
+            }
+            Event::PointerUp { pos, button }
+                if *button == button::MIDDLE && self.on_alt_click.is_some() =>
+            {
+                if cx.contains(*pos) {
+                    self.alt_activate(cx);
+                }
+                Handled::Yes
+            }
             Event::KeyDown(k) if k.keycode == key::SPACE || k.keycode == key::ENTER => {
                 self.pressed = true;
                 cx.request_paint();
@@ -611,7 +649,11 @@ impl<S: 'static> Widget<S> for Button<S> {
             // the *addressing* name and most buttons have none.
             value: Some(self.text.clone()),
             actions: if self.enabled {
-                vec!["click", "activate", "focus"]
+                if self.on_alt_click.is_some() {
+                    vec!["click", "activate", "focus", "alt_click"]
+                } else {
+                    vec!["click", "activate", "focus"]
+                }
             } else {
                 Vec::new()
             },
@@ -625,6 +667,13 @@ impl<S: 'static> Widget<S> for Button<S> {
             // cannot tell the two apart, which is the point.
             "click" | "activate" | "press" => {
                 self.activate(cx);
+                Handled::Yes
+            }
+            // Scriptable for the same reason `click` is: a task list's
+            // close is a middle click, and an action a script cannot
+            // reach is a feature `hey` cannot test.
+            "alt_click" | "middle_click" => {
+                self.alt_activate(cx);
                 Handled::Yes
             }
             "set_text" | "set_value" | "set_label" => {
@@ -673,6 +722,11 @@ impl<S: 'static> WidgetMut<'_, Button<S>, S> {
     pub fn set_on_click(&mut self, f: impl Fn(&mut S, &mut Ui<S>) + 'static) {
         self.on_click = Some(Box::new(f));
     }
+
+    /// Replace the middle-button callback.
+    pub fn set_on_alt_click(&mut self, f: impl Fn(&mut S, &mut Ui<S>) + 'static) {
+        self.on_alt_click = Some(Box::new(f));
+    }
 }
 
 /// Builder for a [`Button`].
@@ -687,6 +741,20 @@ impl<S: 'static> ButtonBuilder<S> {
     #[must_use]
     pub fn on_click(mut self, f: impl Fn(&mut S, &mut Ui<S>) + 'static) -> Self {
         self.button.on_click = Some(Box::new(f));
+        self
+    }
+
+    /// What to do when the button is **middle**-clicked.
+    ///
+    /// A second, distinct act on the same button — the shape a task list
+    /// needs, where a click focuses a window and a middle click closes
+    /// it. It is deliberately not reachable from the keyboard: there is
+    /// no conventional key for "the other click", and inventing one
+    /// (Shift-Enter?) would be a binding nobody would guess. Scripts
+    /// reach it through the `alt_click` action instead.
+    #[must_use]
+    pub fn on_alt_click(mut self, f: impl Fn(&mut S, &mut Ui<S>) + 'static) -> Self {
+        self.button.on_alt_click = Some(Box::new(f));
         self
     }
 
@@ -734,6 +802,7 @@ pub fn button<S: 'static>(text: impl Into<String>) -> ButtonBuilder<S> {
         pressed: false,
         style: None,
         on_click: None,
+        on_alt_click: None,
         metrics: crate::wire::TextMetrics::default(),
     };
     ButtonBuilder {

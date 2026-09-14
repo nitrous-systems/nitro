@@ -22,7 +22,7 @@ use nitro_wire::msg::{
     self, ClientMsg, CreateNode, DestroyNode, Fill, Reparent, ServerMsg, SetBorder, SetBounds,
     SetClip, SetCorners, SetFill, SetImage, SetText, SetTransform,
 };
-use nitro_wire::types::{BufferId, Layer, NodeId, NodeKind, caps};
+use nitro_wire::types::{BufferId, Edge, Layer, NodeId, NodeKind, caps};
 
 use crate::error::Error;
 use crate::theme::TextStyle;
@@ -275,23 +275,97 @@ impl Wire {
         Ok(())
     }
 
-    /// Create the one top-level window.
+    /// Create the one top-level window, on `layer` and with `flags`.
+    ///
+    /// Both are `Normal`/`0` for an ordinary app. A shell surface passes
+    /// its own — and passes them *here*, in the same transaction as the
+    /// window itself, because a bar's layer is not a property it acquires
+    /// a frame later: a `Top` window created as `Normal` would be visibly
+    /// in the window-management z-order until the next commit.
     pub(crate) fn create_window(
         &mut self,
         id: NodeId,
         title: &str,
         size: Size,
+        layer: Layer,
+        flags: u32,
     ) -> Result<(), Error> {
         self.send(
             &ClientMsg::CreateWindow(msg::CreateWindow {
                 id,
                 size,
-                layer: Layer::Normal,
-                flags: 0,
+                layer,
+                flags,
                 title: title.to_owned(),
             }),
             id,
         )
+    }
+
+    /// Give the window an application id.
+    ///
+    /// Sent for every app, from the name it was constructed with, because
+    /// the app id is what a *window list* shows and groups by: a bar
+    /// cannot tell two untitled windows apart without it, and it is the
+    /// only field that names the program rather than the document. It
+    /// rides the window's own first commit, so a window never exists
+    /// without one.
+    pub(crate) fn set_app_id(&mut self, id: NodeId, app_id: &str) -> Result<(), Error> {
+        self.send(
+            &ClientMsg::SetAppId(msg::SetAppId {
+                window: id,
+                app_id: app_id.to_owned(),
+            }),
+            id,
+        )
+    }
+
+    /// Anchor the window to its output's edges (needs `caps::SHELL`).
+    ///
+    /// Queued as a mutation rather than sent at once, so it rides the
+    /// same commit as the `CreateWindow` above. That ordering is not a
+    /// nicety: the server buffers `SetAnchor` to the sender's commit
+    /// precisely so a bar can create and anchor a window in one
+    /// transaction (`docs/shell.md`), and splitting them would make the
+    /// bar paint at its placeholder size for a frame.
+    pub(crate) fn set_anchor(&mut self, id: NodeId, edges: u8, margin: u32) -> Result<(), Error> {
+        self.send(
+            &ClientMsg::SetAnchor(msg::SetAnchor {
+                window: id,
+                edges,
+                margin,
+            }),
+            id,
+        )
+    }
+
+    /// Reserve `px` logical pixels along `edge` of the window's output
+    /// (needs `caps::SHELL`). Buffered to the commit, as `set_anchor` is.
+    pub(crate) fn set_exclusive_zone(
+        &mut self,
+        id: NodeId,
+        edge: Edge,
+        px: u32,
+    ) -> Result<(), Error> {
+        self.send(
+            &ClientMsg::SetExclusiveZone(msg::SetExclusiveZone {
+                window: id,
+                edge,
+                px,
+            }),
+            id,
+        )
+    }
+
+    /// Send a shell op that is answered **on receipt** rather than at a
+    /// commit — the questions and the ops on other clients' windows.
+    ///
+    /// It deliberately does not go through [`Wire::send`]: those count as
+    /// pending mutations and would make the next flush commit, so a bar
+    /// that merely asked a question would break the idle contract.
+    pub(crate) fn send_now(&mut self, msg: &ClientMsg) -> Result<(), Error> {
+        self.conn.send(msg)?;
+        self.flush_all()
     }
 
     /// Create a `Group` under `parent`, before `before` (or appended).

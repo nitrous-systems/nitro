@@ -156,7 +156,24 @@ pub struct Ui<S> {
     /// handler is handed `&mut Ui<S>`, so it must not be reachable
     /// through the tree it is holding.
     key_handlers: Vec<Option<KeyHandler<S>>>,
+    /// What kind of window to open; `None` for an ordinary app.
+    ///
+    /// Held rather than applied immediately because the surface is
+    /// described before the window exists: [`Ui::open_window`] turns it
+    /// into the layer, the flags, the anchor and the zone of one commit.
+    surface: Option<crate::shell::Surface>,
+    /// The application id, sent with the window; see [`Ui::set_app_id`].
+    app_id: String,
+    /// Shell-event handlers, in registration order; see [`Ui::on_shell`].
+    ///
+    /// `Option` for the same reason a widget leaves its arena slot: a
+    /// handler is handed `&mut Ui<S>`, so it must not be reachable
+    /// through the tree it is holding.
+    shell_handlers: Vec<Option<ShellHandler<S>>>,
 }
+
+/// A shell-event handler; see [`Ui::on_shell`].
+type ShellHandler<S> = Box<dyn FnMut(&mut S, &mut Ui<S>, &crate::shell::ShellEvent)>;
 
 /// An app callback: it is handed the state and the whole tree, exactly
 /// like a widget's own.
@@ -212,6 +229,9 @@ impl<S: 'static> Ui<S> {
             timers: Vec::new(),
             next_timer: 1,
             key_handlers: Vec::new(),
+            surface: None,
+            app_id: String::new(),
+            shell_handlers: Vec::new(),
         }
     }
 
@@ -937,10 +957,70 @@ impl<S: 'static> Ui<S> {
             Size::new(m.w.max(1.0).ceil(), m.h.max(1.0).ceil())
         };
         self.window_size = size;
-        self.wire.create_window(WINDOW, title, size)?;
+        let surface = self.surface;
+        let (layer, flags) = surface.map_or((nitro_wire::types::Layer::Normal, 0), |s| {
+            (s.layer, s.flags)
+        });
+        self.wire.create_window(WINDOW, title, size, layer, flags)?;
+        // The app id, in the same commit: it is what a window list names
+        // the program by, and a window that existed for one frame without
+        // one would appear in a bar as an anonymous row.
+        if !self.app_id.is_empty() {
+            let app_id = std::mem::take(&mut self.app_id);
+            self.wire.set_app_id(WINDOW, &app_id)?;
+            self.app_id = app_id;
+        }
+        // In the *same* transaction, which is the whole reason the server
+        // buffers these two to the sender's commit: an anchor answered on
+        // receipt would name a window `Commit` has not created yet, and a
+        // bar that anchored a frame later would paint once at the
+        // placeholder size above and then jump. See `docs/shell.md`.
+        if let Some(s) = surface {
+            if let Some(a) = s.anchor {
+                self.wire.set_anchor(WINDOW, a.edges, a.margin)?;
+            }
+            if let Some((edge, px)) = s.zone {
+                self.wire.set_exclusive_zone(WINDOW, edge, px)?;
+            }
+        }
         self.window_open = true;
         self.mark(root, Dirty::LAYOUT | Dirty::PAINT | Dirty::TREE);
         Ok(())
+    }
+
+    /// Set the application id sent with the window: what a window list
+    /// names this program by. [`App`](crate::App) sets it from the name
+    /// the app was constructed with.
+    pub fn set_app_id(&mut self, app_id: impl Into<String>) {
+        self.app_id = app_id.into();
+    }
+
+    /// Open this window as a shell surface: a bar, dock, launcher or
+    /// wallpaper rather than an ordinary application window.
+    ///
+    /// Must be called **before** [`Ui::open_window`] — the surface is
+    /// what that call creates, and a window cannot change layer without
+    /// the desktop seeing it on the wrong one first.
+    /// [`App::shell`](crate::App::shell) is the form an app uses.
+    pub fn set_surface(&mut self, surface: crate::shell::Surface) {
+        self.surface = Some(surface);
+    }
+
+    /// What kind of surface this window is, if it is one.
+    #[must_use]
+    pub fn surface(&self) -> Option<crate::shell::Surface> {
+        self.surface
+    }
+
+    /// Whether this connection may send the shell ops, i.e. whether it
+    /// arrived on `shell.sock`.
+    ///
+    /// Worth checking before binding a hotkey: a shell op on an
+    /// unprivileged connection is a **fatal** protocol error, so the
+    /// honest failure is to notice here rather than to be disconnected.
+    #[must_use]
+    pub fn is_shell(&self) -> bool {
+        self.wire.conn().has_caps(nitro_wire::types::caps::SHELL)
     }
 
     /// Resize the window's content area; the next flush re-lays out.
@@ -1368,6 +1448,35 @@ impl<S: 'static> Ui<S> {
             }
             ServerMsg::Key(k) => self.key(state, k),
             ServerMsg::Focus(f) if !f.focused => self.blur(state),
+            // The shell socket's news. Not input, so not routed to a
+            // widget: offered to the handlers `on_shell` registered.
+            ServerMsg::WindowInfo(i) => {
+                self.dispatch_shell(state, &crate::shell::ShellEvent::Window(i.clone()));
+            }
+            ServerMsg::WindowGone(g) => {
+                self.dispatch_shell(state, &crate::shell::ShellEvent::WindowGone(g.window));
+            }
+            ServerMsg::WindowListEnd(_) => {
+                self.dispatch_shell(state, &crate::shell::ShellEvent::WindowListEnd);
+            }
+            ServerMsg::OutputInfo(o) => {
+                self.dispatch_shell(state, &crate::shell::ShellEvent::Output(o.clone()));
+            }
+            ServerMsg::OutputGone(o) => {
+                self.dispatch_shell(state, &crate::shell::ShellEvent::OutputGone(o.id));
+            }
+            ServerMsg::OutputsEnd(_) => {
+                self.dispatch_shell(state, &crate::shell::ShellEvent::OutputsEnd);
+            }
+            ServerMsg::HotKey(h) => {
+                self.dispatch_shell(
+                    state,
+                    &crate::shell::ShellEvent::HotKey {
+                        id: h.id,
+                        pressed: h.pressed,
+                    },
+                );
+            }
             _ => {}
         }
     }
@@ -1561,6 +1670,158 @@ impl<S: 'static> Ui<S> {
     #[must_use]
     pub fn key_handler_count(&self) -> usize {
         self.key_handlers.len()
+    }
+
+    // -- the shell socket ---------------------------------------------
+
+    /// Register a handler for [`ShellEvent`](crate::shell::ShellEvent)s:
+    /// window-list changes, output hotplug and hotkeys.
+    ///
+    /// A handler is handed `&mut S` and `&mut Ui<S>`, exactly like a
+    /// button's `on_click`, so it edits the tree rather than only setting
+    /// a flag — which is what lets a bar's window list be ordinary tree
+    /// code.
+    ///
+    /// This is a list rather than a widget hung off the root, for the
+    /// same reason [`Ui::on_key`] is: these events have no widget to be
+    /// routed to. A `WindowInfo` is news about *somebody else's* window,
+    /// and there is no position to hit-test and no focus to follow.
+    pub fn on_shell(
+        &mut self,
+        handler: impl FnMut(&mut S, &mut Ui<S>, &crate::shell::ShellEvent) + 'static,
+    ) {
+        self.shell_handlers.push(Some(Box::new(handler)));
+    }
+
+    /// How many shell handlers are registered.
+    #[must_use]
+    pub fn shell_handler_count(&self) -> usize {
+        self.shell_handlers.len()
+    }
+
+    /// Offer a shell event to every handler, in registration order.
+    ///
+    /// Every handler sees every event — unlike a key, which stops at the
+    /// first taker. There is nothing to consume: two handlers interested
+    /// in the window list are both right, and a "handled" answer would
+    /// only let the first one silently starve the second.
+    pub fn dispatch_shell(&mut self, state: &mut S, ev: &crate::shell::ShellEvent) {
+        let mut i = 0;
+        // By index rather than over an iterator: a handler holds `&mut
+        // Ui<S>` and may register another one.
+        while i < self.shell_handlers.len() {
+            let Some(mut h) = self.shell_handlers[i].take() else {
+                i += 1;
+                continue;
+            };
+            h(state, self, ev);
+            if i < self.shell_handlers.len() {
+                self.shell_handlers[i] = Some(h);
+            }
+            i += 1;
+        }
+    }
+
+    /// Ask for the window list and subscribe to its changes.
+    ///
+    /// Answered with one
+    /// [`ShellEvent::Window`](crate::shell::ShellEvent::Window) per
+    /// window then a `WindowListEnd`; afterwards changes arrive unasked,
+    /// so a bar never polls.
+    ///
+    /// # Errors
+    /// A wire failure. Sending this on an unprivileged connection is a
+    /// fatal protocol error at the server — check [`Ui::is_shell`].
+    pub fn window_list(&mut self) -> Result<(), Error> {
+        self.wire.send_now(&nitro_wire::msg::ClientMsg::WindowList(
+            nitro_wire::msg::WindowList,
+        ))
+    }
+
+    /// Ask for the output list and subscribe to hotplug.
+    ///
+    /// # Errors
+    /// As [`Ui::window_list`].
+    pub fn outputs(&mut self) -> Result<(), Error> {
+        self.wire.send_now(&nitro_wire::msg::ClientMsg::Outputs(
+            nitro_wire::msg::Outputs,
+        ))
+    }
+
+    /// Give keyboard focus to another client's window.
+    ///
+    /// Silently refused by the server when it cannot be honoured — a
+    /// `NO_FOCUS` or minimized window, a stale ref — on exactly the terms
+    /// a click on it would be. There is no per-request error in this
+    /// protocol, and a bar's window list must not be able to wedge the
+    /// keyboard by naming the wrong row.
+    ///
+    /// # Errors
+    /// As [`Ui::window_list`].
+    pub fn focus_window(&mut self, window: nitro_wire::types::WindowRef) -> Result<(), Error> {
+        self.wire.send_now(&nitro_wire::msg::ClientMsg::FocusWindow(
+            nitro_wire::msg::FocusWindow { window },
+        ))
+    }
+
+    /// Ask another client's window to close.
+    ///
+    /// A *request*: the owning client is told and decides, so unsaved
+    /// work survives a misclick in a task list.
+    ///
+    /// # Errors
+    /// As [`Ui::window_list`].
+    pub fn close_window(&mut self, window: nitro_wire::types::WindowRef) -> Result<(), Error> {
+        self.wire.send_now(&nitro_wire::msg::ClientMsg::CloseWindow(
+            nitro_wire::msg::CloseWindow { window },
+        ))
+    }
+
+    /// Put another client's window into a state.
+    ///
+    /// # Errors
+    /// As [`Ui::window_list`].
+    pub fn set_window_state_for(
+        &mut self,
+        window: nitro_wire::types::WindowRef,
+        state: crate::shell::WindowState,
+    ) -> Result<(), Error> {
+        self.wire
+            .send_now(&nitro_wire::msg::ClientMsg::SetWindowStateFor(
+                nitro_wire::msg::SetWindowStateFor { window, state },
+            ))
+    }
+
+    /// Bind a server-global hotkey.
+    ///
+    /// `mods` is a [`nitro_wire::types::mod_mask`] bitmask, **not** the
+    /// xkb mask a [`KeyEvent`] carries: xkb's serialized mask depends on
+    /// the compiled keymap, so it cannot be compared against a constant.
+    /// `keysym: 0` asks for the bare-modifier **tap**, which fires once,
+    /// on the release.
+    ///
+    /// While bound, the chord is not delivered to the focused client at
+    /// all — a global hotkey the focused application could also see would
+    /// be a keylogger and an ambiguity at once.
+    ///
+    /// # Errors
+    /// As [`Ui::window_list`].
+    pub fn bind_key(&mut self, id: u32, mods: u32, keysym: u32) -> Result<(), Error> {
+        self.wire.send_now(&nitro_wire::msg::ClientMsg::BindKey(
+            nitro_wire::msg::BindKey { id, mods, keysym },
+        ))
+    }
+
+    /// Release a hotkey binding. Unbinding an id that is not bound is a
+    /// deliberate no-op: a shell shutting down should not have to
+    /// remember what it managed to bind.
+    ///
+    /// # Errors
+    /// As [`Ui::window_list`].
+    pub fn unbind_key(&mut self, id: u32) -> Result<(), Error> {
+        self.wire.send_now(&nitro_wire::msg::ClientMsg::UnbindKey(
+            nitro_wire::msg::UnbindKey { id },
+        ))
     }
 
     /// Offer a key to the app-level handlers, in registration order.
@@ -1886,6 +2147,22 @@ impl<S: 'static> Ui<S> {
             .iter()
             .map(|h| (h.fd.as_raw_fd(), h.fd.as_fd()))
             .collect()
+    }
+
+    /// Bring every pending timer `by` closer to firing, as though that
+    /// much time had passed.
+    ///
+    /// For tests that supply their own clock. A timer's deadline is an
+    /// `Instant` from the monotonic clock, which no amount of faking a
+    /// *wall* clock moves — so a test of the bar's minute-aligned tick
+    /// would otherwise have to wait a real minute to see it. Shifting the
+    /// deadlines is the honest form of that fast-forward: it preserves
+    /// the relative order of the timers and fires exactly the ones that
+    /// the elapsed time would have.
+    pub fn advance_timers(&mut self, by: Duration) {
+        for t in &mut self.timers {
+            t.deadline -= by;
+        }
     }
 
     /// Milliseconds until the next timer, or `None` when there is none.

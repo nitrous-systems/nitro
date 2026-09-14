@@ -807,7 +807,18 @@ impl Scene {
         if key == parent || self.is_ancestor(key, parent) {
             return Err(Error::BadParent);
         }
-        let position = child_position(new, before)?;
+        // Validated before anything is mutated, so a bad sibling aborts
+        // the batch without having moved the node; the *position* it
+        // yields is recomputed below, after the removal.
+        child_position(new, before)?;
+        // "Put me before myself" is where I already am. Answered here, as
+        // a no-op, because the position below is measured after the node
+        // has left the list — at which point it names a sibling that is
+        // no longer there, and the request would fail as `BadSibling`
+        // instead of doing the nothing it asks for.
+        if before == Some(key) {
+            return Ok(());
+        }
         let new_depth = new.depth + 1;
         let window = new.window;
         if new_depth + self.subtree_height(key) > MAX_DEPTH {
@@ -817,7 +828,16 @@ impl Scene {
         self.damage_now(key);
         self.node_mut_ref(old_parent).children.retain(|c| *c != key);
         self.mark(old_parent, Dirty::STRUCTURE);
+        // Recomputed *after* the removal, not before, because a reparent
+        // within the same parent is a **reorder**: the node has just left
+        // the child list the position was measured against, so an index
+        // taken earlier is off by one — and for "move to the end" it is
+        // one past the end, which is a panic rather than a wrong answer.
+        // A client can ask for exactly that (a window list dropping a
+        // button re-orders its siblings), so this was reachable from the
+        // wire: `a_reorder_within_one_parent_is_not_off_by_one` pins it.
         let p = self.node_mut_ref(parent);
+        let position = child_position(p, before)?;
         p.children.insert(position, key);
         self.node_mut_ref(key).parent = Some(parent);
         self.rewrite_subtree(key, new_depth, window);

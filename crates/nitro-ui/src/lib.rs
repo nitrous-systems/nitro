@@ -72,6 +72,7 @@
 //! | [`event`] | [`Event`], [`Handled`] and the key/button codes |
 //! | [`theme`] | [`Theme`] and [`TextStyle`] |
 //! | [`introspect`] | the per-app socket: `list`/`get`/`set`/`do`/`watch`/`shot` |
+//! | [`shell`] | shell surfaces: layers, anchors, exclusive zones, the window list |
 //! | [`shot`] | screenshot one window, by cropping the server's |
 //! | [`test`] | the in-process harness (feature `test-support`) |
 
@@ -82,6 +83,7 @@ pub mod error;
 pub mod event;
 pub mod introspect;
 pub mod layout;
+pub mod shell;
 pub mod shot;
 pub mod theme;
 pub mod ui;
@@ -107,6 +109,7 @@ pub use layout::{
 };
 pub use nitro_core::{Color, Point, Rect, Size, Transform};
 pub use nitro_wire::types::Align;
+pub use shell::{Anchor, ShellEvent, Surface};
 pub use theme::{TextStyle, Theme};
 pub use ui::{FdToken, Node, TimerId, Ui, WidgetMut};
 pub use widget::{Access, EventCx, LayoutCx, MeasureCx, PaintCx, Role, TextRun, Widget};

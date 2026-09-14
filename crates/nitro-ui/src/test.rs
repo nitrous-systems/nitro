@@ -44,6 +44,29 @@ use crate::wire::Mutation;
 /// Default output size the harness runs the server at.
 pub const OUTPUT: (u32, u32) = (320, 240);
 
+/// What a harness is built with: the arguments every constructor above
+/// funnels into one place, so adding a knob does not mean another
+/// five-argument overload.
+struct Options {
+    name: String,
+    size: Option<Size>,
+    theme: Theme,
+    backdrop: bool,
+    surface: Option<crate::shell::Surface>,
+}
+
+impl Options {
+    fn new(name: &str, size: Option<Size>, theme: Theme, backdrop: bool) -> Self {
+        Self {
+            name: name.to_owned(),
+            size,
+            theme,
+            backdrop,
+            surface: None,
+        }
+    }
+}
+
 /// A server, a client and a widget tree, all in this process.
 pub struct Harness<S> {
     server: TestServer,
@@ -106,7 +129,41 @@ impl<S: 'static> Harness<S> {
         backdrop: bool,
         build: impl FnOnce(&mut Ui<S>) -> WidgetId,
     ) -> Self {
-        let server = TestServer::start(name, OUTPUT.0, OUTPUT.1);
+        Self::build_with(Options::new(name, size, theme, backdrop), state, build)
+    }
+
+    /// A harness on the **shell** socket, for a bar, dock, launcher or
+    /// wallpaper: the connection carries `caps::SHELL` and the window is
+    /// opened as `surface`.
+    ///
+    /// A shell surface cannot be tested over the ordinary socket at all —
+    /// the first shell op would be a fatal protocol error — so this is
+    /// not a convenience but the only way in.
+    ///
+    /// # Panics
+    /// As [`Harness::new`].
+    pub fn shell(
+        name: &str,
+        state: S,
+        surface: crate::shell::Surface,
+        size: Option<Size>,
+        build: impl FnOnce(&mut Ui<S>) -> WidgetId,
+    ) -> Self {
+        let mut opts = Options::new(name, size, Theme::default(), true);
+        opts.surface = Some(surface);
+        Self::build_with(opts, state, build)
+    }
+
+    /// The one constructor the others funnel through.
+    fn build_with(opts: Options, state: S, build: impl FnOnce(&mut Ui<S>) -> WidgetId) -> Self {
+        let Options {
+            name,
+            size,
+            theme,
+            backdrop,
+            surface,
+        } = opts;
+        let server = TestServer::start(&name, OUTPUT.0, OUTPUT.1);
         // Park the pointer in a corner: the server puts it in the middle
         // of the output, where it would contaminate every pixel
         // assertion and hover every widget under it.
@@ -115,13 +172,24 @@ impl<S: 'static> Harness<S> {
             y: 0.999,
             time_ns: 1_000_000,
         });
-        let conn = Connection::connect(server.wire_path(), name).expect("wire connect");
-        let mut app = App::with_connection(conn, name).theme(theme);
+        // The socket *is* the capability: a shell surface connects to
+        // `shell.sock`, and that is the only difference between the two
+        // paths here — same handshake, same client, same loop.
+        let path = if surface.is_some() {
+            server.shell_path()
+        } else {
+            server.wire_path()
+        };
+        let conn = Connection::connect(path, &name).expect("connect");
+        let mut app = App::with_connection(conn, &name).theme(theme);
         if !backdrop {
             app = app.transparent();
         }
         if let Some(s) = size {
             app = app.size(s);
+        }
+        if let Some(s) = surface {
+            app = app.surface(s);
         }
         let ui = app.build(build).expect("build the tree");
         let mut h = Self {
@@ -257,6 +325,11 @@ impl<S: 'static> Harness<S> {
     pub fn settle(&mut self) {
         for _ in 0..64 {
             self.pump();
+            // Timers are part of the loop, not an extra: `event_loop_with`
+            // runs them after every wakeup, so a harness that skipped
+            // them would test a tree the real app never has — a bar whose
+            // clock never ticks.
+            self.ui.run_timers(&mut self.state);
             self.serve_socket();
             let sent = self.ui.flush().expect("flush");
             if !sent && !self.drain_pending() {
@@ -572,6 +645,29 @@ impl<S: 'static> Harness<S> {
         self.ui.commit_count()
     }
 
+    /// Run every timer whose deadline has passed, as the app loop does.
+    ///
+    /// [`Harness::settle`] already does this; it is public for a test
+    /// that wants to run the timers at a chosen moment — a clock test
+    /// that moves its own wall clock and then asks for exactly one tick.
+    pub fn run_timers(&mut self) {
+        self.ui.run_timers(&mut self.state);
+    }
+
+    /// Fast-forward every pending timer by `ms`; see
+    /// [`Ui::advance_timers`].
+    pub fn advance_timers(&mut self, ms: u64) {
+        self.ui.advance_timers(Duration::from_millis(ms));
+    }
+
+    /// Milliseconds until the tree's next timer, or `None` when it has
+    /// none. What the app loop passes to `epoll_wait` — and so the
+    /// honest way to assert that an idle app is not about to wake up.
+    #[must_use]
+    pub fn next_timeout(&self) -> Option<u64> {
+        self.ui.next_timeout()
+    }
+
     /// Assert that nothing is sent for `ms` milliseconds: the idle
     /// property, checked from the outside.
     ///
@@ -582,6 +678,10 @@ impl<S: 'static> Harness<S> {
         let deadline = Instant::now() + Duration::from_millis(ms);
         while Instant::now() < deadline {
             self.pump();
+            // Timers run here too, so "idle" means what the app loop
+            // means by it: a bar polling its sensors every 5 s is idle
+            // exactly when those polls change nothing.
+            self.ui.run_timers(&mut self.state);
             let sent = self.ui.flush().expect("flush");
             assert!(!sent, "a settled tree committed while idle");
             std::thread::sleep(Duration::from_millis(5));

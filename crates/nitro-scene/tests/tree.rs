@@ -99,6 +99,44 @@ fn reparent_moves_the_subtree_and_keeps_order() {
 }
 
 #[test]
+fn a_reorder_within_one_parent_is_not_off_by_one() {
+    // A reparent whose new parent is the *old* one is a reorder, and the
+    // insert position has to be measured after the node has left the
+    // list rather than before. Measuring it first is off by one for every
+    // move to the right — and for "move to the end" it is one past the
+    // end, which panicked the whole compositor.
+    //
+    // It was reachable from the wire: a bar's window list removes a
+    // button and re-orders the siblings, which is exactly this shape.
+    let mut s = scene();
+    let (_, root) = window(&mut s);
+    let parent = group(&mut s, root, Rect::new(0.0, 0.0, 100.0, 100.0));
+    let first = rect(&mut s, parent, Rect::new(0.0, 0.0, 10.0, 10.0));
+    let second = rect(&mut s, parent, Rect::new(0.0, 0.0, 10.0, 10.0));
+    let third = rect(&mut s, parent, Rect::new(0.0, 0.0, 10.0, 10.0));
+    assert_eq!(s.node(parent).unwrap().children(), &[first, second, third]);
+
+    // To the end: the case that panicked.
+    s.reparent(CLIENT, first, parent, None).unwrap();
+    assert_eq!(s.node(parent).unwrap().children(), &[second, third, first]);
+
+    // And to a sibling further right, which was silently off by one.
+    s.reparent(CLIENT, second, parent, Some(first)).unwrap();
+    assert_eq!(s.node(parent).unwrap().children(), &[third, second, first]);
+
+    // Moving a node before itself is a no-op, not an error: it names a
+    // sibling that is still in the list when the position is taken.
+    s.reparent(CLIENT, third, parent, Some(third)).unwrap();
+    assert_eq!(s.node(parent).unwrap().children(), &[third, second, first]);
+
+    // A sibling that is not there at all is still refused, and refused
+    // *before* anything moved.
+    let elsewhere = rect(&mut s, root, Rect::new(0.0, 0.0, 10.0, 10.0));
+    assert!(s.reparent(CLIENT, second, parent, Some(elsewhere)).is_err());
+    assert_eq!(s.node(parent).unwrap().children(), &[third, second, first]);
+}
+
+#[test]
 fn reparent_across_windows_rewrites_ownership() {
     let mut s = scene();
     let (w1, r1) = window(&mut s);

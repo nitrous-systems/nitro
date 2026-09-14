@@ -1,0 +1,36 @@
+[package]
+name = "nitro-bar"
+description = "The nitro top bar: window list, clock and battery/load/memory, on the shell socket"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The toolkit, and `rustix` for the two things the toolkit does not do:
+# the wall clock (`clock_gettime`) and reading `/sys`/`/proc`.
+nitro-ui = { workspace = true }
+rustix = { workspace = true, features = ["time"] }
+
+[lib]
+name = "nitro_bar"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nitro-bar"
+path = "src/main.rs"
+
+[dev-dependencies]
+# The in-process harness: a real server on the fake backend, a real shell
+# connection, real pixels. A dev-dependency, so the shipped binary never
+# links the compositor.
+nitro-ui = { workspace = true, features = ["test-support"] }
+# The tests open a *second*, ordinary client to have a window for the
+# window list to list, and assert on the `Configure` the exclusive zone
+# produces. That is raw wire, so the tests name the wire crate; the
+# shipped bar does not.
+nitro-wire = { workspace = true }
+nitro-core = { workspace = true }

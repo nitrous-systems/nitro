@@ -232,7 +232,7 @@ and the content hangs underneath it.
 | `Flex` (`column()`, `row()`) | `container` | — | — | draws nothing; everything is its `LayoutStyle` |
 | `Panel` | `container` | — | — | background, radius, border, each `None` = the theme's |
 | `Label` | `label` | its text | `set_value` | remembers the width it was measured at |
-| `Button` | `button` | — | `click`, `activate`, `focus` | hover/pressed/focused faces |
+| `Button` | `button` | — | `click`, `activate`, `focus`, `alt_click` | hover/pressed/focused faces; `alt_click` is the middle button |
 | `TextField` | `textfield` | its contents | `set_value`, `submit`, `clear`, `focus` | caret, selection, click-to-place, h-scroll |
 | `Checkbox` | `checkbox` | `true`/`false` | `toggle`, `set_value`, `focus` | Space toggles |
 | `Slider` | `slider` | the number | `set_value`, `focus` | drag, arrows, Home/End, optional step |
@@ -412,6 +412,59 @@ loop clamps its timeout to 10 ms and wakes 100×/s. With nothing connected
 — the normal case — the app blocks indefinitely exactly as before. See
 `docs/introspection.md`; registering the client streams is M3.
 
+## Shell surfaces
+
+A bar, a dock, a launcher and a wallpaper are `nitro-ui` apps like any
+other, with one difference the toolkit has to express: they connect to
+`shell.sock` rather than `wire.sock`, and that connection may name its
+own layer, stick to its output's edges and reserve screen space. The
+model is `docs/shell.md`; `crate::shell` is the client's half of it, and
+`crates/nitro-bar` is the consumer.
+
+`App::shell(name)` connects to the privileged socket and
+`App::surface(Surface::bar(32))` says what kind of window to open.
+Three decisions are worth stating.
+
+**The surface is described up front, not configured afterwards.** The
+layer, the flags, the anchor and the zone all ride the **same commit** as
+the `CreateWindow`. That is not tidiness: the server buffers `SetAnchor`
+and `SetExclusiveZone` to the sender's commit precisely so a bar can
+create and anchor in one transaction — it is the M3-B hardware probe's
+regression, where an anchor answered on receipt named a window `Commit`
+had not created yet — and a bar that anchored a frame later would paint
+once at its placeholder size and then jump.
+
+**`App::shell` fails rather than falling back.** A bar that silently
+downgraded to the ordinary socket would come up looking right and be
+killed by the first shell op it sent, which is a far harder failure to
+read than "could not connect". `Ui::is_shell` is the check for code that
+wants to degrade deliberately instead.
+
+**Shell events are a separate hook from widget events.** `Ui::on_shell`
+registers a handler for `ShellEvent` — the window list, output hotplug,
+hotkeys — offered `&mut S` and `&mut Ui<S>` exactly like a button's
+`on_click`, so a bar's task list is ordinary tree code. It is a list
+rather than a widget hung off the root for the same reason `on_key` is:
+a `WindowInfo` is news about *somebody else's* window, with no position
+to hit-test and no focus to follow. Unlike a key, every handler sees
+every event — there is nothing to consume, and a "handled" answer would
+only let the first handler silently starve the second.
+
+The questions (`window_list`, `outputs`) and the ops on other clients'
+windows (`focus_window`, `close_window`, `set_window_state_for`,
+`bind_key`) are sent **immediately** rather than queued as mutations,
+because they are not mutations: queuing them would make the next flush
+commit, and a shell that merely asked a question would break the idle
+contract. Nothing here polls — `WindowList` and `Outputs` subscribe — so
+a bar with nothing changing sits in `epoll_wait` like any other app.
+
+The toolkit also sends `SetAppId` for every app now, from the name it was
+constructed with, in the window's own first commit. The app id is what a
+window list names a *program* by (the title names the document), so a
+window that existed without one would appear in a bar as an anonymous
+row — and the bar could not recognise and skip its own window, which is
+exactly the bug the first version of it had.
+
 ## Writing a widget
 
 A widget is a plain struct with a `Widget<S>` impl. Every method has a
@@ -483,6 +536,21 @@ offers `shot()` for pixel assertions, `widget::<W>(id)` for state, and a
 label's text change cost exactly one commit and exactly one `SetText`.
 Counting messages is the only honest way to check the "work is
 proportional to what changed" claim from outside.
+
+`Harness::shell(name, state, surface, size, build)` is the same thing on
+the **shell** socket, for a bar or a launcher: a shell surface cannot be
+tested over the ordinary socket at all, since the first shell op would be
+a fatal protocol error, so this is not a convenience but the only way in.
+
+Timers are part of what the harness runs, because they are part of what
+the app loop runs: `settle` and `assert_idle` both fire due timers, so a
+test sees the tree the real app has rather than one whose clock never
+ticks. `advance_timers(ms)` fast-forwards every pending deadline. That
+last one exists because a timer's deadline is an `Instant` from the
+**monotonic** clock, which no amount of faking an app's *wall* clock
+moves — so a test of a minute-aligned tick would otherwise have to wait a
+real minute to see it. Shifting the deadlines preserves the timers'
+relative order and fires exactly the ones the elapsed time would have.
 
 Two things it needs from `nitro-server`, both behind its `test-support`
 feature:

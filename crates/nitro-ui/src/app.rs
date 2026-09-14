@@ -39,6 +39,7 @@ pub struct App {
     backdrop: bool,
     introspect: bool,
     name: String,
+    surface: Option<crate::shell::Surface>,
 }
 
 impl App {
@@ -48,16 +49,33 @@ impl App {
     /// # Errors
     /// Any connection or handshake failure.
     pub fn new(name: &str) -> Result<Self, Error> {
-        let conn = Connection::connect_default(name)?;
-        Ok(Self {
-            conn,
-            title: name.to_owned(),
-            theme: Theme::default(),
-            size: None,
-            backdrop: true,
-            introspect: true,
-            name: name.to_owned(),
-        })
+        Ok(Self::with_connection(
+            Connection::connect_default(name)?,
+            name,
+        ))
+    }
+
+    /// Connect to the **shell** socket named by `NITRO_SHELL_SOCKET` (or
+    /// the default path) and announce ourselves as `name`.
+    ///
+    /// A connection made here is privileged: it carries `caps::SHELL` and
+    /// may send the shell ops. The socket *is* the capability — a client
+    /// is privileged because of where it connected, not because of
+    /// anything it sent (`docs/shell.md`).
+    ///
+    /// This **fails** rather than falling back to the ordinary socket. A
+    /// bar that silently downgraded would come up looking right and then
+    /// be killed by the first shell op it sent, which is a much harder
+    /// failure to read than "could not connect".
+    ///
+    /// # Errors
+    /// Any connection or handshake failure — in particular a server too
+    /// old to have the shell socket, or a wrong `XDG_RUNTIME_DIR`.
+    pub fn shell(name: &str) -> Result<Self, Error> {
+        Ok(Self::with_connection(
+            Connection::connect_shell(name)?,
+            name,
+        ))
     }
 
     /// Use an already-connected socket. What the test harness does.
@@ -71,7 +89,23 @@ impl App {
             backdrop: true,
             introspect: true,
             name: title.to_owned(),
+            surface: None,
         }
+    }
+
+    /// Open the window as a shell surface — a bar, dock, launcher or
+    /// wallpaper — rather than as an ordinary application window.
+    ///
+    /// The layer, the flags, the anchor and the exclusive zone are all
+    /// applied in the window's **first commit**; see
+    /// [`crate::shell::Surface`].
+    ///
+    /// It does not connect anything: pair it with [`App::shell`], which
+    /// is where the privilege comes from.
+    #[must_use]
+    pub fn surface(mut self, surface: crate::shell::Surface) -> Self {
+        self.surface = Some(surface);
+        self
     }
 
     /// Do not paint the theme's background behind the tree.
@@ -138,10 +172,15 @@ impl App {
             size,
             backdrop,
             introspect: _,
-            name: _,
+            name,
+            surface,
         } = self;
         let mut ui = Ui::new(conn, theme);
         ui.set_backdrop(backdrop);
+        ui.set_app_id(&name);
+        if let Some(s) = surface {
+            ui.set_surface(s);
+        }
         let root = build(&mut ui);
         ui.set_root(root)?;
         ui.open_window(&title, size)?;

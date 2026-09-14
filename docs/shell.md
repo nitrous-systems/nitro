@@ -478,6 +478,18 @@ its window is on. "One bar per output" is a shell-side decision today (open
 one window per output); an `output` field on `SetAnchor` would let the
 server place it, and is worth adding when a shell actually wants it.
 
+One now does, and it turns out "open one window per output" is not
+actually available to a shell. `crates/nitro-bar` (M3-C) therefore opens
+**one** bar, on whichever output the server placed its window: a client
+cannot choose the output, because `CreateWindow` carries none and every
+new window is placed on the primary one, and nothing moves a window
+between outputs afterwards but a user's drag. N bar windows would all
+land on the same output — N overlapping bars and N×32 px of zone on one
+screen, which is worse than one bar. Closing this needs the `output`
+field on `SetAnchor` *and* a way to place the window there to begin with;
+the bar's README states the limitation where a reader of the bar will
+find it.
+
 **Stacking order in the window list.** The list is ordered by window
 identity. A shell that wants z-order, or the MRU order for a task
 switcher, needs another op or a field; neither has a consumer yet.
