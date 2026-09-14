@@ -241,21 +241,25 @@ full output below.
 
 | scene | nitro dev | vello dev | nitro **box** | vello **box** | box speedup |
 |---|---|---|---|---|---|
-| a `solid_fill` | **0.17 ms** | 0.33 ms | **1.82 ms** | 2.21 ms | 1.21× |
-| b `rrects_alpha` | **5.47 ms** | 3.55 ms | **11.73 ms** | 8.02 ms | 0.68× |
-| c `gradient` | **0.18 ms** | 1.84 ms | **1.82 ms** | 5.48 ms | 3.01× |
-| d `blits` | **24.17 ms** | 9.29 ms | **35.49 ms** | 21.19 ms | 0.60× |
-| e `ui_frame` | **2.98 ms** | 14.68 ms | **5.22 ms** | 27.23 ms | 5.22× |
+| a `solid_fill` | **0.17 ms** | 0.33 ms | **1.83 ms** | 2.21 ms | 1.21× |
+| b `rrects_alpha` | **5.45 ms** | 3.55 ms | **11.77 ms** | 8.02 ms | 0.68× |
+| c `gradient` | **0.18 ms** | 1.84 ms | **1.84 ms** | 5.48 ms | 2.98× |
+| d `blits` | **24.17 ms** | 9.29 ms | **36.09 ms** | 21.19 ms | 0.59× |
+| e `ui_frame` | **2.97 ms** | 14.68 ms | **5.22 ms** | 27.23 ms | 5.22× |
 
 Only (d) changed by design — see [the blit row split](#the-blit-row-split),
 re-taken now that the server paints into a heap shadow. (a), (b), (c), (e)
-and the glyph scenes are untouched code, and the small movements in them are
-**code layout, not work**: the split adds ~170 lines of blit code to the
-binary and shifts everything after it. That is not a guess — a control binary
-containing the split but never taking it reproduces those movements exactly,
-while (d) stays at the baseline. The effect is real enough to invert between
-machines: on dev it costs (b) 5.2 → 5.47 ms, on the box it *gains* (a)/(b)/(c)
-about 1–7 %. See [measuring this crate](#measuring-this-crate).
+and the glyph scenes are untouched code.
+
+Those untouched scenes are worth a warning. On dev, (b) reads 5.45 ms here
+against 5.20 before — and **the split cannot touch scene (b), which contains
+no blit call at all.** It is **code layout, not work**: the split adds ~170
+lines of blit code to the binary and shifts everything after it. That is not a
+guess — a control binary containing the split but never taking it reproduces
+the movement exactly, while (d) stays at the baseline. The effect is not even
+stable across machines or days: on the box the same scenes moved 1–7 % in the
+*other* direction in one session and not at all in the next. See [measuring
+this crate](#measuring-this-crate).
 
 Raw output:
 
@@ -270,18 +274,26 @@ scene f  glyphs_loop   min=0.227ms  median=0.229ms
 scene g  glyphs_batch  min=0.225ms  median=0.227ms
 
 # box (ssh kaspar@192.168.1.204), --iters 25 (min of 3 runs)
-scene a  solid_fill    min=1.823ms  median=1.878ms
-scene b  rrects_alpha  min=11.732ms median=11.793ms
-scene c  gradient      min=1.823ms  median=1.878ms
-scene d  blits         min=35.485ms median=35.557ms
-scene e  ui_frame      min=5.219ms  median=5.225ms
+scene a  solid_fill    min=1.834ms  median=1.887ms
+scene b  rrects_alpha  min=11.776ms median=11.829ms
+scene c  gradient      min=1.841ms  median=1.887ms
+scene d  blits         min=36.299ms median=36.415ms
+scene e  ui_frame      min=5.215ms  median=5.226ms
 scene f  glyphs_loop   min=0.314ms  median=0.315ms
 scene g  glyphs_batch  min=0.316ms  median=0.317ms
 ```
 
-(d) on the box is the noisiest number here: three interleaved pairs gave
-35.11 / 35.49 / 36.15 ms against a baseline pinned at 38.30 ± 0.01, so the
-win is 6–8 % and the spread is the box's, not the change's.
+(d) on the box is the noisiest number here, and the number that moved most
+under scrutiny. Seven interleaved pairs, order flipped from pair 4, all seven
+the same sign: baseline 38.05 ms against 36.09 (−5.2 %). One baseline run came
+in at 36.46 against a 37.98–38.31 cluster; including it the delta is −4.5 %,
+and it is reported rather than dropped.
+
+An earlier measurement of this same lever said −7.4 %. It was taken against a
+build with the `alpha == 0` bug described in [the guard that looks
+redundant](#the-guard-that-looks-redundant), and about two of those seven
+points were the bug skipping work that has to happen. Dev did not notice the
+fix (24.17 vs 24.21 ms); the box, which has no AVX2, did.
 
 Before this round of work, scene (e) measured **5.18 ms on dev and 9.36 ms on
 the box**, and scene (d) **27.26 / 38.08 ms**.
@@ -375,9 +387,9 @@ later round added **(d) < 10 ms**.
   levers that produced the 1.79× and the measurement that says the remaining
   gap is not another dispatch trick.
 
-- **(d) is 35.49 ms on the box, down from 38.08 — and the 10 ms target is
+- **(d) is 36.09 ms on the box, down from 38.08 — and the 10 ms target is
   still not reachable in scalar code.** The row split that #3693 measured and
-  then reverted has been **re-taken**: 27.31 → 24.17 ms dev, 38.30 → 35.49 ms
+  then reverted has been **re-taken**: 27.31 → 24.17 ms dev, 38.05 → 36.09 ms
   box. It was reverted because it lost on the write-combined DRM dumb buffer;
   #539 moved the rasterizer's destination to a heap shadow, which removed that
   objection. See [the blit row split](#the-blit-row-split).
@@ -550,11 +562,12 @@ of how nearly it shipped.
 
 | | dev | box |
 |---|---|---|
-| without the split | 27.31 ms | 38.30 ms |
-| with the split | **24.17 ms** | **35.49 ms** |
-| | −11.5 % | −7.4 % |
+| without the split | 27.31 ms | 38.05 ms |
+| with the split | **24.17 ms** | **36.09 ms** |
+| | −11.5 % | −5.2 % |
 
-Four interleaved pairs on dev, three on the box, non-overlapping on both.
+Four interleaved pairs on dev, seven on the box (order flipped from pair 4),
+all the same sign on both.
 
 **It is held to byte identity**, the same bar as the thin-border fast path:
 `blit_split_is_byte_identical_to_the_general_walk` runs 320 geometry
@@ -622,7 +635,8 @@ an all-zero texel in that case. (128 is exact, not a round number — at 127,
 `t.a = 1` still rounds to zero.) So it is resolved **once per run**, and the
 faint-`extra` loop is `#[cold]` and `#[inline(never)]`, because merely letting
 it share a function with the hot loop cost **1.6 ms even when it never ran**.
-Scene (d) is back to 24.17 ms and the sweep hash matches `329faf3` exactly.
+Scene (d) is back to 24.17 ms on dev and 36.09 on the box, and the sweep hash
+matches `329faf3` exactly.
 
 Three tests pin the reasoning rather than just the outcome: the `alpha == 0`
 sweep over every `(t.a, t.b, extra)`, the threshold being exactly 128, and
@@ -723,9 +737,9 @@ it is not part of ours, and the workspace `Cargo.toml` already excludes it).
   what our autovectorized scalar loops cannot match on a no-AVX2 CPU.
 
 **Is our rasterizer > 2× slower than `vello_cpu` on (b) or (e)?** No. On (e)
-we are 5.2× *faster*. On (b) we are 1.47× slower (11.73 vs 8.02 ms) — the
+we are 5.2× *faster*. On (b) we are 1.47× slower (11.77 vs 8.02 ms) — the
 spec's "more than 2× slower" threshold is not crossed. The only scene where
-we lose badly in absolute terms is (d), blits, at 1.7× slower (35.49 vs
+we lose badly in absolute terms is (d), blits, at 1.7× slower (36.09 vs
 21.19 ms) — down from 1.8× with the row split re-taken.
 
 ### Recommendation
