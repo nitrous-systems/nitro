@@ -685,6 +685,82 @@ fn a_keystroke_costs_nothing_for_a_row_that_did_not_change() {
     // And the two rows that went were destroyed rather than rewritten.
     assert!(named(&mut h, "results/1").is_none());
 
+    // The same property for the **icon**, which is the one that broke.
+    // `SetText` alone would not have caught it: a row's icon widget
+    // reports the icon it is *showing*, and after a `BadIcon` that is
+    // the fallback rather than the name that was sent — so a launcher
+    // that asked the widget "is this already your icon?" re-sent the
+    // failing name on every keystroke. Counted here rather than
+    // described, and counted in the harness's own theme-less server
+    // where **every** coloured name fails, which is the case that breaks.
+    let icons = h.mutations().iter().filter(|m| m.op == "SetIcon").count();
+    assert_eq!(
+        icons,
+        0,
+        "the unchanged row re-sent {icons} SetIcon(s): {:?}",
+        h.mutations()
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}
+
+#[test]
+fn a_row_whose_icon_the_box_lacks_is_not_re_sent_on_every_keystroke() {
+    // The bug this exists for, in the shape it actually had.
+    //
+    // A `.desktop` file names a coloured application icon; the harness's
+    // server has no icon theme, so the name earns a `BadIcon` and the
+    // row falls back to the symbolic `window`. The row's *requested*
+    // icon has not changed — it is still `nosuchapp-abc` — but the
+    // widget is now showing `window`, so a refresh that compared against
+    // the widget saw a difference, re-sent the failing name, made the
+    // server walk its whole icon search path again, earned a second
+    // `BadIcon`, re-armed the fallback and blinked the icon. Every
+    // keystroke. On the test box that was ~18 of 20 rows.
+    //
+    // Six keystrokes that keep the same row matched, and the assertion
+    // is zero: the icon is asked for once, when the row is built.
+    let (mut h, dir) = with_files(
+        "icon-resend",
+        &[(
+            "nosuch.desktop",
+            "[Desktop Entry]\nType=Application\nName=Nosuchapp\nExec=/bin/true\n\
+             Icon=nosuchapp-abc\n",
+        )],
+    );
+    super_tap(&mut h);
+    until(&mut h, "the show", |h| h.state().is_visible());
+    assert_eq!(h.state().match_count(), 1);
+
+    // The premise: it really did fall back, so the widget's icon and the
+    // requested one really do differ. Without this the test would pass
+    // against a server that resolved the name.
+    let id = named(&mut h, "results/0").expect("row 0");
+    assert!(
+        h.widget::<Button<Launcher>>(id).icon_fell_back(),
+        "the premise failed: this box resolved `nosuchapp-abc`"
+    );
+
+    h.tap();
+    h.clear_tap();
+    // `n`, `o`, `s`, `u`, `c`, `h` — the row matches throughout, so
+    // nothing about it changes but the query.
+    for code in [49u32, 24, 31, 22, 46, 35] {
+        h.key(code);
+        h.settle();
+    }
+    assert_eq!(h.state().match_count(), 1, "the row stayed matched");
+
+    let icons = h.mutations().iter().filter(|m| m.op == "SetIcon").count();
+    assert_eq!(
+        icons,
+        0,
+        "six keystrokes re-sent {icons} SetIcon(s) for a row whose icon \
+         never changed: {:?}",
+        h.mutations()
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
     h.quit();
 }

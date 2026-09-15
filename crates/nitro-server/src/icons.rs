@@ -329,8 +329,31 @@ impl IconEngine {
         }
         if let Some(index) = self.app_index.get(name).copied() {
             return match self.app_paths.get(&index) {
+                // Known bad: refuse without touching the filesystem, so
+                // a launcher redrawing forty rows does not walk the
+                // search path forty times.
                 Some(Resolved::Missing) => None,
-                _ => Some(index),
+                Some(Resolved::File(_)) => Some(index),
+                // Known *name*, unknown path: the only way to be here is
+                // a `set_theme`, which drops every resolved path and
+                // keeps every handle (the scene is holding the indices,
+                // and an index that changed meaning would be far worse
+                // than a re-resolve). So the question "does this name
+                // exist?" has to be asked again of the new theme — and
+                // asked *here*, at commit time, because this is the call
+                // whose answer becomes a `BadIcon` and therefore the
+                // client's chance to send its fallback. Resolving it
+                // lazily at paint time instead would draw nothing and
+                // tell nobody.
+                None => {
+                    let resolved = self
+                        .theme
+                        .lookup(name, PROBE_PX, 1)
+                        .map_or(Resolved::Missing, Resolved::File);
+                    let ok = matches!(resolved, Resolved::File(_));
+                    self.app_paths.insert(index, resolved);
+                    ok.then_some(index)
+                }
             };
         }
         // A wanted size is needed to pick a directory, and there isn't one
@@ -871,11 +894,14 @@ mod tests {
 
     /// An engine whose search path is exactly `dir` — nothing the box
     /// happens to have installed can reach these tests.
+    ///
+    /// Through [`IconEngine::with_dirs`] rather than by setting `theme`
+    /// directly, because the restriction has to survive a `set_theme`:
+    /// an engine that had only its *parsed theme* replaced would fall
+    /// back to the real `/usr/share/icons` the moment a test reloaded,
+    /// and its result would depend on the box running it.
     fn themed(dir: &std::path::Path) -> IconEngine {
-        IconEngine {
-            theme: IconTheme::with_dirs(vec![dir.to_path_buf()], "hicolor"),
-            ..IconEngine::default()
-        }
+        IconEngine::with_dirs(vec![dir.to_path_buf()], "hicolor")
     }
 
     /// Write `bytes` to `rel` under `dir`, creating the directories.
@@ -1256,7 +1282,7 @@ mod tests {
     }
 
     #[test]
-    fn changing_the_theme_drops_the_tiles_and_keeps_the_handles() {
+    fn changing_the_theme_drops_the_tiles_and_re_resolves_the_names() {
         // A node in the scene holds an *index*, so an index may never
         // change meaning — but the file behind it may, which is the whole
         // point of `theme.icons`.
@@ -1267,6 +1293,7 @@ mod tests {
         e.app_tile(icon, 24).expect("decodes");
         assert_eq!(e.app_cache.len(), 1);
         assert!(e.app_bytes > 0);
+
         e.set_theme("hicolor");
         assert!(e.app_cache.is_empty(), "the tiles went");
         assert_eq!(e.app_bytes, 0);
@@ -1275,6 +1302,24 @@ mod tests {
             Some(icon),
             "and the handle did not move"
         );
+
+        // The half that is easy to get wrong: a name that resolved under
+        // the *old* theme must be asked again of the new one, and asked
+        // **here**, at commit time — because this is the call whose
+        // answer becomes a `BadIcon` and so the client's chance to send
+        // its fallback. An engine that kept answering `Some` would draw
+        // nothing and tell nobody.
+        std::fs::remove_file(dir.join("hicolor/48x48/apps/testapp.png"))
+            .expect("remove the icon the way a package removal would");
+        e.set_theme("hicolor");
+        assert_eq!(
+            e.lookup_app("testapp"),
+            None,
+            "a name the new theme lacks must be refused, not silently blank"
+        );
+        // And the refusal is remembered, so a launcher redrawing forty
+        // rows does not walk the search path forty times.
+        assert_eq!(e.lookup_app("testapp"), None);
     }
 
     #[test]

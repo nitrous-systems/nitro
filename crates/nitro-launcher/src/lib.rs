@@ -190,6 +190,19 @@ pub struct Launcher {
     /// Extra entries merged into every scan: the nitro binaries next to
     /// the launcher, so a box with no desktop files still works.
     builtins: Vec<Entry>,
+    /// The icon last **asked for** on each row, by row position.
+    ///
+    /// Held for the same reason `nitro-bar`'s `Entry::icon` is, and the
+    /// launcher needs it more: a row's widget reports the icon it is
+    /// *showing*, which after a `BadIcon` is the fallback rather than the
+    /// name that was sent. Asking the widget "is this already your icon?"
+    /// therefore answers **no** forever for every application the box's
+    /// icon theme does not have — which on a thin theme is most of them —
+    /// and every keystroke would re-send the failing name, walk the whole
+    /// theme search path again server-side, earn a second `BadIcon` and
+    /// blink the icon. Comparing against what was *requested* is the only
+    /// question with a stable answer.
+    row_icons: Vec<RowIcon>,
     /// The ids of the tree, filled in by [`build`].
     ids: Option<Ids>,
 }
@@ -214,6 +227,7 @@ impl Launcher {
             shows: 0,
             dirs: desktop::search_dirs(),
             builtins: builtins(),
+            row_icons: Vec::new(),
             ids: None,
         }
     }
@@ -853,17 +867,24 @@ fn refresh(s: &mut Launcher, ui: &mut Ui<Launcher>) {
         let text = decorate(text, n == s.selected);
         let index = *index;
         if let Some(id) = rows.get(n).copied() {
+            // Asked against what this row was **last asked for**, not
+            // against what its widget is showing. The two differ exactly
+            // when the icon fell back, which on a box whose theme is thin
+            // is most rows — and asking the widget would then re-send the
+            // failing name on every keystroke, costing a full theme walk
+            // server-side, a second `BadIcon`, two mutations and a visible
+            // blink per row. See `Launcher::row_icons`.
+            let icon_changed = s.row_icons.get(n) != Some(icon);
             if let Ok(mut b) = ui.widget_mut::<Button<Launcher>>(id) {
                 b.set_text(text);
-                // The icon has to be replaced for the same reason the
-                // callback below does: a row shows a different
+                // The icon has to be replaced when it moved, for the same
+                // reason the callback below does: a row shows a different
                 // application after every keystroke, and an icon left
                 // over from the last query is a picture of the wrong
-                // program beside the right name. `apply_row_icon`
-                // returns early when nothing moved, so a row whose entry
-                // did not change costs no `SetIcon` and therefore no
-                // commit — which is what keeps typing cheap.
-                apply_row_icon(&mut b, icon);
+                // program beside the right name.
+                if icon_changed {
+                    apply_row_icon(&mut b, icon);
+                }
                 // The callback has to be replaced too: row 0 shows a
                 // different application after every keystroke, and a
                 // button whose label moved but whose callback did not is
@@ -891,6 +912,14 @@ fn refresh(s: &mut Launcher, ui: &mut Ui<Launcher>) {
     for id in rows.into_iter().skip(wanted.len()) {
         let _ = ui.remove(id);
     }
+    // Recorded **after** the loop, in one write, so the comparison above
+    // is against the previous pass throughout — updating it row by row
+    // inside the loop would be correct too, but this way there is one
+    // place that can get out of step with the widgets and it is next to
+    // the `remove` that shortens the list.
+    s.row_icons.clear();
+    s.row_icons
+        .extend(wanted.iter().map(|(_, _, icon)| icon.clone()));
 
     // The "no matches" label doubles as the error line, so it says
     // whichever is true. An empty string is an empty widget, not a blank
@@ -1002,9 +1031,12 @@ fn build_row_icon(
 
 /// Put `icon` on a row button that already exists.
 ///
-/// The setters return early on an unchanged value, so a row whose entry
-/// did not move costs nothing — which is what keeps a keystroke to the
-/// rows that actually changed.
+/// Called only when the row's icon actually moved — see the guard in
+/// [`refresh`] and [`Launcher::row_icons`] for why that check cannot be
+/// left to the setters. The setters do return early on an unchanged
+/// value, but "unchanged" to a widget means the icon it is *showing*,
+/// and a row that fell back is showing the fallback rather than the name
+/// that was asked for.
 fn apply_row_icon(b: &mut nitro_ui::WidgetMut<'_, Button<Launcher>, Launcher>, icon: &RowIcon) {
     match icon {
         RowIcon::Coloured(name) => {

@@ -463,10 +463,46 @@ commit does not know yet. A 256 px PNG is ~2 ms on the Pentium (#3711),
 which is a frame — per-frame would be a bug, and per-commit would put it
 on the client's first-paint latency.
 
-A decode failure is a `BadIcon`, one line in the log, and a `Missing`
-mark so the *next* frame does not try again. A missing icon is the common
-case on a thin theme, and a launcher redrawing forty rows must not walk
-the search path forty times a frame.
+**Two failures, and only one of them reaches the client.** The
+distinction falls out of the lazy decode and it is worth being exact
+about, because the obvious reading is wrong.
+
+*Resolution* fails at **commit** time — the theme has no such name — and
+that is a `BadIcon`: the node is cleared, the client is told, and its
+`.fallback(…)` fires inside the same interaction. That is the common
+case on a thin theme and it is the one the fallback exists for.
+
+*Decoding* fails at **paint** time — the name resolved, the file was
+there at commit, and it turns out to be truncated, unreadable, or not a
+PNG. There is no client in the paint path and no transaction to attach an
+error to, so what happens is: a one-line `warn`, a `Missing` mark so the
+next frame does not try again, and an **empty icon box** for that node.
+The widget's fallback does *not* fire. The client only learns anything if
+it re-sends the same name later, at which point `lookup_app` sees the
+mark and refuses with a `BadIcon` as usual.
+
+That is a deliberate consequence rather than an oversight, but it is a
+real gap and it is written down here rather than left to be discovered:
+reporting it properly means remembering the refusal and attaching it to
+the next commit from that client, which is a queue and an ownership
+question for a case that needs a *corrupt file in an installed icon
+theme*. `app_icon_misses` in `stats` is how a server says it is
+happening; if it is ever above zero on a real box, this is the paragraph
+to come back to.
+
+The `Missing` mark matters for cost as well as for correctness: a missing
+icon is the common case on a thin theme, and a launcher redrawing forty
+rows must not walk the search path forty times a frame.
+
+**A theme change re-asks every name, and keeps every handle.**
+`set_theme` (on `reload`) drops every resolved path and every decoded
+tile but keeps the **handles**, because the scene is holding those
+indices and an index that changed meaning would be a far worse bug than a
+re-resolve. The next `lookup_app` for a name whose path was dropped
+resolves it again against the new theme — at *commit* time, which is what
+matters: a name the new theme does not have is refused there with a
+`BadIcon`, so the client's `.fallback(…)` fires, rather than the node
+silently drawing nothing.
 
 `stats` gains `app_icons_cached`, `app_icon_bytes`, `app_icon_loads`,
 `app_icon_misses`, `app_icon_evictions` and `app_icon_decode_us_max`.
@@ -504,10 +540,35 @@ entry's is symbolic, because a built-in exists precisely on the box with
 no icon theme installed, so its icon has to come from the set compiled
 into the server.
 
-The idle and latency contracts are untouched, and the reason is
-structural rather than measured: `SetIcon` is one-way, so a row costs no
-round trip, and the decode is the server's and lazy. The launcher's
-first-paint measurement with 40 entries is in `docs/latency.md`.
+The idle and latency contracts hold, and the second one is measured
+rather than argued. The structural argument is that `SetIcon` is
+one-way, so a row costs no round trip, and the decode is the server's and
+lazy — but "no round trip" is a claim about a protocol and "it opens as
+fast" is a claim about a clock, and the second does not follow from the
+first for free: a row's icon is still a node, a mutation and a blit.
+
+`crates/nitro-launcher/tests/first_paint.rs` times the show — the tap,
+through layout, paint and flush, until the server goes quiet — over 40
+`.desktop` entries filling the 20-row list, with one variable: every
+entry names an icon, or none does. The icon arm deliberately names icons
+**no theme has**, so it is the expensive case rather than the cheap one:
+the server walks its whole search path per row, answers `BadIcon`, and
+the widget sends its fallback. Twelve timed shows per arm, alternating,
+median:
+
+| arm | first paint, 20 rows |
+|---|---|
+| every row names a theme icon (all 20 fall back) | **247.4 ms** |
+| no row names one (control) | **247.6 ms** |
+
+**×1.00.** The number to watch is not the few tenths of a millisecond,
+which is noise on a shared machine — it is that a synchronous round trip
+per row would put twenty of them on this path and show up as a multiple.
+The test asserts only that loose bound for exactly that reason: a tight
+one would be a flaky test that readers learn to re-run, which is worse
+than no test. The absolute figures are the dev box's and are dominated by
+the per-row `SetText` measurement round trips the launcher already made
+before this task.
 
 **`nitro-bar`**'s window list uses a window's `app_id` **directly as an
 icon name**, falling back to `window`. That is the freedesktop
