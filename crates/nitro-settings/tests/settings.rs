@@ -955,3 +955,405 @@ fn revert_puts_the_checkbox_back_without_writing() {
     );
     h.quit();
 }
+
+// ---------------------------------------------------------------------
+// layout: nothing is laid out smaller than it measures
+// ---------------------------------------------------------------------
+
+/// A dialog at the size the **binary** opens, rather than [`WINDOW`].
+///
+/// Every other test in this file uses `WINDOW` — 300×210, deliberately
+/// tighter than the harness's 320×240 output — because those tests are
+/// about behaviour on a screen too small for the dialog, which is the
+/// awkward case rather than a soft one. The layout tests ask the
+/// opposite question: is [`nitro_settings::WINDOW_SIZE`] itself big
+/// enough for the tree it was chosen for. So they open at that constant,
+/// and a failure here means the constant is wrong rather than that a
+/// small screen is small.
+fn layout_harness(dir: &Path) -> Harness<Settings> {
+    let path = dir.join(conf::FILE_NAME);
+    let mut h = Harness::shell(
+        "nitro-settings",
+        Settings::new()
+            .with_config_path(path)
+            .with_audio_dirs(Vec::new()),
+        nitro_settings::ORDINARY_WINDOW,
+        Some(nitro_settings::WINDOW_SIZE),
+        build,
+    );
+    h.wait_for("the display rows", |h| !h.state().connectors().is_empty());
+    h.settle();
+    h
+}
+
+/// Every widget in the tree, as `hey list` walks it: the canonical path
+/// and the window-coordinate bounds — the same two numbers
+/// `hey nitro-settings list` prints, read through the same
+/// `Ui::introspect` pass, so this test and the box agree by construction
+/// rather than by transcription.
+fn tree(h: &mut Harness<Settings>) -> Vec<(String, nitro_ui::Rect)> {
+    let mut nodes = Vec::new();
+    h.ui().introspect(&mut nodes);
+    nodes
+        .iter()
+        .map(|n| {
+            let path = nitro_ui::introspect::path_of(h.ui(), n.id).unwrap_or_default();
+            (path, n.bounds)
+        })
+        .collect()
+}
+
+#[test]
+fn no_widget_is_laid_out_smaller_than_it_measures() {
+    // The regression test for the whole bug, and for the thing eighteen
+    // passing tests could not see.
+    //
+    // Nothing about it was a *measurement* failure: every widget measured
+    // correctly and was then laid out smaller than it measured, because
+    // the root column's intrinsic height (~400 px with one output) exceeded
+    // a 320 px window and a flex container hands its overflow back to its
+    // children as `flex_shrink`, weighted by size. On the box that read as
+    // headings with the descenders sliced off ("Displays" — 17.5 px of
+    // text in an 11.8 px box, so no tail on the `p`), the two-line notes
+    // cut to ~1.3 lines, the keyboard captions rendering as
+    // "Layc"/"Varia"/"Optic", and the display row's `y` field ending at
+    // x=452 in a 440-wide window.
+    //
+    // So this pins the invariant rather than any one symptom: at
+    // `WINDOW_SIZE`, with the harness's one output, nothing in the tree is
+    // laid out shorter or narrower than what the font engine says it
+    // needs. Every "want" below is measured through that engine rather
+    // than written down, so the assertions follow the theme and the
+    // constants instead of freezing today's numbers.
+    let dir = scratch("layout-intrinsic");
+    let mut h = layout_harness(&dir);
+    let theme = nitro_ui::Theme::default();
+    let text_style = nitro_ui::TextStyle::new(theme.font_family.clone(), nitro_settings::TEXT_SIZE);
+
+    // 1. Every `control_row()` is exactly ROW_HEIGHT tall.
+    //
+    // An equality, not a tolerance: `control_row` asks for an explicit
+    // `height(ROW_HEIGHT)`, and the bug was precisely that asking is not
+    // getting — an explicit length is folded into the constraints a child
+    // is *measured* with, and the solver then shrinks it anyway. Under the
+    // old constants every one of these came out at 17.5.
+    let rows: Vec<(String, nitro_ui::Rect)> = tree(&mut h)
+        .into_iter()
+        .filter(|(p, _)| {
+            p == &format!("window/displays/{CONNECTOR}")
+                || p == "window/keyboard/container[0]"
+                || p == "window/keyboard/container[1]"
+                || p == "window/audio"
+                || p == "window/appearance"
+                || p == "window/container[4]"
+        })
+        .collect();
+    assert_eq!(rows.len(), 6, "found every control row: {rows:?}");
+    for (path, b) in &rows {
+        assert!(
+            (b.h - nitro_settings::ROW_HEIGHT).abs() < 0.01,
+            "{path} is {} tall, not ROW_HEIGHT {}",
+            b.h,
+            nitro_settings::ROW_HEIGHT,
+        );
+    }
+
+    // 2. Every heading is at least as tall as its own text measures.
+    let mut head =
+        nitro_ui::TextStyle::new(theme.font_family.clone(), nitro_settings::HEADING_SIZE);
+    head.weight = 600;
+    let all = tree(&mut h);
+    for text in ["Displays", "Keyboard", "Audio", "Appearance"] {
+        let want = h
+            .ui()
+            .measure_text(text, &head, 0.0)
+            .expect("measure the heading")
+            .height;
+        let (path, b) = all
+            .iter()
+            .find(|(p, _)| {
+                p.starts_with("window/label[")
+                    && nitro_ui::introspect::resolve(h.ui(), p).is_some_and(|id| {
+                        h.ui()
+                            .widget::<Label>(id)
+                            .is_ok_and(|l: &Label| l.text() == text)
+                    })
+            })
+            .unwrap_or_else(|| panic!("no heading {text} in {all:?}"));
+        assert!(
+            b.h >= want - 0.01,
+            "heading {path} ({text}) is {} tall but its text measures {want}: \
+             the missing pixels are the descenders — the `p` in Displays, the \
+             `y` in Keyboard, the `pp` in Appearance",
+            b.h,
+        );
+    }
+
+    // 3. Every caption is as wide as an unconstrained measure of the same
+    //    string.
+    //
+    // "Layout" is the one the box rendered as "Layc". Three fields whose
+    // width resolves to ~102 px each do not fit beside three captions in
+    // 420 px of inner width, and with every child shrinking by weight the
+    // captions lost 40 %. A caption is the one thing in a row that cannot
+    // usefully be narrowed — a field degrades gracefully at any width, a
+    // six-letter word does not — so captions are `shrink(0.0)` and the
+    // fields absorb the deficit.
+    for (path, caption) in [
+        ("keyboard/container[0]/label[0]", "Layout"),
+        ("keyboard/container[0]/label[1]", "Variant"),
+        ("keyboard/container[0]/label[2]", "Options"),
+        ("keyboard/container[1]/label[0]", "Test here"),
+        ("audio/label[0]", "Volume"),
+        ("appearance/label[0]", "Colour scheme"),
+    ] {
+        let want = h
+            .ui()
+            .measure_text(caption, &text_style, 0.0)
+            .expect("measure the caption")
+            .width;
+        let id = named(&mut h, path);
+        let b = h.ui().window_bounds(id);
+        assert!(
+            b.w >= want - 0.01,
+            "the caption {caption:?} at {path} is {} wide but measures {want} \
+             free: a clipped caption reads `Layc`",
+            b.w,
+        );
+    }
+
+    // 4. Every wrapped line of prose gets its full height.
+    //
+    // A wrapped label's height depends on the width it is given, so each
+    // one is re-measured at the width it was actually allotted — the
+    // honest comparison, and the one that catches "two lines rendered in
+    // 1.3 lines of box". `audio_status` is in here because it was the
+    // worst of them: 15.1 px of text in 10.2 px of box.
+    for path in ["displays_note", "appearance_note", "audio_status"] {
+        let id = named(&mut h, path);
+        let text = h.widget::<Label>(id).text().to_owned();
+        let b = h.ui().window_bounds(id);
+        let want = h
+            .ui()
+            .measure_text(&text, &text_style, b.w)
+            .expect("measure the note")
+            .height;
+        assert!(
+            b.h >= want - 0.01,
+            "{path} is {} tall but its text wraps to {want} at {} wide: `{text}`",
+            b.h,
+            b.w,
+        );
+    }
+
+    h.quit();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn nothing_in_the_tree_overhangs_the_window() {
+    // The other face of the same bug, and the one that needs its own test
+    // because it is not about any widget's *own* size: seven children
+    // whose widths are all pinned simply do not fit in 420 px of inner
+    // width, and no amount of shrinking elsewhere fixes an arrangement
+    // that is too wide. On the box the display row's `y` field ended at
+    // x=452 in a 440-wide window — visibly half off the edge.
+    //
+    // Every widget in the tree, not a chosen few: a check that named the
+    // fields it already knew about would not have caught the field that
+    // moves next.
+    let dir = scratch("layout-overhang");
+    let mut h = layout_harness(&dir);
+    let size = h.ui().window_size();
+
+    for (path, b) in tree(&mut h) {
+        // The buttons row's spacer is a zero-size strut placed at the far
+        // edge: no area, no ink, nothing to clip.
+        if b.w <= 0.0 || b.h <= 0.0 {
+            continue;
+        }
+        assert!(
+            b.x + b.w <= size.w + 0.01,
+            "{path} ends at x={} in a {}-wide window",
+            b.x + b.w,
+            size.w,
+        );
+        assert!(
+            b.y + b.h <= size.h + 0.01,
+            "{path} ends at y={} in a {}-tall window",
+            b.y + b.h,
+            size.h,
+        );
+    }
+
+    // And the root's last child — the buttons row — ends inside the
+    // padding rather than merely inside the window. Apply sitting on the
+    // bottom edge is the failure this catches.
+    let (_, buttons) = tree(&mut h)
+        .into_iter()
+        .find(|(p, _)| p == "window/container[4]")
+        .expect("the buttons row");
+    assert!(
+        buttons.y + buttons.h <= size.h - nitro_settings::PAD + 0.01,
+        "the buttons row ends at {} and the window's content stops at {}",
+        buttons.y + buttons.h,
+        size.h - nitro_settings::PAD,
+    );
+
+    h.quit();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_second_output_still_fits_the_window() {
+    // The width half of the claim, under the case that actually stresses
+    // it. A hotplugged 2560×1440 output makes the longest mode string the
+    // dialog can show ("2560×1440 @ 60 Hz", 135.6 px against the 320×240
+    // harness output's 119.1) — and a row whose parts are all `shrink(0)`
+    // has no give left, so if `WINDOW_SIZE.w` were chosen for the narrow
+    // case this is where it would overflow.
+    //
+    // The row arrives as a real `Output` event from a real hotplug, not
+    // as an invented `OutputInfo`: the whole point of the harness is that
+    // the rows come down the wire the way they do on the box.
+    let dir = scratch("layout-two-outputs");
+    let mut h = layout_harness(&dir);
+    h.server().request_line("plug 2560x1440\n");
+    h.wait_for("the second display row", |h| {
+        h.state().connectors().len() > 1
+    });
+    h.settle();
+
+    let size = h.ui().window_size();
+    let rows: Vec<(String, nitro_ui::Rect)> = tree(&mut h)
+        .into_iter()
+        .filter(|(p, _)| p.starts_with("window/displays/"))
+        .collect();
+    assert!(
+        rows.iter().any(|(p, _)| p.contains("Virtual-2")),
+        "the hotplugged output has a row: {rows:?}"
+    );
+    for (path, b) in &rows {
+        assert!(
+            b.x + b.w <= size.w + 0.01,
+            "{path} ends at x={} in a {}-wide window",
+            b.x + b.w,
+            size.w,
+        );
+    }
+    // The mode label keeps the width its longer string measures: that is
+    // the one that was being eaten.
+    let mode_id = named(&mut h, "displays/Virtual-2/mode");
+    let mode = h.ui().window_bounds(mode_id);
+    let theme = nitro_ui::Theme::default();
+    let style = nitro_ui::TextStyle::new(theme.font_family.clone(), nitro_settings::TEXT_SIZE);
+    let text = h.widget::<Label>(mode_id).text().to_owned();
+    let want = h
+        .ui()
+        .measure_text(&text, &style, 0.0)
+        .expect("measure the mode")
+        .width;
+    assert!(
+        mode.w >= want - 0.01,
+        "the mode label is {} wide but `{text}` measures {want}",
+        mode.w,
+    );
+
+    // The second row costs ROW_HEIGHT + GAP and the window does *not*
+    // grow for it — that is the documented limitation, and it is asserted
+    // rather than left implicit so that a future change to it is a
+    // deliberate one. The tree now exceeds the window by one row's worth;
+    // what must still hold is that no *row* is squashed, because each one
+    // has a `min_height`.
+    for (path, b) in &rows {
+        if path.matches('/').count() == 2 {
+            assert!(
+                (b.h - nitro_settings::ROW_HEIGHT).abs() < 0.01,
+                "{path} is {} tall, not ROW_HEIGHT: a second monitor must \
+                 shorten neither row",
+                b.h,
+            );
+        }
+    }
+
+    h.quit();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_window_declares_its_tree_as_its_minimum_size() {
+    // The other half of the fix, and the reason a bigger constant alone is
+    // not enough: a window the user can drag smaller can be dragged back
+    // into the bug. So the dialog publishes `WINDOW_SIZE` as the window's
+    // **minimum** through `SetWindowLimits`, and it is the *server* that
+    // refuses the drag — a client which merely clamped its own layout
+    // would draw a letterbox inside a window the user is still shrinking.
+    //
+    // The assertion leans on a property of `Ui::set_window_limits` that
+    // makes it a real test rather than a restatement: **re-declaring the
+    // same limits sends nothing.** So a second call with exactly
+    // `(WINDOW_SIZE, no maximum)` producing no message is proof that those
+    // are the limits already on the wire — it cannot pass if the dialog
+    // declared a smaller minimum, a different maximum, or none at all.
+    // A control follows: different limits *do* produce a message, so the
+    // silence above is the de-duplication and not a dead tap.
+    //
+    // What this does not claim is that the server honours them; that is
+    // `a_resize_respects_the_limits_the_client_declared` in
+    // `crates/nitro-server/tests/wm.rs`, which drives a real edge drag.
+    // It cannot be re-run here: the harness's output is 320×240 and this
+    // window is 560×400, so its right edge — the thing a drag grabs — is
+    // off-screen.
+    let dir = scratch("layout-limits");
+    let path = dir.join(conf::FILE_NAME);
+    let mut h = Harness::shell(
+        "nitro-settings",
+        Settings::new()
+            .with_config_path(path)
+            .with_audio_dirs(Vec::new()),
+        nitro_settings::ORDINARY_WINDOW,
+        Some(nitro_settings::WINDOW_SIZE),
+        build,
+    );
+    h.settle();
+
+    // No maximum: a machine with four monitors wants to drag this window
+    // taller, and nothing here should stop it.
+    let no_max = Size::new(0.0, 0.0);
+    h.ui().tap(true);
+    h.ui()
+        .set_window_limits(nitro_settings::WINDOW_SIZE, no_max)
+        .expect("re-declare the same limits");
+    h.flush();
+    assert!(
+        !h.mutations().iter().any(|m| m.op == "SetWindowLimits"),
+        "re-declaring the same limits sends nothing, so the dialog had \
+         already declared min={:?} max={no_max:?}; it sent {:?}",
+        nitro_settings::WINDOW_SIZE,
+        h.mutations(),
+    );
+
+    // The control: the tap is live and this path does emit.
+    h.ui()
+        .set_window_limits(Size::new(320.0, 240.0), no_max)
+        .expect("declare different limits");
+    h.flush();
+    assert!(
+        h.mutations().iter().any(|m| m.op == "SetWindowLimits"),
+        "a *different* minimum does reach the wire, so the silence above \
+         was de-duplication rather than a dead tap: {:?}",
+        h.mutations(),
+    );
+    h.ui().tap(false);
+
+    // And the minimum is the window's own opening size, so there is no
+    // width at which the tree is asked to fit in less than it measures.
+    assert_eq!(
+        nitro_settings::WINDOW_SIZE,
+        h.ui().window_size(),
+        "the window opens at exactly the size it declares as its minimum"
+    );
+
+    h.quit();
+    let _ = std::fs::remove_dir_all(&dir);
+}

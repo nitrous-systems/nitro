@@ -21,9 +21,27 @@
 //! │ Volume [======o===] 65 %  ☐ mute                      │
 //! │ via wpctl                                            │
 //! │ ────────────────────────────────────────────────────  │
+//! │ Appearance                                           │
+//! │ Colour scheme ☐ Dark                                  │
+//! │ The scheme is saved and applied at once; …            │
+//! │ ────────────────────────────────────────────────────  │
 //! │ [Apply] [Revert]                            applied   │
 //! └──────────────────────────────────────────────────────┘
 //! ```
+//!
+//! # Why the window is the size it is
+//!
+//! [`WINDOW_SIZE`] is derived from the tree rather than chosen, and its
+//! doc comment says how — because the previous value was not, and a
+//! window smaller than its own tree does not clip, it **shrinks**: a
+//! flex container hands its overflow back to its children weighted by
+//! size, so every heading, note and row in this dialog was laid out
+//! smaller than it had measured. Nothing measured wrong, which is why it
+//! survived eighteen passing tests and was found by looking at the
+//! screen. See [`control_row`], [`heading`], [`note`] and [`caption`] for
+//! the `shrink(0.0)`/`min_height` that stop it recurring, and
+//! `no_widget_is_laid_out_smaller_than_it_measures` in
+//! `tests/settings.rs` for the pin.
 //!
 //! # Driving it with `hey`
 //!
@@ -126,14 +144,46 @@ use conf::{Conf, KeyboardConf};
 /// The name the app registers under, and so the first argument to `hey`.
 pub const APP_NAME: &str = "nitro-settings";
 
-/// The window's size when it opens.
+/// The window's size when it opens, and its **minimum** thereafter.
 ///
 /// Explicit, unlike `nitro-calc`'s measured window: the display section's
 /// height depends on how many monitors are plugged in, so a window sized
 /// to its tree would open differently on every machine — and resize
 /// itself when one was unplugged, which is the one thing a settings
 /// dialog must not do while you are using it.
-pub const WINDOW_SIZE: Size = Size::new(440.0, 320.0);
+///
+/// That rationale stands; what it used to omit is that an explicit size
+/// still has to **fit the tree it contains**. It did not. At 440×320 the
+/// root column's intrinsic height was ~400 px, and a flex container hands
+/// an overflow back to its children as `flex_shrink` — so every direct
+/// child of the root was scaled down to make the sum fit: section
+/// headings 17.5 → 11.8 px (descenders gone: the `p` in "Displays", the
+/// `y` in "Keyboard"), the two-line notes 30 → 20 px, `audio_status`
+/// 15.1 → 10.2, and every `control_row` 26 → 17.5. Horizontally the same
+/// arithmetic ate the keyboard captions — "Layout" rendered in 26 px as
+/// "Layc" — and pushed the display row's `y` field out past the window's
+/// right edge. Nothing about it was a *text measurement* bug, which is
+/// why eighteen passing tests never saw it: every widget measured
+/// correctly and was then laid out smaller than it measured.
+///
+/// So the number is now derived from the tree rather than chosen: 540 px
+/// of inner width is what the display row needs with none of its parts
+/// squashed (76 name + 136 mode + 64 slider + 30 value + 79 checkbox +
+/// 2 × 54 position + 6 × 6 gaps ≈ 529), and 400 px of height is what one
+/// output's worth of tree measures at that width, with the appearance
+/// note fitting on one line. Widening it further is free; narrowing it is
+/// what produced the bug, which is why [`build`] also pins it as the
+/// window's **minimum** through `Ui::set_window_limits`.
+///
+/// It does **not** grow for a second monitor: each extra output adds
+/// `ROW_HEIGHT + GAP` = 32 px, and the window has no way to ask the
+/// server to resize it (`Ui::resize` only re-lays the client's own tree
+/// out inside whatever the server gave — verified on pixels, the frame
+/// does not move). A three-monitor machine gets a window it must drag
+/// taller once, which is the limitation `docs/settings.md` records; the
+/// alternative is a client-initiated resize op that does not exist and
+/// that this task is not the place to add.
+pub const WINDOW_SIZE: Size = Size::new(560.0, 400.0);
 
 /// The "surface" an **ordinary** window is.
 ///
@@ -173,17 +223,23 @@ const SCALE_STEP: f32 = 0.25;
 const VOLUME_STEP: f32 = 0.05;
 
 /// Font size of a section heading.
-const HEADING_SIZE: f32 = 15.0;
+///
+/// The layout constants below are **public** for one reason: the test
+/// that pins "no widget is laid out smaller than it measures" has to ask
+/// the font engine what a heading of this size measures, and a test that
+/// hard-coded 15.0 would stop testing the tree the moment somebody
+/// changed the constant. Same for the rest of them.
+pub const HEADING_SIZE: f32 = 15.0;
 /// Font size of everything else.
-const TEXT_SIZE: f32 = 13.0;
+pub const TEXT_SIZE: f32 = 13.0;
 /// Gap between rows, and between the widgets inside one.
-const GAP: f32 = 6.0;
+pub const GAP: f32 = 6.0;
 /// Padding around the whole window.
-const PAD: f32 = 10.0;
+pub const PAD: f32 = 10.0;
 /// Height of one control row.
-const ROW_HEIGHT: f32 = 26.0;
+pub const ROW_HEIGHT: f32 = 26.0;
 /// Width of a position field: five digits and a minus sign.
-const POS_WIDTH: f32 = 54.0;
+pub const POS_WIDTH: f32 = 54.0;
 
 /// What the displays note says when the shell socket gave us the list.
 const NOTE_LIVE: &str = "Positions are typed, in desktop pixels — drag-arrange is not in M4.";
@@ -516,12 +572,7 @@ pub fn build(ui: &mut Ui<Settings>) -> WidgetId {
     // file, on the first turn of the loop — `build` has no state to put
     // them in and no answer from the connection yet.
     let displays = ui.build(column().name(names::DISPLAYS).gap(GAP).width_percent(1.0));
-    let displays_note = ui.build(
-        label(NOTE_LIVE)
-            .name(names::DISPLAYS_NOTE)
-            .size(TEXT_SIZE)
-            .color_role(ColorRole::TextDim),
-    );
+    let displays_note = ui.build(note(NOTE_LIVE).name(names::DISPLAYS_NOTE));
 
     // -- keyboard ------------------------------------------------------
     let layout = ui.build(field(names::LAYOUT, "us").grow(1.0));
@@ -558,12 +609,7 @@ pub fn build(ui: &mut Ui<Settings>) -> WidgetId {
             .size(TEXT_SIZE)
             .width(48.0),
     );
-    let audio_status = ui.build(
-        label("")
-            .name(names::AUDIO_STATUS)
-            .size(TEXT_SIZE)
-            .color_role(ColorRole::TextDim),
-    );
+    let audio_status = ui.build(note("").name(names::AUDIO_STATUS));
     let volume = ui.build(
         slider(0.0)
             .name(names::VOLUME)
@@ -617,6 +663,11 @@ pub fn build(ui: &mut Ui<Settings>) -> WidgetId {
     // capture ids that already exist — the same ordering the audio
     // section uses for `audio_status`.
     let status = ui.build(
+        // Not a `note`: this one lives **inside** a row, where
+        // `flex_shrink` governs width rather than height, and a status
+        // line that refused to narrow would take the space out of the
+        // Apply and Revert buttons beside it. A long verdict is better
+        // clipped than a button is.
         label("")
             .name(names::STATUS)
             .size(TEXT_SIZE)
@@ -627,12 +678,7 @@ pub fn build(ui: &mut Ui<Settings>) -> WidgetId {
             set_scheme(s, ui, status, on);
         },
     ));
-    let appearance_note = ui.build(
-        label(NOTE_APPEARANCE)
-            .name(names::APPEARANCE_NOTE)
-            .size(TEXT_SIZE)
-            .color_role(ColorRole::TextDim),
-    );
+    let appearance_note = ui.build(note(NOTE_APPEARANCE).name(names::APPEARANCE_NOTE));
 
     // -- apply / revert ------------------------------------------------
     let ids = Ids {
@@ -707,28 +753,71 @@ pub fn build(ui: &mut Ui<Settings>) -> WidgetId {
 }
 
 /// A row of controls: the shape every labelled line in this dialog has.
+///
+/// `height(ROW_HEIGHT)` alone does **not** make a row `ROW_HEIGHT` tall.
+/// An explicit length is folded into the constraints a child is
+/// *measured* with, and the flex solver then takes a container's overflow
+/// back out of its children weighted by `flex_shrink` — after which it
+/// clamps only to `min_height`/`max_height`. So a root column with more
+/// tree than window squashed every row to 17.5 px while each one went on
+/// reporting that it had asked for 26. The `min_height` is what survives
+/// that second pass, and it is why `every_row_is_exactly_row_height` can
+/// assert an equality rather than a tolerance.
 fn control_row() -> FlexBuilder<Settings> {
     row()
         .gap(GAP)
         .height(ROW_HEIGHT)
+        .min_height(ROW_HEIGHT)
         .width_percent(1.0)
         .cross_align(CrossAlign::Center)
 }
 
 /// A section heading.
+///
+/// `shrink(0.0)` for the reason [`control_row`] carries a `min_height`: a
+/// heading is one line of text at a fixed size, so there is no smaller
+/// honest version of it. Letting the root column reclaim its overflow
+/// here cost the headings their descenders — 17.5 px of measured text
+/// laid out in 11.8 — which is what "Displays" with no tail on the `p`
+/// looked like on the box.
 fn heading(text: &str) -> LabelBuilder<Settings> {
     label(text)
         .size(HEADING_SIZE)
         .weight(600)
+        .shrink(0.0)
         .color_role(ColorRole::Text)
+}
+
+/// A line of explanatory text under a section.
+///
+/// Wrapped, so its height depends on the width it is given — and
+/// `shrink(0.0)` so the height it computes is the height it gets. Without
+/// it the two-line notes were laid out in 20 px of a measured 30 and the
+/// second line was sliced through the middle.
+fn note(text: &str) -> LabelBuilder<Settings> {
+    label(text)
+        .size(TEXT_SIZE)
+        .shrink(0.0)
+        .color_role(ColorRole::TextDim)
 }
 
 /// A label in front of a control.
 ///
 /// Deliberately **unnamed**: it is furniture, and naming it would put a
 /// second `layout` in the keyboard row for `hey` to be ambiguous about.
+///
+/// `shrink(0.0)` because a caption is the one thing in a row that cannot
+/// usefully be narrowed: the fields beside it degrade gracefully at any
+/// width, a six-letter word does not. The keyboard row wants 683 px of
+/// its three captions and three fields and gets 540, and with every child
+/// shrinking by weight the captions lost 40 % of their width — "Layout"
+/// in 26 px reads "Layc". Now the overflow comes out of the fields, which
+/// is where it belongs.
 fn caption(text: &str) -> LabelBuilder<Settings> {
-    label(text).size(TEXT_SIZE).color_role(ColorRole::TextDim)
+    label(text)
+        .size(TEXT_SIZE)
+        .shrink(0.0)
+        .color_role(ColorRole::TextDim)
 }
 
 /// A named text field with a placeholder.
@@ -747,6 +836,18 @@ fn field(name: &str, placeholder: &str) -> TextFieldBuilder<Settings> {
 /// volume is read once. After the first turn of the loop there is no
 /// timer left armed at all, which is what the idle test asserts.
 fn install(ui: &mut Ui<Settings>, ids: Ids) {
+    // The one thing that stops the bug coming back by the user's own
+    // hand: the server refuses a drag below this, so the tree can never
+    // again be asked to fit in less than it measures. Zero on the height
+    // axis would mean "no limit", so both components are real numbers;
+    // the maximum is unlimited, because a machine with four monitors
+    // wants to make this window taller and nothing here should stop it.
+    //
+    // Sent from here rather than from `build` because `build` runs before
+    // the window exists — `Ui::set_window_limits` records that and rides
+    // the window's first commit, which is exactly what is wanted, but
+    // `install` is where every other piece of wiring lives.
+    let _ = ui.set_window_limits(WINDOW_SIZE, Size::new(0.0, 0.0));
     ui.on_shell(
         move |s: &mut Settings, ui: &mut Ui<Settings>, ev: &ShellEvent| match ev {
             ShellEvent::Output(info) => upsert_output(s, ui, ids, info),
@@ -934,10 +1035,23 @@ fn add_row(
         })
     });
 
+    // Everything in a display row except the slider is `shrink(0.0)`.
+    //
+    // A row is a flex container and its natural width exceeds the
+    // window's on a long connector name or a long mode string, so
+    // something has to give. With the default `flex_shrink` of 1 the
+    // overflow came out of all seven children weighted by size, which is
+    // how the `y` field ended at x=452 in a 440-wide window and how the
+    // mode string lost its refresh rate. A slider is the one control here
+    // whose *only* job is to be dragged — it reads correctly at any width
+    // down to its `min_width`, and its value is shown by the label beside
+    // it — so it absorbs the whole deficit and the rest of the row keeps
+    // the width it measured.
     let name_label = ui.build(
         label(connector)
             .name(names::OUTPUT_NAME)
             .size(TEXT_SIZE)
+            .shrink(0.0)
             .min_width(76.0),
     );
     let mode_label = ui.build(
@@ -945,12 +1059,14 @@ fn add_row(
             .name(names::OUTPUT_MODE)
             .size(TEXT_SIZE)
             .color_role(ColorRole::TextDim)
+            .shrink(0.0)
             .min_width(96.0),
     );
     let scale_value = ui.build(
         label(conf::format_scale(scale))
             .name(names::SCALE_VALUE)
             .size(TEXT_SIZE)
+            .shrink(0.0)
             .width(30.0),
     );
     let scale_slider = ui.build(
@@ -973,14 +1089,15 @@ fn add_row(
         checkbox("primary")
             .name(names::PRIMARY)
             .checked(saved.is_some_and(|o| o.primary))
+            .shrink(0.0)
             .on_toggle(move |s: &mut Settings, ui: &mut Ui<Settings>, on: bool| {
                 if on {
                     make_primary(s, ui, &mine);
                 }
             }),
     );
-    let x = ui.build(field(names::POS_X, "x").width(POS_WIDTH));
-    let y = ui.build(field(names::POS_Y, "y").width(POS_WIDTH));
+    let x = ui.build(field(names::POS_X, "x").width(POS_WIDTH).shrink(0.0));
+    let y = ui.build(field(names::POS_Y, "y").width(POS_WIDTH).shrink(0.0));
     if let Some((px, py)) = position {
         set_field(ui, x, &px.to_string());
         set_field(ui, y, &py.to_string());

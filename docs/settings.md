@@ -243,11 +243,58 @@ ticks**.
 $ nitro-settings
 ```
 
-Three sections in one decorated window: **Displays** (one row per output
+Four sections in one decorated window: **Displays** (one row per output
 — name, mode, a scale slider, a `primary` checkbox, and x/y position
 fields), **Keyboard** (layout, variant, options, and a field to type in
-afterwards), **Audio** (volume and mute). **Apply** writes the file;
-**Revert** re-reads it.
+afterwards), **Audio** (volume and mute) and **Appearance** (the dark
+scheme). **Apply** writes the file; **Revert** re-reads it.
+
+### The window is 560×400, and that is not a taste decision
+
+It is the size the tree measures. The widest thing in it is a display
+row — 76 px of connector name, 136 of mode string, a slider at its 64 px
+minimum, 30 for the scale value, 79 for the `primary` checkbox, two 54 px
+position fields and six 6 px gaps, ≈ 529 — and 400 px is what one
+output's worth of sections comes to at that width, with both notes on one
+line.
+
+This is written down because getting it wrong is not a cosmetic bug. The
+window was 440×320 while its tree measured ~400 px tall, and a flex
+container whose children do not fit **takes the overflow back out of
+them**, weighted by size (`flex_shrink`, CSS's rule). So every direct
+child of the root column was laid out smaller than it had measured:
+section headings at 11.8 px instead of 17.5, which cut the descenders off
+"Displays" and "Keyboard"; the two-line notes in 20 px of a needed 30;
+`no audio backend found` in 10.2 px; every control row at 17.5 instead of
+26. Horizontally the same arithmetic shrank the keyboard captions to
+26/28/30 px — "Layout" rendering as "Layc" — and pushed the display row's
+`y` field out to x=452 in a 440-wide window.
+
+Every widget *measured* correctly throughout; each was then laid out
+smaller than it measured, which is why eighteen passing tests never saw
+it. Two things stop it recurring:
+
+- Anything with no smaller honest version is `shrink(0.0)` — headings,
+  captions, notes, and every part of a display row except the slider,
+  which is the one control that reads correctly at any width and so
+  absorbs the whole deficit. Control rows also carry a `min_height`,
+  because an explicit `height` is folded into the constraints a child is
+  *measured* with and the solver shrinks it afterwards anyway.
+- The dialog declares 560×400 as the window's **minimum** via
+  `SetWindowLimits`, so the server refuses a drag that would put the tree
+  back into less space than it needs. There is no maximum.
+
+`no_widget_is_laid_out_smaller_than_it_measures` in
+`crates/nitro-settings/tests/settings.rs` pins it, reading the same
+bounds `hey nitro-settings list` prints.
+
+**It does not grow for a third monitor.** Each extra output costs one row
+plus a gap (32 px), and a client cannot ask the server to resize it —
+`Ui::resize` only re-lays the client's own tree out inside whatever size
+the server gave, which is the behaviour the explicit size exists to get
+(a settings dialog that resized itself when you unplugged a monitor would
+be the worse bug). Two outputs fit; beyond that, drag the window taller
+once. It will not shrink back under you.
 
 The output list comes from the shell socket, so the rows are the outputs
 the compositor actually has, with their live scales and positions — not
