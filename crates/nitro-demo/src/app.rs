@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 
 use nitro_core::{Point, Rect, Size};
 use nitro_wire::client::Connection;
-use nitro_wire::msg::{ClientMsg, RequestFrame, ServerMsg};
+use nitro_wire::msg::{ClientMsg, Frame, RequestFrame, ServerMsg};
 use nitro_wire::types::{ButtonState, NodeId};
 use nitro_wire::{Error as WireError, Writer};
 use rustix::event::{PollFd, PollFlags};
@@ -178,6 +178,16 @@ pub struct App {
     /// build never created is a fatal `UnknownNode`, and that asymmetry
     /// is precisely the bug this field exists to prevent.
     has_image: bool,
+    /// The output's refresh interval in nanoseconds, as the **server**
+    /// reported it on the last `Frame` callback.
+    ///
+    /// `None` until one arrives. The demo used to assume 16 667 µs, which
+    /// was right for as long as nitro only ever ran at 60 Hz; the server
+    /// has been putting the real period on every `Frame` the whole time,
+    /// so reading it is both more honest and free. The one place it is
+    /// used — the `--stats` cross-check tolerance — is a *frame*, and a
+    /// frame at 120 Hz is half the frame it was.
+    pub refresh_ns: Option<u32>,
 }
 
 impl App {
@@ -219,6 +229,7 @@ impl App {
             pacing_mark: (0, 0),
             last_summary: now,
             has_image: false,
+            refresh_ns: None,
         };
         app.build()?;
         Ok(app)
@@ -337,6 +348,21 @@ impl App {
         Ok(())
     }
 
+    /// Record the refresh interval the server put on a `Frame` callback,
+    /// and say which window it was for.
+    ///
+    /// `refresh_ns` is the only place this client can learn how long a
+    /// frame actually is: it used to assume 16 667 µs, which was right for
+    /// as long as nitro only ever ran at 60 Hz. A `0` means the server had
+    /// no output to ask, which is not an answer and must not become one.
+    fn on_frame(&mut self, f: &Frame) -> Option<usize> {
+        self.frames_received += 1;
+        if f.refresh_ns > 0 {
+            self.refresh_ns = Some(f.refresh_ns);
+        }
+        self.index_of(f.window)
+    }
+
     /// Handle one batch of server messages.
     ///
     /// Returns the number handled. Input is coalesced: the *last* motion
@@ -381,8 +407,7 @@ impl App {
                     }
                 }
                 ServerMsg::Frame(f) => {
-                    self.frames_received += 1;
-                    if let Some(i) = self.index_of(f.window) {
+                    if let Some(i) = self.on_frame(f) {
                         frames[i] = Some(());
                     }
                 }

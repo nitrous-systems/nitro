@@ -50,8 +50,10 @@ pub struct Ledger {
 
 impl Ledger {
     /// How many unanswered serials to remember. At 60 Hz this is four
-    /// seconds of commits — far more than the server's 200 ms input-stamp
-    /// carry, so nothing that *can* still be answered is ever dropped.
+    /// seconds of commits and at 120 Hz two — either way far more than the
+    /// server's 200 ms input-stamp carry, so nothing that *can* still be
+    /// answered is ever dropped. The bound that matters is the carry, not
+    /// the rate, which is why this is a count and not a duration.
     pub const CAPACITY: usize = 256;
 
     /// An empty ledger.

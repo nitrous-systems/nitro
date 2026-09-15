@@ -55,6 +55,11 @@ pub const IMG_BYTES: u32 = IMG_STRIDE * IMG_EDGE;
 /// How far the animated rect travels per frame callback, in logical
 /// pixels. Small on purpose: the point of `--animate` is frame pacing, not
 /// throughput, and 4 px at 60 Hz is a visible, countable 240 px/s.
+///
+/// Per *callback*, so the speed on screen follows the refresh rate: the
+/// same 4 px is 480 px/s at 120 Hz. That is the right behaviour for a
+/// pacing demo — the thing being demonstrated is that there is one commit
+/// per frame — but it does mean the 240 px/s above is a 60 Hz figure.
 pub const ANIMATE_STEP: f32 = 4.0;
 
 /// Colours of the four cards, left to right.

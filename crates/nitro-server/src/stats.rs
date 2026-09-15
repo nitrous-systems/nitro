@@ -10,8 +10,12 @@
 //! looking for.
 //!
 //! The windows are short on purpose: [`PAINT_WINDOW`] frames is two
-//! seconds at 60 Hz, long enough to average out scheduler noise and short
-//! enough that a regression shows up while the tester is still watching.
+//! seconds at 60 Hz (one at 120), long enough to average out scheduler
+//! noise and short enough that a regression shows up while the tester is
+//! still watching. A count rather than a duration, deliberately: the
+//! quantity being averaged is per-frame work, so "the last N frames" is
+//! the honest window at any refresh rate — what changes with the rate is
+//! how many seconds of history that is, not what the number means.
 //! [`I2P_WINDOW`] input-to-photon samples is the same idea for a quantity
 //! that is only sampled when there is input to sample.
 //!

@@ -97,7 +97,23 @@ use crate::text::TextEngine;
 /// How long before the next vblank a client should have committed, so the
 /// server still has a whole rasterization pass left. Two milliseconds is
 /// about a third of the paint budget measured on the test box.
+///
+/// An **absolute** amount, deliberately: it is the server's own work — one
+/// rasterization pass plus the copy out of the shadow — and that work does
+/// not get faster because the panel got faster. See [`frame_margin_ns`]
+/// for what happens when the period gets short enough that a fixed 2 ms is
+/// most of it.
 pub const FRAME_MARGIN_NS: u64 = 2_000_000;
+
+/// The largest share of one refresh period the margin may take.
+///
+/// A quarter. At 60 Hz (16.67 ms) and at 120 Hz (8.33 ms) this is above
+/// [`FRAME_MARGIN_NS`] and so changes nothing — the margin at both rates is
+/// the measured 2 ms. It bites at 240 Hz and beyond (4.17 ms period), where
+/// a fixed 2 ms would hand the client under half of each frame and the
+/// deadline would start pushing commits onto the *following* vblank, which
+/// is the exact latency the deferral machinery exists to avoid.
+const FRAME_MARGIN_MAX_SHARE: u64 = 4;
 
 /// Bytes per pixel of the only format the frame path speaks (`XRGB8888`),
 /// the same one [`nitro_kms`] scans out.
@@ -531,18 +547,29 @@ pub fn next_vblank(last_vblank_ns: u64, refresh_ns: u32, now_ns: u64) -> u64 {
     last_vblank_ns + (elapsed / period + 1) * period
 }
 
+/// The margin to use at a given refresh period.
+///
+/// [`FRAME_MARGIN_NS`], or a quarter of the period when that is smaller.
+/// Unchanged at 60 and 120 Hz; see [`FRAME_MARGIN_MAX_SHARE`].
+#[must_use]
+pub fn frame_margin_ns(refresh_ns: u32) -> u64 {
+    let period = u64::from(refresh_ns).max(1);
+    FRAME_MARGIN_NS.min(period / FRAME_MARGIN_MAX_SHARE)
+}
+
 /// The frame deadline for a client: the next expected vblank minus
-/// [`FRAME_MARGIN_NS`], but never in the past — a client told to aim for a
+/// [`frame_margin_ns`], but never in the past — a client told to aim for a
 /// moment that has already gone would only busy-loop. When the margin would
 /// take the deadline behind `now`, aim for the vblank after it.
 #[must_use]
 pub fn frame_deadline(last_vblank_ns: u64, refresh_ns: u32, now_ns: u64) -> u64 {
     let period = u64::from(refresh_ns).max(1);
+    let margin = frame_margin_ns(refresh_ns);
     let mut vblank = next_vblank(last_vblank_ns, refresh_ns, now_ns);
-    while vblank.saturating_sub(FRAME_MARGIN_NS) <= now_ns {
+    while vblank.saturating_sub(margin) <= now_ns {
         vblank += period;
     }
-    vblank - FRAME_MARGIN_NS
+    vblank - margin
 }
 
 /// Total area of a region, in pixels, for the `damage_px` statistic.
@@ -814,6 +841,9 @@ mod tests {
     fn refresh_interval_from_millihertz() {
         assert_eq!(refresh_ns(60_000), 16_666_666);
         assert_eq!(refresh_ns(59_940), 16_683_350);
+        // The rates `output.<c>.mode` makes reachable on the test box.
+        assert_eq!(refresh_ns(120_000), 8_333_333);
+        assert_eq!(refresh_ns(240_000), 4_166_666);
         // Nonsense modes fall back to 60 Hz rather than dividing by zero.
         assert_eq!(refresh_ns(0), 16_666_667);
     }
@@ -845,6 +875,30 @@ mod tests {
         let d = frame_deadline(now, period, late);
         assert_eq!(d, now + 2 * u64::from(period) - FRAME_MARGIN_NS);
         assert!(d > late);
+    }
+
+    #[test]
+    fn the_margin_is_unchanged_at_60_and_120_and_shrinks_only_past_that() {
+        // The audit's question, answered as a test rather than a comment:
+        // the 2 ms margin is a *measured* rasterization pass, so it must
+        // not scale with the panel — and it does not, at either rate the
+        // box can actually run.
+        assert_eq!(frame_margin_ns(refresh_ns(60_000)), FRAME_MARGIN_NS);
+        assert_eq!(frame_margin_ns(refresh_ns(120_000)), FRAME_MARGIN_NS);
+        // 8.33 ms / 4 = 2.08 ms, just above the constant — which is how
+        // close 120 Hz is to the cap, and why the cap is here at all.
+        assert!(u64::from(refresh_ns(120_000)) / 4 > FRAME_MARGIN_NS);
+        // At 240 Hz a fixed 2 ms would be most of a 4.17 ms frame, so the
+        // quarter-period cap takes over and the client keeps three
+        // quarters of every frame.
+        let fast = refresh_ns(240_000);
+        assert_eq!(frame_margin_ns(fast), u64::from(fast) / 4);
+        assert!(frame_margin_ns(fast) < FRAME_MARGIN_NS);
+        // The deadline follows, and is still strictly in the future.
+        let now = 1_000;
+        let d = frame_deadline(now, fast, now);
+        assert_eq!(d, now + u64::from(fast) - frame_margin_ns(fast));
+        assert!(d > now);
     }
 
     /// Paint one frame and report the region it covered.

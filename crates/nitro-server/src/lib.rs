@@ -2185,11 +2185,19 @@ impl Server {
                     time,
                 } => {
                     self.frames += 1;
+                    // The flip's own output's period, so the
+                    // `FLIP_INTERVAL_MAX_PERIODS` cut-off below means four
+                    // *actual* frames — 8.3 ms each at 120 Hz, not 16.7.
+                    // The literal is the fallback for one racy case: a
+                    // completion arriving for an output unplugged between
+                    // the commit and the event, where there is no period
+                    // to read and the sample is about to be discarded
+                    // anyway.
                     let refresh_ns = self
                         .outputs
                         .iter()
                         .find(|o| o.kms_id == output)
-                        .map_or(16_666_667, |o| o.refresh_ns);
+                        .map_or(frame::refresh_ns(0), |o| o.refresh_ns);
                     self.flips.record(time, refresh_ns);
                     debug!("{output} flipped seq={sequence} t={time:?}");
                     self.on_flip(output, sequence, time);

@@ -13,9 +13,16 @@ use nitro_demo::args::{self, Args, Mode};
 use nitro_demo::{control, latency, png, scene};
 use rustix::event::{PollFd, PollFlags};
 
-/// One refresh at 60 Hz: the tolerance the client's and the server's views
-/// of latency are allowed to differ by.
-const FRAME_US: u64 = 16_667;
+/// One refresh at 60 Hz, in microseconds: the tolerance the client's and
+/// the server's views of latency may differ by when the server has not
+/// said what a frame actually is.
+///
+/// A **fallback**, since #3718: the tolerance is one frame, and a frame is
+/// 8 333 µs at 120 Hz, so a fixed 16 667 would quietly accept a
+/// half-frame disagreement the check exists to catch. The real period
+/// comes off the server's `Frame` callback ([`App::refresh_ns`]) and this
+/// only applies before the first one has arrived.
+const FRAME_US_AT_60: u64 = 16_667;
 
 fn main() -> ExitCode {
     let show_damage = std::env::var_os("NITRO_DEMO_SHOW_DAMAGE").is_some_and(|v| v == "1");
@@ -164,9 +171,14 @@ fn report(app: &mut App, final_report: bool) -> Result<(), Box<dyn std::error::E
                 if let (Some(client), Some(&server)) =
                     (app.hist.summary(), stats.get("i2p_mean_us"))
                 {
-                    let ok = latency::agree(client.mean, server, FRAME_US);
+                    // One *actual* frame: the rate the server says it is
+                    // running, not the rate nitro used to always run at.
+                    let frame_us = app
+                        .refresh_ns
+                        .map_or(FRAME_US_AT_60, |ns| u64::from(ns) / 1_000);
+                    let ok = latency::agree(client.mean, server, frame_us);
                     emit(&format!(
-                        "cross-check: client mean {} us vs server mean {server} us — {} (tolerance {FRAME_US} us)",
+                        "cross-check: client mean {} us vs server mean {server} us — {} (tolerance {frame_us} us)",
                         client.mean,
                         if ok { "agree" } else { "DISAGREE" }
                     ))?;
