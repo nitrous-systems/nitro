@@ -138,9 +138,24 @@ roles! {
     WindowBorderActive = "window_border_active",
     /// The frame border of an unfocused window.
     WindowBorderInactive = "window_border_inactive",
-    /// The close button on a title bar.
+    /// The close button on a title bar: since #3715 its **hover**
+    /// background, the disc that appears under the `x` glyph when the
+    /// pointer is on it.
+    ///
+    /// It used to be the button's resting face — a red circle, painted
+    /// whether or not anyone was pointing at it. The buttons are symbolic
+    /// icons now (`docs/wm.md`), so the red moved from "what a close
+    /// button looks like" to "what it looks like when a click would close
+    /// the window", which is where every other desktop puts it.
     TitleClose = "title_close",
-    /// The maximize button on a title bar.
+    /// The maximize button on a title bar. **No longer painted**: the
+    /// maximize button is a `square` glyph on the same hover background as
+    /// minimize since #3715, and there is no green circle left to colour.
+    ///
+    /// Kept because a role index *is* a wire index (see the module docs):
+    /// removing one would renumber every role after it and silently
+    /// re-colour a client one release behind. An unused role costs four
+    /// bytes in the `Theme` message and nothing else.
     TitleMaximize = "title_maximize",
     /// Top of the desktop's wallpaper gradient.
     DesktopTop = "desktop_top",
@@ -196,6 +211,20 @@ roles! {
     /// `window_border_active`: it has to read clearly against both the
     /// border colours *and* whatever is behind the window.
     ResizeHint = "resize_hint",
+    /// The disc under a title-bar button while the pointer is on it.
+    ///
+    /// The frame's buttons are symbolic glyphs on a background that is
+    /// **transparent until hovered** (`docs/wm.md`), so this role is the
+    /// whole of the "you are on the button" affordance for minimize and
+    /// maximize — close has [`Role::TitleClose`], because a red close is
+    /// the one convention every desktop shares.
+    ///
+    /// It is a role of its own rather than [`Role::ButtonHover`] because
+    /// the two sit on different backgrounds: a toolkit button hovers on a
+    /// window background, and in the light scheme `button_hover`
+    /// (`#d6d9e4`) against `title_bar_active` (`#d6dde8`) is a difference
+    /// of two units in one channel — an affordance nobody can see.
+    TitleButtonHover = "title_button_hover",
 }
 
 impl Role {
@@ -352,9 +381,9 @@ impl Palette {
             ButtonActive, ButtonDisabled, ButtonHover, ButtonText, Caret, Danger, DesktopBottom,
             DesktopTop, Field, Focus, ModalBackground, Placeholder, ResizeHint, Selection, Success,
             TerminalBackground, TerminalCursor, TerminalText, Text, TextDim, TextOnAccent,
-            TitleBarActive, TitleBarInactive, TitleClose, TitleMaximize, TitleTextActive,
-            TitleTextInactive, Track, Warning, WindowBackground, WindowBorderActive,
-            WindowBorderInactive,
+            TitleBarActive, TitleBarInactive, TitleButtonHover, TitleClose, TitleMaximize,
+            TitleTextActive, TitleTextInactive, Track, Warning, WindowBackground,
+            WindowBorderActive, WindowBorderInactive,
         };
         let mut p = Self([Color::BLACK; Role::COUNT]);
         // Chrome. These are `nitro_ui::Theme::default()`'s values, which
@@ -392,6 +421,10 @@ impl Palette {
         p.set(WindowBorderInactive, Color::rgb(0xc4, 0xc8, 0xd0));
         p.set(TitleClose, Color::rgb(0xd9, 0x5b, 0x4e));
         p.set(TitleMaximize, Color::rgb(0x62, 0xa8, 0x5c));
+        // A hover disc on a *light* title bar: darker than both bars, and
+        // distinctly bluer than the neutral `button_hover` so the two
+        // cannot be confused when they sit side by side on a dialog.
+        p.set(TitleButtonHover, Color::rgb(0xb3, 0xc0, 0xd4));
         // The resize affordance: the accent, which is exactly the "this is
         // the interesting thing" colour, and already contrasts with both
         // window border colours.
@@ -436,9 +469,9 @@ impl Palette {
             ButtonActive, ButtonDisabled, ButtonHover, ButtonText, Caret, Danger, DesktopBottom,
             DesktopTop, Field, Focus, ModalBackground, Placeholder, ResizeHint, Selection, Success,
             TerminalBackground, TerminalCursor, TerminalText, Text, TextDim, TextOnAccent,
-            TitleBarActive, TitleBarInactive, TitleClose, TitleMaximize, TitleTextActive,
-            TitleTextInactive, Track, Warning, WindowBackground, WindowBorderActive,
-            WindowBorderInactive,
+            TitleBarActive, TitleBarInactive, TitleButtonHover, TitleClose, TitleMaximize,
+            TitleTextActive, TitleTextInactive, Track, Warning, WindowBackground,
+            WindowBorderActive, WindowBorderInactive,
         };
         let mut p = Self([Color::BLACK; Role::COUNT]);
         p.set(WindowBackground, Color::rgb(0x1e, 0x20, 0x26));
@@ -476,6 +509,7 @@ impl Palette {
         p.set(WindowBorderInactive, Color::rgb(0x3a, 0x42, 0x4c));
         p.set(TitleClose, Color::rgb(0xd9, 0x5b, 0x4e));
         p.set(TitleMaximize, Color::rgb(0x62, 0xa8, 0x5c));
+        p.set(TitleButtonHover, Color::rgb(0x46, 0x5c, 0x78));
         p.set(ResizeHint, Color::rgb(0x6c, 0xa8, 0xf0));
         p.set(DesktopTop, Color::rgb(0x2a, 0x30, 0x3c));
         p.set(DesktopBottom, Color::rgb(0x15, 0x18, 0x20));
@@ -607,7 +641,7 @@ mod tests {
         // would renumber every wire index after it — fails here rather than
         // on somebody's screen. Appending updates this line, and that edit
         // is the point: it is where you notice you are changing the wire.
-        assert_eq!(Role::ALL.last(), Some(&Role::ResizeHint));
+        assert_eq!(Role::ALL.last(), Some(&Role::TitleButtonHover));
     }
 
     #[test]

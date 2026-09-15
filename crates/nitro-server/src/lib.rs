@@ -39,6 +39,7 @@ pub mod config;
 pub mod control;
 pub mod cursor;
 pub mod defer;
+pub mod desktop_index;
 pub mod frame;
 pub mod icon_theme;
 pub mod icons;
@@ -67,7 +68,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use nitro_core::{Damage, Point, Rect, Size};
+use nitro_core::{Damage, Point, Rect, Role, Size};
 use nitro_kms::{
     Backend, DrmBackend, DrmOptions, Error as KmsError, Event, FakeBackend, ModeRequest, Modeline,
     OutputId as KmsOutputId, OutputInfo, Rect as KmsRect,
@@ -191,6 +192,15 @@ pub struct Config {
     /// deterministic at all — otherwise it asserts about whatever theme
     /// the machine running it happens to have installed.
     pub icon_dirs: Option<Vec<PathBuf>>,
+    /// `.desktop` search directories, replacing the XDG ones
+    /// ([`crate::desktop_index`]).
+    ///
+    /// `None` means the real ones. A test sets it for exactly the reason
+    /// `icon_dirs` exists: the `app_id → Icon=` hop reads files the
+    /// distribution wrote, and a test that used the box's own
+    /// `/usr/share/applications` would assert about whatever is
+    /// installed there.
+    pub desktop_dirs: Option<Vec<PathBuf>>,
 }
 
 impl Config {
@@ -202,6 +212,15 @@ impl Config {
     /// the developer's own `~/.config/nitro/server.conf`, which would make
     /// its result depend on the box it runs on. A configuration test sets
     /// the field to a file in its own temporary directory.
+    ///
+    /// `desktop_dirs: Some(vec![])` for exactly that reason one step
+    /// further out: the `app_id → .desktop → Icon=` hop reads whatever
+    /// `/usr/share/applications` holds, so a test left on the real path
+    /// would resolve `nitro-calc` on a packager's box and not on anyone
+    /// else's. `icon_dirs` stays `None` because the icon *theme* is
+    /// already inert without one — `IconTheme` finds no files and answers
+    /// `BadIcon` — whereas an application directory full of entries is
+    /// the normal state of a developer machine.
     #[must_use]
     pub fn fake(width: u32, height: u32, path: impl Into<PathBuf>) -> Self {
         let control_path: PathBuf = path.into();
@@ -221,6 +240,7 @@ impl Config {
             shadow: true,
             config_path: None,
             icon_dirs: None,
+            desktop_dirs: Some(Vec::new()),
         }
     }
 }
@@ -720,6 +740,14 @@ struct Server {
     /// border back, and nothing else remembers which that was. See
     /// [`Server::set_resize_hint`].
     resize_hint: Option<WindowKey>,
+    /// The title-bar button the pointer is on, whose disc is painted.
+    ///
+    /// Cached for exactly [`Server::resize_hint`]'s reason: what matters
+    /// is the *change*, and putting the previous button's disc back needs
+    /// to know which it was. The window is part of the key because two
+    /// frames' buttons are different buttons — sliding from one window's
+    /// close to another's has to unlight the first.
+    button_hover: Option<(WindowKey, Region)>,
     /// The shaped title run of each framed window, so a retitle can release
     /// the old one.
     frame_titles: HashMap<WindowKey, nitro_text::TextKey>,
@@ -1021,9 +1049,15 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         epoll,
         scene: Scene::new(),
         text: TextEngine::new(),
-        icons: match config.icon_dirs.take() {
-            Some(dirs) => IconEngine::with_dirs(dirs, settings.theme.icon_theme()),
-            None => IconEngine::with_theme(settings.theme.icon_theme()),
+        icons: {
+            let mut icons = match config.icon_dirs.take() {
+                Some(dirs) => IconEngine::with_dirs(dirs, settings.theme.icon_theme()),
+                None => IconEngine::with_theme(settings.theme.icon_theme()),
+            };
+            if let Some(dirs) = config.desktop_dirs.take() {
+                icons.set_desktop_dirs(dirs);
+            }
+            icons
         },
         outputs: Vec::new(),
         keyboard,
@@ -1032,6 +1066,7 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         wm: WindowManager::new(),
         decorations: HashMap::new(),
         resize_hint: None,
+        button_hover: None,
         frame_titles: HashMap::new(),
         scale_overrides: std::mem::take(&mut config.scales),
         mode_overrides: std::mem::take(&mut config.modes),
@@ -2703,6 +2738,17 @@ impl Server {
         if icons_changed {
             self.icons.set_theme(self.settings.theme.icon_theme());
         }
+        // The `.desktop` index, unconditionally — see
+        // [`IconEngine::rescan_desktop`]. There is no setting to diff:
+        // what changes is the filesystem, and `reload` is the user saying
+        // "look again" after installing something.
+        self.icons.rescan_desktop();
+        // A frame's icon is its window's `app_id` re-resolved, so every
+        // decoration asks again: the package that just arrived may be the
+        // one whose window is on screen showing the generic fallback.
+        for win in self.decorations.keys().copied().collect::<Vec<_>>() {
+            self.reicon(win);
+        }
 
         // Scale, position and primary all land in `sync_outputs`, which is
         // the one place that decides them; it re-`Configure`s the clients
@@ -2814,17 +2860,27 @@ impl Server {
             self.note_input(time_ns);
             return;
         }
-        // The resize affordance follows the pointer, but not during a drag:
-        // the branch above has already returned, so a drag in flight never
-        // repaints a border it is not over.
+        // The resize affordance and the button hover both follow the
+        // pointer, but not during a drag: the branch above has already
+        // returned, so a drag in flight never repaints a frame it is not
+        // over.
         //
         // This puts `frame_hit` on the **motion** path, where it used to run
         // only on a button press — a z-order walk per motion event. That is
         // why it no longer allocates, and why the restyle it may cause is
         // `style_only` rather than the full `restyle`: see both for the
         // costs that were taken back out.
-        let hint = self.resize_hint_at(self.pointer_desktop());
-        self.set_resize_hint(hint);
+        //
+        // **One** walk answers both affordances. #3715 added the second
+        // and took the obvious shape first — a `resize_hint_at` and a
+        // `button_hover_at`, each doing its own hit test — which is two
+        // z-order walks per motion event where #3713's review had just
+        // finished getting it down to one.
+        let frame_hit = self.pointer_desktop().and_then(|p| self.frame_hit(p));
+        self.set_resize_hint(
+            frame_hit.and_then(|(win, region)| matches!(region, Region::Resize(_)).then_some(win)),
+        );
+        self.set_button_hover(frame_hit.filter(|(_, region)| region.is_button()));
         let target = output.and_then(|id| input::hit(&self.scene, id, point));
         let now_over = target.map(|t| t.window);
         if now_over != self.pointer.over {
@@ -2898,6 +2954,11 @@ impl Server {
                     match region {
                         Region::Close => self.close_window(window),
                         Region::Maximize => self.toggle_maximize(window),
+                        // Not a soft close: the window keeps its
+                        // geometry, its z-order and its place in the
+                        // cycling order, and `Alt+Tab` brings it back.
+                        // See `wm::WindowManager::demote`.
+                        Region::Minimize => self.set_state(window, WindowState::Minimized),
                         _ => {}
                     }
                 }
@@ -2949,7 +3010,7 @@ impl Server {
                     Region::Resize(edges) => {
                         self.begin_resize(win, edges, point);
                     }
-                    Region::Close | Region::Maximize => {
+                    Region::Close | Region::Maximize | Region::Minimize => {
                         self.wm.begin_drag(Drag::Button {
                             window: win,
                             region,
@@ -3240,6 +3301,14 @@ impl Server {
         if self.resize_hint == Some(win) {
             self.resize_hint = None;
         }
+        if self.button_hover.is_some_and(|(w, _)| w == win) {
+            // A dead window's button is not hovered. Cleared rather than
+            // left to the next motion, because nothing guarantees there
+            // is one: a window closed under a stationary pointer would
+            // leave the hover pointing at a key the scene has destroyed,
+            // and the next frame to gain that key would light up.
+            self.button_hover = None;
+        }
         let title = self.frame_titles.remove(&win);
         self.text.release(title);
         self.wm.remove(win);
@@ -3265,6 +3334,20 @@ impl Server {
                 self.focus_window(next);
             }
         }
+    }
+
+    /// Drop everything a *closed* window left behind: what
+    /// [`Server::forget_window`] forgets, plus the pointer state that
+    /// only a commit's `closed_windows` list can reach.
+    fn forget_closed(&mut self, win: WindowKey) {
+        if self.focus == Some(win) {
+            self.focus = None;
+        }
+        if self.pointer.over == Some(win) {
+            self.pointer.over = None;
+        }
+        self.touch_targets.retain(|_, (w, _)| *w != win);
+        self.forget_window(win);
     }
 
     fn touch(
@@ -3504,6 +3587,55 @@ impl Server {
         };
         self.decorations.insert(win, nodes);
         self.restyle(win, self.focus == Some(win));
+        self.reicon(win);
+    }
+
+    /// Point a frame's application-icon node at whatever the window's
+    /// `app_id` resolves to, or at the `window` fallback.
+    ///
+    /// The frame is the **server's own** tree, so there is no `SetIcon`
+    /// and no `BadIcon`: the fallback happens here, synchronously, in the
+    /// same call that failed to resolve. A client has to be told its name
+    /// failed and send another message; the server is the resolver, so
+    /// the node is never briefly blank.
+    ///
+    /// Called on `decorate` and again whenever `SetAppId` moves — the
+    /// protocol allows a client to change its app id after mapping
+    /// (`docs/wire.md`), and `nitro-term` does exactly that when it
+    /// learns what it is running — so the icon has to be re-resolved
+    /// rather than resolved once and remembered.
+    fn reicon(&mut self, win: WindowKey) {
+        let Some(nodes) = self.decorations.get(&win).copied() else {
+            return;
+        };
+        let Ok(app_id) = self.scene.window_info(win).map(|i| i.app_id().to_owned()) else {
+            return;
+        };
+        // The full three-step resolution — theme, then `<app_id>.desktop`
+        // `Icon=`, then that name symbolic-or-theme — which is what makes
+        // `nitro-calc` a calculator rather than a generic window.
+        let resolved = self
+            .icons
+            .lookup_app(&app_id)
+            .map(|icon| (icon.handle(), icon.role(Role::Text)))
+            .or_else(|| {
+                // Nothing anywhere: one of ours, tinted like the title.
+                // `Role::Text` is not used here — the fallback sits in
+                // the title bar and has to recede with it — so the tint
+                // is set by `style_only` on the next line rather than
+                // baked in.
+                self.icons
+                    .lookup(wm::icon_names::FALLBACK_APP)
+                    .map(|handle| {
+                        (
+                            handle,
+                            wm::role_byte(wm::title_role(self.focus == Some(win))),
+                        )
+                    })
+            });
+        if let Err(e) = wm::set_app_icon(&mut self.scene, &nodes, resolved) {
+            warn!("setting a frame icon: {e}");
+        }
     }
 
     /// Restyle a window's frame for a focus change, and re-shape its title
@@ -3526,14 +3658,53 @@ impl Server {
     /// depends on `focused` alone. So paying all of that whenever a pointer
     /// crosses a window edge would be pure waste, and it would land in
     /// `shape_us` — polluting the statistic `docs/latency.md` points a
-    /// reader at to find real shaping costs.
+    /// reader at to find real shaping costs. Since #3715 the button
+    /// hover rides the same path and inherits the same guarantee.
     fn style_only(&mut self, win: WindowKey, focused: bool) {
         let Some(nodes) = self.decorations.get(&win).copied() else {
             return;
         };
         let hint = self.resize_hint == Some(win);
-        if let Err(e) = wm::style_frame(&mut self.scene, &nodes, focused, hint, &self.palette) {
+        let hover = self.button_hover.filter(|(w, _)| *w == win).map(|(_, r)| r);
+        if let Err(e) =
+            wm::style_frame(&mut self.scene, &nodes, focused, hint, hover, &self.palette)
+        {
             warn!("styling a frame: {e}");
+        }
+        // A symbolic app-icon fallback is tinted like the title, so it
+        // has to follow the focus with it. A resolved application icon is
+        // a picture and is left alone — an unfocused Firefox logo is
+        // still the Firefox logo.
+        self.restyle_fallback_icon(win, focused);
+    }
+
+    /// Retint a frame's app icon **if** it is the symbolic fallback.
+    ///
+    /// The discriminator is the node's own stored role byte rather than a
+    /// flag beside it: `AS_COLOURED` means the tile is somebody else's
+    /// artwork and has no tint to change, and anything else is one of our
+    /// coverage masks. One record, so nothing can disagree with it.
+    fn restyle_fallback_icon(&mut self, win: WindowKey, focused: bool) {
+        let Some(nodes) = self.decorations.get(&win).copied() else {
+            return;
+        };
+        let Some(icon) = self
+            .scene
+            .node(nodes.app_icon)
+            .ok()
+            .and_then(nitro_scene::Node::icon)
+        else {
+            return;
+        };
+        if icon.role == nitro_scene::IconRef::AS_COLOURED {
+            return;
+        }
+        let want = wm::role_byte(wm::title_role(focused));
+        if icon.role == want {
+            return;
+        }
+        if let Err(e) = wm::set_app_icon(&mut self.scene, &nodes, Some((icon.icon, want))) {
+            warn!("retinting a frame icon: {e}");
         }
     }
 
@@ -3569,11 +3740,35 @@ impl Server {
         }
     }
 
-    /// The window whose resize band the pointer is in, if any: what
-    /// [`Server::set_resize_hint`] lights up.
-    fn resize_hint_at(&self, point: Option<Point>) -> Option<WindowKey> {
-        let (win, region) = self.frame_hit(point?)?;
-        matches!(region, Region::Resize(_)).then_some(win)
+    /// Light the disc under whichever title-bar button the pointer is on,
+    /// and put the previous one back.
+    ///
+    /// The twin of [`Server::set_resize_hint`], on the same motion path,
+    /// written to the same rules and for the same reason: the frame's
+    /// buttons are bare symbolic glyphs since #3715, and a symbol with no
+    /// hover state gives no sign that it is a control at all.
+    ///
+    /// Three properties it shares, each of which was a review finding on
+    /// #3713 before it was a rule here:
+    ///
+    /// * The hit test is the caller's, and it is the *same* one the
+    ///   resize hint uses — one `frame_hit` per motion, not two.
+    /// * An unchanged hover returns before touching the scene, so the
+    ///   common case (the pointer is over content) is a comparison.
+    /// * The restyle is `style_only`, never `restyle`: a hover must not
+    ///   re-shape a title that cannot have changed.
+    fn set_button_hover(&mut self, hover: Option<(WindowKey, Region)>) {
+        if self.button_hover == hover {
+            return;
+        }
+        let old = self.button_hover;
+        self.button_hover = hover;
+        for win in [old.map(|(w, _)| w), hover.map(|(w, _)| w)]
+            .into_iter()
+            .flatten()
+        {
+            self.style_only(win, self.focus == Some(win));
+        }
     }
 
     /// (Re)shape a framed window's title text, eliding it to the space
@@ -4018,16 +4213,7 @@ impl Server {
             return;
         };
         let s = ClientId::SERVER;
-        for key in [
-            Some(nodes.background),
-            Some(nodes.bar),
-            Some(nodes.title),
-            Some(nodes.close),
-            nodes.maximize,
-        ]
-        .into_iter()
-        .flatten()
-        {
+        for key in nodes.all() {
             if let Err(e) = self.scene.set_visible(s, key, visible) {
                 warn!("hiding a decoration: {e}");
             }
@@ -5244,19 +5430,18 @@ impl Server {
         }
         client.frame_requests.extend(outcome.frame_requests);
         for win in outcome.closed_windows {
-            if self.focus == Some(win) {
-                self.focus = None;
-            }
-            if self.pointer.over == Some(win) {
-                self.pointer.over = None;
-            }
-            self.touch_targets.retain(|_, (w, _)| *w != win);
-            self.forget_window(win);
+            self.forget_closed(win);
         }
         // The title bar is the server's, so a retitle is a repaint the
-        // client never asks for and never sees.
+        // client never asks for and never sees. An app id is an icon
+        // name (`docs/shell.md`), so a window that renamed itself
+        // re-resolves its frame icon the same way — the server's own
+        // node, so no message and no round trip in either direction.
         for win in outcome.retitled {
             self.retitle(win);
+        }
+        for win in outcome.reiconed {
+            self.reicon(win);
         }
         let relisted = outcome.relisted;
         let shell_ops = outcome.shell_ops;

@@ -38,9 +38,22 @@ pub const CORNER_RADIUS: f32 = 6.0;
 /// How wide the resize grab band is, inside and outside the frame edge.
 pub const RESIZE_BAND: f32 = 6.0;
 /// Size of one title-bar button (a square), logical pixels.
+///
+/// It is both the **hit** region and the hover disc the pointer lights
+/// up: letting the two differ — a slightly larger disc looks better —
+/// would put a visible affordance edge where a press does nothing, which
+/// is the mistake [`Role::ResizeHint`] already exists to have fixed once.
 pub const BUTTON: f32 = 14.0;
 /// Gap between the buttons and from the right edge.
 pub const BUTTON_GAP: f32 = 8.0;
+/// The application icon in the title bar, logical pixels.
+///
+/// 16 rather than [`BUTTON`]'s 14: this is the one icon in the frame that
+/// may be somebody else's PNG, and 16 is the size every icon theme ships
+/// (`docs/icons.md`). A 14 would resample every one of them.
+pub const APP_ICON: f32 = 16.0;
+/// Gap between the application icon and the title text.
+pub const APP_ICON_GAP: f32 = 6.0;
 /// Smallest content size a drag may resize a window to.
 pub const MIN_CONTENT: Size = Size::new(64.0, 32.0);
 /// Two clicks closer together than this on the title bar are a double
@@ -120,8 +133,23 @@ pub enum Region {
     Close,
     /// The maximize button.
     Maximize,
+    /// The minimize button.
+    Minimize,
     /// A resize band, naming the edges it pulls.
     Resize(Edges),
+}
+
+impl Region {
+    /// Whether this region is one of the title bar's buttons.
+    ///
+    /// Every button behaves the same in three places — a press begins a
+    /// [`Drag::Button`], a hover lights a disc, a release fires inside
+    /// itself — so the set is named once rather than spelled out as a
+    /// three-arm `matches!` in each.
+    #[must_use]
+    pub fn is_button(self) -> bool {
+        matches!(self, Self::Close | Self::Maximize | Self::Minimize)
+    }
 }
 
 /// Where a drag currently is.
@@ -234,22 +262,37 @@ pub fn hit_frame(frame: Rect, inset: Insets, point: Point, fixed: bool) -> Optio
     Some(Region::Content)
 }
 
-/// The title bar's buttons, right to left: close, then maximize.
+/// The title bar's buttons, right to left: close, maximize, minimize.
 ///
-/// A `FIXED_SIZE` window gets only the close button — offering to maximize
-/// a window that cannot be resized would be a lie.
+/// A `FIXED_SIZE` window keeps close and minimize and loses **maximize**
+/// — offering to maximize a window that cannot be resized would be a lie,
+/// while putting one away is something any window can do. It is also what
+/// makes the missing button *mean* something: a frame with two buttons is
+/// a frame that will not resize, visible before you try it.
+///
+/// Right to left rather than left to right because close is the button
+/// whose position a user knows without looking, so it is the one that has
+/// to stay pinned to the corner when the others come and go.
 #[must_use]
 pub fn buttons(frame: Rect, fixed: bool) -> Vec<(Region, Rect)> {
     let y = frame.y + (TITLE_H - BUTTON) / 2.0;
-    let close_x = frame.x + frame.w - BUTTON_GAP - BUTTON;
-    let mut out = vec![(Region::Close, Rect::new(close_x, y, BUTTON, BUTTON))];
+    let mut x = frame.x + frame.w - BUTTON_GAP - BUTTON;
+    let mut out = vec![(Region::Close, Rect::new(x, y, BUTTON, BUTTON))];
     if !fixed {
-        out.push((
-            Region::Maximize,
-            Rect::new(close_x - BUTTON_GAP - BUTTON, y, BUTTON, BUTTON),
-        ));
+        x -= BUTTON_GAP + BUTTON;
+        out.push((Region::Maximize, Rect::new(x, y, BUTTON, BUTTON)));
     }
+    x -= BUTTON_GAP + BUTTON;
+    out.push((Region::Minimize, Rect::new(x, y, BUTTON, BUTTON)));
     out
+}
+
+/// How much of the title bar's right-hand end the buttons occupy, the
+/// gap that separates them from the title included.
+#[must_use]
+pub fn button_room(fixed: bool) -> f32 {
+    let count = if fixed { 2.0 } else { 3.0 };
+    count * (BUTTON + BUTTON_GAP) + BUTTON_GAP
 }
 
 /// Whether a logical rect contains a point (half-open on the far edges).
@@ -566,6 +609,53 @@ pub fn cycle_candidates(scene: &Scene, mru: &[WindowKey]) -> Vec<WindowKey> {
         .collect()
 }
 
+/// The symbolic icon names the frame draws with.
+///
+/// Named here rather than inlined because they are the frame's whole
+/// visual vocabulary, and because each is a choice:
+///
+/// * `x` for close and `dash` for minimize — the two shapes every desktop
+///   uses, and the two that survive being ten logical pixels wide.
+/// * `square` for maximize rather than `arrows-angle-expand`. The arrows
+///   read better in a vector viewer and turn to mush at this size: four
+///   diagonal heads and their tails inside a ten-unit box, against one
+///   outlined rectangle whose four strokes land on whole pixels. The
+///   square is also what the button *does* — fill the screen — rather
+///   than a metaphor for it.
+/// * `window` is the application-icon fallback, matching the rule
+///   `nitro-bar` already uses for its window list (`docs/shell.md`).
+pub mod icon_names {
+    /// The close button.
+    pub const CLOSE: &str = "x";
+    /// The maximize button.
+    pub const MAXIMIZE: &str = "square";
+    /// The minimize button.
+    pub const MINIMIZE: &str = "dash";
+    /// What the title bar shows when the window's `app_id` resolves to
+    /// no icon at all.
+    pub const FALLBACK_APP: &str = "window";
+}
+
+/// The glyph inside a title-bar button, logical pixels.
+///
+/// Smaller than [`BUTTON`] so the hover disc reads as a disc *behind* the
+/// glyph rather than as a box around it.
+pub const BUTTON_ICON: f32 = 10.0;
+
+/// One title-bar button's two nodes.
+///
+/// A rect and an icon, and they cannot be one node: an icon node has no
+/// fill and a rect node has no artwork. The rect is transparent until the
+/// pointer is on the button, which is what makes a resting title bar
+/// three glyphs on a flat strip rather than three coloured lozenges.
+#[derive(Debug, Clone, Copy)]
+pub struct FrameButton {
+    /// The hover disc, transparent while nothing is pointing at it.
+    pub background: nitro_scene::NodeKey,
+    /// The symbolic glyph, tinted from the palette.
+    pub icon: nitro_scene::NodeKey,
+}
+
 /// The node ids of one window's frame decorations, so the server can
 /// restyle them on a focus change and retitle them on a `SetWindowTitle`.
 #[derive(Debug, Clone, Copy)]
@@ -576,12 +666,50 @@ pub struct FrameNodes {
     pub background: nitro_scene::NodeKey,
     /// The title bar rect.
     pub bar: nitro_scene::NodeKey,
+    /// The application's icon, left of the title.
+    pub app_icon: nitro_scene::NodeKey,
     /// The title text node.
     pub title: nitro_scene::NodeKey,
     /// The close button.
-    pub close: nitro_scene::NodeKey,
+    pub close: FrameButton,
     /// The maximize button, absent on a `FIXED_SIZE` window.
-    pub maximize: Option<nitro_scene::NodeKey>,
+    pub maximize: Option<FrameButton>,
+    /// The minimize button.
+    pub minimize: FrameButton,
+}
+
+impl FrameNodes {
+    /// The button a [`Region`] names, if it names one this frame has.
+    #[must_use]
+    pub fn button(&self, region: Region) -> Option<FrameButton> {
+        match region {
+            Region::Close => Some(self.close),
+            Region::Maximize => self.maximize,
+            Region::Minimize => Some(self.minimize),
+            _ => None,
+        }
+    }
+
+    /// Every node in the frame, for the paths that treat them alike:
+    /// hiding the decorations for fullscreen, and counting them.
+    #[must_use]
+    pub fn all(&self) -> Vec<nitro_scene::NodeKey> {
+        let mut out = vec![
+            self.background,
+            self.bar,
+            self.app_icon,
+            self.title,
+            self.close.background,
+            self.close.icon,
+            self.minimize.background,
+            self.minimize.icon,
+        ];
+        if let Some(m) = self.maximize {
+            out.push(m.background);
+            out.push(m.icon);
+        }
+        out
+    }
 }
 
 /// Build the decoration nodes of a freshly framed window.
@@ -589,6 +717,29 @@ pub struct FrameNodes {
 /// Every node is owned by [`ClientId::SERVER`] and lives *under the frame
 /// group, before the client's content*, so the client always paints on top
 /// of its own frame's background and can never paint over the title bar.
+///
+/// # The node count, and why each one is there
+///
+/// **Eleven** for a resizable window, **nine** for a `FIXED_SIZE` one
+/// — `docs/budget.md` multiplies this by the 240 bytes a `Node` costs, so
+/// it is pinned by a test:
+///
+/// | node | why it cannot be shared |
+/// |---|---|
+/// | frame group | the window's root; the insets hang off it |
+/// | background | the border and the body, one rounded rect |
+/// | title bar | a different colour from the body |
+/// | app icon | artwork, which no rect can hold |
+/// | title | a shaped text run |
+/// | 3 × (disc + glyph) | a rect has no artwork and an icon has no fill |
+///
+/// The buttons are the expensive half, and the alternative was
+/// considered: **one** disc, moved to whichever button is hovered, since
+/// only one can be — nine nodes and seven. It was not taken because the
+/// disc's bounds would then change on every hover, damaging its old
+/// rectangle *and* its new one, where three fixed discs each damage only
+/// themselves; a hover would cost twice the pixels it does now, on the
+/// motion path.
 ///
 /// # Errors
 /// Anything the scene refuses; in practice only a dead window key.
@@ -604,40 +755,99 @@ pub fn build_frame(
     let rect = |scene: &mut Scene| -> Result<nitro_scene::NodeKey, nitro_scene::Error> {
         scene.create_node(s, nitro_scene::NodeKind::Rect, root, Some(content))
     };
+    let icon_node = |scene: &mut Scene| -> Result<nitro_scene::NodeKey, nitro_scene::Error> {
+        scene.create_node(s, nitro_scene::NodeKind::Icon, root, Some(content))
+    };
     let background = rect(scene)?;
     let bar = rect(scene)?;
+    let app_icon = icon_node(scene)?;
     let title = scene.create_node(s, nitro_scene::NodeKind::Text, root, Some(content))?;
-    let close = rect(scene)?;
-    let maximize = if fixed { None } else { Some(rect(scene)?) };
+    // Created in the order they are drawn: the disc first, the glyph on
+    // top of it. Siblings paint in creation order, so this is the whole
+    // of what puts the glyph over its own background.
+    let button = |scene: &mut Scene, name: &str| -> Result<FrameButton, nitro_scene::Error> {
+        let background = rect(scene)?;
+        let glyph = icon_node(scene)?;
+        scene.set_corner_radius(s, background, BUTTON / 2.0)?;
+        if let Some(index) = nitro_icons::index_of(name) {
+            // The role is a stored *index*, resolved per frame against
+            // whatever palette the server holds — which is why a scheme
+            // flip recolours the frame's glyphs with no re-raster,
+            // exactly as it does a client's. `style_frame` overwrites it
+            // with the focus-dependent one immediately; this is the
+            // value a frame would keep if it were never styled.
+            scene.set_icon(
+                s,
+                glyph,
+                Some(nitro_scene::IconRef::new(
+                    index,
+                    BUTTON_ICON,
+                    role_byte(Role::TitleTextActive),
+                )),
+            )?;
+        }
+        Ok(FrameButton {
+            background,
+            icon: glyph,
+        })
+    };
+    let close = button(scene, icon_names::CLOSE)?;
+    let maximize = if fixed {
+        None
+    } else {
+        Some(button(scene, icon_names::MAXIMIZE)?)
+    };
+    let minimize = button(scene, icon_names::MINIMIZE)?;
 
     scene.set_corner_radius(s, background, CORNER_RADIUS)?;
     scene.set_corner_radius(s, bar, CORNER_RADIUS)?;
-    scene.set_corner_radius(s, close, BUTTON / 2.0)?;
-    if let Some(m) = maximize {
-        scene.set_corner_radius(s, m, BUTTON / 2.0)?;
-    }
-    scene.set_fill(
-        s,
-        close,
-        nitro_scene::Fill::Solid(palette.get(Role::TitleClose)),
-    )?;
-    if let Some(m) = maximize {
-        scene.set_fill(
-            s,
-            m,
-            nitro_scene::Fill::Solid(palette.get(Role::TitleMaximize)),
-        )?;
-    }
     let nodes = FrameNodes {
         root,
         background,
         bar,
+        app_icon,
         title,
         close,
         maximize,
+        minimize,
     };
     layout_frame(scene, win, &nodes)?;
+    style_frame(scene, &nodes, false, false, None, palette)?;
     Ok(nodes)
+}
+
+/// A palette role as the byte a [`nitro_scene::IconRef`] stores.
+///
+/// Exact by construction: `Role` is `repr(u8)`, so its index cannot
+/// exceed 255.
+#[must_use]
+pub fn role_byte(role: Role) -> u8 {
+    role.index() as u8
+}
+
+/// Point a frame's application-icon node at an icon, or clear it.
+///
+/// The frame is the server's **own** tree, so there is no `SetIcon` on
+/// the wire and no client to answer: this is the internal twin of the
+/// path a client's `SetIcon` takes, and it is why the server can do the
+/// fallback synchronously. A client that names an icon the server lacks
+/// is told `BadIcon` and sends its own fallback a message later; the
+/// server *is* the resolver, so it simply resolves the fallback in the
+/// same call and the node is never briefly blank.
+///
+/// `icon` is the `(handle, role)` pair the engine already resolved:
+/// `AS_COLOURED` for a theme PNG, a palette role for a symbolic shape
+/// (see [`crate::icons::AppIcon`]).
+///
+/// # Errors
+/// Anything the scene refuses.
+pub fn set_app_icon(
+    scene: &mut Scene,
+    nodes: &FrameNodes,
+    icon: Option<(u32, u8)>,
+) -> Result<(), nitro_scene::Error> {
+    let reference = icon.map(|(handle, role)| nitro_scene::IconRef::new(handle, APP_ICON, role));
+    scene.set_icon(ClientId::SERVER, nodes.app_icon, reference)
 }
 
 /// Lay the decoration nodes out for the window's current size.
@@ -655,19 +865,23 @@ pub fn layout_frame(
     let s = ClientId::SERVER;
     scene.set_bounds(s, nodes.background, Rect::new(0.0, 0.0, size.w, size.h))?;
     scene.set_bounds(s, nodes.bar, Rect::new(0.0, 0.0, size.w, TITLE_H))?;
-    // The title starts after the left border and stops before the buttons,
-    // so a long title is elided rather than running under them.
-    let button_room = if fixed {
-        BUTTON + 2.0 * BUTTON_GAP
-    } else {
-        2.0 * BUTTON + 3.0 * BUTTON_GAP
-    };
-    let title_w = (size.w - BUTTON_GAP - button_room).max(0.0);
+    scene.set_bounds(
+        s,
+        nodes.app_icon,
+        Rect::new(BUTTON_GAP, (TITLE_H - APP_ICON) / 2.0, APP_ICON, APP_ICON),
+    )?;
+    // The title starts after the application icon and stops before the
+    // buttons, so a long title is elided rather than running under
+    // either. The icon took `APP_ICON + APP_ICON_GAP` off its left end,
+    // which is what makes a narrow window elide sooner than it used to
+    // rather than draw its title through the artwork.
+    let title_x = BUTTON_GAP + APP_ICON + APP_ICON_GAP;
+    let title_w = (size.w - title_x - button_room(fixed)).max(0.0);
     scene.set_bounds(
         s,
         nodes.title,
         Rect::new(
-            BUTTON_GAP,
+            title_x,
             (TITLE_H - TITLE_SIZE_LINE) / 2.0,
             title_w,
             TITLE_SIZE_LINE,
@@ -675,14 +889,15 @@ pub fn layout_frame(
     )?;
     let frame = Rect::new(0.0, 0.0, size.w, size.h);
     for (region, rect) in buttons(frame, fixed) {
-        let key = match region {
-            Region::Close => Some(nodes.close),
-            Region::Maximize => nodes.maximize,
-            _ => None,
+        let Some(button) = nodes.button(region) else {
+            continue;
         };
-        if let Some(key) = key {
-            scene.set_bounds(s, key, rect)?;
-        }
+        scene.set_bounds(s, button.background, rect)?;
+        // The glyph's node is the *whole* button, not the glyph's own
+        // box: the scene centres an icon in its bounds, so this is what
+        // puts a 10 px shape in the middle of a 14 px disc without any
+        // arithmetic that could disagree with the disc's.
+        scene.set_bounds(s, button.icon, rect)?;
     }
     Ok(())
 }
@@ -693,15 +908,30 @@ pub const TITLE_SIZE_LINE: f32 = 18.0;
 
 /// Restyle a frame for its focus state and the current palette.
 ///
-/// Every colour a decoration has is set here — including the two button
-/// faces, which do not depend on focus but do depend on the palette — so
-/// that a `theme.scheme` change is one call per frame and needs no second
-/// path for "the colours moved but the focus did not".
+/// Every colour a decoration has is set here — including the buttons'
+/// glyph tints and hover discs, which do not depend on focus but do
+/// depend on the palette — so that a `theme.scheme` change is one call
+/// per frame and needs no second path for "the colours moved but the
+/// focus did not".
 ///
 /// `hint` lights the border up in [`Role::ResizeHint`]: the pointer is in
 /// this window's resize band, and until cursor shapes land (M4) the
 /// border changing colour is the only thing that says so. See
 /// [`border_color`].
+///
+/// `hover` is the button the pointer is on, whose disc is painted; every
+/// other disc is transparent. It is the same motion path `hint` rides,
+/// and for the same reason: a frame button with no hover state is a
+/// symbol that gives no sign it can be clicked.
+///
+/// # Why the icon nodes are rewritten and the title is not
+///
+/// Retinting an icon is `set_icon` with a different role **byte**, which
+/// is a `PAINT` mark and nothing else — no raster, because the cache
+/// holds coverage (`docs/icons.md`), and no allocation. Retinting the
+/// *title* means re-eliding and re-shaping, which is why `retitle` is a
+/// separate call the hover path does not make. That asymmetry is the
+/// whole reason a hover can be `style_only`.
 ///
 /// # Errors
 /// Anything the scene refuses.
@@ -710,6 +940,7 @@ pub fn style_frame(
     nodes: &FrameNodes,
     focused: bool,
     hint: bool,
+    hover: Option<Region>,
     palette: &Palette,
 ) -> Result<(), nitro_scene::Error> {
     let s = ClientId::SERVER;
@@ -726,19 +957,98 @@ pub fn style_frame(
         Some(nitro_scene::Border::new(BORDER, border)),
     )?;
     scene.set_fill(s, nodes.bar, nitro_scene::Fill::Solid(bar))?;
-    scene.set_fill(
-        s,
-        nodes.close,
-        nitro_scene::Fill::Solid(palette.get(Role::TitleClose)),
-    )?;
-    if let Some(m) = nodes.maximize {
-        scene.set_fill(
-            s,
-            m,
-            nitro_scene::Fill::Solid(palette.get(Role::TitleMaximize)),
-        )?;
+    let text = title_role(focused);
+    for region in [Region::Close, Region::Maximize, Region::Minimize] {
+        let Some(button) = nodes.button(region) else {
+            continue;
+        };
+        let hovered = hover == Some(region);
+        let disc = if hovered {
+            nitro_scene::Fill::Solid(palette.get(button_hover_role(region)))
+        } else {
+            // Transparent, not the bar's colour: a disc painted in the
+            // bar's own colour is still a node with a fill, so it still
+            // rasterises a rounded rect every frame and still has to be
+            // repainted when the bar's colour moves. `Fill::None` paints
+            // nothing at all, which is what a resting button costs here.
+            nitro_scene::Fill::None
+        };
+        scene.set_fill(s, button.background, disc)?;
+        // The glyph follows the title's colour, so an unfocused window's
+        // buttons recede exactly as its title does — one statement about
+        // focus rather than two that could disagree. On hover it takes
+        // the colour that reads on the disc, whatever the focus: the
+        // pointer is on it, and a button that dims while being pointed
+        // at reads as disabled.
+        let tint = if hovered {
+            button_hover_text_role(region)
+        } else {
+            text
+        };
+        retint(scene, button.icon, tint)?;
     }
     Ok(())
+}
+
+/// Re-point an icon node at the same icon and size in a different palette
+/// role.
+///
+/// The handle and the size are read back from the node rather than kept
+/// in a shadow copy beside it: two records of one icon can disagree, and
+/// this way there is only one. What changes is the **role index**, never
+/// a colour — the painter resolves it per frame, which is what makes a
+/// scheme flip free (`docs/icons.md`).
+fn retint(
+    scene: &mut Scene,
+    key: nitro_scene::NodeKey,
+    role: Role,
+) -> Result<(), nitro_scene::Error> {
+    let Some(existing) = scene.node(key).ok().and_then(nitro_scene::Node::icon) else {
+        // No glyph: the icon set lacks the name, which `build_frame`
+        // already tolerated. Nothing to tint.
+        return Ok(());
+    };
+    scene.set_icon(
+        ClientId::SERVER,
+        key,
+        Some(nitro_scene::IconRef::new(
+            existing.icon,
+            existing.size(),
+            role_byte(role),
+        )),
+    )
+}
+
+/// The disc colour under a hovered title-bar button.
+///
+/// Close is [`Role::TitleClose`] and the others are
+/// [`Role::TitleButtonHover`], which is the one place the frame still
+/// spends the red: a close button that looks like its neighbours until
+/// the moment you point at it, and then unmistakably does not. Painting
+/// it red at rest is what the frame did before #3715, and it made the
+/// most destructive control on the window the most eye-catching thing on
+/// it.
+#[must_use]
+pub fn button_hover_role(region: Region) -> Role {
+    match region {
+        Region::Close => Role::TitleClose,
+        _ => Role::TitleButtonHover,
+    }
+}
+
+/// The glyph colour on a hovered title-bar button.
+///
+/// On close that is [`Role::TextOnAccent`]: the disc underneath is a
+/// saturated red in both schemes, and the title text colour — near-black
+/// on light, near-white on dark — would read against it by luck rather
+/// than by design. `text_on_accent` is the role that exists for "ink on a
+/// saturated field", and it is the one that flips with the scheme.
+#[must_use]
+pub fn button_hover_text_role(region: Region) -> Role {
+    match region {
+        Region::Close => Role::TextOnAccent,
+        _ => Role::TitleTextActive,
+    }
 }
 
 /// The colour of a frame's border: its focus colour, or
@@ -777,10 +1087,22 @@ pub fn border_color(focused: bool, hint: bool, palette: &Palette) -> Color {
 /// The title colour for a focus state.
 #[must_use]
 pub fn title_color(focused: bool, palette: &Palette) -> Color {
+    palette.get(title_role(focused))
+}
+
+/// The palette role a frame's title text and button glyphs take.
+///
+/// A role rather than a colour, because an icon node stores an **index**
+/// and resolves it per frame: that is what makes a `theme.scheme` flip
+/// recolour the frame's glyphs with no re-raster and no second path.
+/// [`title_color`] is the same answer for the text node, which stores a
+/// resolved colour because a shaped run does.
+#[must_use]
+pub fn title_role(focused: bool) -> Role {
     if focused {
-        palette.get(Role::TitleTextActive)
+        Role::TitleTextActive
     } else {
-        palette.get(Role::TitleTextInactive)
+        Role::TitleTextInactive
     }
 }
 
@@ -890,22 +1212,108 @@ mod tests {
             Some(Region::Content)
         );
         assert_eq!(hit_frame(f, i, Point::new(402.0, 150.0), true), None);
+        // Close and minimize stay: putting a window away is something any
+        // window can do, and only *maximize* would be a lie on one that
+        // cannot be resized. The gap it leaves is the affordance — a
+        // two-button frame is a frame that will not resize, visible
+        // before you try it.
         let regions: Vec<Region> = buttons(f, true).into_iter().map(|(r, _)| r).collect();
-        assert_eq!(regions, vec![Region::Close]);
+        assert_eq!(regions, vec![Region::Close, Region::Minimize]);
+        // And the two are where the three would have put them, minus the
+        // middle one: close is still pinned to the corner.
+        assert_eq!(buttons(f, true)[0].1, buttons(f, false)[0].1);
+        assert_eq!(buttons(f, true)[1].1, buttons(f, false)[1].1);
     }
 
     #[test]
     fn the_buttons_are_hit_before_the_bar() {
         let f = frame();
         let i = frame_insets();
-        let close = buttons(f, false)[0].1;
-        let centre = Point::new(close.x + close.w / 2.0, close.y + close.h / 2.0);
-        assert_eq!(hit_frame(f, i, centre, false), Some(Region::Close));
-        let max = buttons(f, false)[1].1;
-        let centre = Point::new(max.x + max.w / 2.0, max.y + max.h / 2.0);
-        assert_eq!(hit_frame(f, i, centre, false), Some(Region::Maximize));
-        // The buttons do not overlap.
-        assert!(max.x + max.w <= close.x);
+        let all = buttons(f, false);
+        assert_eq!(
+            all.iter().map(|(r, _)| *r).collect::<Vec<_>>(),
+            vec![Region::Close, Region::Maximize, Region::Minimize],
+            "right to left: close is the one whose position users know"
+        );
+        for (region, rect) in &all {
+            let centre = Point::new(rect.x + rect.w / 2.0, rect.y + rect.h / 2.0);
+            assert_eq!(hit_frame(f, i, centre, false), Some(*region));
+            assert!(region.is_button(), "{region:?}");
+        }
+        // They do not overlap, and they are all inside the title bar.
+        for pair in all.windows(2) {
+            let (right, left) = (pair[0].1, pair[1].1);
+            assert!(left.x + left.w <= right.x, "{left:?} {right:?}");
+        }
+        for (_, rect) in &all {
+            assert!(rect.y >= f.y && rect.y + rect.h <= f.y + TITLE_H);
+            assert!(rect.x >= f.x && rect.x + rect.w <= f.x + f.w);
+        }
+        // A hit on the bar away from them is still a move drag.
+        assert_eq!(
+            hit_frame(f, i, Point::new(f.x + 60.0, f.y + 14.0), false),
+            Some(Region::TitleBar)
+        );
+        assert!(!Region::TitleBar.is_button());
+        assert!(!Region::Content.is_button());
+    }
+
+    #[test]
+    fn the_title_gets_what_the_icon_and_the_buttons_leave() {
+        // The arithmetic `layout_frame` does, checked here because it is
+        // the one number a frame's look depends on that no pixel test
+        // would localise: a title too wide runs under the buttons, a
+        // title too narrow elides a name that would have fitted.
+        let width = 300.0;
+        let title_x = BUTTON_GAP + APP_ICON + APP_ICON_GAP;
+        for fixed in [false, true] {
+            let title_w = width - title_x - button_room(fixed);
+            let leftmost = buttons(Rect::new(0.0, 0.0, width, 200.0), fixed)
+                .last()
+                .expect("every frame has buttons")
+                .1;
+            assert!(
+                title_x + title_w <= leftmost.x,
+                "fixed={fixed}: the title ends at {} and the first button starts at {}",
+                title_x + title_w,
+                leftmost.x
+            );
+            // And it stops exactly one gap short, rather than wasting
+            // room a long title could have used.
+            assert_eq!(title_x + title_w + BUTTON_GAP, leftmost.x);
+        }
+        // The icon sits between the left edge and the title, and the two
+        // do not overlap.
+        assert!(BUTTON_GAP + APP_ICON <= title_x);
+    }
+
+    #[test]
+    fn a_hovered_button_takes_a_role_and_close_is_the_only_red_one() {
+        // The red moved from "what a close button looks like" to "what it
+        // looks like when a click would close the window", which is the
+        // whole visual argument of #3715 — so it has to still be there on
+        // hover and nowhere else.
+        let p = Palette::light();
+        assert_eq!(button_hover_role(Region::Close), Role::TitleClose);
+        assert_eq!(button_hover_role(Region::Maximize), Role::TitleButtonHover);
+        assert_eq!(button_hover_role(Region::Minimize), Role::TitleButtonHover);
+        // A hover disc nobody can see is no affordance: the shared role
+        // has to differ from both title bars, which is why it is its own
+        // role rather than `button_hover` (two units apart from
+        // `title_bar_active` in the light scheme).
+        for scheme in [Palette::light(), Palette::dark()] {
+            let disc = scheme.get(Role::TitleButtonHover);
+            assert_ne!(disc, scheme.get(Role::TitleBarActive));
+            assert_ne!(disc, scheme.get(Role::TitleBarInactive));
+        }
+        // And the glyph on the red disc is the role that exists for ink
+        // on a saturated field, not whichever title colour happens to
+        // read against it.
+        assert_eq!(button_hover_text_role(Region::Close), Role::TextOnAccent);
+        assert_ne!(
+            p.get(button_hover_text_role(Region::Close)),
+            p.get(Role::TitleClose)
+        );
     }
 
     #[test]

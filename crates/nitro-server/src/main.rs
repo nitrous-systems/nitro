@@ -129,6 +129,10 @@ fn config_from_env() -> Result<Config, String> {
         // field exists for the tests, which cannot use an environment
         // variable because they run as threads of one process.
         icon_dirs: None,
+        // The real XDG application directories, for the `app_id →
+        // .desktop → Icon=` hop. A field for the tests, for exactly the
+        // reason `icon_dirs` is one.
+        desktop_dirs: None,
     })
 }
 

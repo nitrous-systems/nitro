@@ -26,7 +26,7 @@
 //! PNGs and a container has none.
 
 use nitro_server::icon_theme::IconTheme;
-use nitro_server::icons::IconEngine;
+use nitro_server::icons::{AppIcon, IconEngine};
 
 /// Icon names to look for, chosen to span the ways a theme is laid out
 /// rather than to be present.
@@ -160,6 +160,11 @@ fn the_engine_loads_a_real_application_icon_at_the_size_it_was_asked_for() {
     // be 24 square or the blit's one-to-one fast path silently becomes a
     // scaled one.
     let mut engine = IconEngine::with_theme("hicolor");
+    // No `.desktop` indirection here: this test is about the *theme*
+    // half, and a box whose `/usr/share/applications` happens to carry an
+    // entry for one of the probe names would silently change which file
+    // is being decoded. The hop has its own tests, against fixtures.
+    engine.set_desktop_dirs(Vec::new());
     if !engine.has_app_icons() {
         eprintln!("skipping: no icon theme installed");
         return;
@@ -167,9 +172,14 @@ fn the_engine_loads_a_real_application_icon_at_the_size_it_was_asked_for() {
 
     let mut loaded = 0usize;
     for name in NAMES {
-        let Some(handle) = engine.lookup_app(name) else {
+        let Some(icon) = engine.lookup_app(name) else {
             continue;
         };
+        assert!(
+            matches!(icon, AppIcon::Theme(_)),
+            "{name} answered from the symbolic set with no .desktop index"
+        );
+        let handle = icon.handle();
         for px in [16u32, 24, 32] {
             if engine.app_tile_len(handle, px).is_none() {
                 // A name that resolved but whose file will not decode is

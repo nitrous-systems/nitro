@@ -17,12 +17,12 @@ use std::path::PathBuf;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use nitro_core::{Color, Rect, Role, Size};
+use nitro_core::{Color, Palette, Rect, Role, Size};
 use nitro_kms::Image;
 use nitro_server::{Config, run};
 use nitro_wire::client::Connection;
 use nitro_wire::msg::ServerMsg;
-use nitro_wire::types::{ErrorCode, Layer, NodeId, caps};
+use nitro_wire::types::{ErrorCode, Layer, NodeId, caps, window_flags};
 
 const OUT: (u32, u32) = (640, 480);
 const WIN: Size = Size::new(200.0, 120.0);
@@ -44,6 +44,7 @@ struct Harness {
     config_dir: PathBuf,
     config_path: PathBuf,
     icon_dir: PathBuf,
+    desktop_dir: PathBuf,
     thread: Option<JoinHandle<Result<(), nitro_server::Error>>>,
 }
 
@@ -64,6 +65,22 @@ impl Harness {
     }
 
     fn start_with_icons(name: &str, conf: &str, app_icons: bool) -> Self {
+        Self::start_full(name, conf, app_icons, &[])
+    }
+
+    /// A harness with an icon fixture tree **and** a `.desktop` fixture
+    /// directory holding `(basename, Icon=)` entries.
+    ///
+    /// The third resolution step (#3715) reads files the distribution
+    /// wrote, so it gets a fixture directory for exactly the reason the
+    /// icon tree has one: a test pointed at the box's own
+    /// `/usr/share/applications` would resolve `nitro-calc` on a
+    /// packager's machine and nowhere else.
+    fn start_with_desktop(name: &str, conf: &str, entries: &[(&str, &str)]) -> Self {
+        Self::start_full(name, conf, true, entries)
+    }
+
+    fn start_full(name: &str, conf: &str, app_icons: bool, entries: &[(&str, &str)]) -> Self {
         let dir = std::env::temp_dir().join(format!("nitro-icons-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("nitro").join("control.sock");
@@ -72,6 +89,7 @@ impl Harness {
         std::fs::create_dir_all(&config_dir).expect("config dir");
         std::fs::write(&config_path, conf).expect("write server.conf");
         let icon_dir = dir.join("icons");
+        let desktop_dir = dir.join("applications");
 
         let mut config = Config::fake(OUT.0, OUT.1, &path);
         config.config_path = Some(config_path.clone());
@@ -89,6 +107,15 @@ impl Harness {
             .expect("index.theme");
             config.icon_dirs = Some(vec![icon_dir.clone()]);
         }
+        std::fs::create_dir_all(&desktop_dir).expect("applications dir");
+        for (basename, icon) in entries {
+            std::fs::write(
+                desktop_dir.join(format!("{basename}.desktop")),
+                format!("[Desktop Entry]\nType=Application\nName={basename}\nIcon={icon}\n"),
+            )
+            .expect("a desktop entry");
+        }
+        config.desktop_dirs = Some(vec![desktop_dir.clone()]);
         let wire_path = config.wire_path.clone();
         let shell_path = config.shell_path.clone();
         let thread = std::thread::spawn(move || run(config));
@@ -99,6 +126,7 @@ impl Harness {
             config_dir,
             config_path,
             icon_dir,
+            desktop_dir,
             thread: Some(thread),
         };
         wait_for("the control socket", || {
@@ -167,6 +195,21 @@ impl Harness {
             .join("apps");
         std::fs::create_dir_all(&dir).expect("the apps directory");
         std::fs::write(dir.join(format!("{name}.png")), solid_png(side, rgb)).expect("the icon");
+    }
+
+    /// Write a `.desktop` entry into the harness's applications
+    /// directory after the server has started.
+    ///
+    /// The index is built at start and again on `reload`, so an entry
+    /// installed here is invisible until a `reload` happens — which is
+    /// exactly the property
+    /// `a_reload_rescans_the_desktop_index` is about.
+    fn install_desktop_entry(&self, basename: &str, icon: &str) {
+        std::fs::write(
+            self.desktop_dir.join(format!("{basename}.desktop")),
+            format!("[Desktop Entry]\nType=Application\nName={basename}\nIcon={icon}\n"),
+        )
+        .expect("a desktop entry");
     }
 
     fn shot(&self) -> Image {
@@ -250,6 +293,15 @@ fn expect<T>(
 
 /// A window with a flat backdrop and one icon node in its top-left
 /// corner, returning the window root and the `Configure` that placed it.
+///
+/// **Undecorated**, and that is load-bearing since #3715: a decorated
+/// frame draws its own icons — the app icon and three button glyphs — so
+/// a counter like `icon_renders` would answer about four icons plus the
+/// one under test. These tests are about the *client's* icon, so the
+/// frame is opted out of rather than subtracted, which would be a
+/// magic number that silently goes stale the day the frame changes.
+/// `crates/nitro-server/tests/wm.rs` is where the frame's own icons are
+/// counted.
 fn window_with_icon(
     conn: &mut Connection,
     seen: &mut Vec<ServerMsg>,
@@ -260,7 +312,7 @@ fn window_with_icon(
     let back = NodeId(2);
     let icon = NodeId(3);
     conn.tx()
-        .create_window_with(root, "icons", WIN, Layer::Normal, 0)
+        .create_window_with(root, "icons", WIN, Layer::Normal, window_flags::UNDECORATED)
         .create_rect(back, root, Rect::new(0.0, 0.0, WIN.w, WIN.h))
         .fill_solid(back, BACKDROP)
         .create_icon(icon, root, Rect::new(0.0, 0.0, size, size))
@@ -383,7 +435,8 @@ fn crc32(data: &[u8]) -> u32 {
 }
 
 /// A window with a flat backdrop and one **coloured** application icon
-/// node, the `AS_COLOURED` twin of [`window_with_icon`].
+/// node, the `AS_COLOURED` twin of [`window_with_icon`]. Undecorated for
+/// the same reason.
 fn window_with_app_icon(
     conn: &mut Connection,
     seen: &mut Vec<ServerMsg>,
@@ -394,7 +447,7 @@ fn window_with_app_icon(
     let back = NodeId(2);
     let icon = NodeId(3);
     conn.tx()
-        .create_window_with(root, "icons", WIN, Layer::Normal, 0)
+        .create_window_with(root, "icons", WIN, Layer::Normal, window_flags::UNDECORATED)
         .create_rect(back, root, Rect::new(0.0, 0.0, WIN.w, WIN.h))
         .fill_solid(back, BACKDROP)
         .create_icon(icon, root, Rect::new(0.0, 0.0, size, size))
@@ -795,6 +848,225 @@ fn a_settled_desktop_re_rasterises_nothing() {
     );
     assert_eq!(h.stat("icon_renders"), renders);
     assert_eq!(h.stat("icons_cached"), 1);
+
+    drop(conn);
+    h.quit();
+}
+
+// ---------------------------------------------------------------------
+// #3715: the third lookup step — app_id → .desktop → Icon=
+// ---------------------------------------------------------------------
+
+/// An app id the theme has never heard of resolves through its
+/// `.desktop` file to one of the server's **own** symbolic shapes, and
+/// is drawn tinted.
+///
+/// This is the defect the step exists for, end to end through the real
+/// server: `nitro-calc` is an app id, `calculator` is the shape, and the
+/// only thing on the machine that ties them together is
+/// `deploy/nitro-calc.desktop`. Before #3715 the bar showed the generic
+/// `window` glyph for every one of our own applications.
+#[test]
+fn an_app_id_resolves_through_a_desktop_entry_to_a_symbolic_icon() {
+    let h = Harness::start_with_desktop("indirect", "", &[("nitro-calc", "calculator")]);
+    let mut seen = Vec::new();
+    let mut conn = h.client("indirect");
+    // `AS_COLOURED`, as `nitro-bar` sends for a window-list button: the
+    // client asks for the app id and knows nothing about `.desktop`
+    // files, which is the whole point of putting the hop in the server.
+    let (_root, c) = window_with_app_icon(&mut conn, &mut seen, "nitro-calc", 16.0);
+    h.settle();
+
+    // No `BadIcon`: the name resolved, so the client's fallback never
+    // had to fire.
+    assert!(
+        !seen.iter().any(|m| matches!(m, ServerMsg::Error(_))),
+        "the indirected name was refused: {seen:?}"
+    );
+
+    // And it is drawn **tinted**, not blitted: the pixels are the
+    // palette's `text`, which is what a coverage mask composited over
+    // the backdrop gives and what a coloured PNG could not.
+    let px = icon_box(&h.shot(), &c, 16);
+    let back = u32::from(BACKDROP.r) << 16 | u32::from(BACKDROP.g) << 8 | u32::from(BACKDROP.b);
+    let text = Palette::default().get(Role::Text);
+    let tint = u32::from(text.r) << 16 | u32::from(text.g) << 8 | u32::from(text.b);
+    let ink = px.iter().filter(|p| **p != back).count();
+    assert!(ink > 20, "only {ink} px of ink in the icon box");
+    assert!(
+        px.contains(&tint),
+        "the indirected icon is not painted in a palette role, so it was \
+         not resolved to the symbolic set"
+    );
+
+    // The counters say which path answered, which is the half a pixel
+    // test cannot: a symbolic answer rasterises a mask and decodes no
+    // file at all.
+    assert_eq!(h.stat("icon_renders"), 1);
+    assert_eq!(h.stat("app_icon_loads"), 0, "nothing was decoded");
+    assert_eq!(h.stat("desktop_entries"), 1);
+    assert_eq!(h.stat("app_icon_indirections"), 1);
+
+    drop(conn);
+    h.quit();
+}
+
+/// The same hop landing in the icon **theme** instead: the `Icon=` names
+/// a PNG, so the tile is blitted in its own colours and `AS_COLOURED`
+/// survives all the way to the node.
+#[test]
+fn an_indirected_name_that_is_a_theme_png_keeps_its_own_colours() {
+    let h = Harness::start_with_desktop(
+        "indirect-png",
+        "",
+        &[("org.example.Browser", "browser-art")],
+    );
+    h.install_app_icon("browser-art", 48, 0x00c8_6414);
+    let mut seen = Vec::new();
+    let mut conn = h.client("indirect-png");
+    let (_root, c) = window_with_app_icon(&mut conn, &mut seen, "org.example.Browser", 24.0);
+    h.settle();
+
+    let px = icon_box(&h.shot(), &c, 24);
+    let hits = px.iter().filter(|p| **p == 0x00c8_6414).count();
+    assert!(
+        hits > 400,
+        "only {hits} px of the file's own colour: a tinted mask, not a blit"
+    );
+    assert_eq!(h.stat("icon_renders"), 0, "nothing symbolic was rasterised");
+    assert_eq!(h.stat("app_icon_loads"), 1, "decoded exactly once");
+    assert_eq!(h.stat("app_icon_indirections"), 1);
+
+    drop(conn);
+    h.quit();
+}
+
+/// The theme still wins, the hop is one deep, and a name with neither is
+/// still a `BadIcon`.
+///
+/// Three rules in one server because each is a *negative*: the cheapest
+/// way to get them wrong is to have no test at all, and the cheapest way
+/// to have one is to put them where a fixture already exists.
+#[test]
+fn the_desktop_hop_is_one_deep_and_never_shadows_the_theme() {
+    let h = Harness::start_with_desktop(
+        "indirect-rules",
+        "",
+        &[
+            // The theme has `direct`, so the entry must not be consulted:
+            // a `.desktop` is what answers a name the theme could not,
+            // never an override of one it could.
+            ("direct", "wrong-art"),
+            // `a` names `b`, and `b` is itself only an entry. One hop, so
+            // the chain stops and `a` is refused.
+            ("a", "b"),
+            ("b", "direct-art"),
+        ],
+    );
+    h.install_app_icon("direct", 32, 0x0011_2233);
+    h.install_app_icon("direct-art", 32, 0x0044_5566);
+    h.install_app_icon("wrong-art", 32, 0x0077_8899);
+    let mut seen = Vec::new();
+    let mut conn = h.client("indirect-rules");
+    let (_root, c) = window_with_app_icon(&mut conn, &mut seen, "direct", 32.0);
+    h.settle();
+    let px = icon_box(&h.shot(), &c, 32);
+    assert!(
+        px.iter().filter(|p| **p == 0x0011_2233).count() > 600,
+        "the .desktop entry shadowed the theme's own file"
+    );
+    assert_eq!(h.stat("app_icon_indirections"), 0, "no hop was needed");
+
+    // `a` needs two hops, which is one more than there is.
+    seen.clear();
+    conn.tx()
+        .set_icon(NodeId(3), "a", 32.0, nitro_wire::msg::SetIcon::AS_COLOURED)
+        .commit(2)
+        .unwrap();
+    conn.flush().unwrap();
+    let code = expect(&mut conn, &mut seen, "an Error for a", |m| match m {
+        ServerMsg::Error(e) => Some(e.code),
+        _ => None,
+    });
+    assert_eq!(code, ErrorCode::BadIcon, "the hop recursed");
+
+    // And a name with neither an entry nor a file is refused as before.
+    seen.clear();
+    conn.tx()
+        .set_icon(
+            NodeId(3),
+            "no-such-anything",
+            32.0,
+            nitro_wire::msg::SetIcon::AS_COLOURED,
+        )
+        .commit(3)
+        .unwrap();
+    conn.flush().unwrap();
+    let code = expect(&mut conn, &mut seen, "an Error", |m| match m {
+        ServerMsg::Error(e) => Some(e.code),
+        _ => None,
+    });
+    assert_eq!(code, ErrorCode::BadIcon);
+    assert_eq!(h.stat("clients"), 1, "and the client survived both");
+
+    drop(conn);
+    h.quit();
+}
+
+/// A `reload` re-scans the `.desktop` index, so an application installed
+/// while the desktop is running gets its icon.
+///
+/// The index is built once at start, which is right — a `read_dir` per
+/// unresolved name on the commit path would be filesystem work on the
+/// client's first-paint latency — but that makes `reload` the only
+/// moment it can notice a package arriving. Before the reload the name
+/// is a `BadIcon`, which is the honest answer rather than a blank node.
+#[test]
+fn a_reload_rescans_the_desktop_index() {
+    let h = Harness::start_with_desktop("indirect-reload", "", &[]);
+    let mut seen = Vec::new();
+    let mut conn = h.client("indirect-reload");
+    let (_root, c) = window_with_app_icon(&mut conn, &mut seen, "nitro-settings", 16.0);
+    let code = expect(&mut conn, &mut seen, "an Error", |m| match m {
+        ServerMsg::Error(e) => Some(e.code),
+        _ => None,
+    });
+    assert_eq!(code, ErrorCode::BadIcon, "nothing answers it yet");
+    assert_eq!(h.stat("desktop_entries"), 0);
+
+    // The package lands, and the user reloads.
+    h.install_desktop_entry("nitro-settings", "gear");
+    let reloads = h.stat("config_reloads");
+    h.rewrite_config("# touched\n");
+    // The state being measured has to have actually happened: a write
+    // the watch missed would make every assertion below a tautology.
+    wait_for("the config reload", || h.stat("config_reloads") > reloads);
+    h.settle();
+    assert_eq!(h.stat("desktop_entries"), 1, "the index was re-scanned");
+
+    // The same name, re-sent as the client's next repaint would: now it
+    // resolves, and it draws.
+    seen.clear();
+    conn.tx()
+        .set_icon(
+            NodeId(3),
+            "nitro-settings",
+            16.0,
+            nitro_wire::msg::SetIcon::AS_COLOURED,
+        )
+        .commit(2)
+        .unwrap();
+    conn.flush().unwrap();
+    h.settle();
+    assert!(
+        !seen.iter().any(|m| matches!(m, ServerMsg::Error(_))),
+        "still refused after the reload: {seen:?}"
+    );
+    let px = icon_box(&h.shot(), &c, 16);
+    let back = u32::from(BACKDROP.r) << 16 | u32::from(BACKDROP.g) << 8 | u32::from(BACKDROP.b);
+    let ink = px.iter().filter(|p| **p != back).count();
+    assert!(ink > 20, "only {ink} px of ink after the reload");
+    assert_eq!(h.stat("app_icon_indirections"), 1);
 
     drop(conn);
     h.quit();

@@ -460,6 +460,21 @@ impl Node {
         }
     }
 
+    /// Icon reference; `None` unless this is an `Icon` node with an icon.
+    ///
+    /// The twin of [`Node::text`], and it exists for the same reason: the
+    /// *server* sets these on the nodes it owns (a window frame's app
+    /// icon and its buttons) and then has to re-tint them on a focus
+    /// change, which means reading back the handle and the size it
+    /// already stored rather than keeping a shadow copy that could
+    /// disagree with the scene.
+    pub fn icon(&self) -> Option<IconRef> {
+        match self.data {
+            NodeData::Icon(i) => i,
+            _ => None,
+        }
+    }
+
     /// Transform from the node's local space (origin at its top-left corner)
     /// to device pixels. Cached; valid after `update`.
     pub fn world_transform(&self) -> Transform {

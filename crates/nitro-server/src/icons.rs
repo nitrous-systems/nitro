@@ -86,6 +86,7 @@ use std::time::Instant;
 use nitro_core::{Color, IRect, Palette, Point, Rect, Role, Transform};
 use nitro_raster::{Canvas, Image as RasterImage, Mask, PixelFormat};
 
+use crate::desktop_index::DesktopIndex;
 use crate::icon_theme::IconTheme;
 use crate::{debug, warn};
 
@@ -142,6 +143,55 @@ enum Resolved {
     Missing,
 }
 
+/// Which of the server's two icon sets answered an application name, and
+/// the handle into it.
+///
+/// The distinction exists because of the `.desktop` hop (#3715): an
+/// `AS_COLOURED` request for `nitro-calc` resolves, through
+/// `deploy/nitro-calc.desktop`'s `Icon=calculator`, to one of the
+/// **server's own symbolic** shapes — which has no colours of its own and
+/// so has to be drawn tinted. The caller therefore needs to know *which*
+/// set answered before it can pick the role byte to store in the scene:
+/// [`Self::Theme`] keeps `AS_COLOURED`, [`Self::Symbolic`] takes a
+/// palette role.
+///
+/// This is the same mixed-tint rule the toolkit's own fallback already
+/// applies client-side (`nitro-ui`'s `icon_fallback_tinted` sends its
+/// fallback with `Role::Text` rather than `AS_COLOURED`), and it is now
+/// the server's too — which is what makes it work for `nitro-bar`, whose
+/// name is an app id and whose fallback therefore never fired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppIcon {
+    /// A file in the machine's icon theme: painted with `AS_COLOURED`, in
+    /// its own colours.
+    Theme(u32),
+    /// One of the server's compiled-in shapes, reached through a
+    /// `.desktop` file's `Icon=`: painted tinted, like any symbolic icon.
+    Symbolic(u32),
+}
+
+impl AppIcon {
+    /// The handle, whichever set it is into.
+    #[must_use]
+    pub fn handle(self) -> u32 {
+        match self {
+            Self::Theme(i) | Self::Symbolic(i) => i,
+        }
+    }
+
+    /// The `role` byte a scene node holding this icon must carry:
+    /// `AS_COLOURED` for a theme file, `tint` for a symbolic shape.
+    #[must_use]
+    pub fn role(self, tint: Role) -> u8 {
+        match self {
+            Self::Theme(_) => nitro_scene::IconRef::AS_COLOURED,
+            // The cast is exact: `Role` is `repr(u8)`, so its index
+            // cannot exceed 255 by construction.
+            Self::Symbolic(_) => tint.index() as u8,
+        }
+    }
+}
+
 /// The icon set, the rasteriser and the mask cache.
 ///
 /// One instance lives in the event loop, beside the [`TextEngine`]. It is
@@ -161,6 +211,18 @@ pub struct IconEngine {
     /// A search path fixed at construction, overriding the XDG one. See
     /// [`IconEngine::with_dirs`].
     dirs: Option<Vec<PathBuf>>,
+    /// `basename -> Icon=` over the XDG application directories: the
+    /// third resolution step, added by #3715. See
+    /// [`IconEngine::resolve_indirect`] and [`crate::desktop_index`].
+    desktop: DesktopIndex,
+    /// A `.desktop` search path fixed at construction, as `dirs` is for
+    /// icons and for the same reason.
+    desktop_dirs: Option<Vec<PathBuf>>,
+    /// How many names were answered by going through a `.desktop` file
+    /// rather than by the theme directly — the `app_icon_indirections`
+    /// stat, and the number that says whether the hop is earning its
+    /// index.
+    app_indirections: u64,
     /// Application icon **names** a client has asked for, in the order
     /// they were first seen. The index into this is what the scene
     /// stores, exactly as [`nitro_icons::index_of`] is for the symbolic
@@ -229,6 +291,18 @@ impl IconEngine {
         e
     }
 
+    /// Fix the `.desktop` search path, as [`Self::with_dirs`] fixes the
+    /// icon one and for the same reason: an index built from the
+    /// developer's own `/usr/share/applications` would make a test's
+    /// answer depend on what that box has installed.
+    ///
+    /// Called at construction, before anything has resolved a name; it
+    /// re-scans immediately, so the index is never half-built.
+    pub fn set_desktop_dirs(&mut self, dirs: Vec<PathBuf>) {
+        self.desktop_dirs = Some(dirs);
+        self.rescan_desktop();
+    }
+
     /// An engine whose icon search path is exactly `dirs`.
     ///
     /// The hermetic form, for the tests and for [`Config::icon_dirs`]:
@@ -280,6 +354,50 @@ impl IconEngine {
         );
     }
 
+    /// Re-scan the XDG application directories: the `app_id → Icon=`
+    /// index (#3715).
+    ///
+    /// Called at construction and on every `reload` — **unconditionally**,
+    /// unlike [`Self::set_theme`], which the server diffs `theme.icons`
+    /// before calling. The two are diffed differently because they cost
+    /// differently: re-reading the icon theme throws away every decoded
+    /// application tile, so a reload that only moved a monitor must not
+    /// cost the launcher its icons; re-scanning this index throws away
+    /// nothing at all — it is a fresh `basename -> Icon=` map and the
+    /// resolved handles are untouched.
+    ///
+    /// And it has to be unconditional, because there is no setting to
+    /// diff: what changes is the *filesystem*. A package installed while
+    /// the desktop is running is exactly the case this exists for, and no
+    /// key in `server.conf` moves when it happens. `reload` is the moment
+    /// the user says "look again", and nothing here watches the
+    /// directories — a watch on `$XDG_DATA_DIRS` is an inotify descriptor
+    /// per directory for a change that matters once a month.
+    pub fn rescan_desktop(&mut self) {
+        let started = Instant::now();
+        self.desktop = match &self.desktop_dirs {
+            Some(dirs) => DesktopIndex::with_dirs(dirs.clone()),
+            None => DesktopIndex::load(),
+        };
+        debug!(
+            "desktop entries: {} indexed over {} director{} in {:.1} ms",
+            self.desktop.len(),
+            self.desktop.dirs().len(),
+            if self.desktop.dirs().len() == 1 {
+                "y"
+            } else {
+                "ies"
+            },
+            started.elapsed().as_secs_f32() * 1e3
+        );
+    }
+
+    /// The `.desktop` index, for diagnostics and the tests.
+    #[must_use]
+    pub fn desktop(&self) -> &DesktopIndex {
+        &self.desktop
+    }
+
     /// The icon theme in force, for the tests and for diagnostics.
     #[must_use]
     pub fn theme(&self) -> &IconTheme {
@@ -308,25 +426,91 @@ impl IconEngine {
         nitro_icons::index_of(name)
     }
 
-    /// The handle for an **application** icon name, or `None` when the
-    /// machine's icon theme has no such icon.
+    /// The handle for an **application** icon name, or `None` when
+    /// nothing on the machine answers it.
     ///
-    /// Resolution — walking the theme's directories and `stat`ing — happens
-    /// here, at commit time, because this is the call that decides whether
-    /// the client gets a `BadIcon`: a name that cannot be answered must be
-    /// answered *now*, so the client's `.fallback(…)` can re-send inside
-    /// the same interaction rather than a frame later. What does **not**
-    /// happen here is the decode: that is milliseconds, it depends on the
-    /// device size the node has not been laid out at yet, and it belongs
-    /// on the paint path where it is paid once and cached.
+    /// # The three steps, in order
+    ///
+    /// 1. **The machine's icon theme** ([`crate::icon_theme`]) — what
+    ///    `AS_COLOURED` means, and all #3714 did.
+    /// 2. **`<name>.desktop`'s `Icon=`** ([`crate::desktop_index`]): one
+    ///    hop, added by #3715.
+    /// 3. That `Icon=` value through the **normal symbolic-then-theme**
+    ///    resolution — so `nitro-calc` → `calculator` finds the server's
+    ///    own glyph and `firefox` → `firefox` finds the theme's PNG.
+    ///
+    /// **One hop, and no recursion.** An `Icon=` that resolves nowhere is
+    /// a `BadIcon`, not another `.desktop` lookup: a chain of
+    /// indirections is a cycle waiting to happen and answers no question
+    /// the single hop does not. That is a property of the call graph
+    /// rather than a rule to remember — step 3 calls
+    /// [`Self::lookup_theme`], which cannot reach the index.
+    ///
+    /// # Why the symbolic set is not step 0
+    ///
+    /// The role byte is still the **selector**: a palette role means the
+    /// symbolic set and never looks at anything else, and this function
+    /// is only reached for `AS_COLOURED`. Trying the symbolic set for the
+    /// *requested* name first would be the one-namespace design
+    /// `docs/icons.md` rejects — it would make `icon("list").coloured()`
+    /// mean the desktop's own glyph on every box, invisibly shadowing
+    /// whatever a theme installs.
+    ///
+    /// The symbolic set *is* consulted for the **indirected** name, and
+    /// that is a different question. The `.desktop` file is the
+    /// application's own statement about which shape it wants, so there
+    /// is nothing to shadow: `Icon=calculator` in a file we ship means
+    /// our `calculator`, deliberately.
+    ///
+    /// # When the work happens
+    ///
+    /// Resolution — walking the theme's directories and `stat`ing, plus a
+    /// hash lookup in the index — happens here, at commit time, because
+    /// this is the call that decides whether the client gets a `BadIcon`:
+    /// a name that cannot be answered must be answered *now*, so the
+    /// client's `.fallback(…)` can re-send inside the same interaction
+    /// rather than a frame later. What does **not** happen here is the
+    /// decode: that is milliseconds, it depends on the device size the
+    /// node has not been laid out at yet, and it belongs on the paint
+    /// path where it is paid once and cached.
     ///
     /// A name resolved once keeps its index forever, including the
     /// resolution's answer, so a launcher rebuilding its rows costs one
     /// hash lookup per row and no filesystem at all.
-    pub fn lookup_app(&mut self, name: &str) -> Option<u32> {
+    pub fn lookup_app(&mut self, name: &str) -> Option<AppIcon> {
         if name.is_empty() {
             return None;
         }
+        if let Some(index) = self.lookup_theme(name) {
+            return Some(AppIcon::Theme(index));
+        }
+        // Step 2, the one hop. Owned because resolving the target borrows
+        // `self` mutably; the alternative — threading the index's
+        // lifetime through the theme walk — would save one `String` on a
+        // path that has just `stat`ed a directory tree.
+        let target = self.desktop.icon(name)?.to_owned();
+        if target == name {
+            // `Icon=` naming its own file's basename. It resolved nowhere
+            // above, so it resolves nowhere here either; saying so costs
+            // a comparison and makes the no-recursion rule visible.
+            return None;
+        }
+        let resolved = match nitro_icons::index_of(&target) {
+            Some(symbolic) => AppIcon::Symbolic(symbolic),
+            None => AppIcon::Theme(self.lookup_theme(&target)?),
+        };
+        self.app_indirections += 1;
+        debug!("app icon {name:?} resolved to {target:?} through a .desktop entry");
+        Some(resolved)
+    }
+
+    /// Step 1 alone: the handle for a name the machine's **icon theme**
+    /// has a file for.
+    ///
+    /// Split out of [`Self::lookup_app`] so the indirected name is
+    /// resolved by the same code without being able to take the
+    /// `.desktop` hop a second time.
+    fn lookup_theme(&mut self, name: &str) -> Option<u32> {
         if let Some(index) = self.app_index.get(name).copied() {
             return match self.app_paths.get(&index) {
                 // Known bad: refuse without touching the filesystem, so
@@ -662,6 +846,16 @@ impl IconEngine {
         out.push(("app_icon_misses", self.app_misses));
         out.push(("app_icon_evictions", self.app_evictions));
         out.push(("app_icon_decode_us_max", self.app_decode_us_max));
+        // The `.desktop` hop (#3715). `desktop_entries` is what the index
+        // found — zero on a box with no applications installed, which is
+        // a legitimate state and not a failure — and
+        // `app_icon_indirections` is how many distinct names were
+        // answered through it rather than by the theme directly. The
+        // second is the one that says whether the index is earning its
+        // read: on the test box it should be one per nitro application on
+        // screen, and zero on a desktop of nothing but theme icons.
+        out.push(("desktop_entries", self.desktop.len() as u64));
+        out.push(("app_icon_indirections", self.app_indirections));
     }
 }
 
@@ -901,7 +1095,29 @@ mod tests {
     /// back to the real `/usr/share/icons` the moment a test reloaded,
     /// and its result would depend on the box running it.
     fn themed(dir: &std::path::Path) -> IconEngine {
-        IconEngine::with_dirs(vec![dir.to_path_buf()], "hicolor")
+        let mut e = IconEngine::with_dirs(vec![dir.to_path_buf()], "hicolor");
+        // No `.desktop` directories unless a test asks for some: the
+        // indirection hop reads files the distribution wrote, and an
+        // engine that consulted the box's own `/usr/share/applications`
+        // would answer differently on every machine.
+        e.set_desktop_dirs(Vec::new());
+        e
+    }
+
+    /// The handle a *theme* lookup answered with, for the tests written
+    /// before [`AppIcon`] existed, which are all about the theme half.
+    ///
+    /// It asserts the variant rather than ignoring it: a fixture name
+    /// that started resolving through a `.desktop` file would be a
+    /// different test, and one that passed silently.
+    fn theme_handle(e: &mut IconEngine, name: &str) -> Option<u32> {
+        match e.lookup_app(name) {
+            Some(AppIcon::Theme(i)) => Some(i),
+            Some(AppIcon::Symbolic(i)) => {
+                panic!("{name} resolved to the symbolic set ({i}), not the theme")
+            }
+            None => None,
+        }
     }
 
     /// Write `bytes` to `rel` under `dir`, creating the directories.
@@ -1123,9 +1339,7 @@ mod tests {
             (0xc0, 0x50, 0x30),
         );
         let mut e = themed(&dir);
-        let icon = e
-            .lookup_app("testapp")
-            .expect("the fixture theme has testapp");
+        let icon = theme_handle(&mut e, "testapp").expect("the fixture theme has testapp");
         let mut buf = vec![0u8; 32 * 32 * 4];
         let shot = |e: &mut IconEngine, buf: &mut Vec<u8>| {
             buf.fill(0);
@@ -1184,7 +1398,7 @@ mod tests {
             (0x40, 0x50, 0x60),
         );
         let mut e = themed(&dir);
-        let icon = e.lookup_app("testapp").expect("testapp resolves");
+        let icon = theme_handle(&mut e, "testapp").expect("testapp resolves");
         let small = e.app_tile(icon, 16).expect("16 px decodes").data.clone();
         let big = e.app_tile(icon, 48).expect("48 px decodes").data.clone();
         assert_eq!(e.app_loads, 2);
@@ -1201,16 +1415,20 @@ mod tests {
         let dir = fixture("missing");
         install_png(&dir, "hicolor/48x48/apps/testapp.png", 48, (1, 2, 3));
         let mut e = themed(&dir);
-        assert_eq!(e.lookup_app("no-such-application"), None);
-        assert_eq!(e.lookup_app(""), None, "an empty name clears, never looks");
+        assert_eq!(theme_handle(&mut e, "no-such-application"), None);
+        assert_eq!(
+            theme_handle(&mut e, ""),
+            None,
+            "an empty name clears, never looks"
+        );
         // The name that *does* exist still works afterwards — a failed
         // lookup must not poison the index.
-        assert!(e.lookup_app("testapp").is_some());
+        assert!(theme_handle(&mut e, "testapp").is_some());
         // And a file that is not a PNG is a miss with a log line, not a
         // panic and not a retry on every frame.
         std::fs::write(dir.join("hicolor/48x48/apps/broken.png"), b"not a png")
             .expect("write the broken fixture");
-        let broken = e.lookup_app("broken").expect("the file is there to find");
+        let broken = theme_handle(&mut e, "broken").expect("the file is there to find");
         assert!(e.app_tile(broken, 24).is_none());
         assert_eq!(e.app_misses, 1);
         assert!(e.app_tile(broken, 24).is_none());
@@ -1227,7 +1445,7 @@ mod tests {
         let png = encode_rgba(32, 16, (0x11, 0x22, 0x33));
         install_bytes(&dir, "hicolor/32x32/apps/wide.png", &png);
         let mut e = themed(&dir);
-        let icon = e.lookup_app("wide").expect("wide resolves");
+        let icon = theme_handle(&mut e, "wide").expect("wide resolves");
         let tile = e.app_tile(icon, 32).expect("decodes").data.clone();
         let at = |x: usize, y: usize| tile[(y * 32 + x) * 4 + 3];
         assert_eq!(at(16, 16), 0xff, "the middle band is the artwork");
@@ -1254,9 +1472,7 @@ mod tests {
         let mut e = themed(&dir);
         let mut handles = Vec::new();
         for n in 0..3 {
-            let h = e
-                .lookup_app(&format!("app{n}"))
-                .expect("the fixture has it");
+            let h = theme_handle(&mut e, &format!("app{n}")).expect("the fixture has it");
             e.app_tile(h, 48).expect("decodes");
             handles.push(h);
         }
@@ -1289,7 +1505,7 @@ mod tests {
         let dir = fixture("retheme");
         install_png(&dir, "hicolor/48x48/apps/testapp.png", 48, (1, 2, 3));
         let mut e = themed(&dir);
-        let icon = e.lookup_app("testapp").expect("testapp resolves");
+        let icon = theme_handle(&mut e, "testapp").expect("testapp resolves");
         e.app_tile(icon, 24).expect("decodes");
         assert_eq!(e.app_cache.len(), 1);
         assert!(e.app_bytes > 0);
@@ -1299,7 +1515,7 @@ mod tests {
         assert_eq!(e.app_bytes, 0);
         assert_eq!(
             e.lookup_app("testapp"),
-            Some(icon),
+            Some(AppIcon::Theme(icon)),
             "and the handle did not move"
         );
 
@@ -1343,7 +1559,7 @@ mod tests {
                 "{key} is missing or not zero on a fresh engine: {pairs:?}"
             );
         }
-        let icon = e.lookup_app("testapp").expect("testapp resolves");
+        let icon = theme_handle(&mut e, "testapp").expect("testapp resolves");
         e.app_tile(icon, 32).expect("decodes");
         let mut pairs = Vec::new();
         e.write_pairs(&mut pairs);
@@ -1352,6 +1568,134 @@ mod tests {
         assert_eq!(get("app_icon_bytes"), 32 * 32 * 4);
         assert_eq!(get("app_icon_loads"), 1);
         assert_eq!(get("app_icon_misses"), 0);
+    }
+
+    /// A fixture with both an icon tree and an applications tree.
+    fn indirecting(dir: &std::path::Path, entries: &[(&str, &str)]) -> IconEngine {
+        let apps = dir.join("applications");
+        std::fs::create_dir_all(&apps).expect("the applications directory");
+        for (name, icon) in entries {
+            std::fs::write(
+                apps.join(format!("{name}.desktop")),
+                format!("[Desktop Entry]\nType=Application\nName={name}\nIcon={icon}\n"),
+            )
+            .expect("write a desktop entry");
+        }
+        let mut e = IconEngine::with_dirs(vec![dir.to_path_buf()], "hicolor");
+        e.set_desktop_dirs(vec![apps]);
+        e
+    }
+
+    #[test]
+    fn an_app_id_the_theme_lacks_is_answered_by_its_desktop_entry() {
+        // The defect #3715 exists for: `nitro-calc` is an app id, not an
+        // icon name, so every nitro application in the bar's window list
+        // showed the `window` fallback. The fact that ties the two
+        // together is `Icon=calculator` in `deploy/nitro-calc.desktop`,
+        // and this is the server consulting it.
+        let dir = fixture("indirect-symbolic");
+        let mut e = indirecting(
+            &dir,
+            &[("nitro-calc", "calculator"), ("nitro-settings", "gear")],
+        );
+        // Symbolic, because `calculator` is one of *our* shapes — so the
+        // node has to store a palette role, not `AS_COLOURED`, or it
+        // would look the handle up in the application cache and draw an
+        // empty box.
+        let calc = e.lookup_app("nitro-calc").expect("the .desktop hop");
+        assert_eq!(
+            calc,
+            AppIcon::Symbolic(nitro_icons::index_of("calculator").unwrap())
+        );
+        assert_eq!(calc.role(Role::Text), Role::Text.index() as u8);
+        assert_eq!(
+            e.lookup_app("nitro-settings").map(AppIcon::handle),
+            nitro_icons::index_of("gear"),
+        );
+        // An app id with no entry and no theme file is still a `BadIcon`.
+        assert_eq!(e.lookup_app("no-such-app"), None);
+        let mut pairs = Vec::new();
+        e.write_pairs(&mut pairs);
+        let get = |key: &str| pairs.iter().find(|(k, _)| *k == key).map_or(0, |(_, v)| *v);
+        assert_eq!(get("desktop_entries"), 2);
+        assert_eq!(get("app_icon_indirections"), 2);
+        assert_eq!(
+            get("app_icon_loads"),
+            0,
+            "a symbolic answer decodes nothing"
+        );
+    }
+
+    #[test]
+    fn an_indirected_name_may_also_be_a_theme_png() {
+        // `firefox` with `Icon=firefox-nightly`: the hop lands in the
+        // theme, not in the symbolic set, and the node keeps
+        // `AS_COLOURED` so the artwork is blitted in its own colours.
+        let dir = fixture("indirect-theme");
+        install_png(&dir, "hicolor/48x48/apps/browser-icon.png", 48, (7, 8, 9));
+        let mut e = indirecting(&dir, &[("org.example.Browser", "browser-icon")]);
+        let icon = e.lookup_app("org.example.Browser").expect("the hop");
+        assert!(matches!(icon, AppIcon::Theme(_)));
+        assert_eq!(
+            icon.role(Role::Text),
+            nitro_scene::IconRef::AS_COLOURED,
+            "a coloured PNG keeps its own colours"
+        );
+        assert_eq!(e.app_name(icon.handle()), Some("browser-icon"));
+        // And it decodes at the size asked for, like any theme icon.
+        assert_eq!(
+            e.app_tile_len(icon.handle(), 24),
+            Some(24 * 24 * 4),
+            "the indirected name is a normal theme handle from here on"
+        );
+    }
+
+    #[test]
+    fn the_theme_wins_over_the_desktop_entry_and_the_hop_never_recurses() {
+        let dir = fixture("indirect-order");
+        // A name the theme *has*: the entry must not be consulted at all,
+        // because a `.desktop` is the fallback for a name the theme could
+        // not answer, not an override of one it could.
+        install_png(&dir, "hicolor/48x48/apps/direct.png", 48, (1, 1, 1));
+        install_png(&dir, "hicolor/48x48/apps/other.png", 48, (2, 2, 2));
+        let mut e = indirecting(
+            &dir,
+            &[
+                ("direct", "other"),
+                // One hop and no further: `a`'s `Icon=b` names a file
+                // that is itself only a `.desktop` basename, so the
+                // chain `a -> b -> c` must stop at `b` and refuse.
+                ("a", "b"),
+                ("b", "c"),
+                // A self-naming entry, the degenerate cycle.
+                ("loop", "loop"),
+            ],
+        );
+        let direct = e.lookup_app("direct").expect("the theme has it");
+        assert_eq!(e.app_name(direct.handle()), Some("direct"));
+        assert_eq!(e.lookup_app("a"), None, "one hop, never two");
+        assert_eq!(e.lookup_app("loop"), None, "and never itself");
+        let mut pairs = Vec::new();
+        e.write_pairs(&mut pairs);
+        let get = |key: &str| pairs.iter().find(|(k, _)| *k == key).map_or(0, |(_, v)| *v);
+        assert_eq!(
+            get("app_icon_indirections"),
+            0,
+            "nothing was answered by the hop: {pairs:?}"
+        );
+    }
+
+    #[test]
+    fn a_palette_role_never_takes_the_desktop_hop() {
+        // The selector rule, which the third step must not weaken: a
+        // *tinted* request is the symbolic set and only ever the symbolic
+        // set. If `lookup` consulted the index, `icon("nitro-calc")` with
+        // `Role::Text` would start working — and `icon("list")` would
+        // start meaning whatever a `list.desktop` on the box says.
+        let dir = fixture("indirect-selector");
+        let e = indirecting(&dir, &[("nitro-calc", "calculator")]);
+        assert_eq!(e.lookup("nitro-calc"), None);
+        assert!(e.lookup("calculator").is_some());
     }
 
     #[test]

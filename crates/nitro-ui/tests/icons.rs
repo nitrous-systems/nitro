@@ -50,6 +50,29 @@ fn set_icons(h: &Harness<()>) -> usize {
     h.mutations().iter().filter(|m| m.op == "SetIcon").count()
 }
 
+/// How many icons the **server's own decorations** rasterised.
+///
+/// Since #3715 a decorated window's title bar carries an application
+/// icon and three symbolic button glyphs, all of them the server's own
+/// nodes — so `icon_renders` is no longer "what this client asked for".
+/// Every assertion in this file that used to read a bare count now reads
+/// the difference from this baseline, **measured** on a harness with a
+/// window and no client icon at all rather than written down as a
+/// constant: a hard-coded 4 would go stale the day the frame changes,
+/// and would go stale silently, because the number would still look
+/// plausible.
+fn frame_icon_renders() -> u64 {
+    let h = Harness::sized(
+        "icon-baseline",
+        (),
+        Size::new(200.0, 160.0),
+        |ui: &mut Ui<()>| ui.build(column().child(label("no icons here"))),
+    );
+    let n = h.server().stat("icon_renders");
+    h.quit();
+    n
+}
+
 /// The pixels of a widget's box, as `0x00rrggbb`.
 fn crop(h: &Harness<()>, rect: nitro_ui::Rect) -> Vec<u32> {
     let img = h.shot();
@@ -213,6 +236,7 @@ fn an_icon_button_never_creates_an_icon_node_without_the_capability() {
     // repaint merely reuses it. The build closure runs before any paint,
     // so the bit is masked there — which is also exactly the state a
     // real app starts in against a real old server.
+    let base = frame_icon_renders();
     let mut h = Harness::sized(
         "button-icon-never",
         (),
@@ -246,7 +270,7 @@ fn an_icon_button_never_creates_an_icon_node_without_the_capability() {
     assert_eq!(h.server().stat("windows"), 1);
     assert_eq!(
         h.server().stat("icon_renders"),
-        0,
+        base,
         "the server rasterised an icon for a client that was told it had none"
     );
 
@@ -398,7 +422,7 @@ fn an_unknown_icon_name_leaves_the_app_running() {
     assert_eq!(h.server().stat("clients"), 1, "the client survived");
     assert_eq!(h.server().stat("windows"), 1);
     // And it drew nothing for the bad name.
-    assert_eq!(h.server().stat("icon_renders"), 0);
+    assert_eq!(h.server().stat("icon_renders"), frame_icon_renders());
     h.quit();
 }
 
@@ -442,6 +466,7 @@ fn a_coloured_icon_sends_the_as_coloured_role() {
     // the `SetIcon` count and the server's reaction say what actually
     // left the process. A test of the widget alone would pass against a
     // `paint` that never called `cx.icon_tinted` at all.
+    let base = frame_icon_renders();
     let mut h = Harness::sized(
         "icon-coloured",
         (),
@@ -495,7 +520,7 @@ fn a_coloured_icon_sends_the_as_coloured_role() {
     // hit the symbolic set too and pushed `icon_renders` to 2.
     assert_eq!(
         h.server().stat("icon_renders"),
-        1,
+        base + 1,
         "the coloured icon was rasterised from the symbolic set, so the \
          role byte did not survive the trip"
     );
@@ -526,6 +551,7 @@ fn a_bad_icon_falls_back_exactly_once() {
     // the icon theme for `gear`, earn a second `BadIcon` and leave a
     // blank box — which is exactly the case this feature exists to
     // survive, so the test takes the path the consumers take.
+    let base = frame_icon_renders();
     let mut h = Harness::sized(
         "icon-fallback",
         (),
@@ -569,7 +595,7 @@ fn a_bad_icon_falls_back_exactly_once() {
     // "the widget's field changed" from "the icon is on the screen".
     assert_eq!(
         h.server().stat("icon_renders"),
-        1,
+        base + 1,
         "the fallback name never reached the server"
     );
 
@@ -600,7 +626,7 @@ fn a_bad_icon_falls_back_exactly_once() {
     );
     // Nothing was re-rasterised either, which is the same claim from the
     // server's side: the settled tree is genuinely settled.
-    assert_eq!(h.server().stat("icon_renders"), 1);
+    assert_eq!(h.server().stat("icon_renders"), base + 1);
 
     assert_eq!(h.server().stat("clients"), 1, "the client survived");
     h.quit();
@@ -682,7 +708,7 @@ fn a_bad_fallback_does_not_loop() {
     assert_eq!(h.server().stat("windows"), 1);
     assert_eq!(
         h.server().stat("icon_renders"),
-        0,
+        frame_icon_renders(),
         "neither nonsense name should have rasterised anything"
     );
     h.quit();

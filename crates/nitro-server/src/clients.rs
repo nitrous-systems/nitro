@@ -31,7 +31,7 @@
 use std::collections::HashMap;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
-use nitro_core::{IRect, Rect, Size};
+use nitro_core::{IRect, Rect, Role, Size};
 use nitro_scene::{
     Border, BufferDesc, BufferKey, ClientId, Error as SceneError, Fill as SceneFill, IconRef,
     ImageRef, NodeKey, NodeKind as SceneNodeKind, Scene, TextAlign, TextRef, WindowFlags,
@@ -264,6 +264,15 @@ pub struct ApplyOutcome {
     pub state_requests: Vec<(WindowKey, WindowState)>,
     /// Windows whose title changed, so the server can redraw the title bar.
     pub retitled: Vec<WindowKey>,
+    /// Windows whose `app_id` changed, so the server can re-resolve the
+    /// icon in their title bar.
+    ///
+    /// Separate from `relisted` for the reason `retitled` is: an app id
+    /// change is three different jobs — tell the bar its list entry
+    /// moved, re-resolve the frame's icon, and *not* reshape the title —
+    /// and a list that conflated them would do the expensive one on every
+    /// message that touched a window.
+    pub reiconed: Vec<WindowKey>,
     /// Windows something in the shell's `WindowInfo` changed on — a title,
     /// an app id. Separate from `retitled` because the two answer different
     /// questions: `retitled` is "reshape the title bar", and this is "tell
@@ -415,6 +424,12 @@ fn apply_msg(
         ClientMsg::SetAppId(m) => {
             let win = window_of(client, m.window)?;
             outcome.relisted.push(win);
+            // The app id *is* the icon name (`docs/shell.md`), so a
+            // window that renames itself after mapping gets a new frame
+            // icon. `nitro-term` does exactly this when it learns what it
+            // is running, and a frame that resolved once at map time
+            // would keep the generic glyph for the rest of the session.
+            outcome.reiconed.push(win);
             scene
                 .set_app_id(client.id, win, m.app_id)
                 .map_err(|e| scene_err("SetAppId", e))
@@ -591,8 +606,8 @@ fn apply_msg(
             // so without destroying and recreating a node.
             let reference = if m.name.is_empty() {
                 None
-            } else if let Some(index) = icon_handle(icons, m.role, &m.name) {
-                Some(IconRef::new(index, sane_icon_size(m.size), m.role))
+            } else if let Some((index, role)) = icon_handle(icons, m.role, &m.name) {
+                Some(IconRef::new(index, sane_icon_size(m.size), role))
             } else {
                 // Unknown name: the node is cleared, the client is told,
                 // and the connection lives. Recorded here and reported
@@ -760,7 +775,7 @@ fn sane_icon_size(size: f32) -> f32 {
 }
 
 /// The handle a `SetIcon` names, from whichever of the server's two icon
-/// sets its `role` selects.
+/// sets its `role` selects, **and the role byte the node must carry**.
 ///
 /// The role byte is the **selector**, not a search order: a palette role
 /// means the symbolic set compiled into the server, and
@@ -777,11 +792,27 @@ fn sane_icon_size(size: f32) -> f32 {
 /// and tinting its alpha. A theme icon is a picture, not a coverage mask:
 /// tinting one throws away the artwork and keeps its silhouette, which
 /// looks like a bug on every icon that is not already monochrome.
-fn icon_handle(icons: &mut IconEngine, role: u8, name: &str) -> Option<u32> {
+///
+/// # Why the answer includes a role
+///
+/// Since #3715 an `AS_COLOURED` name may resolve, through one
+/// `<name>.desktop` hop, to one of the *symbolic* shapes — which is how
+/// `nitro-calc` becomes `calculator`. A symbolic shape is an A8 coverage
+/// mask with no colours of its own, so the node cannot keep
+/// `AS_COLOURED`: it would resolve the handle against the application
+/// cache, find nothing, and draw an empty box. The engine knows which set
+/// answered, so it says, and the node stores [`Role::Text`] instead.
+///
+/// That is the same mixed-tint rule the toolkit's `icon_fallback_tinted`
+/// already applies client-side — a coloured icon's fallback is symbolic
+/// and tinted — moved server-side for the case the client cannot see: the
+/// bar asks for an app id, and the indirection is the server's index.
+fn icon_handle(icons: &mut IconEngine, role: u8, name: &str) -> Option<(u32, u8)> {
     if role == IconRef::AS_COLOURED {
-        icons.lookup_app(name)
+        let icon = icons.lookup_app(name)?;
+        Some((icon.handle(), icon.role(Role::Text)))
     } else {
-        icons.lookup(name)
+        Some((icons.lookup(name)?, role))
     }
 }
 

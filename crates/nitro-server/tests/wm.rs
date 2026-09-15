@@ -511,15 +511,33 @@ fn a_decorated_window_gets_a_title_bar_above_its_content() {
     let (cx, cy) = win.content();
     assert_eq!(rgb(img.pixel(cx as u32, cy as u32)), to_rgb(RED));
 
-    // The close button is a distinct colour, on the right of the bar.
+    // The close button's glyph, which since #3715 is a symbolic `x`
+    // tinted like the title rather than a red disc. Its centre is the
+    // crossing of the two strokes, so it is ink: the discriminator is
+    // that the button's *corner* is still bar colour, i.e. there is no
+    // disc under it while nothing is pointing at it.
     let close = wm::buttons(frame, false)[0].1;
-    assert_eq!(
-        rgb(img.pixel(
-            (close.x + close.w / 2.0) as u32,
-            (close.y + close.h / 2.0) as u32
-        )),
-        to_rgb(role(Role::TitleClose)),
+    let centre = img.pixel(
+        (close.x + close.w / 2.0) as u32,
+        (close.y + close.h / 2.0) as u32,
     );
+    assert_ne!(rgb(centre), to_rgb(bar(true)), "the x glyph is drawn");
+    assert_eq!(
+        rgb(img.pixel(close.x as u32, close.y as u32)),
+        to_rgb(bar(true)),
+        "a resting button has no disc: its corner is the bar"
+    );
+    // And the red is gone from the resting frame entirely — it is a
+    // hover colour now, which is the whole visual change.
+    let mut reds = 0;
+    for y in frame.y as u32..(frame.y + wm::TITLE_H) as u32 {
+        for x in frame.x as u32..(frame.x + frame.w) as u32 {
+            if rgb(img.pixel(x, y)) == to_rgb(role(Role::TitleClose)) {
+                reds += 1;
+            }
+        }
+    }
+    assert_eq!(reds, 0, "title_close is painted only on hover");
 
     drop(conn);
     h.quit();
@@ -1539,14 +1557,20 @@ fn super_arrows_tile_the_focused_window_to_half_the_work_area() {
 /// The server's own contribution to `nodes`, per decorated window.
 ///
 /// #538 measured ~50 nodes per decorated window on the box and asked what
-/// a frame actually contains. It is six — the frame group, the background,
-/// the bar, the title text and two buttons — and the rest of that number
-/// was the client's own tree, which the server does not choose. Pinned
-/// here because `nodes` is what `docs/budget.md` multiplies by the 240
-/// bytes a `Node` costs: a frame that quietly grew to twenty nodes would
-/// move the budget line without anyone noticing.
+/// a frame actually contains. It was six; since #3715 it is **eleven** —
+/// the frame group, the background, the bar, the application icon, the
+/// title, and three buttons of a disc plus a glyph each — and the rest of
+/// that number was the client's own tree, which the server does not
+/// choose. Pinned here because `nodes` is what `docs/budget.md`
+/// multiplies by the 240 bytes a `Node` costs: a frame that quietly grew
+/// to twenty nodes would move the budget line without anyone noticing.
+///
+/// The +5 is argued in `wm::build_frame`'s documentation, and the one
+/// alternative worth naming is recorded there too: a *single* hover disc
+/// moved between the buttons would be nine, and was not taken because it
+/// would damage two rectangles per hover instead of one.
 #[test]
-fn a_frame_costs_six_scene_nodes_and_a_fixed_window_five() {
+fn a_frame_costs_eleven_scene_nodes_and_a_fixed_window_nine() {
     let mut h = Harness::start("framecost", OUT.0, OUT.1);
     let mut inbox = Inbox::default();
     let mut conn = h.client("framecost");
@@ -1560,11 +1584,12 @@ fn a_frame_costs_six_scene_nodes_and_a_fixed_window_five() {
     assert_eq!(h.stat("decorated"), 1);
     assert_eq!(
         h.stat("nodes") - empty,
-        8,
-        "two client nodes plus a six-node frame"
+        13,
+        "two client nodes plus an eleven-node frame"
     );
 
-    // A FIXED_SIZE window has no maximize button, so its frame is five.
+    // A FIXED_SIZE window has no maximize button, so its frame is nine:
+    // one disc and one glyph fewer.
     let mut c2 = h.client("framecost2");
     let mut in2 = Inbox::default();
     let _fixed = make_window(
@@ -1581,8 +1606,8 @@ fn a_frame_costs_six_scene_nodes_and_a_fixed_window_five() {
     assert_eq!(h.stat("decorated"), 2);
     assert_eq!(
         h.stat("nodes") - empty,
-        8 + 7,
-        "the second window adds two of its own plus a five-node frame"
+        13 + 11,
+        "the second window adds two of its own plus a nine-node frame"
     );
 
     // An undecorated window pays nothing: the server adds no node at all.
@@ -1602,7 +1627,7 @@ fn a_frame_costs_six_scene_nodes_and_a_fixed_window_five() {
     assert_eq!(h.stat("decorated"), 2, "the third window opted out");
     assert_eq!(
         h.stat("nodes") - empty,
-        8 + 7 + 2,
+        13 + 11 + 2,
         "an undecorated window is its own two nodes and nothing else"
     );
 
@@ -1851,4 +1876,550 @@ fn a_fixed_size_window_never_lights_its_border() {
 
     drop(conn);
     h.quit();
+}
+
+// ---------------------------------------------------------------------
+// #3715: the frame's icons — the app icon, the three buttons, the hover
+// ---------------------------------------------------------------------
+
+/// The pixels of a rectangle, as `0x00rrggbb`.
+fn crop(img: &Image, r: Rect) -> Vec<u32> {
+    let mut out = Vec::new();
+    for y in r.y as u32..(r.y + r.h) as u32 {
+        for x in r.x as u32..(r.x + r.w) as u32 {
+            out.push(rgb(img.pixel(x, y)));
+        }
+    }
+    out
+}
+
+/// How many pixels of `rect` are exactly `want`.
+fn census(img: &Image, rect: Rect, want: u32) -> usize {
+    crop(img, rect).into_iter().filter(|p| *p == want).count()
+}
+
+/// Squared distance between two `0x00rrggbb` colours.
+///
+/// For the assertions that cannot use exact equality because the pixel
+/// under test is anti-aliased: an icon's strokes are blended with
+/// whatever is behind them, so "how far is this from the background" is
+/// the honest question, not "is it exactly the tint".
+fn distance(a: u32, b: u32) -> i64 {
+    let ch = |v: u32, s: u32| i64::from((v >> s) & 0xff);
+    let (dr, dg, db) = (
+        ch(a, 16) - ch(b, 16),
+        ch(a, 8) - ch(b, 8),
+        ch(a, 0) - ch(b, 0),
+    );
+    dr * dr + dg * dg + db * db
+}
+
+/// Whether `px` could be `fg` composited over `bg` at some coverage.
+///
+/// Every channel has to lie between the two **and** imply the same
+/// coverage to within a rounding step: a pixel that is 70 % of one tint
+/// is not 70 % of another, so this is what tells two tints apart on
+/// anti-aliased artwork where nothing is ever the full colour.
+fn blend_of(px: u32, bg: u32, fg: u32) -> bool {
+    let ch = |v: u32, s: u32| f32::from(((v >> s) & 0xff) as u8);
+    let mut alphas = Vec::new();
+    for s in [16u32, 8, 0] {
+        let (p, b, f) = (ch(px, s), ch(bg, s), ch(fg, s));
+        if (f - b).abs() < 1.0 {
+            // This channel says nothing: the two colours agree on it.
+            continue;
+        }
+        let a = (p - b) / (f - b);
+        if !(-0.02..=1.02).contains(&a) {
+            return false;
+        }
+        alphas.push(a);
+    }
+    let Some(first) = alphas.first().copied() else {
+        return px == bg;
+    };
+    // 2/255 per channel is the widest a rounding difference can be.
+    alphas.iter().all(|a| (a - first).abs() < 0.02)
+}
+
+/// The button rectangle a region names, in desktop coordinates.
+fn button_rect(win: &Win, region: wm::Region, fixed: bool) -> Rect {
+    wm::buttons(win.frame(true), fixed)
+        .into_iter()
+        .find(|(r, _)| *r == region)
+        .unwrap_or_else(|| panic!("no {region:?} button"))
+        .1
+}
+
+/// A title bar draws an application icon and three symbolic buttons, and
+/// none of them is a coloured disc.
+///
+/// The frame is the server's own tree, so this is also the test that the
+/// internal icon path works at all: there is no `SetIcon` on the wire
+/// for any of these four nodes.
+#[test]
+fn a_title_bar_draws_an_app_icon_and_three_symbolic_buttons() {
+    let mut h = Harness::start("frameicons", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("frameicons");
+    let win = make_window(&mut conn, &mut inbox, 1, "Hello", WIN, RED, 0, 1);
+    park(&mut h);
+
+    let f = win.frame(true);
+    let img = h.shot();
+    let bar_rgb = to_rgb(bar(true));
+
+    // The application icon: ink where the artwork is, in the box
+    // `layout_frame` reserved for it. `app_id` is unset on this window,
+    // so what is drawn is the `window` fallback — resolved by the server
+    // itself, synchronously, with no round trip for the client to make.
+    let icon_box = Rect::new(
+        f.x + wm::BUTTON_GAP,
+        f.y + (wm::TITLE_H - wm::APP_ICON) / 2.0,
+        wm::APP_ICON,
+        wm::APP_ICON,
+    );
+    let ink = crop(&img, icon_box)
+        .into_iter()
+        .filter(|p| *p != bar_rgb)
+        .count();
+    assert!(ink > 8, "only {ink} px of app icon in a 16x16 box");
+
+    // Three buttons, each with ink and no disc. "Ink" is the
+    // discriminator that a coloured rect would also satisfy, so the disc
+    // is ruled out separately: a filled 14 px circle is ~150 px of one
+    // colour, and a glyph is a handful of strokes.
+    for region in [
+        wm::Region::Close,
+        wm::Region::Maximize,
+        wm::Region::Minimize,
+    ] {
+        let rect = button_rect(&win, region, false);
+        let px = crop(&img, rect);
+        let ink = px.iter().filter(|p| **p != bar_rgb).count();
+        assert!(ink > 4, "{region:?} drew only {ink} px");
+        assert!(
+            ink < 80,
+            "{region:?} covered {ink} of {} px — that is a disc, not a glyph",
+            px.len()
+        );
+        // And the corners are bar colour: nothing is painted behind it.
+        assert_eq!(
+            rgb(img.pixel(rect.x as u32, rect.y as u32)),
+            bar_rgb,
+            "{region:?} has a background at rest"
+        );
+    }
+
+    // The old look is gone from the resting frame: neither button
+    // colour appears anywhere in the title bar.
+    let bar_rect = Rect::new(f.x, f.y, f.w, wm::TITLE_H);
+    for r in [Role::TitleClose, Role::TitleMaximize] {
+        assert_eq!(
+            census(&img, bar_rect, to_rgb(role(r))),
+            0,
+            "{} is still painted at rest",
+            r.key()
+        );
+    }
+
+    drop(conn);
+    h.quit();
+}
+
+/// Hovering a button paints its disc; moving off it takes the disc away.
+///
+/// Settled on a **pixel census** of the button's own rectangle rather
+/// than on one sample, because one sample inside a glyph stroke would
+/// answer about the glyph and one outside it would answer about the bar.
+/// The disc is the thing that appears, so its area is what is counted.
+#[test]
+fn hovering_a_frame_button_paints_a_disc_and_leaving_it_takes_it_away() {
+    let mut h = Harness::start("framehover", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("framehover");
+    let win = make_window(&mut conn, &mut inbox, 1, "Hover", WIN, RED, 0, 1);
+    park(&mut h);
+
+    let close = button_rect(&win, wm::Region::Close, false);
+    let minimize = button_rect(&win, wm::Region::Minimize, false);
+    let red = to_rgb(role(Role::TitleClose));
+    let hover = to_rgb(role(Role::TitleButtonHover));
+
+    assert_eq!(census(&h.shot(), close, red), 0, "no disc at rest");
+
+    // The pointer paints a 24 px cursor over whatever it hovers, so it
+    // is parked at the button's **bottom-right** inside corner: still
+    // inside the hit region (`contains` is half-open on the far edges),
+    // and the cursor's body then extends down and right, away from the
+    // rectangle the census counts.
+    let corner = |r: Rect| (r.x + r.w - 1.0, r.y + r.h - 1.0);
+    let (cx, cy) = corner(close);
+    h.point_at(cx, cy, OUT);
+    h.settle();
+    let lit = census(&h.shot(), close, red);
+    assert!(lit > 60, "the close disc is only {lit} px");
+    assert_eq!(
+        census(&h.shot(), minimize, hover),
+        0,
+        "a hover lit a button the pointer is not on"
+    );
+
+    // Slide to minimize: its disc lights, close's goes out. The two are
+    // different roles, which is the whole reason close keeps the red.
+    let (mx, my) = corner(minimize);
+    h.point_at(mx, my, OUT);
+    h.settle();
+    let img = h.shot();
+    assert!(
+        census(&img, minimize, hover) > 60,
+        "the minimize disc is only {} px",
+        census(&img, minimize, hover)
+    );
+    assert_eq!(census(&img, close, red), 0, "close went out");
+
+    // Off the frame entirely and every disc is gone.
+    park(&mut h);
+    let img = h.shot();
+    assert_eq!(census(&img, close, red), 0);
+    assert_eq!(census(&img, minimize, hover), 0);
+
+    // A hover is a *colour* change and nothing else, exactly as the
+    // resize hint is (#3713): no text may be shaped and no icon may be
+    // rasterised for it. A monotonic counter is what can say "none at
+    // all"; a mean cannot.
+    let layouts = h.stat("text_layouts");
+    let renders = h.stat("icon_renders");
+    for _ in 0..3 {
+        h.point_at(cx, cy, OUT);
+        h.settle();
+        h.point_at(mx, my, OUT);
+        h.settle();
+        park(&mut h);
+    }
+    assert_eq!(
+        h.stat("text_layouts"),
+        layouts,
+        "hovering a frame button shaped text"
+    );
+    assert_eq!(
+        h.stat("icon_renders"),
+        renders,
+        "a tint is a role index, not a raster: hovering re-rasterised an icon"
+    );
+
+    drop(conn);
+    h.quit();
+}
+
+/// The minimize button puts the window away, and `Alt+Tab` brings it
+/// back — the action `Region::Minimize` has had since M3-A, with a
+/// button on it at last.
+#[test]
+fn the_minimize_button_minimizes_and_alt_tab_brings_it_back() {
+    let mut h = Harness::start("minbutton", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("minbutton");
+    let a = make_window(&mut conn, &mut inbox, 1, "a", WIN, RED, 0, 1);
+    let mut b = make_window(&mut conn, &mut inbox, 3, "b", WIN, GREEN, 0, 2);
+    park(&mut h);
+    let (bx, by) = b.content();
+    assert_eq!(rgb(h.shot().pixel(bx as u32, by as u32)), to_rgb(GREEN));
+
+    // Press and release inside the button: an action fires on release
+    // *inside itself*, which is what lets a user change their mind.
+    let rect = button_rect(&b, wm::Region::Minimize, false);
+    h.point_at(rect.x + rect.w / 2.0, rect.y + rect.h / 2.0, OUT);
+    h.settle();
+    h.button(BTN_LEFT, ButtonState::Pressed);
+    h.settle();
+    h.button(BTN_LEFT, ButtonState::Released);
+    h.settle();
+
+    assert_eq!(h.stat("minimized"), 1, "the button minimized it");
+    assert_eq!(h.stat("windows"), 2, "still a window, just hidden");
+    park(&mut h);
+    assert_ne!(
+        rgb(h.shot().pixel(bx as u32, by as u32)),
+        to_rgb(GREEN),
+        "its pixels are gone"
+    );
+
+    h.key(KEY_LEFTALT, true);
+    h.key(KEY_TAB, true);
+    h.key(KEY_TAB, false);
+    h.key(KEY_LEFTALT, false);
+    h.settle();
+    await_focus(&mut conn, &mut inbox, b.root, "Alt+Tab reached it");
+    refresh(&mut conn, &mut inbox, &mut b);
+    park(&mut h);
+    assert_eq!(h.stat("minimized"), 0, "Alt+Tab un-minimized it");
+    assert_eq!(rgb(h.shot().pixel(bx as u32, by as u32)), to_rgb(GREEN));
+    let _ = a;
+
+    drop(conn);
+    h.quit();
+}
+
+/// Sliding off a button before releasing cancels it, for all three.
+///
+/// The property is not new — it is what `Drag::Button` is for — but the
+/// third button is, and a minimize that fired on press would be a window
+/// the user cannot stop putting away.
+#[test]
+fn a_frame_button_fires_only_on_a_release_inside_itself() {
+    let mut h = Harness::start("buttoncancel", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("buttoncancel");
+    let win = make_window(&mut conn, &mut inbox, 1, "cancel", WIN, RED, 0, 1);
+    park(&mut h);
+
+    for region in [
+        wm::Region::Close,
+        wm::Region::Maximize,
+        wm::Region::Minimize,
+    ] {
+        let rect = button_rect(&win, region, false);
+        let before = win.frame(true);
+        h.point_at(rect.x + rect.w / 2.0, rect.y + rect.h / 2.0, OUT);
+        h.settle();
+        h.button(BTN_LEFT, ButtonState::Pressed);
+        h.settle();
+        // Slide off, onto the title bar, and let go there.
+        let (tx, ty) = win.title_bar();
+        h.point_at(tx, ty, OUT);
+        h.settle();
+        h.button(BTN_LEFT, ButtonState::Released);
+        h.settle();
+        assert_eq!(
+            h.stat("minimized"),
+            0,
+            "{region:?} minimized on a slide-off"
+        );
+        assert_eq!(h.stat("windows"), 1, "{region:?} closed on a slide-off");
+        // There is no `maximized` counter, so the geometry is the
+        // observable: a maximize would have filled the work area.
+        let mut after = win;
+        refresh(&mut conn, &mut inbox, &mut after);
+        assert_eq!(
+            after.frame(true),
+            before,
+            "{region:?} changed the geometry on a slide-off"
+        );
+    }
+
+    drop(conn);
+    h.quit();
+}
+
+/// A drag repaints the frame and re-lays it out, and must rasterise
+/// nothing: not a glyph, not an icon.
+///
+/// `text_layouts` was already pinned by #3713's review; `icon_renders`
+/// is the same claim for the four icons #3715 added, and it is the one
+/// that would catch a `layout_frame` that re-sent the icons with a new
+/// size on every motion.
+#[test]
+fn dragging_a_frame_rasterises_neither_text_nor_icons() {
+    let mut h = Harness::start("dragicons", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("dragicons");
+    let mut win = make_window(&mut conn, &mut inbox, 1, "Drag me", WIN, RED, 0, 1);
+    park(&mut h);
+
+    let layouts = h.stat("text_layouts");
+    let renders = h.stat("icon_renders");
+    let cached = h.stat("icons_cached");
+    let frames = h.stat("frames");
+
+    let (tx, ty) = win.title_bar();
+    h.point_at(tx, ty, OUT);
+    h.settle();
+    h.button(BTN_LEFT, ButtonState::Pressed);
+    h.settle();
+    for i in 1..=30 {
+        h.point_at(tx + i as f32 * 2.0, ty + i as f32, OUT);
+        h.settle();
+    }
+    h.button(BTN_LEFT, ButtonState::Released);
+    h.settle();
+    await_configure(&mut conn, &mut inbox, &mut win, "the drag");
+
+    assert!(
+        h.stat("frames") > frames + 10,
+        "the window really did repaint: {} frames for 30 motions",
+        h.stat("frames") - frames
+    );
+    assert_eq!(h.stat("text_layouts"), layouts, "a drag shaped text");
+    assert_eq!(h.stat("icon_renders"), renders, "a drag rasterised an icon");
+    assert_eq!(h.stat("icons_cached"), cached);
+
+    drop(conn);
+    h.quit();
+}
+
+/// A focus change retints the frame's symbolic icons without
+/// re-rasterising them, exactly as it retints the title.
+#[test]
+fn a_focus_change_retints_the_frames_icons_with_no_raster() {
+    let mut h = Harness::start("framefocus", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("framefocus");
+    let a = make_window(&mut conn, &mut inbox, 1, "a", WIN, RED, 0, 1);
+    park(&mut h);
+    let close = button_rect(&a, wm::Region::Close, false);
+    let focused = crop(&h.shot(), close);
+    let renders = h.stat("icon_renders");
+
+    // A second window takes the focus, so `a` is now inactive.
+    let b = make_window(&mut conn, &mut inbox, 3, "b", WIN, GREEN, 0, 2);
+    park(&mut h);
+    let unfocused = crop(&h.shot(), close);
+    assert_ne!(
+        focused, unfocused,
+        "an unfocused frame's glyphs did not recede with its title"
+    );
+    // Which colours they moved *between*. Not an exact-equality census:
+    // a 10 px glyph drawn from a 16-unit grid is anti-aliased
+    // everywhere, so **no** pixel of it is the full tint — the deepest
+    // ink in the focused crop measures 70 % coverage, which is a blend
+    // that happens to land close to the *inactive* title colour. A
+    // nearest-colour test would therefore report the opposite of the
+    // truth, which is what this assertion did first.
+    //
+    // What is true of a blend and of nothing else: every channel lies
+    // between the background and the tint. That separates the two cases
+    // cleanly here, because the focused ink is darker than the inactive
+    // tint ever gets on its own lighter bar.
+    let deepest = |px: &[u32], bg: u32| {
+        *px.iter()
+            .max_by_key(|p| distance(**p, bg))
+            .expect("the button box is not empty")
+    };
+    let ink = deepest(&focused, to_rgb(bar(true)));
+    assert!(
+        blend_of(ink, to_rgb(bar(true)), to_rgb(role(Role::TitleTextActive))),
+        "the focused glyph's deepest ink {ink:06x} is not \
+         title_text_active over title_bar_active"
+    );
+    assert!(
+        !blend_of(
+            ink,
+            to_rgb(bar(false)),
+            to_rgb(role(Role::TitleTextInactive))
+        ),
+        "and it is not the inactive pair either, so the test discriminates"
+    );
+    let ink = deepest(&unfocused, to_rgb(bar(false)));
+    assert!(
+        blend_of(
+            ink,
+            to_rgb(bar(false)),
+            to_rgb(role(Role::TitleTextInactive))
+        ),
+        "the unfocused glyph's deepest ink {ink:06x} is not \
+         title_text_inactive over title_bar_inactive"
+    );
+    // And nothing was rasterised for any of it: the cache holds
+    // coverage, and a tint is a role index the painter resolves per
+    // frame (`docs/icons.md`).
+    assert_eq!(
+        h.stat("icon_renders"),
+        renders,
+        "a focus change re-rasterised the frame's icons"
+    );
+    let _ = b;
+
+    drop(conn);
+    h.quit();
+}
+
+/// An `app_id` that changes **after** the window is mapped re-resolves
+/// the frame's icon.
+///
+/// The protocol allows it and `nitro-term` uses it — a terminal learns
+/// what it is running after it has a window — so a frame that resolved
+/// once at map time would keep the generic fallback for the rest of the
+/// session. The whole thing is the server's own tree, so there is no
+/// message to the client in either direction.
+///
+/// The app id has to reach the frame's icon **through the `.desktop`
+/// hop**, which is the only way an app id becomes a shape: an
+/// `AS_COLOURED` request never consults the symbolic set for the name it
+/// was given (that is the selector rule `docs/icons.md` argues for), so
+/// a bare `set_app_id("terminal")` against a server with no applications
+/// directory resolves to nothing and keeps the fallback — which is what
+/// the first version of this test measured, and mistook for a bug.
+#[test]
+fn an_app_id_set_after_mapping_re_resolves_the_frame_icon() {
+    let dir = std::env::temp_dir().join(format!("nitro-wm-apps-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("applications dir");
+    std::fs::write(
+        dir.join("nitro-term.desktop"),
+        "[Desktop Entry]\nType=Application\nName=Terminal\nIcon=terminal\n",
+    )
+    .expect("a desktop entry");
+    let mut h = Harness::start_with("frameappid", OUT.0, OUT.1, |config| {
+        config.desktop_dirs = Some(vec![dir.clone()]);
+    });
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("frameappid");
+    let win = make_window(&mut conn, &mut inbox, 1, "Term", WIN, RED, 0, 1);
+    park(&mut h);
+
+    let f = win.frame(true);
+    let icon_box = Rect::new(
+        f.x + wm::BUTTON_GAP,
+        f.y + (wm::TITLE_H - wm::APP_ICON) / 2.0,
+        wm::APP_ICON,
+        wm::APP_ICON,
+    );
+    // No app id yet, so this is the `window` fallback — the server's own
+    // synchronous answer, with no `BadIcon` and no round trip.
+    let before = crop(&h.shot(), icon_box);
+    let bar_rgb = to_rgb(bar(true));
+    assert!(
+        before.iter().any(|p| *p != bar_rgb),
+        "the fallback drew nothing"
+    );
+    let renders = h.stat("icon_renders");
+    assert_eq!(h.stat("app_icon_indirections"), 0);
+
+    conn.tx()
+        .set_app_id(win.root, "nitro-term")
+        .commit(2)
+        .unwrap();
+    conn.flush().unwrap();
+    h.settle();
+    park(&mut h);
+
+    let after = crop(&h.shot(), icon_box);
+    assert_ne!(
+        before, after,
+        "the frame kept its old icon after the app id changed"
+    );
+    assert!(
+        h.stat("icon_renders") > renders,
+        "a genuinely different shape was rasterised"
+    );
+    assert_eq!(
+        h.stat("app_icon_indirections"),
+        1,
+        "and it came through the .desktop entry, which is the only way an \
+         app id becomes a shape"
+    );
+    // The client heard nothing about any of it: the frame is not its
+    // tree, and a `SetAppId` earns no reply.
+    conn.flush().unwrap();
+    let _ = conn.poll(&mut inbox.0);
+    assert!(
+        !inbox.0.iter().any(|m| matches!(m, ServerMsg::Error(_))),
+        "the server complained to the client: {:?}",
+        inbox.0
+    );
+
+    drop(conn);
+    h.quit();
+    let _ = std::fs::remove_dir_all(&dir);
 }
