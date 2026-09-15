@@ -43,11 +43,27 @@ struct Harness {
     wire_path: PathBuf,
     config_dir: PathBuf,
     config_path: PathBuf,
+    icon_dir: PathBuf,
     thread: Option<JoinHandle<Result<(), nitro_server::Error>>>,
 }
 
 impl Harness {
     fn start(name: &str, conf: &str) -> Self {
+        Self::start_with_icons(name, conf, false)
+    }
+
+    /// A harness whose icon search path is a fixture tree of its own,
+    /// populated by [`Harness::install_app_icon`].
+    ///
+    /// Hermetic on purpose: an application-icon test that used the real
+    /// `/usr/share/icons` would assert about whatever theme the machine
+    /// running it happens to have, which is a test that passes on the
+    /// author's box and fails in CI — or, worse, the other way round.
+    fn start_with_app_icons(name: &str, conf: &str) -> Self {
+        Self::start_with_icons(name, conf, true)
+    }
+
+    fn start_with_icons(name: &str, conf: &str, app_icons: bool) -> Self {
         let dir = std::env::temp_dir().join(format!("nitro-icons-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("nitro").join("control.sock");
@@ -55,9 +71,24 @@ impl Harness {
         let config_path = config_dir.join("server.conf");
         std::fs::create_dir_all(&config_dir).expect("config dir");
         std::fs::write(&config_path, conf).expect("write server.conf");
+        let icon_dir = dir.join("icons");
 
         let mut config = Config::fake(OUT.0, OUT.1, &path);
         config.config_path = Some(config_path.clone());
+        if app_icons {
+            std::fs::create_dir_all(icon_dir.join("hicolor")).expect("icon dir");
+            std::fs::write(
+                icon_dir.join("hicolor").join("index.theme"),
+                "[Icon Theme]\n\
+                 Directories=16x16/apps,24x24/apps,32x32/apps,48x48/apps\n\
+                 [16x16/apps]\nSize=16\nType=Fixed\n\
+                 [24x24/apps]\nSize=24\nType=Fixed\n\
+                 [32x32/apps]\nSize=32\nType=Fixed\n\
+                 [48x48/apps]\nSize=48\nType=Fixed\n",
+            )
+            .expect("index.theme");
+            config.icon_dirs = Some(vec![icon_dir.clone()]);
+        }
         let wire_path = config.wire_path.clone();
         let shell_path = config.shell_path.clone();
         let thread = std::thread::spawn(move || run(config));
@@ -67,6 +98,7 @@ impl Harness {
             wire_path,
             config_dir,
             config_path,
+            icon_dir,
             thread: Some(thread),
         };
         wait_for("the control socket", || {
@@ -119,6 +151,22 @@ impl Harness {
         let tmp = self.config_dir.join("server.conf.tmp");
         std::fs::write(&tmp, conf).expect("write temp");
         std::fs::rename(&tmp, &self.config_path).expect("rename into place");
+    }
+
+    /// Put a `side × side` PNG of one solid colour into the harness's
+    /// fixture theme, as `hicolor/<side>x<side>/apps/<name>.png`.
+    ///
+    /// The colour is given in `0xrrggbb`, which is how the readback
+    /// reports it, so a test compares what it installed with what it sees
+    /// without reordering anything in its head.
+    fn install_app_icon(&self, name: &str, side: u32, rgb: u32) {
+        let dir = self
+            .icon_dir
+            .join("hicolor")
+            .join(format!("{side}x{side}"))
+            .join("apps");
+        std::fs::create_dir_all(&dir).expect("the apps directory");
+        std::fs::write(dir.join(format!("{name}.png")), solid_png(side, rgb)).expect("the icon");
     }
 
     fn shot(&self) -> Image {
@@ -251,6 +299,299 @@ fn edge_pixels(px: &[u32], background: u32, foreground: u32) -> usize {
     px.iter()
         .filter(|p| **p != background && **p != foreground)
         .count()
+}
+
+/// A `side × side` opaque RGBA PNG of one colour, given `0xrrggbb`.
+///
+/// Written here rather than checked in as a binary fixture: a test that
+/// reads a `.png` from the repository asserts about a file nobody can
+/// read in a diff, and every byte of this one is validated by the real
+/// decoder the moment the server loads it. Stored deflate blocks and
+/// unfiltered scanlines — it is a fixture writer, not a compressor.
+fn solid_png(side: u32, rgb: u32) -> Vec<u8> {
+    let (r, g, b) = (
+        ((rgb >> 16) & 0xff) as u8,
+        ((rgb >> 8) & 0xff) as u8,
+        (rgb & 0xff) as u8,
+    );
+    let mut raw = Vec::new();
+    for _ in 0..side {
+        // Filter byte 0 ("none"), then the row.
+        raw.extend_from_slice(&[0u8]);
+        for _ in 0..side {
+            raw.extend_from_slice(&[r, g, b, 0xff]);
+        }
+    }
+    let mut zlib = vec![0x78u8, 0x01];
+    for (i, block) in raw.chunks(65_535).enumerate() {
+        zlib.push(u8::from((i + 1) * 65_535 >= raw.len()));
+        let len = block.len() as u16;
+        zlib.extend_from_slice(&len.to_le_bytes());
+        zlib.extend_from_slice(&(!len).to_le_bytes());
+        zlib.extend_from_slice(block);
+    }
+    zlib.extend_from_slice(&adler32(&raw).to_be_bytes());
+
+    let mut out = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    let mut chunk = |kind: &[u8; 4], data: &[u8]| {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        let mut body = kind.to_vec();
+        body.extend_from_slice(data);
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&crc32(&body).to_be_bytes());
+    };
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&side.to_be_bytes());
+    ihdr.extend_from_slice(&side.to_be_bytes());
+    // depth 8, colour type 6 (RGBA), deflate, adaptive filtering, no
+    // interlace: the shape every icon in every theme is written in.
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+    chunk(b"IHDR", &ihdr);
+    chunk(b"IDAT", &zlib);
+    chunk(b"IEND", &[]);
+    out
+}
+
+/// Adler-32, for [`solid_png`]'s zlib wrapper.
+fn adler32(data: &[u8]) -> u32 {
+    let (mut a, mut b) = (1u32, 0u32);
+    for chunk in data.chunks(5552) {
+        for &x in chunk {
+            a += u32::from(x);
+            b += a;
+        }
+        a %= 65_521;
+        b %= 65_521;
+    }
+    (b << 16) | a
+}
+
+/// CRC-32 as PNG defines it, for [`solid_png`]'s chunks.
+fn crc32(data: &[u8]) -> u32 {
+    let mut c = 0xFFFF_FFFFu32;
+    for &byte in data {
+        c ^= u32::from(byte);
+        for _ in 0..8 {
+            c = if c & 1 != 0 {
+                0xEDB8_8320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
+        }
+    }
+    c ^ 0xFFFF_FFFF
+}
+
+/// A window with a flat backdrop and one **coloured** application icon
+/// node, the `AS_COLOURED` twin of [`window_with_icon`].
+fn window_with_app_icon(
+    conn: &mut Connection,
+    seen: &mut Vec<ServerMsg>,
+    name: &str,
+    size: f32,
+) -> (NodeId, nitro_wire::msg::Configure) {
+    let root = NodeId(1);
+    let back = NodeId(2);
+    let icon = NodeId(3);
+    conn.tx()
+        .create_window_with(root, "icons", WIN, Layer::Normal, 0)
+        .create_rect(back, root, Rect::new(0.0, 0.0, WIN.w, WIN.h))
+        .fill_solid(back, BACKDROP)
+        .create_icon(icon, root, Rect::new(0.0, 0.0, size, size))
+        .set_icon(icon, name, size, nitro_wire::msg::SetIcon::AS_COLOURED)
+        .commit(1)
+        .unwrap();
+    conn.flush().unwrap();
+    let c = expect(conn, seen, "the first Configure", |m| match m {
+        ServerMsg::Configure(c) if c.window == root => Some(*c),
+        _ => None,
+    });
+    (root, c)
+}
+
+#[test]
+fn a_coloured_application_icon_is_painted_in_its_own_colours() {
+    // The whole point of `AS_COLOURED`, settled on pixels: the tile that
+    // reaches the screen is the file's colour, not a palette role's. The
+    // discriminator is the colour itself — `#c86414` is in no palette, so
+    // a server that tinted a coverage mask could not produce it.
+    let h = Harness::start_with_app_icons("coloured", "");
+    h.install_app_icon("testapp", 48, 0x00c8_6414);
+    let mut seen = Vec::new();
+    let mut conn = h.client("coloured");
+    let (_root, c) = window_with_app_icon(&mut conn, &mut seen, "testapp", 24.0);
+    h.settle();
+
+    let px = icon_box(&h.shot(), &c, 24);
+    let hits = px.iter().filter(|p| **p == 0x00c8_6414).count();
+    assert!(
+        hits > 400,
+        "only {hits} pixels of the icon's own colour in a 24x24 box"
+    );
+    // The symbolic side is untouched: no mask was rasterised for this.
+    assert_eq!(h.stat("icon_renders"), 0);
+    assert_eq!(h.stat("app_icon_loads"), 1, "decoded exactly once");
+    assert_eq!(h.stat("app_icons_cached"), 1);
+    assert_eq!(h.stat("app_icon_bytes"), 24 * 24 * 4);
+    assert_eq!(h.stat("app_icon_misses"), 0);
+
+    // And a settled desktop decodes nothing further, however much it
+    // repaints — the "never per frame" half of the lazy-decode claim.
+    let frames = h.stat("frames");
+    for i in 0..6u32 {
+        conn.tx()
+            .bounds(NodeId(3), Rect::new(i as f32, i as f32, 24.0, 24.0))
+            .commit(10 + i)
+            .unwrap();
+        conn.flush().unwrap();
+        h.settle();
+    }
+    assert!(h.stat("frames") >= frames + 6, "it really did repaint");
+    assert_eq!(h.stat("app_icon_loads"), 1);
+
+    drop(conn);
+    h.quit();
+}
+
+#[test]
+fn an_application_name_the_theme_lacks_is_a_bad_icon_and_the_client_survives() {
+    // `BadIcon` covers both sets, on the same terms: a name the machine's
+    // theme does not have is a gap, not a disconnect — which is what a
+    // client's `.fallback(…)` depends on being told about.
+    let h = Harness::start_with_app_icons("coloured-missing", "");
+    h.install_app_icon("testapp", 48, 0x0011_2233);
+    let mut seen = Vec::new();
+    let mut conn = h.client("coloured-missing");
+    let (_root, c) = window_with_app_icon(&mut conn, &mut seen, "no-such-application", 24.0);
+
+    let code = expect(&mut conn, &mut seen, "an Error", |m| match m {
+        ServerMsg::Error(e) => Some(e.code),
+        _ => None,
+    });
+    assert_eq!(code, ErrorCode::BadIcon);
+    h.settle();
+    let px = icon_box(&h.shot(), &c, 24);
+    let back = u32::from(BACKDROP.r) << 16 | u32::from(BACKDROP.g) << 8 | u32::from(BACKDROP.b);
+    assert!(px.iter().all(|p| *p == back), "it drew something anyway");
+    assert_eq!(h.stat("app_icon_loads"), 0);
+
+    // The fallback a client would send next is honoured on the same
+    // connection, which is the property that makes `.fallback(…)` work.
+    conn.tx()
+        .set_icon(
+            NodeId(3),
+            "testapp",
+            24.0,
+            nitro_wire::msg::SetIcon::AS_COLOURED,
+        )
+        .commit(2)
+        .unwrap();
+    conn.flush().unwrap();
+    h.settle();
+    assert_eq!(h.stat("clients"), 1, "the client is still connected");
+    assert_eq!(h.stat("app_icon_loads"), 1, "and its fallback drew");
+
+    drop(conn);
+    h.quit();
+}
+
+#[test]
+fn a_symbolic_name_is_not_an_application_name_and_the_reverse() {
+    // The namespace decision, from the outside: the role byte picks the
+    // set and nothing falls back between them. `gear` is ours and the
+    // fixture theme does not have it; `testapp` is the theme's and the
+    // symbolic set does not have it. Each is a `BadIcon` in the other's
+    // role, which is what makes `icon("list")` mean the same thing on
+    // every box.
+    let h = Harness::start_with_app_icons("namespaces", "");
+    h.install_app_icon("testapp", 32, 0x0044_8866);
+    let mut seen = Vec::new();
+    let mut conn = h.client("namespaces");
+    let (_root, _c) = window_with_app_icon(&mut conn, &mut seen, "gear", 16.0);
+    let code = expect(&mut conn, &mut seen, "an Error for gear", |m| match m {
+        ServerMsg::Error(e) => Some(e.code),
+        _ => None,
+    });
+    assert_eq!(code, ErrorCode::BadIcon, "a symbolic name is not an app");
+    h.settle();
+    assert_eq!(h.stat("app_icon_loads"), 0);
+    assert_eq!(h.stat("icon_renders"), 0);
+
+    seen.clear();
+    conn.tx()
+        .set_icon(NodeId(3), "testapp", 16.0, Role::Text.index() as u8)
+        .commit(2)
+        .unwrap();
+    conn.flush().unwrap();
+    let code = expect(&mut conn, &mut seen, "an Error for testapp", |m| match m {
+        ServerMsg::Error(e) => Some(e.code),
+        _ => None,
+    });
+    assert_eq!(
+        code,
+        ErrorCode::BadIcon,
+        "a theme name tinted by a role is refused rather than silhouetted"
+    );
+    h.settle();
+    assert_eq!(h.stat("icon_renders"), 0);
+    assert_eq!(h.stat("clients"), 1);
+
+    drop(conn);
+    h.quit();
+}
+
+#[test]
+fn a_two_times_output_reads_the_bigger_source_for_a_coloured_icon() {
+    // The scale claim for application icons, which is a *different* claim
+    // from the symbolic one: there is no rasteriser here, so being crisp
+    // means reading the file the theme ships for that size rather than
+    // blowing up a smaller one. The theme has 24 and 48; a 24-logical
+    // icon on a 2× output is 48 device px and must take the 48 px file.
+    //
+    // Two servers rather than a reload, matching
+    // `a_two_times_output_rasterises_a_real_two_times_icon`: the scale is
+    // read at start-up and a fresh process is the honest way to change
+    // the one variable under test.
+    let shot_at = |name: &str, conf: &str| -> (Vec<u32>, u64, u64) {
+        let h = Harness::start_with_app_icons(name, conf);
+        h.install_app_icon("testapp", 24, 0x0011_2233);
+        h.install_app_icon("testapp", 48, 0x00cc_4422);
+        let mut seen = Vec::new();
+        let mut conn = h.client(name);
+        let (_root, c) = window_with_app_icon(&mut conn, &mut seen, "testapp", 24.0);
+        h.settle();
+        let px = icon_box(&h.shot(), &c, 24);
+        let (bytes, loads) = (h.stat("app_icon_bytes"), h.stat("app_icon_loads"));
+        drop(conn);
+        h.quit();
+        (px, bytes, loads)
+    };
+
+    let (one, one_bytes, one_loads) = shot_at("coloured-scale1", "");
+    assert_eq!(one_loads, 1);
+    assert_eq!(one_bytes, 24 * 24 * 4, "one 24 device px tile");
+    assert!(
+        one.iter().filter(|p| **p == 0x0011_2233).count() > 400,
+        "scale 1 took something other than the 24 px file"
+    );
+
+    let (two, two_bytes, two_loads) = shot_at("coloured-scale2", "output.Virtual-1.scale = 2\n");
+    assert_eq!(two_loads, 1);
+    assert_eq!(two_bytes, 48 * 48 * 4, "one 48 device px tile");
+    // The *colour* is the discriminator, not the byte count: a doubled
+    // 24 px tile would also be 48²×4 bytes, but it could not contain a
+    // colour that is only in the 48 px file.
+    let big = two.iter().filter(|p| **p == 0x00cc_4422).count();
+    assert!(
+        big > 1600,
+        "only {big} pixels of the 48 px source at scale 2; a scaled 24 px \
+         tile could not contain that colour at all"
+    );
+    assert_eq!(
+        one.iter().filter(|p| **p == 0x00cc_4422).count(),
+        0,
+        "and the scale-1 shot has none of it, so the two really differ"
+    );
 }
 
 #[test]

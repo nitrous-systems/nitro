@@ -167,6 +167,16 @@ pub struct Config {
     /// with neither `$XDG_CONFIG_HOME` nor `$HOME` gets. `main.rs` fills
     /// it from [`config::path`].
     pub config_path: Option<PathBuf>,
+    /// Icon-theme base directories, replacing the XDG search path.
+    ///
+    /// `None` means the real one. A test sets it for the reason `scales`
+    /// is a field rather than an environment variable: the environment is
+    /// process-global and the tests run as threads of one process, so
+    /// `NITRO_ICON_PATH` set by one test would decide another's answer.
+    /// It is also the only way to make an application-icon test
+    /// deterministic at all — otherwise it asserts about whatever theme
+    /// the machine running it happens to have installed.
+    pub icon_dirs: Option<Vec<PathBuf>>,
 }
 
 impl Config {
@@ -194,6 +204,7 @@ impl Config {
             scales: HashMap::new(),
             shadow: true,
             config_path: None,
+            icon_dirs: None,
         }
     }
 }
@@ -885,7 +896,10 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         epoll,
         scene: Scene::new(),
         text: TextEngine::new(),
-        icons: IconEngine::with_theme(settings.theme.icon_theme()),
+        icons: match config.icon_dirs.take() {
+            Some(dirs) => IconEngine::with_dirs(dirs, settings.theme.icon_theme()),
+            None => IconEngine::with_theme(settings.theme.icon_theme()),
+        },
         outputs: Vec::new(),
         keyboard,
         cursor: Cursor::new(),

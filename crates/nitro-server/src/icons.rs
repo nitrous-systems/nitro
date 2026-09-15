@@ -158,6 +158,9 @@ pub struct IconEngine {
     /// The parsed icon theme: the search path and every `index.theme` in
     /// the chain, read once at start and again on `reload`.
     theme: IconTheme,
+    /// A search path fixed at construction, overriding the XDG one. See
+    /// [`IconEngine::with_dirs`].
+    dirs: Option<Vec<PathBuf>>,
     /// Application icon **names** a client has asked for, in the order
     /// they were first seen. The index into this is what the scene
     /// stores, exactly as [`nitro_icons::index_of`] is for the symbolic
@@ -226,6 +229,26 @@ impl IconEngine {
         e
     }
 
+    /// An engine whose icon search path is exactly `dirs`.
+    ///
+    /// The hermetic form, for the tests and for [`Config::icon_dirs`]:
+    /// the answer then depends only on the trees handed in, not on what
+    /// the machine running them happens to have installed. The
+    /// restriction survives a `reload`, because a test that reloaded its
+    /// way back onto `/usr/share/icons` would be a test whose result
+    /// depended on the box again.
+    ///
+    /// [`Config::icon_dirs`]: crate::Config::icon_dirs
+    #[must_use]
+    pub fn with_dirs(dirs: Vec<PathBuf>, theme: &str) -> Self {
+        let mut e = Self {
+            dirs: Some(dirs),
+            ..Self::default()
+        };
+        e.set_theme(theme);
+        e
+    }
+
     /// Re-read the icon theme, on `reload`.
     ///
     /// Everything derived from the old theme goes with it: the resolved
@@ -237,7 +260,10 @@ impl IconEngine {
     /// string-free.
     pub fn set_theme(&mut self, theme: &str) {
         let started = Instant::now();
-        self.theme = IconTheme::load(theme);
+        self.theme = match &self.dirs {
+            Some(dirs) => IconTheme::with_dirs(dirs.clone(), theme),
+            None => IconTheme::load(theme),
+        };
         self.app_paths.clear();
         self.app_cache.clear();
         self.app_bytes = 0;
@@ -1051,7 +1077,12 @@ mod tests {
         let dir = fixture("paints");
         // Solid `#3050c0`, which no palette role is: if the tile were
         // tinted rather than blitted, this exact colour could not appear.
-        install_png(&dir, "hicolor/48x48/apps/testapp.png", 48, (0xc0, 0x50, 0x30));
+        install_png(
+            &dir,
+            "hicolor/48x48/apps/testapp.png",
+            48,
+            (0xc0, 0x50, 0x30),
+        );
         let mut e = themed(&dir);
         let icon = e
             .lookup_app("testapp")
@@ -1101,8 +1132,18 @@ mod tests {
         // downscale the 48, and the two are separate cache entries for the
         // same reason two glyph sizes are.
         let dir = fixture("sizes");
-        install_png(&dir, "hicolor/16x16/apps/testapp.png", 16, (0x10, 0x20, 0x30));
-        install_png(&dir, "hicolor/48x48/apps/testapp.png", 48, (0x40, 0x50, 0x60));
+        install_png(
+            &dir,
+            "hicolor/16x16/apps/testapp.png",
+            16,
+            (0x10, 0x20, 0x30),
+        );
+        install_png(
+            &dir,
+            "hicolor/48x48/apps/testapp.png",
+            48,
+            (0x40, 0x50, 0x60),
+        );
         let mut e = themed(&dir);
         let icon = e.lookup_app("testapp").expect("testapp resolves");
         let small = e.app_tile(icon, 16).expect("16 px decodes").data.clone();
@@ -1248,12 +1289,7 @@ mod tests {
         e.app_tile(icon, 32).expect("decodes");
         let mut pairs = Vec::new();
         e.write_pairs(&mut pairs);
-        let get = |key: &str| {
-            pairs
-                .iter()
-                .find(|(k, _)| *k == key)
-                .map_or(0, |(_, v)| *v)
-        };
+        let get = |key: &str| pairs.iter().find(|(k, _)| *k == key).map_or(0, |(_, v)| *v);
         assert_eq!(get("app_icons_cached"), 1);
         assert_eq!(get("app_icon_bytes"), 32 * 32 * 4);
         assert_eq!(get("app_icon_loads"), 1);

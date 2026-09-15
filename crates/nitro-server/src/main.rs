@@ -102,6 +102,11 @@ fn config_from_env() -> Result<Config, String> {
         // neither `$XDG_CONFIG_HOME` nor `$HOME` — means no file and no
         // watch rather than a guessed path the user cannot find.
         config_path: nitro_server::config::path(),
+        // The real XDG icon search path. `NITRO_ICON_PATH` overrides it,
+        // and it is read where the path is built rather than here: the
+        // field exists for the tests, which cannot use an environment
+        // variable because they run as threads of one process.
+        icon_dirs: None,
     })
 }
 
