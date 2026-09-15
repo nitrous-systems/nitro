@@ -259,6 +259,78 @@ to be `window/container[4]`. It is `window/buttons` now: a path built out
 of a sibling count changes whenever the tree above it does, which makes
 every script that used it quietly wrong rather than loudly broken.
 
+## Measured on the box
+
+Test box (Pentium G3240, HDMI-A-1 1920×1080), bar and settings open, my
+build of server *and* every client (the wire changed, so a mixed tree
+would be a protocol mismatch rather than a test).
+
+**Crispness, settled on pixels.** An icon crop always contains ink, so
+"I can see a gear" proves nothing. The discriminating control is a **2×
+nearest-neighbour upscale of the scale-1 crop** — literally what the
+server would put on screen if it blitted a scaled tile — compared against
+the scale-2 crop. Same icon, same colour, same position, one variable:
+
+| | 16 device px | a 2× NN blit of it | 32 device px (scale 2) |
+|---|---|---|---|
+| bar `list`: edge px | 12 | **48** (= 4 × 12, by construction) | **12** |
+| bar `list`: distinct colours | 3 | 3 | **4** |
+| settings `display`: edge px | 30 | **120** | **50** |
+| settings `display`: distinct colours | 14 | 14 | **27** |
+
+Neither number matches the blit, and the second is the one that closes
+the case: a nearest-neighbour upscale **cannot invent a colour its source
+lacks**. The scale-1 `list` tile's entire palette is
+`{7b7b7f, cacace, e4e4e8}`; at scale 2 the box shows `#121216` — the true
+`button_text` — plus `4f4f53` and `515155`. Three colours that are not in
+the 1× tile at all, so it cannot be a scaled 1× tile.
+
+`icon_bytes` corroborates from the other side: 7 × 16² = 1 792 at scale
+1, and 5 888 at scale 2, i.e. exactly +4 × 32² for the four masks
+re-rasterised at the device size.
+
+**The scheme flip.** `theme.scheme = dark` into the watched file, nothing
+restarted (`config_reloads` checked to have advanced *first*, so this is
+not a measurement of a switch that never happened):
+
+| | measured |
+|---|---|
+| icon pixels changed | **256/256** in both the bar's and settings' 16×16 boxes |
+| whole screen | 100.0 % (230 352 of 230 400 sampled px) |
+| **`icon_renders`** | **11 → 11 — unmoved** |
+| `icons_cached` | 11 → 11 |
+| frames across the switch | 7 |
+
+`icon_renders` not moving *is* the coverage-not-tinted-pixels decision:
+every icon on screen changed colour and the server rasterised nothing.
+
+**Idle**, 45 s windows inside one minute, with @3700's app-absent control:
+
+| arm | frames | bar CPU ticks | `icon_renders` |
+|---|---|---|---|
+| bar + settings open | **2** | 0 | 11 → 11 |
+| settings killed (control) | **2** | 0 | 11 → 11 |
+
+Identical in both arms — the 2 frames are the bar's 30 s sensor poll, not
+the icons. My first pass read 4 in one arm, and the fault was my own
+instrument: the start gate allowed a `:32` start, and `:32 + 45 s`
+crosses the minute boundary and picks up the clock tick. Gating on `:02`
+only puts both arms inside one minute and the difference vanishes.
+
+**Remote**, the point of by-name: `nitro-settings` running on the dev box
+over `ssh -L` to `remote.listen = 127.0.0.1:7712`, rendering on the
+box's screen. Its `display` heading icon is **256/256 pixels identical**
+to the local one — the same artwork, from the same server, because what
+crossed the link was the string `"display"` and not a pixel. An `Image`
+could not have made the trip at all.
+
+**Sizes and memory.** `docs/budget.md` has the tables; the two numbers
+worth repeating here are that the server's +268 KB is **84 % zeno's
+rasteriser** (measured by rebuilding with the table cut to one icon) and
+only 16 % artwork at **935 B/icon**, and that the cache is **1 792
+bytes** for the seven icons on screen — 0.17 % of the glyph atlas beside
+it.
+
 ## Deferred to icons-B
 
 Everything to do with **application** icons:

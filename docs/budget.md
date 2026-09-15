@@ -34,6 +34,43 @@ the tool is installed.
 | `nitro-shot` | 330 160 | — | ok |
 | `nitro-server` | 2 047 016 | — | see below |
 
+**M4-G (icons)** moved five of these; the row that needs an argument is
+the server's. Measured on the box, mine against main's binary, same
+build flags:
+
+| binary | main | M4-G | delta |
+|---|---|---|---|
+| `nitro-server` | 2 232 064 | **2 500 504** | **+268 440 (+12.0 %)** |
+| `nitro-bar` | 617 624 | 623 464 | +5 840 |
+| `nitro-settings` | 750 312 | 754 704 | +4 392 |
+| `nitro-launcher` | 720 544 | 722 488 | +1 944 |
+| `nitro-files` | 844 000 | 845 800 | +1 800 |
+| `nitro-calc` | 593 088 | 594 872 | +1 784 |
+| `nitro-term` | 677 480 | 677 944 | +464 |
+| `hey` | 370 400 | 370 400 | **+0** (links no toolkit) |
+
+The server's +268 KB is not what it looks like, and the split was
+measured rather than reasoned about — by rebuilding with the icon
+**table** cut to one entry and everything else (zeno, the `IconEngine`,
+the wire op) left in place, so exactly one variable moved:
+
+| | bytes | what it is |
+|---|---|---|
+| main | 2 232 064 | |
+| + zeno and the `IconEngine`, one icon | 2 457 504 | **+225 440 — code** |
+| + the other 46 icons | 2 500 520 | **+43 016 — data, 935 B/icon** |
+
+So **84 % of the delta is zeno's rasteriser**, linked into the server for
+the first time, and 16 % is the artwork. That matters for the decision it
+justifies: the marginal cost of an icon is under a kilobyte, so the set
+can grow to a few hundred without this row moving appreciably, and the
+one-off is paid whether the set has one icon or fifty. It is also the
+number to point at if anyone proposes a *second* rasteriser.
+
+The clients pay 0.5–1 KB each for the `Icon` widget and nothing for the
+artwork, which is the whole point of the server owning it: `hey` links no
+toolkit and is byte-identical.
+
 Identical on the dev machine and the box (same artefact, `rsync`ed, and
 `sha256sum`-verified on both sides for the M2 row below).
 
@@ -136,6 +173,8 @@ as long as it did. The server's current, audited line is in
 | `nitro-server`, **file-backed** (#538) | 0–5 | **7 252 kB** | — | `RssFile` ≤ 7.5 MB | **ok**, and flat in windows |
 | `nitro-calc` | 1 | **2 752 kB** | **2 752 kB** | ≤ 3 MB (client) | **ok**, 92 % |
 | `nitro-settings` (M4-C) | 1 | **2 872 kB** | **2 872 kB** | ≤ 3.5 MB (M4-C) | **ok**, 82 % |
+| `nitro-settings` (M4-G, four heading icons) | 1 | **3 004 kB** | **3 004 kB** | ≤ 3.5 MB (M4-C) | **ok**, 86 % |
+| `nitro-bar` (M4-G, three icons) | — | **2 744 kB** | **2 744 kB** | — | +0 kB against M4-F's 2 744 |
 | `nitro-demo` | 1 | 3 132 kB | 3 132 kB | ≤ 3 MB (client) | over by 4 % |
 | `nitro-demo` | 5 | 3 224 kB | 3 224 kB | ≤ 3 MB (client) | over by 7 % |
 
@@ -218,6 +257,49 @@ decorated window costs **86 kB**, not 21 kB, and the frame is **6** scene
 nodes, not 18 — the 18 was the client's own tree counted as the server's.
 The dominant term is neither: it is the 64 KiB receive buffer `nitro-wire`
 allocates per *connection*. See "The server's 17.8 MB, audited".)
+
+### The icon cache, and why it is not in the server's RSS row
+
+The server's RSS went **down**, not up, with icons on screen. Three
+interleaved pairs (@3706's method), same clients up in both arms, both
+binaries stashed and swapped by md5:
+
+| pair | arm | VmRSS | RssAnon | VmHWM |
+|---|---|---|---|---|
+| 1 | M4-G | 17 840 kB | 10 272 kB | 19 152 kB |
+| 1 | main | 18 264 kB | 10 996 kB | 18 624 kB |
+| 2 | M4-G | 17 716 kB | 10 280 kB | 19 036 kB |
+| 2 | main | 18 200 kB | 10 996 kB | 18 732 kB |
+| 3 | M4-G | 17 872 kB | 10 272 kB | 19 184 kB |
+| 3 | main | 18 220 kB | 10 996 kB | 18 820 kB |
+
+**−400 kB VmRSS and −720 kB RssAnon, the same sign in all three pairs**,
+against +400 kB VmHWM. The direction is consistent enough to be a signal
+rather than this box's drift, but it is **not attributed to the icons**:
+the cache itself is 1 792 bytes (see below), three orders of magnitude
+too small to explain it. The honest reading is that a 268 KB larger
+binary rearranges the allocator's arenas and the glibc mmap threshold the
+unit pins (#547), and the peak rising while the steady state falls is
+what that looks like. Recorded because it was measured; not claimed as a
+win.
+
+The cache is small enough that its row is a footnote rather than a
+budget line. On the box with the bar and settings open:
+
+| | measured | what it is |
+|---|---|---|
+| `icons_cached` | **7** | exactly the distinct `(name, px)` pairs on screen: the bar's `list`/`cpu`/`memory` and settings' `display`/`keyboard`/`speaker`/`palette`, all at 16 |
+| `icon_bytes` | **1 792** | 7 × 16² — one A8 byte per pixel, no padding |
+| `icon_renders` | **7** | one per entry, and it **stops there**: unmoved across a scheme flip, 10 repaints and two 45 s idle windows |
+| `icon_refusals` | **0** | nothing was ever refused for want of room |
+| at scale 2 | `icons_cached` **11**, `icon_bytes` **5 888** | +4 × 32² exactly: four masks re-rasterised at the device size |
+
+For scale, the glyph atlas beside it is **1 048 576 bytes** for 186
+glyphs — the icon cache is 0.17 % of it. That is the number the
+no-eviction decision rests on: all 47 icons at all four recommended sizes
+is about 190 KB against a 2 MiB ceiling, so the set has a hard bound
+rather than a policy, and `icon_refusals` is how the server would say
+that reasoning was wrong.
 
 ### The 8 MB the shadow buffer costs, and what it buys
 
