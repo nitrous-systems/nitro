@@ -181,6 +181,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nitro-bench"
+version = "0.0.1"
+dependencies = [
+ "nitro-core",
+ "nitro-kms",
+ "nitro-server",
+ "nitro-wire",
+ "rustix",
+]
+
+[[package]]
 name = "nitro-calc"
 version = "0.0.1"
 dependencies = [

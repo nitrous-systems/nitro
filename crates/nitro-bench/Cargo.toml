@@ -1,0 +1,33 @@
+[package]
+name = "nitro-bench"
+description = "Old-school graphics benchmarks on the nitro wire: x11perf-style operation micro-benchmarks and the classic demo effects, with a JSON ledger and a report generator"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+nitro-core = { workspace = true }
+nitro-wire = { workspace = true }
+# `event` for the poll loop, `fs` for the memfd the pixel scenarios upload
+# through, `process` for the /proc CPU sampler's own pid and `time` for the
+# client-side clock — the same four `nitro-demo` uses, because a benchmark
+# that reached for a different syscall crate would be measuring a different
+# client than the one this tree ships. `param` is the one addition:
+# `sysconf(_SC_CLK_TCK)`, which is what turns the kernel's CPU *ticks* into
+# the microseconds-per-frame column, and hard-coding its 100 would be a
+# magic number that is right everywhere until it is quietly wrong.
+rustix = { version = "1", features = ["event", "fs", "param", "process", "time"] }
+
+[dev-dependencies]
+# The integration test drives the real server loop in-process on the fake
+# backend, exactly as `crates/nitro-demo/tests/against_server.rs` does.
+# That is the only thing that stops the scenarios drifting into sending
+# mutations no real server accepts — which would be a benchmark of a dead
+# connection reporting an excellent CPU figure.
+nitro-server = { path = "../nitro-server" }
+# For `Image`, the shape a `shot` readback comes back in.
+nitro-kms = { workspace = true }
