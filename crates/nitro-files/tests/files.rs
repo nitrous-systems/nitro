@@ -101,6 +101,30 @@ fn app(dir: &Path, xdg: &Path) -> (Harness<Files>, Ids) {
     (h, ids)
 }
 
+/// How many distinct icons the **server's own decorations** cache.
+///
+/// Since #3715 a decorated window's title bar carries an application
+/// icon and three symbolic button glyphs, all of them the server's own
+/// nodes — so `icons_cached` is not "what this client asked for".
+/// Measured on a harness with a window and no icons at all rather than
+/// written down as a constant, which would go stale silently: the number
+/// would still look plausible.
+///
+/// A name of its own, not the file manager's: a `TestServer`'s socket
+/// directory is keyed on the name, so two harnesses sharing one share a
+/// directory and the second's teardown takes the first's socket with it.
+fn frame_icons_cached() -> usize {
+    let h = Harness::sized(
+        "files-icon-baseline",
+        (),
+        Size::new(300.0, 220.0),
+        |ui: &mut nitro_ui::Ui<()>| ui.build(nitro_ui::widgets::label("no icons here")),
+    );
+    let n = h.server().stat("icons_cached") as usize;
+    h.quit();
+    n
+}
+
 /// Write `text` to `path`, creating the parents.
 fn write(path: &Path, text: &str) {
     if let Some(parent) = path.parent() {
@@ -1267,6 +1291,14 @@ fn every_type_gets_its_own_icon_and_the_server_draws_them() {
     // The **distinct** names on screen are what the server cached, one
     // entry per `(name, px)`. That is the arithmetic that separates "the
     // rows name artwork" from "each row carries its own".
+    //
+    // Measured against a **baseline**, not against zero: since #3715 a
+    // decorated window's own title bar carries an application icon and
+    // three symbolic button glyphs, so `icons_cached` counts those too.
+    // The baseline is taken from a harness with a window and no icons of
+    // its own rather than written down as a constant — a hard-coded 4
+    // would go stale the day the frame changes, and stale silently,
+    // because the number would still look plausible.
     let distinct: std::collections::BTreeSet<&str> = got
         .iter()
         .take(want.len())
@@ -1278,7 +1310,7 @@ fn every_type_gets_its_own_icon_and_the_server_draws_them() {
     );
     assert_eq!(
         h.server().stat("icons_cached") as usize,
-        distinct.len(),
+        frame_icons_cached() + distinct.len(),
         "cached entries are the distinct icons on screen, not the rows: {distinct:?}"
     );
     assert_eq!(

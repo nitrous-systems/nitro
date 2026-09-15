@@ -612,6 +612,22 @@ fn icon_list_of(n: usize, h: f32) -> (Harness<Vec<usize>>, WidgetId) {
 
 #[test]
 fn a_row_icon_is_a_named_icon_node_and_the_server_rasterises_it() {
+    // The baseline the frame itself caches, measured rather than
+    // written down: since #3715 a decorated window's title bar carries
+    // an application icon and three symbolic button glyphs, so
+    // `icons_cached` counts those too. A hard-coded 4 would go stale
+    // the day the frame changes, and go stale silently.
+    let base = {
+        let h = Harness::sized(
+            "list-icon-baseline",
+            Vec::<usize>::new(),
+            Size::new(200.0, 200.0),
+            |ui: &mut Ui<Vec<usize>>| ui.build(nitro_ui::widgets::label("no icons here")),
+        );
+        let n = h.server().stat("icons_cached");
+        h.quit();
+        n
+    };
     let (h, id) = icon_list_of(40, 200.0);
     let made = h.widget::<List<Vec<usize>>>(id).materialised();
     assert!(made > 1, "the list materialised rows");
@@ -619,8 +635,8 @@ fn a_row_icon_is_a_named_icon_node_and_the_server_rasterises_it() {
     // The server really drew artwork for them — the claim a count of
     // client-side mutations cannot make on its own.
     assert!(
-        h.server().stat("icon_renders") > 0,
-        "the server rasterised no icon at all"
+        h.server().stat("icon_renders") > base,
+        "the server rasterised no icon for the rows at all"
     );
     // Two distinct names, one size: the cache is keyed on
     // `(icon, device px)`, so a screenful of alternating icons is two
@@ -628,7 +644,7 @@ fn a_row_icon_is_a_named_icon_node_and_the_server_rasterises_it() {
     // separates "the rows share artwork" from "each row has its own".
     assert_eq!(
         h.server().stat("icons_cached"),
-        2,
+        base + 2,
         "two names at one size are two cache entries, not one per row"
     );
     assert_eq!(h.server().stat("icon_refusals"), 0, "both names exist");
