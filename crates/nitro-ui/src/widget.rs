@@ -688,6 +688,34 @@ impl<S: 'static> PaintCx<'_, S> {
         self.note(r);
     }
 
+    /// Draw a symbolic icon in `slot`, parented to a group slot's node
+    /// rather than to the widget's own group.
+    ///
+    /// The `_in` twin of [`PaintCx::icon_tinted`], for the same reason
+    /// [`PaintCx::text_in`] exists: a virtualised widget puts its content
+    /// inside a clipping group of its own so that scrolling is one
+    /// `SetTransform`, and the content's slots have to be parented there.
+    pub fn icon_in(
+        &mut self,
+        parent: NodeId,
+        slot: Slot,
+        rect: Rect,
+        name: &str,
+        size: f32,
+        tint: IconTint,
+    ) {
+        let at = crate::wire::SlotAt {
+            parent,
+            before: NodeId::NONE,
+            index: slot as usize,
+        };
+        let r =
+            self.ui
+                .wire_mut()
+                .paint_icon(&mut self.slots, at, rect, name, size, tint.role_byte());
+        self.note(r);
+    }
+
     /// Draw text in `slot`, parented to a group slot's node.
     pub fn text_in(
         &mut self,

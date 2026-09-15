@@ -382,26 +382,38 @@ impl Files {
 
     /// The rows as the list widget takes them.
     ///
-    /// A directory gets a `/` in its icon column and `<dir>` for its
-    /// size; everything else gets its size and its date. There is no
-    /// icon theme and no image loader here — the spec asks for a glyph
-    /// and a glyph is what the server can draw with the fonts it has.
+    /// A directory gets `<dir>` for its size; everything else gets its
+    /// size and its date. The icon column is a **name**, not a glyph:
+    /// `folder-fill` for a directory, one of the `file-earmark-*` family
+    /// for a file, `hdd` for a device node — and the server draws the
+    /// artwork, at the output's scale, in the colour the palette's `Text`
+    /// role currently names (`docs/icons.md`).
+    ///
+    /// **The icon is not computed here.** It is
+    /// [`dir::Entry::icon`](crate::dir::Entry::icon), resolved once when
+    /// the listing was read, because resolving it means a MIME glob match
+    /// per file and this function runs again every time the selection
+    /// moves. What is left here is formatting.
     #[must_use]
     pub fn rows(&self) -> Vec<Row> {
         self.shown()
             .into_iter()
             .map(|e| {
-                let detail = if e.kind == Kind::Dir {
-                    "<dir>".to_owned()
-                } else {
-                    format!("{}   {}", dir::format_size(e), dir::format_mtime(e.mtime))
+                let detail = match e.kind {
+                    Kind::Dir => "<dir>".to_owned(),
+                    // The link marker stays in the *detail* column now
+                    // that the icon column says what the target is: a
+                    // symlinked directory and a real one draw the same
+                    // folder, and `→` is the only thing that
+                    // distinguishes them. Dropping it would make a link
+                    // indistinguishable from what it points at.
+                    Kind::Symlink if e.symlink_dir => "→ <dir>".to_owned(),
+                    Kind::Symlink => {
+                        format!("→ {}   {}", dir::format_size(e), dir::format_mtime(e.mtime))
+                    }
+                    _ => format!("{}   {}", dir::format_size(e), dir::format_mtime(e.mtime)),
                 };
-                let icon = match e.kind {
-                    Kind::Dir => "/",
-                    Kind::Symlink => "~",
-                    _ => " ",
-                };
-                Row::new(e.name.clone()).icon(icon).detail(detail)
+                Row::new(e.name.clone()).icon(e.icon).detail(detail)
             })
             .collect()
     }
@@ -903,7 +915,7 @@ pub fn relist(s: &mut Files, ui: &mut Ui<Files>) {
         start_scan(s, ui, &cwd);
         return;
     }
-    match dir::read_dir(&cwd) {
+    match dir::read_dir(&cwd, &s.globs) {
         Ok(mut entries) => {
             dir::sort(&mut entries, s.sort);
             s.entries = entries;
@@ -923,13 +935,13 @@ pub fn relist(s: &mut Files, ui: &mut Ui<Files>) {
 /// directory for the fifty milliseconds it takes is better than a blank
 /// window, and the status line says what is happening.
 fn start_scan(s: &mut Files, ui: &mut Ui<Files>, cwd: &Path) {
-    let scan = match dir::Scan::start(cwd.to_path_buf(), s.sort) {
+    let scan = match dir::Scan::start(cwd.to_path_buf(), s.sort, s.globs.clone()) {
         Ok(scan) => scan,
         Err(e) => {
             // A thread we could not start is not a reason to show
             // nothing: fall back to reading it here, slow but correct.
             s.message = Some(format!("background read failed ({e}), reading inline"));
-            match dir::read_dir(cwd) {
+            match dir::read_dir(cwd, &s.globs) {
                 Ok(mut entries) => {
                     dir::sort(&mut entries, s.sort);
                     s.entries = entries;
@@ -1060,7 +1072,7 @@ fn watch_fired(s: &mut Files, ui: &mut Ui<Files>) {
         start_scan(s, ui, &cwd);
         return;
     }
-    if let Ok(mut entries) = dir::read_dir(&cwd) {
+    if let Ok(mut entries) = dir::read_dir(&cwd, &s.globs) {
         dir::sort(&mut entries, s.sort);
         s.entries = entries;
         s.listings += 1;
@@ -1138,13 +1150,12 @@ pub fn activate(s: &mut Files, ui: &mut Ui<Files>, index: usize) {
         return;
     };
     let path = s.cwd.join(&entry.name);
-    // A symlink is followed here and nowhere else: the listing does not
-    // stat through it (that is a syscall per row), but activating one
-    // row is one syscall and "enter the directory this points at" is
-    // what a double-click means.
-    let is_dir = entry.kind == Kind::Dir
-        || (entry.kind == Kind::Symlink && std::fs::metadata(&path).is_ok_and(|m| m.is_dir()));
-    if is_dir {
+    // A symlink's target was resolved when the listing was read (one
+    // `metadata` per link, `dir::read_dir`), which is also what put a
+    // folder in its icon column — so "enter the directory this points at"
+    // and "show it as a folder" cannot disagree, and activating a row
+    // costs no syscall at all.
+    if entry.opens_a_directory() {
         navigate(s, ui, path);
         return;
     }

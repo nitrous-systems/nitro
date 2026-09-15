@@ -65,12 +65,77 @@ pub struct Entry {
     pub name: String,
     /// What it is.
     pub kind: Kind,
+    /// Whether this is a symlink whose target is a directory.
+    ///
+    /// Resolved **once per listing**, with one `metadata` call per symlink
+    /// and none at all for anything else — see [`read_dir`]. It is a field
+    /// rather than a method because the answer costs a syscall: a
+    /// `rows()` that asked it per repaint would `stat` every link on every
+    /// selection change, and `rows()` is re-run for one.
+    pub symlink_dir: bool,
+    /// The **name** of the symbolic icon this row shows, resolved once
+    /// when the listing was read.
+    ///
+    /// A name and not a glyph: the server owns the artwork
+    /// (`docs/icons.md`). Resolved here rather than in
+    /// [`crate::Files::rows`] because resolving it means a MIME lookup —
+    /// a glob match per file — and `rows()` runs again whenever the
+    /// selection moves. See [`icon_of`].
+    pub icon: &'static str,
     /// Size in bytes; `0` for a directory, and `0` when the `stat`
     /// failed.
     pub size: u64,
     /// Modification time, in seconds since the Unix epoch, and negative
     /// before it.
     pub mtime: i64,
+}
+
+impl Entry {
+    /// Whether activating this row enters a directory.
+    ///
+    /// A directory, or a symlink that points at one — the follow happened
+    /// when the listing was read, so asking costs nothing here.
+    #[must_use]
+    pub fn opens_a_directory(&self) -> bool {
+        self.kind == Kind::Dir || (self.kind == Kind::Symlink && self.symlink_dir)
+    }
+}
+
+/// The icon a directory gets, and a symlink pointing at one.
+pub const FOLDER_ICON: &str = "folder-fill";
+/// The icon a file with no more specific type gets, and a symlink that
+/// does not point at a directory.
+pub const FILE_ICON: &str = "file-earmark";
+/// The icon a fifo, socket, device node or failed `stat` gets.
+///
+/// `hdd` rather than a file icon because each of those is a *device or
+/// channel* rather than a document, and the one thing a user must not
+/// conclude from the column is "this is a file I can open".
+pub const OTHER_ICON: &str = "hdd";
+
+/// The symbolic icon name for one entry, given the MIME table.
+///
+/// The whole type → icon decision for a listing in one function, so that
+/// [`read_dir`] and the background [`Scan`] cannot disagree about it. The
+/// MIME half is [`crate::mime::icon_for`]; everything else is the kind.
+#[must_use]
+pub fn icon_of(
+    kind: Kind,
+    name: &str,
+    symlink_dir: bool,
+    globs: &[crate::mime::Glob],
+) -> &'static str {
+    match kind {
+        Kind::Dir => FOLDER_ICON,
+        // A symlink shows what it *points at*, because that is what
+        // activating it does. The link itself is still marked, in the
+        // detail column — see `Files::rows`.
+        Kind::Symlink if symlink_dir => FOLDER_ICON,
+        Kind::Symlink => FILE_ICON,
+        Kind::Other => OTHER_ICON,
+        Kind::File => crate::mime::type_of(Path::new(name), globs)
+            .map_or(FILE_ICON, |m| crate::mime::icon_for(&m)),
+    }
 }
 
 /// The sort order, which `Ctrl+S` cycles through.
@@ -103,7 +168,7 @@ impl Sort {
 /// Read one directory into rows.
 ///
 /// Uses `symlink_metadata`, so a symlink is reported as a symlink and its
-/// target is never touched — see [`Kind`].
+/// target is never touched for its *kind* — see [`Kind`].
 ///
 /// An entry whose `stat` fails (a symlink into a directory we may not
 /// search, a file deleted between the `getdents` and the `stat`) is kept
@@ -113,10 +178,25 @@ impl Sort {
 /// `read_dir` itself is an error, because a directory that cannot be
 /// opened has no rows at all and the app must say so.
 ///
+/// # What this costs, per row
+///
+/// One `symlink_metadata`, as before, plus two things the icon column
+/// needs and pays for **here rather than per repaint**:
+///
+/// * a **`metadata` call per symlink**, and only per symlink, to learn
+///   whether it points at a directory. That is the one place this module
+///   follows a link, and it is bounded by the number of links in the
+///   directory rather than by its size;
+/// * a **glob match per regular file** ([`crate::mime::type_of`]), which
+///   is a suffix comparison against the table and no I/O at all.
+///
+/// Both land in [`Entry`] fields, so [`crate::Files::rows`] — which is
+/// re-run whenever the selection moves — is pure formatting.
+///
 /// # Errors
 /// Whatever `read_dir` returns: the path is missing, is not a directory,
 /// or may not be read.
-pub fn read_dir(path: &Path) -> std::io::Result<Vec<Entry>> {
+pub fn read_dir(path: &Path, globs: &[crate::mime::Glob]) -> std::io::Result<Vec<Entry>> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(path)? {
         // An individual `DirEntry` error is a read that failed partway
@@ -135,10 +215,19 @@ pub fn read_dir(path: &Path) -> std::io::Result<Vec<Entry>> {
             .ok()
             .or_else(|| md.as_ref().ok().map(std::fs::Metadata::file_type))
             .map_or(Kind::Other, kind_of);
+        // One `stat` *through* the link, for links only. A link into a
+        // dead NFS mount can block here — which is the cost the `Kind`
+        // doc comment refuses to pay per row, and pays only for the rows
+        // that are actually links, once per listing.
+        let symlink_dir =
+            kind == Kind::Symlink && std::fs::metadata(entry.path()).is_ok_and(|m| m.is_dir());
+        let icon = icon_of(kind, &name, symlink_dir, globs);
         let (size, mtime) = md.map_or((0, 0), |m| (m.len(), m.mtime()));
         out.push(Entry {
             name,
             kind,
+            symlink_dir,
+            icon,
             size,
             mtime,
         });
@@ -475,18 +564,24 @@ pub struct Scan {
 }
 
 impl Scan {
-    /// Start reading `path` on a thread, sorted by `by`.
+    /// Start reading `path` on a thread, sorted by `by`, with `globs` as
+    /// the MIME table its icon column is resolved against.
     ///
     /// The sort happens on the thread as well, because sorting fifty
     /// thousand rows is the same kind of work as reading them and doing
     /// it on the loop would give back the pause the thread exists to
-    /// avoid.
+    /// avoid. The MIME lookups go with them, for the same reason and with
+    /// more force: a thousand glob matches on the loop is the cost this
+    /// whole module exists to keep off it. The table is **cloned** onto
+    /// the thread — a `globs2` on this box is ~2 000 small rules and the
+    /// alternative is an `Arc` in the app state for a copy made once per
+    /// big directory.
     ///
     /// # Errors
     /// If the pipe cannot be created or the thread cannot be spawned.
     /// Reading the directory itself fails *later*, as the value
     /// [`Scan::take`] hands back.
-    pub fn start(path: PathBuf, by: Sort) -> std::io::Result<Scan> {
+    pub fn start(path: PathBuf, by: Sort, globs: Vec<crate::mime::Glob>) -> std::io::Result<Scan> {
         let (read, write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
         let flags = rustix::fs::fcntl_getfl(&read)?;
         rustix::fs::fcntl_setfl(&read, flags | rustix::fs::OFlags::NONBLOCK)?;
@@ -495,7 +590,7 @@ impl Scan {
         let join = std::thread::Builder::new()
             .name("nitro-files-scan".to_owned())
             .spawn(move || {
-                let mut result = read_dir(&dir);
+                let mut result = read_dir(&dir, &globs);
                 if let Ok(entries) = &mut result {
                     sort(entries, by);
                 }
@@ -593,6 +688,8 @@ mod tests {
         Entry {
             name: name.to_owned(),
             kind,
+            symlink_dir: false,
+            icon: icon_of(kind, name, false, &[]),
             size,
             mtime,
         }
@@ -624,7 +721,7 @@ mod tests {
         std::fs::create_dir(dir.join("sub")).expect("mkdir");
         std::os::unix::fs::symlink(dir.join("a.txt"), dir.join("link")).expect("symlink");
 
-        let mut entries = read_dir(&dir).expect("read the directory");
+        let mut entries = read_dir(&dir, &[]).expect("read the directory");
         sort(&mut entries, Sort::Name);
         assert_eq!(names(&entries), vec!["sub", "a.txt", "link"]);
         let by = |n: &str| {
@@ -652,16 +749,191 @@ mod tests {
         // one you cannot use to find out why a file is broken.
         let dir = scratch("dangling");
         std::os::unix::fs::symlink(dir.join("nowhere"), dir.join("dangling")).expect("symlink");
-        let entries = read_dir(&dir).expect("read");
+        let entries = read_dir(&dir, &[]).expect("read");
         assert_eq!(names(&entries), vec!["dangling"]);
         assert_eq!(entries[0].kind, Kind::Symlink);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
+    fn a_listing_resolves_each_rows_icon_once_and_follows_only_the_symlinks() {
+        // The icon column, from the model's side: every row carries the
+        // *name* of an icon, resolved while the directory was read.
+        let dir = scratch("icons");
+        std::fs::write(dir.join("notes.txt"), b"x").expect("write");
+        std::fs::write(dir.join("main.rs"), b"x").expect("write");
+        std::fs::write(dir.join("photo.png"), b"x").expect("write");
+        std::fs::write(dir.join("song.mp3"), b"x").expect("write");
+        std::fs::write(dir.join("clip.mp4"), b"x").expect("write");
+        std::fs::write(dir.join("bundle.zip"), b"x").expect("write");
+        std::fs::write(dir.join("mystery.qqq"), b"x").expect("write");
+        std::fs::create_dir(dir.join("sub")).expect("mkdir");
+        std::os::unix::fs::symlink(dir.join("sub"), dir.join("to-dir")).expect("symlink");
+        std::os::unix::fs::symlink(dir.join("notes.txt"), dir.join("to-file")).expect("symlink");
+        std::os::unix::fs::symlink(dir.join("nowhere"), dir.join("dangling")).expect("symlink");
+        std::fs::write(dir.join("file-with-fifo-name"), b"x").expect("write");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            dir.join("pipe"),
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_bits_truncate(0o600),
+            0,
+        )
+        .expect("mkfifo");
+
+        // An empty glob table: the built-in extension table answers, so
+        // this test says the same thing on a box with
+        // `shared-mime-info` and on one without.
+        let entries = read_dir(&dir, &[]).expect("read");
+        let icon = |n: &str| {
+            entries
+                .iter()
+                .find(|e| e.name == n)
+                .map_or_else(|| panic!("no entry {n}"), |e| e.icon)
+        };
+        assert_eq!(icon("sub"), FOLDER_ICON);
+        assert_eq!(icon("notes.txt"), "file-earmark-text");
+        assert_eq!(icon("main.rs"), "file-earmark-code");
+        assert_eq!(icon("photo.png"), "file-earmark-image");
+        assert_eq!(icon("song.mp3"), "file-earmark-music");
+        assert_eq!(icon("clip.mp4"), "file-earmark-play");
+        assert_eq!(icon("bundle.zip"), "file-earmark-zip");
+        assert_eq!(icon("mystery.qqq"), FILE_ICON, "an unknown type is a file");
+        // A fifo is not a document, and the icon must not invite the user
+        // to open it as one.
+        assert_eq!(icon("pipe"), OTHER_ICON);
+        // A symlink shows what it points at, because that is what
+        // activating it does — and a dangling one shows a file rather
+        // than a folder, since its `metadata` fails.
+        assert_eq!(icon("to-dir"), FOLDER_ICON);
+        assert_eq!(icon("to-file"), FILE_ICON);
+        assert_eq!(icon("dangling"), FILE_ICON);
+
+        // The follow is recorded, so nothing downstream needs to `stat`
+        // again: `opens_a_directory` is the one question activation asks.
+        let by = |n: &str| {
+            entries
+                .iter()
+                .find(|e| e.name == n)
+                .cloned()
+                .unwrap_or_else(|| panic!("no entry {n}"))
+        };
+        assert!(by("to-dir").symlink_dir && by("to-dir").opens_a_directory());
+        assert!(!by("to-file").symlink_dir && !by("to-file").opens_a_directory());
+        assert!(!by("dangling").symlink_dir);
+        assert!(by("sub").opens_a_directory());
+        assert!(!by("notes.txt").opens_a_directory());
+        // And the *kind* is untouched by the follow: a symlink to a
+        // directory is still a symlink, so it still sorts with the files
+        // (`Kind`'s doc comment, and the reason the icon is a separate
+        // field rather than a re-derived kind).
+        assert_eq!(by("to-dir").kind, Kind::Symlink);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_system_glob_table_decides_the_icon_when_there_is_one() {
+        // The half the built-in table cannot show: with a `globs2` the
+        // machine's own answer wins, and the icon follows it. A `.ttf` has
+        // no built-in type, so this is the same name drawing two
+        // different icons with one variable.
+        let dir = scratch("icons-globs");
+        std::fs::write(dir.join("Vera.ttf"), b"x").expect("write");
+        let without = read_dir(&dir, &[]).expect("read");
+        assert_eq!(without[0].icon, FILE_ICON);
+        let globs = crate::mime::parse_globs2("50:font/ttf:*.ttf\n");
+        let with = read_dir(&dir, &globs).expect("read");
+        assert_eq!(with[0].icon, "file-earmark-font");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_thousand_row_listing_stays_inside_a_frame() {
+        // The cost of the icon column, measured rather than argued, with
+        // the **added** work isolated rather than a before/after of the
+        // whole function: the third arm below times a thousand `icon_of`
+        // calls against the same table with no filesystem in the way, so
+        // it is the icon column's own cost and nothing else's.
+        //
+        // The bound is deliberately loose — 100 ms for a thousand rows on
+        // any machine this runs on — because a tight one is a flaky test
+        // readers learn to re-run, which is worse than no test. What it
+        // guards is a *shape* regression: a lookup that started opening
+        // files, or one that moved from per-listing to per-repaint. The
+        // numbers beside it are the result, and they are in
+        // `docs/files.md`.
+        let dir = scratch("thousand");
+        for i in 0..1_000 {
+            let ext = match i % 5 {
+                0 => "txt",
+                1 => "rs",
+                2 => "png",
+                3 => "mp3",
+                _ => "zip",
+            };
+            std::fs::write(dir.join(format!("f{i:04}.{ext}")), b"x").expect("write");
+        }
+        // A synthetic table the size of a real `globs2` (~2 000 rules on
+        // this box), so the measurement is of the worst case the app
+        // actually meets rather than of an empty table.
+        let text = (0..2_000).fold(String::new(), |mut acc, i| {
+            use std::fmt::Write as _;
+            let _ = writeln!(acc, "50:application/x-synthetic-{i}:*.ext{i}");
+            acc
+        });
+        let globs = crate::mime::parse_globs2(&text);
+        assert_eq!(globs.len(), 2_000);
+
+        let start = std::time::Instant::now();
+        let entries = read_dir(&dir, &globs).expect("read");
+        let with = start.elapsed();
+        assert_eq!(entries.len(), 1_000);
+        // Every row really did get an icon, so the timing is of the work
+        // and not of a lookup that was skipped.
+        assert!(
+            entries.iter().all(|e| e.icon.starts_with("file-earmark")),
+            "a row came back without an icon"
+        );
+        assert!(
+            entries.iter().any(|e| e.icon == "file-earmark-image"),
+            "the types really were resolved"
+        );
+
+        let start = std::time::Instant::now();
+        let _ = read_dir(&dir, &[]).expect("read");
+        let without = start.elapsed();
+
+        // The icon column's own cost: the same thousand names through the
+        // same table, with no `getdents` and no `stat` at all.
+        let names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
+        let start = std::time::Instant::now();
+        let mut sink = 0usize;
+        for n in &names {
+            sink += icon_of(Kind::File, n, false, &globs).len();
+        }
+        let lookups = start.elapsed();
+        assert!(sink > 0, "the lookups were optimised away");
+
+        eprintln!(
+            "1000 rows: {:.1} ms listing with a 2000-rule globs2, {:.1} ms with an \
+             empty table, {:.1} ms for the 1000 MIME lookups alone",
+            with.as_secs_f64() * 1e3,
+            without.as_secs_f64() * 1e3,
+            lookups.as_secs_f64() * 1e3
+        );
+        assert!(
+            with.as_millis() < 100,
+            "a thousand-row listing took {with:?}, which is past a frame by an order of magnitude"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn reading_a_missing_directory_is_an_error_value() {
         let missing = std::env::temp_dir().join(format!("nitro-files-nope-{}", std::process::id()));
-        assert!(read_dir(&missing).is_err());
+        assert!(read_dir(&missing, &[]).is_err());
     }
 
     #[test]
@@ -869,7 +1141,7 @@ mod tests {
         }
         std::fs::create_dir(dir.join("adir")).expect("mkdir");
 
-        let mut scan = Scan::start(dir.clone(), Sort::Name).expect("start the scan");
+        let mut scan = Scan::start(dir.clone(), Sort::Name, Vec::new()).expect("start the scan");
         assert_eq!(scan.path(), dir.as_path());
 
         // Exactly what the app loop does: sleep on the descriptor until
@@ -892,7 +1164,7 @@ mod tests {
     #[test]
     fn a_scan_of_a_missing_directory_delivers_the_error_not_a_panic() {
         let missing = std::env::temp_dir().join(format!("nitro-files-gone-{}", std::process::id()));
-        let mut scan = Scan::start(missing, Sort::Name).expect("start");
+        let mut scan = Scan::start(missing, Sort::Name, Vec::new()).expect("start");
         assert!(wait_readable(&scan, 10), "the doorbell rang");
         let result = scan.take().expect("a result");
         assert!(result.is_err(), "the failure arrives as a value");
@@ -907,7 +1179,7 @@ mod tests {
         for i in 0..50 {
             std::fs::write(dir.join(format!("f{i}")), b"").expect("write");
         }
-        let scan = Scan::start(dir.clone(), Sort::Name).expect("start");
+        let scan = Scan::start(dir.clone(), Sort::Name, Vec::new()).expect("start");
         drop(scan);
         std::thread::sleep(std::time::Duration::from_millis(50));
         // Still here.

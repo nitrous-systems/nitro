@@ -221,9 +221,9 @@ fn looks_like_a_timestamp(s: &str) -> bool {
 fn a_directory_lists_its_folders_first_then_its_files_by_name() {
     // The headline, and the one assertion made through the list widget's
     // visible rows rather than the model: directories first, then names
-    // case-insensitively, each row carrying its glyph and either `<dir>`
-    // or a size and a date. If this failed, every other test in this file
-    // would be asserting about rows the user cannot see.
+    // case-insensitively, each row carrying its icon name and either
+    // `<dir>` or a size and a date. If this failed, every other test in
+    // this file would be asserting about rows the user cannot see.
     let (root, dir) = fixture("listing");
     std::fs::create_dir_all(dir.join("alpha")).expect("a subdirectory");
     std::fs::create_dir_all(dir.join("Beta")).expect("a subdirectory");
@@ -237,7 +237,10 @@ fn a_directory_lists_its_folders_first_then_its_files_by_name() {
         ["alpha", "Beta", "notes.txt", "Photo.png"],
         "directories first, then case-insensitive name"
     );
-    assert_eq!(rows[0].0, "/", "a directory carries the folder glyph");
+    assert_eq!(
+        rows[0].0, "folder-fill",
+        "a directory carries the folder icon's name"
+    );
     assert_eq!(rows[0].2, "<dir>", "and no size");
     assert_eq!(rows[1].2, "<dir>");
 
@@ -1200,6 +1203,195 @@ fn every_part_is_addressable_the_way_hey_addresses_it() {
         nitro_ui::introspect::get_prop(h.ui(), &format!("window/{}", names::STATUS), "value")
             .expect("the status line");
     assert_eq!(said, "1 items, 0 selected");
+
+    let _ = std::fs::remove_dir_all(&root);
+    h.quit();
+}
+
+#[test]
+fn every_type_gets_its_own_icon_and_the_server_draws_them() {
+    // The icon column end to end: one file of each family in a real
+    // directory, read by the real `read_dir`, formatted by the real
+    // `rows`, and drawn by a real server. Ten distinct names in one
+    // listing, which is what the screenshot on the box shows.
+    //
+    // The MIME table is **empty** (see `app`), so every answer here comes
+    // from the built-in extension table — which is exactly the box with
+    // no `shared-mime-info`, and the arm that has to work.
+    let (root, dir) = fixture("icons");
+    std::fs::create_dir_all(dir.join("adir")).expect("a subdirectory");
+    write(&dir.join("b.txt"), "text");
+    write(&dir.join("c.rs"), "fn main() {}");
+    write(&dir.join("d.png"), "not really a png");
+    write(&dir.join("e.mp3"), "not really an mp3");
+    write(&dir.join("f.mp4"), "not really an mp4");
+    write(&dir.join("g.zip"), "not really a zip");
+    write(&dir.join("h.qqq"), "an unknown extension");
+    std::os::unix::fs::symlink(dir.join("adir"), dir.join("i-to-dir")).expect("symlink");
+    std::os::unix::fs::symlink(dir.join("b.txt"), dir.join("j-to-file")).expect("symlink");
+    let (h, ids) = app(&dir, &root.join("xdg"));
+
+    let got: Vec<(String, String)> = rows(&h, ids)
+        .into_iter()
+        .map(|(icon, text, _)| (text, icon))
+        .collect();
+    let want = [
+        ("adir", "folder-fill"),
+        ("b.txt", "file-earmark-text"),
+        ("c.rs", "file-earmark-code"),
+        ("d.png", "file-earmark-image"),
+        ("e.mp3", "file-earmark-music"),
+        ("f.mp4", "file-earmark-play"),
+        ("g.zip", "file-earmark-zip"),
+        ("h.qqq", "file-earmark"),
+        // A symlink shows what it points at, because that is what
+        // activating it does — and the arrow in the detail column is the
+        // only thing left that says it is a link.
+        ("i-to-dir", "folder-fill"),
+        ("j-to-file", "file-earmark"),
+    ];
+    // The list is virtualised, so only what fits is on screen; assert on
+    // the prefix that is, and that it is long enough to be a test.
+    assert!(
+        got.len() >= 6,
+        "too few visible rows to say anything: {got:?}"
+    );
+    for (name, icon) in want.iter().take(got.len()) {
+        let row = got
+            .iter()
+            .find(|(t, _)| t == name)
+            .unwrap_or_else(|| panic!("no row {name} in {got:?}"));
+        assert_eq!(&row.1, icon, "the icon for {name}");
+    }
+
+    // The **distinct** names on screen are what the server cached, one
+    // entry per `(name, px)`. That is the arithmetic that separates "the
+    // rows name artwork" from "each row carries its own".
+    let distinct: std::collections::BTreeSet<&str> = got
+        .iter()
+        .take(want.len())
+        .map(|(_, i)| i.as_str())
+        .collect();
+    assert!(
+        h.server().stat("icon_renders") > 0,
+        "the server rasterised no icon at all"
+    );
+    assert_eq!(
+        h.server().stat("icons_cached") as usize,
+        distinct.len(),
+        "cached entries are the distinct icons on screen, not the rows: {distinct:?}"
+    );
+    assert_eq!(
+        h.server().stat("icon_refusals"),
+        0,
+        "every name the app used is in the server's set"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    h.quit();
+}
+
+#[test]
+fn a_symlinked_directory_is_a_folder_icon_and_still_marked_as_a_link() {
+    // The one row where the icon deliberately lies about the *kind*: a
+    // symlink to a directory draws a folder, because activating it enters
+    // one. The arrow in the detail column is what keeps it honest, and
+    // dropping it would make a link indistinguishable from its target.
+    let (root, dir) = fixture("symlink-icon");
+    std::fs::create_dir_all(dir.join("real")).expect("a subdirectory");
+    write(&dir.join("target.txt"), "x");
+    std::os::unix::fs::symlink(dir.join("real"), dir.join("to-real")).expect("symlink");
+    std::os::unix::fs::symlink(dir.join("target.txt"), dir.join("to-file")).expect("symlink");
+    std::os::unix::fs::symlink(dir.join("nowhere"), dir.join("dangling")).expect("symlink");
+    let (mut h, ids) = app(&dir, &root.join("xdg"));
+
+    let by = |h: &Harness<Files>, name: &str| -> (String, String) {
+        rows(h, ids)
+            .into_iter()
+            .find(|(_, t, _)| t == name)
+            .map_or_else(
+                || panic!("no row {name}"),
+                |(icon, _, detail)| (icon, detail),
+            )
+    };
+    let (icon, detail) = by(&h, "to-real");
+    assert_eq!(icon, "folder-fill", "a link to a directory is a folder");
+    assert_eq!(detail, "→ <dir>", "and the arrow says it is a link");
+    let (icon, detail) = by(&h, "to-file");
+    assert_eq!(icon, "file-earmark");
+    assert!(detail.starts_with('→'), "still marked: {detail:?}");
+    // A dangling link cannot be followed, so it is a file rather than a
+    // folder — which is the honest answer and is not a panic.
+    let (icon, _) = by(&h, "dangling");
+    assert_eq!(icon, "file-earmark");
+
+    // And activation follows the cached answer rather than re-`stat`ing:
+    // entering the row really enters the directory.
+    let index = names_of(&h, ids)
+        .iter()
+        .position(|n| n == "to-real")
+        .expect("the row");
+    {
+        let (ui, state) = h.parts();
+        nitro_ui::introspect::invoke(
+            ui,
+            state,
+            &format!("window/{}", names::LIST),
+            "activate",
+            Some(&index.to_string()),
+        )
+        .expect("activate the link");
+    }
+    h.settle();
+    assert_eq!(
+        h.state().cwd(),
+        dir.join("to-real"),
+        "activating a link to a directory entered it"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    h.quit();
+}
+
+#[test]
+fn a_selection_move_does_not_re_resolve_a_single_mime_type() {
+    // The cost claim, and it is asserted on syscalls rather than on a
+    // clock: `rows()` is re-run whenever the selection changes (see
+    // `refresh_rows`), so a MIME lookup inside it would mean a glob match
+    // per file per keystroke and a `stat` per symlink per keystroke.
+    //
+    // The instrument is the `Entry` itself: the icon is a field, so the
+    // rows a second `rows()` produces must be *identical* to the first
+    // without the model having been re-read. A `listings` counter that did
+    // not move is what says the directory was not re-read.
+    let (root, dir) = fixture("icon-cost");
+    for i in 0..20 {
+        write(&dir.join(format!("f{i:02}.txt")), "x");
+    }
+    std::os::unix::fs::symlink(dir.join("f00.txt"), dir.join("link")).expect("symlink");
+    let (mut h, ids) = app(&dir, &root.join("xdg"));
+    let before = h.state().listings();
+    let first = rows(&h, ids);
+
+    // Walk the selection down the list. Every one of these calls
+    // `refresh_rows` → `rows()`.
+    for _ in 0..10 {
+        h.key(key::DOWN);
+    }
+    h.settle();
+    assert_eq!(
+        h.state().listings(),
+        before,
+        "moving the selection re-listed the directory"
+    );
+    // The rows are unchanged, which is what makes the toolkit's `SetIcon`
+    // diff answer zero: the icon names are the same objects they were.
+    let after = rows(&h, ids);
+    assert_eq!(
+        first.iter().map(|(i, _, _)| i).collect::<Vec<_>>(),
+        after.iter().map(|(i, _, _)| i).collect::<Vec<_>>(),
+        "the icon column changed when only the selection moved"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
     h.quit();

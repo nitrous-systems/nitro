@@ -34,8 +34,8 @@
 //!
 //! # The rows are data, not widgets
 //!
-//! The model is a [`Row`] per line — an optional glyph, a primary text
-//! and a right-aligned secondary text — and the widget owns it. There is
+//! The model is a [`Row`] per line — an optional **icon name**, a primary
+//! text and a right-aligned secondary text — and the widget owns it. There is
 //! no per-row widget, no per-row callback and no per-row state: a row is
 //! addressed by its index, and that index is what `on_activate` and
 //! `on_select` are handed.
@@ -69,9 +69,11 @@ use crate::event::{Event, Handled, button, key, mods};
 use crate::layout::{Constraints, ShrinkFloor};
 use crate::theme::TextStyle;
 use crate::ui::{Ui, WidgetMut};
-use crate::widget::{Access, EventCx, LayoutCx, MeasureCx, PaintCx, Role, Slot, TextRun, Widget};
+use crate::widget::{
+    Access, EventCx, IconTint, LayoutCx, MeasureCx, PaintCx, Role, Slot, TextRun, Widget,
+};
 
-/// Paint slots a materialised row occupies: its background, its glyph,
+/// Paint slots a materialised row occupies: its background, its icon,
 /// its primary text and its secondary text.
 const SLOTS_PER_ROW: Slot = 4;
 /// Slot of the list's own background rect. It is what makes the widget
@@ -90,24 +92,54 @@ const TYPE_AHEAD_GAP: Duration = Duration::from_millis(900);
 /// Two clicks closer together than this on the same row are a
 /// double-click, which activates it.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
-/// Width reserved for the glyph slot, as the spec's "16 px icon".
+/// Side of a row's icon, and the width of the column it sits in.
+///
+/// 16 is one of the four sizes the artwork is drawn for (`docs/icons.md`)
+/// and it fits a row whose height is a line of 13 px text plus padding
+/// without moving it — which is the contract: **a row that gained an icon
+/// is the same height as one that has not.**
 const ICON_W: f32 = 16.0;
+/// Gap between a row's icon column and its label.
+const ICON_GAP: f32 = 4.0;
 /// Horizontal padding inside a row.
 const ROW_PAD: f32 = 6.0;
 
 /// One line of a [`List`].
 ///
-/// Three fields rather than a formatted string, because the secondary
+/// Separate fields rather than a formatted string, because the secondary
 /// text is right-aligned in a column of its own: a size or a date lines
 /// up down the list only if the widget knows which part of the row it
 /// is.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// `Eq` is deliberately **not** derived — [`Row::icon_size`] is an `f32`
+/// — and nothing in the widget needs it: rows are compared by the paint
+/// slots' cached messages, which is a comparison of what was *sent*.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Row {
-    /// A short glyph shown in a 16 px column: `"▸"`, `"/"`, whatever the
-    /// app draws with the fonts the server happens to have. There is no
-    /// icon theme and no image here on purpose — an icon loader is a
-    /// feature, and this is the widget.
+    /// The **name** of a symbolic icon shown in a fixed column before the
+    /// label: `"folder-fill"`, `"file-earmark-text"`.
+    ///
+    /// A name and not a glyph, and not a picture: the server owns the
+    /// artwork, rasterises it at the output's scale and tints it from the
+    /// palette, so a row's icon survives a remote link and a scheme flip
+    /// for free. See `docs/icons.md`. Without
+    /// [`caps::ICONS`](nitro_wire::types::caps::ICONS) the column
+    /// collapses and the label starts where it would have, which is the
+    /// same bargain a leading-icon [`Button`](crate::widgets::Button)
+    /// makes: a row with a gap where an icon would be is worse than a row
+    /// without one.
     pub icon: Option<String>,
+    /// How that icon is coloured; `None` means
+    /// [`ColorRole::Text`](crate::ColorRole::Text).
+    ///
+    /// Symbolic only in practice — a list row is the app's own furniture,
+    /// not a name that came out of a `.desktop` file — but the field is an
+    /// [`IconTint`] rather than a role so that a row *can* carry an
+    /// application icon without a second field, and gets the same
+    /// `BadIcon` handling everything else does.
+    pub icon_tint: Option<IconTint>,
+    /// The icon's square side in logical pixels; `None` means 16.
+    pub icon_size: Option<f32>,
     /// The row's main text, left-aligned and clipped to its column.
     pub text: String,
     /// Secondary text, right-aligned: a size, a date, a count.
@@ -120,16 +152,50 @@ impl Row {
     pub fn new(text: impl Into<String>) -> Self {
         Self {
             icon: None,
+            icon_tint: None,
+            icon_size: None,
             text: text.into(),
             detail: String::new(),
         }
     }
 
-    /// The same row with a glyph in its icon column.
+    /// The same row with a symbolic icon, named, in its icon column.
     #[must_use]
     pub fn icon(mut self, icon: impl Into<String>) -> Self {
         self.icon = Some(icon.into());
         self
+    }
+
+    /// The same row with an explicit tint for its icon.
+    #[must_use]
+    pub fn icon_tint(mut self, tint: IconTint) -> Self {
+        self.icon_tint = Some(tint);
+        self
+    }
+
+    /// The same row with an explicit icon side, in logical pixels.
+    ///
+    /// The column grows with it, so a bigger icon costs width and never
+    /// height: the row is as tall as the list says it is.
+    #[must_use]
+    pub fn icon_size(mut self, px: f32) -> Self {
+        self.icon_size = Some(px);
+        self
+    }
+
+    /// The icon's square side: the explicit one, or 16.
+    #[must_use]
+    pub fn side(&self) -> f32 {
+        self.icon_size
+            .filter(|p| p.is_finite() && *p > 0.0)
+            .unwrap_or(ICON_W)
+    }
+
+    /// The tint the icon takes: the explicit one, or the row text's role.
+    #[must_use]
+    pub fn tint(&self) -> IconTint {
+        self.icon_tint
+            .unwrap_or(IconTint::Role(nitro_core::Role::Text))
     }
 
     /// The same row with right-aligned secondary text.
@@ -643,6 +709,16 @@ struct RowPaint {
     text: Color,
     detail: Color,
     selection: Color,
+    /// Whether the server had [`caps::ICONS`](nitro_wire::types::caps::ICONS)
+    /// when these rows were painted.
+    ///
+    /// In `RowPaint` rather than read per row because it is exactly the
+    /// kind of change the per-slot cache cannot see: a capability going
+    /// away moves every row's label and destroys every icon node while
+    /// leaving "same row, same generation, same selection" true. Same
+    /// argument as the colours beside it, and the same field that pins
+    /// it — see [`List::painted_with`].
+    icons: bool,
 }
 
 impl<S: 'static> List<S> {
@@ -698,7 +774,19 @@ impl<S: 'static> List<S> {
         self.paint_row_text(cx, group, slot, index, y, paint);
     }
 
-    /// The three text nodes of a row: glyph, primary, secondary.
+    /// The three content nodes of a row: the icon, the primary text and
+    /// the secondary text.
+    ///
+    /// The icon is an **`Icon` node named by the row**, not a glyph in a
+    /// text node, and the two consequences worth knowing are both here:
+    /// it is guarded by [`caps::ICONS`](nitro_wire::types::caps::ICONS)
+    /// (without which the column collapses and the label starts where it
+    /// would have, exactly as a leading-icon
+    /// [`Button`](crate::widgets::Button) does), and it costs a `SetIcon`
+    /// **only when the name changes**, because the paint slot caches the
+    /// last one it requested. That is what makes a `set_rows` over an
+    /// unchanged listing free and a scroll that merely re-anchors the
+    /// window cost the rows whose icon genuinely differs.
     fn paint_row_text(
         &self,
         cx: &mut PaintCx<'_, S>,
@@ -711,17 +799,36 @@ impl<S: 'static> List<S> {
         let row = self.model.row(index);
         let top = top_y + ((self.row_h - paint.style.size_px) / 2.0).max(0.0);
         let line = self.line_h.max(paint.style.size_px);
-        let has_icon = row.icon.is_some();
-        if let Some(icon) = &row.icon {
-            cx.text_in(
+        // The column is this row's own icon side rather than the widest in
+        // the model: finding that maximum means walking every row, which
+        // is the one thing a virtualised list must never do. Every list in
+        // this tree uses one size, so the labels line up; a list that
+        // mixes sizes indents per row instead of centring in a shared
+        // column, which is the honest trade and is documented in
+        // `docs/ui.md`.
+        let icon = row.icon.as_deref().filter(|n| !n.is_empty());
+        let column = match icon {
+            Some(_) if paint.icons => row.side(),
+            _ => 0.0,
+        };
+        if let Some(name) = icon
+            && paint.icons
+        {
+            let side = row.side();
+            // Centred in the row's own height, not on the text's baseline:
+            // the icon is square and 16 px against a ~13 px line, so
+            // aligning it to the text would push it below the row.
+            let iy = top_y + ((self.row_h - side) / 2.0).max(0.0);
+            cx.icon_in(
                 group,
                 slot + 1,
-                Rect::new(ROW_PAD, top, ICON_W, line),
-                icon,
-                TextRun::new(&paint.style, paint.detail),
+                Rect::new(ROW_PAD, iy, side, side),
+                name,
+                side,
+                row.tint(),
             );
         }
-        let left = ROW_PAD + if has_icon { ICON_W + 4.0 } else { 0.0 };
+        let left = ROW_PAD + if column > 0.0 { column + ICON_GAP } else { 0.0 };
         // The secondary column is a third of the row, capped: a date is
         // a fixed width and a name is not, so the name gets the slack.
         let detail_w = if row.detail.is_empty() {
@@ -812,6 +919,7 @@ impl<S: 'static> Widget<S> for List<S> {
             text: theme.text,
             detail: theme.text_disabled,
             selection: theme.selection,
+            icons: cx.has_icons(),
         };
         // A colour or font change invalidates every materialised row,
         // and nothing else here would notice: the per-slot cache keys on

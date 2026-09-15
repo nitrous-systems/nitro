@@ -1045,6 +1045,7 @@ impl Wire {
             } else {
                 slots[i].node = NodeId::NONE;
                 slots[i].text = None;
+                slots[i].icon = None;
                 slots[i].image = None;
             }
         }

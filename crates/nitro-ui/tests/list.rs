@@ -548,3 +548,342 @@ fn a_palette_change_repaints_every_row() {
         "an unchanged palette is silence"
     );
 }
+
+// ---------------------------------------------------------------------
+// Row icons
+// ---------------------------------------------------------------------
+//
+// A row's icon is a **name**, and `SetIcon` is the mutation it costs. So
+// every claim about it is a count of that mutation, taken from the
+// outside — the same instrument the rest of this file uses for text, and
+// for the same reason: "work proportional to change" is a number.
+//
+// The lesson #3714's review paid for is the one these tests are shaped
+// by: a diff must compare against what was **requested**, not against
+// what is displayed. A slot that cached the displayed name would re-send
+// the row's icon on every repaint the moment a fallback or a capability
+// mask put something else on screen.
+
+/// A model of `n` rows alternating between two icon names.
+fn icon_rows(n: usize) -> Vec<Row> {
+    (0..n)
+        .map(|i| {
+            let name = if i % 2 == 0 {
+                "file-earmark"
+            } else {
+                "folder-fill"
+            };
+            Row::new(format!("file-{i:05}"))
+                .icon(name)
+                .detail(format!("{i} B"))
+        })
+        .collect()
+}
+
+/// A list of `n` icon-carrying rows in a window `h` pixels tall.
+fn icon_list_of(n: usize, h: f32) -> (Harness<Vec<usize>>, WidgetId) {
+    let mut h = Harness::sized(
+        "list-icons",
+        Vec::new(),
+        Size::new(240.0, h),
+        move |ui: &mut Ui<Vec<usize>>| {
+            let l = ui.build(
+                list()
+                    .name("rows")
+                    .rows(icon_rows(n))
+                    .grow(1.0)
+                    .width_percent(1.0),
+            );
+            let root = ui.build(
+                column()
+                    .child(panel().background(Color::WHITE))
+                    .width_percent(1.0)
+                    .height_percent(1.0),
+            );
+            ui.attach(root, l).unwrap();
+            root
+        },
+    );
+    let root = h.ui().root().unwrap();
+    let id = h.ui().children(root)[1];
+    h.settle();
+    (h, id)
+}
+
+#[test]
+fn a_row_icon_is_a_named_icon_node_and_the_server_rasterises_it() {
+    let (h, id) = icon_list_of(40, 200.0);
+    let made = h.widget::<List<Vec<usize>>>(id).materialised();
+    assert!(made > 1, "the list materialised rows");
+
+    // The server really drew artwork for them — the claim a count of
+    // client-side mutations cannot make on its own.
+    assert!(
+        h.server().stat("icon_renders") > 0,
+        "the server rasterised no icon at all"
+    );
+    // Two distinct names, one size: the cache is keyed on
+    // `(icon, device px)`, so a screenful of alternating icons is two
+    // entries however many rows show them. That is the arithmetic that
+    // separates "the rows share artwork" from "each row has its own".
+    assert_eq!(
+        h.server().stat("icons_cached"),
+        2,
+        "two names at one size are two cache entries, not one per row"
+    );
+    assert_eq!(h.server().stat("icon_refusals"), 0, "both names exist");
+    h.quit();
+}
+
+#[test]
+fn a_row_that_gained_an_icon_is_the_same_height() {
+    // The layout contract: the icon column is width, never height. A
+    // 16 px icon in a row whose text line is ~13 px would otherwise make
+    // every list in the tree taller, which is a change to every app.
+    let (plain, plain_id) = list_of(40, 200.0);
+    let (icons, icons_id) = icon_list_of(40, 200.0);
+    let a = plain.widget::<List<Vec<usize>>>(plain_id).row_height();
+    let b = icons.widget::<List<Vec<usize>>>(icons_id).row_height();
+    assert_eq!(
+        a.to_bits(),
+        b.to_bits(),
+        "an icon column changed the row height: {a} vs {b}"
+    );
+    // And the same number of rows fit, which is the visible consequence.
+    assert_eq!(
+        plain.widget::<List<Vec<usize>>>(plain_id).rows_that_fit(),
+        icons.widget::<List<Vec<usize>>>(icons_id).rows_that_fit()
+    );
+    plain.quit();
+    icons.quit();
+}
+
+#[test]
+fn set_rows_with_identical_rows_sends_no_set_icon_and_one_changed_row_sends_one() {
+    // The headline, and the review lesson from #3714 made into a number.
+    //
+    // A `List` diff reuses its ring slots, so a refresh that produced
+    // the same listing must cost nothing — and a refresh that changed
+    // one row's *type* must cost exactly the one `SetIcon` that row
+    // needs. The comparison happens inside the paint slot, against the
+    // last `SetIcon` it **requested**, which is what makes both halves
+    // true at once.
+    let (mut h, id) = icon_list_of(40, 200.0);
+    h.tap();
+    h.clear_tap();
+
+    // Identical rows. The generation bump invalidates every cached slot,
+    // so the widget re-derives and re-emits every row — and the wire
+    // layer drops every message whose content did not change.
+    h.ui()
+        .widget_mut::<List<Vec<usize>>>(id)
+        .unwrap()
+        .set_rows(icon_rows(40));
+    h.settle();
+    assert_eq!(
+        count(&h, "SetIcon"),
+        0,
+        "a set_rows over an unchanged listing re-sent icons: {:?}",
+        h.mutations()
+    );
+    // The control that makes the zero mean something: the text did not
+    // move either, so this is a genuinely unchanged model rather than an
+    // icon path that stopped working.
+    assert_eq!(count(&h, "SetText"), 0, "nor any text");
+
+    // One row's icon changed. Row 3 is inside the materialised window.
+    let mut changed = icon_rows(40);
+    changed[3] = Row::new("file-00003").icon("hdd").detail("3 B");
+    h.clear_tap();
+    h.ui()
+        .widget_mut::<List<Vec<usize>>>(id)
+        .unwrap()
+        .set_rows(changed);
+    h.settle();
+    assert_eq!(
+        count(&h, "SetIcon"),
+        1,
+        "one changed row is one SetIcon, got {:?}",
+        h.mutations()
+    );
+    assert_eq!(
+        count(&h, "CreateNode"),
+        0,
+        "and the icon node is reused rather than re-created"
+    );
+    h.quit();
+}
+
+#[test]
+fn scrolling_does_not_re_send_an_icon_for_a_row_that_merely_moved() {
+    // The recycling question. Slots are addressed `row % ring`, so a
+    // scroll that re-anchors the window hands slot *k* a different row —
+    // and if that row's icon name is the same, the slot's cached
+    // `SetIcon` matches and nothing is sent. With alternating icons and
+    // an even ring the names line up exactly, which is the case worth
+    // pinning: the rows all changed, the icons did not.
+    let (mut h, id) = icon_list_of(1_000, 200.0);
+    let row_h = h.widget::<List<Vec<usize>>>(id).row_height();
+    let ring = h.widget::<List<Vec<usize>>>(id).materialised();
+
+    // Inside the spare rows first: one `SetTransform`, no row work at
+    // all, which is the existing contract and the floor for this one.
+    h.tap();
+    h.clear_tap();
+    h.ui()
+        .widget_mut::<List<Vec<usize>>>(id)
+        .unwrap()
+        .scroll_to(row_h);
+    h.settle();
+    assert_eq!(
+        count(&h, "SetIcon"),
+        0,
+        "a one-row scroll re-sent an icon: {:?}",
+        h.mutations()
+    );
+
+    // Now twenty scrolls of a whole window each, which re-anchors every
+    // time and re-emits every row's text. The icons are bounded by the
+    // rows whose *name* differs, which for an even ring is none.
+    h.clear_tap();
+    for k in 1..=20 {
+        h.ui()
+            .widget_mut::<List<Vec<usize>>>(id)
+            .unwrap()
+            .scroll_to(row_h * (k * ring) as f32);
+        h.settle();
+    }
+    let icons = count(&h, "SetIcon");
+    let texts = count(&h, "SetText");
+    assert!(
+        texts > 0,
+        "the rows really were re-emitted, so the icon count means something"
+    );
+    // The bound is "the rows whose icon changed", and the parity of the
+    // ring decides whether that is zero or the whole window per scroll.
+    // On this harness the ring is 10, the names alternate, and the
+    // measured figure is **0 SetIcons against 400 SetTexts** — the rows
+    // all changed and the icons did not.
+    let bound = if ring % 2 == 0 { 0 } else { 20 * ring };
+    assert!(
+        icons <= bound,
+        "scrolling re-sent icons for rows that only moved: {icons} SetIcons \
+         over 20 window scrolls of a {ring}-slot ring (bound {bound})"
+    );
+    h.quit();
+}
+
+#[test]
+fn without_the_icons_capability_a_row_is_its_label_and_no_icon_node() {
+    // The guard, and it is not cosmetic: painting an icon creates a node
+    // of `NodeKind::Icon`, which a server predating the icon set rejects
+    // as a *decode error* and closes the connection on. So a list that
+    // emitted its rows' icons unguarded would not lose a column, it
+    // would lose the application. Masked before the first paint, because
+    // once the node exists the damage is done.
+    let mut h = Harness::sized(
+        "list-icons-off",
+        Vec::new(),
+        Size::new(240.0, 200.0),
+        |ui: &mut Ui<Vec<usize>>| {
+            let l = ui.build(
+                list()
+                    .name("rows")
+                    .rows(icon_rows(40))
+                    .grow(1.0)
+                    .width_percent(1.0),
+            );
+            let root = ui.build(column().width_percent(1.0).height_percent(1.0));
+            ui.attach(root, l).unwrap();
+            root
+        },
+    );
+    h.ui().hide_icons(true);
+    assert!(!h.ui().has_icons());
+    h.settle();
+    let root = h.ui().root().unwrap();
+    let id = h.ui().children(root)[0];
+
+    assert_eq!(
+        count(&h, "SetIcon"),
+        0,
+        "an icon-less server was sent a SetIcon: {:?}",
+        h.mutations()
+    );
+    // The app is alive and the pass succeeded, which is the claim that
+    // matters: a missing column, never a broken tree.
+    h.ui().flush().expect("the paint pass must not fail");
+    assert_eq!(h.server().stat("clients"), 1);
+    // The rows are still there and still readable, and the row height did
+    // not move either — the label simply starts where the icon would have
+    // been, exactly as a leading-icon `Button` collapses to its label.
+    assert!(h.widget::<List<Vec<usize>>>(id).materialised() > 1);
+    h.quit();
+}
+
+#[test]
+fn the_capability_going_away_moves_the_labels_and_the_cache_notices() {
+    // The failure the `icons` field of `RowPaint` exists for, and it is
+    // exactly the shape of the palette bug above: the per-slot cache
+    // answers "same row, same generation, same selection" — all three
+    // still true — while the labels have to move left by the width of a
+    // column that no longer exists. Without the field a settled list
+    // would keep the indent and draw nothing in it.
+    let (mut h, id) = icon_list_of(40, 200.0);
+    h.tap();
+    h.clear_tap();
+    h.settle();
+    assert_eq!(ops(&h), Vec::<&str>::new(), "the list really is settled");
+
+    h.ui().hide_icons(true);
+    let visible = h.widget::<List<Vec<usize>>>(id).visible_rows().len();
+    h.ui().mark(id, nitro_ui::Dirty::PAINT);
+    h.settle();
+
+    // Every materialised row's text box moved, so every row re-emitted.
+    assert!(
+        count(&h, "SetBounds") >= visible,
+        "the labels did not move when the icon column went away: {:?}",
+        h.mutations()
+    );
+    // And the icon nodes are gone rather than left drawing stale artwork.
+    assert!(
+        count(&h, "DestroyNode") >= visible,
+        "the icon nodes outlived the capability: {:?}",
+        h.mutations()
+    );
+    // Settled again: a widget that marked itself and never cleared the
+    // flag would repaint for ever.
+    h.clear_tap();
+    h.settle();
+    assert_eq!(ops(&h), Vec::<&str>::new(), "settled again");
+    h.quit();
+}
+
+#[test]
+fn a_row_icon_survives_a_scheme_flip_with_no_set_icon_at_all() {
+    // The property the whole by-name design rests on, from the client's
+    // side: the node holds a *role index*, so the server re-resolves the
+    // colour at paint time. A scheme switch therefore costs the rows'
+    // text (which carries its colour in `SetText`) and **nothing** for
+    // their icons.
+    let (mut h, _id) = icon_list_of(40, 200.0);
+    let before = h.server().stat("icon_renders");
+    h.tap();
+    h.clear_tap();
+    h.ui().set_palette(nitro_core::Palette::dark());
+    h.settle();
+    assert_eq!(
+        count(&h, "SetIcon"),
+        0,
+        "a scheme switch re-sent a row's icon: {:?}",
+        h.mutations()
+    );
+    assert!(count(&h, "SetText") > 0, "the text did change colour");
+    assert_eq!(
+        h.server().stat("icon_renders"),
+        before,
+        "and the server re-rasterised an icon it already had as coverage"
+    );
+    h.quit();
+}

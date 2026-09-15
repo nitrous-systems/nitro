@@ -199,6 +199,28 @@ pub fn load_globs2(path: &Path) -> Vec<Glob> {
         .unwrap_or_default()
 }
 
+/// Whether `name` ends in `.{ext}`, with something in front of the dot.
+///
+/// Split out and written on bytes for one reason, and it is a measured
+/// one: the obvious spelling is `name.ends_with(&format!(".{ext}"))`,
+/// which allocates **once per rule per file**. That was invisible while
+/// [`type_of`] was called when the user opened something; the icon column
+/// calls it once per file per listing, and a `globs2` on this box holds
+/// ~2 000 rules — so a thousand-row directory meant two million `String`s
+/// and **75.7 ms**, an eighth of a second of the loop. The same listing
+/// with this function is 3.6 ms. See `docs/files.md`.
+///
+/// A name that is *only* an extension (`.gz`) is a hidden file called
+/// `gz` and not an archive, which is the `+ 2` below.
+fn ends_with_dot_ext(name: &str, ext: &str) -> bool {
+    let (n, e) = (name.as_bytes(), ext.as_bytes());
+    if n.len() < e.len() + 2 {
+        return false;
+    }
+    let dot = n.len() - e.len() - 1;
+    n[dot] == b'.' && &n[dot + 1..] == e
+}
+
 /// The MIME type of `path`: the `globs2` table first, then the built-in
 /// one.
 ///
@@ -208,17 +230,178 @@ pub fn load_globs2(path: &Path) -> Vec<Glob> {
 /// system table the highest weight wins, and a tie is broken by the
 /// **longer** extension, so a `.tar.gz` is gzip-compressed-tar rather
 /// than plain gzip when both rules carry the default weight of 50.
+///
+/// **This is called once per file per listing** (`dir::read_dir`), not
+/// once per file the user opens, which is what [`ends_with_dot_ext`] is
+/// about.
 #[must_use]
 pub fn type_of(path: &Path, globs: &[Glob]) -> Option<String> {
     let name = path.file_name()?.to_string_lossy().to_ascii_lowercase();
     let best = globs
         .iter()
-        .filter(|g| name.len() > g.ext.len() + 1 && name.ends_with(&format!(".{}", g.ext)))
+        .filter(|g| ends_with_dot_ext(&name, &g.ext))
         .max_by_key(|g| (g.weight, g.ext.len()));
     if let Some(g) = best {
         return Some(g.mime.clone());
     }
     builtin_type(&name).map(str::to_owned)
+}
+
+/// Whether a type is source, a script or markup: **text with a syntax**,
+/// which is what the code icon means.
+///
+/// Its own function rather than an arm of [`icon_for`] because the list is
+/// long, and because it has to be consulted *before* the `text/` family:
+/// a `.rs`, a `.c`, a `.sh` and an `.html` are all `text/…`, and a code
+/// icon says more about them than a document icon does. That ordering is
+/// the one real decision in this map and it is visible at the call site.
+fn is_code(mime: &str) -> bool {
+    matches!(
+        mime,
+        "text/html"
+            | "text/xml"
+            | "text/css"
+            | "text/javascript"
+            | "text/x-rust"
+            | "text/x-python"
+            | "text/x-python3"
+            | "text/x-java"
+            | "text/x-java-source"
+            | "text/x-go"
+            | "text/x-lua"
+            | "text/x-perl"
+            | "text/x-ruby"
+            | "text/x-sql"
+            | "text/x-shellscript"
+            | "text/x-makefile"
+            | "text/x-patch"
+            | "text/x-diff"
+            | "application/javascript"
+            | "application/x-javascript"
+            | "application/ecmascript"
+            | "application/x-shellscript"
+            | "application/x-perl"
+            | "application/x-python"
+            | "application/x-ruby"
+            | "application/x-php"
+            | "application/xhtml+xml"
+    ) || mime.starts_with("text/x-c")
+        || mime.starts_with("text/x-script")
+}
+
+/// Whether a type is structured text that is configuration, data or a
+/// document rather than code.
+fn is_document(mime: &str) -> bool {
+    matches!(
+        mime,
+        "application/json"
+            | "application/ld+json"
+            | "application/xml"
+            | "application/toml"
+            | "application/x-toml"
+            | "application/x-yaml"
+            | "application/yaml"
+            | "application/x-desktop"
+            | "application/pdf"
+            | "application/rtf"
+            | "application/x-tex"
+    )
+}
+
+/// Whether a type is an archive or a compressed container.
+///
+/// The list is the shapes a `globs2` table actually produces for the
+/// things on a desktop; the `-compressed-tar` spellings are
+/// `shared-mime-info`'s own name for a `.tar.gz` and friends, and they are
+/// what an installed table returns rather than `application/gzip`.
+fn is_archive(mime: &str) -> bool {
+    matches!(
+        mime,
+        "application/zip"
+            | "application/gzip"
+            | "application/zstd"
+            | "application/x-tar"
+            | "application/x-xz"
+            | "application/x-lzma"
+            | "application/x-lz4"
+            | "application/x-bzip"
+            | "application/x-bzip2"
+            | "application/x-7z-compressed"
+            | "application/x-rar"
+            | "application/x-rar-compressed"
+            | "application/vnd.rar"
+            | "application/x-compressed-tar"
+            | "application/x-bzip-compressed-tar"
+            | "application/x-bzip2-compressed-tar"
+            | "application/x-xz-compressed-tar"
+            | "application/x-zstd-compressed-tar"
+            | "application/x-lzma-compressed-tar"
+            | "application/x-cpio"
+            | "application/x-archive"
+            | "application/x-deb"
+            | "application/vnd.debian.binary-package"
+            | "application/x-rpm"
+            | "application/epub+zip"
+            | "application/java-archive"
+    )
+}
+
+/// Whether a type is a font.
+///
+/// `font/*` is the modern family (RFC 8081); the `application/x-font-*`
+/// spellings predate it and are still what a 2010-vintage `globs2` on a
+/// long-lived box says, so both are matched.
+fn is_font(mime: &str) -> bool {
+    mime.starts_with("font/")
+        || mime.starts_with("application/x-font")
+        || matches!(
+            mime,
+            "application/font-woff" | "application/vnd.ms-opentype"
+        )
+}
+
+/// The symbolic icon name for a MIME type.
+///
+/// The whole map in one place, so that "what icon does a `.rs` file get"
+/// is answered once and is testable without a listing, a server or a
+/// window. The names are the `file-earmark-*` family of the server's
+/// symbolic set (`crates/nitro-icons/icons.txt`, `docs/icons.md`).
+///
+/// The order below is the map: the specific full-type lists first
+/// ([`is_code`] before everything, for the reason its doc comment gives),
+/// then the media families by prefix, then `text/*` as the catch-all under
+/// them.
+///
+/// A type nobody here claims gets the plain `file-earmark`, which is the
+/// same answer a file with no type at all gets: the icon column then says
+/// "a file", which is true, rather than guessing.
+#[must_use]
+pub fn icon_for(mime: &str) -> &'static str {
+    // Lowercased and stripped of any `; charset=…` parameter: a `globs2`
+    // table holds bare types, but a MIME type is case-insensitive
+    // (RFC 2045 §5.1) and this string need not always come from there.
+    let mime = mime.split(';').next().unwrap_or(mime).trim();
+    let lower = mime.to_ascii_lowercase();
+    let mime = lower.as_str();
+    if is_code(mime) {
+        return "file-earmark-code";
+    }
+    if is_document(mime) {
+        return "file-earmark-text";
+    }
+    if is_archive(mime) {
+        return "file-earmark-zip";
+    }
+    if is_font(mime) {
+        return "file-earmark-font";
+    }
+    match mime.split_once('/') {
+        Some(("image", _)) => "file-earmark-image",
+        Some(("audio", _)) => "file-earmark-music",
+        Some(("video", _)) => "file-earmark-play",
+        Some(("text", _)) => "file-earmark-text",
+        _ => "file-earmark",
+    }
 }
 
 /// Where the MIME associations live.
@@ -665,6 +848,125 @@ mod tests {
         write(&dir.join("globs2"), "50:text/plain:*.txt\n");
         assert_eq!(load_globs2(&dir.join("globs2")).len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_icon_table_maps_every_family_it_claims_and_nothing_else() {
+        // The whole type → icon map as a table, so a rule can be read
+        // and checked without a listing, a server or a window.
+        let cases = [
+            // Plain text and the structured-data types that are
+            // configuration rather than code.
+            ("text/plain", "file-earmark-text"),
+            ("text/markdown", "file-earmark-text"),
+            ("text/csv", "file-earmark-text"),
+            ("application/json", "file-earmark-text"),
+            ("application/xml", "file-earmark-text"),
+            ("application/toml", "file-earmark-text"),
+            ("application/x-yaml", "file-earmark-text"),
+            ("application/pdf", "file-earmark-text"),
+            // Source, scripts and markup: text with a *syntax*. These are
+            // matched before the `text/` family, which is the one
+            // ordering decision in the function.
+            ("text/x-csrc", "file-earmark-code"),
+            ("text/x-c++src", "file-earmark-code"),
+            ("text/x-chdr", "file-earmark-code"),
+            ("text/x-rust", "file-earmark-code"),
+            ("text/x-python", "file-earmark-code"),
+            ("text/x-shellscript", "file-earmark-code"),
+            ("application/x-shellscript", "file-earmark-code"),
+            ("text/html", "file-earmark-code"),
+            ("text/css", "file-earmark-code"),
+            ("text/javascript", "file-earmark-code"),
+            ("application/javascript", "file-earmark-code"),
+            // Media, by family.
+            ("image/png", "file-earmark-image"),
+            ("image/jpeg", "file-earmark-image"),
+            ("image/svg+xml", "file-earmark-image"),
+            ("image/x-portable-pixmap", "file-earmark-image"),
+            ("audio/mpeg", "file-earmark-music"),
+            ("audio/flac", "file-earmark-music"),
+            ("audio/x-wav", "file-earmark-music"),
+            ("video/mp4", "file-earmark-play"),
+            ("video/x-matroska", "file-earmark-play"),
+            ("video/webm", "file-earmark-play"),
+            // Fonts, both spellings: `font/*` is RFC 8081 and
+            // `application/x-font-*` is what an older `globs2` says.
+            ("font/ttf", "file-earmark-font"),
+            ("font/woff2", "file-earmark-font"),
+            ("application/x-font-ttf", "file-earmark-font"),
+            ("application/vnd.ms-opentype", "file-earmark-font"),
+            // Archives, including `shared-mime-info`'s
+            // `-compressed-tar` spellings for a `.tar.gz`.
+            ("application/zip", "file-earmark-zip"),
+            ("application/gzip", "file-earmark-zip"),
+            ("application/zstd", "file-earmark-zip"),
+            ("application/x-tar", "file-earmark-zip"),
+            ("application/x-xz", "file-earmark-zip"),
+            ("application/x-bzip2", "file-earmark-zip"),
+            ("application/x-7z-compressed", "file-earmark-zip"),
+            ("application/vnd.rar", "file-earmark-zip"),
+            ("application/x-compressed-tar", "file-earmark-zip"),
+            ("application/epub+zip", "file-earmark-zip"),
+            // Everything else is honestly "a file". A guess here would
+            // be worse than the plain icon: the column would assert a
+            // type the table does not know.
+            ("application/octet-stream", "file-earmark"),
+            ("application/x-executable", "file-earmark"),
+            ("application/vnd.oasis.opendocument.text", "file-earmark"),
+            ("model/gltf+json", "file-earmark"),
+            ("", "file-earmark"),
+        ];
+        for (mime, want) in cases {
+            assert_eq!(icon_for(mime), want, "icon_for({mime:?})");
+        }
+    }
+
+    #[test]
+    fn a_type_is_matched_case_insensitively_and_without_its_parameters() {
+        // A MIME type is case-insensitive (RFC 2045 §5.1) and may carry
+        // parameters. A `globs2` table holds neither shape, so this is
+        // robustness rather than a case in use — but a column that drew
+        // the generic icon for `text/plain; charset=utf-8` would be a
+        // bug nobody would think to look for.
+        assert_eq!(icon_for("TEXT/PLAIN"), "file-earmark-text");
+        assert_eq!(icon_for("Image/PNG"), "file-earmark-image");
+        assert_eq!(icon_for("text/plain; charset=utf-8"), "file-earmark-text");
+        assert_eq!(icon_for("  text/x-rust  "), "file-earmark-code");
+    }
+
+    #[test]
+    fn with_no_globs2_the_builtin_table_still_gives_sensible_icons() {
+        // The case the built-in table exists for, joined to the icon map:
+        // a box with no `shared-mime-info` (the test box, a bare rootfs)
+        // must still show a photo as a photo. The glob list is **empty**
+        // here, so every answer comes from `builtin_type`.
+        let icon = |name: &str| icon_for(&type_of(Path::new(name), &[]).unwrap_or_default());
+        assert_eq!(icon("notes.txt"), "file-earmark-text");
+        assert_eq!(icon("README.md"), "file-earmark-text");
+        assert_eq!(icon("main.rs"), "file-earmark-code");
+        assert_eq!(icon("build.sh"), "file-earmark-code");
+        assert_eq!(icon("page.html"), "file-earmark-code");
+        assert_eq!(icon("photo.PNG"), "file-earmark-image");
+        assert_eq!(icon("shot.ppm"), "file-earmark-image");
+        assert_eq!(icon("song.mp3"), "file-earmark-music");
+        assert_eq!(icon("clip.mp4"), "file-earmark-play");
+        assert_eq!(icon("bundle.zip"), "file-earmark-zip");
+        assert_eq!(icon("notes.tar"), "file-earmark-zip");
+        // Two honest gaps, recorded rather than papered over: the
+        // built-in table has no font extensions and no `.toml`-adjacent
+        // oddities, so `.ttf` is the generic file icon *without* a
+        // `globs2`. Adding them to `builtin_type` would be an
+        // improvement to that table and is not this map's business.
+        assert_eq!(icon("Vera.ttf"), "file-earmark");
+        assert_eq!(icon("mystery.qqq"), "file-earmark");
+        assert_eq!(icon("no-extension"), "file-earmark");
+        // And with a `globs2` that does know fonts, the same name is a
+        // font — which is the half that shows the map is doing the work
+        // rather than the extension table.
+        let globs = parse_globs2("50:font/ttf:*.ttf\n");
+        let with = icon_for(&type_of(Path::new("Vera.ttf"), &globs).unwrap_or_default());
+        assert_eq!(with, "file-earmark-font");
     }
 
     /// A config root and a data root holding the given files.
