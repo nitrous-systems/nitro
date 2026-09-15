@@ -113,11 +113,67 @@ pub fn stat(pairs: &[(String, u64)], key: &str) -> Option<u64> {
 /// ordinary case of the first one, and the caller shows it as "no server"
 /// rather than as a fault.
 pub fn stats_at(path: &Path) -> std::io::Result<Vec<(String, u64)>> {
+    Ok(parse_stats(&request_at(path, b"stats\n")?))
+}
+
+/// The server's counters, from wherever the environment says it is.
+///
+/// # Errors
+/// As [`stats_at`].
+pub fn stats() -> std::io::Result<Vec<(String, u64)>> {
+    stats_at(&control_path())
+}
+
+/// Every mode the server says each connector offers, as
+/// `(connector, mode)` pairs in the order `modes` listed them.
+///
+/// Read-only, and read for one reason: a display row can then say *what
+/// else this screen could do* — `1920×1080 @ 60 Hz (also 120, 85, 50,
+/// 24)` — which is the information a user needs before writing an
+/// `output.<c>.mode` line and which nothing in the UI can otherwise
+/// supply. This app does **not** offer a mode picker: a control that
+/// blanks the screen for a second, and can leave a panel dark if the
+/// monitor disagrees, is not something to put behind a combo box in M4.
+/// The line tells you what to write; `docs/settings.md` says how.
+///
+/// # Errors
+/// As [`stats_at`]. An older server that has no `modes` command answers
+/// `err`, which lands here as an error and leaves the row saying only the
+/// mode in force — the behaviour before this existed.
+pub fn modes_at(path: &Path) -> std::io::Result<Vec<(String, String)>> {
+    let body = request_at(path, b"modes\n")?;
+    Ok(body
+        .lines()
+        .filter_map(|l| {
+            let mut words = l.split_ascii_whitespace();
+            let name = words.next()?;
+            let mode = words.next()?;
+            Some((name.to_owned(), mode.to_owned()))
+        })
+        .collect())
+}
+
+/// The server's mode list, from wherever the environment says it is.
+///
+/// # Errors
+/// As [`modes_at`].
+pub fn modes() -> std::io::Result<Vec<(String, String)>> {
+    modes_at(&control_path())
+}
+
+/// Send one request and return its body (the lines between the `ok` and
+/// the blank line).
+///
+/// The half [`stats_at`] and [`modes_at`] share: connect, write, check the
+/// status line, read until the body ends. Every read has a timeout, for
+/// the reason in the module docs — this app runs *on* the compositor it is
+/// asking, and a frozen window is the user's only way to fix it.
+fn request_at(path: &Path, request: &[u8]) -> std::io::Result<String> {
     let mut sock = UnixStream::connect(path)
         .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
     sock.set_read_timeout(Some(IO_TIMEOUT))?;
     sock.set_write_timeout(Some(IO_TIMEOUT))?;
-    sock.write_all(b"stats\n")?;
+    sock.write_all(request)?;
     let mut reader = BufReader::new(sock);
     let mut status = String::new();
     reader.read_line(&mut status)?;
@@ -135,15 +191,7 @@ pub fn stats_at(path: &Path) -> std::io::Result<Vec<(String, u64)>> {
         }
         body.push_str(&line);
     }
-    Ok(parse_stats(&body))
-}
-
-/// The server's counters, from wherever the environment says it is.
-///
-/// # Errors
-/// As [`stats_at`].
-pub fn stats() -> std::io::Result<Vec<(String, u64)>> {
-    stats_at(&control_path())
+    Ok(body)
 }
 
 /// The `config_reloads` counter, or `None` when there is no server to ask

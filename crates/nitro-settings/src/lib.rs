@@ -488,6 +488,15 @@ pub struct Settings {
     /// click really did reach the disk" that is not "read the file and
     /// hope".
     scheme_writes: u64,
+    /// Every mode each connector offers, from the server's `modes`
+    /// command, as `(connector, mode)` in the order it listed them.
+    ///
+    /// Read once at start-up and not refreshed: it is a monitor's
+    /// capability list, which does not change while the dialog is open
+    /// unless the cable does — and a hotplug rebuilds the rows anyway.
+    /// Empty when there is no server to ask, which is exactly when the
+    /// row should say nothing extra.
+    modes: Vec<(String, String)>,
 }
 
 impl Settings {
@@ -506,6 +515,7 @@ impl Settings {
             reverts: 0,
             status: String::new(),
             scheme_writes: 0,
+            modes: Vec::new(),
         }
     }
 
@@ -986,6 +996,13 @@ fn init(s: &mut Settings, ui: &mut Ui<Settings>, ids: Ids) {
     if s.control.is_none() {
         s.control = Some(ui.control_path());
     }
+    // The monitor's own capability list, for the read-only "(also 120,
+    // 85, …)" on each display row. A server that is not running, or one
+    // too old to know `modes`, leaves this empty and the row says only
+    // the mode in force — which is what it said before this existed.
+    if let Some(path) = s.control.as_deref() {
+        s.modes = control::modes_at(path).unwrap_or_default();
+    }
     s.audio = Backend::detect_in(&s.audio_dirs);
     load_audio(s, ui, ids);
 
@@ -1078,7 +1095,12 @@ fn upsert_output(s: &mut Settings, ui: &mut Ui<Settings>, ids: Ids, info: &Outpu
         // move here. The scale and the position are deliberately *not*
         // re-read: they are what the user is editing, and a hotplug
         // elsewhere on the desktop must not throw away a typed number.
-        set_named_label(ui, container, names::OUTPUT_MODE, &mode_text(info));
+        set_named_label(
+            ui,
+            container,
+            names::OUTPUT_MODE,
+            &mode_text_with_alternatives(info, &s.modes),
+        );
         return;
     }
     let conf = load_conf(s);
@@ -1164,11 +1186,14 @@ fn add_row(
             .min_width(76.0),
     );
     let mode_label = ui.build(
-        label(info.map_or_else(|| "—".to_owned(), mode_text))
-            .name(names::OUTPUT_MODE)
-            .size(TEXT_SIZE)
-            .color_role(ColorRole::TextDim)
-            .min_width(96.0),
+        label(info.map_or_else(
+            || "—".to_owned(),
+            |i| mode_text_with_alternatives(i, &s.modes),
+        ))
+        .name(names::OUTPUT_MODE)
+        .size(TEXT_SIZE)
+        .color_role(ColorRole::TextDim)
+        .min_width(96.0),
     );
     let scale_value = ui.build(
         label(conf::format_scale(scale))
@@ -1274,6 +1299,58 @@ fn make_primary(s: &mut Settings, ui: &mut Ui<Settings>, connector: &str) {
 #[must_use]
 pub fn mode_text(info: &OutputInfo) -> String {
     format!("{}×{} @ {}", info.w, info.h, format_hz(info.refresh_mhz))
+}
+
+/// `1920×1080 @ 60 Hz (also 120, 85, 50, 24)`.
+///
+/// The mode in force plus **the other refresh rates this connector offers
+/// at that same size**, which is the one question a display row can answer
+/// and the file cannot: `output.<c>.mode = 1920x1080@120` is only worth
+/// typing if 120 is on the list.
+///
+/// Only the rates at the current size, and only rates — the full list is a
+/// dozen entries on a television and would not fit the row. Someone who
+/// wants all of it runs `modes` on the control socket, which is what
+/// `crates/nitro-server/README.md` points at; this line is the hint that
+/// there is something to look for.
+#[must_use]
+pub fn mode_text_with_alternatives(info: &OutputInfo, modes: &[(String, String)]) -> String {
+    let here = mode_text(info);
+    let size = format!("{}x{}@", info.w, info.h);
+    let mut others: Vec<String> = Vec::new();
+    for (_, m) in modes.iter().filter(|(n, _)| *n == info.name) {
+        let Some(rate) = m.strip_prefix(&size) else {
+            continue;
+        };
+        // The rate in force is what the line already says, and a table
+        // that lists the same rate twice (60.000 and 59.940 both round to
+        // "60" in this spelling) must not say it twice either.
+        if rate == nitro_kms_hz(info.refresh_mhz) || others.iter().any(|o| o == rate) {
+            continue;
+        }
+        others.push(rate.to_owned());
+    }
+    if others.is_empty() {
+        here
+    } else {
+        format!("{here} (also {})", others.join(", "))
+    }
+}
+
+/// The rate in the spelling the `modes` command uses, so the current mode
+/// can be matched against that list.
+///
+/// Not [`format_hz`], which is the spelling a *person* reads (`60 Hz`,
+/// `59.94 Hz`): this one has to agree character for character with the
+/// server's, or the line lists the rate it is already running as an
+/// alternative to itself.
+fn nitro_kms_hz(refresh_mhz: u32) -> String {
+    if refresh_mhz.is_multiple_of(1000) {
+        format!("{}", refresh_mhz / 1000)
+    } else {
+        let s = format!("{:.3}", f64::from(refresh_mhz) / 1000.0);
+        s.trim_end_matches('0').trim_end_matches('.').to_owned()
+    }
 }
 
 /// Millihertz as a refresh rate a person reads.
@@ -1566,4 +1643,97 @@ pub fn run() -> Result<(), Error> {
     app.title("Settings")
         .size(WINDOW_SIZE)
         .run(Settings::new(), build)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(w: u32, h: u32, refresh_mhz: u32) -> OutputInfo {
+        OutputInfo {
+            id: 1,
+            name: "HDMI-A-1".to_owned(),
+            w,
+            h,
+            refresh_mhz,
+            scale: 1.0,
+            x: 0,
+            y: 0,
+        }
+    }
+
+    #[test]
+    fn a_rate_a_person_reads() {
+        assert_eq!(format_hz(60_000), "60 Hz");
+        assert_eq!(format_hz(120_000), "120 Hz");
+        assert_eq!(format_hz(59_940), "59.94 Hz");
+    }
+
+    #[test]
+    fn the_mode_line_names_the_other_rates_at_this_size() {
+        // The box's connector, as `modes` reports it: several rates at
+        // 1080p and a 4K mode that is a different *size*.
+        let modes: Vec<(String, String)> = [
+            "1920x1080@120",
+            "1920x1080@85",
+            "1920x1080@60",
+            "1920x1080@50",
+            "1920x1080@24",
+            "3840x2160@30",
+        ]
+        .iter()
+        .map(|m| ("HDMI-A-1".to_owned(), (*m).to_owned()))
+        .collect();
+        assert_eq!(
+            mode_text_with_alternatives(&info(1920, 1080, 60_000), &modes),
+            "1920×1080 @ 60 Hz (also 120, 85, 50, 24)",
+            "the rate in force is not listed as an alternative to itself, \
+             and a different size is not an alternative at all"
+        );
+        // At 120 the same list reads the other way round, which is the
+        // check that the exclusion is of the *current* rate and not of a
+        // hard-coded 60.
+        assert_eq!(
+            mode_text_with_alternatives(&info(1920, 1080, 120_000), &modes),
+            "1920×1080 @ 120 Hz (also 85, 60, 50, 24)"
+        );
+        // A size the connector lists nothing else at says nothing extra.
+        assert_eq!(
+            mode_text_with_alternatives(&info(3840, 2160, 30_000), &modes),
+            "3840×2160 @ 30 Hz"
+        );
+        // No server to ask: the line is what it always was.
+        assert_eq!(
+            mode_text_with_alternatives(&info(1920, 1080, 60_000), &[]),
+            "1920×1080 @ 60 Hz"
+        );
+    }
+
+    #[test]
+    fn a_fractional_rate_matches_the_servers_spelling() {
+        // The trap this exists for: `format_hz` says `59.94 Hz` and the
+        // server says `59.94`, and if the two disagreed by a digit the
+        // line would offer the rate it is already running as something
+        // else to try.
+        let modes: Vec<(String, String)> = ["1920x1080@60", "1920x1080@59.94"]
+            .iter()
+            .map(|m| ("HDMI-A-1".to_owned(), (*m).to_owned()))
+            .collect();
+        assert_eq!(
+            mode_text_with_alternatives(&info(1920, 1080, 59_940), &modes),
+            "1920×1080 @ 59.94 Hz (also 60)"
+        );
+    }
+
+    #[test]
+    fn another_connectors_modes_are_not_this_rows() {
+        let modes = vec![
+            ("DP-1".to_owned(), "1920x1080@144".to_owned()),
+            ("HDMI-A-1".to_owned(), "1920x1080@120".to_owned()),
+        ];
+        assert_eq!(
+            mode_text_with_alternatives(&info(1920, 1080, 60_000), &modes),
+            "1920×1080 @ 60 Hz (also 120)"
+        );
+    }
 }
