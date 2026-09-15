@@ -13,17 +13,17 @@ already use, so a decoded icon goes on screen without a conversion pass.
 ## Why this exists rather than the `png` crate
 
 Because it was measured, not assumed. `DEPENDENCIES.md` carries the full
-table under "`png`, measured"; the short version is that the crate is
-**faster** (1.2–2.7× on the test box, the gap growing with image size) and
-**lighter on peak RSS** (+1.5 MB vs +3.8 MB decoding a 512×512), while this
-crate is **smaller in the binary** (+50 KB vs +130 KB in `nitro-server`),
-**smaller in code we ship** (~1000 lines against ~27 700 across the crate
-and its eight transitive dependencies) and **zero new external crates
-against nine**.
+table under "`png` versus our own decoder, measured (#3711)"; the short
+version is that the crate is **faster** (1.2–2.7× on the test box, the gap
+growing with image size) and **lighter on peak RSS** (+1.5 MB vs +3.8 MB
+decoding a 512×512), while this crate is **smaller in the binary** (+50 KB
+vs +130 KB in `nitro-server`), **smaller in code we ship** (999 lines
+against ~28 500 across the crate and its eight transitive dependencies) and
+**zero new external crates against eight**.
 
 At icon sizes the speed difference is 3–4 µs per file, which is the length
 of a syscall. That is the trade this crate takes: it is slower at a scale
-where slower does not matter, to keep nine crates and 27 000 lines of
+where slower does not matter, to keep eight crates and ~28 500 lines of
 someone else's parser out of a process that runs for the whole session.
 
 The one number that is a genuine cost rather than a rounding error is peak
@@ -75,7 +75,26 @@ fixed function of the path, so a failure is reproducible.
   `/usr/share/pixmaps`, asserting the buffer size matches the reported
   dimensions and that alpha is binary for the colour types that have none.
   **Skips, with a message, when no such files exist**, so a CI container
-  without an icon theme does not fail.
+  without an icon theme does not fail. It also decodes each file a second
+  time through `naive_unfilter` + `naive_expand` — the specification's §9.2
+  and §7.2 pseudocode transcribed the slow, obvious way — and requires the
+  two to be byte-identical. The real decoder is `const`-generic per `bpp`
+  with a head/body split and a palette table hoisted out of the row loop;
+  that is precisely where a transcription error hides from a test sharing
+  its structure, and the naive version shares none of it.
+- `tests/corpus.rs`'s synthetic half, which exists because **the installed
+  corpus cannot exercise the filters**. A census of all 2602 scanlines of
+  the 70 PNGs on the dev box: filter 0 ×2096, filter 1 ×88, filter 2 ×210,
+  **filter 3 ×0**, filter 4 ×208. So the cross-check run on real files never
+  executes the average filter at all, and its Paeth rows are flat enough
+  that a tie-break mutation changes nothing. Thirty-five PNGs are therefore
+  built in the test — every filter against every colour type, over
+  deliberately non-smooth samples so `a`, `b` and `c` differ — and checked
+  both against the bytes they were built from and against the naive path.
+  Verified by mutation: rounding the average filter up, flipping the Paeth
+  `b`/`c` tie, moving the row-head boundary by one, taking the low byte of a
+  16-bit sample and swapping the palette's channel order are all **caught**;
+  before the synthetic inputs, none of them were.
 - `tests/fuzz.rs` — the no-panic property above.
 
 The correctness evidence that mattered most is not in this repository: it

@@ -89,9 +89,15 @@ impl<'a> BitReader<'a> {
         }
     }
 
-    /// Top the buffer up to at least 57 bits — enough for the longest thing
-    /// the block loop asks for between refills (a 15-bit length code, five
-    /// extra bits, a 15-bit distance code and thirteen extra: 48).
+    /// Top the buffer up to **at least 56 bits**, which is the bound a
+    /// caller may rely on: the fast path starting from an empty buffer adds
+    /// exactly seven bytes and leaves 56, and at `bitcnt == 56` it is a
+    /// no-op. 56 is deliberately above the real requirement — the longest
+    /// run the block loop asks for between refills is a 15-bit length code,
+    /// five extra bits, a 15-bit distance code and thirteen extra, i.e.
+    /// **48 bits** — so there are eight bits of headroom. Anything wanting
+    /// a wider read than 48 between refills must re-check this arithmetic
+    /// rather than assume 57 or 64.
     ///
     /// The fast path loads **eight bytes at once** with `from_le_bytes` and
     /// keeps as many whole bytes of them as fit. That is one load instead
@@ -119,7 +125,9 @@ impl<'a> BitReader<'a> {
             let chunk: [u8; 8] = self.data[self.pos..self.pos + 8]
                 .try_into()
                 .expect("the slice is exactly 8 bytes");
-            // 1..=7 whole bytes, whichever leaves `bitcnt` at 57..=64.
+            // 0..=7 whole bytes, whichever leaves `bitcnt` at 56..=63:
+            // zero when the buffer already holds 56 or more, which is why
+            // the guard above bounds `bitcnt` rather than this shift.
             let whole = ((63 - self.bitcnt) >> 3) as usize;
             let bits = 8 * whole as u32;
             let mask = (1u64 << bits) - 1;
