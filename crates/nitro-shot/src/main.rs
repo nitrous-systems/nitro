@@ -3,6 +3,7 @@
 //! ```text
 //! nitro-shot [-o FILE] [--raw] [--output NAME]   screenshot (PNG, or raw XRGB8888 with --raw)
 //! nitro-shot --outputs                            list outputs
+//! nitro-shot --modes                              list every mode each connector offers
 //! nitro-shot --stats                              frame counters
 //! nitro-shot --quit                               stop the server
 //! ```
@@ -20,8 +21,14 @@ use std::process::ExitCode;
 
 #[derive(Debug, PartialEq, Eq)]
 enum Mode {
-    Shot { raw: bool, output: Option<String> },
+    Shot {
+        raw: bool,
+        output: Option<String>,
+    },
     Outputs,
+    /// Every mode each connected connector offers — what
+    /// `output.<connector>.mode` may be set to. See `docs/settings.md`.
+    Modes,
     Stats,
     Quit,
 }
@@ -33,7 +40,7 @@ struct Args {
 }
 
 const USAGE: &str =
-    "usage: nitro-shot [-o FILE] [--raw] [--output NAME] | --outputs | --stats | --quit";
+    "usage: nitro-shot [-o FILE] [--raw] [--output NAME] | --outputs | --modes | --stats | --quit";
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
     let mut file = None;
@@ -47,6 +54,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--raw" => raw = true,
             "--output" => output = Some(it.next().ok_or("--output needs a NAME")?),
             "--outputs" => cmd = Some(Mode::Outputs),
+            "--modes" => cmd = Some(Mode::Modes),
             "--stats" => cmd = Some(Mode::Stats),
             "--quit" => cmd = Some(Mode::Quit),
             "-h" | "--help" => return Err(USAGE.to_owned()),
@@ -161,11 +169,11 @@ fn run(args: Args) -> io::Result<()> {
                 write_out(args.file.as_ref(), &png)
             }
         }
-        Mode::Outputs | Mode::Stats => {
-            let line = if args.mode == Mode::Outputs {
-                "outputs\n"
-            } else {
-                "stats\n"
+        Mode::Outputs | Mode::Modes | Mode::Stats => {
+            let line = match args.mode {
+                Mode::Outputs => "outputs\n",
+                Mode::Modes => "modes\n",
+                _ => "stats\n",
             };
             request(&mut conn, line)?;
             let body = read_text_body(&mut conn)?;
@@ -227,6 +235,7 @@ mod tests {
         );
         assert_eq!(parse("--stats").unwrap().mode, Mode::Stats);
         assert_eq!(parse("--outputs -o o.txt").unwrap().mode, Mode::Outputs);
+        assert_eq!(parse("--modes").unwrap().mode, Mode::Modes);
         assert_eq!(parse("--quit").unwrap().mode, Mode::Quit);
         assert!(parse("-o").is_err());
         assert!(parse("--frob").is_err());

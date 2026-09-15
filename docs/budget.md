@@ -925,7 +925,7 @@ why the number is a per-*string* cost and not a per-frame one, and the
 async measurement path is M3 — this is the first measurement that puts a
 price on that decision.
 
-The run was checked against the trap `docs/latency.md` section 5 warns
+The run was checked against the trap `docs/latency.md` section 7 warns
 about: **1.7 flips/s** over the typing run, nowhere near the 60.0 that
 would mean the queue was full and the number was backlog rather than
 latency.

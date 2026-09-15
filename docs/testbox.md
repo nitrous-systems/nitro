@@ -9,7 +9,7 @@ snappy here, it is snappy.
 | OS / kernel | Ubuntu 26.04 LTS, kernel 7.0 |
 | CPU / RAM | Pentium G3240 (Haswell, 2 cores, SSE4.2, **no AVX2**), 3.3 GB, **no swap** |
 | GPU | Intel HD (HSW GT1), `i915`, `/dev/dri/card1`, `renderD128` |
-| Outputs | HDMI-A-1 1920×1080 connected; VGA-1 unused |
+| Outputs | HDMI-A-1 1920×1080 connected, **running at 120 Hz** (see below); VGA-1 unused |
 | Seat | systemd-logind (seatd also present); user in `video`,`render`,`input` |
 | Libs | libseat 0.9, libinput 1.31, libdrm 2.4.131, libxkbcommon 1.13 |
 | Tools | `perf`, `ydotool`, `chvt`, rustup (`~/.cargo/bin`) |
@@ -67,6 +67,62 @@ $ just box-session lock       # M4; refused, honestly
 err lock is not implemented yet (M4: …)
 $ just box-session suspend    # systemctl suspend, via the session
 ```
+
+## The panel runs at 120 Hz
+
+**By the human's choice, and the line is in his `server.conf` to stay**
+(#3718):
+
+```text
+output.HDMI-A-1.mode = 1920x1080@120
+```
+
+So `nitro-shot --outputs` says `1920x1080@120000` and
+`flip_interval_mean_us` is ~8 333 under continuous motion, not ~16 667.
+**Anything measured here is a 120 Hz number unless it says otherwise**,
+and every figure in `docs/latency.md` §1–§4 and `docs/budget.md` predates
+the key and is a 60 Hz number. `docs/latency.md` §5 has the conversion and
+the two thresholds that move with the rate.
+
+To take a 60 Hz comparison, **rewrite the line rather than deleting it** —
+deleting it gives the connector's preferred mode, which *is* 60 here, but
+leaves nothing behind saying the box is meant to be at 120:
+
+```console
+$ ssh box "sed -i 's/^output.HDMI-A-1.mode.*/output.HDMI-A-1.mode = 1920x1080@60/' ~/.config/nitro/server.conf"
+$ ssh box 'sudo systemctl restart nitro-dev'
+$ ssh box '~/nitro-bin/nitro-shot --outputs'    # confirm before measuring
+... and put `1920x1080@120` back when you release the box.
+```
+
+A restart is not strictly needed for a rate change — a same-size retime is
+live on `reload` — but a restart is what makes the arms comparable: it
+gives each one a fresh server, which is what every A/B in this room has
+done.
+
+**Check `outputs` at the start of every arm.** A `mode` line that matches
+nothing is a warning in the log and the *default* mode on screen, so an
+arm that silently ran at 60 while labelled 120 looks exactly like "120 Hz
+bought nothing". `~/nitro-bin/nitro-shot --modes` lists what the connector
+offers, which is also the answer to "what may I write here".
+
+### 240 Hz is not available on this source
+
+The human asked. The connector's own list tops out at 1080p@120, and the
+reason is the link rather than the panel: HDMI 1.4 on Haswell caps the
+TMDS clock near **300 MHz**, 1080p@120 is 285.5 MHz (just under), and
+1080p@240 needs 606.5 MHz with CVT-RB. 1080p@144 (346.5) and @165 (401.0)
+do not fit either. `docs/settings.md` has the full mode table, the
+arithmetic, and the 1280×720@240 modeline experiment — which *does* fit
+under the limit at 279.75 MHz, because KMS will set a mode the EDID never
+advertised.
+
+**If you set a modeline and the screen goes black, ssh still works**: the
+server is fine, the monitor is not. Remove the line and restart. `just
+shot` keeps working the whole time and proves **nothing** about sync — it
+reads the shadow buffer, which is the picture the server composed, not the
+picture the glass received. Only a person looking at the panel can settle
+that.
 
 ## Rules learned the hard way
 

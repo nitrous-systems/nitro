@@ -15,6 +15,7 @@ $XDG_CONFIG_HOME/nitro/server.conf      (default ~/.config/nitro/server.conf)
 output.HDMI-A-1.scale    = 2
 output.HDMI-A-1.position = 0,0
 output.HDMI-A-1.primary  = true
+output.HDMI-A-1.mode     = 1920x1080@120
 output.VGA-1.position    = 1920,0
 
 keyboard.layout  = de
@@ -57,6 +58,8 @@ broken desktop and a text console.
 | key | value | default |
 |---|---|---|
 | `output.<connector>.scale` | `0.5`–`8`; the logical-to-device factor | EDID: 2 at ≥ 192 dpi, else 1 |
+| `output.<connector>.mode` | `<W>x<H>[@<Hz>]`, or `max`, or `fastest` — which of the connector's modes to run | the connector's preferred mode |
+| `output.<connector>.modeline` | raw timings the monitor never advertised; see below | none |
 | `output.<connector>.position` | `x,y` — this output's top-left corner in **desktop (logical)** coordinates; may be negative | placed after the last positioned output, in connector order |
 | `output.<connector>.primary` | `true`/`yes`/`on`/`1` (and the negatives) | the first connector |
 | `keyboard.layout` | an xkb layout, e.g. `us`, `de`, `us,de` | `us` |
@@ -75,6 +78,205 @@ reports `DP-1.2`), so the field is taken after the **last** dot.
 An explicit empty value is not the same as an absent key:
 `keyboard.variant =` means "no variant", where saying nothing lets
 `XKB_DEFAULT_VARIANT` or xkbcommon's own default decide.
+
+### `output.<connector>.mode`
+
+```text
+output.HDMI-A-1.mode = 1920x1080@120
+```
+
+**Which of the connector's modes to run.** With no such line nitro takes
+the connector's *preferred* mode — the kernel's own choice, the one the
+EDID marks — which is what it did for its whole life before this key
+existed, and on every panel anyone has plugged in that has meant 60 Hz.
+
+Four spellings, all matched against the list the connector actually
+reports:
+
+| value | means |
+|---|---|
+| `1920x1080@120` | exactly that size, and the listed rate nearest 120 Hz |
+| `1920x1080` | exactly that size, **highest** rate available at it |
+| `fastest` | the preferred *size*, highest rate at it |
+| `max` | largest area, then highest rate — ignoring the preferred flag |
+
+The rate may be fractional: `@59.94` is a real mode and picks it.
+
+**Matching.** The size must match **exactly** — there is no scaling here,
+this key chooses a mode and nothing else. The rate is matched to the
+**nearest** listed mode within **0.5 Hz**, which is the rule that makes
+`@60` unambiguous: an HDMI connector lists 60.000 *and* 59.940, 60 mHz
+apart, and a threshold rule would have to pick one of them arbitrarily.
+Nearest picks the one you asked for, both ways round. **Interlaced modes
+are never selected** by a `mode` line: the default rule tolerates one as a
+last resort, because a connector that lists nothing else still has to
+light up, but answering an explicit `1920x1080@60` with a 1080i mode would
+put a different picture on screen than the one that was asked for.
+
+**A size or rate the connector does not have is a warning, not a
+failure.** The output comes up on its default mode and the log names every
+mode the connector *does* list — which is exactly the text you need in
+order to write a line that works:
+
+```text
+[warn] HDMI-A-1: no mode matches `2560x1440@144`; this connector lists
+       1920x1080@120, 1920x1080@85, 1920x1080@60, 1920x1080@60,
+       1920x1080@50, 1920x1080@24, 3840x2160@30, 3840x2160@25,
+       3840x2160@24. Using the default mode.
+```
+
+The same list without waiting for a mistake: **`modes` on the control
+socket** (`crates/nitro-server/README.md`), which marks the preferred mode
+`*` and the one in use `=`. `nitro-settings` shows the short version on
+each display row — `1920×1080 @ 60 Hz (also 120, 85, 50, 24)` — and
+deliberately offers no mode *picker*: a control that blanks the screen and
+can leave a panel dark is not something to put behind a combo box.
+
+**`outputs` reports the truth, not the request.** A `mode` line that did
+not take shows as the mode that did, which is the only way to tell a
+modeset that happened from one that silently did not:
+
+```console
+$ nitro-shot --outputs
+HDMI-A-1 1920x1080@120000 scale=1 pos=0,0 primary=1
+```
+
+#### When it takes effect
+
+**On reload, live.** A mode set is a *full modeset* — the CRTC is retimed
+and the panel blanks for a moment — not an atomic property flip like
+`scale` or `position`, so it is applied only when the resolved mode
+actually changed. A reload that moved a colour, or one that repeats the
+same `mode` line, costs nothing at all: the comparison happens before the
+hardware is touched.
+
+A **refresh** change at the same size (1080p60 → 1080p120) is the cheap
+case and the one this key is mostly for: no buffer changes size, so the
+shadow and both scanout buffers stay exactly as they are. A **size**
+change reallocates them and re-lays-out the desktop, which is the same
+path a hotplug already takes — it works, and it is a visibly bigger
+event.
+
+The key is also read **before the first modeset**, not after it: the
+server reads `server.conf` before it opens the card, so a box configured
+for 120 Hz comes up at 120 Hz rather than lighting at 60 and retiming a
+moment later.
+
+#### `NITRO_MODE`, for a measurement run
+
+```console
+$ NITRO_MODE=HDMI-A-1=1920x1080@120 nitro-server
+$ NITRO_MODE=HDMI-A-1=1920x1080@120,DP-1=max nitro-server
+```
+
+Comma-separated, `<connector>=<mode>`, exactly `NITRO_SCALE`'s shape and
+for the same reason: the environment is the **development** channel, so a
+sweep or a one-off comparison can override the box's own file without
+editing it. It beats `output.<c>.mode`.
+
+#### `output.<connector>.modeline`, and how to get your screen back
+
+```text
+output.HDMI-A-1.modeline = 279750 1280 1328 1360 1440 720 723 727 810 +hsync -vsync
+```
+
+Raw timings, X-style, with the clock in **kHz** (the unit the kernel's own
+`i915_display_info` prints, not X's MHz):
+`<clock_khz> <hdisp> <hsync_start> <hsync_end> <htotal> <vdisp>
+<vsync_start> <vsync_end> <vtotal> [+hsync|-hsync] [+vsync|-vsync]`.
+Polarity defaults to `+hsync -vsync`, which is what CVT reduced blanking
+wants. `NITRO_MODELINE=<connector>=<timings>` is the environment form —
+one connector per variable, because a modeline has spaces in it and could
+not share `NITRO_MODE`'s comma-separated list without a quoting rule.
+
+> **This bypasses the monitor's advertised list entirely.** The EDID is
+> not consulted; the kernel is asked whether the timings are *drivable*
+> (an atomic `TEST_ONLY` commit before anything is applied, so a rejected
+> modeline is a warning and the default mode, never a server that will not
+> start) but nothing checks whether the **panel** will sync to them. A
+> panel that will not shows black until you change the line back.
+
+**Recovering from a black screen.** ssh in — the server is running fine,
+it is the monitor that is unhappy — remove or fix the line, and restart:
+
+```console
+$ ssh box
+$ sed -i '/modeline/d' ~/.config/nitro/server.conf
+$ sudo systemctl restart nitro-dev
+```
+
+`just shot` keeps working throughout, and is **not** evidence either way:
+it reads the shadow buffer, which is the picture the server *composed*.
+Whether that picture reached the glass is a question only a person looking
+at the panel can answer. (The #3705 lesson, in a new costume: the
+instrument was measuring the layer below the broken one.)
+
+`outputs` marks a custom mode so the caveat travels with the numbers:
+
+```console
+HDMI-A-1 1280x720@239840 scale=1 pos=0,0 primary=1 (custom)
+```
+
+#### The test box's modes, and the 240 Hz question
+
+The human asked for 240 Hz — "the monitor can do it". On this source it
+cannot, and the evidence is the connector's own list.
+`sudo cat /sys/kernel/debug/dri/1/i915_display_info`, HDMI-A-1:
+
+| mode | clock |
+|---|---|
+| 1920x1080@120 | 285 500 kHz |
+| 1920x1080@85 | |
+| **1920x1080@60** (preferred) | 148 500 kHz |
+| 1920x1080@60 | |
+| 1920x1080@50 | |
+| 1920x1080@24 | |
+| 3840x2160@30 / 25 / 24 | |
+
+**120 Hz is the top of the list and nothing above it exists.** The reason
+is the link, not the panel: this is HDMI 1.4 on Haswell, whose TMDS clock
+tops out near **300 MHz**. 1080p@120 at 285.5 MHz is just under it — which
+is why it is the last mode the EDID offers — and 1080p@240 needs
+**606.5 MHz** with CVT-RB v1 (583.2 with RBv2), twice the ceiling. Not
+close. 1080p@144 (346.5 MHz) and 1080p@165 (401.0 MHz) do not fit either,
+which is worth saying with the numbers rather than by trying: 346.5 > 300,
+so there is nothing to attempt.
+
+**240 Hz is a DisplayPort or HDMI 2.x question for another source**, and
+that is the honest end of it for this box at 1080p.
+
+What *does* fit under 300 MHz is a **smaller** mode at 240 Hz, and KMS
+accepts an arbitrary mode blob whether or not the EDID lists it — which is
+what `modeline` is for. CVT 1.2 reduced blanking for 1280×720@240:
+
+```text
+RBv1: H blanking is a constant 160 px (48 front, 32 sync, 80 back), so
+      htotal = 1280 + 160 = 1440.
+      V blanking is the fewest lines covering RB_MIN_V_BLANK = 460 us:
+      h_period = (1e6/240 - 460) / 720 = 4.1944 us, so
+      vbi = floor(460 / 4.1944) + 1 = 90 lines, vtotal = 810.
+      vsync is 4 lines after a 3-line front porch: 723, 727.
+      clock = 1440 * 810 * 240 = 279.936 MHz, rounded DOWN to CVT's
+      0.25 MHz step = 279.750 MHz.
+      Actual refresh = 279 750 000 / (1440 * 810) = 239.84 Hz.
+
+RBv2: H blanking 80 px (8 front, 32 sync, 40 back), htotal 1360;
+      same 810 lines; clock = 1360 * 810 * 240 = 264.384 MHz.
+```
+
+**279.75 MHz is inside the 300 MHz limit** — and so is RBv2's 264.4, with
+more headroom. The formula is checkable against a mode the box already
+has: run it for 1920×1080@120 and it produces **285 500 kHz**, the exact
+clock the kernel reports for that connector's 120 Hz mode. That is the
+reason to trust the 279 750.
+
+```text
+output.HDMI-A-1.modeline = 279750 1280 1328 1360 1440 720 723 727 810 +hsync -vsync
+```
+
+Whether the **panel** syncs to it is a separate question from whether the
+link can carry it, and the only instrument for it is a person looking at
+the screen. See `docs/testbox.md` for what happened when it was tried.
 
 ### `remote.listen`
 
@@ -214,6 +416,7 @@ leave nothing clickable with which to fix it — including this app.
 | setting | wins | then | then |
 |---|---|---|---|
 | output scale | `NITRO_SCALE=<c>=<f32>` | `output.<c>.scale` | EDID dpi step |
+| output mode | `NITRO_MODE=<c>=<mode>` / `NITRO_MODELINE=<c>=<timings>` | `output.<c>.mode` / `.modeline` | the connector's preferred mode |
 | output position | — | `output.<c>.position` | left-to-right in connector order |
 | primary output | — | `output.<c>.primary` | the first connector |
 | keyboard | `XKB_DEFAULT_*` | `keyboard.*` | the `us` layout |
@@ -256,6 +459,11 @@ On reload the server re-applies the scales (a change sends a `Configure`
 to that output's windows and repaints it in full), re-lays out the
 desktop positions, and rebuilds the xkb keymap — resetting the key state,
 because a keymap swap invalidates whatever modifiers were being held.
+
+A changed `output.<c>.mode` is applied **first**, because it decides what
+the layout is laying out. It is the one key here whose application is a
+full modeset rather than a property flip, so it is done only when the
+resolved mode actually moved — see the key's own section above.
 
 ### Why the watch is on the directory
 

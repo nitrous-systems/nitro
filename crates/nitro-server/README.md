@@ -91,7 +91,8 @@ tests.
 |----------------------|-----------------------------------------------------------------------|
 | `shot [output-name]` | `ok <width> <height> <stride>\n` + `stride*height` bytes `XRGB8888`. Read from the output's **shadow buffer** when there is one — cheaper (no uncached reads back out of write-combined memory) and, if anything, more honest: the shadow is complete by construction, where the front buffer is complete only because the age-2 rule says so. It falls back to `read_front` under `NITRO_SHADOW=0` and for the moments before a shadow has been painted into. The two are byte-identical once a frame has settled, which `tests/shadow.rs` pins. |
 | `shot-front [name]`  | The same, read off the **scanout** buffer whatever the shadow holds. Test-only: with the shadow on, an ordinary `shot` cannot see whether the copy out of the shadow put the right bytes where the display reads them, so a shadow test would be unable to fail. |
-| `outputs`            | `ok\n`, one `name WxH@refresh_mhz scale=<s> pos=<x>,<y> primary=<0\|1>\n` per output, blank line. `pos` is the output's origin in **desktop** (logical) space — the number a window position on that output is relative to, which is what someone debugging a two-monitor layout is asking for; the device rectangle is `WxH` at `pos × scale`, so both spaces are recoverable from the one line. `scale` prints without a trailing `.0` (`scale=2`, `scale=1.25`), which is also how the configuration file that produced it spells it. |
+| `outputs`            | `ok\n`, one `name WxH@refresh_mhz scale=<s> pos=<x>,<y> primary=<0\|1>\n` per output, blank line, and a trailing ` (custom)` when the mode came from an `output.<c>.modeline` rather than from the connector's own list. `pos` is the output's origin in **desktop** (logical) space — the number a window position on that output is relative to, which is what someone debugging a two-monitor layout is asking for; the device rectangle is `WxH` at `pos × scale`, so both spaces are recoverable from the one line. `scale` prints without a trailing `.0` (`scale=2`, `scale=1.25`), which is also how the configuration file that produced it spells it. |
+| `modes`              | `ok\n`, one `name <WxH@Hz>` line per mode each connected connector offers, blank line. ` *` marks the connector's preferred mode and ` =` the one in use. **Separate from `outputs` rather than a second line on it**, because the two answer different questions and one of them is unbounded: `outputs` is "what is on screen" and is one line per output forever, while this is "what could I write in the file" and is a dozen lines per connector on a television — folding it in would make every existing parser of the `outputs` reply (`nitro-shot --outputs`, `nitro-settings`, three test suites) handle a variable number of lines per output for a question none of them asked. The mode text is **exactly** what `output.<connector>.mode` takes, so an answer to "how do I run this screen at 120" is a line you can copy. A `modeline`'s timings are in no connector list, so a custom mode is appended as `WxH@Hz (custom)` — it is the one mode this reply would otherwise not mention, and the one nothing else validated. See `docs/settings.md`. |
 | `stats`              | `ok\n`, one `key value` line per statistic (see below), blank line     |
 | `quit`               | `ok\n`, then orderly shutdown                                          |
 | `reload`             | `ok\n`; re-reads `server.conf` and applies it. Synchronous — the `ok` comes back after the reload was applied — which is what makes it the reload a test can use, where SIGHUP and the inotify watch are races against the loop noticing. `config_reloads` counts it. |
@@ -119,6 +120,8 @@ closed.
 | `NITRO_INPUT`     | `off`                            | input enabled                  |
 | `NITRO_INPUT_DIR` | directory scanned for `event*`   | `/dev/input`                   |
 | `NITRO_SCALE`     | `<connector>=<f32>,…` per-output scale override, e.g. `HDMI-A-1=2` | `server.conf`'s `output.<c>.scale`, else EDID-derived: 2 at ≥ 192 dpi, else 1. See `docs/wm.md` and the precedence table below. |
+| `NITRO_MODE`      | `<connector>=<WxH[@Hz]\|max\|fastest>,…` per-output mode override, e.g. `HDMI-A-1=1920x1080@120` | `server.conf`'s `output.<c>.mode`, else the connector's preferred mode. Same development-channel role as `NITRO_SCALE`, so a measurement run can sweep refresh rates without editing the box's file. See `docs/settings.md`. |
+| `NITRO_MODELINE`  | `<connector>=<clock_khz> <hdisp> <hss> <hse> <htotal> <vdisp> <vss> <vse> <vtotal> [±hsync] [±vsync]` | none. Raw timings the monitor never advertised, validated with an atomic `TEST_ONLY` commit before anything is applied. **One** connector per variable, because a modeline has spaces in it and could not share `NITRO_MODE`'s comma-separated list without a quoting rule. See `docs/settings.md` for the recovery procedure when a panel will not sync. |
 | `NITRO_CONFIG`    | path of `server.conf`            | `$XDG_CONFIG_HOME/nitro/server.conf`, else `$HOME/.config/nitro/server.conf`. With neither variable set there is **no file and no watch** and the server runs on its defaults — the state a system service with an empty environment is in. See `docs/settings.md`. |
 | `NITRO_SHADOW`    | `0` to paint straight into the scanout buffer | enabled: each output gets a heap shadow buffer (one scanout-sized allocation, ~8 MB at 1080p) that the rasterizer paints into, with only the damage rects streamed out to the write-combined dumb buffer. Worth 9.3× on the frame path and 8 MB of RSS per output (`docs/latency.md` §4.5, `docs/budget.md`); `0` is the A/B lever, not a supported configuration. |
 | `NITRO_FONT_DIRS` | colon-separated font directories | `/usr/share/fonts:/usr/local/share/fonts:~/.local/share/fonts` (read by `nitro-text`) |
@@ -163,6 +166,7 @@ because it is the user's explicit answer to the EDID's guess.
 | setting | wins | then | then |
 |---|---|---|---|
 | output scale | `NITRO_SCALE=<c>=<f32>` | `output.<c>.scale` | EDID dpi step: 2 at ≥ 192 dpi, else 1 |
+| output mode | `NITRO_MODE=<c>=<mode>`, `NITRO_MODELINE=<c>=<timings>` | `output.<c>.mode`, `output.<c>.modeline` | the connector's preferred mode |
 | output position | — | `output.<c>.position`, in **desktop** (logical) units | placed after the last positioned output, in connector order |
 | primary output | — | `output.<c>.primary = true` | the first connector |
 | keyboard | `XKB_DEFAULT_{RULES,MODEL,LAYOUT,VARIANT,OPTIONS}` | `keyboard.layout\|variant\|options` | the `us` layout |
@@ -504,9 +508,19 @@ released by whichever comes first:
 * **the client's commit** — the next wakeup, usually — which adds content
   damage, so one flip carries cursor *and* content;
 * **the deadline**, `frame::frame_deadline`: the next expected vblank
-  minus `FRAME_MARGIN_NS`. A client that never answers therefore costs
-  nothing at all, because 2 ms is ten paint passes on the test box — the
-  cursor still reaches that same vblank.
+  minus `frame::frame_margin_ns`. A client that never answers therefore
+  costs nothing at all, because 2 ms is ten paint passes on the test box —
+  the cursor still reaches that same vblank.
+
+  The margin is `FRAME_MARGIN_NS` (2 ms, the measured third of a paint
+  budget) **capped at a quarter of the actual refresh period**. It is the
+  server's own rasterization pass, and that pass does not get faster
+  because the panel did, so it is deliberately an absolute number rather
+  than a fraction — unchanged at 60 Hz *and* at 120 Hz (a quarter of
+  8.33 ms is 2.08 ms, just above it). The cap bites only past that, at
+  240 Hz and beyond, where a fixed 2 ms would be most of a 4.17 ms frame
+  and the deadline would start pushing commits onto the following vblank,
+  which is the exact latency this machinery exists to avoid.
 
 Four conditions all have to hold, and each of the last three is a way of
 saying "nobody is already waiting for these pixels":
@@ -761,10 +775,10 @@ looking for.
 | `active`                 | 1 unless the session is paused by a VT switch.                           |
 | `flip_interval_mean_us`  | Mean interval between flips, in microseconds.                            |
 | `flip_interval_min_us`   | Shortest interval seen.                                                  |
-| `flip_interval_max_us`   | Longest interval seen. Intervals longer than four refresh periods are **not counted**: an idle server deliberately stops flipping, and that gap is the absence of frames, not a slow one — counting it would measure how long the desktop sat still. |
+| `flip_interval_max_us`   | Longest interval seen. Intervals longer than four refresh periods are **not counted**: an idle server deliberately stops flipping, and that gap is the absence of frames, not a slow one — counting it would measure how long the desktop sat still. The period is the **flipping output's own**, so "four periods" is 33.3 ms at 120 Hz and 66.7 ms at 60, not a constant. |
 | `flips_deferred`         | Cursor-only flips held back for a client's answer, counted once per episode (a burst of motion inside one frame period is one). See the frame path above. |
 | `defer_timeouts`         | How many of those ended at the deadline instead of at a commit — the client did not answer. Tracking `flips_deferred` means a wedged client: the cursor is still reaching every vblank, but nothing is riding with it. |
-| `paint_us_min`           | Rasterization time per frame, over the last 120 frames (two seconds at 60 Hz). Paint only — not the copy to the scanout buffer (`copy_us_*`) and not the commit. With the shadow on, a min of 0 is normal and correct: the age-2 carry frame has no new damage to draw, only pixels to copy. |
+| `paint_us_min`           | Rasterization time per frame, over the last 120 frames (two seconds at 60 Hz, one at 120 — the window is a frame count, because the quantity is per-frame work). Paint only — not the copy to the scanout buffer (`copy_us_*`) and not the commit. With the shadow on, a min of 0 is normal and correct: the age-2 carry frame has no new damage to draw, only pixels to copy. |
 | `paint_us_mean`          | Mean of the same window.                                                 |
 | `paint_us_max`           | Max of the same window — in practice a full-screen repaint.              |
 | `copy_us_min`            | Microseconds spent streaming the shadow buffer's damage rects into the scanout buffer, same 120-frame window. Always 0 under `NITRO_SHADOW=0`, where there is no copy. Kept apart from `paint_us` because the two measure different hardware — cached heap versus the write-combined mapping — and respond to different changes. |

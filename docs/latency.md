@@ -497,7 +497,86 @@ frame, so a server with nothing to do does nothing with it either.
 which is `1920 × 1080 × 4` to the byte. `docs/budget.md` records it as
 the deliberate trade it is.
 
-## 5. Remote: the same measurement over TCP (M4-E1)
+## 5. At 120 Hz
+
+**Every number in this dossier is a 60 Hz number.** They were all taken
+before `output.<connector>.mode` existed (#3718), on a box that had no way
+to run at anything else. This section says what changes when it does.
+
+### The budgets are per-frame, and the frame halved
+
+`DESIGN.md`'s rule is "input → photon within one refresh", and it is
+written that way on purpose: the target is a refresh, not 16.7 ms. At
+120 Hz the refresh is **8 333 µs**, so:
+
+| | at 60 Hz | at 120 Hz |
+|---|---|---|
+| one refresh (the budget) | 16 667 µs | **8 333 µs** |
+| ½ refresh — the mean wait for the next vblank | 8 333 | **4 167** |
+| the measured median i2p (§4.1), against it | 9 290 µs = **0.56 refreshes** | 9 290 − ~4 200 ≈ **5 100 µs = 0.61 refreshes** |
+| `flip_interval_mean_us` under continuous motion | ≈ 16 667 | ≈ **8 333** |
+| `flip_interval_max_us` cut-off (four periods) | 66 667 | **33 333** |
+| the frame margin (§4.2, `frame_margin_ns`) | 2 000 | **2 000**, unchanged |
+| the saturation threshold (§4.4): 2 flips per move | 30 moves/s | **60 moves/s** |
+
+**What the halved period does and does not change.** It does not make any
+of the *work* faster: `paint_us_mean` and `copy_us_mean` are per-frame
+figures and are the same per frame at either rate — there are simply twice
+as many frames per second, so the server's CPU under continuous motion
+roughly doubles. It does take about **half a frame off the latency**,
+because the dominant term in §4.1's 9.3 ms is the wait for the next
+vblank, and that wait is half as long. In refresh-fractions the figure
+therefore gets slightly *worse* while in milliseconds it gets better,
+which is the honest way to state it: 120 Hz buys wall-clock latency, not
+headroom.
+
+**The two thresholds move with it, and both matter for a rate sweep.**
+§4.4's saturation cliff is where the input rate demands more flips than
+the display retires, so at 120 Hz it sits at 60 moves/s rather than 30 —
+the ydotool recipe in §2 (20 ms apart, ~41 moves/s) is *above* the cliff
+at 60 Hz and *below* it at 120, which means the same recipe measures two
+different things at the two rates. A 60-vs-120 comparison has to be run
+at a pacing that is unsaturated at **both**, which is the §4.4 trap in a
+new costume. And `flip_interval_max_us`' four-period cut-off is four
+*actual* periods: the server reads the flipping output's own
+`refresh_mhz`, so the bound is 33.3 ms at 120 Hz and the statistic keeps
+meaning "a slow frame" rather than "an idle gap".
+
+**The frame margin stays at 2 ms**, deliberately. It is the server's own
+rasterization pass — about a third of the paint budget measured on this
+box — and that pass does not get faster because the panel did. A quarter
+of an 8.33 ms frame is 2.08 ms, just above it, so 120 Hz is the last rate
+at which the constant applies unchanged; past that a cap takes over
+(`crates/nitro-server/README.md`).
+
+### Idle is still zero, and that is the claim to check first
+
+A refresh rate must not change idle behaviour at all: the server stops
+flipping when nothing changes, and "nothing changes" is rate-independent.
+So the idle reading at 120 Hz has to be the *same* number as at 60 — two
+frames in 45 s with bar and launcher, which is the bar's 30 s sensor poll
+and not a frame rate. A doubled idle figure would mean something is
+pacing itself off vblank that should not be, and is the one result here
+that would be a defect rather than a measurement.
+
+### Running the comparison
+
+```sh
+box$ sed -i 's/^output.HDMI-A-1.mode.*/output.HDMI-A-1.mode = 1920x1080@120/' \
+         ~/.config/nitro/server.conf
+box$ sudo systemctl restart nitro-dev
+box$ ~/nitro-bin/nitro-shot --outputs      # 1920x1080@120000 — check before measuring
+```
+
+and back to 60 by rewriting the line to `1920x1080@60` (not by deleting
+it, if the box is the one the human left at 120 — see `docs/testbox.md`).
+The §7 cautions all still apply, plus one that is specific to a rate
+sweep: **`outputs` before every arm.** A `mode` line that matched nothing
+is a warning in the log and the *default* mode on screen, so an arm that
+silently ran at 60 while being labelled 120 looks exactly like "120 Hz
+bought nothing".
+
+## 6. Remote: the same measurement over TCP (M4-E1)
 
 An app on the dev box, its window on the test box, over a 1 Gb LAN
 (`docs/remote.md` has the model and the security model). The question
@@ -565,7 +644,7 @@ Same direction in four of five pairs.
   0.63 %**, taken from the server socket's own `ss -ti` counters either
   side of the run.
 
-## 6. Reproducing
+## 7. Reproducing
 
 ```sh
 just deploy                                   # includes nitro-demo
@@ -603,7 +682,7 @@ A before/after wants both builds measured in the same sitting, alternating
 if possible. The box is shared and its thermal and scheduler state drift;
 two runs a day apart are not a controlled comparison.
 
-For a **remote** run (section 5), the client is on the other machine and
+For a **remote** run (section 6), the client is on the other machine and
 the `NITRO_SOCKET` goes with it:
 
 ```sh
