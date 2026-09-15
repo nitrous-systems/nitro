@@ -504,6 +504,13 @@ the dependency policy working rather than a coincidence: both were
 measured against the alternative first, and in both cases the alternative
 was a crate we already had the ingredients for.
 
+**M4-H gives `nitro-png` its consumer**, and changes neither number:
+`nitro-server` gains it as a path dependency for the application icons
+(`docs/icons.md`), so the workspace is **81** lines and still **37**
+distinct external names. A decoder written in #3711 with no consumer is
+now the reason that measurement was worth taking — the eight crates the
+`png` route would have added are eight crates this feature did not cost.
+
 
 ## `rustix` features by crate
 

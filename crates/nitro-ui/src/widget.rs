@@ -364,6 +364,56 @@ impl<S: 'static> LayoutCx<'_, S> {
 /// rectangle and a colour.
 pub type Slot = u16;
 
+/// How the server is to colour an icon: from the palette, or from the
+/// artwork itself.
+///
+/// The two arms are **two different icon sets**, not two renderings of
+/// one. A palette role names the symbolic set compiled into the server
+/// (`gear`, `list`, `cpu`), whose artwork is a coverage mask that is
+/// tinted at paint time — which is what makes a `theme.scheme` flip free.
+/// [`IconTint::Coloured`] names an **application** icon in the machine's
+/// XDG icon theme (`firefox`, `org.gnome.Calculator`), which is a picture
+/// and is painted in its own colours. Nothing falls back between them:
+/// the server answers `BadIcon` for a symbolic name asked for as
+/// coloured, and for a theme-only name asked for with a role. See
+/// `docs/icons.md`.
+///
+/// There is deliberately no `Color` arm, for the reason there is no
+/// `.color(Color)` on an [`IconBuilder`](crate::widgets::IconBuilder): a
+/// colour written down in a widget is a colour the desktop's scheme
+/// switch cannot reach, and `deploy/lint-colors.sh` fails the build for
+/// one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IconTint {
+    /// Tint the symbolic set's coverage mask with this palette role.
+    Role(nitro_core::Role),
+    /// Paint an application icon's own colours, untinted.
+    Coloured,
+}
+
+impl IconTint {
+    /// The `SetIcon.role` byte this tint travels as.
+    ///
+    /// A `u8` rather than an enum on the wire because the palette has
+    /// fewer than 255 roles and the protocol reserved `0xff` for exactly
+    /// this before there was anything to put in it — so the full-colour
+    /// mode arrived with no wire change at all
+    /// (`nitro_wire::msg::SetIcon::AS_COLOURED`).
+    #[must_use]
+    pub fn role_byte(self) -> u8 {
+        match self {
+            IconTint::Role(r) => r.index() as u8,
+            IconTint::Coloured => nitro_wire::msg::SetIcon::AS_COLOURED,
+        }
+    }
+
+    /// Whether this is [`IconTint::Coloured`].
+    #[must_use]
+    pub fn is_coloured(self) -> bool {
+        self == IconTint::Coloured
+    }
+}
+
 /// How a run of text is drawn: style, colour, alignment and wrap width.
 ///
 /// `max_width` is the one field that is not merely cosmetic. It **must**
@@ -545,16 +595,29 @@ impl<S: 'static> PaintCx<'_, S> {
     /// server tints it with. No pixels cross the wire, which is what
     /// makes it work identically on a remote link and recolour itself
     /// when the scheme flips — see `docs/icons.md`.
+    ///
+    /// For a full-colour **application** icon use
+    /// [`PaintCx::icon_tinted`] with [`IconTint::Coloured`]; the two are
+    /// different namespaces on the server and nothing falls back between
+    /// them.
     pub fn icon(&mut self, slot: Slot, rect: Rect, name: &str, size: f32, role: nitro_core::Role) {
+        self.icon_tinted(slot, rect, name, size, IconTint::Role(role));
+    }
+
+    /// Draw an icon in `slot` with an explicit [`IconTint`]: a palette
+    /// role, or the icon's own colours.
+    ///
+    /// The additive twin of [`PaintCx::icon`] rather than a change to its
+    /// signature, because `icon(.., role)` is the overwhelmingly common
+    /// call and every existing caller — inside this crate and in
+    /// `nitro-bar`, `nitro-launcher`, `nitro-settings` — means exactly
+    /// that. A widget that wants the other mode says so.
+    pub fn icon_tinted(&mut self, slot: Slot, rect: Rect, name: &str, size: f32, tint: IconTint) {
         let at = self.slot_at(slot);
-        let r = self.ui.wire_mut().paint_icon(
-            &mut self.slots,
-            at,
-            rect,
-            name,
-            size,
-            role.index() as u8,
-        );
+        let r =
+            self.ui
+                .wire_mut()
+                .paint_icon(&mut self.slots, at, rect, name, size, tint.role_byte());
         self.note(r);
     }
 

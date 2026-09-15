@@ -18,7 +18,9 @@ use crate::event::{Event, Handled, button, key};
 use crate::layout::{Constraints, CrossAlign, Direction, MainAlign, ShrinkFloor};
 use crate::theme::TextStyle;
 use crate::ui::{Ui, WidgetMut};
-use crate::widget::{Access, EventCx, LayoutCx, MeasureCx, PaintCx, Role, TextRun, Widget};
+use crate::widget::{
+    Access, EventCx, IconTint, LayoutCx, MeasureCx, PaintCx, Role, TextRun, Widget,
+};
 
 // ---------------------------------------------------------------------
 // Flex
@@ -478,18 +480,43 @@ type ClickFn<S> = Box<dyn Fn(&mut S, &mut Ui<S>)>;
 
 /// A push button: label, hover/pressed/focused visuals, and a callback
 /// that receives the app state and the whole tree.
+///
+/// It draws an icon in one of **two** modes, which are different things
+/// and deliberately kept apart (see [`IconMode`]): *instead of* the
+/// label, which is what a toolbar glyph button is, or *in front of* it,
+/// which is what a launcher row and a window-list entry are.
 pub struct Button<S> {
     text: String,
-    /// A symbolic icon drawn instead of the label, by name.
+    /// An icon drawn instead of, or in front of, the label — by name.
     ///
-    /// A button is either a word or a glyph, never both: a toolbar button
-    /// showing `≡` used to be a *character* in the label, which meant it
-    /// came from whatever font happened to have that codepoint and was
-    /// the wrong weight next to everything else. Naming an icon instead
-    /// makes it the desktop's own artwork, rasterised at the output's
-    /// scale — see `docs/icons.md`. The text is still the accessible
-    /// name, which is why both fields exist.
+    /// Naming an icon rather than putting a character in the label makes
+    /// it the desktop's own artwork, rasterised at the output's scale:
+    /// the `≡` this replaced came from whatever font on the box happened
+    /// to have U+2630 and was the wrong weight beside everything else.
+    /// See `docs/icons.md`. The text is still the accessible name, which
+    /// is why both fields exist.
     icon: Option<String>,
+    /// Whether [`Button::icon`] replaces the label or leads it.
+    icon_mode: IconMode,
+    /// How the icon is coloured, or `None` for "the colour the label has
+    /// in this state".
+    ///
+    /// `None` is a distinct state from `Some(IconTint::Role(..))` rather
+    /// than a spelling of the default role: it is what makes a *disabled*
+    /// icon button's glyph go dim with its label without the caller
+    /// restating the role for every state the button has. Naming a role
+    /// pins it; [`IconTint::Coloured`] means the artwork's own colours.
+    icon_tint: Option<IconTint>,
+    /// A second icon name, tried once if the server does not have the
+    /// first, with the tint to try it in; see
+    /// [`ButtonBuilder::icon_fallback_tinted`].
+    icon_fallback: Option<(String, IconTint)>,
+    /// Whether that retry has been answered for. As [`Icon`]'s field of
+    /// the same name: the once-ness is the `take`, this is the record.
+    icon_fell_back: bool,
+    /// An explicit icon side in logical pixels, or `None` for "as big as
+    /// the label"; see [`ButtonBuilder::icon_size`].
+    icon_size: Option<f32>,
     enabled: bool,
     pressed: bool,
     style: Option<TextStyle>,
@@ -497,6 +524,31 @@ pub struct Button<S> {
     /// The **middle**-button callback; see [`ButtonBuilder::on_alt_click`].
     on_alt_click: Option<ClickFn<S>>,
     metrics: crate::wire::TextMetrics,
+}
+
+/// Where a [`Button`]'s icon goes relative to its label.
+///
+/// Two modes rather than one mode with an empty label, because the two
+/// have different *measurements* and the difference is visible: a glyph
+/// button is a square plus padding and must not reserve room for a word
+/// it does not draw, and a row button is `icon + gap + label` and must
+/// not clip the word it does. Both are decided in
+/// [`Button::shows_icon`], so `measure` and `paint` cannot disagree about
+/// which of the three shapes a button is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IconMode {
+    /// The icon is drawn **instead of** the label, centred in the face.
+    ///
+    /// The text stays the accessible name — the glyph is for the eye, the
+    /// word for everything else — and is what the button falls back to
+    /// without [`caps::ICONS`](nitro_wire::types::caps::ICONS).
+    Replace,
+    /// The icon is drawn **in front of** the label, [`ICON_GAP`] apart.
+    ///
+    /// Without the capability the button is simply its label, at the
+    /// label's own width: a row with a gap where an icon would be is a
+    /// worse answer than a row without one.
+    Leading,
 }
 
 impl<S> std::fmt::Debug for Button<S> {
@@ -516,10 +568,74 @@ impl<S> Button<S> {
         &self.text
     }
 
-    /// The icon drawn instead of the label, if any.
+    /// The icon drawn instead of, or in front of, the label — if any.
     #[must_use]
     pub fn icon(&self) -> Option<&str> {
         self.icon.as_deref()
+    }
+
+    /// Where that icon goes: [`IconMode::Replace`] or
+    /// [`IconMode::Leading`].
+    #[must_use]
+    pub fn icon_mode(&self) -> IconMode {
+        self.icon_mode
+    }
+
+    /// How the icon is coloured, or `None` when it takes whatever colour
+    /// the label has in the button's current state.
+    #[must_use]
+    pub fn icon_tint(&self) -> Option<IconTint> {
+        self.icon_tint
+    }
+
+    /// Whether the icon is an **application** icon, painted in its own
+    /// colours rather than tinted from the palette.
+    #[must_use]
+    pub fn is_icon_coloured(&self) -> bool {
+        self.icon_tint.is_some_and(IconTint::is_coloured)
+    }
+
+    /// The explicit icon side in logical pixels, or `None` when the icon
+    /// is sized from the label.
+    #[must_use]
+    pub fn icon_size(&self) -> Option<f32> {
+        self.icon_size
+    }
+
+    /// The icon name tried if the server does not have [`Button::icon`],
+    /// if any. `None` once it has been taken.
+    #[must_use]
+    pub fn icon_fallback(&self) -> Option<&str> {
+        self.icon_fallback.as_ref().map(|(n, _)| n.as_str())
+    }
+
+    /// The tint that fallback is asked for in, which need not be the
+    /// icon's own: an application icon usually falls back to a symbolic
+    /// one.
+    #[must_use]
+    pub fn icon_fallback_tint(&self) -> Option<IconTint> {
+        self.icon_fallback.as_ref().map(|(_, t)| *t)
+    }
+
+    /// Whether that one retry has been taken.
+    #[must_use]
+    pub fn icon_fell_back(&self) -> bool {
+        self.icon_fell_back
+    }
+
+    /// Swap in the fallback icon name and its tint, or answer `false` if
+    /// there is nothing left to try. As [`Icon::take_fallback`].
+    pub(crate) fn take_icon_fallback(&mut self) -> bool {
+        if self.icon_fell_back {
+            return false;
+        }
+        self.icon_fell_back = true;
+        let Some((name, tint)) = self.icon_fallback.take() else {
+            return false;
+        };
+        self.icon = Some(name);
+        self.icon_tint = Some(tint);
+        true
     }
 
     /// Whether the button reacts to input.
@@ -577,24 +693,54 @@ impl<S: 'static> Button<S> {
 }
 
 impl<S: 'static> Button<S> {
-    /// Whether this button draws its icon rather than its label.
+    /// Whether this button draws its icon at all, and in which mode.
     ///
     /// Both halves of the question in one place, because **`measure` and
-    /// `paint` must never disagree about it**: an icon box is a square
-    /// and a label box is not, so a button that measured one and painted
-    /// the other would reserve the wrong space. Without
+    /// `paint` must never disagree about it**: an icon box is a square, a
+    /// label box is not and a leading-icon box is a third shape, so a
+    /// button that measured one and painted another would reserve the
+    /// wrong space. Without
     /// [`caps::ICONS`](nitro_wire::types::caps::ICONS) the answer is
-    /// `false` and the button falls back to its text.
-    fn shows_icon(&self, has_icons: bool) -> bool {
-        has_icons && self.icon.is_some()
+    /// `None` and the button is its text.
+    fn shows_icon(&self, has_icons: bool) -> Option<IconMode> {
+        if has_icons && self.icon.is_some() {
+            Some(self.icon_mode)
+        } else {
+            None
+        }
     }
 
     /// The icon's square side, in logical pixels.
     ///
-    /// Free-standing rather than a method: it is a fact about the style
-    /// and the grid, not about this button.
-    fn icon_side(style: &TextStyle) -> f32 {
-        style.size_px.max(crate::widgets::ICON_SIZE)
+    /// The default ties the icon to the **label**: `max(font size, 16)`,
+    /// because in [`IconMode::Replace`] the glyph stands in for the word
+    /// and so should be the word's size. An explicit
+    /// [`ButtonBuilder::icon_size`] overrides that in every mode — a
+    /// caller who pinned one in `Replace` mode meant it — and is what a
+    /// leading icon usually needs, since there the icon sits *beside* the
+    /// word rather than standing in for it and the two sizes are
+    /// unrelated: a launcher row's 16 px text wants a 24 px logo, and a
+    /// bar's 13 px window list wants the 16 px its other icons use.
+    ///
+    /// A method rather than a free function now, because with the
+    /// override it is a fact about this button and not only about the
+    /// style and the grid.
+    fn icon_side(&self, style: &TextStyle) -> f32 {
+        self.icon_size
+            .unwrap_or_else(|| style.size_px.max(crate::widgets::ICON_SIZE))
+    }
+
+    /// The tint the icon takes, given the role the label is taking in
+    /// this state.
+    ///
+    /// The default (`None`) follows the label, which is the whole reason
+    /// the field is an `Option`: a disabled icon button whose glyph kept
+    /// `ButtonText` looks clickable, which is a lie about what it will
+    /// do. An explicit tint — a pinned role, or [`IconTint::Coloured`] —
+    /// does not follow it, because an application icon has no role to
+    /// take and a caller who named one meant it.
+    fn tint(&self, text_role: nitro_core::Role) -> IconTint {
+        self.icon_tint.unwrap_or(IconTint::Role(text_role))
     }
 }
 
@@ -611,9 +757,25 @@ impl<S: 'static> Widget<S> for Button<S> {
         // Only when the server actually has icons, though: without them
         // the button paints its label instead, and measuring a square
         // here would reserve a box the text does not fit in.
-        if self.shows_icon(has_icons) {
-            let side = Self::icon_side(&style);
-            return constraints.constrain(Size::new(side + px * 2.0, side + py * 2.0));
+        if let Some(mode) = self.shows_icon(has_icons) {
+            let side = self.icon_side(&style);
+            match mode {
+                IconMode::Replace => {
+                    return constraints.constrain(Size::new(side + px * 2.0, side + py * 2.0));
+                }
+                IconMode::Leading => {
+                    // The label is still measured — this mode draws both —
+                    // and the box is icon + gap + label, so the word is
+                    // never clipped by a square that was sized for the
+                    // glyph alone. The height is the taller of the two,
+                    // because an icon larger than the font's line box
+                    // must not be cut off by it.
+                    self.metrics = cx.measure_text(&self.text, &style, 0.0).unwrap_or_default();
+                    let w = side + ICON_GAP + self.metrics.width + px * 2.0;
+                    let h = side.max(self.metrics.height) + py * 2.0;
+                    return constraints.constrain(Size::new(w, h));
+                }
+            }
         }
         self.metrics = cx.measure_text(&self.text, &style, 0.0).unwrap_or_default();
         constraints.constrain(Size::new(
@@ -664,6 +826,9 @@ impl<S: 'static> Widget<S> for Button<S> {
             (theme.border_width, theme.border)
         };
         let radius = theme.radius;
+        // Copied out before the first `cx.rect`: `theme` borrows `cx`, and
+        // every paint call below needs `cx` mutably.
+        let (pad_x, _) = theme.button_padding;
         let style = self.resolved_style(theme);
         let bounds = cx.bounds;
         cx.rect(0, bounds, Fill::Solid(face), radius, border);
@@ -677,24 +842,49 @@ impl<S: 'static> Widget<S> for Button<S> {
         // already keeps `text` as its accessible name for exactly this
         // reason: the glyph is for the eye, the word is for everything
         // else.
-        if self.shows_icon(has_icons)
+        let mode = self.shows_icon(has_icons);
+        let mut text_box = Rect::new(0.0, 0.0, bounds.w, 0.0);
+        let mut align = Align::Center;
+        if let Some(mode) = mode
             && let Some(name) = self.icon.clone()
         {
-            // The icon is centred in the face by the scene, which centres
-            // an icon in its node's bounds; the node is the whole face,
-            // so the widget does no arithmetic at all.
-            let side = Self::icon_side(&style);
-            cx.icon(1, bounds, &name, side, text_role);
-            return;
+            let side = self.icon_side(&style);
+            let tint = self.tint(text_role);
+            match mode {
+                IconMode::Replace => {
+                    // The icon is centred in the face by the scene, which
+                    // centres an icon in its node's bounds; the node is
+                    // the whole face, so the widget does no arithmetic at
+                    // all.
+                    cx.icon_tinted(1, bounds, &name, side, tint);
+                    return;
+                }
+                IconMode::Leading => {
+                    // Both are drawn, so the widget places them itself:
+                    // the icon in a square box at the left padding,
+                    // vertically centred in the face, and the label in
+                    // what is left. Left-aligned rather than centred,
+                    // because a row of these is a *list* — a launcher's
+                    // entries, a window list — and centred labels beside
+                    // left-aligned icons do not line up down the column.
+                    let iy = ((bounds.h - side) / 2.0).max(0.0);
+                    let icon_box = Rect::new(pad_x, iy, side, side);
+                    cx.icon_tinted(2, icon_box, &name, side, tint);
+                    let left = pad_x + side + ICON_GAP;
+                    text_box = Rect::new(left, 0.0, (bounds.w - left - pad_x).max(0.0), 0.0);
+                    align = Align::Left;
+                }
+            }
         }
-        // The label is centred by the text node's own alignment
-        // horizontally, and by its box vertically.
+        // The label is aligned horizontally by the text node itself, and
+        // centred vertically by its box.
         let h = self.metrics.height.max(1.0);
         let y = ((bounds.h - h) / 2.0).max(0.0);
-        let text_box = Rect::new(0.0, y, bounds.w, h);
+        text_box.y = y;
+        text_box.h = h;
         // A button's label is measured unwrapped and the button is sized
         // around it, so it never wraps.
-        let run = TextRun::new(&style, text_color).align(Align::Center);
+        let run = TextRun::new(&style, text_color).align(align);
         cx.text(1, text_box, &self.text.clone(), run);
     }
 
@@ -865,6 +1055,96 @@ impl<S: 'static> WidgetMut<'_, Button<S>, S> {
     pub fn set_on_alt_click(&mut self, f: impl Fn(&mut S, &mut Ui<S>) + 'static) {
         self.on_alt_click = Some(Box::new(f));
     }
+
+    /// Show a **leading** symbolic icon, in front of the label, tinted
+    /// with the label's own colour.
+    ///
+    /// Layout, not paint: the box is `icon + gap + label`, so a button
+    /// that gained an icon is wider than it was.
+    ///
+    /// It does **not** switch a [`IconMode::Replace`] button into a
+    /// leading one — the mode is set where the button is built, because
+    /// changing it changes the button's whole shape and a caller that
+    /// merely wanted a different glyph would silently get a different
+    /// widget. Use [`WidgetMut::set_icon_mode`] to say so deliberately.
+    pub fn set_icon(&mut self, name: impl Into<String>) {
+        let name = name.into();
+        if self.icon.as_deref() == Some(name.as_str()) {
+            return;
+        }
+        self.icon = Some(name);
+        self.icon_fell_back = false;
+        self.request_layout();
+    }
+
+    /// Show a leading **application** icon: the name is resolved in the
+    /// machine's icon theme and painted in its own colours.
+    ///
+    /// The shape a window list and a launcher row want, and the reason
+    /// this is a setter as well as a builder method: both create the
+    /// button before they know which application it is for.
+    pub fn set_icon_coloured(&mut self, name: impl Into<String>) {
+        self.icon_tint = Some(IconTint::Coloured);
+        self.set_icon(name);
+    }
+
+    /// Drop the icon, leaving the label.
+    pub fn clear_icon(&mut self) {
+        if self.icon.is_none() {
+            return;
+        }
+        self.icon = None;
+        self.icon_fell_back = false;
+        self.request_layout();
+    }
+
+    /// Put the icon in front of the label, or in place of it.
+    pub fn set_icon_mode(&mut self, mode: IconMode) {
+        if self.icon_mode == mode {
+            return;
+        }
+        self.icon_mode = mode;
+        self.request_layout();
+    }
+
+    /// Pin the icon's square side in logical pixels, or with `None` size
+    /// it from the label again. Layout, because the box changes.
+    pub fn set_icon_size(&mut self, px: Option<f32>) {
+        if self.icon_size.map(f32::to_bits) == px.map(f32::to_bits) {
+            return;
+        }
+        self.icon_size = px;
+        self.request_layout();
+    }
+
+    /// Pin the icon's tint, or with `None` let it follow the label's
+    /// colour as the button's state changes.
+    pub fn set_icon_tint(&mut self, tint: Option<IconTint>) {
+        if self.icon_tint == tint {
+            return;
+        }
+        self.icon_tint = tint;
+        self.request_paint();
+    }
+
+    /// Set (or clear, with `None`) the icon name tried when the server
+    /// does not have this one, keeping the icon's current tint, and arm
+    /// the one retry again.
+    pub fn set_icon_fallback(&mut self, name: Option<String>) {
+        let tint = self
+            .icon_tint
+            .unwrap_or(IconTint::Role(nitro_core::Role::Text));
+        self.set_icon_fallback_tinted(name.map(|n| (n, tint)));
+    }
+
+    /// As [`WidgetMut::set_icon_fallback`], with the fallback's own tint
+    /// — the mixed case, which is the usual one: a coloured application
+    /// icon falls back to a **symbolic** glyph, because the symbolic set
+    /// is the one that is compiled in and so cannot be missing.
+    pub fn set_icon_fallback_tinted(&mut self, fallback: Option<(String, IconTint)>) {
+        self.icon_fallback = fallback;
+        self.icon_fell_back = false;
+    }
 }
 
 /// Builder for a [`Button`].
@@ -913,6 +1193,134 @@ impl<S: 'static> ButtonBuilder<S> {
     #[must_use]
     pub fn icon(mut self, name: impl Into<String>) -> Self {
         self.button.icon = Some(name.into());
+        self.button.icon_mode = IconMode::Replace;
+        self
+    }
+
+    /// Draw a symbolic icon **in front of** the label, tinted with the
+    /// label's own colour.
+    ///
+    /// The other icon mode: [`ButtonBuilder::icon`] replaces the word
+    /// with a glyph, this puts one before it. A row in a list wants this
+    /// — a launcher entry, a window-list button — because the word is the
+    /// content and the icon is the hint, and neither is redundant.
+    /// [`ICON_GAP`] separates them and the button measures to the sum, so
+    /// nothing is clipped.
+    #[must_use]
+    pub fn icon_leading(mut self, name: impl Into<String>) -> Self {
+        self.button.icon = Some(name.into());
+        self.button.icon_mode = IconMode::Leading;
+        self
+    }
+
+    /// Draw an **application** icon in front of the label, in its own
+    /// colours.
+    ///
+    /// [`ButtonBuilder::icon_leading`] for a name from the machine's XDG
+    /// icon theme rather than the desktop's symbolic set — a `.desktop`
+    /// file's `Icon=`, a window's app id. The two namespaces do not fall
+    /// back to each other, so pair it with
+    /// [`ButtonBuilder::icon_fallback_tinted`]: a name that came from
+    /// outside the program is a claim about the box, not a fact about it.
+    #[must_use]
+    pub fn icon_coloured(mut self, name: impl Into<String>) -> Self {
+        self.button.icon_tint = Some(IconTint::Coloured);
+        self.icon_leading(name)
+    }
+
+    /// Pin the icon's tint instead of letting it follow the label.
+    ///
+    /// By default a button's icon takes whatever role its label takes in
+    /// the current state, which is what makes a disabled icon button look
+    /// disabled. Pinning is for an icon whose meaning *is* its colour, and
+    /// [`IconTint::Coloured`] is what [`ButtonBuilder::icon_coloured`]
+    /// sets.
+    #[must_use]
+    pub fn icon_tint(mut self, tint: IconTint) -> Self {
+        self.button.icon_tint = Some(tint);
+        self
+    }
+
+    /// Pin the icon's square side in logical pixels, instead of sizing it
+    /// from the label.
+    ///
+    /// Without this an icon button's icon is `max(font size, 16)`, which
+    /// is right for [`ButtonBuilder::icon`] — the glyph stands in for the
+    /// word, so it should be the word's size — and usually wrong for a
+    /// **leading** icon, where the icon sits beside the word rather than
+    /// replacing it and the two sizes have nothing to do with each other.
+    /// A launcher row's 16 px text wants a 24 px application logo (a logo
+    /// at 16 px is a smudge); a bar's 13 px window list wants 16 px,
+    /// which is what the bar's other icons already use.
+    ///
+    /// It applies in **every** mode: a caller who pinned a size on a
+    /// glyph button meant it, and honouring it only in one mode would be
+    /// a setter whose effect depended on a call made somewhere else.
+    ///
+    /// 16, 24, 32 and 48 are the sizes the artwork is drawn for — the
+    /// grid is 16 units, so an integer multiple puts every stroke on a
+    /// whole pixel boundary. Anything else works and is properly
+    /// anti-aliased; it is simply slightly softer. See `docs/icons.md`.
+    ///
+    /// Order-independent with respect to [`ButtonBuilder::icon`],
+    /// [`icon_leading`](ButtonBuilder::icon_leading) and
+    /// [`icon_coloured`](ButtonBuilder::icon_coloured): it sets a field
+    /// of its own and never touches the name or the mode.
+    #[must_use]
+    pub fn icon_size(mut self, px: f32) -> Self {
+        self.button.icon_size = Some(px);
+        self
+    }
+
+    /// A second icon name, tried **once** if the server does not have the
+    /// first, in the icon's own tint.
+    ///
+    /// The same contract as [`IconBuilder::fallback`], on the button's
+    /// icon: a `BadIcon` naming this button's icon re-sends with this
+    /// name through the normal paint path, and a `BadIcon` for the
+    /// fallback itself is the end of it. The mode and size are kept.
+    ///
+    /// Keeping the tint is right for a theme icon falling back to a more
+    /// generic theme icon. For the far more common
+    /// application-icon-falls-back-to-symbolic-glyph case, use
+    /// [`ButtonBuilder::icon_fallback_tinted`] — the reason is there.
+    #[must_use]
+    pub fn icon_fallback(mut self, name: impl Into<String>) -> Self {
+        let tint = self
+            .button
+            .icon_tint
+            .unwrap_or(IconTint::Role(nitro_core::Role::Text));
+        self.button.icon_fallback = Some((name.into(), tint));
+        self
+    }
+
+    /// A second icon name, tried **once**, in a tint of its own.
+    ///
+    /// **The mixed case, and it is the common one.** An application icon
+    /// names a file in the machine's XDG icon theme, and the whole reason
+    /// it needs a fallback is that the machine may not have that theme —
+    /// or may have it and not this application. So the icon to reach for
+    /// when the lookup fails has to come from the set that *cannot* be
+    /// missing: the symbolic one compiled into the server. `window` is
+    /// exactly that — it is in the symbolic set and in no icon theme —
+    /// so an `icon_fallback("window")` that kept the coloured tint would
+    /// earn a second `BadIcon` and leave a blank row for every
+    /// application the theme does not have, which is precisely the case
+    /// this feature exists to survive.
+    ///
+    /// ```no_run
+    /// # use nitro_ui::{ColorRole, IconTint, widgets::button};
+    /// # fn f<S: 'static>() {
+    /// // A window-list button: the app's own icon if the box has it, the
+    /// // desktop's `window` glyph if it does not.
+    /// let b = button::<S>("Firefox")
+    ///     .icon_coloured("firefox")
+    ///     .icon_fallback_tinted("window", IconTint::Role(ColorRole::Text));
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn icon_fallback_tinted(mut self, name: impl Into<String>, tint: IconTint) -> Self {
+        self.button.icon_fallback = Some((name.into(), tint));
         self
     }
 
@@ -950,6 +1358,11 @@ pub fn button<S: 'static>(text: impl Into<String>) -> ButtonBuilder<S> {
     let button = Button {
         text: text.into(),
         icon: None,
+        icon_mode: IconMode::Replace,
+        icon_tint: None,
+        icon_fallback: None,
+        icon_fell_back: false,
+        icon_size: None,
         enabled: true,
         pressed: false,
         style: None,
@@ -3006,7 +3419,27 @@ pub fn image<S: 'static>(width: u32, height: u32, pixels: Vec<u8>) -> ImageBuild
 pub struct Icon {
     name: String,
     size: f32,
-    color_role: nitro_core::Role,
+    tint: IconTint,
+    /// A second name to try when the server says the first one is
+    /// unknown, with the tint to try it in; see
+    /// [`IconBuilder::fallback`].
+    ///
+    /// The tint is part of the fallback rather than inherited, because
+    /// the mixed case is the *common* one: an application icon falls back
+    /// to a **symbolic** one, and those are two different sets with two
+    /// different `role` bytes. See [`IconBuilder::fallback_tinted`].
+    fallback: Option<(String, IconTint)>,
+    /// Whether the fallback question has been answered for this name.
+    ///
+    /// The once-ness itself comes from `Option::take` below — a consumed
+    /// fallback cannot be consumed twice — so this is not what *stops*
+    /// the loop. What it adds is the record: [`Icon::fell_back`] can
+    /// report that the retry happened, and an icon with **no** fallback
+    /// is marked answered too, so it is not re-examined for every later
+    /// `BadIcon` some other widget earned. [`WidgetMut::set_icon`] and
+    /// [`WidgetMut::set_fallback`] clear it, because a new name deserves
+    /// the same one try the first one had.
+    fell_back: bool,
 }
 
 impl Icon {
@@ -3023,9 +3456,92 @@ impl Icon {
     }
 
     /// The palette role the server tints it with.
+    ///
+    /// A **coloured** icon has no role — it is painted in the artwork's
+    /// own colours — and this answers the role it would take if it were
+    /// switched back to a tinted one: the last
+    /// [`IconBuilder::color_role`], or the default
+    /// [`ColorRole::Text`](nitro_core::Role::Text). Ask
+    /// [`Icon::is_coloured`] first when the difference matters; the
+    /// honest single answer is [`Icon::tint`].
+    ///
+    /// It keeps returning a `Role` rather than becoming an
+    /// `Option<Role>` because every caller in this tree —
+    /// `crates/nitro-ui/tests/icons.rs`, `nitro-settings`' tests — asks
+    /// *which* role, and an `Option` would make all of them unwrap a
+    /// case they never construct.
     #[must_use]
     pub fn color_role(&self) -> nitro_core::Role {
-        self.color_role
+        match self.tint {
+            IconTint::Role(r) => r,
+            IconTint::Coloured => nitro_core::Role::Text,
+        }
+    }
+
+    /// How the icon is coloured: a palette role, or its own colours.
+    #[must_use]
+    pub fn tint(&self) -> IconTint {
+        self.tint
+    }
+
+    /// Whether this is an **application** icon, painted in its own
+    /// colours rather than tinted from the palette.
+    #[must_use]
+    pub fn is_coloured(&self) -> bool {
+        self.tint.is_coloured()
+    }
+
+    /// The name tried when the server does not have [`Icon::name`], if
+    /// any. `None` once it has been taken.
+    #[must_use]
+    pub fn fallback(&self) -> Option<&str> {
+        self.fallback.as_ref().map(|(n, _)| n.as_str())
+    }
+
+    /// The tint that fallback is asked for in, which need not be this
+    /// icon's: an application icon usually falls back to a symbolic one.
+    #[must_use]
+    pub fn fallback_tint(&self) -> Option<IconTint> {
+        self.fallback.as_ref().map(|(_, t)| *t)
+    }
+
+    /// Whether the fallback has already been taken — so [`Icon::name`] is
+    /// the fallback's now, and no further one is coming.
+    #[must_use]
+    pub fn fell_back(&self) -> bool {
+        self.fell_back
+    }
+
+    /// Swap in the fallback name **and its tint**, or answer `false` if
+    /// there is nothing left to try.
+    ///
+    /// The whole of the fallback policy, in one place with exactly one
+    /// caller ([`Ui::dispatch`](crate::Ui::dispatch)'s `BadIcon` arm), so
+    /// "exactly once" is a property of this function rather than of the
+    /// routing above it — which matters because one transaction can earn
+    /// several `BadIcon`s and the routing offers the fallback to a widget
+    /// once per error.
+    ///
+    /// The `take` is what makes it once: the fallback is *moved* out, so
+    /// a second call finds `None` however it got here. The retry is
+    /// itself a name the server may not have, and a widget that re-armed
+    /// on its own failure would trade a missing icon for a
+    /// `SetIcon`-per-frame loop against a server answering perfectly
+    /// honestly — `a_bad_fallback_does_not_loop` is the assertion.
+    pub(crate) fn take_fallback(&mut self) -> bool {
+        if self.fell_back {
+            return false;
+        }
+        // Marked answered even when there is no fallback, so a widget
+        // whose only name is unknown is not re-examined for every later
+        // `BadIcon`.
+        self.fell_back = true;
+        let Some((name, tint)) = self.fallback.take() else {
+            return false;
+        };
+        self.name = name;
+        self.tint = tint;
+        true
     }
 }
 
@@ -3044,8 +3560,8 @@ impl<S: 'static> Widget<S> for Icon {
             return;
         }
         let bounds = cx.bounds;
-        let (name, size, role) = (self.name.clone(), self.size, self.color_role);
-        cx.icon(0, bounds, &name, size, role);
+        let (name, size, tint) = (self.name.clone(), self.size, self.tint);
+        cx.icon_tinted(0, bounds, &name, size, tint);
     }
 
     fn role(&self) -> Role {
@@ -3078,12 +3594,17 @@ impl<S: 'static> Widget<S> for Icon {
 /// Setters for a live [`Icon`].
 impl<S: 'static> WidgetMut<'_, Icon, S> {
     /// Show a different icon. Paint only: every icon is the same square.
+    ///
+    /// The tint is untouched — a coloured icon stays coloured — and the
+    /// fallback latch is **reset**, because this is a new name and it
+    /// deserves the same one try at its fallback the first one had.
     pub fn set_icon(&mut self, name: impl Into<String>) {
         let name = name.into();
         if self.name == name {
             return;
         }
         self.name = name;
+        self.fell_back = false;
         self.request_paint();
     }
 
@@ -3097,9 +3618,46 @@ impl<S: 'static> WidgetMut<'_, Icon, S> {
     }
 
     /// Take the tint from another palette role.
+    ///
+    /// Turns a coloured icon back into a tinted one, for the same reason
+    /// [`IconBuilder::color_role`] does after
+    /// [`IconBuilder::coloured`]: the two are mutually exclusive and the
+    /// last word wins.
     pub fn set_color_role(&mut self, role: nitro_core::Role) {
-        self.color_role = role;
+        self.tint = IconTint::Role(role);
         self.request_paint();
+    }
+
+    /// Paint this icon's own colours: it names an **application** icon in
+    /// the machine's icon theme rather than one of the desktop's symbolic
+    /// glyphs.
+    pub fn set_coloured(&mut self, coloured: bool) {
+        let tint = if coloured {
+            IconTint::Coloured
+        } else {
+            IconTint::Role(self.color_role())
+        };
+        if self.tint == tint {
+            return;
+        }
+        self.tint = tint;
+        self.request_paint();
+    }
+
+    /// Set (or clear, with `None`) the name tried when the server does
+    /// not have this one, keeping this icon's own tint, and arm the one
+    /// retry again.
+    pub fn set_fallback(&mut self, name: Option<String>) {
+        let tint = self.tint;
+        self.set_fallback_tinted(name.map(|n| (n, tint)));
+    }
+
+    /// As [`WidgetMut::set_fallback`], with the fallback's own tint — the
+    /// mixed case, which is the usual one: a coloured application icon
+    /// falls back to a **symbolic** glyph.
+    pub fn set_fallback_tinted(&mut self, fallback: Option<(String, IconTint)>) {
+        self.fallback = fallback;
+        self.fell_back = false;
     }
 }
 
@@ -3128,9 +3686,94 @@ impl<S: 'static> IconBuilder<S> {
     /// There is deliberately **no** `.color(Color)`: an icon takes a role
     /// and nothing else, so a scheme flip can never leave one behind.
     /// `deploy/lint-colors.sh` enforces the same rule from the outside.
+    ///
+    /// Mutually exclusive with [`IconBuilder::coloured`], and the **last
+    /// call wins**: `icon("x").coloured().color_role(Text)` is a tinted
+    /// symbolic `x`. One field holds one answer, so there is no order in
+    /// which the two can both be true and no state in which the widget
+    /// has to guess which the caller meant.
     #[must_use]
     pub fn color_role(mut self, role: nitro_core::Role) -> Self {
-        self.icon.color_role = role;
+        self.icon.tint = IconTint::Role(role);
+        self
+    }
+
+    /// This name is an **application** icon: paint the artwork's own
+    /// colours instead of tinting it.
+    ///
+    /// The name is then resolved in the machine's XDG icon theme
+    /// (`firefox`, `org.gnome.Calculator`) rather than in the symbolic
+    /// set compiled into the server, and the two do not fall back to each
+    /// other in either direction — `icon("gear").coloured()` is a
+    /// `BadIcon` on a box whose theme has no `gear`, exactly as
+    /// `icon("firefox")` without this is. That is deliberate: one
+    /// namespace searched "ours first" would make the same call mean the
+    /// desktop's glyph on one box and somebody's application icon on
+    /// another, invisibly. `docs/icons.md` has the argument.
+    ///
+    /// Pair it with [`IconBuilder::fallback_tinted`] when the name comes
+    /// from outside the program — a `.desktop` file's `Icon=`, a
+    /// window's app id — since such a name is a *claim* about the box's
+    /// icon theme rather than a fact.
+    #[must_use]
+    pub fn coloured(mut self) -> Self {
+        self.icon.tint = IconTint::Coloured;
+        self
+    }
+
+    /// A second name to show if the server does not have the first, in
+    /// **this icon's own tint**.
+    ///
+    /// Tried **exactly once**, and only for a name the server actually
+    /// complained about: the widget re-sends with this name the next time
+    /// it paints, and a `BadIcon` for the fallback itself is the end of
+    /// it. The size is kept.
+    ///
+    /// This is the shorthand for a fallback within the *same* set — one
+    /// theme icon falling back to a more generic theme icon,
+    /// `icon("firefox").coloured().fallback("application-x-executable")`.
+    /// When the fallback comes from the other set, which is the usual
+    /// case, use [`IconBuilder::fallback_tinted`].
+    ///
+    /// It is a client-side retry rather than a server-side search list
+    /// because the fallback is a *policy* — a launcher wants a generic
+    /// application icon, a bar's window list wants `window` — and a
+    /// policy that lived in the server would be one every app had to
+    /// share. It costs one extra `SetIcon` in the case where the first
+    /// name was wrong, and nothing at all otherwise.
+    #[must_use]
+    pub fn fallback(mut self, name: impl Into<String>) -> Self {
+        let tint = self.icon.tint;
+        self.icon.fallback = Some((name.into(), tint));
+        self
+    }
+
+    /// A second name to show if the server does not have the first, in a
+    /// tint of its own.
+    ///
+    /// **The mixed case, and it is the common one.** An application icon
+    /// is a name from the machine's XDG icon theme, and the whole reason
+    /// it needs a fallback is that the machine may not have that theme —
+    /// or may have it and not this application. So the icon to reach for
+    /// when the lookup fails has to come from the set that *cannot* fail:
+    /// the symbolic one compiled into the server. `window` is exactly
+    /// that — it is in the symbolic set and in no icon theme — so
+    /// `.fallback("window")` on a coloured icon would keep the coloured
+    /// tint, earn a second `BadIcon` and leave a blank box on every
+    /// application the theme does not have, which is precisely the case
+    /// this feature exists to survive.
+    ///
+    /// ```no_run
+    /// # use nitro_ui::{ColorRole, IconTint, widgets::icon};
+    /// # fn f<S: 'static>() {
+    /// let app = icon::<S>("firefox")
+    ///     .coloured()
+    ///     .fallback_tinted("window", IconTint::Role(ColorRole::Text));
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn fallback_tinted(mut self, name: impl Into<String>, tint: IconTint) -> Self {
+        self.icon.fallback = Some((name.into(), tint));
         self
     }
 }
@@ -3151,6 +3794,16 @@ impl<S: 'static> IntoWidget<S> for IconBuilder<S> {
 /// The default side of an [`Icon`], in logical pixels.
 pub const ICON_SIZE: f32 = 16.0;
 
+/// The gap between a [`Button`]'s leading icon and its label, in logical
+/// pixels.
+///
+/// Narrower than the theme's `gap` (8 px), which separates *widgets*: an
+/// icon and the word it belongs to are one thing, and spacing them like
+/// two siblings makes a row read as two columns. 6 px is the same figure
+/// [`List`](crate::List) puts between its glyph column and its text, so
+/// a launcher row and a file row line up.
+pub const ICON_GAP: f32 = 6.0;
+
 /// A symbolic icon called `name`, 16 px square, tinted
 /// [`ColorRole::Text`](nitro_core::Role::Text).
 ///
@@ -3158,12 +3811,17 @@ pub const ICON_SIZE: f32 = 16.0;
 /// # use nitro_ui::{ColorRole, widgets::icon};
 /// # fn f<S: 'static>() {
 /// let gear = icon::<S>("gear").size(24.0).color_role(ColorRole::TextDim);
+/// // An application icon from the machine's icon theme, with a symbolic
+/// // one to fall back on if the box does not have it.
+/// let app = icon::<S>("firefox").coloured().fallback("window");
 /// # }
 /// ```
 ///
 /// An unknown name draws nothing and leaves the connection alone — the
 /// server answers `Error { BadIcon }` and keeps going, because a missing
-/// icon must never be able to close an application.
+/// icon must never be able to close an application. With
+/// [`IconBuilder::fallback`] that error is also the cue to try the other
+/// name, once.
 #[must_use]
 pub fn icon<S: 'static>(name: impl Into<String>) -> IconBuilder<S> {
     IconBuilder {
@@ -3171,7 +3829,9 @@ pub fn icon<S: 'static>(name: impl Into<String>) -> IconBuilder<S> {
         icon: Icon {
             name: name.into(),
             size: ICON_SIZE,
-            color_role: nitro_core::Role::Text,
+            tint: IconTint::Role(nitro_core::Role::Text),
+            fallback: None,
+            fell_back: false,
         },
     }
 }

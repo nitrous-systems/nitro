@@ -77,7 +77,7 @@ use nitro_ui::shell::{ShellEvent, Surface, WindowInfo};
 use nitro_ui::widgets::{
     Button, Label, TextField, button as button_widget, column, label, scroll, text_field,
 };
-use nitro_ui::{App, ColorRole, Error, Size, Ui, WidgetId};
+use nitro_ui::{App, ColorRole, Error, IconTint, Size, Ui, WidgetId};
 
 use desktop::{Entry, Source};
 
@@ -827,14 +827,14 @@ fn show_error(s: &mut Launcher, ui: &mut Ui<Launcher>) {
 /// named by position.
 fn refresh(s: &mut Launcher, ui: &mut Ui<Launcher>) {
     let Some(ids) = s.ids else { return };
-    let wanted: Vec<(usize, String)> = s
+    let wanted: Vec<(usize, String, RowIcon)> = s
         .matches
         .iter()
-        .filter_map(|i| s.entries.get(*i).map(|e| (*i, row_text(e))))
+        .filter_map(|i| s.entries.get(*i).map(|e| (*i, row_text(e), row_icon(e))))
         .collect();
     let rows = ui.children(ids.list);
 
-    for (n, (index, text)) in wanted.iter().enumerate() {
+    for (n, (index, text, icon)) in wanted.iter().enumerate() {
         // Decorated **here**, rather than written bare and then
         // overwritten by a `restyle_rows` pass immediately afterwards.
         //
@@ -855,6 +855,15 @@ fn refresh(s: &mut Launcher, ui: &mut Ui<Launcher>) {
         if let Some(id) = rows.get(n).copied() {
             if let Ok(mut b) = ui.widget_mut::<Button<Launcher>>(id) {
                 b.set_text(text);
+                // The icon has to be replaced for the same reason the
+                // callback below does: a row shows a different
+                // application after every keystroke, and an icon left
+                // over from the last query is a picture of the wrong
+                // program beside the right name. `apply_row_icon`
+                // returns early when nothing moved, so a row whose entry
+                // did not change costs no `SetIcon` and therefore no
+                // commit — which is what keeps typing cheap.
+                apply_row_icon(&mut b, icon);
                 // The callback has to be replaced too: row 0 shows a
                 // different application after every keystroke, and a
                 // button whose label moved but whose callback did not is
@@ -865,16 +874,15 @@ fn refresh(s: &mut Launcher, ui: &mut Ui<Launcher>) {
             }
             continue;
         }
-        let id = ui.build(
-            button_widget(text)
-                .name(row_name(n))
-                .size(TEXT_SIZE)
-                .height(ROW_H)
-                .width_percent(1.0)
-                .on_click(move |s: &mut Launcher, ui: &mut Ui<Launcher>| {
-                    launch_index(s, ui, index);
-                }),
-        );
+        let button = button_widget(text)
+            .name(row_name(n))
+            .size(TEXT_SIZE)
+            .height(ROW_H)
+            .width_percent(1.0)
+            .on_click(move |s: &mut Launcher, ui: &mut Ui<Launcher>| {
+                launch_index(s, ui, index);
+            });
+        let id = ui.build(build_row_icon(button, icon));
         if ui.attach(ids.list, id).is_err() {
             return;
         }
@@ -924,6 +932,97 @@ fn restyle_rows(s: &mut Launcher, ui: &mut Ui<Launcher>) {
             // moving the selection costs exactly two `SetText`s — the row
             // that lost the marker and the one that gained it.
             b.set_text(text);
+        }
+    }
+}
+
+/// The icon a row shows, and which of the server's two icon sets it
+/// comes from.
+///
+/// The distinction is not cosmetic and it is not the launcher's choice:
+/// the sets are separate namespaces on the wire (`docs/icons.md`), so
+/// something has to say which a name belongs to, and the entry's
+/// **source** already knows. A `.desktop` file's `Icon=` is a claim about
+/// the machine's icon theme; a built-in's is a shape compiled into the
+/// server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowIcon {
+    /// An application icon from the machine's XDG icon theme, painted in
+    /// its own colours, falling back to the symbolic [`FALLBACK_ICON`].
+    Coloured(String),
+    /// One of the server's own symbolic icons, tinted from the palette.
+    Symbolic(String),
+    /// The entry names no icon at all, so the row shows the generic one
+    /// rather than a gap: a column of names where three have a picture
+    /// and two do not is a column that looks broken.
+    None,
+}
+
+/// The icon shown for an entry that names none, and the fallback when a
+/// named one is not on this box.
+///
+/// From the **symbolic** set on purpose. The whole reason a row needs a
+/// fallback is that the machine may have no icon theme — which is
+/// exactly the state of the test box — so the icon reached for when the
+/// lookup fails has to come from the set that cannot be missing.
+pub const FALLBACK_ICON: &str = "window";
+
+/// The square side of a row's icon, in logical pixels.
+///
+/// 24 against a 28 px row: big enough that an application logo is
+/// recognisable rather than a smudge, small enough to leave the text
+/// vertically centred beside it. It is one of the four sizes the artwork
+/// is drawn for, so a symbolic fallback lands on whole pixels.
+pub const ROW_ICON_PX: f32 = 24.0;
+
+/// Which icon a row shows for `entry`.
+#[must_use]
+pub fn row_icon(entry: &Entry) -> RowIcon {
+    match (&entry.icon, &entry.source) {
+        (Some(name), Source::Desktop(_)) => RowIcon::Coloured(name.clone()),
+        (Some(name), Source::Builtin) => RowIcon::Symbolic(name.clone()),
+        (None, _) => RowIcon::None,
+    }
+}
+
+/// Put `icon` on a row button being built.
+fn build_row_icon(
+    button: nitro_ui::widgets::ButtonBuilder<Launcher>,
+    icon: &RowIcon,
+) -> nitro_ui::widgets::ButtonBuilder<Launcher> {
+    let button = button.icon_size(ROW_ICON_PX);
+    match icon {
+        RowIcon::Coloured(name) => button
+            .icon_coloured(name.clone())
+            .icon_fallback_tinted(FALLBACK_ICON, IconTint::Role(ColorRole::Text)),
+        RowIcon::Symbolic(name) => button.icon_leading(name.clone()),
+        RowIcon::None => button.icon_leading(FALLBACK_ICON),
+    }
+}
+
+/// Put `icon` on a row button that already exists.
+///
+/// The setters return early on an unchanged value, so a row whose entry
+/// did not move costs nothing — which is what keeps a keystroke to the
+/// rows that actually changed.
+fn apply_row_icon(b: &mut nitro_ui::WidgetMut<'_, Button<Launcher>, Launcher>, icon: &RowIcon) {
+    match icon {
+        RowIcon::Coloured(name) => {
+            b.set_icon_fallback_tinted(Some((
+                FALLBACK_ICON.to_owned(),
+                IconTint::Role(ColorRole::Text),
+            )));
+            b.set_icon_coloured(name.clone());
+        }
+        RowIcon::Symbolic(name) => {
+            b.set_icon_tint(None);
+            b.set_icon_fallback_tinted(None);
+            b.set_icon(name.clone());
+        }
+        RowIcon::None => {
+            b.set_icon_tint(None);
+            b.set_icon_fallback_tinted(None);
+            b.set_icon(FALLBACK_ICON);
         }
     }
 }

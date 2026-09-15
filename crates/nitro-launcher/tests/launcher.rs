@@ -548,6 +548,104 @@ fn arrows_move_the_selection_and_wrap() {
 }
 
 #[test]
+fn a_desktop_row_asks_for_a_coloured_icon_and_a_builtin_asks_for_a_symbolic_one() {
+    // The rule `row_icon` implements, and the reason it is a rule rather
+    // than a string: the server's two icon sets are separate namespaces
+    // (`docs/icons.md`), so something has to say which a name belongs
+    // to, and the entry's **source** already knows. A `.desktop` file's
+    // `Icon=` is a claim about the machine's icon theme; a built-in's is
+    // a shape compiled into the server, which is exactly why a built-in
+    // exists — it is the entry for a box that has no theme at all.
+    let dir = std::env::temp_dir().join(format!(
+        "nitro-launcher-icons-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("fixture dir");
+    std::fs::write(
+        dir.join("browser.desktop"),
+        "[Desktop Entry]\nType=Application\nName=Browser\nExec=/bin/true\nIcon=firefox\n",
+    )
+    .expect("fixture file");
+    std::fs::write(
+        dir.join("plain.desktop"),
+        "[Desktop Entry]\nType=Application\nName=Plain\nExec=/bin/true\n",
+    )
+    .expect("fixture file");
+    let mut h = launcher(
+        vec![dir.clone()],
+        // A program of its own: a built-in whose `argv[0]` file name
+        // matched a `.desktop` entry's would be dropped as a duplicate,
+        // which is `rescan`'s job and not what this test is about.
+        vec![Entry {
+            name: "Zebra".to_owned(),
+            argv: vec!["/bin/echo".to_owned()],
+            terminal: false,
+            icon: Some("calculator".to_owned()),
+            source: Source::Builtin,
+        }],
+    );
+    h.settle();
+    super_tap(&mut h);
+    until(&mut h, "the show", |h| h.state().is_visible());
+    // Sorted by name: Browser, Plain, Zebra.
+    assert_eq!(
+        h.state().match_names(),
+        vec!["Browser".to_owned(), "Plain".to_owned(), "Zebra".to_owned()]
+    );
+
+    // Row 0, the `.desktop` entry: a coloured application icon with the
+    // symbolic `window` behind it. On a box whose theme has no
+    // `firefox` the fallback has already fired by now, which is the
+    // feature working rather than a failure — so both outcomes are
+    // asserted, the way `nitro-bar`'s equivalent test does it.
+    let id = named(&mut h, "results/0").expect("row 0");
+    let b = h.widget::<Button<Launcher>>(id);
+    if b.icon_fell_back() {
+        assert_eq!(b.icon(), Some(nitro_launcher::FALLBACK_ICON));
+    } else {
+        assert_eq!(b.icon(), Some("firefox"));
+        assert!(b.is_icon_coloured(), "a .desktop Icon= names the theme");
+        assert_eq!(b.icon_fallback(), Some(nitro_launcher::FALLBACK_ICON));
+    }
+    assert!(
+        b.icon_size()
+            .is_some_and(|px| (px - nitro_launcher::ROW_ICON_PX).abs() < 0.01),
+        "24 px, not the label's size: got {:?}",
+        b.icon_size()
+    );
+    // The label is still there: the icon is in front of the name, not
+    // instead of it, so `hey get results/0 value` is unaffected.
+    assert!(b.text().contains("Browser"), "{}", b.text());
+
+    // Row 1, a `.desktop` entry naming no icon: the generic symbolic one
+    // rather than a gap, because a column where three names have a
+    // picture and two do not looks broken.
+    let id = named(&mut h, "results/1").expect("row 1");
+    let b = h.widget::<Button<Launcher>>(id);
+    assert_eq!(b.icon(), Some(nitro_launcher::FALLBACK_ICON));
+    assert!(
+        !b.is_icon_coloured(),
+        "the generic icon is the symbolic one"
+    );
+
+    // Row 2, the built-in: symbolic, and with **no** fallback, because a
+    // name from the compiled-in set cannot be missing.
+    let id = named(&mut h, "results/2").expect("row 2");
+    let b = h.widget::<Button<Launcher>>(id);
+    assert_eq!(b.icon(), Some("calculator"));
+    assert!(
+        !b.is_icon_coloured(),
+        "a built-in's icon is the server's own artwork"
+    );
+    assert!(!b.icon_fell_back(), "and it did not have to fall back");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}
+
+#[test]
 fn a_keystroke_costs_nothing_for_a_row_that_did_not_change() {
     // "Work is proportional to what changed", on the keystroke path.
     //

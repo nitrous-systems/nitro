@@ -712,6 +712,174 @@ fn the_icons_are_painted_once_and_never_again() {
 }
 
 #[test]
+fn a_window_list_button_asks_for_its_app_id_as_a_coloured_icon() {
+    // Rule (a) of `docs/shell.md`, asserted where it is implemented: the
+    // bar sends the window's **app id** as the icon name, coloured, with
+    // the symbolic `window` as the fallback. It parses no `.desktop`
+    // file and reads nothing off disk, which is the whole reason the
+    // rule is worth having — and the whole reason it is limited.
+    let mut h = harness();
+    h.settle();
+    let conn = open_window(&h, "alpha", Size::new(120.0, 90.0));
+    until(&mut h, "the window to be listed", |h| {
+        h.state().window_count() == 1
+    });
+    h.settle();
+    let win = h.state().windows().first().copied().expect("a window");
+    let id = named(&mut h, &nitro_bar::entry_name(win)).expect("its button");
+    let button = h.widget::<nitro_ui::widgets::Button<Bar>>(id);
+
+    // **Two outcomes are correct here, and which one happens is a fact
+    // about the machine running the test rather than about the bar.**
+    // The icon the button asks for is the app id, `alpha`, and no icon
+    // theme on earth has an application called that — so on any real box
+    // the server answers `BadIcon` and the button has already spent its
+    // one fallback by the time this runs. A test that demanded `alpha`
+    // would therefore pass only on a machine with a hand-made theme, and
+    // a test that demanded `window` would pass for the wrong reason on a
+    // machine that happened to have one. Asserting the pair is the
+    // honest shape: it is the app id and the fallback is still armed, or
+    // it is the fallback *and the button says it fell back*.
+    if button.icon_fell_back() {
+        assert_eq!(button.icon(), Some(nitro_bar::icons::WINDOW));
+        assert_eq!(
+            button.icon_fallback(),
+            None,
+            "a spent fallback is taken, which is what makes it exactly once"
+        );
+    } else {
+        assert_eq!(button.icon(), Some("alpha"));
+        assert!(
+            button.is_icon_coloured(),
+            "an app id names the machine's icon theme, not the symbolic set"
+        );
+        assert_eq!(button.icon_fallback(), Some(nitro_bar::icons::WINDOW));
+    }
+    assert!(
+        button
+            .icon_size()
+            .is_some_and(|px| (px - 16.0).abs() < 0.01),
+        "16 px, like the bar's other icons: got {:?}",
+        button.icon_size()
+    );
+    // The label is untouched — the icon is in front of the title, not
+    // instead of it, so `hey` and a screen reader still see the words.
+    assert!(button.text().contains("alpha"));
+
+    // And the name that went out really was the app id rather than the
+    // title, which the live widget can no longer tell us once it has
+    // fallen back. `entry_icon` is the function that decides, so it is
+    // the one to ask — with a `WindowInfo` whose title and app id
+    // differ, which `open_window` deliberately does not produce.
+    assert_eq!(
+        nitro_bar::entry_icon(&nitro_ui::shell::WindowInfo {
+            window: nitro_ui::shell::WindowRef(7),
+            state: nitro_ui::shell::WindowState::Normal,
+            focused: false,
+            output: 0,
+            layer: Layer::Normal,
+            app_id: "firefox".to_owned(),
+            title: "Inbox — Mail".to_owned(),
+        }),
+        "firefox"
+    );
+
+    drop(conn);
+    h.quit();
+}
+
+#[test]
+fn the_window_list_icons_are_painted_once_and_never_again() {
+    // The idle contract extended to the window list, which is the part
+    // that could plausibly break it: unlike the bar's static icons these
+    // are created at run time and rewritten whenever a `WindowInfo`
+    // arrives — and a focus change sends one for *both* windows
+    // involved. An app id is fixed for a window's life, so an unchanged
+    // list must cost zero `SetIcon`s however many polls and focus
+    // changes go past.
+    let readings = nitro_bar::Readings {
+        battery: Some("87%".to_owned()),
+        load: Some("0.4".to_owned()),
+        mem: Some("1.2/3.3G".to_owned()),
+    };
+    let mut h = bar(Bar::new()
+        .with_poll_ms(20)
+        .with_sensors(move || readings.clone()));
+    h.settle();
+    let mut a = open_window(&h, "alpha", Size::new(120.0, 90.0));
+    let b = open_window(&h, "beta", Size::new(120.0, 90.0));
+    until(&mut h, "both windows to be listed", |h| {
+        h.state().window_count() == 2
+    });
+    h.settle();
+
+    // Armed *after* the list settled, so what follows is "no second
+    // SetIcon" rather than "no SetIcon at all" — the icons are asserted
+    // to be on the buttons by
+    // `a_window_list_button_asks_for_its_app_id_as_a_coloured_icon`.
+    h.tap();
+    // Four polls' worth of 30 s ticks, compressed as the other idle
+    // tests compress them.
+    for _ in 0..4 {
+        h.advance_timers(31);
+        h.run_timers();
+        h.settle();
+    }
+    // And a retitle, which is the `WindowInfo` a real desktop actually
+    // produces while a list sits still: the label moves, the app id does
+    // not, so the icon must not be re-sent.
+    a.tx()
+        .set_window_title(NodeId(1), "alpha renamed")
+        .commit(3)
+        .expect("retitle");
+    while !a.flush().expect("flush") {}
+    until(&mut h, "the retitle", |h| {
+        h.state()
+            .window_labels()
+            .iter()
+            .any(|l| l.contains("renamed"))
+    });
+    h.settle();
+
+    let icons = h.mutations().iter().filter(|m| m.op == "SetIcon").count();
+    assert_eq!(
+        icons,
+        0,
+        "a settled window list emitted {icons} SetIcon(s): {:?}",
+        h.mutations()
+    );
+
+    drop(a);
+    drop(b);
+    h.quit();
+}
+
+#[test]
+fn a_window_with_no_app_id_still_gets_an_icon() {
+    // An empty name **clears** an icon node on the wire, so passing an
+    // absent app id straight through would leave a gap where every other
+    // button has a picture. The generic symbolic icon is the honest
+    // answer, and it is the same one the fallback uses.
+    use nitro_ui::shell::{WindowInfo, WindowRef, WindowState};
+    let info = |app_id: &str| WindowInfo {
+        window: WindowRef(7),
+        state: WindowState::Normal,
+        focused: false,
+        output: 0,
+        layer: Layer::Normal,
+        app_id: app_id.to_owned(),
+        title: "Some Title".to_owned(),
+    };
+    // The title is *not* consulted: an icon name is an app id or it is
+    // nothing, because a title is prose and prose is not an icon name.
+    assert_eq!(nitro_bar::entry_icon(&info("")), nitro_bar::icons::WINDOW);
+    assert_eq!(
+        nitro_bar::entry_icon(&info("   ")),
+        nitro_bar::icons::WINDOW
+    );
+}
+
+#[test]
 fn the_launcher_button_draws_an_icon_and_keeps_its_accessible_name() {
     // The bargain the `≡` character was traded for: the glyph is the
     // desktop's own artwork (so it is the right weight, at the output's

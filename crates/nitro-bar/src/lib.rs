@@ -80,7 +80,7 @@ pub mod sensors;
 use nitro_ui::build::{ContainerBuilder as _, StyleBuilder as _};
 use nitro_ui::shell::{Layer, ShellEvent, Surface, WindowInfo, WindowRef};
 use nitro_ui::widgets::{Button, Label, button as button_widget, icon, label, row, spacer};
-use nitro_ui::{App, ColorRole, Error, Size, Ui, WidgetId};
+use nitro_ui::{App, ColorRole, Error, IconTint, Size, Ui, WidgetId};
 
 /// The name the bar registers under, and so the first argument to `hey`.
 pub const APP_NAME: &str = "nitro-bar";
@@ -163,6 +163,16 @@ pub mod icons {
     pub const LOAD: &str = "cpu";
     /// In front of the memory readout.
     pub const MEM: &str = "memory";
+    /// The window-list button of an application whose icon the box does
+    /// not have.
+    ///
+    /// From the **symbolic** set, which is the point: the window list's
+    /// icons are named by app id and looked up in the machine's icon
+    /// theme, so the fallback has to come from the set that is compiled
+    /// into the server and therefore cannot be missing. On a box with no
+    /// icon theme at all — the test box — every button shows this, which
+    /// is a task list that still reads rather than a row of gaps.
+    pub const WINDOW: &str = "window";
 }
 
 /// One entry in the window list: the server's id, what it currently says,
@@ -175,6 +185,12 @@ struct Entry {
     /// The label last pushed into the button, so an unchanged
     /// `WindowInfo` costs nothing.
     text: String,
+    /// The icon name last pushed into the button — the window's app id.
+    ///
+    /// Held for the same reason `text` is, and it matters more: the bar's
+    /// idle contract is "no `SetIcon` after the first paint for an
+    /// unchanged list", so something has to know what was already sent.
+    icon: String,
     /// Whether it is drawn as focused.
     focused: bool,
     /// The button widget.
@@ -427,6 +443,34 @@ pub fn height() -> f32 {
         .and_then(|v| v.trim().parse::<f32>().ok())
         .filter(|h| h.is_finite())
         .map_or(DEFAULT_HEIGHT, |h| h.clamp(8.0, 256.0))
+}
+
+/// The icon name a window-list button asks for: the window's **app id**.
+///
+/// Rule (a) of the two `docs/shell.md` sets out, and the whole of it. An
+/// application's desktop file is conventionally named after its app id
+/// and its `Icon=` conventionally matches, so the app id is usually the
+/// icon's name as well — `firefox` is all three. The bar therefore does
+/// no `.desktop` parsing, holds no index and reads no files: it sends one
+/// string and the server looks it up in the machine's icon theme.
+///
+/// It is honestly limited, and the limit is worth stating where a reader
+/// will hit it: an application whose app id and icon name differ
+/// (`org.gnome.Nautilus` with `Icon=nautilus`) gets the fallback icon and
+/// nothing says why. The alternative — the server resolving
+/// `app_id → .desktop → Icon=` — is more correct and much bigger; the
+/// reasoning is in `docs/shell.md`.
+///
+/// A window with no app id at all gets [`icons::WINDOW`] directly rather
+/// than an empty name, because an empty name *clears* an icon node on the
+/// wire and would leave a gap where every other button has a picture.
+#[must_use]
+pub fn entry_icon(info: &WindowInfo) -> String {
+    let id = info.app_id.trim();
+    if id.is_empty() {
+        return icons::WINDOW.to_owned();
+    }
+    id.to_owned()
 }
 
 /// Shorten a window label to something a bar can show.
@@ -706,11 +750,14 @@ fn upsert(s: &mut Bar, ui: &mut Ui<Bar>, ids: Ids, info: &WindowInfo) {
         return;
     }
     let text = entry_label(info);
+    let icon = entry_icon(info);
     let window = info.window;
     if let Some(e) = s.entries.iter_mut().find(|e| e.window == window) {
         let id = e.id;
         e.text.clone_from(&text);
         e.focused = info.focused;
+        let icon_changed = e.icon != icon;
+        e.icon.clone_from(&icon);
         // One setter for both changes, because both are the same string.
         // It returns early when the string is unchanged, so a
         // `WindowInfo` that changed nothing we draw costs no mutation and
@@ -718,6 +765,17 @@ fn upsert(s: &mut Bar, ui: &mut Ui<Bar>, ids: Ids, info: &WindowInfo) {
         // *both* windows involved.
         if let Ok(mut b) = ui.widget_mut::<Button<Bar>>(id) {
             b.set_text(button_text(&text, info.focused));
+            // The icon only when the app id moved, which is almost never:
+            // an app id is fixed for a window's life in every client we
+            // ship, and the one thing that can change it — a late
+            // `SetAppId` — is exactly when the icon should change too.
+            // Guarding it here rather than leaning on the setter's own
+            // early return is what makes the idle claim checkable: the
+            // 120 s tick test asserts **zero** `SetIcon`s, not "no
+            // visible change".
+            if icon_changed {
+                b.set_icon_coloured(icon.clone());
+            }
         }
         return;
     }
@@ -728,6 +786,16 @@ fn upsert(s: &mut Bar, ui: &mut Ui<Bar>, ids: Ids, info: &WindowInfo) {
             // and names the same window the server does.
             .name(entry_name(window))
             .size(TEXT_SIZE)
+            // The app id **as an icon name**, which is the freedesktop
+            // convention: an application's desktop file is usually named
+            // after its app id and its `Icon=` usually matches. It is a
+            // claim about the box rather than a fact about it, so it is
+            // paired with a symbolic fallback — see `docs/shell.md` for
+            // the rule, its limitation, and the bigger alternative that
+            // was not taken.
+            .icon_size(ICON_PX)
+            .icon_coloured(icon.clone())
+            .icon_fallback_tinted(icons::WINDOW, IconTint::Role(ColorRole::ButtonText))
             .max_width(MAX_BUTTON_W)
             // The buttons shrink with their row, for the reason the row
             // does (see `build`): the window list is the one part of the
@@ -763,6 +831,7 @@ fn upsert(s: &mut Bar, ui: &mut Ui<Bar>, ids: Ids, info: &WindowInfo) {
     s.entries.push(Entry {
         window,
         text,
+        icon,
         focused: info.focused,
         id,
     });

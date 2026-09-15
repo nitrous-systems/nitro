@@ -136,5 +136,7 @@ pub use nitro_wire::msg::Fill;
 pub use shell::{Anchor, ShellEvent, Surface};
 pub use theme::{TextStyle, Theme};
 pub use ui::{FdToken, Frame, Node, TimerId, Ui, WidgetMut};
-pub use widget::{Access, EventCx, LayoutCx, MeasureCx, PaintCx, Role, Slot, TextRun, Widget};
+pub use widget::{
+    Access, EventCx, IconTint, LayoutCx, MeasureCx, PaintCx, Role, Slot, TextRun, Widget,
+};
 pub use wire::{Mutation, TextMetrics};
