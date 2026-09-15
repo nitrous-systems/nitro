@@ -923,3 +923,209 @@ fn a_positioned_output_reports_the_scaled_device_origin_it_was_given() {
     drop(conn);
     h.quit();
 }
+
+// ---------------------------------------------------------------------------
+// `output.<connector>.mode`
+// ---------------------------------------------------------------------------
+
+/// The mode table a mode test's fake connector offers.
+///
+/// The shape of the test box's HDMI-A-1 (`docs/testbox.md`): a preferred
+/// 60, a faster rate at the same size, a second rate close enough to 60 to
+/// make `@60` a real question, and a smaller size so a *size* change is
+/// reachable too. Scaled down from 1920×1080 only so the harness's window
+/// arithmetic stays the arithmetic every other test here uses.
+const MODES: [(u32, u32, u32); 4] = [
+    (640, 480, 60_000),
+    (640, 480, 120_000),
+    (640, 480, 59_940),
+    (320, 240, 240_000),
+];
+
+/// A harness whose fake connector has a mode table.
+fn mode_harness(name: &str, conf: &str) -> Harness {
+    Harness::start_with(name, conf, |c| c.fake_modes = MODES.to_vec())
+}
+
+/// The `@refresh` field of an `outputs` line, as millihertz.
+fn reported_refresh(h: &Harness) -> u32 {
+    let line = h.output_line("Virtual-1");
+    line.split_ascii_whitespace()
+        .nth(1)
+        .and_then(|f| f.split_once('@'))
+        .and_then(|(_, r)| r.parse().ok())
+        .unwrap_or_else(|| panic!("no WxH@refresh in {line:?}"))
+}
+
+#[test]
+fn the_file_picks_the_mode_and_outputs_reports_it() {
+    // Without a `mode` line the connector's preferred mode is what runs,
+    // which is what nitro always did.
+    let h = mode_harness("mode-default", "# nothing about the mode\n");
+    assert_eq!(reported_refresh(&h), 60_000);
+    h.quit();
+
+    // With one, the rate the file asked for — and `outputs` reports the
+    // truth rather than the request, which is the only way to tell a
+    // modeset that happened from one that silently did not.
+    let h = mode_harness("mode-120", "output.Virtual-1.mode = 640x480@120\n");
+    assert_eq!(reported_refresh(&h), 120_000);
+    assert!(
+        h.output_line("Virtual-1")
+            .starts_with("Virtual-1 640x480@120000 "),
+        "{}",
+        h.output_line("Virtual-1")
+    );
+    h.quit();
+}
+
+#[test]
+fn sixty_is_not_fifty_nine_ninety_four() {
+    // Both rates are in the table 60 mHz apart, so this is the case the
+    // nearest-match rule exists for: `@60` must not round into the 59.94
+    // that sits next to it in every HDMI table, and vice versa.
+    let h = mode_harness("mode-60", "output.Virtual-1.mode = 640x480@60\n");
+    assert_eq!(reported_refresh(&h), 60_000);
+    h.quit();
+
+    let h = mode_harness("mode-5994", "output.Virtual-1.mode = 640x480@59.94\n");
+    assert_eq!(reported_refresh(&h), 59_940);
+    h.quit();
+}
+
+#[test]
+fn the_aliases_mean_what_the_documentation_says() {
+    // `fastest`: the preferred *size*, top rate. `max`: largest area,
+    // ignoring the preferred flag — which on this table is the smaller,
+    // faster mode losing to the bigger, slower one.
+    let h = mode_harness("mode-fastest", "output.Virtual-1.mode = fastest\n");
+    assert_eq!(
+        h.output_line("Virtual-1").split_whitespace().nth(1),
+        Some("640x480@120000")
+    );
+    h.quit();
+
+    let h = mode_harness("mode-max", "output.Virtual-1.mode = max\n");
+    assert_eq!(
+        h.output_line("Virtual-1").split_whitespace().nth(1),
+        Some("640x480@120000")
+    );
+    h.quit();
+}
+
+#[test]
+fn the_environment_beats_the_file_for_the_mode() {
+    // The same ladder `NITRO_SCALE` is on, and for the same reason: a
+    // measurement run must be able to override the box's own file without
+    // editing it. `Config::modes` is `NITRO_MODE`, parsed.
+    let h = Harness::start_with(
+        "mode-envwins",
+        "output.Virtual-1.mode = 640x480@120\n",
+        |c| {
+            c.fake_modes = MODES.to_vec();
+            c.modes = nitro_server::parse_modes("Virtual-1=640x480@59.94");
+        },
+    );
+    assert_eq!(
+        reported_refresh(&h),
+        59_940,
+        "NITRO_MODE wins over the file"
+    );
+    h.quit();
+}
+
+#[test]
+fn an_unlisted_mode_warns_and_leaves_the_desktop_up() {
+    // The whole reason the request falls back rather than failing: a
+    // `mode` line naming a resolution this monitor does not have must cost
+    // a warning, not a desktop. The server is up, the output is on its
+    // preferred mode, and the rest of the file still applied.
+    let h = mode_harness(
+        "mode-unlisted",
+        "output.Virtual-1.mode = 2560x1440@144\noutput.Virtual-1.scale = 2\n",
+    );
+    assert_eq!(reported_refresh(&h), 60_000);
+    assert_eq!(h.output_field("Virtual-1", "scale"), "2");
+    h.quit();
+}
+
+#[test]
+fn a_reload_retimes_the_output_and_a_second_one_costs_nothing() {
+    let h = mode_harness("mode-reload", "output.Virtual-1.mode = 640x480@60\n");
+    assert_eq!(reported_refresh(&h), 60_000);
+    h.settle();
+
+    // A same-size refresh change is applied live: no buffer changes size,
+    // so there is nothing to reallocate and no reason to make the user
+    // restart for it.
+    h.rewrite_config("output.Virtual-1.mode = 640x480@120\n");
+    assert_eq!(h.request_line("reload\n"), "ok");
+    assert_eq!(reported_refresh(&h), 120_000);
+
+    // And a reload that says the same thing again is not a second
+    // modeset: the backend compares before it touches the hardware, which
+    // is what keeps an unrelated reload (a colour, a keyboard layout) from
+    // blanking the screen.
+    let frames = h.stat("frames");
+    h.rewrite_config("output.Virtual-1.mode = 640x480@120\ntheme.scheme = dark\n");
+    assert_eq!(h.request_line("reload\n"), "ok");
+    assert_eq!(reported_refresh(&h), 120_000);
+    assert!(h.stat("frames") >= frames, "a reload never loses frames");
+    h.quit();
+}
+
+#[test]
+fn a_reload_can_change_the_size_too_and_the_desktop_follows() {
+    // The expensive case: the mode's *size* changes, so the scanout
+    // buffers and the shadow are reallocated and the scene is re-laid out.
+    // Checked through the desktop rather than the backend, because "the
+    // output is 320x240 now" is only true if the scene agrees.
+    let h = mode_harness("mode-resize", "output.Virtual-1.mode = 640x480@60\n");
+    h.settle();
+    h.rewrite_config("output.Virtual-1.mode = 320x240\n");
+    assert_eq!(h.request_line("reload\n"), "ok");
+    let line = h.output_line("Virtual-1");
+    assert_eq!(
+        line.split_whitespace().nth(1),
+        Some("320x240@240000"),
+        "{line}"
+    );
+    h.settle();
+    // The readback is the new size, which is the half a mode report
+    // cannot fake: the buffers really were reallocated.
+    let mut c = h.connect();
+    c.get_mut().write_all(b"shot\n").unwrap();
+    let mut header = String::new();
+    c.read_line(&mut header).unwrap();
+    assert!(header.starts_with("ok 320 240 "), "{header:?}");
+    h.quit();
+}
+
+#[test]
+fn the_modes_command_lists_what_a_user_may_write() {
+    // The answer to "how do I run this screen at 120", which `outputs`
+    // cannot give: it reports the one mode in force.
+    let h = mode_harness("mode-list", "output.Virtual-1.mode = 640x480@120\n");
+    let lines = h.request_text("modes\n");
+    assert_eq!(
+        lines,
+        vec![
+            "ok",
+            "Virtual-1 640x480@60 *",
+            "Virtual-1 640x480@120 =",
+            "Virtual-1 640x480@59.94",
+            "Virtual-1 320x240@240",
+        ],
+        "`*` is the preferred mode and `=` the one in use"
+    );
+    // Every line's mode text is exactly what the key takes, which is the
+    // property that makes this list useful rather than decorative.
+    for l in lines.iter().skip(1) {
+        let spec = l.split_whitespace().nth(1).unwrap();
+        assert!(
+            nitro_kms::ModeRequest::parse(spec).is_ok(),
+            "{spec:?} is not something `output.<c>.mode` accepts"
+        );
+    }
+    h.quit();
+}

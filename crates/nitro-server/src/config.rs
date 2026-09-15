@@ -952,6 +952,104 @@ mod tests {
     }
 
     #[test]
+    fn a_mode_line_parses_in_every_spelling() {
+        let s = parse(
+            "output.HDMI-A-1.mode = 1920x1080@120\n\
+             output.DP-1.mode = 1280x720\n\
+             output.DP-2.mode = max\n\
+             output.DP-3.mode = fastest\n\
+             output.DP-4.mode = 1920x1080@59.94\n",
+        );
+        assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+        assert_eq!(
+            s.output("HDMI-A-1").expect("HDMI").mode,
+            Some(ModeRequest::Size {
+                width: 1920,
+                height: 1080,
+                refresh_mhz: Some(120_000)
+            })
+        );
+        assert_eq!(
+            s.output("DP-1").expect("DP-1").mode,
+            Some(ModeRequest::Size {
+                width: 1280,
+                height: 720,
+                refresh_mhz: None
+            })
+        );
+        assert_eq!(s.output("DP-2").expect("DP-2").mode, Some(ModeRequest::Max));
+        assert_eq!(
+            s.output("DP-3").expect("DP-3").mode,
+            Some(ModeRequest::Fastest)
+        );
+        assert_eq!(
+            s.output("DP-4").expect("DP-4").mode,
+            Some(ModeRequest::Size {
+                width: 1920,
+                height: 1080,
+                refresh_mhz: Some(59_940)
+            })
+        );
+        assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn a_bad_mode_is_a_warning_and_the_default_stays() {
+        // The whole point of the fallback: a typo costs a log line, not a
+        // desktop, and the rest of the file still applies.
+        let s = parse("output.HDMI-A-1.mode = 1920 by 1080\noutput.HDMI-A-1.scale = 2\n");
+        assert_eq!(s.warnings.len(), 1, "{:?}", s.warnings);
+        assert!(s.warnings[0].contains("mode"), "{:?}", s.warnings);
+        assert_eq!(s.output("HDMI-A-1").expect("HDMI").mode, None);
+        assert_eq!(s.output("HDMI-A-1").expect("HDMI").scale, Some(2.0));
+    }
+
+    #[test]
+    fn an_empty_mode_means_say_nothing_about_it() {
+        // `output.X.mode =` is how a settings app or a `sed` turns an
+        // override off without deleting the line, the same way
+        // `remote.listen =` is "no listener". Last assignment wins, so
+        // the empty one clears the earlier one.
+        let s = parse("output.HDMI-A-1.mode = 1920x1080@120\noutput.HDMI-A-1.mode =\n");
+        assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+        assert_eq!(s.output("HDMI-A-1").expect("HDMI").mode, None);
+    }
+
+    #[test]
+    fn a_modeline_is_the_same_field_and_the_last_one_wins() {
+        // Two spellings of one instruction, so a file setting both does
+        // not need a precedence rule nobody could remember: the last
+        // assignment wins, like every other key here.
+        let s = parse(
+            "output.HDMI-A-1.mode = 1920x1080@120\n\
+             output.HDMI-A-1.modeline = 249000 1280 1328 1360 1440 720 723 728 735 +hsync -vsync\n",
+        );
+        assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+        let Some(ModeRequest::Custom(ml)) = s.output("HDMI-A-1").expect("HDMI").mode else {
+            panic!("want a modeline, got {:?}", s.output("HDMI-A-1"));
+        };
+        assert_eq!(ml.clock_khz, 249_000);
+        assert_eq!(ml.refresh_mhz(), 235_260);
+        // ... and the other way round.
+        let s = parse(
+            "output.HDMI-A-1.modeline = 249000 1280 1328 1360 1440 720 723 728 735\n\
+             output.HDMI-A-1.mode = 1920x1080@120\n",
+        );
+        assert!(matches!(
+            s.output("HDMI-A-1").expect("HDMI").mode,
+            Some(ModeRequest::Size { .. })
+        ));
+    }
+
+    #[test]
+    fn a_bad_modeline_is_a_warning_naming_what_is_wrong() {
+        let s = parse("output.HDMI-A-1.modeline = 249000 1280 1328\n");
+        assert_eq!(s.warnings.len(), 1, "{:?}", s.warnings);
+        assert!(s.warnings[0].contains("missing"), "{:?}", s.warnings);
+        assert!(s.is_empty());
+    }
+
+    #[test]
     fn keyboard_repeat_is_refused_by_name() {
         // Not "unknown": it is the key a reader most expects, and the
         // warning has to say *why* it does nothing rather than imply a typo.

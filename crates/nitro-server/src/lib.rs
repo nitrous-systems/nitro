@@ -158,6 +158,16 @@ pub struct Config {
     /// from `NITRO_MODE` / `NITRO_MODELINE`; a test sets it directly, for
     /// the same reason `scales` is a field.
     pub modes: HashMap<String, ModeRequest>,
+    /// The mode table the **fake** backend's output offers, as
+    /// `(width, height, refresh_mhz)` with the first entry preferred.
+    ///
+    /// Empty is the historical shape: one output at exactly
+    /// [`BackendKind::Fake`]'s size and 60 Hz, which is what every test
+    /// that does not care about modes still gets. A test that *does* care
+    /// fills this in, and `output.<c>.mode` then has something to choose
+    /// from without a monitor — the same [`select_mode`](nitro_kms::drm::select::select_mode)
+    /// the DRM backend runs, over a table a test wrote.
+    pub fake_modes: Vec<(u32, u32, u32)>,
     /// Paint into a heap shadow buffer per output and stream the damage
     /// into the scanout buffer, rather than rasterizing straight into it.
     ///
@@ -207,6 +217,7 @@ impl Config {
             fake_input: None,
             scales: HashMap::new(),
             modes: HashMap::new(),
+            fake_modes: Vec::new(),
             shadow: true,
             config_path: None,
             icon_dirs: None,
@@ -859,7 +870,13 @@ pub fn run(mut config: Config) -> Result<(), Error> {
     let mut backend: Box<dyn Backend> = match &config.backend {
         BackendKind::Fake { width, height } => {
             info!("fake backend {width}x{height}");
-            Box::new(FakeBackend::single(*width, *height).map_err(io_err("create fake backend"))?)
+            let spec = nitro_kms::FakeOutputSpec::new(*width, *height);
+            let spec = if config.fake_modes.is_empty() {
+                spec
+            } else {
+                spec.modes(&config.fake_modes)
+            };
+            Box::new(FakeBackend::new(&[spec]).map_err(io_err("create fake backend"))?)
         }
         BackendKind::FakeHeadless => {
             info!("fake backend with no outputs");
