@@ -14,8 +14,16 @@ where the pointer actually is**. Move, look, correct, repeat: three
 iterations put it on the pixel, and no model of the acceleration curve is
 needed at all.
 
-    ./pointer.py move X Y          # land the pointer on X,Y
-    ./pointer.py drag X1 Y1 X2 Y2  # press at X1,Y1, release at X2,Y2
+    ./pointer.py move X Y              # land the pointer on X,Y
+    ./pointer.py drag X1 Y1 X2 Y2 [app] # press at X1,Y1, release at X2,Y2
+    ./pointer.py calibrate             # measure ABS_SCALE on a new box
+
+Placement is **absolute** (`ydotool mousemove -a`), which skips the
+acceleration curve entirely and lands on the pixel in one call; the
+closed loop below is now only a check. Pass `app` to `drag` and the
+window is tracked by `hey <app> get window bounds` rather than by light
+pixels — the pixel heuristic assumes a dark desktop and the default
+scheme is light, so it reports the wallpaper.
 
 The cursor is found as the darkest cluster that is *not* where the cursor
 was in a reference frame, which is why every call takes its own reference
@@ -29,6 +37,9 @@ import time
 
 SHOT = os.path.expanduser("~/nitro-bin/nitro-shot")
 SOCK = "/tmp/.ydotool_socket"
+# The absolute device's coordinate space, as a multiple of the mode. Two on
+# this box: `mousemove -a -x X/2 -y Y/2` lands at (X, Y). See `calibrate`.
+ABS_SCALE = 2.0
 
 
 def ydotool(*args):
@@ -37,6 +48,40 @@ def ydotool(*args):
         check=False,
         capture_output=True,
     )
+
+
+def move_abs(x, y):
+    """Put the pointer at (x, y) in **absolute** mode.
+
+    `ydotool mousemove -a` bypasses libinput's acceleration entirely, so
+    there is no curve to model and no loop to close: one call lands on the
+    pixel. The catch is the factor of two — on this box the absolute
+    device's coordinate space is twice the mode's, so `-x X/2 -y Y/2`
+    lands at (X, Y). `docs/testbox.md` records the measurement; `ABS_SCALE`
+    is where to change it if another box disagrees, and `calibrate()`
+    below is how to find out.
+    """
+    ydotool("mousemove", "-a", "-x", str(int(x // ABS_SCALE)),
+            "-y", str(int(y // ABS_SCALE)))
+    time.sleep(0.25)
+
+
+def calibrate():
+    """Measure ABS_SCALE: ask for (200, 200) absolute and look.
+
+    Run it once on a new box. A box where the absolute space *is* the
+    mode reports 1.0; this one reports 2.0.
+    """
+    ydotool("mousemove", "-a", "-x", "100", "-y", "100")
+    time.sleep(0.4)
+    pos = locate()
+    if pos is None:
+        print("cannot see the cursor", file=sys.stderr)
+        return None
+    # Asked for 100,100 in the device's space; where did it land?
+    scale = (pos[0] / 100.0, pos[1] / 100.0)
+    print(f"asked 100,100 landed {pos} -> ABS_SCALE ~ {scale}")
+    return scale
 
 
 def shot():
@@ -96,35 +141,67 @@ def locate():
 
 
 def move_to(x, y, tries=4):
-    """Land the pointer on (x, y), correcting from what the screen says."""
-    # Park first: from a known corner the first guess is close.
-    ydotool("mousemove", "--", "-10000", "-10000")
-    time.sleep(0.25)
-    ydotool("mousemove", "--", str(x // 2), str(y // 2))
-    time.sleep(0.3)
+    """Land the pointer on (x, y).
+
+    **Absolute mode first**, which is exact and needs no screenshot at
+    all; the closed loop below is only a check, and only runs while the
+    cursor can still be seen. That ordering is the fix for the thing that
+    made this script unreliable once the default scheme became *light*:
+    the locator looks for a dark arrow among changed pixels, and on a
+    light desktop it often finds nothing and returns `None`. A `None` used
+    to mean "give up"; now it means "the absolute move already did the
+    job", which it did.
+    """
+    move_abs(x, y)
     for _ in range(tries):
         pos = locate()
         if pos is None:
-            print("cannot see the cursor", file=sys.stderr)
-            return None
+            # Cannot see it, so cannot correct it — and after an absolute
+            # move there is nothing to correct. Trust the placement.
+            return (x, y)
         dx, dy = x - pos[0], y - pos[1]
         if abs(dx) <= 2 and abs(dy) <= 2:
             return pos
-        # Relative moves are accelerated, so correct by the *observed*
-        # error rather than by a predicted one; it converges in two or
-        # three passes because the error shrinks each time.
-        ydotool("mousemove", "--", str(dx), str(dy))
-        time.sleep(0.3)
-    return locate()
+        # Correct absolutely too: a relative nudge would put the
+        # acceleration curve back in the picture, which is the whole thing
+        # absolute mode is here to avoid.
+        move_abs(x + dx * ABS_SCALE, y + dy * ABS_SCALE)
+    return locate() or (x, y)
+
+
+def app_origin(app):
+    """A nitro app's own view of where its window is, via `hey`.
+
+    The honest answer, and the one to use: the app is asked, so no pixel
+    heuristic can be fooled. `hey <app> get window bounds` prints
+    `x,y,w,h`.
+    """
+    b = app_bounds(app)
+    return None if b is None else (b[0], b[1])
+
+
+def app_bounds(app):
+    """`hey <app> get window bounds` as (x, y, w, h), or None."""
+    out = subprocess.run(
+        [os.path.expanduser("~/nitro-bin/hey"), app, "get", "window", "bounds"],
+        check=False,
+        capture_output=True,
+    ).stdout.decode()
+    try:
+        return tuple(int(v) for v in out.strip().split(","))
+    except ValueError:
+        return None
 
 
 def window_origin():
     """Top-left of the topmost light (window) region on screen.
 
-    A window's content is near-white and the desktop is a dark gradient,
-    so the bounding box of light pixels is the windows' extent. It is a
-    blunt instrument and exactly right for one job: telling whether a
-    drag moved something, and by how much.
+    **Deprecated; prefer `app_origin`.** It assumes "light pixels on a
+    dark desktop", which stopped being true when the default scheme became
+    *light* — the desktop gradient is now light too, so this finds the
+    wallpaper and reports the same origin whatever the window does. Kept
+    only for a window belonging to no nitro app (nothing to ask), and the
+    caller must know that is what it is getting.
     """
     w, h, d = shot()
     stride = w * 4
@@ -152,16 +229,8 @@ def app_size(app):
     which makes a resize loop that closes on it report a perfect success
     while the window has not moved a pixel. It did, for three runs.
     """
-    out = subprocess.run(
-        [os.path.expanduser("~/nitro-bin/hey"), app, "get", "window", "bounds"],
-        check=False,
-        capture_output=True,
-    ).stdout.decode()
-    try:
-        x, y, w, h = (int(v) for v in out.strip().split(","))
-    except ValueError:
-        return None
-    return w, h
+    b = app_bounds(app)
+    return None if b is None else (b[2], b[3])
 
 
 def window_box():
@@ -191,8 +260,13 @@ def main():
         x, y = int(sys.argv[2]), int(sys.argv[3])
         got = move_to(x, y)
         print(f"asked {x},{y} landed {got}")
+    elif sys.argv[1:2] == ["calibrate"]:
+        calibrate()
     elif len(sys.argv) >= 6 and sys.argv[1] == "drag":
         x1, y1, x2, y2 = (int(v) for v in sys.argv[2:6])
+        # Optional trailing app name: track *it* rather than light pixels.
+        app = sys.argv[6] if len(sys.argv) >= 7 else None
+        track = (lambda: app_origin(app)) if app else window_origin
         got = move_to(x1, y1)
         print(f"press at {x1},{y1} (landed {got})")
         ydotool("click", "0x40")
@@ -211,10 +285,10 @@ def main():
         # A single -200 request moved the window 38 pixels. Asking again
         # from the error each time converges anyway, and needs no model
         # of the curve.
-        start = window_origin()
+        start = track()
         want = (x2 - x1, y2 - y1)
         for _ in range(12):
-            now = window_origin()
+            now = track()
             if now is None or start is None:
                 break
             got = (now[0] - start[0], now[1] - start[1])
@@ -225,7 +299,7 @@ def main():
             time.sleep(0.25)
         ydotool("click", "0x80")
         time.sleep(0.5)
-        end = window_origin()
+        end = track()
         if start and end:
             print(f"window moved by {end[0] - start[0]},{end[1] - start[1]} "
                   f"(asked {want[0]},{want[1]})")

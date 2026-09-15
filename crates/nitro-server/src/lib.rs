@@ -601,6 +601,14 @@ struct Server {
     wm: WindowManager,
     /// The decoration nodes of each framed window.
     decorations: HashMap<WindowKey, FrameNodes>,
+    /// The window whose frame edge is currently lit as a resize
+    /// affordance, because the pointer is in its resize band.
+    ///
+    /// Cached rather than recomputed at paint time because it is a
+    /// *change* that matters: the restyle has to put the previous window's
+    /// border back, and nothing else remembers which that was. See
+    /// [`Server::set_resize_hint`].
+    resize_hint: Option<WindowKey>,
     /// The shaped title run of each framed window, so a retitle can release
     /// the old one.
     frame_titles: HashMap<WindowKey, nitro_text::TextKey>,
@@ -883,6 +891,7 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         pointer: Pointer::default(),
         wm: WindowManager::new(),
         decorations: HashMap::new(),
+        resize_hint: None,
         frame_titles: HashMap::new(),
         scale_overrides: std::mem::take(&mut config.scales),
         origins: Vec::new(),
@@ -2579,6 +2588,11 @@ impl Server {
             self.note_input(time_ns);
             return;
         }
+        // The resize affordance follows the pointer, but not during a drag:
+        // the branch above has already returned, so a drag in flight never
+        // repaints a border it is not over.
+        let hint = self.resize_hint_at(self.pointer_desktop());
+        self.set_resize_hint(hint);
         let target = output.and_then(|id| input::hit(&self.scene, id, point));
         let now_over = target.map(|t| t.window);
         if now_over != self.pointer.over {
@@ -2991,6 +3005,9 @@ impl Server {
     /// store, keyed by owner, and this is the only place it can be freed.
     fn forget_window(&mut self, win: WindowKey) {
         self.decorations.remove(&win);
+        if self.resize_hint == Some(win) {
+            self.resize_hint = None;
+        }
         let title = self.frame_titles.remove(&win);
         self.text.release(title);
         self.wm.remove(win);
@@ -3263,10 +3280,46 @@ impl Server {
         let Some(nodes) = self.decorations.get(&win).copied() else {
             return;
         };
-        if let Err(e) = wm::style_frame(&mut self.scene, &nodes, focused, &self.palette) {
+        let hint = self.resize_hint == Some(win);
+        if let Err(e) = wm::style_frame(&mut self.scene, &nodes, focused, hint, &self.palette) {
             warn!("styling a frame: {e}");
         }
         self.retitle(win);
+    }
+
+    /// Light the frame edge of whichever window the pointer could resize by
+    /// pressing right now, and put the previous one back.
+    ///
+    /// The resize band is six logical pixels wide and the border it
+    /// straddles is one, so a user aiming at the border they can see has
+    /// nothing telling them whether they are in it — which is #3713's
+    /// second half, reported as "resizing does not work (by grabbing a
+    /// border)". Cursor *shapes* are the real answer and are M5; until
+    /// then the border itself is the affordance, and this is what turns it
+    /// on.
+    ///
+    /// Called from every motion, so it is written to do nothing in the
+    /// common case: the hit test it needs has already been run by the
+    /// caller, and an unchanged hint returns before touching the scene.
+    /// Only a window that is actually [`Server::resizable`] lights up —
+    /// offering a grab that would do nothing is worse than offering none.
+    fn set_resize_hint(&mut self, hint: Option<WindowKey>) {
+        let hint = hint.filter(|w| self.resizable(*w));
+        if self.resize_hint == hint {
+            return;
+        }
+        let old = self.resize_hint;
+        self.resize_hint = hint;
+        for win in [old, hint].into_iter().flatten() {
+            self.restyle(win, self.focus == Some(win));
+        }
+    }
+
+    /// The window whose resize band the pointer is in, if any: what
+    /// [`Server::set_resize_hint`] lights up.
+    fn resize_hint_at(&self, point: Option<Point>) -> Option<WindowKey> {
+        let (win, region) = self.frame_hit(point?)?;
+        matches!(region, Region::Resize(_)).then_some(win)
     }
 
     /// (Re)shape a framed window's title text, eliding it to the space
@@ -3394,6 +3447,26 @@ impl Server {
             .ok()
             .filter(|i| i.state() != WindowState::Minimized)
             .and_then(|i| self.scene.node(i.content()).ok())
+            .is_some_and(nitro_scene::Node::visible)
+    }
+
+    /// Whether a window's **frame** is on screen, which is what decides
+    /// whether it can be grabbed by [`Server::frame_hit`].
+    ///
+    /// The window's root node, and deliberately not [`Server::showing`]'s
+    /// *content* node: for a decorated window the title bar, the border and
+    /// the buttons are the content's siblings, so a client that hid its own
+    /// content group still has a frame painted on screen and that frame must
+    /// still drag, close and resize. `Minimized` needs no separate test —
+    /// `Scene::set_window_state` hides the root for exactly that state — but
+    /// it is checked anyway, because "is this window on screen" having one
+    /// obvious answer is worth more than the branch it costs.
+    fn on_screen(&self, win: WindowKey) -> bool {
+        self.scene
+            .window_info(win)
+            .ok()
+            .filter(|i| i.state() != WindowState::Minimized)
+            .and_then(|i| self.scene.node(i.root()).ok())
             .is_some_and(nitro_scene::Node::visible)
     }
 
@@ -3766,11 +3839,27 @@ impl Server {
 
     /// Which window's frame the pointer is over, and where in it.
     ///
-    /// Front to back through the z-order, skipping minimized windows: a
-    /// hidden window must not swallow a click, which is also why this is a
-    /// separate walk from the scene's own hit test (that one only knows
-    /// about *painted* nodes and would never see a resize band outside the
-    /// window at all).
+    /// Front to back through the z-order, skipping windows that are not
+    /// **showing**: a hidden window must not swallow a click, which is also
+    /// why this is a separate walk from the scene's own hit test (that one
+    /// only knows about *painted* nodes and would never see a resize band
+    /// outside the window at all).
+    ///
+    /// "Not showing" is [`Server::showing`], not just `Minimized`, and that
+    /// is #3713: the launcher is a centred 600x400 `Overlay` created
+    /// visible and hidden on its loop's first turn with `SetVisible` — no
+    /// state change, so its state stays `Normal`. A walk that only skipped
+    /// `Minimized` therefore found that invisible rectangle in front of
+    /// everything and returned its `Region::Content`, and every title-bar
+    /// press, frame button and resize band under it did nothing while
+    /// content clicks (which take the `pointer.over` path, filled in by the
+    /// scene's visibility-honouring hit test) kept working. Reported from
+    /// the box as "I cannot move windows" after a restart, and it "fixed
+    /// itself" only once the window was dragged out from under the
+    /// launcher's rectangle by some other means.
+    ///
+    /// The two hit tests must agree about who is on screen; this is the
+    /// half that had its own answer.
     fn frame_hit(&self, point: Point) -> Option<(WindowKey, Region)> {
         // The pointer decides which output's stack to walk, but the
         // *resize bands* reach outside a window, so a grab just past a
@@ -3784,7 +3873,7 @@ impl Server {
                 let Ok(info) = self.scene.window_info(win) else {
                     continue;
                 };
-                if info.state() == WindowState::Minimized {
+                if !self.on_screen(win) {
                     continue;
                 }
                 if !info.is_framed() {

@@ -698,26 +698,27 @@ pub const TITLE_SIZE_LINE: f32 = 18.0;
 /// that a `theme.scheme` change is one call per frame and needs no second
 /// path for "the colours moved but the focus did not".
 ///
+/// `hint` lights the border up in [`Role::ResizeHint`]: the pointer is in
+/// this window's resize band, and until cursor shapes land (M5) the
+/// border changing colour is the only thing that says so. See
+/// [`border_color`].
+///
 /// # Errors
 /// Anything the scene refuses.
 pub fn style_frame(
     scene: &mut Scene,
     nodes: &FrameNodes,
     focused: bool,
+    hint: bool,
     palette: &Palette,
 ) -> Result<(), nitro_scene::Error> {
     let s = ClientId::SERVER;
-    let (bar, border) = if focused {
-        (
-            palette.get(Role::TitleBarActive),
-            palette.get(Role::WindowBorderActive),
-        )
+    let bar = if focused {
+        palette.get(Role::TitleBarActive)
     } else {
-        (
-            palette.get(Role::TitleBarInactive),
-            palette.get(Role::WindowBorderInactive),
-        )
+        palette.get(Role::TitleBarInactive)
     };
+    let border = border_color(focused, hint, palette);
     scene.set_fill(s, nodes.background, nitro_scene::Fill::Solid(bar))?;
     scene.set_border(
         s,
@@ -738,6 +739,39 @@ pub fn style_frame(
         )?;
     }
     Ok(())
+}
+
+/// The colour of a frame's border: its focus colour, or
+/// [`Role::ResizeHint`] while the pointer is in its resize band.
+///
+/// # Why the band is *shown* rather than made bigger
+///
+/// The band already straddles the edge — [`RESIZE_BAND`] outwards and
+/// inwards as far as the frame's own border ([`hit_frame`]) — so pressing
+/// *on* the visible border has always worked. What did not work was
+/// knowing that, and #3713 is a user reporting exactly that: "resizing
+/// does not work (by grabbing a border)" on a border one pixel wide, with
+/// no cursor shape to say otherwise.
+///
+/// Widening the band inwards would not have fixed it either — it steals
+/// the client's outermost pixels and makes a button flush against the
+/// window edge unclickable, which is the mistake
+/// `the_resize_band_never_steals_the_clients_content` exists to keep out.
+/// So the fix is to make the band *visible*: the frame's own border, which
+/// the user is already aiming at, changes colour the moment the pointer is
+/// somewhere a press would resize. It costs no node and no pixel of
+/// anyone's content, and it goes away on its own when cursor shapes
+/// arrive.
+#[must_use]
+pub fn border_color(focused: bool, hint: bool, palette: &Palette) -> Color {
+    if hint {
+        return palette.get(Role::ResizeHint);
+    }
+    if focused {
+        palette.get(Role::WindowBorderActive)
+    } else {
+        palette.get(Role::WindowBorderInactive)
+    }
 }
 
 /// The title colour for a focus state.
@@ -1054,6 +1088,46 @@ mod tests {
         assert!(!wm.title_click(key(1), 10_000_000_000));
         // Different window.
         assert!(!wm.title_click(key(2), 10_000_000_001));
+    }
+
+    #[test]
+    fn the_border_shows_the_resize_hint_over_its_focus_colour() {
+        // The hint is a *hover* state, so it has to win over both focus
+        // colours: a user hovering an unfocused window's edge is told the
+        // same thing as one hovering the focused window's.
+        let p = Palette::light();
+        assert_eq!(
+            border_color(true, false, &p),
+            p.get(Role::WindowBorderActive)
+        );
+        assert_eq!(
+            border_color(false, false, &p),
+            p.get(Role::WindowBorderInactive)
+        );
+        for focused in [true, false] {
+            assert_eq!(border_color(focused, true, &p), p.get(Role::ResizeHint));
+        }
+        // And it is a colour of its own, not one of the two it replaces —
+        // a hint indistinguishable from the resting border is no hint.
+        assert_ne!(p.get(Role::ResizeHint), p.get(Role::WindowBorderActive));
+        assert_ne!(p.get(Role::ResizeHint), p.get(Role::WindowBorderInactive));
+    }
+
+    #[test]
+    fn the_band_a_hint_advertises_is_the_band_that_grabs() {
+        // The hint lights the *border*, so pressing on the border must
+        // resize: an affordance drawn somewhere a press does nothing is
+        // worse than none, and #3713 is a user finding exactly that.
+        let f = frame();
+        let i = frame_insets();
+        let on_border = Point::new(f.x + i.left / 2.0, f.y + f.h / 2.0);
+        assert!(
+            matches!(hit_frame(f, i, on_border, false), Some(Region::Resize(_))),
+            "the lit border is inside the band"
+        );
+        // And a fixed-size window, which never lights up, has no band
+        // there either — the two rules agree.
+        assert_eq!(hit_frame(f, i, on_border, true), Some(Region::Content));
     }
 
     #[test]

@@ -86,6 +86,7 @@ desktop can be pasted straight back into a file.
 | `window_border_inactive` | an unfocused one's | `#c4c8d0` | `#3a424c` |
 | `title_close` | the close button | `#d95b4e` | `#d95b4e` |
 | `title_maximize` | the maximize button | `#62a85c` | `#62a85c` |
+| `resize_hint` | the frame edge, while the pointer is in its resize band | `#0f5fbe` | `#6ca8f0` |
 | `desktop_top` | top of the wallpaper gradient — **and of the server's own uncovered desktop** | `#dce3ed` | `#2a303c` |
 | `desktop_bottom` | bottom of both | `#bec7d4` | `#151820` |
 | `terminal_background` | a terminal's default background (`SGR 49`) | `#fbfbf8` | `#141418` |

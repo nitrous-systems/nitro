@@ -49,27 +49,58 @@ Geometry, in logical units:
 | border | 1, left/right/bottom |
 | top corner radius | 6 |
 | button | 14 × 14, 8 apart, close rightmost |
-| resize grab band | 6, **outside** the frame edge only |
+| resize grab band | 6 outside the frame edge, inwards only to the border (or the title bar, at the top) |
+| resize hint | the border repaints in `resize_hint` while the pointer is in the band |
 
 The insets are `(1, 28, 1, 1)`. `Window::size()` and every `Configure` are
 the **content's** size; `Window::frame_size()` adds the insets.
 `Configure.position` is the content's origin, so a client holding a
 screenshot of the whole output can still crop it to exactly itself.
 
-### Why the resize band only reaches outwards
+### Why the band is lopsided, and why it is now visible
 
-The obvious implementation grabs six pixels either side of the frame edge.
-It is also wrong: with a 1-px border that steals the outermost six pixels
-of the *client's* content, and a button flush against the window edge
-becomes unclickable. So the band reaches inwards only as far as the
-frame's own border (or the title bar, at the top) and outwards the full
-six pixels. Six pixels of slop outside the window is what makes a 1-px
-border grabbable, and it costs the client nothing, because those pixels
-are not its.
+The band **straddles** the frame edge, but not symmetrically: six pixels
+outwards, and inwards only as far as the frame's own border — one pixel on
+the sides and the bottom, the title bar at the top. The obvious
+implementation, six pixels either side, is wrong: with a 1-px border it
+steals the outermost six pixels of the *client's* content, and a button
+flush against the window edge becomes unclickable
+(`the_resize_band_never_steals_the_clients_content`). The outward six are
+what make a 1-px border grabbable, and they cost the client nothing,
+because those pixels are not its.
+
+So pressing *on* the visible border has always resized. What was missing
+was any way to know that, and #3713 is a user on real hardware reporting
+exactly that failure: "resizing does not work (by grabbing a border)". The
+border is one pixel wide, the band around it is invisible, and cursor
+shapes are still deferred — so there was nothing on screen to aim at and
+nothing to say when you had hit it.
+
+The fix is to make the band *visible* rather than bigger: while the
+pointer is anywhere a press would start a resize, the frame's border
+repaints in the `resize_hint` role (`docs/theme.md`). It is the pixel the
+user is already aiming at, it costs no scene node — the border is one the
+frame already had — and it steals nothing from the client. Only a window
+that can actually be resized lights up: a `FIXED_SIZE` window has no bands
+at all, so offering it a grab that does nothing would be worse than
+offering none.
+
+When cursor shapes land the hint becomes redundant with them, not
+contradicted by them: both answer "a press here resizes", one at the
+pointer and one at the edge.
+
+### Which windows resize
+
+Every decorated window except a `FIXED_SIZE` one — and no shipped app sets
+that flag, so the calculator, the settings window, the file manager and
+the terminal all resize by their edges and corners. `FIXED_SIZE` is also
+visible in the frame *before* you try it: such a window has no maximize
+button, and now no lit border either.
 
 ### Hit regions
 
-Front to back through the z-order, skipping minimized windows:
+Front to back through the z-order, skipping windows that are not on
+screen — minimized, or hidden by their own client with `SetVisible`:
 
 | region | pointer action |
 |---|---|
@@ -82,8 +113,23 @@ Front to back through the z-order, skipping minimized windows:
 A button fires on **release inside itself**, which is what lets a user
 change their mind by sliding off it before letting go.
 
+**A hidden window is not a hit target.** This walk is separate from the
+scene's own hit test — the scene only knows about *painted* nodes and
+would never see a resize band outside a window at all — so the two have to
+be told the same thing about who is on screen, and #3713 is what it looks
+like when they are not. The launcher is a centred 600×400 `Overlay`,
+created visible and hidden on its loop's first turn with `SetVisible`; its
+window *state* stays `Normal`, so a walk that skipped only `Minimized`
+found an invisible rectangle in front of everything and returned its
+`Content`. Every title-bar drag, frame button and resize band under it did
+nothing, while content clicks — which go through the scene's hit test,
+which does honour visibility — kept working. The test of "on screen" is
+the window's **root** node, not the client's content group: a client that
+hides its own content still has a frame, and that frame still drags.
+
 Cursor *shapes* are M4: the arrow does not change over a resize band in
-M3.
+M3. The border's `resize_hint` colour is what stands in for them until
+they land — see above.
 
 ## Interaction
 
@@ -362,7 +408,9 @@ rather than on real hardware.
   the z-order are per *output*, and nothing in the model assumes there is
   only ever one set of them, so this is an addition rather than a rework.
 * **Cursor shapes.** The arrow stays an arrow over a resize band and a
-  title bar. M4, together with the cursor theme.
+  title bar. M4, together with the cursor theme. The band is not invisible
+  in the meantime — the frame border lights up in `resize_hint` while the
+  pointer is in it — but a shape at the pointer is still the right answer.
 * **Rotation.** Position, scale and the primary flag per connector are
   persistent since M4-C (`server.conf`, `docs/settings.md`); rotation is
   not, because nothing in the scene applies one yet.

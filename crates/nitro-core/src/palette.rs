@@ -184,6 +184,18 @@ roles! {
     Ansi14 = "ansi14",
     /// ANSI 15: bright white.
     Ansi15 = "ansi15",
+    /// The frame edge a window can be resized by, while the pointer is in
+    /// its grab band.
+    ///
+    /// The resize band is six logical pixels wide and the border it
+    /// straddles is one, so without something to see there is nothing to
+    /// tell a user where to press — they grab the visible border, miss by
+    /// three pixels, and conclude that resizing does not work (#3713).
+    /// Until cursor *shapes* land (M5) this highlight is the whole of the
+    /// affordance, which is why it is a role and not a tint of
+    /// `window_border_active`: it has to read clearly against both the
+    /// border colours *and* whatever is behind the window.
+    ResizeHint = "resize_hint",
 }
 
 impl Role {
@@ -255,9 +267,13 @@ impl Scheme {
 
 /// One colour per [`Role`].
 ///
-/// Cheap to clone (200 bytes), compared by value, and sent whole: a
-/// palette change is one wire message and one repaint, never a
-/// negotiation.
+/// Cheap to clone (four bytes a role, so ~200), compared by value, and
+/// sent whole: a palette change is one wire message and one repaint,
+/// never a negotiation.
+///
+/// The size is written as the arithmetic rather than as a number because
+/// the number moves: appending a role grows it by four bytes, and a stale
+/// literal here is the sort of comment that quietly stops being true.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Palette([Color; Role::COUNT]);
 
@@ -334,7 +350,7 @@ impl Palette {
             Accent, AccentActive, AccentHover, Ansi0, Ansi1, Ansi2, Ansi3, Ansi4, Ansi5, Ansi6,
             Ansi7, Ansi8, Ansi9, Ansi10, Ansi11, Ansi12, Ansi13, Ansi14, Ansi15, Border, Button,
             ButtonActive, ButtonDisabled, ButtonHover, ButtonText, Caret, Danger, DesktopBottom,
-            DesktopTop, Field, Focus, ModalBackground, Placeholder, Selection, Success,
+            DesktopTop, Field, Focus, ModalBackground, Placeholder, ResizeHint, Selection, Success,
             TerminalBackground, TerminalCursor, TerminalText, Text, TextDim, TextOnAccent,
             TitleBarActive, TitleBarInactive, TitleClose, TitleMaximize, TitleTextActive,
             TitleTextInactive, Track, Warning, WindowBackground, WindowBorderActive,
@@ -376,6 +392,10 @@ impl Palette {
         p.set(WindowBorderInactive, Color::rgb(0xc4, 0xc8, 0xd0));
         p.set(TitleClose, Color::rgb(0xd9, 0x5b, 0x4e));
         p.set(TitleMaximize, Color::rgb(0x62, 0xa8, 0x5c));
+        // The resize affordance: the accent, which is exactly the "this is
+        // the interesting thing" colour, and already contrasts with both
+        // window border colours.
+        p.set(ResizeHint, Color::rgb(0x0f, 0x5f, 0xbe));
         // Desktop.
         p.set(DesktopTop, Color::rgb(0xdc, 0xe3, 0xed));
         p.set(DesktopBottom, Color::rgb(0xbe, 0xc7, 0xd4));
@@ -414,7 +434,7 @@ impl Palette {
             Accent, AccentActive, AccentHover, Ansi0, Ansi1, Ansi2, Ansi3, Ansi4, Ansi5, Ansi6,
             Ansi7, Ansi8, Ansi9, Ansi10, Ansi11, Ansi12, Ansi13, Ansi14, Ansi15, Border, Button,
             ButtonActive, ButtonDisabled, ButtonHover, ButtonText, Caret, Danger, DesktopBottom,
-            DesktopTop, Field, Focus, ModalBackground, Placeholder, Selection, Success,
+            DesktopTop, Field, Focus, ModalBackground, Placeholder, ResizeHint, Selection, Success,
             TerminalBackground, TerminalCursor, TerminalText, Text, TextDim, TextOnAccent,
             TitleBarActive, TitleBarInactive, TitleClose, TitleMaximize, TitleTextActive,
             TitleTextInactive, Track, Warning, WindowBackground, WindowBorderActive,
@@ -456,6 +476,7 @@ impl Palette {
         p.set(WindowBorderInactive, Color::rgb(0x3a, 0x42, 0x4c));
         p.set(TitleClose, Color::rgb(0xd9, 0x5b, 0x4e));
         p.set(TitleMaximize, Color::rgb(0x62, 0xa8, 0x5c));
+        p.set(ResizeHint, Color::rgb(0x6c, 0xa8, 0xf0));
         p.set(DesktopTop, Color::rgb(0x2a, 0x30, 0x3c));
         p.set(DesktopBottom, Color::rgb(0x15, 0x18, 0x20));
         p.set(TerminalBackground, Color::rgb(0x14, 0x14, 0x18));
@@ -582,7 +603,11 @@ mod tests {
             );
         }
         assert_eq!(Role::COUNT, Role::ALL.len());
-        assert_eq!(Role::ALL.last(), Some(&Role::Ansi15));
+        // The *last* role, pinned so that an insertion in the middle — which
+        // would renumber every wire index after it — fails here rather than
+        // on somebody's screen. Appending updates this line, and that edit
+        // is the point: it is where you notice you are changing the wire.
+        assert_eq!(Role::ALL.last(), Some(&Role::ResizeHint));
     }
 
     #[test]

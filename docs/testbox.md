@@ -82,8 +82,23 @@ $ just box-session suspend    # systemctl suspend, via the session
   27 px high. Worse, small slow moves are **decelerated**: a single
   `mousemove -- -200` moved a dragged window 38 px.
 
-  So do not model the curve, **close the loop**: `deploy/pointer.py`
-  moves, looks at a screenshot, and corrects.
+  Better still, **do not use relative mode for placement at all**.
+  `ydotool mousemove -a` is absolute and the acceleration is not applied
+  to it, so one call lands on the pixel — with one trap worth writing
+  down, because it costs an hour to rediscover: on this box the absolute
+  device's coordinate space is **twice** the mode's, so
+
+  ```console
+  $ sudo YDOTOOL_SOCKET=/tmp/.ydotool_socket ydotool mousemove -a -x 550 -y 308
+  ```
+
+  lands the pointer at **(1100, 616)** on a 1920×1080 screen. Halve the
+  coordinate you want. `deploy/pointer.py calibrate` measures the factor
+  on a box that disagrees, and the script's `ABS_SCALE` is where it
+  lives.
+
+  `deploy/pointer.py` therefore places absolutely and only *checks* with
+  a screenshot; the closed loop below is the fallback, not the method.
 
   ```console
   $ python3 /tmp/pointer.py move 1100 617       # lands within 1 px, ~1.3 s
@@ -93,8 +108,15 @@ $ just box-session suspend    # systemctl suspend, via the session
   ```
 
   It works because the compositor draws a **software** cursor, so a
-  screenshot says where the pointer is. Two traps it records in its own
-  comments, both of which produced a confidently wrong answer first:
+  screenshot says where the pointer is. Three traps it records in its own
+  comments, all of which produced a confidently wrong answer first:
+  **the default scheme is now `light`**, so "a window is light pixels on
+  a dark desktop" finds the *wallpaper* — `window_origin()` is deprecated
+  for exactly that, and `drag` takes an optional app name so it can track
+  the window by `hey <app> get window bounds` instead. The cursor
+  locator, which looks for a dark arrow among the changed pixels, fails
+  the same way and now returns "trust the absolute placement" rather than
+  giving up. And:
   during a drag the "what changed between two frames" trick sees the
   *window* as well as the cursor, so a drag closes the loop on the
   window's origin; and a resize does not move the origin at all, so it

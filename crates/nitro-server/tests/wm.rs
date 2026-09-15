@@ -1611,3 +1611,223 @@ fn a_frame_costs_six_scene_nodes_and_a_fixed_window_five() {
     drop(c3);
     h.quit();
 }
+
+/// #3713: a **hidden** overlay swallowed every frame interaction.
+///
+/// Reported from the box as "I cannot move windows" right after a server
+/// restart, with the title-bar buttons dead too while content clicks
+/// still worked. That split is the whole diagnosis: a content click goes
+/// through `pointer.over`, which the scene's own hit test fills in and
+/// which honours node visibility; a title press, a button and a resize
+/// band all go through `frame_hit`, which walked the z-order skipping
+/// only `Minimized` windows and never asked whether the window was
+/// *showing*.
+///
+/// The launcher is exactly that window: a centred 600x400 `Overlay`
+/// created visible and hidden on the loop's first turn (`SetVisible`,
+/// not a state change), sitting in front of everything on the desktop.
+/// Every press on a window under it hit-tested to the invisible overlay's
+/// `Region::Content`, so the window manager saw a content hit and did
+/// nothing — `dragging` stayed 0. It "started working" later on the box
+/// because a real desktop eventually moves the window out from under the
+/// centred 600x400 rectangle.
+///
+/// On `8d31cc3` this fails at the first assertion with `dragging 0` and a
+/// frame that never moved.
+#[test]
+fn a_hidden_overlay_does_not_swallow_the_title_bar_under_it() {
+    let mut h = Harness::start("hidden-overlay", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("hidden-overlay");
+    let mut win = make_window(&mut conn, &mut inbox, 1, "under", WIN, RED, 0, 1);
+
+    // A launcher-shaped overlay: shell socket, `Overlay` layer, undecorated
+    // and NO_FOCUS, covering the middle of the screen — then hidden, the
+    // way the real launcher hides itself before its first frame.
+    let mut shell_inbox = Inbox::default();
+    let mut shell = h.shell("overlay");
+    let overlay_root = NodeId(11);
+    let overlay_rect = NodeId(12);
+    let overlay_size = Size::new(600.0, 400.0);
+    shell
+        .tx()
+        .create_window_with(
+            overlay_root,
+            "overlay",
+            overlay_size,
+            Layer::Overlay,
+            window_flags::UNDECORATED | window_flags::NO_FOCUS,
+        )
+        .create_rect(
+            overlay_rect,
+            overlay_root,
+            Rect::new(0.0, 0.0, overlay_size.w, overlay_size.h),
+        )
+        .fill_solid(overlay_rect, GREEN)
+        .commit(1)
+        .unwrap();
+    shell.flush().unwrap();
+    let _ = expect(&mut shell, &mut shell_inbox.0, "Configure", |m| match m {
+        ServerMsg::Configure(c) if c.window == overlay_root => Some(c.position),
+        _ => None,
+    });
+    shell.tx().visible(overlay_root, false).commit(2).unwrap();
+    shell.flush().unwrap();
+    h.settle();
+
+    // It really is off screen: the window under it is what you see.
+    let (cx, cy) = win.content();
+    assert_eq!(
+        rgb(h.shot().pixel(cx as u32, cy as u32)),
+        to_rgb(RED),
+        "the hidden overlay paints nothing"
+    );
+
+    // The title bar of the window *under* the hidden overlay still drags.
+    let before = win.frame(true);
+    let (bx, by) = win.title_bar();
+    h.point_at(bx, by, OUT);
+    h.settle();
+    h.button(BTN_LEFT, ButtonState::Pressed);
+    h.settle();
+    assert_eq!(
+        h.stat("dragging"),
+        1,
+        "a press on the title bar starts a drag even with a hidden overlay over it"
+    );
+    h.point_at(bx - 40.0, by + 30.0, OUT);
+    h.settle();
+    h.button(BTN_LEFT, ButtonState::Released);
+    h.settle();
+
+    refresh(&mut conn, &mut inbox, &mut win);
+    let after = win.frame(true);
+    assert_eq!(
+        (after.x - before.x, after.y - before.y),
+        (-40.0, 30.0),
+        "the window followed the pointer"
+    );
+
+    drop((conn, shell));
+    h.quit();
+}
+
+/// #3713's second half: the resize band is invisible, so nobody finds it.
+///
+/// The band straddles the frame edge and always did — six logical pixels
+/// out, and inwards as far as the frame's own border — so pressing *on*
+/// the border has always resized. What was missing was any way to know
+/// that: the border is one pixel wide and cursor shapes are M5, so the
+/// human on the box grabbed the border, saw nothing happen anywhere near
+/// it, and reported that resizing does not work.
+///
+/// So the border lights up in `resize_hint` while the pointer is
+/// somewhere a press would resize. This asserts both halves: the colour
+/// appears on hover and goes away again, and a press *on the lit border*
+/// really does resize.
+#[test]
+fn the_frame_edge_lights_up_where_a_press_would_resize_it() {
+    let mut h = Harness::start("resize-hint", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("resize-hint");
+    let mut win = make_window(&mut conn, &mut inbox, 1, "hint", WIN, RED, 0, 1);
+    park(&mut h);
+
+    // The left border: one pixel wide, and the pixel the user aims at when
+    // they mean "resize this". Sampled well above where the pointer will
+    // hover, because the software cursor is 24 px square and would paint
+    // over the very pixel under test — the whole edge lights up, so any
+    // point on it answers the question.
+    let f = win.frame(true);
+    let (ex, ey) = (f.x as u32, (f.y + wm::TITLE_H + 6.0) as u32);
+    // Inside the 1-px border, and low enough that the cursor drawn there
+    // cannot reach the sample point above.
+    let (hover_x, hover_y) = (f.x + 0.5, f.y + f.h - 8.0);
+    assert_eq!(
+        rgb(h.shot().pixel(ex, ey)),
+        to_rgb(role(Role::WindowBorderActive)),
+        "at rest the focused window's border is its focus colour"
+    );
+
+    // Hover the border itself — inside the window, not in the outward slop.
+    h.point_at(hover_x, hover_y, OUT);
+    h.settle();
+    assert_eq!(
+        rgb(h.shot().pixel(ex, ey)),
+        to_rgb(role(Role::ResizeHint)),
+        "the border says a press here would resize"
+    );
+
+    // And the affordance does not lie: pressing there starts a resize.
+    h.button(BTN_LEFT, ButtonState::Pressed);
+    h.settle();
+    assert_eq!(h.stat("dragging"), 1, "the lit border really is grabbable");
+    h.point_at(hover_x - 30.0, hover_y, OUT);
+    h.settle();
+    h.button(BTN_LEFT, ButtonState::Released);
+    h.settle();
+    await_configure(&mut conn, &mut inbox, &mut win, "the left-edge resize");
+    assert_eq!(
+        win.frame(true).w,
+        f.w + 30.0,
+        "a left-edge drag grew the window leftwards"
+    );
+
+    // Move away and the border goes back to its focus colour: the hint is
+    // a hover state, not a new look.
+    park(&mut h);
+    let f = win.frame(true);
+    let (ex, ey) = (f.x as u32, (f.y + wm::TITLE_H + 6.0) as u32);
+    assert_eq!(
+        rgb(h.shot().pixel(ex, ey)),
+        to_rgb(role(Role::WindowBorderActive)),
+        "the hint goes away with the pointer"
+    );
+
+    drop(conn);
+    h.quit();
+}
+
+/// A window that *cannot* be resized must not offer to be.
+///
+/// `hit_frame` gives a `FIXED_SIZE` window no bands at all, so there is
+/// nothing to advertise; lighting its border would be an affordance that
+/// does nothing, which is worse than none. The same rule covers a
+/// maximized window, whose geometry the window manager owns.
+#[test]
+fn a_fixed_size_window_never_lights_its_border() {
+    let mut h = Harness::start("hint-fixed", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("hint-fixed");
+    let win = make_window(
+        &mut conn,
+        &mut inbox,
+        1,
+        "fixed",
+        WIN,
+        RED,
+        window_flags::FIXED_SIZE,
+        1,
+    );
+    park(&mut h);
+
+    // Sampled clear of the pointer, which paints a 24 px cursor over
+    // whatever it hovers.
+    let f = win.frame(true);
+    let (ex, ey) = (f.x as u32, (f.y + wm::TITLE_H + 6.0) as u32);
+    h.point_at(f.x + 0.5, f.y + f.h - 8.0, OUT);
+    h.settle();
+    assert_eq!(
+        rgb(h.shot().pixel(ex, ey)),
+        to_rgb(role(Role::WindowBorderActive)),
+        "a fixed-size window's border promises nothing"
+    );
+    h.button(BTN_LEFT, ButtonState::Pressed);
+    h.settle();
+    assert_eq!(h.stat("dragging"), 0, "and there is nothing to grab");
+    h.button(BTN_LEFT, ButtonState::Released);
+    h.settle();
+
+    drop(conn);
+    h.quit();
+}
