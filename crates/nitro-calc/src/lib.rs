@@ -218,7 +218,24 @@ pub fn build(ui: &mut Ui<Calc>) -> WidgetId {
     ui.attach(root, display).unwrap();
 
     for line in KEYPAD {
-        let r = ui.build(row().gap(GAP).height(ROW_HEIGHT).width_percent(1.0));
+        // `shrink_to_zero` on the **row**, matching the `grow(1.0)` on the
+        // buttons inside it: this keypad is elastic by construction. The
+        // buttons divide whatever width there is, and `ROW_HEIGHT` is
+        // the height a comfortable tap target wants rather than the
+        // height its glyphs need — 44 px around an 18 px label. So a
+        // keypad squeezed into a short window is honestly a smaller
+        // keypad, which is what the toolkit's default floor (never
+        // smaller than measured; overflow and clip instead) assumes it
+        // is not. A row of text would keep the floor; a grid of tap
+        // targets gives it up, and the buttons follow the row because
+        // their height is a percentage of it.
+        let r = ui.build(
+            row()
+                .gap(GAP)
+                .height(ROW_HEIGHT)
+                .shrink_to_zero()
+                .width_percent(1.0),
+        );
         for (text, name, k) in line {
             if name.is_empty() {
                 continue;

@@ -15,7 +15,7 @@ use nitro_wire::types::{Align, BufferId};
 use crate::arena::Dirty;
 use crate::build::{Built, ContainerBuilder, IntoWidget, StyleBuilder};
 use crate::event::{Event, Handled, button, key};
-use crate::layout::{Constraints, CrossAlign, Direction, MainAlign};
+use crate::layout::{Constraints, CrossAlign, Direction, MainAlign, ShrinkFloor};
 use crate::theme::TextStyle;
 use crate::ui::{Ui, WidgetMut};
 use crate::widget::{Access, EventCx, LayoutCx, MeasureCx, PaintCx, Role, TextRun, Widget};
@@ -1604,6 +1604,13 @@ impl<S: 'static> IntoWidget<S> for TextFieldBuilder<S> {
 }
 
 /// An editable line of text, initially `text`.
+///
+/// Takes the [`ShrinkFloor::Zero`] floor: a field is a viewport over its
+/// own string — it scrolls horizontally to keep the caret visible — so
+/// a narrower field shows less of the text rather than smaller text.
+/// Its measured width is a default of twenty characters, for when
+/// nobody said otherwise, and is not a claim on the space. Use
+/// `min_width` for the narrowest field still worth typing into.
 #[must_use]
 pub fn text_field<S: 'static>(text: impl Into<String>) -> TextFieldBuilder<S> {
     let text = text.into();
@@ -1622,10 +1629,9 @@ pub fn text_field<S: 'static>(text: impl Into<String>) -> TextFieldBuilder<S> {
         scroll: 0.0,
         view_width: 0.0,
     };
-    TextFieldBuilder {
-        built: Built::new(Flex),
-        field,
-    }
+    let mut built = Built::new(Flex);
+    built.state_mut().style.shrink_floor = ShrinkFloor::Zero;
+    TextFieldBuilder { built, field }
 }
 
 // ---------------------------------------------------------------------
@@ -2285,6 +2291,13 @@ impl<S: 'static> IntoWidget<S> for SliderBuilder<S> {
 
 /// A horizontal slider at `value`, over `0.0..=1.0` unless `.range()`
 /// says otherwise.
+///
+/// Takes the [`ShrinkFloor::Zero`] floor: a slider has no content, and
+/// the size it measures to is a *default* for when nobody gave it one,
+/// not a statement about what it needs. A narrower track is still a
+/// track — the same drag, the same value — so a slider is the natural
+/// place for a crowded row's overflow to go. Give it a `min_width` to
+/// say how narrow is still draggable.
 #[must_use]
 pub fn slider<S: 'static>(value: f32) -> SliderBuilder<S> {
     let slider = Slider {
@@ -2296,10 +2309,9 @@ pub fn slider<S: 'static>(value: f32) -> SliderBuilder<S> {
         dragging: false,
         on_change: None,
     };
-    SliderBuilder {
-        built: Built::new(Flex),
-        slider,
-    }
+    let mut built = Built::new(Flex);
+    built.state_mut().style.shrink_floor = ShrinkFloor::Zero;
+    SliderBuilder { built, slider }
 }
 
 /// A number as the introspection protocol prints it: no trailing `.0`
@@ -2567,10 +2579,19 @@ impl<S: 'static> IntoWidget<S> for ScrollBuilder<S> {
 }
 
 /// A vertical scrolling viewport.
+///
+/// Opts out of the default content shrink floor
+/// ([`ShrinkFloor::Zero`]) for the reason [`list`](crate::list) does: a
+/// viewport given less room shows less of its child, which is an honest
+/// smaller version of itself. Its `measure` already takes the height it
+/// is offered rather than its content's, so the floor is what keeps the
+/// two answers consistent when the offer arrives as an overflow.
 #[must_use]
 pub fn scroll<S: 'static>() -> ScrollBuilder<S> {
+    let mut built = Built::new(Scroll::default());
+    built.state_mut().style.shrink_floor = ShrinkFloor::Zero;
     ScrollBuilder {
-        built: Built::new(Scroll::default()),
+        built,
         scroll: Scroll {
             offset: 0.0,
             content_height: 0.0,

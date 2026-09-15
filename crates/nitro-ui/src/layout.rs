@@ -91,6 +91,30 @@ pub enum CrossAlign {
     Stretch,
 }
 
+/// How small a child may be laid out along the main axis.
+///
+/// The default is [`ShrinkFloor::Content`]: a child never ends up
+/// smaller than the size it measured to. That is CSS's `min-size: auto`
+/// on a flex item, and it exists because most widgets have no smaller
+/// honest version of themselves — a label laid out below its measured
+/// height is painted with the full glyphs and loses its descenders,
+/// and a container laid out below its children's total renders them
+/// outside itself, on top of whatever comes next.
+///
+/// A widget that *is* honestly smaller than its content — a viewport
+/// over a scrolled or virtualised child, like
+/// [`List`](crate::List) and [`Scroll`](crate::widgets::Scroll) — says
+/// so with [`ShrinkFloor::Zero`], and then `flex_shrink` means what it
+/// means in CSS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShrinkFloor {
+    /// Never smaller than the measured size (`basis`). The default.
+    #[default]
+    Content,
+    /// May be shrunk to nothing; only an explicit `min_*` holds it up.
+    Zero,
+}
+
 /// An explicit, relative or automatic extent.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum Length {
@@ -239,7 +263,14 @@ pub struct LayoutStyle {
     pub flex_grow: f32,
     /// Share of a main-axis overflow this widget gives back, weighted by
     /// its measured main size (as CSS does it).
+    ///
+    /// It only divides the overflow between the children that *can*
+    /// shrink — the ones whose [`shrink_floor`](Self::shrink_floor) is
+    /// [`ShrinkFloor::Zero`], plus any whose explicit `min_*` still
+    /// leaves them room. `0.0` still means "never shrink at all".
     pub flex_shrink: f32,
+    /// How far below its measured size this widget may be laid out.
+    pub shrink_floor: ShrinkFloor,
 }
 
 impl Default for LayoutStyle {
@@ -259,6 +290,7 @@ impl Default for LayoutStyle {
             max_height: None,
             flex_grow: 0.0,
             flex_shrink: 1.0,
+            shrink_floor: ShrinkFloor::Content,
         }
     }
 }
@@ -401,6 +433,33 @@ fn gap_total(gap: f32, n: usize) -> f32 {
     if n > 1 { gap * (n - 1) as f32 } else { 0.0 }
 }
 
+/// The smallest main-axis size `it` may be laid out at.
+///
+/// The content floor is the item's own measured size — which, for a
+/// container, already sums its children, so "a column is never shorter
+/// than the rows inside it" needs no separate rule. An explicit `max_*`
+/// caps it (an author who asked for a cap meant it), and an explicit
+/// `min_*` larger than the content still wins, exactly as the final
+/// clamp has always made it.
+fn floor_main(it: &FlexItem, dir: Direction) -> f32 {
+    let (min, max) = match dir {
+        Direction::Row => (it.style.min_width, it.style.max_width),
+        Direction::Column => (it.style.min_height, it.style.max_height),
+    };
+    let content = match it.style.shrink_floor {
+        ShrinkFloor::Content => dir.main(it.basis),
+        ShrinkFloor::Zero => 0.0,
+    };
+    let content = match max {
+        Some(m) => content.min(m),
+        None => content,
+    };
+    match min {
+        Some(m) => m.max(content),
+        None => content,
+    }
+}
+
 /// Place `items` inside a container of `inner` **content-box** size.
 ///
 /// `inner` is what is left after the container's own padding, and the
@@ -415,6 +474,14 @@ fn gap_total(gap: f32, n: usize) -> f32 {
 /// free space is taken back weighted by `flex_shrink * basis`, then
 /// [`MainAlign`] places whatever is still left over and [`CrossAlign`]
 /// sizes and positions each child on the other axis.
+///
+/// The one place this departs from CSS's *defaults* rather than its
+/// arithmetic is the shrink floor: a child is never laid out below its
+/// own [`basis`](FlexItem::basis) unless it says it can
+/// ([`ShrinkFloor::Zero`]), which is CSS's `min-size: auto` by another
+/// name. An overflow no child will absorb is left as overflow — the
+/// children run past the container's end and the parent (or the window)
+/// clips them — rather than being squashed into text nobody can read.
 pub fn solve(container: &LayoutStyle, inner: Size, items: &[FlexItem], out: &mut Vec<Rect>) {
     out.clear();
     if items.is_empty() {
@@ -443,16 +510,29 @@ pub fn solve(container: &LayoutStyle, inner: Size, items: &[FlexItem], out: &mut
             free = 0.0;
         }
     } else if free < 0.0 {
+        // Only the children that *can* give something back are weighted,
+        // so a column of labels next to one scrollable child hands the
+        // whole deficit to the child that can honestly absorb it instead
+        // of taking a proportional bite out of every label first and
+        // clamping it back afterwards.
+        let floors: Vec<f32> = items.iter().map(|it| floor_main(it, dir)).collect();
         let weights: Vec<f32> = items
             .iter()
             .zip(&main)
-            .map(|(it, m)| it.style.flex_shrink.max(0.0) * m)
+            .zip(&floors)
+            .map(|((it, m), floor)| {
+                if *m > *floor {
+                    it.style.flex_shrink.max(0.0) * m
+                } else {
+                    0.0
+                }
+            })
             .collect();
         let total: f32 = weights.iter().sum();
         if total > 0.0 {
             let deficit = -free;
-            for ((m, w), _) in main.iter_mut().zip(&weights).zip(items) {
-                *m = (*m - deficit * w / total).max(0.0);
+            for ((m, w), floor) in main.iter_mut().zip(&weights).zip(&floors) {
+                *m = (*m - deficit * w / total).max(*floor);
             }
             free = 0.0;
         }
@@ -548,6 +628,19 @@ mod tests {
         FlexItem::new(LayoutStyle::default(), basis)
     }
 
+    /// An item that may be laid out smaller than it measured — what a
+    /// `List` or a `Scroll` is, and what every item was by default
+    /// before the content floor landed.
+    fn squashable(basis: Size) -> FlexItem {
+        FlexItem::new(
+            LayoutStyle {
+                shrink_floor: ShrinkFloor::Zero,
+                ..LayoutStyle::default()
+            },
+            basis,
+        )
+    }
+
     fn flexible(basis: Size, grow: f32) -> FlexItem {
         FlexItem::new(
             LayoutStyle {
@@ -614,7 +707,12 @@ mod tests {
     #[test]
     fn shrink_is_weighted_by_the_measured_size() {
         let style = column(0.0);
-        let items = [item(Size::new(10.0, 40.0)), item(Size::new(10.0, 20.0))];
+        // Both items opt out of the content floor: this is the CSS
+        // arithmetic, and the default floor is what stops it applying.
+        let items = [
+            squashable(Size::new(10.0, 40.0)),
+            squashable(Size::new(10.0, 20.0)),
+        ];
         let mut out = Vec::new();
         solve(&style, Size::new(50.0, 30.0), &items, &mut out);
         // 30 of overflow, weights 40:20 → 20 and 10 taken back.
@@ -627,16 +725,133 @@ mod tests {
     fn a_zero_shrink_child_keeps_its_size() {
         let fixed = LayoutStyle {
             flex_shrink: 0.0,
+            shrink_floor: ShrinkFloor::Zero,
             ..LayoutStyle::default()
         };
         let items = [
             FlexItem::new(fixed, Size::new(10.0, 40.0)),
-            item(Size::new(10.0, 20.0)),
+            squashable(Size::new(10.0, 20.0)),
         ];
         let mut out = Vec::new();
         solve(&column(0.0), Size::new(50.0, 50.0), &items, &mut out);
         assert_close!(out[0].h, 40.0);
         assert_close!(out[1].h, 10.0);
+    }
+
+    #[test]
+    fn the_content_floor_holds_an_item_at_its_basis() {
+        // A label beside a list, in a column 30 px short. The label
+        // keeps every pixel it measured and the list — which is
+        // honestly smaller when it is given less — takes the whole
+        // deficit, even though by CSS weights the label would have
+        // given back two thirds of it.
+        let label = item(Size::new(10.0, 40.0));
+        let list = squashable(Size::new(10.0, 60.0));
+        let items = [label, list];
+        let mut out = Vec::new();
+        solve(&column(0.0), Size::new(50.0, 70.0), &items, &mut out);
+        assert_close!(out[0].h, 40.0, "the label is not squashed");
+        assert_close!(out[1].h, 30.0, "the list absorbs all 30 of it");
+        assert_close!(out[1].y, 40.0);
+    }
+
+    #[test]
+    fn an_explicit_min_larger_than_the_basis_still_wins() {
+        // `min_height` above the measured size raises the floor; below
+        // it, the content floor is the higher of the two and holds.
+        let tall = LayoutStyle {
+            min_height: Some(50.0),
+            shrink_floor: ShrinkFloor::Zero,
+            ..LayoutStyle::default()
+        };
+        let small_min = LayoutStyle {
+            min_height: Some(5.0),
+            ..LayoutStyle::default()
+        };
+        let items = [
+            FlexItem::new(tall, Size::new(10.0, 20.0)),
+            FlexItem::new(small_min, Size::new(10.0, 20.0)),
+        ];
+        let mut out = Vec::new();
+        solve(&column(0.0), Size::new(50.0, 10.0), &items, &mut out);
+        assert_close!(out[0].h, 50.0, "the explicit min beats the basis");
+        assert_close!(out[1].h, 20.0, "the basis beats the smaller min");
+    }
+
+    #[test]
+    fn an_overflowing_column_runs_past_its_end_rather_than_squashing() {
+        // Three rows of 26 in a 60 px column: 78 wanted, 18 short. Every
+        // row keeps its height and the last one ends at 78 — outside the
+        // container, for the parent (or the window) to clip. Squashing
+        // would have made them 20 each and every glyph would have been
+        // painted into a box too small for it.
+        let items = [
+            item(Size::new(10.0, 26.0)),
+            item(Size::new(10.0, 26.0)),
+            item(Size::new(10.0, 26.0)),
+        ];
+        let mut out = Vec::new();
+        solve(&column(0.0), Size::new(50.0, 60.0), &items, &mut out);
+        for (i, r) in out.iter().enumerate() {
+            assert_close!(r.h, 26.0, "row {i} keeps its measured height");
+        }
+        assert_close!(out[2].y, 52.0);
+        assert_close!(out[2].bottom(), 78.0);
+        assert!(
+            out[2].bottom() > 60.0,
+            "the surplus is overflow, not a smaller row"
+        );
+        // And the rows do not overlap: each starts where the last ended.
+        assert_close!(out[1].y, out[0].bottom());
+        assert_close!(out[2].y, out[1].bottom());
+    }
+
+    #[test]
+    fn a_container_never_ends_before_the_children_it_holds() {
+        // The rule #561 asked to be confirmed rather than assumed. A
+        // container's basis is its own intrinsic size, which already sums
+        // its children — so giving it the content floor is all it takes
+        // for its children to stay inside it. Here: an inner column of
+        // three 26 px rows (intrinsic 78) as the second child of a root
+        // that is 40 px short. The inner column is laid out at 78 and
+        // the rows it re-solves at that height all fit inside.
+        let inner_style = column(0.0);
+        let rows = [
+            item(Size::new(10.0, 26.0)),
+            item(Size::new(10.0, 26.0)),
+            item(Size::new(10.0, 26.0)),
+        ];
+        let inner_basis = Size::new(
+            intrinsic_cross(&inner_style, &rows),
+            intrinsic_main(&inner_style, &rows),
+        );
+        assert_close!(inner_basis.h, 78.0);
+
+        let outer = [
+            item(Size::new(10.0, 20.0)),
+            FlexItem::new(inner_style.clone(), inner_basis),
+        ];
+        let mut out = Vec::new();
+        solve(&column(0.0), Size::new(50.0, 58.0), &outer, &mut out);
+        let column_rect = out[1];
+        assert_close!(column_rect.h, 78.0, "the column keeps its intrinsic height");
+
+        // Now solve the column's own children in the height it was given.
+        let mut inner_out = Vec::new();
+        solve(
+            &inner_style,
+            Size::new(column_rect.w, column_rect.h),
+            &rows,
+            &mut inner_out,
+        );
+        let last = inner_out[2];
+        assert_close!(last.bottom(), 78.0);
+        assert!(
+            last.bottom() <= column_rect.h + 1e-4,
+            "the last row ends at {} inside a column of {}",
+            last.bottom(),
+            column_rect.h
+        );
     }
 
     #[test]

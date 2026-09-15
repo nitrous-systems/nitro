@@ -66,7 +66,7 @@ use nitro_wire::types::Align;
 
 use crate::build::{Built, IntoWidget, StyleBuilder};
 use crate::event::{Event, Handled, button, key, mods};
-use crate::layout::Constraints;
+use crate::layout::{Constraints, ShrinkFloor};
 use crate::theme::TextStyle;
 use crate::ui::{Ui, WidgetMut};
 use crate::widget::{Access, EventCx, LayoutCx, MeasureCx, PaintCx, Role, Slot, TextRun, Widget};
@@ -1113,10 +1113,18 @@ impl<S: 'static> IntoWidget<S> for ListBuilder<S> {
 }
 
 /// A virtualised list of rows.
+///
+/// The one widget in this crate that is **not** the size of its content,
+/// so it is also the one that opts out of the default content shrink
+/// floor ([`ShrinkFloor::Zero`]): showing fewer rows is exactly what a
+/// list does when it is given less room, which is what virtualisation
+/// is for. Every other widget would rather overflow than be squashed.
 #[must_use]
 pub fn list<S: 'static>() -> ListBuilder<S> {
+    let mut built = Built::new(List::<S>::default());
+    built.state_mut().style.shrink_floor = ShrinkFloor::Zero;
     ListBuilder {
-        built: Built::new(List::<S>::default()),
+        built,
         list: List::default(),
     }
 }

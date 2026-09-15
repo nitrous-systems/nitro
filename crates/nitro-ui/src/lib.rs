@@ -108,6 +108,7 @@ pub use error::Error;
 pub use event::{Event, Handled, KeyEvent};
 pub use layout::{
     Constraints, CrossAlign, Direction, Edges, FlexItem, LayoutStyle, Length, MainAlign,
+    ShrinkFloor,
 };
 pub use list::{List, ListModel, Row, list};
 pub use nitro_core::{Color, Point, Rect, Size, Transform};

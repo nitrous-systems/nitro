@@ -1456,3 +1456,75 @@ fn a_widget_callback_changes_that_widget_by_deferring() {
     assert_eq!(h.widget::<Label>(target).text(), "nested");
     h.quit();
 }
+
+#[test]
+fn a_column_that_does_not_fit_clips_rather_than_squashing_its_labels() {
+    // Issue #561, at the level the user meets it: three labels in a
+    // window too short for them.
+    //
+    // Before the content shrink floor this was the *silent* bug — the
+    // solver handed the overflow back to all three weighted by size, the
+    // server painted each label's full glyphs into a box smaller than
+    // the text it had measured, and every number `hey list` reported was
+    // internally consistent. Run against the old solver these labels
+    // come back at 11.5/11.5/11.5 px against a measured 15.1, which is
+    // what clipped the descenders of "Displays" on the box.
+    //
+    // What the floor buys: every label keeps its measured height, the
+    // rows never overlap, and the surplus runs off the bottom for the
+    // window to clip.
+    let mut h = Harness::sized("floor", (), Size::new(200.0, 60.0), |ui: &mut Ui<()>| {
+        let root = ui.build(column().gap(6.0).padding(4.0));
+        for text in ["Displays", "Keyboard", "Appearance"] {
+            let l = ui.build(label(text).size(15.0).weight(600));
+            ui.attach(root, l).unwrap();
+        }
+        root
+    });
+    if !h.has_text() {
+        h.quit();
+        return;
+    }
+    let root = h.ui().root().unwrap();
+    let kids = h.ui().children(root);
+    assert_eq!(kids.len(), 3);
+
+    // The "want" is measured through the server's own font engine rather
+    // than written down, so this follows the theme and the font the box
+    // has rather than freezing today's metrics.
+    let style = nitro_ui::TextStyle {
+        weight: 600,
+        ..nitro_ui::TextStyle::new("sans", 15.0)
+    };
+    for id in &kids {
+        let text = h.widget::<Label>(*id).text().to_owned();
+        let want = h
+            .ui()
+            .measure_text(&text, &style, 0.0)
+            .expect("measure")
+            .height;
+        let got = h.bounds(*id).h;
+        assert!(
+            got >= want - 1e-3,
+            "{text:?} is laid out {got} tall but measures {want}"
+        );
+    }
+
+    // And they do not overlap: each starts at or after the one above it
+    // ended. This is the half that `min_height` on the leaves alone did
+    // not buy — the container used to be shrunk below the children it
+    // now refuses to shrink, and they rendered on top of each other.
+    for pair in kids.windows(2) {
+        let (a, b) = (h.bounds(pair[0]), h.bounds(pair[1]));
+        assert!(b.y >= a.bottom() - 1e-3, "rows overlap: {a:?} then {b:?}");
+    }
+
+    // The surplus is overflow, not squash: the tree is genuinely taller
+    // than the 60 px window, which is the outcome the floor chooses.
+    let last = h.bounds(kids[2]);
+    assert!(
+        last.bottom() > h.ui().window_size().h,
+        "the third label runs past the window: {last:?}"
+    );
+    h.quit();
+}

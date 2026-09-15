@@ -1097,8 +1097,10 @@ fn no_widget_is_laid_out_smaller_than_it_measures() {
     // 420 px of inner width, and with every child shrinking by weight the
     // captions lost 40 %. A caption is the one thing in a row that cannot
     // usefully be narrowed — a field degrades gracefully at any width, a
-    // six-letter word does not — so captions are `shrink(0.0)` and the
-    // fields absorb the deficit.
+    // six-letter word does not. Since #561 that is the toolkit's default
+    // rather than a `shrink(0.0)` this app spells: a caption keeps what
+    // it measured, and the fields, which say they are viewports over
+    // their own text, absorb the deficit.
     for (path, caption) in [
         ("keyboard/container[0]/label[0]", "Layout"),
         ("keyboard/container[0]/label[1]", "Variant"),
@@ -1219,13 +1221,16 @@ fn two_outputs_fit_the_window_and_a_third_clips_rather_than_overlaps() {
     //    docs two files away said two outputs fit.
     //
     // 2. Past whatever the constant holds, the overflow must **clip**,
-    //    not overlap. That is not automatic: the rows carry
+    //    not overlap. That used not to be automatic: the rows carry
     //    `min_height(ROW_HEIGHT)`, but the `displays` column holding them
     //    had the default `flex_shrink` of 1, so on overflow the column
     //    was laid out shorter than its own rows and the last row was
     //    drawn over `displays_note` — 0.8 px at two outputs, 15.6 px at
-    //    three. A window that ends early is a window; one that writes a
-    //    row on top of a sentence is a bug report.
+    //    three. Since #561 a container's measured size is its own floor
+    //    and already sums its children, so the column cannot end before
+    //    its rows and this test passes unchanged across that move. A
+    //    window that ends early is a window; one that writes a row on
+    //    top of a sentence is a bug report.
     //
     // The rows arrive as real `Output` events from real hotplugs, not as
     // invented `OutputInfo`s: the point of the harness is that they come
@@ -1264,8 +1269,8 @@ fn two_outputs_fit_the_window_and_a_third_clips_rather_than_overlaps() {
 
     // The mode label keeps the width its longer string measures: a
     // hotplugged 2560×1440 makes the longest mode string the dialog can
-    // show (135.6 px against the harness output's 119.1), and a row whose
-    // parts are all `shrink(0)` has no give left, so a `WINDOW_SIZE.w`
+    // show (135.6 px against the harness output's 119.1), and the only
+    // child of this row with any give is the slider, so a `WINDOW_SIZE.w`
     // chosen for the narrow case would overflow right here.
     let mode_id = named(&mut h, "displays/Virtual-2/mode");
     let mode = h.ui().window_bounds(mode_id);
@@ -1335,8 +1340,8 @@ fn two_outputs_fit_the_window_and_a_third_clips_rather_than_overlaps() {
     assert!(
         column.y + column.h <= note.y + 0.01,
         "the displays column ends at {} and the note starts at {}: they \
-         overlap by {}, which is the failure `shrink(0.0)` on the column \
-         exists to prevent",
+         overlap by {}, which is the failure the toolkit's content \
+         shrink floor exists to prevent",
         column.y + column.h,
         note.y,
         column.y + column.h - note.y,

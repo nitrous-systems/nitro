@@ -287,21 +287,25 @@ section headings at 11.8 px instead of 17.5, which cut the descenders off
 
 Every widget *measured* correctly throughout; each was then laid out
 smaller than it measured, which is why eighteen passing tests never saw
-it. Three things stop it recurring:
+it. Two things stop it recurring, and the first is no longer this app's
+doing:
 
-- Anything with no smaller honest version is `shrink(0.0)` — headings,
-  captions, notes, and every part of a display row except the slider,
-  which is the one control that reads correctly at any width and so
-  absorbs the whole deficit. Control rows also carry a `min_height`,
-  because an explicit `height` is folded into the constraints a child is
-  *measured* with and the solver shrinks it afterwards anyway.
-- The `displays` and `keyboard` **columns** are `shrink(0.0)` too. A
-  container of `min_height` rows that can itself be shrunk is laid out
-  shorter than the rows inside it, and the last row is then drawn over
-  whatever follows — 0.8 px of overlap with two outputs, 15.6 px with
-  three, on top of `displays_note`. Overlap is a worse failure than
-  clipping: it corrupts a line the user is still reading instead of
-  ending the window early.
+- **The toolkit makes a widget's measured size its floor** (#561). A
+  child is never laid out below what it measured unless it says it can,
+  and a container's measured size already sums its children — so a
+  column cannot end before the rows inside it either. This dialog used
+  to spell both halves itself: `shrink(0.0)` on the headings, captions,
+  notes and most of a display row, *and* on the `displays` and
+  `keyboard` columns, because a container of `min_height` rows that
+  could itself be shrunk was laid out shorter than the rows inside it
+  and drew the last one over `displays_note` — 0.8 px of overlap with
+  two outputs, 15.6 px with three. Those calls are gone; the behaviour
+  is the default. What is left is the small print the floor does not
+  cover: the slider is the one control that reads correctly at any
+  width (the toolkit gives it the `Zero` floor, and this app gives it a
+  `min_width`), and the `x`/`y` position fields spell `shrink(0.0)`
+  because a text field opts out too and a box too narrow for "1920" is
+  not a smaller version of itself.
 - The dialog declares 560×440 as the window's **minimum** via
   `SetWindowLimits`, so the server refuses a drag that would put the tree
   back into less space than it needs. There is no maximum.

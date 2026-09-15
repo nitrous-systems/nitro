@@ -40,14 +40,15 @@
 //! is why it survived eighteen passing tests and was found by looking at
 //! the screen.
 //!
-//! Two rules keep it fixed, and the second is easy to miss: anything
-//! with no smaller honest version is `shrink(0.0)` ([`control_row`],
-//! [`heading`], [`note`], [`caption`]), **and so are the `displays` and
-//! `keyboard` columns** — a container of `min_height` rows that can
-//! itself be shrunk ends up shorter than the rows inside it, and draws
-//! the last one over whatever follows. `no_widget_is_laid_out_smaller_than_it_measures`
+//! Two rules used to keep it fixed, and both are now the toolkit's job
+//! (#561): a child is never laid out below the size it measured unless
+//! it says it can, and a container's measured size already sums its
+//! children, so a column cannot end before the rows inside it. What was
+//! `shrink(0.0)` on the headings, notes, captions and on the `displays`
+//! and `keyboard` columns is now the default, and this file no longer
+//! spells it. `no_widget_is_laid_out_smaller_than_it_measures`
 //! and `two_outputs_fit_the_window_and_a_third_clips_rather_than_overlaps`
-//! in `tests/settings.rs` pin both.
+//! in `tests/settings.rs` pin both, unchanged across that move.
 //!
 //! # Driving it with `hey`
 //!
@@ -204,14 +205,16 @@ pub const APP_NAME: &str = "nitro-settings";
 /// client-initiated resize op that does not exist and that this task is
 /// not the place to add.
 ///
-/// Past that point the degradation is **clipping, not overlap**, and that
-/// took a second fix: the `displays` and `keyboard` sub-columns kept the
-/// default `shrink(1.0)` while the rows inside them carry `min_height`,
-/// so a column was laid out shorter than the rows it contained and the
-/// last row was drawn over `displays_note` — 0.8 px of overlap at two
-/// outputs, 15.6 px at three. They are `shrink(0.0)` too, so a column is
-/// never smaller than its own rows and the tree runs off the bottom edge
-/// honestly instead of writing on top of itself.
+/// Past that point the degradation is **clipping, not overlap** — and
+/// since #561 that is the toolkit's guarantee rather than this file's
+/// care. A child is never laid out below what it measured, and a
+/// container's measured size already sums its children, so a column
+/// cannot end before the rows inside it. Before that landed, the
+/// `displays` and `keyboard` sub-columns needed an explicit
+/// `shrink(0.0)` for exactly this: without it a column was laid out
+/// shorter than the rows it contained and the last row was drawn over
+/// `displays_note` — 0.8 px of overlap at two outputs, 15.6 px at
+/// three.
 pub const WINDOW_SIZE: Size = Size::new(560.0, 440.0);
 
 /// The "surface" an **ordinary** window is.
@@ -601,41 +604,21 @@ pub fn build(ui: &mut Ui<Settings>) -> WidgetId {
     // file, on the first turn of the loop — `build` has no state to put
     // them in and no answer from the connection yet.
     //
-    // `shrink(0.0)` on the **column**, not just on the rows inside it.
-    // A `control_row` carries `min_height(ROW_HEIGHT)`, which the flex
-    // solver's final clamp honours — but the column holding those rows
-    // had the default `flex_shrink` of 1, so when the root ran out of
-    // height the column was laid out *shorter than the rows it contains*
-    // and the last row was drawn on top of `displays_note`: 0.8 px of
-    // overlap with two outputs, 15.6 px with three. Overlap is a worse
-    // failure than clipping, because it corrupts a line the user is
-    // still reading rather than just ending the window early. With this,
-    // a column is never smaller than its own rows and the surplus runs
-    // off the bottom edge instead.
-    let displays = ui.build(
-        column()
-            .name(names::DISPLAYS)
-            .gap(GAP)
-            .width_percent(1.0)
-            .shrink(0.0),
-    );
+    // No `shrink(0.0)` here any more: since #561 a container's measured
+    // size is its floor, and a container's measured size already sums
+    // its children — so a column cannot be laid out shorter than the
+    // rows it holds. It used to be able to, and the last row was drawn
+    // on top of `displays_note`: 0.8 px of overlap with two outputs,
+    // 15.6 px with three.
+    let displays = ui.build(column().name(names::DISPLAYS).gap(GAP).width_percent(1.0));
     let displays_note = ui.build(note(NOTE_LIVE).name(names::DISPLAYS_NOTE));
 
     // -- keyboard ------------------------------------------------------
-    //
-    // `shrink(0.0)` on the column for the reason `displays` has it: a
-    // container of `min_height` rows must not be shrunk below them.
     let layout = ui.build(field(names::LAYOUT, "us").grow(1.0));
     let variant = ui.build(field(names::VARIANT, "nodeadkeys").grow(1.0));
     let options = ui.build(field(names::OPTIONS, "ctrl:nocaps").grow(1.0));
     let test = ui.build(field(names::TEST, "type here after Apply").grow(1.0));
-    let keyboard = ui.build(
-        column()
-            .name(names::KEYBOARD)
-            .gap(GAP)
-            .width_percent(1.0)
-            .shrink(0.0),
-    );
+    let keyboard = ui.build(column().name(names::KEYBOARD).gap(GAP).width_percent(1.0));
     let kb_row = ui.build(control_row());
     for (caption_text, id) in [
         ("Layout", layout),
@@ -810,15 +793,18 @@ pub fn build(ui: &mut Ui<Settings>) -> WidgetId {
 
 /// A row of controls: the shape every labelled line in this dialog has.
 ///
-/// `height(ROW_HEIGHT)` alone does **not** make a row `ROW_HEIGHT` tall.
-/// An explicit length is folded into the constraints a child is
-/// *measured* with, and the flex solver then takes a container's overflow
-/// back out of its children weighted by `flex_shrink` — after which it
-/// clamps only to `min_height`/`max_height`. So a root column with more
+/// `height(ROW_HEIGHT)` is now enough on its own. It used **not** to be:
+/// an explicit length is folded into the constraints a child is
+/// *measured* with, and the flex solver then took a container's overflow
+/// back out of its children weighted by `flex_shrink`, clamping only to
+/// `min_height`/`max_height` afterwards — so a root column with more
 /// tree than window squashed every row to 17.5 px while each one went on
-/// reporting that it had asked for 26. The `min_height` is what survives
-/// that second pass, and it is why `every_row_is_exactly_row_height` can
-/// assert an equality rather than a tolerance.
+/// reporting that it had asked for 26. Since #561 the measured size is
+/// itself the floor, so the row keeps the 26 it asked for. The
+/// `min_height` stays because it is what a row that ends up in a
+/// `Zero`-floor container would still be held up by, and it is why
+/// `every_row_is_exactly_row_height` can assert an equality rather than
+/// a tolerance.
 fn control_row() -> FlexBuilder<Settings> {
     row()
         .gap(GAP)
@@ -830,31 +816,27 @@ fn control_row() -> FlexBuilder<Settings> {
 
 /// A section heading.
 ///
-/// `shrink(0.0)` for the reason [`control_row`] carries a `min_height`: a
-/// heading is one line of text at a fixed size, so there is no smaller
-/// honest version of it. Letting the root column reclaim its overflow
-/// here cost the headings their descenders — 17.5 px of measured text
-/// laid out in 11.8 — which is what "Displays" with no tail on the `p`
-/// looked like on the box.
+/// A heading is one line of text at a fixed size, so there is no smaller
+/// honest version of it — and since #561 that is the toolkit's default
+/// rather than something this file asks for. Letting the root column
+/// reclaim its overflow here cost the headings their descenders: 17.5 px
+/// of measured text laid out in 11.8, which is what "Displays" with no
+/// tail on the `p` looked like on the box.
 fn heading(text: &str) -> LabelBuilder<Settings> {
     label(text)
         .size(HEADING_SIZE)
         .weight(600)
-        .shrink(0.0)
         .color_role(ColorRole::Text)
 }
 
 /// A line of explanatory text under a section.
 ///
-/// Wrapped, so its height depends on the width it is given — and
-/// `shrink(0.0)` so the height it computes is the height it gets. Without
-/// it the two-line notes were laid out in 20 px of a measured 30 and the
-/// second line was sliced through the middle.
+/// Wrapped, so its height depends on the width it is given — and the
+/// height it computes is the height it gets. Before #561 the two-line
+/// notes were laid out in 20 px of a measured 30 and the second line was
+/// sliced through the middle.
 fn note(text: &str) -> LabelBuilder<Settings> {
-    label(text)
-        .size(TEXT_SIZE)
-        .shrink(0.0)
-        .color_role(ColorRole::TextDim)
+    label(text).size(TEXT_SIZE).color_role(ColorRole::TextDim)
 }
 
 /// A label in front of a control.
@@ -862,18 +844,16 @@ fn note(text: &str) -> LabelBuilder<Settings> {
 /// Deliberately **unnamed**: it is furniture, and naming it would put a
 /// second `layout` in the keyboard row for `hey` to be ambiguous about.
 ///
-/// `shrink(0.0)` because a caption is the one thing in a row that cannot
-/// usefully be narrowed: the fields beside it degrade gracefully at any
-/// width, a six-letter word does not. The keyboard row wants 683 px of
-/// its three captions and three fields and gets 540, and with every child
-/// shrinking by weight the captions lost 40 % of their width — "Layout"
-/// in 26 px reads "Layc". Now the overflow comes out of the fields, which
-/// is where it belongs.
+/// A caption is the one thing in a row that cannot usefully be narrowed:
+/// the fields beside it degrade gracefully at any width, a six-letter
+/// word does not. The keyboard row wants 683 px of its three captions
+/// and three fields and gets 540; with every child shrinking by weight
+/// the captions lost 40 % of their width and "Layout" in 26 px read
+/// "Layc". The overflow now comes out of the fields, which say they are
+/// viewports over their own text, and the caption keeps what it
+/// measured without asking.
 fn caption(text: &str) -> LabelBuilder<Settings> {
-    label(text)
-        .size(TEXT_SIZE)
-        .shrink(0.0)
-        .color_role(ColorRole::TextDim)
+    label(text).size(TEXT_SIZE).color_role(ColorRole::TextDim)
 }
 
 /// A named text field with a placeholder.
@@ -1091,23 +1071,24 @@ fn add_row(
         })
     });
 
-    // Everything in a display row except the slider is `shrink(0.0)`.
+    // Nothing in a display row spells `shrink(0.0)` any more: since #561
+    // a widget's measured size is its own floor, and the slider is the
+    // one control here that says otherwise (`slider()` takes the `Zero`
+    // floor, because a narrower track is still a track and its value is
+    // in the label beside it). So the overflow lands on the slider by
+    // construction rather than by seven opt-outs.
     //
     // A row is a flex container and its natural width exceeds the
     // window's on a long connector name or a long mode string, so
-    // something has to give. With the default `flex_shrink` of 1 the
-    // overflow came out of all seven children weighted by size, which is
-    // how the `y` field ended at x=452 in a 440-wide window and how the
-    // mode string lost its refresh rate. A slider is the one control here
-    // whose *only* job is to be dragged — it reads correctly at any width
-    // down to its `min_width`, and its value is shown by the label beside
-    // it — so it absorbs the whole deficit and the rest of the row keeps
-    // the width it measured.
+    // something has to give. With the old default — every child shrinking
+    // by weight — the `y` field ended at x=452 in a 440-wide window and
+    // the mode string lost its refresh rate. The `min_width`s stay: they
+    // are what a *shorter* string than today's would still reserve, and
+    // the slider's is what says how narrow is still draggable.
     let name_label = ui.build(
         label(connector)
             .name(names::OUTPUT_NAME)
             .size(TEXT_SIZE)
-            .shrink(0.0)
             .min_width(76.0),
     );
     let mode_label = ui.build(
@@ -1115,14 +1096,12 @@ fn add_row(
             .name(names::OUTPUT_MODE)
             .size(TEXT_SIZE)
             .color_role(ColorRole::TextDim)
-            .shrink(0.0)
             .min_width(96.0),
     );
     let scale_value = ui.build(
         label(conf::format_scale(scale))
             .name(names::SCALE_VALUE)
             .size(TEXT_SIZE)
-            .shrink(0.0)
             .width(30.0),
     );
     let scale_slider = ui.build(
@@ -1145,13 +1124,19 @@ fn add_row(
         checkbox("primary")
             .name(names::PRIMARY)
             .checked(saved.is_some_and(|o| o.primary))
-            .shrink(0.0)
             .on_toggle(move |s: &mut Settings, ui: &mut Ui<Settings>, on: bool| {
                 if on {
                     make_primary(s, ui, &mine);
                 }
             }),
     );
+    // The two position fields hold three or four digits, so they take an
+    // explicit width rather than the field default of twenty characters.
+    // `shrink(0.0)` is still spelled out here because a field is one of
+    // the few widgets that *does* opt out of the content floor (it is a
+    // viewport over its own text), so without it these two would be the
+    // first thing a crowded row narrowed — and a position box too narrow
+    // for "1920" is not a smaller version of itself.
     let x = ui.build(field(names::POS_X, "x").width(POS_WIDTH).shrink(0.0));
     let y = ui.build(field(names::POS_Y, "y").width(POS_WIDTH).shrink(0.0));
     if let Some((px, py)) = position {

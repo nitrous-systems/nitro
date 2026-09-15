@@ -8,7 +8,7 @@
 //! behaves like a retained one.
 
 use crate::arena::WidgetState;
-use crate::layout::{CrossAlign, Direction, Edges, Length, MainAlign};
+use crate::layout::{CrossAlign, Direction, Edges, Length, MainAlign, ShrinkFloor};
 use crate::widget::AnyWidget;
 
 /// A widget plus its framework state and children, ready to be inserted.
@@ -157,9 +157,31 @@ pub trait StyleBuilder<S>: Sized {
     }
 
     /// Share of the parent's main-axis overflow this widget gives back.
+    ///
+    /// It divides an overflow only between the children that *may* be
+    /// laid out smaller than they measured — see
+    /// [`shrink_to_zero`](Self::shrink_to_zero), which is what says so.
+    /// By default nothing may be, so by default this weighting never
+    /// comes up. `0.0` means "never shrink", and still does.
     #[must_use]
     fn shrink(mut self, v: f32) -> Self {
         self.built_mut().state.style.flex_shrink = v;
+        self
+    }
+
+    /// Allow this widget to be laid out smaller than it measured.
+    ///
+    /// The default floor is the widget's own measured size: a container
+    /// with more content than room overflows (and is clipped) rather
+    /// than squashing its children, because most widgets — a line of
+    /// text above all — have no smaller honest version. Say this on a
+    /// widget that does: a viewport over a scrolled or virtualised
+    /// child, which shows less of its content rather than a smaller
+    /// version of it. [`list`](crate::list) and
+    /// [`scroll`](crate::widgets::scroll) already say it for you.
+    #[must_use]
+    fn shrink_to_zero(mut self) -> Self {
+        self.built_mut().state.style.shrink_floor = ShrinkFloor::Zero;
         self
     }
 

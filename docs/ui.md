@@ -437,18 +437,43 @@ model has unit tests that need no server (`solve`, `intrinsic_main`,
 `LayoutStyle` carries `direction` (Row/Column), `main_align`
 (Start/Center/End/SpaceBetween), `cross_align`
 (Start/Center/End/Stretch), `gap`, `padding`, `margin`, `width`/`height`
-as `Length` (Auto/Px/Percent), `min_`/`max_` on both axes, `flex_grow`
-and `flex_shrink`.
+as `Length` (Auto/Px/Percent), `min_`/`max_` on both axes, `flex_grow`,
+`flex_shrink` and `shrink_floor`.
 
 Two passes, as CSS does it: measure every child at its intrinsic size,
 divide positive free space by `flex_grow`, take negative free space back
 weighted by `flex_shrink × basis`, then `MainAlign` places whatever is
 still left over and `CrossAlign` sizes and positions on the other axis.
 
+**A child never shrinks below what it measured unless it says it can.**
+That is `shrink_floor`, whose default is `Content` — CSS's `min-size:
+auto` on a flex item — and it is the one place the model departs from
+CSS's defaults rather than its arithmetic. A container with more content
+than room therefore *overflows*: the children run past its end and the
+parent, or the window, clips them. It does not squash them, because most
+widgets have no smaller honest version of themselves: a label laid out
+below its measured height is still painted with the full glyphs and
+loses its descenders, and a column laid out below its children's total
+draws its last row over whatever follows. Overflow ends the window
+early; squashing corrupts a line the user is still reading. Because a
+container's basis is its own measured size, which already sums its
+children, the container rule falls out of the child rule for free.
+
+The opt-out is `.shrink_to_zero()`, for a widget that is honestly
+smaller when it is given less room: a viewport over a scrolled or
+virtualised child. `List` takes it — showing fewer rows is what
+virtualisation is *for* — and so do `Scroll`, `TextField` (a viewport
+over its own string) and `Slider` (whose measured size is a default, not
+a claim; give it a `min_width` for the narrowest still-draggable track).
+`flex_shrink` keeps its meaning and now only divides an overflow between
+the children that may take it; `.shrink(0.0)` still means "never shrink
+at all".
+
 What it does **not** do: wrapping, `order`, baseline alignment, and the
 iteration CSS performs when a min/max clamp puts free space back on the
-table (we clamp once and accept the second-order error). `Adaptive` and
-breakpoints are M3.
+table (we clamp once and accept the second-order error). An overflow no
+child will absorb is left as overflow rather than iterated on. `Adaptive`
+and breakpoints are M3.
 
 ## Text measurement is synchronous, and that is an M2 choice
 
@@ -1104,7 +1129,9 @@ regrets:
   inside a widget.
 * **The flex solver clamps min/max once** rather than iterating as CSS
   does, so a child whose clamp releases free space does not give it back
-  to its siblings.
+  to its siblings. An overflow that no child will absorb — the usual
+  case now that `shrink_floor` defaults to `Content` — is likewise left
+  as overflow rather than iterated on.
 * **No pointer grab.** A press followed by a release outside the widget
   is not routed back to it, so `Button` drops its pressed state on
   `PointerLeave` instead. A real grab is a server-side concept and M3.

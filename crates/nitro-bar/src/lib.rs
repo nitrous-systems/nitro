@@ -472,7 +472,36 @@ pub fn build(ui: &mut Ui<Bar>) -> WidgetId {
                 s.launcher_presses += 1;
             }),
     );
-    let windows = ui.build(row().name(names::WINDOWS).gap(GAP).height_percent(1.0));
+    // `shrink_to_zero` on the window-list **row**, and nowhere else in
+    // this file.
+    //
+    // Every other section of the bar is a fixed string that must keep
+    // the width it measured — which is the toolkit's default since #561,
+    // and is why the clock and the sensor labels need no opt-out here.
+    // The window list is the one part whose content is unbounded: each
+    // button is already elided to `MAX_LABEL_CHARS` and capped at
+    // `MAX_BUTTON_W`, but twelve of them on a 1920 bar want 12 × 180 +
+    // 11 × 6 = 2226 px of a 1904 px strip, and the count has no ceiling
+    // at all.
+    //
+    // Measured on the harness at 12 windows: with the content floor the
+    // row is laid out at its intrinsic 2226-ish and pushes the clock,
+    // battery, load and memory clean off the end of the bar — the clock
+    // that is supposed to be centred *on the bar* lands past its right
+    // edge. That is worse than the alternative, because the sections it
+    // displaces are the ones the user did not open and cannot close.
+    // So this row keeps the old elastic behaviour: the buttons divide
+    // whatever is left over, exactly as they did before, and a title too
+    // narrow to read is the honest signal that there are too many
+    // windows for the bar. The `max_width` cap on each button is what
+    // keeps that from being the *usual* case.
+    let windows = ui.build(
+        row()
+            .name(names::WINDOWS)
+            .gap(GAP)
+            .shrink_to_zero()
+            .height_percent(1.0),
+    );
 
     // -- centre: the clock --------------------------------------------
     let clock_id = ui.build(
@@ -641,6 +670,16 @@ fn upsert(s: &mut Bar, ui: &mut Ui<Bar>, ids: Ids, info: &WindowInfo) {
             .name(entry_name(window))
             .size(TEXT_SIZE)
             .max_width(MAX_BUTTON_W)
+            // The buttons shrink with their row, for the reason the row
+            // does (see `build`): the window list is the one part of the
+            // bar whose content has no ceiling, and a squeezed title is
+            // a better failure than a button drawn over the clock. A
+            // `Zero` floor on the row alone would not do it — the row
+            // would be narrowed and its children would then overflow
+            // *it* — which is the container-versus-child pair #561 is
+            // about, read in the one direction where the child really is
+            // the elastic one.
+            .shrink_to_zero()
             .height_percent(1.0)
             .on_click(move |_s: &mut Bar, ui: &mut Ui<Bar>| {
                 // Silently refused by the server when it cannot be
