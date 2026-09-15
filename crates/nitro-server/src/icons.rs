@@ -365,6 +365,19 @@ impl IconEngine {
         !self.theme.is_empty()
     }
 
+    /// The size in bytes of the cached tile for `(icon, px)`, decoding it
+    /// if this is its first use, or `None` when it will not decode.
+    ///
+    /// The corpus test's window onto the cache. It is a length rather
+    /// than the pixels because the pixels are whatever the distribution
+    /// shipped and there is nothing to assert about them — what the paint
+    /// path depends on is that the tile is exactly `px × px × 4`, whatever
+    /// the source file's dimensions were, because that is what keeps the
+    /// blit on its one-to-one fast path.
+    pub fn app_tile_len(&mut self, icon: u32, px: u32) -> Option<usize> {
+        self.app_tile(icon, px).map(|e| e.data.len())
+    }
+
     /// Draw icon `icon` into `canvas`, clipped to `clip`.
     ///
     /// `origin` is the icon box's top-left corner in the node's local
