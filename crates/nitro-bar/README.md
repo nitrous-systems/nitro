@@ -5,9 +5,9 @@ The desktop's **top bar**, and the first program written against the
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────┐
-│ ☰  ▸ Calculator │ hello-dialog      09:41        87%+  0.4   1.2/3.3G  │
+│ ≣  ▸ Calculator │ hello-dialog    09:41      87%+  ⚙ 0.4  ▤ 1.2/3.3G │
 └────────────────────────────────────────────────────────────────────────┘
-  launcher   ─── window list ───      clock       battery load  memory
+  launcher   ─── window list ───    clock     battery  load    memory
 ```
 
 It is a `nitro-ui` app like any other — a state struct, a tree built

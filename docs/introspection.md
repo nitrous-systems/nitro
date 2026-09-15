@@ -255,7 +255,7 @@ line each:
 | prop | meaning |
 |---|---|
 | `path` | the widget's own path |
-| `role` | `button`, `label`, `textfield`, `checkbox`, `scroll`, `slider`, `separator`, `image`, `container`, `spacer`, `other` |
+| `role` | `button`, `label`, `textfield`, `checkbox`, `scroll`, `list`, `slider`, `terminal`, `separator`, `image`, `icon`, `container`, `spacer`, `other` |
 | `name` | addressing/accessible name, or `-` |
 | `value` | the widget's value as text, or `-` |
 | `text` | `value` for widgets whose value *is* their text (label, button, text field) |

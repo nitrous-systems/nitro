@@ -576,16 +576,43 @@ impl<S: 'static> Button<S> {
     }
 }
 
+impl<S: 'static> Button<S> {
+    /// Whether this button draws its icon rather than its label.
+    ///
+    /// Both halves of the question in one place, because **`measure` and
+    /// `paint` must never disagree about it**: an icon box is a square
+    /// and a label box is not, so a button that measured one and painted
+    /// the other would reserve the wrong space. Without
+    /// [`caps::ICONS`](nitro_wire::types::caps::ICONS) the answer is
+    /// `false` and the button falls back to its text.
+    fn shows_icon(&self, has_icons: bool) -> bool {
+        has_icons && self.icon.is_some()
+    }
+
+    /// The icon's square side, in logical pixels.
+    ///
+    /// Free-standing rather than a method: it is a fact about the style
+    /// and the grid, not about this button.
+    fn icon_side(style: &TextStyle) -> f32 {
+        style.size_px.max(crate::widgets::ICON_SIZE)
+    }
+}
+
 impl<S: 'static> Widget<S> for Button<S> {
     fn measure(&mut self, cx: &mut MeasureCx<'_, S>, constraints: Constraints) -> Size {
+        let has_icons = cx.has_icons();
         let theme = cx.theme();
         let (px, py) = theme.button_padding;
         let style = self.resolved_style(theme);
         // An icon button measures to the icon's square box plus the same
         // padding a label gets, and costs **no round trip** — which is
         // the whole reason icons are square by contract.
-        if self.icon.is_some() {
-            let side = style.size_px.max(crate::widgets::ICON_SIZE);
+        //
+        // Only when the server actually has icons, though: without them
+        // the button paints its label instead, and measuring a square
+        // here would reserve a box the text does not fit in.
+        if self.shows_icon(has_icons) {
+            let side = Self::icon_side(&style);
             return constraints.constrain(Size::new(side + px * 2.0, side + py * 2.0));
         }
         self.metrics = cx.measure_text(&self.text, &style, 0.0).unwrap_or_default();
@@ -596,17 +623,40 @@ impl<S: 'static> Widget<S> for Button<S> {
     }
 
     fn paint(&mut self, cx: &mut PaintCx<'_, S>) {
+        let has_icons = cx.has_icons();
         let theme = cx.theme();
         let hovered = cx.ui.is_hovered(cx.id);
         let focused = cx.ui.is_focused(cx.id);
-        let (face, text_color) = if !self.enabled {
-            (theme.button_disabled, theme.text_disabled)
+        // The colour and the *role* that names it travel together: the
+        // label takes the colour, the icon takes the role (the server
+        // resolves it at paint time, which is what makes a scheme flip
+        // free). Picking them in one place is what stops a disabled icon
+        // button from looking enabled — which it did until this was a
+        // pair rather than a hard-coded `ButtonText`.
+        let (face, text_color, text_role) = if !self.enabled {
+            (
+                theme.button_disabled,
+                theme.text_disabled,
+                nitro_core::Role::TextDim,
+            )
         } else if self.pressed {
-            (theme.button_active, theme.button_text)
+            (
+                theme.button_active,
+                theme.button_text,
+                nitro_core::Role::ButtonText,
+            )
         } else if hovered {
-            (theme.button_hover, theme.button_text)
+            (
+                theme.button_hover,
+                theme.button_text,
+                nitro_core::Role::ButtonText,
+            )
         } else {
-            (theme.button, theme.button_text)
+            (
+                theme.button,
+                theme.button_text,
+                nitro_core::Role::ButtonText,
+            )
         };
         let border = if focused {
             (theme.border_width.max(1.0) + 1.0, theme.focus)
@@ -617,12 +667,24 @@ impl<S: 'static> Widget<S> for Button<S> {
         let style = self.resolved_style(theme);
         let bounds = cx.bounds;
         cx.rect(0, bounds, Fill::Solid(face), radius, border);
-        if let Some(name) = self.icon.clone() {
+        // Without `caps::ICONS` this falls through to the label, and
+        // that is the whole point of the guard. Emitting the icon anyway
+        // would send `CreateNode { kind: Icon }`, which a server that
+        // predates the icon set rejects as a decode error and closes the
+        // connection on — so an icon button would *kill the app* against
+        // an old server rather than costing a gap. Falling back to the
+        // text is strictly better than a blank face, and the button
+        // already keeps `text` as its accessible name for exactly this
+        // reason: the glyph is for the eye, the word is for everything
+        // else.
+        if self.shows_icon(has_icons)
+            && let Some(name) = self.icon.clone()
+        {
             // The icon is centred in the face by the scene, which centres
             // an icon in its node's bounds; the node is the whole face,
             // so the widget does no arithmetic at all.
-            let side = style.size_px.max(crate::widgets::ICON_SIZE);
-            cx.icon(1, bounds, &name, side, nitro_core::Role::ButtonText);
+            let side = Self::icon_side(&style);
+            cx.icon(1, bounds, &name, side, text_role);
             return;
         }
         // The label is centred by the text node's own alignment

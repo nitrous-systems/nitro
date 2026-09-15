@@ -174,6 +174,15 @@ pub(crate) struct Wire {
     /// Whether the window's subtree is shown, so an unchanged
     /// [`Wire::set_visible`] costs no mutation and therefore no commit.
     window_visible: bool,
+    /// Whether to answer [`Wire::has_icons`] with `false` however the
+    /// server answered.
+    ///
+    /// A test facility, and the reason it exists rather than a mock:
+    /// the branch it reaches is the one a widget takes against an **old**
+    /// server, which by definition cannot be started from this tree.
+    /// Masking the bit on a real connection exercises the real code path
+    /// with one variable changed, which a hand-built fake `Ui` would not.
+    hide_icons: bool,
 }
 
 impl Wire {
@@ -191,6 +200,7 @@ impl Wire {
             next_buffer: 1,
             text_cache: TextMeasureCache::default(),
             window_visible: true,
+            hide_icons: false,
         }
     }
 
@@ -530,7 +540,13 @@ impl Wire {
 
     /// Whether the server has the symbolic icon set.
     pub(crate) fn has_icons(&self) -> bool {
-        self.conn.has_caps(caps::ICONS)
+        self.conn.has_caps(caps::ICONS) && !self.hide_icons
+    }
+
+    /// Pretend the server has no icon set (a test facility; see
+    /// [`Ui::hide_icons`](crate::Ui::hide_icons)).
+    pub(crate) fn set_hide_icons(&mut self, on: bool) {
+        self.hide_icons = on;
     }
 
     /// Whether the link to the server is remote: no buffers, no images.

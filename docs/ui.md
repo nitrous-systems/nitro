@@ -330,6 +330,23 @@ Without `caps::ICONS` the widget measures the identical box and paints
 nothing, so an icon-less server costs a gap in a row and never a broken
 layout — the same bargain `Label` makes with `caps::TEXT`.
 
+**`Button::icon` is the same guard with a better fallback.** A button
+given an icon falls back to painting its *label* when the server has
+none, which is why a button keeps its `text` even when it shows a glyph:
+the glyph is for the eye, the word is for everything else, and a blank
+face would be worse than either. Both `measure` and `paint` ask the
+capability, and they must agree — an icon box is a square and a label box
+is not, so a button that measured one and painted the other would clip.
+
+The guard is not cosmetic, and this is the reason it is spelled out
+here rather than left to the reader. Painting an icon creates a node of
+`NodeKind::Icon`; on a server older than the icon set that kind is a
+**decode error**, which is fatal — so an unguarded icon button does not
+lose a glyph against an old server, it loses the application.
+`crates/nitro-ui/tests/icons.rs` pins both halves, and pins them by
+masking the capability *before the first paint*, because once the node
+exists the damage is already done.
+
 **`TextField` does not re-measure the tree on a keystroke.** Its
 `measure` is a function of the *font* and its width style, never of its
 contents, so typing repaints one widget and lays out nothing. The one

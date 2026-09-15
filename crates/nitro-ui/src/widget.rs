@@ -274,6 +274,20 @@ impl<S: 'static> MeasureCx<'_, S> {
         self.ui.theme()
     }
 
+    /// Whether the server has the symbolic icon set (the `ICONS`
+    /// capability).
+    ///
+    /// Needed at *measure* time, not only at paint time, by any widget
+    /// that falls back to something else without it: a
+    /// [`Button`](crate::widgets::Button) with an icon draws its label
+    /// instead, and a label is not the same size as a 16-px square. A
+    /// widget whose measurement disagreed with its paint about which of
+    /// the two it was showing would reserve the wrong box.
+    #[must_use]
+    pub fn has_icons(&self) -> bool {
+        self.ui.has_icons()
+    }
+
     /// Measure a string, synchronously; see
     /// [`Ui::measure_text`](crate::Ui::measure_text).
     ///

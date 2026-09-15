@@ -70,7 +70,7 @@ server, off a real readback) assert that inequality.
 ships beside the crate as `LICENSE.bootstrap-icons` and is recorded in
 `DEPENDENCIES.md`'s vendored-assets section.
 
-47 icons, in five groups:
+47 icons, in six groups:
 
 | group | names |
 |---|---|
@@ -226,7 +226,14 @@ it.
 
 The button keeps its **text** (`"Menu"`) as its accessible name, so
 `hey nitro-bar list` and a screen reader are unaffected: the glyph is for
-the eye, the word is for everything else.
+the eye, the word is for everything else. It is also the fallback:
+without `caps::ICONS` an icon button paints that label instead, which is
+why the text is not optional. A button that emitted its icon regardless
+would send `CreateNode { kind: Icon }` to a server that rejects the kind
+as a decode error — so the bar would have *killed itself* against an
+older server rather than showing a plain button. Both `measure` and
+`paint` therefore ask the capability, and they have to give the same
+answer: an icon box is square and a label box is not.
 
 Battery and wifi deliberately get no icon: the bar has a battery sensor
 and no wifi one, and an icon in front of `87%+` would be redundant where

@@ -758,6 +758,21 @@ impl<S: 'static> Ui<S> {
         self.wire.clear_tap();
     }
 
+    /// Answer [`Ui::has_icons`] with `false` however the server answered
+    /// (a test facility, like [`Ui::tap`]).
+    ///
+    /// It exists because the branch it reaches is the one a widget takes
+    /// against a server **older than the icon set**, and such a server
+    /// cannot be started from this tree. Masking the bit on a real
+    /// connection runs the real code path with exactly one variable
+    /// changed; a hand-built fake `Ui` would prove only that the fake
+    /// works. What is under test is not cosmetic: a widget that emits an
+    /// icon node anyway sends `CreateNode { kind: Icon }`, which an old
+    /// server rejects as a decode error and **closes the connection** on.
+    pub fn hide_icons(&mut self, on: bool) {
+        self.wire.set_hide_icons(on);
+    }
+
     /// Measure a string with the server's fonts.
     ///
     /// `max_width` of `0.0` means "no limit". The result is cached by
