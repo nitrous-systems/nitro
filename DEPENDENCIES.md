@@ -11,7 +11,7 @@ number we watch.
 |---|---|---|---|
 | `rustix` | seat, kms, server, wire, demo, session, launcher, files | Safe Linux syscalls (epoll, mmap, sockets + `SCM_RIGHTS`, timerfd, netlink) with no libc. The one crate that lets the rest of the tree be `unsafe`-free. | + `bitflags`, `linux-raw-sys` |
 | `zerocopy` (+ `zerocopy-derive`) | wire | The wire format *is* `#[repr(C)]` layout: `U32<LittleEndian>`/`F32<LE>`/… give guaranteed little-endian fields, `Unaligned` lets a payload be decoded in place from any `&[u8]`, and `ref_from_bytes`/`as_bytes` replace the pointer casts we would otherwise write by hand. Validated, total, and `unsafe`-free in our tree. | +3 crates: `zerocopy`, `zerocopy-derive`, and **`syn` 2.x**. Note `drm` → `bytemuck_derive` pins `syn` **3.x**, so the two do *not* share a build: syn is compiled twice. **Measured and left alone** — see "`syn` is compiled twice" below; deduplicating it makes the wall-clock build *slower* on a many-core box. |
-| `drm` (+ `drm-ffi`, `drm-sys`, `drm-fourcc`) | kms | Safe wrappers over the ~30 DRM/KMS ioctls (atomic commit, dumb buffers, AddFB2, properties, events). Hand-rolling them is precisely the `unsafe` we forbid. | pulls `bytemuck` + `bytemuck_derive` → `syn` 3.x (proc-macro, compile time). `bytemuck_derive` is a *direct* dependency of `drm`, so `default-features = false` cannot drop it. Measured: see "`syn` is compiled twice" below. |
+| `drm` (+ `drm-ffi`, `drm-sys`, `drm-fourcc`) | kms | Safe wrappers over the ~30 DRM/KMS ioctls (atomic commit, dumb buffers, AddFB2, properties, events). Hand-rolling them is precisely the `unsafe` we forbid. **`drm-ffi` is named directly since #3718**, for one type: `drm_mode_modeinfo`, which `output.<c>.modeline` fills in so a user-supplied mode can be handed to the CRTC as a `MODE_ID` blob. `drm::control::Mode` is a `#[repr(transparent)]` wrapper over it with a `From` impl, so building one needs no `unsafe`; the alternative is transcribing a 68-byte kernel ABI struct by hand. **No new external name and no new lock entry** — it was already in the graph as `drm`'s own dependency, at the same 0.9.1 resolution. | pulls `bytemuck` + `bytemuck_derive` → `syn` 3.x (proc-macro, compile time). `bytemuck_derive` is a *direct* dependency of `drm`, so `default-features = false` cannot drop it. Measured: see "`syn` is compiled twice" below. |
 | `signal-hook` (+ `signal-hook-registry`) | server, demo, session | SIGTERM/SIGINT → self-pipe without `unsafe` in our tree: `sigaction` and an async-signal-safe handler are exactly the shim we would otherwise have to write ourselves. `default-features = false` (no iterator/channel). The demo uses it so Ctrl-C prints its latency summary instead of killing the process mid-histogram. `nitro-session` uses it for the same reason the server does, and it is the crate's third consumer rather than a new dependency. | + `libc` (already pulled by `libseat`). Only `low_level::pipe::register` is used. |
 | `libseat` (+ `libseat-sys`) | seat | Bindings to the C libseat: one interface over logind / seatd / raw VT for DRM master + input fds without root. The single deliberate C dependency. | + `errno`, `libc`, `log`. `default-features = false`: the `custom_logger` feature builds a C shim (`cc`) to route libseat's log lines through `log`; we do not log. |
 | `input` (+ `input-sys`) | server | Bindings to libinput, which is the only sane way to read evdev: tap detection, pointer acceleration, scroll-source classification and touchpad state are thousands of lines of hard-won device quirks we are not going to re-derive. `default-features = false, features = ["libinput_1_21"]` — the `udev` feature is **off**, so `libudev` never enters the tree: the server finds devices by reading `/dev/input` and opens them through `nitro-seat`. | + `libc` (already there via `libseat`). The FFI `unsafe` lives in the dependency; `LibinputInterface` is a safe trait we implement. Input-device hotplug is M3: it needs the netlink uevent socket `nitro-kms` already has, plus a directory diff. |
@@ -510,6 +510,16 @@ was a crate we already had the ingredients for.
 distinct external names. A decoder written in #3711 with no consumer is
 now the reason that measurement was worth taking — the eight crates the
 `png` route would have added are eight crates this feature did not cost.
+
+**Output mode selection (#3718) leaves the name count at 37 as well.**
+`nitro-kms` names `drm-ffi` directly for `drm_mode_modeinfo`, which is one
+more dependency *line* and **zero** new external names: `drm-ffi` was
+already in the graph — `drm` pulls it, at the same version Cargo had
+already resolved — so `Cargo.lock` gains one dependency edge, no package
+entry, and nothing new is compiled. The alternative was hand-writing the
+kernel's 68-byte `drm_mode_modeinfo` and an `unsafe` transmute into
+`drm::control::Mode`, which is exactly the trade the row above says this
+dependency exists to avoid.
 
 
 ## `rustix` features by crate
