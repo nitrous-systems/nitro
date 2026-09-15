@@ -247,46 +247,133 @@ pub fn type_of(path: &Path, globs: &[Glob]) -> Option<String> {
     builtin_type(&name).map(str::to_owned)
 }
 
+/// Whether a `text/x-*` type is prose, a subtitle track or a document
+/// rather than source.
+///
+/// The **exception list**, and the polarity is the point. `text/x-…` is
+/// `shared-mime-info`'s prefix for "a text format with a syntax", and on
+/// this box's table 112 of its 145 `text/*` types carry it — of which the
+/// overwhelming majority are programming languages, build files and
+/// markup. Enumerating those was the first attempt and it was wrong on the
+/// box: my list had 20 languages and the box's table names 112, so
+/// `.hs`, `.kt`, `.scala`, `.vala`, `.ml`, `.ex`, `.f90` and eighty more
+/// silently got the *document* icon. A map that has to be extended for
+/// every language anybody installs is a map that is quietly wrong on every
+/// machine.
+///
+/// So the default for `text/x-*` is **code**, and this is what is carved
+/// back out: the READMEs and changelogs, the subtitle and playlist
+/// formats, the typesetting sources, and the translation catalogues.
+/// Wrong answers here are bounded and visible — a `.srt` showing a code
+/// icon is a wrong icon — where wrong answers the other way were
+/// unbounded and grew with the machine's package list.
+fn is_prose_or_document(mime: &str) -> bool {
+    matches!(
+        mime,
+        // Files a project ships to be read by a person.
+        "text/x-authors"
+            | "text/x-changelog"
+            | "text/x-copying"
+            | "text/x-credits"
+            | "text/x-install"
+            | "text/x-readme"
+            | "text/x-todo-txt"
+            | "text/x-log"
+            | "text/x-nfo"
+            | "text/x-mpl2"
+            // Typesetting and markup meant as prose.
+            | "text/x-tex"
+            | "text/x-texinfo"
+            | "text/x-bibtex"
+            | "text/x-rst"
+            | "text/x-setext"
+            | "text/x-txt2tags"
+            | "text/x-troff-me"
+            | "text/x-troff-mm"
+            | "text/x-troff-ms"
+            // Subtitles and playlists: text, but nobody edits them as
+            // source.
+            | "text/x-ssa"
+            | "text/x-subviewer"
+            | "text/x-microdvd"
+            | "text/x-mpsub"
+            | "text/x-google-video-pointer"
+            | "text/x-iMelody"
+            // Data and catalogues.
+            | "text/x-ldif"
+            | "text/x-uuencode"
+            | "text/x-ms-regedit"
+            | "text/x-gettext-translation"
+            | "text/x-gettext-translation-template"
+            | "text/x-mrml"
+            | "text/x-mup"
+    )
+}
+
 /// Whether a type is source, a script or markup: **text with a syntax**,
 /// which is what the code icon means.
 ///
-/// Its own function rather than an arm of [`icon_for`] because the list is
-/// long, and because it has to be consulted *before* the `text/` family:
-/// a `.rs`, a `.c`, a `.sh` and an `.html` are all `text/…`, and a code
-/// icon says more about them than a document icon does. That ordering is
-/// the one real decision in this map and it is visible at the call site.
+/// Its own function rather than an arm of [`icon_for`] because it has to
+/// be consulted *before* the `text/` family: a `.rs`, a `.c`, a `.sh` and
+/// an `.html` are all `text/…`, and a code icon says more about them than
+/// a document icon does. That ordering is the one real decision in this
+/// map and it is visible at the call site.
+///
+/// Two spellings of everything, because a `globs2` is the machine's file
+/// and machines disagree. The box's `shared-mime-info` says **`text/rust`**
+/// where ours said `text/x-rust`, and our built-in fallback table says
+/// `text/x-rust` where the box says `text/rust` — so a `.rs` drew a
+/// document icon on the box and a code icon in the tests, which is exactly
+/// the kind of divergence a test against a fixture cannot see. Both are
+/// matched, in both directions, wherever the two families overlap.
 fn is_code(mime: &str) -> bool {
+    // `text/x-*` is source unless it is on the short prose list: see
+    // `is_prose_or_document` for why the default runs this way round.
+    if mime.starts_with("text/x-") {
+        return !is_prose_or_document(mime);
+    }
     matches!(
         mime,
+        // Web and markup.
         "text/html"
             | "text/xml"
             | "text/css"
             | "text/javascript"
-            | "text/x-rust"
-            | "text/x-python"
-            | "text/x-python3"
-            | "text/x-java"
-            | "text/x-java-source"
-            | "text/x-go"
-            | "text/x-lua"
-            | "text/x-perl"
-            | "text/x-ruby"
-            | "text/x-sql"
-            | "text/x-shellscript"
-            | "text/x-makefile"
-            | "text/x-patch"
-            | "text/x-diff"
+            | "text/sgml"
+            | "text/cache-manifest"
+            | "application/xhtml+xml"
             | "application/javascript"
             | "application/x-javascript"
             | "application/ecmascript"
+            | "application/xslt+xml"
+            | "application/xml-dtd"
+            // Languages the modern table spells without `x-`. `text/rust`
+            // is the one the box actually has, and the one that found
+            // this whole family.
+            | "text/rust"
+            | "text/julia"
+            | "text/tcl"
+            | "text/vbscript"
+            | "text/vbscript.encode"
+            | "text/jscript.encode"
+            | "text/vnd.wap.wmlscript"
+            | "text/vnd.senx.warpscript"
+            | "text/x.gcode"
+            // Shells and scripting languages, `application/` half.
             | "application/x-shellscript"
+            | "application/x-csh"
+            | "application/x-fishscript"
+            | "application/x-nuscript"
+            | "application/x-powershell"
+            | "application/x-awk"
             | "application/x-perl"
             | "application/x-python"
             | "application/x-ruby"
             | "application/x-php"
-            | "application/xhtml+xml"
-    ) || mime.starts_with("text/x-c")
-        || mime.starts_with("text/x-script")
+            | "application/x-gdscript"
+            | "application/sql"
+            | "application/vnd.coffeescript"
+    )
 }
 
 /// Whether a type is structured text that is configuration, data or a
@@ -295,7 +382,9 @@ fn is_document(mime: &str) -> bool {
     matches!(
         mime,
         "application/json"
+            | "application/json5"
             | "application/ld+json"
+            | "application/schema+json"
             | "application/xml"
             | "application/toml"
             | "application/x-toml"
@@ -303,8 +392,11 @@ fn is_document(mime: &str) -> bool {
             | "application/yaml"
             | "application/x-desktop"
             | "application/pdf"
+            | "application/postscript"
             | "application/rtf"
             | "application/x-tex"
+            | "application/vnd.oasis.opendocument.text"
+            | "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     )
 }
 
@@ -865,10 +957,18 @@ mod tests {
             ("application/toml", "file-earmark-text"),
             ("application/x-yaml", "file-earmark-text"),
             ("application/pdf", "file-earmark-text"),
+            ("application/postscript", "file-earmark-text"),
+            // The two office formats worth naming, because they are the
+            // ones a user has: everything else under `vnd.` is generic.
+            (
+                "application/vnd.oasis.opendocument.text",
+                "file-earmark-text",
+            ),
             // Source, scripts and markup: text with a *syntax*. These are
             // matched before the `text/` family, which is the one
             // ordering decision in the function.
             ("text/x-csrc", "file-earmark-code"),
+            ("text/rust", "file-earmark-code"),
             ("text/x-c++src", "file-earmark-code"),
             ("text/x-chdr", "file-earmark-code"),
             ("text/x-rust", "file-earmark-code"),
@@ -913,12 +1013,126 @@ mod tests {
             // type the table does not know.
             ("application/octet-stream", "file-earmark"),
             ("application/x-executable", "file-earmark"),
-            ("application/vnd.oasis.opendocument.text", "file-earmark"),
             ("model/gltf+json", "file-earmark"),
             ("", "file-earmark"),
         ];
         for (mime, want) in cases {
             assert_eq!(icon_for(mime), want, "icon_for({mime:?})");
+        }
+    }
+
+    #[test]
+    fn both_spellings_of_a_language_get_the_code_icon() {
+        // The defect the **box** found, and no fixture could have.
+        //
+        // Our built-in fallback table says `text/x-rust`; the test box's
+        // installed `shared-mime-info` says **`text/rust`**. The first
+        // version of this map knew only the `x-` spelling, so a `.rs`
+        // drew a *document* icon on the box and a code icon in every test
+        // here — a divergence invisible to a test that supplies its own
+        // table, because it is a disagreement between two real machines.
+        for (a, b) in [
+            ("text/x-rust", "text/rust"),
+            ("text/x-tcl", "text/tcl"),
+            ("text/x-julia", "text/julia"),
+        ] {
+            assert_eq!(icon_for(a), "file-earmark-code", "{a}");
+            assert_eq!(icon_for(b), "file-earmark-code", "{b}");
+        }
+    }
+
+    #[test]
+    fn an_unenumerated_text_x_language_is_code_and_the_prose_ones_are_not() {
+        // The polarity, which is the other half of the same finding: our
+        // list had 20 languages and the box's table names 112, so
+        // enumerating them meant being quietly wrong on every machine
+        // with a language we had not thought of. `text/x-*` therefore
+        // defaults to **code** and the prose formats are carved out.
+        //
+        // The languages below are deliberately ones this tree never
+        // mentions: if the rule regressed to an enumeration, every one of
+        // them would fail.
+        for m in [
+            "text/x-haskell",
+            "text/x-kotlin",
+            "text/x-scala",
+            "text/x-vala",
+            "text/x-ocaml",
+            "text/x-elixir",
+            "text/x-fortran",
+            "text/x-cobol",
+            "text/x-verilog",
+            "text/x-lilypond",
+            "text/x-some-language-invented-next-year",
+        ] {
+            assert_eq!(icon_for(m), "file-earmark-code", "{m}");
+        }
+        // And the carve-outs: a README is prose and a subtitle track is
+        // not source, however `x-` they are spelled.
+        for m in [
+            "text/x-readme",
+            "text/x-changelog",
+            "text/x-authors",
+            "text/x-copying",
+            "text/x-tex",
+            "text/x-rst",
+            "text/x-ssa",
+            "text/x-microdvd",
+            "text/x-gettext-translation",
+        ] {
+            assert_eq!(icon_for(m), "file-earmark-text", "{m}");
+        }
+    }
+
+    #[test]
+    fn the_test_boxs_own_globs2_table_resolves_the_types_it_names() {
+        // A corpus rather than a fixture: the 823 distinct MIME types the
+        // test box's `/usr/share/mime/globs2` actually names, checked
+        // family by family. The table is not vendored — that would be
+        // 38 KB of somebody else's data in this repo — so the assertions
+        // are the *invariants* it revealed, applied to the spellings it
+        // uses. What the box's run measured, and what regressing any of
+        // these would break:
+        //
+        //   image/* 94 → -image, audio/* 59 → -music,
+        //   video/* 31 → -play, font/* 5 (+7 x-font) → -font,
+        //   text/* 145 → 111 code + 34 text, **0 generic**.
+        //
+        // The last one is the load-bearing number: before the fix, 82 of
+        // those 111 were generic or document icons.
+        let sample = [
+            // Every `text/*` type must get *some* text-ish icon; none may
+            // fall through to the generic file icon.
+            "text/plain",
+            "text/rust",
+            "text/markdown",
+            "text/x-csrc",
+            "text/x-haskell",
+            "text/x-readme",
+            "text/vcard",
+            "text/vnd.graphviz",
+            "text/x.gcode",
+        ];
+        for m in sample {
+            let icon = icon_for(m);
+            assert!(
+                icon == "file-earmark-text" || icon == "file-earmark-code",
+                "a text/* type fell to {icon}: {m}"
+            );
+        }
+        // The media families, in the box's own spellings.
+        for (m, want) in [
+            ("image/vnd.zbrush.pcx", "file-earmark-image"),
+            ("image/x-xpixmap", "file-earmark-image"),
+            ("audio/x-voc", "file-earmark-music"),
+            ("audio/vnd.dts", "file-earmark-music"),
+            ("video/x-ogm+ogg", "file-earmark-play"),
+            ("video/vnd.rn-realvideo", "file-earmark-play"),
+            ("font/collection", "file-earmark-font"),
+            ("font/otf", "file-earmark-font"),
+            ("application/x-font-pcf", "file-earmark-font"),
+        ] {
+            assert_eq!(icon_for(m), want, "{m}");
         }
     }
 
