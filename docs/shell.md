@@ -351,6 +351,27 @@ later changes must also *remove* it, so the filter belongs on the same
 upsert path as everything else rather than at the point a window is first
 seen.
 
+### The list is the part of the bar that yields
+
+Since #561 a widget is never laid out below the size it measured unless
+it says it can, so a bar whose sections do not fit **overflows** rather
+than squashing them. The window list is the one section whose content
+count has no ceiling, so it is the one that takes the `Zero` shrink floor
+(on the row *and* on its buttons — narrowing the row alone would only
+make its children overflow it instead).
+
+Measured on the box at 1920: twelve windows need no shrinking at all
+(buttons at their natural 104 px, well under the `MAX_BUTTON_W` cap of
+180, the row ending at 1379). At twenty-four the row is squeezed to 1708
+and the buttons fall to 65 px, with the clock, battery, load and memory
+still on the strip. Without the opt-out that row would be laid out at its
+intrinsic ~2700 px and push all four off the end of the bar — including
+the clock that is supposed to be centred *on the bar*. A squeezed title
+is the better failure, because the sections it would otherwise displace
+are the ones the user did not open and cannot close; `MAX_LABEL_CHARS`
+and `MAX_BUTTON_W` are what keep a squeezed title from being the usual
+case.
+
 ### Server-global window ids
 
 `WindowInfo.window` is a `WindowRef`, a dense `u32` the server mints. It is

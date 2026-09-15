@@ -478,23 +478,26 @@ pub fn build(ui: &mut Ui<Bar>) -> WidgetId {
     // Every other section of the bar is a fixed string that must keep
     // the width it measured — which is the toolkit's default since #561,
     // and is why the clock and the sensor labels need no opt-out here.
-    // The window list is the one part whose content is unbounded: each
-    // button is already elided to `MAX_LABEL_CHARS` and capped at
-    // `MAX_BUTTON_W`, but twelve of them on a 1920 bar want 12 × 180 +
-    // 11 × 6 = 2226 px of a 1904 px strip, and the count has no ceiling
+    // The window list is the one part whose content count has no
+    // ceiling: each button is already elided to `MAX_LABEL_CHARS` and
+    // capped at `MAX_BUTTON_W`, but the *number* of them is not capped
     // at all.
     //
-    // Measured on the harness at 12 windows: with the content floor the
-    // row is laid out at its intrinsic 2226-ish and pushes the clock,
-    // battery, load and memory clean off the end of the bar — the clock
-    // that is supposed to be centred *on the bar* lands past its right
-    // edge. That is worse than the alternative, because the sections it
-    // displaces are the ones the user did not open and cannot close.
-    // So this row keeps the old elastic behaviour: the buttons divide
-    // whatever is left over, exactly as they did before, and a title too
-    // narrow to read is the honest signal that there are too many
-    // windows for the bar. The `max_width` cap on each button is what
-    // keeps that from being the *usual* case.
+    // Measured on the box at 1920, which corrected a guess made from the
+    // 320 px test harness: **twelve** windows need no shrinking at all
+    // (buttons at their natural 104 px, the row ending at 1379). The
+    // cliff is around twenty. At twenty-four the row is squeezed to 1708
+    // and the buttons fall to 65 px, with the clock, battery, load and
+    // memory all still on the strip — whereas with the content floor the
+    // row would be laid out at its intrinsic ~2700 px and push all four
+    // clean off the end of the bar, including the clock that is supposed
+    // to be centred *on the bar*.
+    //
+    // So this row keeps the elastic behaviour: the buttons divide
+    // whatever is left over, and a title too narrow to read is the
+    // honest signal that there are too many windows for the bar. That is
+    // the better failure, because the sections it would otherwise
+    // displace are the ones the user did not open and cannot close.
     let windows = ui.build(
         row()
             .name(names::WINDOWS)
