@@ -298,7 +298,7 @@ pub fn apply(
     client: &mut WireClient,
     scene: &mut Scene,
     text: &mut TextEngine,
-    icons: &IconEngine,
+    icons: &mut IconEngine,
     serial: u32,
 ) -> Result<ApplyOutcome, ApplyError> {
     let mut outcome = ApplyOutcome::default();
@@ -360,7 +360,7 @@ fn apply_msg(
     client: &mut WireClient,
     scene: &mut Scene,
     text: &mut TextEngine,
-    icons: &IconEngine,
+    icons: &mut IconEngine,
     msg: ClientMsg,
     outcome: &mut ApplyOutcome,
 ) -> Result<(), ApplyError> {
@@ -591,7 +591,7 @@ fn apply_msg(
             // so without destroying and recreating a node.
             let reference = if m.name.is_empty() {
                 None
-            } else if let Some(index) = icons.lookup(&m.name) {
+            } else if let Some(index) = icon_handle(icons, m.role, &m.name) {
                 Some(IconRef::new(index, sane_icon_size(m.size), m.role))
             } else {
                 // Unknown name: the node is cleared, the client is told,
@@ -757,6 +757,32 @@ fn sane_icon_size(size: f32) -> f32 {
         return DEFAULT_ICON_PX;
     }
     size.clamp(crate::icons::MIN_PX as f32, crate::icons::MAX_PX as f32)
+}
+
+/// The handle a `SetIcon` names, from whichever of the server's two icon
+/// sets its `role` selects.
+///
+/// The role byte is the **selector**, not a search order: a palette role
+/// means the symbolic set compiled into the server, and
+/// [`IconRef::AS_COLOURED`] means the machine's XDG icon theme. Nothing
+/// falls back from one to the other, and that is the point — a single
+/// namespace searched "ours first" would make `icon("list")` mean the
+/// desktop's own list glyph on one box and a theme's list icon on
+/// another, invisibly. Here the call site says which it wants, so there
+/// is no collision to resolve and no shadowing to document. `docs/icons.md`
+/// has the argument in full.
+///
+/// A tinted *theme* icon — a role byte with a name only the theme has — is
+/// therefore refused with `BadIcon` rather than quietly finding the file
+/// and tinting its alpha. A theme icon is a picture, not a coverage mask:
+/// tinting one throws away the artwork and keeps its silhouette, which
+/// looks like a bug on every icon that is not already monochrome.
+fn icon_handle(icons: &mut IconEngine, role: u8, name: &str) -> Option<u32> {
+    if role == IconRef::AS_COLOURED {
+        icons.lookup_app(name)
+    } else {
+        icons.lookup(name)
+    }
 }
 
 /// The box an icon gets when the client asked for a nonsense size.

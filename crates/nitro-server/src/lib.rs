@@ -40,6 +40,7 @@ pub mod control;
 pub mod cursor;
 pub mod defer;
 pub mod frame;
+pub mod icon_theme;
 pub mod icons;
 pub mod input;
 pub mod keyboard;
@@ -884,7 +885,7 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         epoll,
         scene: Scene::new(),
         text: TextEngine::new(),
-        icons: IconEngine::new(),
+        icons: IconEngine::with_theme(settings.theme.icon_theme()),
         outputs: Vec::new(),
         keyboard,
         cursor: Cursor::new(),
@@ -2447,6 +2448,7 @@ impl Server {
             warn!("{}: {w}", path.display());
         }
         let keyboard_changed = settings.keyboard != self.settings.keyboard;
+        let icons_changed = settings.theme.icon_theme() != self.settings.theme.icon_theme();
         let palette = settings.palette();
         self.settings = settings;
         // The palette *is* diffed, unlike everything else here, and for a
@@ -2481,6 +2483,14 @@ impl Server {
                 kb.reset();
             }
             self.hotkeys.reset();
+        }
+
+        // The icon theme, only when it moved, and for the same reason the
+        // keyboard is diffed: re-reading it walks the whole search path
+        // and throws away every decoded application tile, so a `reload`
+        // that only moved a monitor must not cost the launcher its icons.
+        if icons_changed {
+            self.icons.set_theme(self.settings.theme.icon_theme());
         }
 
         // Scale, position and primary all land in `sync_outputs`, which is
@@ -4925,7 +4935,7 @@ impl Server {
         };
         // The buffer descriptors arrived with their messages; hand them to
         // the client's map once the scene has minted the keys.
-        let (scene, text, icons) = (&mut self.scene, &mut self.text, &self.icons);
+        let (scene, text, icons) = (&mut self.scene, &mut self.text, &mut self.icons);
         let result = clients::apply(&mut client, scene, text, icons, serial);
         let outcome = match result {
             Ok(o) => o,

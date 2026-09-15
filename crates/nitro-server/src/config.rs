@@ -22,6 +22,7 @@
 //!
 //! theme.scheme = dark
 //! theme.accent = #6ca8f0
+//! theme.icons  = Adwaita
 //!
 //! remote.listen    = 127.0.0.1:7700
 //! ```
@@ -60,6 +61,7 @@
 //! | keyboard | `XKB_DEFAULT_*` | `keyboard.*` | the `us` layout |
 //! | colour scheme | — | `theme.scheme` | `light` |
 //! | one colour | — | `theme.<role>` | the scheme's value |
+//! | icon theme | — | `theme.icons` | `hicolor` |
 //! | remote listener | — | `remote.listen` | off |
 //!
 //! The environment wins because it is the *development* channel — a
@@ -85,6 +87,17 @@ const MAX_SCALE: f32 = 8.0;
 /// The smallest scale a file may ask for; below this the decorations are
 /// sub-pixel and a window cannot be grabbed.
 const MIN_SCALE: f32 = 0.5;
+
+/// The XDG icon theme application icons are looked up in when
+/// `theme.icons` says nothing.
+///
+/// `hicolor` rather than a prettier theme, because it is the one the
+/// specification *requires* every theme to inherit from and the one an
+/// application installs its own icon into. A box with no theme installed
+/// at all still has `/usr/share/icons/hicolor`, and a box with three of
+/// them still finds the application's own artwork there — see
+/// `docs/icons.md`.
+pub const DEFAULT_ICON_THEME: &str = "hicolor";
 
 /// What one connector's section says.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -146,6 +159,17 @@ pub struct ThemeSettings {
     /// `theme.scheme`: `light` or `dark`. `None` means the file said
     /// nothing, and the built-in default ([`Scheme::Light`]) applies.
     pub scheme: Option<Scheme>,
+    /// `theme.icons`: the **XDG icon theme** application icons are looked
+    /// up in (`hicolor`, `Adwaita`, `Papirus`, …). `None` means the file
+    /// said nothing and [`DEFAULT_ICON_THEME`] applies.
+    ///
+    /// Unlike every other key in this section it does not name a colour,
+    /// and it is here rather than in a section of its own because it is
+    /// the same question: what the desktop *looks* like. `theme.scheme`
+    /// picks the palette the server tints its own symbolic set with, and
+    /// `theme.icons` picks where the coloured application icons come
+    /// from — see `docs/icons.md`.
+    pub icons: Option<String>,
     /// `theme.<role>`: per-role `#rrggbb[aa]` overrides, applied on top
     /// of the scheme in role order rather than file order, so two lines
     /// for the same role resolve the same way a repeated `scale` does
@@ -157,7 +181,14 @@ impl ThemeSettings {
     /// Whether the file says anything about colours.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.scheme.is_none() && self.overrides.is_empty()
+        self.scheme.is_none() && self.overrides.is_empty() && self.icons.is_none()
+    }
+
+    /// The icon theme to look application icons up in: the one the file
+    /// names, or [`DEFAULT_ICON_THEME`].
+    #[must_use]
+    pub fn icon_theme(&self) -> &str {
+        self.icons.as_deref().unwrap_or(DEFAULT_ICON_THEME)
     }
 
     /// The palette this section describes: the scheme, then the
@@ -409,6 +440,29 @@ pub fn parse(text: &str) -> Settings {
         // list of them and a role added there is configurable the same
         // day.
         if let Some(field) = key.strip_prefix("theme.") {
+            // `theme.icons` is a *name*, not a colour, so it is matched
+            // before the role table gets a chance to reject it. An empty
+            // value means "the default", on the same terms
+            // `remote.listen =` means "no listener": it is how a settings
+            // app turns an override off without deleting the line.
+            if field == "icons" {
+                settings.theme.icons = if value.is_empty() {
+                    None
+                } else if value.contains('/') || value.contains('\0') {
+                    // A theme name is a *directory* name inside the icon
+                    // search path, so a separator in it would escape that
+                    // path. Refused with a warning rather than sanitised,
+                    // because a silently-rewritten theme name is a
+                    // configuration file that does not do what it says.
+                    settings.warnings.push(format!(
+                        "line {number}: icon theme {value:?} must be a plain name, not a path"
+                    ));
+                    None
+                } else {
+                    Some(value.to_owned())
+                };
+                continue;
+            }
             if field == "scheme" {
                 match Scheme::from_name(value) {
                     Some(s) => settings.theme.scheme = Some(s),
@@ -551,6 +605,37 @@ mod tests {
             s.palette().get(Role::Accent),
             nitro_core::Color::rgb(0xff, 0, 0)
         );
+    }
+
+    #[test]
+    fn the_icon_theme_is_a_name_and_defaults_to_hicolor() {
+        // Nothing said: the specification's own fallback theme, which is
+        // the one an application installs its icon into.
+        assert_eq!(parse("").theme.icon_theme(), DEFAULT_ICON_THEME);
+        let s = parse("theme.icons = Adwaita\n");
+        assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+        assert_eq!(s.theme.icon_theme(), "Adwaita");
+        assert!(!s.is_empty(), "an icon theme is a setting like any other");
+        // An empty value is "the default", the same shape
+        // `keyboard.variant =` and `remote.listen =` already have.
+        let s = parse("theme.icons =\n");
+        assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+        assert_eq!(s.theme.icon_theme(), DEFAULT_ICON_THEME);
+        // A theme name is a directory name inside the icon search path,
+        // so a separator is refused with a warning rather than quietly
+        // sanitised into something the file does not say.
+        for bad in [
+            "theme.icons = ../../etc\n",
+            "theme.icons = /usr/share/icons/Adwaita\n",
+        ] {
+            let s = parse(bad);
+            assert_eq!(s.warnings.len(), 1, "{bad:?}: {:?}", s.warnings);
+            assert_eq!(s.theme.icon_theme(), DEFAULT_ICON_THEME);
+        }
+        // And it is not mistaken for a colour role.
+        let s = parse("theme.icons = hicolor\ntheme.scheme = dark\n");
+        assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+        assert_eq!(s.theme.scheme, Some(Scheme::Dark));
     }
 
     #[test]

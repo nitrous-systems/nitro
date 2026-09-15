@@ -16,6 +16,9 @@ nitro-scene = { path = "../nitro-scene" }
 nitro-raster = { path = "../nitro-raster" }
 nitro-text = { path = "../nitro-text" }
 nitro-icons = { path = "../nitro-icons" }
+# The PNG decoder application icons come out of (#3711): no dependencies
+# of its own, so this is one crate and not nine.
+nitro-png = { path = "../nitro-png" }
 nitro-seat = { path = "../nitro-seat" }
 nitro-kms = { path = "../nitro-kms" }
 rustix = { version = "1", features = ["event", "fs", "net", "process", "time"] }
