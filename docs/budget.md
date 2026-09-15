@@ -877,3 +877,45 @@ alone.
 writer for `--save-small` is a small deflate encoder rather than the `png`
 crate, for the same reason `nitro-shot` has one. `DEPENDENCIES.md` has the
 per-crate justification for every external name in the table above.
+
+### `nitro-png` adds zero of them, and that was measured (#3711)
+
+The workspace crate count is **77 lines** and still **37 distinct external
+crate names** with `nitro-png` in: the three new lines are `nitro-png`
+itself and two `(*)` markers, not a crate.
+
+That is the whole point of the crate, and unusually for this page it is a
+number that was *contested* before it was recorded. The question was the
+human's, verbatim — "are we sure using a png crate saves code/ram/compile
+time?" — so both routes were built and measured. `DEPENDENCIES.md` §"`png`
+versus our own decoder" has the full table; the rows this page watches:
+
+| | `nitro-png` | `png` 0.18 |
+|---|---|---|
+| new external crates | **0** | **8** |
+| `nitro-server` binary | 2 282 776 B (+50 712) | 2 361 872 B (+129 808) |
+| clean build, wall (3 runs) | 29.46 / 29.61 / 29.50 s | 29.97 / 30.14 / 29.98 s |
+| clean build, user CPU | 62.10 / 62.14 / 62.30 s | 65.55 / 65.72 / 65.54 s |
+| incremental, wall | 19.11 / 19.17 / 19.17 s | 19.64 / 19.57 / 19.65 s |
+| peak RSS, 512×512 decode (box) | +3.8 MB | **+1.5 MB** |
+| decode 48×48 / 512×512 (box) | 18.3 µs / 13.3 ms | **14.9 µs / 5.9 ms** |
+| lines we ship | **999** | ~28 500 |
+
+Baseline is `nitro-server` on main at 2 232 064 B, 29.17 / 29.15 / 29.12 s
+clean, 18.83 / 18.78 / 18.75 s incremental — same methodology as the
+binaries table above, with each configuration reachable from `main` behind
+a hidden flag so LTO cannot delete the decode.
+
+**The compile-time difference is ~0.5 s of wall on a 29 s build**, and by
+the rule the `syn` section of `DEPENDENCIES.md` established, that is noise
+for deciding purposes even though the clusters do not overlap. The ~3.5 s
+of user CPU is real and off the critical path on a 128-core box.
+
+**Two rows go the crate's way and are recorded rather than buried.** It
+decodes 1.2–2.7× faster, and it holds less memory doing it — it unfilters
+row by row where `nitro-png` materialises the whole filtered raster. At
+icon sizes the speed gap is 3–4 µs and the RSS gap is single-digit kB,
+which is why the 80 KB of binary and the eight crates decide it; at
+512×512 the gaps are 7.5 ms and 2.3 MB, which is why the entry names
+"a consumer that decodes images much larger than an icon" as the condition
+that re-opens the question.

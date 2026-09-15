@@ -321,15 +321,150 @@ disappears on the next `cargo update`.
 
 Planned (M3+): nothing currently. `parley` sits behind swash as the
 upgrade path if bidi, font fallback or rich text ever become requirements.
-Rejected: `serde` (hand-written wire), `png` (own stored-deflate encoder in
-`nitro-shot`, copied verbatim into `nitro-hey` — moving it into
-`nitro-core` would put a PNG encoder in the dependency graph of the
-server, the toolkit and every app, to save 120 lines of pure arithmetic
-that two CLIs use; revisit at a third consumer), `tokio`/`async-*`
+Rejected: `serde` (hand-written wire), **`png`** — encoding *and* decoding,
+now measured rather than assumed; see "`png` versus our own decoder" below
+— `tokio`/`async-*`
 (single-threaded epoll loop), `winit`,
 `wgpu`, `smithay`, `libudev` (a `read_dir` and a netlink socket do what we
 need of it), `fontconfig` (a `read_dir` and three alias tables do what we
 need of it), `parley` and `rustybuzz` (see above).
+
+## `png` versus our own decoder, measured (#3711)
+
+Icons are coming, XDG icon themes are largely PNG, and the server will need
+a decoder. `png` was already under Rejected for the *encoder* side, on the
+argument that a stored-deflate writer is 120 lines of arithmetic. Decoding
+is a real parser, so the rejection was re-opened with the only question
+that settles it: **"are we sure a png crate saves code/ram/compile time?
+Measure!"**
+
+Both routes were built. `crates/nitro-png` is the one that landed; the
+`png`-crate harness lived in a scratch consumer and is gone. Everything
+below is measured, not estimated.
+
+### The table
+
+| | `crates/nitro-png` | `png` 0.18 |
+|---|---|---|
+| **new external crates** | **0** | **8**: `png`, `flate2`, `miniz_oxide` (×2, 0.8 *and* 0.9), `fdeflate`, `crc32fast`, `simd-adler32`, `adler2`, `cfg-if` |
+| **`nitro-server` binary** | 2 282 776 B (**+50 712**, +2.3 %) | 2 361 872 B (**+129 808**, +5.8 %) |
+| **clean build, wall** | 29.46 / 29.61 / 29.50 s | 29.97 / 30.14 / 29.98 s |
+| **clean build, user CPU** | 62.10 / 62.14 / 62.30 s | 65.55 / 65.72 / 65.54 s |
+| **incremental, wall** | 19.11 / 19.17 / 19.17 s | 19.64 / 19.57 / 19.65 s |
+| **decode, 16×16** | 10.2 µs | 6.8 µs |
+| **decode, 48×48** | 18.3 µs | 14.9 µs |
+| **decode, 128×128** | 619 µs | 324 µs |
+| **decode, 256×256** | 2178 µs | 823 µs |
+| **decode, 512×512** | 13 327 µs | 5872 µs |
+| **peak RSS over baseline, 512×512** | **+3.8 MB** | **+1.5 MB** |
+| **lines: code we own** | **999** non-test code lines | 0 |
+| **lines: code we ship** | 999 | **~28 500** across the nine crates |
+| **`unsafe` in the dependency** | none | `flate2` 37 sites, `miniz_oxide` 4, `png` 1, `fdeflate` 1 |
+
+Baseline is `nitro-server` on main: 2 232 064 B, 29.17 / 29.15 / 29.12 s
+clean, 18.83 / 18.78 / 18.75 s incremental. Binary and compile figures are
+the dev box (128 cores, `-p nitro-server`, release, the profile's own
+`strip = true`, `docs/budget.md`'s methodology); each configuration is the
+same tree with one dependency added and a hidden `--decode-png FILE` flag
+in `main` that prints the decoded size and a checksum, so LTO cannot drop
+the decode. **Decode speed and RSS are the test box** (Pentium G3240,
+Haswell, no AVX2 — the CPU that matters), median of 21, release.
+
+**Compile time is real but small, and in the crate's disfavour**: the two
+clusters do not overlap in any of the three pairs, but the whole difference
+is ~0.5 s wall against a 29 s build. Under the rule this file already
+applies to `syn`, half a second is close enough to noise that it decides
+nothing; the ~3.5 s of *user* CPU the crate route costs is the more honest
+figure, and it is off the critical path on a many-core box for exactly the
+reason the `syn` section gives.
+
+### The crate is faster, and it does not matter at icon sizes
+
+`png` wins on speed at every size, by 1.2× to 2.7×, and the gap grows with
+the image. That is a real result and it is not a tuning miss that one more
+afternoon would close: `simd-adler32` and `crc32fast` dispatch on runtime
+CPU features, `fdeflate` has a specialised fast path for the
+filter-0/RGBA8 shape most icons are, and `miniz_oxide`'s inflate is
+heavily tuned. Ours already has a 9-bit Huffman lookup table, an 8-byte
+bulk bit refill and `const`-generic unrolled filter rows; the remaining
+gap is theirs to keep.
+
+What decides it is the absolute number. **At the sizes a theme is made of
+— 16 to 48 px — the difference is 3–4 µs per icon**, about the cost of a
+syscall, against a first paint that is already tens of milliseconds. At
+256×256 it is 1.4 ms, which is visible; at 512×512, 7.5 ms, which is a
+frame. An icon loader does not decode 512×512 images, and if one ever does
+— a thumbnailer, say — that is the moment to re-open this, with the
+numbers already in hand.
+
+### Peak RSS is the one place ours is worse in kind
+
++3.8 MB against +1.5 MB decoding a 512×512, over a 2.2 MB baseline, on the
+box. Ours holds the whole filtered raster *and* the output BGRA at once;
+`png` unfilters row by row into a one-row scratch. For a 48×48 icon that
+is 9 kB of transient and irrelevant, but it is a design property rather
+than an oversight, and on a 3.3 GB box with no swap it is the number that
+would matter first if the decoder ever met a large image. The fix, if it
+is ever needed, is a streaming unfilter — not a dependency.
+
+### Why ours wins anyway
+
+Eight crates and ~28 500 lines, to save 999 lines and 3 µs per icon. The
+second `miniz_oxide` is the detail that makes the point: `flate2` wants
+0.9, `png` wants 0.8, so the tree compiles two copies of the same inflate
+implementation — and neither is the one that decodes our PNGs, because
+`png` reaches for `fdeflate` first. That is four inflate implementations
+in the dependency graph of a display server, to decode a 48×48 icon.
+
+And 80 KB of `nitro-server` is not nothing against a binary this file's
+sibling `docs/budget.md` watches to the byte.
+
+The `unsafe` row is worth naming separately. This tree's one deliberate
+exception is eleven lines in `nitro-seat`; the crate route adds 43 sites
+across three dependencies, all of them in code that parses **untrusted
+bytes**. `DEPENDENCIES.md` already flags font files as "the one input where
+a dependency parses bytes we did not produce" and is careful that swash is
+pure safe Rust. Icons come from the same place fonts do — system
+directories — so the exposure is comparable, but the mitigation that made
+fonts acceptable (a malformed table is a panic, not memory corruption)
+does not hold for `flate2`, which wraps a C-shaped API even in its Rust
+backend. Ours is `unsafe_code = "deny"` with no exception, and
+`tests/fuzz.rs` asserts no input panics.
+
+### What the comparison itself bought
+
+The corpus diff is the part worth keeping in a document about
+dependencies. Both routes decoded **6455 PNGs** (`/usr/share` and `/opt` on
+the dev box — icon themes here are SVG, so `/usr/share/icons` has only 67
+files and the box 13) and the pixels were compared **byte for byte**, not
+"both returned Ok". That found a real bug in ours: `tRNS` colour-key
+entries are two bytes big-endian **at every bit depth**, and the decoder
+read the high byte — so at depth 8 every key compared as zero and the
+black pixels of colour-keyed images silently went transparent. 59 files
+disagreed; zero do now.
+
+A test written by the same author from the same misreading of the
+specification would not have caught it. That is the argument for measuring
+against a mature crate even when the decision is to write your own — and
+the reason the harness is recorded in the task thread rather than kept: it
+requires the dependency it exists to reject.
+
+The survey the interlace refusal rests on came out of the same run: **0 of
+6455 files are Adam7-interlaced**, which `crates/nitro-png/tests/corpus.rs`
+re-checks on whatever machine runs it rather than trusting this sentence.
+
+### The conditions that would re-open it
+
+A consumer that decodes images much larger than an icon (RSS, then speed);
+an icon path measured to be decode-bound, which at 3–4 µs it will not be;
+or a need for Adam7, APNG frames past the first, or colour management,
+each of which is a feature we would be writing rather than a bug we would
+be fixing.
+
+The workspace figure is **77** lines and **37 distinct external crate
+names** with `nitro-png` in — the name count unchanged, which is the number
+this whole section exists to hold still.
+
 
 ## `rustix` features by crate
 

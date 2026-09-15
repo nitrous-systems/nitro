@@ -1,0 +1,16 @@
+[package]
+name = "nitro-png"
+description = "PNG decoder for icons: inflate, unfilter and expand to straight-alpha BGRA. No dependencies, no unsafe, no interlace."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Deliberately empty, and that is the point of the crate: a PNG decoder is
+# inflate plus unfiltering plus arithmetic, all of which is in this
+# directory. `DEPENDENCIES.md` records what the `png` crate was measured to
+# cost against it.
+[dependencies]
+
+[lints]
+workspace = true

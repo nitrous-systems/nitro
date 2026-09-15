@@ -23,6 +23,7 @@ nitro-term   = { path = "crates/nitro-term" }
 nitro-settings = { path = "crates/nitro-settings" }
 nitro-raster = { path = "crates/nitro-raster" }
 nitro-text   = { path = "crates/nitro-text" }
+nitro-png    = { path = "crates/nitro-png" }
 nitro-seat   = { path = "crates/nitro-seat" }
 nitro-kms    = { path = "crates/nitro-kms" }
 rustix       = { version = "1", default-features = false, features = ["std"] }

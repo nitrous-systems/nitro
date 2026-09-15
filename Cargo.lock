@@ -242,6 +242,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "nitro-png"
+version = "0.0.1"
+
+[[package]]
 name = "nitro-raster"
 version = "0.0.1"
 dependencies = [
