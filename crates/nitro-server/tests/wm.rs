@@ -1717,7 +1717,7 @@ fn a_hidden_overlay_does_not_swallow_the_title_bar_under_it() {
 /// The band straddles the frame edge and always did — six logical pixels
 /// out, and inwards as far as the frame's own border — so pressing *on*
 /// the border has always resized. What was missing was any way to know
-/// that: the border is one pixel wide and cursor shapes are M5, so the
+/// that: the border is one pixel wide and cursor shapes are M4, so the
 /// human on the box grabbed the border, saw nothing happen anywhere near
 /// it, and reported that resizing does not work.
 ///
@@ -1771,6 +1771,27 @@ fn the_frame_edge_lights_up_where_a_press_would_resize_it() {
         win.frame(true).w,
         f.w + 30.0,
         "a left-edge drag grew the window leftwards"
+    );
+
+    // Hovering in and out of the band is a *colour* change and nothing
+    // else: the title cannot have changed, so nothing may be re-shaped.
+    // The first cut of this feature restyled through the full `restyle`,
+    // which elides (a binary search of `measure` calls) and re-shapes on
+    // every call, so wiggling the pointer over a window edge did text
+    // layout — on the motion path, and into `shape_us_mean`. A monotonic
+    // counter is what can say "none at all"; a mean cannot, because the
+    // work is real work and the average stays plausible.
+    let layouts = h.stat("text_layouts");
+    for _ in 0..3 {
+        h.point_at(hover_x, hover_y, OUT);
+        h.settle();
+        h.point_at(f.x + 40.0, hover_y, OUT);
+        h.settle();
+    }
+    assert_eq!(
+        h.stat("text_layouts"),
+        layouts,
+        "crossing a resize band must not shape any text"
     );
 
     // Move away and the border goes back to its focus colour: the hint is

@@ -2591,6 +2591,12 @@ impl Server {
         // The resize affordance follows the pointer, but not during a drag:
         // the branch above has already returned, so a drag in flight never
         // repaints a border it is not over.
+        //
+        // This puts `frame_hit` on the **motion** path, where it used to run
+        // only on a button press — a z-order walk per motion event. That is
+        // why it no longer allocates, and why the restyle it may cause is
+        // `style_only` rather than the full `restyle`: see both for the
+        // costs that were taken back out.
         let hint = self.resize_hint_at(self.pointer_desktop());
         self.set_resize_hint(hint);
         let target = output.and_then(|id| input::hit(&self.scene, id, point));
@@ -3277,6 +3283,25 @@ impl Server {
     /// Restyle a window's frame for a focus change, and re-shape its title
     /// in the matching colour.
     fn restyle(&mut self, win: WindowKey, focused: bool) {
+        self.style_only(win, focused);
+        self.retitle(win);
+    }
+
+    /// The colours of a frame, and **only** the colours: no title.
+    ///
+    /// Split out of [`Server::restyle`] because the resize hint runs on the
+    /// *motion* path, and `retitle` is not cheap: it elides (a binary
+    /// search of `measure` calls), shapes, inserts a fresh run in the text
+    /// store and releases the old one — and because the `TextKey` is new
+    /// every time, `set_text`'s "same run" early-out never fires and the
+    /// title node is marked `Dirty::PAINT` on every call.
+    ///
+    /// Nothing about the hint changes the title: [`wm::title_color`]
+    /// depends on `focused` alone. So paying all of that whenever a pointer
+    /// crosses a window edge would be pure waste, and it would land in
+    /// `shape_us` — polluting the statistic `docs/latency.md` points a
+    /// reader at to find real shaping costs.
+    fn style_only(&mut self, win: WindowKey, focused: bool) {
         let Some(nodes) = self.decorations.get(&win).copied() else {
             return;
         };
@@ -3284,7 +3309,6 @@ impl Server {
         if let Err(e) = wm::style_frame(&mut self.scene, &nodes, focused, hint, &self.palette) {
             warn!("styling a frame: {e}");
         }
-        self.retitle(win);
     }
 
     /// Light the frame edge of whichever window the pointer could resize by
@@ -3294,7 +3318,7 @@ impl Server {
     /// straddles is one, so a user aiming at the border they can see has
     /// nothing telling them whether they are in it — which is #3713's
     /// second half, reported as "resizing does not work (by grabbing a
-    /// border)". Cursor *shapes* are the real answer and are M5; until
+    /// border)". Cursor *shapes* are the real answer and are M4; until
     /// then the border itself is the affordance, and this is what turns it
     /// on.
     ///
@@ -3311,7 +3335,11 @@ impl Server {
         let old = self.resize_hint;
         self.resize_hint = hint;
         for win in [old, hint].into_iter().flatten() {
-            self.restyle(win, self.focus == Some(win));
+            // Colours only: a hover must not re-shape a title that cannot
+            // have changed. See [`Server::style_only`], and
+            // `the_frame_edge_lights_up_where_a_press_would_resize_it`,
+            // which fails on `text_layouts` if this becomes `restyle`.
+            self.style_only(win, self.focus == Some(win));
         }
     }
 
@@ -3865,8 +3893,14 @@ impl Server {
         // *resize bands* reach outside a window, so a grab just past a
         // screen edge has to find the window on the other side of it: walk
         // every output, frontmost stack first.
-        let outputs: Vec<SceneOutputId> = self.outputs.iter().map(|o| o.scene_id).collect();
-        for id in outputs {
+        //
+        // By index, and deliberately: this used to collect the scene ids
+        // into a `Vec` to end the borrow of `self.outputs`, which was
+        // affordable when it ran once per button press. The resize hint put
+        // it on the *motion* path, and an allocation per motion event is
+        // exactly what `docs/budget.md` promises the input path does not do.
+        for i in 0..self.outputs.len() {
+            let id = self.outputs[i].scene_id;
             let origin = self.desktop_origin(id);
             let local = Point::new(point.x - origin.x, point.y - origin.y);
             for win in self.scene.windows_front_to_back(id) {

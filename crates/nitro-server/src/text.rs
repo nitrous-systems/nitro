@@ -127,6 +127,19 @@ pub struct TextEngine {
     store: TextStore,
     /// Microseconds per `shape` call, for the `shape_us_mean` statistic.
     shape_us: Window,
+    /// How many layout passes have run: every `shape` **and** every
+    /// `measure`, which is what `shape_us_mean` already averages over.
+    ///
+    /// A monotonic count rather than a rate, because the question it
+    /// answers is not "how fast" but "did this happen at all". #3713 put
+    /// the resize hint on the motion path, and the first cut restyled a
+    /// frame through `retitle`, which elides (a binary search of
+    /// `measure`s) and re-shapes on every call — so wiggling the pointer
+    /// across a window edge shaped text, for a title that cannot have
+    /// changed. `shape_us_mean` could not show it (it is a mean, and the
+    /// work is real work, so the number stays plausible); a counter that
+    /// must not move does.
+    layouts: u64,
     /// Device-space glyph positions, reused across paint calls so a run of
     /// glyphs costs no allocation. See [`TextEngine::paint`].
     batch: Vec<(i32, i32, GlyphKey)>,
@@ -171,6 +184,7 @@ impl TextEngine {
             atlas: Atlas::new(),
             store: TextStore::new(),
             shape_us: Window::new(SHAPE_WINDOW),
+            layouts: 0,
             batch: Vec::new(),
         }
     }
@@ -207,6 +221,7 @@ impl TextEngine {
         );
         self.shape_us
             .push(u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX));
+        self.layouts += 1;
         let key = self.store.insert(owner, shaped);
         // The store just took it, so the lookup cannot fail.
         let shaped = self
@@ -234,6 +249,7 @@ impl TextEngine {
         );
         self.shape_us
             .push(u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX));
+        self.layouts += 1;
         metrics
     }
 
@@ -439,6 +455,7 @@ impl TextEngine {
         out.push(("atlas_bytes", self.atlas.bytes() as u64));
         out.push(("text_runs", self.store.len() as u64));
         out.push(("shape_us_mean", self.shape_us.mean()));
+        out.push(("text_layouts", self.layouts));
     }
 }
 

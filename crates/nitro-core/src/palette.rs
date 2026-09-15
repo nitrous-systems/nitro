@@ -191,7 +191,7 @@ roles! {
     /// straddles is one, so without something to see there is nothing to
     /// tell a user where to press — they grab the visible border, miss by
     /// three pixels, and conclude that resizing does not work (#3713).
-    /// Until cursor *shapes* land (M5) this highlight is the whole of the
+    /// Until cursor *shapes* land (M4) this highlight is the whole of the
     /// affordance, which is why it is a role and not a tint of
     /// `window_border_active`: it has to read clearly against both the
     /// border colours *and* whatever is behind the window.

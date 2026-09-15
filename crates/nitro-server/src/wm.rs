@@ -699,7 +699,7 @@ pub const TITLE_SIZE_LINE: f32 = 18.0;
 /// path for "the colours moved but the focus did not".
 ///
 /// `hint` lights the border up in [`Role::ResizeHint`]: the pointer is in
-/// this window's resize band, and until cursor shapes land (M5) the
+/// this window's resize band, and until cursor shapes land (M4) the
 /// border changing colour is the only thing that says so. See
 /// [`border_color`].
 ///
