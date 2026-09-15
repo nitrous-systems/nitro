@@ -525,6 +525,87 @@ shipped; the note is here so the next person knows what they are
 choosing between. Our own applications keep the convention: the
 `.desktop` files under `deploy/` are named after their app ids.
 
+### Measured on the box
+
+Test box (Pentium G3240, HDMI-A-1 1920×1080), my build of server *and*
+every client, the human's own `server.conf` restored afterwards.
+
+**What the box actually has**, because that is the finding the whole
+design has to survive: `/usr/share/icons` holds **17 PNGs**, of which the
+application ones are `foot`, `gvim`, `apport` and `org.freedesktop.fwupd`
+(plus `htop` in `/usr/share/pixmaps`). Adwaita is not installed at all.
+So `hicolor` PNGs installed by applications really are what exists, the
+symbolic fallback really is the usual answer, and no fixture had to be
+installed to take the screenshot below — the icons in it are the box's.
+
+**The launcher**, opened on the bare Super tap, 20 entries:
+
+| row | icon it asked for | what was drawn |
+|---|---|---|
+| Foot | `foot`, coloured | the theme's PNG — 23 non-grey px in the icon box |
+| Htop | `htop`, coloured | the theme's PNG — 343 non-grey px |
+| Calculator, Files, Settings, Terminal | `calculator`, `folder-fill`, `gear`, `terminal`, symbolic | tinted, 0 non-grey px |
+| Vim | `gvim`, coloured | fell back — `gvim` is only under `locolor` |
+
+"Non-grey" (max channel − min channel > 24) is the discriminator rather
+than "there is ink": a symbolic icon is tinted from the palette and so is
+grey by construction, while a real application icon cannot be. Foot's
+cream `(249, 239, 198)` and Htop's green `(110, 193, 112)` are colours no
+palette role in either scheme contains.
+
+**Lazy decode, from the outside.** `app_icon_loads` was **0** until the
+launcher was first shown — the rows existed, the names were resolved, and
+not a byte had been read. On the first paint it went to 5: the icons that
+resolved, not the 20 rows. Scrolling the list to rows the first paint did
+not reach left it at 5, because those rows' names do not resolve; every
+row that *does* resolve costs exactly one decode, ever.
+
+**Scale 2, and the 48 px source.** `theme.icons` untouched,
+`output.HDMI-A-1.scale = 2` written into the watched file and `reload`ed,
+nothing restarted:
+
+| | `app_icons_cached` | `app_icon_bytes` |
+|---|---|---|
+| scale 1 | 2 | **4 608** = 2 × 24² × 4 |
+| scale 2 | 4 | **23 040** = 4 608 + 2 × 48² × 4 |
+
+The delta is **+18 432 bytes, exactly two 48×48 tiles**. A 24-logical
+icon on a 2× output is 48 device px, and the cache grew by precisely the
+two new tiles at that size rather than by a scaled copy of the old ones —
+which also shows the 24 px entries were kept, since an output can change
+scale back. That is the arithmetic proof the task asked for, and it is
+stronger than a crop: a doubled 24 px tile would occupy the same 9 216
+bytes each, so bytes alone would not discriminate — but the *theme* has
+no 24 px `foot`, so the scale-1 tile is itself a downscale of the 48 and
+the scale-2 one is the file untouched.
+
+**Idle**, 45 s windows gated to start at `:02` so neither crosses a
+minute boundary (the instrument error `docs/icons.md` already records),
+launcher closed, with an `NITRO_ICON_PATH=/tmp/no-such-icons` control arm
+that makes every application icon unresolvable:
+
+| arm | `app_icon_loads` | frames / 45 s | `icon_renders` | bar CPU ticks |
+|---|---|---|---|---|
+| icons resolve | 5 | **2** | 7 → 7 | 0 |
+| control, nothing resolves | 0 | **2** | 7 → 7 | 0 |
+
+Identical, and identical to icons-A's figure: the 2 frames are the bar's
+30 s sensor poll. Application icons add nothing to idle, which is the
+claim — `SetIcon` is one-way, the decode is the server's and already
+done, and a cached tile is an integer-aligned blit.
+
+**The bar's window list**, with calc, settings and a terminal open: all
+three show the symbolic `window`, because our app ids (`nitro-calc`,
+`nitro-settings`, `nitro-term`) are in no icon theme on the box. That is
+rule (a) working as documented rather than failing — the fallback is what
+keeps the list readable — and it is exactly what the `.desktop` files
+under `deploy/` would fix on a box where they were installed.
+
+Sizes and memory are in `docs/budget.md`; the two numbers worth repeating
+here are that the server grew **+97 368 B (+3.9 %)**, a third of what the
+symbolic set cost, and that the largest icon actually loaded decoded in
+**214–510 µs**.
+
 ### Still deferred
 
 * **SVG application icons**, and the gradients they need.

@@ -71,6 +71,60 @@ The clients pay 0.5–1 KB each for the `Icon` widget and nothing for the
 artwork, which is the whole point of the server owning it: `hey` links no
 toolkit and is byte-identical.
 
+### M4-H: the application icons (#3714)
+
+The other half — the XDG theme lookup, `nitro-png` and the coloured tile
+cache. Measured the same way, my branch against main `c843f59`, release,
+same flags:
+
+| binary | main | M4-H | delta |
+|---|---|---|---|
+| `nitro-server` | 2 501 560 | **2 598 928** | **+97 368 (+3.9 %)** |
+| `nitro-launcher` | 721 184 | **731 096** | **+9 912 (+1.4 %)** |
+| `nitro-bar` | 622 304 | **628 616** | **+6 312 (+1.0 %)** |
+| `nitro-calc` | 594 272 | **599 184** | **+4 912 (+0.8 %)** |
+| `nitro-settings` | 753 592 | **758 016** | **+4 424 (+0.6 %)** |
+
+The server's +95 KB is the PNG decoder, the theme parser and the
+resampler. It is a third of what the symbolic set cost, and the shape of
+the comparison is worth keeping: M4-G's +268 KB was 84 % *somebody else's
+rasteriser* linked in for the first time, while this row is code we own —
+#3711 measured the alternative at **+130 KB** for the `png` crate and its
+eight dependencies, so the decision made there is worth 33 KB and eight
+crates here. `DEPENDENCIES.md` has that table.
+
+The clients pay 4–10 KB for the leading-icon `Button` mode, the tint enum
+and the fallback latch — no artwork and no decoder, which is the same
+bargain as before. `nitro-launcher` pays most because it also gained
+`Icon=` parsing.
+
+**Resident memory.** The tile cache is the only new allocation, and it is
+bounded at 4 MiB with an LRU (`IconEngine::APP_MAX_BYTES`). Server VmRSS
+with five 24 px tiles cached against a fresh server with none — three
+interleaved pairs, each arm its own process, because the cache survives a
+reload and there is no honest way to empty it in place:
+
+| pair | none | 5 tiles cached | delta |
+|---|---|---|---|
+| 1 | 17 700 kB | 17 788 kB | **+88 kB** |
+| 2 | 17 684 kB | 17 776 kB | **+92 kB** |
+| 3 | 17 640 kB | 17 720 kB | **+80 kB** |
+
+`app_icon_bytes` says 11 520 for those five (5 × 24² × 4), so ~80 kB of
+the ~87 kB mean is the decoder's transient and the allocator's rounding
+rather than the tiles. That is the cost `nitro-png`'s README predicts and
+names as its one real trade: it holds the whole filtered raster *and* the
+output buffer at once. At icon sizes it is tens of kilobytes; the fix, if
+a consumer ever decodes something large, is a streaming unfilter and not
+a dependency.
+
+**Decode time**, the number the lazy-decode decision rests on:
+`app_icon_decode_us_max` after loading every application icon the box can
+resolve was **214–510 µs** across runs, for 48×48 hicolor PNGs resampled
+to 24 device px. #3711 measured 2 178 µs for a 256×256 on this CPU, so a
+large icon really would be a frame — which is why the decode is on the
+first *paint* and never on the commit or on a repaint.
+
 Identical on the dev machine and the box (same artefact, `rsync`ed, and
 `sha256sum`-verified on both sides for the M2 row below).
 
