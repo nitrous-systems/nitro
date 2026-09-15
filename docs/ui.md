@@ -289,7 +289,7 @@ and the content hangs underneath it.
 | `Checkbox` | `checkbox` | `true`/`false` | `toggle`, `set_value`, `focus` | Space toggles |
 | `Slider` | `slider` | the number | `set_value`, `focus` | drag, arrows, Home/End, optional step |
 | `Scroll` | `scroll` | the offset | `scroll_to`, `scroll_by`, `focus` | wheel, arrows, PgUp/PgDn, Home/End |
-| `List` | `list` | the **visible** rows, one per line | `activate`, `select`, `scroll_to`, `scroll_by`, `focus` | virtualised: `visible + 2` rows materialised, whatever the model holds |
+| `List` | `list` | the **visible** rows, one per line | `activate`, `select`, `scroll_to`, `scroll_by`, `focus` | virtualised: `visible + 2` rows materialised, whatever the model holds; a row's icon is a **name** |
 | `Separator` | `separator` | — | — | spans its container on the other axis |
 | `Image` | `image` | `WxH` | — | an `ARGB` buffer, uploaded once in a memfd |
 | `Icon` | `icon` | the icon **name** | `set_icon`, `set_value` | named, never drawn: the server owns the artwork (`docs/icons.md`) |
@@ -392,11 +392,16 @@ when it stands beside it: a 13 px application logo next to a 16 px
 symbolic one is visibly odd, and 16/24/32/48 are the sizes the artwork is
 drawn for.
 
-`List` rows are **not** affected by any of this: a row's `icon` field is
-a glyph string painted as text, not an `Icon` widget, and rows are
-virtualised into slot ranges rather than being arbitrary widgets. Real
-icons in a `List` would be their own task; a leading-icon `Button` is
-what the launcher and the bar use.
+`List` rows carry icons too, since M4-I, and on the same terms: a row's
+`icon` field is an icon **name**, painted into an `Icon` node in a fixed
+column, guarded by the same capability check and diffed against the same
+slot cache. What a row does *not* get is `.coloured()` or a fallback —
+there is no `IconMode` to choose and no `.fallback(…)` to latch — because
+a row's icon is the app's own furniture rather than a name that came out
+of a `.desktop` file, so there is nothing for it to fall back *from*. The
+`icon_tint` field is an `IconTint` rather than a role so that the door is
+open; the widget has no second name to try. See *A row's icon is a name*
+under `List` below.
 
 The guard is not cosmetic, and this is the reason it is spelled out
 here rather than left to the reader. Painting an icon creates a node of
@@ -452,8 +457,8 @@ is that widget. `nitro-files` (M4-D) is the app that needed it, because a
 directory is the only model whose size the user chooses and nothing
 bounds; `docs/files.md` has that argument.
 
-Its rows are **data, not widgets**: a `Row` is an optional glyph, a
-primary text and a right-aligned secondary text, and the widget owns the
+Its rows are **data, not widgets**: a `Row` is an optional **icon name**,
+a primary text and a right-aligned secondary text, and the widget owns the
 model. There is no per-row widget, no per-row callback and no per-row
 state — a row is addressed by its index, and that index is what
 `on_activate` and `on_select` are handed. An app with a model of its own
@@ -512,6 +517,80 @@ because a list that armed a timer on every keystroke would wake the loop
 half a second after the user stopped typing in order to do nothing;
 `a_settled_list_sends_nothing_while_idle` asserts `next_timeout() ==
 None` and then that the app is silent.
+
+#### A row's icon is a name, in a column that costs width and never height
+
+`Row::icon("folder-fill")` names an icon from the server's symbolic set —
+the same namespace and the same `SetIcon` a `Button` or an `Icon` widget
+uses, so `docs/icons.md`'s three properties come with it: it survives a
+remote link, it recolours itself when the scheme flips with no client
+message, and it is rasterised at the output's device scale rather than
+doubled. `.icon_tint(t)` and `.icon_size(px)` are beside it; the tint
+defaults to `ColorRole::Text` and the size to **16**, which is one of the
+four sizes the artwork is drawn for.
+
+It used to be a *glyph* — `"/"`, `"~"` — painted as text, because when the
+widget was written the server had no icons. It has had them since M4-G,
+and the substitution is not cosmetic: the glyph came from whatever font on
+the box happened to carry that character, at whatever weight, and on a box
+whose fonts lacked it from nothing at all.
+
+**The column is width, not height**, and that is the layout contract worth
+stating because breaking it would change every app at once: a 16 px icon
+in a row whose text line is ~13 px does *not* make the row taller — the
+icon is centred in the row's own height, the row height is still
+`line + 8`, and `a_row_that_gained_an_icon_is_the_same_height` asserts
+that a list with icons and one without have the same `row_height()` and
+fit the same number of rows.
+
+The column is **this row's own icon side**, not the widest in the model.
+Finding that maximum means walking every row, which is the one thing a
+virtualised list must never do; every list in this tree uses one size, so
+the labels line up, and a list that mixed sizes would indent per row
+rather than centre in a shared column. That is the trade, and it is here
+rather than left to be discovered.
+
+**Without `caps::ICONS` the column collapses** and the label starts where
+it would have, which is the same bargain a leading-icon `Button` makes: a
+row with a gap where an icon would be is a worse answer than a row without
+one. The guard is not cosmetic, for the reason spelled out above — an
+`Icon` node against a server predating the icon set is a decode error and
+therefore fatal — and
+`without_the_icons_capability_a_row_is_its_label_and_no_icon_node` pins it
+by masking the bit *before the first paint*.
+
+Two failures that the per-slot cache cannot see on its own, and both are
+pinned. A **scheme flip** must cost the rows' text and nothing for their
+icons, because the node holds a role index and the server resolves the
+colour per frame: `a_row_icon_survives_a_scheme_flip_with_no_set_icon_at_all`
+asserts zero `SetIcon`s *and* that the server's `icon_renders` did not
+budge. And the **capability going away** moves every label while leaving
+"same row, same generation, same selection" true, which is exactly the
+shape of the palette bug the `painted_with` field exists for — so
+`has_icons()` is a field of `RowPaint` beside the colours, and
+`the_capability_going_away_moves_the_labels_and_the_cache_notices` checks
+that the labels move and the icon nodes are destroyed rather than left
+drawing stale artwork.
+
+**What it costs is the icons that changed, and the comparison is against
+what was *requested*.** A `List` reuses its ring slots, so a refresh that
+produced the same listing must cost nothing, and a refresh that changed
+one row's type must cost exactly one `SetIcon`. Both fall out of the paint
+slot caching the last `SetIcon` it *sent* rather than what is displayed —
+which is the lesson #3714's review paid for: a slot that cached the
+displayed name would re-send a row's icon on every repaint the moment a
+fallback or a capability mask put something else on screen.
+`set_rows_with_identical_rows_sends_no_set_icon_and_one_changed_row_sends_one`
+is the pair of numbers, **0 and 1**, with the `SetText` count beside them
+as the control that makes the zero mean something.
+
+Scrolling is the other half, because slots are addressed `row % ring`: a
+re-anchor hands slot *k* a different row, and if that row's icon name
+matches the slot's cached one, nothing is sent. Twenty whole-window
+scrolls over a model whose icons alternate cost **0 `SetIcon`s against 400
+`SetText`s** on the harness's ten-slot ring — the rows all changed, the
+icons did not
+(`scrolling_does_not_re_send_an_icon_for_a_row_that_merely_moved`).
 
 Its introspection value is the **visible** rows, one per line, with the
 detail column tab-separated, which is the honest answer rather than a

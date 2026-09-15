@@ -98,6 +98,38 @@ and the fallback latch — no artwork and no decoder, which is the same
 bargain as before. `nitro-launcher` pays most because it also gained
 `Icon=` parsing.
 
+### M4-I: the file listing's type icons (#3716)
+
+`Row` gaining a named icon in `nitro-ui`, and `nitro-files` resolving one
+per row from its MIME type. **No server change**, which is the point of
+by-name and shows in the table: the artwork was already there.
+
+Dev machine, my branch against main `6019fde`, release, same flags, both
+built in their own worktree from a clean `target`:
+
+| binary | main | M4-I | delta |
+|---|---|---|---|
+| `nitro-files` | 849 520 | **857 440** | **+7 920 (+0.9 %)** |
+| `nitro-bar` | 628 600 | 628 632 | **+32** |
+| `nitro-launcher` | 732 184 | 732 216 | +32 |
+| `nitro-settings` | 758 016 | 758 048 | +32 |
+| `nitro-calc` | 599 200 | 599 232 | +32 |
+| `nitro-term` | 679 520 | 679 552 | +32 |
+| `nitro-server` | — | — | **+0**, untouched |
+
+`nitro-files` stays inside its **1 MB client budget at 86 %**, up from
+85 %. Its +7.9 KB is `mime::icon_for`'s four match tables and the
+per-family predicates around them, which is string data and a jump table;
+the +32 bytes on every other toolkit client is `List`'s icon branch, and it
+is the honest figure for "a widget gained a feature five apps do not use".
+
+The row worth reading is the server's zero. A per-type icon column on a
+thousand-row listing added **no bytes at all** to the process that draws
+it, because the client sends `"file-earmark-code"` and the artwork was
+already compiled in — which is the arithmetic form of the argument
+`docs/icons.md` opens with, and the reason M4-G's +268 KB was a one-off
+rather than a per-consumer cost.
+
 **Resident memory.** The tile cache is the only new allocation, and it is
 bounded at 4 MiB with an LRU (`IconEngine::APP_MAX_BYTES`). Server VmRSS
 with five 24 px tiles cached against a fresh server with none — three

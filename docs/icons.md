@@ -250,6 +250,25 @@ and asserts zero.
 row with the label, in `ColorRole::Text`: `display`, `keyboard`,
 `speaker`, `palette`.
 
+**`nitro-files`.** Every row of the listing carries a **type** icon at
+16 px in `ColorRole::Text`: `folder-fill` for a directory and for a symlink
+pointing at one, the `file-earmark-*` family by MIME type
+(`-text`/`-code`/`-image`/`-music`/`-play`/`-font`/`-zip`, plain
+`file-earmark` for anything unclaimed), and `hdd` for a fifo, socket,
+device node or an entry whose `stat` failed. The map is
+`mime::icon_for`; `docs/files.md` has the table and the argument for why
+source is matched before `text/*`.
+
+It is the first consumer where the icon is **per row of a virtualised
+list** rather than per widget, which is the case the cache's arithmetic was
+waiting for: a screenful of a mixed directory is one entry per *distinct*
+name at one size, so ten rows showing three types cost three masks.
+`nitro-ui`'s `List` grew the row-icon API for it (`docs/ui.md`), and the
+row's diff compares against the last `SetIcon` it **requested** — so a
+`set_rows` over an unchanged listing costs zero and twenty whole-window
+scrolls over a model whose icons alternate cost zero against 400
+`SetText`s.
+
 The heading row is deliberately **not** a `control_row`. A `control_row`
 is `ROW_HEIGHT` (26 px) tall by contract, and a heading is as tall as its
 own text (17.5 px at `HEADING_SIZE`); pinning the headings to 26 would

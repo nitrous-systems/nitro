@@ -56,27 +56,49 @@ process.
 
 ## The model
 
-### A row is four fields, and none of them is a path
+### A row is six fields, and none of them is a path
 
-`dir::Entry` is a name, a `Kind`, a size and an mtime. The name is the
-**file name only**, never a path: the directory it is in is the one the
-app is showing, and carrying it per row would be a hundred thousand
-copies of the same string. `Kind` is the four cases `symlink_metadata`
-can answer without following anything — `Dir`, `File`, `Symlink`,
-`Other` — and the last one absorbs fifos, sockets, device nodes and,
-deliberately, entries whose `stat` failed.
+`dir::Entry` is a name, a `Kind`, an icon name, a symlink-follow answer, a
+size and an mtime. The name is the **file name only**, never a path: the
+directory it is in is the one the app is showing, and carrying it per row
+would be a hundred thousand copies of the same string. `Kind` is the four
+cases `symlink_metadata` can answer without following anything — `Dir`,
+`File`, `Symlink`, `Other` — and the last one absorbs fifos, sockets,
+device nodes and, deliberately, entries whose `stat` failed.
 
-Two decisions in that sentence are worth defending.
+Three decisions in that sentence are worth defending.
 
-**A symlink is a symlink even when it points at a directory.** Resolving
-it would be a second `stat` per link on every listing, and a hang on the
-one that points into a dead mount — which is the failure this app spends
-most of its design avoiding. The visible consequence is that a symlinked
+**A symlink's `Kind` is `Symlink` even when it points at a directory.**
+The kind is what `symlink_metadata` says and nothing more, so a symlinked
 directory sorts among the files rather than with the directories.
-Entering it still works, because the kernel follows the link when the
-app `read_dir`s it, and `activate` does one `metadata` call on the one
-row the user actually chose: one syscall for one deliberate action is a
-different proposition from one per row per listing.
+Entering it still works, because the kernel follows the link when the app
+`read_dir`s it.
+
+**But the follow itself now happens once per listing**, and that is a
+change M4-I made deliberately. The icon column has to know whether a link
+points at a directory — a link to a folder draws a folder, because that is
+what activating it does — so `read_dir` does one `metadata` call **per
+symlink**, and records the answer in `Entry::symlink_dir`. The cost is
+bounded by the number of links in the directory rather than by its size,
+which is the distinction that mattered in the original argument: what was
+refused was a `stat` per *row*, and this is not that. It is still the case
+that a link into a dead mount can block here; what has changed is that the
+blocking is paid by the listing rather than by `activate`, and a listing
+already reads the directory.
+
+The payoff is that `activate` costs no syscall at all — it asks
+`Entry::opens_a_directory()`, which is the same field the icon came from,
+so "enter the directory this points at" and "draw it as a folder" cannot
+disagree. Before, they were two separate `metadata` calls that could in
+principle answer differently.
+
+**The icon is a field, not a method**, and that is the third decision.
+`Entry::icon` is the *name* of a symbolic icon, resolved when the listing
+was read, because resolving it means a MIME glob match — and `Files::rows`
+runs again every time the selection moves. A `rows()` that looked the type
+up would be a glob match per file and a `stat` per link **per keystroke**;
+`a_selection_move_does_not_re_resolve_a_single_mime_type` is the test that
+holds the line.
 
 **A `stat` that failed is still a row**, with a size and time of zero. A
 dangling symlink, a file deleted between the `getdents` and the `stat`, a
@@ -153,6 +175,118 @@ arithmetic, in different punctuation, writes the trash's `DeletionDate`;
 `the_civil_calendar_gets_the_leap_years_right` checks 1900 (not a leap
 year), 2000 (one) and the December 31st where the shifted-year
 arithmetic has to put the day back into the right civil year.
+
+### The icon column is a type, drawn by the server
+
+Every row carries the **name** of a symbolic icon. Not a glyph and not a
+picture: the client sends `"file-earmark-code"` and the server rasterises
+artwork it owns, at the output's device scale, tinted from the palette's
+`Text` role. `docs/icons.md` makes that argument in full; the three
+consequences here are that the column survives a remote link (a buffer is
+a file descriptor and cannot cross TCP), recolours itself on a
+`theme.scheme` flip with **no client message at all**, and is a real 2×
+raster on a 2× screen rather than a doubled 16 px tile.
+
+It used to be a glyph — `/` for a directory, `~` for a symlink, a space
+otherwise — and this document's *Limitations* said so under "no icon
+theme; glyphs only", because when the app was written the server drew
+rectangles and text. It has drawn icons by name since M4-G (#3712) and
+theme icons since M4-H (#3714), so the limitation closed and the glyph
+went with it. The glyph was never good: `/` and `~` came from whatever
+font on the box carried them, at whatever weight, beside text shaped from
+a different face.
+
+**The map**, in `mime::icon_for`, keyed on the MIME type
+`mime::type_of` already resolves for opening files:
+
+| what | icon |
+|---|---|
+| a directory, and a symlink pointing at one | `folder-fill` |
+| `text/*`, `application/{json,xml,toml,x-yaml,pdf,rtf,x-tex,x-desktop}` | `file-earmark-text` |
+| source, scripts and markup: `text/x-c*`, `text/x-rust`, `text/x-python`, `text/x-shellscript`, `text/html`, `text/css`, `application/javascript`, … | `file-earmark-code` |
+| `image/*` | `file-earmark-image` |
+| `audio/*` | `file-earmark-music` |
+| `video/*` | `file-earmark-play` |
+| `font/*`, `application/x-font-*` | `file-earmark-font` |
+| archives: `application/{zip,gzip,zstd,x-tar,x-xz,x-bzip*,x-7z-compressed,vnd.rar,x-compressed-tar,…}` | `file-earmark-zip` |
+| a symlink that does not point at a directory, and a file whose type is unknown or unclaimed | `file-earmark` |
+| a fifo, socket, device node, or an entry whose `stat` failed | `hdd` |
+
+Two things in that table are decisions rather than data.
+
+**Source is matched before `text/*`.** A `.rs`, a `.c`, a `.sh` and an
+`.html` are all `text/…`, and a code icon says more about them than a
+document icon does — so the full-type lists come first and `text/*` is the
+catch-all beneath them. That ordering is the only real choice in the map
+and it is visible at the call site rather than buried in a match arm.
+
+**An unclaimed type gets the plain file icon**, never a guess. The column
+then says "a file", which is true. A guess would have the column asserting
+a type the table does not know, and an icon is exactly the kind of claim a
+user believes without checking.
+
+**A symlink shows what it points at, and the arrow moved to the detail
+column.** A link to a directory draws `folder-fill`, because activating it
+enters one; the `→` that used to be a `~` in the icon column is now in
+front of the size, which is the only thing left distinguishing a link from
+its target. Dropping it would make them indistinguishable, which is worse
+than a duplicated folder icon.
+
+**Without `caps::ICONS`** the column collapses and the names start where
+they would have — the toolkit's rule for every icon, and the one
+`Ui::hide_icons` exercises in `nitro-ui`'s tests.
+
+#### What it cost, and the allocation it found
+
+The lookup is one glob match per file per **listing**, and that sentence
+is the whole cost argument: `Files::rows` is re-run whenever the selection
+moves, so a lookup living there would be a glob match per file per
+keystroke. It lives in `dir::read_dir` instead, and its answer is an
+`Entry` field.
+
+Measuring it turned up a real defect, and it was a defect the moment this
+task put `type_of` on the listing path rather than on the open path.
+`type_of` filtered its rules with `name.ends_with(&format!(".{ext}"))` —
+one `String` allocation **per rule per file**. Against a 2 000-rule
+`globs2` and a thousand-row directory that is two million allocations:
+
+| a thousand rows, 2 000-rule `globs2`, release | |
+|---|---|
+| with `format!` per rule | **75.7 ms** |
+| with a byte suffix compare | **2.9 ms** |
+| the same listing with an empty table (no `globs2`) | 1.1 ms |
+| the thousand MIME lookups alone, no filesystem | **1.7 ms** |
+
+75.7 ms is an eighth of a second of the event loop on the *dev* box, which
+on the Pentium would have been a visible stall on every listing — and it
+was invisible before, because `type_of` was called once, when the user
+opened something. `ends_with_dot_ext` is the fix and it carries that
+paragraph as its doc comment.
+
+`a_thousand_row_listing_stays_inside_a_frame` is the test, with a loose
+100 ms bound deliberately: a tight bound is a flaky test readers learn to
+re-run, which is worse than no test. What the bound guards is a *shape*
+regression — a lookup that started opening files, or one that moved back
+to per-repaint. The third arm times the thousand lookups with no
+filesystem in the way, so the number attributed to the icon column is the
+icon column's own.
+
+**The box with no `shared-mime-info`** is the arm that has to work, since
+that is the test box's bare rootfs: with an empty glob table the built-in
+extension table answers, and `.txt`, `.rs`, `.sh`, `.html`, `.png`,
+`.ppm`, `.mp3`, `.mp4` and `.zip` all get their right icon
+(`with_no_globs2_the_builtin_table_still_gives_sensible_icons`). Two
+honest gaps are pinned rather than papered over: the built-in table has no
+font extensions, so a `.ttf` is the generic file icon *without* a
+`globs2` and a font icon *with* one. Filling that gap is an improvement to
+`builtin_type`, not to this map, and the test asserts both halves so the
+next person sees the choice.
+
+**No sidebar and no places list.** There is nothing for `house`,
+`hdd`-as-a-root or `recycle` to go in: the app is a path bar, a list and a
+status line, and the trash is reached with `Delete` rather than from a
+tree. The three names are in `icons.txt` and are what a sidebar would use
+on the day one exists; adding the sidebar is a feature, not an icon.
 
 ## The virtual list, and why a file manager is the app that needed it
 
@@ -919,19 +1053,26 @@ regrets.
   reason (`DEPENDENCIES.md`), and a file manager reading every file in a
   directory to draw the list is precisely what the extension-based MIME
   lookup exists to avoid.
-* **No icon theme; glyphs only.** A directory gets `/`, a symlink `~`,
-  everything else a space. An icon theme means an SVG rasterizer or a PNG
-  decoder plus the freedesktop icon-theme lookup, and the server draws
-  rectangles and text; a glyph is what it can draw with the fonts it has.
+* **Symbolic icons only; no coloured theme icons and no per-app artwork.**
+  The column is the server's own symbolic set, by MIME type. A `.desktop`
+  file showing *its* application's icon, or a `.png` showing a thumbnail
+  of itself, are the two things it deliberately does not do: the first
+  means parsing every `.desktop` in the listing to read `Icon=`, which is
+  a file read per row; the second is the thumbnail limitation above.
+  `nitro-launcher` already shows coloured theme icons
+  (`IconTint::Coloured`), so the mechanism exists — what is missing is a
+  reason to pay a read per row for it.
 * **No mounts UI.** No removable-device list, no mount or unmount, no
   `udisks`. All three are D-Bus, and `DESIGN.md` spends its one D-Bus
   permission on the session rather than here.
 * **Timestamps are UTC.** Argued above: no timezone database in the tree.
   Wrong by a constant offset, so the column's ordering stays honest.
-* **Symlinks are not stat'ed through in the listing.** A symlinked
-  directory shows as a symlink and sorts with the files. Following would
-  be a `stat` per link per listing and a hang on the one pointing into a
-  dead mount; `activate` follows the single row the user chose.
+* **A symlinked directory sorts with the files**, because its `Kind` is
+  what `symlink_metadata` says. Since M4-I the listing *does* follow each
+  link once — one `metadata` per symlink, for the icon column and for
+  `activate` — so a link into a dead mount can block the listing. What is
+  still refused is a `stat` per **row**; the follow is bounded by the
+  number of links. Argued above.
 * **`nitro-term` does not honour `-e` yet**, so the `text/*` editor
   fallback opens a terminal rather than the editor. The argv is already
   the conventional `term -e EDITOR path`, so this closes with a change in
@@ -973,7 +1114,11 @@ feature set narrowed to those four. `DEPENDENCIES.md` carries the row.
 ## Testing
 
 * `src/dir.rs` unit-tests the model with no display server: the four
-  kinds, a dangling symlink surviving a failed `stat`, the
+  kinds, the icon each of them resolves to (including a real fifo, a
+  symlink to a directory, a symlink to a file and a dangling one), the
+  system glob table deciding an icon the built-in one has no answer for, a
+  timed thousand-row listing with the MIME lookups isolated,
+  a dangling symlink surviving a failed `stat`, the
   directories-first rule under all three sort keys, case-insensitive
   names, the total order asserted from two starting permutations, the
   hidden-file filter, 1000-based sizes with the 999 999-byte rollover,
@@ -982,7 +1127,11 @@ feature set narrowed to those four. `DEPENDENCIES.md` carries the row.
   and the background scan — woken through a real `poll`, delivering
   sorted entries, delivering a failure as a value, and surviving being
   dropped mid-read.
-* `src/mime.rs` unit-tests the resolution order against fixture
+* `src/mime.rs` unit-tests the type → icon map as a table — every family
+  it claims and the types it deliberately does not, case and parameters
+  folded, and the whole map reached through `type_of` with an **empty**
+  glob list so the no-`shared-mime-info` box is the arm under test. Then
+  the resolution order against fixture
   directories: the built-in table, a system rule outranking it, the
   longest suffix breaking a weight tie, `[Default Applications]` over
   `[Added Associations]` over `mimeinfo.cache`, a config list outranking
