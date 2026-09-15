@@ -1,0 +1,29 @@
+[Desktop Entry]
+Type=Application
+Name=Calculator
+GenericName=Calculator
+Comment=A calculator on nitro-ui
+# The file name is `nitro-calc.desktop` and the application's app id is
+# `nitro-calc` — the same string, deliberately. `nitro-bar`'s window list
+# resolves an icon by using a window's app id *as* an icon name
+# (docs/shell.md), which is the freedesktop convention and works exactly
+# when the two agree. Renaming either without the other silently costs
+# the bar its icon.
+#
+# `Icon=` names one of the **server's own symbolic icons**, not an icon
+# theme's: nitro's apps ship no artwork of their own, and a shape from
+# the compiled-in set is present on every box including one with no icon
+# theme installed at all. The launcher's built-in entry names the same
+# shape, so a box with this file and a box without look the same.
+#
+# Not installed by `just deploy`, for the reason `nitro-term.desktop`
+# records: on the box the binaries live in `~/nitro-bin`, which is not on
+# the session's PATH, so a bare `Exec=` fails — and a `.desktop` file
+# shadows the launcher's built-in entry, which uses an absolute path.
+# This file is for a packager who installs the binary into `/usr/bin`.
+Exec=nitro-calc
+Icon=calculator
+Terminal=false
+StartupWMClass=nitro-calc
+Categories=Utility;Calculator;
+Keywords=calculator;maths;arithmetic;

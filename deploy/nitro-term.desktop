@@ -16,7 +16,19 @@ Comment=A terminal on nitro-ui
 # then correct. `crates/nitro-launcher/README.md` describes the built-in
 # fallback that covers the box.
 Exec=nitro-term
-Icon=utilities-terminal
+# A **symbolic** icon name, not the theme's `utilities-terminal` this file
+# used to name. The reason is the one the whole set exists for: the box
+# this is deployed to has no icon theme with a terminal in it, so
+# `utilities-terminal` would be a `BadIcon` and a blank row, while
+# `terminal` is compiled into the server and present everywhere. It also
+# matches what the launcher's built-in entry asks for, so a box with this
+# file and a box without look identical.
+Icon=terminal
 Terminal=false
+# `nitro-term` registers this as its app id, and `nitro-bar`'s window list
+# uses a window's app id *as* an icon name (docs/shell.md). Keeping the
+# file name, the app id and this key the same string is what makes the
+# bar's rule work for our own applications.
+StartupWMClass=nitro-term
 Categories=System;TerminalEmulator;
 Keywords=shell;prompt;command;console;

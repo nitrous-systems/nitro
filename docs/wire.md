@@ -638,7 +638,7 @@ answer is an empty measurement rather than an error.
 |---|---|---|
 | `node` | `NodeId` | the `Icon` node |
 | `size` | `f32` | the icon's square side in **logical** pixels |
-| `role` | `u8` | palette `Role` index, or `0xff` = "as coloured" |
+| `role` | `u8` | palette `Role` index, or `0xff` = the **application** icon set |
 | `name` | `str` | icon name (`"gear"`); **empty clears the node** |
 
 Fixed head 9 bytes (`4+4+1`), then the name — the same shape as
@@ -662,16 +662,46 @@ for a non-finite or non-positive one rather than erroring, because an
 icon must never be able to kill a client.
 
 `role` is a palette index (`docs/theme.md`), resolved by the server at
-*paint* time. `0xff` (`AS_COLOURED`) means "draw the icon's own colours,
-do not tint"; it is accepted and draws nothing today, and exists so the
-wire does not have to change when the full-colour application icons of
-icons-B arrive. An index past the last role this server knows falls back
-to `Text` rather than vanishing — a client one release ahead gets a
-visible icon in the wrong colour, not a silent gap.
+*paint* time. An index past the last role this server knows falls back to
+`Text` rather than vanishing — a client one release ahead gets a visible
+icon in the wrong colour, not a silent gap.
+
+**`0xff` (`AS_COLOURED`) selects the other icon set.** Since M4-H it does
+not mean "this name, untinted": it means the name is an **application**
+icon, looked up in the machine's XDG icon theme (`theme.icons` in
+`server.conf`) and painted in the file's own colours. A palette role
+means the server's own symbolic set, and *nothing falls back between the
+two*.
+
+That is a decision rather than an implementation detail, so it is written
+down here as well as in `docs/icons.md`: one namespace searched
+"symbolic first" would make `SetIcon { name: "list" }` mean the desktop's
+own list glyph on a bare box and somebody else's artwork on a box with a
+theme that happens to ship a `list` — invisibly, and differently per
+machine. With the role as the selector the *caller* says which set it
+means, and there is no collision to reason about.
+
+The corollary is the combination that is **refused**: a palette role with
+a name only the icon theme has earns `BadIcon`, rather than finding the
+file and tinting its alpha. A theme icon is a picture, not a coverage
+mask — tinting one throws the artwork away and keeps the silhouette,
+which looks like a rendering bug on every icon that is not already
+monochrome. A client that wants a tinted icon names one from the
+symbolic set, which is what that set is for.
+
+The scale argument above holds for both, by different means: a symbolic
+icon is *rasterised* at the device size, and an application icon is read
+from the theme directory that matches the device size (a 48 px file for a
+24-logical icon on a 2× output) and resampled once into a cached tile.
+Neither is a doubled 16 px bitmap.
 
 An **unknown name** earns `Error { BadIcon }` and the node draws nothing;
-the connection survives. See [Errors](#errors) for why this and the
-remote buffer op are the only two non-fatal errors in the protocol.
+the connection survives. It covers both sets: a symbolic name the server
+does not have and an application name the machine's theme does not have
+are the same answer, because from the client's side they are the same
+fact — the icon it asked for cannot be drawn, and it should send its
+fallback. See [Errors](#errors) for why this and the remote buffer op are
+the only two non-fatal errors in the protocol.
 
 ### `CreateBuffer` — 0x0301 — **carries 1 fd**
 
@@ -1488,6 +1518,20 @@ to.
   already knows about them, which is the property that makes appending
   to a strict enumeration compatible here and would not make it so for,
   say, a new `Fill` tag the server could push unprompted.
+* The M4-H application icons change **no bytes at all**: `SetIcon`'s
+  reserved `role = 0xff` went from "accepted, draws nothing" to "this
+  name is an application icon". That is the door M4-G left open being
+  used, and it is the cheapest kind of change on this list — no op code,
+  no capability bit, no field. `VERSION` stays **1**.
+
+  It is worth one paragraph anyway, because a *meaning* changing is
+  exactly what the versioning policy is nervous about. It is safe here
+  because no client could have been relying on the old behaviour: the old
+  behaviour was "nothing is drawn", which is indistinguishable from a
+  node the client never created, and `docs/icons.md` and this document
+  both said in as many words that the value was reserved for this. The
+  observable difference for an old client is that a name it never had a
+  reason to send now draws an icon.
 * `VERSION` is bumped only for a change that is not expressible that way —
   a different framing, a changed field, a removed op. A version mismatch is
   fatal at handshake: there is no negotiation and no compatibility shim.

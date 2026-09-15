@@ -879,6 +879,7 @@ fn a_builtin_is_launchable_with_no_desktop_files_at_all() {
                 format!("echo ok > {}", marker.display()),
             ],
             terminal: false,
+            icon: Some("calculator".to_owned()),
             source: Source::Builtin,
         }],
     );

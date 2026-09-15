@@ -23,6 +23,7 @@ keyboard.options = ctrl:nocaps
 
 theme.scheme = dark
 theme.accent = #6ca8f0
+theme.icons  = hicolor
 ```
 
 Save it and the desktop re-lays out and re-colours. No restart, no `systemctl`, no
@@ -63,6 +64,7 @@ broken desktop and a text console.
 | `keyboard.options` | xkb options, e.g. `ctrl:nocaps` | none |
 | `theme.scheme` | `light` or `dark` — the desktop's colour scheme | `light` |
 | `theme.<role>` | `#rrggbb` or `#rrggbbaa`, overriding one role on top of the scheme | the scheme's value |
+| `theme.icons` | the **XDG icon theme** application icons come from, e.g. `hicolor`, `Adwaita` | `hicolor` |
 | `remote.listen` | `<addr>:<port>` — bind a **TCP** listener for remote apps | absent: no TCP socket at all |
 
 `<connector>` is the name the kernel gives the connector — `HDMI-A-1`,
@@ -150,6 +152,46 @@ missing is one that cannot be supported over the phone.
 A key naming no role, or a value that is not six or eight hex digits, is
 warned about and skipped like any other bad line.
 
+### Application icons: `theme.icons`
+
+```text
+theme.icons = Adwaita
+```
+
+The **name of a directory** in the XDG icon search path
+(`$XDG_DATA_HOME/icons`, `~/.icons`, `$XDG_DATA_DIRS/icons`, plus the
+flat `/usr/share/pixmaps` last), not a path: a value with a `/` in it is
+warned about and ignored, because a theme name is joined onto a search
+directory and a separator would escape it. An empty value means the
+default, like `keyboard.variant =` does.
+
+It decides where the server looks for the **coloured application icons**
+a launcher or a task list asks for by name — `firefox`, `nitro-calc`. It
+has nothing to do with the desktop's own symbolic icons (the gear, the
+list, the battery), which are compiled into the server and follow
+`theme.scheme` like the text does. `docs/icons.md` has both halves and
+the reason they are separate namespaces.
+
+The default is `hicolor` because the icon-theme specification requires
+every theme to fall back to it and every application to install its own
+icon there, so it is the one theme that is *about* the applications on
+the box rather than about a look. Naming a theme that is not installed
+is not an error: its inheritance chain ends at `hicolor` anyway.
+
+Only `.png` files are candidates today. A theme that ships its
+application icons as SVG only — Adwaita is one — will therefore find
+nothing through this key and fall back to whatever `hicolor` has;
+`docs/icons.md` records why SVG is deferred.
+
+A reload re-reads the theme **only when this key changed**, because doing
+so walks the whole search path and throws away every decoded icon; a
+reload that moved a monitor must not cost the launcher its icons.
+
+`NITRO_ICON_PATH` (colon-separated absolute directories) replaces the
+entire search path, `/usr/share/pixmaps` included. It exists so a test or
+a demo can be hermetic; a partial override is not a fixture, because
+whatever the box has installed still leaks into the answer.
+
 ## Nothing in this file can fail
 
 A configuration file is user input that arrives **while the compositor is
@@ -177,6 +219,7 @@ leave nothing clickable with which to fix it — including this app.
 | keyboard | `XKB_DEFAULT_*` | `keyboard.*` | the `us` layout |
 | colour scheme | — | `theme.scheme` | `light` |
 | one colour | — | `theme.<role>` | the scheme's value |
+| icon theme | `NITRO_ICON_PATH` (the search path, not the name) | `theme.icons` | `hicolor` |
 
 The environment wins because it is the **development** channel: a
 `NITRO_SCALE=HDMI-A-1=2 just fake` must not be silently overridden by

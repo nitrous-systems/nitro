@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=Files
+GenericName=File Manager
+Comment=A file browser on nitro-ui
+# See `deploy/nitro-calc.desktop` for why the file name, the app id and
+# `StartupWMClass` are all `nitro-files`, why `Icon=` names a symbolic
+# icon rather than a theme one, and why `just deploy` does not install
+# this file.
+Exec=nitro-files
+Icon=folder-fill
+Terminal=false
+StartupWMClass=nitro-files
+Categories=System;FileTools;FileManager;
+Keywords=files;browser;directory;folder;

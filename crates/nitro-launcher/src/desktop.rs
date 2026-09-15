@@ -16,15 +16,23 @@
 //! |---|---|
 //! | `Name` | the entry's label, and what the query matches against |
 //! | `Exec` | the command, with the `%f`/`%u`/… field codes stripped |
+//! | `Icon` | the icon's **name**, handed to the server (see [`Entry::icon`]) |
 //! | `NoDisplay=true` | the entry is skipped |
 //! | `Hidden=true` | the entry is skipped ("deleted" in the spec) |
 //! | `Terminal=true` | kept, but marked: see [`Entry::terminal`] |
 //! | `Type` | anything but `Application` is skipped |
 //!
-//! Everything else — `Icon`, `Categories`, `MimeType`, `Actions`, the
-//! whole `X-` namespace — is read past. Icons are M4: the toolkit has an
-//! `Image` widget but no icon *theme* lookup, and half an icon theme is
-//! worse than none.
+//! Everything else — `Categories`, `MimeType`, `Actions`, the whole `X-`
+//! namespace — is read past.
+//!
+//! `Icon` is one **string**, never a file: the launcher does not look it
+//! up, does not know where the machine's icon theme is, and never reads a
+//! PNG. It sends the name and the server resolves it, which is the same
+//! bargain the rest of the toolkit makes for icons and for text — see
+//! `docs/icons.md`. The spec allows an absolute path there as well as a
+//! name, and that too is passed through unexamined: deciding whether
+//! `/opt/thing/icon.png` is readable is the server's business, because
+//! the server is the process that will read it.
 //!
 //! # Two rules that are easy to get wrong
 //!
@@ -61,11 +69,34 @@ pub struct Entry {
     /// cannot type at, which looks exactly like a launcher that did
     /// nothing. [`Entry::runnable`] is the predicate.
     pub terminal: bool,
+    /// `Icon=`: the name of the application's icon, or `None` when the
+    /// file names none.
+    ///
+    /// A **name**, not a path and not pixels: it goes over the wire in a
+    /// `SetIcon` with the `AS_COLOURED` role and the server finds the
+    /// file in the machine's XDG icon theme. A launcher that resolved it
+    /// itself would need the theme, the size directories and a PNG
+    /// decoder — in a process that does not own the output scale, so it
+    /// could not pick the right size anyway.
+    ///
+    /// Kept as `Option<String>` rather than defaulted to the program's
+    /// name: "this file says nothing about an icon" and "this file asks
+    /// for an icon called `firefox`" are different facts, and only the
+    /// caller knows what a missing one should fall back to.
+    pub icon: Option<String>,
     /// Where it came from, for diagnostics and for the tests.
     pub source: Source,
 }
 
 /// Where an [`Entry`] came from.
+///
+/// Also what decides how its [`icon`](Entry::icon) is drawn, which is
+/// worth stating because it is not obvious: a `Desktop` entry's `Icon=`
+/// names an **application** icon in the machine's XDG theme and is drawn
+/// in its own colours, while a `Builtin`'s names one of the server's own
+/// **symbolic** icons and is tinted from the palette. The two namespaces
+/// are separate on the wire (`docs/icons.md`), so something has to say
+/// which is meant, and the source already knows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
     /// A `.desktop` file at this path.
@@ -107,6 +138,7 @@ pub fn parse(text: &str, path: &Path) -> Option<Entry> {
     let mut name = None::<String>;
     let mut exec = None::<String>;
     let mut kind = None::<String>;
+    let mut icon = None::<String>;
     let mut terminal = false;
     let mut hidden = false;
     for line in text.lines() {
@@ -141,6 +173,10 @@ pub fn parse(text: &str, path: &Path) -> Option<Entry> {
             "Name" => name = Some(value.to_owned()),
             "Exec" => exec = Some(value.to_owned()),
             "Type" => kind = Some(value.to_owned()),
+            // An empty `Icon=` is "no icon", not an icon called "": an
+            // empty name clears an icon node on the wire, so passing it
+            // through would be a widget asking for nothing at all.
+            "Icon" => icon = Some(value.to_owned()).filter(|v| !v.is_empty()),
             "Terminal" => terminal = is_true(value),
             "NoDisplay" | "Hidden" => hidden |= is_true(value),
             _ => {}
@@ -167,6 +203,7 @@ pub fn parse(text: &str, path: &Path) -> Option<Entry> {
         name,
         argv,
         terminal,
+        icon,
         source: Source::Desktop(path.to_path_buf()),
     })
 }
@@ -464,6 +501,40 @@ mod tests {
         assert!(!e.terminal);
         assert!(e.runnable());
         assert_eq!(e.source, Source::Desktop(p()));
+        assert_eq!(e.icon, None, "a file that names no icon asks for none");
+    }
+
+    #[test]
+    fn the_icon_is_a_name_and_is_passed_through_unexamined() {
+        // The launcher does not resolve it, so there is nothing here to
+        // validate: a name, an absolute path, or a name for an icon this
+        // box does not have all leave the parser the same way and are the
+        // server's problem, which is the only process that knows where
+        // the theme is.
+        let e = parse(
+            "[Desktop Entry]\nName=Browser\nExec=firefox\nIcon=firefox\n",
+            &p(),
+        )
+        .expect("an application entry");
+        assert_eq!(e.icon.as_deref(), Some("firefox"));
+        let e = parse(
+            "[Desktop Entry]\nName=Thing\nExec=thing\nIcon=/opt/thing/icon.png\n",
+            &p(),
+        )
+        .expect("an application entry");
+        assert_eq!(e.icon.as_deref(), Some("/opt/thing/icon.png"));
+        // An empty `Icon=` is "no icon", not an icon named "" — which on
+        // the wire would mean "clear this node".
+        let e = parse("[Desktop Entry]\nName=X\nExec=x\nIcon=\n", &p()).expect("an entry");
+        assert_eq!(e.icon, None);
+        // And a localized icon key does not overwrite the plain one, for
+        // the reason `Name[de]` does not overwrite `Name`.
+        let e = parse(
+            "[Desktop Entry]\nName=X\nExec=x\nIcon=plain\nIcon[de]=deutsch\n",
+            &p(),
+        )
+        .expect("an entry");
+        assert_eq!(e.icon.as_deref(), Some("plain"));
     }
 
     #[test]

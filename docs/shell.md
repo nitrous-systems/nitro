@@ -372,6 +372,41 @@ are the ones the user did not open and cannot close; `MAX_LABEL_CHARS`
 and `MAX_BUTTON_W` are what keep a squeezed title from being the usual
 case.
 
+### The icon is the app id, and that is the whole rule
+
+Each window-list button carries a 16 px **coloured** application icon,
+and the name it asks for is the window's `app_id` itself, with `window`
+as the fallback. `nitro-bar` does no `.desktop` parsing, holds no index,
+and reads no files.
+
+That works because of a convention rather than a specification: an
+application's desktop file is usually named after its app id, and its
+`Icon=` key usually matches both. `firefox` has app id `firefox` and icon
+`firefox`. Our own applications keep it deliberately — the `.desktop`
+files under `deploy/` are named after the `App::new` name each binary
+registers, which *is* the app id the shell reports.
+
+It is also honestly limited, and the limit is the reason this section
+exists rather than a comment: an application whose app id and icon name
+differ gets the fallback icon and nothing says why.
+`org.gnome.Nautilus` with `Icon=nautilus` is the shape that fails, and
+reverse-DNS app ids are common.
+
+The alternative considered was to have the **server** resolve
+`app_id → .desktop → Icon=`. It is strictly more correct and strictly
+bigger: it puts a `.desktop` index, its search path, and the question of
+when to invalidate it inside the compositor, to cover a case the
+convention already covers most of the time. The small rule shipped; if
+the fallback icon starts showing up on applications people actually run,
+that is the evidence for the bigger one, and this paragraph is what it
+will be weighed against. See `docs/icons.md` for the icon lookup itself.
+
+The icons do not touch the bar's idle contract: an app id is fixed for a
+window's life, so each button sends exactly one `SetIcon` when it is
+created and none afterwards — the same property the static icons have,
+and asserted over 120 s of sensor ticks by
+`the_icons_are_painted_once_and_never_again`.
+
 ### Server-global window ids
 
 `WindowInfo.window` is a `WindowRef`, a dense `u32` the server mints. It is

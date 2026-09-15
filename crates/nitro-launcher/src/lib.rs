@@ -401,23 +401,29 @@ fn program_file_name(entry: &Entry) -> &str {
 /// directory scan: `~/nitro-bin` also holds `nitro-server`, `hey` and
 /// `shell_probe`, and offering the user a button that starts a second
 /// compositor would be worse than offering nothing.
+///
+/// The third column is a **symbolic** icon name, not a theme one, and
+/// that is the point: a built-in exists precisely on the box that has no
+/// icon theme installed, so its icon has to come from the set compiled
+/// into the server. The packaged `.desktop` files under `deploy/` name
+/// the same shapes, so a box with both looks the same either way.
 #[must_use]
 pub fn builtins() -> Vec<Entry> {
-    const KNOWN: [(&str, &str); 6] = [
-        ("nitro-calc", "Calculator"),
-        ("nitro-term", "Terminal"),
-        ("nitro-settings", "Settings"),
-        ("nitro-files", "Files"),
-        ("hello_dialog", "Hello Dialog"),
-        ("nitro-demo", "Nitro Demo"),
+    const KNOWN: [(&str, &str, &str); 6] = [
+        ("nitro-calc", "Calculator", "calculator"),
+        ("nitro-term", "Terminal", "terminal"),
+        ("nitro-settings", "Settings", "gear"),
+        ("nitro-files", "Files", "folder-fill"),
+        ("hello_dialog", "Hello Dialog", "window"),
+        ("nitro-demo", "Nitro Demo", "palette"),
     ];
     let Some(dir) = spawn::exe_dir() else {
         return Vec::new();
     };
     KNOWN
         .iter()
-        .filter(|(bin, _)| dir.join(bin).is_file())
-        .map(|(bin, name)| Entry {
+        .filter(|(bin, _, _)| dir.join(bin).is_file())
+        .map(|(bin, name, icon)| Entry {
             name: (*name).to_owned(),
             // The absolute path, not the bare name: `~/nitro-bin` is not
             // on the compositor unit's `PATH`, and a launcher that only
@@ -425,6 +431,7 @@ pub fn builtins() -> Vec<Entry> {
             // would fail exactly on the box it was written for.
             argv: vec![dir.join(bin).to_string_lossy().into_owned()],
             terminal: false,
+            icon: Some((*icon).to_owned()),
             source: Source::Builtin,
         })
         .collect()
@@ -992,6 +999,7 @@ mod tests {
             name: "htop".to_owned(),
             argv: vec!["htop".to_owned()],
             terminal: true,
+            icon: None,
             source: Source::Builtin,
         };
         assert_eq!(row_text(&e), "htop (terminal)");
@@ -1017,6 +1025,7 @@ mod tests {
                 name: "Calculator".to_owned(),
                 argv: vec!["/opt/nitro-calc".to_owned()],
                 terminal: false,
+                icon: Some("calculator".to_owned()),
                 source: Source::Builtin,
             }]);
         l.rescan();
@@ -1073,6 +1082,7 @@ mod tests {
                 name: "Calculator".to_owned(),
                 argv: vec!["/opt/nitro-calc".to_owned()],
                 terminal: false,
+                icon: Some("calculator".to_owned()),
                 source: Source::Builtin,
             }]);
         l.rescan();

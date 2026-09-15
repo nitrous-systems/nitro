@@ -338,21 +338,201 @@ only 16 % artwork at **935 B/icon**, and that the cache is **1 792
 bytes** for the seven icons on screen — 0.17 % of the glyph atlas beside
 it.
 
-## Deferred to icons-B
+## Application icons
 
-Everything to do with **application** icons:
+Everything above is artwork the server **owns**. An application icon is
+artwork it does not: `firefox` is a PNG the distribution installed under
+`/usr/share/icons`, and the only reason the server touches it at all is
+that it is the process that knows the output scale and the one that has
+to blit the pixels.
 
-* the XDG icon-theme lookup (`hicolor`, theme inheritance, size
-  directories, `index.theme`);
-* PNG and the SVG subset those themes are drawn in — this depends on
-  task #3711's PNG decoder;
-* **full colour.** `SetIcon.role` already carries the sentinel
-  `0xff` = `AS_COLOURED`, meaning "paint the icon's own colours, do not
-  tint", and `IconRef::AS_COLOURED` carries it through the scene. It is
-  accepted and draws nothing today, which is the door left open: the
-  message and the cache can carry a full-colour icon without a wire
-  change.
-* per-icon user overrides, and a `server.conf` icon theme setting.
+```rust,ignore
+icon("firefox").coloured().size(24.0).fallback("window")
+```
+
+Same message, same node kind, no new op: `SetIcon` with `role = 0xff`
+(`AS_COLOURED`). The door M4-G left open, walked through.
+
+### The role byte is the selector, not a search order
+
+A palette role means the **symbolic** set compiled into the server.
+`AS_COLOURED` means the machine's **icon theme**. Nothing falls back from
+one to the other, in either direction.
+
+The obvious alternative — one namespace, symbolic first — was rejected,
+and the reason is worth stating because it looks like the friendlier
+design. It makes the meaning of `icon("list")` depend on what the box
+has installed: today no theme on either of our machines ships a `list`,
+so the desktop's own glyph wins; the day one does, the shadowing is the
+only thing between the menu button and somebody else's artwork, and
+nothing anywhere would say so. Shadowing is invisible by construction.
+With the role deciding, the call site says which set it means, there is
+no collision to resolve, and `icon("list")` is the same eleven pixels on
+every machine.
+
+The corollary is a combination that is **refused** rather than
+implemented: a palette role with a theme-only name earns `BadIcon`. It
+would have been easy to find the file and tint its alpha — "a monochrome
+theme icon used symbolically" — but a theme icon is a picture, not a
+coverage mask. Tinting one throws the artwork away and keeps the
+silhouette, which is a rendering bug on every icon that is not already
+monochrome, and the client cannot know which those are.
+`a_symbolic_name_is_not_an_application_name_and_the_reverse` asserts both
+directions through the real server.
+
+### The lookup: the XDG spec, the honest subset
+
+`crates/nitro-server/src/icon_theme.rs`, and it is filesystem and parsing
+only — it returns a path and decodes nothing.
+
+**Search path**, in order: `$XDG_DATA_HOME/icons`, `~/.icons`, each
+`$XDG_DATA_DIRS` entry plus `/icons` (default
+`/usr/local/share:/usr/share`), and the flat, unthemed
+`/usr/share/pixmaps` **last**. `NITRO_ICON_PATH` replaces the whole list,
+`/usr/share/pixmaps` included — a partial override is not a fixture,
+because whatever the box has installed still leaks into the answer.
+
+**Theme chain**: `theme.icons` from `server.conf` (default `hicolor`,
+see `docs/settings.md`), then its `Inherits=` transitively, breadth-first,
+each theme once, with **`hicolor` always last** whether or not anything
+named it. Cycles are guarded and the chain is capped at 16, because an
+`index.theme` is a file any package may drop.
+
+**Size matching** is the spec's: each theme's `index.theme` gives
+`Directories`, and each directory group its `Size`, `Scale`, `Type`
+(`Fixed`/`Scalable`/`Threshold`), `MinSize`, `MaxSize` and `Threshold`.
+An exact match at the requested **scale** wins; failing that, the
+smallest size distance, tie-broken towards the requested scale and then
+towards the **larger** source, because downscaling a 48 into a 24 is
+sharper than doubling a 16. Failing *that*, a bounded scan of the theme's
+directories and then the flat ones, which is what makes a lone
+`/usr/share/pixmaps/foo.png` work.
+
+One deliberate deviation: the exact-match pass runs over the **whole
+chain** before the closest-size pass, where the spec exhausts both passes
+per theme before recursing to the parent. The difference shows up when a
+child theme ships one odd size of an icon and `hicolor` ships the
+requested one — the spec takes the child's mis-sized file, we take
+hicolor's exact one. A display server resamples every icon it draws, so a
+correctly sized file from the fallback theme is visibly better than a
+resampled one from the preferred theme, and the preferred theme still
+wins for every icon it ships at a normal size, which is all of them.
+
+**PNG only.** `.svg` and `.xpm` are skipped. That is not laziness about
+formats, it is the #3711 survey's finding: 14 of 20 Adwaita application
+SVGs need gradients, which `nitro-raster` does not do, and rasterising
+them properly is a renderer rather than a feature. Half an SVG renderer
+shows up as *silently wrong artwork* in a user's launcher, which is worse
+than a missing icon — and a missing icon already has a fallback. The
+survey's other finding is why this is liveable: Adwaita is SVG-only on
+both our boxes, `/usr/share/icons` holds 67 PNGs on the dev box and 13 on
+the test box, and what actually exists in practice is `hicolor` PNGs
+installed by the applications themselves — which is exactly what
+`theme.icons = hicolor` finds.
+
+An **absolute path** in the name is honoured, as the desktop-entry spec
+allows in `Icon=`, when it ends in `.png` and names a readable file. A
+name containing `/`, `..` or a NUL is refused outright.
+
+### The cache: pixels, and an LRU
+
+Two differences from the symbolic cache, both forced.
+
+**It holds a BGRA tile, not coverage.** A coloured icon has no tint to
+resolve, so there is nothing to keep out of the key. The entry is the
+tile the blitter takes, already resampled to the device size, so the
+per-frame path is an integer-aligned one-to-one copy. A scheme flip does
+not touch it, which is correct: a Firefox logo is not part of the
+palette.
+
+**It evicts.** The symbolic set is *closed*, which is what lets that
+cache refuse rather than evict; the set of applications on a machine is
+not. `IconEngine::APP_MAX_BYTES` is 4 MiB with LRU behind it — 64 tiles
+of 128² or about a thousand at 32², where a launcher showing twenty 24 px
+rows and a bar showing ten 16 px buttons costs 41 KB. "Refuse the next
+one" would mean a launcher whose last rows are blank for the rest of the
+session.
+
+**The decode is lazy and happens once.** Resolution (walking the theme,
+`stat`) happens at *commit* time, because that is the call that decides
+whether the client earns a `BadIcon` and therefore whether its
+`.fallback(…)` fires inside the same interaction. Reading and decoding
+the file happens on the **first paint** that needs it, once per `(name,
+device px)`: it costs milliseconds, and it depends on a device size the
+commit does not know yet. A 256 px PNG is ~2 ms on the Pentium (#3711),
+which is a frame — per-frame would be a bug, and per-commit would put it
+on the client's first-paint latency.
+
+A decode failure is a `BadIcon`, one line in the log, and a `Missing`
+mark so the *next* frame does not try again. A missing icon is the common
+case on a thin theme, and a launcher redrawing forty rows must not walk
+the search path forty times a frame.
+
+`stats` gains `app_icons_cached`, `app_icon_bytes`, `app_icon_loads`,
+`app_icon_misses`, `app_icon_evictions` and `app_icon_decode_us_max`.
+`app_icon_loads` is the interesting one, the way `icon_renders` is for
+the symbolic half: on a settled desktop it must stop growing.
+
+### Resampling, and why it is not the raster's blitter
+
+The tile is built by `square_tile`/`resample` in `icons.rs` rather than
+by `Canvas::blit`, and that is not duplication. A `Canvas` is a *screen*:
+its pixels are `XRGB8888` and its blitter writes a zero into every fourth
+byte, because a framebuffer has no alpha to keep. Running an icon through
+it produces a **fully transparent tile** — which is what the first
+version of this code did, and what
+`an_application_icon_is_decoded_once_and_blitted_in_its_own_colours`
+caught. An icon tile is a source image, not a destination.
+
+Within that function: the mix is **premultiplied**, because averaging
+straight-alpha samples drags a transparent pixel's colour into its
+neighbour and every icon drawn on transparent black — which is most of
+them — comes back with a dark halo. Downscaling takes the **area
+average** of every source pixel the destination covers (48 → 16 is nine
+samples; a 4-tap bilinear would miss five ninths of the artwork, which is
+how thin strokes vanish); upscaling is bilinear, because there is nothing
+to average and nearest-neighbour is the blocky doubled tile this document
+spends a section arguing against. A non-square source is **letterboxed**,
+not stretched.
+
+### The consumers
+
+**`nitro-launcher`** parses `Icon=` (`desktop.rs`, `Entry::icon`) and
+puts a 24 px icon in front of every row, falling back to `window`. A
+`.desktop` entry's icon is coloured (it names the theme); a **built-in**
+entry's is symbolic, because a built-in exists precisely on the box with
+no icon theme installed, so its icon has to come from the set compiled
+into the server.
+
+The idle and latency contracts are untouched, and the reason is
+structural rather than measured: `SetIcon` is one-way, so a row costs no
+round trip, and the decode is the server's and lazy. The launcher's
+first-paint measurement with 40 entries is in `docs/latency.md`.
+
+**`nitro-bar`**'s window list uses a window's `app_id` **directly as an
+icon name**, falling back to `window`. That is the freedesktop
+convention — an application's `.desktop` file is usually named after its
+app id and its `Icon=` usually matches — and it is right often enough to
+be worth one string. It is also honestly limited: an application whose
+app id and icon name differ (`org.gnome.Nautilus` vs `nautilus`) gets the
+fallback.
+
+The alternative was to have the *server* resolve `app_id` → `.desktop` →
+`Icon=`, which is strictly better and strictly bigger: it puts a
+`.desktop` index, its search path and its invalidation into the
+compositor, for a case the convention already covers. Rule (a) is what
+shipped; the note is here so the next person knows what they are
+choosing between. Our own applications keep the convention: the
+`.desktop` files under `deploy/` are named after their app ids.
+
+### Still deferred
+
+* **SVG application icons**, and the gradients they need.
+* **`.desktop`-based resolution for the bar**, above.
+* **Per-icon user overrides** — pinning one name to one file. That is a
+  desktop-settings feature, not a path resolver's.
+* **`Context=`, localized theme names, `.icon` metadata.** All of it
+  exists for an icon *chooser*; we are given a name and asked for a file.
 
 What is *not* deferred and not planned: client-supplied icon pixels.
 An app that needs arbitrary artwork has `Image`, and pays the buffer for
