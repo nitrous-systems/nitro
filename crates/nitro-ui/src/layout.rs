@@ -106,6 +106,28 @@ pub enum CrossAlign {
 /// [`List`](crate::List) and [`Scroll`](crate::widgets::Scroll) — says
 /// so with [`ShrinkFloor::Zero`], and then `flex_shrink` means what it
 /// means in CSS.
+///
+/// # The flag is one field, but the floor is per-axis
+///
+/// There is no `shrink_floor_x`/`_y`: the floor applies to whichever
+/// axis is the **parent's main axis**, so the same widget is floored on
+/// its height in a `Column` and on its width in a `Row`. That matters
+/// for the two opt-outs whose justification is horizontal:
+/// [`text_field`](crate::widgets::text_field) is a viewport over its own
+/// string and [`slider`](crate::widgets::slider) has no content at all,
+/// but both arguments are about *width*. Put either in a `Column` and
+/// `Zero` also lets it be laid out shorter than it measured, which is
+/// #561 again wearing a different widget — a field squeezed below its
+/// line height clips the text inside it.
+///
+/// In practice neither is a column's flexible child (a field's height is
+/// its font's, a slider's is its knob's, and both are normally rows'
+/// children), so this is a sharp edge rather than a live bug. The
+/// defence if you hit it is the ordinary one: `min_height`, which the
+/// floor is a `max` against. Splitting the flag per axis would be the
+/// thorough fix and is deliberately not done here — one field is what
+/// every call site actually needs, and two would have to be explained at
+/// each of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ShrinkFloor {
     /// Never smaller than the measured size (`basis`). The default.
@@ -433,6 +455,50 @@ fn gap_total(gap: f32, n: usize) -> f32 {
     if n > 1 { gap * (n - 1) as f32 } else { 0.0 }
 }
 
+/// Take a main-axis overflow back out of the children that can give it.
+///
+/// Returns the deficit still outstanding afterwards: zero when something
+/// absorbed it, the full amount when nothing could. Split out of
+/// [`solve`] because it is the one step with its own arithmetic worth
+/// reading on its own.
+///
+/// Only the children that *can* give something back are weighted, so a
+/// column of labels next to one scrollable child hands the whole deficit
+/// to the child that can honestly absorb it instead of taking a
+/// proportional bite out of every label first and clamping it back
+/// afterwards — which would divide by a total that includes items
+/// destined to give nothing.
+///
+/// The returned remainder is currently *not* load-bearing: `solve`
+/// clamps the leftover at zero before positioning, so an unabsorbed
+/// deficit is discarded either way and a version of this that lied and
+/// returned zero would pass every test. It is returned honestly anyway,
+/// because the alternative is a function whose signature says the
+/// overflow was consumed when it was not.
+fn shrink_to_fit(items: &[FlexItem], dir: Direction, main: &mut [f32], deficit: f32) -> f32 {
+    let floors: Vec<f32> = items.iter().map(|it| floor_main(it, dir)).collect();
+    let weights: Vec<f32> = items
+        .iter()
+        .zip(&*main)
+        .zip(&floors)
+        .map(|((it, m), floor)| {
+            if *m > *floor {
+                it.style.flex_shrink.max(0.0) * m
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let total: f32 = weights.iter().sum();
+    if total <= 0.0 {
+        return deficit;
+    }
+    for ((m, w), floor) in main.iter_mut().zip(&weights).zip(&floors) {
+        *m = (*m - deficit * w / total).max(*floor);
+    }
+    0.0
+}
+
 /// The smallest main-axis size `it` may be laid out at.
 ///
 /// The content floor is the item's own measured size — which, for a
@@ -510,32 +576,7 @@ pub fn solve(container: &LayoutStyle, inner: Size, items: &[FlexItem], out: &mut
             free = 0.0;
         }
     } else if free < 0.0 {
-        // Only the children that *can* give something back are weighted,
-        // so a column of labels next to one scrollable child hands the
-        // whole deficit to the child that can honestly absorb it instead
-        // of taking a proportional bite out of every label first and
-        // clamping it back afterwards.
-        let floors: Vec<f32> = items.iter().map(|it| floor_main(it, dir)).collect();
-        let weights: Vec<f32> = items
-            .iter()
-            .zip(&main)
-            .zip(&floors)
-            .map(|((it, m), floor)| {
-                if *m > *floor {
-                    it.style.flex_shrink.max(0.0) * m
-                } else {
-                    0.0
-                }
-            })
-            .collect();
-        let total: f32 = weights.iter().sum();
-        if total > 0.0 {
-            let deficit = -free;
-            for ((m, w), floor) in main.iter_mut().zip(&weights).zip(&floors) {
-                *m = (*m - deficit * w / total).max(*floor);
-            }
-            free = 0.0;
-        }
+        free = -shrink_to_fit(items, dir, &mut main, -free);
     }
 
     // Clamp to each child's own main-axis min/max, which can put free
@@ -549,6 +590,19 @@ pub fn solve(container: &LayoutStyle, inner: Size, items: &[FlexItem], out: &mut
     }
 
     // 3. Position on the main axis.
+    //
+    // A negative leftover is overflow, not something to distribute. With
+    // the content floor as the default it is also the *ordinary* case:
+    // when nothing can shrink, every weight above is zero, `free` is
+    // never zeroed and arrives here still negative. Spending it would
+    // undo the floor's whole point — `Center` would halve it into a
+    // cursor before the container's own origin, `End` would use it
+    // whole, and `SpaceBetween` would divide it into a *negative gap*
+    // that draws each child on top of the one before it. So the leftover
+    // is clamped: whatever does not fit runs past the container's end
+    // for the parent to clip, and `SpaceBetween` degenerates to `Start`,
+    // which is what CSS does with negative free space too.
+    let free = free.max(0.0);
     let n = items.len();
     let (mut cursor, between) = match container.main_align {
         MainAlign::Center => (free / 2.0, container.gap),
@@ -779,6 +833,43 @@ mod tests {
     }
 
     #[test]
+    fn a_max_below_the_basis_caps_the_content_floor() {
+        // The third clamp in `floor_main` (`max(min, min(basis, max))`),
+        // pinned through the one place it is observable.
+        //
+        // It is deliberately *not* asserted on the capped item's own
+        // size: the final `clamp_opt` caps that to `max_height` whether
+        // or not `floor_main` does, so asserting it would pass with the
+        // cap deleted — coverage that only looks like coverage. What the
+        // cap really decides is whether the item counts as *able to
+        // shrink*, and that is visible in its **sibling**.
+        //
+        // A column 10 px short: A has a `Zero` floor and a basis of 40,
+        // B measured 20 but is capped at 12. With the cap, B is above
+        // its floor, so it is weighted and takes part of the deficit and
+        // A keeps 33.33; without it, B's floor would be its full basis
+        // of 20, B would be weightless, and A alone would absorb all 10
+        // and come out at 30.
+        let capped = LayoutStyle {
+            max_height: Some(12.0),
+            ..LayoutStyle::default()
+        };
+        let items = [
+            squashable(Size::new(10.0, 40.0)),
+            FlexItem::new(capped, Size::new(10.0, 20.0)),
+        ];
+        let mut out = Vec::new();
+        solve(&column(0.0), Size::new(50.0, 50.0), &items, &mut out);
+        assert_close!(out[1].h, 12.0, "the cap holds on the capped item");
+        assert_close!(
+            out[0].h,
+            100.0 / 3.0,
+            "the capped item was weighted as shrinkable, so its sibling \
+             kept a share of the deficit rather than absorbing all of it"
+        );
+    }
+
+    #[test]
     fn an_overflowing_column_runs_past_its_end_rather_than_squashing() {
         // Three rows of 26 in a 60 px column: 78 wanted, 18 short. Every
         // row keeps its height and the last one ends at 78 — outside the
@@ -804,6 +895,74 @@ mod tests {
         // And the rows do not overlap: each starts where the last ended.
         assert_close!(out[1].y, out[0].bottom());
         assert_close!(out[2].y, out[1].bottom());
+    }
+
+    #[test]
+    fn an_overflowing_container_never_places_a_child_before_its_start() {
+        // The leftover is spent from the start edge or not at all.
+        //
+        // With the content floor as the default, the ordinary overflow
+        // case leaves *nothing* that can shrink — every item sits at its
+        // floor, every weight is zero — so `free` stays negative and
+        // reaches the alignment arithmetic, which before this clamp
+        // turned it into position: `Center` halved it into a negative
+        // cursor, `End` used it whole, and `SpaceBetween` divided it into
+        // a *negative gap* that drew each child `|free| / (n - 1)` on top
+        // of the one before it.
+        //
+        // That is the exact failure this floor exists to remove — a row
+        // written through a sentence the user is still reading — and the
+        // floor is what made the path reachable: with the old default
+        // shrink of 1.0 something always absorbed the deficit and `free`
+        // was zeroed before it got here. `main_align_places_the_leftover`
+        // only ever offered positive free space, so nothing caught it.
+        //
+        // Three rows of 26 in a 60 px column: 78 wanted, 18 over.
+        let items = [
+            item(Size::new(10.0, 26.0)),
+            item(Size::new(10.0, 26.0)),
+            item(Size::new(10.0, 26.0)),
+        ];
+        let mut out = Vec::new();
+        for align in [
+            MainAlign::Start,
+            MainAlign::Center,
+            MainAlign::End,
+            MainAlign::SpaceBetween,
+        ] {
+            let style = LayoutStyle {
+                main_align: align,
+                ..column(0.0)
+            };
+            solve(&style, Size::new(50.0, 60.0), &items, &mut out);
+            assert!(
+                out[0].y >= -1e-4,
+                "{align:?} placed the first child at {} — before the \
+                 container's own origin, i.e. on top of whatever \
+                 precedes it",
+                out[0].y,
+            );
+            for i in 1..out.len() {
+                assert!(
+                    out[i].y >= out[i - 1].bottom() - 1e-4,
+                    "{align:?} overlapped row {i} at {} with row {} \
+                     ending at {}",
+                    out[i].y,
+                    i - 1,
+                    out[i - 1].bottom(),
+                );
+            }
+            // Overflow is still overflow: clamping the leftover must not
+            // have quietly shrunk anything to make it fit.
+            for (i, r) in out.iter().enumerate() {
+                assert_close!(r.h, 26.0, "{align:?} row {i}");
+            }
+            assert!(
+                out[2].bottom() > 60.0,
+                "{align:?} still runs past the container's end: {}",
+                out[2].bottom(),
+            );
+        }
     }
 
     #[test]

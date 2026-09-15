@@ -469,11 +469,23 @@ a claim; give it a `min_width` for the narrowest still-draggable track).
 the children that may take it; `.shrink(0.0)` still means "never shrink
 at all".
 
+The floor applies to whichever axis is the **parent's** main axis, and
+`shrink_floor` is one field rather than one per axis. So a widget that
+opted out for a horizontal reason has also opted out vertically: the
+`TextField` and `Slider` arguments above are both about width, and in a
+`Column` the same flag lets them be laid out shorter than they measured.
+Neither is normally a column's flexible child, so this is a sharp edge
+rather than a live bug, and `min_height` is the defence — the floor is a
+`max` against it.
+
 What it does **not** do: wrapping, `order`, baseline alignment, and the
 iteration CSS performs when a min/max clamp puts free space back on the
 table (we clamp once and accept the second-order error). An overflow no
-child will absorb is left as overflow rather than iterated on. `Adaptive`
-and breakpoints are M3.
+child will absorb is left as overflow rather than iterated on, and the
+leftover a `MainAlign` distributes is clamped at zero — a negative
+leftover is overflow, so `SpaceBetween` degenerates to `Start` rather
+than spacing children *backwards* on top of each other, which is what
+CSS does with negative free space too. `Adaptive` and breakpoints are M3.
 
 ## Text measurement is synchronous, and that is an M2 choice
 
@@ -1131,7 +1143,13 @@ regrets:
   does, so a child whose clamp releases free space does not give it back
   to its siblings. An overflow that no child will absorb — the usual
   case now that `shrink_floor` defaults to `Content` — is likewise left
-  as overflow rather than iterated on.
+  as overflow rather than iterated on, and the leftover `MainAlign`
+  spends is clamped at zero so a negative one cannot be distributed.
+* **`shrink_floor` is one field, not one per axis.** It applies to the
+  parent's main axis, so a widget that opted out for a horizontal reason
+  (`TextField`, `Slider`) is also unfloored vertically. `min_height` is
+  the defence; splitting the flag per axis is the thorough fix and is
+  not done.
 * **No pointer grab.** A press followed by a release outside the widget
   is not routed back to it, so `Button` drops its pressed state on
   `PointerLeave` instead. A real grab is a server-side concept and M3.

@@ -139,6 +139,19 @@ const HISTORY_SIZE: f32 = 13.0;
 const BUTTON_SIZE: f32 = 18.0;
 /// Height of one keypad row.
 const ROW_HEIGHT: f32 = 44.0;
+/// Smallest a keypad row may be squeezed to.
+///
+/// The rows opt out of the toolkit's content shrink floor (see
+/// [`build`]), which on its own means a floor of *zero*: a short enough
+/// window would collapse the keypad to nothing rather than to "small but
+/// still tappable". This bounds it at the button's own line box, so a
+/// squeezed key is still a key with its glyph inside it, and below that
+/// the keypad overflows and clips like anything else.
+///
+/// `BUTTON_SIZE` rather than the measured line height because a constant
+/// cannot call the font engine; 18 px of text measures ~21 px of line
+/// box in the default theme, so this is the conservative side of it.
+const ROW_MIN_HEIGHT: f32 = BUTTON_SIZE;
 /// Gap between buttons; the window's padding is twice it.
 const GAP: f32 = 6.0;
 
@@ -229,11 +242,18 @@ pub fn build(ui: &mut Ui<Calc>) -> WidgetId {
         // is not. A row of text would keep the floor; a grid of tap
         // targets gives it up, and the buttons follow the row because
         // their height is a percentage of it.
+        //
+        // `min_height` puts the floor back at a *defensible* place
+        // rather than at zero: opting out of the content floor means
+        // "smaller is honest", not "arbitrarily small is honest", and
+        // without this a short enough window collapses the keypad
+        // entirely. See `ROW_MIN_HEIGHT`.
         let r = ui.build(
             row()
                 .gap(GAP)
                 .height(ROW_HEIGHT)
                 .shrink_to_zero()
+                .min_height(ROW_MIN_HEIGHT)
                 .width_percent(1.0),
         );
         for (text, name, k) in line {
