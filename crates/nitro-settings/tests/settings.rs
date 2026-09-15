@@ -1205,17 +1205,31 @@ fn nothing_in_the_tree_overhangs_the_window() {
 }
 
 #[test]
-fn a_second_output_still_fits_the_window() {
-    // The width half of the claim, under the case that actually stresses
-    // it. A hotplugged 2560×1440 output makes the longest mode string the
-    // dialog can show ("2560×1440 @ 60 Hz", 135.6 px against the 320×240
-    // harness output's 119.1) — and a row whose parts are all `shrink(0)`
-    // has no give left, so if `WINDOW_SIZE.w` were chosen for the narrow
-    // case this is where it would overflow.
+fn two_outputs_fit_the_window_and_a_third_clips_rather_than_overlaps() {
+    // Two claims the first draft of this fix got wrong, and they are
+    // paired here because the second is what made the first survive.
     //
-    // The row arrives as a real `Output` event from a real hotplug, not
-    // as an invented `OutputInfo`: the whole point of the harness is that
-    // the rows come down the wire the way they do on the box.
+    // 1. `WINDOW_SIZE` must actually hold **two** outputs. The docs said
+    //    so while the constant was the one-output figure rounded up: the
+    //    tree measures 391.2 px for one output and exactly
+    //    `ROW_HEIGHT + GAP` = 32 px more per output after it, so two need
+    //    423.2 and the old 400 was short by 23. The old version of this
+    //    test asserted only `x + w <= width` and so never noticed — its
+    //    own comment said "the tree now exceeds the window" while the
+    //    docs two files away said two outputs fit.
+    //
+    // 2. Past whatever the constant holds, the overflow must **clip**,
+    //    not overlap. That is not automatic: the rows carry
+    //    `min_height(ROW_HEIGHT)`, but the `displays` column holding them
+    //    had the default `flex_shrink` of 1, so on overflow the column
+    //    was laid out shorter than its own rows and the last row was
+    //    drawn over `displays_note` — 0.8 px at two outputs, 15.6 px at
+    //    three. A window that ends early is a window; one that writes a
+    //    row on top of a sentence is a bug report.
+    //
+    // The rows arrive as real `Output` events from real hotplugs, not as
+    // invented `OutputInfo`s: the point of the harness is that they come
+    // down the wire the way they do on the box.
     let dir = scratch("layout-two-outputs");
     let mut h = layout_harness(&dir);
     h.server().request_line("plug 2560x1440\n");
@@ -1227,13 +1241,19 @@ fn a_second_output_still_fits_the_window() {
     let size = h.ui().window_size();
     let rows: Vec<(String, nitro_ui::Rect)> = tree(&mut h)
         .into_iter()
-        .filter(|(p, _)| p.starts_with("window/displays/"))
+        .filter(|(p, _)| p.starts_with("window/displays/") && p.matches('/').count() == 2)
         .collect();
-    assert!(
-        rows.iter().any(|(p, _)| p.contains("Virtual-2")),
-        "the hotplugged output has a row: {rows:?}"
-    );
+    assert_eq!(rows.len(), 2, "two display rows: {rows:?}");
+
+    // Every row: full height, inside the window, both axes. The vertical
+    // half is the one that was missing.
     for (path, b) in &rows {
+        assert!(
+            (b.h - nitro_settings::ROW_HEIGHT).abs() < 0.01,
+            "{path} is {} tall, not ROW_HEIGHT: a second monitor must \
+             shorten neither row",
+            b.h,
+        );
         assert!(
             b.x + b.w <= size.w + 0.01,
             "{path} ends at x={} in a {}-wide window",
@@ -1241,8 +1261,12 @@ fn a_second_output_still_fits_the_window() {
             size.w,
         );
     }
-    // The mode label keeps the width its longer string measures: that is
-    // the one that was being eaten.
+
+    // The mode label keeps the width its longer string measures: a
+    // hotplugged 2560×1440 makes the longest mode string the dialog can
+    // show (135.6 px against the harness output's 119.1), and a row whose
+    // parts are all `shrink(0)` has no give left, so a `WINDOW_SIZE.w`
+    // chosen for the narrow case would overflow right here.
     let mode_id = named(&mut h, "displays/Virtual-2/mode");
     let mode = h.ui().window_bounds(mode_id);
     let theme = nitro_ui::Theme::default();
@@ -1259,22 +1283,64 @@ fn a_second_output_still_fits_the_window() {
         mode.w,
     );
 
-    // The second row costs ROW_HEIGHT + GAP and the window does *not*
-    // grow for it — that is the documented limitation, and it is asserted
-    // rather than left implicit so that a future change to it is a
-    // deliberate one. The tree now exceeds the window by one row's worth;
-    // what must still hold is that no *row* is squashed, because each one
-    // has a `min_height`.
-    for (path, b) in &rows {
-        if path.matches('/').count() == 2 {
-            assert!(
-                (b.h - nitro_settings::ROW_HEIGHT).abs() < 0.01,
-                "{path} is {} tall, not ROW_HEIGHT: a second monitor must \
-                 shorten neither row",
-                b.h,
-            );
-        }
-    }
+    // Claim 1: the whole tree still fits, buttons row included. This is
+    // the assertion the docs' "two outputs fit" rests on, so it is here
+    // rather than in prose.
+    let (_, buttons) = tree(&mut h)
+        .into_iter()
+        .find(|(p, _)| p == "window/container[4]")
+        .expect("the buttons row");
+    assert!(
+        buttons.y + buttons.h <= size.h - nitro_settings::PAD + 0.01,
+        "with two outputs the buttons row ends at {} and the window's \
+         content stops at {}: WINDOW_SIZE.h is short by {}",
+        buttons.y + buttons.h,
+        size.h - nitro_settings::PAD,
+        buttons.y + buttons.h - (size.h - nitro_settings::PAD),
+    );
+
+    // Claim 2: a third output does not fit — and degrades by clipping.
+    // The rows keep their height and stay inside their column, and the
+    // column still ends above the note rather than through it.
+    h.server().request_line("plug 1280x1024\n");
+    h.wait_for("the third display row", |h| {
+        h.state().connectors().len() > 2
+    });
+    h.settle();
+
+    let all = tree(&mut h);
+    let find = |needle: &str| -> nitro_ui::Rect {
+        all.iter()
+            .find(|(p, _)| p == needle)
+            .unwrap_or_else(|| panic!("no {needle} in {all:?}"))
+            .1
+    };
+    let column = find("window/displays");
+    let note = find("window/displays_note");
+    let last = find("window/displays/Virtual-3");
+
+    assert!(
+        (last.h - nitro_settings::ROW_HEIGHT).abs() < 0.01,
+        "the third row is {} tall, not ROW_HEIGHT",
+        last.h,
+    );
+    assert!(
+        last.y + last.h <= column.y + column.h + 0.01,
+        "the third row ends at {} but its column ends at {}: a column \
+         shrunk below the rows it contains is how a row ends up drawn \
+         over the note beneath it",
+        last.y + last.h,
+        column.y + column.h,
+    );
+    assert!(
+        column.y + column.h <= note.y + 0.01,
+        "the displays column ends at {} and the note starts at {}: they \
+         overlap by {}, which is the failure `shrink(0.0)` on the column \
+         exists to prevent",
+        column.y + column.h,
+        note.y,
+        column.y + column.h - note.y,
+    );
 
     h.quit();
     let _ = std::fs::remove_dir_all(&dir);
@@ -1302,7 +1368,7 @@ fn the_window_declares_its_tree_as_its_minimum_size() {
     // `a_resize_respects_the_limits_the_client_declared` in
     // `crates/nitro-server/tests/wm.rs`, which drives a real edge drag.
     // It cannot be re-run here: the harness's output is 320×240 and this
-    // window is 560×400, so its right edge — the thing a drag grabs — is
+    // window is 560×440, so its right edge — the thing a drag grabs — is
     // off-screen.
     let dir = scratch("layout-limits");
     let path = dir.join(conf::FILE_NAME);
@@ -1319,7 +1385,7 @@ fn the_window_declares_its_tree_as_its_minimum_size() {
 
     // No maximum: a machine with four monitors wants to drag this window
     // taller, and nothing here should stop it.
-    let no_max = Size::new(0.0, 0.0);
+    let no_max = Size::ZERO;
     h.ui().tap(true);
     h.ui()
         .set_window_limits(nitro_settings::WINDOW_SIZE, no_max)
@@ -1344,6 +1410,13 @@ fn the_window_declares_its_tree_as_its_minimum_size() {
          was de-duplication rather than a dead tap: {:?}",
         h.mutations(),
     );
+    // Put the real limits back. Nothing below asserts on them today, but
+    // a test that leaves the control's 320×240 installed is a trap for
+    // whoever adds an assertion after it.
+    h.ui()
+        .set_window_limits(nitro_settings::WINDOW_SIZE, no_max)
+        .expect("restore the dialog's own limits");
+    h.flush();
     h.ui().tap(false);
 
     // And the minimum is the window's own opening size, so there is no

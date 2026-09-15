@@ -31,17 +31,23 @@
 //!
 //! # Why the window is the size it is
 //!
-//! [`WINDOW_SIZE`] is derived from the tree rather than chosen, and its
-//! doc comment says how — because the previous value was not, and a
-//! window smaller than its own tree does not clip, it **shrinks**: a
-//! flex container hands its overflow back to its children weighted by
-//! size, so every heading, note and row in this dialog was laid out
-//! smaller than it had measured. Nothing measured wrong, which is why it
-//! survived eighteen passing tests and was found by looking at the
-//! screen. See [`control_row`], [`heading`], [`note`] and [`caption`] for
-//! the `shrink(0.0)`/`min_height` that stop it recurring, and
-//! `no_widget_is_laid_out_smaller_than_it_measures` in
-//! `tests/settings.rs` for the pin.
+//! [`WINDOW_SIZE`] is **measured** from the tree rather than chosen, and
+//! its doc comment carries the table — because the previous value was
+//! not, and a window smaller than its own tree does not clip, it
+//! **shrinks**: a flex container hands its overflow back to its children
+//! weighted by size, so every heading, note and row in this dialog was
+//! laid out smaller than it had measured. Nothing measured wrong, which
+//! is why it survived eighteen passing tests and was found by looking at
+//! the screen.
+//!
+//! Two rules keep it fixed, and the second is easy to miss: anything
+//! with no smaller honest version is `shrink(0.0)` ([`control_row`],
+//! [`heading`], [`note`], [`caption`]), **and so are the `displays` and
+//! `keyboard` columns** — a container of `min_height` rows that can
+//! itself be shrunk ends up shorter than the rows inside it, and draws
+//! the last one over whatever follows. `no_widget_is_laid_out_smaller_than_it_measures`
+//! and `two_outputs_fit_the_window_and_a_third_clips_rather_than_overlaps`
+//! in `tests/settings.rs` pin both.
 //!
 //! # Driving it with `hey`
 //!
@@ -166,24 +172,47 @@ pub const APP_NAME: &str = "nitro-settings";
 /// why eighteen passing tests never saw it: every widget measured
 /// correctly and was then laid out smaller than it measured.
 ///
-/// So the number is now derived from the tree rather than chosen: 540 px
-/// of inner width is what the display row needs with none of its parts
-/// squashed (76 name + 136 mode + 64 slider + 30 value + 79 checkbox +
-/// 2 × 54 position + 6 × 6 gaps ≈ 529), and 400 px of height is what one
-/// output's worth of tree measures at that width, with the appearance
-/// note fitting on one line. Widening it further is free; narrowing it is
-/// what produced the bug, which is why [`build`] also pins it as the
-/// window's **minimum** through `Ui::set_window_limits`.
+/// So the number is now derived from the tree rather than chosen, and
+/// both axes are **measured** rather than reasoned about. 540 px of inner
+/// width is what the display row needs with none of its parts squashed
+/// (76 name + 136 mode + 64 slider + 30 value + 79 checkbox +
+/// 2 × 54 position + 6 × 6 gaps ≈ 529). The height comes from measuring
+/// the built tree at that width with the height unbounded, which gives
+/// **391.2 px for one output and exactly 32 px (`ROW_HEIGHT + GAP`) per
+/// output after it**:
 ///
-/// It does **not** grow for a second monitor: each extra output adds
-/// `ROW_HEIGHT + GAP` = 32 px, and the window has no way to ask the
-/// server to resize it (`Ui::resize` only re-lays the client's own tree
-/// out inside whatever the server gave — verified on pixels, the frame
-/// does not move). A three-monitor machine gets a window it must drag
-/// taller once, which is the limitation `docs/settings.md` records; the
-/// alternative is a client-initiated resize op that does not exist and
-/// that this task is not the place to add.
-pub const WINDOW_SIZE: Size = Size::new(560.0, 400.0);
+/// | outputs | tree needs | fits in 440 |
+/// |---|---|---|
+/// | 1 | 391.2 | yes, 49 px spare |
+/// | 2 | 423.2 | yes, 17 px spare |
+/// | 3 | 455.2 | **no** — 15 px short |
+///
+/// 440 is therefore the smallest round number that holds the two-monitor
+/// case, which is what a laptop-plus-screen desktop actually is. The
+/// first draft of this fix said 400 and claimed two outputs fit; 400 is
+/// the *one*-output figure rounded up, and the claim was false by 23 px.
+/// Widening or heightening it further is free; narrowing it is what
+/// produced the bug, which is why [`build`] also pins it as the window's
+/// **minimum** through `Ui::set_window_limits`.
+///
+/// It does **not** grow for a third monitor. The window has no way to ask
+/// the server to resize it — `Ui::resize` only re-lays the client's own
+/// tree out inside whatever the server gave, verified on pixels rather
+/// than from the docs: the frame does not move. So a three-monitor
+/// machine gets a window it must drag taller once, which is the
+/// limitation `docs/settings.md` records; the alternative is a
+/// client-initiated resize op that does not exist and that this task is
+/// not the place to add.
+///
+/// Past that point the degradation is **clipping, not overlap**, and that
+/// took a second fix: the `displays` and `keyboard` sub-columns kept the
+/// default `shrink(1.0)` while the rows inside them carry `min_height`,
+/// so a column was laid out shorter than the rows it contained and the
+/// last row was drawn over `displays_note` — 0.8 px of overlap at two
+/// outputs, 15.6 px at three. They are `shrink(0.0)` too, so a column is
+/// never smaller than its own rows and the tree runs off the bottom edge
+/// honestly instead of writing on top of itself.
+pub const WINDOW_SIZE: Size = Size::new(560.0, 440.0);
 
 /// The "surface" an **ordinary** window is.
 ///
@@ -571,15 +600,42 @@ pub fn build(ui: &mut Ui<Settings>) -> WidgetId {
     // An empty column: the rows arrive from the shell socket, or from the
     // file, on the first turn of the loop — `build` has no state to put
     // them in and no answer from the connection yet.
-    let displays = ui.build(column().name(names::DISPLAYS).gap(GAP).width_percent(1.0));
+    //
+    // `shrink(0.0)` on the **column**, not just on the rows inside it.
+    // A `control_row` carries `min_height(ROW_HEIGHT)`, which the flex
+    // solver's final clamp honours — but the column holding those rows
+    // had the default `flex_shrink` of 1, so when the root ran out of
+    // height the column was laid out *shorter than the rows it contains*
+    // and the last row was drawn on top of `displays_note`: 0.8 px of
+    // overlap with two outputs, 15.6 px with three. Overlap is a worse
+    // failure than clipping, because it corrupts a line the user is
+    // still reading rather than just ending the window early. With this,
+    // a column is never smaller than its own rows and the surplus runs
+    // off the bottom edge instead.
+    let displays = ui.build(
+        column()
+            .name(names::DISPLAYS)
+            .gap(GAP)
+            .width_percent(1.0)
+            .shrink(0.0),
+    );
     let displays_note = ui.build(note(NOTE_LIVE).name(names::DISPLAYS_NOTE));
 
     // -- keyboard ------------------------------------------------------
+    //
+    // `shrink(0.0)` on the column for the reason `displays` has it: a
+    // container of `min_height` rows must not be shrunk below them.
     let layout = ui.build(field(names::LAYOUT, "us").grow(1.0));
     let variant = ui.build(field(names::VARIANT, "nodeadkeys").grow(1.0));
     let options = ui.build(field(names::OPTIONS, "ctrl:nocaps").grow(1.0));
     let test = ui.build(field(names::TEST, "type here after Apply").grow(1.0));
-    let keyboard = ui.build(column().name(names::KEYBOARD).gap(GAP).width_percent(1.0));
+    let keyboard = ui.build(
+        column()
+            .name(names::KEYBOARD)
+            .gap(GAP)
+            .width_percent(1.0)
+            .shrink(0.0),
+    );
     let kb_row = ui.build(control_row());
     for (caption_text, id) in [
         ("Layout", layout),
@@ -847,7 +903,7 @@ fn install(ui: &mut Ui<Settings>, ids: Ids) {
     // the window exists — `Ui::set_window_limits` records that and rides
     // the window's first commit, which is exactly what is wanted, but
     // `install` is where every other piece of wiring lives.
-    let _ = ui.set_window_limits(WINDOW_SIZE, Size::new(0.0, 0.0));
+    let _ = ui.set_window_limits(WINDOW_SIZE, Size::ZERO);
     ui.on_shell(
         move |s: &mut Settings, ui: &mut Ui<Settings>, ev: &ShellEvent| match ev {
             ShellEvent::Output(info) => upsert_output(s, ui, ids, info),

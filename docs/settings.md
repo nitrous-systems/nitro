@@ -249,14 +249,29 @@ fields), **Keyboard** (layout, variant, options, and a field to type in
 afterwards), **Audio** (volume and mute) and **Appearance** (the dark
 scheme). **Apply** writes the file; **Revert** re-reads it.
 
-### The window is 560×400, and that is not a taste decision
+### The window is 560×440, and both numbers are measured
 
-It is the size the tree measures. The widest thing in it is a display
-row — 76 px of connector name, 136 of mode string, a slider at its 64 px
-minimum, 30 for the scale value, 79 for the `primary` checkbox, two 54 px
-position fields and six 6 px gaps, ≈ 529 — and 400 px is what one
-output's worth of sections comes to at that width, with both notes on one
-line.
+The widest thing in it is a display row — 76 px of connector name, 136 of
+mode string, a slider at its 64 px minimum, 30 for the scale value, 79
+for the `primary` checkbox, two 54 px position fields and six 6 px gaps,
+≈ 529 — so the inner width is 540.
+
+The height is not reasoned about, it is measured: the built tree at that
+width, with the height unbounded, comes to **391.2 px for one output and
+exactly `ROW_HEIGHT + GAP` = 32 px more per output after it**.
+
+| outputs | the tree needs | fits in 440 |
+|---|---|---|
+| 1 | 391.2 | yes, 49 px spare |
+| 2 | 423.2 | yes, 17 px spare |
+| 3 | 455.2 | **no** — 15 px short |
+
+440 is the smallest round number that holds the two-monitor case, which
+is what a laptop-plus-external-screen desktop is. The first draft of this
+fix said 400 and claimed two outputs fit — 400 is the *one*-output figure
+rounded up, and the claim was false by 23 px. That is why the table is
+here and why a test asserts the two-output case rather than prose
+claiming it.
 
 This is written down because getting it wrong is not a cosmetic bug. The
 window was 440×320 while its tree measured ~400 px tall, and a flex
@@ -272,7 +287,7 @@ section headings at 11.8 px instead of 17.5, which cut the descenders off
 
 Every widget *measured* correctly throughout; each was then laid out
 smaller than it measured, which is why eighteen passing tests never saw
-it. Two things stop it recurring:
+it. Three things stop it recurring:
 
 - Anything with no smaller honest version is `shrink(0.0)` — headings,
   captions, notes, and every part of a display row except the slider,
@@ -280,21 +295,31 @@ it. Two things stop it recurring:
   absorbs the whole deficit. Control rows also carry a `min_height`,
   because an explicit `height` is folded into the constraints a child is
   *measured* with and the solver shrinks it afterwards anyway.
-- The dialog declares 560×400 as the window's **minimum** via
+- The `displays` and `keyboard` **columns** are `shrink(0.0)` too. A
+  container of `min_height` rows that can itself be shrunk is laid out
+  shorter than the rows inside it, and the last row is then drawn over
+  whatever follows — 0.8 px of overlap with two outputs, 15.6 px with
+  three, on top of `displays_note`. Overlap is a worse failure than
+  clipping: it corrupts a line the user is still reading instead of
+  ending the window early.
+- The dialog declares 560×440 as the window's **minimum** via
   `SetWindowLimits`, so the server refuses a drag that would put the tree
   back into less space than it needs. There is no maximum.
 
-`no_widget_is_laid_out_smaller_than_it_measures` in
-`crates/nitro-settings/tests/settings.rs` pins it, reading the same
+`no_widget_is_laid_out_smaller_than_it_measures` and
+`two_outputs_fit_the_window_and_a_third_clips_rather_than_overlaps` in
+`crates/nitro-settings/tests/settings.rs` pin all of it, reading the same
 bounds `hey nitro-settings list` prints.
 
-**It does not grow for a third monitor.** Each extra output costs one row
-plus a gap (32 px), and a client cannot ask the server to resize it —
-`Ui::resize` only re-lays the client's own tree out inside whatever size
-the server gave, which is the behaviour the explicit size exists to get
-(a settings dialog that resized itself when you unplugged a monitor would
-be the worse bug). Two outputs fit; beyond that, drag the window taller
-once. It will not shrink back under you.
+**It does not grow for a third monitor.** A client cannot ask the server
+to resize it — `Ui::resize` only re-lays the client's own tree out inside
+whatever size the server gave, which is the behaviour the explicit size
+exists to get (a settings dialog that resized itself when you unplugged a
+monitor would be the worse bug). With three or more outputs the tree runs
+past the bottom edge and is **clipped**, not squashed and not overlapped:
+the rows keep their full height and the Apply/Revert row is what goes
+out of view. Drag the window taller once and it stays there — the
+minimum only stops it shrinking.
 
 The output list comes from the shell socket, so the rows are the outputs
 the compositor actually has, with their live scales and positions — not
