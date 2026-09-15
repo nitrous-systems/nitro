@@ -496,6 +496,14 @@ The workspace figure is **77** lines and **37 distinct external crate
 names** with `nitro-png` in — the name count unchanged, which is the number
 this whole section exists to hold still.
 
+**M4-G's icons leave it at 37 too**, at **80** lines: `nitro-icons` is a
+new workspace member and `zeno` becomes a *direct* dependency of it, but
+zeno was already in the tree as one of swash's seven. Two consecutive
+features — a PNG decoder and an icon set — for zero new external names is
+the dependency policy working rather than a coincidence: both were
+measured against the alternative first, and in both cases the alternative
+was a crate we already had the ingredients for.
+
 
 ## `rustix` features by crate
 
