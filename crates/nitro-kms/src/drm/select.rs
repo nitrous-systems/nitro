@@ -776,16 +776,19 @@ mod tests {
 
     #[test]
     fn a_modeline_parses_and_computes_its_own_refresh() {
-        // CVT-RB 1280x720@240, the experiment the box exists for.
-        let ml = Modeline::parse("249000 1280 1328 1360 1440 720 723 728 735 +hsync -vsync")
+        // CVT-RB v1 1280x720@240, the experiment the box exists for; see
+        // `tmp/cvt_rb.py` in the task and the recipe in `docs/settings.md`.
+        let ml = Modeline::parse("279750 1280 1328 1360 1440 720 723 727 810 +hsync -vsync")
             .expect("a well-formed modeline");
-        assert_eq!(ml.clock_khz, 249_000);
+        assert_eq!(ml.clock_khz, 279_750);
         assert_eq!((ml.hdisplay, ml.vdisplay), (1280, 720));
         assert!(ml.hsync_positive && !ml.vsync_positive);
-        // 249 000 000 / (1440 * 735) = 235.2 Hz — the arithmetic, not a
-        // wish: these timings are 235, not 240, and the number the server
-        // reports must be the one the timings produce.
-        assert_eq!(ml.refresh_mhz(), 235_260);
+        // 279 750 000 000 / (1440 * 810) = 239.840 Hz (integer) — the arithmetic,
+        // not a wish: the clock is rounded down to CVT's 0.25 MHz step, so
+        // these timings are 239.84 Hz and not 240, and what the server
+        // reports has to be what the timings produce rather than what the
+        // person asking for them had in mind.
+        assert_eq!(ml.refresh_mhz(), 239_840);
         // Sync polarity defaults to +hsync -vsync (what CVT-RB wants) when
         // the line does not say.
         let bare = Modeline::parse("148500 1920 2008 2052 2200 1080 1084 1089 1125").expect("bare");
@@ -816,7 +819,7 @@ mod tests {
     fn hz_text_is_what_the_config_file_spells() {
         assert_eq!(hz_text(120_000), "120");
         assert_eq!(hz_text(59_940), "59.94");
-        assert_eq!(hz_text(235_260), "235.26");
+        assert_eq!(hz_text(239_840), "239.84");
         assert_eq!(hz_text(0), "0");
     }
 

@@ -1022,17 +1022,17 @@ mod tests {
         // assignment wins, like every other key here.
         let s = parse(
             "output.HDMI-A-1.mode = 1920x1080@120\n\
-             output.HDMI-A-1.modeline = 249000 1280 1328 1360 1440 720 723 728 735 +hsync -vsync\n",
+             output.HDMI-A-1.modeline = 279750 1280 1328 1360 1440 720 723 727 810 +hsync -vsync\n",
         );
         assert!(s.warnings.is_empty(), "{:?}", s.warnings);
         let Some(ModeRequest::Custom(ml)) = s.output("HDMI-A-1").expect("HDMI").mode else {
             panic!("want a modeline, got {:?}", s.output("HDMI-A-1"));
         };
-        assert_eq!(ml.clock_khz, 249_000);
-        assert_eq!(ml.refresh_mhz(), 235_260);
+        assert_eq!(ml.clock_khz, 279_750);
+        assert_eq!(ml.refresh_mhz(), 239_840);
         // ... and the other way round.
         let s = parse(
-            "output.HDMI-A-1.modeline = 249000 1280 1328 1360 1440 720 723 728 735\n\
+            "output.HDMI-A-1.modeline = 279750 1280 1328 1360 1440 720 723 727 810\n\
              output.HDMI-A-1.mode = 1920x1080@120\n",
         );
         assert!(matches!(
