@@ -19,6 +19,7 @@
 //!   `Event::Hotplug` **and make the poll fd readable**, so an idle
 //!   server wakes for it; the change takes effect on `rescan`.
 
+use std::collections::HashMap;
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::time::Duration;
@@ -28,6 +29,7 @@ use rustix::time::{
     timerfd_settime,
 };
 
+use crate::drm::select::{ModeCandidate, ModeRequest, select_mode};
 use crate::{BYTES_PER_PIXEL, Backend, BufferMut, Error, Event, Image, OutputId, OutputInfo, Rect};
 
 /// Description of one virtual output.
@@ -43,6 +45,16 @@ pub struct FakeOutputSpec {
     pub refresh_mhz: u32,
     /// Reported physical size.
     pub phys_mm: (u32, u32),
+    /// The modes this virtual connector claims to offer.
+    ///
+    /// Empty means "only the one above", which is what every fake output
+    /// was before `output.<c>.mode` existed and what a test that does not
+    /// care still gets. A test that *does* care ([`FakeOutputSpec::modes`])
+    /// hands over a table and the backend picks from it the same way the
+    /// DRM backend picks from a connector's list — same [`select_mode`],
+    /// same fallback, same warning — which is what makes a mode test
+    /// runnable without a monitor.
+    pub modes: Vec<ModeCandidate>,
 }
 
 impl FakeOutputSpec {
@@ -55,6 +67,7 @@ impl FakeOutputSpec {
             height,
             refresh_mhz: 60_000,
             phys_mm: (width * 254 / 960, height * 254 / 960),
+            modes: Vec::new(),
         }
     }
 
@@ -70,6 +83,50 @@ impl FakeOutputSpec {
     pub fn refresh_mhz(mut self, mhz: u32) -> Self {
         self.refresh_mhz = mhz;
         self
+    }
+
+    /// Offer a mode table, so `output.<c>.mode` has something to choose
+    /// from.
+    ///
+    /// Each entry is `(width, height, refresh_mhz)`; the **first** is the
+    /// preferred one, which is what the output comes up on when nothing is
+    /// configured. Sizes other than the spec's are allowed and are what
+    /// make a size change testable headlessly.
+    #[must_use]
+    pub fn modes(mut self, modes: &[(u32, u32, u32)]) -> Self {
+        self.modes = modes
+            .iter()
+            .enumerate()
+            .map(|(i, &(width, height, refresh_mhz))| ModeCandidate {
+                width,
+                height,
+                refresh_mhz,
+                preferred: i == 0,
+                interlaced: false,
+            })
+            .collect();
+        if let Some(m) = self.modes.first() {
+            self.width = m.width;
+            self.height = m.height;
+            self.refresh_mhz = m.refresh_mhz;
+        }
+        self
+    }
+
+    /// The mode table this spec offers, which is its own single mode when
+    /// it was never given one.
+    fn mode_table(&self) -> Vec<ModeCandidate> {
+        if self.modes.is_empty() {
+            vec![ModeCandidate {
+                width: self.width,
+                height: self.height,
+                refresh_mhz: self.refresh_mhz,
+                preferred: true,
+                interlaced: false,
+            }]
+        } else {
+            self.modes.clone()
+        }
     }
 }
 
@@ -94,6 +151,9 @@ impl FakeOutput {
                 height: spec.height,
                 refresh_mhz: spec.refresh_mhz,
                 phys_mm: spec.phys_mm,
+                // Nothing on the fake backend is a modeline: it has no
+                // EDID to bypass, so every mode it offers is its own.
+                custom_mode: false,
             },
             stride,
             bufs: [vec![0; len], vec![0; len]],
@@ -116,6 +176,12 @@ pub struct FakeBackend {
     pending_specs: Vec<FakeOutputSpec>,
     pending_removals: Vec<OutputId>,
     hotplug_queued: bool,
+    /// The spec each live output was built from, so a mode change can be
+    /// resolved against its table without re-deriving it.
+    specs: Vec<FakeOutputSpec>,
+    /// The mode requests in force, by connector name.
+    modes: HashMap<String, ModeRequest>,
+    warnings: Vec<String>,
 }
 
 impl FakeBackend {
@@ -140,6 +206,9 @@ impl FakeBackend {
             pending_specs: Vec::new(),
             pending_removals: Vec::new(),
             hotplug_queued: false,
+            specs: Vec::new(),
+            modes: HashMap::new(),
+            warnings: Vec::new(),
         };
         for s in specs {
             this.add_output(s);
@@ -159,7 +228,56 @@ impl FakeBackend {
         let id = OutputId(self.next_id);
         self.next_id += 1;
         self.outputs.push(FakeOutput::new(id, spec));
+        self.specs.push(spec.clone());
+        self.apply_mode(self.outputs.len() - 1);
         self.infos.push(self.outputs.last().unwrap().info.clone());
+    }
+
+    /// Resolve output `i`'s configured mode against its table and resize
+    /// it if the answer moved. Returns whether anything changed.
+    ///
+    /// The same shape the DRM backend has: an unmatched request is a
+    /// warning naming what the connector *does* list, plus the default
+    /// mode. Buffers are reallocated when the size changes, because on a
+    /// real backend that is a fresh pair of dumb buffers too.
+    fn apply_mode(&mut self, i: usize) -> bool {
+        let table = self.specs[i].mode_table();
+        let name = self.specs[i].name.clone();
+        let wanted = self.modes.get(&name).copied();
+        if let Some(req) = wanted.as_ref() {
+            if matches!(req, ModeRequest::Custom(_)) {
+                self.warnings.push(format!(
+                    "{name}: a modeline needs real hardware; the fake backend has no timings to set"
+                ));
+            } else if crate::drm::select::request_match(&table, req).is_none() {
+                self.warnings.push(format!(
+                    "{name}: no mode matches `{req}`; this connector lists {}. Using the default mode.",
+                    crate::drm::select::describe_modes(&table)
+                ));
+            }
+        }
+        let Some(mi) = select_mode(&table, wanted.as_ref()) else {
+            return false;
+        };
+        let m = table[mi];
+        let o = &mut self.outputs[i];
+        if (o.info.width, o.info.height, o.info.refresh_mhz) == (m.width, m.height, m.refresh_mhz) {
+            return false;
+        }
+        let resized = (o.info.width, o.info.height) != (m.width, m.height);
+        o.info.width = m.width;
+        o.info.height = m.height;
+        o.info.refresh_mhz = m.refresh_mhz;
+        if resized {
+            o.stride = (m.width * BYTES_PER_PIXEL).div_ceil(64) * 64;
+            let len = (o.stride * m.height) as usize;
+            o.bufs = [vec![0; len], vec![0; len]];
+            o.front = 0;
+            // A mode set is a modeset: nothing is in flight across it, the
+            // same promise `resume` makes.
+            o.pending = false;
+        }
+        true
     }
 
     /// Simulate plugging in a new output: queues `Event::Hotplug`; the
@@ -405,6 +523,7 @@ impl Backend for FakeBackend {
         for id in std::mem::take(&mut self.pending_removals) {
             if let Some(i) = self.outputs.iter().position(|o| o.info.id == id) {
                 self.outputs.remove(i);
+                self.specs.remove(i);
                 changed = true;
             }
         }
@@ -416,6 +535,33 @@ impl Backend for FakeBackend {
             self.infos = self.outputs.iter().map(|o| o.info.clone()).collect();
         }
         Ok(changed)
+    }
+
+    fn set_modes(&mut self, modes: &HashMap<String, ModeRequest>) -> Result<bool, Error> {
+        if *modes == self.modes {
+            return Ok(false);
+        }
+        self.modes.clone_from(modes);
+        let mut changed = false;
+        for i in 0..self.outputs.len() {
+            changed |= self.apply_mode(i);
+        }
+        if changed {
+            self.infos = self.outputs.iter().map(|o| o.info.clone()).collect();
+        }
+        Ok(changed)
+    }
+
+    fn take_warnings(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.warnings)
+    }
+
+    fn available_modes(&self, output: OutputId) -> Vec<ModeCandidate> {
+        self.outputs
+            .iter()
+            .position(|o| o.info.id == output)
+            .map(|i| self.specs[i].mode_table())
+            .unwrap_or_default()
     }
 
     fn pause(&mut self) {
@@ -478,6 +624,95 @@ mod tests {
         let b = FakeBackend::single(8, 4).unwrap();
         let id = b.outputs()[0].id;
         (b, id)
+    }
+
+    /// A fake connector with the test box's mode shape: a preferred
+    /// 1080p60 plus a 120 and a smaller size, so a request can be right,
+    /// wrong, or about a size change.
+    fn multi_mode() -> FakeBackend {
+        FakeBackend::new(&[FakeOutputSpec::new(1920, 1080).named("HDMI-A-1").modes(&[
+            (1920, 1080, 60_000),
+            (1920, 1080, 120_000),
+            (1280, 720, 240_000),
+        ])])
+        .unwrap()
+    }
+
+    fn req(text: &str) -> ModeRequest {
+        ModeRequest::parse(text).unwrap()
+    }
+
+    fn want(name: &str, spec: &str) -> HashMap<String, ModeRequest> {
+        HashMap::from([(name.to_owned(), req(spec))])
+    }
+
+    #[test]
+    fn a_mode_request_retimes_the_output() {
+        let mut b = multi_mode();
+        // Preferred first, which is the 60.
+        assert_eq!(b.outputs()[0].refresh_mhz, 60_000);
+        assert!(b.set_modes(&want("HDMI-A-1", "1920x1080@120")).unwrap());
+        assert_eq!(b.outputs()[0].refresh_mhz, 120_000);
+        assert_eq!((b.outputs()[0].width, b.outputs()[0].height), (1920, 1080));
+        assert!(b.take_warnings().is_empty());
+        // Idempotent: the same map is not a modeset.
+        assert!(!b.set_modes(&want("HDMI-A-1", "1920x1080@120")).unwrap());
+        // And so is a *different* request that resolves to the same mode:
+        // the map changed, the hardware did not.
+        assert!(!b.set_modes(&want("HDMI-A-1", "fastest")).unwrap());
+        assert_eq!(b.outputs()[0].refresh_mhz, 120_000);
+    }
+
+    #[test]
+    fn a_size_change_reallocates_the_buffers() {
+        let mut b = multi_mode();
+        let id = b.outputs()[0].id;
+        assert!(b.set_modes(&want("HDMI-A-1", "1280x720")).unwrap());
+        let info = b.outputs()[0].clone();
+        assert_eq!(
+            (info.width, info.height, info.refresh_mhz),
+            (1280, 720, 240_000)
+        );
+        let buf = b.back_buffer(id).unwrap();
+        assert_eq!((buf.width, buf.height), (1280, 720));
+        assert_eq!(buf.data.len() as u32, buf.stride * 720);
+        // The shortest period across outputs is the tick period, so a
+        // 240 Hz output really does tick four times as often as a 60.
+        assert_eq!(
+            b.period(),
+            Duration::from_nanos(1_000_000_000_000 / 240_000)
+        );
+    }
+
+    #[test]
+    fn an_unmatched_request_warns_and_keeps_the_default() {
+        let mut b = multi_mode();
+        assert!(!b.set_modes(&want("HDMI-A-1", "2560x1440@144")).unwrap());
+        assert_eq!(b.outputs()[0].refresh_mhz, 60_000);
+        let warnings = b.take_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("no mode matches `2560x1440@144`"),
+            "{warnings:?}"
+        );
+        // The evidence a user needs to write a line that works.
+        assert!(
+            warnings[0].contains("1920x1080@60, 1920x1080@120, 1280x720@240"),
+            "{warnings:?}"
+        );
+        // Drained, so a reload that did not change the line is silent.
+        assert!(b.take_warnings().is_empty());
+    }
+
+    #[test]
+    fn a_connector_the_map_does_not_name_is_left_alone() {
+        let mut b = multi_mode();
+        assert!(!b.set_modes(&want("DP-1", "1280x720")).unwrap());
+        assert_eq!(
+            (b.outputs()[0].width, b.outputs()[0].refresh_mhz),
+            (1920, 60_000)
+        );
+        assert!(b.take_warnings().is_empty());
     }
 
     #[test]

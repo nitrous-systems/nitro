@@ -24,9 +24,11 @@ pub mod drm;
 pub mod fake;
 pub mod uevent;
 
-pub use crate::drm::{DrmBackend, DrmFd, DrmOptions};
+pub use crate::drm::select::ModeCandidate;
+pub use crate::drm::{DrmBackend, DrmFd, DrmOptions, ModeRequest, Modeline};
 pub use crate::fake::{FakeBackend, FakeOutputSpec};
 
+use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::os::fd::BorrowedFd;
@@ -61,6 +63,15 @@ pub struct OutputInfo {
     pub refresh_mhz: u32,
     /// Physical size in millimetres, `(0, 0)` when unknown.
     pub phys_mm: (u32, u32),
+    /// The mode came from a user-supplied modeline rather than the
+    /// connector's own list.
+    ///
+    /// Reported rather than kept private because it changes what a number
+    /// on screen *means*: a custom mode was never validated against the
+    /// monitor's EDID, so "the panel is dark" is a possible and expected
+    /// outcome, and the `outputs` line says `(custom)` so whoever is
+    /// reading it knows which question to ask.
+    pub custom_mode: bool,
 }
 
 /// An axis-aligned rectangle in output pixel space.
@@ -387,6 +398,47 @@ pub trait Backend {
     /// on a fake one with no outputs to remove.
     fn simulate_unplug(&mut self) -> bool {
         false
+    }
+
+    /// Re-apply the per-connector mode configuration, returning whether
+    /// [`Backend::outputs`] changed.
+    ///
+    /// A **full modeset**, not a property flip: the CRTC is retimed and
+    /// the screen blanks for the duration. That is why it is a separate
+    /// method rather than something `rescan` reads — the caller decides
+    /// when it is worth doing, and the answer is "when the configuration
+    /// actually changed", which is what an unchanged map returning `false`
+    /// without touching the hardware enforces.
+    ///
+    /// The default is `Ok(false)`: a backend with no modes to set (the
+    /// fake one) has nothing to do, and saying so is not an error.
+    ///
+    /// # Errors
+    /// [`Error::Io`] if the re-probe or the modeset fails.
+    fn set_modes(&mut self, _modes: &HashMap<String, ModeRequest>) -> Result<bool, Error> {
+        Ok(false)
+    }
+
+    /// Take whatever the backend has to say about the mode configuration.
+    ///
+    /// A request that matched no listed mode, or a modeline the kernel
+    /// refused: both are non-fatal — the output comes up on its default
+    /// mode — and both are things the user has to be told, because they
+    /// wrote a line that did not do what it says. This crate has no
+    /// logger, so the sentences come out here and the caller logs them.
+    fn take_warnings(&mut self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Every mode `output`'s connector lists, in the kernel's own order.
+    ///
+    /// What `output.<connector>.mode` may choose from, and therefore what
+    /// a user needs to see before writing that line — the server's `modes`
+    /// control command is this list and nothing else. An unknown id gives
+    /// an empty list rather than an error: it is a question, not a
+    /// command.
+    fn available_modes(&self, _output: OutputId) -> Vec<ModeCandidate> {
+        Vec::new()
     }
 }
 

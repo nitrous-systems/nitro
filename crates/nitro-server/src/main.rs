@@ -15,6 +15,10 @@
 //!   which is what a headless test wants.
 //! - `NITRO_SCALE=<connector>=<f32>,…` overrides an output's scale; see
 //!   `docs/wm.md`. It beats `server.conf`, which beats the EDID.
+//! - `NITRO_MODE=<connector>=<WxH[@Hz]|max|fastest>,…` overrides an
+//!   output's mode, and `NITRO_MODELINE=<connector>=<clock> <hdisp> …`
+//!   drives one at timings the monitor does not advertise. Both beat
+//!   `output.<c>.mode` in `server.conf`; see `docs/settings.md`.
 //! - `NITRO_CONFIG` overrides where `server.conf` is read from; otherwise
 //!   `$XDG_CONFIG_HOME/nitro/server.conf`, else
 //!   `$HOME/.config/nitro/server.conf`. With neither variable set there is
@@ -94,6 +98,20 @@ fn config_from_env() -> Result<Config, String> {
         scales: std::env::var("NITRO_SCALE")
             .map(|s| nitro_server::parse_scales(&s))
             .unwrap_or_default(),
+        // `NITRO_MODE` is a comma-separated list like `NITRO_SCALE`;
+        // `NITRO_MODELINE` holds one connector's raw timings, which
+        // contain spaces and so cannot share that list. The modeline wins
+        // where both name the same connector, because it is the more
+        // specific instruction of the two.
+        modes: {
+            let mut m = std::env::var("NITRO_MODE")
+                .map(|s| nitro_server::parse_modes(&s))
+                .unwrap_or_default();
+            if let Ok(s) = std::env::var("NITRO_MODELINE") {
+                m.extend(nitro_server::parse_modelines(&s));
+            }
+            m
+        },
         // Anything but `0` leaves the shadow on: this is a measurement
         // escape hatch, not a configuration surface, and the default is
         // the one that ships.

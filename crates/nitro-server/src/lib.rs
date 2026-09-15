@@ -69,7 +69,7 @@ use std::time::{Duration, Instant};
 
 use nitro_core::{Damage, Point, Rect, Size};
 use nitro_kms::{
-    Backend, DrmBackend, DrmOptions, Error as KmsError, Event, FakeBackend,
+    Backend, DrmBackend, DrmOptions, Error as KmsError, Event, FakeBackend, ModeRequest, Modeline,
     OutputId as KmsOutputId, OutputInfo, Rect as KmsRect,
 };
 use nitro_raster::Canvas;
@@ -154,6 +154,10 @@ pub struct Config {
     /// environment is process-global and the tests run in threads of one
     /// process.
     pub scales: HashMap<String, f32>,
+    /// Per-output mode overrides by connector name. `main.rs` fills this
+    /// from `NITRO_MODE` / `NITRO_MODELINE`; a test sets it directly, for
+    /// the same reason `scales` is a field.
+    pub modes: HashMap<String, ModeRequest>,
     /// Paint into a heap shadow buffer per output and stream the damage
     /// into the scanout buffer, rather than rasterizing straight into it.
     ///
@@ -202,6 +206,7 @@ impl Config {
             input_dir: None,
             fake_input: None,
             scales: HashMap::new(),
+            modes: HashMap::new(),
             shadow: true,
             config_path: None,
             icon_dirs: None,
@@ -295,6 +300,89 @@ pub fn parse_scales(spec: &str) -> HashMap<String, f32> {
             }
             _ => warn!("NITRO_SCALE: {value:?} is not a positive scale"),
         }
+    }
+    out
+}
+
+/// Parse per-output mode overrides, `<name>=<mode>,…`.
+///
+/// `NITRO_MODE=HDMI-A-1=1920x1080@120`, in exactly the style `NITRO_SCALE`
+/// established and for the same reason: a one-off measurement or a test
+/// must be able to say "run this connector at this rate" without editing
+/// the box's configuration file, and the environment is the *development*
+/// channel that beats the file.
+///
+/// A mode spec has no comma in it, so the split is unambiguous. A bad
+/// entry is a warning and is skipped, like every other configuration
+/// error in this tree: an unparseable `NITRO_MODE` must not stop a server
+/// from starting.
+#[must_use]
+pub fn parse_modes(spec: &str) -> HashMap<String, ModeRequest> {
+    let mut out = HashMap::new();
+    for entry in spec.split(',').filter(|e| !e.trim().is_empty()) {
+        let Some((name, value)) = entry.split_once('=') else {
+            warn!("NITRO_MODE: {entry:?} is not name=mode");
+            continue;
+        };
+        match ModeRequest::parse(value) {
+            Ok(m) => {
+                out.insert(name.trim().to_owned(), m);
+            }
+            Err(e) => warn!("NITRO_MODE: {value:?}: {e}"),
+        }
+    }
+    out
+}
+
+/// Parse per-output modelines, `<name>=<clock> <hdisp> …`.
+///
+/// `NITRO_MODELINE=HDMI-A-1=249000 1280 1328 1360 1440 720 723 728 735
+/// +hsync -vsync`. Separate from [`parse_modes`] because a modeline
+/// contains spaces and could not share `NITRO_MODE`'s comma-separated
+/// list without a quoting rule; one variable therefore holds **one**
+/// connector's timings, which is what a one-off experiment wants anyway.
+///
+/// Merged on top of `NITRO_MODE`, so a variable naming the same connector
+/// twice ends up with the modeline — the more specific of the two.
+#[must_use]
+pub fn parse_modelines(spec: &str) -> HashMap<String, ModeRequest> {
+    let mut out = HashMap::new();
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return out;
+    }
+    let Some((name, value)) = spec.split_once('=') else {
+        warn!("NITRO_MODELINE: {spec:?} is not name=<modeline>");
+        return out;
+    };
+    match Modeline::parse(value) {
+        Ok(m) => {
+            out.insert(name.trim().to_owned(), ModeRequest::Custom(m));
+        }
+        Err(e) => warn!("NITRO_MODELINE: {value:?}: {e}"),
+    }
+    out
+}
+
+/// The modes every connector should run, after everything has had its say.
+///
+/// `NITRO_MODE`/`NITRO_MODELINE` beat `output.<c>.mode`, which beats the
+/// connector's own preferred mode — the same precedence, and for the same
+/// reasons, as [`resolve_scale`]. One function so startup, a reload and a
+/// hotplug cannot drift apart: a replugged monitor has to come back at the
+/// rate the user configured, not the one the EDID prefers.
+#[must_use]
+fn resolve_modes(
+    overrides: &HashMap<String, ModeRequest>,
+    settings: &config::Settings,
+) -> HashMap<String, ModeRequest> {
+    let mut out: HashMap<String, ModeRequest> = settings
+        .outputs
+        .iter()
+        .filter_map(|(name, o)| o.mode.map(|m| (name.clone(), m)))
+        .collect();
+    for (name, m) in overrides {
+        out.insert(name.clone(), *m);
     }
     out
 }
@@ -626,6 +714,10 @@ struct Server {
     frame_titles: HashMap<WindowKey, nitro_text::TextKey>,
     /// Per-output scale overrides from `NITRO_SCALE`, by connector name.
     scale_overrides: HashMap<String, f32>,
+    /// Per-output mode overrides from `NITRO_MODE` / `NITRO_MODELINE`, by
+    /// connector name. Beats `output.<c>.mode`, like every other
+    /// environment override here.
+    mode_overrides: HashMap<String, ModeRequest>,
     /// Where each output's logical space starts in the desktop space, by
     /// scene id, in the order `sync_outputs` laid them out.
     ///
@@ -746,7 +838,25 @@ pub fn run(mut config: Config) -> Result<(), Error> {
     // Declared before `device`/`backend` so an early `?` drops it last.
     let mut seat: Option<Rc<RefCell<Seat>>> = None;
     let mut device: Option<Device> = None;
-    let backend: Box<dyn Backend> = match &config.backend {
+    // The configuration file is read **before** the backend, because
+    // `output.<c>.mode` is an input to the very first modeset: reading it
+    // afterwards would light the panel at its preferred rate and retime it
+    // a moment later, which is a visible blank at every boot for no
+    // reason. Its `keyboard.*` section is likewise an input to the keymap
+    // compiled further down.
+    let settings = match config.config_path.as_deref() {
+        Some(path) => {
+            let s = config::load(path);
+            info!("configuration from {}", path.display());
+            for w in &s.warnings {
+                warn!("{}: {w}", path.display());
+            }
+            s
+        }
+        None => config::Settings::default(),
+    };
+    let modes = resolve_modes(&config.modes, &settings);
+    let mut backend: Box<dyn Backend> = match &config.backend {
         BackendKind::Fake { width, height } => {
             info!("fake backend {width}x{height}");
             Box::new(FakeBackend::single(*width, *height).map_err(io_err("create fake backend"))?)
@@ -763,12 +873,22 @@ pub fn run(mut config: Config) -> Result<(), Error> {
                 info!("interrupted while waiting for the seat; exiting");
                 return Ok(());
             }
-            let (dev, be) = open_card(&mut s, card.as_deref())?;
+            let (dev, be) = open_card(&mut s, card.as_deref(), &modes)?;
             seat = Some(Rc::new(RefCell::new(s)));
             device = Some(dev);
             be
         }
     };
+    // The fake backend learns its modes here rather than at construction,
+    // because `FakeBackend::single` is the shape every test already calls.
+    // On the DRM backend the map went in through `DrmOptions` and this is
+    // a no-op comparison against what is already in force.
+    if let Err(e) = backend.set_modes(&modes) {
+        warn!("applying the configured modes: {e}");
+    }
+    for w in backend.take_warnings() {
+        warn!("{w}");
+    }
 
     let input: Box<dyn InputSource> = match (&seat, config.input_dir.as_deref()) {
         (_, _) if config.fake_input.is_some() => {
@@ -819,24 +939,12 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         None
     };
 
-    // The configuration file, before the keyboard: its `keyboard.*`
-    // section is an input to the keymap, and a keymap compiled without it
-    // would be thrown away one line later.
-    let settings = match config.config_path.as_deref() {
-        Some(path) => {
-            let s = config::load(path);
-            info!("configuration from {}", path.display());
-            for w in &s.warnings {
-                warn!("{}: {w}", path.display());
-            }
-            s
-        }
-        None => config::Settings::default(),
-    };
-    // The watch is opened even when the file itself is absent — the
-    // directory is what is watched, so a `server.conf` created after the
-    // server started is picked up. A missing *directory* is the ordinary
-    // state of a fresh install and is not worth more than a debug line.
+    // The keyboard's section came out of the file read before the
+    // backend; the watch is opened even when the file itself is absent —
+    // the directory is what is watched, so a `server.conf` created after
+    // the server started is picked up. A missing *directory* is the
+    // ordinary state of a fresh install and is not worth more than a debug
+    // line.
     let config_watch = match config.config_path.as_deref() {
         Some(path) => match ConfigWatch::open(path) {
             Ok(w) => {
@@ -909,6 +1017,7 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         resize_hint: None,
         frame_titles: HashMap::new(),
         scale_overrides: std::mem::take(&mut config.scales),
+        mode_overrides: std::mem::take(&mut config.modes),
         origins: Vec::new(),
         palette: settings.palette(),
         theme_serial: 1,
@@ -1122,11 +1231,15 @@ fn card_candidates(card: Option<&Path>) -> Vec<PathBuf> {
 
 /// Open the first candidate with a connected output; fall back to the
 /// first that opens at all (hotplug may bring an output later).
-fn open_card(seat: &mut Seat, card: Option<&Path>) -> Result<(Device, Box<dyn Backend>), Error> {
+fn open_card(
+    seat: &mut Seat,
+    card: Option<&Path>,
+    modes: &HashMap<String, ModeRequest>,
+) -> Result<(Device, Box<dyn Backend>), Error> {
     let mut fallback: Option<PathBuf> = None;
     let mut last_err = String::from("no /dev/dri/card* found");
     for path in card_candidates(card) {
-        match try_open(seat, &path) {
+        match try_open(seat, &path, modes) {
             Ok((dev, be)) if !be.outputs().is_empty() || card.is_some() => {
                 return Ok((dev, be));
             }
@@ -1144,12 +1257,16 @@ fn open_card(seat: &mut Seat, card: Option<&Path>) -> Result<(Device, Box<dyn Ba
     }
     if let Some(path) = fallback {
         warn!("no card has a connected output; using {}", path.display());
-        return try_open(seat, &path);
+        return try_open(seat, &path, modes);
     }
     Err(Error::NoDevice(last_err))
 }
 
-fn try_open(seat: &mut Seat, path: &Path) -> Result<(Device, Box<dyn Backend>), Error> {
+fn try_open(
+    seat: &mut Seat,
+    path: &Path,
+    modes: &HashMap<String, ModeRequest>,
+) -> Result<(Device, Box<dyn Backend>), Error> {
     let dev = seat.open_device(path)?;
     // The backend gets its own fd (a dup sharing the open file
     // description, hence DRM master) so it can be `'static`; the seat's
@@ -1158,10 +1275,22 @@ fn try_open(seat: &mut Seat, path: &Path) -> Result<(Device, Box<dyn Backend>), 
         .as_fd()
         .try_clone_to_owned()
         .map_err(io_err("dup DRM fd"))?;
-    match DrmBackend::open(fd, &DrmOptions::default()) {
-        Ok(be) => {
+    let opts = DrmOptions {
+        hotplug: true,
+        modes: modes.clone(),
+    };
+    match DrmBackend::open(fd, &opts) {
+        Ok(mut be) => {
             if let Some(e) = be.hotplug_error() {
                 warn!("hotplug disabled: {e}");
+            }
+            // What the mode configuration had to say about this card.
+            // Emitted here rather than swallowed, because "the line you
+            // wrote matched nothing" is the one thing a user needs to
+            // hear: the desktop comes up either way and the only visible
+            // symptom is a rate that did not change.
+            for w in be.take_warnings() {
+                warn!("{}: {w}", path.display());
             }
             info!(
                 "opened {} with {} output(s)",
@@ -1250,6 +1379,32 @@ impl Server {
     /// Removing an output orphans its windows — the scene unplaces them —
     /// so they are migrated onto the primary output afterwards rather than
     /// left invisible with no way back.
+    /// Re-apply `output.<c>.mode` after a reload.
+    ///
+    /// **A mode set is a full modeset**, not a property flip like scale or
+    /// position: the CRTC is retimed and the panel blanks for the
+    /// duration. So this is done only when the resolved map actually
+    /// changed — which the backend enforces by comparing before touching
+    /// anything — and a reload that moved a colour costs nothing.
+    ///
+    /// A refresh change at the same size (1080p60 → 1080p120) is cheap
+    /// enough to do live: no buffer changes size, so the shadow and the
+    /// two scanout buffers stay exactly as they are. A **size** change is
+    /// the expensive case, and the backend handles it by reallocating; the
+    /// `sync_outputs` that follows resizes the shadow and repaints in
+    /// full, which is the same path a hotplug already takes.
+    fn apply_modes(&mut self) {
+        let modes = resolve_modes(&self.mode_overrides, &self.settings);
+        match self.backend.set_modes(&modes) {
+            Ok(true) => info!("output modes re-applied"),
+            Ok(false) => {}
+            Err(e) => warn!("applying the configured modes: {e}"),
+        }
+        for w in self.backend.take_warnings() {
+            warn!("{w}");
+        }
+    }
+
     fn sync_outputs(&mut self) {
         let infos: Vec<OutputInfo> = self.backend.outputs().to_vec();
         let mut lost = false;
@@ -2510,6 +2665,11 @@ impl Server {
         // Scale, position and primary all land in `sync_outputs`, which is
         // the one place that decides them; it re-`Configure`s the clients
         // of any output whose scale moved and `invalidate`s every output.
+        //
+        // The **mode** is applied first, because it decides what
+        // `sync_outputs` is laying out: a retimed or resized output has to
+        // be the one the scene is told about, not the one it was before.
+        self.apply_modes();
         self.sync_outputs();
         // The remote listener, which may appear, move or go away. Done
         // unconditionally like everything else here, and idempotent: an
@@ -4085,6 +4245,7 @@ impl Server {
         let reply = match protocol::parse(line) {
             Err(msg) => protocol::err_reply(&msg),
             Ok(Request::Outputs) => self.outputs_reply(),
+            Ok(Request::Modes) => self.modes_reply(),
             Ok(Request::Stats) => self.stats_reply(),
             Ok(Request::Shot(name)) => self.shot(name.as_deref()),
             Ok(Request::ShotFront(name)) => self.shot_front(name.as_deref()),
@@ -4142,11 +4303,54 @@ impl Server {
                         .map_or(1.0, |(_, scale)| scale),
                     position: (origin.x as i32, origin.y as i32),
                     primary: primary == Some(scene_id),
+                    custom_mode: info.custom_mode,
                 }
             })
             .collect();
         lines.sort_unstable_by_key(|o| o.position);
         protocol::outputs_reply(&lines)
+    }
+
+    /// `modes`: every mode every connected connector offers.
+    ///
+    /// The answer to "what may I write in `output.<c>.mode`", which is a
+    /// question `outputs` cannot answer — it reports the one mode in
+    /// force. Ordered by connector in the backend's own order and, within
+    /// one, in the kernel's, because that order is itself information: the
+    /// kernel lists a connector's modes best-first.
+    fn modes_reply(&self) -> Vec<u8> {
+        let mut lines: Vec<protocol::ModeLine> = Vec::new();
+        for info in self.backend.outputs() {
+            for m in self.backend.available_modes(info.id) {
+                lines.push(protocol::ModeLine {
+                    name: info.name.clone(),
+                    mode: m.to_string(),
+                    preferred: m.preferred,
+                    current: !info.custom_mode
+                        && m.width == info.width
+                        && m.height == info.height
+                        && m.refresh_mhz == info.refresh_mhz,
+                });
+            }
+            // A modeline is not in the connector's list at all, so it
+            // would otherwise be the one mode this reply does not mention
+            // — and it is the one most worth seeing, because it is the one
+            // nothing else validated.
+            if info.custom_mode {
+                lines.push(protocol::ModeLine {
+                    name: info.name.clone(),
+                    mode: format!(
+                        "{}x{}@{} (custom)",
+                        info.width,
+                        info.height,
+                        nitro_kms::drm::select::hz_text(info.refresh_mhz)
+                    ),
+                    preferred: false,
+                    current: true,
+                });
+            }
+        }
+        protocol::modes_reply(&lines)
     }
 
     fn stats_reply(&self) -> Vec<u8> {

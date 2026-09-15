@@ -11,4 +11,11 @@ workspace = true
 
 [dependencies]
 drm = "0.15"
+# The kernel's `drm_mode_modeinfo`, so a user-supplied modeline can be
+# handed to the CRTC as a `MODE_ID` blob. Already in the tree as `drm`'s
+# own dependency (same 0.9.1 resolution, no new lock entry and no new
+# external crate name); naming it directly is what makes `Mode::from(raw)`
+# reachable, and the alternative is hand-rolling a 68-byte kernel ABI
+# struct. See DEPENDENCIES.md.
+drm-ffi = "0.9"
 rustix = { version = "1", features = ["event", "fs", "mm", "net", "time"] }

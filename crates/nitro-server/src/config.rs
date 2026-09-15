@@ -56,6 +56,7 @@
 //! | setting | wins | then | then |
 //! |---|---|---|---|
 //! | output scale | `NITRO_SCALE` | `output.<c>.scale` | EDID dpi step |
+//! | output mode | `NITRO_MODE` / `NITRO_MODELINE` | `output.<c>.mode` / `.modeline` | the connector's preferred mode |
 //! | output position | — | `output.<c>.position` | left-to-right in connector order |
 //! | primary output | — | `output.<c>.primary` | the first connector |
 //! | keyboard | `XKB_DEFAULT_*` | `keyboard.*` | the `us` layout |
@@ -73,6 +74,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use nitro_core::{Palette, Role, Scheme, palette};
+use nitro_kms::{ModeRequest, Modeline};
 
 /// The file's name inside the configuration directory.
 pub const FILE_NAME: &str = "server.conf";
@@ -114,13 +116,24 @@ pub struct OutputSettings {
     /// to, and the one a client gets when it has no say. At most one
     /// output wins; a file naming two gets the first in file order.
     pub primary: bool,
+    /// `output.<connector>.mode` (`1920x1080@120`, `1280x720`, `max`,
+    /// `fastest`) or `output.<connector>.modeline` (raw timings).
+    ///
+    /// `NITRO_MODE` / `NITRO_MODELINE` still win over it. Absent means the
+    /// connector's preferred mode, which is what nitro always ran before
+    /// this key existed. The two keys share one field because they are two
+    /// spellings of one instruction — "drive this connector at these
+    /// timings" — and a file setting both would otherwise have to be given
+    /// a precedence rule nobody could remember; the **last** one wins,
+    /// like every other key here.
+    pub mode: Option<ModeRequest>,
 }
 
 impl OutputSettings {
     /// Whether this section says anything at all.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.scale.is_none() && self.position.is_none() && !self.primary
+        self.scale.is_none() && self.position.is_none() && !self.primary && self.mode.is_none()
     }
 }
 
@@ -397,7 +410,7 @@ pub fn parse(text: &str) -> Settings {
         if let Some(rest) = key.strip_prefix("output.") {
             let Some((connector, field)) = rest.rsplit_once('.') else {
                 settings.warnings.push(format!(
-                    "line {number}: `{key}` wants `output.<connector>.<scale|position|primary>`"
+                    "line {number}: `{key}` wants `output.<connector>.<scale|position|primary|mode|modeline>`"
                 ));
                 continue;
             };
@@ -429,8 +442,37 @@ pub fn parse(text: &str) -> Settings {
                         .warnings
                         .push(format!("line {number}: primary {value:?} is not a boolean")),
                 },
+                // An empty value is "say nothing about the mode", on the
+                // same terms `remote.listen =` is "no listener": it is how
+                // a settings app or a `sed` turns an override off without
+                // deleting the line, and without it the only way back to
+                // the preferred mode would be to know what it is.
+                "mode" => {
+                    if value.is_empty() {
+                        entry.mode = None;
+                    } else {
+                        match ModeRequest::parse(value) {
+                            Ok(m) => entry.mode = Some(m),
+                            Err(e) => settings
+                                .warnings
+                                .push(format!("line {number}: mode {value:?}: {e}")),
+                        }
+                    }
+                }
+                "modeline" => {
+                    if value.is_empty() {
+                        entry.mode = None;
+                    } else {
+                        match Modeline::parse(value) {
+                            Ok(m) => entry.mode = Some(ModeRequest::Custom(m)),
+                            Err(e) => settings
+                                .warnings
+                                .push(format!("line {number}: modeline {value:?}: {e}")),
+                        }
+                    }
+                }
                 other => settings.warnings.push(format!(
-                    "line {number}: unknown output key `{other}` (want scale, position or primary)"
+                    "line {number}: unknown output key `{other}` (want scale, position, primary, mode or modeline)"
                 )),
             }
             continue;

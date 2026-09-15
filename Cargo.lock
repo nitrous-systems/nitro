@@ -245,6 +245,7 @@ name = "nitro-kms"
 version = "0.0.1"
 dependencies = [
  "drm",
+ "drm-ffi",
  "rustix",
 ]
 

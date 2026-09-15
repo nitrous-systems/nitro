@@ -33,6 +33,7 @@ use ::drm::{ClientCapability, Device as BasicDevice};
 use crate::uevent::UeventSocket;
 use crate::{BYTES_PER_PIXEL, Backend, BufferMut, Error, Event, Image, OutputId, OutputInfo, Rect};
 use select::{Assignment, ConnectorCandidate, ModeCandidate, PlaneCandidate};
+pub use select::{ModeRequest, Modeline};
 
 // ---------------------------------------------------------------------------
 // fd plumbing
@@ -86,16 +87,27 @@ impl BasicDevice for Card<'_> {}
 impl ControlDevice for Card<'_> {}
 
 /// Options for [`DrmBackend::open`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DrmOptions {
     /// Open a kernel uevent socket for hotplug. Failure to open it is not
     /// fatal (see [`DrmBackend::hotplug_error`]).
     pub hotplug: bool,
+    /// What mode each connector should run, by connector name
+    /// (`HDMI-A-1`). A connector not named here, or one whose request
+    /// matches nothing it lists, takes the default rule and warns — a
+    /// configuration typo must cost a log line, not a desktop.
+    pub modes: HashMap<String, ModeRequest>,
 }
 
-impl Default for DrmOptions {
-    fn default() -> Self {
-        Self { hotplug: true }
+impl DrmOptions {
+    /// Hotplug on, no mode overrides: what a caller with nothing to say
+    /// wants, and what `Default` used to mean before `modes` existed.
+    #[must_use]
+    pub fn with_hotplug() -> Self {
+        Self {
+            hotplug: true,
+            modes: HashMap::new(),
+        }
     }
 }
 
@@ -309,6 +321,54 @@ fn connector_name(info: &connector::Info) -> String {
     format!("{}-{}", info.interface().as_str(), info.interface_id())
 }
 
+/// Build a `Mode` from user-supplied timings.
+///
+/// The one place this crate constructs a mode rather than repeating one
+/// the kernel handed it. `drm_mode_modeinfo` is plain data — a struct of
+/// integers plus a 32-byte name — and `drm`'s `Mode` is a
+/// `#[repr(transparent)]` wrapper over it with a `From` impl, so this
+/// needs no `unsafe`: it fills the fields and converts. The kernel is
+/// still the judge of whether the timings are drivable, which is what the
+/// `TEST_ONLY` commit in [`DrmBackend::probe_connectors`] asks it.
+///
+/// `DRM_MODE_TYPE_USERDEF` is set because that is what the flag means, and
+/// it is how `i915_display_info` will show the mode came from us.
+fn mode_from_modeline(ml: &Modeline) -> Mode {
+    let mut raw = drm_ffi::drm_mode_modeinfo {
+        clock: ml.clock_khz,
+        hdisplay: ml.hdisplay as u16,
+        hsync_start: ml.hsync_start as u16,
+        hsync_end: ml.hsync_end as u16,
+        htotal: ml.htotal as u16,
+        hskew: 0,
+        vdisplay: ml.vdisplay as u16,
+        vsync_start: ml.vsync_start as u16,
+        vsync_end: ml.vsync_end as u16,
+        vtotal: ml.vtotal as u16,
+        vscan: 0,
+        vrefresh: ml.refresh_mhz() / 1000,
+        flags: if ml.hsync_positive {
+            ModeFlags::PHSYNC.bits()
+        } else {
+            ModeFlags::NHSYNC.bits()
+        } | if ml.vsync_positive {
+            ModeFlags::PVSYNC.bits()
+        } else {
+            ModeFlags::NVSYNC.bits()
+        },
+        type_: ModeTypeFlags::USERDEF.bits(),
+        name: [0; 32],
+    };
+    // The kernel prints this name; make it say what the mode is rather
+    // than leaving it blank. Truncated to fit, NUL-terminated by the
+    // zero-initialised array above.
+    let text = format!("{}x{}", ml.hdisplay, ml.vdisplay);
+    for (dst, b) in raw.name.iter_mut().zip(text.bytes()).take(31) {
+        *dst = b.cast_signed();
+    }
+    Mode::from(raw)
+}
+
 /// Bitmask of CRTC indices (into `res.crtcs()`) selected by `filter`.
 fn crtc_mask(res: &ResourceHandles, filter: ::drm::control::CrtcListFilter) -> u32 {
     let allowed = res.filter_crtcs(filter);
@@ -324,6 +384,8 @@ struct Probed {
     info: connector::Info,
     name: String,
     mode: Mode,
+    /// The mode is a user-supplied modeline, not one the connector lists.
+    custom: bool,
     candidate: ConnectorCandidate,
 }
 
@@ -347,6 +409,10 @@ pub struct DrmBackend<'fd> {
     uevent: Option<UeventSocket>,
     hotplug_error: Option<io::Error>,
     damage_scratch: Vec<i32>,
+    opts: DrmOptions,
+    /// Non-fatal complaints about the mode configuration, for the caller
+    /// to log. See [`DrmBackend::take_warnings`].
+    warnings: Vec<String>,
 }
 
 impl<'fd> DrmBackend<'fd> {
@@ -398,6 +464,8 @@ impl<'fd> DrmBackend<'fd> {
             uevent,
             hotplug_error,
             damage_scratch: Vec::new(),
+            opts: opts.clone(),
+            warnings: Vec::new(),
         };
         this.rescan()?;
         Ok(this)
@@ -461,9 +529,17 @@ impl<'fd> DrmBackend<'fd> {
     }
 
     /// Every connected connector with a usable mode.
-    fn probe_connectors(&self) -> Result<Vec<Probed>, Error> {
+    ///
+    /// `&mut self` because a rejected modeline is recorded here: this
+    /// crate has no logger of its own (`nitro-kms` is below the server and
+    /// deliberately depends on nothing), so what it has to say about a
+    /// configuration line is collected in [`DrmBackend::take_warnings`]
+    /// and logged by the caller, the way [`DrmBackend::hotplug_error`]
+    /// already reports the one other non-fatal failure.
+    fn probe_connectors(&mut self) -> Result<Vec<Probed>, Error> {
         let mut out = Vec::new();
-        for &handle in self.res.connectors() {
+        let handles: Vec<connector::Handle> = self.res.connectors().to_vec();
+        for handle in handles {
             let info = self
                 .card
                 .get_connector(handle, true)
@@ -471,9 +547,42 @@ impl<'fd> DrmBackend<'fd> {
             if info.state() != connector::State::Connected {
                 continue;
             }
+            let name = connector_name(&info);
             let cands: Vec<ModeCandidate> = info.modes().iter().map(mode_candidate).collect();
-            let Some(mi) = select::select_mode(&cands) else {
-                continue;
+            let wanted = self.opts.modes.get(&name).copied();
+            let mut custom = false;
+            let mut mode = None;
+            if let Some(ModeRequest::Custom(ml)) = wanted {
+                // A modeline bypasses the monitor's advertised list, so
+                // the kernel is the only check there is — and it is asked
+                // *before* anything is committed for real, with
+                // `TEST_ONLY`. A refusal is a warning and the default
+                // mode, never a server that will not start.
+                let candidate = mode_from_modeline(&ml);
+                match self.test_mode(handle, &info, &candidate) {
+                    Ok(()) => {
+                        mode = Some(candidate);
+                        custom = true;
+                    }
+                    Err(e) => self.warnings.push(format!(
+                        "{name}: the kernel refused modeline `{ml}` ({e}); using the default mode"
+                    )),
+                }
+            } else if let Some(req) = wanted.as_ref()
+                && select::request_match(&cands, req).is_none()
+            {
+                self.warnings.push(format!(
+                    "{name}: no mode matches `{req}`; this connector lists {}. Using the default mode.",
+                    select::describe_modes(&cands)
+                ));
+            }
+            let mode = if let Some(m) = mode {
+                m
+            } else {
+                let Some(mi) = select::select_mode(&cands, wanted.as_ref()) else {
+                    continue;
+                };
+                info.modes()[mi]
             };
             let mut mask = 0u32;
             let mut current = None;
@@ -488,8 +597,9 @@ impl<'fd> DrmBackend<'fd> {
                 }
             }
             out.push(Probed {
-                name: connector_name(&info),
-                mode: info.modes()[mi],
+                name,
+                mode,
+                custom,
                 candidate: ConnectorCandidate {
                     crtc_mask: mask,
                     current_crtc: current,
@@ -498,6 +608,55 @@ impl<'fd> DrmBackend<'fd> {
             });
         }
         Ok(out)
+    }
+
+    /// Ask the kernel whether `mode` is drivable on this connector, with
+    /// `DRM_MODE_ATOMIC_TEST_ONLY` — nothing is applied either way.
+    ///
+    /// The test names a CRTC the connector can actually use; without one
+    /// the commit is rejected for the wrong reason and a perfectly good
+    /// modeline would look unsupported.
+    fn test_mode(
+        &self,
+        handle: connector::Handle,
+        info: &connector::Info,
+        mode: &Mode,
+    ) -> Result<(), io::Error> {
+        let crtc = info
+            .encoders()
+            .iter()
+            .filter_map(|&enc| self.card.get_encoder(enc).ok())
+            .find_map(|e| {
+                let allowed = self.res.filter_crtcs(e.possible_crtcs());
+                self.res
+                    .crtcs()
+                    .iter()
+                    .copied()
+                    .find(|c| allowed.contains(c))
+            })
+            .ok_or_else(|| io::Error::other("no CRTC can drive this connector"))?;
+        let blob = match self.card.create_property_blob(mode) {
+            Ok(property::Value::Blob(id)) => id,
+            Ok(_) => unreachable!("create_property_blob returns Blob"),
+            Err(e) => return Err(e),
+        };
+        let mut req = AtomicModeReq::new();
+        req.add_property(
+            handle,
+            self.conn_props[&handle.into()].crtc_id,
+            property::Value::CRTC(Some(crtc)),
+        );
+        let cp = &self.crtc_props[&crtc.into()];
+        req.add_property(crtc, cp.mode_id, property::Value::Blob(blob));
+        req.add_property(crtc, cp.active, property::Value::Boolean(true));
+        let result = self.card.atomic_commit(
+            AtomicCommitFlags::TEST_ONLY | AtomicCommitFlags::ALLOW_MODESET,
+            req,
+        );
+        // The blob was created only to ask the question; the mode that is
+        // actually used gets one of its own in `create_output`.
+        let _ = self.card.destroy_property_blob(blob);
+        result
     }
 
     fn plane_candidates(&self) -> Result<Vec<PlaneCandidate>, Error> {
@@ -552,6 +711,7 @@ impl<'fd> DrmBackend<'fd> {
                 height: h,
                 refresh_mhz: cand.refresh_mhz,
                 phys_mm: probed.info.size().unwrap_or((0, 0)),
+                custom_mode: probed.custom,
             },
             connector: probed.info.handle(),
             crtc,
@@ -886,6 +1046,42 @@ impl Backend for DrmBackend<'_> {
             "resume must leave no output flip-pending"
         );
         r
+    }
+
+    /// Replace the per-connector mode requests and re-probe.
+    ///
+    /// What a configuration reload calls. Returns whether anything
+    /// changed, on the same terms as [`Backend::rescan`]: an output whose
+    /// mode moved is torn down and rebuilt, and one whose mode did not is
+    /// left completely alone — so a reload that changed a colour does not
+    /// blank the screen.
+    ///
+    /// # Errors
+    /// [`Error::Io`] if the re-probe or the modeset fails.
+    fn set_modes(&mut self, modes: &HashMap<String, ModeRequest>) -> Result<bool, Error> {
+        if *modes == self.opts.modes {
+            return Ok(false);
+        }
+        self.opts.modes.clone_from(modes);
+        self.rescan()
+    }
+
+    fn take_warnings(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.warnings)
+    }
+
+    fn available_modes(&self, output: OutputId) -> Vec<ModeCandidate> {
+        let Some(o) = self.output(output) else {
+            return Vec::new();
+        };
+        // Re-read the connector rather than caching the list at probe
+        // time: a monitor that was renegotiated (a KVM, an AVR waking up)
+        // lists different modes, and a stale table would answer "what can
+        // I write in the file" with yesterday's truth.
+        let Ok(info) = self.card.get_connector(o.connector, false) else {
+            return Vec::new();
+        };
+        info.modes().iter().map(mode_candidate).collect()
     }
 
     fn read_front(&mut self, output: OutputId) -> Result<Image, Error> {

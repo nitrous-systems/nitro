@@ -9,6 +9,7 @@
 //! | `shot [output-name]` | `ok <w> <h> <stride>\n` + `stride*h` bytes `XRGB8888`         |
 //! | `shot-front [name]`  | the same, read off the **scanout** buffer; for tests          |
 //! | `outputs`            | `ok\n` + one [`OutputLine`] per output + `\n`                 |
+//! | `modes`              | `ok\n` + `<name> <mode>[ *][ =]\n` lines + `\n`             |
 //! | `stats`              | `ok\n` + `key value\n` lines + `\n`                           |
 //! | `quit`               | `ok\n`, then the server shuts down                           |
 //! | `reload`             | `ok\n`; re-reads `server.conf` and applies it                |
@@ -40,6 +41,18 @@ pub enum Request {
     ShotFront(Option<String>),
     /// List outputs.
     Outputs,
+    /// List every mode each connector offers.
+    ///
+    /// Separate from [`Request::Outputs`] rather than a second line on it,
+    /// because the two answer different questions and one of them is
+    /// unbounded: `outputs` is "what is on screen" and is one line per
+    /// output forever, while `modes` is "what could I write in the file"
+    /// and is a dozen lines per connector on a television. Folding the
+    /// list into `outputs` would make every existing parser of that reply
+    /// — `nitro-shot --outputs`, `nitro-settings`, three test suites —
+    /// deal with a variable number of lines per output for a question
+    /// none of them asked.
+    Modes,
     /// Frame counters.
     Stats,
     /// Orderly shutdown.
@@ -102,14 +115,16 @@ pub fn parse(line: &str) -> Result<Request, String> {
         ("plug", None) => Err("`plug` needs a WxH size".to_owned()),
         ("unplug", None) => Ok(Request::Unplug),
         ("outputs", None) => Ok(Request::Outputs),
+        ("modes", None) => Ok(Request::Modes),
         ("stats", None) => Ok(Request::Stats),
         ("quit", None) => Ok(Request::Quit),
         ("reload", None) => Ok(Request::Reload),
         ("focus", None) => Ok(Request::Focus),
         ("theme", None) => Ok(Request::Theme),
-        ("outputs" | "stats" | "quit" | "reload" | "focus" | "unplug" | "theme", Some(_)) => {
-            Err(format!("`{cmd}` takes no argument"))
-        }
+        (
+            "outputs" | "stats" | "quit" | "reload" | "focus" | "unplug" | "theme" | "modes",
+            Some(_),
+        ) => Err(format!("`{cmd}` takes no argument")),
         _ => Err(format!("unknown request `{cmd}`")),
     }
 }
@@ -171,6 +186,28 @@ pub struct OutputLine {
     /// Whether this is the primary output: where orphaned windows migrate
     /// and what a window with no output of its own is measured against.
     pub primary: bool,
+    /// The mode came from a `modeline`, not from the connector's list.
+    ///
+    /// Printed as a trailing ` (custom)`, appended rather than made a
+    /// `key=value` like the rest, because it is not a setting with a
+    /// value: it is a caveat about the numbers earlier in the same line.
+    /// A reader that splits on whitespace and takes the fields it knows is
+    /// unaffected either way.
+    pub custom_mode: bool,
+}
+
+/// One connector and one of the modes it offers, for `modes`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModeLine {
+    /// Connector name, e.g. `HDMI-A-1`.
+    pub name: String,
+    /// The mode as `output.<c>.mode` spells it: `1920x1080@120`.
+    pub mode: String,
+    /// The connector's `PREFERRED` mode — what it comes up on with no
+    /// `mode` line at all.
+    pub preferred: bool,
+    /// The mode currently being scanned out.
+    pub current: bool,
 }
 
 /// Format a scale the way a person writes one: `2`, not `2.0`; `1.25`
@@ -188,8 +225,9 @@ fn scale_text(scale: f32) -> String {
 
 /// `ok\n`, one line per output, blank line.
 ///
-/// Each line is `name WxH@refresh_mhz scale=<s> pos=<x>,<y> primary=<0|1>`,
-/// where `pos` is the **desktop-space logical** origin: the number a window
+/// Each line is `name WxH@refresh_mhz scale=<s> pos=<x>,<y> primary=<0|1>`
+/// and, for a mode the monitor never advertised, a trailing ` (custom)`.
+/// `pos` is the **desktop-space logical** origin: the number a window
 /// position on that output is relative to, which is what someone debugging
 /// a two-monitor layout is actually asking for. The device-pixel rectangle
 /// is `WxH` at that origin times the scale, so both spaces are recoverable
@@ -200,7 +238,7 @@ pub fn outputs_reply(outputs: &[OutputLine]) -> Vec<u8> {
         // Writing to a String cannot fail.
         let _ = writeln!(
             s,
-            "{} {}x{}@{} scale={} pos={},{} primary={}",
+            "{} {}x{}@{} scale={} pos={},{} primary={}{}",
             o.name,
             o.width,
             o.height,
@@ -209,6 +247,31 @@ pub fn outputs_reply(outputs: &[OutputLine]) -> Vec<u8> {
             o.position.0,
             o.position.1,
             u8::from(o.primary),
+            if o.custom_mode { " (custom)" } else { "" },
+        );
+    }
+    s.push('\n');
+    s.into_bytes()
+}
+
+/// `ok\n`, one `name mode` line per available mode, blank line.
+///
+/// A ` *` marks the connector's preferred mode and a ` =` the one in use;
+/// a mode that is both carries both. Two one-character suffixes rather
+/// than words, because the list is long and the alignment is what makes it
+/// readable — and the mode text itself is exactly what
+/// `output.<connector>.mode` takes, so the answer to "how do I run this
+/// screen at 120" is a line you can copy.
+pub fn modes_reply(modes: &[ModeLine]) -> Vec<u8> {
+    let mut s = String::from("ok\n");
+    for m in modes {
+        let _ = writeln!(
+            s,
+            "{} {}{}{}",
+            m.name,
+            m.mode,
+            if m.preferred { " *" } else { "" },
+            if m.current { " =" } else { "" },
         );
     }
     s.push('\n');
@@ -286,6 +349,11 @@ mod tests {
             Ok(Request::ShotFront(Some("HDMI-A-1".to_owned())))
         );
         assert_eq!(parse("  outputs  "), Ok(Request::Outputs));
+        assert_eq!(parse("modes"), Ok(Request::Modes));
+        assert_eq!(
+            parse("modes HDMI-A-1"),
+            Err("`modes` takes no argument".to_owned())
+        );
         assert_eq!(parse("stats"), Ok(Request::Stats));
         assert_eq!(parse("quit\n"), Ok(Request::Quit));
         assert_eq!(parse("reload"), Ok(Request::Reload));
@@ -368,6 +436,7 @@ mod tests {
             scale: 1.0,
             position: (0, 0),
             primary: true,
+            custom_mode: false,
         }];
         assert_eq!(
             outputs_reply(&outs),
@@ -395,6 +464,7 @@ mod tests {
                 scale: 1.0,
                 position: (0, 0),
                 primary: false,
+                custom_mode: false,
             },
             OutputLine {
                 name: "DP-1".to_owned(),
@@ -404,6 +474,7 @@ mod tests {
                 scale: 2.0,
                 position: (1920, 0),
                 primary: true,
+                custom_mode: false,
             },
         ];
         let text = String::from_utf8(outputs_reply(&outs)).unwrap();
@@ -427,6 +498,60 @@ mod tests {
     }
 
     #[test]
+    fn a_custom_mode_is_marked_on_the_outputs_line() {
+        // The numbers say 1280x720@235260 whether the monitor agreed to
+        // them or not, so the line has to say which — a modeline bypasses
+        // the EDID, and "the panel is dark" is a possible outcome nothing
+        // else in this reply would hint at.
+        let outs = [OutputLine {
+            name: "HDMI-A-1".to_owned(),
+            width: 1280,
+            height: 720,
+            refresh_mhz: 235_260,
+            scale: 1.0,
+            position: (0, 0),
+            primary: true,
+            custom_mode: true,
+        }];
+        assert_eq!(
+            outputs_reply(&outs),
+            b"ok\nHDMI-A-1 1280x720@235260 scale=1 pos=0,0 primary=1 (custom)\n\n"
+        );
+    }
+
+    #[test]
+    fn the_modes_reply_marks_the_preferred_and_the_current_one() {
+        let modes = [
+            ModeLine {
+                name: "HDMI-A-1".to_owned(),
+                mode: "1920x1080@120".to_owned(),
+                preferred: false,
+                current: true,
+            },
+            ModeLine {
+                name: "HDMI-A-1".to_owned(),
+                mode: "1920x1080@60".to_owned(),
+                preferred: true,
+                current: false,
+            },
+            ModeLine {
+                name: "HDMI-A-1".to_owned(),
+                mode: "1920x1080@50".to_owned(),
+                preferred: false,
+                current: false,
+            },
+        ];
+        assert_eq!(
+            String::from_utf8(modes_reply(&modes)).unwrap(),
+            "ok\n\
+             HDMI-A-1 1920x1080@120 =\n\
+             HDMI-A-1 1920x1080@60 *\n\
+             HDMI-A-1 1920x1080@50\n\n"
+        );
+        assert_eq!(modes_reply(&[]), b"ok\n\n");
+    }
+
+    #[test]
     fn a_negative_output_position_survives_the_round_trip() {
         // A screen may be to the *left* of the origin, which is what the
         // configuration file allows and what a signed `pos` is for.
@@ -438,6 +563,7 @@ mod tests {
             scale: 1.0,
             position: (-1024, -100),
             primary: false,
+            custom_mode: false,
         }];
         assert_eq!(
             outputs_reply(&outs),
