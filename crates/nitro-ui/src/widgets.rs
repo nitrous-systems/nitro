@@ -1,4 +1,4 @@
-//! The M2 widget set: [`Flex`], [`Panel`], [`Label`], [`Button`] and
+//! The widget set: [`Flex`], [`Panel`], [`Label`], [`Button`], [`Icon`] and
 //! [`Spacer`].
 //!
 //! Each is a plain struct with a builder function (`column()`, `label()`,
@@ -480,6 +480,16 @@ type ClickFn<S> = Box<dyn Fn(&mut S, &mut Ui<S>)>;
 /// that receives the app state and the whole tree.
 pub struct Button<S> {
     text: String,
+    /// A symbolic icon drawn instead of the label, by name.
+    ///
+    /// A button is either a word or a glyph, never both: a toolbar button
+    /// showing `≡` used to be a *character* in the label, which meant it
+    /// came from whatever font happened to have that codepoint and was
+    /// the wrong weight next to everything else. Naming an icon instead
+    /// makes it the desktop's own artwork, rasterised at the output's
+    /// scale — see `docs/icons.md`. The text is still the accessible
+    /// name, which is why both fields exist.
+    icon: Option<String>,
     enabled: bool,
     pressed: bool,
     style: Option<TextStyle>,
@@ -504,6 +514,12 @@ impl<S> Button<S> {
     #[must_use]
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    /// The icon drawn instead of the label, if any.
+    #[must_use]
+    pub fn icon(&self) -> Option<&str> {
+        self.icon.as_deref()
     }
 
     /// Whether the button reacts to input.
@@ -565,6 +581,13 @@ impl<S: 'static> Widget<S> for Button<S> {
         let theme = cx.theme();
         let (px, py) = theme.button_padding;
         let style = self.resolved_style(theme);
+        // An icon button measures to the icon's square box plus the same
+        // padding a label gets, and costs **no round trip** — which is
+        // the whole reason icons are square by contract.
+        if self.icon.is_some() {
+            let side = style.size_px.max(crate::widgets::ICON_SIZE);
+            return constraints.constrain(Size::new(side + px * 2.0, side + py * 2.0));
+        }
         self.metrics = cx.measure_text(&self.text, &style, 0.0).unwrap_or_default();
         constraints.constrain(Size::new(
             self.metrics.width + px * 2.0,
@@ -594,6 +617,14 @@ impl<S: 'static> Widget<S> for Button<S> {
         let style = self.resolved_style(theme);
         let bounds = cx.bounds;
         cx.rect(0, bounds, Fill::Solid(face), radius, border);
+        if let Some(name) = self.icon.clone() {
+            // The icon is centred in the face by the scene, which centres
+            // an icon in its node's bounds; the node is the whole face,
+            // so the widget does no arithmetic at all.
+            let side = style.size_px.max(crate::widgets::ICON_SIZE);
+            cx.icon(1, bounds, &name, side, nitro_core::Role::ButtonText);
+            return;
+        }
         // The label is centred by the text node's own alignment
         // horizontally, and by its box vertically.
         let h = self.metrics.height.max(1.0);
@@ -810,6 +841,19 @@ impl<S: 'static> ButtonBuilder<S> {
         self
     }
 
+    /// Draw a symbolic icon instead of the label.
+    ///
+    /// The `text` the button was built with stays its **accessible**
+    /// name, so `hey app list` still says what the button does and a
+    /// screen reader still has something to read. That is the whole
+    /// bargain: the glyph is for the eye, the word is for everything
+    /// else.
+    #[must_use]
+    pub fn icon(mut self, name: impl Into<String>) -> Self {
+        self.button.icon = Some(name.into());
+        self
+    }
+
     /// Set the label's font size.
     #[must_use]
     pub fn size(mut self, px: f32) -> Self {
@@ -843,6 +887,7 @@ impl<S: 'static> IntoWidget<S> for ButtonBuilder<S> {
 pub fn button<S: 'static>(text: impl Into<String>) -> ButtonBuilder<S> {
     let button = Button {
         text: text.into(),
+        icon: None,
         enabled: true,
         pressed: false,
         style: None,
@@ -2869,6 +2914,202 @@ pub fn image<S: 'static>(width: u32, height: u32, pixels: Vec<u8>) -> ImageBuild
             pending: ok.then_some(pixels),
             stale: None,
             alpha: true,
+        },
+    }
+}
+
+// ---------------------------------------------------------------------
+// Icon
+// ---------------------------------------------------------------------
+
+/// A symbolic icon, named rather than drawn.
+///
+/// The widget sends a **name** and a palette role; the server owns the
+/// artwork, rasterises it at the output's device scale and tints it from
+/// the current scheme. Nothing about the icon crosses the wire as pixels,
+/// which is what makes it work over a remote link, follow a
+/// `theme.scheme` flip with no repaint from the app, and be crisp on a 2×
+/// output. `docs/icons.md` makes the argument in full.
+///
+/// **Icons are square by contract**, and that is what makes them free:
+/// the widget measures to `size × size` with no round trip at all, unlike
+/// a [`Label`], which cannot know its width until the server has shaped
+/// its string. Every icon in the set is authored on a 16-unit grid, so
+/// `size` is both the width and the height.
+///
+/// Without [`caps::ICONS`](nitro_wire::types::caps::ICONS) the widget
+/// measures exactly the same box and paints nothing: an old or icon-less
+/// server costs a gap in a row, never a broken layout.
+#[derive(Debug)]
+pub struct Icon {
+    name: String,
+    size: f32,
+    color_role: nitro_core::Role,
+}
+
+impl Icon {
+    /// The icon's name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The icon's square side in logical pixels.
+    #[must_use]
+    pub fn size(&self) -> f32 {
+        self.size
+    }
+
+    /// The palette role the server tints it with.
+    #[must_use]
+    pub fn color_role(&self) -> nitro_core::Role {
+        self.color_role
+    }
+}
+
+impl<S: 'static> Widget<S> for Icon {
+    fn measure(&mut self, _cx: &mut MeasureCx<'_, S>, constraints: Constraints) -> Size {
+        // No round trip, and no dependence on the `ICONS` capability
+        // either: the measurement is the contract (square, `size` a
+        // side), not a question about what the server happens to have.
+        // A fontless-server-equivalent icon set therefore lays out
+        // identically and simply draws nothing.
+        constraints.constrain(Size::new(self.size, self.size))
+    }
+
+    fn paint(&mut self, cx: &mut PaintCx<'_, S>) {
+        if !cx.has_icons() || self.name.is_empty() {
+            return;
+        }
+        let bounds = cx.bounds;
+        let (name, size, role) = (self.name.clone(), self.size, self.color_role);
+        cx.icon(0, bounds, &name, size, role);
+    }
+
+    fn role(&self) -> Role {
+        Role::Icon
+    }
+
+    fn accessible(&self) -> Access {
+        // The *name* is both the accessible name and the value: it is
+        // the only meaningful thing about an icon, and it is what makes
+        // `hey app get path name` answer `gear` rather than `16x16`.
+        Access {
+            name: Some(self.name.clone()),
+            value: Some(self.name.clone()),
+            actions: Vec::new(),
+        }
+    }
+
+    fn action(&mut self, cx: &mut EventCx<'_, S>, action: &str, arg: Option<&str>) -> Handled {
+        match action {
+            "set_icon" | "set_value" => {
+                arg.unwrap_or_default().clone_into(&mut self.name);
+                cx.request_paint();
+                Handled::Yes
+            }
+            _ => Handled::No,
+        }
+    }
+}
+
+/// Setters for a live [`Icon`].
+impl<S: 'static> WidgetMut<'_, Icon, S> {
+    /// Show a different icon. Paint only: every icon is the same square.
+    pub fn set_icon(&mut self, name: impl Into<String>) {
+        let name = name.into();
+        if self.name == name {
+            return;
+        }
+        self.name = name;
+        self.request_paint();
+    }
+
+    /// Resize the icon. Layout, because the box changes.
+    pub fn set_size(&mut self, px: f32) {
+        if self.size.to_bits() == px.to_bits() {
+            return;
+        }
+        self.size = px;
+        self.request_layout();
+    }
+
+    /// Take the tint from another palette role.
+    pub fn set_color_role(&mut self, role: nitro_core::Role) {
+        self.color_role = role;
+        self.request_paint();
+    }
+}
+
+/// Builder for an [`Icon`].
+pub struct IconBuilder<S> {
+    built: Built<S>,
+    icon: Icon,
+}
+
+impl<S: 'static> IconBuilder<S> {
+    /// Set the icon's square side in logical pixels (default 16).
+    ///
+    /// 16, 24, 32 and 48 are the recommended sizes: the artwork is drawn
+    /// on a 16-unit grid, so an integer multiple keeps its strokes on
+    /// pixel boundaries. Anything else still works and is still
+    /// anti-aliased; it is simply slightly softer.
+    #[must_use]
+    pub fn size(mut self, px: f32) -> Self {
+        self.icon.size = px;
+        self
+    }
+
+    /// Take the tint from a palette role (default
+    /// [`ColorRole::Text`](nitro_core::Role::Text)).
+    ///
+    /// There is deliberately **no** `.color(Color)`: an icon takes a role
+    /// and nothing else, so a scheme flip can never leave one behind.
+    /// `deploy/lint-colors.sh` enforces the same rule from the outside.
+    #[must_use]
+    pub fn color_role(mut self, role: nitro_core::Role) -> Self {
+        self.icon.color_role = role;
+        self
+    }
+}
+
+impl<S: 'static> StyleBuilder<S> for IconBuilder<S> {
+    fn built_mut(&mut self) -> &mut Built<S> {
+        &mut self.built
+    }
+}
+
+impl<S: 'static> IntoWidget<S> for IconBuilder<S> {
+    fn into_widget(mut self) -> Built<S> {
+        self.built.replace_widget(self.icon);
+        self.built
+    }
+}
+
+/// The default side of an [`Icon`], in logical pixels.
+pub const ICON_SIZE: f32 = 16.0;
+
+/// A symbolic icon called `name`, 16 px square, tinted
+/// [`ColorRole::Text`](nitro_core::Role::Text).
+///
+/// ```no_run
+/// # use nitro_ui::{ColorRole, widgets::icon};
+/// # fn f<S: 'static>() {
+/// let gear = icon::<S>("gear").size(24.0).color_role(ColorRole::TextDim);
+/// # }
+/// ```
+///
+/// An unknown name draws nothing and leaves the connection alone — the
+/// server answers `Error { BadIcon }` and keeps going, because a missing
+/// icon must never be able to close an application.
+#[must_use]
+pub fn icon<S: 'static>(name: impl Into<String>) -> IconBuilder<S> {
+    IconBuilder {
+        built: Built::new(Flex),
+        icon: Icon {
+            name: name.into(),
+            size: ICON_SIZE,
+            color_role: nitro_core::Role::Text,
         },
     }
 }

@@ -24,6 +24,9 @@ pub enum NodeKind {
     Image,
     /// A shaped text run, held outside the scene and named by a [`TextRef`].
     Text,
+    /// A symbolic icon, named by an [`IconRef`] and rasterised by whoever
+    /// owns the icon set.
+    Icon,
     /// Reserved: an externally-provided surface (dma-buf).
     Surface,
 }
@@ -145,6 +148,60 @@ impl TextRef {
     }
 }
 
+/// What a [`NodeKind::Icon`] node draws: which icon, how big, and which
+/// palette role tints it.
+///
+/// The same division of labour as [`TextRef`]: the scene holds an opaque
+/// handle and the geometry, and knows nothing about paths, rasterisers or
+/// coverage masks. `icon` is an index into whatever icon set the painter
+/// owns — the scene only ever compares it for equality — and `role` is a
+/// palette role index resolved **at paint time**, which is what makes a
+/// scheme flip recolour every icon in the same frame as the text, with no
+/// client message at all.
+///
+/// `size` is the icon's square box in local units. It is not taken from
+/// the node's bounds because a client may lay a 16 px icon out inside a
+/// taller row; the icon is centred in the bounds, like a text block is
+/// aligned in them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct IconRef {
+    /// Handle into the painter's icon set.
+    pub icon: u32,
+    /// Palette role index, or [`IconRef::AS_COLOURED`].
+    pub role: u8,
+    /// Box size in local units; icons are square.
+    pub size_bits: u32,
+}
+
+impl IconRef {
+    /// `role` value meaning "the icon's own colours", reserved for the
+    /// full-colour application icons that are not implemented yet.
+    pub const AS_COLOURED: u8 = 0xff;
+
+    /// An icon reference.
+    #[must_use]
+    pub fn new(icon: u32, size: f32, role: u8) -> Self {
+        Self {
+            icon,
+            role,
+            size_bits: size.to_bits(),
+        }
+    }
+
+    /// The box size in local units.
+    #[must_use]
+    pub fn size(self) -> f32 {
+        f32::from_bits(self.size_bits)
+    }
+
+    /// Whether this icon can put any pixel on screen.
+    #[must_use]
+    pub fn is_visible(self) -> bool {
+        let s = self.size();
+        s.is_finite() && s > 0.0
+    }
+}
+
 /// Paint properties of a [`NodeKind::Rect`].
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct RectData {
@@ -165,6 +222,7 @@ pub(crate) enum NodeData {
     Rect(RectData),
     Image(Option<ImageRef>),
     Text(Option<TextRef>),
+    Icon(Option<IconRef>),
     Surface,
 }
 
@@ -175,6 +233,7 @@ impl NodeData {
             Self::Rect(_) => NodeKind::Rect,
             Self::Image(_) => NodeKind::Image,
             Self::Text(_) => NodeKind::Text,
+            Self::Icon(_) => NodeKind::Icon,
             Self::Surface => NodeKind::Surface,
         }
     }
@@ -185,6 +244,7 @@ impl NodeData {
             NodeKind::Rect => Self::Rect(RectData::default()),
             NodeKind::Image => Self::Image(None),
             NodeKind::Text => Self::Text(None),
+            NodeKind::Icon => Self::Icon(None),
             NodeKind::Surface => Self::Surface,
         }
     }
@@ -462,6 +522,7 @@ impl Node {
             NodeData::Rect(r) => r.fill.is_visible() || r.border.is_some_and(Border::is_visible),
             NodeData::Image(i) => i.is_some(),
             NodeData::Text(t) => t.is_some_and(TextRef::is_visible),
+            NodeData::Icon(i) => i.is_some_and(IconRef::is_visible),
             // The reserved kind stores nothing, so it paints nothing.
             NodeData::Group | NodeData::Surface => false,
         }

@@ -5,8 +5,9 @@ use std::collections::HashMap;
 use nitro_core::{IRect, Point, Rect, Size, Transform};
 
 use crate::{
-    Border, Buffer, BufferDesc, BufferKey, ClientId, Configure, Error, Fill, ImageRef, Insets,
-    Layer, Node, NodeKey, NodeKind, OutputId, TextRef, Window, WindowFlags, WindowKey, WindowState,
+    Border, Buffer, BufferDesc, BufferKey, ClientId, Configure, Error, Fill, IconRef, ImageRef,
+    Insets, Layer, Node, NodeKey, NodeKind, OutputId, TextRef, Window, WindowFlags, WindowKey,
+    WindowState,
     key::Arena,
     node::{ALL_DIRTY, Dirty, NodeData},
     window::Output,
@@ -1068,6 +1069,36 @@ impl Scene {
             return Ok(());
         }
         *slot = text;
+        self.mark(key, Dirty::PAINT);
+        Ok(())
+    }
+
+    /// Point an icon node at an icon, or clear it with `None`.
+    ///
+    /// The scene does not rasterise anything: `icon.icon` is an opaque handle
+    /// into the painter's icon set, exactly as `TextRef::key` is one into its
+    /// text store. The *role* is stored rather than a colour, which is the
+    /// whole point — the painter resolves it against the current palette on
+    /// every frame, so a scheme switch recolours every icon on screen without
+    /// a single client message or a single scene mutation.
+    ///
+    /// # Errors
+    /// [`Error::StaleKey`], [`Error::NotOwner`], [`Error::WrongKind`] on
+    /// anything but an icon node.
+    pub fn set_icon(
+        &mut self,
+        client: ClientId,
+        key: NodeKey,
+        icon: Option<IconRef>,
+    ) -> Result<(), Error> {
+        let node = self.check_mut(client, key)?;
+        let NodeData::Icon(slot) = &mut node.data else {
+            return Err(Error::WrongKind);
+        };
+        if *slot == icon {
+            return Ok(());
+        }
+        *slot = icon;
         self.mark(key, Dirty::PAINT);
         Ok(())
     }

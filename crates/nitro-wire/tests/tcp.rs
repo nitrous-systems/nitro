@@ -11,7 +11,7 @@ use nitro_core::{Rect, Size};
 use nitro_wire::client::Connection;
 use nitro_wire::codec::Writer;
 use nitro_wire::io::Socket;
-use nitro_wire::msg::{ClientMsg, Commit, CreateBuffer, SetBounds};
+use nitro_wire::msg::{ClientMsg, Commit, CreateBuffer, SetBounds, SetIcon};
 use nitro_wire::server::{ClientStream, TcpListener};
 use nitro_wire::types::{BufferId, Layer, NodeId, caps, format};
 use nitro_wire::{Endpoint, Error, header};
@@ -305,4 +305,58 @@ fn a_window_over_tcp_looks_exactly_like_one_over_a_unix_socket() {
     let mut w2 = Writer::new();
     ClientMsg::from(cw).encode(&mut w2).expect("re-encode");
     assert_eq!(w2.bytes(), over_unix.as_slice());
+}
+
+#[test]
+fn a_set_icon_crosses_tcp_unchanged() {
+    // The point of naming icons rather than sending them: a `SetIcon` is
+    // a string and nine bytes, so unlike `SetImage` it needs no
+    // descriptor and works over a remote link with no special case at
+    // all. This is that claim, over a real loopback socket rather than
+    // through the codec.
+    let listener = TcpListener::bind("127.0.0.1:0".parse().expect("literal")).expect("bind");
+    let addr = listener.addr();
+
+    let server = thread::spawn(move || {
+        let mut client = accept_blocking(&listener);
+        let hello = next_blocking(&mut client);
+        assert!(matches!(hello, ClientMsg::Hello(_)), "{hello:?}");
+        assert!(client.is_remote());
+        client
+            .welcome("nitro-test", caps::WM | caps::ICONS | caps::REMOTE)
+            .expect("welcome");
+        assert!(client.flush().expect("flush"));
+        let mut msgs = Vec::new();
+        loop {
+            match next_blocking(&mut client) {
+                ClientMsg::Commit(_) => break,
+                other => msgs.push(other),
+            }
+        }
+        msgs
+    });
+
+    let endpoint = Endpoint::parse(&format!("tcp://{addr}")).expect("parse");
+    let mut conn = Connection::connect_endpoint(&endpoint, "tcp-client").expect("connect");
+    // The server said it has icons; a remote client may use them, which
+    // is exactly what it may *not* do with buffers.
+    assert!(conn.has_caps(caps::ICONS));
+    assert!(conn.has_caps(caps::REMOTE));
+
+    let sent = SetIcon {
+        node: NodeId(7),
+        size: 24.0,
+        role: 4,
+        name: "volume-mute".to_owned(),
+    };
+    conn.send(&ClientMsg::SetIcon(sent.clone())).expect("queue");
+    conn.send(&ClientMsg::Commit(Commit { serial: 1 }))
+        .expect("queue");
+    while !conn.flush().expect("flush") {
+        wait_writable(conn.as_fd());
+    }
+
+    let msgs = server.join().expect("server thread");
+    assert_eq!(msgs.len(), 1, "{msgs:#?}");
+    assert_eq!(msgs[0], ClientMsg::SetIcon(sent));
 }

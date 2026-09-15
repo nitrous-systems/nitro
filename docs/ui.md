@@ -292,6 +292,7 @@ and the content hangs underneath it.
 | `List` | `list` | the **visible** rows, one per line | `activate`, `select`, `scroll_to`, `scroll_by`, `focus` | virtualised: `visible + 2` rows materialised, whatever the model holds |
 | `Separator` | `separator` | — | — | spans its container on the other axis |
 | `Image` | `image` | `WxH` | — | an `ARGB` buffer, uploaded once in a memfd |
+| `Icon` | `icon` | the icon **name** | `set_icon`, `set_value` | named, never drawn: the server owns the artwork (`docs/icons.md`) |
 | `Spacer` | `spacer` | — | — | `.grow(1.0)` and nothing else |
 
 `Role::Terminal` exists too, and has no widget in this crate: it is what
@@ -301,10 +302,33 @@ reader has to know that this widget's text is a *screen* — rewritten in
 place, addressed by row and column — rather than a document that grows,
 which is why AT-SPI has had the role since the beginning.
 
-Three of them are worth a paragraph, because each makes a claim about
-cost that the rest of the design has to hold up — and a fourth, `List`,
+Four of them are worth a paragraph, because each makes a claim about
+cost that the rest of the design has to hold up — and a fifth, `List`,
 wants a section of its own, because its claim is the one this document
 spent two milestones deferring.
+
+**`Icon` measures without a round trip, because icons are square by
+contract.** `icon("gear").size(16.0)` measures to exactly 16 × 16 and
+asks the server nothing. A `Label` cannot do that — it has no fonts, so
+it has to ask how wide its string is — but every icon in the set is drawn
+on a 16-unit grid, so one number is both dimensions and the layout is
+arithmetic rather than a question.
+
+What crosses the wire is a **name and a palette role**, never pixels, and
+that is the whole design: `docs/icons.md` makes the argument in full, but
+the three-line version is that it is the only form that survives a remote
+link (a buffer is a file descriptor and cannot cross TCP), a scheme flip
+(the server resolves the role at paint time, so a `theme.scheme = dark`
+recolours every icon with no client message at all) and a scale change
+(the server re-rasterises at the output's device size, so a 2× screen
+gets a real 2× icon rather than a doubled 16 px tile).
+
+There is deliberately **no** `.color(Color)` on an `IconBuilder`, only
+`.color_role(Role)`: a literal is a colour the user's switch could never
+reach, and `deploy/lint-colors.sh` enforces the same rule from outside.
+Without `caps::ICONS` the widget measures the identical box and paints
+nothing, so an icon-less server costs a gap in a row and never a broken
+layout — the same bargain `Label` makes with `caps::TEXT`.
 
 **`TextField` does not re-measure the tree on a keystroke.** Its
 `measure` is a function of the *font* and its width style, never of its

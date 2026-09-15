@@ -67,7 +67,7 @@ mod window;
 pub use buffer::{Buffer, BufferDesc, BufferKey};
 pub use error::Error;
 pub use node::{
-    Border, Dirty, Fill, ImageRef, Node, NodeKey, NodeKind, RectData, TextAlign, TextRef,
+    Border, Dirty, Fill, IconRef, ImageRef, Node, NodeKey, NodeKind, RectData, TextAlign, TextRef,
 };
 pub use paint::{Hit, PaintItem, PaintKind};
 pub use scene::{MAX_DEPTH, Scene, UpdateStats};

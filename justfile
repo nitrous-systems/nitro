@@ -37,6 +37,16 @@ fake-shot out="tmp/fake-shot.png":
     mkdir -p tmp && cargo run -q -p nitro-shot -- -o {{out}} && echo "wrote {{out}}"
 
 # ---------------------------------------------------------------------------
+# Icons (see docs/icons.md)
+# ---------------------------------------------------------------------------
+
+# Regenerate crates/nitro-icons/src/set.rs from the pinned upstream commit.
+# `just icons-import gear house` also adds those two names to icons.txt.
+# Idempotent: a run with no arguments must leave set.rs byte-identical.
+icons-import *names:
+    bash deploy/icons-import.sh {{names}}
+
+# ---------------------------------------------------------------------------
 # Budget (see docs/budget.md)
 # ---------------------------------------------------------------------------
 

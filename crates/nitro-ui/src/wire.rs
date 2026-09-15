@@ -20,7 +20,7 @@ use nitro_core::{Color, Rect, Size, Transform};
 use nitro_wire::client::Connection;
 use nitro_wire::msg::{
     self, ClientMsg, CreateNode, DestroyNode, Fill, Reparent, ServerMsg, SetBorder, SetBounds,
-    SetClip, SetCorners, SetFill, SetImage, SetText, SetTransform,
+    SetClip, SetCorners, SetFill, SetIcon, SetImage, SetText, SetTransform,
 };
 use nitro_wire::types::{BufferId, Edge, Layer, NodeId, NodeKind, caps};
 
@@ -121,6 +121,7 @@ pub(crate) struct PaintSlot {
     radius: f32,
     border: (f32, Color),
     text: Option<SetText>,
+    icon: Option<SetIcon>,
     image: Option<(BufferId, nitro_core::IRect)>,
     /// Group slots only: the transform applied to the slot's children,
     /// and whether they are clipped to its bounds.
@@ -141,6 +142,7 @@ impl PaintSlot {
             radius: 0.0,
             border: (0.0, Color::TRANSPARENT),
             text: None,
+            icon: None,
             image: None,
             transform: Transform::IDENTITY,
             clip: false,
@@ -526,6 +528,11 @@ impl Wire {
         self.conn.has_caps(caps::TEXT)
     }
 
+    /// Whether the server has the symbolic icon set.
+    pub(crate) fn has_icons(&self) -> bool {
+        self.conn.has_caps(caps::ICONS)
+    }
+
     /// Whether the link to the server is remote: no buffers, no images.
     pub(crate) fn is_remote(&self) -> bool {
         self.conn.has_caps(caps::REMOTE)
@@ -755,6 +762,49 @@ impl Wire {
         }
         if changed_text {
             self.send(&ClientMsg::SetText(want), node)?;
+        }
+        Ok(())
+    }
+
+    /// Emit an icon slot, sending only what changed.
+    ///
+    /// One `SetIcon` on the first paint and nothing afterwards: an icon
+    /// is static, and the two things that would change it — the desktop's
+    /// scheme and the output's scale — are the *server's* to act on, not
+    /// the client's. That is the whole reason a role and a name go over
+    /// the wire instead of pixels, and the bar's "120 s of sensor ticks
+    /// emit no second `SetIcon`" test is the assertion of it.
+    pub(crate) fn paint_icon(
+        &mut self,
+        slots: &mut Vec<PaintSlot>,
+        at: SlotAt,
+        rect: Rect,
+        name: &str,
+        size: f32,
+        role: u8,
+    ) -> Result<(), Error> {
+        let index = at.index;
+        let fresh = self.ensure_slot(slots, at, NodeKind::Icon)?;
+        let slot = &mut slots[index];
+        slot.used = true;
+        let node = slot.node;
+        let want = SetIcon {
+            node,
+            size,
+            role,
+            name: name.to_owned(),
+        };
+        let changed_bounds = fresh || slot.bounds != rect;
+        let changed_icon = fresh || slot.icon.as_ref() != Some(&want);
+        slot.bounds = rect;
+        if changed_icon {
+            slot.icon = Some(want.clone());
+        }
+        if changed_bounds {
+            self.set_bounds(node, rect)?;
+        }
+        if changed_icon {
+            self.send(&ClientMsg::SetIcon(want), node)?;
         }
         Ok(())
     }

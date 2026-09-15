@@ -1045,7 +1045,7 @@ fn no_widget_is_laid_out_smaller_than_it_measures() {
                 || p == "window/keyboard/container[1]"
                 || p == "window/audio"
                 || p == "window/appearance"
-                || p == "window/container[4]"
+                || p == "window/buttons"
         })
         .collect();
     assert_eq!(rows.len(), 6, "found every control row: {rows:?}");
@@ -1072,7 +1072,12 @@ fn no_widget_is_laid_out_smaller_than_it_measures() {
         let (path, b) = all
             .iter()
             .find(|(p, _)| {
-                p.starts_with("window/label[")
+                // The headings live inside their heading rows now (an
+                // icon and a label), so the path is
+                // `window/container[N]/label[0]` rather than
+                // `window/label[N]`. Matched on the *text* rather than
+                // the shape for exactly that reason.
+                p.ends_with("/label[0]")
                     && nitro_ui::introspect::resolve(h.ui(), p).is_some_and(|id| {
                         h.ui()
                             .widget::<Label>(id)
@@ -1193,7 +1198,7 @@ fn nothing_in_the_tree_overhangs_the_window() {
     // bottom edge is the failure this catches.
     let (_, buttons) = tree(&mut h)
         .into_iter()
-        .find(|(p, _)| p == "window/container[4]")
+        .find(|(p, _)| p == "window/buttons")
         .expect("the buttons row");
     assert!(
         buttons.y + buttons.h <= size.h - nitro_settings::PAD + 0.01,
@@ -1293,7 +1298,7 @@ fn two_outputs_fit_the_window_and_a_third_clips_rather_than_overlaps() {
     // rather than in prose.
     let (_, buttons) = tree(&mut h)
         .into_iter()
-        .find(|(p, _)| p == "window/container[4]")
+        .find(|(p, _)| p == "window/buttons")
         .expect("the buttons row");
     assert!(
         buttons.y + buttons.h <= size.h - nitro_settings::PAD + 0.01,
@@ -1432,6 +1437,118 @@ fn the_window_declares_its_tree_as_its_minimum_size() {
         "the window opens at exactly the size it declares as its minimum"
     );
 
+    h.quit();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_window_holds_its_tree_with_the_heading_icons() {
+    // `WINDOW_SIZE` is *measured*, so anything added to the tree has to
+    // re-measure it. The heading icons deliberately do not grow it: a
+    // heading row is as tall as its tallest child, and the 16 px icon is
+    // only 0.5 px taller than the 15 px heading label's 17.5 px line box
+    // — i.e. not taller at all. Making the heading a `control_row` would
+    // have added 8.5 px per section (34 px over four), which is what
+    // this test exists to stop somebody doing by reflex.
+    //
+    // Reported rather than asserted against a frozen constant: the
+    // number is printed so a reader of the test output can see what the
+    // tree costs today, and the assertion is the invariant (it fits).
+    let dir = scratch("layout-heading-icons");
+    let mut h = layout_harness(&dir);
+    let size = h.ui().window_size();
+
+    let all = tree(&mut h);
+    let find = |needle: &str| -> nitro_ui::Rect {
+        all.iter()
+            .find(|(p, _)| p == needle)
+            .unwrap_or_else(|| panic!("no {needle} in {all:?}"))
+            .1
+    };
+    let buttons = find("window/buttons");
+    let used = buttons.y + buttons.h + nitro_settings::PAD;
+    println!("the tree occupies {used} px of a {}-px window", size.h);
+    assert!(
+        used <= size.h + 0.01,
+        "the tree needs {used} px and WINDOW_SIZE.h is {}",
+        size.h,
+    );
+
+    // Each heading row is exactly as tall as its label, so the icons
+    // cost nothing vertically — the claim the paragraph above makes.
+    let theme = nitro_ui::Theme::default();
+    let mut head =
+        nitro_ui::TextStyle::new(theme.font_family.clone(), nitro_settings::HEADING_SIZE);
+    head.weight = 600;
+    let label_h = h
+        .ui()
+        .measure_text("Displays", &head, 0.0)
+        .expect("measure the heading")
+        .height;
+    for name in [
+        nitro_settings::names::DISPLAYS_ICON,
+        nitro_settings::names::KEYBOARD_ICON,
+        nitro_settings::names::AUDIO_ICON,
+        nitro_settings::names::APPEARANCE_ICON,
+    ] {
+        let id = named(&mut h, name);
+        let b = h.ui().window_bounds(id);
+        // The icon keeps its full square: nothing shrinks it, which is
+        // what a clipped icon would look like.
+        assert!(
+            (b.w - nitro_settings::ICON_PX).abs() < 0.01
+                && (b.h - nitro_settings::ICON_PX).abs() < 0.01,
+            "{name} is {}x{}, not a {}-px square",
+            b.w,
+            b.h,
+            nitro_settings::ICON_PX,
+        );
+        let parent = h.ui().parent(id).expect("the heading row");
+        let row = h.ui().window_bounds(parent);
+        assert!(
+            row.h <= label_h.max(nitro_settings::ICON_PX) + 0.01,
+            "the heading row is {} tall; its label measures {label_h} and \
+             its icon is {}: an icon must not make a heading taller",
+            row.h,
+            nitro_settings::ICON_PX,
+        );
+    }
+
+    h.quit();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn every_heading_carries_its_icon_by_name() {
+    // The consumer half: each section's icon is the one `docs/icons.md`
+    // says it is, addressable for `hey`, and taking its colour from a
+    // *role* so a scheme switch moves it with the heading beside it.
+    let dir = scratch("heading-icons");
+    let mut h = layout_harness(&dir);
+    for (name, icon) in [
+        (
+            nitro_settings::names::DISPLAYS_ICON,
+            nitro_settings::icons::DISPLAYS,
+        ),
+        (
+            nitro_settings::names::KEYBOARD_ICON,
+            nitro_settings::icons::KEYBOARD,
+        ),
+        (
+            nitro_settings::names::AUDIO_ICON,
+            nitro_settings::icons::AUDIO,
+        ),
+        (
+            nitro_settings::names::APPEARANCE_ICON,
+            nitro_settings::icons::APPEARANCE,
+        ),
+    ] {
+        let id = named(&mut h, name);
+        let w = h.widget::<nitro_ui::widgets::Icon>(id);
+        assert_eq!(w.name(), icon);
+        assert!((w.size() - nitro_settings::ICON_PX).abs() < 0.01);
+        assert_eq!(w.color_role(), nitro_ui::ColorRole::Text);
+    }
     h.quit();
     let _ = std::fs::remove_dir_all(&dir);
 }

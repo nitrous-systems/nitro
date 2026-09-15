@@ -1,0 +1,69 @@
+# Curated icon set for nitro-icons.
+#
+# One Bootstrap Icons name per line; `#` starts a comment, blank lines are
+# ignored. `deploy/icons-import.sh` reads this file, fetches each name from the
+# pinned upstream commit and regenerates `src/set.rs`.
+#
+# The list is kept **sorted** (byte order, matching Rust's `str` ordering)
+# because the importer rewrites it sorted whenever it is invoked as
+# `icons-import.sh NAME...` to add icons. Keeping the committed form sorted too
+# means such a run shows a one-line diff instead of reshuffling the whole file.
+#
+# Every name here must exist upstream at the pinned sha, must be drawn on the
+# `0 0 16 16` viewBox, must consist only of elements the importer understands,
+# and must not mix `fill-rule`s between its paths -- see the importer for why
+# each of those is a hard error rather than a warning.
+#
+# Substitution on file: Bootstrap's `arrow-clockwise` mixes `fill-rule` between
+# its two paths (the ring is `evenodd`, the arrowhead is `nonzero`), which this
+# importer refuses to flatten into one path. `recycle` carries the same
+# "refresh / go round again" meaning in a single nonzero path, so it is used
+# instead.
+
+arrow-left
+arrow-up
+arrows-angle-expand
+battery
+battery-charging
+battery-full
+battery-half
+calculator
+check
+circle-fill
+cpu
+dash
+display
+exclamation-triangle
+file-earmark
+file-earmark-code
+file-earmark-font
+file-earmark-image
+file-earmark-music
+file-earmark-play
+file-earmark-text
+file-earmark-zip
+folder-fill
+folder2-open
+gear
+hdd
+house
+info-circle
+keyboard
+list
+memory
+moon
+palette
+recycle
+search
+sliders
+speaker
+square
+sun
+terminal
+volume-down
+volume-mute
+volume-up
+wifi
+wifi-off
+window
+x

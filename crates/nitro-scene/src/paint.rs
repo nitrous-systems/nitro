@@ -8,7 +8,7 @@ use nitro_core::{Color, IRect, Point, Rect, Transform};
 
 use crate::{
     BufferKey, Fill, NodeKey, OutputId, Scene, WindowKey,
-    node::{Border, NodeData, TextAlign, TextRef},
+    node::{Border, IconRef, NodeData, TextAlign, TextRef},
     update::device_rect,
 };
 
@@ -58,6 +58,27 @@ pub enum PaintKind {
         origin: Point,
         /// Tint of every glyph.
         color: Color,
+    },
+    /// A symbolic icon, drawn from the caller's icon set.
+    ///
+    /// `origin` is the icon box's top-left corner in the node's local
+    /// space (the box is centred in the node's bounds, so a 16 px icon in
+    /// a 26 px row lands where a reader expects it). `size` is the box's
+    /// side in local units — icons are square by contract.
+    ///
+    /// The **role**, not a colour: the painter resolves it against the
+    /// palette it is holding at paint time, which is what makes a scheme
+    /// switch recolour icons in the same frame as text. `role` equal to
+    /// [`IconRef::AS_COLOURED`] means "do not tint".
+    Icon {
+        /// Handle into the painter's icon set.
+        icon: u32,
+        /// Top-left corner of the square icon box in local units.
+        origin: Point,
+        /// Box side in local units.
+        size: f32,
+        /// Palette role index to tint with.
+        role: u8,
     },
 }
 
@@ -151,6 +172,23 @@ fn text_origin(text: TextRef, width: f32) -> Point {
     Point::new(x, 0.0)
 }
 
+/// Where an icon's square box sits inside bounds `width` × `height`.
+///
+/// Centred on both axes, unlike a text block, and the asymmetry is not an
+/// oversight: a text node's box *is* its line box, so its vertical
+/// placement is the client's to decide, whereas an icon is a square glyph
+/// a client puts in whatever row it has. Centring is what makes
+/// `row(icon("gear"), label("Display"))` line up without the app doing
+/// arithmetic. Rounded to whole local units so a 16 px icon in a 26 px
+/// row does not land on a half-pixel and blur.
+fn icon_origin(icon: IconRef, width: f32, height: f32) -> Point {
+    let size = icon.size();
+    Point::new(
+        ((width - size) / 2.0).max(0.0).round(),
+        ((height - size) / 2.0).max(0.0).round(),
+    )
+}
+
 impl Scene {
     /// Append the items needed to redraw `clip` on `output`, in painter's
     /// order: layers back to front, windows back to front within a layer,
@@ -211,6 +249,12 @@ impl Scene {
                         key: text.key,
                         origin: text_origin(text, node.bounds.w),
                         color: text.color,
+                    }),
+                    NodeData::Icon(Some(icon)) => Some(PaintKind::Icon {
+                        icon: icon.icon,
+                        origin: icon_origin(icon, node.bounds.w, node.bounds.h),
+                        size: icon.size(),
+                        role: icon.role,
                     }),
                     _ => None,
                 };

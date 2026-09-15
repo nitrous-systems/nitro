@@ -567,6 +567,79 @@ impl Body for MeasureText {
     }
 }
 
+/// Put a named symbolic icon on an `Icon` node (needs
+/// [`caps::ICONS`](crate::types::caps::ICONS)).
+///
+/// The client sends a **name**, never pixels — the same bargain
+/// [`SetText`] makes, for the same three reasons: it costs the same over
+/// a remote link as over a local one, the server can recolour it when
+/// the scheme flips, and it can rasterise it again at whatever the
+/// output's scale is. `docs/icons.md` has the argument.
+///
+/// `size` is the icon's box in **logical** pixels. Icons are square by
+/// contract, so one number is both width and height and the toolkit can
+/// measure one without a round trip.
+///
+/// `role` is a [`Role`] index into the desktop's palette, resolved at
+/// *paint* time so a `theme.scheme` switch recolours icons in the same
+/// frame as text. [`SetIcon::AS_COLOURED`] (0xff) means "draw the icon's
+/// own colours", which no symbolic icon has yet — it is the door left
+/// open for the full-colour application icons of icons-B.
+///
+/// An empty `name` **clears** the node. An unknown name earns an
+/// [`ErrorCode::BadIcon`] and the node draws nothing; the connection
+/// survives, which is the one thing that must be true of a missing icon.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetIcon {
+    /// The `Icon` node.
+    pub node: NodeId,
+    /// Box size in logical pixels; the icon is square.
+    pub size: f32,
+    /// Palette [`Role`] index, or [`SetIcon::AS_COLOURED`].
+    pub role: u8,
+    /// Icon name (`"gear"`); empty clears the node.
+    pub name: String,
+}
+
+impl SetIcon {
+    /// `role` value meaning "paint the icon's own colours, do not tint".
+    ///
+    /// Reserved rather than used: every icon in the symbolic set is a
+    /// single-colour glyph and takes a role. It exists so the wire does
+    /// not have to change when full-colour application icons arrive.
+    pub const AS_COLOURED: u8 = 0xff;
+}
+
+/// The fixed part of [`SetIcon`] — everything but the name.
+#[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct SetIconFixed {
+    node: <NodeId as Plain>::Wire,
+    size: <f32 as Plain>::Wire,
+    role: <u8 as Plain>::Wire,
+}
+
+impl Body for SetIcon {
+    fn encode_body(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.put_struct(&SetIconFixed {
+            node: Plain::to_wire(self.node),
+            size: Plain::to_wire(self.size),
+            role: Plain::to_wire(self.role),
+        });
+        w.put_str(&self.name);
+        Ok(())
+    }
+    fn decode_body(r: &mut Reader<'_>, _fds: &mut FdQueue) -> Result<Self, DecodeError> {
+        let f = r.get_struct::<SetIconFixed>()?;
+        Ok(Self {
+            node: Plain::from_wire(f.node)?,
+            size: Plain::from_wire(f.size)?,
+            role: Plain::from_wire(f.role)?,
+            name: r.get_str()?,
+        })
+    }
+}
+
 /// Register a shared-memory buffer, passing its descriptor with this
 /// frame.
 ///
@@ -1295,6 +1368,9 @@ msg_enum! {
         SetText = 0x0206,
         /// Measure a string; answered at once with `TextMeasured`.
         MeasureText = 0x0207,
+        /// Put a named symbolic icon on an `Icon` node (needs
+        /// `caps::ICONS`).
+        SetIcon = 0x0208,
         /// Register a buffer (carries one fd).
         CreateBuffer = 0x0301,
         /// Release a buffer.

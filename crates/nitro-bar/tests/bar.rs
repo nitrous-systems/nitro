@@ -536,7 +536,9 @@ fn every_section_is_addressable_for_hey() {
         names::CLOCK,
         names::BATTERY,
         names::LOAD,
+        names::LOAD_ICON,
         names::MEM,
+        names::MEM_ICON,
     ] {
         assert!(named(&mut h, name).is_some(), "no widget named {name}");
     }
@@ -656,5 +658,75 @@ fn a_poll_that_finds_the_same_readings_does_not_touch_the_tree() {
         "an unchanged poll produced no mutation at all: {:?}",
         h.mutations()
     );
+    h.quit();
+}
+
+#[test]
+fn the_icons_are_painted_once_and_never_again() {
+    // The icon half of the idle contract, and the reason icons are sent
+    // **by name**: an icon is static, so the two things that could
+    // change it — the desktop's scheme and the output's scale — are the
+    // *server's* to act on. The bar therefore sends one `SetIcon` per
+    // icon on the first paint and none afterwards, however many sensor
+    // polls go past.
+    //
+    // 120 s of ticks at the real 30 s interval is four polls; the poll
+    // interval is compressed to 20 ms here for the same reason
+    // `a_settled_bar_sends_nothing_while_its_sensors_tick` compresses
+    // it, and the readings are fixed so what is being measured is
+    // "nothing changed" rather than "this machine held still".
+    let readings = nitro_bar::Readings {
+        battery: Some("87%".to_owned()),
+        load: Some("0.4".to_owned()),
+        mem: Some("1.2/3.3G".to_owned()),
+    };
+    let mut h = bar(Bar::new()
+        .with_fake_time_ms((9 * 3600 + 41 * 60 + 5) * 1000)
+        .with_poll_ms(20)
+        .with_sensors(move || readings.clone()));
+    h.settle();
+
+    // The icons really are in the tree, so what follows is "no second
+    // SetIcon" rather than "no SetIcon at all".
+    for name in [names::LOAD_ICON, names::MEM_ICON] {
+        let id = named(&mut h, name).unwrap_or_else(|| panic!("no widget named {name}"));
+        assert!((h.widget::<nitro_ui::widgets::Icon>(id).size() - 16.0).abs() < 0.01);
+    }
+
+    h.tap();
+    // Four polls' worth of 30 s ticks, compressed.
+    for _ in 0..4 {
+        h.advance_timers(31);
+        h.run_timers();
+        h.settle();
+    }
+    let icons = h.mutations().iter().filter(|m| m.op == "SetIcon").count();
+    assert_eq!(
+        icons,
+        0,
+        "120 s of sensor ticks emitted {icons} SetIcon(s): {:?}",
+        h.mutations()
+    );
+
+    h.quit();
+}
+
+#[test]
+fn the_launcher_button_draws_an_icon_and_keeps_its_accessible_name() {
+    // The bargain the `≡` character was traded for: the glyph is the
+    // desktop's own artwork (so it is the right weight, at the output's
+    // scale, in the palette's colour), and the *word* is still what a
+    // script and a screen reader see. A button that lost its name would
+    // still look right and would be unaddressable.
+    let mut h = harness();
+    h.settle();
+    let id = named(&mut h, names::LAUNCHER).expect("the launcher button");
+    let button = h.widget::<nitro_ui::widgets::Button<Bar>>(id);
+    assert_eq!(button.icon(), Some(nitro_bar::icons::LAUNCHER));
+    assert_eq!(button.text(), "Menu");
+    // And it still fires the same callback a real click runs.
+    h.click(id);
+    h.settle();
+    assert_eq!(h.state().launcher_presses(), 1);
     h.quit();
 }

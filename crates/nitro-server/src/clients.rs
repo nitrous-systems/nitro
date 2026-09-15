@@ -33,9 +33,9 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
 use nitro_core::{IRect, Rect, Size};
 use nitro_scene::{
-    Border, BufferDesc, BufferKey, ClientId, Error as SceneError, Fill as SceneFill, ImageRef,
-    NodeKey, NodeKind as SceneNodeKind, Scene, TextAlign, TextRef, WindowFlags, WindowKey,
-    WindowState,
+    Border, BufferDesc, BufferKey, ClientId, Error as SceneError, Fill as SceneFill, IconRef,
+    ImageRef, NodeKey, NodeKind as SceneNodeKind, Scene, TextAlign, TextRef, WindowFlags,
+    WindowKey, WindowState,
 };
 use nitro_text::TextKey;
 use nitro_wire::error::Error as WireError;
@@ -46,6 +46,7 @@ use nitro_wire::types::{
     format, window_flags,
 };
 
+use crate::icons::IconEngine;
 use crate::shell;
 use crate::text::{StyleRequest, TextEngine};
 use crate::{debug, warn};
@@ -248,6 +249,14 @@ pub struct ApplyOutcome {
     /// the measured size back at the commit, which is how a toolkit lays a
     /// label out without a separate `MeasureText` round trip.
     pub text_metrics: Vec<(NodeId, msg::TextMetrics)>,
+    /// Icon names this transaction asked for and the set does not have.
+    ///
+    /// Collected rather than returned as an error, because
+    /// [`ErrorCode::BadIcon`] is **not fatal**: the node was cleared, the
+    /// rest of the batch applies, and the client is told. A desktop must
+    /// not lose an application because one of its widgets named an icon a
+    /// newer set has — see `docs/icons.md`.
+    pub bad_icons: Vec<(NodeId, String)>,
     /// Windows whose client asked for a state change, in arrival order. The
     /// scene does not act on these: which rectangle `Maximized` means is
     /// the window manager's business, and it is the one thing in a
@@ -289,6 +298,7 @@ pub fn apply(
     client: &mut WireClient,
     scene: &mut Scene,
     text: &mut TextEngine,
+    icons: &IconEngine,
     serial: u32,
 ) -> Result<ApplyOutcome, ApplyError> {
     let mut outcome = ApplyOutcome::default();
@@ -312,7 +322,7 @@ pub fn apply(
                     .map_err(|e| scene_err("CreateBuffer", e))?;
                 client.buffers.insert(id, key);
             }
-            Pending::Msg(msg) => apply_msg(client, scene, text, *msg, &mut outcome)?,
+            Pending::Msg(msg) => apply_msg(client, scene, text, icons, *msg, &mut outcome)?,
         }
     }
     Ok(outcome)
@@ -350,6 +360,7 @@ fn apply_msg(
     client: &mut WireClient,
     scene: &mut Scene,
     text: &mut TextEngine,
+    icons: &IconEngine,
     msg: ClientMsg,
     outcome: &mut ApplyOutcome,
 ) -> Result<(), ApplyError> {
@@ -573,6 +584,28 @@ fn apply_msg(
             // has to commit for is a measurement it cannot lay out with.
             Ok(())
         }
+        ClientMsg::SetIcon(m) => {
+            let key = node_key(client, m.node)?;
+            // An empty name clears the node, and clearing is never an
+            // error: it is how a widget that stopped showing an icon says
+            // so without destroying and recreating a node.
+            let reference = if m.name.is_empty() {
+                None
+            } else if let Some(index) = icons.lookup(&m.name) {
+                Some(IconRef::new(index, sane_icon_size(m.size), m.role))
+            } else {
+                // Unknown name: the node is cleared, the client is told,
+                // and the connection lives. Recorded here and reported
+                // after the batch, so the client sees the whole
+                // transaction applied before the complaint about one
+                // node of it.
+                outcome.bad_icons.push((m.node, m.name));
+                None
+            };
+            scene
+                .set_icon(client.id, key, reference)
+                .map_err(|e| scene_err("SetIcon", e))
+        }
         ClientMsg::CreateBuffer(_) => {
             // Turned into `Pending::Buffer` when it arrived; the fd cannot
             // wait for the commit.
@@ -712,6 +745,23 @@ fn sane_rect(rect: Rect) -> Result<Rect, ApplyError> {
     Ok(rect)
 }
 
+/// An icon's requested box size, clamped rather than refused.
+///
+/// Unlike a rect's geometry this is not a protocol error: a size is a
+/// *hint* about how big to rasterise, the server clamps it to what it will
+/// actually draw ([`crate::icons::MIN_PX`]–[`crate::icons::MAX_PX`] at
+/// scale 1), and a client that asked for a NaN gets the default rather
+/// than a dead connection — an icon must never be able to kill a client.
+fn sane_icon_size(size: f32) -> f32 {
+    if !size.is_finite() || size <= 0.0 {
+        return DEFAULT_ICON_PX;
+    }
+    size.clamp(crate::icons::MIN_PX as f32, crate::icons::MAX_PX as f32)
+}
+
+/// The box an icon gets when the client asked for a nonsense size.
+const DEFAULT_ICON_PX: f32 = 16.0;
+
 /// The scene's node kind for a wire kind. `Surface` is reserved: the server
 /// advertises no `DMABUF` capability, so a client asking for one is using a
 /// feature it was told does not exist. `Text` is live from M2 and is **always
@@ -725,6 +775,7 @@ fn scene_kind(kind: NodeKind) -> Result<SceneNodeKind, ApplyError> {
         NodeKind::Rect => Ok(SceneNodeKind::Rect),
         NodeKind::Image => Ok(SceneNodeKind::Image),
         NodeKind::Text => Ok(SceneNodeKind::Text),
+        NodeKind::Icon => Ok(SceneNodeKind::Icon),
         NodeKind::Surface => Err(ApplyError::new(
             ErrorCode::WrongKind,
             "Surface nodes are M5; the server does not advertise the DMABUF capability",

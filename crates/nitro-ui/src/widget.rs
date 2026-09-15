@@ -64,6 +64,14 @@ pub enum Role {
     Separator,
     /// A picture.
     Image,
+    /// A symbolic icon, named rather than drawn.
+    ///
+    /// Its own role rather than `Image`, because the two are different
+    /// things to a script and to a screen reader: an image's value is
+    /// "how many pixels", an icon's is *the name of the icon*, which is
+    /// the only meaningful thing about it. `hey app get path name` on an
+    /// icon answers `gear`.
+    Icon,
     /// Empty space.
     Spacer,
     /// Anything else.
@@ -86,6 +94,7 @@ impl Role {
             Role::Terminal => "terminal",
             Role::Separator => "separator",
             Role::Image => "image",
+            Role::Icon => "icon",
             Role::Spacer => "spacer",
             Role::Other => "other",
         }
@@ -106,6 +115,7 @@ impl Role {
             Role::Terminal,
             Role::Separator,
             Role::Image,
+            Role::Icon,
             Role::Spacer,
             Role::Other,
         ]
@@ -455,6 +465,13 @@ impl<S: 'static> PaintCx<'_, S> {
         self.ui.has_text()
     }
 
+    /// Whether the server has the symbolic icon set (the `ICONS`
+    /// capability).
+    #[must_use]
+    pub fn has_icons(&self) -> bool {
+        self.ui.has_icons()
+    }
+
     /// Keep slot `slot` exactly as it was last painted.
     ///
     /// A slot the paint does not emit has its node destroyed — which is
@@ -504,6 +521,26 @@ impl<S: 'static> PaintCx<'_, S> {
             .ui
             .wire_mut()
             .paint_text(&mut self.slots, at, rect, text, run);
+        self.note(r);
+    }
+
+    /// Draw a symbolic icon in `slot`, by **name**.
+    ///
+    /// `rect` is the box the icon is centred in; `size` is the icon's own
+    /// square side in logical pixels and `role` the palette role the
+    /// server tints it with. No pixels cross the wire, which is what
+    /// makes it work identically on a remote link and recolour itself
+    /// when the scheme flips — see `docs/icons.md`.
+    pub fn icon(&mut self, slot: Slot, rect: Rect, name: &str, size: f32, role: nitro_core::Role) {
+        let at = self.slot_at(slot);
+        let r = self.ui.wire_mut().paint_icon(
+            &mut self.slots,
+            at,
+            rect,
+            name,
+            size,
+            role.index() as u8,
+        );
         self.note(r);
     }
 
@@ -782,6 +819,7 @@ mod tests {
             Role::Slider,
             Role::Separator,
             Role::Image,
+            Role::Icon,
             Role::Spacer,
             Role::Other,
         ] {

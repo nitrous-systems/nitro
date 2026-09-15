@@ -628,6 +628,18 @@ impl<S: 'static> Ui<S> {
         self.wire.has_text()
     }
 
+    /// Whether the server has the symbolic icon set (the `ICONS`
+    /// capability).
+    ///
+    /// The same shape as [`Ui::has_text`]: without it an
+    /// [`icon`](crate::widgets::icon) widget still *measures* its square
+    /// box, so the layout is identical, and paints nothing. A gap, never
+    /// a broken tree.
+    #[must_use]
+    pub fn has_icons(&self) -> bool {
+        self.wire.has_icons()
+    }
+
     /// Whether this app is talking to the server over a **remote** link
     /// (the `REMOTE` capability).
     ///

@@ -11,8 +11,9 @@ document describes them.
 not change: additions go in as new op codes guarded by a capability bit,
 and only an incompatible change bumps `VERSION`. The last in-place change
 was `WindowInfo.layer` (task #3697), in the `SHELL` block; before that,
-`Configure.position` (task #3683). The last *addition* was `Theme`
-(0x8004) behind the `THEME` bit (task #3706, M4).
+`Configure.position` (task #3683). The last *addition* is `SetIcon`
+(0x0208) behind the new `ICONS` bit (task #3712, M4-G); before that,
+`Theme` (0x8004) behind the `THEME` bit (task #3706, M4).
 
 ## Transport
 
@@ -195,6 +196,7 @@ containing the transaction reached the screen.
 | 4 | `WM` | the server manages windows: decorations, states, limits, app ids (M3) |
 | 5 | `SHELL` | the connection arrived on the **shell socket** and may send the shell ops (M3) |
 | 6 | `THEME` | the server owns the colour palette and pushes it (M4); see [`Theme`](#theme--0x8004) |
+| 7 | `ICONS` | the server has the symbolic icon set, so `Icon` nodes will actually draw (M4-G); see [`SetIcon`](#seticon--0x0208) |
 
 `SHELL` is bit 5, not bit 3: bit 3 is `REMOTE` and was taken in M1. It is
 *reported*, never negotiated — a client cannot ask for it. See
@@ -207,6 +209,14 @@ to *wait* for colours or fall back to its built-in ones — and because a
 future non-desktop server (a remote view, a test fixture) may honestly
 not have a palette to push.
 
+`ICONS` has the shape of `TEXT` rather than of `THEME`: it says the
+server has artwork to draw with, the way `TEXT` says it found a font. The
+current server compiles the set in, so it always sets the bit — but it is
+asked rather than asserted, because a stripped or fixture server honestly
+may not have one, and because a client that checks the bit lays out
+identically either way (an `Icon` node measures a square box whatever the
+answer, and simply paints nothing without it). See `docs/icons.md`.
+
 `REMOTE` is **granted since M4-E1**, for and only for a connection
 accepted on the TCP listener (`remote.listen` in `server.conf`). It is
 reported on the same terms: the fact is which socket the client reached,
@@ -218,10 +228,18 @@ cannot prove what a `0700` path proves.
 
 ## Errors
 
-**Every error is fatal.** The server sends `Error { serial, code, msg }`
-and closes the connection; there is no per-request error and no recovery.
-`serial` is the transaction being applied, or 0 outside one. `msg` is for
-logs and is never parsed.
+**Every error is fatal, with two named exceptions.** The server sends
+`Error { serial, code, msg }` and closes the connection; there is no
+per-request error and no recovery. `serial` is the transaction being
+applied, or 0 outside one. `msg` is for logs and is never parsed.
+
+The exceptions are `BadBuffer` for a **remote** client's buffer op (see
+[Descriptors on a remote link](#descriptors-on-a-remote-link)) and
+`BadIcon` for an unknown icon name. Both share a shape: the thing the
+client asked for is permanently unavailable *to it*, the frame was
+consumed whole so the stream is still in step, and killing the connection
+would cost an application rather than a feature. A desktop must not lose
+an app because one of its widgets named an icon a newer set has.
 
 | code | value | when |
 |---|---|---|
@@ -232,13 +250,14 @@ logs and is never parsed.
 | `BadBuffer` | 5 | unknown buffer, or fd/size/stride inconsistent with the declared geometry |
 | `Limit` | 6 | a protocol limit was exceeded |
 | `Version` | 7 | the client asked for a version the server does not speak |
+| `BadIcon` | 8 | `SetIcon` named an icon the server does not have — **not fatal** |
 
 ## Enumerations
 
 | type | values |
 |---|---|
 | `Layer` | `Background` 0, `Normal` 1, `Top` 2, `Overlay` 3 |
-| `NodeKind` | `Group` 1, `Rect` 2, `Image` 3, `Text` 4, `Surface` 5 *(reserved)* |
+| `NodeKind` | `Group` 1, `Rect` 2, `Image` 3, `Text` 4, `Surface` 5 *(reserved)*, `Icon` 6 |
 | `ButtonState` | `Released` 0, `Pressed` 1 |
 | `AxisSource` | `Wheel` 0, `Finger` 1, `Continuous` 2, `WheelTilt` 3 |
 | `TouchPhase` | `Down` 0, `Move` 1, `Up` 2, `Cancel` 3 |
@@ -312,6 +331,7 @@ Assigned in blocks of 0x100 so a block can grow without renumbering.
 | `0x0205` | `SetBorder` | style |
 | `0x0206` | `SetText` | style (see `TEXT`) |
 | `0x0207` | `MeasureText` | style (see `TEXT`) |
+| `0x0208` | `SetIcon` | style (see `ICONS`) |
 | `0x0301` | `CreateBuffer` | buffers |
 | `0x0302` | `DestroyBuffer` | buffers |
 | `0x0303` | `BufferDamage` | buffers |
@@ -611,6 +631,47 @@ before it can lay itself out, so making it wait for a commit would
 deadlock the layout it is part of. It creates no node and mutates
 nothing. Answered whether or not the `TEXT` bit is set; without fonts the
 answer is an empty measurement rather than an error.
+
+### `SetIcon` — 0x0208
+
+| field | type | meaning |
+|---|---|---|
+| `node` | `NodeId` | the `Icon` node |
+| `size` | `f32` | the icon's square side in **logical** pixels |
+| `role` | `u8` | palette `Role` index, or `0xff` = "as coloured" |
+| `name` | `str` | icon name (`"gear"`); **empty clears the node** |
+
+Fixed head 9 bytes (`4+4+1`), then the name — the same shape as
+`SetWindowTitle`. Requires the `ICONS` capability; applies at the next
+`Commit`, like every other mutation. On a node that is not an `Icon` node
+it is a `WrongKind` error.
+
+The client sends a **name**, never pixels. `docs/icons.md` makes the case
+in full; the three-line version is that it is the only form that survives
+a remote link (a buffer is a descriptor and cannot cross TCP), a scheme
+flip (the server resolves the role at paint time, so `theme.scheme`
+recolours every icon with no client message) and a scale change (the
+server rasterises at `round(size × output scale)`, so a 2× screen gets a
+real 2× icon rather than a doubled tile).
+
+**`size` is one number because icons are square by contract.** Every icon
+in the set is drawn on a 16-unit grid, which is what lets a toolkit
+measure one without a round trip. 16, 24, 32 and 48 are the recommended
+sizes; the server clamps into `4..=512` device pixels and substitutes 16
+for a non-finite or non-positive one rather than erroring, because an
+icon must never be able to kill a client.
+
+`role` is a palette index (`docs/theme.md`), resolved by the server at
+*paint* time. `0xff` (`AS_COLOURED`) means "draw the icon's own colours,
+do not tint"; it is accepted and draws nothing today, and exists so the
+wire does not have to change when the full-colour application icons of
+icons-B arrive. An index past the last role this server knows falls back
+to `Text` rather than vanishing — a client one release ahead gets a
+visible icon in the wrong colour, not a silent gap.
+
+An **unknown name** earns `Error { BadIcon }` and the node draws nothing;
+the connection survives. See [Errors](#errors) for why this and the
+remote buffer op are the only two non-fatal errors in the protocol.
 
 ### `CreateBuffer` — 0x0301 — **carries 1 fd**
 
@@ -1408,6 +1469,25 @@ to.
   The same reasoning does **not** extend to the `0x_0xx..0x_3xx` blocks:
   a field added in place to any message an ordinary client can receive
   is a `VERSION` bump.
+* The M4-G icon op — `SetIcon` 0x0208 — is the sanctioned path again:
+  **one new op code** in the gap after the text ops, guarded by a **new
+  `ICONS` capability bit** (bit 7), plus one new value in each of two
+  enumerations (`NodeKind::Icon` = 6 and `ErrorCode::BadIcon` = 8). No
+  field of any pre-existing message changed and no byte moved, so
+  `VERSION` stays **1**.
+
+  The two enum values need their own note, because appending to an
+  enumeration is not automatically free: a value outside the list is a
+  *decode error* in this protocol, not a silently-ignored unknown. So an
+  old client that somehow received `NodeKind::Icon` or
+  `ErrorCode::BadIcon` would disconnect rather than misread. It cannot:
+  `NodeKind` only ever travels **client → server** (in `CreateNode`), and
+  a client that does not know the kind cannot send it; and `BadIcon` is
+  only ever sent in answer to a `SetIcon`, which a client without the
+  `ICONS` bit must not send. Both are reachable only by a peer that
+  already knows about them, which is the property that makes appending
+  to a strict enumeration compatible here and would not make it so for,
+  say, a new `Fill` tag the server could push unprompted.
 * `VERSION` is bumped only for a change that is not expressible that way —
   a different framing, a changed field, a removed op. A version mismatch is
   fatal at handshake: there is no negotiation and no compatibility shim.

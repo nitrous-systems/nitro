@@ -90,6 +90,7 @@ use nitro_scene::{Fill as SceneFill, OutputId, PaintItem, PaintKind, Scene};
 use nitro_wire::types::format;
 
 use crate::cursor::Cursor;
+use crate::icons::IconEngine;
 use crate::render::paint_background;
 use crate::text::TextEngine;
 
@@ -575,6 +576,7 @@ pub fn paint_region(
     canvas: &mut Canvas<'_>,
     scene: &Scene,
     text: &mut TextEngine,
+    icons: &mut IconEngine,
     output: OutputId,
     region: &[IRect],
     cursor: (&Cursor, CursorState),
@@ -606,7 +608,7 @@ pub fn paint_region(
             paint_background(canvas, &clip, width, height, palette);
         }
         for item in &items[first..] {
-            paint_item(canvas, &clip, item, scene, text);
+            paint_item(canvas, &clip, item, scene, text, icons, palette);
         }
         if cursor_state.visible {
             cursor_image.paint(canvas, &clip, cursor_state.x, cursor_state.y);
@@ -650,6 +652,8 @@ fn paint_item(
     item: &PaintItem,
     scene: &Scene,
     text: &mut TextEngine,
+    icons: &mut IconEngine,
+    palette: &Palette,
 ) {
     let clip = clip.intersect(&item.clip);
     if clip.is_empty() {
@@ -729,6 +733,36 @@ fn paint_item(
                 key,
                 origin,
                 color,
+                item.opacity,
+            );
+        }
+        PaintKind::Icon {
+            icon,
+            origin,
+            size,
+            role,
+        } => {
+            // Narrowed to the node's box for the same reason text is: an
+            // icon's mask is a square rasterised from a 16-unit grid, and
+            // a rounding that put its last row one pixel past the bounds
+            // would put a pixel outside what the scene damaged for it —
+            // which nothing would ever repaint.
+            let clip = clip.intersect(&item.bounds);
+            if clip.is_empty() {
+                return;
+            }
+            // The palette is resolved *here*, per frame, which is why a
+            // `theme.scheme` flip recolours icons with no client message
+            // and no re-raster: the cache holds coverage, not pixels.
+            icons.paint(
+                canvas,
+                &clip,
+                &item.transform,
+                icon,
+                origin,
+                size,
+                role,
+                palette,
                 item.opacity,
             );
         }
@@ -1244,7 +1278,15 @@ mod tests {
             // be touched.
             bounds,
         };
-        paint_item(&mut canvas, &surface, &item, &Scene::new(), &mut engine);
+        paint_item(
+            &mut canvas,
+            &surface,
+            &item,
+            &Scene::new(),
+            &mut engine,
+            &mut IconEngine::new(),
+            &Palette::light(),
+        );
 
         let mut inside = 0u32;
         for y in 0..h {

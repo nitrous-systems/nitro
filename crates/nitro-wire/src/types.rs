@@ -148,6 +148,15 @@ tag_enum! {
         Text = 4,
         /// External surface (dma-buf, Wayland adapter). Reserved for M5.
         Surface = 5,
+        /// A symbolic icon, named by the client and drawn by the server
+        /// with [`SetIcon`](crate::msg::SetIcon).
+        ///
+        /// Its own kind rather than an `Image`, because an `Image` *is* a
+        /// region of a client buffer — a file descriptor the server maps,
+        /// which a remote client cannot have at all. An icon carries no
+        /// buffer, works unchanged over TCP, and is recoloured by the
+        /// server when the scheme flips. See `docs/icons.md`.
+        Icon = 6,
     }
 }
 
@@ -280,6 +289,14 @@ tag_enum! {
         /// The client asked for a protocol version the server does not
         /// speak.
         Version = 7,
+        /// [`SetIcon`](crate::msg::SetIcon) named an icon the server does
+        /// not have.
+        ///
+        /// **The one other non-fatal error**, beside a remote client's
+        /// buffer op: the node draws nothing and the connection stays up.
+        /// A desktop must not die because one app asked for an icon a
+        /// newer icon set has — see `docs/icons.md`.
+        BadIcon = 8,
     }
 }
 
@@ -325,6 +342,14 @@ pub mod caps {
     /// client that does not understand the bit keeps its built-in
     /// defaults, which is why the message is behind a bit at all.
     pub const THEME: u32 = 1 << 6;
+    /// The server has the symbolic icon set, so `Icon` nodes and
+    /// [`SetIcon`](crate::msg::SetIcon) will actually draw (M4-G).
+    ///
+    /// The same shape as [`TEXT`]: a client names an icon, the server
+    /// owns the artwork and rasterises it at the output's scale. Without
+    /// the bit a client lays out the same square box and paints nothing,
+    /// so an old or icon-less server costs a gap, not a dead connection.
+    pub const ICONS: u32 = 1 << 7;
 }
 
 /// Modifier mask for [`BindKey`](crate::msg::BindKey), by *name*.
@@ -404,7 +429,10 @@ mod tests {
         );
         assert_eq!(Layer::from_raw(3), Ok(Layer::Overlay));
         assert_eq!(NodeKind::from_raw(0), Err(DecodeError::BadValue));
-        assert_eq!(NodeKind::from_raw(6), Err(DecodeError::BadValue));
+        assert_eq!(NodeKind::from_raw(6), Ok(NodeKind::Icon));
+        assert_eq!(NodeKind::from_raw(7), Err(DecodeError::BadValue));
+        assert_eq!(ErrorCode::from_raw(8), Ok(ErrorCode::BadIcon));
+        assert_eq!(ErrorCode::from_raw(9), Err(DecodeError::BadValue));
         assert_eq!(TouchPhase::from_raw(3), Ok(TouchPhase::Cancel));
         assert_eq!(ErrorCode::from_raw(7), Ok(ErrorCode::Version));
         assert_eq!(ErrorCode::from_raw(0), Err(DecodeError::BadValue));
@@ -434,6 +462,7 @@ mod tests {
         assert_eq!(caps::WM, 0x10);
         assert_eq!(caps::SHELL, 0x20);
         assert_eq!(caps::THEME, 0x40);
+        assert_eq!(caps::ICONS, 0x80);
         // A new bit, not a reuse of any taken one.
         assert_eq!(
             caps::THEME
@@ -443,6 +472,17 @@ mod tests {
                     | caps::REMOTE
                     | caps::WM
                     | caps::SHELL),
+            0
+        );
+        assert_eq!(
+            caps::ICONS
+                & (caps::DIRECT_SCANOUT
+                    | caps::TEXT
+                    | caps::DMABUF
+                    | caps::REMOTE
+                    | caps::WM
+                    | caps::SHELL
+                    | caps::THEME),
             0
         );
         // The shell bit is a *new* bit, not a reuse of `REMOTE`.

@@ -1,0 +1,13 @@
+[package]
+name = "nitro-icons"
+description = "Symbolic icons: a curated Bootstrap Icons subset baked in as SVG paths on a 16-unit grid, with an index-based handle and an A8 coverage rasteriser. zeno only, no scene or wire dependency."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+zeno = { workspace = true }
+
+[lints]
+workspace = true

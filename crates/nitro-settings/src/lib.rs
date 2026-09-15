@@ -141,7 +141,7 @@ use nitro_ui::build::{ContainerBuilder as _, StyleBuilder as _};
 use nitro_ui::shell::{Layer, OutputInfo, ShellEvent, Surface};
 use nitro_ui::widgets::{
     Checkbox, FlexBuilder, Label, LabelBuilder, Slider, TextField, TextFieldBuilder, button,
-    checkbox, column, label, row, separator, slider, spacer, text_field,
+    checkbox, column, icon, label, row, separator, slider, spacer, text_field,
 };
 use nitro_ui::{App, ColorRole, CrossAlign, Error, Scheme, Size, Ui, WidgetId};
 
@@ -272,6 +272,14 @@ pub const PAD: f32 = 10.0;
 pub const ROW_HEIGHT: f32 = 26.0;
 /// Width of a position field: five digits and a minus sign.
 pub const POS_WIDTH: f32 = 54.0;
+/// The side of a section heading's icon, in logical pixels.
+///
+/// 16, not `HEADING_SIZE`: the artwork is drawn on a 16-unit grid, so a
+/// 16 px box puts every stroke on a whole pixel at scale 1 and on a whole
+/// pair at scale 2. It is also slightly taller than the 15 px heading,
+/// which is what makes the pair read as an icon with a label rather than
+/// as two words.
+pub const ICON_PX: f32 = 16.0;
 
 /// What the displays note says when the shell socket gave us the list.
 const NOTE_LIVE: &str = "Positions are typed, in desktop pixels — drag-arrange is not in M4.";
@@ -361,6 +369,38 @@ pub mod names {
     pub const REVERT: &str = "revert";
     /// The line that says what Apply did.
     pub const STATUS: &str = "status";
+    /// The row holding Apply, Revert and the status line.
+    ///
+    /// Named rather than left as `window/container[N]`, and the reason is
+    /// worth recording: it *was* an index, and adding the four heading
+    /// rows renumbered it. A path built out of a sibling count is a path
+    /// that changes whenever the tree above it does, which makes every
+    /// script and every test that used it quietly wrong rather than
+    /// loudly broken.
+    pub const BUTTONS: &str = "buttons";
+
+    /// The icon beside the Displays heading.
+    pub const DISPLAYS_ICON: &str = "displays_icon";
+    /// The icon beside the Keyboard heading.
+    pub const KEYBOARD_ICON: &str = "keyboard_icon";
+    /// The icon beside the Audio heading.
+    pub const AUDIO_ICON: &str = "audio_icon";
+    /// The icon beside the Appearance heading.
+    pub const APPEARANCE_ICON: &str = "appearance_icon";
+}
+
+/// The icons each section heading carries, named in one place so a
+/// rename is one edit and the tests assert on the same constants the
+/// tree is built from.
+pub mod icons {
+    /// Beside "Displays".
+    pub const DISPLAYS: &str = "display";
+    /// Beside "Keyboard".
+    pub const KEYBOARD: &str = "keyboard";
+    /// Beside "Audio".
+    pub const AUDIO: &str = "speaker";
+    /// Beside "Appearance".
+    pub const APPEARANCE: &str = "palette";
 }
 
 /// One display row: the connector it is for, and the widgets in it.
@@ -746,17 +786,17 @@ pub fn build(ui: &mut Ui<Settings>) -> WidgetId {
             .on_click(move |s: &mut Settings, ui: &mut Ui<Settings>| revert(s, ui, ids)),
     );
     let gap = ui.build(spacer().grow(1.0));
-    let buttons = ui.build(control_row());
+    let buttons = ui.build(control_row().name(names::BUTTONS));
     for child in [apply_button, revert_button, gap, status] {
         ui.attach(buttons, child).unwrap();
     }
 
     // -- the window ----------------------------------------------------
     let root = ui.build(column().gap(GAP).padding(PAD).width_percent(1.0));
-    let h_displays = ui.build(heading("Displays"));
-    let h_keyboard = ui.build(heading("Keyboard"));
-    let h_audio = ui.build(heading("Audio"));
-    let h_appearance = ui.build(heading("Appearance"));
+    let h_displays = heading_row(ui, names::DISPLAYS_ICON, icons::DISPLAYS, "Displays");
+    let h_keyboard = heading_row(ui, names::KEYBOARD_ICON, icons::KEYBOARD, "Keyboard");
+    let h_audio = heading_row(ui, names::AUDIO_ICON, icons::AUDIO, "Audio");
+    let h_appearance = heading_row(ui, names::APPEARANCE_ICON, icons::APPEARANCE, "Appearance");
     let appearance = ui.build(control_row().name(names::APPEARANCE));
     let scheme_caption = ui.build(caption("Colour scheme"));
     for child in [scheme_caption, dark] {
@@ -814,7 +854,7 @@ fn control_row() -> FlexBuilder<Settings> {
         .cross_align(CrossAlign::Center)
 }
 
-/// A section heading.
+/// A section heading's **label**.
 ///
 /// A heading is one line of text at a fixed size, so there is no smaller
 /// honest version of it — and since #561 that is the toolkit's default
@@ -827,6 +867,38 @@ fn heading(text: &str) -> LabelBuilder<Settings> {
         .size(HEADING_SIZE)
         .weight(600)
         .color_role(ColorRole::Text)
+}
+
+/// A section heading: its icon and its label, in one row.
+///
+/// The row is **not** a `control_row`: a `control_row` is
+/// `ROW_HEIGHT`-tall by contract, and a heading is as tall as its own
+/// text (17.5 px at `HEADING_SIZE`). Pinning the heading to 26 would add
+/// 8.5 px per section — 34 px over four sections — to a window whose
+/// height is measured from its tree. So the row takes its height from
+/// its children, which is what `HEADING_ROW_H` below records and why
+/// `WINDOW_SIZE` did not move.
+///
+/// `ColorRole::Text`, the same role the label takes, so the pair is one
+/// visual unit that follows the scheme together.
+fn heading_row(ui: &mut Ui<Settings>, name: &str, icon_name: &str, text: &str) -> WidgetId {
+    let container = ui.build(
+        row()
+            .gap(GAP)
+            .width_percent(1.0)
+            .cross_align(CrossAlign::Center),
+    );
+    let glyph = ui.build(
+        icon(icon_name)
+            .name(name)
+            .size(ICON_PX)
+            .color_role(ColorRole::Text),
+    );
+    let text = ui.build(heading(text));
+    for child in [glyph, text] {
+        ui.attach(container, child).unwrap();
+    }
+    container
 }
 
 /// A line of explanatory text under a section.

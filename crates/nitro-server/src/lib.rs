@@ -40,6 +40,7 @@ pub mod control;
 pub mod cursor;
 pub mod defer;
 pub mod frame;
+pub mod icons;
 pub mod input;
 pub mod keyboard;
 pub mod logging;
@@ -83,6 +84,7 @@ use crate::control::{Client, ReadOutcome};
 use crate::cursor::Cursor;
 use crate::defer::DeferredFlip;
 use crate::frame::{CursorState, OutputState};
+use crate::icons::IconEngine;
 use crate::input::{InputEvent, InputSource, LibinputSource, Pointer};
 use crate::keyboard::{Hotkey, Keyboard, Mods};
 use crate::protocol::Request;
@@ -589,6 +591,8 @@ struct Server {
     scene: Scene,
     /// Fonts, the shaper, the glyph atlas and every shaped run on screen.
     text: TextEngine,
+    /// The symbolic icon set and its cache of rasterised coverage masks.
+    icons: IconEngine,
     outputs: Vec<OutputState>,
     keyboard: Option<Keyboard>,
     cursor: Cursor,
@@ -872,6 +876,7 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         epoll,
         scene: Scene::new(),
         text: TextEngine::new(),
+        icons: IconEngine::new(),
         outputs: Vec::new(),
         keyboard,
         cursor: Cursor::new(),
@@ -1596,6 +1601,7 @@ impl Server {
                     &mut shadow.canvas(),
                     &self.scene,
                     &mut self.text,
+                    &mut self.icons,
                     scene_id,
                     &rasterize,
                     (&self.cursor, cursor_state),
@@ -1612,6 +1618,7 @@ impl Server {
                     &mut canvas,
                     &self.scene,
                     &mut self.text,
+                    &mut self.icons,
                     scene_id,
                     &region,
                     (&self.cursor, cursor_state),
@@ -4024,6 +4031,7 @@ impl Server {
         ];
         self.stats.write_pairs(&mut pairs);
         self.text.write_pairs(&mut pairs);
+        self.icons.write_pairs(&mut pairs);
         pairs.push(("clients", self.wire_clients.len() as u64));
         pairs.push(("windows", self.scene.window_count() as u64));
         pairs.push(("nodes", self.scene.node_count() as u64));
@@ -4329,10 +4337,19 @@ impl Server {
     /// *before* it tries to allocate one. A remote client never gets
     /// `SHELL`: the shell socket is a `0700` path and the privilege is
     /// having opened it, which a TCP port cannot prove.
+    ///
+    /// `ICONS` has the shape of `TEXT` rather than of `THEME`: it says
+    /// the server has an icon set to draw with. This build compiles one
+    /// in, so it is always set — but it is asked rather than asserted,
+    /// because a stripped or fixture server honestly may not have one,
+    /// and a client that checks the bit lays out identically either way.
     fn caps(&self, shell: bool, remote: bool) -> u32 {
         let mut caps = nitro_wire::types::caps::WM | nitro_wire::types::caps::THEME;
         if self.text.has_fonts() {
             caps |= nitro_wire::types::caps::TEXT;
+        }
+        if self.icons.has_icons() {
+            caps |= nitro_wire::types::caps::ICONS;
         }
         if shell {
             caps |= nitro_wire::types::caps::SHELL;
@@ -4785,7 +4802,8 @@ impl Server {
         };
         // The buffer descriptors arrived with their messages; hand them to
         // the client's map once the scene has minted the keys.
-        let result = clients::apply(&mut client, &mut self.scene, &mut self.text, serial);
+        let (scene, text, icons) = (&mut self.scene, &mut self.text, &self.icons);
+        let result = clients::apply(&mut client, scene, text, icons, serial);
         let outcome = match result {
             Ok(o) => o,
             Err(ApplyError { code, detail }) => {
@@ -4815,6 +4833,7 @@ impl Server {
             debug_assert_eq!(metrics.node, node);
             client.send(&ServerMsg::TextMetrics(metrics));
         }
+        report_bad_icons(&mut client, serial, outcome.bad_icons);
         for (node_id, win) in outcome.new_windows {
             self.place_new_window(&mut client, node_id, win);
         }
@@ -5246,6 +5265,33 @@ impl Server {
                 None => "no outputs".to_owned(),
             })
         })
+    }
+}
+
+/// Tell a client about every icon name in its commit the set did not have.
+///
+/// The **only** non-fatal error a local client can earn, and deliberately
+/// so: the node was cleared, the rest of the batch applied, and saying so
+/// costs a gap in the UI rather than an application. Every other error in
+/// this protocol closes the connection, which is exactly why this one
+/// needs to be written down somewhere a reader will find it — see
+/// `docs/icons.md`.
+///
+/// Sent *after* the transaction was applied, like `TextMetrics`, so a
+/// client sees the whole commit take effect before the complaint about
+/// one node of it.
+fn report_bad_icons(client: &mut clients::WireClient, serial: u32, bad: Vec<(NodeId, String)>) {
+    for (node, name) in bad {
+        warn!(
+            "client {}: node {} asked for unknown icon {name:?}",
+            client.id.0,
+            node.raw()
+        );
+        client.send(&ServerMsg::Error(msg::Error {
+            serial,
+            code: ErrorCode::BadIcon,
+            msg: format!("no icon named {name:?}"),
+        }));
     }
 }
 

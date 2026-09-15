@@ -223,6 +223,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nitro-icons"
+version = "0.0.1"
+dependencies = [
+ "zeno",
+]
+
+[[package]]
 name = "nitro-kms"
 version = "0.0.1"
 dependencies = [
@@ -272,6 +279,7 @@ version = "0.0.1"
 dependencies = [
  "input",
  "nitro-core",
+ "nitro-icons",
  "nitro-kms",
  "nitro-raster",
  "nitro-scene",

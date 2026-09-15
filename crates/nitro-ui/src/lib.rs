@@ -66,7 +66,7 @@
 //! | module | what is in it |
 //! |--------|---------------|
 //! | [`widget`] | the [`Widget`] trait and the pass contexts |
-//! | [`widgets`] | `Flex`, `Panel`, `Label`, `Button`, `TextField`, `Checkbox`, `Scroll`, `Slider`, `Separator`, `Image`, `Spacer` |
+//! | [`widgets`] | `Flex`, `Panel`, `Label`, `Button`, `TextField`, `Checkbox`, `Scroll`, `Slider`, `Separator`, `Image`, `Icon`, `Spacer` |
 //! | [`list`] | `List`: a **virtualised** list, `visible + 2` nodes for any model |
 //! | [`build`] | the builder traits |
 //! | [`layout`] | the flex model, as pure functions |

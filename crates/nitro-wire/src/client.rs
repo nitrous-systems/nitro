@@ -17,9 +17,9 @@ use crate::msg::{
     BindKey, BufferDamage, ClientMsg, CloseWindow, Commit, CreateBuffer, CreateNode, CreateWindow,
     DestroyBuffer, DestroyNode, Fill, FocusWindow, GrabKeyboard, Hello, MeasureText, Outputs,
     Reparent, RequestFrame, ServerMsg, SetAnchor, SetAppId, SetBorder, SetBounds, SetClip,
-    SetCorners, SetExclusiveZone, SetFill, SetImage, SetLayer, SetOpacity, SetText, SetTransform,
-    SetVisible, SetWindowLimits, SetWindowState, SetWindowStateFor, SetWindowTitle, UnbindKey,
-    WindowList,
+    SetCorners, SetExclusiveZone, SetFill, SetIcon, SetImage, SetLayer, SetOpacity, SetText,
+    SetTransform, SetVisible, SetWindowLimits, SetWindowState, SetWindowStateFor, SetWindowTitle,
+    UnbindKey, WindowList,
 };
 use crate::types::{Align, BufferId, Edge, Layer, NodeId, NodeKind, WindowRef, WindowState};
 
@@ -596,6 +596,13 @@ impl Transaction<'_> {
             .bounds(id, rect)
     }
 
+    /// Create an icon node under `parent` with its bounds set.
+    #[must_use]
+    pub fn create_icon(self, id: NodeId, parent: NodeId, rect: Rect) -> Self {
+        self.create_node(id, NodeKind::Icon, parent)
+            .bounds(id, rect)
+    }
+
     /// Destroy a node and its subtree.
     #[must_use]
     pub fn destroy_node(mut self, id: NodeId) -> Self {
@@ -700,6 +707,25 @@ impl Transaction<'_> {
     #[must_use]
     pub fn set_text_full(mut self, m: SetText) -> Self {
         push!(self, m)
+    }
+
+    /// Put a named symbolic icon on an `Icon` node.
+    ///
+    /// The client never sends pixels: the server owns the artwork and
+    /// rasterises it at the output's scale, tinted with the palette role
+    /// `role` names. An empty `name` clears the node; an unknown one is
+    /// a non-fatal `Error { BadIcon }`. See `docs/icons.md`.
+    #[must_use]
+    pub fn set_icon(mut self, id: NodeId, name: &str, size: f32, role: u8) -> Self {
+        push!(
+            self,
+            SetIcon {
+                node: id,
+                size,
+                role,
+                name: name.to_owned(),
+            }
+        )
     }
 
     /// Register a shared-memory buffer, passing `fd`.

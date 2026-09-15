@@ -13,10 +13,10 @@ use nitro_wire::msg::{
     FocusWindow, Frame, GrabKeyboard, Hello, HotKey, Key, MeasureText, OutputGone, OutputInfo,
     Outputs, OutputsEnd, PointerAxis, PointerButton, PointerEnter, PointerLeave, PointerMotion,
     Presented, Reparent, RequestFrame, ServerMsg, SetAnchor, SetAppId, SetBorder, SetBounds,
-    SetClip, SetCorners, SetExclusiveZone, SetFill, SetImage, SetLayer, SetOpacity, SetText,
-    SetTransform, SetVisible, SetWindowLimits, SetWindowState, SetWindowStateFor, SetWindowTitle,
-    TextMeasured, TextMetrics, Theme, Touch, UnbindKey, Welcome, WindowGone, WindowInfo,
-    WindowList, WindowListEnd, WindowState,
+    SetClip, SetCorners, SetExclusiveZone, SetFill, SetIcon, SetImage, SetLayer, SetOpacity,
+    SetText, SetTransform, SetVisible, SetWindowLimits, SetWindowState, SetWindowStateFor,
+    SetWindowTitle, TextMeasured, TextMetrics, Theme, Touch, UnbindKey, Welcome, WindowGone,
+    WindowInfo, WindowList, WindowListEnd, WindowState,
 };
 use nitro_wire::types::{
     Align, AxisSource, BufferId, ButtonState, CursorPos, Edge, ErrorCode, Layer, NodeId, NodeKind,
@@ -181,6 +181,22 @@ fn client_messages() -> Vec<ClientMsg> {
             color: Color::BLACK,
             family: String::new(),
             text: String::new(),
+        }
+        .into(),
+        SetIcon {
+            node: NodeId(41),
+            size: 16.0,
+            role: Role::TextDim.index() as u8,
+            name: "gear".to_owned(),
+        }
+        .into(),
+        // The two edges: an empty name clears the node, and 0xff is the
+        // "as coloured" sentinel reserved for icons-B.
+        SetIcon {
+            node: NodeId(42),
+            size: 0.0,
+            role: SetIcon::AS_COLOURED,
+            name: String::new(),
         }
         .into(),
         MeasureText {
@@ -839,6 +855,17 @@ fn payload_layouts_are_frozen() {
     assert_eq!(w.bytes(), &GOLDEN_SET_TEXT);
 
     let mut w = Writer::new();
+    ClientMsg::from(SetIcon {
+        node: NodeId(0x0102_0304),
+        size: 16.0,
+        role: 3,
+        name: "gear".to_owned(),
+    })
+    .encode(&mut w)
+    .unwrap();
+    assert_eq!(w.bytes(), &GOLDEN_SET_ICON);
+
+    let mut w = Writer::new();
     ClientMsg::from(MeasureText {
         request: 0x0a0b_0c0d,
         size_px: 16.0,
@@ -1223,6 +1250,19 @@ const GOLDEN_SET_TEXT: [u8; 8 + 21 + 8 + 6] = [
     0x11, 0x22, 0x33, 0x44, // color
     0x04, 0x00, 0x00, 0x00, b's', b'a', b'n', b's', // family
     0x02, 0x00, 0x00, 0x00, b'h', b'i', // text
+];
+
+/// Golden frame for a fixed [`SetIcon`]; see `payload_layouts_are_frozen`.
+///
+/// Head is 9 bytes (`node` + `size` + `role`), then the name, which is the
+/// same shape as every other message with one variable tail.
+const GOLDEN_SET_ICON: [u8; 8 + 9 + 8] = [
+    // header: len=17, op=0x0208, fds=0, flags=0
+    0x11, 0x00, 0x00, 0x00, 0x08, 0x02, 0x00, 0x00, //
+    0x04, 0x03, 0x02, 0x01, // node
+    0x00, 0x00, 0x80, 0x41, // size 16.0
+    0x03, // role 3 (Text)
+    0x04, 0x00, 0x00, 0x00, b'g', b'e', b'a', b'r', // name
 ];
 
 /// Golden frame for a fixed [`MeasureText`].

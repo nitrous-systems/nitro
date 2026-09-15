@@ -3,9 +3,9 @@
 //!
 //! ```text
 //! ┌──────────────────────────────────────────────────────────────────┐
-//! │ ☰  Calculator │ hello-dialog          09:41          87%+ 0.4 1.2/3.3G │
+//! │ ≣  Calculator │ hello-dialog     09:41      87%+ ⚙0.4 ▤1.2/3.3G │
 //! └──────────────────────────────────────────────────────────────────┘
-//!    launcher  ── windows ──            clock        battery load  mem
+//!    launcher  ── windows ──        clock      battery load  mem
 //! ```
 //!
 //! It is a `nitro-ui` app like any other — a state struct, a tree built
@@ -79,7 +79,7 @@ pub mod sensors;
 
 use nitro_ui::build::{ContainerBuilder as _, StyleBuilder as _};
 use nitro_ui::shell::{Layer, ShellEvent, Surface, WindowInfo, WindowRef};
-use nitro_ui::widgets::{Button, Label, button as button_widget, label, row, spacer};
+use nitro_ui::widgets::{Button, Label, button as button_widget, icon, label, row, spacer};
 use nitro_ui::{App, ColorRole, Error, Size, Ui, WidgetId};
 
 /// The name the bar registers under, and so the first argument to `hey`.
@@ -110,6 +110,14 @@ pub const POLL_MS: u64 = 30_000;
 /// a 32 px strip has to fit a line of text with air around it.
 const TEXT_SIZE: f32 = 13.0;
 
+/// The side of the bar's icons, in logical pixels.
+///
+/// 16 rather than `TEXT_SIZE`: the artwork is drawn on a 16-unit grid, so
+/// a 16 px box puts every stroke on a whole pixel at scale 1 and on a
+/// whole pair at scale 2. A 13 px icon would be legible and slightly
+/// soft, for no gain — the bar is 32 px tall and has the room.
+const ICON_PX: f32 = 16.0;
+
 /// Gap between the sections, and between the buttons inside them.
 const GAP: f32 = 6.0;
 
@@ -138,8 +146,23 @@ pub mod names {
     pub const BATTERY: &str = "battery";
     /// The CPU load readout.
     pub const LOAD: &str = "load";
+    /// The icon in front of the load readout.
+    pub const LOAD_ICON: &str = "load_icon";
     /// The memory readout.
     pub const MEM: &str = "mem";
+    /// The icon in front of the memory readout.
+    pub const MEM_ICON: &str = "mem_icon";
+}
+
+/// The icons the bar names, in one place so a rename is one edit and a
+/// test can assert on the same constants the tree is built from.
+pub mod icons {
+    /// The launcher button's hamburger.
+    pub const LAUNCHER: &str = "list";
+    /// In front of the load average.
+    pub const LOAD: &str = "cpu";
+    /// In front of the memory readout.
+    pub const MEM: &str = "memory";
 }
 
 /// One entry in the window list: the server's id, what it currently says,
@@ -459,8 +482,18 @@ pub fn build(ui: &mut Ui<Bar>) -> WidgetId {
     // The launcher button does not open the launcher itself: it fires the
     // same bare-Super path the launcher already listens on (#3691), so
     // there is one trigger rather than two that must agree.
+    //
+    // The glyph is an **icon**, not a character. `☰` used to be a
+    // codepoint in the label, which meant it came from whatever font on
+    // the box happened to have U+2630 — a different weight and a
+    // different optical size from everything beside it, and nothing at
+    // all on a box whose fonts lack it. `icon("list")` is the desktop's
+    // own artwork, rasterised by the server at the output's scale and
+    // tinted from the palette. The button's *text* is still "Menu", so
+    // `hey nitro-bar list` and a screen reader are unaffected.
     let launcher = ui.build(
-        button_widget("☰")
+        button_widget("Menu")
+            .icon(icons::LAUNCHER)
             .name(names::LAUNCHER)
             .size(TEXT_SIZE)
             .height_percent(1.0)
@@ -521,10 +554,33 @@ pub fn build(ui: &mut Ui<Bar>) -> WidgetId {
             .size(TEXT_SIZE)
             .color_role(ColorRole::TextDim),
     );
+    // The two readouts that are *numbers with no units* get an icon in
+    // front of them, because `0.4  1.2/3.3G` says nothing about which is
+    // which. The icons are static — they are painted once and never
+    // again, however many sensor polls go past, which is what keeps the
+    // bar's idle contract intact (`icons_are_painted_once_and_never_again`
+    // in `tests/bar.rs`).
+    //
+    // Battery and wifi deliberately get none: the bar has a battery
+    // *sensor* and no wifi one, and an icon in front of `87%+` would be
+    // redundant where an icon in front of `0.4` is the only thing that
+    // makes it readable.
+    let load_icon = ui.build(
+        icon(icons::LOAD)
+            .name(names::LOAD_ICON)
+            .size(ICON_PX)
+            .color_role(ColorRole::TextDim),
+    );
     let load = ui.build(
         label("")
             .name(names::LOAD)
             .size(TEXT_SIZE)
+            .color_role(ColorRole::TextDim),
+    );
+    let mem_icon = ui.build(
+        icon(icons::MEM)
+            .name(names::MEM_ICON)
+            .size(ICON_PX)
             .color_role(ColorRole::TextDim),
     );
     let mem = ui.build(
@@ -548,7 +604,7 @@ pub fn build(ui: &mut Ui<Bar>) -> WidgetId {
     let left_pad = ui.build(spacer().grow(1.0));
     let right_pad = ui.build(spacer().grow(1.0));
     for child in [
-        launcher, windows, left_pad, clock_id, right_pad, battery, load, mem,
+        launcher, windows, left_pad, clock_id, right_pad, battery, load_icon, load, mem_icon, mem,
     ] {
         ui.attach(root, child).unwrap();
     }

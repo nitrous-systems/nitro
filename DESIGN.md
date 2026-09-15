@@ -842,6 +842,59 @@ D-Bus client is allowed.
     crates: `rustix`'s `net` already covers TCP sockets and socket
     options.
 
+  - **M4-G done.** **Symbolic icons, server-side by name.** A client
+    sends `icon("gear")` — a name, a palette role and a square size —
+    and the server rasterises the artwork it owns at that output's
+    device scale in the colour that role currently names. `SetIcon`
+    (0x0208) behind `caps::ICONS`, `crates/nitro-icons` (a vendored
+    Bootstrap Icons subset, MIT, pinned to a commit), an `IconEngine`
+    beside the text engine, an `icon()` widget, and the bar and settings
+    as first consumers. `docs/icons.md`.
+
+    It is the text argument a second time, and the same three reasons
+    make it: **remote** (a buffer is a file descriptor and cannot cross
+    TCP, so pixels are the one thing a remote app cannot send; a name
+    is nine bytes and a string), **theme** (the node stores a *role*,
+    resolved at paint time, so `theme.scheme = dark` recolours every
+    icon in the same frame as the text — and because the cache holds
+    coverage rather than tinted pixels, at **zero** re-rasterisations),
+    and **scale** (rasterised at `round(size × output scale)`, so a 2×
+    screen gets a real 2× icon rather than a doubled 16 px tile —
+    settled on the count of anti-aliased edge pixels, which a 2× blit
+    would multiply by exactly four and a real raster does not).
+
+    Two decisions are worth recording. `Icon` is its **own node kind**
+    rather than an `Image`: an `Image` *is* a region of a client
+    buffer, so overloading it would have meant a node whose meaning
+    depended on which setter ran last, with no defined answer for
+    `SetImage` then `SetIcon`. And an unknown name is the protocol's
+    **second non-fatal error** (`BadIcon`), on exactly the terms the
+    remote buffer op earned the first: the node is cleared, the commit
+    applies, the client is told and keeps running. A desktop must not
+    lose an application because one widget named an icon a newer set
+    has, and a client cannot check in advance since the set is the
+    server's.
+
+    The dependency is **zero new crates**: `zeno` was already in the
+    tree via swash. It did not come free, though, and the trap is the
+    transferable part — zeno 0.3.3 mishandles SVG's *implicit repeated
+    arc argument sets*, which 13 of our 47 icons are written with, and
+    **`render_into` reports no error when it does**. It silently draws
+    the prefix it parsed. A mishandled icon would have shipped as a
+    stray fragment with every return value green. So the importer
+    converts arcs to cubics at import time and `set.rs` holds arc-free
+    data, which makes the construct unwritable rather than merely
+    unused; the conversion is checked against the 33 icons zeno does
+    parse natively (worst edge-pixel delta 38/255, **zero** solid-pixel
+    flips at 16/32/64/128 px).
+
+    The cache never evicts, and unlike the glyph atlas that is not a
+    deferral: the set is *closed*, so all 47 icons at all four
+    recommended sizes is about **190 KB**, against a 2 MiB ceiling that
+    refuses rather than evicts. An LRU here would be machinery
+    answering a question that cannot be asked; `icon_refusals` in
+    `stats` is how the server would say that reasoning was wrong.
+
 - **M5** — Wayland adapter; GPU backend.
 
 ## What we take from the old repo
