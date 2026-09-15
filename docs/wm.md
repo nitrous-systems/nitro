@@ -27,11 +27,27 @@ decorated the server wraps that group in a **frame group** it owns under
 frame group  (server)          ← Window::root(),  the whole window
 ├── background rect (server)   ← border colour, rounded top corners
 ├── title bar rect  (server)
+├── app icon        (server)   ← the window's app_id, resolved server-side
 ├── title text      (server)   ← elided with "…"
-├── close button    (server)
-├── maximize button (server)   ← absent when FIXED_SIZE
+├── close    disc + x     (server)
+├── maximize disc + square(server)   ← absent when FIXED_SIZE
+├── minimize disc + dash  (server)
 └── content group   (client)   ← Window::content(), offset by the insets
 ```
+
+**Eleven nodes**, nine on a `FIXED_SIZE` window. That is the figure
+`docs/budget.md` multiplies by the 240 bytes a `Node` costs, and
+`a_frame_costs_eleven_scene_nodes_and_a_fixed_window_nine` pins it, so a
+frame that quietly grew would move the budget line loudly instead.
+
+Each node earns its place by being a thing no other node can be. A rect
+has a fill and no artwork; an icon has artwork and no fill; a text node
+holds a shaped run. So a button that is a glyph on a disc is two nodes,
+and the alternative — **one** disc moved to whichever button is hovered,
+since only one ever is — was considered and not taken: a disc whose
+bounds change on every hover damages its old rectangle *and* its new one,
+where three fixed discs each damage only themselves. That is twice the
+pixels per hover, on the motion path.
 
 The client's `NodeId` names the **content** group, before and after
 framing: `Scene::frame_window` mints a new root *above* the existing node
@@ -48,9 +64,60 @@ Geometry, in logical units:
 | title bar height | 28 |
 | border | 1, left/right/bottom |
 | top corner radius | 6 |
-| button | 14 × 14, 8 apart, close rightmost |
+| application icon | 16 × 16, 8 from the left edge, 6 before the title |
+| button | 14 × 14, 8 apart, close rightmost; a 10 px glyph centred in each |
 | resize grab band | 6 outside the frame edge, inwards only to the border (or the title bar, at the top) |
 | resize hint | the border repaints in `resize_hint` while the pointer is in the band |
+| button hover | the disc under the pointer's button paints; every other disc is transparent |
+
+The title's box is what is left: it starts after the icon and stops one
+gap short of the leftmost button, so a long title is elided rather than
+running under either. The icon took 22 logical pixels off its left end,
+which means a narrow window elides sooner than it did before M4 — the
+right trade, because a title bar with no icon and a fully spelled title
+says less at a glance than one with an icon and an ellipsis.
+
+### The icons, and why the buttons stopped being circles
+
+Until #3715 the buttons were a red circle and a green one, and the
+application had no icon anywhere in its own frame. Both are fixed by the
+same mechanism: the frame is scene nodes the **server** owns, and the
+server owns the icon engine too, so a decoration can hold an icon exactly
+as a client's widget can.
+
+**The application icon** is the window's `app_id`, resolved through the
+full three-step lookup (`docs/icons.md`): the icon theme, then
+`<app_id>.desktop`'s `Icon=`, then that name symbolic-or-theme. So
+`nitro-calc` shows a calculator and `firefox` shows Firefox's own PNG.
+The fallback when nothing resolves is the `window` glyph, tinted like the
+title — and it happens **synchronously**, in the same call: a client that
+names a missing icon is told `BadIcon` and sends its fallback a message
+later, but the server *is* the resolver, so the node is never briefly
+blank. A window whose `app_id` changes after mapping (`SetAppId` is legal
+at any time, and `nitro-term` uses it) re-resolves.
+
+**The buttons** are `x`, `square` and `dash` from the symbolic set,
+tinted like the title, on a disc that is **transparent until hovered**.
+`square` rather than `arrows-angle-expand` for maximize because four
+diagonal arrowheads and their tails inside a ten-pixel box turn to mush
+at scale 1, where one outlined rectangle's four strokes land on whole
+pixels — and because the square is what the button *does* rather than a
+metaphor for it.
+
+The red did not disappear; it moved. `title_close` is the close button's
+**hover** disc, so the most destructive control on the window is the one
+that looks ordinary until you point at it, and then unmistakably does
+not. Minimize and maximize hover in `title_button_hover`, a role of its
+own because a title bar is not a window background — `docs/theme.md` has
+that argument and the one about why `title_maximize` is kept though it
+now paints nothing.
+
+The hover rides the **same motion path** as the resize hint, and the same
+single `frame_hit` per motion event: one z-order walk answers both
+affordances, and the restyle it causes is `style_only` rather than the
+full `restyle`, so crossing a button never shapes text. Both are pinned —
+`text_layouts` and `icon_renders` unmoved across a hover and across a
+30-step drag.
 
 The insets are `(1, 28, 1, 1)`. `Window::size()` and every `Configure` are
 the **content's** size; `Window::frame_size()` adds the insets.
@@ -94,8 +161,8 @@ pointer and one at the edge.
 Every decorated window except a `FIXED_SIZE` one — and no shipped app sets
 that flag, so the calculator, the settings window, the file manager and
 the terminal all resize by their edges and corners. `FIXED_SIZE` is also
-visible in the frame *before* you try it: such a window has no maximize
-button, and now no lit border either.
+visible in the frame *before* you try it: such a window has two buttons
+rather than three — no maximize — and now no lit border either.
 
 ### Hit regions
 
@@ -107,11 +174,23 @@ screen — minimized, or hidden by their own client with `SetVisible`:
 | title bar | press-drag moves; double click toggles maximize |
 | close button | `Closed` to the client on release *inside the button* |
 | maximize button | toggle maximize on release inside the button |
+| minimize button | minimize on release inside the button |
 | edge / corner band | press-drag resizes those edges |
 | content | the client's, routed as `PointerButton` / `PointerMotion` |
 
 A button fires on **release inside itself**, which is what lets a user
-change their mind by sliding off it before letting go.
+change their mind by sliding off it before letting go. That matters most
+for the newest of the three: a minimize that fired on press would be a
+window the user cannot stop putting away.
+
+**Minimize is a button since #3715, and was an action long before.**
+`Region::Minimize` and everything behind it — the demote, the focus
+handover, the `Alt+Tab` that brings it back — shipped in M3-A and were
+reachable only by `Super+H`. `buttons()` returned close and maximize, so
+the frame offered no way to do the one thing a user does to a window more
+often than any other. A `FIXED_SIZE` window keeps close and minimize and
+loses only maximize: putting a window away is something any window can
+do, and only *maximize* would be a lie on one that cannot be resized.
 
 **A hidden window is not a hit target.** This walk is separate from the
 scene's own hit test — the scene only knows about *painted* nodes and
@@ -230,7 +309,8 @@ back. Adding or removing a frame for real would restructure the tree under
 a live client.
 
 A `FIXED_SIZE` window silently refuses `Maximized` and `Fullscreen`, and
-gets neither resize bands nor a maximize button. Silently, because the
+gets neither resize bands nor a maximize button — though it keeps close
+and minimize. Silently, because the
 protocol has no per-request error: every error is fatal, and killing a
 connection over "you cannot maximize this" would be absurd.
 

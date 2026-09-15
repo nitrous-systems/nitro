@@ -84,9 +84,10 @@ desktop can be pasted straight back into a file.
 | `title_text_inactive` | an unfocused window's title text | `#555c66` | `#9aa4b0` |
 | `window_border_active` | the focused window's frame border | `#6d8eb8` | `#5a8dc8` |
 | `window_border_inactive` | an unfocused one's | `#c4c8d0` | `#3a424c` |
-| `title_close` | the close button | `#d95b4e` | `#d95b4e` |
-| `title_maximize` | the maximize button | `#62a85c` | `#62a85c` |
+| `title_close` | the close button's **hover** disc — red only while the pointer is on it | `#d95b4e` | `#d95b4e` |
+| `title_maximize` | **no longer painted**; kept because a role index is a wire index | `#62a85c` | `#62a85c` |
 | `resize_hint` | the frame edge, while the pointer is in its resize band | `#0f5fbe` | `#6ca8f0` |
+| `title_button_hover` | the disc under a hovered minimize or maximize button | `#b3c0d4` | `#465c78` |
 | `desktop_top` | top of the wallpaper gradient — **and of the server's own uncovered desktop** | `#dce3ed` | `#2a303c` |
 | `desktop_bottom` | bottom of both | `#bec7d4` | `#151820` |
 | `terminal_background` | a terminal's default background (`SGR 49`) | `#fbfbf8` | `#141418` |
@@ -317,3 +318,32 @@ desktop's (`SGR 38;2;r;g;b`, and `nitro-wallpaper --color`).
 The thing *not* to do is add a colour to an app because no role fits. If
 a widget needs a colour the table does not name, the table is missing a
 meaning — add it here, where the user's switch can reach it.
+
+### What an *unused* role is for, and why it stays
+
+`title_maximize` names nothing on screen any more. The frame's buttons
+became symbolic glyphs in #3715 (`docs/wm.md`), so there is no green
+circle left for it to colour, and `title_close` changed meaning from
+"what a close button looks like" to "what it looks like when a click
+would close the window".
+
+The role is kept anyway, and the reason is the rule above read backwards:
+**a role's position is its wire index**, so removing one renumbers every
+role after it. A client one release behind would go on reading the table
+by index and get its whole lower half shifted — every terminal's ANSI
+colours wrong, silently, on a desktop that looked fine to everyone who
+had upgraded. An unused role costs four bytes in the `Theme` message and
+a row in this table; a renumbered one costs a wire break.
+
+So the rule is: roles are appended, never inserted, and **never removed**.
+One that stops being used is documented as unused rather than deleted. If
+the table ever accumulates enough of them to matter, that is a versioned
+`Theme` message, not a quiet deletion.
+
+`title_button_hover` is a role rather than a reuse of `button_hover` for
+the complementary reason, and it is worth recording because reuse was the
+first instinct: the two sit on different backgrounds. In the light scheme
+`button_hover` is `#d6d9e4` and `title_bar_active` is `#d6dde8` — a
+difference of two units in one channel, which is an affordance nobody can
+see. A hover disc has to read against a *title bar*, and that is a
+different meaning from a button face on a window background.

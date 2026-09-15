@@ -386,20 +386,24 @@ application's desktop file is usually named after its app id, and its
 files under `deploy/` are named after the `App::new` name each binary
 registers, which *is* the app id the shell reports.
 
-It is also honestly limited, and the limit is the reason this section
-exists rather than a comment: an application whose app id and icon name
-differ gets the fallback icon and nothing says why.
-`org.gnome.Nautilus` with `Icon=nautilus` is the shape that fails, and
-reverse-DNS app ids are common.
+**The limitation shrank in #3715 without the rule changing.** The bar
+still sends the raw app id and still reads nothing; what changed is that
+the *server*, failing to find that name in the icon theme, now looks for
+`<app_id>.desktop` and resolves its `Icon=` (`docs/icons.md`). So the
+case that falls back is no longer "an application whose app id is not an
+icon name" — which was every application this desktop ships, and is why
+the box showed the generic `window` glyph for the calculator — but the
+narrower **"an application whose `.desktop` basename differs from its app
+id"**. `org.gnome.Nautilus` ships `org.gnome.Nautilus.desktop` and now
+resolves; an application that registers one app id and installs a
+differently named entry still gets the fallback, and nothing says why.
 
-The alternative considered was to have the **server** resolve
-`app_id → .desktop → Icon=`. It is strictly more correct and strictly
-bigger: it puts a `.desktop` index, its search path, and the question of
-when to invalidate it inside the compositor, to cover a case the
-convention already covers most of the time. The small rule shipped; if
-the fallback icon starts showing up on applications people actually run,
-that is the evidence for the bigger one, and this paragraph is what it
-will be weighed against. See `docs/icons.md` for the icon lookup itself.
+That is the bigger alternative this section used to weigh — "have the
+server resolve `app_id` → `.desktop` → `Icon=`, strictly better and
+strictly bigger" — taken, on the evidence it asked for: the fallback icon
+was showing up on the applications people on this box actually run. The
+index is 200 lines in the compositor, the bar is unchanged, and the
+small rule is still the one the bar implements.
 
 The icons do not touch the bar's idle contract: an app id is fixed for a
 window's life, so each button sends exactly one `SetIcon` when it is

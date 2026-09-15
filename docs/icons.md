@@ -417,7 +417,22 @@ monochrome, and the client cannot know which those are.
 `a_symbolic_name_is_not_an_application_name_and_the_reverse` asserts both
 directions through the real server.
 
-### The lookup: the XDG spec, the honest subset
+### The lookup: three steps, in this order
+
+An `AS_COLOURED` name is resolved by asking three questions, and the
+first one that answers wins:
+
+| # | where | added |
+|---|---|---|
+| 1 | the machine's **XDG icon theme** — a PNG on disk | #3714 |
+| 2 | **`<name>.desktop`'s `Icon=`**, one hop, no recursion | #3715 |
+| 3 | that `Icon=` value through the **normal** symbolic-then-theme lookup | #3715 |
+
+Step 1 is the rest of this section. Steps 2 and 3 are the `.desktop`
+indirection below, and the short version is that they are what turns
+`nitro-calc` into `calculator`.
+
+### Step 1: the XDG spec, the honest subset
 
 `crates/nitro-server/src/icon_theme.rs`, and it is filesystem and parsing
 only — it returns a path and decodes nothing.
@@ -470,6 +485,103 @@ installed by the applications themselves — which is exactly what
 An **absolute path** in the name is honoured, as the desktop-entry spec
 allows in `Icon=`, when it ends in `.png` and names a readable file. A
 name containing `/`, `..` or a NUL is refused outright.
+
+### The `.desktop` indirection
+
+`crates/nitro-server/src/desktop_index.rs`.
+
+A name that resolves in neither the symbolic set nor the icon theme is
+looked up as a **desktop-entry basename**, and its `Icon=` value goes
+back through the normal resolution. `nitro-calc` → `calculator` (ours,
+symbolic); `firefox` → `firefox` (the theme's PNG); an absolute path is
+honoured exactly as in step 1.
+
+**Why this exists at all** is the paragraph the previous version of this
+document ended with. `nitro-bar`'s window list asks for an icon by a
+window's `app_id`, on the freedesktop convention that a desktop file is
+named after its app id and its `Icon=` usually matches. On the test box
+that convention falls back for **every one of our own applications**: the
+bar showed the generic `window` glyph for the calculator, the settings
+window and the terminal alike, because `nitro-calc` is an app id and not
+an icon name. The fact that ties the two together was written down all
+along — `Icon=calculator` in `deploy/nitro-calc.desktop` — and nothing
+read it.
+
+**One hop, and no recursion.** An `Icon=` that resolves nowhere is a
+`BadIcon`, not another `.desktop` lookup. A chain would be a cycle
+waiting to happen and answers no question the single hop does not; it is
+a property of the call graph rather than a rule to remember, because step
+3 calls the theme lookup directly and cannot reach the index.
+
+**The symbolic set is not step 0**, and that is the selector rule holding
+rather than bending. A palette role means the symbolic set and never
+looks at anything else; `AS_COLOURED` never consults the symbolic set for
+the name it was *given*. Trying it first would be the one-namespace
+design this document rejects two sections up — `icon("list").coloured()`
+would quietly mean the desktop's own glyph on every box, shadowing
+whatever a theme installs.
+
+The symbolic set **is** consulted for the **indirected** name, and that
+is a different question: the `.desktop` file is the application's own
+statement about which shape it wants, so there is nothing to shadow.
+`Icon=calculator` in a file we ship means our `calculator`, deliberately.
+
+**A symbolic answer to a coloured request is drawn tinted**, in
+`Role::Text`. It has to be: a symbolic icon is an A8 coverage mask with
+no colours of its own, so a node that kept `AS_COLOURED` would look the
+handle up in the application cache, find nothing and draw an empty box.
+`IconEngine::lookup_app` therefore answers with an `AppIcon` saying which
+set replied, and `clients.rs` stores the role byte that implies. This is
+the same **mixed-tint rule** the toolkit's own fallback already applies
+client-side — `nitro-ui`'s `icon_fallback_tinted` sends a coloured icon's
+fallback with a palette role — and it is now the server's too, which is
+what makes it work for the bar, whose name *is* an app id and whose
+fallback therefore never fired. A tinted request whose target is a
+coloured PNG is unchanged from #3714: refused, for the reason the
+role-byte section gives.
+
+**The search path** is `$XDG_DATA_HOME/applications`,
+`~/.local/share/applications`, and each `$XDG_DATA_DIRS` entry plus
+`/applications` — the same directory precedence the icon path uses, minus
+the flat `/usr/share/pixmaps`, which is an icon directory and holds no
+desktop entries. Earlier wins, so a user's own entry overrides a
+packaged one.
+
+**The index is built once**, at start and on every `reload`, as
+`basename -> Icon=` and nothing else. Eagerly rather than on the first
+miss, because the alternative is a `read_dir` on the commit path — the
+call a client's first-paint latency waits on — for a staleness guarantee
+it would not actually provide: nothing here watches the filesystem either
+way. `reload` is the moment the user says "look again" after installing
+something, and it re-resolves every decorated window's frame icon with
+it. The scan is bounded at 4 096 entries and 64 KiB per file, because
+`$XDG_DATA_DIRS` is user-controlled and a directory with a million files
+in it must not make the server's start unbounded.
+
+**Why the parser is not the launcher's.**
+`crates/nitro-launcher/src/desktop.rs` already reads these files, and
+this duplicates the thirty lines it needs. Three reasons, in order of
+weight: the **dependency edge runs backwards** — the launcher is a
+*client*, linking `nitro-wire` and `nitro-ui` and spawning processes, and
+a compositor that linked its launcher to reuse a `split('=')` would pull
+an application's tree into the process that owns the screen; the two want
+**different answers** — the launcher needs `Name`, `Exec`, `Terminal`,
+`NoDisplay`, `Hidden`, `Type` and the `%f` field codes and has to *skip*
+entries, where this needs one key from files it never filters, because an
+icon for a `NoDisplay=true` entry is still the right icon for that
+application's window; and this is an **index**, not a parse — the
+artefact is a map built once, not a `Vec<Entry>` that is then sorted and
+filtered.
+
+What *is* shared is the format's two traps, which is why it is a scan
+rather than a `split('=')`: only the `[Desktop Entry]` group counts (a
+later `[Desktop Action …]` has its own `Icon=`), and a localized key is
+not the key (`Icon[de]=` must never overwrite `Icon=`).
+
+`stats` gains `desktop_entries` (how many the index holds) and
+`app_icon_indirections` (how many distinct names were answered through
+the hop rather than by the theme directly). The second is the one that
+says whether the index is earning its read.
 
 ### The cache: pixels, and an LRU
 
@@ -615,13 +727,33 @@ be worth one string. It is also honestly limited: an application whose
 app id and icon name differ (`org.gnome.Nautilus` vs `nautilus`) gets the
 fallback.
 
-The alternative was to have the *server* resolve `app_id` → `.desktop` →
-`Icon=`, which is strictly better and strictly bigger: it puts a
-`.desktop` index, its search path and its invalidation into the
-compositor, for a case the convention already covers. Rule (a) is what
-shipped; the note is here so the next person knows what they are
-choosing between. Our own applications keep the convention: the
-`.desktop` files under `deploy/` are named after their app ids.
+Since #3715 the bar's rule is unchanged and its **limitation has shrunk**,
+because the server took the second step for it. The name the bar sends is
+still the raw `app_id` and it still holds no index and reads no files;
+what changed is that the server, failing to find that name in the theme,
+now looks for `<app_id>.desktop` and resolves its `Icon=`. So the case
+that falls back is no longer "an app whose app id is not an icon name" —
+which is all of ours — but the narrower "an app whose `.desktop`
+**basename** differs from its app id". `org.gnome.Nautilus` ships
+`org.gnome.Nautilus.desktop`, so it now works; an application that
+registers one app id and installs a differently named entry does not.
+
+The alternative that was weighed here — "have the *server* resolve
+`app_id` → `.desktop` → `Icon=`; strictly better and strictly bigger" —
+is the thing that shipped, and the evidence the paragraph asked for is
+what drove it: the fallback icon *was* showing up on applications people
+actually run, namely every application this desktop ships. The index, its
+search path and its invalidation are in the compositor after all, and
+they are 200 lines. Our own applications keep the convention regardless:
+the `.desktop` files under `deploy/` are named after their app ids.
+
+**The window decorations** are the other consumer, and the one with no
+client at all. A decorated window's title bar carries its application's
+icon at 16 px and three symbolic button glyphs; all four are nodes the
+*server* owns, so they are set through the engine's internal path rather
+than over the wire, and the `window` fallback fires synchronously instead
+of as a `BadIcon` somebody has to answer. `docs/wm.md` has the frame
+anatomy.
 
 ### Measured on the box
 
@@ -693,11 +825,12 @@ claim — `SetIcon` is one-way, the decode is the server's and already
 done, and a cached tile is an integer-aligned blit.
 
 **The bar's window list**, with calc, settings and a terminal open: all
-three show the symbolic `window`, because our app ids (`nitro-calc`,
-`nitro-settings`, `nitro-term`) are in no icon theme on the box. That is
+three showed the symbolic `window`, because our app ids (`nitro-calc`,
+`nitro-settings`, `nitro-term`) are in no icon theme on the box. That was
 rule (a) working as documented rather than failing — the fallback is what
-keeps the list readable — and it is exactly what the `.desktop` files
-under `deploy/` would fix on a box where they were installed.
+keeps the list readable — and it is exactly the finding that made #3715's
+indirection worth building. The measurement above is icons-B's and is
+kept as it was taken; #3715's own box numbers are in its section below.
 
 Sizes and memory are in `docs/budget.md`; the two numbers worth repeating
 here are that the server grew **+97 368 B (+3.9 %)**, a third of what the
@@ -707,11 +840,19 @@ symbolic set cost, and that the largest icon actually loaded decoded in
 ### Still deferred
 
 * **SVG application icons**, and the gradients they need.
-* **`.desktop`-based resolution for the bar**, above.
 * **Per-icon user overrides** — pinning one name to one file. That is a
   desktop-settings feature, not a path resolver's.
 * **`Context=`, localized theme names, `.icon` metadata.** All of it
   exists for an icon *chooser*; we are given a name and asked for a file.
+* **Watching the `.desktop` directories.** The index is rebuilt at start
+  and on `reload`, so an application installed while the desktop is
+  running gets its icon on the next `reload` and not before. A watch
+  would be an inotify descriptor per directory in `$XDG_DATA_DIRS` for a
+  change that happens when a user installs software — and `reload` is
+  already the gesture for "I changed something, look again".
+
+`.desktop`-based resolution for the bar is no longer on this list: #3715
+built it, and the section above is what it does.
 
 What is *not* deferred and not planned: client-supplied icon pixels.
 An app that needs arbitrary artwork has `Image`, and pays the buffer for

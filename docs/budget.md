@@ -420,6 +420,35 @@ is about 190 KB against a 2 MiB ceiling, so the set has a hard bound
 rather than a policy, and `icon_refusals` is how the server would say
 that reasoning was wrong.
 
+### A decorated frame's nodes: 6 → 11 (#3715)
+
+The server's own contribution to the `nodes` counter, per decorated
+window. `nodes` × 240 bytes is what this page multiplies, so the figure
+is pinned by a test
+(`a_frame_costs_eleven_scene_nodes_and_a_fixed_window_nine`) rather than
+remembered:
+
+| | nodes | what they are |
+|---|---|---|
+| before #3715 | **6** | frame group, background, bar, title, 2 buttons |
+| after | **11** | \+ app icon, and each button is a disc **and** a glyph |
+| `FIXED_SIZE` | **9** | no maximize, so two fewer |
+| undecorated | **0** | unchanged: opting out still costs nothing |
+
+At 240 bytes a node that is **+1 200 bytes per decorated window** — under
+the 4 kB granularity `RssAnon` is reported at, which is why the 86 kB
+per-window figure above is not restated as if it had moved.
+
+The five are argued in `wm::build_frame`, and the argument is that each
+is a thing no other node can be: a rect has a fill and no artwork, an
+icon has artwork and no fill. The alternative worth recording is **one**
+hover disc moved between the buttons rather than three fixed ones, since
+only one is ever lit — nine nodes and seven, a saving of 480 bytes per
+window. It was not taken because a disc whose bounds change on every
+hover damages its old rectangle *and* its new one, where three fixed
+discs each damage only themselves: twice the pixels per hover, paid on
+the motion path, to save half a kilobyte of a 9.5 MB process.
+
 ### The 8 MB the shadow buffer costs, and what it buys
 
 Since #539 each output owns a heap-resident shadow buffer, and unlike the
@@ -717,6 +746,13 @@ wire receive buffer plus 6 scene nodes plus the shaped title. And the
 floor drops from 2 424 kB to **1 684 kB**, a 740 kB saving on an idle
 desktop.
 
+(Those numbers are the M4-hygiene measurement and are kept as taken. The
+frame is **11 scene nodes** since #3715 — see *A decorated frame's nodes*
+below — which adds 5 × 240 B = 1.2 kB per window to the arithmetic:
+within the 4 kB granularity `RssAnon` is reported at, so the 86 kB figure
+is unchanged and it would be dishonest to restate it as though it had
+been re-measured.)
+
 The arithmetic closes exactly: with the shadow on and the threshold
 pinned, `RssAnon` at zero dialogs is 9 784 kB, and 9 784 − 8 100 (the
 1080p shadow) = **1 684 kB**, identical to the no-shadow floor.
@@ -741,7 +777,8 @@ no-shadow measurement predicted — the ratchet is gone, and the residual
 16 kB is one page-rounded allocation, not a third mechanism. The default
 row ratchets **2 296 kB** over two windows and never returns; the pinned row
 shows what a decorated window really costs, ~86 kB, which is the ~66 kB wire
-receive buffer plus 6 scene nodes plus the shaped title. `stats` at every
+receive buffer plus 6 scene nodes (11 since #3715, below) plus the shaped
+title. `stats` at every
 sample: `font_bytes 0`, `font_loads == font_releases` (11/11),
 `font_evictions 0` — the sweep is doing its job and the residue is entirely
 the allocator's.
