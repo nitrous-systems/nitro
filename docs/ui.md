@@ -330,6 +330,41 @@ Without `caps::ICONS` the widget measures the identical box and paints
 nothing, so an icon-less server costs a gap in a row and never a broken
 layout — the same bargain `Label` makes with `caps::TEXT`.
 
+**`.coloured()` is the other icon set, not the other colour.** Since
+M4-H the server owns two: the symbolic one compiled into it, and the
+machine's XDG icon theme. `icon("gear")` names the first and takes a
+role; `icon("firefox").coloured()` names the second and takes none — an
+application icon has its own colours, and no role to resolve. The
+`IconTint` enum is the toolkit's name for that choice
+(`IconTint::Role(r)` or `IconTint::Coloured`), and the two are mutually
+exclusive with the last call winning.
+
+Nothing falls back between the sets, which is why a coloured icon wants
+`.fallback_tinted(name, tint)`: a name that came from outside the program
+— a `.desktop` file's `Icon=`, a window's app id — is a claim about the
+box rather than a fact about it, and the icon to reach for when it is
+wrong has to come from the set that **cannot** be missing. That is the
+mixed case and it is the common one:
+
+```rust,ignore
+icon("firefox").coloured()
+    .fallback_tinted("window", IconTint::Role(ColorRole::Text))
+```
+
+`.fallback(name)` is the same-tint shorthand, right for a theme icon
+falling back to a more generic theme icon. Both are **exactly once**: the
+server's `BadIcon` re-sends through the normal paint path, and a
+`BadIcon` for the fallback itself is the end of it. `Icon::fell_back()`
+is how a test — or a caller — asks which name is actually on screen.
+
+One wrinkle worth knowing, because it shows in the code and will look
+like a shortcut otherwise: `Error { BadIcon }` carries **no node id**, so
+the toolkit routes it to a widget by parsing the quoted icon name out of
+the error's message and offering the fallback to every widget whose slot
+holds a `SetIcon` for that name. It is honest and bounded, and it is a
+weaker guarantee than the wire could give — issue #564 is the wire change
+that would fix it.
+
 **`Button::icon` is the same guard with a better fallback.** A button
 given an icon falls back to painting its *label* when the server has
 none, which is why a button keeps its `text` even when it shows a glyph:
@@ -337,6 +372,31 @@ the glyph is for the eye, the word is for everything else, and a blank
 face would be worse than either. Both `measure` and `paint` ask the
 capability, and they must agree — an icon box is a square and a label box
 is not, so a button that measured one and painted the other would clip.
+
+A button has **two icon modes**, and `IconMode::Replace` — the glyph
+*instead of* the word — is the original and still the default.
+`IconMode::Leading` puts the icon in front of the label with `ICON_GAP`
+between them and measures to the sum, which is what a row in a list
+wants: a launcher entry or a window-list button, where the word is the
+content and the icon is the hint and neither is redundant. The builders
+are `.icon(n)`, `.icon_leading(n)` and `.icon_coloured(n)`, with
+`.icon_size(px)`, `.icon_tint(t)`, `.icon_fallback(n)` and
+`.icon_fallback_tinted(n, t)` beside them, and a `WidgetMut<Button>`
+setter for each — because a task list creates its buttons before it knows
+which application they are for. In every mode the **text** stays the
+accessible name, so `hey` and a screen reader are unaffected.
+
+`.icon_size` exists because a button's icon otherwise takes the label's
+font size, which is right when the glyph stands in for the word and wrong
+when it stands beside it: a 13 px application logo next to a 16 px
+symbolic one is visibly odd, and 16/24/32/48 are the sizes the artwork is
+drawn for.
+
+`List` rows are **not** affected by any of this: a row's `icon` field is
+a glyph string painted as text, not an `Icon` widget, and rows are
+virtualised into slot ranges rather than being arbitrary widgets. Real
+icons in a `List` would be their own task; a leading-icon `Button` is
+what the launcher and the bar use.
 
 The guard is not cosmetic, and this is the reason it is spelled out
 here rather than left to the reader. Painting an icon creates a node of
