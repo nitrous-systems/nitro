@@ -115,7 +115,12 @@ built in their own worktree from a clean `target`:
 | `nitro-settings` | 758 016 | 758 048 | +32 |
 | `nitro-calc` | 599 200 | 599 232 | +32 |
 | `nitro-term` | 679 520 | 679 552 | +32 |
-| `nitro-server` | — | — | **+0**, untouched |
+| `nitro-server` | — | — | **+0**, byte-identical |
+
+Confirmed on the box, where the comparison is against the binary it was
+actually carrying rather than against a rebuild: `nitro-files`
+**850 696 → 860 336 (+9 640, +1.1 %)**, and `nitro-server`
+**md5-identical** — the "+0" row is verified rather than argued.
 
 `nitro-files` stays inside its **1 MB client budget at 86 %**, up from
 85 %. Its +7.9 KB is `mime::icon_for`'s four match tables and the
@@ -129,6 +134,22 @@ it, because the client sends `"file-earmark-code"` and the artwork was
 already compiled in — which is the arithmetic form of the argument
 `docs/icons.md` opens with, and the reason M4-G's +268 KB was a one-off
 rather than a per-consumer cost.
+
+**Resident memory**, on the box, same directory both arms:
+
+| `nitro-files` RSS | before | after |
+|---|---|---|
+| 10-row test directory | 3 156 kB | **3 152 kB** |
+| `/usr/bin`, 1 860 rows | 3 716 kB | **3 656 kB** |
+
+Both **down**, and not claimed as a win: the icon names are `&'static
+str`, so the `Entry` grew two words and lost nothing, and 60 kB is three
+orders of magnitude more than that. The honest reading is the same one
+@3712 recorded — a differently-sized binary rearranging glibc's arenas
+against the `MALLOC_MMAP_THRESHOLD_` the unit pins. Recorded because
+measured; not attributed. What the row does establish is that a per-row
+icon column costs **no** resident memory in the client, which is what
+"the server owns the artwork" predicts.
 
 **Resident memory.** The tile cache is the only new allocation, and it is
 bounded at 4 MiB with an LRU (`IconEngine::APP_MAX_BYTES`). Server VmRSS

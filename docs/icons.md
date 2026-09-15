@@ -269,6 +269,24 @@ row's diff compares against the last `SetIcon` it **requested** — so a
 scrolls over a model whose icons alternate cost zero against 400
 `SetText`s.
 
+Measured on the box with a directory holding one of each type:
+`icons_cached` **3 → 13** for ten rows showing nine distinct names,
+`icon_bytes` **3 328 = 13 × 16²**, `icon_refusals` **0**, and
+`icon_renders` unmoved across twenty full-window scrolls of a 1 860-row
+listing. The server binary was **byte-identical** to the one already
+deployed — a per-type icon column on a thousand-row directory added no
+bytes at all to the process that draws it, which is this document's
+opening argument in arithmetic. `docs/files.md` has the pixel census and
+the rename control that settle "ten distinguishable icons" on numbers
+rather than on a description.
+
+It also found the map defect worth repeating here, because it is about
+*names* and this document is about naming things: the box's
+`shared-mime-info` spells Rust `text/rust` where our built-in table spells
+it `text/x-rust`, so a `.rs` drew the wrong icon on the box and the right
+one in every test. A name is only as portable as the table that produces
+it, and a table tested against a fixture is a test of the fixture.
+
 The heading row is deliberately **not** a `control_row`. A `control_row`
 is `ROW_HEIGHT` (26 px) tall by contract, and a heading is as tall as its
 own text (17.5 px at `HEADING_SIZE`); pinning the headings to 26 would

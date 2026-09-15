@@ -960,6 +960,131 @@ appears is a shell rather than `vi`, because `-e` is not implemented
 yet. Both halves are the documented state, and the first half is the
 half this app owns.
 
+### The icon column on the box (M4-I)
+
+Same machine, same method, my build of `nitro-files` against the one the
+box was carrying (`e483c27f` → `39f90b7e`; the two md5s checked to be
+**distinct** before any A/B, which is @3704's byte-identical-binaries
+trap). `nitro-server` was **not rebuilt** — my branch's server binary is
+md5-identical to the box's, which is the "+0" row of `docs/budget.md`
+verified rather than argued.
+
+A directory with one of each: a dir, `.txt`, `.rs`, `.png`, `.mp3`,
+`.mp4`, `.ttf`, `.zip`, an unknown extension and a symlink to the dir.
+
+| what | measured |
+|---|---|
+| `icons_cached` before the app, after it | **3 → 13** |
+| distinct icon names in the listing | **10** (9 unique + the folder shared by `adir` and its symlink) |
+| `icon_bytes` | **3 328** = 13 × 16², no padding |
+| `icon_refusals` | **0** — every name the app used is in the server's set |
+| `icon_renders` after first paint, then 20 full-window scrolls | **13 → 13, unmoved** |
+| `nodes`, 1 860-row listing | **199** — a screenful, not 1 860 × 4 |
+| RSS, 10 rows / 1 860 rows | 3 152 kB / **3 656 kB** (was 3 156 / 3 716 before) |
+| binary | 850 696 → **860 336 (+9 640, +1.1 %)** |
+| `nitro-server` | **byte-identical**, +0 |
+
+**"Ten distinguishable icons" is settled on a pixel census, not on a
+description.** An icon crop always contains ink — @3712's lesson, and
+@3709's before it, where a heading crop false-positived on the *fixed*
+build — so "I can see a folder" proves nothing. The instrument is the
+16×16 icon box of each row, compared pixel-for-pixel against every other
+row:
+
+| | pairwise differing pixels, out of 256 |
+|---|---|
+| `adir` vs `j-to-dir` (symlink to it) | **0** — the one intended duplicate |
+| every other pair | **19–191** |
+
+Nine distinct images for nine distinct types, and the only collision is
+the one the design asks for.
+
+**The control that makes that decisive is a rename.** Identical censuses
+would also be produced by a column that drew one glyph for everything, or
+one keyed on the row *index*; what separates those is changing a single
+file's type and seeing the column follow. `mv e.mp3 e.zip`, then the same
+two shots compared:
+
+| row | pixels changed |
+|---|---|
+| `e.*` (the renamed one) | **56** |
+| all nine others | **0** |
+
+and afterwards the renamed row is **0 pixels different** from `h.zip`,
+where before it was 56. One file changed type, exactly one row's artwork
+changed, and it became pixel-identical to the other file of that type.
+
+**Idle is unchanged, and the control is again what makes it readable.**
+Four 45 s windows, gated to start at `:02` so none can cross a minute
+boundary — @3712's instrument error, which this room has now watched
+invent a regression three times:
+
+| arm | frames / 45 s | `icon_renders` |
+|---|---|---|
+| files open, 1 860 rows | 2 | 13 → 13 |
+| app absent (control) | 4 | 13 → 13 |
+| app absent (control, second) | 0 | 13 → 13 |
+| files open, second | 0 | 13 → 13 |
+
+The app arm is never *above* the control, and the spread in both arms is
+the bar's 30 s sensor poll landing inside the window or not. Reporting the
+first pair alone would have shown "2 with the app, 4 without" and invited
+exactly the wrong conclusion; reporting the second pair alone would have
+shown 0 and 0 and proved nothing. The honest reading is that the icons
+contribute nothing to idle, which is what `SetIcon` being one-way and the
+mask being cached predicts.
+
+**Scrolling costs no icons.** Twenty whole-window scrolls of `/usr/bin`
+(1 860 rows) left `icons_cached` and `icon_renders` at 13. Slots are
+addressed `row % ring`, so a re-anchor hands a slot a different row and
+the cached `SetIcon` still matches whenever the *name* is the same — and
+in a directory of binaries it almost always is. The harness counts the
+same thing from the client side and gets 0 `SetIcon`s against 400
+`SetText`s.
+
+#### The defect the box found, which no fixture could have
+
+The map was wrong, and it was wrong in a way only a second real machine
+could show. Our built-in fallback table spells Rust `text/x-rust`; the
+box's installed `shared-mime-info` spells it **`text/rust`**. So `c.rs`
+drew a *document* icon on the box and a *code* icon in every test here —
+the pixel census is what caught it, as rows 1 and 2 (`b.txt` and `c.rs`)
+came back **pixel-identical**, which is exactly the collision the census
+exists to detect.
+
+Auditing the box's table rather than patching the one symptom made it
+worse and then better. Of the 823 distinct types that `globs2` names, 145
+are `text/*` and **112 of those are `text/x-*`** — overwhelmingly
+programming languages. My list enumerated twenty. So `.hs`, `.kt`,
+`.scala`, `.vala`, `.ml`, `.ex`, `.f90` and eighty more were silently
+getting the document icon, on every machine, and no test could see it
+because every test supplied its own table.
+
+| the box's 823 types, through `icon_for` | before | after |
+|---|---|---|
+| `file-earmark-code` | 29 | **111** |
+| `file-earmark-text` | 130 | 63 |
+| `text/*` reaching the generic icon | 0 | 0 |
+
+The fix is a **polarity change**, not a longer list: `text/x-*` is
+`shared-mime-info`'s prefix for "text with a syntax", so it defaults to
+**code**, and the prose formats are carved out — READMEs and changelogs,
+subtitle tracks, TeX and troff, translation catalogues. A map that has to
+be extended for every language anybody installs is a map that is quietly
+wrong on every machine; a map with a bounded exception list is wrong only
+where it is visibly wrong. Re-deployed and re-measured: `icons_cached`
+12 → **13**, the new entry being exactly the code icon `c.rs` now gets.
+
+The transferable shape, and it is the room's recurring one in a new
+costume: **a lookup table tested against a fixture is a test of the
+fixture.** `mime.rs` had ten tests of its resolution order, all passing,
+all supplying their own `globs2` — and the one fact none of them could
+contain is that two real machines spell the same language differently.
+The corpus test added for it asserts the *invariants* the box's table
+revealed (every `text/*` reaches a text-ish icon; an unenumerated
+`text/x-` language is code) rather than vendoring 38 KB of somebody
+else's data.
+
 ### Four defects that 78 passing tests could not see
 
 Recorded because the *why* is transferable. Three were found by running
