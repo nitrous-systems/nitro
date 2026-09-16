@@ -32,12 +32,16 @@ just box-chvt 1    # VT-switch survival test; `just box-chvt 2` to come back
 just box-stop
 ```
 
-`just bench` is the long one — 45 runs, about fifteen minutes at the
-default eight seconds each, and it restarts `nitro-dev`. **Announce it in
-the `nitro-testbox` room before starting**, as with anything that takes
-the box for a window. It backs up and restores the human's
-`~/.config/nitro/server.conf` (a refresh-rate sweep writes a `mode` line
-into it and must hand back exactly what it found), and it reads the
+`just bench` is the long one — 54 runs, about twelve minutes at six
+seconds each, and it restarts `nitro-dev`. The three-rate sweep
+(`just bench "1920x1080@60 1920x1080@120 720p240" 6`) is 140 runs and
+about twenty minutes, and it **puts the screen at 1280×720 for the
+240 Hz arm**, so that arm is a reduced matrix and the script logs when it
+enters and leaves it. **Announce it in the `nitro-testbox` room before
+starting**, as with anything that takes the box for a window. It backs up
+and restores the human's `~/.config/nitro/server.conf` (a refresh sweep
+writes a `mode` or `modeline` line into it and must hand back exactly
+what it found, his `mode = 1920x1080@120` included), and it reads the
 control socket through a small Python client rather than `nc`, for the
 reason in the rules below.
 
@@ -120,14 +124,40 @@ arm that silently ran at 60 while labelled 120 looks exactly like "120 Hz
 bought nothing". `~/nitro-bin/nitro-shot --modes` lists what the connector
 offers, which is also the answer to "what may I write here".
 
-> **And check the md5 of the binary you are measuring, every time.** This
-> cost a measurement during #3718: a retime experiment was run against
-> what was assumed to be the new build, produced a clean-looking result,
-> and was in fact main's server — the key was inert, nothing set had any
-> effect, and the numbers were a measurement of nothing. The log said
-> `unknown output key 'mode'` the whole time. The box is shared and
-> several tasks deploy to it in an evening; `md5sum` on both ends before
-> and after is the only thing that makes an A/B mean what it says.
+> **And check the md5 of the binary you are measuring, every time — at
+> the start of the run *and at the end*.** This has now cost two
+> measurements, in two different ways, and the second is why the rule has
+> a second half.
+>
+> #3718: a retime experiment was run against what was assumed to be the
+> new build, produced a clean-looking result, and was in fact main's
+> server — the key was inert, nothing set had any effect, and the numbers
+> were a measurement of nothing. The log said `unknown output key 'mode'`
+> the whole time.
+>
+> #3722: a 141-run benchmark sweep was measured against binaries **a
+> different task deployed six minutes after the sweep's own `rsync` and
+> six minutes before its first arm**. The pre-run md5 check passed —
+> it was taken before the other deploy landed. Everything else agreed
+> too: `outputs` reported the right mode at every arm, the client's own
+> `refresh_mhz` agreed with `outputs`, and the ledger's `sha` column
+> faithfully named the tree the *caller* had built from. Forty minutes of
+> numbers, nothing anywhere saying they were somebody else's build.
+>
+> So: **an md5 before a run answers "is this mine now". A long run has to
+> answer "was it mine *throughout*", and only a pair of fingerprints
+> answers that.** `deploy/bench.sh` now records both in the ledger and
+> fails with `# INVALID: the binaries changed DURING this run` if they
+> differ; a clean run carries `# binaries unchanged across the whole
+> run`. Anything else that holds the box for more than a few minutes
+> should do the same, because a `just deploy` from another branch does
+> not read the room and will not warn you.
+>
+> The related trap, same family: **do not take the sha from the box's
+> git clone.** `~/src/ai/nitro` is whatever `just box-push` last pushed
+> there, which on this box was seventeen commits behind the binaries in
+> `~/nitro-bin`. A provenance field has to be derived from the artefact
+> it describes, not from something that is usually the same.
 
 ### 240 Hz at 1080p is out of reach — but 720p@240 works
 

@@ -109,6 +109,18 @@ pub struct Record {
     pub host: String,
     /// Free text: `bar+launcher up`, `control: shell killed`.
     pub note: String,
+    /// Whether the window was opened fullscreen.
+    ///
+    /// Recorded, and not inferred from the geometry, because the rate
+    /// sweep compares arms at **different screen sizes**: a fullscreen
+    /// row is 1920x1080 at the 60 and 120 Hz arms and 1280x720 at the
+    /// 240 Hz one, so a pivot keyed on `(scenario, n, size)` puts them in
+    /// different rows and reports the comparison it exists to make as two
+    /// gaps. "The fullscreen arm" is the thing being compared across
+    /// rates; the size is what changed. An older ledger has no such key
+    /// and reads back `false`, which is why
+    /// [`Record::is_fullscreen`] falls back to the geometry.
+    pub fullscreen: bool,
 }
 
 /// The fallback frame budget, µs: one 60 Hz period.
@@ -358,6 +370,37 @@ impl Record {
         within && !self.dropped()
     }
 
+    /// Whether this row is the **control arm** — the one run per rate
+    /// taken with the shell clients killed.
+    ///
+    /// Read from the note, which `deploy/bench.sh` writes as
+    /// `control: shell clients killed; …`. A flag would be better and
+    /// the note is what exists in every ledger already, including the
+    /// two checked in; adding a field would leave the old ones
+    /// indistinguishable from their own baselines.
+    ///
+    /// It matters because the control is otherwise byte-for-byte the
+    /// same sweep point as the row it controls (`rects n=500`), so any
+    /// grouping that does not separate them lets one silently replace
+    /// the other.
+    #[must_use]
+    pub fn is_control(&self) -> bool {
+        self.note.starts_with("control:")
+    }
+
+    /// Whether this run's window covered the screen.
+    ///
+    /// The recorded flag when the ledger has one, and the geometry when
+    /// it does not: `docs/bench-72ef50b.jsonl` predates the key, and a
+    /// report that read every one of its fullscreen rows as windowed
+    /// would quietly re-pair the whole rate table. The fallback is
+    /// "bigger than the period-correct 640x480 in both axes", which is
+    /// exactly the distinction the old ledger's two sizes encode.
+    #[must_use]
+    pub fn is_fullscreen(&self) -> bool {
+        self.fullscreen || (self.width > 640 && self.height > 480)
+    }
+
     /// The row label a table uses for this run.
     ///
     /// The sweep point belongs in the label because a table of `rects`,
@@ -429,6 +472,7 @@ impl Record {
         push_string(&mut out, "sha", &self.sha);
         push_string(&mut out, "host", &self.host);
         push_string(&mut out, "note", &self.note);
+        push_bool(&mut out, "fullscreen", self.fullscreen);
         // Every `push_*` leaves a trailing comma; dropping it here beats
         // threading a "first field" flag through twenty-two calls.
         if out.ends_with(',') {
@@ -544,6 +588,13 @@ fn push_string(out: &mut String, key: &str, value: &str) {
 fn push_u64(out: &mut String, key: &str, value: u64) {
     push_key(out, key);
     out.push_str(&value.to_string());
+    out.push(',');
+}
+
+/// Append `"key":value,` for a flag.
+fn push_bool(out: &mut String, key: &str, value: bool) {
+    push_key(out, key);
+    out.push_str(if value { "true" } else { "false" });
     out.push(',');
 }
 
@@ -726,6 +777,7 @@ impl<'a> Parser<'a> {
             "sha" => record.sha = self.text()?,
             "host" => record.host = self.text()?,
             "note" => record.note = self.text()?,
+            "fullscreen" => record.fullscreen = self.boolean()?,
             _ => self.skip_value()?,
         }
         Ok(())
@@ -870,6 +922,19 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// A `true`/`false` literal.
+    ///
+    /// A number is accepted too — nonzero is true — because a ledger is
+    /// a text file other tools append to, and refusing `"fullscreen":1`
+    /// would lose a whole run over a spelling of the same fact.
+    fn boolean(&mut self) -> Result<bool, ParseError> {
+        match self.peek() {
+            Some(b't') => self.literal("true").map(|()| true),
+            Some(b'f') => self.literal("false").map(|()| false),
+            _ => Ok(self.unsigned()? != 0),
+        }
+    }
+
     /// An object whose values are all numbers: a `stats` snapshot.
     fn number_object(&mut self) -> Result<BTreeMap<String, u64>, ParseError> {
         let mut map = BTreeMap::new();
@@ -1005,6 +1070,7 @@ mod tests {
             sha: "deadbeef".to_owned(),
             host: "bench-box".to_owned(),
             note: "bar+launcher up".to_owned(),
+            fullscreen: true,
         }
     }
 
@@ -1331,5 +1397,40 @@ mod tests {
             ..Record::default()
         };
         assert_eq!(swept.label(), "starfield n=2000 1920x1080");
+    }
+
+    /// The flag is written and read back, and an older ledger that has
+    /// no such key still answers the question from its geometry.
+    ///
+    /// The fallback is load-bearing rather than tidy:
+    /// `docs/bench-72ef50b.jsonl` predates the key, and a report that
+    /// read every one of its fullscreen rows as windowed would file each
+    /// of them under a different rate key from its own 720p twin and
+    /// print the comparison as two columns of `?` — a wrong answer that
+    /// looks exactly like a gap in the sweep.
+    #[test]
+    fn fullscreen_round_trips_and_falls_back_to_the_geometry() {
+        let mut record = full();
+        record.fullscreen = false;
+        let line = record.to_json();
+        assert!(line.contains("\"fullscreen\":false"), "{line}");
+        assert_eq!(Record::from_json(&line).unwrap(), record);
+
+        // No key at all: a 1080p run reads as fullscreen, a VGA one does
+        // not, which is exactly what the old ledger's two sizes encode.
+        let old_fullscreen =
+            Record::from_json(r#"{"scenario":"plasma","width":1920,"height":1080}"#).unwrap();
+        assert!(!old_fullscreen.fullscreen);
+        assert!(old_fullscreen.is_fullscreen());
+        let old_vga =
+            Record::from_json(r#"{"scenario":"plasma","width":640,"height":480}"#).unwrap();
+        assert!(!old_vga.is_fullscreen());
+
+        // And a 720p fullscreen run — the 240 Hz arm's shape — reads as
+        // fullscreen from the geometry too, which is what lets it pair
+        // with a 1080p row from a ledger that never carried the flag.
+        let old_720p =
+            Record::from_json(r#"{"scenario":"plasma","width":1280,"height":720}"#).unwrap();
+        assert!(old_720p.is_fullscreen());
     }
 }

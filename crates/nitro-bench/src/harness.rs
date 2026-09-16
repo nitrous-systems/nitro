@@ -593,6 +593,7 @@ pub fn run_with(
         sha: cfg.sha.clone(),
         host: cfg.host.clone(),
         note: cfg.note.clone(),
+        fullscreen: cfg.fullscreen,
     })
 }
 

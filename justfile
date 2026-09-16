@@ -127,14 +127,23 @@ box-push:
 # ---------------------------------------------------------------------------
 
 # The whole throughput matrix on the box, written to ~/tmp/bench/<sha>.jsonl
-# there and fetched to tmp/bench/ here. `just bench "60 120"` sweeps the
-# refresh rate (needs #3718's `output.<c>.mode` key on the box's build).
+# there and fetched to tmp/bench/ here. `just bench "1920x1080@60
+# 1920x1080@120 720p240"` sweeps the refresh rate; a bare `60` still means
+# 1080p at that rate, and `720p240` is the CVT-RB modeline #3718 verified
+# on the panel.
 #
-# It restarts `nitro-dev` and, in the refresh sweep, writes a `mode` line
-# into the human's `server.conf` — backed up and restored by the script.
-# Announce in the `nitro-testbox` room before running it: the box is shared.
+# It restarts `nitro-dev` and, in the refresh sweep, writes a `mode` or
+# `modeline` line into the human's `server.conf` — backed up and restored
+# by the script. Announce in the `nitro-testbox` room before running it:
+# the box is shared, and the 720p arm changes what is on his screen.
+#
+# `NITRO_BENCH_SHA` is exported **from here**, not read from the box's
+# clone, because the clone is whatever `just box-push` last put there and
+# the binaries are whatever `just deploy` last built: a sweep stamped
+# with the clone's sha names a tree that did not build what it measured.
+# (#3722 lost a run to exactly that.)
 bench modes="" seconds="10":
-    ssh {{box}} 'bash -s' -- --seconds {{seconds}} {{ if modes == "" { "" } else { "--modes '" + modes + "'" } }} < deploy/bench.sh
+    ssh {{box}} 'NITRO_BENCH_SHA='"$(git rev-parse --short HEAD)"' bash -s' -- --seconds {{seconds}} {{ if modes == "" { "" } else { "--modes '" + modes + "'" } }} < deploy/bench.sh
     mkdir -p tmp/bench
     ssh {{box}} 'cat ~/tmp/bench/*.jsonl' > tmp/bench/box.jsonl
     @echo "wrote tmp/bench/box.jsonl"

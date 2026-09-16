@@ -33,6 +33,25 @@
 //! sweep point, are nowhere near each other. Putting them side by side
 //! in a table of their own is the difference between the data being
 //! present and the answer being visible.
+//!
+//! # Why the rate tables are per scenario, and the pivot is not
+//!
+//! Two shapes, two questions. [`refresh_pivot`] is the index: every
+//! sweep point measured at more than one rate, three cells each, in one
+//! table a reader skims for "what moved". [`rate_tables`] is the
+//! evidence: one table per scenario family, a column per rate, and the
+//! five figures §9 argues from — presented/s, server µs/frame, client
+//! µs/frame, `paint µs mean`, verdict.
+//!
+//! The per-scenario shape exists because the §9 questions are asked of a
+//! *scenario*, not of a matrix: "does the retained path keep per-frame
+//! cost flat across rates" is answered by reading `boing-node`'s three
+//! server-µs cells and finding them equal, and no arrangement that
+//! scatters those three cells across a forty-row table answers it. Each
+//! table also states its own frame budget per column — 16 667 / 8 335 /
+//! 4 167 µs — because every verdict in it is a comparison against that
+//! number and a reader should not have to hold three of them in their
+//! head.
 
 use crate::record::Record;
 use std::collections::BTreeMap;
@@ -94,9 +113,234 @@ pub fn markdown(records: &[Record]) -> String {
     for (scenario, group) in group_by_scenario(records) {
         out.push_str(&table(&scenario, &group));
     }
+    out.push_str(&rate_tables(records));
     let pivot = refresh_pivot(records);
     if !pivot.is_empty() {
         out.push_str(&pivot);
+    }
+    out
+}
+
+/// What identifies "the same measurement at a different refresh rate".
+///
+/// A named type rather than a bare tuple because it is the thing two
+/// tables and three bugs are about: scenario, sweep point, buffer edge
+/// (windowed runs only), fullscreen, control. See [`rate_key`], which
+/// builds one and documents why each field is or is not in it.
+type RateKey = (String, u64, u32, bool, bool);
+
+/// A rate key's runs, by rounded hertz.
+type ByRate<'a> = BTreeMap<u64, &'a Record>;
+
+/// The key a run is compared *across rates* by.
+///
+/// `(scenario, n, size, fullscreen, control)` — and deliberately **not**
+/// the geometry, with `size` dropped for a fullscreen run. Three
+/// decisions, each one a wrong table in the first version of this
+/// function, and each visible only against a real three-rate ledger:
+///
+/// * **Not the geometry.** The whole point of the 720p@240 arm is that
+///   its screen is a different size, so keying on width and height
+///   files `boing 1920x1080` and `boing 1280x720` as two unrelated rows
+///   and prints the comparison this table exists for as two columns of
+///   `?`.
+/// * **`size` only when the run is windowed.** At a fullscreen run
+///   `size` is not a sweep point at all, it is an *output*: the pixel
+///   scenarios record the screen's width (1920, 1920, **1280**) and
+///   `boing-node` records the ball's on-screen diameter (389 at 1080p,
+///   **260** at 720p). Keying on it therefore re-introduced the
+///   geometry through the back door and scattered every fullscreen row
+///   across three keys — the same empty table as above, arrived at by a
+///   field that does not have `width` in its name. A fullscreen arm is
+///   identified by *being fullscreen*; its size is what the rate sweep
+///   varies.
+/// * **The control arm is not the same run as the row it shadows.**
+///   `deploy/bench.sh` takes one `rects n=500` per rate with the shell
+///   clients killed, and it is otherwise identical to the measured
+///   `rects n=500`. Without this, "last run wins" silently replaced
+///   every rate's real row with its control — a table reporting the
+///   shell's absence as if it were the baseline, which is a *plausible*
+///   number in the right units and the worst kind of wrong.
+fn rate_key(record: &Record) -> RateKey {
+    let fullscreen = record.is_fullscreen();
+    (
+        record.scenario.clone(),
+        record.n,
+        if fullscreen { 0 } else { record.size },
+        fullscreen,
+        record.is_control(),
+    )
+}
+
+/// The rate at which a run is filed, in whole hertz.
+///
+/// Rounded, so 119 982 mHz and a true 120 000 share a column — the
+/// grouping a human means when they say "the 120 Hz arm", and the
+/// spelling `outputs` does not use.
+fn rate_of(record: &Record) -> u64 {
+    hz(u64::from(record.refresh_mhz))
+}
+
+/// One rate-comparison table per scenario family, or an empty string
+/// when nothing was measured at more than one rate.
+///
+/// The five columns per rate are the ones §9's questions are asked in:
+/// **presented/s** (did it hold the rate), **server** and **client
+/// µs/frame** (the headline pair — and the pair whose *flatness* across
+/// rates is the retained path's claim), **paint µs mean** (the server's
+/// own counter, which is where a bandwidth wall shows up as a rise that
+/// the CPU column blurs), and the **verdict**.
+///
+/// A scenario with runs at only one rate is skipped entirely rather than
+/// printed with two empty columns: a table of `?` is not evidence of
+/// anything, and the per-scenario table above already has the row.
+#[must_use]
+pub fn rate_tables(records: &[Record]) -> String {
+    let mut by_key: BTreeMap<RateKey, ByRate> = BTreeMap::new();
+    // First-appearance order for both the families and the rows inside
+    // them, for the reason `group_by_scenario` gives: the ledger's order
+    // is the order the sweep ran, and re-sorting by a measured column
+    // would let a noisy run reorder the table.
+    let mut order: Vec<RateKey> = Vec::new();
+    let mut families: Vec<String> = Vec::new();
+    for record in records {
+        let key = rate_key(record);
+        if !by_key.contains_key(&key) {
+            order.push(key.clone());
+        }
+        if !families.contains(&record.scenario) {
+            families.push(record.scenario.clone());
+        }
+        // Last run wins for a repeated (key, rate): a re-run is a
+        // correction, not a second opinion. The same rule the pivot uses.
+        by_key
+            .entry(key)
+            .or_default()
+            .insert(rate_of(record), record);
+    }
+
+    let mut out = String::new();
+    for family in families {
+        let rows: Vec<_> = order
+            .iter()
+            .filter(|key| key.0 == family)
+            .filter_map(|key| {
+                let rates = by_key.get(key)?;
+                (rates.len() >= 2).then_some(rates)
+            })
+            .collect();
+        if rows.is_empty() {
+            continue;
+        }
+        let mut rates: Vec<u64> = rows
+            .iter()
+            .flat_map(|rates| rates.keys().copied())
+            .collect();
+        rates.sort_unstable();
+        rates.dedup();
+
+        let _ = write!(out, "#### {family} across rates\n\n");
+        // The budget line, once per table. Every verdict below is a
+        // comparison against it, and a reader who has to divide 1e6 by a
+        // rate in their head to check one will not check one.
+        let budgets: Vec<String> = rows
+            .first()
+            .map(|rates| {
+                rates
+                    .values()
+                    .map(|r| format!("{:.0} Hz = {:.0} µs", r.refresh_hz(), r.frame_budget_us()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !budgets.is_empty() {
+            let _ = write!(out, "Frame budget: {}.\n\n", budgets.join(", "));
+        }
+        out.push_str("| run |");
+        for rate in &rates {
+            let _ = write!(
+                out,
+                " {rate} presented/s | {rate} server µs | {rate} client µs | {rate} paint µs | {rate} verdict |"
+            );
+        }
+        out.push('\n');
+        out.push_str("|---|");
+        for _ in &rates {
+            out.push_str("---|---|---|---|---|");
+        }
+        out.push('\n');
+        for by_rate in rows {
+            // The label comes from the run itself, and at the 240 Hz arm
+            // a fullscreen run's label says `1280x720` while its 60 Hz
+            // twin says `1920x1080`. Taking the *first* rate's label
+            // would print one size over a row of three; the label is
+            // therefore stripped of geometry and the geometry stated per
+            // cell would be four more columns. Instead the row is named
+            // by scenario and sweep point, and §9 states the sizes once.
+            let label = by_rate
+                .values()
+                .next()
+                .map_or_else(String::new, |r| rate_row_label(r));
+            let _ = write!(out, "| {label} |");
+            for rate in &rates {
+                match by_rate.get(rate) {
+                    Some(record) => {
+                        let _ = write!(
+                            out,
+                            " {:.1} | {:.1} | {:.1} | {} | {} |",
+                            record.presented_per_s(),
+                            record.server_cpu_us_per_frame(),
+                            record.client_cpu_us_per_frame(),
+                            stat_cell(record, "paint_us_mean", 1),
+                            verdict(record)
+                        );
+                    }
+                    // A cell with no run is a gap in the sweep, and
+                    // saying so beats leaving the reader to infer it.
+                    None => {
+                        let _ = write!(
+                            out,
+                            " {MISSING} | {MISSING} | {MISSING} | {MISSING} | {MISSING} |"
+                        );
+                    }
+                }
+            }
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// The row label inside a rate table: scenario, sweep point, whether
+/// the window covered the screen, and whether it is the control — but
+/// never a size.
+///
+/// [`Record::label`] puts the geometry in, which is right everywhere
+/// else and wrong here: a rate row spans arms whose screens are
+/// *different sizes* (1920x1080 at 60 and 120, 1280x720 at 240), so one
+/// arm's geometry printed over all three would be a false label on two
+/// thirds of the row. `fullscreen` is the honest name for what is held
+/// constant.
+///
+/// The `control` suffix matters for the same reason the key carries it:
+/// two `rects n=500 640x480` rows in one table, identical but for the
+/// shell being up, are indistinguishable without it — and a reader who
+/// cannot tell which is which will read the control as the baseline.
+fn rate_row_label(record: &Record) -> String {
+    let mut out = record.scenario.clone();
+    if record.n != 0 {
+        let _ = write!(out, " n={}", record.n);
+    }
+    if record.is_fullscreen() {
+        out.push_str(" fullscreen");
+    } else {
+        if record.size != 0 {
+            let _ = write!(out, " size={}", record.size);
+        }
+        out.push_str(" 640x480");
+    }
+    if record.is_control() {
+        out.push_str(" (control: shell down)");
     }
     out
 }
@@ -134,27 +378,27 @@ pub fn table(title: &str, records: &[Record]) -> String {
     out
 }
 
-/// The 60 Hz / 120 Hz comparison, or an empty string when no
-/// `(scenario, n, size)` was run at two refresh rates.
+/// The rate comparison as one index table, or an empty string when no
+/// sweep point was run at two refresh rates.
 ///
 /// Only the three columns that answer the question are carried over:
 /// server cost per frame, the rate achieved, and the verdict. Everything
-/// else is already in the scenario table above, and a wide pivot would
-/// hide the one comparison it exists to make.
+/// else is already in the scenario tables above and in [`rate_tables`],
+/// and a wide pivot would hide the one comparison it exists to make.
 ///
 /// Rates are named by their rounded hertz rather than by millihertz, so
-/// the columns read `60 Hz` and `120 Hz`; a mode that is really 59.94
-/// therefore shares a column with a true 60, which is the grouping a
-/// human means.
+/// the columns read `60 Hz`, `120 Hz` and `240 Hz`; a mode that is really
+/// 119.982 therefore shares a column with a true 120, which is the
+/// grouping a human means.
 #[must_use]
 pub fn refresh_pivot(records: &[Record]) -> String {
     // `BTreeMap` keyed by the sweep point, then by rate: deterministic
     // order without sorting floats, and the rate order falls out
     // ascending, which is the direction the question is asked in.
-    let mut by_key: BTreeMap<(String, u64, u32), BTreeMap<u64, &Record>> = BTreeMap::new();
+    let mut by_key: BTreeMap<RateKey, ByRate> = BTreeMap::new();
     let mut seen = Vec::new();
     for record in records {
-        let key = (record.scenario.clone(), record.n, record.size);
+        let key = rate_key(record);
         if !by_key.contains_key(&key) {
             seen.push(key.clone());
         }
@@ -163,7 +407,7 @@ pub fn refresh_pivot(records: &[Record]) -> String {
         by_key
             .entry(key)
             .or_default()
-            .insert(u64::from(record.refresh_mhz), record);
+            .insert(rate_of(record), record);
     }
     let pivots: Vec<_> = seen
         .into_iter()
@@ -187,10 +431,7 @@ pub fn refresh_pivot(records: &[Record]) -> String {
     for rate in &rates {
         let _ = write!(
             out,
-            " {} Hz server µs/frame | {} Hz presented/s | {} Hz verdict |",
-            hz(*rate),
-            hz(*rate),
-            hz(*rate)
+            " {rate} Hz server µs/frame | {rate} Hz presented/s | {rate} Hz verdict |"
         );
     }
     out.push('\n');
@@ -199,11 +440,11 @@ pub fn refresh_pivot(records: &[Record]) -> String {
         out.push_str("---|---|---|");
     }
     out.push('\n');
-    for ((scenario, n, size), by_rate) in pivots {
-        let label = by_rate
-            .values()
-            .next()
-            .map_or_else(|| format!("{scenario} n={n} size={size}"), |r| r.label());
+    for ((scenario, n, size, _, _), by_rate) in pivots {
+        let label = by_rate.values().next().map_or_else(
+            || format!("{scenario} n={n} size={size}"),
+            |r| rate_row_label(r),
+        );
         let _ = write!(out, "| {label} |");
         for rate in &rates {
             match by_rate.get(rate) {
@@ -435,6 +676,189 @@ mod tests {
         assert!(pivot.contains("144 Hz"), "{pivot}");
         let rects = pivot.lines().find(|l| l.starts_with("| rects")).unwrap();
         assert!(rects.contains("| ? | ? | ? |"), "{rects}");
+    }
+
+    /// The 240 Hz arm runs at 1280×720 while the 60 and 120 Hz arms run
+    /// at 1920×1080, so a comparison keyed on the geometry would file
+    /// the same scenario as three unrelated rows and print the answer as
+    /// gaps.
+    ///
+    /// This is the property the whole rate table turns on, and it is the
+    /// one a size-keyed version got confidently wrong: three full
+    /// columns of data, no row with more than one of them, and a table
+    /// that reads as "nothing was measured twice".
+    #[test]
+    fn a_fullscreen_row_pairs_across_rates_despite_a_different_screen() {
+        let sixty = healthy("boing", 0);
+        let mut onetwenty = healthy("boing", 0);
+        onetwenty.refresh_mhz = 120_000;
+        let mut twoforty = healthy("boing", 0);
+        twoforty.refresh_mhz = 240_000;
+        twoforty.width = 1_280;
+        twoforty.height = 720;
+        let records = [sixty, onetwenty, twoforty];
+
+        let tables = rate_tables(&records);
+        assert!(tables.contains("#### boing across rates"), "{tables}");
+        let row = tables
+            .lines()
+            .find(|l| l.starts_with("| boing"))
+            .unwrap_or_default();
+        assert!(
+            !row.contains(MISSING),
+            "all three rates land in one row: {row}"
+        );
+        assert_eq!(
+            tables.lines().filter(|l| l.starts_with("| boing")).count(),
+            1,
+            "{tables}"
+        );
+        // The label names what is held constant, never one arm's size:
+        // `1920x1080` over a row two thirds of which is 1280x720 would
+        // be a false label rather than a missing one.
+        assert!(row.contains("| boing fullscreen |"), "{row}");
+        assert!(
+            !row.contains("1920x1080") && !row.contains("1280x720"),
+            "{row}"
+        );
+
+        // And the pivot pairs them on the same key.
+        let pivot = refresh_pivot(&records);
+        let pivot_row = pivot.lines().find(|l| l.starts_with("| boing")).unwrap();
+        assert!(!pivot_row.contains(MISSING), "{pivot_row}");
+    }
+
+    /// A fullscreen arm and a 640×480 arm of the same scenario are two
+    /// different measurements and must not collapse into one row — the
+    /// other half of the key, and the failure a purely
+    /// `(scenario, n)` key would introduce while fixing the first one.
+    #[test]
+    fn the_vga_arm_and_the_fullscreen_arm_stay_separate_rows() {
+        let mut vga = healthy("starfield", 500);
+        vga.width = 640;
+        vga.height = 480;
+        let mut vga_fast = vga.clone();
+        vga_fast.refresh_mhz = 120_000;
+        let full = healthy("starfield", 500);
+        let mut full_fast = full.clone();
+        full_fast.refresh_mhz = 120_000;
+
+        let tables = rate_tables(&[vga, vga_fast, full, full_fast]);
+        let rows: Vec<&str> = tables
+            .lines()
+            .filter(|l| l.starts_with("| starfield"))
+            .collect();
+        assert_eq!(rows.len(), 2, "{tables}");
+        assert!(rows.iter().any(|r| r.contains("640x480")), "{tables}");
+        assert!(rows.iter().any(|r| r.contains("fullscreen")), "{tables}");
+    }
+
+    /// Each rate table states the budget its verdicts were drawn
+    /// against, and a scenario measured at one rate only is skipped
+    /// rather than printed as a row of `?`.
+    #[test]
+    fn a_rate_table_names_its_budgets_and_skips_the_unpaired() {
+        let sixty = healthy("rects", 10);
+        let mut fast = healthy("rects", 10);
+        fast.refresh_mhz = 120_000;
+        let lonely = healthy("plasma", 0);
+
+        let tables = rate_tables(&[sixty, fast, lonely]);
+        assert!(tables.contains("60 Hz = 16667 µs"), "{tables}");
+        assert!(tables.contains("120 Hz = 8333 µs"), "{tables}");
+        assert!(
+            !tables.contains("#### plasma"),
+            "one rate is not a comparison: {tables}"
+        );
+
+        // Nothing paired at all is an empty string, not an empty table.
+        assert!(rate_tables(&[healthy("rects", 10)]).is_empty());
+    }
+
+    /// The 240 Hz column's budget is 4 167 µs, which is the number §9
+    /// judges every 720p row against.
+    #[test]
+    fn the_240_hz_budget_is_the_one_the_document_quotes() {
+        let sixty = healthy("fire", 0);
+        let mut fast = healthy("fire", 0);
+        fast.refresh_mhz = 239_840;
+        let tables = rate_tables(&[sixty, fast]);
+        assert!(tables.contains("240 Hz = 4169 µs"), "{tables}");
+        // 239.840 Hz is filed under the 240 Hz column, because that is
+        // the mode a human names — and the rate no connector offers.
+        assert!(tables.contains("240 presented/s"), "{tables}");
+    }
+
+    /// A fullscreen run's `size` is an **output**, not a sweep point,
+    /// and it differs per rate arm — so the key must ignore it.
+    ///
+    /// Measured values from the real ledger: the pixel scenarios record
+    /// the screen width (1920 at 60 and 120, 1280 at 240) and
+    /// `boing-node` records the ball's on-screen diameter (389 against
+    /// 260). Keying on `size` re-introduced the geometry through a field
+    /// that does not have `width` in its name, and scattered every
+    /// fullscreen row across three keys — an all-`?` table that looks
+    /// exactly like "the 240 Hz arm never ran".
+    #[test]
+    fn a_fullscreen_runs_size_is_an_output_and_does_not_split_the_row() {
+        let mut sixty = healthy("boing-node", 0);
+        sixty.fullscreen = true;
+        sixty.size = 389;
+        let mut fast = sixty.clone();
+        fast.refresh_mhz = 239_840;
+        fast.width = 1_280;
+        fast.height = 720;
+        fast.size = 260;
+
+        let tables = rate_tables(&[sixty, fast]);
+        let rows: Vec<&str> = tables
+            .lines()
+            .filter(|l| l.starts_with("| boing-node"))
+            .collect();
+        assert_eq!(rows.len(), 1, "{tables}");
+        assert!(!rows[0].contains(MISSING), "{}", rows[0]);
+        // And neither arm's `size` is printed, because neither is true
+        // of the other two thirds of the row.
+        assert!(
+            !rows[0].contains("389") && !rows[0].contains("260"),
+            "{}",
+            rows[0]
+        );
+    }
+
+    /// The control arm — one `rects n=500` per rate with the shell
+    /// clients killed — is otherwise identical to the measured row, so
+    /// "last run wins" silently replaced every rate's real row with its
+    /// control.
+    ///
+    /// That is the worst shape of wrong: a plausible number, in the
+    /// right units, in the right cell, reporting the shell's *absence*
+    /// as the baseline that every other row was taken with it present.
+    #[test]
+    fn the_control_arm_does_not_overwrite_the_row_it_controls() {
+        let sixty = healthy("rects", 500);
+        let mut fast = healthy("rects", 500);
+        fast.refresh_mhz = 120_000;
+        let mut control = healthy("rects", 500);
+        control.note = "control: shell clients killed; 4 procs".to_owned();
+        control.server_cpu_us = sixty.server_cpu_us / 2;
+        let mut control_fast = control.clone();
+        control_fast.refresh_mhz = 120_000;
+
+        let tables = rate_tables(&[sixty, fast, control, control_fast]);
+        let rows: Vec<&str> = tables
+            .lines()
+            .filter(|l| l.starts_with("| rects"))
+            .collect();
+        assert_eq!(rows.len(), 2, "the control is its own row: {tables}");
+        assert!(
+            rows.iter().filter(|r| r.contains("(control:")).count() == 1,
+            "{tables}"
+        );
+        // The measured row keeps its own cost, rather than inheriting
+        // the control's cheaper one.
+        let measured = rows.iter().find(|r| !r.contains("(control:")).unwrap();
+        assert!(measured.contains("2000.0"), "{measured}");
     }
 
     #[test]
