@@ -231,13 +231,85 @@ pub struct Label {
     /// measuring wrapped and painting unwrapped would reserve two lines
     /// and draw one overflowing line.
     wrap_width: f32,
+    /// Whether a string too wide for the box is shortened with an
+    /// ellipsis instead of overflowing it. See [`LabelBuilder::elide`].
+    elide: bool,
+    /// What an eliding label actually paints: the longest prefix of
+    /// `text` that fits, plus `…`. Empty for a label that is not
+    /// eliding, or whose text fits whole.
+    ///
+    /// Recomputed only when the width it was computed for changes, which
+    /// is what keeps a repaint at a settled width free of `MeasureText`
+    /// round trips — the work is proportional to the change, not to the
+    /// number of paints.
+    elided: Option<String>,
+    /// The width `elided` was computed for. `f32::NAN` when nothing has
+    /// been computed, so the first comparison always misses.
+    elided_at: f32,
+    /// How many elision searches this label has run.
+    ///
+    /// Observable ([`Label::elisions`]) because the memo it counts is not
+    /// observable any other way: the toolkit caches measurements by
+    /// `(text, style, max_width)`, so a search re-run at an unchanged
+    /// width answers out of that cache and costs no wire traffic and no
+    /// server-side layout pass. A `text_layouts` census would therefore
+    /// pass whether or not the memo existed — which is exactly what it
+    /// did when the memo was disabled to check. Counting the searches is
+    /// the honest pin.
+    elisions: u64,
 }
 
+/// What an elided label ends with.
+const ELLIPSIS: &str = "\u{2026}";
+
+/// How many characters of the original survive at an eliding label's
+/// narrowest.
+///
+/// The floor an eliding label reports is `…` plus this many characters,
+/// and the number is a judgement rather than a measurement: fewer than
+/// three and the remnant names nothing (`H…` could be any connector),
+/// many more and a crowded row is back to overflowing because the label
+/// would not give the space up. Three is what distinguishes `HDM…` from
+/// `VGA…`, which is the question a user asks of a truncated label.
+const ELIDE_FLOOR_CHARS: usize = 3;
+
 impl Label {
-    /// The current text.
+    /// The current text — the whole string, whatever is on screen.
+    ///
+    /// An elided label paints a prefix; this still answers the full text,
+    /// because that is what the label *is* and what an accessibility
+    /// client must read. [`Label::painted_text`] is the other question.
     #[must_use]
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    /// What is actually on screen: the elided prefix when the label is
+    /// eliding and does not fit, else the whole text.
+    #[must_use]
+    pub fn painted_text(&self) -> &str {
+        self.elided.as_deref().unwrap_or(&self.text)
+    }
+
+    /// Whether this label shortens a string too wide for its box.
+    #[must_use]
+    pub fn is_eliding(&self) -> bool {
+        self.elide
+    }
+
+    /// Whether the text on screen right now is a shortened one.
+    #[must_use]
+    pub fn is_elided(&self) -> bool {
+        self.elided.is_some()
+    }
+
+    /// How many elision searches this label has run since it was built.
+    ///
+    /// The observable half of "work ∝ change": a label that re-elided on
+    /// every paint would move this on every paint. See the field.
+    #[must_use]
+    pub fn elisions(&self) -> u64 {
+        self.elisions
     }
 
     /// The explicit text style, if one was set.
@@ -263,6 +335,116 @@ impl Label {
             .clone()
             .unwrap_or_else(|| TextStyle::from_theme(theme))
     }
+
+    /// Forget any elision, so the next `measure` recomputes it.
+    ///
+    /// Called whenever the input to the search changed — the string, the
+    /// style — rather than on every paint, which is the whole point:
+    /// re-eliding at an unchanged width would put a `MeasureText` round
+    /// trip (`log(len)` of them) into a repaint that has nothing new to
+    /// say.
+    fn invalidate_elision(&mut self) {
+        self.elided = None;
+        self.elided_at = f32::NAN;
+    }
+
+    /// Re-run the elision search if `width` is not what it was last run
+    /// at, and answer the metrics of whatever will be painted.
+    ///
+    /// The search is the server's own (`Text::elide` in `nitro-server`,
+    /// which is what elides a title bar): a binary search over char
+    /// boundaries for the longest prefix whose text plus `…` still fits,
+    /// costing `log(len)` measurements rather than one per prefix. It
+    /// runs in the client only because the client is where the layout
+    /// happens; the measuring is the server's, over the wire and through
+    /// the measurement cache, so a repeated search on a settled string
+    /// costs no round trips either.
+    fn reelide<S: 'static>(
+        &mut self,
+        cx: &mut MeasureCx<'_, S>,
+        style: &TextStyle,
+        width: f32,
+    ) -> crate::wire::TextMetrics {
+        if self.elided_at.to_bits() == width.to_bits() {
+            let text = self.elided.clone().unwrap_or_else(|| self.text.clone());
+            return cx.measure_text(&text, style, 0.0).unwrap_or_default();
+        }
+        self.elided_at = width;
+        self.elisions += 1;
+        let whole = cx.measure_text(&self.text, style, 0.0).unwrap_or_default();
+        if whole.width <= width || self.text.is_empty() {
+            self.elided = None;
+            return whole;
+        }
+        let prefix = elide_to(cx, style, &self.text, width);
+        let metrics = cx.measure_text(&prefix, style, 0.0).unwrap_or_default();
+        self.elided = Some(prefix);
+        metrics
+    }
+
+    /// The narrowest an eliding label is willing to be: `…` plus the
+    /// first [`ELIDE_FLOOR_CHARS`] characters of its text.
+    fn elide_floor<S: 'static>(&self, cx: &mut MeasureCx<'_, S>, style: &TextStyle) -> Size {
+        let end = self
+            .text
+            .char_indices()
+            .nth(ELIDE_FLOOR_CHARS)
+            .map_or(self.text.len(), |(i, _)| i);
+        let remnant = if end == self.text.len() {
+            self.text.clone()
+        } else {
+            format!("{}{ELLIPSIS}", &self.text[..end])
+        };
+        cx.measure_text(&remnant, style, 0.0)
+            .unwrap_or_default()
+            .size()
+    }
+}
+
+/// The longest prefix of `text` that, with `…` after it, fits in `width`.
+///
+/// A free function rather than a method because it is the toolkit's
+/// answer to a question about a string, not about a label: a binary
+/// search over char boundaries, so no candidate ever splits a code
+/// point, and `log(len)` measurements rather than one per prefix.
+/// `nitro-server`'s `Text::elide` is the same search over the server's
+/// own font state, and the two agree on the result by construction —
+/// they ask the same shaper the same questions.
+fn elide_to<S: 'static>(
+    cx: &mut MeasureCx<'_, S>,
+    style: &TextStyle,
+    text: &str,
+    width: f32,
+) -> String {
+    if width <= 0.0 {
+        return ELLIPSIS.to_owned();
+    }
+    let bounds: Vec<usize> = text
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(text.len()))
+        .collect();
+    // `lo` always fits (the empty prefix does, or nothing can) and `hi`
+    // never does.
+    let (mut lo, mut hi) = (0usize, bounds.len() - 1);
+    while lo + 1 < hi {
+        let mid = lo + (hi - lo) / 2;
+        let candidate = format!("{}{ELLIPSIS}", &text[..bounds[mid]]);
+        let fits = cx
+            .measure_text(&candidate, style, 0.0)
+            .unwrap_or_default()
+            .width
+            <= width;
+        if fits {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    // Not even one character plus an ellipsis fits. An ellipsis alone is
+    // still more honest than half a glyph: it says "there is text here
+    // and you cannot see it", which a clipped `H` does not.
+    format!("{}{ELLIPSIS}", &text[..bounds[lo]])
 }
 
 impl<S: 'static> Widget<S> for Label {
@@ -276,6 +458,28 @@ impl<S: 'static> Widget<S> for Label {
         } else {
             0.0
         };
+        if self.elide {
+            // An eliding label never wraps: it is one line that gets
+            // shorter, and asking the server to wrap it as well would
+            // reserve two lines for a string this widget has already
+            // promised to fit on one.
+            self.wrap_width = 0.0;
+            if constraints.max.w.is_finite() {
+                self.metrics = self.reelide(cx, &style, constraints.max.w);
+                // The floor is reported from here rather than left to a
+                // `min_width`, because only this widget can compute it:
+                // it depends on the server's fonts and on the string.
+                let floor = self.elide_floor(cx, &style);
+                cx.report_floor(floor);
+            } else {
+                // "As wide as you like" is the intrinsic measurement, and
+                // the intrinsic size of an eliding label is its whole
+                // text: eliding is what it does when it is given *less*.
+                self.invalidate_elision();
+                self.metrics = cx.measure_text(&self.text, &style, 0.0).unwrap_or_default();
+            }
+            return constraints.constrain(self.metrics.size());
+        }
         self.wrap_width = max;
         self.metrics = cx.measure_text(&self.text, &style, max).unwrap_or_default();
         constraints.constrain(self.metrics.size())
@@ -292,7 +496,8 @@ impl<S: 'static> Widget<S> for Label {
         let run = TextRun::new(&style, color)
             .align(self.align)
             .wrap_at(self.wrap_width);
-        cx.text(0, bounds, &self.text.clone(), run);
+        let text = self.painted_text().to_owned();
+        cx.text(0, bounds, &text, run);
     }
 
     fn role(&self) -> Role {
@@ -300,6 +505,10 @@ impl<S: 'static> Widget<S> for Label {
     }
 
     fn accessible(&self) -> Access {
+        // The **whole** text, even when a prefix is what is on screen: an
+        // accessibility client reads the label, and a screen reader that
+        // announced "HDMI-A-1 1920×1080 @ 119…" would be reporting the
+        // width of a box rather than the content of a label.
         Access {
             name: Some(self.text.clone()),
             value: Some(self.text.clone()),
@@ -311,6 +520,7 @@ impl<S: 'static> Widget<S> for Label {
         match action {
             "set_text" | "set_value" => {
                 arg.unwrap_or_default().clone_into(&mut self.text);
+                self.invalidate_elision();
                 cx.request_layout();
                 Handled::Yes
             }
@@ -329,12 +539,24 @@ impl<S: 'static> WidgetMut<'_, Label, S> {
             return;
         }
         self.text = text;
+        self.invalidate_elision();
         self.request_layout();
     }
 
     /// Replace the text style.
     pub fn set_text_style(&mut self, style: TextStyle) {
         self.style = Some(style);
+        self.invalidate_elision();
+        self.request_layout();
+    }
+
+    /// Turn elision on or off; see [`LabelBuilder::elide`].
+    pub fn set_elide(&mut self, on: bool) {
+        if self.elide == on {
+            return;
+        }
+        self.elide = on;
+        self.invalidate_elision();
         self.request_layout();
     }
 
@@ -433,6 +655,37 @@ impl<S: 'static> LabelBuilder<S> {
         self.label.align = align;
         self
     }
+
+    /// Shorten the text with `…` when the box is narrower than the
+    /// string, instead of overflowing it.
+    ///
+    /// A label is the widget with no smaller honest version of itself,
+    /// which is why the toolkit's default floor is its measured size
+    /// (`docs/ui.md`) — a row of full-width labels overflows rather than
+    /// squashing them. This is the opt-in for the label that *does* have
+    /// one: it drops characters from the end and says so with an
+    /// ellipsis, which is a smaller honest version.
+    ///
+    /// An eliding label takes part in shrink like a
+    /// [`shrink_to_zero`](crate::build::StyleBuilder::shrink_to_zero)
+    /// widget, but with a floor of its own: `…` plus its first three
+    /// characters, reported from `measure` because only the label can
+    /// compute it. So a crowded row narrows it instead of running past
+    /// the window, and what survives is the front of the string — the
+    /// part that names the thing.
+    ///
+    /// It also never wraps: an eliding label is one line by definition,
+    /// and the two policies contradict each other (a wrapped label gets
+    /// *taller* when it is given less width, which is the opposite of
+    /// what a row needs). Use one or the other.
+    ///
+    /// The search runs only when the width it was last run at changes,
+    /// so a repaint at a settled width costs no measurements.
+    #[must_use]
+    pub fn elide(mut self, on: bool) -> Self {
+        self.label.elide = on;
+        self
+    }
 }
 
 impl<S: 'static> StyleBuilder<S> for LabelBuilder<S> {
@@ -447,6 +700,15 @@ impl<S: 'static> IntoWidget<S> for LabelBuilder<S> {
         // so), but deliberately not its addressing name: a path built
         // out of a sentence would change every time the sentence did.
         // `.name("message")` is how a label gets a stable path.
+        //
+        // An eliding label opts out of the content floor here rather
+        // than at every call site: it has said it is honestly smaller
+        // than its text, and the floor it *does* have is the one it
+        // reports from `measure`. A caller who wants a wider one still
+        // writes `min_width`, which wins as it always did.
+        if self.label.elide {
+            self.built.state.style.shrink_floor = crate::layout::ShrinkFloor::Zero;
+        }
         self.built.replace_widget(self.label);
         self.built
     }
@@ -463,6 +725,10 @@ pub fn label<S: 'static>(text: impl Into<String>) -> LabelBuilder<S> {
         align: Align::Left,
         metrics: crate::wire::TextMetrics::default(),
         wrap_width: 0.0,
+        elide: false,
+        elided: None,
+        elided_at: f32::NAN,
+        elisions: 0,
     };
     LabelBuilder {
         built: Built::new(Flex),
@@ -1435,7 +1701,8 @@ fn measure_container<S: 'static>(cx: &mut MeasureCx<'_, S>, constraints: Constra
         let cstyle = cx.ui.style(c);
         let avail = inner.deflate(cstyle.margin);
         let basis = cx.measure_child(c, avail);
-        items.push(crate::layout::FlexItem::new(cstyle, basis));
+        let floor = cx.ui.reported_floor(c);
+        items.push(crate::layout::FlexItem::new(cstyle, basis).with_floor(floor));
     }
     let main = crate::layout::intrinsic_main(&style, &items);
     let cross = crate::layout::intrinsic_cross(&style, &items);

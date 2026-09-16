@@ -1037,10 +1037,16 @@ fn no_widget_is_laid_out_smaller_than_it_measures() {
     // getting — an explicit length is folded into the constraints a child
     // is *measured* with, and the solver then shrinks it anyway. Under the
     // old constants every one of these came out at 17.5.
+    //
+    // A display row contributes **two** of them since #3725: it is a
+    // column of a `top` and a `bottom` line, not one row (see `add_row`).
+    // The row's own container is therefore not in this list — it is
+    // 2 × ROW_HEIGHT + GAP tall, which is checked below.
     let rows: Vec<(String, nitro_ui::Rect)> = tree(&mut h)
         .into_iter()
         .filter(|(p, _)| {
-            p == &format!("window/displays/{CONNECTOR}")
+            p == &format!("window/displays/{CONNECTOR}/top")
+                || p == &format!("window/displays/{CONNECTOR}/bottom")
                 || p == "window/keyboard/container[0]"
                 || p == "window/keyboard/container[1]"
                 || p == "window/audio"
@@ -1048,7 +1054,7 @@ fn no_widget_is_laid_out_smaller_than_it_measures() {
                 || p == "window/buttons"
         })
         .collect();
-    assert_eq!(rows.len(), 6, "found every control row: {rows:?}");
+    assert_eq!(rows.len(), 7, "found every control row: {rows:?}");
     for (path, b) in &rows {
         assert!(
             (b.h - nitro_settings::ROW_HEIGHT).abs() < 0.01,
@@ -1157,6 +1163,38 @@ fn no_widget_is_laid_out_smaller_than_it_measures() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Assert that no widget in the tree has any part of itself outside the
+/// window, on either axis.
+///
+/// Factored out because #3725 needs it three times: the tree the dialog
+/// opens with, the tree a second monitor grows, and the tree a 60-char
+/// mode string produces. A check that ran only on the first would have
+/// passed throughout the bug it exists for — the row that spilled onto
+/// the desktop did so because of a *string*, not because of a monitor.
+#[track_caller]
+fn check_nothing_overhangs(h: &mut Harness<Settings>, what: &str) {
+    let size = h.ui().window_size();
+    for (path, b) in tree(h) {
+        // The buttons row's spacer is a zero-size strut placed at the far
+        // edge: no area, no ink, nothing to clip.
+        if b.w <= 0.0 || b.h <= 0.0 {
+            continue;
+        }
+        assert!(
+            b.x + b.w <= size.w + 0.01,
+            "with {what}, {path} ends at x={} in a {}-wide window",
+            b.x + b.w,
+            size.w,
+        );
+        assert!(
+            b.y + b.h <= size.h + 0.01,
+            "with {what}, {path} ends at y={} in a {}-tall window",
+            b.y + b.h,
+            size.h,
+        );
+    }
+}
+
 #[test]
 fn nothing_in_the_tree_overhangs_the_window() {
     // The other face of the same bug, and the one that needs its own test
@@ -1172,26 +1210,7 @@ fn nothing_in_the_tree_overhangs_the_window() {
     let dir = scratch("layout-overhang");
     let mut h = layout_harness(&dir);
     let size = h.ui().window_size();
-
-    for (path, b) in tree(&mut h) {
-        // The buttons row's spacer is a zero-size strut placed at the far
-        // edge: no area, no ink, nothing to clip.
-        if b.w <= 0.0 || b.h <= 0.0 {
-            continue;
-        }
-        assert!(
-            b.x + b.w <= size.w + 0.01,
-            "{path} ends at x={} in a {}-wide window",
-            b.x + b.w,
-            size.w,
-        );
-        assert!(
-            b.y + b.h <= size.h + 0.01,
-            "{path} ends at y={} in a {}-tall window",
-            b.y + b.h,
-            size.h,
-        );
-    }
+    check_nothing_overhangs(&mut h, "one output");
 
     // And the root's last child — the buttons row — ends inside the
     // padding rather than merely inside the window. Apply sitting on the
@@ -1205,6 +1224,88 @@ fn nothing_in_the_tree_overhangs_the_window() {
         "the buttons row ends at {} and the window's content stops at {}",
         buttons.y + buttons.h,
         size.h - nitro_settings::PAD,
+    );
+
+    h.quit();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn nothing_overhangs_with_two_outputs_or_with_a_long_mode_string() {
+    // The pin for #3725 itself, and it takes three cases because the bug
+    // was not about the number of monitors.
+    //
+    // What the human saw on the box was one output and a *long string*:
+    // #3718 appended the connector's alternative rates to the mode label
+    // (`1920×1080 @ 119.98 Hz (also 60, 84.904, 59.94, 50, 24, 23.976)`,
+    // 62 characters), the toolkit's content floor meant the label could
+    // not shrink below it, and the row grew from ~530 px to ~700 in a
+    // 560-px window — so the slider, the scale value, the checkbox and
+    // both position fields were painted outside the frame, on the
+    // desktop. Every bounds check in this file passed throughout: they
+    // ran on the harness's own short mode string.
+    //
+    // The cases, then: two outputs; a sixty-character mode string; and a
+    // mode string long enough that no amount of give elsewhere in the row
+    // can absorb it. The last one is what proves the label itself is the
+    // backstop — sixty characters, it turns out, the *slider* still
+    // absorbs (it has 12 px of travel above its 64 px minimum), which is
+    // the row degrading exactly as it should and therefore not a test of
+    // the elision at all.
+    //
+    // Strings are set through the same `set_text` action `hey` drives,
+    // so this is a scripted change going down the real path.
+    let dir = scratch("layout-overhang-cases");
+    let mut h = layout_harness(&dir);
+
+    h.server().request_line("plug 2560x1440\n");
+    h.wait_for("the second display row", |h| {
+        h.state().connectors().len() > 1
+    });
+    h.settle();
+    check_nothing_overhangs(&mut h, "two outputs");
+
+    // 60 characters: what #3718's line comes to on the box's connector.
+    let sixty = "1920x1080 @ 119.98 Hz (also 60, 84.904, 59.94, 50, 24, 23.9)";
+    assert_eq!(sixty.len(), 60, "sixty characters, as the spec asks");
+    for connector in h.state().connectors() {
+        set_value(&mut h, &format!("displays/{connector}/mode"), sixty);
+    }
+    h.settle();
+    check_nothing_overhangs(&mut h, "a 60-character mode string");
+
+    // And a string nothing else in the row can pay for. The row's only
+    // other give is the slider's 12 px above its minimum, so past that
+    // the label is what has to yield — and yielding, for a label, is
+    // eliding.
+    let huge =
+        "1920x1080 @ 119.98 Hz (also 120, 100, 85, 84.904, 75, 72, 60, 59.94, 50, 30, 24, 23.976)";
+    for connector in h.state().connectors() {
+        set_value(&mut h, &format!("displays/{connector}/mode"), huge);
+    }
+    h.settle();
+    check_nothing_overhangs(&mut h, "an 88-character mode string");
+
+    let first = h.state().connectors()[0].clone();
+    let mode = named(&mut h, &format!("displays/{first}/mode"));
+    assert_eq!(
+        h.widget::<Label>(mode).text(),
+        huge,
+        "the label still holds the whole string, which is what `hey get` \
+         and an accessibility client read"
+    );
+    assert!(
+        h.widget::<Label>(mode).is_elided()
+            && h.widget::<Label>(mode).painted_text().ends_with('…'),
+        "and shows an elided prefix of it rather than overflowing: {:?}",
+        h.widget::<Label>(mode).painted_text(),
+    );
+    assert!(
+        h.widget::<Label>(mode)
+            .painted_text()
+            .starts_with("1920x1080"),
+        "with the part that names the mode surviving: {:?}",
+        h.widget::<Label>(mode).painted_text(),
     );
 
     h.quit();
@@ -1257,11 +1358,17 @@ fn two_outputs_fit_the_window_and_a_third_clips_rather_than_overlaps() {
 
     // Every row: full height, inside the window, both axes. The vertical
     // half is the one that was missing.
+    //
+    // A display row is two `control_row`s in a column since #3725, so its
+    // height is 2 × ROW_HEIGHT + GAP. An equality still, for the reason
+    // the single row's was one: this is what "neither line was squashed"
+    // looks like from outside.
+    let row_h = 2.0 * nitro_settings::ROW_HEIGHT + nitro_settings::GAP;
     for (path, b) in &rows {
         assert!(
-            (b.h - nitro_settings::ROW_HEIGHT).abs() < 0.01,
-            "{path} is {} tall, not ROW_HEIGHT: a second monitor must \
-             shorten neither row",
+            (b.h - row_h).abs() < 0.01,
+            "{path} is {} tall, not the {row_h} of two lines and a gap: a \
+             second monitor must shorten neither row",
             b.h,
         );
         assert!(
@@ -1272,11 +1379,13 @@ fn two_outputs_fit_the_window_and_a_third_clips_rather_than_overlaps() {
         );
     }
 
-    // The mode label keeps the width its longer string measures: a
-    // hotplugged 2560×1440 makes the longest mode string the dialog can
-    // show (135.6 px against the harness output's 119.1), and the only
-    // child of this row with any give is the slider, so a `WINDOW_SIZE.w`
-    // chosen for the narrow case would overflow right here.
+    // The mode label shows its whole string unelided: a hotplugged
+    // 2560×1440 makes the longest mode line the dialog can show, and
+    // splitting the alternatives onto the second line is what left room
+    // for it. If `WINDOW_SIZE.w` were chosen for the narrow case, this is
+    // where it would show — as an ellipsis rather than as an overflow,
+    // which is the point of the elision but still the wrong outcome for a
+    // string this short.
     let mode_id = named(&mut h, "displays/Virtual-2/mode");
     let mode = h.ui().window_bounds(mode_id);
     let theme = nitro_ui::Theme::default();
@@ -1291,6 +1400,11 @@ fn two_outputs_fit_the_window_and_a_third_clips_rather_than_overlaps() {
         mode.w >= want - 0.01,
         "the mode label is {} wide but `{text}` measures {want}",
         mode.w,
+    );
+    assert!(
+        !h.widget::<Label>(mode_id).is_elided(),
+        "and it is not elided: {:?}",
+        h.widget::<Label>(mode_id).painted_text(),
     );
 
     // Claim 1: the whole tree still fits, buttons row included. This is
@@ -1330,8 +1444,8 @@ fn two_outputs_fit_the_window_and_a_third_clips_rather_than_overlaps() {
     let last = find("window/displays/Virtual-3");
 
     assert!(
-        (last.h - nitro_settings::ROW_HEIGHT).abs() < 0.01,
-        "the third row is {} tall, not ROW_HEIGHT",
+        (last.h - row_h).abs() < 0.01,
+        "the third row is {} tall, not the {row_h} of two lines and a gap",
         last.h,
     );
     assert!(

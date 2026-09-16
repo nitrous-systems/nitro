@@ -169,6 +169,11 @@ pub struct WidgetState {
     /// Memoized `measure`: the constraints it was called with and what it
     /// answered. Invalidated by [`Dirty::LAYOUT`].
     pub(crate) measured: Option<(Constraints, nitro_core::Size)>,
+    /// The floor the widget reported from its last `measure`, if it has
+    /// an opinion its style cannot express — see
+    /// [`FlexItem::floor`](crate::layout::FlexItem::floor). Memoized
+    /// alongside `measured` and cleared with it.
+    pub(crate) floor: Option<nitro_core::Size>,
     pub(crate) flags: Dirty,
     /// The widget's own scene `Group`; children hang under it.
     pub(crate) node: Option<NodeId>,
@@ -210,6 +215,7 @@ impl Default for WidgetState {
             hovered: false,
             focused: false,
             measured: None,
+            floor: None,
             // A new widget has never been laid out, painted or attached.
             flags: Dirty::LAYOUT | Dirty::PAINT | Dirty::TREE,
             node: None,

@@ -419,13 +419,41 @@ pub struct FlexItem {
     pub style: LayoutStyle,
     /// The child's measured size, *excluding* its margin.
     pub basis: Size,
+    /// The smallest size the *widget itself* says it can honestly be laid
+    /// out at, if it has an opinion — reported from its own `measure`
+    /// through [`MeasureCx::report_floor`](crate::widget::MeasureCx::report_floor).
+    ///
+    /// It exists for the widget that is neither of the two things
+    /// [`ShrinkFloor`] can say. An eliding
+    /// [`Label`](crate::widgets::Label) is honestly smaller than its
+    /// text — it drops characters and says so with an ellipsis — but it
+    /// is not honestly *arbitrarily* small: below the ellipsis plus a
+    /// few characters it has stopped communicating anything. So it takes
+    /// [`ShrinkFloor::Zero`] and reports the width of that remnant here,
+    /// and the row it sits in narrows it instead of overflowing.
+    ///
+    /// A floor a `min_width`/`min_height` could express is better said
+    /// that way; this is for a floor only the widget can compute,
+    /// because it depends on the server's fonts.
+    pub floor: Option<Size>,
 }
 
 impl FlexItem {
     /// A child with the default style at a measured size.
     #[must_use]
     pub fn new(style: LayoutStyle, basis: Size) -> Self {
-        Self { style, basis }
+        Self {
+            style,
+            basis,
+            floor: None,
+        }
+    }
+
+    /// The same item with a widget-reported floor; see [`FlexItem::floor`].
+    #[must_use]
+    pub fn with_floor(mut self, floor: Option<Size>) -> Self {
+        self.floor = floor;
+        self
     }
 }
 
@@ -507,6 +535,10 @@ fn shrink_to_fit(items: &[FlexItem], dir: Direction, main: &mut [f32], deficit: 
 /// caps it (an author who asked for a cap meant it), and an explicit
 /// `min_*` larger than the content still wins, exactly as the final
 /// clamp has always made it.
+///
+/// A widget that opted out of the content floor may still report one of
+/// its own ([`FlexItem::floor`]); that raises the `Zero` floor and is
+/// capped and clamped like any other.
 fn floor_main(it: &FlexItem, dir: Direction) -> f32 {
     let (min, max) = match dir {
         Direction::Row => (it.style.min_width, it.style.max_width),
@@ -515,6 +547,15 @@ fn floor_main(it: &FlexItem, dir: Direction) -> f32 {
     let content = match it.style.shrink_floor {
         ShrinkFloor::Content => dir.main(it.basis),
         ShrinkFloor::Zero => 0.0,
+    };
+    // A widget that reported its own floor raises the `Zero` one to it:
+    // an eliding label may lose characters but not the ellipsis and the
+    // first few of them. It can only ever *raise* the floor, and it is
+    // still capped by `max_*` below, so a widget cannot talk itself out
+    // of a cap its author asked for.
+    let content = match it.floor {
+        Some(f) => content.max(dir.main(f)),
+        None => content,
     };
     let content = match max {
         Some(m) => content.min(m),

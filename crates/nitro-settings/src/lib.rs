@@ -9,8 +9,10 @@
 //! ```text
 //! ┌──────────────────────────────────────────────────────┐
 //! │ Displays                                             │
-//! │ HDMI-A-1 1920×1080 @ 60 Hz [==o===] 2 ☑ primary 0   0 │  one row per output
-//! │ VGA-1    1280×1024 @ 60 Hz [o=====] 1 ☐ primary 1920 0│
+//! │ HDMI-A-1 1920×1080 @ 119.98 Hz [==o===] 2 ☑ primary   │  two lines per output
+//! │    position [0   ] [0   ]  also 120 · 85 · 60 · 50 Hz │
+//! │ VGA-1    1280×1024 @ 60 Hz     [o=====] 1 ☐ primary   │
+//! │    position [1920] [0   ]  also 75 Hz                 │
 //! │ Positions are typed; drag-arrange is not in M4.       │
 //! │ ────────────────────────────────────────────────────  │
 //! │ Keyboard                                             │
@@ -28,6 +30,23 @@
 //! │ [Apply] [Revert]                            applied   │
 //! └──────────────────────────────────────────────────────┘
 //! ```
+//!
+//! # Why a display row is two lines
+//!
+//! Because one was not enough, and the way it failed is the reason the
+//! layout rules in `docs/ui.md` are what they are. The row held seven
+//! widgets; #3718 then put the connector's whole alternative-rate list
+//! into the mode label, and since #561 a label cannot be laid out below
+//! its own text. So the row did not narrow — it grew to ~700 px in a
+//! 560-px window, and its last four widgets were painted **on the
+//! desktop**, outside the frame.
+//!
+//! Line 1 is what the monitor is and the two controls you reach for;
+//! line 2, indented under the connector, is where it sits and what else
+//! it could run. Both of the dim labels **elide**, so a television with
+//! a dozen rates shortens its line rather than pushing the row out.
+//! (And the toolkit now clips a window's content to the window, so even
+//! a row that did overflow would be cut off rather than spilled.)
 //!
 //! # Why the window is the size it is
 //!
@@ -174,24 +193,48 @@ pub const APP_NAME: &str = "nitro-settings";
 /// correctly and was then laid out smaller than it measured.
 ///
 /// So the number is now derived from the tree rather than chosen, and
-/// both axes are **measured** rather than reasoned about. 540 px of inner
-/// width is what the display row needs with none of its parts squashed
-/// (76 name + 136 mode + 64 slider + 30 value + 79 checkbox +
-/// 2 × 54 position + 6 × 6 gaps ≈ 529). The height comes from measuring
-/// the built tree at that width with the height unbounded, which gives
-/// **391.2 px for one output and exactly 32 px (`ROW_HEIGHT + GAP`) per
-/// output after it**:
+/// both axes are **measured** rather than reasoned about.
 ///
-/// | outputs | tree needs | fits in 440 |
+/// # The width, and why the row it was measured for changed shape
+///
+/// 540 px of inner width was what the display row needed as one line:
+/// 76 name + 136 mode + 64 slider + 30 value + 79 checkbox + 2 × 54
+/// position + 6 × 6 gaps ≈ 529. That row was already full when #3718
+/// appended the connector's alternative rates to the mode label
+/// (`1920×1080 @ 119.98 Hz (also 60, 84.904, 59.94, 50, 24, 23.976)`),
+/// which took the mode from 136 px to ~300 — and since #561 a label
+/// cannot be laid out below its text, so the row did not narrow. It
+/// **grew**, to ~700 px in this 560-px window, and the slider, the scale
+/// value, the checkbox and both position fields were painted on the
+/// desktop beside the frame. (Two bugs, and #3725 fixed both: the
+/// toolkit now clips a window's content to the window, so the worst case
+/// is cut off rather than spilled.)
+///
+/// The width did not move, because the row did: it is two lines now (see
+/// `add_row`), and the width is still what its *first* line needs.
+///
+/// # The height, which did move
+///
+/// Measured from the built tree at that width with the height unbounded.
+/// A display row is 2 × `ROW_HEIGHT` + `GAP` = 58 px of content, so each
+/// output after the first costs **64 px** (`58 + GAP`) rather than the
+/// 32 it cost as one line:
+///
+/// | outputs | tree needs | fits in 500 |
 /// |---|---|---|
-/// | 1 | 391.2 | yes, 49 px spare |
-/// | 2 | 423.2 | yes, 17 px spare |
-/// | 3 | 455.2 | **no** — 15 px short |
+/// | 1 | 423.2 | yes, 77 px spare |
+/// | 2 | 487.2 | yes, 13 px spare |
+/// | 3 | 551.2 | **no** — 51 px short |
 ///
-/// 440 is therefore the smallest round number that holds the two-monitor
-/// case, which is what a laptop-plus-screen desktop actually is. The
-/// first draft of this fix said 400 and claimed two outputs fit; 400 is
-/// the *one*-output figure rounded up, and the claim was false by 23 px.
+/// 440 → **500**, and the reason is the second line: 440 held two
+/// one-line rows with 17 px spare and holds two two-line rows 47 px
+/// short. 500 is the smallest round number that holds the two-monitor
+/// case, which is what a laptop-plus-screen desktop actually is, and the
+/// table is here rather than in prose because the first draft of the
+/// *previous* fix claimed two outputs fit at 400 and was wrong by 23 px.
+/// `two_outputs_fit_the_window_and_a_third_clips_rather_than_overlaps`
+/// asserts the two-output row rather than restating it.
+///
 /// Widening or heightening it further is free; narrowing it is what
 /// produced the bug, which is why [`build`] also pins it as the window's
 /// **minimum** through `Ui::set_window_limits`.
@@ -215,7 +258,7 @@ pub const APP_NAME: &str = "nitro-settings";
 /// shorter than the rows it contained and the last row was drawn over
 /// `displays_note` — 0.8 px of overlap at two outputs, 15.6 px at
 /// three.
-pub const WINDOW_SIZE: Size = Size::new(560.0, 440.0);
+pub const WINDOW_SIZE: Size = Size::new(560.0, 500.0);
 
 /// The "surface" an **ordinary** window is.
 ///
@@ -272,6 +315,16 @@ pub const PAD: f32 = 10.0;
 pub const ROW_HEIGHT: f32 = 26.0;
 /// Width of a position field: five digits and a minus sign.
 pub const POS_WIDTH: f32 = 54.0;
+/// How far a display row's second line is indented under its first.
+///
+/// The width of the connector-name column (`min_width(76)`) would line
+/// the second line's first widget up *with* the mode rather than under
+/// the connector, which reads as a second output rather than as a
+/// continuation. `GAP * 2` is the smallest indent that is visibly an
+/// indent and costs the second line almost none of its width — the line
+/// it sits on is the one with the two position fields, which have no
+/// give.
+pub const ROW_INDENT: f32 = GAP * 2.0;
 /// The side of a section heading's icon, in logical pixels.
 ///
 /// 16, not `HEADING_SIZE`: the artwork is drawn on a 16-unit grid, so a
@@ -321,8 +374,19 @@ pub mod names {
     pub const DISPLAYS_NOTE: &str = "displays_note";
     /// In a display row: the connector name.
     pub const OUTPUT_NAME: &str = "name";
-    /// In a display row: the resolution and refresh rate.
+    /// In a display row: the resolution and refresh rate in force.
     pub const OUTPUT_MODE: &str = "mode";
+    /// In a display row: the other rates the connector offers at that
+    /// size, on the second line. Absent from a row whose connector
+    /// offers nothing else — a row says only what it has to say.
+    pub const OUTPUT_MODES: &str = "modes";
+    /// In a display row: the caption in front of the position fields.
+    pub const POSITION: &str = "position";
+    /// In a display row: the first line — connector, mode, scale,
+    /// primary.
+    pub const ROW_TOP: &str = "top";
+    /// In a display row: the second line — position, and the rates.
+    pub const ROW_BOTTOM: &str = "bottom";
     /// In a display row: the scale slider.
     pub const SCALE: &str = "scale";
     /// In a display row: the label showing the slider's value.
@@ -432,7 +496,20 @@ struct Row {
     /// user has an explicit value, and it is written back unconditionally.
     seeded_scale: Option<f32>,
     /// The row container, removed when the output goes away.
+    ///
+    /// A **column** of two lines since #3725, not a `control_row`: one
+    /// row could not hold the connector, the mode, the alternatives
+    /// #3718 added, the slider, its value, the checkbox and two position
+    /// fields, and the toolkit's content floor turns "cannot hold" into
+    /// "runs past the window". The `hey` path is unchanged —
+    /// `displays/<connector>/scale` still resolves, because a segment
+    /// that names no direct child is looked for by name in the subtree.
     container: WidgetId,
+    /// The label carrying the mode in force, on line 1.
+    mode: WidgetId,
+    /// The dim label listing the connector's other rates, on line 2, or
+    /// `None` for a connector that offers none.
+    modes: Option<WidgetId>,
     /// The scale slider.
     scale: WidgetId,
     /// The label beside it.
@@ -1088,19 +1165,28 @@ pub fn percent(level: f32) -> String {
 /// every later change, so keying on the connector and upserting is one
 /// code path where "added versus changed" would be two that must agree.
 fn upsert_output(s: &mut Settings, ui: &mut Ui<Settings>, ids: Ids, info: &OutputInfo) {
-    if let Some(r) = s.rows.iter_mut().find(|r| r.connector == info.name) {
-        r.output = Some(info.id);
-        let container = r.container;
+    if let Some(r) = s.rows.iter().find(|r| r.connector == info.name) {
+        let (mode, modes) = (r.mode, r.modes);
+        if let Some(r) = s.rows.iter_mut().find(|r| r.connector == info.name) {
+            r.output = Some(info.id);
+        }
         // A mode change is the only thing a re-sent `OutputInfo` may
         // move here. The scale and the position are deliberately *not*
         // re-read: they are what the user is editing, and a hotplug
         // elsewhere on the desktop must not throw away a typed number.
-        set_named_label(
-            ui,
-            container,
-            names::OUTPUT_MODE,
-            &mode_text_with_alternatives(info, &s.modes),
-        );
+        //
+        // Both lines move together, because both are about the mode: the
+        // one in force on line 1, and the ones it could be on line 2. A
+        // connector that grew its list while the window was open keeps
+        // whatever label it was built with, though — a row with no
+        // `modes` label cannot gain one without a relayout of the whole
+        // section, and a mode *change* does not change the list.
+        set_label(ui, mode, &mode_text(info));
+        if let Some(id) = modes
+            && let Some(text) = alternatives_text(info, &s.modes)
+        {
+            set_label(ui, id, &text);
+        }
         return;
     }
     let conf = load_conf(s);
@@ -1165,35 +1251,53 @@ fn add_row(
         })
     });
 
-    // Nothing in a display row spells `shrink(0.0)` any more: since #561
-    // a widget's measured size is its own floor, and the slider is the
-    // one control here that says otherwise (`slider()` takes the `Zero`
-    // floor, because a narrower track is still a track and its value is
-    // in the label beside it). So the overflow lands on the slider by
-    // construction rather than by seven opt-outs.
+    // A display row is **two lines** since #3725, and the reason is the
+    // arithmetic rather than taste. One row held seven widgets — the
+    // connector, the mode, the slider, its value, the `primary` box and
+    // two position fields — and #3718 then put the connector's whole
+    // alternative-rate list into the mode label
+    // (`1920×1080 @ 119.98 Hz (also 60, 84.904, 59.94, 50, 24,
+    // 23.976)`). Since #561 a label cannot be laid out below its text,
+    // so the row did not narrow: it grew to ~700 px in a 560-px window
+    // and the last four widgets were painted on the desktop beside it.
     //
-    // A row is a flex container and its natural width exceeds the
-    // window's on a long connector name or a long mode string, so
-    // something has to give. With the old default — every child shrinking
-    // by weight — the `y` field ended at x=452 in a 440-wide window and
-    // the mode string lost its refresh rate. The `min_width`s stay: they
-    // are what a *shorter* string than today's would still reserve, and
-    // the slider's is what says how narrow is still draggable.
+    //     HDMI-A-1   1920×1080 @ 119.98 Hz   [──●──] 1   ☐ primary
+    //       position [0] [0]   also 120 · 85 · 60 · 50 · 24 Hz
+    //
+    // Line 1 is what the monitor *is* and the two controls you reach for;
+    // line 2, indented under the connector, is what it could be. The
+    // alternatives are a dim secondary label rather than a picker: a
+    // picker that changed the mode would blank the screen from a dialog
+    // you might be reading on it, which is the control `docs/settings.md`
+    // says this app deliberately does not offer. They **elide**, so a
+    // television's dozen rates shorten rather than push the row out, and
+    // the row carries no `modes` label at all on a connector that offers
+    // nothing else.
+    //
+    // Nothing here spells `shrink(0.0)` except the position fields: since
+    // #561 a widget's measured size is its own floor, and the two widgets
+    // that say otherwise say so themselves — the slider (`Zero`, because
+    // a narrower track is still a track and its value is in the label
+    // beside it) and the eliding label (`Zero` with a floor of `…` plus
+    // three characters). So an overflow lands on those two by
+    // construction. The `min_width`s stay: they are what a *shorter*
+    // string than today's would still reserve, and the slider's is what
+    // says how narrow is still draggable.
     let name_label = ui.build(
         label(connector)
             .name(names::OUTPUT_NAME)
             .size(TEXT_SIZE)
             .min_width(76.0),
     );
+    // Just the mode in force. The alternatives moved to line 2, which is
+    // what stopped this label from being the thing that broke the row.
     let mode_label = ui.build(
-        label(info.map_or_else(
-            || "—".to_owned(),
-            |i| mode_text_with_alternatives(i, &s.modes),
-        ))
-        .name(names::OUTPUT_MODE)
-        .size(TEXT_SIZE)
-        .color_role(ColorRole::TextDim)
-        .min_width(96.0),
+        label(info.map_or_else(|| "—".to_owned(), mode_text))
+            .name(names::OUTPUT_MODE)
+            .size(TEXT_SIZE)
+            .color_role(ColorRole::TextDim)
+            .elide(true)
+            .min_width(96.0),
     );
     let scale_value = ui.build(
         label(conf::format_scale(scale))
@@ -1227,30 +1331,19 @@ fn add_row(
                 }
             }),
     );
-    // The two position fields hold three or four digits, so they take an
-    // explicit width rather than the field default of twenty characters.
-    // `shrink(0.0)` is still spelled out here because a field is one of
-    // the few widgets that *does* opt out of the content floor (it is a
-    // viewport over its own text), so without it these two would be the
-    // first thing a crowded row narrowed — and a position box too narrow
-    // for "1920" is not a smaller version of itself.
-    let x = ui.build(field(names::POS_X, "x").width(POS_WIDTH).shrink(0.0));
-    let y = ui.build(field(names::POS_Y, "y").width(POS_WIDTH).shrink(0.0));
-    if let Some((px, py)) = position {
-        set_field(ui, x, &px.to_string());
-        set_field(ui, y, &py.to_string());
-    }
-
-    let container = ui.build(control_row().name(connector));
-    for child in [
-        name_label,
-        mode_label,
-        scale_slider,
-        scale_value,
-        primary,
+    let BottomLine {
+        row: bottom,
         x,
         y,
-    ] {
+        rates: rates_label,
+    } = build_bottom_line(s, ui, info, position);
+
+    let top = ui.build(control_row().name(names::ROW_TOP));
+    for child in [name_label, mode_label, scale_slider, scale_value, primary] {
+        ui.attach(top, child).unwrap();
+    }
+    let container = ui.build(column().name(connector).gap(GAP).width_percent(1.0));
+    for child in [top, bottom] {
         ui.attach(container, child).unwrap();
     }
     if ui.attach(ids.displays, container).is_err() {
@@ -1266,12 +1359,88 @@ fn add_row(
             None => Some(scale),
         },
         container,
+        mode: mode_label,
+        modes: rates_label,
         scale: scale_slider,
         scale_value,
         primary,
         x,
         y,
     });
+}
+
+/// The widgets on a display row's **second** line, and the line itself.
+///
+/// Split out of [`add_row`] because the row is two lines and the function
+/// was one: a reader who wants to know what the position fields do should
+/// not have to walk past the slider's callback to find them.
+struct BottomLine {
+    /// The line itself, ready to attach.
+    row: WidgetId,
+    /// The x position field.
+    x: WidgetId,
+    /// The y position field.
+    y: WidgetId,
+    /// The dim label listing the connector's other rates, or `None` for a
+    /// connector that offers none.
+    rates: Option<WidgetId>,
+}
+
+/// Build a display row's second line: `position [x] [y]  also … Hz`.
+///
+/// Indented under the connector (`ROW_INDENT`), so it reads as a
+/// continuation of the first line rather than as another output.
+///
+/// # Panics
+/// Never in practice — every `attach` names an id created just above.
+fn build_bottom_line(
+    s: &Settings,
+    ui: &mut Ui<Settings>,
+    info: Option<&OutputInfo>,
+    position: Option<(i32, i32)>,
+) -> BottomLine {
+    // The two position fields hold three or four digits, so they take an
+    // explicit width rather than the field default of twenty characters.
+    // `shrink(0.0)` is still spelled out here because a field is one of
+    // the few widgets that *does* opt out of the content floor (it is a
+    // viewport over its own text), so without it these two would be the
+    // first thing a crowded row narrowed — and a position box too narrow
+    // for "1920" is not a smaller version of itself.
+    let x = ui.build(field(names::POS_X, "x").width(POS_WIDTH).shrink(0.0));
+    let y = ui.build(field(names::POS_Y, "y").width(POS_WIDTH).shrink(0.0));
+    if let Some((px, py)) = position {
+        set_field(ui, x, &px.to_string());
+        set_field(ui, y, &py.to_string());
+    }
+    let position_caption = ui.build(caption("position").name(names::POSITION));
+    // Only when there is something to list. A row that said `also  Hz`,
+    // or reserved space for a connector with one mode, would be spending
+    // the window's scarcest axis on nothing.
+    let rates = info
+        .and_then(|i| alternatives_text(i, &s.modes))
+        .map(|text| {
+            ui.build(
+                label(text)
+                    .name(names::OUTPUT_MODES)
+                    .size(TEXT_SIZE)
+                    .color_role(ColorRole::TextDim)
+                    .elide(true)
+                    .grow(1.0)
+                    .min_width(60.0),
+            )
+        });
+    let row = ui.build(
+        control_row()
+            .name(names::ROW_BOTTOM)
+            .padding_xy(ROW_INDENT, 0.0),
+    );
+    for child in [position_caption, x, y] {
+        ui.attach(row, child).unwrap();
+    }
+    if let Some(m) = rates {
+        ui.attach(row, m).unwrap();
+    }
+    BottomLine { row, x, y, rates }
 }
 
 /// Tick `connector`'s primary box and clear every other.
@@ -1301,21 +1470,35 @@ pub fn mode_text(info: &OutputInfo) -> String {
     format!("{}×{} @ {}", info.w, info.h, format_hz(info.refresh_mhz))
 }
 
-/// `1920×1080 @ 60 Hz (also 120, 85, 50, 24)`.
+/// `also 120 · 85 · 50 · 24 Hz`, or `None` when there is nothing to say.
 ///
-/// The mode in force plus **the other refresh rates this connector offers
-/// at that same size**, which is the one question a display row can answer
-/// and the file cannot: `output.<c>.mode = 1920x1080@120` is only worth
-/// typing if 120 is on the list.
+/// The second line of a display row: the *other* rates this connector
+/// offers at the size it is running, which is the one thing about a
+/// monitor the file cannot tell you. Middle dots rather than commas
+/// because the list is a set of alternatives rather than a sentence, and
+/// one `Hz` at the end rather than six, because the row has no room for
+/// the five it does not need.
 ///
-/// Only the rates at the current size, and only rates — the full list is a
-/// dozen entries on a television and would not fit the row. Someone who
-/// wants all of it runs `modes` on the control socket, which is what
-/// `crates/nitro-server/README.md` points at; this line is the hint that
-/// there is something to look for.
+/// Rates are printed as a **person** reads them — at most two decimals
+/// and no trailing zeros, so `84.904` from the kernel's table is `84.9`
+/// and `59.940` is `59.94`. The matching against the server's own
+/// spelling happens before that, on the server's strings, which is why
+/// [`nitro_kms_hz`] still exists: the exclusion of the current rate has
+/// to agree with the server character for character, and the display
+/// spelling deliberately does not.
 #[must_use]
-pub fn mode_text_with_alternatives(info: &OutputInfo, modes: &[(String, String)]) -> String {
-    let here = mode_text(info);
+pub fn alternatives_text(info: &OutputInfo, modes: &[(String, String)]) -> Option<String> {
+    let others = alternative_rates(info, modes);
+    if others.is_empty() {
+        return None;
+    }
+    let shown: Vec<String> = others.iter().map(|r| trim_rate(r)).collect();
+    Some(format!("also {} Hz", shown.join(" · ")))
+}
+
+/// The other rates this connector offers at the size it is running, in
+/// the server's own spelling and in the order `modes` listed them.
+fn alternative_rates(info: &OutputInfo, modes: &[(String, String)]) -> Vec<String> {
     let size = format!("{}x{}@", info.w, info.h);
     let mut others: Vec<String> = Vec::new();
     for (_, m) in modes.iter().filter(|(n, _)| *n == info.name) {
@@ -1330,11 +1513,26 @@ pub fn mode_text_with_alternatives(info: &OutputInfo, modes: &[(String, String)]
         }
         others.push(rate.to_owned());
     }
-    if others.is_empty() {
-        here
-    } else {
-        format!("{here} (also {})", others.join(", "))
-    }
+    others
+}
+
+/// A rate from the server's table, as a person reads it: at most two
+/// decimals, and no trailing zeros.
+///
+/// The server prints three decimals because that is what a millihertz
+/// table has (`84.904`, `59.940`); a display row wants `84.9` and
+/// `59.94`. Rounding rather than truncating, so `84.904` does not become
+/// `84.90` and then `84.9` by a different route than `84.896` would.
+fn trim_rate(rate: &str) -> String {
+    let Ok(v) = rate.parse::<f64>() else {
+        // Not a number we can re-print: show the server's own spelling
+        // rather than nothing. A rate this app cannot parse is a rate the
+        // user can still type into `output.<c>.mode`.
+        return rate.to_owned();
+    };
+    let s = format!("{v:.2}");
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    s.to_owned()
 }
 
 /// The rate in the spelling the `modes` command uses, so the current mode
@@ -1589,18 +1787,6 @@ fn set_label(ui: &mut Ui<Settings>, id: WidgetId, text: &str) {
     }
 }
 
-/// Set the text of the label named `name` among `parent`'s children.
-fn set_named_label(ui: &mut Ui<Settings>, parent: WidgetId, name: &str, text: &str) {
-    let Some(id) = ui
-        .children(parent)
-        .into_iter()
-        .find(|id| ui.address_name(*id).as_deref() == Some(name))
-    else {
-        return;
-    };
-    set_label(ui, id, text);
-}
-
 /// Set a text field's contents, ignoring a stale id.
 fn set_field(ui: &mut Ui<Settings>, id: WidgetId, text: &str) {
     if let Ok(mut f) = ui.widget_mut::<TextField<Settings>>(id) {
@@ -1670,7 +1856,7 @@ mod tests {
     }
 
     #[test]
-    fn the_mode_line_names_the_other_rates_at_this_size() {
+    fn the_second_line_names_the_other_rates_at_this_size() {
         // The box's connector, as `modes` reports it: several rates at
         // 1080p and a 4K mode that is a different *size*.
         let modes: Vec<(String, String)> = [
@@ -1685,8 +1871,8 @@ mod tests {
         .map(|m| ("HDMI-A-1".to_owned(), (*m).to_owned()))
         .collect();
         assert_eq!(
-            mode_text_with_alternatives(&info(1920, 1080, 60_000), &modes),
-            "1920×1080 @ 60 Hz (also 120, 85, 50, 24)",
+            alternatives_text(&info(1920, 1080, 60_000), &modes).as_deref(),
+            Some("also 120 · 85 · 50 · 24 Hz"),
             "the rate in force is not listed as an alternative to itself, \
              and a different size is not an alternative at all"
         );
@@ -1694,34 +1880,57 @@ mod tests {
         // check that the exclusion is of the *current* rate and not of a
         // hard-coded 60.
         assert_eq!(
-            mode_text_with_alternatives(&info(1920, 1080, 120_000), &modes),
-            "1920×1080 @ 120 Hz (also 85, 60, 50, 24)"
+            alternatives_text(&info(1920, 1080, 120_000), &modes).as_deref(),
+            Some("also 85 · 60 · 50 · 24 Hz")
         );
-        // A size the connector lists nothing else at says nothing extra.
+        // A size the connector lists nothing else at gets no second-line
+        // label at all, rather than an empty one: `None` is what tells
+        // `add_row` not to build the widget.
+        assert_eq!(alternatives_text(&info(3840, 2160, 30_000), &modes), None);
+        // No server to ask: nothing to say.
+        assert_eq!(alternatives_text(&info(1920, 1080, 60_000), &[]), None);
+        // And the line in force is its own label, with no list in it —
+        // which is the whole of #3725's row fix in one assertion.
         assert_eq!(
-            mode_text_with_alternatives(&info(3840, 2160, 30_000), &modes),
-            "3840×2160 @ 30 Hz"
-        );
-        // No server to ask: the line is what it always was.
-        assert_eq!(
-            mode_text_with_alternatives(&info(1920, 1080, 60_000), &[]),
-            "1920×1080 @ 60 Hz"
+            mode_text(&info(1920, 1080, 119_982)),
+            "1920×1080 @ 119.98 Hz"
         );
     }
 
     #[test]
-    fn a_fractional_rate_matches_the_servers_spelling() {
-        // The trap this exists for: `format_hz` says `59.94 Hz` and the
-        // server says `59.94`, and if the two disagreed by a digit the
-        // line would offer the rate it is already running as something
-        // else to try.
-        let modes: Vec<(String, String)> = ["1920x1080@60", "1920x1080@59.94"]
+    fn a_rate_is_printed_with_at_most_two_decimals_and_no_trailing_zeros() {
+        // The server's table is in millihertz and prints three decimals
+        // (`84.904`, `59.940`, `120.000`); a display row wants what a
+        // person reads. Rounded rather than truncated, so `84.904` and
+        // `84.896` do not arrive at `84.9` by different routes.
+        let modes: Vec<(String, String)> = ["1920x1080@84.904", "1920x1080@59.940", "1920x1080@50"]
             .iter()
             .map(|m| ("HDMI-A-1".to_owned(), (*m).to_owned()))
             .collect();
         assert_eq!(
-            mode_text_with_alternatives(&info(1920, 1080, 59_940), &modes),
-            "1920×1080 @ 59.94 Hz (also 60)"
+            alternatives_text(&info(1920, 1080, 119_982), &modes).as_deref(),
+            Some("also 84.9 · 59.94 · 50 Hz")
+        );
+        // A rate this app cannot parse is shown in the server's own
+        // spelling rather than dropped: it is still a string the user can
+        // type into `output.<c>.mode`.
+        assert_eq!(trim_rate("weird"), "weird");
+    }
+
+    #[test]
+    fn a_fractional_rate_matches_the_servers_spelling() {
+        // The trap this exists for: the *display* spelling of the rate in
+        // force is `59.94 Hz` and the server's is `59.940`, and the
+        // exclusion has to be done on the server's, or the line offers
+        // the rate it is already running as something else to try.
+        let modes: Vec<(String, String)> = ["1920x1080@60", "1920x1080@59.94"]
+            .iter()
+            .map(|m| ("HDMI-A-1".to_owned(), (*m).to_owned()))
+            .collect();
+        assert_eq!(mode_text(&info(1920, 1080, 59_940)), "1920×1080 @ 59.94 Hz");
+        assert_eq!(
+            alternatives_text(&info(1920, 1080, 59_940), &modes).as_deref(),
+            Some("also 60 Hz")
         );
     }
 
@@ -1732,8 +1941,8 @@ mod tests {
             ("HDMI-A-1".to_owned(), "1920x1080@120".to_owned()),
         ];
         assert_eq!(
-            mode_text_with_alternatives(&info(1920, 1080, 60_000), &modes),
-            "1920×1080 @ 60 Hz (also 120)"
+            alternatives_text(&info(1920, 1080, 60_000), &modes).as_deref(),
+            Some("also 120 Hz")
         );
     }
 }

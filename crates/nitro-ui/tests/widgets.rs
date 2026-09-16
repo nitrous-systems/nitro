@@ -6,8 +6,8 @@ use nitro_ui::build::{ContainerBuilder as _, StyleBuilder as _};
 use nitro_ui::event::key;
 use nitro_ui::test::Harness;
 use nitro_ui::widgets::{
-    Checkbox, Scroll, Separator, Slider, TextField, button, checkbox, column, label, panel, scroll,
-    separator, slider, text_field,
+    Checkbox, Label, Scroll, Separator, Slider, TextField, button, checkbox, column, label, panel,
+    row, scroll, separator, slider, text_field,
 };
 use nitro_ui::{Ui, WidgetId};
 
@@ -672,4 +672,230 @@ fn replacing_an_image_releases_the_buffer_it_replaced() {
     let b = h.bounds(img);
     let px = h.shot().pixel(b.x as u32 + 4, b.y as u32 + 4);
     assert_eq!(px & 0x00ff_ffff, 0x0000_00ff, "the blue block is drawn");
+}
+
+#[test]
+fn an_eliding_label_shortens_itself_instead_of_overflowing_the_row() {
+    // A label is the widget with no smaller honest version of itself,
+    // which is why the toolkit's default floor is its measured size — a
+    // row of full-width labels overflows rather than squashing them.
+    // `.elide(true)` is the opt-in for the label that *does* have one:
+    // it drops characters from the end and says so with an ellipsis.
+    //
+    // The row here is the settings dialog's display row with everything
+    // but the shape removed: a long mode string beside a fixed-width
+    // control, in a window narrower than the two together. Without
+    // elision the row runs past the window (that is #561 working as
+    // designed, and what the human saw on the box). With it the label
+    // gives the space up, the fixed sibling keeps its width, and nothing
+    // leaves the window.
+    let long = "1920×1080 @ 119.98 Hz (also 60, 84.904, 59.94, 50, 24, 23.976)";
+    let mut h = Harness::sized("elide", (), Size::new(220.0, 60.0), |ui: &mut Ui<()>| {
+        let mode = ui.build(label(long).name("mode").size(13.0).elide(true));
+        let fixed = ui.build(label("☐ primary").name("fixed").size(13.0).width(80.0));
+        let root = ui.build(row().gap(6.0).padding(6.0).width_percent(1.0));
+        ui.attach(root, mode).unwrap();
+        ui.attach(root, fixed).unwrap();
+        root
+    });
+    if !h.has_text() {
+        h.quit();
+        return;
+    }
+    let root = h.ui().root().unwrap();
+    let (mode, fixed) = {
+        let k = h.ui().children(root);
+        (k[0], k[1])
+    };
+    let size = h.ui().window_size();
+
+    // 1. The row fits: both children end inside the window.
+    for (name, id) in [("mode", mode), ("fixed", fixed)] {
+        let b = h.bounds(id);
+        assert!(
+            b.right() <= size.w + 0.01,
+            "{name} ends at x={} in a {}-wide window",
+            b.right(),
+            size.w,
+        );
+    }
+
+    // 2. It is the *label* that gave way, not the fixed sibling.
+    assert!(
+        (h.bounds(fixed).w - 80.0).abs() < 0.01,
+        "the fixed sibling kept its width: {:?}",
+        h.bounds(fixed),
+    );
+
+    // 3. And it gave way by eliding rather than by being squashed: what
+    //    is painted is a prefix of the text plus `…`, and it really is
+    //    shorter than what the whole string measures.
+    let painted = h.widget::<Label>(mode).painted_text().to_owned();
+    assert!(
+        h.widget::<Label>(mode).is_elided(),
+        "the label knows it is showing less than it has: {painted:?}"
+    );
+    assert!(
+        painted.ends_with('…') && long.starts_with(painted.trim_end_matches('…')),
+        "the painted text is a prefix of the original plus an ellipsis: {painted:?}"
+    );
+    // `text()` is still the whole string — an accessibility client reads
+    // the label, not the width of its box.
+    assert_eq!(h.widget::<Label>(mode).text(), long);
+
+    // 4. The prefix that survives is the part that names the thing: the
+    //    resolution, not three characters of it.
+    assert!(
+        painted.starts_with("1920×1080"),
+        "the important prefix survives: {painted:?}"
+    );
+    h.quit();
+}
+
+#[test]
+fn an_eliding_label_keeps_an_ellipsis_and_three_characters_at_its_narrowest() {
+    // The floor. An eliding label takes part in shrink like a
+    // `shrink_to_zero` widget, which on its own would let a crowded row
+    // narrow it to nothing — and a label of zero width is not a smaller
+    // honest version of itself, it is an absent one. So it reports a
+    // floor of `…` plus its first three characters: enough to tell
+    // `HDMI-A-1` from `VGA-1`, which is the question a user asks of a
+    // truncated label, and few enough that the row still gets most of
+    // the space back.
+    //
+    // The floor is measured through the server's own font engine here,
+    // exactly as the widget computes it, so the assertion follows the
+    // theme and the box's fonts instead of freezing today's metrics.
+    let text = "HDMI-A-1 1920×1080 @ 119.98 Hz";
+    let mut h = Harness::sized(
+        "elidefloor",
+        (),
+        Size::new(120.0, 60.0),
+        |ui: &mut Ui<()>| {
+            let mode = ui.build(label(text).name("mode").size(13.0).elide(true));
+            // A sibling far too wide for the window, with no give at all:
+            // whatever the row cannot take out of the label it must leave as
+            // overflow, which is what puts the label on its floor.
+            let hog = ui.build(label("X".repeat(40)).name("hog").size(13.0));
+            let root = ui.build(row().gap(6.0).width_percent(1.0));
+            ui.attach(root, mode).unwrap();
+            ui.attach(root, hog).unwrap();
+            root
+        },
+    );
+    if !h.has_text() {
+        h.quit();
+        return;
+    }
+    let root = h.ui().root().unwrap();
+    let mode = h.ui().children(root)[0];
+
+    let theme = nitro_ui::Theme::default();
+    let style = nitro_ui::TextStyle::new(theme.font_family.clone(), 13.0);
+    let floor = h
+        .ui()
+        .measure_text("HDM…", &style, 0.0)
+        .expect("measure the remnant")
+        .width;
+    let got = h.bounds(mode).w;
+    assert!(
+        (got - floor).abs() < 0.51,
+        "the label was narrowed to {got} but its floor is `HDM…` = {floor}: \
+         an eliding label gives space up, but not the ellipsis and the first \
+         three characters"
+    );
+    assert!(
+        h.widget::<Label>(mode).painted_text().ends_with('…'),
+        "and what is left is elided, not clipped: {:?}",
+        h.widget::<Label>(mode).painted_text(),
+    );
+    h.quit();
+}
+
+#[test]
+fn re_eliding_happens_on_a_width_change_and_on_nothing_else() {
+    // Work ∝ change. The elision search is `log(len)` measurements, and a
+    // label that re-ran it whenever it was asked for its size would put
+    // them in the layout path of every frame — the same mistake as
+    // re-shaping a title on every pointer motion (`retitle`,
+    // `docs/wm.md`).
+    //
+    // Two things about the census are worth recording, because the two
+    // obvious versions of this test both pass vacuously.
+    //
+    // *Repaints* are not the interesting event: `paint` never measures,
+    // so ten repaints re-elide nothing whatever the code does. They are
+    // still asserted below, because that is the property the spec names
+    // and a future `paint` that measured would break it — but the
+    // load-bearing half is the ten **relayouts**, which do call
+    // `measure`, at an unchanged width.
+    //
+    // And the counter is the label's own rather than the server's
+    // `text_layouts`, because measurements are cached client-side by
+    // `(text, style, max_width)`: a search re-run at a width it has
+    // already been run at is answered entirely out of that cache, with
+    // no wire traffic and no server-side layout pass. A `text_layouts`
+    // census reads zero whether or not the memo exists — checked by
+    // deleting the memo and watching it still pass.
+    let long = "1920×1080 @ 119.98 Hz (also 60, 84.904, 59.94, 50, 24, 23.976)";
+    let mut h = Harness::sized("elidework", (), Size::new(220.0, 60.0), |ui: &mut Ui<()>| {
+        let mode = ui.build(label(long).name("mode").size(13.0).elide(true));
+        let root = ui.build(row().gap(6.0).padding(6.0).width_percent(1.0));
+        ui.attach(root, mode).unwrap();
+        root
+    });
+    if !h.has_text() {
+        h.quit();
+        return;
+    }
+    let root = h.ui().root().unwrap();
+    let mode = h.ui().children(root)[0];
+    h.settle();
+    assert!(
+        h.widget::<Label>(mode).is_elided(),
+        "the label really is eliding, so there is a search to count"
+    );
+
+    let before = h.widget::<Label>(mode).elisions();
+    let layouts = h.server().stat("text_layouts");
+    for _ in 0..10 {
+        h.ui().mark(mode, nitro_ui::Dirty::PAINT);
+        h.flush();
+        h.settle();
+    }
+    assert_eq!(
+        h.widget::<Label>(mode).elisions(),
+        before,
+        "ten repaints re-elided nothing"
+    );
+    for _ in 0..10 {
+        h.ui()
+            .mark(mode, nitro_ui::Dirty::LAYOUT | nitro_ui::Dirty::PAINT);
+        h.flush();
+        h.settle();
+    }
+    assert_eq!(
+        h.widget::<Label>(mode).elisions(),
+        before,
+        "ten *relayouts* at an unchanged width re-elided nothing either: \
+         the search is memoized on the width it was run at"
+    );
+    // And none of it cost the server any text work, which is what the
+    // memo is ultimately for.
+    assert_eq!(
+        h.server().stat("text_layouts"),
+        layouts,
+        "twenty passes at an unchanged width shaped nothing"
+    );
+
+    // The control: a narrower window is a new width, and that does cost
+    // a search — so the equalities above are the memo and not a counter
+    // that never moves.
+    h.configure(Size::new(160.0, 60.0));
+    h.settle();
+    assert!(
+        h.widget::<Label>(mode).elisions() > before,
+        "a width change re-elides: the counter is live"
+    );
+    h.quit();
 }

@@ -131,7 +131,7 @@ pub struct TimerId(u64);
 ///
 /// One `Ui` owns one window. It is generic over the app's state type `S`,
 /// which is what callbacks are handed alongside the tree itself.
-#[allow(clippy::struct_excessive_bools)] // Independent facts about one window, not a state machine: `quit`, `window_open`, `backdrop_wanted` and `frame_requested` have no shared vocabulary to collapse into.
+#[allow(clippy::struct_excessive_bools)] // Independent facts about one window, not a state machine: `quit`, `window_open`, `backdrop_wanted`, `root_clipped` and `frame_requested` have no shared vocabulary to collapse into.
 pub struct Ui<S> {
     arena: Arena<S>,
     root: Option<WidgetId>,
@@ -158,6 +158,13 @@ pub struct Ui<S> {
     /// dialog's dark text lands on whatever the desktop is showing.
     backdrop: Option<NodeId>,
     backdrop_wanted: bool,
+    /// Whether the root's group has been told to clip to the window.
+    ///
+    /// One `SetClip`, remembered: the rectangle it clips to is the root
+    /// widget's own bounds, which the layout pass keeps equal to the
+    /// window on every `Configure`, so a resize needs no second message.
+    /// See [`Ui::pass_clip`].
+    root_clipped: bool,
     /// The colour and size the backdrop was last sent, so a resize or a
     /// theme change costs one mutation and an idle tree costs none.
     backdrop_sent: Option<(Size, nitro_core::Color)>,
@@ -327,6 +334,7 @@ impl<S: 'static> Ui<S> {
             scale: 1.0,
             backdrop: None,
             backdrop_wanted: true,
+            root_clipped: false,
             backdrop_sent: None,
             control_path: None,
             focused: None,
@@ -501,6 +509,8 @@ impl<S: 'static> Ui<S> {
             return Err(Error::StaleWidget);
         }
         self.root = Some(id);
+        // A new root is a new group, and the clip rides the group.
+        self.root_clipped = false;
         self.mark(id, Dirty::LAYOUT | Dirty::PAINT | Dirty::TREE);
         Ok(())
     }
@@ -1665,9 +1675,43 @@ impl<S: 'static> Ui<S> {
         }
         self.pass_tree(root)?;
         self.pass_layout(root)?;
+        self.pass_clip(root)?;
         self.pass_paint(root)?;
         self.pass_backdrop()?;
         self.wire.commit()
+    }
+
+    /// CLIP: the root's group clips everything under it to the window.
+    ///
+    /// **A window's content is clipped to the window.** A layout that
+    /// overflows is a bug either way, but there are two ways for it to
+    /// fail and only one of them is survivable: cut off at the window's
+    /// edge, or painted onto the desktop beside it. `nitro-settings`
+    /// shipped the second one — a display row 700 px wide in a 560 px
+    /// window put its slider, its checkbox and both position fields
+    /// outside the frame, over whatever was behind.
+    ///
+    /// The clip is a single `SetClip` on the root widget's own group,
+    /// which the layout pass already sizes to the window on every
+    /// `Configure` — so "and on every size change" costs nothing extra
+    /// and cannot go stale: the rectangle the scene clips to *is* the
+    /// rectangle the root was laid out in. Sent once, then remembered.
+    ///
+    /// The server will eventually forbid a window painting outside its
+    /// own frame regardless of what its client asks for; the toolkit
+    /// does not wait for that, because a toolkit that relies on the
+    /// compositor to contain it is a toolkit whose bugs are invisible
+    /// until they are somebody else's.
+    fn pass_clip(&mut self, root: WidgetId) -> Result<(), Error> {
+        if self.root_clipped {
+            return Ok(());
+        }
+        let Some(node) = self.arena.slot(root).and_then(|s| s.state.node) else {
+            return Ok(());
+        };
+        self.wire.set_clip(node, true)?;
+        self.root_clipped = true;
+        Ok(())
     }
 
     /// The window background: one `Rect` node, created before anything
@@ -1901,6 +1945,12 @@ impl<S: 'static> Ui<S> {
         let Ok(mut widget) = self.take(id) else {
             return Size::ZERO;
         };
+        // A widget re-reports its floor from `measure`, so the stale one
+        // is cleared first: a label that stopped eliding must not keep
+        // the floor it had while it did.
+        if let Some(slot) = self.arena.slot_mut(id) {
+            slot.state.floor = None;
+        }
         let size = {
             let mut cx = MeasureCx { ui: self, id };
             widget.measure(&mut cx, c)
@@ -1911,6 +1961,19 @@ impl<S: 'static> Ui<S> {
             slot.state.measured = Some((c, size));
         }
         size
+    }
+
+    /// Record a floor a widget reported from its own `measure`; see
+    /// [`MeasureCx::report_floor`](crate::widget::MeasureCx::report_floor).
+    pub(crate) fn set_reported_floor(&mut self, id: WidgetId, floor: Option<Size>) {
+        if let Some(slot) = self.arena.slot_mut(id) {
+            slot.state.floor = floor;
+        }
+    }
+
+    /// The floor a widget last reported, for the flex solver.
+    pub(crate) fn reported_floor(&self, id: WidgetId) -> Option<Size> {
+        self.arena.slot(id).and_then(|s| s.state.floor)
     }
 
     /// The default container layout: flex-solve the children of `id`
@@ -1935,7 +1998,7 @@ impl<S: 'static> Ui<S> {
                 (inner.h - cstyle.margin.vertical()).max(0.0),
             );
             let basis = self.measure(*c, Constraints::loose(avail));
-            items.push(FlexItem::new(cstyle, basis));
+            items.push(FlexItem::new(cstyle, basis).with_floor(self.reported_floor(*c)));
         }
         let mut rects = self.rect_pool.pop().unwrap_or_default();
         crate::layout::solve(&style, inner, &items, &mut rects);

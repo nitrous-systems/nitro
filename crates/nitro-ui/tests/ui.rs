@@ -1528,3 +1528,121 @@ fn a_column_that_does_not_fit_clips_rather_than_squashing_its_labels() {
     );
     h.quit();
 }
+
+#[test]
+fn a_child_moved_past_the_window_paints_nothing_on_the_desktop() {
+    // The other half of #561's answer, and the one `nitro-settings`
+    // needed: the content floor stops a row being *squashed*, and this
+    // stops the overflow it produces instead from being painted on the
+    // desktop.
+    //
+    // The settings dialog shipped without it. Its display row measured
+    // ~700 px in a 560-px window, nothing in the row would shrink, and
+    // the slider, the `primary` checkbox and both position fields were
+    // painted outside the frame, over the wallpaper. `SetClip` is opt-in
+    // on the wire and the toolkit never set it on its own root, so a
+    // window's content was contained by nothing at all.
+    //
+    // The pin is a pixel census of the desktop strip immediately right
+    // of the window, taken **before and after** the child moves out
+    // there: moving a white 60×40 panel from inside the window to
+    // x = width + 10 must change *zero* pixels of desktop. Before/after
+    // rather than against a constant colour, because the desktop is a
+    // gradient and "changed" is the honest question anyway. The census
+    // runs on `output_shot`, not `shot` — the latter crops to the window
+    // and would hide exactly the spill this is about.
+    //
+    // The child is moved by a container that overrides `layout`, because
+    // no flex arrangement produces a child outside its parent on
+    // purpose: the failure being pinned is the *paint* path, and the
+    // layout that leads there is reproduced directly rather than through
+    // an app's arithmetic.
+
+    /// A container that places its one child either inside its own box
+    /// or ten pixels past its right edge — an overflowing row, with the
+    /// arithmetic removed.
+    #[derive(Default)]
+    struct Overflowing {
+        outside: bool,
+    }
+    impl nitro_ui::Widget<()> for Overflowing {
+        fn measure(
+            &mut self,
+            _cx: &mut nitro_ui::MeasureCx<'_, ()>,
+            c: nitro_ui::Constraints,
+        ) -> Size {
+            c.max
+        }
+        fn layout(&mut self, cx: &mut nitro_ui::LayoutCx<'_, ()>, bounds: Rect) {
+            let x = if self.outside { bounds.w + 10.0 } else { 10.0 };
+            for child in cx.children() {
+                cx.place_child(child, Rect::new(x, 10.0, 60.0, 40.0));
+            }
+        }
+    }
+
+    let mut h = Harness::sized("rootclip", (), Size::new(120.0, 80.0), |ui: &mut Ui<()>| {
+        let far = ui.build(
+            panel()
+                .background(nitro_core::Color::WHITE)
+                .name("far")
+                .width(60.0)
+                .height(40.0),
+        );
+        let mut built = nitro_ui::Built::new(Overflowing::default());
+        built.state_mut().name = Some("root".to_owned());
+        let root = ui.build(built);
+        ui.attach(root, far).unwrap();
+        root
+    });
+    let origin = h.ui().window_position();
+    let size = h.ui().window_size();
+    let far = nitro_ui::introspect::resolve(h.ui(), "window/far").expect("the child");
+    assert!(
+        h.bounds(far).right() <= size.w,
+        "the child starts inside the window: {:?} in {size:?}",
+        h.bounds(far),
+    );
+
+    // The desktop strip right of the window, in output coordinates.
+    let before = h.output_shot();
+    let strip_x = (origin.x + size.w).max(0.0) as u32;
+    let strip_w = 60u32.min(before.width.saturating_sub(strip_x));
+    let y0 = origin.y.max(0.0) as u32;
+    let y1 = ((origin.y + size.h) as u32).min(before.height);
+    assert!(
+        strip_w > 0 && y1 > y0,
+        "there is desktop right of the window to look at"
+    );
+
+    let root = h.ui().root().unwrap();
+    {
+        let mut w = h.ui().widget_mut::<Overflowing>(root).expect("the root");
+        w.outside = true;
+        w.request_layout();
+    }
+    h.settle();
+    assert!(
+        h.bounds(far).x > size.w,
+        "the child really moved outside the window: {:?} in {size:?}",
+        h.bounds(far),
+    );
+
+    let after = h.output_shot();
+    let mut changed = 0usize;
+    for y in y0..y1 {
+        for x in strip_x..strip_x + strip_w {
+            if before.pixel(x, y) != after.pixel(x, y) {
+                changed += 1;
+            }
+        }
+    }
+    assert_eq!(
+        changed, 0,
+        "a widget laid out past the window's right edge changed {changed} pixels \
+         in the {strip_w}-px desktop strip beside it: a window's content is \
+         clipped to the window, so overflow is a layout bug you *see* as \
+         cut-off, never as spill"
+    );
+    h.quit();
+}

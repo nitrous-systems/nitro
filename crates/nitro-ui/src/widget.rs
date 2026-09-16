@@ -314,6 +314,24 @@ impl<S: 'static> MeasureCx<'_, S> {
     ) -> Result<Vec<(u32, f32)>, Error> {
         self.ui.cursor_positions(text, style)
     }
+
+    /// Report the smallest size this widget can honestly be laid out at,
+    /// when that is neither its measured size nor zero.
+    ///
+    /// The flex solver reads it as [`FlexItem::floor`](crate::FlexItem)
+    /// and it only ever *raises* a [`ShrinkFloor::Zero`](crate::layout::ShrinkFloor)
+    /// floor, so a widget that does not call this behaves exactly as
+    /// before. It is for a floor an author cannot write down as a
+    /// `min_width`, because only the widget can compute it: an eliding
+    /// [`Label`](crate::widgets::Label) reports the width of
+    /// `…` plus its first few characters, which depends on the server's
+    /// fonts and on the string.
+    ///
+    /// Called from `measure`, and remembered with the measurement: the
+    /// framework clears both together when the widget goes layout-dirty.
+    pub fn report_floor(&mut self, floor: Size) {
+        self.ui.set_reported_floor(self.id, Some(floor));
+    }
 }
 
 /// Context for [`Widget::layout`].
