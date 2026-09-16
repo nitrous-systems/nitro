@@ -728,6 +728,69 @@ the bar's three window-list icons going from **0/256 differing pixels**
 (three identical `window` glyphs) to 117–129/256 when the `.desktop`
 files are installed.
 
+### The cursor, the corners and the frame (#3724)
+
+Box, dark scheme, 1920×1080@119982, scale 1, one `nitro-calc`. Both arms
+are the same script against the same live desktop one build apart, and
+every cursor claim is a **diff against a control shot with the pointer
+parked in a corner** — the cursor is painted into the framebuffer here,
+so "there is ink at (x, y)" is not "this ink is the cursor's".
+
+**The arrow's tail.** The old art's notch is six columns wide and the
+tail leaves it one column right of where the shoulder ends — the
+discontinuity the box read as a check mark. The new one leaves the
+shoulder immediately and every row of the run shifts by exactly one:
+
+```text
+      before                        after
+ 12 |#OOOOO######..|          12 |#OOOOOO#####..|
+ 13 |#OOOO##OO#....|          13 |#OO#OO#.......|
+ 14 |#OOO#..#OO#...|          14 |#O#.#OO#......|
+ 15 |#OO#....#OO#..|          15 |##...#OO#.....|
+```
+
+**The five shapes**, hovered with no press: `size_hor` on the right edge,
+`size_ver` on the bottom, `size_fdiag` at the bottom-right corner with
+the pointer **15 px up the right edge**, `size_bdiag` at the bottom-left,
+and `move` during a live title drag. On main, all five positions show the
+same arrow. A resize shape is visibly **centred** on the pointer where
+the arrow hangs off it, which is the hotspot difference on screen.
+
+**The corner grabs both axes.** A press 3 px outside the right edge and
+15 px above the bottom gives `dragging 1`, and the content goes
+**223×334 → 263×366**: +40 wide *and* +32 tall from one drag.
+
+**The cost.** 30 hover motions along the frame edge, crossing arrow ↔
+`size_hor` ↔ `size_fdiag`: `text_layouts` **135 → 135**, `icon_renders`
+**7 → 7**.
+
+**The frame, in the pixels the report turns into:**
+
+| | before | after |
+|---|---|---|
+| `(frame.x, frame.y + 14)` | `2c3e55` — the **bar**, so the border is not beside it | `4d6788` — the border |
+| one pixel inside | `2c3e55` | `2c3e55` — bar |
+| bottom corner pixel | `1d212c` — neither border (`5a8dc8`) nor desktop (`1e2026`) but a **fade** | `4d6788` |
+| 8 px along the bottom edge | desktop colour, the whole run | `4d6788` × 8 |
+| 8 px up the side edge | four rows of fade before full border | `4d6788` × 8 |
+
+Two strokes that never met, with the client's square corner in the gap —
+and after, sixteen sampled pixels of one colour with no fade anywhere. At
+the top-left the border now follows the 6-px arc (`374860 465e7d 4d6788`
+across three columns of row 1) where it used to run straight past it.
+
+**Idle stays zero**, 45 s gated to `:02` so the bar's minute tick cannot
+land inside the window: **0** and **2** frames with the decorated window
+present, **4** and **0** with it absent. The control moves as much as the
+arm, which is the point — the residual is the bar's sensors, not the
+frame.
+
+**Not measurable on this box:** it is a 1× output, so the `round(scale)`×
+magnification is a code path the hardware never enters. That evidence is
+`the_cursor_is_painted_at_the_outputs_scale` in the harness, which pins
+the 48×48 covered rect and that the ink reaches device row `y + 40` —
+which a 24-px arrow cannot.
+
 ## What is deferred
 
 * **Workspaces / virtual desktops.** Not in M3 at all. The MRU list and

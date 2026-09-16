@@ -346,6 +346,42 @@ get an answer.
   bounding box of light pixels is **not** a window — the cursor is light
   too, and it moves with the drag, which made three runs report a
   perfect resize of a window that had not moved.
+- **A colour run is not an edge when the shape is allowed to have
+  content** (#3724). Locating a window's frame by "the widest contiguous
+  run of title-bar colour" is a defensible boundary right up until you
+  remember the title's *glyphs interrupt the run* — so the row it finds
+  is the first one **below** the text, 20 px down on a 28-px bar. Two
+  failures followed, and the second is the one worth the entry:
+
+  1. "The pixel beside the title bar" was sampled below the bar, in the
+     client's area, and read bar colour where border was expected. Nearly
+     filed as a regression in the feature under test.
+  2. A title-bar press at `frame.y + 14` measured from that wrong top
+     landed **on the client's content**, `dragging` stayed 0, and the
+     move cursor never appeared — producing a perfectly legible crop of
+     *the arrow* during what looked like a title drag. The obvious
+     reading was "the drag's cursor shape does not work".
+
+  **The instrument's defect was indistinguishable from the feature's**,
+  and a better crop could not have separated them. What did was a
+  **sweep**: the same press at five heights down the bar, which turns
+  "it does not work" into `+4 → dragging=1, +8 → 0, +14 → 0`, and a
+  boundary at +4 is a fact about the coordinates rather than about the
+  code. The fix for the locator is to find the run and then *walk up*
+  from it at a column the content cannot reach (3 px in from the border,
+  left of the app icon). Same family as the entry above — @3705's "a
+  bounding box of light pixels is not a window" — one step in: a bounding
+  box fails because other things are bright, a colour run fails because
+  the thing itself is not uniform.
+
+- **A diff against a pre-drag shot cannot show the cursor during a drag**
+  (#3724), because the drag moves the *window*: the diff is a rectangle
+  of translated title bar with the pointer somewhere inside it, and it is
+  confidently unreadable. Measure inside a patch of one **role colour**
+  instead — the blank stretch of title bar right of the text and left of
+  the buttons — where "not that colour" means "the cursor" with no
+  reference frame at all.
+
 - **`PAMName=login` moves the tree out of the unit's cgroup.**
   pam_systemd puts the session in `user-1000.slice/session-N.scope`, so
   `system.slice/nitro-dev.service/cgroup.procs` is **empty** while the
