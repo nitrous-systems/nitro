@@ -24,8 +24,10 @@
 //! * **Focus follows the raise**, the raise follows the click, and the MRU
 //!   list is what `Alt+Tab` walks.
 //!
-//! What is *not* here: workspaces, cursor shapes and a persistent
-//! multi-output layout. See `docs/wm.md`.
+//! What is *not* here: workspaces, cursor *themes* and a persistent
+//! multi-output layout. Cursor **shapes** are here since #3724 — the
+//! server picks one per motion from [`hit_frame`]'s answer, and
+//! `crates/nitro-server/src/cursor.rs` holds the art. See `docs/wm.md`.
 
 use nitro_core::{Color, Palette, Point, Rect, Role, Size};
 use nitro_scene::{ClientId, Insets, Layer, OutputId, Scene, WindowKey};
@@ -800,8 +802,8 @@ impl FrameNodes {
 /// | node | why it cannot be shared |
 /// |---|---|
 /// | frame group | the window's root; the insets hang off it |
-/// | background | the border and the body, one rounded rect |
-/// | title bar | a different colour from the body |
+/// | title bar | rounded, bordered; the frame's top |
+/// | background | the body below it: square, bordered, and what hides the bar's overhang |
 /// | app icon | artwork, which no rect can hold |
 /// | title | a shaped text run |
 /// | 3 × (disc + glyph) | a rect has no artwork and an icon has no fill |
@@ -831,8 +833,13 @@ pub fn build_frame(
     let icon_node = |scene: &mut Scene| -> Result<nitro_scene::NodeKey, nitro_scene::Error> {
         scene.create_node(s, nitro_scene::NodeKind::Icon, root, Some(content))
     };
-    let background = rect(scene)?;
+    // **The bar is created before the body**, and the order is the whole
+    // of how the frame is one shape. Siblings paint in creation order, so
+    // the body — which starts at the top inset — paints *over* the bar's
+    // overhang and hides it. See `layout_frame` for the geometry and for
+    // what went wrong when the client was the thing doing the hiding.
     let bar = rect(scene)?;
+    let background = rect(scene)?;
     let app_icon = icon_node(scene)?;
     let title = scene.create_node(s, nitro_scene::NodeKind::Text, root, Some(content))?;
     // Created in the order they are drawn: the disc first, the glyph on
@@ -939,18 +946,37 @@ pub fn layout_frame(
     // # The frame is one shape: see the module docs' anatomy, and
     // `docs/wm.md`.
     //
-    // The background is **square** and starts `CORNER_RADIUS` down; the
-    // bar is rounded and overhangs the top inset by the same amount. Two
-    // rects, the count the budget already pays for, arranged so that the
+    // Two rects — the count the budget already pays for — arranged so the
     // 1-px border they both carry traces **one** continuous outline:
     //
     // ```text
-    //   ╭─────────╮   ← the bar's rounded top arc, bordered
+    //   ╭─────────╮   ← the bar: rounded, bordered, the frame's top
     //   │ title   │
-    //   ├─────────┤   ← y = CORNER_RADIUS: the background's top edge,
-    //   │ client  │     hidden under the opaque bar, and the two
-    //   └─────────┘     side strokes meeting exactly
+    //   ├─────────┤   ← y = TITLE_H: the body's top edge. The body is
+    //   │ client  │     created *after* the bar, so it paints over the
+    //   └─────────┘     bar's overhang; the two side strokes meet here
     // ```
+    //
+    // **Why the bar overhangs.** A rect node has one radius for all four
+    // corners, so a rounded bar has rounded *bottom* corners too — and a
+    // bottom border stroke. Growing its box by `CORNER_RADIUS` puts both
+    // below the top inset, where something else covers them. What is left
+    // on screen is a bar rounded at the top and square where it meets the
+    // client, which is the shape it always looked like.
+    //
+    // **What covers them is the frame's own body, and that is the review
+    // finding this paragraph exists for.** The first cut had the body
+    // start at `CORNER_RADIUS` and leaned on the *client's content group*
+    // — the last sibling — to hide the overhang. That holds for a client
+    // that fills its content rect, which every `nitro-ui` app does, and
+    // the protocol requires nothing of the sort: a client that paints
+    // nothing showed a 192-px run of the bar's bottom stroke lying across
+    // its own first rows (`a_client_that_paints_nothing_does_not_show_
+    // the_bars_overhang`, which failed before this line changed). A
+    // server-drawn frame may not depend on a client drawing anything, so
+    // the body now starts at `TITLE_H` and is created after the bar: the
+    // frame hides its own overhang and the client is not part of the
+    // argument.
     //
     // **Why the bottom corners are square.** They were rounded until
     // #3724, at the same `CORNER_RADIUS` as the top, and could not work:
@@ -964,23 +990,10 @@ pub fn layout_frame(
     // corners are whole-pixel geometry: the vertical and horizontal runs
     // are the same 1-px stroke of the same rect and *join*, with no
     // antialiasing at all.
-    //
-    // **Why the bar overhangs.** A rect node has one radius for all four
-    // corners, so a rounded bar has rounded bottom corners too. Growing
-    // its box by `CORNER_RADIUS` puts those arcs — and its bottom border
-    // stroke — *below* the top inset, where the client's content group
-    // (the last sibling, so painted over them) hides them. What is left
-    // on screen is a bar rounded at the top and square where it meets the
-    // client, which is the shape it always looked like.
     let bar_box = Rect::new(0.0, 0.0, size.w, TITLE_H + CORNER_RADIUS);
-    let body = Rect::new(
-        0.0,
-        CORNER_RADIUS,
-        size.w,
-        (size.h - CORNER_RADIUS).max(0.0),
-    );
-    scene.set_bounds(s, nodes.background, body)?;
+    let body = Rect::new(0.0, TITLE_H, size.w, (size.h - TITLE_H).max(0.0));
     scene.set_bounds(s, nodes.bar, bar_box)?;
+    scene.set_bounds(s, nodes.background, body)?;
     // Where the leftmost button starts is what everything to its left has
     // to fit inside. Taken from `buttons` rather than recomputed, so the
     // layout and the hit test cannot disagree about it.
@@ -1057,9 +1070,10 @@ pub const TITLE_SIZE_LINE: f32 = 18.0;
 /// focus did not".
 ///
 /// `hint` lights the border up in [`Role::ResizeHint`]: the pointer is in
-/// this window's resize band, and until cursor shapes land (M4) the
-/// border changing colour is the only thing that says so. See
-/// [`border_color`].
+/// this window's resize band. Since #3724 the cursor also takes the
+/// band's own shape, and the two are complementary rather than redundant
+/// — one answer at the pointer, one at the edge, and only the edge says
+/// *which* edge. See [`border_color`].
 ///
 /// `hover` is the button the pointer is on, whose disc is painted; every
 /// other disc is transparent. It is the same motion path `hint` rides,
@@ -1222,8 +1236,14 @@ pub fn button_hover_text_role(region: Region) -> Role {
 /// So the fix is to make the band *visible*: the frame's own border, which
 /// the user is already aiming at, changes colour the moment the pointer is
 /// somewhere a press would resize. It costs no node and no pixel of
-/// anyone's content, and it goes away on its own when cursor shapes
-/// arrive.
+/// anyone's content.
+///
+/// **It stays now that cursor shapes have landed** (#3724), and does not
+/// "go away on its own" as this comment used to predict. The two answer
+/// the same question in different places — one at the pointer, one at the
+/// edge — and the edge is the one that says *which* edge, which a
+/// symmetric double arrow cannot. `docs/wm.md` has the argument, and #565
+/// (the hint's visibility) is left open on the strength of it.
 #[must_use]
 pub fn border_color(focused: bool, hint: bool, palette: &Palette) -> Color {
     if hint {

@@ -2906,18 +2906,8 @@ impl Server {
             frame_hit.and_then(|(win, region)| matches!(region, Region::Resize(_)).then_some(win)),
         );
         self.set_button_hover(frame_hit.filter(|(_, region)| region.is_button()));
-        // And the cursor shape, off that same one walk: a band the window
-        // can actually be resized by takes the shape that points along it,
-        // everything else the arrow. `resizable` is the same filter
-        // `set_resize_hint` applies, and for the same reason — a diagonal
-        // cursor over a `FIXED_SIZE` window would promise a grab that does
-        // nothing.
-        self.set_cursor_shape(match frame_hit {
-            Some((win, Region::Resize(edges))) if self.resizable(win) => {
-                crate::cursor::Shape::for_edges(edges)
-            }
-            _ => crate::cursor::Shape::Arrow,
-        });
+        // And the cursor shape, off that same one walk.
+        self.set_cursor_shape(Self::shape_for(frame_hit, |w| self.resizable(w)));
         let target = output.and_then(|id| input::hit(&self.scene, id, point));
         let now_over = target.map(|t| t.window);
         if now_over != self.pointer.over {
@@ -3000,6 +2990,15 @@ impl Server {
                     }
                 }
             }
+            // The drag owned the shape while it lasted (a `move` cross, or
+            // the grabbed edges'), and the pointer is very likely nowhere
+            // near the frame any more. Re-derive it from what is actually
+            // under the pointer *now*, or a release over the bare desktop
+            // leaves the move cross sitting there until the next motion
+            // event — which, if the user lets go and does not move, is
+            // indefinitely.
+            self.update_cursor_shape();
+
             self.note_input(time_ns);
             return;
         }
@@ -3779,9 +3778,10 @@ impl Server {
     /// straddles is one, so a user aiming at the border they can see has
     /// nothing telling them whether they are in it — which is #3713's
     /// second half, reported as "resizing does not work (by grabbing a
-    /// border)". Cursor *shapes* are the real answer and are M4; until
-    /// then the border itself is the affordance, and this is what turns it
-    /// on.
+    /// border)". Since #3724 the cursor takes the band's shape too, and
+    /// the border keeps lighting up beside it: the shape says "a press
+    /// here resizes", the lit edge says *which* edge, and a symmetric
+    /// double arrow cannot say the second. `docs/wm.md` has the argument.
     ///
     /// Called from every motion, so it is written to do nothing in the
     /// common case: the hit test it needs has already been run by the
@@ -3866,6 +3866,49 @@ impl Server {
         let (x, y) = self.pointer.device();
         self.damage_cursor_at(x, y, old);
         self.damage_cursor_at(x, y, shape);
+    }
+
+    /// The shape a frame region calls for, given a way to ask whether a
+    /// window is resizable.
+    ///
+    /// A band the window can **actually** be resized by takes the shape
+    /// that points along it; everything else takes the arrow. `resizable`
+    /// is the same filter [`Server::set_resize_hint`] applies, and for the
+    /// same reason — a diagonal cursor over a `FIXED_SIZE` window would
+    /// promise a grab that does nothing, which is worse than promising
+    /// none.
+    ///
+    /// A free function of the hit rather than a method, because the two
+    /// callers hold `self` differently: the motion path has already
+    /// borrowed it for the hit test, and the release path has not looked
+    /// yet. Having one rule matters more than the shape of the call —
+    /// the release exists precisely so a drag cannot leave a stale cursor
+    /// behind, and a second copy of the rule would be a second thing to
+    /// get wrong.
+    fn shape_for(
+        hit: Option<(WindowKey, Region)>,
+        resizable: impl Fn(WindowKey) -> bool,
+    ) -> crate::cursor::Shape {
+        match hit {
+            Some((win, Region::Resize(edges))) if resizable(win) => {
+                crate::cursor::Shape::for_edges(edges)
+            }
+            _ => crate::cursor::Shape::Arrow,
+        }
+    }
+
+    /// Re-derive the cursor shape from whatever is under the pointer now.
+    ///
+    /// The motion path does this inline, off the `frame_hit` it already
+    /// has. This is for the one place that has no hit in hand and cannot
+    /// skip the question: the **release** that ends a drag. A drag owns
+    /// the shape while it lasts and the pointer is routinely nowhere near
+    /// the frame by the time it ends, so without this a release over the
+    /// bare desktop leaves the move cross there until the next motion —
+    /// indefinitely, if the user lets go and does not move.
+    fn update_cursor_shape(&mut self) {
+        let hit = self.pointer_desktop().and_then(|p| self.frame_hit(p));
+        self.set_cursor_shape(Self::shape_for(hit, |w| self.resizable(w)));
     }
 
     /// The shape a drag in flight shows.

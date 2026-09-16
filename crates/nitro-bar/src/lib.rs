@@ -772,29 +772,18 @@ pub fn button_text(label: &str, focused: bool, minimized: bool) -> String {
 /// button and is the one thing that must not happen here: a disabled
 /// button ignores clicks, and clicking a minimized entry is precisely
 /// what has to work.
+///
+/// **The label only, never the icon.** The button's primary icon is the
+/// window's app id resolved in the machine's icon theme, and dimming it
+/// would not dim it — it would destroy it. See the argument at the
+/// `.icon_coloured(…)` call in [`upsert`], and
+/// `a_minimized_entry_dims_its_label_and_leaves_its_icon_alone`.
 #[must_use]
 pub fn entry_text_role(minimized: bool) -> ColorRole {
     if minimized {
         ColorRole::TextDim
     } else {
         ColorRole::ButtonText
-    }
-}
-
-/// The tint a window-list button's **application** icon takes.
-///
-/// An application icon is somebody else's artwork painted in its own
-/// colours ([`IconTint::Coloured`]), so there is nothing to dim in it —
-/// a minimized Firefox is still the Firefox logo, exactly as an
-/// unfocused window's frame icon is (`docs/wm.md`). A minimized entry
-/// therefore dims the *symbolic* case only, where the glyph is one of
-/// ours and a role is what colours it.
-#[must_use]
-pub fn entry_icon_tint(minimized: bool) -> IconTint {
-    if minimized {
-        IconTint::Role(ColorRole::TextDim)
-    } else {
-        IconTint::Coloured
     }
 }
 
@@ -852,7 +841,6 @@ fn upsert(s: &mut Bar, ui: &mut Ui<Bar>, ids: Ids, info: &WindowInfo) {
             // the bar's idle claim is counted, not eyeballed.
             if dim_changed {
                 b.set_text_role(Some(entry_text_role(minimized)));
-                b.set_icon_tint(Some(entry_icon_tint(minimized)));
             }
             // The icon only when the app id moved, which is almost never:
             // an app id is fixed for a window's life in every client we
@@ -884,8 +872,28 @@ fn upsert(s: &mut Bar, ui: &mut Ui<Bar>, ids: Ids, info: &WindowInfo) {
             // was not taken.
             .icon_size(ICON_PX)
             .icon_coloured(icon.clone())
-            .icon_tint(entry_icon_tint(minimized))
-            .icon_fallback_tinted(icons::WINDOW, IconTint::Role(entry_text_role(minimized)))
+            // **The icon's tint does not follow the dimming**, and that is
+            // not an oversight — it is the one thing the minimized look
+            // must not touch. The primary icon's name is the window's
+            // **app id**, resolved in the machine's icon theme, and the
+            // role byte is the server's *selector* rather than a hint: a
+            // non-`AS_COLOURED` role means the compiled-in symbolic set
+            // and nothing else (`clients.rs::icon_handle`). So asking for
+            // `firefox` in `TextDim` is not "the Firefox logo, dimmed", it
+            // is a lookup of `firefox` in a set that does not have it —
+            // `BadIcon`, the node cleared, the toolkit's one rescue spent
+            // swapping the name for `window`, and on restore a
+            // `lookup_app("window")` that fails with the rescue already
+            // latched. The entry's icon would be gone for good, and
+            // `upsert` could not repair it: `set_icon_coloured` only fires
+            // `if icon_changed`, and the app id has not changed.
+            //
+            // It is also the right *look*, which is what
+            // `docs/wm.md` says about the frame's own app icon: somebody
+            // else's artwork has no tint to change, and a minimized
+            // Firefox is still the Firefox logo. The bracket and the
+            // dimmed label carry the state.
+            .icon_fallback_tinted(icons::WINDOW, IconTint::Role(ColorRole::ButtonText))
             .text_role(entry_text_role(minimized))
             .max_width(MAX_BUTTON_W)
             // The buttons shrink with their row, for the reason the row

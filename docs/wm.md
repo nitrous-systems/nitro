@@ -25,8 +25,8 @@ decorated the server wraps that group in a **frame group** it owns under
 
 ```
 frame group  (server)          ← Window::root(),  the whole window
-├── background rect (server)   ← border colour, rounded top corners
-├── title bar rect  (server)
+├── title bar rect  (server)   ← rounded top corners, bordered
+├── background rect (server)   ← the body below it; square, bordered
 ├── app icon        (server)   ← the window's app_id, resolved server-side
 ├── title text      (server)   ← elided with "…"
 ├── close    disc + x     (server)
@@ -173,9 +173,9 @@ with no new node — still eleven per frame, nine on a `FIXED_SIZE` one:
 ```text
   ╭───────────╮     the bar: rounded (radius 6), bordered, and
   │   title   │     grown 6 px past the top inset so its own
-  ├───────────┤  ←  bottom arcs fall behind the client's content
-  │           │     y = 6: the body's top edge, under the bar
-  │  client   │
+  ├───────────┤  ←  bottom arcs fall behind the body
+  │           │     y = 28: the body's top edge — the seam, and
+  │  client   │     the one row where both strokes land
   │           │
   └───────────┘     square bottom corners: whole-pixel geometry,
                    so the two runs *join*
@@ -183,10 +183,28 @@ with no new node — still eleven per frame, nine on a `FIXED_SIZE` one:
 
 The bar overhangs because a rect node has **one radius for all four
 corners**: a bar rounded at the top is rounded at the bottom too, so its
-lower arcs and its bottom stroke are pushed below the inset, where the
-client's content group — the last sibling, painted over them — hides
-them. What is left on screen is a bar rounded at the top and square where
-it meets the client, which is the shape it always appeared to be.
+lower arcs and its bottom stroke are pushed below the inset, where
+something must cover them. What is left on screen is a bar rounded at the
+top and square where it meets the client, which is the shape it always
+appeared to be.
+
+**What covers them is the frame's own body — and the first cut got this
+wrong in a way worth recording.** It had the body start at the corner
+radius and leaned on the *client's content group*, the last sibling, to
+hide the overhang. That holds for a client that fills its content rect,
+which every `nitro-ui` app does and the protocol requires of nobody. A
+window with a root group and no content at all showed a **192-px run of
+the bar's bottom stroke** lying across its own first rows. So the body
+starts at `TITLE_H` and is created *after* the bar, which is why the node
+list above has the bar first: siblings paint in creation order, the frame
+hides its own overhang, and the client is not part of the argument.
+`a_client_that_paints_nothing_does_not_show_the_bars_overhang` is that
+case, and it fails on the old geometry.
+
+The rule it is an instance of: **a server-drawn decoration may not depend
+on a client drawing anything.** The frame is the server's answer to "what
+does a window look like", and a client that draws nothing is a client
+exercising a right the protocol gives it, not a client misbehaving.
 
 The bottom corners are square rather than rounded-to-match because a
 rounded corner cannot be made continuous here without also clipping the
@@ -212,6 +230,17 @@ Pinned from the outside by
 at `(frame.x, frame.y + bar_height/2)` is `border_color`, the one inside
 it is bar colour, and eight pixels along **both** arms of **both** bottom
 corners are border with no desktop pixel in the run.
+
+And from the box, at 6×, same window position in both arms:
+
+![the frame's corners, before and after](frame-corners.png)
+
+The top row is the "wider than the title bar" half — the border running
+straight past the bar's arc on the left, following it on the right. The
+bottom row is the notch: on the left both runs fade out before they meet
+and the desktop shows through the corner, on the right the same 1-px
+stroke turns and carries on.
+
 
 ### Why the band is lopsided, and why it is now visible
 

@@ -614,11 +614,20 @@ fn dragging_the_title_bar_moves_the_window_by_the_drag_delta() {
     let (cx, cy) = win.content();
     assert_eq!(rgb(img.pixel(cx as u32, cy as u32)), to_rgb(RED));
 
-    // Four motions, so at most four frames plus the press and release:
+    // Four motions, so at most four frames plus the press and release —
     // the drag is *not* repainting the whole screen per motion. The real
     // bound is the damage, checked below.
+    //
+    // **Fourteen rather than twelve since #3724**, and the two extra are
+    // the cursor's: a title drag takes the `move` cross on the press and
+    // gives it back on the release, and each is a cursor-damage frame.
+    // Two per drag is the whole cost — it does not scale with the
+    // motions, which is what the bound is really for — and it is cursor
+    // damage, so `damage_px_mean` below is unmoved by it. Verified by
+    // probe rather than deduced: forcing `drag_shape` to return the
+    // arrow puts this back to exactly 11.
     let painted = h.stat("frames") - frames_before;
-    assert!(painted <= 12, "a six-event drag painted {painted} frames");
+    assert!(painted <= 14, "a six-event drag painted {painted} frames");
 
     // Old ∪ new per motion, not a full screen: one step of the drag
     // damages about twice the window's area.
@@ -2896,6 +2905,24 @@ fn the_cursor_changes_shape_over_a_resize_band() {
 /// the scene: no text is shaped, no icon rasterised, and the frame it
 /// causes is a cursor-only one. The counters are what can say "none at
 /// all"; a screenshot cannot.
+///
+/// # Why `damage_px` is *not* asserted here
+///
+/// #3724's spec asked this test to also pin "`damage_px` ≈ cursor
+/// rects", and it deliberately does not, because on this path that claim
+/// is false. Hovering a band changes two things: the cursor's shape
+/// **and** the frame's border, which lights up in `resize_hint` (#3713)
+/// — so the damage is the two cursor rects *plus* a full-height border
+/// column, and a bound written around the cursor alone would fail for
+/// what is correct behaviour.
+///
+/// The claim the spec was reaching for is that a shape change *by
+/// itself* adds no scene damage, and that is held where it is true:
+/// `Server::set_cursor_shape` damages through `damage_cursor_at`, which
+/// calls `OutputState::damage_cursor` — the accounting
+/// `cursor_only_is_true_only_when_nothing_else_is_pending` exists to
+/// keep separable from content damage. Asserting a number here would be
+/// asserting the resize hint's cost under a name that says cursor.
 #[test]
 fn hovering_a_band_changes_the_cursor_and_nothing_else() {
     let mut h = Harness::start("cursor-cost", OUT.0, OUT.1);
@@ -3105,12 +3132,7 @@ fn the_cursor_is_painted_at_the_outputs_scale() {
     h.settle();
     let shot = h.shot();
 
-    let area = Rect::new(
-        f64::from(px) as f32 - 8.0,
-        f64::from(py) as f32 - 8.0,
-        80.0,
-        80.0,
-    );
+    let area = Rect::new(px - 8.0, py - 8.0, 80.0, 80.0);
     let ink = cursor_ink(&shot, &control, area, Rect::new(-10.0, -10.0, 0.0, 0.0));
     assert!(!ink.is_empty(), "no cursor on a 2x output");
     let (bx, by, _, _) = bbox(&ink);
@@ -3137,5 +3159,90 @@ fn the_cursor_is_painted_at_the_outputs_scale() {
         "the arrow stopped short of 2x: it was painted at 1x"
     );
 
+    h.quit();
+}
+
+/// A client that paints **nothing** must not reveal the title bar's
+/// overhang.
+///
+/// The frame makes one outline out of two rects by growing the title bar
+/// `CORNER_RADIUS` past the top inset, so its own rounded *bottom* arcs
+/// and its bottom border stroke fall below the inset and something has
+/// to cover them (`wm::layout_frame`).
+///
+/// **The review asked what that something is, and the first answer was
+/// wrong.** It was the *client's* content group — the last sibling — and
+/// that holds only for a client that fills its content rect. Every
+/// `nitro-ui` app does; the protocol requires nothing of the sort. This
+/// test is the case it does not hold for: a window with a root group and
+/// no content at all. It failed before the fix with **192 px of the
+/// bar's bottom stroke** lying across the client's own first rows.
+///
+/// A server-drawn frame may not depend on a client drawing anything, so
+/// the body now starts at `TITLE_H` and is created *after* the bar: the
+/// frame hides its own overhang, and the client is not part of the
+/// argument at all.
+#[test]
+fn a_client_that_paints_nothing_does_not_show_the_bars_overhang() {
+    let mut h = Harness::start("overhang", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("overhang");
+
+    // A window with a root and nothing in it: no rect, no fill.
+    let root = NodeId(1);
+    conn.tx()
+        .create_window_with(root, "bare", WIN, Layer::Normal, 0)
+        .commit(1)
+        .unwrap();
+    conn.flush().unwrap();
+    let (pos, size) = expect(&mut conn, &mut inbox.0, "Configure", |m| match m {
+        ServerMsg::Configure(c) if c.window == root => Some((c.position, c.size)),
+        _ => None,
+    });
+    let win = Win { root, pos, size };
+    park(&mut h);
+
+    let img = h.shot();
+    let f = win.frame(true);
+    let bar_rgb = to_rgb(bar(true));
+    let border = to_rgb(role(Role::WindowBorderActive));
+    let row_border = |y: u32| {
+        ((f.x + 4.0) as u32..(f.x + f.w - 4.0) as u32)
+            .filter(|x| rgb(img.pixel(*x, y)) == border)
+            .count()
+    };
+
+    // Row 0 below the inset is the **body's own top stroke** — one pixel
+    // of border where the two rects meet, which is the seam of the single
+    // outline and is there on every frame, painted or bare. It is
+    // asserted rather than skipped, because "the seam is exactly one row"
+    // is the property that separates it from an overhang.
+    let seam = (f.y + wm::TITLE_H) as u32;
+    assert!(
+        row_border(seam) > 100,
+        "the two rects do not meet at y={seam}: only {} border px",
+        row_border(seam)
+    );
+
+    // And every row below it, through the overhang's depth and past it,
+    // carries none. That is the claim: `CORNER_RADIUS` rows of bar and a
+    // bottom stroke would be showing here without the fix.
+    for d in 1..=(wm::CORNER_RADIUS as u32 + 4) {
+        let y = seam + d;
+        let n = row_border(y);
+        assert_eq!(
+            n, 0,
+            "row {d} below the seam carries {n} px of border: the bar's \
+             overhang is showing through a client that paints nothing"
+        );
+    }
+
+    // The top-left corner is still the bar's arc: the pixel beside the
+    // bar at half its height is the border, as on any other frame.
+    let mid = (f.y + wm::TITLE_H / 2.0) as u32;
+    assert_eq!(rgb(img.pixel(f.x as u32, mid)), border);
+    assert_eq!(rgb(img.pixel(f.x as u32 + 1, mid)), bar_rgb);
+
+    drop(conn);
     h.quit();
 }

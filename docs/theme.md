@@ -179,10 +179,16 @@ black-outlined white in both schemes and has no role. It is the one thing
 that must stay legible over content the desktop does not control — a
 photo, a terminal, a client's own black window — and a dark-scheme cursor
 inverted to white-on-black would vanish against exactly the dark content
-the dark scheme exists for. `deploy/lint-colors.sh` sees no colour
-construction in `cursor.rs`: the art is bytes, and the two values it maps
-to are `Color::BLACK` and `Color::WHITE`, which the lint does not count
-as colours for the reason its header gives.
+the dark scheme exists for.
+
+The art itself constructs nothing the lint objects to: it is bytes, and
+the two values it maps them to are `Color::BLACK` and `Color::WHITE`,
+which the lint does not count as colours for the reason its header gives.
+There *is* one `Color::rgba(…)` in `cursor.rs`, in the magnified paint
+path, and it carries a `// lint-colors: allow` pragma: it reads a pixel
+back out of the already-converted mask to fill a block with, which is
+arithmetic on a value chosen above rather than a choice of its own. That
+is exactly the case the per-line escape hatch exists for.
 
 ## The switch: `server.conf`
 

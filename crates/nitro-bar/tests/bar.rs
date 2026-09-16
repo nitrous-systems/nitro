@@ -1033,3 +1033,115 @@ fn clicking_an_unfocused_entry_focuses_it_rather_than_minimizing_it() {
     drop((a, b));
     h.quit();
 }
+
+/// A minimized entry dims its **label**, and does not touch its icon.
+///
+/// The review of #3724 caught this as a real defect, and it is worth a
+/// test of its own because the failure is silent and permanent.
+///
+/// The button's primary icon is the window's **app id**, resolved in the
+/// machine's icon theme, and the role byte a `SetIcon` carries is the
+/// server's *selector* rather than a hint: a non-`AS_COLOURED` role means
+/// the compiled-in symbolic set and nothing else. So dimming that icon
+/// does not dim it — it asks for `firefox` in a set that has no
+/// `firefox`, earns `BadIcon`, spends the toolkit's one fallback swapping
+/// the name for `window`, and on restore asks `lookup_app("window")`,
+/// which also fails, with the fallback now latched. The entry's icon is
+/// gone for good, and `upsert` cannot repair it: `set_icon_coloured` only
+/// fires `if icon_changed`, and the app id never changed.
+///
+/// **The assertion is that the toggle changes nothing about the icon**,
+/// which is the machine-independent form. Naming a tint would not be: on
+/// a box with a matching theme the icon is the app id and `Coloured`, on
+/// a box without one it has already fallen back to the symbolic `window`
+/// — and `a_window_list_button_asks_for_its_app_id_as_a_coloured_icon`
+/// makes that argument at length. Either is fine; what must not happen is
+/// that *minimizing* moves it.
+#[test]
+fn a_minimized_entry_dims_its_label_and_leaves_its_icon_alone() {
+    let mut h = harness();
+    h.settle();
+    let conn = open_window(&h, "dimmable", Size::new(120.0, 90.0));
+    until(&mut h, "the window", |h| h.state().window_count() == 1);
+    h.settle();
+    let win = h.state().windows()[0];
+    until(&mut h, "the focus", |h| {
+        h.state().focused_window() == Some(win)
+    });
+    let id = named(&mut h, &nitro_bar::entry_name(win)).expect("its button");
+
+    let before = {
+        let b = h.widget::<nitro_ui::widgets::Button<Bar>>(id);
+        (
+            b.icon().map(str::to_owned),
+            b.icon_tint(),
+            b.icon_fell_back(),
+            b.text_role(),
+        )
+    };
+    assert_eq!(
+        before.3,
+        Some(nitro_ui::ColorRole::ButtonText),
+        "a visible entry's label is ordinary button text"
+    );
+
+    // Minimize it through the bar's own click, which is the path that
+    // had the bug.
+    h.click(id);
+    until(&mut h, "the minimize", |h| {
+        h.server().stat("minimized") == 1
+    });
+    until(&mut h, "the bar to hear", |h| {
+        h.state().minimized_windows() == vec![win]
+    });
+    h.settle();
+
+    {
+        let b = h.widget::<nitro_ui::widgets::Button<Bar>>(id);
+        assert_eq!(
+            b.text_role(),
+            Some(nitro_ui::ColorRole::TextDim),
+            "a minimized entry's label is dimmed"
+        );
+        assert_eq!(
+            (
+                b.icon().map(str::to_owned),
+                b.icon_tint(),
+                b.icon_fell_back()
+            ),
+            (before.0.clone(), before.1, before.2),
+            "minimizing moved the icon: name, tint or fallback state changed"
+        );
+    }
+
+    // And back, which is where the damage used to become permanent.
+    h.click(id);
+    until(&mut h, "the restore", |h| h.server().stat("minimized") == 0);
+    until(&mut h, "the focus back", |h| {
+        h.state().focused_window() == Some(win)
+    });
+    h.settle();
+
+    let b = h.widget::<nitro_ui::widgets::Button<Bar>>(id);
+    assert_eq!(
+        b.text_role(),
+        Some(nitro_ui::ColorRole::ButtonText),
+        "a restored entry's label is ordinary again"
+    );
+    assert_eq!(
+        (
+            b.icon().map(str::to_owned),
+            b.icon_tint(),
+            b.icon_fell_back()
+        ),
+        (before.0, before.1, before.2),
+        "the icon did not survive a minimize/restore round trip"
+    );
+    // Whatever the machine resolved, the icon is still *an* icon: the
+    // failure this test exists for ends with the node cleared and nothing
+    // left to name.
+    assert!(b.icon().is_some(), "the entry lost its icon entirely");
+
+    drop(conn);
+    h.quit();
+}
