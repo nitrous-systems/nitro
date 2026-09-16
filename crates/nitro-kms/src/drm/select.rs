@@ -69,22 +69,43 @@ pub fn hz_text(refresh_mhz: u32) -> String {
     }
 }
 
+/// How many modes a "no such mode" warning names before it summarises.
+///
+/// The box's HDMI connector lists **45**, which came as a surprise: the
+/// kernel's `i915_display_info` shows a handful of interesting ones and
+/// the EDID's real list runs all the way down to 720x400@70. Printed in
+/// full that is a 1 400-character log line, which is worse than useless —
+/// the reader scrolls past it. Twelve is enough to cover every mode of
+/// the size anyone asked for plus the sizes above it, and the tail is
+/// reported as a count with a pointer at `modes`, which prints all of
+/// them in a form worth reading.
+const MODES_IN_A_WARNING: usize = 12;
+
 /// Every mode a connector lists, in the spelling `output.<c>.mode` takes.
 ///
 /// This is the text a "no such mode" warning carries, and it is the whole
 /// reason that warning is worth emitting: the user asked for a mode the
 /// panel does not have, and the next thing they need is the list of the
-/// ones it does.
+/// ones it does. Truncated at [`MODES_IN_A_WARNING`] with the remainder
+/// counted — a real connector lists far more modes than a log line should
+/// carry, and a warning nobody reads is not a warning.
 #[must_use]
 pub fn describe_modes(modes: &[ModeCandidate]) -> String {
     if modes.is_empty() {
         return "none".to_owned();
     }
-    modes
+    let head = modes
         .iter()
+        .take(MODES_IN_A_WARNING)
         .map(ToString::to_string)
         .collect::<Vec<_>>()
-        .join(", ")
+        .join(", ");
+    match modes.len().checked_sub(MODES_IN_A_WARNING) {
+        Some(rest) if rest > 0 => {
+            format!("{head}, and {rest} more (`modes` on the control socket lists them all)")
+        }
+        _ => head,
+    }
 }
 
 /// Raw mode timings, the way an X-style modeline spells them.
@@ -718,6 +739,57 @@ mod tests {
         assert_eq!(request_match(&modes, &req("1920x1080@60")), None);
         assert_eq!(select_mode(&modes, Some(&req("1920x1080@60"))), Some(1));
         assert_eq!(request_match(&modes, &req("max")), Some(1));
+    }
+
+    #[test]
+    fn a_long_mode_list_is_truncated_in_a_warning() {
+        // The box's HDMI connector really lists **45** modes — the EDID
+        // runs all the way down to 720x400@70 — and printing them all
+        // produced a 1 400-character log line that a reader scrolls past.
+        // A warning nobody reads is not a warning.
+        let many: Vec<ModeCandidate> = (0..45)
+            .map(|i| m(1920 - i * 8, 1080, 60_000, i == 0))
+            .collect();
+        let text = describe_modes(&many);
+        assert!(text.len() < 400, "{} chars is a wall: {text}", text.len());
+        assert!(text.starts_with("1920x1080@60, 1912x1080@60"), "{text}");
+        assert!(
+            text.ends_with("and 33 more (`modes` on the control socket lists them all)"),
+            "the tail is counted and points at the command that prints it: {text}"
+        );
+        // A list that fits is printed whole, with no "and 0 more".
+        let few = &many[..MODES_IN_A_WARNING];
+        assert!(
+            !describe_modes(few).contains("more"),
+            "{}",
+            describe_modes(few)
+        );
+    }
+
+    #[test]
+    fn the_boxs_real_120_hz_mode_is_119_982_and_at_120_finds_it() {
+        // Measured on the box, not assumed: `modes` reports
+        // `1920x1080@119.982`, because the 285 500 kHz clock over
+        // 2080x1144 is 119.982 Hz and not a round 120. A rule that
+        // required an exact match would have failed on the one mode this
+        // whole task exists to reach — which is why the match is
+        // *nearest within 0.5 Hz* and not equality.
+        let modes = [
+            m(1920, 1080, 60_000, true),
+            m(1920, 1080, 119_982, false),
+            m(1920, 1080, 84_904, false),
+            m(1920, 1080, 59_940, false),
+        ];
+        let i = select_mode(&modes, Some(&req("1920x1080@120"))).expect("a mode");
+        assert_eq!(modes[i].refresh_mhz, 119_982);
+        // 85 likewise: the listed mode is 84.904, 96 mHz off nominal.
+        let i = select_mode(&modes, Some(&req("1920x1080@85"))).expect("a mode");
+        assert_eq!(modes[i].refresh_mhz, 84_904);
+        // And the tolerance still has a floor: 0.5 Hz is not "anything
+        // close-ish", so a rate the connector genuinely lacks is refused
+        // rather than rounded into its neighbour.
+        assert_eq!(request_match(&modes, &req("1920x1080@90")), None);
+        assert_eq!(request_match(&modes, &req("1920x1080@119")), None);
     }
 
     #[test]
