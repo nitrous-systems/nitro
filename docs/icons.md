@@ -1083,6 +1083,68 @@ files restores the built-in and the launch works again (0 → 1, argv
 first arm mean what it says. So the two halves ship in one commit;
 `docs/testbox.md` carries the rollback warning.
 
+#### The third consumer, which the first run did not census
+
+The run above measured the bar's window list, the two frames, the entry
+count and the launch — and **not** `results/N`. Review caught that the
+same commit broke the launcher's own rows, and the deduction was right:
+installing the files flips those entries from `Source::Builtin` to
+`Source::Desktop`, `row_icon` keyed the *namespace* off the source, and a
+row therefore sent `SetIcon("calculator", AS_COLOURED)` — which step 1
+misses (no theme has it), step 2 misses (`calculator.desktop` does not
+exist) and the symbolic set is forbidden to answer. All four rows fell
+back to one `window` glyph.
+
+Measured, on the box, one variable — two launcher binaries built from the
+same tree differing only in `row_icon`, each verified by md5 **after** the
+copy:
+
+| launcher row icon boxes, of 576 px (24×24) | `Icon=` (before) | app id (after) |
+|---|---|---|
+| all 6 pairs among our four rows | **0** | **293–371** |
+| distinct boxes among our four | **1** | **4** |
+| `app_icon_indirections` | **0** | **7** |
+
+And the control that makes it attributable — per row, before vs after, at
+the same screen coordinates:
+
+| row | changed |
+|---|---|
+| Calculator / Files / Settings | **329 / 361 / 281** of 576 |
+| Terminal | **81** |
+| **Foot, Foot Client, Foot Server, Hello Dialog, Htop, Nitro Demo, TeXInfo, Vim** | **0** each |
+
+Eight rows of 576 px moved **zero**. `Foot` is the load-bearing one: it
+has a real theme PNG, so its row proves the ordinary third-party path is
+untouched — for an application whose basename and `Icon=` agree, both
+spellings resolve to the same file.
+
+**Three instrument failures on this one measurement**, all of which
+returned a confident number first, and all three are the same shape as
+traps already in `docs/testbox.md`:
+
+* **The launcher is never rebuilt, only hidden**, so `hey … list` returns
+  row bounds whether or not it is showing. Censusing those coordinates
+  read the **wallpaper**, which — being a gradient — obligingly reported
+  `576/576 differing` for every pair, with 2–4 colours per box. The show
+  is now proved in pixels (~240 000 for a 600×400 overlay) before
+  anything is measured.
+* **A widget's bounds are window-local.** `hey` puts row 0 at `(12,74)`;
+  the launcher's origin on screen was `(660,340)`. Adding the two is the
+  difference between measuring icons and measuring wallpaper — the same
+  shape as `hey <app> get window bounds` returning `0,0,w,h` for the
+  frame census earlier in this task. The origin is now derived from the
+  pixels the tap changed, not from any reported coordinate.
+* **`hey nitro-launcher do launcher click` changed 0 pixels**, because a
+  scripted `click` runs the widget's callback — the input path's
+  *destination* — and the launcher's trigger is a server-side tap state
+  machine. It takes a real `ydotool key 125:1 125:0`. (`nitro-bar`'s
+  README already says this about focus; it is equally true of the tap.)
+
+A fourth was caught before it ran: the tap **toggles**, so "240 000 px
+changed" is equally consistent with showing and with hiding, and the
+first version of the guard could not tell them apart.
+
 ### Still deferred
 
 * **SVG application icons**, and the gradients they need.

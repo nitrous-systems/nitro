@@ -215,6 +215,32 @@ offers, which is also the answer to "what may I write here".
 > `~/nitro-bin`. A provenance field has to be derived from the artefact
 > it describes, not from something that is usually the same.
 
+> **And `md5sum -c` your backup against the box *before* restoring it,
+> not only after.** The rule above has a third form that cost a deploy
+> during #3723. A worker backed up `~/nitro-bin` at 07:58, the
+> orchestrator deployed main at 08:01 — three minutes into the window —
+> and the worker's restore at 08:30 put the 07:58 snapshot back and
+> reported a clean **26/26 OK**. That is what a correct restore looks
+> like, and it was a correct restore *to the wrong point in time*: it
+> silently reverted the orchestrator's deploy.
+>
+> The three forms, because they answer different questions and only the
+> last one covers this:
+>
+> | check | answers |
+> |---|---|
+> | md5 before a run (#3718) | is this binary mine **now**? |
+> | md5 before *and* after (#3722) | was it mine **throughout**? |
+> | **md5 -c before restoring (#3723)** | did anything land **while I held the box**? |
+>
+> A `md5sum -c` after the restore compares the box to *your backup*, so
+> it passes by construction whenever the restore worked — it cannot see
+> that the backup itself went stale. Run it **first**, and treat a
+> mismatch as "somebody deployed during my window; find out what before
+> overwriting it" rather than as a reason to re-copy harder. The `ls -l`
+> mtimes on `~/nitro-bin` are the cheap corroboration: a file stamped
+> inside your window that you did not put there is the whole story.
+
 ### 240 Hz at 1080p is out of reach — but 720p@240 works
 
 The human asked. The connector's own list tops out at 1080p@119.982, and
