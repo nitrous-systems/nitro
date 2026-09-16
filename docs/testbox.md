@@ -120,33 +120,51 @@ arm that silently ran at 60 while labelled 120 looks exactly like "120 Hz
 bought nothing". `~/nitro-bin/nitro-shot --modes` lists what the connector
 offers, which is also the answer to "what may I write here".
 
-### 240 Hz is not available on this source
+> **And check the md5 of the binary you are measuring, every time.** This
+> cost a measurement during #3718: a retime experiment was run against
+> what was assumed to be the new build, produced a clean-looking result,
+> and was in fact main's server — the key was inert, nothing set had any
+> effect, and the numbers were a measurement of nothing. The log said
+> `unknown output key 'mode'` the whole time. The box is shared and
+> several tasks deploy to it in an evening; `md5sum` on both ends before
+> and after is the only thing that makes an A/B mean what it says.
+
+### 240 Hz at 1080p is out of reach — but 720p@240 works
 
 The human asked. The connector's own list tops out at 1080p@119.982, and
 the reason is the link rather than the panel: HDMI 1.4 on Haswell caps the
 TMDS clock near **300 MHz**, 1080p@120 is 285.5 MHz (just under), and
 1080p@240 needs 606.5 MHz with CVT-RB. 1080p@144 (346.5) and @165 (401.0)
-do not fit either. `docs/settings.md` has the full mode table, the
-arithmetic, and the 1280×720@240 modeline experiment.
+do not fit either. `docs/settings.md` has the full mode table and the
+arithmetic.
 
-**That experiment was run, and half of it is answered.** With
-`output.HDMI-A-1.modeline = 279750 1280 1328 1360 1440 720 723 727 810
-+hsync -vsync` the kernel **accepted** the mode and the CRTC really did
-scan out at 240: `outputs` reported `1280x720@239840 … (custom)`, 380
+**A smaller mode does fit, and it was tried — successfully.** With
+
+```text
+output.HDMI-A-1.modeline = 279750 1280 1328 1360 1440 720 723 727 810 +hsync -vsync
+```
+
+(CVT-RB 1280×720@240, 279.75 MHz) the kernel accepted the mode, the CRTC
+scanned out at 240 — `outputs` reported `1280x720@239840 … (custom)`, 380
 flips in 1.7 s = **219 flips/s**, `flip_interval_mean_us` 4 491 against a
-4 167 µs period. So the link carries it.
+4 167 µs period — **and the panel syncs**: asked of the one instrument
+that can answer it, a person at the monitor, who reported a stable picture
+(*"720p 240hz!"*) on a mode this display never advertised.
 
-**Whether the panel locks is still unknown** — nobody was at the monitor.
-It is recorded as *kernel accepted, panel sync unobserved*, not as a
-working 240 Hz mode. **To close it, set the line, restart, and look at the
-screen**; that is the entire method, and it is the only one, because:
+So **this box can be measured at 240 Hz**, at 720p. That makes a 4 167 µs
+frame a real target rather than a hypothetical one, and it makes the
+pixel-path arms of a benchmark sweep interesting at a size where the frame
+is 3 686 400 B instead of 8 294 400.
 
 **If you set a modeline and the screen goes black, ssh still works**: the
 server is fine, the monitor is not. Remove the line and restart. `just
 shot` keeps working the whole time and proves **nothing** about sync — it
 reads the shadow buffer, which is the picture the server composed, not the
 picture the glass received. It returned a perfect 3 686 400-byte 1280×720
-frame during the run above, with the panel's state entirely unknown.
+frame throughout the run above, and would have returned the identical
+bytes had the panel stayed dark. **Only a person looking at the screen
+closes that question**, which is why it took two attempts hours apart to
+get an answer.
 
 ## Rules learned the hard way
 

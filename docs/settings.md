@@ -305,7 +305,8 @@ reason to trust the 279 750.
 output.HDMI-A-1.modeline = 279750 1280 1328 1360 1440 720 723 727 810 +hsync -vsync
 ```
 
-**Tried on the box, and the kernel took it.** `outputs` reported
+**Tried on the box, and it works — on the glass, not just in the CRTC.**
+`outputs` reported
 
 ```console
 HDMI-A-1 1280x720@239840 scale=1 pos=0,0 primary=1 (custom)
@@ -320,14 +321,18 @@ for. The desktop laid out at 720p without squashing anything (bar
 1280×32, launcher 600×400, settings 560×440 with its buttons row inside
 the window).
 
-**Whether the panel syncs to it is unverified.** That is a different
-question from whether the link carries it, and the only instrument for it
-is a person looking at the screen — nobody was at the box. `nitro-shot`
-returned a perfect 3 686 400-byte 1280×720 frame throughout, and that is
-**not evidence**: it reads the shadow buffer, which is the picture the
-server composed, not the picture the glass received. Recorded here as
-*kernel accepted, panel sync unobserved* rather than as a working 240 Hz
-mode. `docs/testbox.md` says how to retry it.
+**And the panel syncs.** That is a separate question from whether the link
+carries it, and the only instrument for it is a person looking at the
+screen: asked, and the answer was *"720p 240hz!"* — a stable picture at
+1280×720, on a mode this monitor never advertised. `nitro-shot` returned a
+perfect 3 686 400-byte frame throughout and is **not** what settled it: it
+reads the shadow buffer, which is the picture the server composed, not the
+picture the glass received, and it would have returned exactly the same
+bytes with the panel dark.
+
+So **240 Hz is reachable on this box at 720p**, and `docs/latency.md`'s
+budgets at a 4 167 µs frame are a real target rather than a hypothetical
+one. `docs/testbox.md` has the recipe and the recovery procedure.
 
 ### `remote.listen`
 

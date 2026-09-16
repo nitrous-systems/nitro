@@ -627,6 +627,36 @@ Every arm above prints its own flips/s against its cap: 32.5 against 60,
 32.6 against 120. Neither was measuring queue depth. **A 60-vs-120
 comparison that does not report flips/s per arm has not ruled this out.**
 
+#### A retime keeps the output; a resize replaces it — measured
+
+The reason `output.<c>.mode` is a live key rather than a restart-only one.
+A same-size retime must not reach the rest of the server as an unplug
+followed by a plug — scene removal, windows migrated to the primary,
+`OutputGone` on every socket — for a change that moves nothing on screen.
+
+No test can settle that: the fake backend *edits* an output in place and
+has no code path that could replace one, so an assertion there is vacuous
+(confirmed the hard way — breaking the rule left the fake-backend test
+green, which is why it no longer claims this). The decision itself is a
+pure function, `select::reconcile_one`, whose test does fail when the rule
+is removed. What is left is whether the DRM backend behaves as the
+function says, and only real KMS can answer it.
+
+The instrument is the server's own log: `layout_outputs` prints
+`output#N NAME: WxH@…` **only for an output it has not seen before**, so a
+new line means a new `OutputState`, which means the KMS output was
+destroyed and rebuilt.
+
+| arm | mode changes | new outputs logged |
+|---|---|---|
+| **retime** 1080p120 → 60 → 120 → 60 | 3, all same size | **0** |
+| **resize** (control) 1080p → 720p → 1080p | 2, size changes | **2** (`output#2`, `output#3`) |
+
+The control is what makes the zero mean something: the same instrument,
+the same number of reloads, one variable — whether the mode's *size*
+moved. Without it, "0 new outputs" is equally consistent with a log line
+that never fires.
+
 ### Running the comparison
 
 ```sh
@@ -638,6 +668,10 @@ box$ ~/nitro-bin/nitro-shot --outputs      # 1920x1080@120000 — check before m
 
 and back to 60 by rewriting the line to `1920x1080@60` (not by deleting
 it, if the box is the one the human left at 120 — see `docs/testbox.md`).
+**Check the `md5sum` of the deployed binary on both ends first**: a stale
+server treats `mode` as an unknown key, comes up at the default rate, and
+hands back an arm that looks like "the rate bought nothing". That cost a
+run during #3718.
 The §7 cautions all still apply, plus one that is specific to a rate
 sweep: **`outputs` before every arm.** A `mode` line that matched nothing
 is a warning in the log and the *default* mode on screen, so an arm that
