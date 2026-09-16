@@ -55,11 +55,13 @@
 //! # Painting one rect
 //!
 //! For each rect of the region: the server's background first (unless an
-//! opaque client rect covers the whole thing — [`PaintItem::opaque_cover`]
-//! is the scene's conservative promise about that), then the scene's paint
-//! list clipped to the rect, then the software cursor last. The rasterizer
-//! never writes outside the clip it was given, so one rect cannot smear
-//! into another.
+//! opaque client item covers the whole thing — [`PaintItem::opaque_cover`]
+//! is the scene's conservative promise about that, and it covers an opaque
+//! 1:1 image as well as a solid rect, which is what lets a maximised
+//! window skip the desktop and everything under it), then the scene's
+//! paint list clipped to the rect, then the software cursor last. The
+//! rasterizer never writes outside the clip it was given, so one rect
+//! cannot smear into another.
 //!
 //! # Deadlines
 //!
@@ -731,7 +733,9 @@ fn paint_item(
                 );
             }
         }
-        PaintKind::Image { size, buffer, src } => {
+        PaintKind::Image {
+            size, buffer, src, ..
+        } => {
             let Ok(buffer) = scene.buffer(buffer) else {
                 return;
             };

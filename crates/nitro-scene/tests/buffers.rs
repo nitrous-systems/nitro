@@ -4,8 +4,11 @@
 mod common;
 
 use common::{CLIENT, OTHER, OUT, damage, group, rect, scene, settle, update, window};
-use nitro_core::{IRect, Rect, Size};
-use nitro_scene::{BufferDesc, ClientId, Error, ImageRef, Layer, NodeKind, PaintKind};
+use nitro_core::{IRect, Rect, Size, Transform};
+use nitro_scene::{
+    BufferDesc, BufferKey, ClientId, Error, ImageRef, Layer, NodeKey, NodeKind, PaintItem,
+    PaintKind, Scene,
+};
 
 /// A 64x64 BGRX buffer, 4 bytes per pixel.
 fn desc() -> BufferDesc {
@@ -65,9 +68,11 @@ fn an_image_node_paints_its_source_region() {
             size: (32.0, 32.0),
             buffer,
             src,
+            opaque: false,
         }
     );
-    // An image is never an opaque occluder: the scene cannot see its alpha.
+    // This buffer's format was not declared opaque, so the scene cannot see
+    // through it and refuses to report a cover.
     assert_eq!(items[0].opaque_cover(), None);
 }
 
@@ -422,4 +427,164 @@ fn the_scene_survives_a_buffer_used_by_many_images() {
         s.node(stray).unwrap().world_bounds(),
         IRect::new(0, 100, 5, 5)
     );
+}
+
+/// The same 64x64 geometry, but declared opaque — an `XR24`-style buffer.
+fn opaque_desc() -> BufferDesc {
+    desc().with_opaque(true)
+}
+
+/// An image node on `buffer` covering `bounds`, sampling `src`.
+fn image_node(s: &mut Scene, root: NodeKey, b: BufferKey, bounds: Rect, src: IRect) -> NodeKey {
+    let node = s.create_node(CLIENT, NodeKind::Image, root, None).unwrap();
+    s.set_bounds(CLIENT, node, bounds).unwrap();
+    s.set_image(CLIENT, node, Some(ImageRef::new(b, src)))
+        .unwrap();
+    node
+}
+
+#[test]
+fn an_opaque_pixel_aligned_one_to_one_image_is_an_occluder() {
+    let mut s = scene();
+    let (_, root) = window(&mut s);
+    let d = opaque_desc();
+    let buffer = s.create_buffer(CLIENT, d, vec![0; d.byte_len()]).unwrap();
+    let node = image_node(
+        &mut s,
+        root,
+        buffer,
+        Rect::new(10.0, 20.0, 64.0, 64.0),
+        d.full_rect(),
+    );
+    settle(&mut s);
+
+    let mut items = Vec::new();
+    s.paint_list(OUT, &IRect::new(0, 0, 800, 600), &mut items);
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0].kind,
+        PaintKind::Image {
+            size: (64.0, 64.0),
+            buffer,
+            src: d.full_rect(),
+            opaque: true,
+        }
+    );
+    assert_eq!(items[0].opaque_cover(), Some(IRect::new(10, 20, 64, 64)));
+
+    // Below full opacity it stops qualifying, like every other kind.
+    s.set_opacity(CLIENT, node, 0.5).unwrap();
+    settle(&mut s);
+    assert_eq!(paint_one(&s).opaque_cover(), None);
+}
+
+fn paint_one(s: &Scene) -> PaintItem {
+    let mut items = Vec::new();
+    s.paint_list(OUT, &IRect::new(0, 0, 800, 600), &mut items);
+    assert_eq!(items.len(), 1);
+    items[0]
+}
+
+#[test]
+fn an_image_that_is_not_provably_opaque_reports_no_cover() {
+    // Every geometric negative in one table: an alpha-carrying format, a
+    // scaled image, a source rect smaller than its destination, a
+    // fractionally placed one and a fractionally sized one. Rotation needs a
+    // transform rather than bounds, so it gets its own test below.
+    let alpha = desc(); // not declared opaque
+    let opaque = opaque_desc();
+    let full = opaque.full_rect();
+    let cases: [(&str, BufferDesc, Rect, IRect); 5] = [
+        ("alpha format", alpha, Rect::new(0.0, 0.0, 64.0, 64.0), full),
+        ("scaled 2x", opaque, Rect::new(0.0, 0.0, 128.0, 128.0), full),
+        (
+            "src smaller than dst",
+            opaque,
+            Rect::new(0.0, 0.0, 64.0, 64.0),
+            IRect::new(0, 0, 32, 32),
+        ),
+        (
+            "fractional x",
+            opaque,
+            Rect::new(0.5, 0.0, 64.0, 64.0),
+            full,
+        ),
+        (
+            "fractional width",
+            opaque,
+            Rect::new(0.0, 0.0, 64.5, 64.0),
+            full,
+        ),
+    ];
+
+    for (what, d, bounds, src) in cases {
+        let mut s = scene();
+        let (_, root) = window(&mut s);
+        let b = s.create_buffer(CLIENT, d, vec![0; d.byte_len()]).unwrap();
+        image_node(&mut s, root, b, bounds, src);
+        settle(&mut s);
+        assert_eq!(paint_one(&s).opaque_cover(), None, "{what}");
+    }
+}
+
+#[test]
+fn a_rotated_opaque_image_reports_no_cover() {
+    let mut s = scene();
+    let (_, root) = window(&mut s);
+    let desc = opaque_desc();
+    let buffer = s
+        .create_buffer(CLIENT, desc, vec![0; desc.byte_len()])
+        .unwrap();
+    let g = group(&mut s, root, Rect::new(0.0, 0.0, 200.0, 200.0));
+    image_node(
+        &mut s,
+        g,
+        buffer,
+        Rect::new(0.0, 0.0, 64.0, 64.0),
+        desc.full_rect(),
+    );
+    settle(&mut s);
+    assert!(paint_one(&s).opaque_cover().is_some(), "upright");
+
+    let k = std::f32::consts::FRAC_1_SQRT_2;
+    s.set_transform(
+        CLIENT,
+        g,
+        Transform {
+            a: k,
+            b: k,
+            c: -k,
+            d: k,
+            e: 0.0,
+            f: 0.0,
+        },
+    )
+    .unwrap();
+    settle(&mut s);
+    assert_eq!(paint_one(&s).opaque_cover(), None, "rotated");
+}
+
+#[test]
+fn a_format_the_server_would_reject_is_never_an_occluder() {
+    // The hazard: two places decide "this image paints opaque pixels" — the
+    // scene's flag and the server's `pixel_format` lookup. If the flag says
+    // yes for a fourcc the painter cannot map, `paint_region` skips the
+    // background *and* every item beneath, and the painter then draws
+    // nothing: a hole. `BufferDesc::new` defaults the flag to false, so a
+    // desc built without `with_opaque` — which is every desc the server does
+    // not vouch for — cannot trigger it.
+    let mut s = scene();
+    let (_, root) = window(&mut s);
+    let d = BufferDesc::new(64, 64, 64 * 4, 0);
+    assert!(!d.is_opaque(), "the conservative default");
+    let b = s.create_buffer(CLIENT, d, vec![0; d.byte_len()]).unwrap();
+    image_node(
+        &mut s,
+        root,
+        b,
+        Rect::new(0.0, 0.0, 64.0, 64.0),
+        d.full_rect(),
+    );
+    settle(&mut s);
+    assert_eq!(paint_one(&s).opaque_cover(), None);
 }

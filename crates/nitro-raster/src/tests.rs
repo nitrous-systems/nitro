@@ -835,6 +835,89 @@ fn blit_sub_rect_one_to_one_is_exact() {
 }
 
 #[test]
+fn blit_one_to_one_handles_odd_widths_and_offsets() {
+    // The opaque 1:1 row loop stores two pixels at a time, so a row with an
+    // odd pixel count (or an odd x offset, which shifts where the pairs
+    // start) exercises the 4-byte tail. A miss here is silent corruption of
+    // the last column, so pin it at several widths and offsets.
+    let data = checker_image(16, 16, PixelFormat::Xrgb8888);
+    let img = image_of(&data, 16, 16, PixelFormat::Xrgb8888);
+    for (w, wf) in [
+        (1_u32, 1.0_f32),
+        (2, 2.0),
+        (3, 3.0),
+        (7, 7.0),
+        (9, 9.0),
+        (15, 15.0),
+    ] {
+        for (ox, oxf) in [(0_u32, 0.0_f32), (1, 1.0), (3, 3.0)] {
+            if ox + w > img.width {
+                continue; // the source rect must stay inside the image
+            }
+
+            let mut s = Surface::new(32, 8);
+            let clip = s.canvas().bounds();
+            let sr = IRect::new(iw(ox), 1, iw(w), 4);
+            s.canvas()
+                .blit(&clip, &Rect::new(oxf, 2.0, wf, 4.0), &img, &sr, 1.0);
+            for y in 0..4 {
+                for x in 0..w {
+                    let o = ((y + 1) * img.stride + (x + ox) * 4) as usize;
+                    assert_eq!(
+                        s.bgr(iw(ox + x), 2 + iw(y)),
+                        (data[o], data[o + 1], data[o + 2]),
+                        "w={w} ox={ox} ({x},{y})"
+                    );
+                    // Byte 3 is always stored as 0, whatever the source held.
+                    let d = (y as usize + 2) * s.stride as usize + (ox + x) as usize * 4 + 3;
+                    assert_eq!(s.data[d], 0, "w={w} ox={ox} x byte at ({x},{y})");
+                }
+            }
+            // The pixel just past the run is untouched.
+            assert_eq!(s.px(iw(ox + w), 2), SENTINEL, "w={w} ox={ox}");
+        }
+    }
+}
+
+#[test]
+fn blit_one_to_one_zeroes_the_x_byte_of_an_xrgb_source() {
+    // An XRGB source whose byte 3 is garbage must not leak it into the
+    // canvas: every write path in the crate stores 0 there.
+    let stride = 64_u32;
+    let mut data = vec![0u8; (stride * 4) as usize];
+    for (i, px) in data.chunks_exact_mut(4).enumerate() {
+        px.copy_from_slice(&[i as u8, 0x40, 0x80, 0xFF]);
+    }
+    let img = Image {
+        data: &data,
+        width: 5,
+        height: 4,
+        stride,
+        format: PixelFormat::Xrgb8888,
+    };
+    let mut s = Surface::new(8, 8);
+    let clip = s.canvas().bounds();
+    s.canvas().blit(
+        &clip,
+        &Rect::new(0.0, 0.0, 5.0, 4.0),
+        &img,
+        &img.bounds(),
+        1.0,
+    );
+    for y in 0..4_usize {
+        for x in 0..5_usize {
+            let o = y * stride as usize + x * 4;
+            let d = y * s.stride as usize + x * 4;
+            assert_eq!(
+                &s.data[d..d + 4],
+                &[data[o], data[o + 1], data[o + 2], 0],
+                "({x},{y})"
+            );
+        }
+    }
+}
+
+#[test]
 fn blit_straight_alpha_source_over() {
     // A 2x1 source: left fully transparent, right 50 % red.
     let mut data = vec![0u8; 64];

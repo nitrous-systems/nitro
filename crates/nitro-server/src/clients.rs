@@ -975,7 +975,15 @@ pub fn validate_buffer(m: &msg::CreateBuffer) -> Result<BufferDesc, ApplyError> 
             format!("declared size {} does not cover {need} bytes", m.size),
         ));
     }
-    Ok(BufferDesc::new(m.width, m.height, m.stride, m.format))
+    // `XR24` has no alpha channel, so every pixel of such a buffer is fully
+    // opaque and an image on it can occlude what is behind it. The flag is
+    // the scene's only knowledge of what a fourcc means, and it must agree
+    // with `frame::pixel_format`'s opaque formats exactly: if the scene says
+    // "covered" and the painter then declines to draw, the frame has a hole.
+    Ok(
+        BufferDesc::new(m.width, m.height, m.stride, m.format)
+            .with_opaque(m.format == format::XR24),
+    )
 }
 
 /// A buffer's descriptor kept alongside its fd, so `BufferDamage` can
@@ -1089,8 +1097,12 @@ mod tests {
         let ok = msg_buffer(16, 8, 64, 512, format::XR24);
         assert_eq!(
             validate_buffer(&ok).unwrap(),
-            BufferDesc::new(16, 8, 64, format::XR24)
+            BufferDesc::new(16, 8, 64, format::XR24).with_opaque(true)
         );
+        // `AR24` carries alpha, so it must not be declared opaque: the flag
+        // is what lets the compositor skip everything behind an image.
+        let alpha = msg_buffer(16, 8, 64, 512, format::AR24);
+        assert!(!validate_buffer(&alpha).unwrap().is_opaque());
 
         let bad_format = msg_buffer(16, 8, 64, 512, 0x1234_5678);
         assert_eq!(
@@ -1134,7 +1146,10 @@ mod tests {
             file.write_all(&[0xAB; 64]).unwrap();
         }
         let (desc, data) = read_buffer(&m).unwrap();
-        assert_eq!(desc, BufferDesc::new(4, 4, 16, format::XR24));
+        assert_eq!(
+            desc,
+            BufferDesc::new(4, 4, 16, format::XR24).with_opaque(true)
+        );
         assert_eq!(data, vec![0xABu8; 64]);
 
         // Rewrite one row through the fd and re-read only that row.

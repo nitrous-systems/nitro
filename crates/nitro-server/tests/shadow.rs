@@ -489,3 +489,143 @@ fn the_copy_is_measured_separately_from_the_paint() {
     assert!(plain.stat("paint_us_max") > 0);
     plain.quit();
 }
+
+/// An opaque image occludes what is behind it, and the picture is exactly
+/// what it was when nothing was occluded.
+///
+/// This is the end-to-end pin on the occlusion lever (#3728). A fullscreen
+/// opaque `XR24` image used to force the server to paint the desktop
+/// background and every item beneath it first, only to overwrite the lot;
+/// `PaintItem::opaque_cover` now qualifies such an image, so those passes
+/// are skipped. The property that must survive is pixel identity: a solid
+/// rect and an image of the same solid colour, in the same place, have to
+/// produce the same screen — the second one just gets there without
+/// painting what nobody can see.
+///
+/// The image is added *over* the rect so the occlusion actually fires:
+/// adding it damages exactly its own bounds, the item covers that clip,
+/// and everything below — the rect, the window's frame background, the
+/// desktop — is skipped. If the cover were wrong in either direction the
+/// two screenshots diverge.
+#[test]
+fn an_opaque_image_occludes_without_changing_a_pixel() {
+    use nitro_wire::msg::CreateBuffer;
+    use nitro_wire::types::{BufferId, format};
+    use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
+
+    let h = Harness::start("occlusion", true);
+    let mut conn = h.client("painter");
+    let size = Size::new(96.0, 64.0);
+    // (b, g, r) as the buffer stores them; the same colour as the rect.
+    let (b, g, r) = (0x20u8, 0xC0u8, 0x80u8);
+    window(&h, &mut conn, size, Color::rgb(r, g, b));
+    let with_rect = h.front();
+
+    // An XR24 buffer of that colour, the exact size of the window content,
+    // with a garbage X byte to prove the blit masks it off.
+    let (bw, bh) = (size.w as u32, size.h as u32);
+    let stride = bw * 4;
+    let fd = memfd_create("nitro-occlusion", MemfdFlags::CLOEXEC).unwrap();
+    ftruncate(&fd, u64::from(stride) * u64::from(bh)).unwrap();
+    let pixels: Vec<u8> = (0..(stride * bh))
+        .map(|i| match i % 4 {
+            0 => b,
+            1 => g,
+            2 => r,
+            _ => 0xFF,
+        })
+        .collect();
+    {
+        let mut file = std::fs::File::from(fd.try_clone().unwrap());
+        file.write_all(&pixels).unwrap();
+    }
+
+    let image = NodeId(3);
+    conn.tx()
+        .create_buffer(CreateBuffer {
+            id: BufferId(1),
+            width: bw,
+            height: bh,
+            stride,
+            format: format::XR24,
+            size: stride * bh,
+            fd,
+        })
+        .create_image(image, NodeId(1), Rect::new(0.0, 0.0, size.w, size.h))
+        .image(image, BufferId(1), nitro_core::IRect::new(0, 0, 96, 64))
+        .commit(50)
+        .unwrap();
+    conn.flush().unwrap();
+    h.settle();
+
+    assert_same(
+        &h.front(),
+        &with_rect,
+        "an opaque image over an identical rect",
+    );
+    h.quit();
+}
+
+/// An image that carries alpha does *not* occlude: what is behind it still
+/// has to be painted, or the blend has nothing to blend against.
+///
+/// The negative half of the occlusion pin. An `AR24` buffer at 50 % alpha
+/// over a known rect must come out as the blend of the two; if the scene
+/// wrongly reported a cover, the server would skip the rect and the frame
+/// background and blend against whatever the buffer happened to hold.
+#[test]
+fn an_image_with_alpha_does_not_occlude() {
+    use nitro_wire::msg::CreateBuffer;
+    use nitro_wire::types::{BufferId, format};
+    use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
+
+    let h = Harness::start("occlusion-alpha", true);
+    let mut conn = h.client("painter");
+    let size = Size::new(96.0, 64.0);
+    let c = window(&h, &mut conn, size, Color::rgb(0x00, 0x00, 0xFF));
+
+    let (bw, bh) = (size.w as u32, size.h as u32);
+    let stride = bw * 4;
+    let fd = memfd_create("nitro-occlusion-alpha", MemfdFlags::CLOEXEC).unwrap();
+    ftruncate(&fd, u64::from(stride) * u64::from(bh)).unwrap();
+    // Straight-alpha red at a = 128 over the blue rect.
+    let pixels: Vec<u8> = (0..(stride * bh))
+        .map(|i| match i % 4 {
+            0 | 1 => 0x00,
+            2 => 0xFF,
+            _ => 0x80,
+        })
+        .collect();
+    {
+        let mut file = std::fs::File::from(fd.try_clone().unwrap());
+        file.write_all(&pixels).unwrap();
+    }
+
+    let image = NodeId(3);
+    conn.tx()
+        .create_buffer(CreateBuffer {
+            id: BufferId(1),
+            width: bw,
+            height: bh,
+            stride,
+            format: format::AR24,
+            size: stride * bh,
+            fd,
+        })
+        .create_image(image, NodeId(1), Rect::new(0.0, 0.0, size.w, size.h))
+        .image(image, BufferId(1), nitro_core::IRect::new(0, 0, 96, 64))
+        .commit(50)
+        .unwrap();
+    conn.flush().unwrap();
+    h.settle();
+
+    let px = h
+        .front()
+        .pixel(c.position.x as u32 + 8, c.position.y as u32 + 8);
+    let (red, green, blue) = ((px >> 16) & 0xFF, (px >> 8) & 0xFF, px & 0xFF);
+    assert!(red > 0x70 && red < 0x90, "half red, got {px:#010x}");
+    assert_eq!(green, 0, "no green anywhere, got {px:#010x}");
+    assert!(blue > 0x70 && blue < 0x90, "half blue, got {px:#010x}");
+
+    h.quit();
+}

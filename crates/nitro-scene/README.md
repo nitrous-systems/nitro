@@ -267,12 +267,32 @@ never cleared.
 *guaranteed* to fill with fully opaque pixels, so a rasterizer can skip what is
 behind it. It is deliberately conservative, because only under-reporting is
 sound here — over-reporting would let a caller drop content that is in fact
-visible. An item qualifies only when it is a fully opaque, square-cornered,
-axis-aligned solid rect *whose device rect lands on exact pixel boundaries*:
-`bounds` is rounded outward, so a rect on a half-pixel edge covers its boundary
-pixels only partially and reports `None`. Rounded corners, a translucent fill
-or border, accumulated opacity below 1.0 and rotation all disqualify it too.
-Images never qualify: the scene cannot see their alpha.
+visible. Two kinds qualify:
+
+- a fully opaque, square-cornered, axis-aligned **solid rect** *whose device
+  rect lands on exact pixel boundaries*: `bounds` is rounded outward, so a rect
+  on a half-pixel edge covers its boundary pixels only partially and reports
+  `None`. Rounded corners, a translucent fill or border, accumulated opacity
+  below 1.0 and rotation all disqualify it too.
+- an **image on a buffer whose format was declared opaque**
+  (`BufferDesc::is_opaque`), drawn axis-aligned, pixel-aligned, and exactly 1:1
+  with its source rect. Scaling disqualifies it: a scaled blit samples across
+  its source edges, so its coverage of the destination's boundary pixels is a
+  property of the sampler rather than of the rect, and the sound answer there is
+  to say nothing. The 1:1 test is deliberately stricter than the rasterizer's
+  epsilon, for the same reason.
+
+The scene still never looks inside a pixel and still does not know what any
+fourcc means: `is_opaque` is a boolean the *server* computed at
+`create_buffer` time and handed over, and it defaults to `false`, so a
+`BufferDesc` built without `with_opaque` costs an occlusion opportunity rather
+than risking a hole. That default is load-bearing — the flag must be true only
+for formats the painter will actually accept, because if the scene says
+"covered" and the painter then declines to draw, the frame has nothing in it
+where the background was skipped.
+
+This is what lets a maximised opaque window skip the desktop background and
+every window beneath it, which is most of a fullscreen repaint's cost (#3728).
 
 **`hit_test(output, point)`** returns the topmost window, deepest node, and the
 point in that node's local coordinates (via `Transform::invert`, so rotation and
@@ -320,7 +340,9 @@ explicit scratch stack and do not recurse at all.
 
 `create_buffer` takes ownership of a copy of the client's pixels; the scene
 holds them until `destroy_buffer`. The format is an opaque fourcc — the scene
-never looks inside a pixel, it only checks that the described bytes exist.
+never looks inside a pixel, it only checks that the described bytes exist. The
+one thing it records about the format is `BufferDesc::with_opaque`, and even
+that is a boolean the caller computed; see `opaque_cover` above.
 
 `buffer_mut` hands out `&mut [u8]` for in-place updates. Writing there changes
 nothing on screen until `buffer_damaged(key, rects)` says which pixels moved;

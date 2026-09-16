@@ -1067,7 +1067,28 @@ impl<'a> Canvas<'a> {
             let dstart = y as usize * self.stride as usize + lo as usize * BYTES_PER_PIXEL;
             let drow = &mut self.data[dstart..dstart + slen];
             if opaque {
-                for (d, s) in drow.chunks_exact_mut(4).zip(srow.chunks_exact(4)) {
+                // Two pixels per store. The obvious per-pixel form —
+                // `d.copy_from_slice(&[s[0], s[1], s[2], 0])` — does not
+                // vectorize on a baseline `x86-64` target (LLVM emits a byte
+                // shuffle), and measured 3.6x slower than this at 1920x1080.
+                // Widening to a `u64` reaches memcpy speed with no SIMD, no
+                // intrinsics and no `unsafe`.
+                //
+                // The mask is not optional: it zeroes both X bytes, which is
+                // the crate-wide contract that byte 3 of a stored pixel is 0.
+                // A plain row `copy_from_slice` would propagate the client's
+                // byte 3 and is a behaviour change, not an optimisation.
+                const KEEP: u64 = 0x00FF_FFFF_00FF_FFFF;
+                let pairs = drow.len() & !7;
+                let (dhead, dtail) = drow.split_at_mut(pairs);
+                let (shead, stail) = srow.split_at(pairs);
+                for (d, s) in dhead.chunks_exact_mut(8).zip(shead.chunks_exact(8)) {
+                    let v = u64::from_le_bytes(s.try_into().unwrap_or([0; 8])) & KEEP;
+                    d.copy_from_slice(&v.to_le_bytes());
+                }
+                // `drow.len()` is always a multiple of 4, so the tail is one
+                // pixel at most.
+                for (d, s) in dtail.chunks_exact_mut(4).zip(stail.chunks_exact(4)) {
                     d.copy_from_slice(&[s[0], s[1], s[2], 0]);
                 }
             } else {

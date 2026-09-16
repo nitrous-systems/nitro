@@ -34,6 +34,10 @@ pub enum PaintKind {
         buffer: BufferKey,
         /// Source region in buffer pixels.
         src: IRect,
+        /// Whether the buffer's pixels are fully opaque, copied from its
+        /// [`BufferDesc::is_opaque`](crate::BufferDesc::is_opaque) so that
+        /// [`PaintItem::opaque_cover`] stays a pure function of the item.
+        opaque: bool,
     },
     /// A shaped text run, drawn from the caller's text store.
     ///
@@ -112,12 +116,22 @@ impl PaintItem {
     ///
     /// Deliberately conservative: it is only ever sound to *under*-report
     /// here, since over-reporting would let a caller skip content that is in
-    /// fact visible through a partially covered pixel. An item qualifies only
-    /// when it is a fully opaque, square-cornered, axis-aligned solid rect
-    /// whose device rect lands on exact pixel boundaries; anything else —
-    /// rounded corners, a translucent fill or border, accumulated opacity
-    /// below 1.0, rotation, or a fractional edge — reports `None`. Images
-    /// never qualify: the scene cannot see their alpha.
+    /// fact visible through a partially covered pixel. Two kinds qualify:
+    ///
+    /// - a fully opaque, square-cornered, axis-aligned solid rect whose
+    ///   device rect lands on exact pixel boundaries;
+    /// - an image on a buffer whose format was declared opaque
+    ///   ([`BufferDesc::is_opaque`](crate::BufferDesc::is_opaque)), drawn
+    ///   axis-aligned, pixel-aligned and 1:1 with its source rect.
+    ///
+    /// Anything else — rounded corners, a translucent fill or border,
+    /// accumulated opacity below 1.0, rotation, a fractional edge, a scaled
+    /// or alpha-carrying image, text, an icon — reports `None`.
+    ///
+    /// The 1:1 requirement on an image is what makes the answer checkable by
+    /// eye: a scaled blit samples across its source edges, so its coverage of
+    /// the destination's boundary pixels is a property of the sampler rather
+    /// than of the rect, and the sound answer is to say nothing.
     #[must_use]
     pub fn opaque_cover(&self) -> Option<IRect> {
         if self.opacity < 1.0 {
@@ -149,6 +163,31 @@ impl PaintItem {
                     && exact.w.fract() == 0.0
                     && exact.h.fract() == 0.0;
                 if aligned { Some(self.bounds) } else { None }
+            }
+            PaintKind::Image {
+                size, src, opaque, ..
+            } => {
+                if !(opaque && self.transform.is_axis_aligned()) {
+                    return None;
+                }
+                let local = Rect::new(0.0, 0.0, size.0, size.1);
+                let exact = self.transform.apply_rect(&local);
+                let aligned = exact.x.fract() == 0.0
+                    && exact.y.fract() == 0.0
+                    && exact.w.fract() == 0.0
+                    && exact.h.fract() == 0.0;
+                // Pixel-aligned, so the outward-rounded device rect *is* the
+                // exact one and the 1:1 test can be made in integers. It is
+                // deliberately stricter than the rasterizer's epsilon:
+                // under-reporting is the sound direction, and exact equality
+                // is the clause a reviewer can check by eye.
+                let device = device_rect(&self.transform, local);
+                let one_to_one = device.w == src.w && device.h == src.h && src.w > 0 && src.h > 0;
+                if aligned && one_to_one {
+                    Some(self.bounds)
+                } else {
+                    None
+                }
             }
             _ => None,
         }
@@ -244,6 +283,13 @@ impl Scene {
                         size,
                         buffer: image.buffer,
                         src: image.src,
+                        // A stale key cannot happen (the node would have been
+                        // emptied), but if it did, `false` is the answer that
+                        // costs nothing but an occlusion.
+                        opaque: self
+                            .buffers
+                            .get(image.buffer)
+                            .is_some_and(|b| b.desc.is_opaque()),
                     }),
                     NodeData::Text(Some(text)) => Some(PaintKind::Text {
                         key: text.key,

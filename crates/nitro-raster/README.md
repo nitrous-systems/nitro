@@ -567,6 +567,66 @@ The rules that follow, for anyone optimizing this crate:
   were the same lesson found earlier from the other direction; they were
   rejected on the heap benchmark too, so they stay rejected.
 
+### The 1:1 opaque blit stores two pixels at a time
+
+`blit_1to1` is the path every unscaled, pixel-aligned image takes — which is
+every fullscreen client buffer the compositor puts on screen. Its opaque arm
+used to copy one pixel per iteration:
+
+```rust
+for (d, s) in drow.chunks_exact_mut(4).zip(srow.chunks_exact(4)) {
+    d.copy_from_slice(&[s[0], s[1], s[2], 0]);
+}
+```
+
+That four-byte array literal **defeats the autovectorizer on a baseline
+`x86-64` target**: LLVM cannot see a wide load/mask/store in it and emits a
+byte shuffle instead. The cost is not subtle, and it depends entirely on what
+the binary was compiled for — measured standalone at 1920×1080:
+
+| codegen target | the old loop | `u64` masked pairs | plain memcpy |
+|---|---|---|---|
+| `x86-64` (the default, and what ships) | **0.36 ns/px** | **0.10** | 0.12 |
+| `x86-64 +sse4.2` | 0.196 | 0.124 | 0.12 |
+| `haswell` / `native` (AVX2) | 0.127 | 0.124 | 0.12 |
+
+So on the target we actually build for, the loop cost **3× a memcpy** of the
+same bytes, and the whole gap closes on AVX2 — the compiler was doing the
+right thing all along wherever it had the instructions to do it with.
+
+The fix is to widen the store, not to reach for intrinsics:
+
+```rust
+const KEEP: u64 = 0x00FF_FFFF_00FF_FFFF; // zero both X bytes
+```
+
+Two pixels per `u64`, masked, plus a ≤1-pixel 4-byte tail (`drow.len()` is
+always a multiple of 4, so `& !7` leaves 0 or 4 bytes). Output is
+**bit-identical to the old loop by construction** — same three channels, same
+zeroed X byte — so no golden hash moves, which is the check that it is a
+re-spelling and not a behaviour change.
+
+**The mask is not optional.** It is what keeps the crate-wide contract that
+every write path stores 0 in byte 3 (see [the blit row
+split](#the-blit-row-split), which is where that contract is argued). A plain
+`copy_from_slice` of the whole row benched ~2 % faster still and is *wrong*:
+it propagates the client's byte 3 into the canvas, and whether byte 3 is
+preserved is a decision about the pixel-format contract, not a blit detail.
+`blit_one_to_one_zeroes_the_x_byte_of_an_xrgb_source` pins it against a source
+whose byte 3 is `0xFF`.
+
+**No `unsafe`, no intrinsics, no new dependency.** The tree denies `unsafe`,
+and the interesting part of the result is that it did not need any: 64-bit
+general-purpose stores reach memcpy speed on a machine with no AVX2 at all,
+which is precisely the machine (a Haswell Pentium) where the cost was
+measured. `blit_one_to_one_handles_odd_widths_and_offsets` sweeps widths 1–15
+and odd x offsets so the tail loop cannot silently corrupt the last column.
+
+This is one of the two levers in #3728; the other one is not in this crate —
+see `nitro-scene`'s `opaque_cover`. Together they cut a fullscreen 1080p
+repaint's paint time by ~3× locally.
+
+
 ### The blit row split
 
 The scaled blit walks one destination row at a time. The original loop did,
