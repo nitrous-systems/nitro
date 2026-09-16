@@ -151,11 +151,28 @@ same `mode` line, costs nothing at all: the comparison happens before the
 hardware is touched.
 
 A **refresh** change at the same size (1080p60 → 1080p120) is the cheap
-case and the one this key is mostly for: no buffer changes size, so the
-shadow and both scanout buffers stay exactly as they are. A **size**
-change reallocates them and re-lays-out the desktop, which is the same
-path a hotplug already takes — it works, and it is a visibly bigger
-event.
+case and the one this key is mostly for. The output is **retimed in
+place**: the CRTC's mode blob is swapped and the modeset re-run, while the
+output keeps its identity, both scanout buffers, their framebuffer ids and
+the shadow. Nothing is reallocated and nothing is repainted, because the
+buffers are the right size and already hold the right pixels.
+
+That is a deliberate special case rather than something that falls out.
+The backend's reconcile pass otherwise drops any output whose mode changed
+and builds a fresh one — and a fresh one has a **new output id**, which
+reaches the rest of the server as an unplug followed by a plug: the scene
+removes the output, every window on it is migrated to the primary, and
+every connected client is sent `OutputGone` before the replacement is
+announced. For a rate change, which alters no geometry at all, that is a
+great deal of damage for nothing. So the rule is in one place and is
+tested as a pure function (`select::reconcile_one`): **same size → retime,
+different size → replace.**
+
+A **size** change takes the replace path, and should: the buffers really
+are the wrong size and the clients really do need reconfiguring. The
+scanout buffers and the shadow are reallocated and the desktop is
+re-laid-out, which is the same path a hotplug already takes — it works,
+and it is a visibly bigger event.
 
 The key is also read **before the first modeset**, not after it: the
 server reads `server.conf` before it opens the card, so a box configured

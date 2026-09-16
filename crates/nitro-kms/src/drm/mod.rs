@@ -87,10 +87,17 @@ impl BasicDevice for Card<'_> {}
 impl ControlDevice for Card<'_> {}
 
 /// Options for [`DrmBackend::open`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct DrmOptions {
     /// Open a kernel uevent socket for hotplug. Failure to open it is not
     /// fatal (see [`DrmBackend::hotplug_error`]).
+    ///
+    /// **`true` in [`DrmOptions::default`]**, and the explicit `impl` below
+    /// is there to keep it that way: a `#[derive(Default)]` would silently
+    /// make it `false` the moment a second field was added, which is
+    /// exactly what happened once during #3718 and which nothing catches —
+    /// a backend with no uevent socket compiles, runs, and simply never
+    /// sees a monitor being plugged in.
     pub hotplug: bool,
     /// What mode each connector should run, by connector name
     /// (`HDMI-A-1`). A connector not named here, or one whose request
@@ -99,11 +106,9 @@ pub struct DrmOptions {
     pub modes: HashMap<String, ModeRequest>,
 }
 
-impl DrmOptions {
-    /// Hotplug on, no mode overrides: what a caller with nothing to say
-    /// wants, and what `Default` used to mean before `modes` existed.
-    #[must_use]
-    pub fn with_hotplug() -> Self {
+impl Default for DrmOptions {
+    /// Hotplug on, no mode overrides.
+    fn default() -> Self {
         Self {
             hotplug: true,
             modes: HashMap::new(),
@@ -334,6 +339,15 @@ fn connector_name(info: &connector::Info) -> String {
 /// `DRM_MODE_TYPE_USERDEF` is set because that is what the flag means, and
 /// it is how `i915_display_info` will show the mode came from us.
 fn mode_from_modeline(ml: &Modeline) -> Mode {
+    // `Modeline::parse` enforces the 16-bit fit and the timing ordering,
+    // and the fields are `pub`, so a hand-built one could violate both and
+    // silently truncate in the casts below. Only tests construct one
+    // directly today; this keeps it that way.
+    debug_assert!(
+        ml.check().is_ok(),
+        "modeline invariants: {:?}",
+        ml.check().err()
+    );
     let mut raw = drm_ffi::drm_mode_modeinfo {
         clock: ml.clock_khz,
         hdisplay: ml.hdisplay as u16,
@@ -616,6 +630,19 @@ impl<'fd> DrmBackend<'fd> {
     /// The test names a CRTC the connector can actually use; without one
     /// the commit is rejected for the wrong reason and a perfectly good
     /// modeline would look unsupported.
+    ///
+    /// **It takes the lowest CRTC the connector *can* use, without
+    /// excluding one already driving another connector**, and on a
+    /// multi-head box that is a known false negative: the kernel may
+    /// refuse because the CRTC is busy rather than because the timings
+    /// are undrivable, and the modeline is then dropped with a warning
+    /// quoting an error about the wrong thing. Left as it is on purpose
+    /// — the cost of being wrong is one warning and the default mode (the
+    /// whole fallback path exists for exactly that), and doing better
+    /// means running `select::assign` here against a set of assignments
+    /// that do not exist yet, because this runs *during* the probe that
+    /// produces them. The single-output case, which is every box this has
+    /// run on, is exact.
     fn test_mode(
         &self,
         handle: connector::Handle,
@@ -727,27 +754,97 @@ impl<'fd> DrmBackend<'fd> {
         })
     }
 
+    /// Swap output `idx`'s mode for `probed`'s, keeping everything else.
+    ///
+    /// The cheap half of a mode change, and the reason `reconcile` treats
+    /// a retime differently from a resize: the two dumb buffers are the
+    /// right size already, so the [`OutputId`], the `FrameBuf`s, the
+    /// framebuffer ids and the plane's committed `FB_ID` all survive. Only
+    /// the CRTC's `MODE_ID` blob is replaced — and the caller's
+    /// [`Backend::rescan`] follows with `modeset_all`, which is what
+    /// actually retimes the CRTC.
+    ///
+    /// The old blob is destroyed **after** the new one exists, so a
+    /// failure part-way leaves the output on a blob the kernel still
+    /// holds rather than on a dangling id.
+    fn retime(&mut self, idx: usize, probed: &Probed) -> Result<(), Error> {
+        let blob = match self.card.create_property_blob(&probed.mode) {
+            Ok(property::Value::Blob(id)) => id,
+            Ok(_) => unreachable!("create_property_blob returns Blob"),
+            Err(e) => {
+                return Err(Error::Io {
+                    op: "create mode blob",
+                    source: e,
+                });
+            }
+        };
+        let cand = mode_candidate(&probed.mode);
+        let o = &mut self.outputs[idx];
+        let old = o.mode_blob;
+        o.mode = probed.mode;
+        o.mode_blob = blob;
+        o.info.refresh_mhz = cand.refresh_mhz;
+        o.info.custom_mode = probed.custom;
+        // A retime is a modeset: whatever was in flight is abandoned, on
+        // the same terms `Backend::resume` promises. The buffers keep
+        // their contents — they are the right size and the right pixels —
+        // so `front` is left alone and nothing needs repainting.
+        o.pending = false;
+        let _ = self.card.destroy_property_blob(old);
+        Ok(())
+    }
+
     /// Diff the probed connectors against the current outputs. Returns
     /// whether anything changed.
+    ///
+    /// A **same-size retime** (1080p60 → 1080p120) keeps the output: same
+    /// [`OutputId`], same buffers, only the mode blob swapped
+    /// ([`DrmBackend::retime`]). That is what makes
+    /// `output.<connector>.mode` a live key rather than a restart-only
+    /// one — without it a rate change destroys the output and recreates
+    /// it under a new id, which reaches the server as an unplug followed
+    /// by a plug: the scene drops the output, every window on it is
+    /// migrated to the primary, and every wire client is sent
+    /// `OutputGone`. For a change the user asked for and that alters
+    /// nothing about the geometry, that is a great deal of damage.
+    ///
+    /// A **size** change still tears down and rebuilds, because the
+    /// buffers really are the wrong size and every client really does
+    /// need reconfiguring.
     fn reconcile(&mut self, probed: &[Probed]) -> Result<bool, Error> {
         let mut changed = false;
 
-        // 1. Drop outputs whose connector is gone or whose mode changed.
+        // 1. Drop outputs whose connector is gone, whose mode changed
+        //    size, or whose CRTC/plane moved under them. Retime the ones
+        //    that only changed timing.
         let mut i = 0;
         while i < self.outputs.len() {
             let o = &self.outputs[i];
-            let keep = probed.iter().any(|p| {
+            // A probed connector counts as "this output's" only when its
+            // CRTC and plane are still where they were; a resource that
+            // moved under us is a rebuild whatever the mode says.
+            let matched = probed.iter().find(|p| {
                 p.info.handle() == o.connector
-                    && p.mode == o.mode
                     && self.res.crtcs().get(o.crtc_idx) == Some(&o.crtc)
                     && self.planes.get(o.plane_idx) == Some(&o.plane)
             });
-            if keep {
-                i += 1;
-            } else {
-                let o = self.outputs.remove(i);
-                o.destroy(&self.card);
-                changed = true;
+            let dims = |m: &Mode| {
+                let (w, h) = m.size();
+                (u32::from(w), u32::from(h), mode_candidate(m).refresh_mhz)
+            };
+            match select::reconcile_one(dims(&o.mode), matched.map(|p| dims(&p.mode))) {
+                select::Reconcile::Keep => i += 1,
+                select::Reconcile::Retime => {
+                    let p = matched.expect("Retime is only returned for a matched connector");
+                    self.retime(i, p)?;
+                    changed = true;
+                    i += 1;
+                }
+                select::Reconcile::Replace => {
+                    let o = self.outputs.remove(i);
+                    o.destroy(&self.card);
+                    changed = true;
+                }
             }
         }
 
@@ -1116,6 +1213,18 @@ impl Drop for DrmBackend<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_default_options_keep_hotplug_on() {
+        // Regression, and the reason `DrmOptions` has a hand-written
+        // `Default`: a `#[derive(Default)]` makes this `false`, every
+        // caller still compiles, and the only symptom is that plugging a
+        // monitor in does nothing. Nothing else in the tree catches that,
+        // because a backend without a uevent socket is perfectly healthy
+        // right up to the moment a cable moves.
+        assert!(DrmOptions::default().hotplug);
+        assert!(DrmOptions::default().modes.is_empty());
+    }
 
     #[test]
     fn damage_blob_layout_is_x1y1x2y2_clipped() {

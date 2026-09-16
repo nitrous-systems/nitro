@@ -236,10 +236,21 @@ impl FakeBackend {
     /// Resolve output `i`'s configured mode against its table and resize
     /// it if the answer moved. Returns whether anything changed.
     ///
-    /// The same shape the DRM backend has: an unmatched request is a
-    /// warning naming what the connector *does* list, plus the default
-    /// mode. Buffers are reallocated when the size changes, because on a
-    /// real backend that is a fresh pair of dumb buffers too.
+    /// An unmatched request is a warning naming what the connector *does*
+    /// list, plus the default mode — the same shape the DRM backend has.
+    /// Buffers are reallocated when the size changes, because on a real
+    /// backend that is a fresh pair of dumb buffers too.
+    ///
+    /// **Where this backend cannot stand in for the real one.** A fake
+    /// output is *edited*, so it keeps its [`OutputId`] across any mode
+    /// change by construction — there is no code path here that could
+    /// replace one. The DRM backend has to actively decide not to
+    /// (`select::reconcile_one` returning `Retime` rather than
+    /// `Replace`), and that decision is the whole of what makes
+    /// `output.<c>.mode` a live key. So a test on this backend asserting
+    /// the id survives a retime is **vacuous** and must not be read as
+    /// evidence for the DRM path; `a_retime_keeps_the_output_and_a_resize_replaces_it`
+    /// in `drm/select.rs` tests the rule itself.
     fn apply_mode(&mut self, i: usize) -> bool {
         let table = self.specs[i].mode_table();
         let name = self.specs[i].name.clone();
@@ -651,6 +662,10 @@ mod tests {
         let mut b = multi_mode();
         // Preferred first, which is the 60.
         assert_eq!(b.outputs()[0].refresh_mhz, 60_000);
+        // Deliberately *not* asserting the `OutputId` survives: on this
+        // backend an output is edited and could not get a new id however
+        // the code were broken, so such an assertion would be vacuous.
+        // The rule that matters is `select::reconcile_one`, tested there.
         assert!(b.set_modes(&want("HDMI-A-1", "1920x1080@120")).unwrap());
         assert_eq!(b.outputs()[0].refresh_mhz, 120_000);
         assert_eq!((b.outputs()[0].width, b.outputs()[0].height), (1920, 1080));

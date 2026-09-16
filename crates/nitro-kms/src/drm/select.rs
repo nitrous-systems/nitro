@@ -198,7 +198,15 @@ impl Modeline {
 
     /// Reject timings the kernel would reject, or that would divide by
     /// zero on the way there.
-    fn check(&self) -> Result<(), String> {
+    ///
+    /// Called by [`Modeline::parse`], which is how every modeline from a
+    /// file or the environment arrives. The fields are `pub`, so a
+    /// hand-built one bypasses it — `mode_from_modeline` therefore
+    /// `debug_assert!`s on this before casting each timing to `u16`.
+    ///
+    /// # Errors
+    /// A message naming what is wrong, suitable for a warning line.
+    pub fn check(&self) -> Result<(), String> {
         if self.clock_khz == 0 {
             return Err("modeline clock is 0".to_owned());
         }
@@ -479,6 +487,52 @@ pub fn refresh_millihertz(
         den *= u64::from(vscan);
     }
     (num / den) as u32
+}
+
+/// What to do with an existing output when the connector was re-probed.
+///
+/// Extracted from `DrmBackend::reconcile` so the rule is testable without
+/// a device, which is this module's whole reason to exist. The rule is
+/// short but it is the difference between `output.<c>.mode` being a live
+/// key and a restart-only one, and it is not visible from the DRM code
+/// that implements it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reconcile {
+    /// Nothing moved: leave the output completely alone.
+    Keep,
+    /// Same size, different timing. Swap the CRTC's mode blob and keep
+    /// the output — same id, same buffers, same framebuffers.
+    ///
+    /// The case that matters: a rate change alters no geometry, so
+    /// destroying the output would reach the server as an unplug followed
+    /// by a plug — the scene drops it, its windows migrate to the
+    /// primary, and every client is sent `OutputGone` — for a change the
+    /// user asked for and that moves nothing.
+    Retime,
+    /// The connector is gone, the mode changed **size**, or the CRTC or
+    /// plane moved. Destroy the output and build a fresh one: the buffers
+    /// really are the wrong size and the clients really do need
+    /// reconfiguring.
+    Replace,
+}
+
+/// Decide [`Reconcile`] for one output.
+///
+/// `probed` is the mode the connector now wants, `None` when the
+/// connector is gone or its resources moved. `current` is the mode the
+/// output is on. Sizes are `(width, height)` in pixels.
+#[must_use]
+pub fn reconcile_one(current: (u32, u32, u32), probed: Option<(u32, u32, u32)>) -> Reconcile {
+    let Some(p) = probed else {
+        return Reconcile::Replace;
+    };
+    if p == current {
+        Reconcile::Keep
+    } else if (p.0, p.1) == (current.0, current.1) {
+        Reconcile::Retime
+    } else {
+        Reconcile::Replace
+    }
 }
 
 /// A connected connector as far as CRTC assignment is concerned.
@@ -790,6 +844,33 @@ mod tests {
         // rather than rounded into its neighbour.
         assert_eq!(request_match(&modes, &req("1920x1080@90")), None);
         assert_eq!(request_match(&modes, &req("1920x1080@119")), None);
+    }
+
+    #[test]
+    fn a_retime_keeps_the_output_and_a_resize_replaces_it() {
+        use Reconcile::{Keep, Replace, Retime};
+        let at = |w, h, r| (w, h, r);
+        let cur = at(1920, 1080, 60_000);
+
+        // Nothing moved.
+        assert_eq!(reconcile_one(cur, Some(cur)), Keep);
+
+        // The case this whole distinction exists for: 1080p60 → 1080p120
+        // changes no geometry, so destroying the output would reach the
+        // server as an unplug followed by a plug — scene drops it, windows
+        // migrate to the primary, every client gets `OutputGone` — for a
+        // change the user asked for that moves nothing on screen.
+        assert_eq!(reconcile_one(cur, Some(at(1920, 1080, 119_982))), Retime);
+        assert_eq!(reconcile_one(cur, Some(at(1920, 1080, 59_940))), Retime);
+
+        // A size change really is a rebuild: the buffers are the wrong
+        // size and the clients really do need reconfiguring.
+        assert_eq!(reconcile_one(cur, Some(at(1280, 720, 60_000))), Replace);
+        assert_eq!(reconcile_one(cur, Some(at(1280, 720, 239_840))), Replace);
+        assert_eq!(reconcile_one(cur, Some(at(1920, 1200, 60_000))), Replace);
+
+        // Connector gone, or its CRTC/plane moved under us.
+        assert_eq!(reconcile_one(cur, None), Replace);
     }
 
     #[test]

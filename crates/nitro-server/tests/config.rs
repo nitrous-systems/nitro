@@ -1055,12 +1055,42 @@ fn a_reload_retimes_the_output_and_a_second_one_costs_nothing() {
     assert_eq!(reported_refresh(&h), 60_000);
     h.settle();
 
-    // A same-size refresh change is applied live: no buffer changes size,
-    // so there is nothing to reallocate and no reason to make the user
-    // restart for it.
+    // A window, so the retime can be checked for what it does to the
+    // *clients* rather than only to the counters.
+    let mut seen = Vec::new();
+    let mut conn = h.client("mode-reload");
+    let root = make_window(&mut conn, &mut seen, 1, 1);
+    let before = configure(&mut conn, &mut seen, root);
+    h.settle();
+
+    // A same-size refresh change is applied live, and the window is
+    // undisturbed by it: same output, same size, same scale, nothing
+    // closed. That is what a retime looks like from a client's side.
+    //
+    // **What this cannot prove.** It runs on the fake backend, which
+    // *edits* an output in place and has no code path that could replace
+    // one -- so the interesting half, "the DRM backend decided to retime
+    // rather than destroy and rebuild under a new id", is not under test
+    // here and a green result says nothing about it. That rule is
+    // `select::reconcile_one`, tested directly in `drm/select.rs` by
+    // `a_retime_keeps_the_output_and_a_resize_replaces_it`, which does
+    // fail when the rule is removed. This test covers the server-side
+    // consequence; that one covers the decision.
     h.rewrite_config("output.Virtual-1.mode = 640x480@120\n");
     assert_eq!(h.request_line("reload\n"), "ok");
     assert_eq!(reported_refresh(&h), 120_000);
+    assert_eq!(h.stat("outputs"), 1);
+    h.settle();
+    let after = latest_configure(&mut conn, &mut seen, root);
+    assert_eq!(
+        (after.output, after.size, after.scale),
+        (before.output, before.size, before.scale),
+        "a retime must not move the window or change the output it is on"
+    );
+    assert!(
+        !seen.iter().any(|m| matches!(m, ServerMsg::Closed(_))),
+        "a retime must not close anything"
+    );
 
     // And a reload that says the same thing again is not a second
     // modeset: the backend compares before it touches the hardware, which
@@ -1071,6 +1101,8 @@ fn a_reload_retimes_the_output_and_a_second_one_costs_nothing() {
     assert_eq!(h.request_line("reload\n"), "ok");
     assert_eq!(reported_refresh(&h), 120_000);
     assert!(h.stat("frames") >= frames, "a reload never loses frames");
+
+    drop(conn);
     h.quit();
 }
 

@@ -257,8 +257,15 @@ pub fn outputs_reply(outputs: &[OutputLine]) -> Vec<u8> {
 /// `ok\n`, one `name mode` line per available mode, blank line.
 ///
 /// A ` *` marks the connector's preferred mode and a ` =` the one in use;
-/// a mode that is both carries both. Two one-character suffixes rather
-/// than words, because the list is long and the alignment is what makes it
+/// a mode that is both carries both. **At most one line carries `=`** — a
+/// connector may list the same width/height/refresh twice with different
+/// timings (the test box lists 1920x1080@60 twice), and marking both would
+/// have the reply say two modes are in use. The caller marks the first
+/// match, which is the kernel's order and so the one selection would have
+/// picked.
+///
+/// Two one-character suffixes rather than words, because the list is long
+/// (45 modes on that connector) and the alignment is what makes it
 /// readable — and the mode text itself is exactly what
 /// `output.<connector>.mode` takes, so the answer to "how do I run this
 /// screen at 120" is a line you can copy.

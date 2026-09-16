@@ -1404,12 +1404,20 @@ impl Server {
     /// changed — which the backend enforces by comparing before touching
     /// anything — and a reload that moved a colour costs nothing.
     ///
-    /// A refresh change at the same size (1080p60 → 1080p120) is cheap
-    /// enough to do live: no buffer changes size, so the shadow and the
-    /// two scanout buffers stay exactly as they are. A **size** change is
-    /// the expensive case, and the backend handles it by reallocating; the
-    /// `sync_outputs` that follows resizes the shadow and repaints in
-    /// full, which is the same path a hotplug already takes.
+    /// A refresh change **at the same size** (1080p60 → 1080p120) is done
+    /// live and cheaply: the backend retimes the output in place, so the
+    /// [`OutputId`](nitro_kms::OutputId) survives and the `sync_outputs`
+    /// below finds the same output with a new `refresh_ns` — no scene
+    /// removal, no window migration, no `OutputGone` on any socket, and
+    /// no buffer reallocated. That is a property of
+    /// `select::reconcile_one`, not an accident: without it a rate change
+    /// would destroy the output and build a new one under a fresh id,
+    /// which arrives here as an unplug followed by a plug.
+    ///
+    /// A **size** change is the expensive case and takes exactly that
+    /// path, correctly: the output is replaced, its windows are migrated,
+    /// the shadow is resized and the desktop repaints in full — the same
+    /// sequence a hotplug already runs.
     fn apply_modes(&mut self) {
         let modes = resolve_modes(&self.mode_overrides, &self.settings);
         match self.backend.set_modes(&modes) {
@@ -2216,6 +2224,15 @@ impl Server {
                     }
                 }
                 Err(e) => warn!("rescan: {e}"),
+            }
+            // A rescan re-reads every connector, so a `mode` line that
+            // matches nothing produces its warning again. Drained here
+            // rather than left to the next reload: the warnings are a
+            // `Vec` on the backend, so a flapping connector would
+            // otherwise grow it without bound and then deliver the whole
+            // pile at once, long after the event that caused it.
+            for w in self.backend.take_warnings() {
+                warn!("{w}");
             }
             self.register_backend()?;
             self.settle();
@@ -4346,15 +4363,27 @@ impl Server {
     fn modes_reply(&self) -> Vec<u8> {
         let mut lines: Vec<protocol::ModeLine> = Vec::new();
         for info in self.backend.outputs() {
+            // `=` marks the mode in use, and **at most one line may carry
+            // it**. A connector can list the same W/H/refresh twice with
+            // different timings — the test box lists 1920x1080@60 twice,
+            // at 148 500 kHz and another clock — and matching on those
+            // three numbers alone would mark both, so the reply would say
+            // two modes are in use. The first match wins, which is the
+            // kernel's own order and therefore the one `select_mode`
+            // would have picked.
+            let mut marked = false;
             for m in self.backend.available_modes(info.id) {
+                let current = !marked
+                    && !info.custom_mode
+                    && m.width == info.width
+                    && m.height == info.height
+                    && m.refresh_mhz == info.refresh_mhz;
+                marked |= current;
                 lines.push(protocol::ModeLine {
                     name: info.name.clone(),
                     mode: m.to_string(),
                     preferred: m.preferred,
-                    current: !info.custom_mode
-                        && m.width == info.width
-                        && m.height == info.height
-                        && m.refresh_mhz == info.refresh_mhz,
+                    current,
                 });
             }
             // A modeline is not in the connector's list at all, so it
