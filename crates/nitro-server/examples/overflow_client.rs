@@ -104,14 +104,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Report what the server says, so a run is self-describing: the
     // `Configure` gives the content rectangle every pixel claim is
-    // measured against, and an `Error` is the refusal.
+    // measured against, an `Error` is the refusal, and a
+    // `PointerButton` is a click that *reached us* — which is the hit
+    // test's half of the containment claim, so it is printed for the
+    // whole life of the process rather than for an opening window.
+    //
+    // The first cut printed for three seconds and then went quiet in an
+    // idle loop that called `seen.clear()`, so a click injected later
+    // produced no line at all. That reports "no click arrived" for a
+    // click that did, which is indistinguishable from the clip working
+    // — and it was caught only by the control arm (a click *inside* the
+    // window, which must arrive) reporting zero too. A silent client is
+    // not evidence of a silent compositor.
     let mut seen = Vec::new();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    while std::time::Instant::now() < deadline {
+    let mut clicks = 0usize;
+    loop {
         conn.flush()?;
         if conn.poll(&mut seen).is_err() {
             emit("the server closed the connection")?;
-            break;
+            return Ok(());
         }
         for m in seen.drain(..) {
             match m {
@@ -125,6 +136,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     c.position.x + SIZE.w + 280.0,
                     280.0,
                 ))?,
+                ServerMsg::PointerButton(b) => {
+                    clicks += 1;
+                    emit(&format!(
+                        "PointerButton #{clicks} REACHED US: button={:#x} state={:?}",
+                        b.button, b.state
+                    ))?;
+                }
                 ServerMsg::Error(e) => {
                     emit(&format!("Error {:?}: {}", e.code, e.msg))?;
                     emit("the compositor refused to be opted out of: contained")?;
@@ -134,18 +152,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    if unclip {
-        emit("NO ERROR: this server let us turn our window's clip off")?;
-    }
-    // Idle with the window up, for a screenshot.
-    loop {
-        conn.flush()?;
-        if conn.poll(&mut seen).is_err() {
-            return Ok(());
-        }
-        seen.clear();
-        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 
