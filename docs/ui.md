@@ -306,6 +306,10 @@ are invisible until they are somebody else's.
 desktop strip beside the window: 0 changed pixels with the clip, 1998
 without it.
 
+The same census on the real box, against the settings dialog that found
+this: **1910 changed pixels in a 27-row band** — one row's worth of
+widgets on the wallpaper — before, **0** after (`docs/settings.md`).
+
 ## The widget set
 
 | widget | role | value | actions | notes |

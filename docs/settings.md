@@ -579,7 +579,19 @@ worst case is cut off rather than spilled: `docs/ui.md`.)
 
 Line 1 is what the monitor *is* and the two controls you reach for; line
 2, indented under the connector, is where it sits and what else it could
-run. Both dim labels **elide** (`docs/ui.md`), so a television with a
+run. On the box, on the human's own screen:
+
+```text
+HDMI-A-1  1920×1080 @ 119.98 Hz  [──●────] 1   ☐ primary
+   position [0   ] [0   ]  also 60 · 84.9 · 59.94 · 50 · 24 · 23.98 Hz
+```
+
+**Both halves were measured there rather than argued.** Before the fix,
+`hey nitro-settings list` put the `y` field at x=717..831 in a 560-wide
+window, and a pixel census of the 200-px desktop strip right of the frame
+found **1910 changed pixels in a 27-row band** — one `ROW_HEIGHT` of
+widgets lying on the wallpaper, which is the human's bug report in
+numbers rather than a shadow or an anti-aliasing fringe. After: **0**. Both dim labels **elide** (`docs/ui.md`), so a television with a
 dozen rates shortens its line rather than pushing the row out, and the
 important prefix — the resolution — is what survives. A connector that
 offers nothing else at its current size has no rates label at all rather
