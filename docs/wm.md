@@ -77,6 +77,18 @@ which means a narrow window elides sooner than it did before M4 — the
 right trade, because a title bar with no icon and a fully spelled title
 says less at a glance than one with an icon and an ellipsis.
 
+**A frame with no room for the icon drops it.** A window can be dragged
+to the 64 × 32 content floor, which is a 66-pixel frame — narrower than
+three buttons and their gaps, so the icon's box (starting 8 in) and the
+leftmost button (starting at 0) would be composited on top of each
+other. Clipping is the honest failure and overlap is not: an overlapped
+icon is two shapes nobody can read, where a dropped one is a title bar
+visibly too small for it. #3709 established that rule for the toolkit's
+flex solver by getting it wrong — it traded a squashing bug for an
+overlap bug, and the review called the trade the worse regression. The
+buttons are what a squeezed frame keeps, because they are its controls;
+the icon is what it spends.
+
 ### The icons, and why the buttons stopped being circles
 
 Until #3715 the buttons were a red circle and a green one, and the
