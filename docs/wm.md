@@ -866,6 +866,63 @@ magnification is a code path the hardware never enters. That evidence is
 the 48×48 covered rect and that the ink reaches device row `y + 40` —
 which a 24-px arrow cannot.
 
+### Containment: a spilling client, contained (#3726)
+
+Box, dark scheme, 1920×1080@119982, scale 1, both arms one build apart
+against the same live desktop. The client is
+`examples/overflow_client` — **raw `nitro-wire`, no toolkit** — asking
+for the spill three ways: a blue rect from 20 px inside the right edge
+running 300 px past it, a magenta one at `y = -TITLE_H` over the title
+bar, and a `SetClip { clip: false }` on its own window.
+
+| census | main `cfdc70c` | with #3726 |
+|---|---|---|
+| blue on the desktop strip right of the frame (320×429) | **11 160** | **0** |
+| magenta on the title bar's row, full frame width | **120** | **0** |
+| blue surviving in the last 20 px *inside* the content | 20 | **20** |
+| the pixel 1 px right of the content edge | `0x0060ff` (the client) | `0x4d6788` (the border) |
+| `SetClip{false}` on its own window | accepted | **`BadParent`, fatal** |
+| click 40 px past the frame, on the spill's row | — | **0 reached the client** |
+| control: click 20 px *inside* the edge, same row | — | **2** (press + release) |
+
+The 20 surviving pixels are the load-bearing row: they are what makes
+this a **clip** rather than a node that vanished, and the colour one
+pixel further out changing from the client's blue to the frame's border
+is the same fact from the other side.
+
+**The box could not have verified this with any app it runs, and that is
+why the client exists.** Every application on that screen is a
+`nitro-ui` app, and since #3725 the toolkit clips its own root — so a
+spill is contained by the *client* before the server is ever asked to
+contain it, and a working compositor clip is pixel-identical to a broken
+one. That is #3724's overhang finding one layer over: a box run measures
+the **clients** the box has, and a guarantee about badly-behaved clients
+is not exercised by a desktop staffed entirely by well-behaved ones.
+
+So the *containment* evidence is the harness's, where the mechanism can
+be switched off: forcing `node.clip = false` in `create_window_with`
+reproduces **11 160** and **120** exactly, and reverting restores 0/0. A
+census that cannot fail proves nothing. What the box adds is the part no
+harness has — real i915 scanout, the human's panel, and main's own server
+as the before-arm, i.e. the desktop actually showing the spill first.
+
+**Two instrument failures, both caught by the control rather than by
+reasoning**, and the second is the one worth carrying:
+
+* `pkill -f overflow_client` in an ssh command **matches the remote
+  shell's own command line**, which contains that string — so the shell
+  killed itself and the run printed nothing at all. Twice, in two
+  dresses. `pkill -x` matches the process name.
+* **`ydotool -a` takes half device pixels on this box**: probed, not
+  assumed — `ydotool(100,100)` puts ink at device 200, `(400,300)` at
+  800,600. So the first hit-test arm clicked off-screen, was clamped, and
+  reported "0 clicks reached the client" — which is exactly what a
+  working clip reports. The control click *inside* the window read 0 too,
+  and that is the only reason the run was not published as a pass. **An
+  arm whose failure mode is indistinguishable from its success needs a
+  control that must succeed**, and the calibration has to be measured
+  from the ink, not taken from the tool's flag name.
+
 ## What is deferred
 
 * **Workspaces / virtual desktops.** Not in M3 at all. The MRU list and
