@@ -43,3 +43,9 @@ name = "hello_client"
 # Throwaway M3-B hardware probe for the shell socket; see `docs/shell.md`.
 [[example]]
 name = "shell_probe"
+
+# Raw-wire client that deliberately paints outside its window, for
+# verifying the compositor's containment on the box (#3726). No toolkit,
+# so it is not contained by its own `SetClip` the way our apps are.
+[[example]]
+name = "overflow_client"
