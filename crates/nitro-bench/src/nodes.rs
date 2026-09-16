@@ -79,6 +79,26 @@ impl Scenario for BoingNode {
 
     fn build(&mut self, ctx: &mut Ctx) -> Result<Vec<ClientMsg>, Error> {
         self.boing = Boing::new(ctx.size.w as u32, ctx.size.h as u32);
+        // The sprite is rendered at **exactly the size it will be drawn**,
+        // and the box run is why that is spelled out rather than assumed.
+        //
+        // The first version took `--size` as the sprite edge and let the
+        // simulation choose the ball's radius from the window. On a 1080p
+        // fullscreen run those disagree — a 128 px sprite in 172 px bounds
+        // — and the server then **resamples the image every frame**:
+        // 9.7 ms of paint and 170 k damage pixels to move one ball, which
+        // made the retained arm look four times worse than the pixel arm
+        // it exists to beat. The scenario was measuring image scaling, not
+        // the retained path, and it would have been reported as a finding
+        // about nitro rather than as the benchmark's own bug.
+        //
+        // So the edge follows the simulation: it is the ball's on-screen
+        // diameter in device pixels, which is the one value at which the
+        // server has nothing to resample. `--size` is therefore ignored
+        // here — the recorded `size` is the edge actually uploaded, so the
+        // table cannot lie about which one ran.
+        let (_, _, r) = self.boing.position(0);
+        self.edge = ((r * 2.0 * ctx.scale).ceil() as u32).max(8);
         ctx.size_px = self.edge;
         let sprite = self.boing.sprite(self.edge, 0);
         let fd = memfd(&sprite.data)?;
@@ -571,6 +591,77 @@ mod tests {
             refresh_ns: 16_666_667,
             n: 0,
             size_px: 0,
+        }
+    }
+
+    /// The defect the box found: a sprite whose pixels do not match the
+    /// size it is drawn at makes the **server resample it every frame**.
+    ///
+    /// The first version of this scenario uploaded a 128 px sprite and
+    /// then set 172 px bounds on a 1080p run, and the server duly scaled
+    /// the image on every one of 480 frames: 9.7 ms of paint and 170 k
+    /// damage pixels to move one ball. The retained arm looked four times
+    /// worse than the pixel arm it exists to beat, and the number would
+    /// have been written up as a finding about nitro rather than as this
+    /// benchmark's own bug.
+    ///
+    /// One-to-one is therefore an invariant, not a detail, and it is
+    /// asserted at every scale and window size the sweep uses.
+    #[test]
+    fn the_boing_sprite_is_never_resampled() {
+        for (w, h, scale) in [
+            (640.0, 480.0, 1.0),
+            (1920.0, 1080.0, 1.0),
+            (1920.0, 1080.0, 2.0),
+            (320.0, 240.0, 1.0),
+        ] {
+            let mut c = ctx();
+            c.size = Size::new(w, h);
+            c.scale = scale;
+            let mut s = BoingNode::new(w as u32, h as u32, 128);
+            let build = s.build(&mut c).unwrap();
+
+            let ClientMsg::CreateBuffer(buf) = build
+                .iter()
+                .find(|m| matches!(m, ClientMsg::CreateBuffer(_)))
+                .unwrap()
+            else {
+                unreachable!()
+            };
+            let ClientMsg::SetBounds(b) = build
+                .iter()
+                .rev()
+                .find(|m| matches!(m, ClientMsg::SetBounds(_)))
+                .unwrap()
+            else {
+                unreachable!()
+            };
+            // Bounds are logical, the buffer is device pixels: the test is
+            // that they agree *after* scale, which is the condition under
+            // which the server has nothing to resample.
+            let device = b.rect.w * scale;
+            assert!(
+                (device - buf.width as f32).abs() <= 1.0,
+                "{w}x{h}@{scale}: a {} px sprite drawn at {device} device px \
+                 would be resampled every frame",
+                buf.width
+            );
+            assert_eq!(buf.width, buf.height, "the sprite must stay square");
+
+            // And it must hold for every frame of the run, not just the
+            // first: a simulation whose radius changed with time would
+            // reintroduce the scaling one frame later.
+            for f in [0u64, 1, 75, 149, 1000] {
+                let ClientMsg::SetBounds(b) = s.frame(&mut c, f).unwrap().remove(0) else {
+                    panic!()
+                };
+                assert!(
+                    (b.rect.w * scale - buf.width as f32).abs() <= 1.0,
+                    "{w}x{h}@{scale} frame {f}: bounds {} vs sprite {}",
+                    b.rect.w,
+                    buf.width
+                );
+            }
         }
     }
 

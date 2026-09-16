@@ -123,14 +123,36 @@ pub fn self_pid() -> u32 {
         .cast_unsigned()
 }
 
+/// The pid on the other end of a connected socket (`SO_PEERCRED`).
+///
+/// **This is the right way to find the server**, and the reason it is
+/// here rather than a `pgrep`: the benchmark is connected to exactly one
+/// server, and the kernel knows which process that is. Scanning `/proc`
+/// for the name (see [`find_by_comm`]) finds *a* `nitro-server`, which on
+/// a development machine with three of them running is a coin toss — and
+/// a coin toss that lands on an idle one reports a server CPU cost of
+/// **zero**, the single most flattering wrong answer a compositor
+/// benchmark can produce. It was caught by noticing exactly that column
+/// of zeroes in a local run.
+///
+/// # Errors
+/// `SO_PEERCRED` is a Unix-socket option: a TCP connection has no peer
+/// pid and reports one, which is correct and means the server CPU column
+/// is honestly missing on a remote link rather than wrong.
+pub fn peer_pid(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<u32> {
+    let cred = rustix::net::sockopt::socket_peercred(fd)?;
+    Ok(cred.pid.as_raw_nonzero().get().cast_unsigned())
+}
+
 /// Find the one process whose executable name is `name`, by scanning
 /// `/proc/*/comm`.
 ///
-/// Returns `None` when there is no such process and the **lowest** pid
-/// when there are several. The benchmark uses it to find `nitro-server`,
-/// of which there is exactly one on a working box; two would mean a stale
-/// server is still holding the socket, which is a state worth noticing
-/// rather than averaging over — so the caller is told how many were found.
+/// The fallback for when there is no connected socket to ask; prefer
+/// [`peer_pid`], which cannot pick the wrong process. Returns the pids in
+/// ascending order, and the caller is told how many there were rather
+/// than being handed one silently: two `nitro-server`s means a stale one
+/// is still around, which is a state worth noticing rather than averaging
+/// over.
 ///
 /// `comm` is truncated to 15 bytes by the kernel, so a name longer than
 /// that is compared against its own truncation. `nitro-server` is twelve
@@ -249,6 +271,19 @@ mod tests {
         assert_eq!(t.micros(100), 350_000);
         // A nonsense rate gives zero rather than a division fault.
         assert_eq!(t.micros(0), 0);
+    }
+
+    /// The instrument that matters: asking the *socket* who the server is
+    /// cannot pick the wrong process, and `/proc`-scanning can.
+    ///
+    /// A socketpair stands in for the wire connection; both ends belong
+    /// to this process, so the answer is checkable against a pid we
+    /// already know.
+    #[test]
+    fn a_connected_socket_names_its_peer() {
+        let (a, _b) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let pid = peer_pid(std::os::fd::AsFd::as_fd(&a)).expect("SO_PEERCRED");
+        assert_eq!(pid, self_pid());
     }
 
     /// The instrument has to work on the process running the test, which

@@ -502,7 +502,17 @@ pub fn run_with(
     h.commit(&first)?;
 
     // Everything above is setup. The zero is here.
-    let server_pid = cpu::find_by_comm("nitro-server").first().copied();
+    //
+    // The server is identified by asking the *socket* who is on the other
+    // end, not by scanning `/proc` for the name: a development machine
+    // with three `nitro-server`s running makes the scan a coin toss, and a
+    // toss that lands on an idle one reports a server CPU of zero — the
+    // most flattering possible wrong answer for a compositor. The scan is
+    // the documented fallback for a remote link, where `SO_PEERCRED` has
+    // no answer to give and the column is honestly missing instead.
+    let server_pid = cpu::peer_pid(h.conn.as_fd())
+        .ok()
+        .or_else(|| cpu::find_by_comm("nitro-server").first().copied());
     let cpu0_server = server_pid
         .and_then(|p| cpu::read(p).ok())
         .unwrap_or_default();

@@ -302,7 +302,7 @@ fn creating_and_destroying_nodes_leaves_the_count_where_it_was() {
         after,
         before,
         "{} node(s) leaked over {} generations",
-        after as i64 - before as i64,
+        after.cast_signed() - before.cast_signed(),
         rec.commits
     );
     b.quit();

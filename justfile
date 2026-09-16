@@ -64,7 +64,7 @@ box := env_var_or_default("NITRO_BOX", "kaspar@192.168.1.204")
 # is why they are deployed together and in one rsync — a session that
 # started yesterday's bar next to today's server is the failure mode the
 # sibling lookup exists to prevent.
-box_bins := "nitro-server nitro-session nitro-shot nitro-demo nitro-calc nitro-term nitro-files nitro-bar nitro-launcher nitro-wallpaper nitro-settings hey"
+box_bins := "nitro-server nitro-session nitro-shot nitro-demo nitro-bench nitro-calc nitro-term nitro-files nitro-bar nitro-launcher nitro-wallpaper nitro-settings hey"
 box_examples := "hello_client hello_dialog shell_probe"
 
 # Build release, rsync binaries to the box, restart the dev session.
@@ -121,3 +121,35 @@ box-chvt n:
 # Push the repo to the box's clone (~/src/ai/nitro).
 box-push:
     git push box main
+
+# ---------------------------------------------------------------------------
+# Benchmarks (see docs/bench.md)
+# ---------------------------------------------------------------------------
+
+# The whole throughput matrix on the box, written to ~/tmp/bench/<sha>.jsonl
+# there and fetched to tmp/bench/ here. `just bench "60 120"` sweeps the
+# refresh rate (needs #3718's `output.<c>.mode` key on the box's build).
+#
+# It restarts `nitro-dev` and, in the refresh sweep, writes a `mode` line
+# into the human's `server.conf` — backed up and restored by the script.
+# Announce in the `nitro-testbox` room before running it: the box is shared.
+bench modes="" seconds="10":
+    ssh {{box}} 'bash -s' -- --seconds {{seconds}} {{ if modes == "" { "" } else { "--modes '" + modes + "'" } }} < deploy/bench.sh
+    mkdir -p tmp/bench
+    ssh {{box}} 'cat ~/tmp/bench/*.jsonl' > tmp/bench/box.jsonl
+    @echo "wrote tmp/bench/box.jsonl"
+
+# The markdown for docs/bench.md, from a ledger.
+bench-report file="tmp/bench/box.jsonl":
+    cargo run -q -p nitro-bench -- report {{file}}
+
+# This machine's memcpy bandwidth — the denominator the pixel-path
+# verdicts need. `just bench-bandwidth box` measures the box instead.
+bench-bandwidth where="here":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ "{{where}}" == box ]]; then
+        ssh {{box}} '~/nitro-bin/nitro-bench bandwidth'
+    else
+        cargo run -q --release -p nitro-bench -- bandwidth
+    fi

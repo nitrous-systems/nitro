@@ -37,13 +37,20 @@
 //! fitted in cache would report something like 20 GB/s, which is a true
 //! statement about the cache and a false one about the frame path.
 //!
-//! The loops are written to be un-eliminable without `unsafe` or a
-//! `black_box`: the copy and write loops feed a checksum that the caller
-//! is handed back and the binary prints, so the optimiser cannot drop the
-//! stores. That is the same trick #3711 used in this tree for the PNG
-//! measurement, and for the same reason: an LTO'd-away loop measures
-//! nothing and reports a spectacular number for it.
+//! The loops are written so the optimiser cannot delete them, and that
+//! needed a second attempt worth writing down. The first version fed each
+//! round's result into a checksum the caller prints, on the theory that a
+//! store whose value is observed cannot be dropped. **It was not enough:**
+//! LLVM proved the copy's source was a constant fill, folded the whole
+//! loop away, and the probe reported *zero microseconds* — `inf GB/s`, a
+//! spectacular number for nothing at all. The fix is
+//! `std::hint::black_box` around the buffers inside the loop, which is the
+//! only thing in stable Rust that actually promises this, plus the
+//! checksum kept as corroboration. #3711 hit the same class of trap in
+//! this tree and the lesson is the same one: **an eliminated loop does not
+//! report an error, it reports a great result.**
 
+use std::hint::black_box;
 use std::time::Instant;
 
 /// One bandwidth measurement.
@@ -63,7 +70,12 @@ impl Bandwidth {
     ///
     /// Zero microseconds gives zero rather than an infinity: a
     /// measurement that took no time was not a measurement, and
-    /// `inf GB/s` in a table is worse than a blank.
+    /// `inf GB/s` in a table is worse than a blank. This is not a
+    /// theoretical guard — it is exactly what the first version of the
+    /// copy loop produced before `black_box` went in, and the reason the
+    /// zero case is a reported value rather than a panic is that a
+    /// reader seeing `0.00 GB/s` next to a working `read` row asks the
+    /// right question immediately.
     #[must_use]
     pub fn bytes_per_second(&self) -> f64 {
         if self.micros == 0 {
@@ -108,12 +120,13 @@ pub fn copy(bytes: usize, rounds: u32) -> Bandwidth {
     let t = Instant::now();
     let mut checksum = 0u64;
     for r in 0..rounds {
-        dst.copy_from_slice(&src);
-        // One byte per round, read back from the destination: enough to
-        // make the copy observable, cheap enough not to be measured.
+        // `black_box` on the source stops the optimiser from knowing it
+        // is a constant fill and folding the copy away; see the module
+        // docs, where this cost a measurement.
+        dst.copy_from_slice(black_box(&src));
         checksum = checksum
             .wrapping_mul(31)
-            .wrapping_add(u64::from(dst[(r as usize * 4096) % bytes]));
+            .wrapping_add(u64::from(black_box(&dst)[(r as usize * 4096) % bytes]));
     }
     Bandwidth {
         bytes: bytes as u64 * u64::from(rounds),
@@ -129,11 +142,10 @@ pub fn write(bytes: usize, rounds: u32) -> Bandwidth {
     let t = Instant::now();
     let mut checksum = 0u64;
     for r in 0..rounds {
-        let v = (r & 0xff) as u8;
-        dst.fill(v);
+        dst.fill(black_box((r & 0xff) as u8));
         checksum = checksum
             .wrapping_mul(31)
-            .wrapping_add(u64::from(dst[(r as usize * 4096) % bytes]));
+            .wrapping_add(u64::from(black_box(&dst)[(r as usize * 4096) % bytes]));
     }
     Bandwidth {
         bytes: bytes as u64 * u64::from(rounds),
@@ -144,8 +156,10 @@ pub fn write(bytes: usize, rounds: u32) -> Bandwidth {
 
 /// Sum every byte, `rounds` times: the read-only cost.
 ///
-/// Summed into a `u64` the caller prints, which is what stops the loop
-/// being deleted — a read whose result is unused is not a read.
+/// The buffer goes through `black_box` each round for the same reason the
+/// copy does: a sum over a constant fill is a multiplication, and a
+/// version of this without it reported 27 GB/s on a machine that copies
+/// at 15.
 #[must_use]
 pub fn read(bytes: usize, rounds: u32) -> Bandwidth {
     let src = vec![0x5au8; bytes];
@@ -153,7 +167,7 @@ pub fn read(bytes: usize, rounds: u32) -> Bandwidth {
     let mut checksum = 0u64;
     for _ in 0..rounds {
         let mut sum = 0u64;
-        for chunk in src.chunks_exact(8) {
+        for chunk in black_box(&src).chunks_exact(8) {
             // Eight bytes at a time so the loop is not dominated by the
             // bounds check; still no `unsafe` and still no wider type than
             // a `u64`, which is what an SSE2-only baseline would use.
@@ -161,7 +175,7 @@ pub fn read(bytes: usize, rounds: u32) -> Bandwidth {
                 chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
             ]));
         }
-        checksum = checksum.wrapping_add(sum);
+        checksum = checksum.wrapping_add(black_box(sum));
     }
     Bandwidth {
         bytes: bytes as u64 * u64::from(rounds),
@@ -220,6 +234,42 @@ mod tests {
         };
         assert!((b.frames_1080p() - 240.0).abs() < 0.001, "{b:?}");
         assert!((b.gb_per_second() - 1.990_656).abs() < 1e-6);
+    }
+
+    /// The trap that cost a measurement, as a test.
+    ///
+    /// A loop the optimiser deleted takes zero microseconds, so a
+    /// non-zero duration over a buffer big enough that no machine copies
+    /// it in under a microsecond **is** the assertion that the loop ran.
+    /// 8 MB is a 1080p frame; nothing copies one of those in a
+    /// microsecond, so a zero here means the bytes were never moved.
+    ///
+    /// Only meaningful in a release build — a debug build never folds
+    /// anything, so this test would pass on a version with the bug. The
+    /// comment says so rather than pretending otherwise, and the guard
+    /// that matters in practice is `bytes_per_second` returning 0.0 for a
+    /// zero duration, which is checked separately and is what puts a
+    /// visible `0.00 GB/s` in the table instead of `inf`.
+    #[test]
+    fn the_loops_are_not_optimised_away() {
+        const FRAME: usize = 8_294_400;
+        for (what, b) in [
+            ("copy", copy(FRAME, 4)),
+            ("write", write(FRAME, 4)),
+            ("read", read(FRAME, 4)),
+        ] {
+            assert!(
+                b.micros > 0,
+                "{what} moved {} bytes in zero microseconds — the loop was eliminated",
+                b.bytes
+            );
+            // And the derived figure is finite, which is the property a
+            // table actually needs.
+            assert!(
+                b.gb_per_second().is_finite() && b.gb_per_second() > 0.0,
+                "{what}: {b:?}"
+            );
+        }
     }
 
     /// A zero-microsecond measurement is not a measurement, and an

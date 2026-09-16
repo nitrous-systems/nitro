@@ -285,18 +285,63 @@ impl Record {
     }
 
     /// Whether the server reported a flip gap long enough to be a missed
-    /// vblank.
+    /// vblank **during this run**.
     ///
-    /// The test is `flip_interval_max_us > 1.5 × frame_budget_us`: a
-    /// skipped frame leaves an interval of about two periods and a
-    /// healthy frame about one, so [`DROP_FACTOR`] sits at the midpoint,
-    /// far from both. A server that does not report the counter is not
-    /// evidence of a drop, so the answer there is `false` — the report
-    /// prints `?` for the missing cell and lets the human see the gap.
+    /// The test is on the *rise* in `flip_interval_max_us`, not on its
+    /// value, and that distinction was found by running the matrix on the
+    /// box rather than by reasoning about it. The server's counter is a
+    /// **cumulative all-time maximum that never decays**: once any run
+    /// stretches an interval to 33 ms, every later run against the same
+    /// server process inherits that number. The first version of this
+    /// method read `stats_after` and duly reported 25 of 45 runs as having
+    /// dropped frames while they presented a flat 59.9/s — a verdict
+    /// column that was really measuring which scenario had run *earlier*
+    /// in the session.
+    ///
+    /// So: a run dropped a frame when the maximum **it** produced crossed
+    /// [`DROP_FACTOR`] × the budget. A missed vblank leaves an interval of
+    /// about two periods and a healthy frame about one, so 1.5 sits at the
+    /// midpoint, far from both.
+    ///
+    /// A rise is attributable to this run because the counter only moves
+    /// upward; a run that stayed inside a previous record is reported as
+    /// not having dropped, which is the honest reading — its own intervals
+    /// were no worse than the budget allows, and the fact that something
+    /// earlier was worse is not evidence about it. [`Record::kept_up`]
+    /// catches the other failure mode, a run that was uniformly and
+    /// smoothly slower than the display.
+    ///
+    /// A server that does not report the counter is not evidence of a
+    /// drop, so the answer there is `false` — the report prints `?` for
+    /// the missing cell and lets the human see the gap.
     #[must_use]
     pub fn dropped(&self) -> bool {
-        self.stat_after("flip_interval_max_us")
-            .is_some_and(|max_us| max_us as f64 > DROP_FACTOR * self.frame_budget_us())
+        let Some(after) = self.stat_after("flip_interval_max_us") else {
+            return false;
+        };
+        let before = self
+            .stats_before
+            .get("flip_interval_max_us")
+            .copied()
+            .unwrap_or(0);
+        // A counter that went *down* means the server restarted between
+        // the two samples, so `after` is already this run's own maximum
+        // and the threshold applies to it directly.
+        let mine = after != before;
+        mine && after as f64 > DROP_FACTOR * self.frame_budget_us()
+    }
+
+    /// How far `flip_interval_max_us` rose during the run, in
+    /// microseconds — the raw number [`Record::dropped`] thresholds.
+    ///
+    /// Exposed because the report prints it: a reader who wants to argue
+    /// with the 1.5 threshold is entitled to the measurement it was
+    /// applied to, and a `0` in that column is what says "this run's worst
+    /// interval was no worse than something earlier in the session",
+    /// which is a different claim from "it was fine".
+    #[must_use]
+    pub fn flip_max_rise_us(&self) -> i64 {
+        self.stat_delta("flip_interval_max_us")
     }
 
     /// Whether the run held the output's rate: presenting within 5 % of
@@ -420,6 +465,16 @@ impl Record {
 /// Blank lines are skipped so a file can be spaced out by hand, and lines
 /// whose first non-space character is `#` are skipped so a ledger can
 /// carry a comment about the machine it came from.
+///
+/// **Objects that are not runs are skipped too**, identified by a `kind`
+/// key. `deploy/bench.sh` writes the machine's memory-bandwidth probe into
+/// the same file, because the denominator belongs with the numbers it
+/// divides; without this rule that object parsed as a `Record` with every
+/// field defaulted and appeared in the report as a nameless row claiming
+/// zero frames and a verdict of **slow**. A schema that shares a file has
+/// to say which kind each line is, and skipping on the marker rather than
+/// erroring keeps an old reader working against a newer ledger — the same
+/// rule the unknown-key case follows.
 #[must_use]
 pub fn read_jsonl(text: &str) -> (Vec<Record>, Vec<ParseError>) {
     let mut records = Vec::new();
@@ -427,6 +482,14 @@ pub fn read_jsonl(text: &str) -> (Vec<Record>, Vec<ParseError>) {
     for (index, line) in text.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        // A `kind` key marks a line that is not a run. Matched as raw text
+        // rather than by parsing first: a non-run object may legitimately
+        // carry keys and types this parser knows nothing about, and
+        // parsing it only to throw it away would turn a future schema
+        // addition into an error message.
+        if trimmed.contains("\"kind\":") {
             continue;
         }
         match Record::from_json(line) {
@@ -1016,6 +1079,26 @@ mod tests {
         assert!(error.message.contains("number"), "{error}");
     }
 
+    /// A ledger carries more than runs, and the third defect the box run
+    /// exposed was that the reader did not know it.
+    ///
+    /// `deploy/bench.sh` writes the memory-bandwidth probe into the same
+    /// file — the denominator belongs with the numbers it divides. Without
+    /// the `kind` rule that object parsed as a `Record` with every field
+    /// defaulted and appeared at the top of the report as a nameless row
+    /// claiming zero frames and a verdict of **slow**.
+    #[test]
+    fn a_line_that_is_not_a_run_is_skipped_rather_than_defaulted() {
+        let text = concat!(
+            "{\"kind\":\"bandwidth\",\"copy_gb_per_s\":3.61,\"copy_checksum\":18446744}\n",
+            "{\"scenario\":\"rects\",\"presented\":10}\n",
+        );
+        let (records, errors) = read_jsonl(text);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(records.len(), 1, "the bandwidth object is not a run");
+        assert_eq!(records[0].scenario, "rects");
+    }
+
     #[test]
     fn a_mixed_quality_file_yields_records_and_errors() {
         let text = concat!(
@@ -1087,6 +1170,66 @@ mod tests {
         record.refresh_mhz = 0;
         assert!((record.frame_budget_us() - 16_666.67).abs() < 0.01);
         assert!((record.refresh_hz() - 60.0).abs() < 0.01);
+    }
+
+    /// The defect the box run found, as a test.
+    ///
+    /// `flip_interval_max_us` is a **cumulative all-time maximum that
+    /// never decays**. Reading `stats_after` alone made 25 of 45 real runs
+    /// report dropped frames while presenting a flat 59.9/s: they had
+    /// inherited a 33 ms record set by an unrelated scenario earlier in
+    /// the same server process. The verdict column was measuring run
+    /// *order*.
+    #[test]
+    fn a_max_inherited_from_an_earlier_run_is_not_this_runs_drop() {
+        let mut record = Record {
+            refresh_mhz: 60_000,
+            seconds: 8.0,
+            presented: 479,
+            ..Record::default()
+        };
+        // A previous scenario left a two-period record behind; this run
+        // did not move it. Both samples are far past the threshold, and
+        // the honest verdict is still "not mine".
+        record
+            .stats_before
+            .insert("flip_interval_max_us".to_owned(), 33_348);
+        record
+            .stats_after
+            .insert("flip_interval_max_us".to_owned(), 33_348);
+        assert!(
+            !record.dropped(),
+            "an unmoved counter is somebody else's drop"
+        );
+        assert!(record.kept_up(), "and the run kept up at 59.9/s");
+        assert_eq!(record.flip_max_rise_us(), 0);
+
+        // The same run that actually *raises* the record did drop one.
+        record
+            .stats_after
+            .insert("flip_interval_max_us".to_owned(), 50_009);
+        assert!(record.dropped());
+        assert_eq!(record.flip_max_rise_us(), 16_661);
+
+        // A rise that is still inside the budget is jitter, not a drop:
+        // both halves of the test have to hold.
+        record
+            .stats_before
+            .insert("flip_interval_max_us".to_owned(), 16_671);
+        record
+            .stats_after
+            .insert("flip_interval_max_us".to_owned(), 16_680);
+        assert!(!record.dropped(), "9 us of jitter is not a missed vblank");
+
+        // A counter that went *down* means the server restarted, so the
+        // `after` value is this run's own maximum and stands on its own.
+        record
+            .stats_before
+            .insert("flip_interval_max_us".to_owned(), 50_009);
+        record
+            .stats_after
+            .insert("flip_interval_max_us".to_owned(), 33_400);
+        assert!(record.dropped(), "a fresh server's own 33 ms is its own");
     }
 
     #[test]

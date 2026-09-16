@@ -45,10 +45,17 @@ use std::fmt::Write as _;
 /// the cost columns in the order the work happens (client mutations →
 /// server paint → copy → wire bytes); `verdict` last because it is the
 /// conclusion drawn from everything to its left.
-const HEADER: &str = "| run | presented/s | commits/s | mutations/frame | server µs/frame | client µs/frame | paint µs mean/max | copy µs mean | damage px | bytes/frame | verdict |";
+///
+/// `flip rise` sits next to the verdict because it is the evidence for
+/// it. The server's `flip_interval_max_us` is a cumulative all-time
+/// maximum, so its *value* says nothing about a given run and its **rise**
+/// says everything — see [`Record::dropped`], where reading the value
+/// alone once marked 25 of 45 clean runs as dropped. Printing the rise
+/// lets a reader check the verdict rather than take it.
+const HEADER: &str = "| run | presented/s | commits/s | mutations/frame | server µs/frame | client µs/frame | paint µs mean/max | copy µs mean | damage px | bytes/frame | flip rise µs | verdict |";
 
 /// The markdown separator row matching [`HEADER`].
-const SEPARATOR: &str = "|---|---|---|---|---|---|---|---|---|---|---|";
+const SEPARATOR: &str = "|---|---|---|---|---|---|---|---|---|---|---|---|";
 
 /// What to print for a server counter this run does not have.
 ///
@@ -108,7 +115,7 @@ pub fn table(title: &str, records: &[Record]) -> String {
     for record in records {
         let _ = writeln!(
             out,
-            "| {} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {} | {} | {} | {:.0} | {} |",
+            "| {} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {} | {} | {} | {:.0} | {} | {} |",
             record.label(),
             record.presented_per_s(),
             record.commits_per_s(),
@@ -119,6 +126,7 @@ pub fn table(title: &str, records: &[Record]) -> String {
             stat_cell(record, "copy_us_mean", 1),
             stat_cell(record, "damage_px_mean", 0),
             record.bytes_per_frame(),
+            record.flip_max_rise_us(),
             verdict(record),
         );
     }

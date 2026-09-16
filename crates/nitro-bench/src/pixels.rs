@@ -179,7 +179,22 @@ impl Scenario for PixelScenario {
             .into(),
             SetBounds {
                 id: IMAGE,
-                rect: Rect::new(0.0, 0.0, ctx.size.w, ctx.size.h),
+                // The node is the buffer's own size, **not** the window's,
+                // and the box run is why this is spelled out.
+                //
+                // The first version stretched every buffer across the
+                // whole window. The server then resampled it on every
+                // frame, and `putimage` at 100, 250 and 500 px all
+                // reported the same ~11 ms of paint and the same 307 200
+                // damage pixels — a sweep whose four points measured one
+                // thing, image scaling, and whose x11perf heritage claims
+                // it measures an upload. The same mistake caught in
+                // `boing-node` (see `nodes.rs`), found by the same run.
+                //
+                // Logical units, so a scale-2 output draws a
+                // device-pixel-sized buffer at half the logical size and
+                // the mapping stays one-to-one where it matters.
+                rect: Rect::new(0.0, 0.0, w as f32 / ctx.scale, h as f32 / ctx.scale),
             }
             .into(),
             CreateBuffer {
@@ -322,6 +337,64 @@ mod tests {
         let mut s = PixelScenario::new("plasma", Box::new(Plasma::new()), 0);
         s.build(&mut c).unwrap();
         assert_eq!(s.dimensions(), (1280, 960));
+    }
+
+    /// The defect the box found, and the third of its kind: an image node
+    /// whose bounds are not its buffer's size makes the **server resample
+    /// it every frame**.
+    ///
+    /// The first version stretched every buffer across the whole window,
+    /// and `putimage` at 100, 250 and 500 px duly reported the same ~11 ms
+    /// of paint and the same 307 200 damage pixels. Four sweep points, one
+    /// measurement — of image scaling, by a scenario whose whole claim is
+    /// that it measures an upload.
+    ///
+    /// One-to-one is therefore an invariant, asserted at every size and
+    /// scale the sweep uses.
+    #[test]
+    fn a_pixel_scenario_is_never_resampled() {
+        for edge in [0u32, 64, 100, 250, 500, 1080] {
+            for scale in [1.0f32, 2.0] {
+                let mut cx = ctx(640.0, 480.0);
+                cx.scale = scale;
+                let mut scen = PixelScenario::new("putimage", Box::new(Plasma::new()), edge);
+                let msgs = scen.build(&mut cx).unwrap();
+                let (width, height) = scen.dimensions();
+
+                let ClientMsg::SetBounds(bounds) = msgs
+                    .iter()
+                    .find(|m| matches!(m, ClientMsg::SetBounds(_)))
+                    .unwrap()
+                else {
+                    unreachable!()
+                };
+                // Bounds are logical and the buffer is device pixels, so
+                // the test is that they agree after scale — the condition
+                // under which the server has nothing to resample.
+                assert!(
+                    (bounds.rect.w * scale - width as f32).abs() <= 1.0
+                        && (bounds.rect.h * scale - height as f32).abs() <= 1.0,
+                    "edge {edge} @{scale}: a {width}x{height} buffer drawn at {}x{} device px \
+                     would be resampled every frame",
+                    bounds.rect.w * scale,
+                    bounds.rect.h * scale
+                );
+
+                // And the source rectangle is the whole buffer, so no
+                // cropping hides a mismatch.
+                let ClientMsg::SetImage(image) = msgs
+                    .iter()
+                    .find(|m| matches!(m, ClientMsg::SetImage(_)))
+                    .unwrap()
+                else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    (image.src.w, image.src.h),
+                    (width.cast_signed(), height.cast_signed())
+                );
+            }
+        }
     }
 
     #[test]
