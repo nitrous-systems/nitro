@@ -593,6 +593,16 @@ found **1910 changed pixels in a 27-row band** — one `ROW_HEIGHT` of
 widgets lying on the wallpaper, which is the human's bug report in
 numbers rather than a shadow or an anti-aliasing fringe. After: **0**.
 
+**What the box could *not* tell us**, and it is worth knowing before
+trusting a screenshot of this row: on that connector both labels fit —
+165 px and 339 px, comfortably inside the row — so the elision never
+engages there and `is_elided()` is false for both. A feature whose whole
+purpose is to degrade gracefully is by construction not exercised by
+hardware on which nothing has to degrade, and the crop looks the same
+whether the fallback works or is broken. (It was broken, and a review
+caught it rather than the box.) The load-bearing evidence for the
+elision is therefore in the harness, where the width can be forced.
+
 Both dim labels **elide** (`docs/ui.md`), so a television with a dozen
 rates shortens its line rather than pushing the row out, and the
 important prefix — the resolution — is what survives. The tests assert
