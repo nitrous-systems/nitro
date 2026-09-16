@@ -156,6 +156,13 @@ regression — a shadowed built-in replaced by a command that could not
 run. `tests/deployed.rs` pins the shadowing, the bare-name resolution and
 its control against the repository's real files.
 
+One consequence of that shadowing is worth a pointer, because it bit this
+crate once: when a file replaces a built-in, the row's icon changes
+*namespace* too. A row for a scanned entry asks the server for the
+entry's **app id**, not for its `Icon=` value — `row_icon`'s rustdoc has
+the argument, and it is the difference between our four applications
+showing their own glyphs and all four showing the generic `window`.
+
 The search path is rescanned on **show**, and only when a directory's
 mtime moved. Re-reading a few hundred files on every keystroke would be
 hundreds of syscalls per character; never re-reading them would mean

@@ -980,8 +980,15 @@ fn restyle_rows(s: &mut Launcher, ui: &mut Ui<Launcher>) {
 /// value, which is the distinction this enum used to get wrong.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RowIcon {
-    /// An application icon from the machine's XDG icon theme, painted in
-    /// its own colours, falling back to the symbolic [`FALLBACK_ICON`].
+    /// An **application** icon, sent with the `AS_COLOURED` role and
+    /// falling back to the symbolic [`FALLBACK_ICON`].
+    ///
+    /// "Coloured" is the role byte, not a promise about the answer. The
+    /// name carried here is the entry's **app id**, and the server
+    /// resolves it from *either* set: the machine's XDG icon theme
+    /// first, painted in its own colours, and failing that the app id's
+    /// own `.desktop` `Icon=` — which for everything we ship is a
+    /// symbolic shape, drawn tinted. See [`row_icon`].
     Coloured(String),
     /// One of the server's own symbolic icons, tinted from the palette.
     Symbolic(String),
