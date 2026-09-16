@@ -837,6 +837,95 @@ here are that the server grew **+97 368 B (+3.9 %)**, a third of what the
 symbolic set cost, and that the largest icon actually loaded decoded in
 **214–510 µs**.
 
+### Measured on the box (#3715, the `.desktop` hop)
+
+Test box, dark scheme, scale 1, my build of server *and* every client,
+the human's own `server.conf` restored afterwards. **No fixtures**: the
+four `.desktop` files are `deploy/nitro-{calc,files,settings,term}.desktop`
+from this repository, copied to `~/.local/share/applications` — which is
+exactly the box state #3714's writeup says would fix the bar.
+
+**The headline, as an A/B with one variable.** Same binary, same three
+apps, fresh server and fresh clients in both arms; the only difference is
+whether the entries are installed. The numbers are the bar's window-list
+icon boxes compared against each other, pixel for pixel:
+
+| bar window-list icons | calc vs settings | calc vs term | settings vs term |
+|---|---|---|---|
+| **before** — no entries | **0/256** | **0/256** | **0/256** |
+| **after** — entries installed | **129/256** | **117/256** | **124/256** |
+
+Zero differing pixels *is* #3714's finding reproduced: three identical
+`window` glyphs. `app_icon_indirections` went 0 → 9 across the same pair.
+
+A false start worth recording, because it looks like the feature failing:
+the first control removed the files and sent one `reload`, and the icons
+**did not change**. The bar sends one `SetIcon` per window when the
+window appears, and the scene nodes still hold resolved handles — so a
+before-arm needs a restart. A control that shares state with the arm is
+not a control.
+
+**The defect this run found, which the whole suite missed.**
+`desktop_entries` read **0 on a fresh server with twelve `.desktop` files
+on disk**, and **12** after a `reload`. `rescan_desktop` was called only
+from `set_desktop_dirs`, which only a *test* calls: every fixture had an
+index and a real server had an empty one until the user happened to
+reload. Every test passed, because every test supplies its own
+directories — the construction path the tests take was not the one the
+product takes. Both constructors scan now, and
+`a_default_engine_has_already_scanned_for_desktop_entries` asserts the
+constructor rather than the fixture.
+
+**The frame's own icons**, `nitro-calc`, focused (bar `#2c3e55`):
+
+| | measured |
+|---|---|
+| app icon box, ink | **92/256 px**, of which `f0f4f8` × 50 — `title_text_active`, i.e. tinted |
+| close / maximize / minimize ink | **28 / 26 / 12** of 196 — glyphs, not discs |
+| every button's corner at rest | **bar colour**: no disc |
+| `title_close` in the resting title bar | **0 px** |
+| `title_maximize` in the resting title bar | **0 px** |
+
+The last two are the censuses that would catch a regression to the old
+look: the red and the green are not on screen at all until the pointer
+arrives.
+
+**Hover**, pointer at each button's centre:
+
+| hovered | px changed | `title_close` | `title_button_hover` | the other two |
+|---|---|---|---|---|
+| close | 160/196 | **75** | 0 | 0, 0 |
+| maximize | 160/196 | 0 | **79** | 0, 0 |
+| minimize | 160/196 | 0 | **91** | 0, 0 |
+| after leaving | — | **0** | **0** | 0, 0 |
+
+`text_layouts` 142 → 142 and `icon_renders` 7 → 7 across all of it: a
+hover shapes no text and rasterises nothing.
+
+**Scale, and the arithmetic that makes it a re-raster rather than a
+blit.** `icon_bytes` is **1 324** at scale 1, and that figure closes
+exactly: 3 × 10² (the button glyphs) + 16² (the frame icon) + 3 × 16²
+(the bar's own icons). At scale 2 it is **5 420**, a delta of **+4 096 =
+four 32² masks** — the four 16-logical icons re-rasterised at the device
+size. Back at scale 1, `icon_renders` stays at 11: the 16 px masks were
+kept, because an output can change scale back.
+
+**The rest**, on pixels or on counters rather than on description:
+
+| claim | measured |
+|---|---|
+| minimize button | `minimized` 0 → **1**; `Alt+Tab` → **0** |
+| maximize button | bounds → **0,0,1918,1019** = the work area exactly |
+| close button | `windows` 4 → 3, `decorated` 1 → 0, process gone |
+| drag, 30 steps | **91 frames**, `text_layouts` **+0**, `icon_renders` **+0** |
+| idle, 45 s gated to `:02` | arm **+4**, control **+2**, arm **+4**, control **+4** |
+| `nitro-server` binary | 2 599 008 → **2 613 488 (+14 480 B, +0.56 %)** |
+
+The idle arms are run **twice each** because a single pair is publishable
+in either direction: the app arm is never *above* the control, and the
+one reading of 2 is the bar's 30 s poll landing differently in the
+window, not a cost of the icons.
+
 ### Still deferred
 
 * **SVG application icons**, and the gradients they need.

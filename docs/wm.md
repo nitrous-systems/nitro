@@ -494,6 +494,42 @@ The box has VGA-1 **disconnected**, so the multi-output paths are covered
 by the fake backend's `plug`/`unplug` in `crates/nitro-server/tests/wm.rs`
 rather than on real hardware.
 
+### The icons and the buttons (#3715)
+
+Same box, dark scheme, scale 1, one `nitro-calc` window. The two claims
+that needed pixels rather than counters:
+
+**Nothing is painted behind a button at rest.** Every button's corner is
+bar colour, the glyphs are 28 / 26 / 12 px of ink in a 196-px box — a
+filled 14 px disc would be ~150 — and a census of the whole title bar
+finds **0 px** of `title_close` and **0 px** of `title_maximize`. The old
+look is not merely covered up; it is not drawn.
+
+**A hover lights one disc and only one.** Pointer at each button's
+centre, counting the button's own 196 px:
+
+| hovered | px changed | `title_close` | `title_button_hover` | the other two |
+|---|---|---|---|---|
+| close | 160 | **75** | 0 | 0, 0 |
+| maximize | 160 | 0 | **79** | 0, 0 |
+| minimize | 160 | 0 | **91** | 0, 0 |
+| after leaving | — | **0** | **0** | 0, 0 |
+
+And it costs no work beyond the fill: `text_layouts` 142 → 142,
+`icon_renders` 7 → 7 across every hover above. A 30-step title-bar drag
+is the same story over 91 frames — both counters **+0**.
+
+The three actions, on the server's own counters rather than on a
+description: minimize takes `minimized` 0 → 1 and `Alt+Tab` returns it to
+0; maximize gives bounds of exactly **0,0,1918,1019**, the work area;
+close takes `windows` 4 → 3 and `decorated` 1 → 0, with the client
+process gone.
+
+`docs/icons.md` has the resolution half — including the A/B that shows
+the bar's three window-list icons going from **0/256 differing pixels**
+(three identical `window` glyphs) to 117–129/256 when the `.desktop`
+files are installed.
+
 ## What is deferred
 
 * **Workspaces / virtual desktops.** Not in M3 at all. The MRU list and

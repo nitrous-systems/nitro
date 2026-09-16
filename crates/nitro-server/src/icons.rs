@@ -272,9 +272,16 @@ impl IconEngine {
     pub const APP_MAX_BYTES: usize = 4 * 1024 * 1024;
 
     /// An empty engine. Rasterises nothing until something is painted.
+    ///
+    /// It **does** scan the XDG application directories, because that is
+    /// the index the `app_id → Icon=` hop reads, and an engine without
+    /// one silently answers `BadIcon` for every one of our own
+    /// applications. See [`Self::rescan_desktop`] for what that cost.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        let mut e = Self::default();
+        e.rescan_desktop();
+        e
     }
 
     /// An engine whose application icons come from the XDG theme called
@@ -288,6 +295,7 @@ impl IconEngine {
     pub fn with_theme(theme: &str) -> Self {
         let mut e = Self::default();
         e.set_theme(theme);
+        e.rescan_desktop();
         e
     }
 
@@ -320,6 +328,7 @@ impl IconEngine {
             ..Self::default()
         };
         e.set_theme(theme);
+        e.rescan_desktop();
         e
     }
 
@@ -357,22 +366,30 @@ impl IconEngine {
     /// Re-scan the XDG application directories: the `app_id → Icon=`
     /// index (#3715).
     ///
-    /// Called at construction and on every `reload` — **unconditionally**,
-    /// unlike [`Self::set_theme`], which the server diffs `theme.icons`
-    /// before calling. The two are diffed differently because they cost
-    /// differently: re-reading the icon theme throws away every decoded
-    /// application tile, so a reload that only moved a monitor must not
-    /// cost the launcher its icons; re-scanning this index throws away
-    /// nothing at all — it is a fresh `basename -> Icon=` map and the
-    /// resolved handles are untouched.
+    /// Called from **both constructors** and on every `reload`. Both,
+    /// and that is the bug the test box found rather than the suite: it
+    /// used to be called only from [`Self::set_desktop_dirs`], which
+    /// only a test calls — so every test had an index and a real server
+    /// had an empty one until the user happened to `reload`. Every
+    /// fixture passed, because a fixture sets `desktop_dirs`; the box
+    /// reported `desktop_entries 0` with twelve files on disk.
     ///
-    /// And it has to be unconditional, because there is no setting to
-    /// diff: what changes is the *filesystem*. A package installed while
-    /// the desktop is running is exactly the case this exists for, and no
-    /// key in `server.conf` moves when it happens. `reload` is the moment
-    /// the user says "look again", and nothing here watches the
-    /// directories — a watch on `$XDG_DATA_DIRS` is an inotify descriptor
-    /// per directory for a change that matters once a month.
+    /// **Unconditional**, unlike [`Self::set_theme`], which the server
+    /// diffs `theme.icons` before calling. The two are diffed
+    /// differently because they cost differently: re-reading the icon
+    /// theme throws away every decoded application tile, so a reload
+    /// that only moved a monitor must not cost the launcher its icons;
+    /// re-scanning this index throws away nothing at all — it is a fresh
+    /// `basename -> Icon=` map and the resolved handles are untouched.
+    ///
+    /// And it has to be unconditional on `reload`, because there is no
+    /// setting to diff: what changes is the *filesystem*. A package
+    /// installed while the desktop is running is exactly the case this
+    /// exists for, and no key in `server.conf` moves when it happens.
+    /// `reload` is the moment the user says "look again", and nothing
+    /// here watches the directories — a watch on `$XDG_DATA_DIRS` is an
+    /// inotify descriptor per directory for a change that matters when
+    /// somebody installs software.
     pub fn rescan_desktop(&mut self) {
         let started = Instant::now();
         self.desktop = match &self.desktop_dirs {
@@ -1683,6 +1700,46 @@ mod tests {
             0,
             "nothing was answered by the hop: {pairs:?}"
         );
+    }
+
+    #[test]
+    fn a_default_engine_has_already_scanned_for_desktop_entries() {
+        // The defect the test box found and the whole suite missed.
+        //
+        // `rescan_desktop` used to be called only from
+        // `set_desktop_dirs`, which only a test calls. So every fixture
+        // had an index and a **real server had an empty one** until the
+        // user happened to `reload`: on the box, `desktop_entries 0`
+        // with twelve `.desktop` files on disk, and every nitro app back
+        // to the generic `window` glyph.
+        //
+        // Every existing test passed because every one of them supplies
+        // its own directories — which is @3716's lesson exactly ("a
+        // lookup table tested against a fixture is a test of the
+        // fixture"), one layer further out: the *construction path* the
+        // tests take was not the one the product takes.
+        //
+        // So this asserts the constructor's own behaviour and cannot use
+        // the fixture form to do it. It therefore says nothing about
+        // *contents* — the machine running it may have any number of
+        // entries, including none — only that the scan **happened**,
+        // which is the part that was wrong. `dirs()` is empty before a
+        // scan and holds the XDG search path after one, and that
+        // distinction is exactly the bug.
+        for engine in [IconEngine::new(), IconEngine::with_theme("hicolor")] {
+            assert!(
+                !engine.desktop().dirs().is_empty(),
+                "a fresh engine never scanned for .desktop entries, so a \
+                 real server's index is empty until the first reload"
+            );
+        }
+        // And the hermetic form still wins, or every test that installs
+        // its own entries would be reading the developer's box.
+        let e = IconEngine::with_dirs(vec![std::path::PathBuf::from("/nonexistent")], "hicolor");
+        let mut e = e;
+        e.set_desktop_dirs(Vec::new());
+        assert!(e.desktop().dirs().is_empty());
+        assert_eq!(e.desktop().len(), 0);
     }
 
     #[test]

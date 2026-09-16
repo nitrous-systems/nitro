@@ -83,6 +83,36 @@ The clients pay 0.5–1 KB each for the `Icon` widget and nothing for the
 artwork, which is the whole point of the server owning it: `hey` links no
 toolkit and is byte-identical.
 
+### M4-H2: the frame's icons and the `.desktop` hop (#3715)
+
+The title bar's application icon, the three symbolic button glyphs, and
+the `app_id → <app_id>.desktop → Icon=` index behind them. Measured on
+the box against the set that was on it, release, same flags:
+
+| binary | before | #3715 | delta |
+|---|---|---|---|
+| `nitro-server` | 2 599 008 | **2 613 488** | **+14 480 (+0.56 %)** |
+
+A twentieth of what the symbolic set cost and a seventh of the theme
+lookup, because almost nothing new is *code*: the artwork was already
+compiled in at M4-G, the theme walk and the PNG decoder at M4-H, and what
+#3715 adds is a 200-line `basename -> Icon=` scanner plus the frame
+nodes. No client grew at all — the frame is the server's own tree, so
+there is no wire message and no toolkit change for a client to link.
+
+**Residency** is the index itself: `basename -> Icon=` for every
+`.desktop` on the search path, held as two `String`s per entry. The box
+has 12 entries with `~/.local/share/applications` populated and 8
+without; a developer machine with a full desktop installed has ~300,
+which is tens of kilobytes of `String` — against `desktop_entries` in
+`stats` so it can be watched rather than assumed. Server RSS with the
+index live and one decorated window open: **VmRSS 18 200 kB, RssAnon
+10 400 kB**.
+
+The per-frame node count is the other half of this task's cost and has
+its own section above; the short version is +5 nodes, 1 200 bytes per
+decorated window, under the granularity `RssAnon` is reported at.
+
 ### M4-H: the application icons (#3714)
 
 The other half — the XDG theme lookup, `nitro-png` and the coloured tile
