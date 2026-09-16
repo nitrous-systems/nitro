@@ -559,6 +559,74 @@ and not a frame rate. A doubled idle figure would mean something is
 pacing itself off vblank that should not be, and is the one result here
 that would be a defect rather than a measurement.
 
+### Measured on the box (#3718)
+
+Three **interleaved** pairs, alternating 120/60 with a fresh server each
+arm, the same evening, the same binary — one variable. Pointer motion
+through the documented absolute path, paced at ~16 moves/s so that both
+arms are **unsaturated at their own cap** (see the trap below).
+
+| pair | `i2p_mean_us` @ 120 | @ 60 | Δ |
+|---|---|---|---|
+| 1 | **6 362** | 9 928 | −3 566 |
+| 2 | **6 312** | 10 299 | −3 987 |
+| 3 | **6 181** | 10 576 | −4 395 |
+
+**3/3 the same sign**, no overlap between the two arms' ranges, mean
+Δ **−3 983 µs** against a predicted half-frame of 4 167. That is the
+mechanism behaving exactly as the model says: the dominant term is the
+wait for the next vblank, and the wait halved.
+
+And the fraction goes the other way, which is the honest way to state it:
+**9.3 ms was 0.56 of a 60 Hz refresh; 6.3 ms is 0.76 of a 120 Hz one.**
+120 Hz buys wall-clock latency and *spends* headroom. Both sentences are
+true; the second is the one a budget cares about.
+
+| | 120 Hz | 60 Hz |
+|---|---|---|
+| `outputs` | `1920x1080@119982` | `1920x1080@60000` |
+| `flip_interval_mean_us`, continuous motion | **8 357** (period 8 335) | **16 666** (period 16 667) |
+| `flip_interval_min_us` | 8 330 | 16 660 |
+| `flip_interval_max_us` | 16 673 = **2.00 periods** | 16 676 = 1.00 |
+| flips/s, continuous motion | 118.7 (cap 120) | 59.8 (cap 60) |
+| `paint_us_mean` / `copy_us_mean` | **17 / 5** | **17 / 7** |
+| server CPU, 30 s continuous motion | 0.4 % | 0.3 % |
+| **idle, 45 s, bar + launcher** | **0 frames** | **0 frames** |
+| **idle, 45 s, launcher killed (control)** | **0 frames** | **0 frames** |
+
+`paint_us_mean` is **identical per frame** at both rates, which is the
+whole "twice the frames, not twice the work per frame" claim in one
+number. The CPU figures are *not* a 2× and must not be read as one: both
+arms were driven at the same **input** rate (~32 flips/s demanded,
+unsaturated at either cap), so both produced the same number of frames.
+That is a property of the measurement, not a result. Twice the frames
+costs twice the CPU; this pair of runs did not produce twice the frames.
+
+**Idle is zero at both rates and in both arms**, which is the reading that
+mattered most: a refresh rate must not touch idle at all. Note it is 0
+and not the 2 other runs in this tree report — those had 45 s windows
+crossing the bar's 30 s sensor poll, and this one was gated to start at
+`:02` so it does not. The app-absent control is what makes that
+interpretable rather than a puzzle.
+
+**`just shot` at 120 vs 60: 48 of 2 073 600 pixels differ**, in a 7×9 box
+at x 930..936 y 12..20 — one clock glyph. The control settles it: two
+shots at the **same** rate 62 s apart differ by **97 px** over
+x 929..1826 y 12..20, so the rate diff is a strict subset of the clock's
+own churn. The answer is "nothing attributable to the refresh rate",
+rather than "48 px, probably fine".
+
+#### The pacing trap, and how each arm proves it avoided it
+
+§4.4's saturation cliff is two flips per pointer move, so it sits at
+**30 moves/s at 60 Hz and 60 moves/s at 120**. The recipe in §2 (20 ms
+apart, ~41 moves/s) is therefore *above* the cliff at 60 and *below* it at
+120 — the same recipe measures backlog in one arm and latency in the
+other, and would hand back a large, stable, entirely fake improvement.
+Every arm above prints its own flips/s against its cap: 32.5 against 60,
+32.6 against 120. Neither was measuring queue depth. **A 60-vs-120
+comparison that does not report flips/s per arm has not ruled this out.**
+
 ### Running the comparison
 
 ```sh

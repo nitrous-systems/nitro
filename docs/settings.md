@@ -220,18 +220,32 @@ HDMI-A-1 1280x720@239840 scale=1 pos=0,0 primary=1 (custom)
 #### The test box's modes, and the 240 Hz question
 
 The human asked for 240 Hz — "the monitor can do it". On this source it
-cannot, and the evidence is the connector's own list.
-`sudo cat /sys/kernel/debug/dri/1/i915_display_info`, HDMI-A-1:
+cannot, and the evidence is the connector's own list. `modes` on the
+control socket (`nitro-shot --modes`), HDMI-A-1 — **45 modes**, of which
+the interesting head is:
 
-| mode | clock |
-|---|---|
-| 1920x1080@120 | 285 500 kHz |
-| 1920x1080@85 | |
-| **1920x1080@60** (preferred) | 148 500 kHz |
-| 1920x1080@60 | |
-| 1920x1080@50 | |
-| 1920x1080@24 | |
-| 3840x2160@30 / 25 / 24 | |
+| mode | clock | note |
+|---|---|---|
+| **1920x1080@60** | 148 500 kHz | `PREFERRED`, and what the box ran before this key existed |
+| 3840x2160@30 / 29.97 / 25 / 24 / 23.976 | | the largest *area*, which is why `max` and `fastest` differ here |
+| **1920x1080@119.982** | 285 500 kHz | the top of the list |
+| 1920x1080@84.904 | | |
+| 1920x1080@60 / 59.94 / 50 / 24 / 23.976 | | |
+| 1680x1050@59.883, 1280x1024@75.024, … | | 30 more, down to 720x400@70.081 |
+
+Two things in that table are worth more than they look. **The 120 Hz mode
+is 119.982 Hz, not 120** — 285 500 kHz over 2080×1144 — so `outputs`
+reports `@119982`, and a rule that required an exact match would have
+failed on the one mode this key exists to reach. You still write
+`mode = 1920x1080@120`; that is what the 0.5 Hz nearest-match rule is for,
+and `@85` likewise finds the listed 84.904. **A script that greps
+`outputs` for the literal `@120000` will never match** and will skip the
+arm silently — grep `1920x1080@` and parse.
+
+And the list is **45 modes long**, not the handful `i915_display_info`
+shows: the EDID's real list runs all the way down to 720x400@70. That is
+why a "no such mode" warning truncates at twelve and points here — printed
+whole it is a 1 400-character log line nobody reads.
 
 **120 Hz is the top of the list and nothing above it exists.** The reason
 is the link, not the panel: this is HDMI 1.4 on Haswell, whose TMDS clock
@@ -274,9 +288,29 @@ reason to trust the 279 750.
 output.HDMI-A-1.modeline = 279750 1280 1328 1360 1440 720 723 727 810 +hsync -vsync
 ```
 
-Whether the **panel** syncs to it is a separate question from whether the
-link can carry it, and the only instrument for it is a person looking at
-the screen. See `docs/testbox.md` for what happened when it was tried.
+**Tried on the box, and the kernel took it.** `outputs` reported
+
+```console
+HDMI-A-1 1280x720@239840 scale=1 pos=0,0 primary=1 (custom)
+```
+
+and the CRTC really was scanning out at that rate: 380 flips in 1.7 s =
+**219 flips/s**, `flip_interval_mean_us` **4 491** against a 4 167 µs
+period. Note the reported **239 840** rather than 240 000 — CVT rounds the
+clock down to its 0.25 MHz step, so the timings really are 239.84 Hz and
+the server reports what the timings produce rather than what was asked
+for. The desktop laid out at 720p without squashing anything (bar
+1280×32, launcher 600×400, settings 560×440 with its buttons row inside
+the window).
+
+**Whether the panel syncs to it is unverified.** That is a different
+question from whether the link carries it, and the only instrument for it
+is a person looking at the screen — nobody was at the box. `nitro-shot`
+returned a perfect 3 686 400-byte 1280×720 frame throughout, and that is
+**not evidence**: it reads the shadow buffer, which is the picture the
+server composed, not the picture the glass received. Recorded here as
+*kernel accepted, panel sync unobserved* rather than as a working 240 Hz
+mode. `docs/testbox.md` says how to retry it.
 
 ### `remote.listen`
 

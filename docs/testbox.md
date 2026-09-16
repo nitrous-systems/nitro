@@ -77,12 +77,26 @@ $ just box-session suspend    # systemctl suspend, via the session
 output.HDMI-A-1.mode = 1920x1080@120
 ```
 
-So `nitro-shot --outputs` says `1920x1080@120000` and
-`flip_interval_mean_us` is ~8 333 under continuous motion, not ~16 667.
+> **The line only does anything with a build that knows the key.** An
+> older `nitro-server` answers it with `unknown output key \`mode\`` and
+> comes up at 60 — a warning, the rest of the file still applied, the
+> desktop fine. So between #3718 landing and whatever is deployed on the
+> box, "the config says 120" and "the box is at 60" can both be true at
+> once. **Read `outputs`, not the file.**
+
+So `nitro-shot --outputs` says `1920x1080@**119982**` — not `@120000`:
+this connector's 120 Hz mode is 285 500 kHz over 2080×1144, which is
+119.982 Hz. You still *write* `@120` (matching is nearest-within-0.5 Hz
+so a person writes the round number), but **a script that greps for the
+literal `@120000` will never match and will skip the arm silently.** Grep
+`1920x1080@` and parse. `flip_interval_mean_us` is ~8 333 under
+continuous motion, not ~16 667.
+
 **Anything measured here is a 120 Hz number unless it says otherwise**,
 and every figure in `docs/latency.md` §1–§4 and `docs/budget.md` predates
-the key and is a 60 Hz number. `docs/latency.md` §5 has the conversion and
-the two thresholds that move with the rate.
+the key and is a 60 Hz number. `docs/latency.md` §5 has the conversion,
+the measured 60-vs-120 pairs, and the two thresholds that move with the
+rate.
 
 To take a 60 Hz comparison, **rewrite the line rather than deleting it** —
 deleting it gives the connector's preferred mode, which *is* 60 here, but
@@ -108,21 +122,31 @@ offers, which is also the answer to "what may I write here".
 
 ### 240 Hz is not available on this source
 
-The human asked. The connector's own list tops out at 1080p@120, and the
-reason is the link rather than the panel: HDMI 1.4 on Haswell caps the
+The human asked. The connector's own list tops out at 1080p@119.982, and
+the reason is the link rather than the panel: HDMI 1.4 on Haswell caps the
 TMDS clock near **300 MHz**, 1080p@120 is 285.5 MHz (just under), and
 1080p@240 needs 606.5 MHz with CVT-RB. 1080p@144 (346.5) and @165 (401.0)
 do not fit either. `docs/settings.md` has the full mode table, the
-arithmetic, and the 1280×720@240 modeline experiment — which *does* fit
-under the limit at 279.75 MHz, because KMS will set a mode the EDID never
-advertised.
+arithmetic, and the 1280×720@240 modeline experiment.
+
+**That experiment was run, and half of it is answered.** With
+`output.HDMI-A-1.modeline = 279750 1280 1328 1360 1440 720 723 727 810
++hsync -vsync` the kernel **accepted** the mode and the CRTC really did
+scan out at 240: `outputs` reported `1280x720@239840 … (custom)`, 380
+flips in 1.7 s = **219 flips/s**, `flip_interval_mean_us` 4 491 against a
+4 167 µs period. So the link carries it.
+
+**Whether the panel locks is still unknown** — nobody was at the monitor.
+It is recorded as *kernel accepted, panel sync unobserved*, not as a
+working 240 Hz mode. **To close it, set the line, restart, and look at the
+screen**; that is the entire method, and it is the only one, because:
 
 **If you set a modeline and the screen goes black, ssh still works**: the
 server is fine, the monitor is not. Remove the line and restart. `just
 shot` keeps working the whole time and proves **nothing** about sync — it
 reads the shadow buffer, which is the picture the server composed, not the
-picture the glass received. Only a person looking at the panel can settle
-that.
+picture the glass received. It returned a perfect 3 686 400-byte 1280×720
+frame during the run above, with the panel's state entirely unknown.
 
 ## Rules learned the hard way
 
