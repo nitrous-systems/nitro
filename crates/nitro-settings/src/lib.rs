@@ -1506,7 +1506,7 @@ pub fn mode_text(info: &OutputInfo) -> String {
 /// and no trailing zeros, so `84.904` from the kernel's table is `84.9`
 /// and `59.940` is `59.94`. The matching against the server's own
 /// spelling happens before that, on the server's strings, which is why
-/// [`nitro_kms_hz`] still exists: the exclusion of the current rate has
+/// `nitro_kms_hz` still exists: the exclusion of the current rate has
 /// to agree with the server character for character, and the display
 /// spelling deliberately does not.
 #[must_use]
