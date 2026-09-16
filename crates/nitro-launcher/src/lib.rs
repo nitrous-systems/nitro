@@ -420,7 +420,9 @@ fn program_file_name(entry: &Entry) -> &str {
 /// that is the point: a built-in exists precisely on the box that has no
 /// icon theme installed, so its icon has to come from the set compiled
 /// into the server. The packaged `.desktop` files under `deploy/` name
-/// the same shapes, so a box with both looks the same either way.
+/// the same shapes, so a box with both looks the same either way — which
+/// holds only because a scanned entry's row asks for its **app id** and
+/// lets the server hop to that same `Icon=`. See [`row_icon`].
 #[must_use]
 pub fn builtins() -> Vec<Entry> {
     const KNOWN: [(&str, &str, &str); 6] = [
@@ -971,9 +973,11 @@ fn restyle_rows(s: &mut Launcher, ui: &mut Ui<Launcher>) {
 /// The distinction is not cosmetic and it is not the launcher's choice:
 /// the sets are separate namespaces on the wire (`docs/icons.md`), so
 /// something has to say which a name belongs to, and the entry's
-/// **source** already knows. A `.desktop` file's `Icon=` is a claim about
-/// the machine's icon theme; a built-in's is a shape compiled into the
-/// server.
+/// **source** already knows. A built-in's icon is a shape compiled into
+/// the server; a `.desktop` entry's is an application icon, asked for by
+/// **app id** so the server's `.desktop` hop can answer it from either
+/// set — see [`row_icon`] for why the app id rather than the `Icon=`
+/// value, which is the distinction this enum used to get wrong.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RowIcon {
     /// An application icon from the machine's XDG icon theme, painted in
@@ -1005,13 +1009,74 @@ pub const FALLBACK_ICON: &str = "window";
 pub const ROW_ICON_PX: f32 = 24.0;
 
 /// Which icon a row shows for `entry`.
+///
+/// For a `.desktop` entry the name asked for is the entry's **app id** —
+/// its file's basename — and **not** its `Icon=` value. That looks like
+/// an indirection too many and is the opposite: it is the name the
+/// *server* can resolve, and the `Icon=` value is the one it often
+/// cannot.
+///
+/// The server's lookup for an `AS_COLOURED` name is: the machine's icon
+/// theme, then `<name>.desktop`'s `Icon=` (#3715), then `BadIcon`. It is
+/// deliberately **not** allowed to try its own symbolic set for the name
+/// it was handed (`docs/icons.md` §"The symbolic set is not step 0"),
+/// because that would make `icon("list").coloured()` mean the desktop's
+/// own glyph on every box and silently shadow whatever a theme installs.
+///
+/// So the two spellings differ exactly where it matters to us. Our own
+/// files name symbolic shapes — `Icon=calculator`, `Icon=gear` — which
+/// are in the server's compiled-in set and in **no icon theme**: sending
+/// `calculator` coloured resolves nowhere on a box without a matching
+/// theme, which is every box we ship to, and the row falls back to the
+/// generic `window`. Sending `nitro-calc` takes the hop, which reads
+/// `nitro-calc.desktop`'s own `Icon=calculator`, finds it in the
+/// symbolic set and answers with a handle the server draws **tinted** —
+/// the same path `nitro-bar`'s window list already takes, and the reason
+/// it shows real icons.
+///
+/// A third-party application is unaffected, because for it the two
+/// spellings agree: `firefox.desktop` has `Icon=firefox`, so the theme
+/// answers on the first step either way. The hop only changes the answer
+/// where the basename and the `Icon=` differ — which is precisely the
+/// case this launcher was getting wrong.
+///
+/// An entry that names **no** `Icon=` is unchanged: it shows
+/// [`FALLBACK_ICON`] directly, from the symbolic set, rather than asking
+/// for its app id and taking a `BadIcon` first. "This file names no
+/// icon" is a fact about the file, and spending a round trip to
+/// rediscover it would put one on the first-paint path for every such
+/// row — which is what `tests/first_paint.rs`'s control arm measures,
+/// and it caught exactly that when this function briefly asked anyway.
+///
+/// A **built-in** is unchanged: its icon name is a symbolic shape by
+/// construction (`builtins()` writes it), and it has no `.desktop` file
+/// for a hop to read.
 #[must_use]
 pub fn row_icon(entry: &Entry) -> RowIcon {
     match (&entry.icon, &entry.source) {
-        (Some(name), Source::Desktop(_)) => RowIcon::Coloured(name.clone()),
+        // The app id, coloured: the hop's entry point, and the only
+        // spelling that resolves for the files we ship. `app_id` answers
+        // `None` only for a path with no usable basename — which the
+        // scanner cannot produce but the type permits — and then the
+        // file's own `Icon=` is still better than nothing.
+        (Some(name), Source::Desktop(path)) => {
+            RowIcon::Coloured(app_id(path).unwrap_or_else(|| name.clone()))
+        }
         (Some(name), Source::Builtin) => RowIcon::Symbolic(name.clone()),
         (None, _) => RowIcon::None,
     }
+}
+
+/// The app id of a `.desktop` file: its basename without the extension.
+///
+/// The same string the application registers with `App::new` and the
+/// same one `nitro-bar` sends for its window-list buttons — which is the
+/// convention `deploy/*.desktop` keep deliberately, and what makes the
+/// server's `app_id` → `<app_id>.desktop` step find the file at all.
+fn app_id(path: &std::path::Path) -> Option<String> {
+    let file = path.file_name()?.to_str()?;
+    let stem = file.strip_suffix(".desktop").unwrap_or(file);
+    (!stem.is_empty()).then(|| stem.to_owned())
 }
 
 /// Put `icon` on a row button being built.

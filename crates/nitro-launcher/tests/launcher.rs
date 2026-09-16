@@ -596,17 +596,31 @@ fn a_desktop_row_asks_for_a_coloured_icon_and_a_builtin_asks_for_a_symbolic_one(
     );
 
     // Row 0, the `.desktop` entry: a coloured application icon with the
-    // symbolic `window` behind it. On a box whose theme has no
-    // `firefox` the fallback has already fired by now, which is the
-    // feature working rather than a failure — so both outcomes are
-    // asserted, the way `nitro-bar`'s equivalent test does it.
+    // symbolic `window` behind it. The name asked for is the entry's
+    // **app id** — the file's basename, `browser` — and not its `Icon=`
+    // value, because the app id is the name the *server* can resolve:
+    // theme first, then `<app_id>.desktop`'s own `Icon=` (#3715). For a
+    // third-party application the two agree (`firefox.desktop` has
+    // `Icon=firefox`); this fixture deliberately makes them **differ**,
+    // so the test can tell the two spellings apart at all. See
+    // `row_icon` for why the difference decides whether our own
+    // applications get an icon.
+    //
+    // On a box whose theme has no `browser` the fallback has already
+    // fired by now, which is the feature working rather than a failure —
+    // so both outcomes are asserted, the way `nitro-bar`'s equivalent
+    // test does it.
     let id = named(&mut h, "results/0").expect("row 0");
     let b = h.widget::<Button<Launcher>>(id);
     if b.icon_fell_back() {
         assert_eq!(b.icon(), Some(nitro_launcher::FALLBACK_ICON));
     } else {
-        assert_eq!(b.icon(), Some("firefox"));
-        assert!(b.is_icon_coloured(), "a .desktop Icon= names the theme");
+        assert_eq!(
+            b.icon(),
+            Some("browser"),
+            "the row asks for the app id, not the `Icon=` value"
+        );
+        assert!(b.is_icon_coloured(), "an application icon names the theme");
         assert_eq!(b.icon_fallback(), Some(nitro_launcher::FALLBACK_ICON));
     }
     assert!(

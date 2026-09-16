@@ -695,12 +695,33 @@ not stretched.
 
 ### The consumers
 
-**`nitro-launcher`** parses `Icon=` (`desktop.rs`, `Entry::icon`) and
-puts a 24 px icon in front of every row, falling back to `window`. A
-`.desktop` entry's icon is coloured (it names the theme); a **built-in**
-entry's is symbolic, because a built-in exists precisely on the box with
-no icon theme installed, so its icon has to come from the set compiled
-into the server.
+**`nitro-launcher`** puts a 24 px icon in front of every row, falling
+back to `window`. A **built-in** entry's icon is symbolic — a built-in
+exists precisely on the box with no icon theme installed, so its icon has
+to come from the set compiled into the server. A **`.desktop`** entry's
+is an application icon, asked for by the entry's **app id** (its file's
+basename) rather than by its `Icon=` value.
+
+That last point is the launcher's half of the indirection, and it is
+worth stating because the obvious reading is backwards. Sending `Icon=`
+directly looks like one lookup saved and is one *namespace* lost: an
+`AS_COLOURED` name goes to the machine's icon theme, then to
+`<name>.desktop`, then to `BadIcon` — and never to the symbolic set, by
+the rule two sections up. Our own files name symbolic shapes
+(`Icon=calculator`), which no icon theme has, so the direct spelling
+resolves nowhere on exactly the boxes this desktop runs on and every row
+falls back to `window`. Sending `nitro-calc` takes the hop, reads that
+same `Icon=calculator`, finds it in the symbolic set and draws it tinted
+— the identical path `nitro-bar`'s window list takes. For a third-party
+application the two spellings agree (`firefox.desktop` has
+`Icon=firefox`), so nothing changes for it; the hop only matters where
+the basename and the `Icon=` differ, which is all of ours.
+
+(An entry naming **no** `Icon=` still shows `window` directly rather than
+asking for its app id first: that would put a `BadIcon` round trip on the
+first-paint path for every such row, which is what `first_paint.rs`'s
+control arm measures — and it caught exactly that regression when this
+rule was first written.)
 
 The idle and latency contracts hold, and the second one is measured
 rather than argued. The structural argument is that `SetIcon` is

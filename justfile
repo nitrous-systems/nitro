@@ -102,6 +102,12 @@ deploy-bins:
     # Idempotent: rsync over the same four basenames, and the launcher
     # and the server both key their indexes on the basename.
     #
+    # **The files go last, and the order is deliberate.** A failure here
+    # leaves the box with new binaries and no entries, which is the
+    # benign half of the coupling below — the launcher falls back to its
+    # built-ins and everything still runs. The other order could leave
+    # entries next to old binaries, which is the half that breaks.
+    #
     # ⚠ The files and the `PATH` prepend are **coupled, and the coupling
     # is one-directional**: measured on the box during #3723, these four
     # files installed next to a session that does *not* prepend (any

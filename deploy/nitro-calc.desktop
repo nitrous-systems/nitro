@@ -16,6 +16,15 @@ Comment=A calculator on nitro-ui
 # theme installed at all. The launcher's built-in entry names the same
 # shape, so a box with this file and a box without look the same.
 #
+# That last sentence is true **because the launcher asks for the app
+# id**, not for this `Icon=` value — and it was briefly false during
+# #3723, which is why it is spelled out here. A row that sent
+# `calculator` with the coloured role would reach the icon *theme*, which
+# has no such file on our boxes, and fall back to the generic `window`;
+# sending `nitro-calc` lets the server take the same `<app_id>.desktop`
+# hop it takes for the bar and land back on this line.
+# `crates/nitro-launcher/src/lib.rs`'s `row_icon` has the argument.
+#
 # `just deploy` installs this file into `~/.local/share/applications` on
 # the test box (#3723), and it is a bare `Exec=` on purpose: see
 # `nitro-term.desktop` for why that now resolves there as well as on a

@@ -308,3 +308,76 @@ fn an_installed_file_replaces_the_builtin_rather_than_doubling_it() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// **The shipped entries' `Icon=` names a symbolic shape, not a theme
+/// one — so a row that asks for it `AS_COLOURED` cannot resolve.**
+///
+/// This is the defect the reviewer of #3723 found, and it is a property
+/// of these four files rather than of any fixture, which is why it is
+/// pinned here. The chain, all of it already in the tree before this
+/// task:
+///
+/// * `Launcher::rescan` drops the built-in and keeps the file's entry,
+///   so Calculator/Files/Settings/Terminal become `Source::Desktop(_)`
+///   (that is the shadowing #3723 wants);
+/// * `row_icon` keyed the **namespace** off the source, so the row sent
+///   `SetIcon("calculator", AS_COLOURED)` where the built-in had sent
+///   the symbolic `calculator`;
+/// * `IconEngine::lookup_app` is explicitly *not* allowed to consult the
+///   symbolic set for the name it was **given** (`docs/icons.md` §"The
+///   symbolic set is not step 0"), and `calculator` is in no icon theme
+///   on the box — so it is a `BadIcon`, and all four rows fell back to
+///   the same tinted `window` glyph.
+///
+/// The hop that saves the bar does not fire, because the bar sends the
+/// **app id** and the launcher was sending the `Icon=` *value*. So the
+/// fix is to send the app id here too; this test pins the fact that
+/// makes the old code wrong, so that a future edit which reverts to
+/// `Icon=` has to argue with a number.
+#[test]
+fn the_shipped_icons_are_symbolic_names_no_icon_theme_has() {
+    // Every shipped `Icon=` is a name from the server's **own** compiled
+    // set. Asserted against `nitro-icons` rather than by listing the
+    // four strings again: the set is the thing that makes them work, and
+    // a file that renamed `Icon=` to something the set lacks is exactly
+    // the regression worth catching.
+    for (file, entry) in shipped() {
+        let icon = entry
+            .icon
+            .as_deref()
+            .expect("every shipped file names an icon");
+        assert!(
+            nitro_icons::index_of(icon).is_some(),
+            "{file}: `Icon={icon}` is not in the server's symbolic set, so \
+             on a box with no icon theme it resolves nowhere"
+        );
+    }
+}
+
+/// A shipped entry's row asks for the **app id**, coloured — not its
+/// `Icon=` value.
+///
+/// The app id is the `.desktop` basename, which is what the server's
+/// #3715 hop turns into `Icon=` and then into a symbolic handle, drawn
+/// tinted. Sending `Icon=` directly skips the hop and lands in the icon
+/// theme, which on a themeless box is a `BadIcon` and a `window` glyph.
+///
+/// A real application is unaffected: `firefox.desktop` has
+/// `Icon=firefox`, so both spellings resolve to the same PNG.
+#[test]
+fn a_shipped_entry_asks_for_its_app_id_so_the_servers_hop_can_fire() {
+    use nitro_launcher::{RowIcon, row_icon};
+
+    for (file, entry) in shipped() {
+        let app_id = file.strip_suffix(".desktop").expect("a .desktop file");
+        match row_icon(&entry) {
+            RowIcon::Coloured(name) => assert_eq!(
+                name, app_id,
+                "{file}: the row asks for {name:?}; it must ask for the \
+                 app id {app_id:?}, which is the name the server's \
+                 `app_id` → `<app_id>.desktop` → `Icon=` hop resolves"
+            ),
+            other => panic!("{file}: a .desktop entry's row is {other:?}, not coloured"),
+        }
+    }
+}

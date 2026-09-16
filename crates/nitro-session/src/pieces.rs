@@ -140,9 +140,21 @@ pub fn resolve(program: &str, dir: Option<&Path>) -> PathBuf {
 
 /// `PATH` with `dir` prepended, for the environment a child inherits.
 ///
-/// `None` when there is nothing to do — no directory, or a directory
-/// that is already the first entry — so a caller can leave the variable
-/// alone rather than rewrite it to itself. A `PATH` that is unset or
+/// `None` when there is nothing to do, which is three cases: no
+/// directory; a directory that is already the first entry (so a caller
+/// can leave the variable alone rather than rewrite it to itself); and a
+/// directory whose path is **not UTF-8**.
+///
+/// That third one is a deliberate give-up rather than an oversight. A
+/// `PATH` is a `:`-joined byte string and `OsString` could carry it, but
+/// the child of a session installed under a non-UTF-8 path would then get
+/// a `PATH` this function cannot log, compare or explain — and the whole
+/// value of the prepend is that `/proc/<pid>/environ` answers "why did
+/// that resolve?". Leaving `PATH` untouched loses the launcher's bare
+/// `Exec=` on such a box, which is a visible missing icon rather than a
+/// silent misbehaviour, and no box we ship to is in that state.
+///
+/// A `PATH` that is unset or
 /// empty becomes just `dir`, which is the same answer `execvp` would
 /// give for an empty `PATH` on a system with a confused environment
 /// (POSIX says an empty `PATH` means the current directory, and
@@ -286,6 +298,18 @@ mod tests {
     #[test]
     fn there_is_nothing_to_do_without_a_dir_or_when_it_is_already_first() {
         assert_eq!(path_with_bin_dir(None, Some("/usr/bin")), None);
+        // A non-UTF-8 directory is the third `None`: documented as a
+        // give-up rather than silently absent, and pinned so a future
+        // `OsString` rewrite has to change the test that states the rule.
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            let raw = std::ffi::OsStr::from_bytes(b"/opt/\xff\xfenitro");
+            assert_eq!(
+                path_with_bin_dir(Some(Path::new(raw)), Some("/usr/bin")),
+                None,
+                "a path that is not UTF-8 leaves PATH alone"
+            );
+        }
         assert_eq!(
             path_with_bin_dir(Some(Path::new("/usr/bin")), Some("/usr/bin:/bin")),
             None,

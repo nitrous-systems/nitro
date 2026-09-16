@@ -50,3 +50,9 @@ nitro-core = { workspace = true }
 # test compares two of them pixel for pixel (the launcher must not be on
 # screen before the first Super tap), which is the only use.
 nitro-kms = { workspace = true }
+# `index_of`, so `tests/deployed.rs` can assert that every shipped
+# `Icon=` names a shape in the server's **own** compiled-in set rather
+# than re-listing the four strings next to the files that already carry
+# them. A dev-dependency: the launcher itself never resolves an icon,
+# which is the whole bargain `src/desktop.rs` documents.
+nitro-icons = { workspace = true }
