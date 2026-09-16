@@ -88,9 +88,32 @@ launcher entry with `spawn: No such file or directory`. Since #3723
 every child inherits, so the bare name resolves and the shadowing is the
 behaviour we want: **one** Terminal entry in the launcher, the packaged
 one. If the launcher ever shows a Terminal entry that does not start,
-that `PATH` prepend is the first thing to check —
-`tr '\0' '\n' < /proc/$(pgrep -f nitro-launcher)/environ | grep ^PATH`
-should begin with `/home/kaspar/nitro-bin`.
+that `PATH` prepend is the first thing to check — and it needs `sudo`,
+since the session's children are not the ssh user's processes for
+`/proc` purposes:
+
+```console
+$ pid=$(pgrep -x nitro-launcher)
+$ sudo sh -c "tr '\0' '\n' < /proc/$pid/environ" | grep ^PATH=
+PATH=/home/kaspar/nitro-bin:/usr/local/sbin:/usr/local/bin:...
+```
+
+The session's own `PATH` is the unit's and does **not** start with
+`~/nitro-bin` — only its children's does, which is the change. Seeing
+both is the cheapest confirmation that the prepend is live.
+
+> **⚠ The files and the deployed `nitro-session` are coupled, and only
+> one order is safe.** Measured on the box during #3723 rather than
+> assumed: these four files installed next to a session that does *not*
+> prepend (anything before #3723) reproduce the original regression
+> exactly — `hey nitro-launcher do results/0 click` on Terminal spawns
+> **nothing**, `pgrep -c nitro-term` stays 0, because the packaged entry
+> shadows the built-in and its bare `Exec=` does not resolve. Removing
+> the files brings the built-in back and the launch works again (the
+> control for that arm). So: a rollback of the binaries to a pre-#3723
+> build must take the four files with it, and a box deployed from such a
+> build must not be left with them. `just deploy` from a tree containing
+> #3723 is always consistent, because it writes both halves.
 
 ```console
 $ just box-session            # status

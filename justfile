@@ -101,6 +101,17 @@ deploy-bins:
     #
     # Idempotent: rsync over the same four basenames, and the launcher
     # and the server both key their indexes on the basename.
+    #
+    # ⚠ The files and the `PATH` prepend are **coupled, and the coupling
+    # is one-directional**: measured on the box during #3723, these four
+    # files installed next to a session that does *not* prepend (any
+    # build before #3723) reproduce the original regression exactly —
+    # launching Terminal from the launcher spawns nothing, because the
+    # packaged entry shadows the built-in and its bare `Exec=` does not
+    # resolve. The two halves therefore ship in one commit and must land
+    # together; installing the files from this recipe while an older
+    # `nitro-session` is deployed is the one way to get the old failure
+    # back.
     ssh {{box}} 'mkdir -p ~/.local/share/applications'
     rsync -az deploy/*.desktop {{box}}:.local/share/applications/
 

@@ -968,6 +968,100 @@ in either direction: the app arm is never *above* the control, and the
 one reading of 2 is the bar's 30 s poll landing differently in the
 window, not a cost of the icons.
 
+### Measured on the box (#3723, the entries actually installed)
+
+Test box at 1080p@119982, dark, scale 1, my build of every binary
+(md5-checked at entry **and** at exit, unchanged — a run whose binaries
+move under it is two builds interleaved). The human's `server.conf`
+restored `diff`-identical. **No fixtures**: the entries are
+`deploy/nitro-{calc,files,settings,term}.desktop` from this repository,
+rsynced by the `just deploy-bins` recipe this task adds.
+
+#3715 measured this feature with the files copied in by hand and then
+removed for hygiene. This is the same measurement with them **deployed**,
+and with the two things that copy could not show: a fifth window as a
+control, and whether launching from the launcher still works.
+
+**The headline, one variable.** Both arms are the same script — restart,
+then the same five clients in the same order, then one full-screen
+readback — so the server places the windows identically and the same
+coordinates name the same button in both. Fresh server *and* fresh
+clients each arm, because the bar sends one `SetIcon` per window at
+creation and the scene nodes hold resolved handles: a "control" that
+shares state with the arm is no control (#3715's false start).
+
+| bar window-list icon boxes, of 256 px | before | after |
+|---|---|---|
+| every one of the **10** pairs among 5 buttons | **0** | **159–198** |
+| distinct icon boxes on screen | **1** | **5** |
+
+One distinct box across five buttons *is* #3714's finding in its sharpest
+form: not "they look similar", but literally one glyph drawn five times.
+
+**The control is what makes the arm attributable.** `hello_dialog` has no
+`.desktop` file and no theme icon, so it must not move:
+
+| button, before → after | changed |
+|---|---|
+| Calculator | **162**/256 |
+| Settings | **159**/256 |
+| Terminal | **34**/256 |
+| Files | **173**/256 |
+| **`hello-dialog` (control)** | **0**/256 |
+
+Terminal's 34 is smaller because `terminal`'s glyph shares most of its
+box with `window`'s — two rectangles — which is exactly why the *pairwise*
+table above is the headline: 34 px is unambiguous against a control that
+moved 0.
+
+**The frames**, measured one window at a time so nothing can be mistaken
+for the frame, and located by the `title_bar` colour rather than by "a
+band wider than N" — the first attempt at that found a 765 px gradient
+band **in the wallpaper** and reported a confident 0/256:
+
+| title-bar icon box, 16×16 | before | after | changed |
+|---|---|---|---|
+| `nitro-calc` | 55 px ink | **91** | **136**/256 |
+| `nitro-files` | 55 px ink | **151** | **160**/256 |
+
+55 px of ink in both before-arms is the same `window` glyph twice.
+
+**The counters**, and the launcher:
+
+| | before | after |
+|---|---|---|
+| `desktop_entries` | **8** (system files only) | **12** |
+| `app_icon_indirections` | **0** | **4** |
+| launcher entries named Terminal / Calculator / Files / Settings | 1 each (built-ins) | **1 each** (the files') |
+| `hey nitro-launcher do results/0 click` on Terminal → `pgrep -c nitro-term` | 1 → 2 | **1 → 2**, argv `nitro-term` |
+
+That last row is the regression the old "deliberately NOT installed"
+comment guarded, and it is the one an icon screenshot cannot see: an
+entry that is present and dead looks identical to a working one. The
+spawned process's argv is the bare `nitro-term`, not the built-in's
+absolute path — so what ran is the packaged `Exec=`, resolved through the
+inherited `PATH`. A second `just deploy` of the same four files left
+`desktop_entries` at 12 and the entry list byte-identical.
+
+**The prepend, from the outside**, which is the whole fix in two lines:
+
+```text
+nitro-session : PATH=/usr/local/sbin:/usr/local/bin:...      ← the unit's
+nitro-launcher: PATH=/home/kaspar/nitro-bin:/usr/local/sbin:...
+nitro-bar     : PATH=/home/kaspar/nitro-bin:/usr/local/sbin:...
+```
+
+**The finding that changes a deployment rule.** The files and the
+`PATH`-prepending session are **coupled**, and it was worth measuring
+rather than assuming: with the four files installed next to *main's*
+session (no prepend), launching Terminal from the launcher spawns
+**nothing** — `pgrep -c nitro-term` 0 → 0 — because the packaged entry
+shadows the built-in and its bare `Exec=` does not resolve. Removing the
+files restores the built-in and the launch works again (0 → 1, argv
+`/home/kaspar/nitro-bin/nitro-term`), which is the control that makes the
+first arm mean what it says. So the two halves ship in one commit;
+`docs/testbox.md` carries the rollback warning.
+
 ### Still deferred
 
 * **SVG application icons**, and the gradients they need.
