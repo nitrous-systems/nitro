@@ -140,6 +140,22 @@ The built-ins are what makes the **test box** work: a freshly rsynced
 empty list cannot be tested at all. A real `.desktop` file naming the
 same program replaces its built-in rather than appearing beside it.
 
+**Since #3723 the box has both**, and the shadowing above is what keeps
+the list honest: `just deploy` installs `deploy/*.desktop` into
+`~/.local/share/applications`, so Calculator, Files, Settings and
+Terminal come from the files and appear **once** each — the packaged
+entry, not the packaged entry plus the fallback. `nitro-demo` ships no
+`.desktop` (a tool, not an application) and keeps its built-in.
+
+Those files carry a **bare `Exec=`**, which is the spec's form and a
+packager's, and it works on the box because `nitro-session` prepends its
+own executable's directory to the `PATH` every child inherits. This
+crate needs nothing for that: `Command::new("nitro-term")` is `execvp`
+and the kernel does the search. Before it, installing those files was a
+regression — a shadowed built-in replaced by a command that could not
+run. `tests/deployed.rs` pins the shadowing, the bare-name resolution and
+its control against the repository's real files.
+
 The search path is rescanned on **show**, and only when a directory's
 mtime moved. Re-reading a few hundred files on every keystroke would be
 hundreds of syscalls per character; never re-reading them would mean
@@ -340,3 +356,12 @@ reason; the query being cleared on reopen; an application installed since
 start-up appearing; a built-in launchable with no `.desktop` files at
 all; every part addressable for `hey`; idle silence both hidden and
 shown; and the centred anchor leaving the window its own size.
+
+`tests/deployed.rs` is the fourth file, and it is deliberately **not**
+fixture-based: it reads `deploy/*.desktop` from this repository and
+asserts what the rest of the desktop assumes of them — the file name, the
+app id, `StartupWMClass` and `Icon=` all lining up (#3714/#3715), every
+`Exec=` being a bare name, that bare name resolving against a `PATH` that
+contains the binary and failing against one that does not, and the
+installed files shadowing the built-ins into exactly one entry each,
+idempotently across a repeated deploy.

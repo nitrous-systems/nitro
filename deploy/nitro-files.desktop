@@ -4,9 +4,9 @@ Name=Files
 GenericName=File Manager
 Comment=A file browser on nitro-ui
 # See `deploy/nitro-calc.desktop` for why the file name, the app id and
-# `StartupWMClass` are all `nitro-files`, why `Icon=` names a symbolic
-# icon rather than a theme one, and why `just deploy` does not install
-# this file.
+# `StartupWMClass` are all `nitro-files`, and why `Icon=` names a
+# symbolic icon rather than a theme one. `just deploy` installs this
+# file; `nitro-term.desktop` records why the bare `Exec=` resolves.
 Exec=nitro-files
 Icon=folder-fill
 Terminal=false

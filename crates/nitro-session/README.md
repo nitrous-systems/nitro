@@ -194,7 +194,7 @@ the action, so a bar does not have to carry a process spawn.
 |---|---|
 | `NITRO_SOCKET` / `NITRO_SHELL_SOCKET` | the sockets waited for; the same variables the server binds and clients connect to |
 | `NITRO_SESSION_SOCKET` | overrides the session socket path |
-| `NITRO_SESSION_BIN_DIR` | where the pieces are looked for before `$PATH` |
+| `NITRO_SESSION_BIN_DIR` | where the pieces are looked for before `$PATH`, and what is prepended to the children's `PATH` |
 | `NITRO_SESSION_PIECES` | which shell pieces to start (comma separated; empty = the server alone) |
 | `NITRO_LOG` | `error\|warn\|info\|debug`, same levels and format as the server |
 
@@ -218,6 +218,37 @@ and `just deploy` replaces all of them at once; a session that searched
 server. A sibling that is not an executable *file* falls through to
 `$PATH` rather than becoming an `EACCES` at spawn time, which is the
 half-rsynced-file case.
+
+## …and the children get that directory on their `PATH`
+
+The same directory is **prepended to the `PATH` every child inherits**
+(`pieces::path_with_bin_dir`). The lookup above answers "where is the
+bar?" for the session; this answers it for everything the session's
+children go on to start, and the case that forced it is the launcher's.
+
+A `.desktop` file's `Exec=` is a bare program name — the spec's form, and
+what a packager ships, because on an ordinary system the binary is in
+`/usr/bin`. On the box it is in `~/nitro-bin`, so `Exec=nitro-term` was
+an `execvp` that could only fail; and since a `.desktop` file shadows the
+launcher's built-in entry for the same program, installing
+`deploy/nitro-term.desktop` replaced a working launcher entry with
+`spawn: No such file or directory`. That is why `just deploy` refused to
+install the files at all, and why the box showed the generic `window`
+icon for every one of our applications even after the server learned to
+resolve `app_id` → `<app_id>.desktop` → `Icon=` (#3715).
+
+The session is the process that knows where the desktop's binaries are,
+so it is the process that says so. **Prepended**, not appended, for the
+same reason the sibling lookup wins over `$PATH`: a stale
+`/usr/local/bin/nitro-term` must lose to the binary deployed beside the
+running session. And because it is the session's *own* directory, an
+installed `/usr/bin/nitro-session` contributes `/usr/bin` — already
+there, so the rewrite is skipped entirely and the environment a packaged
+desktop's children see is untouched.
+
+Nothing else about the environment is edited; `NITRO_SESSION_BIN_DIR`
+moves both halves together, since it is the directory the session looks
+in.
 
 ## stdio
 
@@ -254,8 +285,11 @@ whole compositor into a supervisor whose job is `fork`, `exec` and
 `src/` unit-tests the parts that are pure: the backoff sequence and its
 reset boundary, the start/teardown order, path resolution (sibling vs
 `$PATH`, including the non-executable and the directory cases), the
-readiness timeout (with the stale-socket and wedged-listener traps), the
-command parser, and the line buffering.
+`PATH` the children inherit (prepended, the empty and already-first
+no-ops) and a real child proving a **bare name resolves** through it with
+a control that shows it does not without, the readiness timeout (with the
+stale-socket and wedged-listener traps), the command parser, and the line
+buffering.
 
 `tests/session.rs` runs a **real** `Session` — real fork/exec, real
 pidfds, the real poll loop, the real handshake probe — against

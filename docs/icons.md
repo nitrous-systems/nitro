@@ -760,6 +760,35 @@ search path and its invalidation are in the compositor after all, and
 they are 200 lines. Our own applications keep the convention regardless:
 the `.desktop` files under `deploy/` are named after their app ids.
 
+#### What still falls back to `window`, and on purpose
+
+The hop only fires for an app id that has a `.desktop` file, and since
+#3723 `just deploy` installs ours — all four of them — into
+`~/.local/share/applications` on the box. So the list of things that
+still show the generic `window` glyph is short and deliberate:
+
+| | icon |
+|---|---|
+| `nitro-calc`, `nitro-files`, `nitro-settings`, `nitro-term` | `calculator`, `folder-fill`, `gear`, `terminal`, through the hop |
+| **`nitro-bar`, `nitro-launcher`, `nitro-wallpaper`** | `window` — **no `.desktop`, on purpose** |
+| **`nitro-demo`, `nitro-bench`** | `window` — **no `.desktop`, on purpose** |
+| `nitro-shot`, `hey` | not windows at all |
+
+The shell surfaces are the first group's reason: a bar, a launcher and a
+wallpaper are not applications and must not be listed *in* the launcher,
+and they have no window-list button either (`docs/shell.md`: only
+`Normal` windows are applications). An entry for them would be a button
+that starts a second bar. The second group is tools — a demo and a
+benchmark are things a developer runs from a shell with arguments, not
+things a user picks off a list — and `nitro-demo` keeps the launcher's
+**built-in** entry, which is the right amount of discoverability for it:
+present on a box where the binaries are, absent from anybody's
+application menu.
+
+So the `window` glyph on one of those is the fallback working, not a
+defect, and the file to *not* write is part of the design rather than an
+oversight somebody should fix.
+
 **The window decorations** are the other consumer, and the one with no
 client at all. A decorated window's title bar carries its application's
 icon at 16 px and three symbolic button glyphs; all four are nodes the

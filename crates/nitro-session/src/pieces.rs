@@ -35,6 +35,39 @@
 //! not executable falls through to it rather than becoming a start
 //! failure.
 //!
+//! # …and the same directory goes *onto* `PATH` for the children
+//!
+//! [`path_with_bin_dir`] prepends that directory to the `PATH` every
+//! child inherits. The sibling lookup above answers "where is the bar?"
+//! for the session; this answers the same question for everything the
+//! session's children go on to start, and the case that forced it is the
+//! launcher's.
+//!
+//! A `.desktop` file's `Exec=` is a **bare program name** — that is what
+//! the freedesktop spec says to write and what a packager ships, because
+//! on an ordinary system the binary is in `/usr/bin` and `/usr/bin` is on
+//! `PATH`. On the box the binaries are in `~/nitro-bin`, which is on
+//! nobody's `PATH`, so `Exec=nitro-term` was an `execvp` that could only
+//! fail — and because a `.desktop` file *shadows* the launcher's built-in
+//! entry for the same program, installing `deploy/nitro-term.desktop`
+//! replaced a working launcher entry with `spawn: No such file or
+//! directory`. That is why `just deploy-bins` refused to install the
+//! files at all, and it is the root cause this fixes rather than works
+//! around: the session is the process that knows where the desktop's
+//! binaries are, so it is the process that should say so to its
+//! children.
+//!
+//! **Prepended, not appended.** The same argument as the sibling lookup,
+//! one level down: a box with a stale `/usr/local/bin/nitro-term` must
+//! start the one that was deployed beside the running session, not
+//! yesterday's. And it is the *session's* directory rather than a
+//! configured one, so a `/usr/bin/nitro-session` contributes `/usr/bin`
+//! — already on `PATH`, and therefore a no-op rather than a surprise.
+//!
+//! Nothing else about the environment is touched: the session passes its
+//! environment on unchanged, which is how `NITRO_BACKEND` reaches the
+//! server without this crate knowing the name.
+//!
 //! [`nitro-launcher`'s `exe_dir`]: https://example.invalid
 
 use std::os::unix::fs::PermissionsExt as _;
@@ -103,6 +136,41 @@ pub fn resolve(program: &str, dir: Option<&Path>) -> PathBuf {
         }
     }
     PathBuf::from(program)
+}
+
+/// `PATH` with `dir` prepended, for the environment a child inherits.
+///
+/// `None` when there is nothing to do — no directory, or a directory
+/// that is already the first entry — so a caller can leave the variable
+/// alone rather than rewrite it to itself. A `PATH` that is unset or
+/// empty becomes just `dir`, which is the same answer `execvp` would
+/// give for an empty `PATH` on a system with a confused environment
+/// (POSIX says an empty `PATH` means the current directory, and
+/// inheriting *that* is not a thing a session should hand its children).
+///
+/// The directory is not checked for existence: the whole point is that
+/// `execvp` searches, and a `PATH` entry that does not exist is skipped
+/// by the kernel's search rather than being an error. Checking here
+/// would also be a TOCTOU against an rsync in flight — exactly the box's
+/// deploy.
+#[must_use]
+pub fn path_with_bin_dir(dir: Option<&Path>, path: Option<&str>) -> Option<String> {
+    let dir = dir?;
+    let dir = dir.to_str()?;
+    if dir.is_empty() {
+        return None;
+    }
+    let Some(path) = path.filter(|p| !p.is_empty()) else {
+        return Some(dir.to_owned());
+    };
+    // Already first: rewriting `PATH` to itself would churn the
+    // environment of every restart for nothing, and would make the
+    // variable look edited in a `/proc/<pid>/environ` somebody is
+    // reading to answer "who put that there?".
+    if path.split(':').next() == Some(dir) {
+        return None;
+    }
+    Some(format!("{dir}:{path}"))
 }
 
 /// Whether `path` is a regular file with an execute bit set.
@@ -182,5 +250,52 @@ mod tests {
 
         assert_eq!(resolve("nitro-bar", None), PathBuf::from("nitro-bar"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The children's `PATH` gets the session's own directory in front,
+    /// which is what makes a packaged `Exec=nitro-term` resolve on a box
+    /// whose binaries are in `~/nitro-bin`.
+    #[test]
+    fn the_bin_dir_goes_in_front_of_the_inherited_path() {
+        let dir = Path::new("/home/kaspar/nitro-bin");
+        assert_eq!(
+            path_with_bin_dir(Some(dir), Some("/usr/bin:/bin")).as_deref(),
+            Some("/home/kaspar/nitro-bin:/usr/bin:/bin"),
+            "prepended, so a deployed binary wins over a stale installed one"
+        );
+    }
+
+    #[test]
+    fn an_absent_or_empty_path_becomes_the_bin_dir_alone() {
+        let dir = Path::new("/opt/nitro");
+        assert_eq!(
+            path_with_bin_dir(Some(dir), None).as_deref(),
+            Some("/opt/nitro")
+        );
+        assert_eq!(
+            path_with_bin_dir(Some(dir), Some("")).as_deref(),
+            Some("/opt/nitro"),
+            "an empty PATH means the current directory to execvp; the \
+             children get the session's directory instead"
+        );
+    }
+
+    /// Two no-ops, and both matter: a session with no directory to offer
+    /// must not touch the variable, and a session already first in the
+    /// list must not rewrite `PATH` to itself on every restart.
+    #[test]
+    fn there_is_nothing_to_do_without_a_dir_or_when_it_is_already_first() {
+        assert_eq!(path_with_bin_dir(None, Some("/usr/bin")), None);
+        assert_eq!(
+            path_with_bin_dir(Some(Path::new("/usr/bin")), Some("/usr/bin:/bin")),
+            None,
+            "an installed session contributes a directory that is already there"
+        );
+        // Present but *not* first is still a change: the whole point is
+        // that the session's own directory outranks the rest.
+        assert_eq!(
+            path_with_bin_dir(Some(Path::new("/usr/bin")), Some("/bin:/usr/bin")).as_deref(),
+            Some("/usr/bin:/bin:/usr/bin")
+        );
     }
 }

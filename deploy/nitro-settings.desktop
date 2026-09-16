@@ -4,9 +4,9 @@ Name=Settings
 GenericName=Desktop Settings
 Comment=Outputs, keyboard and colours, written to server.conf
 # See `deploy/nitro-calc.desktop` for why the file name, the app id and
-# `StartupWMClass` are all `nitro-settings`, why `Icon=` names a symbolic
-# icon rather than a theme one, and why `just deploy` does not install
-# this file.
+# `StartupWMClass` are all `nitro-settings`, and why `Icon=` names a
+# symbolic icon rather than a theme one. `just deploy` installs this
+# file; `nitro-term.desktop` records why the bare `Exec=` resolves.
 Exec=nitro-settings
 Icon=gear
 Terminal=false

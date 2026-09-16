@@ -762,7 +762,13 @@ impl Drop for Session {
 fn spawn_slot(slot: &mut Slot, config: &Config) -> Result<(), SpawnError> {
     let program = crate::pieces::resolve(slot.piece.program, config.bin_dir.as_deref());
     let args = config.args_for(slot.piece.program);
-    let child = Child::spawn(slot.piece.program, slot.piece.role, &program, &args)?;
+    let child = Child::spawn(
+        slot.piece.program,
+        slot.piece.role,
+        &program,
+        &args,
+        config.bin_dir.as_deref(),
+    )?;
     info!(
         "started {} (pid {}) from {}",
         slot.piece.program,

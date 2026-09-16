@@ -49,6 +49,16 @@
 //! terminal to be on a VT of. A shell client with a tty on stdin would be
 //! a toolkit app that can be Ctrl-C'd from a keyboard the compositor also
 //! owns; they get `/dev/null`.
+//!
+//! # `PATH`
+//!
+//! Every child is started with the session's own directory prepended to
+//! `PATH` ([`crate::pieces::path_with_bin_dir`]). The session already
+//! *finds* its pieces there; this is the same fact stated to the
+//! processes it starts, so a `.desktop` file's bare `Exec=nitro-term`
+//! resolves for the launcher on a box whose binaries live in
+//! `~/nitro-bin`. `crates/nitro-session/src/pieces.rs` has the argument
+//! and `docs/shell.md` §"The icon is the app id" the consequence.
 
 use std::os::unix::process::CommandExt as _;
 use std::path::Path;
@@ -123,6 +133,10 @@ impl Child {
     /// Start `program` (already resolved to a path or a bare name) with
     /// `args`, in its own process group, and open a pidfd for it.
     ///
+    /// `bin_dir` is prepended to the child's `PATH`; see the module docs
+    /// and [`crate::pieces::path_with_bin_dir`]. `None` leaves `PATH`
+    /// exactly as the session received it.
+    ///
     /// # Errors
     /// [`SpawnError::Spawn`] if the program could not be started,
     /// [`SpawnError::NoPidfd`] if it started but cannot be watched.
@@ -131,6 +145,7 @@ impl Child {
         role: Role,
         program: &Path,
         args: &[String],
+        bin_dir: Option<&Path>,
     ) -> Result<Self, SpawnError> {
         let mut cmd = Command::new(program);
         cmd.args(args)
@@ -140,6 +155,17 @@ impl Child {
             // `poll` while a child filled the pipe).
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
+        // The session's own directory, in front of whatever `PATH` the
+        // unit handed us: `~/nitro-bin` is on nobody's `PATH`, and a
+        // launcher asked to run a packaged `Exec=nitro-term` has nothing
+        // else to go on. Read from the *current* environment rather than
+        // from a value captured at start, because that is what the child
+        // would otherwise inherit.
+        if let Some(path) =
+            crate::pieces::path_with_bin_dir(bin_dir, std::env::var("PATH").ok().as_deref())
+        {
+            cmd.env("PATH", path);
+        }
         if role == Role::Server {
             // The compositor's tty; see the module docs.
             cmd.stdin(Stdio::inherit());
@@ -344,6 +370,7 @@ mod tests {
             Role::Shell,
             Path::new("nitro-no-such-binary-ever"),
             &[],
+            None,
         )
         .expect_err("not on PATH");
         assert!(matches!(e, SpawnError::Spawn(_)), "{e}");
@@ -356,6 +383,7 @@ mod tests {
             Role::Shell,
             Path::new("/bin/sh"),
             &["-c".to_owned(), "exit 7".to_owned()],
+            None,
         )
         .expect("spawn");
         // The pidfd is the wakeup: poll it rather than sleeping.
@@ -380,6 +408,7 @@ mod tests {
             Role::Shell,
             Path::new("/bin/sh"),
             &["-c".to_owned(), "sleep 60".to_owned()],
+            None,
         )
         .expect("spawn");
         c.terminate();
@@ -395,6 +424,93 @@ mod tests {
         };
         rustix::event::poll(&mut fds, Some(&ts)).expect("poll");
         assert_eq!(c.reap(), Some(Exit::Signal(15)));
+    }
+
+    /// The child really sees the directory on its `PATH`, and a **bare
+    /// program name in it resolves** — which is the whole point, because
+    /// the thing that has to work is a launcher's `execvp("nitro-term")`
+    /// two processes further down.
+    ///
+    /// Asserted by running a child that `exec`s a bare name found only
+    /// in a fixture directory, rather than by reading the `Command`'s
+    /// env list: `Command::env` would show the string either way, and
+    /// the claim is about what `execvp` does with it.
+    #[test]
+    fn a_child_inherits_the_bin_dir_on_its_path_and_a_bare_name_resolves() {
+        let dir = std::env::temp_dir().join(format!("nitro-session-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("ran");
+        // A "binary" with a name no `PATH` on any machine has, so a pass
+        // cannot come from the ambient environment.
+        let bare = "nitro-session-path-probe";
+        let probe = dir.join(bare);
+        std::fs::write(
+            &probe,
+            format!("#!/bin/sh\necho resolved > {}\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &probe,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .unwrap();
+
+        let mut c = Child::spawn(
+            "probe",
+            Role::Shell,
+            Path::new("/bin/sh"),
+            // `sh -c 'exec <bare>'` is `execvp` with the child's own
+            // `PATH`, which is exactly what a launcher does with an
+            // `Exec=` value.
+            &["-c".to_owned(), format!("exec {bare}")],
+            Some(&dir),
+        )
+        .expect("spawn");
+        let fd = c.as_fd();
+        let mut fds = [rustix::event::PollFd::new(
+            &fd,
+            rustix::event::PollFlags::IN,
+        )];
+        let ts = rustix::event::Timespec {
+            tv_sec: 5,
+            tv_nsec: 0,
+        };
+        rustix::event::poll(&mut fds, Some(&ts)).expect("poll");
+        assert_eq!(
+            c.reap(),
+            Some(Exit::Code(0)),
+            "the bare name resolved: a failed `exec` in `sh -c` exits 127"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap_or_default().trim(),
+            "resolved"
+        );
+
+        // And the control, which is what makes the arm mean something:
+        // the same child without the directory cannot find the program.
+        let _ = std::fs::remove_file(&marker);
+        let mut c = Child::spawn(
+            "probe-control",
+            Role::Shell,
+            Path::new("/bin/sh"),
+            &["-c".to_owned(), format!("exec {bare} 2>/dev/null")],
+            None,
+        )
+        .expect("spawn");
+        let fd = c.as_fd();
+        let mut fds = [rustix::event::PollFd::new(
+            &fd,
+            rustix::event::PollFlags::IN,
+        )];
+        rustix::event::poll(&mut fds, Some(&ts)).expect("poll");
+        assert_eq!(
+            c.reap(),
+            Some(Exit::Code(127)),
+            "without the bin dir the bare name is not on PATH"
+        );
+        assert!(!marker.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -430,6 +546,7 @@ mod tests {
             Role::Shell,
             Path::new("/bin/sh"),
             &["-c".to_owned(), "exit 0".to_owned()],
+            None,
         )
         .expect("spawn");
         let fd = c.as_fd();

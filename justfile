@@ -76,13 +76,33 @@ deploy-bins:
     cargo build --release --workspace --bins --examples
     cd target/release && rsync -az {{box_bins}} {{box}}:nitro-bin/
     cd target/release/examples && rsync -az {{box_examples}} {{box}}:nitro-bin/
-    # `deploy/nitro-term.desktop` is deliberately NOT installed here.
-    # The launcher's built-in entry spawns `~/nitro-bin/nitro-term` by
-    # absolute path; a `.desktop` file shadows that built-in, and its
-    # `Exec=nitro-term` is a bare name that the session's `PATH` does not
-    # resolve — so installing it replaced a working entry with
-    # "spawn: No such file or directory". The file is for a packager who
-    # puts the binary in `/usr/bin`; the box is covered by the built-in.
+    # `deploy/*.desktop` are installed too, and are part of the deployed
+    # set exactly like `~/nitro-bin` — a worker who "restores the box as
+    # found" must leave them (docs/testbox.md).
+    #
+    # They were deliberately *not* installed until #3723, and the reason
+    # is worth keeping because it is what had to be fixed rather than
+    # worked around: their `Exec=` is a bare name, as the freedesktop
+    # spec asks and a packager needs, and `~/nitro-bin` is on nobody's
+    # `PATH` — so `Exec=nitro-term` was an `execvp` that could only fail,
+    # and because a `.desktop` file *shadows* the launcher's built-in
+    # entry for the same program, installing one replaced a working
+    # launcher entry with "spawn: No such file or directory".
+    #
+    # `nitro-session` now prepends its own executable's directory to the
+    # `PATH` every child inherits (`crates/nitro-session/src/pieces.rs`),
+    # which is the same sibling lookup it already used to *find* the
+    # pieces, stated to the processes it starts. So the bare name
+    # resolves, the shadowing is now the behaviour we want — one Terminal
+    # entry, the packaged one — and the box gets what #3715 needs: an
+    # `<app_id>.desktop` for the server to resolve `nitro-calc` →
+    # `Icon=calculator` through, so the bar's window list and the title
+    # bars show real application icons instead of the generic `window`.
+    #
+    # Idempotent: rsync over the same four basenames, and the launcher
+    # and the server both key their indexes on the basename.
+    ssh {{box}} 'mkdir -p ~/.local/share/applications'
+    rsync -az deploy/*.desktop {{box}}:.local/share/applications/
 
 # Install/refresh the systemd unit on the box (needs sudo there).
 box-install:

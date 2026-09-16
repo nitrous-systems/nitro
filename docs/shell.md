@@ -398,6 +398,34 @@ id"**. `org.gnome.Nautilus` ships `org.gnome.Nautilus.desktop` and now
 resolves; an application that registers one app id and installs a
 differently named entry still gets the fallback, and nothing says why.
 
+**And the hop needs the file to be installed, which is what #3723 did.**
+A rule that reads `<app_id>.desktop` is worth nothing on a box where
+nobody wrote one, and until #3723 `just deploy` deliberately did not:
+`deploy/*.desktop` carry a bare `Exec=` (the spec's form, and a
+packager's), the box's binaries live in `~/nitro-bin`, and that
+directory is on nobody's `PATH` — so installing them handed the launcher
+a command it could not run, *and* shadowed the built-in entry that could.
+
+The fix is a `PATH`, in the one process that knows the answer.
+`nitro-session` already finds its own pieces by looking next to its
+executable (`crates/nitro-session/src/pieces.rs`, "the sibling lookup");
+it now **prepends that directory to the `PATH` every child inherits**, so
+the same fact is available to everything its children go on to start.
+The launcher needs no change for it — `Command::new("nitro-term")` is
+`execvp`, and the kernel does the search — which is the argument for
+putting it there rather than teaching the launcher about deployment
+layouts. Prepended rather than appended, for the same reason the sibling
+lookup wins over `$PATH`: a stale `/usr/local/bin/nitro-term` must lose
+to the binary deployed beside the running session. An installed
+`/usr/bin/nitro-session` contributes `/usr/bin`, which is already there,
+so the change is a no-op off the box.
+
+With the files installed the shadowing becomes the behaviour we want: the
+launcher shows **one** Terminal entry, the packaged one, because
+`Launcher::rescan` drops a built-in whose program's *file name* matches a
+scanned entry's. `crates/nitro-launcher/tests/deployed.rs` pins all of it
+against the repository's own files rather than fixtures.
+
 That is the bigger alternative this section used to weigh — "have the
 server resolve `app_id` → `.desktop` → `Icon=`, strictly better and
 strictly bigger" — taken, on the evidence it asked for: the fallback icon

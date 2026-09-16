@@ -20,7 +20,7 @@ snappy here, it is snappy.
 
 ```
 just box-install   # once: systemd unit nitro-dev on tty2 (replaces getty@tty2)
-just deploy        # build release → rsync ~/nitro-bin/ → restart nitro-dev
+just deploy        # build release → rsync ~/nitro-bin/ + ~/.local/share/applications/ → restart nitro-dev
 just shot          # front-buffer readback → tmp/shot.png
 just box-log       # journalctl -f
 just box-session   # what is running, from the session's own socket
@@ -58,6 +58,39 @@ supervises all four. So `pgrep nitro` shows five processes, a
 `pkill nitro-bar` is repaired within about a second, and
 `systemctl stop nitro-dev` takes the whole desktop down in order. See
 [`crates/nitro-session/README.md`](../crates/nitro-session/README.md).
+
+## The deployed set is two directories, not one
+
+`just deploy` writes **`~/nitro-bin/`** and
+**`~/.local/share/applications/`**, and both are part of the deployed
+state. A worker who restores the box "as found" must leave the four
+`.desktop` files in place: they are `deploy/nitro-{calc,files,settings,
+term}.desktop` from this repository, they are re-written by every
+`just deploy`, and deleting them is not tidying up — it is undeploying
+half the desktop's icons.
+
+They matter because of #3715: the server resolves an `app_id` it cannot
+find in the icon theme through `<app_id>.desktop`'s `Icon=`, so
+`nitro-calc` becomes the `calculator` glyph in the bar's window list and
+in the window's own title bar. With the files absent, every one of our
+applications shows the generic `window` shape — which is exactly what the
+box looked like before #3723 and looks like again the moment somebody
+"restores" the directory away. `stats desktop_entries` is the check: 8 on
+a box with only the system files, **12** with ours installed.
+
+Installing them used to be actively harmful, and the fix is worth knowing
+because it changed a rule: their `Exec=` is a bare program name (the spec
+asks for one, and a packager needs one), `~/nitro-bin` is on nobody's
+`PATH`, and a `.desktop` file *shadows* the launcher's built-in entry for
+the same program — so installing `nitro-term.desktop` replaced a working
+launcher entry with `spawn: No such file or directory`. Since #3723
+`nitro-session` prepends its own executable's directory to the `PATH`
+every child inherits, so the bare name resolves and the shadowing is the
+behaviour we want: **one** Terminal entry in the launcher, the packaged
+one. If the launcher ever shows a Terminal entry that does not start,
+that `PATH` prepend is the first thing to check —
+`tr '\0' '\n' < /proc/$(pgrep -f nitro-launcher)/environ | grep ^PATH`
+should begin with `/home/kaspar/nitro-bin`.
 
 ```console
 $ just box-session            # status

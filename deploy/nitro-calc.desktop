@@ -16,11 +16,10 @@ Comment=A calculator on nitro-ui
 # theme installed at all. The launcher's built-in entry names the same
 # shape, so a box with this file and a box without look the same.
 #
-# Not installed by `just deploy`, for the reason `nitro-term.desktop`
-# records: on the box the binaries live in `~/nitro-bin`, which is not on
-# the session's PATH, so a bare `Exec=` fails — and a `.desktop` file
-# shadows the launcher's built-in entry, which uses an absolute path.
-# This file is for a packager who installs the binary into `/usr/bin`.
+# `just deploy` installs this file into `~/.local/share/applications` on
+# the test box (#3723), and it is a bare `Exec=` on purpose: see
+# `nitro-term.desktop` for why that now resolves there as well as on a
+# system where the binary is in `/usr/bin`.
 Exec=nitro-calc
 Icon=calculator
 Terminal=false
