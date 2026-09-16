@@ -2423,3 +2423,97 @@ fn an_app_id_set_after_mapping_re_resolves_the_frame_icon() {
     h.quit();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A window resized down past the room for its icon **drops** the icon
+/// rather than drawing a button through it.
+///
+/// Through the real resize path rather than by arithmetic, because the
+/// arithmetic is already a unit test and what could still be wrong is
+/// the wiring: `layout_frame` runs on every resize, and an icon whose
+/// bounds were set once in `build_frame` would stay 16 px wide while the
+/// buttons walked left across it.
+///
+/// **The discriminator is the leftmost button's own pixels**, and
+/// getting that right took two attempts. The obvious test — "the strip
+/// left of the buttons is bar colour" — passes whether or not the fix is
+/// there, because at the minimum width that strip is *empty*: the
+/// leftmost button starts at the frame's own left edge, so the assertion
+/// never runs. A test whose claim is skipped is worse than no test,
+/// since it reports success. What is true only with the fix is that the
+/// minimize button at 66 px wide is **pixel-identical** to the same
+/// button on a roomy frame: the icon would have been composited over it,
+/// and two shapes on top of each other are not one shape.
+#[test]
+fn a_window_too_narrow_for_its_icon_drops_it_rather_than_overlapping() {
+    let mut h = Harness::start("narrowicon", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("narrowicon");
+    let mut win = make_window(&mut conn, &mut inbox, 1, "Squeeze", WIN, RED, 0, 1);
+    park(&mut h);
+
+    let wide = win.frame(true);
+    let bar_rgb = to_rgb(bar(true));
+    let ink = |img: &Image, r: Rect| crop(img, r).into_iter().filter(|p| *p != bar_rgb).count();
+    let icon_box = Rect::new(
+        wide.x + wm::BUTTON_GAP,
+        wide.y + (wm::TITLE_H - wm::APP_ICON) / 2.0,
+        wm::APP_ICON,
+        wm::APP_ICON,
+    );
+    let shot = h.shot();
+    assert!(ink(&shot, icon_box) > 8, "the icon is there to begin with");
+    // The reference: the leftmost button, drawn with nothing near it.
+    let reference = crop(&shot, button_rect(&win, wm::Region::Minimize, false));
+
+    // Drag the right edge left until the frame hits its floor. The
+    // minimum is `MIN_CONTENT` plus the insets and the server clamps, so
+    // asking for far less lands exactly on it.
+    let (ex, ey) = (wide.x + wide.w - 0.5, wide.y + wide.h / 2.0);
+    h.drag((ex, ey), (wide.x + 10.0, ey), OUT);
+    await_configure(&mut conn, &mut inbox, &mut win, "the squeeze");
+    park(&mut h);
+
+    let narrow = win.frame(true);
+    let needs = wm::BUTTON_GAP + wm::APP_ICON + wm::APP_ICON_GAP;
+    let start = wm::buttons_start(narrow, false) - narrow.x;
+    assert!(
+        start < needs,
+        "this frame still has room for an icon ({start} >= {needs}), so the \
+         test is measuring nothing"
+    );
+
+    // The buttons are all still inside the frame and still hit-testable:
+    // a narrow frame keeps its controls, which is what makes dropping
+    // the icon the right trade rather than an arbitrary one.
+    let i = wm::frame_insets();
+    for (region, rect) in wm::buttons(narrow, false) {
+        assert!(
+            rect.x >= narrow.x && rect.x + rect.w <= narrow.x + narrow.w,
+            "{region:?} left the frame: {rect:?} in {narrow:?}"
+        );
+        let centre = Point::new(rect.x + rect.w / 2.0, rect.y + rect.h / 2.0);
+        assert_eq!(
+            wm::hit_frame(narrow, i, centre, false),
+            Some(region),
+            "{region:?} is not clickable on a narrow frame"
+        );
+    }
+
+    // The claim: the leftmost button is exactly what it was on the roomy
+    // frame. Without the guard the icon's box still starts 8 px in and
+    // the button starts at 0, so the artwork lands on top of the glyph.
+    let squeezed = crop(&h.shot(), button_rect(&win, wm::Region::Minimize, false));
+    let moved = squeezed
+        .iter()
+        .zip(&reference)
+        .filter(|(a, b)| a != b)
+        .count();
+    assert_eq!(
+        moved, 0,
+        "{moved} px of the minimize button changed when the frame narrowed: \
+         something is being drawn through it"
+    );
+
+    drop(conn);
+    h.quit();
+}

@@ -287,12 +287,19 @@ pub fn buttons(frame: Rect, fixed: bool) -> Vec<(Region, Rect)> {
     out
 }
 
-/// How much of the title bar's right-hand end the buttons occupy, the
-/// gap that separates them from the title included.
+/// The left edge of the leftmost title-bar button: everything the frame
+/// draws to the left of it — the application icon and the title — has to
+/// fit inside that.
+///
+/// Derived from [`buttons`] rather than computed from the constants a
+/// second time, which is the whole reason it exists: the layout and the
+/// hit test have to agree about where the buttons start, and two copies
+/// of that arithmetic are two chances to disagree.
 #[must_use]
-pub fn button_room(fixed: bool) -> f32 {
-    let count = if fixed { 2.0 } else { 3.0 };
-    count * (BUTTON + BUTTON_GAP) + BUTTON_GAP
+pub fn buttons_start(frame: Rect, fixed: bool) -> f32 {
+    buttons(frame, fixed)
+        .last()
+        .map_or(frame.x + frame.w, |(_, r)| r.x)
 }
 
 /// Whether a logical rect contains a point (half-open on the far edges).
@@ -865,18 +872,45 @@ pub fn layout_frame(
     let s = ClientId::SERVER;
     scene.set_bounds(s, nodes.background, Rect::new(0.0, 0.0, size.w, size.h))?;
     scene.set_bounds(s, nodes.bar, Rect::new(0.0, 0.0, size.w, TITLE_H))?;
-    scene.set_bounds(
-        s,
-        nodes.app_icon,
-        Rect::new(BUTTON_GAP, (TITLE_H - APP_ICON) / 2.0, APP_ICON, APP_ICON),
-    )?;
-    // The title starts after the application icon and stops before the
+    // Where the leftmost button starts is what everything to its left has
+    // to fit inside. Taken from `buttons` rather than recomputed, so the
+    // layout and the hit test cannot disagree about it.
+    let frame = Rect::new(0.0, 0.0, size.w, size.h);
+    let all = buttons(frame, fixed);
+    let start = all.last().map_or(size.w, |(_, r)| r.x);
+
+    // **The icon goes away before it is drawn through.** A window can be
+    // dragged down to a 64-pixel content box (`MIN_CONTENT`), which is a
+    // 66-pixel frame — narrower than three buttons and their gaps. The
+    // icon's box would then start at 8 and the leftmost button at 0, so
+    // the artwork and the glyph would be composited on top of each other.
+    //
+    // Clipping is the honest failure and overlap is not: an overlapped
+    // icon is two shapes nobody can read, where a dropped one is a title
+    // bar that is visibly too small for it. (#3709 and #3710 reached the
+    // same rule for the toolkit's flex solver from the other end: a row
+    // drawn through a sentence is worse than a row that is not drawn.)
+    // An empty rect paints nothing — `Node::has_content` is false for one
+    // — without touching `visible`, which fullscreen owns.
+    let icon_fits = BUTTON_GAP + APP_ICON + APP_ICON_GAP <= start;
+    let icon_box = if icon_fits {
+        Rect::new(BUTTON_GAP, (TITLE_H - APP_ICON) / 2.0, APP_ICON, APP_ICON)
+    } else {
+        Rect::new(BUTTON_GAP, (TITLE_H - APP_ICON) / 2.0, 0.0, 0.0)
+    };
+    scene.set_bounds(s, nodes.app_icon, icon_box)?;
+    // The title starts after the application icon — or at the left border
+    // when there was no room for one — and stops one gap before the
     // buttons, so a long title is elided rather than running under
     // either. The icon took `APP_ICON + APP_ICON_GAP` off its left end,
     // which is what makes a narrow window elide sooner than it used to
     // rather than draw its title through the artwork.
-    let title_x = BUTTON_GAP + APP_ICON + APP_ICON_GAP;
-    let title_w = (size.w - title_x - button_room(fixed)).max(0.0);
+    let title_x = if icon_fits {
+        BUTTON_GAP + APP_ICON + APP_ICON_GAP
+    } else {
+        BUTTON_GAP
+    };
+    let title_w = (start - BUTTON_GAP - title_x).max(0.0);
     scene.set_bounds(
         s,
         nodes.title,
@@ -887,8 +921,7 @@ pub fn layout_frame(
             TITLE_SIZE_LINE,
         ),
     )?;
-    let frame = Rect::new(0.0, 0.0, size.w, size.h);
-    for (region, rect) in buttons(frame, fixed) {
+    for (region, rect) in all {
         let Some(button) = nodes.button(region) else {
             continue;
         };
@@ -1267,24 +1300,65 @@ mod tests {
         let width = 300.0;
         let title_x = BUTTON_GAP + APP_ICON + APP_ICON_GAP;
         for fixed in [false, true] {
-            let title_w = width - title_x - button_room(fixed);
-            let leftmost = buttons(Rect::new(0.0, 0.0, width, 200.0), fixed)
-                .last()
-                .expect("every frame has buttons")
-                .1;
+            let frame = Rect::new(0.0, 0.0, width, 200.0);
+            let start = buttons_start(frame, fixed);
+            let title_w = start - BUTTON_GAP - title_x;
             assert!(
-                title_x + title_w <= leftmost.x,
-                "fixed={fixed}: the title ends at {} and the first button starts at {}",
+                title_x + title_w <= start,
+                "fixed={fixed}: the title ends at {} and the first button starts at {start}",
                 title_x + title_w,
-                leftmost.x
             );
             // And it stops exactly one gap short, rather than wasting
             // room a long title could have used.
-            assert_eq!(title_x + title_w + BUTTON_GAP, leftmost.x);
+            assert_eq!(title_x + title_w + BUTTON_GAP, start);
+            // `buttons_start` is the leftmost button's own x, not a
+            // second opinion about it.
+            assert_eq!(
+                start,
+                buttons(frame, fixed).last().expect("buttons").1.x,
+                "fixed={fixed}"
+            );
         }
         // The icon sits between the left edge and the title, and the two
         // do not overlap.
         assert!(BUTTON_GAP + APP_ICON <= title_x);
+    }
+
+    #[test]
+    fn a_frame_too_narrow_for_the_icon_drops_it_rather_than_overlapping() {
+        // A window can be dragged to a 64 × 32 content box, so the frame
+        // can be 66 logical pixels wide — narrower than three buttons and
+        // their gaps. The icon's box starts at 8 and the leftmost button
+        // at 0, so a layout that placed the icon unconditionally would
+        // composite the artwork and a glyph on top of each other.
+        //
+        // Overlap is the worse failure and this tree has said so before:
+        // #3709 traded a clipping bug for an overlap bug and the review
+        // called it a regression, because clipping ends a thing early
+        // where overlap writes one thing through another. The rule here
+        // is the same, in the one direction a *frame* can be squeezed.
+        let narrow = MIN_CONTENT.w + 2.0 * BORDER;
+        for fixed in [false, true] {
+            let frame = Rect::new(0.0, 0.0, narrow, 200.0);
+            let start = buttons_start(frame, fixed);
+            assert!(
+                BUTTON_GAP + APP_ICON + APP_ICON_GAP > start,
+                "fixed={fixed}: this frame is not actually too narrow, so \
+                 the test is measuring nothing"
+            );
+            // Every button is still inside the frame it belongs to — the
+            // buttons are what a narrow frame keeps.
+            for (region, rect) in buttons(frame, fixed) {
+                assert!(
+                    rect.x >= 0.0 && rect.x + rect.w <= narrow,
+                    "{region:?} left the frame at width {narrow}"
+                );
+            }
+        }
+        // And a frame with room keeps its icon, so the rule is a
+        // threshold rather than "never draw one".
+        let roomy = Rect::new(0.0, 0.0, 300.0, 200.0);
+        assert!(BUTTON_GAP + APP_ICON + APP_ICON_GAP <= buttons_start(roomy, false));
     }
 
     #[test]
