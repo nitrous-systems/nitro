@@ -151,6 +151,20 @@ fingerprint() {
         awk '{print $1}' | tr '\n' ' '
 }
 BINS_BEFORE="$(fingerprint)"
+if [[ -z ${BINS_BEFORE// /} ]]; then
+    # An empty fingerprint would make the end-of-run check compare ""
+    # against "" and write a confident `# binaries unchanged across the
+    # whole run: ` with nothing after the colon — an instrument agreeing
+    # with itself while naming nothing, which is the exact failure family
+    # this guard exists to close. Refuse instead.
+    #
+    # It is reachable: `md5sum` is silenced so a missing `~/nitro-bin`
+    # does not abort the script, and `NITRO_BENCH_BIN` can legitimately
+    # point the runner somewhere else entirely.
+    say "REFUSING to start: no binaries to fingerprint in $HOME/nitro-bin"
+    say "  (a run whose provenance check is vacuous is worse than no check)"
+    exit 2
+fi
 
 # Re-check the binaries and say so in the ledger, whatever the answer.
 check_bins() {

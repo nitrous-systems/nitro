@@ -1254,10 +1254,11 @@ the fact that it fails**:
 
 **Not one fullscreen pixel scenario gained a single presented frame from
 doubling the refresh rate, and five of six lost frames.** Rotozoom is the
-headline: it was the one effect holding a full 60 Hz at 1080p, at 100.5 %
-of its frame budget, and at 120 Hz it presents **23.3/s — 39 % of what it
-managed at half the refresh**. Offering it twice as many vblanks made it
-slower in absolute terms.
+headline: it was the one effect holding ~60 Hz at 1080p, at **99.1 % of
+its frame budget** (16 525 µs against 16 667 — §7.10's figure), and at
+120 Hz it presents **23.3/s, 39 % of what it managed at half the
+refresh**. Offering it twice as many vblanks made it slower in absolute
+terms.
 
 The mechanism is visible in the server's counters, and it is **not** the
 rasteriser:
@@ -1278,10 +1279,11 @@ while the frame rate falls, so the per-frame copy did not get cheaper for
 having less time available.
 
 **The honest statement is therefore narrower than §5's, and it is the one
-the data supports:** at 1080p the fullscreen pixel path is already at or
-past its limit at 60 Hz — rotozoom at 100.5 % of budget, three of the six
-below 60/s — and 120 Hz does not move that limit, it only halves the
-budget each frame is measured against. The bandwidth arithmetic predicts
+the data supports:** at 1080p the fullscreen pixel path is already at the
+edge of its limit at 60 Hz — rotozoom at **99.1 %** of budget with
+nothing left over, three of the six already below 60/s — and 120 Hz does
+not move that limit, it only halves the budget each frame is measured
+against. The bandwidth arithmetic predicts
 *that there is a wall around here* and the wall is where it said; what the
 measurement adds is that at 1080p the path was already against it at 60,
 so the 120 Hz column does not show a cliff so much as the absence of a
@@ -1388,25 +1390,56 @@ The crossover *did* move, though, and the VGA column is where it shows:
 
 At VGA the node arm loses at n=2000 — §7.8's finding, reproduced at 60 and
 120 Hz — but at 240 Hz its cost **halves** (6 156 → 3 153 µs) while the
-buffer arm's does not move, and the two arms converge to within 8 %. That
-is not the rate making nodes cheaper; nothing else in this document
-supports that reading, and §9.2 says per-frame retained cost is flat.
-Look at the mutation count instead: the n=2000 node arm at 240 Hz
-presented 1 413 frames against 1 414 commits while the 60 Hz arm
-presented 359 of 360, so both arms kept up — but the server's damage
-figure is identical (309 444 px) at all three rates while its paint cost
-fell from 3 052 to 1 556 µs. **The node arm at 240 Hz is doing the same
-work against a screen that is being rescanned four times as often, and
-the per-frame paint is falling because the damage union has less time to
-accumulate between frames.** A fast display gives a retained scene
-*smaller* per-frame damage, which is a genuinely new statement and the
-one thing in this section the previous version could not have guessed.
+buffer arm's does not move, and the two arms converge to within 8 %.
+
+**I cannot say from this ledger why**, and the honest form of that is
+worth more than a plausible mechanism. What is established:
+
+- Both arms kept up. The n=2000 node arm presented **1 440 of 1 441
+  commits** at 240 Hz and 359 of 360 at 60, so this is not a scene being
+  measured over frames it failed to draw.
+- The scene is identical. `mutations ÷ presented` is 2 005.6 / 2 002.8 /
+  2 001.4 across the three rates, and the stars move by frame *index*
+  rather than by elapsed time, so each frame displaces them equally at
+  every rate.
+- `damage_px_mean` is **309 444 px at all three rates**, and
+  `paint_us_mean` fell from 3 052 to 1 556 µs against it. `copy_us_mean`
+  fell the same way, 417 → 213, over a region the counter says did not
+  change.
+- The fall is consistent rather than an outlier: paint min/mean/max at
+  240 Hz is 1 518 / 1 556 / 1 630 µs, a tight distribution well clear of
+  the 60 Hz row's 3 024 / 3 052 / 3 144.
+
+A caution about reading the damage column against the paint column, which
+this section originally got wrong: **they are not measured over the same
+region.** `paint_us` times `rasterize_region()` — this frame's damage
+alone, because the shadow already holds everything older — while
+`damage_px` reports `repaint_region()`, the age-2 union
+`damage(n) ∪ damage(n-1)` that the copy is done over
+(`crates/nitro-server/src/frame.rs`). So a constant `damage_px` does not
+by itself mean the rasterizer's input was constant, and an earlier draft
+of this paragraph used it to argue a mechanism it cannot support.
+
+The candidate that survives partway is the one §9.6 measures: the 240 Hz
+arm runs at 720p, so the server's shadow buffer is **3 686 400 bytes
+against 8 294 400**, and the same 309 444-pixel copy out of a smaller
+buffer is cheaper per pixel on a box with 3 MB of L3. That would explain
+`copy_us` halving at a constant copy region, and paint shares the same
+destination. **But it does not explain the selectivity**: `boing-node`
+(2 021 → 2 014 µs) and `starfield-nodes` n=500 (1 178 → 1 180) are
+perfectly flat at 240 Hz against the same smaller shadow, and a locality
+effect should have moved them too. Until something distinguishes those
+rows from this one, "paint halved at constant reported damage, cause not
+identified" is the whole of what this ledger supports. The measurement to
+run is `starfield-nodes --n 2000` at 720p@**60** — the same screen, the
+old rate — which separates the shadow's size from the refresh rate in one
+arm. This sweep could not: on this box 240 Hz only exists at 720p.
 
 So the widget author's rule from §7.8 — "the retained path is right until
 you have of order a thousand independently moving things in a small
-window" — survives, with a rate-dependent footnote: **at 240 Hz the
-crossing moves out past n = 2000 even at VGA**, and at 720p the node arm
-never loses at all.
+window" — survives, with a footnote that is an observation rather than an
+explanation: **at 240 Hz the measured crossing moves out past n = 2000
+even at VGA**, and at 720p the node arm never loses at all.
 
 ### 9.5 The x11perf headline, and `text` vs `text-static`, per rate
 
@@ -1540,7 +1573,7 @@ table at the top of this section.
 
 #### rects across rates
 
-Frame budget: 60 Hz = 16667 µs, 120 Hz = 8335 µs.
+Frame budget: 60 Hz = 16667 µs, 120 Hz = 8335 µs, 240 Hz = 4169 µs.
 
 | run | 60 presented/s | 60 server µs | 60 client µs | 60 paint µs | 60 verdict | 120 presented/s | 120 server µs | 120 client µs | 120 paint µs | 120 verdict | 240 presented/s | 240 server µs | 240 client µs | 240 paint µs | 240 verdict |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
@@ -1565,7 +1598,7 @@ Frame budget: 60 Hz = 16667 µs, 120 Hz = 8335 µs.
 
 #### text across rates
 
-Frame budget: 60 Hz = 16667 µs, 120 Hz = 8335 µs.
+Frame budget: 60 Hz = 16667 µs, 120 Hz = 8335 µs, 240 Hz = 4169 µs.
 
 | run | 60 presented/s | 60 server µs | 60 client µs | 60 paint µs | 60 verdict | 120 presented/s | 120 server µs | 120 client µs | 120 paint µs | 120 verdict | 240 presented/s | 240 server µs | 240 client µs | 240 paint µs | 240 verdict |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
@@ -1578,7 +1611,7 @@ Frame budget: 60 Hz = 16667 µs, 120 Hz = 8335 µs.
 
 #### text-static across rates
 
-Frame budget: 60 Hz = 16667 µs, 120 Hz = 8335 µs.
+Frame budget: 60 Hz = 16667 µs, 120 Hz = 8335 µs, 240 Hz = 4169 µs.
 
 | run | 60 presented/s | 60 server µs | 60 client µs | 60 paint µs | 60 verdict | 120 presented/s | 120 server µs | 120 client µs | 120 paint µs | 120 verdict | 240 presented/s | 240 server µs | 240 client µs | 240 paint µs | 240 verdict |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|

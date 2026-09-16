@@ -240,18 +240,35 @@ pub fn rate_tables(records: &[Record]) -> String {
         rates.dedup();
 
         let _ = write!(out, "#### {family} across rates\n\n");
-        // The budget line, once per table. Every verdict below is a
-        // comparison against it, and a reader who has to divide 1e6 by a
-        // rate in their head to check one will not check one.
-        let budgets: Vec<String> = rows
-            .first()
-            .map(|rates| {
-                rates
-                    .values()
-                    .map(|r| format!("{:.0} Hz = {:.0} µs", r.refresh_hz(), r.frame_budget_us()))
-                    .collect()
+        // The budget line, once per table, **over the same `rates`
+        // vector the header is built from**.
+        //
+        // It used to be built from `rows.first()`, which is only the
+        // same list when the family's first row happens to have been run
+        // at every rate in the table. When it was not — `rects`, whose
+        // first row is the VGA-only n=10 pair — the table printed 240 Hz
+        // columns full of data under a budget line naming 60 and 120,
+        // i.e. a caption that was wrong about the one column §9.3 argues
+        // from. A per-table caption has to be derived from the table,
+        // not from a row of it; the row is a sample and the header is
+        // the population.
+        //
+        // Any record filed under a rate will do for the budget, since
+        // `frame_budget_us` is a function of `refresh_mhz` alone and
+        // every record under one column shares a rounded rate — so the
+        // lookup takes the first row that actually has that rate rather
+        // than assuming a particular one does.
+        let budgets: Vec<String> = rates
+            .iter()
+            .map(|rate| {
+                rows.iter()
+                    .find_map(|by_rate| by_rate.get(rate))
+                    .map_or_else(
+                        || format!("{rate} Hz = {MISSING} µs"),
+                        |r| format!("{:.0} Hz = {:.0} µs", r.refresh_hz(), r.frame_budget_us()),
+                    )
             })
-            .unwrap_or_default();
+            .collect();
         if !budgets.is_empty() {
             let _ = write!(out, "Frame budget: {}.\n\n", budgets.join(", "));
         }
@@ -773,6 +790,39 @@ mod tests {
 
         // Nothing paired at all is an empty string, not an empty table.
         assert!(rate_tables(&[healthy("rects", 10)]).is_empty());
+    }
+
+    /// The budget line must cover every column the **header** has, not
+    /// every rate the family's **first row** happens to carry.
+    ///
+    /// This is the shipped `rects` table's shape: its first row (n=10)
+    /// ran only at 60 and 120, while later rows add a 240 Hz cell. The
+    /// first version built the caption from `rows.first()` and so
+    /// printed a full 240 Hz column of data under a budget line naming
+    /// only 60 and 120 — a caption wrong about the one column §9.3
+    /// draws its "how many mutations fit in 4.2 ms" answer from.
+    #[test]
+    fn the_budget_line_covers_every_column_not_just_the_first_rows() {
+        // n=10: 60 and 120 only — the unpaired-at-240 first row.
+        let small = healthy("rects", 10);
+        let mut small_fast = healthy("rects", 10);
+        small_fast.refresh_mhz = 120_000;
+        // n=100: all three, so the table grows a 240 Hz column.
+        let big = healthy("rects", 100);
+        let mut big_fast = healthy("rects", 100);
+        big_fast.refresh_mhz = 120_000;
+        let mut big_fastest = healthy("rects", 100);
+        big_fastest.refresh_mhz = 239_840;
+
+        let tables = rate_tables(&[small, small_fast, big, big_fast, big_fastest]);
+        assert!(tables.contains("240 presented/s"), "{tables}");
+        assert!(
+            tables.contains("240 Hz = 4169 µs"),
+            "a column with data needs its budget in the caption: {tables}"
+        );
+        // And the caption is still complete for the other two.
+        assert!(tables.contains("60 Hz = 16667 µs"), "{tables}");
+        assert!(tables.contains("120 Hz = 8333 µs"), "{tables}");
     }
 
     /// The 240 Hz column's budget is 4 167 µs, which is the number §9
