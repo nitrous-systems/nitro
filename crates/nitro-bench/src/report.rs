@@ -355,7 +355,9 @@ mod tests {
         let rows = lines.iter().filter(|l| l.starts_with("| rects")).count();
         assert_eq!(rows, 3);
         assert!(out.ends_with("\n\n"), "every table ends with a blank line");
-        assert!(out.contains("| rects n=1000 |"), "{out}");
+        // The fixture is a 1920x1080 run, so the label carries its
+        // geometry rather than a bare `size=` that would read as square.
+        assert!(out.contains("| rects n=1000 1920x1080 |"), "{out}");
     }
 
     #[test]

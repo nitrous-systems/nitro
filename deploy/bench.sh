@@ -237,14 +237,26 @@ matrix() {
     # The pairs. Each arm immediately after its twin: this box's numbers
     # drift by the day, so a comparison assembled from two evenings is not
     # a comparison.
+    #
+    # Every pair runs at **both** sizes, because the spec asked for the
+    # native resolution and the period-correct 640x480 and the two answer
+    # different questions: fullscreen is where the pixel arm hits the
+    # bandwidth wall, and VGA is where it does not, so a node arm that
+    # wins at both wins for a reason other than the wall.
+    bench boing --note "$tag; 640x480, pixel arm of the pair"
+    bench boing-node --note "$tag; 640x480, node arm of the pair"
     bench boing --fullscreen --note "$tag; pixel arm of the pair"
     bench boing-node --fullscreen --note "$tag; node arm of the pair"
     local sn
     for sn in 100 500 2000; do
         ((quick)) && [[ $sn == 2000 ]] && continue
+        bench starfield --n "$sn" --note "$tag; 640x480, pixel arm"
+        bench starfield-nodes --n "$sn" --note "$tag; 640x480, node arm"
         bench starfield --n "$sn" --fullscreen --note "$tag; pixel arm"
         bench starfield-nodes --n "$sn" --fullscreen --note "$tag; node arm"
     done
+    bench balls --n 32 --note "$tag; 640x480, pixel arm"
+    bench balls-nodes --n 32 --note "$tag; 640x480, node arm"
     bench balls --n 32 --fullscreen --note "$tag; pixel arm"
     bench balls-nodes --n 32 --fullscreen --note "$tag; node arm"
 }

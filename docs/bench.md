@@ -131,6 +131,30 @@ Knowing precisely which is missing is worth more than a synthetic ops/s
 figure for a primitive that does not exist. If a path primitive is ever
 added, this section is where its benchmark goes.
 
+**`-move` ("flying windows") is missing too, and for a sharper reason.**
+x11perf's version creates N small decorated windows and moves them every
+frame; it is the classic exercise of the window manager, the frame hit
+test and the damage union. On this wire it is **not expressible at all**:
+no client message carries a window position. `CreateWindow` has `size`,
+`layer`, `flags` and `title` and no origin, and `position` occurs exactly
+once in the entire protocol — on the server's `Configure`, travelling the
+other way. Placement is the window manager's decision and a client is
+*told* where it ended up. Nor is it a privilege question: the `SHELL`
+block can focus, restack, anchor and reserve screen space, and it cannot
+move a window either.
+
+So the honest statement is that **a client cannot animate its own window
+across the screen**, and a benchmark of that operation would have to
+drive the pointer through the server's own drag path rather than send
+anything. `rects-move` is emphatically *not* a substitute and is not
+offered as one: it moves undecorated `Rect` nodes inside a single window
+and touches no window-manager code. Whether the gap matters is a real
+question — a tiling desktop never needs it, a floating one gets dragging
+from the server for free, and the case it actually blocks is a client
+animating its own window (a slide-in panel, a tear-off palette). It is
+recorded here because the spec asked for the scenario and the reason it
+is absent is a fact about the protocol rather than about the benchmark.
+
 ## 4. The shape of a run
 
 One process per row, which is load-bearing rather than convenient: the

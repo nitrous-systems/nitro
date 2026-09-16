@@ -366,8 +366,10 @@ pub struct Scroll {
     pub rows: usize,
     /// Height of one row in logical pixels.
     pub row_h: f32,
-    /// The clipping group.
-    group: NodeId,
+    /// The clipping group, fixed at the viewport and never moved.
+    clipper: NodeId,
+    /// The content group inside it, which is what actually scrolls.
+    content: NodeId,
 }
 
 impl Scroll {
@@ -377,14 +379,15 @@ impl Scroll {
         Self {
             rows,
             row_h,
-            group: NodeId(FIRST_NODE),
+            clipper: NodeId(FIRST_NODE),
+            content: NodeId(FIRST_NODE + 1),
         }
     }
 
     /// Node id of the `i`th row.
     #[must_use]
     pub fn row(i: usize) -> NodeId {
-        NodeId(FIRST_NODE + 1 + i as u32)
+        NodeId(FIRST_NODE + 2 + i as u32)
     }
 }
 
@@ -394,22 +397,47 @@ impl Scenario for Scroll {
     }
 
     fn build(&mut self, ctx: &mut Ctx) -> Result<Vec<ClientMsg>, Error> {
+        // **Two** groups, and the split is the whole correctness of the
+        // scenario. A clipper fixed at the viewport with `clip: true`, and
+        // a content group inside it that moves.
+        //
+        // The first version used one group for both, setting it to the
+        // viewport at build time and then to `(0, offset, w, h + content)`
+        // every frame — so from frame 0 onward the clip rectangle was
+        // taller than the window and **clipped nothing at all**. The rows
+        // were bounded only by the window itself, which is a different
+        // scene from the one the docs and issue #570 describe. Caught in
+        // review; `the_clipper_never_moves_and_stays_at_the_viewport`
+        // pins it.
+        let content_h = self.rows as f32 * self.row_h;
         let mut out = vec![
             CreateNode {
-                id: self.group,
+                id: self.clipper,
                 kind: NodeKind::Group,
                 parent: WINDOW,
                 before: NodeId::NONE,
             }
             .into(),
             SetBounds {
-                id: self.group,
+                id: self.clipper,
                 rect: Rect::new(0.0, 0.0, ctx.size.w, ctx.size.h),
             }
             .into(),
             nitro_wire::msg::SetClip {
-                id: self.group,
+                id: self.clipper,
                 clip: true,
+            }
+            .into(),
+            CreateNode {
+                id: self.content,
+                kind: NodeKind::Group,
+                parent: self.clipper,
+                before: NodeId::NONE,
+            }
+            .into(),
+            SetBounds {
+                id: self.content,
+                rect: Rect::new(0.0, 0.0, ctx.size.w, content_h),
             }
             .into(),
         ];
@@ -418,7 +446,7 @@ impl Scenario for Scroll {
                 CreateNode {
                     id: Self::row(i),
                     kind: NodeKind::Rect,
-                    parent: self.group,
+                    parent: self.content,
                     before: NodeId::NONE,
                 }
                 .into(),
@@ -442,16 +470,16 @@ impl Scenario for Scroll {
     }
 
     fn frame(&mut self, ctx: &mut Ctx, frame: u64) -> Result<Vec<ClientMsg>, Error> {
-        // The group's bounds are its origin; moving them scrolls the whole
-        // column in one mutation, which is the retained scroll. One row
-        // per frame, wrapping at the content's height, so the scenario
-        // runs for ever without drifting into an empty region.
-        let content = self.rows as f32 * self.row_h;
-        let offset = -((frame as f32 * self.row_h) % content.max(1.0));
+        // Only the *content* group moves; the clipper stays where it is,
+        // so the viewport really is a viewport. One row per frame,
+        // wrapping at the content's height, so the scenario runs for ever
+        // without drifting into an empty region.
+        let content_h = self.rows as f32 * self.row_h;
+        let offset = -((frame as f32 * self.row_h) % content_h.max(1.0));
         Ok(vec![
             SetBounds {
-                id: self.group,
-                rect: Rect::new(0.0, offset, ctx.size.w, ctx.size.h + content),
+                id: self.content,
+                rect: Rect::new(0.0, offset, ctx.size.w, content_h),
             }
             .into(),
         ])
@@ -746,6 +774,65 @@ mod tests {
             }
         }
         assert!(d.is_some(), "no bounds for ball 0");
+    }
+
+    /// The defect review caught: a clipping group that the per-frame
+    /// mutation grows taller than the window clips nothing.
+    ///
+    /// The first version used one group for both jobs, so from frame 0
+    /// onward the clip rectangle was `h + content` tall and always
+    /// covered the viewport. The rows were bounded only by the window,
+    /// which is a different scene from the one `docs/bench.md` §7.5 and
+    /// issue #570 describe — and the 675 696 damage-pixel figure #570
+    /// rests on came from it.
+    #[test]
+    fn the_clipper_never_moves_and_stays_at_the_viewport() {
+        let mut s = Scroll::new(200, 16.0);
+        let build = s.build(&mut ctx()).unwrap();
+
+        // Exactly one node is clipped, and it is at the viewport.
+        let with_clip: Vec<NodeId> = build
+            .iter()
+            .filter_map(|m| match m {
+                ClientMsg::SetClip(c) if c.clip => Some(c.id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(with_clip.len(), 1, "exactly one clipper");
+        let clipper = with_clip[0];
+        let bounds_of = |msgs: &[ClientMsg], id: NodeId| -> Option<Rect> {
+            msgs.iter().rev().find_map(|m| match m {
+                ClientMsg::SetBounds(b) if b.id == id => Some(b.rect),
+                _ => None,
+            })
+        };
+        let c = bounds_of(&build, clipper).expect("the clipper has bounds");
+        assert_eq!(
+            (c.x, c.y, c.w, c.h),
+            (0.0, 0.0, 640.0, 480.0),
+            "the clipper must be the viewport"
+        );
+
+        // And no frame ever touches it: a scroll moves the content.
+        for f in 0..16u64 {
+            let msgs = s.frame(&mut ctx(), f).unwrap();
+            assert!(
+                bounds_of(&msgs, clipper).is_none(),
+                "frame {f} moved the clipper, so it clips nothing"
+            );
+            // The content group is taller than the viewport — otherwise
+            // there is nothing to clip and the scenario is measuring a
+            // viewport-sized repaint of a viewport-sized scene.
+            let ClientMsg::SetBounds(b) = &msgs[0] else {
+                panic!("a scroll frame is a SetBounds")
+            };
+            assert!(
+                b.rect.h > 480.0,
+                "frame {f}: content is {} tall, not taller than the 480 viewport",
+                b.rect.h
+            );
+            assert_ne!(b.id, clipper);
+        }
     }
 
     /// A retained scroll is one mutation, whatever the content's height —

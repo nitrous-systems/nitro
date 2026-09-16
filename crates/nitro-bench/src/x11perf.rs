@@ -39,6 +39,18 @@
 //! not a gap in the benchmark: a chart widget or a drawing app would need
 //! either a path primitive or a client-side buffer, and knowing which of
 //! those is missing is worth more than a synthetic ops/s figure.
+//!
+//! `-move` ("flying windows": N decorated windows moved per frame) is the
+//! second one, and it is missing for a sharper reason: **no client
+//! message on this wire carries a window position.** `CreateWindow` has
+//! `size`, `layer`, `flags` and `title` and no origin; `position` occurs
+//! exactly once in the whole protocol, on the server's `Configure`.
+//! Placement belongs to the window manager and a client is *told* where
+//! it ended up, so a client-driven window move is not expressible at all
+//! — not even privileged, since the `SHELL` block has focus, layer,
+//! anchors and exclusive zones but no move either. `rects-move` is not a
+//! substitute: it moves undecorated nodes inside one window and touches
+//! no window-manager path. `docs/bench.md` §3 argues both gaps together.
 
 use nitro_core::{Color, Rect};
 use nitro_wire::msg::{ClientMsg, CreateNode, SetBounds, SetFill, SetText};
@@ -191,12 +203,27 @@ impl Scenario for Rects {
         let mut out = Vec::with_capacity(self.count);
         for (i, r) in self.origin.iter().enumerate() {
             if self.moving {
-                // A small orbit: two pixels of travel per frame, which is
-                // enough that old and new bounds only partly overlap — the
-                // case that makes a damage union bigger than either rect.
-                let phase = (frame + i as u64) % 8;
-                let dx = f32::from(i16::from(phase < 4)) * 2.0;
-                let dy = f32::from(i16::from(phase % 4 < 2)) * 2.0;
+                // A four-phase orbit round a 2×2 square:
+                // (2,0) → (2,2) → (0,2) → (0,0) → …
+                //
+                // **Consecutive phases always differ on at least one
+                // axis**, and that is the whole property. The first
+                // version used an eight-phase cycle whose position
+                // repeated on consecutive frames, so half of the `SetBounds`
+                // it sent were `node.bounds == bounds` and the server's
+                // `set_bounds` early-returned: the arm mutated on
+                // alternate frames while the recolour arm mutated on every
+                // one, and the two were not comparable. The doc then drew
+                // a finding from the gap. Caught in review, with a
+                // regression test below.
+                //
+                // Two pixels of travel, which is enough that the old and
+                // new bounds only partly overlap — the case that makes a
+                // damage union bigger than either rect, which is what
+                // separates this arm from the recolouring one.
+                let phase = (frame + i as u64) % 4;
+                let dx = f32::from(u8::from(phase < 2)) * 2.0;
+                let dy = f32::from(u8::from(!phase.is_multiple_of(3))) * 2.0;
                 out.push(
                     SetBounds {
                         id: Self::node(i),
@@ -439,6 +466,76 @@ mod tests {
         let msgs = s.frame(&mut ctx(), 3).unwrap();
         assert_eq!(msgs.len(), 5);
         assert!(msgs.iter().all(|m| matches!(m, ClientMsg::SetBounds(_))));
+    }
+
+    /// The defect review caught: a "moving" arm whose position repeats on
+    /// consecutive frames is not moving on those frames.
+    ///
+    /// `Scene::set_bounds` early-returns when the bounds are unchanged, so
+    /// a repeated position makes the `SetBounds` a server-side no-op. The
+    /// first version cycled through eight phases that collapsed to four
+    /// positions *in pairs* — (2,2),(2,2),(2,0),(2,0),(0,2),(0,2),(0,0),(0,0)
+    /// — so the move arm did half the work of the recolour arm it was
+    /// being compared against, and `docs/bench.md` drew a finding from the
+    /// difference. The comparison is only like-for-like if **every frame
+    /// actually moves every node.**
+    #[test]
+    fn every_moving_frame_actually_moves_every_rect() {
+        let mut s = Rects::moving(6, 32.0);
+        s.build(&mut ctx()).unwrap();
+        let at = |s: &mut Rects, f: u64| -> Vec<(f32, f32)> {
+            s.frame(&mut ctx(), f)
+                .unwrap()
+                .into_iter()
+                .map(|m| {
+                    let ClientMsg::SetBounds(b) = m else {
+                        panic!("the moving arm must send bounds")
+                    };
+                    (b.rect.x, b.rect.y)
+                })
+                .collect()
+        };
+        let mut previous = at(&mut s, 0);
+        for f in 1..24u64 {
+            let current = at(&mut s, f);
+            for (i, (was, now)) in previous.iter().zip(current.iter()).enumerate() {
+                assert_ne!(
+                    was, now,
+                    "frame {f}: rect {i} did not move, so its SetBounds is a no-op \
+                     and this arm is not comparable with the recolour arm"
+                );
+            }
+            previous = current;
+        }
+    }
+
+    /// And the recolour arm has to satisfy the same property, or the
+    /// comparison tilts the other way: a repeated colour is an equally
+    /// silent no-op.
+    #[test]
+    fn every_recolour_frame_actually_recolours_every_rect() {
+        let mut s = Rects::recolour(6, 32.0);
+        s.build(&mut ctx()).unwrap();
+        let at = |s: &mut Rects, f: u64| -> Vec<nitro_wire::msg::Fill> {
+            s.frame(&mut ctx(), f)
+                .unwrap()
+                .into_iter()
+                .map(|m| {
+                    let ClientMsg::SetFill(f) = m else {
+                        panic!("the recolour arm must send fills")
+                    };
+                    f.fill
+                })
+                .collect()
+        };
+        let mut previous = at(&mut s, 0);
+        for f in 1..24u64 {
+            let current = at(&mut s, f);
+            for (i, (was, now)) in previous.iter().zip(current.iter()).enumerate() {
+                assert_ne!(was, now, "frame {f}: rect {i} kept its colour");
+            }
+            previous = current;
+        }
     }
 
     /// A move expressed as an offset from a stored origin cannot drift:

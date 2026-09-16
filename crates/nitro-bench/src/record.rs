@@ -362,19 +362,26 @@ impl Record {
     ///
     /// The sweep point belongs in the label because a table of `rects`,
     /// `rects`, `rects` is not a table. `n=` and `size=` appear only when
-    /// they apply; a scenario swept by neither (the full-screen effects)
-    /// is identified by its resolution instead, which is the thing that
-    /// actually varies between its rows.
+    /// they apply.
+    ///
+    /// `size=` is the **buffer edge** a pixel scenario was asked for, so
+    /// it is only printed as a bare number when the buffer really is
+    /// square. A fullscreen run records `size` as its width, which made
+    /// `plasma size=1920` read as a 1920² buffer when it was 1920×1080
+    /// — a reviewer caught it. When the recorded geometry is not square
+    /// the label prints `WxH` instead, which is the unambiguous form and
+    /// happens to be the one a reader of the fullscreen rows wants
+    /// anyway.
     #[must_use]
     pub fn label(&self) -> String {
         let mut out = self.scenario.clone();
         if self.n != 0 {
             let _ = write!(out, " n={}", self.n);
         }
-        if self.size != 0 {
+        let square = self.width == self.height;
+        if self.size != 0 && square {
             let _ = write!(out, " size={}", self.size);
-        }
-        if self.n == 0 && self.size == 0 && self.width != 0 && self.height != 0 {
+        } else if self.width != 0 && self.height != 0 {
             let _ = write!(out, " {}x{}", self.width, self.height);
         }
         out
@@ -1287,5 +1294,42 @@ mod tests {
         record.width = 1_920;
         record.height = 1_080;
         assert_eq!(record.label(), "plasma 1920x1080");
+    }
+
+    /// A fullscreen pixel run records `size` as its *width*, so printing
+    /// it bare read as a square buffer: `plasma size=1920` for a
+    /// 1920×1080 one. Caught in review. A non-square run prints `WxH`.
+    #[test]
+    fn a_non_square_run_is_labelled_by_its_geometry_not_its_edge() {
+        let record = Record {
+            scenario: "plasma".to_owned(),
+            size: 1_920,
+            width: 1_920,
+            height: 1_080,
+            ..Record::default()
+        };
+        assert_eq!(record.label(), "plasma 1920x1080");
+
+        // A genuinely square buffer still says so, because there `size`
+        // is the whole truth and is the x11perf name people quote.
+        let square = Record {
+            scenario: "putimage".to_owned(),
+            size: 500,
+            width: 500,
+            height: 500,
+            ..Record::default()
+        };
+        assert_eq!(square.label(), "putimage size=500");
+
+        // And the sweep point survives either way.
+        let swept = Record {
+            scenario: "starfield".to_owned(),
+            n: 2_000,
+            size: 1_920,
+            width: 1_920,
+            height: 1_080,
+            ..Record::default()
+        };
+        assert_eq!(swept.label(), "starfield n=2000 1920x1080");
     }
 }

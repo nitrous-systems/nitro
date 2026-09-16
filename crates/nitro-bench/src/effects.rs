@@ -169,6 +169,37 @@ pub trait Effect {
     /// the documented exception of the stateful three, for which it must
     /// be a pure function of that plus the frames already rendered.
     fn render(&mut self, surface: &mut Surface, frame: u64);
+
+    /// Rebuild for a `width` × `height` surface, discarding any state
+    /// that was sized for the old one.
+    ///
+    /// # Why this is on the trait and not left to the constructor
+    ///
+    /// Three of these effects carry a *box*: `Fire` owns a heat grid,
+    /// `Starfield` projects into a viewport, `Balls` and `Boing` bounce
+    /// off walls. All four are constructed before the server has said how
+    /// big the window is, because a `--fullscreen` run only learns its
+    /// size from the `Configure` that arrives after the window exists.
+    ///
+    /// Without this hook a fullscreen run simulated a 640×480 world and
+    /// drew it into an 8 MB buffer: the fire burned in the top-left
+    /// quadrant and the rest of the frame stayed at the zero-fill, the
+    /// ball bounced off invisible walls at 640×480 while its retained
+    /// twin used the whole screen, and every star lived in one quarter of
+    /// the surface. The tell was in the ledger and went unread for a
+    /// while: fullscreen fire reported **2 933 µs** of compute against
+    /// VGA fire's **8 592**, i.e. four times the pixels for a third of
+    /// the cost, which cannot be true. `PixelScenario::build` now calls
+    /// this, and `a_fullscreen_effect_is_rebuilt_at_the_configured_size`
+    /// pins it.
+    ///
+    /// The default is a no-op, which is correct for the two effects that
+    /// genuinely have no box — `Plasma` and `Rotozoom` are pure functions
+    /// of the pixel coordinate and read their extent from the surface on
+    /// every call.
+    fn resize(&mut self, width: u32, height: u32) {
+        let _ = (width, height);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -523,6 +554,12 @@ pub struct Fire {
     palette: [u32; 256],
     /// The cooling/jitter source, seeded from a constant.
     rng: Rng,
+    /// The seed that source was built from, kept so [`Effect::resize`]
+    /// can rebuild the grid without changing which fire this is — a
+    /// resize that silently re-seeded would make the checksums depend on
+    /// the window size, which is exactly the coupling the fixed seed
+    /// exists to remove.
+    seed: u64,
     /// Last frame simulated, so a repeated `render` of the same frame
     /// redraws rather than advancing the automaton twice.
     last: Option<u64>,
@@ -562,6 +599,7 @@ impl Fire {
             heat,
             palette: fire_palette(),
             rng: Rng::new(seed),
+            seed,
             last: None,
         }
     }
@@ -631,6 +669,19 @@ impl Effect for Fire {
             self.last = Some(frame);
         }
         self.blit(surface);
+    }
+
+    /// Rebuild the heat grid at the new size.
+    ///
+    /// The fire is discarded and re-seeded rather than resampled: a
+    /// cellular automaton has no meaningful interpolation, and the
+    /// benchmark resizes exactly once, before frame 0, when there is
+    /// nothing to preserve.
+    fn resize(&mut self, width: u32, height: u32) {
+        if width == self.width && height == self.height {
+            return;
+        }
+        *self = Self::seeded(width, height, self.seed);
     }
 }
 
@@ -995,6 +1046,20 @@ impl Effect for Boing {
             }
         }
     }
+
+    /// Re-box the ball's bounce for the new surface.
+    ///
+    /// The whole point of [`Boing::position`] taking its box at
+    /// construction is that the node arm and the pixel arm agree about
+    /// where the ball is; a fullscreen pixel run that kept a 640×480 box
+    /// while its retained twin rebuilt at 1920×1080 would break exactly
+    /// that equivalence, which is the load-bearing claim of the
+    /// comparison. The sine table is kept: it is the same table at any
+    /// size.
+    fn resize(&mut self, width: u32, height: u32) {
+        self.width = width;
+        self.height = height;
+    }
 }
 
 /// A 0..=1 triangle wave of `frame` with period `period` frames.
@@ -1202,6 +1267,24 @@ impl Effect for Starfield {
                 surface.put(x + 1, y + 1, c);
             }
         }
+    }
+
+    /// Re-project the field into the new viewport.
+    ///
+    /// Cheap and exact, because the stars themselves live in a centred
+    /// normalised space and only [`Starfield::project`] knows about
+    /// pixels: the field is the same field, seen through a different
+    /// window. That is what lets the node arm and the pixel arm be the
+    /// same starfield — without it a fullscreen pixel run clamped every
+    /// star to `w-1`/`h-1` of 640×480 and drew the whole sky into the
+    /// top-left quadrant while its retained twin used the screen.
+    fn resize(&mut self, width: u32, height: u32) {
+        if width == self.width && height == self.height {
+            return;
+        }
+        self.width = width;
+        self.height = height;
+        self.project();
     }
 }
 
@@ -1435,6 +1518,20 @@ impl Effect for Balls {
                 }
             }
         }
+    }
+
+    /// Rebuild the simulation for the new box.
+    ///
+    /// Unlike the starfield, these bodies live in **pixel** space — radii
+    /// are a fraction of the box and velocities are pixels per frame — so
+    /// there is nothing to re-project and the honest resize is a fresh
+    /// set from the same seed. The benchmark resizes once, before frame
+    /// 0, so no motion is lost.
+    fn resize(&mut self, width: u32, height: u32) {
+        if width == self.width && height == self.height {
+            return;
+        }
+        *self = Self::new(self.out.len(), width, height);
     }
 }
 

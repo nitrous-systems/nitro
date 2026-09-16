@@ -144,6 +144,17 @@ impl PixelScenario {
     pub fn dimensions(&self) -> (u32, u32) {
         (self.surface.width, self.surface.height)
     }
+
+    /// The buffer's bytes, BGRA, `stride` per row.
+    ///
+    /// For the tests, which settle "did the effect actually cover the
+    /// surface" on pixels rather than on the geometry the scenario
+    /// reports about itself — the geometry was right while the pixels
+    /// were wrong, which is how the fullscreen-resize defect survived.
+    #[must_use]
+    pub fn pixels(&self) -> &[u8] {
+        &self.surface.data
+    }
 }
 
 impl Scenario for PixelScenario {
@@ -167,6 +178,14 @@ impl Scenario for PixelScenario {
         let (w, h) = (w.max(1), h.max(1));
         ctx.size_px = w;
         self.surface = Surface::new(w, h);
+        // Rebuild the effect for the size the *server* gave us, which a
+        // fullscreen run only learns here. Without this the effect keeps
+        // whatever box it was constructed with on the command line — 640×480
+        // by default — and simulates a quarter-resolution world into a
+        // full-resolution buffer. See `Effect::resize`, which carries the
+        // ledger evidence: fullscreen fire reported less compute than VGA
+        // fire, which cannot be true.
+        self.effect.resize(w, h);
         self.effect.render(&mut self.surface, 0);
         let fd = memfd(&self.surface.data)?;
         let msgs = vec![
@@ -284,7 +303,7 @@ pub fn write_bandwidth(w: u32, h: u32, refresh_mhz: u32) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::effects::Plasma;
+    use crate::effects::{Balls, Boing, Fire, Plasma, Rotozoom, Starfield};
     use nitro_core::Size;
 
     fn ctx(w: f32, h: f32) -> Ctx {
@@ -395,6 +414,99 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The defect the reviewer caught, and the third instance of the same
+    /// class in this crate: a `--fullscreen` run constructs its effect
+    /// from the *command line's* size, because the real one is not known
+    /// until the server's `Configure` arrives, and nothing rebuilt it.
+    ///
+    /// `a_fullscreen_buffer_is_sized_in_device_pixels` below checks the
+    /// `Surface`, and passed throughout — which is precisely why this got
+    /// through. The surface was the right size; the *simulation inside it*
+    /// was not, so the fire burned in a 640×480 corner of an 8 MB buffer
+    /// and the rest stayed at the zero-fill.
+    ///
+    /// The evidence was in the shipped ledger and went unread: fullscreen
+    /// fire reported **2 933 µs** of compute per frame against VGA fire's
+    /// **8 592** — four times the pixels for a third of the cost. This
+    /// test asserts the property that number violated, on the effects
+    /// rather than on the buffer.
+    #[test]
+    fn a_fullscreen_effect_is_rebuilt_at_the_configured_size() {
+        // A fullscreen run: the scenario is *constructed* at the default
+        // 640×480 (as `main.rs` does when `--window` is absent) and the
+        // server then configures 1920×1080.
+        let boxed: Vec<(&str, Box<dyn Effect>)> = vec![
+            ("fire", Box::new(Fire::new(640, 480))),
+            ("boing", Box::new(Boing::new(640, 480))),
+            ("starfield", Box::new(Starfield::new(200, 640, 480))),
+            ("balls", Box::new(Balls::new(16, 640, 480))),
+            ("plasma", Box::new(Plasma::new())),
+            ("rotozoom", Box::new(Rotozoom::new())),
+        ];
+        for (name, effect) in boxed {
+            let mut scen = PixelScenario::new("fullscreen", effect, 0);
+            let mut cx = ctx(1920.0, 1080.0);
+            scen.build(&mut cx).unwrap();
+            assert_eq!(scen.dimensions(), (1920, 1080), "{name}");
+
+            // The discriminator: ink in the far corner. An effect still
+            // simulating 640×480 cannot write past (640, 480), so the
+            // bottom-right quadrant stays exactly as `Surface::new` left
+            // it — zero. Every one of these effects covers its whole
+            // surface (the three that clear to a backdrop do so with a
+            // non-zero colour, and fire's palette entry 0 is opaque
+            // black, which is still a non-zero BGRA word).
+            scen.frame(&mut cx, 8).unwrap();
+            let far = far_corner_is_written(&scen);
+            assert!(
+                far,
+                "{name}: nothing was drawn past the 640x480 corner — the \
+                 effect is still simulating the constructed size"
+            );
+        }
+    }
+
+    /// Whether anything in the surface's bottom-right quadrant — well
+    /// past a 640×480 box — is non-zero.
+    fn far_corner_is_written(scen: &PixelScenario) -> bool {
+        let (w, h) = scen.dimensions();
+        let stride = w as usize * 4;
+        let data = scen.pixels();
+        (h as usize * 3 / 4..h as usize).step_by(7).any(|y| {
+            (w as usize * 3 / 4..w as usize)
+                .step_by(7)
+                .any(|x| data[y * stride + x * 4..][..4] != [0, 0, 0, 0])
+        })
+    }
+
+    /// The two stateless effects read their extent from the surface on
+    /// every call, so resizing them must be a no-op rather than a reset —
+    /// and the three that carry a box must actually take the new one.
+    #[test]
+    fn resize_moves_the_box_of_the_effects_that_have_one() {
+        let mut fire = Fire::new(64, 48);
+        fire.resize(128, 96);
+        let mut small = Surface::new(128, 96);
+        fire.render(&mut small, 0);
+        // A 64x48 grid blitted into a 128x96 surface leaves the right half
+        // untouched; a rebuilt one fills it.
+        let stride = 128 * 4;
+        let bottom = 95 * stride;
+        assert!(
+            small.data[bottom + 100 * 4..bottom + 100 * 4 + 4] != [0, 0, 0, 0],
+            "the fire did not re-seed across the wider grid"
+        );
+
+        let mut boing = Boing::new(640, 480);
+        let (_, _, r_small) = boing.position(0);
+        boing.resize(1920, 1080);
+        let (_, _, r_big) = boing.position(0);
+        assert!(
+            r_big > r_small * 1.5,
+            "the ball's radius did not follow the box: {r_small} -> {r_big}"
+        );
     }
 
     #[test]

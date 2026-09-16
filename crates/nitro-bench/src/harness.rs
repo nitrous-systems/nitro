@@ -294,9 +294,20 @@ impl Harness {
     ///
     /// Undecorated: the server's title bar is real work on a real frame,
     /// and including it would fold a constant of "one decorated window"
-    /// into every scenario's per-frame cost — except in `move`, whose
-    /// whole subject *is* the decoration, and which therefore asks for
-    /// decorated windows of its own.
+    /// into every scenario's per-frame cost, identically, where it adds
+    /// nothing any of them is measuring.
+    ///
+    /// x11perf's `-move` ("flying windows") would be the one scenario
+    /// that wanted the opposite — its whole subject is the decoration and
+    /// the window manager. **It is not implemented, because on this wire
+    /// it cannot be**: no client message carries a window position.
+    /// `CreateWindow` has `size`, `layer`, `flags` and `title` and no
+    /// origin; `position` appears exactly once in the protocol, on the
+    /// server's `Configure`. Placement is the window manager's, a client
+    /// is told where it ended up, and a client-driven move is not
+    /// expressible. That is the same kind of finding as the missing line
+    /// and arc ops and `docs/bench.md` §3 argues it there rather than
+    /// faking the scenario with something adjacent.
     #[must_use]
     pub fn create_window(&self, title: &str) -> ClientMsg {
         CreateWindow {
