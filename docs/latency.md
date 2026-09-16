@@ -18,6 +18,17 @@ pointer could answer (section 3.2), and the fix was to defer that flip
 (issue #529, now closed). Section 4 has the before/after and the one
 methodological trap that hid it.
 
+**This dossier measures latency and nothing else.** Its companion is
+[`bench.md`](bench.md), the *throughput* dossier: how many mutations per
+frame the server sustains before it misses a vblank, and what a presented
+frame costs in CPU on both sides of the socket — `x11perf`'s 1988
+operations and the classic demo effects, ported to the wire by
+`nitro-bench` and run on this same box. The two questions are
+independent, and a system can pass either while failing the other: a
+compositor that answers one pointer move in 9 ms may still be unable to
+repaint a full screen sixty times a second, which is exactly what
+`bench.md` finds.
+
 ## 1. What the numbers mean
 
 Two independent views of the same interval, deliberately, because a

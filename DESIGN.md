@@ -233,6 +233,10 @@ D-Bus client is allowed.
   timerfd deadline so a client that never answers cannot stall the arrow
   (issue #529). Full method, before/after, the rate sweep and the
   saturation trap that hid the improvement are in `docs/latency.md`;
+  **throughput** — the other half of the question, how much drawing per
+  frame the server sustains and what a frame costs in CPU — is in
+  `docs/bench.md`, measured by `nitro-bench` against the 1988 `x11perf`
+  operations and the classic demo effects;
   sizes and RSS in `docs/budget.md`. Three VT round trips with a client
   connected are clean and input still routes afterwards. Text was the one
   thing the milestone promised and did not deliver — M1 shipped rects and

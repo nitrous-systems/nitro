@@ -29,10 +29,22 @@ the tool is installed.
 | `nitro-term` | 650 136 | ≤ 900 KB (M4-A) | **ok**, 72 % |
 | `nitro-settings` | 719 240 | ≤ 700 KB (M4-C) | **over by 2.7 %**, see below |
 | `nitro-demo` | 481 240 | ≤ 1 MB (client) | **ok**, 48 % |
+| `nitro-bench` | 626 016 | ≤ 1 MB (client) | **ok**, 63 % |
 | `hello_client` | 393 344 | ≤ 1 MB (client) | **ok**, 39 % |
 | `hey` | 368 008 | — | ok |
 | `nitro-shot` | 330 160 | — | ok |
 | `nitro-server` | 2 047 016 | — | see below |
+
+The `nitro-bench` row is measured on the box rather than here, because
+that is the only machine it is ever deployed to. It is 144 776 bytes
+above `nitro-demo`, and the gap is entirely its own: sixteen scenarios,
+six demo effects with their palettes and sine table, a hand-written JSON
+reader/writer and a markdown table generator — against `nitro-demo`'s one
+scene and one histogram. It links the same two crates (`nitro-wire`,
+`nitro-core`) and adds **no external dependency**: the workspace is still
+at 37 crates, because the effects' PRNG and sine table are twenty lines
+each and the report's JSON is hand-rolled rather than serde. What it
+buys is in `docs/bench.md`.
 
 **M4-G (icons)** moved five of these; the row that needs an argument is
 the server's. Measured on the box, mine against main's binary, same
