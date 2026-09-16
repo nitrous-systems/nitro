@@ -36,9 +36,19 @@
 #     rewritten from scratch: it carries his dark scheme and his `de`
 #     layout and those are his, not ours.
 #   * After each restart the script **confirms `outputs` reports the rate
-#     it asked for** before running a single scenario. Otherwise the 120
-#     Hz column is a measurement of a switch that never happened — the
-#     #3704 rule this room learned the hard way.
+#     it asked for**, to within half a hertz, before running a single
+#     scenario. Otherwise the 120 Hz column is a measurement of a switch
+#     that never happened — the #3704 rule this room learned the hard
+#     way. A mode line that matches nothing is a *warning plus the
+#     default*, so the server comes back happily at 60 and a fallen-back
+#     arm is indistinguishable from "120 Hz bought nothing".
+#
+#     The tolerance is not slack: a real mode's refresh is almost never
+#     the round number. This panel's "120" is clock 285 500 over
+#     2080x1144 = **119.982 Hz**, reported as `@119982`, and its 85 is
+#     84.904. An equality check against `hz * 1000` would skip the arm
+#     for ever — which is exactly the quiet failure the guard exists to
+#     catch, and is what the first version of it did.
 #
 # Usage, on the box:
 #   deploy/bench.sh [--seconds N] [--out FILE] [--modes "60 120"]
@@ -80,6 +90,11 @@ mkdir -p "$(dirname "$out")"
 conf="$HOME/.config/nitro/server.conf"
 backup="$(mktemp)"
 restored=0
+# The refresh rate `outputs` reported for the arm now running, in
+# millihertz. Set by `set_mode`, read by the matrix note: a column
+# labelled with the *requested* rate would be the request marking its own
+# homework, and on this panel "120" is really 119 982.
+MEASURED_MHZ=""
 
 # The human's configuration is his. Restore it whatever happens — a
 # `mode` line left behind would silently change every measurement anyone
@@ -178,14 +193,40 @@ set_mode() {
         sleep 1
     done
     sleep 3
+    # Confirm the rate, and **parse it rather than matching a literal**.
+    #
+    # A real mode's refresh is almost never the round number you asked
+    # for. The box's "120 Hz" mode is clock 285 500 over 2080x1144, i.e.
+    # **119.982 Hz**, and `outputs` reports `@119982`; its 85 is 84.904.
+    # The first version of this check compared against `hz * 1000` and so
+    # would have skipped the 120 Hz arm *for ever* — silently, with a
+    # tidy `# SKIPPED` line in the ledger — which is precisely the quiet
+    # failure this guard exists to catch, committed inside the guard
+    # itself. (#3718, who owns the key, caught it.)
+    #
+    # The config line still asks for the round number: matching is
+    # nearest-within-0.5 Hz exactly so a person writes `@120`. So the
+    # check is "did we land within half a hertz of what we asked for",
+    # which is the same rule the server applies, rather than string
+    # equality against a number no connector actually offers.
     local got
-    got="$(control outputs | grep -o '@[0-9]*' | head -1 | tr -d '@')"
-    local want=$((hz * 1000))
-    if [[ $got != "$want" ]]; then
-        say "REFUSING the ${hz} Hz arm: outputs reports @${got:-nothing}, not @$want"
+    got="$(control outputs | grep -oE '@[0-9]+' | head -1 | tr -d '@')"
+    if [[ -z ${got:-} ]]; then
+        say "REFUSING the ${hz} Hz arm: outputs reported no refresh at all"
         return 1
     fi
-    say "confirmed: outputs reports @$got"
+    local want=$((hz * 1000))
+    local delta=$((got - want))
+    ((delta < 0)) && delta=$((-delta))
+    if ((delta > 500)); then
+        say "REFUSING the ${hz} Hz arm: outputs reports @${got}, ${delta} mHz from @${want}"
+        say "  (\`nitro-shot --modes\` lists what this connector really offers)"
+        return 1
+    fi
+    say "confirmed: outputs reports @$got, within ${delta} mHz of the ${hz} Hz asked for"
+    # Hand the measured rate back so the ledger's note carries the truth
+    # rather than the request.
+    MEASURED_MHZ="$got"
     return 0
 }
 
@@ -271,10 +312,18 @@ if [[ -z $modes ]]; then
     matrix "bar+launcher up"
 else
     for hz in $modes; do
+        MEASURED_MHZ=""
         if set_mode "$hz"; then
-            matrix "bar+launcher up; ${hz} Hz"
+            # The note carries the rate the server **reported**, not the
+            # one asked for: 120 is really 119.982 on this panel, and a
+            # column labelled with the request would be the request
+            # marking its own homework. `refresh_mhz` in each record is
+            # the client's own reading of the frame callback, so the two
+            # are independent and a reader can check them against each
+            # other.
+            matrix "bar+launcher up; asked ${hz} Hz, outputs says @${MEASURED_MHZ}"
         else
-            printf '# SKIPPED the %s Hz arm: outputs did not report it\n' "$hz" >>"$out"
+            printf '# SKIPPED the %s Hz arm: outputs did not confirm the mode\n' "$hz" >>"$out"
         fi
     done
 fi

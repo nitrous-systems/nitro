@@ -843,7 +843,7 @@ per mode. Two rules in that script are non-negotiable and both are scar
 tissue. The human's `server.conf` is **backed up and restored**, never
 rewritten from scratch — it carries his colour scheme and his keyboard
 layout, and those are his. And after each restart the script **refuses
-the arm unless the server's `outputs` reply reports `@120000`**: a mode
+the arm unless the server's `outputs` reply confirms the mode**: a mode
 line that matches nothing is a *warning plus the default*, so the server
 comes back happily at 60 Hz and an arm that silently fell back would
 produce a full, plausible, internally consistent 120 Hz column that was
@@ -852,6 +852,27 @@ what that looks like. `nitro-bench report` has a refresh-pivot table
 waiting for the data; it prints nothing today because there is nothing to
 pivot.
 
+**That check parses the rate rather than matching a literal, and the
+reason is worth a paragraph because the first version got it wrong.** A
+real mode's refresh is almost never the round number you asked for. This
+panel's "120 Hz" mode is clock 285 500 over a 2080×1144 total, which is
+**119.982 Hz**, and `outputs` reports `@119982`; its 85 is 84.904. The
+configuration line should still say `@120` — the key matches to the
+nearest listed mode within half a hertz precisely so that a person writes
+the round number — but a guard comparing the reply against the literal
+`@120000` would **never match and would skip the 120 Hz arm for ever**,
+silently, leaving a tidy `# SKIPPED` line in the ledger. That is the same
+class of quiet failure the guard was written to catch, committed inside
+the guard itself; #3718, who owns the key, spotted it. The check is now
+"within 500 mHz of what was asked", which is the rule the server itself
+applies, and the ledger's note records the rate `outputs` **reported**
+rather than the one requested — a column labelled with the request would
+be the request marking its own homework. Each record's `refresh_mhz` is
+the client's independent reading of the same thing, from the `Frame`
+callback's `refresh_ns`, so the two can be checked against each other.
+`nitro-shot --modes` lists what a connector really offers, in the
+spelling the key takes.
+
 **1080p@240 is not reachable on this box, and that is arithmetic rather
 than pessimism.** HDMI 1.4 on Haswell caps the TMDS clock near 300 MHz.
 1080p@120 is 285.5 MHz — the last mode the EDID offers, fitting with
@@ -859,6 +880,18 @@ about 5 % to spare. 1080p@144 needs 346.5 MHz, 1080p@165 needs 401.0 and
 1080p@240 needs roughly 606 MHz: none of them fit, and no amount of
 software gets them. **1280×720@240** with CVT-RB timing is about 280 MHz
 and might, which is what #3718 is testing.
+
+**The link carries it; the panel is the open question.** #3718 set the
+modeline (`279750 1280 1328 1360 1440 720 723 727 810 +hsync -vsync`) and
+the kernel accepted it: the CRTC really is at 240, `outputs` reports
+**`1280x720@239840 (custom)`** — CVT rounds the pixel clock down to a
+0.25 MHz step, so "240" is 239.840 — and the server managed **219
+flips/s** with a mean flip interval of **4 491 µs** against the 4 167 µs
+period. Whether a photon reaches the glass is a question no instrument in
+this repository can answer: `just shot` reads the *shadow* buffer and
+returns a perfectly good 1280×720 frame whether or not the panel locked.
+Only a human looking at the screen can settle it, which is the same rule
+this project applies to every pixels claim, one layer further out.
 
 If 720p@240 lands, the predictions worth writing down in advance so they
 can be wrong in public. The frame is **1 280 × 720 × 4 = 3 686 400
