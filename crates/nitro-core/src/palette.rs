@@ -134,9 +134,21 @@ roles! {
     TitleTextActive = "title_text_active",
     /// Title text of an unfocused window.
     TitleTextInactive = "title_text_inactive",
-    /// The frame border of the focused window.
+    /// The frame border of the focused window: **a shade of that
+    /// window's title bar**, not an unrelated accent.
+    ///
+    /// The border and the title bar are one continuous shape since #3724
+    /// (`docs/wm.md`), and the eye reads a frame as one thing or as two.
+    /// Before #3724 this was a mid blue against a pale-blue bar, which is
+    /// two: the box reported "a frame around the bottom left and right
+    /// window sides… a bit wider than the title bar, and a different
+    /// color". It is now the bar's own colour **darkened** — which is what
+    /// a 1-px outline around a filled shape is for — and the *focused*
+    /// signal is carried by the title bar, where it covers 28 px of window
+    /// rather than one.
     WindowBorderActive = "window_border_active",
-    /// The frame border of an unfocused window.
+    /// The frame border of an unfocused window: `title_bar_inactive`'s
+    /// edge, by the same rule.
     WindowBorderInactive = "window_border_inactive",
     /// The close button on a title bar: since #3715 its **hover**
     /// background, the disc that appears under the `x` glyph when the
@@ -417,8 +429,12 @@ impl Palette {
         p.set(TitleBarInactive, Color::rgb(0xea, 0xec, 0xf0));
         p.set(TitleTextActive, Color::rgb(0x17, 0x1c, 0x24));
         p.set(TitleTextInactive, Color::rgb(0x55, 0x5c, 0x66));
-        p.set(WindowBorderActive, Color::rgb(0x6d, 0x8e, 0xb8));
-        p.set(WindowBorderInactive, Color::rgb(0xc4, 0xc8, 0xd0));
+        // The border is the *bar's* edge, not a second colour: each is its
+        // own title bar darkened enough to read as an outline against the
+        // desktop behind it. See `Role::WindowBorderActive`. `#d6dde8` and
+        // `#eaecf0` darken to these.
+        p.set(WindowBorderActive, Color::rgb(0x8c, 0x9a, 0xae));
+        p.set(WindowBorderInactive, Color::rgb(0xb6, 0xbb, 0xc4));
         p.set(TitleClose, Color::rgb(0xd9, 0x5b, 0x4e));
         p.set(TitleMaximize, Color::rgb(0x62, 0xa8, 0x5c));
         // A hover disc on a *light* title bar: darker than both bars, and
@@ -505,8 +521,11 @@ impl Palette {
         p.set(TitleBarInactive, Color::rgb(0x23, 0x2a, 0x33));
         p.set(TitleTextActive, Color::rgb(0xf0, 0xf4, 0xf8));
         p.set(TitleTextInactive, Color::rgb(0x9a, 0xa4, 0xb0));
-        p.set(WindowBorderActive, Color::rgb(0x5a, 0x8d, 0xc8));
-        p.set(WindowBorderInactive, Color::rgb(0x3a, 0x42, 0x4c));
+        // Each border is its own title bar, lightened rather than darkened
+        // — a dark bar's edge has to come *up* to be visible against a dark
+        // desktop. `#2c3e55` and `#232a33` give these.
+        p.set(WindowBorderActive, Color::rgb(0x4d, 0x67, 0x88));
+        p.set(WindowBorderInactive, Color::rgb(0x39, 0x42, 0x4e));
         p.set(TitleClose, Color::rgb(0xd9, 0x5b, 0x4e));
         p.set(TitleMaximize, Color::rgb(0x62, 0xa8, 0x5c));
         p.set(TitleButtonHover, Color::rgb(0x46, 0x5c, 0x78));
@@ -720,6 +739,63 @@ mod tests {
                     bg.key()
                 );
             }
+        }
+    }
+
+    /// A frame's border is the edge of **its own title bar**, not a
+    /// second colour beside it.
+    ///
+    /// #3724, from the box: "there seems to be a frame around the bottom
+    /// left and right window sides, but that is a bit wider than the
+    /// title bar, and a different color". Half of that was geometry (the
+    /// border did not follow the bar's rounded corners — `docs/wm.md`);
+    /// this is the other half. `window_border_active` was `#6d8eb8`, a
+    /// mid blue against a `#d6dde8` pale-blue bar: a *different colour*,
+    /// which the eye reads as a second frame around the first.
+    ///
+    /// "Its own bar's shade" is checkable without naming a value, in two
+    /// parts. Each border must be **distinct enough from its bar to read
+    /// as an outline, and no more** — the ceiling is what the old blue
+    /// failed, at 2.9:1. And the two borders must be **sorted the way
+    /// their two bars are**: whichever bar is lighter has the lighter
+    /// border, which is what "each is its own bar's edge" means, and is
+    /// something a single accent could never satisfy. The obvious third
+    /// claim — each border is *nearer* its own bar than the other — is
+    /// not checkable here: the light scheme's two bars are 1.16:1 apart,
+    /// closer to each other than either is to its border, so the
+    /// comparison would measure rounding rather than design.
+
+    #[test]
+    fn a_frame_border_is_its_own_title_bars_shade() {
+        use Role::{TitleBarActive, TitleBarInactive, WindowBorderActive, WindowBorderInactive};
+        for (name, p) in both() {
+            for (border, own) in [
+                (WindowBorderActive, TitleBarActive),
+                (WindowBorderInactive, TitleBarInactive),
+            ] {
+                let (b, o) = (p.get(border), p.get(own));
+                let mine = contrast(b, o);
+                // Visible as an outline, but a *shade*: a 1-px line needs
+                // some separation to exist at all, and more than this
+                // stops being the bar's edge and starts being a frame of
+                // its own. The old `#6d8eb8` on `#d6dde8` was 2.9.
+                assert!(
+                    (1.25..=2.6).contains(&mine),
+                    "{name}: {} against {} is {mine:.2}:1 — outside the \
+                     ‘a shade of its own bar’ band",
+                    border.key(),
+                    own.key()
+                );
+            }
+            let brighter_bar =
+                luminance(p.get(TitleBarActive)) > luminance(p.get(TitleBarInactive));
+            let brighter_border =
+                luminance(p.get(WindowBorderActive)) > luminance(p.get(WindowBorderInactive));
+            assert_eq!(
+                brighter_bar, brighter_border,
+                "{name}: the borders are not sorted the way their bars are, \
+                 so at least one is not its own bar's shade"
+            );
         }
     }
 

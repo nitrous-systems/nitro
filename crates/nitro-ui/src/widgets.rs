@@ -829,6 +829,9 @@ pub struct Button<S> {
     icon_size: Option<f32>,
     enabled: bool,
     pressed: bool,
+    /// A pinned role for the label, or `None` for the one the button's
+    /// current state implies; see [`ButtonBuilder::text_role`].
+    text_role: Option<nitro_core::Role>,
     style: Option<TextStyle>,
     on_click: Option<ClickFn<S>>,
     /// The **middle**-button callback; see [`ButtonBuilder::on_alt_click`].
@@ -958,6 +961,13 @@ impl<S> Button<S> {
     #[must_use]
     pub fn is_pressed(&self) -> bool {
         self.pressed
+    }
+
+    /// The role pinned for the label, or `None` when it follows the
+    /// button's state; see [`ButtonBuilder::text_role`].
+    #[must_use]
+    pub fn text_role(&self) -> Option<nitro_core::Role> {
+        self.text_role
     }
 
     fn resolved_style(&self, theme: &crate::Theme) -> TextStyle {
@@ -1141,6 +1151,18 @@ impl<S: 'static> Widget<S> for Button<S> {
         let (pad_x, _) = theme.button_padding;
         let style = self.resolved_style(theme);
         let bounds = cx.bounds;
+        // A pinned role overrides whichever the state implied, and takes
+        // the *colour* with it: the label and the icon must agree, or a
+        // deliberately dimmed row would have a bright glyph beside a grey
+        // word. Resolved from the palette rather than from the `Theme`'s
+        // handful of named colours, because a pinned role may be any role
+        // at all. Taken after `theme` is done with, since `cx.color`
+        // borrows `cx` too.
+        let (text_color, text_role) = match self.text_role {
+            Some(role) => (cx.color(role), role),
+            None => (text_color, text_role),
+        };
+
         cx.rect(0, bounds, Fill::Solid(face), radius, border);
         // Without `caps::ICONS` this falls through to the label, and
         // that is the whole point of the guard. Emitting the icon anyway
@@ -1427,6 +1449,16 @@ impl<S: 'static> WidgetMut<'_, Button<S>, S> {
         self.request_layout();
     }
 
+    /// Pin the label's palette role, or with `None` let it follow the
+    /// button's state again. See [`ButtonBuilder::text_role`].
+    pub fn set_text_role(&mut self, role: Option<nitro_core::Role>) {
+        if self.text_role == role {
+            return;
+        }
+        self.text_role = role;
+        self.request_paint();
+    }
+
     /// Pin the icon's tint, or with `None` let it follow the label's
     /// colour as the button's state changes.
     pub fn set_icon_tint(&mut self, tint: Option<IconTint>) {
@@ -1634,6 +1666,29 @@ impl<S: 'static> ButtonBuilder<S> {
         self
     }
 
+    /// Pin the label's palette role instead of letting it follow the
+    /// button's state.
+    ///
+    /// By default a button's label takes `ButtonText` — or `TextDim` when
+    /// it is disabled — and its icon follows, which is what makes a
+    /// disabled icon button look disabled. Pinning is for a button whose
+    /// label carries a *meaning* the state machine does not know about,
+    /// and there is exactly one such case in this tree: the bar's window
+    /// list dims the entry of a **minimized** window.
+    ///
+    /// It is deliberately not spelled `set_enabled(false)`, which is the
+    /// obvious way to grey a button and would be wrong here: a disabled
+    /// button ignores clicks, and clicking a minimized entry to bring the
+    /// window back is precisely what has to keep working.
+    ///
+    /// The icon follows the pinned role like it follows any other, unless
+    /// [`ButtonBuilder::icon_tint`] pins one of its own.
+    #[must_use]
+    pub fn text_role(mut self, role: nitro_core::Role) -> Self {
+        self.button.text_role = Some(role);
+        self
+    }
+
     /// Set the label's font size.
     #[must_use]
     pub fn size(mut self, px: f32) -> Self {
@@ -1675,6 +1730,7 @@ pub fn button<S: 'static>(text: impl Into<String>) -> ButtonBuilder<S> {
         icon_size: None,
         enabled: true,
         pressed: false,
+        text_role: None,
         style: None,
         on_click: None,
         on_alt_click: None,

@@ -38,6 +38,32 @@ pub const BORDER: f32 = 1.0;
 pub const CORNER_RADIUS: f32 = 6.0;
 /// How wide the resize grab band is, inside and outside the frame edge.
 pub const RESIZE_BAND: f32 = 6.0;
+/// How far along either edge a frame corner still grabs *both* of them,
+/// in logical pixels.
+///
+/// # Why 24, and why an L rather than a square
+///
+/// Until #3724 a corner was exactly the intersection of two bands: a
+/// **6 × 6 patch**, most of it outside the window. The box reported the
+/// consequence — "it is very hard to hit the corner of a window (to
+/// resize it in two dimensions)" — and Fitts says why. A target's
+/// difficulty goes as `log2(distance / width + 1)`, so width is the term
+/// you can actually buy: at a pointer speed of about a pixel per
+/// millisecond, a 6-px target crossed at that rate gives the hand roughly
+/// **6 ms** to stop in, which is inside a person's correction latency —
+/// you find it by hunting, not by aiming. A 24-px reach along each edge
+/// is four times that, and the *shape* is what makes it free: the L lies
+/// along the two edges the corner joins, where the only thing it takes
+/// over is single-edge resizing that the remaining stretch of each edge
+/// still offers. A 24 × 24 *square* would have been the other way to get
+/// the width, and it would have eaten 24 px of the client's own content
+/// at every corner, which is precisely what
+/// `the_resize_band_never_steals_the_clients_content` exists to forbid.
+///
+/// The band's *inward* reach is unchanged: still the frame's own border
+/// (the title bar at the top). Only the corner's reach **along** the
+/// edges grew.
+pub const CORNER_REACH: f32 = 24.0;
 /// Size of one title-bar button (a square), logical pixels.
 ///
 /// It is both the **hit** region and the hover disc the pointer lights
@@ -212,6 +238,12 @@ impl Drag {
 /// could not be clicked at all. Six pixels of slop outside the window is
 /// what makes a 1-px border grabbable, and it costs the client nothing
 /// because those pixels are not its.
+///
+/// **Corners are L-shaped**, not the 6 × 6 intersection of two bands:
+/// anywhere in the band within [`CORNER_REACH`] of a corner *along either
+/// edge* pulls both of that corner's edges. See [`CORNER_REACH`] for the
+/// argument; the shape means the reach costs the client nothing either,
+/// because it lies along the same band the edges already own.
 #[must_use]
 pub fn hit_frame(frame: Rect, inset: Insets, point: Point, fixed: bool) -> Option<Region> {
     let outer = Rect::new(
@@ -229,26 +261,28 @@ pub fn hit_frame(frame: Rect, inset: Insets, point: Point, fixed: bool) -> Optio
             return None;
         }
     } else {
-        let edges = Edges {
+        let mut edges = Edges {
             left: point.x <= frame.x + inset.left,
             right: point.x >= frame.x + frame.w - inset.right,
             top: point.y <= frame.y + inset.top.min(RESIZE_BAND),
             bottom: point.y >= frame.y + frame.h - inset.bottom,
         };
-        if edges.any() {
-            return Some(Region::Resize(edges));
-        }
-        if !contains(frame, point) {
+        if !edges.any() && !contains(frame, point) {
             // Inside the outer band but past every edge test: the pointer
             // is in the slop *outside* the window, so it is grabbing
             // whichever edges it is beyond.
-            let edges = Edges {
+            edges = Edges {
                 left: point.x < frame.x,
                 right: point.x >= frame.x + frame.w,
                 top: point.y < frame.y,
                 bottom: point.y >= frame.y + frame.h,
             };
-            return edges.any().then_some(Region::Resize(edges));
+        }
+        if edges.any() {
+            return Some(Region::Resize(reach_corner(frame, point, edges)));
+        }
+        if !contains(frame, point) {
+            return None;
         }
     }
     if point.y < frame.y + inset.top {
@@ -261,6 +295,37 @@ pub fn hit_frame(frame: Rect, inset: Insets, point: Point, fixed: bool) -> Optio
         return Some(Region::TitleBar);
     }
     Some(Region::Content)
+}
+
+/// Grow an edge grab into a corner grab when the point is within
+/// [`CORNER_REACH`] of one along the *other* axis.
+///
+/// This is the whole of the L: a point already in the right-edge band and
+/// 20 px above the frame's bottom is 20 px from the bottom-right corner
+/// along that edge, so it pulls the bottom too. A point in the band on
+/// only one axis and far from both corners on the other is unchanged, so
+/// every straight-edge grab more than [`CORNER_REACH`] from a corner
+/// behaves exactly as it did.
+fn reach_corner(frame: Rect, point: Point, edges: Edges) -> Edges {
+    let near = |v: f32, lo: f32, hi: f32| -> (bool, bool) {
+        (v <= lo + CORNER_REACH, v >= hi - CORNER_REACH)
+    };
+    let (near_left, near_right) = near(point.x, frame.x, frame.x + frame.w);
+    let (near_top, near_bottom) = near(point.y, frame.y, frame.y + frame.h);
+    let mut out = edges;
+    // A vertical-edge grab reaches into the horizontal edges, and the
+    // other way round. Each side is taken only when the point is *not*
+    // already closer to the opposite one — a frame shorter than twice the
+    // reach would otherwise claim both, which is no corner at all.
+    if edges.left || edges.right {
+        out.top |= near_top && !near_bottom;
+        out.bottom |= near_bottom && !near_top;
+    }
+    if edges.top || edges.bottom {
+        out.left |= near_left && !near_right;
+        out.right |= near_right && !near_left;
+    }
+    out
 }
 
 /// The title bar's buttons, right to left: close, maximize, minimize.
@@ -807,7 +872,7 @@ pub fn build_frame(
     };
     let minimize = button(scene, icon_names::MINIMIZE)?;
 
-    scene.set_corner_radius(s, background, CORNER_RADIUS)?;
+    scene.set_corner_radius(s, background, 0.0)?;
     scene.set_corner_radius(s, bar, CORNER_RADIUS)?;
     let nodes = FrameNodes {
         root,
@@ -871,8 +936,51 @@ pub fn layout_frame(
     let size = info.frame_size();
     let fixed = info.flags().fixed_size;
     let s = ClientId::SERVER;
-    scene.set_bounds(s, nodes.background, Rect::new(0.0, 0.0, size.w, size.h))?;
-    scene.set_bounds(s, nodes.bar, Rect::new(0.0, 0.0, size.w, TITLE_H))?;
+    // # The frame is one shape: see the module docs' anatomy, and
+    // `docs/wm.md`.
+    //
+    // The background is **square** and starts `CORNER_RADIUS` down; the
+    // bar is rounded and overhangs the top inset by the same amount. Two
+    // rects, the count the budget already pays for, arranged so that the
+    // 1-px border they both carry traces **one** continuous outline:
+    //
+    // ```text
+    //   ╭─────────╮   ← the bar's rounded top arc, bordered
+    //   │ title   │
+    //   ├─────────┤   ← y = CORNER_RADIUS: the background's top edge,
+    //   │ client  │     hidden under the opaque bar, and the two
+    //   └─────────┘     side strokes meeting exactly
+    // ```
+    //
+    // **Why the bottom corners are square.** They were rounded until
+    // #3724, at the same `CORNER_RADIUS` as the top, and could not work:
+    // the client's content group is a *rectangle* the server does not
+    // clip, so at a rounded bottom corner the content painted past the
+    // arc while the border, traced along that arc at fractional coverage,
+    // faded out before reaching it. The result was a corner with a
+    // desktop-coloured hole in the border run and a square red client
+    // corner sticking through it — the box reported it as a frame "a bit
+    // wider than the title bar, and a different color". Square bottom
+    // corners are whole-pixel geometry: the vertical and horizontal runs
+    // are the same 1-px stroke of the same rect and *join*, with no
+    // antialiasing at all.
+    //
+    // **Why the bar overhangs.** A rect node has one radius for all four
+    // corners, so a rounded bar has rounded bottom corners too. Growing
+    // its box by `CORNER_RADIUS` puts those arcs — and its bottom border
+    // stroke — *below* the top inset, where the client's content group
+    // (the last sibling, so painted over them) hides them. What is left
+    // on screen is a bar rounded at the top and square where it meets the
+    // client, which is the shape it always looked like.
+    let bar_box = Rect::new(0.0, 0.0, size.w, TITLE_H + CORNER_RADIUS);
+    let body = Rect::new(
+        0.0,
+        CORNER_RADIUS,
+        size.w,
+        (size.h - CORNER_RADIUS).max(0.0),
+    );
+    scene.set_bounds(s, nodes.background, body)?;
+    scene.set_bounds(s, nodes.bar, bar_box)?;
     // Where the leftmost button starts is what everything to its left has
     // to fit inside. Taken from `buttons` rather than recomputed, so the
     // layout and the hit test cannot disagree about it.
@@ -991,6 +1099,16 @@ pub fn style_frame(
         Some(nitro_scene::Border::new(BORDER, border)),
     )?;
     scene.set_fill(s, nodes.bar, nitro_scene::Fill::Solid(bar))?;
+    // **The bar carries the same border as the body.** The two rects
+    // overlap by `CORNER_RADIUS` (see `layout_frame`), so their strokes
+    // form one continuous outline: the bar's traces the rounded top and
+    // its two side strokes run down into the body's, which carries on to
+    // the square bottom corners. Before #3724 only the body had a border
+    // and it was a full-height rect *behind* the bar, so the border ran
+    // straight past the bar's 6-px arc at the top and — being a stroke on
+    // a rounded rect whose content was not rounded — left a gap at each
+    // bottom corner. One border in two pieces rather than two borders.
+    scene.set_border(s, nodes.bar, Some(nitro_scene::Border::new(BORDER, border)))?;
     let text = title_role(focused);
     for region in [Region::Close, Region::Maximize, Region::Minimize] {
         let Some(button) = nodes.button(region) else {
@@ -1219,6 +1337,12 @@ mod tests {
         // Issue found by the toolkit tests: a band reaching six pixels
         // *inwards* over a 1-px border makes a button flush against the
         // window edge unclickable.
+        //
+        // Sampled at the frame's **middle**, deliberately: the corner
+        // reach added in #3724 runs along the edges, and the whole claim
+        // is that it did not move the band inwards. The corner's own
+        // version of this check is in
+        // `a_corner_reaches_along_both_its_edges`.
         let f = frame();
         let i = frame_insets();
         for d in 1..=6 {
@@ -1233,6 +1357,144 @@ mod tests {
                 hit_frame(f, i, Point::new(200.0, y), false),
                 Some(Region::Content),
                 "{d} px above the bottom border is the client's"
+            );
+        }
+        // And that holds *at* a corner too, which is the property the
+        // reach could have broken: one pixel in from the bottom-right
+        // corner, diagonally, is still the client's.
+        for d in 1..=6 {
+            let p = Point::new(
+                f.x + f.w - i.right - d as f32,
+                f.y + f.h - i.bottom - d as f32,
+            );
+            assert_eq!(
+                hit_frame(f, i, p, false),
+                Some(Region::Content),
+                "{d} px in from the bottom-right corner is the client's"
+            );
+        }
+    }
+
+    /// #3724's third report: "it is very hard to hit the corner of a
+    /// window (to resize it in two dimensions)".
+    ///
+    /// A corner used to be the 6 × 6 intersection of two bands. It is now
+    /// an **L**: anywhere in the band within [`CORNER_REACH`] of the
+    /// corner along either edge grabs both edges. The straight-edge grabs
+    /// further out are unchanged, which is the other half of the claim —
+    /// a reach that swallowed the whole edge would make single-axis
+    /// resizing impossible on a small window.
+    #[test]
+    fn a_corner_reaches_along_both_its_edges() {
+        let f = frame();
+        let i = frame_insets();
+        let br = Edges::corner(true, true);
+        // 20 px up the right edge: inside the reach, so the bottom-right
+        // corner. This is the case the box could not hit.
+        assert_eq!(
+            hit_frame(f, i, Point::new(f.x + f.w - 0.5, f.y + f.h - 20.0), false),
+            Some(Region::Resize(br)),
+            "20 px up the right edge is the bottom-right corner"
+        );
+        // And 20 px left along the bottom edge, which is the same corner
+        // reached along the other arm of the L.
+        assert_eq!(
+            hit_frame(f, i, Point::new(f.x + f.w - 20.0, f.y + f.h - 0.5), false),
+            Some(Region::Resize(br)),
+            "20 px left along the bottom edge is the same corner"
+        );
+        // In the outward slop, too: the band straddles the edge, and the
+        // reach is a property of the band, not of the window's inside.
+        assert_eq!(
+            hit_frame(f, i, Point::new(f.x + f.w + 3.0, f.y + f.h - 15.0), false),
+            Some(Region::Resize(br)),
+            "3 px outside and 15 px up is still the corner"
+        );
+        // Every corner, by the same rule, along both of its arms.
+        for (right, bottom) in [(false, false), (true, false), (false, true), (true, true)] {
+            let want = Edges::corner(right, bottom);
+            let ex = if right { f.x + f.w - 0.5 } else { f.x + 0.5 };
+            let ey = if bottom { f.y + f.h - 0.5 } else { f.y + 0.5 };
+            let dy = if bottom { -20.0 } else { 20.0 };
+            let dx = if right { -20.0 } else { 20.0 };
+            assert_eq!(
+                hit_frame(f, i, Point::new(ex, ey + dy), false),
+                Some(Region::Resize(want)),
+                "the vertical arm of corner({right}, {bottom})"
+            );
+            assert_eq!(
+                hit_frame(f, i, Point::new(ex + dx, ey), false),
+                Some(Region::Resize(want)),
+                "the horizontal arm of corner({right}, {bottom})"
+            );
+        }
+    }
+
+    /// The reach is [`CORNER_REACH`] and not the whole edge: past it, a
+    /// band grabs one axis, exactly as it did before #3724.
+    #[test]
+    fn an_edge_past_the_corner_reach_still_grabs_one_axis() {
+        let f = frame();
+        let i = frame_insets();
+        // The frame is 300 × 200, so its middle is far outside both
+        // corners' reach on either axis.
+        assert_eq!(
+            hit_frame(f, i, Point::new(f.x + 0.5, f.y + f.h / 2.0), false),
+            Some(Region::Resize(Edges {
+                left: true,
+                ..Edges::NONE
+            })),
+            "the middle of the left edge pulls the left edge alone"
+        );
+        assert_eq!(
+            hit_frame(f, i, Point::new(f.x + f.w / 2.0, f.y + f.h - 0.5), false),
+            Some(Region::Resize(Edges {
+                bottom: true,
+                ..Edges::NONE
+            })),
+            "the middle of the bottom edge pulls the bottom alone"
+        );
+        // Exactly one pixel past the reach, which is where the boundary
+        // has to be if `CORNER_REACH` means anything.
+        assert_eq!(
+            hit_frame(
+                f,
+                i,
+                Point::new(f.x + f.w - 0.5, f.y + f.h - CORNER_REACH - 1.0),
+                false
+            ),
+            Some(Region::Resize(Edges {
+                right: true,
+                ..Edges::NONE
+            })),
+            "one pixel past the reach is a plain right-edge grab"
+        );
+    }
+
+    /// A frame shorter than twice the reach must not claim both corners
+    /// of an edge at once: "nearer the top *and* nearer the bottom" is
+    /// not a corner, it is a window with no middle.
+    #[test]
+    fn a_tiny_frame_does_not_grab_two_corners_at_once() {
+        // `MIN_CONTENT` plus the insets: the smallest a drag can make a
+        // window, and 34 px tall against a 24 px reach.
+        let f = Rect::new(
+            100.0,
+            50.0,
+            MIN_CONTENT.w + 2.0 * BORDER,
+            MIN_CONTENT.h + TITLE_H + BORDER,
+        );
+        let i = frame_insets();
+        for d in 0..(f.h as i32) {
+            let p = Point::new(f.x + 0.5, f.y + d as f32 + 0.5);
+            let Some(Region::Resize(e)) = hit_frame(f, i, p, false) else {
+                continue;
+            };
+            assert!(
+                !(e.top && e.bottom),
+                "({}, {}) grabs the top and the bottom at once",
+                p.x,
+                p.y
             );
         }
     }

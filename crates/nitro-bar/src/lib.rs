@@ -78,7 +78,7 @@ pub mod clock;
 pub mod sensors;
 
 use nitro_ui::build::{ContainerBuilder as _, StyleBuilder as _};
-use nitro_ui::shell::{Layer, ShellEvent, Surface, WindowInfo, WindowRef};
+use nitro_ui::shell::{Layer, ShellEvent, Surface, WindowInfo, WindowRef, WindowState};
 use nitro_ui::widgets::{Button, Label, button as button_widget, icon, label, row, spacer};
 use nitro_ui::{App, ColorRole, Error, IconTint, Size, Ui, WidgetId};
 
@@ -193,6 +193,14 @@ struct Entry {
     icon: String,
     /// Whether it is drawn as focused.
     focused: bool,
+    /// Whether the window is minimized, which both dims the row and
+    /// decides what a click on it does.
+    ///
+    /// Held here rather than asked of the server per click because the
+    /// bar already has it — every `WindowInfo` carries the state — and
+    /// because the alternative would be a round trip on the click path to
+    /// learn something the last event already said.
+    minimized: bool,
     /// The button widget.
     id: WidgetId,
 }
@@ -355,6 +363,19 @@ impl Bar {
     #[must_use]
     pub fn focused_window(&self) -> Option<WindowRef> {
         self.entries.iter().find(|e| e.focused).map(|e| e.window)
+    }
+
+    /// The windows the list draws as minimized. For the tests, and for
+    /// the same reason `window_labels` is: the dimming is a *rendered*
+    /// property, and a test that only read the label would pass on a bar
+    /// that marked the row and forgot to tint it.
+    #[must_use]
+    pub fn minimized_windows(&self) -> Vec<WindowRef> {
+        self.entries
+            .iter()
+            .filter(|e| e.minimized)
+            .map(|e| e.window)
+            .collect()
     }
 
     /// What the clock currently shows.
@@ -703,7 +724,7 @@ fn install(ui: &mut Ui<Bar>, ids: Ids) {
 }
 
 /// The label a window-list button shows: the window's label, with a
-/// marker when it holds focus.
+/// marker when it holds focus and a bracket when it is minimized.
 ///
 /// Focus is shown *in the label* rather than by disabling the other
 /// buttons, which was the first attempt and was plainly wrong: a disabled
@@ -711,12 +732,69 @@ fn install(ui: &mut Ui<Bar>, ids: Ids) {
 /// but one unclickable — in the one widget whose entire purpose is to be
 /// clicked. It is also the form a script can read, since `hey` prints a
 /// button's label as its value.
+///
+/// A **minimized** window is marked the same way, and for the same
+/// reason: `[Calculator]` rather than a state a script cannot see. The
+/// brackets are the convention every taskbar since twm has used for "put
+/// away", they survive a palette a user has made low-contrast, and they
+/// are paired with — not replaced by — the dimmed tint the button takes
+/// (see [`entry_text_role`]): colour alone is an affordance a
+/// colour-blind user does not get, and a marker alone is one that is easy
+/// to miss in a row of eight.
 #[must_use]
-pub fn button_text(label: &str, focused: bool) -> String {
+pub fn button_text(label: &str, focused: bool, minimized: bool) -> String {
+    if minimized {
+        // Never both markers: a minimized window does not hold focus (the
+        // server hands focus on when it minimizes one), so `▸ [x]` would
+        // be a state that cannot happen.
+        return format!("[{label}]");
+    }
     if focused {
         format!("▸ {label}")
     } else {
         label.to_owned()
+    }
+}
+
+/// The palette role a window-list button's label takes.
+///
+/// A minimized window's entry is **dimmed**: it is still a row you can
+/// click — that is the whole of #3724's second half — but it is not a
+/// window that is on screen, and a task list in which the eight rows for
+/// eight windows look identical says nothing about which of them you can
+/// actually see. `TextDim` is the role for exactly that ("a hint, a units
+/// suffix, a disabled label", `docs/theme.md`) and it is contrast-checked
+/// against the window background in both schemes by the palette's own
+/// tests, so the dimmed row stays readable rather than becoming a row
+/// nobody can make out.
+///
+/// Not `set_enabled(false)`, which would be the obvious way to grey a
+/// button and is the one thing that must not happen here: a disabled
+/// button ignores clicks, and clicking a minimized entry is precisely
+/// what has to work.
+#[must_use]
+pub fn entry_text_role(minimized: bool) -> ColorRole {
+    if minimized {
+        ColorRole::TextDim
+    } else {
+        ColorRole::ButtonText
+    }
+}
+
+/// The tint a window-list button's **application** icon takes.
+///
+/// An application icon is somebody else's artwork painted in its own
+/// colours ([`IconTint::Coloured`]), so there is nothing to dim in it —
+/// a minimized Firefox is still the Firefox logo, exactly as an
+/// unfocused window's frame icon is (`docs/wm.md`). A minimized entry
+/// therefore dims the *symbolic* case only, where the glyph is one of
+/// ours and a role is what colours it.
+#[must_use]
+pub fn entry_icon_tint(minimized: bool) -> IconTint {
+    if minimized {
+        IconTint::Role(ColorRole::TextDim)
+    } else {
+        IconTint::Coloured
     }
 }
 
@@ -752,10 +830,13 @@ fn upsert(s: &mut Bar, ui: &mut Ui<Bar>, ids: Ids, info: &WindowInfo) {
     let text = entry_label(info);
     let icon = entry_icon(info);
     let window = info.window;
+    let minimized = info.state == WindowState::Minimized;
     if let Some(e) = s.entries.iter_mut().find(|e| e.window == window) {
         let id = e.id;
         e.text.clone_from(&text);
         e.focused = info.focused;
+        let dim_changed = e.minimized != minimized;
+        e.minimized = minimized;
         let icon_changed = e.icon != icon;
         e.icon.clone_from(&icon);
         // One setter for both changes, because both are the same string.
@@ -764,7 +845,15 @@ fn upsert(s: &mut Bar, ui: &mut Ui<Bar>, ids: Ids, info: &WindowInfo) {
         // no commit — which matters, because a focus change sends one for
         // *both* windows involved.
         if let Ok(mut b) = ui.widget_mut::<Button<Bar>>(id) {
-            b.set_text(button_text(&text, info.focused));
+            b.set_text(button_text(&text, info.focused, minimized));
+            // The tint only when the state actually crossed the minimize
+            // line, for the reason the icon is guarded below: an
+            // unconditional setter would be a paint per `WindowInfo` and
+            // the bar's idle claim is counted, not eyeballed.
+            if dim_changed {
+                b.set_text_role(Some(entry_text_role(minimized)));
+                b.set_icon_tint(Some(entry_icon_tint(minimized)));
+            }
             // The icon only when the app id moved, which is almost never:
             // an app id is fixed for a window's life in every client we
             // ship, and the one thing that can change it — a late
@@ -780,7 +869,7 @@ fn upsert(s: &mut Bar, ui: &mut Ui<Bar>, ids: Ids, info: &WindowInfo) {
         return;
     }
     let id = ui.build(
-        button_widget(button_text(&text, info.focused))
+        button_widget(button_text(&text, info.focused, minimized))
             // Named by the server's own window id, so the path a script
             // uses (`windows/win7`) is stable for the window's whole life
             // and names the same window the server does.
@@ -795,7 +884,9 @@ fn upsert(s: &mut Bar, ui: &mut Ui<Bar>, ids: Ids, info: &WindowInfo) {
             // was not taken.
             .icon_size(ICON_PX)
             .icon_coloured(icon.clone())
-            .icon_fallback_tinted(icons::WINDOW, IconTint::Role(ColorRole::ButtonText))
+            .icon_tint(entry_icon_tint(minimized))
+            .icon_fallback_tinted(icons::WINDOW, IconTint::Role(entry_text_role(minimized)))
+            .text_role(entry_text_role(minimized))
             .max_width(MAX_BUTTON_W)
             // The buttons shrink with their row, for the reason the row
             // does (see `build`): the window list is the one part of the
@@ -808,7 +899,30 @@ fn upsert(s: &mut Bar, ui: &mut Ui<Bar>, ids: Ids, info: &WindowInfo) {
             // the elastic one.
             .shrink_to_zero()
             .height_percent(1.0)
-            .on_click(move |_s: &mut Bar, ui: &mut Ui<Bar>| {
+            .on_click(move |s: &mut Bar, ui: &mut Ui<Bar>| {
+                // **The taskbar toggle**, and the whole of #3724's second
+                // half. Three cases, one message each, decided from the
+                // state the bar already holds:
+                //
+                // * unfocused, on screen → `FocusWindow`: focus and raise.
+                // * minimized → `FocusWindow` as well. The *server*
+                //   restores it first (`Server::focus_window_for_shell`),
+                //   because "un-minimize then focus" is one act and a bar
+                //   that sent two messages could have the second refused
+                //   for the state the first had just changed.
+                // * focused and on screen → minimize it. That is what
+                //   every taskbar does, and it is the only way to *put a
+                //   window away* from the bar: there was none before, so
+                //   the focused row was a button that did nothing.
+                //
+                // No new wire message: minimizing goes out as the
+                // `SetWindowStateFor` the bar could already send.
+                let entry = s.entries.iter().find(|e| e.window == window);
+                let put_away = entry.is_some_and(|e| e.focused && !e.minimized);
+                if put_away {
+                    let _ = ui.set_window_state_for(window, WindowState::Minimized);
+                    return;
+                }
                 // Silently refused by the server when it cannot be
                 // honoured, on the same terms a click on the window would
                 // be; a task list must not be able to wedge the keyboard.
@@ -833,6 +947,7 @@ fn upsert(s: &mut Bar, ui: &mut Ui<Bar>, ids: Ids, info: &WindowInfo) {
         text,
         icon,
         focused: info.focused,
+        minimized,
         id,
     });
 }

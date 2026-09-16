@@ -578,13 +578,23 @@ pub fn region_area(region: &[IRect]) -> u64 {
     region.iter().map(|r| r.area().cast_unsigned()).sum()
 }
 
-/// Where the cursor is and whether to draw it.
+/// Where the cursor is, which shape it is showing, and whether to draw it.
 #[derive(Debug, Clone, Copy)]
 pub struct CursorState {
     /// Hotspot position in device pixels.
     pub x: i32,
     /// Hotspot position in device pixels.
     pub y: i32,
+    /// Which shape the server has chosen for the pointer's position.
+    ///
+    /// Chosen by the server alone, from the frame region under the
+    /// pointer — there is no client request for one yet
+    /// (`docs/wire.md`'s deferred list).
+    pub shape: crate::cursor::Shape,
+    /// The whole factor the cursor is magnified by on this output, so a
+    /// 2× output gets a 48-device-pixel cursor rather than a physically
+    /// half-size one. See [`Cursor::paint_scale`].
+    pub scale: i32,
     /// Whether the cursor is drawn at all (no pointer device: no cursor).
     pub visible: bool,
 }
@@ -638,7 +648,14 @@ pub fn paint_region(
             paint_item(canvas, &clip, item, scene, text, icons, palette);
         }
         if cursor_state.visible {
-            cursor_image.paint(canvas, &clip, cursor_state.x, cursor_state.y);
+            cursor_image.paint(
+                canvas,
+                &clip,
+                cursor_state.x,
+                cursor_state.y,
+                cursor_state.shape,
+                cursor_state.scale,
+            );
         }
     }
     items.clear();

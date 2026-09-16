@@ -898,3 +898,138 @@ fn the_launcher_button_draws_an_icon_and_keeps_its_accessible_name() {
     assert_eq!(h.state().launcher_presses(), 1);
     h.quit();
 }
+
+/// #3724's second report: "if a window is minimized, clicking it in the
+/// bar should re-open it".
+///
+/// The whole toggle, through the real click path, on the server's own
+/// counters: **focused → minimized → restored**, with `stats minimized`
+/// going 0 → 1 → 0 and `focused` following it down and back up.
+///
+/// Both halves were broken, in different places. Clicking the *focused*
+/// entry did nothing at all, because focusing an already-focused window
+/// is a no-op — so the bar's row for the window you were looking at was
+/// a button with no effect. And clicking a *minimized* entry did nothing
+/// either, silently: `FocusWindow` went out, and the server's
+/// `focusable()` excludes `Minimized`, so it was refused on the same
+/// terms a `NO_FOCUS` overlay is. The refusal is still there for
+/// `NO_FOCUS`; a minimized window is restored first.
+#[test]
+fn clicking_the_focused_entry_minimizes_it_and_clicking_it_again_restores_it() {
+    let mut h = harness();
+    h.settle();
+    let conn = open_window(&h, "toggle", Size::new(120.0, 90.0));
+    until(&mut h, "the window", |h| h.state().window_count() == 1);
+
+    // A new window on the Normal layer takes focus when it is placed, so
+    // the entry starts focused and on screen.
+    let win = h.state().windows()[0];
+    until(&mut h, "the focus", |h| {
+        h.state().focused_window() == Some(win)
+    });
+    assert_eq!(h.server().stat("minimized"), 0, "nothing is put away yet");
+    assert_eq!(h.server().stat("focused"), 1);
+
+    let id = named(&mut h, &nitro_bar::entry_name(win)).expect("its button");
+
+    // One: the focused, visible entry. A click puts the window away.
+    h.click(id);
+    until(&mut h, "the minimize", |h| {
+        h.server().stat("minimized") == 1
+    });
+    until(&mut h, "the bar to hear about it", |h| {
+        h.state().minimized_windows() == vec![win]
+    });
+    assert_eq!(
+        h.server().stat("focused"),
+        0,
+        "the only window was put away, so nothing holds focus"
+    );
+    assert_eq!(
+        h.state().focused_window(),
+        None,
+        "the bar's own view followed"
+    );
+    // And the row says so, in a form a script can read: `hey` prints a
+    // button's label as its value, and this is what it prints.
+    assert_eq!(
+        h.widget::<nitro_ui::widgets::Button<Bar>>(id).text(),
+        "[toggle]",
+        "a minimized entry is marked, not merely dimmed"
+    );
+    // Dimmed as well as marked: colour alone is an affordance a
+    // colour-blind user does not get, and a marker alone is easy to miss
+    // in a row of eight, so the entry carries both.
+    assert_eq!(
+        h.widget::<nitro_ui::widgets::Button<Bar>>(id).text_role(),
+        Some(nitro_ui::ColorRole::TextDim),
+        "a minimized entry is not dimmed"
+    );
+    // But it is still **enabled**: a disabled button ignores clicks, and
+    // the next thing this test does is click it.
+    assert!(
+        h.widget::<nitro_ui::widgets::Button<Bar>>(id).is_enabled(),
+        "a minimized entry must stay clickable"
+    );
+
+    // Two: the minimized entry. A click brings it back and focuses it.
+    h.click(id);
+    until(&mut h, "the restore", |h| h.server().stat("minimized") == 0);
+    until(&mut h, "the focus to come back", |h| {
+        h.state().focused_window() == Some(win)
+    });
+    assert_eq!(h.server().stat("focused"), 1);
+    assert!(
+        h.state().minimized_windows().is_empty(),
+        "the bar still thinks the window is put away"
+    );
+    assert_eq!(
+        h.widget::<nitro_ui::widgets::Button<Bar>>(id).text(),
+        "▸ toggle",
+        "the restored entry is marked focused again"
+    );
+    assert_eq!(
+        h.widget::<nitro_ui::widgets::Button<Bar>>(id).text_role(),
+        Some(nitro_ui::ColorRole::ButtonText),
+        "the restored entry is still dimmed"
+    );
+
+    drop(conn);
+    h.quit();
+}
+
+/// An **unfocused, visible** entry is not a toggle: it focuses.
+///
+/// The other arm of the click rule, and the one that must not regress —
+/// a task list whose rows minimized whatever you clicked would be
+/// unusable. `clicking_a_window_list_button_focuses_that_window` covers
+/// the focus half; this one is specifically that the window is *not* put
+/// away on the way.
+#[test]
+fn clicking_an_unfocused_entry_focuses_it_rather_than_minimizing_it() {
+    let mut h = harness();
+    h.settle();
+    let a = open_window(&h, "alpha", Size::new(120.0, 90.0));
+    until(&mut h, "alpha", |h| h.state().window_count() == 1);
+    let b = open_window(&h, "beta", Size::new(120.0, 90.0));
+    until(&mut h, "beta", |h| h.state().window_count() == 2);
+
+    // The newest took focus, so the first entry is unfocused and visible.
+    let first = h.state().windows()[0];
+    until(&mut h, "beta's focus", |h| {
+        h.state().focused_window() != Some(first)
+    });
+    let id = named(&mut h, &nitro_bar::entry_name(first)).expect("alpha's button");
+    h.click(id);
+    until(&mut h, "the focus to move", |h| {
+        h.state().focused_window() == Some(first)
+    });
+    assert_eq!(
+        h.server().stat("minimized"),
+        0,
+        "clicking an unfocused row put a window away"
+    );
+
+    drop((a, b));
+    h.quit();
+}

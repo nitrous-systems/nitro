@@ -2502,7 +2502,29 @@ fn a_window_too_narrow_for_its_icon_drops_it_rather_than_overlapping() {
     // The claim: the leftmost button is exactly what it was on the roomy
     // frame. Without the guard the icon's box still starts 8 px in and
     // the button starts at 0, so the artwork lands on top of the glyph.
-    let squeezed = crop(&h.shot(), button_rect(&win, wm::Region::Minimize, false));
+    //
+    // The button's **leftmost column is excluded**, and that is not the
+    // assertion being weakened — it is the one pixel of the crop that is
+    // not the button. At the minimum width the leftmost button starts at
+    // the frame's own left edge, so its first column *is* the frame's
+    // 1-px border, which has been the bar's edge colour since #3724 (it
+    // used to be hidden behind a full-height background rect the bar was
+    // drawn over, so it did not reach the title bar at all — the two-frame
+    // look the box reported). One column out of fourteen; the other
+    // thirteen still carry the whole overlap claim, because an icon
+    // composited over this button would land in its middle, not on its
+    // outermost column.
+    let side = wm::BUTTON as usize;
+    let without_border = |px: &[u32]| -> Vec<u32> {
+        px.chunks(side)
+            .flat_map(|row| row[1..].to_vec())
+            .collect::<Vec<_>>()
+    };
+    let squeezed = without_border(&crop(
+        &h.shot(),
+        button_rect(&win, wm::Region::Minimize, false),
+    ));
+    let reference = without_border(&reference);
     let moved = squeezed
         .iter()
         .zip(&reference)
@@ -2717,5 +2739,403 @@ fn a_window_minimized_by_its_own_button_comes_back_unlit() {
     let _ = keep;
 
     drop(conn);
+    h.quit();
+}
+
+// ---------------------------------------------------------------------
+// #3724: the cursor shapes, the L-shaped corners, and one frame border
+// ---------------------------------------------------------------------
+
+/// Where the cursor's ink is, as a set of device pixels that differ from
+/// a reference shot taken with the pointer parked elsewhere.
+///
+/// The software cursor is painted into the same buffer as everything
+/// else (`crates/nitro-server/src/cursor.rs` says why), so a screenshot
+/// is the only honest way to ask what shape is on screen — and a diff
+/// against a control shot is what turns "there is ink here" into "this
+/// ink is the cursor's".
+///
+/// `frame` is excluded to one pixel either side of its outline, because
+/// hovering a band *also* lights the resize hint (#3713) and that repaint
+/// is a change the diff would otherwise attribute to the cursor — as a
+/// full-height column of border, which is exactly what a "is this arrow
+/// wider than it is tall?" question must not see.
+fn cursor_ink(shot: &Image, control: &Image, area: Rect, frame: Rect) -> Vec<(u32, u32)> {
+    let on_outline = |x: u32, y: u32| -> bool {
+        let (x, y) = (x as f32, y as f32);
+        let near = |v: f32, edge: f32| (v - edge).abs() <= 1.0;
+        let in_x = x >= frame.x - 1.0 && x <= frame.x + frame.w;
+        let in_y = y >= frame.y - 1.0 && y <= frame.y + frame.h;
+        (in_y && (near(x, frame.x) || near(x, frame.x + frame.w - 1.0)))
+            || (in_x && (near(y, frame.y) || near(y, frame.y + frame.h - 1.0)))
+    };
+    let mut out = Vec::new();
+    for y in area.y as u32..(area.y + area.h) as u32 {
+        for x in area.x as u32..(area.x + area.w) as u32 {
+            if !on_outline(x, y) && rgb(shot.pixel(x, y)) != rgb(control.pixel(x, y)) {
+                out.push((x, y));
+            }
+        }
+    }
+    out
+}
+
+/// The bounding box of a set of pixels, as `(x, y, w, h)`.
+fn bbox(px: &[(u32, u32)]) -> (u32, u32, u32, u32) {
+    let x0 = px.iter().map(|p| p.0).min().unwrap_or(0);
+    let x1 = px.iter().map(|p| p.0).max().unwrap_or(0);
+    let y0 = px.iter().map(|p| p.1).min().unwrap_or(0);
+    let y1 = px.iter().map(|p| p.1).max().unwrap_or(0);
+    (x0, y0, x1 - x0 + 1, y1 - y0 + 1)
+}
+
+/// The server picks a resize cursor from the band under the pointer, and
+/// the arrow everywhere else.
+///
+/// The claim is about **pixels**, not about an internal enum: the shapes
+/// have different hotspots, so the arrow's ink starts at the pointer and
+/// grows down-right while a double arrow is centred on it. Hovering an
+/// edge and then the desktop, and measuring where the ink lands relative
+/// to the pointer, is what distinguishes them from the outside.
+#[test]
+fn the_cursor_changes_shape_over_a_resize_band() {
+    let mut h = Harness::start("cursor-shapes", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("cursor-shapes");
+    let win = make_window(&mut conn, &mut inbox, 1, "shapes", WIN, RED, 0, 1);
+    park(&mut h);
+    let control = h.shot();
+
+    let f = win.frame(true);
+    // Over the client's own content: the arrow, whose hotspot is its tip,
+    // so every pixel of it is at or right-and-below the pointer.
+    let (cx, cy) = win.content();
+    h.point_at(cx, cy, OUT);
+    h.settle();
+    let area = Rect::new(cx - 30.0, cy - 30.0, 60.0, 60.0);
+    let ink = cursor_ink(&h.shot(), &control, area, f);
+    assert!(!ink.is_empty(), "no cursor drawn over the content");
+    let (bx, by, _, _) = bbox(&ink);
+    assert_eq!(
+        (bx, by),
+        (cx as u32, cy as u32),
+        "the arrow's ink starts at the pointer: its hotspot is its tip"
+    );
+
+    // The middle of the right edge, far from either corner: a horizontal
+    // double arrow, centred on the pointer. So its ink reaches *left* of
+    // the pointer, which the arrow's never does.
+    let (ex, ey) = (f.x + f.w - 0.5, f.y + f.h / 2.0);
+    h.point_at(ex, ey, OUT);
+    h.settle();
+    let area = Rect::new(ex - 30.0, ey - 30.0, 60.0, 60.0);
+    let ink = cursor_ink(&h.shot(), &control, area, f);
+    assert!(!ink.is_empty(), "no cursor drawn over the band");
+    let (bx, by, bw, bh) = bbox(&ink);
+    assert!(
+        bx < ex as u32 && by < ey as u32,
+        "a resize cursor is centred on the pointer, not hung off it: \
+         ink starts at ({bx}, {by}) for a pointer at ({ex}, {ey})"
+    );
+    // Horizontal, so wider than tall — which is what tells `size_hor`
+    // from `size_ver` without naming a pixel.
+    assert!(
+        bw > bh,
+        "the right edge's cursor is {bw}x{bh}: not a horizontal arrow"
+    );
+
+    // The middle of the bottom edge: the same shape turned ninety
+    // degrees, so taller than wide.
+    let (ex, ey) = (f.x + f.w / 2.0, f.y + f.h - 0.5);
+    h.point_at(ex, ey, OUT);
+    h.settle();
+    let area = Rect::new(ex - 30.0, ey - 30.0, 60.0, 60.0);
+    let ink = cursor_ink(&h.shot(), &control, area, f);
+    let (_, _, bw, bh) = bbox(&ink);
+    assert!(
+        bh > bw,
+        "the bottom edge's cursor is {bw}x{bh}: not a vertical arrow"
+    );
+
+    // And a corner: the diagonal, which is square-ish and — unlike either
+    // straight arrow — has ink in the two opposite quadrants around the
+    // pointer and none in the other two.
+    let (ex, ey) = (f.x + f.w - 0.5, f.y + f.h - 15.0);
+    h.point_at(ex, ey, OUT);
+    h.settle();
+    let area = Rect::new(ex - 30.0, ey - 30.0, 60.0, 60.0);
+    let ink = cursor_ink(&h.shot(), &control, area, f);
+    let quadrant = |dx: bool, dy: bool| {
+        ink.iter()
+            .filter(|(x, y)| {
+                let past_x = f32::from(u16::try_from(*x).unwrap()) > ex;
+                let past_y = f32::from(u16::try_from(*y).unwrap()) > ey;
+                past_x == dx && past_y == dy
+            })
+            .count()
+    };
+    // `size_fdiag` runs top-left to bottom-right, so the ink is in the
+    // ↖ and ↘ quadrants.
+    assert!(
+        quadrant(false, false) > 10 && quadrant(true, true) > 10,
+        "the corner's cursor has no diagonal body"
+    );
+    assert!(
+        quadrant(true, false) < quadrant(false, false) / 2,
+        "the corner's cursor is not a ╲ diagonal"
+    );
+
+    drop(conn);
+    h.quit();
+}
+
+/// A shape change is **cursor damage and nothing else**.
+///
+/// The shape rides the same `frame_hit` per motion that the resize hint
+/// and the button hover already ride, and like them it must not reach
+/// the scene: no text is shaped, no icon rasterised, and the frame it
+/// causes is a cursor-only one. The counters are what can say "none at
+/// all"; a screenshot cannot.
+#[test]
+fn hovering_a_band_changes_the_cursor_and_nothing_else() {
+    let mut h = Harness::start("cursor-cost", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("cursor-cost");
+    let win = make_window(&mut conn, &mut inbox, 1, "cost", WIN, RED, 0, 1);
+    park(&mut h);
+
+    let f = win.frame(true);
+    let layouts = h.stat("text_layouts");
+    let renders = h.stat("icon_renders");
+    // Thirty motions along the right edge, in and out of the band: every
+    // one of them crosses between the arrow and a resize shape, and one
+    // of them crosses between `size_hor` and `size_fdiag` as it passes
+    // into the corner's reach.
+    for i in 0..30 {
+        let t = i as f32 / 29.0;
+        let y = f.y + wm::TITLE_H + 4.0 + t * (f.h - wm::TITLE_H - 8.0);
+        h.point_at(f.x + f.w - 0.5, y, OUT);
+        h.settle();
+        h.point_at(f.x + f.w / 2.0, y, OUT);
+        h.settle();
+    }
+    assert_eq!(
+        h.stat("text_layouts"),
+        layouts,
+        "a cursor shape change must not shape any text"
+    );
+    assert_eq!(
+        h.stat("icon_renders"),
+        renders,
+        "a cursor shape change must not rasterise any icon"
+    );
+
+    drop(conn);
+    h.quit();
+}
+
+/// #3724's fourth report: "there seems to be a frame around the bottom
+/// left and right window sides, but that is a bit wider than the title
+/// bar, and a different color".
+///
+/// Two defects in one look, and this pins both fixes.
+///
+/// **The border hugs the bar.** It used to be the stroke of a
+/// full-height background rect that the title bar was painted *over*, so
+/// at the top-left the border ran straight down past the bar's 6-px
+/// rounded corner: a blue line beside a pale bar, which reads as a
+/// second frame. The bar now carries the border itself, so the pixel
+/// immediately left of the bar is border and the one inside it is bar.
+///
+/// **The bottom corners join.** A rounded bottom corner is a stroke at
+/// fractional coverage, and the client's square content painted through
+/// it: the horizontal and vertical runs faded out before meeting and
+/// left a desktop-coloured notch. The bottom corners are square now, so
+/// the corner run is continuous — no pixel of it is the desktop.
+#[test]
+fn the_frame_border_is_one_continuous_shape_with_the_title_bar() {
+    let mut h = Harness::start("one-frame", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("one-frame");
+    let win = make_window(&mut conn, &mut inbox, 1, "frame", WIN, RED, 0, 1);
+    park(&mut h);
+    let img = h.shot();
+
+    let f = win.frame(true);
+    let border = to_rgb(role(Role::WindowBorderActive));
+    let bar_rgb = to_rgb(bar(true));
+
+    // Beside the title bar, at half its height — well below the 6-px
+    // corner arc, so both sides are whole pixels of one colour each.
+    let y = (f.y + wm::TITLE_H / 2.0) as u32;
+    assert_eq!(
+        rgb(img.pixel(f.x as u32, y)),
+        border,
+        "the pixel at the frame's left edge, beside the bar, is the border"
+    );
+    assert_eq!(
+        rgb(img.pixel(f.x as u32 + 1, y)),
+        bar_rgb,
+        "and the pixel one inside it is the title bar: no gap between them"
+    );
+    // The same on the right, which is the other side of the same claim.
+    assert_eq!(
+        rgb(img.pixel((f.x + f.w) as u32 - 1, y)),
+        border,
+        "the right edge beside the bar is the border"
+    );
+
+    // The two bottom corners: the border's corner run is continuous.
+    // Eight pixels along each arm of each corner, none of which may be
+    // the desktop showing through a gap.
+    let desktop_top = to_rgb(role(Role::DesktopTop));
+    let desktop_bottom = to_rgb(role(Role::DesktopBottom));
+    let bottom = (f.y + f.h) as u32 - 1;
+    for (name, corner_x, dx) in [
+        ("bottom-left", f.x as u32, 1i32),
+        ("bottom-right", (f.x + f.w) as u32 - 1, -1i32),
+    ] {
+        for d in 0..8u32 {
+            // Along the bottom edge from the corner.
+            let x = u32::try_from(i64::from(corner_x) + i64::from(dx) * i64::from(d)).unwrap();
+            let px = rgb(img.pixel(x, bottom));
+            assert_eq!(
+                px, border,
+                "{name}: the bottom run is {px:06x} at +{d}, not the border"
+            );
+            assert!(
+                px != desktop_top && px != desktop_bottom,
+                "{name}: the desktop shows through the corner at +{d}"
+            );
+            // And up the side edge from the same corner.
+            let px = rgb(img.pixel(corner_x, bottom - d));
+            assert_eq!(
+                px, border,
+                "{name}: the side run is {px:06x} at -{d}, not the border"
+            );
+        }
+    }
+
+    // The border is the *bar's* shade, not an unrelated accent: it has to
+    // read as the edge of the thing it outlines rather than as a second
+    // frame around it. The claim is about the colours themselves, so it
+    // is checked across **both** schemes in `nitro_core::palette`'s
+    // `a_frame_border_is_its_own_title_bars_shade`; what is pinned here
+    // is that the pixel on screen really is the role that test governs,
+    // which the two assertions above already did.
+
+    drop(conn);
+    h.quit();
+}
+
+/// A press 15 px above the bottom-right corner, three pixels outside the
+/// frame, grabs **both** edges — the box's "it is very hard to hit the
+/// corner of a window" from the other end of the stack.
+///
+/// The unit test pins `hit_frame`'s arithmetic; this one pins that the
+/// server wires it up, by dragging from there and checking that the
+/// window grew in *both* dimensions.
+#[test]
+fn a_press_up_the_edge_from_a_corner_resizes_both_axes() {
+    let mut h = Harness::start("corner-reach", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("corner-reach");
+    let mut win = make_window(&mut conn, &mut inbox, 1, "corner", WIN, RED, 0, 1);
+    park(&mut h);
+
+    let before = win.frame(true);
+    // Three pixels outside the right edge and fifteen above the bottom:
+    // inside the band, inside the corner's reach, and a place that used
+    // to be a plain right-edge grab.
+    let from = (before.x + before.w + 3.0, before.y + before.h - 15.0);
+    h.point_at(from.0, from.1, OUT);
+    h.settle();
+    h.button(BTN_LEFT, ButtonState::Pressed);
+    h.settle();
+    assert_eq!(h.stat("dragging"), 1, "the press did not start a drag");
+    h.point_at(from.0 + 40.0, from.1 + 30.0, OUT);
+    h.settle();
+    h.button(BTN_LEFT, ButtonState::Released);
+    h.settle();
+    await_configure(&mut conn, &mut inbox, &mut win, "the corner drag");
+
+    let after = win.frame(true);
+    assert!(
+        after.w > before.w && after.h > before.h,
+        "a corner drag grew {:?} to {:?}: not both axes",
+        (before.w, before.h),
+        (after.w, after.h)
+    );
+    // The opposite corner did not move: a resize from the bottom-right
+    // pulls that corner and pins the other.
+    assert_eq!(
+        (after.x, after.y),
+        (before.x, before.y),
+        "the top-left corner moved during a bottom-right resize"
+    );
+
+    drop(conn);
+    h.quit();
+}
+
+/// The cursor is painted in **device** pixels, so a 2× output gets a
+/// 48-px arrow rather than a physically half-size one.
+///
+/// Every other rectangle on the desktop is logical and the output's
+/// scale lives in the window root's transform, so a 2× output simply
+/// gets twice the device pixels for the same logical box. The cursor is
+/// the one thing outside that: it is blitted after the scene, at the
+/// pointer's device position, so without a factor of its own it would
+/// shrink to half its apparent size exactly where the pixels are
+/// smallest.
+#[test]
+fn the_cursor_is_painted_at_the_outputs_scale() {
+    let mut h = Harness::start_with("cursor-scale", OUT.0, OUT.1, |c| {
+        c.scales = nitro_server::parse_scales("Virtual-1=2");
+    });
+    // The bare desktop, so every pixel that differs between the two shots
+    // is the cursor's: no frame, no hint, no client.
+    park(&mut h);
+    let control = h.shot();
+
+    // Well clear of the parked position and of the output's edges, so the
+    // 48-px square is not clipped by either.
+    let (px, py) = (200.0f32, 150.0f32);
+    h.point_at(px, py, OUT);
+    h.settle();
+    let shot = h.shot();
+
+    let area = Rect::new(
+        f64::from(px) as f32 - 8.0,
+        f64::from(py) as f32 - 8.0,
+        80.0,
+        80.0,
+    );
+    let ink = cursor_ink(&shot, &control, area, Rect::new(-10.0, -10.0, 0.0, 0.0));
+    assert!(!ink.is_empty(), "no cursor on a 2x output");
+    let (bx, by, _, _) = bbox(&ink);
+    assert_eq!(
+        (bx, by),
+        (px as u32, py as u32),
+        "the arrow's tip is still its hotspot at 2x"
+    );
+    // The covered square is 48 device pixels on a side. Asserted as the
+    // rect the damage and the paint both derive from, since the arrow's
+    // own ink does not fill its corner.
+    let rect = nitro_server::cursor::Cursor::rect_scaled(
+        px as i32,
+        py as i32,
+        nitro_server::cursor::Shape::Arrow,
+        nitro_server::cursor::Cursor::paint_scale(2.0),
+    );
+    assert_eq!((rect.w, rect.h), (48, 48), "a 2x cursor is 48 px square");
+    // And the ink really does reach into that square's far half, which a
+    // 24-px arrow drawn at 1x could not: the tail's close is at art row
+    // 21, so device row py + 42.
+    assert!(
+        ink.iter().any(|(_, y)| *y >= py as u32 + 40),
+        "the arrow stopped short of 2x: it was painted at 1x"
+    );
+
     h.quit();
 }

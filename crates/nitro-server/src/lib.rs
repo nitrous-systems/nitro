@@ -748,6 +748,15 @@ struct Server {
     /// frames' buttons are different buttons — sliding from one window's
     /// close to another's has to unlight the first.
     button_hover: Option<(WindowKey, Region)>,
+    /// Which cursor shape the pointer is showing.
+    ///
+    /// Cached for the same reason [`Server::resize_hint`] is, and with the
+    /// same damage rule: a shape change damages the **old rect ∪ the new**
+    /// (they differ, because the hotspots do) and nothing else — no scene
+    /// node moved, so no scene damage and no restyle. Chosen from the same
+    /// single `frame_hit` per motion that already drives the hint and the
+    /// hover; see [`Server::set_cursor_shape`].
+    cursor_shape: crate::cursor::Shape,
     /// The shaped title run of each framed window, so a retitle can release
     /// the old one.
     frame_titles: HashMap<WindowKey, nitro_text::TextKey>,
@@ -1067,6 +1076,7 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         decorations: HashMap::new(),
         resize_hint: None,
         button_hover: None,
+        cursor_shape: crate::cursor::Shape::Arrow,
         frame_titles: HashMap::new(),
         scale_overrides: std::mem::take(&mut config.scales),
         mode_overrides: std::mem::take(&mut config.modes),
@@ -1895,16 +1905,23 @@ impl Server {
         }
     }
 
-    /// Where the cursor is on `output`, in that output's buffer space.
+    /// Where the cursor is on `output`, in that output's buffer space,
+    /// which shape it is showing and how far it is magnified.
     fn cursor_state(&self, output: SceneOutputId) -> CursorState {
-        let origin = self
+        let (origin, scale) = self
             .scene
             .output_info(output)
-            .map_or((0, 0), |(rect, _)| (rect.x, rect.y));
+            .map_or(((0, 0), 1.0), |(rect, scale)| ((rect.x, rect.y), scale));
         let (x, y) = self.pointer.device();
         CursorState {
             x: x - origin.0,
             y: y - origin.1,
+            shape: self.cursor_shape,
+            // Per **output**: the cursor is painted in device pixels, so
+            // a 2x output needs a 2x cursor to be the same physical size,
+            // and the pointer can be on either screen of a mixed-scale
+            // desk. Each output paints it at its own factor.
+            scale: Cursor::paint_scale(scale),
             visible: self.pointer.present,
         }
     }
@@ -2833,9 +2850,10 @@ impl Server {
     fn move_pointer(&mut self, x: f64, y: f64, time_ns: u64) {
         let bounds = input::output_union(&self.scene);
         let (old_x, old_y) = self.pointer.device();
+        let old_shape = self.cursor_shape;
         let appeared = self.pointer.seen();
         if appeared {
-            self.damage_global(Cursor::rect(old_x, old_y));
+            self.damage_cursor_at(old_x, old_y, old_shape);
         }
         if !self.pointer.move_to(x, y, bounds) && !appeared {
             return;
@@ -2843,8 +2861,8 @@ impl Server {
         let (new_x, new_y) = self.pointer.device();
         if (old_x, old_y) != (new_x, new_y) {
             // Old ∪ new, exactly like the scene's own damage rule.
-            self.damage_global(Cursor::rect(old_x, old_y));
-            self.damage_global(Cursor::rect(new_x, new_y));
+            self.damage_cursor_at(old_x, old_y, old_shape);
+            self.damage_cursor_at(new_x, new_y, old_shape);
         }
         let point = self.pointer.position();
         let output = input::output_at(&self.scene, point);
@@ -2857,6 +2875,13 @@ impl Server {
         if let Some(drag) = self.wm.drag()
             && self.drive_drag(drag)
         {
+            // A drag in flight owns the shape too: a title drag shows the
+            // move cross for as long as it lasts, and a resize drag keeps
+            // the shape of the edges it grabbed even once the pointer has
+            // run past them. Neither can be re-derived from the region
+            // under the pointer, because during a drag the pointer is
+            // routinely nowhere near the frame it is moving.
+            self.set_cursor_shape(Self::drag_shape(drag));
             self.note_input(time_ns);
             return;
         }
@@ -2881,6 +2906,18 @@ impl Server {
             frame_hit.and_then(|(win, region)| matches!(region, Region::Resize(_)).then_some(win)),
         );
         self.set_button_hover(frame_hit.filter(|(_, region)| region.is_button()));
+        // And the cursor shape, off that same one walk: a band the window
+        // can actually be resized by takes the shape that points along it,
+        // everything else the arrow. `resizable` is the same filter
+        // `set_resize_hint` applies, and for the same reason — a diagonal
+        // cursor over a `FIXED_SIZE` window would promise a grab that does
+        // nothing.
+        self.set_cursor_shape(match frame_hit {
+            Some((win, Region::Resize(edges))) if self.resizable(win) => {
+                crate::cursor::Shape::for_edges(edges)
+            }
+            _ => crate::cursor::Shape::Arrow,
+        });
         let target = output.and_then(|id| input::hit(&self.scene, id, point));
         let now_over = target.map(|t| t.window);
         if now_over != self.pointer.over {
@@ -3448,15 +3485,27 @@ impl Server {
         }
     }
 
-    /// Damage a device-pixel rect in global coordinates on whichever
-    /// outputs it touches — the software cursor's rect, and nothing else.
-    /// Scene damage goes through [`Server::update_scene`], which is what
-    /// keeps [`frame::OutputState::cursor_only`] able to tell them apart.
-    fn damage_global(&mut self, rect: nitro_core::IRect) {
+    /// Damage the rectangle a cursor with its hotspot at `(x, y)` global
+    /// device pixels covers, on every output it touches.
+    ///
+    /// This is the server's *only* non-scene damage: the software cursor,
+    /// and nothing else. Scene damage goes through
+    /// [`Server::update_scene`], which is what keeps
+    /// [`frame::OutputState::cursor_only`] able to tell them apart.
+    ///
+    /// The covered rectangle is computed **per output** rather than once
+    /// globally, because the cursor is magnified by each output's own
+    /// whole scale factor ([`Cursor::paint_scale`]): on a 2× screen it is
+    /// 48 device pixels square and on its 1× neighbour 24. One global rect
+    /// would have to be the larger of the two and would over-damage the
+    /// smaller screen on every motion — on the motion path, which is the
+    /// one `docs/budget.md` is strict about.
+    fn damage_cursor_at(&mut self, x: i32, y: i32, shape: crate::cursor::Shape) {
         for output in &mut self.outputs {
-            let Some((origin, _)) = self.scene.output_info(output.scene_id) else {
+            let Some((origin, scale)) = self.scene.output_info(output.scene_id) else {
                 continue;
             };
+            let rect = Cursor::rect_scaled(x, y, shape, Cursor::paint_scale(scale));
             let local = rect
                 .translate(-origin.x, -origin.y)
                 .intersect(&output.bounds());
@@ -3783,6 +3832,50 @@ impl Server {
             .flatten()
         {
             self.style_only(win, self.focus == Some(win));
+        }
+    }
+
+    /// Put the pointer into a cursor shape, damaging what it leaves and
+    /// what it takes.
+    ///
+    /// The third affordance on the motion path, beside
+    /// [`Server::set_resize_hint`] and [`Server::set_button_hover`], and
+    /// written to the same rules: the hit test is the caller's (the *same*
+    /// `frame_hit`), and an unchanged shape returns before touching
+    /// anything.
+    ///
+    /// What it does **not** do is touch the scene. A shape change is
+    /// cursor damage and only cursor damage — the old shape's rect ∪ the
+    /// new one's, which differ because the hotspots do — so it is not a
+    /// restyle, it shapes no text, it re-rasterises no icon, and
+    /// [`frame::OutputState::cursor_only`] still calls the frame it causes
+    /// a cursor-only flip. That is what
+    /// `hovering_a_band_changes_the_cursor_and_nothing_else` pins.
+    fn set_cursor_shape(&mut self, shape: crate::cursor::Shape) {
+        if self.cursor_shape == shape {
+            return;
+        }
+        let old = self.cursor_shape;
+        self.cursor_shape = shape;
+        if !self.pointer.present {
+            // Nothing is drawn, so nothing changed on screen. The shape is
+            // still recorded: the first motion that makes the pointer
+            // visible paints whatever it should already have been.
+            return;
+        }
+        let (x, y) = self.pointer.device();
+        self.damage_cursor_at(x, y, old);
+        self.damage_cursor_at(x, y, shape);
+    }
+
+    /// The shape a drag in flight shows.
+    fn drag_shape(drag: Drag) -> crate::cursor::Shape {
+        match drag {
+            Drag::Move { .. } => crate::cursor::Shape::Move,
+            Drag::Resize { edges, .. } => crate::cursor::Shape::for_edges(edges),
+            // A button press is not a drag the pointer follows; the
+            // pointer is parked on a title-bar button.
+            Drag::Button { .. } => crate::cursor::Shape::Arrow,
         }
     }
 
@@ -4288,6 +4381,45 @@ impl Server {
         }
         if self.focusable(win) {
             self.focus_window(Some(win));
+        }
+    }
+
+    /// A shell's `FocusWindow`: restore the window if it is minimized,
+    /// then raise and focus it.
+    ///
+    /// The **`NO_FOCUS` refusal is unchanged**: a window whose client
+    /// opted out of focus, or a stale ref, is silently ignored on exactly
+    /// the terms a click on it would be, because a bar's window list must
+    /// not be able to wedge the keyboard by naming the wrong row.
+    ///
+    /// What changed in #3724 is the *minimized* case, which was refused
+    /// with it: [`Server::focusable`] excludes `Minimized`, so clicking a
+    /// minimized window in the bar did nothing at all, silently — the box
+    /// reported it as "if a window is minimized, clicking it in the bar
+    /// should re-open it". Restoring it first is what every taskbar does,
+    /// and it is the same `set_state(Normal)` that `Alt+Tab` already uses
+    /// to bring a minimized window back ([`Server::cycle_focus`]) rather
+    /// than a second un-minimize path that could drift from it.
+    fn focus_window_for_shell(&mut self, win: WindowKey) {
+        if self
+            .scene
+            .window_info(win)
+            .is_ok_and(|i| i.state() == WindowState::Minimized)
+        {
+            // Only for a window that could take focus once it is back. A
+            // `NO_FOCUS` window is refused *before* it is restored, or the
+            // bar would be able to un-minimize a panel it can never focus.
+            if !self
+                .scene
+                .window_info(win)
+                .is_ok_and(|i| i.flags().focusable)
+            {
+                return;
+            }
+            self.set_state(win, WindowState::Normal);
+        }
+        if self.focusable(win) {
+            self.raise_and_focus(win);
         }
     }
 
@@ -5065,14 +5197,8 @@ impl Server {
                 true
             }
             ClientMsg::FocusWindow(m) => {
-                // Silently refused for a window that cannot take focus, on
-                // exactly the terms a click on it would be: a shell's window
-                // list showing a `NO_FOCUS` overlay must not be able to
-                // wedge the keyboard by clicking it.
-                if let Some(win) = self.window_refs.key_for(m.window)
-                    && self.focusable(win)
-                {
-                    self.raise_and_focus(win);
+                if let Some(win) = self.window_refs.key_for(m.window) {
+                    self.focus_window_for_shell(win);
                 }
                 true
             }
