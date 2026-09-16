@@ -20,7 +20,7 @@
 //!
 //! ```text
 //! hey nitro-bar list
-//! hey nitro-bar do windows/win3 click        # focus that window
+//! hey nitro-bar do windows/win3 click        # focus it, restore it, or put it away
 //! hey nitro-bar get clock value              # 09:41
 //! ```
 //!

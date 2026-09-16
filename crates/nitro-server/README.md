@@ -473,6 +473,15 @@ ARGB image blitted like anything else, inside the frame's damage clip —
 into the shadow, like everything else — and a pointer move damages the old
 and the new cursor rect.
 
+Since #3724 there are **six** such images — the arrow, four resize double
+arrows and a move cross — and the server picks one from the frame region
+under the pointer, off the same `frame_hit` per motion that drives the
+resize hint and the button hover. A shape change is cursor damage and
+nothing else. On a scaled output the cursor is magnified by that output's
+whole scale factor with nearest-neighbour blocks, so a 2× screen gets a
+48-device-pixel pointer rather than a physically half-size one. See
+`docs/wm.md` §Cursor shapes.
+
 It is drawn only once a pointer device has actually reported something,
 not merely because an output exists. Whether there is a pointer on this
 desk is a question libinput's capability bits answer badly — a machine can

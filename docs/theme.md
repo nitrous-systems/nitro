@@ -82,8 +82,8 @@ desktop can be pasted straight back into a file.
 | `title_bar_inactive` | an unfocused window's title bar | `#eaecf0` | `#232a33` |
 | `title_text_active` | its title text | `#171c24` | `#f0f4f8` |
 | `title_text_inactive` | an unfocused window's title text | `#555c66` | `#9aa4b0` |
-| `window_border_active` | the focused window's frame border | `#6d8eb8` | `#5a8dc8` |
-| `window_border_inactive` | an unfocused one's | `#c4c8d0` | `#3a424c` |
+| `window_border_active` | the focused window's frame border — **a shade of its own title bar**, see below | `#8c9aae` | `#4d6788` |
+| `window_border_inactive` | an unfocused one's, by the same rule | `#b6bbc4` | `#39424e` |
 | `title_close` | the close button's **hover** disc — red only while the pointer is on it | `#d95b4e` | `#d95b4e` |
 | `title_maximize` | **no longer painted**; kept because a role index is a wire index | `#62a85c` | `#62a85c` |
 | `resize_hint` | the frame edge, while the pointer is in its resize band | `#0f5fbe` | `#6ca8f0` |
@@ -134,11 +134,55 @@ has no business overriding it.
 * the twelve chromatic ANSI colours clear 3:1 against their own
   `terminal_background`. The four greys (0, 7, 8, 15) are exempt, because
   by ANSI convention one of them *is* the scheme's background colour;
+* each **frame border is a shade of its own title bar** — see below;
 * every colour round-trips through `#rrggbb`/`#rrggbbaa`.
 
 The contrast maths is the WCAG formula, implemented in twenty lines
 (`luminance`, `contrast`) rather than eyeballed. A "nicer" grey that
 quietly makes a label unreadable fails the build.
+
+### A frame border is its own title bar's edge
+
+The two `window_border_*` roles are the only ones in the table with a
+**relational** rule as well as a value, and #3724 is why. They used to be
+blues — `#6d8eb8` light, `#5a8dc8` dark — unrelated to the pale-blue
+title bars they outlined, and a user on the test box read the result as
+two frames rather than one: *"there seems to be a frame around the bottom
+left and right window sides, but that is a bit wider than the title bar,
+and a different color"*. The geometry half of that is fixed in
+`docs/wm.md`; this is the colour half.
+
+The rule: a 1-px outline around a filled shape is that shape's **edge**.
+So each border is its own bar darkened (light scheme) or lightened (dark),
+far enough to read as an outline and no further.
+`a_frame_border_is_its_own_title_bars_shade` holds it to two checkable
+claims rather than to taste:
+
+* each border sits in a **1.25–2.6:1** band against its own bar — the
+  floor is "an outline exists", the ceiling is what the old blue failed
+  at 2.9:1;
+* the two borders are **sorted the way their two bars are**: whichever
+  bar is the lighter has the lighter border. A single accent used for
+  both, which is what this replaced, cannot satisfy that.
+
+The obvious third claim — each border is *nearer* its own bar than the
+other — is deliberately not asserted: the light scheme's two bars are
+1.16:1 apart, closer to each other than either is to its border, so the
+comparison would measure rounding rather than design.
+
+The focus signal did not move to the border, it stayed where it always
+was: the **title bar's own colour**, which is 28 px of window against the
+border's one.
+
+**Cursors are the exception to the whole table.** The software cursor is
+black-outlined white in both schemes and has no role. It is the one thing
+that must stay legible over content the desktop does not control — a
+photo, a terminal, a client's own black window — and a dark-scheme cursor
+inverted to white-on-black would vanish against exactly the dark content
+the dark scheme exists for. `deploy/lint-colors.sh` sees no colour
+construction in `cursor.rs`: the art is bytes, and the two values it maps
+to are `Color::BLACK` and `Color::WHITE`, which the lint does not count
+as colours for the reason its header gives.
 
 ## The switch: `server.conf`
 

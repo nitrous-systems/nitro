@@ -1532,6 +1532,23 @@ to.
   both said in as many words that the value was reserved for this. The
   observable difference for an old client is that a name it never had a
   reason to send now draws an icon.
+* **`SetCursor` is deferred to M5**, and named here so the gap is a
+  decision rather than an oversight. #3724 gave the *server* five cursor
+  shapes beyond the arrow — the four resize diagonals and the move cross
+  — chosen from the frame region under the pointer (`docs/wm.md`). A
+  **client** still cannot ask for one: a text widget cannot show an
+  I-beam and a link cannot show a hand.
+
+  It is deferred rather than added because the shape is only half of it.
+  A useful `SetCursor` is a named shape *and* a client-supplied bitmap
+  with a hotspot, which is a buffer op, a lifetime question (the cursor
+  outlives the frame that set it) and a re-entrancy one (the pointer is
+  over a node whose client has gone). Shipping the enum half now would
+  freeze a message that has to grow the other half later, which is
+  precisely what this policy exists to prevent. When it lands it is the
+  sanctioned path: a new op code in the `0x_02x` gap, a new capability
+  bit, and `VERSION` stays **1**.
+
 * `VERSION` is bumped only for a change that is not expressible that way —
   a different framing, a changed field, a removed op. A version mismatch is
   fatal at handshake: there is no negotiation and no compatibility shim.

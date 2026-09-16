@@ -62,12 +62,15 @@ Geometry, in logical units:
 | | |
 |---|---|
 | title bar height | 28 |
-| border | 1, left/right/bottom |
+| border | 1, **all four sides**, one continuous outline |
 | top corner radius | 6 |
+| bottom corners | square, so the border's two runs meet exactly |
 | application icon | 16 × 16, 8 from the left edge, 6 before the title |
 | button | 14 × 14, 8 apart, close rightmost; a 10 px glyph centred in each |
 | resize grab band | 6 outside the frame edge, inwards only to the border (or the title bar, at the top) |
+| corner reach | 24 along either edge from a corner: the band there grabs **both** edges |
 | resize hint | the border repaints in `resize_hint` while the pointer is in the band |
+| cursor shape | the band's own: `size_hor`, `size_ver`, `size_fdiag`, `size_bdiag`; `move` during a title drag |
 | button hover | the disc under the pointer's button paints; every other disc is transparent |
 
 The title's box is what is left: it starts after the icon and stops one
@@ -146,6 +149,70 @@ the **content's** size; `Window::frame_size()` adds the insets.
 `Configure.position` is the content's origin, so a client holding a
 screenshot of the whole output can still crop it to exactly itself.
 
+### One frame, not two: how the border and the bar share an outline
+
+Until #3724 the frame looked like two shapes, and the box said so: *"there
+seems to be a frame around the bottom left and right window sides, but
+that is a bit wider than the title bar, and a different color"*. Both
+halves of that were true, and they had different causes.
+
+The old arrangement was a **full-height background rect** carrying the
+border, with the title bar painted on top of it. Two consequences:
+
+* At the top the border ran straight down past the bar's 6-px rounded
+  corner — a line beside the bar rather than around it, which is exactly
+  what "a frame around the window" means when you can see both.
+* At the bottom the corners were rounded and the *client's content is
+  not*. A rounded stroke is drawn at fractional coverage, so the two runs
+  faded out before meeting while the client's square corner painted
+  through the gap: a 1–2 px desktop-coloured notch in each bottom corner.
+
+The frame is now laid out so the two rects' strokes are **one outline**,
+with no new node — still eleven per frame, nine on a `FIXED_SIZE` one:
+
+```text
+  ╭───────────╮     the bar: rounded (radius 6), bordered, and
+  │   title   │     grown 6 px past the top inset so its own
+  ├───────────┤  ←  bottom arcs fall behind the client's content
+  │           │     y = 6: the body's top edge, under the bar
+  │  client   │
+  │           │
+  └───────────┘     square bottom corners: whole-pixel geometry,
+                   so the two runs *join*
+```
+
+The bar overhangs because a rect node has **one radius for all four
+corners**: a bar rounded at the top is rounded at the bottom too, so its
+lower arcs and its bottom stroke are pushed below the inset, where the
+client's content group — the last sibling, painted over them — hides
+them. What is left on screen is a bar rounded at the top and square where
+it meets the client, which is the shape it always appeared to be.
+
+The bottom corners are square rather than rounded-to-match because a
+rounded corner cannot be made continuous here without also clipping the
+client, and clipping a client's corners is a much bigger change than this
+is: it would mean the server deciding the shape of somebody else's
+pixels. Square corners are whole-pixel geometry — the vertical and
+horizontal runs are the same 1-px stroke of the same rect — so there is
+no antialiasing to fade out and nothing to leave a gap.
+
+**And the colour.** `window_border_active` was `#6d8eb8`, a mid blue
+against the `#d6dde8` pale-blue bar. That is a *different colour*, which
+is the other half of what the eye reads as a second frame. Both border
+roles are now shades of their own title bar (`docs/theme.md`), and the
+focus signal lives where it always did — in the title bar itself, which
+is 28 px of window rather than one. The rule is checkable rather than
+tasteful: `a_frame_border_is_its_own_title_bars_shade` holds each border
+to a contrast band against its own bar (visible as an outline, never as a
+second colour) and requires the two borders to be sorted the way their
+two bars are.
+
+Pinned from the outside by
+`the_frame_border_is_one_continuous_shape_with_the_title_bar`: the pixel
+at `(frame.x, frame.y + bar_height/2)` is `border_color`, the one inside
+it is bar colour, and eight pixels along **both** arms of **both** bottom
+corners are border with no desktop pixel in the run.
+
 ### Why the band is lopsided, and why it is now visible
 
 The band **straddles** the frame edge, but not symmetrically: six pixels
@@ -174,9 +241,129 @@ that can actually be resized lights up: a `FIXED_SIZE` window has no bands
 at all, so offering it a grab that does nothing would be worse than
 offering none.
 
-When cursor shapes land the hint becomes redundant with them, not
-contradicted by them: both answer "a press here resizes", one at the
-pointer and one at the edge.
+The hint **stays** now that cursor shapes have landed (#3724), and is not
+redundant with them: both answer "a press here resizes", one at the
+pointer and one at the edge, and the one at the edge is the one that says
+*which* edge. It is left at 1 px — widening it to 2 would move the border
+out from under the pointer as the pointer arrived, which is a worse
+affordance than a thin one that stays put. #565 (the hint's visibility)
+therefore stays **open**: the cursor shape is the larger half of its
+answer and is now in, and what is left of it is a colour question the
+palette can settle without moving any geometry.
+
+### Corners you can hit
+
+A corner used to be exactly the intersection of two bands: a **6 × 6
+patch**, most of it outside the window. The box, on a real mouse: *"it is
+very hard to hit the corner of a window (to resize it in two
+dimensions)"*.
+
+Fitts's law says why, and says which term to buy. Difficulty goes as
+`log2(distance / width + 1)`, and distance is the user's business — width
+is ours. At a typical hand speed of about a pixel per millisecond, a 6-px
+target gives roughly **6 ms** to stop in, which is inside a person's
+correction latency: you find a 6 × 6 corner by hunting for it, not by
+aiming at it.
+
+So `CORNER_REACH = 24`: within the band, any point closer than 24 logical
+pixels to a frame corner **along either edge** resolves to that corner.
+The bottom-right corner is grabbable from a 24-px stretch of the right
+edge *and* a 24-px stretch of the bottom edge — an **L**, four times the
+reach in each direction, and the shape is what makes it free:
+
+```text
+     │                        │
+     │    client content      │─┐
+     │                        │ │  24 px: the corner's
+     │                        │ │  vertical arm
+     └───────────────────────┘─┘
+                    └────────┘
+                      24 px: the horizontal arm
+```
+
+A 24 × 24 *square* would have bought the same width and taken 24 px of
+the client's content at every corner, which is precisely what
+`the_resize_band_never_steals_the_clients_content` exists to forbid. The
+L lies along the band the edges already own, so the only thing it takes
+over is single-edge resizing within 24 px of a corner — and the rest of
+each edge still offers that
+(`an_edge_past_the_corner_reach_still_grabs_one_axis`). The band's
+**inward** reach is unchanged: still the frame's own border, the title
+bar at the top.
+
+A frame shorter or narrower than twice the reach does **not** claim both
+corners of an edge at once: "nearer the top and nearer the bottom" is not
+a corner, it is a window with no middle, so the nearer one wins
+(`a_tiny_frame_does_not_grab_two_corners_at_once`, run against the
+64 × 32 content floor).
+
+The corner is also *discoverable* now, which the patch never was: the
+cursor turns into the matching diagonal while the pointer is anywhere in
+the L, and the `resize_hint` border lights on the two edges meeting
+there.
+
+### Cursor shapes
+
+The pointer shows one of six shapes, and the **server** picks it
+(`crates/nitro-server/src/cursor.rs`):
+
+| where the pointer is | shape |
+|---|---|
+| anywhere else | the arrow (`left_ptr`) |
+| a left or right band | `size_hor` ↔ |
+| a top or bottom band | `size_ver` ↕ |
+| a top-left / bottom-right corner | `size_fdiag` ╲ |
+| a top-right / bottom-left corner | `size_bdiag` ╱ |
+| a drag in flight | the drag's own: `move` for a title drag, the grabbed edges' shape for a resize |
+
+Three properties, each of which was a review finding on #3713 or #3715
+before it was a rule here:
+
+* **The same hit test.** The shape comes off the *same* single
+  `frame_hit` per motion event that already answers the resize hint and
+  the button hover — not a fourth z-order walk.
+* **Cursor damage only.** A shape change damages the old shape's rect ∪
+  the new one's (they differ: the arrow's hotspot is its tip, every other
+  shape's is its middle) and touches no scene node, shapes no text and
+  rasterises no icon.
+  `hovering_a_band_changes_the_cursor_and_nothing_else` runs 30 motions
+  along a frame edge and pins `text_layouts` and `icon_renders` at **+0**.
+* **Only where a press would work.** A `FIXED_SIZE` window's edges keep
+  the arrow, for the same reason its border does not light up.
+
+A **drag in flight** keeps its own shape rather than re-deriving one from
+whatever is under the pointer, because during a drag the pointer is
+routinely nowhere near the frame it is moving.
+
+The arrow itself was redrawn. The old art ran a **four-pixel** tail out of
+the notch three columns too far right, which reads as a check mark — the
+box's *"the mouse pointer tail is weird (off angle). I'd prefer a regular
+mouse pointer"*. It is now the canonical `left_ptr`: tip at (0, 0), a
+vertical left edge, a diagonal right edge to the shoulder, and a **2-px
+tail at exactly 45°**, each row shifted one column from the row above
+(`the_tails_run_is_a_forty_five_degree_diagonal`). The shape was checked
+against X11's own `left_ptr` by decoding
+`/usr/share/icons/Adwaita/cursors/left_ptr`'s 24-px frame and comparing
+silhouettes; no file is vendored, the art is transcribed.
+
+**Cursors are not themed**, in either scheme, and that is the one
+deliberate exception to "every colour is a role". The pointer must stay
+legible over content the desktop does not control — a photo, a terminal,
+a client's own black window — and a dark-scheme cursor inverted to
+white-on-black would vanish against exactly the dark content the dark
+scheme exists for. Black outline, white fill, both schemes.
+
+**Scale.** The cursor is painted in *device* pixels, so at `scale = 2` a
+24-px arrow would be physically half-size. It is painted at
+`round(scale)`× instead — a 2× output gets a 48-device-pixel cursor —
+with **nearest-neighbour blocks** rather than `Canvas::blit`'s scaled
+path, which is bilinear and would resample the 1-px outline into a grey
+smear. `Cursor::rect_scaled` is what both the paint and the damage derive
+from, so they cannot disagree, and the factor is per **output**: the
+pointer can cross from a 2× screen to a 1× one.
+
+Clients still **cannot request a shape**: that is a `SetCursor` wire
+message, deferred to M5 with its argument in `docs/wire.md`.
 
 ### Which windows resize
 
@@ -228,9 +415,10 @@ which does honour visibility — kept working. The test of "on screen" is
 the window's **root** node, not the client's content group: a client that
 hides its own content still has a frame, and that frame still drags.
 
-Cursor *shapes* are M4: the arrow does not change over a resize band in
-M3. The border's `resize_hint` colour is what stands in for them until
-they land — see above.
+Cursor *shapes* are **done in #3724**: a resize band shows the double
+arrow for the edges it pulls, a title drag shows the move cross, and
+everything else shows the arrow. The border's `resize_hint` colour stays
+beside them rather than being replaced — see §Cursor shapes above.
 
 ## Interaction
 
@@ -545,10 +733,13 @@ files are installed.
 * **Workspaces / virtual desktops.** Not in M3 at all. The MRU list and
   the z-order are per *output*, and nothing in the model assumes there is
   only ever one set of them, so this is an addition rather than a rework.
-* **Cursor shapes.** The arrow stays an arrow over a resize band and a
-  title bar. M4, together with the cursor theme. The band is not invisible
-  in the meantime — the frame border lights up in `resize_hint` while the
-  pointer is in it — but a shape at the pointer is still the right answer.
+* **Cursor *themes*.** The six shapes are compiled-in ASCII art
+  (§Cursor shapes); loading an XCursor theme off the box — a file format,
+  a search path and a fallback policy — is not in M4. Nor is
+  `SetCursor`, the wire message that would let a *client* ask for a shape
+  (an I-beam over a text field, a hand over a link): it is deferred to M5
+  with its argument in `docs/wire.md`, because a useful one carries a
+  client-supplied bitmap and a hotspot as well as a named shape.
 * **Rotation.** Position, scale and the primary flag per connector are
   persistent since M4-C (`server.conf`, `docs/settings.md`); rotation is
   not, because nothing in the scene applies one yet.

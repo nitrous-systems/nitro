@@ -462,14 +462,56 @@ wants stacking order can ask for it when there is a reason to.
 
 `FocusWindow`, `CloseWindow` and `SetWindowStateFor` take a `WindowRef`.
 All three are **silently refused** when they cannot be honoured — a
-`NO_FOCUS` or minimized window cannot take focus, a `FIXED_SIZE` window
-cannot maximize, a stale ref names nothing — on exactly the terms a click
-or a `SetWindowState` from the owning client would be. There is no
+`NO_FOCUS` window cannot take focus, a `FIXED_SIZE` window cannot
+maximize, a stale ref names nothing — on exactly the terms a click or a
+`SetWindowState` from the owning client would be. There is no
 per-request error in this protocol, and a bar's window list must not be
 able to wedge the keyboard by clicking the wrong row.
 
+**`FocusWindow` restores a minimized window first** (#3724). It used to
+be refused for one, because the server's `focusable()` excludes
+`Minimized` — so clicking a minimized entry in the bar did nothing at
+all, silently, which is what the test box reported: *"if a window is
+minimized, clicking it in the bar should re-open it"*. The server now
+un-minimizes it through the **same** `set_state(Normal)` that `Alt+Tab`
+uses and then raises and focuses it. Two reasons it is the server's job
+and not the bar's: "restore then focus" is one act, so a bar sending two
+messages could have the second refused for the state the first had just
+changed; and every shell gets the behaviour rather than each one
+reimplementing it. The `NO_FOCUS` refusal is unchanged and is checked
+*before* the restore, so a bar cannot un-minimize a panel it could never
+focus.
+
 `CloseWindow` is a *request*: the owning client gets `Closed` and decides,
 so unsaved work survives a misclick in a task list.
+
+### What a click on a window-list entry does
+
+The rule a task list follows, and `nitro-bar` implements it in
+`upsert`'s `on_click`. It needs no new message: the bar knows each
+entry's focus and state from the `WindowInfo` it already subscribes to.
+
+| the entry's window | click | what the bar sends |
+|---|---|---|
+| unfocused, on screen | focus and raise it | `FocusWindow` |
+| minimized | restore, raise and focus it | `FocusWindow` (the server restores) |
+| focused, on screen | minimize it | `SetWindowStateFor { Minimized }` |
+| any | **middle** click: ask it to close | `CloseWindow` |
+
+The third row is the taskbar toggle every desktop has, and before #3724
+the bar had no equivalent: focusing an already-focused window is a no-op,
+so the row for the window you were looking at was a button that did
+nothing. It goes out as the `SetWindowStateFor` the bar could already
+send, so the wire is untouched.
+
+A **minimized** entry is rendered differently, because eight identical
+rows for eight windows say nothing about which of them are on screen: the
+label is bracketed (`[Calculator]`) *and* dimmed to `text_dim`. Both,
+not either — colour alone is an affordance a colour-blind user does not
+get, and a marker alone is easy to miss in a long row. What it is **not**
+is `set_enabled(false)`, the obvious way to grey a button: a disabled
+button ignores clicks, and clicking a minimized entry is precisely what
+has to work.
 
 The ops that act on the sender's **own** windows (`SetLayer`,
 `SetExclusiveZone`, `SetAnchor`, `GrabKeyboard`) take a `NodeId` instead and

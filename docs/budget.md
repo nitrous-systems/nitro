@@ -479,6 +479,38 @@ hover damages its old rectangle *and* its new one, where three fixed
 discs each damage only themselves: twice the pixels per hover, paid on
 the motion path, to save half a kilobyte of a 9.5 MB process.
 
+### The cursor's six shapes: 13 824 bytes, once (#3724)
+
+The software cursor used to be one 24 × 24 arrow converted to ARGB8888 at
+startup: 2 304 bytes, too small to appear on this page. #3724 made it six
+shapes — the arrow, four resize double-arrows and the move cross — so the
+figure is **6 × 24 × 24 × 4 = 13 824 bytes**, pinned by
+`every_shape_has_the_documented_size`.
+
+That is 11.5 kB of a 2.5 MB `RssAnon` line, or **0.5 %**, and it is a
+constant: one allocation per server, not per output, per window or per
+pointer. What it buys is the affordance the frame could not carry — a
+band that says what it does before you press it — and it buys it without
+touching the two things this page is strict about:
+
+* **No scene nodes.** The cursor is a blit after the paint list, not a
+  node in it, so 11 nodes per decorated frame is unchanged.
+* **No per-motion allocation.** The masks are converted once and
+  immutable; a shape change is two damage rects and a different index.
+
+The alternative was converting on demand and caching one shape, which
+would save 11.5 kB and put a 2 304-byte conversion on the *motion* path
+every time the pointer crossed a window edge. Half a frame of work to
+save half a page of memory is the trade this page exists to refuse.
+
+At `scale = 2` the **painted** cursor is 48 × 48 device pixels, but no
+more memory: the magnification is nearest-neighbour blocks drawn straight
+from the 24 × 24 art (`crates/nitro-server/src/cursor.rs`), not a second
+bitmap. The damage follows the painted size, so a 2× output damages
+2 304 device pixels per cursor rect against 576 at 1× — four times the
+pixels for four times the resolution, which is the same physical area.
+
+
 ### The 8 MB the shadow buffer costs, and what it buys
 
 Since #539 each output owns a heap-resident shadow buffer, and unlike the
