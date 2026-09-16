@@ -15,10 +15,10 @@ use nitro_scene::{Fill, NodeKey, NodeKind, Scene};
 /// return every leaf.
 ///
 /// The grid is **50 columns**, so 1 000 groups of 8 px span 400 x 160 and fit
-/// inside the 400 x 300 window `common::window` makes. That matters since a
-/// window's content group clips: a grid 100 columns wide spanned 800 px, half
-/// of it outside the window, and the culling test below then counted 5 000 of
-/// its 10 000 leaves rather than measuring culling at all.
+/// inside the 400 x 300 window `common::window` makes. That matters because a
+/// window's content group clips: a grid 100 columns wide would span 800 px,
+/// half of it outside the window, and the culling test below would count
+/// 5 000 of its 10 000 leaves rather than measuring culling at all.
 fn forest(s: &mut Scene, root: NodeKey, groups: usize, per_group: usize) -> Vec<NodeKey> {
     let mut leaves = Vec::with_capacity(groups * per_group);
     for g in 0..groups {

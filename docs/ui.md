@@ -303,10 +303,16 @@ whatever its client asks for (#3726): a window's content group clips, and
 that, and keeps its own clip anyway — a toolkit that relies on the
 compositor to contain it is one whose bugs are invisible until they are
 somebody else's, and the toolkit's clip is what makes an overflow show up
-in `nitro-ui`'s own tests rather than only on a desktop. The two agree by
-construction: both clip to the root's bounds, which the layout pass keeps
-equal to the window's content rectangle, so setting the flag is the no-op
-the server treats it as.
+in `nitro-ui`'s own tests rather than only on a desktop.
+
+The two are **redundant, not the same clip**, and the distinction is
+worth keeping straight: the compositor clips the window's *content
+group* (the `WINDOW` id a `CreateWindow` binds), while `Ui` clips the
+**root widget's** group, which `pass_tree` creates as a child of it. Two
+nodes one level apart, narrowing to the same rectangle — the layout pass
+places the root at the window's full size, as above. So the toolkit's
+`SetClip` is a real mutation on a group whose `clip` starts `false`, and
+not a flag the server has already set.
 `a_child_moved_past_the_window_paints_nothing_on_the_desktop` in
 `crates/nitro-ui/tests/ui.rs` is the pin, and it is a pixel census of the
 desktop strip beside the window: 0 changed pixels with the clip, 1998

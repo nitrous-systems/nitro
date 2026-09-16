@@ -3476,15 +3476,24 @@ fn a_client_may_not_switch_its_windows_clip_off() {
     h.quit();
 }
 
-/// Asking for the clip the window already has is accepted, so the
-/// toolkit's own `SetClip` is not a protocol error.
+/// Asking a window for the clip it already has is **accepted**, not
+/// refused: the refusal is about *clearing* the flag, not about the
+/// message.
 ///
-/// `nitro-ui` sets the flag on its root widget's group as of #3725, and
-/// that group *is* the window's content node. If the refusal above were
-/// about the message rather than about clearing the flag, every
-/// `nitro-ui` app would be disconnected on its first frame — which is
-/// exactly the regression this pins, and why the two directions are
-/// tested separately.
+/// A raw-wire client that names its own window node is the caller this
+/// protects — `examples/overflow_client` sends exactly this when its
+/// `--no-unclip` arm is absent — and "set it to what it is" has always
+/// been the no-op `set_clip`'s equality check makes it. Refusing it
+/// would turn a redundant-but-legal request into a dropped connection.
+///
+/// It is **not** `nitro-ui`'s path, and an earlier version of this
+/// comment claimed it was. The toolkit clips the *root widget's* group,
+/// which `pass_tree` creates under the window as a fresh `alloc_node`
+/// id; the window's content group is the `WINDOW` id itself. Two nodes
+/// one level apart, so the toolkit never asks the question this test
+/// asks — and the 243 `nitro-ui` tests passing against a real server
+/// with the refusal live is the evidence: if the toolkit did name the
+/// window node, every one of them would have died with `BadParent`.
 #[test]
 fn setting_the_clip_a_window_already_has_is_accepted() {
     let h = Harness::start("reclip", OUT.0, OUT.1);
@@ -3502,7 +3511,7 @@ fn setting_the_clip_a_window_already_has_is_accepted() {
     let _ = conn.poll(&mut inbox.0);
     assert!(
         !inbox.0.iter().any(|m| matches!(m, ServerMsg::Error(_))),
-        "the toolkit's own SetClip must not be an error: {:?}",
+        "a redundant SetClip{{true}} must not be an error: {:?}",
         inbox.0
     );
     let img = h.shot();

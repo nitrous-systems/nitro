@@ -983,13 +983,18 @@ impl Scene {
     /// clear it: `clip: false` on it is [`Error::RootNode`], the same
     /// answer [`destroy_node`](Scene::destroy_node) and
     /// [`reparent`](Scene::reparent) give for the other two things a
-    /// client may not do to a node the window owns. `clip: true` on it is
-    /// the no-op it already was, so a toolkit that sets the flag itself
-    /// (`nitro-ui` does, on its root widget's group) keeps working
-    /// unchanged. Refused rather than silently ignored because a client
-    /// asking for it has a layout that will now be cut off, and a
-    /// compositor that answers "done" to a request it did not honour
-    /// teaches the client the wrong thing.
+    /// client may not do to a node the window owns. `clip: true` on it
+    /// stays the no-op the equality check below always made it, so a
+    /// client that re-asserts the flag on its own window node is not
+    /// disconnected for a redundant request. Clearing it is refused
+    /// rather than silently ignored because a client asking for it has a
+    /// layout that will now be cut off, and a compositor that answers
+    /// "done" to a request it did not honour teaches the client the
+    /// wrong thing.
+    ///
+    /// A toolkit's own clip is a *different* node and is unaffected
+    /// either way: `nitro-ui` clips its root widget's group, which hangs
+    /// under the window's content group rather than being it.
     ///
     /// See [`create_window_with`](Scene::create_window_with) for why the
     /// window clips at all, and why its own bounds are the rectangle.

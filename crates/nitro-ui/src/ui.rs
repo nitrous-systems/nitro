@@ -1705,14 +1705,18 @@ impl<S: 'static> Ui<S> {
     /// window's rectangle either way. If that ever changes, this clip
     /// has to become a rectangle of its own rather than a flag.
     ///
-    /// The server **now** forbids a window painting outside its own
-    /// frame regardless of what its client asks for (#3726): the
-    /// window's content group — which is this very node — clips, and
-    /// `SetClip { clip: false }` on it is refused. This call is
-    /// therefore asking for a flag that is already set, which the
-    /// server answers as the no-op it is.
+    /// The server **now** clips a window's content too, regardless of
+    /// what its client asks for (#3726) — but **not this node**. The
+    /// compositor clips the window's *content group*, which is the
+    /// `WINDOW` id a `CreateWindow` binds; the root widget's group is a
+    /// child of it, created by [`Ui::pass_tree`] from `alloc_node`. So
+    /// this `SetClip` is a real mutation on a group whose `clip` starts
+    /// `false`, not a no-op, and the two clips are **redundant rather
+    /// than identical**: they narrow to the same rectangle, because the
+    /// layout pass places the root at the window's full size (above), but
+    /// they are two nodes one level apart.
     ///
-    /// It is kept rather than deleted, and not only for older servers: a
+    /// Kept rather than deleted, and not only for older servers: a
     /// toolkit that relies on the compositor to contain it is a toolkit
     /// whose bugs are invisible until they are somebody else's. The clip
     /// here is what makes an overflowing layout show up as cut-off in

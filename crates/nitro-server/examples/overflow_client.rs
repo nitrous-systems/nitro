@@ -133,7 +133,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     c.position.y,
                     c.size.w,
                     c.size.h,
-                    c.position.x + SIZE.w + 280.0,
+                    // From the size the server actually gave us, not the
+                    // size we asked for: a line that mixes the two would
+                    // quietly describe a different window if the server
+                    // ever configured us smaller.
+                    c.position.x + c.size.w + 280.0,
                     280.0,
                 ))?,
                 ServerMsg::PointerButton(b) => {

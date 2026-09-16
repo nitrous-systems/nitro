@@ -385,8 +385,10 @@ fn a_client_cannot_turn_its_windows_clip_off() {
     assert!(s.node(content).unwrap().clip(), "and it really is still on");
 
     // Asking for the clip it already has is the no-op it always was, so
-    // a toolkit that sets the flag on its own root — `nitro-ui` does —
-    // is not broken by this.
+    // a client that re-asserts the flag on its own window node is not
+    // refused for a redundant request. (A toolkit's own clip is a
+    // different node: `nitro-ui` clips its root widget's group, which
+    // hangs *under* this one.)
     s.set_clip(CLIENT, content, true).unwrap();
     assert!(s.node(content).unwrap().clip());
 

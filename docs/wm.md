@@ -67,8 +67,13 @@ reparent the node its window owns. So a client's nodes are bounded by its
 content rectangle: a widget laid out past the right edge is **cut off at
 the edge**, not painted on the desktop beside the frame, and one given a
 negative `y` does not paint over the title bar the server drew. Setting
-the clip it already has stays a no-op, so a toolkit that clips its own
-root (`nitro-ui` does) is unaffected.
+the clip it already has stays a no-op, so a client that re-asserts it on
+its own window node is not disconnected for a redundant request.
+
+A toolkit's own clip is a **different node** and is unaffected either
+way: `nitro-ui` clips its root widget's group, which hangs *under* the
+window's content group rather than being it, at the same rectangle. The
+two are redundant, not one — see `docs/ui.md`.
 
 The three things a compositor could get out of step here agree because
 they read the *same* `clip_rect` off the node: **paint** cuts off at it,
