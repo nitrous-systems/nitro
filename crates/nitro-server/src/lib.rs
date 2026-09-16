@@ -68,7 +68,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use nitro_core::{Damage, Point, Rect, Role, Size};
+use nitro_core::{Damage, Point, Rect, Size};
 use nitro_kms::{
     Backend, DrmBackend, DrmOptions, Error as KmsError, Event, FakeBackend, ModeRequest, Modeline,
     OutputId as KmsOutputId, OutputInfo, Rect as KmsRect,
@@ -3614,24 +3614,30 @@ impl Server {
         // The full three-step resolution — theme, then `<app_id>.desktop`
         // `Icon=`, then that name symbolic-or-theme — which is what makes
         // `nitro-calc` a calculator rather than a generic window.
+        //
+        // **Both branches take the title's role**, and that is the whole
+        // of the tint decision for this node. `AppIcon::role` ignores the
+        // argument for a theme PNG (a picture has no tint) and takes it
+        // for one of our coverage masks, so the one expression is correct
+        // for both — and a symbolic icon reached through the hop recedes
+        // with the title exactly as the fallback does.
+        //
+        // An earlier cut passed `Role::Text` here and only the fallback
+        // branch the title role, which left a hop-resolved icon at full
+        // strength on an *unfocused* frame until some later `style_only`
+        // corrected it. `reicon` runs on `SetAppId` and on every
+        // decoration at `reload`, neither of which is a focus change, so
+        // nothing was guaranteed to follow.
+        let tint = wm::title_role(self.focus == Some(win));
         let resolved = self
             .icons
             .lookup_app(&app_id)
-            .map(|icon| (icon.handle(), icon.role(Role::Text)))
+            .map(|icon| (icon.handle(), icon.role(tint)))
             .or_else(|| {
                 // Nothing anywhere: one of ours, tinted like the title.
-                // `Role::Text` is not used here — the fallback sits in
-                // the title bar and has to recede with it — so the tint
-                // is set by `style_only` on the next line rather than
-                // baked in.
                 self.icons
                     .lookup(wm::icon_names::FALLBACK_APP)
-                    .map(|handle| {
-                        (
-                            handle,
-                            wm::role_byte(wm::title_role(self.focus == Some(win))),
-                        )
-                    })
+                    .map(|handle| (handle, wm::role_byte(tint)))
             });
         if let Err(e) = wm::set_app_icon(&mut self.scene, &nodes, resolved) {
             warn!("setting a frame icon: {e}");
@@ -3678,12 +3684,21 @@ impl Server {
         self.restyle_fallback_icon(win, focused);
     }
 
-    /// Retint a frame's app icon **if** it is the symbolic fallback.
+    /// Retint a frame's app icon **if** it is one of our coverage masks.
     ///
     /// The discriminator is the node's own stored role byte rather than a
     /// flag beside it: `AS_COLOURED` means the tile is somebody else's
     /// artwork and has no tint to change, and anything else is one of our
-    /// coverage masks. One record, so nothing can disagree with it.
+    /// coverage masks — whether it got there as the `window` fallback or
+    /// through the `.desktop` hop, which are the same kind of thing and
+    /// must recede with the title alike. One record, so nothing can
+    /// disagree with it.
+    ///
+    /// [`Server::reicon`] already stores the right role, so on a freshly
+    /// resolved icon this is a no-op that returns at the `icon.role ==
+    /// want` line. What it exists for is the *later* focus change, where
+    /// the node is correct for the old focus and nothing else would
+    /// touch it.
     fn restyle_fallback_icon(&mut self, win: WindowKey, focused: bool) {
         let Some(nodes) = self.decorations.get(&win).copied() else {
             return;
@@ -4123,6 +4138,20 @@ impl Server {
             self.reflow_work_area();
         }
         if state == WindowState::Minimized {
+            // The pointer may be on one of this window's frame buttons —
+            // in fact it *is*, in the case that matters: clicking
+            // minimize hides the frame with its own disc still filled.
+            // `button_hover` is otherwise cleared only by a motion, so
+            // a restore before the pointer moves (`Alt+Tab`) would bring
+            // the window back lit under a pointer that is elsewhere.
+            //
+            // `forget_window` already does this for a window that was
+            // destroyed; this is the same rule for one that merely
+            // stopped being on screen.
+            if self.button_hover.is_some_and(|(w, _)| w == win) {
+                self.button_hover = None;
+                self.style_only(win, self.focus == Some(win));
+            }
             // Putting a window away makes it the *least* recently used, not
             // the most: leaving it at the front is what makes the first
             // `Alt+Tab` after a minimize land on the window that already

@@ -558,6 +558,19 @@ it. The scan is bounded at 4 096 entries and 64 KiB per file, because
 `$XDG_DATA_DIRS` is user-controlled and a directory with a million files
 in it must not make the server's start unbounded.
 
+**An indirected answer is memoised under the name that was asked for.**
+That is not free bookkeeping, it is what makes the "one hash lookup per
+row and no filesystem at all" promise true for the case this feature
+exists for. The theme's own cache keys on the name that *resolved*, which
+for an indirected icon is the `Icon=` target and never the `app_id` the
+caller asked about — so without the memo the requested name stays
+unknown and every repeat re-walks the theme directories and re-takes the
+hop. It is also what makes `app_icon_indirections` count **distinct
+names** rather than calls, which is what a reader needs it to mean: a bar
+redrawing its window list must not make the number climb. Both a
+`theme.icons` change and a `reload`'s re-scan drop it, since those are
+the two things that can change the answer.
+
 **Why the parser is not the launcher's.**
 `crates/nitro-launcher/src/desktop.rs` already reads these files, and
 this duplicates the thirty lines it needs. Three reasons, in order of

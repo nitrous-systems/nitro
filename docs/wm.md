@@ -131,6 +131,16 @@ full `restyle`, so crossing a button never shapes text. Both are pinned —
 `text_layouts` and `icon_renders` unmoved across a hover and across a
 30-step drag.
 
+Being motion-driven, the hover needs clearing wherever a *frame* leaves
+under a stationary pointer, and there are exactly two such places.
+A window that is **destroyed** clears it in `forget_window`, beside the
+resize hint. A window that is **minimized** clears it in `set_state`, and
+that one is not hypothetical: the minimize button is the only control
+that removes its own window from the screen while the pointer is still on
+it, so the frame would go away with its disc filled and an `Alt+Tab`
+restore — which moves no pointer — would bring it back lit under a
+pointer that is somewhere else.
+
 The insets are `(1, 28, 1, 1)`. `Window::size()` and every `Configure` are
 the **content's** size; `Window::frame_size()` adds the insets.
 `Configure.position` is the content's origin, so a client holding a

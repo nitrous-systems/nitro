@@ -360,7 +360,8 @@ descriptor per frame until it hit the process limit.
 
 **Placement and decoration.** A new window is **decorated** unless it
 passed `UNDECORATED`: the server wraps its group in a frame group it owns
-and draws a title bar, a border and two buttons into it. It is then
+and draws a title bar, a border, the application's icon and three buttons
+into it. It is then
 placed **centred-cascade** in the primary output's work area — the first
 window centred, each later one 28 px down and right, clamped inside the
 area and rounded to whole logical pixels. The client is told what it got
@@ -803,7 +804,7 @@ looking for.
 | `text_layouts`           | Layout passes since start: every shape and every measure. Monotonic, so a test can assert an interaction did **no** text work — a mean cannot, because real work keeps the mean plausible. |
 | `clients`                | Connected wire clients.                                                  |
 | `windows`                | Windows in the scene.                                                    |
-| `nodes`                  | Nodes in the scene, across every window — the server's own frame nodes included. A decorated window costs the server **six** of them (the frame group, the background, the title bar, the title text and two buttons; five on a `FIXED_SIZE` window, which has no maximize), pinned by `tests/wm.rs::a_frame_costs_six_scene_nodes_and_a_fixed_window_five`. Everything above that in the count is the client's own tree. |
+| `nodes`                  | Nodes in the scene, across every window — the server's own frame nodes included. A decorated window costs the server **eleven** of them (the frame group, the background, the title bar, the application icon, the title text, and three buttons of a hover disc plus a glyph each; **nine** on a `FIXED_SIZE` window, which has no maximize), pinned by `tests/wm.rs::a_frame_costs_eleven_scene_nodes_and_a_fixed_window_nine`. Everything above that in the count is the client's own tree. |
 | `outputs`                | Outputs currently connected.                                             |
 | `shadow_bytes`           | Heap held by the shadow buffers, summed over the outputs: one scanout-sized `XRGB8888` buffer each (8 294 400 bytes at 1080p), 0 under `NITRO_SHADOW=0`. It is the server's one allocation proportional to pixels rather than to work, and `docs/budget.md` argues for it explicitly rather than leaving it to be inferred from `outputs`. |
 | `decorated`              | Windows carrying a server-drawn frame. `windows - decorated` is how many opted out with `UNDECORATED`. |
@@ -936,8 +937,10 @@ limit of 1024 — but real.
   undecorated one with no frame at all; a title-bar drag moving the frame
   by exactly the drag delta while the damage stays proportional to the
   window; an edge drag resizing it and `Configure`-ing the client, and
-  the client's own `SetWindowLimits` clamping both ends of it; the close
-  and maximize buttons; `Super`-drag moving and resizing an *undecorated*
+  the client's own `SetWindowLimits` clamping both ends of it; the close,
+  maximize and minimize buttons, each firing only on a release inside
+  itself, and the hover disc that appears under the pointer and nowhere
+  else; `Super`-drag moving and resizing an *undecorated*
   window; `Alt+Tab` walking three windows in MRU order and holding its
   place across repeated Tabs; a minimized window gone from the screen and
   from the hit test but still reachable with `Alt+Tab`; `Super+Q`/`M`/

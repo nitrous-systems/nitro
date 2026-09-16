@@ -218,11 +218,30 @@ pub struct IconEngine {
     /// A `.desktop` search path fixed at construction, as `dirs` is for
     /// icons and for the same reason.
     desktop_dirs: Option<Vec<PathBuf>>,
-    /// How many names were answered by going through a `.desktop` file
-    /// rather than by the theme directly — the `app_icon_indirections`
-    /// stat, and the number that says whether the hop is earning its
-    /// index.
+    /// How many **distinct names** were answered by going through a
+    /// `.desktop` file rather than by the theme directly — the
+    /// `app_icon_indirections` stat, and the number that says whether
+    /// the hop is earning its index.
+    ///
+    /// Distinct rather than per call, which is what `indirected` below
+    /// makes true: a bar redrawing its window list must not make this
+    /// climb.
     app_indirections: u64,
+    /// `requested name -> what the hop answered`, so a name that needed
+    /// the indirection is resolved once and not re-walked.
+    ///
+    /// Without this, a name the theme lacks costs a full theme walk
+    /// **plus** the hop on *every* call: `lookup_theme` caches its
+    /// answer under the name it resolved, which for an indirected icon
+    /// is the `Icon=` *target*, not the `app_id` the caller asked about.
+    /// The requested name itself stayed unknown, so nothing was
+    /// memoised and the "one hash lookup per row and no filesystem at
+    /// all" promise did not hold for exactly the case this feature
+    /// exists for.
+    ///
+    /// Dropped by [`Self::set_theme`] and [`Self::rescan_desktop`],
+    /// which are the two things that can change the answer.
+    indirected: HashMap<String, AppIcon>,
     /// Application icon **names** a client has asked for, in the order
     /// they were first seen. The index into this is what the scene
     /// stores, exactly as [`nitro_icons::index_of`] is for the symbolic
@@ -350,6 +369,13 @@ impl IconEngine {
         self.app_paths.clear();
         self.app_cache.clear();
         self.app_bytes = 0;
+        // The hop's memo goes too: it holds handles whose *meaning* is a
+        // path this theme change just dropped, and an indirected name
+        // whose target the new theme lacks has to be refused at commit
+        // time so the client's fallback fires. Keeping it would be the
+        // "draw nothing and tell nobody" failure `lookup_theme`'s
+        // re-resolve comment argues against, one level up.
+        self.indirected.clear();
         debug!(
             "icon theme {theme:?}: chain [{}] over {} director{} in {:.1} ms",
             self.theme.chain().join(", "),
@@ -396,6 +422,11 @@ impl IconEngine {
             Some(dirs) => DesktopIndex::with_dirs(dirs.clone()),
             None => DesktopIndex::load(),
         };
+        // Every memoised hop was an answer from the *old* index, so it
+        // goes with it — otherwise a package whose `Icon=` changed, or
+        // one that was removed, would keep answering from a file that no
+        // longer says what it said.
+        self.indirected.clear();
         debug!(
             "desktop entries: {} indexed over {} director{} in {:.1} ms",
             self.desktop.len(),
@@ -491,15 +522,24 @@ impl IconEngine {
     /// node has not been laid out at yet, and it belongs on the paint
     /// path where it is paid once and cached.
     ///
-    /// A name resolved once keeps its index forever, including the
-    /// resolution's answer, so a launcher rebuilding its rows costs one
-    /// hash lookup per row and no filesystem at all.
+    /// A name resolved once keeps its answer, including the hop's: a
+    /// theme name keeps its index forever and an indirected one is
+    /// memoised under the name that was *asked for*, so a bar rebuilding
+    /// its window list costs one hash lookup per row and no filesystem
+    /// at all.
     pub fn lookup_app(&mut self, name: &str) -> Option<AppIcon> {
         if name.is_empty() {
             return None;
         }
         if let Some(index) = self.lookup_theme(name) {
             return Some(AppIcon::Theme(index));
+        }
+        // Answered before, through the hop. Kept under the *requested*
+        // name because that is the one the caller repeats and the one
+        // `lookup_theme` will never learn: it caches under whatever name
+        // actually resolved, which here is the `Icon=` target.
+        if let Some(hit) = self.indirected.get(name) {
+            return Some(*hit);
         }
         // Step 2, the one hop. Owned because resolving the target borrows
         // `self` mutably; the alternative — threading the index's
@@ -516,6 +556,7 @@ impl IconEngine {
             Some(symbolic) => AppIcon::Symbolic(symbolic),
             None => AppIcon::Theme(self.lookup_theme(&target)?),
         };
+        self.indirected.insert(name.to_owned(), resolved);
         self.app_indirections += 1;
         debug!("app icon {name:?} resolved to {target:?} through a .desktop entry");
         Some(resolved)
@@ -1641,6 +1682,54 @@ mod tests {
             0,
             "a symbolic answer decodes nothing"
         );
+    }
+
+    #[test]
+    fn an_indirected_name_is_resolved_once_and_the_stat_counts_names() {
+        // The claim `lookup_app`'s doc makes: "one hash lookup per row
+        // and no filesystem at all". It did not hold for the indirected
+        // case, and the reason is worth keeping: `lookup_theme` caches
+        // its answer under the name that *resolved*, which for an
+        // indirected icon is the `Icon=` target, never the `app_id` the
+        // caller asked about. So the requested name stayed unknown and
+        // every call re-walked the theme and re-took the hop.
+        //
+        // `app_icon_indirections` is the observable, and it is what the
+        // stat comment and `docs/icons.md` both promise: **distinct
+        // names answered through the hop**, not calls. A bar redrawing
+        // its window list on every clock tick must not make it climb.
+        let dir = fixture("indirect-memo");
+        let mut e = indirecting(&dir, &[("nitro-calc", "calculator")]);
+        let want = AppIcon::Symbolic(nitro_icons::index_of("calculator").unwrap());
+        for _ in 0..20 {
+            assert_eq!(e.lookup_app("nitro-calc"), Some(want));
+        }
+        let mut pairs = Vec::new();
+        e.write_pairs(&mut pairs);
+        let get = |key: &str| pairs.iter().find(|(k, _)| *k == key).map_or(0, |(_, v)| *v);
+        assert_eq!(
+            get("app_icon_indirections"),
+            1,
+            "twenty lookups of one name counted as more than one name"
+        );
+
+        // A name that resolves nowhere is still refused every time \u2014 it
+        // is not memoised, because there is nothing to memoise, and the
+        // `.desktop` index makes that lookup a hash miss rather than a
+        // filesystem walk.
+        for _ in 0..5 {
+            assert_eq!(e.lookup_app("no-such-app"), None);
+        }
+
+        // And the memo is dropped by the two things that can change the
+        // answer, or an uninstalled package would answer from a file
+        // that is gone.
+        e.set_theme("hicolor");
+        assert!(e.indirected.is_empty(), "a theme change kept the memo");
+        assert_eq!(e.lookup_app("nitro-calc"), Some(want));
+        assert!(!e.indirected.is_empty());
+        e.rescan_desktop();
+        assert!(e.indirected.is_empty(), "a rescan kept the memo");
     }
 
     #[test]

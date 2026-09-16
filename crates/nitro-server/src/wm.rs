@@ -11,8 +11,9 @@
 //!
 //! * **Decorations are server-side and opt-out.** A decorated window's
 //!   client group is wrapped in a *frame group* the server owns
-//!   ([`nitro_scene::Scene::frame_window`]), carrying a title bar, a border
-//!   and two buttons. A client that sets `UNDECORATED` gets no frame and
+//!   ([`nitro_scene::Scene::frame_window`]), carrying a title bar, a border,
+//!   the application's icon and three buttons. A client that sets
+//!   `UNDECORATED` gets no frame and
 //!   still gets server move/resize through the `Super` modifier.
 //! * **The server moves and resizes windows with zero client round-trips.**
 //!   A drag is one scene mutation per motion event plus one

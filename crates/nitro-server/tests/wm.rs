@@ -2517,3 +2517,205 @@ fn a_window_too_narrow_for_its_icon_drops_it_rather_than_overlapping() {
     drop(conn);
     h.quit();
 }
+
+/// A frame icon that came through the **`.desktop` hop** follows the
+/// focus, exactly as the `window` fallback does.
+///
+/// `a_focus_change_retints_the_frames_icons_with_no_raster` uses a
+/// window with no `app_id`, so it only ever exercises the fallback — and
+/// the fallback branch was the one that took the title's role. A
+/// hop-resolved symbolic icon (`nitro-calc` → `calculator`, the headline
+/// case) went in at `Role::Text` and stayed at full strength on an
+/// unfocused frame until some later restyle happened to correct it.
+///
+/// The discriminator is the **app icon's own box**, not the frame's:
+/// the title and the buttons recede whatever the icon does, so a crop
+/// that included them would change either way.
+#[test]
+fn an_icon_resolved_through_a_desktop_entry_recedes_with_the_title() {
+    let dir = std::env::temp_dir().join(format!("nitro-wm-hopfocus-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("applications dir");
+    std::fs::write(
+        dir.join("nitro-calc.desktop"),
+        "[Desktop Entry]\nType=Application\nName=Calculator\nIcon=calculator\n",
+    )
+    .expect("a desktop entry");
+    let mut h = Harness::start_with("hopfocus", OUT.0, OUT.1, |config| {
+        config.desktop_dirs = Some(vec![dir.clone()]);
+    });
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("hopfocus");
+    let a = make_window(&mut conn, &mut inbox, 1, "calc", WIN, RED, 0, 1);
+    conn.tx()
+        .set_app_id(a.root, "nitro-calc")
+        .commit(2)
+        .unwrap();
+    conn.flush().unwrap();
+    park(&mut h);
+    assert_eq!(
+        h.stat("app_icon_indirections"),
+        1,
+        "the icon did not come through the .desktop hop, so this test is \
+         measuring the fallback like the other one"
+    );
+
+    let f = a.frame(true);
+    let icon_box = Rect::new(
+        f.x + wm::BUTTON_GAP,
+        f.y + (wm::TITLE_H - wm::APP_ICON) / 2.0,
+        wm::APP_ICON,
+        wm::APP_ICON,
+    );
+    let img = h.shot();
+    let focused = crop(&img, icon_box);
+    // It is ink, and it is the *active* title colour: the bug put
+    // `Role::Text` here, which on the default scheme is a different
+    // colour from `title_text_active`.
+    let deepest = |px: &[u32], bg: u32| {
+        *px.iter()
+            .max_by_key(|p| distance(**p, bg))
+            .expect("the icon box is not empty")
+    };
+    let ink = deepest(&focused, to_rgb(bar(true)));
+    assert!(
+        blend_of(ink, to_rgb(bar(true)), to_rgb(role(Role::TitleTextActive))),
+        "the focused hop-resolved icon's deepest ink {ink:06x} is not \
+         title_text_active over title_bar_active"
+    );
+    assert!(
+        !blend_of(ink, to_rgb(bar(true)), to_rgb(role(Role::Text))),
+        "and it is not Role::Text, which is what the bug stored"
+    );
+
+    // A second window takes the focus: the icon has to recede with the
+    // title rather than stay at full strength.
+    let b = make_window(&mut conn, &mut inbox, 3, "b", WIN, GREEN, 0, 3);
+    park(&mut h);
+    let img = h.shot();
+    let unfocused = crop(&img, icon_box);
+    assert_ne!(
+        focused, unfocused,
+        "the hop-resolved icon did not recede with its title"
+    );
+    let ink = deepest(&unfocused, to_rgb(bar(false)));
+    assert!(
+        blend_of(
+            ink,
+            to_rgb(bar(false)),
+            to_rgb(role(Role::TitleTextInactive))
+        ),
+        "the unfocused icon's deepest ink {ink:06x} is not \
+         title_text_inactive over title_bar_inactive"
+    );
+
+    // And a focus change costs no raster: a tint is a role index the
+    // painter resolves per frame. Measured **after** `b` exists, because
+    // creating a window builds a frame with icons of its own — `b` has
+    // no `app_id`, so it adds the `window` fallback's mask, and counting
+    // that as the focus change's cost was this test's first mistake.
+    let renders = h.stat("icon_renders");
+    h.key(KEY_LEFTALT, true);
+    h.key(KEY_TAB, true);
+    h.key(KEY_TAB, false);
+    h.key(KEY_LEFTALT, false);
+    h.settle();
+    await_focus(&mut conn, &mut inbox, a.root, "Alt+Tab back to the calc");
+    park(&mut h);
+    let refocused = crop(&h.shot(), icon_box);
+    assert_eq!(
+        refocused, focused,
+        "the icon did not come back to its focused look"
+    );
+    assert_eq!(
+        h.stat("icon_renders"),
+        renders,
+        "a focus change re-rasterised the frame's app icon"
+    );
+    let _ = b;
+
+    drop(conn);
+    h.quit();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A window minimized **by its own button** comes back unlit.
+///
+/// The one control that removes its window from the screen while the
+/// pointer is still on it. `button_hover` is otherwise cleared only by a
+/// motion, so the frame goes away with its disc filled, the hover state
+/// still names `(win, Minimize)`, and an `Alt+Tab` restore before the
+/// pointer moves brings the window back lit.
+///
+/// The measurement has to be taken with the pointer **away from the
+/// frame**, and that is the whole difficulty: restoring puts the window
+/// back exactly where it was, so with the pointer where it was the
+/// button really is under it and a lit disc is *correct*. An earlier
+/// version of this test asserted at that moment and failed against
+/// correct behaviour. So: restore, move the pointer off, and only then
+/// compare against the resting look.
+#[test]
+fn a_window_minimized_by_its_own_button_comes_back_unlit() {
+    let mut h = Harness::start("hoverminimize", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("hoverminimize");
+    let keep = make_window(&mut conn, &mut inbox, 1, "keep", WIN, BLUE, 0, 1);
+    let mut away = make_window(&mut conn, &mut inbox, 3, "away", WIN, GREEN, 0, 2);
+    park(&mut h);
+    let rect = button_rect(&away, wm::Region::Minimize, false);
+    let at_rest = crop(&h.shot(), rect);
+
+    // Press and release on the button; the pointer does not move after.
+    h.point_at(rect.x + rect.w / 2.0, rect.y + rect.h / 2.0, OUT);
+    h.settle();
+    h.button(BTN_LEFT, ButtonState::Pressed);
+    h.settle();
+    h.button(BTN_LEFT, ButtonState::Released);
+    h.settle();
+    assert_eq!(h.stat("minimized"), 1, "the button minimized it");
+
+    // Back with the keyboard, so nothing clears the hover on the way.
+    h.key(KEY_LEFTALT, true);
+    h.key(KEY_TAB, true);
+    h.key(KEY_TAB, false);
+    h.key(KEY_LEFTALT, false);
+    h.settle();
+    await_focus(&mut conn, &mut inbox, away.root, "Alt+Tab reached it");
+    refresh(&mut conn, &mut inbox, &mut away);
+    h.settle();
+
+    // Now move the pointer off the frame and look: with nothing pointing
+    // at it, the button must be exactly as it was before any of this.
+    // **Before** the pointer moves, which is the only moment that
+    // discriminates. `park` moves it, and a motion clears the hover
+    // whether or not the state change did -- so a post-park comparison
+    // passes either way, which is what the first version of this test
+    // did and why it proved nothing.
+    //
+    // The pointer is still over the button, so its 24 px cursor is in
+    // the crop in both arms; what separates them is the disc underneath.
+    // Measured: 176 px differ from the resting look with the hover
+    // latched, 28 with it cleared -- the 28 being the cursor alone.
+    let rect = button_rect(&away, wm::Region::Minimize, false);
+    let moved = crop(&h.shot(), rect)
+        .iter()
+        .zip(&at_rest)
+        .filter(|(x, y)| x != y)
+        .count();
+    assert!(
+        moved < 60,
+        "{moved} px of the minimize button differ from its resting look \
+         with the pointer still on it: the hover survived the window \
+         leaving the screen, so a restore brings it back lit"
+    );
+
+    // And once the pointer really does leave, nothing is lit at all.
+    park(&mut h);
+    let after = crop(&h.shot(), button_rect(&away, wm::Region::Minimize, false));
+    let moved = after.iter().zip(&at_rest).filter(|(x, y)| x != y).count();
+    assert_eq!(moved, 0, "{moved} px still differ with the pointer away");
+    let _ = keep;
+
+    drop(conn);
+    h.quit();
+}
