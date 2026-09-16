@@ -128,9 +128,10 @@ order to write a line that works:
 The same list without waiting for a mistake: **`modes` on the control
 socket** (`crates/nitro-server/README.md`), which marks the preferred mode
 `*` and the one in use `=`. `nitro-settings` shows the short version on
-each display row — `1920×1080 @ 60 Hz (also 120, 85, 50, 24)` — and
-deliberately offers no mode *picker*: a control that blanks the screen and
-can leave a panel dark is not something to put behind a combo box.
+each display row — the mode in force on the first line and
+`also 120 · 85 · 50 · 24 Hz` on the second — and deliberately offers no
+mode *picker*: a control that blanks the screen and can leave a panel
+dark is not something to put behind a combo box.
 
 **`outputs` reports the truth, not the request.** A `mode` line that did
 not take shows as the mode that did, which is the only way to tell a
@@ -318,8 +319,8 @@ period. Note the reported **239 840** rather than 240 000 — CVT rounds the
 clock down to its 0.25 MHz step, so the timings really are 239.84 Hz and
 the server reports what the timings produce rather than what was asked
 for. The desktop laid out at 720p without squashing anything (bar
-1280×32, launcher 600×400, settings 560×440 with its buttons row inside
-the window).
+1280×32, launcher 600×400, settings 560×440 — the size it was then; it is
+560×500 since #3725 — with its buttons row inside the window).
 
 **And the panel syncs.** That is a separate question from whether the link
 carries it, and the only instrument for it is a person looking at the
@@ -550,35 +551,75 @@ ticks**.
 $ nitro-settings
 ```
 
-Four sections in one decorated window: **Displays** (one row per output
-— name, mode, a scale slider, a `primary` checkbox, and x/y position
-fields), **Keyboard** (layout, variant, options, and a field to type in
+Four sections in one decorated window: **Displays** (two lines per output
+— name, mode, a scale slider and a `primary` checkbox on the first;
+position and the connector's other refresh rates on the second),
+**Keyboard** (layout, variant, options, and a field to type in
 afterwards), **Audio** (volume and mute) and **Appearance** (the dark
 scheme). **Apply** writes the file; **Revert** re-reads it.
 
-### The window is 560×440, and both numbers are measured
+### A display row is two lines, because one overflowed the window
 
-The widest thing in it is a display row — 76 px of connector name, 136 of
-mode string, a slider at its 64 px minimum, 30 for the scale value, 79
-for the `primary` checkbox, two 54 px position fields and six 6 px gaps,
-≈ 529 — so the inner width is 540.
+```text
+HDMI-A-1  1920×1080 @ 119.98 Hz   [──●──] 1   ☐ primary
+   position [0   ] [0   ]   also 120 · 85 · 60 · 50 · 24 Hz
+```
+
+It was one line until #3725, and the way that failed is worth keeping
+because it is the layout model working exactly as documented. The row
+held seven widgets and was already full at ≈ 529 px of a 540-px inner
+width. #3718 then appended the connector's alternative rates to the mode
+label — `1920×1080 @ 119.98 Hz (also 60, 84.904, 59.94, 50, 24, 23.976)`,
+62 characters, ~300 px where the mode alone was 136 — and since #561 a
+`Label` cannot be laid out below its own text. So the row did not narrow.
+It **grew**, to ~700 px, and the slider, the scale value, the checkbox
+and both position fields were painted outside the frame, on the desktop.
+(The toolkit now also clips a window's content to the window, so the
+worst case is cut off rather than spilled: `docs/ui.md`.)
+
+Line 1 is what the monitor *is* and the two controls you reach for; line
+2, indented under the connector, is where it sits and what else it could
+run. Both dim labels **elide** (`docs/ui.md`), so a television with a
+dozen rates shortens its line rather than pushing the row out, and the
+important prefix — the resolution — is what survives. A connector that
+offers nothing else at its current size has no rates label at all rather
+than an empty one.
+
+The rates are the one question a display row can answer and the file
+cannot: `output.<c>.mode = 1920x1080@120` is only worth typing if 120 is
+on the list. They are read-only, and deliberately not a picker — see
+*`output.<connector>.mode`* above for why this app offers no mode
+selector. They are printed as a person reads them: at most two decimals
+and no trailing zeros, so the kernel's `84.904` is `84.9` and `59.940` is
+`59.94`. The matching that excludes the rate already in force happens on
+the *server's* spelling, before that, or the line would offer the rate it
+is running as something else to try.
+
+### The window is 560×500, and both numbers are measured
+
+The widest thing in it is a display row's **first** line — 76 px of
+connector name, 136 of mode string, a slider at its 64 px minimum, 30 for
+the scale value, 79 for the `primary` checkbox and four 6 px gaps — so
+the inner width is 540, unchanged across the two-line split.
 
 The height is not reasoned about, it is measured: the built tree at that
-width, with the height unbounded, comes to **391.2 px for one output and
-exactly `ROW_HEIGHT + GAP` = 32 px more per output after it**.
+width, with the height unbounded. A display row is now
+`2 × ROW_HEIGHT + GAP` = 58 px of content, so each output after the first
+costs **64 px** rather than the 32 it cost as one line.
 
-| outputs | the tree needs | fits in 440 |
+| outputs | the tree needs | fits in 500 |
 |---|---|---|
-| 1 | 391.2 | yes, 49 px spare |
-| 2 | 423.2 | yes, 17 px spare |
-| 3 | 455.2 | **no** — 15 px short |
+| 1 | 423.2 | yes, 77 px spare |
+| 2 | 487.2 | yes, 13 px spare |
+| 3 | 551.2 | **no** — 51 px short |
 
-440 is the smallest round number that holds the two-monitor case, which
-is what a laptop-plus-external-screen desktop is. The first draft of this
-fix said 400 and claimed two outputs fit — 400 is the *one*-output figure
-rounded up, and the claim was false by 23 px. That is why the table is
-here and why a test asserts the two-output case rather than prose
-claiming it.
+440 → **500**, and the second line is the whole of the difference: 440
+held two one-line rows with 17 px spare and holds two two-line rows 47 px
+short. 500 is the smallest round number that holds the two-monitor case,
+which is what a laptop-plus-external-screen desktop is. The table is here
+rather than in prose because the first draft of the *previous* fix said
+400, claimed two outputs fit, and was wrong by 23 px — so a test asserts
+the two-output case instead of prose claiming it.
 
 This is written down because getting it wrong is not a cosmetic bug. The
 window was 440×320 while its tree measured ~400 px tall, and a flex
@@ -612,15 +653,24 @@ doing:
   width (the toolkit gives it the `Zero` floor, and this app gives it a
   `min_width`), and the `x`/`y` position fields spell `shrink(0.0)`
   because a text field opts out too and a box too narrow for "1920" is
-  not a smaller version of itself.
-- The dialog declares 560×440 as the window's **minimum** via
+  not a smaller version of itself, and the two dim labels in a display
+  row `.elide(true)` — which is the same statement one step further on:
+  a label *does* have a smaller honest version if it is allowed to say
+  so with an ellipsis, and its floor is then `…` plus three characters
+  rather than zero.
+- The dialog declares 560×500 as the window's **minimum** via
   `SetWindowLimits`, so the server refuses a drag that would put the tree
   back into less space than it needs. There is no maximum.
 
-`no_widget_is_laid_out_smaller_than_it_measures` and
+`no_widget_is_laid_out_smaller_than_it_measures`,
+`nothing_overhangs_with_two_outputs_or_with_a_long_mode_string` and
 `two_outputs_fit_the_window_and_a_third_clips_rather_than_overlaps` in
 `crates/nitro-settings/tests/settings.rs` pin all of it, reading the same
-bounds `hey nitro-settings list` prints.
+bounds `hey nitro-settings list` prints. The middle one is #3725's: it
+checks every widget's bounds against the window with two outputs, with a
+sixty-character mode string, and with one long enough that nothing else
+in the row can absorb it — because the bug it exists for was about a
+*string*, and every bounds check in that file passed throughout it.
 
 **It does not grow for a third monitor.** A client cannot ask the server
 to resize it — `Ui::resize` only re-lays the client's own tree out inside

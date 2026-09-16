@@ -530,6 +530,15 @@ fn every_section_is_hey_addressable() {
         (&format!("displays/{CONNECTOR}"), "container"),
         (&format!("displays/{CONNECTOR}/name"), "label"),
         (&format!("displays/{CONNECTOR}/mode"), "label"),
+        // #3725: the row is a column of two lines, so the canonical path
+        // `list` prints is `displays/<c>/top/scale`. Every short path
+        // above still resolves — a segment naming no direct child is
+        // looked for by name in the subtree — which is the property that
+        // let the row change shape without breaking a documented
+        // command. These two are the second line's own names.
+        (&format!("displays/{CONNECTOR}/position"), "label"),
+        (&format!("displays/{CONNECTOR}/top"), "container"),
+        (&format!("displays/{CONNECTOR}/bottom"), "container"),
         (&format!("displays/{CONNECTOR}/scale"), "slider"),
         (&format!("displays/{CONNECTOR}/scale_value"), "label"),
         (&format!("displays/{CONNECTOR}/primary"), "checkbox"),
@@ -1226,6 +1235,172 @@ fn nothing_in_the_tree_overhangs_the_window() {
         size.h - nitro_settings::PAD,
     );
 
+    h.quit();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A layout harness whose dialog believes its connector offers several
+/// refresh rates at its current size.
+///
+/// The harness's fake output offers exactly **one** mode, so a row built
+/// against its control socket never gets a second-line rates label at
+/// all. `Settings::with_modes` injects a table instead, which is how the
+/// label that #3718's string used to live in gets tested at all.
+fn rates_harness(dir: &Path, modes: &[&str]) -> Harness<Settings> {
+    let path = dir.join(conf::FILE_NAME);
+    let mut h = Harness::shell(
+        "nitro-settings",
+        Settings::new()
+            .with_config_path(path)
+            .with_audio_dirs(Vec::new())
+            .with_modes(
+                modes
+                    .iter()
+                    .map(|m| (CONNECTOR.to_owned(), (*m).to_owned()))
+                    .collect(),
+            ),
+        nitro_settings::ORDINARY_WINDOW,
+        Some(nitro_settings::WINDOW_SIZE),
+        build,
+    );
+    h.wait_for("the display rows", |h| !h.state().connectors().is_empty());
+    h.settle();
+    h
+}
+
+#[test]
+fn the_second_line_lists_the_other_rates_and_elides_a_long_list() {
+    // The label #3718's string used to live in, in its own place: the
+    // second line of the display row, dim, read-only, and eliding.
+    //
+    // The harness's output is `Virtual-1` at 320×240@60, so the injected
+    // table is at that size — the shape of the box's connector's list
+    // rather than its numbers, which is what this is about. 60 is in the
+    // table and must *not* be listed: the rate in force is not an
+    // alternative to itself.
+    let dir = scratch("row-rates");
+    let mut h = rates_harness(
+        &dir,
+        &[
+            "320x240@120",
+            "320x240@85",
+            "320x240@60",
+            "320x240@50",
+            "320x240@24",
+            "640x480@30",
+        ],
+    );
+    let rates = named(&mut h, &format!("displays/{CONNECTOR}/modes"));
+    assert_eq!(
+        h.widget::<Label>(rates).text(),
+        "also 120 · 85 · 50 · 24 Hz",
+        "the other rates at this size, in the server's order, with the \
+         one in force left out and a different size not counted"
+    );
+    assert!(
+        !h.widget::<Label>(rates).is_elided(),
+        "a five-rate list fits: {:?}",
+        h.widget::<Label>(rates).painted_text(),
+    );
+    // It is on the second line, under the connector rather than beside
+    // it, and inside the window.
+    let bottom = named(&mut h, &format!("displays/{CONNECTOR}/bottom"));
+    let top = named(&mut h, &format!("displays/{CONNECTOR}/top"));
+    let (b, t, r) = (
+        h.ui().window_bounds(bottom),
+        h.ui().window_bounds(top),
+        h.ui().window_bounds(rates),
+    );
+    assert!(
+        b.y >= t.bottom() - 0.01,
+        "the second line is below the first"
+    );
+    assert!(
+        r.y >= b.y - 0.01 && r.bottom() <= b.bottom() + 0.01,
+        "the rates label is on the second line: {r:?} in {b:?}"
+    );
+    assert!(
+        r.right() <= h.ui().window_size().w + 0.01,
+        "and inside the window: {r:?}"
+    );
+    h.quit();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // A television's list: fourteen rates, far more than the line can
+    // hold. It elides rather than pushing the row out — which is the
+    // whole of #3725's fix for the shape #3718 produced.
+    let dir = scratch("row-rates-many");
+    let mut h = rates_harness(
+        &dir,
+        &[
+            "320x240@240",
+            "320x240@200",
+            "320x240@144",
+            "320x240@120",
+            "320x240@100",
+            "320x240@85",
+            "320x240@84.904",
+            "320x240@75",
+            "320x240@72",
+            "320x240@59.94",
+            "320x240@50",
+            "320x240@30",
+            "320x240@24",
+            "320x240@23.976",
+        ],
+    );
+    check_nothing_overhangs(&mut h, "a fourteen-rate connector");
+    let rates = named(&mut h, &format!("displays/{CONNECTOR}/modes"));
+    assert!(
+        h.widget::<Label>(rates).is_elided()
+            && h.widget::<Label>(rates).painted_text().ends_with('…'),
+        "a fourteen-rate list elides: {:?}",
+        h.widget::<Label>(rates).painted_text(),
+    );
+    assert!(
+        h.widget::<Label>(rates)
+            .painted_text()
+            .starts_with("also 240"),
+        "and keeps the front of the list: {:?}",
+        h.widget::<Label>(rates).painted_text(),
+    );
+    // Two decimals at most, no trailing zeros: the kernel's `84.904` and
+    // `23.976` read as `84.9` and `23.98`.
+    let whole = h.widget::<Label>(rates).text().to_owned();
+    assert!(
+        whole.contains("84.9 ") && whole.contains("23.98 Hz") && !whole.contains("84.904"),
+        "rates are printed as a person reads them: {whole:?}"
+    );
+    h.quit();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_connector_with_one_mode_gets_no_second_line_rates_label() {
+    // A row says only what it has to say. The harness's fake output
+    // offers one mode, so this is the default case rather than a
+    // contrived one: no `modes` label in the tree, and `hey` says so.
+    let dir = scratch("row-rates-none");
+    let mut h = layout_harness(&dir);
+    assert!(
+        nitro_ui::introspect::resolve(h.ui(), &format!("window/displays/{CONNECTOR}/modes"))
+            .is_none(),
+        "a connector with nothing else to offer has no rates label: {:?}",
+        tree(&mut h)
+            .into_iter()
+            .map(|(p, _)| p)
+            .filter(|p| p.contains("displays"))
+            .collect::<Vec<_>>(),
+    );
+    // And the row is still exactly two lines tall, so the absent label
+    // costs nothing vertically either.
+    let row = named(&mut h, &format!("displays/{CONNECTOR}"));
+    let want = 2.0 * nitro_settings::ROW_HEIGHT + nitro_settings::GAP;
+    assert!(
+        (h.ui().window_bounds(row).h - want).abs() < 0.01,
+        "the row is {} tall, not {want}",
+        h.ui().window_bounds(row).h,
+    );
     h.quit();
     let _ = std::fs::remove_dir_all(&dir);
 }

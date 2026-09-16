@@ -277,13 +277,42 @@ The consequence worth stating: **a moved widget costs one mutation and no
 repaint of its content**, because the move is a `SetBounds` on the group
 and the content hangs underneath it.
 
+### A window's content is clipped to the window
+
+`Ui` sets `SetClip` on the **root** widget's group, once, and the scene
+clips every descendant to it. The rectangle it clips to is the root's own
+bounds, which the layout pass keeps equal to the window's content area on
+every `Configure`, so a resize needs no second message and the clip
+cannot go stale.
+
+So **overflow is a layout bug you *see* as cut-off, never as spill.** A
+row wider than its window ends at the window's edge; it does not paint
+its last widgets onto the desktop beside the frame. That is worth
+stating as a rule because the toolkit shipped without it and a real app
+found out: `nitro-settings`' display row grew to ~700 px in a 560-px
+window (#3718 added a long string to a row that was already full, and
+the content floor below means a `Label` will not shrink below its text),
+and the slider, the checkbox and both position fields were painted on the
+wallpaper. `SetClip` is opt-in on the wire — it has to be, a `Scroll`
+needs it and a shadow must not have it — and nothing was setting it on a
+window's root.
+
+The compositor will eventually forbid a window painting outside its own
+frame whatever its client asks for. The toolkit does not wait for that:
+a toolkit that relies on the compositor to contain it is one whose bugs
+are invisible until they are somebody else's.
+`a_child_moved_past_the_window_paints_nothing_on_the_desktop` in
+`crates/nitro-ui/tests/ui.rs` is the pin, and it is a pixel census of the
+desktop strip beside the window: 0 changed pixels with the clip, 1998
+without it.
+
 ## The widget set
 
 | widget | role | value | actions | notes |
 |---|---|---|---|---|
 | `Flex` (`column()`, `row()`) | `container` | — | — | draws nothing; everything is its `LayoutStyle` |
 | `Panel` | `container` | — | — | background, radius, border, each `None` = the theme's |
-| `Label` | `label` | its text | `set_value` | remembers the width it was measured at |
+| `Label` | `label` | its text | `set_value` | remembers the width it was measured at; `.elide(true)` shortens with `…` instead of overflowing |
 | `Button` | `button` | — | `click`, `activate`, `focus`, `alt_click` | hover/pressed/focused faces; `alt_click` is the middle button |
 | `TextField` | `textfield` | its contents | `set_value`, `submit`, `clear`, `focus` | caret, selection, click-to-place, h-scroll |
 | `Checkbox` | `checkbox` | `true`/`false` | `toggle`, `set_value`, `focus` | Space toggles |
@@ -648,6 +677,35 @@ a claim; give it a `min_width` for the narrowest still-draggable track).
 `flex_shrink` keeps its meaning and now only divides an overflow between
 the children that may take it; `.shrink(0.0)` still means "never shrink
 at all".
+
+### A third answer: a floor the widget computes
+
+Two of the three widgets in a crowded row are covered by the rules above
+— the ones with no smaller honest version (the default floor) and the
+viewports (`shrink_to_zero`). An **eliding label** is neither. It *is*
+honestly smaller than its text: it drops characters and says so with an
+ellipsis. But it is not honestly *arbitrarily* small — below `…` plus a
+few characters it has stopped communicating anything, and `HDM…` versus
+`VGA…` is the question a truncated label has to be able to answer.
+
+So a widget may report a floor of its own from `measure`, with
+`cx.report_floor(size)`. The solver reads it as `FlexItem::floor` and it
+only ever *raises* a `Zero` floor; a `max_*` still caps it and a `min_*`
+still beats it. It is for the floor an author cannot write down as a
+`min_width`, because only the widget can compute it: `Label`'s depends on
+the server's fonts and on the string.
+
+`.elide(true)` is the whole of it from the outside. An eliding label
+takes the `Zero` floor automatically, reports `…` plus its first three
+characters as its floor, and never wraps (the two policies contradict
+each other — a wrapped label gets *taller* when given less width, which
+is the opposite of what a row needs). The search is the server's own
+title elision (`Text::elide`, `docs/wm.md`) run client-side: a binary
+search over char boundaries for the longest prefix that fits, `log(len)`
+measurements rather than one per prefix, memoized on the width it ran at
+so a relayout at an unchanged width costs nothing. `Label::text()` is
+still the whole string — that is what `hey get` and an accessibility
+client read — and `Label::painted_text()` is what is on screen.
 
 The floor applies to whichever axis is the **parent's** main axis, and
 `shrink_floor` is one field rather than one per axis. So a widget that

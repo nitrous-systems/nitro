@@ -636,6 +636,23 @@ impl Settings {
         self
     }
 
+    /// Use this mode table instead of asking the control socket for one.
+    ///
+    /// `(connector, mode)` pairs in the spelling the server's `modes`
+    /// command uses, e.g. `("HDMI-A-1", "1920x1080@120")`.
+    ///
+    /// Injected for the same reason the config path and the audio search
+    /// path are — a test must not reach for `std::env::set_var` — and for
+    /// one more: the harness's fake output offers exactly **one** mode,
+    /// so a row built against its server never gets a second-line rates
+    /// label, and the label would have no test at all. A non-empty list
+    /// here is taken as given and the socket is not asked.
+    #[must_use]
+    pub fn with_modes(mut self, modes: Vec<(String, String)>) -> Self {
+        self.modes = modes;
+        self
+    }
+
     /// Which audio backend was found, if any.
     #[must_use]
     pub fn audio(&self) -> Option<&Backend> {
@@ -1073,11 +1090,17 @@ fn init(s: &mut Settings, ui: &mut Ui<Settings>, ids: Ids) {
     if s.control.is_none() {
         s.control = Some(ui.control_path());
     }
-    // The monitor's own capability list, for the read-only "(also 120,
-    // 85, …)" on each display row. A server that is not running, or one
-    // too old to know `modes`, leaves this empty and the row says only
-    // the mode in force — which is what it said before this existed.
-    if let Some(path) = s.control.as_deref() {
+    // The monitor's own capability list, for the read-only
+    // `also 120 · 85 · … Hz` on each display row's second line. A server
+    // that is not running, or one too old to know `modes`, leaves this
+    // empty and the row says only the mode in force — and carries no
+    // second-line rates label at all, which is what it did before this
+    // existed. A list injected by a test wins: the harness's fake output
+    // offers one mode, so asking its server would make the label
+    // untestable.
+    if s.modes.is_empty()
+        && let Some(path) = s.control.as_deref()
+    {
         s.modes = control::modes_at(path).unwrap_or_default();
     }
     s.audio = Backend::detect_in(&s.audio_dirs);

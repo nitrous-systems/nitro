@@ -184,6 +184,15 @@ why the captions in front of the fields are deliberately **unnamed**: a
 label called `layout` beside the field called `layout` would make
 `keyboard/layout` ambiguous and break every command above.
 
+That rule is also what kept these commands working when a display row
+became **two lines** in #3725 (`docs/settings.md`). The row is now a
+column of a `top` and a `bottom` line, so the canonical path `list`
+prints is `displays/HDMI-A-1/top/scale`; `displays/HDMI-A-1/scale` still
+resolves, because the segment names no direct child and is unique in the
+subtree. The second line adds `mode`'s companion `modes` (the
+connector's other refresh rates, read-only, absent on a connector that
+offers none) and `position` for the caption in front of `x` and `y`.
+
 ## Why there is a second copy of the config parser
 
 `src/conf.rs` renders and parses the same format as
