@@ -135,6 +135,31 @@ A window with no output is *unplaced*: it is not painted, cannot be hit, and
 produces no damage. Placement is a server decision, so `place_window` takes no
 `ClientId`.
 
+### A window's content is always clipped to the window
+
+The **content group** — the node `create_window` mints, which stays the
+client's own node when `frame_window` inserts a root above it — is created with
+`clip` set, and `set_clip` refuses to clear it (`Error::RootNode`, the answer
+`destroy_node` and `reparent` already give for a node its window owns). Asking
+for the clip it already has stays a no-op, so a toolkit that clips its own root
+is unaffected.
+
+So a client's nodes are bounded by its content rectangle whatever it sends:
+overflow is **cut off at the window's edge** rather than painted on the desktop
+beside the frame, and a negative offset does not reach the server-drawn title
+bar. Paint, `hit_test` and damage all narrow by the same cached `clip_rect`, so
+the three agree by construction — a pixel a client could not paint is one it
+cannot be clicked on and cannot repaint.
+
+The rectangle is the node's **own bounds**, which is what keeps it from going
+stale: a clip stored beside the window would need rewriting on every resize and
+inset change, and the path that forgot would clip to yesterday's window. Those
+bounds are already the content rectangle — `set_window_size`,
+`set_window_inset` and a client's own `set_bounds` on its top-level group all
+maintain that — so an undecorated or fullscreen window (zero insets) clips to
+its full bounds with nothing to keep in step. Cost: one `bool` already in the
+node.
+
 ## Dirty flags and damage
 
 ### Marking
@@ -252,7 +277,8 @@ Images never qualify: the scene cannot see their alpha.
 **`hit_test(output, point)`** returns the topmost window, deepest node, and the
 point in that node's local coordinates (via `Transform::invert`, so rotation and
 scale are handled exactly). Windows are tried front to back, children front to
-back. Clip groups reject points outside their clip, invisible and fully
+back. Clip groups reject points outside their clip — including a window's own
+content group, which always clips — invisible and fully
 transparent subtrees are skipped, and a node only counts as hit if it actually
 paints something — so an empty group never swallows a click, and a rotated rect
 is not hit in the corners of its bounding box.
@@ -307,11 +333,12 @@ leaves its buffer alone.
 
 ## Testing
 
-108 tests, all pure and fast (no I/O, no sleeps, no globals):
+130 tests, all pure and fast (no I/O, no sleeps, no globals):
 
 - `tests/tree.rs` — shape, and every error path.
 - `tests/damage.rs` — damage exactness, clips, outputs, scale, configures.
 - `tests/traverse.rs` — paint order, culling, hit testing.
+- `tests/frames.rs` — frame groups, window state, and the window's own clip.
 - `tests/buffers.rs` — buffer ownership and damage propagation.
 - `tests/stress.rs` — 10 000+ nodes; asserts `visited_nodes` stays proportional.
 

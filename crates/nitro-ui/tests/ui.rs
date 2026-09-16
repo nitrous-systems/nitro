@@ -1571,6 +1571,13 @@ fn a_child_moved_past_the_window_paints_nothing_on_the_desktop() {
     // on the wire and the toolkit never set it on its own root, so a
     // window's content was contained by nothing at all.
     //
+    // Since #3726 the *server* clips a window's content too, so this
+    // test would now pass with the toolkit's own `pass_clip` removed.
+    // It is still the toolkit's pin: it runs against a real server, so
+    // it holds whichever of the two clips is doing the work, and it is
+    // what keeps an overflow visible as cut-off in `nitro-ui`'s tests
+    // rather than only on somebody's desktop.
+    //
     // The pin is a pixel census of the desktop strip immediately right
     // of the window, taken **before and after** the child moves out
     // there: moving a white 60×40 panel from inside the window to

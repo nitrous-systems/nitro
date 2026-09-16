@@ -3246,3 +3246,269 @@ fn a_client_that_paints_nothing_does_not_show_the_bars_overhang() {
     drop(conn);
     h.quit();
 }
+
+// ---------------------------------------------------------------------
+// #3726: a window's content never paints outside its window
+// ---------------------------------------------------------------------
+
+/// A window with two deliberately overflowing children, for the tests
+/// below: green content, and blue rects that run past the right edge and
+/// above the top. Returns the window and the node ids of the two spills.
+///
+/// This is `nitro-settings`' Displays row with the arithmetic removed.
+/// That dialog's row measured ~700 px in a 560-px window and its slider,
+/// checkbox and both position fields were painted **on the desktop** to
+/// the right of the frame. #3725 fixed the toolkit — it clips its own
+/// root now — and these tests pin that a client which does not, or will
+/// not, is contained anyway: the guarantee is the compositor's, not the
+/// toolkit's, because a toolkit's promise covers only the apps that use
+/// it. So the client here is raw wire, with no `nitro-ui` anywhere.
+fn overflowing_window(conn: &mut Connection, inbox: &mut Inbox) -> (Win, NodeId) {
+    let root = NodeId(1);
+    let body = NodeId(2);
+    let spill_right = NodeId(3);
+    let spill_up = NodeId(4);
+    conn.tx()
+        .create_window_with(root, "contain", WIN, Layer::Normal, 0)
+        .create_rect(body, root, Rect::new(0.0, 0.0, WIN.w, WIN.h))
+        .fill_solid(body, GREEN)
+        // Starts inside the window and runs 300 px past its right edge.
+        .create_rect(
+            spill_right,
+            root,
+            Rect::new(WIN.w - 20.0, 10.0, 300.0, 40.0),
+        )
+        .fill_solid(spill_right, BLUE)
+        // And one at a negative y, over the server's own title bar.
+        .create_rect(
+            spill_up,
+            root,
+            Rect::new(10.0, -wm::TITLE_H, 60.0, wm::TITLE_H),
+        )
+        .fill_solid(spill_up, BLUE)
+        .commit(1)
+        .unwrap();
+    conn.flush().unwrap();
+    let (pos, size) = expect(conn, &mut inbox.0, "Configure", |m| match m {
+        ServerMsg::Configure(c) if c.window == root => Some((c.position, c.size)),
+        _ => None,
+    });
+    (Win { root, pos, size }, spill_right)
+}
+
+/// The pixels: a client's overflow is cut off at its window's edge, and
+/// the desktop beside the frame holds nothing of it.
+#[test]
+fn a_client_paints_nothing_outside_its_own_window() {
+    let mut h = Harness::start("contain", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("contain");
+    let (win, _) = overflowing_window(&mut conn, &mut inbox);
+    park(&mut h);
+
+    let img = h.shot();
+    let f = win.frame(true);
+    let blue = to_rgb(BLUE);
+
+    // 1. The strip of desktop right of the frame holds no client pixel
+    //    at all. The census is over the whole height of the frame and
+    //    100 px out, which is where the spilled widgets landed on the
+    //    box: `0` is the claim.
+    let strip = Rect::new(f.x + f.w, f.y, 100.0, f.h);
+    assert_eq!(
+        census(&img, strip, blue),
+        0,
+        "the client painted {} px on the desktop beside its frame",
+        census(&img, strip, blue)
+    );
+    // Nor any of its background, which would be the same bug in the
+    // colour that is easier to miss.
+    assert_eq!(census(&img, strip, to_rgb(GREEN)), 0);
+
+    // 2. It *is* painted up to the edge: the clip cuts off, it does not
+    //    discard. The last content column inside the frame is the
+    //    spilling rect's blue, so this is the difference between a clip
+    //    and a node that vanished.
+    let last_col = (win.pos.x + win.size.w - 1.0) as u32;
+    let row = (win.pos.y + 20.0) as u32;
+    assert_eq!(
+        rgb(img.pixel(last_col, row)),
+        blue,
+        "cut off at the window's edge, not thrown away"
+    );
+    // And one pixel further right is the frame's border, not the client.
+    assert_eq!(
+        rgb(img.pixel(last_col + 1, row)),
+        to_rgb(role(Role::WindowBorderActive))
+    );
+
+    // 3. The title bar is untouched: the client's negative-y rect did
+    //    not paint over the decorations. A whole-row census, because a
+    //    window with no close button is the failure this prevents.
+    let bar_row = Rect::new(f.x, f.y + wm::TITLE_H / 2.0, f.w, 1.0);
+    assert_eq!(
+        census(&img, bar_row, blue),
+        0,
+        "the client painted over its own title bar"
+    );
+
+    drop(conn);
+    h.quit();
+}
+
+/// The other two halves of the same rule, which have to agree with the
+/// pixels above: what can be **clicked** and what is **damaged**.
+///
+/// They agree because all three read the same `clip_rect` off the node.
+/// Kept in one test because they are one claim about one window — a
+/// pixel a client was not allowed to paint is not a pixel it owns, and
+/// not one it may repaint either.
+#[test]
+fn a_client_cannot_click_or_damage_outside_its_own_window() {
+    let mut h = Harness::start("contain2", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("contain2");
+    let (win, spill_right) = overflowing_window(&mut conn, &mut inbox);
+    park(&mut h);
+    let root = win.root;
+    let f = win.frame(true);
+
+    // The hit test agrees with the pixels. A click where the spilled
+    // rect *would* be must not reach the client — this is the click on
+    // the spilled checkbox that would otherwise toggle a setting the
+    // user cannot see.
+    h.point_at(f.x + f.w + 40.0, win.pos.y + 20.0, OUT);
+    h.settle();
+    h.button(BTN_LEFT, ButtonState::Pressed);
+    h.button(BTN_LEFT, ButtonState::Released);
+    h.settle();
+    conn.flush().unwrap();
+    let _ = conn.poll(&mut inbox.0);
+    assert!(
+        !inbox
+            .0
+            .iter()
+            .any(|m| matches!(m, ServerMsg::PointerButton(p) if p.window == root)),
+        "a click outside the window reached the client: a pixel it was \
+         not allowed to paint is not a pixel it owns"
+    );
+    // The same click one pixel inside the content *does* arrive, so the
+    // assertion above is about the clip and not about a broken harness.
+    inbox.0.clear();
+    h.point_at(win.pos.x + win.size.w - 2.0, win.pos.y + 20.0, OUT);
+    h.settle();
+    h.button(BTN_LEFT, ButtonState::Pressed);
+    h.button(BTN_LEFT, ButtonState::Released);
+    h.settle();
+    let hit = expect(&mut conn, &mut inbox.0, "a PointerButton", |m| match m {
+        ServerMsg::PointerButton(p) if p.window == root => Some(p.window),
+        _ => None,
+    });
+    assert_eq!(hit, root);
+
+    // Damage. Moving the spilled rect further out into the desktop
+    // repaints nothing out there: the damage union is intersected with
+    // the clip, so the mean stays bounded by the window rather than
+    // growing with how far the client pushed its node.
+    park(&mut h);
+    let strip = Rect::new(f.x + f.w, f.y, 100.0, f.h);
+    let before = h.shot();
+    conn.tx()
+        .bounds(spill_right, Rect::new(WIN.w + 100.0, 10.0, 300.0, 40.0))
+        .commit(2)
+        .unwrap();
+    conn.flush().unwrap();
+    park(&mut h);
+    let after = h.shot();
+    // A mean bounded by twice the window's own area — old ∪ new, both
+    // clipped to it. A compositor damaging where the node actually went
+    // would report the desktop strip on top of that.
+    let window_area = f64::from(f.w * f.h) * 2.0;
+    let mean = h.stat("damage_px_mean") as f64;
+    assert!(
+        mean < window_area,
+        "damage_px_mean {mean} exceeds the window's own {window_area}: \
+         damage escaped the clip"
+    );
+    // And pixel-exactly: nothing in the desktop strip changed colour
+    // between the two shots. Before/after rather than against a
+    // constant, because the desktop is a gradient and "changed" is the
+    // honest question.
+    let moved = (strip.y as u32..(strip.y + strip.h) as u32)
+        .flat_map(|y| (strip.x as u32..(strip.x + strip.w) as u32).map(move |x| (x, y)))
+        .filter(|(x, y)| rgb(before.pixel(*x, *y)) != rgb(after.pixel(*x, *y)))
+        .count();
+    assert_eq!(moved, 0, "{moved} desktop pixels were repainted");
+
+    drop(conn);
+    h.quit();
+}
+
+/// `SetClip{false}` on a window's own node is refused, and that is what
+/// makes the containment above an invariant rather than a default.
+///
+/// The client owns its content group — its window `NodeId` names that
+/// node, which is what lets it parent children under it — so the
+/// ownership check that stops it touching *another* client's nodes was
+/// never going to stop this. The refusal is explicit, and it is a fatal
+/// protocol error like every other refused mutation: a client whose
+/// layout is about to be cut off is told so rather than being answered
+/// "done" to a request that was not honoured.
+#[test]
+fn a_client_may_not_switch_its_windows_clip_off() {
+    let h = Harness::start("noclip", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("noclip");
+    let win = make_window(&mut conn, &mut inbox, 1, "noclip", WIN, RED, 0, 1);
+
+    conn.tx().clip(win.root, false).commit(2).unwrap();
+    conn.flush().unwrap();
+    let code = expect(&mut conn, &mut inbox.0, "an Error", |m| match m {
+        ServerMsg::Error(e) => Some(e.code),
+        _ => None,
+    });
+    // `RootNode` maps onto `BadParent`, the code the other two things a
+    // client may not do to a node its window owns already answer
+    // (destroying it, reparenting it).
+    assert_eq!(code, nitro_wire::types::ErrorCode::BadParent);
+
+    drop(conn);
+    h.quit();
+}
+
+/// Asking for the clip the window already has is accepted, so the
+/// toolkit's own `SetClip` is not a protocol error.
+///
+/// `nitro-ui` sets the flag on its root widget's group as of #3725, and
+/// that group *is* the window's content node. If the refusal above were
+/// about the message rather than about clearing the flag, every
+/// `nitro-ui` app would be disconnected on its first frame — which is
+/// exactly the regression this pins, and why the two directions are
+/// tested separately.
+#[test]
+fn setting_the_clip_a_window_already_has_is_accepted() {
+    let h = Harness::start("reclip", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("reclip");
+    let win = make_window(&mut conn, &mut inbox, 1, "reclip", WIN, RED, 0, 1);
+
+    conn.tx().clip(win.root, true).commit(2).unwrap();
+    conn.flush().unwrap();
+    h.settle();
+
+    // Still one live, painted window: the connection survived.
+    assert_eq!(h.stat("windows"), 1);
+    conn.flush().unwrap();
+    let _ = conn.poll(&mut inbox.0);
+    assert!(
+        !inbox.0.iter().any(|m| matches!(m, ServerMsg::Error(_))),
+        "the toolkit's own SetClip must not be an error: {:?}",
+        inbox.0
+    );
+    let img = h.shot();
+    let (cx, cy) = win.content();
+    assert_eq!(rgb(img.pixel(cx as u32, cy as u32)), to_rgb(RED));
+
+    drop(conn);
+    h.quit();
+}

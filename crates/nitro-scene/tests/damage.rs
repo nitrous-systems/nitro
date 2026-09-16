@@ -655,14 +655,20 @@ fn damage_accumulates_across_updates_until_the_caller_clears_it() {
     let mut d = Damage::new();
     s.set_fill(CLIENT, a, Fill::Solid(Color::BLACK)).unwrap();
     s.update(&mut DamageSink::new(&mut [(OUT, &mut d)]));
-    let b = rect(&mut s, root, Rect::new(500.0, 500.0, 10.0, 10.0));
+    // Both rects are inside the window, which is the only place a
+    // client's node can put pixels at all: the content group clips.
+    // This test is about two updates accumulating into one region, so
+    // the second rect is at the far corner *of the window* — it used to
+    // be at (500, 500) in a 400x300 window, where today it would be
+    // clipped away and damage nothing, pinning nothing.
+    let b = rect(&mut s, root, Rect::new(300.0, 200.0, 10.0, 10.0));
     s.update(&mut DamageSink::new(&mut [(OUT, &mut d)]));
 
     assert!(d.intersects(&IRect::new(0, 0, 10, 10)));
-    assert!(d.intersects(&IRect::new(500, 500, 10, 10)));
+    assert!(d.intersects(&IRect::new(300, 200, 10, 10)));
     assert_eq!(
         s.node(b).unwrap().world_bounds(),
-        IRect::new(500, 500, 10, 10)
+        IRect::new(300, 200, 10, 10)
     );
 }
 

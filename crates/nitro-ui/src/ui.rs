@@ -1705,11 +1705,19 @@ impl<S: 'static> Ui<S> {
     /// window's rectangle either way. If that ever changes, this clip
     /// has to become a rectangle of its own rather than a flag.
     ///
-    /// The server will eventually forbid a window painting outside its
-    /// own frame regardless of what its client asks for; the toolkit
-    /// does not wait for that, because a toolkit that relies on the
-    /// compositor to contain it is a toolkit whose bugs are invisible
-    /// until they are somebody else's.
+    /// The server **now** forbids a window painting outside its own
+    /// frame regardless of what its client asks for (#3726): the
+    /// window's content group — which is this very node — clips, and
+    /// `SetClip { clip: false }` on it is refused. This call is
+    /// therefore asking for a flag that is already set, which the
+    /// server answers as the no-op it is.
+    ///
+    /// It is kept rather than deleted, and not only for older servers: a
+    /// toolkit that relies on the compositor to contain it is a toolkit
+    /// whose bugs are invisible until they are somebody else's. The clip
+    /// here is what makes an overflowing layout show up as cut-off in
+    /// `nitro-ui`'s own tests, against its own harness, instead of only
+    /// on a desktop.
     fn pass_clip(&mut self, root: WidgetId) -> Result<(), Error> {
         if self.root_clipped {
             return Ok(());

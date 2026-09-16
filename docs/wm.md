@@ -57,6 +57,47 @@ node on top of its own title bar. The decorations are the content group's
 *siblings*, inserted before it, so the client always paints over its own
 frame's background and never over the bar.
 
+### What a client can and cannot draw
+
+**A window's content is clipped to the window, by the compositor, whatever
+the client sends.** The content group carries `clip` from the moment
+`create_window` mints it, and `SetClip { clip: false }` on it is refused
+with `BadParent` — the same answer a client gets for trying to destroy or
+reparent the node its window owns. So a client's nodes are bounded by its
+content rectangle: a widget laid out past the right edge is **cut off at
+the edge**, not painted on the desktop beside the frame, and one given a
+negative `y` does not paint over the title bar the server drew. Setting
+the clip it already has stays a no-op, so a toolkit that clips its own
+root (`nitro-ui` does) is unaffected.
+
+The three things a compositor could get out of step here agree because
+they read the *same* `clip_rect` off the node: **paint** cuts off at it,
+the **hit test** rejects points outside it — a click where a spilled
+checkbox appears to be reaches nothing, because a pixel a client was not
+allowed to paint is not a pixel it owns — and **damage** is intersected
+with it, so a node dragged out into the desktop repaints nothing out
+there and costs no pixels beyond the window it vacated.
+
+The rectangle clipped to is the content group's **own bounds**, and that
+is the whole of why it cannot go stale. A clip stored beside the window
+would have to be rewritten on every resize, maximize, fullscreen and
+`UNDECORATED` toggle, and the one path that forgot would clip to
+yesterday's window — invisibly, because the common case is a client that
+does not overflow. Those bounds are *already* the content rectangle: the
+scene keeps them so on a server resize, on an inset change, and when a
+client resizes its own top-level group. An undecorated or fullscreen
+window has zero insets, so its clip is its full bounds, with nothing to
+keep in step. Cost: one `bool` already in the node, no extra rect and no
+extra node — the frame is still eleven nodes, nine on `FIXED_SIZE`.
+
+Why in the compositor when #3725 had just fixed the toolkit: a toolkit's
+promise covers the apps that use it. `nitro-settings` shipped a Displays
+row ~700 px wide in a 560-px window, and its slider, checkbox and both
+position fields were painted **on the desktop** beside the frame; the
+toolkit now clips its root, but a client that does not use `nitro-ui`, or
+uses an older one, is contained regardless. Containing windows is what a
+compositor is for.
+
 Geometry, in logical units:
 
 | | |
@@ -696,6 +737,11 @@ else.
 
 `Minimized` is `visible = false` on the frame group, which is one
 `INHERIT` mutation and damages exactly the rectangle the window covered.
+
+A client's damage is bounded by its window as well, and for the same
+reason its paint is: the union is intersected with the content group's
+clip, so a node a client moves out into the desktop repaints nothing out
+there — see §What a client can and cannot draw.
 
 ## Measured
 

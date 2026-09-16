@@ -411,6 +411,9 @@ impl Node {
     }
 
     /// Whether this group clips its children to its bounds.
+    ///
+    /// Always true for a window's content group, which the window owns:
+    /// see [`Scene::set_clip`](crate::Scene::set_clip).
     pub fn clip(&self) -> bool {
         self.clip
     }

@@ -259,6 +259,9 @@ impl Scene {
     /// nothing can be hit until [`place_window`](Scene::place_window) puts it
     /// on an output, and its content group *is* its root until
     /// [`frame_window`](Scene::frame_window) wraps one around it.
+    ///
+    /// Its content group **clips**: see
+    /// [`create_window_with`](Scene::create_window_with).
     pub fn create_window(
         &mut self,
         client: ClientId,
@@ -270,6 +273,30 @@ impl Scene {
     }
 
     /// [`create_window`](Scene::create_window) with explicit flags.
+    ///
+    /// # A window's content is always clipped to the window
+    ///
+    /// The content group is created with [`clip`](Node::clip) set, and
+    /// [`set_clip`](Scene::set_clip) refuses to clear it. So a client's
+    /// nodes are bounded by its window's content rectangle whatever the
+    /// client sends: a node laid out past the right edge is cut off at
+    /// the edge, not painted on the desktop beside the frame, and one
+    /// given a negative `y` does not paint over its own title bar.
+    /// Paint, hit testing and damage all read the same clip, so a pixel
+    /// that is not drawn cannot be clicked and cannot be damaged either.
+    ///
+    /// **The rectangle it clips to is the node's own bounds, and that is
+    /// the whole of why it cannot go stale.** A clip rectangle stored
+    /// beside the window would have to be rewritten on every resize,
+    /// maximize, fullscreen and inset change, and any path that forgot
+    /// would clip to yesterday's window — invisibly, because the common
+    /// case is a client that does not overflow. The content group's
+    /// bounds are *already* the content rectangle: the scene keeps them
+    /// so in [`set_window_size`](Scene::set_window_size),
+    /// [`set_window_inset`](Scene::set_window_inset) and in
+    /// [`set_bounds`](Scene::set_bounds) when a client resizes its own
+    /// top-level group. Clipping to them is therefore correct in every
+    /// one of those cases by construction, with nothing to keep in step.
     pub fn create_window_with(
         &mut self,
         client: ClientId,
@@ -303,6 +330,11 @@ impl Scene {
         let node = self.node_mut_ref(root);
         node.window = win;
         node.bounds = Rect::new(0.0, 0.0, size.w, size.h);
+        // The window's own clip, and the one thing here a client cannot
+        // undo. This node is the content group — `frame_window` inserts a
+        // new root *above* it and leaves it alone — so the flag set here
+        // is the one in force for a framed window too.
+        node.clip = true;
         self.mark(root, ALL_DIRTY);
         win
     }
@@ -947,16 +979,39 @@ impl Scene {
 
     /// Set whether a group clips its descendants to its bounds.
     ///
+    /// **A window's content group always clips** and this call cannot
+    /// clear it: `clip: false` on it is [`Error::RootNode`], the same
+    /// answer [`destroy_node`](Scene::destroy_node) and
+    /// [`reparent`](Scene::reparent) give for the other two things a
+    /// client may not do to a node the window owns. `clip: true` on it is
+    /// the no-op it already was, so a toolkit that sets the flag itself
+    /// (`nitro-ui` does, on its root widget's group) keeps working
+    /// unchanged. Refused rather than silently ignored because a client
+    /// asking for it has a layout that will now be cut off, and a
+    /// compositor that answers "done" to a request it did not honour
+    /// teaches the client the wrong thing.
+    ///
+    /// See [`create_window_with`](Scene::create_window_with) for why the
+    /// window clips at all, and why its own bounds are the rectangle.
+    ///
     /// # Errors
-    /// [`Error::StaleKey`], [`Error::NotOwner`], [`Error::WrongKind`].
+    /// [`Error::StaleKey`], [`Error::NotOwner`], [`Error::WrongKind`],
+    /// [`Error::RootNode`] when clearing a window content group's clip.
     pub fn set_clip(&mut self, client: ClientId, key: NodeKey, clip: bool) -> Result<(), Error> {
         let node = self.check_mut(client, key)?;
         if node.data.kind() != NodeKind::Group {
             return Err(Error::WrongKind);
         }
+        let window = node.window;
         if node.clip == clip {
             return Ok(());
         }
+        // Only ever reached with `clip: false`, since the content group is
+        // created clipping: the equality above answers `true` first.
+        if self.windows.get(window).is_some_and(|w| w.content == key) {
+            return Err(Error::RootNode);
+        }
+        let node = self.node_mut_ref(key);
         node.clip = clip;
         self.mark(key, Dirty::INHERIT);
         Ok(())

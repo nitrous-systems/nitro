@@ -547,6 +547,18 @@ Hides the node and its whole subtree.
 
 `Group` nodes only: clips children to the group's bounds.
 
+**A window's own group always clips, and this cannot turn it off.** The
+node a `CreateWindow` binds — the window's content group — is created
+clipping, so a client's nodes are bounded by its content rectangle
+whatever it sends: overflow is cut off at the window's edge rather than
+painted on the desktop beside the frame, a click outside the window
+reaches nothing, and damage never leaves it. `clip: false` on that node
+is refused with `BadParent`, like any other attempt to mutate what the
+window owns; `clip: true` on it is the no-op it already was, so a toolkit
+that clips its own root is unaffected. Every other group is the client's
+to clip or not — a scroll view needs it, a shadow must not have it. See
+`docs/wm.md` §What a client can and cannot draw.
+
 ### `SetFill` — 0x0203
 
 | field | type |

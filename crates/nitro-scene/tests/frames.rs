@@ -346,3 +346,218 @@ fn flags_and_the_app_id_survive_the_round_trip() {
     s.set_app_id(CLIENT, win, "org.nitro.calc").unwrap();
     assert_eq!(s.window_info(win).unwrap().app_id(), "org.nitro.calc");
 }
+
+// ------------------------------------------------- the window's own clip
+
+#[test]
+fn a_windows_content_clips_from_the_moment_it_exists() {
+    // Not "after the server sets it up": the flag is on the node
+    // `create_window` mints, so there is no window in any state, framed
+    // or not, decorated or not, whose content does not clip.
+    let mut s = scene();
+    let (win, content) = window_at(&mut s, Point::ZERO, Size::new(200.0, 100.0));
+    assert!(s.node(content).unwrap().clip(), "undecorated");
+
+    let frame = s.frame_window(win, INSET).unwrap();
+    assert!(
+        s.node(content).unwrap().clip(),
+        "framing inserts a root above the content and leaves its flag alone"
+    );
+    assert!(
+        !s.node(frame).unwrap().clip(),
+        "the frame group does not clip: the title bar's rounded overhang \
+         lives outside the content rect on purpose"
+    );
+}
+
+#[test]
+fn a_client_cannot_turn_its_windows_clip_off() {
+    // The whole point of moving this into the compositor: a client that
+    // does not want to be contained does not get to opt out. `SetClip`
+    // is the only wire message that could ask, and it is refused.
+    let mut s = scene();
+    let (win, content) = window_at(&mut s, Point::ZERO, Size::new(200.0, 100.0));
+
+    assert_eq!(
+        s.set_clip(CLIENT, content, false).unwrap_err(),
+        Error::RootNode
+    );
+    assert!(s.node(content).unwrap().clip(), "and it really is still on");
+
+    // Asking for the clip it already has is the no-op it always was, so
+    // a toolkit that sets the flag on its own root — `nitro-ui` does —
+    // is not broken by this.
+    s.set_clip(CLIENT, content, true).unwrap();
+    assert!(s.node(content).unwrap().clip());
+
+    // Not even the server, and that is deliberate rather than an
+    // oversight: the invariant is the compositor's promise to the user
+    // about every window, so there is no privileged caller who may void
+    // it. A `wm` that needed to would be a `wm` with a bug.
+    assert_eq!(
+        s.set_clip(nitro_scene::ClientId::SERVER, content, false)
+            .unwrap_err(),
+        Error::RootNode
+    );
+
+    // A framed window answers the same, through the same node.
+    s.frame_window(win, INSET).unwrap();
+    assert_eq!(
+        s.set_clip(CLIENT, content, false).unwrap_err(),
+        Error::RootNode
+    );
+
+    // And an ordinary group of the client's own is still the client's to
+    // clip or not: the refusal is about the *window's* node, not a new
+    // rule about clipping.
+    let g = common::group(&mut s, content, Rect::new(0.0, 0.0, 50.0, 50.0));
+    s.set_clip(CLIENT, g, true).unwrap();
+    s.set_clip(CLIENT, g, false).unwrap();
+    assert!(!s.node(g).unwrap().clip());
+}
+
+#[test]
+fn a_node_outside_the_window_paints_nothing_and_cannot_be_hit() {
+    // The three consequences that have to agree, in one test: what is
+    // painted, what is hit, and what is damaged. They agree because all
+    // three read the *same* `clip_rect` off the node — this pins that
+    // they do, so a later change that gives the hit test a rectangle of
+    // its own fails here rather than on a desktop.
+    let mut s = scene();
+    let (_, content) = window_at(&mut s, Point::new(10.0, 20.0), Size::new(200.0, 100.0));
+    // `nitro-settings`' Displays row, with the arithmetic removed: a
+    // child laid out past the window's right edge.
+    let spill = rect(&mut s, content, Rect::new(180.0, 10.0, 200.0, 30.0));
+    settle(&mut s);
+
+    // Painted: only the 20 px that are inside the window.
+    assert_eq!(
+        s.node(spill).unwrap().world_bounds(),
+        nitro_core::IRect::new(190, 30, 20, 30),
+        "cut off at the window's edge, not painted past it"
+    );
+
+    // Hit: a point on the part inside reaches the client...
+    let hit = s.hit_test(OUT, Point::new(195.0, 35.0)).unwrap();
+    assert_eq!(hit.node, spill);
+    // ...and a point on the part outside reaches nothing at all. This is
+    // the click on the spilled checkbox that must not arrive: a pixel
+    // the client did not get to paint is a pixel it does not own.
+    assert!(
+        s.hit_test(OUT, Point::new(260.0, 35.0)).is_none(),
+        "a node outside the window is not hit-testable"
+    );
+}
+
+#[test]
+fn moving_a_node_out_of_the_window_damages_nothing_outside_it() {
+    // The damage half of the same rule, and the one a compositor gets
+    // wrong quietly: a repaint of pixels the window does not own is not
+    // visible as a wrong colour, only as a window somewhere else
+    // flickering — or as a damage figure nobody can account for.
+    let mut s = scene();
+    let (_, content) = window_at(&mut s, Point::ZERO, Size::new(200.0, 100.0));
+    let r = rect(&mut s, content, Rect::new(10.0, 10.0, 20.0, 20.0));
+    settle(&mut s);
+
+    // Straight out of the window, 300 px to the right.
+    s.set_bounds(CLIENT, r, Rect::new(310.0, 10.0, 20.0, 20.0))
+        .unwrap();
+    let d = common::damage(&mut s);
+    // Old ∪ new, and the new half is empty: the node vacated its old
+    // rectangle and arrived nowhere paintable.
+    assert_eq!(
+        d.rects(),
+        &[nitro_core::IRect::new(10, 10, 20, 20)],
+        "the pixels it left, and nothing outside the window"
+    );
+    assert!(s.node(r).unwrap().world_bounds().is_empty());
+    // `painted` is deliberately *not* the answer here: it is the node's
+    // own content-ness (visible, opaque, has something to draw), and the
+    // clip shows up in `world_bounds`. Both are read on the paint path —
+    // `paint_list` and `hit_node` require `painted` **and** a
+    // `world_bounds` hit — so a fully clipped node still reaches neither
+    // the rasterizer nor a click.
+    assert!(s.node(r).unwrap().painted());
+}
+
+#[test]
+fn the_clip_follows_every_resize_because_it_is_the_content_bounds() {
+    // The failure mode a clip rectangle stored beside the window would
+    // have: correct on the day it was written, then one path forgets to
+    // update it and the window clips to a size it no longer has. Nothing
+    // here re-sets a clip, because the clip *is* the content bounds.
+    let mut s = scene();
+    let (win, content) = window_at(&mut s, Point::ZERO, Size::new(200.0, 100.0));
+    let frame = s.frame_window(win, INSET).unwrap();
+    // A child that sticks out in every direction, so the clip is the
+    // only thing deciding its footprint.
+    let child = rect(&mut s, content, Rect::new(-500.0, -500.0, 2000.0, 2000.0));
+    settle(&mut s);
+
+    let content_rect = |s: &nitro_scene::Scene| s.node(child).unwrap().world_bounds();
+
+    // Framed and Normal: the content rect, inside the insets.
+    assert_eq!(
+        content_rect(&s),
+        nitro_core::IRect::new(1, 28, 200, 100),
+        "clipped to the content rect, not the frame"
+    );
+
+    // A server-driven resize (maximize, an edge drag).
+    s.set_window_size(nitro_scene::ClientId::SERVER, win, Size::new(400.0, 250.0))
+        .unwrap();
+    settle(&mut s);
+    assert_eq!(content_rect(&s), nitro_core::IRect::new(1, 28, 400, 250));
+
+    // Fullscreen: the insets go to zero and the content takes the whole
+    // frame, so an undecorated window clips to its full bounds.
+    s.set_window_inset(win, Insets::NONE).unwrap();
+    settle(&mut s);
+    assert_eq!(
+        content_rect(&s),
+        nitro_core::IRect::new(0, 0, 400, 250),
+        "UNDECORATED/fullscreen: the clip is the whole window"
+    );
+    // And back, which is what leaving fullscreen does.
+    s.set_window_inset(win, INSET).unwrap();
+    settle(&mut s);
+    assert_eq!(content_rect(&s), nitro_core::IRect::new(1, 28, 400, 250));
+
+    // A *client's* own resize of its top-level group, which the scene
+    // treats as a resize request and re-origins inside the frame.
+    s.set_bounds(CLIENT, content, Rect::new(0.0, 0.0, 120.0, 60.0))
+        .unwrap();
+    settle(&mut s);
+    assert_eq!(content_rect(&s), nitro_core::IRect::new(1, 28, 120, 60));
+
+    // The frame group grew and shrank with it all along.
+    assert_eq!(
+        s.node(frame).unwrap().bounds().size(),
+        Size::new(120.0 + INSET.width(), 60.0 + INSET.height())
+    );
+}
+
+#[test]
+fn a_client_cannot_paint_over_its_own_title_bar() {
+    // The other direction, and the one a client reaches by accident: a
+    // negative offset. The frame's decorations are the content group's
+    // *siblings*, so without a clip a node at y = -28 would paint over
+    // the title bar the server drew — a window with no close button.
+    let mut s = scene();
+    let (win, content) = window_at(&mut s, Point::ZERO, Size::new(200.0, 100.0));
+    s.frame_window(win, INSET).unwrap();
+    let over = rect(
+        &mut s,
+        content,
+        Rect::new(0.0, -INSET.top, 200.0, INSET.top),
+    );
+    settle(&mut s);
+
+    assert!(
+        s.node(over).unwrap().world_bounds().is_empty(),
+        "the title bar is not the client's to paint on"
+    );
+    // The title bar's own pixels are reached by nothing of the client's.
+    assert!(s.hit_test(OUT, Point::new(100.0, 14.0)).is_none());
+}

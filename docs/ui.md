@@ -297,10 +297,16 @@ wallpaper. `SetClip` is opt-in on the wire — it has to be, a `Scroll`
 needs it and a shadow must not have it — and nothing was setting it on a
 window's root.
 
-The compositor will eventually forbid a window painting outside its own
-frame whatever its client asks for. The toolkit does not wait for that:
-a toolkit that relies on the compositor to contain it is one whose bugs
-are invisible until they are somebody else's.
+The compositor **now** forbids a window painting outside its own frame
+whatever its client asks for (#3726): a window's content group clips, and
+`SetClip { clip: false }` on it is refused. The toolkit did not wait for
+that, and keeps its own clip anyway — a toolkit that relies on the
+compositor to contain it is one whose bugs are invisible until they are
+somebody else's, and the toolkit's clip is what makes an overflow show up
+in `nitro-ui`'s own tests rather than only on a desktop. The two agree by
+construction: both clip to the root's bounds, which the layout pass keeps
+equal to the window's content rectangle, so setting the flag is the no-op
+the server treats it as.
 `a_child_moved_past_the_window_paints_nothing_on_the_desktop` in
 `crates/nitro-ui/tests/ui.rs` is the pin, and it is a pixel census of the
 desktop strip beside the window: 0 changed pixels with the clip, 1998
