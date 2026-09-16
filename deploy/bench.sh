@@ -210,9 +210,17 @@ set_mode() {
     # which is the same rule the server applies, rather than string
     # equality against a number no connector actually offers.
     local got
-    got="$(control outputs | grep -oE '@[0-9]+' | head -1 | tr -d '@')"
+    # Anchored on **this connector's line**, not on the first `@` in the
+    # whole reply: `outputs` prints one line per output, so a second
+    # monitor (or a `(custom)` modeline row) would otherwise silently
+    # supply the number this guard then blesses. Reviewer's catch, and it
+    # is the same failure mode as the literal below — a guard reading the
+    # wrong field is worse than no guard, because it reports success.
+    got="$(control outputs | grep -E "^${connector} " | head -1 |
+        grep -oE '@[0-9]+' | head -1 | tr -d '@')"
     if [[ -z ${got:-} ]]; then
-        say "REFUSING the ${hz} Hz arm: outputs reported no refresh at all"
+        say "REFUSING the ${hz} Hz arm: outputs has no refresh for $connector"
+        control outputs | sed 's/^/    /' >&2
         return 1
     fi
     local want=$((hz * 1000))
