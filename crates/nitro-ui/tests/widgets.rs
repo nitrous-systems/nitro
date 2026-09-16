@@ -674,6 +674,40 @@ fn replacing_an_image_releases_the_buffer_it_replaced() {
     assert_eq!(px & 0x00ff_ffff, 0x0000_00ff, "the blue block is drawn");
 }
 
+/// Assert that what a label **paints** fits the box it is painted in.
+///
+/// The property `.elide(true)` actually sells, and the one no test made
+/// until #3725's review found it missing. Eliding to the width the label
+/// was *offered* rather than the width it was *given* passes every
+/// assertion about `painted_text()` — it really does end in `…` — while
+/// the scene clips that longer string at the label's own rect, mid-glyph
+/// and ellipsis included, which is the hard truncation the ellipsis
+/// exists to replace. Measured before the fix: a 122-px box painting a
+/// 205-px string.
+///
+/// So the honest question is not "does it end in an ellipsis" but "does
+/// the server say this string fits that rectangle", and this asks the
+/// server.
+#[track_caller]
+fn assert_painted_fits<S: 'static>(h: &mut Harness<S>, id: WidgetId, px: f32) {
+    let painted = h.widget::<Label>(id).painted_text().to_owned();
+    let theme = nitro_ui::Theme::default();
+    let style = nitro_ui::TextStyle::new(theme.font_family.clone(), px);
+    let want = h
+        .ui()
+        .measure_text(&painted, &style, 0.0)
+        .expect("measure what is painted")
+        .width;
+    let box_w = h.bounds(id).w;
+    assert!(
+        want <= box_w + 0.5,
+        "the label paints {painted:?}, which measures {want}, into a \
+         {box_w}-px box: the scene clips a run to its item's bounds, so \
+         those {:.1} px are cut off mid-glyph and the ellipsis with them",
+        want - box_w,
+    );
+}
+
 #[test]
 fn an_eliding_label_shortens_itself_instead_of_overflowing_the_row() {
     // A label is the widget with no smaller honest version of itself,
@@ -749,6 +783,15 @@ fn an_eliding_label_shortens_itself_instead_of_overflowing_the_row() {
         painted.starts_with("1920×1080"),
         "the important prefix survives: {painted:?}"
     );
+
+    // 5. And what is painted fits the box it is painted in — the
+    //    property the four assertions above do *not* make, and the one
+    //    the first version of this feature failed: it elided against the
+    //    width the label was offered (208 px, the row's inner width)
+    //    rather than the width it was given (~122 px after the solver
+    //    took the overflow out of it), so a 205-px string went into a
+    //    122-px box and the scene cut it mid-glyph, ellipsis and all.
+    assert_painted_fits(&mut h, mode, 13.0);
     h.quit();
 }
 
@@ -809,6 +852,12 @@ fn an_eliding_label_keeps_an_ellipsis_and_three_characters_at_its_narrowest() {
         "and what is left is elided, not clipped: {:?}",
         h.widget::<Label>(mode).painted_text(),
     );
+    // And the remnant really fits the floor-width box, which is the
+    // assertion that makes the two above mean something: before #3725's
+    // review the label elided against the ~120 px it was *offered* and
+    // was then laid out at this ~28 px floor, so `painted_text()` ended
+    // in an ellipsis that was itself off the end of the box.
+    assert_painted_fits(&mut h, mode, 13.0);
     h.quit();
 }
 
@@ -856,7 +905,19 @@ fn re_eliding_happens_on_a_width_change_and_on_nothing_else() {
         "the label really is eliding, so there is a search to count"
     );
 
+    // What the settled count *is*, stated rather than merely held
+    // constant below. Since #3725's review the search runs from `layout`
+    // and nowhere else, so bringing this label up costs exactly **one**
+    // — the first time it learns its own width. A version that also
+    // searched from `measure` would read two, and a version that
+    // searched on every pass would read more; pinning the number here is
+    // what makes the equalities below say "and it stayed at one".
     let before = h.widget::<Label>(mode).elisions();
+    assert_eq!(
+        before, 1,
+        "a settled eliding label has searched once: the offered width is \
+         not a width it elides against, only the width it is given"
+    );
     let layouts = h.server().stat("text_layouts");
     for _ in 0..10 {
         h.ui().mark(mode, nitro_ui::Dirty::PAINT);

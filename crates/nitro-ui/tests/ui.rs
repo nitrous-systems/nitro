@@ -1530,6 +1530,34 @@ fn a_column_that_does_not_fit_clips_rather_than_squashing_its_labels() {
 }
 
 #[test]
+fn the_root_is_placed_at_the_window_whatever_its_own_style_says() {
+    // The premise `Ui::pass_clip`'s doc comment leans on, asserted rather
+    // than assumed: the clip is a *flag* on the root's group rather than
+    // a rectangle of its own, and that is only sound while the root's
+    // group is the window's rectangle.
+    //
+    // It is, and not by accident of the styles apps happen to use:
+    // `pass_layout` lays the root out at `Rect(0, 0, window_size)`
+    // without consulting its width/height at all. So a root that asks
+    // for 300×100 in a 240×160 window is *measured* at 300×100 and still
+    // *placed* at 240×160 — which is what this pins. If that ever
+    // changes, the clip has to carry its own rectangle.
+    let mut h = Harness::sized(
+        "rootstyle",
+        (),
+        Size::new(240.0, 160.0),
+        |ui: &mut Ui<()>| ui.build(panel().width(300.0).height(100.0)),
+    );
+    let root = h.ui().root().unwrap();
+    assert_eq!(
+        h.bounds(root),
+        Rect::new(0.0, 0.0, 240.0, 160.0),
+        "the root is placed at the window, not at the 300×100 it asked for"
+    );
+    h.quit();
+}
+
+#[test]
 fn a_child_moved_past_the_window_paints_nothing_on_the_desktop() {
     // The other half of #561's answer, and the one `nitro-settings`
     // needed: the content floor stops a row being *squashed*, and this

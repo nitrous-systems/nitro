@@ -1172,6 +1172,35 @@ fn no_widget_is_laid_out_smaller_than_it_measures() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Assert that what the label at `path` **paints** fits its own box.
+///
+/// The toolkit has this as `assert_painted_fits`; it is repeated here
+/// because the property is what the *dialog* promises — the row degrades
+/// by eliding — and a settings test that only checked bounds would pass
+/// with the ellipsis clipped off the end of its own label, which is what
+/// #3725's review caught. A row whose labels are cut mid-glyph is not a
+/// row that fitted.
+#[track_caller]
+fn assert_label_fits(h: &mut Harness<Settings>, path: &str) {
+    let id = named(h, path);
+    let painted = h.widget::<Label>(id).painted_text().to_owned();
+    let theme = nitro_ui::Theme::default();
+    let style = nitro_ui::TextStyle::new(theme.font_family.clone(), nitro_settings::TEXT_SIZE);
+    let want = h
+        .ui()
+        .measure_text(&painted, &style, 0.0)
+        .expect("measure what is painted")
+        .width;
+    let box_w = h.ui().window_bounds(id).w;
+    assert!(
+        want <= box_w + 0.5,
+        "{path} paints {painted:?}, which measures {want}, into a \
+         {box_w}-px box: the scene clips a run to its item's bounds, so \
+         the last {:.1} px are cut off mid-glyph and the ellipsis with them",
+        want - box_w,
+    );
+}
+
 /// Assert that no widget in the tree has any part of itself outside the
 /// window, on either axis.
 ///
@@ -1302,6 +1331,7 @@ fn the_second_line_lists_the_other_rates_and_elides_a_long_list() {
         "a five-rate list fits: {:?}",
         h.widget::<Label>(rates).painted_text(),
     );
+    assert_label_fits(&mut h, &format!("displays/{CONNECTOR}/modes"));
     // It is on the second line, under the connector rather than beside
     // it, and inside the window.
     let bottom = named(&mut h, &format!("displays/{CONNECTOR}/bottom"));
@@ -1364,6 +1394,13 @@ fn the_second_line_lists_the_other_rates_and_elides_a_long_list() {
         "and keeps the front of the list: {:?}",
         h.widget::<Label>(rates).painted_text(),
     );
+    // And the elided line actually fits its own box, which the two
+    // assertions above do not check and the bounds check above cannot:
+    // the label is laid out at whatever is left of the second line after
+    // `position`/`x`/`y` (~340 px of its ~516-px offer), so a version
+    // that elided against the offer — which is what #3725's review
+    // caught — would put an ellipsis off the end of its own label.
+    assert_label_fits(&mut h, &format!("displays/{CONNECTOR}/modes"));
     // Two decimals at most, no trailing zeros: the kernel's `84.904` and
     // `23.976` read as `84.9` and `23.98`.
     let whole = h.widget::<Label>(rates).text().to_owned();
@@ -1482,6 +1519,14 @@ fn nothing_overhangs_with_two_outputs_or_with_a_long_mode_string() {
         "with the part that names the mode surviving: {:?}",
         h.widget::<Label>(mode).painted_text(),
     );
+    // The assertion the bounds check cannot make, on every eliding label
+    // in every row: what is painted fits the box it is painted in. A row
+    // whose labels are cut mid-glyph is not a row that fitted, and
+    // `check_nothing_overhangs` above would not notice — the boxes were
+    // never the label's problem.
+    for connector in h.state().connectors() {
+        assert_label_fits(&mut h, &format!("displays/{connector}/mode"));
+    }
 
     h.quit();
     let _ = std::fs::remove_dir_all(&dir);

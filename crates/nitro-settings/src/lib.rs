@@ -1188,11 +1188,11 @@ pub fn percent(level: f32) -> String {
 /// every later change, so keying on the connector and upserting is one
 /// code path where "added versus changed" would be two that must agree.
 fn upsert_output(s: &mut Settings, ui: &mut Ui<Settings>, ids: Ids, info: &OutputInfo) {
-    if let Some(r) = s.rows.iter().find(|r| r.connector == info.name) {
+    if let Some(r) = s.rows.iter_mut().find(|r| r.connector == info.name) {
+        r.output = Some(info.id);
+        // Copied out of the `&mut` so the label setters below can borrow
+        // `s` again: one scan, and the ids are `Copy`.
         let (mode, modes) = (r.mode, r.modes);
-        if let Some(r) = s.rows.iter_mut().find(|r| r.connector == info.name) {
-            r.output = Some(info.id);
-        }
         // A mode change is the only thing a re-sent `OutputInfo` may
         // move here. The scale and the position are deliberately *not*
         // re-read: they are what the user is editing, and a hotplug

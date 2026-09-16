@@ -1697,6 +1697,14 @@ impl<S: 'static> Ui<S> {
     /// and cannot go stale: the rectangle the scene clips to *is* the
     /// rectangle the root was laid out in. Sent once, then remembered.
     ///
+    /// That equality holds because [`Ui::pass_layout`] lays the root out
+    /// at `Rect(0, 0, window_size)` **regardless of the root's own
+    /// width/height style** — not because a root style could not ask for
+    /// something else. A root with `width(300.0)` is measured at 300 and
+    /// still *placed* at the window's full size, so its group is the
+    /// window's rectangle either way. If that ever changes, this clip
+    /// has to become a rectangle of its own rather than a flag.
+    ///
     /// The server will eventually forbid a window painting outside its
     /// own frame regardless of what its client asks for; the toolkit
     /// does not wait for that, because a toolkit that relies on the

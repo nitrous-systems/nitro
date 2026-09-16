@@ -349,7 +349,22 @@ impl Label {
     }
 
     /// Re-run the elision search if `width` is not what it was last run
-    /// at, and answer the metrics of whatever will be painted.
+    /// at.
+    ///
+    /// **`width` is the width the label is laid out at, not the width it
+    /// was offered.** That distinction is the whole of #3725's review:
+    /// the first version of this ran from `measure`, against
+    /// `constraints.max.w` — which for a flex child is the *container's*
+    /// available inner width, before `solve` takes the overflow back out
+    /// of it. The prefix that fit the offer was then painted into the
+    /// shrunk box and clipped mid-glyph by the scene, ellipsis and all,
+    /// which is exactly the hard truncation the ellipsis exists to
+    /// replace. Measured: a 122-px box painting a 205-px string.
+    ///
+    /// So the search runs from [`Widget::layout`], which is the first
+    /// moment a leaf knows its own width, and `measure` does not search
+    /// at all — an eliding label's *basis* is its whole text, which is
+    /// what lets the solver decide how much to take away.
     ///
     /// The search is the server's own (`Text::elide` in `nitro-server`,
     /// which is what elides a title bar): a binary search over char
@@ -359,32 +374,31 @@ impl Label {
     /// happens; the measuring is the server's, over the wire and through
     /// the measurement cache, so a repeated search on a settled string
     /// costs no round trips either.
-    fn reelide<S: 'static>(
-        &mut self,
-        cx: &mut MeasureCx<'_, S>,
-        style: &TextStyle,
-        width: f32,
-    ) -> crate::wire::TextMetrics {
+    ///
+    /// Answers whether anything changed, so the caller can ask for a
+    /// repaint only when there is something new to paint.
+    fn reelide<S: 'static>(&mut self, ui: &mut Ui<S>, style: &TextStyle, width: f32) -> bool {
         if self.elided_at.to_bits() == width.to_bits() {
-            let text = self.elided.clone().unwrap_or_else(|| self.text.clone());
-            return cx.measure_text(&text, style, 0.0).unwrap_or_default();
+            return false;
         }
         self.elided_at = width;
         self.elisions += 1;
-        let whole = cx.measure_text(&self.text, style, 0.0).unwrap_or_default();
-        if whole.width <= width || self.text.is_empty() {
-            self.elided = None;
-            return whole;
-        }
-        let prefix = elide_to(cx, style, &self.text, width);
-        let metrics = cx.measure_text(&prefix, style, 0.0).unwrap_or_default();
-        self.elided = Some(prefix);
-        metrics
+        let before = self.elided.clone();
+        let whole = ui
+            .measure_text(&self.text, style, 0.0)
+            .unwrap_or_default()
+            .width;
+        self.elided = if whole <= width || self.text.is_empty() {
+            None
+        } else {
+            Some(elide_to(ui, style, &self.text, width))
+        };
+        before != self.elided
     }
 
     /// The narrowest an eliding label is willing to be: `…` plus the
     /// first [`ELIDE_FLOOR_CHARS`] characters of its text.
-    fn elide_floor<S: 'static>(&self, cx: &mut MeasureCx<'_, S>, style: &TextStyle) -> Size {
+    fn elide_floor<S: 'static>(&self, ui: &mut Ui<S>, style: &TextStyle) -> Size {
         let end = self
             .text
             .char_indices()
@@ -395,7 +409,7 @@ impl Label {
         } else {
             format!("{}{ELLIPSIS}", &self.text[..end])
         };
-        cx.measure_text(&remnant, style, 0.0)
+        ui.measure_text(&remnant, style, 0.0)
             .unwrap_or_default()
             .size()
     }
@@ -410,12 +424,7 @@ impl Label {
 /// `nitro-server`'s `Text::elide` is the same search over the server's
 /// own font state, and the two agree on the result by construction —
 /// they ask the same shaper the same questions.
-fn elide_to<S: 'static>(
-    cx: &mut MeasureCx<'_, S>,
-    style: &TextStyle,
-    text: &str,
-    width: f32,
-) -> String {
+fn elide_to<S: 'static>(ui: &mut Ui<S>, style: &TextStyle, text: &str, width: f32) -> String {
     if width <= 0.0 {
         return ELLIPSIS.to_owned();
     }
@@ -430,7 +439,7 @@ fn elide_to<S: 'static>(
     while lo + 1 < hi {
         let mid = lo + (hi - lo) / 2;
         let candidate = format!("{}{ELLIPSIS}", &text[..bounds[mid]]);
-        let fits = cx
+        let fits = ui
             .measure_text(&candidate, style, 0.0)
             .unwrap_or_default()
             .width
@@ -464,25 +473,53 @@ impl<S: 'static> Widget<S> for Label {
             // reserve two lines for a string this widget has already
             // promised to fit on one.
             self.wrap_width = 0.0;
-            if constraints.max.w.is_finite() {
-                self.metrics = self.reelide(cx, &style, constraints.max.w);
-                // The floor is reported from here rather than left to a
-                // `min_width`, because only this widget can compute it:
-                // it depends on the server's fonts and on the string.
-                let floor = self.elide_floor(cx, &style);
-                cx.report_floor(floor);
-            } else {
-                // "As wide as you like" is the intrinsic measurement, and
-                // the intrinsic size of an eliding label is its whole
-                // text: eliding is what it does when it is given *less*.
-                self.invalidate_elision();
-                self.metrics = cx.measure_text(&self.text, &style, 0.0).unwrap_or_default();
-            }
+            // **The basis is the whole text, always — the search does not
+            // run here.** What this method is offered is the container's
+            // available width, and `solve` has not yet taken the
+            // overflow back out of it, so a prefix chosen against that
+            // number would be painted into a narrower box and clipped
+            // mid-glyph (ellipsis included), which is the truncation the
+            // ellipsis exists to replace. The eliding happens in
+            // `layout`, at the width this label actually gets.
+            //
+            // Reporting the whole text as the basis is also what makes
+            // the solver's arithmetic right: the deficit it divides is
+            // the difference between what the row wants and what it has,
+            // and a label that pre-shrank itself would understate it.
+            self.metrics = cx.measure_text(&self.text, &style, 0.0).unwrap_or_default();
+            // The floor is reported from here rather than left to a
+            // `min_width`, because only this widget can compute it: it
+            // depends on the server's fonts and on the string.
+            let floor = self.elide_floor(cx.ui, &style);
+            cx.report_floor(floor);
             return constraints.constrain(self.metrics.size());
         }
         self.wrap_width = max;
         self.metrics = cx.measure_text(&self.text, &style, max).unwrap_or_default();
         constraints.constrain(self.metrics.size())
+    }
+
+    /// Elide to the width this label was actually given.
+    ///
+    /// A leaf's `layout` is the **first moment it knows its own width**:
+    /// `measure` is offered the container's available space, and the
+    /// flex solver then takes the row's overflow back out of whatever
+    /// can give it — an eliding label above all. Nothing re-measures a
+    /// leaf afterwards (`Ui::layout_widget` calls `layout` and clears
+    /// `LAYOUT` in the same pass), so this is also the *only* moment.
+    ///
+    /// It requests a **paint**, never a layout. The string it chooses is
+    /// by construction no wider than the box it was chosen for, so it
+    /// cannot change this label's size, and asking for a layout here
+    /// would invite a measure/layout loop for no gain.
+    fn layout(&mut self, cx: &mut LayoutCx<'_, S>, bounds: Rect) {
+        if !self.elide {
+            return;
+        }
+        let style = self.resolved_style(cx.theme());
+        if self.reelide(cx.ui, &style, bounds.w) {
+            cx.ui.mark(cx.id, Dirty::PAINT);
+        }
     }
 
     fn paint(&mut self, cx: &mut PaintCx<'_, S>) {
@@ -679,8 +716,15 @@ impl<S: 'static> LabelBuilder<S> {
     /// *taller* when it is given less width, which is the opposite of
     /// what a row needs). Use one or the other.
     ///
-    /// The search runs only when the width it was last run at changes,
-    /// so a repaint at a settled width costs no measurements.
+    /// The search runs from `layout`, at the width the label was
+    /// actually given, and only when that width changes — so a settled
+    /// label has searched exactly once and a repaint costs nothing. It
+    /// deliberately does *not* run from `measure`: what `measure` is
+    /// offered is the container's available width, before the solver
+    /// takes the row's overflow back out of it, and a prefix chosen
+    /// against that would be painted into a narrower box and clipped
+    /// mid-glyph — ellipsis included, which is the truncation this
+    /// exists to replace.
     #[must_use]
     pub fn elide(mut self, on: bool) -> Self {
         self.label.elide = on;

@@ -711,6 +711,28 @@ so a relayout at an unchanged width costs nothing. `Label::text()` is
 still the whole string — that is what `hey get` and an accessibility
 client read — and `Label::painted_text()` is what is on screen.
 
+**The search runs from `layout`, not from `measure`, and that is the
+load-bearing detail.** What `measure` is offered is the *container's*
+available width; `solve` has not yet taken the row's overflow back out
+of it. A label that elided against the offer would paint a string chosen
+for 208 px into the 122-px box the solver gave it, and `PaintKind::Text`
+clips a run to its item's bounds — so it would be cut mid-glyph with the
+ellipsis itself clipped away, which is precisely the truncation the
+ellipsis exists to replace. (That was the first version of this feature,
+and every assertion about `painted_text()` passed while it was broken;
+the test that catches it asks the server whether the painted string fits
+the box, which is the property `.elide(true)` actually sells.)
+
+So an eliding label's **basis is its whole text** — which is also what
+makes the solver's arithmetic right, since the deficit it divides is the
+difference between what the row wants and what it has — and `layout` is
+where it learns what it got. That is the first moment a leaf knows its
+own width and, because nothing re-measures a leaf afterwards, the only
+one. It requests a *paint* there and never a layout: the string it picks
+cannot be wider than the box it was picked for, so it cannot change the
+label's size, and asking for a layout would invite a measure/layout
+loop. A settled eliding label has searched exactly **once**.
+
 The floor applies to whichever axis is the **parent's** main axis, and
 `shrink_floor` is one field rather than one per axis. So a widget that
 opted out for a horizontal reason has also opted out vertically: the

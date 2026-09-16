@@ -591,11 +591,16 @@ HDMI-A-1  1920×1080 @ 119.98 Hz  [──●────] 1   ☐ primary
 window, and a pixel census of the 200-px desktop strip right of the frame
 found **1910 changed pixels in a 27-row band** — one `ROW_HEIGHT` of
 widgets lying on the wallpaper, which is the human's bug report in
-numbers rather than a shadow or an anti-aliasing fringe. After: **0**. Both dim labels **elide** (`docs/ui.md`), so a television with a
-dozen rates shortens its line rather than pushing the row out, and the
-important prefix — the resolution — is what survives. A connector that
-offers nothing else at its current size has no rates label at all rather
-than an empty one.
+numbers rather than a shadow or an anti-aliasing fringe. After: **0**.
+
+Both dim labels **elide** (`docs/ui.md`), so a television with a dozen
+rates shortens its line rather than pushing the row out, and the
+important prefix — the resolution — is what survives. The tests assert
+that what each label *paints* fits the box it is painted in, not merely
+that it ends in an ellipsis: an ellipsis clipped off the end of its own
+label is the truncation it exists to replace. A connector that offers
+nothing else at its current size has no rates label at all rather than
+an empty one.
 
 The rates are the one question a display row can answer and the file
 cannot: `output.<c>.mode = 1920x1080@120` is only worth typing if 120 is
