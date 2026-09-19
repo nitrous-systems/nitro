@@ -906,6 +906,10 @@ impl<'fd> DrmBackend<'fd> {
         for &p in &self.planes {
             let pp = &self.plane_props[&p.into()];
             if !pp.primary {
+                // We do not use cursor or overlay planes. Clear any state left by
+                // the previous DRM master (for example, GDM's hardware cursor).
+                req.add_property(p, pp.fb_id, property::Value::Framebuffer(None));
+                req.add_property(p, pp.crtc_id, property::Value::CRTC(None));
                 continue;
             }
             if let Some(o) = self.outputs.iter().find(|o| o.plane == p) {
