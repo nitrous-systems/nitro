@@ -2378,8 +2378,9 @@ impl<S: 'static> Ui<S> {
     }
 
     /// Route a key to the focused widget, bubbling to the root, then to
-    /// the app's own handlers. `Tab` is the framework's: it moves focus
-    /// and is never offered to a widget.
+    /// the app's own handlers. A pressed, unhandled `Tab` (including
+    /// Shift-Tab) finally falls back to framework focus traversal; a widget
+    /// or app handler can take it to override that behavior.
     ///
     /// The order for a press is the whole of the key contract:
     ///
@@ -2389,7 +2390,8 @@ impl<S: 'static> Ui<S> {
     ///    same way — which is how a text field types a `q` that an app
     ///    also uses as a shortcut;
     /// 3. only then the handlers registered with [`Ui::on_key`] and
-    ///    [`Ui::set_shortcut`], in registration order.
+    ///    [`Ui::set_shortcut`], in registration order;
+    /// 4. for a pressed, still-unhandled Tab or Shift-Tab, focus traversal.
     ///
     /// A widget therefore always wins over an app shortcut, and an app
     /// shortcut always gets the keys no widget wanted.
@@ -2401,10 +2403,6 @@ impl<S: 'static> Ui<S> {
             mods: k.mods,
             text: k.utf8.clone(),
         };
-        if pressed && k.keycode == key::TAB {
-            self.focus_next(state, ev.shift());
-            return;
-        }
         let target = self.focused.or(self.root);
         let mut handled = Handled::No;
         if let Some(target) = target {
@@ -2427,7 +2425,10 @@ impl<S: 'static> Ui<S> {
         // and again on the release would run twice, and the handler
         // signature has no way to tell the two apart.
         if pressed && !handled.is_handled() {
-            self.run_key_handlers(state, &ev);
+            handled = self.run_key_handlers(state, &ev);
+        }
+        if pressed && k.keycode == key::TAB && !handled.is_handled() {
+            self.focus_next(state, ev.shift());
         }
     }
 

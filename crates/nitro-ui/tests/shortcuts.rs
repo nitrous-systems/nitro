@@ -168,6 +168,47 @@ fn a_shortcut_matches_its_modifiers_exactly() {
 }
 
 #[test]
+fn a_handler_can_take_tab_before_focus_traversal() {
+    let mut h = Harness::sized(
+        "handled-tab",
+        Seen::default(),
+        Size::new(200.0, 80.0),
+        |ui: &mut Ui<Seen>| {
+            let first = ui.build(button("first").on_click(|_: &mut Seen, _: &mut Ui<Seen>| {}));
+            let second = ui.build(button("second").on_click(|_: &mut Seen, _: &mut Ui<Seen>| {}));
+            let root = ui.build(row().gap(8.0));
+            ui.attach(root, first).unwrap();
+            ui.attach(root, second).unwrap();
+            ui.on_key(|s: &mut Seen, _: &mut Ui<Seen>, k: &KeyEvent| {
+                if k.keycode == key::TAB {
+                    s.keys.push("tab".into());
+                    Handled::Yes
+                } else {
+                    Handled::No
+                }
+            });
+            root
+        },
+    );
+    let root = h.ui().root().unwrap();
+    let first = h.ui().children(root)[0];
+    let second = h.ui().children(root)[1];
+    h.ui().focus(first);
+    h.settle();
+
+    h.key(key::TAB);
+
+    assert_eq!(h.state().keys, ["tab"]);
+    assert_eq!(
+        h.ui().focused(),
+        Some(first),
+        "handled Tab must not traverse focus"
+    );
+    assert_ne!(h.ui().focused(), Some(second));
+    h.quit();
+}
+
+#[test]
 fn handlers_run_in_registration_order_until_one_takes_the_key() {
     let mut h = Harness::sized(
         "order",

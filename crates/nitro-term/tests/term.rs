@@ -132,6 +132,34 @@ fn type_text(h: &mut Harness<TermApp>, grid: WidgetId, text: &str) {
 // ---------------------------------------------------------------------
 
 #[test]
+fn tab_reaches_the_pty() {
+    let (mut h, grid) = harness_running(&[
+        "/bin/sh",
+        "-c",
+        "printf ready; stty raw -echo; dd bs=1 count=2 status=none | od -An -t u1",
+    ]);
+
+    pump_until(&mut h, "the byte dumper to be ready", |h| {
+        screen(h, grid).contains("ready")
+    });
+
+    h.key(key::TAB);
+    h.key(key::ENTER);
+    pump_until(&mut h, "od to print Tab", |h| {
+        let output = screen(h, grid);
+        let bytes = output.split_whitespace().collect::<Vec<_>>();
+        bytes.windows(2).any(|pair| pair == ["9", "13"])
+    });
+    let output = screen(&mut h, grid);
+    let bytes = output.split_whitespace().collect::<Vec<_>>();
+    assert!(
+        bytes.windows(2).any(|pair| pair == ["9", "13"]),
+        "od received Tab (09) and Enter (13): {bytes:?}"
+    );
+    h.quit();
+}
+
+#[test]
 fn echo_hello_shows_hello_in_the_grid() {
     let (mut h, grid) = harness_running(&["/bin/sh", "-c", "echo hello"]);
     pump_until(&mut h, "hello", |h| screen(h, grid).contains("hello"));
