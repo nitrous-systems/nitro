@@ -136,7 +136,7 @@ fn tab_reaches_the_pty() {
     let (mut h, grid) = harness_running(&[
         "/bin/sh",
         "-c",
-        "printf ready; stty raw -echo; dd bs=1 count=2 status=none | od -An -t u1",
+        "stty raw -echo; printf ready; dd bs=1 count=2 status=none | od -An -t u1",
     ]);
 
     pump_until(&mut h, "the byte dumper to be ready", |h| {
