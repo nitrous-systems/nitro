@@ -1,5 +1,7 @@
 //! The widget set: [`Flex`], [`Panel`], [`Label`], [`Button`], [`Icon`] and
-//! [`Spacer`].
+//! [`Spacer`], plus [`TextField`], [`Checkbox`], [`Slider`], [`Scroll`],
+//! [`Separator`] and [`Image`]. The split-view widgets — `SidebarRow`,
+//! `Card`, `CardRow`, `Pages`, `Switch` — live in [`split`](crate::split).
 //!
 //! Each is a plain struct with a builder function (`column()`, `label()`,
 //! `button()`) and setters reachable through

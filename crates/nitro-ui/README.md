@@ -68,7 +68,10 @@ socket — see below.
 ## Widgets
 
 `Flex` (`column()`, `row()`), `Panel`, `Label`, `Button`, `TextField`,
-`Checkbox`, `Slider`, `Scroll`, `Separator`, `Image`, `Spacer`. Each has
+`Checkbox`, `Slider`, `Scroll`, `Separator`, `Image`, `Icon`, `Spacer`,
+`List`; and the split-view blueprint in `split` — `SidebarRow`, `Card`,
+`CardRow`, `Pages`, `Switch`, with `split_view()`, `content_column()`,
+`group_caption()`, `footnote()` composing them (`docs/ui.md`). Each has
 a builder, a `WidgetMut` impl with setters, and `role`/`accessible`/
 `action` so the introspection socket can read and drive it. Sizes, radius
 and padding come from a `Theme`, overridable at `App` level.

@@ -339,6 +339,11 @@ widgets on the wallpaper — before, **0** after (`docs/settings.md`).
 | `Image` | `image` | `WxH` | — | an `ARGB` buffer, uploaded once in a memfd |
 | `Icon` | `icon` | the icon **name** | `set_icon`, `set_value` | named, never drawn: the server owns the artwork (`docs/icons.md`) |
 | `Spacer` | `spacer` | — | — | `.grow(1.0)` and nothing else |
+| `SidebarRow` | `button` | its label | `click`, `activate`, `focus`, `set_selected` | the split view's category row: icon + label on a rounded pill; Up/Down walk the siblings |
+| `Card` | `container` | — | — | a surface with a hairline ring; paints an inset hairline between each pair of rows |
+| `CardRow` | `container` / `button` | its label | `click`, `activate`, `focus` when clickable | label (+ subtitle) left, one control right; `.on_click` makes it a navigation row with a chevron |
+| `Pages` | `container` | the current index | `set_value`, `show` | every page laid out, one shown; a switch is two `SetVisible`s |
+| `Switch` | `checkbox` | `true`/`false` | `toggle`, `set_value`, `focus` | a toggle pill with the checkbox's role, so `hey set … value true` is the same |
 
 `Role::Terminal` exists too, and has no widget in this crate: it is what
 `nitro-term`'s grid answers, and it is here because the role vocabulary
@@ -651,6 +656,94 @@ Every one of them answers `role()`, `accessible()` and `action()`, which
 is what the introspection socket serves and what an AT-SPI bridge will
 read. `action()` is not optional in spirit: it is the difference between
 a widget a script can drive and one it can only look at.
+
+## Split view blueprint
+
+The layout every current desktop converges on — categories or places on
+the left, content on the right (GNOME Settings and Files, macOS System
+Settings and Finder; `docs/research/`) — shipped as one set of builders
+in `nitro_ui::split` so `nitro-settings`, `nitro-files` and the apps
+after them share one anatomy:
+
+```text
+┌──────────────┬─────────────────────────────────────────────┐
+│ Settings     │ Displays                          [header]  │  46 px, flat, bold 15
+│              ├─────────────────────────────────────────────┤
+│ ▣ Displays   │  Outputs                        [caption]   │  15 px @600, 24 above
+│   Keyboard   │ ┌─────────────────────────────────────────┐ │
+│   Audio      │ │ Label                 control           │ │  card: Surface, r10,
+│   Appearance │ │·········································│ │  1 px Hairline ring;
+│              │ │ Label                 control           │ │  rows ≥ 40 px, inset
+│  [sidebar]   │ └─────────────────────────────────────────┘ │  hairlines between
+│              │  A dim footnote under the card.  [footnote] │  12 px TextDim
+└──────────────┴─────────────────────────────────────────────┘
+   200 px, SidebarBackground   │ 1 px Hairline   content, WindowBackground, 20 px gutters
+   rows 32 px, inset 6, r8                       column clamped to 600 (GNOME) unless `.unclamped()`
+```
+
+Every colour is a role — `SidebarBackground`, `SidebarSelected`,
+`SidebarHover`, `Hairline` are the four the blueprint added
+(`docs/theme.md`), the rest are `Surface`, `Text`, `TextDim`, `Accent`,
+`Focus` — so the whole view follows a `theme.scheme` switch without
+being told (`the_sidebar_and_cards_follow_a_scheme_switch`). The
+measurements are `pub const`s in the module (`SIDEBAR_WIDTH`,
+`SIDEBAR_ROW_HEIGHT`, `CARD_RADIUS`, …) so an app and a test read the
+same numbers.
+
+**`split_view()` is built, not converted.** The other builders are
+`IntoWidget`; this one is `split_view()….build(ui) -> SplitParts`,
+because an app needs the ids of the slots — it attaches rows to
+`parts.sidebar`, pages to `parts.content_body`, changes
+`parts.title`. Slots take either a builder (`.content(..)`) or a widget
+the app built earlier because a callback captured an id
+(`.content_id(..)`, `.content_header_leading_id(..)`), and every slot has
+a stable default name (`sidebar`, `sidebar_header`, `content`,
+`content_header`, `title`, `content_body`, `content_footer`) so `hey`
+resolves them without holding ids.
+
+**Selection is neutral and deferred.** A `SidebarRow` selected is
+`SidebarSelected`, a grey pill, not the accent — the accent is for the
+control that wants attention. A row that selects itself from its own
+`on_click` must `ui.defer` the `set_selected`, for the rule above: it
+is out of its slot while its callback runs. The shape both apps use is
+one deferred `select(i)` that updates every row, the page stack and the
+title.
+
+**`Pages` hides, it does not relayout.** Every page is laid out at the
+full body and *kept* laid out; the pages that are not current are hidden
+with `Ui::set_node_visible`, a `WidgetState.visible` flag that sends
+one `SetVisible` per change. A hidden subtree is skipped by hit-testing
+(the pointer does not enter it) and by `focus_order` (Tab does not reach
+into it), but it keeps its bounds and its names: `hey get keyboard/layout
+value` answers from any page, `hey list` shows it with a `hidden` flag,
+and `get … visible` says which. A page switch is `SetVisible` ×2, the
+two rows' fills, the title's `SetText` and one commit —
+`clicking_a_sidebar_row_shows_that_page_and_only_that_page` counts them.
+The alternative — placing hidden pages at zero size — re-laid-out every
+eliding label on every switch, which is why the flag exists.
+
+**Cards paint their own separators.** `Card::layout` runs the flex
+solver and then records each row's `y`; if the list moved it marks
+itself paint-dirty, and `paint` draws one inset hairline per row after
+the first (`a_card_paints_one_separator_fewer_than_its_rows`). A settled
+card is idle. The hairline ring stands in for the shadow both desktops
+draw: the scene has no shadows.
+
+**`CardRow` hover is for navigation rows only.** Nothing clips to a
+card's radius, so a hover face on every row would poke out of the
+corners; a plain label/control row paints nothing, a `.on_click` row
+paints `SidebarHover` and a `chevron-right`.
+
+**`List` grew `row_inset`/`row_radius`** so a list in a pane draws the
+same rounded pill the sidebar rows have; the defaults are 0, so a
+launcher's full-width slab is unchanged.
+
+**How chat and mail should use it.** Rooms or folders are `sidebar_row`s
+under `sidebar_section`s, with `.badge("3")` for unread counts and
+`sidebar_separator()` between accounts; the content header carries the
+room's name and `content_header_trailing` its actions; the message list
+is a `List` with `row_inset(6)`; compose and per-account settings are
+`content_column`s of `card`s. Nothing in the blueprint is settings-shaped.
 
 ## Layout
 
@@ -1423,6 +1516,11 @@ regrets:
 * **A widget must paint to be hit.** Inherited from the server's hit
   test, and correct there; documented above because it is surprising from
   inside a widget.
+* **A hidden page's widgets are still listed.** `set_node_visible(false)`
+  keeps a subtree in the tree with its bounds, so `hey list` prints it
+  (flagged `hidden`) at the coordinates it would have. That is the
+  feature — a script sets a control on any page — and the trap: a pixel
+  probe at a hidden widget's bounds sees the page on top of it.
 * **The flex solver clamps min/max once** rather than iterating as CSS
   does, so a child whose clamp releases free space does not give it back
   to its siblings. An overflow that no child will absorb — the usual
