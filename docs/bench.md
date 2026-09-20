@@ -11,13 +11,18 @@ burning a whole core to do it.
 benchmarks in the field — `x11perf`'s operation micro-benchmarks and six
 demoscene effects — to a retained scene graph, runs them on the test box
 with the real desktop up, and writes one JSON object per run to a ledger.
-Everything below is from one such ledger, checked in as
-`docs/bench-1f35491.jsonl`: **140 scenario runs** plus one bandwidth
-measurement, sha `1f35491`, host `ubuntu`, taken 2026-09-16 in a single
-sitting **swept over three refresh rates** — 1920×1080@60, 1920×1080@120
-and 1280×720@240 (§9). The previous ledger,
-`docs/bench-72ef50b.jsonl` (54 runs at 60 Hz only), is kept for history;
-**this one is current** and every table below is regenerated from it.
+**Four ledgers are checked in, and which one a number came from decides
+what it means:**
+
+| ledger | runs | what it is |
+|---|---|---|
+| `docs/bench-72ef50b.jsonl` | 54 | The first sitting, 60 Hz only. Kept for history. |
+| **`docs/bench-1f35491.jsonl`** | **140** | sha `1f35491`, 2026-09-16, one sitting **swept over three refresh rates** — 1920×1080@60, 1920×1080@120 and 1280×720@240 (§9). **§6–§9 are generated from and argue from this ledger**, and it is the only one with a 120 Hz arm. It is **pre-#3728**, so its fullscreen paint figures are superseded by §7.10b — they are left as measured rather than rewritten. |
+| `docs/bench-49d023b.jsonl` | 16 | The #569 pair (§7.10a): `28b6fdd` → `49d023b`, both arms in one sitting, fullscreen 1080p@60 only. |
+| **`docs/bench-5e4b02e.jsonl`** | **86** | sha `5e4b02e`, 2026-09-20, **post-#3728** — two arms, 1920×1080@60 and 1280×720@240, **no 120 Hz arm**. The current fullscreen numbers (§7.10b), and what closed #568. |
+
+Everything in §6–§9 below is from `1f35491` unless a section says
+otherwise; §7.10a and §7.10b say otherwise and name their own ledgers.
 
 **Headline: the same bouncing ball costs 20 833 µs of client CPU per
 frame as a fullscreen pixel buffer and 111 µs as a moved sprite node,
@@ -1157,7 +1162,17 @@ presented 59.0/s. §9.1 is what happens to that row when the budget
 halves: it falls to **23.3 presented/s at 120 Hz**, the largest loss in
 the sweep. That row is the best single illustration of why this document
 exists: fps says "fine", and CPU per frame says "one more window on that
-screen and it is not". It gets there by having the cheapest effect of the
+screen and it is not".
+
+> **Superseded 2026-09-20 (#3728):** this row's margin is no longer
+> nonexistent. Re-measured on the box after #3728, rotozoom fullscreen
+> at 1080p@60 costs **6 889 µs/frame against the 16 667 budget — 41 %,
+> not 99.1 %** — with paint 10 963 → 3 951 µs. §7.10b has the table. The
+> paragraph is left as measured because the *reasoning* is the durable
+> part and §9.1's 120 Hz column is `1f35491`'s; what changed is the
+> number, not the lesson.
+
+It gets there by having the cheapest effect of the
 three (6 881 µs, a per-pixel gather rather than a transcendental) and
 paying the most for its upload (5 411 µs, 43 % of its client frame).
 
@@ -1240,8 +1255,417 @@ what `crates/nitro-server/tests/shadow.rs`'s screenshot-equality tests
 assert in CI. `plasma` at 15/s and `putimage` at 30/s are effect-bound
 (47 333 and 25 833 µs/frame of pure compute) and stay exactly where they
 were: removing the upload cannot help a client that spends fifty
-milliseconds in its own sine loop. #568 is untouched and is now the
-largest remaining term on these rows.
+milliseconds in its own sine loop. #568 is untouched by *this* change and
+was the largest remaining term on these rows — until #3728, which is
+§7.10b, the next section.
+
+### 7.10b #568 re-measured after #3728 — the 11.5 ms headline is dead, and ns/px fell at both sizes
+
+Everything above §7.10a is the `1f35491` ledger and is left as measured.
+This section is a **third, separate sitting**, and its numbers come from
+`docs/bench-5e4b02e.jsonl` — not from editing the tables above. The
+reason it is added rather than substituted is stated plainly in §7.10b.6.
+
+**Why the re-measure.** #3728 (`7509d73`, "Skip occluded passes and widen
+the 1:1 opaque blit store") landed two levers: skipping passes fully
+occluded by an opaque 1:1 XR24 image, and an 8-byte widened store in the
+1:1 opaque blit. Its commit message records a **dev-machine** figure —
+`starfield --n 500 --fullscreen` at 976 µs against ~2 400 — on the *fake*
+backend, with no scanout, no bar and no launcher behind it. The box sweep
+was deliberately not re-run at the time, correctly, because this
+document's provenance rule forbids rewriting tables from a ledger that
+does not exist. The consequence was that §8a still argued from
+`paint_us_mean` **11 757 µs / 71 % of the frame** — honest, sourced, and
+**stale by one lever**.
+
+**Provenance.** 86 scenario runs plus one bandwidth probe, sha
+`5e4b02e`, host `ubuntu`, 2026-09-20, one sitting, 6 s per run — the same
+run length as the `1f35491` sitting, so run length is not a variable
+between the two. Two arms: **1920×1080@60** (54 runs) and **1280×720@240**
+(32 runs, the reduced matrix). The ledger carries
+`# binaries unchanged across the whole run: c0bb1f5d… 50870c57…` at both
+ends, and those md5s were compared against the **local** `target/release`
+binaries before the run started — the script's own fingerprint pair
+answers "was it mine throughout", and only the local↔box comparison
+answers "is it the tree I think it is", which `deploy/bench.sh` cannot
+check because it runs on the box. **No `# SKIPPED` arm, no `# FAILED`
+row, no `# INVALID` line**; every record's `sha` is `5e4b02e` and none
+carries the `-box-checkout` fallback suffix.
+
+**There is no 120 Hz arm in this ledger.** §9's three-rate argument rests
+on `1f35491` and is untouched by this section.
+
+#### 7.10b.1 The headline: 11 517 → 5 424 µs, and 69 % → 33 % of the frame
+
+Fullscreen 1920×1080@60, `paint_us_mean` µs. **Pre** is `1f35491`
+(pre-#3728); **now** is `5e4b02e`. Both columns are fullscreen rows at
+60 Hz in their own ledger — the rate is in the key deliberately, see
+§7.10b.7.
+
+| fullscreen 1080p@60 | paint pre | paint **now** | × | copy pre → now | server µs/f pre → now | presented/s pre → now | % of 16 667 µs frame |
+|---|---|---|---|---|---|---|---|
+| `starfield n=100` | 11 553 | **5 328** | 2.17 | 2 141 → 2 500 | 16 500 → **8 189** | 60.0 → 59.8 | 69 % → **32 %** |
+| `starfield n=500` | 11 517 | **5 424** | 2.12 | 2 144 → 2 524 | 16 356 → **8 273** | 59.0 → 59.8 | 69 % → **33 %** |
+| `starfield n=2000` | 11 757 | **5 391** | 2.18 | 2 182 → 2 518 | 16 741 → **8 245** | 59.8 → 59.8 | 71 % → **32 %** |
+| `balls n=32` | 11 663 | **5 365** | 2.17 | 2 139 → 2 538 | 16 657 → **8 194** | 59.8 → 60.0 | 70 % → **32 %** |
+| `rotozoom` | 10 963 | **3 951** | 2.77 | 2 793 → 2 802 | 16 525 → **6 889** | 59.0 → 60.0 | 66 % → **24 %** |
+| `fire` | 3 697 | **2 245** | 1.65 | 3 128 → 2 451 | 16 667 → **8 068** | 30.0 → 34.4 | 22 % → **13 %** |
+| `plasma` | 3 511 | **1 576** | 2.23 | 2 094 → 2 106 | 14 444 → **7 582** | 15.0 → 15.2 | 21 % → **9 %** |
+| `boing` \* | 5 976 | **5 587** | 1.07 | 2 666 → 3 820 | 20 389 → **9 765** | 30.0 → **55.4** | 36 % → **34 %** |
+| `boing-node` *(control)* | 9 572 | 9 637 | 0.99 | 205 → 202 | 10 000 → 10 084 | 59.8 → 59.8 | 57 % → 58 % |
+| `starfield-nodes n=500` *(control)* | 5 202 | 5 220 | 1.00 | 2 512 → 2 523 | 8 750 → 8 806 | 60.0 → 60.0 | 31 % → 31 % |
+| `balls-nodes n=32` *(control)* | 3 743 | 3 778 | 0.99 | 1 013 → 1 019 | 6 045 → 6 100 | 59.8 → 59.8 | 22 % → 23 % |
+
+\* `boing --fullscreen` runs **twice per arm** in both ledgers — once in
+the effects loop and once as the pixel arm of the boing pair — so its row
+is the mean of the two (pre 5 912/6 041, now 5 659/5 515). §9.6's table
+quoted the single 6 041 run. Picking one silently would be the same class
+of error as §7.10b.7's.
+
+**So the answer to the headline question is: neither.** Not the 11.5 ms
+this document had been claiming, and not the 976 µs the dev box
+suggested. **≈5 400 µs**, a 2.1–2.8× improvement on the exact metric #568
+was filed against, and paint is now **a third of the 60 Hz frame rather
+than 71 %**. The dev figure was never going to transfer: it is a fake
+backend with no scanout and no shell clients, and this box runs every row
+with the bar, the launcher and the wallpaper up.
+
+**The three retained-path rows are controls and do not move** (0.99–1.00×).
+#3728's levers are about an opaque 1:1 image blit, which the node path
+never takes, so a change that moved them would have been a change doing
+something other than advertised.
+
+**`copy_us_mean` does not improve, and on the damage-saturated rows it
+rises slightly** (2 141 → 2 500 on `starfield n=100`). That is the right
+shape: #3728 removed *paint* passes, and the shadow→scanout copy is the
+same number of bytes over the same write-combined path either way. It is
+also why the frame's total is not down by the full paint saving.
+
+#### 7.10b.2 ns/px at both sizes — the question that survives the fix
+
+This is what the task existed to settle. §9.6 established that the
+per-pixel excess is **proportional to area rather than fixed per frame**,
+so lever A removing *redundant passes* would not, on its own, make the
+remaining pass cheaper per pixel. If ns/px had fallen at 1080p only, the
+gap would still be open.
+
+`ns/px = paint_us_mean × 1000 ÷ damage_px_mean`, per row, in each row's
+own ledger. **The 720p column is at 240 Hz in both ledgers** — that is the
+only 720p arm either sitting has, so the size comparison holds the rate
+fixed at a rate that differs from the 1080p column. §9.6 carries the same
+caveat and it is unchanged here.
+
+| fullscreen | 1080p@60 ns/px pre → **now** | × | 720p@240 ns/px pre → **now** | × |
+|---|---|---|---|---|
+| `plasma` | 1.69 → **0.76** | 2.23 | 1.49 → **0.82** | 1.81 |
+| `fire` | 1.78 → **1.08** | 1.65 | 1.52 → **0.82** | 1.87 |
+| `boing` | 2.88 → **2.69** | 1.07 | 2.13 → **1.18** | 1.80 |
+| `rotozoom` | 5.29 → **1.91** | 2.77 | 4.93 → **1.86** | 2.65 |
+| `starfield n=100` | 5.57 → **2.57** | 2.17 | 5.60 → **2.15** | 2.60 |
+| `starfield n=500` | 5.55 → **2.62** | 2.12 | 5.62 → **2.16** | 2.59 |
+| `starfield n=2000` | 5.67 → **2.60** | 2.18 | 5.64 → **2.19** | 2.58 |
+| `balls n=32` | 5.62 → **2.59** | 2.17 | *(1080p only — no `balls` in the reduced 720p matrix)* | — |
+| `boing-node` *(control)* | 56.68 → 57.07 | 0.99 | 57.81 → **38.39** | 1.51 |
+| `starfield-nodes n=500` *(control)* | 2.51 → 2.52 | 1.00 | 1.84 → 1.80 | 1.02 |
+
+**ns/px fell at both sizes, on every pixel-arm scenario.** 1.07–2.77× at
+1080p and 1.80–2.65× at 720p. The fall is not smaller at the smaller size
+— for `boing`, `fire` and the starfields it is *larger* — which is the
+shape that distinguishes "the remaining pass got cheaper per pixel" from
+"redundant whole-frame passes were removed at the larger frame only". Had
+#3728 only skipped passes, the 720p column would have moved less than the
+1080p one, not more.
+
+`balls n=32` has no 720p counterpart: the reduced `matrix_720p240` drops
+the balls pair. That is a row the 720p arm never ran, not a blank
+measurement — saying which is the point of §11.1.
+
+`boing-node` at 720p is the one control that moves (57.81 → 38.39), and
+it is not a paint improvement: it damages 75 667 px there, the smallest
+damage in the matrix, and it went from 120.8 to 240.0 presented/s between
+the sittings. Its ns/px is dominated by per-frame overhead divided by a
+tiny area, which is exactly the regime §9.6 says ns/px is the wrong
+statistic for. At 1080p, where it damages 168 868 px, it is flat (0.99×).
+
+#### 7.10b.3 The `putimage` fit, recomputed — and why the old one cannot be reused
+
+#568's argument was an extrapolation: fit `putimage`'s damage/paint
+points, extrapolate to 2 073 600 px, and compare against what fullscreen
+measures. Three different numbers for that extrapolation are in
+circulation (the issue's ~3 250 µs, §8a/§9.6's ~3 060 µs, and a
+least-squares fit over `1f35491`'s four points giving 2 780 µs), from
+different ledgers and different methods.
+
+**The fit has to be recomputed from this ledger, not quoted**, for two
+reasons. The first is #3728 itself: `putimage`'s buffer is an opaque 1:1
+XR24 image, so lever A speeds the *fit* up too, and comparing a new
+fullscreen number against the old fit would be exactly the error this
+document is about. The second is that **`putimage`'s damage changed
+between the two ledgers for an unrelated reason**: #3726 made the server
+clip a window's content to the window, so the sweep's oversized buffers
+are now cut at the 640×480 window edge — `size 500` damages 500×480 =
+240 000 px where it damaged 250 000, and `size 1080` damages 640×480 =
+307 200 px where `1f35491` recorded 613 440. The new arm's lever arm is
+therefore **shorter**, and an extrapolation to 2 073 600 px from it
+reaches 6.7× beyond its largest point.
+
+Method: ordinary least squares `paint_us = a + b·px` over the `putimage`
+rows of one arm, stated with the points used.
+
+| fit | points (px) | `paint_us = a + b·px` | → at 2 073 600 px | fullscreen `starfield n=500` measures | residual |
+|---|---|---|---|---|---|
+| `1f35491` 60 Hz, all 4 | 10 010 / 62 502 / 250 000 / 613 440 | 206 + 1.241 µs/1000px | 2 780 µs | 11 517 | **4.14×** |
+| `5e4b02e` 60 Hz, all 4 | 10 000 / 62 500 / 240 000 / 307 200 | 11 + 0.919 µs/1000px | **1 916 µs** | 5 424 | **2.83×** |
+| `1f35491` 60 Hz, 3 small | 10 010 / 62 502 / 250 000 | 96 + 2.520 µs/1000px | 5 320 µs | 11 517 | 2.16× |
+| `5e4b02e` 60 Hz, 3 small | 10 000 / 62 500 / 240 000 | 9 + 0.948 µs/1000px | 1 975 µs | 5 424 | 2.75× |
+
+And at 720p (target 921 600 px), where the arm has three points and tops
+out at `size 720`:
+
+| fit | points (px) | → at 921 600 px | fullscreen measures | residual |
+|---|---|---|---|---|
+| `1f35491` 240 Hz | 10 000 / 250 000 / 380 160 | 941 µs | 5 177 | **5.50×** |
+| `5e4b02e` 240 Hz | 10 000 / 240 000 / 307 200 | **425 µs** | 1 995 | **4.69×** |
+
+**Read these as bounds, not as a single number.** The residual is
+sensitive to which points enter the fit — 4.14× vs 2.16× on the *same*
+pre-fix ledger, purely from dropping the largest point — which is the
+honest reason #568's "~3.8×" and §8a's "~3 060 µs" and the issue's
+"~3 250 µs" never agreed. The slope is the durable part, and it is
+unambiguous: **1.241 → 0.919 µs/1000 px at 60 Hz (1.35× cheaper per
+pixel), 0.800 → 0.230 at 240 Hz**, measured on rows whose damage the
+window clip *shrank*, which if anything understates the gain.
+
+A residual of 2.8× remains at 1080p. It is smaller than the 4.1× the same
+method gave pre-fix, and it is measured against a fit whose largest point
+is now 307 200 px, so the extrapolation is six times beyond its data. **It
+is not evidence of a further 2.8× lever**; it is what a long extrapolation
+from a short lever arm looks like when the two regimes differ (a 640×480
+window's buffer versus a full-surface composite). Closing that question
+properly needs a `putimage` sweep whose points reach fullscreen area —
+which this matrix cannot produce, because #3726 now clips them to the
+window.
+
+#### 7.10b.4 Verdict on #568
+
+**The gap is closed and the issue dies.**
+
+The two things #568 asked for are both answered. The headline —
+`paint_us_mean` 11 757 µs, 71 % of the 60 Hz frame — is **5 328–5 424 µs
+and 32–33 %**, a 2.1–2.8× improvement on the exact metric. And the
+per-pixel question that survived the fix is answered the way a real fix
+answers it: **ns/px fell at 1080p *and* at 720p, on every pixel-arm
+scenario**, 1.07–2.77× and 1.80–2.65× respectively. Lever A did not
+merely remove redundant passes at the larger frame; the remaining pass is
+genuinely cheaper per pixel.
+
+What remains is a *measurement* limitation rather than a known cost: the
+residual between the `putimage` fit and the fullscreen rows is 2.8× at
+1080p, down from 4.1× by the same method, and the fit's lever arm is now
+too short to carry an extrapolation that far. That is not the 3.8×
+per-pixel gap #568 was filed about, and re-filing it would be inventing a
+finding out of an artefact of the fitting method. It is recorded here and
+in §9.6 so a future sweep can pick it up if it ever matters.
+
+Attribution, stated because the pre-ledger predates more than one lever:
+`1f35491` is 55 commits before `5e4b02e`, and two of them touch the pixel
+path — #3728 and #3754 (mapping sealed client buffers, `1bce188`). The
+`49d023b` ledger brackets them, its `28b6fdd` arm being post-#3728 and
+pre-#3754, so the two are separable and the answer is unambiguous:
+
+| fullscreen 1080p@60, `paint_us_mean` | `1f35491` pre-#3728 | `28b6fdd` +#3728 | `49d023b` +#3754 | `5e4b02e` now |
+|---|---|---|---|---|
+| `starfield n=500` | 11 517 | **5 874** | 5 264 | 5 424 |
+| `balls n=32` | 11 663 | **5 815** | 5 345 | 5 365 |
+| `rotozoom` | 10 963 | **3 984** | 3 850 | 3 951 |
+| `plasma` | 3 511 | **1 523** | 1 571 | 1 576 |
+
+**The entire drop happens at #3728**, and #3754 leaves `paint_us_mean`
+flat — as it must, since it removed the client's upload and the server's
+`pread`, neither of which is paint. The credit for this section's headline
+belongs to #3728 alone.
+
+#### 7.10b.5 What this sitting does not show
+
+- **No 120 Hz arm.** §9's rate argument is `1f35491`'s and is not
+  re-measured here. A fullscreen 1080p paint of 5 424 µs now fits inside
+  a 8 333 µs 120 Hz frame where 11 517 did not, but that is arithmetic
+  against a budget, **not a measurement at 120 Hz**, and §9.1's
+  bandwidth argument (three passes over the frame at 2.98 GB/s of an
+  available 3.56) is a separate ceiling this section does not touch.
+- **`balls` has no 720p row**, as above.
+- **The two sittings are four days apart** (2026-09-16 and 2026-09-20) on
+  a box whose numbers drift. The `boing`/`fire` presented/s differences
+  are partly #3754's client-side saving, not paint. The within-sitting
+  controls are what carry the claim: three retained-path rows flat to
+  within 1 %.
+- Standing caveat, unchanged: 2-core Haswell, SSE4.2, **no AVX2**. The
+  *ratio* travels; the absolute microseconds are this box's. Measured
+  `copy` bandwidth this sitting was 3.56 GB/s against 3.43 on the
+  `1f35491` sitting — a 4 % drift that bounds how much of any small
+  difference above is real.
+
+#### 7.10b.6 Why this is a new section and not a regeneration
+
+`just bench-report docs/bench-5e4b02e.jsonl` reproduces every table in
+this section, and the tables in §7.10b.8 are that tool's output pasted
+verbatim. They are **added** rather than swapped into §6/§9.8 for two
+reasons:
+
+1. **This ledger has no 120 Hz arm.** Regenerating §6 and §9.8 from it
+   would *delete* the column §9.1, §9.2, §9.3 and §9.5 argue from —
+   replacing one stale claim with four newly-unsupported ones.
+2. **Several hundred prose numbers in §7.1–§7.10 are quoted from
+   `1f35491` rows.** Regenerating the tables beneath them would leave
+   every one of those paragraphs silently contradicting the table above
+   it. An honestly-labelled stale table beats a document that disagrees
+   with itself.
+
+§7.10a set the precedent one lever earlier and states it in its first
+line. This is the same shape.
+
+#### 7.10b.7 An instrument bug, in the §9.7 tradition — committed in the analysis, not the run
+
+The first version of the script that produced §7.10b.1 keyed its
+before/after rows on `(scenario, n, width, height)` and **silently
+reported the 120 Hz numbers as the "pre" column**. `1f35491` holds
+fullscreen 1080p rows at *both* 60 and 120 Hz; with rate absent from the
+key, the 120 Hz arm — which is read second — overwrote the 60 Hz one.
+Every "pre" figure was plausible, internally consistent, and about the
+wrong arm: `balls n=32` read 12 401 instead of 11 663, and `rotozoom`
+4 946 instead of 10 963, which would have turned a 2.77× win into a
+1.25× one.
+
+**This is `report.rs`'s `rate_key` collision, reproduced in the analysis
+of the ledger it warns about** (`report.rs:164` drops `size` for
+fullscreen runs and keys on rounded hertz; `:214` is last-run-wins). It
+was caught by adding rate to the key and asserting the key is unique —
+at which point the assert fired again, on `boing --fullscreen`, which
+legitimately runs twice per arm. Both are now handled explicitly and the
+duplicate is disclosed in §7.10b.1's footnote rather than resolved by
+whichever row happened to be last.
+
+The same trap decided the run's shape: a `1280x720@60` arm was **not**
+added to this ledger, because a 720p@60 fullscreen row and a 1080p@60
+fullscreen row are the same `rate_key`, and `just bench-report` would
+have replaced every 1080p row in §7.10b.8 with its 720p twin — producing
+a complete, plausible, entirely wrong table. The 720p arm is at 240 Hz,
+which is also the only rate `1f35491` has 720p rows at.
+
+#### 7.10b.8 The generated tables for this ledger
+
+From `cargo run -q -p nitro-bench -- report docs/bench-5e4b02e.jsonl`,
+pasted verbatim; the fullscreen-relevant scenarios only. **Two arms: 60 Hz
+at 1920×1080 and 240 Hz at 1280×720.** Rows labelled `640x480` are the
+period-correct arm and run at both rates; rows labelled `1920x1080` are
+the 60 Hz arm's fullscreen and `1280x720` the 240 Hz arm's.
+
+#### putimage
+
+| run | presented/s | commits/s | mutations/frame | server µs/frame | client µs/frame | paint µs mean/max | copy µs mean | damage px | bytes/frame | flip rise µs | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| putimage 640x480 | 59.8 | 60.0 | 1.0 | 306.4 | 640.7 | 16.0/19.0 | 10.0 | 10000 | 56 | 0 | ok |
+| putimage 640x480 | 59.8 | 60.0 | 1.0 | 445.7 | 3788.3 | 72.0/94.0 | 84.0 | 62500 | 56 | 0 | ok |
+| putimage 640x480 | 60.0 | 60.0 | 1.0 | 694.4 | 9750.0 | 236.0/271.0 | 205.0 | 240000 | 56 | 0 | ok |
+| putimage 640x480 | 29.8 | 30.0 | 1.0 | 1508.4 | 26033.5 | 289.0/606.0 | 372.0 | 307200 | 56 | 0 | **slow** |
+| putimage 640x480 | 240.0 | 240.0 | 1.0 | 298.6 | 645.8 | 16.0/18.0 | 10.0 | 10000 | 56 | 0 | ok |
+| putimage 640x480 | 120.0 | 120.0 | 1.0 | 625.0 | 4777.8 | 69.0/303.0 | 172.0 | 240000 | 56 | 0 | **slow** |
+| putimage 640x480 | 60.0 | 60.0 | 1.0 | 1052.6 | 12382.3 | 176.0/377.0 | 265.0 | 307200 | 56 | 0 | **slow** |
+
+#### plasma
+
+| run | presented/s | commits/s | mutations/frame | server µs/frame | client µs/frame | paint µs mean/max | copy µs mean | damage px | bytes/frame | flip rise µs | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| plasma 640x480 | 59.8 | 60.0 | 1.0 | 640.7 | 8607.2 | 234.0/266.0 | 269.0 | 307200 | 56 | 0 | ok |
+| plasma 1920x1080 | 15.2 | 15.0 | 1.0 | 7582.4 | 46703.3 | 1576.0/3219.0 | 2106.0 | 2073600 | 56 | 16666 | **dropped** |
+| plasma 640x480 | 120.1 | 119.9 | 1.0 | 873.8 | 5936.2 | 120.0/268.0 | 245.0 | 307200 | 56 | 0 | **slow** |
+| plasma 1280x720 | 40.0 | 40.0 | 1.0 | 3541.7 | 20166.7 | 760.0/1583.0 | 903.0 | 921600 | 56 | 0 | **slow** |
+
+#### fire
+
+| run | presented/s | commits/s | mutations/frame | server µs/frame | client µs/frame | paint µs mean/max | copy µs mean | damage px | bytes/frame | flip rise µs | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| fire 640x480 | 59.7 | 59.9 | 1.0 | 1197.8 | 8969.4 | 434.0/522.0 | 431.0 | 307200 | 56 | 0 | ok |
+| fire 1920x1080 | 34.4 | 34.4 | 1.0 | 8067.6 | 18357.5 | 2245.0/4928.0 | 2451.0 | 2073600 | 56 | 0 | **slow** |
+| fire 640x480 | 240.0 | 240.0 | 1.0 | 659.7 | 2465.3 | 258.0/281.0 | 273.0 | 307200 | 56 | 0 | ok |
+| fire 1280x720 | 73.2 | 73.0 | 1.0 | 3553.5 | 9430.5 | 753.0/1576.0 | 891.0 | 921600 | 56 | 0 | **slow** |
+
+#### rotozoom
+
+| run | presented/s | commits/s | mutations/frame | server µs/frame | client µs/frame | paint µs mean/max | copy µs mean | damage px | bytes/frame | flip rise µs | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| rotozoom 640x480 | 59.8 | 60.0 | 1.0 | 1142.1 | 3649.0 | 416.0/459.0 | 418.0 | 307200 | 56 | 0 | ok |
+| rotozoom 1920x1080 | 60.0 | 60.0 | 1.0 | 6888.9 | 9250.0 | 3951.0/6013.0 | 2802.0 | 2073600 | 56 | 0 | ok |
+| rotozoom 640x480 | 240.0 | 240.0 | 1.0 | 715.3 | 1618.1 | 247.0/277.0 | 293.0 | 307200 | 56 | 0 | ok |
+| rotozoom 1280x720 | 235.9 | 235.9 | 1.0 | 3241.5 | 3170.9 | 1713.0/1749.0 | 1356.0 | 921600 | 56 | 0 | ok |
+
+#### boing
+
+| run | presented/s | commits/s | mutations/frame | server µs/frame | client µs/frame | paint µs mean/max | copy µs mean | damage px | bytes/frame | flip rise µs | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| boing 640x480 | 59.8 | 60.0 | 1.0 | 1420.6 | 6378.8 | 668.0/1045.0 | 448.0 | 307200 | 56 | 0 | ok |
+| boing 1920x1080 | 59.2 | 59.2 | 1.0 | 9691.0 | 15814.6 | 5659.0/5765.0 | 3826.0 | 2073600 | 56 | 0 | ok |
+| boing 640x480 | 59.8 | 59.9 | 1.0 | 1309.2 | 6267.4 | 561.0/949.0 | 429.0 | 307205 | 56 | 0 | ok |
+| boing 1920x1080 | 51.5 | 51.5 | 1.0 | 9838.7 | 16161.3 | 5515.0/5660.0 | 3814.0 | 2073600 | 56 | 0 | ok |
+| boing 640x480 | 239.8 | 239.9 | 1.0 | 681.0 | 2223.8 | 257.0/382.0 | 278.0 | 307200 | 56 | 0 | ok |
+| boing 1280x720 | 120.2 | 120.0 | 1.0 | 4771.2 | 6352.3 | 1088.0/2250.0 | 1215.0 | 921600 | 56 | 0 | **slow** |
+
+#### boing-node
+
+| run | presented/s | commits/s | mutations/frame | server µs/frame | client µs/frame | paint µs mean/max | copy µs mean | damage px | bytes/frame | flip rise µs | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| boing-node 640x480 | 60.0 | 60.0 | 1.0 | 2277.8 | 55.6 | 2021.0/2097.0 | 43.0 | 32880 | 52 | 0 | ok |
+| boing-node 1920x1080 | 59.8 | 60.0 | 1.0 | 10083.6 | 55.7 | 9637.0/9731.0 | 202.0 | 168868 | 52 | 0 | ok |
+| boing-node 640x480 | 240.0 | 240.0 | 1.0 | 2256.9 | 62.5 | 2014.0/2045.0 | 43.0 | 33061 | 52 | 0 | ok |
+| boing-node 1280x720 | 240.0 | 240.0 | 1.0 | 3104.2 | 48.6 | 2905.0/2964.0 | 63.0 | 75667 | 52 | 0 | ok |
+
+#### starfield
+
+| run | presented/s | commits/s | mutations/frame | server µs/frame | client µs/frame | paint µs mean/max | copy µs mean | damage px | bytes/frame | flip rise µs | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| starfield n=100 640x480 | 59.8 | 60.0 | 1.0 | 1337.0 | 473.5 | 663.0/1317.0 | 430.0 | 307200 | 56 | 0 | ok |
+| starfield n=100 1920x1080 | 59.8 | 60.0 | 1.0 | 8189.4 | 3899.7 | 5328.0/5631.0 | 2500.0 | 2073600 | 56 | 0 | ok |
+| starfield n=500 640x480 | 59.8 | 60.0 | 1.0 | 1197.8 | 445.7 | 511.0/1008.0 | 419.0 | 307200 | 56 | 0 | ok |
+| starfield n=500 1920x1080 | 59.8 | 60.0 | 1.0 | 8273.0 | 4094.7 | 5424.0/5787.0 | 2524.0 | 2073600 | 56 | 0 | ok |
+| starfield n=2000 640x480 | 60.0 | 60.0 | 1.0 | 1305.6 | 611.1 | 603.0/1086.0 | 443.0 | 307200 | 56 | 0 | ok |
+| starfield n=2000 1920x1080 | 59.8 | 60.0 | 1.0 | 8245.1 | 4178.3 | 5391.0/5736.0 | 2518.0 | 2073600 | 56 | 0 | ok |
+| starfield n=100 640x480 | 240.0 | 240.0 | 1.0 | 1215.3 | 423.6 | 519.0/839.0 | 427.0 | 307200 | 56 | 0 | ok |
+| starfield n=100 1280x720 | 239.8 | 240.0 | 1.0 | 3224.5 | 1633.1 | 1986.0/2045.0 | 1040.0 | 921600 | 56 | 0 | ok |
+| starfield n=500 640x480 | 240.2 | 240.2 | 1.0 | 1214.4 | 451.1 | 528.0/685.0 | 427.0 | 307200 | 56 | 0 | ok |
+| starfield n=500 1280x720 | 240.2 | 240.2 | 1.0 | 3220.0 | 1644.7 | 1995.0/2056.0 | 1042.0 | 921600 | 56 | 0 | ok |
+| starfield n=2000 640x480 | 240.2 | 240.2 | 1.0 | 1242.2 | 576.0 | 573.0/944.0 | 430.0 | 307200 | 56 | 0 | ok |
+| starfield n=2000 1280x720 | 240.0 | 240.0 | 1.0 | 3236.1 | 1715.3 | 2015.0/2054.0 | 1049.0 | 921600 | 56 | 0 | ok |
+
+#### starfield-nodes
+
+| run | presented/s | commits/s | mutations/frame | server µs/frame | client µs/frame | paint µs mean/max | copy µs mean | damage px | bytes/frame | flip rise µs | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| starfield-nodes n=100 640x480 | 59.8 | 60.0 | 100.0 | 1392.8 | 55.7 | 646.0/700.0 | 362.0 | 301192 | 2824 | 0 | ok |
+| starfield-nodes n=100 1920x1080 | 59.8 | 60.0 | 100.0 | 7130.9 | 111.4 | 4464.0/4777.0 | 2498.0 | 2032190 | 2824 | 0 | ok |
+| starfield-nodes n=500 640x480 | 60.0 | 60.0 | 500.0 | 2500.0 | 138.9 | 1164.0/1244.0 | 380.0 | 307200 | 14024 | 0 | ok |
+| starfield-nodes n=500 1920x1080 | 60.0 | 60.0 | 500.0 | 8805.6 | 166.7 | 5220.0/5381.0 | 2523.0 | 2073600 | 14024 | 0 | ok |
+| starfield-nodes n=2000 640x480 | 59.8 | 60.0 | 2000.0 | 6100.3 | 362.1 | 3012.0/3094.0 | 362.0 | 307200 | 56024 | 0 | ok |
+| starfield-nodes n=2000 1920x1080 | 60.0 | 60.2 | 2000.0 | 11416.7 | 333.3 | 6541.0/6912.0 | 2340.0 | 2073600 | 56024 | 0 | ok |
+| starfield-nodes n=100 640x480 | 240.0 | 240.0 | 100.0 | 1416.7 | 90.3 | 620.0/703.0 | 354.0 | 285845 | 2824 | 0 | ok |
+| starfield-nodes n=100 1280x720 | 240.0 | 240.0 | 100.0 | 3111.1 | 97.2 | 1640.0/2101.0 | 958.0 | 859774 | 2824 | 0 | ok |
+| starfield-nodes n=500 640x480 | 240.2 | 240.2 | 500.0 | 2463.6 | 152.7 | 1169.0/1190.0 | 379.0 | 307200 | 14024 | 0 | ok |
+| starfield-nodes n=500 1280x720 | 240.0 | 240.0 | 500.0 | 3145.8 | 111.1 | 1661.0/1716.0 | 810.0 | 921600 | 14024 | 0 | ok |
+| starfield-nodes n=2000 640x480 | 239.7 | 239.8 | 2000.0 | 3108.5 | 187.8 | 1535.0/1571.0 | 278.0 | 307200 | 56024 | 0 | ok |
+| starfield-nodes n=2000 1280x720 | 233.8 | 234.0 | 2000.0 | 4048.5 | 206.7 | 2201.0/2527.0 | 827.0 | 921600 | 56024 | 0 | ok |
+
+#### balls
+
+| run | presented/s | commits/s | mutations/frame | server µs/frame | client µs/frame | paint µs mean/max | copy µs mean | damage px | bytes/frame | flip rise µs | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| balls n=32 640x480 | 59.8 | 60.0 | 1.0 | 1281.3 | 752.1 | 626.0/1070.0 | 420.0 | 307200 | 56 | 0 | ok |
+| balls n=32 1920x1080 | 60.0 | 60.0 | 1.0 | 8194.4 | 5027.8 | 5365.0/5668.0 | 2538.0 | 2073600 | 56 | 0 | ok |
+
+#### balls-nodes
+
+| run | presented/s | commits/s | mutations/frame | server µs/frame | client µs/frame | paint µs mean/max | copy µs mean | damage px | bytes/frame | flip rise µs | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| balls-nodes n=32 640x480 | 59.8 | 60.0 | 32.0 | 1754.9 | 55.7 | 1207.0/1370.0 | 79.0 | 61003 | 920 | 0 | ok |
+| balls-nodes n=32 1920x1080 | 59.8 | 60.0 | 32.0 | 6100.3 | 83.6 | 3778.0/4447.0 | 1019.0 | 835574 | 920 | 0 | ok |
 
 ## 8. The `flip rise` column, and a lesson about instruments
 
@@ -1421,20 +1845,27 @@ measures the quantity it names.**
 A benchmark that ends in a document is half a benchmark. The three
 findings below were the worst numbers in the matrix and each was filed as
 an issue, so that a future run has something to close rather than a
-paragraph to re-read. **Two of the three are now closed, and they closed
-in different ways**: #569 by a change that made the cost go away, #570 by
-a measurement that showed the finding was a misreading of a correct
-number. The second kind is worth filing for too.
+paragraph to re-read. **All three are now closed, and they closed in
+three different ways**: #569 by a change that made the cost go away,
+#570 by a measurement that showed the finding was a misreading of a
+correct number, and #568 by a fix (#3728) whose effect had to be
+**re-measured on the box** before it could be believed — the dev-machine
+number in its commit message was a fake backend with no scanout, and the
+row below carried a stale headline for four days because this document
+will not rewrite a table from a ledger that does not exist. §7.10b is
+that ledger. The second and third kinds are worth filing for too.
 
 | issue | the number | what it is |
 |---|---|---|
-| **#568** | `paint_us_mean` **11 757 µs** for a fullscreen 1080p repaint — **71 %** of the 60 Hz frame, and more than a whole 120 Hz frame | Fullscreen rows across three scenarios — rotozoom, starfield at all three N, balls — do genuinely different work per frame (a per-pixel gather, two thousand moving stars, thirty-two circles) and report near-identical server costs: **16 525–16 741 µs, paint 10 963–11 757**, because the server's work is a function of damaged area alone. A least-squares fit through `putimage`'s four damage/paint points extrapolates to ~3 060 µs at 2 073 600 px against the 11 000–11 800 measured, so **a fullscreen repaint is ~3.8× more expensive per pixel than a large partial one** — and §9.6 adds the constraint that the excess is *proportional to area rather than fixed per frame*: at 720p every scenario's ns/px falls rather than rises, so the thing to profile is the per-pixel path at full-surface damage and not a setup cost. |
+| **#568** | ~~`paint_us_mean` **11 757 µs** for a fullscreen 1080p repaint — **71 %** of the 60 Hz frame~~ → **5 328–5 424 µs, 32–33 % of the frame** | **Fixed by #3728, re-measured on the box in §7.10b** (`docs/bench-5e4b02e.jsonl`). The finding was real and is stated below as it was measured; the numbers it rests on are the pre-#3728 ledger and the row above is the correction. Original: fullscreen rows across three scenarios — rotozoom, starfield at all three N, balls — do genuinely different work per frame (a per-pixel gather, two thousand moving stars, thirty-two circles) and reported near-identical server costs: **16 525–16 741 µs, paint 10 963–11 757**, because the server's work is a function of damaged area alone. A least-squares fit through `putimage`'s four damage/paint points extrapolated to ~3 060 µs at 2 073 600 px against the 11 000–11 800 measured, so **a fullscreen repaint was ~3.8× more expensive per pixel than a large partial one** — and §9.6 added the constraint that the excess is *proportional to area rather than fixed per frame*. **What closed it:** #3728 skipped passes fully occluded by an opaque 1:1 XR24 image and widened the 1:1 opaque blit's store, which is precisely a per-pixel-path change at full-surface damage — the thing §9.6 said to profile. Paint fell **2.1–2.8×** at 1080p, and the question that survived the fix is answered too: **ns/px fell at *both* sizes** — 1.07–2.77× at 1080p and 1.80–2.65× at 720p — so the remaining pass is genuinely cheaper per pixel rather than merely run fewer times. The residual against a recomputed `putimage` fit is 2.8×, down from 4.1× by the same method, and is now dominated by the fit's lever arm (#3726 clips the sweep's buffers to the window, so its largest point is 307 200 px); §7.10b.3 says why that is a fitting artefact and not a further lever. |
 | **#569** | ~~`upload_us` **2 570–6 044 µs/frame** at 1080p~~ → **0**, and the server's `pread` with it | **Fixed.** The client now renders straight into a mapping of its own sealed memfd and the server maps the same file read-only, so two of the frame's three passes over the pixels are gone. Measured either side in one sitting: `docs/bench-49d023b.jsonl` and §7.10 below. `upload_us` is 0 on every row, server CPU/frame falls 13–50 %, and `boing` crosses the 60 Hz budget and doubles to 60 fps. The seal check (`F_SEAL_SHRINK`, `F_SEAL_GROW`, `F_SEAL_SEAL`, verified with `F_GET_SEALS`) is what makes the mapping sound against a hostile client; `crates/nitro-shm/README.md` carries the argument and the residuals. Scope was always the escape hatch: the retained path never paid this (§7.7's 83.5 µs) and is unchanged — `boing-node` is the control row and does not move. |
 | **#570** | ~~a one-row scroll damages **304 768 px = 0.99× the viewport**, a factor of ~30 against `CopyArea`~~ → **damage is within 6 % of minimal; the finding was a misreading** | **Retired, and the measurement is the interesting part.** The number was right and the reasoning was wrong. A one-row scroll of heterogeneous content genuinely changes **450 of 480 viewport rows = 288 000 px** (the 30 that do not are the scenario's own 1-px inter-row gaps; with solid content it is 480 of 480), because shifting differently-coloured rows past a fixed viewport gives every pixel its neighbour's colour. Reported damage is **306 560 px against a true minimum of 288 000 — 1.06×**, the excess being `Damage`'s documented rect-merge policy (`crates/nitro-core/src/damage.rs`). So there is no 30× to reclaim: **what `CopyArea` bought was not less damage but cheaper pixels**, and the recommended fix (damage the symmetric difference) would have left 267 520 px stale — see §8 D, because the test it proposed as proof would have certified the bug. The real prize is ~2× on `paint_us`, filed as **#592** with its ceiling attached, and `damage_px_mean` cannot move at all: it is `damage(n) ∪ damage(n−1)`, pixels that genuinely differ from the age-2 back buffer. §7.5 carries the full argument. (The figure was 675 696 px in an earlier ledger, from a clipping group that clipped nothing.) |
 
-**#568 is about the server's cost being proportional to damaged area**,
+**#568 was about the server's cost being proportional to damaged area**,
 and that is a statement about the *rasterizer's* per-pixel path at full‑
-surface damage, not about the scene graph's arithmetic. An earlier
+surface damage, not about the scene graph's arithmetic. Reading it that
+way is what made it fixable: #3728 changed the per-pixel path at
+full-surface damage and the cost fell 2.1–2.8× (§7.10b). An earlier
 version of this paragraph generalised it to two of the three — "the
 damage it computes is larger than the area that actually changed" — on
 the strength of #570. That generalisation does not survive #570's
@@ -1489,6 +1920,20 @@ doing the work, and the VGA rows are the control that separates them: a
 its column is a pure rate comparison.
 
 ### 9.1 The fullscreen pixel path at 120 Hz — the §5 prediction, checked
+
+> **Read with §7.10b, 2026-09-20.** Everything in §9 is the `1f35491`
+> ledger and is **pre-#3728**, which cut fullscreen paint 2.1–2.8×. Two
+> of this section's load-bearing figures moved: rotozoom's 99.1 % of the
+> 60 Hz budget is now 41 %, and §9.6's ns/px table has a post-fix pair
+> at the end. **The 120 Hz arm has not been re-measured** — the post-fix
+> ledger has only 60 Hz and 240 Hz arms — so this section's 120 Hz
+> conclusions stand as the only measurement there is, and the bandwidth
+> argument below is a ceiling that #3728 does not move: it removes
+> *passes over the frame* that paint makes, not the damage-to-scanout
+> copy, and `copy_us_mean` is flat or slightly up post-fix. What a
+> re-run at 120 Hz would settle is whether a 5 400 µs paint now fits
+> the 8 333 µs budget in practice; arithmetic says it does, and
+> arithmetic against a budget is not a measurement.
 
 §5 predicts that three passes over a fullscreen 1080p frame at 120 Hz
 wants 2.99 GB/s against this box's measured copy bandwidth, i.e. **83 %
@@ -1725,6 +2170,15 @@ frames. The absolute numbers are the ones to read.
 
 ### 9.6 #568's fixed per-frame cost at 4.2 ms — and what 720p says about it
 
+> **This section is the pre-#3728 measurement and is left as measured.**
+> It is the analysis that decided what to profile, and it was right: the
+> excess is proportional to area, so the per-pixel path at full-surface
+> damage was the thing to change, and #3728 changed it. The post-fix
+> numbers are in §7.10b and the closing pair is restated at the end of
+> this section. Every figure between here and there is from
+> `docs/bench-1f35491.jsonl`.
+
+
 #568 records that a fullscreen 1080p repaint costs `paint_us_mean`
 11 300–11 700 µs regardless of what is being drawn, and that a
 least-squares fit through `putimage`'s damage/paint points extrapolates
@@ -1737,7 +2191,7 @@ pixels** — so if the cost were purely linear in area, paint should fall
 by 55.6 %. Per-pixel cost, which is the form that makes the question
 answerable:
 
-| fullscreen | 1080p `paint_us_mean` | ns/px | 720p `paint_us_mean` | ns/px |
+| fullscreen (**pre-#3728**, `1f35491`) | 1080p `paint_us_mean` | ns/px | 720p `paint_us_mean` | ns/px |
 |---|---|---|---|---|
 | `plasma` | 3 511 | 1.69 | **1 372** | **1.49** |
 | `boing` | 6 041 | 2.91 | **1 963** | **2.13** |
@@ -1767,6 +2221,34 @@ damage-saturated rows, 48.0/s for fire, 42.2/s for boing, 34.3/s for
 plasma.** A 4 169 µs budget against a 5 199 µs paint is one frame in two
 before the client has computed anything, which is exactly the 120.0/s
 those rows report. The numbers are on #568.
+
+**What happened next, and it is the part this section got right.** The
+prescription above — *profile the per-pixel path at full-surface damage,
+not a fixed setup cost* — is what #3728 acted on, and the re-measurement
+(§7.10b, `docs/bench-5e4b02e.jsonl`) closes the question this table
+posed. The closing pair, ns/px at both sizes, same instrument, same box:
+
+| fullscreen | 1080p@60 ns/px pre → **post** | 720p@240 ns/px pre → **post** |
+|---|---|---|
+| `plasma` | 1.69 → **0.76** | 1.49 → **0.82** |
+| `boing` | 2.88 → **2.69** | 2.13 → **1.18** |
+| `rotozoom` | 5.29 → **1.91** | 4.93 → **1.86** |
+| `starfield` n=2000 | 5.67 → **2.60** | 5.64 → **2.19** |
+
+**ns/px fell at both sizes**, 1.07–2.77× at 1080p and 1.80–2.65× at 720p,
+which is the shape that distinguishes a cheaper per-pixel path from
+merely running fewer whole-frame passes — had it been only the latter,
+the 720p column would have moved *less* than the 1080p one, and for
+`boing`, `fire` and the starfields it moved more. The `boing` 1080p
+figure is 2.88 rather than this table's 2.91 because §7.10b averages the
+two `boing --fullscreen` runs each arm contains; this table quoted the
+second.
+
+And the frame rates the last paragraph reports are transformed: at
+720p@240 the damage-saturated rows now present at **235.9–240.2/s**
+against the 120.0/s above, because a 1 995 µs paint fits inside the
+4 169 µs budget where 5 199 µs took two frames. `fire` is 73.2/s against
+48.0, `plasma` 40.0 against 34.3, `boing` 120.2 against 42.2.
 
 ### 9.7 What the rate sweep cost in instrument bugs
 
@@ -2054,10 +2536,25 @@ Frame budget: 60 Hz = 16667 µs, 120 Hz = 8335 µs.
 
 ```sh
 just bench                       # the whole matrix once at the box's current mode (~12 min, 54 runs plus a bandwidth probe)
-just bench "1920x1080@60 1920x1080@120 720p240" 6   # the three-rate sweep behind §9 (~17 min, 140 runs)
+just bench '1920x1080@60\ 1920x1080@120\ 720p240' 6   # the three-rate sweep behind §9 (~17 min, 140 runs)
+just bench '1920x1080@60\ 720p240' 6                  # the two-arm sweep behind §7.10b (~11 min, 86 runs)
 just bench-report                # tmp/bench/box.jsonl → the markdown above
-just bench-bandwidth box         # the box's memcpy rate: copy 3.43 GB/s
+just bench-bandwidth box         # the box's memcpy rate: copy 3.43 GB/s (3.56 on the §7.10b sitting)
 ```
+
+**The backslashes are load-bearing and are not a typo.** A multi-word
+`--modes` argument written the obvious way — `just bench "60 120"` —
+**exits 2 with `unknown argument 120`**. `just` passes the string to
+`ssh` as one argv element, but ssh joins its argv with spaces into a
+single command string and the *remote* shell re-splits it, so every arm
+after the first arrives at `deploy/bench.sh` as a stray positional. The
+escaped space survives the second split. This section documented the
+double-quoted spelling from its first version and **that spelling has
+never worked**; the 140-run `1f35491` ledger reached the box some other
+way. Filed as **#618**, which owns the `justfile` fix and the other two
+doc sites; this line is corrected here because a command that exits 2 in
+a section headed "Reproducing" is the exact failure this document is
+about.
 
 and, for one scenario at a time, on the box:
 
@@ -2065,19 +2562,25 @@ and, for one scenario at a time, on the box:
 XDG_RUNTIME_DIR=/run/user/1000 ~/nitro-bin/nitro-bench rects --n 1000 --seconds 10 --json
 XDG_RUNTIME_DIR=/run/user/1000 ~/nitro-bin/nitro-bench boing --fullscreen --seconds 6 --json
 ~/nitro-bin/nitro-bench list     # every scenario, with the x11perf op it ports
-~/nitro-bin/nitro-bench report ~/tmp/bench/1f35491.jsonl
+~/nitro-bin/nitro-bench report ~/tmp/bench/5e4b02e.jsonl
 ```
 
 The ledger is `~/tmp/bench/<sha>.jsonl` on the box, fetched to
-`tmp/bench/box.jsonl` here. The run behind this document is **checked in**
-as `docs/bench-1f35491.jsonl` (363 KB), so a reviewer can re-derive every
-figure above with
+`tmp/bench/box.jsonl` here. **Delete the box-side file once fetched**:
+`just bench` fetches with `cat ~/tmp/bench/*.jsonl`, a glob, so a ledger
+left there is concatenated into the *next* task's run — and
+`deploy/bench.sh` **appends**, so a second attempt at the same sha
+doubles every row rather than replacing it. The runs behind this document
+are **checked in** — `docs/bench-1f35491.jsonl` (363 KB) for §6–§9 and
+`docs/bench-5e4b02e.jsonl` (231 KB) for §7.10b — so a reviewer can
+re-derive every figure with
 
 ```sh
-cargo run -q -p nitro-bench -- report docs/bench-1f35491.jsonl
+cargo run -q -p nitro-bench -- report docs/bench-1f35491.jsonl   # §6 and §9.8
+cargo run -q -p nitro-bench -- report docs/bench-5e4b02e.jsonl   # §7.10b.8
 ```
 
-and get the tables in §6 back byte for byte. That is deliberate: a
+and get those tables back byte for byte. That is deliberate: a
 document whose evidence lives only in a gitignored `tmp/` is a document
 asking to be trusted, and this one would rather be checked. Lines are
 append-only and self-describing,
@@ -2143,10 +2646,17 @@ of a benchmark document is a reader who takes it for more than it is.
   pixel count together and cannot separate them. The 640×480 rows are
   the control that can — identical scenes at all three rates — and they
   are what §9.2's flat-per-frame result rests on.
-- **One box, one evening, one sha** (`1f35491` on `ubuntu`, 2026-09-16).
-  This box's numbers drift day to day; the within-sitting ratios in §7
-  are the durable part, and the absolute microsecond figures should be
-  expected to move by a few percent on a re-run.
+- **One box, and now three sittings and three shas** on `ubuntu`:
+  `1f35491` (2026-09-16, three rates, §6–§9 and every prose number in
+  §7.1–§7.10), `49d023b`/`28b6fdd` (2026-09-20, the #569 pair, §7.10a)
+  and `5e4b02e` (2026-09-20, two arms, §7.10b and the current fullscreen
+  figures). **Within a sitting the ratios are the durable part**; across
+  sittings this box's numbers drift day to day, and the absolute
+  microsecond figures should be expected to move by a few percent on a
+  re-run. The measured `copy` bandwidth moved 3.43 → 3.56 GB/s between
+  the first and third sittings, which is roughly the size of drift to
+  expect. §7.10b's cross-sitting comparison carries three retained-path
+  control rows, flat to within 1 %, for exactly this reason.
 - **CPU is quantised to 10 ms ticks** (§2): the sub-100 µs client figures
   mean "under a hundred microseconds", not three significant figures.
   And **`damage_px_mean` includes the age-2 union** `damage(n) ∪
