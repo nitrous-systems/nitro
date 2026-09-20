@@ -5434,7 +5434,7 @@ impl Server {
     /// shell and not just the launcher: **once a binding fires, no other
     /// client sees a key until its client has had a turn.** The wait ends
     /// at the shell's next commit (it answered, grab or no grab), at
-    /// [`HOTKEY_ANSWER_NS`] (it is not going to), or when the shell goes
+    /// [`HOTKEY_ANSWER`] (it is not going to), or when the shell goes
     /// away or the modifier state is reset.
     ///
     /// Keys are *dropped*, not queued and replayed: a replay would arrive

@@ -826,6 +826,7 @@ looking for.
 | `hotkeys`                | Live `BindKey` bindings held by shell clients. |
 | `exclusive_zones`        | Windows reserving screen space off an output edge. |
 | `grabbed`                | 1 while a shell client holds a keyboard grab. A 1 with no launcher on screen is a stuck grab. |
+| `keys_withheld`          | Keys dropped because a shell's `BindKey` binding had fired and the shell had not answered yet, so routing them by focus would have typed them into whatever application was focused (`docs/shell.md` §A binding buys its client a turn). Cumulative, and normally 0: a non-zero value means someone types faster than the shell wakes, which is the race the counter exists to make visible. |
 | `config_reloads`         | Completed `server.conf` reloads since startup, whatever triggered them — the `reload` request, SIGHUP and the inotify watch all land in this one counter, because what a caller wants to know is "did the server pick my edit up", not which of the three doors it came through. A reload of a file that will not parse still counts: the file *was* re-read, and every line it could not use was warned about and skipped. |
 
 The key naming is inconsistent on purpose — `paint_us_min` but

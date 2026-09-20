@@ -600,7 +600,7 @@ different from the mode the kernel actually set.
 
 ## Statistics
 
-Four keys in `stats`, and the first is the one to look at when a bar "is
+Five keys in `stats`, and the first is the one to look at when a bar "is
 not working":
 
 | key | meaning |
@@ -609,6 +609,7 @@ not working":
 | `hotkeys` | live `BindKey` bindings. |
 | `exclusive_zones` | windows reserving space. |
 | `grabbed` | 1 while a keyboard grab is held. A 1 with no launcher on screen is a stuck grab. |
+| `keys_withheld` | keys dropped while a shell owed an answer to a binding that had just fired (§[A binding buys its client a turn](#a-binding-buys-its-client-a-turn)). Cumulative, and normally 0: a non-zero value means someone types faster than the shell wakes. |
 
 ## Testing
 
