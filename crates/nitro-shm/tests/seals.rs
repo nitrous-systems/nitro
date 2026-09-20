@@ -398,50 +398,62 @@ fn the_unsafe_surface_is_exactly_what_the_docs_claim() {
     // Now the documents. Every place that quotes a count of this crate's
     // `unsafe` blocks must quote the right one.
     //
-    // The check is deliberately narrow: take the word **immediately**
-    // before "block(s)" on whitespace-normalised text, strip Markdown
-    // punctuation, and require that if it is a number word it is the
-    // right one. Two earlier versions were wrong in opposite directions,
-    // and both were caught only by reintroducing the reviewer's defect
-    // and watching what the test did:
+    // Walk back up to three words from "block(s)" and judge the **nearest
+    // number word**, skipping non-number modifiers. The documents write
+    // the claim two ways — "four blocks" and "the four `unsafe` blocks"
+    // — and the modifier is why the obvious matcher does not work.
+    //
+    // Three earlier versions were wrong, each caught only by re-breaking
+    // the docs and watching what the test did. They are worth listing,
+    // because every one of them *looked* right:
     //
     //  * splitting on `\n` and asking whether the fragment mentioned a
-    //    number *and* "unsafe" silently **passed** the defect, because
-    //    `...and three` and `blocks in nitro-shm...` are different
-    //    fragments;
+    //    number *and* "unsafe" silently **passed** the defect: `...and
+    //    three` and `blocks in nitro-shm...` are different fragments.
     //  * scanning a 40-character window **failed on clean text**, because
     //    "one `munmap` — four blocks" legitimately contains "one".
+    //  * judging only the *immediately* preceding word **was blind to
+    //    three of the four files it named**: they phrase it "four
+    //    `unsafe` blocks", so the adjacent word is "unsafe" and the site
+    //    was skipped entirely. It passed on clean text and caught the one
+    //    defect it was tested with — in `DEPENDENCIES.md`, the single
+    //    file whose phrasing it happened to fit. The reviewer of #569
+    //    found that by running the matcher over all four files instead of
+    //    one.
     //
-    // Only the adjacent word carries the count, so only it is judged.
+    // The lesson is in the test's name: "I broke it and watched it fail"
+    // is evidence only for the phrasing that was broken. Every phrasing
+    // in the table below is exercised by
+    // `the_doc_count_guard_catches_drift_in_every_phrasing`.
     let quantifiers = |src: &str| -> Vec<String> {
+        let bare = |w: &str| {
+            w.trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase()
+        };
         let flat = src.split_whitespace().collect::<Vec<_>>().join(" ");
         let words: Vec<&str> = flat.split(' ').collect();
         let mut found = Vec::new();
         for (i, w) in words.iter().enumerate() {
-            let bare = w
-                .trim_matches(|c: char| !c.is_alphanumeric())
-                .to_lowercase();
-            if (bare == "block" || bare == "blocks")
-                && let Some(prev) = i.checked_sub(1)
-            {
-                found.push(
-                    words[prev]
-                        .trim_matches(|c: char| !c.is_alphanumeric())
-                        .to_lowercase(),
-                );
+            if bare(w) != "block" && bare(w) != "blocks" {
+                continue;
+            }
+            // Nearest number word within three, so "four `unsafe` blocks"
+            // is judged and the walk stops at "four" before it can reach
+            // the "one" of "one `munmap` — four blocks".
+            for j in (i.saturating_sub(3)..i).rev() {
+                let b = bare(words[j]);
+                if NUMBER_WORDS.contains(&b.as_str()) {
+                    found.push(b);
+                    break;
+                }
             }
         }
         found
     };
-    for (path, src) in [
-        ("DEPENDENCIES.md", include_str!("../../../DEPENDENCIES.md")),
-        ("crates/nitro-shm/README.md", include_str!("../README.md")),
-        ("crates/nitro-shm/src/map.rs", map),
-        ("crates/nitro-shm/src/lib.rs", include_str!("../src/lib.rs")),
-    ] {
+    for (path, src) in DOCS_QUOTING_THE_COUNT {
         for q in quantifiers(src) {
             assert!(
-                !(NUMBER_WORDS.contains(&q.as_str()) && q != WORD),
+                q == WORD,
                 "{path} quotes \"{q} block(s)\" where this crate's `unsafe` \
                  block count is {WORD}. Every document quoting this number \
                  must agree with `map.rs`. The count has drifted twice \
@@ -450,6 +462,103 @@ fn the_unsafe_surface_is_exactly_what_the_docs_claim() {
             );
         }
     }
+}
+
+/// The files that quote the `unsafe` block count, and their text.
+///
+/// A named constant so the guard and its own self-test read the same
+/// list. **Its limit, stated rather than implied**: a document that
+/// starts quoting the number later is invisible to both until it is added
+/// here.
+const DOCS_QUOTING_THE_COUNT: [(&str, &str); 4] = [
+    ("DEPENDENCIES.md", include_str!("../../../DEPENDENCIES.md")),
+    ("crates/nitro-shm/README.md", include_str!("../README.md")),
+    ("crates/nitro-shm/src/map.rs", include_str!("../src/map.rs")),
+    ("crates/nitro-shm/src/lib.rs", include_str!("../src/lib.rs")),
+];
+
+/// The guard above, tested against **every phrasing the real files use**.
+///
+/// This exists because the previous version of that guard was blind to
+/// three of the four files it named, and passed anyway: it was verified
+/// by breaking one file, and that file was the only one whose phrasing
+/// its matcher fit. "I broke it and watched it fail" is evidence for the
+/// phrasing you broke and nothing else.
+///
+/// So rather than trusting a hand-run, this drives the matcher over the
+/// real documents: every site must be *judged* (not skipped), the clean
+/// text must produce no complaint, and drifting each site in its own
+/// file's phrasing must be caught.
+#[test]
+fn the_doc_count_guard_catches_drift_in_every_phrasing() {
+    // The matcher, in the same shape the guard uses.
+    fn quantifiers(src: &str) -> Vec<String> {
+        let bare = |w: &str| {
+            w.trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase()
+        };
+        let flat = src.split_whitespace().collect::<Vec<_>>().join(" ");
+        let words: Vec<&str> = flat.split(' ').collect();
+        let mut found = Vec::new();
+        for (i, w) in words.iter().enumerate() {
+            if bare(w) != "block" && bare(w) != "blocks" {
+                continue;
+            }
+            for j in (i.saturating_sub(3)..i).rev() {
+                let b = bare(words[j]);
+                if ["one", "two", "three", "four", "five", "six"].contains(&b.as_str()) {
+                    found.push(b);
+                    break;
+                }
+            }
+        }
+        found
+    }
+
+    // 1. On the real files the guard sees a count in every file, and every
+    //    count it sees is "four". A file contributing *no* judged site is
+    //    the blindness that shipped last time, so it is an error here.
+    for (path, src) in DOCS_QUOTING_THE_COUNT {
+        let found = quantifiers(src);
+        assert!(
+            !found.is_empty(),
+            "{path} quotes the block count, but the matcher judges no site \
+             in it — that is exactly the blindness this test exists to \
+             catch. Check how the claim is phrased there."
+        );
+        assert!(
+            found.iter().all(|q| q == "four"),
+            "{path} on clean text yields {found:?}, expected all \"four\""
+        );
+    }
+
+    // 2. Drift introduced in each file, in that file's own phrasing, is
+    //    caught. Both real phrasings are covered: the bare "four blocks"
+    //    of DEPENDENCIES.md and the "four `unsafe` blocks" of the other
+    //    three, which the previous matcher skipped.
+    for (path, src) in DOCS_QUOTING_THE_COUNT {
+        let drifted = src
+            .replace("four blocks", "three blocks")
+            .replace("four `unsafe` blocks", "three `unsafe` blocks")
+            .replace("four\nblocks", "three\nblocks")
+            .replace("four `unsafe`\nblocks", "three `unsafe`\nblocks");
+        assert_ne!(drifted, src, "{path}: the drift rewrite matched nothing");
+        let found = quantifiers(&drifted);
+        assert!(
+            found.iter().any(|q| q == "three"),
+            "{path}: drifting the count to \"three\" was NOT caught — the \
+             matcher reported {found:?}. The guard is blind to this \
+             file's phrasing, which is how the last version shipped."
+        );
+    }
+
+    // 3. And the false positive that killed an earlier attempt stays
+    //    dead: the walk must stop at the nearer number.
+    assert_eq!(
+        quantifiers("one `munmap` — four blocks, all in map.rs"),
+        vec!["four".to_string()],
+        "the walk ran past `four` and judged the `one` of `one munmap`"
+    );
 }
 
 /// The `unsafe` exception is scoped by two things, and one of them is a
