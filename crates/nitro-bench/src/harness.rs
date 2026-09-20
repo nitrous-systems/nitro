@@ -93,9 +93,9 @@ pub trait Scenario {
     fn frame(&mut self, ctx: &mut Ctx, frame: u64) -> Result<Vec<ClientMsg>, Error>;
 
     /// Microseconds this scenario spent in its own pixel work, so the
-    /// report can subtract it: `frame = effect + upload + server paint +
-    /// copy`, and a fullscreen effect whose own sine loop costs 9 ms has
-    /// not told you anything about the compositor.
+    /// report can subtract it: `frame = effect + server paint + copy`,
+    /// and a fullscreen effect whose own sine loop costs 9 ms has not
+    /// told you anything about the compositor.
     ///
     /// Zero for the scenarios that push no pixels, which is the honest
     /// answer for them rather than a missing column.
@@ -103,10 +103,15 @@ pub trait Scenario {
         0
     }
 
-    /// Microseconds spent writing pixels into the client buffer's memfd —
-    /// the `pwrite` the server will `pread` back. Kept apart from
-    /// [`Scenario::compute_us`] because they are different costs with
-    /// different fixes: one is the effect, the other is the wire.
+    /// Microseconds spent uploading pixels to the server.
+    ///
+    /// **Zero for every scenario since #569**, which is why it is still
+    /// here: it used to be the per-frame `pwrite` of the client buffer
+    /// into its memfd, which the server then `pread` back. The client now
+    /// renders into a mapping of that memfd and the server maps it too, so
+    /// there is no copy left to time. The column stays so that ledgers
+    /// written before the change go on parsing and so the report can show
+    /// the cost as gone rather than silently drop it.
     fn upload_us(&self) -> u64 {
         0
     }
@@ -139,7 +144,7 @@ pub struct Ctx {
 pub enum Error {
     /// The wire protocol or its socket.
     Wire(WireError),
-    /// A syscall (`memfd`, `poll`, `pwrite`).
+    /// A syscall (`memfd`, `poll`, `mmap`).
     Io(rustix::io::Errno),
     /// The server sent a fatal `Error` message.
     Server(String),

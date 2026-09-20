@@ -81,7 +81,7 @@ use nitro_wire::server::Listener as WireListener;
 use nitro_wire::types::{ButtonState, ErrorCode, NodeId};
 use rustix::event::epoll::{self, EventData, EventFlags};
 
-use crate::clients::{ApplyError, BufferSource, Pending, WireClient};
+use crate::clients::{ApplyError, Pending, WireClient};
 use crate::control::{Client, ReadOutcome};
 use crate::cursor::Cursor;
 use crate::defer::DeferredFlip;
@@ -831,16 +831,6 @@ struct Server {
     /// Which window each live touch point started on, and where it is in
     /// that window's coordinates.
     touch_targets: HashMap<i32, (WindowKey, Point)>,
-    /// Buffers' descriptors and fds, so `BufferDamage` can re-read rows.
-    buffer_sources: HashMap<(ClientId, nitro_scene::BufferKey), BufferSource>,
-    /// Descriptors from `CreateBuffer`s in a transaction that has not
-    /// committed yet; they move into `buffer_sources` when it does.
-    pending_fds: Vec<(
-        u64,
-        nitro_wire::types::BufferId,
-        OwnedFd,
-        nitro_scene::BufferDesc,
-    )>,
     /// Windows created while no output existed, waiting for one.
     unplaced: Vec<(ClientId, WindowKey)>,
     /// Newest input timestamp not yet consumed by a frame; see
@@ -1117,8 +1107,6 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         focus: None,
         pending_focus: None,
         touch_targets: HashMap::new(),
-        buffer_sources: HashMap::new(),
-        pending_fds: Vec::new(),
         unplaced: Vec::new(),
         pending_input_ns: 0,
         defer: defer::DeferredFlip::new().map_err(errno("create the deferred-flip timer"))?,
@@ -5132,10 +5120,15 @@ impl Server {
             }
             ClientMsg::Commit(commit) => self.commit(token, commit.serial),
             ClientMsg::CreateBuffer(buffer) => {
-                // The descriptor is read *now*, not at commit: the client
-                // may legitimately reuse the memfd for the next frame as
-                // soon as it has sent this message.
-                let (desc, data) = match clients::read_buffer(&buffer) {
+                // The descriptor is checked and *mapped* now, not at commit:
+                // the client may legitimately close or reuse its own
+                // descriptor as soon as it has sent this message, and a
+                // buffer whose fd is not sealed must be refused before any
+                // of the batch is applied. From here on the scene holds the
+                // mapping, so there is no server-side copy to keep in step
+                // and `BufferDamage` only marks nodes for repaint.
+                let id = buffer.id;
+                let (desc, pixels) = match clients::map_buffer(buffer) {
                     Ok(pair) => pair,
                     Err(e) => {
                         self.disconnect(token, Some((0, e.code, e.detail)));
@@ -5145,8 +5138,7 @@ impl Server {
                 let Some(client) = self.wire_clients.get_mut(&token) else {
                     return false;
                 };
-                client.pending.push(Pending::Buffer(buffer.id, desc, data));
-                self.pending_fds.push((token, buffer.id, buffer.fd, desc));
+                client.pending.push(Pending::Buffer(id, desc, pixels));
                 true
             }
             other => {
@@ -5712,18 +5704,10 @@ impl Server {
                 return false;
             }
         };
-        self.adopt_buffer_fds(token, &client);
-        for (key, rects) in outcome.buffer_damage {
-            self.refresh_damaged_buffer(client.id, key, &rects);
-        }
-        // `DestroyBuffer` promises the server drops its mapping. The scene
-        // forgets the pixels itself; the descriptor is ours, and this is
-        // the only place it can be released before the client goes — a
-        // client cycling one buffer per frame would otherwise leak an fd
-        // per frame until it hit the process limit.
-        for key in outcome.destroyed_buffers {
-            self.buffer_sources.remove(&(client.id, key));
-        }
+        // No buffer bookkeeping here since #569: the scene holds each
+        // buffer's mapping, so `BufferDamage` needs no re-read and
+        // `DestroyBuffer` releases the pages by dropping the store (its
+        // `Drop` is the `munmap`).
         // Every node this transaction (re)shaped gets its measured size
         // back. Sent after the batch was applied, so a client that set the
         // text of several nodes in one commit sees one message per node and
@@ -5839,30 +5823,6 @@ impl Server {
         }
         self.wire_clients.insert(token, client);
         true
-    }
-
-    /// Move the fds that came with this transaction's `CreateBuffer`s into
-    /// the server's map, now that the scene has keys for them.
-    fn adopt_buffer_fds(&mut self, token: u64, client: &WireClient) {
-        let mine: Vec<(
-            u64,
-            nitro_wire::types::BufferId,
-            OwnedFd,
-            nitro_scene::BufferDesc,
-        )> = std::mem::take(&mut self.pending_fds);
-        for (t, id, fd, desc) in mine {
-            if t != token {
-                self.pending_fds.push((t, id, fd, desc));
-                continue;
-            }
-            let Some(key) = client.buffers.get(&id).copied() else {
-                // The transaction that would have created it failed or the
-                // id was destroyed in the same batch; the fd goes with it.
-                continue;
-            };
-            self.buffer_sources
-                .insert((client.id, key), BufferSource { fd, desc });
-        }
     }
 
     /// Place a newly created window: decorate it, centred-cascade it into
@@ -6004,10 +5964,12 @@ impl Server {
             self.forget_window(win);
         }
         for key in client.buffers.values().copied().collect::<Vec<_>>() {
+            // Dropping the scene's buffer drops its mapping, which is the
+            // `munmap`. Since #569 there is no descriptor to release
+            // alongside it: `Mapping::map` closed the client's fd the
+            // moment the pages were mapped.
             let _ = self.scene.destroy_buffer(id, key);
-            self.buffer_sources.remove(&(id, key));
         }
-        self.pending_fds.retain(|(t, _, _, _)| *t != token);
         // Every shaped run the client's nodes held. The scene's destroy
         // walk drops the nodes, but the runs live in the text store, which
         // knows them only by owner — so this is the one place they are
@@ -6027,28 +5989,6 @@ impl Server {
         self.window_watchers.retain(|t| *t != token);
         self.output_watchers.retain(|t| *t != token);
         // Dropping the stream removes it from the epoll set.
-    }
-
-    /// Re-read the rows a client declared damaged in one of its buffers.
-    /// Called after a transaction, because the scene only learns which
-    /// image nodes to repaint at that point.
-    fn refresh_damaged_buffer(
-        &mut self,
-        id: ClientId,
-        key: nitro_scene::BufferKey,
-        rects: &[nitro_core::IRect],
-    ) {
-        let Some(source) = self.buffer_sources.get(&(id, key)) else {
-            return;
-        };
-        let desc = source.desc;
-        let fd = source.fd.as_fd();
-        let Ok(data) = self.scene.buffer_mut(id, key) else {
-            return;
-        };
-        if let Err(e) = clients::reread_damage(fd, desc, rects, data) {
-            warn!("re-reading buffer damage: {}", e.detail);
-        }
     }
 
     /// Hotplug an output into the fake backend.

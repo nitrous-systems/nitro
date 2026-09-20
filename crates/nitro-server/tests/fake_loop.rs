@@ -886,10 +886,9 @@ fn a_bad_message_gets_an_error_and_a_disconnect() {
 }
 
 #[test]
-fn a_buffer_is_copied_from_the_memfd_and_blitted() {
+fn a_buffer_is_mapped_from_the_memfd_and_blitted() {
     use nitro_wire::msg::CreateBuffer;
     use nitro_wire::types::{BufferId, format};
-    use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
 
     let (w, h) = (200, 120);
     let h_ = Harness::start("buffer", w, h);
@@ -897,10 +896,10 @@ fn a_buffer_is_copied_from_the_memfd_and_blitted() {
     let mut conn = h_.client("images");
     let mut seen = Vec::new();
 
-    // A 16x16 buffer of one solid colour, written through the fd.
+    // A 16x16 buffer of one solid colour, written through the fd. Sealed,
+    // because the server maps it and refuses anything it cannot prove
+    // will not shrink under the mapping (#569).
     let (bw, bh, stride) = (16u32, 16u32, 16u32 * 4);
-    let fd = memfd_create("nitro-test-buffer", MemfdFlags::CLOEXEC).unwrap();
-    ftruncate(&fd, u64::from(stride) * u64::from(bh)).unwrap();
     let pixels: Vec<u8> = (0..(stride * bh))
         .map(|i| match i % 4 {
             0 => 0x20, // B
@@ -909,10 +908,7 @@ fn a_buffer_is_copied_from_the_memfd_and_blitted() {
             _ => 0xFF, // A (unused for XR24)
         })
         .collect();
-    {
-        let mut file = std::fs::File::from(fd.try_clone().unwrap());
-        file.write_all(&pixels).unwrap();
-    }
+    let fd = nitro_shm::memfd_with("nitro-test-buffer", &pixels).unwrap();
 
     let root = NodeId(1);
     let image = NodeId(2);
@@ -1019,16 +1015,25 @@ fn the_desktop_frame_is_still_painted_under_everything() {
 }
 
 #[test]
-fn cycling_buffers_does_not_leak_the_clients_descriptors() {
+fn cycling_buffers_does_not_leak_the_clients_mappings() {
     use nitro_wire::msg::CreateBuffer;
     use nitro_wire::types::{BufferId, format};
-    use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
 
     // A client that pushes changing pixels does create → damage → destroy
-    // once per frame. The server keeps each buffer's fd so `BufferDamage`
-    // can re-read rows, and `DestroyBuffer` is what must give it back:
-    // without that it leaks one descriptor per frame until the process
-    // hits its fd limit.
+    // once per frame. Since #569 the server *maps* each buffer instead of
+    // copying it, so what must be given back is the mapping rather than a
+    // descriptor: `DestroyBuffer` drops the scene's buffer, whose store's
+    // `Drop` is the `munmap`. Without that the server leaks an 8 KiB
+    // mapping per frame until it runs out of address space or
+    // `vm.max_map_count`.
+    //
+    // The *descriptor* side of this is now trivially safe — `Mapping::map`
+    // closes the client's fd the moment the pages are mapped, so the
+    // server holds none to leak — and counting fds would therefore assert
+    // nothing. Counting `/proc/self/maps` entries by memfd name asserts
+    // the thing that can still go wrong, and for the same reason the fd
+    // count was chosen over a process-wide total: a sibling test's server
+    // cannot move it.
     let h_ = Harness::start("bufcycle", 200, 120);
     let mut conn = h_.client("cycler");
     let mut seen = Vec::new();
@@ -1046,12 +1051,12 @@ fn cycling_buffers_does_not_leak_the_clients_descriptors() {
         _ => None,
     });
 
-    let before = open_buffer_fds();
+    let before = mapped_buffers();
     let (bw, bh, stride) = (8u32, 8u32, 8u32 * 4);
     for i in 0..64u32 {
         let id = BufferId(i + 1);
-        let fd = memfd_create(BUFFER_MEMFD_NAME, MemfdFlags::CLOEXEC).unwrap();
-        ftruncate(&fd, u64::from(stride) * u64::from(bh)).unwrap();
+        let fd =
+            nitro_shm::create_sealed(BUFFER_MEMFD_NAME, u64::from(stride) * u64::from(bh)).unwrap();
         conn.tx()
             .create_buffer(CreateBuffer {
                 id,
@@ -1079,49 +1084,102 @@ fn cycling_buffers_does_not_leak_the_clients_descriptors() {
     }
     h_.settle();
 
-    let after = open_buffer_fds();
+    let after = mapped_buffers();
     assert!(
         after <= before + 4,
-        "leaked buffer descriptors over 64 cycles: {before} -> {after}"
+        "leaked buffer mappings over 64 cycles: {before} -> {after}"
     );
     h_.quit();
 }
 
-/// How many of *this test's* buffer descriptors the process holds.
+/// How many of *this test's* buffer memfds the process has mapped.
 ///
 /// The server runs on a thread of this same process, so its leaks are
 /// ours to see — but so is every other test's, and the tests in this file
-/// run in parallel by default. A plain count of `/proc/self/fd` therefore
-/// measures the whole process: a sibling test whose server happens to be
-/// starting (sockets, an epoll, an eventfd, a timerfd) moves it by half a
-/// dozen, and this test would report a leak that is somebody else's
-/// server doing its job. That failure was observed at roughly one run in
-/// five, and it never reproduced when the file was run single-threaded,
-/// which is the signature of exactly this.
+/// run in parallel by default. Anything process-wide (a count of
+/// `/proc/self/maps` lines, or of `/proc/self/fd`) therefore measures
+/// every sibling server starting up as well, and this test would report a
+/// leak that is somebody else's server doing its job. That failure was
+/// observed at roughly one run in five on the fd version of this test,
+/// and it never reproduced single-threaded, which is the signature of
+/// exactly this.
 ///
-/// So count the thing under test instead. The descriptors at stake are
-/// the `memfd`s the client passes with `CreateBuffer`, and a memfd's
-/// `/proc/self/fd` link carries the name it was created with —
-/// `/memfd:nitro-cycle (deleted)`. Counting those by name is immune to
-/// anything another test is doing, and it is also a *sharper* assertion:
-/// a leak of 64 buffer descriptors now shows up as 64 rather than being
-/// diluted into a process-wide total in the hundreds.
-fn open_buffer_fds() -> usize {
-    let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+/// So count the thing under test. A mapping of a memfd shows up in
+/// `/proc/self/maps` as `/memfd:nitro-cycle (deleted)`, carrying the name
+/// the memfd was created with, which is immune to anything another test is
+/// doing and is also sharper: a leak of 64 mappings shows up as 64 rather
+/// than diluted into a process-wide total.
+fn mapped_buffers() -> usize {
+    let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else {
         return 0;
     };
-    entries
-        .flatten()
-        .filter(|e| {
-            std::fs::read_link(e.path())
-                .is_ok_and(|target| target.to_string_lossy().contains(BUFFER_MEMFD_NAME))
-        })
+    maps.lines()
+        .filter(|l| l.contains(&format!("/memfd:{BUFFER_MEMFD_NAME}")))
         .count()
 }
 
-/// The name `cycling_buffers_does_not_leak_the_clients_descriptors` gives
-/// its memfds, and the string `open_buffer_fds` recognises them by.
+/// The name `cycling_buffers_does_not_leak_the_clients_mappings` gives
+/// its memfds, and the string `mapped_buffers` recognises them by.
 const BUFFER_MEMFD_NAME: &str = "nitro-cycle";
+
+/// An unsealed `CreateBuffer` is refused and the client is disconnected.
+///
+/// The protocol-level half of #569's no-fallback rule: the server maps the
+/// descriptor, so it must be able to prove the file cannot shrink under
+/// the mapping, and a client that did not seal gets `BadBuffer` rather
+/// than a silent `pread` path nobody exercises.
+#[test]
+fn an_unsealed_buffer_is_refused_and_disconnects() {
+    use nitro_wire::msg::CreateBuffer;
+    use nitro_wire::types::{BufferId, ErrorCode, format};
+    use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
+
+    let h_ = Harness::start("unsealed", 200, 120);
+    let mut conn = h_.client("hostile");
+    let mut seen = Vec::new();
+
+    let root = NodeId(1);
+    let image = NodeId(2);
+    conn.tx()
+        .create_window(root, "unsealed", Size::new(64.0, 64.0), Layer::Normal)
+        .create_image(image, root, Rect::new(0.0, 0.0, 32.0, 32.0))
+        .commit(1)
+        .unwrap();
+    conn.flush().unwrap();
+    expect(&mut conn, &mut seen, "Configure", |m| match m {
+        ServerMsg::Configure(c) if c.window == root => Some(*c),
+        _ => None,
+    });
+
+    let (bw, bh, stride) = (8u32, 8u32, 8u32 * 4);
+    let fd = memfd_create("nitro-unsealed", MemfdFlags::CLOEXEC).unwrap();
+    ftruncate(&fd, u64::from(stride) * u64::from(bh)).unwrap();
+    conn.tx()
+        .create_buffer(CreateBuffer {
+            id: BufferId(1),
+            width: bw,
+            height: bh,
+            stride,
+            format: format::XR24,
+            size: stride * bh,
+            fd,
+        })
+        .commit(2)
+        .unwrap();
+    conn.flush().unwrap();
+
+    let err = expect(&mut conn, &mut seen, "Error", |m| match m {
+        ServerMsg::Error(e) => Some(e.clone()),
+        _ => None,
+    });
+    assert_eq!(err.code, ErrorCode::BadBuffer);
+    assert!(
+        err.msg.contains("F_SEAL_SHRINK"),
+        "the error should name the missing seal: {:?}",
+        err.msg
+    );
+    h_.quit();
+}
 
 #[test]
 fn a_commit_that_changes_no_pixels_is_still_presented() {

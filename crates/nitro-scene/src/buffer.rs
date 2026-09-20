@@ -1,5 +1,7 @@
 //! Client-supplied pixel buffers.
 
+use std::fmt;
+
 use crate::{ClientId, Error, key::define_key};
 use nitro_core::IRect;
 
@@ -94,15 +96,46 @@ impl BufferDesc {
     }
 }
 
+/// Where a buffer's bytes live.
+///
+/// The scene does not care whether the pixels are a heap copy or a mapping
+/// of the client's own memfd; it only reads them. This trait is the seam:
+/// `Vec<u8>` implements it for tests and for buffers the server owns
+/// outright, and the server's mapped-buffer type implements it without the
+/// scene learning what a mapping is (the scene stays `forbid(unsafe_code)`
+/// and dependency-free of `rustix`).
+///
+/// [`bytes_mut`](Self::bytes_mut) is `None` for a store whose bytes are
+/// not the scene's to change — a read-only mapping of a client's buffer,
+/// which the *client* writes and the server only reads.
+pub trait PixelStore: fmt::Debug {
+    /// The pixel bytes.
+    fn bytes(&self) -> &[u8];
+    /// The pixel bytes, writable, or `None` if the store is read-only.
+    fn bytes_mut(&mut self) -> Option<&mut [u8]>;
+}
+
+impl PixelStore for Vec<u8> {
+    fn bytes(&self) -> &[u8] {
+        self
+    }
+
+    fn bytes_mut(&mut self) -> Option<&mut [u8]> {
+        Some(self)
+    }
+}
+
 /// A buffer owned by the scene.
 ///
-/// The server copies client bytes in at `create_buffer` time; from then on the
-/// scene owns them and hands out `&mut [u8]` for in-place updates.
+/// The server hands in a [`PixelStore`] at `create_buffer` time — a mapping
+/// of the client's sealed memfd in production, a `Vec<u8>` in tests. The
+/// scene owns the store for the buffer's life and drops it on
+/// `destroy_buffer`, which for a mapping is the `munmap`.
 #[derive(Debug)]
 pub struct Buffer {
     pub(crate) desc: BufferDesc,
     pub(crate) client: ClientId,
-    pub(crate) data: Vec<u8>,
+    pub(crate) data: Box<dyn PixelStore>,
 }
 
 impl Buffer {
@@ -118,6 +151,6 @@ impl Buffer {
 
     /// The pixel bytes.
     pub fn data(&self) -> &[u8] {
-        &self.data
+        self.data.bytes()
     }
 }

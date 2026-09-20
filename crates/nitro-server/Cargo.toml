@@ -13,6 +13,9 @@ workspace = true
 nitro-core = { path = "../nitro-core" }
 nitro-wire = { version = "0.0.1", path = "../nitro-wire" }
 nitro-scene = { path = "../nitro-scene" }
+# Sealed memfds and their one sanctioned mapping: the client buffer path
+# (#569). The `unsafe` lives there, scoped to one module, not here.
+nitro-shm = { workspace = true }
 nitro-raster = { path = "../nitro-raster" }
 nitro-text = { path = "../nitro-text" }
 nitro-icons = { path = "../nitro-icons" }

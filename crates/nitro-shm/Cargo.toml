@@ -1,0 +1,21 @@
+[package]
+name = "nitro-shm"
+description = "Sealed memfds and the one sanctioned mapping of them: the tree's single `unsafe` surface for client pixel buffers"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# `workspace = true` is what makes the `#![allow(unsafe_code)]` in
+# `src/map.rs` a *scoped exception* to the workspace's `unsafe_code =
+# "deny"` rather than decoration: without this table the deny never applies
+# to the crate and the allow would be allowing nothing.
+[lints]
+workspace = true
+
+[dependencies]
+# `fs` for `memfd_create`/`fcntl_add_seals`/`fcntl_get_seals`/`fstat`/
+# `ftruncate`/`pwrite`; `mm` for `mmap`/`munmap`. This is the first crate
+# outside `nitro-kms` to enable `mm`, and it is the only one that should:
+# the mapping lives here so that nothing else in the tree has to.
+rustix = { workspace = true, features = ["fs", "mm"] }

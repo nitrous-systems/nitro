@@ -1,57 +1,69 @@
-//! The pixel path: a client buffer rewritten and re-uploaded every frame.
+//! The pixel path: a client buffer rewritten in place every frame.
 //!
 //! # What this measures, and against what ceiling
 //!
 //! This is `x11perf -putimage100/-putimage500` and every fullscreen demo
 //! effect, which turn out to be the same benchmark: a client fills S×S
 //! BGRA pixels, tells the server the whole buffer changed, and the server
-//! reads them back and composites them. The chain per frame is
+//! composites them. The chain per frame is
 //!
 //! ```text
-//! frame = effect + upload + server pread + server paint + server copy
+//! frame = effect + server paint + server copy
 //! ```
 //!
-//! and this module times the first two itself so the report can subtract
-//! them. Without that split a fullscreen plasma at 9 ms per frame is an
+//! and this module times the first itself so the report can subtract it.
+//! Without that split a fullscreen plasma at 9 ms per frame is an
 //! indictment of the compositor when most of it was the sine loop.
 //!
 //! The ceiling to hold every number against: a 1080p BGRA frame is
 //! **1920 × 1080 × 4 = 8 294 400 bytes**. At 60 Hz that is 497 MB/s
-//! *written* by the client, and the server reads the same bytes back out
-//! (`pread`, because the server copies rather than maps — see
-//! `nitro-server`'s `read_buffer`, which explains why a mapping would let
-//! a client shrink a memfd into a SIGBUS), then paints them, then copies
-//! the damage into write-combined scanout memory. So a fullscreen
-//! putimage at 60 Hz moves on the order of 1.5 GB/s through a machine
-//! whose measured `memcpy` bandwidth [`crate::bandwidth`] reports, and at
-//! 120 Hz it wants twice that. That is the arithmetic that decides
-//! whether the pixel path can keep up, and it is the reason the retained
-//! path exists.
+//! *written* by the client. Until #569 the same bytes crossed memory twice
+//! more — the client `pwrite`ing them into its memfd and the server
+//! `pread`ing them back out — so a fullscreen putimage moved on the order
+//! of 1.5 GB/s at 60 Hz and wanted 3 GB/s at 120, against a box whose
+//! measured `memcpy` bandwidth ([`crate::bandwidth`]) is 3.6 GB/s. Two of
+//! those three passes are now gone: the effect writes the client buffer
+//! *once*, through a mapping the server reads directly.
 //!
-//! # Why a fresh memfd per run and one `pwrite` per frame
+//! # Why a mapping, and what seals it
 //!
-//! The buffer is created once and re-written in place; `BufferDamage`
-//! tells the server which rows changed, and the server re-`pread`s only
-//! those. A benchmark that created a new buffer every frame would be
-//! measuring `CreateBuffer` and fd passing, which is a different and much
-//! rarer operation. Writing is `pwrite` rather than `mmap` for the reason
-//! the whole tree writes `pwrite`: mapping needs `unsafe`, which this
-//! tree denies. That is itself a finding — the upload column is a
-//! syscall-per-frame that a mapped buffer would not pay, and the report
-//! says how much it is.
+//! The buffer is created once and rewritten in place; `BufferDamage` tells
+//! the server which rows changed. A benchmark that created a new buffer
+//! every frame would be measuring `CreateBuffer` and fd passing, which is
+//! a different and much rarer operation.
 //!
-//! The scenario keeps its own descriptor on that one buffer, obtained by
-//! [`rustix::io::dup`] of the descriptor it hands to `CreateBuffer`. It
-//! is a `dup` and **not** a second [`memfd`] call, and the distinction is
-//! the whole of issue #584: `memfd_create` mints a *new anonymous file*
-//! every time it is called, and a memfd has no name to re-open, so a
-//! second call yields an unrelated file that merely starts with the same
-//! bytes. Every per-frame `pwrite` then landed in a file the server never
-//! reads, and every pixel-path benchmark displayed frame 0 forever — a
-//! correct-looking, never-moving picture, while still paying every byte
-//! of the per-frame cost the report measures.
+//! The buffer is a **sealed** memfd ([`nitro_shm::create_sealed`]:
+//! `F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL`) mapped read/write by this
+//! client and read-only by the server. The seals are not decoration and
+//! not this client's choice: the server refuses to map an unsealed
+//! descriptor, because a client that could shrink its memfd under the
+//! server's live mapping could `SIGBUS` the compositor. `nitro-shm`'s
+//! module docs carry the proofs. What the arrangement buys the benchmark
+//! is that `upload_us` — a whole pass over 8 MB plus a syscall per frame —
+//! becomes zero work rather than cheaper work.
+//!
+//! Because the server reads the same pages the effect writes, there is a
+//! tearing contract, and the harness already satisfies it: it renders on
+//! `Frame`, which the server sends after it has painted the previous one.
+//! A client that wrote while the server painted would see its own frame
+//! torn, not the server misbehave.
+//!
+//! # The bug this replaced
+//!
+//! The `pwrite` shape it replaces had a defect that outlived the crate's
+//! whole history (#584): `build` called `memfd()` twice, once for the
+//! descriptor moved into `CreateBuffer` and once for the one kept for
+//! per-frame writes. `memfd_create` mints a *new anonymous file* on every
+//! call and a memfd has no name to re-open, so the client wrote every
+//! frame into a file the server had never heard of and every pixel-path
+//! run displayed frame 0 for ever — while still paying every byte of the
+//! cost the report measured. A mapping cannot have that bug: there is one
+//! file, one set of pages and no copy. That is exactly why the property is
+//! still asserted below rather than assumed — "trivially true by
+//! construction" is how the original survived for the crate's whole life
+//! behind a comment describing the design it failed to implement.
 
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd as _, OwnedFd};
 use std::time::Instant;
 
 use nitro_core::{IRect, Rect};
@@ -67,40 +79,35 @@ pub const BUFFER: BufferId = BufferId(1);
 /// The `Image` node it is bound to.
 pub const IMAGE: NodeId = NodeId(FIRST_NODE);
 
-/// Put `pixels` in a fresh memfd and hand back its descriptor.
+/// Put `pixels` in a fresh sealed memfd and hand back its descriptor.
 ///
-/// `pwrite` rather than `mmap`: mapping would need `unsafe`, which this
-/// tree denies. The same function `nitro-demo` uses, for the same reason,
-/// and duplicated for the same reason its control socket is — twenty
-/// lines is not a crate.
+/// The write-once shape, for the `boing-node` sprite ([`crate::nodes`]),
+/// whose pixels never change after `build`. A scenario that rewrites its
+/// buffer every frame maps it instead — see [`PixelScenario::build`].
 ///
 /// # Errors
-/// Any `memfd_create`/`ftruncate`/`pwrite` failure.
+/// Any `memfd_create`/`ftruncate`/`F_ADD_SEALS`/`pwrite` failure.
 pub fn memfd(pixels: &[u8]) -> Result<OwnedFd, rustix::io::Errno> {
-    let fd = rustix::fs::memfd_create("nitro-bench", rustix::fs::MemfdFlags::CLOEXEC)?;
-    rustix::fs::ftruncate(&fd, pixels.len() as u64)?;
-    write_all_at(&fd, pixels, 0)?;
-    Ok(fd)
+    nitro_shm::memfd_with("nitro-bench", pixels)
 }
 
-/// `pwrite` in a loop until the slice is out.
+/// A failed mapping as a harness error.
 ///
-/// # Errors
-/// Any `pwrite` failure; a zero-length write is reported as `EIO` rather
-/// than spun on, because a memfd that accepts nothing will go on accepting
-/// nothing and a benchmark must not hang.
-pub fn write_all_at(fd: &OwnedFd, data: &[u8], offset: u64) -> Result<(), rustix::io::Errno> {
-    use rustix::io::Errno;
-    let mut done = 0usize;
-    while done < data.len() {
-        match rustix::io::pwrite(fd, &data[done..], offset + done as u64) {
-            Ok(0) => return Err(Errno::IO),
-            Ok(n) => done += n,
-            Err(Errno::INTR) => {}
-            Err(e) => return Err(e),
+/// [`nitro_shm::MapError`] distinguishes a missing seal from a short file
+/// from a failed syscall; the benchmark can do nothing about any of them
+/// but stop, so they collapse onto the `Errno` the harness already
+/// carries — keeping the specific one where there is one.
+fn map_err(e: nitro_shm::MapError) -> Error {
+    match e {
+        nitro_shm::MapError::Os(errno) => Error::Io(errno),
+        // A buffer this client just created and sealed itself cannot fail
+        // the seal check or be short; if it somehow does, `EINVAL` is the
+        // honest summary of "the fd is not what we require".
+        other => {
+            debug_assert!(false, "our own sealed memfd was rejected: {other}");
+            Error::Io(rustix::io::Errno::INVAL)
         }
     }
-    Ok(())
 }
 
 /// A scenario that redraws a whole client buffer every frame.
@@ -115,15 +122,15 @@ pub struct PixelScenario {
     effect: Box<dyn Effect>,
     /// Scenario name, which is the effect's unless overridden.
     label: &'static str,
-    /// The pixel buffer, reused every frame.
+    /// The pixel buffer, reused every frame. After `build` it *is* the
+    /// client buffer: a mapping of the memfd the server reads.
     surface: Surface,
-    /// Its memfd, kept open for the life of the run.
-    fd: Option<OwnedFd>,
     /// Requested buffer edge, or 0 for "the window's size".
     edge: u32,
     /// Accumulated microseconds in the effect.
     compute_us: u64,
-    /// Accumulated microseconds in `pwrite`.
+    /// Accumulated microseconds uploading. Zero since #569 — see
+    /// [`Scenario::upload_us`].
     upload_us: u64,
 }
 
@@ -136,7 +143,6 @@ impl PixelScenario {
             effect,
             label,
             surface: Surface::new(1, 1),
-            fd: None,
             edge,
             compute_us: 0,
             upload_us: 0,
@@ -188,7 +194,6 @@ impl Scenario for PixelScenario {
         };
         let (w, h) = (w.max(1), h.max(1));
         ctx.size_px = w;
-        self.surface = Surface::new(w, h);
         // Rebuild the effect for the size the *server* gave us, which a
         // fullscreen run only learns here. Without this the effect keeps
         // whatever box it was constructed with on the command line — 640×480
@@ -197,21 +202,29 @@ impl Scenario for PixelScenario {
         // ledger evidence: fullscreen fire reported less compute than VGA
         // fire, which cannot be true.
         self.effect.resize(w, h);
-        self.effect.render(&mut self.surface, 0);
-        let fd = memfd(&self.surface.data)?;
-        // The descriptor below moves into `CreateBuffer`, so the scenario
-        // keeps a `dup` of it for the per-frame writes: two descriptors
-        // on *one* file, the server `pread`ing what this client
-        // `pwrite`s. Re-sending the buffer every frame would be the
-        // alternative, which is the thing this scenario exists not to do.
+
+        // One sealed memfd, mapped read/write here and read-only by the
+        // server. The effect renders straight into these pages, so there
+        // is no upload: the bytes the server blits are the bytes the
+        // effect just wrote, with nothing in between.
         //
-        // It must be a `dup` and not a second `memfd()`. `memfd_create`
-        // creates a new anonymous file on every call and a memfd has no
-        // name to re-open, so a second call is an unrelated file that
-        // merely starts with the same bytes — which is precisely the bug
-        // (#584) that left every pixel-path benchmark showing frame 0
-        // forever while doing all the work of animating.
-        let mine = rustix::io::dup(&fd)?;
+        // The seals are the server's precondition for mapping at all
+        // (#569) — it refuses a descriptor it cannot prove will not shrink
+        // under its mapping — so `create_sealed` is not a nicety this
+        // client could skip.
+        let byte_len = (w as usize) * (h as usize) * 4;
+        let fd = nitro_shm::create_sealed("nitro-bench", byte_len as u64)?;
+        let map = nitro_shm::MappingMut::map_mut(fd.as_fd(), byte_len).map_err(map_err)?;
+        self.surface = Surface::mapped(w, h, map);
+        // Frame 0 is drawn before the server is told about the buffer, so
+        // the first thing it ever maps is already a rendered frame.
+        self.effect.render(&mut self.surface, 0);
+        // The descriptor moves into `CreateBuffer` below and this client
+        // keeps none: the mapping holds its own reference to the file, so
+        // there is nothing to `dup` and nothing to close. That also makes
+        // the two-descriptors-on-one-memfd mistake of #584 unrepresentable
+        // here — there is one file and one mapping of it, and the server
+        // maps the same file from the descriptor it is handed.
         let msgs = vec![
             CreateNode {
                 id: IMAGE,
@@ -257,20 +270,14 @@ impl Scenario for PixelScenario {
             }
             .into(),
         ];
-        self.fd = Some(mine);
         Ok(msgs)
     }
 
     fn frame(&mut self, _ctx: &mut Ctx, frame: u64) -> Result<Vec<ClientMsg>, Error> {
         let t0 = Instant::now();
+        // Straight into the mapped client buffer: this *is* the upload.
         self.effect.render(&mut self.surface, frame + 1);
         self.compute_us += t0.elapsed().as_micros() as u64;
-
-        let t1 = Instant::now();
-        if let Some(fd) = &self.fd {
-            write_all_at(fd, &self.surface.data, 0)?;
-        }
-        self.upload_us += t1.elapsed().as_micros() as u64;
 
         Ok(vec![
             BufferDamage {
@@ -290,6 +297,18 @@ impl Scenario for PixelScenario {
         self.compute_us
     }
 
+    /// Microseconds spent uploading: **zero since #569**.
+    ///
+    /// What this used to be was the per-frame `pwrite` of the whole
+    /// buffer into the memfd — 4–6 ms of a fullscreen 1080p frame on the
+    /// box. The effect now renders into a mapping of that memfd, so those
+    /// bytes are never copied and the counter has nothing to accumulate.
+    ///
+    /// Kept rather than removed, for two reasons: the ledger's `upload_us`
+    /// column is in every `docs/bench-*.jsonl` written before this, and
+    /// older files must go on parsing; and a column that reads 0 says
+    /// "this cost is gone" where a vanished one would just look like a
+    /// changed report. `the_upload_column_is_zero_now` pins it.
     fn upload_us(&self) -> u64 {
         self.upload_us
     }
@@ -557,21 +576,25 @@ mod tests {
         }
     }
 
-    /// The defect behind issue #584, named directly: the descriptor the
-    /// scenario keeps for its per-frame `pwrite`s must be the **same
-    /// file** as the one it handed to `CreateBuffer`.
+    /// The property issue #584 was the violation of, re-expressed for the
+    /// mapped buffer: **the bytes the effect writes are the bytes the
+    /// server reads, on every frame** — not just the first.
     ///
-    /// `build` used to call `memfd()` twice, and the comment there said
-    /// "two descriptors on one memfd" — which is the right design and
-    /// not what the code did. `memfd_create` mints a new anonymous file
-    /// per call, so the client wrote every frame into a file the server
-    /// had never heard of and the screen showed frame 0 forever.
-    ///
-    /// Settled on `(st_dev, st_ino)` rather than on the pixels, because
-    /// the two files start with identical contents — which is exactly
-    /// why this was invisible in every screenshot-shaped test.
+    /// The old shape kept a second descriptor for its per-frame `pwrite`s
+    /// and this test compared `(st_dev, st_ino)` of the two, because
+    /// `build` called `memfd()` twice and `memfd_create` mints a *new*
+    /// anonymous file per call: the client wrote every frame into a file
+    /// the server had never heard of and the screen showed frame 0 for
+    /// ever. There is no second descriptor now — the effect renders into a
+    /// mapping of the one file that went to `CreateBuffer` — so the claim
+    /// is checked at its source instead: read the file back through the
+    /// server's own descriptor and compare it with what the effect thinks
+    /// it drew. That is strictly stronger than the inode comparison it
+    /// replaces (same file *and* same bytes), and it is asserted rather
+    /// than assumed precisely because "true by construction" is how the
+    /// original bug survived behind a comment claiming this design.
     #[test]
-    fn the_per_frame_writes_go_to_the_buffer_the_server_was_given() {
+    fn the_effects_pixels_land_in_the_buffer_the_server_was_given() {
         let mut s = PixelScenario::new("plasma", Box::new(Plasma::new()), 64);
         let msgs = s.build(&mut ctx(640.0, 480.0)).unwrap();
         let ClientMsg::CreateBuffer(create) = msgs
@@ -581,29 +604,40 @@ mod tests {
         else {
             unreachable!()
         };
-        let mine = s.fd.as_ref().expect("the scenario kept a descriptor");
-        assert_eq!(
-            identity(&create.fd),
-            identity(mine),
-            "the scenario writes its frames into a different file than the \
-             one the server reads — the picture will never move"
+        // Frame 0, drawn during `build`, is already in the server's file.
+        assert!(
+            read_back(&create.fd, s.byte_len()) == s.pixels(),
+            "the server's descriptor does not hold the pixels the effect drew"
         );
+        // And every subsequent frame, with no upload step in between.
+        for f in 0..4 {
+            s.frame(&mut ctx(640.0, 480.0), f).unwrap();
+            assert!(
+                read_back(&create.fd, s.byte_len()) == s.pixels(),
+                "frame {f} is not what the server's descriptor holds"
+            );
+        }
     }
 
-    /// `(st_dev, st_ino)`: the pair that says "same file", whatever the
-    /// descriptor. Spelled locally rather than shared; the precedent is
-    /// `crates/nitro-wire/tests/common/mod.rs::identity`, and three lines
-    /// is not a crate.
-    fn identity(fd: impl std::os::fd::AsFd) -> (u64, u64) {
-        let st = rustix::fs::fstat(fd).expect("fstat");
-        (st.st_dev as u64, st.st_ino as u64)
+    /// `pread` the whole buffer back out of a descriptor — the server's
+    /// view, taken the slow way on purpose: the point is to read the file
+    /// by a route that shares nothing with the mapping under test.
+    fn read_back(fd: &OwnedFd, len: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; len];
+        let mut done = 0;
+        while done < len {
+            let n = rustix::io::pread(fd, &mut buf[done..], done as u64).expect("pread");
+            assert!(n > 0, "short read");
+            done += n;
+        }
+        buf
     }
 
-    /// And the end-to-end shape of the same claim, without a server: a
-    /// later frame's bytes are readable back out of the descriptor the
-    /// server holds.
+    /// The moving-picture half of the same claim, and the one that failed
+    /// for the crate's whole history before #584: a *later* frame's bytes
+    /// are visible through the descriptor the server holds.
     #[test]
-    fn a_frames_pixels_are_visible_through_the_servers_descriptor() {
+    fn a_later_frames_pixels_are_visible_through_the_servers_descriptor() {
         let mut s = PixelScenario::new("plasma", Box::new(Plasma::new()), 64);
         let msgs = s.build(&mut ctx(640.0, 480.0)).unwrap();
         let ClientMsg::CreateBuffer(create) = msgs
@@ -612,16 +646,6 @@ mod tests {
             .expect("CreateBuffer")
         else {
             unreachable!()
-        };
-        let read_back = |fd: &OwnedFd, len: usize| {
-            let mut buf = vec![0u8; len];
-            let mut done = 0;
-            while done < len {
-                let n = rustix::io::pread(fd, &mut buf[done..], done as u64).expect("pread");
-                assert!(n > 0, "short read");
-                done += n;
-            }
-            buf
         };
         let first = read_back(&create.fd, s.byte_len());
         // Plasma is a pure function of the frame index, so frame 40 is
@@ -636,7 +660,7 @@ mod tests {
         assert!(
             first != later,
             "forty frames later the server's buffer is unchanged — the \
-             benchmark is uploading into nowhere"
+             benchmark is animating into nowhere"
         );
         assert!(
             later == s.pixels(),
@@ -644,19 +668,50 @@ mod tests {
         );
     }
 
-    /// The two cost columns must actually accumulate, or the report's
-    /// `frame = effect + upload + …` decomposition is fiction.
+    /// The buffer the server is handed is **sealed**, or it would refuse
+    /// it. Checked here rather than left to the integration test, because
+    /// this is the line of the benchmark that has to keep the protocol's
+    /// side of the bargain.
     #[test]
-    fn the_effect_and_upload_costs_are_accounted_separately() {
+    fn the_buffer_handed_to_the_server_is_sealed() {
+        let mut s = PixelScenario::new("plasma", Box::new(Plasma::new()), 64);
+        let msgs = s.build(&mut ctx(640.0, 480.0)).unwrap();
+        let ClientMsg::CreateBuffer(create) = msgs
+            .iter()
+            .find(|m| matches!(m, ClientMsg::CreateBuffer(_)))
+            .expect("CreateBuffer")
+        else {
+            unreachable!()
+        };
+        nitro_shm::check_seals(create.fd.as_fd())
+            .expect("the server will refuse a buffer without the seals");
+        // The sprite path too: `nodes.rs` hands `memfd()`'s descriptor to
+        // the same `CreateBuffer`.
+        let sprite = memfd(&[0u8; 64]).unwrap();
+        nitro_shm::check_seals(sprite.as_fd()).expect("sprite buffers are sealed too");
+    }
+
+    /// The cost columns. `compute_us` must accumulate, and `upload_us`
+    /// must be **zero**: what it used to count was the per-frame `pwrite`,
+    /// and #569 removed the copy rather than making it faster. The column
+    /// survives so old ledgers parse and so the report can show the cost
+    /// as gone; a non-zero value here would mean a copy crept back in.
+    #[test]
+    fn the_upload_column_is_zero_now() {
         let mut s = PixelScenario::new("plasma", Box::new(Plasma::new()), 128);
         s.build(&mut ctx(640.0, 480.0)).unwrap();
         for f in 0..8 {
             s.frame(&mut ctx(640.0, 480.0), f).unwrap();
         }
         // Microsecond resolution on a fast machine can legitimately round
-        // a small frame to zero, so this asserts the counters exist and
-        // are finite rather than a threshold that would be flaky.
+        // a small frame to zero, so compute is asserted finite rather than
+        // against a threshold that would be flaky.
         assert!(s.compute_us() < 10_000_000);
-        assert!(s.upload_us() < 10_000_000);
+        assert_eq!(
+            s.upload_us(),
+            0,
+            "the pixel path is copying again: the upload column should be \
+             zero since the client renders into the mapped buffer"
+        );
     }
 }

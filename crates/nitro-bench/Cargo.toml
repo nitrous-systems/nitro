@@ -21,6 +21,10 @@ nitro-wire = { workspace = true }
 # the microseconds-per-frame column, and hard-coding its 100 would be a
 # magic number that is right everywhere until it is quietly wrong.
 rustix = { version = "1", features = ["event", "fs", "net", "param", "process", "time"] }
+# Sealed memfds and the mapping the pixel scenarios render into (#569).
+# The `unsafe` lives in that crate, scoped to one module; this crate stays
+# `#![forbid(unsafe_code)]`.
+nitro-shm = { workspace = true }
 
 [dev-dependencies]
 # The integration test drives the real server loop in-process on the fake

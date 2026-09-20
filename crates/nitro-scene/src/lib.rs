@@ -64,7 +64,7 @@ mod scene;
 mod update;
 mod window;
 
-pub use buffer::{Buffer, BufferDesc, BufferKey};
+pub use buffer::{Buffer, BufferDesc, BufferKey, PixelStore};
 pub use error::Error;
 pub use node::{
     Border, Dirty, Fill, IconRef, ImageRef, Node, NodeKey, NodeKind, RectData, TextAlign, TextRef,

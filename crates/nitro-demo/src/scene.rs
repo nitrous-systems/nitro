@@ -553,27 +553,17 @@ pub fn checker(edge: u32) -> Vec<u8> {
     px
 }
 
-/// Put `pixels` in a fresh memfd and hand back its descriptor.
+/// Put `pixels` in a fresh **sealed** memfd and hand back its descriptor.
 ///
-/// `pwrite` rather than `mmap`: mapping would need `unsafe`, which this
-/// tree denies, and the demo writes its pixels once.
+/// The seals (`F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL`) are what let the
+/// server *map* the buffer rather than copy it out (#569); an unsealed
+/// descriptor is a `BadBuffer`. The demo writes its pixels once, so the
+/// one-`pwrite` shape of `nitro_shm::memfd_with` is right here.
 ///
 /// # Errors
-/// Any `memfd_create`/`ftruncate`/`pwrite` failure.
+/// Any `memfd_create`/`ftruncate`/`F_ADD_SEALS`/`pwrite` failure.
 pub fn memfd(pixels: &[u8]) -> Result<OwnedFd, rustix::io::Errno> {
-    use rustix::io::Errno;
-    let fd = rustix::fs::memfd_create("nitro-demo", rustix::fs::MemfdFlags::CLOEXEC)?;
-    rustix::fs::ftruncate(&fd, pixels.len() as u64)?;
-    let mut done = 0usize;
-    while done < pixels.len() {
-        match rustix::io::pwrite(&fd, &pixels[done..], done as u64) {
-            Ok(0) => return Err(Errno::IO),
-            Ok(n) => done += n,
-            Err(Errno::INTR) => {}
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(fd)
+    nitro_shm::memfd_with("nitro-demo", pixels)
 }
 
 /// Nearest-neighbour downscale of an `XRGB8888` image by an integer

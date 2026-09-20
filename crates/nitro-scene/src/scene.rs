@@ -6,8 +6,8 @@ use nitro_core::{IRect, Point, Rect, Size, Transform};
 
 use crate::{
     Border, Buffer, BufferDesc, BufferKey, ClientId, Configure, Error, Fill, IconRef, ImageRef,
-    Insets, Layer, Node, NodeKey, NodeKind, OutputId, TextRef, Window, WindowFlags, WindowKey,
-    WindowState,
+    Insets, Layer, Node, NodeKey, NodeKind, OutputId, PixelStore, TextRef, Window, WindowFlags,
+    WindowKey, WindowState,
     key::Arena,
     node::{ALL_DIRTY, Dirty, NodeData},
     window::Output,
@@ -1207,7 +1207,8 @@ impl Scene {
 
     // --------------------------------------------------------------- buffers
 
-    /// Take ownership of a copy of a client's pixels.
+    /// Take ownership of a client's pixels — a [`PixelStore`], which is a
+    /// mapping of the client's memfd in production and a `Vec<u8>` in tests.
     ///
     /// # Errors
     /// [`Error::BadBuffer`] if the description is degenerate or `data` is
@@ -1216,10 +1217,14 @@ impl Scene {
         &mut self,
         client: ClientId,
         desc: BufferDesc,
-        data: Vec<u8>,
+        data: impl PixelStore + 'static,
     ) -> Result<BufferKey, Error> {
-        desc.validate(data.len())?;
-        Ok(self.buffers.insert(Buffer { desc, client, data }))
+        desc.validate(data.bytes().len())?;
+        Ok(self.buffers.insert(Buffer {
+            desc,
+            client,
+            data: Box::new(data),
+        }))
     }
 
     /// Mutable access to a buffer's pixels.
@@ -1228,13 +1233,14 @@ impl Scene {
     /// [`buffer_damaged`](Scene::buffer_damaged) says which pixels moved.
     ///
     /// # Errors
-    /// [`Error::StaleKey`], [`Error::NotOwner`].
+    /// [`Error::StaleKey`], [`Error::NotOwner`], [`Error::ReadOnly`] if the
+    /// buffer's store is a read-only mapping.
     pub fn buffer_mut(&mut self, client: ClientId, key: BufferKey) -> Result<&mut [u8], Error> {
         let buffer = self.buffers.get_mut(key).ok_or(Error::StaleKey)?;
         if !client.may_touch(buffer.client) {
             return Err(Error::NotOwner);
         }
-        Ok(&mut buffer.data)
+        buffer.data.bytes_mut().ok_or(Error::ReadOnly)
     }
 
     /// Declare which parts of a buffer changed, in buffer pixels.

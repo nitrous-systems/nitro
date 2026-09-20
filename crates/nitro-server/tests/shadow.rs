@@ -511,7 +511,6 @@ fn the_copy_is_measured_separately_from_the_paint() {
 fn an_opaque_image_occludes_without_changing_a_pixel() {
     use nitro_wire::msg::CreateBuffer;
     use nitro_wire::types::{BufferId, format};
-    use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
 
     let h = Harness::start("occlusion", true);
     let mut conn = h.client("painter");
@@ -522,11 +521,10 @@ fn an_opaque_image_occludes_without_changing_a_pixel() {
     let with_rect = h.front();
 
     // An XR24 buffer of that colour, the exact size of the window content,
-    // with a garbage X byte to prove the blit masks it off.
+    // with a garbage X byte to prove the blit masks it off. Sealed: the
+    // server maps client buffers and refuses unsealed ones (#569).
     let (bw, bh) = (size.w as u32, size.h as u32);
     let stride = bw * 4;
-    let fd = memfd_create("nitro-occlusion", MemfdFlags::CLOEXEC).unwrap();
-    ftruncate(&fd, u64::from(stride) * u64::from(bh)).unwrap();
     let pixels: Vec<u8> = (0..(stride * bh))
         .map(|i| match i % 4 {
             0 => b,
@@ -535,10 +533,7 @@ fn an_opaque_image_occludes_without_changing_a_pixel() {
             _ => 0xFF,
         })
         .collect();
-    {
-        let mut file = std::fs::File::from(fd.try_clone().unwrap());
-        file.write_all(&pixels).unwrap();
-    }
+    let fd = nitro_shm::memfd_with("nitro-occlusion", &pixels).unwrap();
 
     let image = NodeId(3);
     conn.tx()
@@ -577,7 +572,6 @@ fn an_opaque_image_occludes_without_changing_a_pixel() {
 fn an_image_with_alpha_does_not_occlude() {
     use nitro_wire::msg::CreateBuffer;
     use nitro_wire::types::{BufferId, format};
-    use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
 
     let h = Harness::start("occlusion-alpha", true);
     let mut conn = h.client("painter");
@@ -586,8 +580,6 @@ fn an_image_with_alpha_does_not_occlude() {
 
     let (bw, bh) = (size.w as u32, size.h as u32);
     let stride = bw * 4;
-    let fd = memfd_create("nitro-occlusion-alpha", MemfdFlags::CLOEXEC).unwrap();
-    ftruncate(&fd, u64::from(stride) * u64::from(bh)).unwrap();
     // Straight-alpha red at a = 128 over the blue rect.
     let pixels: Vec<u8> = (0..(stride * bh))
         .map(|i| match i % 4 {
@@ -596,10 +588,7 @@ fn an_image_with_alpha_does_not_occlude() {
             _ => 0x80,
         })
         .collect();
-    {
-        let mut file = std::fs::File::from(fd.try_clone().unwrap());
-        file.write_all(&pixels).unwrap();
-    }
+    let fd = nitro_shm::memfd_with("nitro-occlusion-alpha", &pixels).unwrap();
 
     let image = NodeId(3);
     conn.tx()

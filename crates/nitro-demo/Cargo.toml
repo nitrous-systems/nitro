@@ -12,6 +12,8 @@ workspace = true
 [dependencies]
 nitro-core = { workspace = true }
 nitro-wire = { workspace = true }
+# Sealed memfds for image buffers: the server maps them (#569).
+nitro-shm = { workspace = true }
 # `poll` for the event loop, `memfd_create`/`pwrite` for the image buffer,
 # `clock_gettime` for the client-side clock and `getuid` for the /tmp
 # fallback of the control-socket path. Same crate the rest of the tree uses.

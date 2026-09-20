@@ -886,11 +886,15 @@ impl Wire {
         self.send(&ClientMsg::SetTransform(SetTransform { id, transform }), id)
     }
 
-    /// Put `pixels` in a memfd, hand the descriptor to the server and
-    /// return the buffer id.
+    /// Put `pixels` in a **sealed** memfd, hand the descriptor to the
+    /// server and return the buffer id.
     ///
-    /// `pwrite` rather than `mmap`: mapping would need `unsafe`, which
-    /// this tree denies, and an image's pixels are written once.
+    /// The seals are the server's precondition for mapping the buffer
+    /// instead of copying it (#569): it refuses a descriptor it cannot
+    /// prove will not shrink under the mapping. An image's pixels are
+    /// written once, so `nitro_shm::memfd_with` (one `pwrite` pass) is the
+    /// right shape here; a client that repaints every frame should map the
+    /// buffer instead.
     ///
     /// **Refused on a remote link.** A buffer *is* a descriptor, and a
     /// descriptor cannot cross TCP; the server says so in `Welcome` with
@@ -1066,21 +1070,11 @@ pub(crate) fn keep_slot(slots: &mut [PaintSlot], index: usize) -> bool {
     }
 }
 
-/// Put `pixels` in a fresh memfd and hand back its descriptor.
+/// Put `pixels` in a fresh sealed memfd and hand back its descriptor.
+///
+/// See [`Wire::create_buffer`] for why the seals are not optional.
 fn memfd(pixels: &[u8]) -> Result<std::os::fd::OwnedFd, Error> {
-    use rustix::io::Errno;
-    let fd = rustix::fs::memfd_create("nitro-ui-image", rustix::fs::MemfdFlags::CLOEXEC)?;
-    rustix::fs::ftruncate(&fd, pixels.len() as u64)?;
-    let mut done = 0usize;
-    while done < pixels.len() {
-        match rustix::io::pwrite(&fd, &pixels[done..], done as u64) {
-            Ok(0) => return Err(Errno::IO.into()),
-            Ok(n) => done += n,
-            Err(Errno::INTR) => {}
-            Err(e) => return Err(e.into()),
-        }
-    }
-    Ok(fd)
+    Ok(nitro_shm::memfd_with("nitro-ui-image", pixels)?)
 }
 
 /// Rough metrics for a server with no fonts: enough for a layout that

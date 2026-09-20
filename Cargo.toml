@@ -27,6 +27,7 @@ nitro-png    = { path = "crates/nitro-png" }
 nitro-icons  = { path = "crates/nitro-icons" }
 nitro-seat   = { path = "crates/nitro-seat" }
 nitro-kms    = { path = "crates/nitro-kms" }
+nitro-shm    = { path = "crates/nitro-shm" }
 rustix       = { version = "1", default-features = false, features = ["std"] }
 drm          = "0.15"
 libseat      = { version = "0.2", default-features = false }

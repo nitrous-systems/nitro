@@ -72,7 +72,45 @@ pub struct Surface {
     /// Bytes between the start of one row and the start of the next.
     pub stride: u32,
     /// The pixels: `stride * height` bytes, `[b, g, r, a]` per pixel.
-    pub data: Vec<u8>,
+    pub data: Pixels,
+}
+
+/// Where a surface's pixels live.
+///
+/// A sprite or a test surface is a heap `Vec`; a scenario's client buffer
+/// is a **mapping of its own sealed memfd**, so the effect renders straight
+/// into the pages the server reads and there is no upload pass at all
+/// (#569). Both deref to `[u8]`, so every effect is written once and does
+/// not know which it has.
+///
+/// `nitro-bench` stays `#![forbid(unsafe_code)]`: the mapping comes from
+/// `nitro-shm`, which is where the `unsafe` and its proofs live.
+#[derive(Debug)]
+pub enum Pixels {
+    /// A heap buffer, owned by this process alone.
+    Heap(Vec<u8>),
+    /// A read/write mapping of a sealed memfd shared with the server.
+    Shared(nitro_shm::MappingMut),
+}
+
+impl std::ops::Deref for Pixels {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Heap(v) => v,
+            Self::Shared(m) => m.as_bytes(),
+        }
+    }
+}
+
+impl std::ops::DerefMut for Pixels {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        match self {
+            Self::Heap(v) => v,
+            Self::Shared(m) => m.as_bytes_mut(),
+        }
+    }
 }
 
 impl Surface {
@@ -84,12 +122,41 @@ impl Surface {
     /// `vec![0; n]` is a `calloc` rather than a memset.
     pub fn new(width: u32, height: u32) -> Self {
         let stride = width * 4;
-        let data = vec![0u8; (stride as usize) * (height as usize)];
+        let data = Pixels::Heap(vec![0u8; (stride as usize) * (height as usize)]);
         Self {
             width,
             height,
             stride,
             data,
+        }
+    }
+
+    /// A surface that renders **straight into a client buffer**: the
+    /// mapping of a sealed memfd the server also maps.
+    ///
+    /// This is what removes the second of the three passes a client frame
+    /// used to make (#569). The stride is `width * 4`, tightly packed, and
+    /// the mapping must be exactly that many bytes per row for `height`
+    /// rows — asserted rather than trusted, because a mismatch would have
+    /// the effects writing outside the rows they think they own and the
+    /// wire message describing a geometry the buffer does not have.
+    ///
+    /// # Panics
+    /// If the mapping is not exactly `width * 4 * height` bytes.
+    #[must_use]
+    pub fn mapped(width: u32, height: u32, map: nitro_shm::MappingMut) -> Self {
+        let stride = width * 4;
+        assert_eq!(
+            map.len(),
+            (stride as usize) * (height as usize),
+            "a {width}x{height} surface needs {} mapped bytes",
+            (stride as usize) * (height as usize)
+        );
+        Self {
+            width,
+            height,
+            stride,
+            data: Pixels::Shared(map),
         }
     }
 
@@ -105,7 +172,7 @@ impl Surface {
     /// exactly the uninitialised-memory bug worth catching.
     pub fn checksum(&self) -> u64 {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for &b in &self.data {
+        for &b in self.data.iter() {
             h ^= u64::from(b);
             h = h.wrapping_mul(0x0000_0100_0000_01b3);
         }

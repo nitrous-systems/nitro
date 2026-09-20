@@ -33,6 +33,9 @@ pub enum Error {
     BadBuffer,
     /// No output with that id has been added.
     UnknownOutput,
+    /// The buffer's pixels are a read-only mapping of the client's memory;
+    /// the client writes them, the scene only reads.
+    ReadOnly,
 }
 
 impl fmt::Display for Error {
@@ -47,6 +50,7 @@ impl fmt::Display for Error {
             Self::TooDeep => "tree too deep",
             Self::BadBuffer => "invalid buffer",
             Self::UnknownOutput => "unknown output",
+            Self::ReadOnly => "buffer is read-only",
         };
         f.write_str(s)
     }

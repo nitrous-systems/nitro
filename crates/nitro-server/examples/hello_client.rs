@@ -341,25 +341,16 @@ fn checker_blob() -> Vec<u8> {
     px
 }
 
-/// Put `pixels` in a fresh memfd and hand back its descriptor.
+/// Put `pixels` in a fresh **sealed** memfd and hand back its descriptor.
 ///
-/// Written with `pwrite` rather than `mmap`: mapping the buffer would need
-/// `unsafe`, which this tree denies, and the demo writes its pixels exactly
-/// once so a syscall per pass costs nothing.
+/// The seals (`F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL`) are not
+/// optional: the server maps the descriptor and refuses one it cannot
+/// prove will not shrink under the mapping, which would be a `SIGBUS` in
+/// the compositor. `nitro_shm::memfd_with` is the write-once shape every
+/// image-carrying client in the tree uses; see `docs/wire.md` under
+/// `CreateBuffer`.
 fn shared_buffer(pixels: &[u8]) -> Result<OwnedFd, Errno> {
-    let fd = rustix::fs::memfd_create("nitro-hello", rustix::fs::MemfdFlags::CLOEXEC)?;
-    rustix::fs::ftruncate(&fd, pixels.len() as u64)?;
-    let mut done = 0usize;
-    while done < pixels.len() {
-        // Short writes are legal; loop until the whole image is in.
-        match rustix::io::pwrite(&fd, &pixels[done..], done as u64) {
-            Ok(0) => return Err(Errno::IO),
-            Ok(n) => done += n,
-            Err(Errno::INTR) => {}
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(fd)
+    nitro_shm::memfd_with("nitro-hello", pixels)
 }
 
 /// Write every queued byte, waiting for writability as needed.

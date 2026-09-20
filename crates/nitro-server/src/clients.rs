@@ -29,14 +29,15 @@
 //! map, not a search of the scene.
 
 use std::collections::HashMap;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::BorrowedFd;
 
-use nitro_core::{IRect, Rect, Role, Size};
+use nitro_core::{Rect, Role, Size};
 use nitro_scene::{
     Border, BufferDesc, BufferKey, ClientId, Error as SceneError, Fill as SceneFill, IconRef,
-    ImageRef, NodeKey, NodeKind as SceneNodeKind, Scene, TextAlign, TextRef, WindowFlags,
-    WindowKey, WindowState,
+    ImageRef, NodeKey, NodeKind as SceneNodeKind, PixelStore, Scene, TextAlign, TextRef,
+    WindowFlags, WindowKey, WindowState,
 };
+use nitro_shm::{MapError, Mapping};
 use nitro_text::TextKey;
 use nitro_wire::error::Error as WireError;
 use nitro_wire::msg::{self, ClientMsg, ServerMsg};
@@ -68,11 +69,11 @@ const BYTES_PER_PIXEL: u32 = 4;
 pub enum Pending {
     /// A message with no side effects until it is applied.
     Msg(Box<ClientMsg>),
-    /// `CreateBuffer` with its pixels already read out of the memfd: the
-    /// descriptor must be consumed when the message arrives, not when the
-    /// transaction commits, or a client could rewrite the buffer in
-    /// between and tear its own frame.
-    Buffer(BufferId, BufferDesc, Vec<u8>),
+    /// `CreateBuffer` with its memfd already mapped: the descriptor is
+    /// checked and mapped when the message arrives, not when the
+    /// transaction commits, so a buffer that fails the seal check is
+    /// refused before anything else in the batch is looked at.
+    Buffer(BufferId, BufferDesc, MappedPixels),
 }
 
 /// One connected wire client.
@@ -234,16 +235,6 @@ pub struct ApplyOutcome {
     pub frame_requests: Vec<NodeId>,
     /// Windows destroyed, so the server can drop focus and z-order state.
     pub closed_windows: Vec<WindowKey>,
-    /// Buffers whose rows the server must re-read from the client's memfd,
-    /// with the rectangles the client declared damaged. The scene only
-    /// learns *which nodes* to repaint; the pixels are the server's job,
-    /// because only it holds the descriptor.
-    pub buffer_damage: Vec<(BufferKey, Vec<IRect>)>,
-    /// Buffers released, so the server can drop the descriptor it kept for
-    /// re-reading them. The scene owns the pixels and forgets them on its
-    /// own; the *fd* is the server's, and nothing else would ever close it
-    /// before the client disconnects.
-    pub destroyed_buffers: Vec<BufferKey>,
     /// Text nodes (re)shaped by this transaction, with the metrics the
     /// client is told in a `TextMetrics`. A client that asked for text gets
     /// the measured size back at the commit, which is how a toolkit lays a
@@ -622,25 +613,28 @@ fn apply_msg(
                 .map_err(|e| scene_err("SetIcon", e))
         }
         ClientMsg::CreateBuffer(_) => {
-            // Turned into `Pending::Buffer` when it arrived; the fd cannot
-            // wait for the commit.
+            // Turned into `Pending::Buffer` when it arrived: the fd is
+            // checked and mapped on receipt, not at the commit.
             Ok(())
         }
         ClientMsg::DestroyBuffer(m) => {
             let key = buffer_key(client, m.id)?;
             client.buffers.remove(&m.id);
-            outcome.destroyed_buffers.push(key);
+            // The scene drops the `Buffer`, and with it the mapping: the
+            // `munmap` is the store's `Drop`, so there is no descriptor for
+            // the server to remember to release.
             scene
                 .destroy_buffer(client.id, key)
                 .map_err(|e| scene_err("DestroyBuffer", e))
         }
         ClientMsg::BufferDamage(m) => {
             let key = buffer_key(client, m.id)?;
+            // The pixels are already there: the scene's buffer is a live
+            // mapping of the client's memfd, so the only work is marking
+            // the image nodes that sample the damaged rows for repaint.
             scene
                 .buffer_damaged(client.id, key, &m.rects)
-                .map_err(|e| scene_err("BufferDamage", e))?;
-            outcome.buffer_damage.push((key, m.rects));
-            Ok(())
+                .map_err(|e| scene_err("BufferDamage", e))
         }
         ClientMsg::SetImage(m) => {
             let key = node_key(client, m.id)?;
@@ -857,83 +851,73 @@ fn scene_fill(fill: msg::Fill) -> SceneFill {
     }
 }
 
-/// Validate a `CreateBuffer` and read its pixels out of the memfd.
+/// A client's pixels as the scene sees them: a read-only mapping of its
+/// sealed memfd.
 ///
-/// The bytes are **copied**, not mapped. Mapping would be one `mmap` and
-/// zero copies, but a client can shrink a memfd under a live mapping and
-/// turn the server's reads into SIGBUS, so a safe mapping needs either
-/// `F_SEAL_SHRINK` enforcement or a signal handler — and `mmap` is `unsafe`
-/// in our tree besides. `pread` costs one pass over the pixels per update
-/// and is the M1 answer; `BufferDamage` keeps that pass proportional to
-/// what actually changed. Revisit with sealing when a client pushes video.
-///
-/// # Errors
-/// A description that does not add up, a size past [`MAX_BUFFER_BYTES`], or
-/// a descriptor that will not read.
-pub fn read_buffer(m: &msg::CreateBuffer) -> Result<(BufferDesc, Vec<u8>), ApplyError> {
-    let desc = validate_buffer(m)?;
-    let len = desc.byte_len();
-    let mut data = vec![0u8; len];
-    read_exact_at(m.fd.as_fd(), &mut data, 0)?;
-    Ok((desc, data))
+/// A newtype because both [`Mapping`] and [`PixelStore`] are foreign to
+/// this crate. The scene never learns what a mapping is; `nitro-shm` never
+/// learns what a scene is.
+#[derive(Debug)]
+pub struct MappedPixels(pub Mapping);
+
+impl PixelStore for MappedPixels {
+    fn bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+
+    /// `None`, always: the client writes these pages, the server only
+    /// reads them, and the mapping is `PROT_READ` besides.
+    fn bytes_mut(&mut self) -> Option<&mut [u8]> {
+        None
+    }
 }
 
-/// Re-read the damaged rows of a buffer. Only whole rows are re-read: the
-/// rectangles are usually wide and the row is contiguous, so one `pread`
-/// per row band beats one per rectangle-row.
+/// Validate a `CreateBuffer` and map its memfd.
+///
+/// The bytes are **mapped**, not copied, and the precondition for that is
+/// the seal check: a client can shrink an unsealed memfd under a live
+/// mapping and turn the server's next read into a `SIGBUS`, so
+/// [`Mapping::map`] asks the kernel (`F_GET_SEALS`) whether
+/// `F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL` are in force on *this* fd
+/// and refuses otherwise. There is deliberately no `pread` fallback for an
+/// unsealed buffer: a fallback would make the mapped path's safety
+/// argument untestable from the outside (which path did the server take?)
+/// and leave the copying path rotting unexercised. The proofs are in
+/// `nitro-shm/src/map.rs`; `docs/wire.md` states the requirement to
+/// clients.
+///
+/// Exactly `byte_len` (`stride * height`) is mapped, not the declared
+/// `size`: a client cannot make the server reserve address space beyond
+/// the [`MAX_BUFFER_BYTES`] cap by declaring a large `size`. The `size` is
+/// still checked against the file, because `docs/wire.md` says an
+/// inconsistent one is a `BadBuffer`.
 ///
 /// # Errors
-/// As [`read_buffer`].
-pub fn reread_damage(
-    fd: BorrowedFd<'_>,
-    desc: BufferDesc,
-    rects: &[IRect],
-    data: &mut [u8],
-) -> Result<(), ApplyError> {
-    for rect in rects {
-        let rect = rect.intersect(&desc.full_rect());
-        if rect.is_empty() {
-            continue;
-        }
-        let y0 = rect.y.cast_unsigned();
-        let rows = rect.h.cast_unsigned();
-        let start = (y0 as usize) * (desc.stride as usize);
-        let end = start + (rows as usize) * (desc.stride as usize);
-        if end > data.len() {
-            continue;
-        }
-        read_exact_at(fd, &mut data[start..end], start as u64)?;
+/// A description that does not add up, a size past [`MAX_BUFFER_BYTES`], a
+/// descriptor without the required seals (the detail names which are
+/// missing), a file shorter than the declared size, or a descriptor that
+/// will not map.
+pub fn map_buffer(m: msg::CreateBuffer) -> Result<(BufferDesc, MappedPixels), ApplyError> {
+    let desc = validate_buffer(&m)?;
+    let bad = |detail: String| ApplyError::new(ErrorCode::BadBuffer, detail);
+    let file_len = nitro_shm::sealed_len(&m.fd).map_err(|e| match e {
+        MapError::Seals(s) => bad(format!("buffer {s}")),
+        other => bad(other.to_string()),
+    })?;
+    if file_len < u64::from(m.size) {
+        return Err(bad(format!(
+            "buffer fd is {file_len} bytes, shorter than the declared size {}",
+            m.size
+        )));
     }
-    Ok(())
-}
-
-/// `pread` in a loop until the slice is full. A short read means the
-/// client's memfd is smaller than it declared, which is a bad buffer, not
-/// something to pad with zeroes.
-fn read_exact_at(fd: BorrowedFd<'_>, buf: &mut [u8], mut offset: u64) -> Result<(), ApplyError> {
-    let mut done = 0usize;
-    while done < buf.len() {
-        match rustix::io::pread(fd, &mut buf[done..], offset) {
-            Ok(0) => {
-                return Err(ApplyError::new(
-                    ErrorCode::BadBuffer,
-                    "buffer fd is shorter than the declared size",
-                ));
-            }
-            Ok(n) => {
-                done += n;
-                offset += n as u64;
-            }
-            Err(rustix::io::Errno::INTR) => {}
-            Err(e) => {
-                return Err(ApplyError::new(
-                    ErrorCode::BadBuffer,
-                    format!("reading the buffer fd: {e}"),
-                ));
-            }
-        }
-    }
-    Ok(())
+    let mapping = Mapping::map(m.fd, desc.byte_len()).map_err(|e| match e {
+        MapError::Seals(s) => bad(format!("buffer {s}")),
+        MapError::TooShort { file, need } => bad(format!(
+            "buffer fd is {file} bytes, shorter than the {need} the geometry needs"
+        )),
+        MapError::Os(errno) => bad(format!("mapping the buffer fd: {errno}")),
+    })?;
+    Ok((desc, MappedPixels(mapping)))
 }
 
 /// Check a `CreateBuffer`'s geometry against the format and the caps.
@@ -984,16 +968,6 @@ pub fn validate_buffer(m: &msg::CreateBuffer) -> Result<BufferDesc, ApplyError> 
         BufferDesc::new(m.width, m.height, m.stride, m.format)
             .with_opaque(m.format == format::XR24),
     )
-}
-
-/// A buffer's descriptor kept alongside its fd, so `BufferDamage` can
-/// re-read rows without the client sending them again.
-#[derive(Debug)]
-pub struct BufferSource {
-    /// The client's memfd.
-    pub fd: OwnedFd,
-    /// Its declared geometry.
-    pub desc: BufferDesc,
 }
 
 /// The protocol code for a wire-level failure, re-exported so the event
@@ -1065,12 +1039,28 @@ pub fn wire_layer(layer: nitro_scene::Layer) -> Layer {
 mod tests {
     use super::*;
     use nitro_core::Color;
+    use std::os::fd::OwnedFd;
 
     fn create_buffer(width: u32, height: u32, stride: u32, size: u32, format: u32) -> OwnedFd {
-        use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
-        let fd = memfd_create("nitro-test", MemfdFlags::CLOEXEC).unwrap();
-        ftruncate(&fd, u64::from(stride) * u64::from(height)).unwrap();
+        let fd =
+            nitro_shm::create_sealed("nitro-test", u64::from(stride) * u64::from(height)).unwrap();
         let _ = (width, size, format);
+        fd
+    }
+
+    /// A memfd of `len` bytes with exactly `seals` on it — for the
+    /// per-seal negatives, which `create_sealed` cannot produce.
+    fn memfd_with_seals(len: u64, seals: rustix::fs::SealFlags) -> OwnedFd {
+        use rustix::fs::{MemfdFlags, fcntl_add_seals, ftruncate, memfd_create};
+        let fd = memfd_create(
+            "nitro-test",
+            MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
+        )
+        .unwrap();
+        ftruncate(&fd, len).unwrap();
+        if !seals.is_empty() {
+            fcntl_add_seals(&fd, seals).unwrap();
+        }
         fd
     }
 
@@ -1137,33 +1127,49 @@ mod tests {
         );
     }
 
+    /// The mapping is the memfd: a write through the client's descriptor
+    /// after the map is visible with no re-read at all, which is what
+    /// makes `BufferDamage` a pure "repaint these nodes" message.
     #[test]
-    fn reading_a_buffer_copies_the_memfd_and_rereads_damage() {
-        use std::io::Write as _;
+    fn mapping_a_buffer_sees_the_memfd_live() {
+        use std::io::{Seek as _, Write as _};
         let m = msg_buffer(4, 4, 16, 64, format::XR24);
+        let client_fd = m.fd.try_clone().unwrap();
         {
-            let mut file = std::fs::File::from(m.fd.try_clone().unwrap());
+            let mut file = std::fs::File::from(client_fd.try_clone().unwrap());
             file.write_all(&[0xAB; 64]).unwrap();
         }
-        let (desc, data) = read_buffer(&m).unwrap();
+        let (desc, pixels) = map_buffer(m).unwrap();
         assert_eq!(
             desc,
             BufferDesc::new(4, 4, 16, format::XR24).with_opaque(true)
         );
-        assert_eq!(data, vec![0xABu8; 64]);
+        assert_eq!(pixels.bytes(), &[0xABu8; 64]);
 
-        // Rewrite one row through the fd and re-read only that row.
+        // Rewrite one row through the client's fd; the mapping follows.
         {
-            use std::io::Seek as _;
-            let mut file = std::fs::File::from(m.fd.try_clone().unwrap());
+            let mut file = std::fs::File::from(client_fd);
             file.seek(std::io::SeekFrom::Start(16)).unwrap();
             file.write_all(&[0x11; 16]).unwrap();
         }
-        let mut copy = data.clone();
-        reread_damage(m.fd.as_fd(), desc, &[IRect::new(0, 1, 4, 1)], &mut copy).unwrap();
-        assert_eq!(&copy[0..16], &[0xABu8; 16]);
-        assert_eq!(&copy[16..32], &[0x11u8; 16]);
-        assert_eq!(&copy[32..64], &[0xABu8; 32]);
+        assert_eq!(&pixels.bytes()[0..16], &[0xABu8; 16]);
+        assert_eq!(&pixels.bytes()[16..32], &[0x11u8; 16]);
+        assert_eq!(&pixels.bytes()[32..64], &[0xABu8; 32]);
+    }
+
+    /// The store is read-only from the scene's side: the client writes
+    /// the pages, the server does not.
+    #[test]
+    fn a_mapped_buffer_is_read_only_to_the_scene() {
+        let m = msg_buffer(4, 4, 16, 64, format::XR24);
+        let (desc, pixels) = map_buffer(m).unwrap();
+        let mut scene = Scene::new();
+        let key = scene.create_buffer(ClientId(7), desc, pixels).unwrap();
+        assert_eq!(
+            scene.buffer_mut(ClientId(7), key).unwrap_err(),
+            SceneError::ReadOnly
+        );
+        assert_eq!(scene.buffer(key).unwrap().data().len(), 64);
     }
 
     #[test]
@@ -1172,8 +1178,72 @@ mod tests {
         // Declare twice the rows the fd actually has.
         m.height = 8;
         m.size = 128;
-        let err = read_buffer(&m).unwrap_err();
+        let err = map_buffer(m).unwrap_err();
         assert_eq!(err.code, ErrorCode::BadBuffer);
+        assert!(err.detail.contains("shorter"), "{}", err.detail);
+    }
+
+    /// A declared `size` the file does not cover is a `BadBuffer` even when
+    /// the geometry fits — `docs/wire.md`'s "inconsistent size" rule.
+    #[test]
+    fn a_declared_size_past_the_file_is_a_bad_buffer() {
+        let mut m = msg_buffer(4, 4, 16, 64, format::XR24);
+        m.size = 65;
+        let err = map_buffer(m).unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadBuffer);
+        assert!(err.detail.contains("declared size"), "{}", err.detail);
+    }
+
+    /// An unsealed buffer is refused — no `pread` fallback — and the detail
+    /// names what is missing. A plain `memfd_create` without
+    /// `MFD_ALLOW_SEALING` is what every pre-#569 client sent.
+    #[test]
+    fn an_unsealed_buffer_is_refused() {
+        use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
+        let mut m = msg_buffer(4, 4, 16, 64, format::XR24);
+        let fd = memfd_create("nitro-test-unsealed", MemfdFlags::CLOEXEC).unwrap();
+        ftruncate(&fd, 64).unwrap();
+        m.fd = fd;
+        let err = map_buffer(m).unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadBuffer);
+        assert_eq!(err.detail, "buffer fd lacks F_SEAL_SHRINK, F_SEAL_GROW");
+    }
+
+    /// Each required seal on its own: missing `SHRINK`, missing `GROW`,
+    /// missing `SEAL`. All three are `BadBuffer`, each naming its bit.
+    #[test]
+    fn each_missing_seal_is_refused_by_name() {
+        use rustix::fs::SealFlags;
+        for (seals, missing) in [
+            (SealFlags::GROW | SealFlags::SEAL, "F_SEAL_SHRINK"),
+            (SealFlags::SHRINK | SealFlags::SEAL, "F_SEAL_GROW"),
+            (SealFlags::SHRINK | SealFlags::GROW, "F_SEAL_SEAL"),
+        ] {
+            let mut m = msg_buffer(4, 4, 16, 64, format::XR24);
+            m.fd = memfd_with_seals(64, seals);
+            let err = map_buffer(m).unwrap_err();
+            assert_eq!(err.code, ErrorCode::BadBuffer, "{missing}");
+            assert_eq!(err.detail, format!("buffer fd lacks {missing}"));
+        }
+    }
+
+    /// Something that is not a memfd at all cannot be sealed, and is
+    /// refused for that reason rather than mapped on trust.
+    #[test]
+    fn a_regular_file_is_refused() {
+        let mut m = msg_buffer(4, 4, 16, 64, format::XR24);
+        let path = std::env::temp_dir().join(format!("nitro-clients-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(64).unwrap();
+        m.fd = file.into();
+        let err = map_buffer(m).unwrap_err();
+        let _ = std::fs::remove_file(path);
+        assert_eq!(err.code, ErrorCode::BadBuffer);
+        assert!(
+            err.detail.contains("does not support sealing"),
+            "{}",
+            err.detail
+        );
     }
 
     #[test]
