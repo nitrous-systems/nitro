@@ -4,6 +4,9 @@
 //! `F_GET_SEALS` or a file-backed `mmap`, and rustix's `linux_raw` backend
 //! uses inline asm), which is why each safety-relevant claim in
 //! `src/map.rs` is pinned here against what the kernel actually does.
+//!
+//! This file is also the worked example for `docs/bench.md` §11.1 — a test
+//! that checks something adjacent to the claim it names.
 
 use std::os::fd::{AsFd, OwnedFd};
 

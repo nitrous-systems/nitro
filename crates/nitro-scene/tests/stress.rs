@@ -379,7 +379,7 @@ fn scroll_to(s: &mut Scene, content: NodeKey, rows: usize, frame: usize) {
 /// where the decision gets revisited — and `visited_nodes` is the right
 /// probe for it, because unlike `damage_px_mean` it counts work done rather
 /// than pixels claimed, so it cannot be satisfied by a corrupt screen
-/// (`docs/bench.md` §11 D).
+/// (`docs/bench.md` §8 D).
 #[test]
 fn a_tall_clipped_column_costs_a_walk_per_content_row() {
     for rows in [500usize, 2000] {
@@ -445,7 +445,7 @@ fn scrolling_damages_the_viewport_not_the_exposed_band() {
     assert!(
         area > 250_000,
         "a scroll must damage ~the viewport, got {area} px; \
-         see docs/bench.md §7.5 and §11 D"
+         see docs/bench.md §7.5 and §8 D"
     );
     assert!(area <= 307_200, "and never more than the viewport: {area}");
 }

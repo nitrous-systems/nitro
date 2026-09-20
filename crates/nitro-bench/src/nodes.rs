@@ -381,7 +381,7 @@ impl Scenario for BallNodes {
 /// and cannot move regardless: it is `damage(n) u damage(n-1)`, the
 /// region the age-2 back buffer is behind by. The compressible cost is
 /// `paint_us` (issue #592), and the probe for the scene walk's own
-/// scaling is `visited_nodes`. See `docs/bench.md` §7.5 and §11 D.
+/// scaling is `visited_nodes`. See `docs/bench.md` §7.5 and §8 D.
 pub struct Scroll {
     /// Rows of content; the column is this many rects tall.
     pub rows: usize,

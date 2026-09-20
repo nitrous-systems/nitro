@@ -197,6 +197,12 @@ D-Bus client is allowed.
 - **Clippy pedantic, deny.** Workspace lints in `Cargo.toml`; every crate
   sets `[lints] workspace = true`. Per-lint allows are workspace-level with
   a stated reason, not sprinkled through the code.
+- **A green test is evidence only about what it looked at.** A test can
+  check something *adjacent* to the claim in its name — the other file,
+  the other parity, the second frame — and stay green while the claim is
+  false. Assert over every artefact the claim covers, and make a checker
+  that finds nothing say so. `docs/bench.md` §11.1, with the worked
+  example in `crates/nitro-shm/tests/seals.rs`.
 
 ## Milestones
 

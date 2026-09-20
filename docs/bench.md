@@ -802,7 +802,7 @@ framebuffer that has already been blitted and false of a scene graph that
 has not: damaging the two thin bands would leave **267 520 px stale** —
 the whole viewport interior frozen at the previous frame with only the
 top and bottom edges animating. It is not a smaller correct answer, it is
-an incorrect one, and §11 D records what that would have done to a test.
+an incorrect one, and §8 D records what that would have done to a test.
 
 §9 adds that the figure does not move with the refresh rate — 306 560 px
 at 60, 120 and 240 Hz alike, for 1 616 / 1 599 / 1 522 µs/frame — so a
@@ -1375,6 +1375,12 @@ differently than they did.
   which, unlike `damage_px_mean`, **cannot be satisfied by a corrupt
   screen**, because it counts work done rather than pixels claimed.
 
+  This rule has a sibling one level out. Here the assertion is on the
+  wrong *quantity* — a proxy for the property. It can also be on exactly
+  the right quantity and read the wrong *artefact*: the other file, the
+  other parity, the second frame. That is §11.1.
+
+
 Four properties, four regression tests, and one rule they share: each
 test asserts the property the bad number violated, not the shape of the
 code that produced it. Note also what none of them were: a wrong
@@ -1424,7 +1430,7 @@ number. The second kind is worth filing for too.
 |---|---|---|
 | **#568** | `paint_us_mean` **11 757 µs** for a fullscreen 1080p repaint — **71 %** of the 60 Hz frame, and more than a whole 120 Hz frame | Fullscreen rows across three scenarios — rotozoom, starfield at all three N, balls — do genuinely different work per frame (a per-pixel gather, two thousand moving stars, thirty-two circles) and report near-identical server costs: **16 525–16 741 µs, paint 10 963–11 757**, because the server's work is a function of damaged area alone. A least-squares fit through `putimage`'s four damage/paint points extrapolates to ~3 060 µs at 2 073 600 px against the 11 000–11 800 measured, so **a fullscreen repaint is ~3.8× more expensive per pixel than a large partial one** — and §9.6 adds the constraint that the excess is *proportional to area rather than fixed per frame*: at 720p every scenario's ns/px falls rather than rises, so the thing to profile is the per-pixel path at full-surface damage and not a setup cost. |
 | **#569** | ~~`upload_us` **2 570–6 044 µs/frame** at 1080p~~ → **0**, and the server's `pread` with it | **Fixed.** The client now renders straight into a mapping of its own sealed memfd and the server maps the same file read-only, so two of the frame's three passes over the pixels are gone. Measured either side in one sitting: `docs/bench-49d023b.jsonl` and §7.10 below. `upload_us` is 0 on every row, server CPU/frame falls 13–50 %, and `boing` crosses the 60 Hz budget and doubles to 60 fps. The seal check (`F_SEAL_SHRINK`, `F_SEAL_GROW`, `F_SEAL_SEAL`, verified with `F_GET_SEALS`) is what makes the mapping sound against a hostile client; `crates/nitro-shm/README.md` carries the argument and the residuals. Scope was always the escape hatch: the retained path never paid this (§7.7's 83.5 µs) and is unchanged — `boing-node` is the control row and does not move. |
-| **#570** | ~~a one-row scroll damages **304 768 px = 0.99× the viewport**, a factor of ~30 against `CopyArea`~~ → **damage is within 6 % of minimal; the finding was a misreading** | **Retired, and the measurement is the interesting part.** The number was right and the reasoning was wrong. A one-row scroll of heterogeneous content genuinely changes **450 of 480 viewport rows = 288 000 px** (the 30 that do not are the scenario's own 1-px inter-row gaps; with solid content it is 480 of 480), because shifting differently-coloured rows past a fixed viewport gives every pixel its neighbour's colour. Reported damage is **306 560 px against a true minimum of 288 000 — 1.06×**, the excess being `Damage`'s documented rect-merge policy (`crates/nitro-core/src/damage.rs`). So there is no 30× to reclaim: **what `CopyArea` bought was not less damage but cheaper pixels**, and the recommended fix (damage the symmetric difference) would have left 267 520 px stale — see §11 D, because the test it proposed as proof would have certified the bug. The real prize is ~2× on `paint_us`, filed as **#592** with its ceiling attached, and `damage_px_mean` cannot move at all: it is `damage(n) ∪ damage(n−1)`, pixels that genuinely differ from the age-2 back buffer. §7.5 carries the full argument. (The figure was 675 696 px in an earlier ledger, from a clipping group that clipped nothing.) |
+| **#570** | ~~a one-row scroll damages **304 768 px = 0.99× the viewport**, a factor of ~30 against `CopyArea`~~ → **damage is within 6 % of minimal; the finding was a misreading** | **Retired, and the measurement is the interesting part.** The number was right and the reasoning was wrong. A one-row scroll of heterogeneous content genuinely changes **450 of 480 viewport rows = 288 000 px** (the 30 that do not are the scenario's own 1-px inter-row gaps; with solid content it is 480 of 480), because shifting differently-coloured rows past a fixed viewport gives every pixel its neighbour's colour. Reported damage is **306 560 px against a true minimum of 288 000 — 1.06×**, the excess being `Damage`'s documented rect-merge policy (`crates/nitro-core/src/damage.rs`). So there is no 30× to reclaim: **what `CopyArea` bought was not less damage but cheaper pixels**, and the recommended fix (damage the symmetric difference) would have left 267 520 px stale — see §8 D, because the test it proposed as proof would have certified the bug. The real prize is ~2× on `paint_us`, filed as **#592** with its ceiling attached, and `damage_px_mean` cannot move at all: it is `damage(n) ∪ damage(n−1)`, pixels that genuinely differ from the age-2 back buffer. §7.5 carries the full argument. (The figure was 675 696 px in an earlier ledger, from a clipping group that clipped nothing.) |
 
 **#568 is about the server's cost being proportional to damaged area**,
 and that is a statement about the *rasterizer's* per-pixel path at full‑
@@ -2165,3 +2171,73 @@ of a benchmark document is a reader who takes it for more than it is.
   1's other half and is measured in `docs/latency.md` §4.3 — 0 frames and
   0 CPU ticks over five seconds with clients connected. A throughput
   suite by construction never idles.
+
+### 11.1 A test that checks something adjacent to the claim
+
+The limits above are about a reader taking this document for more than it
+is. A green test is the same transaction with a machine, and it fails the
+same way:
+
+> **A green test is evidence only about what it looked at.** If the
+> assertion never reads the artefact the claim is about — the other file,
+> the other parity, the second frame — it is a test of something adjacent
+> to the claim, and it stays green while the claim is false.
+
+This is worse than a missing test. A missing test is visible; this one is
+silent by construction, and the tick is read as coverage of the claim in
+the test's name. §8 D is its near neighbour and a different rule: there,
+the assertion is on a *proxy quantity* and a system broken in the
+direction the metric does not look satisfies it. Here the predicate can be
+exactly right and still be evaluated over the wrong *artefact*.
+
+Four instances in one round of work:
+
+- **#566** — a bound that held at one parity, so half the inputs were
+  never really constrained (§8 D; `crates/nitro-ui/tests/list.rs`).
+- **#584** — one screenshot proved *a* picture reached the screen, not a
+  *moving* one; the defect survived the crate's entire history behind a
+  comment asserting the correct design (§4, §8 D;
+  `crates/nitro-bench/tests/against_server.rs`).
+- **#570** — the acceptance test it proposed would have measured the
+  instrument rather than the claim, and passed on a visibly corrupt
+  screen (§8 D).
+- **#569, twice** — and this is the one that earns the entry. The guard
+  `the_unsafe_surface_is_exactly_what_the_docs_claim` counted this
+  crate's `unsafe` blocks in `map.rs` and never read the documents
+  quoting that count, so it could not catch the stale figure in
+  `DEPENDENCIES.md` — exactly the drift it existed to prevent. When that
+  was fixed, the replacement matcher judged only the word immediately
+  before "block(s)" and was blind to most of the files it named,
+  because those files write the count with a modifier in between. It
+  passed on clean text and caught the one defect it was tested with.
+
+The fourth is the point: **the guard built because of the first three was
+itself subject to the pattern, twice** — and the second time it was
+verified by breaking a document, by the author and independently by the
+reviewer, both of whom concluded it was sound.
+
+Two sub-rules came out of that, and they are the reusable part:
+
+> **Breaking one input is evidence only for the input you broke.** A guard
+> over N sites needs N breaks.
+
+The matcher was verified against the single file whose phrasing it
+happened to fit. What resolved it was running the matcher across *all* its
+inputs, not testing one input harder.
+
+> **A checker that finds nothing must say so.** "No findings" and "cannot
+> look" are indistinguishable from outside, and the harmless-looking one
+> is usually wrong.
+
+The remedy is the assertion in
+`the_doc_count_guard_catches_drift_in_every_phrasing`: every named input
+must yield at least one *judged* site, which turns silent blindness into a
+loud failure. That assertion is the general fix — correcting the matcher
+alone would have left the method intact.
+
+The worked example is `crates/nitro-shm/tests/seals.rs` (commits
+`c025a5e`, `5921684`). Its comments record all four matcher attempts and
+why two of them would have shipped green, and `DOCS_QUOTING_THE_COUNT`'s
+doc comment states the guard's own remaining limit rather than implying
+it. Read it there rather than re-deriving it here.
+
