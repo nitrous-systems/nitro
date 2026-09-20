@@ -80,6 +80,7 @@
 //! hey nitro-settings set displays/HDMI-A-1/x value 0
 //! hey nitro-settings get displays/HDMI-A-1/scale_value value   # 2
 //! hey nitro-settings set keyboard/layout value de
+//! hey nitro-settings do keyboard/nocaps toggle            # Caps Lock is Ctrl
 //! hey nitro-settings do apply click
 //! hey nitro-settings get status value                      # applied
 //! ```
@@ -111,6 +112,36 @@
 //! a genuinely poorer dialog (no resolutions, and no output the file has
 //! never heard of), so it **says so in a label**,
 //! [`names::DISPLAYS_NOTE`], rather than quietly showing less.
+//!
+//! # "Caps Lock is Ctrl" edits a list it does not own
+//!
+//! The Keyboard page's one switch, and the only xkb option this dialog
+//! gives a control rather than a spelling to remember. It writes the
+//! token `ctrl:nocaps` into the `options` field beside it and takes it
+//! out again — there is no remap path in this crate and there must not
+//! be one: libxkbcommon already does that token correctly, LED, lock
+//! state and modifier interactions included, and a second implementation
+//! in a settings app would be a worse one.
+//!
+//! What the control has to get right is the *list*. `keyboard.options`
+//! is comma-separated, may hold entries this app has no widget for
+//! (`grp:alt_shift_toggle`, `compose:ralt`) and may have been typed by
+//! hand — so the switch adds or drops only its own token and preserves
+//! every other entry and its position ([`conf::with_option`]). A control
+//! that wrote the whole field would silently delete a configuration from
+//! a switch the user flipped to get one thing, which is the failure this
+//! design is shaped around.
+//!
+//! The switch and the field show **one** value — the field, which is
+//! what [`collect`] reads — and each follows the other. That cannot
+//! loop, because a *setter* is the app changing its own mind and does
+//! not run the user callback (`TextField::set_text`,
+//! `Switch::set_checked`), while an *action* — a click, a keystroke,
+//! `hey do`/`hey set` — does.
+//!
+//! No control for the neighbouring `ctrl:swapcaps`, and none for the
+//! rest of the vocabulary: one switch for the common case, and the file
+//! stays the escape hatch.
 //!
 //! # The file is rewritten wholesale
 //!
@@ -413,6 +444,9 @@ pub mod names {
     pub const VARIANT: &str = "variant";
     /// `keyboard.options`.
     pub const OPTIONS: &str = "options";
+    /// The "Caps Lock is Ctrl" switch: the `ctrl:nocaps` token inside
+    /// [`OPTIONS`], as a control rather than as a string to type.
+    pub const NOCAPS: &str = "nocaps";
     /// The scratch field, to type in after Apply and see the new layout.
     pub const TEST: &str = "test";
 
@@ -746,6 +780,7 @@ struct Ids {
     layout: WidgetId,
     variant: WidgetId,
     options: WidgetId,
+    nocaps: WidgetId,
     volume: WidgetId,
     volume_value: WidgetId,
     mute: WidgetId,
@@ -824,6 +859,42 @@ pub fn build(ui: &mut Ui<Settings>) -> WidgetId {
         ui.attach(r, id).unwrap();
         ui.attach(kb_card, r).unwrap();
     }
+    // The one xkb option with a control rather than a spelling to
+    // remember, because it is the one people ask for. It edits the
+    // `options` field rather than a second piece of state: the field
+    // stays the single source of truth that Apply reads, so the two
+    // cannot disagree about what is going to be written.
+    //
+    // Neither direction re-enters. `TextField::set_text` and
+    // `Switch::set_checked` are setters — the app changing its own mind —
+    // and neither runs the user callback; only an *action* (a click, a
+    // keystroke, `hey do`/`hey set`) does. That asymmetry is what makes
+    // a pair of controls that write to each other safe.
+    let nocaps = ui.build(switch("").name(names::NOCAPS).on_toggle(
+        move |_s: &mut Settings, ui: &mut Ui<Settings>, on: bool| {
+            let now = field_text(ui, options);
+            set_field(ui, options, &conf::with_option(&now, conf::NOCAPS, on));
+        },
+    ));
+    // Installed after the switch rather than in `field(..)` above,
+    // because a builder's callback can only capture ids that already
+    // exist and `Switch` has no `set_on_toggle` — so the switch has to be
+    // the one built second.
+    if let Ok(mut f) = ui.widget_mut::<TextField<Settings>>(options) {
+        f.set_on_change(
+            move |_s: &mut Settings, ui: &mut Ui<Settings>, text: &str| {
+                let on = conf::has_option(text, conf::NOCAPS);
+                if let Ok(mut sw) = ui.widget_mut::<Switch<Settings>>(nocaps) {
+                    sw.set_checked(on);
+                }
+            },
+        );
+    }
+    let nocaps_row =
+        ui.build(card_row("Caps Lock is Ctrl").subtitle("Adds ctrl:nocaps to the options above"));
+    ui.attach(nocaps_row, nocaps).unwrap();
+    ui.attach(kb_card, nocaps_row).unwrap();
+
     let test_card = ui.build(card());
     let test_row = ui.build(card_row("Test here"));
     ui.attach(test_row, test).unwrap();
@@ -1031,6 +1102,7 @@ pub fn build(ui: &mut Ui<Settings>) -> WidgetId {
         layout,
         variant,
         options,
+        nocaps,
         volume,
         volume_value,
         mute,
@@ -1825,6 +1897,15 @@ fn fill_keyboard(ui: &mut Ui<Settings>, ids: Ids, k: &KeyboardConf) {
     set_field(ui, ids.layout, &k.layout);
     set_field(ui, ids.variant, &k.variant);
     set_field(ui, ids.options, &k.options);
+    // `set_field` is a setter and does not run the field's `on_change`,
+    // so the switch is set from the same string rather than left to
+    // follow along. That is deliberate on both counts: the load and the
+    // Revert path put both controls right in one pass, and nothing in
+    // this function can loop back into the other one.
+    let on = conf::has_option(&k.options, conf::NOCAPS);
+    if let Ok(mut sw) = ui.widget_mut::<Switch<Settings>>(ids.nocaps) {
+        sw.set_checked(on);
+    }
 }
 
 /// Put the appearance section back to what the file says.

@@ -121,6 +121,34 @@ ignore the message.
 **"Test here"** is a scratch text field for exactly this: after Apply,
 type in it and see whether the new layout took.
 
+## "Caps Lock is Ctrl"
+
+The Keyboard page's one switch, and the only xkb option with a control
+instead of a spelling to remember. It adds and removes exactly
+`ctrl:nocaps` in the `options` field beside it — which is what
+libxkbcommon has always done with that token, LED and lock state and
+modifier interactions included. There is no bespoke remap path here: the
+control writes a string, and the compositor's keymap does the work.
+
+It **edits the list rather than replacing it**. `keyboard.options` is
+comma-separated and may well have been typed by hand
+(`grp:alt_shift_toggle,compose:ralt`), so the switch adds or drops its
+own token and leaves every other entry, in its original order, alone —
+`conf::with_option`, round-tripped in a unit test and again through the
+real file in `the_caps_lock_switch_edits_only_its_own_option`. A control
+that overwrote the field would delete a configuration from a switch the
+user flipped to get one thing.
+
+The switch and the field show one value and each follows the other:
+typing `ctrl:nocaps` into the field ticks the switch, flipping the
+switch rewrites the field. That cannot loop, because a *setter*
+(`set_text`, `set_checked`) is the app changing its own mind and does
+not run the user callback — only an *action* does.
+
+There is deliberately no control for `ctrl:swapcaps` (swap rather than
+replace) or for any other option: one switch for the common case, and
+the **file remains the escape hatch for the full xkb vocabulary**.
+
 ## Where the display list comes from
 
 The **shell socket**. `App::shell` connects to `shell.sock`,
@@ -173,6 +201,7 @@ $ hey nitro-settings set displays/HDMI-A-1/scale value 2
 $ hey nitro-settings set displays/HDMI-A-1/x value 0
 $ hey nitro-settings get displays/HDMI-A-1/scale_value value   # 2
 $ hey nitro-settings set keyboard/layout value de
+$ hey nitro-settings do keyboard/nocaps toggle                 # Caps Lock is Ctrl
 $ hey nitro-settings do apply click
 $ hey nitro-settings get status value                          # applied
 ```

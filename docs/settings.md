@@ -64,7 +64,7 @@ broken desktop and a text console.
 | `output.<connector>.primary` | `true`/`yes`/`on`/`1` (and the negatives) | the first connector |
 | `keyboard.layout` | an xkb layout, e.g. `us`, `de`, `us,de` | `us` |
 | `keyboard.variant` | an xkb variant, e.g. `nodeadkeys` | none |
-| `keyboard.options` | xkb options, e.g. `ctrl:nocaps` | none |
+| `keyboard.options` | xkb options, comma-separated, e.g. `ctrl:nocaps`; see below | none |
 | `theme.scheme` | `light` or `dark` — the desktop's colour scheme | `light` |
 | `theme.<role>` | `#rrggbb` or `#rrggbbaa`, overriding one role on top of the scheme | the scheme's value |
 | `theme.icons` | the **XDG icon theme** application icons come from, e.g. `hicolor`, `Adwaita` | `hicolor` |
@@ -373,6 +373,46 @@ On **reload** (below), the key behaves as you would want:
 | nothing (key removed) | the listener closes; **clients already connected keep working**, because a connection lives on the socket it was accepted on |
 | something unusable | a `warn` and no listener — a typo must not cost you your desktop |
 
+### `keyboard.options`, and the one option with a control
+
+```text
+keyboard.options = ctrl:nocaps
+keyboard.options = grp:alt_shift_toggle,compose:ralt
+```
+
+A comma-separated list of **xkb options**, passed to libxkbcommon as the
+RMLVO options string and not interpreted here at all. The whole
+vocabulary `xkeyboard-config` ships is available — layout-switch keys,
+compose keys, Ctrl and Alt placements — and `/usr/share/X11/xkb/rules/
+base.lst` is its list.
+
+One of them has a **control** in `nitro-settings`' Keyboard page: the
+**Caps Lock is Ctrl** switch, which adds and removes exactly the token
+`ctrl:nocaps`. It is the thing people actually ask for, and asking them
+to know the spelling of an xkb option to get it is the settings app
+declining to be a settings app.
+
+The switch **edits the list rather than replacing it**: it adds its own
+token or drops it, and every other entry — and their order — survives
+untouched. That matters because this field may well have been typed by
+hand, and a control that overwrote it would delete a configuration from
+a checkbox the user ticked to get one thing (`with_option` in
+`crates/nitro-settings/src/conf.rs`, pinned end to end by
+`the_caps_lock_switch_edits_only_its_own_option`). The switch and the
+`options` field show one value and each follows the other, so typing
+`ctrl:nocaps` into the field ticks the switch and vice versa.
+
+There is deliberately **no second control** for the neighbouring
+`ctrl:swapcaps` (which *swaps* Caps Lock and Ctrl rather than replacing
+Caps Lock) or for anything else: one switch for the common case, and the
+**file stays the escape hatch for the full xkb vocabulary**. It is a
+different token and the switch leaves it alone.
+
+It takes effect on **reload**, with nothing restarted: a `keyboard.*`
+change recompiles the keymap (`Server::reload_config` →
+`Keyboard::with_settings`) exactly as `keyboard.layout` does, so Apply
+and the status line's `applied` is the whole interaction.
+
 ### `keyboard.repeat` is deliberately absent
 
 It is the key a reader most expects to find, so the parser names it
@@ -557,8 +597,8 @@ category's page on the right — a header with its title, a scrolling
 column of grouped cards, and the Apply/Revert row as a footer.
 **Displays** (two lines per output — name, mode, a scale slider and a
 `primary` checkbox on the first; position and the connector's other
-refresh rates on the second), **Keyboard** (layout, variant, options, and
-a field to type in afterwards), **Audio** (volume and mute) and
+refresh rates on the second), **Keyboard** (layout, variant, options, a
+**Caps Lock is Ctrl** switch, and a field to type in afterwards), **Audio** (volume and mute) and
 **Appearance** (the dark scheme). **Apply** writes the file; **Revert**
 re-reads it.
 
@@ -664,8 +704,9 @@ the first costs **64 px**.
 
 The window used to be 560×500 with every section stacked in one column;
 what the split view bought is that the page holds five outputs where the
-column held two, and the tallest page (Keyboard: two captions, two cards,
-four rows) needs 287 px. Past five outputs the page **scrolls** — the
+column held two, and the tallest page (Keyboard: two captions, two
+cards, five rows) needs 336 px — measured, as `the_window_holds_every_page`
+prints it. Past five outputs the page **scrolls** — the
 content column is a `Scroll` — rather than clipping.
 
 This is written down because getting it wrong is not a cosmetic bug. The
@@ -748,6 +789,7 @@ be wrong.
 $ hey nitro-settings do sidebar/nav_displays click        # show a page
 $ hey nitro-settings set displays/HDMI-A-1/scale value 2
 $ hey nitro-settings set keyboard/layout value de         # from any page
+$ hey nitro-settings do keyboard/nocaps toggle            # Caps Lock is Ctrl
 $ hey nitro-settings do apply click
 $ hey nitro-settings get status value
 applied

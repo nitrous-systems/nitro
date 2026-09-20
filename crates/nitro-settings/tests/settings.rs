@@ -417,6 +417,107 @@ fn revert_restores_the_widgets_from_the_file() {
 }
 
 #[test]
+fn the_caps_lock_switch_edits_only_its_own_option() {
+    // The failure this control is designed around: `keyboard.options` is
+    // a list, and a person may well have typed it. A checkbox that
+    // overwrote the field would silently delete a configuration the user
+    // has no other way back to — so the round trip has to give the
+    // original string back, entries and order intact, through the real
+    // callback and the real file rather than only in `conf.rs`' unit
+    // test.
+    let dir = scratch("nocaps-apply");
+    let path = dir.join(conf::FILE_NAME);
+    std::fs::write(
+        &path,
+        "keyboard.layout = us\nkeyboard.options = grp:alt_shift_toggle,compose:ralt\n",
+    )
+    .expect("seed");
+    let mut h = harness(&dir);
+
+    let nocaps = named(&mut h, names::NOCAPS);
+    assert!(
+        !h.widget::<Switch<Settings>>(nocaps).is_checked(),
+        "the file says nothing about ctrl:nocaps"
+    );
+
+    do_action(&mut h, names::NOCAPS, "toggle");
+    assert_eq!(
+        field(&mut h, names::OPTIONS),
+        "grp:alt_shift_toggle,compose:ralt,ctrl:nocaps",
+        "ticking appended its own token and kept the other two"
+    );
+    do_action(&mut h, names::APPLY, "click");
+    let text = std::fs::read_to_string(&path).expect("read back");
+    assert!(
+        text.contains("keyboard.options = grp:alt_shift_toggle,compose:ralt,ctrl:nocaps"),
+        "{text}"
+    );
+
+    do_action(&mut h, names::NOCAPS, "toggle");
+    do_action(&mut h, names::APPLY, "click");
+    let text = std::fs::read_to_string(&path).expect("read back");
+    assert!(
+        text.contains("keyboard.options = grp:alt_shift_toggle,compose:ralt"),
+        "unticking recovered exactly what the file started with:\n{text}"
+    );
+    h.quit();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_caps_lock_switch_follows_the_file_and_the_field() {
+    // Two controls showing one value, so each has to drive the other and
+    // neither may drive itself. The asymmetry that makes the pair safe:
+    // an *action* (`do … toggle`, `set … value`, a click, a keystroke)
+    // runs the user callback, a *setter* (`set_text`, `set_checked`)
+    // does not — so the switch writing the field and the field writing
+    // the switch cannot loop.
+    let dir = scratch("nocaps-follow");
+    let path = dir.join(conf::FILE_NAME);
+    std::fs::write(&path, "keyboard.options = ctrl:nocaps\n").expect("seed");
+    let mut h = harness(&dir);
+
+    let nocaps = named(&mut h, names::NOCAPS);
+    assert!(
+        h.widget::<Switch<Settings>>(nocaps).is_checked(),
+        "the switch opened on what the file says"
+    );
+
+    // Typing into the field is the other direction: the field's
+    // `on_change` reads the token out of the text and sets the switch.
+    set_field(&mut h, names::OPTIONS, "compose:ralt");
+    assert!(
+        !h.widget::<Switch<Settings>>(nocaps).is_checked(),
+        "clearing the token out of the field unticked the switch"
+    );
+    set_field(&mut h, names::OPTIONS, "compose:ralt,ctrl:nocaps");
+    assert!(
+        h.widget::<Switch<Settings>>(nocaps).is_checked(),
+        "and typing it back ticked it again"
+    );
+
+    // `ctrl:swapcaps` is a *different* xkb option — swap rather than
+    // replace — and this control does not own it. A prefix or substring
+    // test would tick the box for it and then delete it on the next
+    // untick.
+    set_field(&mut h, names::OPTIONS, "ctrl:swapcaps");
+    assert!(
+        !h.widget::<Switch<Settings>>(nocaps).is_checked(),
+        "ctrl:swapcaps is not ctrl:nocaps"
+    );
+
+    // And Revert puts both back from the file in one pass.
+    do_action(&mut h, names::REVERT, "click");
+    assert_eq!(field(&mut h, names::OPTIONS), "ctrl:nocaps");
+    assert!(
+        h.widget::<Switch<Settings>>(nocaps).is_checked(),
+        "Revert showed what the file says"
+    );
+    h.quit();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn the_audio_section_drives_a_fake_wpctl() {
     let dir = scratch("audio");
     let bin = dir.join("bin");
@@ -564,6 +665,7 @@ fn every_section_is_hey_addressable() {
         ("keyboard/layout", "textfield"),
         ("keyboard/variant", "textfield"),
         ("keyboard/options", "textfield"),
+        ("keyboard/nocaps", "checkbox"),
         ("keyboard/test", "textfield"),
         ("audio", "container"),
         ("audio/volume", "slider"),

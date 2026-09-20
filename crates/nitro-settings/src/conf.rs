@@ -163,6 +163,51 @@ impl Conf {
     }
 }
 
+/// The xkb option that makes Caps Lock a second Ctrl.
+///
+/// One token, spelled once, because the checkbox in the Keyboard pane
+/// writes it and `fill_keyboard` reads it back: two spellings of a
+/// string libxkbcommon has to recognise is one typo away from a control
+/// that silently does nothing.
+pub const NOCAPS: &str = "ctrl:nocaps";
+
+/// Whether the comma-separated `keyboard.options` list carries `token`.
+///
+/// An exact match on a trimmed entry, never a substring: `ctrl:swapcaps`
+/// contains neither more nor less of [`NOCAPS`] than any other option,
+/// and a prefix test would report the *swap* option as the *replace* one.
+#[must_use]
+pub fn has_option(options: &str, token: &str) -> bool {
+    options.split(',').any(|o| o.trim() == token)
+}
+
+/// `options` with `token` added or removed, **every other entry and its
+/// position preserved**.
+///
+/// This is the load-bearing half of the "Caps Lock is Ctrl" checkbox and
+/// the reason it is a function with tests rather than two lines in a
+/// callback. `keyboard.options` is a list, it may have been typed by
+/// hand (`grp:alt_shift_toggle,compose:ralt`), and a control that wrote
+/// the whole field would delete a user's configuration from a checkbox
+/// they ticked to get one thing. So: the list is split on `,`, entries
+/// are trimmed and empties dropped (`a,,b` and `a, b` are tolerated),
+/// removal drops only entries equal to `token`, adding is a no-op when
+/// it is already there and otherwise appends at the end, and the result
+/// is re-joined with `,` and no spaces. An empty result is `""`, which
+/// [`render`] writes as a bare `keyboard.options =`.
+#[must_use]
+pub fn with_option(options: &str, token: &str, on: bool) -> String {
+    let mut kept: Vec<&str> = options
+        .split(',')
+        .map(str::trim)
+        .filter(|o| !o.is_empty() && *o != token)
+        .collect();
+    if on {
+        kept.push(token);
+    }
+    kept.join(",")
+}
+
 /// Format a scale the way the file spells it.
 ///
 /// A whole number is written without its `.0` (`2`, not `2.0`) because
@@ -721,5 +766,57 @@ keyboard.options = ctrl:nocaps
         let text = render(&example());
         assert!(!text.contains("theme."), "{text}");
         assert_eq!(parse(&text).theme, ThemeConf::default());
+    }
+
+    #[test]
+    fn toggling_caps_lock_leaves_every_other_option_exactly_as_it_was() {
+        // The requirement the checkbox exists to not break: the field may
+        // hold options a person typed by hand, and a round trip through
+        // the control must give the original string back — same entries,
+        // same order.
+        let original = "grp:alt_shift_toggle,compose:ralt";
+        let on = with_option(original, NOCAPS, true);
+        assert_eq!(on, "grp:alt_shift_toggle,compose:ralt,ctrl:nocaps");
+        assert!(has_option(&on, NOCAPS));
+        assert_eq!(with_option(&on, NOCAPS, false), original);
+    }
+
+    #[test]
+    fn adding_to_an_empty_list_and_removing_the_only_entry() {
+        assert_eq!(with_option("", NOCAPS, true), NOCAPS);
+        // `""` is what `keyboard_line` renders as a bare
+        // `keyboard.options =`, which is the file saying "no options".
+        assert_eq!(with_option(NOCAPS, NOCAPS, false), "");
+        assert!(!has_option("", NOCAPS));
+    }
+
+    #[test]
+    fn both_directions_are_idempotent() {
+        let on = with_option(NOCAPS, NOCAPS, true);
+        assert_eq!(on, NOCAPS, "adding twice does not duplicate the token");
+        assert_eq!(with_option("compose:ralt", NOCAPS, false), "compose:ralt");
+    }
+
+    #[test]
+    fn swapcaps_is_a_different_option_and_survives_both_directions() {
+        // A substring or prefix test would take `ctrl:swapcaps` for
+        // `ctrl:nocaps` and delete a setting the checkbox does not own.
+        assert!(!has_option("ctrl:swapcaps", NOCAPS));
+        assert_eq!(
+            with_option("ctrl:swapcaps", NOCAPS, true),
+            "ctrl:swapcaps,ctrl:nocaps"
+        );
+        assert_eq!(with_option("ctrl:swapcaps", NOCAPS, false), "ctrl:swapcaps");
+    }
+
+    #[test]
+    fn whitespace_and_empty_entries_are_tolerated() {
+        // What a hand-edited file looks like. The output is normalised —
+        // one comma, no spaces — which is what this app writes anyway.
+        assert!(has_option("grp:alt_shift_toggle, ctrl:nocaps", NOCAPS));
+        assert_eq!(
+            with_option(" grp:alt_shift_toggle ,, compose:ralt ", NOCAPS, true),
+            "grp:alt_shift_toggle,compose:ralt,ctrl:nocaps"
+        );
     }
 }
