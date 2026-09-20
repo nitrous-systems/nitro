@@ -564,24 +564,40 @@ fn a_palette_change_repaints_every_row() {
 // the row's icon on every repaint the moment a fallback or a capability
 // mask put something else on screen.
 
-/// A model of `n` rows alternating between two icon names.
-fn icon_rows(n: usize) -> Vec<Row> {
+/// The two names [`icon_rows`] cycles through, named once so the
+/// "two cache entries, not one per row" arithmetic below has something to
+/// count rather than a repeated literal.
+const TWO_ICONS: [&str; 2] = ["file-earmark", "folder-fill"];
+
+/// A model of `n` rows cycling through `names` as their icons.
+fn icon_rows_cycling(n: usize, names: &[&str]) -> Vec<Row> {
     (0..n)
         .map(|i| {
-            let name = if i % 2 == 0 {
-                "file-earmark"
-            } else {
-                "folder-fill"
-            };
             Row::new(format!("file-{i:05}"))
-                .icon(name)
+                .icon(names[i % names.len()])
                 .detail(format!("{i} B"))
         })
         .collect()
 }
 
+/// A model of `n` rows alternating between two icon names.
+fn icon_rows(n: usize) -> Vec<Row> {
+    icon_rows_cycling(n, &TWO_ICONS)
+}
+
 /// A list of `n` icon-carrying rows in a window `h` pixels tall.
 fn icon_list_of(n: usize, h: f32) -> (Harness<Vec<usize>>, WidgetId) {
+    icon_list_cycling(n, h, &TWO_ICONS)
+}
+
+/// As [`icon_list_of`], with the icon names the rows cycle through
+/// spelled out: a test that cares how the cycle lines up with the ring
+/// picks its own period.
+fn icon_list_cycling(
+    n: usize,
+    h: f32,
+    names: &'static [&'static str],
+) -> (Harness<Vec<usize>>, WidgetId) {
     let mut h = Harness::sized(
         "list-icons",
         Vec::new(),
@@ -590,7 +606,7 @@ fn icon_list_of(n: usize, h: f32) -> (Harness<Vec<usize>>, WidgetId) {
             let l = ui.build(
                 list()
                     .name("rows")
-                    .rows(icon_rows(n))
+                    .rows(icon_rows_cycling(n, names))
                     .grow(1.0)
                     .width_percent(1.0),
             );
@@ -735,10 +751,21 @@ fn scrolling_does_not_re_send_an_icon_for_a_row_that_merely_moved() {
     // The recycling question. Slots are addressed `row % ring`, so a
     // scroll that re-anchors the window hands slot *k* a different row —
     // and if that row's icon name is the same, the slot's cached
-    // `SetIcon` matches and nothing is sent. With alternating icons and
-    // an even ring the names line up exactly, which is the case worth
+    // `SetIcon` matches and nothing is sent. That is the case worth
     // pinning: the rows all changed, the icons did not.
-    let (mut h, id) = icon_list_of(1_000, 200.0);
+    //
+    // Three names, and each scroll moves the model by a whole multiple of
+    // `3 * ring` rows, so every slot is handed a row exactly three names
+    // further along: same name, different row. The alignment is
+    // **engineered rather than lucky** — with two names it fell out of
+    // the ring happening to be even (10 here), so the expectation was
+    // parity-dependent and went vacuous the day a viewport or row height
+    // moved the ring to an odd number (#566). Three names cannot line up
+    // with a one-ring scroll at all unless `3 | ring`, so if the step
+    // below is ever weakened the test fails loudly instead of quietly
+    // asserting nothing.
+    const NAMES: &[&str] = &["file-earmark", "folder-fill", "hdd"];
+    let (mut h, id) = icon_list_cycling(1_000, 200.0, NAMES);
     let row_h = h.widget::<List<Vec<usize>>>(id).row_height();
     let ring = h.widget::<List<Vec<usize>>>(id).materialised();
 
@@ -758,15 +785,21 @@ fn scrolling_does_not_re_send_an_icon_for_a_row_that_merely_moved() {
         h.mutations()
     );
 
-    // Now twenty scrolls of a whole window each, which re-anchors every
-    // time and re-emits every row's text. The icons are bounded by the
-    // rows whose *name* differs, which for an even ring is none.
+    // Now twenty scrolls of `3 * ring` rows each, which re-anchors every
+    // time and re-emits every row's text while every slot keeps its icon
+    // name. Model is 1 000 rows, so 20 * 3 * ring rows of travel stays
+    // well inside it and none of the scrolls clamps.
+    let step = NAMES.len() * ring;
+    assert!(
+        20 * step + ring < 1_000,
+        "the scrolls must not clamp: {step}-row steps in a 1 000-row model"
+    );
     h.clear_tap();
     for k in 1..=20 {
         h.ui()
             .widget_mut::<List<Vec<usize>>>(id)
             .unwrap()
-            .scroll_to(row_h * (k * ring) as f32);
+            .scroll_to(row_h * (k * step) as f32);
         h.settle();
     }
     let icons = count(&h, "SetIcon");
@@ -775,16 +808,18 @@ fn scrolling_does_not_re_send_an_icon_for_a_row_that_merely_moved() {
         texts > 0,
         "the rows really were re-emitted, so the icon count means something"
     );
-    // The bound is "the rows whose icon changed", and the parity of the
-    // ring decides whether that is zero or the whole window per scroll.
-    // On this harness the ring is 10, the names alternate, and the
-    // measured figure is **0 SetIcons against 400 SetTexts** — the rows
-    // all changed and the icons did not.
-    let bound = if ring % 2 == 0 { 0 } else { 20 * ring };
-    assert!(
-        icons <= bound,
+    // The honest expectation, and it is flat: **0 SetIcons against 400
+    // SetTexts** as measured here. Every slot was handed a different row
+    // and every row re-derived its paint, so a diff that compared
+    // anything other than the last *requested* icon name would show one
+    // `SetIcon` per row per scroll instead.
+    assert_eq!(
+        icons,
+        0,
         "scrolling re-sent icons for rows that only moved: {icons} SetIcons \
-         over 20 window scrolls of a {ring}-slot ring (bound {bound})"
+         against {texts} SetTexts over 20 scrolls of {step} rows each \
+         ({ring}-slot ring, {} icon names)",
+        NAMES.len()
     );
     h.quit();
 }

@@ -554,10 +554,21 @@ whatever it sends: overflow is cut off at the window's edge rather than
 painted on the desktop beside the frame, a click outside the window
 reaches nothing, and damage never leaves it. `clip: false` on that node
 is refused with `BadParent`, like any other attempt to mutate what the
-window owns; `clip: true` on it is the no-op it already was, so a toolkit
-that clips its own root is unaffected. Every other group is the client's
-to clip or not — a scroll view needs it, a shadow must not have it. See
-`docs/wm.md` §What a client can and cannot draw.
+window owns; `clip: true` on it is the no-op it already was, so a client
+that re-asserts the flag on its own window node is not disconnected for a
+redundant request. Naming your own window node in a `SetClip` at all is a
+raw-wire thing to do — `examples/overflow_client` is the one that does it
+— and the refusal is about *clearing* the flag, not about the message.
+
+A toolkit's own clip is a **different node** and is unaffected either
+way: `nitro-ui` clips its root widget's group, which hangs *under* the
+window's content group rather than being it, at the same rectangle. The
+two are redundant, not one — see `docs/ui.md` §A window's content is
+clipped to the window.
+
+Every other group is the client's to clip or not — a scroll view needs
+it, a shadow must not have it. See `docs/wm.md` §What a client can and
+cannot draw.
 
 ### `SetFill` — 0x0203
 
