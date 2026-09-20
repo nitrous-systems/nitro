@@ -27,6 +27,17 @@
 //! history.** Lines pushed off the top of the primary screen land in it;
 //! the alternate screen has none, because full-screen programs would
 //! otherwise fill it with frames of themselves.
+//!
+//! **Erasing carries the background.** This is BCE, back colour erase:
+//! the cells an erase leaves behind are painted with the pen's
+//! background, not with the default one. It covers the operations a
+//! program drives — ED, EL, ECH, ICH, DCH and every scroll (LF, RI, SU,
+//! SD, IL, DL) — because that is what `tmux` assumes when it draws its
+//! status line as `SGR 48;5;n` followed by an EL and then the labels:
+//! without BCE the bar would stop where the text stops. It deliberately
+//! does *not* cover resize, RIS or entering the alternate screen, where
+//! the pen in force is an accident rather than an instruction. Only the
+//! background survives an erase; see [`Style::erase`].
 
 use std::collections::VecDeque;
 
@@ -132,6 +143,42 @@ pub struct Style {
     pub attrs: Attrs,
 }
 
+impl Style {
+    /// The style an erase performed with this pen leaves behind (BCE).
+    ///
+    /// Only the *background* survives: a program that erases under a
+    /// bold underlined pen wants the colour behind the cursor, not an
+    /// underline stretching to the right margin — which is what every
+    /// other terminal does and what `tmux`'s status line assumes.
+    ///
+    /// Inverse is resolved the way a viewer resolves it, so `SGR 7`
+    /// followed by an EL erases with the *foreground*. When that
+    /// foreground is the terminal's own, no [`CellColor`] can name it and
+    /// the `INVERSE` bit is kept instead — the one attribute that has to
+    /// survive, because it is the only way to say "the text colour".
+    #[must_use]
+    pub fn erase(self) -> Style {
+        let bg = if self.attrs.inverse() {
+            self.fg
+        } else {
+            self.bg
+        };
+        match bg {
+            CellColor::Default if self.attrs.inverse() => Style {
+                fg: CellColor::Default,
+                bg: CellColor::Default,
+                attrs: Attrs::INVERSE,
+            },
+            CellColor::Default => Style::default(),
+            bg => Style {
+                fg: CellColor::Default,
+                bg,
+                attrs: Attrs::NONE,
+            },
+        }
+    }
+}
+
 /// Whether a cell is the first half of a double-width character, the
 /// second (a placeholder that draws nothing), or neither.
 ///
@@ -180,13 +227,23 @@ impl Default for Cell {
 impl Cell {
     /// An empty cell: a space with default colours.
     ///
-    /// This is what erasing produces. Note that it is *default*-styled,
-    /// not painted with the current background: this grid does not
-    /// implement background-colour erase, so a program that wants a
-    /// coloured region has to print spaces into it.
+    /// This is the *default*-styled blank, which is what a resize, a
+    /// reset or a switch to the alternate screen leaves behind. A
+    /// program's own erase uses [`Cell::erased`] instead, so that the
+    /// pen's background survives it.
     #[must_use]
     pub fn blank() -> Self {
         Self::default()
+    }
+
+    /// An erased cell: a space carrying `pen`'s background (BCE).
+    #[must_use]
+    pub fn erased(pen: Style) -> Self {
+        Self {
+            ch: ' ',
+            style: pen.erase(),
+            wide: Wide::No,
+        }
     }
 
     /// Whether the cell is indistinguishable from an erased one.
@@ -1043,8 +1100,9 @@ impl Grid {
         }
         self.clear_wide_partner(row, from);
         self.clear_wide_partner(row, to - 1);
+        let fill = Cell::erased(self.cursor.pen);
         for cell in &mut self.lines[row][from..to] {
-            *cell = Cell::blank();
+            *cell = fill;
         }
         self.damage_span(row, from, to);
     }
@@ -1057,10 +1115,11 @@ impl Grid {
         if n == 0 {
             return;
         }
+        let fill = Cell::erased(self.cursor.pen);
         let line = &mut self.lines[row];
         line[col..].rotate_right(n);
         for cell in &mut line[col..col + n] {
-            *cell = Cell::blank();
+            *cell = fill;
         }
         sanitize_line(line);
         self.damage_span(row, col, self.cols);
@@ -1074,10 +1133,12 @@ impl Grid {
         if n == 0 {
             return;
         }
+        let fill = Cell::erased(self.cursor.pen);
+        let cols = self.cols;
         let line = &mut self.lines[row];
         line[col..].rotate_left(n);
-        for cell in &mut line[self.cols - n..] {
-            *cell = Cell::blank();
+        for cell in &mut line[cols - n..] {
+            *cell = fill;
         }
         sanitize_line(line);
         self.damage_span(row, col, self.cols);
@@ -1145,10 +1206,11 @@ impl Grid {
         }
         let n = n.min(bot - top + 1);
         let keep = to_history && !self.alt && top == 0 && bot == self.rows - 1;
+        let fill = Cell::erased(self.cursor.pen);
         for _ in 0..n {
             let mut line = self.lines.remove(top);
             if !keep {
-                line.fill(Cell::blank());
+                line.fill(fill);
                 self.lines.insert(bot, line);
                 continue;
             }
@@ -1157,7 +1219,7 @@ impl Grid {
             // freed and re-allocated: it is already the right width, and
             // recycling it is what keeps a scrolling terminal from
             // churning one full-width allocation per line.
-            line.fill(Cell::blank());
+            line.fill(fill);
             self.lines.insert(bot, line);
         }
         self.damage_scroll(top, bot);
@@ -1170,9 +1232,10 @@ impl Grid {
             return;
         }
         let n = n.min(bot - top + 1);
+        let fill = Cell::erased(self.cursor.pen);
         for _ in 0..n {
             let mut line = self.lines.remove(bot);
-            line.fill(Cell::blank());
+            line.fill(fill);
             self.lines.insert(top, line);
         }
         self.damage_scroll(top, bot);
@@ -1717,6 +1780,191 @@ mod tests {
         g.delete_chars(1);
         assert_consistent(&g);
         assert_eq!(g.row_text(0), " 好");
+    }
+
+    // --- back colour erase (BCE) ---------------------------------------
+
+    /// The cells of a display row, as a `Vec` so a test can index freely.
+    fn cells(grid: &Grid, row: usize) -> Vec<Cell> {
+        grid.display_row(row).to_vec()
+    }
+
+    #[test]
+    fn an_erase_carries_the_pens_background() {
+        let mut g = Grid::new(10, 2, 0);
+        put(&mut g, "abc");
+        g.set_pen(Style {
+            bg: CellColor::Indexed(4),
+            ..Style::default()
+        });
+        g.move_to_col(3);
+        g.erase_in_line(0);
+        for (col, cell) in cells(&g, 0).into_iter().enumerate().skip(3) {
+            assert_eq!(cell.ch, ' ', "col {col}");
+            assert_eq!(cell.style.bg, CellColor::Indexed(4), "col {col}");
+            assert_eq!(cell.style.fg, CellColor::Default, "col {col}");
+            assert_eq!(cell.style.attrs, Attrs::NONE, "col {col}");
+        }
+        // And the row now reaches the right margin: that is the bar.
+        let r = runs(&g, 0);
+        assert_eq!(r.last().unwrap().col + r.last().unwrap().cols, 10);
+    }
+
+    #[test]
+    fn an_erase_under_a_default_pen_is_still_a_plain_blank() {
+        let mut g = Grid::new(10, 2, 0);
+        put(&mut g, "abc");
+        g.move_to_col(0);
+        g.erase_in_line(2);
+        assert!(cells(&g, 0).iter().all(Cell::is_blank));
+        assert_eq!(trimmed_len(g.display_row_raw(0)), 0);
+        assert!(runs(&g, 0).is_empty(), "an idle row still costs nothing");
+    }
+
+    #[test]
+    fn an_erase_under_an_inverse_pen_erases_with_the_foreground() {
+        let mut g = Grid::new(6, 1, 0);
+        g.set_pen(Style {
+            fg: CellColor::Indexed(3),
+            attrs: Attrs::INVERSE,
+            ..Style::default()
+        });
+        g.erase_in_line(2);
+        for cell in cells(&g, 0) {
+            assert_eq!(cell.style.bg, CellColor::Indexed(3));
+            assert_eq!(cell.style.attrs, Attrs::NONE);
+        }
+
+        // With default colours there is no `CellColor` for "the terminal's
+        // foreground", so the inverse bit survives and the viewer
+        // resolves it.
+        let mut g = Grid::new(6, 1, 0);
+        g.set_pen(Style {
+            attrs: Attrs::INVERSE,
+            ..Style::default()
+        });
+        g.erase_in_line(2);
+        for cell in cells(&g, 0) {
+            assert_eq!(cell.style.bg, CellColor::Default);
+            assert_eq!(cell.style.fg, CellColor::Default);
+            assert_eq!(cell.style.attrs, Attrs::INVERSE);
+            assert!(!cell.is_blank(), "an inverse erase is visible");
+        }
+    }
+
+    #[test]
+    fn an_erase_drops_the_pens_other_attributes() {
+        let mut g = Grid::new(6, 1, 0);
+        let mut attrs = Attrs::BOLD;
+        attrs.insert(Attrs::UNDERLINE);
+        g.set_pen(Style {
+            fg: CellColor::Indexed(1),
+            bg: CellColor::Rgb(1, 2, 3),
+            attrs,
+        });
+        g.erase_in_line(2);
+        for cell in cells(&g, 0) {
+            assert_eq!(cell.style.bg, CellColor::Rgb(1, 2, 3));
+            assert_eq!(cell.style.fg, CellColor::Default);
+            assert_eq!(
+                cell.style.attrs,
+                Attrs::NONE,
+                "an underline must not stretch to the margin"
+            );
+        }
+    }
+
+    #[test]
+    fn a_scroll_blanks_the_new_row_with_the_pen() {
+        let pen = Style {
+            bg: CellColor::Indexed(2),
+            ..Style::default()
+        };
+
+        // LF at the bottom of the screen: the recycled row is painted.
+        let mut g = Grid::new(4, 3, 10);
+        put(&mut g, "top");
+        g.set_pen(pen);
+        g.move_to(2, 0);
+        g.line_feed();
+        for cell in cells(&g, 2) {
+            assert_eq!(cell.style.bg, CellColor::Indexed(2));
+        }
+
+        // RI at the top: same, at the other end.
+        let mut g = Grid::new(4, 3, 0);
+        g.set_pen(pen);
+        g.move_to(0, 0);
+        g.reverse_line_feed();
+        for cell in cells(&g, 0) {
+            assert_eq!(cell.style.bg, CellColor::Indexed(2));
+        }
+
+        // And inside a scroll region, via DL and IL.
+        let mut g = Grid::new(4, 4, 0);
+        g.set_scroll_region(Some((1, 2)));
+        g.set_pen(pen);
+        g.move_to(1, 0);
+        g.delete_lines(1);
+        for cell in cells(&g, 2) {
+            assert_eq!(cell.style.bg, CellColor::Indexed(2));
+        }
+        g.move_to(1, 0);
+        g.insert_lines(1);
+        for cell in cells(&g, 1) {
+            assert_eq!(cell.style.bg, CellColor::Indexed(2));
+        }
+    }
+
+    #[test]
+    fn ich_and_dch_open_and_close_with_the_pens_background() {
+        let mut g = Grid::new(6, 1, 0);
+        put(&mut g, "abcdef");
+        g.set_pen(Style {
+            bg: CellColor::Indexed(5),
+            ..Style::default()
+        });
+        g.move_to_col(1);
+        g.insert_chars(2);
+        assert_eq!(g.row_text(0), "a  bcd");
+        for col in 1..3 {
+            assert_eq!(cells(&g, 0)[col].style.bg, CellColor::Indexed(5));
+        }
+        g.delete_chars(2);
+        // The cells pulled in at the right margin are erased too.
+        for col in 4..6 {
+            assert_eq!(cells(&g, 0)[col].style.bg, CellColor::Indexed(5));
+        }
+    }
+
+    #[test]
+    fn a_resize_adds_plain_blank_rows() {
+        // A window drag is not a program's erase: whatever pen happens to
+        // be in force is an accident, so the new rows stay plain.
+        let mut g = Grid::new(6, 2, 0);
+        g.set_pen(Style {
+            bg: CellColor::Indexed(4),
+            ..Style::default()
+        });
+        g.resize(8, 4);
+        for row in 0..4 {
+            assert!(
+                cells(&g, row).iter().all(Cell::is_blank),
+                "row {row} should be plain"
+            );
+        }
+
+        // Nor is RIS, nor entering the alternate screen.
+        let mut g = Grid::new(6, 2, 0);
+        g.set_pen(Style {
+            bg: CellColor::Indexed(4),
+            ..Style::default()
+        });
+        g.set_alt_screen(true);
+        assert!(cells(&g, 0).iter().all(Cell::is_blank));
+        g.set_alt_screen(false);
+        g.reset();
+        assert!(cells(&g, 0).iter().all(Cell::is_blank));
     }
 
     #[test]

@@ -91,6 +91,26 @@ A run with the *default* background gets no rect at all — the window's
 backdrop is already that colour. Most of a normal screen is default
 background, so this is most of the rects.
 
+Its companion is **back colour erase**, and a BCE-erased run *does* get a
+rect — which is what makes a status bar a bar. When a program erases
+(ED, EL, ECH, ICH, DCH, or any scroll: LF, RI, SU, SD, IL, DL) the cells
+left behind carry the pen's *background* rather than the default one.
+`tmux` draws its status line as a background-setting SGR, then an EL,
+then the labels; without BCE the colour would stop where the text stops
+and the rest of the row would fall back to the window's backdrop, which
+is exactly how the bug looked. Only the background survives an erase —
+an underline must not stretch to the right margin — except that `SGR 7`
+erases with the *foreground* and keeps the inverse bit, because no cell
+colour can name "the terminal's text colour". Resize, RIS and entering
+the alternate screen deliberately keep plain blanks: the pen in force
+there is an accident of whatever last printed, not an instruction.
+
+One consequence worth knowing: a scrolled-off row is stored in the
+scrollback trimmed of its trailing blanks, and a BCE-painted cell is not
+blank, so a full-width painted row is stored at full width. That is
+correct — the colour is real content — and bounded by what the program
+actually painted; ordinary shell output is unaffected.
+
 **2. A row that did not change is not walked.** `paint` asks
 `Grid::row_dirty` first, and for a clean row calls `PaintCx::keep`, which
 tells the framework the row's slots are unchanged without re-deriving

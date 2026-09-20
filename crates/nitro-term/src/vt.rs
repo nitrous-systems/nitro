@@ -680,6 +680,53 @@ mod tests {
         assert_eq!(t.grid().cursor(), Some((0, 2)));
     }
 
+    /// The regression pin for the tmux status bar: `SGR 48;5;n` then an
+    /// `EL` then the labels. Without back colour erase the bar stops
+    /// where the text stops, which is exactly what the bug looked like.
+    #[test]
+    fn the_status_bar_sequence_tmux_emits_fills_the_row() {
+        let t = term(20, 2, b"\x1b[2;1H\x1b[48;5;4m\x1b[38;5;0m\x1b[K[0] bash");
+        let r = runs(&t, 1);
+        // The erased tail drops the pen's *foreground* (BCE keeps only
+        // the background), so the labels and the bar are two runs; what
+        // matters, and what was broken, is that the background is
+        // continuous all the way to the right margin.
+        assert_eq!(r.first().unwrap().col, 0);
+        let end = r.last().unwrap();
+        assert_eq!(end.col + end.cols, 20, "the bar reaches the margin: {r:?}");
+        assert!(
+            r.iter().all(|run| run.style.bg == CellColor::Indexed(4)),
+            "every cell of the bar is painted: {r:?}"
+        );
+        assert_eq!(style_at(&t, 1, 19).bg, CellColor::Indexed(4));
+
+        // With no foreground of its own the whole row really is one run.
+        let t = term(20, 1, b"\x1b[48;5;4m\x1b[K[0] bash");
+        let r = runs(&t, 0);
+        assert_eq!(r.len(), 1, "{r:?}");
+        assert_eq!(r[0].cols, 20);
+
+        // The active-window segment is inverse rather than coloured:
+        // `SGR 7` + EL must erase with the *foreground*, so the viewer
+        // still resolves a visible background.
+        let t = term(10, 1, b"\x1b[7m\x1b[Kab");
+        let r = runs(&t, 0);
+        assert_eq!(r.len(), 1, "{r:?}");
+        assert_eq!(r[0].cols, 10);
+        assert!(r[0].style.attrs.inverse());
+    }
+
+    #[test]
+    fn sgr_49_puts_the_erase_background_back() {
+        let t = term(10, 2, b"\x1b[48;5;4m\x1b[K\x1b[2;1H\x1b[49m\x1b[K");
+        assert_eq!(runs(&t, 0).len(), 1, "row 0 is still painted");
+        assert!(
+            runs(&t, 1).is_empty(),
+            "a default-background erase still costs nothing"
+        );
+        assert_eq!(style_at(&t, 1, 0), Style::default());
+    }
+
     #[test]
     fn il_and_dl_move_whole_lines() {
         let t = term(4, 4, b"r0\r\nr1\r\nr2\r\nr3\x1b[2;1H\x1b[1L");

@@ -199,6 +199,33 @@ fn what_the_shell_colours_becomes_styled_runs() {
 }
 
 #[test]
+fn a_full_width_coloured_erase_paints_the_whole_row() {
+    // What `tmux` does for its status line: set a background, erase the
+    // line, then write the labels. Back colour erase is what makes the
+    // bar a bar — without it the colour stops where the text stops, and
+    // the rest of the row falls back to the window's own background.
+    let (mut h, grid) = harness_running(&["/bin/sh", "-c", "printf '\\033[44m\\033[Kstatus\\n'"]);
+    pump_until(&mut h, "the status line", |h| {
+        screen(h, grid).contains("status")
+    });
+    let g = h.widget::<TermGrid>(grid);
+    let mut runs = Vec::new();
+    g.term().grid().row_runs(0, &mut runs);
+    let last = runs.last().expect("a painted row");
+    assert_eq!(
+        last.col + last.cols,
+        80,
+        "the bar reaches the right margin: {runs:?}"
+    );
+    let painted = Palette::default().ansi_indexed(4);
+    assert!(
+        runs.iter().all(|run| g.bg_of(run.style) == Some(painted)),
+        "every run carries the erase background: {runs:?}"
+    );
+    h.quit();
+}
+
+#[test]
 fn the_osc_title_reaches_the_window() {
     let (mut h, grid) = harness_running(&[
         "/bin/sh",
