@@ -716,8 +716,11 @@ one `SetVisible` per change. A hidden subtree is skipped by hit-testing
 (the pointer does not enter it) and by `focus_order` (Tab does not reach
 into it), but it keeps its bounds and its names: `hey get keyboard/layout
 value` answers from any page, `hey list` shows it with a `hidden` flag,
-and `get … visible` says which. A page switch is `SetVisible` ×2, the
-two rows' fills, the title's `SetText` and one commit —
+and `get … visible` says which. If the focused widget is on the page just hidden,
+`show` drops the focus (`Ui::unfocus`): a scripted switch moves no
+pointer, and keystrokes must not land in a field nobody can see. A page
+switch is `SetVisible` ×2, the two rows' fills, the title's `SetText`
+and one commit —
 `clicking_a_sidebar_row_shows_that_page_and_only_that_page` counts them.
 The alternative — placing hidden pages at zero size — re-laid-out every
 eliding label on every switch, which is why the flag exists.

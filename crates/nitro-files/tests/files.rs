@@ -54,6 +54,9 @@ const LETTERS: [u32; 26] = [
     21, 44,
 ];
 
+/// The window every test opens; see [`app`].
+const WINDOW: Size = Size::new(560.0, 280.0);
+
 /// A fresh scratch root, unique to this test *and* this process, and the
 /// directory inside it the app will show.
 ///
@@ -98,12 +101,7 @@ fn app(dir: &Path, xdg: &Path) -> (Harness<Files>, Ids) {
         .with_env(Vec::new(), assoc, trash)
         .with_term(TERM)
         .with_places(places);
-    let mut h = Harness::sized(
-        nitro_files::APP_NAME,
-        state,
-        Size::new(560.0, 280.0),
-        nitro_files::build,
-    );
+    let mut h = Harness::sized(nitro_files::APP_NAME, state, WINDOW, nitro_files::build);
     // The same `start` the binary runs, on the tree `build` produced: a
     // test that wired the widgets up itself would be testing a different
     // file manager.
@@ -126,11 +124,16 @@ fn app(dir: &Path, xdg: &Path) -> (Harness<Files>, Ids) {
 /// A name of its own, not the file manager's: a `TestServer`'s socket
 /// directory is keyed on the name, so two harnesses sharing one share a
 /// directory and the second's teardown takes the first's socket with it.
+///
+/// Measured at the **app's window size**: the app's window is wider than
+/// the harness's output, so the title bar's button glyphs at its right
+/// end are off the output and never rasterised — a baseline taken on a
+/// narrower window would count three glyphs the app's frame never draws.
 fn frame_icons_cached() -> usize {
     let h = Harness::sized(
         "files-icon-baseline",
         (),
-        Size::new(300.0, 220.0),
+        WINDOW,
         |ui: &mut nitro_ui::Ui<()>| ui.build(nitro_ui::widgets::label("no icons here")),
     );
     let n = h.server().stat("icons_cached") as usize;
@@ -1586,10 +1589,28 @@ fn the_sidebar_lists_the_places_that_exist_and_highlights_the_one_on_screen() {
         "the scratch dir is no place"
     );
 
+    // The rows are built from the **state's** places, never from the
+    // environment's: on a box whose real `~` happens to hold exactly a
+    // `Documents`, the two sets share every key and only the paths tell
+    // them apart. A row that kept an environment-built closure would
+    // navigate to the developer's real directory here.
     h.click(documents);
     h.settle();
     let want = root.join("home/Documents");
-    assert_eq!(h.state().cwd(), want, "the row navigated");
+    assert_eq!(h.state().cwd(), want, "the row navigated to the fixture");
+    assert_ne!(
+        h.state().cwd(),
+        nitro_launcher::spawn::home_dir()
+            .unwrap_or_default()
+            .join("Documents"),
+        "and not to the real home's"
+    );
+    let rows: Vec<_> = h.state().places().iter().map(|p| p.path.clone()).collect();
+    assert!(
+        rows.iter()
+            .all(|p| p == Path::new("/") || p.starts_with(&root)),
+        "every place is the fixture's: {rows:?}"
+    );
     assert!(h.widget::<SidebarRow<Files>>(documents).is_selected());
     assert!(!h.widget::<SidebarRow<Files>>(home).is_selected());
 

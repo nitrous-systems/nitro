@@ -620,7 +620,10 @@ pub fn build(ui: &mut Ui<Files>) -> WidgetId {
                 // A pop, not a push: going back must not put the
                 // directory being left onto the history it just came
                 // from. Deferred, because `navigate` disables this very
-                // button when the history runs out.
+                // button when the history runs out. A directory that has
+                // gone since is a message in the status line, and the
+                // entry is consumed rather than kept: retrying it would
+                // only say the same thing again.
                 if let Some(to) = s.history.pop() {
                     ui.defer(move |s: &mut Files, ui: &mut Ui<Files>| {
                         navigate_with(s, ui, to, false);
@@ -708,17 +711,15 @@ pub fn build(ui: &mut Ui<Files>) -> WidgetId {
         ui.attach(body, child).expect("attach a child of the body");
     }
 
-    // The sidebar: the places the state was given, or the environment's.
-    // Built here rather than in `start` so the tree is whole before the
-    // first commit; `start` finds the rows by name like every other id.
-    let trash_root = std::env::var_os("XDG_DATA_HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| nitro_launcher::spawn::home_dir().map(|h| h.join(".local/share")))
-        .unwrap_or_else(|| PathBuf::from(".local/share"))
-        .join("Trash");
-    let env_places = places::from_env(&trash_root);
-    let mut view = split_view()
+    // The sidebar holds only its section header here: the rows come
+    // from the *state's* places, which `build` cannot see, so `start`
+    // attaches them (`sync_places`) before the first commit — `run` and
+    // the harness both call `start` before flushing. Building a default
+    // set here and replacing it later was tried and rejected: two sets
+    // that share their keys but not their paths are told apart by
+    // nothing a row carries, and a test fixture's `place_documents`
+    // then navigated to the developer's real `~/Documents`.
+    let view = split_view()
         .sidebar_name(names::PLACES)
         .sidebar_header(TITLE)
         .sidebar_child(sidebar_section("Places"))
@@ -727,17 +728,6 @@ pub fn build(ui: &mut Ui<Files>) -> WidgetId {
         .content_header_leading_id(path)
         .content_id(body)
         .content_footer_id(footer);
-    // The rows are attached by `start` once the state's own places are
-    // known; the environment's are attached now as the default and
-    // replaced by `start` when the state has a different set.
-    let mut prev = places::Section::Places;
-    for p in &env_places {
-        if p.section != prev {
-            view = view.sidebar_child(sidebar_separator());
-            prev = p.section;
-        }
-        view = view.sidebar_child(place_row(p));
-    }
     let parts = view.build(ui);
     install(ui);
     parts.root
@@ -755,53 +745,32 @@ fn place_row(p: &places::Place) -> nitro_ui::split::SidebarRowBuilder<Files> {
         })
 }
 
-/// Rebuild the sidebar rows from `s.places`, and remember their ids.
+/// Build the sidebar rows from `s.places`, and remember their ids.
 ///
-/// Called by [`start`]: the tree was built with the environment's
-/// places, and a state given other ones (a test's fixture) replaces
-/// them here. The rows of an unchanged set are simply found.
+/// Called by [`start`], and **unconditionally**: whatever rows the
+/// sidebar holds (none, after `build`; a previous set, if `start` ran
+/// twice) go, and the state's places come back. A row's `on_click`
+/// captures its path, so a row can only be trusted to go where
+/// `s.places` says if it was built from `s.places`.
 fn sync_places(s: &mut Files, ui: &mut Ui<Files>) {
     let Some(sidebar) = nitro_ui::introspect::resolve(ui, names::PLACES) else {
         return;
     };
-    let want: Vec<String> = s
-        .places
-        .iter()
-        .map(|p| format!("{}{}", names::PLACE_PREFIX, p.key))
-        .collect();
-    let have: Vec<(WidgetId, Option<String>)> = ui
-        .children(sidebar)
-        .into_iter()
-        .map(|c| (c, ui.address_name(c)))
-        .collect();
-    let have_names: Vec<&str> = have
-        .iter()
-        .filter_map(|(_, n)| n.as_deref())
-        .filter(|n| n.starts_with(names::PLACE_PREFIX))
-        .collect();
-    if have_names != want.iter().map(String::as_str).collect::<Vec<_>>() {
-        // Everything after the section header goes; the rows come back
-        // from the state's list.
-        for (c, _) in have.iter().skip(1) {
-            let _ = ui.remove(*c);
+    // Everything after the section header goes.
+    for c in ui.children(sidebar).into_iter().skip(1) {
+        let _ = ui.remove(c);
+    }
+    s.place_rows.clear();
+    let mut prev = places::Section::Places;
+    for p in &s.places {
+        if p.section != prev {
+            let _ = ui.add_child(sidebar, sidebar_separator());
+            prev = p.section;
         }
-        let mut prev = places::Section::Places;
-        for p in &s.places {
-            if p.section != prev {
-                let _ = ui.add_child(sidebar, sidebar_separator());
-                prev = p.section;
-            }
-            let _ = ui.add_child(sidebar, place_row(p));
+        if let Ok(row) = ui.add_child(sidebar, place_row(p)) {
+            s.place_rows.push(row);
         }
     }
-    s.place_rows = ui
-        .children(sidebar)
-        .into_iter()
-        .filter(|c| {
-            ui.address_name(*c)
-                .is_some_and(|n| n.starts_with(names::PLACE_PREFIX))
-        })
-        .collect();
 }
 
 /// Select the sidebar row whose place is `cwd`, and deselect the rest.

@@ -343,13 +343,24 @@ fn pages_show_one_child_and_hide_the_rest() {
     assert!(!h.widget::<Switch<S>>(hidden_switch).is_checked());
 
     // Switch pages: one SetVisible each way, and the same click now
-    // reaches page 1's switch.
+    // reaches page 1's switch. The click above focused page 0's switch;
+    // a scripted switch moves no pointer, so `show` drops the focus
+    // rather than leaving keystrokes in a widget nobody can see.
+    assert_eq!(h.ui().focused(), Some(visible_switch));
     h.tap();
     h.clear_tap();
     h.ui().widget_mut::<Pages>(p).unwrap().show(1);
     h.settle();
     assert_eq!(count(&h, "SetVisible"), 2);
     assert_eq!(count(&h, "SetBounds"), 0);
+    assert_eq!(
+        h.ui().focused(),
+        None,
+        "the hidden page's switch lost the focus"
+    );
+    h.key(key::SPACE);
+    h.settle();
+    assert_eq!(h.state().toggles, [true], "and Space reaches nothing");
     // The pointer is parked on the switch from the click above; a click
     // without a move is routed to the chain of the last move, so step
     // off and back on as a person would.

@@ -3072,6 +3072,20 @@ impl<S: 'static> Ui<S> {
         }
     }
 
+    /// Drop the focus without an `&mut S`, for a setter that finds the
+    /// focused widget has just been hidden (`Pages::show`). The
+    /// `FocusChanged` is queued like [`Ui::focus`]'s and delivered by
+    /// [`Ui::deliver_focus_events`].
+    pub fn unfocus(&mut self) {
+        if let Some(old) = self.focused.take() {
+            if let Some(slot) = self.arena.slot_mut(old) {
+                slot.state.focused = false;
+            }
+            self.mark(old, Dirty::PAINT);
+            self.pending_focus.push((old, false));
+        }
+    }
+
     /// Drop the focus entirely.
     pub fn blur(&mut self, state: &mut S) {
         if let Some(old) = self.focused.take() {

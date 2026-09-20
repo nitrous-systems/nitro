@@ -30,7 +30,7 @@ pub enum Section {
 /// One sidebar row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Place {
-    /// A stable key for the row's addressing name: `sidebar/place_<key>`.
+    /// A stable key for the row's addressing name: `places/place_<key>`.
     pub key: &'static str,
     /// What the row says.
     pub label: String,

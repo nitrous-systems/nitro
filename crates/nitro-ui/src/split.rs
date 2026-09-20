@@ -1116,6 +1116,15 @@ impl<S: 'static> WidgetMut<'_, Pages, S> {
         for (k, c) in self.ui().children(id).into_iter().enumerate() {
             self.ui().set_node_visible(c, k == index);
         }
+        // A field on the page just hidden must not keep the keyboard: a
+        // scripted switch moves no pointer, so nothing else would take
+        // the focus off it and keystrokes would land in a widget nobody
+        // can see. Dropped to nowhere rather than moved to a guess.
+        if let Some(f) = self.ui().focused()
+            && !self.ui().is_visible(f)
+        {
+            self.ui().unfocus();
+        }
     }
 }
 
