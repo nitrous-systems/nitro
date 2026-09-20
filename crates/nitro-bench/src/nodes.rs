@@ -357,10 +357,31 @@ impl Scenario for BallNodes {
 ///
 /// So this scenario is the honest port: a clipping group holding a column
 /// of rects taller than the window, whose offset moves one line per
-/// frame. `damage_px_mean` then answers the question the x11perf number
-/// was a proxy for — is a scroll the size of the viewport, or the size of
-/// the exposed line? The two differ by the viewport's height in rows, and
-/// which one this server does is a fact about it, not about the benchmark.
+/// frame.
+///
+/// **What `damage_px_mean` does and does not answer here.** An earlier
+/// version of this comment said it answers "is a scroll the size of the
+/// viewport, or the size of the exposed line?". It does not, and that
+/// false dichotomy is what issue #570 was filed on: it invites the
+/// reading that a viewport-sized number means the server is repainting
+/// ~30x more than it needs to. Measured, a one-row scroll of this
+/// scenario's content genuinely changes **450 of the 480 viewport rows**
+/// (the 30 that do not are the 1-px inter-row gaps `row_h - 1.0` leaves;
+/// with solid content it is 480 of 480), because shifting
+/// differently-coloured rows past a fixed viewport gives every pixel its
+/// neighbour's colour. So the honest reading is that the reported
+/// 306 560 px is **1.06x a true minimum of 288 000** — the server's
+/// damage is within 6 % of minimal, and what `CopyArea` bought was not
+/// less damage but cheaper pixels: the same area moved rather than
+/// re-rasterized. The 640x16 = 10 240 px "exposed line" is what X11
+/// *repainted*, not what changed, and comparing damage against it
+/// compares two different quantities.
+///
+/// `damage_px_mean` is therefore the wrong probe for the scroll question
+/// and cannot move regardless: it is `damage(n) u damage(n-1)`, the
+/// region the age-2 back buffer is behind by. The compressible cost is
+/// `paint_us` (issue #592), and the probe for the scene walk's own
+/// scaling is `visited_nodes`. See `docs/bench.md` §7.5 and §11 D.
 pub struct Scroll {
     /// Rows of content; the column is this many rects tall.
     pub rows: usize,
