@@ -141,8 +141,11 @@ The **content group** — the node `create_window` mints, which stays the
 client's own node when `frame_window` inserts a root above it — is created with
 `clip` set, and `set_clip` refuses to clear it (`Error::RootNode`, the answer
 `destroy_node` and `reparent` already give for a node its window owns). Asking
-for the clip it already has stays a no-op, so a toolkit that clips its own root
-is unaffected.
+for the clip it already has stays a no-op, so a client that re-asserts the flag
+on its own window node is not disconnected for a redundant request. A toolkit's
+own clip is a *different* node and is unaffected either way: `nitro-ui` clips
+its root widget's group, which hangs under the window's content group rather
+than being it.
 
 So a client's nodes are bounded by its content rectangle whatever it sends:
 overflow is **cut off at the window's edge** rather than painted on the desktop

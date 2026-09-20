@@ -660,7 +660,7 @@ fn a_row_icon_is_a_named_icon_node_and_the_server_rasterises_it() {
     // separates "the rows share artwork" from "each row has its own".
     assert_eq!(
         h.server().stat("icons_cached"),
-        base + 2,
+        base + TWO_ICONS.len() as u64,
         "two names at one size are two cache entries, not one per row"
     );
     assert_eq!(h.server().stat("icon_refusals"), 0, "both names exist");
