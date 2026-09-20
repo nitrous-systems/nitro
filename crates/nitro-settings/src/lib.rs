@@ -7,29 +7,26 @@
 //! work?" honestly.
 //!
 //! ```text
-//! ┌──────────────────────────────────────────────────────┐
-//! │ Displays                                             │
-//! │ HDMI-A-1 1920×1080 @ 119.98 Hz [==o===] 2 ☑ primary   │  two lines per output
-//! │    position [0   ] [0   ]  also 120 · 85 · 60 · 50 Hz │
-//! │ VGA-1    1280×1024 @ 60 Hz     [o=====] 1 ☐ primary   │
-//! │    position [1920] [0   ]  also 75 Hz                 │
-//! │ Positions are typed; drag-arrange is not in M4.       │
-//! │ ────────────────────────────────────────────────────  │
-//! │ Keyboard                                             │
-//! │ Layout [de    ] Variant [      ] Options [ctrl:nocaps]│
-//! │ Test here [                                         ] │
-//! │ ────────────────────────────────────────────────────  │
-//! │ Audio                                                │
-//! │ Volume [======o===] 65 %  ☐ mute                      │
-//! │ via wpctl                                            │
-//! │ ────────────────────────────────────────────────────  │
-//! │ Appearance                                           │
-//! │ Colour scheme ☐ Dark                                  │
-//! │ The scheme is saved and applied at once; …            │
-//! │ ────────────────────────────────────────────────────  │
-//! │ [Apply] [Revert]                            applied   │
-//! └──────────────────────────────────────────────────────┘
+//! ┌──────────────┬───────────────────────────────────────────────────┐
+//! │ Settings     │ Displays                                          │
+//! │              ├───────────────────────────────────────────────────┤
+//! │ ▣ Displays   │  Outputs                                          │
+//! │   Keyboard   │ ┌───────────────────────────────────────────────┐ │
+//! │   Audio      │ │ HDMI-A-1 1920×1080 @ 119.98 Hz [==o==] 2 ☑ pri │ │
+//! │   Appearance │ │    position [0   ] [0   ]  also 120 · 85 Hz   │ │
+//! │              │ └───────────────────────────────────────────────┘ │
+//! │              │  Positions are typed; drag-arrange is not in M4.  │
+//! │              ├───────────────────────────────────────────────────┤
+//! │              │ [Apply] [Revert]                          applied │
+//! └──────────────┴───────────────────────────────────────────────────┘
 //! ```
+//!
+//! The window is the split-view blueprint from `nitro_ui::split`
+//! (`docs/ui.md`): a sidebar row per category, a [`Pages`] stack of
+//! content columns on the right — every page laid out, one shown — and
+//! the Apply/Revert row as the content footer. Switching a page is a
+//! handful of mutations and no relayout, and `hey` reads and sets a
+//! control on any page whether or not it is the one on screen.
 //!
 //! # Why a display row is two lines
 //!
@@ -158,9 +155,13 @@ use std::time::Duration;
 
 use nitro_ui::build::{ContainerBuilder as _, StyleBuilder as _};
 use nitro_ui::shell::{Layer, OutputInfo, ShellEvent, Surface};
+use nitro_ui::split::{
+    CARD_ROW_PAD_X, CONTENT_GUTTER, Pages, SidebarRow, Switch, card, card_row, content_column,
+    footnote, group_caption, pages, sidebar_row, split_view, switch,
+};
 use nitro_ui::widgets::{
-    Checkbox, FlexBuilder, Label, LabelBuilder, Slider, TextField, TextFieldBuilder, button,
-    checkbox, column, icon, label, row, separator, slider, spacer, text_field,
+    Button, Checkbox, FlexBuilder, Label, LabelBuilder, Slider, TextField, TextFieldBuilder,
+    button, checkbox, column, label, row, separator, slider, spacer, text_field,
 };
 use nitro_ui::{App, ColorRole, CrossAlign, Error, Scheme, Size, Ui, WidgetId};
 
@@ -211,7 +212,10 @@ pub const APP_NAME: &str = "nitro-settings";
 /// is cut off rather than spilled.)
 ///
 /// The width did not move, because the row did: it is two lines now (see
-/// `add_row`), and the width is still what its *first* line needs.
+/// `add_row`), and the width is still what its *first* line needs — plus,
+/// since the split view, the 200 px sidebar, the hairline, the 20 px
+/// gutters and the card's 12 px side padding: 760 leaves the line 495,
+/// 86 over its 409 floor.
 ///
 /// # The height, which did move
 ///
@@ -220,18 +224,17 @@ pub const APP_NAME: &str = "nitro-settings";
 /// output after the first costs **64 px** (`58 + GAP`) rather than the
 /// 32 it cost as one line:
 ///
-/// | outputs | tree needs | fits in 500 |
+/// | outputs | the Displays page needs | fits in 520 |
 /// |---|---|---|
-/// | 1 | 423.2 | yes, 77 px spare |
-/// | 2 | 487.2 | yes, 13 px spare |
-/// | 3 | 551.2 | **no** — 51 px short |
+/// | 1 | 258 | yes, 262 px spare |
+/// | 2 | 322 | yes, 198 px spare |
+/// | 5 | 514 | yes, 6 px spare |
 ///
-/// 440 → **500**, and the reason is the second line: 440 held two
-/// one-line rows with 17 px spare and holds two two-line rows 47 px
-/// short. 500 is the smallest round number that holds the two-monitor
-/// case, which is what a laptop-plus-screen desktop actually is, and the
-/// table is here rather than in prose because the first draft of the
-/// *previous* fix claimed two outputs fit at 400 and was wrong by 23 px.
+/// 500 → **520** with the split view, and the page holds five outputs
+/// where the old single column held two: the other three sections are
+/// on their own pages now. The table is here rather than in prose
+/// because the first draft of an earlier fix claimed two outputs fit at
+/// 400 and was wrong by 23 px.
 /// `two_outputs_fit_the_window_and_a_third_clips_rather_than_overlaps`
 /// asserts the two-output row rather than restating it.
 ///
@@ -239,14 +242,12 @@ pub const APP_NAME: &str = "nitro-settings";
 /// produced the bug, which is why [`build`] also pins it as the window's
 /// **minimum** through `Ui::set_window_limits`.
 ///
-/// It does **not** grow for a third monitor. The window has no way to ask
+/// It does **not** grow for a sixth monitor. The window has no way to ask
 /// the server to resize it — `Ui::resize` only re-lays the client's own
 /// tree out inside whatever the server gave, verified on pixels rather
-/// than from the docs: the frame does not move. So a three-monitor
-/// machine gets a window it must drag taller once, which is the
-/// limitation `docs/settings.md` records; the alternative is a
-/// client-initiated resize op that does not exist and that this task is
-/// not the place to add.
+/// than from the docs: the frame does not move. Past what fits, the
+/// Displays page **scrolls** (a content column is a `Scroll`), which is
+/// the split view's answer to the old "drag it taller once".
 ///
 /// Past that point the degradation is **clipping, not overlap** — and
 /// since #561 that is the toolkit's guarantee rather than this file's
@@ -258,7 +259,13 @@ pub const APP_NAME: &str = "nitro-settings";
 /// shorter than the rows it contained and the last row was drawn over
 /// `displays_note` — 0.8 px of overlap at two outputs, 15.6 px at
 /// three.
-pub const WINDOW_SIZE: Size = Size::new(560.0, 500.0);
+pub const WINDOW_SIZE: Size = Size::new(760.0, 520.0);
+
+/// Width of the keyboard fields: wide enough for `ctrl:nocaps,compose:ralt`
+/// and narrow enough that the label beside it keeps its line.
+pub const FIELD_WIDTH: f32 = 220.0;
+/// Width of the volume slider.
+pub const SLIDER_WIDTH: f32 = 160.0;
 
 /// The "surface" an **ordinary** window is.
 ///
@@ -443,15 +450,36 @@ pub mod names {
     /// loudly broken.
     pub const BUTTONS: &str = "buttons";
 
-    /// The icon beside the Displays heading.
+    /// The icon in the Displays sidebar row.
     pub const DISPLAYS_ICON: &str = "displays_icon";
-    /// The icon beside the Keyboard heading.
+    /// The icon in the Keyboard sidebar row.
     pub const KEYBOARD_ICON: &str = "keyboard_icon";
-    /// The icon beside the Audio heading.
+    /// The icon in the Audio sidebar row.
     pub const AUDIO_ICON: &str = "audio_icon";
-    /// The icon beside the Appearance heading.
+    /// The icon in the Appearance sidebar row.
     pub const APPEARANCE_ICON: &str = "appearance_icon";
+
+    /// The sidebar: the column the four category rows live in
+    /// (`nitro_ui::split::names::SIDEBAR`).
+    pub const SIDEBAR: &str = "sidebar";
+    /// The sidebar row that shows the Displays page:
+    /// `hey nitro-settings do sidebar/nav_displays click`.
+    pub const NAV_DISPLAYS: &str = "nav_displays";
+    /// The sidebar row for the Keyboard page.
+    pub const NAV_KEYBOARD: &str = "nav_keyboard";
+    /// The sidebar row for the Audio page.
+    pub const NAV_AUDIO: &str = "nav_audio";
+    /// The sidebar row for the Appearance page.
+    pub const NAV_APPEARANCE: &str = "nav_appearance";
+    /// The page stack; its value is the index of the page on show.
+    pub const PAGES: &str = "pages";
+    /// The content header's title: the current category's name.
+    pub const TITLE: &str = "title";
 }
+
+/// The four pages, in sidebar order. The index is what [`names::PAGES`]
+/// answers and what `select_page` takes.
+pub const PAGE_TITLES: [&str; 4] = ["Displays", "Keyboard", "Audio", "Appearance"];
 
 /// The icons each section heading carries, named in one place so a
 /// rename is one edit and the tests assert on the same constants the
@@ -731,6 +759,13 @@ struct Ids {
 /// Public because the tests build the tree the binary builds: a test that
 /// built its own would be testing a second dialog.
 ///
+/// The tree is the split-view blueprint (`docs/ui.md`): four category
+/// rows in a sidebar, a page per category on the right, and the
+/// Apply/Revert row as the content footer. The pages are a
+/// [`Pages`] stack — every page is laid out and only the current one is
+/// shown, so `hey` can read and set a control on any page whether or
+/// not it is the one on screen.
+///
 /// # Panics
 /// Never in practice — every `attach` names an id this function has just
 /// created, and a fresh id cannot be stale.
@@ -754,31 +789,54 @@ pub fn build(ui: &mut Ui<Settings>) -> WidgetId {
     // rows it holds. It used to be able to, and the last row was drawn
     // on top of `displays_note`: 0.8 px of overlap with two outputs,
     // 15.6 px with three.
-    let displays = ui.build(column().name(names::DISPLAYS).gap(GAP).width_percent(1.0));
-    let displays_note = ui.build(note(NOTE_LIVE).name(names::DISPLAYS_NOTE));
+    let displays = ui.build(
+        column()
+            .name(names::DISPLAYS)
+            .gap(GAP)
+            .padding_xy(CARD_ROW_PAD_X, GAP)
+            .width_percent(1.0),
+    );
+    let displays_note = ui.build(footnote(NOTE_LIVE).name(names::DISPLAYS_NOTE));
+    let displays_card = ui.build(card());
+    ui.attach(displays_card, displays).unwrap();
+    // Unclamped: a display line wants every pixel the pane has, and 600
+    // is the clamp a form wants, not a table.
+    let displays_page = content_column()
+        .unclamped()
+        .child(group_caption("Outputs"))
+        .build(ui);
+    for child in [displays_card, displays_note] {
+        ui.attach(displays_page.column, child).unwrap();
+    }
 
     // -- keyboard ------------------------------------------------------
-    let layout = ui.build(field(names::LAYOUT, "us").grow(1.0));
-    let variant = ui.build(field(names::VARIANT, "nodeadkeys").grow(1.0));
-    let options = ui.build(field(names::OPTIONS, "ctrl:nocaps").grow(1.0));
-    let test = ui.build(field(names::TEST, "type here after Apply").grow(1.0));
-    let keyboard = ui.build(column().name(names::KEYBOARD).gap(GAP).width_percent(1.0));
-    let kb_row = ui.build(control_row());
+    let layout = ui.build(field(names::LAYOUT, "us").width(FIELD_WIDTH));
+    let variant = ui.build(field(names::VARIANT, "nodeadkeys").width(FIELD_WIDTH));
+    let options = ui.build(field(names::OPTIONS, "ctrl:nocaps").width(FIELD_WIDTH));
+    let test = ui.build(field(names::TEST, "type here after Apply").width(FIELD_WIDTH));
+    let kb_card = ui.build(card());
     for (caption_text, id) in [
         ("Layout", layout),
         ("Variant", variant),
         ("Options", options),
     ] {
-        let c = ui.build(caption(caption_text));
-        ui.attach(kb_row, c).unwrap();
-        ui.attach(kb_row, id).unwrap();
+        let r = ui.build(card_row(caption_text));
+        ui.attach(r, id).unwrap();
+        ui.attach(kb_card, r).unwrap();
     }
-    let test_row = ui.build(control_row());
-    let test_caption = ui.build(caption("Test here"));
-    ui.attach(test_row, test_caption).unwrap();
+    let test_card = ui.build(card());
+    let test_row = ui.build(card_row("Test here"));
     ui.attach(test_row, test).unwrap();
-    ui.attach(keyboard, kb_row).unwrap();
-    ui.attach(keyboard, test_row).unwrap();
+    ui.attach(test_card, test_row).unwrap();
+    let keyboard_page = content_column()
+        .name(names::KEYBOARD)
+        .child(group_caption("Layout"))
+        .build(ui);
+    ui.attach(keyboard_page.column, kb_card).unwrap();
+    let try_caption = ui.build(group_caption("Try it"));
+    for child in [try_caption, test_card] {
+        ui.attach(keyboard_page.column, child).unwrap();
+    }
 
     // -- audio ---------------------------------------------------------
     //
@@ -790,15 +848,17 @@ pub fn build(ui: &mut Ui<Settings>) -> WidgetId {
         label("")
             .name(names::VOLUME_VALUE)
             .size(TEXT_SIZE)
-            .width(48.0),
+            .color_role(ColorRole::TextDim)
+            .width(48.0)
+            .align(nitro_ui::Align::Right),
     );
-    let audio_status = ui.build(note("").name(names::AUDIO_STATUS));
+    let audio_status = ui.build(footnote("").name(names::AUDIO_STATUS));
     let volume = ui.build(
         slider(0.0)
             .name(names::VOLUME)
             .range(0.0, 1.0)
             .step(VOLUME_STEP)
-            .grow(1.0)
+            .width(SLIDER_WIDTH)
             .min_width(80.0)
             .on_change(move |s: &mut Settings, ui: &mut Ui<Settings>, v: f32| {
                 // The label first: it is what the user is looking at
@@ -812,7 +872,7 @@ pub fn build(ui: &mut Ui<Settings>) -> WidgetId {
                 }
             }),
     );
-    let mute = ui.build(checkbox("mute").name(names::MUTE).on_toggle(
+    let mute = ui.build(switch("").name(names::MUTE).on_toggle(
         move |s: &mut Settings, ui: &mut Ui<Settings>, on: bool| {
             if let Some(b) = s.audio.clone()
                 && let Err(e) = b.set_muted(on)
@@ -821,15 +881,24 @@ pub fn build(ui: &mut Ui<Settings>) -> WidgetId {
             }
         },
     ));
-    let audio = ui.build(control_row().name(names::AUDIO));
-    let volume_caption = ui.build(caption("Volume"));
-    for child in [volume_caption, volume, volume_value, mute] {
+    let audio = ui.build(card().name(names::AUDIO));
+    let volume_row = ui.build(card_row("Volume"));
+    for child in [volume, volume_value] {
+        ui.attach(volume_row, child).unwrap();
+    }
+    let mute_row = ui.build(card_row("Mute"));
+    ui.attach(mute_row, mute).unwrap();
+    for child in [volume_row, mute_row] {
         ui.attach(audio, child).unwrap();
+    }
+    let audio_page = content_column().child(group_caption("Output")).build(ui);
+    for child in [audio, audio_status] {
+        ui.attach(audio_page.column, child).unwrap();
     }
 
     // -- appearance ----------------------------------------------------
     //
-    // One checkbox, because there are two schemes. A pair of radio
+    // One switch, because there are two schemes. A pair of radio
     // buttons would say the same thing in twice the space, and a
     // drop-down would promise a list that does not exist.
     //
@@ -837,16 +906,16 @@ pub fn build(ui: &mut Ui<Settings>) -> WidgetId {
     // wait for Apply**: it writes `server.conf` on the spot. A colour
     // scheme is the one setting whose result you judge by looking at it,
     // and the server pushes the new palette to every client within a
-    // frame — so "tick it and watch the desktop change" is the whole
+    // frame — so "flip it and watch the desktop change" is the whole
     // interaction. Making the user press Apply afterwards would be
     // asking them to confirm something they can already see.
     //
-    // The status label is built *before* the checkbox because the
+    // The status label is built *before* the switch because the
     // toggle's callback writes to it, and a builder's callback can only
     // capture ids that already exist — the same ordering the audio
     // section uses for `audio_status`.
     let status = ui.build(
-        // Not a `note`: this one lives **inside** a row, where
+        // Not a `footnote`: this one lives **inside** a row, where
         // `flex_shrink` governs width rather than height, and a status
         // line that refused to narrow would take the space out of the
         // Apply and Revert buttons beside it. A long verdict is better
@@ -856,14 +925,106 @@ pub fn build(ui: &mut Ui<Settings>) -> WidgetId {
             .size(TEXT_SIZE)
             .color_role(ColorRole::TextDim),
     );
-    let dark = ui.build(checkbox("Dark").name(names::DARK).on_toggle(
+    let dark = ui.build(switch("").name(names::DARK).on_toggle(
         move |s: &mut Settings, ui: &mut Ui<Settings>, on: bool| {
             set_scheme(s, ui, status, on);
         },
     ));
-    let appearance_note = ui.build(note(NOTE_APPEARANCE).name(names::APPEARANCE_NOTE));
+    let appearance = ui.build(card().name(names::APPEARANCE));
+    let dark_row = ui.build(card_row("Dark").subtitle("Applied at once; no Apply needed"));
+    ui.attach(dark_row, dark).unwrap();
+    ui.attach(appearance, dark_row).unwrap();
+    let appearance_note = ui.build(footnote(NOTE_APPEARANCE).name(names::APPEARANCE_NOTE));
+    let appearance_page = content_column()
+        .child(group_caption("Colour scheme"))
+        .build(ui);
+    for child in [appearance, appearance_note] {
+        ui.attach(appearance_page.column, child).unwrap();
+    }
 
-    // -- apply / revert ------------------------------------------------
+    // -- the pages, the sidebar, the footer ----------------------------
+    let pages_id = ui.build(pages().name(names::PAGES));
+    for p in [displays_page, keyboard_page, audio_page, appearance_page] {
+        ui.attach(pages_id, p.page).unwrap();
+    }
+    let nav_names = [
+        names::NAV_DISPLAYS,
+        names::NAV_KEYBOARD,
+        names::NAV_AUDIO,
+        names::NAV_APPEARANCE,
+    ];
+    let icon_names = [
+        names::DISPLAYS_ICON,
+        names::KEYBOARD_ICON,
+        names::AUDIO_ICON,
+        names::APPEARANCE_ICON,
+    ];
+    let icon_glyphs = [
+        icons::DISPLAYS,
+        icons::KEYBOARD,
+        icons::AUDIO,
+        icons::APPEARANCE,
+    ];
+    let mut nav = [pages_id; 4];
+    for i in 0..4 {
+        nav[i] = ui.build(
+            sidebar_row(icon_glyphs[i], PAGE_TITLES[i])
+                .name(nav_names[i])
+                .icon_name(icon_names[i])
+                .selected(i == 0)
+                // Deferred: the row that was clicked is out of its slot
+                // while this runs, and `select_page` sets its face.
+                .on_click(move |_s: &mut Settings, ui: &mut Ui<Settings>| {
+                    ui.defer(move |_s: &mut Settings, ui: &mut Ui<Settings>| {
+                        select_page(ui, i);
+                    });
+                }),
+        );
+    }
+
+    let apply_button = ui.build(button("Apply").name(names::APPLY).size(TEXT_SIZE));
+    let revert_button = ui.build(button("Revert").name(names::REVERT).size(TEXT_SIZE));
+    let gap = ui.build(spacer().grow(1.0));
+    let buttons = ui.build(control_row().name(names::BUTTONS));
+    for child in [apply_button, revert_button, gap, status] {
+        ui.attach(buttons, child).unwrap();
+    }
+    let footer_line = ui.build(
+        separator()
+            .color_role(ColorRole::Hairline)
+            .width_percent(1.0),
+    );
+    let footer = ui.build(
+        column()
+            .width_percent(1.0)
+            .cross_align(CrossAlign::Stretch)
+            .padding_xy(0.0, 0.0),
+    );
+    let footer_pad = ui.build(
+        column()
+            .width_percent(1.0)
+            .padding_xy(CONTENT_GUTTER, PAD)
+            .cross_align(CrossAlign::Stretch),
+    );
+    ui.attach(footer_pad, buttons).unwrap();
+    for child in [footer_line, footer_pad] {
+        ui.attach(footer, child).unwrap();
+    }
+
+    let parts = split_view()
+        .sidebar_header("Settings")
+        .content_header(PAGE_TITLES[0])
+        .content(nitro_ui::Built::<Settings>::new(nitro_ui::widgets::Flex))
+        .build(ui);
+    // The content body the builder made is a placeholder; the pages go
+    // in it so the body keeps its `content_body` name and its grow.
+    ui.attach(parts.content_body, pages_id).unwrap();
+    for n in nav {
+        ui.attach(parts.sidebar, n).unwrap();
+    }
+    let content = ui.parent(parts.content_body).expect("the content pane");
+    ui.attach(content, footer).unwrap();
+
     let ids = Ids {
         displays,
         displays_note,
@@ -877,62 +1038,42 @@ pub fn build(ui: &mut Ui<Settings>) -> WidgetId {
         dark,
         status,
     };
-    let apply_button = ui.build(
-        button("Apply")
-            .name(names::APPLY)
-            .size(TEXT_SIZE)
-            .on_click(move |s: &mut Settings, ui: &mut Ui<Settings>| apply(s, ui, ids)),
-    );
-    let revert_button = ui.build(
-        button("Revert")
-            .name(names::REVERT)
-            .size(TEXT_SIZE)
-            .on_click(move |s: &mut Settings, ui: &mut Ui<Settings>| revert(s, ui, ids)),
-    );
-    let gap = ui.build(spacer().grow(1.0));
-    let buttons = ui.build(control_row().name(names::BUTTONS));
-    for child in [apply_button, revert_button, gap, status] {
-        ui.attach(buttons, child).unwrap();
+    if let Ok(mut b) = ui.widget_mut::<Button<Settings>>(apply_button) {
+        b.set_on_click(move |s: &mut Settings, ui: &mut Ui<Settings>| apply(s, ui, ids));
     }
-
-    // -- the window ----------------------------------------------------
-    let root = ui.build(column().gap(GAP).padding(PAD).width_percent(1.0));
-    let h_displays = heading_row(ui, names::DISPLAYS_ICON, icons::DISPLAYS, "Displays");
-    let h_keyboard = heading_row(ui, names::KEYBOARD_ICON, icons::KEYBOARD, "Keyboard");
-    let h_audio = heading_row(ui, names::AUDIO_ICON, icons::AUDIO, "Audio");
-    let h_appearance = heading_row(ui, names::APPEARANCE_ICON, icons::APPEARANCE, "Appearance");
-    let appearance = ui.build(control_row().name(names::APPEARANCE));
-    let scheme_caption = ui.build(caption("Colour scheme"));
-    for child in [scheme_caption, dark] {
-        ui.attach(appearance, child).unwrap();
-    }
-    let sep_a = ui.build(separator().width_percent(1.0));
-    let sep_b = ui.build(separator().width_percent(1.0));
-    let sep_c = ui.build(separator().width_percent(1.0));
-    let sep_d = ui.build(separator().width_percent(1.0));
-    for child in [
-        h_displays,
-        displays,
-        displays_note,
-        sep_a,
-        h_keyboard,
-        keyboard,
-        sep_b,
-        h_audio,
-        audio,
-        audio_status,
-        sep_c,
-        h_appearance,
-        appearance,
-        appearance_note,
-        sep_d,
-        buttons,
-    ] {
-        ui.attach(root, child).unwrap();
+    if let Ok(mut b) = ui.widget_mut::<Button<Settings>>(revert_button) {
+        b.set_on_click(move |s: &mut Settings, ui: &mut Ui<Settings>| revert(s, ui, ids));
     }
 
     install(ui, ids);
-    root
+    parts.root
+}
+
+/// Show page `index`: the page stack, the four sidebar rows and the
+/// header title move together.
+///
+/// Public so a test (or an app embedding the dialog) can switch pages
+/// without clicking; `hey do sidebar/nav_keyboard click` is the scripted
+/// way.
+pub fn select_page(ui: &mut Ui<Settings>, index: usize) {
+    let Some(pages_id) = nitro_ui::introspect::resolve(ui, names::PAGES) else {
+        return;
+    };
+    if let Ok(mut p) = ui.widget_mut::<Pages>(pages_id) {
+        p.show(index);
+    }
+    if let Some(sidebar) = nitro_ui::introspect::resolve(ui, names::SIDEBAR) {
+        for (k, row) in ui.children(sidebar).into_iter().enumerate() {
+            if let Ok(mut r) = ui.widget_mut::<SidebarRow<Settings>>(row) {
+                r.set_selected(k == index);
+            }
+        }
+    }
+    if let Some(title) = nitro_ui::introspect::resolve(ui, names::TITLE)
+        && let Some(text) = PAGE_TITLES.get(index)
+    {
+        set_label(ui, title, text);
+    }
 }
 
 /// A row of controls: the shape every labelled line in this dialog has.
@@ -956,63 +1097,6 @@ fn control_row() -> FlexBuilder<Settings> {
         .min_height(ROW_HEIGHT)
         .width_percent(1.0)
         .cross_align(CrossAlign::Center)
-}
-
-/// A section heading's **label**.
-///
-/// A heading is one line of text at a fixed size, so there is no smaller
-/// honest version of it — and since #561 that is the toolkit's default
-/// rather than something this file asks for. Letting the root column
-/// reclaim its overflow here cost the headings their descenders: 17.5 px
-/// of measured text laid out in 11.8, which is what "Displays" with no
-/// tail on the `p` looked like on the box.
-fn heading(text: &str) -> LabelBuilder<Settings> {
-    label(text)
-        .size(HEADING_SIZE)
-        .weight(600)
-        .color_role(ColorRole::Text)
-}
-
-/// A section heading: its icon and its label, in one row.
-///
-/// The row is **not** a `control_row`: a `control_row` is
-/// `ROW_HEIGHT`-tall by contract, and a heading is as tall as its own
-/// text (17.5 px at `HEADING_SIZE`). Pinning the heading to 26 would add
-/// 8.5 px per section — 34 px over four sections — to a window whose
-/// height is measured from its tree. So the row takes its height from
-/// its children, which is what `HEADING_ROW_H` below records and why
-/// `WINDOW_SIZE` did not move.
-///
-/// `ColorRole::Text`, the same role the label takes, so the pair is one
-/// visual unit that follows the scheme together.
-fn heading_row(ui: &mut Ui<Settings>, name: &str, icon_name: &str, text: &str) -> WidgetId {
-    let container = ui.build(
-        row()
-            .gap(GAP)
-            .width_percent(1.0)
-            .cross_align(CrossAlign::Center),
-    );
-    let glyph = ui.build(
-        icon(icon_name)
-            .name(name)
-            .size(ICON_PX)
-            .color_role(ColorRole::Text),
-    );
-    let text = ui.build(heading(text));
-    for child in [glyph, text] {
-        ui.attach(container, child).unwrap();
-    }
-    container
-}
-
-/// A line of explanatory text under a section.
-///
-/// Wrapped, so its height depends on the width it is given — and the
-/// height it computes is the height it gets. Before #561 the two-line
-/// notes were laid out in 20 px of a measured 30 and the second line was
-/// sliced through the middle.
-fn note(text: &str) -> LabelBuilder<Settings> {
-    label(text).size(TEXT_SIZE).color_role(ColorRole::TextDim)
 }
 
 /// A label in front of a control.
@@ -1155,7 +1239,7 @@ fn load_audio(s: &mut Settings, ui: &mut Ui<Settings>, ids: Ids) {
     if let Ok(mut sl) = ui.widget_mut::<Slider<Settings>>(ids.volume) {
         sl.set_value(v.level);
     }
-    if let Ok(mut c) = ui.widget_mut::<Checkbox<Settings>>(ids.mute) {
+    if let Ok(mut c) = ui.widget_mut::<Switch<Settings>>(ids.mute) {
         c.set_checked(v.muted);
     }
     set_label(ui, ids.volume_value, &percent(v.level));
@@ -1170,7 +1254,7 @@ fn set_audio_enabled(ui: &mut Ui<Settings>, ids: Ids, on: bool) {
     if let Ok(mut sl) = ui.widget_mut::<Slider<Settings>>(ids.volume) {
         sl.set_enabled(on);
     }
-    if let Ok(mut c) = ui.widget_mut::<Checkbox<Settings>>(ids.mute) {
+    if let Ok(mut c) = ui.widget_mut::<Switch<Settings>>(ids.mute) {
         c.set_enabled(on);
     }
 }
@@ -1746,7 +1830,7 @@ fn fill_keyboard(ui: &mut Ui<Settings>, ids: Ids, k: &KeyboardConf) {
 /// Put the appearance section back to what the file says.
 fn fill_appearance(ui: &mut Ui<Settings>, ids: Ids, t: &conf::ThemeConf) {
     let dark = t.scheme.unwrap_or_default() == Scheme::Dark;
-    if let Ok(mut c) = ui.widget_mut::<Checkbox<Settings>>(ids.dark) {
+    if let Ok(mut c) = ui.widget_mut::<Switch<Settings>>(ids.dark) {
         // `set_checked` does not fire `on_change`, which is what makes
         // this safe to call from Revert: a setter that re-entered
         // `set_scheme` would write the file back out on every Revert,

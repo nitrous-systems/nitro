@@ -6,23 +6,22 @@ one `nitro-server` watches with inotify and reloads — and so the first
 nitro app whose output something else reads back.
 
 ```text
-┌──────────────────────────────────────────────────────┐
-│ Displays                                             │
-│ HDMI-A-1 1920×1080 @ 60 Hz [==o===] 2 ☑ primary 0   0 │
-│ VGA-1    1280×1024 @ 60 Hz [o=====] 1 ☐ primary 1920 0│
-│ Positions are typed; drag-arrange is not in M4.       │
-│ ────────────────────────────────────────────────────  │
-│ Keyboard                                             │
-│ Layout [de    ] Variant [      ] Options [ctrl:nocaps]│
-│ Test here [                                         ] │
-│ ────────────────────────────────────────────────────  │
-│ Audio                                                │
-│ Volume [======o===] 65 %  ☐ mute                      │
-│ via wpctl                                            │
-│ ────────────────────────────────────────────────────  │
-│ [Apply] [Revert]                            applied   │
-└──────────────────────────────────────────────────────┘
+┌──────────────┬───────────────────────────────────────────────────┐
+│ Settings     │ Displays                                          │
+│              ├───────────────────────────────────────────────────┤
+│ ▣ Displays   │  Outputs                                          │
+│   Keyboard   │ ┌───────────────────────────────────────────────┐ │
+│   Audio      │ │ HDMI-A-1 1920×1080 @ 60 Hz [==o==] 2 ☑ primary │ │
+│   Appearance │ │    position [0   ] [0   ]                     │ │
+│              │ └───────────────────────────────────────────────┘ │
+│              │  Positions are typed; drag-arrange is not in M4.  │
+│              ├───────────────────────────────────────────────────┤
+│              │ [Apply] [Revert]                          applied │
+└──────────────┴───────────────────────────────────────────────────┘
 ```
+
+A split view (`docs/ui.md`): a sidebar row per category, a page per
+row. `hey nitro-settings do sidebar/nav_keyboard click` switches pages.
 
 Run it against a server (`just fake` in another terminal):
 

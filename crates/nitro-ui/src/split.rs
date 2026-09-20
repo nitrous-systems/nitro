@@ -938,7 +938,8 @@ impl<S: 'static> ContentColumnBuilder<S> {
         self
     }
 
-    /// The addressing name of the page (the scroll viewport).
+    /// The addressing name of the groups column (a `container`, so
+    /// `hey` addresses a page's controls as `<name>/<control>`).
     #[must_use]
     pub fn name(mut self, n: impl Into<String>) -> Self {
         self.name = Some(n.into());
@@ -960,12 +961,40 @@ impl<S: 'static> ContentColumnBuilder<S> {
     }
 }
 
+/// The ids of a built [`ContentColumnBuilder`], for an app that attaches
+/// groups it built earlier (because their callbacks capture ids).
+#[derive(Debug, Clone, Copy)]
+pub struct ContentColumn {
+    /// The scrolling page; what goes into a [`pages`] stack or a
+    /// [`SplitViewBuilder::content`].
+    pub page: WidgetId,
+    /// The column the groups go in: attach captions, cards and
+    /// footnotes here.
+    pub column: WidgetId,
+}
+
+impl<S: 'static> ContentColumnBuilder<S> {
+    /// Materialise the column and hand back its ids.
+    ///
+    /// # Panics
+    /// Never in practice: the attach names an id built a line earlier.
+    pub fn build(self, ui: &mut Ui<S>) -> ContentColumn {
+        let page = ui.build(self);
+        let wrapper = ui.children(page)[0];
+        let column = ui.children(wrapper)[0];
+        ContentColumn { page, column }
+    }
+}
+
 impl<S: 'static> IntoWidget<S> for ContentColumnBuilder<S> {
     fn into_widget(self) -> Built<S> {
         let mut inner = column()
             .width_percent(1.0)
             .gap(CONTENT_GAP)
             .cross_align(CrossAlign::Stretch);
+        if let Some(n) = self.name {
+            inner = inner.name(n);
+        }
         inner.built_mut().state_mut().style.padding = Edges {
             left: CONTENT_GUTTER,
             top: CONTENT_GAP,
@@ -983,11 +1012,11 @@ impl<S: 'static> IntoWidget<S> for ContentColumnBuilder<S> {
             .width_percent(1.0)
             .cross_align(CrossAlign::Center)
             .child(inner);
-        let mut s = scroll().grow(1.0).width_percent(1.0).child(wrapper);
-        if let Some(n) = self.name {
-            s = s.name(n);
-        }
-        s.into_widget()
+        scroll()
+            .grow(1.0)
+            .width_percent(1.0)
+            .child(wrapper)
+            .into_widget()
     }
 }
 

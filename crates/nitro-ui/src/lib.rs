@@ -115,8 +115,9 @@ pub use layout::{
 pub use list::{List, ListModel, Row, list};
 pub use nitro_core::{Color, Point, Rect, Size, Transform};
 pub use split::{
-    Card, CardRow, Pages, SidebarRow, SplitParts, Switch, card, card_row, content_column, footnote,
-    group_caption, pages, sidebar_row, sidebar_section, sidebar_separator, split_view, switch,
+    Card, CardRow, ContentColumn, Pages, SidebarRow, SplitParts, Switch, card, card_row,
+    content_column, footnote, group_caption, pages, sidebar_row, sidebar_section,
+    sidebar_separator, split_view, switch,
 };
 // The semantic colour palette. `nitro_core::Role` is re-exported as
 // `ColorRole` because this crate already has a `Role` — the

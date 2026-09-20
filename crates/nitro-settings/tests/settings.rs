@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use nitro_settings::{Settings, build, conf, names};
+use nitro_ui::split::Switch;
 use nitro_ui::test::Harness;
 use nitro_ui::widgets::{Checkbox, Label, Slider, TextField};
 use nitro_ui::{Size, WidgetId};
@@ -90,6 +91,21 @@ fn harness(dir: &Path) -> Harness<Settings> {
 fn named(h: &mut Harness<Settings>, path: &str) -> WidgetId {
     nitro_ui::introspect::resolve(h.ui(), &format!("window/{path}"))
         .unwrap_or_else(|| panic!("no widget at {path}"))
+}
+
+/// The first `Label` in the tree whose text is `text`, with its bounds.
+fn label_by_text(h: &mut Harness<Settings>, text: &str) -> (String, nitro_ui::Rect) {
+    let all = tree(h);
+    all.iter()
+        .find(|(p, _)| {
+            nitro_ui::introspect::resolve(h.ui(), p).is_some_and(|id| {
+                h.ui()
+                    .widget::<Label>(id)
+                    .is_ok_and(|l: &Label| l.text() == text)
+            })
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("no label {text:?} in {all:?}"))
 }
 
 /// A text field's contents.
@@ -419,7 +435,7 @@ fn the_audio_section_drives_a_fake_wpctl() {
     );
     let mute = named(&mut h, names::MUTE);
     assert!(
-        h.widget::<Checkbox<Settings>>(mute).is_checked(),
+        h.widget::<Switch<Settings>>(mute).is_checked(),
         "and `[MUTED]` ticked the box"
     );
     let value = named(&mut h, names::VOLUME_VALUE);
@@ -469,7 +485,7 @@ fn an_empty_search_path_says_no_audio_backend_found() {
     let volume = named(&mut h, names::VOLUME);
     assert!(!h.widget::<Slider<Settings>>(volume).is_enabled());
     let mute = named(&mut h, names::MUTE);
-    assert!(!h.widget::<Checkbox<Settings>>(mute).is_enabled());
+    assert!(!h.widget::<Switch<Settings>>(mute).is_enabled());
     h.quit();
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -557,6 +573,13 @@ fn every_section_is_hey_addressable() {
         ("apply", "button"),
         ("revert", "button"),
         ("status", "label"),
+        ("sidebar", "container"),
+        ("sidebar/nav_displays", "button"),
+        ("sidebar/nav_keyboard", "button"),
+        ("sidebar/nav_audio", "button"),
+        ("sidebar/nav_appearance", "button"),
+        ("pages", "container"),
+        ("title", "label"),
     ] {
         let answer = ask(&mut h, &socket, &format!("get {path} role\n"));
         assert_eq!(
@@ -899,7 +922,7 @@ fn the_checkbox_starts_on_what_the_file_says() {
     let mut h = harness(&dir);
     let dark = named(&mut h, names::DARK);
     assert!(
-        h.widget::<Checkbox<Settings>>(dark).is_checked(),
+        h.widget::<Switch<Settings>>(dark).is_checked(),
         "the box reflects the file it opened on"
     );
     h.quit();
@@ -954,7 +977,7 @@ fn revert_puts_the_checkbox_back_without_writing() {
 
     let dark = named(&mut h, names::DARK);
     assert!(
-        h.widget::<Checkbox<Settings>>(dark).is_checked(),
+        h.widget::<Switch<Settings>>(dark).is_checked(),
         "Revert showed what the file says"
     );
     assert_eq!(
@@ -1013,6 +1036,8 @@ fn tree(h: &mut Harness<Settings>) -> Vec<(String, nitro_ui::Rect)> {
 }
 
 #[test]
+// One test because it is one invariant checked four ways over one tree.
+#[allow(clippy::too_many_lines)]
 fn no_widget_is_laid_out_smaller_than_it_measures() {
     // The regression test for the whole bug, and for the thing eighteen
     // passing tests could not see.
@@ -1037,7 +1062,6 @@ fn no_widget_is_laid_out_smaller_than_it_measures() {
     let dir = scratch("layout-intrinsic");
     let mut h = layout_harness(&dir);
     let theme = nitro_ui::Theme::default();
-    let text_style = nitro_ui::TextStyle::new(theme.font_family.clone(), nitro_settings::TEXT_SIZE);
 
     // 1. Every `control_row()` is exactly ROW_HEIGHT tall.
     //
@@ -1050,20 +1074,19 @@ fn no_widget_is_laid_out_smaller_than_it_measures() {
     // A display row contributes **two** of them since #3725: it is a
     // column of a `top` and a `bottom` line, not one row (see `add_row`).
     // The row's own container is therefore not in this list — it is
-    // 2 × ROW_HEIGHT + GAP tall, which is checked below.
-    let rows: Vec<(String, nitro_ui::Rect)> = tree(&mut h)
-        .into_iter()
-        .filter(|(p, _)| {
-            p == &format!("window/displays/{CONNECTOR}/top")
-                || p == &format!("window/displays/{CONNECTOR}/bottom")
-                || p == "window/keyboard/container[0]"
-                || p == "window/keyboard/container[1]"
-                || p == "window/audio"
-                || p == "window/appearance"
-                || p == "window/buttons"
-        })
-        .collect();
-    assert_eq!(rows.len(), 7, "found every control row: {rows:?}");
+    // 2 × ROW_HEIGHT + GAP tall, which is checked below. The keyboard,
+    // audio and appearance lines are `card_row`s now (the split view),
+    // which have a minimum rather than a fixed height.
+    let mut rows: Vec<(String, nitro_ui::Rect)> = Vec::new();
+    for path in [
+        format!("displays/{CONNECTOR}/top"),
+        format!("displays/{CONNECTOR}/bottom"),
+        "buttons".to_owned(),
+    ] {
+        let id = named(&mut h, &path);
+        rows.push((path, h.ui().window_bounds(id)));
+    }
+    assert_eq!(rows.len(), 3, "found every control row: {rows:?}");
     for (path, b) in &rows {
         assert!(
             (b.h - nitro_settings::ROW_HEIGHT).abs() < 0.01,
@@ -1074,9 +1097,26 @@ fn no_widget_is_laid_out_smaller_than_it_measures() {
     }
 
     // 2. Every heading is at least as tall as its own text measures.
-    let mut head =
-        nitro_ui::TextStyle::new(theme.font_family.clone(), nitro_settings::HEADING_SIZE);
-    head.weight = 600;
+    //
+    // The headings are the sidebar rows' labels (`SIDEBAR_LABEL_PX`,
+    // regular) and the content header's title (`HEADER_TITLE_PX`, 600).
+    let head =
+        nitro_ui::TextStyle::new(theme.font_family.clone(), nitro_ui::split::SIDEBAR_LABEL_PX);
+    let mut title_style =
+        nitro_ui::TextStyle::new(theme.font_family.clone(), nitro_ui::split::HEADER_TITLE_PX);
+    title_style.weight = 600;
+    let title_id = named(&mut h, names::TITLE);
+    let title_want = h
+        .ui()
+        .measure_text("Displays", &title_style, 0.0)
+        .expect("measure the title")
+        .height;
+    let title_b = h.ui().window_bounds(title_id);
+    assert!(
+        title_b.h >= title_want - 0.01,
+        "the title is {} tall but measures {title_want}",
+        title_b.h
+    );
     let all = tree(&mut h);
     for text in ["Displays", "Keyboard", "Audio", "Appearance"] {
         let want = h
@@ -1087,11 +1127,10 @@ fn no_widget_is_laid_out_smaller_than_it_measures() {
         let (path, b) = all
             .iter()
             .find(|(p, _)| {
-                // The headings live inside their heading rows now (an
+                // The headings are the sidebar rows' labels now (an
                 // icon and a label), so the path is
-                // `window/container[N]/label[0]` rather than
-                // `window/label[N]`. Matched on the *text* rather than
-                // the shape for exactly that reason.
+                // `window/…/sidebar/nav_x/label[0]`. Matched on the
+                // *text* rather than the shape for exactly that reason.
                 p.ends_with("/label[0]")
                     && nitro_ui::introspect::resolve(h.ui(), p).is_some_and(|id| {
                         h.ui()
@@ -1121,21 +1160,27 @@ fn no_widget_is_laid_out_smaller_than_it_measures() {
     // rather than a `shrink(0.0)` this app spells: a caption keeps what
     // it measured, and the fields, which say they are viewports over
     // their own text, absorb the deficit.
-    for (path, caption) in [
-        ("keyboard/container[0]/label[0]", "Layout"),
-        ("keyboard/container[0]/label[1]", "Variant"),
-        ("keyboard/container[0]/label[2]", "Options"),
-        ("keyboard/container[1]/label[0]", "Test here"),
-        ("audio/label[0]", "Volume"),
-        ("appearance/label[0]", "Colour scheme"),
+    //
+    // The captions are `card_row` labels now, and a card row's label is
+    // 14 px `Text` rather than 13 px dim; they are found by text since a
+    // card row's label has no name of its own.
+    let row_style =
+        nitro_ui::TextStyle::new(theme.font_family.clone(), nitro_ui::split::ROW_LABEL_PX);
+    for caption in [
+        "Layout",
+        "Variant",
+        "Options",
+        "Test here",
+        "Volume",
+        "Mute",
+        "Dark",
     ] {
         let want = h
             .ui()
-            .measure_text(caption, &text_style, 0.0)
+            .measure_text(caption, &row_style, 0.0)
             .expect("measure the caption")
             .width;
-        let id = named(&mut h, path);
-        let b = h.ui().window_bounds(id);
+        let (path, b) = label_by_text(&mut h, caption);
         assert!(
             b.w >= want - 0.01,
             "the caption {caption:?} at {path} is {} wide but measures {want} \
@@ -1151,13 +1196,14 @@ fn no_widget_is_laid_out_smaller_than_it_measures() {
     // honest comparison, and the one that catches "two lines rendered in
     // 1.3 lines of box". `audio_status` is in here because it was the
     // worst of them: 15.1 px of text in 10.2 px of box.
+    let note_style = nitro_ui::TextStyle::new(theme.font_family.clone(), nitro_ui::split::SMALL_PX);
     for path in ["displays_note", "appearance_note", "audio_status"] {
         let id = named(&mut h, path);
         let text = h.widget::<Label>(id).text().to_owned();
         let b = h.ui().window_bounds(id);
         let want = h
             .ui()
-            .measure_text(&text, &text_style, b.w)
+            .measure_text(&text, &note_style, b.w)
             .expect("measure the note")
             .height;
         assert!(
@@ -1250,13 +1296,11 @@ fn nothing_in_the_tree_overhangs_the_window() {
     let size = h.ui().window_size();
     check_nothing_overhangs(&mut h, "one output");
 
-    // And the root's last child — the buttons row — ends inside the
+    // And the content footer — the buttons row — ends inside the
     // padding rather than merely inside the window. Apply sitting on the
     // bottom edge is the failure this catches.
-    let (_, buttons) = tree(&mut h)
-        .into_iter()
-        .find(|(p, _)| p == "window/buttons")
-        .expect("the buttons row");
+    let buttons_id = named(&mut h, "buttons");
+    let buttons = h.ui().window_bounds(buttons_id);
     assert!(
         buttons.y + buttons.h <= size.h - nitro_settings::PAD + 0.01,
         "the buttons row ends at {} and the window's content stops at {}",
@@ -1570,9 +1614,15 @@ fn two_outputs_fit_the_window_and_a_third_clips_rather_than_overlaps() {
     h.settle();
 
     let size = h.ui().window_size();
-    let rows: Vec<(String, nitro_ui::Rect)> = tree(&mut h)
+    let displays = named(&mut h, "displays");
+    let rows: Vec<(String, nitro_ui::Rect)> = h
+        .ui()
+        .children(displays)
         .into_iter()
-        .filter(|(p, _)| p.starts_with("window/displays/") && p.matches('/').count() == 2)
+        .map(|id| {
+            let path = nitro_ui::introspect::path_of(h.ui(), id).unwrap_or_default();
+            (path, h.ui().window_bounds(id))
+        })
         .collect();
     assert_eq!(rows.len(), 2, "two display rows: {rows:?}");
 
@@ -1630,10 +1680,8 @@ fn two_outputs_fit_the_window_and_a_third_clips_rather_than_overlaps() {
     // Claim 1: the whole tree still fits, buttons row included. This is
     // the assertion the docs' "two outputs fit" rests on, so it is here
     // rather than in prose.
-    let (_, buttons) = tree(&mut h)
-        .into_iter()
-        .find(|(p, _)| p == "window/buttons")
-        .expect("the buttons row");
+    let buttons_id = named(&mut h, "buttons");
+    let buttons = h.ui().window_bounds(buttons_id);
     assert!(
         buttons.y + buttons.h <= size.h - nitro_settings::PAD + 0.01,
         "with two outputs the buttons row ends at {} and the window's \
@@ -1652,16 +1700,12 @@ fn two_outputs_fit_the_window_and_a_third_clips_rather_than_overlaps() {
     });
     h.settle();
 
-    let all = tree(&mut h);
-    let find = |needle: &str| -> nitro_ui::Rect {
-        all.iter()
-            .find(|(p, _)| p == needle)
-            .unwrap_or_else(|| panic!("no {needle} in {all:?}"))
-            .1
-    };
-    let column = find("window/displays");
-    let note = find("window/displays_note");
-    let last = find("window/displays/Virtual-3");
+    let column_id = named(&mut h, "displays");
+    let note_id = named(&mut h, "displays_note");
+    let last_id = named(&mut h, "displays/Virtual-3");
+    let column = h.ui().window_bounds(column_id);
+    let note = h.ui().window_bounds(note_id);
+    let last = h.ui().window_bounds(last_id);
 
     assert!(
         (last.h - row_h).abs() < 0.01,
@@ -1776,49 +1820,39 @@ fn the_window_declares_its_tree_as_its_minimum_size() {
 }
 
 #[test]
-fn the_window_holds_its_tree_with_the_heading_icons() {
+fn the_window_holds_every_page() {
     // `WINDOW_SIZE` is *measured*, so anything added to the tree has to
-    // re-measure it. The heading icons deliberately do not grow it: a
-    // heading row is as tall as its tallest child, and the 16 px icon is
-    // only 0.5 px taller than the 15 px heading label's 17.5 px line box
-    // — i.e. not taller at all. Making the heading a `control_row` would
-    // have added 8.5 px per section (34 px over four), which is what
-    // this test exists to stop somebody doing by reflex.
+    // re-measure it. With the split view there are four pages, and the
+    // one on screen is the only one a person can see overhang — so each
+    // is shown in turn and checked. The sidebar icons keep their full
+    // square, and a sidebar row is exactly the blueprint's height.
     //
     // Reported rather than asserted against a frozen constant: the
     // number is printed so a reader of the test output can see what the
     // tree costs today, and the assertion is the invariant (it fits).
-    let dir = scratch("layout-heading-icons");
+    let dir = scratch("layout-every-page");
     let mut h = layout_harness(&dir);
     let size = h.ui().window_size();
 
-    let all = tree(&mut h);
-    let find = |needle: &str| -> nitro_ui::Rect {
-        all.iter()
-            .find(|(p, _)| p == needle)
-            .unwrap_or_else(|| panic!("no {needle} in {all:?}"))
-            .1
-    };
-    let buttons = find("window/buttons");
-    let used = buttons.y + buttons.h + nitro_settings::PAD;
-    println!("the tree occupies {used} px of a {}-px window", size.h);
-    assert!(
-        used <= size.h + 0.01,
-        "the tree needs {used} px and WINDOW_SIZE.h is {}",
-        size.h,
-    );
+    for (i, title) in nitro_settings::PAGE_TITLES.iter().enumerate() {
+        nitro_settings::select_page(h.ui(), i);
+        h.settle();
+        check_nothing_overhangs(&mut h, title);
+        let pages = named(&mut h, names::PAGES);
+        let page = h.ui().children(pages)[i];
+        let wrapper = h.ui().children(page)[0];
+        let content = h.ui().children(wrapper)[0];
+        let used = h.ui().window_bounds(content).bottom();
+        println!(
+            "the {title} page occupies up to y={used} of a {}-px window",
+            size.h
+        );
+        let title_id = named(&mut h, names::TITLE);
+        assert_eq!(h.widget::<Label>(title_id).text(), *title);
+    }
+    nitro_settings::select_page(h.ui(), 0);
+    h.settle();
 
-    // Each heading row is exactly as tall as its label, so the icons
-    // cost nothing vertically — the claim the paragraph above makes.
-    let theme = nitro_ui::Theme::default();
-    let mut head =
-        nitro_ui::TextStyle::new(theme.font_family.clone(), nitro_settings::HEADING_SIZE);
-    head.weight = 600;
-    let label_h = h
-        .ui()
-        .measure_text("Displays", &head, 0.0)
-        .expect("measure the heading")
-        .height;
     for name in [
         nitro_settings::names::DISPLAYS_ICON,
         nitro_settings::names::KEYBOARD_ICON,
@@ -1837,17 +1871,85 @@ fn the_window_holds_its_tree_with_the_heading_icons() {
             b.h,
             nitro_settings::ICON_PX,
         );
-        let parent = h.ui().parent(id).expect("the heading row");
+        let parent = h.ui().parent(id).expect("the sidebar row");
         let row = h.ui().window_bounds(parent);
         assert!(
-            row.h <= label_h.max(nitro_settings::ICON_PX) + 0.01,
-            "the heading row is {} tall; its label measures {label_h} and \
-             its icon is {}: an icon must not make a heading taller",
+            (row.h - nitro_ui::split::SIDEBAR_ROW_HEIGHT).abs() < 0.01,
+            "the sidebar row is {} tall, not {}",
             row.h,
-            nitro_settings::ICON_PX,
+            nitro_ui::split::SIDEBAR_ROW_HEIGHT,
         );
     }
 
+    h.quit();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn clicking_a_sidebar_row_shows_that_page_and_only_that_page() {
+    // The split view from outside: `hey do sidebar/nav_keyboard click`
+    // switches the page, the header follows, the row is selected, and
+    // the other pages are hidden but still addressable — `keyboard/
+    // layout` answers from any page, which is what a script relies on.
+    let dir = scratch("pages");
+    let mut h = harness(&dir);
+    let socket = h.open_socket("nitro-settings");
+    h.settle();
+
+    let reply = ask(&mut h, &socket, "get keyboard/layout visible\n");
+    assert_eq!(
+        reply,
+        vec!["false".to_owned()],
+        "the keyboard page starts hidden"
+    );
+    let reply = ask(&mut h, &socket, "get displays visible\n");
+    assert_eq!(reply, vec!["true".to_owned()]);
+
+    h.tap();
+    h.clear_tap();
+    let reply = ask(&mut h, &socket, "do sidebar/nav_keyboard click\n");
+    assert!(reply.is_empty(), "a `do` answers with a bare ok");
+    h.settle();
+    let ops: Vec<&str> = h.mutations().iter().map(|m| m.op).collect();
+    let visibles = ops.iter().filter(|o| **o == "SetVisible").count();
+    let bounds = ops.iter().filter(|o| **o == "SetBounds").count();
+    assert_eq!(visibles, 2, "one page out, one in: {ops:?}");
+    assert_eq!(bounds, 0, "a page switch lays nothing out again: {ops:?}");
+
+    assert_eq!(
+        ask(&mut h, &socket, "get keyboard/layout visible\n"),
+        vec!["true".to_owned()]
+    );
+    assert_eq!(
+        ask(&mut h, &socket, "get displays visible\n"),
+        vec!["false".to_owned()]
+    );
+    assert_eq!(
+        ask(&mut h, &socket, "get pages value\n"),
+        vec!["1".to_owned()]
+    );
+    assert_eq!(
+        ask(&mut h, &socket, "get title value\n"),
+        vec!["Keyboard".to_owned()]
+    );
+    let row = named(&mut h, "sidebar/nav_keyboard");
+    assert!(
+        h.widget::<nitro_ui::split::SidebarRow<Settings>>(row)
+            .is_selected()
+    );
+    let row = named(&mut h, "sidebar/nav_displays");
+    assert!(
+        !h.widget::<nitro_ui::split::SidebarRow<Settings>>(row)
+            .is_selected()
+    );
+
+    // A control on a hidden page still takes a value.
+    let reply = ask(&mut h, &socket, "set displays/Virtual-1/scale value 2\n");
+    assert!(reply.is_empty(), "{reply:?}");
+    h.settle();
+    let value = named(&mut h, "displays/Virtual-1/scale_value");
+    assert_eq!(h.widget::<Label>(value).text(), "2");
+    h.assert_idle(200);
     h.quit();
     let _ = std::fs::remove_dir_all(&dir);
 }

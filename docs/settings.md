@@ -320,7 +320,7 @@ clock down to its 0.25 MHz step, so the timings really are 239.84 Hz and
 the server reports what the timings produce rather than what was asked
 for. The desktop laid out at 720p without squashing anything (bar
 1280×32, launcher 600×400, settings 560×440 — the size it was then; it is
-560×500 since #3725 — with its buttons row inside the window).
+760×520 as a split view now — with its buttons row inside the window).
 
 **And the panel syncs.** That is a separate question from whether the link
 carries it, and the only instrument for it is a person looking at the
@@ -551,12 +551,26 @@ ticks**.
 $ nitro-settings
 ```
 
-Four sections in one decorated window: **Displays** (two lines per output
-— name, mode, a scale slider and a `primary` checkbox on the first;
-position and the connector's other refresh rates on the second),
-**Keyboard** (layout, variant, options, and a field to type in
-afterwards), **Audio** (volume and mute) and **Appearance** (the dark
-scheme). **Apply** writes the file; **Revert** re-reads it.
+Four categories in a **split view** (`docs/ui.md`, "Split view
+blueprint"): a sidebar on the left with a row per category, and the
+category's page on the right — a header with its title, a scrolling
+column of grouped cards, and the Apply/Revert row as a footer.
+**Displays** (two lines per output — name, mode, a scale slider and a
+`primary` checkbox on the first; position and the connector's other
+refresh rates on the second), **Keyboard** (layout, variant, options, and
+a field to type in afterwards), **Audio** (volume and mute) and
+**Appearance** (the dark scheme). **Apply** writes the file; **Revert**
+re-reads it.
+
+![nitro-settings, the Displays page](settings-split.png)
+
+The four pages are a `Pages` stack: every page is laid out and only the
+current one is shown, so `hey nitro-settings get keyboard/layout value`
+answers from any page and a switch costs `SetVisible` ×2, the two
+sidebar rows' faces, the title's `SetText` and one commit — no relayout
+(`clicking_a_sidebar_row_shows_that_page_and_only_that_page` counts the
+mutations). `hey nitro-settings do sidebar/nav_keyboard click` switches
+pages from a script; Up/Down in a focused sidebar row walk them.
 
 ### A display row is two lines, because one overflowed the window
 
@@ -622,31 +636,37 @@ and no trailing zeros, so the kernel's `84.904` is `84.9` and `59.940` is
 the *server's* spelling, before that, or the line would offer the rate it
 is running as something else to try.
 
-### The window is 560×500, and both numbers are measured
+### The window is 760×520, and both numbers are measured
 
-The widest thing in it is a display row's **first** line — 76 px of
-connector name, 136 of mode string, a slider at its 64 px minimum, 30 for
-the scale value, 79 for the `primary` checkbox and four 6 px gaps — so
-the inner width is 540, unchanged across the two-line split.
+The sidebar is the blueprint's 200 px plus a 1 px hairline; the content
+pane is what is left, 559 px, with 20 px gutters. The widest thing in it
+is a display row's **first** line — 76 px of connector name, 136 of mode
+string, a slider at its 64 px minimum, 30 for the scale value, 79 for the
+`primary` checkbox and four 6 px gaps ≈ 409 at the floor — inside a card
+with 12 px of side padding, so the line has 495 px, 86 more than its
+floor. The Displays page is the one page that is **unclamped**: the
+other three clamp their column to 600 px as GNOME does, but a display
+line is a table, not a form, and wants every pixel.
 
-The height is not reasoned about, it is measured: the built tree at that
-width, with the height unbounded. A display row is now
-`2 × ROW_HEIGHT + GAP` = 58 px of content, so each output after the first
-costs **64 px** rather than the 32 it cost as one line.
+The height is measured from the built tree with the height unbounded.
+The content header is 46 px, the footer 47 (a hairline, 10 px of padding
+and the 26 px buttons row), the caption 24 above the card and 6 below,
+and a display row is `2 × ROW_HEIGHT + GAP` = 58 px, so each output after
+the first costs **64 px**.
 
-| outputs | the tree needs | fits in 500 |
+| outputs | the Displays page needs | fits in 520 |
 |---|---|---|
-| 1 | 423.2 | yes, 77 px spare |
-| 2 | 487.2 | yes, 13 px spare |
-| 3 | 551.2 | **no** — 51 px short |
+| 1 | 258 | yes, 262 px spare |
+| 2 | 322 | yes, 198 px spare |
+| 3 | 386 | yes, 134 px spare |
+| 4 | 450 | yes, 70 px spare |
+| 5 | 514 | yes, 6 px spare |
 
-440 → **500**, and the second line is the whole of the difference: 440
-held two one-line rows with 17 px spare and holds two two-line rows 47 px
-short. 500 is the smallest round number that holds the two-monitor case,
-which is what a laptop-plus-external-screen desktop is. The table is here
-rather than in prose because the first draft of the *previous* fix said
-400, claimed two outputs fit, and was wrong by 23 px — so a test asserts
-the two-output case instead of prose claiming it.
+The window used to be 560×500 with every section stacked in one column;
+what the split view bought is that the page holds five outputs where the
+column held two, and the tallest page (Keyboard: two captions, two cards,
+four rows) needs 287 px. Past five outputs the page **scrolls** — the
+content column is a `Scroll` — rather than clipping.
 
 This is written down because getting it wrong is not a cosmetic bug. The
 window was 440×320 while its tree measured ~400 px tall, and a flex
@@ -685,7 +705,7 @@ doing:
   a label *does* have a smaller honest version if it is allowed to say
   so with an ellipsis, and its floor is then `…` plus three characters
   rather than zero.
-- The dialog declares 560×500 as the window's **minimum** via
+- The dialog declares 760×520 as the window's **minimum** via
   `SetWindowLimits`, so the server refuses a drag that would put the tree
   back into less space than it needs. There is no maximum.
 
@@ -725,17 +745,24 @@ be wrong.
 ### Everything is `hey`-addressable
 
 ```console
+$ hey nitro-settings do sidebar/nav_displays click        # show a page
 $ hey nitro-settings set displays/HDMI-A-1/scale value 2
-$ hey nitro-settings set keyboard/layout value de
+$ hey nitro-settings set keyboard/layout value de         # from any page
 $ hey nitro-settings do apply click
 $ hey nitro-settings get status value
 applied
+$ hey nitro-settings get pages value                      # 0..3
+$ hey nitro-settings get title value                      # Displays
 ```
 
 Rows are named by connector, so `displays/HDMI-A-1/primary` is stable
-across reboots and hotplugs. The captions in front of the fields are
+across reboots and hotplugs. The sidebar rows are `sidebar/nav_displays`,
+`nav_keyboard`, `nav_audio`, `nav_appearance`; their icons
+`displays_icon` and so on. The labels in front of the fields are
 deliberately unnamed: a label named `layout` beside the field named
-`layout` would make the short path ambiguous.
+`layout` would make the short path ambiguous. A control on a page that
+is not showing is listed with `hidden` in its flags and still takes a
+`set`.
 
 ### Three limitations, stated rather than discovered
 
@@ -770,7 +797,8 @@ value. See `docs/wm.md`.
 
 ### Appearance
 
-One checkbox, **Dark**, writing `theme.scheme`. Unlike every other
+One switch, **Dark**, writing `theme.scheme` (role `checkbox`, so
+`hey nitro-settings set dark value true` flips it). Unlike every other
 control in the window it does not wait for Apply: it saves on the spot,
 and the desktop changes colour within a frame. A colour scheme is the one
 setting you judge by looking at it, so asking the user to confirm
