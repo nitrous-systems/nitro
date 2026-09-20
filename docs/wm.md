@@ -740,6 +740,126 @@ it may have been holding a modifier whose release will never arrive.
 Failure to open the socket is not fatal: a sandbox with no netlink loses
 hotplug, not the keyboard it already has.
 
+## Overview mode
+
+Designed in #3785, not yet built; the chain that builds it hangs off that
+task. The GNOME study the design is drawn from, with the measurements
+below in full, is `docs/research/overview.md`.
+
+An **overview** is a WM mode in which every `Normal`-layer window on an
+output is scaled down in place and laid out so all of them are visible at
+once, with an app icon and a caption per thumbnail, and a search field
+over the top. It is what a bare-Super tap will open instead of the plain
+launcher, and it absorbs the launcher rather than sitting beside it.
+
+### Server-side, because the primitive is already here
+
+The obvious alternative was a screencopy wire message letting a shell
+client receive window contents and draw the grid in the toolkit. It was
+rejected, and the reasoning is worth keeping because the cost is not
+obvious:
+
+* **The server can already scale a live window.** `Scene::set_transform`
+  takes an arbitrary affine and a framed window's root is a
+  `ClientId::SERVER`-owned group, so `set_transform(SERVER, frame,
+  scale(s))` scales the client's own content node — and the same call
+  from the client is `Err(NotOwner)`. The privilege boundary is already
+  correct; the capability needs no new wire surface, no new capability
+  bit, and no new grant.
+* **A client-side overview is strictly more expensive.** It pays the
+  identical downscale (the cost is `blit`'s, not the server's), plus a
+  buffer copy across a socket, plus per-frame buffer churn per thumbnail.
+* **And it is the most security-sensitive thing this protocol could
+  grow** — one client reading every other client's pixels — which
+  `docs/shell.md` §Deferred says cannot even be scoped today for want of
+  a peer identity.
+
+Liveness comes free: a thumbnail *is* the window, so a thumbnail of a
+playing video plays.
+
+### The number that constrains the whole design
+
+`nitro-raster`'s `blit` has a 1:1 fast path gated on `one_to_one` in
+`blit_impl` — source and destination the same size, destination
+integer-aligned. Miss it and every pixel costs a bilinear fetch of two
+texel pairs plus a blend. Measured on this box, release, 1920x1080 XRGB
+destination, 1280x800 source:
+
+| path | ns/px |
+|---|---|
+| 1:1 blit, `Xrgb8888` — today's ordinary window path | ~0.2 |
+| scaled blit, `Xrgb8888` | ~12 |
+| scaled blit, `Argb8888` | ~16 |
+
+**A ~57x per-pixel cliff**, and the ratio is the load-bearing part: the
+1:1 figure is memory-bandwidth-bound and moves by about 2x with machine
+state. The cost is destination-area dominated and so nearly independent
+of window count — a grid covering 67 % of a 1080p screen costs **17.0 ms**
+with 4 thumbnails and **17.5 ms** with 25. Against §Measured's 0.19 ms
+mean / 0.32 ms max server paint, a naively-redrawn overview is 50-90x the
+whole frame budget and misses vsync outright.
+
+**The desktop is damage-driven, and that is what makes the design work.**
+Nothing repaints until something changes, so a *settled* overview costs
+nothing: a scale change damages old ∪ new once, and the next update
+produces empty damage. A settled 16-window overview with one animating
+client costs about 1 ms.
+
+So: **animating position is affordable, animating scale is not.** Entering
+and leaving interpolate the slots' positions and fade a scrim; the scale
+itself is set once. A scale animation would rescale every thumbnail every
+frame and regress the desktop to missed vsync. Anything that later wants
+one must first add a downscale cache in `nitro-raster` — measured at
+1.04 ms per thumbnail paid on change, turning the 17.3 ms per-frame cost
+into 0.37 ms. **This is the easiest regression in the tree to reintroduce
+by accident**, so overview mode carries a test asserting that a settled
+overview produces no damage.
+
+### Two hazards of the scaled transform
+
+**A scaled window is still live and still interactive.** `input::hit` →
+`window_local` inverts the world transform, so without an explicit rule a
+click on a thumbnail is delivered to that client as an ordinary click at
+scaled-down local coordinates. Overview mode must swallow it — and the
+rule is **scoped by layer**, not global: pointer events over
+`Layer::Normal` windows are swallowed and reinterpreted as thumbnail
+selection, while `Overlay` and `Top` windows route normally, which is what
+keeps the search field and its result rows clickable. `hit_test` resolves
+topmost-first, so `Overlay` naturally wins over the thumbnails beneath it.
+
+**Scaling re-rasterizes text.** `TextEngine::paint` computes
+`device_size = run.size_px * scale` and `GlyphKey` quantizes size to
+1/64 px, so a scaled title bar rasterizes a fresh glyph set and pollutes
+the atlas. Decorations are therefore **hidden** in overview — which
+`FrameNodes::all()` already does for fullscreen (§States) — and each
+thumbnail's icon and caption are drawn **unscaled** instead. GNOME does
+the same, for its own reasons.
+
+### Scope and geometry
+
+* **Per output**, like the MRU list and the z-order (§Multi-output).
+* The layout area is the **work area**, not the output rect: the bar stays
+  visible over the overview, because the bar is how you leave.
+* The window set is `Layer::Normal` only — the bar, the wallpaper and the
+  search overlay are not thumbnails — and **includes** `Minimized` ones. A
+  minimized window keeps its geometry and its place in the MRU order
+  (§States), so including it is free, and an overview that could not reach
+  a minimized window would be a worse `Alt+Tab`.
+* The layout itself is GNOME's `UnalignedLayoutStrategy`, ported: aspect
+  ratios preserved, ragged rows, one global scale fitted to the area,
+  windows sorted vertically into rows and horizontally within one, slots
+  floored to the pixel grid. `docs/research/overview.md` §2 has the
+  algorithm and the constants.
+
+The search UI stays in `nitro-launcher` as an `Overlay` client — the seam
+is layers, which already work — so the server draws only scaled windows it
+already owns, a scrim, and per-thumbnail icon and caption nodes, all of
+which are `Rect`/`Icon`/`Text` nodes `wm::build_frame` already builds.
+The trigger rework and the launcher's absorption are a behaviour change to
+a working interaction; they are specified with the task that makes them,
+and `docs/shell.md` §Hotkeys changes there rather than here.
+
+
 ## Damage
 
 Unchanged, and the reason a drag is cheap: moving a window damages **old ∪
@@ -943,6 +1063,16 @@ reasoning**, and the second is the one worth carrying:
 * **Workspaces / virtual desktops.** Not in M3 at all. The MRU list and
   the z-order are per *output*, and nothing in the model assumes there is
   only ever one set of them, so this is an addition rather than a rework.
+  §Overview mode is the nearest neighbour and is deliberately *not* a
+  workspace feature: it is one output's windows arranged at once, with no
+  second set to switch between. GNOME's overview carries a workspace strip
+  and a rounded workspace-background card; nitro's has neither, and
+  adding workspaces later would add a strip rather than rework the grid.
+* **Per-window opacity in overview.** The scrim fades and the slots
+  interpolate their positions; the *scale* does not animate, on measured
+  grounds (§Overview mode). A scale animation needs a downscale cache in
+  `nitro-raster` first — the lever is recorded with its number so nobody
+  re-measures it.
 * **Cursor *themes*.** The six shapes are compiled-in ASCII art
   (§Cursor shapes); loading an XCursor theme off the box — a file format,
   a search path and a fallback policy — is not in M4. Nor is

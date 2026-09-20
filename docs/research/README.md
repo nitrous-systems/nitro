@@ -1,11 +1,13 @@
-# Design research: what GNOME and macOS share, and what nitro does about it
+# Design research: how other desktops solve a problem, and what nitro does about it
 
-Two measured analyses of the layout every current desktop converges on —
-**categories / places on the left, content on the right** — and the
-column that matters: which of the traits they share nitro implements in
-the split-view blueprint (`docs/ui.md`, "Split view blueprint",
-`crates/nitro-ui/src/split.rs`), which it approximates, and which it
-cannot do and why.
+Measured analyses of designs nitro is deliberately borrowing from, each
+ending in the column that matters: which traits nitro implements, which
+it approximates, and which it cannot do and why.
+
+**Application chrome** — the layout every current desktop converges on,
+**categories / places on the left, content on the right** — against the
+split-view blueprint (`docs/ui.md`, "Split view blueprint",
+`crates/nitro-ui/src/split.rs`):
 
 * [`gnome-settings-files.md`](gnome-settings-files.md) — GNOME 45–47
   (libadwaita) Settings and Files: split view, sidebar rows, boxed-list
@@ -14,11 +16,20 @@ cannot do and why.
   Settings and Finder: sidebar, form groups, AppKit semantic colours,
   radii, spacing.
 
+**The desktop shell itself**:
+
+* [`overview.md`](overview.md) — GNOME's Activities overview: the window
+  grid layout algorithm (read from `gnome-shell` source, not inferred
+  from pictures), slot geometry measured off screenshots, search and the
+  `Escape` ladder, the zero-window and many-window cases. It also carries
+  the **architecture decision** for nitro's own overview, with the
+  measurements it rests on — the summary is `docs/wm.md` §Overview mode.
+
 The screenshots and SCSS the analyses cite live in the gitignored
 `tmp/research/`; the numbers were read off them and are reproduced in
 the documents, so the PNGs are not needed in-tree.
 
-## The shared traits, and nitro's answer
+## The shared traits of application chrome, and nitro's answer
 
 | # | trait | GNOME | macOS | in nitro |
 |---|---|---|---|---|
@@ -37,3 +48,11 @@ The three "no"s — shadows, vibrancy, window corner radius above 6 — are
 all the same fact: they are things the *compositor* draws, and nitro's
 scene draws solid and gradient rects, text and icons. Everything a
 toolkit can do with those, the blueprint does.
+
+`overview.md` hits the same three "no"s from the other side, which is
+why it is filed here rather than being only a design note: GNOME's
+overview blurs its backdrop, shadows its thumbnail chrome and
+spring-scales its windows, and every one of those is a GPU compositor
+effect nitro drops. The pattern generalises — what nitro copies from
+another desktop is its *arrangement*, and what it declines is whatever
+that desktop's compositor draws for free.
