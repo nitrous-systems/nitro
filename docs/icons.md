@@ -70,7 +70,7 @@ server, off a real readback) assert that inequality.
 ships beside the crate as `LICENSE.bootstrap-icons` and is recorded in
 `DEPENDENCIES.md`'s vendored-assets section.
 
-47 icons, in six groups:
+53 icons, in six groups:
 
 | group | names |
 |---|---|
@@ -78,8 +78,8 @@ ships beside the crate as `LICENSE.bootstrap-icons` and is recorded in
 | status | `battery` `battery-half` `battery-full` `battery-charging` `volume-up` `volume-down` `volume-mute` `wifi` `wifi-off` `cpu` `memory` `hdd` |
 | settings | `display` `keyboard` `speaker` `palette` `sliders` `gear` |
 | window controls | `x` `dash` `square` `arrows-angle-expand` |
-| files | `folder-fill` `folder2-open` `file-earmark` `file-earmark-text` `file-earmark-image` `file-earmark-zip` `file-earmark-code` `file-earmark-font` `file-earmark-play` `file-earmark-music` |
-| general | `sun` `moon` `arrow-left` `arrow-up` `recycle` `check` `circle-fill` `exclamation-triangle` `info-circle` |
+| files | `folder-fill` `folder2-open` `file-earmark` `file-earmark-text` `file-earmark-image` `file-earmark-zip` `file-earmark-code` `file-earmark-font` `file-earmark-play` `file-earmark-music` `download` `headphones` `images` `film` `trash3` |
+| general | `sun` `moon` `arrow-left` `arrow-up` `chevron-right` `recycle` `check` `circle-fill` `exclamation-triangle` `info-circle` |
 
 **One substitution from the list the task named**, and it is worth
 recording because it is a property of the upstream set rather than a
@@ -90,6 +90,15 @@ silently draw the wrong shape. `arrow-counterclockwise` and
 `arrow-repeat` are identically affected (95 of the 2 078 upstream icons
 are). `recycle` carries the same "refresh, go round again" meaning in a
 single nonzero path and is used instead.
+
+Two more substitutions of the same kind, from the split-view work
+(`docs/ui.md`, "Split view blueprint"). `music-note-beamed` — and
+`music-note`, `music-note-list` — mix fill rules exactly as
+`arrow-clockwise` does, so `nitro-files`' Music place uses
+**`headphones`**. And `image` (singular) draws its frame 0.002 px past
+the 16-unit grid, which `no_ink_is_clipped_by_the_box` refuses because
+that sliver would be clipped at every size; **`images`** is drawn inside
+the grid and reads the same at 16 px, so Pictures uses it.
 
 ### Adding one
 
@@ -122,7 +131,7 @@ swash, so the icon set costs **no new external crate**.
 Bootstrap's paths use SVG arcs heavily (~22 000 `A`/`a` commands across
 the full upstream set), and zeno 0.3.3 *implements* arcs but its parser
 mishandles **implicit repeated arc argument sets** — `a rx ry φ f1 f2 x y
-rx ry φ f1 f2 x y` with the command letter written once. 13 of our 47
+rx ry φ f1 f2 x y` with the command letter written once. 13 of the original 47
 icons are written that way.
 
 The dangerous part is the failure mode: `render_into` reports **no
@@ -184,8 +193,8 @@ Keyed by `(icon index, device px)` → an **A8 coverage mask**.
   is two entries, exactly as a glyph at two sizes is.
 
 **No eviction**, matching the glyph atlas, and for a sharper reason: the
-set is *closed*. 47 icons at the four recommended sizes is 47 × (256 +
-576 + 1 024 + 2 304) ≈ **190 KB** — the whole set, everywhere, at every
+set is *closed*. 53 icons at the four recommended sizes is 53 × (256 +
+576 + 1 024 + 2 304) ≈ **215 KB** — the whole set, everywhere, at every
 size a desktop lays out at. `IconEngine::MAX_BYTES` is 2 MiB, an order of
 magnitude past that, and a raster that would cross it is refused rather
 than evicting something: an LRU for a bounded set answers a question that

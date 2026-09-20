@@ -437,6 +437,7 @@ mod tests {
             "arrow-left",
             "arrow-up",
             "arrows-angle-expand",
+            "chevron-right",
             "list",
             "sliders",
         ];

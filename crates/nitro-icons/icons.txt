@@ -19,7 +19,6 @@
 # importer refuses to flatten into one path. `recycle` carries the same
 # "refresh / go round again" meaning in a single nonzero path, so it is used
 # instead.
-
 arrow-left
 arrow-up
 arrows-angle-expand
@@ -29,10 +28,12 @@ battery-full
 battery-half
 calculator
 check
+chevron-right
 circle-fill
 cpu
 dash
 display
+download
 exclamation-triangle
 file-earmark
 file-earmark-code
@@ -42,11 +43,14 @@ file-earmark-music
 file-earmark-play
 file-earmark-text
 file-earmark-zip
+film
 folder-fill
 folder2-open
 gear
 hdd
+headphones
 house
+images
 info-circle
 keyboard
 list
@@ -60,6 +64,7 @@ speaker
 square
 sun
 terminal
+trash3
 volume-down
 volume-mute
 volume-up
