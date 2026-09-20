@@ -7,7 +7,7 @@
 //! engine directly — that is `src/engine.rs`'s own tests' job, and mixing
 //! the two would let a UI bug hide behind a passing state machine.
 
-use nitro_calc::{Calc, build};
+use nitro_calc::{Calc, build, min_window};
 use nitro_ui::event::key;
 use nitro_ui::test::Harness;
 use nitro_ui::widgets::Label;
@@ -21,9 +21,48 @@ use nitro_ui::{Size, WidgetId};
 /// the pointer. The rows shrink to fit (they have the default
 /// `flex_shrink`), which is the same path a real `Configure` to a small
 /// screen takes — so this is the awkward case, not a soft one.
+///
+/// The width is the window's own declared minimum (277 px; see
+/// [`nitro_calc::min_window`]), because since #3783 a narrower window is
+/// one the server would refuse to let the user drag to — a test opening
+/// it would be testing a state that no longer exists. The *height* is
+/// still well short of what the tree wants, which is the awkwardness
+/// this harness is here for.
 fn harness() -> Harness<Calc> {
-    Harness::sized("calc", Calc::new(), Size::new(240.0, 228.0), build)
+    Harness::sized("calc", Calc::new(), Size::new(277.0, 228.0), build)
 }
+
+/// Every keypad button's addressing name, in tree order.
+///
+/// The grid assertions want *all* of them rather than a sample: a button
+/// that was the odd one out is exactly the one a sample would miss.
+const BUTTONS: [&str; 19] = [
+    "clear",
+    "backspace",
+    "negate",
+    "divide",
+    "7",
+    "8",
+    "9",
+    "times",
+    "4",
+    "5",
+    "6",
+    "minus",
+    "1",
+    "2",
+    "3",
+    "plus",
+    "0",
+    "point",
+    "equals",
+];
+
+/// The gap between buttons, and half the window's padding. Mirrors the
+/// `GAP` the tree is built with; a copy because it is private there, and
+/// the assertions below would be circular if they read it from the code
+/// under test.
+const GAP: f32 = 6.0;
 
 /// The widget named `name`, found the way `hey` finds it.
 fn named(h: &mut Harness<Calc>, name: &str) -> WidgetId {
@@ -39,6 +78,12 @@ fn display(h: &mut Harness<Calc>) -> String {
 fn history(h: &mut Harness<Calc>) -> String {
     let id = named(h, "history");
     h.widget::<Label>(id).text().to_owned()
+}
+
+/// The laid-out box of the widget named `name`.
+fn box_of(h: &mut Harness<Calc>, name: &str) -> nitro_ui::Rect {
+    let id = named(h, name);
+    h.bounds(id)
 }
 
 /// Click the buttons named by `names`, in order.
@@ -329,5 +374,202 @@ fn nothing_is_sent_while_it_sits_there() {
     let mut h = harness();
     click_all(&mut h, &["7", "plus", "8", "equals"]);
     h.assert_idle(200);
+    h.quit();
+}
+
+#[test]
+fn every_field_survives_the_minimum_window() {
+    // Issue #614: the calculator could be dragged small enough that
+    // fields vanished. The window now declares a minimum, so the
+    // interesting question is whether *that* size is actually habitable
+    // — a minimum the tree does not fit in is a lie, not a fix.
+    let mut h = harness();
+    let min = min_window(h.ui());
+    h.configure(min);
+    h.settle();
+
+    let check = |h: &mut Harness<Calc>, when: &str| {
+        for name in BUTTONS.iter().copied().chain(["display", "history"]) {
+            let b = box_of(h, name);
+            assert!(
+                b.w > 0.0 && b.h > 0.0,
+                "{name} has no box at the declared minimum {min:?} ({when}): {b:?}"
+            );
+        }
+        // And the bottom row is *inside* the window, not merely non-zero:
+        // a keypad pushed past the edge is the same bug with a box.
+        let e = box_of(h, "equals");
+        assert!(
+            e.y + e.h <= min.h,
+            "the last keypad row bottoms out inside the window ({when}): \
+             {e:?} in {min:?}"
+        );
+    };
+    check(&mut h, "empty");
+
+    // The half that fails without eliding labels. Fifteen digits is what
+    // the engine allows, and a label that wrapped them to a second line
+    // would make the *column* taller — pushing the keypad's bottom row
+    // out of a window the user cannot make any bigger by shrinking. A
+    // minimum computed from one-line labels does not close that; the
+    // labels being one line by construction does.
+    type_text(&mut h, "123456789012345");
+    h.settle();
+    assert_eq!(display(&mut h), "123456789012345");
+    check(&mut h, "after a fifteen-digit entry");
+
+    // And with the history line at its longest too: two full entries and
+    // an operator is the widest string this calculator can put up there.
+    type_text(&mut h, "*123456789012345=");
+    h.settle();
+    assert_eq!(history(&mut h), "123456789012345 × 123456789012345 =");
+    check(&mut h, "with a full history line");
+    h.quit();
+}
+
+#[test]
+fn the_keypad_is_a_grid() {
+    // "The button sizes are non-uniform, they should all have the same
+    // size" — the other half of #614.
+    //
+    // `grow` divides the *leftover* space equally; it does not equalise
+    // sizes. Left at their natural basis the buttons stayed apart by
+    // exactly the difference between their glyphs (`⌫` measures twice
+    // what `C` does), and the last row had three children dividing what
+    // the others split four ways. So: one explicit width for every cell,
+    // and `=` a real two-cell span rather than a row with a different
+    // child count.
+    //
+    // Checked at several sizes, not just the default: the equal basis is
+    // what makes them equal at rest, and `grow` proportional to the span
+    // is what keeps them equal under a `Configure`. A fix that only did
+    // the first would pass at one width and fail at every other.
+    let mut h = harness();
+    let min = min_window(h.ui());
+    for size in [
+        min,
+        Size::new(320.0, 240.0),
+        Size::new(500.0, 400.0),
+        Size::new(300.0, 700.0),
+    ] {
+        h.configure(size);
+        h.settle();
+
+        let cell = box_of(&mut h, "7");
+        for name in BUTTONS {
+            if name == "equals" {
+                continue;
+            }
+            let b = box_of(&mut h, name);
+            assert!(
+                (b.w - cell.w).abs() < 0.01 && (b.h - cell.h).abs() < 0.01,
+                "at {size:?} the {name} button is {b:?}, not the {cell:?} \
+                 every other cell is"
+            );
+        }
+
+        // `=` is two cells and the gap it bridges — not "a bit wider",
+        // and not a third of a row.
+        let eq = box_of(&mut h, "equals");
+        let want = cell.w * 2.0 + GAP;
+        assert!(
+            (eq.w - want).abs() < 0.01,
+            "at {size:?} `=` spans {:?}, not two cells plus the gap ({want})",
+            eq.w
+        );
+        assert!(
+            (eq.h - cell.h).abs() < 0.01,
+            "at {size:?} `=` is {:?} tall, not a cell's {:?}",
+            eq.h,
+            cell.h
+        );
+
+        // And the row it is in ends where the others do: a span that
+        // overshot would be uniform and still wrong.
+        let divide = box_of(&mut h, "divide");
+        assert!(
+            (eq.x + eq.w - (divide.x + divide.w)).abs() < 0.01,
+            "at {size:?} the last row ends at {} and the first at {}",
+            eq.x + eq.w,
+            divide.x + divide.w
+        );
+    }
+    h.quit();
+}
+
+#[test]
+fn the_window_declares_its_tree_as_its_minimum() {
+    // The fix for "it can be resized until the fields vanish" is a
+    // minimum the *server* enforces: a client that merely clamped its
+    // own layout would draw a letterbox inside a window the user is
+    // still shrinking.
+    //
+    // The assertion leans on a property of `Ui::set_window_limits` that
+    // makes it a real test rather than a restatement: **re-declaring the
+    // same limits sends nothing.** So a second call with exactly
+    // `(min_window, no maximum)` producing no message is proof that
+    // those are the limits already on the wire — it cannot pass if the
+    // calculator declared a smaller minimum, a different maximum, or
+    // none at all. A control follows: different limits *do* produce a
+    // message, so the silence above is the de-duplication and not a dead
+    // tap.
+    //
+    // What this does not claim is that the server honours them; that is
+    // `a_resize_respects_the_limits_the_client_declared` in
+    // `crates/nitro-server/tests/wm.rs`, which drives a real edge drag.
+    let mut h = harness();
+    h.settle();
+    let min = min_window(h.ui());
+
+    // No maximum: a calculator is happy as big as the screen allows.
+    let no_max = Size::ZERO;
+    h.tap();
+    h.ui()
+        .set_window_limits(min, no_max)
+        .expect("re-declare the same limits");
+    h.flush();
+    assert!(
+        !h.mutations().iter().any(|m| m.op == "SetWindowLimits"),
+        "re-declaring the same limits sends nothing, so the calculator \
+         had already declared min={min:?} max={no_max:?}; it sent {:?}",
+        h.mutations(),
+    );
+
+    // The control: the tap is live and this path does emit.
+    h.ui()
+        .set_window_limits(Size::new(100.0, 100.0), no_max)
+        .expect("declare different limits");
+    h.flush();
+    assert!(
+        h.mutations().iter().any(|m| m.op == "SetWindowLimits"),
+        "a *different* minimum does reach the wire, so the silence above \
+         was de-duplication rather than a dead tap: {:?}",
+        h.mutations(),
+    );
+    // Put the real limits back: a test that leaves the control's 100×100
+    // installed is a trap for whoever adds an assertion after it.
+    h.ui()
+        .set_window_limits(min, no_max)
+        .expect("restore the calculator's own limits");
+    h.flush();
+    h.ui().tap(false);
+
+    // And the minimum is derived, not declared: it is at least as wide
+    // as the keypad's own cells and as tall as its rows' floors, so
+    // there is no size at which the tree is asked to fit in less than it
+    // measures. Checking it against the *laid-out* keypad is what makes
+    // this catch a keypad that grew a row while the number stayed put.
+    h.configure(min);
+    h.settle();
+    let clear = box_of(&mut h, "clear");
+    let equals = box_of(&mut h, "equals");
+    assert!(
+        equals.x + equals.w + GAP * 2.0 <= min.w + 0.01,
+        "the minimum width holds the whole keypad: {equals:?} in {min:?}"
+    );
+    assert!(
+        clear.h >= 18.0,
+        "and a row at the minimum is still a tappable height: {clear:?}"
+    );
     h.quit();
 }

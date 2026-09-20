@@ -110,6 +110,26 @@ to exponential rather than printing a screenful of zeros.
 went on computing with a number nobody can see would be worse than one
 that stops.
 
+**The window has a floor, and it is measured.** The calculator declares a
+minimum size through `SetWindowLimits`, so the server refuses a drag that
+would resize the fields away — a client that merely clamped its own
+layout would draw a letterbox inside a window the user is still
+shrinking. Unlike `nitro-settings`, which publishes a fixed
+`WINDOW_SIZE`, this one is *derived*: the keypad table's own shape, the
+rows' minimum height, and the width of fifteen digits measured in the
+display's own font. Add a key with a wider glyph and the minimum moves
+with it. Both labels elide rather than wrap, because a label that wrapped
+would answer "less width" with "more height" and push the bottom row of
+keys out of a window that is already as small as it may be.
+
+**Every keypad button is the same size.** `grow` divides the *leftover*
+space, which does not equalise anything — so every button is given the
+same explicit width basis (the widest glyph in the table plus the theme's
+button padding), and `=` spans two cells by asking for two cells' worth
+of both basis and stretch. `hey nitro-calc get window/display value`
+still answers with the whole number even when the display is painting an
+ellipsis: elision is a painting decision, not a truncation of the text.
+
 ## What it costs
 
 One keypress changes one thing — the display's string — and what that
@@ -133,6 +153,16 @@ widget, and keys go through the real keymap. It covers the click path,
 the key path, the two mixing freely, `C`, error recovery, the
 fifteen-digit cap, a `Configure` resize stretching the keypad, real ink
 on real pixels, Tab order, the mutation count and the idle silence.
+
+Two of them are about the window's *shape* rather than its arithmetic,
+and they are the ones that keep issue **#614** closed:
+`every_field_survives_the_minimum_window` shrinks the window to its own
+declared minimum and asserts every button and both labels still have a
+box inside it — with a fifteen-digit entry and a full history line up,
+which is the case a wrapping label would break by making the column
+*taller*. `the_keypad_is_a_grid` asserts every button is the same size at
+four different window sizes, with `=` exactly two cells plus the gap it
+bridges.
 
 `crates/nitro-hey/tests/calc_end_to_end.rs` does the same through the
 socket with the real `hey` binary, asserting the commands in this README.

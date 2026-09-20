@@ -58,12 +58,18 @@ fn ok(o: &Output) -> String {
 ///
 /// The window has to fit the harness's 320×240 output *with its
 /// decorations on*: since M3 the server frames a window with a 28 px title
-/// bar and a 1 px border, so a 240×228 window is a 242×257 thing on screen
-/// and its bottom rows fall off the output — which would make `shot`
-/// return a clipped crop rather than the whole window. See
-/// `nitro-calc/tests/calc.rs` for why a window that does not fit matters.
+/// bar and a 1 px border, so a 277×204 window is a 279×233 thing on screen
+/// and anything taller has its bottom rows fall off the output — which
+/// would make `shot` return a clipped crop rather than the whole window.
+/// See `nitro-calc/tests/calc.rs` for why a window that does not fit
+/// matters.
+///
+/// 277×204 is not a spare number: it is the calculator's own declared
+/// minimum (`nitro_calc::min_window`), and since #3783 the server would
+/// refuse to let a user drag the window below it — so opening smaller
+/// here would test a state that no longer exists.
 fn harness() -> (Harness<Calc>, PathBuf) {
-    let mut h = Harness::sized("nitro-calc", Calc::new(), Size::new(240.0, 200.0), build);
+    let mut h = Harness::sized("nitro-calc", Calc::new(), Size::new(277.0, 204.0), build);
     h.open_socket("nitro-calc");
     h.settle();
     let dir = h.socket_dir().expect("socket dir");
