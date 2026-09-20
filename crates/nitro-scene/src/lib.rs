@@ -14,6 +14,46 @@
 //! * [`Scene::paint_list`] and [`Scene::hit_test`] skip any subtree whose
 //!   cached extent misses the region or point they were given.
 //!
+//! # What "proportional to change" does and does not promise
+//!
+//! It is proportional to the number of **changed nodes**, not to the number
+//! of nodes whose *pixels* change — and the gap between those two is worth
+//! stating, because the promise above is easy to over-read.
+//!
+//! A mutation to a group's bounds or transform drags its whole subtree
+//! along: every descendant's world state must be recomputed, because a
+//! descendant carries no dirty flag of its own. [`Scene::update`] therefore
+//! costs one visit **per child of the moved group**, including children
+//! that are entirely outside the clip in force both before and after and
+//! so cannot paint either way.
+//!
+//! The shape that makes this expensive is a *tall unvirtualised subtree
+//! under a clipper*: a scrolling column of 50 000 rows in a 480-px viewport
+//! costs ~50 000 visits and ~2.1 ms of pure scene walk to move by one row,
+//! of which ~470 in every 500 are invisible throughout. The walk cannot be
+//! made sublinear by culling alone, either — the per-child loop is O(n)
+//! regardless, since each child costs at least a dirty-flag read and a
+//! bounds union. Going genuinely sublinear needs a spatial index over
+//! children, which this crate does not have.
+//!
+//! **It does not have one because nothing in this tree needs it, and that
+//! is a load-bearing expectation of clients rather than an accident.**
+//! Every long list here virtualises: the terminal materialises screen rows
+//! only and keeps scrollback in its model, the UI list materialises the
+//! visible rows plus two "whether the model holds a hundred rows or a
+//! hundred thousand", and the one unvirtualised tall-child shape (a scroll
+//! viewport over a single taller child) has one in-tree user bounded at
+//! twenty entries. A client that builds an unvirtualised 50 000-row column
+//! and scrolls it will find the cliff, and the answer is to virtualise
+//! rather than to expect the scene graph to absorb it.
+//!
+//! `a_tall_clipped_column_costs_a_walk_per_content_row` in
+//! `tests/stress.rs` pins the present cost, and carries the measurements
+//! and the reasoning for why culling the descent was prototyped during
+//! #3745 and deliberately not taken. `docs/bench.md` §7.5 has the wider
+//! context, including why a scroll's *damage* — as distinct from its walk
+//! — is already within 6 % of minimal.
+//!
 //! ```
 //! use nitro_core::{Color, Damage, IRect, Point, Rect, Size};
 //! use nitro_scene::{ClientId, DamageSink, Fill, Layer, NodeKind, OutputId, Scene};

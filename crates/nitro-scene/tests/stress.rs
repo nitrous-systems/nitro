@@ -7,8 +7,8 @@
 
 mod common;
 
-use common::{CLIENT, OUT, damage, rect, scene, settle, update, window};
-use nitro_core::{Color, IRect, Point, Rect, Transform};
+use common::{CLIENT, OUT, damage, group, rect, scene, settle, update, window, window_at};
+use nitro_core::{Color, IRect, Point, Rect, Size, Transform};
 use nitro_scene::{Fill, NodeKey, NodeKind, Scene};
 
 /// Build `groups` groups of `per_group` rects each, laid out on a grid, and
@@ -309,4 +309,143 @@ fn a_thousand_updates_do_not_leak_damage_or_work() {
     // The tree is exactly as big as it was.
     assert_eq!(s.node_count(), 11_001);
     assert!(damage(&mut s).is_empty());
+}
+
+/// The benchmark's `scroll` scene: a fixed clipper at the viewport with a
+/// taller content column inside it, `rows` rows of 16 px.
+fn scroll_scene(rows: usize) -> (Scene, NodeKey) {
+    let mut s = scene();
+    // 640x480 window at the origin, as `nitro-bench scroll` builds it.
+    let (_, root) = window_at(&mut s, Point::ZERO, Size::new(640.0, 480.0));
+    let clipper = group(&mut s, root, Rect::new(0.0, 0.0, 640.0, 480.0));
+    s.set_clip(CLIENT, clipper, true).unwrap();
+    let content = group(
+        &mut s,
+        clipper,
+        Rect::new(0.0, 0.0, 640.0, rows as f32 * 16.0),
+    );
+    for i in 0..rows {
+        rect(
+            &mut s,
+            content,
+            Rect::new(0.0, i as f32 * 16.0, 640.0, 15.0),
+        );
+    }
+    settle(&mut s);
+    (s, content)
+}
+
+/// Scroll the content group up by `frame` rows.
+fn scroll_to(s: &mut Scene, content: NodeKey, rows: usize, frame: usize) {
+    let offset = -((frame % rows) as f32 * 16.0);
+    s.set_bounds(
+        CLIENT,
+        content,
+        Rect::new(0.0, offset, 640.0, rows as f32 * 16.0),
+    )
+    .unwrap();
+}
+
+/// **A characterisation test, not an aspiration.** It pins the cost that is
+/// there today so that a change making it *worse* fails loudly.
+///
+/// Translating a group sets `Dirty::TRANSFORM`, so the walk descends into
+/// every child to recompute world state — even the ~470 of every 500 rows
+/// that are entirely outside the clip rectangle both before and after. The
+/// walk is therefore proportional to **content** rows, not visible ones: at
+/// 50 000 rows it is `visited_nodes` = 50 003 and ~2.1 ms of pure scene walk
+/// per frame (measured; `docs/bench.md` §7.5).
+///
+/// **This is a known cliff and it is deliberately unfixed.** Culling the
+/// descent was prototyped and measured during #3745 and not taken, for two
+/// reasons worth recording so the next reader does not re-derive them:
+///
+/// 1. **No in-tree client pays it.** Every long list in this tree
+///    virtualises: `nitro-term` materialises screen rows only (scrollback
+///    lives in the model, never in the scene), `nitro_ui::List` materialises
+///    `visible + 2` "whether the model holds a hundred rows or a hundred
+///    thousand", and the one unvirtualised tall-child shape,
+///    `nitro_ui::Scroll`, has a single in-tree user bounded at 20 results.
+///    At the benchmark's own n=500 culling saved ~9 µs against 1 616 µs of
+///    server CPU — well under 1 % of the frame.
+/// 2. **Culling is not free and not local.** The sound version leaves a
+///    skipped node's `world_transform` stale, which is safe for `paint_list`
+///    and `hit_test` (both key off `subtree_bounds`, which stays `EMPTY`)
+///    but *not* for `Scene::device_bounds`, which recomputes from that
+///    cache and was measured returning a stale rectangle for a culled node.
+///    A wider contract change than the win justifies while (1) holds.
+///
+/// If an unvirtualised tall column ever appears in a client, this test is
+/// where the decision gets revisited — and `visited_nodes` is the right
+/// probe for it, because unlike `damage_px_mean` it counts work done rather
+/// than pixels claimed, so it cannot be satisfied by a corrupt screen
+/// (`docs/bench.md` §11 D).
+#[test]
+fn a_tall_clipped_column_costs_a_walk_per_content_row() {
+    for rows in [500usize, 2000] {
+        let (mut s, content) = scroll_scene(rows);
+        scroll_to(&mut s, content, rows, 1);
+        let (_, stats) = update(&mut s);
+        // Window root + clipper + content group + every row.
+        assert_eq!(
+            stats.visited_nodes,
+            rows + 3,
+            "the walk is proportional to content rows, not visible ones \
+             ({rows} rows)"
+        );
+    }
+}
+
+/// The other half of the characterisation: the cost above is specific to
+/// dragging a whole subtree along. Dirtying one row's fill still costs one
+/// path however tall the column — so the cliff is about `descend_all`, not
+/// about the tree being big.
+#[test]
+fn dirtying_one_row_of_a_tall_column_still_costs_one_path() {
+    let rows = 2000;
+    let (mut s, content) = scroll_scene(rows);
+    let first = s.node(content).unwrap().children()[0];
+    s.set_fill(CLIENT, first, Fill::Solid(Color::BLACK))
+        .unwrap();
+    let (dmg, stats) = update(&mut s);
+    // Root + clipper + content + the one row.
+    assert_eq!(stats.visited_nodes, 4);
+    assert_eq!(stats.damaged_nodes, 1);
+    assert!(!dmg.is_empty());
+}
+
+/// A scroll damages the viewport because a scroll *changes* the viewport —
+/// the test that refutes the fix issue #570 recommended.
+///
+/// The proposal was to damage only the two thin bands at the leading and
+/// trailing edges of a pure translation. That is true of a framebuffer
+/// already blitted and false of a scene graph that has not been: shifting a
+/// column of differently-coloured rows past a fixed viewport gives
+/// essentially every pixel its neighbour's colour, so the damage really is
+/// viewport-sized (450 of 480 rows genuinely change; the 30 that do not are
+/// the 1-px inter-row gaps). Asserting it here means a future
+/// "optimisation" that shrinks the damage to the exposed 640x16 = 10 240 px
+/// band fails *in this crate*, instead of shipping and being discovered as
+/// a frozen screen.
+#[test]
+fn scrolling_damages_the_viewport_not_the_exposed_band() {
+    let rows = 500;
+    let (mut s, content) = scroll_scene(rows);
+    scroll_to(&mut s, content, rows, 1);
+    let (dmg, stats) = update(&mut s);
+    assert!(stats.damaged_nodes > 0);
+
+    let area: i64 = dmg
+        .rects()
+        .iter()
+        .map(|r| i64::from(r.w) * i64::from(r.h))
+        .sum();
+    // The viewport is 640x480 = 307 200 px, and the damage is essentially
+    // all of it. The exposed band alone would be 10 240.
+    assert!(
+        area > 250_000,
+        "a scroll must damage ~the viewport, got {area} px; \
+         see docs/bench.md §7.5 and §11 D"
+    );
+    assert!(area <= 307_200, "and never more than the viewport: {area}");
 }

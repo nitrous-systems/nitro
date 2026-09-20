@@ -759,17 +759,54 @@ which the server's own counters account for 834 µs of paint and 361 of
 copy.
 
 The window is 640 × 480 = 307 200 pixels, so **a one-row scroll damages
-0.998 of the viewport**: essentially exactly one full viewport repaint,
-every frame, to move the content up sixteen pixels. State it plainly as
-the finding it is: **this server repaints the viewport rather than
-blitting it, so the cost of a scroll is the size of the viewport and not
-the size of the exposed line.** X11's `CopyArea` moved the existing
-pixels and repainted only the newly exposed row — 640 × 16 = 10 240
-pixels. 306 560 ÷ 10 240 is a factor of **~30**, and it is the factor to
-quote. §9 adds that the figure does not move with the refresh rate —
-306 560 px at 60, 120 and 240 Hz alike, for 1 616 / 1 599 / 1 522
-µs/frame — so a scroll costs a viewport repaint per frame however often
-frames happen.
+0.998 of the viewport**. The obvious reading of that — and the one this
+document carried, and the one issue #570 was filed on — is that the
+server repaints a viewport where `CopyArea` repainted a 640 × 16 = 10 240
+pixel line, a factor of **~30** waiting to be reclaimed. **That reading
+is wrong, and the measurement that retires it is a different measurement
+from the one above.**
+
+The question the damage figure cannot answer on its own is *how many
+viewport pixels genuinely differ across a one-row scroll*. Sampling the
+paint list per scanline either side of the mutation and comparing the
+resolved top colour:
+
+| | px |
+|---|---|
+| viewport rows that genuinely change | **450 of 480** |
+| genuinely-changed pixels | **288 000** |
+| `damage_px` reported | **306 560** |
+| the "exposed line" the ~30× compared against | 10 240 |
+
+**450 of 480 rows change**, and the 30 that do not are the scenario's own
+1-px inter-row gaps (`row_h - 1.0`, one per 16 px, 480 ÷ 16 = 30), which
+stay gaps under a 16-px shift. With solid content — a terminal, a file
+list — it is 480 of 480. This is obvious once stated: scrolling a column
+of *differently coloured* rows past a fixed viewport gives every pixel
+its neighbour's colour. A probe at the dead centre of the viewport, 240
+px from either edge, shows it directly — the row painting `(320, 240)`
+has fill 15 before the mutation and fill 16 after.
+
+So the finding, stated correctly: **the server's damage for a scroll is
+306 560 px against a true minimum of 288 000 — 1.06×, within 6 % of
+minimal.** The excess is `Damage`'s documented rect-merge policy in
+`crates/nitro-core/src/damage.rs` collapsing the region to its bounding
+box, which is a trade that crate makes on purpose. There is no 30× of
+damage to reclaim, because there is no 30× of damage. **What `CopyArea`
+bought was never less damage — it was cheaper pixels: the same area,
+moved instead of re-rasterized.**
+
+That also disposes of the fix #570 recommended ("damage the symmetric
+difference of a pure translation, not the union"). It is true of a
+framebuffer that has already been blitted and false of a scene graph that
+has not: damaging the two thin bands would leave **267 520 px stale** —
+the whole viewport interior frozen at the previous frame with only the
+top and bottom edges animating. It is not a smaller correct answer, it is
+an incorrect one, and §11 D records what that would have done to a test.
+
+§9 adds that the figure does not move with the refresh rate — 306 560 px
+at 60, 120 and 240 Hz alike, for 1 616 / 1 599 / 1 522 µs/frame — so a
+scroll costs the same per frame however often frames happen.
 
 A previous version of this document reported 675 696 px, "2.2
 viewports", and explained the excess as the age-2 damage union plus the
@@ -781,12 +818,49 @@ clipper that actually clips, the number is a clean one-viewport repaint
 and the finding *survives in a stronger form* — there is no longer a
 residual to explain away.
 
-That is a real difference from X11's model and not obviously the wrong
-choice: a blit-based scroll needs the server to prove nothing else
-changed in the region, and at 1.6 ms a viewport repaint fits inside a
-16.7 ms budget ten times over. But it is the number to point at if
-`nitro-term` ever wants a fast full-screen scroll, and the number a
-copy-based optimisation would have to beat.
+**The recoverable factor is ~2× on paint, not ~30× on damage**, and it is
+filed as **#592** with its ceiling attached. This section's own run puts
+`paint_us` at 834 µs and `copy_us` at 361 (#592 quotes 815 and 373 from a
+neighbouring sitting; the difference is this box's run-to-run drift, not
+a disagreement). A `memmove` of 640 × 464 px XRGB8888 is 27 µs here, so
+the paint side is compressible to ~27 µs plus one 640 × 16 exposed band.
+The copy side is *not*, without per-buffer translation accumulators: the
+scanout buffer handed out at frame *n* was on screen at *n−2*, so serving
+it by translation needs a two-frame (32 px) delta plus repair. And
+`damage_px_mean` will not move at all — it is `region_area` of
+`repaint_region`, which is `damage(n) ∪ damage(n−1)`, the region the
+age-2 back buffer is behind by (`crates/nitro-server/src/frame.rs`).
+Those pixels genuinely differ between that buffer and the screen and must
+be written whatever the scene graph concludes. So roughly 1 616 → ~800
+µs/frame: real, worth having, and not 30×.
+
+**One claim in the issue does need narrowing, and it is the issue's best
+paragraph.** "A 500-row list and a 50 000-row list scroll for the same
+client cost" is true on the wire — one `SetBounds`, 52 bytes, whatever
+the height — and false in the server, where the update walk is
+proportional to *content* rows rather than visible ones:
+
+| rows | `visited_nodes` | update walk |
+|---|---|---|
+| 500 | 503 | 22 µs |
+| 5 000 | 5 003 | 215 µs |
+| 50 000 | 50 003 | **2 138 µs** |
+
+At 50 000 rows the scene walk alone is 2.1 ms/frame, and ~470 of every
+500 rows are entirely outside the clip rectangle both before and after.
+**No client in this tree pays it**, and that is the load-bearing part:
+`nitro-term` materialises screen rows only (slots are `row *
+SLOTS_PER_ROW` for `row in 0..grid().rows()`; scrollback lives in the
+model, never in the scene), `nitro_ui::List` is explicitly `visible + 2`
+"whether the model holds a hundred rows or a hundred thousand", and the
+one unvirtualised tall-child shape, `nitro_ui::Scroll`, has a single
+in-tree user bounded at `MAX_RESULTS = 20`. The cliff is real and it is
+unoccupied; `crates/nitro-scene/src/lib.rs` records it, and
+`a_tall_clipped_column_costs_a_walk_per_content_row` in
+`crates/nitro-scene/tests/stress.rs` pins the present behaviour so it
+fails if anyone makes it worse. Culling the walk was prototyped and
+measured during this task and **not taken** — the reasoning is with the
+test.
 
 ### 7.6 `create` — menus and tooltips are cheap
 
@@ -1248,16 +1322,65 @@ differently than they did.
   fixed clipper at the viewport with a moving content group inside it
   gives 304 768 — 0.99 of the viewport — and the finding behind #570 came
   out *cleaner*, with nothing left to explain away (§7.5).
+- **D — an instrument that was right, and a reading of it that was not.**
+  The three above are instrument defects: a scenario measuring a
+  different scene from the one its name described. This one is not, and
+  that is why it is worth the space. `scroll`'s 306 560 damage pixels
+  were **correct** — they reproduce exactly, at every content size and
+  every refresh rate. What was wrong was the inference drawn from them:
+  that a viewport's worth of damage to move content by one row meant the
+  server was repainting ~30× more than it needed to, because `CopyArea`
+  repainted only the exposed 640 × 16 line. Nobody checked the quantity
+  that claim rests on — *how many viewport pixels genuinely differ* — and
+  when it is measured it is **450 of 480 rows, 288 000 px**, against
+  306 560 damaged. The server was within 6 % of minimal the whole time,
+  and 10 240 px is what `CopyArea` *repainted*, not what changed; the
+  ~30× compared two different quantities (§7.5).
 
-Three properties, three regression tests, and one rule they share: each
+  **The part worth keeping is what the proposed proof would have done.**
+  #570 named its own acceptance test: damage the symmetric difference of
+  the translation instead of the union, and assert `damage_px_mean` falls
+  from ~304 768 to ~20 000. That test would have **passed on a visibly
+  corrupt screen** — 267 520 px of viewport interior frozen at the
+  previous frame, only the top and bottom bands animating — because the
+  metric it asserts on is a proxy for "the server is not doing
+  unnecessary work", and a server that does not do *necessary* work
+  satisfies it beautifully. A test that certifies the bug is worse than
+  no test.
+
+  That is the third time this batch, and the sibling cases make the rule
+  rather than the anecdote: **#566**'s parity-dependent bound, and
+  **#584**'s one-screenshot test that proved *a* frame arrived but not
+  that frames *keep* arriving. All three assert that a proxy metric
+  moved, rather than the property the metric was standing in for. The
+  rule, and the better probe in each case:
+
+  > **Assert the property, not the proxy.** If the assertion can be
+  > satisfied by a system that is broken in the direction the metric does
+  > not look, it is not a test of the property.
+
+  For #584 the property is *frames keep arriving*, so the probe is two
+  screenshots separated in time, not one. For #566 it is the bound
+  holding at both parities, not at the one sampled. For #570 the property
+  is *the walk does not touch what it cannot paint*, and the probe is
+  `visited_nodes` (`UpdateStats`, `crates/nitro-scene/src/scene.rs`) —
+  which, unlike `damage_px_mean`, **cannot be satisfied by a corrupt
+  screen**, because it counts work done rather than pixels claimed.
+
+Four properties, four regression tests, and one rule they share: each
 test asserts the property the bad number violated, not the shape of the
 code that produced it. Note also what none of them were: a wrong
-formula, a mis-parsed field, a unit error. Every one was a scenario
-quietly measuring a *different scene* from the one its name and this
-document described, while every counter around it stayed self-consistent.
+formula, a mis-parsed field, a unit error. A, B and C were each a
+scenario quietly measuring a *different scene* from the one its name and
+this document described, while every counter around it stayed
+self-consistent. **D is the one that was not an instrument defect at
+all** — the counter was right, the scene was the one described, and the
+error was entirely in the sentence the number was turned into. It is the
+harder failure to catch, because there is nothing in the code to find.
 
-All five are the same lesson, and it is the one this project keeps
-relearning — from `docs/latency.md`'s saturated-display trap, from the
+**Those five** — the flip-interval verdict, the folded bandwidth loop, and
+A, B and C — are one lesson, and it is the one this project keeps
+relearning: from `docs/latency.md`'s saturated-display trap, from the
 `boing-node` resampling bug in §7.7, and from #3711:
 
 > **The instrument agreed with the code because it was measuring the
@@ -1268,25 +1391,43 @@ Neither does a fire burning in a corner of its buffer, or a rect that
 never moved: they report a number, and the number goes in a table, and
 the table goes in a document like this one.
 
+**D is the exception that makes the rule precise, and it is the more
+uncomfortable case.** There the instrument did *not* agree with the code
+by measuring the layer below the broken one — there was no broken layer.
+The number was right, and it was turned into a sentence that did not
+follow from it, and the sentence was quoted onward into an issue, a table
+row and a recommended fix. Checking the instrument would not have caught
+it; only measuring the quantity the claim actually rested on did. So the
+two halves are worth stating together: **verify that the instrument
+measures the scene you described, and then verify that the conclusion
+measures the quantity it names.**
+
 ## 8a. The three worst numbers, filed
 
 A benchmark that ends in a document is half a benchmark. The three
-findings below are the worst numbers in the matrix and each is an open
-issue, so that a future run has something to close rather than a
-paragraph to re-read.
+findings below were the worst numbers in the matrix and each was filed as
+an issue, so that a future run has something to close rather than a
+paragraph to re-read. **Two of the three are now closed, and they closed
+in different ways**: #569 by a change that made the cost go away, #570 by
+a measurement that showed the finding was a misreading of a correct
+number. The second kind is worth filing for too.
 
 | issue | the number | what it is |
 |---|---|---|
 | **#568** | `paint_us_mean` **11 757 µs** for a fullscreen 1080p repaint — **71 %** of the 60 Hz frame, and more than a whole 120 Hz frame | Fullscreen rows across three scenarios — rotozoom, starfield at all three N, balls — do genuinely different work per frame (a per-pixel gather, two thousand moving stars, thirty-two circles) and report near-identical server costs: **16 525–16 741 µs, paint 10 963–11 757**, because the server's work is a function of damaged area alone. A least-squares fit through `putimage`'s four damage/paint points extrapolates to ~3 060 µs at 2 073 600 px against the 11 000–11 800 measured, so **a fullscreen repaint is ~3.8× more expensive per pixel than a large partial one** — and §9.6 adds the constraint that the excess is *proportional to area rather than fixed per frame*: at 720p every scenario's ns/px falls rather than rises, so the thing to profile is the per-pixel path at full-surface damage and not a setup cost. |
 | **#569** | ~~`upload_us` **2 570–6 044 µs/frame** at 1080p~~ → **0**, and the server's `pread` with it | **Fixed.** The client now renders straight into a mapping of its own sealed memfd and the server maps the same file read-only, so two of the frame's three passes over the pixels are gone. Measured either side in one sitting: `docs/bench-49d023b.jsonl` and §7.10 below. `upload_us` is 0 on every row, server CPU/frame falls 13–50 %, and `boing` crosses the 60 Hz budget and doubles to 60 fps. The seal check (`F_SEAL_SHRINK`, `F_SEAL_GROW`, `F_SEAL_SEAL`, verified with `F_GET_SEALS`) is what makes the mapping sound against a hostile client; `crates/nitro-shm/README.md` carries the argument and the residuals. Scope was always the escape hatch: the retained path never paid this (§7.7's 83.5 µs) and is unchanged — `boing-node` is the control row and does not move. |
-| **#570** | a one-row scroll damages **304 768 px = 0.99× the viewport** | The wire side is excellent — one mutation, 52 bytes, independent of content height. The server side repaints the whole viewport where `CopyArea` moved a line and repainted only the exposed 640×16 = 10 240 px, a factor of ~30. Damaging the *symmetric difference* of a pure translation rather than the union would take this to ~20 000 px without touching the rasterizer, and `nitro-bench scroll` re-run is the proof it would land. It compounds with #568 for a fullscreen `nitro-term`. (The figure was 675 696 px in an earlier ledger, from a clipping group that clipped nothing; the issue is unchanged, its number is now honest — §7.5.) |
+| **#570** | ~~a one-row scroll damages **304 768 px = 0.99× the viewport**, a factor of ~30 against `CopyArea`~~ → **damage is within 6 % of minimal; the finding was a misreading** | **Retired, and the measurement is the interesting part.** The number was right and the reasoning was wrong. A one-row scroll of heterogeneous content genuinely changes **450 of 480 viewport rows = 288 000 px** (the 30 that do not are the scenario's own 1-px inter-row gaps; with solid content it is 480 of 480), because shifting differently-coloured rows past a fixed viewport gives every pixel its neighbour's colour. Reported damage is **306 560 px against a true minimum of 288 000 — 1.06×**, the excess being `Damage`'s documented rect-merge policy (`crates/nitro-core/src/damage.rs`). So there is no 30× to reclaim: **what `CopyArea` bought was not less damage but cheaper pixels**, and the recommended fix (damage the symmetric difference) would have left 267 520 px stale — see §11 D, because the test it proposed as proof would have certified the bug. The real prize is ~2× on `paint_us`, filed as **#592** with its ceiling attached, and `damage_px_mean` cannot move at all: it is `damage(n) ∪ damage(n−1)`, pixels that genuinely differ from the age-2 back buffer. §7.5 carries the full argument. (The figure was 675 696 px in an earlier ledger, from a clipping group that clipped nothing.) |
 
-Two of the three are about the same underlying thing — **the server's cost
-is proportional to damaged area, and the damage it computes is larger
-than the area that actually changed.** That is not a contradiction of
-`DESIGN.md` goal 1 so much as a statement of where the goal is currently
-achieved at the wrong granularity: proportional to what the *scene graph*
-thinks changed, rather than to what the pixels did.
+**#568 is about the server's cost being proportional to damaged area**,
+and that is a statement about the *rasterizer's* per-pixel path at full‑
+surface damage, not about the scene graph's arithmetic. An earlier
+version of this paragraph generalised it to two of the three — "the
+damage it computes is larger than the area that actually changed" — on
+the strength of #570. That generalisation does not survive #570's
+retirement: its damage is 1.06× the area that actually changed, which is
+the scene graph getting the granularity **right**. The sentence is
+narrowed rather than deleted because it is exactly the kind of
+plausible‑sounding summary that outlives the finding it was drawn from.
 
 ## 9. Refresh rate: 60 Hz, 120 Hz and 720p@240, measured
 
