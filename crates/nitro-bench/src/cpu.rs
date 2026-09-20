@@ -59,8 +59,9 @@ impl CpuTicks {
     /// is actually asking for.
     ///
     /// The split is kept in the struct because it diagnoses: a pixel-push
-    /// scenario that is all `stime` is spending its life in `pread` and
-    /// `write`, and one that is all `utime` is spending it in the effect.
+    /// scenario that is all `stime` is spending its life in the kernel —
+    /// socket writes, and before #569 the `pwrite`/`pread` of the buffer
+    /// too — and one that is all `utime` is spending it in the effect.
     #[must_use]
     pub fn total(&self) -> u64 {
         self.utime + self.stime

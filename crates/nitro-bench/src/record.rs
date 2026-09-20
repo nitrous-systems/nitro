@@ -91,9 +91,18 @@ pub struct Record {
     pub rx_bytes: u64,
     /// Total microseconds spent in the effect itself (pixel scenarios).
     pub compute_us: u64,
-    /// Total microseconds spent writing pixels into the memfd, kept apart
-    /// from `compute_us` because "the effect is slow" and "the upload is
-    /// slow" have completely different fixes.
+    /// Total microseconds the client spent handing pixels to the server.
+    ///
+    /// **Structurally zero since #569**, and kept for two reasons: every
+    /// ledger written before that carries real values here and must go on
+    /// parsing, and a column that reads 0 says "this cost is gone" where
+    /// a removed one would look like a changed report.
+    ///
+    /// What it used to count was the per-frame `pwrite` of the whole
+    /// buffer into the client's memfd, which the server then `pread` back
+    /// — 4–6 ms of a fullscreen 1080p frame on the test box. The client
+    /// now renders straight into a mapping of that memfd and the server
+    /// maps it too, so there is no copy left to time.
     pub upload_us: u64,
     /// Client `utime+stime` delta over the run, microseconds.
     pub client_cpu_us: u64,
@@ -236,12 +245,15 @@ impl Record {
         ratio(self.compute_us as f64, self.commits as f64)
     }
 
-    /// Microseconds spent writing pixels into the memfd per committed
+    /// Microseconds spent handing pixels to the server per committed
     /// frame.
     ///
-    /// Kept separate from [`Record::compute_us_per_frame`] because the
-    /// fix for a slow upload (smaller buffer, fewer bytes touched) has
-    /// nothing to do with the fix for a slow effect.
+    /// **Zero on any run since #569** — see [`Record::upload_us`]. On
+    /// older ledgers it is the per-frame `pwrite`, and reading it next to
+    /// [`Record::compute_us_per_frame`] is what told those runs whether a
+    /// slow frame was the effect or the upload. There is no upload left
+    /// to be slow, so on current data this column's only job is to show
+    /// that.
     #[must_use]
     pub fn upload_us_per_frame(&self) -> f64 {
         ratio(self.upload_us as f64, self.commits as f64)

@@ -48,7 +48,8 @@
 //!   account for the cost. Every scenario shares it, which is what makes
 //!   them comparable.
 //! * [`x11perf`] — the operation micro-benchmarks.
-//! * [`pixels`] — the client-buffer path: an effect uploaded every frame.
+//! * [`pixels`] — the client-buffer path: an effect rendered straight
+//!   into a mapped client buffer every frame.
 //! * [`nodes`] — the retained path: the same effects as scene mutations.
 //! * [`cpu`] — µs of CPU per presented frame, the number that does not
 //!   saturate at 60 Hz.

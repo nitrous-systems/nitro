@@ -341,7 +341,8 @@ fn the_required_seals_are_exactly_the_three() {
     assert!(!REQUIRED_SEALS.contains(SealFlags::WRITE));
 }
 
-/// The size of the audited surface, asserted rather than described.
+/// The size of the audited surface, asserted rather than described — in
+/// the code **and** in every document that quotes the number.
 ///
 /// `DEPENDENCIES.md`, this crate's `README.md` and `map.rs`'s own header
 /// all tell a reviewer how many `unsafe` blocks there are to audit. That
@@ -350,17 +351,28 @@ fn the_required_seals_are_exactly_the_three() {
 /// worse than none, because it tells an auditor they have seen
 /// everything when they have not.
 ///
-/// (It was already wrong once: the first draft of those docs said
-/// "three", having counted `from_raw_parts` and `from_raw_parts_mut` as
-/// one. Hence this test.)
+/// It has now been wrong twice. The first draft said "three", having
+/// counted `from_raw_parts` and `from_raw_parts_mut` as one; the fix
+/// updated three places and **missed a fourth** (`DEPENDENCIES.md`'s
+/// icons-comparison paragraph), which the reviewer of #569 then found by
+/// hand. The first version of this test could not have caught that: it
+/// counted blocks in `map.rs` and never read the documents. So it reads
+/// them now — the whole point is that no human should have to diff a
+/// number against four files again.
 #[test]
 fn the_unsafe_surface_is_exactly_what_the_docs_claim() {
+    const BLOCKS: usize = 4;
+    const WORD: &str = "four";
+    /// The number words a doc might use, so a stale one is caught rather
+    /// than merely "not found".
+    const NUMBER_WORDS: [&str; 6] = ["one", "two", "three", "four", "five", "six"];
+
     let map = include_str!("../src/map.rs");
     let blocks = map.matches("unsafe {").count();
     assert_eq!(
-        blocks, 4,
+        blocks, BLOCKS,
         "map.rs has {blocks} `unsafe` blocks; the docs (DEPENDENCIES.md, \
-         README.md, map.rs's header) all say four. Update them together \
+         README.md, map.rs's header) all say {WORD}. Update them together \
          with the code, or an auditor reads a count that no longer \
          describes what they must audit."
     );
@@ -382,6 +394,62 @@ fn the_unsafe_surface_is_exactly_what_the_docs_claim() {
         !include_str!("../src/lib.rs").contains(&mm_path),
         "src/lib.rs reaches for the mm module; the mapping must stay in map.rs"
     );
+
+    // Now the documents. Every place that quotes a count of this crate's
+    // `unsafe` blocks must quote the right one.
+    //
+    // The check is deliberately narrow: take the word **immediately**
+    // before "block(s)" on whitespace-normalised text, strip Markdown
+    // punctuation, and require that if it is a number word it is the
+    // right one. Two earlier versions were wrong in opposite directions,
+    // and both were caught only by reintroducing the reviewer's defect
+    // and watching what the test did:
+    //
+    //  * splitting on `\n` and asking whether the fragment mentioned a
+    //    number *and* "unsafe" silently **passed** the defect, because
+    //    `...and three` and `blocks in nitro-shm...` are different
+    //    fragments;
+    //  * scanning a 40-character window **failed on clean text**, because
+    //    "one `munmap` — four blocks" legitimately contains "one".
+    //
+    // Only the adjacent word carries the count, so only it is judged.
+    let quantifiers = |src: &str| -> Vec<String> {
+        let flat = src.split_whitespace().collect::<Vec<_>>().join(" ");
+        let words: Vec<&str> = flat.split(' ').collect();
+        let mut found = Vec::new();
+        for (i, w) in words.iter().enumerate() {
+            let bare = w
+                .trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase();
+            if (bare == "block" || bare == "blocks")
+                && let Some(prev) = i.checked_sub(1)
+            {
+                found.push(
+                    words[prev]
+                        .trim_matches(|c: char| !c.is_alphanumeric())
+                        .to_lowercase(),
+                );
+            }
+        }
+        found
+    };
+    for (path, src) in [
+        ("DEPENDENCIES.md", include_str!("../../../DEPENDENCIES.md")),
+        ("crates/nitro-shm/README.md", include_str!("../README.md")),
+        ("crates/nitro-shm/src/map.rs", map),
+        ("crates/nitro-shm/src/lib.rs", include_str!("../src/lib.rs")),
+    ] {
+        for q in quantifiers(src) {
+            assert!(
+                !(NUMBER_WORDS.contains(&q.as_str()) && q != WORD),
+                "{path} quotes \"{q} block(s)\" where this crate's `unsafe` \
+                 block count is {WORD}. Every document quoting this number \
+                 must agree with `map.rs`. The count has drifted twice \
+                 already, and the second time a reviewer had to find it by \
+                 hand."
+            );
+        }
+    }
 }
 
 /// The `unsafe` exception is scoped by two things, and one of them is a

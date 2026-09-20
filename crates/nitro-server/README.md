@@ -364,11 +364,14 @@ releases the mapping: the scene drops the buffer, whose store's `Drop` is
 the `munmap`. The server keeps no descriptor at all, because the mapping
 pins the file and `nitro-shm` closes the fd as soon as the pages are in.
 
-`DestroyBuffer` releases the descriptor as well as the pixels. The scene
-forgets the bytes on its own, but the fd is the server's, and a client
-that cycles buffers — create, damage, destroy, once per frame, which is
-the obvious way to push changing images — would otherwise leak one
-descriptor per frame until it hit the process limit.
+So what a client that cycles buffers — create, damage, destroy, once per
+frame, which is the obvious way to push changing images — must be given
+back is the **mapping**, not a descriptor. Without that it would leak an
+address-space range per frame until it exhausted `vm.max_map_count` or
+memory; `cycling_buffers_does_not_leak_the_clients_mappings` in
+`tests/fake_loop.rs` asserts it by counting `/proc/self/maps` entries by
+memfd name. Counting *descriptors* there would now assert nothing, since
+the server never holds one.
 
 **Placement and decoration.** A new window is **decorated** unless it
 passed `UNDECORATED`: the server wraps its group in a frame group it owns

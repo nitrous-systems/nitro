@@ -22,8 +22,11 @@
 //! them is how bandwidth claims go wrong:
 //!
 //! * **copy** — `dst[i] = src[i]` over a buffer: one read and one write
-//!   per byte. This is what the server's `pread` of a client buffer and
-//!   its copy into the scanout buffer both are.
+//!   per byte. This is what the server's copy of a painted frame into the
+//!   scanout buffer is. Until #569 a client buffer crossed memory twice
+//!   more on this path (the client's `pwrite`, the server's `pread`);
+//!   both are gone now that the buffer is mapped, which is why the
+//!   fullscreen pixel arm moved from ~3 copies per frame to one.
 //! * **write** — `dst[i] = value`: a write per byte and no read. This is
 //!   what an effect filling its own surface does, and it is *faster* than
 //!   a copy, so quoting a copy number for it would understate the

@@ -451,7 +451,7 @@ And 80 KB of `nitro-server` is not nothing against a binary this file's
 sibling `docs/budget.md` watches to the byte.
 
 The `unsafe` row is worth naming separately. This tree's deliberate
-exceptions are two and small — eleven lines in `nitro-seat` and three
+exceptions are two and small — eleven lines in `nitro-seat` and four
 blocks in `nitro-shm`, both of them a *kernel* contract (an fd we own, a
 mapping of a file the kernel has sealed against us) with a written proof
 and tests that assert the kernel's half of it. The crate route adds 43
