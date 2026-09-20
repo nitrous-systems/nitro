@@ -113,8 +113,13 @@ compute_layout(windows, num_rows):
     ideal_row_width = total_width / num_rows
     sorted = windows sorted by centre.y          # vertical sort -> which row
     for i in 0 .. num_rows-1:
-        greedily append windows while keep_same_row(...) or i is the last row
-        row.full_height = max over its windows of height * window_scale
+        for each remaining window w in sorted order:
+            width  = w.width  * window_scale(w)
+            height = w.height * window_scale(w)
+            row.full_height = max(row.full_height, height)   # <- before the test
+            if not (keep_same_row(row, w, width, ideal) or i is the last row):
+                break                                        # w goes to row i+1
+            append w to row; row.full_width += width
     for each row: sort its windows by centre.x   # horizontal sort -> order in row
     grid_width  = max row.full_width
     grid_height = Σ row.full_height
@@ -133,6 +138,15 @@ in a top row, and a window on the left stays on the left. The source calls this
 `keep_same_row`'s second clause is a nicety worth keeping: a row already at 90 %
 of ideal will still take a window that overshoots to 105 %, because 105 is
 closer to ideal than 90 is.
+
+Note the `full_height` bump is **read-ahead**: in `computeLayout`'s greedy loop
+(`workspace.js`) `row.fullHeight = Math.max(row.fullHeight, height)` runs
+*before* the `_keepSameRow(...) || (i === numRows - 1)` test, so it also executes
+for the window that fails the test and `break`s out — a window that ends up in
+the **next** row can still raise the height of the row it left. Surprising, and
+it is not cosmetic: `full_height` feeds `grid_height`, which feeds the layout
+scale, which moves every slot. Port it verbatim, quirk included, rather than
+tidying it into "max over the row's own windows".
 
 ### 2.3 Fitting to the area
 
@@ -482,5 +496,10 @@ nitro should keep its bar visible for the same reason: the bar is how you leave.
 The window set is `Layer::Normal` only — the bar, the wallpaper and the launcher
 are not thumbnails — and **includes** `WindowState::Minimized`, which GNOME also
 shows. A minimized window keeps its geometry and its place in the MRU order
-(`docs/wm.md` §States), so including it costs nothing and an overview that
-cannot reach a minimized window would be a worse `Alt+Tab`.
+(`docs/wm.md` §States), and an overview that cannot reach a minimized window
+would be a worse `Alt+Tab`. It is not free, though: `Minimized` is
+`visible = false` on the frame group (`Scene::set_window_state`) and
+`Server::showing` / `focusable` filter those windows out, so the overview owes
+**restore bookkeeping** — un-hide them on entry, re-hide exactly the set it
+un-hid on exit, and un-minimize before focusing when a minimized thumbnail is
+clicked, since `focusable` would otherwise make the focus a no-op.

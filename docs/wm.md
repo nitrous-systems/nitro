@@ -843,8 +843,12 @@ the same, for its own reasons.
 * The window set is `Layer::Normal` only — the bar, the wallpaper and the
   search overlay are not thumbnails — and **includes** `Minimized` ones. A
   minimized window keeps its geometry and its place in the MRU order
-  (§States), so including it is free, and an overview that could not reach
-  a minimized window would be a worse `Alt+Tab`.
+  (§States), and an overview that could not reach a minimized window would
+  be a worse `Alt+Tab`. It is not free: `Minimized` is `visible = false` on
+  the frame group and both `showing` and `focusable` skip it, so the
+  overview owes restore bookkeeping — un-hide on entry, re-hide exactly the
+  set it un-hid on exit, and un-minimize before focusing a clicked
+  thumbnail.
 * The layout itself is GNOME's `UnalignedLayoutStrategy`, ported: aspect
   ratios preserved, ragged rows, one global scale fitted to the area,
   windows sorted vertically into rows and horizontally within one, slots
