@@ -73,10 +73,29 @@
 //! All three stdio streams go to `/dev/null`. An application's stray
 //! `println!` would otherwise land in the launcher's own stdout, which on
 //! the test box is the compositor unit's journal.
+//!
+//! # Working directory
+//!
+//! The child runs in the **user's home**, or in the directory the entry's
+//! `Path=` names — which is the desktop-entry spec's default and its one
+//! override. Before this the child inherited the launcher's cwd, and the
+//! launcher inherits `nitro-session`'s, which under the systemd unit is
+//! `/`: a terminal started from the launcher opened at `kaspar@ubuntu:/`
+//! (issue #571). `$HOME` is used only when it is set **and** is a
+//! directory; with no usable home the child inherits, as before, rather
+//! than every launch failing on a `chdir`. A `Path=` is used as given: one
+//! that does not exist fails the spawn with "No such file or directory",
+//! which the launcher already shows, and is what the entry asked for.
+//!
+//! `Command` changes directory before it execs, so a *relative* program
+//! path with a slash in it (`./foo`) would resolve against the new
+//! directory. Nothing in practice does that — a bare name goes through
+//! `PATH` regardless of the cwd, and a `.desktop` `Exec=` is absolute or
+//! bare — but it is the one way the cwd can reach the exec.
 
 use std::os::fd::{AsFd as _, OwnedFd};
 use std::os::unix::process::CommandExt as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 use nitro_ui::{FdToken, Ui};
@@ -249,16 +268,31 @@ impl Children {
             .collect()
     }
 
-    /// Start `argv` detached, and remember the child so it can be reaped.
+    /// Start `argv` detached in the default working directory, and
+    /// remember the child so it can be reaped. [`Children::spawn_in`]
+    /// with no directory; see there.
+    ///
+    /// # Errors
+    /// As [`Children::spawn_in`].
+    pub fn spawn(&mut self, argv: &[String]) -> Result<u32, Error> {
+        self.spawn_in(argv, None)
+    }
+
+    /// Start `argv` detached in `dir` — or, for `None`, in the user's
+    /// home (module docs, *Working directory*) — and remember the child
+    /// so it can be reaped.
     ///
     /// # Errors
     /// [`Error::Empty`] for an empty argv, or [`Error::Spawn`] if the
     /// process could not be started at all — which for `execvp` means the
-    /// program was not found on `PATH`.
-    pub fn spawn(&mut self, argv: &[String]) -> Result<u32, Error> {
+    /// program was not found on `PATH`, and for a `dir` that does not
+    /// exist means the `chdir` before it.
+    pub fn spawn_in(&mut self, argv: &[String], dir: Option<&Path>) -> Result<u32, Error> {
         self.reap();
         let (program, rest) = argv.split_first().ok_or(Error::Empty)?;
-        let child = command(program, rest).spawn().map_err(Error::Spawn)?;
+        let child = command_in(program, rest, dir)
+            .spawn()
+            .map_err(Error::Spawn)?;
         let pid = child.id();
         // The descriptor that will say "this one exited". It is opened
         // here rather than in [`Children::watch`] so it is taken while
@@ -283,14 +317,24 @@ impl Children {
     }
 }
 
-/// The `Command` a launch runs, built but not spawned.
-///
-/// Separate from [`Children::spawn`] so a test can assert on what would
-/// be run — the environment subtraction and the stdio redirection are
-/// promises this module makes, and a test that had to actually start a
-/// process to check them would be asserting on something else.
+/// The `Command` a launch runs, built but not spawned, in the default
+/// working directory. [`command_in`] with no directory.
 #[must_use]
 pub fn command(program: &str, args: &[String]) -> Command {
+    command_in(program, args, None)
+}
+
+/// The `Command` a launch runs, built but not spawned, in `dir` — or, for
+/// `None`, in the user's home when there is one (module docs, *Working
+/// directory*).
+///
+/// Separate from [`Children::spawn_in`] so a test can assert on what would
+/// be run — the environment subtraction, the stdio redirection and the
+/// working directory are promises this module makes, and a test that had
+/// to actually start a process to check them would be asserting on
+/// something else.
+#[must_use]
+pub fn command_in(program: &str, args: &[String], dir: Option<&Path>) -> Command {
     let mut cmd = Command::new(program);
     cmd.args(args)
         .stdin(Stdio::null())
@@ -303,7 +347,29 @@ pub fn command(program: &str, args: &[String]) -> Command {
     // `setsid`; see the module docs for the half it is not and why that
     // half is a thing neither process has.
     cmd.process_group(0);
+    // The spec's default is the user's home; an entry's `Path=` is the
+    // override, and is used as given. Only a home that exists is used:
+    // a missing one must not turn every launch into a `chdir` failure.
+    match dir {
+        Some(dir) => {
+            cmd.current_dir(dir);
+        }
+        None => {
+            if let Some(home) = home_dir() {
+                cmd.current_dir(home);
+            }
+        }
+    }
     cmd
+}
+
+/// `$HOME`, when it is set, non-empty and a directory.
+#[must_use]
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+        .filter(|h| h.is_dir())
 }
 
 /// Where a nitro binary that sits next to the launcher would be.
@@ -415,6 +481,61 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(c.is_empty(), "the exited child was reaped");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_default_working_directory_is_the_users_home() {
+        // Issue #571: a terminal started from the launcher opened at `/`,
+        // the session's cwd under the unit. The spec's default is the
+        // home, and it is asked for on the `Command` rather than
+        // inherited. Read from the environment, never set: see the env
+        // test above for why a test binary must not `set_var`.
+        let cmd = command("/bin/true", &[]);
+        match home_dir() {
+            Some(home) => assert_eq!(cmd.get_current_dir(), Some(home.as_path())),
+            None => assert_eq!(cmd.get_current_dir(), None, "no usable home: inherit"),
+        }
+    }
+
+    #[test]
+    fn an_entrys_own_directory_wins_over_the_home() {
+        let dir = std::env::temp_dir();
+        let cmd = command_in("/bin/true", &[], Some(&dir));
+        assert_eq!(cmd.get_current_dir(), Some(dir.as_path()));
+    }
+
+    #[test]
+    fn a_launched_process_really_starts_in_the_directory_it_was_given() {
+        // The end-to-end shape of `Path=`: what the child sees as its
+        // cwd, not what the `Command` was told. Compared canonicalised,
+        // since `/tmp` is a symlink on some boxes.
+        let dir = std::env::temp_dir().join(format!("nitro-launcher-cwd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("pwd");
+        let mut c = Children::new();
+        c.spawn_in(
+            &[
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                format!("pwd > {}", marker.display()),
+            ],
+            Some(&dir),
+        )
+        .expect("spawn");
+        for _ in 0..200 {
+            if marker.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let seen = PathBuf::from(std::fs::read_to_string(&marker).unwrap_or_default().trim());
+        assert_eq!(
+            seen.canonicalize().expect("the child's cwd exists"),
+            dir.canonicalize().unwrap(),
+            "the child ran in the directory it was given"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

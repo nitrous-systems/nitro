@@ -84,6 +84,14 @@ pub struct Entry {
     /// for an icon called `firefox`" are different facts, and only the
     /// caller knows what a missing one should fall back to.
     pub icon: Option<String>,
+    /// `Path=`: the working directory the program asks to be run in, or
+    /// `None` when the file names none.
+    ///
+    /// The desktop-entry spec makes the user's home the default, and
+    /// [`crate::spawn`] supplies that; an entry that sets `Path=` gets
+    /// exactly what it asked for, existing or not. An empty `Path=` is
+    /// "no request", for the reason an empty `Icon=` is no icon.
+    pub path: Option<PathBuf>,
     /// Where it came from, for diagnostics and for the tests.
     pub source: Source,
 }
@@ -133,12 +141,13 @@ impl Entry {
 ///
 /// The path is carried through into [`Source::Desktop`] and is not read.
 #[must_use]
-pub fn parse(text: &str, path: &Path) -> Option<Entry> {
+pub fn parse(text: &str, file: &Path) -> Option<Entry> {
     let mut in_entry = false;
     let mut name = None::<String>;
     let mut exec = None::<String>;
     let mut kind = None::<String>;
     let mut icon = None::<String>;
+    let mut path = None::<PathBuf>;
     let mut terminal = false;
     let mut hidden = false;
     for line in text.lines() {
@@ -177,6 +186,7 @@ pub fn parse(text: &str, path: &Path) -> Option<Entry> {
             // empty name clears an icon node on the wire, so passing it
             // through would be a widget asking for nothing at all.
             "Icon" => icon = Some(value.to_owned()).filter(|v| !v.is_empty()),
+            "Path" => path = Some(value).filter(|v| !v.is_empty()).map(PathBuf::from),
             "Terminal" => terminal = is_true(value),
             "NoDisplay" | "Hidden" => hidden |= is_true(value),
             _ => {}
@@ -204,7 +214,8 @@ pub fn parse(text: &str, path: &Path) -> Option<Entry> {
         argv,
         terminal,
         icon,
-        source: Source::Desktop(path.to_path_buf()),
+        path,
+        source: Source::Desktop(file.to_path_buf()),
     })
 }
 
@@ -502,6 +513,22 @@ mod tests {
         assert!(e.runnable());
         assert_eq!(e.source, Source::Desktop(p()));
         assert_eq!(e.icon, None, "a file that names no icon asks for none");
+        assert_eq!(
+            e.path, None,
+            "and one that names no directory asks for none"
+        );
+    }
+
+    #[test]
+    fn the_working_directory_is_passed_through_when_asked_for() {
+        // `Path=` is the one way an entry overrides the spec's default of
+        // the user's home; the launcher does not check that it exists,
+        // since a spawn that fails on a bad one says so.
+        let e = parse("[Desktop Entry]\nName=X\nExec=x\nPath=/tmp\n", &p()).expect("an entry");
+        assert_eq!(e.path.as_deref(), Some(Path::new("/tmp")));
+        // An empty `Path=` is no request, not a request for "".
+        let e = parse("[Desktop Entry]\nName=X\nExec=x\nPath=\n", &p()).expect("an entry");
+        assert_eq!(e.path, None);
     }
 
     #[test]

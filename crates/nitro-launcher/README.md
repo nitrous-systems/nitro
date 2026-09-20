@@ -226,6 +226,13 @@ tests.
 and `process_group(0)` so a signal aimed at the launcher's group does not
 reach the application.
 
+The child runs in **`$HOME`**, or in the directory the entry's `Path=`
+names — the desktop-entry spec's default and its override. Before this it
+inherited the launcher's cwd, which under the session unit is `/`, so a
+terminal launched from here opened at `kaspar@ubuntu:/` (issue #571). A
+home that is unset or not a directory falls back to inheriting rather than
+failing every launch on the `chdir`.
+
 `NITRO_SHELL_SOCKET` is **removed** from the child's environment: it
 names the privileged socket, and an application started from the launcher
 is an ordinary application. The directory is `0700` and a determined

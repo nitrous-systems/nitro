@@ -323,6 +323,58 @@ fn entering_a_directory_follows_the_path_bar_and_up_comes_back() {
 }
 
 #[test]
+fn the_window_is_titled_after_the_directory_on_screen() {
+    // Issue #571: the bar read `nitro-files` next to `Calculator` and
+    // `Settings` — the binary name, because that was what the app was
+    // titled with. The title is the directory's basename, set from
+    // `navigate` and nowhere else, so every way of moving agrees with it;
+    // `/` has no name and gets the `.desktop` file's `Name=`.
+    let (root, dir) = fixture("title");
+    let sub = dir.join("sub");
+    write(&sub.join("inner.txt"), "inner");
+    let (mut h, ids) = app(&dir, &root.join("xdg"));
+    assert_eq!(
+        h.ui().window_title(),
+        "dir",
+        "the starting directory's name"
+    );
+
+    submit_path(&mut h, ids, &sub.display().to_string());
+    assert_eq!(h.state().cwd(), sub);
+    assert_eq!(
+        h.ui().window_title(),
+        "sub",
+        "the title followed the navigation"
+    );
+
+    // A navigation that is refused leaves the title alone with the
+    // listing: the user is still looking at `sub`.
+    submit_path(&mut h, ids, &sub.join("inner.txt").display().to_string());
+    assert_eq!(h.state().cwd(), sub);
+    assert_eq!(
+        h.ui().window_title(),
+        "sub",
+        "a refused navigation changes nothing"
+    );
+
+    submit_path(&mut h, ids, "/");
+    assert_eq!(h.state().cwd(), Path::new("/"));
+    assert_eq!(
+        h.ui().window_title(),
+        nitro_files::TITLE,
+        "the root has no name of its own, so the app's name stands in"
+    );
+    assert_eq!(
+        nitro_files::TITLE,
+        "Files",
+        "which is `Name=` in the .desktop file"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    h.quit();
+}
+
+#[test]
 fn a_path_submitted_in_the_bar_navigates_and_a_bad_one_only_complains() {
     // The failure mode this pins: a path bar that empties the list when
     // the user fat-fingers a directory name. A path that is missing, or

@@ -255,6 +255,7 @@ fn an_installed_file_replaces_the_builtin_rather_than_doubling_it() {
         argv: vec![bin.join(prog).to_string_lossy().into_owned()],
         terminal: false,
         icon: Some((*icon).to_owned()),
+        path: None,
         source: Source::Builtin,
     })
     .collect();

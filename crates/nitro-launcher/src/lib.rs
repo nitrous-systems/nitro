@@ -448,6 +448,7 @@ pub fn builtins() -> Vec<Entry> {
             argv: vec![dir.join(bin).to_string_lossy().into_owned()],
             terminal: false,
             icon: Some((*icon).to_owned()),
+            path: None,
             source: Source::Builtin,
         })
         .collect()
@@ -803,7 +804,7 @@ fn launch_index(s: &mut Launcher, ui: &mut Ui<Launcher>, index: usize) {
         return;
     }
     hide(s, ui);
-    match s.children.spawn(&entry.argv) {
+    match s.children.spawn_in(&entry.argv, entry.path.as_deref()) {
         Ok(_) => {
             // The child's pidfd joins the loop, so its exit is reaped the
             // moment it happens rather than at the next launch.
@@ -1203,6 +1204,7 @@ mod tests {
             argv: vec!["htop".to_owned()],
             terminal: true,
             icon: None,
+            path: None,
             source: Source::Builtin,
         };
         assert_eq!(row_text(&e), "htop (terminal)");
@@ -1229,6 +1231,7 @@ mod tests {
                 argv: vec!["/opt/nitro-calc".to_owned()],
                 terminal: false,
                 icon: Some("calculator".to_owned()),
+                path: None,
                 source: Source::Builtin,
             }]);
         l.rescan();
@@ -1286,6 +1289,7 @@ mod tests {
                 argv: vec!["/opt/nitro-calc".to_owned()],
                 terminal: false,
                 icon: Some("calculator".to_owned()),
+                path: None,
                 source: Source::Builtin,
             }]);
         l.rescan();

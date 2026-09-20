@@ -583,6 +583,7 @@ fn a_desktop_row_asks_for_a_coloured_icon_and_a_builtin_asks_for_a_symbolic_one(
             argv: vec!["/bin/echo".to_owned()],
             terminal: false,
             icon: Some("calculator".to_owned()),
+            path: None,
             source: Source::Builtin,
         }],
     );
@@ -1068,6 +1069,7 @@ fn a_builtin_is_launchable_with_no_desktop_files_at_all() {
             ],
             terminal: false,
             icon: Some("calculator".to_owned()),
+            path: None,
             source: Source::Builtin,
         }],
     );

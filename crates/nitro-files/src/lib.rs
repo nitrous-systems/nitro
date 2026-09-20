@@ -81,8 +81,29 @@ use nitro_ui::{App, Error, List, Row, Ui, WidgetId};
 
 use dir::{Entry, Kind, Sort};
 
-/// The app id, the window title and the name `hey` addresses.
+/// The app id and the name `hey` addresses. **Not** the window title:
+/// the bar's icon rule and `StartupWMClass` in `deploy/nitro-files.desktop`
+/// key on this, so it has to stay the binary name; what the user reads is
+/// [`title_for`].
 pub const APP_NAME: &str = "nitro-files";
+
+/// The human name, matching `Name=` in the `.desktop` file — what the
+/// window is called when the directory has no name of its own (`/`).
+pub const TITLE: &str = "Files";
+
+/// The window title for a directory: its basename, or [`TITLE`] when it
+/// has none. Finder-style — `src`, not `/home/k/src` and not
+/// `src — Files` — because the bar has one line and the path bar already
+/// says where you are.
+///
+/// `cwd` is always normalised by the time it gets here: [`navigate`] only
+/// sees [`dir::resolve`] output or the process's `current_dir`, both
+/// lexically normal and absolute, so `file_name()` is `None` only for `/`.
+#[must_use]
+pub fn title_for(cwd: &Path) -> String {
+    cwd.file_name()
+        .map_or_else(|| TITLE.to_owned(), |n| n.to_string_lossy().into_owned())
+}
 
 /// Initial window size: wide enough for a name, a size and a date.
 pub const WIDTH: f32 = 720.0;
@@ -684,7 +705,6 @@ fn install(ui: &mut Ui<Files>) {
     // toolkit's ordering gives that for free — `on_key` handlers see
     // only what the focused chain declined.
     ui.on_key(move |s: &mut Files, ui: &mut Ui<Files>, k: &KeyEvent| app_key(s, ui, k));
-    let _ = ui.set_window_title(APP_NAME);
 }
 
 /// The name of a sort order, for the status line.
@@ -885,6 +905,12 @@ pub fn navigate(s: &mut Files, ui: &mut Ui<Files>, to: PathBuf) {
     }
     s.cwd = to;
     s.message = None;
+    // The title follows the directory, and this is the only place it is
+    // set — so every way of getting somewhere agrees on what it is
+    // called. The setter drops an unchanged title, and `run` opens the
+    // window with this directory's title already, so the first pass here
+    // sends nothing.
+    let _ = ui.set_window_title(title_for(&s.cwd));
     cancel_edit(s, ui);
     // Rewrite the path bar with the **normalised** path, whatever the
     // user typed: submitting `~/src/../src/` should leave `/home/…/src`
@@ -1324,10 +1350,25 @@ pub fn start(ui: &mut Ui<Files>, state: &mut Files) -> Result<(), Error> {
 pub fn run() -> Result<(), Error> {
     let mut state = Files::here();
     let mut ui = App::new(APP_NAME)?
-        .title(APP_NAME)
+        .title(title_for(&state.cwd))
         .size(nitro_ui::Size::new(WIDTH, HEIGHT))
         .build(build)?;
     start(&mut ui, &mut state)?;
     let socket = nitro_ui::introspect::Socket::bind(APP_NAME).ok();
     nitro_ui::app::event_loop_with(&mut ui, &mut state, socket)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_title_is_the_directory_name_or_the_app_name() {
+        assert_eq!(title_for(Path::new("/home/k/src")), "src");
+        assert_eq!(title_for(Path::new("/home/k")), "k");
+        // The root has no name of its own, so the window is called what
+        // the `.desktop` file calls the program.
+        assert_eq!(title_for(Path::new("/")), TITLE);
+        assert_eq!(TITLE, "Files");
+    }
 }
