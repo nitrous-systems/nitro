@@ -456,32 +456,66 @@ mod tests {
         )
         .unwrap();
 
-        let mut c = Child::spawn(
-            "probe",
-            Role::Shell,
-            Path::new("/bin/sh"),
-            // `sh -c 'exec <bare>'` is `execvp` with the child's own
-            // `PATH`, which is exactly what a launcher does with an
-            // `Exec=` value.
-            &["-c".to_owned(), format!("exec {bare}")],
-            Some(&dir),
-        )
-        .expect("spawn");
-        let fd = c.as_fd();
-        let mut fds = [rustix::event::PollFd::new(
-            &fd,
-            rustix::event::PollFlags::IN,
-        )];
         let ts = rustix::event::Timespec {
             tv_sec: 5,
             tv_nsec: 0,
         };
-        rustix::event::poll(&mut fds, Some(&ts)).expect("poll");
-        assert_eq!(
-            c.reap(),
-            Some(Exit::Code(0)),
-            "the bare name resolved: a failed `exec` in `sh -c` exits 127"
+
+        // The probe is an image this process just wrote, and this is a
+        // multi-threaded test binary: `fork` copies the whole fd table,
+        // so any other test thread that forks in the window between the
+        // write's `open` and its `close` inherits a writable descriptor
+        // on the probe, and holds it until it `exec`s. `execve` refuses
+        // an image that is open for writing anywhere in the system with
+        // `ETXTBSY`, which `sh` reports as exit **126** — "found, but
+        // refused" — as distinct from the 127 of "not on `PATH`". That
+        // is a known Rust-level hazard, not a quirk of this test:
+        // rust-lang/rust#89522. The window is inherently racy but
+        // bounded, and closes as soon as the colliding child `exec`s, so
+        // retry the spawn a few times, which is what upstream advises.
+        let mut exit = None;
+        for attempt in 0..8 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let mut c = Child::spawn(
+                "probe",
+                Role::Shell,
+                Path::new("/bin/sh"),
+                // `sh -c 'exec <bare>'` is `execvp` with the child's own
+                // `PATH`, which is exactly what a launcher does with an
+                // `Exec=` value.
+                &["-c".to_owned(), format!("exec {bare}")],
+                Some(&dir),
+            )
+            .expect("spawn");
+            let fd = c.as_fd();
+            let mut fds = [rustix::event::PollFd::new(
+                &fd,
+                rustix::event::PollFlags::IN,
+            )];
+            rustix::event::poll(&mut fds, Some(&ts)).expect("poll");
+            exit = c.reap();
+            if exit != Some(Exit::Code(126)) {
+                break;
+            }
+        }
+        assert_ne!(
+            exit,
+            Some(Exit::Code(126)),
+            "`sh` found the probe on `PATH` and the kernel refused to \
+             `exec` it: 126 is `ETXTBSY` (another forked child still \
+             holds a writable fd on the freshly written image, \
+             rust-lang/rust#89522), not a `PATH` failure — retrying the \
+             spawn did not outlast the window"
         );
+        assert_eq!(
+            exit,
+            Some(Exit::Code(0)),
+            "the bare name resolved: in `sh -c`, an `exec` of a name not \
+             on `PATH` exits 127"
+        );
+
         assert_eq!(
             std::fs::read_to_string(&marker).unwrap_or_default().trim(),
             "resolved"
