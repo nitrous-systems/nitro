@@ -14,7 +14,6 @@ snappy here, it is snappy.
 | Libs | libseat 0.9, libinput 1.31, libdrm 2.4.131, libxkbcommon 1.13 |
 | Tools | `perf`, `ydotool`, `chvt`, rustup (`~/.cargo/bin`) |
 | Repo | `~/src/ai/nitro` — git remote `box`, push with `just box-push` |
-| Old stack | `~/src/ai/nitro-old`, `~/src/ai/gpui-solo` — reference only |
 
 ## Loop
 
