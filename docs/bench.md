@@ -1264,7 +1264,8 @@ was the largest remaining term on these rows — until #3728, which is
 Everything above §7.10a is the `1f35491` ledger and is left as measured.
 This section is a **third, separate sitting**, and its numbers come from
 `docs/bench-5e4b02e.jsonl` — not from editing the tables above. The
-reason it is added rather than substituted is stated plainly in §7.10b.6.
+reason it is added rather than substituted is stated plainly in §7.10b.6
+below.
 
 **Why the re-measure.** #3728 (`7509d73`, "Skip occluded passes and widen
 the 1:1 opaque blit store") landed two levers: skipping passes fully
@@ -1365,7 +1366,7 @@ caveat and it is unchanged here.
 | `starfield n=500` | 5.55 → **2.62** | 2.12 | 5.62 → **2.16** | 2.59 |
 | `starfield n=2000` | 5.67 → **2.60** | 2.18 | 5.64 → **2.19** | 2.58 |
 | `balls n=32` | 5.62 → **2.59** | 2.17 | *(1080p only — no `balls` in the reduced 720p matrix)* | — |
-| `boing-node` *(control)* | 56.68 → 57.07 | 0.99 | 57.81 → **38.39** | 1.51 |
+| `boing-node` *(control)* | 56.68 → 57.07 | 0.99 | 57.17 → **38.39** | 1.49 |
 | `starfield-nodes n=500` *(control)* | 2.51 → 2.52 | 1.00 | 1.84 → 1.80 | 1.02 |
 
 **ns/px fell at both sizes, on every pixel-arm scenario.** 1.07–2.77× at
@@ -1380,12 +1381,15 @@ shape that distinguishes "the remaining pass got cheaper per pixel" from
 the balls pair. That is a row the 720p arm never ran, not a blank
 measurement — saying which is the point of §11.1.
 
-`boing-node` at 720p is the one control that moves (57.81 → 38.39), and
-it is not a paint improvement: it damages 75 667 px there, the smallest
-damage in the matrix, and it went from 120.8 to 240.0 presented/s between
-the sittings. Its ns/px is dominated by per-frame overhead divided by a
-tiny area, which is exactly the regime §9.6 says ns/px is the wrong
-statistic for. At 1080p, where it damages 168 868 px, it is flat (0.99×).
+`boing-node` at 720p is the one control that moves (57.17 → 38.39), and
+it is not a paint improvement: it damages **76 509 px pre and 75 667 px
+post** — the smallest damage in the matrix, and the only row in either
+ns/px table whose damage differs between the sittings, because the ball
+is somewhere else when the window opens. It also went from 120.8 to
+240.0 presented/s between the sittings. Its ns/px is dominated by
+per-frame overhead divided by a tiny area, which is exactly the regime
+§9.6 says ns/px is the wrong statistic for. At 1080p, where it damages
+168 868 px in both, it is flat (0.99×).
 
 #### 7.10b.3 The `putimage` fit, recomputed — and why the old one cannot be reused
 
@@ -1431,10 +1435,23 @@ out at `size 720`:
 sensitive to which points enter the fit — 4.14× vs 2.16× on the *same*
 pre-fix ledger, purely from dropping the largest point — which is the
 honest reason #568's "~3.8×" and §8a's "~3 060 µs" and the issue's
-"~3 250 µs" never agreed. The slope is the durable part, and it is
-unambiguous: **1.241 → 0.919 µs/1000 px at 60 Hz (1.35× cheaper per
-pixel), 0.800 → 0.230 at 240 Hz**, measured on rows whose damage the
+"~3 250 µs" never agreed. The slope is the durable part, and **stated by
+one method throughout** — OLS over all of an arm's `putimage` points,
+the same fits as the tables above — it is
+**1.241 → 0.919 µs/1000 px at 60 Hz (1.35× cheaper per pixel) and
+0.965 → 0.459 at 240 Hz (2.10×)**, measured on rows whose damage the
 window clip *shrank*, which if anything understates the gain.
+
+> An earlier draft of that sentence gave the 240 Hz pair as
+> "0.800 → 0.230" — the **secant between the first two points only**,
+> not the OLS slope, while the 60 Hz pair beside it was OLS. One
+> sentence, declared unambiguous, switching method between its halves,
+> and inflating the 240 Hz per-pixel gain from 2.10× to 3.48× — two
+> sentences after the paragraph's own point that the numbers in
+> circulation never agreed *because nobody stated the method*. Caught in
+> review (#3781). Recorded rather than quietly corrected, because a
+> paragraph about method-sensitivity that is itself method-inconsistent
+> is the most persuasive form the error takes.
 
 A residual of 2.8× remains at 1080p. It is smaller than the 4.1× the same
 method gave pre-fix, and it is measured against a fit whose largest point
@@ -1524,20 +1541,25 @@ reasons:
 §7.10a set the precedent one lever earlier and states it in its first
 line. This is the same shape.
 
-#### 7.10b.7 An instrument bug, in the §9.7 tradition — committed in the analysis, not the run
+#### 7.10b.7 Three instrument bugs, in the §9.7 tradition — committed in the analysis, not the run
 
-The first version of the script that produced §7.10b.1 keyed its
-before/after rows on `(scenario, n, width, height)` and **silently
+All three produced plausible numbers rather than errors, all three are in
+the *analysis of* the ledger rather than the run that made it, and two of
+the three survived into a draft of this section. The third decided the
+shape of the run.
+
+**1. The `rate_key` collision, reproduced against the ledger that warns
+about it.** The first version of the script that produced §7.10b.1 keyed
+its before/after rows on `(scenario, n, width, height)` and **silently
 reported the 120 Hz numbers as the "pre" column**. `1f35491` holds
 fullscreen 1080p rows at *both* 60 and 120 Hz; with rate absent from the
 key, the 120 Hz arm — which is read second — overwrote the 60 Hz one.
 Every "pre" figure was plausible, internally consistent, and about the
 wrong arm: `balls n=32` read 12 401 instead of 11 663, and `rotozoom`
 4 946 instead of 10 963, which would have turned a 2.77× win into a
-1.25× one.
+1.25× one — i.e. it would have argued the fix barely worked.
 
-**This is `report.rs`'s `rate_key` collision, reproduced in the analysis
-of the ledger it warns about** (`report.rs:164` drops `size` for
+This is `report.rs`'s own collision (`report.rs:164` drops `size` for
 fullscreen runs and keys on rounded hertz; `:214` is last-run-wins). It
 was caught by adding rate to the key and asserting the key is unique —
 at which point the assert fired again, on `boing --fullscreen`, which
@@ -1545,12 +1567,53 @@ legitimately runs twice per arm. Both are now handled explicitly and the
 duplicate is disclosed in §7.10b.1's footnote rather than resolved by
 whichever row happened to be last.
 
-The same trap decided the run's shape: a `1280x720@60` arm was **not**
+**2. A cross-ledger divisor: pre-paint over post-damage.** The script
+that produced the ns/px table took the damage divisor **once, from the
+post ledger**, and used it for both columns:
+
+```
+px = B[k][0]['stats_after']['damage_px_mean']   # post ledger only
+ns_px_pre  = paint_pre  * 1000 / px             # <- wrong divisor
+ns_px_post = paint_post * 1000 / px
+```
+
+For every row whose damage is identical across the two sittings this is
+harmless, and on the fullscreen rows damage is *exactly* 2 073 600 or
+921 600 in both — which is why it survived a read-through of the
+numbers. It is wrong for precisely the rows where damage differs.
+**`boing-node` at 720p reads 57.17 → 38.39 and was published as
+57.81 → 38.39 until review caught it**; 57.81 is `4374 ÷ 75 667`, the
+pre ledger's paint over the post ledger's damage. That row damages
+76 509 px pre and 75 667 post, because the ball is somewhere else when
+the window opens. The ratio moved 1.51× → 1.49×.
+
+This is the rule §11.1 states and this section restates — *never mix a
+pre-fix row into a post-fix table without labelling it* — broken inside
+the table written to honour it. An audit recomputing every cell with each
+row divided by its own ledger's damage found **two** rows whose damage
+differs between sittings: `boing-node` 720p, and `starfield-nodes n=100`
+720p (867 916 vs 859 774), which happens never to have been quoted. Both
+are tiny-damage or nearly-static rows; every fullscreen pixel-arm row,
+which is what the verdict rests on, has identical damage in both ledgers
+and is unaffected. **The audit is the artefact, not the two corrected
+cells** — a divisor bug chased only through the one cell someone noticed
+would have left the other one standing.
+
+**3. The trap that shaped the run.** A `1280x720@60` arm was **not**
 added to this ledger, because a 720p@60 fullscreen row and a 1080p@60
 fullscreen row are the same `rate_key`, and `just bench-report` would
 have replaced every 1080p row in §7.10b.8 with its 720p twin — producing
 a complete, plausible, entirely wrong table. The 720p arm is at 240 Hz,
 which is also the only rate `1f35491` has 720p rows at.
+
+The common shape, and the reason all three are recorded rather than
+quietly fixed: **every one of them is a divisor, a key or a method chosen
+once and then applied to rows it does not fit.** None produces an error,
+a blank or an implausible figure; each produces a number of the right
+magnitude about the wrong thing — as does the method switch corrected in
+§7.10b.3. That is the failure mode a document made entirely of numbers
+has to defend against, and the defence is mechanical re-derivation of
+every cell from the ledgers, which is why both are checked in.
 
 #### 7.10b.8 The generated tables for this ledger
 
@@ -2646,7 +2709,7 @@ of a benchmark document is a reader who takes it for more than it is.
   pixel count together and cannot separate them. The 640×480 rows are
   the control that can — identical scenes at all three rates — and they
   are what §9.2's flat-per-frame result rests on.
-- **One box, and now three sittings and three shas** on `ubuntu`:
+- **One box, three sittings, four shas** on `ubuntu`:
   `1f35491` (2026-09-16, three rates, §6–§9 and every prose number in
   §7.1–§7.10), `49d023b`/`28b6fdd` (2026-09-20, the #569 pair, §7.10a)
   and `5e4b02e` (2026-09-20, two arms, §7.10b and the current fullscreen
