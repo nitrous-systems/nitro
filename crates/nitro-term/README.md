@@ -35,9 +35,10 @@ C0, `Alt+x` → `ESC x`, and the xterm modifier-parameter form so
 
 On the output side: C0 controls, cursor movement, ED/EL, ICH/DCH/IL/DL,
 SGR (bold, italic, underline, inverse, 16/256/truecolor foreground and
-background, with background-colour erase), DECSTBM scroll regions, the alternate screen (1049 and the
-older 47/1047/1048), cursor visibility, bracketed paste, application
-cursor keys, OSC 0/2 window titles, DECSC/DECRC, and DSR/DA replies.
+background, with background-colour erase), DECSTBM scroll regions, the
+alternate screen (1049 and the older 47/1047/1048), cursor visibility,
+bracketed paste, application cursor keys, OSC 0/2 window titles,
+DECSC/DECRC, and DSR/DA replies.
 Anything unrecognised is ignored rather than displayed, and nothing in
 the parser can panic on hostile bytes — `ten_kilobytes_of_noise_never_panic`
 feeds it exactly that.
