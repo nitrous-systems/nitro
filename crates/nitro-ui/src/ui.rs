@@ -73,6 +73,10 @@ pub struct Node {
     pub focusable: bool,
     /// Whether it currently has the keyboard focus.
     pub focused: bool,
+    /// Whether it is on screen: its own flag and every ancestor's, see
+    /// [`Ui::is_visible`]. A hidden widget keeps its bounds, so a hidden
+    /// page is still listed and still resolves by name.
+    pub visible: bool,
     /// Its children, in paint order.
     pub children: Vec<WidgetId>,
 }
@@ -1035,6 +1039,7 @@ impl<S: 'static> Ui<S> {
             bounds: self.window_bounds(id),
             focusable: slot.state.focusable,
             focused: slot.state.focused,
+            visible: self.is_visible(id),
             children: slot.state.children.clone(),
         })
     }
@@ -1064,6 +1069,55 @@ impl<S: 'static> Ui<S> {
                 self.introspect_into(c, out);
             }
         }
+    }
+
+    /// Show or hide a widget and everything under it, without touching
+    /// its layout.
+    ///
+    /// This is the page-stack primitive: a widget that is not the
+    /// current page keeps its bounds and its scene nodes, but its group
+    /// is hidden on the server (one `SetVisible`, sent only when the
+    /// value changes), the pointer does not enter it and Tab does not
+    /// reach anything inside it. Nothing is re-laid-out or re-painted,
+    /// which is what makes a page switch cost a handful of mutations
+    /// rather than a rebuild of the page. Named widgets inside a hidden
+    /// page still resolve, so `hey` can read and set them from any page.
+    pub fn set_node_visible(&mut self, id: WidgetId, visible: bool) {
+        let Some(slot) = self.arena.slot_mut(id) else {
+            return;
+        };
+        slot.state.visible = visible;
+        let node = slot.state.node;
+        if let Some(n) = node
+            && slot.state.sent_visible != Some(visible)
+        {
+            slot.state.sent_visible = Some(visible);
+            let _ = self.wire.set_visible(n, visible);
+        }
+        // The tree pass (re)sends the flag for a group that does not
+        // exist yet, so the order of `set_node_visible` and the first
+        // flush does not matter.
+        if node.is_none() {
+            self.mark(id, Dirty::TREE);
+        }
+    }
+
+    /// Whether `id` is shown — its own flag **and** every ancestor's,
+    /// since a widget inside a hidden page is not on screen either. See
+    /// [`Ui::set_node_visible`].
+    #[must_use]
+    pub fn is_visible(&self, id: WidgetId) -> bool {
+        let mut cur = Some(id);
+        while let Some(w) = cur {
+            let Some(slot) = self.arena.slot(w) else {
+                return false;
+            };
+            if !slot.state.visible {
+                return false;
+            }
+            cur = slot.state.parent;
+        }
+        true
     }
 
     // -- dirty marking ------------------------------------------------
@@ -1818,6 +1872,7 @@ impl<S: 'static> Ui<S> {
                 slot.state.node = Some(node);
             }
         }
+        self.sync_visible(id)?;
         if flags.has(Dirty::TREE) {
             self.sync_children(id)?;
         }
@@ -1830,6 +1885,25 @@ impl<S: 'static> Ui<S> {
             slot.state.flags.remove(Dirty::TREE | Dirty::SUB_TREE);
         }
         Ok(())
+    }
+
+    /// Send a hidden widget's flag once its group exists. A group is
+    /// created visible, so only `false` — or a value that differs from
+    /// the last one sent — costs a message.
+    fn sync_visible(&mut self, id: WidgetId) -> Result<(), Error> {
+        let Some(slot) = self.arena.slot_mut(id) else {
+            return Ok(());
+        };
+        let Some(node) = slot.state.node else {
+            return Ok(());
+        };
+        let want = slot.state.visible;
+        let sent = slot.state.sent_visible.unwrap_or(true);
+        if sent == want {
+            return Ok(());
+        }
+        slot.state.sent_visible = Some(want);
+        self.wire.set_visible(node, want)
     }
 
     /// Bring the scene's child order in line with the widget's.
@@ -2837,6 +2911,7 @@ impl<S: 'static> Ui<S> {
             let mut next = None;
             for c in slot.state.children.iter().rev() {
                 if let Some(cs) = self.arena.slot(*c)
+                    && cs.state.visible
                     && cs.state.bounds.contains(inner)
                 {
                     next = Some(*c);
@@ -3048,6 +3123,11 @@ impl<S: 'static> Ui<S> {
         let Some(slot) = self.arena.slot(id) else {
             return;
         };
+        // A hidden subtree is not on screen, so nothing in it can take
+        // the focus: Tab would otherwise land on a field nobody can see.
+        if !slot.state.visible {
+            return;
+        }
         if slot.state.focusable {
             out.push(id);
         }

@@ -95,8 +95,13 @@ fn flex<S: 'static>(direction: Direction) -> FlexBuilder<S> {
 #[derive(Debug, Default)]
 pub struct Panel {
     background: Option<Color>,
+    /// A palette role for the background, resolved at paint time so the
+    /// panel follows a scheme switch; a `Some(Color)` would be frozen.
+    background_role: Option<nitro_core::Role>,
     radius: Option<f32>,
     border: Option<(f32, Color)>,
+    /// A role-coloured border, for the same reason.
+    border_role: Option<(f32, nitro_core::Role)>,
 }
 
 impl Panel {
@@ -114,9 +119,15 @@ impl<S: 'static> Widget<S> for Panel {
 
     fn paint(&mut self, cx: &mut PaintCx<'_, S>) {
         let theme = cx.theme();
-        let fill = self.background.unwrap_or(theme.surface);
         let radius = self.radius.unwrap_or(theme.radius);
-        let border = self.border.unwrap_or((theme.border_width, theme.border));
+        let (fill, border) = (
+            self.background.unwrap_or(theme.surface),
+            self.border.unwrap_or((theme.border_width, theme.border)),
+        );
+        // A role wins over a literal and over the theme: it is the one
+        // of the three that moves with the palette.
+        let fill = self.background_role.map_or(fill, |r| cx.color(r));
+        let border = self.border_role.map_or(border, |(w, r)| (w, cx.color(r)));
         let bounds = cx.bounds;
         cx.rect(0, bounds, Fill::Solid(fill), radius, border);
     }
@@ -158,6 +169,22 @@ impl<S: 'static> PanelBuilder<S> {
     #[must_use]
     pub fn background(mut self, color: Color) -> Self {
         self.panel.background = Some(color);
+        self
+    }
+
+    /// Take the background from a palette role, so the panel follows a
+    /// scheme switch. Wins over [`PanelBuilder::background`].
+    #[must_use]
+    pub fn background_role(mut self, role: nitro_core::Role) -> Self {
+        self.panel.background_role = Some(role);
+        self
+    }
+
+    /// A border whose colour is a palette role. Wins over
+    /// [`PanelBuilder::border`].
+    #[must_use]
+    pub fn border_role(mut self, width: f32, role: nitro_core::Role) -> Self {
+        self.panel.border_role = Some((width, role));
         self
     }
 
@@ -3497,6 +3524,8 @@ pub fn scroll<S: 'static>() -> ScrollBuilder<S> {
 pub struct Separator {
     vertical: bool,
     color: Option<Color>,
+    /// A palette role, resolved at paint time; wins over `color`.
+    color_role: Option<nitro_core::Role>,
 }
 
 impl Separator {
@@ -3526,7 +3555,11 @@ impl<S: 'static> Widget<S> for Separator {
     }
 
     fn paint(&mut self, cx: &mut PaintCx<'_, S>) {
-        let color = self.color.unwrap_or(cx.theme().track);
+        let color = match (self.color_role, self.color) {
+            (Some(role), _) => cx.color(role),
+            (None, Some(c)) => c,
+            (None, None) => cx.theme().track,
+        };
         let bounds = cx.bounds;
         cx.fill_rect(0, bounds, color);
     }
@@ -3565,6 +3598,14 @@ impl<S: 'static> SeparatorBuilder<S> {
         self.separator.color = Some(color);
         self
     }
+
+    /// Take the colour from a palette role, so the line follows a scheme
+    /// switch. Wins over [`SeparatorBuilder::color`].
+    #[must_use]
+    pub fn color_role(mut self, role: nitro_core::Role) -> Self {
+        self.separator.color_role = Some(role);
+        self
+    }
 }
 
 impl<S: 'static> StyleBuilder<S> for SeparatorBuilder<S> {
@@ -3588,6 +3629,7 @@ pub fn separator<S: 'static>() -> SeparatorBuilder<S> {
         separator: Separator {
             vertical: false,
             color: None,
+            color_role: None,
         },
     }
 }

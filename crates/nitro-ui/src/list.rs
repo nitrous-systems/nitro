@@ -292,6 +292,13 @@ pub struct List<S> {
     extend_from: usize,
     /// Pixels per wheel notch.
     speed: f32,
+    /// How far the selection rect (and the row's content) is inset from
+    /// the viewport's left and right edges, and its corner radius. Both
+    /// 0 by default — a launcher's full-width slab — and set by the
+    /// split-view file list, whose rows sit in a pane and want the
+    /// rounded pill the sidebar rows have. See `docs/ui.md`.
+    row_inset: f32,
+    row_radius: f32,
     /// The type-ahead prefix and when it was last added to.
     prefix: String,
     /// When the prefix was last touched, so it expires without a timer:
@@ -351,6 +358,8 @@ impl<S: 'static> Default for List<S> {
             selected: BTreeSet::new(),
             extend_from: 0,
             speed: 3.0,
+            row_inset: 0.0,
+            row_radius: 0.0,
             prefix: String::new(),
             prefix_at: None,
             last_click: None,
@@ -757,9 +766,14 @@ impl<S: 'static> List<S> {
         cx.rect_in(
             group,
             slot,
-            Rect::new(0.0, y, self.view_w, self.row_h),
+            Rect::new(
+                self.row_inset,
+                y,
+                (self.view_w - 2.0 * self.row_inset).max(0.0),
+                self.row_h,
+            ),
             fill,
-            0.0,
+            self.row_radius,
             (0.0, Color::TRANSPARENT),
         );
         if same_row && !self.dirty_rows {
@@ -807,6 +821,7 @@ impl<S: 'static> List<S> {
         // column, which is the honest trade and is documented in
         // `docs/ui.md`.
         let icon = row.icon.as_deref().filter(|n| !n.is_empty());
+        let pad = ROW_PAD + self.row_inset;
         let column = match icon {
             Some(_) if paint.icons => row.side(),
             _ => 0.0,
@@ -822,13 +837,13 @@ impl<S: 'static> List<S> {
             cx.icon_in(
                 group,
                 slot + 1,
-                Rect::new(ROW_PAD, iy, side, side),
+                Rect::new(pad, iy, side, side),
                 name,
                 side,
                 row.tint(),
             );
         }
-        let left = ROW_PAD + if column > 0.0 { column + ICON_GAP } else { 0.0 };
+        let left = pad + if column > 0.0 { column + ICON_GAP } else { 0.0 };
         // The secondary column is a third of the row, capped: a date is
         // a fixed width and a name is not, so the name gets the slack.
         let detail_w = if row.detail.is_empty() {
@@ -836,7 +851,7 @@ impl<S: 'static> List<S> {
         } else {
             (self.view_w * 0.34).min(190.0)
         };
-        let text_w = (self.view_w - ROW_PAD - detail_w - left).max(0.0);
+        let text_w = (self.view_w - pad - detail_w - left).max(0.0);
         cx.text_in(
             group,
             slot + 2,
@@ -848,7 +863,7 @@ impl<S: 'static> List<S> {
             cx.text_in(
                 group,
                 slot + 3,
-                Rect::new(self.view_w - ROW_PAD - detail_w, top, detail_w, line),
+                Rect::new(self.view_w - pad - detail_w, top, detail_w, line),
                 &row.detail,
                 TextRun::new(&paint.style, paint.detail).align(Align::Right),
             );
@@ -1202,6 +1217,21 @@ impl<S: 'static> ListBuilder<S> {
     #[must_use]
     pub fn speed(mut self, rows: f32) -> Self {
         self.list.speed = rows;
+        self
+    }
+
+    /// Inset the selection rect and the row content from the viewport's
+    /// left and right edges (default 0: full-width rows).
+    #[must_use]
+    pub fn row_inset(mut self, px: f32) -> Self {
+        self.list.row_inset = px;
+        self
+    }
+
+    /// Corner radius of the selection rect (default 0).
+    #[must_use]
+    pub fn row_radius(mut self, px: f32) -> Self {
+        self.list.row_radius = px;
         self
     }
 }

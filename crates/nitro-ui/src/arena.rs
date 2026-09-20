@@ -143,10 +143,10 @@ impl std::ops::BitOr for Dirty {
 /// read it for every widget on every pass, and a widget that forgot to
 /// expose one of these would simply not work.
 #[derive(Debug)]
-// Five flags, not a state machine: `focusable`, `hovered`, `focused`
-// and the two content-group bits are independent facts about a widget,
-// and folding any pair into an enum would invent a state that cannot
-// occur to describe two that can.
+// Six flags, not a state machine: `focusable`, `hovered`, `focused`,
+// `visible` and the two content-group bits are independent facts about
+// a widget, and folding any pair into an enum would invent a state that
+// cannot occur to describe two that can.
 #[allow(clippy::struct_excessive_bools)]
 pub struct WidgetState {
     /// Parent, or `None` for the root.
@@ -166,6 +166,17 @@ pub struct WidgetState {
     pub hovered: bool,
     /// Whether this widget has the keyboard focus.
     pub focused: bool,
+    /// Whether this widget (and its subtree) is shown at all.
+    ///
+    /// `false` is what a page switcher sets on the pages that are not
+    /// current: the widget keeps its bounds and its scene nodes, but the
+    /// group is hidden on the server, the pointer does not enter it and
+    /// Tab does not reach anything inside it. See
+    /// [`Ui::set_node_visible`](crate::Ui::set_node_visible).
+    pub visible: bool,
+    /// The visibility last sent for the group, so a stable one costs
+    /// nothing. `None` until the group exists.
+    pub(crate) sent_visible: Option<bool>,
     /// Memoized `measure`: the constraints it was called with and what it
     /// answered. Invalidated by [`Dirty::LAYOUT`].
     pub(crate) measured: Option<(Constraints, nitro_core::Size)>,
@@ -214,6 +225,8 @@ impl Default for WidgetState {
             focusable: false,
             hovered: false,
             focused: false,
+            visible: true,
+            sent_visible: None,
             measured: None,
             floor: None,
             // A new widget has never been laid out, painted or attached.

@@ -68,6 +68,7 @@
 //! | [`widget`] | the [`Widget`] trait and the pass contexts |
 //! | [`widgets`] | `Flex`, `Panel`, `Label`, `Button`, `TextField`, `Checkbox`, `Scroll`, `Slider`, `Separator`, `Image`, `Icon`, `Spacer` |
 //! | [`list`] | `List`: a **virtualised** list, `visible + 2` nodes for any model |
+//! | [`split`] | the split-view blueprint: `SidebarRow`, `Card`, `CardRow`, `Pages`, `Switch`, `split_view` |
 //! | [`build`] | the builder traits |
 //! | [`layout`] | the flex model, as pure functions |
 //! | [`event`] | [`Event`], [`Handled`] and the key/button codes |
@@ -87,6 +88,7 @@ pub mod layout;
 pub mod list;
 pub mod shell;
 pub mod shot;
+pub mod split;
 pub mod theme;
 pub mod ui;
 pub mod widget;
@@ -112,6 +114,10 @@ pub use layout::{
 };
 pub use list::{List, ListModel, Row, list};
 pub use nitro_core::{Color, Point, Rect, Size, Transform};
+pub use split::{
+    Card, CardRow, Pages, SidebarRow, SplitParts, Switch, card, card_row, content_column, footnote,
+    group_caption, pages, sidebar_row, sidebar_section, sidebar_separator, split_view, switch,
+};
 // The semantic colour palette. `nitro_core::Role` is re-exported as
 // `ColorRole` because this crate already has a `Role` — the
 // *accessibility* role of a widget ([`widget::Role`]), which predates it

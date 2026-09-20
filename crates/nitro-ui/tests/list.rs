@@ -9,7 +9,7 @@
 //! what changed", and it is why a 100 000-row model appears in a test
 //! that runs in milliseconds.
 
-use nitro_core::{Color, Size};
+use nitro_core::{Color, Rect, Size};
 use nitro_ui::build::{ContainerBuilder as _, StyleBuilder as _};
 use nitro_ui::event::key;
 use nitro_ui::test::Harness;
@@ -936,5 +936,46 @@ fn a_row_icon_survives_a_scheme_flip_with_no_set_icon_at_all() {
         before,
         "and the server re-rasterised an icon it already had as coverage"
     );
+    h.quit();
+}
+
+#[test]
+fn a_row_inset_moves_the_selection_rect_and_nothing_else() {
+    // `row_inset`/`row_radius` are what a list in a split-view pane uses
+    // for the rounded pill its sidebar rows have. They change *where*
+    // the selection is painted, not what a selection move costs.
+    let mut h = Harness::sized(
+        "inset",
+        Vec::new(),
+        Size::new(240.0, 200.0),
+        |ui: &mut Ui<Vec<usize>>| {
+            ui.build(
+                list()
+                    .rows(rows(50))
+                    .row_inset(6.0)
+                    .row_radius(6.0)
+                    .width_percent(1.0)
+                    .height_percent(1.0),
+            )
+        },
+    );
+    h.settle();
+    let id = h.ui().root().unwrap();
+    click_row(&mut h, id, 0);
+    h.tap();
+    h.clear_tap();
+    h.key(key::DOWN);
+    h.settle();
+    assert_eq!(ops(&h), ["SetFill", "SetFill", "Commit"]);
+    // The selection is inset: the left 6 px of the row are not the
+    // selection colour, and the pixels past them are.
+    let b = h.bounds(id);
+    let row_h = h.widget::<List<Vec<usize>>>(id).row_height();
+    let sel = h.ui().theme().selection.to_u32() >> 8;
+    let y = (b.y + row_h * 1.5).floor();
+    let inset = h.ink_count(Rect::new(b.x.ceil(), y, 5.0, 1.0), sel);
+    assert_eq!(inset, 5, "the inset is not painted as selection");
+    let painted = h.ink_count(Rect::new(b.x + 8.0, y, 4.0, 1.0), sel);
+    assert_eq!(painted, 0, "past the inset the row is the selection");
     h.quit();
 }

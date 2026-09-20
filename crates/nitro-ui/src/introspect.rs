@@ -980,6 +980,9 @@ fn flags<S: 'static>(ui: &Ui<S>, node: &Node) -> String {
     if node.focusable {
         out.push("focusable");
     }
+    if !node.visible {
+        out.push("hidden");
+    }
     if crate::introspect::enabled(ui, node.id) {
         out.push("enabled");
     }
@@ -1042,6 +1045,7 @@ fn get<S: 'static>(ui: &Ui<S>, path: &str, prop: Option<&str>) -> Result<String,
         ("enabled", enabled(ui, id).to_string()),
         ("focused", node.focused.to_string()),
         ("focusable", node.focusable.to_string()),
+        ("visible", node.visible.to_string()),
         ("hovered", ui.is_hovered(id).to_string()),
         ("children", node.children.len().to_string()),
         ("actions", node.access.actions.join(",")),
@@ -1134,9 +1138,8 @@ pub fn set<S: 'static>(
             }
             Ok(())
         }
-        "path" | "role" | "bounds" | "children" | "actions" | "hovered" | "focusable" => {
-            Err(format!("`{prop}` is read-only"))
-        }
+        "path" | "role" | "bounds" | "children" | "actions" | "hovered" | "focusable"
+        | "visible" => Err(format!("`{prop}` is read-only")),
         other => {
             let action = format!("set_{other}");
             match ui.action(state, id, &action, Some(value)) {
