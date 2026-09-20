@@ -30,7 +30,8 @@
 //!    the leak check;
 //! 4. the pixel path really does read the client's buffer (the pixels the
 //!    effect computed are on the screen), so `putimage` is measuring an
-//!    upload and not a no-op.
+//!    upload and not a no-op, and it goes on reading it — the picture
+//!    *moves*, which is issue #584.
 
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::os::unix::net::UnixStream;
@@ -321,6 +322,12 @@ fn creating_and_destroying_nodes_leaves_the_count_where_it_was() {
 /// This is the room's rule from `nitro-testbox` in its own costume: a
 /// counter agreeing with the code proves nothing when the counter is
 /// measuring the layer below the broken one.
+///
+/// What it does **not** cover, and did not catch, is issue #584: one
+/// screenshot proves a frame arrived, not that frames keep arriving.
+/// Frame 0's plasma reaches the screen inside `CreateBuffer` itself, so
+/// this test passed for the whole time the picture was frozen. The
+/// moving half is [`the_pixel_path_keeps_pushing_pixels`].
 #[test]
 fn the_pixel_path_puts_the_clients_bytes_on_the_screen() {
     let b = Box_::start("putimage", 320, 240);
@@ -349,6 +356,114 @@ fn the_pixel_path_puts_the_clients_bytes_on_the_screen() {
         "only {} distinct colours on screen — the buffer never reached it",
         seen.len()
     );
+    b.quit();
+}
+
+/// And it keeps pushing them: the picture *moves*.
+///
+/// Issue #584, reported by eye — "the benchmarks look static, shouldn't
+/// the starfield show movement?". It did not, for a reason no counter
+/// could see: the scenario wrote every frame into a second, unrelated
+/// memfd (`memfd_create` mints a new file per call), so the server
+/// faithfully re-`pread` a buffer nobody was writing and presented frame
+/// 0 forever. Commits, frames, damage, CPU and bandwidth were all real —
+/// only the pixel values were stale — which is why every existing
+/// assertion in this file passed.
+///
+/// So the claim is the one the reporter made: two screenshots, a known
+/// number of frames apart, must differ. The frame callbacks are driven
+/// explicitly rather than by running against a wall clock and sleeping
+/// between shots, because "probably some frames happened" is the flaky
+/// version of this test.
+///
+/// `plasma` is the effect because it is a pure function of the frame
+/// index, so "frame 5 is not frame 25" is guaranteed by `effects`' own
+/// unit tests rather than by luck.
+#[test]
+fn the_pixel_path_keeps_pushing_pixels() {
+    let b = Box_::start("moving", 320, 240);
+    let cfg = RunConfig {
+        seconds: 0.0,
+        size: Some(nitro_core::Size::new(320.0, 240.0)),
+        fullscreen: false,
+        note: "fake backend".to_owned(),
+        sha: "test".to_owned(),
+        host: "test".to_owned(),
+    };
+    let conn = Connection::connect(&b.wire, "nitro-bench").expect("wire connect");
+    let mut h = Harness::with_connection(conn, &cfg, 0, 0).expect("harness");
+    let mut s = scenario("plasma", 0, 0, 320, 240).expect("scenario");
+
+    h.commit(&[h.create_window("nitro-bench plasma")])
+        .expect("open");
+    assert!(
+        h.await_configure(Duration::from_secs(5)).expect("pump"),
+        "the server never configured the window"
+    );
+    let mut ctx = h.ctx;
+    let mut first = s.build(&mut ctx).expect("build");
+    h.ctx = ctx;
+    first.push(Harness::request_frame());
+    h.commit(&first).expect("first commit");
+
+    // Drive `want` frame callbacks, answering each with the scenario's
+    // mutations exactly as `run_with` does.
+    let mut frame = 0u64;
+    let mut events = Vec::new();
+    let mut drive = |h: &mut Harness, s: &mut dyn nitro_bench::harness::Scenario, want: u64| {
+        let target = frame + want;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while frame < target {
+            assert!(
+                Instant::now() < deadline,
+                "timed out after {frame} of {target} frames"
+            );
+            assert!(!h.closed, "the server closed the window mid-run");
+            let callbacks = h
+                .pump(Duration::from_millis(100), &mut events)
+                .expect("pump");
+            for _ in 0..callbacks {
+                let mut ctx = h.ctx;
+                let mut batch = s.frame(&mut ctx, frame).expect("frame");
+                h.ctx = ctx;
+                frame += 1;
+                batch.push(Harness::request_frame());
+                h.commit(&batch).expect("commit");
+            }
+        }
+    };
+
+    drive(&mut h, s.as_mut(), 5);
+    b.settle();
+    let early = b.shot();
+    drive(&mut h, s.as_mut(), 20);
+    b.settle();
+    let late = b.shot();
+
+    assert_eq!((early.width, early.height), (late.width, late.height));
+    assert!(
+        early.data != late.data,
+        "the screen never changed over {frame} frames of plasma — the \
+         client's per-frame writes are not reaching the server's buffer"
+    );
+    // And not because the second shot is blank: both must still be a
+    // rendered plasma, or "it changed" would also pass for a window that
+    // went black.
+    for (which, img) in [("early", &early), ("late", &late)] {
+        let mut seen = std::collections::BTreeSet::new();
+        for y in 0..img.height {
+            for x in 0..img.width {
+                let off = (y * img.stride + x * 4) as usize;
+                seen.insert([img.data[off], img.data[off + 1], img.data[off + 2]]);
+            }
+        }
+        assert!(
+            seen.len() > 8,
+            "the {which} shot has only {} distinct colours",
+            seen.len()
+        );
+    }
+    drop(h);
     b.quit();
 }
 

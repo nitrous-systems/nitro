@@ -39,6 +39,17 @@
 //! tree denies. That is itself a finding — the upload column is a
 //! syscall-per-frame that a mapped buffer would not pay, and the report
 //! says how much it is.
+//!
+//! The scenario keeps its own descriptor on that one buffer, obtained by
+//! [`rustix::io::dup`] of the descriptor it hands to `CreateBuffer`. It
+//! is a `dup` and **not** a second [`memfd`] call, and the distinction is
+//! the whole of issue #584: `memfd_create` mints a *new anonymous file*
+//! every time it is called, and a memfd has no name to re-open, so a
+//! second call yields an unrelated file that merely starts with the same
+//! bytes. Every per-frame `pwrite` then landed in a file the server never
+//! reads, and every pixel-path benchmark displayed frame 0 forever — a
+//! correct-looking, never-moving picture, while still paying every byte
+//! of the per-frame cost the report measures.
 
 use std::os::fd::OwnedFd;
 use std::time::Instant;
@@ -188,6 +199,19 @@ impl Scenario for PixelScenario {
         self.effect.resize(w, h);
         self.effect.render(&mut self.surface, 0);
         let fd = memfd(&self.surface.data)?;
+        // The descriptor below moves into `CreateBuffer`, so the scenario
+        // keeps a `dup` of it for the per-frame writes: two descriptors
+        // on *one* file, the server `pread`ing what this client
+        // `pwrite`s. Re-sending the buffer every frame would be the
+        // alternative, which is the thing this scenario exists not to do.
+        //
+        // It must be a `dup` and not a second `memfd()`. `memfd_create`
+        // creates a new anonymous file on every call and a memfd has no
+        // name to re-open, so a second call is an unrelated file that
+        // merely starts with the same bytes — which is precisely the bug
+        // (#584) that left every pixel-path benchmark showing frame 0
+        // forever while doing all the work of animating.
+        let mine = rustix::io::dup(&fd)?;
         let msgs = vec![
             CreateNode {
                 id: IMAGE,
@@ -233,12 +257,7 @@ impl Scenario for PixelScenario {
             }
             .into(),
         ];
-        // The descriptor moved into the message; open a second one on the
-        // same pixels for the per-frame writes. Two descriptors on one
-        // memfd is the ordinary way to do this — the server holds its own
-        // for `pread`, and re-sending the buffer every frame would be the
-        // alternative, which is the thing this scenario exists not to do.
-        self.fd = Some(memfd(&self.surface.data)?);
+        self.fd = Some(mine);
         Ok(msgs)
     }
 
@@ -536,6 +555,93 @@ mod tests {
             assert_eq!(msgs.len(), 1);
             assert!(matches!(msgs[0], ClientMsg::BufferDamage(_)));
         }
+    }
+
+    /// The defect behind issue #584, named directly: the descriptor the
+    /// scenario keeps for its per-frame `pwrite`s must be the **same
+    /// file** as the one it handed to `CreateBuffer`.
+    ///
+    /// `build` used to call `memfd()` twice, and the comment there said
+    /// "two descriptors on one memfd" — which is the right design and
+    /// not what the code did. `memfd_create` mints a new anonymous file
+    /// per call, so the client wrote every frame into a file the server
+    /// had never heard of and the screen showed frame 0 forever.
+    ///
+    /// Settled on `(st_dev, st_ino)` rather than on the pixels, because
+    /// the two files start with identical contents — which is exactly
+    /// why this was invisible in every screenshot-shaped test.
+    #[test]
+    fn the_per_frame_writes_go_to_the_buffer_the_server_was_given() {
+        let mut s = PixelScenario::new("plasma", Box::new(Plasma::new()), 64);
+        let msgs = s.build(&mut ctx(640.0, 480.0)).unwrap();
+        let ClientMsg::CreateBuffer(create) = msgs
+            .iter()
+            .find(|m| matches!(m, ClientMsg::CreateBuffer(_)))
+            .expect("CreateBuffer")
+        else {
+            unreachable!()
+        };
+        let mine = s.fd.as_ref().expect("the scenario kept a descriptor");
+        assert_eq!(
+            identity(&create.fd),
+            identity(mine),
+            "the scenario writes its frames into a different file than the \
+             one the server reads — the picture will never move"
+        );
+    }
+
+    /// `(st_dev, st_ino)`: the pair that says "same file", whatever the
+    /// descriptor. Spelled locally rather than shared; the precedent is
+    /// `crates/nitro-wire/tests/common/mod.rs::identity`, and three lines
+    /// is not a crate.
+    fn identity(fd: impl std::os::fd::AsFd) -> (u64, u64) {
+        let st = rustix::fs::fstat(fd).expect("fstat");
+        (st.st_dev as u64, st.st_ino as u64)
+    }
+
+    /// And the end-to-end shape of the same claim, without a server: a
+    /// later frame's bytes are readable back out of the descriptor the
+    /// server holds.
+    #[test]
+    fn a_frames_pixels_are_visible_through_the_servers_descriptor() {
+        let mut s = PixelScenario::new("plasma", Box::new(Plasma::new()), 64);
+        let msgs = s.build(&mut ctx(640.0, 480.0)).unwrap();
+        let ClientMsg::CreateBuffer(create) = msgs
+            .iter()
+            .find(|m| matches!(m, ClientMsg::CreateBuffer(_)))
+            .expect("CreateBuffer")
+        else {
+            unreachable!()
+        };
+        let read_back = |fd: &OwnedFd, len: usize| {
+            let mut buf = vec![0u8; len];
+            let mut done = 0;
+            while done < len {
+                let n = rustix::io::pread(fd, &mut buf[done..], done as u64).expect("pread");
+                assert!(n > 0, "short read");
+                done += n;
+            }
+            buf
+        };
+        let first = read_back(&create.fd, s.byte_len());
+        // Plasma is a pure function of the frame index, so frame 40 is
+        // not frame 0 — the effects' own tests own that claim.
+        for f in 0..40 {
+            s.frame(&mut ctx(640.0, 480.0), f).unwrap();
+        }
+        let later = read_back(&create.fd, s.byte_len());
+        // Compared as booleans rather than with `assert_ne!` on the
+        // vectors: a failing `assert_ne!` prints a megabyte of BGRA and
+        // the one bit that matters is "did it change at all".
+        assert!(
+            first != later,
+            "forty frames later the server's buffer is unchanged — the \
+             benchmark is uploading into nowhere"
+        );
+        assert!(
+            later == s.pixels(),
+            "the server sees other bytes than the effect drew"
+        );
     }
 
     /// The two cost columns must actually accumulate, or the report's

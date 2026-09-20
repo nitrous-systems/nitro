@@ -190,6 +190,29 @@ separate "the retained arm wins" from "the pixel arm hit the bandwidth
 wall at 1080p" — two different claims, of which only the first is about
 the architecture.
 
+### A defect behind these runs, and why the numbers survive it
+
+Every pixel-path row below (`putimage`, `plasma`, `fire`, `rotozoom`,
+`boing`, `starfield`, `balls`) was measured while the benchmark was
+displaying a **frozen frame 0**. `PixelScenario::build` called
+`memfd_create` twice where it meant to `dup` once, so the descriptor the
+client wrote every frame and the descriptor the server read from were two
+unrelated files that merely started with the same bytes. Nobody saw it
+because the picture was a correctly rendered plasma or starfield — just
+the same one every frame. Issue #584, fixed; the node-path rows were
+never affected.
+
+**The cost columns stand and the box sweep was not re-run.** Every byte
+of per-frame work still happened: the effect really computed a new frame
+(`compute_us`), the client really `pwrite` a whole buffer (`upload_us`),
+the server really re-`pread` the full damaged rect and really blitted it
+(`paint_us`, `damage_px`). Only the pixel *values* were stale, and
+copying a byte does not cost more or less depending on what the byte is.
+Measured either side of the fix, `plasma --fullscreen` agrees within this
+box's noise. A reader is entitled to know what the screen was showing
+while these numbers were taken; they are not entitled to a different
+number, because there isn't one.
+
 ## 5. Ceilings: what the machine can move
 
 A benchmark result without a denominator is a number, not a finding.
