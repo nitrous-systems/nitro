@@ -815,8 +815,13 @@ group was set to `(0, offset, w, h + content)` every frame, so the clip
 rectangle was taller than the window from frame 0 and **clipped nothing
 at all**, leaving the rows to damage area outside the viewport. With a
 clipper that actually clips, the number is a clean one-viewport repaint
-and the finding *survives in a stronger form* — there is no longer a
-residual to explain away.
+with no residual to explain away. **What survived that correction was
+the measurement, not the inference drawn from it** — worth stating
+precisely, because an earlier version of this paragraph said "the
+finding *survives in a stronger form*" and, read today, its nearest
+referent is the ~30× claim the paragraphs above retire. The clean figure
+is what made the *reading* checkable, and checking it is what retired
+it.
 
 **The recoverable factor is ~2× on paint, not ~30× on damage**, and it is
 filed as **#592** with its ceiling attached. This section's own run puts
@@ -1320,8 +1325,11 @@ differently than they did.
   nobody had described: 675 696 damage pixels, "2.2 viewports", with the
   excess explained away in prose as the age-2 union and the shell. A
   fixed clipper at the viewport with a moving content group inside it
-  gives 304 768 — 0.99 of the viewport — and the finding behind #570 came
-  out *cleaner*, with nothing left to explain away (§7.5).
+  gives 304 768 — 0.99 of the viewport — so the **number** came out
+  cleaner, with nothing left to explain away (§7.5). The reading built on
+  that number did not survive, and D below is where it is retired: a
+  clean measurement is what made the inference checkable, not evidence
+  that the inference was right.
 - **D — an instrument that was right, and a reading of it that was not.**
   The three above are instrument defects: a scenario measuring a
   different scene from the one its name described. This one is not, and
