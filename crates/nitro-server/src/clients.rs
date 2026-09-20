@@ -104,6 +104,16 @@ pub struct WireClient {
     /// release its own. The scene stores only the opaque key; this map is
     /// what turns that key back into something the store can drop.
     pub texts: HashMap<NodeKey, TextKey>,
+    /// Server→client capability bits this client declared it understands,
+    /// from `ClientCaps` (M5-A). 0 until it sends one, which means "the
+    /// v1 message set only".
+    ///
+    /// Nothing reads it yet — the server advertises no bit above 7, so
+    /// there is no M5 message to gate. It is recorded now because the rule
+    /// it exists for ("never send a message belonging to a bit the client
+    /// did not list") cannot be honoured retroactively by a server that
+    /// threw the list away. See `docs/wire.md`.
+    pub client_caps: u32,
 }
 
 impl WireClient {
@@ -122,6 +132,7 @@ impl WireClient {
             frame_requests: Vec::new(),
             unpresented: Vec::new(),
             texts: HashMap::new(),
+            client_caps: 0,
         }
     }
 
@@ -368,6 +379,13 @@ fn apply_msg(
         ClientMsg::Hello(_) | ClientMsg::Commit(_) => {
             // Never buffered: the stream handles `Hello`, and `Commit` is
             // what drives this function.
+            Ok(())
+        }
+        ClientMsg::ClientCaps(_) => {
+            // Never buffered either: `handle_wire_msg` records it on
+            // receipt, because it is a connection property rather than a
+            // scene mutation. The arm exists because this match is the
+            // table and has no `_`.
             Ok(())
         }
         ClientMsg::CreateWindow(m) => {
@@ -718,6 +736,26 @@ fn apply_msg(
         | ClientMsg::CloseWindow(_)
         | ClientMsg::SetWindowStateFor(_)
         | ClientMsg::Outputs(_) => Ok(()),
+        // The M5-A ops (#3767): the protocol surface landed ahead of the
+        // behaviour, so they are refused. `handle_wire_msg` already
+        // disconnects on receipt and none of these ever reaches `pending`;
+        // this arm is belt and braces, and exists because the match above
+        // is the op table and deliberately has no `_`.
+        ClientMsg::CreatePopup(_)
+        | ClientMsg::RepositionPopup(_)
+        | ClientMsg::SetCursor(_)
+        | ClientMsg::StartMove(_)
+        | ClientMsg::StartResize(_)
+        | ClientMsg::ListOutputs(_)
+        | ClientMsg::SetSelection(_)
+        | ClientMsg::RequestSelection(_)
+        | ClientMsg::SendSelection(_)
+        | ClientMsg::StartDrag(_)
+        | ClientMsg::AcceptDrop(_)
+        | ClientMsg::FinishDrag(_) => Err(ApplyError::new(
+            ErrorCode::Protocol,
+            "this op needs a capability this server does not advertise",
+        )),
     }
 }
 

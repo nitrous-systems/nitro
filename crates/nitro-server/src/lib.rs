@@ -107,6 +107,19 @@ pub const SERVER_NAME: &str = "nitro";
 const REMOTE_NO_BUFFERS: &str = "buffers are not available on a remote link: \
      file descriptors cannot be passed over TCP (caps::REMOTE, docs/remote.md)";
 
+/// Largest number of outstanding selection requests one connection may
+/// have made.
+///
+/// The clipboard's peer of `MAX_PENDING_FDS`. A request parks server state
+/// until the owner answers it, and an owner is under no obligation to be
+/// quick, so a client that fires requests and never reads the answers
+/// would grow that state without bound. The 17th outstanding request is
+/// **answered immediately with an EOF descriptor** rather than refused:
+/// the requester already has exactly one code path for "I cannot serve
+/// that", so the bound costs no new error, and the client that feels it is
+/// the one misbehaving. See `docs/wire.md` § Receive-side limits.
+pub const MAX_PENDING_SELECTIONS: usize = 16;
+
 /// Which display backend to run on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendKind {
@@ -1203,6 +1216,41 @@ fn is_shell_op(msg: &ClientMsg) -> bool {
             | ClientMsg::CloseWindow(_)
             | ClientMsg::SetWindowStateFor(_)
             | ClientMsg::Outputs(_)
+    )
+}
+
+/// Whether a message is one of the **M5-A** ops this server does not yet
+/// implement.
+///
+/// The protocol surface landed ahead of the behaviour (task #3767), so the
+/// twelve ops below decode but are refused: `Server::caps` advertises none
+/// of the M5 bits, so no conformant client sends one, and a client that
+/// does anyway hears why instead of being silently ignored.
+///
+/// `ClientCaps` (0x0003) is deliberately **not** here: it is accepted and
+/// recorded, because the rule that makes it safe — the server must not
+/// send what the client did not list — cannot be honoured by a server that
+/// throws the list away, and each M5 task should gain one `if` rather than
+/// re-litigate this.
+///
+/// A `match` over the variants rather than an op-code range test, for the
+/// reason `is_shell_op` gives: a range would keep compiling after someone
+/// implemented one of these, which is exactly when it must not.
+fn is_m5_op(msg: &ClientMsg) -> bool {
+    matches!(
+        msg,
+        ClientMsg::CreatePopup(_)
+            | ClientMsg::RepositionPopup(_)
+            | ClientMsg::SetCursor(_)
+            | ClientMsg::StartMove(_)
+            | ClientMsg::StartResize(_)
+            | ClientMsg::ListOutputs(_)
+            | ClientMsg::SetSelection(_)
+            | ClientMsg::RequestSelection(_)
+            | ClientMsg::SendSelection(_)
+            | ClientMsg::StartDrag(_)
+            | ClientMsg::AcceptDrop(_)
+            | ClientMsg::FinishDrag(_)
     )
 }
 
@@ -5046,6 +5094,41 @@ impl Server {
             .is_some_and(|c| !c.stream.is_closed())
     }
 
+    /// Record a `ClientCaps` (M5-A). Returns whether the client survives.
+    ///
+    /// Answered **on receipt** rather than buffered for the commit: it is
+    /// a connection property, not a scene mutation — the `BindKey`
+    /// precedent.
+    ///
+    /// Accepted and **stored** even though nothing reads it yet. The rule
+    /// that makes `ClientCaps` safe is "the server must not send a message
+    /// belonging to a bit the client did not list", and a server that
+    /// cannot store the list cannot honour that rule the moment it grows a
+    /// bit — so M5-B through M5-I each gain one `if` instead of
+    /// re-litigating this. See `docs/wire.md` § Capability opt-in.
+    fn record_client_caps(&mut self, token: u64, caps: u32) -> bool {
+        let advertised = self.caps(Self::is_shell(token), Self::is_remote(token));
+        let extra = caps & !advertised;
+        if extra != 0 {
+            // A client claiming to understand messages the server never
+            // offered is confused, and this is the cheap place to say so.
+            self.disconnect(
+                token,
+                Some((
+                    0,
+                    ErrorCode::Protocol,
+                    format!("ClientCaps named bits {extra:#x} the server did not advertise"),
+                )),
+            );
+            return false;
+        }
+        let Some(client) = self.wire_clients.get_mut(&token) else {
+            return false;
+        };
+        client.client_caps = caps;
+        true
+    }
+
     /// Buffer, or act on, one decoded client message. Returns whether the
     /// client survives it.
     fn handle_wire_msg(&mut self, token: u64, message: ClientMsg) -> bool {
@@ -5119,6 +5202,7 @@ impl Server {
                 true
             }
             ClientMsg::Commit(commit) => self.commit(token, commit.serial),
+            ClientMsg::ClientCaps(m) => self.record_client_caps(token, m.caps),
             ClientMsg::CreateBuffer(buffer) => {
                 // The descriptor is checked and *mapped* now, not at commit:
                 // the client may legitimately close or reuse its own
@@ -5142,6 +5226,24 @@ impl Server {
                 true
             }
             other => {
+                // The M5-A ops decode but are not implemented: this server
+                // advertises no bit above 7, so no conformant client sends
+                // one. Refused **at receipt** rather than at the commit,
+                // which matters for `SendSelection`: buffering it would
+                // park a descriptor in `pending` until a commit that may
+                // never come.
+                if is_m5_op(&other) {
+                    let name = other.name();
+                    self.disconnect(
+                        token,
+                        Some((
+                            0,
+                            ErrorCode::Protocol,
+                            format!("{name} needs a capability this server does not advertise"),
+                        )),
+                    );
+                    return false;
+                }
                 // The shell ops are answered on receipt rather than buffered
                 // for the commit. They are not scene mutations a frame must
                 // show atomically: `WindowList` is a *question*, `BindKey` a
@@ -6134,6 +6236,15 @@ fn report_bad_icons(client: &mut clients::WireClient, serial: u32, bad: Vec<(Nod
         client.send(&ServerMsg::Error(msg::Error {
             serial,
             code: ErrorCode::BadIcon,
+            // **The quoting here is parsed by the toolkit.** `nitro-ui`'s
+            // `quoted()` (`crates/nitro-ui/src/ui.rs`) pulls the icon name
+            // back out of this string to route the failure to the widget
+            // that asked, because `Error` carries no node id. So this
+            // format string is load-bearing prose: do not reword or
+            // re-quote it. The replacement exists on the wire as
+            // `ServerMsg::IconRefused { serial, node, name }` (0x8303,
+            // M5-A/#3767) and task **#3786** switches both ends over to
+            // it — after which this comment and the parser both go.
             msg: format!("no icon named {name:?}"),
         }));
     }

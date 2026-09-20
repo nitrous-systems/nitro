@@ -122,6 +122,30 @@ carries their frame's **header**. Two rules bind the sender:
 1. One `sendmsg` may carry the descriptors of **at most one** frame.
 2. That call must include the bytes of that frame's header.
 
+**Both directions carry descriptors.** Until M5-A only the client did
+(`CreateBuffer`); the server now sends `Keymap` (0x8208) and
+`SelectionData` (0x8502), and the client also sends `SendSelection`
+(0x0307). The two rules above are unchanged and apply to the server's
+writes exactly as to the client's — the `Writer` and `Socket::send_all`
+that implement the split are the same code in both directions. Three
+consequences are worth naming, because three places used to assume the
+server never sent one:
+
+* `needs_fd` is **direction-agnostic**. Ops are numerically disjoint
+  between the directions, so one function classifies both.
+* The server's `send` refuses an fd-carrying message on a **remote** (TCP)
+  link before encoding it, exactly as the client's has since M4-E1. A
+  frame whose header promises descriptors that can never arrive would
+  desynchronise the peer's stream, which is worse than the feature not
+  working.
+* The client's receive loop applies the same `MAX_PENDING_FDS` yield rule
+  the server's has; see [Receive-side limits](#receive-side-limits).
+
+Who creates and who closes each descriptor is per message; the data
+transfer table is under
+[Descriptor ownership](#descriptor-ownership-per-message), and `Keymap`
+and `CreateBuffer` state theirs in their own sections.
+
 `nitro-wire`'s `Socket` splits its writes accordingly. Note that the split
 cannot be recovered by re-parsing the outgoing buffer: a short write may
 stop *inside* a header, after which the buffer no longer starts on a frame
@@ -151,7 +175,8 @@ All integers little-endian. No padding anywhere.
 | `bool` | 1 | 0 or 1; **any other byte is a decode error** |
 | `str` | 4 + n | `u32` byte length, then UTF-8. No NUL terminator; an embedded NUL is an error. |
 | `bytes` | 4 + n | `u32` length, then the bytes. |
-| `vec<T>` | 4 + n·k | `u32` item count, then the items back to back. |
+| `vec<T>` | 4 + n·k | `u32` item count, then the items back to back. Fixed-size items only. |
+| `vec<str>` | 4 + … | `u32` item count, then that many `str` fields back to back. |
 | `Point` | 8 | `x: f32`, `y: f32` |
 | `Size` | 8 | `w: f32`, `h: f32` |
 | `Rect` | 16 | `x, y, w, h: f32` |
@@ -164,6 +189,12 @@ All integers little-endian. No padding anywhere.
 
 A declared length larger than `MAX_PAYLOAD` is rejected before anything is
 allocated, so a hostile count cannot make the peer reserve gigabytes.
+
+`vec<str>` needs its own guard, because its items have no fixed size and
+the `count × item_size` check cannot be made. Every `str` carries at least
+its own 4-byte length prefix, so a count needing more than `4 × count`
+remaining bytes is `Truncated` **before** anything is reserved — the same
+shape of check, adapted.
 
 ## Ids and transactions
 
@@ -197,6 +228,28 @@ containing the transaction reached the screen.
 | 5 | `SHELL` | the connection arrived on the **shell socket** and may send the shell ops (M3) |
 | 6 | `THEME` | the server owns the colour palette and pushes it (M4); see [`Theme`](#theme--0x8004) |
 | 7 | `ICONS` | the server has the symbolic icon set, so `Icon` nodes will actually draw (M4-G); see [`SetIcon`](#seticon--0x0208) |
+| 8 | `POPUP` | `CreatePopup` / `RepositionPopup` / `PopupDone` are accepted (M5-A) |
+| 9 | `CURSOR` | `SetCursor` — a client may ask for a named cursor shape (M5-A) |
+| 10 | `DRAG` | `StartMove` / `StartResize` — client-initiated **window** drag, not DnD (M5-A) |
+| 11 | `OUTPUTS` | `ListOutputs` — an unprivileged client may enumerate outputs (M5-A) |
+| 12 | `KEYMAP` | the server sends the xkb `Keymap` and `Modifiers` (M5-A) |
+| 13 | `RELEASE` | the server sends `BufferReleased` (M5-A) |
+| 14 | `DATA` | clipboard **and** drag-and-drop; see [Data transfer](#data-transfer-caps-data) (M5-A) |
+
+Bits 8–14 together are `caps::CAPS_M5_MASK`, the range
+[`ClientCaps`](#capability-opt-in-clientcaps) governs.
+
+`DATA` is **one** bit for two features because they are one mechanism: the
+offer, the MIME list and the descriptor relay are shared, and
+`RequestSelection` names which of the two it means with a one-byte
+`DataSource`. Two bits would mean two copies of the same four messages.
+
+**None of bits 8–14 is advertised yet.** M5-A froze the protocol surface
+ahead of the behaviour, deliberately, so that the eight follow-up tasks
+implement against bytes nobody can still change. Until each lands, the
+server advertises no bit above 7 and refuses every M5-A client op with
+`Error { Protocol }` — which is the correct answer rather than a stub,
+because no conformant client sends one without the bit.
 
 `SHELL` is bit 5, not bit 3: bit 3 is `REMOTE` and was taken in M1. It is
 *reported*, never negotiated — a client cannot ask for it. See
@@ -225,6 +278,72 @@ use `CreateBuffer`, `BufferDamage` or `SetImage` — see
 [Descriptors on a remote link](#descriptors-on-a-remote-link) and
 `docs/remote.md`. `REMOTE` and `SHELL` never appear together: a TCP port
 cannot prove what a `0700` path proves.
+
+### Capability opt-in: `ClientCaps`
+
+A capability bit alone cannot carry a **server → client** addition, and
+M5-A is the first change to make that matter.
+
+The mechanics: `ServerMsg::decode` answers `UnknownOp` for an op it does
+not know, and the client's `poll` treats that as fatal. So *any* new
+server→client message pushed unprompted kills an older client. "Sending
+the request proves knowledge" does not save the M5-A ops either: a drop
+target never sent a `DATA` op, yet the whole `DragEnter…DragDrop` side is
+pushed at it. The `THEME` precedent (0x8004, pushed to everyone right
+after `Welcome`) got away with it only because every client ships from
+this tree; Route A ends that, because the Chromium backend is built out of
+tree and versioned independently.
+
+So a client names the subset it is ready to receive:
+
+```text
+ClientCaps = 0x0003   { caps: u32 }
+```
+
+The rules:
+
+1. **The server must not send a message belonging to a bit the client did
+   not list.** No `ClientCaps` = 0 = a pre-M5-A client, which sees exactly
+   the v1 message set.
+2. It gates the **server → client** direction only. Client → server ops
+   stay gated on the server's `Welcome` bits, as before. The two are
+   orthogonal: a client may send `ListOutputs` only because the server
+   advertised `OUTPUTS`, and will be *answered* only because it listed
+   `OUTPUTS` in its `ClientCaps`.
+3. Sending a client op whose bit was not listed is `Error { Protocol }`.
+   A client that asks for outputs while claiming not to understand the
+   answer is confused, and this is the cheap place to say so.
+4. Listing a bit means "I know every message this document ties to that
+   bit **at this `VERSION`**". That is what lets
+   [`IconRefused`](#iconrefused--0x8303) ride the existing `ICONS` bit.
+5. A second `ClientCaps` replaces the first — a client may narrow or
+   widen — and is not an error.
+
+**Discovery.** `ClientCaps` is deliberately behind no capability bit of
+its own, which raises the obvious question: how does a client know the
+server understands 0x0003? The rule is
+
+> send `ClientCaps` **only if** `Welcome.caps` carried at least one bit
+> ≥ 8 (`caps::CAPS_M5_MASK`).
+
+A server advertising any bit in that range necessarily knows the op,
+because the bits and the op arrived in the same change. A server
+advertising none has nothing to opt in to, so sending it there is both
+useless and fatal — the exact failure `ClientCaps` exists to prevent,
+running backwards. `Connection::client_caps` *enforces* this rather than
+merely documenting it: it returns without sending when no such bit was
+advertised, so the footgun is unreachable through the helper. A
+hand-rolled client that sends the frame anyway still dies, which is
+correct.
+
+**Grandfather clause.** `ClientCaps` governs **bits 8 and above**, plus
+the single named exception of `IconRefused` under the existing `ICONS`
+bit. The v1-era unconditional pushes — `Theme` under `THEME`, and every
+message of the frozen v1 set — are unchanged and are **not** subject to
+it. The mechanism exists because M5-A is the first change to add
+server→client messages a client may not know; it does not reach backwards,
+and reading rule 1 as retiring the unconditional `Theme` would be a
+behaviour change of `VERSION`-bump weight.
 
 ## Errors
 
@@ -265,6 +384,12 @@ an app because one of its widgets named an icon a newer set has.
 | `WindowState` | `Normal` 0, `Maximized` 1, `Fullscreen` 2, `Minimized` 3 |
 | `Edge` | `Top` 0, `Bottom` 1, `Left` 2, `Right` 3 *(M3, shell)* |
 | `Fill` tag | `None` 0, `Solid` 1, `Linear` 2 |
+| `PopupAnchor` | `None` 0, `Top` 1, `Bottom` 2, `Left` 3, `Right` 4, `TopLeft` 5, `BottomLeft` 6, `TopRight` 7, `BottomRight` 8 *(M5-A)* |
+| `PopupGravity` | the same nine values, same numbering *(M5-A)* |
+| `DragAction` | `None` 0, `Copy` 1, `Move` 2, `Link` 3 *(M5-A)* |
+| `KeymapFormat` | `XkbV1` 1 *(M5-A)* |
+| `DataSource` | `Clipboard` 0, `Drag` 1 *(M5-A)* |
+| `CursorShape` (`u16`) | `None` 0, then `wp_cursor_shape_device_v1` 1–34 — see below *(M5-A)* |
 
 A value outside the list is a decode error, not a silently-ignored
 unknown. `Surface` decodes but is rejected by the server, which
@@ -290,6 +415,61 @@ so it cannot be compared against a constant and a shell could not express
 `SetAnchor`. Opposite edges together mean "span that axis"; neither means
 "centre on it". Unknown bits are reserved and must be zero.
 
+`CursorShape` (M5-A) is a **`u16`**, not a byte, and its values 1–34 are
+`wp_cursor_shape_device_v1`'s **verbatim**:
+
+| value | name | value | name | value | name |
+|---|---|---|---|---|---|
+| 0 | `None` (hide) | 12 | `Copy` | 24 | `SwResize` |
+| 1 | `Default` | 13 | `Move` | 25 | `WResize` |
+| 2 | `ContextMenu` | 14 | `NoDrop` | 26 | `EwResize` |
+| 3 | `Help` | 15 | `NotAllowed` | 27 | `NsResize` |
+| 4 | `Pointer` | 16 | `Grab` | 28 | `NeswResize` |
+| 5 | `Progress` | 17 | `Grabbing` | 29 | `NwseResize` |
+| 6 | `Wait` | 18 | `EResize` | 30 | `ColResize` |
+| 7 | `Cell` | 19 | `NResize` | 31 | `RowResize` |
+| 8 | `Crosshair` | 20 | `NeResize` | 32 | `AllScroll` |
+| 9 | `Text` | 21 | `NwResize` | 33 | `ZoomIn` |
+| 10 | `VerticalText` | 22 | `SResize` | 34 | `ZoomOut` |
+| 11 | `Alias` | 23 | `SeResize` | | |
+
+Borrowing an externally validated list makes a future Wayland adapter a
+cast and stops this enum being re-litigated every time a new cursor is
+wanted. It covers every `ui::mojom::CursorType` a Chromium backend needs:
+the panning family maps to `AllScroll`, the `*NoResize` family to
+`NotAllowed`, and the `kDnd*` family to `NoDrop`/`Move`/`Copy`/`Alias`.
+`CursorType::kCustom` is deliberately unsupported — see the Versioning
+policy.
+
+`constraint_adjust` (M5-A): `SLIDE_X` 1, `SLIDE_Y` 2, `FLIP_X` 4,
+`FLIP_Y` 8, `RESIZE_X` 16, `RESIZE_Y` 32. Used by `CreatePopup` and
+`RepositionPopup`; the values match `ui::OwnedWindowConstraintAdjustment`.
+Unknown bits are reserved and must be zero.
+
+> **`RESIZE_Y` is spelled correctly here.** Chromium's constant is
+> `kAdjustmentRezizeY` — a typo upstream, at the same bit. It is
+> deliberately not copied; do not "fix" ours to match when comparing the
+> two files.
+
+`popup_flags` (M5-A): `GRAB` 1 — take the pointer grab, so a click
+outside the popup chain dismisses the whole chain and is **consumed**
+rather than delivered. Unknown bits are reserved and must be zero.
+
+`resize_edges` (M5-A): `TOP` 1, `BOTTOM` 2, `LEFT` 4, `RIGHT` 8. Used by
+`StartResize`. **The same bit positions as `anchor`, by design**, so a
+toolkit holding one edge set can hand it to either — but a separate module
+in the code, because a resize edge set and a window anchor are not the
+same idea and a shared name would invite them to drift into one. Two bits
+are a corner; 0 means "the server picks". Unknown bits are reserved and
+must be zero.
+
+`drag_actions` (M5-A): `COPY` 1, `MOVE` 2, `LINK` 4 — the *set* a drag
+source offers, on `StartDrag` and `DragEnter`. The destination picks one
+and names it as a `DragAction` in `AcceptDrop`. Without this field
+copy-versus-move (the Ctrl/Shift behaviour every file manager has) could
+not be expressed at all, and `AcceptDrop.action` would have nothing to be
+chosen from. Unknown bits are reserved and must be zero.
+
 **Errata (M3).** Bits 1 and 2 used to be documented as `FULLSCREEN` and
 `OPAQUE`. Both were placeholders that no implementation ever honoured:
 fullscreen is now a window *state* (`SetWindowState`, `WindowState`) rather
@@ -312,12 +492,19 @@ Assigned in blocks of 0x100 so a block can grow without renumbering.
 |---|---|---|
 | `0x0001` | `Hello` | session |
 | `0x0002` | `Commit` | session |
+| `0x0003` | `ClientCaps` | session (M5-A; **no bit of its own**) |
 | `0x0010` | `CreateWindow` | session |
 | `0x0011` | `SetWindowTitle` | session |
 | `0x0012` | `RequestFrame` | session |
 | `0x0013` | `SetWindowState` | session (see `WM`) |
 | `0x0014` | `SetWindowLimits` | session (see `WM`) |
 | `0x0015` | `SetAppId` | session (see `WM`) |
+| `0x0016` | `CreatePopup` | session (see `POPUP`) |
+| `0x0017` | `RepositionPopup` | session (see `POPUP`) |
+| `0x0018` | `SetCursor` | session (see `CURSOR`) |
+| `0x0019` | `StartMove` | session (see `DRAG`) |
+| `0x001a` | `StartResize` | session (see `DRAG`) |
+| `0x001b` | `ListOutputs` | session (see `OUTPUTS`) — **answered in `0x84xx`** |
 | `0x0101` | `CreateNode` | tree |
 | `0x0102` | `DestroyNode` | tree |
 | `0x0103` | `Reparent` | tree |
@@ -336,6 +523,12 @@ Assigned in blocks of 0x100 so a block can grow without renumbering.
 | `0x0302` | `DestroyBuffer` | buffers |
 | `0x0303` | `BufferDamage` | buffers |
 | `0x0304` | `SetImage` | buffers |
+| `0x0305` | `SetSelection` | data transfer (see `DATA`) |
+| `0x0306` | `RequestSelection` | data transfer (see `DATA`) |
+| `0x0307` | `SendSelection` | data transfer (see `DATA`) — **carries 1 fd** |
+| `0x0308` | `StartDrag` | data transfer (see `DATA`) |
+| `0x0309` | `AcceptDrop` | data transfer (see `DATA`) |
+| `0x030a` | `FinishDrag` | data transfer (see `DATA`) |
 | `0x0401` | `SetLayer` | shell (see `SHELL`) |
 | `0x0402` | `SetExclusiveZone` | shell (see `SHELL`) |
 | `0x0403` | `SetAnchor` | shell (see `SHELL`) |
@@ -361,6 +554,7 @@ Assigned in blocks of 0x100 so a block can grow without renumbering.
 | `0x8103` | `Focus` | windows |
 | `0x8104` | `Closed` | windows |
 | `0x8105` | `WindowState` | windows (see `WM`) |
+| `0x8106` | `PopupDone` | windows (see `POPUP`) |
 | `0x8201` | `PointerEnter` | input |
 | `0x8202` | `PointerLeave` | input |
 | `0x8203` | `PointerMotion` | input |
@@ -368,15 +562,48 @@ Assigned in blocks of 0x100 so a block can grow without renumbering.
 | `0x8205` | `PointerAxis` | input |
 | `0x8206` | `Key` | input |
 | `0x8207` | `Touch` | input |
-| `0x8301` | `TextMetrics` | text |
-| `0x8302` | `TextMeasured` | text |
+| `0x8208` | `Keymap` | input (see `KEYMAP`) — **carries 1 fd** |
+| `0x8209` | `Modifiers` | input (see `KEYMAP`) |
+| `0x8301` | `TextMetrics` | replies about content |
+| `0x8302` | `TextMeasured` | replies about content |
+| `0x8303` | `IconRefused` | replies about content (see `ICONS`) |
+| `0x8305` | `BufferReleased` | replies about content (see `RELEASE`) |
 | `0x8401` | `HotKey` | shell (see `SHELL`) |
 | `0x8402` | `WindowInfo` | shell (see `SHELL`) |
 | `0x8403` | `WindowListEnd` | shell (see `SHELL`) |
 | `0x8404` | `WindowGone` | shell (see `SHELL`) |
 | `0x8405` | `OutputInfo` | shell (see `SHELL`) |
 | `0x8406` | `OutputsEnd` | shell (see `SHELL`) |
-| `0x8407` | `OutputGone` | shell (see `SHELL`) |
+| `0x8407` | `OutputGone` | shell (see `SHELL` **or** `OUTPUTS`) |
+| `0x8408` | `OutputWorkArea` | shell (see `SHELL` **or** `OUTPUTS`) |
+| `0x8501` | `SelectionOffer` | data transfer (see `DATA`) |
+| `0x8502` | `SelectionData` | data transfer (see `DATA`) — **carries 1 fd** |
+| `0x8503` | `SelectionRequest` | data transfer (see `DATA`) |
+| `0x8504` | `DragEnter` | data transfer (see `DATA`) |
+| `0x8505` | `DragMotion` | data transfer (see `DATA`) |
+| `0x8506` | `DragLeave` | data transfer (see `DATA`) |
+| `0x8507` | `DragDrop` | data transfer (see `DATA`) |
+| `0x8508` | `DragFinished` | data transfer (see `DATA`) |
+
+Two block notes, both warts kept deliberately.
+
+**Server block 3 is "replies about content", not only text.** The module
+table calls client `0x_3xx` *buffers* and server `0x83xx` *text*, because
+M2 put `TextMetrics`/`TextMeasured` there first. `IconRefused` at `0x8303`
+and `BufferReleased` at `0x8305` restore the block number's original
+meaning — one block for the server's replies about a client's content —
+rather than opening a block per subject. **`0x8304` is deliberately
+free**: it is not a gap to be filled by the next thing that needs a
+number, it is simply unassigned.
+
+**`ListOutputs` is an unprivileged op answered in the shell block.**
+`0x001b` is answered by `OutputInfo` `0x8405`, `OutputWorkArea` `0x8408`
+and `OutputsEnd` `0x8406`, with later `OutputGone` `0x8407`s. Duplicating
+four messages into a new block to keep the numbering tidy would be worse:
+two encoders, two decoders and two things to keep in step forever. The
+access rule, stated once here and again under
+[Shell](#shell-caps-shell): **those four messages are sent to a client
+holding either `SHELL` or `OUTPUTS`.**
 
 ## Messages, client → server
 
@@ -397,6 +624,21 @@ Must be the first message. A version mismatch is fatal.
 
 Applies everything sent since the last commit, atomically. The serial is
 echoed in `Presented`.
+
+### `ClientCaps` — 0x0003
+
+| field | type | meaning |
+|---|---|---|
+| `caps` | `u32` | bits whose **server → client** messages this client understands |
+
+Fixed head 4 bytes. Behind no capability bit of its own; see
+[Capability opt-in](#capability-opt-in-clientcaps) for the five rules, the
+discovery rule (send it only when `Welcome.caps` carried a bit ≥ 8) and
+the grandfather clause (it governs bits 8 and above, plus `IconRefused`
+under `ICONS`).
+
+`caps` must be a subset of what `Welcome` advertised: claiming to
+understand messages the server never offered is `Error { Protocol }`.
 
 ### `CreateWindow` — 0x0010
 
@@ -480,6 +722,151 @@ Fixed head 4 bytes (`window`), then the string — the same shape as
 `SetWindowTitle`.
 
 Requires the `WM` capability bit.
+
+### `CreatePopup` — 0x0016
+
+| field | type | meaning |
+|---|---|---|
+| `id` | `NodeId` | new id for the popup's root group |
+| `parent` | `NodeId` | the parent window, or a parent popup for a submenu chain |
+| `anchor_rect` | `IRect` | rectangle in the parent's logical space to anchor against |
+| `anchor` | `u8` (`PopupAnchor`) | which point of `anchor_rect` the popup hangs off |
+| `gravity` | `u8` (`PopupGravity`) | which way it grows from that point |
+| `constraint` | `u32` | `constraint_adjust` bitmask |
+| `size` | `Size` | requested size in logical pixels |
+| `flags` | `u32` | `popup_flags` bitmask |
+
+Fixed head **42 bytes**; every field is fixed, so the payload is the head.
+Requires `POPUP`.
+
+A popup is a menu or a tooltip — what Wayland calls a popup, and what
+Chromium calls `kMenu`/`kTooltip`. Chromium's `kPopup`/`kBubble` are
+subsurfaces and want ordinary nodes in the parent window instead; they do
+**not** need this op.
+
+**The answer is an ordinary `Configure`.** A popup is a window, so the
+server reports the geometry it actually gave — after any sliding,
+flipping or shrinking `constraint` allowed — through
+[`Configure`](#configure--0x8101), and there is deliberately no
+`PopupConfigure`. `Configure.position` keeps its existing meaning,
+**output-global logical coordinates**, and is *not* parent-relative the
+way `xdg_popup.configure` is: nitro has no reason to hide global
+coordinates (`Configure` has always carried them, which is what lets a
+client crop a screenshot of its own window), and a backend that needs
+parent-relative subtracts the parent's `Configure.position`, which it
+already holds.
+
+**Why `anchor_rect` is an `IRect`.** It is the one integer rectangle in a
+logical-pixel space — everywhere else in the unprivileged blocks, logical
+geometry is `f32` (`SetBounds.rect`, `CreateWindow.size`,
+`Configure.position`), and `IRect` otherwise appears only in *buffer
+pixel* coordinates. The argument for keeping it integer: both ends of the
+only conversation this field has — `xdg_positioner.set_anchor_rect` and
+`ui::OwnedWindowAnchor::anchor_rect`, which is a `gfx::Rect` of integer
+DIP — are integer, so an `f32` here would be a widening on the way in and
+a rounding on the way out, with the rounding landing inside the
+flip/slide/resize arithmetic. A menu that jitters by a subpixel when its
+parent moves is what that buys. And no client has a fractional anchor to
+express: an anchor rect is a widget's box, not a transform. (Both types
+are 16 bytes, so the head is 42 either way.)
+
+`flags` bit `GRAB` takes the pointer grab: a click outside the popup chain
+dismisses the whole chain and is **consumed**, not delivered. Dismissal is
+reported with [`PopupDone`](#popupdone--0x8106), after the popup has
+already been unmapped — the unmap-then-notify ordering Chromium expects.
+
+Authorized by **owning the parent window**, not by an input serial; see
+the Versioning policy.
+
+### `RepositionPopup` — 0x0017
+
+| field | type | meaning |
+|---|---|---|
+| `id` | `NodeId` | the popup, by the sender's own node id |
+| `anchor_rect` | `IRect` | new anchor rectangle in the parent's logical space |
+| `anchor` | `u8` (`PopupAnchor`) | which point of it the popup hangs off |
+| `gravity` | `u8` (`PopupGravity`) | which way it grows |
+| `constraint` | `u32` | `constraint_adjust` bitmask |
+
+Fixed head **26 bytes**. Requires `POPUP`. Answered with another
+`Configure`, exactly as `CreatePopup` is.
+
+**There is deliberately no reposition token.** `xdg_positioner` hands one
+back in `xdg_popup.repositioned` so a client can tell which request a
+configure answers — but Chromium's `XdgPopup::OnRepositioned` is
+`NOTIMPLEMENTED_LOG_ONCE()`
+(`ui/ozone/platform/wayland/host/xdg_popup.cc:360-362`), so the token is
+never matched. A token here would be bytes on every reposition serving one
+call site that does nothing. Noted so a Wayland-literate reader sees a
+decision rather than an oversight.
+
+### `SetCursor` — 0x0018
+
+| field | type | meaning |
+|---|---|---|
+| `shape` | `u16` (`CursorShape`) | the shape wanted; `None` (0) hides the cursor |
+
+Fixed head **2 bytes**. Requires `CURSOR`.
+
+**Names no window, on purpose.** The cursor is a property of the
+*pointer*, not of a surface — `wl_pointer.set_cursor` names no target
+window either — and the authorization is "does this client hold pointer
+focus **now**", which the server answers itself. A client that does not is
+**silently ignored**, not disconnected: focus can legitimately leave
+between the send and the receive, and killing a client for losing that
+race would be killing it for being correct.
+
+A **named shape, never a bitmap**. The compositor knows better how to draw
+a cursor at the output's scale, which is the argument `wp_cursor_shape_v1`
+itself makes, and it is why the enum is that protocol's list verbatim. See
+[Enumerations](#enumerations) for the table and the Versioning policy for
+why `CursorType::kCustom` is unsupported.
+
+### `StartMove` — 0x0019
+
+| field | type | meaning |
+|---|---|---|
+| `window` | `NodeId` | one of the sender's own windows |
+
+Fixed head **4 bytes**. Requires `DRAG`.
+
+What a client-side-decorated window needs to be draggable by its own title
+bar — without it, a client that draws its own decorations cannot be moved
+at all. The server drives the drag from there exactly as it does for one
+begun on a server-drawn frame.
+
+Authorized by pointer focus **and a button actually being down**; ignored
+otherwise, on the same terms as `SetCursor`.
+
+### `StartResize` — 0x001a
+
+| field | type | meaning |
+|---|---|---|
+| `window` | `NodeId` | one of the sender's own windows |
+| `edges` | `u8` | `resize_edges` bitmask: what the user grabbed |
+
+Fixed head **5 bytes**. Requires `DRAG`. Two bits are a corner; `0` lets
+the server choose. Same authorization as `StartMove`.
+
+### `ListOutputs` — 0x001b
+
+No fields; head **0 bytes**. Requires `OUTPUTS`.
+
+Exactly [`Outputs`](#outputs--0x040b) without the shell socket. Answered
+at once with one `OutputInfo` and one `OutputWorkArea` per connected
+output, then an `OutputsEnd`; the connection is then **subscribed** to
+hotplug, so a mode, scale, position or work-area change produces another
+message and an unplug an `OutputGone`. Asking twice re-sends the snapshot;
+the subscription is idempotent.
+
+The snapshot is **complete at `OutputsEnd`** — that terminator is what
+makes it safe for the work area to arrive in a second message rather than
+as a field on `OutputInfo`; see
+[`OutputWorkArea`](#outputworkarea--0x8408).
+
+The answers live in the `0x84xx` shell block. That wart is deliberate: see
+the note under the op-code tables, and the access rule under
+[Shell](#shell-caps-shell).
 
 ### `CreateNode` — 0x0101
 
@@ -796,6 +1183,104 @@ An empty vector means "nothing changed" and is legal.
 | `buffer` | `BufferId` | `NONE` detaches |
 | `src` | `IRect` | source rectangle in buffer pixels |
 
+### `SetSelection` — 0x0305
+
+| field | type | meaning |
+|---|---|---|
+| `mimes` | `vec<str>` | MIME types offered, most preferred first; empty clears |
+
+Head **0 bytes** — the whole payload is the vector. Requires `DATA`.
+
+Declares what this client *can* serve, never any bytes. A paste elsewhere
+earns a [`SelectionRequest`](#selectionrequest--0x8503), answered with
+[`SendSelection`](#sendselection--0x0307--carries-1-fd). An **empty** `mimes` clears the
+selection, and the server then pushes `SelectionOffer { mimes: [] }` to
+everyone.
+
+Authorized by **keyboard focus**, not by an input serial; a client without
+it is `Error { Protocol }`. See [Data transfer](#data-transfer-caps-data).
+
+### `RequestSelection` — 0x0306
+
+| field | type | meaning |
+|---|---|---|
+| `request` | `u32` | the **requester's** own id, echoed in `SelectionData` |
+| `source` | `u8` (`DataSource`) | `Clipboard` or the drag offer currently over this client |
+| `mime` | `str` | the type wanted, from the offer's list |
+
+Fixed head **5 bytes**, then the string. Requires `DATA`.
+
+A `Drag` request is valid **only while this client is the current drop
+target** — it has had a `DragEnter` and neither a `DragLeave` nor a
+completed drag. Outside that window it is `Error { Protocol }`, on the
+same footing as the focus checks that replace input serials.
+
+**Every accepted request is answered exactly once**, and a failure is an
+already-at-EOF descriptor rather than a silence — so the requester needs
+one code path and no timeout. Reusing a `request` that is still
+outstanding is `Error { Protocol }`. See
+[Data transfer](#data-transfer-caps-data) for the two id spaces, the
+failure path and the per-connection bound.
+
+### `SendSelection` — 0x0307 — **carries 1 fd**
+
+| field | type | meaning |
+|---|---|---|
+| `request` | `u32` | the **server's** id, from the `SelectionRequest` being answered |
+
+Fixed head **4 bytes**, plus one descriptor. Requires `DATA`.
+
+**The owner supplies the descriptor** — a readable one: a sealed memfd, or
+the read end of a pipe it writes at its leisure. The server relays it to
+the requester as [`SelectionData`](#selectiondata--0x8502--carries-1-fd) and never reads
+it. A descriptor already at EOF means "I cannot serve that MIME type".
+
+An unknown or stale `request` is **not** an error; the server closes the
+descriptor and drops the message. See
+[Data transfer](#data-transfer-caps-data) for why, and for the
+fd-ownership rules.
+
+### `StartDrag` — 0x0308
+
+| field | type | meaning |
+|---|---|---|
+| `window` | `NodeId` | the window the drag starts from |
+| `icon` | `NodeId` | node to drag under the pointer; `NONE` for no icon |
+| `actions` | `u32` | `drag_actions` bitmask: what this source allows |
+| `mimes` | `vec<str>` | MIME types offered, most preferred first |
+
+Fixed head **12 bytes**, then the vector. Requires `DATA`.
+
+`mimes` is last because it is the variable field, which moves it against
+the M5-A sketch — the same house rule that reordered `SetAppId`. The
+`actions` field is an addition to the sketch: without it copy-versus-move
+cannot be expressed and `AcceptDrop.action` has nothing to be chosen from.
+
+Authorized by pointer focus **and a button actually being down**.
+
+### `AcceptDrop` — 0x0309
+
+| field | type | meaning |
+|---|---|---|
+| `action` | `u8` (`DragAction`) | what this target would do; `None` rejects |
+| `mime` | `str` | the type it would read; empty rejects |
+
+Fixed head **1 byte**, then the string — `mime` moved last for the same
+reason `StartDrag.mimes` did. Requires `DATA`.
+
+Sent by the **destination** while a drag is over it, and again whenever
+the answer changes (the pointer moved to another widget, a modifier went
+down). `action` must be one of the actions `DragEnter` advertised.
+
+### `FinishDrag` — 0x030a
+
+No fields; head **0 bytes**. Requires `DATA`.
+
+Sent by the drag **source** after its
+[`DragFinished`](#dragfinished--0x8508): it releases the offer and the
+server drops the drag icon. A source that disconnects instead is
+equivalent.
+
 ## Messages, server → client
 
 ### `Welcome` — 0x8001
@@ -927,6 +1412,20 @@ event, so receiving one is the only confirmation a state took effect.
 
 Sent only to clients that were told the `WM` capability bit.
 
+### `PopupDone` — 0x8106
+
+| field | type | meaning |
+|---|---|---|
+| `popup` | `NodeId` | the popup, by the owning client's own node id |
+
+Fixed head **4 bytes**. Requires `POPUP`.
+
+The popup was dismissed — an outside click, Escape, or the parent going
+away. The whole chain below the dismissed popup goes with it, each
+reported separately. The server has **already unmapped** it by the time
+this arrives, which is the unmap-then-notify ordering Chromium expects;
+the client should destroy the node.
+
 ### `PointerEnter` — 0x8201
 
 | field | type | meaning |
@@ -988,6 +1487,59 @@ Same fields as `PointerEnter`.
 | `pos` | `Point` | |
 | `time_ns` | `u64` | |
 
+### `Keymap` — 0x8208 — **carries 1 fd**
+
+| field | type | meaning |
+|---|---|---|
+| `format` | `u8` (`KeymapFormat`) | `XkbV1` (1) |
+| `size` | `u32` | bytes to map, **including** the trailing NUL |
+| `rate_hz` | `u32` | advisory repeat rate, repeats per second; 0 = none |
+| `delay_ms` | `u32` | advisory delay before the first repeat; 0 = none |
+
+Fixed head **13 bytes**, plus one descriptor. Requires `KEYMAP`.
+
+For a client that owns its own `xkb_state` and must not have the server
+resolve for it. The existing `Key` fields do not change: a toolkit that
+uses `keysym`/`utf8` never negotiates `KEYMAP` and never sees this. Sent
+after the handshake and again on every layout change.
+
+**The descriptor.** A **sealed memfd** — `memfd_create(MFD_ALLOW_SEALING)`
+plus `F_ADD_SEALS` with `F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL`, as
+`CreateBuffer` demands and for the same `SIGBUS` reason — to be mapped
+`PROT_READ | MAP_PRIVATE`. It holds the `XKB_KEYMAP_FORMAT_TEXT_V1`
+string **NUL-terminated**, with `size` counting the NUL. That is Wayland's
+convention, so an adapter is a pass-through. The **server creates it**;
+the **client owns it** once it has decoded the message, and closes it. One
+frame's descriptors per `sendmsg`, header included, as always.
+
+**`rate_hz` and `delay_ms` are advisory.** They describe the *user's
+preference*, not a server behaviour: nitro synthesises no repeats, so a
+client that wants them repeats itself — exactly `wl_keyboard.repeat_info`,
+which is advisory for the same reason, and exactly what a Chromium backend
+wants since it repeats on its own. They ride here rather than on a message
+of their own because the server recompiles the keymap on config reload
+anyway, so the two always change together. **Until `keyboard.repeat`
+exists in `server.conf` the server sends `0, 0`** — do not read the fields
+as a promise; `docs/settings.md` § `keyboard.repeat` is the other half of
+this note.
+
+### `Modifiers` — 0x8209
+
+| field | type | meaning |
+|---|---|---|
+| `depressed` | `u32` | modifiers currently held down |
+| `latched` | `u32` | modifiers latched for the next key |
+| `locked` | `u32` | modifiers locked (caps lock, num lock) |
+| `group` | `u32` | effective layout (group) index |
+
+Fixed head **16 bytes**. Requires `KEYMAP`.
+
+The four masks `xkb_state_serialize_mods`/`_layout` produce, to be fed
+straight into the client's own `xkb_state_update_mask`. Sent whenever any
+of them changes, and after every `Keymap`. **Meaningful only against the
+keymap that message carried** — the bit positions depend on it, which is
+why `BindKey` uses `mod_mask` names instead.
+
 ### `TextMetrics` — 0x8301
 
 | field | type | meaning |
@@ -1023,6 +1575,57 @@ with it.
 Fixed head 24 bytes, then the vector. Sent on receipt of the
 `MeasureText`, not at a commit. `cursor_x` may be empty.
 
+### `IconRefused` — 0x8303
+
+| field | type | meaning |
+|---|---|---|
+| `serial` | `u32` | the transaction being applied, or 0 outside one |
+| `node` | `NodeId` | the `Icon` node whose name was refused |
+| `name` | `str` | the name that was not found |
+
+Fixed head **8 bytes**, then the string. Requires the **existing** `ICONS`
+bit, and a `ClientCaps` listing it.
+
+The same fact as `Error { BadIcon }` — which is retained verbatim for a
+client that does not know this message — but carrying the **node id**, so
+a toolkit can route the failure to the widget that asked. `Error.msg` is
+documented as being for logs and never parsed; before this message existed
+the toolkit had no choice but to parse the icon name out of it, and this
+is what makes that documentation true again.
+
+A **new op code behind an existing capability bit**: the M2 text ops set
+that precedent, and `ClientCaps` makes it safe here — a client that lists
+`ICONS` is by construction new enough to know this message, and one that
+lists nothing keeps getting `Error { BadIcon }`, prose and all. It is the
+single named exception to "`ClientCaps` governs bits 8 and above".
+
+Non-fatal, exactly as `Error { BadIcon }` is: the node draws nothing and
+the connection stays up.
+
+**Not yet sent by the server.** M5-A ships the message, its layout and
+this section; switching `report_bad_icons` over to it, and deleting the
+toolkit's parser of `Error.msg`, is task **#3786**. Until that lands every
+client still receives `Error { BadIcon }`, whatever its `ClientCaps` says.
+
+*(0x8304 is deliberately unassigned.)*
+
+### `BufferReleased` — 0x8305
+
+| field | type | meaning |
+|---|---|---|
+| `id` | `BufferId` | the buffer whose pixels are free again |
+
+Fixed head **4 bytes**. Requires `RELEASE`.
+
+The server maps a client's pages and reads them at paint time, so a client
+that redraws into a buffer still being composited tears. `Presented` is a
+usable but **conservative** substitute — a buffer is free once blitted
+into the shadow, well before scanout — and this is the exact answer, which
+is what lets a two-buffer client avoid a frame of latency.
+
+It does **not** release the id: that is still `DestroyBuffer`. It says
+only that the pixels may be overwritten.
+
 ## Shell (caps `SHELL`)
 
 The bar, the launcher and the wallpaper are ordinary `nitro-ui` clients.
@@ -1051,6 +1654,26 @@ privileged because of **where they connected**.
 What this is *not*: a per-message capability negotiation, a per-app allow
 list, or an authentication protocol. `docs/shell.md` states the model, the
 threat it does and does not address, and what is deferred.
+
+### The output messages are also reachable with `OUTPUTS`
+
+One exception to "every op in this section requires `SHELL`", added in
+M5-A. `OutputInfo` (0x8405), `OutputsEnd` (0x8406), `OutputGone` (0x8407)
+and `OutputWorkArea` (0x8408) are sent to a client holding **either**
+`SHELL` **or** `OUTPUTS`, because an ordinary client needs the output
+layout for the same reason a shell does — to place a window, to pick a
+maximize geometry, to know a scale before it allocates.
+
+The *request* differs: a shell asks with `Outputs` (0x040b, `SHELL`), an
+ordinary client with `ListOutputs` (0x001b, `OUTPUTS`). The **answers are
+the same four messages**. That leaves an unprivileged `0x00xx` op answered
+in the privileged `0x84xx` block, which is a wart and is kept knowingly:
+duplicating four messages into a new block to tidy the numbering would
+mean two encoders, two decoders and two things to keep in step forever.
+
+Nothing else in this section is reachable without `SHELL`. In particular
+the output messages carry nothing about *other clients' windows*, which is
+what the privilege actually protects.
 
 ### Server-global window ids
 
@@ -1358,6 +1981,269 @@ relative to each other (unplugging the left one moves every other), and a
 diff a shell had to reassemble would be a second source of truth about the
 layout.
 
+### `OutputWorkArea` — 0x8408
+
+| field | type | meaning |
+|---|---|---|
+| `id` | `u32` | the output, the same id `OutputInfo` carries |
+| `area` | `IRect` | work area in **global device pixels** |
+
+Fixed head **20 bytes**. Sent to a client holding `SHELL` **or**
+`OUTPUTS`, like the other four output messages.
+
+The output's rectangle with every exclusive zone subtracted: what
+`Maximized` fills and what new windows are placed into. Sent for each
+output between its `OutputInfo` and the `OutputsEnd` that terminates the
+snapshot, and again whenever the work area alone changes.
+
+`area` is in **device pixels in the global space**, exactly like
+`OutputInfo.x/y/w/h` — consistency inside one subject beats matching a
+consumer's DIP convention, which a backend already has to divide for.
+
+**Why a message rather than a field on `OutputInfo`.** The argument is
+**cadence**, not compatibility. The work area moves when an *exclusive
+zone* changes (`SetExclusiveZone`, a bar hiding itself), which touches
+none of the output's mode, position, scale or name. Folding it into
+`OutputInfo` would force a whole output list to be re-sent on every zone
+change, or leave the field stale — and stale here is a client computing
+maximize geometry wrong. A separate message is both the snapshot carrier
+and the update channel.
+
+The objection that sank a parallel `WindowLayer` in #3697 — "an output is
+briefly listed with an unknown work area" — does not apply, because the
+output list has a **terminator**: the snapshot is complete at
+`OutputsEnd`, and a client reads the whole snapshot before acting on it. A
+window list has no per-window terminator, which is why that case went the
+other way. The Versioning policy has the rest of the argument, including
+why #3697's exemption cannot simply be reused here.
+
+## Data transfer (caps `DATA`)
+
+Clipboard and drag-and-drop are **one capability bit** because they are
+one mechanism: an offer (a list of MIME types), a request naming one type,
+and a file descriptor the bytes travel over. `RequestSelection.source`
+names which of the two a request is about; nothing else differs.
+
+### The clipboard sequence
+
+```text
+owner      →  SetSelection { mimes }                            (0x0305)
+server     →  SelectionOffer { mimes }          to everyone     (0x8501)
+
+requester  →  RequestSelection { request, source, mime }        (0x0306)
+server     →  SelectionRequest { request', source, mime }  to owner  (0x8503)
+owner      →  SendSelection { request' } + 1 fd                 (0x0307)
+server     →  SelectionData { request } + the same fd  to requester (0x8502)
+```
+
+**The owner supplies the descriptor**, which is the inversion Wayland does
+not make, and it is deliberate. A Wayland client serving a large clipboard
+payload needs a *writer state machine* in its event loop, because a pipe
+holds 64 KiB and the compositor hands it the write end. Here an owner that
+already has the bytes hands over a **sealed memfd** and is done — no
+partial writes, no re-entry — and the server relays a descriptor instead
+of copying bytes. An owner that prefers a pipe still may: it creates one,
+sends the read end, and writes at its leisure.
+
+### The drag-and-drop sequence
+
+```text
+source       →  StartDrag { window, icon, actions, mimes }      (0x0308)
+
+server       →  DragEnter { window, pos, actions, mimes }  to target  (0x8504)
+server       →  DragMotion { window, pos, time_ns }        to target  (0x8505)
+target       →  AcceptDrop { action, mime }                    (0x0309)
+target       →  RequestSelection { request, Drag, mime }       (0x0306)  — reads the data
+server       →  DragLeave { window }                      to target  (0x8506)
+  … or …
+server       →  DragDrop { window }                       to target  (0x8507)
+server       →  DragFinished { accepted, action }          to source  (0x8508)
+source       →  FinishDrag                                     (0x030a)
+```
+
+The destination reads the dragged bytes with an ordinary
+`RequestSelection` carrying `source: Drag`, answered by the same
+`SelectionRequest`/`SendSelection`/`SelectionData` machinery. That request
+is valid only between a `DragEnter` and the matching `DragLeave` or the
+end of the drop; outside that window it is `Error { Protocol }`.
+
+**The source learns the action only at `DragFinished`.** There is no
+mid-drag action message — Wayland's `wl_data_source.action` — and that is
+a decision, not an omission: it maps to
+`WmDragHandler::LocationDelegate::OnDragOperationChanged`, which has
+exactly one caller in the whole Chromium tree
+(`ui/ozone/platform/x11/x11_window.cc:1738`) and **zero under
+`ui/ozone/platform/wayland/`**. The Wayland backend never calls it, so a
+nitro backend modelled on it needs nothing here. If cursor feedback ever
+wants it, it is a new op behind the existing `DATA` bit — cheap, and not
+bytes spent on speculation now.
+
+### The two `request` id spaces
+
+They are **different spaces and never meet**; the server maps between
+them.
+
+* `RequestSelection.request` / `SelectionData.request` — the
+  **requester's** id. Client-allocated, namespaced per connection exactly
+  like a `NodeId`. It exists so a client with several reads in flight can
+  match answers. The server echoes it and never interprets it. The
+  `MeasureText`/`TextMeasured` pair is the existing precedent for a
+  client-allocated request id.
+* `SelectionRequest.request` / `SendSelection.request` — the **server's**
+  id, handed to the owner and echoed back. Server-allocated and
+  server-global. An owner must not assume any relationship to the other
+  space.
+
+A requester reusing an id that is still outstanding is
+`Error { Protocol }`: it has made its own answers ambiguous, and unlike
+the owner-side race below that is entirely within its control.
+
+### The failure path, and why there is no timeout
+
+**Every accepted `RequestSelection` is answered by exactly one
+`SelectionData`.** When the server cannot get a descriptor from the owner
+it creates a pipe, closes the write end, and sends the read end —
+byte-identical to the owner's own way of saying "I cannot serve that MIME
+type". So the requester needs exactly one code path and no timeout logic.
+
+It fires when:
+
+* the owner disconnects;
+* the owner answers with an unknown or stale id;
+* the selection owner changes before the `SendSelection` arrives;
+* the per-connection cap below is hit.
+
+The remaining rules:
+
+* **An unknown or stale `request` in `SendSelection` is not a protocol
+  error.** The owner is racing a selection change it has not yet been told
+  about, which is legitimate and unavoidable; killing a correct client for
+  losing that race would be wrong. The server closes the descriptor and
+  drops the message. The original requester has already been answered with
+  an EOF descriptor by the rule above.
+* **If the owner changes between `RequestSelection` and `SendSelection`**,
+  the request is answered from the owner it was *sent to*. A late
+  `SendSelection` from the old owner is the stale case above; the new
+  owner is never asked about an old request.
+* **`MAX_PENDING_SELECTIONS = 16` outstanding requests per connection**,
+  counted as requests a client has *made*. The 17th is answered
+  immediately with an EOF descriptor rather than refused — same single
+  code path, no new error, and the client that is misbehaving is the one
+  that feels it. See [Receive-side limits](#receive-side-limits).
+* A client that never reads its end costs one descriptor and one pipe
+  until it disconnects, which the same cap bounds.
+
+### Two things a client must not do
+
+1. **Do not block on the read.** A hostile or merely slow owner can hand
+   over a descriptor that never reaches EOF — true of Wayland too. Read
+   non-blocking, from the event loop.
+2. **Do not assume the owner writes.** A descriptor already at EOF with no
+   bytes is a documented, expected answer, not a bug.
+
+### Descriptor ownership, per message
+
+| message | who creates the fd | who closes it | what EOF means |
+|---|---|---|---|
+| `Keymap` 0x8208 | the server (sealed memfd) | the client, after mapping | n/a — `size` is exact |
+| `SendSelection` 0x0307 | the selection **owner** | the server, once relayed (or at once if stale) | "I cannot serve that MIME type" |
+| `SelectionData` 0x8502 | relayed, not created | the **requester** | end of the data, or the refusal above |
+| `SelectionRequest` 0x8503 | — **no fd** | — | — |
+
+The two `sendmsg` rules under [File descriptors](#file-descriptors) are
+unchanged and apply in both directions: one frame's descriptors per call,
+and that call includes the frame's header.
+
+### Clearing the selection
+
+`SetSelection { mimes: [] }` clears it, and the server then pushes
+`SelectionOffer { mimes: [] }` to **everyone** rather than saying nothing.
+A client holding a stale offer must be told it is stale, or a paste button
+stays enabled forever after the owning app exits; and an empty list is the
+natural "there is no selection", so both ends of the protocol encode the
+same fact the same way.
+
+### `SelectionOffer` — 0x8501
+
+| field | type | meaning |
+|---|---|---|
+| `mimes` | `vec<str>` | types offered, most preferred first; empty = no selection |
+
+Head **0 bytes** — the payload is the vector. Pushed to every client
+holding `DATA` whenever the selection changes.
+
+### `SelectionData` — 0x8502 — **carries 1 fd**
+
+| field | type | meaning |
+|---|---|---|
+| `request` | `u32` | the requester's own id, echoed back |
+
+Fixed head **4 bytes**, plus one descriptor — the one the owner supplied,
+relayed rather than copied. Read it non-blocking, to EOF; see the two
+rules above.
+
+### `SelectionRequest` — 0x8503
+
+| field | type | meaning |
+|---|---|---|
+| `request` | `u32` | the **server's** id, echoed in `SendSelection` |
+| `source` | `u8` (`DataSource`) | clipboard, or a drag offer |
+| `mime` | `str` | the type wanted, from this client's own offer |
+
+Fixed head **5 bytes**, then the string. **Carries no descriptor**: the
+owner supplies one with `SendSelection`.
+
+### `DragEnter` — 0x8504
+
+| field | type | meaning |
+|---|---|---|
+| `window` | `NodeId` | the window the drag is over |
+| `pos` | `Point` | pointer position in that window's coordinate space |
+| `actions` | `u32` | `drag_actions` bitmask the source offers |
+| `mimes` | `vec<str>` | types offered, most preferred first |
+
+Fixed head **16 bytes**, then the vector.
+
+### `DragMotion` — 0x8505
+
+| field | type | meaning |
+|---|---|---|
+| `window` | `NodeId` | |
+| `pos` | `Point` | |
+| `time_ns` | `u64` | `CLOCK_MONOTONIC` nanoseconds |
+
+Fixed head **20 bytes**.
+
+### `DragLeave` — 0x8506
+
+| field | type | meaning |
+|---|---|---|
+| `window` | `NodeId` | the window the drag left |
+
+Fixed head **4 bytes**. The offer is gone: a `RequestSelection` with
+`source: Drag` after this is `Error { Protocol }`.
+
+### `DragDrop` — 0x8507
+
+| field | type | meaning |
+|---|---|---|
+| `window` | `NodeId` | the window dropped on |
+
+Fixed head **4 bytes**. The destination may still read the data — the
+drag stays open until the transfer finishes — and should have said what it
+would do with `AcceptDrop` before now.
+
+### `DragFinished` — 0x8508
+
+| field | type | meaning |
+|---|---|---|
+| `accepted` | `bool` | whether the offer was taken |
+| `action` | `u8` (`DragAction`) | the action the destination chose |
+
+Fixed head **2 bytes**. Sent to the drag **source**, and the only point at
+which it learns the action. A rejected or cancelled drag is
+`accepted: false` with `action: None`. The source answers `FinishDrag`.
+
 ## Deviations from the M1 sketch
 
 The task's sketch is followed except where a fixed-size head had to come
@@ -1412,6 +2298,35 @@ first, or where a name was ambiguous. Every difference:
     then `family`, then `text`, in that order. The "at most one variable
     tail" rule becomes "the head is still one `repr(C)` struct"; the
     strings are read back to back after it.
+13. **M5-A: `SendSelection` carries the fd, `SelectionRequest` does not.**
+    The sketch gave a descriptor to `SelectionRequest` *and* to
+    `SendSelection` *and* to `SelectionData`, which describes two
+    different protocols at once (a server-made pipe and an owner-made fd)
+    and leaves `SendSelection` with no role in the first. Settled: **the
+    owner supplies the fd**, `SelectionRequest` carries none, and the
+    server relays a descriptor instead of copying bytes. The argument is
+    in [Data transfer](#data-transfer-caps-data): an owner that already
+    has the bytes hands over a sealed memfd and is done, with no writer
+    state machine in its event loop.
+14. **M5-A: `StartDrag` and `DragEnter` gained an `actions` field.** The
+    sketch has none. Without it copy-versus-move — the Ctrl/Shift
+    behaviour every file manager has — cannot be expressed at all, and
+    `AcceptDrop.action` would have nothing to be chosen from.
+15. **M5-A: `RequestSelection` and `SelectionRequest` gained a
+    `DataSource` byte**, moving both heads from 4 to 5. The sketch gives a
+    drop target a `mimes` list in `DragEnter` and then no op with which to
+    ask for the bytes; one byte on the existing request pair is what keeps
+    "the offer/mime/fd machinery is shared" true, and so keeps `DATA` one
+    capability bit rather than two.
+16. **M5-A reorders two messages so the variable field is last**, the same
+    house rule that moved `SetAppId`'s string: `StartDrag` is
+    `{window, icon, actions, mimes}` and `AcceptDrop` is
+    `{action, mime}`.
+17. **M5-A adds `ClientCaps` (0x0003), which is not in the sketch's op
+    list at all.** It is the one addition outside it, and it is what makes
+    every other one safe: without it a pushed server→client message kills
+    a client that does not know the op. See
+    [Capability opt-in](#capability-opt-in-clientcaps).
 
 ## Receive-side limits
 
@@ -1423,6 +2338,7 @@ resource a peer can make it hold:
 | `MAX_PAYLOAD` | 16 MiB | one oversize frame |
 | `MAX_FDS` | 8 | descriptors declared by one frame |
 | `MAX_PENDING_FDS` | 64 | **unclaimed** descriptors held by the framer |
+| `MAX_PENDING_SELECTIONS` | 16 | outstanding selection requests **one connection has made** |
 | `READ_BUDGET` | 1 MiB | bytes one `read`/`poll` call takes before yielding |
 
 `MAX_PENDING_FDS` is the subtle one, and the two receive limits are
@@ -1464,6 +2380,25 @@ case, is a fatal `UnexpectedFd`.
 event loop: a receive loop that ran until `EAGAIN` would let a peer that
 keeps writing hold the loop indefinitely while the framer's buffer grows.
 The socket stays readable, so the next epoll wakeup simply continues.
+
+`MAX_PENDING_SELECTIONS` is the clipboard's peer of `MAX_PENDING_FDS`, and
+bounds a different resource: server *state*, not descriptors. A
+`RequestSelection` parks a mapping from the requester's id to the owner's
+until the owner answers, and an owner is under no obligation to be quick
+— so a client that fires requests and never reads the answers would grow
+that state without bound. The 17th outstanding request is **answered
+immediately with an EOF descriptor** rather than refused: the requester
+already has exactly one code path for "I cannot serve that", so the bound
+costs no new error and no new client code, and the client that feels it is
+the one misbehaving. See
+[the failure path](#the-failure-path-and-why-there-is-no-timeout).
+
+Since M5-A the `MAX_PENDING_FDS` rule runs in **both** directions. A
+client can now receive descriptors (`Keymap`, `SelectionData`), so a buggy
+or hostile server could park them in a client's framer exactly as a client
+could in the server's, and the client's `poll` therefore has the same two
+halves: yield at the cap **if there is a frame to drain**, and be fatal if
+there is not.
 
 A hangup is reported only once nothing decodable is left, so a loop that
 handles one message per wakeup does not lose what already arrived. The
@@ -1583,22 +2518,163 @@ to.
   both said in as many words that the value was reserved for this. The
   observable difference for an old client is that a name it never had a
   reason to send now draws an icon.
-* **`SetCursor` is deferred to M5**, and named here so the gap is a
-  decision rather than an oversight. #3724 gave the *server* five cursor
-  shapes beyond the arrow — the four resize diagonals and the move cross
-  — chosen from the frame region under the pointer (`docs/wm.md`). A
-  **client** still cannot ask for one: a text widget cannot show an
-  I-beam and a link cannot show a hand.
+* **`SetCursor` was deferred to M5, and landed in M5-A** as `0x0018`
+  behind the new `CURSOR` bit. The paragraph below is the M4-era
+  reasoning, kept because the decision it records is still in force for
+  the half that did *not* ship; what changed is recorded after it.
 
-  It is deferred rather than added because the shape is only half of it.
+  #3724 gave the *server* five cursor shapes beyond the arrow — the four
+  resize diagonals and the move cross — chosen from the frame region under
+  the pointer (`docs/wm.md`). A **client** still could not ask for one: a
+  text widget could not show an I-beam and a link could not show a hand.
+
+  It was deferred rather than added because the shape is only half of it.
   A useful `SetCursor` is a named shape *and* a client-supplied bitmap
   with a hotspot, which is a buffer op, a lifetime question (the cursor
   outlives the frame that set it) and a re-entrancy one (the pointer is
-  over a node whose client has gone). Shipping the enum half now would
+  over a node whose client has gone). Shipping the enum half then would
   freeze a message that has to grow the other half later, which is
-  precisely what this policy exists to prevent. When it lands it is the
-  sanctioned path: a new op code in the `0x_02x` gap, a new capability
-  bit, and `VERSION` stays **1**.
+  precisely what this policy exists to prevent.
+
+  **What M5-A changed: the named-shape half is now judged sufficient on
+  its own**, so the message does not have to grow and freezing it is
+  safe. `wp_cursor_shape_v1` makes the argument for us — the compositor
+  knows better how to draw a cursor at the output's scale, and a named
+  shape is what lets it. Every `ui::mojom::CursorType` a browser needs
+  maps onto the list except `kCustom` (CSS `cursor: url(…)`), which is
+  **deliberately unsupported** and falls back to `Pointer`. That is the
+  bitmap half, with all three of its problems, and declining it is what
+  makes the enum half a finished message rather than a down payment. If a
+  bitmap cursor is ever wanted it is a *new op* behind a new bit, not a
+  field on this one.
+
+  Two details of the prediction were wrong and are corrected here rather
+  than quietly: the op landed in `0x001x`, not the `0x_02x` gap the
+  paragraph guessed, and the shape is a `u16` rather than a byte, because
+  the borrowed `wp_cursor_shape_device_v1` numbering is worth more than
+  the byte. `VERSION` stays **1**, as promised.
+
+* **M5-A** — the wire surface for a Chromium Ozone backend: `ClientCaps`
+  `0x0003`, `CreatePopup`…`ListOutputs` `0x0016..0x001b`,
+  `SetSelection`…`FinishDrag` `0x0305..0x030a`, `PopupDone` `0x8106`,
+  `Keymap`/`Modifiers` `0x8208`–`0x8209`, `IconRefused` `0x8303`,
+  `BufferReleased` `0x8305`, `OutputWorkArea` `0x8408`, and the new
+  `0x85xx` data-transfer block. **`VERSION` stays 1.**
+
+  The ordinary part of the argument first: every one of these is a **new
+  op code behind a new capability bit** (bits 8–14: `POPUP`, `CURSOR`,
+  `DRAG`, `OUTPUTS`, `KEYMAP`, `RELEASE`, `DATA`), which is the sanctioned
+  path this list has taken four times already. **No field of any
+  pre-existing message changed and no byte moved** — the
+  `payload_layouts_are_frozen` goldens are untouched, which is the
+  tripwire that says so mechanically. Three things need more than that.
+
+  **1. `IconRefused` is a new op code behind an *existing* bit.** It rides
+  `ICONS` (bit 7) rather than taking a bit of its own, exactly as the M2
+  text ops rode `TEXT`. What makes it safe is `ClientCaps`: a client that
+  lists `ICONS` is by construction new enough to know the message, and one
+  that lists nothing keeps receiving `Error { BadIcon }` verbatim, prose
+  and all. (The alternative — adding a node id to `Error` in place — would
+  have been a bump: `Error` is an unprivileged message any ordinary client
+  receives.)
+
+  **2. `ClientCaps` is the one addition outside the sketch's op list, and
+  it is load-bearing.** A capability bit cannot by itself carry a
+  server→client addition, because `ServerMsg::decode` answers `UnknownOp`
+  for an op it does not know and the client's `poll` treats that as fatal.
+  The `THEME` precedent — 0x8004 pushed to everyone right after `Welcome`
+  — got away with it only because every client ships from this tree. Route
+  A ends that: the Chromium backend is built out of tree and versioned
+  independently. `ClientCaps` is the four bytes that make every pushed
+  M5-A message safe; the rules, the discovery rule and the grandfather
+  clause are under
+  [Capability opt-in](#capability-opt-in-clientcaps). It governs bits 8
+  and above plus the `IconRefused` exception, and does **not** reach
+  backwards: the v1-era unconditional `Theme` push is unchanged, because
+  retiring it would itself be a change of bump weight.
+
+  **3. `work_area` is a new message, not a field on `OutputInfo`.** This
+  is the decision most likely to be second-guessed, so the reasoning is
+  recorded in full.
+
+  Adding it in place would have moved bytes in `OutputInfo`, and the
+  tempting move was to reuse #3697's argument (the `layer` field on
+  `WindowInfo`, further up this list). **That argument cannot be reused
+  here, and saying so is the point.** It has two legs — the block is
+  reachable only through `shell.sock`, and every reader ships from this
+  tree — and `ListOutputs` (0x001b) saws off the first one *by design*: it
+  exists precisely to make `OutputInfo` reachable by unprivileged clients.
+  Re-using an argument after removing its premise is exactly what this
+  policy exists to stop. A parallel `OutputInfo2` was rejected too: two
+  messages carrying the same six fields, forever.
+
+  So `OutputWorkArea` (0x8408) is a message of its own — and the decisive
+  argument for it is not compatibility at all but **cadence**. The work
+  area moves when an *exclusive zone* changes (`SetExclusiveZone`, a bar
+  hiding itself), which touches none of the output's mode, position, scale
+  or name. Folding it in would force a whole output list to be re-sent on
+  every zone change, or leave the field stale — and stale here is a client
+  computing maximize geometry wrong. A separate message is both the
+  snapshot carrier and the update channel.
+
+  The objection that sank a parallel `WindowLayer` in #3697 — "an output
+  is briefly listed with an unknown work area" — does not apply, because
+  the output list has a **terminator**: the snapshot is complete at
+  `OutputsEnd`. A window list has no per-window terminator, which is why
+  that case went the other way. No pre-existing byte moves, so this needs
+  no exemption at all.
+
+  **4. The new strict enums are safe to append to, by the M4-G rule.**
+  `CursorShape`, `PopupAnchor`, `PopupGravity`, `DragAction`,
+  `KeymapFormat` and `DataSource` all decode strictly — an unlisted value
+  is a `BadValue` decode error, as everywhere here — so the question the
+  `NodeKind::Icon`/`BadIcon` paragraph asks applies to each: could a peer
+  receive a value it does not know? It cannot. Every one of these values
+  travels only in a message tied to a bit its receiver must have named:
+  the client→server enums ride ops a client may send only because the
+  server advertised the bit, and the server→client ones ride messages the
+  server may send only because the client listed the bit in `ClientCaps`.
+  Both directions are reachable only by a peer that already knows about
+  them, which is the property that makes appending to a strict enumeration
+  compatible.
+
+* **M5-A deliberately adds no input serials, and that is a decision worth
+  its own entry.** Wayland stamps a serial on every input event, and
+  `set_cursor`, `xdg_popup.grab`, `start_drag` and `set_selection` all
+  require one. nitro's `Key`, `PointerButton` and `PointerEnter` carry
+  none, and M5-A does not add any.
+
+  Adding one **in place** would be a `VERSION` bump by this document's own
+  rule ("a field added in place to any message an ordinary client can
+  receive is a bump"). And it would buy nothing, because the serial's two
+  jobs are both empty here:
+
+  | job | does nitro need it? |
+  |---|---|
+  | anti-spoofing: prove the request follows a real input event this client received | **No.** nitro has no authentication at all — any process with the user's uid may connect (`docs/shell.md`: the grant is "a process running as this user", no finer). A serial check protects nothing that `connect(2)` does not already give away. |
+  | race resolution: reject a request naming a stale focus or grab | **No.** The server already knows who holds pointer and keyboard focus, and processes one client at a time on one thread. "Do you hold focus **now**" is strictly more accurate than "did you at serial N". |
+
+  So every op Wayland would gate on a serial is gated on a **server-side
+  focus check** instead. This is the contract the M5 follow-up tasks
+  implement, so it is stated here rather than left to each of them:
+
+  | op | authorization | on failure |
+  |---|---|---|
+  | `SetCursor` | holds **pointer focus** | silently ignored — focus can legitimately leave between send and receive |
+  | `CreatePopup` / `RepositionPopup` | **owns the parent** window or popup | `Error { UnknownNode }` |
+  | `StartMove` / `StartResize` | holds pointer focus **and** a button is down | silently ignored, as `SetCursor` |
+  | `SetSelection` | holds **keyboard focus** | `Error { Protocol }` |
+  | `StartDrag` | holds pointer focus **and** a button is down | silently ignored |
+  | `RequestSelection { source: Drag }` | is the **current drop target** (had a `DragEnter`, no `DragLeave`, drag not finished) | `Error { Protocol }` |
+
+  The split between "ignored" and "`Protocol`" follows whether the client
+  could plausibly be *racing* rather than lying: pointer focus changes
+  under a client's feet, so losing it is not a protocol violation;
+  asking for a drag offer that never existed is.
+
+  **Consequence for a Chromium backend:** Chromium hands the platform
+  serials it expects forwarded. The backend drops them. Nothing upstream
+  inspects what it does with them.
 
 * `VERSION` is bumped only for a change that is not expressible that way —
   a different framing, a changed field, a removed op. A version mismatch is

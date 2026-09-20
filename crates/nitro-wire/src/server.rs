@@ -357,8 +357,23 @@ impl ClientStream {
     /// Queue a message for this client.
     ///
     /// # Errors
-    /// [`Error::Encode`] for a message that cannot be represented.
+    /// [`Error::Encode`] for a message that cannot be represented, or
+    /// [`Error::RemoteNoFds`] for a message that needs a file descriptor
+    /// on a **remote** connection.
+    ///
+    /// The remote refusal is the twin of the one
+    /// [`Connection::send`](crate::client::Connection::send) has had since
+    /// M4-E1, and it exists for the same reason: since M5-A the *server*
+    /// sends descriptors too ([`Keymap`](crate::msg::Keymap),
+    /// [`SelectionData`](crate::msg::SelectionData)), and a frame whose
+    /// header promises descriptors that can never arrive would leave the
+    /// peer waiting for bytes that do not exist. Refusing before the
+    /// message is encoded leaves nothing queued and the connection
+    /// exactly as it was.
     pub fn send(&mut self, msg: &ServerMsg) -> Result<(), Error> {
+        if self.socket.is_remote() && needs_fd(msg.op()) {
+            return Err(Error::RemoteNoFds);
+        }
         msg.encode(&mut self.out)?;
         Ok(())
     }
@@ -388,13 +403,18 @@ impl ClientStream {
 
 /// Whether an op can only be honoured with a file descriptor attached.
 ///
-/// One op in v1. It is a function rather than a `matches!` at the call
-/// site so that adding a second fd-carrying message is a change in one
-/// place, and so the rule is greppable from the remote code that depends
-/// on it.
+/// **Direction-agnostic**: ops are numerically disjoint between the two
+/// directions, so one function covers both, and since M5-A both
+/// directions have fd-carrying messages. It is a function rather than a
+/// `matches!` at the call site so that adding another fd-carrying message
+/// is a change in one place, and so the rule is greppable from the remote
+/// code that depends on it.
 #[must_use]
 pub fn needs_fd(op: u16) -> bool {
     op == msg::CreateBuffer::OP
+        || op == msg::SendSelection::OP
+        || op == msg::Keymap::OP
+        || op == msg::SelectionData::OP
 }
 
 /// Whether an op is about a **buffer**, and so cannot mean anything on a

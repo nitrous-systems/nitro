@@ -28,6 +28,14 @@ table, error codes and the versioning policy — is in
   the one request/response pair, answered on receipt rather than at a
   commit. Both are accepted whether or not the server reports the `TEXT`
   capability bit; the bit says whether the text will be *visible*.
+* **Capabilities gate both directions, differently.** A client may send
+  an op only if the server advertised its bit in `Welcome`; the server may
+  *push* a message only if the client listed that bit in `ClientCaps`
+  (M5-A, bits 8 and above). The second half exists because an unknown op
+  code is a fatal decode error, so a message pushed at a client that does
+  not know it would kill the connection. `Connection::client_caps`
+  enforces the "only send it to a server new enough to know it" rule
+  itself. See `docs/wire.md`.
 
 ## Client
 
@@ -173,3 +181,8 @@ the guard is removed: unclaimed descriptors cannot accumulate
 cannot monopolise a `read` (`READ_BUDGET`), a hangup does not discard
 already-received messages, and a peer that dies mid-frame terminates the
 loop instead of spinning.
+
+The golden-byte tests (`payload_layouts_are_frozen` and its M5-A twin) are
+the tripwire for an accidental layout change: they hold literal frames for
+the messages whose heads are worth pinning, so a reordered or resized
+field fails there rather than in someone else's decoder.

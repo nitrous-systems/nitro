@@ -425,6 +425,16 @@ nothing behind it — a setting that appears to work, changes nothing, and
 costs a user an afternoon. When key repeat is implemented this key is
 where it goes.
 
+**This stays true after M5-A**, despite what the wire now carries.
+`Keymap` (op `0x8208`, caps `KEYMAP`) has `rate_hz` and `delay_ms`
+fields — but they are **advisory**, describing the *user's preference*
+for a client that repeats on its own, exactly as `wl_keyboard`'s
+`repeat_info` does. The server still synthesises nothing, and until this
+key exists it sends `0, 0`, which the protocol defines as "do not repeat
+/ no preference". So the fields are the wire half of the setting, waiting
+for the setting — not evidence that it is already there. See
+`docs/wire.md` under `Keymap`.
+
 ### Colours: `theme.scheme` and `theme.<role>`
 
 `theme.scheme` picks one of two built-in palettes; each `theme.<role>`

@@ -226,6 +226,20 @@ impl Writer {
         }
     }
 
+    /// Append a `vec<str>`: `u32` count then that many `str` fields.
+    ///
+    /// Separate from [`Writer::put_vec`], which is `Plain`-only because a
+    /// fixed item size is what lets the reader validate a hostile count
+    /// before allocating. A `str` has no fixed size, so
+    /// [`Reader::get_str_vec`] validates against the 4-byte length prefix
+    /// every item must carry instead.
+    pub fn put_str_vec<S: AsRef<str>>(&mut self, items: &[S]) {
+        self.put_u32(items.len() as u32);
+        for it in items {
+            self.put_str(it.as_ref());
+        }
+    }
+
     /// Attach a file descriptor to the frame being written.
     ///
     /// The fd is sent with the `sendmsg` that carries this frame's header.
@@ -468,6 +482,29 @@ impl<'a> Reader<'a> {
         }
         Ok(out)
     }
+
+    /// Read a `vec<str>`: `u32` count then that many `str` fields.
+    ///
+    /// The hostile-count guard matches [`Reader::get_vec`]'s, adapted to a
+    /// variable-size item: each `str` is at least its own 4-byte length
+    /// prefix, so a count needing more than the remaining bytes is
+    /// [`DecodeError::Truncated`] **before** anything is reserved.
+    ///
+    /// # Errors
+    /// [`DecodeError::Truncated`], [`DecodeError::TooLarge`] or
+    /// [`DecodeError::BadUtf8`].
+    pub fn get_str_vec(&mut self) -> Result<Vec<String>, DecodeError> {
+        let count = self.get_u32()? as usize;
+        let need = count.checked_mul(4).ok_or(DecodeError::TooLarge)?;
+        if need > self.remaining() {
+            return Err(DecodeError::Truncated);
+        }
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            out.push(self.get_str()?);
+        }
+        Ok(out)
+    }
 }
 
 /// The fds that arrived with a frame, handed to `decode` in order.
@@ -559,6 +596,7 @@ mod tests {
         w.put_str("héllo");
         w.put_bytes(&[1, 2, 3]);
         w.put_vec(&[Rect::new(1.0, 2.0, 3.0, 4.0)]);
+        w.put_str_vec(&["text/plain".to_owned(), String::new()]);
         let bytes = w.bytes().to_vec();
         let mut r = Reader::new(&bytes);
         assert_eq!(r.get_u8().unwrap(), 1);
@@ -573,6 +611,10 @@ mod tests {
             r.get_vec::<Rect>().unwrap(),
             vec![Rect::new(1.0, 2.0, 3.0, 4.0)]
         );
+        assert_eq!(
+            r.get_str_vec().unwrap(),
+            vec!["text/plain".to_owned(), String::new()]
+        );
         assert!(r.finish().is_ok());
     }
 
@@ -584,6 +626,22 @@ mod tests {
         let bytes = w.bytes().to_vec();
         let mut r = Reader::new(&bytes);
         assert_eq!(r.get_vec::<Rect>(), Err(DecodeError::Truncated));
+
+        // The same, for a `vec<str>`: each item is at least a 4-byte
+        // length prefix, so the count is checked against the bytes
+        // actually available before anything is reserved.
+        let mut r = Reader::new(&bytes);
+        assert_eq!(r.get_str_vec(), Err(DecodeError::Truncated));
+
+        // A count whose byte requirement overflows `usize`.
+        let mut w = Writer::new();
+        w.put_u32(u32::MAX);
+        w.buf.extend_from_slice(&[0u8; 64]);
+        let bytes = w.bytes().to_vec();
+        assert_eq!(
+            Reader::new(&bytes).get_str_vec(),
+            Err(DecodeError::Truncated)
+        );
 
         // Bad UTF-8 and embedded NUL.
         let mut w = Writer::new();

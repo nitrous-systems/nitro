@@ -11,9 +11,9 @@ use nitro_core::{Rect, Size};
 use nitro_wire::client::Connection;
 use nitro_wire::codec::Writer;
 use nitro_wire::io::Socket;
-use nitro_wire::msg::{ClientMsg, Commit, CreateBuffer, SetBounds, SetIcon};
+use nitro_wire::msg::{ClientMsg, Commit, CreateBuffer, Keymap, ServerMsg, SetBounds, SetIcon};
 use nitro_wire::server::{ClientStream, TcpListener};
-use nitro_wire::types::{BufferId, Layer, NodeId, caps, format};
+use nitro_wire::types::{BufferId, KeymapFormat, Layer, NodeId, caps, format};
 use nitro_wire::{Endpoint, Error, header};
 
 mod common;
@@ -208,6 +208,77 @@ fn a_unix_socket_still_carries_descriptors() {
     .encode(&mut w)
     .expect("encode");
     assert!(a.send_all(&mut w).expect("a local socket takes fds"));
+}
+
+/// The server's half of the remote guard, which M5-A made necessary.
+///
+/// Until then only the *client* could send a descriptor, so only
+/// `Connection::send` needed the check. `Keymap` and `SelectionData` go
+/// the other way, and a remote client negotiating `KEYMAP` would otherwise
+/// get a frame whose header promises a descriptor TCP cannot carry — which
+/// desynchronises its stream, the one failure worse than "the feature did
+/// not work". `ClientStream::send` therefore refuses *before* encoding, so
+/// nothing is queued and the connection is exactly as it was.
+#[test]
+fn the_server_refuses_an_fd_frame_on_a_remote_link() {
+    let listener = TcpListener::bind("127.0.0.1:0".parse().expect("addr")).expect("bind");
+    let addr = listener.addr();
+
+    let client = thread::spawn(move || {
+        let endpoint = Endpoint::parse(&format!("tcp://{addr}")).expect("parse");
+        let mut conn = Connection::connect_endpoint(&endpoint, "keymap-client").expect("connect");
+        assert!(conn.has_caps(caps::REMOTE));
+        // Drain for a moment so the assertion is "nothing was sent".
+        let mut msgs = Vec::new();
+        for _ in 0..20 {
+            let _ = conn.poll(&mut msgs);
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+        msgs
+    });
+
+    let mut stream = loop {
+        if let Some(s) = listener.accept().expect("accept") {
+            break s;
+        }
+        thread::sleep(std::time::Duration::from_millis(5));
+    };
+    assert!(stream.is_remote());
+    loop {
+        wait_readable(stream.as_fd());
+        stream.read().expect("read");
+        if let Some(msg) = stream.next_msg().expect("decode") {
+            assert!(nitro_wire::server::is_hello(&msg).is_some());
+            break;
+        }
+    }
+    stream
+        .welcome("nitro", caps::REMOTE | caps::KEYMAP)
+        .expect("welcome");
+    assert!(stream.flush().expect("flush"));
+
+    let err = stream
+        .send(&ServerMsg::Keymap(Keymap {
+            format: KeymapFormat::XkbV1,
+            size: 4096,
+            rate_hz: 25,
+            delay_ms: 600,
+            fd: memfd("remote-keymap", 4096),
+        }))
+        .expect_err("a keymap fd cannot go out over TCP");
+    assert!(
+        matches!(err, Error::RemoteNoFds),
+        "want RemoteNoFds, got {err:?}"
+    );
+    // Nothing queued: the stream is exactly as it was, not wedged.
+    assert!(!stream.has_pending_writes());
+    assert!(stream.flush().expect("the connection still works"));
+
+    let msgs = client.join().expect("client thread");
+    assert!(
+        msgs.iter().all(|m| !matches!(m, ServerMsg::Keymap(_))),
+        "no half-keymap reached the client: {msgs:#?}"
+    );
 }
 
 /// The byte image of one message, spelled out.

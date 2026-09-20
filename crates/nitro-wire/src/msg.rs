@@ -12,8 +12,9 @@
 //! | `0x_0xx` | session and windows | session |
 //! | `0x_1xx` | tree | windows |
 //! | `0x_2xx` | style (including text style) | input |
-//! | `0x_3xx` | buffers | text |
+//! | `0x_3xx` | buffers | replies about content (text, icons, buffers) |
 //! | `0x_4xx` | shell (caps `SHELL`) | shell (caps `SHELL`) |
+//! | `0x_5xx` | — | data transfer (caps `DATA`) |
 //!
 //! # Layout
 //!
@@ -40,8 +41,9 @@ use crate::codec::{FdQueue, Reader, Writer};
 use crate::error::{DecodeError, EncodeError};
 use crate::types::WindowState as WindowStateValue;
 use crate::types::{
-    Align, AxisSource, BufferId, ButtonState, CursorPos, Edge, ErrorCode, Layer, NodeId, NodeKind,
-    TouchPhase, WindowRef,
+    Align, AxisSource, BufferId, ButtonState, CursorPos, CursorShape, DataSource, DragAction, Edge,
+    ErrorCode, KeymapFormat, Layer, NodeId, NodeKind, PopupAnchor, PopupGravity, TouchPhase,
+    WindowRef,
 };
 use crate::wire::Plain;
 
@@ -792,6 +794,340 @@ impl Body for Outputs {
     }
 }
 
+/// Ask for the output list as an **unprivileged** client (needs
+/// [`caps::OUTPUTS`](crate::types::caps::OUTPUTS)).
+///
+/// Exactly [`Outputs`] without the shell socket: answered at once with one
+/// [`OutputInfo`] per connected output, an [`OutputWorkArea`] for each,
+/// and an [`OutputsEnd`]; the connection is then subscribed to hotplug.
+/// The snapshot is complete **at** `OutputsEnd`, which is what makes a
+/// separate work-area message safe.
+///
+/// The answer deliberately re-uses the shell block's messages rather than
+/// duplicating four of them into a new one: those four are sent to a
+/// client holding **either** `SHELL` **or** `OUTPUTS`. `docs/wire.md`
+/// records the wart under both the op-code table and the Shell section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListOutputs;
+
+impl Body for ListOutputs {
+    fn encode_body(&self, _w: &mut Writer) -> Result<(), EncodeError> {
+        Ok(())
+    }
+    fn decode_body(_r: &mut Reader<'_>, _fds: &mut FdQueue) -> Result<Self, DecodeError> {
+        Ok(Self)
+    }
+}
+
+/// End a drag this client started (needs
+/// [`caps::DATA`](crate::types::caps::DATA)).
+///
+/// Sent by the drag **source** after it has been told the outcome with a
+/// [`DragFinished`]: it releases the offer and the server drops the drag
+/// icon. A source that disconnects instead is equivalent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FinishDrag;
+
+impl Body for FinishDrag {
+    fn encode_body(&self, _w: &mut Writer) -> Result<(), EncodeError> {
+        Ok(())
+    }
+    fn decode_body(_r: &mut Reader<'_>, _fds: &mut FdQueue) -> Result<Self, DecodeError> {
+        Ok(Self)
+    }
+}
+
+/// Declare which server→client messages this client understands (M5-A).
+///
+/// **Behind no capability bit of its own**, and the one addition that
+/// makes every other one safe. `ServerMsg::decode` answers
+/// [`DecodeError::UnknownOp`] for an op it does not know and
+/// [`crate::client::Connection::poll`] treats that as fatal — so a
+/// server→client message pushed unprompted would *kill* an older client.
+/// This message is how a client says which of the server's advertised
+/// bits it is ready to receive messages for.
+///
+/// The rules, in full (`docs/wire.md` has them too):
+///
+/// * The server must not send a message belonging to a bit the client did
+///   not list. No `ClientCaps` = 0 = the v1 message set only.
+/// * It gates the **server → client** direction only. Client → server ops
+///   stay gated on the server's `Welcome` bits. The two are orthogonal.
+/// * Sending an op whose bit was not listed is `Error { Protocol }`: a
+///   client asking for outputs while claiming not to understand the
+///   answer is confused.
+/// * Listing a bit means "I know every message this document ties to that
+///   bit **at this `VERSION`**". That is what lets [`IconRefused`] ride
+///   the existing `ICONS` bit.
+/// * A second `ClientCaps` replaces the first — a client may narrow or
+///   widen — and is not an error.
+/// * It governs **bits 8 and above** plus the named [`IconRefused`]
+///   exception. The v1-era unconditional pushes ([`Theme`] under `THEME`,
+///   and every message of the frozen v1 set) are grandfathered and
+///   unchanged: the mechanism does not reach backwards.
+///
+/// Send it **only** when `Welcome.caps` carried at least one bit in
+/// [`caps::CAPS_M5_MASK`](crate::types::caps::CAPS_M5_MASK). A server
+/// advertising any of those necessarily knows this op, because the bits
+/// and the op arrived in the same change; a server advertising none has
+/// nothing to opt in to, so sending it is both useless and fatal.
+/// [`Connection::client_caps`](crate::client::Connection::client_caps)
+/// enforces that rather than merely documenting it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientCaps {
+    /// Bits from [`caps`](crate::types::caps) whose server→client
+    /// messages this client understands. Must be a subset of what
+    /// `Welcome` advertised.
+    pub caps: u32,
+}
+
+impl Body for ClientCaps {
+    fn encode_body(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.put_u32(self.caps);
+        Ok(())
+    }
+    fn decode_body(r: &mut Reader<'_>, _fds: &mut FdQueue) -> Result<Self, DecodeError> {
+        Ok(Self { caps: r.get_u32()? })
+    }
+}
+
+/// Offer the clipboard selection (needs
+/// [`caps::DATA`](crate::types::caps::DATA)).
+///
+/// The client declares the MIME types it can serve; it does **not** send
+/// any bytes. Whoever pastes gets a [`SelectionRequest`] back and answers
+/// with [`SendSelection`].
+///
+/// An **empty** `mimes` clears the selection, and the server then pushes
+/// `SelectionOffer { mimes: [] }` to everyone — a client holding a stale
+/// offer must be told it is stale, or a paste button stays enabled forever
+/// after the owning app exits.
+///
+/// Authorized by keyboard focus, not by an input serial: see the
+/// Versioning policy in `docs/wire.md`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetSelection {
+    /// MIME types offered, most preferred first. Empty clears.
+    pub mimes: Vec<String>,
+}
+
+impl Body for SetSelection {
+    fn encode_body(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.put_str_vec(&self.mimes);
+        Ok(())
+    }
+    fn decode_body(r: &mut Reader<'_>, _fds: &mut FdQueue) -> Result<Self, DecodeError> {
+        Ok(Self {
+            mimes: r.get_str_vec()?,
+        })
+    }
+}
+
+/// Ask to read a selection in one MIME type (needs
+/// [`caps::DATA`](crate::types::caps::DATA)).
+///
+/// `source` says whether this is the clipboard or the drag offer
+/// currently over this client; a [`DataSource::Drag`] request is only
+/// valid between a [`DragEnter`] and the matching [`DragLeave`] or the end
+/// of the drop, and outside that window it is `Error { Protocol }`.
+///
+/// `request` is the **requester's own** id, namespaced per connection like
+/// a [`NodeId`], echoed in the [`SelectionData`] that answers it — the
+/// same shape as [`MeasureText`]'s `request`. It is a *different* id space
+/// from [`SelectionRequest::request`], which the server allocates for the
+/// owner; the server maps between them and the two never meet.
+///
+/// **Every accepted request is answered exactly once.** When the server
+/// cannot get a descriptor from the owner it sends a `SelectionData`
+/// carrying a pipe that is already at EOF, which is byte-identical to the
+/// owner's own way of saying "I cannot serve that". So the requester needs
+/// one code path and no timeout. Reusing a `request` that is still
+/// outstanding is `Error { Protocol }`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestSelection {
+    /// Client-chosen request id, echoed in [`SelectionData`].
+    pub request: u32,
+    /// Clipboard, or the drag offer currently over this client.
+    pub source: DataSource,
+    /// The MIME type wanted, from the offer's list.
+    pub mime: String,
+}
+
+/// The fixed part of [`RequestSelection`] — everything but the mime.
+#[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct RequestSelectionFixed {
+    request: <u32 as Plain>::Wire,
+    source: <DataSource as Plain>::Wire,
+}
+
+impl Body for RequestSelection {
+    fn encode_body(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.put_struct(&RequestSelectionFixed {
+            request: Plain::to_wire(self.request),
+            source: Plain::to_wire(self.source),
+        });
+        w.put_str(&self.mime);
+        Ok(())
+    }
+    fn decode_body(r: &mut Reader<'_>, _fds: &mut FdQueue) -> Result<Self, DecodeError> {
+        let f = r.get_struct::<RequestSelectionFixed>()?;
+        Ok(Self {
+            request: Plain::from_wire(f.request)?,
+            source: Plain::from_wire(f.source)?,
+            mime: r.get_str()?,
+        })
+    }
+}
+
+/// Answer a [`SelectionRequest`] by handing over a readable descriptor
+/// (needs [`caps::DATA`](crate::types::caps::DATA)).
+///
+/// **The owner supplies the fd**, which is the inversion Wayland does not
+/// make: an owner that already has the bytes hands over a *sealed memfd*
+/// and is done, with no partial writes and no writer state machine in its
+/// event loop. An owner that prefers a pipe still may — it creates one,
+/// sends the read end, and writes at its leisure.
+///
+/// "I cannot serve that MIME type" is this message with a descriptor
+/// already at EOF (a pipe whose write end is closed), exactly Wayland's
+/// "close it without writing". The requester must read **non-blocking**: a
+/// hostile owner can hand over a descriptor that never reaches EOF.
+///
+/// `request` is the **server's** id, from the [`SelectionRequest`] this
+/// answers. An unknown or stale one is deliberately *not* a protocol
+/// error — the owner is racing a selection change it has not been told
+/// about yet, which is legitimate and unavoidable. The server closes the
+/// descriptor and drops the message; the original requester was already
+/// answered with an EOF descriptor.
+///
+/// `PartialEq` compares the declared fields only, not which file the
+/// descriptor points at — the [`CreateBuffer`] precedent, and what makes
+/// round-trip tests possible.
+#[derive(Debug)]
+pub struct SendSelection {
+    /// The `request` of the [`SelectionRequest`] being answered.
+    pub request: u32,
+    /// A **readable** descriptor the requester will read to EOF. A sealed
+    /// memfd or the read end of a pipe; EOF with no bytes means "I cannot
+    /// serve that". The server relays it and does not read it.
+    pub fd: OwnedFd,
+}
+
+impl PartialEq for SendSelection {
+    fn eq(&self, o: &Self) -> bool {
+        self.request == o.request
+    }
+}
+
+impl Body for SendSelection {
+    fn encode_body(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.put_u32(self.request);
+        let dup = rustix::io::dup(self.fd.as_fd()).map_err(EncodeError::Fd)?;
+        w.put_fd(dup);
+        Ok(())
+    }
+    fn decode_body(r: &mut Reader<'_>, fds: &mut FdQueue) -> Result<Self, DecodeError> {
+        Ok(Self {
+            request: r.get_u32()?,
+            fd: fds.take()?,
+        })
+    }
+}
+
+/// Start a drag from one of this client's windows (needs
+/// [`caps::DATA`](crate::types::caps::DATA)).
+///
+/// The source offers `mimes` and the set of `actions` it will allow; the
+/// destination picks one and names it in [`AcceptDrop`], and the source
+/// hears the outcome in [`DragFinished`]. There is deliberately **no**
+/// mid-drag action message: Wayland's `wl_data_source.action` maps to
+/// `WmDragHandler::LocationDelegate::OnDragOperationChanged`, which the
+/// Wayland Ozone backend never calls, so the source learning the action
+/// only at the end matches what the backend nitro is modelled on does.
+///
+/// `icon` is a node the server draws under the pointer for the duration;
+/// [`NodeId::NONE`] means "no drag icon".
+///
+/// Authorized by pointer focus plus a button actually being down, not by
+/// an input serial. `mimes` is last because it is the variable field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartDrag {
+    /// The window the drag starts from, by the sender's own node id.
+    pub window: NodeId,
+    /// Node to drag under the pointer, or [`NodeId::NONE`] for none.
+    pub icon: NodeId,
+    /// Offered actions, a [`drag_actions`](crate::types::drag_actions)
+    /// bitmask.
+    pub actions: u32,
+    /// MIME types offered, most preferred first.
+    pub mimes: Vec<String>,
+}
+
+/// The fixed part of [`StartDrag`] — everything but the mime list.
+#[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct StartDragFixed {
+    window: <NodeId as Plain>::Wire,
+    icon: <NodeId as Plain>::Wire,
+    actions: <u32 as Plain>::Wire,
+}
+
+impl Body for StartDrag {
+    fn encode_body(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.put_struct(&StartDragFixed {
+            window: Plain::to_wire(self.window),
+            icon: Plain::to_wire(self.icon),
+            actions: Plain::to_wire(self.actions),
+        });
+        w.put_str_vec(&self.mimes);
+        Ok(())
+    }
+    fn decode_body(r: &mut Reader<'_>, _fds: &mut FdQueue) -> Result<Self, DecodeError> {
+        let f = r.get_struct::<StartDragFixed>()?;
+        Ok(Self {
+            window: Plain::from_wire(f.window)?,
+            icon: Plain::from_wire(f.icon)?,
+            actions: Plain::from_wire(f.actions)?,
+            mimes: r.get_str_vec()?,
+        })
+    }
+}
+
+/// Tell the server what this drop target will do with the offer (needs
+/// [`caps::DATA`](crate::types::caps::DATA)).
+///
+/// Sent by the **destination** while a drag is over it, and again whenever
+/// the answer changes (the pointer moved to a different widget, a modifier
+/// was pressed). An empty `mime`, or [`DragAction::None`], **rejects** the
+/// offer, which is how the source's cursor learns it cannot drop here.
+///
+/// `action` must be one of the actions [`DragEnter`] advertised. `mime` is
+/// last, being the variable field — a reordering against the M5-A sketch,
+/// like [`SetAppId`]'s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptDrop {
+    /// The action this target would take, or [`DragAction::None`] to
+    /// reject.
+    pub action: DragAction,
+    /// The MIME type it would read, or empty to reject.
+    pub mime: String,
+}
+
+impl Body for AcceptDrop {
+    fn encode_body(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.put(self.action);
+        w.put_str(&self.mime);
+        Ok(())
+    }
+    fn decode_body(r: &mut Reader<'_>, _fds: &mut FdQueue) -> Result<Self, DecodeError> {
+        Ok(Self {
+            action: r.get()?,
+            mime: r.get_str()?,
+        })
+    }
+}
+
 /// One window in the shell's window list.
 ///
 /// Sent for each window in answer to [`WindowList`], and again whenever
@@ -1022,6 +1358,315 @@ impl Body for OutputInfo {
     }
 }
 
+/// The xkb keymap, for a client that owns its own `xkb_state` (needs
+/// [`caps::KEYMAP`](crate::types::caps::KEYMAP)).
+///
+/// **Carries one descriptor**, and it is the first time the *server* sends
+/// one. The fd is a **sealed memfd** — `memfd_create(MFD_ALLOW_SEALING)`
+/// plus `F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL`, as [`CreateBuffer`]
+/// demands and for the same `SIGBUS` reason — to be mapped `PROT_READ |
+/// MAP_PRIVATE`. It holds the `XKB_KEYMAP_FORMAT_TEXT_V1` string
+/// **NUL-terminated**, with `size` counting the NUL. That is Wayland's
+/// convention, so an adapter is a pass-through. The client owns the
+/// descriptor once it has decoded the message and closes it.
+///
+/// Sent after the handshake and again on every layout change. The existing
+/// [`Key`] fields do not change: a toolkit that uses `keysym`/`utf8` never
+/// negotiates `KEYMAP` and never sees this.
+///
+/// `rate_hz` and `delay_ms` are **advisory** and describe the *user's
+/// preference*, not a server behaviour: nitro synthesises no repeats, so a
+/// client that wants them repeats itself — exactly `wl_keyboard`'s
+/// `repeat_info`, and exactly what Chromium wants. `0` in either means "do
+/// not repeat / no preference", and until `keyboard.repeat` exists in
+/// `server.conf` the server sends `0, 0`; do not read the fields as a
+/// promise. They ride here rather than on a message of their own because
+/// the server recompiles the keymap on config reload anyway, so the two
+/// always change together.
+///
+/// `PartialEq` compares the declared fields only, not which file the
+/// descriptor points at — the [`CreateBuffer`] precedent.
+#[derive(Debug)]
+pub struct Keymap {
+    /// Format of the bytes in the descriptor.
+    pub format: KeymapFormat,
+    /// Bytes to map, **including** the trailing NUL.
+    pub size: u32,
+    /// Advisory repeat rate in repeats per second; 0 = do not repeat.
+    pub rate_hz: u32,
+    /// Advisory delay in milliseconds before the first repeat; 0 = none.
+    pub delay_ms: u32,
+    /// Sealed memfd holding the keymap; map `PROT_READ | MAP_PRIVATE`.
+    pub fd: OwnedFd,
+}
+
+impl PartialEq for Keymap {
+    fn eq(&self, o: &Self) -> bool {
+        self.format == o.format
+            && self.size == o.size
+            && self.rate_hz == o.rate_hz
+            && self.delay_ms == o.delay_ms
+    }
+}
+
+/// The fixed part of [`Keymap`] — all of it but the descriptor.
+#[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct KeymapFixed {
+    format: <KeymapFormat as Plain>::Wire,
+    size: <u32 as Plain>::Wire,
+    rate_hz: <u32 as Plain>::Wire,
+    delay_ms: <u32 as Plain>::Wire,
+}
+
+impl Body for Keymap {
+    fn encode_body(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.put_struct(&KeymapFixed {
+            format: Plain::to_wire(self.format),
+            size: Plain::to_wire(self.size),
+            rate_hz: Plain::to_wire(self.rate_hz),
+            delay_ms: Plain::to_wire(self.delay_ms),
+        });
+        let dup = rustix::io::dup(self.fd.as_fd()).map_err(EncodeError::Fd)?;
+        w.put_fd(dup);
+        Ok(())
+    }
+    fn decode_body(r: &mut Reader<'_>, fds: &mut FdQueue) -> Result<Self, DecodeError> {
+        let f = r.get_struct::<KeymapFixed>()?;
+        Ok(Self {
+            format: Plain::from_wire(f.format)?,
+            size: Plain::from_wire(f.size)?,
+            rate_hz: Plain::from_wire(f.rate_hz)?,
+            delay_ms: Plain::from_wire(f.delay_ms)?,
+            fd: fds.take()?,
+        })
+    }
+}
+
+/// An icon name a [`SetIcon`] asked for was not in the set (needs the
+/// existing [`caps::ICONS`](crate::types::caps::ICONS) bit, and a
+/// [`ClientCaps`] listing it).
+///
+/// The same fact as `Error { BadIcon }` — which is retained verbatim for a
+/// client that does not know this message — but carrying the **node id**,
+/// so a toolkit can route the failure to the widget that asked instead of
+/// parsing the icon name out of a human-readable string. `Error.msg` is
+/// documented as being for logs and never parsed, and this message is what
+/// makes that true again.
+///
+/// A new op code behind an *existing* capability bit, which the M2 text
+/// ops set the precedent for and [`ClientCaps`] makes safe: a client that
+/// lists `ICONS` is by construction new enough to know this message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IconRefused {
+    /// Serial of the transaction being applied, or 0 outside one.
+    pub serial: u32,
+    /// The `Icon` node whose name was refused.
+    pub node: NodeId,
+    /// The name that was not found.
+    pub name: String,
+}
+
+/// The fixed part of [`IconRefused`] — everything but the name.
+#[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct IconRefusedFixed {
+    serial: <u32 as Plain>::Wire,
+    node: <NodeId as Plain>::Wire,
+}
+
+impl Body for IconRefused {
+    fn encode_body(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.put_struct(&IconRefusedFixed {
+            serial: Plain::to_wire(self.serial),
+            node: Plain::to_wire(self.node),
+        });
+        w.put_str(&self.name);
+        Ok(())
+    }
+    fn decode_body(r: &mut Reader<'_>, _fds: &mut FdQueue) -> Result<Self, DecodeError> {
+        let f = r.get_struct::<IconRefusedFixed>()?;
+        Ok(Self {
+            serial: Plain::from_wire(f.serial)?,
+            node: Plain::from_wire(f.node)?,
+            name: r.get_str()?,
+        })
+    }
+}
+
+/// A new clipboard selection exists (needs
+/// [`caps::DATA`](crate::types::caps::DATA)).
+///
+/// Pushed to every client whenever the selection changes, carrying the
+/// MIME types the new owner offers. An **empty** list means there is no
+/// selection — the encoding [`SetSelection`] uses to clear it, so both
+/// ends of the protocol say the same fact the same way, and a paste button
+/// can be disabled rather than left enabled forever after the owning app
+/// exits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectionOffer {
+    /// MIME types offered, most preferred first. Empty = no selection.
+    pub mimes: Vec<String>,
+}
+
+impl Body for SelectionOffer {
+    fn encode_body(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.put_str_vec(&self.mimes);
+        Ok(())
+    }
+    fn decode_body(r: &mut Reader<'_>, _fds: &mut FdQueue) -> Result<Self, DecodeError> {
+        Ok(Self {
+            mimes: r.get_str_vec()?,
+        })
+    }
+}
+
+/// The answer to a [`RequestSelection`]: a descriptor to read the data
+/// from (needs [`caps::DATA`](crate::types::caps::DATA)).
+///
+/// **Carries one descriptor**, the one the owner supplied with
+/// [`SendSelection`], relayed rather than copied. `request` is the
+/// requester's own id, echoed back.
+///
+/// The requester **must read non-blocking** and must not assume the owner
+/// writes: a descriptor already at EOF is how "I cannot serve that MIME
+/// type" is said, and a hostile owner can hand over one that never reaches
+/// EOF. Every accepted request earns exactly one of these — when the
+/// server cannot get a descriptor from the owner (it disconnected, it
+/// answered a stale id, the selection changed, or the per-connection cap
+/// was hit) the server makes a pipe, closes the write end, and sends the
+/// read end, which is byte-identical. One code path, no timeout.
+///
+/// `PartialEq` compares the declared fields only — the [`CreateBuffer`]
+/// precedent.
+#[derive(Debug)]
+pub struct SelectionData {
+    /// The `request` of the [`RequestSelection`] this answers.
+    pub request: u32,
+    /// A readable descriptor; read it to EOF, non-blocking.
+    pub fd: OwnedFd,
+}
+
+impl PartialEq for SelectionData {
+    fn eq(&self, o: &Self) -> bool {
+        self.request == o.request
+    }
+}
+
+impl Body for SelectionData {
+    fn encode_body(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.put_u32(self.request);
+        let dup = rustix::io::dup(self.fd.as_fd()).map_err(EncodeError::Fd)?;
+        w.put_fd(dup);
+        Ok(())
+    }
+    fn decode_body(r: &mut Reader<'_>, fds: &mut FdQueue) -> Result<Self, DecodeError> {
+        Ok(Self {
+            request: r.get_u32()?,
+            fd: fds.take()?,
+        })
+    }
+}
+
+/// Someone wants the selection this client owns (needs
+/// [`caps::DATA`](crate::types::caps::DATA)).
+///
+/// Carries **no descriptor**: the owner supplies one, with
+/// [`SendSelection`] carrying this `request` back. `source` says whether
+/// the clipboard or a drag offer is being read, for an owner serving both.
+///
+/// `request` is the **server's** id, server-global and handed to the
+/// owner. It is a different id space from [`RequestSelection::request`],
+/// which the requester allocates; the server maps between them and an
+/// owner must not assume any relationship.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectionRequest {
+    /// Server-allocated request id, echoed in [`SendSelection`].
+    pub request: u32,
+    /// Whether the clipboard or a drag offer is being read.
+    pub source: DataSource,
+    /// The MIME type wanted, from the list this client offered.
+    pub mime: String,
+}
+
+/// The fixed part of [`SelectionRequest`] — everything but the mime.
+#[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct SelectionRequestFixed {
+    request: <u32 as Plain>::Wire,
+    source: <DataSource as Plain>::Wire,
+}
+
+impl Body for SelectionRequest {
+    fn encode_body(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.put_struct(&SelectionRequestFixed {
+            request: Plain::to_wire(self.request),
+            source: Plain::to_wire(self.source),
+        });
+        w.put_str(&self.mime);
+        Ok(())
+    }
+    fn decode_body(r: &mut Reader<'_>, _fds: &mut FdQueue) -> Result<Self, DecodeError> {
+        let f = r.get_struct::<SelectionRequestFixed>()?;
+        Ok(Self {
+            request: Plain::from_wire(f.request)?,
+            source: Plain::from_wire(f.source)?,
+            mime: r.get_str()?,
+        })
+    }
+}
+
+/// A drag entered one of this client's windows (needs
+/// [`caps::DATA`](crate::types::caps::DATA)).
+///
+/// The destination learns what is on offer and which `actions` the source
+/// allows, answers with [`AcceptDrop`], and reads the bytes with a
+/// [`RequestSelection`] carrying
+/// [`DataSource::Drag`](crate::types::DataSource::Drag) — which is valid
+/// from here until the matching [`DragLeave`] or the end of the drop.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DragEnter {
+    /// The window the drag is over.
+    pub window: NodeId,
+    /// Pointer position in that window's coordinate space.
+    pub pos: Point,
+    /// Actions the source offers; a
+    /// [`drag_actions`](crate::types::drag_actions) bitmask.
+    pub actions: u32,
+    /// MIME types offered, most preferred first.
+    pub mimes: Vec<String>,
+}
+
+/// The fixed part of [`DragEnter`] — everything but the mime list.
+#[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct DragEnterFixed {
+    window: <NodeId as Plain>::Wire,
+    pos: <Point as Plain>::Wire,
+    actions: <u32 as Plain>::Wire,
+}
+
+impl Body for DragEnter {
+    fn encode_body(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.put_struct(&DragEnterFixed {
+            window: Plain::to_wire(self.window),
+            pos: Plain::to_wire(self.pos),
+            actions: Plain::to_wire(self.actions),
+        });
+        w.put_str_vec(&self.mimes);
+        Ok(())
+    }
+    fn decode_body(r: &mut Reader<'_>, _fds: &mut FdQueue) -> Result<Self, DecodeError> {
+        let f = r.get_struct::<DragEnterFixed>()?;
+        Ok(Self {
+            window: Plain::from_wire(f.window)?,
+            pos: Plain::from_wire(f.pos)?,
+            actions: Plain::from_wire(f.actions)?,
+            mimes: r.get_str_vec()?,
+        })
+    }
+}
+
 fixed_msg! {
     /// Ask for a frame callback on this window: the server answers with
     /// [`Frame`] carrying the deadline for the next flip. One request,
@@ -1167,6 +1812,123 @@ fixed_msg! {
         buffer: BufferId,
         /// Source rectangle in buffer pixels.
         src: IRect,
+    }
+
+    // ------------------------------------------------------- M5-A (M5)
+
+    /// Create a **popup**: a menu or tooltip positioned against a
+    /// rectangle of its parent (needs
+    /// [`caps::POPUP`](crate::types::caps::POPUP)).
+    ///
+    /// A popup is a window, so its constrained geometry arrives as an
+    /// ordinary [`Configure`] — there is no `PopupConfigure`.
+    /// `Configure.position` keeps its usual meaning, **output-global**
+    /// logical coordinates, and is *not* parent-relative the way
+    /// `xdg_popup.configure` is; a backend that wants parent-relative
+    /// subtracts the parent's `Configure.position`, which it already
+    /// holds.
+    ///
+    /// `anchor_rect` is an [`IRect`] — the one integer rectangle in a
+    /// logical-pixel space, argued in `docs/wire.md`: both ends of the
+    /// only conversation this field has (`xdg_positioner.set_anchor_rect`
+    /// and `ui::OwnedWindowAnchor::anchor_rect`) are integer, and an
+    /// `f32` would put a rounding inside the flip/slide arithmetic.
+    ///
+    /// The server dismisses a popup with [`PopupDone`]. `flags` carries
+    /// [`popup_flags`](crate::types::popup_flags): `GRAB` takes the
+    /// pointer grab, so a click outside the chain dismisses the whole
+    /// chain and is consumed.
+    ///
+    /// Authorized by owning the parent window, not by an input serial.
+    CreatePopup {
+        /// Node id for the popup's root group, allocated by the client.
+        id: NodeId,
+        /// The parent window (or parent popup, for a submenu chain).
+        parent: NodeId,
+        /// Rectangle in the parent's logical space to anchor against,
+        /// in integer logical pixels.
+        anchor_rect: IRect,
+        /// Which point of `anchor_rect` the popup hangs off.
+        anchor: PopupAnchor,
+        /// Which way the popup grows from that point.
+        gravity: PopupGravity,
+        /// What the server may do when it does not fit; a
+        /// [`constraint_adjust`](crate::types::constraint_adjust) bitmask.
+        constraint: u32,
+        /// Requested size in logical pixels; the server answers with what
+        /// it gave in [`Configure`].
+        size: Size,
+        /// Bits from [`popup_flags`](crate::types::popup_flags).
+        flags: u32,
+    }
+
+    /// Move an existing popup to a new anchor (needs
+    /// [`caps::POPUP`](crate::types::caps::POPUP)).
+    ///
+    /// The result arrives as another [`Configure`]. There is deliberately
+    /// **no reposition token**: Chromium's `XdgPopup::OnRepositioned` is
+    /// `NOTIMPLEMENTED_LOG_ONCE()`
+    /// (`ui/ozone/platform/wayland/host/xdg_popup.cc:360-362`), so the
+    /// token upstream hands it is never matched, and a token here would
+    /// be bytes on every reposition serving one call site that does
+    /// nothing.
+    RepositionPopup {
+        /// The popup, by the sender's own node id.
+        id: NodeId,
+        /// New anchor rectangle in the parent's logical space.
+        anchor_rect: IRect,
+        /// Which point of it the popup hangs off.
+        anchor: PopupAnchor,
+        /// Which way it grows from that point.
+        gravity: PopupGravity,
+        /// [`constraint_adjust`](crate::types::constraint_adjust) bitmask.
+        constraint: u32,
+    }
+
+    /// Ask for a named cursor shape (needs
+    /// [`caps::CURSOR`](crate::types::caps::CURSOR)).
+    ///
+    /// Deliberately names **no window**: the cursor is a property of the
+    /// *pointer*, not of a surface — `wl_pointer.set_cursor` names no
+    /// target window either — and the authorization is "does this client
+    /// hold pointer focus", which the server answers itself. A client
+    /// that does not is silently ignored rather than disconnected: focus
+    /// can legitimately leave between send and receive.
+    ///
+    /// A named shape, never a bitmap: the compositor knows better how to
+    /// draw a cursor at the output's scale, which is the argument
+    /// `wp_cursor_shape_v1` itself makes.
+    /// [`CursorShape::None`](crate::types::CursorShape::None) hides it.
+    SetCursor {
+        /// The shape wanted.
+        shape: CursorShape,
+    }
+
+    /// Start an interactive **window move** (needs
+    /// [`caps::DRAG`](crate::types::caps::DRAG)).
+    ///
+    /// What a client-side-decorated window needs to be draggable by its
+    /// own title bar. The server drives the drag from there, exactly as
+    /// it does for a drag begun on a server-drawn frame.
+    ///
+    /// Authorized by pointer focus **and** a button actually being down,
+    /// not by an input serial; otherwise ignored.
+    StartMove {
+        /// The window, by the sender's own node id.
+        window: NodeId,
+    }
+
+    /// Start an interactive **window resize** (needs
+    /// [`caps::DRAG`](crate::types::caps::DRAG)).
+    ///
+    /// `edges` is a [`resize_edges`](crate::types::resize_edges) bitmask
+    /// naming what the user grabbed; two bits are a corner and 0 lets the
+    /// server choose. Same authorization as [`StartMove`].
+    StartResize {
+        /// The window, by the sender's own node id.
+        window: NodeId,
+        /// Bitmask from [`resize_edges`](crate::types::resize_edges).
+        edges: u8,
     }
 
     // ----------------------------------------------------- shell (SHELL)
@@ -1338,6 +2100,9 @@ msg_enum! {
         Hello = 0x0001,
         /// Apply the pending mutations atomically.
         Commit = 0x0002,
+        /// Declare which server→client messages this client understands
+        /// (M5-A; behind no capability bit of its own).
+        ClientCaps = 0x0003,
         /// Create a top-level window.
         CreateWindow = 0x0010,
         /// Retitle a window.
@@ -1350,6 +2115,18 @@ msg_enum! {
         SetWindowLimits = 0x0014,
         /// Give a window an application id (needs `caps::WM`).
         SetAppId = 0x0015,
+        /// Create a popup (needs `caps::POPUP`).
+        CreatePopup = 0x0016,
+        /// Move an existing popup (needs `caps::POPUP`).
+        RepositionPopup = 0x0017,
+        /// Ask for a named cursor shape (needs `caps::CURSOR`).
+        SetCursor = 0x0018,
+        /// Start an interactive window move (needs `caps::DRAG`).
+        StartMove = 0x0019,
+        /// Start an interactive window resize (needs `caps::DRAG`).
+        StartResize = 0x001a,
+        /// Ask for the output list unprivileged (needs `caps::OUTPUTS`).
+        ListOutputs = 0x001b,
         /// Create a node.
         CreateNode = 0x0101,
         /// Destroy a node and its subtree.
@@ -1388,6 +2165,20 @@ msg_enum! {
         BufferDamage = 0x0303,
         /// Attach a buffer region to an image node.
         SetImage = 0x0304,
+        /// Offer the clipboard selection (needs `caps::DATA`).
+        SetSelection = 0x0305,
+        /// Ask to read a selection (needs `caps::DATA`).
+        RequestSelection = 0x0306,
+        /// Answer a `SelectionRequest` with a readable fd (needs
+        /// `caps::DATA`; carries one fd).
+        SendSelection = 0x0307,
+        /// Start a drag (needs `caps::DATA`).
+        StartDrag = 0x0308,
+        /// Accept or reject the offer over this target (needs
+        /// `caps::DATA`).
+        AcceptDrop = 0x0309,
+        /// End a drag this client started (needs `caps::DATA`).
+        FinishDrag = 0x030a,
         /// Move one of this client's windows to another layer (needs
         /// `caps::SHELL`).
         SetLayer = 0x0401,
@@ -1736,6 +2527,131 @@ fixed_msg! {
         time_ns: u64,
     }
 
+    // ------------------------------------------------------- M5-A (M5)
+
+    /// A popup was dismissed (needs
+    /// [`caps::POPUP`](crate::types::caps::POPUP)).
+    ///
+    /// An outside click, Escape, or the parent going away. The whole
+    /// chain below the dismissed popup goes with it, each reported
+    /// separately. The client should destroy the node; the server has
+    /// already unmapped it, which is the unmap-then-notify ordering
+    /// Chromium expects.
+    PopupDone {
+        /// The popup, by the owning client's own node id.
+        popup: NodeId,
+    }
+
+    /// The xkb modifier masks changed (needs
+    /// [`caps::KEYMAP`](crate::types::caps::KEYMAP)).
+    ///
+    /// The four masks `xkb_state_serialize_mods`/`_layout` produce, to be
+    /// fed straight into the client's own `xkb_state_update_mask`. Sent
+    /// whenever any of them changes, and after every [`Keymap`]. Meaningful
+    /// only against the keymap that message carried — the bit positions
+    /// depend on it, which is why [`BindKey`] uses names instead.
+    Modifiers {
+        /// Modifiers currently held down.
+        depressed: u32,
+        /// Modifiers latched for the next key.
+        latched: u32,
+        /// Modifiers locked (caps lock, num lock).
+        locked: u32,
+        /// Effective layout (group) index.
+        group: u32,
+    }
+
+    /// The server has finished reading a buffer (needs
+    /// [`caps::RELEASE`](crate::types::caps::RELEASE)).
+    ///
+    /// The server maps the client's pages and reads them at paint time,
+    /// so a client that redraws into a buffer still being composited
+    /// tears. [`Presented`] is a usable but conservative substitute — a
+    /// buffer is free once blitted, well before scanout — and this is the
+    /// exact answer: after it, the id's pixels may be overwritten. It does
+    /// **not** release the id itself; that is still [`DestroyBuffer`].
+    BufferReleased {
+        /// The buffer whose pixels are free again.
+        id: BufferId,
+    }
+
+    /// An output's **work area** (needs
+    /// [`caps::SHELL`](crate::types::caps::SHELL) or
+    /// [`caps::OUTPUTS`](crate::types::caps::OUTPUTS)).
+    ///
+    /// The output's rectangle with every exclusive zone subtracted: what
+    /// `Maximized` fills and what new windows are placed into. Sent for
+    /// each output between its [`OutputInfo`] and the [`OutputsEnd`] that
+    /// terminates the snapshot, and again whenever the work area alone
+    /// changes.
+    ///
+    /// A message rather than a field on `OutputInfo`, and the argument is
+    /// **cadence** rather than compatibility: the work area moves when an
+    /// exclusive zone changes ([`SetExclusiveZone`], a bar hiding itself),
+    /// which touches none of the output's mode, position, scale or name.
+    /// Folding it in would force a whole output list to be re-sent on
+    /// every zone change, or leave the field stale — and stale here is a
+    /// client computing maximize geometry wrong. `docs/wire.md` has the
+    /// full argument, including why #3697's reasoning cannot be reused.
+    ///
+    /// `area` is in **device pixels in the global space**, exactly like
+    /// [`OutputInfo`]'s `x`/`y`/`w`/`h`.
+    OutputWorkArea {
+        /// The output, the same id [`OutputInfo`] carries.
+        id: u32,
+        /// Work area in global device pixels.
+        area: IRect,
+    }
+
+    /// The drag moved inside a window (needs
+    /// [`caps::DATA`](crate::types::caps::DATA)).
+    DragMotion {
+        /// The window the drag is over.
+        window: NodeId,
+        /// Pointer position in that window's coordinate space.
+        pos: Point,
+        /// Event time, `CLOCK_MONOTONIC` nanoseconds.
+        time_ns: u64,
+    }
+
+    /// The drag left a window (needs
+    /// [`caps::DATA`](crate::types::caps::DATA)).
+    ///
+    /// The offer is gone: a [`RequestSelection`] with
+    /// [`DataSource::Drag`](crate::types::DataSource::Drag) after this is
+    /// `Error { Protocol }`.
+    DragLeave {
+        /// The window the drag left.
+        window: NodeId,
+    }
+
+    /// The user dropped over a window (needs
+    /// [`caps::DATA`](crate::types::caps::DATA)).
+    ///
+    /// The destination may still read the data — the drag window stays
+    /// open until the transfer finishes — and should have said what it
+    /// would do with [`AcceptDrop`] before now.
+    DragDrop {
+        /// The window dropped on.
+        window: NodeId,
+    }
+
+    /// A drag this client started ended (needs
+    /// [`caps::DATA`](crate::types::caps::DATA)).
+    ///
+    /// Sent to the drag **source**, carrying the action the destination
+    /// settled on — the only point at which the source learns it, which
+    /// matches what the Wayland Ozone backend does (it never calls
+    /// `OnDragOperationChanged`). A rejected or cancelled drag is
+    /// `accepted: false` with [`DragAction::None`]. The source answers
+    /// [`FinishDrag`].
+    DragFinished {
+        /// Whether the offer was taken.
+        accepted: bool,
+        /// The action the destination chose.
+        action: DragAction,
+    }
+
     // ----------------------------------------------------- shell (SHELL)
 
     /// A hotkey bound with [`BindKey`] fired (shell only).
@@ -1788,6 +2704,8 @@ msg_enum! {
         Closed = 0x8104,
         /// A window's state changed (needs `caps::WM`).
         WindowState = 0x8105,
+        /// A popup was dismissed (needs `caps::POPUP`).
+        PopupDone = 0x8106,
         /// Pointer entered.
         PointerEnter = 0x8201,
         /// Pointer left.
@@ -1802,10 +2720,21 @@ msg_enum! {
         Key = 0x8206,
         /// Touch point.
         Touch = 0x8207,
+        /// The xkb keymap (needs `caps::KEYMAP`; carries one fd).
+        Keymap = 0x8208,
+        /// The xkb modifier masks (needs `caps::KEYMAP`).
+        Modifiers = 0x8209,
         /// Metrics of a text node the server just shaped.
         TextMetrics = 0x8301,
         /// Answer to a `MeasureText`.
         TextMeasured = 0x8302,
+        /// A `SetIcon` named an icon the set does not have, with the node
+        /// id (needs the existing `caps::ICONS` bit; M5-A).
+        IconRefused = 0x8303,
+        // 0x8304 is deliberately free.
+        /// The server has finished reading a buffer (needs
+        /// `caps::RELEASE`).
+        BufferReleased = 0x8305,
         /// A bound hotkey fired (needs `caps::SHELL`).
         HotKey = 0x8401,
         /// One window of the shell's list (needs `caps::SHELL`).
@@ -1820,6 +2749,26 @@ msg_enum! {
         OutputsEnd = 0x8406,
         /// An output was unplugged (needs `caps::SHELL`).
         OutputGone = 0x8407,
+        /// An output's work area (needs `caps::SHELL` or `caps::OUTPUTS`).
+        OutputWorkArea = 0x8408,
+        /// A new clipboard selection exists (needs `caps::DATA`).
+        SelectionOffer = 0x8501,
+        /// Answer to a `RequestSelection` (needs `caps::DATA`; carries one
+        /// fd).
+        SelectionData = 0x8502,
+        /// Someone wants the selection this client owns (needs
+        /// `caps::DATA`).
+        SelectionRequest = 0x8503,
+        /// A drag entered a window (needs `caps::DATA`).
+        DragEnter = 0x8504,
+        /// A drag moved inside a window (needs `caps::DATA`).
+        DragMotion = 0x8505,
+        /// A drag left a window (needs `caps::DATA`).
+        DragLeave = 0x8506,
+        /// The user dropped over a window (needs `caps::DATA`).
+        DragDrop = 0x8507,
+        /// A drag this client started ended (needs `caps::DATA`).
+        DragFinished = 0x8508,
     }
 }
 

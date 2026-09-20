@@ -3,6 +3,7 @@
 //! buffer.
 
 use std::os::fd::BorrowedFd;
+use std::os::fd::OwnedFd;
 use std::path::Path;
 
 use nitro_core::{Color, IRect, Rect, Size, Transform};
@@ -14,14 +15,19 @@ use crate::error::Error;
 use crate::framing::Framer;
 use crate::io::Socket;
 use crate::msg::{
-    BindKey, BufferDamage, ClientMsg, CloseWindow, Commit, CreateBuffer, CreateNode, CreateWindow,
-    DestroyBuffer, DestroyNode, Fill, FocusWindow, GrabKeyboard, Hello, MeasureText, Outputs,
-    Reparent, RequestFrame, ServerMsg, SetAnchor, SetAppId, SetBorder, SetBounds, SetClip,
-    SetCorners, SetExclusiveZone, SetFill, SetIcon, SetImage, SetLayer, SetOpacity, SetText,
-    SetTransform, SetVisible, SetWindowLimits, SetWindowState, SetWindowStateFor, SetWindowTitle,
+    AcceptDrop, BindKey, BufferDamage, ClientCaps, ClientMsg, CloseWindow, Commit, CreateBuffer,
+    CreateNode, CreatePopup, CreateWindow, DestroyBuffer, DestroyNode, Fill, FinishDrag,
+    FocusWindow, GrabKeyboard, Hello, ListOutputs, MeasureText, Outputs, Reparent, RepositionPopup,
+    RequestFrame, RequestSelection, SendSelection, ServerMsg, SetAnchor, SetAppId, SetBorder,
+    SetBounds, SetClip, SetCorners, SetCursor, SetExclusiveZone, SetFill, SetIcon, SetImage,
+    SetLayer, SetOpacity, SetSelection, SetText, SetTransform, SetVisible, SetWindowLimits,
+    SetWindowState, SetWindowStateFor, SetWindowTitle, StartDrag, StartMove, StartResize,
     UnbindKey, WindowList,
 };
-use crate::types::{Align, BufferId, Edge, Layer, NodeId, NodeKind, WindowRef, WindowState};
+use crate::types::{
+    Align, BufferId, CursorShape, DataSource, DragAction, Edge, Layer, NodeId, NodeKind,
+    PopupAnchor, PopupGravity, WindowRef, WindowState, caps,
+};
 
 /// Where the shell socket lives; see [`crate::shell_socket_path`].
 pub use crate::shell_socket_path;
@@ -272,6 +278,181 @@ impl Connection {
         self.send(&ClientMsg::Outputs(Outputs))
     }
 
+    /// Declare which server→client messages this client understands
+    /// (M5-A).
+    ///
+    /// Send this once after the handshake, naming the subset of
+    /// [`Connection::caps`] whose server→client messages you are ready to
+    /// decode. The server must not push a message belonging to a bit you
+    /// did not list, and a message you do not know would be a fatal
+    /// [`DecodeError::UnknownOp`](crate::DecodeError::UnknownOp) in
+    /// [`Connection::poll`] — which is exactly what this exists to
+    /// prevent. See [`ClientCaps`] for the full rules.
+    ///
+    /// **The discovery rule is enforced here, not merely documented.**
+    /// The op is behind no capability bit of its own, so sending it to a
+    /// pre-M5-A server would earn an `UnknownOp` and kill the connection
+    /// — the failure mode it was invented to prevent, running backwards.
+    /// So this method sends nothing, and returns `Ok(())`, unless
+    /// `Welcome.caps` carried at least one bit in
+    /// [`caps::CAPS_M5_MASK`](crate::types::caps::CAPS_M5_MASK): a server
+    /// advertising one of those necessarily knows the op, because the bits
+    /// and the op arrived in the same change. A hand-rolled client that
+    /// sends the frame anyway still dies, which is correct.
+    ///
+    /// `bits` is masked to what the server actually advertised: claiming
+    /// to understand a message the server never offered is
+    /// `Error { Protocol }`.
+    ///
+    /// # Errors
+    /// As [`Connection::send`].
+    pub fn client_caps(&mut self, bits: u32) -> Result<(), Error> {
+        if self.caps & caps::CAPS_M5_MASK == 0 {
+            return Ok(());
+        }
+        self.send(&ClientMsg::ClientCaps(ClientCaps {
+            caps: bits & self.caps,
+        }))
+    }
+
+    /// Ask for a named cursor shape (needs `caps::CURSOR`).
+    ///
+    /// Names no window on purpose: the cursor belongs to the *pointer*,
+    /// and the server authorizes by asking whether this client holds
+    /// pointer focus **now**. A client that does not is silently ignored
+    /// rather than disconnected.
+    ///
+    /// # Errors
+    /// As [`Connection::send`].
+    pub fn set_cursor(&mut self, shape: CursorShape) -> Result<(), Error> {
+        self.send(&ClientMsg::SetCursor(SetCursor { shape }))
+    }
+
+    /// Start an interactive window move (needs `caps::DRAG`).
+    ///
+    /// Honoured only while this client holds pointer focus with a button
+    /// down; otherwise ignored.
+    ///
+    /// # Errors
+    /// As [`Connection::send`].
+    pub fn start_move(&mut self, window: NodeId) -> Result<(), Error> {
+        self.send(&ClientMsg::StartMove(StartMove { window }))
+    }
+
+    /// Start an interactive window resize (needs `caps::DRAG`).
+    ///
+    /// `edges` is a [`resize_edges`](crate::types::resize_edges) bitmask;
+    /// two bits are a corner and 0 lets the server choose. Same
+    /// authorization as [`Connection::start_move`].
+    ///
+    /// # Errors
+    /// As [`Connection::send`].
+    pub fn start_resize(&mut self, window: NodeId, edges: u8) -> Result<(), Error> {
+        self.send(&ClientMsg::StartResize(StartResize { window, edges }))
+    }
+
+    /// Ask for the output list as an unprivileged client and subscribe to
+    /// hotplug (needs `caps::OUTPUTS`).
+    ///
+    /// The answer is one [`OutputInfo`](crate::msg::OutputInfo) and one
+    /// [`OutputWorkArea`](crate::msg::OutputWorkArea) per output, then an
+    /// [`OutputsEnd`](crate::msg::OutputsEnd) — the *shell* block's
+    /// messages, reachable here without the shell socket. The snapshot is
+    /// complete at `OutputsEnd`.
+    ///
+    /// # Errors
+    /// As [`Connection::send`].
+    pub fn list_outputs(&mut self) -> Result<(), Error> {
+        self.send(&ClientMsg::ListOutputs(ListOutputs))
+    }
+
+    /// Offer the clipboard selection (needs `caps::DATA`).
+    ///
+    /// Declares MIME types, never bytes: a paste earns a
+    /// [`SelectionRequest`](crate::msg::SelectionRequest) that this client
+    /// answers with [`Connection::send_selection`]. An empty `mimes`
+    /// clears the selection.
+    ///
+    /// # Errors
+    /// As [`Connection::send`].
+    pub fn set_selection(&mut self, mimes: &[String]) -> Result<(), Error> {
+        self.send(&ClientMsg::SetSelection(SetSelection {
+            mimes: mimes.to_vec(),
+        }))
+    }
+
+    /// Ask to read a selection in one MIME type (needs `caps::DATA`).
+    ///
+    /// `request` is the caller's own id, echoed in the
+    /// [`SelectionData`](crate::msg::SelectionData) that answers it, and
+    /// must not repeat one still outstanding. Exactly one answer always
+    /// arrives — a failure is a descriptor already at EOF, not a silence
+    /// — so no timeout is needed; read it **non-blocking**.
+    ///
+    /// # Errors
+    /// As [`Connection::send`].
+    pub fn request_selection(
+        &mut self,
+        request: u32,
+        source: DataSource,
+        mime: &str,
+    ) -> Result<(), Error> {
+        self.send(&ClientMsg::RequestSelection(RequestSelection {
+            request,
+            source,
+            mime: mime.to_owned(),
+        }))
+    }
+
+    /// Answer a [`SelectionRequest`](crate::msg::SelectionRequest) with a
+    /// readable descriptor (needs `caps::DATA`).
+    ///
+    /// `request` is the **server's** id from the message being answered.
+    /// `fd` is a sealed memfd or the read end of a pipe; one already at
+    /// EOF means "I cannot serve that MIME type".
+    ///
+    /// # Errors
+    /// As [`Connection::send`] — including [`Error::RemoteNoFds`], since
+    /// this message carries a descriptor.
+    pub fn send_selection(&mut self, request: u32, fd: OwnedFd) -> Result<(), Error> {
+        self.send(&ClientMsg::SendSelection(SendSelection { request, fd }))
+    }
+
+    /// Start a drag (needs `caps::DATA`).
+    ///
+    /// Takes the whole [`StartDrag`] message rather than four loose
+    /// arguments; build it with struct literal syntax. Honoured only while
+    /// this client holds pointer focus with a button down.
+    ///
+    /// # Errors
+    /// As [`Connection::send`].
+    pub fn start_drag(&mut self, drag: StartDrag) -> Result<(), Error> {
+        self.send(&ClientMsg::StartDrag(drag))
+    }
+
+    /// Say what this drop target would do with the offer over it (needs
+    /// `caps::DATA`).
+    ///
+    /// An empty `mime` or [`DragAction::None`] rejects it.
+    ///
+    /// # Errors
+    /// As [`Connection::send`].
+    pub fn accept_drop(&mut self, action: DragAction, mime: &str) -> Result<(), Error> {
+        self.send(&ClientMsg::AcceptDrop(AcceptDrop {
+            action,
+            mime: mime.to_owned(),
+        }))
+    }
+
+    /// End a drag this client started, after its
+    /// [`DragFinished`](crate::msg::DragFinished) (needs `caps::DATA`).
+    ///
+    /// # Errors
+    /// As [`Connection::send`].
+    pub fn finish_drag(&mut self) -> Result<(), Error> {
+        self.send(&ClientMsg::FinishDrag(FinishDrag))
+    }
+
     /// Give keyboard focus to another client's window (needs `caps::SHELL`).
     ///
     /// # Errors
@@ -358,6 +539,16 @@ impl Connection {
     /// decoded each pass, so nothing is left buffered unnecessarily. The
     /// socket stays readable and the next wakeup continues.
     ///
+    /// It also applies the same [`MAX_PENDING_FDS`](crate::MAX_PENDING_FDS)
+    /// rule, for the same reason and with the same two halves: since M5-A
+    /// the *server* sends descriptors ([`Keymap`](crate::msg::Keymap),
+    /// [`SelectionData`](crate::msg::SelectionData)), so a buggy or
+    /// hostile server can park them in a client's framer exactly as a
+    /// client could in the server's. At the cap the loop yields **if there
+    /// is a frame to drain** — decoding is what claims descriptors — and
+    /// is fatal if there is not, because then they belong to no frame and
+    /// never will. See `docs/wire.md` § Receive-side limits.
+    ///
     /// # Errors
     /// [`Error::Closed`] on hangup, [`Error::Decode`] on a malformed
     /// frame — both fatal.
@@ -372,6 +563,17 @@ impl Connection {
             }
             if self.closed || read >= crate::server::READ_BUDGET {
                 break;
+            }
+            if self.framer.pending_fds() >= crate::MAX_PENDING_FDS {
+                // The frames above have all been drained, so if the framer
+                // still holds one it is incomplete and more bytes will
+                // finish it: yield and let the next wakeup continue. If it
+                // holds none, these descriptors belong to no frame and
+                // never will — that is the flood, and it is fatal.
+                if self.framer.has_frame() {
+                    break;
+                }
+                return Err(Error::Decode(crate::DecodeError::UnexpectedFd));
             }
             match self.socket.recv_into(&mut self.framer) {
                 Ok(Some(n)) => read += n,
@@ -753,6 +955,49 @@ impl Transaction<'_> {
     #[must_use]
     pub fn image(mut self, id: NodeId, buffer: BufferId, src: IRect) -> Self {
         push!(self, SetImage { id, buffer, src })
+    }
+
+    /// Create a popup — a menu or tooltip anchored to a rectangle of its
+    /// parent (needs `caps::POPUP`).
+    ///
+    /// Takes the whole [`CreatePopup`] message rather than eight loose
+    /// arguments; build it with struct literal syntax, as
+    /// [`Transaction::create_buffer`] and [`Transaction::set_text_full`]
+    /// do.
+    ///
+    /// A **scene mutation**, and on the transaction for that reason: the
+    /// popup must appear atomically with the content committed into it,
+    /// or a menu shows one frame empty. The server answers with a
+    /// [`Configure`](crate::msg::Configure) carrying the geometry it
+    /// actually gave, constrained as `constraint` allows.
+    #[must_use]
+    pub fn create_popup(mut self, popup: CreatePopup) -> Self {
+        push!(self, popup)
+    }
+
+    /// Move an existing popup to a new anchor (needs `caps::POPUP`).
+    ///
+    /// Answered with another [`Configure`](crate::msg::Configure). There
+    /// is deliberately no reposition token — see [`RepositionPopup`].
+    #[must_use]
+    pub fn reposition_popup(
+        mut self,
+        id: NodeId,
+        anchor_rect: IRect,
+        anchor: PopupAnchor,
+        gravity: PopupGravity,
+        constraint: u32,
+    ) -> Self {
+        push!(
+            self,
+            RepositionPopup {
+                id,
+                anchor_rect,
+                anchor,
+                gravity,
+                constraint,
+            }
+        )
     }
 
     /// Queue the [`Commit`] that ends this transaction.

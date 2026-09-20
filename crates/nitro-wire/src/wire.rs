@@ -12,8 +12,9 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use crate::error::DecodeError;
 use crate::types::{
-    Align, AxisSource, BufferId, ButtonState, CursorPos, Edge, ErrorCode, Layer, NodeId, NodeKind,
-    TouchPhase, WindowRef, WindowState,
+    Align, AxisSource, BufferId, ButtonState, CursorPos, CursorShape, DataSource, DragAction, Edge,
+    ErrorCode, KeymapFormat, Layer, NodeId, NodeKind, PopupAnchor, PopupGravity, TouchPhase,
+    WindowRef, WindowState,
 };
 
 /// A type with a fixed-size, little-endian wire representation.
@@ -108,6 +109,12 @@ plain_tag!(TouchPhase, u8, u8);
 plain_tag!(WindowState, u8, u8);
 plain_tag!(Edge, u8, u8);
 plain_tag!(ErrorCode, u16, U16);
+plain_tag!(CursorShape, u16, U16);
+plain_tag!(PopupAnchor, u8, u8);
+plain_tag!(PopupGravity, u8, u8);
+plain_tag!(DragAction, u8, u8);
+plain_tag!(KeymapFormat, u8, u8);
+plain_tag!(DataSource, u8, u8);
 
 /// `impl Plain` for the id newtypes.
 macro_rules! plain_id {
@@ -367,5 +374,44 @@ mod tests {
             assert_eq!(<Align as Plain>::from_wire(Plain::to_wire(a)), Ok(a));
         }
         assert_eq!(<Align as Plain>::from_wire(3), Err(DecodeError::BadValue));
+    }
+
+    #[test]
+    fn the_m5_tags_round_trip_through_their_wire_form() {
+        for s in [
+            CursorShape::None,
+            CursorShape::Default,
+            CursorShape::NwseResize,
+            CursorShape::ZoomOut,
+        ] {
+            assert_eq!(<CursorShape as Plain>::from_wire(Plain::to_wire(s)), Ok(s));
+        }
+        assert_eq!(
+            <CursorShape as Plain>::from_wire(U16::new(35)),
+            Err(DecodeError::BadValue)
+        );
+        assert_eq!(
+            <PopupAnchor as Plain>::from_wire(Plain::to_wire(PopupAnchor::TopRight)),
+            Ok(PopupAnchor::TopRight)
+        );
+        assert_eq!(
+            <PopupGravity as Plain>::from_wire(Plain::to_wire(PopupGravity::BottomLeft)),
+            Ok(PopupGravity::BottomLeft)
+        );
+        assert_eq!(
+            <DragAction as Plain>::from_wire(Plain::to_wire(DragAction::Move)),
+            Ok(DragAction::Move)
+        );
+        assert_eq!(
+            <KeymapFormat as Plain>::from_wire(Plain::to_wire(KeymapFormat::XkbV1)),
+            Ok(KeymapFormat::XkbV1)
+        );
+        assert_eq!(
+            <DataSource as Plain>::from_wire(Plain::to_wire(DataSource::Drag)),
+            Ok(DataSource::Drag)
+        );
+        // A `CursorShape` is two bytes, little-endian, like every other
+        // `u16` here.
+        assert_eq!(Plain::to_wire(CursorShape::ZoomOut).as_bytes(), &[34, 0]);
     }
 }
