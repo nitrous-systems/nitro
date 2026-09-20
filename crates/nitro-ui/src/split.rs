@@ -1513,14 +1513,62 @@ pub struct SplitParts {
 pub struct SplitViewBuilder<S> {
     sidebar_width: f32,
     sidebar_name: String,
-    sidebar_header: Option<Built<S>>,
-    sidebar_children: Vec<Built<S>>,
+    sidebar_header: Option<Part<S>>,
+    sidebar_children: Vec<Part<S>>,
     header_title: Option<String>,
-    header_leading: Vec<Built<S>>,
-    header_trailing: Vec<Built<S>>,
-    content: Option<Built<S>>,
-    footer: Option<Built<S>>,
+    header_leading: Vec<Part<S>>,
+    header_trailing: Vec<Part<S>>,
+    content: Option<Part<S>>,
+    footer: Option<Part<S>>,
     name: String,
+}
+
+/// A slot's content: a subtree still to be built, or a widget the app
+/// built earlier because a callback needed its id.
+enum Part<S> {
+    Built(Box<Built<S>>),
+    Id(WidgetId),
+}
+
+impl<S: 'static> Part<S> {
+    fn build(self, ui: &mut Ui<S>) -> WidgetId {
+        match self {
+            Self::Built(b) => ui.build(*b),
+            Self::Id(id) => id,
+        }
+    }
+
+    fn state_mut<'a>(&'a mut self, ui: &'a mut Ui<S>) -> StatePatch<'a, S> {
+        match self {
+            Self::Built(b) => StatePatch::Built(b.state_mut()),
+            Self::Id(id) => StatePatch::Live(ui, *id),
+        }
+    }
+}
+
+/// A way to touch the framework state of either kind of [`Part`].
+enum StatePatch<'a, S> {
+    Built(&'a mut crate::WidgetState),
+    Live(&'a mut Ui<S>, WidgetId),
+}
+
+impl<S: 'static> StatePatch<'_, S> {
+    fn set(self, f: impl FnOnce(&mut Option<String>, &mut crate::LayoutStyle)) {
+        match self {
+            Self::Built(st) => f(&mut st.name, &mut st.style),
+            Self::Live(ui, id) => {
+                let mut name = ui.address_name(id);
+                let mut style = ui.style(id);
+                f(&mut name, &mut style);
+                ui.set_style(id, style);
+                if let Some(n) = name
+                    && ui.address_name(id).is_none()
+                {
+                    ui.set_address_name(id, n);
+                }
+            }
+        }
+    }
 }
 
 impl<S: 'static> SplitViewBuilder<S> {
@@ -1549,7 +1597,7 @@ impl<S: 'static> SplitViewBuilder<S> {
     /// A bold title at the top of the sidebar.
     #[must_use]
     pub fn sidebar_header(mut self, title: impl Into<String>) -> Self {
-        self.sidebar_header = Some(
+        self.sidebar_header = Some(Part::Built(Box::new(
             row()
                 .name(names::SIDEBAR_HEADER)
                 .height(HEADER_HEIGHT)
@@ -1564,21 +1612,30 @@ impl<S: 'static> SplitViewBuilder<S> {
                         .elide(true),
                 )
                 .into_widget(),
-        );
+        )));
         self
     }
 
     /// Any widget as the sidebar header (a search field, say).
     #[must_use]
     pub fn sidebar_header_widget(mut self, w: impl IntoWidget<S>) -> Self {
-        self.sidebar_header = Some(w.into_widget());
+        self.sidebar_header = Some(Part::Built(Box::new(w.into_widget())));
         self
     }
 
     /// A row, section or separator in the sidebar.
     #[must_use]
     pub fn sidebar_child(mut self, w: impl IntoWidget<S>) -> Self {
-        self.sidebar_children.push(w.into_widget());
+        self.sidebar_children
+            .push(Part::Built(Box::new(w.into_widget())));
+        self
+    }
+
+    /// A sidebar child the app built earlier (its `on_click` captured
+    /// an id, say).
+    #[must_use]
+    pub fn sidebar_child_id(mut self, id: WidgetId) -> Self {
+        self.sidebar_children.push(Part::Id(id));
         self
     }
 
@@ -1590,7 +1647,8 @@ impl<S: 'static> SplitViewBuilder<S> {
         I::Item: IntoWidget<S>,
     {
         for w in ws {
-            self.sidebar_children.push(w.into_widget());
+            self.sidebar_children
+                .push(Part::Built(Box::new(w.into_widget())));
         }
         self
     }
@@ -1605,14 +1663,32 @@ impl<S: 'static> SplitViewBuilder<S> {
     /// A widget before the title in the content header (a back button).
     #[must_use]
     pub fn content_header_leading(mut self, w: impl IntoWidget<S>) -> Self {
-        self.header_leading.push(w.into_widget());
+        self.header_leading
+            .push(Part::Built(Box::new(w.into_widget())));
+        self
+    }
+
+    /// As [`SplitViewBuilder::content_header_leading`], for a widget the
+    /// app built earlier.
+    #[must_use]
+    pub fn content_header_leading_id(mut self, id: WidgetId) -> Self {
+        self.header_leading.push(Part::Id(id));
         self
     }
 
     /// A widget after the title, at the trailing end (an action button).
     #[must_use]
     pub fn content_header_trailing(mut self, w: impl IntoWidget<S>) -> Self {
-        self.header_trailing.push(w.into_widget());
+        self.header_trailing
+            .push(Part::Built(Box::new(w.into_widget())));
+        self
+    }
+
+    /// As [`SplitViewBuilder::content_header_trailing`], for a widget
+    /// the app built earlier.
+    #[must_use]
+    pub fn content_header_trailing_id(mut self, id: WidgetId) -> Self {
+        self.header_trailing.push(Part::Id(id));
         self
     }
 
@@ -1622,14 +1698,31 @@ impl<S: 'static> SplitViewBuilder<S> {
     /// too.
     #[must_use]
     pub fn content(mut self, w: impl IntoWidget<S>) -> Self {
-        self.content = Some(w.into_widget());
+        self.content = Some(Part::Built(Box::new(w.into_widget())));
+        self
+    }
+
+    /// As [`SplitViewBuilder::content`], for a widget the app built
+    /// earlier (a list whose callbacks captured ids, a [`pages`] stack
+    /// the app attached pages to).
+    #[must_use]
+    pub fn content_id(mut self, id: WidgetId) -> Self {
+        self.content = Some(Part::Id(id));
         self
     }
 
     /// A non-scrolling row under the body (Apply/Revert, a status line).
     #[must_use]
     pub fn content_footer(mut self, w: impl IntoWidget<S>) -> Self {
-        self.footer = Some(w.into_widget());
+        self.footer = Some(Part::Built(Box::new(w.into_widget())));
+        self
+    }
+
+    /// As [`SplitViewBuilder::content_footer`], for a widget the app
+    /// built earlier.
+    #[must_use]
+    pub fn content_footer_id(mut self, id: WidgetId) -> Self {
+        self.footer = Some(Part::Id(id));
         self
     }
 
@@ -1667,17 +1760,18 @@ impl<S: 'static> SplitViewBuilder<S> {
 
     /// The sidebar pane: `(pane, rows column)`.
     fn build_sidebar(&mut self, ui: &mut Ui<S>) -> (WidgetId, WidgetId) {
-        let mut rows = column()
-            .name(self.sidebar_name.clone())
-            .width_percent(1.0)
-            .padding(SIDEBAR_ROW_INSET)
-            .gap(2.0)
-            .cross_align(CrossAlign::Stretch)
-            .into_widget();
+        let rows = ui.build(
+            column()
+                .name(self.sidebar_name.clone())
+                .width_percent(1.0)
+                .padding(SIDEBAR_ROW_INSET)
+                .gap(2.0)
+                .cross_align(CrossAlign::Stretch),
+        );
         for c in self.sidebar_children.drain(..) {
-            rows.push(c);
+            let c = c.build(ui);
+            ui.attach(rows, c).expect("fresh ids");
         }
-        let rows = ui.build(rows);
         let body = ui.build(scroll().grow(1.0).width_percent(1.0));
         ui.attach(body, rows).expect("fresh ids");
         let side = ui.build(
@@ -1692,7 +1786,7 @@ impl<S: 'static> SplitViewBuilder<S> {
                 .cross_align(CrossAlign::Stretch),
         );
         if let Some(h) = self.sidebar_header.take() {
-            let h = ui.build(h);
+            let h = h.build(ui);
             ui.attach(side, h).expect("fresh ids");
         }
         ui.attach(side, body).expect("fresh ids");
@@ -1719,16 +1813,17 @@ impl<S: 'static> SplitViewBuilder<S> {
         }
         let body = match self.content.take() {
             Some(mut b) => {
-                let st = b.state_mut();
-                if st.name.is_none() {
-                    st.name = Some(names::CONTENT_BODY.to_owned());
-                }
-                st.style.flex_grow = 1.0;
-                st.style.shrink_floor = ShrinkFloor::Zero;
-                if st.style.width == Length::Auto {
-                    st.style.width = Length::Percent(1.0);
-                }
-                ui.build(b)
+                b.state_mut(ui).set(|name, style| {
+                    if name.is_none() {
+                        *name = Some(names::CONTENT_BODY.to_owned());
+                    }
+                    style.flex_grow = 1.0;
+                    style.shrink_floor = ShrinkFloor::Zero;
+                    if style.width == Length::Auto {
+                        style.width = Length::Percent(1.0);
+                    }
+                });
+                b.build(ui)
             }
             None => ui.build(
                 column()
@@ -1740,11 +1835,12 @@ impl<S: 'static> SplitViewBuilder<S> {
         ui.attach(content, body).expect("fresh ids");
         let mut footer = None;
         if let Some(mut f) = self.footer.take() {
-            let st = f.state_mut();
-            if st.name.is_none() {
-                st.name = Some(names::CONTENT_FOOTER.to_owned());
-            }
-            let f = ui.build(f);
+            f.state_mut(ui).set(|name, _| {
+                if name.is_none() {
+                    *name = Some(names::CONTENT_FOOTER.to_owned());
+                }
+            });
+            let f = f.build(ui);
             ui.attach(content, f).expect("fresh ids");
             footer = Some(f);
         }
@@ -1763,7 +1859,7 @@ impl<S: 'static> SplitViewBuilder<S> {
                 .cross_align(CrossAlign::Center),
         );
         for w in self.header_leading.drain(..) {
-            let w = ui.build(w);
+            let w = w.build(ui);
             ui.attach(header, w).expect("fresh ids");
         }
         if let Some(t) = self.header_title.take() {
@@ -1783,7 +1879,7 @@ impl<S: 'static> SplitViewBuilder<S> {
             ui.attach(header, s).expect("fresh ids");
         }
         for w in self.header_trailing.drain(..) {
-            let w = ui.build(w);
+            let w = w.build(ui);
             ui.attach(header, w).expect("fresh ids");
         }
         header

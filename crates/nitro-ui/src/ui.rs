@@ -930,6 +930,16 @@ impl<S: 'static> Ui<S> {
         self.arena.slot(id).and_then(|s| s.state.name.clone())
     }
 
+    /// Set the widget's addressing name after it was built — what
+    /// `.name(..)` does on a builder. A builder that composes widgets an
+    /// app built earlier (`split_view().content_id(..)`) uses it to give
+    /// the slot its default name.
+    pub fn set_address_name(&mut self, id: WidgetId, name: impl Into<String>) {
+        if let Some(slot) = self.arena.slot_mut(id) {
+            slot.state.name = Some(name.into());
+        }
+    }
+
     /// The widget's accessible name: what it calls itself, falling back
     /// to its addressing name.
     #[must_use]

@@ -2,19 +2,23 @@
 //! [`List`](nitro_ui::List) was written for.
 //!
 //! ```text
-//! ┌──────────────────────────────────────────────┐
-//! │ [ /home/kaspar/src                  ] [  ↑ ] │  path bar + up
-//! ├──────────────────────────────────────────────┤
-//! │ / nitro                            <dir>     │
-//! │ / old                              <dir>     │  the List
-//! │   notes.txt                        912 B     │
-//! │   photo.png                        4.2 MB    │
-//! ├──────────────────────────────────────────────┤
-//! │ 4 items, 1 selected                          │  status line
-//! └──────────────────────────────────────────────┘
+//! ┌──────────────┬────────────────────────────────────────────┐
+//! │ Files        │ [←] [↑] [ /home/kaspar/src               ] │  back, up, path
+//! │              ├────────────────────────────────────────────┤
+//! │  PLACES      │ ▸ nitro                            <dir>   │
+//! │ ▣ Home       │ ▸ old                              <dir>   │  the List
+//! │   Documents  │   notes.txt                        912 B   │
+//! │ ─────────    │   photo.png                        4.2 MB  │
+//! │   Root       ├────────────────────────────────────────────┤
+//! │   Trash      │ 4 items, 1 selected                        │  status line
+//! └──────────────┴────────────────────────────────────────────┘
 //! ```
 //!
-//! The model is [`dir`], [`mime`], [`trash`] and [`ops`] — four modules
+//! The window is the split-view blueprint (`nitro_ui::split`,
+//! `docs/ui.md`): a sidebar of [`places`] on the left, the list and its
+//! header on the right.
+//!
+//! The model is [`dir`], [`mime`], [`trash`], [`ops`] and [`places`] — five modules
 //! with no widget in them, tested without a display server. This file is
 //! the other half: the tree, the keys and the three things that make a
 //! file manager different from a list of strings.
@@ -70,13 +74,15 @@
 pub mod dir;
 pub mod mime;
 pub mod ops;
+pub mod places;
 pub mod trash;
 
 use std::path::{Path, PathBuf};
 
 use nitro_ui::build::{ContainerBuilder as _, StyleBuilder as _};
 use nitro_ui::event::{Handled, KeyEvent, key, mods};
-use nitro_ui::widgets::{Label, TextField, button, column, label, row, text_field};
+use nitro_ui::split::{SidebarRow, sidebar_row, sidebar_section, sidebar_separator, split_view};
+use nitro_ui::widgets::{Button, Label, TextField, button, column, label, text_field};
 use nitro_ui::{App, Error, List, Row, Ui, WidgetId};
 
 use dir::{Entry, Kind, Sort};
@@ -106,9 +112,11 @@ pub fn title_for(cwd: &Path) -> String {
 }
 
 /// Initial window size: wide enough for a name, a size and a date.
-pub const WIDTH: f32 = 720.0;
+pub const WIDTH: f32 = 860.0;
 /// Initial window height.
-pub const HEIGHT: f32 = 480.0;
+pub const HEIGHT: f32 = 520.0;
+/// How many directories Back remembers.
+pub const HISTORY: usize = 64;
 
 /// The names every widget carries, so `hey` can address them.
 ///
@@ -121,6 +129,13 @@ pub mod names {
     pub const PATH: &str = "path";
     /// The "up one directory" button.
     pub const UP: &str = "up";
+    /// The "back to the previous directory" button.
+    pub const BACK: &str = "back";
+    /// The sidebar's rows column (`nitro_ui::split::names::SIDEBAR`
+    /// renamed): a place is `places/place_<key>`, e.g. `places/place_home`.
+    pub const PLACES: &str = "places";
+    /// The prefix of a place row's name: `place_home`, `place_root`, …
+    pub const PLACE_PREFIX: &str = "place_";
     /// The file list.
     pub const LIST: &str = "list";
     /// The status line at the bottom.
@@ -220,6 +235,12 @@ pub struct Files {
     listings: u64,
     /// The terminal binary the text fallback opens an editor in.
     term: String,
+    /// The sidebar's places, in row order.
+    places: Vec<places::Place>,
+    /// The sidebar rows, one per place, found by [`start`].
+    place_rows: Vec<WidgetId>,
+    /// Where Back goes: the directories left behind, newest last.
+    history: Vec<PathBuf>,
 }
 
 impl Files {
@@ -245,6 +266,9 @@ impl Files {
             ids: None,
             listings: 0,
             term: term_binary(),
+            places: Vec::new(),
+            place_rows: Vec::new(),
+            history: Vec::new(),
         }
     }
 
@@ -271,6 +295,27 @@ impl Files {
         self.assoc = assoc;
         self.trash = trash;
         self
+    }
+
+    /// The sidebar's places. The default is [`places::from_env`] with the
+    /// trash's root, resolved when the tree is built; a test injects a
+    /// fixture so the row set does not depend on the developer's home.
+    #[must_use]
+    pub fn with_places(mut self, places: Vec<places::Place>) -> Self {
+        self.places = places;
+        self
+    }
+
+    /// The sidebar's places, in row order.
+    #[must_use]
+    pub fn places(&self) -> &[places::Place] {
+        &self.places
+    }
+
+    /// The directories Back would go to, newest last.
+    #[must_use]
+    pub fn history(&self) -> &[PathBuf] {
+        &self.history
     }
 
     /// Use `term` as the terminal the text fallback opens an editor in.
@@ -474,6 +519,8 @@ pub struct Ids {
     /// The rename / new-folder field, hidden unless something is being
     /// edited.
     pub edit: WidgetId,
+    /// The back button.
+    pub back: WidgetId,
 }
 
 impl Ids {
@@ -489,6 +536,7 @@ impl Ids {
             list: find(names::LIST)?,
             status: find(names::STATUS)?,
             edit: find(names::EDIT)?,
+            back: find(names::BACK)?,
         })
     }
 }
@@ -498,6 +546,10 @@ impl Ids {
 /// # Panics
 /// Never in practice: every `attach` names an id built a few lines
 /// above, and a fresh id cannot be stale.
+// One function because it is one tree, and the order the widgets are
+// created in is the order they are read in — the same allow
+// `nitro-settings::build` takes for the same reason.
+#[allow(clippy::too_many_lines)]
 pub fn build(ui: &mut Ui<Files>) -> WidgetId {
     // The tree is built before any callback has seen the state, so the
     // path bar starts with the process's directory; [`start`] writes the
@@ -511,6 +563,7 @@ pub fn build(ui: &mut Ui<Files>) -> WidgetId {
             .name(names::PATH)
             .placeholder("Path")
             .grow(1.0)
+            .height(34.0)
             .on_submit(|s: &mut Files, ui: &mut Ui<Files>, text: &str| {
                 // Deferred, like every callback in this file that writes
                 // back to the widget it came from: `navigate` rewrites
@@ -552,21 +605,35 @@ pub fn build(ui: &mut Ui<Files>) -> WidgetId {
                 ui.defer(move |s: &mut Files, ui: &mut Ui<Files>| navigate(s, ui, to));
             }),
     );
-    let up = ui.build(
-        button("↑")
-            .name(names::UP)
+    let up = ui.build(button("↑").name(names::UP).icon("arrow-up").on_click(
+        |s: &mut Files, ui: &mut Ui<Files>| {
+            let to = dir::parent_of(&s.cwd.clone());
+            navigate(s, ui, to);
+        },
+    ));
+    let back = ui.build(
+        button("←")
+            .name(names::BACK)
+            .icon("arrow-left")
+            .disabled()
             .on_click(|s: &mut Files, ui: &mut Ui<Files>| {
-                let to = dir::parent_of(&s.cwd.clone());
-                navigate(s, ui, to);
+                // A pop, not a push: going back must not put the
+                // directory being left onto the history it just came
+                // from. Deferred, because `navigate` disables this very
+                // button when the history runs out.
+                if let Some(to) = s.history.pop() {
+                    ui.defer(move |s: &mut Files, ui: &mut Ui<Files>| {
+                        navigate_with(s, ui, to, false);
+                    });
+                }
             }),
     );
-    let bar = ui.build(row().gap(6.0).width_percent(1.0));
-    ui.attach(bar, path).expect("attach the path bar");
-    ui.attach(bar, up).expect("attach the up button");
 
     let list = ui.build(
         nitro_ui::list()
             .name(names::LIST)
+            .row_inset(nitro_ui::split::SIDEBAR_ROW_INSET)
+            .row_radius(6.0)
             .grow(1.0)
             .width_percent(1.0)
             .on_activate(|s: &mut Files, ui: &mut Ui<Files>, index: usize| {
@@ -605,20 +672,145 @@ pub fn build(ui: &mut Ui<Files>) -> WidgetId {
             }),
     );
 
-    let status = ui.build(label("").name(names::STATUS).size(12.0).width_percent(1.0));
+    let status = ui.build(
+        label("")
+            .name(names::STATUS)
+            .size(nitro_ui::split::SMALL_PX)
+            .color_role(nitro_ui::ColorRole::TextDim)
+            .width_percent(1.0),
+    );
+    let footer_line = ui.build(
+        nitro_ui::widgets::separator()
+            .color_role(nitro_ui::ColorRole::Hairline)
+            .width_percent(1.0),
+    );
+    let footer_pad = ui.build(
+        column()
+            .width_percent(1.0)
+            .padding_xy(nitro_ui::split::CONTENT_GUTTER, 6.0),
+    );
+    ui.attach(footer_pad, status)
+        .expect("attach the status line");
+    let footer = ui.build(column().width_percent(1.0));
+    for child in [footer_line, footer_pad] {
+        ui.attach(footer, child).expect("attach the footer");
+    }
 
-    let root = ui.build(
+    // The body: the list scrolls itself, so it is not in a `Scroll`; the
+    // edit field sits under it at height 0 until a rename opens it.
+    let body = ui.build(
         column()
             .gap(6.0)
-            .padding(8.0)
-            .width_percent(1.0)
-            .height_percent(1.0),
+            .padding_xy(nitro_ui::split::SIDEBAR_ROW_INSET, 0.0)
+            .width_percent(1.0),
     );
-    for child in [bar, list, edit, status] {
-        ui.attach(root, child).expect("attach a child of the root");
+    for child in [list, edit] {
+        ui.attach(body, child).expect("attach a child of the body");
     }
+
+    // The sidebar: the places the state was given, or the environment's.
+    // Built here rather than in `start` so the tree is whole before the
+    // first commit; `start` finds the rows by name like every other id.
+    let trash_root = std::env::var_os("XDG_DATA_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| nitro_launcher::spawn::home_dir().map(|h| h.join(".local/share")))
+        .unwrap_or_else(|| PathBuf::from(".local/share"))
+        .join("Trash");
+    let env_places = places::from_env(&trash_root);
+    let mut view = split_view()
+        .sidebar_name(names::PLACES)
+        .sidebar_header(TITLE)
+        .sidebar_child(sidebar_section("Places"))
+        .content_header_leading_id(back)
+        .content_header_leading_id(up)
+        .content_header_leading_id(path)
+        .content_id(body)
+        .content_footer_id(footer);
+    // The rows are attached by `start` once the state's own places are
+    // known; the environment's are attached now as the default and
+    // replaced by `start` when the state has a different set.
+    let mut prev = places::Section::Places;
+    for p in &env_places {
+        if p.section != prev {
+            view = view.sidebar_child(sidebar_separator());
+            prev = p.section;
+        }
+        view = view.sidebar_child(place_row(p));
+    }
+    let parts = view.build(ui);
     install(ui);
-    root
+    parts.root
+}
+
+/// One sidebar row for a place. Its `on_click` navigates — deferred,
+/// because `navigate` selects the row that was clicked.
+fn place_row(p: &places::Place) -> nitro_ui::split::SidebarRowBuilder<Files> {
+    let to = p.path.clone();
+    sidebar_row(p.icon, p.label.clone())
+        .name(format!("{}{}", names::PLACE_PREFIX, p.key))
+        .on_click(move |_s: &mut Files, ui: &mut Ui<Files>| {
+            let to = to.clone();
+            ui.defer(move |s: &mut Files, ui: &mut Ui<Files>| navigate(s, ui, to));
+        })
+}
+
+/// Rebuild the sidebar rows from `s.places`, and remember their ids.
+///
+/// Called by [`start`]: the tree was built with the environment's
+/// places, and a state given other ones (a test's fixture) replaces
+/// them here. The rows of an unchanged set are simply found.
+fn sync_places(s: &mut Files, ui: &mut Ui<Files>) {
+    let Some(sidebar) = nitro_ui::introspect::resolve(ui, names::PLACES) else {
+        return;
+    };
+    let want: Vec<String> = s
+        .places
+        .iter()
+        .map(|p| format!("{}{}", names::PLACE_PREFIX, p.key))
+        .collect();
+    let have: Vec<(WidgetId, Option<String>)> = ui
+        .children(sidebar)
+        .into_iter()
+        .map(|c| (c, ui.address_name(c)))
+        .collect();
+    let have_names: Vec<&str> = have
+        .iter()
+        .filter_map(|(_, n)| n.as_deref())
+        .filter(|n| n.starts_with(names::PLACE_PREFIX))
+        .collect();
+    if have_names != want.iter().map(String::as_str).collect::<Vec<_>>() {
+        // Everything after the section header goes; the rows come back
+        // from the state's list.
+        for (c, _) in have.iter().skip(1) {
+            let _ = ui.remove(*c);
+        }
+        let mut prev = places::Section::Places;
+        for p in &s.places {
+            if p.section != prev {
+                let _ = ui.add_child(sidebar, sidebar_separator());
+                prev = p.section;
+            }
+            let _ = ui.add_child(sidebar, place_row(p));
+        }
+    }
+    s.place_rows = ui
+        .children(sidebar)
+        .into_iter()
+        .filter(|c| {
+            ui.address_name(*c)
+                .is_some_and(|n| n.starts_with(names::PLACE_PREFIX))
+        })
+        .collect();
+}
+
+/// Select the sidebar row whose place is `cwd`, and deselect the rest.
+fn refresh_places(s: &Files, ui: &mut Ui<Files>) {
+    for (row, place) in s.place_rows.iter().zip(&s.places) {
+        if let Ok(mut r) = ui.widget_mut::<SidebarRow<Files>>(*row) {
+            r.set_selected(place.path == s.cwd);
+        }
+    }
 }
 
 /// The shortcuts and the window title.
@@ -887,6 +1079,12 @@ fn short(path: &Path) -> String {
 /// it, so there is exactly one place that re-lists, re-arms the watch
 /// and resets the selection.
 pub fn navigate(s: &mut Files, ui: &mut Ui<Files>, to: PathBuf) {
+    navigate_with(s, ui, to, true);
+}
+
+/// [`navigate`], with a say in whether the directory being left is
+/// pushed onto the Back history. Back itself passes `false`.
+fn navigate_with(s: &mut Files, ui: &mut Ui<Files>, to: PathBuf, remember: bool) {
     // A path that is not a directory is a message, not a state change:
     // leaving the user in the directory they could see is better than
     // showing them an empty list of somewhere that does not exist.
@@ -903,8 +1101,21 @@ pub fn navigate(s: &mut Files, ui: &mut Ui<Files>, to: PathBuf) {
             return;
         }
     }
-    s.cwd = to;
+    if remember && s.listings > 0 && s.cwd != to {
+        s.history.push(std::mem::replace(&mut s.cwd, to));
+        if s.history.len() > HISTORY {
+            s.history.remove(0);
+        }
+    } else {
+        s.cwd = to;
+    }
     s.message = None;
+    if let Some(ids) = s.ids
+        && let Ok(mut b) = ui.widget_mut::<Button<Files>>(ids.back)
+    {
+        b.set_enabled(!s.history.is_empty());
+    }
+    refresh_places(s, ui);
     // The title follows the directory, and this is the only place it is
     // set — so every way of getting somewhere agrees on what it is
     // called. The setter drops an unchanged title, and `run` opens the
@@ -1334,6 +1545,10 @@ fn paste(s: &mut Files, ui: &mut Ui<Files>) {
 /// named widgets are not in it.
 pub fn start(ui: &mut Ui<Files>, state: &mut Files) -> Result<(), Error> {
     state.ids = Some(Ids::of(ui).ok_or(Error::NoRoot)?);
+    if state.places.is_empty() {
+        state.places = places::from_env(state.trash.root());
+    }
+    sync_places(state, ui);
     let cwd = state.cwd.clone();
     navigate(state, ui, cwd);
     if let Some(ids) = state.ids {

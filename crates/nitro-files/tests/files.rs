@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 
 use nitro_files::{Confirm, Editing, Files, Ids, dir, mime, names, trash};
 use nitro_ui::event::key;
+use nitro_ui::split::SidebarRow;
 use nitro_ui::test::Harness;
 use nitro_ui::widgets::{Button, Label, TextField};
 use nitro_ui::{List, Size};
@@ -73,22 +74,34 @@ fn fixture(name: &str) -> (PathBuf, PathBuf) {
 /// temp directories so a test never reads the developer's `~/.config` and
 /// never puts anything in their real trash.
 ///
-/// The window is 300×220 inside the harness's 320×240 output: a list of
-/// half a dozen rows, which is the awkward case rather than a soft one —
-/// the list is virtualised, so a test that gave it room for everything
-/// would never see the window into the model.
+/// The window is 560×280 on the harness's 320×240 output: beside the
+/// 200 px sidebar the list gets a few rows and ~350 px of width, which
+/// is the awkward case rather than a soft one — the list is
+/// virtualised, so a test that gave it room for everything would never
+/// see the window into the model. The rows are read through the widget
+/// API rather than pixels, so the part off the output does not matter;
+/// the header buttons a test clicks are at the top and on it.
+///
+/// The sidebar's places are a **fixture** — a home next to `dir` with
+/// only Root and Trash after it — so the row set never depends on the
+/// developer's `~` or `user-dirs.dirs`.
 fn app(dir: &Path, xdg: &Path) -> (Harness<Files>, Ids) {
     let assoc = mime::Assoc::at(vec![xdg.join("config")], vec![xdg.join("data")]);
+    let home = dir.parent().expect("the scratch root").join("home");
+    std::fs::create_dir_all(home.join("Documents")).expect("the fixture home");
+    let trash = trash::Trash::at(xdg.join("Trash"));
+    let places = nitro_files::places::places(Some(&home), &[], &trash.root().join("files"));
     let state = Files::new(dir)
         // An empty glob table, so the built-in extension table is what
         // answers `foo.txt` and the result does not depend on whether
         // this box has `/usr/share/mime/globs2`.
-        .with_env(Vec::new(), assoc, trash::Trash::at(xdg.join("Trash")))
-        .with_term(TERM);
+        .with_env(Vec::new(), assoc, trash)
+        .with_term(TERM)
+        .with_places(places);
     let mut h = Harness::sized(
         nitro_files::APP_NAME,
         state,
-        Size::new(300.0, 220.0),
+        Size::new(560.0, 280.0),
         nitro_files::build,
     );
     // The same `start` the binary runs, on the tree `build` produced: a
@@ -97,7 +110,7 @@ fn app(dir: &Path, xdg: &Path) -> (Harness<Files>, Ids) {
     let (ui, state) = h.parts();
     nitro_files::start(ui, state).expect("start the app");
     h.settle();
-    let ids = Ids::of(h.ui()).expect("the four named widgets");
+    let ids = Ids::of(h.ui()).expect("the five named widgets");
     (h, ids)
 }
 
@@ -1280,6 +1293,30 @@ fn every_part_is_addressable_the_way_hey_addresses_it() {
             .expect("the status line");
     assert_eq!(said, "1 items, 0 selected");
 
+    // The split view's parts: `places/place_<key>` for every place, and
+    // the back button, all by the documented names.
+    for (path, role) in [
+        (names::PLACES.to_owned(), "container"),
+        (
+            format!("{}/{}home", names::PLACES, names::PLACE_PREFIX),
+            "button",
+        ),
+        (
+            format!("{}/{}root", names::PLACES, names::PLACE_PREFIX),
+            "button",
+        ),
+        (
+            format!("{}/{}trash", names::PLACES, names::PLACE_PREFIX),
+            "button",
+        ),
+        (names::BACK.to_owned(), "button"),
+        (names::UP.to_owned(), "button"),
+    ] {
+        let got = nitro_ui::introspect::get_prop(h.ui(), &format!("window/{path}"), "role")
+            .unwrap_or_else(|e| panic!("{path}: {e}"));
+        assert_eq!(got, role, "{path}");
+    }
+
     let _ = std::fs::remove_dir_all(&root);
     h.quit();
 }
@@ -1305,7 +1342,7 @@ fn every_type_gets_its_own_icon_and_the_server_draws_them() {
     write(&dir.join("h.qqq"), "an unknown extension");
     std::os::unix::fs::symlink(dir.join("adir"), dir.join("i-to-dir")).expect("symlink");
     std::os::unix::fs::symlink(dir.join("b.txt"), dir.join("j-to-file")).expect("symlink");
-    let (h, ids) = app(&dir, &root.join("xdg"));
+    let (mut h, ids) = app(&dir, &root.join("xdg"));
 
     let got: Vec<(String, String)> = rows(&h, ids)
         .into_iter()
@@ -1351,19 +1388,61 @@ fn every_type_gets_its_own_icon_and_the_server_draws_them() {
     // its own rather than written down as a constant — a hard-coded 4
     // would go stale the day the frame changes, and stale silently,
     // because the number would still look plausible.
-    let distinct: std::collections::BTreeSet<&str> = got
-        .iter()
-        .take(want.len())
-        .map(|(_, i)| i.as_str())
-        .collect();
+    //
+    // Only the rows the **output** shows: the window is taller than the
+    // harness's 320×240 output, and a row below its bottom edge is never
+    // rasterised, so its icon is never cached.
+    // The window is taller than the harness's 320×240 output, and an
+    // icon below the output's bottom edge is never rasterised, so the
+    // count is bracketed: every icon wholly on the output is cached,
+    // and nothing wholly off it is. What sits on the edge may go
+    // either way, which is the server's business.
+    let origin = h.ui().window_position();
+    let output_h = f32::from(u16::try_from(nitro_ui::test::OUTPUT.1).unwrap());
+    let list_b = h.bounds(ids.list);
+    let row_h = h.widget::<List<Files>>(ids.list).row_height();
+    let mut surely: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut maybe: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut classify = |top: f32, icon: &str| {
+        if top + 16.0 <= output_h {
+            surely.insert(icon.to_owned());
+        }
+        if top < output_h {
+            maybe.insert(icon.to_owned());
+        }
+    };
+    for (i, (_, icon)) in got.iter().take(want.len()).enumerate() {
+        classify(
+            origin.y + list_b.y + i as f32 * row_h + (row_h - 16.0) / 2.0,
+            icon,
+        );
+    }
+    // Plus the split view's own: the two header buttons and the
+    // fixture's sidebar rows (`docs/files.md`, "Places").
+    classify(0.0, "arrow-left");
+    classify(0.0, "arrow-up");
+    for place in h.state().places().to_vec() {
+        let row =
+            nitro_ui::introspect::resolve(h.ui(), &format!("{}{}", names::PLACE_PREFIX, place.key))
+                .expect("the place row");
+        let icon = h.ui().children(row)[0];
+        let top = origin.y + h.bounds(icon).y;
+        classify(top, place.icon);
+    }
+    let cached = h.server().stat("icons_cached") as usize;
+    let baseline = frame_icons_cached();
+    assert!(
+        (baseline + surely.len()..=baseline + maybe.len()).contains(&cached),
+        "cached entries are the distinct icons on screen, not the rows: \
+         {cached} cached, {baseline} for the frame, surely {surely:?}, maybe {maybe:?}"
+    );
+    assert!(
+        cached < baseline + got.len() + h.state().places().len() + 2,
+        "fewer entries than icon-carrying rows: {cached}"
+    );
     assert!(
         h.server().stat("icon_renders") > 0,
         "the server rasterised no icon at all"
-    );
-    assert_eq!(
-        h.server().stat("icons_cached") as usize,
-        frame_icons_cached() + distinct.len(),
-        "cached entries are the distinct icons on screen, not the rows: {distinct:?}"
     );
     assert_eq!(
         h.server().stat("icon_refusals"),
@@ -1476,6 +1555,131 @@ fn a_selection_move_does_not_re_resolve_a_single_mime_type() {
         after.iter().map(|(i, _, _)| i).collect::<Vec<_>>(),
         "the icon column changed when only the selection moved"
     );
+
+    let _ = std::fs::remove_dir_all(&root);
+    h.quit();
+}
+
+#[test]
+fn the_sidebar_lists_the_places_that_exist_and_highlights_the_one_on_screen() {
+    // The fixture home has a `Documents` and nothing else, so the sidebar
+    // is Home, Documents, a separator, Root, Trash. Clicking a row
+    // navigates, and the row whose place is `cwd` is the selected one.
+    let (root, dir) = fixture("places");
+    write(&dir.join("a.txt"), "a");
+    let (mut h, _ids) = app(&dir, &root.join("xdg"));
+    let keys: Vec<&str> = h.state().places().iter().map(|p| p.key).collect();
+    assert_eq!(keys, ["home", "documents", "root", "trash"]);
+
+    let row = |h: &mut Harness<Files>, key: &str| {
+        nitro_ui::introspect::resolve(
+            h.ui(),
+            &format!("window/{}/{}{key}", names::PLACES, names::PLACE_PREFIX),
+        )
+        .unwrap_or_else(|| panic!("the {key} row"))
+    };
+    let home = row(&mut h, "home");
+    let documents = row(&mut h, "documents");
+    assert_eq!(h.ui().role(home).unwrap(), nitro_ui::Role::Button);
+    assert!(
+        !h.widget::<SidebarRow<Files>>(home).is_selected(),
+        "the scratch dir is no place"
+    );
+
+    h.click(documents);
+    h.settle();
+    let want = root.join("home/Documents");
+    assert_eq!(h.state().cwd(), want, "the row navigated");
+    assert!(h.widget::<SidebarRow<Files>>(documents).is_selected());
+    assert!(!h.widget::<SidebarRow<Files>>(home).is_selected());
+
+    // Navigating any other way moves the highlight too.
+    submit_path_to(&mut h, &root.join("home"));
+    assert!(h.widget::<SidebarRow<Files>>(home).is_selected());
+    assert!(!h.widget::<SidebarRow<Files>>(documents).is_selected());
+    h.assert_idle(100);
+
+    let _ = std::fs::remove_dir_all(&root);
+    h.quit();
+}
+
+/// Navigate through `hey set path value`, from any page.
+fn submit_path_to(h: &mut Harness<Files>, to: &Path) {
+    let (ui, state) = h.parts();
+    nitro_ui::introspect::set(
+        ui,
+        state,
+        &format!("window/{}", names::PATH),
+        "value",
+        &to.display().to_string(),
+    )
+    .expect("set the path");
+    h.settle();
+}
+
+#[test]
+fn back_returns_to_the_previous_directory_and_is_disabled_at_the_start() {
+    let (root, dir) = fixture("back");
+    let sub = dir.join("sub");
+    write(&sub.join("inner.txt"), "inner");
+    let (mut h, ids) = app(&dir, &root.join("xdg"));
+    assert!(
+        !h.widget::<Button<Files>>(ids.back).is_enabled(),
+        "nowhere to go back to yet"
+    );
+    assert!(h.state().history().is_empty());
+
+    h.key(key::ENTER);
+    h.settle();
+    assert_eq!(h.state().cwd(), sub);
+    assert_eq!(h.state().history(), std::slice::from_ref(&dir));
+    assert!(h.widget::<Button<Files>>(ids.back).is_enabled());
+
+    h.click(ids.back);
+    h.settle();
+    assert_eq!(h.state().cwd(), dir, "back went back");
+    assert!(h.state().history().is_empty(), "and consumed the entry");
+    assert!(!h.widget::<Button<Files>>(ids.back).is_enabled());
+
+    // Up is a navigation like any other: it is remembered.
+    let up = nitro_ui::introspect::resolve(h.ui(), "window/up").expect("up");
+    h.click(up);
+    h.settle();
+    assert_eq!(h.state().history(), std::slice::from_ref(&dir));
+
+    let _ = std::fs::remove_dir_all(&root);
+    h.quit();
+}
+
+#[test]
+fn the_trash_row_opens_the_trash_files_directory() {
+    let (root, dir) = fixture("trash-row");
+    write(&dir.join("doomed.txt"), "x");
+    let (mut h, ids) = app(&dir, &root.join("xdg"));
+    let trash = nitro_ui::introspect::resolve(h.ui(), "window/place_trash").expect("trash row");
+    // Nothing has been trashed, so `files/` does not exist yet: the row
+    // is there anyway, and the status line says why it cannot be shown.
+    h.click(trash);
+    h.settle();
+    assert_eq!(h.state().cwd(), dir, "a missing directory is not entered");
+    assert!(
+        h.state()
+            .message()
+            .is_some_and(|m| m.contains("Trash/files")),
+        "{:?}",
+        h.state().message()
+    );
+
+    // Trash something, and the row goes there.
+    h.key(key::DELETE);
+    h.settle();
+    h.key(key::Y);
+    h.settle();
+    h.click(trash);
+    h.settle();
+    assert_eq!(h.state().cwd(), root.join("xdg/Trash/files"));
+    assert!(h.widget::<SidebarRow<Files>>(trash).is_selected());
+    assert_eq!(names_of(&h, ids), ["doomed.txt"]);
 
     let _ = std::fs::remove_dir_all(&root);
     h.quit();

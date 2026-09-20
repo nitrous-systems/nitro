@@ -26,26 +26,33 @@ nothing the user did, and `nitro-files` is where that answer was
 written down.
 
 ```text
-        ┌──────────────────────────────────────────────┐
-        │ [ /home/kaspar/src                  ] [  ↑ ] │  TextField `path`
-        ├──────────────────────────────────────────────┤     + Button `up`
-        │ / nitro                            <dir>     │
-        │ / old                              <dir>     │  List `list`
-        │   notes.txt         912 B   2024-03-01 09:15 │  (virtualised)
-        │   photo.png         4.2 MB  2024-02-11 21:40 │
-        ├──────────────────────────────────────────────┤
-        │ [ name                                     ] │  TextField `edit`
-        ├──────────────────────────────────────────────┤     (height 0 when idle)
-        │ 4 items, 1 selected — copied notes.txt       │  Label `status`
-        └──────────────────────────────────────────────┘
-             │                                    ▲
-    activate │                                    │ entries
-             ▼                                    │
-   nitro_launcher::spawn            dir::read_dir / dir::Scan (thread)
+ ┌──────────────┬──────────────────────────────────────────────────┐
+ │ Files        │ [←] [↑] [ /home/kaspar/src                     ] │  Buttons `back`, `up`
+ │              ├──────────────────────────────────────────────────┤   + TextField `path`
+ │  PLACES      │ ▸ nitro                                  <dir>   │
+ │ ▣ Home       │ ▸ old                                    <dir>   │  List `list`
+ │   Documents  │   notes.txt         912 B   2024-03-01 09:15     │  (virtualised)
+ │   Downloads  │   photo.png         4.2 MB  2024-02-11 21:40     │
+ │ ─────────    │ [ name                                         ] │  TextField `edit`
+ │   Root       ├──────────────────────────────────────────────────┤   (height 0 when idle)
+ │   Trash      │ 4 items, 1 selected — copied notes.txt           │  Label `status`
+ └──────────────┴──────────────────────────────────────────────────┘
+       sidebar        │                                    ▲
+   `places/place_*`   │ activate                           │ entries
+                      ▼                                    │
+            nitro_launcher::spawn            dir::read_dir / dir::Scan (thread)
 ```
 
-Five widgets, four modules and no dialogs. The modules — `dir`, `mime`,
-`trash`, `ops` — contain no widget code at all and are tested without a
+![nitro-files, the home directory](files-split.png)
+
+The window is the **split view** from `docs/ui.md`: a sidebar of places
+on the left, and on the right a header (back, up, the path bar), the
+list with rounded inset selection rows (`List::row_inset`/`row_radius`),
+and the status line as a footer under a hairline. The list is not in a
+`Scroll` — it scrolls itself, which is the whole point of it.
+
+Seven widgets plus the sidebar, five modules and no dialogs. The
+modules — `dir`, `mime`, `trash`, `ops`, `places` — contain no widget code at all and are tested without a
 display server; `src/lib.rs` is the tree, the keys and the wiring. That
 split is not tidiness: the interesting properties of a file manager
 ("directories first, whatever you sorted by", "912 B but 4.2 kB", "a
@@ -779,6 +786,34 @@ a condition to handle: be loud in the journal and carry on. Not
 `unwrap` — a file manager should not die because a label did not update
 — and not silence, which is the bug that started this.
 
+## Places
+
+The sidebar lists, under a **Places** header: Home, then whichever of
+Desktop, Documents, Downloads, Music, Pictures and Videos exist — from
+`$XDG_CONFIG_HOME/user-dirs.dirs` when it names them, else `~/Name` —
+then, after a hairline, **Root** (`/`) and **Trash** (the trash's
+`files/` directory). `places::places` is the pure function behind it,
+tested without a display; `places::from_env` reads the environment.
+
+Only directories that **exist** are listed. A row for a place you
+cannot go to is a row that disappoints, and both desktops hide them;
+`xdg-user-dirs` writes `$HOME` back for a directory the user removed,
+and that one is skipped too since it is Home already. The trash is the
+one exception — it is listed before anything has been trashed, and
+navigating to it then says `Trash/files: No such file` in the status
+line, which is the message the path bar gives for any missing directory.
+
+The row whose place is the directory on screen is the selected one,
+whichever way you got there; `navigate` sets it, since `navigate` is the
+one door. Clicking a row is deferred (`Ui::defer`): the row selects
+itself, and a widget cannot write to itself from inside its own callback
+(see below). Music's icon is `headphones` and Pictures' is `images` —
+`docs/icons.md` explains both substitutions.
+
+**Back** remembers the last `HISTORY` (64) directories left by any
+navigation, and is disabled when there are none. Going back pops rather
+than pushes, so Back, Back does not oscillate.
+
 ## Everything is addressable
 
 ```text
@@ -786,6 +821,8 @@ hey nitro-files set path value /tmp     # navigate
 hey nitro-files get list text           # the visible rows
 hey nitro-files do list activate        # enter the selected row
 hey nitro-files get status value        # "4 items, 1 selected"
+hey nitro-files do places/place_home click   # a sidebar row
+hey nitro-files do back click
 ```
 
 The widget names are constants (`names::PATH`, `names::LIST`, …) rather
@@ -1187,9 +1224,12 @@ regrets.
   `nitro-launcher` already shows coloured theme icons
   (`IconTint::Coloured`), so the mechanism exists — what is missing is a
   reason to pay a read per row for it.
-* **No mounts UI.** No removable-device list, no mount or unmount, no
-  `udisks`. All three are D-Bus, and `DESIGN.md` spends its one D-Bus
-  permission on the session rather than here.
+* **No mounts UI, and no bookmarks.** No removable-device list, no mount
+  or unmount, no `udisks`. All three are D-Bus, and `DESIGN.md` spends
+  its one D-Bus permission on the session rather than here. The sidebar
+  is the XDG places and nothing the user adds: no bookmarks file, no
+  drag to reorder — a `~/.config/gtk-3.0/bookmarks` reader is the
+  obvious next step and is not this one.
 * **Timestamps are UTC.** Argued above: no timezone database in the tree.
   Wrong by a constant offset, so the column's ordering stays honest.
 * **A symlinked directory sorts with the files**, because its `Kind` is
