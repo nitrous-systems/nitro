@@ -835,7 +835,15 @@ positions already **widget-local**:
 * **Tab** is the framework's and is never offered to a widget:
   `focus_next` walks the focusable widgets in pre-order and wraps.
   Shift-Tab walks back.
-* **Configure** resizes and re-lays out; **Closed** quits.
+* **Configure** resizes and re-lays out; **Closed** quits — but only a
+  `Closed` naming *this app's* window. The toolkit binds exactly one, and
+  a `Closed` for any other id is somebody else's news: it is reported on
+  stderr and ignored.
+* **Error** is printed (`nitro-ui: server error …`) and, for every code
+  but the two non-fatal ones, latched: `pump` returns it as the loop's
+  error, so a client killed for a protocol violation exits non-zero with
+  the server's own sentence instead of exiting 0 on the EOF that follows.
+  `Ui::last_server_error` reads the latch.
 
 After every batch, `flush()`.
 

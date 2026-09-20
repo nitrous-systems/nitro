@@ -133,6 +133,11 @@ pub use nitro_wire::types::Align;
 // first — must be able to name it. Re-exported for the same reason
 // `Align` is: an app depends on `nitro-ui` and nothing else.
 pub use nitro_wire::msg::Fill;
+// [`Ui::last_server_error`] hands back the server's own error message,
+// so an app must be able to name it — and its `code` — for the same
+// reason: it depends on `nitro-ui` and nothing else.
+pub use nitro_wire::msg::Error as ServerError;
+pub use nitro_wire::types::ErrorCode;
 pub use shell::{Anchor, ShellEvent, Surface};
 pub use theme::{TextStyle, Theme};
 pub use ui::{FdToken, Frame, Node, TimerId, Ui, WidgetMut};

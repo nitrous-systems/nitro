@@ -561,6 +561,86 @@ fn quit_is_set_by_the_app_and_by_a_closed_window() {
 }
 
 #[test]
+fn a_closed_for_another_window_does_not_quit() {
+    let mut h = Harness::sized("closed", (), Size::new(100.0, 50.0), |ui: &mut Ui<()>| {
+        ui.build(column())
+    });
+    // Some other client's window. A `Closed` naming it is news about
+    // somebody else, and must not end our loop.
+    let (ui, state) = h.parts();
+    ui.dispatch(
+        state,
+        &nitro_wire::msg::ServerMsg::Closed(nitro_wire::msg::Closed {
+            window: nitro_wire::types::NodeId(7),
+        }),
+    );
+    assert!(
+        !h.ui().should_quit(),
+        "a stray Closed is not ours to act on"
+    );
+
+    // `ui::WINDOW`, the one window the toolkit binds. Named literally
+    // because it is `pub(crate)` and an integration test is out of crate.
+    let (ui, state) = h.parts();
+    ui.dispatch(
+        state,
+        &nitro_wire::msg::ServerMsg::Closed(nitro_wire::msg::Closed {
+            window: nitro_wire::types::NodeId(1),
+        }),
+    );
+    assert!(h.ui().should_quit(), "our own window closing quits");
+    h.quit();
+}
+
+#[test]
+fn a_fatal_server_error_is_kept_and_reported() {
+    let mut h = Harness::sized("fatal", (), Size::new(100.0, 50.0), |ui: &mut Ui<()>| {
+        ui.build(column())
+    });
+    assert!(h.ui().last_server_error().is_none());
+    let (ui, state) = h.parts();
+    ui.dispatch(
+        state,
+        &nitro_wire::msg::ServerMsg::Error(nitro_wire::msg::Error {
+            serial: 0,
+            code: nitro_wire::types::ErrorCode::Protocol,
+            msg: "unknown opcode 0x9999".into(),
+        }),
+    );
+    let e = h
+        .ui()
+        .last_server_error()
+        .expect("a fatal error is latched, not dropped");
+    assert_eq!(e.code, nitro_wire::types::ErrorCode::Protocol);
+    assert_eq!(e.msg, "unknown opcode 0x9999");
+    h.quit();
+}
+
+#[test]
+fn a_bad_icon_error_is_not_latched() {
+    let mut h = Harness::sized("badicon", (), Size::new(100.0, 50.0), |ui: &mut Ui<()>| {
+        ui.build(column())
+    });
+    // One of the protocol's two non-fatal codes: the connection is kept,
+    // so nothing may be latched for a later EOF to report.
+    let (ui, state) = h.parts();
+    ui.dispatch(
+        state,
+        &nitro_wire::msg::ServerMsg::Error(nitro_wire::msg::Error {
+            serial: 3,
+            code: nitro_wire::types::ErrorCode::BadIcon,
+            msg: "no icon named \"nope\"".into(),
+        }),
+    );
+    assert!(
+        h.ui().last_server_error().is_none(),
+        "a non-fatal BadIcon is not a reason to die"
+    );
+    assert!(!h.ui().should_quit());
+    h.quit();
+}
+
+#[test]
 fn the_scroll_wheel_reaches_the_widget_under_the_pointer() {
     /// A widget that counts the scroll deltas it is given, so the test
     /// can check the axis event really routes.

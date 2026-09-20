@@ -199,6 +199,13 @@ pub struct Ui<S> {
     /// [`Ui::take_activations`] is where a watcher collects them.
     activations: Vec<WidgetId>,
     quit: bool,
+    /// The last fatal [`ServerMsg::Error`] the server sent.
+    ///
+    /// `Server::disconnect` sends the error and *then* closes the socket,
+    /// so the reason and the EOF arrive as two separate events; without
+    /// this the app read the explanation, dropped it, and exited 0 on the
+    /// EOF that followed.
+    last_server_error: Option<nitro_wire::msg::Error>,
     // Scratch pools. Layout recurses, so one vector is not enough; these
     // are stacks of reusable ones, which is what keeps a flush free of
     // per-widget allocation once the tree has settled.
@@ -343,6 +350,7 @@ impl<S: 'static> Ui<S> {
             hover_chain: Vec::new(),
             activations: Vec::new(),
             quit: false,
+            last_server_error: None,
             id_pool: Vec::new(),
             item_pool: Vec::new(),
             rect_pool: Vec::new(),
@@ -728,6 +736,16 @@ impl<S: 'static> Ui<S> {
     #[must_use]
     pub fn should_quit(&self) -> bool {
         self.quit
+    }
+
+    /// The last fatal error the server reported, if any.
+    ///
+    /// Latched by [`Ui::dispatch`] and taken by [`Ui::pump`], which turns
+    /// it into the loop's return error so a client killed for a protocol
+    /// violation says why instead of exiting 0.
+    #[must_use]
+    pub fn last_server_error(&self) -> Option<&nitro_wire::msg::Error> {
+        self.last_server_error.as_ref()
     }
 
     /// Ask the app loop to stop after this event batch.
@@ -2117,7 +2135,17 @@ impl<S: 'static> Ui<S> {
         match self.wire.conn_mut().poll(&mut batch) {
             Ok(_) => {}
             Err(nitro_wire::Error::Closed) => {
+                // The server may have explained itself in an earlier batch
+                // and then closed. Report that reason rather than exiting
+                // 0 — or with a bare `connection closed` — on the EOF.
                 self.quit = true;
+                if let Some(e) = self.last_server_error.take() {
+                    return Err(nitro_wire::Error::Rejected {
+                        code: e.code,
+                        msg: e.msg,
+                    }
+                    .into());
+                }
             }
             Err(e) => return Err(e.into()),
         }
@@ -2132,6 +2160,19 @@ impl<S: 'static> Ui<S> {
         self.wire.stray.append(&mut batch);
         self.deliver_focus_events(state);
         self.run_deferred(state);
+        // A latched error is fatal by construction (the non-fatal codes
+        // never latch), and the server closes the socket right behind it.
+        // Report it now rather than waiting for the EOF: a `flush` later
+        // in the same iteration would otherwise fail with a bare `EPIPE`
+        // and bury the reason the server gave.
+        if let Some(e) = self.last_server_error.take() {
+            self.quit = true;
+            return Err(nitro_wire::Error::Rejected {
+                code: e.code,
+                msg: e.msg,
+            }
+            .into());
+        }
         Ok(n)
     }
 
@@ -2152,7 +2193,19 @@ impl<S: 'static> Ui<S> {
                     self.dispatch_resize(state, c.size);
                 }
             }
-            ServerMsg::Closed(_) => self.quit = true,
+            // Only our own window: the toolkit binds exactly one
+            // (`WINDOW`, see `open_window`), and a `Closed` naming any
+            // other id is not ours to act on. Quitting on it turned every
+            // stray into the quietest exit in the tree — exit 0, no
+            // output.
+            ServerMsg::Closed(c) if c.window == WINDOW => self.quit = true,
+            ServerMsg::Closed(c) => {
+                eprintln!(
+                    "nitro-ui: ignoring Closed for window {} (ours is {})",
+                    c.window.raw(),
+                    WINDOW.raw()
+                );
+            }
             // The desktop's colours changed (or arrived for the first
             // time, right behind the `Welcome`). Not routed to a widget:
             // every widget is affected, so this marks the whole tree and
@@ -2225,8 +2278,27 @@ impl<S: 'static> Ui<S> {
             ServerMsg::Error(e) if e.code == ErrorCode::BadIcon => {
                 self.bad_icon(e);
             }
+            ServerMsg::Error(e) => self.server_error(e),
             _ => {}
         }
+    }
+
+    /// Report a `ServerMsg::Error` the toolkit cannot act on, and latch
+    /// it so [`Ui::pump`] can turn it into the loop's return error.
+    ///
+    /// Every code but `BadIcon` (handled by the arm above) and
+    /// `BadBuffer` on a remote link is fatal by the protocol's
+    /// definition — the server closes the socket right behind it, see
+    /// `docs/wire.md` and `Server::disconnect`. The remote `BadBuffer`
+    /// carve-out is `docs/remote.md` §3: the server sends it and *keeps*
+    /// the client, so latching it would make an unrelated later EOF
+    /// report the wrong reason.
+    fn server_error(&mut self, e: &nitro_wire::msg::Error) {
+        eprintln!("nitro-ui: server error {:?}: {}", e.code, e.msg);
+        if e.code == ErrorCode::BadBuffer && self.is_remote() {
+            return;
+        }
+        self.last_server_error = Some(e.clone());
     }
 
     /// Route an `Error { BadIcon }` to the widget (or widgets) that asked
