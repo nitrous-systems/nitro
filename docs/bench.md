@@ -725,12 +725,22 @@ client's per-commit cost, **25 640 is the effect and 1 388 is the
 is 5 % of the client's cost, so making the wire faster would buy this
 scenario almost nothing.
 
-That upload column is itself a finding. The tree writes `pwrite` rather
-than `mmap` because mapping needs `unsafe`, which this workspace denies —
-so the upload column is a syscall per frame that a mapped buffer would
-not pay. At 1080p it is **1 388 µs/frame**, about 8 % of a 60 Hz budget.
-That is the price of the `#![forbid(unsafe_code)]` rule, measured, and it
-is small.
+That upload column was itself a finding, and it is now a **fixed** one.
+The tree used to write `pwrite` rather than `mmap` because mapping needs
+`unsafe`, which this workspace denies — so the upload column was a syscall
+per frame that a mapped buffer would not pay. At 1080p it was **1 388
+µs/frame** here, about 8 % of a 60 Hz budget, and 2 570–6 044 µs on the
+fullscreen effect rows where the buffer is four times the size.
+
+#569 took it to **zero**: the client renders into a mapping of a *sealed*
+memfd and the server maps the same file instead of `pread`ing it. The
+numbers in this section predate that change — they are the 1f35491 ledger
+and are left exactly as measured — and §7.10a carries the before/after.
+What made it possible was not lifting the `unsafe` rule but earning an
+exception: `F_SEAL_SHRINK`, `F_SEAL_GROW` and `F_SEAL_SEAL` on the
+client's memfd, verified by the server with `F_GET_SEALS` before it maps
+anything, which is what stops a hostile client shrinking the file into a
+`SIGBUS` under the server's mapping.
 
 ### 7.5 `scroll` — a retained scroll is one mutation
 
@@ -1084,6 +1094,76 @@ computes nothing. Fire and rotozoom are the rows that will break first at
 left to give, and §9.1 measures exactly that: fire 30.0 → 24.2/s and
 rotozoom 59.0 → 23.3/s at 120 Hz.
 
+### 7.10a #569 follow-up — mapping the buffer, measured either side
+
+Everything above this line is the 1f35491 ledger and is left as measured.
+This section is a **separate, paired run** for #569, and its numbers come
+from `docs/bench-49d023b.jsonl` — not from editing the tables above.
+
+**What changed.** A client frame used to cross memory three times before
+the rasterizer touched it: the effect wrote a heap `Surface`, the client
+`pwrite` it into a memfd, and the server `pread` it back into scene-owned
+memory. Now the client renders **straight into a mapping of its own
+memfd** and the server **maps the same file read-only**, so the frame
+crosses once. The enabling condition is sealing: the client creates the
+memfd with `MFD_ALLOW_SEALING` and applies `F_SEAL_SHRINK`, `F_SEAL_GROW`
+and `F_SEAL_SEAL`, and the server verifies that with `F_GET_SEALS` and
+refuses the buffer otherwise — without which a client could shrink the
+file under the server's mapping and `SIGBUS` the compositor. The argument
+is in `crates/nitro-shm/README.md`.
+
+**How it was measured.** Both arms in **one sitting**, 1920×1080@60, 6 s
+per run, `before` = 28b6fdd (main), `after` = 49d023b. Each arm was
+deployed and then **md5-verified against the running binary** before its
+rows were taken — the §8 lesson about instruments, and the #3704 rule.
+`before` ran first, so any warming drift over the sitting counts against
+the change rather than for it.
+
+| fullscreen 1080p | upload µs/f | client µs/f | server µs/f | presented/s |
+|---|---|---|---|---|
+| `balls n=32` | 5 519 → **0** | 9 750 → **4 972** | 12 417 → **8 139** | 60 → 60 |
+| `starfield n=500` | 5 848 → **0** | 9 750 → **3 889** | 12 361 → **8 056** | 60 → 60 |
+| `rotozoom` | 2 527 → **0** | 10 639 → **9 944** | 9 722 → **6 750** | 60 → 60 |
+| `fire` | 3 512 → **0** | 22 167 → **18 191** | 12 389 → **8 404** | 30 → 31 |
+| `boing` | 4 399 → **0** | 20 667 → **15 667** | 16 556 → **9 444** | **30 → 60** |
+| `plasma` | 2 583 → **0** | 49 333 → **47 333** | 10 333 → **7 667** | 15 → 15 |
+| `putimage 1080` | 1 425 → **0** | 27 056 → **25 833** | 3 111 → **1 556** | 30 → 30 |
+| `boing-node` *(control)* | 0 → 0 | 83 → 83 | 9 889 → 10 000 | 60 → 60 |
+
+**The shape is the one predicted: two of the three passes disappear.**
+
+- **`upload_us` is 0 on every row**, because there is no upload left to
+  time — not a cheaper copy, no copy. The column is kept rather than
+  removed so older ledgers go on parsing and so the report shows the cost
+  as *gone* rather than silently dropping it.
+- **Server CPU per frame falls 13–50 %**, which is the `pread` leaving.
+  The biggest proportional win is `putimage` (3 111 → 1 556, a halving):
+  it damages a small buffer, so the `pread` was most of what the server
+  did. `boing` falls furthest in absolute terms (16 556 → 9 444).
+- **Client CPU per frame falls by roughly the old upload**, as it must:
+  `balls` 9 750 → 4 972 against an upload of 5 519, `starfield`
+  9 750 → 3 889 against 5 848.
+- **`boing` doubles its frame rate, 30 → 60/s.** That is the one row where
+  the saving crosses a threshold rather than just showing up in a column:
+  its client frame cost was 20 634 µs against the 16 667 µs a 60 Hz frame
+  allows, so it missed every second vsync; at 15 614 µs it fits. This is
+  also why its `paint_us_mean` *rises* (3 089 → 5 486) — the server is
+  painting twice as many frames, not painting more slowly.
+- **`boing-node` is the control and does not move** (9 889 → 10 000 µs,
+  within this box's run-to-run noise). The retained path never paid the
+  upload, so a change to the pixel escape hatch must leave it alone — and
+  it does.
+
+**What did not change.** `damage_px_mean` is identical on every row
+(2 073 600 for the fullscreen arm), so the scenarios are doing the same
+work and being measured the same way; the pixels are unchanged, which is
+what `crates/nitro-server/tests/shadow.rs`'s screenshot-equality tests
+assert in CI. `plasma` at 15/s and `putimage` at 30/s are effect-bound
+(47 333 and 25 833 µs/frame of pure compute) and stay exactly where they
+were: removing the upload cannot help a client that spends fifty
+milliseconds in its own sine loop. #568 is untouched and is now the
+largest remaining term on these rows.
+
 ## 8. The `flip rise` column, and a lesson about instruments
 
 `flip_interval_max_us` is the server's **cumulative, all-time maximum**
@@ -1198,7 +1278,7 @@ paragraph to re-read.
 | issue | the number | what it is |
 |---|---|---|
 | **#568** | `paint_us_mean` **11 757 µs** for a fullscreen 1080p repaint — **71 %** of the 60 Hz frame, and more than a whole 120 Hz frame | Fullscreen rows across three scenarios — rotozoom, starfield at all three N, balls — do genuinely different work per frame (a per-pixel gather, two thousand moving stars, thirty-two circles) and report near-identical server costs: **16 525–16 741 µs, paint 10 963–11 757**, because the server's work is a function of damaged area alone. A least-squares fit through `putimage`'s four damage/paint points extrapolates to ~3 060 µs at 2 073 600 px against the 11 000–11 800 measured, so **a fullscreen repaint is ~3.8× more expensive per pixel than a large partial one** — and §9.6 adds the constraint that the excess is *proportional to area rather than fixed per frame*: at 720p every scenario's ns/px falls rather than rises, so the thing to profile is the per-pixel path at full-surface damage and not a setup cost. |
-| **#569** | `upload_us` **2 570–6 044 µs/frame** at 1080p — for `starfield` and `balls`, **more than the effect itself** | The `pwrite`/`pread` pair the buffer path pays because `mmap` is `unsafe` in this tree and a client can shrink a memfd into a SIGBUS under the server's mapping. `F_SEAL_SHRINK` is the fix that exists and is not taken; the price of not taking it is now measured at 5–60 % of the client's whole frame, and at the top of that range (starfield n=100 at 1080p: 6 044 µs of upload against 3 908 of effect) the client spends more time handing the frame over than making it. Note the scope: the retained path never pays it (§7.7's 83.5 µs), so this is "make the escape hatch cheaper", not "the architecture is wrong". |
+| **#569** | ~~`upload_us` **2 570–6 044 µs/frame** at 1080p~~ → **0**, and the server's `pread` with it | **Fixed.** The client now renders straight into a mapping of its own sealed memfd and the server maps the same file read-only, so two of the frame's three passes over the pixels are gone. Measured either side in one sitting: `docs/bench-49d023b.jsonl` and §7.10 below. `upload_us` is 0 on every row, server CPU/frame falls 13–50 %, and `boing` crosses the 60 Hz budget and doubles to 60 fps. The seal check (`F_SEAL_SHRINK`, `F_SEAL_GROW`, `F_SEAL_SEAL`, verified with `F_GET_SEALS`) is what makes the mapping sound against a hostile client; `crates/nitro-shm/README.md` carries the argument and the residuals. Scope was always the escape hatch: the retained path never paid this (§7.7's 83.5 µs) and is unchanged — `boing-node` is the control row and does not move. |
 | **#570** | a one-row scroll damages **304 768 px = 0.99× the viewport** | The wire side is excellent — one mutation, 52 bytes, independent of content height. The server side repaints the whole viewport where `CopyArea` moved a line and repainted only the exposed 640×16 = 10 240 px, a factor of ~30. Damaging the *symmetric difference* of a pure translation rather than the union would take this to ~20 000 px without touching the rasterizer, and `nitro-bench scroll` re-run is the proof it would land. It compounds with #568 for a fullscreen `nitro-term`. (The figure was 675 696 px in an earlier ledger, from a clipping group that clipped nothing; the issue is unchanged, its number is now honest — §7.5.) |
 
 Two of the three are about the same underlying thing — **the server's cost

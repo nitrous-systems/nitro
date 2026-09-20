@@ -597,17 +597,27 @@ M3-E one: `nitro-session` with wallpaper, bar and launcher, plus
 `hello_client` and `hello_dialog` as the two applications, settled — six
 windows, three decorated.)
 
-**`RssShmem` is 0 for every process**, and the reason is worth stating
-precisely, because it is the column's whole justification. `RssShmem`
-counts resident **shared** mappings — tmpfs, shmem, shared-anon — and the
-server makes none. A client's buffer arrives as a memfd, and the server
-**copies** it: `clients::read_buffer` `pread`s the pixels into a `Vec<u8>`
-and `reread_damage` re-`pread`s the damaged rows, because a client can
-shrink a memfd under a live mapping and turn the server's reads into
-`SIGBUS`. So a client buffer is **anon** in the server, not shared and not
-file-backed — and `MAX_BUFFER_BYTES` is 64 MB apiece, which is the one
-term in the anon breakdown that could dwarf everything else if a client
-pushed video. The scanout buffers *are* mapped — `nitro-kms` calls
+**`RssShmem` was 0 for every process when these rows were measured**, and
+the reason is worth stating precisely, because it is the column's whole
+justification. `RssShmem` counts resident **shared** mappings — tmpfs,
+shmem, shared-anon — and at the time the server made none: a client's
+buffer arrived as a memfd and the server *copied* it, `pread`ing the pixels
+into a `Vec<u8>`, because a client can shrink a memfd under a live mapping
+and turn the server's reads into `SIGBUS`. So a client buffer was **anon**
+in the server, not shared and not file-backed.
+
+**#569 moved that term.** The server now maps the client's sealed memfd
+instead of copying it (see `crates/nitro-shm/README.md` for why that is
+sound), so client buffer pixels are a resident **shared** mapping: they
+leave `RssAnon` and appear in `RssShmem`, which is no longer structurally
+zero. The *total* is what improves — the server stops holding a second
+copy of every client's pixels at all, so the 64 MB-per-buffer worst case
+below is now one allocation shared between client and server rather than
+one each. The tables on this page predate the change and are **not**
+re-measured here; they are labelled with the sha they were taken at, and
+the column to watch on the next pass is `RssShmem` rather than `RssAnon`.
+
+The scanout buffers *are* mapped — `nitro-kms` calls
 `map_dumb_buffer` and keeps the mapping for the life of the output — but a
 DRM dumb-buffer mapping is a device mapping (`VM_PFNMAP`/`VM_IO`) that the
 kernel does not account to any RSS bucket at all.
@@ -701,9 +711,12 @@ from `/proc/<pid>/status`; `just box-ps` now prints all three.
 
 `RssShmem` is **0** in every sample taken for this audit, and the column
 is carried rather than dropped because it is the one that would move if
-the server ever stopped copying. `RssShmem` counts resident **shared**
-mappings, and the server makes none: client buffers are `pread` into a
-`Vec<u8>` (anon), and the scanout buffers, though genuinely `mmap`ed by
+the server ever stopped copying. It since has: **#569** maps client buffers
+instead of `pread`ing them, so on any measurement taken after that commit
+this column is where a client's pixels live. At the time of these samples
+`RssShmem` counts resident **shared** mappings and the server made none:
+client buffers were `pread` into a `Vec<u8>` (anon), and the scanout
+buffers, though genuinely `mmap`ed by
 `nitro-kms`, are device mappings the kernel accounts to no RSS bucket. The
 mechanism is spelled out under the M3 desktop table above. So the third
 term is structurally zero here, not merely small — and `VmRSS = RssAnon +
@@ -751,7 +764,7 @@ shell connections, six windows and every glyph on screen. Of that:
 | glyph atlas | **1 048 576** | `atlas_bytes`, one 1024×1024 A8 page |
 | scene nodes | 206 × 240 = **49 440** | `nodes` × `size_of::<Node>()` |
 | per wire connection | ~**66 000** each | `nitro-wire`'s 64 KiB `RECV_CHUNK` receive scratch, allocated in `Socket::from_fd` before the handshake; measured by opening 5 idle sockets that never send a byte (+332 kB) |
-| client buffer pixels | one `Vec<u8>` per buffer | `clients::read_buffer` `pread`s each memfd into the heap rather than mapping it, so a client's pixels are the server's **anon**. Small here — the shell clients are a wallpaper and two thin bars — but `MAX_BUFFER_BYTES` is **64 MB** apiece, so this is the term that would dominate everything above it the day a client pushes video. |
+| client buffer pixels | one mapping per buffer | **Since #569** the server `mmap`s each client memfd rather than `pread`ing it, so a client's pixels are a *shared* mapping (`RssShmem`) of the client's own pages, not a second anon copy. Small here — the shell clients are a wallpaper and two thin bars — and `MAX_BUFFER_BYTES` is still **64 MB** apiece, but it is now one allocation between the two processes rather than one each. The rows above were measured before the change, when this was an anon `Vec<u8>`. |
 | font bytes, settled | **0** | `font_bytes`; see below |
 
 **The atlas is 43 % of the server's anonymous memory**, and one page is
@@ -866,11 +879,24 @@ mapped file truncated under us is a SIGBUS, and only the caller can promise
 it will not be. `mallopt(M_MMAP_THRESHOLD, …)` (option 2) is libc FFI and
 the same problem, for a glibc-specific knob that is a no-op on musl.
 
-So the trade is: **2 MB of resident memory on one test box against the
-`unsafe_code = "deny"` rule with its single sanctioned exception.** The rule
-is worth more. Revisit if `memmap2` ever offers a safe file mapping, or if
-the server acquires a sanctioned `unsafe` boundary for some other reason —
-at which point option 3 is a small change and the right one.
+So the trade was: **2 MB of resident memory on one test box against the
+`unsafe_code = "deny"` rule, which at the time had a single sanctioned
+exception.** The rule was worth more. The revisit condition recorded here
+was "if `memmap2` ever offers a safe file mapping, or if the server
+acquires a sanctioned `unsafe` boundary for some other reason — at which
+point option 3 is a small change and the right one."
+
+**That boundary now exists.** #569 added `nitro-shm`, a scoped `unsafe`
+exception that owns the tree's one `mmap`/`munmap` for client pixel
+buffers, so the tree now has two exceptions rather than one. Mapping the
+font file is therefore a small change rather than a new rule — but it is
+filed as a follow-up (issue #594) rather than done here, because the font
+case needs its **own** argument and does not inherit this one: it is a
+read-only mapping of a file *we did not create and cannot seal*, so
+nothing stops a package upgrade truncating it under the mapping. That is
+the same `SIGBUS` hazard, without the tool that closed it for client
+buffers — which is exactly the kind of reasoning that must not ride along
+on an unrelated task.
 
 ### The revised budget line
 

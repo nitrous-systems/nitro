@@ -1,10 +1,17 @@
-//! The mapping: three `unsafe` blocks and their proofs.
+//! The mapping: four `unsafe` blocks and their proofs.
 //!
 //! **`unsafe` exception**: task 3754 / issue #569, granted on the condition
 //! that every `SAFETY` comment below is an argument, not a restatement.
-//! Listed under "`unsafe` exceptions" in `DEPENDENCIES.md`. The workspace
-//! lint is `unsafe_code = "deny"`; this file, and only this file, allows
-//! it. Nothing outside it may write `unsafe`.
+//! Recorded under "`unsafe` exceptions" in `DEPENDENCIES.md`, with the
+//! narrative version in this crate's `README.md`. The workspace lint is
+//! `unsafe_code = "deny"`; this file, and only this file, allows it.
+//! Nothing outside it may write `unsafe` — and that is enforced by the
+//! compiler rather than by this sentence: the allow below is an inner
+//! attribute scoped to this module, so an `unsafe` block anywhere else in
+//! the crate fails the build. (`Cargo.toml` must keep
+//! `[lints] workspace = true` for the deny to apply at all;
+//! `the_lint_that_scopes_this_exception_is_still_in_place` in
+//! `tests/seals.rs` is the regression test for someone deleting it.)
 //!
 //! The threat model throughout is a **hostile client**: the process that
 //! created the memfd, still holds a descriptor to it, and will do whatever
@@ -16,6 +23,24 @@
 //! [`RawMap`]. [`Mapping`] (read-only, the server's) and [`MappingMut`]
 //! (read/write, the client's) are thin wrappers that fix the protection
 //! flags and expose slices.
+//!
+//! # Miri cannot check any of this, and here is why
+//!
+//! Stated here rather than only in the crate docs, because this is the
+//! file a reader arrives at asking "was this verified by a tool?". It was
+//! not, and it cannot be: `memfd_create`, `F_ADD_SEALS`, `F_GET_SEALS` and
+//! a **file-backed** `mmap` have no Miri shims (Miri models anonymous
+//! memory only), and rustix's default `linux_raw` backend issues syscalls
+//! through inline assembly, which Miri refuses outright. So there is no
+//! `cargo miri test` result to point at for this module.
+//!
+//! What stands in for it is that every load-bearing claim below is pinned
+//! by a **real-kernel** test in `tests/seals.rs` that asserts the kernel's
+//! own behaviour rather than a model of it — in particular
+//! `a_sealed_memfd_cannot_be_shrunk`, which checks `ftruncate` returns
+//! `EPERM` *and* that the mapping is still readable to its last byte. That
+//! is the difference between "the seal was set" and "the seal is in
+//! force", and it is the hinge the whole argument turns on.
 
 #![allow(unsafe_code)]
 

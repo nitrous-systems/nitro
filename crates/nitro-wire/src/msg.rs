@@ -664,6 +664,15 @@ pub struct CreateBuffer {
     /// Size of the mapping in bytes.
     pub size: u32,
     /// The memfd / shm descriptor.
+    ///
+    /// **Must be a sealed memfd**: `memfd_create(MFD_ALLOW_SEALING)` plus
+    /// `F_ADD_SEALS` with `F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL`. The
+    /// server maps it rather than copying the pixels out, so it verifies
+    /// the seals with `F_GET_SEALS` first and answers `BadBuffer` if any
+    /// is missing — an unsealed file could be shrunk under the live
+    /// mapping and `SIGBUS` the compositor. Sealing leaves writing alone,
+    /// which is what lets the client go on rendering frames into it. See
+    /// `docs/wire.md` under `CreateBuffer`.
     pub fd: OwnedFd,
 }
 

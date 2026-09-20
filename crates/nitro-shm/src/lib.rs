@@ -12,8 +12,9 @@
 //! - this module is safe Rust: creating a memfd with the seals the mapping
 //!   relies on ([`create_sealed`], [`memfd_with`]), and checking that an fd
 //!   someone *else* handed us carries them ([`check_seals`]);
-//! - [`map`] holds the three `unsafe` blocks (`mmap`, `from_raw_parts`,
-//!   `munmap`) and the `SAFETY` proofs for each. It is the only module in
+//! - [`map`] holds the four `unsafe` blocks (`mmap`, `from_raw_parts`,
+//!   `from_raw_parts_mut`, `munmap`) and the `SAFETY` proofs for each. It
+//!   is the only module in
 //!   the workspace with `#![allow(unsafe_code)]` besides one function in
 //!   `nitro-seat`; the exception is scoped to that file and recorded in
 //!   `DEPENDENCIES.md`.

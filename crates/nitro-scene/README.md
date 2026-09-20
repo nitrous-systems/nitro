@@ -341,8 +341,15 @@ explicit scratch stack and do not recurse at all.
 
 ## Buffers
 
-`create_buffer` takes ownership of a copy of the client's pixels; the scene
-holds them until `destroy_buffer`. The format is an opaque fourcc — the scene
+`create_buffer` takes a [`PixelStore`] — whatever holds the client's
+pixels; the scene holds it until `destroy_buffer`. In the server that is a
+read-only **mapping** of the client's sealed memfd (#569), so the pixels
+are the client's own pages and the scene never copies them; in tests it is
+a `Vec<u8>`. The scene does not know which, and deliberately knows nothing
+about `mmap` or seals: it reads bytes through the trait and drops the store
+when the buffer dies, which for a mapping is the `munmap`. A store that
+reports no writable view makes `buffer_mut` return `Error::ReadOnly` — the
+client writes those pages, not the server. The format is an opaque fourcc — the scene
 never looks inside a pixel, it only checks that the described bytes exist. The
 one thing it records about the format is `BufferDesc::with_opaque`, and even
 that is a boolean the caller computed; see `opaque_cover` above.

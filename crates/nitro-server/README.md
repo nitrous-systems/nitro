@@ -339,18 +339,30 @@ one hash map rather than a search of the scene, and the scene damages the
 pixels those windows covered as it removes them, so the area repaints
 without them on the next frame.
 
-**The buffer copy path.** `CreateBuffer` validates the description
+**The buffer mapping path.** `CreateBuffer` validates the description
 (format, stride, a 64 MiB cap that fits a 4K ARGB frame with room to
-spare) and `pread`s the pixels out of the client's memfd into scene-owned
-memory. They are **copied, not mapped**, and that is the M1 answer rather
-than an oversight: a client can shrink a memfd under a live mapping and
-turn the server's next read into SIGBUS, so a safe mapping needs either
-enforced `F_SEAL_SHRINK` or a signal handler — and `mmap` is `unsafe`,
-which this tree does not use. The copy costs one pass over the pixels per
-update, and `BufferDamage` keeps that pass proportional to what actually
-changed: only the damaged *rows* are re-read, one `pread` per row band,
-because a row is contiguous and damage rectangles are usually wide.
-Revisit with sealing when a client pushes video.
+spare), checks the descriptor's **seals**, and then `mmap`s the client's
+memfd read-only into the scene's buffer. The pixels are **mapped, not
+copied** (#569): the client renders into the same pages the rasterizer
+samples, so a frame crosses memory once instead of three times — worth
+4–6 ms of a fullscreen 1080p frame on the test box.
+
+That used to be unsafe to do, and the seal check is what changed. A client
+can `ftruncate` an unsealed memfd under a live mapping and turn the
+server's next read into a `SIGBUS`, so the server refuses any buffer whose
+fd does not carry `F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL`, verified
+with `F_GET_SEALS` before mapping — a `BadBuffer` error, with **no**
+`pread` fallback, so the mapped path is the only path and cannot rot
+untested. The `mmap` itself and its safety proofs live in `nitro-shm`,
+which is the tree's one sanctioned `unsafe` boundary for this; see
+`crates/nitro-shm/README.md`, including the residuals sealing does not
+close.
+
+`BufferDamage` is therefore now only "mark the image nodes that sample
+these rows for repaint" — there is no copy to refresh. `DestroyBuffer`
+releases the mapping: the scene drops the buffer, whose store's `Drop` is
+the `munmap`. The server keeps no descriptor at all, because the mapping
+pins the file and `nitro-shm` closes the fd as soon as the pages are in.
 
 `DestroyBuffer` releases the descriptor as well as the pixels. The scene
 forgets the bytes on its own, but the fd is the server's, and a client

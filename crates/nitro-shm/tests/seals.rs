@@ -340,3 +340,105 @@ fn the_required_seals_are_exactly_the_three() {
     );
     assert!(!REQUIRED_SEALS.contains(SealFlags::WRITE));
 }
+
+/// The size of the audited surface, asserted rather than described.
+///
+/// `DEPENDENCIES.md`, this crate's `README.md` and `map.rs`'s own header
+/// all tell a reviewer how many `unsafe` blocks there are to audit. That
+/// number is the one thing in the prose a reader cannot check at a glance
+/// and is most likely to be wrong after a refactor — and a stale count is
+/// worse than none, because it tells an auditor they have seen
+/// everything when they have not.
+///
+/// (It was already wrong once: the first draft of those docs said
+/// "three", having counted `from_raw_parts` and `from_raw_parts_mut` as
+/// one. Hence this test.)
+#[test]
+fn the_unsafe_surface_is_exactly_what_the_docs_claim() {
+    let map = include_str!("../src/map.rs");
+    let blocks = map.matches("unsafe {").count();
+    assert_eq!(
+        blocks, 4,
+        "map.rs has {blocks} `unsafe` blocks; the docs (DEPENDENCIES.md, \
+         README.md, map.rs's header) all say four. Update them together \
+         with the code, or an auditor reads a count that no longer \
+         describes what they must audit."
+    );
+    // And the two syscalls that must exist exactly once each, because
+    // "one mmap and one munmap in the whole tree" is the claim that makes
+    // the surface auditable in one sitting.
+    assert_eq!(map.matches("rustix::mm::mmap(").count(), 1);
+    assert_eq!(map.matches("rustix::mm::munmap(").count(), 1);
+
+    // The other half of that claim: nothing *outside* this file maps or
+    // unmaps. `nitro-kms` has its own DRM mappings through the `drm`
+    // crate, which is a different thing and not this module path.
+    //
+    // The needle is assembled at runtime rather than written as a
+    // literal, because this test's own source is one of the files it
+    // scans — a literal would match itself and fail. (It did.)
+    let mm_path = format!("rustix{}mm{}", "::", "::");
+    assert!(
+        !include_str!("../src/lib.rs").contains(&mm_path),
+        "src/lib.rs reaches for the mm module; the mapping must stay in map.rs"
+    );
+}
+
+/// The `unsafe` exception is scoped by two things, and one of them is a
+/// line in `Cargo.toml` that looks like boilerplate and is not.
+///
+/// `src/map.rs` carries `#![allow(unsafe_code)]`. That is only an
+/// *exception* if something is denying `unsafe_code` in the first place,
+/// and what does that is `[lints] workspace = true` inheriting the
+/// workspace's `unsafe_code = "deny"`. Delete those two lines and the
+/// allow silently becomes decoration: `unsafe` would be permitted
+/// anywhere in the crate, with no error, no warning, and a module header
+/// still claiming the opposite.
+///
+/// The compiler cannot catch that — the absence of a lint is not a
+/// diagnostic — so it is asserted here as a plain text check, which is
+/// the only place it can be caught. The sibling half (that `map.rs` is
+/// the *only* file allowing it) is enforced by the deny itself: any
+/// `unsafe` elsewhere in the crate fails the build, which is what the
+/// audit of #569 relied on.
+#[test]
+fn the_lint_that_scopes_this_exception_is_still_in_place() {
+    let manifest = include_str!("../Cargo.toml");
+    let has_lints_table = manifest.lines().map(str::trim).any(|l| l == "[lints]");
+    let inherits_workspace = manifest
+        .lines()
+        .map(str::trim)
+        .any(|l| l.replace(' ', "") == "workspace=true");
+    assert!(
+        has_lints_table && inherits_workspace,
+        "crates/nitro-shm/Cargo.toml has lost `[lints] workspace = true`. \
+         The workspace denies `unsafe_code`; without this table that deny \
+         does not apply here, and the `#![allow(unsafe_code)]` in \
+         src/map.rs stops being a scoped exception and becomes a licence \
+         for the whole crate."
+    );
+
+    // And the allow really is scoped to `map.rs`: a crate-level allow in
+    // `lib.rs` would widen the exception to everything. Matched at the
+    // start of a line so that *prose about* the attribute (the crate docs
+    // discuss it, as does the comment explaining why there is no
+    // crate-level `forbid`) is not mistaken for the attribute itself —
+    // the first version of this check made exactly that mistake and
+    // failed on its own documentation.
+    let lib = include_str!("../src/lib.rs");
+    let lib_allows = lib
+        .lines()
+        .map(str::trim)
+        .any(|l| l.starts_with("#![allow(unsafe_code)") || l.starts_with("#[allow(unsafe_code)"));
+    assert!(
+        !lib_allows,
+        "lib.rs allows unsafe_code; the exception must stay scoped to map.rs"
+    );
+    let map = include_str!("../src/map.rs");
+    assert!(
+        map.lines()
+            .map(str::trim)
+            .any(|l| l == "#![allow(unsafe_code)]"),
+        "map.rs has lost its scoped allow"
+    );
+}

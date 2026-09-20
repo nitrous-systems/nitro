@@ -735,12 +735,40 @@ the only two non-fatal errors in the protocol.
 | `height` | `u32` | pixels |
 | `stride` | `u32` | bytes per row; at least `width * 4` |
 | `format` | `u32` | DRM fourcc |
-| `size` | `u32` | mapping size in bytes; at least `stride * height` |
-| *(fd)* | `SCM_RIGHTS` | memfd or shm descriptor |
+| `size` | `u32` | mapping size in bytes; at least `stride * height`, and no larger than the file |
+| *(fd)* | `SCM_RIGHTS` | **sealed** memfd (see below) |
 
-The server maps the descriptor **read-only**. The client keeps writing
-into it and announces changes with `BufferDamage`. An inconsistent
-geometry, size or descriptor is a `BadBuffer` error.
+The descriptor **must be a sealed memfd**: created with
+`memfd_create(name, MFD_ALLOW_SEALING)` and then sealed with
+`fcntl(F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL)`. The server
+verifies this with `fcntl(F_GET_SEALS)` **before** it maps anything, and a
+descriptor missing any of the three earns `BadBuffer` — there is no
+fallback to copying. An inconsistent geometry or size is `BadBuffer` too,
+as is a file shorter than the declared `size`.
+
+The reason is not ceremony. The server **maps** the descriptor read-only
+rather than copying the pixels out of it, so if a client could shrink the
+file under that live mapping, the server's next read of the vanished pages
+would be a `SIGBUS` — any client could kill the compositor. `F_SEAL_SHRINK`
+is what makes that impossible; `F_SEAL_SEAL` is what stops the seal set
+being changed afterwards, so what the server checked is what holds for the
+buffer's life; `F_SEAL_GROW` fixes the size so the declared `size` can be
+checked once and relied on. Sealing does **not** restrict writing: the
+client goes on writing its frames into the same pages, which is the whole
+point. See `crates/nitro-shm/README.md` for the full argument and its
+residuals.
+
+The client keeps writing into the buffer and announces changes with
+`BufferDamage`, which is now purely "repaint the nodes that sample these
+rows": the server re-reads nothing, because it never had a copy.
+
+**The tearing contract.** Because the mapping is live, the bytes the server
+blits are whatever is in the buffer at the moment it paints. A client that
+wants a coherent frame writes the next one only after the server has
+finished the previous one — i.e. after the `Frame` callback (or
+`Presented`) for it. The toolkit and the benchmark harness already work
+this way: they render on `Frame`, which the server sends after the paint.
+A client that ignores this tears its own window and nothing else.
 
 ### `DestroyBuffer` — 0x0302
 
