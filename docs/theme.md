@@ -88,6 +88,10 @@ desktop can be pasted straight back into a file.
 | `title_maximize` | **no longer painted**; kept because a role index is a wire index | `#62a85c` | `#62a85c` |
 | `resize_hint` | the frame edge, while the pointer is in its resize band — **not** the accent, see below | `#003a80` | `#b8dcff` |
 | `title_button_hover` | the disc under a hovered minimize or maximize button | `#b3c0d4` | `#465c78` |
+| `sidebar_background` | the sidebar pane of a split view — a shade **darker** than `window_background` in light, **lighter** in dark | `#ebebed` | `#2a2d34` |
+| `sidebar_selected` | the selected sidebar row's pill — neutral, the accent stays for controls | `#d8d8dc` | `#3f4450` |
+| `sidebar_hover` | a sidebar row under the pointer | `#dfdfe3` | `#353942` |
+| `hairline` | 1-px separations that are a shade, not a border: the pane divider, a card's ring, the lines between a card's rows | `#dcdce0` | `#3a3f48` |
 | `desktop_top` | top of the wallpaper gradient — **and of the server's own uncovered desktop** | `#dce3ed` | `#2a303c` |
 | `desktop_bottom` | bottom of both | `#bec7d4` | `#151820` |
 | `terminal_background` | a terminal's default background (`SGR 49`) | `#fbfbf8` | `#141418` |
@@ -410,3 +414,16 @@ first instinct: the two sit on different backgrounds. In the light scheme
 difference of two units in one channel, which is an affordance nobody can
 see. A hover disc has to read against a *title bar*, and that is a
 different meaning from a button face on a window background.
+
+The four split-view roles (`sidebar_background`, `sidebar_selected`,
+`sidebar_hover`, `hairline` — `docs/ui.md`, "Split view blueprint") are
+roles for the same reason. `sidebar_hover` is not `button_hover`: the
+sidebar pane is itself a shade below the window background, so a hover
+face tuned for the window is a difference of a few units on it. And
+`hairline` is not `border`: a border outlines a control and is held to
+3:1 against what it sits on, while a hairline is deliberately *faint* — a
+1.1–2:1 shade beside the surface, the window and the sidebar alike, which
+is what `the_sidebar_sits_a_shade_off_the_window` pins. The sidebar's
+own value is pinned in the other direction too: darker than the window in
+light and lighter in dark, which is how GNOME and macOS both make two
+panes read as two without a line between them.

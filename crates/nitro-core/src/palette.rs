@@ -240,6 +240,25 @@ roles! {
     /// (`#d6d9e4`) against `title_bar_active` (`#d6dde8`) is a difference
     /// of two units in one channel — an affordance nobody can see.
     TitleButtonHover = "title_button_hover",
+    /// The sidebar pane of a split view (`docs/ui.md`, "Split view
+    /// blueprint"): a shade **darker** than [`Role::WindowBackground`]
+    /// in the light scheme and a shade **lighter** in the dark one, which
+    /// is how both GNOME and macOS make the two panes read as two
+    /// without drawing a border between them.
+    SidebarBackground = "sidebar_background",
+    /// The selected sidebar row's pill. Neutral, not the accent: the
+    /// accent is reserved for the control that wants attention, and a
+    /// permanently-selected category is not it.
+    SidebarSelected = "sidebar_selected",
+    /// A sidebar row under the pointer. Its own role for the reason
+    /// [`Role::TitleButtonHover`] is: [`Role::ButtonHover`] is chosen
+    /// against the window background and is invisible on the sidebar's.
+    SidebarHover = "sidebar_hover",
+    /// A 1-px separation that is a *shade*, not a border: the line
+    /// between the two panes of a split view, the ring around a card and
+    /// the lines between a card's rows. Distinct from [`Role::Border`],
+    /// which outlines a control and has to clear 3:1.
+    Hairline = "hairline",
 }
 
 impl Role {
@@ -394,7 +413,8 @@ impl Palette {
             Accent, AccentActive, AccentHover, Ansi0, Ansi1, Ansi2, Ansi3, Ansi4, Ansi5, Ansi6,
             Ansi7, Ansi8, Ansi9, Ansi10, Ansi11, Ansi12, Ansi13, Ansi14, Ansi15, Border, Button,
             ButtonActive, ButtonDisabled, ButtonHover, ButtonText, Caret, Danger, DesktopBottom,
-            DesktopTop, Field, Focus, ModalBackground, Placeholder, ResizeHint, Selection, Success,
+            DesktopTop, Field, Focus, Hairline, ModalBackground, Placeholder, ResizeHint,
+            Selection, SidebarBackground, SidebarHover, SidebarSelected, Success,
             TerminalBackground, TerminalCursor, TerminalText, Text, TextDim, TextOnAccent,
             TitleBarActive, TitleBarInactive, TitleButtonHover, TitleClose, TitleMaximize,
             TitleTextActive, TitleTextInactive, Track, Warning, WindowBackground,
@@ -451,6 +471,14 @@ impl Palette {
         // against every colour that can be adjacent to the stroke —
         // both borders, both bars, the desktop, the window background.
         p.set(ResizeHint, Color::rgb(0x00, 0x3a, 0x80));
+        // Split view. See docs/ui.md §Split view blueprint. The sidebar
+        // is a shade *below* the window background, the pill and hover
+        // a shade below that, and the hairline sits between the sidebar
+        // and the white surface so it reads on both.
+        p.set(SidebarBackground, Color::rgb(0xeb, 0xeb, 0xed));
+        p.set(SidebarSelected, Color::rgb(0xd8, 0xd8, 0xdc));
+        p.set(SidebarHover, Color::rgb(0xdf, 0xdf, 0xe3));
+        p.set(Hairline, Color::rgb(0xdc, 0xdc, 0xe0));
         // Desktop.
         p.set(DesktopTop, Color::rgb(0xdc, 0xe3, 0xed));
         p.set(DesktopBottom, Color::rgb(0xbe, 0xc7, 0xd4));
@@ -489,7 +517,8 @@ impl Palette {
             Accent, AccentActive, AccentHover, Ansi0, Ansi1, Ansi2, Ansi3, Ansi4, Ansi5, Ansi6,
             Ansi7, Ansi8, Ansi9, Ansi10, Ansi11, Ansi12, Ansi13, Ansi14, Ansi15, Border, Button,
             ButtonActive, ButtonDisabled, ButtonHover, ButtonText, Caret, Danger, DesktopBottom,
-            DesktopTop, Field, Focus, ModalBackground, Placeholder, ResizeHint, Selection, Success,
+            DesktopTop, Field, Focus, Hairline, ModalBackground, Placeholder, ResizeHint,
+            Selection, SidebarBackground, SidebarHover, SidebarSelected, Success,
             TerminalBackground, TerminalCursor, TerminalText, Text, TextDim, TextOnAccent,
             TitleBarActive, TitleBarInactive, TitleButtonHover, TitleClose, TitleMaximize,
             TitleTextActive, TitleTextInactive, Track, Warning, WindowBackground,
@@ -539,6 +568,12 @@ impl Palette {
         // active border was 2.3:1, a shade of the same blue (#565). Pale
         // sky clears 3:1 against everything beside the stroke.
         p.set(ResizeHint, Color::rgb(0xb8, 0xdc, 0xff));
+        // Split view: the sidebar is a shade *above* the window
+        // background here — the light scheme's rule, mirrored.
+        p.set(SidebarBackground, Color::rgb(0x2a, 0x2d, 0x34));
+        p.set(SidebarSelected, Color::rgb(0x3f, 0x44, 0x50));
+        p.set(SidebarHover, Color::rgb(0x35, 0x39, 0x42));
+        p.set(Hairline, Color::rgb(0x3a, 0x3f, 0x48));
         p.set(DesktopTop, Color::rgb(0x2a, 0x30, 0x3c));
         p.set(DesktopBottom, Color::rgb(0x15, 0x18, 0x20));
         p.set(TerminalBackground, Color::rgb(0x14, 0x14, 0x18));
@@ -669,7 +704,7 @@ mod tests {
         // would renumber every wire index after it — fails here rather than
         // on somebody's screen. Appending updates this line, and that edit
         // is the point: it is where you notice you are changing the wire.
-        assert_eq!(Role::ALL.last(), Some(&Role::TitleButtonHover));
+        assert_eq!(Role::ALL.last(), Some(&Role::Hairline));
     }
 
     #[test]
@@ -721,8 +756,9 @@ mod tests {
     #[test]
     fn text_is_readable_on_what_it_sits_on() {
         use Role::{
-            Accent, Button, ButtonText, Field, Placeholder, Surface, Text, TextDim, TextOnAccent,
-            TitleBarActive, TitleBarInactive, TitleTextActive, TitleTextInactive, WindowBackground,
+            Accent, Button, ButtonText, Field, Placeholder, SidebarBackground, SidebarHover,
+            SidebarSelected, Surface, Text, TextDim, TextOnAccent, TitleBarActive,
+            TitleBarInactive, TitleTextActive, TitleTextInactive, WindowBackground,
         };
         for (name, p) in both() {
             for (fg, bg, want) in [
@@ -739,6 +775,14 @@ mod tests {
                 // it indistinguishable from `Text`, which defeats it.
                 (TextDim, WindowBackground, AA_LARGE),
                 (Placeholder, Field, AA_LARGE),
+                // The split view's sidebar: a row's label on the pane,
+                // on the selected pill and under the pointer.
+                (Text, SidebarBackground, AA),
+                (Text, SidebarSelected, AA),
+                (Text, SidebarHover, AA),
+                (TextDim, SidebarBackground, AA_LARGE),
+                (TextDim, SidebarSelected, AA_LARGE),
+                (TextDim, Surface, AA_LARGE),
             ] {
                 let got = contrast(p.get(fg), p.get(bg));
                 assert!(
@@ -805,6 +849,44 @@ mod tests {
                 "{name}: the borders are not sorted the way their bars are, \
                  so at least one is not its own bar's shade"
             );
+        }
+    }
+
+    /// The split view's sidebar is a *shade* off the window background —
+    /// darker on paper, lighter on slate — and its pill and hairline are
+    /// shades too, not borders. See `docs/ui.md`, "Split view blueprint".
+    #[test]
+    fn the_sidebar_sits_a_shade_off_the_window() {
+        use Role::{Hairline, SidebarBackground, SidebarHover, SidebarSelected, Surface};
+        let light = Palette::light();
+        assert!(
+            luminance(light.get(SidebarBackground)) < luminance(light.get(Role::WindowBackground))
+        );
+        let dark = Palette::dark();
+        assert!(
+            luminance(dark.get(SidebarBackground)) > luminance(dark.get(Role::WindowBackground))
+        );
+        for (name, p) in both() {
+            // The pill and the hover face read against the pane, but as
+            // a pill, not a slab; the hover is fainter than the pill.
+            let pill = contrast(p.get(SidebarSelected), p.get(SidebarBackground));
+            let hover = contrast(p.get(SidebarHover), p.get(SidebarBackground));
+            assert!((1.1..=2.0).contains(&pill), "{name}: pill is {pill:.2}:1");
+            assert!(
+                (1.05..=2.0).contains(&hover),
+                "{name}: hover is {hover:.2}:1"
+            );
+            assert!(hover < pill, "{name}: hover is stronger than the pill");
+            // The hairline is visible beside everything it separates,
+            // and a shade beside all of them.
+            for beside in [Surface, Role::WindowBackground, SidebarBackground] {
+                let got = contrast(p.get(Hairline), p.get(beside));
+                assert!(
+                    (1.05..=2.0).contains(&got),
+                    "{name}: hairline beside {} is {got:.2}:1",
+                    beside.key()
+                );
+            }
         }
     }
 
