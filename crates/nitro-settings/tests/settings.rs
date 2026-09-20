@@ -1272,6 +1272,12 @@ fn no_widget_is_laid_out_smaller_than_it_measures() {
         "Layout",
         "Variant",
         "Options",
+        // The longest caption in the dialog — three words where every
+        // other is one or two — and the only row that also carries a
+        // subtitle competing for the same width. So it is the caption a
+        // future width change squeezes first, which is exactly why it is
+        // in the list rather than trusted.
+        "Caps Lock is Ctrl",
         "Test here",
         "Volume",
         "Mute",
