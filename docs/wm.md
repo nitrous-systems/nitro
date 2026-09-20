@@ -116,6 +116,7 @@ Geometry, in logical units:
 | resize grab band | 6 outside the frame edge, inwards only to the border (or the title bar, at the top) |
 | corner reach | 24 along either edge from a corner: the band there grabs **both** edges |
 | resize hint | the border repaints in `resize_hint` while the pointer is in the band |
+| dragged geometry | snapped to whole logical pixels on every move and resize, as at placement |
 | cursor shape | the band's own: `size_hor`, `size_ver`, `size_fdiag`, `size_bdiag`; `move` during a title drag |
 | button hover | the disc under the pointer's button paints; every other disc is transparent |
 
@@ -321,10 +322,19 @@ redundant with them: both answer "a press here resizes", one at the
 pointer and one at the edge, and the one at the edge is the one that says
 *which* edge. It is left at 1 px — widening it to 2 would move the border
 out from under the pointer as the pointer arrived, which is a worse
-affordance than a thin one that stays put. #565 (the hint's visibility)
-therefore stays **open**: the cursor shape is the larger half of its
-answer and is now in, and what is left of it is a colour question the
-palette can settle without moving any geometry.
+affordance than a thin one that stays put. #565 (the hint's visibility on
+hardware) was therefore settled **without moving any geometry**, in two
+parts. The colour: the hint was the accent, which on the focused border —
+itself a blue shade of a blue bar — was a 2.35:1 (dark) / 2.16:1 (light)
+shade shift; it is now a value the palette holds to ≥3:1 against every
+colour the stroke can touch (`docs/theme.md`). And the pixel it lands on:
+the box's at-rest border read at half strength on one edge and ~85 % on
+another, because libinput's deltas are fractional and nothing after
+placement rounded a dragged frame, so every moved or resized window sat
+on a half pixel with every edge blended across two device pixels. A move
+now rounds the written origin and a resize rounds the pulled extent
+(`resize_rect`), the way `clamp_into` always did for a new window — a
+1-px stroke on a whole pixel is the whole stroke, whatever its colour.
 
 ### Corners you can hit
 

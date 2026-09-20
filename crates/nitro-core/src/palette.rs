@@ -218,10 +218,13 @@ roles! {
     /// straddles is one, so without something to see there is nothing to
     /// tell a user where to press — they grab the visible border, miss by
     /// three pixels, and conclude that resizing does not work (#3713).
-    /// Until cursor *shapes* land (M4) this highlight is the whole of the
-    /// affordance, which is why it is a role and not a tint of
-    /// `window_border_active`: it has to read clearly against both the
-    /// border colours *and* whatever is behind the window.
+    /// The cursor shape says *that* the pointer is over a resize band;
+    /// only the edge lighting up says *which* edge, so the highlight
+    /// stays even now that shapes exist (`docs/wm.md`). It is a role and
+    /// not a tint of `window_border_active` because it has to read
+    /// clearly against both border colours, both title bars, the desktop
+    /// and the window background — everything a 1-px stroke can sit
+    /// beside — at 3:1 or better. Both schemes test that.
     ResizeHint = "resize_hint",
     /// The disc under a title-bar button while the pointer is on it.
     ///
@@ -441,10 +444,13 @@ impl Palette {
         // distinctly bluer than the neutral `button_hover` so the two
         // cannot be confused when they sit side by side on a dialog.
         p.set(TitleButtonHover, Color::rgb(0xb3, 0xc0, 0xd4));
-        // The resize affordance: the accent, which is exactly the "this is
-        // the interesting thing" colour, and already contrasts with both
-        // window border colours.
-        p.set(ResizeHint, Color::rgb(0x0f, 0x5f, 0xbe));
+        // The resize affordance. Deliberately *not* the accent: the
+        // focused border is a blue shade of a blue bar, and an
+        // accent-blue hint over it (`#0f5fbe`, 2.2:1) was a shade shift
+        // the box could not see at arm's length (#565). Navy clears 3:1
+        // against every colour that can be adjacent to the stroke —
+        // both borders, both bars, the desktop, the window background.
+        p.set(ResizeHint, Color::rgb(0x00, 0x3a, 0x80));
         // Desktop.
         p.set(DesktopTop, Color::rgb(0xdc, 0xe3, 0xed));
         p.set(DesktopBottom, Color::rgb(0xbe, 0xc7, 0xd4));
@@ -529,7 +535,10 @@ impl Palette {
         p.set(TitleClose, Color::rgb(0xd9, 0x5b, 0x4e));
         p.set(TitleMaximize, Color::rgb(0x62, 0xa8, 0x5c));
         p.set(TitleButtonHover, Color::rgb(0x46, 0x5c, 0x78));
-        p.set(ResizeHint, Color::rgb(0x6c, 0xa8, 0xf0));
+        // Not the accent, for the light scheme's reason: `#6ca8f0` on the
+        // active border was 2.3:1, a shade of the same blue (#565). Pale
+        // sky clears 3:1 against everything beside the stroke.
+        p.set(ResizeHint, Color::rgb(0xb8, 0xdc, 0xff));
         p.set(DesktopTop, Color::rgb(0x2a, 0x30, 0x3c));
         p.set(DesktopBottom, Color::rgb(0x15, 0x18, 0x20));
         p.set(TerminalBackground, Color::rgb(0x14, 0x14, 0x18));
@@ -796,6 +805,38 @@ mod tests {
                 "{name}: the borders are not sorted the way their bars are, \
                  so at least one is not its own bar's shade"
             );
+        }
+    }
+
+    #[test]
+    fn the_resize_hint_reads_against_everything_beside_it() {
+        use Role::{
+            DesktopBottom, DesktopTop, ResizeHint, TitleBarActive, TitleBarInactive,
+            WindowBackground, WindowBorderActive, WindowBorderInactive,
+        };
+        // A 1-px stroke that replaces the border for as long as the
+        // pointer is in the band: it has to be a *different thing* from
+        // the border, not a shade of it. The old accent-coloured hint was
+        // 2.35:1 (dark) and 2.16:1 (light) against the active border,
+        // which is what #565 could not see on hardware.
+        for (name, p) in both() {
+            let hint = p.get(ResizeHint);
+            for beside in [
+                WindowBorderActive,
+                WindowBorderInactive,
+                TitleBarActive,
+                TitleBarInactive,
+                DesktopTop,
+                DesktopBottom,
+                WindowBackground,
+            ] {
+                let got = contrast(hint, p.get(beside));
+                assert!(
+                    got >= AA_LARGE,
+                    "{name}: resize_hint against {} is {got:.2}:1",
+                    beside.key()
+                );
+            }
         }
     }
 

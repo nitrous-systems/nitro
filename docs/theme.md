@@ -86,7 +86,7 @@ desktop can be pasted straight back into a file.
 | `window_border_inactive` | an unfocused one's, by the same rule | `#b6bbc4` | `#39424e` |
 | `title_close` | the close button's **hover** disc — red only while the pointer is on it | `#d95b4e` | `#d95b4e` |
 | `title_maximize` | **no longer painted**; kept because a role index is a wire index | `#62a85c` | `#62a85c` |
-| `resize_hint` | the frame edge, while the pointer is in its resize band | `#0f5fbe` | `#6ca8f0` |
+| `resize_hint` | the frame edge, while the pointer is in its resize band — **not** the accent, see below | `#003a80` | `#b8dcff` |
 | `title_button_hover` | the disc under a hovered minimize or maximize button | `#b3c0d4` | `#465c78` |
 | `desktop_top` | top of the wallpaper gradient — **and of the server's own uncovered desktop** | `#dce3ed` | `#2a303c` |
 | `desktop_bottom` | bottom of both | `#bec7d4` | `#151820` |
@@ -135,6 +135,9 @@ has no business overriding it.
   `terminal_background`. The four greys (0, 7, 8, 15) are exempt, because
   by ANSI convention one of them *is* the scheme's background colour;
 * each **frame border is a shade of its own title bar** — see below;
+* `resize_hint` clears 3:1 against **everything a frame edge can sit
+  beside** — both borders, both title bars, both desktop stops and the
+  window background (`the_resize_hint_reads_against_everything_beside_it`);
 * every colour round-trips through `#rrggbb`/`#rrggbbaa`.
 
 The contrast maths is the WCAG formula, implemented in twenty lines
@@ -173,6 +176,16 @@ comparison would measure rounding rather than design.
 The focus signal did not move to the border, it stayed where it always
 was: the **title bar's own colour**, which is 28 px of window against the
 border's one.
+
+`resize_hint` is the one colour that *replaces* a border, and it is
+deliberately **not the accent** any more. It was (`#0f5fbe` / `#6ca8f0`),
+on the reasoning that the accent is the "interesting thing" colour — but
+the focused border is itself a blue shade of a blue bar, so an
+accent-blue stroke over it was a 2.2:1 (light) / 2.35:1 (dark) shade
+shift the box could not see at arm's length on a 1080p panel (#565). Navy
+on the light scheme and pale sky on the dark are the same family, far
+enough along it to be a different *thing* on the edge: ≥3.8:1 against
+the active border and well above that against everything else.
 
 **Cursors are the exception to the whole table.** The software cursor is
 black-outlined white in both schemes and has no role. It is the one thing

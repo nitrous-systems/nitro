@@ -1169,11 +1169,30 @@ fn a_second_output_takes_a_window_dragged_onto_it_and_gives_it_back() {
     assert_eq!(h.request_line("unplug\n"), "ok");
     wait_for("the output to go", || h.stat("outputs") == 1);
     h.settle();
-    await_configure(&mut conn, &mut inbox, &mut win, "the migration");
-    let back = expect(&mut conn, &mut inbox.0, "Configure", |m| match m {
-        ServerMsg::Configure(c) if c.window == win.root => Some(c.output),
-        _ => None,
-    });
+    // Wait for the migration's `Configure` by its *output*, not by a
+    // geometry change: the dragged frame is already on whole pixels, and
+    // its old local position fits the primary's work area as it is, so
+    // the migration moves nothing — it re-homes. (Before dragged frames
+    // snapped, this leaned on `clamp_into`'s rounding producing a
+    // one-third-pixel move, which was an accident of `title_bar()`.)
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let back = loop {
+        conn.flush().unwrap();
+        let _ = conn.poll(&mut inbox.0);
+        let newest = inbox.0.iter().rev().find_map(|m| match m {
+            ServerMsg::Configure(c) if c.window == win.root => Some(c.output),
+            _ => None,
+        });
+        if newest == Some(first_output) {
+            break first_output;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no Configure for the migration; newest is on {newest:?}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    refresh(&mut conn, &mut inbox, &mut win);
     assert_eq!(back, first_output, "migrated to the primary output");
     let frame = win.frame(true);
     assert!(
@@ -1838,6 +1857,77 @@ fn the_frame_edge_lights_up_where_a_press_would_resize_it() {
         to_rgb(role(Role::WindowBorderActive)),
         "the hint goes away with the pointer"
     );
+
+    drop(conn);
+    h.quit();
+}
+
+/// A frame dragged by a fractional pointer delta lands on whole pixels,
+/// so its 1-px border — and the `resize_hint` that replaces it — covers
+/// a whole device pixel instead of blending into two.
+///
+/// This is the harness-side half of #565: on the box the at-rest border
+/// of a moved window read at roughly half its palette value on one edge
+/// and ~85 % on another, because libinput's deltas are fractional and
+/// nothing after placement rounded the origin. Whatever colour the hint
+/// is, half of it on a half-covered pixel is half a hint. The fake
+/// backend's other drags are all by whole deltas, which is why none of
+/// them saw it.
+#[test]
+fn a_fractionally_dragged_frame_snaps_to_whole_pixels() {
+    let mut h = Harness::start("drag-snap", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("drag-snap");
+    let mut win = make_window(&mut conn, &mut inbox, 1, "snap", WIN, RED, 0, 1);
+    let before = win.frame(true);
+    assert_eq!(
+        (before.x.fract(), before.y.fract()),
+        (0.0, 0.0),
+        "placed whole"
+    );
+
+    // `.4` / `.6`, whose rounding direction survives the pointer's
+    // normalized round trip through the fake backend; not `.5`.
+    let (bx, by) = win.title_bar();
+    h.drag((bx, by), (bx + 10.4, by + 7.6), OUT);
+    refresh(&mut conn, &mut inbox, &mut win);
+    let f = win.frame(true);
+    assert_eq!(
+        (f.x.fract(), f.y.fract()),
+        (0.0, 0.0),
+        "the moved frame is on whole pixels: {f:?}"
+    );
+    assert_eq!(
+        (f.x - before.x, f.y - before.y),
+        (10.0, 8.0),
+        "and it is the rounded delta, not the truncated one"
+    );
+
+    // The border pixel is exactly the palette's value — not a blend of it
+    // with the desktop, which is what a half-pixel edge would sample as.
+    park(&mut h);
+    let (ex, ey) = (f.x as u32, (f.y + wm::TITLE_H + 6.0) as u32);
+    assert_eq!(
+        rgb(h.shot().pixel(ex, ey)),
+        to_rgb(role(Role::WindowBorderActive)),
+        "the border of a fractionally-dragged window is unblended"
+    );
+    h.point_at(f.x + 0.5, f.y + f.h - 8.0, OUT);
+    h.settle();
+    assert_eq!(
+        rgb(h.shot().pixel(ex, ey)),
+        to_rgb(role(Role::ResizeHint)),
+        "and so is the resize hint over it"
+    );
+
+    // A resize by a fractional delta snaps the same way.
+    park(&mut h);
+    let (rx, ry) = (f.x + f.w - 0.5, f.y + f.h / 2.0);
+    h.drag((rx, ry), (rx + 12.6, ry), OUT);
+    await_configure(&mut conn, &mut inbox, &mut win, "the right-edge resize");
+    let r = win.frame(true);
+    assert_eq!(r.w.fract(), 0.0, "the resized frame is whole: {r:?}");
+    assert_eq!((r.x, r.w), (f.x, f.w + 13.0));
 
     drop(conn);
     h.quit();

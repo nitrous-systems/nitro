@@ -4591,6 +4591,13 @@ impl Server {
     /// Clamp a frame origin so the window stays reachable: inside the
     /// union of every output's logical area, with at least a title bar's
     /// worth of it on screen.
+    ///
+    /// Rounded to whole logical pixels, as [`wm::clamp_into`] is for a
+    /// new window: libinput deltas are fractional, and a moved frame at
+    /// a half pixel has every edge blended across two device pixels —
+    /// which is what made the 1-px `resize_hint` stroke read at half
+    /// strength on hardware (#565). The grab offset stays fractional;
+    /// only the written origin is snapped.
     fn clamp_to_desktop(&self, pos: Point, size: Size, fallback: Rect) -> Point {
         let mut union: Option<Rect> = None;
         for (id, _, _) in self.scene.outputs() {
@@ -4612,11 +4619,13 @@ impl Server {
         // there is nothing left to grab.
         let min_visible = wm::TITLE_H.min(size.w).max(1.0);
         Point::new(
-            pos.x.clamp(
-                area.x - (size.w - min_visible).max(0.0),
-                area.x + area.w - min_visible,
-            ),
-            pos.y.clamp(area.y, area.y + area.h - min_visible),
+            pos.x
+                .clamp(
+                    area.x - (size.w - min_visible).max(0.0),
+                    area.x + area.w - min_visible,
+                )
+                .round(),
+            pos.y.clamp(area.y, area.y + area.h - min_visible).round(),
         )
     }
 

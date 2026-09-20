@@ -382,6 +382,13 @@ pub fn contains(rect: Rect, p: Point) -> bool {
 /// clamping, so a client's declared minimum is honoured exactly. An edge
 /// that is not being pulled never moves, which is what makes a
 /// left-edge drag grow the window leftwards rather than move it.
+///
+/// The pulled extent is rounded to whole logical pixels for
+/// [`clamp_into`]'s reason: a pointer delta from a real mouse is
+/// fractional, and a frame edge on a half pixel is a blended edge — and,
+/// while the pointer is in the band, half a [`Role::ResizeHint`] (#565).
+/// Rounding the size before deriving `x`/`y` keeps a whole `start` whole
+/// on every edge.
 #[must_use]
 pub fn resize_rect(
     start: Rect,
@@ -409,16 +416,16 @@ pub fn resize_rect(
 
     let mut rect = start;
     if edges.right {
-        rect.w = (start.w + dx).clamp(min_w, max_w);
+        rect.w = (start.w + dx).clamp(min_w, max_w).round();
     } else if edges.left {
-        let w = (start.w - dx).clamp(min_w, max_w);
+        let w = (start.w - dx).clamp(min_w, max_w).round();
         rect.x = start.x + start.w - w;
         rect.w = w;
     }
     if edges.bottom {
-        rect.h = (start.h + dy).clamp(min_h, max_h);
+        rect.h = (start.h + dy).clamp(min_h, max_h).round();
     } else if edges.top {
-        let h = (start.h - dy).clamp(min_h, max_h);
+        let h = (start.h - dy).clamp(min_h, max_h).round();
         rect.y = start.y + start.h - h;
         rect.h = h;
     }
@@ -1242,8 +1249,13 @@ pub fn button_hover_text_role(region: Region) -> Role {
 /// "go away on its own" as this comment used to predict. The two answer
 /// the same question in different places — one at the pointer, one at the
 /// edge — and the edge is the one that says *which* edge, which a
-/// symmetric double arrow cannot. `docs/wm.md` has the argument, and #565
-/// (the hint's visibility) is left open on the strength of it.
+/// symmetric double arrow cannot. `docs/wm.md` has the argument. #565
+/// (the hint's visibility on hardware) was settled on the strength of it
+/// as a colour question, not a geometry one: the hint was the accent, a
+/// 2.3:1 shade of the already-blue focused border, and is now a value the
+/// palette tests hold to 3:1 against everything beside the stroke — plus
+/// whole-pixel snapping of dragged frames, so the 1-px stroke covers a
+/// whole device pixel instead of blending into two.
 #[must_use]
 pub fn border_color(focused: bool, hint: bool, palette: &Palette) -> Color {
     if hint {
@@ -1738,6 +1750,36 @@ mod tests {
             Size::new(500.0, 400.0),
         );
         assert_eq!((r.w, r.h), (150.0, 120.0));
+    }
+
+    #[test]
+    fn a_fractional_pointer_delta_still_lands_on_whole_pixels() {
+        // A real mouse moves by fractional logical pixels. The frame it
+        // resizes must not: a 1-px border on a half pixel is a blended
+        // border, and half a resize hint (#565).
+        let start = Rect::new(100.0, 50.0, 300.0, 200.0);
+        let edges = Edges {
+            left: true,
+            top: true,
+            ..Edges::NONE
+        };
+        let r = resize_rect(
+            start,
+            Point::new(100.0, 50.0),
+            Point::new(89.6, 42.4),
+            edges,
+            Insets::NONE,
+            Size::ZERO,
+            Size::ZERO,
+        );
+        for (name, v) in [("x", r.x), ("y", r.y), ("w", r.w), ("h", r.h)] {
+            assert_eq!(v.fract(), 0.0, "{name} = {v} is not a whole pixel");
+        }
+        assert_eq!((r.x, r.w), (90.0, 310.0));
+        assert_eq!((r.y, r.h), (42.0, 208.0));
+        // The edges that were not pulled are exactly where they were.
+        assert_eq!(r.x + r.w, start.x + start.w);
+        assert_eq!(r.y + r.h, start.y + start.h);
     }
 
     #[test]
