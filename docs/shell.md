@@ -223,7 +223,9 @@ Three priorities, in this order, in `Server::key`:
 2. **The shell's bindings.**
 3. **The focused client**, or the grab holder — a grab replaces focus at
    *this* step, which is why it does not outrank step 2. See
-   [Keyboard grabs](#keyboard-grabs).
+   [Keyboard grabs](#keyboard-grabs). A key at this step is withheld
+   entirely while a shell owes an answer to a binding that just fired:
+   see [A binding buys its client a turn](#a-binding-buys-its-client-a-turn).
 
 `mods` is a `mod_mask` bitmask (`SHIFT`/`CTRL`/`ALT`/`SUPER`), *not* the
 xkb mask `Key.mods` carries. xkb's serialized mask is an opaque bitmap
@@ -287,8 +289,10 @@ focused window is never told it lost anything — it stays focused, keeps its
 active frame, and simply stops receiving keys.
 
 **A grab does not outrank the bindings.** The priority list above is the
-whole truth: compositor chords, then the shell's `BindKey` bindings, then
-the grab holder or the focused window. A chord that fires is reported as a
+whole truth about *order*: compositor chords, then the shell's `BindKey`
+bindings, then the grab holder or the focused window. (Step 3 has one
+further condition — a key is withheld while a shell owes an answer to a
+binding — described below.) A chord that fires is reported as a
 `HotKey` and is *not* also delivered as a `Key` to the grab holder.
 
 That is the behaviour a launcher actually needs, which is why it is this way
@@ -302,6 +306,55 @@ the key a launcher most wants, is nobody's chord, so this is not a
 constraint in practice.
 `a_bound_chord_under_a_grab_fires_as_a_hotkey_not_a_key` pins the order
 down.
+
+### A binding buys its client a turn
+
+A `HotKey` is a *message*: the server writes it, the shell wakes, builds
+its tree and commits. Until that commit lands the shell holds no grab, so
+without further care every key typed in that gap is routed by step 3 —
+into whatever application merely still had focus. Tapping Super and
+typing a query fast enough typed it into the calculator, and a calculator
+that quit on a bare `q` quit.
+
+That gap is not something the shell can close from its side. It is not a
+commit-ordering problem — `SetVisible` and `GrabKeyboard` in one commit
+are applied in the right order and the grab does stick
+(`a_show_and_a_grab_in_one_commit_take_effect_together`) — it is the
+round trip itself, and only the server knows the `HotKey` is in flight.
+So the server closes it: **from the moment a binding fires until its
+client has had a turn, keys are withheld from everybody else.**
+
+The wait ends at whichever comes first: the pending client's next commit
+(it answered, grab or no grab — it has had its turn), 50 ms
+(`HOTKEY_ANSWER`, generous against a measured sub-millisecond round trip
+on a warm launcher), the client disconnecting, or `HotKeys::reset`. It is
+wall-clock time, because what is bounded is how long a client is given to
+answer; nothing waits on it, since it is only read when the next key
+arrives, so an idle desktop still costs zero wakeups.
+
+Withheld keys are **dropped**, not queued and replayed. A replay would
+arrive out of order with the `HotKey` the client already has, would have
+to be re-resolved against a keymap that may have moved, and would need an
+answer for "what if the shell declines to show". Losing the keystroke
+that raced a trigger is what a user expects of a trigger; delivering it
+to the previous window is the bug. Presses and releases are withheld
+together, or a client sees a release for a press it never got. The
+pending client itself is exempt: if it already holds a grab from an
+earlier show, its own keys keep flowing.
+
+The rule is stated without reference to grabs on purpose, so it holds for
+any shell that binds a hotkey and not only for the launcher. `stats`
+reports `keys_withheld`, cumulative and normally zero.
+`a_key_typed_before_the_shell_answers_its_hotkey_reaches_nobody` in
+`tests/shell.rs` and
+`keys_typed_before_the_launcher_answers_its_trigger_reach_nobody_else` in
+`nitro-launcher/tests/launcher.rs` pin both levels.
+
+One thing is *not* covered: the modifier's own press. A tap is decided on
+the release, so at press time nothing has fired yet and there is nothing
+to withhold — the focused window does see the bare `Super` press. That is
+cosmetic and pre-existing, and both tests above assert it explicitly
+rather than filtering it out, so it cannot grow quietly.
 
 Released by `on: false`, by the window ceasing to **show**, by closing it,
 or by the client disconnecting. "Ceasing to show" is `Server::showing`,

@@ -495,6 +495,24 @@ const TOK_REMOTE_LISTENER: u64 = 11;
 /// is how the histogram once reported 33 seconds.
 const INPUT_STAMP_MAX_AGE_NS: u64 = 200_000_000;
 
+/// How long the keyboard is held for a shell that has just been sent a
+/// `HotKey`, before ordinary routing resumes.
+///
+/// The gap being covered is one client round trip — the write, the
+/// shell's wakeup, the tree it builds and its commit — which measures at
+/// a fraction of a millisecond on a warm idle launcher but is bounded by
+/// scheduling, not by any server work. 50 ms is generous enough that a
+/// shell under load still gets its turn, and short enough that a shell
+/// which never answers costs the user at most one keystroke.
+///
+/// Wall clock, not the input event's `time_ns`: what is being bounded is
+/// how long a client is given to answer, which is real elapsed time. An
+/// input timestamp says when a key was *pressed*, and on a synthetic
+/// source it need not advance with the world at all. Nothing waits on
+/// this deadline either way — it is only read when the next key arrives,
+/// so an idle desktop still takes zero wakeups.
+const HOTKEY_ANSWER: Duration = Duration::from_millis(50);
+
 const TOK_CLIENT_BASE: u64 = 1 << 32;
 const TOK_WIRE_BASE: u64 = 1 << 33;
 /// Shell clients get their own token range, so a token says which socket a
@@ -846,6 +864,12 @@ struct Server {
     /// instead of to the focused window. See
     /// [`GrabKeyboard`](nitro_wire::msg::GrabKeyboard).
     grab: Option<WindowKey>,
+    /// A shell whose hotkey has just fired and whose answer we are
+    /// holding the keyboard for: its epoll token, and the deadline past
+    /// which we stop waiting. See [`Server::key`].
+    hotkey_pending: Option<(u64, Instant)>,
+    /// Keys dropped by that wait, cumulative. Reported as `keys_withheld`.
+    keys_withheld: u64,
 
     next_client: u64,
     next_wire: u64,
@@ -1104,6 +1128,8 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         window_watchers: Vec::new(),
         output_watchers: Vec::new(),
         grab: None,
+        hotkey_pending: None,
+        keys_withheld: 0,
         next_client: 0,
         next_wire: 0,
         next_shell: 0,
@@ -2222,6 +2248,7 @@ impl Server {
                         kb.reset();
                     }
                     self.hotkeys.reset();
+                    self.hotkey_pending = None;
                     for output in &mut self.outputs {
                         output.invalidate();
                     }
@@ -2604,6 +2631,7 @@ impl Server {
         }
         if removed > 0 {
             self.hotkeys.reset();
+            self.hotkey_pending = None;
         }
     }
 
@@ -2746,6 +2774,7 @@ impl Server {
                 kb.reset();
             }
             self.hotkeys.reset();
+            self.hotkey_pending = None;
         }
 
         // The icon theme, only when it moved, and for the same reason the
@@ -3202,6 +3231,7 @@ impl Server {
         // while a modifier was held.
         let fired = self.hotkeys.key(resolved.keysym, pressed, resolved.named);
         if !fired.is_empty() {
+            let mut answered_by = None;
             for (binding, down) in fired {
                 if let Some(client) = self.wire_clients.get_mut(&binding.token) {
                     client.send(&ServerMsg::HotKey(msg::HotKey {
@@ -3209,7 +3239,18 @@ impl Server {
                         pressed: down,
                         time_ns,
                     }));
+                    answered_by = Some(binding.token);
                 }
+            }
+            // The shell now owes us an answer, and it is a round trip away:
+            // write, wake, build the tree, commit. Every key the user types
+            // in that gap would otherwise be routed by focus — into
+            // whatever application happened to be focused, which is how a
+            // query beginning with `q` once quit the calculator. Hold the
+            // keyboard until the shell has had its turn. See
+            // `Server::withheld`.
+            if let Some(token) = answered_by {
+                self.hotkey_pending = Some((token, Instant::now() + HOTKEY_ANSWER));
             }
             self.note_input(time_ns);
             return;
@@ -3234,6 +3275,13 @@ impl Server {
         let Some(window) = self.grab_target().or(self.focus) else {
             return;
         };
+        // ...unless a shell's hotkey just fired and it has not answered
+        // yet: this key is not for whoever is merely still focused.
+        if self.withheld(window) {
+            self.keys_withheld += 1;
+            self.note_input(time_ns);
+            return;
+        }
         let state = if pressed {
             ButtonState::Pressed
         } else {
@@ -4890,6 +4938,11 @@ impl Server {
         pairs.push(("hotkeys", self.hotkeys.len() as u64));
         pairs.push(("exclusive_zones", self.zones.zone_count() as u64));
         pairs.push(("grabbed", u64::from(self.grab.is_some())));
+        // Keys dropped because a shell's hotkey had fired and the shell had
+        // not answered yet (`Server::withheld`). Cumulative, and normally
+        // zero: a non-zero value means someone types faster than the shell
+        // wakes, which is exactly the race this counter exists to pin.
+        pairs.push(("keys_withheld", self.keys_withheld));
         // Completed reloads, however triggered: the control request,
         // SIGHUP and the inotify watch all land in one counter, because
         // what a caller wants to know is "did the server pick my edit up",
@@ -5368,6 +5421,47 @@ impl Server {
         Some(win)
     }
 
+    /// Whether this key must be withheld rather than delivered to `window`.
+    ///
+    /// A shell that binds a hotkey learns its binding fired over the wire,
+    /// so between the server writing the `HotKey` and the shell's commit
+    /// landing there is a round trip in which the shell holds no grab and
+    /// keys are routed by focus — into whatever application the user was
+    /// last in. Tapping Super and typing "quit" fast enough typed it into
+    /// the calculator, which quit.
+    ///
+    /// The fix is stated without reference to grabs, so it holds for any
+    /// shell and not just the launcher: **once a binding fires, no other
+    /// client sees a key until its client has had a turn.** The wait ends
+    /// at the shell's next commit (it answered, grab or no grab), at
+    /// [`HOTKEY_ANSWER_NS`] (it is not going to), or when the shell goes
+    /// away or the modifier state is reset.
+    ///
+    /// Keys are *dropped*, not queued and replayed: a replay would arrive
+    /// out of order with the `HotKey` the shell already has, would have to
+    /// be re-resolved against a keymap that may have moved, and would mean
+    /// deciding what to do when the shell declines to show. Losing the
+    /// keystroke that raced a trigger is what a user expects of a trigger;
+    /// delivering it to the previous window is the bug.
+    ///
+    /// Both presses and releases are withheld, or a client would see a
+    /// release for a press it never got. The pending client itself is
+    /// exempt — if it already holds a grab from an earlier show, its keys
+    /// keep flowing.
+    fn withheld(&mut self, window: WindowKey) -> bool {
+        let Some((token, deadline)) = self.hotkey_pending else {
+            return false;
+        };
+        if Instant::now() >= deadline {
+            self.hotkey_pending = None;
+            return false;
+        }
+        // Not withheld from the client we are waiting for.
+        self.wire_clients
+            .get(&token)
+            .is_none_or(|c| c.window_id(window).is_none())
+    }
+
     /// Put an anchored window where its anchor says, resizing it if the
     /// anchor spans an axis.
     ///
@@ -5595,6 +5689,13 @@ impl Server {
         // spoken either way, and a transaction that turns out to be fatal
         // must not leave the cursor held hostage to a dead connection.
         self.defer.forget(token);
+        // And it is the turn a withheld key was waiting for: the shell has
+        // answered its hotkey, so ordinary routing resumes from here
+        // whether or not it took a grab. Cleared before the transaction is
+        // applied, for the same reason the flip is.
+        if self.hotkey_pending.is_some_and(|(t, _)| t == token) {
+            self.hotkey_pending = None;
+        }
         let Some(mut client) = self.wire_clients.remove(&token) else {
             return false;
         };
@@ -5875,6 +5976,12 @@ impl Server {
         // A client that is gone will never answer, and a flip held for it
         // would sit out its whole deadline for nothing.
         self.defer.forget(token);
+        // A shell that died mid-trigger is not going to answer it, and the
+        // keyboard must not stay held for a token that is about to be
+        // reused.
+        if self.hotkey_pending.is_some_and(|(t, _)| t == token) {
+            self.hotkey_pending = None;
+        }
         let Some(mut client) = self.wire_clients.remove(&token) else {
             return;
         };

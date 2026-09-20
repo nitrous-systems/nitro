@@ -291,6 +291,13 @@ pub fn build(ui: &mut Ui<Calc>) -> WidgetId {
 /// because the server has already applied the keymap, so one arm covers
 /// every layout. Enter, Backspace and Escape produce no text worth
 /// matching on, so they are [`Ui::set_shortcut`]s on their keycodes.
+///
+/// Quitting is `Ctrl+Q`, and it is deliberately *modified*: a bare letter
+/// that closes the app is one stray keystroke away from throwing a sum
+/// away, and keys do land in the wrong window (a launcher trigger races
+/// its own grab). Escape is not a second quit — here it means `Clear`,
+/// which is the stronger convention for a calculator and the one the
+/// shortcut above already implements.
 fn install_keyboard(ui: &mut Ui<Calc>, screen: Screen) {
     for (code, k) in [
         (key::ENTER, Key::Equals),
@@ -301,11 +308,10 @@ fn install_keyboard(ui: &mut Ui<Calc>, screen: Screen) {
             screen.press(s, ui, k);
         });
     }
+    ui.set_shortcut(mods::CTRL, key::Q, |_s: &mut Calc, ui: &mut Ui<Calc>| {
+        ui.quit();
+    });
     ui.on_key(move |s: &mut Calc, ui: &mut Ui<Calc>, ev: &KeyEvent| {
-        if ev.text == "q" {
-            ui.quit();
-            return Handled::Yes;
-        }
         match Key::from_text(&ev.text) {
             Some(k) => {
                 screen.press(s, ui, k);

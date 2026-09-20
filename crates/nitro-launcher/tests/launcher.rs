@@ -129,6 +129,29 @@ fn open_window(h: &Harness<Launcher>, title: &str, size: Size) -> Connection {
     conn
 }
 
+/// Every `Key` the connection has been sent since it was last drained,
+/// by evdev code.
+///
+/// A window that receives a key it should not have is the whole claim of
+/// the race test below, so this reads what actually arrived rather than
+/// asking the server who it thinks it sent to.
+fn keys(conn: &mut Connection) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut msgs = Vec::new();
+    let _ = conn.poll(&mut msgs);
+    for m in msgs {
+        if let nitro_wire::msg::ServerMsg::Key(k) = m {
+            out.push(k.keycode);
+        }
+    }
+    out
+}
+
+/// Throw away whatever the connection has been sent so far.
+fn drain(conn: &mut Connection) {
+    let _ = keys(conn);
+}
+
 /// Pump until `f` holds, so the server's notifications have time to
 /// arrive.
 fn until(h: &mut Harness<Launcher>, what: &str, f: impl Fn(&Harness<Launcher>) -> bool) {
@@ -461,6 +484,71 @@ fn escape_hides_the_launcher() {
         h.server().stat("grabbed") == 0
     });
 
+    let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}
+
+#[test]
+fn keys_typed_before_the_launcher_answers_its_trigger_reach_nobody_else() {
+    // The race #3713 hit: the trigger is a *message*, so between the
+    // server writing the `HotKey` and the launcher's show/grab commit
+    // landing there is a client round trip. Keys arriving in that gap
+    // used to be routed by focus — into whatever application the user was
+    // last in, which is how typing "quit" fast after a Super tap quit the
+    // calculator.
+    //
+    // Driven with `send_key`/`send_key_up`, which queue input *without*
+    // settling, so the launcher never gets a turn between the tap and the
+    // `q`. That is the race, deterministically and with no sleeps.
+    let (mut h, dir) = harness();
+    let mut conn = open_window(&h, "victim", Size::new(120.0, 90.0));
+    until(&mut h, "the other window", |h| {
+        h.server().stat("windows") >= 2
+    });
+    h.settle();
+    drain(&mut conn);
+
+    // Tap and type, all four events in the server's queue before the
+    // launcher is pumped once.
+    h.send_key(KEY_LEFTMETA);
+    h.send_key_up(KEY_LEFTMETA);
+    h.send_key(16); // q
+    h.send_key_up(16);
+    until(&mut h, "the show", |h| h.state().is_visible());
+    assert_eq!(h.server().stat("grabbed"), 1, "and it took the keyboard");
+
+    // The assertion this test exists for: the focused application saw
+    // none of the typing. Before the fix it received the `q` — and a
+    // calculator that quits on `q` exited.
+    //
+    // The Super *press* does still reach it: the tap is decided on the
+    // release, so at press time nothing has fired yet and there is
+    // nothing to withhold. That is a pre-existing leak of the modifier
+    // itself, cosmetic and separate from this bug — asserted here rather
+    // than filtered out, so it cannot grow quietly.
+    assert_eq!(
+        keys(&mut conn),
+        vec![KEY_LEFTMETA],
+        "the focused window must not see keys typed after somebody else's trigger"
+    );
+    assert!(
+        h.server().stat("keys_withheld") >= 1,
+        "and the server says so: it withheld them"
+    );
+
+    // They were dropped, not replayed: a keystroke that raced a trigger
+    // is lost, which is what a user expects of a trigger. Pinned here so
+    // a later "helpfully" buffered replay is a deliberate change with its
+    // own test, not a silent one.
+    assert_eq!(h.state().query(), "", "dropped, not queued and replayed");
+
+    // And the launcher works normally from here: the withholding ends at
+    // its commit, so the very next key goes through the grab.
+    h.key(46); // c
+    h.settle();
+    assert_eq!(h.state().query(), "c");
+
+    drop(conn);
     let _ = std::fs::remove_dir_all(&dir);
     h.quit();
 }

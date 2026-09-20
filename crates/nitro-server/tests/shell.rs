@@ -1764,6 +1764,217 @@ fn a_bound_chord_under_a_grab_fires_as_a_hotkey_not_a_key() {
 }
 
 #[test]
+fn a_key_typed_before_the_shell_answers_its_hotkey_reaches_nobody() {
+    // The race one level below the launcher, stated without reference to
+    // grabs so it holds for any shell: a binding fires, the `HotKey` goes
+    // out over a socket, and until that client has had its turn the
+    // keyboard is *not* handed to whoever merely still has focus.
+    //
+    // Without this, the gap is a full client round trip — write, wake,
+    // build the tree, commit — and every key in it is routed by focus.
+    // That is how a user tapping Super and typing "quit" typed it into
+    // the calculator, which quit (#3713).
+    let mut h = Harness::start("hotkey-window", OUT.0, OUT.1);
+
+    // An ordinary client holding the focus: the window that must *not*
+    // see the key.
+    let mut app_inbox = Inbox::default();
+    let mut app = h.client("app");
+    let app_win = make_window(
+        &mut app,
+        &mut app_inbox,
+        1,
+        "app",
+        WIN,
+        RED,
+        0,
+        Layer::Normal,
+        1,
+    );
+    h.settle();
+    expect(&mut app, &mut app_inbox.0, "focus", |m| match m {
+        ServerMsg::Focus(f) if f.window == app_win.root && f.focused => Some(()),
+        _ => None,
+    });
+    // An unbound key does reach it, so the rest of the test is about the
+    // withholding and not about a client that was never going to hear
+    // anything.
+    h.key(KEY_A, true);
+    h.key(KEY_A, false);
+    h.settle();
+    expect(
+        &mut app,
+        &mut app_inbox.0,
+        "the ordinary key",
+        |m| match m {
+            ServerMsg::Key(k) if k.keycode == KEY_A && k.window == app_win.root => Some(()),
+            _ => None,
+        },
+    );
+    app_inbox.0.clear();
+
+    // A shell that binds the bare-Super tap and then, like a real
+    // launcher, takes a round trip to answer it. This one never answers
+    // at all, which is the worst case of the same shape.
+    let mut shell_inbox = Inbox::default();
+    let mut shell = h.shell("launcher");
+    shell.bind_key(9, mod_mask::SUPER, 0).unwrap();
+    shell.flush().unwrap();
+    wait_for("the binding", || h.stat("hotkeys") == 1);
+    assert_eq!(h.stat("keys_withheld"), 0);
+
+    h.super_tap();
+    wait_for("the tap's HotKey", || {
+        pump(&mut shell, &mut shell_inbox);
+        shell_inbox
+            .0
+            .iter()
+            .any(|m| matches!(m, ServerMsg::HotKey(k) if k.id == 9))
+    });
+
+    // Now the key that races the answer. The deadline is measured on the
+    // input clock, which the harness advances by 5 ms per event, so these
+    // two events are 10 ms into a 50 ms window however long the test's
+    // own socket round trips take.
+    h.key(KEY_A, true);
+    h.key(KEY_A, false);
+    h.settle();
+    wait_for("the keys to be withheld", || h.stat("keys_withheld") == 2);
+    pump(&mut app, &mut app_inbox);
+    // The Super *press* does reach it: a tap is decided on the release, so
+    // at press time nothing has fired and there is nothing to withhold.
+    // That is a pre-existing leak of the modifier itself, cosmetic and
+    // separate — named here rather than filtered away, so it cannot grow.
+    let leaked: Vec<u32> = app_inbox
+        .0
+        .iter()
+        .filter_map(|m| match m {
+            ServerMsg::Key(k) => Some(k.keycode),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        leaked,
+        vec![KEY_LEFTMETA],
+        "the focused window saw a key meant for the shell"
+    );
+
+    // Press *and* release are withheld together — a client handed a
+    // release for a press it never got would think the key was stuck.
+    // That is what `== 2` above says.
+
+    // The shell answering ends the wait, grab or no grab: it has had its
+    // turn, so ordinary routing resumes and the focused window is a
+    // normal window again.
+    shell.commit(1).unwrap();
+    shell.flush().unwrap();
+    h.settle();
+    h.key(KEY_A, true);
+    h.key(KEY_A, false);
+    h.settle();
+    expect(
+        &mut app,
+        &mut app_inbox.0,
+        "keys flowing again",
+        |m| match m {
+            ServerMsg::Key(k) if k.keycode == KEY_A && k.window == app_win.root => Some(()),
+            _ => None,
+        },
+    );
+    assert_eq!(h.stat("keys_withheld"), 2, "and nothing more was withheld");
+
+    drop(shell);
+    drop(app);
+    h.quit();
+}
+
+#[test]
+fn a_show_and_a_grab_in_one_commit_take_effect_together() {
+    // The property the launcher's `show()` depends on, and which #3752's
+    // issue guessed wrong: a `SetVisible(true)` and a `GrabKeyboard(true)`
+    // in the *same* commit do not race each other, even though
+    // `grab_target()` drops a grab on a window that is not showing.
+    //
+    // The server does not apply a batch in arrival order: `SetVisible` is
+    // applied as the message is read, while `GrabKeyboard` is deferred
+    // into the transaction's shell ops and drained after the whole batch.
+    // So the window is always showing by the time the grab is taken. That
+    // ordering is deliberate and load-bearing — a client that had to send
+    // two commits to open a grabbing overlay would have a race it could
+    // not close from its side — so it is pinned here rather than left as
+    // a property everyone believes.
+    let mut h = Harness::start("show-and-grab", OUT.0, OUT.1);
+    let mut app_inbox = Inbox::default();
+    let mut app = h.client("app");
+    let app_win = make_window(
+        &mut app,
+        &mut app_inbox,
+        1,
+        "app",
+        WIN,
+        RED,
+        0,
+        Layer::Normal,
+        1,
+    );
+    h.settle();
+    expect(&mut app, &mut app_inbox.0, "focus", |m| match m {
+        ServerMsg::Focus(f) if f.window == app_win.root && f.focused => Some(()),
+        _ => None,
+    });
+
+    let mut inbox = Inbox::default();
+    let mut shell = h.shell("launcher");
+    let overlay = make_window(
+        &mut shell,
+        &mut inbox,
+        10,
+        "launcher",
+        Size::new(400.0, 300.0),
+        BAR_BLUE,
+        window_flags::UNDECORATED | window_flags::NO_FOCUS,
+        Layer::Overlay,
+        1,
+    );
+    // Start hidden, the way a launcher waiting for its trigger is.
+    shell.tx().visible(overlay.root, false).commit(2).unwrap();
+    shell.flush().unwrap();
+    h.settle();
+    assert_eq!(h.stat("grabbed"), 0);
+
+    // Show and grab in one commit, in the launcher's own order.
+    shell
+        .tx()
+        .visible(overlay.root, true)
+        .grab_keyboard(overlay.root, true)
+        .commit(3)
+        .unwrap();
+    shell.flush().unwrap();
+    h.settle();
+    assert_eq!(h.stat("grabbed"), 1, "the grab stuck despite the ordering");
+
+    // And it is a real grab: the next key goes past the focused window.
+    h.key(KEY_ESC, true);
+    h.key(KEY_ESC, false);
+    h.settle();
+    expect(&mut shell, &mut inbox.0, "the grabbed key", |m| match m {
+        ServerMsg::Key(k) if k.keycode == KEY_ESC && k.window == overlay.root => Some(()),
+        _ => None,
+    });
+    pump(&mut app, &mut app_inbox);
+    assert!(
+        !app_inbox
+            .0
+            .iter()
+            .any(|m| matches!(m, ServerMsg::Key(k) if k.keycode == KEY_ESC)),
+        "and the focused window did not also get it"
+    );
+
+    drop((app, shell));
+    h.quit();
+}
+
+#[test]
 fn hiding_a_grabbing_window_releases_the_grab() {
     // The launcher hides itself on Escape. Requiring an explicit
     // `GrabKeyboard { on: false }` as well would mean one forgotten message

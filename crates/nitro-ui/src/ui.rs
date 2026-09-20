@@ -2516,12 +2516,16 @@ impl<S: 'static> Ui<S> {
     /// subtree never passed on, and an app that needs one is not asking
     /// about a widget at all.
     ///
+    /// A shortcut that quits is spelled with a modifier: a bare letter
+    /// closing an app is one stray keystroke away from losing the user's
+    /// work, and keys do land in the wrong window.
+    ///
     /// ```no_run
-    /// # use nitro_ui::event::{Handled, KeyEvent, key};
+    /// # use nitro_ui::event::{Handled, KeyEvent, key, mods};
     /// # use nitro_ui::Ui;
     /// # fn demo<S: 'static>(ui: &mut Ui<S>) {
     /// ui.on_key(|_s: &mut S, ui: &mut Ui<S>, k: &KeyEvent| {
-    ///     if k.text == "q" || k.keycode == key::ESC {
+    ///     if k.keycode == key::Q && k.mods & mods::MASK == mods::CTRL {
     ///         ui.quit();
     ///         return Handled::Yes;
     ///     }

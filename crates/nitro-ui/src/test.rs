@@ -568,6 +568,20 @@ impl<S: 'static> Harness<S> {
         });
     }
 
+    /// Inject a key *release* **without** settling: the counterpart of
+    /// [`Harness::send_key`], so a whole press-release sequence can be
+    /// queued before the client is given a single turn. That is what a
+    /// race between a trigger and the keys typed after it looks like from
+    /// the server's side.
+    pub fn send_key_up(&mut self, keycode: u32) {
+        self.time_ns += 1_000_000;
+        self.server.push_input(InputEvent::Key {
+            keycode,
+            pressed: false,
+            time_ns: self.time_ns,
+        });
+    }
+
     /// Press a key.
     ///
     /// # Panics

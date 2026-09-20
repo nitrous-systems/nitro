@@ -125,6 +125,25 @@ fn escape_clears_and_backspace_deletes() {
 }
 
 #[test]
+fn a_bare_q_does_not_quit_and_ctrl_q_does() {
+    // A bare letter that closes the app is one stray keystroke away from
+    // throwing a sum away, and keys really do land in the wrong window:
+    // a launcher trigger races the grab it asks for, so a query typed
+    // fast enough after the tap goes to whatever was focused. That is how
+    // a real calculator exited on its own (#3713). So `q` is inert, and
+    // quitting is spelled `Ctrl+Q`.
+    let mut h = harness();
+    type_text(&mut h, "12");
+    h.key(key::Q);
+    assert!(!h.ui().should_quit(), "a bare q must not quit");
+    assert_eq!(display(&mut h), "12", "and must not touch the entry either");
+
+    h.key_with(key::LEFT_CTRL, key::Q);
+    assert!(h.ui().should_quit(), "Ctrl+Q quits");
+    h.quit();
+}
+
+#[test]
 fn clicks_and_keys_mix_freely() {
     // They share one engine, so a half-typed sum can be finished with the
     // mouse. If the two paths had separate state this is what would break.

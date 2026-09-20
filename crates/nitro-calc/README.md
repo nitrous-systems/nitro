@@ -25,7 +25,10 @@ Run it against a server (`just fake` in another terminal):
 $ cargo run -p nitro-calc
 ```
 
-`q` quits. The keyboard mirrors the buttons exactly — `0-9 . + - * /
+`Ctrl+Q` quits — deliberately modified, because a bare letter that closes
+the app is one stray keystroke away from throwing a sum away, and keys do
+land in the wrong window. The keyboard mirrors the buttons exactly —
+`0-9 . + - * /
 =`, `Enter` for `=`, `Backspace` for `⌫`, `Escape` for `C` — because both
 go through the same `engine::Key`. A key and a button that disagreed
 would be two implementations of the same calculator.
