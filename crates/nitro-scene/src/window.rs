@@ -257,6 +257,17 @@ pub struct Window {
     /// Frame position and content size to go back to when leaving
     /// `Maximized`/`Fullscreen`.
     pub(crate) restore: Option<(Point, Size)>,
+    /// The window this one is a **popup** of, if any.
+    ///
+    /// `None` for a toplevel. A popup is an ordinary window with this link
+    /// set: it is placed in output space in its own right, so it escapes
+    /// its parent's content clip by construction (paint and hit testing
+    /// both walk per-window roots), but it is stacked as part of its
+    /// parent's block and goes away with it. There is deliberately no
+    /// child list here: children are found by scanning the (short) layer
+    /// stack, so a `Window` stays allocation-free and the parent edge has
+    /// exactly one copy that cannot drift.
+    pub(crate) parent: Option<WindowKey>,
 }
 
 impl Window {
@@ -367,6 +378,17 @@ impl Window {
     /// [`content_position`](Window::content_position).
     pub fn position(&self) -> Point {
         self.position
+    }
+
+    /// The window this one is a popup of, or `None` for a toplevel.
+    pub fn parent(&self) -> Option<WindowKey> {
+        self.parent
+    }
+
+    /// Whether this window is a popup: a menu or tooltip anchored to a
+    /// parent, rather than a toplevel.
+    pub fn is_popup(&self) -> bool {
+        self.parent.is_some()
     }
 }
 

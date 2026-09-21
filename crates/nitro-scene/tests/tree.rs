@@ -470,3 +470,144 @@ fn errors_display_and_are_std_errors() {
     assert_eq!(e.to_string(), "stale key");
     assert_eq!(Error::NotOwner.to_string(), "not the owner");
 }
+
+// --------------------------------------------------------------- popups
+
+/// A popup of `parent`, placed at `pos`.
+fn popup(s: &mut Scene, parent: nitro_scene::WindowKey, pos: Point) -> nitro_scene::WindowKey {
+    let win = s
+        .create_popup(CLIENT, parent, Size::new(100.0, 80.0))
+        .unwrap();
+    s.place_window(win, Some(OUT), pos).unwrap();
+    win
+}
+
+#[test]
+fn a_popup_lands_directly_above_its_parent() {
+    let mut s = scene();
+    let (a, _) = window(&mut s);
+    let (b, _) = window(&mut s);
+    // `b` is in front of `a`.
+    assert_eq!(s.windows(OUT).collect::<Vec<_>>(), vec![a, b]);
+
+    let menu = popup(&mut s, a, Point::new(10.0, 10.0));
+    // Immediately above its parent, *not* at the front of the layer.
+    assert_eq!(s.windows(OUT).collect::<Vec<_>>(), vec![a, menu, b]);
+
+    // A submenu goes above the menu, still below `b`.
+    let sub = popup(&mut s, menu, Point::new(20.0, 20.0));
+    assert_eq!(s.windows(OUT).collect::<Vec<_>>(), vec![a, menu, sub, b]);
+}
+
+#[test]
+fn raising_the_parent_carries_the_whole_chain() {
+    let mut s = scene();
+    let (a, _) = window(&mut s);
+    let (b, _) = window(&mut s);
+    let menu = popup(&mut s, a, Point::new(10.0, 10.0));
+    let sub = popup(&mut s, menu, Point::new(20.0, 20.0));
+
+    s.raise(a).unwrap();
+    assert_eq!(s.windows(OUT).collect::<Vec<_>>(), vec![b, a, menu, sub]);
+
+    // And raising an unrelated toplevel goes above the whole block.
+    s.raise(b).unwrap();
+    assert_eq!(s.windows(OUT).collect::<Vec<_>>(), vec![a, menu, sub, b]);
+}
+
+#[test]
+fn raising_a_popup_raises_its_chain_root_instead() {
+    let mut s = scene();
+    let (a, _) = window(&mut s);
+    let (b, _) = window(&mut s);
+    let menu = popup(&mut s, a, Point::new(10.0, 10.0));
+    let sub = popup(&mut s, menu, Point::new(20.0, 20.0));
+    assert_eq!(s.windows(OUT).collect::<Vec<_>>(), vec![a, menu, sub, b]);
+
+    // A click inside a popup reaches `raise_and_focus`, which raises. The
+    // popup must not leave its parent behind.
+    s.raise(sub).unwrap();
+    assert_eq!(s.windows(OUT).collect::<Vec<_>>(), vec![b, a, menu, sub]);
+    assert_eq!(s.chain_root(sub), a);
+}
+
+#[test]
+fn lowering_a_parent_takes_its_popups_under() {
+    let mut s = scene();
+    let (a, _) = window(&mut s);
+    let (b, _) = window(&mut s);
+    let menu = popup(&mut s, b, Point::new(10.0, 10.0));
+    assert_eq!(s.windows(OUT).collect::<Vec<_>>(), vec![a, b, menu]);
+
+    s.lower(b).unwrap();
+    assert_eq!(s.windows(OUT).collect::<Vec<_>>(), vec![b, menu, a]);
+}
+
+#[test]
+fn a_popup_inherits_its_parents_layer_and_moves_with_it() {
+    let mut s = scene();
+    let panel = s.create_window(CLIENT, "panel", Size::new(80.0, 20.0), Layer::Top);
+    s.place_window(panel, Some(OUT), Point::ZERO).unwrap();
+    let menu = popup(&mut s, panel, Point::new(0.0, 20.0));
+    assert_eq!(s.window_info(menu).unwrap().layer(), Layer::Top);
+
+    s.set_layer(panel, Layer::Overlay).unwrap();
+    assert_eq!(s.window_info(menu).unwrap().layer(), Layer::Overlay);
+    assert_eq!(s.windows(OUT).collect::<Vec<_>>(), vec![panel, menu]);
+}
+
+#[test]
+fn a_popup_is_undecorated_fixed_and_unfocusable() {
+    let mut s = scene();
+    let (a, _) = window(&mut s);
+    let menu = popup(&mut s, a, Point::new(10.0, 10.0));
+    let flags = s.window_info(menu).unwrap().flags();
+    assert!(!flags.decorated);
+    assert!(flags.fixed_size);
+    assert!(!flags.focusable);
+    assert!(!s.window_info(menu).unwrap().is_framed());
+    assert!(s.window_info(menu).unwrap().is_popup());
+    assert_eq!(s.window_info(menu).unwrap().parent(), Some(a));
+    assert!(!s.window_info(a).unwrap().is_popup());
+}
+
+#[test]
+fn unplacing_a_popup_takes_it_out_of_the_z_order() {
+    let mut s = scene();
+    let (a, _) = window(&mut s);
+    let menu = popup(&mut s, a, Point::new(10.0, 10.0));
+    assert_eq!(s.windows(OUT).collect::<Vec<_>>(), vec![a, menu]);
+
+    // Dismissal: unplaced is unmapped, and the client cannot undo it.
+    s.place_window(menu, None, Point::new(10.0, 10.0)).unwrap();
+    assert_eq!(s.windows(OUT).collect::<Vec<_>>(), vec![a]);
+    assert_eq!(s.window_info(menu).unwrap().output(), None);
+}
+
+#[test]
+fn destroying_a_parent_leaves_no_dangling_parent_link() {
+    let mut s = scene();
+    let (a, _) = window(&mut s);
+    let menu = popup(&mut s, a, Point::new(10.0, 10.0));
+    let sub = popup(&mut s, menu, Point::new(20.0, 20.0));
+    assert_eq!(s.popup_children(a), vec![menu]);
+    assert_eq!(s.popup_children(menu), vec![sub]);
+
+    s.destroy_window(CLIENT, a).unwrap();
+    assert_eq!(s.window_info(menu).unwrap().parent(), None);
+    assert_eq!(s.chain_root(menu), menu);
+    // The submenu still names a live parent, so its chain is intact.
+    assert_eq!(s.window_info(sub).unwrap().parent(), Some(menu));
+}
+
+#[test]
+fn a_popup_of_a_dead_window_is_refused() {
+    let mut s = scene();
+    let (a, _) = window(&mut s);
+    s.destroy_window(CLIENT, a).unwrap();
+    assert_eq!(
+        s.create_popup(CLIENT, a, Size::new(10.0, 10.0))
+            .unwrap_err(),
+        Error::StaleKey
+    );
+}

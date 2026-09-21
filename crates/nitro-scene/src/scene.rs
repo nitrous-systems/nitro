@@ -361,6 +361,7 @@ impl Scene {
             min: Size::ZERO,
             max: Size::ZERO,
             restore: None,
+            parent: None,
         });
         self.note_resized(win);
         let node = self.node_mut_ref(root);
@@ -373,6 +374,120 @@ impl Scene {
         node.clip = true;
         self.mark(root, ALL_DIRTY);
         win
+    }
+
+    /// Create a **popup**: a window anchored to another window.
+    ///
+    /// A popup is an ordinary [`Window`] carrying a
+    /// [`parent`](Window::parent) link, not a node kind of its own. That
+    /// buys three things for free:
+    ///
+    /// * it **escapes the parent's clip**, because
+    ///   [`paint_list`](Scene::paint_list) and
+    ///   [`hit_test`](Scene::hit_test) walk per-window roots and one
+    ///   window's clip never applies to another's tree. Nothing about
+    ///   [`set_clip`](Scene::set_clip)'s refusal to unclip a content group
+    ///   has to change, and nothing should;
+    /// * it is positioned in output space in its own right, so the server
+    ///   can constrain it against the work area;
+    /// * it hit-tests as its own surface and gets its own `Configure`.
+    ///
+    /// It inherits the parent's [`Layer`] — a menu over a `Top` panel is
+    /// itself `Top`, so it is above the panel and below `Overlay`, with no
+    /// new layer and no special case — and is created **undecorated, fixed
+    /// size and unfocusable**: a menu must never grow a title bar and must
+    /// never take the caret away from the window it belongs to.
+    ///
+    /// It starts unplaced, like every other window;
+    /// [`place_window`](Scene::place_window) puts it directly above its
+    /// parent's block.
+    ///
+    /// # Errors
+    /// [`Error::StaleKey`] if `parent` does not name a live window.
+    pub fn create_popup(
+        &mut self,
+        client: ClientId,
+        parent: WindowKey,
+        size: Size,
+    ) -> Result<WindowKey, Error> {
+        let layer = self.windows.get(parent).ok_or(Error::StaleKey)?.layer;
+        let win = self.create_window_with(
+            client,
+            "",
+            size,
+            layer,
+            WindowFlags {
+                decorated: false,
+                fixed_size: true,
+                focusable: false,
+            },
+        );
+        self.window_mut_unchecked(win).parent = Some(parent);
+        Ok(win)
+    }
+
+    /// The windows that name `win` as their parent, in stacking order.
+    ///
+    /// Direct children only; the server walks the chain itself. Scanned out
+    /// of the layer stacks rather than read from a child list on
+    /// [`Window`], so there is exactly one copy of the parent edge.
+    pub fn popup_children(&self, win: WindowKey) -> Vec<WindowKey> {
+        let Some(window) = self.windows.get(win) else {
+            return Vec::new();
+        };
+        let Some(index) = window.output.and_then(|id| self.output_index(id)) else {
+            return Vec::new();
+        };
+        self.outputs[index].layers[window.layer.index()]
+            .iter()
+            .copied()
+            .filter(|w| {
+                self.windows
+                    .get(*w)
+                    .is_some_and(|c| c.parent == Some(win) && *w != win)
+            })
+            .collect()
+    }
+
+    /// A window plus every popup descending from it, in the stack's own
+    /// order: the contiguous run [`place_window`](Scene::place_window) and
+    /// [`restack`](Scene::restack) move as one.
+    ///
+    /// Computed in one place so the invariant "a popup sits immediately
+    /// above its parent's block" has one implementation to be right.
+    fn block(&self, stack: &[WindowKey], win: WindowKey) -> Vec<WindowKey> {
+        stack
+            .iter()
+            .copied()
+            .filter(|w| {
+                let mut cur = *w;
+                // Bounded by the stack length: a parent chain inside one
+                // layer cannot be longer than the layer itself.
+                for _ in 0..=stack.len() {
+                    if cur == win {
+                        return true;
+                    }
+                    match self.windows.get(cur).and_then(|i| i.parent) {
+                        Some(p) => cur = p,
+                        None => return false,
+                    }
+                }
+                false
+            })
+            .collect()
+    }
+
+    /// The root of a popup chain: the first ancestor that is not itself a
+    /// popup, or `win` when it is a toplevel.
+    pub fn chain_root(&self, win: WindowKey) -> WindowKey {
+        let mut cur = win;
+        for _ in 0..self.windows.len() {
+            match self.windows.get(cur).and_then(|i| i.parent) {
+                Some(p) if self.windows.contains(p) => cur = p,
+                _ => break,
+            }
+        }
+        cur
     }
 
     /// Wrap a window's content in a **frame group** owned by the server.
@@ -573,6 +688,18 @@ impl Scene {
         }
         self.destroy_subtree(root);
         self.windows.remove(win);
+        // Defensive: the server dismisses a window's popups before it
+        // destroys it, so this should find nothing — but a dangling
+        // `WindowKey` in a parent link is a key that could later be
+        // followed onto a recycled slot, and there is no cheap way to spot
+        // that after the fact.
+        for key in self.windows.keys().collect::<Vec<_>>() {
+            if let Some(w) = self.windows.get_mut(key)
+                && w.parent == Some(win)
+            {
+                w.parent = None;
+            }
+        }
         Ok(())
     }
 
@@ -636,7 +763,13 @@ impl Scene {
     /// screen with `output = None`.
     ///
     /// Placing a window puts it at the front of its layer if it was not
-    /// already in the output's z-order.
+    /// already in the output's z-order — unless it is a **popup**, which
+    /// goes directly above its parent's block instead, so a menu is above
+    /// the window it belongs to and below whatever was above that.
+    ///
+    /// `output = None` is also how a popup is *unmapped*: an unplaced
+    /// window is in no z-order, so it is neither painted nor hit, and
+    /// unlike a `visible` flag the client cannot undo it.
     ///
     /// # Errors
     /// [`Error::StaleKey`], [`Error::UnknownOutput`].
@@ -649,6 +782,7 @@ impl Scene {
         let window = self.windows.get(win).ok_or(Error::StaleKey)?;
         let old_output = window.output;
         let root = window.root;
+        let parent = window.parent;
         if let Some(id) = output
             && self.output_index(id).is_none()
         {
@@ -671,9 +805,22 @@ impl Scene {
         if let Some(id) = output
             && let Some(index) = self.output_index(id)
         {
-            let stack = &mut self.outputs[index].layers[layer.index()];
-            if !stack.contains(&win) {
-                stack.push(win);
+            if !self.outputs[index].layers[layer.index()].contains(&win) {
+                // A popup goes immediately above its parent's block, not at
+                // the front of the layer: the front is where an unrelated
+                // toplevel belongs, and a menu that jumped there would float
+                // over windows it has nothing to do with.
+                let at = parent.and_then(|p| {
+                    let stack = &self.outputs[index].layers[layer.index()];
+                    let block = self.block(stack, p);
+                    let last = block.last()?;
+                    stack.iter().position(|w| w == last).map(|i| i + 1)
+                });
+                let stack = &mut self.outputs[index].layers[layer.index()];
+                match at {
+                    Some(i) => stack.insert(i, win),
+                    None => stack.push(win),
+                }
             }
         }
         self.mark(root, Dirty::TRANSFORM);
@@ -683,21 +830,37 @@ impl Scene {
     /// Move a window to a different stacking layer, keeping it frontmost
     /// within the new layer.
     ///
+    /// Its popups go with it, keeping their order: a chain that stayed
+    /// behind in the old layer would be a menu floating over a window it
+    /// does not belong to, and the "immediately above its parent's block"
+    /// invariant would be broken with nothing to restore it.
+    ///
     /// # Errors
     /// [`Error::StaleKey`].
     pub fn set_layer(&mut self, win: WindowKey, layer: Layer) -> Result<(), Error> {
-        let window = self.windows.get_mut(win).ok_or(Error::StaleKey)?;
+        let window = self.windows.get(win).ok_or(Error::StaleKey)?;
         if window.layer == layer {
             return Ok(());
         }
-        window.layer = layer;
         let output = window.output;
         let root = window.root;
+        let old = window.layer.index();
+        let block = match output.and_then(|id| self.output_index(id)) {
+            Some(index) => self.block(&self.outputs[index].layers[old], win),
+            None => vec![win],
+        };
+        for w in &block {
+            if let Some(info) = self.windows.get_mut(*w) {
+                info.layer = layer;
+            }
+        }
         if let Some(index) = output.and_then(|id| self.output_index(id)) {
             let id = self.outputs[index].id;
             let out = &mut self.outputs[index];
-            out.remove(win);
-            out.layers[layer.index()].push(win);
+            for w in &block {
+                out.remove(*w);
+            }
+            out.layers[layer.index()].extend_from_slice(&block);
             let bounds = self.node_ref(root).subtree_bounds;
             self.pending.push((id, bounds));
         }
@@ -720,7 +883,17 @@ impl Scene {
         self.restack(win, false)
     }
 
+    /// Move a window within its layer, carrying its popups with it.
+    ///
+    /// A window and its popup descendants are one contiguous **block**: a
+    /// raise moves the whole run and preserves the order inside it, and a
+    /// raise naming a popup is redirected to the chain's root. Without the
+    /// redirect a plain left-click inside a menu (which reaches
+    /// `raise_and_focus` like any other click) would pull the popup to the
+    /// front of the layer and leave its parent behind — silently, because
+    /// it still looks right until some unrelated window is raised.
     fn restack(&mut self, win: WindowKey, front: bool) -> Result<(), Error> {
+        let win = self.chain_root(win);
         let window = self.windows.get(win).ok_or(Error::StaleKey)?;
         let layer = window.layer.index();
         let root = window.root;
@@ -728,19 +901,21 @@ impl Scene {
             return Ok(());
         };
         let id = self.outputs[index].id;
+        let block = self.block(&self.outputs[index].layers[layer], win);
         let stack = &mut self.outputs[index].layers[layer];
-        let Some(pos) = stack.iter().position(|w| *w == win) else {
-            return Ok(());
-        };
-        let at_end = pos + 1 == stack.len();
-        if (front && at_end) || (!front && pos == 0) {
+        if block.is_empty() {
             return Ok(());
         }
-        stack.remove(pos);
+        let at_end = stack.len() >= block.len() && stack[stack.len() - block.len()..] == block[..];
+        let at_start = stack.len() >= block.len() && stack[..block.len()] == block[..];
+        if (front && at_end) || (!front && at_start) {
+            return Ok(());
+        }
+        stack.retain(|w| !block.contains(w));
         if front {
-            stack.push(win);
+            stack.extend_from_slice(&block);
         } else {
-            stack.insert(0, win);
+            stack.splice(0..0, block.iter().copied());
         }
         // Stacking does not move pixels, but it changes who is on top of them.
         let bounds = self.node_ref(root).subtree_bounds;
