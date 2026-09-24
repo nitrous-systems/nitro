@@ -58,6 +58,9 @@ pub struct Connection {
     caps: u32,
     /// Set once the peer hung up; reported after the last message.
     closed: bool,
+    /// Every byte written to the socket since [`Connection::record_sent`]
+    /// turned recording on. `None` (the default) costs nothing.
+    sent: Option<Vec<u8>>,
 }
 
 impl Connection {
@@ -133,6 +136,7 @@ impl Connection {
             server_name: String::new(),
             caps: 0,
             closed: false,
+            sent: None,
         };
         conn.send(&ClientMsg::Hello(Hello {
             version: VERSION,
@@ -508,7 +512,36 @@ impl Connection {
     /// # Errors
     /// [`Error::Closed`] or the underlying errno.
     pub fn flush(&mut self) -> Result<bool, Error> {
-        self.socket.send_all(&mut self.out)
+        let Some(sent) = self.sent.as_mut() else {
+            return self.socket.send_all(&mut self.out);
+        };
+        // What went is the queue's prefix: a partial write leaves the
+        // unsent suffix queued, and it is recorded by the flush that
+        // sends it.
+        let queued = self.out.bytes().to_vec();
+        let result = self.socket.send_all(&mut self.out);
+        let written = queued.len() - self.out.bytes().len();
+        sent.extend_from_slice(&queued[..written]);
+        result
+    }
+
+    /// Turn recording of every byte this connection writes on or off,
+    /// clearing what was recorded.
+    ///
+    /// A test facility. Every message a client sends, including the
+    /// synchronous measure requests, leaves through [`Connection::flush`],
+    /// so this is the one place that can answer "did this string ever
+    /// leave the process?". `nitro-ui`'s secret text field is the case
+    /// that needs the answer.
+    pub fn record_sent(&mut self, on: bool) {
+        self.sent = on.then(Vec::new);
+    }
+
+    /// The bytes written since [`Connection::record_sent`] turned
+    /// recording on: empty when it is off.
+    #[must_use]
+    pub fn sent_bytes(&self) -> &[u8] {
+        self.sent.as_deref().unwrap_or(&[])
     }
 
     /// Start a transaction builder writing into the send buffer.

@@ -785,6 +785,16 @@ impl<S: 'static> Ui<S> {
         self.wire.taped()
     }
 
+    /// Every byte this tree has written to the server since [`Ui::tap`]
+    /// turned the tap on: every message, measure requests included.
+    ///
+    /// What a test searches when the claim is "this string never left
+    /// the process" (a secret [`TextField`](crate::widgets::TextField)).
+    #[must_use]
+    pub fn sent_bytes(&self) -> &[u8] {
+        self.wire.sent_bytes()
+    }
+
     /// Forget the recorded mutations, leaving the tap on.
     pub fn clear_mutations(&mut self) {
         self.wire.clear_tap();

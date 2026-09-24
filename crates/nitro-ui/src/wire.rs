@@ -228,8 +228,18 @@ impl Wire {
     }
 
     /// Turn the mutation tap on or off, clearing whatever it holds.
+    ///
+    /// The byte-level record goes with it: the mutation list says which
+    /// nodes a change touched, the byte record says what actually left
+    /// the process ([`Wire::sent_bytes`]).
     pub(crate) fn set_tap(&mut self, on: bool) {
         self.tap = if on { Some(Vec::new()) } else { None };
+        self.conn.record_sent(on);
+    }
+
+    /// Every byte written to the server since the tap was turned on.
+    pub(crate) fn sent_bytes(&self) -> &[u8] {
+        self.conn.sent_bytes()
     }
 
     /// The mutations recorded since the tap was turned on.

@@ -326,53 +326,105 @@ from existing nitro-ui widgets (`Label`, `TextField`, `Button`, `Flex`,
 not `nobody`), and every distro disagrees on that. A typed username is
 correct everywhere. A list is a later option, off by default.
 
-## Decision 5: `TextField` grows a secret mode, and introspection respects it
+## Decision 5: `TextField` grows a secret mode, and introspection respects it (done)
 
-This is the one change the greeter forces on the toolkit, and it is a
-security fix before it is a feature. Today `TextField::accessible()`
-returns `value: Some(self.text.clone())`. So `nitro-hey get
-window/password value` would print the password, and the introspection
-socket is a documented, scripted interface (goal 5). Three things
-change for `TextField::secret(true)`:
+This is the one change the greeter forces on the toolkit, and it was a
+security fix before it was a feature: `TextField::accessible()` returned
+the text, so `nitro-hey get window/password value` would have printed a
+password. **Built**; the full account is in `docs/ui.md` under "A secret
+`TextField`". In short:
 
-1. **The wire carries bullets, not the text.** The server shapes text, so
-   whatever string the field sends is in the server's scene, in a
-   `nitro-shot` readback, and on the remote link. The field keeps the
-   real bytes client-side and sends `"•"` repeated to the character count.
-2. **Introspection reports length, not value.** `get … value` answers
-   `<secret, 8 chars>`. `set_value` stays allowed, so tests and `hey` can
-   still type into it, because writing a secret is not reading one. `watch`
-   events for the field carry no value.
-3. **No copy.** Copy and cut are no-ops. Paste is allowed.
+- **Every string the field sends the server is the mask**, one `•` per
+  character: the `SetText` it paints, and the strings it asks to have
+  measured and caret-positioned. So the text is not in the scene, a
+  `nitro-shot` readback, the remote link, the measure requests or the
+  measure cache. The field translates caret offsets between the text
+  and the mask.
+- **Introspection reports the mask** as `value` and `text` (the sketch
+  said `<secret, N chars>`; the mask is what AT-SPI does, and it is
+  what `watch` would carry anyway). `set_value` still writes, so tests
+  and `hey` can type a password. **No action unmasks**; only the app
+  can, with `set_secret(false)`, which exists for a conversation whose
+  one field asks a visible question, then a secret one.
+- **Copy and cut** need no change: the field has no clipboard yet. When it
+  gets one, a secret field must refuse both.
+- **Wiping**: zeroed on `clear`, on replacement and on drop, spare
+  capacity scrubbed after every edit, growth done by hand so no
+  outgrown buffer is freed unzeroed, callbacks handed a borrow. It uses
+  `black_box`, not `write_volatile`, because the latter is `unsafe`
+  (the tree has two sanctioned exceptions, and this is not worth a
+  third). It is hygiene, not a boundary: the password also passes
+  through the input events, through the IPC encoder and through greetd.
 
-The buffer is zeroed on drop and on submit with `fill(0)` followed by
-`std::hint::black_box`. That is not a guarantee against the optimiser
-eliding the write. The guaranteed version is `write_volatile`, which is
-`unsafe`, and the tree has one sanctioned `unsafe` exception. The honest
-position: the password also passes through a `String` in the IPC encoder
-and through greetd's own memory, so the zeroing is hygiene, not a
-boundary. The introspection and wire changes above are the actual
-boundary.
+`crates/nitro-ui/tests/secret.rs` checks against every byte the client
+wrote to the socket, with a plain field typed in the same window as the
+control. Each masking path was checked to fail its test when disabled.
 
-The greeter's own introspection socket lives in `greeter`'s `0700`
-runtime directory, so only root and `greeter` can reach it anyway.
-Redaction is still the right default because the same widget will be used
-in-session (Wi-Fi passphrases, `sudo` prompts), where the socket is the
-user's.
+## Decision 6: the owner boots into their own session, locked
+
+On a device with one user (most laptops, phones and workstations), the
+fastest login is not a greeter at all. greetd's `[initial_session]`
+starts the owner's session at boot without authentication, and the
+session comes up **locked**:
+
+```toml
+[initial_session]            # once per boot
+command = "nitro-session --locked"
+user = "alice"
+
+[default_session]            # after any logout: the greeter
+command = "nitro-session --greeter"
+user = "greeter"
+```
+
+Unlocking costs about a frame. No second compositor starts and none is
+torn down, so the common path has no handover at all.
+
+- **One app, two backends.** The lock screen is `nitro-greeter` in a
+  second mode: same layout, same conversation state machine, same secret
+  field. As the greeter it talks to greetd. As the lock screen it talks to
+  `nitro-auth`, a small helper that runs PAM for the session's own user
+  and speaks the same prompt and answer messages. It is the only binary
+  that links libpam: our second deliberate C dependency, with the FFI
+  `unsafe` inside the binding crate (the `xkbcommon` precedent). Which
+  crate is still to be measured. Piping to `unix_chkpwd` needs no
+  library, but supports passwords only.
+- **The lock is the server's, from the first frame.** A lock client
+  started after the desktop would race it. The server starts locked,
+  composites only the lock surface (other windows are not drawn at all,
+  rather than covered) and routes input only to it. Only the lock client
+  can unlock, over a socket `nitro-session` hands it pre-connected. A
+  crashed lock client leaves the screen locked and is restarted. These
+  are `ext-session-lock` semantics; suspend and idle locking need the
+  same thing.
+- **Nothing acts for the user before unlock.** `--locked` starts only
+  what paints (server, wallpaper, bar, lock screen, the launcher's
+  index). Autostart, when nitro has one, waits for the unlock.
+- **Where it does not apply.** A home or keyring encrypted with the login
+  password (fscrypt, systemd-homed, `pam_mount`) cannot open without the
+  password, and an autologin has none. Full-disk encryption is the
+  natural companion: the disk passphrase already authenticated the owner.
+- **Another user never types a password into the owner's session.** The
+  owner's session can only check the owner's password, and anything
+  running as the owner could read what is typed there. So the lock screen
+  asks for the name first. A different name goes to the greeter, where
+  it is chosen again from a list: no channel carries it across.
+  - Before the owner has unlocked, their session has nothing in it, and
+    it logs out.
+  - After they have used it: warn and log out, until multi-session.
+- **Multi-session is deferred.** nitro already survives being a background
+  session, since that is the VT-switch path M3 tests. greetd runs one
+  session per instance, so a second login needs a second instance on
+  another VT, started on demand (a polkit rule for that one unit) or
+  standing by. Switching VTs between two live compositors is also the
+  seamless handover, as a side effect. A session that goes to the
+  background locks.
 
 ## What this does *not* do
 
-- **Lock screen.** This is related but a different mechanism. A lock
-  screen authenticates *inside* the user's session. It cannot go through
-  greetd, which only creates new sessions. It needs either PAM in-process
-  (the FFI that option C refuses) or a helper such as `unix_chkpwd`,
-  which is setuid and already installed, but checks only `pam_unix`
-  passwords, not fingerprints. That is M4's `lock` and needs its own
-  sketch. What it *can* share with this one is the conversation
-  widget from decision 4 and the secret field from decision 5.
-- **Multi-seat, remote login, user switching.** greetd supports one seat
-  per instance, and nothing here precludes a second instance on `seat1`
-  later.
+- **Multi-seat and remote login.** greetd supports one seat per
+  instance, and nothing here precludes a second instance on `seat1`
+  later. User switching is decision 6.
 - **Wayland sessions under our greeter.** These work as a side effect of
   decision 4's session list. `cmd` is any program, and greetd starts it
   after our compositor is gone.
@@ -381,26 +433,24 @@ user's.
 
 In order. Each step can land on its own:
 
-1. **`TextField::secret`** in nitro-ui, with the wire and introspection
-   redaction and tests that assert over *every* place the text could leak
-   (scene string, `get`, `watch`, a `shot`), per the
-   "a green test is evidence only about what it looked at" rule.
-2. **`nitro-greeter` crate**: `greetd.rs` (codec + tests), `flow.rs`
-   (the state machine, pure, tested with a scripted fake greetd over a
-   `socketpair`: password; OTP after password; an info line; a wrong
-   password; `start_session` refused), and `main.rs` (the UI). The
-   dependencies are `nitro-ui` and `rustix`, both already in the tree.
-3. **`nitro-session --greeter`**: the profile, `Role::Primary`, and the
-   two exit-code tests.
-4. **`deploy/greetd/config.toml`** plus a `docs/testbox.md` section:
-   install greetd from the distro, create the `greeter` user, disable
-   `nitro-dev.service`'s tty2 conflict (or move greetd to tty1 and keep
-   dev on tty2). On the box, measure the time from greetd start to first
-   greeter frame, the RSS of the greeter session (target: under the M3
-   desktop's ~31 MB, since it is two processes instead of five), and ten
-   login/logout cycles with the VT coming back each time.
-5. **Docs**: README option A (getty + profile) as the zero-install path,
-   and `DEPENDENCIES.md` gains a short "system components" note that
-   greetd is a runtime requirement of the login path only, not a crate.
+1. **`TextField::secret`**: done (decision 5).
+2. **The server's lock state**: start locked, composite and route input
+   to the lock surface only, unlock only on the lock client's word, stay
+   locked when it crashes. Tested on the fake backend against screenshots
+   and input, including a crashed lock client.
+3. **`nitro-auth` and the conversation**: the helper, and in
+   `nitro-greeter` the pure state machine (tested against scripted
+   conversations: password; one-time code after password; an info line;
+   a wrong password) with the lock-screen UI on top.
+4. **`nitro-session --locked`** and the greetd config. On the box,
+   measure boot to the lock screen's first frame (`first_frame_ms`) and
+   unlock to desktop.
+5. **The greeter**: `greetd.rs` (codec and tests), the same state
+   machine as the greetd backend, and `nitro-session --greeter` with
+   `Role::Primary`. Then `deploy/greetd/`, and a `docs/testbox.md`
+   section with ten login/logout cycles.
+6. **Docs**: README option A (getty + profile) as the zero-install path,
+   and a `DEPENDENCIES.md` note that greetd is a runtime requirement of
+   the login path, not a crate.
 
-The crate count does not move.
+The crate count moves once, for the PAM binding in step 3.

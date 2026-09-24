@@ -1876,8 +1876,29 @@ type ChangeFn<S> = Box<dyn Fn(&mut S, &mut Ui<S>, &str)>;
 /// hangs under a clipping group, and a caret past the right edge moves
 /// that group's transform. Scrolling a long line is one `SetTransform`
 /// and no `SetText`.
+///
+/// **A secret field never lets its text out of the process**
+/// ([`TextFieldBuilder::secret`], [`WidgetMut::set_secret`]). Every
+/// string the field hands the server (the `SetText` it paints, the
+/// strings it asks to have measured and caret-positioned) is the mask,
+/// one [`SECRET_MASK`] per character, so the text is not in the scene,
+/// not in a screenshot, not on a remote link and not a key of the
+/// measure cache. Introspection's `value` is the same mask, which is what
+/// AT-SPI does for a password field too. Only the app sees the text, via
+/// [`TextField::text`] and the change and submit callbacks. There is no
+/// action that turns the mode off, so `nitro-hey` cannot unmask a field.
+/// It can still *write* one (`set_value`), which is how a test types a
+/// password.
+///
+/// Its buffer is also wiped: zeroed on `clear`, before a `set_value`
+/// replaces it and on drop, with the spare capacity scrubbed after every
+/// edit and the growth done by hand, so the old contents are zeroed
+/// rather than freed. That is hygiene, not a boundary: the characters
+/// arrived as input events, and the app has its own copies.
 pub struct TextField<S> {
     text: String,
+    /// Mask everything that leaves the process; see the type's docs.
+    secret: bool,
     placeholder: String,
     /// Caret position, as a byte offset into `text`.
     cursor: usize,
@@ -1899,9 +1920,16 @@ pub struct TextField<S> {
 
 impl<S> std::fmt::Debug for TextField<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TextField")
-            .field("text", &self.text)
-            .field("cursor", &self.cursor)
+        let mut d = f.debug_struct("TextField");
+        if self.secret {
+            d.field(
+                "text",
+                &format_args!("<secret, {} chars>", self.text.chars().count()),
+            );
+        } else {
+            d.field("text", &self.text);
+        }
+        d.field("cursor", &self.cursor)
             .field("anchor", &self.anchor)
             .field("enabled", &self.enabled)
             .finish_non_exhaustive()
@@ -1974,9 +2002,81 @@ impl<S> TextField<S> {
             .unwrap_or_else(|| TextStyle::from_theme(theme))
     }
 
+    /// Whether the field masks its text.
+    #[must_use]
+    pub fn is_secret(&self) -> bool {
+        self.secret
+    }
+
+    /// The string that stands for the text everywhere outside this
+    /// process: the text itself, or one mask character per character.
+    fn shown(&self) -> std::borrow::Cow<'_, str> {
+        if self.secret {
+            std::borrow::Cow::Owned(
+                std::iter::repeat_n(SECRET_MASK, self.text.chars().count()).collect(),
+            )
+        } else {
+            std::borrow::Cow::Borrowed(&self.text)
+        }
+    }
+
+    /// A byte offset into the text, as the byte offset into
+    /// [`TextField::shown`] of the same caret position.
+    fn shown_offset(&self, at: usize) -> usize {
+        if self.secret {
+            self.text[..at].chars().count() * SECRET_MASK.len_utf8()
+        } else {
+            at
+        }
+    }
+
+    /// A byte offset into [`TextField::shown`], back as a byte offset into
+    /// the text (the start of the character it falls in).
+    fn text_offset(&self, offset: usize) -> usize {
+        if self.secret {
+            let nth = offset / SECRET_MASK.len_utf8();
+            self.text
+                .char_indices()
+                .nth(nth)
+                .map_or(self.text.len(), |(i, _)| i)
+        } else {
+            offset
+        }
+    }
+
+    /// After any edit of a secret field: zero the bytes past the end of
+    /// the text. Deleting shifts the tail left and would otherwise leave
+    /// the removed characters' old bytes in the spare capacity.
+    fn scrub(&mut self) {
+        if !self.secret {
+            return;
+        }
+        let mut bytes = std::mem::take(&mut self.text).into_bytes();
+        for b in bytes.spare_capacity_mut() {
+            b.write(0);
+        }
+        std::hint::black_box(&bytes);
+        self.text = String::from_utf8(bytes).expect("only spare capacity was written");
+    }
+
+    /// Make room for `extra` more bytes without a reallocation that would
+    /// free the old buffer unzeroed: grow by hand, then wipe the old one.
+    fn reserve_secret(&mut self, extra: usize) {
+        if !self.secret || self.text.capacity() - self.text.len() >= extra {
+            return;
+        }
+        let want = (self.text.len() + extra)
+            .max(SECRET_CAPACITY)
+            .next_power_of_two();
+        let mut grown = String::with_capacity(want);
+        grown.push_str(&self.text);
+        wipe(&mut self.text);
+        self.text = grown;
+    }
+
     /// The x of byte offset `at`, from the cursor table.
     fn x_of(&self, at: usize) -> f32 {
-        let at = at as u32;
+        let at = self.shown_offset(at) as u32;
         // The table is in increasing offset order; the last entry at or
         // before `at` is the answer. A string the server has not
         // measured yet has an empty table and everything sits at 0,
@@ -2004,7 +2104,7 @@ impl<S> TextField<S> {
                 best = *offset as usize;
             }
         }
-        best.min(self.text.len())
+        self.text_offset(best).min(self.text.len())
     }
 
     /// The next character boundary after `at`, or `at` at the end.
@@ -2030,9 +2130,11 @@ impl<S> TextField<S> {
         if a == b && s.is_empty() {
             return false;
         }
+        self.reserve_secret(s.len());
         self.text.replace_range(a..b, s);
         self.cursor = a + s.len();
         self.anchor = self.cursor;
+        self.scrub();
         true
     }
 
@@ -2060,8 +2162,12 @@ impl<S: 'static> TextField<S> {
     /// Refresh the cursor table for the current string.
     fn remeasure(&mut self, ui: &mut Ui<S>) {
         let style = self.resolved_style(ui.theme());
-        self.metrics = ui.measure_text(&self.text, &style, 0.0).unwrap_or_default();
-        self.cursors = ui.cursor_positions(&self.text, &style).unwrap_or_default();
+        let shown = self.shown();
+        let metrics = ui.measure_text(&shown, &style, 0.0).unwrap_or_default();
+        let cursors = ui.cursor_positions(&shown, &style).unwrap_or_default();
+        drop(shown);
+        self.metrics = metrics;
+        self.cursors = cursors;
     }
 
     /// Run `on_change`, taken out for the call as a button's `on_click`
@@ -2073,7 +2179,9 @@ impl<S: 'static> TextField<S> {
             &mut self.on_change
         };
         let Some(cb) = slot.take() else { return };
-        cb(cx.state, cx.ui, &self.text.clone());
+        // Borrowed, not cloned: a copy would be one more unwiped buffer
+        // holding a secret field's text.
+        cb(cx.state, cx.ui, &self.text);
         if submit {
             self.on_submit = Some(cb);
         } else {
@@ -2155,6 +2263,7 @@ impl<S: 'static> TextField<S> {
                     self.text.replace_range(from..self.cursor, "");
                     self.cursor = from;
                     self.anchor = from;
+                    self.scrub();
                 } else {
                     return true;
                 }
@@ -2167,6 +2276,7 @@ impl<S: 'static> TextField<S> {
                 } else if self.cursor < self.text.len() {
                     let to = self.next_boundary(self.cursor);
                     self.text.replace_range(self.cursor..to, "");
+                    self.scrub();
                 } else {
                     return true;
                 }
@@ -2197,8 +2307,12 @@ impl<S: 'static> Widget<S> for TextField<S> {
             .unwrap_or_default()
             .height
             .max(style.size_px);
-        self.metrics = cx.measure_text(&self.text, &style, 0.0).unwrap_or_default();
-        self.cursors = cx.cursor_positions(&self.text, &style).unwrap_or_default();
+        let shown = self.shown();
+        let metrics = cx.measure_text(&shown, &style, 0.0).unwrap_or_default();
+        let cursors = cx.cursor_positions(&shown, &style).unwrap_or_default();
+        drop(shown);
+        self.metrics = metrics;
+        self.cursors = cursors;
         let default_width = style.size_px * 0.55 * 20.0 + px * 2.0;
         constraints.constrain(Size::new(default_width, line + py * 2.0))
     }
@@ -2279,7 +2393,7 @@ impl<S: 'static> Widget<S> for TextField<S> {
         let (shown, color) = if self.text.is_empty() {
             (self.placeholder.clone(), place_color)
         } else {
-            (self.text.clone(), text_color)
+            (self.shown().into_owned(), text_color)
         };
         cx.text_in(
             view,
@@ -2346,7 +2460,7 @@ impl<S: 'static> Widget<S> for TextField<S> {
     fn accessible(&self) -> Access {
         Access {
             name: None,
-            value: Some(self.text.clone()),
+            value: Some(self.shown().into_owned()),
             actions: if self.enabled {
                 vec!["set_value", "focus", "submit", "clear"]
             } else {
@@ -2358,7 +2472,13 @@ impl<S: 'static> Widget<S> for TextField<S> {
     fn action(&mut self, cx: &mut EventCx<'_, S>, action: &str, arg: Option<&str>) -> Handled {
         match action {
             "set_value" | "set_text" => {
-                arg.unwrap_or_default().clone_into(&mut self.text);
+                let new = arg.unwrap_or_default();
+                if self.secret {
+                    wipe(&mut self.text);
+                    self.reserve_secret(new.len());
+                }
+                new.clone_into(&mut self.text);
+                self.scrub();
                 self.cursor = self.text.len();
                 self.anchor = self.cursor;
                 self.scroll = 0.0;
@@ -2366,7 +2486,7 @@ impl<S: 'static> Widget<S> for TextField<S> {
                 Handled::Yes
             }
             "clear" => {
-                self.text.clear();
+                wipe(&mut self.text);
                 self.cursor = 0;
                 self.anchor = 0;
                 self.scroll = 0.0;
@@ -2392,6 +2512,40 @@ impl<S: 'static> Widget<S> for TextField<S> {
     }
 }
 
+/// The character a secret [`TextField`] shows, and sends, for each
+/// character of its text.
+pub const SECRET_MASK: char = '\u{2022}';
+
+/// Bytes a secret field reserves up front. A password longer than this
+/// still works: the field grows by hand and wipes the old buffer.
+const SECRET_CAPACITY: usize = 128;
+
+/// Zero a string's bytes and leave it empty, keeping its allocation.
+///
+/// Safe code: the bytes are taken out as a `Vec<u8>`, zeroed (spare
+/// capacity included) and put back as an empty string. `black_box`
+/// stops the optimiser from treating the zeroing as a dead store. It is
+/// not a guarantee (only `write_volatile` is, and that is `unsafe`), but
+/// the stores are kept in practice.
+fn wipe(s: &mut String) {
+    let mut bytes = std::mem::take(s).into_bytes();
+    bytes.fill(0);
+    for b in bytes.spare_capacity_mut() {
+        b.write(0);
+    }
+    std::hint::black_box(&bytes);
+    bytes.clear();
+    *s = String::from_utf8(bytes).expect("an empty buffer is valid UTF-8");
+}
+
+impl<S> Drop for TextField<S> {
+    fn drop(&mut self) {
+        if self.secret {
+            wipe(&mut self.text);
+        }
+    }
+}
+
 /// Setters for a live [`TextField`].
 impl<S: 'static> WidgetMut<'_, TextField<S>, S> {
     /// Replace the contents, putting the caret at the end.
@@ -2403,17 +2557,54 @@ impl<S: 'static> WidgetMut<'_, TextField<S>, S> {
         if self.text == text {
             return;
         }
-        self.text = text;
+        if self.secret {
+            wipe(&mut self.text);
+            self.reserve_secret(text.len());
+            self.text.push_str(&text);
+            self.scrub();
+        } else {
+            self.text = text;
+        }
         self.cursor = self.text.len();
         self.anchor = self.cursor;
         self.scroll = 0.0;
+        self.remeasure_now();
+    }
+
+    /// Mask the text (`true`) or show it (`false`).
+    ///
+    /// For a form whose one field asks different questions in turn: a
+    /// login conversation asks for a user name (shown), then a password
+    /// (masked), then perhaps a one-time code. Deliberately **not** an
+    /// introspection action: unmasking is the app's decision, never a
+    /// socket client's.
+    pub fn set_secret(&mut self, secret: bool) {
+        if self.secret == secret {
+            return;
+        }
+        self.secret = secret;
+        if secret {
+            self.reserve_secret(SECRET_CAPACITY);
+            self.scrub();
+        }
+        self.remeasure_now();
+    }
+
+    /// Re-measure the shown string and repaint, for a setter that has no
+    /// event context.
+    fn remeasure_now(&mut self) {
         let id = self.id();
-        let (t, style) = (self.text.clone(), {
-            let theme = self.ui().theme().clone();
-            self.resolved_style(&theme)
-        });
-        let metrics = self.ui().measure_text(&t, &style, 0.0).unwrap_or_default();
-        let cursors = self.ui().cursor_positions(&t, &style).unwrap_or_default();
+        let theme = self.ui().theme().clone();
+        let style = self.resolved_style(&theme);
+        let shown = self.shown().into_owned();
+        let metrics = self
+            .ui()
+            .measure_text(&shown, &style, 0.0)
+            .unwrap_or_default();
+        let cursors = self
+            .ui()
+            .cursor_positions(&shown, &style)
+            .unwrap_or_default();
         self.metrics = metrics;
         self.cursors = cursors;
         self.ui().mark(id, Dirty::PAINT);
@@ -2495,10 +2686,19 @@ impl<S: 'static> TextFieldBuilder<S> {
         self
     }
 
+    /// Mask the text: for a password. See [`TextField`] for exactly what
+    /// that covers.
+    #[must_use]
+    pub fn secret(mut self) -> Self {
+        self.field.secret = true;
+        self.field.reserve_secret(SECRET_CAPACITY);
+        self
+    }
+
     /// Set the font size.
     #[must_use]
     pub fn size(mut self, px: f32) -> Self {
-        let mut s = self.field.style.unwrap_or_default();
+        let mut s = self.field.style.take().unwrap_or_default();
         s.size_px = px;
         self.field.style = Some(s);
         self
@@ -2533,6 +2733,7 @@ pub fn text_field<S: 'static>(text: impl Into<String>) -> TextFieldBuilder<S> {
     let cursor = text.len();
     let field = TextField {
         text,
+        secret: false,
         placeholder: String::new(),
         cursor,
         anchor: cursor,
