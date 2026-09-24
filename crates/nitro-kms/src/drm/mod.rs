@@ -3,15 +3,21 @@
 //! Commit sequence (also in `README.md`):
 //!
 //! 1. `open`: enable `UNIVERSAL_PLANES` + `ATOMIC` client caps, cache the
-//!    property ids of every connector / CRTC / plane, enumerate, then one
-//!    blocking atomic commit with `ALLOW_MODESET` that sets **all** state:
-//!    our connectors get `CRTC_ID`, our CRTCs get `MODE_ID` + `ACTIVE`,
-//!    our primary planes get `FB_ID`/`CRTC_*`/`SRC_*`; every other
-//!    connector, CRTC and primary plane is explicitly disabled so nothing
-//!    inherited from fbcon or a previous master conflicts.
-//! 2. `commit`: `NONBLOCK | PAGE_FLIP_EVENT` with the plane's `FB_ID` and,
-//!    when the plane exposes it, an `FB_DAMAGE_CLIPS` blob.
-//! 3. `dispatch`: page-flip events off the DRM fd become
+//!    property ids of every connector / CRTC / plane, enumerate, pick
+//!    modes (keeping the one already lit when it is as good,
+//!    `select::keep_on_screen`). **Nothing is committed yet**: the panel
+//!    keeps showing what the previous master or fbcon left on it.
+//! 2. The first `commit` is the initial modeset, with the frame it was
+//!    given: one blocking atomic commit with `ALLOW_MODESET` that sets
+//!    **all** state: our connectors get `CRTC_ID`, our CRTCs get
+//!    `MODE_ID` + `ACTIVE`, our primary planes get `FB_ID`/`CRTC_*`/
+//!    `SRC_*`; every other connector, CRTC and primary plane is explicitly
+//!    disabled so nothing inherited from fbcon or a previous master
+//!    conflicts. An ordinary flip to the same buffer follows it, for the
+//!    page-flip event.
+//! 3. Every later `commit`: `NONBLOCK | PAGE_FLIP_EVENT` with the plane's
+//!    `FB_ID` and, when the plane exposes it, an `FB_DAMAGE_CLIPS` blob.
+//! 4. `dispatch`: page-flip events off the DRM fd become
 //!    `Event::Flipped`; uevents off the netlink socket become
 //!    `Event::Hotplug`.
 
@@ -322,6 +328,19 @@ fn mode_candidate(m: &Mode) -> ModeCandidate {
     }
 }
 
+/// The fields `drm_mode_equal` compares: clock, the horizontal and
+/// vertical timings, and the flags (sync polarity, interlace, doublescan,
+/// the picture aspect ratio bits).
+fn same_timings(a: &Mode, b: &Mode) -> bool {
+    a.clock() == b.clock()
+        && a.size() == b.size()
+        && a.hsync() == b.hsync()
+        && a.vsync() == b.vsync()
+        && a.hskew() == b.hskew()
+        && a.vscan() == b.vscan()
+        && a.flags() == b.flags()
+}
+
 fn connector_name(info: &connector::Info) -> String {
     format!("{}-{}", info.interface().as_str(), info.interface_id())
 }
@@ -420,6 +439,11 @@ pub struct DrmBackend<'fd> {
     infos: Vec<OutputInfo>,
     next_id: u32,
     paused: bool,
+    /// Nothing has been committed yet: the CRTCs still show whatever the
+    /// previous master (or fbcon) left there. The first [`Backend::commit`]
+    /// does the initial modeset, with the frame it was given. See
+    /// "The first picture is a finished frame" in `README.md`.
+    unlit: bool,
     uevent: Option<UeventSocket>,
     hotplug_error: Option<io::Error>,
     damage_scratch: Vec<i32>,
@@ -475,6 +499,7 @@ impl<'fd> DrmBackend<'fd> {
             infos: Vec::new(),
             next_id: 1,
             paused: false,
+            unlit: true,
             uevent,
             hotplug_error,
             damage_scratch: Vec::new(),
@@ -590,14 +615,6 @@ impl<'fd> DrmBackend<'fd> {
                     select::describe_modes(&cands)
                 ));
             }
-            let mode = if let Some(m) = mode {
-                m
-            } else {
-                let Some(mi) = select::select_mode(&cands, wanted.as_ref()) else {
-                    continue;
-                };
-                info.modes()[mi]
-            };
             let mut mask = 0u32;
             let mut current = None;
             for &enc in info.encoders() {
@@ -610,6 +627,29 @@ impl<'fd> DrmBackend<'fd> {
                     }
                 }
             }
+            let mode = if let Some(m) = mode {
+                m
+            } else {
+                let Some(mi) = select::select_mode(&cands, wanted.as_ref()) else {
+                    continue;
+                };
+                // Prefer the mode the panel is already showing, when it
+                // answers the configuration as well: an unchanged mode is
+                // what lets the first commit skip the full modeset and
+                // the monitor's resync (`select::keep_on_screen`).
+                //
+                // Only while unlit, when that mode is someone else's.
+                // Once we have committed, the lit mode is our own earlier
+                // pick, and deferring to it would make a configuration
+                // reload that drops `mode = 2560x1440@144` keep 144 Hz
+                // for ever instead of going back to the default.
+                let lit = if self.unlit {
+                    current.and_then(|ci| self.on_screen_mode(ci, info.modes()))
+                } else {
+                    None
+                };
+                info.modes()[select::keep_on_screen(&cands, mi, lit, wanted.as_ref())]
+            };
             out.push(Probed {
                 name,
                 mode,
@@ -622,6 +662,22 @@ impl<'fd> DrmBackend<'fd> {
             });
         }
         Ok(out)
+    }
+
+    /// Index into `listed` of the mode CRTC `crtc_idx` is scanning out
+    /// right now, or `None` when it is off or showing a mode the
+    /// connector does not list (a previous master's modeline, say).
+    ///
+    /// Compared on **timings and flags**, which is what the kernel's
+    /// `drm_mode_equal` compares when it decides whether a commit is a
+    /// full modeset. The mode name and the `type` bits (`PREFERRED`,
+    /// `DRIVER`) are left out on purpose: the CRTC's copy of the mode does
+    /// not carry the connector list's type bits, so a whole-struct `==`
+    /// would never match.
+    fn on_screen_mode(&self, crtc_idx: usize, listed: &[Mode]) -> Option<usize> {
+        let crtc = *self.res.crtcs().get(crtc_idx)?;
+        let lit = self.card.get_crtc(crtc).ok()?.mode()?;
+        listed.iter().position(|m| same_timings(m, &lit))
     }
 
     /// Ask the kernel whether `mode` is drivable on this connector, with
@@ -1000,16 +1056,38 @@ impl Backend for DrmBackend<'_> {
             .iter()
             .position(|o| o.id == output)
             .ok_or(Error::NoSuchOutput(output))?;
-        let o = &mut self.outputs[idx];
-        if o.pending {
+        if self.outputs[idx].pending {
             return Err(Error::FlipPending(output));
         }
+        // The first commit lights the panel with *this* frame. The
+        // modeset is the blocking `ALLOW_MODESET` commit every other
+        // modeset in this file is, and it produces no page-flip event —
+        // asking for one would be refused for any CRTC it switches off —
+        // so an ordinary flip to the same buffer is queued behind it.
+        // That flip is what delivers the `Flipped` the caller's frame
+        // clock waits for, so the server's view of a first frame is
+        // exactly its view of every other one. The cost is one refresh
+        // period before the second frame may be committed.
+        let lighting = self.unlit;
+        if lighting {
+            let o = &mut self.outputs[idx];
+            let was = o.front;
+            o.front = o.back();
+            if let Err(e) = self.modeset_all() {
+                // Nothing reached the glass: put the bookkeeping back, so
+                // the caller's retry paints and lights the same way.
+                self.outputs[idx].front = was;
+                return Err(e);
+            }
+            self.unlit = false;
+        }
+        let o = &mut self.outputs[idx];
         let pp = &self.plane_props[&o.plane.into()];
-        let back = o.back();
+        let target = if lighting { o.front } else { o.back() };
         o.flip_req.add_property(
             o.plane,
             pp.fb_id,
-            property::Value::Framebuffer(Some(o.bufs[back].fb)),
+            property::Value::Framebuffer(Some(o.bufs[target].fb)),
         );
         let mut blob = None;
         if let Some(clips) = pp.fb_damage_clips {
@@ -1045,7 +1123,7 @@ impl Backend for DrmBackend<'_> {
             let _ = self.card.destroy_property_blob(id);
         }
         result?;
-        o.front = back;
+        o.front = target;
         o.pending = true;
         Ok(())
     }
@@ -1104,7 +1182,10 @@ impl Backend for DrmBackend<'_> {
         self.refresh_resources()?;
         let probed = self.probe_connectors()?;
         let changed = self.reconcile(&probed)?;
-        if changed && !self.paused {
+        // Before the first commit there is nothing of ours to show: the
+        // modeset waits for a real frame (`commit`), so a hotplug that
+        // arrives first changes the bookkeeping and nothing on the glass.
+        if changed && !self.paused && !self.unlit {
             self.modeset_all()?;
         }
         Ok(changed)
@@ -1135,7 +1216,14 @@ impl Backend for DrmBackend<'_> {
             // repaints fully after a resume.
             o.pending = false;
         }
-        let r = self.modeset_all();
+        // Unlit means nothing of ours was ever on screen, so there is
+        // nothing to restore: the first commit lights the panel, as it
+        // would have without the VT switch.
+        let r = if self.unlit {
+            Ok(())
+        } else {
+            self.modeset_all()
+        };
         // The post-condition `Backend::resume` promises its caller, checked
         // rather than merely described: nothing is flip-pending, so the
         // server's next paint pass is never turned away by `FlipPending`

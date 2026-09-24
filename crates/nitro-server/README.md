@@ -797,6 +797,7 @@ looking for.
 | `frames`                 | Page flips completed since startup.                                      |
 | `flips_pending`          | Outputs with a flip in flight right now (0 when idle).                   |
 | `uptime_ms`              | Milliseconds since `run()` started.                                      |
+| `first_frame_ms`         | Milliseconds from `run()` to the first accepted commit; `0` before it.   |
 | `active`                 | 1 unless the session is paused by a VT switch.                           |
 | `flip_interval_mean_us`  | Mean interval between flips, in microseconds.                            |
 | `flip_interval_min_us`   | Shortest interval seen.                                                  |

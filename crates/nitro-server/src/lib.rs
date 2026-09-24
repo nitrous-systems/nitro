@@ -886,6 +886,10 @@ struct Server {
     quit: bool,
     frames: u64,
     started: Instant,
+    /// Milliseconds from `run()` to the first commit the backend accepted:
+    /// how long the panel showed someone else's picture (fbcon's, or the
+    /// previous compositor's) before ours. `None` until then.
+    first_frame_ms: Option<u64>,
     flips: FlipStats,
     stats: FrameStats,
     events: Vec<Event>,
@@ -900,6 +904,9 @@ struct Server {
 /// the loop (I/O on the epoll or DRM fd).
 #[allow(clippy::too_many_lines)] // Startup is a sequence, not a structure: splitting it would only scatter the ordering rules it enforces.
 pub fn run(mut config: Config) -> Result<(), Error> {
+    // Taken first, so `uptime_ms` and `first_frame_ms` count the seat, the
+    // card and the font setup rather than starting after them.
+    let started = Instant::now();
     let epoll = epoll::create(epoll::CreateFlags::CLOEXEC).map_err(errno("epoll_create"))?;
     let mut signals = if config.handle_signals {
         let s = signals::Signals::install().map_err(io_err("install signal handlers"))?;
@@ -1139,7 +1146,8 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         active: true,
         quit: false,
         frames: 0,
-        started: Instant::now(),
+        started,
+        first_frame_ms: None,
         flips: FlipStats::default(),
         stats: FrameStats::new(),
         events: Vec::new(),
@@ -1949,6 +1957,11 @@ impl Server {
             .collect();
         match self.backend.commit(id, &kms_damage) {
             Ok(()) => {
+                if self.first_frame_ms.is_none() {
+                    let ms = self.started.elapsed().as_millis() as u64;
+                    self.first_frame_ms = Some(ms);
+                    info!("{id}: first frame {ms} ms after start");
+                }
                 self.stats.paint_us.push(paint_us);
                 self.stats.copy_us.push(copy_us);
                 self.stats.damage_px.push(damage_px);
@@ -4901,6 +4914,7 @@ impl Server {
             ("frames", self.frames),
             ("flips_pending", pending),
             ("uptime_ms", self.started.elapsed().as_millis() as u64),
+            ("first_frame_ms", self.first_frame_ms.unwrap_or(0)),
             ("active", u64::from(self.active)),
             ("flip_interval_mean_us", self.flips.mean_us()),
             (

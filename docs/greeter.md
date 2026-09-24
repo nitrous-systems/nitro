@@ -141,12 +141,45 @@ measured on today (`DESIGN.md` M3: "exits 0, tty1 back"). The greeter
 profile adds a test for it on the box: log in, log out, log in again, ten
 times, on the same pids of greetd.
 
-There is one visible cost: between the two compositors the VT drops to
-text mode for a moment. A seamless handoff, where the second server
-inherits the first one's framebuffer, is a real feature. It is deferred,
-because it means passing a DRM fd across a user boundary. As a
-mitigation, both servers clear to the same theme background colour, so the
-flash is a single modeset rather than a picture change.
+There is one visible cost: between the two compositors the panel shows
+the text console for a moment. Four things happen in order when the
+greeter's `nitro-server` exits and the user's starts:
+
+1. **The exiting process's framebuffers are destroyed.** The kernel
+   removes every framebuffer the process created, and a plane that was
+   showing one is switched off.
+2. **The kernel's console takes the display back.** When the last DRM
+   fd closes, fbdev emulation restores its own buffer and mode.
+3. **logind switches the VT back to text mode.** When the greeter's
+   session ends, logind puts the VT back into `KD_TEXT`, and fbcon
+   redraws.
+4. **The user's `nitro-server` starts**, takes the VT into graphics
+   mode, sets its mode and paints.
+
+| step | fix | who controls it |
+|---|---|---|
+| 1 | `DRM_IOCTL_MODE_CLOSEFB` (Linux 6.8): drop the handle, keep the plane scanning it. `drm-sys` 0.8 has the struct, but `drm-ffi` 0.9 has no wrapper. Upstream it rather than take a second `unsafe` exception. | us, after drm-rs |
+| 2 | someone keeps the device open during the gap, or fbdev emulation is off | not us, under greetd |
+| 3 | fbcon deferred takeover and a quiet boot (Fedora's flicker-free setup): text mode then draws nothing | distro or box config |
+| 4 | the first commit carries a finished frame, and the mode already lit is kept when it is as good, so there is no monitor resync | **us: done** (`nitro-kms` README, "The first picture is a finished frame") |
+
+Step 4 is in: `DrmBackend::open` no longer commits a black buffer. The
+first `commit` is the initial modeset, with the server's first real
+frame, and the probe keeps the mode the CRTC is already scanning out
+when `select::keep_on_screen` says it answers the configuration as well.
+`stats` reports `first_frame_ms`, the length of the gap from the new
+server's side.
+
+With steps 1, 3 and 4, the handover is: greeter frame, possibly one
+black frame, desktop. It shows no text and needs no resync. **Fully
+seamless needs overlap**: the next compositor has the device open
+before the last one closes it, so step 2 never happens. GDM does this by
+starting the user's session on a fresh VT, waiting for its first frame
+and then switching VTs. greetd runs the session on the greeter's VT
+after the greeter has exited, so this is a feature request upstream,
+not something to patch locally. A persistent display holder (a root
+daemon that owns DRM master and leases outputs to each session) would
+also give overlap, and is refused for the same reason as option C.
 
 ## Decision 3: the IPC is hand-rolled, not `greetd_ipc`
 
