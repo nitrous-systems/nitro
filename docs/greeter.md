@@ -158,7 +158,7 @@ greeter's `nitro-server` exits and the user's starts:
 
 | step | fix | who controls it |
 |---|---|---|
-| 1 | `DRM_IOCTL_MODE_CLOSEFB` (Linux 6.8): drop the handle, keep the plane scanning it. `drm-sys` 0.8 has the struct, but `drm-ffi` 0.9 has no wrapper. Upstream it rather than take a second `unsafe` exception. | us, after drm-rs |
+| 1 | `DRM_IOCTL_MODE_CLOSEFB` (Linux 6.8): drop the handle, keep the plane scanning it. `drm-sys` 0.8 has the struct, but `drm-ffi` 0.9 has no wrapper. Upstream it (five lines in `drm-ffi`) rather than take a third `unsafe` exception: `DEPENDENCIES.md` already lists two, in `nitro-seat` and `nitro-shm`. The shim itself is about fifteen lines over `rustix::ioctl`. | us, after drm-rs |
 | 2 | someone keeps the device open during the gap, or fbdev emulation is off | not us, under greetd |
 | 3 | fbcon deferred takeover and a quiet boot (Fedora's flicker-free setup): text mode then draws nothing | distro or box config |
 | 4 | the first commit carries a finished frame, and the mode already lit is kept when it is as good, so there is no monitor resync | **us: done** (`nitro-kms` README, "The first picture is a finished frame") |
@@ -180,6 +180,45 @@ after the greeter has exited, so this is a feature request upstream,
 not something to patch locally. A persistent display holder (a root
 daemon that owns DRM master and leases outputs to each session) would
 also give overlap, and is refused for the same reason as option C.
+
+### Deferred: a keeper process
+
+Recorded here because it is the cheapest route to steps 1 and 2, and
+it is **not being built now**.
+
+Framebuffers and DRM master belong to the open file, not to the
+process. While any fd to that file is open, the old framebuffers
+survive, the plane keeps showing the last frame, and the console never
+gets the last close. So the exiting server does not need to hand over
+master (logind grants that per session anyway), only to keep the file
+open until someone else has committed:
+
+1. After `start_session` succeeds, the greeter's `nitro-server` forks and
+   execs a small keeper with a dup of the DRM fd and its framebuffer
+   ids, detached with `setsid`, then exits normally.
+2. The keeper polls every 100 ms: `GETPLANE` on every plane, and exit
+   once none shows one of its framebuffers. That covers the successor
+   flipping onto the same plane, driving the output from another CRTC,
+   and fbcon having taken the plane back first. It works for any
+   successor, not only nitro. It gives up after 10 s.
+3. Exit timing is invisible: the successor's frame is already on screen,
+   and exiting only frees the old buffers.
+
+It needs no root, no new crates and no `unsafe`, and it works on any
+kernel. It would make `CLOSEFB` unnecessary. The same mechanism serves
+logout as well. Step 3 (text mode during the gap) still needs fbcon
+deferred takeover.
+
+Unverified, and the first things to check on the box: that greetd and
+logind leave a detached process of the greeter's session alive until it
+exits (systemd's default `KillUserProcesses=no` should), and that
+`GETPLANE` reports another file's framebuffer to a client that is not
+master (as far as I know only `GETFB`, which hands out buffer handles,
+is restricted).
+
+Rejected alternative: exec from the greeter into the user session with
+the fd inherited. The switch from `greeter` to the user needs root,
+which is option C.
 
 ## Decision 3: the IPC is hand-rolled, not `greetd_ipc`
 
