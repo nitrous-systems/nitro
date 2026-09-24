@@ -37,7 +37,7 @@ cargo build --release --workspace --bins --examples >&2
 
 echo "== binary sizes (release, stripped) =="
 printf '%-14s %10s\n' binary bytes
-for b in nitro-server nitro-shot nitro-demo nitro-bench nitro-calc nitro-term nitro-files nitro-bar nitro-launcher nitro-wallpaper nitro-settings hey; do
+for b in nitro-server nitro-shot nitro-demo nitro-bench nitro-calc nitro-chess nitro-term nitro-files nitro-bar nitro-launcher nitro-wallpaper nitro-settings hey; do
     printf '%-14s %10s\n' "$b" "$(stat -c %s "target/release/$b")"
 done
 printf '%-14s %10s\n' hello_client "$(stat -c %s target/release/examples/hello_client)"

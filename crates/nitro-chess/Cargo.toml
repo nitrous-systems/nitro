@@ -1,0 +1,36 @@
+[package]
+name = "nitro-chess"
+description = "A chess GUI on nitro-ui for the Salewski chess engine, after tiny-chess and xilem-chess"
+edition.workspace = true
+version.workspace = true
+# The app is the workspace's licence; `src/engine.rs` is Dr. Stefan
+# Salewski's, under MIT, with its licence text next to it in
+# `LICENSE.salewski-chess`. See README.md, "Credits".
+license = "Apache-2.0 AND MIT"
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Upstream's own switch for the engine's debug output, kept under its
+# upstream name so the vendored file compiles unchanged with it.
+salewskiChessDebug = []
+
+[dependencies]
+# The toolkit, and nothing else — the same line `nitro-calc` has. The
+# engine thread's doorbell is `std::io::pipe`, so not even `rustix`.
+nitro-ui = { workspace = true }
+
+[lib]
+name = "nitro_chess"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nitro-chess"
+path = "src/main.rs"
+
+[dev-dependencies]
+# The in-process harness: a real server on the fake backend, a real
+# client, real pixels. Off in the shipped binary.
+nitro-ui = { workspace = true, features = ["test-support"] }

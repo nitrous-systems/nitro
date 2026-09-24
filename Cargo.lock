@@ -200,6 +200,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nitro-chess"
+version = "0.0.1"
+dependencies = [
+ "nitro-ui",
+]
+
+[[package]]
 name = "nitro-core"
 version = "0.0.1"
 
