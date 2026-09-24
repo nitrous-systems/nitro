@@ -45,6 +45,7 @@ pub mod icon_theme;
 pub mod icons;
 pub mod input;
 pub mod keyboard;
+pub mod lock;
 pub mod logging;
 pub mod protocol;
 pub mod remote;
@@ -190,6 +191,11 @@ pub struct Config {
     /// off so the two can be measured against each other on hardware; a
     /// test sets it directly, for the same reason `scales` is a field.
     pub shadow: bool,
+    /// Start with the session **locked** and no lock owner: nothing but the
+    /// background is drawn and no window receives input until a shell
+    /// client sends `Lock` (and so owns the lock), and then only its
+    /// windows do. `NITRO_LOCKED=1`. See [`lock`].
+    pub locked: bool,
     /// Where `server.conf` lives (see [`config`]). `None` means there is
     /// no file and no watch, which is what a test wants and what a service
     /// with neither `$XDG_CONFIG_HOME` nor `$HOME` gets. `main.rs` fills
@@ -251,6 +257,7 @@ impl Config {
             modes: HashMap::new(),
             fake_modes: Vec::new(),
             shadow: true,
+            locked: false,
             config_path: None,
             icon_dirs: None,
             desktop_dirs: Some(Vec::new()),
@@ -867,6 +874,13 @@ struct Server {
     /// instead of to the focused window. See
     /// [`GrabKeyboard`](nitro_wire::msg::GrabKeyboard).
     grab: Option<WindowKey>,
+    /// The session lock: who owns it, if anyone. Applied through the
+    /// scene's [`Admit`](nitro_scene::Admit) filter (`sync_admit`), which
+    /// every input path then asks. See [`lock`].
+    lock: lock::Lock,
+    /// The window that had focus when the session was locked, given it back
+    /// at the unlock if it still exists.
+    focus_before_lock: Option<WindowKey>,
     /// A shell whose hotkey has just fired and whose answer we are
     /// holding the keyboard for: its epoll token, and the deadline past
     /// which we stop waiting. See [`Server::key`].
@@ -1122,6 +1136,12 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         config_watch,
         config_reloads: 0,
         shadow: config.shadow,
+        lock: if config.locked {
+            lock::Lock::locked()
+        } else {
+            lock::Lock::Unlocked
+        },
+        focus_before_lock: None,
         input_hotplug,
         input_dir: config.input_dir.clone(),
         focus: None,
@@ -1163,6 +1183,12 @@ pub fn run(mut config: Config) -> Result<(), Error> {
     // through the same function the reload path uses, so "what
     // `remote.listen` means" has exactly one implementation.
     server.apply_remote_listen();
+    // Before the first frame: a server started locked must never have
+    // painted a window, so the filter is in force before anything is.
+    server.sync_admit();
+    if server.lock.is_locked() {
+        info!("starting locked: nothing is drawn until a shell client sends Lock");
+    }
     server.sync_outputs();
     server.paint_all();
     let result = server.event_loop();
@@ -1224,6 +1250,8 @@ fn is_shell_op(msg: &ClientMsg) -> bool {
             | ClientMsg::CloseWindow(_)
             | ClientMsg::SetWindowStateFor(_)
             | ClientMsg::Outputs(_)
+            | ClientMsg::Lock(_)
+            | ClientMsg::Unlock(_)
     )
 }
 
@@ -2896,7 +2924,7 @@ impl Server {
                 let Some(window) = self.pointer.over else {
                     return;
                 };
-                let sent_to = self.send_to_window(window, |id| {
+                let sent_to = self.send_input(window, |id| {
                     ServerMsg::PointerAxis(msg::PointerAxis {
                         window: id,
                         dx,
@@ -2990,7 +3018,7 @@ impl Server {
         let now_over = target.map(|t| t.window);
         if now_over != self.pointer.over {
             if let Some(left) = self.pointer.over {
-                let sent_to = self.send_to_window(left, |id| {
+                let sent_to = self.send_input(left, |id| {
                     ServerMsg::PointerLeave(msg::PointerLeave {
                         window: id,
                         time_ns,
@@ -3004,7 +3032,7 @@ impl Server {
             self.pointer.over = now_over;
             if let Some(t) = target {
                 let node = self.node_id_for(t.window, t.hit.node);
-                let sent_to = self.send_to_window(t.window, |id| {
+                let sent_to = self.send_input(t.window, |id| {
                     ServerMsg::PointerEnter(msg::PointerEnter {
                         window: id,
                         node,
@@ -3016,7 +3044,7 @@ impl Server {
             }
         } else if let Some(t) = target {
             let node = self.node_id_for(t.window, t.hit.node);
-            let sent_to = self.send_to_window(t.window, |id| {
+            let sent_to = self.send_input(t.window, |id| {
                 ServerMsg::PointerMotion(msg::PointerMotion {
                     window: id,
                     node,
@@ -3148,7 +3176,7 @@ impl Server {
         if state == ButtonState::Pressed && button == input::BTN_LEFT {
             self.raise_and_focus(window);
         }
-        let sent_to = self.send_to_window(window, |id| {
+        let sent_to = self.send_input(window, |id| {
             ServerMsg::PointerButton(msg::PointerButton {
                 window: id,
                 button,
@@ -3267,7 +3295,14 @@ impl Server {
             .as_mut()
             .map_or_else(keyboard::KeyResolution::none, |kb| kb.key(keycode, pressed));
         if pressed && let Some(hotkey) = keyboard::hotkey(resolved.keysym, resolved.named) {
-            self.hotkey(hotkey);
+            // While locked the only compositor chord is a VT switch: it
+            // leaves this session locked behind it, and it is how a user
+            // reaches a text console when the lock screen is broken. The
+            // rest (close, maximize, Alt+Tab, quit) act on windows nobody
+            // may touch until the unlock, and are swallowed.
+            if !self.lock.is_locked() || matches!(hotkey, keyboard::Hotkey::SwitchVt(_)) {
+                self.hotkey(hotkey);
+            }
             // A hotkey is the compositor's, not the client's.
             self.note_input(time_ns);
             return;
@@ -3278,7 +3313,15 @@ impl Server {
         // and an ambiguity. `HotKeys::key` is fed every key, hotkey or not,
         // because the bare-modifier tap is decided by what did *not* happen
         // while a modifier was held.
-        let fired = self.hotkeys.key(resolved.keysym, pressed, resolved.named);
+        // While locked, the shell's bindings are not consulted at all: a
+        // launcher opened over a lock screen would be a way past it. The
+        // tap state machine is reset on both edges of the lock instead of
+        // being fed here.
+        let fired = if self.lock.is_locked() {
+            Vec::new()
+        } else {
+            self.hotkeys.key(resolved.keysym, pressed, resolved.named)
+        };
         if !fired.is_empty() {
             let mut answered_by = None;
             for (binding, down) in fired {
@@ -3321,7 +3364,12 @@ impl Server {
         // A keyboard grab wins over focus: it is how a `NO_FOCUS` overlay
         // reads the keyboard without taking focus away, so the window that
         // was focused stays focused and keeps its active frame.
-        let Some(window) = self.grab_target().or(self.focus) else {
+        //
+        // While locked, only a window the lock admits may be either: a grab
+        // or a focus left on anyone else's window is skipped, not honoured.
+        let grab = self.grab_target().filter(|w| self.scene.admits_window(*w));
+        let focus = self.focus.filter(|w| self.scene.admits_window(*w));
+        let Some(window) = grab.or(focus) else {
             return;
         };
         // ...unless a shell's hotkey just fired and it has not answered
@@ -3338,7 +3386,7 @@ impl Server {
         };
         let utf8 = resolved.utf8.clone();
         let (keysym, mods) = (resolved.keysym, resolved.mods);
-        let sent_to = self.send_to_window(window, |id| {
+        let sent_to = self.send_input(window, |id| {
             ServerMsg::Key(msg::Key {
                 window: id,
                 keycode,
@@ -3515,7 +3563,7 @@ impl Server {
         let Some((win, pos)) = target else {
             return;
         };
-        let sent_to = self.send_to_window(win, |window| {
+        let sent_to = self.send_input(win, |window| {
             ServerMsg::Touch(msg::Touch {
                 window,
                 id: touch_id,
@@ -3630,6 +3678,22 @@ impl Server {
         sent_to
     }
 
+    /// [`Server::send_to_window`] for **input**: pointer, keys, scroll and
+    /// touch. A window the session lock does not admit receives none.
+    ///
+    /// Separate from `send_to_window` on purpose. That one also carries
+    /// `Configure`-like news a hidden client still needs (`WindowState`,
+    /// `Closed`); input is the one kind that must stop at the lock.
+    fn send_input<F>(&mut self, win: WindowKey, build: F) -> Option<u64>
+    where
+        F: Fn(NodeId) -> ServerMsg,
+    {
+        if !self.scene.admits_window(win) {
+            return None;
+        }
+        self.send_to_window(win, build)
+    }
+
     /// An input event has just been sent to a client: its answer is worth
     /// holding a cursor-only flip for. See [`Server::paint_or_defer`].
     ///
@@ -3652,6 +3716,15 @@ impl Server {
     /// Move keyboard focus, telling both the old and the new window.
     fn set_focus(&mut self, window: Option<WindowKey>) {
         if self.focus == window {
+            return;
+        }
+        // The one gate every focus path goes through: a click, Alt+Tab, a
+        // new window, the MRU hand-off, the shell's `FocusWindow` and the
+        // control socket's `focus`. While locked, a window the lock does
+        // not admit cannot take the keyboard.
+        if let Some(w) = window
+            && !self.scene.admits_window(w)
+        {
             return;
         }
         if let Some(old) = self.focus {
@@ -4165,6 +4238,9 @@ impl Server {
             .filter(|i| i.state() != WindowState::Minimized)
             .and_then(|i| self.scene.node(i.root()).ok())
             .is_some_and(nitro_scene::Node::visible)
+            // A window the session lock hides is not on screen: no title bar
+            // to drag, no button to press, no edge to resize.
+            && self.scene.admits_window(win)
     }
 
     /// Where an output's logical space starts in the desktop space.
@@ -4993,6 +5069,8 @@ impl Server {
         // zero: a non-zero value means someone types faster than the shell
         // wakes, which is exactly the race this counter exists to pin.
         pairs.push(("keys_withheld", self.keys_withheld));
+        pairs.push(("locked", u64::from(self.lock.is_locked())));
+        pairs.push(("lock_owned", u64::from(self.lock.owner().is_some())));
         // Completed reloads, however triggered: the control request,
         // SIGHUP and the inotify watch all land in one counter, because
         // what a caller wants to know is "did the server pick my edit up",
@@ -5427,6 +5505,8 @@ impl Server {
                 }
                 true
             }
+            ClientMsg::Lock(_) => self.shell_lock(token),
+            ClientMsg::Unlock(_) => self.shell_unlock(token),
             // The four that name the sender's *own* window are buffered and
             // applied at its `Commit`, by `Server::apply_shell_op`: a bar
             // sends `CreateWindow` and `SetAnchor` in one transaction, so an
@@ -5487,6 +5567,92 @@ impl Server {
     }
 
     /// `BindKey`: claim a server-global chord.
+    /// `Lock` from a shell client. See [`lock`] for the rules.
+    fn shell_lock(&mut self, token: u64) -> bool {
+        if !self.lock.is_locked() {
+            // Before the gate closes, while these windows may still be told
+            // things: the focused one loses the keyboard and the hovered one
+            // the pointer, as they would on a VT switch.
+            self.focus_before_lock = self.focus;
+            self.set_focus(None);
+            self.release_pointer_for_lock();
+        }
+        match self.lock.claim(token) {
+            Ok(how) => {
+                match how {
+                    lock::Claimed::Locked => info!("session locked"),
+                    lock::Claimed::TookOver => info!("lock taken over by a new owner"),
+                    lock::Claimed::Already => {}
+                }
+                self.sync_admit();
+                true
+            }
+            Err(e) => {
+                self.disconnect(token, Some((0, ErrorCode::Protocol, e.to_string())));
+                false
+            }
+        }
+    }
+
+    /// `Unlock` from a shell client: the owner's, or fatal.
+    fn shell_unlock(&mut self, token: u64) -> bool {
+        match self.lock.release(token) {
+            Ok(()) => {
+                info!("session unlocked");
+                self.sync_admit();
+                self.hotkeys.reset();
+                // The window that had the keyboard gets it back, if it is
+                // still there and still wants it.
+                if let Some(w) = self.focus_before_lock.take()
+                    && self.focusable(w)
+                {
+                    self.set_focus(Some(w));
+                }
+                true
+            }
+            Err(e) => {
+                self.disconnect(token, Some((0, ErrorCode::Protocol, e.to_string())));
+                false
+            }
+        }
+    }
+
+    /// Everything the pointer is in the middle of, ended for a lock: the
+    /// hovered window is told the pointer left, a drag in flight is dropped
+    /// and the shell's tap state is reset. The next motion re-hit-tests
+    /// against the admitted windows only.
+    fn release_pointer_for_lock(&mut self) {
+        if let Some(left) = self.pointer.over.take() {
+            let time_ns = monotonic_ns();
+            self.send_to_window(left, |id| {
+                ServerMsg::PointerLeave(msg::PointerLeave {
+                    window: id,
+                    time_ns,
+                })
+            });
+        }
+        let _ = self.wm.end_drag();
+        self.hotkeys.reset();
+        self.hotkey_pending = None;
+    }
+
+    /// Point the scene's [`Admit`](nitro_scene::Admit) filter at the lock
+    /// state: everyone when unlocked, the owner's windows when locked, and
+    /// nobody's while the lock has no owner. The change damages every
+    /// output, and the frame that follows is the one that shows it.
+    fn sync_admit(&mut self) {
+        use nitro_scene::Admit;
+        let admit = match self.lock {
+            lock::Lock::Unlocked => Admit::All,
+            lock::Lock::Locked { owner: None } => Admit::Nobody,
+            lock::Lock::Locked { owner: Some(t) } => self
+                .wire_clients
+                .get(&t)
+                .map_or(Admit::Nobody, |c| Admit::Only(c.id)),
+        };
+        self.scene.set_admit(admit);
+    }
+
     fn shell_bind_key(&mut self, token: u64, m: msg::BindKey) -> bool {
         match self.hotkeys.bind(token, m.id, m.mods, m.keysym) {
             Ok(()) => true,
@@ -6102,6 +6268,13 @@ impl Server {
         // subscriptions, and any grab it still had. Its windows' zones and
         // anchors went with `forget_window` above.
         self.hotkeys.forget_client(token);
+        // A lock owner that goes away leaves the session locked with nobody
+        // holding it: nothing is drawn but the background until a new lock
+        // screen takes it over. A crash is never a way in.
+        if self.lock.forget(token) {
+            warn!("the lock owner went away; the session stays locked");
+            self.sync_admit();
+        }
         self.window_watchers.retain(|t| *t != token);
         self.output_watchers.retain(|t| *t != token);
         // Dropping the stream removes it from the epoll set.
@@ -6393,6 +6566,8 @@ mod tests {
             .into(),
             msg::WindowList.into(),
             msg::Outputs.into(),
+            msg::Lock.into(),
+            msg::Unlock.into(),
             msg::FocusWindow {
                 window: WindowRef(1),
             }

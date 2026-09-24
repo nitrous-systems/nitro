@@ -12,14 +12,14 @@ use nitro_wire::msg::{
     Commit, Configure, CreateBuffer, CreateNode, CreatePopup, CreateWindow, DestroyBuffer,
     DestroyNode, DragDrop, DragEnter, DragFinished, DragLeave, DragMotion, Error as ErrorMsg, Fill,
     FinishDrag, Focus, FocusWindow, Frame, GrabKeyboard, Hello, HotKey, IconRefused, Key, Keymap,
-    ListOutputs, MeasureText, Modifiers, OutputGone, OutputInfo, OutputWorkArea, Outputs,
+    ListOutputs, Lock, MeasureText, Modifiers, OutputGone, OutputInfo, OutputWorkArea, Outputs,
     OutputsEnd, PointerAxis, PointerButton, PointerEnter, PointerLeave, PointerMotion, PopupDone,
     Presented, Reparent, RepositionPopup, RequestFrame, RequestSelection, SelectionData,
     SelectionOffer, SelectionRequest, SendSelection, ServerMsg, SetAnchor, SetAppId, SetBorder,
     SetBounds, SetClip, SetCorners, SetCursor, SetExclusiveZone, SetFill, SetIcon, SetImage,
     SetLayer, SetOpacity, SetSelection, SetText, SetTransform, SetVisible, SetWindowLimits,
     SetWindowState, SetWindowStateFor, SetWindowTitle, StartDrag, StartMove, StartResize,
-    TextMeasured, TextMetrics, Theme, Touch, UnbindKey, Welcome, WindowGone, WindowInfo,
+    TextMeasured, TextMetrics, Theme, Touch, UnbindKey, Unlock, Welcome, WindowGone, WindowInfo,
     WindowList, WindowListEnd, WindowState,
 };
 use nitro_wire::types::{
@@ -1210,10 +1210,12 @@ fn payload_layouts_are_frozen() {
         ]
     );
 
-    // The three empty-bodied shell requests are a bare header.
+    // The empty-bodied shell requests are a bare header.
     for (msg, op) in [
         (ClientMsg::from(WindowList), 0x0407u16),
         (ClientMsg::from(Outputs), 0x040b),
+        (ClientMsg::from(Lock), 0x040c),
+        (ClientMsg::from(Unlock), 0x040d),
     ] {
         let mut w = Writer::new();
         msg.encode(&mut w).unwrap();
@@ -1823,6 +1825,8 @@ fn the_shell_ops_live_in_their_own_block() {
         CloseWindow::OP,
         SetWindowStateFor::OP,
         Outputs::OP,
+        Lock::OP,
+        Unlock::OP,
     ] {
         assert_eq!(op & 0xff00, 0x0400, "client shell op {op:#06x}");
         assert!(ClientMsg::is_op(op));

@@ -392,11 +392,11 @@ torn down, so the common path has no handover at all.
 - **The lock is the server's, from the first frame.** A lock client
   started after the desktop would race it. The server starts locked,
   composites only the lock surface (other windows are not drawn at all,
-  rather than covered) and routes input only to it. Only the lock client
-  can unlock, over a socket `nitro-session` hands it pre-connected. A
-  crashed lock client leaves the screen locked and is restarted. These
-  are `ext-session-lock` semantics; suspend and idle locking need the
-  same thing.
+  rather than covered) and routes input only to it. Only the connection
+  that took the lock can unlock. A crashed lock client leaves the screen
+  locked, and its restart takes the lock over. These are
+  `ext-session-lock` semantics; suspend and idle locking need the same
+  thing. Built: see plan step 2.
 - **Nothing acts for the user before unlock.** `--locked` starts only
   what paints (server, wallpaper, bar, lock screen, the launcher's
   index). Autostart, when nitro has one, waits for the unlock.
@@ -434,10 +434,17 @@ torn down, so the common path has no handover at all.
 In order. Each step can land on its own:
 
 1. **`TextField::secret`**: done (decision 5).
-2. **The server's lock state**: start locked, composite and route input
-   to the lock surface only, unlock only on the lock client's word, stay
-   locked when it crashes. Tested on the fake backend against screenshots
-   and input, including a crashed lock client.
+2. **The server's lock state**: done. `Lock`/`Unlock` shell ops,
+   `NITRO_LOCKED=1`, the scene's `Admit` filter, and a gate on every input
+   path; `docs/shell.md` §The session lock. One difference from decision
+   6's sketch: the lock client is identified by being the connection that
+   sent `Lock` (the `ext-session-lock` rule), not by a socket handed over
+   by `nitro-session`. That needs no new fd plumbing, and an ownerless
+   lock still cannot be unlocked by anyone. What it does not stop is
+   another shell client of the same user taking over an *ownerless* lock,
+   which is the same boundary the shell socket already has (`docs/shell.md`,
+   "What this model is worth"). `nitro-session --locked` starts the lock
+   screen first, so in practice it is the first to ask.
 3. **`nitro-auth` and the conversation**: the helper, and in
    `nitro-greeter` the pure state machine (tested against scripted
    conversations: password; one-time code after password; an info line;

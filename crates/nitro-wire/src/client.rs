@@ -17,12 +17,12 @@ use crate::io::Socket;
 use crate::msg::{
     AcceptDrop, BindKey, BufferDamage, ClientCaps, ClientMsg, CloseWindow, Commit, CreateBuffer,
     CreateNode, CreatePopup, CreateWindow, DestroyBuffer, DestroyNode, Fill, FinishDrag,
-    FocusWindow, GrabKeyboard, Hello, ListOutputs, MeasureText, Outputs, Reparent, RepositionPopup,
-    RequestFrame, RequestSelection, SendSelection, ServerMsg, SetAnchor, SetAppId, SetBorder,
-    SetBounds, SetClip, SetCorners, SetCursor, SetExclusiveZone, SetFill, SetIcon, SetImage,
-    SetLayer, SetOpacity, SetSelection, SetText, SetTransform, SetVisible, SetWindowLimits,
-    SetWindowState, SetWindowStateFor, SetWindowTitle, StartDrag, StartMove, StartResize,
-    UnbindKey, WindowList,
+    FocusWindow, GrabKeyboard, Hello, ListOutputs, Lock, MeasureText, Outputs, Reparent,
+    RepositionPopup, RequestFrame, RequestSelection, SendSelection, ServerMsg, SetAnchor, SetAppId,
+    SetBorder, SetBounds, SetClip, SetCorners, SetCursor, SetExclusiveZone, SetFill, SetIcon,
+    SetImage, SetLayer, SetOpacity, SetSelection, SetText, SetTransform, SetVisible,
+    SetWindowLimits, SetWindowState, SetWindowStateFor, SetWindowTitle, StartDrag, StartMove,
+    StartResize, UnbindKey, Unlock, WindowList,
 };
 use crate::types::{
     Align, BufferId, CursorShape, DataSource, DragAction, Edge, Layer, NodeId, NodeKind,
@@ -280,6 +280,24 @@ impl Connection {
     /// As [`Connection::send`].
     pub fn outputs(&mut self) -> Result<(), Error> {
         self.send(&ClientMsg::Outputs(Outputs))
+    }
+
+    /// Lock the session, or take over an ownerless lock (needs
+    /// `caps::SHELL`). See [`Lock`].
+    ///
+    /// # Errors
+    /// As [`Connection::send`].
+    pub fn lock(&mut self) -> Result<(), Error> {
+        self.send(&ClientMsg::Lock(Lock))
+    }
+
+    /// Unlock the session; lock owner only (needs `caps::SHELL`). See
+    /// [`Unlock`].
+    ///
+    /// # Errors
+    /// As [`Connection::send`].
+    pub fn unlock(&mut self) -> Result<(), Error> {
+        self.send(&ClientMsg::Unlock(Unlock))
     }
 
     /// Declare which server→client messages this client understands

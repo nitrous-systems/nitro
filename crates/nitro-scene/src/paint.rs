@@ -251,6 +251,9 @@ impl Scene {
             let Some(window) = self.windows.get(win) else {
                 continue;
             };
+            if !self.admit.admits(window.client) {
+                continue;
+            }
             let root = window.root;
             let node = self.node_ref(root);
             if !node.subtree_bounds.intersects(clip) {
@@ -355,6 +358,9 @@ impl Scene {
             let Some(window) = self.windows.get(win) else {
                 continue;
             };
+            if !self.admit.admits(window.client) {
+                continue;
+            }
             let root = window.root;
             if let Some(hit) = self.hit_node(root, point) {
                 return Some(hit);

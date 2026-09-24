@@ -70,11 +70,17 @@ struct Harness {
 
 impl Harness {
     fn start(name: &str, width: u32, height: u32) -> Self {
+        Self::start_with(name, width, height, |_| {})
+    }
+
+    /// [`Harness::start`] with a last say over the configuration.
+    fn start_with(name: &str, width: u32, height: u32, tweak: impl FnOnce(&mut Config)) -> Self {
         let dir = std::env::temp_dir().join(format!("nitro-shell-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("nitro").join("control.sock");
         let mut config = Config::fake(1, 1, &path);
         config.backend = BackendKind::Fake { width, height };
+        tweak(&mut config);
         let input = FakeInput::new().expect("eventfd");
         config.fake_input = Some(input.clone());
         let wire_path = config.wire_path.clone();
@@ -552,6 +558,8 @@ fn every_shell_op_is_refused_on_the_ordinary_socket() {
         ("CloseWindow", 8),
         ("SetWindowStateFor", 9),
         ("Outputs", 10),
+        ("Lock", 11),
+        ("Unlock", 12),
     ] {
         let mut inbox = Inbox::default();
         let mut conn = h.client(name);
@@ -580,7 +588,9 @@ fn every_shell_op_is_refused_on_the_ordinary_socket() {
             7 => conn.focus_window(WindowRef(1)),
             8 => conn.close_window(WindowRef(1)),
             9 => conn.set_window_state_for(WindowRef(1), WindowState::Minimized),
-            _ => conn.outputs(),
+            10 => conn.outputs(),
+            11 => conn.lock(),
+            _ => conn.unlock(),
         }
         .unwrap();
         conn.flush().unwrap();
@@ -2334,5 +2344,531 @@ fn a_bar_hidden_with_set_visible_gives_its_strip_back() {
     );
 
     drop((conn, shell));
+    h.quit();
+}
+
+// ---------------------------------------------------------------------------
+// The session lock (`Lock` / `Unlock`, `NITRO_LOCKED`).
+// ---------------------------------------------------------------------------
+
+const LOCK_GREEN: Color = Color::rgb(0x00, 0xC0, 0x00);
+
+/// How many pixels of the screenshot are exactly `color`.
+fn count(img: &nitro_kms::Image, color: Color) -> usize {
+    let want = to_rgb(color);
+    (0..img.height)
+        .flat_map(|y| (0..img.width).map(move |x| (x, y)))
+        .filter(|&(x, y)| {
+            let o = (y * img.stride + x * 4) as usize;
+            rgb(u32::from_le_bytes([
+                img.data[o],
+                img.data[o + 1],
+                img.data[o + 2],
+                img.data[o + 3],
+            ])) == want
+        })
+        .count()
+}
+
+/// The lock screen: a shell client that locks, then shows one green
+/// window. Returns the connection, its inbox and its window.
+fn make_lock_screen(h: &Harness, name: &str) -> (Connection, Inbox, Win) {
+    let mut inbox = Inbox::default();
+    let mut conn = h.shell(name);
+    conn.lock().unwrap();
+    conn.flush().unwrap();
+    let win = make_window(
+        &mut conn,
+        &mut inbox,
+        50,
+        "lock",
+        Size::new(120.0, 80.0),
+        LOCK_GREEN,
+        window_flags::UNDECORATED,
+        Layer::Normal,
+        1,
+    );
+    // In the bottom-right corner, clear of the application in the middle:
+    // a test that points at the application must not hit the lock screen
+    // instead, or a leaking gate would go unnoticed.
+    conn.tx()
+        .set_anchor(win.root, anchor::BOTTOM | anchor::RIGHT, 0)
+        .commit(2)
+        .unwrap();
+    conn.flush().unwrap();
+    let mut win = win;
+    await_configure(&mut conn, &mut inbox, &mut win, "the lock screen's anchor");
+    h.settle();
+    (conn, inbox, win)
+}
+
+/// Whether `(x, y)` is inside `w`.
+fn inside(w: &Win, (x, y): (f32, f32)) -> bool {
+    x >= w.pos.x && y >= w.pos.y && x < w.pos.x + w.size.w && y < w.pos.y + w.size.h
+}
+
+/// An ordinary application: one red window, focused on creation.
+fn make_app(h: &Harness) -> (Connection, Inbox, Win) {
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("app");
+    let win = make_window(
+        &mut conn,
+        &mut inbox,
+        1,
+        "app",
+        WIN,
+        RED,
+        window_flags::UNDECORATED,
+        Layer::Normal,
+        1,
+    );
+    h.settle();
+    (conn, inbox, win)
+}
+
+/// Whether anything that is **input** reached this connection.
+fn got_input(inbox: &Inbox) -> Vec<&'static str> {
+    inbox
+        .0
+        .iter()
+        .filter_map(|m| match m {
+            ServerMsg::Key(_) => Some("Key"),
+            ServerMsg::PointerEnter(_) => Some("PointerEnter"),
+            ServerMsg::PointerMotion(_) => Some("PointerMotion"),
+            ServerMsg::PointerButton(_) => Some("PointerButton"),
+            ServerMsg::PointerAxis(_) => Some("PointerAxis"),
+            ServerMsg::Focus(f) if f.focused => Some("Focus(true)"),
+            _ => None,
+        })
+        .collect()
+}
+
+fn center(w: &Win) -> (f32, f32) {
+    (w.pos.x + w.size.w / 2.0, w.pos.y + w.size.h / 2.0)
+}
+
+fn protocol_error(conn: &mut Connection, inbox: &mut Inbox, what: &str) {
+    let code = expect(conn, &mut inbox.0, what, |m| match m {
+        ServerMsg::Error(e) => Some(e.code),
+        _ => None,
+    });
+    assert_eq!(code, nitro_wire::types::ErrorCode::Protocol, "{what}");
+}
+
+#[test]
+fn a_server_started_locked_draws_nothing_but_its_lock_owner() {
+    let mut h = Harness::start_with("lock-start", OUT.0, OUT.1, |c| c.locked = true);
+    assert_eq!(h.stat("locked"), 1);
+    assert_eq!(h.stat("lock_owned"), 0);
+
+    // An application that connects to a locked session gets a window, and
+    // nothing of it is drawn.
+    let (app, _app_inbox, _) = make_app(&h);
+    park(&mut h);
+    assert_eq!(
+        count(&h.shot(), RED),
+        0,
+        "no application pixel while locked"
+    );
+
+    // The first `Lock` takes the ownerless lock over, and its window, and
+    // only its window, is drawn.
+    let (mut lock, _lock_inbox, _) = make_lock_screen(&h, "lock");
+    assert_eq!(h.stat("lock_owned"), 1);
+    park(&mut h);
+    let img = h.shot();
+    assert!(count(&img, LOCK_GREEN) > 0, "the lock screen is drawn");
+    assert_eq!(count(&img, RED), 0, "and still nothing else");
+
+    // The owner unlocks, and the application is drawn: the control that
+    // shows `count` can see a red window at all.
+    lock.unlock().unwrap();
+    lock.flush().unwrap();
+    wait_for("the unlock", || h.stat("locked") == 0);
+    park(&mut h);
+    assert!(
+        count(&h.shot(), RED) > 0,
+        "the application after the unlock"
+    );
+
+    drop((app, lock));
+    h.quit();
+}
+
+#[test]
+fn while_locked_input_reaches_only_the_lock_owner_and_focus_comes_back() {
+    let mut h = Harness::start("lock-input", OUT.0, OUT.1);
+    let (mut app, mut app_inbox, app_win) = make_app(&h);
+    expect(&mut app, &mut app_inbox.0, "the app's focus", |m| match m {
+        ServerMsg::Focus(f) if f.focused => Some(()),
+        _ => None,
+    });
+
+    // `Lock` alone, before any lock window exists, takes the keyboard away
+    // from the application: it must not wait for a lock screen to appear
+    // and take the focus itself.
+    let mut early = h.shell("early");
+    early.lock().unwrap();
+    early.flush().unwrap();
+    expect(
+        &mut app,
+        &mut app_inbox.0,
+        "the app's focus loss",
+        |m| match m {
+            ServerMsg::Focus(f) if !f.focused => Some(()),
+            _ => None,
+        },
+    );
+    early.unlock().unwrap();
+    early.flush().unwrap();
+    wait_for("the early unlock", || h.stat("locked") == 0);
+    drop(early);
+    h.settle();
+
+    let (mut lock, mut lock_inbox, lock_win) = make_lock_screen(&h, "lock");
+    h.settle();
+    pump(&mut app, &mut app_inbox);
+    app_inbox.0.clear();
+
+    // Pointer over where the application's window is, a click, a key
+    // press: none of it reaches the application.
+    let (x, y) = center(&app_win);
+    assert!(
+        !inside(&lock_win, (x, y)),
+        "the test must point at the app, not the lock"
+    );
+    h.point_at(x, y, OUT);
+    h.settle();
+    h.button(0x110, nitro_wire::types::ButtonState::Pressed);
+    h.button(0x110, nitro_wire::types::ButtonState::Released);
+    h.key(KEY_A, true);
+    h.key(KEY_A, false);
+    h.settle();
+    pump(&mut app, &mut app_inbox);
+    assert_eq!(
+        got_input(&app_inbox),
+        Vec::<&str>::new(),
+        "input reached the app"
+    );
+
+    // The lock screen, focused on creation, did get the key.
+    expect(
+        &mut lock,
+        &mut lock_inbox.0,
+        "the key at the lock screen",
+        |m| match m {
+            ServerMsg::Key(k) if k.keycode == KEY_A => Some(()),
+            _ => None,
+        },
+    );
+
+    // The control socket's `focus` is refused too (it goes through the same
+    // gate every focus path does).
+    {
+        let mut c = h.connect();
+        c.get_mut().write_all(b"focus\n").unwrap();
+        let mut line = String::new();
+        c.read_line(&mut line).unwrap();
+        assert_eq!(line, "ok\n");
+    }
+    h.settle();
+    pump(&mut app, &mut app_inbox);
+    assert_eq!(
+        got_input(&app_inbox),
+        Vec::<&str>::new(),
+        "`focus` focused the app"
+    );
+
+    // Unlock: the application gets its focus back, and keys again.
+    lock.unlock().unwrap();
+    lock.flush().unwrap();
+    expect(
+        &mut app,
+        &mut app_inbox.0,
+        "focus back after the unlock",
+        |m| match m {
+            ServerMsg::Focus(f) if f.focused => Some(()),
+            _ => None,
+        },
+    );
+    h.key(KEY_A, true);
+    h.key(KEY_A, false);
+    expect(
+        &mut app,
+        &mut app_inbox.0,
+        "a key after the unlock",
+        |m| match m {
+            ServerMsg::Key(k) if k.keycode == KEY_A => Some(()),
+            _ => None,
+        },
+    );
+
+    drop((app, lock));
+    h.quit();
+}
+
+#[test]
+fn while_locked_shell_bindings_and_window_chords_do_nothing() {
+    let mut h = Harness::start("lock-keys", OUT.0, OUT.1);
+    let (mut app, mut app_inbox, _) = make_app(&h);
+
+    let mut bar_inbox = Inbox::default();
+    let mut bar = h.shell("bar");
+    bar.bind_key(1, mod_mask::SUPER, XK_RETURN).unwrap();
+    bar.flush().unwrap();
+    h.settle();
+    // The control: the binding fires while unlocked.
+    h.super_chord(KEY_ENTER);
+    // Both edges, before the inbox is cleared: a release arriving after
+    // the clear would read as a binding firing while locked.
+    expect(
+        &mut bar,
+        &mut bar_inbox.0,
+        "the HotKey unlocked",
+        |m| match m {
+            ServerMsg::HotKey(k) if k.id == 1 && !k.pressed => Some(()),
+            _ => None,
+        },
+    );
+    bar_inbox.0.clear();
+
+    let (mut lock, mut lock_inbox, _) = make_lock_screen(&h, "lock");
+    h.super_chord(KEY_ENTER);
+    // Super+Q closes the focused window when unlocked. While locked the
+    // focus is the lock screen's, so a chord that slipped through would
+    // close *that*; the application is checked too.
+    h.super_chord(16);
+    h.settle();
+    pump(&mut bar, &mut bar_inbox);
+    pump(&mut app, &mut app_inbox);
+    pump(&mut lock, &mut lock_inbox);
+    assert!(
+        !bar_inbox
+            .0
+            .iter()
+            .any(|m| matches!(m, ServerMsg::HotKey(_))),
+        "a shell binding fired while locked: {:?}",
+        bar_inbox.0
+    );
+    for (who, inbox) in [("app", &app_inbox), ("lock", &lock_inbox)] {
+        assert!(
+            !inbox.0.iter().any(|m| matches!(m, ServerMsg::Closed(_))),
+            "Super+Q closed the {who} window while locked"
+        );
+    }
+
+    drop((app, bar, lock));
+    h.quit();
+}
+
+#[test]
+fn only_the_owner_unlocks_and_a_second_lock_is_refused() {
+    let h = Harness::start("lock-owner", OUT.0, OUT.1);
+    let (_owner, _owner_inbox, _) = make_lock_screen(&h, "owner");
+
+    // Another shell client may not unlock...
+    let mut other_inbox = Inbox::default();
+    let mut other = h.shell("other");
+    other.unlock().unwrap();
+    other.flush().unwrap();
+    protocol_error(&mut other, &mut other_inbox, "Unlock from a non-owner");
+    assert_eq!(h.stat("locked"), 1, "a refused unlock changed nothing");
+
+    // ...nor take the lock while it is owned.
+    let mut second_inbox = Inbox::default();
+    let mut second = h.shell("second");
+    second.lock().unwrap();
+    second.flush().unwrap();
+    protocol_error(&mut second, &mut second_inbox, "Lock while owned");
+    assert_eq!(h.stat("lock_owned"), 1);
+
+    // And an ordinary client cannot even ask (covered for every shell op in
+    // `every_shell_op_is_refused_on_the_ordinary_socket`).
+    h.quit();
+}
+
+#[test]
+fn unlocking_an_unlocked_session_is_refused() {
+    let h = Harness::start("lock-none", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut shell = h.shell("shell");
+    shell.unlock().unwrap();
+    shell.flush().unwrap();
+    protocol_error(&mut shell, &mut inbox, "Unlock while unlocked");
+    assert_eq!(h.stat("locked"), 0);
+    h.quit();
+}
+
+#[test]
+fn a_lock_screen_that_dies_leaves_the_session_locked_until_the_next_one() {
+    let mut h = Harness::start("lock-crash", OUT.0, OUT.1);
+    let (app, _app_inbox, _) = make_app(&h);
+    let (first, _first_inbox, _) = make_lock_screen(&h, "first");
+    park(&mut h);
+    assert!(count(&h.shot(), LOCK_GREEN) > 0);
+
+    // The lock screen goes away without unlocking.
+    drop(first);
+    wait_for("the owner to be forgotten", || h.stat("lock_owned") == 0);
+    assert_eq!(h.stat("locked"), 1, "still locked");
+    park(&mut h);
+    let img = h.shot();
+    assert_eq!(count(&img, RED), 0, "the application stays hidden");
+    assert_eq!(
+        count(&img, LOCK_GREEN),
+        0,
+        "and the dead lock screen is gone"
+    );
+
+    // A new lock screen takes it over, and can unlock.
+    let (mut second, _second_inbox, _) = make_lock_screen(&h, "second");
+    assert_eq!(h.stat("lock_owned"), 1);
+    park(&mut h);
+    assert!(count(&h.shot(), LOCK_GREEN) > 0);
+    second.unlock().unwrap();
+    second.flush().unwrap();
+    wait_for("the unlock", || h.stat("locked") == 0);
+    park(&mut h);
+    assert!(count(&h.shot(), RED) > 0);
+
+    drop((app, second));
+    h.quit();
+}
+
+#[test]
+fn a_launcher_holding_the_keyboard_loses_it_to_the_lock() {
+    // An overlay with a keyboard grab is the one window that gets keys
+    // without having focus. Locking must not leave that path open.
+    let mut h = Harness::start("lock-grab", OUT.0, OUT.1);
+    let mut launcher_inbox = Inbox::default();
+    let mut launcher = h.shell("launcher");
+    let over = make_window(
+        &mut launcher,
+        &mut launcher_inbox,
+        10,
+        "launcher",
+        Size::new(200.0, 60.0),
+        BAR_BLUE,
+        window_flags::UNDECORATED | window_flags::NO_FOCUS,
+        Layer::Overlay,
+        1,
+    );
+    launcher
+        .tx()
+        .grab_keyboard(over.root, true)
+        .commit(2)
+        .unwrap();
+    launcher.flush().unwrap();
+    h.settle();
+    // The control: the grab gets the key while unlocked.
+    h.key(KEY_A, true);
+    h.key(KEY_A, false);
+    // Wait for the *release*: clearing the inbox between the two would
+    // leave the release to be counted as a leak below.
+    expect(
+        &mut launcher,
+        &mut launcher_inbox.0,
+        "a grabbed key",
+        |m| match m {
+            ServerMsg::Key(k)
+                if k.keycode == KEY_A && k.state == nitro_wire::types::ButtonState::Released =>
+            {
+                Some(())
+            }
+            _ => None,
+        },
+    );
+    launcher_inbox.0.clear();
+
+    let (lock, _lock_inbox, _) = make_lock_screen(&h, "lock");
+    h.key(KEY_A, true);
+    h.key(KEY_A, false);
+    h.settle();
+    pump(&mut launcher, &mut launcher_inbox);
+    assert_eq!(
+        got_input(&launcher_inbox),
+        Vec::<&str>::new(),
+        "the grab outlived the lock"
+    );
+    drop((launcher, lock));
+    h.quit();
+}
+
+#[test]
+fn a_hidden_window_cannot_be_dragged_while_locked() {
+    // Super+drag moves the window under the pointer by the server's own
+    // frame hit test, not the scene's; it must not find a hidden window.
+    let mut h = Harness::start("lock-drag", OUT.0, OUT.1);
+    let (mut app, mut app_inbox, app_win) = make_app(&h);
+    let (lock, _lock_inbox, lock_win) = make_lock_screen(&h, "lock");
+    pump(&mut app, &mut app_inbox);
+    app_inbox.0.clear();
+
+    let (x, y) = center(&app_win);
+    assert!(
+        !inside(&lock_win, (x, y)),
+        "the test must grab the app, not the lock"
+    );
+    h.key(KEY_LEFTMETA, true);
+    h.settle();
+    h.point_at(x, y, OUT);
+    h.settle();
+    h.button(0x110, nitro_wire::types::ButtonState::Pressed);
+    h.settle();
+    for i in 1..=4 {
+        let t = i as f32 / 4.0;
+        h.point_at(x + 60.0 * t, y + 40.0 * t, OUT);
+        h.settle();
+    }
+    h.button(0x110, nitro_wire::types::ButtonState::Released);
+    h.key(KEY_LEFTMETA, false);
+    h.settle();
+    pump(&mut app, &mut app_inbox);
+    assert!(
+        !app_inbox
+            .0
+            .iter()
+            .any(|m| matches!(m, ServerMsg::Configure(_))),
+        "the hidden window was moved: {:?}",
+        app_inbox.0
+    );
+    assert_eq!(h.stat("dragging"), 0);
+    drop((app, lock));
+    h.quit();
+}
+
+#[test]
+fn the_shell_cannot_focus_a_hidden_window_while_locked() {
+    // `FocusWindow` is the one focus path that names a window directly,
+    // bypassing the pointer and the keyboard: the task switcher's. It goes
+    // through the same gate as every other.
+    let h = Harness::start("lock-focus", OUT.0, OUT.1);
+    let (mut app, mut app_inbox, _) = make_app(&h);
+    let mut bar_inbox = Inbox::default();
+    let mut bar = h.shell("bar");
+    bar.window_list().unwrap();
+    bar.flush().unwrap();
+    let map = await_windows(&mut bar, &mut bar_inbox, "the app in the list", |m| {
+        m.values().any(|i| i.title == "app")
+    });
+    let app_ref = *map
+        .iter()
+        .find(|(_, i)| i.title == "app")
+        .map(|(r, _)| r)
+        .unwrap();
+
+    let (lock, _lock_inbox, _) = make_lock_screen(&h, "lock");
+    pump(&mut app, &mut app_inbox);
+    app_inbox.0.clear();
+    bar.focus_window(app_ref).unwrap();
+    bar.flush().unwrap();
+    h.settle();
+    pump(&mut app, &mut app_inbox);
+    assert_eq!(
+        got_input(&app_inbox),
+        Vec::<&str>::new(),
+        "FocusWindow focused a hidden window"
+    );
+    drop((app, bar, lock));
     h.quit();
 }
