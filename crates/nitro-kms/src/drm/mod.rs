@@ -1056,6 +1056,53 @@ impl<'fd> DrmBackend<'fd> {
         r
     }
 
+    /// Queue a page flip of output `idx` to buffer `target`, with
+    /// `damage` as its `FB_DAMAGE_CLIPS` when the plane has them. Leaves
+    /// `front` and `pending` to the caller.
+    fn flip(&mut self, idx: usize, target: usize, damage: &[Rect]) -> Result<(), Error> {
+        let o = &mut self.outputs[idx];
+        let pp = &self.plane_props[&o.plane.into()];
+        o.flip_req.add_property(
+            o.plane,
+            pp.fb_id,
+            property::Value::Framebuffer(Some(o.bufs[target].fb)),
+        );
+        let mut blob = None;
+        if let Some(clips) = pp.fb_damage_clips {
+            Self::build_damage(
+                &mut self.damage_scratch,
+                damage,
+                o.info.width,
+                o.info.height,
+            );
+            let value = if self.damage_scratch.is_empty() {
+                property::Value::Blob(0)
+            } else {
+                let v = self
+                    .card
+                    .create_property_blob(self.damage_scratch.as_slice())
+                    .map_err(Error::io("create damage blob"))?;
+                if let property::Value::Blob(id) = v {
+                    blob = Some(id);
+                }
+                v
+            };
+            o.flip_req.add_property(o.plane, clips, value);
+        }
+        let result = self
+            .card
+            .atomic_commit(
+                AtomicCommitFlags::NONBLOCK | AtomicCommitFlags::PAGE_FLIP_EVENT,
+                o.flip_req.clone(),
+            )
+            .map_err(Error::io("atomic page flip"));
+        if let Some(id) = blob {
+            // The kernel holds its own reference while the state is in use.
+            let _ = self.card.destroy_property_blob(id);
+        }
+        result
+    }
+
     fn output_mut(&mut self, id: OutputId) -> Result<&mut Output, Error> {
         self.outputs
             .iter_mut()
@@ -1136,62 +1183,33 @@ impl Backend for DrmBackend<'_> {
         // exactly its view of every other one. The cost is one refresh
         // period before the second frame may be committed.
         let lighting = !self.outputs[idx].lit;
-        if lighting {
+        let was = self.outputs[idx].front;
+        let target = if lighting {
+            // The lighting commit scans out the frame just painted, so it
+            // becomes `front` before the modeset that reads `front`.
             let o = &mut self.outputs[idx];
-            let was = o.front;
             o.front = o.back();
             o.lit = true;
-            if let Err(e) = self.light(idx) {
-                // Nothing reached the glass: put the bookkeeping back, so
-                // the caller's retry paints and lights the same way.
-                let o = &mut self.outputs[idx];
-                o.front = was;
-                o.lit = false;
-                return Err(e);
-            }
+            o.front
+        } else {
+            self.outputs[idx].back()
+        };
+        let result = if lighting { self.light(idx) } else { Ok(()) }
+            .and_then(|()| self.flip(idx, target, damage));
+        if let Err(e) = result {
+            // A failed commit leaves the bookkeeping as it found it, so
+            // the caller's retry, which paints into the same back buffer
+            // it just painted, commits that buffer. Even when the
+            // lighting modeset went through and only the flip behind it
+            // failed: the panel then shows this frame already, and the
+            // retry lights it again, which is the same mode and the same
+            // buffer and so costs no resync.
+            let o = &mut self.outputs[idx];
+            o.front = was;
+            o.lit = !lighting;
+            return Err(e);
         }
         let o = &mut self.outputs[idx];
-        let pp = &self.plane_props[&o.plane.into()];
-        let target = if lighting { o.front } else { o.back() };
-        o.flip_req.add_property(
-            o.plane,
-            pp.fb_id,
-            property::Value::Framebuffer(Some(o.bufs[target].fb)),
-        );
-        let mut blob = None;
-        if let Some(clips) = pp.fb_damage_clips {
-            Self::build_damage(
-                &mut self.damage_scratch,
-                damage,
-                o.info.width,
-                o.info.height,
-            );
-            let value = if self.damage_scratch.is_empty() {
-                property::Value::Blob(0)
-            } else {
-                let v = self
-                    .card
-                    .create_property_blob(self.damage_scratch.as_slice())
-                    .map_err(Error::io("create damage blob"))?;
-                if let property::Value::Blob(id) = v {
-                    blob = Some(id);
-                }
-                v
-            };
-            o.flip_req.add_property(o.plane, clips, value);
-        }
-        let result = self
-            .card
-            .atomic_commit(
-                AtomicCommitFlags::NONBLOCK | AtomicCommitFlags::PAGE_FLIP_EVENT,
-                o.flip_req.clone(),
-            )
-            .map_err(Error::io("atomic page flip"));
-        if let Some(id) = blob {
-            // The kernel holds its own reference while the state is in use.
-            let _ = self.card.destroy_property_blob(id);
-        }
-        result?;
         o.front = target;
         o.pending = true;
         Ok(())
