@@ -52,7 +52,7 @@ fn tone(dir: &Path, name: &str, secs: f32) -> PathBuf {
 
 fn harness_with(config: Config) -> Harness<Amp> {
     let amp = Amp::new(config).unwrap();
-    Harness::sized("amp", amp, Size::new(480.0, 600.0), build)
+    Harness::new("amp", amp, build)
 }
 
 fn harness() -> Harness<Amp> {
@@ -258,6 +258,67 @@ fn folding_a_section_away_gives_its_space_back() {
 }
 
 #[test]
+fn the_window_fits_what_is_showing() {
+    let mut h = harness();
+    let full = h.ui().window_size();
+    assert!(
+        (full.h - h.ui().natural_size().h).abs() < 0.5,
+        "opens at its natural size: {full:?}"
+    );
+
+    // Folding the playlist snaps the window to the rest, and locks it.
+    act(&mut h, "pl", "activate", None);
+    let natural = h.ui().natural_size();
+    h.wait_for("the server's configure", |h| {
+        (h.ui().window_size().h - natural.h).abs() < 0.5
+    });
+    assert!(h.ui().window_size().h < full.h - 100.0);
+
+    // Folding the equaliser too leaves the main window alone.
+    act(&mut h, "eq", "activate", None);
+    let main_only = h.ui().natural_size().h;
+    h.wait_for("the smaller window", |h| {
+        (h.ui().window_size().h - main_only).abs() < 0.5
+    });
+    assert!(main_only < natural.h);
+
+    // Unfolding both comes back to where it started.
+    act(&mut h, "eq", "activate", None);
+    act(&mut h, "pl", "activate", None);
+    h.wait_for("the full window again", |h| {
+        (h.ui().window_size().h - full.h).abs() < 0.5
+    });
+}
+
+#[test]
+fn a_dragged_open_playlist_keeps_its_height_across_folds() {
+    let mut h = harness();
+    let full = h.ui().window_size();
+    // The user drags the window 100 px taller: the list takes it.
+    h.configure(Size::new(full.w, full.h + 100.0));
+    h.settle();
+    let tall = h.ui().window_size().h;
+    assert!((tall - (full.h + 100.0)).abs() < 0.5);
+
+    // Folding the equaliser keeps the list's height, so the window
+    // shrinks by the equaliser and one gap — to the pixel, since window
+    // sizes are whole pixels.
+    let eq = named(&mut h, "equalizer");
+    let eq_h = h.bounds(eq).h;
+    act(&mut h, "eq", "activate", None);
+    h.wait_for("the shorter window", |h| {
+        (h.ui().window_size().h - (tall - eq_h - 8.0)).abs() < 1.0
+    });
+
+    // Folding the playlist away and back restores the tall list.
+    act(&mut h, "pl", "activate", None);
+    act(&mut h, "pl", "activate", None);
+    h.wait_for("the list at its dragged height", |h| {
+        (h.ui().window_size().h - (tall - eq_h - 8.0)).abs() < 1.0
+    });
+}
+
+#[test]
 fn the_keys_are_winamps() {
     let d = TempDir::new("keys");
     tone(&d.0, "a.wav", 0.05);
@@ -350,6 +411,7 @@ fn state_survives_a_restart() {
         act(&mut h, "volume", "set_value", Some("40"));
         act(&mut h, "eq_3k", "set_value", Some("-4.5"));
         act(&mut h, "shuffle", "activate", None);
+        act(&mut h, "eq", "activate", None);
         // Dropping the harness drops the state, which saves.
     }
     let mut h = harness_with(config);
@@ -357,6 +419,8 @@ fn state_survives_a_restart() {
     assert!((h.state().volume() - 0.4).abs() < 1e-6);
     assert!((h.state().eq().bands[5] + 4.5).abs() < f32::EPSILON);
     assert!(h.state().playlist().shuffle());
+    let eq = named(&mut h, "equalizer");
+    assert!(h.ui().is_collapsed(eq), "the fold is remembered");
     let id = named(&mut h, "volume");
     assert!((h.widget::<Slider<Amp>>(id).value() - 40.0).abs() < f32::EPSILON);
 }

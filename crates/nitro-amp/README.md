@@ -43,6 +43,14 @@ The one crate this depends on is `nitro-ui`.
 | `l` | open (the path field) | `Delete` | remove the selected track |
 | `s` / `r` | shuffle / repeat | `Ctrl+Q` | quit |
 
+**The window fits what is showing**, as Winamp's docked windows did.
+Fold the playlist away and the window shrinks to the main window and
+the equaliser, and its height locks there: those have one right height.
+Unfold it and the window grows back to the list height you last dragged
+it to, and is resizable again. Folding the equaliser takes exactly its
+height off and leaves the list alone. The folds and the list height are
+remembered across runs.
+
 Letters and arrows only reach the player when no widget wants them: a
 focused slider keeps its arrows, the path field its letters. Clicking the
 clock flips it too, and clicking the visualiser cycles spectrum → scope →

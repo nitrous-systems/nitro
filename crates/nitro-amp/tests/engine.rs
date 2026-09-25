@@ -270,10 +270,11 @@ fn the_output_process_gets_exactly_the_samples_scaled_by_the_volume() {
         token: 1,
     });
     until(&p, "the end", |s| s.ended);
-    // The output is kept alive for a following track; dropping the
-    // player ends it, and the fake's `cat` finishes writing.
-    drop(p);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Every sample is in the pipe once the track has ended, and the
+    // output is kept alive for a following track — so wait for the
+    // fake's `cat` to have copied it all *before* dropping the player.
+    // Dropping first would kill `cat` with the tail still in the pipe.
+    let deadline = Instant::now() + Duration::from_secs(10);
     let pcm = loop {
         let pcm = std::fs::read(&out).unwrap_or_default();
         if pcm.len() >= 2_000 * 8 || Instant::now() > deadline {
@@ -281,6 +282,7 @@ fn the_output_process_gets_exactly_the_samples_scaled_by_the_volume() {
         }
         std::thread::sleep(Duration::from_millis(5));
     };
+    drop(p);
     assert_eq!(pcm.len(), 2_000 * 8, "every frame, as f32le stereo");
     let samples: Vec<f32> = pcm
         .chunks_exact(4)

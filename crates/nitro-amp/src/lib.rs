@@ -119,6 +119,15 @@ const TITLE_CELLS: usize = 34;
 /// Seconds `←` and `→` seek by.
 const SEEK_STEP: f64 = 5.0;
 
+/// The narrowest the window may be: the transport row's buttons and
+/// toggles, side by side.
+const MIN_WIDTH: f32 = 440.0;
+
+/// The playlist's natural height, and the least it may be squeezed to.
+const LIST_HEIGHT: f32 = 180.0;
+/// See [`LIST_HEIGHT`]: about three rows.
+const LIST_MIN_HEIGHT: f32 = 72.0;
+
 /// Volume `↑` and `↓` step by, on the 0–100 slider.
 const VOLUME_STEP: f32 = 5.0;
 
@@ -250,10 +259,25 @@ pub struct Amp {
     /// A tick is scheduled.
     ticking: bool,
     ticks: u64,
+    /// Which sections are unfolded; kept across runs.
+    shown_sections: Sections,
+    /// Window height beyond its natural height while the playlist shows:
+    /// the part of the list the user dragged open. See
+    /// [`remember_list_height`].
+    list_extra: f32,
     /// The last status the window drew, to change only what changed.
     shown: Shown,
     state_dir: Option<PathBuf>,
     output: Output,
+}
+
+/// Which of the docked sections are unfolded.
+#[derive(Debug, Clone, Copy)]
+struct Sections {
+    /// The equaliser.
+    eq: bool,
+    /// The playlist editor.
+    pl: bool,
 }
 
 /// The output, as the status line describes it.
@@ -301,6 +325,8 @@ impl Amp {
             balance: 0.0,
             ticking: false,
             ticks: 0,
+            shown_sections: Sections { eq: true, pl: true },
+            list_extra: 0.0,
             shown: Shown::default(),
             state_dir: config.state_dir,
             output,
@@ -379,6 +405,9 @@ impl Amp {
                 ("shuffle", _) => self.playlist.set_shuffle(v == "1"),
                 ("repeat", _) => self.playlist.set_repeat(v == "1"),
                 ("remaining", _) => self.remaining = v == "1",
+                ("show.eq", _) => self.shown_sections.eq = v != "0",
+                ("show.pl", _) => self.shown_sections.pl = v != "0",
+                ("list.extra", Some(f)) => self.list_extra = f.clamp(-1_000.0, 10_000.0),
                 ("current", _) => {
                     if let Ok(i) = v.parse::<usize>() {
                         self.playlist.set_current(i);
@@ -411,6 +440,7 @@ impl Amp {
         let conf = format!(
             "# nitro-amp settings, rewritten on quit\n\
              volume={}\nbalance={}\nremaining={}\nshuffle={}\nrepeat={}\ncurrent={}\n\
+             show.eq={}\nshow.pl={}\nlist.extra={}\n\
              eq.enabled={}\neq.preamp={}\neq.bands={}\n",
             self.volume,
             self.balance,
@@ -420,6 +450,9 @@ impl Amp {
             self.playlist
                 .current()
                 .map_or_else(String::new, |c| c.to_string()),
+            b(self.shown_sections.eq),
+            b(self.shown_sections.pl),
+            self.list_extra,
             b(self.eq.enabled),
             self.eq.preamp,
             bands.join(","),
@@ -840,10 +873,64 @@ fn toggle_section(s: &mut Amp, ui: &mut Ui<Amp>, eq: bool, show: bool) {
     } else {
         (ids.pl_section, ids.pl_toggle)
     };
-    ui.set_collapsed(section, !show);
     if let Ok(mut c) = ui.widget_mut::<Checkbox<Amp>>(cb) {
         c.set_checked(show);
     }
+    if ui.is_collapsed(section) != show {
+        return;
+    }
+    remember_list_height(s, ui, ids);
+    ui.set_collapsed(section, !show);
+    if eq {
+        s.shown_sections.eq = show;
+    } else {
+        s.shown_sections.pl = show;
+    }
+    fit_window(s, ui);
+}
+
+/// Note how much taller than its natural size the window is while the
+/// playlist shows: that surplus is the list the user dragged open, and
+/// it is what folding and unfolding sections must keep.
+fn remember_list_height(s: &mut Amp, ui: &mut Ui<Amp>, ids: Ids) {
+    if !ui.is_collapsed(ids.pl_section) {
+        s.list_extra = ui.window_size().h - ui.natural_size().h;
+    }
+}
+
+/// Size the window to what is showing, as Winamp's docked windows do.
+///
+/// Without the playlist, the main window and the equaliser have one
+/// right height — their content's — so the window is set to it and
+/// **locked** there: the limits' minimum and maximum height are equal,
+/// and the server refuses a vertical drag. With the playlist, the window
+/// is resizable again, the list takes the slack, and it comes back at
+/// the height it had when it was folded away. The width is left where
+/// the user put it, above the minimum.
+fn fit_window(s: &Amp, ui: &mut Ui<Amp>) {
+    let Some(ids) = s.ids else { return };
+    let natural = ui.natural_size();
+    let width = ui.window_size().w.max(MIN_WIDTH);
+    let (min, max, height) = if ui.is_collapsed(ids.pl_section) {
+        (
+            Size::new(MIN_WIDTH, natural.h),
+            Size::new(0.0, natural.h),
+            natural.h,
+        )
+    } else {
+        // The list may be squeezed below its natural height, to a few
+        // rows, but not away.
+        let floor = natural.h - LIST_HEIGHT + LIST_MIN_HEIGHT;
+        (
+            Size::new(MIN_WIDTH, floor),
+            Size::ZERO,
+            natural.h + s.list_extra,
+        )
+    };
+    // Limits first: the request is clamped to them, and on the way from
+    // a locked height to a free one the old maximum would refuse it.
+    let _ = ui.set_window_limits(min, max);
+    let _ = ui.request_window_size(Size::new(width, height));
 }
 
 fn set_checkbox(ui: &mut Ui<Amp>, id: WidgetId, on: bool) {
@@ -1120,7 +1207,7 @@ pub fn build(ui: &mut Ui<Amp>) -> WidgetId {
     let list_w = ui.build(
         list::<Amp>()
             .name("playlist")
-            .height(180.0)
+            .height(LIST_HEIGHT)
             .grow(1.0)
             .width_percent(1.0)
             .on_activate(|s: &mut Amp, ui: &mut Ui<Amp>, i: usize| {
@@ -1194,7 +1281,7 @@ pub fn build(ui: &mut Ui<Amp>) -> WidgetId {
         ui.attach(root, c).unwrap();
     }
 
-    let _ = ui.set_window_limits(Size::new(440.0, 200.0), Size::ZERO);
+    let _ = ui.set_window_limits(Size::new(MIN_WIDTH, 0.0), Size::ZERO);
     let ids = Ids {
         vis: visw,
         clock,
@@ -1235,6 +1322,20 @@ fn ids_install(ui: &mut Ui<Amp>, ids: Ids) {
             show_title(s, ui);
         }
         sync_controls(s, ui, ids);
+        // The folds the last run ended with, then a window to fit them.
+        let shown = s.shown_sections;
+        set_checkbox(ui, ids.eq_toggle, shown.eq);
+        set_checkbox(ui, ids.pl_toggle, shown.pl);
+        ui.set_collapsed(ids.eq_section, !shown.eq);
+        ui.set_collapsed(ids.pl_section, !shown.pl);
+        fit_window(s, ui);
+        // A drag of the window's edge is the user choosing how tall the
+        // list is; remember it for the next fold and the next run.
+        ui.on_resize(|s: &mut Amp, ui: &mut Ui<Amp>, _size: Size| {
+            if let Some(ids) = s.ids {
+                remember_list_height(s, ui, ids);
+            }
+        });
         let st = s.player.status();
         show_clock(s, ui, &st);
         show_info(ui, ids, &st);
@@ -1357,9 +1458,6 @@ pub fn run(paths: &[PathBuf]) -> Result<(), Box<dyn std::error::Error>> {
         amp.add_paths(paths);
         amp.start_on_open();
     }
-    App::new(APP_NAME)?
-        .title("nitro-amp")
-        .size(Size::new(480.0, 600.0))
-        .run(amp, build)?;
+    App::new(APP_NAME)?.title("nitro-amp").run(amp, build)?;
     Ok(())
 }
