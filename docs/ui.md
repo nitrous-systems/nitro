@@ -733,6 +733,16 @@ while it has no box. Its scene nodes are kept, so expanding it again
 repaints only what moved. `nitro-amp` folds its equaliser and playlist
 this way; `a_collapsed_section_gives_its_space_back` is the test.
 
+A collapse gives the space back to the siblings, not to the desktop. An
+app that wants its **window** to follow asks for it: `Ui::natural_size`
+measures the tree as it now stands, collapsed subtrees counting for
+nothing, and `Ui::request_window_size` asks the server for that size,
+clamped to the app's own limits first. `nitro-amp` fits itself this way
+whenever the equaliser or the playlist is folded;
+`a_window_can_fit_itself_to_its_content` checks the server's frame
+followed, from the output's pixels rather than the client's own idea
+of its size.
+
 The alternative — placing hidden pages at zero size — re-laid-out every
 eliding label on every switch, which is why the flag exists.
 

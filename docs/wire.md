@@ -900,6 +900,12 @@ Recursive. Destroying a window's root group closes the window.
 | `id` | `NodeId` | |
 | `rect` | `Rect` | bounds in the parent's coordinate space |
 
+On a window's own root this is a **resize request**: the window's
+content becomes `rect`'s size (its origin is the frame's to decide), the
+server re-lays the frame around it and answers with a `Configure`.
+Window limits are not applied; see `docs/wm.md` §"A client resizing
+itself".
+
 ### `SetTransform` — 0x0105
 
 | field | type |

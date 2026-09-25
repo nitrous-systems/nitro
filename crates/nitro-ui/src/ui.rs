@@ -1488,6 +1488,57 @@ impl<S: 'static> Ui<S> {
         self.wire.set_window_limits(WINDOW, min, max)
     }
 
+    /// The size the tree wants with nothing constraining it: what a
+    /// window opened without an explicit size is given.
+    ///
+    /// With [`Ui::request_window_size`], this is how an app fits its
+    /// window to its content after the content changed shape — a section
+    /// collapsed or expanded — rather than leaving a gap or clipping.
+    /// Collapsed subtrees count for nothing, as they do in layout.
+    #[must_use]
+    pub fn natural_size(&mut self) -> Size {
+        let Some(root) = self.root else {
+            return Size::ZERO;
+        };
+        let m = self.measure(root, Constraints::unbounded());
+        Size::new(m.w.max(1.0).ceil(), m.h.max(1.0).ceil())
+    }
+
+    /// Ask the server to resize the window's content area to `size`.
+    ///
+    /// Sent as a `SetBounds` on the window's own root, which the server
+    /// treats as a resize request and answers with a `Configure`
+    /// (`docs/wire.md`); the tree re-lays out for the new size at once
+    /// rather than a round trip later. The size is clamped to the limits
+    /// set with [`Ui::set_window_limits`] first, because the server
+    /// applies those to the user's drags, not to the client's own
+    /// requests, and an app should not be able to talk its window past
+    /// a floor it declared. Before the window is open it does nothing:
+    /// [`Ui::open_window`] sizes a new window itself. An unchanged size
+    /// sends nothing.
+    ///
+    /// # Errors
+    /// A wire failure, which is fatal.
+    pub fn request_window_size(&mut self, size: Size) -> Result<(), Error> {
+        let size = match self.window_limits {
+            Some((min, max)) => {
+                let axis = |v: f32, lo: f32, hi: f32| {
+                    let v = if lo > 0.0 { v.max(lo) } else { v };
+                    if hi > 0.0 { v.min(hi.max(lo)) } else { v }
+                };
+                Size::new(axis(size.w, min.w, max.w), axis(size.h, min.h, max.h))
+            }
+            None => size,
+        };
+        let size = Size::new(size.w.max(1.0).ceil(), size.h.max(1.0).ceil());
+        if !self.window_open || self.window_size == size {
+            return Ok(());
+        }
+        self.resize(size);
+        self.wire
+            .set_bounds(WINDOW, Rect::new(0.0, 0.0, size.w, size.h))
+    }
+
     /// Ask the server for a frame callback: it answers with one
     /// [`Frame`] carrying the deadline for the next flip.
     ///

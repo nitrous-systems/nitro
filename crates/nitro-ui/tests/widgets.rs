@@ -277,6 +277,74 @@ fn a_collapsed_section_gives_its_space_back() {
     assert!((h.bounds(bottom).y - open).abs() < 0.01);
 }
 
+/// Whether the output pixel just below `content_h` pixels of window
+/// content, at the window's horizontal middle, is the desktop — the same
+/// colour as the desktop on that row to the window's left — rather than
+/// the window or its frame.
+///
+/// Read off the **server's** output, not the harness's window crop:
+/// that crop is cut to the client's own idea of its size, so it would
+/// agree with the client whatever the server did.
+fn desktop_below(h: &mut Harness<()>, content_h: f32) -> bool {
+    let pos = h.ui().window_position();
+    let size = h.ui().window_size();
+    let out = h.output_shot();
+    // Past the frame's bottom border, which is a few pixels thick.
+    let y = (pos.y + content_h + 12.0) as u32;
+    let x = (pos.x + size.w / 2.0) as u32;
+    // The desktop's own colour on that row, halfway between the output's
+    // edge (which has a highlight of its own) and the window's.
+    let desktop = out.pixel((pos.x / 2.0) as u32, y) & 0x00ff_ffff;
+    out.pixel(x, y) & 0x00ff_ffff == desktop
+}
+
+#[test]
+fn a_window_can_fit_itself_to_its_content() {
+    let mut h = Harness::sized("fit", (), Size::new(200.0, 160.0), |ui: &mut Ui<()>| {
+        ui.build(
+            column()
+                .gap(10.0)
+                .child(label("top").name("top").height(30.0))
+                .child(label("folded").name("section").height(60.0)),
+        )
+    });
+    let section = kids(&mut h)[1];
+    h.ui().set_collapsed(section, true);
+    let natural = h.ui().natural_size();
+    assert!(
+        (natural.h - 30.0).abs() < 0.5,
+        "only `top` counts: {natural:?}"
+    );
+    assert!(
+        !desktop_below(&mut h, natural.h),
+        "the tall window covers the probe"
+    );
+
+    // The request goes to the server, which resizes the window **and
+    // its frame** and answers with a `Configure`.
+    h.ui()
+        .request_window_size(Size::new(200.0, natural.h))
+        .unwrap();
+    h.settle();
+    h.wait_for("the server's configure", |h| {
+        (h.ui().window_size().h - natural.h).abs() < 0.5
+    });
+    assert!(
+        desktop_below(&mut h, natural.h),
+        "the frame shrank with the content, leaving desktop below it"
+    );
+
+    // Limits are honoured: the window cannot be asked below its floor.
+    h.ui()
+        .set_window_limits(Size::new(0.0, 50.0), Size::ZERO)
+        .unwrap();
+    h.ui().request_window_size(Size::new(200.0, 10.0)).unwrap();
+    h.settle();
+    h.wait_for("the clamped size", |h| {
+        (h.ui().window_size().h - 50.0).abs() < 0.5
+    });
+}
+
 #[test]
 fn scrolling_is_one_set_transform_and_nothing_else() {
     // The design claim this checks: scrolling moves a group, it does not
