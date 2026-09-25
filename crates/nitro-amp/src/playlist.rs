@@ -8,6 +8,7 @@
 //! [`parse_m3u`] and [`parse_pls`] beside it.
 
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 /// The file extensions treated as audio when a folder is added.
 ///
@@ -78,9 +79,24 @@ pub fn title_from_path(path: &Path) -> String {
 }
 
 /// The playlist.
+///
+/// # The entries are shared, and copied only when that is unavoidable
+///
+/// They sit behind an `Rc` so that the window's list widget can hold the
+/// *same* entries as its model ([`Playlist::shared`]) and format a row
+/// only when it is drawn. Without that, the widget needed its own copy
+/// of every title, rebuilt whenever the current track moved — 3 ms per
+/// "next" at 10 000 tracks, linear in the list, and a second copy of
+/// every string in memory.
+///
+/// Every edit goes through `Rc::make_mut`: copy-on-write. An edit made
+/// while the widget still holds its handle therefore copies the list —
+/// correct, but O(n) — so the window hands its handle back first when it
+/// edits (see `nitro_amp`'s `release_rows`), and the edit is in place.
+/// Moving the current track touches no entry at all, so it never copies.
 #[derive(Debug, Clone, Default)]
 pub struct Playlist {
-    entries: Vec<Entry>,
+    entries: Rc<Vec<Entry>>,
     /// Index of the current track, if any.
     current: Option<usize>,
     /// Whether "next" follows [`Playlist::order`] rather than the list.
@@ -134,8 +150,20 @@ impl Playlist {
     }
 
     /// The entry at `i`, to fill in a title or a duration.
+    ///
+    /// Copies the list first if it is shared; see [`Playlist`].
     pub fn get_mut(&mut self, i: usize) -> Option<&mut Entry> {
-        self.entries.get_mut(i)
+        if i >= self.entries.len() {
+            return None;
+        }
+        Rc::make_mut(&mut self.entries).get_mut(i)
+    }
+
+    /// Another handle on the entries, for a view that reads them — the
+    /// list widget's model. Costs a reference count, not a copy.
+    #[must_use]
+    pub fn shared(&self) -> Rc<Vec<Entry>> {
+        Rc::clone(&self.entries)
     }
 
     /// The current track's index.
@@ -176,7 +204,7 @@ impl Playlist {
 
     /// Append entries.
     pub fn extend(&mut self, entries: impl IntoIterator<Item = Entry>) {
-        self.entries.extend(entries);
+        Rc::make_mut(&mut self.entries).extend(entries);
         if self.shuffle {
             self.reshuffle();
         }
@@ -188,7 +216,7 @@ impl Playlist {
         if i >= self.entries.len() {
             return None;
         }
-        let e = self.entries.remove(i);
+        let e = Rc::make_mut(&mut self.entries).remove(i);
         self.current = match self.current {
             Some(c) if c == i => None,
             Some(c) if c > i => Some(c - 1),
@@ -202,7 +230,9 @@ impl Playlist {
 
     /// Empty the list.
     pub fn clear(&mut self) {
-        self.entries.clear();
+        // A fresh vector rather than `make_mut(..).clear()`: emptying a
+        // shared list must not first copy it.
+        self.entries = Rc::new(Vec::new());
         self.order.clear();
         self.current = None;
     }
@@ -302,7 +332,7 @@ impl Playlist {
     pub fn to_m3u(&self) -> String {
         use std::fmt::Write as _;
         let mut out = String::from("#EXTM3U\n");
-        for e in &self.entries {
+        for e in self.entries.iter() {
             let secs = e.duration.map_or(-1, |d| d.round() as i64);
             // Writing to a `String` cannot fail.
             let _ = writeln!(out, "#EXTINF:{secs},{}", e.title);
@@ -383,13 +413,22 @@ pub fn parse_m3u(text: &str, base: &Path) -> Vec<Entry> {
         if line.starts_with('#') {
             continue;
         }
-        let mut e = Entry::new(resolve(line, base));
-        if let Some((secs, title)) = pending.take() {
-            e.duration = secs;
-            if !title.is_empty() {
-                e.title = title;
-            }
-        }
+        let path = resolve(line, base);
+        // The file-name title only when the playlist gave none: deriving
+        // it and throwing it away was a sixth of loading a 100 000-line
+        // M3U.
+        let e = match pending.take() {
+            Some((duration, title)) if !title.is_empty() => Entry {
+                path,
+                title,
+                duration,
+            },
+            Some((duration, _)) => Entry {
+                duration,
+                ..Entry::new(path)
+            },
+            None => Entry::new(path),
+        };
         out.push(e);
     }
     out
@@ -547,6 +586,30 @@ mod tests {
         p.remove(1);
         assert_eq!(p.current(), None);
         assert!(p.remove(9).is_none());
+    }
+
+    #[test]
+    fn edits_copy_a_shared_list_and_only_a_shared_one() {
+        let mut p = list(3);
+        let before = p.shared();
+        // Moving the current track is not an edit.
+        p.set_current(2);
+        assert!(Rc::ptr_eq(&before, &p.shared()));
+        // An edit while another handle is out copies, and the old handle
+        // still sees the old entries — the view is never torn.
+        p.get_mut(0).unwrap().title = "new".into();
+        assert!(!Rc::ptr_eq(&before, &p.shared()));
+        assert_eq!(before[0].title, "0");
+        drop(before);
+        // Unshared, an edit is in place.
+        let ptr = Rc::as_ptr(&p.shared());
+        p.get_mut(1).unwrap().title = "also".into();
+        assert_eq!(Rc::as_ptr(&p.shared()), ptr);
+        // Clearing a shared list does not copy it first.
+        let held = p.shared();
+        p.clear();
+        assert_eq!(held.len(), 3);
+        assert!(p.is_empty());
     }
 
     #[test]

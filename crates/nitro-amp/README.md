@@ -107,6 +107,16 @@ clock and the visualiser subtract that, and pausing rewinds the decoder
 to the heard position, so the audio still in the pipe when the output is
 stopped is played again on resume rather than lost.
 
+**A long playlist costs nothing per track change.** The list widget's
+model is the playlist's own entries, shared behind an `Rc` and formatted
+into a row only when that row is on screen, so next, previous and
+"play this row" re-point the model instead of rebuilding it. Measured in
+release on the harness: those take ~0.02–0.04 ms in the handler at 100,
+10 000 and 100 000 tracks alike (a full rebuild was 3 ms at 10 000).
+Editing the list goes through copy-on-write with the widget's handle
+taken back first, so an edit is in place, not a copy. Memory is about
+0.33 KB per track: 6.8 MB resident with 10 000 tracks, 3.6 MB empty.
+
 **The visualiser costs one `SetBounds` per moving bar.** One gradient rect
 fills the display and never changes. A background-coloured cover hangs
 over each bar and shortens as the bar rises, so a frame sends only the

@@ -85,6 +85,7 @@ pub mod vis;
 pub mod wav;
 
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use nitro_ui::build::{ContainerBuilder as _, StyleBuilder as _};
 use nitro_ui::event::{Handled, KeyEvent, key, mods};
@@ -92,12 +93,12 @@ use nitro_ui::widgets::{
     Checkbox, Label, Slider, TextField, button, checkbox, column, label, panel, row, slider,
     spacer, text_field,
 };
-use nitro_ui::{App, ColorRole, CrossAlign, List, Row, Size, Ui, WidgetId, list};
+use nitro_ui::{App, ColorRole, CrossAlign, List, ListModel, Row, Size, Ui, WidgetId, list};
 
 use crate::dsp::{EQ_LABELS, EQ_RANGE_DB, EqSettings, PRESETS};
 use crate::engine::{Cmd, Player, State, Status};
 use crate::fmt::Marquee;
-use crate::playlist::Playlist;
+use crate::playlist::{Entry, Playlist};
 use crate::sink::Backend;
 use crate::source::Tools;
 use crate::vis::{Vis, VisMut as _};
@@ -490,7 +491,8 @@ fn load(s: &mut Amp, ui: &mut Ui<Amp>, i: usize, play: bool) {
     {
         l.set_text(fmt::clock(0.0, false));
     }
-    refresh_list(s, ui);
+    // A new current track is not an edit: re-point the rows, O(1).
+    show_rows(s, ui);
     ensure_ticking(s, ui);
 }
 
@@ -571,25 +573,32 @@ fn tick(s: &mut Amp, ui: &mut Ui<Amp>) {
     // Tags arrive with the load: give the entry its real name. First,
     // because a short track can load, play and end between two ticks,
     // and the end is handled below by loading the next one.
+    //
+    // Compared through a shared borrow and written only on a real change:
+    // the entries are shared with the list widget, and a write is an
+    // edit that must first take the widget's handle back (`edit_list`).
+    // Asking for `&mut` on every tick to find out would do that thirty
+    // times a second.
     if st.token == s.token
         && let Some(i) = s.playlist.current()
-        && let Some(e) = s.playlist.get_mut(i)
+        && let Some(e) = s.playlist.get(i)
     {
-        let mut changed = false;
-        if let Some(t) = st.meta.display_title()
-            && e.title != t
-        {
-            e.title = t;
-            changed = true;
-        }
-        if st.duration.is_some() && e.duration != st.duration {
-            e.duration = st.duration;
-            changed = true;
-        }
-        if changed {
-            let line = fmt::title_line(i + 1, &e.title, e.duration);
-            s.marquee.set(&line);
-            refresh_list(s, ui);
+        let title = st.meta.display_title().filter(|t| *t != e.title);
+        let duration = st.duration.filter(|d| e.duration != Some(*d));
+        if title.is_some() || duration.is_some() {
+            edit_list(s, ui, |p| {
+                if let Some(e) = p.get_mut(i) {
+                    if let Some(t) = title {
+                        e.title = t;
+                    }
+                    if duration.is_some() {
+                        e.duration = duration;
+                    }
+                }
+            });
+            if let Some(e) = s.playlist.get(i) {
+                s.marquee.set(&fmt::title_line(i + 1, &e.title, e.duration));
+            }
         }
     }
 
@@ -742,28 +751,88 @@ fn set_status(ui: &mut Ui<Amp>, s: &Amp, error: Option<&str>) {
     }
 }
 
-/// Rebuild the playlist's rows: the current track marked, lengths on
-/// the right, and the total underneath.
+/// The list widget's model: the playlist's own entries, shared rather
+/// than copied, formatted into a row only when that row is drawn.
+///
+/// `row(i)` runs for the materialised rows — a screenful — so the cost of
+/// showing the list, and of moving the "now playing" mark, is the same
+/// at ten tracks or a hundred thousand. See [`Playlist`]'s notes on the
+/// sharing.
+struct PlaylistRows {
+    entries: Rc<Vec<Entry>>,
+    current: Option<usize>,
+}
+
+impl ListModel for PlaylistRows {
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn row(&self, index: usize) -> Row {
+        let Some(e) = self.entries.get(index) else {
+            return Row::default();
+        };
+        let r = Row::new(format!("{}. {}", index + 1, e.title)).detail(fmt::length(e.duration));
+        if self.current == Some(index) {
+            r.icon("play-fill")
+        } else {
+            r
+        }
+    }
+}
+
+/// Stands in for [`PlaylistRows`] while the playlist is being edited: the
+/// same length, so the list keeps its cursor, selection and scroll, and
+/// no handle on the entries, so the edit is not a copy. It is never
+/// drawn — the edit and the real model's return happen in one callback,
+/// before any paint.
+struct Releasing(usize);
+
+impl ListModel for Releasing {
+    fn len(&self) -> usize {
+        self.0
+    }
+
+    fn row(&self, _index: usize) -> Row {
+        Row::default()
+    }
+}
+
+/// Edit the playlist's entries in place, and show the result.
+///
+/// Takes the list widget's handle on the entries back first, so the
+/// edit does not copy them (`Rc::make_mut` on an unshared `Rc` is a
+/// no-op). Anything that *moves the current track* is not an edit and
+/// should not come here; [`show_rows`] is enough for that.
+fn edit_list(s: &mut Amp, ui: &mut Ui<Amp>, f: impl FnOnce(&mut Playlist)) {
+    if let Some(ids) = s.ids
+        && let Ok(mut l) = ui.widget_mut::<List<Amp>>(ids.list)
+    {
+        l.set_model(Box::new(Releasing(s.playlist.len())));
+    }
+    f(&mut s.playlist);
+    refresh_list(s, ui);
+}
+
+/// Point the list at the entries as they are now. O(1): a reference
+/// count and a model swap, whatever the length — which is what makes
+/// next, previous and "play this row" cost the same on any playlist.
+fn show_rows(s: &Amp, ui: &mut Ui<Amp>) {
+    let Some(ids) = s.ids else { return };
+    let model = PlaylistRows {
+        entries: s.playlist.shared(),
+        current: s.playlist.current(),
+    };
+    if let Ok(mut l) = ui.widget_mut::<List<Amp>>(ids.list) {
+        l.set_model(Box::new(model));
+    }
+}
+
+/// [`show_rows`], and the total underneath, which does read every entry
+/// — so this is for after an edit, not for a track change.
 fn refresh_list(s: &Amp, ui: &mut Ui<Amp>) {
     let Some(ids) = s.ids else { return };
-    let cur = s.playlist.current();
-    let rows: Vec<Row> = s
-        .playlist
-        .entries()
-        .iter()
-        .enumerate()
-        .map(|(i, e)| {
-            let r = Row::new(format!("{}. {}", i + 1, e.title)).detail(fmt::length(e.duration));
-            if cur == Some(i) {
-                r.icon("play-fill")
-            } else {
-                r
-            }
-        })
-        .collect();
-    if let Ok(mut l) = ui.widget_mut::<List<Amp>>(ids.list) {
-        l.set_rows(rows);
-    }
+    show_rows(s, ui);
     let known: f64 = s.playlist.entries().iter().filter_map(|e| e.duration).sum();
     let unknown = s.playlist.entries().iter().any(|e| e.duration.is_none());
     let total = format!(
@@ -787,13 +856,12 @@ fn add_from_field(s: &mut Amp, ui: &mut Ui<Amp>, text: &str) {
     let path = expand_tilde(text);
     let entries = playlist::expand(&path);
     let n = entries.len();
-    s.playlist.extend(entries);
+    edit_list(s, ui, |p| p.extend(entries));
     if let Some(ids) = s.ids
         && let Ok(mut f) = ui.widget_mut::<TextField<Amp>>(ids.path)
     {
         f.set_text("");
     }
-    refresh_list(s, ui);
     let msg = if n == 0 {
         Some(format!("{}: no audio files there", path.display()))
     } else {
@@ -817,19 +885,23 @@ fn remove_selected(s: &mut Amp, ui: &mut Ui<Amp>) {
         return;
     };
     let i = l.cursor();
-    let was_current = s.playlist.current() == Some(i);
-    if s.playlist.remove(i).is_none() {
+    if i >= s.playlist.len() {
         return;
     }
+    let was_current = s.playlist.current() == Some(i);
+    edit_list(s, ui, |p| {
+        p.remove(i);
+    });
     if was_current {
         // The loaded track is gone from the list; it may keep playing,
         // but nothing will follow it until the user picks again.
         s.autoplay = false;
     }
-    refresh_list(s, ui);
 }
 
 fn clear_list(s: &mut Amp, ui: &mut Ui<Amp>) {
+    // Not `edit_list`: clearing replaces the entries rather than editing
+    // them, so it never copies, shared or not.
     s.playlist.clear();
     s.autoplay = false;
     s.player.send(Cmd::Stop);
