@@ -3,15 +3,23 @@
 //! Commit sequence (also in `README.md`):
 //!
 //! 1. `open`: enable `UNIVERSAL_PLANES` + `ATOMIC` client caps, cache the
-//!    property ids of every connector / CRTC / plane, enumerate, then one
-//!    blocking atomic commit with `ALLOW_MODESET` that sets **all** state:
-//!    our connectors get `CRTC_ID`, our CRTCs get `MODE_ID` + `ACTIVE`,
-//!    our primary planes get `FB_ID`/`CRTC_*`/`SRC_*`; every other
-//!    connector, CRTC and primary plane is explicitly disabled so nothing
-//!    inherited from fbcon or a previous master conflicts.
-//! 2. `commit`: `NONBLOCK | PAGE_FLIP_EVENT` with the plane's `FB_ID` and,
-//!    when the plane exposes it, an `FB_DAMAGE_CLIPS` blob.
-//! 3. `dispatch`: page-flip events off the DRM fd become
+//!    property ids of every connector / CRTC / plane, enumerate, pick
+//!    modes (keeping the one already lit when it is as good,
+//!    `select::keep_on_screen`). **Nothing is committed yet**: the panel
+//!    keeps showing what the previous master or fbcon left on it.
+//! 2. Each output's first `commit` lights it, with the frame it was
+//!    given: one blocking atomic commit with `ALLOW_MODESET` for every
+//!    output lit so far: its connector gets `CRTC_ID`, its CRTC
+//!    `MODE_ID` and `ACTIVE`, its primary plane `FB_ID`/`CRTC_*`/
+//!    `SRC_*`. An output not lit yet is left out, and keeps the previous
+//!    picture. The commit that lights the last output also disables
+//!    every other connector, CRTC and primary plane, so nothing
+//!    inherited from fbcon or a previous master conflicts. An ordinary
+//!    flip to the same buffer follows, for the page-flip event.
+//! 3. Every later `commit` on that output: `NONBLOCK | PAGE_FLIP_EVENT`
+//!    with the plane's `FB_ID` and, when the plane exposes it, an
+//!    `FB_DAMAGE_CLIPS` blob.
+//! 4. `dispatch`: page-flip events off the DRM fd become
 //!    `Event::Flipped`; uevents off the netlink socket become
 //!    `Event::Hotplug`.
 
@@ -284,6 +292,12 @@ struct Output {
     /// Index of the most recently committed buffer.
     front: usize,
     pending: bool,
+    /// This output has been committed at least once. Until then its CRTC
+    /// shows whatever the previous master (or fbcon) left there, and
+    /// modesets leave its connector, CRTC and plane alone: its first
+    /// [`Backend::commit`] lights it, with the frame it was given. See
+    /// "The first picture is a finished frame" in `README.md`.
+    lit: bool,
     /// Template request for `commit`: plane `FB_ID` (+ damage), nothing
     /// else. Cloned per commit because `atomic_commit` takes it by value.
     flip_req: AtomicModeReq,
@@ -320,6 +334,32 @@ fn mode_candidate(m: &Mode) -> ModeCandidate {
         preferred: m.mode_type().contains(ModeTypeFlags::PREFERRED),
         interlaced,
     }
+}
+
+/// The fields `drm_mode_equal` compares: clock, the horizontal and
+/// vertical timings, and the flags (sync polarity, interlace, doublescan,
+/// the picture aspect ratio bits).
+fn same_timings(a: &Mode, b: &Mode) -> bool {
+    a.clock() == b.clock()
+        && a.size() == b.size()
+        && a.hsync() == b.hsync()
+        && a.vsync() == b.vsync()
+        && a.hskew() == b.hskew()
+        && a.vscan() == b.vscan()
+        && a.flags() == b.flags()
+}
+
+/// Whether a modeset request lists a connector, CRTC or primary plane.
+///
+/// `owner_lit` is whether the output it belongs to is lit, `None` when it
+/// is nobody's; `sweep` is whether every output is lit. An output's
+/// objects are listed once it is lit and never before, so an unlit output
+/// keeps the previous picture. An object that is nobody's is listed (to
+/// disable it) only by a sweep: disabling a CRTC or connector while an
+/// unlit output may still be using it is what a partial commit must not
+/// do.
+fn listed(owner_lit: Option<bool>, sweep: bool) -> bool {
+    owner_lit.unwrap_or(sweep)
 }
 
 fn connector_name(info: &connector::Info) -> String {
@@ -590,14 +630,6 @@ impl<'fd> DrmBackend<'fd> {
                     select::describe_modes(&cands)
                 ));
             }
-            let mode = if let Some(m) = mode {
-                m
-            } else {
-                let Some(mi) = select::select_mode(&cands, wanted.as_ref()) else {
-                    continue;
-                };
-                info.modes()[mi]
-            };
             let mut mask = 0u32;
             let mut current = None;
             for &enc in info.encoders() {
@@ -610,6 +642,31 @@ impl<'fd> DrmBackend<'fd> {
                     }
                 }
             }
+            let mode = if let Some(m) = mode {
+                m
+            } else {
+                let Some(mi) = select::select_mode(&cands, wanted.as_ref()) else {
+                    continue;
+                };
+                // Prefer the mode the panel is already showing, when it
+                // answers the configuration as well: an unchanged mode is
+                // what lets the first commit skip the full modeset and
+                // the monitor's resync (`select::keep_on_screen`).
+                //
+                // Only while this connector is unlit, when that mode is
+                // someone else's. Once we have committed to it, the lit
+                // mode is our own earlier pick, and deferring to it would
+                // make a configuration reload that drops
+                // `mode = 2560x1440@144` keep 144 Hz for ever instead of
+                // going back to the default.
+                let ours = self.outputs.iter().any(|o| o.connector == handle && o.lit);
+                let lit = if ours {
+                    None
+                } else {
+                    current.and_then(|ci| self.on_screen_mode(ci, info.modes()))
+                };
+                info.modes()[select::keep_on_screen(&cands, mi, lit, wanted.as_ref())]
+            };
             out.push(Probed {
                 name,
                 mode,
@@ -622,6 +679,22 @@ impl<'fd> DrmBackend<'fd> {
             });
         }
         Ok(out)
+    }
+
+    /// Index into `listed` of the mode CRTC `crtc_idx` is scanning out
+    /// right now, or `None` when it is off or showing a mode the
+    /// connector does not list (a previous master's modeline, say).
+    ///
+    /// Compared on **timings and flags**, which is what the kernel's
+    /// `drm_mode_equal` compares when it decides whether a commit is a
+    /// full modeset. The mode name and the `type` bits (`PREFERRED`,
+    /// `DRIVER`) are left out on purpose: the CRTC's copy of the mode does
+    /// not carry the connector list's type bits, so a whole-struct `==`
+    /// would never match.
+    fn on_screen_mode(&self, crtc_idx: usize, listed: &[Mode]) -> Option<usize> {
+        let crtc = *self.res.crtcs().get(crtc_idx)?;
+        let lit = self.card.get_crtc(crtc).ok()?.mode()?;
+        listed.iter().position(|m| same_timings(m, &lit))
     }
 
     /// Ask the kernel whether `mode` is drivable on this connector, with
@@ -750,6 +823,7 @@ impl<'fd> DrmBackend<'fd> {
             bufs: [buf0, buf1],
             front: 0,
             pending: false,
+            lit: false,
             flip_req,
         })
     }
@@ -881,21 +955,33 @@ impl<'fd> DrmBackend<'fd> {
 
     // -- commits ------------------------------------------------------------
 
-    /// One blocking `ALLOW_MODESET` commit describing the complete state.
+    /// One blocking `ALLOW_MODESET` commit for every **lit** output.
+    ///
+    /// Once every output is lit it describes the complete state: every
+    /// connector, CRTC and primary plane that is not ours is disabled, so
+    /// nothing inherited from fbcon or a previous master conflicts. While
+    /// some output is still unlit it touches only the lit outputs' objects
+    /// (and clears the non-primary planes, which is always safe): an unlit
+    /// output keeps the previous picture until its own first commit, and
+    /// the objects that are nobody's are swept by the commit that lights
+    /// the last one.
     fn modeset_all(&mut self) -> Result<(), Error> {
+        let sweep = self.outputs.iter().all(|o| o.lit);
         let mut req = AtomicModeReq::new();
         for &c in self.res.connectors() {
             let cp = &self.conn_props[&c.into()];
-            let crtc = self
-                .outputs
-                .iter()
-                .find(|o| o.connector == c)
-                .map(|o| o.crtc);
-            req.add_property(c, cp.crtc_id, property::Value::CRTC(crtc));
+            let out = self.outputs.iter().find(|o| o.connector == c);
+            if !listed(out.map(|o| o.lit), sweep) {
+                continue;
+            }
+            req.add_property(c, cp.crtc_id, property::Value::CRTC(out.map(|o| o.crtc)));
         }
         for &c in self.res.crtcs() {
             let cp = &self.crtc_props[&c.into()];
             let out = self.outputs.iter().find(|o| o.crtc == c);
+            if !listed(out.map(|o| o.lit), sweep) {
+                continue;
+            }
             req.add_property(
                 c,
                 cp.mode_id,
@@ -912,7 +998,11 @@ impl<'fd> DrmBackend<'fd> {
                 req.add_property(p, pp.crtc_id, property::Value::CRTC(None));
                 continue;
             }
-            if let Some(o) = self.outputs.iter().find(|o| o.plane == p) {
+            let out = self.outputs.iter().find(|o| o.plane == p);
+            if !listed(out.map(|o| o.lit), sweep) {
+                continue;
+            }
+            if let Some(o) = out {
                 let (w, h) = (u64::from(o.info.width), u64::from(o.info.height));
                 let fb = o.bufs[o.front].fb;
                 req.add_property(p, pp.fb_id, property::Value::Framebuffer(Some(fb)));
@@ -933,6 +1023,84 @@ impl<'fd> DrmBackend<'fd> {
         self.card
             .atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req)
             .map_err(Error::io("atomic modeset"))
+    }
+
+    /// The modeset that lights output `idx`, already marked lit.
+    ///
+    /// A commit that leaves other outputs unlit can be refused where it
+    /// would not be as part of the complete state: our connector may be
+    /// assigned a CRTC that still drives a connector we have not lit yet,
+    /// or leave the CRTC it was on active with no connector. Then every
+    /// output is lit at once, with whatever its front buffer holds, which
+    /// is a blank frame on the others but never a panel that stays dark.
+    fn light(&mut self, idx: usize) -> Result<(), Error> {
+        let Err(e) = self.modeset_all() else {
+            return Ok(());
+        };
+        let unlit: Vec<usize> = (0..self.outputs.len())
+            .filter(|&i| !self.outputs[i].lit)
+            .collect();
+        if unlit.is_empty() {
+            return Err(e);
+        }
+        for &i in &unlit {
+            self.outputs[i].lit = true;
+        }
+        let r = self.modeset_all();
+        if r.is_err() {
+            for &i in &unlit {
+                self.outputs[i].lit = false;
+            }
+        }
+        debug_assert!(self.outputs[idx].lit);
+        r
+    }
+
+    /// Queue a page flip of output `idx` to buffer `target`, with
+    /// `damage` as its `FB_DAMAGE_CLIPS` when the plane has them. Leaves
+    /// `front` and `pending` to the caller.
+    fn flip(&mut self, idx: usize, target: usize, damage: &[Rect]) -> Result<(), Error> {
+        let o = &mut self.outputs[idx];
+        let pp = &self.plane_props[&o.plane.into()];
+        o.flip_req.add_property(
+            o.plane,
+            pp.fb_id,
+            property::Value::Framebuffer(Some(o.bufs[target].fb)),
+        );
+        let mut blob = None;
+        if let Some(clips) = pp.fb_damage_clips {
+            Self::build_damage(
+                &mut self.damage_scratch,
+                damage,
+                o.info.width,
+                o.info.height,
+            );
+            let value = if self.damage_scratch.is_empty() {
+                property::Value::Blob(0)
+            } else {
+                let v = self
+                    .card
+                    .create_property_blob(self.damage_scratch.as_slice())
+                    .map_err(Error::io("create damage blob"))?;
+                if let property::Value::Blob(id) = v {
+                    blob = Some(id);
+                }
+                v
+            };
+            o.flip_req.add_property(o.plane, clips, value);
+        }
+        let result = self
+            .card
+            .atomic_commit(
+                AtomicCommitFlags::NONBLOCK | AtomicCommitFlags::PAGE_FLIP_EVENT,
+                o.flip_req.clone(),
+            )
+            .map_err(Error::io("atomic page flip"));
+        if let Some(id) = blob {
+            // The kernel holds its own reference while the state is in use.
+            let _ = self.card.destroy_property_blob(id);
+        }
+        result
     }
 
     fn output_mut(&mut self, id: OutputId) -> Result<&mut Output, Error> {
@@ -1000,52 +1168,49 @@ impl Backend for DrmBackend<'_> {
             .iter()
             .position(|o| o.id == output)
             .ok_or(Error::NoSuchOutput(output))?;
-        let o = &mut self.outputs[idx];
-        if o.pending {
+        if self.outputs[idx].pending {
             return Err(Error::FlipPending(output));
         }
-        let pp = &self.plane_props[&o.plane.into()];
-        let back = o.back();
-        o.flip_req.add_property(
-            o.plane,
-            pp.fb_id,
-            property::Value::Framebuffer(Some(o.bufs[back].fb)),
-        );
-        let mut blob = None;
-        if let Some(clips) = pp.fb_damage_clips {
-            Self::build_damage(
-                &mut self.damage_scratch,
-                damage,
-                o.info.width,
-                o.info.height,
-            );
-            let value = if self.damage_scratch.is_empty() {
-                property::Value::Blob(0)
-            } else {
-                let v = self
-                    .card
-                    .create_property_blob(self.damage_scratch.as_slice())
-                    .map_err(Error::io("create damage blob"))?;
-                if let property::Value::Blob(id) = v {
-                    blob = Some(id);
-                }
-                v
-            };
-            o.flip_req.add_property(o.plane, clips, value);
+        // An output's first commit lights it with *this* frame, and only
+        // it: the other outputs keep the previous picture until their own
+        // first frames, instead of showing a zeroed buffer in between. The
+        // modeset is the blocking `ALLOW_MODESET` commit every other
+        // modeset in this file is, and it produces no page-flip event —
+        // asking for one would be refused for any CRTC it switches off —
+        // so an ordinary flip to the same buffer is queued behind it.
+        // That flip is what delivers the `Flipped` the caller's frame
+        // clock waits for, so the server's view of a first frame is
+        // exactly its view of every other one. The cost is one refresh
+        // period before the second frame may be committed.
+        let lighting = !self.outputs[idx].lit;
+        let was = self.outputs[idx].front;
+        let target = if lighting {
+            // The lighting commit scans out the frame just painted, so it
+            // becomes `front` before the modeset that reads `front`.
+            let o = &mut self.outputs[idx];
+            o.front = o.back();
+            o.lit = true;
+            o.front
+        } else {
+            self.outputs[idx].back()
+        };
+        let result = if lighting { self.light(idx) } else { Ok(()) }
+            .and_then(|()| self.flip(idx, target, damage));
+        if let Err(e) = result {
+            // A failed commit leaves the bookkeeping as it found it, so
+            // the caller's retry, which paints into the same back buffer
+            // it just painted, commits that buffer. Even when the
+            // lighting modeset went through and only the flip behind it
+            // failed: the panel then shows this frame already, and the
+            // retry lights it again, which is the same mode and the same
+            // buffer and so costs no resync.
+            let o = &mut self.outputs[idx];
+            o.front = was;
+            o.lit = !lighting;
+            return Err(e);
         }
-        let result = self
-            .card
-            .atomic_commit(
-                AtomicCommitFlags::NONBLOCK | AtomicCommitFlags::PAGE_FLIP_EVENT,
-                o.flip_req.clone(),
-            )
-            .map_err(Error::io("atomic page flip"));
-        if let Some(id) = blob {
-            // The kernel holds its own reference while the state is in use.
-            let _ = self.card.destroy_property_blob(id);
-        }
-        result?;
-        o.front = back;
+        let o = &mut self.outputs[idx];
+        o.front = target;
         o.pending = true;
         Ok(())
     }
@@ -1104,7 +1269,11 @@ impl Backend for DrmBackend<'_> {
         self.refresh_resources()?;
         let probed = self.probe_connectors()?;
         let changed = self.reconcile(&probed)?;
-        if changed && !self.paused {
+        // An output that has not been committed has nothing of ours to
+        // show: its modeset waits for a real frame (`commit`), so a
+        // hotplug changes the bookkeeping for it and nothing on its glass.
+        // With nothing lit at all there is nothing to commit.
+        if changed && !self.paused && self.outputs.iter().any(|o| o.lit) {
             self.modeset_all()?;
         }
         Ok(changed)
@@ -1135,7 +1304,14 @@ impl Backend for DrmBackend<'_> {
             // repaints fully after a resume.
             o.pending = false;
         }
-        let r = self.modeset_all();
+        // An unlit output never had anything of ours on screen, so there
+        // is nothing to restore for it: its first commit lights it, as it
+        // would have without the VT switch. `modeset_all` leaves it alone.
+        let r = if self.outputs.iter().any(|o| o.lit) {
+            self.modeset_all()
+        } else {
+            Ok(())
+        };
         // The post-condition `Backend::resume` promises its caller, checked
         // rather than merely described: nothing is flip-pending, so the
         // server's next paint pass is never turned away by `FlipPending`
@@ -1217,6 +1393,20 @@ impl Drop for DrmBackend<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_modeset_lists_lit_outputs_and_sweeps_only_when_all_are_lit() {
+        // An output's objects: listed once it is lit, whatever the rest.
+        assert!(listed(Some(true), false));
+        assert!(listed(Some(true), true));
+        assert!(
+            !listed(Some(false), false),
+            "an unlit output keeps its picture"
+        );
+        // Nobody's objects: disabled only by the sweep.
+        assert!(!listed(None, false), "no sweep while an output is unlit");
+        assert!(listed(None, true));
+    }
 
     #[test]
     fn the_default_options_keep_hotplug_on() {

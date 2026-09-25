@@ -124,6 +124,7 @@ closed.
 | `NITRO_MODELINE`  | `<connector>=<clock_khz> <hdisp> <hss> <hse> <htotal> <vdisp> <vss> <vse> <vtotal> [±hsync] [±vsync]` | none. Raw timings the monitor never advertised, validated with an atomic `TEST_ONLY` commit before anything is applied. **One** connector per variable, because a modeline has spaces in it and could not share `NITRO_MODE`'s comma-separated list without a quoting rule. See `docs/settings.md` for the recovery procedure when a panel will not sync. |
 | `NITRO_CONFIG`    | path of `server.conf`            | `$XDG_CONFIG_HOME/nitro/server.conf`, else `$HOME/.config/nitro/server.conf`. With neither variable set there is **no file and no watch** and the server runs on its defaults — the state a system service with an empty environment is in. See `docs/settings.md`. |
 | `NITRO_SHADOW`    | `0` to paint straight into the scanout buffer | enabled: each output gets a heap shadow buffer (one scanout-sized allocation, ~8 MB at 1080p) that the rasterizer paints into, with only the damage rects streamed out to the write-combined dumb buffer. Worth 9.3× on the frame path and 8 MB of RSS per output (`docs/latency.md` §4.5, `docs/budget.md`); `0` is the A/B lever, not a supported configuration. |
+| `NITRO_LOCKED`    | `1` to start with the session locked | unlocked. Locked, nothing but the background is drawn and no window gets input until a shell client sends `Lock`; from then only that client's windows do, until it sends `Unlock`. For booting into a locked session (`docs/greeter.md`, decision 6); the model is `docs/shell.md` §The session lock. |
 | `NITRO_FONT_DIRS` | colon-separated font directories | `/usr/share/fonts:/usr/local/share/fonts:~/.local/share/fonts` (read by `nitro-text`) |
 | `NITRO_FONT_CACHE_MB` | cap on resident font-file bytes | `8` (read by `nitro-text`; `0` keeps only the file currently in use — the file that overran the cap is never its own victim, so a too-small cap does not turn into one disk read per glyph) |
 | `NITRO_FONT_INDEX_CACHE` | path of the font index cache, or `off` | `$XDG_CACHE_HOME/nitro/fonts.idx` (read by `nitro-text`) |
@@ -797,6 +798,7 @@ looking for.
 | `frames`                 | Page flips completed since startup.                                      |
 | `flips_pending`          | Outputs with a flip in flight right now (0 when idle).                   |
 | `uptime_ms`              | Milliseconds since `run()` started.                                      |
+| `first_frame_ms`         | Milliseconds from `run()` to the first accepted commit; `0` before it.   |
 | `active`                 | 1 unless the session is paused by a VT switch.                           |
 | `flip_interval_mean_us`  | Mean interval between flips, in microseconds.                            |
 | `flip_interval_min_us`   | Shortest interval seen.                                                  |
@@ -842,6 +844,8 @@ looking for.
 | `exclusive_zones`        | Windows reserving screen space off an output edge. |
 | `grabbed`                | 1 while a shell client holds a keyboard grab. A 1 with no launcher on screen is a stuck grab. |
 | `keys_withheld`          | Keys dropped because a shell's `BindKey` binding had fired and the shell had not answered yet, so routing them by focus would have typed them into whatever application was focused (`docs/shell.md` §A binding buys its client a turn). Cumulative, and normally 0: a non-zero value means someone types faster than the shell wakes, which is the race the counter exists to make visible. |
+| `locked`                 | 1 while the session is locked (`docs/shell.md` §The session lock). |
+| `lock_owned`             | 1 while a shell connection owns the lock. `locked 1` with `lock_owned 0` is a session waiting for a lock screen, or one whose lock screen died: only the background is drawn. |
 | `config_reloads`         | Completed `server.conf` reloads since startup, whatever triggered them — the `reload` request, SIGHUP and the inotify watch all land in this one counter, because what a caller wants to know is "did the server pick my edit up", not which of the three doors it came through. A reload of a file that will not parse still counts: the file *was* re-read, and every line it could not use was warned about and skipped. |
 
 The key naming is inconsistent on purpose — `paint_us_min` but

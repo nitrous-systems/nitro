@@ -735,7 +735,9 @@ fn apply_msg(
         | ClientMsg::FocusWindow(_)
         | ClientMsg::CloseWindow(_)
         | ClientMsg::SetWindowStateFor(_)
-        | ClientMsg::Outputs(_) => Ok(()),
+        | ClientMsg::Outputs(_)
+        | ClientMsg::Lock(_)
+        | ClientMsg::Unlock(_) => Ok(()),
         // The M5-A ops (#3767): the protocol surface landed ahead of the
         // behaviour, so they are refused. `handle_wire_msg` already
         // disconnects on receipt and none of these ever reaches `pending`;

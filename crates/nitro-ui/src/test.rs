@@ -732,6 +732,13 @@ impl<S: 'static> Harness<S> {
         self.ui.mutations()
     }
 
+    /// Every byte the tree has written to the server since
+    /// [`Harness::tap`].
+    #[must_use]
+    pub fn sent_bytes(&self) -> &[u8] {
+        self.ui.sent_bytes()
+    }
+
     /// Forget the recorded mutations, leaving the tap on.
     pub fn clear_tap(&mut self) {
         self.ui.clear_mutations();

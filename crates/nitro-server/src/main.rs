@@ -27,6 +27,9 @@
 //! - `NITRO_SHADOW=0` paints straight into the scanout buffer instead of
 //!   into a per-output heap shadow (the default). For A/B measurement on
 //!   real hardware; see `crates/nitro-server/src/frame.rs`.
+//! - `NITRO_LOCKED=1` starts with the session locked: nothing is drawn and
+//!   no window gets input until a shell client sends `Lock`. See
+//!   `crates/nitro-server/src/lock.rs` and `docs/shell.md`.
 //! - `NITRO_LOG=error|warn|info|debug`.
 
 use std::path::PathBuf;
@@ -120,6 +123,7 @@ fn config_from_env() -> Result<Config, String> {
         // escape hatch, not a configuration surface, and the default is
         // the one that ships.
         shadow: std::env::var("NITRO_SHADOW").as_deref() != Ok("0"),
+        locked: std::env::var("NITRO_LOCKED").as_deref() == Ok("1"),
         // `NITRO_CONFIG`, else the XDG path. `None` — a service with
         // neither `$XDG_CONFIG_HOME` nor `$HOME` — means no file and no
         // watch rather than a guessed path the user cannot find.

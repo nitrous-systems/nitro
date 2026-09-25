@@ -794,6 +794,50 @@ impl Body for Outputs {
     }
 }
 
+/// Lock the session, or take over a lock nobody holds (shell only; needs
+/// [`caps::SHELL`](crate::types::caps::SHELL)).
+///
+/// Answered at once, not at the next [`Commit`]. From then on the
+/// sender is the **lock owner**: only its windows are drawn and only
+/// they receive input, until it sends [`Unlock`]. If the owner
+/// disconnects, the session **stays locked** with no owner, and the next
+/// `Lock` takes it over: that is how a lock screen that crashed is
+/// replaced. A server started locked starts that way too.
+///
+/// Sending it while already the owner does nothing. Sending it while
+/// another connection owns the lock is `Error { Protocol }`: two lock
+/// screens at once is a bug in whoever started the second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Lock;
+
+impl Body for Lock {
+    fn encode_body(&self, _w: &mut Writer) -> Result<(), EncodeError> {
+        Ok(())
+    }
+    fn decode_body(_r: &mut Reader<'_>, _fds: &mut FdQueue) -> Result<Self, DecodeError> {
+        Ok(Self)
+    }
+}
+
+/// Unlock the session (shell only; needs
+/// [`caps::SHELL`](crate::types::caps::SHELL)).
+///
+/// Answered at once. Only the lock owner may send it (see [`Lock`]).
+/// From anyone else, including when the session is not locked, it is
+/// `Error { Protocol }`: an unlock that was not the owner's decision
+/// must not be something a connection can try and survive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unlock;
+
+impl Body for Unlock {
+    fn encode_body(&self, _w: &mut Writer) -> Result<(), EncodeError> {
+        Ok(())
+    }
+    fn decode_body(_r: &mut Reader<'_>, _fds: &mut FdQueue) -> Result<Self, DecodeError> {
+        Ok(Self)
+    }
+}
+
 /// Ask for the output list as an **unprivileged** client (needs
 /// [`caps::OUTPUTS`](crate::types::caps::OUTPUTS)).
 ///
@@ -2202,6 +2246,11 @@ msg_enum! {
         SetWindowStateFor = 0x040a,
         /// Ask for the output list and subscribe (needs `caps::SHELL`).
         Outputs = 0x040b,
+        /// Lock the session, or take over an ownerless lock (needs
+        /// `caps::SHELL`).
+        Lock = 0x040c,
+        /// Unlock the session; lock owner only (needs `caps::SHELL`).
+        Unlock = 0x040d,
     }
 }
 

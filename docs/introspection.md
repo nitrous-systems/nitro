@@ -257,7 +257,7 @@ line each:
 | `path` | the widget's own path |
 | `role` | `button`, `label`, `textfield`, `checkbox`, `scroll`, `list`, `slider`, `terminal`, `separator`, `image`, `icon`, `container`, `spacer`, `other` |
 | `name` | addressing/accessible name, or `-` |
-| `value` | the widget's value as text, or `-` |
+| `value` | the widget's value as text, or `-`; a secret text field reports its mask (`•` per character), never its text |
 | `text` | `value` for widgets whose value *is* their text (label, button, text field) |
 | `bounds` | `x,y,w,h` in window coordinates |
 | `enabled`, `focused`, `hovered`, `focusable` | `true`/`false` |
@@ -287,7 +287,7 @@ the callbacks fire:
 | any focusable | `focus` |
 | `button` | `click` (alias `activate`) |
 | `checkbox` | `toggle`, `set_value <true\|false>` |
-| `textfield` | `set_value <text>`, `submit`, `clear` |
+| `textfield` | `set_value <text>`, `submit`, `clear` (a secret field can be written this way, and there is no action to unmask it) |
 | `slider` | `set_value <number>` |
 | `scroll` | `scroll_to <offset>`, `scroll_by <delta>` |
 | any | `set_name <text>` |

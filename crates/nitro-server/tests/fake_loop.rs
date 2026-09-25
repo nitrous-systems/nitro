@@ -484,6 +484,39 @@ fn outputs_shot_stats_quit_on_fake_backend() {
     h_.quit();
 }
 
+/// `first_frame_ms` is how long the panel showed someone else's picture
+/// before ours: it stays `0` while there is nothing to paint on, is set by
+/// the first commit, and is not moved by any later one. The DRM backend's
+/// deferred first modeset (`nitro-kms` README, "The first picture is a
+/// finished frame") makes that commit the moment the panel changes hands,
+/// which is what the number is for on the box.
+#[test]
+fn first_frame_ms_is_set_once_by_the_first_commit() {
+    let h_ = Harness::start_headless("first-frame");
+    let s = h_.request_text("stats\n");
+    assert_eq!(stat(&s, "first_frame_ms"), 0, "no output, so no frame yet");
+
+    // Long enough that a first frame counted from the right origin cannot
+    // round down to zero.
+    std::thread::sleep(Duration::from_millis(30));
+    assert_eq!(h_.request_line("plug 200x120\n"), "ok");
+    wait_for("the first flip", || h_.frames() >= 1);
+    let s = h_.request_text("stats\n");
+    let first = stat(&s, "first_frame_ms");
+    assert!(first >= 30, "counted from run(), before the plug: {first}");
+    assert!(first <= stat(&s, "uptime_ms"));
+
+    // More frames, same number.
+    let frames = h_.frames();
+    park_cursor(&h_, 0.5, 0.5);
+    h_.settle();
+    wait_for("another flip", || h_.frames() > frames);
+    let s = h_.request_text("stats\n");
+    assert_eq!(stat(&s, "first_frame_ms"), first);
+
+    h_.quit();
+}
+
 #[test]
 fn a_client_window_is_configured_presented_and_painted_where_the_wm_put_it() {
     // M3 moved placement out from under this test twice over: the server

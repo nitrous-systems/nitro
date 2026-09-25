@@ -540,6 +540,8 @@ Assigned in blocks of 0x100 so a block can grow without renumbering.
 | `0x0409` | `CloseWindow` | shell (see `SHELL`) |
 | `0x040a` | `SetWindowStateFor` | shell (see `SHELL`) |
 | `0x040b` | `Outputs` | shell (see `SHELL`) |
+| `0x040c` | `Lock` | shell (see `SHELL`) |
+| `0x040d` | `Unlock` | shell (see `SHELL`) |
 
 ### Server → client
 
@@ -1699,10 +1701,12 @@ The split follows what each op *is*, and it is not uniform:
   `SetWindowState`. They have to be: a bar sends `CreateWindow` and
   `SetAnchor` in one transaction, and an anchor applied on receipt would be
   looking for a window the commit has not created yet.
-* The other seven are answered **on receipt**. `WindowList` and `Outputs`
+* The other nine are answered **on receipt**. `WindowList` and `Outputs`
   are questions, like `MeasureText`; `BindKey`/`UnbindKey` are
-  registrations; and the three `WindowRef` ops act on *another* client's
-  window, which the sender's own commit has nothing to do with.
+  registrations; the three `WindowRef` ops act on *another* client's
+  window, which the sender's own commit has nothing to do with; and
+  `Lock`/`Unlock` change the whole session, which a lock screen must be
+  able to do before its own window exists.
 
 The **privilege check is always on receipt**, whichever group an op is in:
 an unprivileged client is disconnected whether or not it ever commits.
@@ -1893,6 +1897,33 @@ a `WindowState` event, so it learns what actually happened.
 
 Empty payload. Answered on receipt with one `OutputInfo` per connected
 output and an `OutputsEnd`, and subscribes the connection to hotplug.
+
+### `Lock` — 0x040c
+
+Empty payload. Applied on receipt: the session is **locked** and the
+sender is its **owner**. While locked, only the owner's windows are drawn
+and hit-tested, and only they receive input (keys, pointer, scroll,
+touch, focus). Shell bindings do not fire, and the only compositor chord
+is the VT switch. Other clients keep their windows and are still sent
+`Configure`, `WindowState` and `Closed`; they are simply not shown and
+not given input.
+
+- Sent while already the owner: nothing happens.
+- Sent while the lock has **no owner** (its owner disconnected, or the
+  server was started with `NITRO_LOCKED=1`): the sender takes it over.
+- Sent while **another connection** owns the lock: `Error { Protocol }`.
+
+An owner that disconnects leaves the session **locked with no owner**:
+nothing but the background is drawn until the next `Lock`. There is no
+reply; a refusal is the error. The model and its reasons are in
+`docs/shell.md`, "The session lock".
+
+### `Unlock` — 0x040d
+
+Empty payload. Applied on receipt, from the lock owner only: the session
+is unlocked, every window is drawn again, and the window that had focus
+when the lock was taken gets it back. From anyone else, or when the
+session is not locked, it is `Error { Protocol }`.
 
 ### `HotKey` — 0x8401
 
@@ -2447,6 +2478,11 @@ to.
   rather than asked for, and the block is separate so the unprivileged
   protocol can keep growing in `0x_0xx..0x_3xx` without ever colliding
   with a privileged op. `VERSION` stays **1**.
+* `Lock` (`0x040c`) and `Unlock` (`0x040d`) join that block, for the
+  session lock. They are new ops under the existing `SHELL` bit, so no
+  new capability bit is needed: an older server refuses them as unknown
+  ops, which is the right answer for a server that cannot lock. `VERSION`
+  stays **1**.
 * M3-B also **removes a compositor chord**: `Super+Return` was reserved
   for "the launcher" in M3-A and is now bindable through `BindKey`,
   because the launcher exists and binds it. Nothing on the wire changed —

@@ -32,6 +32,38 @@ impl ClientId {
     }
 }
 
+/// Which clients' windows the scene paints and hit-tests.
+///
+/// The one lever a session lock needs from the scene: while it is locked,
+/// only the lock screen's client exists as far as pixels and the pointer
+/// are concerned, and before a lock screen has connected, nobody does.
+/// Filtering here, in the two walks that read the z-order, rather than
+/// toggling each window's root visibility, leaves every window's own
+/// state (minimized, hidden by its client) untouched, so unlocking is
+/// the same one call back to [`Admit::All`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Admit {
+    /// Every window: the ordinary state.
+    #[default]
+    All,
+    /// Only the windows `client` owns.
+    Only(ClientId),
+    /// No window at all.
+    Nobody,
+}
+
+impl Admit {
+    /// Whether a window owned by `owner` is painted and hit-tested.
+    #[must_use]
+    pub fn admits(self, owner: ClientId) -> bool {
+        match self {
+            Self::All => true,
+            Self::Only(c) => c == owner,
+            Self::Nobody => false,
+        }
+    }
+}
+
 /// Stacking layers, back to front.
 ///
 /// Windows are ordered by layer first, then by their position within the

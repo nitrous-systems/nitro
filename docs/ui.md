@@ -330,7 +330,7 @@ widgets on the wallpaper — before, **0** after (`docs/settings.md`).
 | `Panel` | `container` | — | — | background, radius, border, each `None` = the theme's |
 | `Label` | `label` | its text | `set_value` | remembers the width it was measured at; `.elide(true)` shortens with `…` instead of overflowing |
 | `Button` | `button` | — | `click`, `activate`, `focus`, `alt_click` | hover/pressed/focused faces; `alt_click` is the middle button |
-| `TextField` | `textfield` | its contents | `set_value`, `submit`, `clear`, `focus` | caret, selection, click-to-place, h-scroll |
+| `TextField` | `textfield` | its contents (the mask, if secret) | `set_value`, `submit`, `clear`, `focus` | caret, selection, click-to-place, h-scroll, secret mode |
 | `Checkbox` | `checkbox` | `true`/`false` | `toggle`, `set_value`, `focus` | Space toggles |
 | `Slider` | `slider` | the number | `set_value`, `focus` | drag, arrows, Home/End, optional step |
 | `Scroll` | `scroll` | the offset | `scroll_to`, `scroll_by`, `focus` | wheel, arrows, PgUp/PgDn, Home/End |
@@ -477,6 +477,40 @@ only per *new string* — which is one, on the way in.
 Its overflow scrolls **by composition**: the text node hangs under a
 clipping group whose transform is the scroll offset, so a caret past the
 right edge sends one `SetTransform` and no `SetText`.
+
+**A secret `TextField` never lets its text out of the process.**
+`text_field("").secret()` (or `set_secret(true)` on a live one, for a
+login form whose one field asks for a name and then a password) masks
+the field: every string it hands the server is one `•` (`SECRET_MASK`)
+per character. That covers the `SetText` it paints, which keeps the text
+out of the scene, screenshots and the remote link. It also covers the
+strings it asks to have measured and caret-positioned, which keeps the
+text out of the measure requests and out of the measure cache's keys.
+The server's cursor table is therefore for the mask, and the field
+translates between text offsets and mask offsets in both directions
+(caret placement and click-to-place).
+
+Introspection reports the mask as `value` and `text`, as AT-SPI does for
+a password field. `set_value` still writes the field, which is how
+`nitro-hey` or a test types a password. No action turns the mode off:
+unmasking is the app's decision, never a socket client's. `Debug` prints
+`<secret, N chars>`.
+
+The buffer is wiped as well. It is zeroed on `clear`, before a
+replacement and on drop, and its spare capacity is scrubbed after every
+edit. It grows by hand, so an outgrown buffer is zeroed rather than
+freed. The change callbacks get a borrow, not a copy. This part is
+hygiene, not a boundary: the characters arrived as input events, and the
+app keeps whatever it copies. `black_box` stands in for
+`write_volatile`, which would need `unsafe`.
+
+`crates/nitro-ui/tests/secret.rs` checks the boundary against **every
+byte the client sent** (`Harness::sent_bytes`, recorded at
+`Connection::flush`, which every message passes through). A plain field
+typed in the same window is the control, proving the recording sees
+typed text. Each of the masking paths (the bytes, the introspection
+walk, click-to-place, caret scrolling) was checked to fail its test
+when disabled.
 
 **`Scroll` is the same trick one level up, and it uses no extra node at
 all.** A widget's children already hang under its *content group*; the

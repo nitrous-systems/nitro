@@ -5,9 +5,9 @@ use std::collections::HashMap;
 use nitro_core::{IRect, Point, Rect, Size, Transform};
 
 use crate::{
-    Border, Buffer, BufferDesc, BufferKey, ClientId, Configure, Error, Fill, IconRef, ImageRef,
-    Insets, Layer, Node, NodeKey, NodeKind, OutputId, PixelStore, TextRef, Window, WindowFlags,
-    WindowKey, WindowState,
+    Admit, Border, Buffer, BufferDesc, BufferKey, ClientId, Configure, Error, Fill, IconRef,
+    ImageRef, Insets, Layer, Node, NodeKey, NodeKind, OutputId, PixelStore, TextRef, Window,
+    WindowFlags, WindowKey, WindowState,
     key::Arena,
     node::{ALL_DIRTY, Dirty, NodeData},
     window::Output,
@@ -54,6 +54,8 @@ pub struct Scene {
     /// destroyed, windows unplaced or restacked), flushed at the next
     /// `update`.
     pub(crate) pending: Vec<(OutputId, IRect)>,
+    /// Whose windows are painted and hit-tested; see [`Admit`].
+    pub(crate) admit: Admit,
     /// Scratch stack for subtree walks that cannot recurse.
     pub(crate) scratch: Vec<NodeKey>,
     /// Windows whose size changed since the last update.
@@ -79,6 +81,7 @@ impl Scene {
             buffer_users: HashMap::new(),
             dirty_roots: Vec::new(),
             pending: Vec::new(),
+            admit: Admit::All,
             scratch: Vec::new(),
             resized: Vec::new(),
             stats: UpdateStats {
@@ -155,6 +158,39 @@ impl Scene {
         self.windows
             .get(key)
             .expect("scene invariant: nodes name live windows")
+    }
+
+    // ----------------------------------------------------------------- admit
+
+    /// Paint and hit-test only the windows `admit` admits.
+    ///
+    /// A change damages every output whole: which windows show changes
+    /// everywhere at once, and the next [`update`](Scene::update) reports
+    /// it like any other damage. Setting the value already in force does
+    /// nothing, so it costs a frame only when it means one.
+    pub fn set_admit(&mut self, admit: Admit) {
+        if self.admit == admit {
+            return;
+        }
+        self.admit = admit;
+        for o in &self.outputs {
+            self.pending.push((o.id, o.rect));
+        }
+    }
+
+    /// Whose windows are painted and hit-tested.
+    #[must_use]
+    pub fn admit(&self) -> Admit {
+        self.admit
+    }
+
+    /// Whether `win` is admitted: painted and hit-tested. `false` for a
+    /// window that does not exist.
+    #[must_use]
+    pub fn admits_window(&self, win: WindowKey) -> bool {
+        self.windows
+            .get(win)
+            .is_some_and(|w| self.admit.admits(w.client))
     }
 
     // --------------------------------------------------------------- outputs

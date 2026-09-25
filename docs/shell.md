@@ -74,7 +74,7 @@ follows what each one is:
 | ops | when | why |
 |---|---|---|
 | `SetLayer`, `SetExclusiveZone`, `SetAnchor`, `GrabKeyboard` | at the sender's `Commit` | they name the sender's **own** window, and a bar sends `CreateWindow` and `SetAnchor` in one transaction |
-| `BindKey`, `UnbindKey`, `WindowList`, `Outputs`, `FocusWindow`, `CloseWindow`, `SetWindowStateFor` | on receipt | questions and registrations, or ops on *another* client's window — none of which the sender's commit has anything to do with |
+| `BindKey`, `UnbindKey`, `WindowList`, `Outputs`, `FocusWindow`, `CloseWindow`, `SetWindowStateFor`, `Lock`, `Unlock` | on receipt | questions and registrations, ops on *another* client's window, or the whole session — none of which the sender's commit has anything to do with |
 
 The first row is the hardware probe's finding, and worth recording because
 the first implementation got it wrong in a way no unit test caught: the
@@ -116,6 +116,82 @@ sandbox, which does *not* get the runtime directory — start reserving screen
 space or reading every keystroke. That is worth having on its own.
 
 What a stronger model would need is in [Deferred](#deferred).
+
+## The session lock
+
+`Lock` and `Unlock` (`docs/wire.md`) make one shell client the only one
+whose windows exist, as far as the screen and the input devices are
+concerned. It is the server half of the lock screen and of booting into
+a locked session (`docs/greeter.md`, decision 6). The policy is
+`src/lock.rs`, pure and unit-tested. The rules are `ext-session-lock`'s:
+
+- **`Lock` makes the sender the owner.** Only the owner's windows are
+  drawn, hit-tested and given input.
+- **Only the owner unlocks.** `Unlock` from anyone else is fatal, and so
+  is a second `Lock` while someone owns it.
+- **A crash is never a way in.** An owner that disconnects leaves the
+  session locked with *no* owner: only the background is drawn, and
+  nobody can unlock. The next `Lock` takes it over, which is how a
+  restarted lock screen resumes.
+- **A server can start locked.** `NITRO_LOCKED=1` (`Config::locked`)
+  starts with an ownerless lock, in force before the first frame, so a
+  session booted locked never paints an application window.
+
+### Hidden, not covered
+
+The lock is applied in the scene, not by the lock screen drawing over
+everything. `nitro_scene::Admit` filters the two walks that read the
+z-order, paint and hit test, down to the owner's windows (`Only`) or to
+none (`Nobody`). So a lock screen that is transparent, slow to draw its
+first frame, or dead does not show what is behind it: what is behind it
+is not drawn. Every window keeps its own state (minimized, hidden by its
+client, its place in the stack), and unlocking is setting the filter back
+to `All`. A change damages every output whole, once.
+
+### Every input path asks the same question
+
+The scene's filter is the one source of truth, and every input path asks
+it (`Scene::admits_window`). There are more paths than one might expect,
+and each has a test that fails when its gate is removed:
+
+| path | gate | test |
+|---|---|---|
+| pointer enter, motion, button, scroll, touch | the scene's hit test finds only admitted windows | `while_locked_input_reaches_only_the_lock_owner_and_focus_comes_back` |
+| keys | the key goes to a grab or focus only if admitted | `a_launcher_holding_the_keyboard_loses_it_to_the_lock` |
+| focus (click, Alt+Tab, new window, MRU hand-off, `FocusWindow`, control `focus`) | `set_focus` refuses a window that is not admitted | `the_shell_cannot_focus_a_hidden_window_while_locked` |
+| the server's own frame actions (title-bar drag, Super-drag, buttons, resize edges) | `on_screen` is false for a hidden window | `a_hidden_window_cannot_be_dragged_while_locked` |
+| shell bindings, the Super tap | not consulted while locked | `while_locked_shell_bindings_and_window_chords_do_nothing` |
+| compositor chords | only the VT switch works while locked | the same |
+| anything sent as input | `send_input` drops it for a window that is not admitted | none alone: see below |
+
+The key filter and `send_input` back each other up, so removing either
+one alone is caught by nothing. Removing both is caught by the launcher
+test, and that is the intended design, not a gap. Messages that are
+**not** input (`Configure`, `WindowState`, `Closed`) still reach hidden
+clients: they are news about their own windows, and an application
+resized while locked must still be told.
+
+Locking also:
+
+- takes the focus away (the focused window is told) and remembers it for
+  the unlock;
+- gives the keyboard to the lock screen's window if it already has one.
+  A lock screen may map its window before it sends `Lock`, and a window
+  made while the lock had no owner was refused the focus: without this
+  either would need a click before it could read a password. When the
+  focus at the `Lock` was already the lock screen's, the unlock hands it
+  back to the most recently used application window instead;
+- sends the hovered window a `PointerLeave`;
+- drops a drag in flight;
+- resets the Super-tap state.
+
+It does this **on the `Lock` itself**, not when a lock window appears, so
+the application loses the keyboard even if the lock screen never draws.
+
+What the control socket can still do while locked: `shot` shows what is
+on the glass, so the lock screen and the background. `quit` ends the
+session, which is a logout, not an unlock. No control command injects
+input.
 
 ## Exclusive zones
 
@@ -600,7 +676,7 @@ different from the mode the kernel actually set.
 
 ## Statistics
 
-Five keys in `stats`, and the first is the one to look at when a bar "is
+Seven keys in `stats`, and the first is the one to look at when a bar "is
 not working":
 
 | key | meaning |
@@ -610,6 +686,8 @@ not working":
 | `exclusive_zones` | windows reserving space. |
 | `grabbed` | 1 while a keyboard grab is held. A 1 with no launcher on screen is a stuck grab. |
 | `keys_withheld` | keys dropped while a shell owed an answer to a binding that had just fired (§[A binding buys its client a turn](#a-binding-buys-its-client-a-turn)). Cumulative, and normally 0: a non-zero value means someone types faster than the shell wakes. |
+| `locked` | 1 while the session is locked (§[The session lock](#the-session-lock)). |
+| `lock_owned` | 1 while a connection owns the lock. `locked 1` with `lock_owned 0` is a session waiting for a lock screen: only the background is drawn. |
 
 ## Testing
 
@@ -652,6 +730,14 @@ not working":
   connected and not looking like a
   tap; outputs listed, hotplugged and unplugged; and an anchored bar
   re-spanning after a hotplug.
+* The session lock: `src/lock.rs` unit-tests the ownership rules,
+  `nitro-scene/tests/admit.rs` the paint and hit-test filter and its
+  damage, and eleven cases in `tests/shell.rs` drive it through the event
+  loop: started locked, input and focus, a lock window made before the
+  `Lock` (and before a takeover), bindings and chords, a held grab,
+  a Super-drag, `FocusWindow`, refusals, and a lock screen that dies. Each
+  gate was removed in turn to check that a test fails without it
+  (§[Every input path asks the same question](#every-input-path-asks-the-same-question)).
 * `examples/shell_probe.rs` is the hardware probe: a `Top` bar with a 32-px
   exclusive zone, `WindowInfo` events printed as they arrive, and
   `Super+Return` bound. Throwaway, not a shipped binary. The numbers it

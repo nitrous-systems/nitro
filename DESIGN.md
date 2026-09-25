@@ -164,6 +164,11 @@ Session policy that talks to `logind` over D-Bus (suspend, power off,
 lock) lives in one side daemon, `nitro-sessiond`, and is the only place a
 D-Bus client is allowed.
 
+Login is not ours to run as root. `greetd` (a system package, not a
+crate) owns PAM and the VT; `nitro-greeter` is an ordinary nitro-ui
+client that speaks its four-message socket protocol, hosted by
+`nitro-session --greeter`. Sketch and reasoning: `docs/greeter.md`.
+
 ### Adapters (later)
 
 - `nitro-remote`: the server accepts the wire over TCP/SSH; a thin

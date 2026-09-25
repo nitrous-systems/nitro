@@ -461,6 +461,62 @@ pub fn select_mode(modes: &[ModeCandidate], wanted: Option<&ModeRequest>) -> Opt
     }
 }
 
+/// Index of the mode to use when the connector is **already lit**:
+/// `on_screen` is the listed mode whose timings the CRTC is scanning out
+/// right now, and `chosen` is what [`select_mode`] picked.
+///
+/// A full modeset is what makes a monitor resync (one to three seconds of
+/// black on many HDMI panels), and the kernel does one only when the new
+/// mode differs from the old one. So a server that starts on a panel
+/// fbcon or a previous nitro already lit should take the mode it finds,
+/// **when that mode answers the configuration as well**. This is the
+/// greeter-to-desktop handover in `docs/greeter.md`, and it applies to
+/// every other start as well.
+///
+/// "As well" depends on what was asked for:
+///
+/// - **Nothing** (the default rule): the same size, progressive, and a
+///   refresh no more than [`REFRESH_TOLERANCE_MHZ`] below the default
+///   pick. 59.94 on screen where the preferred mode is 60 is kept, and
+///   costs 0.1 %. 30 on screen where 60 is available is not kept: the
+///   rule never lowers the refresh rate to avoid a blank.
+/// - **An explicit request** (`WxH`, `WxH@Hz`, `max`, `fastest`): the
+///   on-screen mode must have exactly the refresh the request resolved
+///   to. The request is an instruction, and `@60` means 60.000, not the
+///   59.940 mode that happens to be lit
+///   ([`REFRESH_TOLERANCE_MHZ`] is about finding the mode, not about
+///   substituting a different one). A request that matched nothing falls
+///   back to the default rule in [`select_mode`], so it is treated as no
+///   request here as well.
+/// - **A modeline** never reaches this function: it is not chosen from
+///   the list.
+///
+/// Interlaced on-screen modes are never kept.
+#[must_use]
+pub fn keep_on_screen(
+    modes: &[ModeCandidate],
+    chosen: usize,
+    on_screen: Option<usize>,
+    wanted: Option<&ModeRequest>,
+) -> usize {
+    let (Some(p), Some(i)) = (modes.get(chosen), on_screen) else {
+        return chosen;
+    };
+    let Some(c) = modes.get(i) else {
+        return chosen;
+    };
+    if c.interlaced || (c.width, c.height) != (p.width, p.height) {
+        return chosen;
+    }
+    let explicit = wanted.is_some_and(|r| request_match(modes, r).is_some());
+    let good_enough = if explicit {
+        c.refresh_mhz == p.refresh_mhz
+    } else {
+        c.refresh_mhz + REFRESH_TOLERANCE_MHZ >= p.refresh_mhz
+    };
+    if good_enough { i } else { chosen }
+}
+
 /// Vertical refresh in millihertz from raw mode timings, the way the
 /// kernel's `drm_mode_vrefresh` computes it.
 #[must_use]
@@ -666,6 +722,112 @@ mod tests {
         assert_eq!(select_mode(&modes, None), Some(1));
         // ... unless it is all there is.
         assert_eq!(select_mode(&modes[..1], None), Some(0));
+    }
+
+    // -- keeping the mode that is already lit --------------------------------
+
+    fn size(w: u32, h: u32, r: Option<u32>) -> ModeRequest {
+        ModeRequest::Size {
+            width: w,
+            height: h,
+            refresh_mhz: r,
+        }
+    }
+
+    #[test]
+    fn nothing_on_screen_keeps_the_pick() {
+        let modes = [m(1920, 1080, 60_000, true), m(1920, 1080, 59_940, false)];
+        assert_eq!(keep_on_screen(&modes, 0, None, None), 0);
+    }
+
+    #[test]
+    fn the_default_rule_gives_way_to_a_lit_mode_within_tolerance() {
+        let modes = [m(1920, 1080, 60_000, true), m(1920, 1080, 59_940, false)];
+        assert_eq!(select_mode(&modes, None), Some(0));
+        assert_eq!(keep_on_screen(&modes, 0, Some(1), None), 1);
+    }
+
+    #[test]
+    fn the_default_rule_never_lowers_the_refresh_to_avoid_a_blank() {
+        let modes = [m(3840, 2160, 60_000, true), m(3840, 2160, 30_000, false)];
+        assert_eq!(keep_on_screen(&modes, 0, Some(1), None), 0);
+    }
+
+    #[test]
+    fn a_faster_lit_mode_at_the_same_size_is_kept() {
+        // A previous master chose 144 Hz where the EDID prefers 60: keeping it
+        // is no worse by the default rule's own standard, and skips a resync.
+        let modes = [m(2560, 1440, 60_000, true), m(2560, 1440, 143_998, false)];
+        assert_eq!(keep_on_screen(&modes, 0, Some(1), None), 1);
+    }
+
+    #[test]
+    fn a_different_size_is_never_kept() {
+        let modes = [m(1920, 1080, 60_000, true), m(1280, 720, 60_000, false)];
+        assert_eq!(keep_on_screen(&modes, 0, Some(1), None), 0);
+    }
+
+    #[test]
+    fn an_interlaced_lit_mode_is_never_kept() {
+        let mut modes = [m(1920, 1080, 60_000, true), m(1920, 1080, 60_000, false)];
+        modes[1].interlaced = true;
+        assert_eq!(keep_on_screen(&modes, 0, Some(1), None), 0);
+    }
+
+    #[test]
+    fn an_explicit_refresh_is_an_instruction_not_a_neighbourhood() {
+        // `@60` resolves to 60.000; the lit 59.940 is within tolerance of the
+        // *request* but is not what it resolved to.
+        let modes = [m(1920, 1080, 59_940, false), m(1920, 1080, 60_000, true)];
+        let req = size(1920, 1080, Some(60_000));
+        let chosen = select_mode(&modes, Some(&req)).unwrap();
+        assert_eq!(chosen, 1);
+        assert_eq!(keep_on_screen(&modes, chosen, Some(0), Some(&req)), 1);
+    }
+
+    #[test]
+    fn an_explicit_request_keeps_a_lit_twin_with_the_same_refresh() {
+        // Two listings of the same nominal mode (a CEA and a detailed timing
+        // with different porches): either answers the request, so the lit one
+        // is kept.
+        let modes = [m(1920, 1080, 60_000, true), m(1920, 1080, 60_000, false)];
+        for req in [
+            size(1920, 1080, Some(60_000)),
+            size(1920, 1080, None),
+            ModeRequest::Max,
+            ModeRequest::Fastest,
+        ] {
+            let chosen = select_mode(&modes, Some(&req)).unwrap();
+            let kept = keep_on_screen(&modes, chosen, Some(1), Some(&req));
+            assert_eq!(kept, 1, "{req}");
+        }
+    }
+
+    #[test]
+    fn fastest_is_not_satisfied_by_a_slower_lit_mode() {
+        let modes = [m(2560, 1440, 60_000, true), m(2560, 1440, 143_998, false)];
+        let req = ModeRequest::Fastest;
+        let chosen = select_mode(&modes, Some(&req)).unwrap();
+        assert_eq!(chosen, 1);
+        assert_eq!(keep_on_screen(&modes, chosen, Some(0), Some(&req)), 1);
+    }
+
+    #[test]
+    fn an_unmatched_request_is_the_default_rule_here_too() {
+        // `select_mode` fell back to the default for a size the monitor does
+        // not have; the tolerance of the default rule applies again.
+        let modes = [m(1920, 1080, 60_000, true), m(1920, 1080, 59_940, false)];
+        let req = size(1600, 900, None);
+        let chosen = select_mode(&modes, Some(&req)).unwrap();
+        assert_eq!(chosen, 0);
+        assert_eq!(keep_on_screen(&modes, chosen, Some(1), Some(&req)), 1);
+    }
+
+    #[test]
+    fn out_of_range_indices_keep_the_pick() {
+        let modes = [m(1920, 1080, 60_000, true)];
+        assert_eq!(keep_on_screen(&modes, 0, Some(7), None), 0);
+        assert_eq!(keep_on_screen(&modes, 7, Some(0), None), 7);
     }
 
     // -- the box's real mode table ------------------------------------------
