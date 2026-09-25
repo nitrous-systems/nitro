@@ -115,6 +115,19 @@ writing an app on this stack costs an app author nothing beyond the
 toolkit. The four lines the tree count rose by are its own `nitro-calc`
 and `nitro-ui (*)` entries, not new crates.
 
+`nitro-amp` (the Winamp-style music player) is the same bargain for an
+app that plays audio: its dependency list is `nitro-ui` and nothing else,
+so it adds no external crate. The codecs and the sound output are **child
+processes**, not libraries — `ffmpeg` (and optionally `ffprobe`) decodes
+everything but WAV to raw `f32le` on a pipe, and `pw-cat`, `paplay` or
+`aplay` plays it from one. That keeps a dozen codec crates, and their
+parsers of untrusted media files, out of both the tree and the player's
+address space; a malformed file can crash `ffmpeg`, not the window.
+WAV is parsed in-process by the crate's own `wav.rs`, which is total
+over hostile input and tested for it. With none of the helpers
+installed the player still runs — WAV plays, silently if there is no
+output — and says so in its status line rather than failing.
+
 The M1 rise from 58 to 60 was the same kind of non-event: one line is
 `nitro-demo`, a workspace crate, and the other is a second
 `signal-hook v0.4.4 (*)` line — cargo's marker for a subtree it has
