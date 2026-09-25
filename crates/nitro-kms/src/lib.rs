@@ -332,10 +332,10 @@ pub trait Backend {
 
     /// Re-probe connectors and modes (after `Event::Hotplug` or a session
     /// resume). Returns whether [`Backend::outputs`] changed. Outputs that
-    /// vanished release their buffers; new ones are modeset immediately
-    /// unless paused, in which case [`Backend::resume`] does it, or unless
-    /// nothing has been committed yet, in which case the first
-    /// [`Backend::commit`] does.
+    /// vanished release their buffers. A new one is not modeset here: its
+    /// first [`Backend::commit`] lights it, with that frame, as it does
+    /// every output. Outputs already lit are modeset again unless paused,
+    /// in which case [`Backend::resume`] does it.
     ///
     /// # Errors
     /// [`Error::Io`] if enumeration fails.
@@ -351,9 +351,9 @@ pub trait Backend {
 
     /// The session is active again. Re-modesets every output (DRM master
     /// may have been revoked and re-granted; CRTC state does not survive
-    /// that, buffers do). A backend that has not committed anything yet
-    /// has nothing of its own to restore, and leaves the lighting to the
-    /// first [`Backend::commit`].
+    /// that, buffers do). An output that has not been committed yet has
+    /// nothing of its own to restore, and is left to its first
+    /// [`Backend::commit`].
     ///
     /// **Post-condition:** any flip in flight is abandoned, so
     /// [`Backend::flip_pending`] is false for every output afterwards and

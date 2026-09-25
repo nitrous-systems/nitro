@@ -67,9 +67,10 @@ flip already in flight completes and is still reported by `dispatch`.
 `resume()` re-modesets every output with one blocking `ALLOW_MODESET`
 commit. DRM master may have been revoked and re-granted in between: dumb
 buffers and framebuffer objects survive that, CRTC/plane state does not.
-`rescan()` may be called while paused; new outputs are then modeset by
-`resume()`. Before the first `commit` there is nothing to restore, and
-`resume()` commits nothing (see "The first picture is a finished frame").
+`rescan()` may be called while paused. Only lit outputs are restored: an
+output with no `commit` yet has nothing of ours to restore, and `resume()`
+leaves it to its first commit (see "The first picture is a finished
+frame").
 
 ### Hotplug
 
@@ -77,7 +78,8 @@ buffers and framebuffer objects survive that, CRTC/plane state does not.
 re-probes connectors and returns whether `outputs()` changed. Outputs whose
 connector vanished (or whose preferred mode changed) release their buffers
 and their `OutputId` is never reused; new connectors get an id, buffers and
-an immediate modeset (unless paused, or nothing has been committed yet).
+lit at their first `commit`, like every output; the outputs already lit
+are modeset again at once (unless paused).
 Re-query `poll_fds()` after a rescan.
 
 Documented-not-solved corner cases: more connected connectors than CRTCs
@@ -102,16 +104,22 @@ same mode (kept as is); CRTC assignment is greedy, not a maximum matching.
    plane whose `possible_crtcs` includes that CRTC. Allocate two
    `XRGB8888` dumb buffers, `AddFB2` them, map them for the output's
    lifetime, create the mode blob.
-3. Initial modeset, **deferred to the first `commit`** and made with the
-   frame that commit carries: **one** blocking `ALLOW_MODESET` commit describing the
-   complete state — our connectors get `CRTC_ID`, our CRTCs `MODE_ID` +
-   `ACTIVE=1`, our planes `FB_ID`/`CRTC_ID`/`SRC_*` (16.16)/`CRTC_*`; every
-   other connector gets `CRTC_ID=0`, every other CRTC `MODE_ID=0`,
-   `ACTIVE=0`, every other primary plane `FB_ID=0`, `CRTC_ID=0`. Stating
-   the whole picture is what keeps the kernel from rejecting the commit
-   because fbcon or a previous master left a CRTC attached elsewhere.
-   It is followed by an ordinary flip to the same buffer, which is what
-   delivers the first `Event::Flipped`.
+3. Initial modeset, **per output, deferred to its first `commit`** and
+   made with the frame that commit carries: one blocking `ALLOW_MODESET`
+   commit for the outputs lit so far — their connectors get `CRTC_ID`,
+   their CRTCs `MODE_ID` + `ACTIVE=1`, their planes `FB_ID`/`CRTC_ID`/
+   `SRC_*` (16.16)/`CRTC_*`. An output not lit yet is left out of the
+   request and keeps the previous picture, rather than showing a zeroed
+   buffer until its own frame. The commit that lights the **last** output
+   describes the complete state: every other connector gets
+   `CRTC_ID=0`, every other CRTC `MODE_ID=0`, `ACTIVE=0`, every other
+   primary plane `FB_ID=0`, `CRTC_ID=0`. Stating the whole picture is
+   what keeps the kernel from rejecting the commit because fbcon or a
+   previous master left a CRTC attached elsewhere. A partial commit the
+   kernel refuses for that reason (our connector assigned a CRTC that
+   still drives one of our unlit connectors) falls back to lighting every
+   output at once. Each is followed by an ordinary flip to the same
+   buffer, which is what delivers the output's first `Event::Flipped`.
 4. `commit`: `NONBLOCK | PAGE_FLIP_EVENT` with the plane's `FB_ID` and,
    when supported, an `FB_DAMAGE_CLIPS` blob (`drm_mode_rect` x1,y1,x2,y2
    built in a reused `Vec<i32>`; the blob is destroyed right after the
@@ -131,14 +139,17 @@ same mode (kept as is); CRTC assignment is greedy, not a maximum matching.
 A server starting on a panel that is already lit (by fbcon, by the
 greeter's compositor, by the previous session) should replace what is
 there with its own first frame, with no black frame in between and,
-where possible, without a monitor resync. Two rules, both about the
-first commit:
+where possible, without a monitor resync. Two rules, both about each
+output's first commit:
 
-- **No commit before there is a frame.** `open` probes, allocates and
-  picks modes, and leaves the CRTCs alone. Until the first `commit`, the
-  panel keeps the previous picture. It is not replaced with the zeroed
-  dumb buffer, which is what `open` used to commit. A `rescan` or
-  `resume` before that point updates the bookkeeping and commits nothing.
+- **No commit before there is a frame, per output.** `open` probes,
+  allocates and picks modes, and leaves the CRTCs alone. Until an
+  output's first `commit`, its panel keeps the previous picture. It is
+  not replaced with the zeroed dumb buffer, which is what `open` used to
+  commit, and with several outputs the first commit lights only its own:
+  lighting them all at once would put the zeroed buffer on every panel
+  but the one whose frame was ready. A `rescan` or `resume` leaves an
+  unlit output alone, and commits nothing while no output is lit.
   A card that is opened, found to have no output and dropped (the
   server's multi-GPU probe) is now never modeset at all.
 - **Keep the mode that is lit, when it is as good.** The kernel does a
@@ -150,8 +161,8 @@ first commit:
   the configuration as well. With nothing configured: the same size, and
   a refresh no more than half a hertz below. With a request: exactly the
   refresh the request resolved to. A modeline is never replaced. This
-  applies **only before the first commit**, while the lit mode is
-  someone else's. After that it is our own earlier pick, and a
+  applies **only before the connector's first commit**, while the lit
+  mode is someone else's. After that it is our own earlier pick, and a
   configuration reload must be able to move away from it.
 
 It is not seamless yet. The previous compositor's exit destroys its
@@ -162,9 +173,11 @@ closing it would take. What this section guarantees is that the gap
 ends in a finished frame, as early as the server can paint one, and
 without a resync when the mode allows.
 
-Verified by unit tests for the mode rule only. This container has no DRM
-device, so the deferred modeset needs checking on the box: a cold start
-from fbcon, `systemctl restart nitro-dev`, and a VT round trip.
+Verified by unit tests for the mode rule and for which objects a
+lighting commit lists only. This container has no DRM device, so the
+deferred modeset needs checking on the box: a cold start from fbcon,
+`systemctl restart nitro-dev`, a VT round trip, and a start with two
+monitors (each should go from the old picture straight to ours).
 
 The fd is passed as `DrmFd::Owned` (closed on drop) or `DrmFd::Borrowed`
 (never closed — for when the seat owns it and closes it itself after the
