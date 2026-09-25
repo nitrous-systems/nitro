@@ -624,6 +624,26 @@ rather than refused. Every server-initiated resize goes through the clamp,
 and a drag additionally cannot go below a 64 × 32 content floor, so a
 client that declares nothing still cannot be resized into nothing.
 
+### A client resizing itself
+
+A client asks for a new content size by sending `SetBounds` on its own
+window root (`docs/wire.md`); the server answers with a `Configure`,
+as for any resize. The limits above are *not* applied to that request:
+they bound what the user can drag a window to, and a client already
+knows its own. `nitro-ui`'s `Ui::request_window_size` clamps to them
+before sending, and `nitro-amp` uses it to fit its window to the
+sections that are unfolded.
+
+The frame follows. The scene resizes the content and the frame group,
+but the decorations drawn inside the frame are the server's, so after
+a scene update that resized a decorated window the server re-lays that
+window's frame and folds the result in with a second update pass. The
+second pass matters on an idle desktop, where there might be no next
+update to carry it. Before this, a client that shrank itself left the
+old frame painted around the gap —
+`a_client_that_resizes_itself_takes_its_frame_with_it` in
+`crates/nitro-server/tests/wm.rs` is the regression.
+
 ## Work area and placement
 
 The **work area** is a per-output rectangle in logical units: everything a

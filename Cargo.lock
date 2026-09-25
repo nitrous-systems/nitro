@@ -171,6 +171,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nitro-amp"
+version = "0.0.1"
+dependencies = [
+ "nitro-ui",
+]
+
+[[package]]
 name = "nitro-bar"
 version = "0.0.1"
 dependencies = [

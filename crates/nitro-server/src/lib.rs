@@ -1821,6 +1821,42 @@ impl Server {
 
     /// Run the scene's update pass and fold the damage into every output.
     fn update_scene(&mut self) {
+        let configures = self.update_scene_once();
+        // A resize the server decided on has already re-laid its frame
+        // (`set_frame_rect`). A client's own `SetBounds` on its window
+        // root has not: the scene resized the content and the frame
+        // group, but the decorations drawn inside the frame — border,
+        // title bar, background — are the server's, and only this layer
+        // knows them. Without this the frame kept its old size around a
+        // client that had shrunk itself, and the gap showed the frame's
+        // background.
+        //
+        // Re-laid *here*, then folded in with a second pass rather than
+        // left for the next update: on an idle desktop there may not be
+        // one, and the stale frame would stay on screen until something
+        // unrelated moved.
+        let mut relaid = false;
+        for c in &configures {
+            if self.decorations.contains_key(&c.window) {
+                self.relayout_frame(c.window);
+                relaid = true;
+            }
+        }
+        if relaid {
+            // Decorations never resize content, so this pass has no
+            // configures of its own to send.
+            let again = self.update_scene_once();
+            debug_assert!(again.is_empty(), "a frame re-layout resized content");
+        }
+        // Every resize is told to the client, which lays out for it.
+        for configure in configures {
+            self.send_configure(configure.window, configure.size);
+        }
+    }
+
+    /// One scene update: fold its damage into the outputs and return the
+    /// windows whose size it changed.
+    fn update_scene_once(&mut self) -> Vec<nitro_scene::Configure> {
         let mut regions: Vec<(SceneOutputId, Damage)> = self
             .outputs
             .iter()
@@ -1845,11 +1881,7 @@ impl Server {
                 output.damage_content(r.translate(-origin.0, -origin.1));
             }
         }
-        // A resize the server decided on (or a client's own `SetBounds` on
-        // a window root) is told to the client, which lays out for it.
-        for configure in result.configures {
-            self.send_configure(configure.window, configure.size);
-        }
+        result.configures
     }
 
     fn send_configure(&mut self, win: WindowKey, size: Size) {

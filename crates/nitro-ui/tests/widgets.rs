@@ -204,6 +204,148 @@ fn a_slider_follows_the_pointer_and_the_arrow_keys() {
 }
 
 #[test]
+fn a_vertical_slider_has_its_minimum_at_the_bottom() {
+    let mut h = Harness::sized("fader", (), Size::new(80.0, 200.0), |ui: &mut Ui<()>| {
+        let s = ui.build(
+            slider(0.0)
+                .name("band")
+                .range(-12.0, 12.0)
+                .step(1.0)
+                .vertical()
+                .height(160.0),
+        );
+        let root = ui.build(panel().background(Color::WHITE).padding(8.0));
+        ui.attach(root, s).unwrap();
+        root
+    });
+    let id = kids(&mut h)[0];
+    let b = h.bounds(id);
+    // Taller than wide: the measured default turned with the track.
+    assert!(b.h > b.w, "a vertical slider is laid out tall, got {b:?}");
+
+    // Near the top is near the maximum; near the bottom, the minimum.
+    h.click_at(Point::new(b.x + b.w / 2.0, b.y + 2.0));
+    same(h.widget::<Slider<()>>(id).value(), 12.0);
+    h.click_at(Point::new(b.x + b.w / 2.0, b.y + b.h - 2.0));
+    same(h.widget::<Slider<()>>(id).value(), -12.0);
+
+    // Up raises it, as it does on a horizontal one.
+    h.key(key::UP);
+    same(h.widget::<Slider<()>>(id).value(), -11.0);
+    h.key(key::DOWN);
+    same(h.widget::<Slider<()>>(id).value(), -12.0);
+}
+
+#[test]
+fn a_collapsed_section_gives_its_space_back() {
+    let mut h = Harness::sized("fold", (), Size::new(200.0, 200.0), |ui: &mut Ui<()>| {
+        ui.build(
+            column()
+                .gap(10.0)
+                .child(label("top").name("top"))
+                .child(
+                    column()
+                        .name("section")
+                        .child(label("one"))
+                        .child(label("two")),
+                )
+                .child(label("bottom").name("bottom")),
+        )
+    });
+    let [top, section, bottom] = kids(&mut h)[..] else {
+        panic!("three children");
+    };
+    let open = h.bounds(bottom).y;
+    assert!(h.bounds(section).h > 0.0);
+
+    h.ui().set_collapsed(section, true);
+    h.settle();
+    assert!(h.ui().is_collapsed(section));
+    assert!(!h.ui().is_visible(section), "a collapsed subtree is hidden");
+    // The section and one of the two gaps around it are gone.
+    let shut = h.bounds(bottom).y;
+    let t = h.bounds(top);
+    assert!(
+        (shut - (t.y + t.h + 10.0)).abs() < 0.01,
+        "bottom sits one gap below top, got {shut}"
+    );
+    assert!(shut < open);
+
+    h.ui().set_collapsed(section, false);
+    h.settle();
+    assert!(h.ui().is_visible(section));
+    assert!((h.bounds(bottom).y - open).abs() < 0.01);
+}
+
+/// Whether the output pixel just below `content_h` pixels of window
+/// content, at the window's horizontal middle, is the desktop — the same
+/// colour as the desktop on that row to the window's left — rather than
+/// the window or its frame.
+///
+/// Read off the **server's** output, not the harness's window crop:
+/// that crop is cut to the client's own idea of its size, so it would
+/// agree with the client whatever the server did.
+fn desktop_below(h: &mut Harness<()>, content_h: f32) -> bool {
+    let pos = h.ui().window_position();
+    let size = h.ui().window_size();
+    let out = h.output_shot();
+    // Past the frame's bottom border, which is a few pixels thick.
+    let y = (pos.y + content_h + 12.0) as u32;
+    let x = (pos.x + size.w / 2.0) as u32;
+    // The desktop's own colour on that row, halfway between the output's
+    // edge (which has a highlight of its own) and the window's.
+    let desktop = out.pixel((pos.x / 2.0) as u32, y) & 0x00ff_ffff;
+    out.pixel(x, y) & 0x00ff_ffff == desktop
+}
+
+#[test]
+fn a_window_can_fit_itself_to_its_content() {
+    let mut h = Harness::sized("fit", (), Size::new(200.0, 160.0), |ui: &mut Ui<()>| {
+        ui.build(
+            column()
+                .gap(10.0)
+                .child(label("top").name("top").height(30.0))
+                .child(label("folded").name("section").height(60.0)),
+        )
+    });
+    let section = kids(&mut h)[1];
+    h.ui().set_collapsed(section, true);
+    let natural = h.ui().natural_size();
+    assert!(
+        (natural.h - 30.0).abs() < 0.5,
+        "only `top` counts: {natural:?}"
+    );
+    assert!(
+        !desktop_below(&mut h, natural.h),
+        "the tall window covers the probe"
+    );
+
+    // The request goes to the server, which resizes the window **and
+    // its frame** and answers with a `Configure`.
+    h.ui()
+        .request_window_size(Size::new(200.0, natural.h))
+        .unwrap();
+    h.settle();
+    h.wait_for("the server's configure", |h| {
+        (h.ui().window_size().h - natural.h).abs() < 0.5
+    });
+    assert!(
+        desktop_below(&mut h, natural.h),
+        "the frame shrank with the content, leaving desktop below it"
+    );
+
+    // Limits are honoured: the window cannot be asked below its floor.
+    h.ui()
+        .set_window_limits(Size::new(0.0, 50.0), Size::ZERO)
+        .unwrap();
+    h.ui().request_window_size(Size::new(200.0, 10.0)).unwrap();
+    h.settle();
+    h.wait_for("the clamped size", |h| {
+        (h.ui().window_size().h - 50.0).abs() < 0.5
+    });
+}
+
+#[test]
 fn scrolling_is_one_set_transform_and_nothing_else() {
     // The design claim this checks: scrolling moves a group, it does not
     // re-lay-out or repaint anything. Counting mutations is the only way

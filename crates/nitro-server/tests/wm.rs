@@ -673,6 +673,46 @@ fn dragging_an_edge_resizes_and_configures_the_client() {
 }
 
 #[test]
+fn a_client_that_resizes_itself_takes_its_frame_with_it() {
+    let mut h = Harness::start("selfsize", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("selfsize");
+    let mut win = make_window(&mut conn, &mut inbox, 1, "selfsize", WIN, RED, 0, 1);
+    park(&mut h);
+    let before = win.frame(true);
+
+    // `SetBounds` on its own window root is a client's resize request
+    // (`docs/wire.md`): half the height.
+    let small = Size::new(WIN.w, WIN.h / 2.0);
+    conn.tx()
+        .bounds(win.root, Rect::new(0.0, 0.0, small.w, small.h))
+        .commit(2)
+        .unwrap();
+    await_configure(&mut conn, &mut inbox, &mut win, "the self-resize");
+    assert_eq!(win.size, small, "the client is told the size it asked for");
+    let after = win.frame(true);
+    assert_eq!(after.h, before.h - WIN.h / 2.0, "the frame shrank with it");
+    h.settle();
+
+    // What was frame below the new bottom edge is desktop again — the
+    // same colour as the desktop on that row beside the window. Before
+    // the frame was re-laid for a client's own resize, the old frame's
+    // background stayed painted there.
+    let img = h.shot();
+    let y = (after.y + after.h + 10.0) as u32;
+    assert!(
+        y < (before.y + before.h) as u32,
+        "the probe is inside the old frame"
+    );
+    let desktop = rgb(img.pixel((before.x / 2.0) as u32, y));
+    let below = rgb(img.pixel((after.x + after.w / 2.0) as u32, y));
+    assert_eq!(below, desktop, "the old frame is gone below the new edge");
+
+    drop(conn);
+    h.quit();
+}
+
+#[test]
 fn a_resize_respects_the_limits_the_client_declared() {
     let mut h = Harness::start("limits", OUT.0, OUT.1);
     let mut inbox = Inbox::default();

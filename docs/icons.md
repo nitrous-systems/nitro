@@ -70,7 +70,7 @@ server, off a real readback) assert that inequality.
 ships beside the crate as `LICENSE.bootstrap-icons` and is recorded in
 `DEPENDENCIES.md`'s vendored-assets section.
 
-53 icons, in six groups:
+61 icons, in seven groups:
 
 | group | names |
 |---|---|
@@ -79,7 +79,8 @@ ships beside the crate as `LICENSE.bootstrap-icons` and is recorded in
 | settings | `display` `keyboard` `speaker` `palette` `sliders` `gear` |
 | window controls | `x` `dash` `square` `arrows-angle-expand` |
 | files | `folder-fill` `folder2-open` `file-earmark` `file-earmark-text` `file-earmark-image` `file-earmark-zip` `file-earmark-code` `file-earmark-font` `file-earmark-play` `file-earmark-music` `download` `headphones` `images` `film` `trash3` |
-| general | `sun` `moon` `arrow-left` `arrow-up` `chevron-right` `recycle` `check` `circle-fill` `exclamation-triangle` `info-circle` |
+| general | `sun` `moon` `arrow-left` `arrow-up` `chevron-right` `recycle` `check` `circle-fill` `exclamation-triangle` `info-circle` `plus-lg` |
+| player | `play-fill` `pause-fill` `stop-fill` `skip-start-fill` `skip-end-fill` `eject-fill` `repeat` |
 
 **One substitution from the list the task named**, and it is worth
 recording because it is a property of the upstream set rather than a
@@ -99,6 +100,12 @@ Two more substitutions of the same kind, from the split-view work
 the 16-unit grid, which `no_ink_is_clipped_by_the_box` refuses because
 that sliver would be clipped at every size; **`images`** is drawn inside
 the grid and reads the same at 16 px, so Pictures uses it.
+
+And one from `nitro-amp`'s transport. Upstream `shuffle` mixes fill
+rules like the rest of this family, so the player's shuffle control is a
+labelled checkbox rather than an icon button; `repeat` is a single
+nonzero path and is imported as-is. `plus-lg` is the one new icon that is
+`evenodd` upstream, and `even_odd_matches_upstream` lists it.
 
 ### Adding one
 
@@ -193,8 +200,8 @@ Keyed by `(icon index, device px)` → an **A8 coverage mask**.
   is two entries, exactly as a glyph at two sizes is.
 
 **No eviction**, matching the glyph atlas, and for a sharper reason: the
-set is *closed*. 53 icons at the four recommended sizes is 53 × (256 +
-576 + 1 024 + 2 304) ≈ **215 KB** — the whole set, everywhere, at every
+set is *closed*. 61 icons at the four recommended sizes is 61 × (256 +
+576 + 1 024 + 2 304) ≈ **254 KB** — the whole set, everywhere, at every
 size a desktop lays out at. `IconEngine::MAX_BYTES` is 2 MiB, an order of
 magnitude past that, and a raster that would cross it is refused rather
 than evicting something: an LRU for a bounded set answers a question that

@@ -155,7 +155,8 @@ Retained widget tree, Masonry-shaped:
 Ordinary clients, each a small binary:
 
 `nitro-bar`, `nitro-launcher`, `nitro-settings` (display/audio/system),
-`nitro-term`, `nitro-calc`, `nitro-files`. Shell-only privileges (place a
+`nitro-term`, `nitro-calc`, `nitro-files`, `nitro-amp` (a Winamp-style
+music player). Shell-only privileges (place a
 window on the top layer, receive global hotkeys, read the window list) are
 granted per socket by the server on connect (socket path / peer creds), not
 by protocol extensions.

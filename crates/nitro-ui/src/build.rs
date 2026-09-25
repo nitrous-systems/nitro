@@ -185,6 +185,16 @@ pub trait StyleBuilder<S>: Sized {
         self
     }
 
+    /// Start collapsed: out of the parent's layout and hidden, until
+    /// [`Ui::set_collapsed`](crate::Ui::set_collapsed) brings it back.
+    #[must_use]
+    fn collapsed(mut self, on: bool) -> Self {
+        let state = &mut self.built_mut().state;
+        state.style.collapsed = on;
+        state.visible = !on;
+        self
+    }
+
     /// Set the accessible name, for introspection.
     #[must_use]
     fn name(mut self, n: impl Into<String>) -> Self {

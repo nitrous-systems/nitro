@@ -1,0 +1,30 @@
+[package]
+name = "nitro-amp"
+description = "A Winamp-style music player: main window, ten-band equaliser, playlist editor and visualiser, scriptable through `hey`"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The toolkit, and nothing else. Decoding (beyond WAV) and output are
+# child processes — `ffmpeg`, and `pw-cat`/`paplay`/`aplay` — for the
+# reasons `src/source.rs` and `src/sink.rs` give, so a music player
+# costs this tree no codec crate and no audio library.
+nitro-ui = { workspace = true }
+
+[lib]
+name = "nitro_amp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nitro-amp"
+path = "src/main.rs"
+
+[dev-dependencies]
+# The in-process harness: a real server on the fake backend, a real
+# client, real pixels. Never linked into the shipped binary.
+nitro-ui = { workspace = true, features = ["test-support"] }

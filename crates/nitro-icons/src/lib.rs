@@ -439,6 +439,7 @@ mod tests {
             "arrows-angle-expand",
             "chevron-right",
             "list",
+            "plus-lg",
             "sliders",
         ];
         let actual: Vec<&str> = all()

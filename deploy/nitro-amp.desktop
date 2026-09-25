@@ -1,0 +1,18 @@
+[Desktop Entry]
+Type=Application
+Name=nitro-amp
+GenericName=Music Player
+Comment=A Winamp-style music player on nitro-ui
+# See `deploy/nitro-calc.desktop` for why the file name, the app id and
+# `StartupWMClass` are all `nitro-amp`, and why `Icon=` names a symbolic
+# icon rather than a theme one. `just deploy` installs this file.
+#
+# `%F` is stripped by the launcher (it opens no files itself), and hands
+# a file manager's selection to the player, which queues and plays it.
+Exec=nitro-amp %F
+Icon=headphones
+Terminal=false
+StartupWMClass=nitro-amp
+Categories=AudioVideo;Audio;Player;
+MimeType=audio/mpeg;audio/flac;audio/ogg;audio/x-wav;audio/wav;audio/x-vorbis+ogg;audio/opus;audio/mp4;audio/x-mpegurl;audio/x-scpls;
+Keywords=music;audio;player;mp3;playlist;winamp;
