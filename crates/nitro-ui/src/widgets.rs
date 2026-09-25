@@ -2882,7 +2882,12 @@ pub fn checkbox<S: 'static>(label: impl Into<String>) -> CheckboxBuilder<S> {
 /// What a [`Slider`] does when its value changes.
 type ValueFn<S> = Box<dyn Fn(&mut S, &mut Ui<S>, f32)>;
 
-/// A horizontal track with a knob: a number picked from a range.
+/// A track with a knob: a number picked from a range.
+///
+/// Horizontal by default, with the minimum on the left. A
+/// [`vertical`](SliderBuilder::vertical) slider puts the minimum at the
+/// **bottom** — a fader, an equaliser band — because "up is more" is the
+/// convention every mixing desk has taught.
 pub struct Slider<S> {
     value: f32,
     min: f32,
@@ -2890,6 +2895,7 @@ pub struct Slider<S> {
     step: f32,
     enabled: bool,
     dragging: bool,
+    vertical: bool,
     on_change: Option<ValueFn<S>>,
 }
 
@@ -2919,6 +2925,12 @@ impl<S> Slider<S> {
     #[must_use]
     pub fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Whether the track runs bottom-to-top rather than left-to-right.
+    #[must_use]
+    pub fn is_vertical(&self) -> bool {
+        self.vertical
     }
 
     /// Where the value sits in its range, as `0.0..=1.0`.
@@ -2957,10 +2969,17 @@ impl<S: 'static> Slider<S> {
         self.on_change = Some(cb);
     }
 
-    /// The value at pointer x `x` inside a track of width `w`.
-    fn value_at(&self, x: f32, w: f32, knob: f32) -> f32 {
-        let usable = (w - knob).max(1.0);
-        let t = ((x - knob / 2.0) / usable).clamp(0.0, 1.0);
+    /// The value under the pointer at `pos` inside a track of `size`.
+    ///
+    /// Horizontal: left is the minimum. Vertical: the *bottom* is.
+    fn value_at(&self, pos: Point, size: Size, knob: f32) -> f32 {
+        let (along, len) = if self.vertical {
+            (size.h - pos.y, size.h)
+        } else {
+            (pos.x, size.w)
+        };
+        let usable = (len - knob).max(1.0);
+        let t = ((along - knob / 2.0) / usable).clamp(0.0, 1.0);
         self.min + t * (self.max - self.min)
     }
 }
@@ -2968,9 +2987,14 @@ impl<S: 'static> Slider<S> {
 impl<S: 'static> Widget<S> for Slider<S> {
     fn measure(&mut self, cx: &mut MeasureCx<'_, S>, constraints: Constraints) -> Size {
         let theme = cx.theme();
-        // Wide enough to be draggable, tall enough for the knob. The
-        // width is a default: a slider is normally given one, or grows.
-        constraints.constrain(Size::new(theme.slider_knob * 8.0, theme.slider_knob))
+        // Long enough to be draggable, thick enough for the knob. The
+        // length is a default: a slider is normally given one, or grows.
+        let (long, thick) = (theme.slider_knob * 8.0, theme.slider_knob);
+        if self.vertical {
+            constraints.constrain(Size::new(thick, long))
+        } else {
+            constraints.constrain(Size::new(long, thick))
+        }
     }
 
     fn paint(&mut self, cx: &mut PaintCx<'_, S>) {
@@ -2989,6 +3013,36 @@ impl<S: 'static> Widget<S> for Slider<S> {
             (theme.border_width, theme.border)
         };
         let bounds = cx.bounds;
+        if self.vertical {
+            // The same three slots as the horizontal track, turned: the
+            // fill grows up from the bottom edge.
+            let tx = ((bounds.w - track_h) / 2.0).max(0.0);
+            let usable = (bounds.h - knob).max(0.0);
+            let y = bounds.h - knob / 2.0 - usable * self.fraction();
+            cx.rect(
+                0,
+                Rect::new(tx, 0.0, track_h, bounds.h),
+                Fill::Solid(rest),
+                track_h / 2.0,
+                (0.0, Color::TRANSPARENT),
+            );
+            cx.rect(
+                1,
+                Rect::new(tx, y, track_h, bounds.h - y),
+                Fill::Solid(filled),
+                track_h / 2.0,
+                (0.0, Color::TRANSPARENT),
+            );
+            let kx = ((bounds.w - knob) / 2.0).max(0.0);
+            cx.rect(
+                2,
+                Rect::new(kx, y - knob / 2.0, knob, knob),
+                Fill::Solid(knob_face),
+                knob / 2.0,
+                border,
+            );
+            return;
+        }
         let ty = ((bounds.h - track_h) / 2.0).max(0.0);
         let usable = (bounds.w - knob).max(0.0);
         let x = knob / 2.0 + usable * self.fraction();
@@ -3021,17 +3075,17 @@ impl<S: 'static> Widget<S> for Slider<S> {
             return Handled::No;
         }
         let knob = cx.theme().slider_knob;
-        let w = cx.bounds.w;
+        let size = cx.bounds.size();
         match ev {
             Event::PointerDown { pos, button } if *button == button::LEFT => {
                 cx.request_focus();
                 self.dragging = true;
-                let v = self.value_at(pos.x, w, knob);
+                let v = self.value_at(*pos, size, knob);
                 self.set(cx, v);
                 Handled::Yes
             }
             Event::PointerMove { pos } if self.dragging => {
-                let v = self.value_at(pos.x, w, knob);
+                let v = self.value_at(*pos, size, knob);
                 self.set(cx, v);
                 Handled::Yes
             }
@@ -3189,6 +3243,16 @@ impl<S: 'static> SliderBuilder<S> {
         self.slider.enabled = false;
         self
     }
+
+    /// Run the track bottom-to-top: the minimum at the bottom, as a
+    /// fader or an equaliser band has it. The arrow keys keep their
+    /// meaning — Up and Right raise the value, Down and Left lower it —
+    /// so a vertical slider needs no second key map.
+    #[must_use]
+    pub fn vertical(mut self) -> Self {
+        self.slider.vertical = true;
+        self
+    }
 }
 
 impl<S: 'static> StyleBuilder<S> for SliderBuilder<S> {
@@ -3223,6 +3287,7 @@ pub fn slider<S: 'static>(value: f32) -> SliderBuilder<S> {
         step: 0.0,
         enabled: true,
         dragging: false,
+        vertical: false,
         on_change: None,
     };
     let mut built = Built::new(Flex);

@@ -332,7 +332,7 @@ widgets on the wallpaper — before, **0** after (`docs/settings.md`).
 | `Button` | `button` | — | `click`, `activate`, `focus`, `alt_click` | hover/pressed/focused faces; `alt_click` is the middle button |
 | `TextField` | `textfield` | its contents | `set_value`, `submit`, `clear`, `focus` | caret, selection, click-to-place, h-scroll |
 | `Checkbox` | `checkbox` | `true`/`false` | `toggle`, `set_value`, `focus` | Space toggles |
-| `Slider` | `slider` | the number | `set_value`, `focus` | drag, arrows, Home/End, optional step |
+| `Slider` | `slider` | the number | `set_value`, `focus` | drag, arrows, Home/End, optional step; `.vertical()` runs it bottom-to-top (a fader, an equaliser band), with Up still raising it |
 | `Scroll` | `scroll` | the offset | `scroll_to`, `scroll_by`, `focus` | wheel, arrows, PgUp/PgDn, Home/End |
 | `List` | `list` | the **visible** rows, one per line | `activate`, `select`, `scroll_to`, `scroll_by`, `focus` | virtualised: `visible + 2` rows materialised, whatever the model holds; a row's icon is a **name** |
 | `Separator` | `separator` | — | — | spans its container on the other axis |
@@ -722,6 +722,17 @@ pointer, and keystrokes must not land in a field nobody can see. A page
 switch is `SetVisible` ×2, the two rows' fills, the title's `SetText`
 and one commit —
 `clicking_a_sidebar_row_shows_that_page_and_only_that_page` counts them.
+**Collapsing is the other half, and it does relayout.** A page stack
+wants hidden pages to keep their box; a section the user folds *away*
+wants the opposite, or the window keeps a hole where it was.
+`Ui::set_collapsed(id, true)` (and the builder's `.collapsed(true)`)
+sets `LayoutStyle::collapsed`, which the flex solver treats as CSS's
+`display: none` — no size, no margin, and no gap on either side — and
+hides the subtree too, so nothing inside it is hit-tested or tabbed to
+while it has no box. Its scene nodes are kept, so expanding it again
+repaints only what moved. `nitro-amp` folds its equaliser and playlist
+this way; `a_collapsed_section_gives_its_space_back` is the test.
+
 The alternative — placing hidden pages at zero size — re-laid-out every
 eliding label on every switch, which is why the flag exists.
 

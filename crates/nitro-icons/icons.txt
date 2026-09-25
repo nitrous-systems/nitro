@@ -34,6 +34,7 @@ cpu
 dash
 display
 download
+eject-fill
 exclamation-triangle
 file-earmark
 file-earmark-code
@@ -57,11 +58,18 @@ list
 memory
 moon
 palette
+pause-fill
+play-fill
+plus-lg
 recycle
+repeat
 search
+skip-end-fill
+skip-start-fill
 sliders
 speaker
 square
+stop-fill
 sun
 terminal
 trash3

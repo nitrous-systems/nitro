@@ -204,6 +204,80 @@ fn a_slider_follows_the_pointer_and_the_arrow_keys() {
 }
 
 #[test]
+fn a_vertical_slider_has_its_minimum_at_the_bottom() {
+    let mut h = Harness::sized("fader", (), Size::new(80.0, 200.0), |ui: &mut Ui<()>| {
+        let s = ui.build(
+            slider(0.0)
+                .name("band")
+                .range(-12.0, 12.0)
+                .step(1.0)
+                .vertical()
+                .height(160.0),
+        );
+        let root = ui.build(panel().background(Color::WHITE).padding(8.0));
+        ui.attach(root, s).unwrap();
+        root
+    });
+    let id = kids(&mut h)[0];
+    let b = h.bounds(id);
+    // Taller than wide: the measured default turned with the track.
+    assert!(b.h > b.w, "a vertical slider is laid out tall, got {b:?}");
+
+    // Near the top is near the maximum; near the bottom, the minimum.
+    h.click_at(Point::new(b.x + b.w / 2.0, b.y + 2.0));
+    same(h.widget::<Slider<()>>(id).value(), 12.0);
+    h.click_at(Point::new(b.x + b.w / 2.0, b.y + b.h - 2.0));
+    same(h.widget::<Slider<()>>(id).value(), -12.0);
+
+    // Up raises it, as it does on a horizontal one.
+    h.key(key::UP);
+    same(h.widget::<Slider<()>>(id).value(), -11.0);
+    h.key(key::DOWN);
+    same(h.widget::<Slider<()>>(id).value(), -12.0);
+}
+
+#[test]
+fn a_collapsed_section_gives_its_space_back() {
+    let mut h = Harness::sized("fold", (), Size::new(200.0, 200.0), |ui: &mut Ui<()>| {
+        ui.build(
+            column()
+                .gap(10.0)
+                .child(label("top").name("top"))
+                .child(
+                    column()
+                        .name("section")
+                        .child(label("one"))
+                        .child(label("two")),
+                )
+                .child(label("bottom").name("bottom")),
+        )
+    });
+    let [top, section, bottom] = kids(&mut h)[..] else {
+        panic!("three children");
+    };
+    let open = h.bounds(bottom).y;
+    assert!(h.bounds(section).h > 0.0);
+
+    h.ui().set_collapsed(section, true);
+    h.settle();
+    assert!(h.ui().is_collapsed(section));
+    assert!(!h.ui().is_visible(section), "a collapsed subtree is hidden");
+    // The section and one of the two gaps around it are gone.
+    let shut = h.bounds(bottom).y;
+    let t = h.bounds(top);
+    assert!(
+        (shut - (t.y + t.h + 10.0)).abs() < 0.01,
+        "bottom sits one gap below top, got {shut}"
+    );
+    assert!(shut < open);
+
+    h.ui().set_collapsed(section, false);
+    h.settle();
+    assert!(h.ui().is_visible(section));
+    assert!((h.bounds(bottom).y - open).abs() < 0.01);
+}
+
+#[test]
 fn scrolling_is_one_set_transform_and_nothing_else() {
     // The design claim this checks: scrolling moves a group, it does not
     // re-lay-out or repaint anything. Counting mutations is the only way

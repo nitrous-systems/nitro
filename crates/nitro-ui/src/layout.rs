@@ -293,6 +293,19 @@ pub struct LayoutStyle {
     pub flex_shrink: f32,
     /// How far below its measured size this widget may be laid out.
     pub shrink_floor: ShrinkFloor,
+    /// Take this widget out of its parent's layout entirely: no size, no
+    /// margin, and no gap on either side of it — CSS's `display: none`.
+    ///
+    /// Different from hiding. [`Ui::set_node_visible`](crate::Ui::set_node_visible)
+    /// keeps a widget's box and only stops it drawing, which is right
+    /// for a page stack whose pages share one slot and wrong for a
+    /// section the user folds away: a hidden section still holds its
+    /// height, and the window keeps a hole where it was. A collapsed
+    /// one gives the space back to its siblings. Set it with
+    /// [`Ui::set_collapsed`](crate::Ui::set_collapsed), which also hides
+    /// the subtree so nothing in it can be clicked or tabbed to while it
+    /// has no box.
+    pub collapsed: bool,
 }
 
 impl Default for LayoutStyle {
@@ -313,6 +326,7 @@ impl Default for LayoutStyle {
             flex_grow: 0.0,
             flex_shrink: 1.0,
             shrink_floor: ShrinkFloor::Content,
+            collapsed: false,
         }
     }
 }
@@ -459,24 +473,32 @@ impl FlexItem {
 
 /// The main-axis extent a set of children needs with no free space at
 /// all: every child at its measured size, plus margins and gaps.
+///
+/// A [collapsed](LayoutStyle::collapsed) child counts for nothing, gaps
+/// included.
 #[must_use]
 pub fn intrinsic_main(container: &LayoutStyle, items: &[FlexItem]) -> f32 {
     let dir = container.direction;
     let mut total = 0.0;
-    for it in items {
+    let mut n = 0;
+    for it in items.iter().filter(|it| !it.style.collapsed) {
         total += dir.main(it.basis) + it.style.margin.main(dir);
+        n += 1;
     }
-    total + gap_total(container.gap, items.len())
+    total + gap_total(container.gap, n)
 }
 
 /// The cross-axis extent a set of children needs: the widest child plus
-/// its margins.
+/// its margins. A collapsed child counts for nothing.
 #[must_use]
 pub fn intrinsic_cross(container: &LayoutStyle, items: &[FlexItem]) -> f32 {
     let dir = container.direction;
-    items.iter().fold(0.0f32, |acc, it| {
-        acc.max(dir.cross(it.basis) + it.style.margin.cross(dir))
-    })
+    items
+        .iter()
+        .filter(|it| !it.style.collapsed)
+        .fold(0.0f32, |acc, it| {
+            acc.max(dir.cross(it.basis) + it.style.margin.cross(dir))
+        })
 }
 
 fn gap_total(gap: f32, n: usize) -> f32 {
@@ -589,7 +611,60 @@ fn floor_main(it: &FlexItem, dir: Direction) -> f32 {
 /// name. An overflow no child will absorb is left as overflow — the
 /// children run past the container's end and the parent (or the window)
 /// clips them — rather than being squashed into text nobody can read.
+///
+/// A [collapsed](LayoutStyle::collapsed) child is solved as though it
+/// were not there — its siblings share the space and no gap is left
+/// where it was — and is given an empty rect at the container's content
+/// origin, so `out` still has one rect per item.
 pub fn solve(container: &LayoutStyle, inner: Size, items: &[FlexItem], out: &mut Vec<Rect>) {
+    out.clear();
+    if items.is_empty() {
+        return;
+    }
+    if items.iter().any(|it| it.style.collapsed) {
+        solve_without_collapsed(container, inner, items, out);
+        return;
+    }
+    solve_present(container, inner, items, out);
+}
+
+/// [`solve`] for a set that has collapsed children: solve the rest, then
+/// thread an empty rect back in at each collapsed position.
+///
+/// A separate path rather than a filter inside the main loop so that the
+/// ordinary case — nothing collapsed, which is every container in the
+/// tree nearly all of the time — pays one scan and no clone.
+fn solve_without_collapsed(
+    container: &LayoutStyle,
+    inner: Size,
+    items: &[FlexItem],
+    out: &mut Vec<Rect>,
+) {
+    let present: Vec<FlexItem> = items
+        .iter()
+        .filter(|it| !it.style.collapsed)
+        .cloned()
+        .collect();
+    let mut placed = Vec::with_capacity(present.len());
+    solve_present(container, inner, &present, &mut placed);
+    let origin = container.direction.rect(
+        container.padding.main_start(container.direction),
+        container.padding.cross_start(container.direction),
+        0.0,
+        0.0,
+    );
+    let mut placed = placed.into_iter();
+    for it in items {
+        if it.style.collapsed {
+            out.push(origin);
+        } else {
+            out.push(placed.next().unwrap_or(origin));
+        }
+    }
+}
+
+/// The flex solve proper, over children none of which is collapsed.
+fn solve_present(container: &LayoutStyle, inner: Size, items: &[FlexItem], out: &mut Vec<Rect>) {
     out.clear();
     if items.is_empty() {
         return;
@@ -764,6 +839,48 @@ mod tests {
         assert_eq!(out[1], Rect::new(0.0, 28.0, 30.0, 10.0));
         assert_close!(intrinsic_main(&style, &items), 38.0);
         assert_close!(intrinsic_cross(&style, &items), 50.0);
+    }
+
+    /// `item` with `collapsed` set.
+    fn collapsed(basis: Size) -> FlexItem {
+        let mut it = item(basis);
+        it.style.collapsed = true;
+        it
+    }
+
+    #[test]
+    fn a_collapsed_child_takes_no_space_and_no_gap() {
+        let style = LayoutStyle {
+            padding: Edges::all(3.0),
+            ..column(8.0)
+        };
+        let items = [
+            item(Size::new(50.0, 20.0)),
+            collapsed(Size::new(70.0, 40.0)),
+            item(Size::new(30.0, 10.0)),
+        ];
+        let mut out = Vec::new();
+        solve(&style, Size::new(100.0, 100.0), &items, &mut out);
+        assert_eq!(out.len(), 3, "one rect per item, collapsed or not");
+        assert_eq!(out[0], Rect::new(3.0, 3.0, 50.0, 20.0));
+        // One gap between the two present children, not two.
+        assert_eq!(out[2], Rect::new(3.0, 31.0, 30.0, 10.0));
+        assert_eq!(out[1], Rect::new(3.0, 3.0, 0.0, 0.0));
+        // Neither its height nor its width is asked for.
+        assert_close!(intrinsic_main(&style, &items), 38.0);
+        assert_close!(intrinsic_cross(&style, &items), 50.0);
+    }
+
+    #[test]
+    fn a_collapsed_child_gives_its_share_of_the_growth_back() {
+        let style = column(0.0);
+        let mut hidden = flexible(Size::new(10.0, 10.0), 1.0);
+        hidden.style.collapsed = true;
+        let items = [flexible(Size::new(10.0, 10.0), 1.0), hidden];
+        let mut out = Vec::new();
+        solve(&style, Size::new(10.0, 100.0), &items, &mut out);
+        assert_close!(out[0].h, 100.0);
+        assert_close!(out[1].h, 0.0);
     }
 
     #[test]

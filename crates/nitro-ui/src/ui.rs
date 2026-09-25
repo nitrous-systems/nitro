@@ -1112,6 +1112,43 @@ impl<S: 'static> Ui<S> {
         }
     }
 
+    /// Take a widget out of its parent's layout, or put it back.
+    ///
+    /// The fold-away primitive, and the complement of
+    /// [`Ui::set_node_visible`]: a hidden widget keeps its box, a
+    /// collapsed one gives it back — its siblings share the space and
+    /// no gap is left where it was (see [`LayoutStyle::collapsed`]).
+    /// It is hidden as well, because a subtree with no box must not be
+    /// hit-tested or reached by Tab either, and shown again on the way
+    /// back.
+    ///
+    /// Collapsing costs the parent's re-layout and one `SetVisible`;
+    /// the subtree's scene nodes are kept, so expanding it again
+    /// repaints nothing that did not move.
+    pub fn set_collapsed(&mut self, id: WidgetId, collapsed: bool) {
+        let Some(slot) = self.arena.slot(id) else {
+            return;
+        };
+        if slot.state.style.collapsed == collapsed {
+            return;
+        }
+        let parent = slot.state.parent;
+        let mut style = slot.state.style.clone();
+        style.collapsed = collapsed;
+        self.set_style(id, style);
+        if let Some(p) = parent {
+            self.mark(p, Dirty::LAYOUT);
+        }
+        self.set_node_visible(id, !collapsed);
+    }
+
+    /// Whether `id` is collapsed out of its parent's layout; see
+    /// [`Ui::set_collapsed`].
+    #[must_use]
+    pub fn is_collapsed(&self, id: WidgetId) -> bool {
+        self.arena.slot(id).is_some_and(|s| s.state.style.collapsed)
+    }
+
     /// Whether `id` is shown — its own flag **and** every ancestor's,
     /// since a widget inside a hidden page is not on screen either. See
     /// [`Ui::set_node_visible`].
