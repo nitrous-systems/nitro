@@ -5566,17 +5566,9 @@ impl Server {
         }
     }
 
-    /// `BindKey`: claim a server-global chord.
     /// `Lock` from a shell client. See [`lock`] for the rules.
     fn shell_lock(&mut self, token: u64) -> bool {
-        if !self.lock.is_locked() {
-            // Before the gate closes, while these windows may still be told
-            // things: the focused one loses the keyboard and the hovered one
-            // the pointer, as they would on a VT switch.
-            self.focus_before_lock = self.focus;
-            self.set_focus(None);
-            self.release_pointer_for_lock();
-        }
+        let was_locked = self.lock.is_locked();
         match self.lock.claim(token) {
             Ok(how) => {
                 match how {
@@ -5584,7 +5576,49 @@ impl Server {
                     lock::Claimed::TookOver => info!("lock taken over by a new owner"),
                     lock::Claimed::Already => {}
                 }
+                if !was_locked {
+                    // The hovered window loses the pointer, as it would on a
+                    // VT switch. `PointerLeave` is not input, so it still
+                    // reaches a window the gate is about to hide.
+                    self.release_pointer_for_lock();
+                }
                 self.sync_admit();
+                if !was_locked {
+                    // What the unlock hands the keyboard back to: the focused
+                    // window, unless that is the lock screen's own (it made
+                    // its window before sending `Lock`), in which case the
+                    // application that had it before that.
+                    self.focus_before_lock = match self.focus {
+                        Some(w) if self.scene.admits_window(w) => self
+                            .wm
+                            .mru()
+                            .iter()
+                            .copied()
+                            .find(|w| !self.scene.admits_window(*w) && self.focusable(*w)),
+                        other => other,
+                    };
+                }
+                // A focus the lock does not admit is taken away (the window
+                // is told), and the lock screen gets the keyboard if it
+                // already has a window: one made before `Lock`, or while
+                // the lock had no owner, was refused the focus then and
+                // would otherwise never get it.
+                if let Some(w) = self.focus
+                    && !self.scene.admits_window(w)
+                {
+                    self.set_focus(None);
+                }
+                if self.focus.is_none() {
+                    let own = self
+                        .wm
+                        .mru()
+                        .iter()
+                        .copied()
+                        .find(|w| self.scene.admits_window(*w) && self.focusable(*w));
+                    if own.is_some() {
+                        self.set_focus(own);
+                    }
+                }
                 true
             }
             Err(e) => {
@@ -5653,6 +5687,7 @@ impl Server {
         self.scene.set_admit(admit);
     }
 
+    /// `BindKey`: claim a server-global chord.
     fn shell_bind_key(&mut self, token: u64, m: msg::BindKey) -> bool {
         match self.hotkeys.bind(token, m.id, m.mods, m.keysym) {
             Ok(()) => true,

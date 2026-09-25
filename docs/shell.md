@@ -175,6 +175,12 @@ Locking also:
 
 - takes the focus away (the focused window is told) and remembers it for
   the unlock;
+- gives the keyboard to the lock screen's window if it already has one.
+  A lock screen may map its window before it sends `Lock`, and a window
+  made while the lock had no owner was refused the focus: without this
+  either would need a click before it could read a password. When the
+  focus at the `Lock` was already the lock screen's, the unlock hands it
+  back to the most recently used application window instead;
 - sends the hovered window a `PointerLeave`;
 - drops a drag in flight;
 - resets the Super-tap state.
@@ -726,8 +732,9 @@ not working":
   re-spanning after a hotplug.
 * The session lock: `src/lock.rs` unit-tests the ownership rules,
   `nitro-scene/tests/admit.rs` the paint and hit-test filter and its
-  damage, and nine cases in `tests/shell.rs` drive it through the event
-  loop: started locked, input and focus, bindings and chords, a held grab,
+  damage, and eleven cases in `tests/shell.rs` drive it through the event
+  loop: started locked, input and focus, a lock window made before the
+  `Lock` (and before a takeover), bindings and chords, a held grab,
   a Super-drag, `FocusWindow`, refusals, and a lock screen that dies. Each
   gate was removed in turn to check that a test fails without it
   (§[Every input path asks the same question](#every-input-path-asks-the-same-question)).

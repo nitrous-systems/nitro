@@ -2377,9 +2377,15 @@ fn make_lock_screen(h: &Harness, name: &str) -> (Connection, Inbox, Win) {
     let mut conn = h.shell(name);
     conn.lock().unwrap();
     conn.flush().unwrap();
+    let win = make_lock_window(h, &mut conn, &mut inbox);
+    (conn, inbox, win)
+}
+
+/// The lock screen's green window, anchored bottom-right.
+fn make_lock_window(h: &Harness, conn: &mut Connection, inbox: &mut Inbox) -> Win {
     let win = make_window(
-        &mut conn,
-        &mut inbox,
+        conn,
+        inbox,
         50,
         "lock",
         Size::new(120.0, 80.0),
@@ -2397,9 +2403,9 @@ fn make_lock_screen(h: &Harness, name: &str) -> (Connection, Inbox, Win) {
         .unwrap();
     conn.flush().unwrap();
     let mut win = win;
-    await_configure(&mut conn, &mut inbox, &mut win, "the lock screen's anchor");
+    await_configure(conn, inbox, &mut win, "the lock screen's anchor");
     h.settle();
-    (conn, inbox, win)
+    win
 }
 
 /// Whether `(x, y)` is inside `w`.
@@ -2601,6 +2607,106 @@ fn while_locked_input_reaches_only_the_lock_owner_and_focus_comes_back() {
             ServerMsg::Key(k) if k.keycode == KEY_A => Some(()),
             _ => None,
         },
+    );
+
+    drop((app, lock));
+    h.quit();
+}
+
+/// A key press and release, then whether it reached `conn`.
+fn key_reaches(h: &mut Harness, conn: &mut Connection, inbox: &mut Inbox, what: &str) {
+    h.key(KEY_A, true);
+    h.key(KEY_A, false);
+    expect(conn, &mut inbox.0, what, |m| match m {
+        ServerMsg::Key(k) if k.keycode == KEY_A => Some(()),
+        _ => None,
+    });
+}
+
+#[test]
+fn a_lock_screen_whose_window_came_first_gets_the_keyboard() {
+    let mut h = Harness::start("lock-window-first", OUT.0, OUT.1);
+    let (mut app, mut app_inbox, _) = make_app(&h);
+    expect(&mut app, &mut app_inbox.0, "the app's focus", |m| match m {
+        ServerMsg::Focus(f) if f.focused => Some(()),
+        _ => None,
+    });
+
+    // The lock screen maps its window *before* it locks. The window takes
+    // the focus on creation, and `Lock` must leave it there rather than
+    // clear it: a password prompt that needs a click first is a bug.
+    let mut lock_inbox = Inbox::default();
+    let mut lock = h.shell("lock");
+    let _ = make_lock_window(&h, &mut lock, &mut lock_inbox);
+    lock.lock().unwrap();
+    lock.flush().unwrap();
+    wait_for("the lock", || h.stat("lock_owned") == 1);
+    h.settle();
+    pump(&mut app, &mut app_inbox);
+    app_inbox.0.clear();
+
+    key_reaches(
+        &mut h,
+        &mut lock,
+        &mut lock_inbox,
+        "the key at the lock screen",
+    );
+    h.settle();
+    pump(&mut app, &mut app_inbox);
+    assert_eq!(
+        got_input(&app_inbox),
+        Vec::<&str>::new(),
+        "input reached the app"
+    );
+
+    // The unlock hands the keyboard back to the application, not to the
+    // lock screen's window, which was the focus at the moment of `Lock`.
+    lock.unlock().unwrap();
+    lock.flush().unwrap();
+    expect(
+        &mut app,
+        &mut app_inbox.0,
+        "focus back after the unlock",
+        |m| match m {
+            ServerMsg::Focus(f) if f.focused => Some(()),
+            _ => None,
+        },
+    );
+    key_reaches(&mut h, &mut app, &mut app_inbox, "a key after the unlock");
+
+    drop((app, lock));
+    h.quit();
+}
+
+#[test]
+fn a_lock_screen_that_takes_over_a_started_lock_gets_the_keyboard() {
+    let mut h = Harness::start_with("lock-takeover-focus", OUT.0, OUT.1, |c| c.locked = true);
+    let (mut app, mut app_inbox, _) = make_app(&h);
+
+    // The window comes first, while the lock has no owner: it is refused
+    // the focus then (nothing is admitted), so the takeover must give it.
+    let mut lock_inbox = Inbox::default();
+    let mut lock = h.shell("lock");
+    let _ = make_lock_window(&h, &mut lock, &mut lock_inbox);
+    lock.lock().unwrap();
+    lock.flush().unwrap();
+    wait_for("the takeover", || h.stat("lock_owned") == 1);
+    h.settle();
+    pump(&mut app, &mut app_inbox);
+    app_inbox.0.clear();
+
+    key_reaches(
+        &mut h,
+        &mut lock,
+        &mut lock_inbox,
+        "the key at the lock screen",
+    );
+    h.settle();
+    pump(&mut app, &mut app_inbox);
+    assert_eq!(
+        got_input(&app_inbox),
+        Vec::<&str>::new(),
+        "input reached the app"
     );
 
     drop((app, lock));
