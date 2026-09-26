@@ -30,7 +30,10 @@
 //!
 //! [`Shape::Arrow`] is the X11 `left_ptr`: tip at the top-left corner, a
 //! vertical left edge, a diagonal right edge down to the shoulder, and a
-//! two-pixel tail running down and to the right at exactly 45°. The
+//! two-pixel stem running down and to the right from the notch, one
+//! column every two rows (about 63°) — steeper than the 45° body edge, as
+//! in `left_ptr` and the classic Windows arrow. The
+
 //! transcription was checked against `/usr/share/icons/Adwaita/cursors/
 //! left_ptr` (X11's own cursor, public domain in shape if not in any one
 //! file) by decoding its 24 px frame and comparing the silhouette; nothing
@@ -180,13 +183,15 @@ pub const HOTSPOT: (i32, i32) = (0, 0);
 
 /// The ordinary pointer: X11's `left_ptr`.
 ///
-/// Tip at `(0, 0)`, a vertical left edge sixteen pixels long, a diagonal
-/// right edge down to the shoulder, and a **two-pixel tail at exactly
-/// 45°** — each row of the tail is shifted one column from the row above,
-/// which `the_tails_run_is_a_forty_five_degree_diagonal` pins. The old art
-/// had a four-pixel-wide tail leaving the notch three columns too far
-/// right, which read as a check mark rather than an arrow; that is what
-/// the box reported as "the mouse pointer tail is weird (off angle)".
+/// Tip at `(0, 0)`, a vertical left edge eighteen pixels long, a diagonal
+/// right edge down to the shoulder, and a **two-pixel stem that steps one
+/// column right every two rows** (about 63°), closed by a rounded cap —
+/// which `the_tail_is_steeper_than_the_body_edge` pins. The first art had
+/// a four-pixel-wide tail leaving the notch too far right (#3724); its
+/// replacement ran the stem at exactly 45°, parallel to the body edge,
+/// and still read as a check mark (#3820). `left_ptr` at 24 px and the
+/// Windows arrow both advance the stem one column per two rows.
+
 const ARROW: Mask = [
     b"#                       ",
     b"##                      ",
@@ -201,16 +206,16 @@ const ARROW: Mask = [
     b"#.........#             ",
     b"#..........#            ",
     b"#......#####            ",
-    b"#..#..#                 ",
-    b"#.# #..#                ",
-    b"##   #..#               ",
+    b"#...#..#                ",
+    b"#..# #..#               ",
+    b"#.#  #..#               ",
+    b"##    #..#              ",
     b"#     #..#              ",
     b"       #..#             ",
+    b"       #..#             ",
     b"        #..#            ",
-    b"         #..#           ",
-    b"          #..#          ",
-    b"           ####         ",
-    b"                        ",
+    b"        #..#            ",
+    b"         ##             ",
     b"                        ",
 ];
 
@@ -637,44 +642,46 @@ mod tests {
         assert_eq!(pixel(&c, Shape::Arrow, 3, 6), [0xFF, 0xFF, 0xFF, 0xFF]);
     }
 
-    /// #3724's first report: "the mouse pointer tail is weird (off
-    /// angle)". The old art ran a four-pixel-wide tail out of the notch
-    /// three columns too far right, which reads as a check mark.
-    ///
-    /// A `left_ptr`'s tail is **two pixels wide at exactly 45°**, so each
-    /// row of it starts one column further right than the row above. That
-    /// is a property of the art a test can hold, and it is the one that
-    /// was wrong.
+    /// #3724's report: "the mouse pointer tail is weird (off angle)".
+    /// A 45° stem, parallel to the body's diagonal edge, still read as a
+    /// check mark (#3820). `left_ptr` and the Windows arrow step their
+    /// stem one column right every **two** rows — steeper than the body
+    /// edge — and that is the property this test holds.
     #[test]
-    fn the_tails_run_is_a_forty_five_degree_diagonal() {
+    fn the_tail_is_steeper_than_the_body_edge() {
         let c = Cursor::new();
         let art = rows(&c, Shape::Arrow);
-        // The tail is everything below the shoulder that is right of the
-        // arrow's left edge: rows where the leftmost ink is not column 0.
-        let starts: Vec<(usize, usize)> = art
-            .iter()
-            .enumerate()
-            .filter_map(|(y, row)| row.find(|ch| ch != ' ').map(|x| (y, x)))
-            .filter(|(_, x)| *x > 0)
+        // The stem is the last ink run of each row below the shoulder
+        // (row 12): outline, two interior, outline.
+        let starts: Vec<usize> = (13..=21)
+            .map(|y| {
+                let row = art[y].trim_end();
+                let x = row.len() - 4;
+                assert_eq!(
+                    &row[x..],
+                    "#..#",
+                    "stem row {y} is not 4 px across: {row:?}"
+                );
+                assert_ne!(
+                    row.as_bytes()[x - 1],
+                    b'#',
+                    "stem row {y} is wider than 4 px"
+                );
+                x
+            })
             .collect();
-        assert!(starts.len() >= 5, "no tail rows found in {art:#?}");
-        for w in starts.windows(2) {
-            let ((y0, x0), (y1, x1)) = (w[0], w[1]);
-            assert_eq!(y1, y0 + 1, "the tail's rows are contiguous");
-            assert_eq!(
-                x1,
-                x0 + 1,
-                "row {y1} of the tail starts at column {x1}, not {}",
-                x0 + 1
-            );
+        assert_eq!(starts, [4, 5, 5, 6, 6, 7, 7, 8, 8], "{art:#?}");
+        for w in starts.windows(3) {
+            // At most one column per row, and never two advances running:
+            // a slope of at least 2:1, steeper than the 45° body edge.
+            assert!(w[1] - w[0] <= 1 && w[2] - w[1] <= 1, "{w:?}");
+            assert!(w[2] - w[0] <= 1, "{w:?} is 45°");
         }
-        // And it is two pixels wide, not four: every tail row but the last
-        // (the closing `####`) has a four-character run — two outline, two
-        // interior — and none is wider.
-        for (y, x) in &starts[..starts.len() - 1] {
-            let run = art[*y][*x..].trim_end().len();
-            assert_eq!(run, 4, "tail row {y} is {run} px across, not 4");
-        }
+        // The stem leaves the notch under the shoulder's start, no jog.
+        assert_eq!(art[12].find("#####"), Some(starts[0] + 3));
+        // A rounded cap closes it, and nothing is below.
+        assert_eq!(art[22].trim_end(), "         ##");
+        assert!(art[23].trim().is_empty());
     }
 
     /// A double arrow points both ways, so it is symmetric about its
@@ -855,8 +862,13 @@ mod tests {
             assert_eq!(at(x, y), black, "({x}, {y}) is not the tip's block");
         }
         // And the arrow reaches twice as far: row 21 of the art is the
-        // tail's close, which at 2× lands at device y = 4 + 42.
-        assert_ne!(at(4 + 22, 4 + 42), SENTINEL, "the 2x arrow is 48 px tall");
+        // stem's last full row (cols 8–11), which at 2× lands at
+        // device y = 4 + 42.
+        assert_ne!(
+            at(4 + 2 * 9, 4 + 2 * 21),
+            SENTINEL,
+            "the 2x arrow is 48 px tall"
+        );
     }
 
     #[test]
