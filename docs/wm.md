@@ -428,9 +428,8 @@ vertical left edge, a diagonal right edge to the shoulder, and a **2-px
 stem stepping one column right every two rows** (about 63°, steeper than
 the 45° body edge), closed by a rounded cap
 (`the_tail_is_steeper_than_the_body_edge`). An intermediate 45° stem ran
-parallel to the body edge and still read as a check mark (#3820). The shape was checked
-
-against X11's own `left_ptr` by decoding
+parallel to the body edge and still read as a check mark (#3820). The
+shape was checked against X11's own `left_ptr` by decoding
 `/usr/share/icons/Adwaita/cursors/left_ptr`'s 24-px frame and comparing
 silhouettes; no file is vendored, the art is transcribed.
 

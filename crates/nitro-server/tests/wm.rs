@@ -3284,7 +3284,6 @@ fn the_cursor_is_painted_at_the_outputs_scale() {
     // And the ink really does reach into that square's far half, which a
     // 24-px arrow drawn at 1x could not: the tail's cap is at art row
     // 22, so device row py + 44.
-
     assert!(
         ink.iter().any(|(_, y)| *y >= py as u32 + 40),
         "the arrow stopped short of 2x: it was painted at 1x"

@@ -33,7 +33,6 @@
 //! two-pixel stem running down and to the right from the notch, one
 //! column every two rows (about 63°) — steeper than the 45° body edge, as
 //! in `left_ptr` and the classic Windows arrow. The
-
 //! transcription was checked against `/usr/share/icons/Adwaita/cursors/
 //! left_ptr` (X11's own cursor, public domain in shape if not in any one
 //! file) by decoding its 24 px frame and comparing the silhouette; nothing
@@ -191,7 +190,6 @@ pub const HOTSPOT: (i32, i32) = (0, 0);
 /// replacement ran the stem at exactly 45°, parallel to the body edge,
 /// and still read as a check mark (#3820). `left_ptr` at 24 px and the
 /// Windows arrow both advance the stem one column per two rows.
-
 const ARROW: Mask = [
     b"#                       ",
     b"##                      ",
