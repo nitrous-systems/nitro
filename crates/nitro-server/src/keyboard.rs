@@ -435,9 +435,23 @@ pub fn is_alt(keysym: u32) -> bool {
     )
 }
 
+/// Whether a keysym is `Escape`, which dismisses a grabbing popup chain.
+/// See `docs/wm.md` § Popups.
+#[must_use]
+pub fn is_escape(keysym: u32) -> bool {
+    keysym == xkb::keysyms::KEY_Escape
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Hotkey, Keyboard, Mods, hotkey, is_alt, mod_of_keysym};
+    use super::{Hotkey, Keyboard, Mods, hotkey, is_alt, is_escape, mod_of_keysym};
+
+    #[test]
+    fn escape_is_escape_and_nothing_else_is() {
+        assert!(is_escape(xkbcommon::xkb::keysyms::KEY_Escape));
+        assert!(!is_escape(xkbcommon::xkb::keysyms::KEY_q));
+        assert!(!is_escape(0));
+    }
     use xkbcommon::xkb;
 
     /// evdev `KEY_A`, from `linux/input-event-codes.h`.

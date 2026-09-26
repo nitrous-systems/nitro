@@ -853,7 +853,48 @@ struct Server {
     /// that window's coordinates.
     touch_targets: HashMap<i32, (WindowKey, Point)>,
     /// Windows created while no output existed, waiting for one.
+    ///
+    /// **Never a popup.** This list drains into `place_new_window`, which
+    /// decorates and centre-cascades — wrong for a menu in every
+    /// particular. A popup whose parent has nowhere to be is dismissed at
+    /// once instead; see [`Server::map_popup`].
     unplaced: Vec<(ClientId, WindowKey)>,
+    /// Every popup the server has mapped, live or dismissed-but-not-yet-
+    /// destroyed, with the positioner it asked for. See [`popup`].
+    ///
+    /// The server's own index, not the scene's parent links, because
+    /// `Scene::destroy_window` runs inside `clients::apply` — before
+    /// `forget_closed` sees the closed window — so by then the scene's
+    /// edge from a dead parent to its popups is already gone.
+    popups: HashMap<WindowKey, popup::PopupInfo>,
+    /// The outermost popup of the chain holding the **pointer grab**, if
+    /// any: a press outside that chain dismisses it and is consumed.
+    popup_grab: Option<WindowKey>,
+    /// A press was consumed by a grab, so its release must be too: a
+    /// client must never see an unpaired `Released`.
+    grab_click_consumed: bool,
+    /// Escape dismissed a grabbing chain, so its release is swallowed for
+    /// the same reason.
+    escape_consumed: bool,
+    /// Popups unmapped and owing their client a `PopupDone`, deepest
+    /// first.
+    ///
+    /// Deferred for `pending_focus`'s reason and not a line further: a
+    /// dismissal can run with the owning client lifted out of
+    /// `wire_clients` by `Server::commit` (a parent destroyed by its own
+    /// `DestroyNode`), where `send_to_window` would find nothing and drop
+    /// the message. **Dismissal only ever enqueues; `settle` is the only
+    /// sender.**
+    pending_popup_done: Vec<WindowKey>,
+    /// A popup mapped or unmapped this wakeup, so what is under a
+    /// *stationary* pointer changed: re-run enter/leave after the next
+    /// scene update. Without it a menu mapped under the pointer never gets
+    /// its first `PointerEnter`, and a client whose menu vanished under it
+    /// believes the pointer is still inside.
+    popup_pointer_refresh: bool,
+    /// Scratch for the popup chain walks, reused so a title-bar drag with a
+    /// menu open allocates nothing per motion event (`docs/budget.md`).
+    popup_scratch: Vec<WindowKey>,
     /// Newest input timestamp not yet consumed by a frame; see
     /// [`Server::note_input`].
     pending_input_ns: u64,
@@ -1149,6 +1190,13 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         pending_focus: None,
         touch_targets: HashMap::new(),
         unplaced: Vec::new(),
+        popups: HashMap::new(),
+        popup_grab: None,
+        grab_click_consumed: false,
+        escape_consumed: false,
+        pending_popup_done: Vec::new(),
+        popup_pointer_refresh: false,
+        popup_scratch: Vec::new(),
         pending_input_ns: 0,
         defer: defer::DeferredFlip::new().map_err(errno("create the deferred-flip timer"))?,
         zones: shell::Zones::new(),
@@ -1260,9 +1308,10 @@ fn is_shell_op(msg: &ClientMsg) -> bool {
 /// implement.
 ///
 /// The protocol surface landed ahead of the behaviour (task #3767), so the
-/// twelve ops below decode but are refused: `Server::caps` advertises none
-/// of the M5 bits, so no conformant client sends one, and a client that
-/// does anyway hears why instead of being silently ignored.
+/// ten ops below decode but are refused: `Server::caps` advertises none
+/// of their bits, so no conformant client sends one, and a client that
+/// does anyway hears why instead of being silently ignored. The two popup
+/// ops left this list with #3773 (`caps::POPUP`).
 ///
 /// `ClientCaps` (0x0003) is deliberately **not** here: it is accepted and
 /// recorded, because the rule that makes it safe — the server must not
@@ -1276,9 +1325,7 @@ fn is_shell_op(msg: &ClientMsg) -> bool {
 fn is_m5_op(msg: &ClientMsg) -> bool {
     matches!(
         msg,
-        ClientMsg::CreatePopup(_)
-            | ClientMsg::RepositionPopup(_)
-            | ClientMsg::SetCursor(_)
+        ClientMsg::SetCursor(_)
             | ClientMsg::StartMove(_)
             | ClientMsg::StartResize(_)
             | ClientMsg::ListOutputs(_)
@@ -1288,6 +1335,15 @@ fn is_m5_op(msg: &ClientMsg) -> bool {
             | ClientMsg::StartDrag(_)
             | ClientMsg::AcceptDrop(_)
             | ClientMsg::FinishDrag(_)
+    )
+}
+
+/// Whether a message is one of the popup ops, i.e. needs the client to
+/// have listed `caps::POPUP` in its `ClientCaps`.
+fn is_popup_op(msg: &ClientMsg) -> bool {
+    matches!(
+        msg,
+        ClientMsg::CreatePopup(_) | ClientMsg::RepositionPopup(_)
     )
 }
 
@@ -1782,11 +1838,16 @@ impl Server {
             .filter(|w| {
                 self.scene
                     .window_info(*w)
-                    .is_ok_and(|i| i.output().is_none())
+                    .is_ok_and(|i| i.output().is_none() && !i.is_popup())
             })
             .collect();
         if orphans.is_empty() {
             return;
+        }
+        // An orphaned parent's popups are dismissed, not migrated — and
+        // *before* the migration, so no popup is ever briefly a toplevel.
+        for win in &orphans {
+            self.dismiss_popups_of(*win);
         }
         info!(
             "migrating {} window(s) to the primary output",
@@ -2189,7 +2250,17 @@ impl Server {
         if let Some(win) = self.pending_focus.take() {
             self.focus_window(Some(win));
         }
+        // The same deferral for `PopupDone`: dismissal can run with the
+        // owning client out of the map. Drained before the update, so the
+        // unmap is already recorded when the client hears (unmap, then
+        // notify).
+        self.flush_popup_done();
         self.update_scene();
+        // A popup mapped or unmapped under a stationary pointer changed
+        // what the pointer is over; hit testing needs the update above.
+        if std::mem::take(&mut self.popup_pointer_refresh) {
+            self.refresh_pointer_over();
+        }
         self.claim_input_stamp();
         self.paint_or_defer();
         self.answer_idle_clients();
@@ -3094,6 +3165,33 @@ impl Server {
         /// Linux evdev `BTN_RIGHT`.
         const BTN_RIGHT: u32 = 0x111;
 
+        // The popup grab goes **first** — above the release/drag branch and
+        // the Super-drag and frame-region branches. Below them, a press on
+        // a title bar with a menu open would start a drag instead of
+        // dismissing, and the swallowed press's release would fall through
+        // to `pointer.over` as an unpaired `Released`.
+        if state == ButtonState::Released && self.grab_click_consumed {
+            self.grab_click_consumed = false;
+            self.note_input(time_ns);
+            return;
+        }
+        if state == ButtonState::Pressed
+            && let Some(root) = self.popup_grab
+        {
+            let inside = self
+                .window_under_pointer()
+                .is_some_and(|w| self.in_popup_chain(w, root));
+            if !inside {
+                // Outside the chain: the whole chain goes and the click is
+                // consumed — not delivered, not a raise, not a focus.
+                self.hotkeys.cancel_tap();
+                self.dismiss_chain(root);
+                self.grab_click_consumed = true;
+                self.note_input(time_ns);
+                return;
+            }
+        }
+
         // A click while a modifier is held is not a bare-modifier tap. This
         // is what keeps `Super`-drag (`docs/wm.md`) and the launcher's
         // bare-Super trigger from being the same gesture: a drag ends with
@@ -3340,6 +3438,28 @@ impl Server {
             self.note_input(time_ns);
             return;
         }
+        // A grabbing popup chain owns Escape: it dismisses the whole chain
+        // and is consumed. After the compositor's own table (which is not
+        // negotiable), before the shell's bindings (a live grab outranks a
+        // shell hotkey for the reason it outranks focus). `cancel_tap`
+        // rather than feeding `hotkeys.key`: something that was not a
+        // bare-modifier tap happened, and discarding a binding list here
+        // would swallow a hotkey's release half.
+        if !pressed && self.escape_consumed && keyboard::is_escape(resolved.keysym) {
+            self.escape_consumed = false;
+            self.note_input(time_ns);
+            return;
+        }
+        if pressed
+            && keyboard::is_escape(resolved.keysym)
+            && let Some(root) = self.popup_grab
+        {
+            self.hotkeys.cancel_tap();
+            self.dismiss_chain(root);
+            self.escape_consumed = true;
+            self.note_input(time_ns);
+            return;
+        }
         // A shell's own bindings come next: after the compositor's, which are
         // not negotiable, and before any client's, because a global hotkey
         // the focused application could also see would be both a keylogger
@@ -3561,6 +3681,7 @@ impl Server {
             self.pointer.over = None;
         }
         self.touch_targets.retain(|_, (w, _)| *w != win);
+        self.popup_window_gone(win);
         self.forget_window(win);
     }
 
@@ -4381,6 +4502,7 @@ impl Server {
             return;
         }
         self.configure(win);
+        self.reflow_popups(win);
     }
 
     /// Set a window's **frame** rectangle: position and content size at
@@ -4414,6 +4536,7 @@ impl Server {
         }
         self.relayout_frame(win);
         self.configure(win);
+        self.reflow_popups(win);
     }
 
     /// Re-lay a window's decorations for its current size.
@@ -4480,6 +4603,8 @@ impl Server {
             self.reflow_work_area();
         }
         if state == WindowState::Minimized {
+            // A window that stops showing takes its menus with it.
+            self.dismiss_popups_of(win);
             // The pointer may be on one of this window's frame buttons —
             // in fact it *is*, in the case that matters: clicking
             // minimize hides the frame with its own disc still filled.
@@ -5351,12 +5476,12 @@ impl Server {
                 true
             }
             other => {
-                // The M5-A ops decode but are not implemented: this server
-                // advertises no bit above 7, so no conformant client sends
-                // one. Refused **at receipt** rather than at the commit,
-                // which matters for `SendSelection`: buffering it would
-                // park a descriptor in `pending` until a commit that may
-                // never come.
+                // The M5-A ops not implemented yet decode but are refused:
+                // this server advertises none of their bits, so no
+                // conformant client sends one. Refused **at receipt**
+                // rather than at the commit, which matters for
+                // `SendSelection`: buffering it would park a descriptor in
+                // `pending` until a commit that may never come.
                 if is_m5_op(&other) {
                     let name = other.name();
                     self.disconnect(
@@ -5365,6 +5490,28 @@ impl Server {
                             0,
                             ErrorCode::Protocol,
                             format!("{name} needs a capability this server does not advertise"),
+                        )),
+                    );
+                    return false;
+                }
+                // `docs/wire.md` rule 3: a client that sends a popup op
+                // without having listed `POPUP` in its `ClientCaps` is
+                // using a feature it never opted into. Checked here, once,
+                // which is also what makes pushing `PopupDone` safe — no
+                // client that did not list the bit can own a popup.
+                if is_popup_op(&other)
+                    && self
+                        .wire_clients
+                        .get(&token)
+                        .is_some_and(|c| c.client_caps & nitro_wire::types::caps::POPUP == 0)
+                {
+                    let name = other.name();
+                    self.disconnect(
+                        token,
+                        Some((
+                            0,
+                            ErrorCode::Protocol,
+                            format!("{name} needs `POPUP` listed in ClientCaps"),
                         )),
                     );
                     return false;
@@ -5419,8 +5566,13 @@ impl Server {
     /// in, so it is always set — but it is asked rather than asserted,
     /// because a stripped or fixture server honestly may not have one,
     /// and a client that checks the bit lays out identically either way.
+    /// `POPUP` is unconditional: every client may create a menu for a
+    /// window it owns, and nothing about the server's hardware or fonts
+    /// can make that a promise it cannot keep.
     fn caps(&self, shell: bool, remote: bool) -> u32 {
-        let mut caps = nitro_wire::types::caps::WM | nitro_wire::types::caps::THEME;
+        let mut caps = nitro_wire::types::caps::WM
+            | nitro_wire::types::caps::THEME
+            | nitro_wire::types::caps::POPUP;
         if self.text.has_fonts() {
             caps |= nitro_wire::types::caps::TEXT;
         }
@@ -5870,6 +6022,9 @@ impl Server {
 
     /// Build one window's `WindowInfo`, minting its server-global id.
     fn window_info_msg(&mut self, win: WindowKey) -> Option<msg::WindowInfo> {
+        if self.scene.window_info(win).ok()?.is_popup() {
+            return None;
+        }
         let id = self.window_refs.id_for(win);
         let focused = self.focus == Some(win);
         let info = self.scene.window_info(win).ok()?;
@@ -5901,6 +6056,9 @@ impl Server {
             .wire_clients
             .values()
             .flat_map(|c| c.windows.values().copied())
+            // A menu is not an application window: a bar's task list must
+            // not sprout an entry per open menu.
+            .filter(|w| self.scene.window_info(*w).is_ok_and(|i| !i.is_popup()))
             .collect();
         out.sort_unstable_by_key(|w| (w.index(), w.generation()));
         out
@@ -6070,6 +6228,14 @@ impl Server {
         for (node_id, win) in outcome.new_windows {
             self.place_new_window(&mut client, node_id, win);
         }
+        // Popups after `new_windows`, so a parent created in the same
+        // batch is already placed, and before `state_requests`, so a
+        // maximize in the same batch re-places the chain rather than
+        // racing it.
+        for (node_id, win, info) in outcome.new_popups {
+            self.map_popup(&mut client, node_id, win, info);
+        }
+        let repositioned = outcome.repositioned_popups;
         client.frame_requests.extend(outcome.frame_requests);
         for win in outcome.closed_windows {
             self.forget_closed(win);
@@ -6104,6 +6270,11 @@ impl Server {
         for (win, op) in shell_ops {
             self.apply_shell_op(win, op);
         }
+        // Repositions with the client back in the map, so the `Configure`
+        // for the popup and for any submenu it drags along reaches it.
+        for (win, info) in repositioned {
+            self.reposition_popup(win, info);
+        }
         for (win, state) in outcome.state_requests {
             self.set_state(win, state);
         }
@@ -6112,8 +6283,15 @@ impl Server {
         // showing (`Server::showing`). Guarded on the zone map so a desktop
         // with no shell running pays one `is_empty` per transaction that
         // touched visibility at all.
-        if visibility_changed && !self.zones.is_empty() {
+        if !visibility_changed.is_empty() && !self.zones.is_empty() {
             self.reflow_work_area();
+        }
+        // A parent that stopped showing takes its menus down with it.
+        // Ungated on zones: this is about popups, not bars.
+        for win in visibility_changed {
+            if !self.showing(win) {
+                self.dismiss_popups_of(win);
+            }
         }
         // Announced with every client back in the map, because a watcher is
         // a *different* client than the one that committed: notifying while
@@ -6308,6 +6486,7 @@ impl Server {
                 self.pointer.over = None;
             }
             self.touch_targets.retain(|_, (w, _)| *w != win);
+            self.popup_window_gone(win);
             if let Err(e) = self.scene.destroy_window(id, win) {
                 warn!("destroying window of client {}: {e}", id.0);
             }
@@ -6466,6 +6645,334 @@ impl Server {
                 None => "no outputs".to_owned(),
             })
         })
+    }
+}
+
+// ------------------------------------------------------------------ popups
+//
+// A popup is a scene `Window` with a parent link (see
+// `Scene::create_popup`); everything here is the server's half: placing it
+// against the parent and the work area, the pointer grab, and dismissal.
+// `docs/wm.md` § Popups has the rules and the reasons.
+impl Server {
+    /// Collect `from`'s live popup descendants, parents before children,
+    /// into `out` (which is cleared first). `from` itself is not included.
+    ///
+    /// Walks the server's own index, not the scene's links: a destroyed
+    /// parent's scene edge is already gone by the time the server hears.
+    fn popups_below(&self, from: WindowKey, out: &mut Vec<WindowKey>) {
+        out.clear();
+        out.push(from);
+        let mut i = 0;
+        while i < out.len() {
+            let p = out[i];
+            i += 1;
+            for (k, info) in &self.popups {
+                if info.parent == p && !info.dismissed && !out.contains(k) {
+                    out.push(*k);
+                }
+            }
+        }
+        out.remove(0);
+    }
+
+    /// Whether `win` is `root` or one of its popup descendants.
+    fn in_popup_chain(&self, win: WindowKey, root: WindowKey) -> bool {
+        let mut cur = win;
+        for _ in 0..=popup::MAX_POPUP_DEPTH {
+            if cur == root {
+                return true;
+            }
+            match self.popups.get(&cur) {
+                Some(info) => cur = info.parent,
+                None => return false,
+            }
+        }
+        false
+    }
+
+    /// Compute a popup's rectangle from its stored positioner and put it
+    /// there. Returns whether it is placed.
+    ///
+    /// The anchor rectangle is in the parent's **content** space; the work
+    /// area is the parent output's, shell zones subtracted, so a menu
+    /// flips away from a bar rather than under it.
+    fn place_popup(&mut self, win: WindowKey) -> bool {
+        let Some(info) = self.popups.get(&win).copied() else {
+            return false;
+        };
+        let Some((output, origin)) = self
+            .scene
+            .window_info(info.parent)
+            .ok()
+            .and_then(|p| Some((p.output()?, p.content_position())))
+        else {
+            return false;
+        };
+        let (rect, anchor, gravity, constraint) = popup::fallback(info.anchor_rect).unwrap_or((
+            info.anchor_rect,
+            info.anchor,
+            info.gravity,
+            info.constraint,
+        ));
+        let area = self.local_work_area(output);
+        let r = popup::constrain(
+            rect.translate(origin.x, origin.y),
+            anchor,
+            gravity,
+            constraint,
+            info.size,
+            area,
+        );
+        let size = Size::new(r.w, r.h);
+        if self.scene.window_info(win).is_ok_and(|i| i.size() != size)
+            && let Err(e) = self.scene.set_window_size(ClientId::SERVER, win, size)
+        {
+            warn!("resizing a popup: {e}");
+        }
+        if let Err(e) = self
+            .scene
+            .place_window(win, Some(output), Point::new(r.x, r.y))
+        {
+            warn!("placing a popup: {e}");
+            return false;
+        }
+        true
+    }
+
+    /// Map a popup a commit just created and tell its client where it
+    /// went. `client` is the committing client, lifted out of the map, so
+    /// the `Configure` is built against it directly (`place_new_window`'s
+    /// reason).
+    ///
+    /// A parent with no output — every connector gone, or a hotplug in
+    /// flight — is a **race**, not a lie: the user clicked, the client sent
+    /// `CreatePopup`, and a monitor went away in between. So the popup is
+    /// created and immediately dismissed with a `PopupDone`, never refused
+    /// with a fatal error, and never parked on `unplaced` (which would
+    /// decorate and cascade it like a toplevel).
+    fn map_popup(
+        &mut self,
+        client: &mut WireClient,
+        node_id: NodeId,
+        win: WindowKey,
+        info: popup::PopupInfo,
+    ) {
+        self.popups.insert(win, info);
+        let parent_live = self.popups.get(&info.parent).is_none_or(|p| !p.dismissed);
+        if !parent_live || !self.place_popup(win) {
+            // A submenu of a menu that is already gone goes the same way.
+            if let Some(i) = self.popups.get_mut(&win) {
+                i.dismissed = true;
+            }
+            self.pending_popup_done.push(win);
+            return;
+        }
+        if info.grab {
+            match self.popup_grab {
+                None => self.popup_grab = Some(win),
+                Some(root) if self.in_popup_chain(win, root) => {}
+                // A grabbing popup outside the chain that holds the grab:
+                // there is only one pointer, so the older chain goes.
+                Some(root) => {
+                    self.dismiss_chain(root);
+                    self.popup_grab = Some(win);
+                }
+            }
+        }
+        if let Ok(i) = self.scene.window_info(win)
+            && let Some(output) = i.output()
+        {
+            let scale = self.scene.output_info(output).map_or(1.0, |(_, s)| s);
+            client.send(&ServerMsg::Configure(msg::Configure {
+                window: node_id,
+                size: i.size(),
+                position: i.content_position(),
+                scale,
+                output: output.0,
+            }));
+        }
+        self.popup_pointer_refresh = true;
+    }
+
+    /// Apply a `RepositionPopup`: anchor first, then the bounds that follow
+    /// from it, which is the order `submenu_view.cc:579-586` sends them in.
+    /// A dismissed popup stays dismissed — a reposition must not
+    /// resurrect a menu the user already closed.
+    fn reposition_popup(&mut self, win: WindowKey, new: popup::PopupInfo) {
+        let Some(info) = self.popups.get_mut(&win) else {
+            return;
+        };
+        if info.dismissed {
+            return;
+        }
+        info.anchor_rect = new.anchor_rect;
+        info.anchor = new.anchor;
+        info.gravity = new.gravity;
+        info.constraint = new.constraint;
+        if self.place_popup(win) {
+            self.configure(win);
+            self.reflow_popups(win);
+        }
+        self.popup_pointer_refresh = true;
+    }
+
+    /// Re-place every popup below `parent` after the parent moved or
+    /// resized. Re-derived from the stored positioner rather than
+    /// dismissed: a tooltip that vanished because its window was nudged
+    /// would be the worse answer.
+    ///
+    /// On the drag path, so it allocates nothing: the walk reuses
+    /// `popup_scratch`, and a desktop with no popup pays one `is_empty`.
+    fn reflow_popups(&mut self, parent: WindowKey) {
+        if self.popups.is_empty() {
+            return;
+        }
+        let mut chain = std::mem::take(&mut self.popup_scratch);
+        self.popups_below(parent, &mut chain);
+        for &win in &chain {
+            if self.place_popup(win) {
+                self.configure(win);
+            }
+        }
+        if !chain.is_empty() {
+            self.popup_pointer_refresh = true;
+        }
+        chain.clear();
+        self.popup_scratch = chain;
+    }
+
+    /// Dismiss `from` and every popup below it: **unmap, then notify**,
+    /// deepest first, which is the order Chromium expects
+    /// (`xdg_popup.cc:351-358`).
+    ///
+    /// Unmapping is unplacing — out of every z-order, neither painted nor
+    /// hit — and it happens here, synchronously. The `PopupDone` does
+    /// **not**: it is enqueued, and `settle` sends it. Never "simplify"
+    /// this into a direct `send_to_window`: a dismissal caused by a
+    /// client's own `DestroyNode` runs while `commit` holds that client
+    /// out of the map, and the message would be silently dropped.
+    fn dismiss_chain(&mut self, from: WindowKey) {
+        let mut chain = Vec::new();
+        self.popups_below(from, &mut chain);
+        if self.popups.get(&from).is_some_and(|i| !i.dismissed) {
+            chain.insert(0, from);
+        }
+        for &win in chain.iter().rev() {
+            let Some(info) = self.popups.get_mut(&win) else {
+                continue;
+            };
+            info.dismissed = true;
+            let pos = self
+                .scene
+                .window_info(win)
+                .map_or(Point::ZERO, nitro_scene::Window::position);
+            if let Err(e) = self.scene.place_window(win, None, pos) {
+                warn!("unmapping a popup: {e}");
+            }
+            if self.popup_grab == Some(win) {
+                self.popup_grab = None;
+            }
+            self.pending_popup_done.push(win);
+        }
+        if !chain.is_empty() {
+            self.popup_pointer_refresh = true;
+        }
+    }
+
+    /// Dismiss every popup chain hanging directly off `win`.
+    fn dismiss_popups_of(&mut self, win: WindowKey) {
+        if self.popups.is_empty() {
+            return;
+        }
+        let children: Vec<WindowKey> = self
+            .popups
+            .iter()
+            .filter(|(_, i)| i.parent == win && !i.dismissed)
+            .map(|(k, _)| *k)
+            .collect();
+        for child in children {
+            self.dismiss_chain(child);
+        }
+    }
+
+    /// A window is gone (destroyed, or its client disconnected): its
+    /// popups go with it, and if it was a popup it leaves the index.
+    fn popup_window_gone(&mut self, win: WindowKey) {
+        if self.popups.is_empty() {
+            return;
+        }
+        self.dismiss_popups_of(win);
+        if self.popups.remove(&win).is_some() {
+            self.popup_pointer_refresh = true;
+        }
+        if self.popup_grab == Some(win) {
+            self.popup_grab = None;
+        }
+        // A client that destroyed its own popup already knows.
+        self.pending_popup_done.retain(|w| *w != win);
+    }
+
+    /// The window under the pointer right now, computed fresh from the
+    /// scene rather than read from `pointer.over`: a popup mapped under a
+    /// stationary pointer has produced no motion event yet.
+    fn window_under_pointer(&self) -> Option<WindowKey> {
+        let point = self.pointer.position();
+        let output = input::output_at(&self.scene, point)?;
+        input::hit(&self.scene, output, point).map(|t| t.window)
+    }
+
+    /// Re-run pointer enter/leave at the pointer's current position.
+    ///
+    /// The enter/leave half of `move_pointer`, for the one case where what
+    /// is under the pointer changes without the pointer moving: a popup
+    /// mapped under it, or a chain unmapped from under it.
+    fn refresh_pointer_over(&mut self) {
+        if !self.pointer.present {
+            return;
+        }
+        let time_ns = monotonic_ns();
+        let point = self.pointer.position();
+        let target =
+            input::output_at(&self.scene, point).and_then(|id| input::hit(&self.scene, id, point));
+        let now_over = target.as_ref().map(|t| t.window);
+        if now_over == self.pointer.over {
+            return;
+        }
+        if let Some(left) = self.pointer.over {
+            self.send_to_window(left, |id| {
+                ServerMsg::PointerLeave(msg::PointerLeave {
+                    window: id,
+                    time_ns,
+                })
+            });
+        }
+        self.pointer.over = now_over;
+        if let Some(t) = target {
+            let node = self.node_id_for(t.window, t.hit.node);
+            self.send_to_window(t.window, |id| {
+                ServerMsg::PointerEnter(msg::PointerEnter {
+                    window: id,
+                    node,
+                    pos: t.local,
+                    time_ns,
+                })
+            });
+        }
+        // Enter/leave went out after `flush_wire_clients` would otherwise
+        // have run for this wakeup's input; the settle that called us
+        // flushes at its end.
+    }
+
+    /// Send the `PopupDone`s dismissal queued. See
+    /// [`Server::dismiss_chain`] for why this is the only sender.
+    fn flush_popup_done(&mut self) {
+        if self.pending_popup_done.is_empty() {
+            return;
+        }
+        for win in std::mem::take(&mut self.pending_popup_done) {
+            self.send_to_window(win, |popup| ServerMsg::PopupDone(msg::PopupDone { popup }));
+        }
     }
 }
 

@@ -42,6 +42,10 @@ pub struct PopupInfo {
     pub gravity: PopupGravity,
     /// `constraint_adjust` bitmask: what the server may do to make it fit.
     pub constraint: u32,
+    /// The size the client asked for. Kept separately from the window's
+    /// current size because `RESIZE_*` may have shrunk that, and a re-place
+    /// after the parent moved must start again from what was asked for.
+    pub size: Size,
     /// Whether it took the pointer grab (`popup_flags::GRAB`).
     pub grab: bool,
     /// Whether it has already been dismissed. A dismissed popup is

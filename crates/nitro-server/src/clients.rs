@@ -44,8 +44,10 @@ use nitro_wire::msg::{self, ClientMsg, ServerMsg};
 use nitro_wire::server::{ClientStream, code_for};
 use nitro_wire::types::{
     Align, BufferId, ErrorCode, Layer, NodeId, NodeKind, WindowState as WireWindowState, anchor,
-    format, window_flags,
+    constraint_adjust, format, popup_flags, window_flags,
 };
+
+use crate::popup::{MAX_POPUP_DEPTH, PopupInfo};
 
 use crate::icons::IconEngine;
 use crate::shell;
@@ -108,11 +110,14 @@ pub struct WireClient {
     /// from `ClientCaps` (M5-A). 0 until it sends one, which means "the
     /// v1 message set only".
     ///
-    /// Nothing reads it yet — the server advertises no bit above 7, so
-    /// there is no M5 message to gate. It is recorded now because the rule
-    /// it exists for ("never send a message belonging to a bit the client
-    /// did not list") cannot be honoured retroactively by a server that
-    /// threw the list away. See `docs/wire.md`.
+    /// Read at receipt by `Server::handle_wire_msg`: a popup op from a
+    /// client that did not list `POPUP` here is `Error { Protocol }`
+    /// (`docs/wire.md` rule 3). That one check is also what makes sending
+    /// `PopupDone` unconditionally safe — a client that never listed the
+    /// bit can never own a popup to be told about. The bits not yet
+    /// advertised are still recorded, because the rule this exists for
+    /// cannot be honoured retroactively by a server that threw the list
+    /// away.
     pub client_caps: u32,
 }
 
@@ -289,12 +294,22 @@ pub struct ApplyOutcome {
     /// window the commit has not created yet. The privilege check is still
     /// on receipt, so an unprivileged client never gets this far.
     pub shell_ops: Vec<(WindowKey, shell::WindowOp)>,
-    /// Whether this transaction showed or hid one of the client's windows.
+    /// Windows whose visibility this transaction changed, in arrival order.
     ///
     /// A window that reserves an exclusive zone stops reserving it when it
     /// stops showing, so the server has to recompute the work area — and it
     /// is the server, not this module, that knows which windows hold zones.
-    pub visibility_changed: bool,
+    /// A list rather than a flag since popups: a parent that stops showing
+    /// dismisses its chain, and for that the server has to know *which*
+    /// window hid.
+    pub visibility_changed: Vec<WindowKey>,
+    /// Popups created, in creation order, with the positioner they asked
+    /// for. The server places them (it owns the work area the constraint
+    /// arithmetic needs) and sends the `Configure`.
+    pub new_popups: Vec<(NodeId, WindowKey, PopupInfo)>,
+    /// `RepositionPopup`s, in arrival order: the popup and its new
+    /// positioner. Deferred for `state_requests`' reason.
+    pub repositioned_popups: Vec<(WindowKey, PopupInfo)>,
 }
 
 /// Apply one client's buffered mutations to the scene, atomically as far as
@@ -525,8 +540,8 @@ fn apply_msg(
             // on, because only the server knows whether this window holds a
             // zone at all; `window_of` would reject a non-window node, so the
             // lookup is the tolerant one.
-            if client.windows.contains_key(&m.id) {
-                outcome.visibility_changed = true;
+            if let Some(win) = client.windows.get(&m.id) {
+                outcome.visibility_changed.push(*win);
             }
             scene
                 .set_visible(client.id, key, m.visible)
@@ -738,14 +753,108 @@ fn apply_msg(
         | ClientMsg::Outputs(_)
         | ClientMsg::Lock(_)
         | ClientMsg::Unlock(_) => Ok(()),
-        // The M5-A ops (#3767): the protocol surface landed ahead of the
-        // behaviour, so they are refused. `handle_wire_msg` already
-        // disconnects on receipt and none of these ever reaches `pending`;
-        // this arm is belt and braces, and exists because the match above
-        // is the op table and deliberately has no `_`.
-        ClientMsg::CreatePopup(_)
-        | ClientMsg::RepositionPopup(_)
-        | ClientMsg::SetCursor(_)
+        ClientMsg::CreatePopup(m) => {
+            if m.id.is_none() || client.nodes.contains_key(&m.id) {
+                return Err(ApplyError::new(
+                    ErrorCode::Protocol,
+                    format!("popup id {} is zero or already in use", m.id.raw()),
+                ));
+            }
+            if client.nodes.len() >= MAX_NODES_PER_CLIENT {
+                return Err(ApplyError::new(ErrorCode::Limit, "too many nodes"));
+            }
+            // Owning the parent *is* the authorization (#3767: no
+            // serials). A foreign window is unnameable through this map,
+            // so "a popup for another client's window" is `UnknownNode`
+            // by construction.
+            let parent = window_of(client, m.parent)?;
+            check_positioner("CreatePopup", m.constraint)?;
+            if m.flags & !popup_flags::ALL != 0 {
+                return Err(ApplyError::new(
+                    ErrorCode::Protocol,
+                    format!("CreatePopup: reserved flag bits in {:#x}", m.flags),
+                ));
+            }
+            let size = sane_size(m.size)?;
+            // Depth: the parent's own chain, plus this one.
+            let mut depth = 1;
+            let mut cur = parent;
+            while let Some(p) = scene
+                .window_info(cur)
+                .ok()
+                .and_then(nitro_scene::Window::parent)
+            {
+                depth += 1;
+                cur = p;
+                if depth >= MAX_POPUP_DEPTH {
+                    return Err(ApplyError::new(
+                        ErrorCode::Limit,
+                        format!("CreatePopup: chains are capped at {MAX_POPUP_DEPTH} levels"),
+                    ));
+                }
+            }
+            let win = scene
+                .create_popup(client.id, parent, size)
+                .map_err(|e| scene_err("CreatePopup", e))?;
+            let content = scene
+                .window_info(win)
+                .map_err(|e| scene_err("CreatePopup", e))?
+                .content();
+            client.bind_node(m.id, content);
+            client.windows.insert(m.id, win);
+            client.window_ids.insert(win, m.id);
+            outcome.new_popups.push((
+                m.id,
+                win,
+                PopupInfo {
+                    parent,
+                    anchor_rect: m.anchor_rect.to_rect(),
+                    anchor: m.anchor,
+                    gravity: m.gravity,
+                    constraint: m.constraint,
+                    size,
+                    grab: m.flags & popup_flags::GRAB != 0,
+                    dismissed: false,
+                },
+            ));
+            Ok(())
+        }
+        ClientMsg::RepositionPopup(m) => {
+            let win = window_of(client, m.id)?;
+            let Some(parent) = scene
+                .window_info(win)
+                .ok()
+                .and_then(nitro_scene::Window::parent)
+            else {
+                return Err(ApplyError::new(
+                    ErrorCode::WrongKind,
+                    format!("RepositionPopup: window {} is not a popup", m.id.raw()),
+                ));
+            };
+            check_positioner("RepositionPopup", m.constraint)?;
+            outcome.repositioned_popups.push((
+                win,
+                PopupInfo {
+                    parent,
+                    anchor_rect: m.anchor_rect.to_rect(),
+                    anchor: m.anchor,
+                    gravity: m.gravity,
+                    constraint: m.constraint,
+                    // Neither is the reposition's to change; the server
+                    // keeps the stored values.
+                    size: Size::ZERO,
+                    grab: false,
+                    dismissed: false,
+                },
+            ));
+            Ok(())
+        }
+        // The rest of the M5-A ops (#3767): the protocol surface landed
+        // ahead of the behaviour, so they are refused. `handle_wire_msg`
+        // already disconnects on receipt and none of these ever reaches
+        // `pending`; this arm is belt and braces, and exists because the
+        // match above is the op table and deliberately has no `_`.
+        ClientMsg::SetCursor(_)
         | ClientMsg::StartMove(_)
         | ClientMsg::StartResize(_)
         | ClientMsg::ListOutputs(_)
@@ -759,6 +868,18 @@ fn apply_msg(
             "this op needs a capability this server does not advertise",
         )),
     }
+}
+
+/// Refuse reserved constraint bits: they are reserved so that a future bit
+/// can mean something, which it cannot if today's server ignores it.
+fn check_positioner(what: &str, constraint: u32) -> Result<(), ApplyError> {
+    if constraint & !constraint_adjust::ALL != 0 {
+        return Err(ApplyError::new(
+            ErrorCode::Protocol,
+            format!("{what}: reserved constraint bits in {constraint:#x}"),
+        ));
+    }
+    Ok(())
 }
 
 fn window_of(client: &WireClient, id: NodeId) -> Result<WindowKey, ApplyError> {
