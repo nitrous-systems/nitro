@@ -47,6 +47,7 @@ pub mod input;
 pub mod keyboard;
 pub mod lock;
 pub mod logging;
+pub mod popup;
 pub mod protocol;
 pub mod remote;
 pub mod render;
