@@ -4,7 +4,7 @@
 //! Pure: the list is computed from a home directory, an optional
 //! `user-dirs.dirs` and a trash root, and nothing here touches a widget
 //! — so it is tested without a display, like [`dir`](crate::dir) and
-//! [`trash`](crate::trash).
+//! `nitro_files::trash`.
 //!
 //! What is listed, in order: **Home**, then the six XDG user directories
 //! that exist (Desktop, Documents, Downloads, Music, Pictures, Videos —
@@ -154,12 +154,25 @@ pub fn places(
     out
 }
 
+/// `$HOME`, when it is set, non-empty and a directory.
+///
+/// A copy of `nitro_launcher::spawn::home_dir`: four lines are cheaper
+/// than a dependency on the launcher, which depends on the toolkit that
+/// in turn depends on this crate.
+#[must_use]
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+        .filter(|h| h.is_dir())
+}
+
 /// The places for the real environment: `$HOME`,
 /// `$XDG_CONFIG_HOME/user-dirs.dirs` (or `~/.config/user-dirs.dirs`),
 /// and the trash's `files/`.
 #[must_use]
 pub fn from_env(trash_root: &Path) -> Vec<Place> {
-    let home = nitro_launcher::spawn::home_dir();
+    let home = home_dir();
     let config = std::env::var_os("XDG_CONFIG_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)

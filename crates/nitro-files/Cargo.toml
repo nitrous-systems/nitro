@@ -19,13 +19,16 @@ nitro-ui = { workspace = true }
 # program detached — and a second copy of that parser would be a second
 # place for the `Name[de]` and `[Desktop Action …]` bugs to live.
 nitro-launcher = { workspace = true }
+# The directory model: listings, the background scan, MIME globs and
+# icons, the sidebar's places. Its own crate so the toolkit's file
+# picker can share it (`crates/nitro-fs`).
+nitro-fs = { workspace = true }
 # `inotify` for the live refresh of the directory on screen (`fs`),
-# `pipe` for the background scan's wakeup descriptor, `event` for
-# `poll` (the scan's own tests, and draining the wakeup), `process` for
-# `getuid`/`getpid` in the temporary-path fallbacks. No new crate: this
-# is the same syscall crate the rest of the tree uses, with the feature
-# set narrowed to what this one needs.
-rustix = { workspace = true, features = ["fs", "pipe", "event", "process"] }
+# `event` for `poll` in the integration tests. No new crate: this is the
+# same syscall crate the rest of the tree uses, with the feature set
+# narrowed to what this one needs. (The scan's `pipe` moved to nitro-fs
+# with the scan.)
+rustix = { workspace = true, features = ["fs", "event"] }
 
 [lib]
 name = "nitro_files"

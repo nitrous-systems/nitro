@@ -63,6 +63,13 @@ process.
 
 ## The model
 
+The model — `dir`, the glob half of `mime`, and `places` — lives in its
+own workspace crate, `crates/nitro-fs`, and `nitro-files` re-exports it
+(`nitro_files::dir` is `nitro_fs::dir`). It moved there so the toolkit's
+file picker can share it: `nitro-files` depends on `nitro-ui`, so code
+living here was out of the toolkit's reach. The association half of
+`mime`, the trash and the operations stay here.
+
 ### A row is six fields, and none of them is a path
 
 `dir::Entry` is a name, a `Kind`, an icon name, a symlink-follow answer, a
@@ -1269,16 +1276,17 @@ regrets.
 
 ## Dependencies
 
-`nitro-ui`, `nitro-launcher` and `rustix` — and **no new external
-crate**. The launcher is a workspace crate and is here for its
-`.desktop` parser and its spawn path, both already argued; `rustix`
-provides `inotify` (`fs`), the scan's pipe (`pipe`), `poll` (`event`) and
-`getuid`/`getpid` for the temporary-path fallbacks (`process`), with the
-feature set narrowed to those four. `DEPENDENCIES.md` carries the row.
+`nitro-ui`, `nitro-launcher`, `nitro-fs` and `rustix` — and **no new
+external crate**. The launcher is a workspace crate and is here for its
+`.desktop` parser and its spawn path, both already argued; `nitro-fs` is
+the directory model (see *The model*) and depends on `rustix` alone
+(`fs`, `pipe` for the scan's doorbell, `event` for `poll` in its tests).
+`nitro-files`' own `rustix` provides `inotify` (`fs`) and `poll` for the
+integration tests (`event`). `DEPENDENCIES.md` carries the rows.
 
 ## Testing
 
-* `src/dir.rs` unit-tests the model with no display server: the four
+* `crates/nitro-fs/src/dir.rs` unit-tests the model with no display server: the four
   kinds, the icon each of them resolves to (including a real fifo, a
   symlink to a directory, a symlink to a file and a dangling one), the
   system glob table deciding an icon the built-in one has no answer for, a
@@ -1292,13 +1300,16 @@ feature set narrowed to those four. `DEPENDENCIES.md` carries the row.
   and the background scan — woken through a real `poll`, delivering
   sorted entries, delivering a failure as a value, and surviving being
   dropped mid-read.
-* `src/mime.rs` unit-tests the type → icon map as a table — every family
-  it claims and the types it deliberately does not, case and parameters
-  folded, and the whole map reached through `type_of` with an **empty**
-  glob list so the no-`shared-mime-info` box is the arm under test. Then
-  the resolution order against fixture
-  directories: the built-in table, a system rule outranking it, the
-  longest suffix breaking a weight tie, `[Default Applications]` over
+* `crates/nitro-fs/src/mime.rs` unit-tests the type → icon map as a
+  table — every family it claims and the types it deliberately does not,
+  case and parameters folded, and the whole map reached through `type_of`
+  with an **empty** glob list so the no-`shared-mime-info` box is the arm
+  under test — and the type resolution: the built-in table, a system rule
+  outranking it, the longest suffix breaking a weight tie.
+* `crates/nitro-fs/src/places.rs` unit-tests the sidebar's list: the
+  `user-dirs.dirs` parse, missing directories left out, no home.
+* `src/mime.rs` unit-tests the handler resolution against fixture
+  directories: `[Default Applications]` over
   `[Added Associations]` over `mimeinfo.cache`, a config list outranking
   a system one, a removal skipped wherever it is offered, an id resolving
   to an argv with the path appended, an unlaunchable entry falling

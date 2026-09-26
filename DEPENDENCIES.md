@@ -9,7 +9,7 @@ number we watch.
 
 | crate | used by | why | cost / notes |
 |---|---|---|---|
-| `rustix` | seat, kms, server, shm, wire, demo, session, launcher, files | Safe Linux syscalls (epoll, mmap, sockets + `SCM_RIGHTS`, timerfd, netlink) with no libc. The one crate that lets the rest of the tree be `unsafe`-free — with the two exceptions listed below, both of which are a *kernel* contract rather than a C one. | + `bitflags`, `linux-raw-sys` |
+| `rustix` | seat, kms, server, shm, wire, demo, session, launcher, files, fs | Safe Linux syscalls (epoll, mmap, sockets + `SCM_RIGHTS`, timerfd, netlink) with no libc. The one crate that lets the rest of the tree be `unsafe`-free — with the two exceptions listed below, both of which are a *kernel* contract rather than a C one. | + `bitflags`, `linux-raw-sys` |
 | `zerocopy` (+ `zerocopy-derive`) | wire | The wire format *is* `#[repr(C)]` layout: `U32<LittleEndian>`/`F32<LE>`/… give guaranteed little-endian fields, `Unaligned` lets a payload be decoded in place from any `&[u8]`, and `ref_from_bytes`/`as_bytes` replace the pointer casts we would otherwise write by hand. Validated, total, and `unsafe`-free in our tree. | +3 crates: `zerocopy`, `zerocopy-derive`, and **`syn` 2.x**. Note `drm` → `bytemuck_derive` pins `syn` **3.x**, so the two do *not* share a build: syn is compiled twice. **Measured and left alone** — see "`syn` is compiled twice" below; deduplicating it makes the wall-clock build *slower* on a many-core box. |
 | `drm` (+ `drm-ffi`, `drm-sys`, `drm-fourcc`) | kms | Safe wrappers over the ~30 DRM/KMS ioctls (atomic commit, dumb buffers, AddFB2, properties, events). Hand-rolling them is precisely the `unsafe` we forbid. **`drm-ffi` is named directly since #3718**, for one type: `drm_mode_modeinfo`, which `output.<c>.modeline` fills in so a user-supplied mode can be handed to the CRTC as a `MODE_ID` blob. `drm::control::Mode` is a `#[repr(transparent)]` wrapper over it with a `From` impl, so building one needs no `unsafe`; the alternative is transcribing a 68-byte kernel ABI struct by hand. **No new external name and no new lock entry** — it was already in the graph as `drm`'s own dependency, at the same 0.9.1 resolution. | pulls `bytemuck` + `bytemuck_derive` → `syn` 3.x (proc-macro, compile time). `bytemuck_derive` is a *direct* dependency of `drm`, so `default-features = false` cannot drop it. Measured: see "`syn` is compiled twice" below. |
 | `signal-hook` (+ `signal-hook-registry`) | server, demo, session | SIGTERM/SIGINT → self-pipe without `unsafe` in our tree: `sigaction` and an async-signal-safe handler are exactly the shim we would otherwise have to write ourselves. `default-features = false` (no iterator/channel). The demo uses it so Ctrl-C prints its latency summary instead of killing the process mid-histogram. `nitro-session` uses it for the same reason the server does, and it is the crate's third consumer rather than a new dependency. | + `libc` (already pulled by `libseat`). Only `low_level::pipe::register` is used. |
@@ -208,6 +208,13 @@ tree. The whole-workspace figure moves **75 → 77** lines and stays at
 **41 distinct external crate names** — the two new lines are
 `nitro-files` itself and a second `nitro-launcher (*)`, cargo's marker
 for a subtree it has already printed.
+
+The model half of it — the listing, the scan, the glob table and icons,
+the places — now lives in the workspace crate `nitro-fs` (#3831), which
+depends on `rustix` alone, so the toolkit's file picker (#3829) can share
+it without depending on the file manager. Still zero external crates:
+the whole-workspace count moves **85 → 86**, the one new line being
+`nitro-fs` itself.
 
 
 The whole-workspace count with the session in is **70** lines and still
@@ -555,7 +562,8 @@ the syscall families it uses.
 | `nitro-hey` | `process` | `getuid` for the `/tmp` fallback of the app-socket directory |
 | `nitro-bar` | `time` | `clock_gettime` for the wall clock |
 | `nitro-launcher` | `process` | `pidfd_open` so a launched child's exit is a descriptor the app loop can wait on rather than a thing noticed at the next spawn (#555), and `getpgrp` in the test that checks a launched process left the launcher's process group |
-| `nitro-files` | `fs`, `pipe`, `event`, `process` | `inotify` for the live refresh of the directory on screen; `pipe` for the background scan's doorbell descriptor; `poll` for draining it and for the scan's own tests; `getuid`/`getpid` for the temporary-path fallbacks |
+| `nitro-files` | `fs`, `event` | `inotify` for the live refresh of the directory on screen; `poll` in the integration tests |
+| `nitro-fs` | `fs`, `pipe`, `event` | `pipe` for the background scan's doorbell descriptor and `fcntl` to make it non-blocking; `poll` in the scan's own tests; `mknodat` for the fifo test |
 | `nitro-session` | `event`, `process` | `poll` over the pidfds, the session socket and the signal pipe; `pidfd_open` so a child's exit is a descriptor rather than a timer tick, `kill_process_group` for teardown, `getuid` for the `/tmp` fallback of the socket path |
 | `nitro-term` | `pty`, `termios`, `process`, `fs`, `stdio` | `openpt`/`grantpt`/`unlockpt`/`ptsname` for the pseudoterminal; `tcsetwinsize` (`TIOCSWINSZ`) so a resize reaches the child as `SIGWINCH`; `kill_process_group`/`waitpid` to take the shell down with the window; `open` for the slave and `fcntl_setfl` to make the master non-blocking |
 

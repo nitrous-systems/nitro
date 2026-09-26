@@ -71,10 +71,10 @@
 //! the honest answer for a widget that draws a screenful of a hundred
 //! thousand: see [`nitro_ui::List`].
 
-pub mod dir;
+pub use nitro_fs::dir;
 pub mod mime;
 pub mod ops;
-pub mod places;
+pub use nitro_fs::places;
 pub mod trash;
 
 use std::path::{Path, PathBuf};

@@ -210,7 +210,7 @@ fn numbered(name: &str, n: u32) -> String {
 /// listing's time column.
 #[must_use]
 pub fn trashinfo(original: &Path, when_unix: i64) -> String {
-    let (y, mo, d, h, mi, s) = crate::dir::civil_from_unix(when_unix);
+    let (y, mo, d, h, mi, s) = nitro_fs::dir::civil_from_unix(when_unix);
     format!(
         "[Trash Info]\nPath={}\nDeletionDate={y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}\n",
         percent_encode(original)

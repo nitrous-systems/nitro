@@ -1,0 +1,23 @@
+[package]
+name = "nitro-fs"
+description = "The widget-free directory model shared by nitro-files and the toolkit's file picker: listings, the background scan, MIME globs to icons, XDG places"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# `fs` for `fcntl` on the scan's wakeup descriptor (and `mknodat` in the
+# fifo test), `pipe` for that descriptor itself, `event` for `poll` in
+# the scan's own tests. The same syscall crate
+# the rest of the tree uses, narrowed to what this one needs; nothing
+# else, and in particular not nitro-ui or nitro-launcher, since the
+# toolkit is meant to depend on this crate.
+rustix = { workspace = true, features = ["fs", "pipe", "event"] }
+
+[lib]
+name = "nitro_fs"
+path = "src/lib.rs"

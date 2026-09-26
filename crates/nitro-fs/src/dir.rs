@@ -78,7 +78,7 @@ pub struct Entry {
     ///
     /// A name and not a glyph: the server owns the artwork
     /// (`docs/icons.md`). Resolved here rather than in
-    /// [`crate::Files::rows`] because resolving it means a MIME lookup —
+    /// `nitro_files::Files::rows` because resolving it means a MIME lookup —
     /// a glob match per file — and `rows()` runs again whenever the
     /// selection moves. See [`icon_of`].
     pub icon: &'static str,
@@ -190,7 +190,7 @@ impl Sort {
 /// * a **glob match per regular file** ([`crate::mime::type_of`]), which
 ///   is a suffix comparison against the table and no I/O at all.
 ///
-/// Both land in [`Entry`] fields, so [`crate::Files::rows`] — which is
+/// Both land in [`Entry`] fields, so `nitro_files::Files::rows` — which is
 /// re-run whenever the selection moves — is pure formatting.
 ///
 /// # Errors
@@ -363,9 +363,10 @@ pub fn format_mtime(secs: i64) -> String {
 /// including 1900 (not a leap year) and 2000 (one), and it is the reason
 /// this file needs no `chrono` and no libc.
 ///
-/// Shared with [`crate::trash`], whose `DeletionDate` is the same civil
-/// time in a different punctuation.
-pub(crate) fn civil_from_unix(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
+/// Shared with `nitro_files::trash`, whose `DeletionDate` is the same
+/// civil time in a different punctuation; returns `(year, month, day,
+/// hour, minute, second)` in UTC.
+pub fn civil_from_unix(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
     const SECS_PER_DAY: i64 = 86_400;
     // Euclidean division, so a timestamp before the epoch floors to the
     // day it is *in* rather than towards zero: `-1` is 23:59:59 on the
@@ -532,7 +533,7 @@ pub fn count_at_most(path: &Path, cap: usize) -> usize {
 ///
 /// # Why a pipe *and* a channel
 ///
-/// The app loop sleeps in `epoll` ([`nitro_ui::Ui::add_fd`] is how an app
+/// The app loop sleeps in `epoll` (`nitro_ui::Ui::add_fd` is how an app
 /// adds to that set), so a worker thread that only sent on a
 /// `std::sync::mpsc` channel would have no way to wake it: the result
 /// would sit in the channel until the user happened to move the mouse.
@@ -588,7 +589,7 @@ impl Scan {
         let (tx, rx) = std::sync::mpsc::channel();
         let dir = path.clone();
         let join = std::thread::Builder::new()
-            .name("nitro-files-scan".to_owned())
+            .name("nitro-fs-scan".to_owned())
             .spawn(move || {
                 let mut result = read_dir(&dir, &globs);
                 if let Ok(entries) = &mut result {
@@ -619,7 +620,7 @@ impl Scan {
         &self.path
     }
 
-    /// The descriptor to hand to [`nitro_ui::Ui::add_fd`].
+    /// The descriptor to hand to `nitro_ui::Ui::add_fd`.
     #[must_use]
     pub fn as_fd(&self) -> BorrowedFd<'_> {
         self.wake.as_fd()
@@ -678,7 +679,7 @@ mod tests {
     /// process, so two tests in the threaded binary cannot collide and a
     /// leftover from a previous run cannot be mistaken for this one's.
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("nitro-files-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nitro-fs-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("a scratch directory");
         dir
@@ -932,7 +933,7 @@ mod tests {
 
     #[test]
     fn reading_a_missing_directory_is_an_error_value() {
-        let missing = std::env::temp_dir().join(format!("nitro-files-nope-{}", std::process::id()));
+        let missing = std::env::temp_dir().join(format!("nitro-fs-nope-{}", std::process::id()));
         assert!(read_dir(&missing, &[]).is_err());
     }
 
@@ -1163,7 +1164,7 @@ mod tests {
 
     #[test]
     fn a_scan_of_a_missing_directory_delivers_the_error_not_a_panic() {
-        let missing = std::env::temp_dir().join(format!("nitro-files-gone-{}", std::process::id()));
+        let missing = std::env::temp_dir().join(format!("nitro-fs-gone-{}", std::process::id()));
         let mut scan = Scan::start(missing, Sort::Name, Vec::new()).expect("start");
         assert!(wait_readable(&scan, 10), "the doorbell rang");
         let result = scan.take().expect("a result");
