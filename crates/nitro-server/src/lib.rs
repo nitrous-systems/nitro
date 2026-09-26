@@ -1825,12 +1825,6 @@ impl Server {
     /// it is not in any z-order, so no click and no `Alt+Tab` raise can get
     /// it back. Migrating is the only behaviour that does not lose work.
     fn migrate_orphans(&mut self) {
-        let Some(primary) = self.primary_output() else {
-            // Every output is gone; the windows wait, exactly as they do
-            // between startup and the first connector.
-            return;
-        };
-        let area = self.local_work_area(primary);
         let orphans: Vec<WindowKey> = self
             .wire_clients
             .values()
@@ -1841,13 +1835,22 @@ impl Server {
                     .is_ok_and(|i| i.output().is_none() && !i.is_popup())
             })
             .collect();
-        if orphans.is_empty() {
-            return;
-        }
         // An orphaned parent's popups are dismissed, not migrated — and
         // *before* the migration, so no popup is ever briefly a toplevel.
+        // Also before the primary check: with every output gone the
+        // windows wait, but a menu anchored to a screen that no longer
+        // exists is over, and its client has to hear so.
         for win in &orphans {
             self.dismiss_popups_of(*win);
+        }
+        let Some(primary) = self.primary_output() else {
+            // Every output is gone; the windows wait, exactly as they do
+            // between startup and the first connector.
+            return;
+        };
+        let area = self.local_work_area(primary);
+        if orphans.is_empty() {
+            return;
         }
         info!(
             "migrating {} window(s) to the primary output",
