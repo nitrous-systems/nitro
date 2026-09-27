@@ -151,6 +151,8 @@ pub struct Config {
     pub tools: Tools,
     /// The output.
     pub backend: Backend,
+    /// Outputs to try, in order, if `backend`'s player will not start.
+    pub fallbacks: Vec<Backend>,
     /// Where the playlist and settings are kept between runs, or `None`
     /// to keep nothing.
     pub state_dir: Option<PathBuf>,
@@ -163,12 +165,15 @@ impl Config {
     /// found, state under `$XDG_CONFIG_HOME/nitro`.
     #[must_use]
     pub fn detect() -> Self {
+        let mut players = Backend::detect_all().into_iter();
+        let backend = players.next().unwrap_or(Backend::Silent);
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(1, |d| d.as_nanos() as u64);
         Self {
             tools: Tools::find(),
-            backend: Backend::detect(),
+            backend,
+            fallbacks: players.collect(),
             state_dir: config_dir(),
             seed,
         }
@@ -181,6 +186,7 @@ impl Config {
         Self {
             tools: Tools::default(),
             backend: Backend::Unpaced,
+            fallbacks: Vec::new(),
             state_dir: None,
             seed: 7,
         }
@@ -310,7 +316,7 @@ impl Amp {
             name: config.backend.name(),
             audible: config.backend.is_audible(),
         };
-        let player = Player::spawn(config.tools, config.backend)?;
+        let player = Player::spawn_with_fallbacks(config.tools, config.backend, config.fallbacks)?;
         let mut amp = Self {
             player,
             playlist: Playlist::with_seed(config.seed),
@@ -500,7 +506,9 @@ fn load(s: &mut Amp, ui: &mut Ui<Amp>, i: usize, play: bool) {
 pub fn play(s: &mut Amp, ui: &mut Ui<Amp>) {
     let st = s.player.with_status(|st| (st.state, st.token));
     let loaded = s.token > 0 && st.1 == s.token && s.playlist.current().is_some();
-    if loaded && s.shown.error.is_none() {
+    // An error on a track that is still paused or playing is a notice
+    // (the output moved to another player), not a failed load: resume.
+    if loaded && (s.shown.error.is_none() || st.0 != State::Stopped) {
         s.player.send(Cmd::Play);
         s.autoplay = true;
         ensure_ticking(s, ui);
@@ -739,11 +747,22 @@ fn set_status(ui: &mut Ui<Amp>, s: &Amp, error: Option<&str>) {
     let Some(ids) = s.ids else { return };
     let (text, role) = match error {
         Some(e) => (e.to_owned(), ColorRole::Danger),
-        None if s.output.audible => (format!("output: {}", s.output.name), ColorRole::TextDim),
-        None => (
-            "no audio player found (pw-cat, paplay, aplay): playing silently".to_owned(),
-            ColorRole::Warning,
-        ),
+        // The engine's output, not the configured one: a player that
+        // would not start has been replaced by the next.
+        None => match s.player.with_status(|st| st.output) {
+            name if name != "silent" => (format!("output: {name}"), ColorRole::TextDim),
+            _ if s.output.audible => (
+                format!(
+                    "{}: would not start, nor any other player: playing silently",
+                    s.output.name
+                ),
+                ColorRole::Warning,
+            ),
+            _ => (
+                "no audio player found (pw-cat, paplay, aplay): playing silently".to_owned(),
+                ColorRole::Warning,
+            ),
+        },
     };
     if let Ok(mut l) = ui.widget_mut::<Label>(ids.status) {
         l.set_text(text);

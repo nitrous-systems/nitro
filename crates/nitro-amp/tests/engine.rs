@@ -294,4 +294,79 @@ fn the_output_process_gets_exactly_the_samples_scaled_by_the_volume() {
     let recorded = std::fs::read_to_string(&args_file).unwrap();
     assert!(recorded.contains("--rate 8000"), "{recorded}");
     assert!(recorded.contains("--format f32"), "{recorded}");
+    // Without `--raw`, pw-cat reads stdin as a sound *file* and exits.
+    assert!(recorded.contains("--playback --raw"), "{recorded}");
+}
+
+/// Wait for a fake player's output file to reach `len` bytes.
+fn wait_for_file(path: &Path, len: usize) -> Vec<u8> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let pcm = std::fs::read(path).unwrap_or_default();
+        if pcm.len() >= len || Instant::now() > deadline {
+            return pcm;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn a_player_that_dies_at_once_hands_over_to_the_next_with_every_frame() {
+    let d = TempDir::new("fallback");
+    let bin = d.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let out = d.path().join("pcm");
+    script(
+        &bin,
+        "pw-cat",
+        "echo 'error: pw_context_connect() failed: Host is down' >&2\nexit 1",
+    );
+    script(&bin, "paplay", &format!("cat > '{}'", out.display()));
+    let mut players = Backend::detect_all_in(&[bin]).into_iter();
+    let first = players.next().unwrap();
+    assert!(matches!(first, Backend::PwCat(_)), "{first:?}");
+
+    let f = tone(d.path(), "t.wav", 8_000, 0.25);
+    let mut p = Player::spawn_with_fallbacks(Tools::default(), first, players.collect()).unwrap();
+    p.send(Cmd::Load {
+        path: f,
+        play: true,
+        token: 1,
+    });
+    let st = until(&p, "the end", |s| s.ended);
+    let pcm = wait_for_file(&out, 2_000 * 8);
+    drop(p);
+    assert_eq!(pcm.len(), 2_000 * 8, "every frame, on the second player");
+    let err = st.error.unwrap_or_default();
+    assert!(err.contains("pipewire"), "{err}");
+    assert!(err.contains("Host is down"), "{err}");
+    assert!(err.contains("using pulseaudio"), "{err}");
+    assert_eq!(st.output, "pulseaudio");
+}
+
+#[test]
+fn a_lone_player_that_dies_says_why_and_the_track_still_ends() {
+    let d = TempDir::new("dies");
+    let bin = d.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    script(
+        &bin,
+        "pw-cat",
+        "echo 'sndfile: failed to open audio file' >&2\necho 'error: open failed' >&2\nexit 1",
+    );
+    let mut players = Backend::detect_all_in(&[bin]).into_iter();
+    let first = players.next().unwrap();
+    let f = tone(d.path(), "t.wav", 8_000, 0.25);
+    let mut p = Player::spawn_with_fallbacks(Tools::default(), first, players.collect()).unwrap();
+    p.send(Cmd::Load {
+        path: f,
+        play: true,
+        token: 1,
+    });
+    let st = until(&p, "the end", |s| s.ended);
+    let err = st.error.unwrap_or_default();
+    assert!(err.contains("pipewire"), "{err}");
+    assert!(err.contains("error: open failed"), "{err}");
+    assert!(err.contains("playing silently"), "{err}");
+    assert_eq!(st.output, "silent");
 }

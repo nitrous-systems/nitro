@@ -134,6 +134,20 @@ impl Player {
     /// # Errors
     /// If the thread cannot be spawned.
     pub fn spawn(tools: Tools, backend: Backend) -> std::io::Result<Self> {
+        Self::spawn_with_fallbacks(tools, backend, Vec::new())
+    }
+
+    /// Start the audio thread with players to try, in order, when
+    /// `backend`'s will not start: one that cannot be spawned, or dies
+    /// before it has played anything. After the last, silence.
+    ///
+    /// # Errors
+    /// If the thread cannot be spawned.
+    pub fn spawn_with_fallbacks(
+        tools: Tools,
+        backend: Backend,
+        fallbacks: Vec<Backend>,
+    ) -> std::io::Result<Self> {
         let (tx, rx) = std::sync::mpsc::channel();
         let status = Arc::new(Mutex::new(Status {
             output: backend.name(),
@@ -142,7 +156,11 @@ impl Player {
         let shared = Arc::clone(&status);
         let join = std::thread::Builder::new()
             .name("nitro-amp-audio".to_owned())
-            .spawn(move || Engine::new(tools, backend, shared).run(&rx))?;
+            .spawn(move || {
+                let mut engine = Engine::new(tools, backend, shared);
+                engine.fallbacks = fallbacks.into();
+                engine.run(&rx);
+            })?;
         Ok(Self {
             tx,
             sent: 0,
@@ -202,6 +220,8 @@ fn lock(m: &Mutex<Status>) -> MutexGuard<'_, Status> {
 struct Engine {
     tools: Tools,
     backend: Backend,
+    /// Players to try next if `backend`'s will not start.
+    fallbacks: VecDeque<Backend>,
     status: Arc<Mutex<Status>>,
     source: Option<Box<dyn Source>>,
     sink: Option<Sink>,
@@ -233,6 +253,7 @@ impl Engine {
         Self {
             tools,
             backend,
+            fallbacks: VecDeque::new(),
             status,
             source: None,
             sink: None,
@@ -438,10 +459,10 @@ impl Engine {
                 Err(e) => {
                     // A player that is installed but will not start (no
                     // sound server running) should not stop the music
-                    // being *shown*: fall back to silence and say so.
-                    self.error = Some(format!("{}: {e}; playing silently", self.backend.name()));
-                    self.backend = Backend::Silent;
-                    self.sink = Backend::Silent.open(rate).ok();
+                    // being *shown*: try the next, else silence, and say
+                    // so.
+                    let failed = format!("{}: {e}", self.backend.name());
+                    self.sink = Some(self.next_backend(&failed, rate));
                 }
             }
         }
@@ -459,12 +480,54 @@ impl Engine {
         if let Some(sink) = &mut self.sink
             && let Err(e) = sink.write(chunk)
         {
-            self.error = Some(format!("{}: {e}", self.backend.name()));
-            self.sink = None;
-            self.state = State::Stopped;
-            return;
+            let mut failed = format!("{}: {e}", self.backend.name());
+            let mut unheard = self.sink.take().and_then(Sink::into_unheard);
+            // A player that died before it can have played anything
+            // (no server, arguments it refuses) is replaced by the next
+            // one, which gets everything the dead one was given.
+            loop {
+                let Some(samples) = unheard else {
+                    self.error = Some(failed);
+                    self.state = State::Stopped;
+                    return;
+                };
+                let mut sink = self.next_backend(&failed, rate);
+                match sink.write(&samples) {
+                    Ok(()) => {
+                        self.sink = Some(sink);
+                        break;
+                    }
+                    Err(e) => {
+                        failed = format!("{failed}; {}: {e}", self.backend.name());
+                        unheard = sink.into_unheard();
+                    }
+                }
+            }
         }
         self.written += (n / 2) as u64;
+    }
+
+    /// Give up on the current player, whose failure `failed` describes,
+    /// and open the next one that starts — or silence, which always
+    /// does. Records the failure and the switch as the error, and makes
+    /// the new player the one later outputs (a new rate, a seek) use.
+    fn next_backend(&mut self, failed: &str, rate: u32) -> Sink {
+        let mut failed = failed.to_owned();
+        while let Some(next) = self.fallbacks.pop_front() {
+            match next.open(rate) {
+                Ok(sink) => {
+                    self.error = Some(format!("{failed}; using {}", next.name()));
+                    self.backend = next;
+                    return sink;
+                }
+                Err(e) => failed = format!("{failed}; {}: {e}", next.name()),
+            }
+        }
+        self.error = Some(format!("{failed}; playing silently"));
+        self.backend = Backend::Silent;
+        Backend::Silent
+            .open(rate)
+            .unwrap_or_else(|_| unreachable!("silence always opens"))
     }
 
     fn publish(&self) {
