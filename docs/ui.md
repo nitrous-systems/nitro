@@ -952,6 +952,23 @@ positions already **widget-local**:
   bubble up until one answers `Handled::Yes`. Enter/leave is computed
   from the difference between the old and new hover chains, so a widget
   gets exactly one `PointerEnter` per crossing.
+* **Pointer capture.** A `PointerDown` captures the pointer for the chain
+  it was delivered to: until the last button is up, every `PointerMove`
+  and the `PointerUp` go to that chain, in each widget's own coordinates
+  — which may be negative or beyond its bounds — wherever the pointer has
+  gone, including outside the window (the server's implicit grab,
+  `docs/wire.md`, keeps the motion coming). While captured, hover is kept
+  honest for the captured widgets only — dragging off a `Button` sends it
+  `PointerLeave` and dragging back on `PointerEnter`, so its face follows
+  — and nothing outside the capture becomes hovered. The release that
+  ends the capture reconciles hover against what is really under the
+  pointer (leaves and enters, no move). `EventCx::is_captured` tells a
+  widget whether a `PointerLeave` is a slide-off (keep the drag) or the
+  server taking the pointer away — a window drag or DnD the app began, a
+  lock, overview, the window closing — after which the release never
+  comes (drop it). A widget removed mid-capture cuts the captured chain
+  at itself; its ancestors keep the capture. `Slider` drags, `TextField`
+  drag-selection and `Button`'s release-inside rule all rest on this.
 * **Focus changes are queued, not delivered inline.** `Ui::focus` is
   reachable from `EventCx::request_focus`, i.e. from inside a widget's
   own `event` — where that widget is out of its slot and the app state is
@@ -1724,9 +1741,6 @@ regrets:
   (`TextField`, `Slider`) is also unfloored vertically. `min_height` is
   the defence; splitting the flag per axis is the thorough fix and is
   not done.
-* **No pointer grab.** A press followed by a release outside the widget
-  is not routed back to it, so `Button` drops its pressed state on
-  `PointerLeave` instead. A real grab is a server-side concept and M3.
 * **`Ui::remove` does not recycle the node ids under the destroyed
   subtree.** One `DestroyNode` on the outermost group frees them
   server-side; reusing them locally would mean proving that commit had

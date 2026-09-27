@@ -1136,7 +1136,10 @@ fn a_slider_drag_survives_leaving_the_widget_and_the_window() {
     h.move_pointer(Point::new(b.x + b.w / 2.0, mid_y));
     h.press(nitro_ui::event::button::LEFT);
     let mid = h.widget::<Slider<S>>(id).value();
-    assert!((40.0..=60.0).contains(&mid), "pressed the middle, got {mid}");
+    assert!(
+        (40.0..=60.0).contains(&mid),
+        "pressed the middle, got {mid}"
+    );
     assert_eq!(h.state().values.len(), 1);
 
     // Right, past the track and past the window's right edge: the value
@@ -1162,7 +1165,11 @@ fn a_slider_drag_survives_leaving_the_widget_and_the_window() {
     let after = h.state().values.len();
     h.move_pointer(Point::new(b.x + b.w - 2.0, 100.0));
     same(h.widget::<Slider<S>>(id).value(), quarter);
-    assert_eq!(h.state().values.len(), after, "a move after the release changes nothing");
+    assert_eq!(
+        h.state().values.len(),
+        after,
+        "a move after the release changes nothing"
+    );
 
     // Back over it, plainly hovered, and a fresh click works.
     h.click_at(Point::new(b.x + b.w - 2.0, mid_y));
@@ -1191,7 +1198,10 @@ fn a_text_field_drag_selects_and_survives_leaving_the_field() {
     // Drag well past the right edge of the field and below the window:
     // the selection extends to the end.
     h.move_pointer(Point::new(b.x + b.w + 40.0, 200.0));
-    assert_eq!(h.widget::<TextField<()>>(field).selected_text(), "hello world");
+    assert_eq!(
+        h.widget::<TextField<()>>(field).selected_text(),
+        "hello world"
+    );
     assert_eq!(h.widget::<TextField<()>>(field).selection(), (0, 11));
 
     // The release ends it; a later move selects nothing more.

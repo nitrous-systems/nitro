@@ -596,6 +596,18 @@ beside them rather than being replaced — see §Cursor shapes above.
   it must be told. Neither blocks on a reply.
 * Dragging a maximized window by its title bar restores it first, under
   the cursor, so the restore rectangle is not silently discarded.
+* **Implicit grab.** A press delivered to a client window pins pointer
+  focus on it until the last button is up: motion (in its coordinates,
+  even outside it) and the release go to it, no leave/enter goes out,
+  and only then is focus re-derived (`docs/wire.md` § `PointerButton`).
+  Ordering against the other pointer owners: the popup grab, DnD and
+  overview see a button event first, so a press they consume never
+  starts a grab; a window drag (frame region, `Super`+drag, or a
+  client's `StartMove`/`StartResize`), a `StartDrag`, a lock, overview
+  and the window closing all end a grab in flight, sending the client a
+  `PointerLeave` and swallowing the release; a grabbing popup mapping
+  mid-press ends it silently. Neither a frame drag nor a `Super`-drag can
+  start on a second button while a grab is held.
 
 ### Keyboard
 

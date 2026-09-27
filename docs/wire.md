@@ -1724,6 +1724,27 @@ Same fields as `PointerEnter`.
 | `state` | `ButtonState` | |
 | `time_ns` | `u64` | |
 
+**Implicit grab.** A press delivered to a window while no button was
+held holds pointer focus on that window until **every** button is up
+again, the X11/Wayland rule. For the grab's duration every
+`PointerMotion` and every further `PointerButton` go to that window,
+whatever is under the pointer; `pos` is still in the window's own
+coordinate space and may be negative or beyond its size, and `node` is
+`NONE` while the pointer is outside it. No `PointerLeave` is sent to the
+grabbing window and no `PointerEnter` to whatever the pointer crosses,
+and a window mapping or unmapping under a still pointer does not move
+focus. The window's `SetCursor` stays honoured throughout. After the
+final release focus is re-derived from the pointer's position, with the
+`PointerLeave`/`PointerEnter` that says where it ended up, so a client
+may see `Released` followed at once by `PointerLeave`. The grab ends
+early — with a `PointerLeave`, and the release then **never arrives** —
+when the server takes the pointer: `StartMove`/`StartResize`, `StartDrag`,
+a session lock, overview mode, or the window closing; a grabbing popup
+(`GRAB`) mapping mid-press ends it too, without a leave, so the
+press-drag-into-the-menu-release gesture runs on ordinary enter/leave. A
+second button pressed mid-grab over another window's title bar is the
+grabbing window's, not a frame drag.
+
 ### `PointerAxis` — 0x8205
 
 | field | type | meaning |

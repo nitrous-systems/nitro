@@ -3262,7 +3262,13 @@ impl<S: 'static> Ui<S> {
     /// it. Hover is kept honest for the captured widgets only — a
     /// button un-presses when dragged off and re-presses when dragged
     /// back on — and nothing outside the capture becomes hovered.
-    fn captured_move_in(&mut self, state: &mut S, win: WindowId, captured: &[WidgetId], pos: Point) {
+    fn captured_move_in(
+        &mut self,
+        state: &mut S,
+        win: WindowId,
+        captured: &[WidgetId],
+        pos: Point,
+    ) {
         let Some(w) = self.win_mut(win) else {
             return;
         };
@@ -3272,9 +3278,9 @@ impl<S: 'static> Ui<S> {
             .iter()
             .copied()
             .filter(|(id, p)| {
-                self.arena
-                    .slot(*id)
-                    .is_some_and(|s| p.x >= 0.0 && p.y >= 0.0 && p.x < s.state.bounds.w && p.y < s.state.bounds.h)
+                self.arena.slot(*id).is_some_and(|s| {
+                    p.x >= 0.0 && p.y >= 0.0 && p.x < s.state.bounds.w && p.y < s.state.bounds.h
+                })
             })
             .collect();
         let new = self.update_hover(state, &old, &inside);

@@ -3423,25 +3423,7 @@ impl Server {
                 // the ordinary path, which re-derives focus.
                 self.end_pointer_grab();
             } else {
-                self.set_resize_hint(None);
-                self.set_button_hover(None);
-                let local = input::window_local(&self.scene, grab, point).unwrap_or(Point::ZERO);
-                let node = output
-                    .and_then(|id| self.pointer_target(id, point))
-                    .filter(|t| t.window == grab)
-                    .map_or(NodeId::NONE, |t| self.node_id_for(grab, t.hit.node));
-                let sent_to = self.send_input(grab, |id| {
-                    ServerMsg::PointerMotion(msg::PointerMotion {
-                        window: id,
-                        node,
-                        pos: local,
-                        time_ns,
-                    })
-                });
-                self.note_client_input(sent_to);
-                self.set_cursor(self.cursor_choice(Some((grab, Region::Content))));
-                self.cursor_stale = false;
-                self.note_input(time_ns);
+                self.grabbed_motion(grab, point, output, time_ns);
                 return;
             }
         }
@@ -3525,6 +3507,35 @@ impl Server {
             frame_hit
         };
         self.set_cursor(self.cursor_choice(cursor_hit));
+        self.cursor_stale = false;
+        self.note_input(time_ns);
+    }
+
+    /// A motion while `grab` holds the implicit grab: see `move_pointer`.
+    fn grabbed_motion(
+        &mut self,
+        grab: WindowKey,
+        point: Point,
+        output: Option<SceneOutputId>,
+        time_ns: u64,
+    ) {
+        self.set_resize_hint(None);
+        self.set_button_hover(None);
+        let local = input::window_local(&self.scene, grab, point).unwrap_or(Point::ZERO);
+        let node = output
+            .and_then(|id| self.pointer_target(id, point))
+            .filter(|t| t.window == grab)
+            .map_or(NodeId::NONE, |t| self.node_id_for(grab, t.hit.node));
+        let sent_to = self.send_input(grab, |id| {
+            ServerMsg::PointerMotion(msg::PointerMotion {
+                window: id,
+                node,
+                pos: local,
+                time_ns,
+            })
+        });
+        self.note_client_input(sent_to);
+        self.set_cursor(self.cursor_choice(Some((grab, Region::Content))));
         self.cursor_stale = false;
         self.note_input(time_ns);
     }
@@ -3669,6 +3680,13 @@ impl Server {
             // explicit that focus is only ever handed on, never dropped.
             return;
         };
+        self.deliver_button(window, button, state, time_ns);
+    }
+
+    /// The ordinary delivery of a button event to `window`, and the
+    /// implicit grab's bookkeeping around it: a delivered press with no
+    /// button held begins one, the release of the last button ends it.
+    fn deliver_button(&mut self, window: WindowKey, button: u32, state: ButtonState, time_ns: u64) {
         if state == ButtonState::Pressed && button == input::BTN_LEFT && self.pointer.grab.is_none()
         {
             self.raise_and_focus(window);

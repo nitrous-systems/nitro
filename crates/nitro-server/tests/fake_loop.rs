@@ -852,7 +852,10 @@ fn a_held_button_keeps_the_pointer_on_the_pressed_window() {
         _ => None,
     });
     let step = cascade_step(size, (w, h));
-    assert!(step.0 > 0.0 && step.1 > 0.0, "no cascade, no overlap: {step:?}");
+    assert!(
+        step.0 > 0.0 && step.1 > 0.0,
+        "no cascade, no overlap: {step:?}"
+    );
     h_.settle();
 
     // Press on the uncovered top-left of the first window.
@@ -892,7 +895,9 @@ fn a_held_button_keeps_the_pointer_on_the_pressed_window() {
     );
     assert!(motion.pos.x > size.w && motion.pos.y > size.h);
     assert!(
-        !seen1.iter().any(|m| matches!(m, ServerMsg::PointerLeave(_))),
+        !seen1
+            .iter()
+            .any(|m| matches!(m, ServerMsg::PointerLeave(_))),
         "no leave mid-grab: {seen1:?}"
     );
     h_.settle();
@@ -918,7 +923,11 @@ fn a_held_button_keeps_the_pointer_on_the_pressed_window() {
     });
     assert_eq!(motion.window, w1.root);
     assert!(motion.pos.x < 0.0 && motion.pos.y < 0.0, "{:?}", motion.pos);
-    assert!(!seen1.iter().any(|m| matches!(m, ServerMsg::PointerLeave(_))));
+    assert!(
+        !seen1
+            .iter()
+            .any(|m| matches!(m, ServerMsg::PointerLeave(_)))
+    );
 
     // Back over the second window and release there: the release is the
     // first window's, and only *after* it does focus move on.
@@ -958,7 +967,10 @@ fn a_held_button_keeps_the_pointer_on_the_pressed_window() {
         .iter()
         .position(|m| matches!(m, ServerMsg::PointerLeave(_)))
         .unwrap();
-    assert!(release_idx < leave_idx, "the release comes before the leave");
+    assert!(
+        release_idx < leave_idx,
+        "the release comes before the leave"
+    );
 
     // A further motion is the second window's, plainly.
     seen2.clear();
