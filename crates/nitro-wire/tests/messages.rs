@@ -16,11 +16,11 @@ use nitro_wire::msg::{
     OutputsEnd, OverviewState, PointerAxis, PointerButton, PointerEnter, PointerLeave,
     PointerMotion, PopupDone, Presented, Reparent, RepositionPopup, RequestFrame, RequestSelection,
     SelectionData, SelectionOffer, SelectionRequest, SendSelection, ServerMsg, SetAnchor, SetAppId,
-    SetBorder, SetBounds, SetClip, SetCorners, SetCursor, SetExclusiveZone, SetFill, SetIcon,
-    SetImage, SetLayer, SetOpacity, SetOverview, SetSelection, SetText, SetTransform, SetVisible,
-    SetWindowLimits, SetWindowState, SetWindowStateFor, SetWindowTitle, StartDrag, StartMove,
-    StartResize, TextMeasured, TextMetrics, Theme, Touch, UnbindKey, Unlock, Welcome, WindowGone,
-    WindowInfo, WindowList, WindowListEnd, WindowState,
+    SetBorder, SetBounds, SetClip, SetCorners, SetCursor, SetDragIconOffset, SetExclusiveZone,
+    SetFill, SetIcon, SetImage, SetLayer, SetOpacity, SetOverview, SetSelection, SetText,
+    SetTransform, SetVisible, SetWindowLimits, SetWindowState, SetWindowStateFor, SetWindowTitle,
+    StartDrag, StartMove, StartResize, TextMeasured, TextMetrics, Theme, Touch, UnbindKey, Unlock,
+    Welcome, WindowGone, WindowInfo, WindowList, WindowListEnd, WindowState,
 };
 use nitro_wire::types::{
     Align, AxisSource, BufferId, ButtonState, CursorPos, CursorShape, DataSource, DragAction, Edge,
@@ -455,6 +455,16 @@ fn client_messages() -> Vec<ClientMsg> {
         }
         .into(),
         FinishDrag.into(),
+        SetDragIconOffset {
+            icon: NodeId(69),
+            offset: Point::new(-10.0, -5.5),
+        }
+        .into(),
+        SetDragIconOffset {
+            icon: NodeId(71),
+            offset: Point::new(0.0, 0.0),
+        }
+        .into(),
     ]
 }
 
@@ -1509,6 +1519,24 @@ fn the_m5_payload_layouts_are_frozen() {
         ]
     );
 
+    let mut w = Writer::new();
+    ClientMsg::from(SetDragIconOffset {
+        icon: NodeId(0x0102_0304),
+        offset: Point::new(-5.0, 2.5),
+    })
+    .encode(&mut w)
+    .unwrap();
+    assert_eq!(
+        w.bytes(),
+        &[
+            // header: len=12, op=0x030b, fds=0, flags=0
+            0x0c, 0x00, 0x00, 0x00, 0x0b, 0x03, 0x00, 0x00, //
+            0x04, 0x03, 0x02, 0x01, // icon
+            0x00, 0x00, 0xa0, 0xc0, // offset.x = -5.0
+            0x00, 0x00, 0x20, 0x40, // offset.y = 2.5
+        ]
+    );
+
     // `ListOutputs` and `FinishDrag` are bare headers, like `WindowList`.
     for (msg, op) in [
         (ClientMsg::from(ListOutputs), 0x001bu16),
@@ -1978,6 +2006,7 @@ fn the_m5_ops_are_where_the_doc_says() {
         (StartDrag::OP, 0x0300),
         (AcceptDrop::OP, 0x0300),
         (FinishDrag::OP, 0x0300),
+        (SetDragIconOffset::OP, 0x0300),
     ] {
         assert_eq!(op & 0xff00, block, "client M5 op {op:#06x}");
         assert!(ClientMsg::is_op(op), "client M5 op {op:#06x}");
@@ -2008,6 +2037,7 @@ fn the_m5_ops_are_where_the_doc_says() {
     assert_eq!(ClientCaps::OP, 0x0003);
     assert_eq!(CreatePopup::OP, 0x0016);
     assert_eq!(FinishDrag::OP, 0x030a);
+    assert_eq!(SetDragIconOffset::OP, 0x030b);
     assert_eq!(PopupDone::OP, 0x8106);
     assert_eq!(Keymap::OP, 0x8208);
     assert_eq!(IconRefused::OP, 0x8303);

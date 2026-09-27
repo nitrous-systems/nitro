@@ -31,7 +31,7 @@
 use std::collections::HashMap;
 use std::os::fd::BorrowedFd;
 
-use nitro_core::{Rect, Role, Size};
+use nitro_core::{Point, Rect, Role, Size};
 use nitro_scene::{
     Border, BufferDesc, BufferKey, ClientId, Error as SceneError, Fill as SceneFill, IconRef,
     ImageRef, NodeKey, NodeKind as SceneNodeKind, PixelStore, Scene, TextAlign, TextRef,
@@ -459,6 +459,11 @@ pub struct ApplyOutcome {
     /// exists and is placed before the server adopts it; authorization —
     /// a button down, pointer focus — is the server's, at processing.
     pub start_drags: Vec<DragStart>,
+    /// `SetDragIconOffset`s, validated, in arrival order: the icon window
+    /// and its top-left relative to the pointer hotspot. Buffered to the
+    /// commit like `start_drags`, so a mid-drag change lands with the new
+    /// icon image.
+    pub drag_icon_offsets: Vec<(WindowKey, Point)>,
 }
 
 /// A validated `StartDrag`; see [`ApplyOutcome::start_drags`].
@@ -1044,7 +1049,17 @@ fn apply_msg(
             let icon = if m.icon.is_none() {
                 None
             } else {
-                Some(drag_icon(client, scene, m.icon, window)?)
+                let icon = icon_window(client, scene, m.icon, "StartDrag")?;
+                if icon == window {
+                    return Err(ApplyError::new(
+                        ErrorCode::Protocol,
+                        format!(
+                            "StartDrag: icon {} is the window the drag starts from",
+                            m.icon.raw()
+                        ),
+                    ));
+                }
+                Some(icon)
             };
             if !crate::data::valid_actions(m.actions) {
                 return Err(ApplyError::new(
@@ -1071,6 +1086,20 @@ fn apply_msg(
             });
             Ok(())
         }
+        ClientMsg::SetDragIconOffset(m) => {
+            let icon = icon_window(client, scene, m.icon, "SetDragIconOffset")?;
+            if !m.offset.x.is_finite() || !m.offset.y.is_finite() {
+                return Err(ApplyError::new(
+                    ErrorCode::Protocol,
+                    format!(
+                        "SetDragIconOffset: offset ({}, {}) is not finite",
+                        m.offset.x, m.offset.y
+                    ),
+                ));
+            }
+            outcome.drag_icon_offsets.push((icon, m.offset));
+            Ok(())
+        }
         ClientMsg::AcceptDrop(_) | ClientMsg::FinishDrag(_) => {
             // Never buffered: `handle_wire_msg` acts on them at receipt.
             // An acceptance answers the motion the target just saw, and a
@@ -1080,20 +1109,21 @@ fn apply_msg(
     }
 }
 
-/// Resolve and check a `StartDrag` icon (`docs/wire.md` § `StartDrag`):
-/// one of the sender's own window roots, not a popup, not the window the
-/// drag starts from, created `UNDECORATED | NO_FOCUS`. Anything else is a
-/// lie rather than a race, so it is fatal.
-fn drag_icon(
+/// Resolve and check a drag icon (`docs/wire.md` § `StartDrag`,
+/// § `SetDragIconOffset`): one of the sender's own window roots, not a
+/// popup, created `UNDECORATED | NO_FOCUS`. Anything else is a lie rather
+/// than a race, so it is fatal. `StartDrag` adds its own check that the
+/// icon is not the window the drag starts from.
+fn icon_window(
     client: &WireClient,
     scene: &Scene,
     id: NodeId,
-    window: WindowKey,
+    what: &str,
 ) -> Result<WindowKey, ApplyError> {
     let bad = |why: &str| {
         ApplyError::new(
             ErrorCode::Protocol,
-            format!("StartDrag: icon {} {why}", id.raw()),
+            format!("{what}: icon {} {why}", id.raw()),
         )
     };
     let icon = client
@@ -1101,12 +1131,7 @@ fn drag_icon(
         .get(&id)
         .copied()
         .ok_or_else(|| bad("is not one of this client's windows"))?;
-    if icon == window {
-        return Err(bad("is the window the drag starts from"));
-    }
-    let info = scene
-        .window_info(icon)
-        .map_err(|e| scene_err("StartDrag", e))?;
+    let info = scene.window_info(icon).map_err(|e| scene_err(what, e))?;
     if info.is_popup() {
         return Err(bad("is a popup"));
     }

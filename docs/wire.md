@@ -569,6 +569,7 @@ Assigned in blocks of 0x100 so a block can grow without renumbering.
 | `0x0308` | `StartDrag` | data transfer (see `DATA`) |
 | `0x0309` | `AcceptDrop` | data transfer (see `DATA`) |
 | `0x030a` | `FinishDrag` | data transfer (see `DATA`) |
+| `0x030b` | `SetDragIconOffset` | data transfer (see `DATA`) |
 | `0x0401` | `SetLayer` | shell (see `SHELL`) |
 | `0x0402` | `SetExclusiveZone` | shell (see `SHELL`) |
 | `0x0403` | `SetAnchor` | shell (see `SHELL`) |
@@ -1455,7 +1456,8 @@ popup, not `window`, and was created `UNDECORATED | NO_FOCUS`; anything
 else is `Error { Protocol }`. The server *adopts* it for good: out of
 window cycling and the shell's window list, on the `Overlay` layer, and
 never hit — the pointer passes through it to the drop target. It is drawn
-**centred on the pointer** (the protocol has no hotspot offset), follows
+at its [`SetDragIconOffset`](#setdragiconoffset--0x030b) hotspot —
+**centred on the pointer** if none was set — follows
 it across outputs, and is unmapped when the pointer grab ends — at the
 drop or the cancel, not at `FinishDrag`, so a source that never finishes
 cannot leave it on screen. It stays adopted: the client may use it as
@@ -1510,6 +1512,43 @@ The phase makes this unambiguous when source and target are one client.
 From anyone else it is a race and ignored. There is **no timeout**: a
 target that never finishes leaves the source waiting, as a Wayland
 target that never calls `wl_data_offer.finish` does.
+
+### `SetDragIconOffset` — 0x030b
+
+| field | type | meaning |
+|---|---|---|
+| `icon` | `u32` (`NodeId`) | the icon window, by the sender's own id |
+| `offset` | `Point` (2 × `f32`) | icon top-left relative to the pointer, logical px |
+
+Fixed head **12 bytes**. Requires `DATA`: from a client that did not list
+it, or over a link that never offered it, it is `Error { Protocol }`.
+
+`offset` is where the icon window's **top-left sits relative to the
+pointer hotspot** — usually negative: `(-10, -5)` means the pointer
+grabbed the image 10 px in from its left and 5 px down from its top.
+This is Wayland's `wl_surface.offset` convention. An icon that never had
+an offset set is drawn centred on the pointer, as before this op existed.
+
+**Buffered to the commit**, like `StartDrag`, so a client may send
+`CreateWindow(icon)`, `SetDragIconOffset` and `StartDrag` in one batch,
+and a mid-drag change lands atomically with the icon's new image: an
+offset committed while the icon is being dragged moves it at once,
+without waiting for pointer motion.
+
+`icon` must be one of the sender's window roots, not a popup, created
+`UNDECORATED | NO_FOCUS` — `StartDrag`'s icon checks, less "not the
+window the drag starts from" — and `offset` must be finite. Anything else
+(`NONE` included) is `Error { Protocol }`.
+
+The offset **sticks to the window** until it is changed or the window is
+destroyed: an icon reused for a later drag keeps it, and it may be set
+before any drag or during one.
+
+**Chromium mapping:** `WmDragHandler::StartDrag` reads the image offset
+from `OSExchangeData::GetDragImageOffset()` (image origin → cursor), and
+`UpdateDragImage(image, offset)` changes it mid-drag. The backend sends
+`-GetDragImageOffset()` for both, as the Wayland backend passes it to
+`wl_surface_offset`.
 
 ## Messages, server → client
 
@@ -2432,6 +2471,7 @@ sends the read end, and writes at its leisure.
 ### The drag-and-drop sequence
 
 ```text
+source       →  SetDragIconOffset { icon, offset }              (0x030b)  — optional
 source       →  StartDrag { window, icon, actions, mimes }      (0x0308)
 
 server       →  DragEnter { window, pos, actions, mimes }  to target  (0x8504)
@@ -3134,6 +3174,11 @@ to.
   serials it expects forwarded. The backend drops them. Nothing upstream
   inspects what it does with them.
 
+* `SetDragIconOffset` (`0x030b`) joins the data block, for a drag icon's
+  hotspot (#3851). It is a new op behind the existing `DATA` bit, so a
+  client sends it only after seeing `DATA`, and an older server refuses
+  it as an unknown op, like `SetOverview`. `StartDrag` is unchanged.
+  `VERSION` stays **1**.
 * `SetAnchor` (0x0403) grew `output` **in place**, moving its body from
   9 to 13 bytes (#3844). The same exemption as `WindowInfo.layer` above,
   and the same premise: the op is in the `SHELL` block, reachable only

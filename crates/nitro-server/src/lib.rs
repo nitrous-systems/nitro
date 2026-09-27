@@ -985,6 +985,11 @@ struct Server {
     /// out of the window list, the MRU and every hit test, and never
     /// migrated as orphans (the drag re-places its icon itself).
     drag_icons: HashSet<WindowKey>,
+    /// `SetDragIconOffset`s: an icon window's top-left relative to the
+    /// pointer hotspot, logical pixels. Sticks to the window until changed
+    /// or the window dies, so a reused icon keeps it; an icon without one
+    /// is centred (`place_drag_icon`).
+    drag_icon_offsets: HashMap<WindowKey, Point>,
     /// A drag ended with a button still held (Escape, a lock, the source
     /// gone): swallow every button event until all are up, so no client
     /// sees a `Released` whose press it never saw.
@@ -1333,6 +1338,7 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         pending_drag_starts: Vec::new(),
         pending_drag_finished: Vec::new(),
         drag_icons: HashSet::new(),
+        drag_icon_offsets: HashMap::new(),
         dnd_swallow: false,
         overview_swallow: None,
         dnd_escape_consumed: false,
@@ -4257,6 +4263,7 @@ impl Server {
             self.relayout_overview();
         }
         self.drag_icons.remove(&win);
+        self.drag_icon_offsets.remove(&win);
         self.dnd_step(|d| d.forget_window(win));
         self.decorations.remove(&win);
         if self.resize_hint == Some(win) {
@@ -7678,6 +7685,20 @@ impl Server {
         let repositioned = outcome.repositioned_popups;
         self.pending_drag_starts
             .extend(outcome.start_drags.into_iter().map(|d| (token, d)));
+        // Before `closed_windows`, so an icon destroyed in the same batch
+        // drops its offset. A mid-drag change moves the icon at once; only
+        // scene, pointer and drag state are touched, so the lifted-out
+        // client does not matter.
+        for (icon, offset) in outcome.drag_icon_offsets {
+            self.drag_icon_offsets.insert(icon, offset);
+            if self
+                .dnd
+                .as_ref()
+                .is_some_and(|d| d.grabbing() && d.icon == Some(icon))
+            {
+                self.place_drag_icon();
+            }
+        }
         client.frame_requests.extend(outcome.frame_requests);
         for win in outcome.closed_windows {
             self.forget_closed(win);
@@ -8431,10 +8452,14 @@ impl Server {
         if self.refuse_popup_op(token, msg) {
             return true;
         }
-        // `StartDrag` is buffered to the commit, so its `DATA` gate is
-        // here; `AcceptDrop`/`FinishDrag` are answered at receipt and
+        // `StartDrag` and `SetDragIconOffset` are buffered to the
+        // commit, so their `DATA` gate is here; `AcceptDrop`/`FinishDrag` are answered at receipt and
         // check it themselves.
-        matches!(msg, ClientMsg::StartDrag(_)) && !self.data_allowed(token, "StartDrag")
+        match msg {
+            ClientMsg::StartDrag(_) => !self.data_allowed(token, "StartDrag"),
+            ClientMsg::SetDragIconOffset(_) => !self.data_allowed(token, "SetDragIconOffset"),
+            _ => false,
+        }
     }
 
     /// Refuse a popup op from a client that never listed `POPUP` in its
@@ -8650,8 +8675,9 @@ impl Server {
         }
     }
 
-    /// Put the drag icon under the pointer, centred, on whichever output
-    /// the pointer is on — which is what carries it across outputs.
+    /// Put the drag icon under the pointer at its `SetDragIconOffset`
+    /// hotspot offset (centred if none was set), on whichever output the
+    /// pointer is on — which is what carries it across outputs.
     ///
     /// This moves a window, so it is content damage, and a frame with an
     /// icon in motion is never a cursor-only flip (`defer.rs`). That is
@@ -8668,13 +8694,18 @@ impl Server {
             .scene
             .window_info(icon)
             .map_or(Size::ZERO, nitro_scene::Window::frame_size);
+        let offset = self
+            .drag_icon_offsets
+            .get(&icon)
+            .copied()
+            .unwrap_or_else(|| Point::new(-size.w / 2.0, -size.h / 2.0));
         let local = output.and_then(|id| self.scene.output_info(id)).map_or(
             Point::ZERO,
             |(rect, scale)| {
                 let s = if scale > 0.0 { scale } else { 1.0 };
                 Point::new(
-                    ((point.x - rect.x as f32) / s - size.w / 2.0).round(),
-                    ((point.y - rect.y as f32) / s - size.h / 2.0).round(),
+                    ((point.x - rect.x as f32) / s + offset.x).round(),
+                    ((point.y - rect.y as f32) / s + offset.y).round(),
                 )
             },
         );

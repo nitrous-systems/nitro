@@ -800,6 +800,124 @@ fn a_decorated_or_focusable_icon_is_fatal() {
     h.quit();
 }
 
+/// Set `icon`'s hotspot offset and commit it.
+fn set_offset(p: &mut Peer, icon: NodeId, x: f32, y: f32) {
+    p.conn.set_drag_icon_offset(icon, Point::new(x, y)).unwrap();
+    let serial = p.next_serial();
+    p.conn.commit(serial).unwrap();
+    p.conn.flush().unwrap();
+}
+
+#[test]
+fn an_icon_offset_puts_the_grab_point_under_the_pointer() {
+    let _fds = shared();
+    let mut h = Harness::start("iconoff");
+    let mut s = two(&mut h);
+    let icon = icon_window(&mut s.a, 50);
+    // Grabbed 5 px in from its top-left, set before the drag.
+    set_offset(&mut s.a, icon, -5.0, -5.0);
+    drag_onto_b(&mut h, &mut s, icon);
+    let (px, py) = (s.at_b.0 + 5.0, s.at_b.1 + 5.0);
+    let img = h.shot(None);
+    assert_eq!(
+        rgb(img.pixel((px + 50.0) as u32, (py + 30.0) as u32)),
+        to_rgb(BLUE),
+        "the 60x40 icon starts 5 px up and left of the pointer"
+    );
+    assert_eq!(
+        rgb(img.pixel((px - 20.0) as u32, (py - 12.0) as u32)),
+        to_rgb(GREEN),
+        "where centring would have put it"
+    );
+    accept_and_drop(&mut h, &mut s);
+    transfer_and_finish(&h, &mut s, 1, b"x");
+    h.quit();
+}
+
+#[test]
+fn an_icon_offset_changed_mid_drag_moves_the_icon_at_once() {
+    let _fds = shared();
+    let mut h = Harness::start("iconmove");
+    let mut s = two(&mut h);
+    let icon = icon_window(&mut s.a, 50);
+    drag_onto_b(&mut h, &mut s, icon);
+    let (px, py) = (s.at_b.0 + 5.0, s.at_b.1 + 5.0);
+    let img = h.shot(None);
+    let (fx, fy) = ((px + 50.0) as u32, (py + 30.0) as u32);
+    assert_eq!(rgb(img.pixel(fx, fy)), to_rgb(GREEN), "centred at first");
+    // The pointer does not move; the icon does.
+    set_offset(&mut s.a, icon, 0.0, 0.0);
+    h.settle();
+    let img = h.shot(None);
+    assert_eq!(
+        rgb(img.pixel(fx, fy)),
+        to_rgb(BLUE),
+        "its top-left is at the pointer now"
+    );
+    assert_eq!(
+        rgb(img.pixel((px - 20.0) as u32, (py - 12.0) as u32)),
+        to_rgb(GREEN)
+    );
+    accept_and_drop(&mut h, &mut s);
+    transfer_and_finish(&h, &mut s, 1, b"x");
+    h.quit();
+}
+
+#[test]
+fn an_icon_offset_without_data_is_fatal() {
+    let _fds = shared();
+    let h = Harness::start("iconcaps");
+    let mut p = Peer {
+        conn: Connection::connect(&h.wire_path, "rude").expect("wire connect"),
+        seen: Vec::new(),
+        serial: 0,
+        released: 0,
+        escapes: 0,
+    };
+    let icon = icon_window(&mut p, 50);
+    set_offset(&mut p, icon, -1.0, -1.0);
+    assert_eq!(p.error(), ErrorCode::Protocol);
+    h.quit();
+}
+
+#[test]
+fn a_bad_icon_offset_is_fatal() {
+    let _fds = shared();
+    let h = Harness::start("badoff");
+    for (i, (flags, x, name)) in [
+        (window_flags::NO_FOCUS, 0.0, "decorated"),
+        (window_flags::UNDECORATED, 0.0, "focusable"),
+        (
+            window_flags::UNDECORATED | window_flags::NO_FOCUS,
+            f32::NAN,
+            "nan",
+        ),
+        (
+            window_flags::UNDECORATED | window_flags::NO_FOCUS,
+            f32::INFINITY,
+            "inf",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut a = h.peer(name);
+        let id = NodeId(50 + i as u32);
+        a.conn
+            .tx()
+            .create_window_with(id, "icon", Size::new(20.0, 20.0), Layer::Normal, flags)
+            .finish()
+            .unwrap();
+        set_offset(&mut a, id, x, 0.0);
+        assert_eq!(a.error(), ErrorCode::Protocol, "{name}");
+    }
+    // Not a window at all.
+    let mut a = h.peer("none");
+    set_offset(&mut a, NodeId::NONE, 0.0, 0.0);
+    assert_eq!(a.error(), ErrorCode::Protocol, "none");
+    h.quit();
+}
+
 #[test]
 fn a_start_drag_without_a_button_or_pointer_focus_is_ignored() {
     let _fds = shared();

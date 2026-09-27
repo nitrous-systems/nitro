@@ -6,7 +6,7 @@ use std::os::fd::BorrowedFd;
 use std::os::fd::OwnedFd;
 use std::path::Path;
 
-use nitro_core::{Color, IRect, Rect, Size, Transform};
+use nitro_core::{Color, IRect, Point, Rect, Size, Transform};
 
 use crate::VERSION;
 use crate::codec::{FdQueue, Writer};
@@ -19,10 +19,10 @@ use crate::msg::{
     CreateNode, CreatePopup, CreateWindow, DestroyBuffer, DestroyNode, Fill, FinishDrag,
     FocusWindow, GrabKeyboard, Hello, ListOutputs, Lock, MeasureText, Outputs, Reparent,
     RepositionPopup, RequestFrame, RequestSelection, SendSelection, ServerMsg, SetAnchor, SetAppId,
-    SetBorder, SetBounds, SetClip, SetCorners, SetCursor, SetExclusiveZone, SetFill, SetIcon,
-    SetImage, SetLayer, SetOpacity, SetOverview, SetSelection, SetText, SetTransform, SetVisible,
-    SetWindowLimits, SetWindowState, SetWindowStateFor, SetWindowTitle, StartDrag, StartMove,
-    StartResize, UnbindKey, Unlock, WindowList,
+    SetBorder, SetBounds, SetClip, SetCorners, SetCursor, SetDragIconOffset, SetExclusiveZone,
+    SetFill, SetIcon, SetImage, SetLayer, SetOpacity, SetOverview, SetSelection, SetText,
+    SetTransform, SetVisible, SetWindowLimits, SetWindowState, SetWindowStateFor, SetWindowTitle,
+    StartDrag, StartMove, StartResize, UnbindKey, Unlock, WindowList,
 };
 use crate::types::{
     Align, BufferId, CursorShape, DataSource, DragAction, Edge, Layer, NodeId, NodeKind,
@@ -462,6 +462,20 @@ impl Connection {
     /// As [`Connection::send`].
     pub fn start_drag(&mut self, drag: StartDrag) -> Result<(), Error> {
         self.send(&ClientMsg::StartDrag(drag))
+    }
+
+    /// Set where a drag icon sits relative to the pointer (needs
+    /// `caps::DATA`): `offset` is the icon's top-left relative to the
+    /// hotspot, usually negative. Applies at the next commit, before or
+    /// during a drag; an icon with none is centred.
+    ///
+    /// # Errors
+    /// As [`Connection::send`].
+    pub fn set_drag_icon_offset(&mut self, icon: NodeId, offset: Point) -> Result<(), Error> {
+        self.send(&ClientMsg::SetDragIconOffset(SetDragIconOffset {
+            icon,
+            offset,
+        }))
     }
 
     /// Say what this drop target would do with the offer over it (needs

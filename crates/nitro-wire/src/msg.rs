@@ -1095,8 +1095,9 @@ impl Body for SendSelection {
 /// only at the end matches what the backend nitro is modelled on does.
 ///
 /// `icon` is a window root of the sender's, created `UNDECORATED |
-/// NO_FOCUS`, that the server adopts and draws centred under the pointer
-/// until the grab ends; [`NodeId::NONE`] means "no drag icon". Anything
+/// NO_FOCUS`, that the server adopts and draws under the pointer at its
+/// [`SetDragIconOffset`] hotspot (centred if none was set) until the grab
+/// ends; [`NodeId::NONE`] means "no drag icon". Anything
 /// else is `Error { Protocol }`.
 ///
 /// Authorized by pointer focus plus a button actually being down, not by
@@ -1180,6 +1181,32 @@ impl Body for AcceptDrop {
             action: r.get()?,
             mime: r.get_str()?,
         })
+    }
+}
+
+fixed_msg! {
+    /// Set where a drag icon sits relative to the pointer (needs
+    /// [`caps::DATA`](crate::types::caps::DATA)).
+    ///
+    /// `offset` is the icon window's **top-left relative to the pointer
+    /// hotspot**, in logical pixels — usually negative: `(-10, -5)` means
+    /// the pointer grabbed the image 10 px in and 5 px down. This is
+    /// Wayland's `wl_surface.offset` convention; Chromium sends
+    /// `-GetDragImageOffset()`, again on `UpdateDragImage`. An icon that
+    /// never had an offset set is drawn centred on the pointer.
+    ///
+    /// `icon` must be a window root of the sender's, not a popup, created
+    /// `UNDECORATED | NO_FOCUS` — the same checks as [`StartDrag`]'s icon —
+    /// and `offset` must be finite; anything else is `Error { Protocol }`.
+    /// Buffered to the commit, so it may be sent in the batch that creates
+    /// the icon, before [`StartDrag`], or mid-drag with a new image. The
+    /// offset sticks to the window until changed or the window is
+    /// destroyed, so a reused icon keeps it.
+    SetDragIconOffset {
+        /// The icon window, by the sender's own node id.
+        icon: NodeId,
+        /// Icon top-left relative to the pointer, logical pixels.
+        offset: Point,
     }
 }
 
@@ -2280,6 +2307,8 @@ msg_enum! {
         AcceptDrop = 0x0309,
         /// End a drag this client started (needs `caps::DATA`).
         FinishDrag = 0x030a,
+        /// Set a drag icon's hotspot offset (needs `caps::DATA`).
+        SetDragIconOffset = 0x030b,
         /// Move one of this client's windows to another layer (needs
         /// `caps::SHELL`).
         SetLayer = 0x0401,
