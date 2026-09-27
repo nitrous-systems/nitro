@@ -639,7 +639,10 @@ fn await_snapshot(
 ) -> (Vec<OutputInfo>, Vec<OutputWorkArea>) {
     wait_for(what, || {
         pump(conn, inbox);
-        inbox.0.iter().any(|m| matches!(m, ServerMsg::OutputsEnd(_)))
+        inbox
+            .0
+            .iter()
+            .any(|m| matches!(m, ServerMsg::OutputsEnd(_)))
     });
     let end = inbox
         .0
@@ -3078,7 +3081,10 @@ fn an_unprivileged_client_lists_outputs_and_sees_hotplug() {
         .expect("the new output")
         .clone();
     assert_eq!(second.x, OUT.0.cast_signed());
-    let second_area = areas.iter().find(|a| a.id == second.id).expect("its work area");
+    let second_area = areas
+        .iter()
+        .find(|a| a.id == second.id)
+        .expect("its work area");
     assert_eq!(
         second_area.area,
         nitro_core::IRect::new(OUT.0.cast_signed(), 0, 800, 600),
@@ -3089,7 +3095,10 @@ fn an_unprivileged_client_lists_outputs_and_sees_hotplug() {
     assert_eq!(h.request_line("unplug\n"), "ok");
     wait_for("the unplug", || {
         pump(&mut conn, &mut inbox);
-        inbox.0.iter().any(|m| matches!(m, ServerMsg::OutputsEnd(_)))
+        inbox
+            .0
+            .iter()
+            .any(|m| matches!(m, ServerMsg::OutputsEnd(_)))
     });
     let gone = inbox
         .0
@@ -3129,7 +3138,10 @@ fn the_output_list_is_the_same_for_a_shell_and_an_ordinary_client() {
     let (plain_infos, plain_areas) = await_snapshot(&mut plain, &mut plain_inbox, "plain list");
 
     assert_eq!(shell_infos.len(), 2);
-    assert_eq!(plain_infos, shell_infos, "field for field, in the same order");
+    assert_eq!(
+        plain_infos, shell_infos,
+        "field for field, in the same order"
+    );
     assert!(shell_infos[0].x < shell_infos[1].x);
     // The shell listed no `ClientCaps`, so it gets no work area (rule 1).
     assert!(shell_areas.is_empty());
@@ -3230,7 +3242,10 @@ fn a_shell_client_that_listed_no_caps_is_not_pushed_a_work_area() {
     h.settle();
     pump(&mut shell, &mut inbox);
     assert!(
-        !inbox.0.iter().any(|m| matches!(m, ServerMsg::OutputWorkArea(_))),
+        !inbox
+            .0
+            .iter()
+            .any(|m| matches!(m, ServerMsg::OutputWorkArea(_))),
         "no 0x8408 for a client that did not list OUTPUTS"
     );
     assert!(!shell.is_closed());
