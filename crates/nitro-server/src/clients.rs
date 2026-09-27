@@ -114,7 +114,9 @@ pub struct WireClient {
     /// client that did not list `POPUP` here is `Error { Protocol }`
     /// (`docs/wire.md` rule 3). That one check is also what makes sending
     /// `PopupDone` unconditionally safe — a client that never listed the
-    /// bit can never own a popup to be told about. The bits not yet
+    /// bit can never own a popup to be told about. The clipboard reads it
+    /// too: a `DATA` op needs the bit listed, and `SelectionOffer` is
+    /// pushed only to clients that listed it. The bits not yet
     /// advertised are still recorded, because the rule this exists for
     /// cannot be honoured retroactively by a server that threw the list
     /// away.
@@ -396,10 +398,14 @@ fn apply_msg(
             // what drives this function.
             Ok(())
         }
-        ClientMsg::ClientCaps(_) => {
-            // Never buffered either: `handle_wire_msg` records it on
-            // receipt, because it is a connection property rather than a
-            // scene mutation. The arm exists because this match is the
+        ClientMsg::ClientCaps(_)
+        | ClientMsg::SetSelection(_)
+        | ClientMsg::RequestSelection(_)
+        | ClientMsg::SendSelection(_) => {
+            // Never buffered either: `handle_wire_msg` answers these on
+            // receipt — `ClientCaps` is a connection property, and the
+            // clipboard ops are not scene mutations (and `SendSelection`
+            // must not park its descriptor until a commit). The arm exists because this match is the
             // table and has no `_`.
             Ok(())
         }
@@ -858,9 +864,6 @@ fn apply_msg(
         | ClientMsg::StartMove(_)
         | ClientMsg::StartResize(_)
         | ClientMsg::ListOutputs(_)
-        | ClientMsg::SetSelection(_)
-        | ClientMsg::RequestSelection(_)
-        | ClientMsg::SendSelection(_)
         | ClientMsg::StartDrag(_)
         | ClientMsg::AcceptDrop(_)
         | ClientMsg::FinishDrag(_) => Err(ApplyError::new(

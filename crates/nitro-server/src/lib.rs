@@ -38,6 +38,7 @@ pub mod clients;
 pub mod config;
 pub mod control;
 pub mod cursor;
+pub mod data;
 pub mod defer;
 pub mod desktop_index;
 pub mod frame;
@@ -916,6 +917,14 @@ struct Server {
     hotkeys: shell::HotKeys,
     /// Server-global window ids, minted for the shell's window list.
     window_refs: shell::WindowRefs,
+    /// The clipboard: owner, offer and parked requests; see [`data`].
+    data: data::Selections,
+    /// `SendSelection` descriptors relayed to a requester, cumulative.
+    /// Reported as `selection_transfers`.
+    selection_transfers: u64,
+    /// Requests answered with an EOF descriptor by the server itself,
+    /// cumulative. Reported as `selection_eof`.
+    selection_eof: u64,
     /// Shell clients subscribed to the window list, by token.
     window_watchers: Vec<u64>,
     /// Shell clients subscribed to output hotplug, by token.
@@ -1207,6 +1216,9 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         zones: shell::Zones::new(),
         hotkeys: shell::HotKeys::new(),
         window_refs: shell::WindowRefs::new(),
+        data: data::Selections::new(),
+        selection_transfers: 0,
+        selection_eof: 0,
         window_watchers: Vec::new(),
         output_watchers: Vec::new(),
         grab: None,
@@ -1313,10 +1325,13 @@ fn is_shell_op(msg: &ClientMsg) -> bool {
 /// implement.
 ///
 /// The protocol surface landed ahead of the behaviour (task #3767), so the
-/// ten ops below decode but are refused: `Server::caps` advertises none
+/// seven ops below decode but are refused: `Server::caps` advertises none
 /// of their bits, so no conformant client sends one, and a client that
 /// does anyway hears why instead of being silently ignored. The two popup
-/// ops left this list with #3773 (`caps::POPUP`).
+/// ops left this list with #3773 (`caps::POPUP`), and the three clipboard
+/// ops with #3774 (`caps::DATA`). The drag ops share `DATA` but stay here
+/// until M5-I implements them: a client that saw the bit for the
+/// clipboard and starts a drag is told so rather than ignored.
 ///
 /// `ClientCaps` (0x0003) is deliberately **not** here: it is accepted and
 /// recorded, because the rule that makes it safe — the server must not
@@ -1334,9 +1349,6 @@ fn is_m5_op(msg: &ClientMsg) -> bool {
             | ClientMsg::StartMove(_)
             | ClientMsg::StartResize(_)
             | ClientMsg::ListOutputs(_)
-            | ClientMsg::SetSelection(_)
-            | ClientMsg::RequestSelection(_)
-            | ClientMsg::SendSelection(_)
             | ClientMsg::StartDrag(_)
             | ClientMsg::AcceptDrop(_)
             | ClientMsg::FinishDrag(_)
@@ -5214,6 +5226,13 @@ impl Server {
         // zero: a non-zero value means someone types faster than the shell
         // wakes, which is exactly the race this counter exists to pin.
         pairs.push(("keys_withheld", self.keys_withheld));
+        // The clipboard (M5-H). Relayed owner descriptors, the server's own
+        // EOF answers, and requests parked waiting for an owner. The first
+        // two are cumulative; the third returns to 0 whenever every owner
+        // has answered, so a stuck non-zero value names a slow owner.
+        pairs.push(("selection_transfers", self.selection_transfers));
+        pairs.push(("selection_eof", self.selection_eof));
+        pairs.push(("selections_pending", self.data.pending() as u64));
         pairs.push(("locked", u64::from(self.lock.is_locked())));
         pairs.push(("lock_owned", u64::from(self.lock.owner().is_some())));
         // Completed reloads, however triggered: the control request,
@@ -5337,12 +5356,11 @@ impl Server {
     /// a connection property, not a scene mutation — the `BindKey`
     /// precedent.
     ///
-    /// Accepted and **stored** even though nothing reads it yet. The rule
-    /// that makes `ClientCaps` safe is "the server must not send a message
-    /// belonging to a bit the client did not list", and a server that
-    /// cannot store the list cannot honour that rule the moment it grows a
-    /// bit — so M5-B through M5-I each gain one `if` instead of
-    /// re-litigating this. See `docs/wire.md` § Capability opt-in.
+    /// **Stored**, because the rule that makes `ClientCaps` safe is "the
+    /// server must not send a message belonging to a bit the client did
+    /// not list": the popup ops and every clipboard push read it, and each
+    /// later M5 task gains one `if` instead of re-litigating this. See
+    /// `docs/wire.md` § Capability opt-in.
     fn record_client_caps(&mut self, token: u64, caps: u32) -> bool {
         let advertised = self.caps(Self::is_shell(token), Self::is_remote(token));
         let extra = caps & !advertised;
@@ -5362,8 +5380,226 @@ impl Server {
         let Some(client) = self.wire_clients.get_mut(&token) else {
             return false;
         };
+        let before = client.client_caps;
         client.client_caps = caps;
+        // A client opting into `DATA` is told about the selection that
+        // already exists, the way `Theme` follows `Welcome`: without it a
+        // browser launched after the copy would not know there was
+        // anything to paste until the next `SetSelection`.
+        let data = nitro_wire::types::caps::DATA;
+        if before & data == 0 && caps & data != 0 && self.data.offer().is_some() {
+            let mimes = self.data.mimes().to_vec();
+            client.send(&ServerMsg::SelectionOffer(msg::SelectionOffer { mimes }));
+        }
         true
+    }
+
+    /// Whether this client may speak `DATA`, disconnecting it if not.
+    ///
+    /// Two checks in one place, both fatal `Protocol` because a conformant
+    /// client cannot fail them: the link must be able to carry descriptors
+    /// (a remote one was never advertised the bit), and the client must
+    /// have listed `caps::DATA` in its `ClientCaps` — `docs/wire.md`
+    /// § Capability opt-in rule 3.
+    fn data_allowed(&mut self, token: u64, name: &str) -> bool {
+        let detail = if Self::is_remote(token) {
+            format!("{name} needs caps::DATA, which a remote link does not have")
+        } else if self
+            .wire_clients
+            .get(&token)
+            .is_some_and(|c| c.client_caps & nitro_wire::types::caps::DATA == 0)
+        {
+            format!("{name} needs `DATA` listed in ClientCaps")
+        } else {
+            return self.wire_clients.contains_key(&token);
+        };
+        self.disconnect(token, Some((0, ErrorCode::Protocol, detail)));
+        false
+    }
+
+    /// The token of the client whose window holds keyboard focus.
+    ///
+    /// The *client*, not the window: a client with two windows, one of
+    /// them focused, may take the selection from either.
+    fn focus_token(&self) -> Option<u64> {
+        let focus = self.focus?;
+        self.wire_clients
+            .iter()
+            .find(|(_, c)| c.owns_window(focus))
+            .map(|(t, _)| *t)
+    }
+
+    /// `SetSelection`: take (or clear) the clipboard. Returns whether the
+    /// client survives.
+    ///
+    /// Authorized by **keyboard focus**, and a violation is fatal: there is
+    /// no legitimate race (unlike `SetCursor`), and a background process
+    /// silently replacing the clipboard is exactly what the rule stops.
+    fn set_selection(&mut self, token: u64, mimes: Vec<String>) -> bool {
+        if !self.data_allowed(token, "SetSelection") {
+            return false;
+        }
+        if self.focus_token() != Some(token) {
+            self.disconnect(
+                token,
+                Some((
+                    0,
+                    ErrorCode::Protocol,
+                    "SetSelection needs keyboard focus".to_owned(),
+                )),
+            );
+            return false;
+        }
+        if let Err(e) = data::validate_mimes(&mimes) {
+            let code = if e.is_limit() {
+                ErrorCode::Limit
+            } else {
+                ErrorCode::Protocol
+            };
+            self.disconnect(token, Some((0, code, e.detail().to_owned())));
+            return false;
+        }
+        // The old owner is not told directly; it sees the new
+        // `SelectionOffer` like everyone else (docs/wire.md § What the
+        // server does).
+        for t in self.data.set_offer(token, mimes) {
+            self.answer_eof(t.requester, t.reply_to);
+        }
+        self.broadcast_offer();
+        true
+    }
+
+    /// `RequestSelection`: ask the owner for the selection in one MIME
+    /// type. Returns whether the client survives. Every request that gets
+    /// past the protocol checks is answered by exactly one `SelectionData`.
+    fn request_selection(&mut self, token: u64, m: msg::RequestSelection) -> bool {
+        if !self.data_allowed(token, "RequestSelection") {
+            return false;
+        }
+        let fatal = if m.source == nitro_wire::types::DataSource::Drag {
+            // Valid only between a `DragEnter` and its `DragLeave`, and
+            // drag-and-drop does not exist until M5-I, so no client is a
+            // drop target. M5-I replaces this arm.
+            Some("RequestSelection { source: Drag } outside a drag")
+        } else if self.data.has_reply_id(token, m.request) {
+            Some("RequestSelection reuses an outstanding request id")
+        } else {
+            None
+        };
+        if let Some(detail) = fatal {
+            self.disconnect(token, Some((0, ErrorCode::Protocol, detail.to_owned())));
+            return false;
+        }
+        // The failures that are answered, not refused. A MIME type outside
+        // the offer is answered here rather than relayed: the answer would
+        // be byte-identical, and this saves waking the owner.
+        let owner = self
+            .data
+            .offer()
+            .filter(|o| o.mimes.contains(&m.mime))
+            .map(|o| o.owner)
+            .filter(|o| self.wire_clients.contains_key(o));
+        let Some(owner) = owner.filter(|_| self.data.outstanding(token) < MAX_PENDING_SELECTIONS)
+        else {
+            self.answer_eof(token, m.request);
+            return true;
+        };
+        let id = self.data.start(token, m.request, owner);
+        let Some(client) = self.wire_clients.get_mut(&owner) else {
+            // Checked above; kept total rather than trusting it.
+            self.data.take(id, owner);
+            self.answer_eof(token, m.request);
+            return true;
+        };
+        client.send(&ServerMsg::SelectionRequest(msg::SelectionRequest {
+            request: id,
+            source: nitro_wire::types::DataSource::Clipboard,
+            mime: m.mime,
+        }));
+        true
+    }
+
+    /// `SendSelection`: relay the owner's descriptor to the requester.
+    /// Returns whether the client survives.
+    ///
+    /// The server never reads, seeks or `fstat`s the descriptor. An
+    /// unknown or stale id is **not** an error: the owner is racing a
+    /// selection change it has not heard about yet, and its requester has
+    /// already been answered at EOF.
+    fn send_selection(&mut self, token: u64, request: u32, fd: OwnedFd) -> bool {
+        if !self.data_allowed(token, "SendSelection") {
+            return false;
+        }
+        let Some(t) = self.data.take(request, token) else {
+            debug!("stale SendSelection {request} from token {token}; dropped");
+            drop(fd);
+            return true;
+        };
+        if let Some(client) = self.wire_clients.get_mut(&t.requester) {
+            client.send(&ServerMsg::SelectionData(msg::SelectionData {
+                request: t.reply_to,
+                fd,
+            }));
+            self.selection_transfers += 1;
+            self.arm_wire_client(t.requester);
+        }
+        true
+    }
+
+    /// Answer a request with a descriptor already at EOF: the single
+    /// failure path, byte-identical to an owner's own "I cannot serve
+    /// that".
+    ///
+    /// `SelectionData::encode_body` dups the read end into the writer's
+    /// queue, so the server's copy closes at the end of this function and
+    /// it holds a descriptor only until the next flush. The client is
+    /// re-armed here because this can run from inside `disconnect` during
+    /// `flush_wire_clients`, after the requester's own flush in that pass:
+    /// without asking for `OUT` the answer would sit queued and the
+    /// requester would wait for an EOF that had been produced but not sent.
+    fn answer_eof(&mut self, token: u64, reply_to: u32) {
+        let Some(client) = self.wire_clients.get_mut(&token) else {
+            return;
+        };
+        let (r, w) = match rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC) {
+            Ok(pair) => pair,
+            Err(e) => {
+                // `EMFILE`/`ENFILE`: the server's own exhaustion. Killing
+                // the client for it would be worse than the one case where
+                // "exactly one answer" cannot be honoured.
+                warn!("pipe for an EOF selection answer: {e}");
+                return;
+            }
+        };
+        drop(w);
+        client.send(&ServerMsg::SelectionData(msg::SelectionData {
+            request: reply_to,
+            fd: r,
+        }));
+        self.selection_eof += 1;
+        self.arm_wire_client(token);
+    }
+
+    /// Push the current offer to every client that listed `DATA` — and
+    /// only those, `docs/wire.md` rule 1: a client that never sent
+    /// `ClientCaps` (the bar, the terminal, every pre-M5 client) would die
+    /// on an op it does not know. Remote clients are excluded by
+    /// construction: they were never advertised the bit, so
+    /// `record_client_caps` refused it.
+    fn broadcast_offer(&mut self) {
+        let mimes = self.data.mimes().to_vec();
+        let mut touched = Vec::new();
+        for (token, client) in &mut self.wire_clients {
+            if client.stream.is_ready() && client.client_caps & nitro_wire::types::caps::DATA != 0 {
+                client.send(&ServerMsg::SelectionOffer(msg::SelectionOffer {
+                    mimes: mimes.clone(),
+                }));
+                touched.push(*token);
+            }
+        }
+        for token in touched {
+            self.arm_wire_client(token);
+        }
     }
 
     /// Buffer, or act on, one decoded client message. Returns whether the
@@ -5440,6 +5676,14 @@ impl Server {
             }
             ClientMsg::Commit(commit) => self.commit(token, commit.serial),
             ClientMsg::ClientCaps(m) => self.record_client_caps(token, m.caps),
+            // The clipboard ops are answered on receipt, never buffered for
+            // the commit. For `SendSelection` that is load-bearing:
+            // buffering it would park a descriptor in `pending` until a
+            // commit that may never come. The other two are not scene
+            // mutations either — a paste must not wait for a frame.
+            ClientMsg::SetSelection(m) => self.set_selection(token, m.mimes),
+            ClientMsg::RequestSelection(m) => self.request_selection(token, m),
+            ClientMsg::SendSelection(m) => self.send_selection(token, m.request, m.fd),
             ClientMsg::CreateBuffer(buffer) => {
                 // The descriptor is checked and *mapped* now, not at commit:
                 // the client may legitimately close or reuse its own
@@ -5521,6 +5765,14 @@ impl Server {
     /// `POPUP` is unconditional: every client may create a menu for a
     /// window it owns, and nothing about the server's hardware or fonts
     /// can make that a promise it cannot keep.
+    ///
+    /// `DATA` (the clipboard, M5-H) is set on every **local** link and
+    /// withheld on a remote one: every leg of a transfer carries a
+    /// descriptor (`SendSelection` in, `SelectionData` out), and
+    /// `ClientStream::send` refuses an fd-carrying message on TCP, so
+    /// advertising it there would be a promise the transport cannot keep.
+    /// It is the fact `REMOTE` states about buffers, expressed as the
+    /// absence of a bit because `DATA` has one.
     fn caps(&self, shell: bool, remote: bool) -> u32 {
         let mut caps = nitro_wire::types::caps::WM
             | nitro_wire::types::caps::THEME
@@ -5536,6 +5788,8 @@ impl Server {
         }
         if remote {
             caps |= nitro_wire::types::caps::REMOTE;
+        } else {
+            caps |= nitro_wire::types::caps::DATA;
         }
         caps
     }
@@ -6467,6 +6721,17 @@ impl Server {
         }
         self.window_watchers.retain(|t| *t != token);
         self.output_watchers.retain(|t| *t != token);
+        // The clipboard: requests this client owed are answered at EOF so
+        // their requesters see an end rather than a hang, and a selection
+        // it owned is cleared for everyone. After `wire_clients.remove`, so
+        // nothing is queued to the dying client.
+        let (was_owner, owed) = self.data.forget_client(token);
+        for t in owed {
+            self.answer_eof(t.requester, t.reply_to);
+        }
+        if was_owner {
+            self.broadcast_offer();
+        }
         // Dropping the stream removes it from the epoll set.
     }
 
@@ -7226,7 +7491,17 @@ mod tests {
                 app_id: String::new(),
             }
             .into(),
+            // The clipboard ops are open to every local client: routing
+            // them through `handle_shell_msg` would make paste a privilege.
+            msg::SetSelection { mimes: Vec::new() }.into(),
+            msg::RequestSelection {
+                request: 1,
+                source: nitro_wire::types::DataSource::Clipboard,
+                mime: "text/plain".to_owned(),
+            }
+            .into(),
         ] {
+            assert!(!is_m5_op(&m), "{} is implemented", m.name());
             assert!(!is_shell_op(&m), "{} is not a shell op", m.name());
         }
     }

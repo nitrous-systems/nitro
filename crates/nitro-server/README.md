@@ -428,6 +428,35 @@ same serial is never reported twice on a multi-output desktop, and frame
 callbacks are answered only by the vblank of the output the requesting
 window is actually on.
 
+### Clipboard (caps `DATA`, M5-H)
+
+`src/data.rs` holds the bookkeeping; `docs/wire.md` § Data transfer is the
+contract. The flow:
+
+1. The owner sends `SetSelection { mimes }`. It must hold **keyboard focus**
+   — the *client*, any of its windows — or it is disconnected with
+   `Protocol`: a background process must not silently replace the
+   clipboard. The list is capped (64 types, 256 bytes each, ASCII only).
+2. The server pushes `SelectionOffer { mimes }` to every client that listed
+   `DATA` in its `ClientCaps` (the owner included), and to a client that
+   opts in later, once, at the moment it does.
+3. A requester sends `RequestSelection { request, mime }`; the server
+   allocates its own id and sends `SelectionRequest` to the owner.
+4. The owner answers `SendSelection` with a readable descriptor (a sealed
+   memfd or a pipe's read end), which the server relays unread as
+   `SelectionData` with the requester's id.
+
+**No payload byte passes through the server.** A parked request is four
+words and no descriptor; a relayed descriptor is dup'd into the writer's
+queue and closed after the flush. Every failure — no selection, a type
+outside the offer, the owner leaving or being replaced, the 17th
+outstanding request — is answered with a pipe whose write end the server
+closed at once, so a requester always gets exactly one answer and never
+hangs. A late `SendSelection` for a cancelled request is dropped quietly.
+
+`DATA` is advertised only on local links: every leg carries a descriptor,
+which TCP cannot. The drag half of `DATA` is refused until M5-I.
+
 ## Frame path
 
 One pass, for each output, every time an event could have changed
@@ -844,6 +873,9 @@ looking for.
 | `exclusive_zones`        | Windows reserving screen space off an output edge. |
 | `grabbed`                | 1 while a shell client holds a keyboard grab. A 1 with no launcher on screen is a stuck grab. |
 | `keys_withheld`          | Keys dropped because a shell's `BindKey` binding had fired and the shell had not answered yet, so routing them by focus would have typed them into whatever application was focused (`docs/shell.md` §A binding buys its client a turn). Cumulative, and normally 0: a non-zero value means someone types faster than the shell wakes, which is the race the counter exists to make visible. |
+| `selection_transfers`    | Owner descriptors relayed to a requester (`SendSelection` → `SelectionData`), cumulative. |
+| `selection_eof`          | Clipboard requests the server answered itself with an EOF descriptor — no selection, a type not offered, the owner gone or replaced, or the per-connection cap — cumulative. |
+| `selections_pending`     | Requests parked waiting for an owner's `SendSelection`. Returns to 0 once every owner has answered; a stuck non-zero value names a slow owner. |
 | `locked`                 | 1 while the session is locked (`docs/shell.md` §The session lock). |
 | `lock_owned`             | 1 while a shell connection owns the lock. `locked 1` with `lock_owned 0` is a session waiting for a lock screen, or one whose lock screen died: only the background is drawn. |
 | `config_reloads`         | Completed `server.conf` reloads since startup, whatever triggered them — the `reload` request, SIGHUP and the inotify watch all land in this one counter, because what a caller wants to know is "did the server pick my edit up", not which of the three doors it came through. A reload of a file that will not parse still counts: the file *was* re-read, and every line it could not use was warned about and skipped. |

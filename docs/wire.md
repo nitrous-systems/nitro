@@ -65,6 +65,12 @@ with the worse error arriving after the recoverable one. `SetImage`
 naming `BufferId::NONE` is exempt — it *clears* an image node, names no
 buffer, and is the one op here a remote client may legitimately send.
 
+The clipboard is handled by **not advertising `DATA`** on a remote link
+rather than by a non-fatal refusal: every leg of a transfer carries a
+descriptor, so there is no useful subset to allow, and a conformant client
+never sends a `DATA` op without the bit. One that does anyway is
+`Error { Protocol }`.
+
 A remote receive does `recvmsg` with **no ancillary buffer** at all: a
 TCP socket cannot produce an `SCM_RIGHTS` cmsg, so asking for one would
 be asking a question with one possible answer.
@@ -244,8 +250,11 @@ offer, the MIME list and the descriptor relay are shared, and
 `RequestSelection` names which of the two it means with a one-byte
 `DataSource`. Two bits would mean two copies of the same four messages.
 
-**Of bits 8–14, only `POPUP` is advertised yet** (M5-G, #3773; always
-set). M5-A froze the protocol surface ahead of the behaviour, deliberately,
+**Of bits 8–14, only `POPUP` and `DATA` are advertised yet**: `POPUP`
+(M5-G, #3773) always, `DATA` (M5-H, #3774) on every **local** link and
+never on a remote one — every leg of a transfer carries a descriptor,
+which TCP cannot (see [Descriptors on a remote link](#descriptors-on-a-remote-link)).
+The drag half of `DATA` is still refused until M5-I. M5-A froze the protocol surface ahead of the behaviour, deliberately,
 so that the eight follow-up tasks implement against bytes nobody can still
 change. Until each of the rest lands, the server does not advertise its
 bit and refuses its client ops with `Error { Protocol }` — which is the
@@ -1226,7 +1235,14 @@ selection, and the server then pushes `SelectionOffer { mimes: [] }` to
 everyone.
 
 Authorized by **keyboard focus**, not by an input serial; a client without
-it is `Error { Protocol }`. See [Data transfer](#data-transfer-caps-data).
+it is `Error { Protocol }`. Focus is per *client*: any window of the
+focused client may take the selection. See [Data transfer](#data-transfer-caps-data).
+
+The list is bounded: at most **64** types (`MAX_MIMES`), each **1–256**
+bytes (`MAX_MIME_LEN`) and **ASCII** — Chromium `CHECK`s that a MIME type
+is ASCII, so one that is not would crash every browser shown the offer.
+Too many or too long is `Error { Limit }`; empty or non-ASCII is
+`Error { Protocol }`. Both are fatal.
 
 ### `RequestSelection` — 0x0306
 
@@ -2190,6 +2206,33 @@ The remaining rules:
 * A client that never reads its end costs one descriptor and one pipe
   until it disconnects, which the same cap bounds.
 
+### What the server does
+
+Four decisions the sequence above leaves open, fixed by the M5-H server:
+
+* **The old owner is not told directly** when the selection moves. There
+  is no `cancelled` op (Wayland's `wl_data_source.cancelled`); the old
+  owner receives the new `SelectionOffer` like everyone else, and an offer
+  it did not make is the signal to drop its data source. If Chromium's
+  `PlatformClipboard` turns out to need an explicit drop, that is a new op
+  behind `DATA`.
+* **Any `SetSelection` cancels every outstanding request**, including when
+  the owner replaces its *own* selection: a new `SetSelection` is a new
+  data source, and the one those requests asked about is gone. They are
+  answered at EOF at once, and a late `SendSelection` for one is the stale
+  case below.
+* **A MIME type outside the current offer is answered at EOF without
+  waking the owner.** The answer would be byte-identical, and the server
+  already knows the owner cannot serve it.
+* **A client opting into `DATA`** (a `ClientCaps` that newly lists the bit)
+  is sent the current `SelectionOffer` at once if a selection exists, so
+  an app started after the copy can paste without waiting for the next one.
+
+A `RequestSelection` with `source: Drag` is `Error { Protocol }` until
+drag-and-drop lands (M5-I): until then no client is ever a drop target.
+A `DATA` op from a client that did not list `DATA` in `ClientCaps`, or from
+a remote client, is `Error { Protocol }`.
+
 ### Two things a client must not do
 
 1. **Do not block on the read.** A hostile or merely slow owner can hand
@@ -2227,7 +2270,9 @@ same fact the same way.
 | `mimes` | `vec<str>` | types offered, most preferred first; empty = no selection |
 
 Head **0 bytes** — the payload is the vector. Pushed to every client
-holding `DATA` whenever the selection changes.
+that listed `DATA` in its `ClientCaps` whenever the selection changes, the
+owner included; and once, to a client whose `ClientCaps` newly lists
+`DATA`, when a selection already exists.
 
 ### `SelectionData` — 0x8502 — **carries 1 fd**
 
@@ -2447,7 +2492,8 @@ that state without bound. The 17th outstanding request is **answered
 immediately with an EOF descriptor** rather than refused: the requester
 already has exactly one code path for "I cannot serve that", so the bound
 costs no new error and no new client code, and the client that feels it is
-the one misbehaving. See
+the one misbehaving. Enforced since M5-H; a parked request holds **no
+descriptor**, only four words of state. See
 [the failure path](#the-failure-path-and-why-there-is-no-timeout).
 
 Since M5-A the `MAX_PENDING_FDS` rule runs in **both** directions. A

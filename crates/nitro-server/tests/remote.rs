@@ -712,3 +712,53 @@ fn pixel(img: &Image, x: u32, y: u32) -> (u8, u8, u8) {
     let i = (y * img.stride + x * 4) as usize;
     (img.data[i + 2], img.data[i + 1], img.data[i])
 }
+
+/// The clipboard (M5-H) is withheld on a remote link, because every leg of
+/// a transfer carries a descriptor: `DATA` is not advertised, a remote
+/// client claiming it in `ClientCaps` is refused, and a `SetSelection`
+/// sent anyway is `Protocol` rather than silently half-working.
+#[test]
+fn data_is_not_advertised_on_a_remote_link() {
+    let h = Harness::start("data", "remote.listen = 127.0.0.1:0\n");
+    let local = h.local_client("local-data");
+    assert!(local.has_caps(caps::DATA), "a local link has the clipboard");
+
+    let mut conn = h.remote_client("remote-data");
+    assert_eq!(conn.caps() & caps::DATA, 0, "a remote link does not");
+    let mut seen = Vec::new();
+    // Raw rather than through `Connection::client_caps`, which masks the
+    // bits to what the server advertised and so cannot make this mistake.
+    conn.send(&ClientMsg::ClientCaps(nitro_wire::msg::ClientCaps {
+        caps: caps::DATA,
+    }))
+    .unwrap();
+    conn.flush().unwrap();
+    let msg = expect(
+        &mut conn,
+        &mut seen,
+        "the ClientCaps refusal",
+        |m| match m {
+            ServerMsg::Error(e) => Some(e.msg.clone()),
+            _ => None,
+        },
+    );
+    assert!(msg.contains("did not advertise"), "{msg}");
+
+    let mut conn = h.remote_client("remote-copy");
+    let mut seen = Vec::new();
+    conn.set_selection(&["text/plain".to_owned()]).unwrap();
+    conn.flush().unwrap();
+    let (code, msg) = expect(
+        &mut conn,
+        &mut seen,
+        "the SetSelection refusal",
+        |m| match m {
+            ServerMsg::Error(e) => Some((e.code, e.msg.clone())),
+            _ => None,
+        },
+    );
+    assert_eq!(code, nitro_wire::types::ErrorCode::Protocol);
+    assert!(msg.contains("remote"), "{msg}");
+    drop(local);
+    h.quit();
+}
