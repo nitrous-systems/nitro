@@ -4,10 +4,10 @@ The desktop's **application launcher**, and since #3789 the **overview's
 search field**: the overlay that comes up with the overview (a bare-Super
 tap, `Super+Space`, the bar's button), searches the `.desktop` files of
 nitro's own applications and starts what you pick. Typing replaces the
-overview's window grid with the
-results (`SetOverview(Search)`), and clearing the query brings the grid back
-(`Grid`). What a query searches is a `SearchScope`: only `Apps` for now, with
-`Windows` and `Files` named as the variants still to come.
+overview's window grid with the results (`SetOverview(Search)`), and
+clearing the query brings the grid back (`Grid`). What a query searches is
+a `SearchScope`: only `Apps` for now, with `Windows` and `Files` named as
+the variants still to come.
 
 ```text
                    ┌────────────────────────────────┐
@@ -154,18 +154,24 @@ would change its path on every keystroke.
 | `$XDG_DATA_DIRS` + `$XDG_DATA_HOME`, each `/applications` | `.desktop` files, parsed by hand (`src/desktop.rs`) |
 | the launcher's own directory | `nitro-calc`, `hello_dialog`, `nitro-demo` if present |
 
-**Only nitro-native applications are listed**, and that is the one
-filter applied after both sources are merged: an entry survives when its
-program's file name is in `NATIVE_PROGRAMS`. Everything else the box has
-installed — firefox, the distribution's terminal — is an X11 or Wayland
-client, and nitro speaks neither yet, so launching one would put a
+**Only nitro-native applications are listed**: a scanned entry survives
+when its program's file name is in `NATIVE_PROGRAMS`. Everything else the
+box has installed — firefox, the distribution's terminal — is an X11 or
+Wayland client, and nitro speaks neither yet, so launching one would put a
 process on the box that never shows a window. A row that cannot work is
 worse than no row. The filter is **temporary**: it goes away with
 `NATIVE_PROGRAMS` and `Launcher::with_native_only` when Wayland support
-lands. Matching on the file name rather than on the `.desktop` path is
-what lets one list cover both sources — a deployed file says
-`Exec=nitro-calc` and a built-in names an absolute path — and it leaves
-the shadowing below intact.
+lands.
+
+It is applied to the **scanned** entries alone, and **before** they are
+merged with the built-ins — which are native by construction, so there is
+nothing there to filter. The order matters: filtering first means a
+foreign `.desktop` file that happened to name a built-in's program cannot
+shadow away the built-in it is not a replacement for. And matching on the
+program's file name rather than on the `.desktop` path is what lets one
+list cover both sources — a deployed file says `Exec=nitro-calc`, a
+built-in names an absolute path — which leaves the real shadowing below
+intact.
 
 The built-ins are what makes the **test box** work: a freshly rsynced
 `~/nitro-bin` has no `.desktop` files anywhere, and a launcher with an
