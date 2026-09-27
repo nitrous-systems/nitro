@@ -2056,7 +2056,7 @@ Refused with `Error { Protocol }`:
 * a reserved bit in `mods`;
 * a malformed tap (zero or several modifiers with `keysym: 0`);
 * one of the **compositor's own** chords (`Ctrl+Alt+*`, `Alt+Tab`,
-  `Super+Q/M/F/H/←/→` — `docs/wm.md` has the table). Those are not
+  `Super+Q/M/F/H/←/→/↑/↓` — `docs/wm.md` has the table). Those are not
   negotiable: `Ctrl+Alt+F2` must switch VT with a wedged shell, and
   `Alt+Tab` is how you leave an application that took the keyboard;
 * a chord **another** shell client already holds.
