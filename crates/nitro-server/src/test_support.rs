@@ -180,6 +180,16 @@ impl TestServer {
         line.trim_end_matches('\n').to_owned()
     }
 
+    /// Inject input through the control socket's `input` request (the
+    /// real input path; see `protocol`): `inject("wheel 0 15")`. Returns
+    /// the status line, `ok <n>` on success.
+    ///
+    /// # Panics
+    /// If the connection closes before the status line.
+    pub fn inject(&self, args: &str) -> String {
+        self.request_line(&format!("input {args}\n"))
+    }
+
     /// Give keyboard focus to the topmost window: ours, since a
     /// `TestServer` runs one client.
     ///

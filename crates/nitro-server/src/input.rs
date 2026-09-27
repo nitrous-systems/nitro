@@ -58,11 +58,18 @@ pub enum InputEvent {
         /// `CLOCK_MONOTONIC` nanoseconds.
         time_ns: u64,
     },
-    /// Absolute pointer motion, already scaled to device pixels.
+    /// Absolute pointer motion from an absolute device (tablet,
+    /// touchscreen, a VM's pointer).
+    ///
+    /// **`x`/`y` are normalised 0..1, not pixels**: libinput transforms
+    /// against a 1×1 box and `Server::route_input` scales the result onto
+    /// the *first* output. A test pushing this must divide by the output
+    /// size. The control socket's `input motion X Y` takes device pixels
+    /// instead and does not go through this variant (see `protocol`).
     PointerAbsolute {
-        /// Position in device pixels.
+        /// Horizontal position, 0..1 of the first output's width.
         x: f64,
-        /// Position in device pixels.
+        /// Vertical position, 0..1 of the first output's height.
         y: f64,
         /// `CLOCK_MONOTONIC` nanoseconds.
         time_ns: u64,

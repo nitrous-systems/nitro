@@ -46,6 +46,7 @@ pub mod desktop_index;
 pub mod frame;
 pub mod icon_theme;
 pub mod icons;
+pub mod inject;
 pub mod input;
 pub mod keyboard;
 pub mod lock;
@@ -519,6 +520,9 @@ const TOK_SIGHUP: u64 = 10;
 const TOK_REMOTE_LISTENER: u64 = 11;
 /// The key-repeat timerfd; see [`repeat`]. Armed only while a key is held.
 const TOK_REPEAT: u64 = 12;
+/// The injected-input timerfd; see [`inject`]. Armed only while a scripted
+/// `input` sequence has events still to come.
+const TOK_INJECT: u64 = 13;
 /// How long an unanswered input keeps waiting for a frame to claim it.
 /// Beyond this the number would not be a latency any more: nothing
 /// responded to the event, and attributing the next unrelated frame to it
@@ -951,6 +955,8 @@ struct Server {
     defer: DeferredFlip,
     /// The held key being auto-repeated, and its timer. See [`repeat`].
     key_repeat: repeat::KeyRepeat,
+    /// Control-socket input still to come, and its timer. See [`inject`].
+    injector: inject::Injector,
 
     /// Exclusive zones and anchors set by shell clients; see [`shell`].
     zones: shell::Zones,
@@ -1312,6 +1318,7 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         pending_input_ns: 0,
         defer: defer::DeferredFlip::new().map_err(errno("create the deferred-flip timer"))?,
         key_repeat: repeat::KeyRepeat::new().map_err(errno("create the key-repeat timer"))?,
+        injector: inject::Injector::new().map_err(errno("create the input-injection timer"))?,
         zones: shell::Zones::new(),
         hotkeys: shell::HotKeys::new(),
         window_refs: shell::WindowRefs::new(),
@@ -1359,6 +1366,8 @@ pub fn run(mut config: Config) -> Result<(), Error> {
     add(&server.epoll, &server.defer.as_fd(), TOK_DEFER)?;
     // Likewise the repeat timer: armed only while a key is held down.
     add(&server.epoll, &server.key_repeat.as_fd(), TOK_REPEAT)?;
+    // And the injection timer: armed only while an `input` sequence runs.
+    add(&server.epoll, &server.injector.as_fd(), TOK_INJECT)?;
     // The third listener, and the only one that is optional. Applied here
     // through the same function the reload path uses, so "what
     // `remote.listen` means" has exactly one implementation.
@@ -2551,6 +2560,7 @@ impl Server {
                     TOK_INPUT_HOTPLUG => self.on_input_hotplug(),
                     TOK_DEFER => self.on_defer_deadline(),
                     TOK_REPEAT => self.on_key_repeat(),
+                    TOK_INJECT => self.on_inject(),
                     // Shell tokens sort above wire tokens, so this arm has
                     // to come first; both end up in `on_wire_client`,
                     // because a shell client *is* a wire client with an
@@ -2582,6 +2592,12 @@ impl Server {
                     // The release of a held key will arrive on the other
                     // VT, if anywhere: stop repeating it now.
                     self.stop_key_repeat();
+                    // Scripted input stops with the real kind: the
+                    // rest of a sequence would land on the other VT's
+                    // return with stale timestamps.
+                    if let Err(e) = self.injector.clear() {
+                        warn!("input injection: disarm: {e}");
+                    }
                     // A drag cannot survive the pointer going to another
                     // session: the release will never arrive here.
                     self.dnd_step(data::Dnd::cancel);
@@ -2694,6 +2710,7 @@ impl Server {
         let Some(output) = self.output_mut(id) else {
             return;
         };
+        let prev_vblank_ns = output.last_vblank_ns;
         output.last_vblank_ns = time_ns;
         output.last_sequence = sequence;
         let presented = std::mem::take(&mut output.in_flight);
@@ -2702,8 +2719,13 @@ impl Server {
         let refresh_ns = output.refresh_ns;
         let deadline_ns = output.frame_deadline_ns(time_ns);
 
+        if prev_vblank_ns > 0 && time_ns > prev_vblank_ns {
+            self.stats.flip_log.push((time_ns - prev_vblank_ns) / 1_000);
+        }
         if input_ns > 0 && time_ns > input_ns {
-            self.stats.i2p_us.push((time_ns - input_ns) / 1_000);
+            let us = (time_ns - input_ns) / 1_000;
+            self.stats.i2p_us.push(us);
+            self.stats.i2p_log.push(us);
         }
         for (client_key, serial) in presented {
             let Some(client) = self
@@ -5823,6 +5845,14 @@ impl Server {
             Ok(Request::Unplug) => self.unplug(),
             Ok(Request::Focus) => self.focus_topmost(),
             Ok(Request::Overview { on, output }) => self.overview_request(on, output.as_deref()),
+            Ok(Request::Input(spec)) => self.input_request(&spec),
+            Ok(Request::Samples(kind)) => {
+                let log = match kind {
+                    protocol::SampleKind::I2p => &self.stats.i2p_log,
+                    protocol::SampleKind::Flip => &self.stats.flip_log,
+                };
+                protocol::samples_reply(log.total, &log.values())
+            }
             Ok(Request::Theme) => protocol::theme_reply(
                 self.settings.theme.scheme.unwrap_or_default(),
                 self.theme_serial,
@@ -6065,6 +6095,11 @@ impl Server {
         // what a caller wants to know is "did the server pick my edit up",
         // not which of the three doors it came through.
         pairs.push(("config_reloads", self.config_reloads));
+        // Control-socket input injection (`input`): events routed so far,
+        // cumulative, and events of a scripted sequence still to come. A
+        // benchmark waits for the second to reach 0.
+        pairs.push(("input_injected", self.injector.injected));
+        pairs.push(("input_inject_pending", self.injector.pending() as u64));
         // The remote listener's address, with the port the kernel chose
         // for a configured `:0`, or `off`. Text rather than a number
         // because an address is not a count; see
@@ -9365,6 +9400,101 @@ impl Server {
         }
         self.settle();
         protocol::ok_reply()
+    }
+
+    /// `input ...`: expand the request into timed events, route the ones
+    /// due now through [`Server::route_input`] before replying, and queue
+    /// the rest on the injection timer. See [`inject`] and the `protocol`
+    /// module docs.
+    fn input_request(&mut self, spec: &protocol::InputSpec) -> Vec<u8> {
+        use protocol::InputAction;
+        if !self.active {
+            return protocol::err_reply("session inactive");
+        }
+        // `motion X Y OUTPUT`: X, Y are relative to that output's device
+        // rectangle, so add its origin to reach the pointer's global space.
+        let origin = match &spec.action {
+            InputAction::Motion {
+                output: Some(name), ..
+            } => {
+                let Some(info) = self.backend.outputs().iter().find(|o| &o.name == name) else {
+                    return protocol::err_reply(&format!("no output named {name}"));
+                };
+                match self.scene.output_info(SceneOutputId(info.id.0)) {
+                    Some((rect, _)) => (f64::from(rect.x), f64::from(rect.y)),
+                    None => return protocol::err_reply(&format!("output {name} is not placed")),
+                }
+            }
+            _ => (0.0, 0.0),
+        };
+        let now = monotonic_ns();
+        let items = inject::expand(spec, now, origin);
+
+        let n = items.len();
+        let mut routed_now = false;
+        for (due, what) in items {
+            if due <= now {
+                self.fire_injected(due, &what);
+                routed_now = true;
+            } else {
+                self.injector.schedule(due, what);
+            }
+        }
+        if routed_now {
+            // As `on_input` does: the `ok` then means "routed and sent".
+            self.flush_wire_clients();
+            self.settle();
+        }
+        if let Err(e) = self.injector.rearm() {
+            warn!("input injection: arm: {e}");
+        }
+        format!("ok {n}\n").into_bytes()
+    }
+
+    /// Route one injected event, stamped with its due time.
+    fn fire_injected(&mut self, due: u64, what: &inject::Pending) {
+        let event = match *what {
+            // Absolute to relative against where the pointer is *now*:
+            // `route_input` adds a `PointerMotion` delta to the position
+            // without re-applying acceleration, so this lands exactly.
+            inject::Pending::MotionTo { x, y } => InputEvent::PointerMotion {
+                dx: x - self.pointer.x,
+                dy: y - self.pointer.y,
+                time_ns: due,
+            },
+            inject::Pending::Event(ref e) => e.clone(),
+        };
+        self.injector.injected += 1;
+        self.route_input(&event);
+    }
+
+    /// The injection timer fired: route whatever of a scripted `input`
+    /// sequence is due, then re-arm for the next.
+    fn on_inject(&mut self) {
+        let now = monotonic_ns();
+        let due = self.injector.take_due(now);
+        if let Some(&(first, _)) = due.first()
+            && now.saturating_sub(first) > 5_000_000
+        {
+            debug!(
+                "input injection: {} event(s) {} µs late",
+                due.len(),
+                (now - first) / 1_000
+            );
+        }
+        let fired = !due.is_empty();
+        if self.active {
+            for (t, what) in &due {
+                self.fire_injected(*t, what);
+            }
+        }
+        if let Err(e) = self.injector.rearm() {
+            warn!("input injection: re-arm: {e}");
+        }
+        if fired {
+            self.flush_wire_clients();
+            self.settle();
+        }
     }
 }
 

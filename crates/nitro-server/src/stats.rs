@@ -129,6 +129,56 @@ impl Window {
     }
 }
 
+/// An append-only log of raw samples, the last [`SAMPLE_LOG`] kept, with a
+/// running total of how many were ever pushed.
+///
+/// The `samples` control request's source. [`Window`] answers min, mean
+/// and max; a benchmark wants percentiles over exactly the samples its own
+/// run produced, and the `total` is what lets it find them: read it before
+/// the run, read the log after, keep the last `after - before`.
+#[derive(Debug, Clone)]
+pub struct SampleLog {
+    ring: std::collections::VecDeque<u64>,
+    /// Samples ever pushed, including the ones since dropped.
+    pub total: u64,
+}
+
+/// How many raw samples a [`SampleLog`] keeps: 150 wheel events twice
+/// over, with room to spare, for 16 KiB.
+pub const SAMPLE_LOG: usize = 2048;
+
+impl SampleLog {
+    /// An empty log.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            ring: std::collections::VecDeque::with_capacity(SAMPLE_LOG),
+            total: 0,
+        }
+    }
+
+    /// Record one sample, dropping the oldest when full.
+    pub fn push(&mut self, value: u64) {
+        if self.ring.len() == SAMPLE_LOG {
+            self.ring.pop_front();
+        }
+        self.ring.push_back(value);
+        self.total += 1;
+    }
+
+    /// The retained samples, oldest first.
+    #[must_use]
+    pub fn values(&self) -> Vec<u64> {
+        self.ring.iter().copied().collect()
+    }
+}
+
+impl Default for SampleLog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// How many frames of paint timing and damage area are kept.
 pub const PAINT_WINDOW: usize = 120;
 
@@ -152,6 +202,12 @@ pub struct FrameStats {
     pub damage_px: Window,
     /// Input-to-photon latency in microseconds.
     pub i2p_us: Window,
+    /// The same samples, raw, for `samples i2p`.
+    pub i2p_log: SampleLog,
+    /// Every flip-to-flip interval of one output, µs, **uncapped** (unlike
+    /// `flip_interval_*`), for `samples flip`. A caller drops the first
+    /// sample of a run, which spans the idle before it.
+    pub flip_log: SampleLog,
 }
 
 impl FrameStats {
@@ -163,6 +219,8 @@ impl FrameStats {
             copy_us: Window::new(PAINT_WINDOW),
             damage_px: Window::new(PAINT_WINDOW),
             i2p_us: Window::new(I2P_WINDOW),
+            i2p_log: SampleLog::new(),
+            flip_log: SampleLog::new(),
         }
     }
 
@@ -203,6 +261,20 @@ impl Default for FrameStats {
 #[cfg(test)]
 mod tests {
     use super::{FrameStats, I2P_WINDOW, PAINT_WINDOW, Window};
+
+    #[test]
+    fn a_sample_log_keeps_the_newest_and_counts_all() {
+        let mut l = super::SampleLog::new();
+        assert_eq!((l.total, l.values().len()), (0, 0));
+        for v in 0..(super::SAMPLE_LOG as u64 + 5) {
+            l.push(v);
+        }
+        assert_eq!(l.total, super::SAMPLE_LOG as u64 + 5);
+        let vals = l.values();
+        assert_eq!(vals.len(), super::SAMPLE_LOG);
+        assert_eq!(vals[0], 5);
+        assert_eq!(*vals.last().unwrap(), super::SAMPLE_LOG as u64 + 4);
+    }
 
     #[test]
     fn empty_window_is_all_zeros() {

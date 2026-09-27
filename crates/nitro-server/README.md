@@ -101,7 +101,21 @@ tests.
 | `theme`              | `ok <scheme> <serial>\n`, one `role #rrggbb[aa]` line per colour role, blank line. Read-only, and the cheap way to answer "what colour is the desktop actually using" with no client and no screenshot: the palette is server state, so the server is the only thing that can say. The role names are the `server.conf` keys, so any line of the output is one `theme.` prefix away from being the config that pins it. See `docs/theme.md`. |
 | `focus`              | `ok\n`; gives keyboard focus to the topmost window. Test-only, and it exists because focus otherwise *follows the click*: a toolkit test of Tab traversal would have to synthesise a click to get focus, which moves the focus to whatever widget was under the pointer — the very state it is about to assert on. `err no windows` when there are none. |
 | `overview [on\|off] [name]` | `ok\n`; enters overview mode on the named output (the first when unnamed) or leaves it. A test and debug hook for the primitive built in #3788 — the triggers in #3789 replace it as the way in. `docs/wm.md` §Overview mode. |
+| `input <action> [opts]` | `ok <n>\n` (events queued or injected; a click is 2). **Synthetic input through the real input path**: the events are ordinary `InputEvent`s handed to `route_input`, so focus, grabs, popups, DnD, key repeat and the input-to-photon stamp behave exactly as for hardware, on the fake and the DRM backend alike. Actions: `motion X Y [OUTPUT]` (absolute, **device pixels** — global device space, or relative to OUTPUT's device rect), `rel DX DY` (device px, no acceleration), `button left\|right\|middle\|CODE down\|up\|click`, `wheel DX DY [wheel\|finger\|continuous\|tilt]` (logical px; libinput reports 15 per wheel notch), `key CODE down\|up\|tap` (evdev, no +8), `type TEXT` (printable ASCII, US layout, Shift for capitals). Options, `key=value`: `t=NS` (CLOCK_MONOTONIC stamp of the first event, default now), `count=N` (1..=10000), `every=MS`, `after=MS`. Sequences are paced **server-side** by a timerfd (`src/inject.rs`) and each event is stamped with its due time, the analogue of an evdev timestamp; events due now are routed before the `ok`. **Pixels, not 0..1**: the internal `PointerAbsolute` is normalised to the *first* output, which `input motion` deliberately does not use. `err session inactive` while VT-switched away, and a pending sequence is dropped on the switch. `nitro-shot --input "wheel 0 15 count=10 every=16"`. |
+| `samples i2p\|flip` | `ok <total>\n`, then the retained raw samples (last 2048), µs, oldest first, blank line. `i2p` is every input-to-photon sample; `flip` every flip-to-flip interval, **uncapped**. `total` counts every sample ever recorded, so a benchmark reads it before a run and keeps the last `after − before` values afterwards — the percentiles `stats` min/mean/max cannot give. `deploy/scroll-bench.py` is the consumer. |
 | anything else        | `err <message>\n`                                                     |
+
+**Security: the control socket can type and click.** `input` makes the
+control socket an input-injection channel: any process running as this
+user can type into and click any window. It lives in a `0700` directory,
+so it is uid-scoped exactly like the shell socket, and the threat model is
+the same one `docs/shell.md` §What this model is worth argues (a program
+running as the user can already read `~/.ssh` and `LD_PRELOAD` the
+browser). There is no per-command gate to reuse — no
+other control request has one beyond the fake-backend refusal of
+`plug`/`unplug` — and none is added. Under the session lock injected
+input routes exactly as hardware does, i.e. to the lock screen and
+nothing else, so it does not bypass the lock.
 
 Several requests per connection are fine; a request line longer than 256
 bytes without a newline drops the client. All three Unix socket files are
@@ -943,6 +957,9 @@ looking for.
 | `locked`                 | 1 while the session is locked (`docs/shell.md` §The session lock). |
 | `lock_owned`             | 1 while a shell connection owns the lock. `locked 1` with `lock_owned 0` is a session waiting for a lock screen, or one whose lock screen died: only the background is drawn. |
 | `config_reloads`         | Completed `server.conf` reloads since startup, whatever triggered them — the `reload` request, SIGHUP and the inotify watch all land in this one counter, because what a caller wants to know is "did the server pick my edit up", not which of the three doors it came through. A reload of a file that will not parse still counts: the file *was* re-read, and every line it could not use was warned about and skipped. |
+| `input_injected`         | Events routed by the control socket's `input` request, cumulative. |
+| `input_inject_pending`   | Events of a scripted `input` sequence (`count`/`every`/`after`) still to come. 0 on an idle desktop; a benchmark waits for it to reach 0. |
+
 
 The key naming is inconsistent on purpose — `paint_us_min` but
 `i2p_min_us` — because that is what the protocol spec says, and the wire
@@ -971,6 +988,11 @@ limit of 1024 — but real.
 
 ## Testing
 
+- `tests/inject.rs` drives a real client entirely through the control
+  socket's `input` request (motion in device pixels, click, wheel, keys,
+  `type`, and a paced `count`/`every` sequence whose timestamps are
+  checked), which is also what makes client end-to-end tests and
+  `deploy/scroll-bench.py` reproducible against a running server.
 - Unit tests per module: protocol parsing and replies, the `OutputState`
   age-2 rule and deadline maths, the statistics windows, control
   buffering, buffer validation, pointer clamping and hit-testing,

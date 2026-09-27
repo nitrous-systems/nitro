@@ -6,6 +6,8 @@
 //! nitro-shot --modes                              list every mode each connector offers
 //! nitro-shot --stats                              frame counters
 //! nitro-shot --quit                               stop the server
+//! nitro-shot --input "ARGS"                       inject input: `input ARGS` (see nitro-server's protocol.rs)
+//! nitro-shot --samples i2p|flip                   raw recent samples, µs, oldest first
 //! ```
 //!
 //! The control socket is `$NITRO_CONTROL`, else
@@ -31,6 +33,11 @@ enum Mode {
     Modes,
     Stats,
     Quit,
+    /// `input <args>`: synthetic input through the server's real input
+    /// path. Prints the status line's count.
+    Input(String),
+    /// `samples i2p|flip`.
+    Samples(String),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -39,8 +46,7 @@ struct Args {
     file: Option<PathBuf>,
 }
 
-const USAGE: &str =
-    "usage: nitro-shot [-o FILE] [--raw] [--output NAME] | --outputs | --modes | --stats | --quit";
+const USAGE: &str = "usage: nitro-shot [-o FILE] [--raw] [--output NAME] | --outputs | --modes | --stats | --quit | --input ARGS | --samples i2p|flip";
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
     let mut file = None;
@@ -57,6 +63,11 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--modes" => cmd = Some(Mode::Modes),
             "--stats" => cmd = Some(Mode::Stats),
             "--quit" => cmd = Some(Mode::Quit),
+            "--input" => cmd = Some(Mode::Input(it.next().ok_or("--input needs ARGS")?)),
+            "--samples" => match it.next().as_deref() {
+                Some(k @ ("i2p" | "flip")) => cmd = Some(Mode::Samples(k.to_owned())),
+                _ => return Err("--samples needs i2p or flip".to_owned()),
+            },
             "-h" | "--help" => return Err(USAGE.to_owned()),
             other => return Err(format!("unknown argument {other:?}\n{USAGE}")),
         }
@@ -183,6 +194,16 @@ fn run(args: Args) -> io::Result<()> {
             request(&mut conn, "quit\n")?;
             Ok(())
         }
+        Mode::Input(ref a) => {
+            let n = request(&mut conn, &format!("input {a}\n"))?;
+            write_out(args.file.as_ref(), format!("{n}\n").as_bytes())
+        }
+        Mode::Samples(ref k) => {
+            let total = request(&mut conn, &format!("samples {k}\n"))?;
+            let body = read_text_body(&mut conn)?;
+            eprintln!("total {total}");
+            write_out(args.file.as_ref(), body.as_bytes())
+        }
     }
 }
 
@@ -237,6 +258,18 @@ mod tests {
         assert_eq!(parse("--outputs -o o.txt").unwrap().mode, Mode::Outputs);
         assert_eq!(parse("--modes").unwrap().mode, Mode::Modes);
         assert_eq!(parse("--quit").unwrap().mode, Mode::Quit);
+        assert_eq!(
+            parse_args(["--input".to_owned(), "wheel 0 15 count=3".to_owned()])
+                .unwrap()
+                .mode,
+            Mode::Input("wheel 0 15 count=3".into())
+        );
+        assert_eq!(
+            parse("--samples i2p").unwrap().mode,
+            Mode::Samples("i2p".into())
+        );
+        assert!(parse("--samples paint").is_err());
+        assert!(parse("--input").is_err());
         assert!(parse("-o").is_err());
         assert!(parse("--frob").is_err());
     }

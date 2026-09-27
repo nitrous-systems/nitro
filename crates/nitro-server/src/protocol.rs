@@ -18,6 +18,41 @@
 //! | `focus`              | `ok\n`; focuses the topmost window, for tests                |
 //! | `theme`              | `ok <scheme> <serial>\n` + `role #rrggbb[aa]\n` lines + `\n` |
 //! | `overview [on\|off] [name]` | `ok\n`; enters/leaves overview mode, for tests      |
+//! | `input <action> ...` | `ok <n>\n`; injects input into the real input path (below)  |
+//! | `samples i2p\|flip`  | `ok <total>\n` + one µs value per line, oldest first, + `\n` |
+//!
+//! # `input`: synthetic input, through the same path as hardware
+//!
+//! ```text
+//! input motion X Y [OUTPUT]   absolute, in DEVICE PIXELS (see below)
+//! input rel DX DY             relative motion, device pixels, no acceleration
+//! input button BTN down|up|click     BTN = evdev code (272, 0x110) or left|right|middle
+//! input wheel DX DY [SRC]     scroll, logical px; SRC = wheel (default) | finger |
+//!                             continuous | tilt. libinput reports 15 per wheel notch.
+//! input key CODE down|up|tap  evdev keycode, without xkb's +8
+//! input type TEXT...          ASCII text, US layout, Shift for capitals/symbols
+//! options (key=value, any order, before TEXT for `type`):
+//!   t=NS      CLOCK_MONOTONIC timestamp of the (first) event; default: now
+//!   count=N   repeat the event N times (1..=10000)
+//!   every=MS  spacing between repeats (fractional ms allowed)
+//!   after=MS  delay before the first one
+//! ```
+//!
+//! **Pixels, not 0..1.** Internally an absolute device
+//! (`InputEvent::PointerAbsolute`) reports a normalised 0..1 position that
+//! is scaled onto the *first* output. `input motion` does not use that: it
+//! takes **device pixels** in the pointer's own global space (origin at the
+//! top-left of the device layout; on a single output, simply that output's
+//! pixels), or, with `OUTPUT`, relative to that output's device rectangle.
+//! It is converted to a relative motion against the pointer position when
+//! the event fires, so it works across several outputs.
+//!
+//! Every event is stamped with its **due** time — `t=`, or now, plus
+//! `after` and `every` — the analogue of a kernel evdev timestamp, so
+//! input-to-photon is measured from when the event "happened". Events due
+//! now are routed before the reply is written; later ones run from a
+//! server-side timer, so a scripted sequence has no client-side jitter.
+//! The reply counts the events queued or injected (a `click` is 2).
 //!
 //! This module only parses and formats; it never touches a socket.
 
@@ -26,7 +61,7 @@ use std::fmt::Write as _;
 use nitro_kms::Image;
 
 /// A parsed request line.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Request {
     /// Readback of one output (the first when unnamed): the shadow buffer
     /// when there is one, else the front buffer. Both hold the same image;
@@ -96,7 +131,110 @@ pub enum Request {
         /// The output to enter on; ignored when leaving.
         output: Option<String>,
     },
+    /// Inject synthetic input through the real input path. See the
+    /// module docs for the grammar.
+    Input(InputSpec),
+    /// Raw recent samples of one statistic, for percentiles a `stats`
+    /// min/mean/max cannot give.
+    Samples(SampleKind),
 }
+
+/// Which sample log `samples` reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleKind {
+    /// Input-to-photon latency, µs.
+    I2p,
+    /// Interval between consecutive flips of one output, µs, uncapped.
+    Flip,
+}
+
+/// Pressed, released, or one then the other at the same instant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Press {
+    /// Press only.
+    Down,
+    /// Release only.
+    Up,
+    /// Press then release (`click` / `tap`).
+    Both,
+}
+
+/// Where a scroll comes from; mirrors `nitro_wire::types::AxisSource`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollSource {
+    /// A notched wheel (discrete).
+    Wheel,
+    /// A touchpad finger (smooth).
+    Finger,
+    /// A continuous device (smooth).
+    Continuous,
+    /// Wheel tilt.
+    Tilt,
+}
+
+/// One `input` action.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InputAction {
+    /// Absolute motion to device pixels, optionally relative to an output.
+    Motion {
+        /// Device-pixel x.
+        x: f64,
+        /// Device-pixel y.
+        y: f64,
+        /// Output whose device rect the point is relative to.
+        output: Option<String>,
+    },
+    /// Relative motion in device pixels.
+    Rel {
+        /// Horizontal delta.
+        dx: f64,
+        /// Vertical delta.
+        dy: f64,
+    },
+    /// A pointer button.
+    Button {
+        /// Evdev button code.
+        code: u32,
+        /// Which half.
+        press: Press,
+    },
+    /// A scroll.
+    Wheel {
+        /// Horizontal, logical px.
+        dx: f32,
+        /// Vertical, logical px.
+        dy: f32,
+        /// Source.
+        source: ScrollSource,
+    },
+    /// A key by evdev code.
+    Key {
+        /// Evdev keycode.
+        code: u32,
+        /// Which half.
+        press: Press,
+    },
+    /// ASCII text, typed on a US layout.
+    Type(String),
+}
+
+/// A parsed `input` request: the action plus its timing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InputSpec {
+    /// What to inject.
+    pub action: InputAction,
+    /// Explicit timestamp of the first event (`t=`), else now.
+    pub t_ns: Option<u64>,
+    /// How many times (`count=`), at least 1.
+    pub count: u32,
+    /// Spacing between repeats (`every=`), ns.
+    pub every_ns: u64,
+    /// Delay before the first (`after=`), ns.
+    pub after_ns: u64,
+}
+
+/// Upper bound on `count=`: a typo must not queue a million events.
+pub const MAX_INPUT_COUNT: u32 = 10_000;
 
 /// Parse one request line (without or with its trailing newline).
 ///
@@ -110,6 +248,9 @@ pub fn parse(line: &str) -> Result<Request, String> {
     };
     if cmd == "overview" {
         return parse_overview(words);
+    }
+    if cmd == "input" {
+        return parse_input(line, words);
     }
     let arg = words.next();
     if words.next().is_some() {
@@ -135,6 +276,9 @@ pub fn parse(line: &str) -> Result<Request, String> {
         ("reload", None) => Ok(Request::Reload),
         ("focus", None) => Ok(Request::Focus),
         ("theme", None) => Ok(Request::Theme),
+        ("samples", Some("i2p")) => Ok(Request::Samples(SampleKind::I2p)),
+        ("samples", Some("flip")) => Ok(Request::Samples(SampleKind::Flip)),
+        ("samples", _) => Err("`samples` wants `i2p` or `flip`".to_owned()),
         (
             "outputs" | "stats" | "quit" | "reload" | "focus" | "unplug" | "theme" | "modes",
             Some(_),
@@ -161,6 +305,159 @@ fn parse_overview<'a>(mut words: impl Iterator<Item = &'a str>) -> Result<Reques
         on,
         output: output.map(str::to_owned),
     })
+}
+
+fn num<T: std::str::FromStr>(what: &str, s: Option<&str>) -> Result<T, String> {
+    let s = s.ok_or_else(|| format!("`input` needs {what}"))?;
+    s.parse().map_err(|_| format!("bad {what} `{s}`"))
+}
+
+fn finite(what: &str, s: Option<&str>) -> Result<f64, String> {
+    let v: f64 = num(what, s)?;
+    if v.is_finite() {
+        Ok(v)
+    } else {
+        Err(format!("bad {what} `{v}`"))
+    }
+}
+
+/// A duration in (fractional) milliseconds, as nanoseconds.
+fn ms_to_ns(key: &str, s: &str) -> Result<u64, String> {
+    let v: f64 = s.parse().map_err(|_| format!("bad `{key}` `{s}`"))?;
+    if !v.is_finite() || !(0.0..=3_600_000.0).contains(&v) {
+        return Err(format!("bad `{key}` `{s}`"));
+    }
+    Ok((v * 1e6).round() as u64)
+}
+
+fn parse_press(s: Option<&str>, both: &str) -> Result<Press, String> {
+    match s {
+        Some("down" | "press") => Ok(Press::Down),
+        Some("up" | "release") => Ok(Press::Up),
+        Some(w) if w == both => Ok(Press::Both),
+        Some(w) => Err(format!("want down|up|{both}, got `{w}`")),
+        None => Err(format!("want down|up|{both}")),
+    }
+}
+
+fn parse_button(s: Option<&str>) -> Result<u32, String> {
+    match s {
+        Some("left") => Ok(0x110),
+        Some("right") => Ok(0x111),
+        Some("middle") => Ok(0x112),
+        Some(w) => {
+            let v = match w.strip_prefix("0x") {
+                Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                None => w.parse().ok(),
+            };
+            v.ok_or_else(|| format!("bad button `{w}`"))
+        }
+        None => Err("`input button` needs a button".to_owned()),
+    }
+}
+
+/// `input <action> ...` — see the module docs.
+fn parse_input<'a>(
+    line: &'a str,
+    mut words: impl Iterator<Item = &'a str>,
+) -> Result<Request, String> {
+    let Some(kind) = words.next() else {
+        return Err("`input` needs an action".to_owned());
+    };
+    let rest: Vec<&str> = words.collect();
+    let mut spec = InputSpec {
+        action: InputAction::Rel { dx: 0.0, dy: 0.0 },
+        t_ns: None,
+        count: 1,
+        every_ns: 0,
+        after_ns: 0,
+    };
+    let mut saw_every = false;
+    // Options are `key=value` words; for `type`, only the ones before the
+    // text (so `type a=b` still types `a=b` once text has started).
+    let mut positional = Vec::new();
+    let mut text_start = None;
+    for (i, w) in rest.iter().enumerate() {
+        let opt = if kind == "type" && text_start.is_some() {
+            None
+        } else {
+            w.split_once('=')
+                .filter(|(k, _)| matches!(*k, "t" | "count" | "every" | "after"))
+        };
+        match opt {
+            Some(("t", v)) => spec.t_ns = Some(v.parse().map_err(|_| format!("bad `t` `{v}`"))?),
+            Some(("count", v)) => {
+                let n: u32 = v.parse().map_err(|_| format!("bad `count` `{v}`"))?;
+                if n == 0 || n > MAX_INPUT_COUNT {
+                    return Err(format!("`count` must be 1..={MAX_INPUT_COUNT}"));
+                }
+                spec.count = n;
+            }
+            Some(("every", v)) => {
+                spec.every_ns = ms_to_ns("every", v)?;
+                saw_every = true;
+            }
+            Some((k, v)) => spec.after_ns = ms_to_ns(k, v)?,
+            None => {
+                if text_start.is_none() {
+                    text_start = Some(i);
+                }
+                positional.push(*w);
+            }
+        }
+    }
+    if saw_every && spec.count < 2 && kind != "type" {
+        return Err("`every` needs `count` > 1".to_owned());
+    }
+    let mut p = positional.iter().copied();
+    spec.action = match kind {
+        "motion" => InputAction::Motion {
+            x: finite("x", p.next())?,
+            y: finite("y", p.next())?,
+            output: p.next().map(str::to_owned),
+        },
+        "rel" => InputAction::Rel {
+            dx: finite("dx", p.next())?,
+            dy: finite("dy", p.next())?,
+        },
+        "button" => InputAction::Button {
+            code: parse_button(p.next())?,
+            press: parse_press(p.next(), "click")?,
+        },
+        "wheel" => InputAction::Wheel {
+            dx: finite("dx", p.next())? as f32,
+            dy: finite("dy", p.next())? as f32,
+            source: match p.next() {
+                None | Some("wheel") => ScrollSource::Wheel,
+                Some("finger") => ScrollSource::Finger,
+                Some("continuous" | "smooth") => ScrollSource::Continuous,
+                Some("tilt") => ScrollSource::Tilt,
+                Some(s) => return Err(format!("unknown scroll source `{s}`")),
+            },
+        },
+        "key" => InputAction::Key {
+            code: num("keycode", p.next())?,
+            press: parse_press(p.next(), "tap")?,
+        },
+        "type" => {
+            let Some(first) = text_start.map(|i| rest[i]) else {
+                return Err("`input type` needs text".to_owned());
+            };
+            // The rest of the *line* from the first text word, so single
+            // spaces inside the text survive the whitespace split.
+            let at = first.as_ptr() as usize - line.as_ptr() as usize;
+            let text = line[at..].trim_end().to_owned();
+            if !text.bytes().all(|b| (0x20..0x7f).contains(&b)) {
+                return Err("`input type` takes printable ASCII only".to_owned());
+            }
+            InputAction::Type(text)
+        }
+        other => return Err(format!("unknown input action `{other}`")),
+    };
+    if !matches!(spec.action, InputAction::Type(_)) && p.next().is_some() {
+        return Err(format!("too many arguments for `input {kind}`"));
+    }
+    Ok(Request::Input(spec))
 }
 
 /// Split the first complete line off `buf`, returning it (without the
@@ -319,6 +616,18 @@ pub fn modes_reply(modes: &[ModeLine]) -> Vec<u8> {
     s.into_bytes()
 }
 
+/// `ok <total>\n`, one value per line, blank line: the `samples` reply.
+/// `total` is how many samples were ever recorded, so a caller that read
+/// it before a run takes the last `after - before` values.
+pub fn samples_reply(total: u64, values: &[u64]) -> Vec<u8> {
+    let mut s = format!("ok {total}\n");
+    for v in values {
+        let _ = writeln!(s, "{v}");
+    }
+    s.push('\n');
+    s.into_bytes()
+}
+
 /// `ok\n`, one `key value` line per pair, blank line.
 pub fn stats_reply(pairs: &[(&str, u64)]) -> Vec<u8> {
     stats_reply_with(pairs, &[])
@@ -427,6 +736,175 @@ mod tests {
             parse("focus now"),
             Err("`focus` takes no argument".to_owned())
         );
+    }
+
+    fn input(line: &str) -> InputSpec {
+        match parse(line) {
+            Ok(Request::Input(s)) => s,
+            other => panic!("{line:?}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_every_input_form() {
+        let s = input("input motion 10 20.5\n");
+        assert_eq!(
+            s.action,
+            InputAction::Motion {
+                x: 10.0,
+                y: 20.5,
+                output: None
+            }
+        );
+        assert_eq!((s.t_ns, s.count, s.every_ns, s.after_ns), (None, 1, 0, 0));
+        assert_eq!(
+            input("input motion 1 2 HDMI-A-1").action,
+            InputAction::Motion {
+                x: 1.0,
+                y: 2.0,
+                output: Some("HDMI-A-1".into())
+            }
+        );
+        assert_eq!(
+            input("input rel -3 4").action,
+            InputAction::Rel { dx: -3.0, dy: 4.0 }
+        );
+        for (w, code) in [
+            ("left", 0x110),
+            ("right", 0x111),
+            ("middle", 0x112),
+            ("272", 272),
+            ("0x113", 0x113),
+        ] {
+            assert_eq!(
+                input(&format!("input button {w} click")).action,
+                InputAction::Button {
+                    code,
+                    press: Press::Both
+                }
+            );
+        }
+        assert_eq!(
+            input("input button left down").action,
+            InputAction::Button {
+                code: 0x110,
+                press: Press::Down
+            }
+        );
+        assert_eq!(
+            input("input button left up").action,
+            InputAction::Button {
+                code: 0x110,
+                press: Press::Up
+            }
+        );
+        assert_eq!(
+            input("input wheel 0 15").action,
+            InputAction::Wheel {
+                dx: 0.0,
+                dy: 15.0,
+                source: ScrollSource::Wheel
+            }
+        );
+        assert_eq!(
+            input("input wheel 1.5 -2 finger").action,
+            InputAction::Wheel {
+                dx: 1.5,
+                dy: -2.0,
+                source: ScrollSource::Finger
+            }
+        );
+        assert_eq!(
+            input("input wheel 0 1 continuous").action,
+            InputAction::Wheel {
+                dx: 0.0,
+                dy: 1.0,
+                source: ScrollSource::Continuous
+            }
+        );
+        assert_eq!(
+            input("input wheel 3 0 tilt").action,
+            InputAction::Wheel {
+                dx: 3.0,
+                dy: 0.0,
+                source: ScrollSource::Tilt
+            }
+        );
+        assert_eq!(
+            input("input key 30 tap").action,
+            InputAction::Key {
+                code: 30,
+                press: Press::Both
+            }
+        );
+        assert_eq!(
+            input("input key 42 down").action,
+            InputAction::Key {
+                code: 42,
+                press: Press::Down
+            }
+        );
+        assert_eq!(
+            input("input type Hello,  world a=b\n").action,
+            InputAction::Type("Hello,  world a=b".into())
+        );
+    }
+
+    #[test]
+    fn parses_input_timing_options() {
+        let s = input("input wheel 0 15 count=150 every=16");
+        assert_eq!((s.count, s.every_ns, s.after_ns), (150, 16_000_000, 0));
+        let s = input("input key 30 tap t=123456 after=2.5");
+        assert_eq!((s.t_ns, s.after_ns), (Some(123_456), 2_500_000));
+        let s = input("input rel 1 1 count=2 every=0.5");
+        assert_eq!((s.count, s.every_ns), (2, 500_000));
+        let s = input("input type every=30 hi");
+        assert_eq!(s.every_ns, 30_000_000);
+        assert_eq!(s.action, InputAction::Type("hi".into()));
+    }
+
+    #[test]
+    fn rejects_bad_input() {
+        for bad in [
+            "input",
+            "input bogus",
+            "input motion 1",
+            "input motion x 2",
+            "input motion 1 2 A B",
+            "input motion NaN 2",
+            "input rel 1",
+            "input button",
+            "input button banana click",
+            "input button left",
+            "input button left hold",
+            "input wheel 0 15 sideways",
+            "input wheel 0 15 wheel extra",
+            "input key a tap",
+            "input key 30 press-ish",
+            "input type",
+            "input type hé",
+            "input wheel 0 15 every=16",
+            "input wheel 0 15 count=0",
+            "input wheel 0 15 count=10001",
+            "input wheel 0 15 count=x",
+            "input wheel 0 15 count=2 every=-1",
+            "input key 30 tap t=soon",
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?} parsed: {:?}", parse(bad));
+        }
+    }
+
+    #[test]
+    fn parses_samples() {
+        assert_eq!(parse("samples i2p"), Ok(Request::Samples(SampleKind::I2p)));
+        assert_eq!(
+            parse("samples flip\n"),
+            Ok(Request::Samples(SampleKind::Flip))
+        );
+        assert!(parse("samples").is_err());
+        assert!(parse("samples paint").is_err());
+        assert_eq!(samples_reply(5, &[1, 2]), b"ok 5\n1\n2\n\n");
+        assert_eq!(samples_reply(0, &[]), b"ok 0\n\n");
     }
 
     #[test]

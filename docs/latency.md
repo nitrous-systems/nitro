@@ -764,6 +764,24 @@ and the cross-check; `--damage` outlines the damage rects; `--save-small
 FILE` writes the downscaled PNG used above, with no ImageMagick needed on
 the box.
 
+**Scripted input instead of ydotool (#3834).** The control socket's
+`input` request injects events through the server's real input path, paced
+by a server-side timerfd and stamped with their due time, so no external
+input tool and no Python sleep jitter enter the measurement.
+`deploy/scroll-bench.py` uses it to reproduce the #3778 scroll test on
+whatever client is under the pointer — 150 wheel events of +15 then 150 of
+−15, 16 ms apart — and prints fps, frame-interval p50/p95/max (from
+`samples flip`) and input-to-photon p50/p95/max (from `samples i2p`) as a
+markdown row. Example, `nitro-files` on `/usr/bin`, fake backend, debug
+build:
+
+```text
+| nitro-files /usr/bin, fake 60 Hz, debug | 6.2 | 25.7 / 32.7 / 32.7 ms | – | 39.7 / 42.6 / 56.2 ms (n=30) |
+```
+
+(That run painted 30 frames for 300 events, so the fps is low; this was
+not investigated further. The script works against any client.)
+
 Three cautions learned here, each of which produced a wrong number first:
 
 - **Check which binary you measured.** Another task deploys to this box
