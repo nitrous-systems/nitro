@@ -445,14 +445,14 @@ pub fn is_escape(keysym: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{Hotkey, Keyboard, Mods, hotkey, is_alt, is_escape, mod_of_keysym};
+    use xkbcommon::xkb;
 
     #[test]
     fn escape_is_escape_and_nothing_else_is() {
-        assert!(is_escape(xkbcommon::xkb::keysyms::KEY_Escape));
-        assert!(!is_escape(xkbcommon::xkb::keysyms::KEY_q));
+        assert!(is_escape(xkb::keysyms::KEY_Escape));
+        assert!(!is_escape(xkb::keysyms::KEY_q));
         assert!(!is_escape(0));
     }
-    use xkbcommon::xkb;
 
     /// evdev `KEY_A`, from `linux/input-event-codes.h`.
     const EVDEV_A: u32 = 30;

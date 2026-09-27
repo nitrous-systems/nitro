@@ -596,6 +596,8 @@ fn destroying_a_parent_leaves_no_dangling_parent_link() {
     s.destroy_window(CLIENT, a).unwrap();
     assert_eq!(s.window_info(menu).unwrap().parent(), None);
     assert_eq!(s.chain_root(menu), menu);
+    // ...but it is still a popup, not a toplevel in waiting.
+    assert!(s.window_info(menu).unwrap().is_popup());
     // The submenu still names a live parent, so its chain is intact.
     assert_eq!(s.window_info(sub).unwrap().parent(), Some(menu));
 }

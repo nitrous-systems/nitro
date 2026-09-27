@@ -1267,3 +1267,71 @@ fn a_popup_whose_parent_has_no_output_is_dismissed_not_fatal() {
     );
     h.quit();
 }
+
+#[test]
+fn a_dismissed_popup_outliving_its_parent_never_becomes_a_toplevel() {
+    // The parent is destroyed but the client keeps the popup's node: the
+    // window is dismissed and unplaced, and its scene parent link is gone.
+    // It must still not be migrated by an output loss, nor listed.
+    let mut h = Harness::start("outlive", OUT.0, OUT.1);
+    let mut conn = popup_client(&h, "outlive");
+    let mut inbox = Inbox::default();
+    let parent = make_window(&mut conn, &mut inbox, 1, RED, 1);
+    park(&mut h);
+    let menu = make_popup(
+        &mut conn,
+        &mut inbox,
+        10,
+        parent.root,
+        Spec::menu(IRect::new(10, 10, 40, 20)),
+        2,
+    );
+    conn.tx().destroy_node(parent.root).commit(3).unwrap();
+    conn.flush().unwrap();
+    await_done(&mut conn, &mut inbox, &[menu.root]);
+    inbox.0.clear();
+
+    // Lose an output with a primary still present: that is what runs the
+    // orphan migration.
+    assert_eq!(h.request_line("plug 400x300\n"), "ok");
+    wait_for("the second output", || h.stat("outputs") == 2);
+    h.settle();
+    assert_eq!(h.request_line("unplug\n"), "ok");
+    wait_for("the output to go", || h.stat("outputs") == 1);
+    h.settle();
+    inbox.pump(&mut conn);
+    assert!(
+        !inbox
+            .0
+            .iter()
+            .any(|m| matches!(m, ServerMsg::Configure(c) if c.window == menu.root)),
+        "the dismissed popup was migrated: {:?}",
+        inbox.0
+    );
+    let img = h.shot();
+    let (w, hh) = (img.width as f32, img.height as f32);
+    let mut green = 0;
+    for y in (0..hh as u32).step_by(4) {
+        for x in (0..w as u32).step_by(4) {
+            if rgb(img.pixel(x, y)) == to_rgb(GREEN) {
+                green += 1;
+            }
+        }
+    }
+    assert_eq!(green, 0, "the dismissed popup is painted somewhere");
+
+    let mut shell = h.shell("bar");
+    let mut s_in = Inbox::default();
+    shell.window_list().unwrap();
+    shell.flush().unwrap();
+    expect(&mut shell, &mut s_in.0, "WindowListEnd", |m| match m {
+        ServerMsg::WindowListEnd(_) => Some(()),
+        _ => None,
+    });
+    assert!(
+        !s_in.0.iter().any(|m| matches!(m, ServerMsg::WindowInfo(_))),
+        "the dismissed popup is listed: {:?}",
+        s_in.0
+    );
+    h.quit();
+}

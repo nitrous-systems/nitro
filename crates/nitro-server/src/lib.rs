@@ -729,10 +729,6 @@ impl Drop for SocketFile {
     }
 }
 
-/// The running server. Field order is drop order: clients first, then the
-/// sockets, then input (whose device fds belong to the seat), then the
-/// backend (which holds a dup of the DRM fd), then the seat's `Device`, and
-/// the seat last.
 /// The popup grab's per-seat state, held together so the `Server` does not
 /// grow a loose bool per rule.
 #[derive(Debug, Default)]
@@ -754,6 +750,10 @@ struct PopupSeat {
     pointer_refresh: bool,
 }
 
+/// The running server. Field order is drop order: clients first, then the
+/// sockets, then input (whose device fds belong to the seat), then the
+/// backend (which holds a dup of the DRM fd), then the seat's `Device`, and
+/// the seat last.
 struct Server {
     wire_clients: HashMap<u64, WireClient>,
     clients: HashMap<u64, Client>,
@@ -6898,13 +6898,6 @@ impl Server {
         false
     }
 
-    /// Refuse a popup op from a client that never listed `POPUP` in its
-    /// `ClientCaps` (`docs/wire.md` rule 3). Returns whether it was
-    /// refused (and the client disconnected).
-    ///
-    /// Checked once, at receipt, which is also what makes pushing
-    /// `PopupDone` safe — no client that did not list the bit can own a
-    /// popup to be told about.
     /// Refuse, on receipt, a client op this client may not send: an
     /// unimplemented M5-A op (no bit advertised), or a popup op without
     /// `POPUP` in its `ClientCaps`. Returns whether it was refused (and the
@@ -6932,6 +6925,13 @@ impl Server {
         true
     }
 
+    /// Refuse a popup op from a client that never listed `POPUP` in its
+    /// `ClientCaps` (`docs/wire.md` rule 3). Returns whether it was
+    /// refused (and the client disconnected).
+    ///
+    /// Checked once, at receipt, which is also what makes pushing
+    /// `PopupDone` safe — no client that did not list the bit can own a
+    /// popup to be told about.
     fn refuse_popup_op(&mut self, token: u64, msg: &ClientMsg) -> bool {
         if !is_popup_op(msg)
             || self

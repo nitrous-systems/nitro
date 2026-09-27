@@ -268,6 +268,11 @@ pub struct Window {
     /// stack, so a `Window` stays allocation-free and the parent edge has
     /// exactly one copy that cannot drift.
     pub(crate) parent: Option<WindowKey>,
+    /// Whether this window was created as a popup. Separate from `parent`
+    /// because the link is cleared when the parent is destroyed, but the
+    /// window is still a (dismissed) popup until its client destroys it
+    /// — and must never start passing for a toplevel in the meantime.
+    pub(crate) popup: bool,
 }
 
 impl Window {
@@ -386,9 +391,10 @@ impl Window {
     }
 
     /// Whether this window is a popup: a menu or tooltip anchored to a
-    /// parent, rather than a toplevel.
+    /// parent, rather than a toplevel. Stays true after the parent is
+    /// destroyed and the [`parent`](Window::parent) link cleared.
     pub fn is_popup(&self) -> bool {
-        self.parent.is_some()
+        self.popup
     }
 }
 

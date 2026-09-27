@@ -362,6 +362,7 @@ impl Scene {
             max: Size::ZERO,
             restore: None,
             parent: None,
+            popup: false,
         });
         self.note_resized(win);
         let node = self.node_mut_ref(root);
@@ -422,7 +423,9 @@ impl Scene {
                 focusable: false,
             },
         );
-        self.window_mut_unchecked(win).parent = Some(parent);
+        let window = self.window_mut_unchecked(win);
+        window.parent = Some(parent);
+        window.popup = true;
         Ok(win)
     }
 
