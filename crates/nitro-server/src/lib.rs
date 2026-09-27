@@ -6392,6 +6392,51 @@ impl Server {
         }
     }
 
+    /// What the client at `token` holds against the buffer caps, with
+    /// every client's bytes filled in for the server-wide one. Counts the
+    /// client's uncommitted batch (`WireClient::held_buffers`), because
+    /// the mapping happens at arrival. `None` if the client is gone.
+    fn buffer_budget(&self, token: u64) -> Option<clients::BufferBudget> {
+        let all: u64 = self
+            .wire_clients
+            .values()
+            .map(|c| c.held_buffers().bytes)
+            .sum();
+        let mut held = self.wire_clients.get(&token)?.held_buffers();
+        held.all_clients_bytes = all;
+        Some(held)
+    }
+
+    /// Check and map a `CreateBuffer` at receipt, parking the mapping in
+    /// the client's batch. Returns whether the client survives it.
+    ///
+    /// The descriptor is checked and *mapped* now, not at commit: the
+    /// client may legitimately close or reuse its own descriptor as soon
+    /// as it has sent this message, and a buffer whose fd is not sealed
+    /// must be refused before any of the batch is applied. From here on
+    /// the scene holds the mapping, so there is no server-side copy to
+    /// keep in step and `BufferDamage` only marks nodes for repaint. The
+    /// buffer caps are checked here too, for the same reason: a cap
+    /// checked at commit would come after the `mmap` it exists to bound.
+    fn create_buffer(&mut self, token: u64, buffer: nitro_wire::msg::CreateBuffer) -> bool {
+        let id = buffer.id;
+        let Some(held) = self.buffer_budget(token) else {
+            return false;
+        };
+        let (desc, pixels) = match clients::map_buffer(buffer, held) {
+            Ok(pair) => pair,
+            Err(e) => {
+                self.disconnect(token, Some((0, e.code, e.detail)));
+                return false;
+            }
+        };
+        let Some(client) = self.wire_clients.get_mut(&token) else {
+            return false;
+        };
+        client.pending.push(Pending::Buffer(id, desc, pixels));
+        true
+    }
+
     /// Buffer, or act on, one decoded client message. Returns whether the
     /// client survives it.
     fn handle_wire_msg(&mut self, token: u64, message: ClientMsg) -> bool {
@@ -6498,28 +6543,7 @@ impl Server {
             // be created in the same batch); see `Server::start_dnd`.
             ClientMsg::AcceptDrop(m) => self.accept_drop(token, m.action, m.mime),
             ClientMsg::FinishDrag(_) => self.finish_drag(token),
-            ClientMsg::CreateBuffer(buffer) => {
-                // The descriptor is checked and *mapped* now, not at commit:
-                // the client may legitimately close or reuse its own
-                // descriptor as soon as it has sent this message, and a
-                // buffer whose fd is not sealed must be refused before any
-                // of the batch is applied. From here on the scene holds the
-                // mapping, so there is no server-side copy to keep in step
-                // and `BufferDamage` only marks nodes for repaint.
-                let id = buffer.id;
-                let (desc, pixels) = match clients::map_buffer(buffer) {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        self.disconnect(token, Some((0, e.code, e.detail)));
-                        return false;
-                    }
-                };
-                let Some(client) = self.wire_clients.get_mut(&token) else {
-                    return false;
-                };
-                client.pending.push(Pending::Buffer(id, desc, pixels));
-                true
-            }
+            ClientMsg::CreateBuffer(buffer) => self.create_buffer(token, buffer),
             other => {
                 // Refused **at receipt**, not at the commit; see
                 // `Server::refuse_at_receipt`.
@@ -7702,7 +7726,7 @@ impl Server {
             }
             self.forget_window(win);
         }
-        for key in client.buffers.values().copied().collect::<Vec<_>>() {
+        for key in client.buffers.values().map(|h| h.key).collect::<Vec<_>>() {
             // Dropping the scene's buffer drops its mapping, which is the
             // `munmap`. Since #569 there is no descriptor to release
             // alongside it: `Mapping::map` closed the client's fd the

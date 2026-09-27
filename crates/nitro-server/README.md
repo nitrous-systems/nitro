@@ -351,6 +351,14 @@ copied** (#569): the client renders into the same pages the rasterizer
 samples, so a frame crosses memory once instead of three times — worth
 4–6 ms of a fullscreen 1080p frame on the test box.
 
+A client is also capped in what it holds: `MAX_BUFFERS_PER_CLIENT` (32)
+buffers and `MAX_MAPPED_BYTES_PER_CLIENT` (128 MiB), counting the ones
+mapped but not yet committed, plus a server-wide
+`MAX_MAPPED_BYTES_ALL_CLIENTS` (1 GiB). The per-client caps are fairness
+— the refusal lands on the client that overreached; the global one is
+what protects the box, since connections are not capped. All three are
+`Limit` and a disconnect, checked before the `mmap`.
+
 That used to be unsafe to do, and the seal check is what changed. A client
 can `ftruncate` an unsealed memfd under a live mapping and turn the
 server's next read into a `SIGBUS`, so the server refuses any buffer whose

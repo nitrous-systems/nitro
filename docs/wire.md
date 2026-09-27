@@ -1240,6 +1240,15 @@ descriptor missing any of the three earns `BadBuffer` — there is no
 fallback to copying. An inconsistent geometry or size is `BadBuffer` too,
 as is a file shorter than the declared `size`.
 
+A client may hold only so many buffers at once — 32 — and only so many
+total mapped bytes — 128 MiB, two maximum-size buffers — counting those
+created but not yet committed; the server also caps the total across all
+clients (1 GiB). Exceeding any of these is `Error { Limit }` and the
+connection closes, like every other limit in this protocol. Destroying a
+buffer gives its headroom back at the next `Commit`; a client that wants
+many images over time should reuse or destroy buffers rather than
+accumulate ids.
+
 The reason is not ceremony. The server **maps** the descriptor read-only
 rather than copying the pixels out of it, so if a client could shrink the
 file under that live mapping, the server's next read of the vanished pages

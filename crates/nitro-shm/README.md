@@ -96,7 +96,11 @@ it is acceptable" is worth more than a false total:
    same class as (1).
 3. **Address space.** A client can ask for many 64 MiB buffers;
    `mmap` failing with `ENOMEM` is a protocol error and a disconnect, not
-   unsoundness. A per-client buffer cap is filed separately.
+   unsoundness. A cap now bounds it: `MAX_BUFFERS_PER_CLIENT` and
+   `MAX_MAPPED_BYTES_PER_CLIENT` in `nitro-server/src/clients.rs` refuse
+   a client holding too many buffers or bytes with `ErrorCode::Limit`,
+   and `MAX_MAPPED_BYTES_ALL_CLIENTS` bounds the server-wide total. The
+   residual is a client exhausting *its own* budget and being dropped.
 4. **Memory pressure** on shmem faults is an OOM kill, not a signal on our
    thread, and is outside what seals can address.
 

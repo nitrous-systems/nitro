@@ -1151,6 +1151,137 @@ fn mapped_buffers() -> usize {
         .count()
 }
 
+/// A sealed XR24 `CreateBuffer` of `w`×`h` at the tightest stride.
+fn sealed_buffer(id: u32, w: u32, h: u32) -> nitro_wire::msg::CreateBuffer {
+    let stride = w * 4;
+    nitro_wire::msg::CreateBuffer {
+        id: nitro_wire::types::BufferId(id),
+        width: w,
+        height: h,
+        stride,
+        format: nitro_wire::types::format::XR24,
+        size: stride * h,
+        fd: nitro_shm::create_sealed("nitro-budget", u64::from(stride) * u64::from(h)).unwrap(),
+    }
+}
+
+/// Expect an `Error { Limit }` whose message contains `detail`, then the
+/// connection closing.
+fn expect_limit_and_close(h_: &Harness, conn: &mut Connection, detail: &str) {
+    let mut seen = Vec::new();
+    let err = expect(conn, &mut seen, "Error", |m| match m {
+        ServerMsg::Error(e) => Some(e.clone()),
+        _ => None,
+    });
+    assert_eq!(err.code, nitro_wire::types::ErrorCode::Limit, "{}", err.msg);
+    assert!(err.msg.contains(detail), "{}", err.msg);
+    wait_for("the connection to close", || {
+        let mut out = Vec::new();
+        matches!(conn.poll(&mut out), Err(nitro_wire::error::Error::Closed))
+    });
+    wait_for("the client to be reaped", || {
+        stat(&h_.request_text("stats\n"), "clients") == 0
+    });
+}
+
+/// One buffer past `MAX_BUFFERS_PER_CLIENT` is refused with `Limit` and a
+/// disconnect. They go in **one uncommitted batch**, so this exercises the
+/// pending half of the accounting: the mapping happens at arrival, and a
+/// cap that counted only committed buffers would let all of them through.
+///
+/// 33 buffers in one batch is deliberately under the framer's
+/// `MAX_PENDING_FDS` (64, `nitro-wire`), so what fires is this cap and not
+/// the fd-flood kill; raising `MAX_BUFFERS_PER_CLIENT` past 64 would make
+/// the two interact.
+#[test]
+fn too_many_buffers_is_refused_with_limit() {
+    use nitro_server::clients::MAX_BUFFERS_PER_CLIENT;
+    let h_ = Harness::start("bufcount", 200, 120);
+    let mut conn = h_.client("hoarder");
+    let mut tx = conn.tx();
+    for i in 0..=MAX_BUFFERS_PER_CLIENT as u32 {
+        tx = tx.create_buffer(sealed_buffer(i + 1, 8, 8));
+    }
+    tx.commit(1).unwrap();
+    conn.flush().unwrap();
+    expect_limit_and_close(&h_, &mut conn, "buffers, the cap is");
+    h_.quit();
+}
+
+/// Three 48 MiB buffers: two fit in `MAX_MAPPED_BYTES_PER_CLIENT`, the
+/// third crosses it and is refused. `create_sealed` only `ftruncate`s and
+/// nothing touches the pages, so this costs no real memory.
+#[test]
+fn too_many_mapped_bytes_is_refused_with_limit() {
+    use nitro_server::clients::{MAX_BUFFER_BYTES, MAX_MAPPED_BYTES_PER_CLIENT};
+    let (w, h) = (1024u32, 12_288u32);
+    let each = u64::from(w) * 4 * u64::from(h);
+    assert!(each <= MAX_BUFFER_BYTES);
+    assert!(2 * each <= MAX_MAPPED_BYTES_PER_CLIENT && 3 * each > MAX_MAPPED_BYTES_PER_CLIENT);
+
+    let h_ = Harness::start("bufbytes", 200, 120);
+    let mut conn = h_.client("glutton");
+    conn.tx()
+        .create_buffer(sealed_buffer(1, w, h))
+        .create_buffer(sealed_buffer(2, w, h))
+        .commit(1)
+        .unwrap();
+    conn.flush().unwrap();
+    conn.tx()
+        .create_buffer(sealed_buffer(3, w, h))
+        .commit(2)
+        .unwrap();
+    conn.flush().unwrap();
+    expect_limit_and_close(&h_, &mut conn, "per-client");
+    h_.quit();
+}
+
+/// The accounting is not one-way: a client at the count cap that destroys
+/// half its buffers can create that many again. (With the cap in force,
+/// `cycling_buffers_does_not_leak_the_clients_mappings` is also a guard
+/// for this: a missing decrement would refuse its 33rd cycle.)
+#[test]
+fn releasing_buffers_restores_headroom() {
+    use nitro_server::clients::MAX_BUFFERS_PER_CLIENT;
+    use nitro_wire::types::BufferId;
+    let n = MAX_BUFFERS_PER_CLIENT as u32;
+    let h_ = Harness::start("bufheadroom", 200, 120);
+    let mut conn = h_.client("recycler");
+
+    let mut tx = conn.tx();
+    for i in 0..n {
+        tx = tx.create_buffer(sealed_buffer(i + 1, 8, 8));
+    }
+    tx.commit(1).unwrap();
+    conn.flush().unwrap();
+
+    let mut tx = conn.tx();
+    for i in 0..n / 2 {
+        tx = tx.destroy_buffer(BufferId(i + 1));
+    }
+    tx.commit(2).unwrap();
+    conn.flush().unwrap();
+
+    let mut tx = conn.tx();
+    for i in 0..n / 2 {
+        tx = tx.create_buffer(sealed_buffer(n + i + 1, 8, 8));
+    }
+    tx.commit(3).unwrap();
+    conn.flush().unwrap();
+    h_.request_text("stats\n");
+    h_.settle();
+
+    let mut out = Vec::new();
+    conn.poll(&mut out).expect("the client is still connected");
+    assert!(
+        !out.iter().any(|m| matches!(m, ServerMsg::Error(_))),
+        "no refusal: {out:?}"
+    );
+    assert_eq!(stat(&h_.request_text("stats\n"), "clients"), 1);
+    h_.quit();
+}
+
+
 /// The name `cycling_buffers_does_not_leak_the_clients_mappings` gives
 /// its memfds, and the string `mapped_buffers` recognises them by.
 const BUFFER_MEMFD_NAME: &str = "nitro-cycle";

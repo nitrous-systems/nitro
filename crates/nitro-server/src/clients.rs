@@ -59,6 +59,68 @@ use crate::{debug, warn};
 /// image fits and a typo in a stride does not ask for a gigabyte.
 pub const MAX_BUFFER_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Maximum buffers one client may hold at once, committed or waiting for
+/// its `Commit`. Every real client in the tree holds one (the toolkit's
+/// `Image` widget holds two for the frame in which it replaces its
+/// pixels); `nitro-demo --windows N` holds N, which is what keeps this
+/// number at 32 rather than the 16 of #595 — a dev tool asking for 20
+/// windows is not an attack. It is the *map count* cap: 32 per client
+/// against a 65530 `vm.max_map_count` is what stops a client in a
+/// create-loop, while the byte cap below is what bounds memory.
+pub const MAX_BUFFERS_PER_CLIENT: usize = 32;
+
+/// Maximum total mapped bytes one client may hold at once, committed or
+/// waiting for its `Commit`. Two maximum-size buffers' worth, so a
+/// fullscreen client double-buffering — or replacing its pixels through
+/// the toolkit's `Image` widget, which keeps the replaced buffer in its
+/// `stale` field until the next paint — fits, and 32 × 64 MiB = 2 GiB
+/// does not. Per-client because it is the *fair* cap: one client cannot
+/// spend the whole box's budget, and the refusal names the client that
+/// overreached rather than whoever asked next.
+pub const MAX_MAPPED_BYTES_PER_CLIENT: u64 = 128 * 1024 * 1024;
+
+// The per-client byte cap must admit *two* maximum-size buffers, because
+// the toolkit's own replacement path holds two: `nitro-ui`'s `Image`
+// widget keeps the buffer a `set_pixels` replaced in its `stale` field
+// until the next paint releases it. Lower this below 2 ×
+// MAX_BUFFER_BYTES, or raise MAX_BUFFER_BYTES above half of it, and a
+// fullscreen client replacing its pixels is disconnected by its own
+// toolkit — a failure that would surface as a dead app, not as a broken
+// invariant here. So it is a compile error instead.
+const _: () = assert!(
+    MAX_MAPPED_BYTES_PER_CLIENT >= 2 * MAX_BUFFER_BYTES,
+    "the per-client byte cap must fit two maximum-size buffers: nitro-ui's \
+     Image widget holds two across a set_pixels replacement"
+);
+
+/// Maximum mapped client-buffer bytes across *all* wire clients.
+///
+/// The per-client cap above is **fairness**; this one is what actually
+/// protects the box, because nothing caps the number of connections and
+/// N × 128 MiB is unbounded.
+///
+/// 8× the per-client cap, not the 4× a first pass chose, and the ratio is
+/// the whole argument. This refusal is fatal like every other
+/// [`map_buffer`] error, so unlike the per-client cap it can disconnect a
+/// client for what *other* clients did: a bar uploading an 8 KiB icon is
+/// dropped because its neighbours filled the budget. That is acceptable
+/// only when reaching the cap is unambiguously an attack rather than a
+/// busy desktop. At 1 GiB it takes eight clients simultaneously holding a
+/// full fullscreen-double-buffered 128 MiB to get there — a state no
+/// honest nitro desktop approaches (the real shell is a wallpaper and two
+/// bars, one small buffer each; `docs/budget.md` measures the whole
+/// desktop in megabytes), and one where dropping connections is the
+/// correct response rather than collateral damage. It is still a fraction
+/// of the 3.3 GB box, so the kernel is not the thing saying no first.
+///
+/// Rejected: a fair-share scheme that refuses only the clients above
+/// `global / client_count`, so the greedy client is dropped instead of
+/// its innocent neighbour. It is the right answer to the amplification
+/// in general, and real complexity for a cap that should never be
+/// reached; if this ever fires in practice, that is the follow-up.
+pub const MAX_MAPPED_BYTES_ALL_CLIENTS: u64 = 1024 * 1024 * 1024;
+
+
 /// Maximum nodes one client may hold. The scene is a shared resource and a
 /// client in a loop must not be able to exhaust it.
 pub const MAX_NODES_PER_CLIENT: usize = 20_000;
@@ -78,6 +140,31 @@ pub enum Pending {
     Buffer(BufferId, BufferDesc, MappedPixels),
 }
 
+/// A buffer a client holds: the scene's key and the bytes it mapped. The
+/// bytes live next to the key so the budget is a sum over what is held —
+/// there is no running counter whose decrement a destroy path could miss.
+#[derive(Debug, Clone, Copy)]
+pub struct HeldBuffer {
+    /// The scene's key.
+    pub key: BufferKey,
+    /// Bytes mapped for it (`BufferDesc::byte_len`).
+    pub bytes: u64,
+}
+
+/// What a client holds against the buffer caps, as [`map_buffer`] checks
+/// them. `Default` is "holds nothing".
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BufferBudget {
+    /// Buffers held by this client, committed plus pending.
+    pub buffers: usize,
+    /// Mapped bytes held by this client, committed plus pending.
+    pub bytes: u64,
+    /// Mapped bytes held by *all* wire clients, this one included. Filled
+    /// in by the caller, the only thing that can see the other clients.
+    pub all_clients_bytes: u64,
+}
+
+
 /// One connected wire client.
 #[derive(Debug)]
 pub struct WireClient {
@@ -91,8 +178,9 @@ pub struct WireClient {
     pub nodes: HashMap<NodeId, NodeKey>,
     /// Scene key to client node id, for naming a node in an input event.
     pub node_ids: HashMap<NodeKey, NodeId>,
-    /// Client buffer id to scene key.
-    pub buffers: HashMap<BufferId, BufferKey>,
+    /// Client buffer id to scene key and mapped size.
+    pub buffers: HashMap<BufferId, HeldBuffer>,
+
     /// Windows this client owns, by their root node's client id.
     pub windows: HashMap<NodeId, WindowKey>,
     /// Scene window key back to the client's node id.
@@ -193,9 +281,33 @@ impl WireClient {
     pub fn buffer_id(&self, key: BufferKey) -> Option<BufferId> {
         self.buffers
             .iter()
-            .find(|&(_, &k)| k == key)
+            .find(|&(_, h)| h.key == key)
             .map(|(&id, _)| id)
     }
+
+    /// What this client holds against the buffer caps: buffers committed
+    /// into `buffers` plus those mapped and waiting in `pending`. The
+    /// pending half is not an optimisation — the mapping happens when the
+    /// message arrives, so a cap that counted only committed buffers would
+    /// be bypassed by one uncommitted batch. `all_clients_bytes` is left
+    /// at this client's own bytes; the caller adds the others'.
+    #[must_use]
+    pub fn held_buffers(&self) -> BufferBudget {
+        let committed = self.buffers.values().map(|h| h.bytes);
+        let pending = self.pending.iter().filter_map(|p| match p {
+            Pending::Buffer(_, desc, _) => Some(desc.byte_len() as u64),
+            Pending::Msg(_) => None,
+        });
+        let (buffers, bytes) = committed
+            .chain(pending)
+            .fold((0, 0u64), |(n, b), x| (n + 1, b.saturating_add(x)));
+        BufferBudget {
+            buffers,
+            bytes,
+            all_clients_bytes: bytes,
+        }
+    }
+
 
     /// Queue a message, ignoring an encode failure (the only way one can
     /// happen is a string longer than the protocol allows, which the server
@@ -393,10 +505,12 @@ pub fn apply(
                         format!("buffer id {} is zero or already in use", id.raw()),
                     ));
                 }
+                let bytes = desc.byte_len() as u64;
                 let key = scene
                     .create_buffer(client.id, desc, data)
                     .map_err(|e| scene_err("CreateBuffer", e))?;
-                client.buffers.insert(id, key);
+                client.buffers.insert(id, HeldBuffer { key, bytes });
+
             }
             Pending::Msg(msg) => apply_msg(client, scene, text, icons, *msg, &mut outcome)?,
         }
@@ -423,7 +537,8 @@ fn before_key(client: &WireClient, id: NodeId) -> Result<Option<NodeKey>, ApplyE
 }
 
 fn buffer_key(client: &WireClient, id: BufferId) -> Result<BufferKey, ApplyError> {
-    client.buffers.get(&id).copied().ok_or_else(|| {
+    client.buffers.get(&id).map(|h| h.key).ok_or_else(|| {
+
         ApplyError::new(
             ErrorCode::BadBuffer,
             format!("no buffer with id {}", id.raw()),
@@ -1180,13 +1295,56 @@ impl PixelStore for MappedPixels {
 /// still checked against the file, because `docs/wire.md` says an
 /// inconsistent one is a `BadBuffer`.
 ///
+/// `held` is what the client (and every client) already holds, committed
+/// plus pending. The budget is checked here, before the `mmap`, because
+/// the mapping happens at arrival: a cap checked at commit would be
+/// decorative. [`MAX_BUFFERS_PER_CLIENT`] and
+/// [`MAX_MAPPED_BYTES_PER_CLIENT`] are fairness,
+/// [`MAX_MAPPED_BYTES_ALL_CLIENTS`] protects the box.
+///
 /// # Errors
 /// A description that does not add up, a size past [`MAX_BUFFER_BYTES`], a
+/// client already at [`MAX_BUFFERS_PER_CLIENT`] or one whose buffers would
+/// pass [`MAX_MAPPED_BYTES_PER_CLIENT`] or all clients' pass
+/// [`MAX_MAPPED_BYTES_ALL_CLIENTS`] (each [`ErrorCode::Limit`]), a
 /// descriptor without the required seals (the detail names which are
 /// missing), a file shorter than the declared size, or a descriptor that
 /// will not map.
-pub fn map_buffer(m: msg::CreateBuffer) -> Result<(BufferDesc, MappedPixels), ApplyError> {
+pub fn map_buffer(
+    m: msg::CreateBuffer,
+    held: BufferBudget,
+) -> Result<(BufferDesc, MappedPixels), ApplyError> {
     let desc = validate_buffer(&m)?;
+    let need = desc.byte_len() as u64;
+    if held.buffers >= MAX_BUFFERS_PER_CLIENT {
+        return Err(ApplyError::new(
+            ErrorCode::Limit,
+            format!(
+                "client already holds {} buffers, the cap is {MAX_BUFFERS_PER_CLIENT}",
+                held.buffers
+            ),
+        ));
+    }
+    if held.bytes.saturating_add(need) > MAX_MAPPED_BYTES_PER_CLIENT {
+        return Err(ApplyError::new(
+            ErrorCode::Limit,
+            format!(
+                "client holds {} mapped bytes; {need} more exceeds the per-client \
+                 {MAX_MAPPED_BYTES_PER_CLIENT} byte cap",
+                held.bytes
+            ),
+        ));
+    }
+    if held.all_clients_bytes.saturating_add(need) > MAX_MAPPED_BYTES_ALL_CLIENTS {
+        return Err(ApplyError::new(
+            ErrorCode::Limit,
+            format!(
+                "all clients hold {} mapped bytes; {need} more exceeds the server-wide \
+                 {MAX_MAPPED_BYTES_ALL_CLIENTS} byte cap",
+                held.all_clients_bytes
+            ),
+        ));
+    }
     let bad = |detail: String| ApplyError::new(ErrorCode::BadBuffer, detail);
     let file_len = nitro_shm::sealed_len(&m.fd).map_err(|e| match e {
         MapError::Seals(s) => bad(format!("buffer {s}")),
@@ -1427,7 +1585,7 @@ mod tests {
             let mut file = std::fs::File::from(client_fd.try_clone().unwrap());
             file.write_all(&[0xAB; 64]).unwrap();
         }
-        let (desc, pixels) = map_buffer(m).unwrap();
+        let (desc, pixels) = map_buffer(m, BufferBudget::default()).unwrap();
         assert_eq!(
             desc,
             BufferDesc::new(4, 4, 16, format::XR24).with_opaque(true)
@@ -1450,7 +1608,7 @@ mod tests {
     #[test]
     fn a_mapped_buffer_is_read_only_to_the_scene() {
         let m = msg_buffer(4, 4, 16, 64, format::XR24);
-        let (desc, pixels) = map_buffer(m).unwrap();
+        let (desc, pixels) = map_buffer(m, BufferBudget::default()).unwrap();
         let mut scene = Scene::new();
         let key = scene.create_buffer(ClientId(7), desc, pixels).unwrap();
         assert_eq!(
@@ -1466,7 +1624,7 @@ mod tests {
         // Declare twice the rows the fd actually has.
         m.height = 8;
         m.size = 128;
-        let err = map_buffer(m).unwrap_err();
+        let err = map_buffer(m, BufferBudget::default()).unwrap_err();
         assert_eq!(err.code, ErrorCode::BadBuffer);
         assert!(err.detail.contains("shorter"), "{}", err.detail);
     }
@@ -1477,7 +1635,7 @@ mod tests {
     fn a_declared_size_past_the_file_is_a_bad_buffer() {
         let mut m = msg_buffer(4, 4, 16, 64, format::XR24);
         m.size = 65;
-        let err = map_buffer(m).unwrap_err();
+        let err = map_buffer(m, BufferBudget::default()).unwrap_err();
         assert_eq!(err.code, ErrorCode::BadBuffer);
         assert!(err.detail.contains("declared size"), "{}", err.detail);
     }
@@ -1492,7 +1650,7 @@ mod tests {
         let fd = memfd_create("nitro-test-unsealed", MemfdFlags::CLOEXEC).unwrap();
         ftruncate(&fd, 64).unwrap();
         m.fd = fd;
-        let err = map_buffer(m).unwrap_err();
+        let err = map_buffer(m, BufferBudget::default()).unwrap_err();
         assert_eq!(err.code, ErrorCode::BadBuffer);
         assert_eq!(err.detail, "buffer fd lacks F_SEAL_SHRINK, F_SEAL_GROW");
     }
@@ -1509,7 +1667,7 @@ mod tests {
         ] {
             let mut m = msg_buffer(4, 4, 16, 64, format::XR24);
             m.fd = memfd_with_seals(64, seals);
-            let err = map_buffer(m).unwrap_err();
+            let err = map_buffer(m, BufferBudget::default()).unwrap_err();
             assert_eq!(err.code, ErrorCode::BadBuffer, "{missing}");
             assert_eq!(err.detail, format!("buffer fd lacks {missing}"));
         }
@@ -1524,7 +1682,7 @@ mod tests {
         let file = std::fs::File::create(&path).unwrap();
         file.set_len(64).unwrap();
         m.fd = file.into();
-        let err = map_buffer(m).unwrap_err();
+        let err = map_buffer(m, BufferBudget::default()).unwrap_err();
         let _ = std::fs::remove_file(path);
         assert_eq!(err.code, ErrorCode::BadBuffer);
         assert!(
@@ -1532,6 +1690,96 @@ mod tests {
             "{}",
             err.detail
         );
+    }
+
+    /// Each of the three budget caps refuses with `Limit`, and one short
+    /// of each is accepted — the second half is what stops an off-by-one
+    /// turning a cap into a cap of zero.
+    #[test]
+    fn a_client_at_its_buffer_budget_is_refused() {
+        // 4×4 at stride 16: 64 bytes mapped.
+        let need = 64;
+        let cases = [
+            (
+                BufferBudget {
+                    buffers: MAX_BUFFERS_PER_CLIENT,
+                    ..BufferBudget::default()
+                },
+                BufferBudget {
+                    buffers: MAX_BUFFERS_PER_CLIENT - 1,
+                    ..BufferBudget::default()
+                },
+                "buffers, the cap is",
+            ),
+            (
+                BufferBudget {
+                    bytes: MAX_MAPPED_BYTES_PER_CLIENT - need + 1,
+                    all_clients_bytes: MAX_MAPPED_BYTES_PER_CLIENT - need + 1,
+                    ..BufferBudget::default()
+                },
+                BufferBudget {
+                    bytes: MAX_MAPPED_BYTES_PER_CLIENT - need,
+                    all_clients_bytes: MAX_MAPPED_BYTES_PER_CLIENT - need,
+                    ..BufferBudget::default()
+                },
+                "per-client",
+            ),
+            (
+                BufferBudget {
+                    all_clients_bytes: MAX_MAPPED_BYTES_ALL_CLIENTS - need + 1,
+                    ..BufferBudget::default()
+                },
+                BufferBudget {
+                    all_clients_bytes: MAX_MAPPED_BYTES_ALL_CLIENTS - need,
+                    ..BufferBudget::default()
+                },
+                "server-wide",
+            ),
+        ];
+        for (over, under, detail) in cases {
+            let m = msg_buffer(4, 4, 16, 64, format::XR24);
+            let err = map_buffer(m, over).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Limit, "{detail}");
+            assert!(err.detail.contains(detail), "{}", err.detail);
+            let m = msg_buffer(4, 4, 16, 64, format::XR24);
+            assert!(map_buffer(m, under).is_ok(), "{detail}");
+        }
+    }
+
+    /// The budget counts what is waiting for a `Commit` as well as what is
+    /// committed, because the mapping already exists at arrival.
+    #[test]
+    fn held_buffers_counts_pending_and_committed() {
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let socket = nitro_wire::io::Socket::from_fd(OwnedFd::from(a)).unwrap();
+        let mut client = WireClient::new(ClientStream::new(socket), ClientId(1));
+        assert_eq!(client.held_buffers().buffers, 0);
+        let m = msg_buffer(4, 4, 16, 64, format::XR24);
+        let (desc, pixels) = map_buffer(m, BufferBudget::default()).unwrap();
+        client
+            .pending
+            .push(Pending::Buffer(BufferId(1), desc, pixels));
+        let held = client.held_buffers();
+        assert_eq!((held.buffers, held.bytes), (1, 64));
+
+        let mut scene = Scene::new();
+        let key = scene
+            .create_buffer(
+                client.id,
+                desc,
+                map_buffer(msg_buffer(8, 8, 32, 256, format::XR24), held)
+                    .unwrap()
+                    .1,
+            )
+            .unwrap();
+        client
+            .buffers
+            .insert(BufferId(2), HeldBuffer { key, bytes: 256 });
+        let held = client.held_buffers();
+        assert_eq!((held.buffers, held.bytes), (2, 320));
+        client.buffers.remove(&BufferId(2));
+        client.pending.clear();
+        assert_eq!(client.held_buffers().buffers, 0);
     }
 
     #[test]
