@@ -826,6 +826,152 @@ fn a_click_focuses_and_raises_over_another_window() {
     h_.quit();
 }
 
+/// The implicit pointer grab (`docs/wire.md` § Implicit grab): a window
+/// that received a press keeps the pointer — motion in its own
+/// coordinates, even outside its content, and the release — until the
+/// button is up, whatever is under the pointer meanwhile. Only then is
+/// focus re-derived, with the leave/enter that says where it ended up.
+#[test]
+fn a_held_button_keeps_the_pointer_on_the_pressed_window() {
+    let (w, h) = (320, 200);
+    let h_ = Harness::start("grab", w, h);
+
+    let mut first = h_.client("first");
+    let mut seen1 = Vec::new();
+    let size = Size::new(100.0, 60.0);
+    let w1 = make_window(&mut first, 1, size, Color::rgb(0xFF, 0, 0), 1);
+    let c1 = expect(&mut first, &mut seen1, "Configure", |m| match m {
+        ServerMsg::Configure(c) if c.window == w1.root => Some(*c),
+        _ => None,
+    });
+    let mut second = h_.client("second");
+    let mut seen2 = Vec::new();
+    let w2 = make_window(&mut second, 1, size, Color::rgb(0, 0xFF, 0), 1);
+    let c2 = expect(&mut second, &mut seen2, "Configure", |m| match m {
+        ServerMsg::Configure(c) if c.window == w2.root => Some(*c),
+        _ => None,
+    });
+    let step = cascade_step(size, (w, h));
+    assert!(step.0 > 0.0 && step.1 > 0.0, "no cascade, no overlap: {step:?}");
+    h_.settle();
+
+    // Press on the uncovered top-left of the first window.
+    park_cursor(&h_, 0.95, 0.95);
+    h_.point_at(&c1, Point::new(10.0, 10.0), 5_000_000);
+    expect(&mut first, &mut seen1, "PointerEnter", |m| match m {
+        ServerMsg::PointerEnter(e) if e.window == w1.root => Some(*e),
+        _ => None,
+    });
+    h_.input.push(InputEvent::PointerButton {
+        button: nitro_server::input::BTN_LEFT,
+        state: ButtonState::Pressed,
+        time_ns: 6_000_000,
+    });
+    let press = expect(&mut first, &mut seen1, "PointerButton", |m| match m {
+        ServerMsg::PointerButton(b) if b.state == ButtonState::Pressed => Some(*b),
+        _ => None,
+    });
+    assert_eq!(press.window, w1.root);
+    seen1.clear();
+
+    // Move onto the second window, to a spot the first (now raised) does
+    // not cover: past its content *and* its 1px border. The first still
+    // gets the motion, in its own space, and no leave; the second gets
+    // nothing at all.
+    let on_second = Point::new(80.0, 40.0);
+    h_.point_at(&c2, on_second, 7_000_000);
+    let motion = expect(&mut first, &mut seen1, "PointerMotion", |m| match m {
+        ServerMsg::PointerMotion(m) => Some(*m),
+        _ => None,
+    });
+    assert_eq!(motion.window, w1.root);
+    assert_eq!(
+        motion.pos,
+        Point::new(on_second.x + step.0, on_second.y + step.1),
+        "window-local coordinates, beyond the window's own content"
+    );
+    assert!(motion.pos.x > size.w && motion.pos.y > size.h);
+    assert!(
+        !seen1.iter().any(|m| matches!(m, ServerMsg::PointerLeave(_))),
+        "no leave mid-grab: {seen1:?}"
+    );
+    h_.settle();
+    second.poll(&mut seen2).unwrap();
+    assert!(
+        !seen2
+            .iter()
+            .any(|m| matches!(m, ServerMsg::PointerEnter(_) | ServerMsg::PointerMotion(_))),
+        "the window under the pointer gets nothing mid-grab: {seen2:?}"
+    );
+
+    // Off every window, onto the bare desktop, above and left of the
+    // first window: still its motion, with negative coordinates.
+    seen1.clear();
+    h_.input.push(InputEvent::PointerAbsolute {
+        x: 0.01,
+        y: 0.01,
+        time_ns: 8_000_000,
+    });
+    let motion = expect(&mut first, &mut seen1, "PointerMotion", |m| match m {
+        ServerMsg::PointerMotion(m) => Some(*m),
+        _ => None,
+    });
+    assert_eq!(motion.window, w1.root);
+    assert!(motion.pos.x < 0.0 && motion.pos.y < 0.0, "{:?}", motion.pos);
+    assert!(!seen1.iter().any(|m| matches!(m, ServerMsg::PointerLeave(_))));
+
+    // Back over the second window and release there: the release is the
+    // first window's, and only *after* it does focus move on.
+    seen1.clear();
+    h_.point_at(&c2, on_second, 9_000_000);
+    expect(&mut first, &mut seen1, "PointerMotion", |m| match m {
+        ServerMsg::PointerMotion(m) => Some(*m),
+        _ => None,
+    });
+    h_.input.push(InputEvent::PointerButton {
+        button: nitro_server::input::BTN_LEFT,
+        state: ButtonState::Released,
+        time_ns: 10_000_000,
+    });
+    let release = expect(&mut first, &mut seen1, "PointerButton", |m| match m {
+        ServerMsg::PointerButton(b) if b.state == ButtonState::Released => Some(*b),
+        _ => None,
+    });
+    assert_eq!(release.window, w1.root);
+    h_.settle();
+    let leave = expect(&mut first, &mut seen1, "PointerLeave", |m| match m {
+        ServerMsg::PointerLeave(l) => Some(*l),
+        _ => None,
+    });
+    assert_eq!(leave.window, w1.root);
+    let enter = expect(&mut second, &mut seen2, "PointerEnter", |m| match m {
+        ServerMsg::PointerEnter(e) => Some(*e),
+        _ => None,
+    });
+    assert_eq!(enter.window, w2.root);
+    assert_eq!(enter.pos, on_second);
+    let release_idx = seen1
+        .iter()
+        .position(|m| matches!(m, ServerMsg::PointerButton(_)))
+        .unwrap();
+    let leave_idx = seen1
+        .iter()
+        .position(|m| matches!(m, ServerMsg::PointerLeave(_)))
+        .unwrap();
+    assert!(release_idx < leave_idx, "the release comes before the leave");
+
+    // A further motion is the second window's, plainly.
+    seen2.clear();
+    h_.point_at(&c2, Point::new(81.0, 41.0), 11_000_000);
+    let motion = expect(&mut second, &mut seen2, "PointerMotion", |m| match m {
+        ServerMsg::PointerMotion(m) => Some(*m),
+        _ => None,
+    });
+    assert_eq!(motion.window, w2.root);
+
+    h_.quit();
+}
+
 #[test]
 fn disconnecting_destroys_everything_the_client_owned_and_repaints() {
     let (w, h) = (320, 200);

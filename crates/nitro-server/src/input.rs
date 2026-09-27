@@ -338,6 +338,14 @@ pub struct Pointer {
     /// bitset: a hand holds at most a few buttons, and evdev codes are
     /// sparse.
     pub buttons: Vec<u32>,
+    /// The window holding the **implicit grab**: the one a button press
+    /// was delivered to while none was held. Until every button is up
+    /// again, motion and releases go to it whatever is under the pointer,
+    /// and no enter/leave is sent — the X11/Wayland rule that lets a
+    /// slider follow a fast drag past its own edge. `over` is left alone
+    /// for the grab's duration (so a `SetCursor` stays valid) and
+    /// re-derived once the grab ends.
+    pub grab: Option<WindowKey>,
 }
 
 impl Pointer {

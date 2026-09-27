@@ -2645,6 +2645,7 @@ impl Server {
                     // the other VT was never seen, and a button believed
                     // down for ever would let any client start a drag.
                     self.pointer.buttons.clear();
+                    self.end_pointer_grab();
                     for output in &mut self.outputs {
                         output.invalidate();
                     }
@@ -3407,6 +3408,43 @@ impl Server {
             self.note_input(time_ns);
             return;
         }
+        // The implicit grab (`Pointer::grab`, `docs/wire.md`): a press was
+        // delivered to a window and a button is still down, so every
+        // motion is that window's whatever it is over now, in its own
+        // coordinates — which may be negative or beyond its content, as
+        // `input::window_local` allows. No enter/leave goes out: `over`
+        // stays where the press left it, so the grabbing client's
+        // `SetCursor` stays honoured and its released-outside gesture
+        // works. The frame affordances go dark for the same reason a
+        // drag's do: a band that would not act on a press must not light.
+        if let Some(grab) = self.pointer.grab {
+            if self.scene.window_info(grab).is_err() {
+                // The window went away under a held button; fall back to
+                // the ordinary path, which re-derives focus.
+                self.end_pointer_grab();
+            } else {
+                self.set_resize_hint(None);
+                self.set_button_hover(None);
+                let local = input::window_local(&self.scene, grab, point).unwrap_or(Point::ZERO);
+                let node = output
+                    .and_then(|id| self.pointer_target(id, point))
+                    .filter(|t| t.window == grab)
+                    .map_or(NodeId::NONE, |t| self.node_id_for(grab, t.hit.node));
+                let sent_to = self.send_input(grab, |id| {
+                    ServerMsg::PointerMotion(msg::PointerMotion {
+                        window: id,
+                        node,
+                        pos: local,
+                        time_ns,
+                    })
+                });
+                self.note_client_input(sent_to);
+                self.set_cursor(self.cursor_choice(Some((grab, Region::Content))));
+                self.cursor_stale = false;
+                self.note_input(time_ns);
+                return;
+            }
+        }
         // The resize affordance and the button hover both follow the
         // pointer, but not during a drag: the branch above has already
         // returned, so a drag in flight never repaints a frame it is not
@@ -3565,7 +3603,11 @@ impl Server {
             .keyboard
             .as_ref()
             .map_or_else(Mods::default, Keyboard::named_mods);
+        // Neither server-side drag may start mid-grab: a second button
+        // pressed over another window's title bar belongs to the grabbing
+        // window, which is where the ordinary delivery below sends it.
         if state == ButtonState::Pressed
+            && self.pointer.grab.is_none()
             && let Some(point) = self.frame_point()
         {
             // Super + drag: the server moves and resizes any window,
@@ -3617,7 +3659,9 @@ impl Server {
             }
         }
 
-        let Some(window) = self.pointer.over else {
+        // The implicit grab owns the release (and any further press) even
+        // once the pointer has left the window it began on.
+        let Some(window) = self.pointer.grab.or(self.pointer.over) else {
             // A click on nothing changes nothing: the desktop is not a
             // focus target, so the keyboard stays where it was. Dropping
             // focus here would leave a screen full of windows and nowhere
@@ -3625,7 +3669,8 @@ impl Server {
             // explicit that focus is only ever handed on, never dropped.
             return;
         };
-        if state == ButtonState::Pressed && button == input::BTN_LEFT {
+        if state == ButtonState::Pressed && button == input::BTN_LEFT && self.pointer.grab.is_none()
+        {
             self.raise_and_focus(window);
         }
         let sent_to = self.send_input(window, |id| {
@@ -3637,7 +3682,31 @@ impl Server {
             })
         });
         self.note_client_input(sent_to);
+        // A press that was actually delivered begins the grab — not one
+        // a lock kept from an unadmitted window, which would otherwise
+        // hold the pointer for a client that never saw it.
+        if state == ButtonState::Pressed && self.pointer.grab.is_none() && sent_to.is_some() {
+            self.pointer.grab = Some(window);
+        }
+        if state == ButtonState::Released && !self.pointer.any_button_down() {
+            self.end_pointer_grab();
+        }
         self.note_input(time_ns);
+    }
+
+    /// End the implicit pointer grab, if one is held.
+    ///
+    /// Focus is not re-derived here: the pointer may be over another
+    /// window, or the desktop, and the leave/enter that says so goes out
+    /// from [`Server::refresh_pointer_over`] on the next settle — the same
+    /// stationary re-check a popup mapping under a still pointer uses,
+    /// because a grab ending is exactly that: what the pointer is over
+    /// changed without it moving. The cursor is re-derived the same way.
+    fn end_pointer_grab(&mut self) {
+        if self.pointer.grab.take().is_some() {
+            self.popup_seat.pointer_refresh = true;
+            self.cursor_stale = true;
+        }
     }
 
     /// Whether a window may be resized by a drag.
@@ -3830,6 +3899,9 @@ impl Server {
             });
             self.note_client_input(sent_to);
         }
+        // The drag owns the pointer now, implicit grab included: the
+        // release ends the drag and is never delivered.
+        self.pointer.grab = None;
         self.set_pointer_over(None);
         self.set_cursor(Some(Self::drag_shape(drag)));
         self.note_input(now);
@@ -4313,6 +4385,9 @@ impl Server {
         }
         if self.pointer.over == Some(win) {
             self.set_pointer_over(None);
+        }
+        if self.pointer.grab == Some(win) {
+            self.end_pointer_grab();
         }
         self.touch_targets.retain(|_, (w, _)| *w != win);
         self.popup_window_gone(win);
@@ -7105,6 +7180,9 @@ impl Server {
     /// and the shell's tap state is reset. The next motion re-hit-tests
     /// against the admitted windows only.
     fn release_pointer_for_lock(&mut self) {
+        // The lock takes the pointer: the grab goes, and the release
+        // that would have ended it is never delivered.
+        self.pointer.grab = None;
         if let Some(left) = self.pointer.over.take() {
             let time_ns = monotonic_ns();
             self.send_to_window(left, |id| {
@@ -7945,6 +8023,9 @@ impl Server {
             if self.pointer.over == Some(win) {
                 self.set_pointer_over(None);
             }
+            if self.pointer.grab == Some(win) {
+                self.end_pointer_grab();
+            }
             self.touch_targets.retain(|_, (w, _)| *w != win);
             self.popup_window_gone(win);
             if let Err(e) = self.scene.destroy_window(id, win) {
@@ -8264,6 +8345,11 @@ impl Server {
                     self.popup_seat.grab = Some(win);
                 }
             }
+            // A grabbing menu that opened on a press ends the press's
+            // implicit grab: the press-drag-into-the-menu-release-on-an-item
+            // gesture wants ordinary enter/leave from here on. A tooltip
+            // (no `GRAB`) mapping mid-drag leaves the grab alone.
+            self.end_pointer_grab();
         }
         if let Ok(i) = self.scene.window_info(win)
             && let Some(output) = i.output()
@@ -8520,6 +8606,13 @@ impl Server {
             self.drive_dnd(monotonic_ns(), false);
             return;
         }
+        // Mid-grab, focus is pinned: a window mapped or unmapped under a
+        // still pointer must not steal it. `end_pointer_grab` sets the
+        // refresh flag *after* clearing the grab, so the re-derivation
+        // it asks for runs on the next settle.
+        if self.pointer.grab.is_some() {
+            return;
+        }
         let time_ns = monotonic_ns();
         let point = self.pointer.position();
         let target =
@@ -8637,6 +8730,7 @@ impl Server {
             });
             self.note_client_input(sent_to);
         }
+        self.pointer.grab = None;
         self.set_pointer_over(None);
         // A button release that a popup grab would have swallowed now
         // belongs to the drag.
@@ -9080,8 +9174,12 @@ impl Server {
         };
         let s = if scale > 0.0 { scale } else { 1.0 };
         let size = Size::new(rect.w as f32 / s, rect.h as f32 / s);
-        // A drag must not carry on under a scaled window.
+        // A drag must not carry on under a scaled window — nor an implicit
+        // grab: the thumbnail's client gets its `PointerLeave` from the
+        // refresh below and drops its pressed state; the eventual release
+        // is swallowed by overview, like a frame drag's.
         let _ = self.wm.end_drag();
+        self.pointer.grab = None;
         let wins: Vec<WindowKey> = self
             .scene
             .windows(output)
