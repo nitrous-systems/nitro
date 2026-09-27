@@ -218,7 +218,10 @@ pub struct WireClient {
     /// first lists it is what sends the `Keymap` + `Modifiers` snapshot
     /// (`Server::send_keymap`), and both messages — including the
     /// re-send after a layout change and every `Modifiers` after a key —
-    /// go only to clients that listed it. The bits not yet
+    /// go only to clients that listed it. `ICONS` picks the form of an
+    /// icon refusal (`report_bad_icons`): `IconRefused` with the node id to
+    /// a client that listed it, `Error { BadIcon }` to one that did not.
+    /// The bits not yet
     /// advertised are still recorded, because the rule this exists for
     /// cannot be honoured retroactively by a server that threw the list
     /// away.

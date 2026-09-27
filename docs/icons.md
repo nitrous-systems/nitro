@@ -174,8 +174,14 @@ with no defined answer. A separate kind costs one enum variant and makes
 the invalid states unrepresentable.
 
 **An unknown name is not fatal.** Every other error in this protocol
-closes the connection; `Error { BadIcon }` does not. The node is cleared,
+closes the connection; a refused icon does not. The node is cleared,
 the rest of the commit applies, the client is told, and it keeps running.
+*How* it is told depends on what it declared: a client that listed
+`ICONS` in its `ClientCaps` gets `IconRefused { serial, node, name }`,
+which names the node so a toolkit can route it to the widget that asked;
+any other gets `Error { BadIcon }`, the pre-M5 form, unchanged. `nitro-ui`
+always opts in, and never parses `Error.msg`. Both are "a `BadIcon`" in
+the prose below.
 A desktop must not lose an application because one of its widgets named
 an icon that a newer icon set has — and a client cannot check in advance,
 since the set is the server's.

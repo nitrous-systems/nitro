@@ -683,11 +683,19 @@ fn an_unknown_icon_name_is_reported_and_the_client_survives() {
     let mut conn = h.client("unknown");
     let (_root, c) = window_with_icon(&mut conn, &mut seen, "no-such-icon-anywhere", 16.0);
 
-    let code = expect(&mut conn, &mut seen, "an Error", |m| match m {
-        ServerMsg::Error(e) => Some(e.code),
+    // A client that never sent `ClientCaps` gets the pre-`IconRefused`
+    // form, prose and all: it may not know op 0x8303.
+    let err = expect(&mut conn, &mut seen, "an Error", |m| match m {
+        ServerMsg::Error(e) => Some(e.clone()),
         _ => None,
     });
-    assert_eq!(code, ErrorCode::BadIcon);
+    assert_eq!(err.serial, 1);
+    assert_eq!(err.code, ErrorCode::BadIcon);
+    assert_eq!(err.msg, "no icon named \"no-such-icon-anywhere\"");
+    assert!(
+        !seen.iter().any(|m| matches!(m, ServerMsg::IconRefused(_))),
+        "a client that did not list ICONS must never see IconRefused"
+    );
     h.settle();
 
     // The node draws nothing: the box is pure backdrop.
@@ -710,6 +718,95 @@ fn an_unknown_icon_name_is_reported_and_the_client_survives() {
     h.settle();
     assert_eq!(h.stat("clients"), 1, "the client is still connected");
     assert_eq!(h.stat("icon_renders"), 1, "and its next icon drew");
+
+    drop(conn);
+    h.quit();
+}
+
+#[test]
+fn an_opted_in_client_is_told_which_node_was_refused() {
+    // The same refusal, in the form that names the node: a client that
+    // listed `ICONS` in `ClientCaps` gets `IconRefused` and no `Error`.
+    let h = Harness::start("refused", "");
+    let mut seen = Vec::new();
+    let mut conn = h.client("refused");
+    assert!(conn.has_caps(caps::ICONS));
+    conn.client_caps(caps::ICONS).unwrap();
+    let (_root, _c) = window_with_icon(&mut conn, &mut seen, "no-such-icon-anywhere", 16.0);
+
+    let r = expect(&mut conn, &mut seen, "an IconRefused", |m| match m {
+        ServerMsg::IconRefused(r) => Some(r.clone()),
+        _ => None,
+    });
+    assert_eq!(r.serial, 1);
+    assert_eq!(r.node, NodeId(3));
+    assert_eq!(r.name, "no-such-icon-anywhere");
+    h.settle();
+    conn.poll(&mut seen).unwrap();
+    assert!(
+        !seen.iter().any(|m| matches!(m, ServerMsg::Error(_))),
+        "an opted-in client is told once, by IconRefused, not also by Error"
+    );
+
+    // Still non-fatal: the next commit applies and draws.
+    assert_eq!(h.stat("clients"), 1);
+    conn.tx()
+        .set_icon(NodeId(3), "gear", 16.0, Role::Text.index() as u8)
+        .commit(2)
+        .unwrap();
+    conn.flush().unwrap();
+    h.settle();
+    assert_eq!(h.stat("clients"), 1, "the client is still connected");
+    assert_eq!(h.stat("icon_renders"), 1, "and its next icon drew");
+
+    drop(conn);
+    h.quit();
+}
+
+#[test]
+fn two_refusals_in_one_commit_each_name_their_own_node() {
+    // The case an id-less `Error` could not express: two icons refused in
+    // one transaction, told apart by node rather than by prose.
+    let h = Harness::start("refused-two", "");
+    let mut seen = Vec::new();
+    let mut conn = h.client("refused-two");
+    conn.client_caps(caps::ICONS).unwrap();
+    let (root, _c) = window_with_icon(&mut conn, &mut seen, "gear", 16.0);
+    conn.tx()
+        .create_icon(NodeId(4), root, Rect::new(20.0, 0.0, 16.0, 16.0))
+        .set_icon(NodeId(4), "no-such-first", 16.0, Role::Text.index() as u8)
+        .create_icon(NodeId(5), root, Rect::new(40.0, 0.0, 16.0, 16.0))
+        .set_icon(NodeId(5), "no-such-second", 16.0, Role::Text.index() as u8)
+        .commit(2)
+        .unwrap();
+    conn.flush().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let refused = loop {
+        let got: Vec<_> = seen
+            .iter()
+            .filter_map(|m| match m {
+                ServerMsg::IconRefused(r) => Some((r.serial, r.node, r.name.clone())),
+                _ => None,
+            })
+            .collect();
+        if got.len() >= 2 {
+            break got;
+        }
+        assert!(Instant::now() < deadline, "only {} IconRefused", got.len());
+        conn.flush().unwrap();
+        conn.poll(&mut seen).unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    assert_eq!(
+        refused,
+        vec![
+            (2, NodeId(4), "no-such-first".to_owned()),
+            (2, NodeId(5), "no-such-second".to_owned()),
+        ]
+    );
+    assert!(!seen.iter().any(|m| matches!(m, ServerMsg::Error(_))));
+    assert_eq!(h.stat("clients"), 1);
 
     drop(conn);
     h.quit();

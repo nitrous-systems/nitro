@@ -633,6 +633,104 @@ fn a_bad_icon_falls_back_exactly_once() {
 }
 
 #[test]
+fn two_refusals_in_one_commit_each_reach_their_own_widget() {
+    // Two icons refused in the same transaction, each with a different
+    // fallback. `IconRefused` names the node, so each widget takes its
+    // own fallback — not the other's, and not twice.
+    let mut h = Harness::sized(
+        "icon-refused-two",
+        (),
+        Size::new(120.0, 80.0),
+        |ui: &mut Ui<()>| {
+            ui.tap(true);
+            ui.build(
+                column()
+                    .cross_align(nitro_ui::CrossAlign::Start)
+                    .child(
+                        icon("definitely-not-an-application")
+                            .name("a")
+                            .coloured()
+                            .size(16.0)
+                            .fallback_tinted("gear", nitro_ui::IconTint::Role(ColorRole::Text)),
+                    )
+                    .child(
+                        icon("also-not-an-application")
+                            .name("b")
+                            .coloured()
+                            .size(16.0)
+                            .fallback_tinted("list", nitro_ui::IconTint::Role(ColorRole::Text)),
+                    ),
+            )
+        },
+    );
+    h.settle();
+
+    let a = named(&mut h, "a");
+    let b = named(&mut h, "b");
+    assert_eq!(h.widget::<Icon>(a).name(), "gear");
+    assert_eq!(h.widget::<Icon>(b).name(), "list");
+    assert!(h.widget::<Icon>(a).fell_back());
+    assert!(h.widget::<Icon>(b).fell_back());
+    assert_eq!(
+        icons_sent(&h).len(),
+        4,
+        "two originals plus one fallback each, got {:?}",
+        h.mutations()
+    );
+    assert_eq!(h.server().stat("clients"), 1, "the client survived");
+    h.quit();
+}
+
+#[test]
+fn only_the_refused_one_of_two_same_named_icons_falls_back() {
+    // The case routing by name could not get right: two widgets asking
+    // for `gear`, one coloured (the icon theme lacks it: refused) and one
+    // symbolic (drawn). Both have a fallback; only the refused node's
+    // widget may take it.
+    let mut h = Harness::sized(
+        "icon-refused-same-name",
+        (),
+        Size::new(120.0, 80.0),
+        |ui: &mut Ui<()>| {
+            ui.tap(true);
+            ui.build(
+                column()
+                    .cross_align(nitro_ui::CrossAlign::Start)
+                    .child(
+                        icon("gear")
+                            .name("app")
+                            .coloured()
+                            .size(16.0)
+                            .fallback_tinted("list", nitro_ui::IconTint::Role(ColorRole::Text)),
+                    )
+                    .child(icon("gear").name("sym").size(16.0).fallback("cpu")),
+            )
+        },
+    );
+    h.settle();
+    assert_eq!(
+        h.server().stat("app_icons_cached"),
+        0,
+        "the test box's icon theme has a `gear`, so this test is \
+         measuring the box rather than the code"
+    );
+
+    let app = named(&mut h, "app");
+    let sym = named(&mut h, "sym");
+    assert_eq!(h.widget::<Icon>(app).name(), "list");
+    assert!(h.widget::<Icon>(app).fell_back());
+    assert_eq!(
+        h.widget::<Icon>(sym).name(),
+        "gear",
+        "the drawn icon took a fallback meant for its namesake"
+    );
+    assert!(!h.widget::<Icon>(sym).fell_back());
+    assert_eq!(h.widget::<Icon>(sym).fallback(), Some("cpu"));
+    assert_eq!(icons_sent(&h).len(), 3, "got {:?}", h.mutations());
+    h.quit();
+}
+
+#[test]
 fn a_bad_fallback_does_not_loop() {
     // Both names nonsense, which is the case that turns a retry into a
     // livelock if the latch is wrong: the fallback's own `BadIcon` would

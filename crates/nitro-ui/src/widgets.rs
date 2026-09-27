@@ -1647,8 +1647,8 @@ impl<S: 'static> ButtonBuilder<S> {
     /// first, in the icon's own tint.
     ///
     /// The same contract as [`IconBuilder::fallback`], on the button's
-    /// icon: a `BadIcon` naming this button's icon re-sends with this
-    /// name through the normal paint path, and a `BadIcon` for the
+    /// icon: an `IconRefused` for this button's icon node re-sends with
+    /// this name through the normal paint path, and a refusal of the
     /// fallback itself is the end of it. The mode and size are kept.
     ///
     /// Keeping the tint is right for a theme icon falling back to a more
@@ -4134,8 +4134,8 @@ pub struct Icon {
     /// fallback cannot be consumed twice — so this is not what *stops*
     /// the loop. What it adds is the record: [`Icon::fell_back`] can
     /// report that the retry happened, and an icon with **no** fallback
-    /// is marked answered too, so it is not re-examined for every later
-    /// `BadIcon` some other widget earned. [`WidgetMut::set_icon`] and
+    /// is marked answered too, so a second refusal of the same node
+    /// (a stale one, say) changes nothing. [`WidgetMut::set_icon`] and
     /// [`WidgetMut::set_fallback`] clear it, because a new name deserves
     /// the same one try the first one had.
     fell_back: bool,
@@ -4215,11 +4215,10 @@ impl Icon {
     /// there is nothing left to try.
     ///
     /// The whole of the fallback policy, in one place with exactly one
-    /// caller ([`Ui::dispatch`](crate::Ui::dispatch)'s `BadIcon` arm), so
-    /// "exactly once" is a property of this function rather than of the
-    /// routing above it — which matters because one transaction can earn
-    /// several `BadIcon`s and the routing offers the fallback to a widget
-    /// once per error.
+    /// caller ([`Ui::dispatch`](crate::Ui::dispatch)'s `IconRefused`
+    /// arm, routed by node id), so "exactly once" is a property of this
+    /// function rather than of the routing above it — a refusal of the
+    /// fallback name reaches this widget again, and must end here.
     ///
     /// The `take` is what makes it once: the fallback is *moved* out, so
     /// a second call finds `None` however it got here. The retry is
@@ -4232,8 +4231,7 @@ impl Icon {
             return false;
         }
         // Marked answered even when there is no fallback, so a widget
-        // whose only name is unknown is not re-examined for every later
-        // `BadIcon`.
+        // whose only name is unknown stays answered on a repeat refusal.
         self.fell_back = true;
         let Some((name, tint)) = self.fallback.take() else {
             return false;
@@ -4517,10 +4515,11 @@ pub const ICON_GAP: f32 = 6.0;
 /// ```
 ///
 /// An unknown name draws nothing and leaves the connection alone — the
-/// server answers `Error { BadIcon }` and keeps going, because a missing
-/// icon must never be able to close an application. With
-/// [`IconBuilder::fallback`] that error is also the cue to try the other
-/// name, once.
+/// server answers `IconRefused` for the node (`Error { BadIcon }` to a
+/// client that did not opt in) and keeps going, because a missing icon
+/// must never be able to close an application. With
+/// [`IconBuilder::fallback`] that refusal is also the cue to try the
+/// other name, once.
 #[must_use]
 pub fn icon<S: 'static>(name: impl Into<String>) -> IconBuilder<S> {
     IconBuilder {

@@ -1741,6 +1741,13 @@ impl<S: 'static> Ui<S> {
         let (layer, flags) = surface.map_or((nitro_wire::types::Layer::Normal, 0), |s| {
             (s.layer, s.flags)
         });
+        // Opt in to `IconRefused` before the first commit: the server
+        // records `ClientCaps` on receipt, so even this window's first
+        // refusals name their node. Masked to what the server advertised,
+        // and not sent at all to a server that cannot know the op.
+        self.wire
+            .conn_mut()
+            .client_caps(nitro_wire::types::caps::ICONS)?;
         self.wire.create_window(main, title, size, layer, flags)?;
         // The app id, in the same commit: it is what a window list names
         // the program by, and a window that existed for one frame without
@@ -2909,13 +2916,12 @@ impl<S: 'static> Ui<S> {
                     },
                 );
             }
-            // An unknown icon name. One of the protocol's two **non-fatal**
-            // errors: the node is cleared, the rest of the transaction
-            // applied, the connection kept — so this is news, not a
-            // failure, and it is the cue for `.fallback(…)`.
-            ServerMsg::Error(e) if e.code == ErrorCode::BadIcon => {
-                self.bad_icon(e);
-            }
+            // An unknown icon name, told with the node that asked (we
+            // listed `ICONS` in `ClientCaps` at `open_window`). Non-fatal:
+            // the node is cleared, the rest of the transaction applied,
+            // the connection kept — so this is news, not a failure, and it
+            // is the cue for `.fallback(…)`.
+            ServerMsg::IconRefused(r) => self.icon_refused(r),
             ServerMsg::Error(e) => self.server_error(e),
             _ => {}
         }
@@ -2978,102 +2984,74 @@ impl<S: 'static> Ui<S> {
     /// Report a `ServerMsg::Error` the toolkit cannot act on, and latch
     /// it so [`Ui::pump`] can turn it into the loop's return error.
     ///
-    /// Every code but `BadIcon` (handled by the arm above) and
-    /// `BadBuffer` on a remote link is fatal by the protocol's
-    /// definition — the server closes the socket right behind it, see
-    /// `docs/wire.md` and `Server::disconnect`. The remote `BadBuffer`
-    /// carve-out is `docs/remote.md` §3: the server sends it and *keeps*
-    /// the client, so latching it would make an unrelated later EOF
-    /// report the wrong reason.
+    /// Every code but `BadIcon` and `BadBuffer` on a remote link is fatal
+    /// by the protocol's definition — the server closes the socket right
+    /// behind it, see `docs/wire.md` and `Server::disconnect`. `BadIcon`
+    /// is the non-fatal refusal a client that did not list `ICONS` gets;
+    /// this toolkit always lists it and is told by
+    /// [`IconRefused`](nitro_wire::msg::IconRefused) instead, so a
+    /// `BadIcon` here is only logged — it names no node to route by, and
+    /// `Error.msg` is never parsed. The remote `BadBuffer` carve-out is
+    /// `docs/remote.md` §3: the server sends it and *keeps* the client, so
+    /// latching either would make an unrelated later EOF report the wrong
+    /// reason.
     fn server_error(&mut self, e: &nitro_wire::msg::Error) {
         eprintln!("nitro-ui: server error {:?}: {}", e.code, e.msg);
-        if e.code == ErrorCode::BadBuffer && self.is_remote() {
+        if e.code == ErrorCode::BadIcon || (e.code == ErrorCode::BadBuffer && self.is_remote()) {
             return;
         }
         self.last_server_error = Some(e.clone());
     }
 
-    /// Route an `Error { BadIcon }` to the widget (or widgets) that asked
-    /// for the name the server refused, and let each take its fallback.
+    /// Route an `IconRefused` to the widget that owns the refused node,
+    /// and let it take its fallback.
     ///
-    /// **Why it is keyed on the name.** `Error` carries `serial`, `code`
-    /// and a human-readable `msg` and *no node id* — see
-    /// `nitro_wire::msg::Error` and the server's `report_bad_icons`,
-    /// which formats `no icon named "foo"` and sends it after the batch.
-    /// So there is genuinely nothing in the message to key a widget off
-    /// directly, and the two honest options are both here:
-    ///
-    /// 1. Parse the quoted name out of `msg` and match the widgets whose
-    ///    icon slot currently holds exactly that name. `msg` is
-    ///    documented as "for logs and never parsed", which this is in
-    ///    tension with — so what is parsed is the **quoted name**, never
-    ///    the prose around it: the sentence may be reworded freely and
-    ///    this still works, and a message with no quoted name falls to
-    ///    (2) rather than misfiring.
-    /// 2. Failing that, offer the fallback to every widget whose icon has
-    ///    not been answered for yet. That is a superset of the right
-    ///    answer and it is bounded by the same exactly-once latch, so the
-    ///    worst case is a widget taking its fallback one error early.
-    ///
-    /// Both are keyed on the tree's own record of what it sent (the paint
-    /// slots hold the last `SetIcon` per slot), not on a guess about
-    /// ordering: a serial covers a whole transaction and several icons
-    /// can be refused in one.
-    ///
-    /// The fix for the tension is a node id on `Error`, which is a wire
-    /// change and therefore a task of its own — noted rather than
-    /// smuggled in here.
-    fn bad_icon(&mut self, e: &nitro_wire::msg::Error) {
-        let refused = quoted(&e.msg);
-        // Collected first, then mutated: `take_fallback` needs the widget
-        // out of its slot, and the walk needs the arena.
-        let hit: Vec<WidgetId> = (0..self.arena.slots.len())
-            .filter_map(|i| {
-                let slot = self.arena.slots.get(i)?;
-                if !slot.alive {
-                    return None;
-                }
-                let id = WidgetId {
-                    index: i as u32,
-                    generation: slot.generation,
-                };
-                // What this widget last put on the wire. A widget with no
-                // icon slot never matches, whatever the message said.
-                let sent = slot
-                    .state
-                    .slots
-                    .iter()
-                    .filter_map(crate::wire::PaintSlot::icon_name)
-                    .any(|n| refused.is_none_or(|r| r == n));
-                sent.then_some(id)
-            })
-            .collect();
-        for id in hit {
-            let took = match self.arena.slot_mut(id).and_then(|s| s.widget.as_mut()) {
-                Some(w) => {
-                    let any = w.as_any_mut();
-                    if let Some(icon) = any.downcast_mut::<crate::widgets::Icon>() {
-                        icon.take_fallback()
-                    } else if let Some(b) = any.downcast_mut::<crate::widgets::Button<S>>() {
-                        b.take_icon_fallback()
-                    } else {
-                        false
-                    }
-                }
-                None => false,
-            };
-            if took {
-                // Through the **normal paint path**, deliberately: an
-                // out-of-band `SetIcon` would leave the slot's cached
-                // name saying the old one, so the next repaint would diff
-                // against a lie and re-send the name that just failed.
-                // Marking the widget is how every other state change in
-                // this toolkit reaches the wire, and it makes the retry
-                // idempotent — several `BadIcon`s before the next flush
-                // cost one `SetIcon`, because the latch has already
-                // fired.
-                self.mark(id, Dirty::PAINT);
+    /// Keyed on the **node id**, which is exact: several icons refused in
+    /// one commit — even two asking for the same name, only one of which
+    /// was refused — each reach the widget that asked. The name is checked
+    /// too, as a guard against a node id recycled between the send and
+    /// the reply (the paint slots hold the last `SetIcon` per slot), so a
+    /// stale refusal is dropped rather than misrouted.
+    fn icon_refused(&mut self, r: &nitro_wire::msg::IconRefused) {
+        let hit = (0..self.arena.slots.len()).find_map(|i| {
+            let slot = self.arena.slots.get(i)?;
+            if !slot.alive {
+                return None;
             }
+            let owns = slot
+                .state
+                .slots
+                .iter()
+                .any(|p| p.node == r.node && p.icon_name() == Some(r.name.as_str()));
+            owns.then_some(WidgetId {
+                index: i as u32,
+                generation: slot.generation,
+            })
+        });
+        let Some(id) = hit else {
+            return;
+        };
+        let took = match self.arena.slot_mut(id).and_then(|s| s.widget.as_mut()) {
+            Some(w) => {
+                let any = w.as_any_mut();
+                if let Some(icon) = any.downcast_mut::<crate::widgets::Icon>() {
+                    icon.take_fallback()
+                } else if let Some(b) = any.downcast_mut::<crate::widgets::Button<S>>() {
+                    b.take_icon_fallback()
+                } else {
+                    false
+                }
+            }
+            None => false,
+        };
+        if took {
+            // Through the **normal paint path**, deliberately: an
+            // out-of-band `SetIcon` would leave the slot's cached name
+            // saying the old one, so the next repaint would diff against
+            // a lie and re-send the name that just failed. Marking the
+            // widget is how every other state change in this toolkit
+            // reaches the wire, and it makes the retry idempotent.
+            self.mark(id, Dirty::PAINT);
         }
     }
 
@@ -4048,25 +4026,6 @@ fn clamp_max(v: f32, min: Option<f32>, max: Option<f32>) -> f32 {
         v = v.max(m);
     }
     v
-}
-
-/// The text between the first pair of `"` in `s`, if there is one.
-///
-/// The one thing [`Ui::bad_icon`] reads out of an error's prose, and it
-/// is deliberately the *quoted* part rather than a pattern over the
-/// sentence: the server writes `no icon named "foo"` with `{name:?}`, and
-/// a future rewording — a translation, an added hint — leaves the quoting
-/// alone. A message with no quotes answers `None`, which is the cue to
-/// fall back to the broader match rather than to match nothing.
-///
-/// It does not un-escape: `{:?}` escapes a `"` inside a name as `\"`, and
-/// a name containing a quote would therefore be truncated here. That is
-/// the right failure — it ends in the broad path, which is bounded — and
-/// unescaping would be a second, subtler parser of a field documented as
-/// never parsed.
-fn quoted(s: &str) -> Option<&str> {
-    let rest = s.split_once('"')?.1;
-    rest.split_once('"').map(|(name, _)| name)
 }
 
 /// The only handle through which a widget's properties change.

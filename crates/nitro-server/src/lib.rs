@@ -9168,30 +9168,40 @@ impl Server {
 /// needs to be written down somewhere a reader will find it — see
 /// `docs/icons.md`.
 ///
+/// Two forms of the same fact, chosen per client:
+///
+/// * a client that listed `ICONS` in its `ClientCaps` gets
+///   `IconRefused { serial, node, name }` (0x8303), which names the node
+///   so a toolkit can route the failure to the widget that asked;
+/// * any other client gets `Error { BadIcon, "no icon named \"…\"" }`,
+///   exactly as before `IconRefused` existed — it may not know the op,
+///   and an unknown op is fatal to it (`docs/wire.md` § Capability
+///   opt-in, rule 1).
+///
 /// Sent *after* the transaction was applied, like `TextMetrics`, so a
 /// client sees the whole commit take effect before the complaint about
 /// one node of it.
 fn report_bad_icons(client: &mut clients::WireClient, serial: u32, bad: Vec<(NodeId, String)>) {
+    let opted_in = client.client_caps & nitro_wire::types::caps::ICONS != 0;
     for (node, name) in bad {
         warn!(
             "client {}: node {} asked for unknown icon {name:?}",
             client.id.0,
             node.raw()
         );
-        client.send(&ServerMsg::Error(msg::Error {
-            serial,
-            code: ErrorCode::BadIcon,
-            // **The quoting here is parsed by the toolkit.** `nitro-ui`'s
-            // `quoted()` (`crates/nitro-ui/src/ui.rs`) pulls the icon name
-            // back out of this string to route the failure to the widget
-            // that asked, because `Error` carries no node id. So this
-            // format string is load-bearing prose: do not reword or
-            // re-quote it. The replacement exists on the wire as
-            // `ServerMsg::IconRefused { serial, node, name }` (0x8303,
-            // M5-A/#3767) and task **#3786** switches both ends over to
-            // it — after which this comment and the parser both go.
-            msg: format!("no icon named {name:?}"),
-        }));
+        if opted_in {
+            client.send(&ServerMsg::IconRefused(msg::IconRefused {
+                serial,
+                node,
+                name,
+            }));
+        } else {
+            client.send(&ServerMsg::Error(msg::Error {
+                serial,
+                code: ErrorCode::BadIcon,
+                msg: format!("no icon named {name:?}"),
+            }));
+        }
     }
 }
 

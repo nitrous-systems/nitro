@@ -403,17 +403,18 @@ icon("firefox").coloured()
 
 `.fallback(name)` is the same-tint shorthand, right for a theme icon
 falling back to a more generic theme icon. Both are **exactly once**: the
-server's `BadIcon` re-sends through the normal paint path, and a
-`BadIcon` for the fallback itself is the end of it. `Icon::fell_back()`
+server's refusal (`IconRefused`) re-sends through the normal paint path,
+and a refusal of the fallback itself is the end of it. `Icon::fell_back()`
 is how a test — or a caller — asks which name is actually on screen.
 
-One wrinkle worth knowing, because it shows in the code and will look
-like a shortcut otherwise: `Error { BadIcon }` carries **no node id**, so
-the toolkit routes it to a widget by parsing the quoted icon name out of
-the error's message and offering the fallback to every widget whose slot
-holds a `SetIcon` for that name. It is honest and bounded, and it is a
-weaker guarantee than the wire could give — issue #564 is the wire change
-that would fix it.
+The refusal is routed **by node id**: `Ui::open_window` lists `ICONS`
+in `ClientCaps`, so the server answers an unknown name with
+`IconRefused { node, name }` rather than `Error { BadIcon }`, and the
+toolkit hands it to the one widget whose paint slot owns that node and
+still shows that name. Two icons refused in one commit, or two widgets
+asking for the same name of which only one is refused, each reach the
+right widget. `Error.msg` is never parsed; a stray `Error { BadIcon }` is
+logged and otherwise ignored.
 
 **`Button::icon` is the same guard with a better fallback.** A button
 given an icon falls back to painting its *label* when the server has

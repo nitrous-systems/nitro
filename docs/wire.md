@@ -383,7 +383,7 @@ an app because one of its widgets named an icon a newer set has.
 | `BadBuffer` | 5 | unknown buffer, or fd/size/stride inconsistent with the declared geometry |
 | `Limit` | 6 | a protocol limit was exceeded |
 | `Version` | 7 | the client asked for a version the server does not speak |
-| `BadIcon` | 8 | `SetIcon` named an icon the server does not have — **not fatal** |
+| `BadIcon` | 8 | `SetIcon` named an icon the server does not have — **not fatal**; a client that listed `ICONS` in `ClientCaps` is told by [`IconRefused`](#iconrefused--0x8303) instead |
 
 ## Enumerations
 
@@ -1212,7 +1212,9 @@ from the theme directory that matches the device size (a 48 px file for a
 24-logical icon on a 2× output) and resampled once into a cached tile.
 Neither is a doubled 16 px bitmap.
 
-An **unknown name** earns `Error { BadIcon }` and the node draws nothing;
+An **unknown name** earns `Error { BadIcon }` — or, for a client that
+listed `ICONS` in its `ClientCaps`, [`IconRefused`](#iconrefused--0x8303)
+naming the node — and the node draws nothing;
 the connection survives. It covers both sets: a symbolic name the server
 does not have and an application name the machine's theme does not have
 are the same answer, because from the client's side they are the same
@@ -1802,10 +1804,14 @@ single named exception to "`ClientCaps` governs bits 8 and above".
 Non-fatal, exactly as `Error { BadIcon }` is: the node draws nothing and
 the connection stays up.
 
-**Not yet sent by the server.** M5-A ships the message, its layout and
-this section; switching `report_bad_icons` over to it, and deleting the
-toolkit's parser of `Error.msg`, is task **#3786**. Until that lands every
-client still receives `Error { BadIcon }`, whatever its `ClientCaps` says.
+**Which form a client gets.** The server picks per client, per refusal:
+one whose current `ClientCaps` lists `ICONS` receives `IconRefused` and
+**no** `Error`; any other receives `Error { BadIcon }` with the prose
+unchanged (`no icon named "…"`). One message per refused node, in the
+order the nodes appeared in the transaction, sent after the transaction
+was applied. `nitro-ui` always lists `ICONS` and routes the refusal to
+the widget that owns `node` (checking `name` too, against a recycled node
+id); nothing in the tree parses `Error.msg`.
 
 *(0x8304 is deliberately unassigned.)*
 
@@ -2894,7 +2900,8 @@ to.
   text ops rode `TEXT`. What makes it safe is `ClientCaps`: a client that
   lists `ICONS` is by construction new enough to know the message, and one
   that lists nothing keeps receiving `Error { BadIcon }` verbatim, prose
-  and all. (The alternative — adding a node id to `Error` in place — would
+  and all — the old path is **retained, not replaced**, so an old client
+  is unaffected (the server switched over in #3786). (The alternative — adding a node id to `Error` in place — would
   have been a bump: `Error` is an unprivileged message any ordinary client
   receives.)
 

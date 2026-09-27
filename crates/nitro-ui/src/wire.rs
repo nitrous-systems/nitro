@@ -135,14 +135,11 @@ impl PaintSlot {
     /// The icon name this slot last painted, or `None` if it painted
     /// something else.
     ///
-    /// The only window the rest of the toolkit has onto *which* icon a
-    /// widget asked for, and it exists for exactly one caller:
-    /// [`Ui::dispatch`](crate::Ui::dispatch) routing an
-    /// `Error { BadIcon }` back to the widget that earned it. That
-    /// message carries a serial and a sentence and **no node id** (see
-    /// `nitro_wire::msg::Error`), so the only thing a client can key on
-    /// is the name — and the last `SetIcon` per slot is where the names
-    /// that are currently on the wire live.
+    /// Read by `Ui::icon_refused`, which routes an `IconRefused` by its
+    /// node id and checks this name as well: a node id may have been
+    /// recycled between the `SetIcon` and the reply, and a refusal for a
+    /// name this slot no longer shows is stale. Nothing parses
+    /// `Error.msg`.
     pub(crate) fn icon_name(&self) -> Option<&str> {
         self.icon.as_ref().map(|i| i.name.as_str())
     }
