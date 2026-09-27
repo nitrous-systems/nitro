@@ -12,9 +12,11 @@ use std::time::{Duration, Instant};
 use nitro_amp::engine::State;
 use nitro_amp::vis::{Mode, Vis};
 use nitro_amp::{Amp, Config, build, wav};
+use nitro_ui::event::key;
+use nitro_ui::picker::Picker;
 use nitro_ui::test::Harness;
 use nitro_ui::widgets::{Label, Slider};
-use nitro_ui::{List, Size, WidgetId};
+use nitro_ui::{List, Size, WidgetId, WindowId};
 
 struct TempDir(PathBuf);
 
@@ -127,6 +129,8 @@ fn every_control_is_named_for_hey() {
         "playlist",
         "path",
         "add",
+        "add_files",
+        "add_folder",
         "remove",
         "clear",
         "total",
@@ -423,4 +427,247 @@ fn state_survives_a_restart() {
     assert!(h.ui().is_collapsed(eq), "the fold is remembered");
     let id = named(&mut h, "volume");
     assert!((h.widget::<Slider<Amp>>(id).value() - 40.0).abs() < f32::EPSILON);
+}
+
+// -- the file dialog --------------------------------------------------
+
+/// A widget in the file dialog, the app's second window.
+fn picker(h: &mut Harness<Amp>, name: &str) -> WidgetId {
+    nitro_ui::introspect::resolve(h.ui(), &format!("window[1]/{name}"))
+        .unwrap_or_else(|| panic!("no dialog widget named {name}"))
+}
+
+/// Invoke `action` on a widget of the file dialog.
+fn act_picker(h: &mut Harness<Amp>, name: &str, action: &str, arg: Option<&str>) {
+    let id = picker(h, name);
+    let (ui, state) = h.parts();
+    ui.action(state, id, action, arg)
+        .unwrap_or_else(|e| panic!("{name} {action}: {e}"));
+    h.settle();
+}
+
+/// The open dialog's window: the app's second, and only other, one.
+fn dialog(h: &mut Harness<Amp>) -> WindowId {
+    let wins = h.ui().windows();
+    assert_eq!(wins.len(), 2, "exactly one dialog is open");
+    wins[1]
+}
+
+fn dialog_picker(h: &mut Harness<Amp>) -> (Option<PathBuf>, bool, Vec<String>) {
+    let win = dialog(h);
+    let root = h.ui().root_of(win).expect("the dialog's root");
+    let p = h.widget::<Picker<Amp>>(root);
+    (
+        p.cwd().map(Path::to_path_buf),
+        p.scanning(),
+        p.shown().into_iter().map(str::to_owned).collect(),
+    )
+}
+
+/// Point the open dialog at `dir` through its path bar, and wait for it
+/// to list it.
+fn pick_in(h: &mut Harness<Amp>, dir: &Path) -> Vec<String> {
+    act_picker(
+        h,
+        "picker_path",
+        "set_text",
+        Some(&dir.display().to_string()),
+    );
+    run_until(h, "the dialog to list the directory", |h| {
+        let (cwd, scanning, _) = dialog_picker(h);
+        cwd.as_deref() == Some(dir) && !scanning
+    });
+    dialog_picker(h).2
+}
+
+fn titles(h: &Harness<Amp>) -> Vec<String> {
+    h.state()
+        .playlist()
+        .entries()
+        .iter()
+        .map(|e| e.title.clone())
+        .collect()
+}
+
+#[test]
+fn eject_opens_files_and_replaces_the_playlist() {
+    let d = TempDir::new("eject");
+    let old = TempDir::new("eject-old");
+    let before = tone(&old.0, "old.wav", 0.05);
+    tone(&d.0, "a.wav", 0.05);
+    tone(&d.0, "b.wav", 0.05);
+    std::fs::write(d.0.join("notes.txt"), "not audio").unwrap();
+    let mut h = harness();
+    add(&mut h, &before);
+    act(&mut h, "eject", "activate", None);
+    let win = dialog(&mut h);
+    assert_eq!(h.ui().window_title_of(win), "Open Files");
+    assert_eq!(
+        pick_in(&mut h, &d.0),
+        ["a.wav", "b.wav"],
+        "the .txt is filtered out"
+    );
+
+    act_picker(&mut h, "picker_list", "select", Some("0"));
+    h.key_with(key::LEFT_SHIFT, key::DOWN);
+    act_picker(&mut h, "picker_ok", "click", None);
+    assert!(!h.ui().has_window(win), "the dialog closed");
+    assert_eq!(titles(&h), ["a", "b"], "the old list is gone");
+    run_until(&mut h, "playing", |h| h.state().status().token > 0);
+    assert_eq!(h.state().playlist().current(), Some(0));
+    run_until(&mut h, "the list to finish", |h| !h.state().is_ticking());
+}
+
+#[test]
+fn add_folder_appends_every_playable_track() {
+    let d = TempDir::new("addfolder");
+    let first = tone(&d.0, "0_first.wav", 0.05);
+    let music = d.0.join("music");
+    std::fs::create_dir_all(music.join("sub")).unwrap();
+    tone(&music, "a.wav", 0.05);
+    tone(&music, "b.wav", 0.05);
+    tone(&music.join("sub"), "c.wav", 0.05);
+    std::fs::write(music.join("cover.txt"), "not audio").unwrap();
+    let mut h = harness();
+    add(&mut h, &first);
+    act(&mut h, "add_folder", "activate", None);
+    let win = dialog(&mut h);
+    assert_eq!(h.ui().window_title_of(win), "Add Folders");
+    pick_in(&mut h, &music);
+    // Nothing selected: Select answers the folder on screen.
+    act_picker(&mut h, "picker_ok", "click", None);
+    assert!(!h.ui().has_window(win));
+    assert_eq!(titles(&h), ["0 first", "a", "b", "c"]);
+    assert_eq!(text(&mut h, "total"), "4 tracks  0:00+");
+    assert_eq!(h.state().status().token, 0, "adding plays nothing");
+}
+
+#[test]
+fn add_files_appends_what_was_picked() {
+    let d = TempDir::new("addfiles");
+    let first = tone(&d.0, "0_first.wav", 0.05);
+    tone(&d.0, "a.wav", 0.05);
+    let mut h = harness();
+    add(&mut h, &first);
+    act(&mut h, "add_files", "activate", None);
+    let win = dialog(&mut h);
+    assert_eq!(h.ui().window_title_of(win), "Add Files");
+    assert_eq!(pick_in(&mut h, &d.0), ["0_first.wav", "a.wav"]);
+    let list = picker(&mut h, "picker_list");
+    let (ui, st) = h.parts();
+    ui.action(st, list, "activate", Some("1")).unwrap();
+    h.settle();
+    assert_eq!(titles(&h), ["0 first", "a"]);
+    assert_eq!(h.state().status().token, 0);
+}
+
+#[test]
+fn ctrl_o_opens_one_dialog_and_cancel_changes_nothing() {
+    let d = TempDir::new("ctrlo");
+    let f = tone(&d.0, "t.wav", 0.05);
+    let mut h = harness();
+    add(&mut h, &f);
+    let vis = named(&mut h, "vis");
+    h.ui().focus(vis);
+    h.key_with(key::LEFT_CTRL, 24); // Ctrl+O
+    let win = dialog(&mut h);
+    // A second request while one is up opens nothing more.
+    act(&mut h, "add_folder", "activate", None);
+    assert_eq!(h.ui().windows().len(), 2);
+    assert!(text(&mut h, "status").contains("already open"));
+
+    act_picker(&mut h, "picker_cancel", "click", None);
+    assert!(!h.ui().has_window(win));
+    assert_eq!(titles(&h), ["t"], "a cancel changes nothing");
+
+    // Shift+L asks for a folder.
+    // A click gives the main window the server's keyboard focus back.
+    h.click(vis);
+    h.ui().focus(vis);
+    h.key_with(key::LEFT_SHIFT, key::L);
+    let win = dialog(&mut h);
+    assert_eq!(h.ui().window_title_of(win), "Open Folder");
+    h.key_in(win, key::ESC);
+    assert!(!h.ui().has_window(win));
+    assert_eq!(h.ui().windows().len(), 1);
+}
+
+#[test]
+fn the_players_keys_stay_out_of_the_dialog() {
+    let d = TempDir::new("leak");
+    let f = tone(&d.0, "t.wav", 0.05);
+    let mut h = harness();
+    add(&mut h, &f);
+    act(&mut h, "eject", "activate", None);
+    let win = dialog(&mut h);
+    let vol = h.state().volume();
+    let (list_len, shuffle) = (h.state().playlist().len(), h.state().playlist().shuffle());
+    // Keys the dialog's list does not take fall through to the app's
+    // handlers: none of them may reach the player.
+    for k in [45, 31, key::DELETE, key::UP, key::DOWN, key::LEFT] {
+        h.key_in(win, k);
+    }
+    h.key(45); // x, through the server to whichever window it focused
+    assert!((h.state().volume() - vol).abs() < f32::EPSILON);
+    assert_eq!(h.state().playlist().len(), list_len);
+    assert_eq!(h.state().playlist().shuffle(), shuffle);
+    assert_eq!(h.state().status().token, 0, "nothing started playing");
+    assert!(h.ui().has_window(win));
+}
+
+#[test]
+fn a_folder_without_audio_is_reported_and_replaces_nothing() {
+    let d = TempDir::new("noaudio");
+    let f = tone(&d.0, "t.wav", 0.05);
+    let empty = d.0.join("docs");
+    std::fs::create_dir_all(&empty).unwrap();
+    std::fs::write(empty.join("readme.txt"), "not audio").unwrap();
+    let mut h = harness();
+    add(&mut h, &f);
+    let vis = named(&mut h, "vis");
+    h.ui().focus(vis);
+    h.key_with(key::LEFT_SHIFT, key::L);
+    pick_in(&mut h, &empty);
+    act_picker(&mut h, "picker_ok", "click", None);
+    assert_eq!(h.ui().windows().len(), 1);
+    assert_eq!(titles(&h), ["t"], "the list is kept");
+    assert!(text(&mut h, "status").contains("no audio files there"));
+}
+
+#[test]
+fn the_dialog_starts_where_the_last_pick_was_made() {
+    let d = TempDir::new("lastdir");
+    let music = d.0.join("music");
+    std::fs::create_dir_all(&music).unwrap();
+    tone(&music, "a.wav", 0.05);
+    let config = Config {
+        state_dir: Some(d.0.join("conf")),
+        ..Config::headless()
+    };
+    {
+        let mut h = harness_with(config.clone());
+        act(&mut h, "add_folder", "activate", None);
+        pick_in(&mut h, &music);
+        act_picker(&mut h, "picker_ok", "click", None);
+        assert_eq!(titles(&h), ["a"]);
+    }
+    let mut h = harness_with(config);
+    act(&mut h, "add_files", "activate", None);
+    run_until(&mut h, "the dialog to list", |h| !dialog_picker(h).1);
+    assert_eq!(dialog_picker(&mut h).0.as_deref(), Some(music.as_path()));
+    assert_eq!(dialog_picker(&mut h).2, ["a.wav"]);
+}
+
+#[test]
+fn paths_from_the_command_line_fill_the_list_and_play() {
+    let d = TempDir::new("argv");
+    tone(&d.0, "a.wav", 0.05);
+    tone(&d.0, "b.wav", 0.05);
+    let mut amp = Amp::new(Config::headless()).unwrap();
+    amp.add_paths(std::slice::from_ref(&d.0));
+    amp.start_on_open();
+    let mut h = Harness::new("amp", amp, build);
+    assert_eq!(titles(&h), ["a", "b"]);
+    run_until(&mut h, "playing", |h| h.state().status().token > 0);
+    run_until(&mut h, "the list to finish", |h| !h.state().is_ticking());
 }

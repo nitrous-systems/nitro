@@ -22,7 +22,7 @@
 //! ├──────────────────────────────────────────────┤
 //! │ ► 1. First song                         3:12 │  playlist
 //! │   2. Second song                        4:05 │
-//! │ [ file, folder, playlist or URL ] Add Rm Clr │
+//! │ [ path or URL ] Add Files Folder Rm Clr      │
 //! └──────────────────────────────────────────────┘
 //! ```
 //!
@@ -58,6 +58,9 @@
 //! ```text
 //! hey nitro-amp do window/path set_text ~/Music
 //! hey nitro-amp do window/add click
+//! hey nitro-amp do window/add_folder click
+//! hey nitro-amp do window[1]/picker_path set_text ~/Music
+//! hey nitro-amp do window[1]/picker_ok click
 //! hey nitro-amp do window/play click
 //! hey nitro-amp get window/title value
 //! hey nitro-amp do window/volume set_value 60
@@ -65,14 +68,28 @@
 //! hey nitro-amp do window/vis set_value scope
 //! ```
 //!
+//! # Opening files
+//!
+//! Winamp's split: *Open* — the eject button, `l`, `Ctrl+O` — shows a
+//! [`nitro_ui::FilePicker`] for audio files and **replaces** the
+//! playlist with what was picked, then plays it; `Shift+L` or
+//! `Ctrl+Shift+O` does the same with a folder, and every playable track
+//! under it. The playlist editor's *add files* and *add folder* buttons
+//! **append** instead, and play nothing. One dialog at a time: asking
+//! for another while one is up only says so on the status line. The
+//! dialog starts where the last pick was made, remembered across runs.
+//! The path field (`Ctrl+L`) still takes a path or a URL typed out.
+//!
 //! # Keys
 //!
 //! Winamp's: `z` previous, `x` play, `c` pause, `v` stop, `b` next,
-//! `l` to open (the path field), `s` shuffle, `r` repeat, `←`/`→` seek
-//! five seconds, `↑`/`↓` volume — each only when no widget wanted the
-//! key (a focused slider keeps its arrows). `Ctrl+T` flips the clock,
-//! `Alt+G` the equaliser, `Alt+E` the playlist, `Delete` removes the
-//! selected track and `Ctrl+Q` quits.
+//! `l` open files, `Shift+L` open a folder, `s` shuffle, `r` repeat,
+//! `←`/`→` seek five seconds, `↑`/`↓` volume — each only when no widget
+//! wanted the key (a focused slider keeps its arrows), and only in the
+//! player's own window, never in the file dialog. `Ctrl+O` /
+//! `Ctrl+Shift+O` open files / a folder, `Ctrl+L` focuses the path
+//! field, `Ctrl+T` flips the clock, `Alt+G` the equaliser, `Alt+E` the
+//! playlist, `Delete` removes the selected track and `Ctrl+Q` quits.
 
 pub mod dsp;
 pub mod engine;
@@ -93,7 +110,10 @@ use nitro_ui::widgets::{
     Checkbox, Label, Slider, TextField, button, checkbox, column, label, panel, row, slider,
     spacer, text_field,
 };
-use nitro_ui::{App, ColorRole, CrossAlign, List, ListModel, Row, Size, Ui, WidgetId, list};
+use nitro_ui::{
+    App, ColorRole, CrossAlign, FilePicker, List, ListModel, Row, Size, Ui, WidgetId, WindowId,
+    list,
+};
 
 use crate::dsp::{EQ_LABELS, EQ_RANGE_DB, EqSettings, PRESETS};
 use crate::engine::{Cmd, Player, State, Status};
@@ -141,7 +161,25 @@ mod code {
     pub const T: u32 = 20;
     /// `KEY_G`.
     pub const G: u32 = 34;
+    /// `KEY_O`.
+    pub const O: u32 = 24;
 }
+
+/// What the file dialog offers first. `source.rs` plays whatever
+/// `ffmpeg` decodes, so this is a convenience, not a gate: "All files"
+/// is always there too. `audio/*` covers the tracker formats
+/// (`audio/x-it`, `audio/x-mod`, …) and, in freedesktop's `globs2`, the
+/// playlists; `WebM` is filed under video. A folder is scanned by
+/// [`playlist::AUDIO_EXTENSIONS`] instead.
+const AUDIO_MIMES: &[&str] = &["audio/*", "video/webm"];
+
+/// The playlist formats [`playlist::expand`] reads, as MIME types.
+const PLAYLIST_MIMES: &[&str] = &[
+    "audio/x-mpegurl",
+    "audio/mpegurl",
+    "application/vnd.apple.mpegurl",
+    "audio/x-scpls",
+];
 
 /// Everything decided at start-up that the tests want to decide
 /// differently.
@@ -276,6 +314,10 @@ pub struct Amp {
     shown: Shown,
     state_dir: Option<PathBuf>,
     output: Output,
+    /// The file dialog, while one is open: there is only ever one.
+    picker: Option<WindowId>,
+    /// Where the last pick was made, and where the next dialog starts.
+    last_dir: Option<PathBuf>,
 }
 
 /// Which of the docked sections are unfolded.
@@ -337,6 +379,8 @@ impl Amp {
             shown: Shown::default(),
             state_dir: config.state_dir,
             output,
+            picker: None,
+            last_dir: None,
         };
         amp.restore();
         amp.player.send(Cmd::Volume(amp.volume));
@@ -415,6 +459,7 @@ impl Amp {
                 ("show.eq", _) => self.shown_sections.eq = v != "0",
                 ("show.pl", _) => self.shown_sections.pl = v != "0",
                 ("list.extra", Some(f)) => self.list_extra = f.clamp(-1_000.0, 10_000.0),
+                ("dir", _) if !v.is_empty() => self.last_dir = Some(PathBuf::from(v)),
                 ("current", _) => {
                     if let Ok(i) = v.parse::<usize>() {
                         self.playlist.set_current(i);
@@ -448,7 +493,7 @@ impl Amp {
             "# nitro-amp settings, rewritten on quit\n\
              volume={}\nbalance={}\nremaining={}\nshuffle={}\nrepeat={}\ncurrent={}\n\
              show.eq={}\nshow.pl={}\nlist.extra={}\n\
-             eq.enabled={}\neq.preamp={}\neq.bands={}\n",
+             eq.enabled={}\neq.preamp={}\neq.bands={}\ndir={}\n",
             self.volume,
             self.balance,
             b(self.remaining),
@@ -463,6 +508,9 @@ impl Amp {
             b(self.eq.enabled),
             self.eq.preamp,
             bands.join(","),
+            self.last_dir
+                .as_deref()
+                .map_or_else(String::new, |d| d.display().to_string()),
         );
         let _ = std::fs::write(dir.join("amp.conf"), conf);
     }
@@ -889,6 +937,95 @@ fn add_from_field(s: &mut Amp, ui: &mut Ui<Amp>, text: &str) {
     set_status(ui, s, msg.as_deref());
 }
 
+/// Whether the file dialog is up.
+fn picker_open(s: &Amp, ui: &Ui<Amp>) -> bool {
+    s.picker.is_some_and(|w| ui.has_window(w))
+}
+
+/// Whether a key belongs to the player: the app-level handlers are
+/// offered every key no widget took, the dialog's window included, and
+/// a letter typed at the file dialog is not "pause".
+fn keys_are_ours(s: &Amp, ui: &Ui<Amp>) -> bool {
+    !(picker_open(s, ui) && ui.active_window() != WindowId::MAIN)
+}
+
+/// Show the file dialog: files, or with `folder` a folder, whose
+/// tracks then `replace` the playlist (and play) or are appended.
+fn open_picker(s: &mut Amp, ui: &mut Ui<Amp>, folder: bool, replace: bool) {
+    if picker_open(s, ui) {
+        set_status(ui, s, Some("a file dialog is already open"));
+        return;
+    }
+    let mut p = if folder {
+        FilePicker::folder()
+    } else {
+        FilePicker::open()
+            .filter("Audio", AUDIO_MIMES.iter().copied())
+            .filter("Playlists", PLAYLIST_MIMES.iter().copied())
+    }
+    .multiple(true)
+    .title(match (folder, replace) {
+        (false, true) => "Open Files",
+        (false, false) => "Add Files",
+        (true, true) => "Open Folder",
+        (true, false) => "Add Folders",
+    })
+    .on_done(move |s: &mut Amp, ui: &mut Ui<Amp>, picked| {
+        s.picker = None;
+        if let Some(paths) = picked {
+            add_picked(s, ui, &paths, replace);
+        }
+    });
+    if let Some(d) = s.last_dir.as_ref().filter(|d| d.is_dir()) {
+        p = p.start_dir(d.clone());
+    }
+    match p.open_in(ui) {
+        Ok(w) => s.picker = Some(w),
+        Err(e) => set_status(ui, s, Some(&format!("cannot open a file dialog: {e}"))),
+    }
+}
+
+/// What the dialog answered: every playable track under `paths`, in
+/// place of the playlist (then playing) or after it.
+fn add_picked(s: &mut Amp, ui: &mut Ui<Amp>, paths: &[PathBuf], replace: bool) {
+    let Some(first) = paths.first() else { return };
+    s.last_dir = if first.is_dir() {
+        Some(first.clone())
+    } else {
+        first.parent().map(Path::to_path_buf)
+    };
+    let entries: Vec<Entry> = paths.iter().flat_map(|p| playlist::expand(p)).collect();
+    if entries.is_empty() {
+        // Nothing playable: leave the list alone, even for a replace.
+        let msg = format!("{}: no audio files there", first.display());
+        set_status(ui, s, Some(&msg));
+        return;
+    }
+    if replace {
+        // As `clear_list`: a fresh list, not an edit of the old one.
+        s.playlist.clear();
+        s.player.send(Cmd::Stop);
+        s.playlist.extend(entries);
+        refresh_list(s, ui);
+        s.failures = 0;
+        set_status(ui, s, None);
+        if let Some(i) = s.playlist.first() {
+            load(s, ui, i, true);
+        }
+    } else {
+        edit_list(s, ui, |p| p.extend(entries));
+        set_status(ui, s, None);
+    }
+}
+
+/// Unfold the playlist and put the cursor in the path field.
+fn focus_path(s: &mut Amp, ui: &mut Ui<Amp>) {
+    if let Some(ids) = s.ids {
+        toggle_section(s, ui, false, true);
+        ui.focus(ids.path);
+    }
+}
+
 fn expand_tilde(text: &str) -> PathBuf {
     if let Some(rest) = text.strip_prefix("~/")
         && let Some(home) = std::env::var_os("HOME")
@@ -1157,10 +1294,7 @@ pub fn build(ui: &mut Ui<Amp>) -> WidgetId {
                 skip(s, ui, true);
             }))
             .child(transport("eject", "eject-fill", |s, ui| {
-                if let Some(ids) = s.ids {
-                    toggle_section(s, ui, false, true);
-                    ui.focus(ids.path);
-                }
+                open_picker(s, ui, false, true);
             }))
             .child(spacer().grow(1.0)),
     );
@@ -1326,6 +1460,18 @@ pub fn build(ui: &mut Ui<Amp>) -> WidgetId {
             add_from_field(s, ui, &text);
         },
     ));
+    let add_files = ui.build(
+        button("")
+            .name("add_files")
+            .icon("file-earmark-music")
+            .on_click(|s: &mut Amp, ui: &mut Ui<Amp>| open_picker(s, ui, false, false)),
+    );
+    let add_folder = ui.build(
+        button("")
+            .name("add_folder")
+            .icon("folder2-open")
+            .on_click(|s: &mut Amp, ui: &mut Ui<Amp>| open_picker(s, ui, true, false)),
+    );
     let remove = ui.build(
         button("")
             .name("remove")
@@ -1350,7 +1496,7 @@ pub fn build(ui: &mut Ui<Amp>) -> WidgetId {
             .cross_align(CrossAlign::Center)
             .width_percent(1.0),
     );
-    for c in [path, add, remove, clear, total] {
+    for c in [path, add, add_files, add_folder, remove, clear, total] {
         ui.attach(pl_bar, c).unwrap();
     }
     let pl_section = ui.build(
@@ -1459,28 +1605,54 @@ fn install_keyboard(ui: &mut Ui<Amp>) {
             toggle_section(s, ui, false, show);
         }
     });
-    ui.set_shortcut(mods::NONE, key::DELETE, |s: &mut Amp, ui: &mut Ui<Amp>| {
-        remove_selected(s, ui);
+    ui.set_shortcut(mods::CTRL, code::O, |s: &mut Amp, ui: &mut Ui<Amp>| {
+        open_picker(s, ui, false, true);
     });
-    ui.set_shortcut(mods::NONE, key::LEFT, |s: &mut Amp, ui: &mut Ui<Amp>| {
-        seek_by(s, ui, -SEEK_STEP);
+    ui.set_shortcut(
+        mods::CTRL | mods::SHIFT,
+        code::O,
+        |s: &mut Amp, ui: &mut Ui<Amp>| open_picker(s, ui, true, true),
+    );
+    ui.set_shortcut(mods::CTRL, key::L, |s: &mut Amp, ui: &mut Ui<Amp>| {
+        if keys_are_ours(s, ui) {
+            focus_path(s, ui);
+        }
     });
-    ui.set_shortcut(mods::NONE, key::RIGHT, |s: &mut Amp, ui: &mut Ui<Amp>| {
-        seek_by(s, ui, SEEK_STEP);
-    });
-    ui.set_shortcut(mods::NONE, key::UP, |s: &mut Amp, ui: &mut Ui<Amp>| {
-        let v = s.volume * 100.0 + VOLUME_STEP;
-        set_volume(s, ui, v);
-    });
-    ui.set_shortcut(mods::NONE, key::DOWN, |s: &mut Amp, ui: &mut Ui<Amp>| {
-        let v = s.volume * 100.0 - VOLUME_STEP;
-        set_volume(s, ui, v);
+    // The bare keys below are the player's only in its own window: the
+    // file dialog's leftovers (an arrow its list did not want, Delete)
+    // must not seek, change the volume or drop a track.
+    ui.on_key(|s: &mut Amp, ui: &mut Ui<Amp>, ev: &KeyEvent| {
+        if ev.mods & mods::MASK != mods::NONE || !keys_are_ours(s, ui) {
+            return Handled::No;
+        }
+        match ev.keycode {
+            key::DELETE => remove_selected(s, ui),
+            key::LEFT => seek_by(s, ui, -SEEK_STEP),
+            key::RIGHT => seek_by(s, ui, SEEK_STEP),
+            key::UP => {
+                let v = s.volume * 100.0 + VOLUME_STEP;
+                set_volume(s, ui, v);
+            }
+            key::DOWN => {
+                let v = s.volume * 100.0 - VOLUME_STEP;
+                set_volume(s, ui, v);
+            }
+            _ => return Handled::No,
+        }
+        Handled::Yes
     });
     ui.on_key(|s: &mut Amp, ui: &mut Ui<Amp>, ev: &KeyEvent| {
         // Only unmodified letters: `Ctrl+C` in a text field is not
         // "pause".
-        if ev.mods & (mods::CTRL | mods::ALT) != 0 {
+        if ev.mods & (mods::CTRL | mods::ALT) != 0 || !keys_are_ours(s, ui) {
             return Handled::No;
+        }
+        if ev.keycode == key::L {
+            // `l` opens files, `Shift+L` a folder: by the modifier, not
+            // the text, which Caps Lock also capitalises.
+            let folder = ev.mods & mods::SHIFT != 0;
+            open_picker(s, ui, folder, true);
+            return Handled::Yes;
         }
         match ev.text.as_str() {
             "z" | "Z" => skip(s, ui, false),
@@ -1500,12 +1672,6 @@ fn install_keyboard(ui: &mut Ui<Amp>) {
                 s.playlist.set_repeat(on);
                 if let Some(ids) = s.ids {
                     set_checkbox(ui, ids.repeat, on);
-                }
-            }
-            "l" | "L" => {
-                if let Some(ids) = s.ids {
-                    toggle_section(s, ui, false, true);
-                    ui.focus(ids.path);
                 }
             }
             _ => return Handled::No,

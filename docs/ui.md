@@ -1325,7 +1325,13 @@ FilePicker::open()                 // or ::save("name.txt"), ::folder()
   window: it is not kept above or centred on the app, and the app's own
   window stays usable while it is open.
 
-`crates/nitro-ui/examples/pick.rs` opens each kind from a button.
+* **App shortcuts see the dialog's leftovers.** `on_key` / `set_shortcut`
+  handlers are offered every key no widget took, in any window, so an
+  app with bare-letter or arrow shortcuts should ignore them while
+  `ui.active_window()` is the dialog (nitro-amp's `keys_are_ours`).
+
+`crates/nitro-ui/examples/pick.rs` opens each kind from a button, and
+`nitro-amp` uses it for Open / Add files and folders (`crates/nitro-amp`).
 
 ## Shell surfaces
 

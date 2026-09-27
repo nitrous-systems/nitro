@@ -40,8 +40,23 @@ The one crate this depends on is `nitro-ui`.
 | `c` | pause / resume | `Ctrl+T` | elapsed ↔ remaining |
 | `v` | stop | `Alt+G` | fold the equaliser |
 | `b` | next | `Alt+E` | fold the playlist |
-| `l` | open (the path field) | `Delete` | remove the selected track |
+| `l` / `Ctrl+O` | open files | `Delete` | remove the selected track |
+| `Shift+L` / `Ctrl+Shift+O` | open a folder | `Ctrl+L` | the path field |
 | `s` / `r` | shuffle / repeat | `Ctrl+Q` | quit |
+
+**Opening files** uses the toolkit's file dialog (`nitro_ui::FilePicker`),
+in a second window. As in Winamp, *Open* — the eject button, `l`,
+`Ctrl+O` — **replaces** the playlist with the picked files and plays
+them; `Shift+L` / `Ctrl+Shift+O` does the same with a folder and every
+playable track under it. The playlist editor's *add files* and *add
+folder* buttons **append** instead and play nothing. The file dialog
+offers audio files first (and playlists, and all files); a folder is
+scanned for the extensions `playlist.rs` knows. Picking nothing playable
+says so and leaves the list alone. There is one dialog at a time: asking
+for another while one is up only says so on the status line. It starts
+in the directory of the last pick, remembered across runs (`dir=` in
+`amp.conf`). Paths on the command line and the path field (for URLs)
+still work.
 
 **The window fits what is showing**, as Winamp's docked windows did.
 Fold the playlist away and the window shrinks to the main window and
@@ -52,7 +67,9 @@ height off and leaves the list alone. The folds and the list height are
 remembered across runs.
 
 Letters and arrows only reach the player when no widget wants them: a
-focused slider keeps its arrows, the path field its letters. Clicking the
+focused slider keeps its arrows, the path field its letters — and
+never while the file dialog has the keyboard, so typing there does not
+pause the track. Clicking the
 clock flips it too, and clicking the visualiser cycles spectrum → scope →
 off.
 
@@ -61,6 +78,9 @@ off.
 ```console
 $ hey nitro-amp do window/path set_text ~/Music
 $ hey nitro-amp do window/add click
+$ hey nitro-amp do window/add_folder click     # the file dialog is window[1]
+$ hey nitro-amp do window[1]/picker_path set_text ~/Music
+$ hey nitro-amp do window[1]/picker_ok click
 $ hey nitro-amp do window/play click
 $ hey nitro-amp get window/title value
 1. Artist - Song (4:05)
@@ -74,7 +94,8 @@ $ hey nitro-amp do window/eq click              # fold the equaliser away
 Every control is named: `prev play pause stop next eject`, `seek volume
 balance`, `shuffle repeat eq pl`, `clock` (and its `clock_text`),
 `title info status vis`, `eq_on preamp eq_60 … eq_16k preset_*`,
-`playlist path add remove clear total`.
+`playlist path add add_files add_folder remove clear total`. The file
+dialog's are `window[1]/picker_*` (see `docs/ui.md`).
 
 ## How it is built
 
