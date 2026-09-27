@@ -12,7 +12,7 @@ use std::os::fd::{AsFd, OwnedFd};
 
 use nitro_shm::{
     Errno, MapError, Mapping, MappingMut, REQUIRED_SEALS, SealError, check_seals, create_sealed,
-    memfd_with, sealed_len,
+    memfd_sealed_readonly, memfd_with, sealed_len,
 };
 use rustix::fs::{MemfdFlags, SealFlags, fcntl_add_seals, ftruncate, memfd_create};
 
@@ -203,6 +203,24 @@ fn a_sealed_memfd_is_still_writable() {
     let fd = create_sealed("nitro-shm-writable", LEN as u64).unwrap();
     pwrite_all(&fd, &[0xAB; 16], 0);
     assert_eq!(pread_all(&fd, 16), vec![0xAB; 16]);
+}
+
+/// The read-only variant: its content is final, it still passes the
+/// subset check, and it still maps read-only.
+#[test]
+fn a_readonly_memfd_refuses_writes_but_maps() {
+    let data = noise(LEN, 7);
+    let fd = memfd_sealed_readonly("nitro-shm-ro", &data).unwrap();
+    let seals = rustix::fs::fcntl_get_seals(&fd).unwrap();
+    assert!(seals.contains(REQUIRED_SEALS | SealFlags::WRITE));
+    assert_eq!(check_seals(fd.as_fd()), Ok(()));
+    assert_eq!(
+        rustix::io::pwrite(&fd, &[0u8; 4], 0).map(|_| ()),
+        Err(Errno::PERM)
+    );
+    assert_eq!(pread_all(&fd, LEN), data);
+    let map = Mapping::map(fd, LEN).unwrap();
+    assert_eq!(map.as_bytes(), &data[..]);
 }
 
 // ------------------------------------------------------------- mapping

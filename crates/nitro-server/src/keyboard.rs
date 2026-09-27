@@ -279,6 +279,66 @@ impl Keyboard {
         // regained.
         self.state = xkb::State::new(&self.keymap);
     }
+
+    /// The compiled keymap as the wire's `Keymap` ships it: the
+    /// `XKB_KEYMAP_FORMAT_TEXT_V1` string, NUL-terminated, in a memfd
+    /// sealed against every change including writes.
+    ///
+    /// One file per keymap, not per client: `Keymap::encode_body` `dup`s
+    /// the descriptor per send, and because the file is write-sealed
+    /// ([`nitro_shm::memfd_sealed_readonly`]) no client holding it can
+    /// change what another one maps. `None` on a size overflow or a
+    /// memfd failure; the caller logs it.
+    #[must_use]
+    pub fn export(&self) -> Option<KeymapFd> {
+        let mut bytes = self
+            .keymap
+            .get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)
+            .into_bytes();
+        // Chromium (and every Wayland client) maps `size` bytes and hands
+        // them to `xkb_keymap_new_from_buffer` expecting a C string.
+        bytes.push(0);
+        let size = u32::try_from(bytes.len()).ok()?;
+        let fd = nitro_shm::memfd_sealed_readonly("nitro-keymap", &bytes).ok()?;
+        Some(KeymapFd { fd, size })
+    }
+
+    /// The four masks the wire's `Modifiers` carries, as xkb serializes
+    /// them. These are *keymap-relative* bit positions, meaningless
+    /// without the [`Keyboard::export`]ed keymap they belong to — which is
+    /// why [`Mods`] stays the compositor's own shape.
+    #[must_use]
+    pub fn mod_masks(&self) -> ModMasks {
+        ModMasks {
+            depressed: self.state.serialize_mods(xkb::STATE_MODS_DEPRESSED),
+            latched: self.state.serialize_mods(xkb::STATE_MODS_LATCHED),
+            locked: self.state.serialize_mods(xkb::STATE_MODS_LOCKED),
+            group: self.state.serialize_layout(xkb::STATE_LAYOUT_EFFECTIVE),
+        }
+    }
+}
+
+/// The compiled keymap in a sealed memfd, as the wire ships it.
+#[derive(Debug)]
+pub struct KeymapFd {
+    /// Sealed (and write-sealed) memfd; `PROT_READ | MAP_PRIVATE` on the
+    /// client side.
+    pub fd: std::os::fd::OwnedFd,
+    /// Bytes to map, **including** the trailing NUL.
+    pub size: u32,
+}
+
+/// The four masks `Modifiers` carries, as xkb serializes them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ModMasks {
+    /// Modifiers held down.
+    pub depressed: u32,
+    /// Modifiers latched for the next key.
+    pub latched: u32,
+    /// Modifiers locked (Caps Lock, Num Lock).
+    pub locked: u32,
+    /// Effective layout (group) index.
+    pub group: u32,
 }
 
 /// Read one `XKB_DEFAULT_*` variable, mapping unset (and empty) to the
@@ -456,7 +516,7 @@ pub fn is_escape(keysym: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Hotkey, Keyboard, Mods, hotkey, is_alt, is_escape, mod_of_keysym};
+    use super::{Hotkey, Keyboard, ModMasks, Mods, hotkey, is_alt, is_escape, mod_of_keysym};
     use xkbcommon::xkb;
 
     #[test]
@@ -698,5 +758,57 @@ mod tests {
             return;
         };
         assert!(!kb.layout_names().is_empty());
+    }
+
+    const EVDEV_CAPSLOCK: u32 = 58;
+
+    /// The exported keymap is a NUL-terminated string xkb compiles back,
+    /// and it names every modifier Chromium looks up by name
+    /// (`xkb_modifier_converter.cc`) — a renamed one would silently lose
+    /// that modifier in the client.
+    #[test]
+    fn the_exported_keymap_compiles_and_names_chromiums_modifiers() {
+        let Some(kb) = Keyboard::new() else {
+            return;
+        };
+        let km = kb.export().expect("export");
+        let len = usize::try_from(km.size).unwrap();
+        let seals = rustix::fs::fcntl_get_seals(&km.fd).unwrap();
+        assert!(seals.contains(rustix::fs::SealFlags::WRITE));
+        let map = nitro_shm::Mapping::map(km.fd, len).unwrap();
+        let bytes = map.as_bytes();
+        assert_eq!(bytes.last(), Some(&0));
+        let text = std::str::from_utf8(&bytes[..len - 1]).unwrap().to_owned();
+        let ctx = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let back = xkb::Keymap::new_from_string(
+            &ctx,
+            text,
+            xkb::KEYMAP_FORMAT_TEXT_V1,
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .expect("the exported keymap compiles");
+        for name in [
+            "Shift", "Control", "Mod1", "Mod4", "Mod5", "Mod3", "Lock", "Mod2",
+        ] {
+            assert_ne!(back.mod_get_index(name), xkb::MOD_INVALID, "{name}");
+        }
+    }
+
+    #[test]
+    fn the_masks_split_held_from_locked() {
+        let Some(mut kb) = Keyboard::new() else {
+            return;
+        };
+        assert_eq!(kb.mod_masks(), ModMasks::default());
+        kb.key(EVDEV_LEFTSHIFT, true);
+        let m = kb.mod_masks();
+        assert_ne!(m.depressed, 0);
+        assert_eq!(m.locked, 0);
+        kb.key(EVDEV_LEFTSHIFT, false);
+        kb.key(EVDEV_CAPSLOCK, true);
+        kb.key(EVDEV_CAPSLOCK, false);
+        let m = kb.mod_masks();
+        assert_eq!(m.depressed, 0);
+        assert_ne!(m.locked, 0);
     }
 }

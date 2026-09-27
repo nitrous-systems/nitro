@@ -752,6 +752,114 @@ fn a_keyboard_layout_change_takes_effect_on_reload() {
     h.quit();
 }
 
+/// Whether `layout` compiles to a keymap whose layout name mentions
+/// `description`. `layout_names()` reports xkb's descriptive names
+/// ("German"), not the RMLVO code, so [`has_layout`]'s exact match cannot
+/// be used to guard a test that must actually run.
+fn has_layout_named(layout: &str, description: &str) -> bool {
+    use nitro_server::config::KeyboardSettings;
+    let settings = KeyboardSettings {
+        layout: Some(layout.to_owned()),
+        ..KeyboardSettings::default()
+    };
+    nitro_server::keyboard::Keyboard::with_settings(&settings)
+        .is_some_and(|kb| kb.layout_names().iter().any(|n| n.contains(description)))
+}
+
+/// The received keymap of a `Keymap` message, compiled.
+fn received_keymap(km: &nitro_wire::msg::Keymap) -> xkbcommon::xkb::Keymap {
+    use xkbcommon::xkb;
+    let fd = rustix::io::dup(&km.fd).unwrap();
+    let len = usize::try_from(km.size).unwrap();
+    let map = nitro_shm::Mapping::map(fd, len).expect("mappable");
+    let text = std::str::from_utf8(&map.as_bytes()[..len - 1])
+        .unwrap()
+        .to_owned();
+    xkb::Keymap::new_from_string(
+        &xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
+        text,
+        xkb::KEYMAP_FORMAT_TEXT_V1,
+        xkb::KEYMAP_COMPILE_NO_FLAGS,
+    )
+    .expect("the received keymap compiles")
+}
+
+/// Every `Keymap` in `seen`, in arrival order, compiled.
+fn keymaps(seen: &[ServerMsg]) -> Vec<xkbcommon::xkb::Keymap> {
+    seen.iter()
+        .filter_map(|m| match m {
+            ServerMsg::Keymap(km) => Some(received_keymap(km)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A `KEYMAP` client evaluates the keymap itself, so a layout change is
+/// news to it: the reload re-sends `Keymap`, and the new one is `de`.
+#[test]
+fn a_layout_change_ships_a_new_keymap() {
+    if !has_layout_named("de", "German") {
+        eprintln!("no `de` xkb layout on this box; skipping the keyboard check");
+        return;
+    }
+    let h = Harness::start("kbd-keymap", "keyboard.layout = us\n");
+    let mut seen = Vec::new();
+    let mut conn = h.client("kbd-keymap");
+    conn.client_caps(nitro_wire::types::caps::KEYMAP).unwrap();
+    expect(&mut conn, &mut seen, "the first Keymap", |m| match m {
+        ServerMsg::Keymap(_) => Some(()),
+        _ => None,
+    });
+    let first = keymaps(&seen);
+    assert_eq!(first.len(), 1);
+    assert!(first[0].layouts().any(|l| l.contains("English")));
+
+    h.rewrite_config("keyboard.layout = de\n");
+    assert_eq!(h.request_line("reload\n"), "ok");
+    wait_for("a second Keymap", || {
+        conn.flush().unwrap();
+        let _ = conn.poll(&mut seen);
+        keymaps(&seen).len() >= 2
+    });
+    let all = keymaps(&seen);
+    let names: Vec<String> = all[1].layouts().map(ToOwned::to_owned).collect();
+    assert!(names.iter().any(|l| l.contains("German")), "{names:?}");
+    drop(conn);
+    h.quit();
+}
+
+/// `server.conf`'s keyboard options are in the keymap the client gets —
+/// the client evaluates it now, so an option applied only server-side
+/// would be lost. With `ctrl:nocaps`, Caps Lock is `Control_L`.
+#[test]
+fn keyboard_options_are_in_the_shipped_keymap() {
+    use xkbcommon::xkb;
+    if nitro_server::keyboard::Keyboard::new().is_none() {
+        eprintln!("no xkb keymap data on this box; skipping the keyboard check");
+        return;
+    }
+    let h = Harness::start(
+        "kbd-nocaps",
+        "keyboard.layout = us\nkeyboard.options = ctrl:nocaps\n",
+    );
+    let mut seen = Vec::new();
+    let mut conn = h.client("kbd-nocaps");
+    conn.client_caps(nitro_wire::types::caps::KEYMAP).unwrap();
+    expect(&mut conn, &mut seen, "a Keymap", |m| match m {
+        ServerMsg::Keymap(_) => Some(()),
+        _ => None,
+    });
+    let km = keymaps(&seen).remove(0);
+    let state = xkb::State::new(&km);
+    // evdev 58 is Caps Lock; xkb numbers it +8.
+    assert_eq!(
+        state.key_get_one_sym(xkb::Keycode::new(58 + 8)).raw(),
+        xkb::keysyms::KEY_Control_L
+    );
+    drop(conn);
+    h.quit();
+}
+
 #[test]
 fn garbage_in_the_file_does_not_stop_the_server_or_lose_the_configuration() {
     // A configuration file is user input that arrives while the compositor

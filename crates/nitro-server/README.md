@@ -750,6 +750,18 @@ clock — testable on the fake backend: `FakeSource` is a queue a test
 pushes into, woken through an `eventfd` so the loop sees the same "fd
 readable, then dispatch" shape it sees from libinput.
 
+A client that owns its own `xkb_state` (Chromium) lists `caps::KEYMAP` in
+`ClientCaps` and is sent the compiled keymap itself: `Keymap` carries the
+`XKB_KEYMAP_FORMAT_TEXT_V1` text, NUL-terminated, in one memfd sealed
+against shrink, grow *and* write and shared by every client, re-sent after
+any `keyboard.*` reload, so `server.conf` options such as `ctrl:nocaps` reach
+the client too. `Modifiers` then carries the four xkb masks to the keyboard
+recipient (grab holder, else focus) whenever they change, right after the
+`Key` that changed them, including keys the compositor swallowed.
+Keycodes stay raw evdev; a client that never lists the bit sees exactly the
+`Key` stream it always did. The bit is withheld on a remote link.
+
+
 Keys are translated by xkbcommon against the `XKB_DEFAULT_*` keymap, with
 the evdev-to-XKB `+ 8` offset applied at every boundary and each event
 resolved against the state *before* it is applied (so pressing Shift does
@@ -1183,7 +1195,7 @@ bare-Super tap bound) and two `nitro-calc` windows, driven with `ydotool`.
 
 | what | value |
 |---|---|
-| sockets | `wire.sock`, `shell.sock` and `control.sock` in one `0700` directory; the probe's `Welcome` is `caps=0x32` (`TEXT|WM|SHELL`) and an ordinary client's lacks `SHELL` (both also carry the always-on bits: `THEME`, `ICONS`, `POPUP`, `OUTPUTS`, and `DATA` locally) |
+| sockets | `wire.sock`, `shell.sock` and `control.sock` in one `0700` directory; the probe's `Welcome` carries `SHELL` and an ordinary client's lacks it (both also carry `WM`, `THEME`, `TEXT`, `ICONS`, `POPUP`, `CURSOR`, `DRAG`, `OUTPUTS`, and locally `DATA` and `KEYMAP`) |
 | anchor | asked for 400 px wide, `Configure`d to **1920×32 at (0,0)** and re-`Configure`d after answering — a bar that ignores that `Configure` paints its original width, which is how the probe found the bug below |
 | exclusive zone | a maximized `nitro-calc`'s own title bar starts at **y=33**, with the bar owning y=0..31; the strip is **given back** when the probe is killed (title bar back at y=0..27) |
 | layers | the bar's pixels win over the maximized window's throughout its strip, which is the `Top`-over-`Normal` ordering |

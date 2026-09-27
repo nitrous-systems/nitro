@@ -762,3 +762,14 @@ fn data_is_not_advertised_on_a_remote_link() {
     drop(local);
     h.quit();
 }
+
+/// `KEYMAP` (M5-C) is withheld on a remote link for `DATA`'s reason: the
+/// `Keymap` it promises carries a descriptor.
+#[test]
+fn keymap_is_not_advertised_on_a_remote_link() {
+    let h = Harness::start("keymap", "remote.listen = 127.0.0.1:0\n");
+    let conn = h.remote_client("remote-keymap");
+    assert_eq!(conn.caps() & caps::KEYMAP, 0, "caps = {:#x}", conn.caps());
+    drop(conn);
+    h.quit();
+}

@@ -250,11 +250,14 @@ offer, the MIME list and the descriptor relay are shared, and
 `RequestSelection` names which of the two it means with a one-byte
 `DataSource`. Two bits would mean two copies of the same four messages.
 
-**Of bits 8–14, only `POPUP`, `CURSOR`, `DRAG`, `OUTPUTS` and `DATA` are
-advertised yet**: `POPUP` (M5-G, #3773), `CURSOR` (M5-E, #3771), `DRAG`
-(M5-F, #3772) and `OUTPUTS` (M5-D, #3770) always, `DATA` (M5-H, #3774) on every **local**
+**Of bits 8–14, only `POPUP`, `CURSOR`, `DRAG`, `OUTPUTS`, `KEYMAP` and
+`DATA` are advertised yet**: `POPUP` (M5-G, #3773), `CURSOR` (M5-E, #3771), `DRAG`
+(M5-F, #3772) and `OUTPUTS` (M5-D, #3770) always, `KEYMAP` (M5-C, #3769)
+on every **local** link whose server compiled a keymap, `DATA` (M5-H, #3774) on every **local**
 link and
-never on a remote one — every leg of a transfer carries a descriptor,
+
+never on a remote one (nor `KEYMAP`) — every leg of a transfer carries a descriptor,
+
 which TCP cannot (see [Descriptors on a remote link](#descriptors-on-a-remote-link)).
 The drag half of `DATA` is still refused until M5-I. M5-A froze the protocol surface ahead of the behaviour, deliberately,
 so that the eight follow-up tasks implement against bytes nobody can still
@@ -1612,8 +1615,18 @@ Fixed head **13 bytes**, plus one descriptor. Requires `KEYMAP`.
 
 For a client that owns its own `xkb_state` and must not have the server
 resolve for it. The existing `Key` fields do not change: a toolkit that
-uses `keysym`/`utf8` never negotiates `KEYMAP` and never sees this. Sent
-after the handshake and again on every layout change.
+uses `keysym`/`utf8` never negotiates `KEYMAP` and never sees this.
+
+**When.** Sent on the `ClientCaps` that first lists `KEYMAP`, and again to
+every `KEYMAP` client after each keymap recompile (a `keyboard.*` change on
+config reload). Not right behind `Welcome` as `Theme` is: rule 1 of the
+opt-in forbids a bit-8+ message before the client listed the bit, and
+`ClientCaps` necessarily follows `Welcome` — a client sends it straight
+behind `Hello`, so it is the same round trip. A repeated `ClientCaps` that
+still lists the bit sends nothing. Never on a remote link, where `KEYMAP`
+is not advertised; once advertised, the bit does not retract for the
+session (a failed re-export keeps the previous keymap).
+
 
 **The descriptor.** A **sealed memfd** — `memfd_create(MFD_ALLOW_SEALING)`
 plus `F_ADD_SEALS` with `F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL`, as
@@ -1622,7 +1635,11 @@ plus `F_ADD_SEALS` with `F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL`, as
 string **NUL-terminated**, with `size` counting the NUL. That is Wayland's
 convention, so an adapter is a pass-through. The **server creates it**;
 the **client owns it** once it has decoded the message, and closes it. One
-frame's descriptors per `sendmsg`, header included, as always.
+frame's descriptors per `sendmsg`, header included, as always. The server
+additionally seals it `F_SEAL_WRITE`; a client must not rely on that (it
+maps `MAP_PRIVATE` anyway), but it is what lets one file be shared by every
+client without any of them being able to change what the others map.
+
 
 **`rate_hz` and `delay_ms` are advisory.** They describe the *user's
 preference*, not a server behaviour: nitro synthesises no repeats, so a
@@ -1651,6 +1668,22 @@ straight into the client's own `xkb_state_update_mask`. Sent whenever any
 of them changes, and after every `Keymap`. **Meaningful only against the
 keymap that message carried** — the bit positions depend on it, which is
 why `BindKey` uses `mod_mask` names instead.
+
+**Recipient.** Only the client that keyboard input currently goes to —
+the keyboard-grab holder, else the focused window's owner, each only if
+the session lock admits it — plus the one snapshot after every `Keymap`.
+An unfocused client is not streamed the modifiers the user holds while
+typing elsewhere; it gets a fresh snapshot when it next gains focus. A
+key the compositor or a shell consumed still moves the masks, and they are
+still sent.
+
+**Ordering.** A `Key`'s `keysym`/`utf8` are resolved against the state
+*before* the event; its `mods` and the `Modifiers` that follows it
+describe the state *after*. `Modifiers` follows the `Key` (Wayland's
+order), so a client evaluating the keycode through its own `xkb_state`
+does so before applying the change the key caused, and then converges on
+the server's post-event masks. Unchanged masks are silence.
+
 
 ### `TextMetrics` — 0x8301
 

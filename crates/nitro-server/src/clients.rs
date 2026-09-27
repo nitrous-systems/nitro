@@ -126,11 +126,19 @@ pub struct WireClient {
     /// `ClientCaps` stays a complete declaration. `DRAG` (M5-F) is not
     /// read: it carries no server→client message, and `StartMove` /
     /// `StartResize` are authorized by pointer focus and a held button
-    /// instead. The bits not yet
+    /// instead. `KEYMAP` (M5-C) is read twice: the `ClientCaps` that
+    /// first lists it is what sends the `Keymap` + `Modifiers` snapshot
+    /// (`Server::send_keymap`), and both messages — including the
+    /// re-send after a layout change and every `Modifiers` after a key —
+    /// go only to clients that listed it. The bits not yet
     /// advertised are still recorded, because the rule this exists for
     /// cannot be honoured retroactively by a server that threw the list
     /// away.
     pub client_caps: u32,
+    /// The last `Modifiers` masks sent to this client, so an unchanged
+    /// state is silence. `None` = never sent, or must be re-sent (it lost
+    /// keyboard focus, and missed every change since).
+    pub last_mods: Option<crate::keyboard::ModMasks>,
 }
 
 impl WireClient {
@@ -150,6 +158,7 @@ impl WireClient {
             unpresented: Vec::new(),
             texts: HashMap::new(),
             client_caps: 0,
+            last_mods: None,
         }
     }
 

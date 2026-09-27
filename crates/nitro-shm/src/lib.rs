@@ -213,16 +213,49 @@ pub fn create_sealed(name: &str, len: u64) -> Result<OwnedFd, Errno> {
 /// that accepts nothing will go on accepting nothing.
 pub fn memfd_with(name: &str, pixels: &[u8]) -> Result<OwnedFd, Errno> {
     let fd = create_sealed(name, pixels.len() as u64)?;
+    write_all_at(&fd, pixels)?;
+    Ok(fd)
+}
+
+/// `bytes` in a fresh memfd sealed `F_SEAL_SHRINK | F_SEAL_GROW |
+/// F_SEAL_WRITE | F_SEAL_SEAL`: an **immutable** file.
+///
+/// The other direction from [`memfd_with`]. There the writer is the
+/// client and it keeps writing; here the writer is the *server*, which
+/// hands one file to many mutually-untrusted readers (the xkb keymap,
+/// `Keymap` in `docs/wire.md`). [`REQUIRED_SEALS`] alone would let any of
+/// them `pwrite` through its descriptor and change what every other
+/// reader maps — `MAP_PRIVATE` is copy-on-write only for the mapper's own
+/// writes. `F_SEAL_WRITE` closes that, and since `F_SEAL_SEAL` is added in
+/// the same call it can be neither added late nor removed.
+///
+/// The result still passes [`check_seals`] (which tests a subset) and
+/// maps read-only with [`Mapping`].
+///
+/// # Errors
+/// Any `memfd_create`/`ftruncate`/`pwrite`/`F_ADD_SEALS` failure. The
+/// write seal cannot fail for its usual reason (a live shared writable
+/// mapping): this function never maps the file.
+pub fn memfd_sealed_readonly(name: &str, bytes: &[u8]) -> Result<OwnedFd, Errno> {
+    let fd = rustix::fs::memfd_create(name, MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING)?;
+    rustix::fs::ftruncate(&fd, bytes.len() as u64)?;
+    write_all_at(&fd, bytes)?;
+    rustix::fs::fcntl_add_seals(&fd, REQUIRED_SEALS | SealFlags::WRITE)?;
+    Ok(fd)
+}
+
+/// `pwrite` all of `bytes` at offset 0. A zero-length write is `EIO`.
+fn write_all_at(fd: &OwnedFd, bytes: &[u8]) -> Result<(), Errno> {
     let mut done = 0usize;
-    while done < pixels.len() {
-        match rustix::io::pwrite(&fd, &pixels[done..], done as u64) {
+    while done < bytes.len() {
+        match rustix::io::pwrite(fd, &bytes[done..], done as u64) {
             Ok(0) => return Err(Errno::IO),
             Ok(n) => done += n,
             Err(Errno::INTR) => {}
             Err(e) => return Err(e),
         }
     }
-    Ok(fd)
+    Ok(())
 }
 
 /// The size of the file behind a **sealed** fd.

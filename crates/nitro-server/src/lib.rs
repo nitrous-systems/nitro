@@ -792,6 +792,10 @@ struct Server {
     icons: IconEngine,
     outputs: Vec<OutputState>,
     keyboard: Option<Keyboard>,
+    /// The current keymap as a sealed memfd, for `Keymap` (M5-C). Rebuilt
+    /// with the keymap; never cleared once set, so `caps::KEYMAP` does not
+    /// retract mid-session (see `Server::caps`).
+    keymap_fd: Option<keyboard::KeymapFd>,
     cursor: Cursor,
     pointer: Pointer,
     /// Window-management policy: MRU, focus, drags, placement.
@@ -1151,6 +1155,13 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         Some(kb) => info!("xkb keymap: {}", kb.layout_names().join(", ")),
         None => warn!("no xkb keymap compiled; keys carry no keysym or text"),
     }
+    let keymap_fd = keyboard.as_ref().and_then(|kb| {
+        let fd = kb.export();
+        if fd.is_none() {
+            warn!("xkb keymap export failed; caps::KEYMAP not advertised");
+        }
+        fd
+    });
 
     let listener = control::bind(&config.control_path).map_err(io_err("bind control socket"))?;
     add(&epoll, &listener, TOK_LISTENER)?;
@@ -1202,6 +1213,7 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         },
         outputs: Vec::new(),
         keyboard,
+        keymap_fd,
         cursor: Cursor::new(),
         pointer: Pointer::default(),
         wm: WindowManager::new(),
@@ -2484,6 +2496,7 @@ impl Server {
                     if let Some(kb) = self.keyboard.as_mut() {
                         kb.reset();
                     }
+                    self.sync_modifiers();
                     self.hotkeys.reset();
                     self.hotkey_pending = None;
                     // Held buttons, for the keyboard's reason: a release on
@@ -2871,6 +2884,7 @@ impl Server {
             kb.reset();
         }
         if removed > 0 {
+            self.sync_modifiers();
             self.hotkeys.reset();
             self.hotkey_pending = None;
         }
@@ -3000,9 +3014,23 @@ impl Server {
         // drops the modifiers the user is holding, neither of which a
         // reload that only moved a monitor should cost.
         if keyboard_changed {
+            let mut recompiled = false;
             match Keyboard::with_settings(&self.settings.keyboard) {
                 Some(kb) => {
                     info!("xkb keymap: {}", kb.layout_names().join(", "));
+                    // A failed export keeps the previous file, exactly as a
+                    // failed compile keeps the previous keymap: clearing
+                    // `keymap_fd` would retract `caps::KEYMAP` from under
+                    // connected clients, and one re-sending `ClientCaps`
+                    // (rule 5) would then be disconnected for naming a bit
+                    // it was legitimately granted.
+                    match kb.export() {
+                        Some(fd) => {
+                            self.keymap_fd = Some(fd);
+                            recompiled = true;
+                        }
+                        None => warn!("keymap export failed; clients keep the previous keymap"),
+                    }
                     self.keyboard = Some(kb);
                 }
                 None => warn!("no xkb keymap compiled; keeping the previous one"),
@@ -3016,6 +3044,17 @@ impl Server {
             }
             self.hotkeys.reset();
             self.hotkey_pending = None;
+            // The client now evaluates the keymap itself, so a new one is
+            // news to every `KEYMAP` client; `send_keymap` follows it with
+            // the (reset) masks. Without a fresh export there is nothing new
+            // to ship, but the reset still moved the masks.
+            if recompiled {
+                let tokens: Vec<u64> = self.wire_clients.keys().copied().collect();
+                for token in tokens {
+                    self.send_keymap(token);
+                }
+            }
+            self.sync_modifiers();
         }
 
         // The icon theme, only when it moved, and for the same reason the
@@ -3613,7 +3652,32 @@ impl Server {
         self.set_frame_rect(win, wm::tile_rect(area, left));
     }
 
+    /// One key event: route it, then tell the keyboard recipient what the
+    /// modifiers became.
+    ///
+    /// The sync is here rather than at the end of [`Server::route_key`]
+    /// because that function returns early on every path that consumes
+    /// the key (compositor hotkey, popup Escape, shell binding, the Alt
+    /// release ending a cycle, no recipient, withheld) — and `kb.key()`
+    /// has already moved the xkb state on each of them. No path skips it:
+    /// the masks describe the physical keyboard, and a client whose
+    /// `xkb_state` missed the Ctrl of a swallowed Ctrl+Alt+F1 is the
+    /// stuck-modifier bug `Modifiers` exists to prevent.
+    ///
+    /// Ordering: a `Key`'s `keysym`/`utf8` are resolved against the state
+    /// **before** the event, its `mods` (and the `Modifiers` that follow)
+    /// describe the state **after** it (`Keyboard::key`). `Modifiers`
+    /// follows the `Key` — Wayland's order — so a client evaluating the
+    /// keycode through its own `xkb_state` does so before applying the
+    /// change the key caused, and then converges on the same post-event
+    /// masks the server holds. The recipient is computed *after* routing,
+    /// because routing can move focus (Alt+Tab, a popup dismiss).
     fn key(&mut self, keycode: u32, pressed: bool, time_ns: u64) {
+        self.route_key(keycode, pressed, time_ns);
+        self.sync_modifiers();
+    }
+
+    fn route_key(&mut self, keycode: u32, pressed: bool, time_ns: u64) {
         // Without a keymap the key still reaches the focused client, with
         // no keysym and no text: the evdev code is the part that never
         // depends on xkb, and a client that only wants raw keys still works.
@@ -4107,6 +4171,117 @@ impl Server {
         if let Some(new) = window {
             self.notify_window(new);
         }
+        // The new recipient needs the current masks before its first key;
+        // the old one's cache is dropped so it is re-told when it returns.
+        self.sync_modifiers();
+    }
+
+    /// The client that keyboard input currently goes to: the grab holder,
+    /// else the focused window's owner, each only if the session lock
+    /// admits it — exactly the recipient `route_key` picks.
+    fn keyboard_recipient(&mut self) -> Option<u64> {
+        let grab = self.grab_target().filter(|w| self.scene.admits_window(*w));
+        let focus = self.focus.filter(|w| self.scene.admits_window(*w));
+        let window = grab.or(focus)?;
+        self.wire_clients
+            .iter()
+            .find(|(_, c)| c.owns_window(window))
+            .map(|(t, _)| *t)
+    }
+
+    /// Send `Modifiers` to the keyboard recipient if its masks moved.
+    ///
+    /// **Only** the recipient: an unfocused client streaming which
+    /// modifiers are held while the user types elsewhere would be half a
+    /// keylogger (`wl_keyboard.modifiers` has the same rule). Every other
+    /// client that was told something has its cache cleared, so it gets a
+    /// fresh snapshot the moment it becomes the recipient again.
+    fn sync_modifiers(&mut self) {
+        let recipient = self.keyboard_recipient();
+        for (token, client) in &mut self.wire_clients {
+            if Some(*token) != recipient {
+                client.last_mods = None;
+            }
+        }
+        if let Some(token) = recipient {
+            self.send_modifiers_to(token);
+        }
+    }
+
+    /// Send `Modifiers` to one `KEYMAP` client, unless it already has
+    /// exactly these masks.
+    fn send_modifiers_to(&mut self, token: u64) {
+        let masks = self
+            .keyboard
+            .as_ref()
+            .map(Keyboard::mod_masks)
+            .unwrap_or_default();
+        let Some(client) = self.wire_clients.get_mut(&token) else {
+            return;
+        };
+        if !client.stream.is_ready()
+            || client.client_caps & nitro_wire::types::caps::KEYMAP == 0
+            || client.last_mods == Some(masks)
+        {
+            return;
+        }
+        client.send(&ServerMsg::Modifiers(msg::Modifiers {
+            depressed: masks.depressed,
+            latched: masks.latched,
+            locked: masks.locked,
+            group: masks.group,
+        }));
+        client.last_mods = Some(masks);
+    }
+
+    /// Send the current `Keymap` to one client, then a `Modifiers`
+    /// snapshot ("after every `Keymap`", `docs/wire.md`) — the one
+    /// exception to recipient-only masks, a single message rather than a
+    /// stream.
+    ///
+    /// Skipped for a client that has not finished its handshake (the
+    /// `set_palette` race) or did not list `KEYMAP` (capability opt-in
+    /// rule 1).
+    fn send_keymap(&mut self, token: u64) {
+        let (rate_hz, delay_ms) = self.repeat_advice();
+        let Some(km) = self.keymap_fd.as_ref() else {
+            return;
+        };
+        let Some(client) = self.wire_clients.get_mut(&token) else {
+            return;
+        };
+        if !client.stream.is_ready() || client.client_caps & nitro_wire::types::caps::KEYMAP == 0 {
+            return;
+        }
+        // `encode_body` dups the descriptor again for the socket; this dup
+        // only lends the message an owned fd. The file is write-sealed,
+        // so every client sharing it is safe (`Keyboard::export`).
+        let fd = match rustix::io::dup(km.fd.as_fd()) {
+            Ok(fd) => fd,
+            Err(e) => {
+                warn!("dup keymap fd: {e}");
+                return;
+            }
+        };
+        client.send(&ServerMsg::Keymap(msg::Keymap {
+            format: nitro_wire::types::KeymapFormat::XkbV1,
+            size: km.size,
+            rate_hz,
+            delay_ms,
+            fd,
+        }));
+        client.last_mods = None;
+        self.send_modifiers_to(token);
+    }
+
+    /// The key-repeat advice `Keymap` carries: advisory, the user's
+    /// preference, and the value a `KEYMAP` client should use for its
+    /// *own* repeat (`docs/wire.md` § `Keymap`). `0, 0` = no preference,
+    /// which is all there is until `keyboard.repeat` exists in
+    /// `server.conf` — #3782 changes this body and nothing else here.
+    #[allow(clippy::unused_self)]
+    fn repeat_advice(&self) -> (u32, u32) {
+        (0, 0)
     }
 
     // ------------------------------------------------------ window management
@@ -5690,6 +5865,14 @@ impl Server {
         };
         let before = client.client_caps;
         client.client_caps = caps;
+        // A client opting into `KEYMAP` is sent the keymap now. Not right
+        // behind `Welcome` as `Theme` is: rule 1 of the opt-in forbids a
+        // bit-8+ message before the client listed the bit, and `ClientCaps`
+        // necessarily comes after `Welcome`. A client sends it straight
+        // behind `Hello`, so it is the same round trip. Keyed on the
+        // transition, so a repeated `ClientCaps` is not a keymap storm.
+        let keymap = nitro_wire::types::caps::KEYMAP;
+        let keymap_now = before & keymap == 0 && caps & keymap != 0;
         // A client opting into `DATA` is told about the selection that
         // already exists, the way `Theme` follows `Welcome`: without it a
         // browser launched after the copy would not know there was
@@ -5698,6 +5881,9 @@ impl Server {
         if before & data == 0 && caps & data != 0 && self.data.offer().is_some() {
             let mimes = self.data.mimes().to_vec();
             client.send(&ServerMsg::SelectionOffer(msg::SelectionOffer { mimes }));
+        }
+        if keymap_now {
+            self.send_keymap(token);
         }
         true
     }
@@ -6115,6 +6301,14 @@ impl Server {
     /// capability — and it carries no server→client message (the drag is
     /// reported through the ordinary `Configure` stream), so nothing needs
     /// a `ClientCaps` gate either.
+    ///
+    /// `KEYMAP` (M5-C) has `DATA`'s shape plus `TEXT`'s: set only on a
+    /// **local** link (`Keymap` carries a descriptor, which TCP cannot)
+    /// *and* only when a keymap was exported — a box with no
+    /// `xkeyboard-config` has nothing to ship. Once set it stays set for
+    /// the session: a reload whose export fails keeps the previous file
+    /// (`reload_config`), so a client re-listing the bit is never
+    /// disconnected for naming one it was granted.
     fn caps(&self, shell: bool, remote: bool) -> u32 {
         let mut caps = nitro_wire::types::caps::WM
             | nitro_wire::types::caps::THEME
@@ -6135,6 +6329,9 @@ impl Server {
             caps |= nitro_wire::types::caps::REMOTE;
         } else {
             caps |= nitro_wire::types::caps::DATA;
+            if self.keymap_fd.is_some() {
+                caps |= nitro_wire::types::caps::KEYMAP;
+            }
         }
         caps
     }
