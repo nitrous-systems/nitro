@@ -99,6 +99,12 @@ struct Window<S> {
     /// The last hit-test walk in this window, kept for `local_pos`; see
     /// [`Ui::pointer_move`].
     chain: Vec<(WidgetId, Point)>,
+    /// The pointer capture: the chain a press was delivered to, held
+    /// until its last button is up. See [`Ui::pointer_button`].
+    capture: Option<Capture>,
+    /// The last window-local pointer position, for the hover reconcile
+    /// that ends a capture; `None` once the pointer has left.
+    last_pos: Option<Point>,
     /// The title last sent, so an unchanged title costs nothing. A
     /// terminal re-sends one per OSC and a shell prompt that carries one
     /// sends the same string on every line.
@@ -140,6 +146,8 @@ impl<S> Window<S> {
             focused: None,
             hover_chain: Vec::new(),
             chain: Vec::new(),
+            capture: None,
+            last_pos: None,
             title: String::new(),
             limits: None,
             visible: true,
@@ -149,6 +157,20 @@ impl<S> Window<S> {
             placed_handlers: Vec::new(),
         }
     }
+}
+
+/// A pointer capture: the widget chain (outermost first) a press was
+/// delivered to, and the buttons still held since. Moves and releases go
+/// to it, in its own coordinates and however far outside it the pointer
+/// has gone, until `buttons` is empty — the client half of the server's
+/// implicit grab (`docs/wire.md`), which is what lets a slider follow a
+/// fast drag past its own edge.
+///
+/// An empty `chain` is a capture too (a press on a window with no root):
+/// it suppresses hover churn until the release like any other.
+struct Capture {
+    chain: Vec<WidgetId>,
+    buttons: Vec<u32>,
 }
 
 /// The window `id` names, out of the list, borrowing only the list —
@@ -592,6 +614,18 @@ impl<S: 'static> Ui<S> {
         for w in &mut self.windows {
             w.hover_chain.retain(|h| !doomed.contains(h));
             w.chain.retain(|(h, _)| !doomed.contains(h));
+            // A captured chain is cut at the first doomed widget, not
+            // filtered: the ancestors above it are still a walkable
+            // path, but a hole in the middle would put the positions
+            // below it in the wrong space. The capture itself stays,
+            // even emptied: the button is still down, and whatever is
+            // under the pointer must not get a release it saw no press
+            // for.
+            if let Some(c) = &mut w.capture
+                && let Some(i) = c.chain.iter().position(|h| doomed.contains(h))
+            {
+                c.chain.truncate(i);
+            }
         }
         self.pending_focus.retain(|(id, _)| !doomed.contains(id));
         self.activations.retain(|a| !doomed.contains(a));
@@ -3182,31 +3216,22 @@ impl<S: 'static> Ui<S> {
     }
 
     /// [`Ui::pointer_move`] in one window: hit-tested from that window's
-    /// root, against that window's hover chain.
+    /// root, against that window's hover chain — or, while a press is
+    /// being captured, walked down the captured chain instead, wherever
+    /// the pointer is.
     fn pointer_move_in(&mut self, state: &mut S, win: WindowId, pos: Point) {
         let Some(w) = self.win_mut(win) else {
             return;
         };
+        w.last_pos = Some(pos);
+        if let Some(captured) = w.capture.as_ref().map(|c| c.chain.clone()) {
+            self.captured_move_in(state, win, &captured, pos);
+            return;
+        }
         let mut chain = std::mem::take(&mut w.chain);
         let old = std::mem::take(&mut w.hover_chain);
         self.hit_chain(win, pos, &mut chain);
-        let new: Vec<WidgetId> = chain.iter().map(|(id, _)| *id).collect();
-        for id in old.iter().rev() {
-            if !new.contains(id) {
-                self.set_hovered(*id, false);
-                self.bubble_one(state, *id, &Event::PointerLeave);
-            }
-        }
-        for (id, local) in &chain {
-            if !old.contains(id) {
-                self.set_hovered(*id, true);
-                self.bubble_one(state, *id, &Event::PointerEnter { pos: *local });
-            }
-        }
-        // Filtered on the way back in: a handler above may have removed a
-        // widget that was in the chain, or the whole window.
-        let alive = |id: &WidgetId| self.arena.is_live(*id);
-        let new: Vec<WidgetId> = new.into_iter().filter(alive).collect();
+        let new = self.update_hover(state, &old, &chain);
         if let Some(w) = self.win_mut(win) {
             w.hover_chain = new;
         }
@@ -3231,16 +3256,113 @@ impl<S: 'static> Ui<S> {
         }
     }
 
+    /// A move while `captured` holds the pointer: positions come from
+    /// walking the captured chain without any containment test, so a
+    /// widget sees the pointer in its own space even when it is outside
+    /// it. Hover is kept honest for the captured widgets only — a
+    /// button un-presses when dragged off and re-presses when dragged
+    /// back on — and nothing outside the capture becomes hovered.
+    fn captured_move_in(&mut self, state: &mut S, win: WindowId, captured: &[WidgetId], pos: Point) {
+        let Some(w) = self.win_mut(win) else {
+            return;
+        };
+        let old = std::mem::take(&mut w.hover_chain);
+        let positions = self.chain_positions(captured, pos);
+        let inside: Vec<(WidgetId, Point)> = positions
+            .iter()
+            .copied()
+            .filter(|(id, p)| {
+                self.arena
+                    .slot(*id)
+                    .is_some_and(|s| p.x >= 0.0 && p.y >= 0.0 && p.x < s.state.bounds.w && p.y < s.state.bounds.h)
+            })
+            .collect();
+        let new = self.update_hover(state, &old, &inside);
+        let mut positions = positions;
+        for (id, local) in positions.iter().rev() {
+            if self
+                .bubble_one(state, *id, &Event::PointerMove { pos: *local })
+                .is_handled()
+            {
+                break;
+            }
+        }
+        positions.retain(|(id, _)| self.arena.is_live(*id));
+        if let Some(w) = self.win_mut(win) {
+            w.hover_chain = new;
+            w.chain = positions;
+        }
+    }
+
+    /// Deliver the enter/leave difference between `old` (the hovered
+    /// chain so far) and `hits` (the chain that is hovered now), and
+    /// return the new hover chain with anything a handler removed
+    /// filtered out.
+    fn update_hover(
+        &mut self,
+        state: &mut S,
+        old: &[WidgetId],
+        hits: &[(WidgetId, Point)],
+    ) -> Vec<WidgetId> {
+        let new: Vec<WidgetId> = hits.iter().map(|(id, _)| *id).collect();
+        for id in old.iter().rev() {
+            if !new.contains(id) {
+                self.set_hovered(*id, false);
+                self.bubble_one(state, *id, &Event::PointerLeave);
+            }
+        }
+        for (id, local) in hits {
+            if !old.contains(id) {
+                self.set_hovered(*id, true);
+                self.bubble_one(state, *id, &Event::PointerEnter { pos: *local });
+            }
+        }
+        // Filtered on the way back in: a handler above may have removed a
+        // widget that was in the chain, or the whole window.
+        new.into_iter()
+            .filter(|id| self.arena.is_live(*id))
+            .collect()
+    }
+
+    /// `pos` in the space of each widget of `chain` (outermost first),
+    /// by the same walk as [`Ui::hit_chain`] but with no containment
+    /// test: a captured widget is told where the pointer is however far
+    /// outside it that is. Stops at the first widget that is gone.
+    fn chain_positions(&self, chain: &[WidgetId], pos: Point) -> Vec<(WidgetId, Point)> {
+        let mut out = Vec::with_capacity(chain.len());
+        let mut p = pos;
+        for id in chain {
+            let Some(slot) = self.arena.slot(*id) else {
+                break;
+            };
+            let b = slot.state.bounds;
+            let local = Point::new(p.x - b.x, p.y - b.y);
+            out.push((*id, local));
+            let t = slot.state.content_transform;
+            p = Point::new(local.x - t.e, local.y - t.f);
+        }
+        out
+    }
+
     /// The pointer left the main window.
     pub fn pointer_leave(&mut self, state: &mut S) {
         self.pointer_leave_in(state, WindowId::MAIN);
     }
 
     /// The pointer left one window.
+    ///
+    /// Mid-capture this means the server took the pointer away — a
+    /// window drag or a drag-and-drop the app began, a lock, overview, the
+    /// window closing — and the release will never come. The capture is
+    /// dropped **before** the leaves go out, so a widget asking
+    /// [`EventCx::is_captured`] in its `PointerLeave` gets `false` and
+    /// lets go of whatever it was holding.
     fn pointer_leave_in(&mut self, state: &mut S, win: WindowId) {
         let Some(w) = self.win_mut(win) else {
             return;
         };
+        w.capture = None;
+        w.last_pos = None;
         w.chain.clear();
         let old = std::mem::take(&mut w.hover_chain);
         for id in old.iter().rev() {
@@ -3251,14 +3373,25 @@ impl<S: 'static> Ui<S> {
 
     /// Route a button press or release to the main window's hovered
     /// chain.
+    ///
+    /// A press **captures** the pointer for the chain it was delivered
+    /// to: every move and release until the last button is up goes to
+    /// that chain, in its own coordinates, wherever the pointer is (see
+    /// [`Capture`]). The release that ends the capture then reconciles
+    /// hover against what is under the pointer now.
     pub fn pointer_button(&mut self, state: &mut S, button: u32, pressed: bool) {
         self.pointer_button_in(state, WindowId::MAIN, button, pressed);
     }
 
-    /// Route a button press or release to one window's hovered chain.
+    /// Route a button press or release to one window's captured chain,
+    /// or to its hovered chain when nothing is captured.
     fn pointer_button_in(&mut self, state: &mut S, win: WindowId, button: u32, pressed: bool) {
-        let Some(chain) = self.win(win).map(|w| w.hover_chain.clone()) else {
+        let Some(w) = self.win(win) else {
             return;
+        };
+        let chain = match &w.capture {
+            Some(c) => c.chain.clone(),
+            None => w.hover_chain.clone(),
         };
         for id in chain.iter().rev() {
             let local = self.local_pos(win, *id);
@@ -3270,6 +3403,57 @@ impl<S: 'static> Ui<S> {
             if self.bubble_one(state, *id, &ev).is_handled() {
                 break;
             }
+        }
+        // Filtered: a handler may have removed part of the chain, and a
+        // captured chain must stay walkable.
+        let alive: Vec<WidgetId> = chain
+            .iter()
+            .copied()
+            .take_while(|id| self.arena.is_live(*id))
+            .collect();
+        let Some(w) = self.win_mut(win) else {
+            return;
+        };
+        if pressed {
+            match &mut w.capture {
+                Some(c) => {
+                    if !c.buttons.contains(&button) {
+                        c.buttons.push(button);
+                    }
+                }
+                None => {
+                    w.capture = Some(Capture {
+                        chain: alive,
+                        buttons: vec![button],
+                    });
+                }
+            }
+            return;
+        }
+        let Some(c) = &mut w.capture else {
+            return;
+        };
+        c.buttons.retain(|b| *b != button);
+        if !c.buttons.is_empty() {
+            return;
+        }
+        w.capture = None;
+        // The capture is over: hover has been pinned to the captured
+        // widgets, so reconcile it against what is really under the
+        // pointer — leaves for captured widgets it is no longer inside,
+        // enters for whatever it is over now. No `PointerMove`: the
+        // pointer did not move.
+        let Some(pos) = w.last_pos else {
+            return;
+        };
+        let mut chain = std::mem::take(&mut w.chain);
+        let old = std::mem::take(&mut w.hover_chain);
+        self.hit_chain(win, pos, &mut chain);
+        let new = self.update_hover(state, &old, &chain);
+        chain.retain(|(id, _)| self.arena.is_live(*id));
+        if let Some(w) = self.win_mut(win) {
+            w.hover_chain = new;
+            w.chain = chain;
         }
     }
 
@@ -3723,6 +3907,17 @@ impl<S: 'static> Ui<S> {
     #[must_use]
     pub fn is_hovered(&self, id: WidgetId) -> bool {
         self.arena.slot(id).is_some_and(|s| s.state.hovered)
+    }
+
+    /// Whether `id` is in a pointer capture: a press was delivered to it
+    /// (or to a descendant) and a button has been held since, so it is
+    /// still receiving the pointer wherever the pointer has gone. See
+    /// [`Ui::pointer_button`].
+    #[must_use]
+    pub fn is_captured(&self, id: WidgetId) -> bool {
+        self.windows
+            .iter()
+            .any(|w| w.capture.as_ref().is_some_and(|c| c.chain.contains(&id)))
     }
 
     /// The focused widget of the active window, if any; see

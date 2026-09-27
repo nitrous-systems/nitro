@@ -892,6 +892,17 @@ impl<S: 'static> EventCx<'_, S> {
         self.ui.is_hovered(self.id)
     }
 
+    /// Whether this widget is in a pointer capture: a press reached it
+    /// (or a descendant) and a button is still held, so it keeps
+    /// receiving `PointerMove` and the `PointerUp`, in its own space,
+    /// wherever the pointer has gone. A `PointerLeave` that arrives with
+    /// this `false` means the pointer is really gone — the server took
+    /// it — and the release will never come.
+    #[must_use]
+    pub fn is_captured(&self) -> bool {
+        self.ui.is_captured(self.id)
+    }
+
     /// Whether `pos` (in this widget's own space) is inside it.
     #[must_use]
     pub fn contains(&self, pos: Point) -> bool {

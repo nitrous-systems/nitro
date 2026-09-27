@@ -855,7 +855,15 @@ pub struct Button<S> {
     /// the label"; see [`ButtonBuilder::icon_size`].
     icon_size: Option<f32>,
     enabled: bool,
+    /// Painted active: a press is held *and* the pointer is over it (or
+    /// a key is held). What [`Button::is_pressed`] answers.
     pressed: bool,
+    /// A left press is being captured: the pointer went down on it and
+    /// has not come up, wherever it is now. `pressed` follows the
+    /// pointer in and out while this holds, and the release activates
+    /// only if it lands inside — sliding off is how a user changes
+    /// their mind.
+    held: bool,
     /// A pinned role for the label, or `None` for the one the button's
     /// current state implies; see [`ButtonBuilder::text_role`].
     text_role: Option<nitro_core::Role>,
@@ -1252,13 +1260,15 @@ impl<S: 'static> Widget<S> for Button<S> {
         match ev {
             Event::PointerDown { button, .. } if *button == button::LEFT => {
                 self.pressed = true;
+                self.held = true;
                 cx.request_focus();
                 cx.request_paint();
                 Handled::Yes
             }
             Event::PointerUp { pos, button } if *button == button::LEFT => {
-                let was = self.pressed;
+                let was = self.held;
                 self.pressed = false;
+                self.held = false;
                 cx.request_paint();
                 if was && cx.contains(*pos) {
                     self.activate(cx);
@@ -1297,19 +1307,30 @@ impl<S: 'static> Widget<S> for Button<S> {
                 }
                 Handled::Yes
             }
-            // There is no pointer grab in M2, so a release that happens
-            // after the pointer has wandered off is never routed here.
-            // Dropping `pressed` on the way out is what keeps a button
-            // from being left painted active for ever.
+            // The pointer slid off mid-press: the face relaxes, but the
+            // press is still ours while the capture holds, and coming
+            // back re-presses it. A leave with no capture behind it is
+            // the server taking the pointer (a drag, a lock): the
+            // release will never come, so let go entirely.
             Event::PointerLeave => {
                 self.pressed = false;
+                if !cx.is_captured() {
+                    self.held = false;
+                }
+                cx.request_paint();
+                Handled::No
+            }
+            Event::PointerEnter { .. } => {
+                if self.held {
+                    self.pressed = true;
+                }
                 cx.request_paint();
                 Handled::No
             }
             // Hover and focus change the face, so each needs a repaint —
             // but neither is *consumed*: an ancestor may want to react to
             // the same pointer crossing it.
-            Event::PointerEnter { .. } | Event::FocusChanged { .. } => {
+            Event::FocusChanged { .. } => {
                 cx.request_paint();
                 Handled::No
             }
@@ -1370,6 +1391,7 @@ impl<S: 'static> Widget<S> for Button<S> {
                 self.enabled = arg != Some("false");
                 if !self.enabled {
                     self.pressed = false;
+                    self.held = false;
                 }
                 cx.request_paint();
                 Handled::Yes
@@ -1399,6 +1421,7 @@ impl<S: 'static> WidgetMut<'_, Button<S>, S> {
         self.enabled = enabled;
         if !enabled {
             self.pressed = false;
+            self.held = false;
         }
         self.request_paint();
     }
@@ -1753,6 +1776,7 @@ pub fn button<S: 'static>(text: impl Into<String>) -> ButtonBuilder<S> {
         icon_size: None,
         enabled: true,
         pressed: false,
+        held: false,
         text_role: None,
         style: crate::TextStyleOverride::default(),
         on_click: None,
@@ -1902,6 +1926,9 @@ pub struct TextField<S> {
     /// The other end of the selection; equal to `cursor` when there is
     /// none.
     anchor: usize,
+    /// A left press is being captured: moves extend the selection from
+    /// `anchor` to wherever the pointer is, past the field's edges too.
+    selecting: bool,
     enabled: bool,
     style: crate::TextStyleOverride,
     on_change: Option<ChangeFn<S>>,
@@ -2422,8 +2449,29 @@ impl<S: 'static> Widget<S> for TextField<S> {
                 let at = self.offset_at(pos.x - px + self.scroll);
                 self.cursor = at;
                 self.anchor = at;
+                self.selecting = true;
                 cx.request_paint();
                 Handled::Yes
+            }
+            // Drag-select: the capture keeps the moves coming after the
+            // pointer has left the field, and `offset_at` clamps to the
+            // ends, so dragging past an edge selects to that end.
+            Event::PointerMove { pos } if self.selecting => {
+                let (px, _) = cx.theme().button_padding;
+                let at = self.offset_at(pos.x - px + self.scroll);
+                if at != self.cursor {
+                    self.cursor = at;
+                    cx.request_paint();
+                }
+                Handled::Yes
+            }
+            Event::PointerUp { button, .. } if *button == button::LEFT && self.selecting => {
+                self.selecting = false;
+                Handled::Yes
+            }
+            Event::PointerLeave if self.selecting && !cx.is_captured() => {
+                self.selecting = false;
+                Handled::No
             }
             Event::KeyDown(k) => Handled::from(self.key(cx, k)),
             Event::Text { text } => {
@@ -2617,6 +2665,9 @@ impl<S: 'static> WidgetMut<'_, TextField<S>, S> {
             return;
         }
         self.enabled = enabled;
+        if !enabled {
+            self.selecting = false;
+        }
         self.request_paint();
     }
 
@@ -2749,6 +2800,7 @@ pub fn text_field<S: 'static>(text: impl Into<String>) -> TextFieldBuilder<S> {
         placeholder: String::new(),
         cursor,
         anchor: cursor,
+        selecting: false,
         enabled: true,
         style: crate::TextStyleOverride::default(),
         on_change: None,
@@ -3304,9 +3356,13 @@ impl<S: 'static> Widget<S> for Slider<S> {
                 self.dragging = false;
                 Handled::Yes
             }
-            // No pointer grab in M2, so a drag that wanders out of the
-            // widget ends there rather than being routed back.
-            Event::PointerLeave => {
+            // A drag survives the pointer wandering off the widget: the
+            // capture keeps the moves coming, `value_at` clamps them to
+            // the track, and the release ends it wherever it lands. A
+            // leave with no capture behind it is the server taking the
+            // pointer away (a window drag, a lock), and then the release
+            // will never come.
+            Event::PointerLeave if !cx.is_captured() => {
                 self.dragging = false;
                 Handled::No
             }
@@ -3414,6 +3470,9 @@ impl<S: 'static> WidgetMut<'_, Slider<S>, S> {
             return;
         }
         self.enabled = enabled;
+        if !enabled {
+            self.dragging = false;
+        }
         self.request_paint();
     }
 }

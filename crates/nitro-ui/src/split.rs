@@ -124,7 +124,10 @@ type ClickFn<S> = Box<dyn Fn(&mut S, &mut Ui<S>)>;
 /// shape as [`Button`](crate::widgets::Button)'s so a scripted `click`
 /// and a real release are indistinguishable to the app.
 struct Pressable<S> {
+    /// Painted active: pressed *and* the pointer over it.
     pressed: bool,
+    /// A left press is being captured; see `Button::held`.
+    held: bool,
     on_click: Option<ClickFn<S>>,
 }
 
@@ -132,6 +135,7 @@ impl<S: 'static> Pressable<S> {
     fn new() -> Self {
         Self {
             pressed: false,
+            held: false,
             on_click: None,
         }
     }
@@ -151,13 +155,15 @@ impl<S: 'static> Pressable<S> {
         match ev {
             Event::PointerDown { button, .. } if *button == button::LEFT => {
                 self.pressed = true;
+                self.held = true;
                 cx.request_focus();
                 cx.request_paint();
                 Some(Handled::Yes)
             }
             Event::PointerUp { pos, button } if *button == button::LEFT => {
-                let was = self.pressed;
+                let was = self.held;
                 self.pressed = false;
+                self.held = false;
                 cx.request_paint();
                 if was && cx.contains(*pos) {
                     self.activate(cx);
@@ -178,12 +184,24 @@ impl<S: 'static> Pressable<S> {
                 }
                 Some(Handled::Yes)
             }
+            // Off mid-press the face relaxes but the press holds while
+            // captured; back on re-presses. See `Button`.
             Event::PointerLeave => {
                 self.pressed = false;
+                if !cx.is_captured() {
+                    self.held = false;
+                }
                 cx.request_paint();
                 Some(Handled::No)
             }
-            Event::PointerEnter { .. } | Event::FocusChanged { .. } => {
+            Event::PointerEnter { .. } => {
+                if self.held {
+                    self.pressed = true;
+                }
+                cx.request_paint();
+                Some(Handled::No)
+            }
+            Event::FocusChanged { .. } => {
                 cx.request_paint();
                 Some(Handled::No)
             }
