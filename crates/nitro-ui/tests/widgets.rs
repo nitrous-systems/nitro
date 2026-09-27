@@ -1102,3 +1102,100 @@ fn re_eliding_happens_on_a_width_change_and_on_nothing_else() {
     );
     h.quit();
 }
+
+/// The implicit pointer grab, end to end: a slider drag survives the
+/// pointer leaving the widget *and the window*, because the server keeps
+/// routing motion to the pressed window and the tree keeps routing it to
+/// the pressed chain, and ends only on the release.
+#[test]
+fn a_slider_drag_survives_leaving_the_widget_and_the_window() {
+    struct S {
+        values: Vec<f32>,
+    }
+    let mut h = Harness::sized(
+        "grab",
+        S { values: Vec::new() },
+        Size::new(220.0, 60.0),
+        |ui: &mut Ui<S>| {
+            let s = ui.build(
+                slider(0.0)
+                    .name("volume")
+                    .range(0.0, 100.0)
+                    .width(160.0)
+                    .on_change(|s: &mut S, _ui: &mut Ui<S>, v: f32| s.values.push(v)),
+            );
+            let root = ui.build(panel().background(Color::WHITE).padding(8.0));
+            ui.attach(root, s).unwrap();
+            root
+        },
+    );
+    let id = kids(&mut h)[0];
+    let b = h.bounds(id);
+    let mid_y = b.y + b.h / 2.0;
+
+    h.move_pointer(Point::new(b.x + b.w / 2.0, mid_y));
+    h.press(nitro_ui::event::button::LEFT);
+    let mid = h.widget::<Slider<S>>(id).value();
+    assert!((40.0..=60.0).contains(&mid), "pressed the middle, got {mid}");
+    assert_eq!(h.state().values.len(), 1);
+
+    // Right, past the track and past the window's right edge: the value
+    // clamps to the maximum and the drag is still on.
+    h.move_pointer(Point::new(260.0, mid_y));
+    same(h.widget::<Slider<S>>(id).value(), 100.0);
+    assert_eq!(h.state().values.len(), 2);
+
+    // Below the window's bottom edge, at a quarter of the track: still
+    // dragging, value near a quarter.
+    h.move_pointer(Point::new(b.x + b.w / 4.0, 100.0));
+    let quarter = h.widget::<Slider<S>>(id).value();
+    assert!(
+        (15.0..=35.0).contains(&quarter),
+        "dragged to a quarter from below the window, got {quarter}"
+    );
+    assert_eq!(h.state().values.len(), 3);
+
+    // Release out there: the drag ends, and the pointer is not over the
+    // slider any more.
+    h.release(nitro_ui::event::button::LEFT);
+    assert!(!h.ui().is_hovered(id), "hover is reconciled on release");
+    let after = h.state().values.len();
+    h.move_pointer(Point::new(b.x + b.w - 2.0, 100.0));
+    same(h.widget::<Slider<S>>(id).value(), quarter);
+    assert_eq!(h.state().values.len(), after, "a move after the release changes nothing");
+
+    // Back over it, plainly hovered, and a fresh click works.
+    h.click_at(Point::new(b.x + b.w - 2.0, mid_y));
+    assert!(h.widget::<Slider<S>>(id).value() > 90.0);
+}
+
+/// Drag-select in a text field: press at one end, drag past the field's
+/// far edge (the capture keeps the moves coming), release out there.
+#[test]
+fn a_text_field_drag_selects_and_survives_leaving_the_field() {
+    let mut h = Harness::sized("select", (), Size::new(260.0, 60.0), |ui: &mut Ui<()>| {
+        let field = ui.build(text_field("hello world").name("input"));
+        let root = ui.build(panel().background(Color::WHITE).padding(8.0));
+        ui.attach(root, field).unwrap();
+        root
+    });
+    let field = kids(&mut h)[0];
+    let b = h.bounds(field);
+    let mid_y = b.y + b.h / 2.0;
+
+    // Press near the left edge of the text: the caret goes to the start.
+    h.move_pointer(Point::new(b.x + 2.0, mid_y));
+    h.press(nitro_ui::event::button::LEFT);
+    assert_eq!(h.widget::<TextField<()>>(field).cursor(), 0);
+
+    // Drag well past the right edge of the field and below the window:
+    // the selection extends to the end.
+    h.move_pointer(Point::new(b.x + b.w + 40.0, 200.0));
+    assert_eq!(h.widget::<TextField<()>>(field).selected_text(), "hello world");
+    assert_eq!(h.widget::<TextField<()>>(field).selection(), (0, 11));
+
+    // The release ends it; a later move selects nothing more.
+    h.release(nitro_ui::event::button::LEFT);
+    h.move_pointer(Point::new(b.x + 2.0, mid_y));
+    assert_eq!(h.widget::<TextField<()>>(field).selection(), (0, 11));
+}

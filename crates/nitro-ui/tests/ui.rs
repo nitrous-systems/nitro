@@ -1864,3 +1864,85 @@ fn on_window_placed_fires_on_the_output_not_on_a_resize() {
     assert_eq!(*h.state(), vec![out.unwrap()], "not again on a resize");
     h.quit();
 }
+
+#[test]
+fn a_button_pressed_then_dragged_off_and_back_on_still_fires() {
+    let mut h = Harness::sized(
+        "back-on",
+        0u32,
+        Size::new(200.0, 120.0),
+        |ui: &mut Ui<u32>| {
+            let b = ui.build(button("Hold me").on_click(|s: &mut u32, _| *s += 1));
+            let root = ui.build(column().padding(10.0));
+            ui.attach(root, b).unwrap();
+            root
+        },
+    );
+    let root = h.ui().root().unwrap();
+    let btn = h.ui().children(root)[0];
+    let b = h.bounds(btn);
+
+    h.move_pointer(Point::new(b.x + 2.0, b.y + 2.0));
+    h.press(nitro_ui::event::button::LEFT);
+    assert!(h.widget::<Button<u32>>(btn).is_pressed());
+
+    // Off the button: the face relaxes, but the press is still captured.
+    h.move_pointer(Point::new(b.x + b.w + 20.0, b.y + b.h + 20.0));
+    assert!(!h.widget::<Button<u32>>(btn).is_pressed());
+    assert!(!h.ui().is_hovered(btn));
+    assert!(h.ui().is_captured(btn));
+
+    // Back on: pressed again, and the release fires.
+    h.move_pointer(Point::new(b.x + 4.0, b.y + 4.0));
+    assert!(h.widget::<Button<u32>>(btn).is_pressed());
+    assert!(h.ui().is_hovered(btn));
+    h.release(nitro_ui::event::button::LEFT);
+    assert_eq!(*h.state(), 1);
+    assert!(!h.ui().is_captured(btn));
+    h.quit();
+}
+
+#[test]
+fn releasing_over_another_widget_reconciles_hover_and_fires_nothing() {
+    let mut h = Harness::sized(
+        "reconcile",
+        (0u32, 0u32),
+        Size::new(240.0, 120.0),
+        |ui: &mut Ui<(u32, u32)>| {
+            let a = ui.build(button("A").on_click(|s: &mut (u32, u32), _| s.0 += 1));
+            let b = ui.build(button("B").on_click(|s: &mut (u32, u32), _| s.1 += 1));
+            let root = ui.build(row().padding(10.0).gap(20.0));
+            ui.attach(root, a).unwrap();
+            ui.attach(root, b).unwrap();
+            root
+        },
+    );
+    let root = h.ui().root().unwrap();
+    let kids = h.ui().children(root);
+    let (a, b) = (kids[0], kids[1]);
+    let ba = h.bounds(a);
+    let bb = h.bounds(b);
+
+    h.move_pointer(Point::new(ba.x + 2.0, ba.y + 2.0));
+    h.press(nitro_ui::event::button::LEFT);
+    // Over B while A holds the capture: B is not hovered, A is captured.
+    h.move_pointer(Point::new(bb.x + 2.0, bb.y + 2.0));
+    assert!(!h.ui().is_hovered(b), "nothing outside the capture hovers");
+    assert!(!h.ui().is_hovered(a));
+    assert!(h.ui().is_captured(a));
+    assert!(!h.widget::<Button<(u32, u32)>>(b).is_pressed());
+
+    // The release goes to A (which does not fire: it landed outside) and
+    // then hover catches up with where the pointer really is.
+    h.release(nitro_ui::event::button::LEFT);
+    assert_eq!(*h.state(), (0, 0));
+    assert!(h.ui().is_hovered(b), "after the release B is hovered");
+    assert!(!h.ui().is_hovered(a));
+    assert!(!h.ui().is_captured(a));
+
+    // And B clicks normally from here.
+    h.press(nitro_ui::event::button::LEFT);
+    h.release(nitro_ui::event::button::LEFT);
+    assert_eq!(*h.state(), (0, 1));
+    h.quit();
+}
