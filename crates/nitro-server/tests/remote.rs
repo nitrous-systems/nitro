@@ -471,12 +471,34 @@ fn a_clipboard_fd_op_from_a_remote_client_is_a_protocol_error_not_a_buffer_one()
         "and does not explain it as a buffer: {msg}"
     );
 
-    // Fatal: the connection goes, unlike the buffers refusal. The honest
-    // client is untouched.
-    drop(conn);
-    wait_for("the clipboard liar to be disconnected", || {
+    // Fatal: the server drops the connection, unlike the buffers refusal.
+    // Both checks below run while our socket is still open, and that order
+    // is the whole assertion. `remote_clients` falls when the server
+    // disconnects the client **or** when it reaps the EOF from a socket we
+    // closed, so dropping `conn` first would make it hold whether or not
+    // the new arm is fatal — it would keep passing with the `is_buffer_op`
+    // split deleted. (The sibling
+    // `a_frame_declaring_descriptors_is_fatal_on_a_remote_link` holds its
+    // raw socket open across the same wait, for the same reason.)
+    //
+    // The `Closed` poll is the primary check: it pins the disconnect on
+    // the connection itself rather than on a stat's bookkeeping.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match conn.poll(&mut seen) {
+            Err(WireError::Closed) => break,
+            Err(e) => panic!("want Closed, got {e:?}"),
+            Ok(_) => assert!(
+                Instant::now() < deadline,
+                "the server kept the connection: a non-buffer fd op must be fatal"
+            ),
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    wait_for("the clipboard liar to be reaped", || {
         h.stat("remote_clients") == 1
     });
+    drop(conn);
     h.settle();
     assert_eq!(h.stat("windows"), 1, "the honest client kept its window");
     drop(honest);
