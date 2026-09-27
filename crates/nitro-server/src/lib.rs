@@ -3956,7 +3956,6 @@ impl Server {
         // is already raised (each Tab raises), and now it becomes the most
         // recently used, so the *next* Alt+Tab starts from there. The raise
         // here is idempotent and kept for safety.
-
         if !pressed && keyboard::is_alt(resolved.keysym) && self.wm.cycling() {
             self.wm.end_cycle();
             if let Some(win) = self.focus {
@@ -4169,7 +4168,6 @@ impl Server {
     /// Tabs walk further back instead of bouncing between two windows.
     /// Windows walked past stay raised in walk order; the pre-cycle
     /// stacking is not restored.
-
     fn cycle_focus(&mut self, forward: bool) {
         let candidates = wm::cycle_candidates(&self.scene, self.wm.mru());
         let Some(win) = self.wm.cycle_next(&candidates, forward) else {
@@ -4188,7 +4186,6 @@ impl Server {
             warn!("raise: {e}");
         }
         self.set_focus(Some(win));
-
     }
 
     /// Drop every scrap of window-management state a closed window left

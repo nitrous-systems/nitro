@@ -660,7 +660,6 @@ last two windows. Trade-off: windows walked past stay raised in walk order;
 the pre-cycle stacking is not restored (a centred switcher overlay would be
 the eventual answer to that).
 
-
 ## States
 
 `Normal`, `Maximized`, `Fullscreen`, `Minimized` — set by the client with
