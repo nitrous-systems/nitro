@@ -1821,7 +1821,7 @@ pub fn spacer<S: 'static>() -> SpacerBuilder<S> {
 
 /// The intrinsic size of a container: the flex solver's own arithmetic,
 /// over the children's measurements.
-fn measure_container<S: 'static>(cx: &mut MeasureCx<'_, S>, constraints: Constraints) -> Size {
+pub(crate) fn measure_container<S: 'static>(cx: &mut MeasureCx<'_, S>, constraints: Constraints) -> Size {
     let style = cx.ui.style(cx.id);
     let inner = constraints.loosen().deflate(style.padding);
     let children = cx.children();
@@ -2634,6 +2634,25 @@ impl<S: 'static> WidgetMut<'_, TextField<S>, S> {
             .unwrap_or(0);
         self.cursor = at;
         self.anchor = at;
+        self.scroll_to_cursor();
+        self.request_paint();
+    }
+
+    /// Select the bytes `from..to`, each clamped to a character
+    /// boundary, with the caret at `to`. A file dialog's name field uses
+    /// it to select a suggested name's stem and leave its extension.
+    pub fn select_range(&mut self, from: usize, to: usize) {
+        let text = &self.text;
+        let snap = |at: usize| {
+            let at = at.min(text.len());
+            (0..=at)
+                .rev()
+                .find(|i| text.is_char_boundary(*i))
+                .unwrap_or(0)
+        };
+        let (from, to) = (snap(from), snap(to));
+        self.anchor = from;
+        self.cursor = to;
         self.scroll_to_cursor();
         self.request_paint();
     }

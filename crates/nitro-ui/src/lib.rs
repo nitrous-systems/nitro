@@ -68,6 +68,7 @@
 //! | [`widget`] | the [`Widget`] trait and the pass contexts |
 //! | [`widgets`] | `Flex`, `Panel`, `Label`, `Button`, `TextField`, `Checkbox`, `Scroll`, `Slider`, `Separator`, `Image`, `Icon`, `Spacer` |
 //! | [`list`] | `List`: a **virtualised** list, `visible + 2` nodes for any model |
+//! | [`picker`] | `FilePicker`: the file / folder dialog, a second window laid out like `nitro-files` |
 //! | [`split`] | the split-view blueprint: `SidebarRow`, `Card`, `CardRow`, `Pages`, `Switch`, `split_view` |
 //! | [`build`] | the builder traits |
 //! | [`layout`] | the flex model, as pure functions |
@@ -86,6 +87,7 @@ pub mod event;
 pub mod introspect;
 pub mod layout;
 pub mod list;
+pub mod picker;
 pub mod shell;
 pub mod shot;
 pub mod split;
@@ -113,6 +115,7 @@ pub use layout::{
     ShrinkFloor,
 };
 pub use list::{List, ListModel, Row, list};
+pub use picker::{FilePicker, PickKind};
 pub use nitro_core::{Color, Point, Rect, Size, Transform};
 pub use split::{
     Card, CardRow, ContentColumn, Pages, SidebarRow, SplitParts, Switch, card, card_row,

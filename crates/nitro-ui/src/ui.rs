@@ -772,10 +772,20 @@ impl<S: 'static> Ui<S> {
         Ok(())
     }
 
-    /// Forget a secondary window locally: its widgets, its state, and
-    /// then its close handlers. The caller has queued the window's
+    /// Forget a secondary window locally: its state, then its close
+    /// handlers, then its widgets. The caller has queued the window's
     /// `DestroyNode`, which takes the whole scene subtree with it, so no
     /// widget sends one of its own.
+    ///
+    /// **The handlers run while the window's widgets are still in the
+    /// arena.** The window itself is already gone from [`Ui::windows`]
+    /// (so a handler that calls [`Ui::remove_window`] again gets
+    /// [`Error::NoWindow`] rather than a second teardown), but a handler
+    /// can still read or take what the window's tree holds. The file
+    /// picker keeps its model, result callback included, in its root
+    /// widget, and a `Closed` from the server is the one way of ending
+    /// it that does not go through the picker's own code — so the
+    /// handler has to be able to reach that widget to answer `None`.
     fn drop_window(&mut self, state: &mut S, win: WindowId) {
         let Some(i) = self.windows.iter().position(|w| w.id == win) else {
             return;
@@ -783,10 +793,7 @@ impl<S: 'static> Ui<S> {
         if i == 0 {
             return;
         }
-        if let Some(root) = self.windows[i].root {
-            let _ = self.remove_subtree(root, false);
-        }
-        let w = self.windows.remove(i);
+        let mut w = self.windows.remove(i);
         if self.active == win {
             self.active = WindowId::MAIN;
         }
@@ -797,10 +804,18 @@ impl<S: 'static> Ui<S> {
             self.gone_windows.remove(0);
         }
         self.gone_windows.push(win.0);
-        for h in w.close_handlers {
+        for h in std::mem::take(&mut w.close_handlers) {
             h(state, self);
         }
+        if let Some(root) = w.root {
+            // Not through `remove_subtree`'s window bookkeeping: the
+            // window is no longer in the list, so this is an ordinary
+            // parentless subtree now. A handler that removed it already
+            // leaves a stale id, which is fine.
+            let _ = self.remove_subtree(root, false);
+        }
     }
+
 
     /// Run `handler` once when `win` goes, whether the app removed it or
     /// the server closed it. Not called for the main window, whose

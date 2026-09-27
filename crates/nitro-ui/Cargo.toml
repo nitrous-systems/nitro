@@ -14,6 +14,10 @@ nitro-core = { workspace = true }
 nitro-wire = { workspace = true }
 # Sealed memfds for image buffers: the server maps them (#569).
 nitro-shm = { workspace = true }
+# The directory model behind `picker::FilePicker`: listing, sorting, MIME
+# types, icons and the XDG places. Its own crate so `nitro-files` (which
+# depends on this one) and the picker share it (#3831).
+nitro-fs = { workspace = true }
 # `poll(2)` for the synchronous text measurement, `epoll` for the app loop.
 rustix = { workspace = true, features = ["event", "fs", "process", "time"] }
 # Only for `test::Harness`, which runs a server in-process. Optional so an
@@ -29,6 +33,11 @@ test-support = ["dep:nitro-server", "nitro-server/test-support"]
 nitro-ui = { path = ".", features = ["test-support"] }
 # Tests inject synthetic input and name wire enumerations directly.
 nitro-server = { path = "../nitro-server", features = ["test-support"] }
+# The picker's tests build a fixture places list.
+nitro-fs = { workspace = true }
 
 [[example]]
 name = "hello_dialog"
+
+[[example]]
+name = "pick"

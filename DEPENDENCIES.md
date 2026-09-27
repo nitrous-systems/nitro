@@ -216,6 +216,11 @@ it without depending on the file manager. Still zero external crates:
 the whole-workspace count moves **85 → 86**, the one new line being
 `nitro-fs` itself.
 
+`nitro-ui` depends on `nitro-fs` too (#3829): `nitro_ui::picker` is the
+toolkit's file / folder dialog and reads directories through it. No new
+external crate — `nitro-fs` brings only `rustix` features the toolkit
+already enables — so the count is unchanged.
+
 
 The whole-workspace count with the session in is **70** lines and still
 **34 distinct external crate names** — the rise from 67 is three

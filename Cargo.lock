@@ -372,6 +372,7 @@ name = "nitro-ui"
 version = "0.0.1"
 dependencies = [
  "nitro-core",
+ "nitro-fs",
  "nitro-server",
  "nitro-shm",
  "nitro-ui",

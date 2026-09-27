@@ -1266,6 +1266,66 @@ addressed to `win`, whichever window the server focused, and
 The introspection socket names a secondary window's root `window[N]`,
 its index in `ui.windows()`; see `docs/introspection.md`.
 
+### The file picker
+
+`nitro_ui::picker::FilePicker` is the file / folder dialog, built on
+`add_window`: a second window laid out like `nitro-files` — a places
+sidebar (Home, the XDG user directories, Root; no Trash), a back / up /
+path header, the virtualised `List` with rounded inset rows, and a footer
+with a status line, a filter button, Cancel and the action button.
+
+```rust,ignore
+FilePicker::open()                 // or ::save("name.txt"), ::folder()
+    .multiple(true)                // Open / Folder only
+    .mime(["image/*"])             // or .filter("Images", ["image/png", "image/jpeg"])
+    .start_dir("/home/me/Pictures")
+    .on_done(|s: &mut State, ui: &mut Ui<State>, picked: Option<Vec<PathBuf>>| { … })
+    .open_in(ui)?;                 // -> WindowId
+```
+
+* **The answer, exactly once.** `on_done` gets `Some(paths)` on accept
+  and `None` on Cancel, Escape, or the window being closed by the server.
+  It is an `FnOnce` held in the dialog and taken by whichever comes
+  first; on accept it runs before the window is removed.
+* **Where its state lives.** Callbacks get the *app's* `&mut S`, so the
+  picker's own state (directory, history, filters, the scan, the
+  callback) lives in the window's root widget, `picker::Picker`, a column
+  container that owns the model. Every callback in the dialog captures
+  the root's id and reaches the model through `widget_mut`, and every
+  write that could land on the widget whose callback is running is
+  deferred. Close handlers run while the closing window's widgets are
+  still in the arena (`drop_window` removes the tree after them), which
+  is what lets a server `Closed` reach the callback in the root.
+* **Filters.** A file shows when its `nitro_fs::mime::type_of` matches a
+  pattern of the active filter: an exact type or `major/*`,
+  case-insensitively, parameters ignored. Directories always show; a file
+  with no known type shows only under "All files", which is always the
+  last filter. The filter button cycles them and is absent when there is
+  only one. A folder dialog lists directories only and has no filter.
+* **Open** accepts the selection, or the cursor row when nothing is
+  selected; activating a file accepts it, activating a directory enters
+  it, and Open on only directories enters the first. **Folder** returns
+  the selected directories, or the current one when nothing is selected.
+  **Save** returns `cwd/name` from the name field (its stem pre-selected);
+  an existing target is confirmed on the status line — press Save again —
+  because there are no dialogs inside the dialog. The caller writes.
+* **Keys.** Escape cancels, Enter accepts (or activates the list row),
+  Ctrl+H toggles dot-files, Ctrl+L focuses the path bar, Backspace or
+  Alt+Up goes up, Alt+Left goes back. The path bar navigates on Enter,
+  and on a change written from outside (`hey … set picker_path value`).
+* **Names**, for `hey` and tests: `picker_path`, `picker_list`,
+  `picker_name`, `picker_status`, `picker_ok`, `picker_cancel`,
+  `picker_filter`, `picker_back`, `picker_up`, and `place_<key>` rows in
+  `picker_places`, all under `window[N]`.
+* **Limitations.** Multiple selection is the list's keyboard one
+  (Shift+arrows, Ctrl+Space): pointer events carry no modifier mask, so
+  there is no Ctrl-click (see *Deviations*). The server has no
+  transient-parent or modal relation yet, so the dialog is an ordinary
+  window: it is not kept above or centred on the app, and the app's own
+  window stays usable while it is open.
+
+`crates/nitro-ui/examples/pick.rs` opens each kind from a button.
+
 ## Shell surfaces
 
 A bar, a dock, a launcher and a wallpaper are `nitro-ui` apps like any

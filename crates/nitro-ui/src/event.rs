@@ -88,6 +88,8 @@ pub mod key {
     pub const C: u32 = 46;
     /// The letter `h`, for `Ctrl-H`.
     pub const H: u32 = 35;
+    /// The letter `l`, for `Ctrl-L` (focus the location bar).
+    pub const L: u32 = 38;
     /// The letter `n`, for `Ctrl-N` and for answering "no".
     pub const N: u32 = 49;
     /// The letter `s`, for `Ctrl-S`.

@@ -1126,6 +1126,19 @@ impl<S: 'static> WidgetMut<'_, List<S>, S> {
         self.request_paint();
     }
 
+    /// Put the cursor back on the first row, select **nothing** and
+    /// scroll to the top — what a list showing a different directory
+    /// wants, where [`set_rows`](Self::set_rows) alone keeps the old
+    /// cursor and scroll clamped into the new model. Fires no callback.
+    pub fn reset_cursor(&mut self) {
+        self.cursor = 0;
+        self.extend_from = 0;
+        self.selected.clear();
+        self.last_click = None;
+        self.scroll_to(0.0);
+        self.request_paint();
+    }
+
     /// Scroll until row `index` is inside the viewport.
     pub fn scroll_to_row(&mut self, index: usize) {
         let row_h = self.row_h;
