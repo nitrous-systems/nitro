@@ -86,6 +86,27 @@ pub struct KeyboardConf {
     pub variant: String,
     /// `keyboard.options`, e.g. `ctrl:nocaps`.
     pub options: String,
+    /// `keyboard.repeat`, as `(delay_ms, rate_hz)`. The one keyboard key
+    /// that is `Option`: unlike the other three it has a default that is
+    /// not "nothing" ([`REPEAT_DEFAULT`]), and writing a line the user
+    /// never asked for would pin today's default into their file. `None`
+    /// writes no line; see `collect` in `lib.rs` for when it becomes
+    /// `Some`.
+    pub repeat: Option<(u32, u32)>,
+}
+
+/// The server's `Repeat::DEFAULT`: 600 ms, then 25 per second. What the
+/// sliders show when the file says nothing. Pinned against the server's
+/// constant by `the_server_parser_reads_back_what_we_write`.
+pub const REPEAT_DEFAULT: (u32, u32) = (600, 25);
+
+/// Parse a `keyboard.repeat` value, `<delay_ms>,<rate_hz>`. Only the
+/// shape is checked here: the widgets clamp to their own ranges, and the
+/// server warns about a value outside its bounds.
+#[must_use]
+pub fn parse_repeat(value: &str) -> Option<(u32, u32)> {
+    let (d, r) = value.split_once(',')?;
+    Some((d.trim().parse().ok()?, r.trim().parse().ok()?))
 }
 
 /// What the `theme.*` keys say, as far as this app models them.
@@ -255,6 +276,9 @@ pub fn render(conf: &Conf) -> String {
     out.push_str(&keyboard_line("keyboard.layout", &k.layout));
     out.push_str(&keyboard_line("keyboard.variant", &k.variant));
     out.push_str(&keyboard_line("keyboard.options", &k.options));
+    if let Some((delay, rate)) = k.repeat {
+        let _ = writeln!(out, "keyboard.repeat = {delay},{rate}");
+    }
     // The theme block is written only when there is something to say,
     // unlike the keyboard's three always-present lines. A `theme.scheme`
     // line the user never asked for would pin today's default into the
@@ -351,6 +375,11 @@ pub fn parse(text: &str) -> Conf {
             "keyboard.layout" => value.clone_into(&mut conf.keyboard.layout),
             "keyboard.variant" => value.clone_into(&mut conf.keyboard.variant),
             "keyboard.options" => value.clone_into(&mut conf.keyboard.options),
+            "keyboard.repeat" => {
+                if let Some(r) = parse_repeat(value) {
+                    conf.keyboard.repeat = Some(r);
+                }
+            }
             "theme.scheme" => conf.theme.scheme = Scheme::from_name(value),
             // Any other `theme.<something>` is a per-role override. It is
             // not validated here: this app cannot render it and does not
@@ -518,6 +547,7 @@ mod tests {
             layout: "de".to_owned(),
             variant: String::new(),
             options: "ctrl:nocaps".to_owned(),
+            repeat: None,
         };
         c
     }
@@ -600,6 +630,24 @@ keyboard.options = ctrl:nocaps
     }
 
     #[test]
+    fn repeat_is_written_only_when_set_and_round_trips() {
+        let mut c = example();
+        assert!(!render(&c).contains("keyboard.repeat"));
+        c.keyboard.repeat = Some((300, 0));
+        let text = render(&c);
+        assert!(
+            text.contains("keyboard.options = ctrl:nocaps\nkeyboard.repeat = 300,0\n"),
+            "{text}"
+        );
+        assert_eq!(parse(&text).keyboard.repeat, Some((300, 0)));
+        assert_eq!(
+            parse("keyboard.repeat = 250 , 40\n").keyboard.repeat,
+            Some((250, 40))
+        );
+        assert_eq!(parse("keyboard.repeat = 300\n").keyboard.repeat, None);
+    }
+
+    #[test]
     fn a_connector_name_may_contain_a_dot() {
         let c = parse("output.DP-1.2.scale = 2\n");
         assert_eq!(c.output("DP-1.2").expect("the branch").scale, Some(2.0));
@@ -626,7 +674,8 @@ keyboard.options = ctrl:nocaps
             "output.X.position = a,b",
             "output.X.primary = maybe",
             "output.X.rotation = 90",
-            "keyboard.repeat = 300,25",
+            "keyboard.repeat = 300",
+            "keyboard.repeat = a,b",
             "nonsense",
             "\0\0\0",
         ] {

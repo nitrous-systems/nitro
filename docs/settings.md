@@ -65,6 +65,7 @@ broken desktop and a text console.
 | `keyboard.layout` | an xkb layout, e.g. `us`, `de`, `us,de` | `us` |
 | `keyboard.variant` | an xkb variant, e.g. `nodeadkeys` | none |
 | `keyboard.options` | xkb options, comma-separated, e.g. `ctrl:nocaps`; see below | none |
+| `keyboard.repeat` | `<delay_ms>,<rate_hz>` — key repeat; rate `0` = off; see below | `600,25` |
 | `theme.scheme` | `light` or `dark` — the desktop's colour scheme | `light` |
 | `theme.<role>` | `#rrggbb` or `#rrggbbaa`, overriding one role on top of the scheme | the scheme's value |
 | `theme.icons` | the **XDG icon theme** application icons come from, e.g. `hicolor`, `Adwaita` | `hicolor` |
@@ -413,27 +414,74 @@ change recompiles the keymap (`Server::reload_config` →
 `Keyboard::with_settings`) exactly as `keyboard.layout` does, so Apply
 and the status line's `applied` is the whole interaction.
 
-### `keyboard.repeat` is deliberately absent
+### `keyboard.repeat`: a held key keeps typing
 
-It is the key a reader most expects to find, so the parser names it
-explicitly and warns rather than letting it fall into "unknown key".
+```text
+keyboard.repeat = 600,25
+```
 
-**Nothing in nitro repeats keys yet.** libinput reports a press and a
-release, the server forwards both, and no client synthesises a repeat in
-between. A `keyboard.repeat = 300,25` would therefore be a promise with
-nothing behind it — a setting that appears to work, changes nothing, and
-costs a user an afternoon. When key repeat is implemented this key is
-where it goes.
+`<delay_ms>,<rate_hz>`: how long a key is held before it starts
+repeating, then how many repeats per second. Absent means **600 ms,
+then 25 per second** — the X server's and most Wayland compositors'
+figures, so a key held on nitro feels like one held anywhere else. A
+**rate of `0` turns repeat off** (`0,0` is the natural spelling; the
+delay is then ignored).
 
-**This stays true after M5-A**, despite what the wire now carries.
-`Keymap` (op `0x8208`, caps `KEYMAP`) has `rate_hz` and `delay_ms`
-fields — but they are **advisory**, describing the *user's preference*
-for a client that repeats on its own, exactly as `wl_keyboard`'s
-`repeat_info` does. The server still synthesises nothing, and until this
-key exists it sends `0, 0`, which the protocol defines as "do not repeat
-/ no preference". So the fields are the wire half of the setting, waiting
-for the setting — not evidence that it is already there. See
-`docs/wire.md` under `Keymap`.
+The values are bounded, and a value outside the bounds is **refused
+with a warning rather than clamped**: delay `100`–`2000` ms, rate
+`0`–`100` per second. Below 100 ms an ordinary keystroke starts
+repeating and words come out with doubled letters; above 100/s a typo
+(`25` → `250`, or the halves swapped) would fire a key into a client
+hundreds of times a second. A refused line leaves the default in force.
+
+**The server repeats, not the clients.** libinput reports one press and
+one release however long a key is held; the server arms a timer on the
+press and synthesises further `Key` presses to the window the press went
+to (`crates/nitro-server/src/repeat.rs`). That is what X does and it is
+chosen for the same reason: every client gets repeat — `nitro-term`,
+every toolkit app, and any client that never links the toolkit — at one
+rate set in one place. The one exception is a client that negotiated
+`KEYMAP`: it evaluates keys through its own `xkb_state` and repeats on
+its own, as a Wayland client does, from the `rate_hz`/`delay_ms` that
+`Keymap` carries (these two numbers; `0, 0` when repeat is off). The
+server sends such a client one press per press, or every key would
+repeat twice. See `docs/wire.md` under `Keymap`.
+
+What repeats and what does not:
+
+- **Only a key delivered to a client.** A compositor hotkey (Super+Q,
+  Alt+F4, Alt+Tab, the VT switches), a shell's binding, a popup's
+  Escape and a key withheld for a shell's pending hotkey never start a
+  repeat — holding Super+Q closes one window, not every window in the
+  MRU list.
+- **Not modifiers**, nor the lock keys: the keymap marks those
+  non-repeating, and the server additionally refuses any modifier
+  keysym.
+- **One key at a time, the newest.** Pressing `b` with `a` held moves
+  the repeat to `b`. A *modifier* press leaves it running, and the
+  repeat is re-resolved each time against the modifiers held now — so
+  holding `a` and adding Shift repeats `A`.
+
+It **stops** on the key's release, on a focus change (a key held while
+focus moves must not keep typing into the new window), on a keyboard
+grab changing, on every keyboard reset (VT switch, a keyboard unplugged,
+a keymap reload), when the session goes inactive, and whenever the window
+the press went to is no longer the one keys would go to.
+
+**An idle desktop makes no wakeups for it**: the timer is a timerfd
+armed only while a key is held and disarmed on release, as the
+deferred-flip timer is. A wakeup that was late sends one repeat, not the
+backlog it "owes". `stats` reports `key_repeats` (cumulative) and
+`key_repeating` (0 or 1 — 0 on an idle desktop, which is the check that
+nothing is stuck).
+
+It takes effect on **reload**, with nothing restarted. A change that
+only moves the repeat does **not** recompile the keymap or drop the
+modifiers you are holding; `KEYMAP` clients are re-sent the keymap with
+the new figures. `nitro-settings`' Keyboard page has a **Repeat delay**
+and a **Repeat rate** slider (rate 0 reads `off`); left at the default,
+Apply writes no `keyboard.repeat` line at all, so the default stays free
+to change in a later release.
 
 ### Colours: `theme.scheme` and `theme.<role>`
 

@@ -1607,8 +1607,8 @@ Same fields as `PointerEnter`.
 |---|---|---|
 | `format` | `u8` (`KeymapFormat`) | `XkbV1` (1) |
 | `size` | `u32` | bytes to map, **including** the trailing NUL |
-| `rate_hz` | `u32` | advisory repeat rate, repeats per second; 0 = none |
-| `delay_ms` | `u32` | advisory delay before the first repeat; 0 = none |
+| `rate_hz` | `u32` | repeat rate for the client's own repeat, per second; 0 = off |
+| `delay_ms` | `u32` | delay before the first repeat, ms; 0 = off |
 
 Fixed head **13 bytes**, plus one descriptor. Requires `KEYMAP`.
 
@@ -1640,16 +1640,17 @@ maps `MAP_PRIVATE` anyway), but it is what lets one file be shared by every
 client without any of them being able to change what the others map.
 
 
-**`rate_hz` and `delay_ms` are advisory.** They describe the *user's
-preference*, not a server behaviour: nitro synthesises no repeats, so a
-client that wants them repeats itself — exactly `wl_keyboard.repeat_info`,
-which is advisory for the same reason, and exactly what a Chromium backend
-wants since it repeats on its own. They ride here rather than on a message
-of their own because the server recompiles the keymap on config reload
-anyway, so the two always change together. **Until `keyboard.repeat`
-exists in `server.conf` the server sends `0, 0`** — do not read the fields
-as a promise; `docs/settings.md` § `keyboard.repeat` is the other half of
-this note.
+**`rate_hz` and `delay_ms` are for the client to repeat with.** They
+are `server.conf`'s `keyboard.repeat` (default 25/s after 600 ms), or
+`0, 0` when repeat is off. The server synthesises repeats for ordinary
+clients, but **not into a `KEYMAP` client**: such a client evaluates
+keys itself and repeats on its own with these figures — exactly
+`wl_keyboard.repeat_info`, and exactly what a Chromium backend wants.
+It therefore sees one `Key` press per physical press. They ride here
+rather than on a message of their own because the two change together
+on a config reload; a reload that changes only `keyboard.repeat`
+re-sends the same keymap with the new figures. See `docs/settings.md`
+§ `keyboard.repeat`.
 
 ### `Modifiers` — 0x8209
 

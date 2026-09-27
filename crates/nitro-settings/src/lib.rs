@@ -81,6 +81,7 @@
 //! hey nitro-settings get displays/HDMI-A-1/scale_value value   # 2
 //! hey nitro-settings set keyboard/layout value de
 //! hey nitro-settings do keyboard/nocaps toggle            # Caps Lock is Ctrl
+//! hey nitro-settings set keyboard/repeat_rate value 0     # key repeat off
 //! hey nitro-settings do apply click
 //! hey nitro-settings get status value                      # applied
 //! ```
@@ -331,6 +332,18 @@ const SCALE_MAX: f32 = 3.0;
 /// Slider step, and so the set of scales this app can write.
 const SCALE_STEP: f32 = 0.25;
 
+/// Shortest repeat delay the slider offers, ms: the server's
+/// `Repeat::MIN_DELAY_MS`, below which ordinary typing doubles letters.
+const REPEAT_DELAY_MIN: f32 = 100.0;
+/// Longest repeat delay the slider offers, ms: the server's
+/// `Repeat::MAX_DELAY_MS`.
+const REPEAT_DELAY_MAX: f32 = 2000.0;
+/// Delay slider step, ms.
+const REPEAT_DELAY_STEP: f32 = 50.0;
+/// Fastest repeat rate the slider offers, per second: the server's
+/// `Repeat::MAX_RATE_HZ`. The bottom of the range, 0, is off.
+const REPEAT_RATE_MAX: f32 = 100.0;
+
 /// Volume slider step: 5 %, which is what one press of a volume key is
 /// worth on most keyboards.
 const VOLUME_STEP: f32 = 0.05;
@@ -447,6 +460,15 @@ pub mod names {
     /// The "Caps Lock is Ctrl" switch: the `ctrl:nocaps` token inside
     /// [`OPTIONS`], as a control rather than as a string to type.
     pub const NOCAPS: &str = "nocaps";
+    /// `keyboard.repeat`'s first half: the delay slider, in ms.
+    pub const REPEAT_DELAY: &str = "repeat_delay";
+    /// The label showing the delay.
+    pub const REPEAT_DELAY_VALUE: &str = "repeat_delay_value";
+    /// `keyboard.repeat`'s second half: the rate slider, per second;
+    /// 0 is off.
+    pub const REPEAT_RATE: &str = "repeat_rate";
+    /// The label showing the rate, or `off`.
+    pub const REPEAT_RATE_VALUE: &str = "repeat_rate_value";
     /// The scratch field, to type in after Apply and see the new layout.
     pub const TEST: &str = "test";
 
@@ -781,6 +803,10 @@ struct Ids {
     variant: WidgetId,
     options: WidgetId,
     nocaps: WidgetId,
+    repeat_delay: WidgetId,
+    repeat_delay_value: WidgetId,
+    repeat_rate: WidgetId,
+    repeat_rate_value: WidgetId,
     volume: WidgetId,
     volume_value: WidgetId,
     mute: WidgetId,
@@ -894,6 +920,45 @@ pub fn build(ui: &mut Ui<Settings>) -> WidgetId {
         ui.build(card_row("Caps Lock is Ctrl").subtitle("Adds ctrl:nocaps to the options above"));
     ui.attach(nocaps_row, nocaps).unwrap();
     ui.attach(kb_card, nocaps_row).unwrap();
+
+    // Key repeat: `keyboard.repeat = <delay>,<rate>`, as two sliders
+    // because it is two numbers and both are judged by feel. The value
+    // labels are built first so the sliders' callbacks can capture them,
+    // as the volume row does. Applied with the rest on Apply; the server
+    // picks it up on the reload with nothing restarted.
+    let repeat_delay_value = ui.build(value_label(names::REPEAT_DELAY_VALUE));
+    let repeat_rate_value = ui.build(value_label(names::REPEAT_RATE_VALUE));
+    let repeat_delay = ui.build(
+        slider(conf::REPEAT_DEFAULT.0 as f32)
+            .name(names::REPEAT_DELAY)
+            .range(REPEAT_DELAY_MIN, REPEAT_DELAY_MAX)
+            .step(REPEAT_DELAY_STEP)
+            .width(SLIDER_WIDTH)
+            .min_width(80.0)
+            .on_change(move |_s: &mut Settings, ui: &mut Ui<Settings>, v: f32| {
+                set_label(ui, repeat_delay_value, &delay_text(v));
+            }),
+    );
+    let repeat_rate = ui.build(
+        slider(conf::REPEAT_DEFAULT.1 as f32)
+            .name(names::REPEAT_RATE)
+            .range(0.0, REPEAT_RATE_MAX)
+            .step(1.0)
+            .width(SLIDER_WIDTH)
+            .min_width(80.0)
+            .on_change(move |_s: &mut Settings, ui: &mut Ui<Settings>, v: f32| {
+                set_label(ui, repeat_rate_value, &rate_text(v));
+            }),
+    );
+    for (caption_text, sl, value) in [
+        ("Repeat delay", repeat_delay, repeat_delay_value),
+        ("Repeat rate", repeat_rate, repeat_rate_value),
+    ] {
+        let r = ui.build(card_row(caption_text));
+        ui.attach(r, sl).unwrap();
+        ui.attach(r, value).unwrap();
+        ui.attach(kb_card, r).unwrap();
+    }
 
     let test_card = ui.build(card());
     let test_row = ui.build(card_row("Test here"));
@@ -1103,6 +1168,10 @@ pub fn build(ui: &mut Ui<Settings>) -> WidgetId {
         variant,
         options,
         nocaps,
+        repeat_delay,
+        repeat_delay_value,
+        repeat_rate,
+        repeat_rate_value,
         volume,
         volume_value,
         mute,
@@ -1792,6 +1861,12 @@ fn collect(s: &Settings, ui: &Ui<Settings>, ids: Ids) -> (Conf, Vec<String>) {
         layout: field_text(ui, ids.layout),
         variant: field_text(ui, ids.variant),
         options: field_text(ui, ids.options),
+        // The sliders showing exactly the default write **no** line, as an
+        // untouched scale writes none: a `keyboard.repeat = 600,25` the
+        // user never chose would pin today's default into their file. A
+        // file that spelled the default out loses the line on Apply, which
+        // changes nothing the server does.
+        repeat: Some(repeat_values(ui, ids)).filter(|r| *r != conf::REPEAT_DEFAULT),
     };
     // The colour section is carried over from the file rather than
     // rendered from the widgets, and it is the one place this dialog
@@ -1906,6 +1981,18 @@ fn fill_keyboard(ui: &mut Ui<Settings>, ids: Ids, k: &KeyboardConf) {
     if let Ok(mut sw) = ui.widget_mut::<Switch<Settings>>(ids.nocaps) {
         sw.set_checked(on);
     }
+    // Setters again, so no callback runs: the labels are set alongside.
+    // A value outside the sliders' range is clamped into it, visibly —
+    // the scale slider's rule.
+    let (delay, rate) = k.repeat.unwrap_or(conf::REPEAT_DEFAULT);
+    for (id, v) in [(ids.repeat_delay, delay), (ids.repeat_rate, rate)] {
+        if let Ok(mut sl) = ui.widget_mut::<Slider<Settings>>(id) {
+            sl.set_value(v as f32);
+        }
+    }
+    let (delay, rate) = repeat_values(ui, ids);
+    set_label(ui, ids.repeat_delay_value, &delay_text(delay as f32));
+    set_label(ui, ids.repeat_rate_value, &rate_text(rate as f32));
 }
 
 /// Put the appearance section back to what the file says.
@@ -1966,6 +2053,42 @@ fn set_scheme(s: &mut Settings, ui: &mut Ui<Settings>, status: WidgetId, dark: b
 fn set_status(s: &mut Settings, ui: &mut Ui<Settings>, ids: Ids, text: &str) {
     text.clone_into(&mut s.status);
     set_label(ui, ids.status, text);
+}
+
+/// A slider's value label, right-aligned beside it.
+fn value_label(name: &str) -> LabelBuilder<Settings> {
+    label("")
+        .name(name)
+        .size(TEXT_SIZE)
+        .color_role(ColorRole::TextDim)
+        .width(64.0)
+        .align(nitro_ui::Align::Right)
+}
+
+/// The delay label: `600 ms`.
+#[must_use]
+pub fn delay_text(v: f32) -> String {
+    format!("{} ms", v.round() as u32)
+}
+
+/// The rate label: `25 /s`, or `off` at 0 — which is what 0 means.
+#[must_use]
+pub fn rate_text(v: f32) -> String {
+    let r = v.round() as u32;
+    if r == 0 {
+        "off".to_owned()
+    } else {
+        format!("{r} /s")
+    }
+}
+
+/// The two repeat sliders, as `(delay_ms, rate_hz)`.
+fn repeat_values(ui: &Ui<Settings>, ids: Ids) -> (u32, u32) {
+    let get = |id| {
+        ui.widget::<Slider<Settings>>(id)
+            .map_or(0, |s| s.value().round() as u32)
+    };
+    (get(ids.repeat_delay), get(ids.repeat_rate))
 }
 
 /// Set a label's text, ignoring a stale id.

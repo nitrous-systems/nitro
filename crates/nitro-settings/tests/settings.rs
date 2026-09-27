@@ -321,6 +321,7 @@ fn the_server_parser_reads_back_what_we_write() {
         layout: "de".to_owned(),
         variant: String::new(),
         options: "ctrl:nocaps".to_owned(),
+        repeat: Some((300, 40)),
     };
 
     let text = conf::render(&c);
@@ -346,6 +347,64 @@ fn the_server_parser_reads_back_what_we_write() {
     // always-written line has to land on the right side of it.
     assert_eq!(parsed.keyboard.variant.as_deref(), Some(""));
     assert_eq!(parsed.keyboard.options.as_deref(), Some("ctrl:nocaps"));
+    let r = parsed.keyboard.repeat.expect("keyboard.repeat");
+    assert_eq!((r.delay_ms, r.rate_hz), (300, 40));
+    // The sliders' "say nothing" value is the server's default.
+    let d = nitro_server::config::Repeat::DEFAULT;
+    assert_eq!((d.delay_ms, d.rate_hz), conf::REPEAT_DEFAULT);
+}
+
+#[test]
+fn the_repeat_sliders_write_keyboard_repeat_and_zero_is_off() {
+    let dir = scratch("repeat");
+    let path = dir.join(conf::FILE_NAME);
+    std::fs::write(&path, "keyboard.repeat = 300,40\n").expect("seed");
+    let mut h = harness_in(
+        &dir,
+        Settings::new()
+            .with_config_path(path.clone())
+            .with_audio_dirs(Vec::new())
+            .with_reload_wait(Duration::from_millis(50)),
+    );
+    h.settle();
+    // Seeded from the file.
+    let delay = named(&mut h, names::REPEAT_DELAY);
+    assert_eq!(
+        h.widget::<Slider<Settings>>(delay).value().to_bits(),
+        300f32.to_bits()
+    );
+    let rate_label = named(&mut h, names::REPEAT_RATE_VALUE);
+    assert_eq!(h.widget::<Label>(rate_label).text(), "40 /s");
+
+    // Rate to 0: the label says off and Apply writes it.
+    set_value(&mut h, names::REPEAT_RATE, "0");
+    assert_eq!(h.widget::<Label>(rate_label).text(), "off");
+    set_value(&mut h, names::REPEAT_DELAY, "450");
+    do_action(&mut h, names::APPLY, "click");
+    let text = std::fs::read_to_string(&path).expect("written");
+    assert!(text.contains("keyboard.repeat = 450,0\n"), "{text}");
+    let parsed = nitro_server::config::parse(&text);
+    assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+    assert!(!parsed.keyboard.repeat().enabled());
+
+    // Back to the default: no line at all, as an untouched scale.
+    set_value(&mut h, names::REPEAT_DELAY, "600");
+    set_value(&mut h, names::REPEAT_RATE, "25");
+    do_action(&mut h, names::APPLY, "click");
+    let text = std::fs::read_to_string(&path).expect("written");
+    assert!(!text.contains("keyboard.repeat"), "{text}");
+
+    // Revert puts the sliders back from the file.
+    std::fs::write(&path, "keyboard.repeat = 200,60\n").expect("rewrite");
+    do_action(&mut h, names::REVERT, "click");
+    assert_eq!(
+        h.widget::<Slider<Settings>>(delay).value().to_bits(),
+        200f32.to_bits()
+    );
+    assert_eq!(h.widget::<Label>(rate_label).text(), "60 /s");
+
+    h.quit();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -666,6 +725,10 @@ fn every_section_is_hey_addressable() {
         ("keyboard/variant", "textfield"),
         ("keyboard/options", "textfield"),
         ("keyboard/nocaps", "checkbox"),
+        ("keyboard/repeat_delay", "slider"),
+        ("keyboard/repeat_delay_value", "label"),
+        ("keyboard/repeat_rate", "slider"),
+        ("keyboard/repeat_rate_value", "label"),
         ("keyboard/test", "textfield"),
         ("audio", "container"),
         ("audio/volume", "slider"),

@@ -1418,15 +1418,13 @@ impl Body for OutputInfo {
 /// [`Key`] fields do not change: a toolkit that uses `keysym`/`utf8` never
 /// negotiates `KEYMAP` and never sees this.
 ///
-/// `rate_hz` and `delay_ms` are **advisory** and describe the *user's
-/// preference*, not a server behaviour: nitro synthesises no repeats, so a
-/// client that wants them repeats itself — exactly `wl_keyboard`'s
-/// `repeat_info`, and exactly what Chromium wants. `0` in either means "do
-/// not repeat / no preference", and until `keyboard.repeat` exists in
-/// `server.conf` the server sends `0, 0`; do not read the fields as a
-/// promise. They ride here rather than on a message of their own because
-/// the server recompiles the keymap on config reload anyway, so the two
-/// always change together.
+/// `rate_hz` and `delay_ms` are the figures a `KEYMAP` client repeats
+/// with: `server.conf`'s `keyboard.repeat`, or `0, 0` when repeat is off.
+/// The server synthesises repeats for ordinary clients but **not** into a
+/// `KEYMAP` client, which evaluates keys itself and repeats on its own —
+/// exactly `wl_keyboard`'s `repeat_info`, and exactly what Chromium wants.
+/// They ride here rather than on a message of their own because the two
+/// change together on a config reload.
 ///
 /// `PartialEq` compares the declared fields only, not which file the
 /// descriptor points at — the [`CreateBuffer`] precedent.
@@ -1436,9 +1434,9 @@ pub struct Keymap {
     pub format: KeymapFormat,
     /// Bytes to map, **including** the trailing NUL.
     pub size: u32,
-    /// Advisory repeat rate in repeats per second; 0 = do not repeat.
+    /// Repeat rate for the client's own repeat, per second; 0 = off.
     pub rate_hz: u32,
-    /// Advisory delay in milliseconds before the first repeat; 0 = none.
+    /// Delay in milliseconds before the first repeat; 0 = off.
     pub delay_ms: u32,
     /// Sealed memfd holding the keymap; map `PROT_READ | MAP_PRIVATE`.
     pub fd: OwnedFd,

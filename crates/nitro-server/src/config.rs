@@ -19,6 +19,7 @@
 //! keyboard.layout  = de
 //! keyboard.variant =
 //! keyboard.options = ctrl:nocaps
+//! keyboard.repeat  = 600,25
 //!
 //! theme.scheme = dark
 //! theme.accent = #6ca8f0
@@ -60,6 +61,7 @@
 //! | output position | — | `output.<c>.position` | left-to-right in connector order |
 //! | primary output | — | `output.<c>.primary` | the first connector |
 //! | keyboard | `XKB_DEFAULT_*` | `keyboard.*` | the `us` layout |
+//! | key repeat | — | `keyboard.repeat` | [`Repeat::DEFAULT`], 600 ms then 25/s |
 //! | colour scheme | — | `theme.scheme` | `light` |
 //! | one colour | — | `theme.<role>` | the scheme's value |
 //! | icon theme | — | `theme.icons` | `hicolor` |
@@ -151,13 +153,123 @@ pub struct KeyboardSettings {
     pub variant: Option<String>,
     /// `keyboard.options`, e.g. `ctrl:nocaps`.
     pub options: Option<String>,
+    /// `keyboard.repeat`, e.g. `600,25`. `None` means the file said
+    /// nothing and [`Repeat::DEFAULT`] applies.
+    pub repeat: Option<Repeat>,
 }
 
 impl KeyboardSettings {
     /// Whether the file says anything about the keyboard.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.layout.is_none() && self.variant.is_none() && self.options.is_none()
+        self.layout.is_none()
+            && self.variant.is_none()
+            && self.options.is_none()
+            && self.repeat.is_none()
+    }
+
+    /// Whether `other` compiles to the same keymap: the three xkb keys,
+    /// and **not** `repeat`. A reload that only changed the repeat rate
+    /// must not recompile the keymap — tens of milliseconds, and a reset
+    /// that drops every modifier the user is holding.
+    #[must_use]
+    pub fn same_keymap(&self, other: &Self) -> bool {
+        self.layout == other.layout
+            && self.variant == other.variant
+            && self.options == other.options
+    }
+
+    /// The repeat in force: the file's, else [`Repeat::DEFAULT`].
+    #[must_use]
+    pub fn repeat(&self) -> Repeat {
+        self.repeat.unwrap_or(Repeat::DEFAULT)
+    }
+}
+
+/// Key repeat: how long a key is held before it starts repeating, and how
+/// fast it repeats after that. `keyboard.repeat = <delay_ms>,<rate_hz>`.
+///
+/// The server synthesises the repeats (`crate::repeat`), so this is a
+/// behaviour, not advice — except to a `KEYMAP` client, which evaluates
+/// keys itself and gets these two numbers on `Keymap` to repeat with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Repeat {
+    /// Milliseconds from the press to the first repeat.
+    pub delay_ms: u32,
+    /// Repeats per second after that. **0 turns repeat off.**
+    pub rate_hz: u32,
+}
+
+impl Repeat {
+    /// What a file that says nothing gets: 600 ms, then 25 per second —
+    /// the X server's and most Wayland compositors' figures, so a key
+    /// held on nitro feels like one held anywhere else.
+    pub const DEFAULT: Self = Self {
+        delay_ms: 600,
+        rate_hz: 25,
+    };
+
+    /// Shortest delay a file may ask for. Below it an ordinary keystroke
+    /// — a press held for the 80–120 ms a typist holds one — starts
+    /// repeating, and every word comes out with doubled letters.
+    pub const MIN_DELAY_MS: u32 = 100;
+    /// Longest delay a file may ask for. Two seconds is already "repeat
+    /// is effectively off", which `rate 0` says honestly.
+    pub const MAX_DELAY_MS: u32 = 2000;
+    /// Fastest rate a file may ask for. A typo (`25` → `250`, or the two
+    /// numbers swapped) must not produce a key that fires hundreds of
+    /// times a second into a client.
+    pub const MAX_RATE_HZ: u32 = 100;
+
+    /// Whether this repeat repeats at all.
+    #[must_use]
+    pub fn enabled(self) -> bool {
+        self.rate_hz > 0
+    }
+
+    /// Parse `<delay_ms>,<rate_hz>`, or say what is wrong with it.
+    ///
+    /// Both halves are required and bounded — see the constants — because
+    /// a silently clamped value is a setting that does something other
+    /// than what the file says. A rate of `0` is "off" and skips the
+    /// delay's bounds: `0,0` is a natural way to write it.
+    ///
+    /// # Errors
+    /// A message naming the problem, for [`Settings::warnings`].
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let Some((delay, rate)) = value.split_once(',') else {
+            return Err("wants `<delay_ms>,<rate_hz>`, e.g. `600,25` (rate 0 = off)".to_owned());
+        };
+        let delay_ms: u32 = delay.trim().parse().map_err(|_| {
+            format!(
+                "delay {:?} is not a whole number of milliseconds",
+                delay.trim()
+            )
+        })?;
+        let rate_hz: u32 = rate
+            .trim()
+            .parse()
+            .map_err(|_| format!("rate {:?} is not a whole number per second", rate.trim()))?;
+        if rate_hz == 0 {
+            return Ok(Self {
+                delay_ms,
+                rate_hz: 0,
+            });
+        }
+        if rate_hz > Self::MAX_RATE_HZ {
+            return Err(format!(
+                "rate {rate_hz}/s is above the maximum of {}",
+                Self::MAX_RATE_HZ
+            ));
+        }
+        if !(Self::MIN_DELAY_MS..=Self::MAX_DELAY_MS).contains(&delay_ms) {
+            return Err(format!(
+                "delay {delay_ms} ms is outside {}..={} ms",
+                Self::MIN_DELAY_MS,
+                Self::MAX_DELAY_MS
+            ));
+        }
+        Ok(Self { delay_ms, rate_hz })
     }
 }
 
@@ -548,16 +660,12 @@ pub fn parse(text: &str) -> Settings {
                     }
                 }
             }
-            // Named explicitly rather than falling into "unknown key",
-            // because it is the one key a reader expects to find and it is
-            // deliberately absent: nothing in this stack repeats keys.
-            // libinput reports a press and a release, the server forwards
-            // them, and no client synthesises repeats — so a
-            // `keyboard.repeat` would be a promise with nothing behind it.
-            // See `docs/settings.md`.
-            "keyboard.repeat" => settings.warnings.push(format!(
-                "line {number}: `keyboard.repeat` is not implemented — nothing in nitro repeats keys yet (docs/settings.md)"
-            )),
+            "keyboard.repeat" => match Repeat::parse(value) {
+                Ok(r) => settings.keyboard.repeat = Some(r),
+                Err(e) => settings
+                    .warnings
+                    .push(format!("line {number}: keyboard.repeat {value:?}: {e}")),
+            },
             other => settings
                 .warnings
                 .push(format!("line {number}: unknown key `{other}`")),
@@ -855,6 +963,11 @@ mod tests {
             "output.X.rotation = 90",
             "keyboard = de",
             "keyboard.repeat = 300,25",
+            "keyboard.repeat = 300",
+            "keyboard.repeat = ,",
+            "keyboard.repeat = -1,25",
+            "keyboard.repeat = 300,1000",
+            "keyboard.repeat = 99999999999,5",
             "remote.listen",
             "remote.listen = ",
             "remote.listen = :",
@@ -1050,17 +1163,73 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_repeat_is_refused_by_name() {
-        // Not "unknown": it is the key a reader most expects, and the
-        // warning has to say *why* it does nothing rather than imply a typo.
+    fn keyboard_repeat_is_delay_then_rate() {
         let s = parse("keyboard.repeat = 300,25\n");
-        assert_eq!(s.warnings.len(), 1);
-        assert!(
-            s.warnings[0].contains("not implemented"),
-            "{:?}",
-            s.warnings
+        assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+        assert_eq!(
+            s.keyboard.repeat,
+            Some(Repeat {
+                delay_ms: 300,
+                rate_hz: 25
+            })
         );
-        assert!(s.is_empty());
+        assert!(!s.is_empty());
+        // Whitespace around either half is tolerated, like `position`.
+        let s = parse("keyboard.repeat = 250 , 40\n");
+        assert_eq!(s.keyboard.repeat().delay_ms, 250);
+        assert_eq!(s.keyboard.repeat().rate_hz, 40);
+    }
+
+    #[test]
+    fn saying_nothing_about_repeat_is_the_default() {
+        let s = parse("keyboard.layout = de\n");
+        assert_eq!(s.keyboard.repeat, None);
+        assert_eq!(s.keyboard.repeat(), Repeat::DEFAULT);
+        assert!(Repeat::DEFAULT.enabled());
+    }
+
+    #[test]
+    fn a_rate_of_zero_turns_repeat_off() {
+        for text in ["keyboard.repeat = 0,0\n", "keyboard.repeat = 600,0\n"] {
+            let s = parse(text);
+            assert!(s.warnings.is_empty(), "{text}: {:?}", s.warnings);
+            assert!(!s.keyboard.repeat().enabled(), "{text}");
+        }
+    }
+
+    #[test]
+    fn nonsense_repeat_values_are_refused_not_clamped() {
+        // Each of these is a typo that, taken at its word or clamped,
+        // would give a key that fires absurdly fast or never. Refused
+        // with a warning: the default stays in force.
+        for value in [
+            "300", "300,", ",25", "-1,25", "300,-5", "fast,25", "300,1000", "300,101", "5,25",
+            "99,25", "2001,25", "300,25,1", "1.5,25",
+        ] {
+            let s = parse(&format!("keyboard.repeat = {value}\n"));
+            assert_eq!(s.warnings.len(), 1, "{value}: {:?}", s.warnings);
+            assert!(
+                s.warnings[0].contains("keyboard.repeat"),
+                "{:?}",
+                s.warnings
+            );
+            assert_eq!(s.keyboard.repeat, None, "{value}");
+        }
+        // The edges themselves are allowed.
+        for value in ["100,100", "2000,1"] {
+            let s = parse(&format!("keyboard.repeat = {value}\n"));
+            assert!(s.warnings.is_empty(), "{value}: {:?}", s.warnings);
+        }
+    }
+
+    #[test]
+    fn a_repeat_change_is_not_a_keymap_change() {
+        let a = parse("keyboard.layout = de\nkeyboard.repeat = 300,25\n").keyboard;
+        let b = parse("keyboard.layout = de\nkeyboard.repeat = 500,10\n").keyboard;
+        assert!(a.same_keymap(&b));
+        assert_ne!(a, b);
+        let c = parse("keyboard.layout = us\nkeyboard.repeat = 300,25\n").keyboard;
+        assert!(!a.same_keymap(&c));
     }
 
     #[test]

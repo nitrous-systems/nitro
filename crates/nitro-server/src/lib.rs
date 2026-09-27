@@ -15,6 +15,7 @@
 //! | seat               | `Seat::dispatch`: `Disable` → suspend input, pause, ack; `Enable` → resume, full repaint |
 //! | backend `poll_fds` | `Backend::dispatch`: `Flipped` → present + paint the next frame, `Hotplug` → rescan |
 //! | libinput           | dispatch, convert, route, paint if anything moved   |
+//! | repeat timerfd     | send the held key again ([`repeat`]); armed only while a key is held |
 //! | signal self-pipe   | SIGTERM/SIGINT → orderly shutdown                    |
 //! | SIGHUP self-pipe   | re-read `server.conf` and apply it                   |
 //! | config inotify     | the configuration directory changed → the same reload |
@@ -53,6 +54,7 @@ pub mod popup;
 pub mod protocol;
 pub mod remote;
 pub mod render;
+pub mod repeat;
 pub mod shell;
 pub mod signals;
 pub mod stats;
@@ -514,6 +516,8 @@ const TOK_SIGHUP: u64 = 10;
 /// from the epoll set entirely when it did not, which is why the feature
 /// costs an ordinary desktop nothing (see [`remote`]).
 const TOK_REMOTE_LISTENER: u64 = 11;
+/// The key-repeat timerfd; see [`repeat`]. Armed only while a key is held.
+const TOK_REPEAT: u64 = 12;
 /// How long an unanswered input keeps waiting for a frame to claim it.
 /// Beyond this the number would not be a latency any more: nothing
 /// responded to the event, and attributing the next unrelated frame to it
@@ -944,6 +948,8 @@ struct Server {
     /// The clients whose answer a cursor-only flip is waiting for, and the
     /// timer that bounds the wait. See [`defer`].
     defer: DeferredFlip,
+    /// The held key being auto-repeated, and its timer. See [`repeat`].
+    key_repeat: repeat::KeyRepeat,
 
     /// Exclusive zones and anchors set by shell clients; see [`shell`].
     zones: shell::Zones,
@@ -1258,6 +1264,7 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         popup_scratch: Vec::new(),
         pending_input_ns: 0,
         defer: defer::DeferredFlip::new().map_err(errno("create the deferred-flip timer"))?,
+        key_repeat: repeat::KeyRepeat::new().map_err(errno("create the key-repeat timer"))?,
         zones: shell::Zones::new(),
         hotkeys: shell::HotKeys::new(),
         window_refs: shell::WindowRefs::new(),
@@ -1290,6 +1297,8 @@ pub fn run(mut config: Config) -> Result<(), Error> {
     // disarmed unless a flip is actually being held, so a registered fd
     // that never fires costs an idle server nothing.
     add(&server.epoll, &server.defer.as_fd(), TOK_DEFER)?;
+    // Likewise the repeat timer: armed only while a key is held down.
+    add(&server.epoll, &server.key_repeat.as_fd(), TOK_REPEAT)?;
     // The third listener, and the only one that is optional. Applied here
     // through the same function the reload path uses, so "what
     // `remote.listen` means" has exactly one implementation.
@@ -2477,6 +2486,7 @@ impl Server {
                     TOK_INPUT => self.on_input(),
                     TOK_INPUT_HOTPLUG => self.on_input_hotplug(),
                     TOK_DEFER => self.on_defer_deadline(),
+                    TOK_REPEAT => self.on_key_repeat(),
                     // Shell tokens sort above wire tokens, so this arm has
                     // to come first; both end up in `on_wire_client`,
                     // because a shell client *is* a wire client with an
@@ -2505,6 +2515,9 @@ impl Server {
                     // Input first: libinput must have let go of its device
                     // fds before the ack, or the VT switch hangs.
                     self.input.suspend();
+                    // The release of a held key will arrive on the other
+                    // VT, if anywhere: stop repeating it now.
+                    self.stop_key_repeat();
                     self.backend.pause();
                     self.active = false;
                     if let Some(seat) = self.seat.as_ref() {
@@ -2527,6 +2540,7 @@ impl Server {
                     // the release that would complete it never arrived.
                     if let Some(kb) = self.keyboard.as_mut() {
                         kb.reset();
+                        self.stop_key_repeat();
                     }
                     self.sync_modifiers();
                     self.hotkeys.reset();
@@ -2914,6 +2928,7 @@ impl Server {
             && let Some(kb) = self.keyboard.as_mut()
         {
             kb.reset();
+            self.stop_key_repeat();
         }
         if removed > 0 {
             self.sync_modifiers();
@@ -3025,7 +3040,8 @@ impl Server {
         for w in &settings.warnings {
             warn!("{}: {w}", path.display());
         }
-        let keyboard_changed = settings.keyboard != self.settings.keyboard;
+        let keyboard_changed = !settings.keyboard.same_keymap(&self.settings.keyboard);
+        let repeat_changed = settings.keyboard.repeat() != self.settings.keyboard.repeat();
         let icons_changed = settings.theme.icon_theme() != self.settings.theme.icon_theme();
         let palette = settings.palette();
         self.settings = settings;
@@ -3073,6 +3089,7 @@ impl Server {
             // use. The shell's armed tap goes with it.
             if let Some(kb) = self.keyboard.as_mut() {
                 kb.reset();
+                self.stop_key_repeat();
             }
             self.hotkeys.reset();
             self.hotkey_pending = None;
@@ -3087,6 +3104,22 @@ impl Server {
                 }
             }
             self.sync_modifiers();
+        } else if repeat_changed {
+            // Only the repeat moved: no recompile, no reset, nothing the
+            // user is holding is dropped. A `KEYMAP` client repeats on its
+            // own from the figures `Keymap` carries, so it gets the same
+            // keymap again with the new ones (the wire has no separate
+            // message for them, by design — `docs/wire.md` § `Keymap`).
+            let tokens: Vec<u64> = self.wire_clients.keys().copied().collect();
+            for token in tokens {
+                self.send_keymap(token);
+            }
+        }
+        // A key repeating at the old rate stops; the next press starts at
+        // the new one. Simpler than re-timing a live repeat, and a reload
+        // with a key held is not a case worth a second code path.
+        if repeat_changed {
+            self.stop_key_repeat();
         }
 
         // The icon theme, only when it moved, and for the same reason the
@@ -3717,6 +3750,18 @@ impl Server {
             .keyboard
             .as_mut()
             .map_or_else(keyboard::KeyResolution::none, |kb| kb.key(keycode, pressed));
+        // Repeat bookkeeping, before any early return below. A release of
+        // the repeating key ends it; so does the press of any other key
+        // that is not a modifier (the new key takes over the repeat if it
+        // is delivered, at the end of this function — and if it was a
+        // hotkey or a shell binding, nothing repeats). A modifier press
+        // leaves it running, so holding `a` and adding Shift repeats `A`.
+        let repeating = self.key_repeat.held().map(|h| h.keycode);
+        if (!pressed && repeating == Some(keycode))
+            || (pressed && keyboard::mod_of_keysym(resolved.keysym).is_none())
+        {
+            self.stop_key_repeat();
+        }
         if pressed && let Some(hotkey) = keyboard::hotkey(resolved.keysym, resolved.named) {
             // While locked the only compositor chord is a VT switch: it
             // leaves this session locked behind it, and it is how a user
@@ -3842,8 +3887,105 @@ impl Server {
                 utf8: utf8.clone(),
             })
         });
+        if pressed && let Some(token) = sent_to {
+            self.start_key_repeat(keycode, window, token);
+        }
         self.note_client_input(sent_to);
         self.note_input(time_ns);
+    }
+
+    /// Start repeating a press that was just delivered to `window`'s
+    /// client `token`, if it should repeat. See [`repeat`] for the rules.
+    ///
+    /// Not for a `KEYMAP` client: it evaluates keys itself and repeats on
+    /// its own from `Keymap`'s `rate_hz`/`delay_ms`, exactly as a Wayland
+    /// client does, so a server repeat would type every key twice. And
+    /// not without a keymap: xkb is what says which keys repeat.
+    fn start_key_repeat(&mut self, keycode: u32, window: WindowKey, token: u64) {
+        let Some(kb) = self.keyboard.as_ref() else {
+            return;
+        };
+        if !kb.repeats(keycode) {
+            return;
+        }
+        if self
+            .wire_clients
+            .get(&token)
+            .is_none_or(|c| c.client_caps & nitro_wire::types::caps::KEYMAP != 0)
+        {
+            return;
+        }
+        let repeat = self.settings.keyboard.repeat();
+        if let Err(e) = self
+            .key_repeat
+            .start(keycode, window, monotonic_ns(), repeat)
+        {
+            warn!("key repeat: arm: {e}");
+        }
+    }
+
+    /// Stop any key repeat. Cheap when nothing is repeating.
+    fn stop_key_repeat(&mut self) {
+        if let Err(e) = self.key_repeat.stop() {
+            warn!("key repeat: disarm: {e}");
+        }
+    }
+
+    /// The repeat timer fired: send the held key again.
+    ///
+    /// Re-checks that the window the press went to is still the one keys
+    /// go to — grab, focus, lock, a shell's pending hotkey — and stops
+    /// instead of sending if it is not. Every path that moves the
+    /// recipient already stops the repeat; this is the backstop for the
+    /// ones that do so lazily (a grab on a window that stopped showing).
+    ///
+    /// The key is re-resolved against the **current** modifier state
+    /// ([`Keyboard::resolve_held`]), and its `time_ns` is now: a repeat
+    /// is a new event, not a replay of the old one.
+    fn on_key_repeat(&mut self) {
+        let now = monotonic_ns();
+        let held = match self.key_repeat.fire(now, self.settings.keyboard.repeat()) {
+            Ok(Some(held)) => held,
+            Ok(None) => return,
+            Err(e) => {
+                warn!("key repeat: re-arm: {e}");
+                return;
+            }
+        };
+        let grab = self.grab_target().filter(|w| self.scene.admits_window(*w));
+        let focus = self.focus.filter(|w| self.scene.admits_window(*w));
+        if grab.or(focus) != Some(held.window) || self.withheld(held.window) {
+            self.stop_key_repeat();
+            return;
+        }
+        let Some(resolved) = self
+            .keyboard
+            .as_ref()
+            .map(|kb| kb.resolve_held(held.keycode))
+        else {
+            self.stop_key_repeat();
+            return;
+        };
+        let sent_to = self.send_input(held.window, |id| {
+            ServerMsg::Key(msg::Key {
+                window: id,
+                keycode: held.keycode,
+                state: ButtonState::Pressed,
+                mods: resolved.mods,
+                keysym: resolved.keysym,
+                time_ns: now,
+                utf8: resolved.utf8.clone(),
+            })
+        });
+        if sent_to.is_none() {
+            // The client went away under the key.
+            self.stop_key_repeat();
+            return;
+        }
+        self.note_client_input(sent_to);
+        self.note_input(now);
+        self.flush_wire_clients();
+        self.settle();
     }
 
     /// Act on one compositor hotkey.
@@ -4185,6 +4327,9 @@ impl Server {
         let old = self.focus;
         self.focus = window;
         self.wm.set_focus(window);
+        // A key held while focus moves must not keep typing into the
+        // window that just got it — the classic stuck-key bug.
+        self.stop_key_repeat();
         if let Some(new) = window {
             self.send_to_window(new, |id| {
                 ServerMsg::Focus(msg::Focus {
@@ -4306,14 +4451,17 @@ impl Server {
         self.send_modifiers_to(token);
     }
 
-    /// The key-repeat advice `Keymap` carries: advisory, the user's
-    /// preference, and the value a `KEYMAP` client should use for its
-    /// *own* repeat (`docs/wire.md` § `Keymap`). `0, 0` = no preference,
-    /// which is all there is until `keyboard.repeat` exists in
-    /// `server.conf` — #3782 changes this body and nothing else here.
-    #[allow(clippy::unused_self)]
+    /// The key-repeat figures `Keymap` carries: `keyboard.repeat` (or its
+    /// default), which a `KEYMAP` client uses for its *own* repeat because
+    /// the server does not repeat into it (`docs/wire.md` § `Keymap`).
+    /// `0, 0` when repeat is off.
     fn repeat_advice(&self) -> (u32, u32) {
-        (0, 0)
+        let r = self.settings.keyboard.repeat();
+        if r.enabled() {
+            (r.rate_hz, r.delay_ms)
+        } else {
+            (0, 0)
+        }
     }
 
     // ------------------------------------------------------ window management
@@ -5741,6 +5889,11 @@ impl Server {
         // zero: a non-zero value means someone types faster than the shell
         // wakes, which is exactly the race this counter exists to pin.
         pairs.push(("keys_withheld", self.keys_withheld));
+        // Key repeats synthesised (`repeat`), cumulative, and whether a
+        // key is repeating right now. The second is 0 on an idle desktop,
+        // which is the check that nothing is left stuck.
+        pairs.push(("key_repeats", self.key_repeat.repeats));
+        pairs.push(("key_repeating", u64::from(self.key_repeat.held().is_some())));
         // The clipboard (M5-H). Relayed owner descriptors, the server's own
         // EOF answers, and requests parked waiting for an owner. The first
         // two are cumulative; the third returns to 0 whenever every owner
@@ -6528,6 +6681,10 @@ impl Server {
                 self.apply_anchor(win);
             }
             shell::WindowOp::Grab(on) => {
+                // Who the keyboard goes to is about to change (or be
+                // re-asserted): a repeat started for the old recipient
+                // ends here.
+                self.stop_key_repeat();
                 if on {
                     self.grab = Some(win);
                 } else if self.grab == Some(win) {

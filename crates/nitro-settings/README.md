@@ -202,6 +202,7 @@ $ hey nitro-settings set displays/HDMI-A-1/x value 0
 $ hey nitro-settings get displays/HDMI-A-1/scale_value value   # 2
 $ hey nitro-settings set keyboard/layout value de
 $ hey nitro-settings do keyboard/nocaps toggle                 # Caps Lock is Ctrl
+$ hey nitro-settings set keyboard/repeat_rate value 0          # key repeat off
 $ hey nitro-settings do apply click
 $ hey nitro-settings get status value                          # applied
 ```

@@ -266,6 +266,37 @@ impl Keyboard {
         }
     }
 
+    /// Whether a held `evdev_keycode` should auto-repeat.
+    ///
+    /// The keymap's own answer first — xkb marks modifiers, lock keys and
+    /// a few others `repeat = false` — and then the modifier keysyms
+    /// regardless, so a keymap that forgot to mark Shift still does not
+    /// machine-gun it into a client.
+    #[must_use]
+    pub fn repeats(&self, evdev_keycode: u32) -> bool {
+        let code = keycode(evdev_keycode);
+        self.keymap.key_repeats(code) && mod_of_keysym(self.peek(evdev_keycode)).is_none()
+    }
+
+    /// What a key that is **already held** produces now, without changing
+    /// state: the press [`crate::repeat`] synthesises.
+    ///
+    /// Resolved against the *current* state rather than remembered from
+    /// the original press, so holding `a` and then pressing Shift repeats
+    /// `A` — which is what every other desktop does.
+    #[must_use]
+    pub fn resolve_held(&self, evdev_keycode: u32) -> KeyResolution {
+        let code = keycode(evdev_keycode);
+        let named = self.named_mods();
+        KeyResolution {
+            keysym: self.state.key_get_one_sym(code).raw(),
+            utf8: self.state.key_get_utf8(code),
+            mods: self.state.serialize_mods(xkb::STATE_MODS_EFFECTIVE),
+            named,
+            ctrl_alt: named.ctrl_alt(),
+        }
+    }
+
     /// The keysym a keycode currently resolves to, without changing state.
     pub fn peek(&self, evdev_keycode: u32) -> u32 {
         self.state.key_get_one_sym(keycode(evdev_keycode)).raw()
@@ -750,6 +781,23 @@ mod tests {
         assert_eq!(r.utf8, "a");
         assert_eq!(r.mods, 0);
         assert!(!r.named.shift);
+    }
+
+    #[test]
+    fn letters_repeat_and_modifiers_do_not() {
+        let Some(mut kb) = Keyboard::new() else {
+            return;
+        };
+        assert!(kb.repeats(EVDEV_A));
+        assert!(!kb.repeats(EVDEV_LEFTSHIFT));
+        assert!(!kb.repeats(EVDEV_CAPSLOCK));
+        // A held key re-resolves against the state as it is now.
+        kb.key(EVDEV_A, true);
+        assert_eq!(kb.resolve_held(EVDEV_A).utf8, "a");
+        kb.key(EVDEV_LEFTSHIFT, true);
+        let r = kb.resolve_held(EVDEV_A);
+        assert_eq!(r.utf8, "A");
+        assert!(r.named.shift);
     }
 
     #[test]

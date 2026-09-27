@@ -285,7 +285,9 @@ fn a_keymap_client_gets_a_keymap_it_can_compile() {
     ] {
         assert_ne!(km.mod_get_index(name), xkb::MOD_INVALID, "{name}");
     }
-    // Repeat advice: nothing configured, so no preference.
+    // The repeat figures: nothing configured, so the default — which a
+    // `KEYMAP` client repeats with itself, the server does not repeat
+    // into it. Pinned in `tests/repeat.rs`.
     drop(conn);
     h.quit();
 }

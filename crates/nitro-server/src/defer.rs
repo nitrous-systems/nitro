@@ -230,7 +230,7 @@ impl DeferredFlip {
 /// which is the one value that must not silently mean "never", so it is
 /// clamped to the first nanosecond of the epoch — long past, and a
 /// timerfd armed for the past fires at once.
-fn arm(fd: BorrowedFd<'_>, deadline_ns: u64) -> rustix::io::Result<()> {
+pub(crate) fn arm(fd: BorrowedFd<'_>, deadline_ns: u64) -> rustix::io::Result<()> {
     let deadline_ns = deadline_ns.max(1);
     let spec = Itimerspec {
         it_interval: Timespec {
