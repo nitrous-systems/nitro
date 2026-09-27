@@ -368,7 +368,6 @@ pub enum Hotkey {
 /// would surprise its own users. Only the bare chord: Ctrl+Alt+F4 is a VT
 /// switch (handled above it), and Alt+Shift+F4 / Super+Alt+F4 stay the
 /// application's.
-
 #[must_use]
 pub fn hotkey(keysym: u32, mods: Mods) -> Option<Hotkey> {
     if mods.ctrl_alt() {
