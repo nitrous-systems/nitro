@@ -7,6 +7,10 @@
 //! that touches an image, so "released" means "no image node references
 //! it" — see `Scene::take_released_buffers`.
 
+// `a`/`b` are the two buffers of a double-buffered client, which is what
+// the protocol docs call them; longer names would obscure the rotation.
+#![allow(clippy::many_single_char_names)]
+
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::os::fd::{AsFd as _, OwnedFd};
 use std::os::unix::net::UnixStream;
