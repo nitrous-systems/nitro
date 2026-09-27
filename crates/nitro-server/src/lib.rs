@@ -2791,6 +2791,11 @@ impl Server {
             self.update_scene();
         }
         self.paint_or_defer();
+        // A commit stamped while this flip was in flight (#646) is in
+        // `painting`; if nothing is left to paint, no frame will carry it.
+        self.answer_idle_clients();
+        self.flush_wire_clients();
+
     }
 
     fn on_accept(&mut self) -> Result<(), Error> {

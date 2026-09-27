@@ -587,3 +587,26 @@ fn releases_cause_no_flip_and_no_wakeup_when_idle() {
     drop(conn);
     h.quit();
 }
+
+/// #646: an empty commit landing while a swap's age-2 follow-up flip is in
+/// flight still gets its `Presented`.
+#[test]
+fn an_empty_commit_right_after_a_swap_is_presented() {
+    let mut h = Harness::start("empty646");
+    h.park();
+    let mut conn = h.client("empty");
+    let mut seen = Vec::new();
+    let a = Buf::new(1, RED);
+    let b = Buf::new(2, GREEN);
+    conn.tx().create_buffer(a.create()).create_buffer(b.create()).commit(1).unwrap();
+    conn.flush().unwrap();
+    presented(&mut conn, &mut seen, 1);
+    let (_, image, _) = image_window(&mut conn, &mut seen, 10, &a, 2);
+    attach(&mut conn, image, &b, 3);
+    presented(&mut conn, &mut seen, 3);
+    conn.tx().commit(40).unwrap();
+    conn.flush().unwrap();
+    presented(&mut conn, &mut seen, 40);
+    drop(conn);
+    h.quit();
+}
