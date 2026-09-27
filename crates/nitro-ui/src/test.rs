@@ -733,7 +733,9 @@ impl<S: 'static> Harness<S> {
             size,
             position,
             scale: self.ui.scale_of(win),
-            output: 0,
+            // What a real resize `Configure` carries: the output the
+            // window is already on, so `on_window_placed` does not fire.
+            output: self.ui.window_output(win).unwrap_or(0),
         });
         self.ui.dispatch(&mut self.state, &msg);
         self.settle();

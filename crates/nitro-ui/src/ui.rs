@@ -117,6 +117,12 @@ struct Window<S> {
     resize_handlers: Vec<Option<ResizeHandler<S>>>,
     /// Run once when the window goes; see [`Ui::on_window_closed`].
     close_handlers: Vec<OnceCallback<S>>,
+    /// The output the server put the window on, from the last
+    /// `Configure`; `None` until the first one arrives.
+    output: Option<u32>,
+    /// Run when `output` changes; see [`Ui::on_window_placed`]. Taken out
+    /// while running, like `resize_handlers`.
+    placed_handlers: Vec<Option<PlacedHandler<S>>>,
 }
 
 impl<S> Window<S> {
@@ -139,6 +145,8 @@ impl<S> Window<S> {
             visible: true,
             resize_handlers: Vec::new(),
             close_handlers: Vec::new(),
+            output: None,
+            placed_handlers: Vec::new(),
         }
     }
 }
@@ -356,6 +364,7 @@ type FrameHandler<S> = Box<dyn FnMut(&mut S, &mut Ui<S>, Frame)>;
 
 /// A window-resize handler; see [`Ui::on_resize`].
 type ResizeHandler<S> = Box<dyn FnMut(&mut S, &mut Ui<S>, Size)>;
+type PlacedHandler<S> = Box<dyn FnMut(&mut S, &mut Ui<S>, u32)>;
 
 /// A palette-change handler; see [`Ui::on_theme`].
 type ThemeHandler<S> = Box<dyn FnMut(&mut S, &mut Ui<S>)>;
@@ -695,9 +704,9 @@ impl<S: 'static> Ui<S> {
     /// resize handlers; events the server sends for it are routed to it
     /// and nowhere else. It is created in the next commit, with the app
     /// id, exactly as [`Ui::open_window`] creates the main window, and
-    /// sized to `size` or to the root's measured size. It is always an
-    /// ordinary (`Normal`-layer) window: shell surfaces are a property of
-    /// the main window.
+    /// sized to `size` or to the root's measured size. It is an ordinary
+    /// (`Normal`-layer) window; a shell opening a second panel uses
+    /// [`Ui::add_surface_window`].
     ///
     /// Closing it — from the app with [`Ui::remove_window`], or by the
     /// user through the server — destroys its tree and runs the handlers
@@ -714,6 +723,39 @@ impl<S: 'static> Ui<S> {
         size: Option<Size>,
         root: WidgetId,
     ) -> Result<WindowId, Error> {
+        self.add_window_with(title, size, root, None)
+    }
+
+    /// Open another window as a shell surface: what a bar uses for its
+    /// second and later panels, with the anchor naming the output each
+    /// one is for ([`Anchor::on`](crate::shell::Anchor::on)).
+    ///
+    /// As [`Ui::add_window`], but the window is created on the surface's
+    /// layer with its flags, and its anchor and exclusive zone ride the
+    /// **same commit** as the `CreateWindow` — the reason a bar paints at
+    /// its final size from the first frame (see [`Ui::set_surface`]).
+    /// Only meaningful on a shell connection ([`Ui::is_shell`]); anywhere
+    /// else the server refuses the layer.
+    ///
+    /// # Errors
+    /// As [`Ui::add_window`].
+    pub fn add_surface_window(
+        &mut self,
+        title: &str,
+        size: Option<Size>,
+        root: WidgetId,
+        surface: crate::shell::Surface,
+    ) -> Result<WindowId, Error> {
+        self.add_window_with(title, size, root, Some(surface))
+    }
+
+    fn add_window_with(
+        &mut self,
+        title: &str,
+        size: Option<Size>,
+        root: WidgetId,
+        surface: Option<crate::shell::Surface>,
+    ) -> Result<WindowId, Error> {
         if !self.arena.is_live(root) {
             return Err(Error::StaleWidget);
         }
@@ -727,13 +769,18 @@ impl<S: 'static> Ui<S> {
             Size::new(m.w.max(1.0).ceil(), m.h.max(1.0).ceil())
         };
         let id = WindowId(self.wire.alloc_node());
-        self.wire
-            .create_window(id.0, title, size, nitro_wire::types::Layer::Normal, 0)?;
+        let (layer, flags) = surface.map_or((nitro_wire::types::Layer::Normal, 0), |s| {
+            (s.layer, s.flags)
+        });
+        self.wire.create_window(id.0, title, size, layer, flags)?;
         if !self.app_id.is_empty() {
             let app_id = std::mem::take(&mut self.app_id);
             let sent = self.wire.set_app_id(id.0, &app_id);
             self.app_id = app_id;
             sent?;
+        }
+        if let Some(s) = surface {
+            self.apply_surface(id.0, s)?;
         }
         let mut w = Window::new(id);
         w.root = Some(root);
@@ -744,6 +791,23 @@ impl<S: 'static> Ui<S> {
         self.windows.push(w);
         self.mark(root, Dirty::LAYOUT | Dirty::PAINT | Dirty::TREE);
         Ok(id)
+    }
+
+    /// Queue a surface's anchor and zone for window `id`, in the commit
+    /// its `CreateWindow` is in.
+    ///
+    /// The anchor goes first: shell ops apply in order at the commit, and
+    /// an anchor naming another output moves the window there, so the
+    /// zone that follows is taken off *that* output's work area rather
+    /// than briefly off the one the window was created on.
+    fn apply_surface(&mut self, id: NodeId, s: crate::shell::Surface) -> Result<(), Error> {
+        if let Some(a) = s.anchor {
+            self.wire.set_anchor(id, a.edges, a.margin, a.output)?;
+        }
+        if let Some((edge, px)) = s.zone {
+            self.wire.set_exclusive_zone(id, edge, px)?;
+        }
+        Ok(())
     }
 
     /// Close a window this app opened with [`Ui::add_window`].
@@ -839,6 +903,51 @@ impl<S: 'static> Ui<S> {
     ) {
         if let Some(w) = self.win_mut(win) {
             w.resize_handlers.push(Some(Box::new(handler)));
+        }
+    }
+
+    /// Run `handler` with the output id whenever the server puts `win` on
+    /// a different output: on its first `Configure`, and on every later
+    /// move or migration. A plain resize does not fire it.
+    ///
+    /// This is the hook a per-output shell keys on, and [`Ui::on_resize`]
+    /// is the wrong one: the `Outputs` snapshot is sent before the main
+    /// window's first `Configure`, so a bar cannot know which output it
+    /// must *not* open a second panel on until the server says where the
+    /// main window went — and a resize says nothing about that.
+    /// Registering on a window that does not exist does nothing.
+    pub fn on_window_placed(
+        &mut self,
+        win: WindowId,
+        handler: impl FnMut(&mut S, &mut Ui<S>, u32) + 'static,
+    ) {
+        if let Some(w) = self.win_mut(win) {
+            w.placed_handlers.push(Some(Box::new(handler)));
+        }
+    }
+
+    /// The output `win` is on, from its last `Configure`; `None` before
+    /// the first one or for an unknown window.
+    #[must_use]
+    pub fn window_output(&self, win: WindowId) -> Option<u32> {
+        self.win(win).and_then(|w| w.output)
+    }
+
+    /// Run one window's placed handlers; see [`Ui::on_window_placed`].
+    fn dispatch_placed_in(&mut self, state: &mut S, win: WindowId, output: u32) {
+        let n = self.win(win).map_or(0, |w| w.placed_handlers.len());
+        for i in 0..n {
+            let Some(mut h) = self
+                .win_mut(win)
+                .and_then(|w| w.placed_handlers.get_mut(i))
+                .and_then(Option::take)
+            else {
+                continue;
+            };
+            h(state, self, output);
+            if let Some(slot) = self.win_mut(win).and_then(|w| w.placed_handlers.get_mut(i)) {
+                *slot = Some(h);
+            }
         }
     }
 
@@ -1763,12 +1872,7 @@ impl<S: 'static> Ui<S> {
         // bar that anchored a frame later would paint once at the
         // placeholder size above and then jump. See `docs/shell.md`.
         if let Some(s) = surface {
-            if let Some(a) = s.anchor {
-                self.wire.set_anchor(main, a.edges, a.margin)?;
-            }
-            if let Some((edge, px)) = s.zone {
-                self.wire.set_exclusive_zone(main, edge, px)?;
-            }
+            self.apply_surface(main, s)?;
         }
         self.windows[0].open = true;
         // Limits set before the window existed ride its first commit, for
@@ -2828,6 +2932,8 @@ impl<S: 'static> Ui<S> {
                 w.scale = c.scale;
                 w.position = c.position;
                 let changed = w.size != c.size;
+                let placed = w.output != Some(c.output);
+                w.output = Some(c.output);
                 self.resize_window(win, c.size);
                 // After the resize, so a handler sees the new size in
                 // `window_size` and can mark the tree itself; and only
@@ -2836,6 +2942,11 @@ impl<S: 'static> Ui<S> {
                 // an app should not reflow its content for those.
                 if changed {
                     self.dispatch_resize_in(state, win, c.size);
+                }
+                // And only when the output moved: the first `Configure`
+                // and every migration, never a bare resize.
+                if placed {
+                    self.dispatch_placed_in(state, win, c.output);
                 }
             }
             // Only our own windows: a `Closed` naming any other id is not

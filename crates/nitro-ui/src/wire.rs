@@ -388,7 +388,8 @@ impl Wire {
         )
     }
 
-    /// Anchor the window to its output's edges (needs `caps::SHELL`).
+    /// Anchor the window to its output's edges (needs `caps::SHELL`);
+    /// `output` is 0 for the window's current output or an output id.
     ///
     /// Queued as a mutation rather than sent at once, so it rides the
     /// same commit as the `CreateWindow` above. That ordering is not a
@@ -396,12 +397,19 @@ impl Wire {
     /// precisely so a bar can create and anchor a window in one
     /// transaction (`docs/shell.md`), and splitting them would make the
     /// bar paint at its placeholder size for a frame.
-    pub(crate) fn set_anchor(&mut self, id: NodeId, edges: u8, margin: u32) -> Result<(), Error> {
+    pub(crate) fn set_anchor(
+        &mut self,
+        id: NodeId,
+        edges: u8,
+        margin: u32,
+        output: u32,
+    ) -> Result<(), Error> {
         self.send(
             &ClientMsg::SetAnchor(msg::SetAnchor {
                 window: id,
                 edges,
                 margin,
+                output,
             }),
             id,
         )

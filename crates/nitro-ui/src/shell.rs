@@ -57,6 +57,9 @@ pub struct Anchor {
     pub edges: u8,
     /// Gap in logical pixels on each anchored edge.
     pub margin: u32,
+    /// The output to anchor on: an [`OutputInfo`] id, or `0` for the
+    /// output the window is on. See [`Anchor::on`].
+    pub output: u32,
 }
 
 impl Anchor {
@@ -66,6 +69,7 @@ impl Anchor {
         Self {
             edges: anchor::TOP | anchor::LEFT | anchor::RIGHT,
             margin: 0,
+            output: 0,
         }
     }
 
@@ -75,6 +79,7 @@ impl Anchor {
         Self {
             edges: anchor::BOTTOM | anchor::LEFT | anchor::RIGHT,
             margin: 0,
+            output: 0,
         }
     }
 
@@ -84,6 +89,7 @@ impl Anchor {
         Self {
             edges: anchor::ALL,
             margin: 0,
+            output: 0,
         }
     }
 
@@ -93,6 +99,7 @@ impl Anchor {
         Self {
             edges: 0,
             margin: 0,
+            output: 0,
         }
     }
 
@@ -100,6 +107,19 @@ impl Anchor {
     #[must_use]
     pub const fn margin(mut self, px: u32) -> Self {
         self.margin = px;
+        self
+    }
+
+    /// The same anchor, on output `output` (an [`OutputInfo`] id).
+    ///
+    /// The server moves the window there before anchoring it, keeps the
+    /// anchor following that output, and re-homes the window to the
+    /// primary if the output is unplugged. `0` is "the output the window
+    /// is on" — "stay", not "primary". A bar opening one panel per output
+    /// uses this with [`Ui::add_surface_window`](crate::Ui::add_surface_window).
+    #[must_use]
+    pub const fn on(mut self, output: u32) -> Self {
+        self.output = output;
         self
     }
 }
@@ -298,6 +318,24 @@ mod tests {
     fn a_margin_insets_without_changing_the_edges() {
         let a = Anchor::top().margin(4);
         assert_eq!(a.margin, 4);
+        assert_eq!(a.edges, Anchor::top().edges);
+    }
+
+    #[test]
+    fn an_anchor_names_no_output_unless_asked() {
+        // 0 is "the output the window is on", which is what every
+        // constructor means; `on` picks one and keeps the rest.
+        for a in [
+            Anchor::top(),
+            Anchor::bottom(),
+            Anchor::fill(),
+            Anchor::centre(),
+        ] {
+            assert_eq!(a.output, 0);
+        }
+        let a = Anchor::top().margin(2).on(7);
+        assert_eq!(a.output, 7);
+        assert_eq!(a.margin, 2);
         assert_eq!(a.edges, Anchor::top().edges);
     }
 }

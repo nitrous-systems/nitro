@@ -1761,3 +1761,106 @@ fn a_child_moved_past_the_window_paints_nothing_on_the_desktop() {
     );
     h.quit();
 }
+
+#[test]
+fn a_surface_window_is_created_anchored_and_reserved_in_one_commit() {
+    // `add_surface_window` is what a bar opens its second panel with, so
+    // it has to do what `open_window` does for the first: the layer on
+    // the `CreateWindow`, and the anchor and zone in the *same* commit —
+    // the server buffers both to the sender's commit precisely for that,
+    // and a panel anchored a commit later would paint once at the wrong
+    // size and jump.
+    let mut h = Harness::shell(
+        "surface-window",
+        (),
+        nitro_ui::shell::Surface::bar(24),
+        Some(Size::new(320.0, 24.0)),
+        |ui: &mut Ui<()>| ui.build(row().padding(4.0).child(label("main"))),
+    );
+    h.settle();
+    assert_eq!(h.server().stat("exclusive_zones"), 1);
+
+    h.tap();
+    h.clear_tap();
+    let root = h.ui().build(row().padding(4.0).child(label("second")));
+    let win = h
+        .ui()
+        .add_surface_window(
+            "second",
+            Some(Size::new(1.0, 24.0)),
+            root,
+            nitro_ui::shell::Surface::bar(24),
+        )
+        .expect("add_surface_window");
+    h.settle();
+    let node = win.raw();
+    let ops: Vec<&str> = h
+        .mutations()
+        .iter()
+        .filter(|m| m.node == node && m.op != "SetAppId")
+        .map(|m| m.op)
+        .collect();
+    assert_eq!(
+        ops,
+        ["CreateWindow", "SetAnchor", "SetExclusiveZone"],
+        "one transaction, anchor before zone; got {:?}",
+        h.mutations()
+    );
+    let first_commit = h
+        .mutations()
+        .iter()
+        .position(|m| m.op == "Commit")
+        .expect("a commit");
+    let zone_at = h
+        .mutations()
+        .iter()
+        .position(|m| m.op == "SetExclusiveZone" && m.node == node)
+        .unwrap();
+    assert!(zone_at < first_commit, "the zone rode the first commit");
+    // The server saw a real shell surface: two zones, and the second is
+    // spanning its output on the `Top` layer.
+    assert_eq!(h.server().stat("exclusive_zones"), 2);
+    assert_eq!(h.ui().window_size_of(win).w, 320.0, "anchored, so it spans");
+    assert_eq!(h.ui().windows().len(), 2);
+    assert_eq!(h.server().stat("shell_clients"), 1, "still one connection");
+    h.quit();
+}
+
+#[test]
+fn on_window_placed_fires_on_the_output_not_on_a_resize() {
+    // A per-output bar keys on where the server put its main window, and
+    // the only message that says so is the `Configure`. The hook fires on
+    // the first one (that is when the output becomes known) and on a
+    // move; a plain resize, which is also a `Configure`, must not.
+    let mut h = Harness::shell(
+        "placed",
+        Vec::<u32>::new(),
+        nitro_ui::shell::Surface::bar(24),
+        Some(Size::new(320.0, 24.0)),
+        |ui: &mut Ui<Vec<u32>>| {
+            ui.on_window_placed(
+                nitro_ui::WindowId::MAIN,
+                |s: &mut Vec<u32>, _ui: &mut Ui<Vec<u32>>, out| s.push(out),
+            );
+            ui.build(row().padding(4.0).child(label("main")))
+        },
+    );
+    h.settle();
+    let out = h.ui().window_output(nitro_ui::WindowId::MAIN);
+    assert!(
+        out.is_some_and(|o| o != 0),
+        "the server named the output: {out:?}"
+    );
+    assert_eq!(
+        *h.state(),
+        vec![out.unwrap()],
+        "fired once, with the output"
+    );
+
+    // A resize is a `Configure` too, and says nothing about placement.
+    h.configure(Size::new(200.0, 24.0));
+    h.settle();
+    assert_eq!(h.ui().window_size(), Size::new(200.0, 24.0));
+    assert_eq!(*h.state(), vec![out.unwrap()], "not again on a resize");
+    h.quit();
+}
