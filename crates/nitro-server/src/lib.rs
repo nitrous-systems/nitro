@@ -66,7 +66,7 @@ pub mod text;
 pub mod wm;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
@@ -960,6 +960,34 @@ struct Server {
     window_refs: shell::WindowRefs,
     /// The clipboard: owner, offer and parked requests; see [`data`].
     data: data::Selections,
+    /// The drag-and-drop gesture in flight, from `StartDrag` to the
+    /// source's `FinishDrag` (M5-I); see [`data::Dnd`]. While it is
+    /// [`grabbing`](data::Dnd::grabbing) it owns the pointer: every
+    /// motion drives it and every button is consumed.
+    dnd: Option<data::Dnd>,
+    /// `StartDrag`s from this wakeup's commits, by token, waiting for
+    /// `settle`: a commit holds its client out of `wire_clients`, and a
+    /// drag start sends `PointerLeave` and `DragEnter` — possibly to that
+    /// very client (the `pending_focus` trap).
+    pending_drag_starts: Vec<(u64, clients::DragStart)>,
+    /// `DragFinished`s for a source that was lifted out of `wire_clients`
+    /// when the drag ended (a commit destroying the window dropped on):
+    /// token, accepted, action. `settle` sends them.
+    pending_drag_finished: Vec<(u64, bool, nitro_wire::types::DragAction)>,
+    /// Windows adopted as drag icons. Not application windows any more:
+    /// out of the window list, the MRU and every hit test, and never
+    /// migrated as orphans (the drag re-places its icon itself).
+    drag_icons: HashSet<WindowKey>,
+    /// A drag ended with a button still held (Escape, a lock, the source
+    /// gone): swallow every button event until all are up, so no client
+    /// sees a `Released` whose press it never saw.
+    dnd_swallow: bool,
+    /// Escape cancelled a drag; its release is swallowed.
+    dnd_escape_consumed: bool,
+    /// Drops delivered to an accepting target, cumulative. `stats`.
+    dnd_drops: u64,
+    /// Drags that ended rejected or cancelled, cumulative. `stats`.
+    dnd_cancels: u64,
     /// `SendSelection` descriptors relayed to a requester, cumulative.
     /// Reported as `selection_transfers`.
     selection_transfers: u64,
@@ -1272,6 +1300,14 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         data: data::Selections::new(),
         selection_transfers: 0,
         selection_eof: 0,
+        dnd: None,
+        pending_drag_starts: Vec::new(),
+        pending_drag_finished: Vec::new(),
+        drag_icons: HashSet::new(),
+        dnd_swallow: false,
+        dnd_escape_consumed: false,
+        dnd_drops: 0,
+        dnd_cancels: 0,
         window_watchers: Vec::new(),
         output_watchers: Vec::new(),
         grab: None,
@@ -1373,40 +1409,6 @@ fn is_shell_op(msg: &ClientMsg) -> bool {
             | ClientMsg::Outputs(_)
             | ClientMsg::Lock(_)
             | ClientMsg::Unlock(_)
-    )
-}
-
-/// Whether a message is one of the **M5-A** ops this server does not yet
-/// implement.
-///
-/// The protocol surface landed ahead of the behaviour (task #3767), so the
-/// ops below decode but are refused: `Server::caps` advertises none
-/// of their bits, so no conformant client sends one, and a client that
-/// does anyway hears why instead of being silently ignored. `StartMove`
-/// and `StartResize` left with #3772 (`caps::DRAG`); see
-/// `Server::start_move`. The two popup
-/// ops left this list with #3773 (`caps::POPUP`), and the three clipboard
-/// ops with #3774 (`caps::DATA`). The drag ops share `DATA` but stay here
-/// until M5-I implements them: a client that saw the bit for the
-/// clipboard and starts a drag is told so rather than ignored.
-/// `ListOutputs` left with #3770 (`caps::OUTPUTS`); it is answered by
-/// `Server::list_outputs` and never reaches this function. `SetCursor`
-/// left with #3771 (`caps::CURSOR`); it is acted on at receipt by
-/// `Server::set_cursor_request`.
-///
-/// `ClientCaps` (0x0003) is deliberately **not** here: it is accepted and
-/// recorded, because the rule that makes it safe — the server must not
-/// send what the client did not list — cannot be honoured by a server that
-/// throws the list away, and each M5 task should gain one `if` rather than
-/// re-litigate this.
-///
-/// A `match` over the variants rather than an op-code range test, for the
-/// reason `is_shell_op` gives: a range would keep compiling after someone
-/// implemented one of these, which is exactly when it must not.
-fn is_m5_op(msg: &ClientMsg) -> bool {
-    matches!(
-        msg,
-        ClientMsg::StartDrag(_) | ClientMsg::AcceptDrop(_) | ClientMsg::FinishDrag(_)
     )
 }
 
@@ -1905,6 +1907,7 @@ impl Server {
                 self.scene
                     .window_info(*w)
                     .is_ok_and(|i| i.output().is_none() && !i.is_popup())
+                    && !self.drag_icons.contains(w)
             })
             .collect();
         // An orphaned parent's popups are dismissed, not migrated — and
@@ -2327,6 +2330,19 @@ impl Server {
         if let Some(win) = self.pending_focus.take() {
             self.focus_window(Some(win));
         }
+        for (token, accepted, action) in std::mem::take(&mut self.pending_drag_finished) {
+            if let Some(client) = self.wire_clients.get_mut(&token) {
+                client.send(&ServerMsg::DragFinished(msg::DragFinished {
+                    accepted,
+                    action,
+                }));
+            }
+        }
+        // Drag starts, for the same reason, and before `flush_popup_done`:
+        // starting one dismisses a grabbing menu.
+        for (token, start) in std::mem::take(&mut self.pending_drag_starts) {
+            self.start_dnd(token, start);
+        }
         // The same deferral for `PopupDone`: dismissal can run with the
         // owning client out of the map. Drained before the update, so the
         // unmap is already recorded when the client hears (unmap, then
@@ -2342,7 +2358,10 @@ impl Server {
         // reverts to the server's own choice now, not at the next motion.
         // After the scene update, so the hit test sees the window gone. A
         // drag in flight owns the shape and is left alone.
-        if std::mem::take(&mut self.cursor_stale) && self.wm.drag().is_none() {
+        if std::mem::take(&mut self.cursor_stale)
+            && self.wm.drag().is_none()
+            && !self.dnd_grabbing()
+        {
             self.update_cursor_shape();
         }
         self.claim_input_stamp();
@@ -2519,6 +2538,9 @@ impl Server {
                     // The release of a held key will arrive on the other
                     // VT, if anywhere: stop repeating it now.
                     self.stop_key_repeat();
+                    // A drag cannot survive the pointer going to another
+                    // session: the release will never arrive here.
+                    self.dnd_step(data::Dnd::cancel);
                     self.backend.pause();
                     self.active = false;
                     if let Some(seat) = self.seat.as_ref() {
@@ -3245,6 +3267,12 @@ impl Server {
         let point = self.pointer.position();
         let output = input::output_at(&self.scene, point);
         self.pointer.output = output;
+        // A drag-and-drop in flight owns every motion, like a window drag.
+        if self.dnd_grabbing() {
+            self.drive_dnd(time_ns, true);
+            self.note_input(time_ns);
+            return;
+        }
         // A drag in flight owns every motion: the window follows the
         // pointer and the client is never consulted, which is what makes a
         // drag zero round trips. Both a move and a resize do send one
@@ -3346,9 +3374,11 @@ impl Server {
             ButtonState::Released => self.pointer.release(button),
         }
 
-        // The popup grab goes **first** — above the release/drag branch;
-        // see `Server::popup_grab_button`.
-        if self.popup_grab_button(state, time_ns) {
+        // The grabs go **first** — above the release/drag branch: a
+        // drag-and-drop (which holds the pointer, so no popup grab can
+        // coexist with it), then the popup grab. See `Server::dnd_button`
+        // and `Server::popup_grab_button`.
+        if self.dnd_button(state, time_ns) || self.popup_grab_button(state, time_ns) {
             return;
         }
 
@@ -3558,7 +3588,7 @@ impl Server {
     ///    a move of its main window from a press on another of its own
     ///    surfaces, as Wayland allows.
     fn drag_request(&self, token: u64, id: NodeId, what: &str) -> Option<WindowKey> {
-        if self.wm.drag().is_some() {
+        if self.wm.drag().is_some() || self.dnd_grabbing() {
             debug!("{what}: a drag is already in flight: ignored");
             return None;
         }
@@ -3776,26 +3806,11 @@ impl Server {
             self.note_input(time_ns);
             return;
         }
-        // A grabbing popup chain owns Escape: it dismisses the whole chain
-        // and is consumed. After the compositor's own table (which is not
-        // negotiable), before the shell's bindings (a live grab outranks a
-        // shell hotkey for the reason it outranks focus). `cancel_tap`
-        // rather than feeding `hotkeys.key`: something that was not a
-        // bare-modifier tap happened, and discarding a binding list here
-        // would swallow a hotkey's release half.
-        if !pressed && self.popup_seat.escape_consumed && keyboard::is_escape(resolved.keysym) {
-            self.popup_seat.escape_consumed = false;
-            self.note_input(time_ns);
-            return;
-        }
-        if pressed
-            && keyboard::is_escape(resolved.keysym)
-            && let Some(root) = self.popup_seat.grab
-        {
-            self.hotkeys.cancel_tap();
-            self.dismiss_chain(root);
-            self.popup_seat.escape_consumed = true;
-            self.note_input(time_ns);
+        // The grabs own Escape (`Server::escape_grabs`): after the
+        // compositor's own table (which is not negotiable), before the
+        // shell's bindings (a live grab outranks a shell hotkey for the
+        // reason it outranks focus).
+        if keyboard::is_escape(resolved.keysym) && self.escape_grabs(pressed, time_ns) {
             return;
         }
         // A shell's own bindings come next: after the compositor's, which are
@@ -4069,6 +4084,8 @@ impl Server {
     /// scene destroys; the shaped run does not — it lives in the text
     /// store, keyed by owner, and this is the only place it can be freed.
     fn forget_window(&mut self, win: WindowKey) {
+        self.drag_icons.remove(&win);
+        self.dnd_step(|d| d.forget_window(win));
         self.decorations.remove(&win);
         if self.resize_hint == Some(win) {
             self.resize_hint = None;
@@ -4897,6 +4914,10 @@ impl Server {
     /// bare desktop leaves the move cross there until the next motion —
     /// indefinitely, if the user lets go and does not move.
     fn update_cursor_shape(&mut self) {
+        if self.dnd_grabbing() {
+            self.set_cursor(Some(self.dnd_shape()));
+            return;
+        }
         let hit = self.pointer_desktop().and_then(|p| self.frame_hit(p));
         self.set_cursor(self.cursor_choice(hit));
     }
@@ -5520,7 +5541,7 @@ impl Server {
                 let Ok(info) = self.scene.window_info(win) else {
                     continue;
                 };
-                if !self.on_screen(win) {
+                if !self.on_screen(win) || self.drag_icons.contains(&win) {
                     continue;
                 }
                 if !info.is_framed() {
@@ -5905,6 +5926,19 @@ impl Server {
         pairs.push(("selection_transfers", self.selection_transfers));
         pairs.push(("selection_eof", self.selection_eof));
         pairs.push(("selections_pending", self.data.pending() as u64));
+        // Drag and drop (M5-I). `dnd_active` is any drag state held (a drop
+        // being read, a source yet to finish) and `dnd_grab` whether one
+        // holds the pointer; both 0 on an idle desktop, which is the check
+        // that nothing was left stuck. The other two are cumulative.
+        pairs.push(("dnd_active", u64::from(self.dnd.is_some())));
+        pairs.push(("dnd_grab", u64::from(self.dnd_grabbing())));
+        // Whether the current target has accepted: what the cursor shows.
+        pairs.push((
+            "dnd_accepted",
+            u64::from(self.dnd.as_ref().is_some_and(data::Dnd::accepted)),
+        ));
+        pairs.push(("dnd_drops", self.dnd_drops));
+        pairs.push(("dnd_cancels", self.dnd_cancels));
         pairs.push(("locked", u64::from(self.lock.is_locked())));
         pairs.push(("lock_owned", u64::from(self.lock.owner().is_some())));
         // Completed reloads, however triggered: the control request,
@@ -6139,7 +6173,7 @@ impl Server {
             } else {
                 ErrorCode::Protocol
             };
-            self.disconnect(token, Some((0, code, e.detail().to_owned())));
+            self.disconnect(token, Some((0, code, e.detail("SetSelection"))));
             return false;
         }
         // The old owner is not told directly; it sees the new
@@ -6159,10 +6193,10 @@ impl Server {
         if !self.data_allowed(token, "RequestSelection") {
             return false;
         }
-        let fatal = if m.source == nitro_wire::types::DataSource::Drag {
-            // Valid only between a `DragEnter` and its `DragLeave`, and
-            // drag-and-drop does not exist until M5-I, so no client is a
-            // drop target. M5-I replaces this arm.
+        let drag = m.source == nitro_wire::types::DataSource::Drag;
+        let fatal = if drag && !self.dnd.as_ref().is_some_and(|d| d.is_drop_target(token)) {
+            // Valid only while this client is the drop target: between a
+            // `DragEnter` and its `DragLeave`, or dropped on and reading.
             Some("RequestSelection { source: Drag } outside a drag")
         } else if self.data.has_reply_id(token, m.request) {
             Some("RequestSelection reuses an outstanding request id")
@@ -6176,18 +6210,24 @@ impl Server {
         // The failures that are answered, not refused. A MIME type outside
         // the offer is answered here rather than relayed: the answer would
         // be byte-identical, and this saves waking the owner.
-        let owner = self
-            .data
-            .offer()
-            .filter(|o| o.mimes.contains(&m.mime))
-            .map(|o| o.owner)
-            .filter(|o| self.wire_clients.contains_key(o));
+        let owner = if drag {
+            self.dnd
+                .as_ref()
+                .filter(|d| d.mimes.contains(&m.mime))
+                .map(|d| d.source)
+        } else {
+            self.data
+                .offer()
+                .filter(|o| o.mimes.contains(&m.mime))
+                .map(|o| o.owner)
+        }
+        .filter(|o| self.wire_clients.contains_key(o));
         let Some(owner) = owner.filter(|_| self.data.outstanding(token) < MAX_PENDING_SELECTIONS)
         else {
             self.answer_eof(token, m.request);
             return true;
         };
-        let id = self.data.start(token, m.request, owner);
+        let id = self.data.start(token, m.request, owner, m.source);
         let Some(client) = self.wire_clients.get_mut(&owner) else {
             // Checked above; kept total rather than trusting it.
             self.data.take(id, owner);
@@ -6196,7 +6236,7 @@ impl Server {
         };
         client.send(&ServerMsg::SelectionRequest(msg::SelectionRequest {
             request: id,
-            source: nitro_wire::types::DataSource::Clipboard,
+            source: m.source,
             mime: m.mime,
         }));
         true
@@ -6385,6 +6425,12 @@ impl Server {
             ClientMsg::SetSelection(m) => self.set_selection(token, m.mimes),
             ClientMsg::RequestSelection(m) => self.request_selection(token, m),
             ClientMsg::SendSelection(m) => self.send_selection(token, m.request, m.fd),
+            // The drag answers too: an acceptance answers the motion the
+            // target just saw, and a finish must not wait for a commit.
+            // `StartDrag` is buffered to the commit instead (its icon may
+            // be created in the same batch); see `Server::start_dnd`.
+            ClientMsg::AcceptDrop(m) => self.accept_drop(token, m.action, m.mime),
+            ClientMsg::FinishDrag(_) => self.finish_drag(token),
             ClientMsg::CreateBuffer(buffer) => {
                 // The descriptor is checked and *mapped* now, not at commit:
                 // the client may legitimately close or reuse its own
@@ -6798,6 +6844,7 @@ impl Server {
             });
         }
         let _ = self.wm.end_drag();
+        self.dnd_step(data::Dnd::cancel);
         self.hotkeys.reset();
         self.hotkey_pending = None;
     }
@@ -7000,7 +7047,7 @@ impl Server {
 
     /// Build one window's `WindowInfo`, minting its server-global id.
     fn window_info_msg(&mut self, win: WindowKey) -> Option<msg::WindowInfo> {
-        if self.scene.window_info(win).ok()?.is_popup() {
+        if self.scene.window_info(win).ok()?.is_popup() || self.drag_icons.contains(&win) {
             return None;
         }
         let id = self.window_refs.id_for(win);
@@ -7037,6 +7084,8 @@ impl Server {
             // A menu is not an application window: a bar's task list must
             // not sprout an entry per open menu.
             .filter(|w| self.scene.window_info(*w).is_ok_and(|i| !i.is_popup()))
+            // Nor is a drag icon.
+            .filter(|w| !self.drag_icons.contains(w))
             .collect();
         out.sort_unstable_by_key(|w| (w.index(), w.generation()));
         out
@@ -7329,6 +7378,8 @@ impl Server {
             self.map_popup(&mut client, node_id, win, info);
         }
         let repositioned = outcome.repositioned_popups;
+        self.pending_drag_starts
+            .extend(outcome.start_drags.into_iter().map(|d| (token, d)));
         client.frame_requests.extend(outcome.frame_requests);
         for win in outcome.closed_windows {
             self.forget_closed(win);
@@ -7619,6 +7670,11 @@ impl Server {
         if was_owner {
             self.broadcast_offer();
         }
+        // Drag and drop: a source gone ends the drag (the target is told),
+        // a target gone leaves it over nothing or fails the drop. After
+        // the clipboard, which already answered what this client owed.
+        self.pending_drag_starts.retain(|(t, _)| *t != token);
+        self.dnd_step(|d| d.forget_client(token));
         // Dropping the stream removes it from the epoll set.
     }
 
@@ -7855,7 +7911,10 @@ impl Server {
     ) {
         self.popups.insert(win, info);
         let parent_live = self.popups.get(&info.parent).is_none_or(|p| !p.dismissed);
-        if !parent_live || !self.place_popup(win) {
+        // A grabbing menu cannot open mid-drag: the drag holds the pointer.
+        // The race path, like a parent with nowhere to be.
+        let refused = info.grab && self.dnd_grabbing();
+        if !parent_live || refused || !self.place_popup(win) {
             // A submenu of a menu that is already gone goes the same way.
             if let Some(i) = self.popups.get_mut(&win) {
                 i.dismissed = true;
@@ -8062,19 +8121,10 @@ impl Server {
         if self.refuse_popup_op(token, msg) {
             return true;
         }
-        if !is_m5_op(msg) {
-            return false;
-        }
-        let name = msg.name();
-        self.disconnect(
-            token,
-            Some((
-                0,
-                ErrorCode::Protocol,
-                format!("{name} needs a capability this server does not advertise"),
-            )),
-        );
-        true
+        // `StartDrag` is buffered to the commit, so its `DATA` gate is
+        // here; `AcceptDrop`/`FinishDrag` are answered at receipt and
+        // check it themselves.
+        matches!(msg, ClientMsg::StartDrag(_)) && !self.data_allowed(token, "StartDrag")
     }
 
     /// Refuse a popup op from a client that never listed `POPUP` in its
@@ -8128,6 +8178,13 @@ impl Server {
         if !self.pointer.present {
             return;
         }
+        // During a drag-and-drop the pointer belongs to the drag: what
+        // mapped or unmapped under it is a new drop target, not a new
+        // pointer focus. Same stationary re-check, `DragEnter`/`DragLeave`.
+        if self.dnd_grabbing() {
+            self.drive_dnd(monotonic_ns(), false);
+            return;
+        }
         let time_ns = monotonic_ns();
         let point = self.pointer.position();
         let target =
@@ -8170,6 +8227,447 @@ impl Server {
         for win in std::mem::take(&mut self.pending_popup_done) {
             self.send_to_window(win, |popup| ServerMsg::PopupDone(msg::PopupDone { popup }));
         }
+    }
+}
+
+// ------------------------------------------------------ drag and drop (M5-I)
+
+impl Server {
+    /// Whether a drag-and-drop holds the pointer.
+    fn dnd_grabbing(&self) -> bool {
+        self.dnd.as_ref().is_some_and(data::Dnd::grabbing)
+    }
+
+    /// The cursor a drag shows: the arrow over a target that accepted,
+    /// the slashed ring everywhere else. Owned by the drag while it
+    /// grabs, the way a window drag owns its move cross.
+    fn dnd_shape(&self) -> crate::cursor::Shape {
+        if self.dnd.as_ref().is_some_and(data::Dnd::accepted) {
+            crate::cursor::Shape::Arrow
+        } else {
+            crate::cursor::Shape::NotAllowed
+        }
+    }
+
+    /// `StartDrag`, validated at the commit and run from `settle`.
+    ///
+    /// Authorization is silent on failure, `StartMove`'s rule for its
+    /// reason (`Server::drag_request`): each check is a race a correct
+    /// client can lose — the user let go before the request arrived.
+    fn start_dnd(&mut self, token: u64, start: clients::DragStart) {
+        let Some(client) = self.wire_clients.get(&token) else {
+            return;
+        };
+        let refused = if self
+            .dnd
+            .as_ref()
+            .is_some_and(|d| d.phase() != data::Phase::Finished)
+        {
+            Some("a drag is already in flight")
+        } else if self.wm.drag().is_some() {
+            Some("a window drag is in flight")
+        } else if !self.pointer.any_button_down() || self.dnd_swallow {
+            Some("no pointer button is down")
+        } else if !self.pointer.over.is_some_and(|w| client.owns_window(w)) {
+            Some("the client does not hold pointer focus")
+        } else if self.lock.is_locked() {
+            Some("the session is locked")
+        } else if !client.owns_window(start.window) {
+            Some("the window is gone")
+        } else {
+            None
+        };
+        if let Some(why) = refused {
+            debug!("StartDrag: {why}: ignored");
+            return;
+        }
+        // A drag whose source has yet to `FinishDrag` is superseded: its
+        // offer is gone, so whatever is still parked against it ends at EOF.
+        if self.dnd.take().is_some() {
+            self.release_dnd_transfers();
+        }
+        // One pointer: a grabbing menu goes first, even the source's own.
+        if let Some(root) = self.popup_seat.grab {
+            self.dismiss_chain(root);
+        }
+        // The source loses pointer focus for the drag, as a Wayland DnD
+        // source surface does; it never sees the release of its press.
+        let now = monotonic_ns();
+        if let Some(left) = self.pointer.over {
+            let sent_to = self.send_input(left, |id| {
+                ServerMsg::PointerLeave(msg::PointerLeave {
+                    window: id,
+                    time_ns: now,
+                })
+            });
+            self.note_client_input(sent_to);
+        }
+        self.set_pointer_over(None);
+        // A button release that a popup grab would have swallowed now
+        // belongs to the drag.
+        self.popup_seat.click_consumed = false;
+        if let Some(icon) = start.icon {
+            self.adopt_drag_icon(icon);
+        }
+        self.dnd = Some(data::Dnd::new(
+            token,
+            start.icon,
+            start.actions,
+            start.mimes,
+        ));
+        self.place_drag_icon();
+        self.set_cursor(Some(self.dnd_shape()));
+        // The first `DragEnter` (usually the source's own window) goes out
+        // from `refresh_pointer_over`, after the scene update has seen the
+        // icon placed.
+        self.popup_seat.pointer_refresh = true;
+        self.note_input(now);
+    }
+
+    /// Make a window the drag icon: out of the window manager and the
+    /// shell's list, on the overlay layer, invisible to hit testing.
+    fn adopt_drag_icon(&mut self, icon: WindowKey) {
+        if !self.drag_icons.insert(icon) {
+            return;
+        }
+        self.wm.remove(icon);
+        self.notify_window_gone(icon);
+        if let Err(e) = self.scene.set_layer(icon, nitro_scene::Layer::Overlay) {
+            warn!("drag icon layer: {e}");
+        }
+        if let Err(e) = self.scene.set_hit_exempt(icon, true) {
+            warn!("drag icon: {e}");
+        }
+    }
+
+    /// Put the drag icon under the pointer, centred, on whichever output
+    /// the pointer is on — which is what carries it across outputs.
+    ///
+    /// This moves a window, so it is content damage, and a frame with an
+    /// icon in motion is never a cursor-only flip (`defer.rs`). That is
+    /// deliberate — there is new content to show — and not to be
+    /// "optimised" into cursor damage: a drag without an icon stays on the
+    /// cursor-only path exactly as ordinary motion does.
+    fn place_drag_icon(&mut self) {
+        let Some(icon) = self.dnd.as_ref().and_then(|d| d.icon) else {
+            return;
+        };
+        let point = self.pointer.position();
+        let output = input::output_at(&self.scene, point);
+        let size = self
+            .scene
+            .window_info(icon)
+            .map_or(Size::ZERO, nitro_scene::Window::frame_size);
+        let local = output.and_then(|id| self.scene.output_info(id)).map_or(
+            Point::ZERO,
+            |(rect, scale)| {
+                let s = if scale > 0.0 { scale } else { 1.0 };
+                Point::new(
+                    ((point.x - rect.x as f32) / s - size.w / 2.0).round(),
+                    ((point.y - rect.y as f32) / s - size.h / 2.0).round(),
+                )
+            },
+        );
+        if let Err(e) = self.scene.place_window(icon, output, local) {
+            warn!("placing the drag icon: {e}");
+        }
+    }
+
+    /// Re-derive the drop target at the pointer and tell whoever needs to
+    /// know: `DragLeave`/`DragEnter` on a change, `DragMotion` otherwise
+    /// (only when the pointer `moved`). The icon follows the pointer.
+    fn drive_dnd(&mut self, time_ns: u64, moved: bool) {
+        if moved {
+            self.place_drag_icon();
+        }
+        let point = self.pointer.position();
+        let hit =
+            input::output_at(&self.scene, point).and_then(|id| input::hit(&self.scene, id, point));
+        // A target is a window whose client listed `DATA` (rule 1: never
+        // push what a client did not list) and that the lock admits.
+        // Anything else is "no target", which rejects.
+        let target = hit.and_then(|t| {
+            let (token, client) = self
+                .wire_clients
+                .iter()
+                .find(|(_, c)| c.owns_window(t.window))?;
+            let listed = client.client_caps & nitro_wire::types::caps::DATA != 0;
+            (listed && self.scene.admits_window(t.window) && !self.drag_icons.contains(&t.window))
+                .then_some((
+                    data::DragTarget {
+                        token: *token,
+                        window: t.window,
+                    },
+                    t.local,
+                ))
+        });
+        let Some(dnd) = self.dnd.as_mut() else {
+            return;
+        };
+        match dnd.retarget(target.map(|(t, _)| t)) {
+            data::Retarget::Same => {
+                if let Some((t, pos)) = target.filter(|_| moved) {
+                    let sent_to = self.send_input(t.window, |id| {
+                        ServerMsg::DragMotion(msg::DragMotion {
+                            window: id,
+                            pos,
+                            time_ns,
+                        })
+                    });
+
+                    self.note_client_input(sent_to);
+                }
+            }
+            data::Retarget::Changed { left } => {
+                let (actions, mimes) = (dnd.actions, dnd.mimes.clone());
+                if let Some(l) = left {
+                    self.send_to_window(l.window, |id| {
+                        ServerMsg::DragLeave(msg::DragLeave { window: id })
+                    });
+                }
+                if let Some((t, pos)) = target {
+                    let sent_to = self.send_input(t.window, |id| {
+                        ServerMsg::DragEnter(msg::DragEnter {
+                            window: id,
+                            pos,
+                            actions,
+                            mimes: mimes.clone(),
+                        })
+                    });
+                    self.note_client_input(sent_to);
+                }
+                // A new target has accepted nothing yet.
+                self.set_cursor(Some(self.dnd_shape()));
+            }
+        }
+    }
+
+    /// An Escape key event for the grabs; returns whether it was consumed.
+    ///
+    /// A grabbing popup chain owns Escape: it dismisses the whole chain and
+    /// is consumed, and so is its release. `cancel_tap` rather than feeding
+    /// `hotkeys.key`: something that was not a bare-modifier tap happened,
+    /// and discarding a binding list here would swallow a hotkey's release
+    /// half. A drag-and-drop owns it the same way ([`Server::dnd_escape`]),
+    /// and is asked first; the two never coexist.
+    fn escape_grabs(&mut self, pressed: bool, time_ns: u64) -> bool {
+        if self.dnd_escape(pressed, time_ns) {
+            return true;
+        }
+        if !pressed && self.popup_seat.escape_consumed {
+            self.popup_seat.escape_consumed = false;
+            self.note_input(time_ns);
+            return true;
+        }
+        if pressed && let Some(root) = self.popup_seat.grab {
+            self.hotkeys.cancel_tap();
+            self.dismiss_chain(root);
+            self.popup_seat.escape_consumed = true;
+            self.note_input(time_ns);
+            return true;
+        }
+        false
+    }
+
+    /// The drag's share of an Escape key event; returns whether it was
+    /// consumed. A press cancels a drag holding the pointer, as a rejected
+    /// drop, and its release is swallowed. There is never a popup grab to
+    /// compete: none can exist during a drag.
+    fn dnd_escape(&mut self, pressed: bool, time_ns: u64) -> bool {
+        if !pressed && self.dnd_escape_consumed {
+            self.dnd_escape_consumed = false;
+        } else if pressed && self.dnd_grabbing() {
+            self.hotkeys.cancel_tap();
+            self.dnd_step(data::Dnd::cancel);
+            self.dnd_escape_consumed = true;
+        } else {
+            return false;
+        }
+        self.note_input(time_ns);
+        true
+    }
+
+    /// The drag's share of a button event. Returns whether it consumed
+    /// it. Called at the very top of `pointer_button`, with the button
+    /// state already recorded.
+    fn dnd_button(&mut self, state: ButtonState, time_ns: u64) -> bool {
+        if self.dnd_swallow {
+            // A drag ended with buttons still held: nobody saw their
+            // presses, so nobody may see their releases.
+            if !self.pointer.any_button_down() {
+                self.dnd_swallow = false;
+            }
+            self.note_input(time_ns);
+            return true;
+        }
+        if !self.dnd_grabbing() {
+            return false;
+        }
+        // Every press and release during the drag is the drag's; the one
+        // that brings the last button up drops.
+        if state == ButtonState::Released && !self.pointer.any_button_down() {
+            self.dnd_step(data::Dnd::release);
+        }
+        self.note_input(time_ns);
+        true
+    }
+
+    /// Run one transition of the drag and act on what it says: send the
+    /// messages, end the pointer grab if it ended, and forget the drag if
+    /// it is over.
+    fn dnd_step(&mut self, f: impl FnOnce(&mut data::Dnd) -> data::Outcome) {
+        let Some(dnd) = self.dnd.as_mut() else {
+            return;
+        };
+        let was_grabbing = dnd.grabbing();
+        let icon = dnd.icon;
+        let outcome = f(dnd);
+        // A release forgets the drag outright, whatever phase it was in.
+        let released_now = matches!(outcome, data::Outcome::Released { .. });
+        let (source, still_grabbing) = (dnd.source, dnd.grabbing() && !released_now);
+        let released = match outcome {
+            data::Outcome::Nothing => None,
+            data::Outcome::Drop(t) => {
+                self.dnd_drops += 1;
+                self.dnd_send(t.window, |id| {
+                    ServerMsg::DragDrop(msg::DragDrop { window: id })
+                });
+                None
+            }
+            data::Outcome::Finished {
+                leave,
+                accepted,
+                action,
+            } => {
+                if let Some(l) = leave {
+                    self.dnd_send(l.window, |id| {
+                        ServerMsg::DragLeave(msg::DragLeave { window: id })
+                    });
+                }
+                if !accepted {
+                    self.dnd_cancels += 1;
+                }
+                self.send_drag_finished(source, accepted, action);
+                None
+            }
+            data::Outcome::Released { leave } => Some(leave),
+        };
+        if let Some(Some(l)) = released {
+            self.dnd_send(l.window, |id| {
+                ServerMsg::DragLeave(msg::DragLeave { window: id })
+            });
+        }
+        if was_grabbing && !still_grabbing {
+            if released.is_some() {
+                // Released mid-grab (the source went): it never reached an
+                // outcome, which counts as cancelled.
+                self.dnd_cancels += 1;
+            }
+            self.end_dnd_grab(icon);
+        } else if still_grabbing {
+            // The target may have gone from under the pointer.
+            self.set_cursor(Some(self.dnd_shape()));
+        }
+        if released.is_some() {
+            self.dnd = None;
+            self.release_dnd_transfers();
+        }
+    }
+
+    /// The pointer grab is over: the icon comes down (not at the source's
+    /// `FinishDrag` — a source that never finishes must not leave an image
+    /// on screen), the cursor is re-derived, and pointer focus comes back
+    /// through the stationary re-check, which sends the `PointerEnter`.
+    fn end_dnd_grab(&mut self, icon: Option<WindowKey>) {
+        if let Some(icon) = icon {
+            let pos = self
+                .scene
+                .window_info(icon)
+                .map_or(Point::ZERO, nitro_scene::Window::position);
+            if let Err(e) = self.scene.place_window(icon, None, pos) {
+                debug!("unmapping the drag icon: {e}");
+            }
+        }
+        self.popup_seat.pointer_refresh = true;
+        self.cursor_stale = true;
+        if self.pointer.any_button_down() {
+            self.dnd_swallow = true;
+        }
+    }
+
+    /// Answer every parked drag transfer at EOF: the drag offer is gone.
+    fn release_dnd_transfers(&mut self) {
+        for t in self.data.cancel_drag() {
+            self.answer_eof(t.requester, t.reply_to);
+        }
+    }
+
+    /// Send a drag message to a window's client and make sure it goes out
+    /// this wakeup: this can run from `disconnect` inside
+    /// `flush_wire_clients`, after the recipient's own flush.
+    fn dnd_send<F>(&mut self, win: WindowKey, build: F)
+    where
+        F: Fn(NodeId) -> ServerMsg,
+    {
+        if let Some(token) = self.send_to_window(win, build) {
+            self.arm_wire_client(token);
+        }
+    }
+
+    /// `DragFinished` to the source — or, if the source is out of the map
+    /// because its own commit ended the drag (source == target, destroying
+    /// the window dropped on), parked for `settle`. A token that is simply
+    /// gone is dropped there.
+    fn send_drag_finished(
+        &mut self,
+        token: u64,
+        accepted: bool,
+        action: nitro_wire::types::DragAction,
+    ) {
+        let Some(client) = self.wire_clients.get_mut(&token) else {
+            self.pending_drag_finished.push((token, accepted, action));
+            return;
+        };
+        client.send(&ServerMsg::DragFinished(msg::DragFinished {
+            accepted,
+            action,
+        }));
+        self.arm_wire_client(token);
+    }
+
+    /// `AcceptDrop`, at receipt. Ignored unless the sender is the target
+    /// of a drag holding the pointer; a mismatch is a rejection, never an
+    /// error — a stale answer to a previous drag is a legitimate race.
+    fn accept_drop(
+        &mut self,
+        token: u64,
+        action: nitro_wire::types::DragAction,
+        mime: String,
+    ) -> bool {
+        if !self.data_allowed(token, "AcceptDrop") {
+            return false;
+        }
+        // The target has answered the motion: release a flip held for it.
+        self.defer.forget(token);
+        if self
+            .dnd
+            .as_mut()
+            .and_then(|d| d.accept(token, action, mime))
+            .is_some()
+        {
+            self.set_cursor(Some(self.dnd_shape()));
+        }
+        true
+    }
+
+    /// `FinishDrag`, at receipt: the target completing a drop, or the
+    /// source releasing a finished drag. See [`data::Dnd::finish`].
+    fn finish_drag(&mut self, token: u64) -> bool {
+        if !self.data_allowed(token, "FinishDrag") {
+            return false;
+        }
+        self.dnd_step(|d| d.finish(token));
+        true
     }
 }
 
@@ -8406,7 +8904,6 @@ mod tests {
             }
             .into(),
         ] {
-            assert!(!is_m5_op(&m), "{} is implemented", m.name());
             assert!(!is_shell_op(&m), "{} is not a shell op", m.name());
         }
     }

@@ -273,6 +273,10 @@ pub struct Window {
     /// window is still a (dismissed) popup until its client destroys it
     /// — and must never start passing for a toplevel in the meantime.
     pub(crate) popup: bool,
+    /// Painted but never hit: the pointer passes straight through it.
+    /// What a drag icon is — it sits under the pointer for the whole drag,
+    /// and a hit test that found it would never find the drop target.
+    pub(crate) hit_exempt: bool,
 }
 
 impl Window {
@@ -395,6 +399,12 @@ impl Window {
     /// destroyed and the [`parent`](Window::parent) link cleared.
     pub fn is_popup(&self) -> bool {
         self.popup
+    }
+
+    /// Whether hit testing passes through this window; see
+    /// [`Scene::set_hit_exempt`](crate::Scene::set_hit_exempt).
+    pub fn is_hit_exempt(&self) -> bool {
+        self.hit_exempt
     }
 }
 

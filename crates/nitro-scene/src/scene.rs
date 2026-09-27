@@ -185,6 +185,18 @@ impl Scene {
         }
     }
 
+    /// Make a window painted but never hit (or undo it): the pointer
+    /// passes through it to whatever is below. A drag icon sits under the
+    /// pointer for the whole drag, and must not hide the drop target.
+    /// Changes no pixels, so it damages nothing.
+    ///
+    /// # Errors
+    /// [`Error::StaleKey`].
+    pub fn set_hit_exempt(&mut self, win: WindowKey, exempt: bool) -> Result<(), Error> {
+        self.windows.get_mut(win).ok_or(Error::StaleKey)?.hit_exempt = exempt;
+        Ok(())
+    }
+
     /// Whose windows are painted and hit-tested.
     #[must_use]
     pub fn admit(&self) -> Admit {
@@ -370,6 +382,7 @@ impl Scene {
             restore: None,
             parent: None,
             popup: false,
+            hit_exempt: false,
         });
         self.note_resized(win);
         let node = self.node_mut_ref(root);

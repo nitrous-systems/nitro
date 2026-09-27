@@ -258,7 +258,7 @@ on every **local** link whose server compiled a keymap, `RELEASE` (M5-B,
 create buffers at all), and `DATA` (M5-H, #3774) on every **local**
 link and never on a remote one (nor `KEYMAP`) — every leg of a transfer
 carries a descriptor, which TCP cannot (see [Descriptors on a remote link](#descriptors-on-a-remote-link)).
-The drag half of `DATA` is still refused until M5-I. M5-A froze the protocol surface ahead of the behaviour, deliberately,
+Drag-and-drop, the other half of `DATA`, landed with M5-I (#3775). M5-A froze the protocol surface ahead of the behaviour, deliberately,
 so that the eight follow-up tasks implement against bytes nobody can still
 change. Until each of the rest lands, the server does not advertise its
 bit and refuses its client ops with `Error { Protocol }` — which is the
@@ -1370,7 +1370,34 @@ the M5-A sketch — the same house rule that reordered `SetAppId`. The
 `actions` field is an addition to the sketch: without it copy-versus-move
 cannot be expressed and `AcceptDrop.action` has nothing to be chosen from.
 
-Authorized by pointer focus **and a button actually being down**.
+Authorized by pointer focus **and a button actually being down**, like
+`StartMove`, and **silently ignored** when that fails — or when another
+drag is still holding the pointer or being read, a window drag is in
+flight, or the session is locked: each is a race a correct client can
+lose. Unlike `StartMove` it is **buffered to the commit**, so an icon
+window created in the same batch exists when it is adopted. A `window`
+that is not the sender's is `Error { UnknownNode }`; `actions` empty or
+with a reserved bit, and a MIME list breaking `SetSelection`'s rules, are
+`Error { Protocol }` (or `Limit`).
+
+**The icon** is `NONE`, or a window root of the sender's that is not a
+popup, not `window`, and was created `UNDECORATED | NO_FOCUS`; anything
+else is `Error { Protocol }`. The server *adopts* it for good: out of
+window cycling and the shell's window list, on the `Overlay` layer, and
+never hit — the pointer passes through it to the drop target. It is drawn
+**centred on the pointer** (the protocol has no hotspot offset), follows
+it across outputs, and is unmapped when the pointer grab ends — at the
+drop or the cancel, not at `FinishDrag`, so a source that never finishes
+cannot leave it on screen. It stays adopted: the client may use it as
+the icon of a later drag, or destroy it.
+
+For the drag's duration the source **loses pointer focus** (a
+`PointerLeave`), and it **never receives the `Released`** of the press that
+started it — Wayland's DnD behaviour. Every button event during the drag
+is the drag's; the release that brings the last button up drops. Escape
+cancels the drag as a rejected drop, and is consumed with its release.
+The cursor shows the arrow over a target that accepted and the slashed
+ring everywhere else.
 
 ### `AcceptDrop` — 0x0309
 
@@ -1386,14 +1413,33 @@ Sent by the **destination** while a drag is over it, and again whenever
 the answer changes (the pointer moved to another widget, a modifier went
 down). `action` must be one of the actions `DragEnter` advertised.
 
+Acted on at receipt, and ignored from anyone but the current target of a
+drag that still holds the pointer — the answer is frozen at the drop, and
+a stale answer to an earlier drag is a race. The "must" is enforced as a
+**rejection**, not an error: an action the source did not offer, or a
+`mime` outside its list, counts exactly like an empty `mime`.
+
 ### `FinishDrag` — 0x030a
 
 No fields; head **0 bytes**. Requires `DATA`.
 
-Sent by the drag **source** after its
-[`DragFinished`](#dragfinished--0x8508): it releases the offer and the
-server drops the drag icon. A source that disconnects instead is
-equivalent.
+Sent by **both ends**, told apart by where the drag is:
+
+* By the **target**, after `DragDrop`, once it has read what it wants: it
+  completes the drop, and the source is sent `DragFinished { accepted:
+  true, action }`. The server cannot infer this from outstanding reads —
+  a target reading several types one at a time has none outstanding in
+  between.
+* By the **source**, after its [`DragFinished`](#dragfinished--0x8508):
+  it releases the offer, and reads still parked against it end at EOF. A
+  source that disconnects instead is equivalent. A source sending it
+  before the target finished gives the drop up (the target gets
+  `DragLeave`).
+
+The phase makes this unambiguous when source and target are one client.
+From anyone else it is a race and ignored. There is **no timeout**: a
+target that never finishes leaves the source waiting, as a Wayland
+target that never calls `wl_data_offer.finish` does.
 
 ## Messages, server → client
 
@@ -2253,9 +2299,30 @@ target       →  RequestSelection { request, Drag, mime }       (0x0306)  — r
 server       →  DragLeave { window }                      to target  (0x8506)
   … or …
 server       →  DragDrop { window }                       to target  (0x8507)
+target       →  RequestSelection { request, Drag, mime }       (0x0306)  — reads the data
+target       →  FinishDrag                                     (0x030a)
 server       →  DragFinished { accepted, action }          to source  (0x8508)
 source       →  FinishDrag                                     (0x030a)
 ```
+
+A rejected or cancelled drag (no acceptance at the release, Escape, a
+lock) skips the target's half: the target gets `DragLeave` and the source
+`DragFinished { accepted: false, action: None }` at once.
+
+**Who is a target:** the window under the pointer (the icon excluded),
+if its client listed `DATA` in `ClientCaps` and the session lock admits
+it. Anything else is "no target", which rejects. The drag crosses clients
+and outputs freely.
+
+**Disconnects.** The source going ends the drag: the grab is released,
+the icon comes down and the target gets `DragLeave`. The target going
+mid-drag leaves the drag carrying on over nothing; going after the drop,
+before its `FinishDrag`, gives the source `DragFinished { accepted:
+false }`.
+
+**Popups** and drags exclude each other: starting a drag dismisses a
+grabbing menu, and a grabbing menu created mid-drag is dismissed at once
+(`docs/wm.md` § Popups and drag-and-drop).
 
 The destination reads the dragged bytes with an ordinary
 `RequestSelection` carrying `source: Drag`, answered by the same
@@ -2351,8 +2418,10 @@ Four decisions the sequence above leaves open, fixed by the M5-H server:
   is sent the current `SelectionOffer` at once if a selection exists, so
   an app started after the copy can paste without waiting for the next one.
 
-A `RequestSelection` with `source: Drag` is `Error { Protocol }` until
-drag-and-drop lands (M5-I): until then no client is ever a drop target.
+A `RequestSelection` with `source: Drag` from a client that is not the
+current drop target is `Error { Protocol }`. A new `SetSelection` cancels
+clipboard requests only, never a drop being read; the end of a drag
+cancels only drag ones.
 A `DATA` op from a client that did not list `DATA` in `ClientCaps`, or from
 a remote client, is `Error { Protocol }`.
 

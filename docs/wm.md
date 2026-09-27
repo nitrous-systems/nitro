@@ -1277,6 +1277,35 @@ created and immediately dismissed, never an error.
 
 Chains are capped at 16 levels.
 
+### Popups and drag-and-drop
+
+A drag-and-drop (M5-I, `docs/wire.md` § The drag-and-drop sequence) holds
+a pointer grab of its own, and it is a **separate mechanism** from the
+popup grab rather than a variant of it. The popup grab is a *press-time
+filter* (an outside press dismisses, motion is untouched); the drag grab
+owns *every* motion and button until the last button comes up — the
+sibling of a window drag, not of a menu. The two never coexist, by these
+rules:
+
+* **A drag starting while a grabbing chain is open dismisses the chain
+  first** (unmap, then `PopupDone`, as for an outside click) — even when
+  the drag starts from inside the menu. The drag's source is the client,
+  not the window, so it carries on.
+* **A grabbing popup created mid-drag is refused by the race path**: marked
+  dismissed and sent `PopupDone` without ever being mapped. A tooltip (no
+  `GRAB`) maps normally.
+* The drag's button check runs above the popup's in `pointer_button`, and
+  its Escape check above the popup's in key routing; with no popup grab
+  possible during a drag, neither ever reaches the other.
+* The stationary enter/leave re-check (`pointer_refresh`) is shared: while
+  a drag holds the pointer it re-derives the **drop target** instead
+  (`DragEnter`/`DragLeave` for a window mapped or unmapped under a still
+  pointer), and the end of the grab uses it to hand pointer focus back
+  with a `PointerEnter`.
+
+A window drag cannot start during a drag-and-drop (presses are the drag's)
+and a drag-and-drop is not started during a window drag.
+
 ## What is deferred
 
 * **Workspaces / virtual desktops.** Not in M3 at all. The MRU list and

@@ -342,6 +342,24 @@ pub struct ApplyOutcome {
     /// `RepositionPopup`s, in arrival order: the popup and its new
     /// positioner. Deferred for `state_requests`' reason.
     pub repositioned_popups: Vec<(WindowKey, PopupInfo)>,
+    /// `StartDrag`s, validated, in arrival order. Buffered to the commit
+    /// (unlike `StartMove`) so an icon window created in the same batch
+    /// exists and is placed before the server adopts it; authorization —
+    /// a button down, pointer focus — is the server's, at processing.
+    pub start_drags: Vec<DragStart>,
+}
+
+/// A validated `StartDrag`; see [`ApplyOutcome::start_drags`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DragStart {
+    /// The window the drag starts from.
+    pub window: WindowKey,
+    /// The icon window to adopt, if any.
+    pub icon: Option<WindowKey>,
+    /// The `drag_actions` offered.
+    pub actions: u32,
+    /// MIME types offered.
+    pub mimes: Vec<String>,
 }
 
 /// Apply one client's buffered mutations to the scene, atomically as far as
@@ -901,18 +919,82 @@ fn apply_msg(
             ));
             Ok(())
         }
-        // The rest of the M5-A ops (#3767): the protocol surface landed
-        // ahead of the behaviour, so they are refused. `handle_wire_msg`
-        // already disconnects on receipt and none of these ever reaches
-        // `pending`; this arm is belt and braces, and exists because the
-        // match above is the op table and deliberately has no `_`.
-        ClientMsg::StartDrag(_)
-        | ClientMsg::AcceptDrop(_)
-        | ClientMsg::FinishDrag(_) => Err(ApplyError::new(
-            ErrorCode::Protocol,
-            "this op needs a capability this server does not advertise",
-        )),
+        ClientMsg::StartDrag(m) => {
+            let window = window_of(client, m.window)?;
+            let icon = if m.icon.is_none() {
+                None
+            } else {
+                Some(drag_icon(client, scene, m.icon, window)?)
+            };
+            if !crate::data::valid_actions(m.actions) {
+                return Err(ApplyError::new(
+                    ErrorCode::Protocol,
+                    format!(
+                        "StartDrag: actions {:#x} are empty or use reserved bits",
+                        m.actions
+                    ),
+                ));
+            }
+            crate::data::validate_mimes(&m.mimes).map_err(|e| {
+                let code = if e.is_limit() {
+                    ErrorCode::Limit
+                } else {
+                    ErrorCode::Protocol
+                };
+                ApplyError::new(code, e.detail("StartDrag"))
+            })?;
+            outcome.start_drags.push(DragStart {
+                window,
+                icon,
+                actions: m.actions,
+                mimes: m.mimes,
+            });
+            Ok(())
+        }
+        ClientMsg::AcceptDrop(_) | ClientMsg::FinishDrag(_) => {
+            // Never buffered: `handle_wire_msg` acts on them at receipt.
+            // An acceptance answers the motion the target just saw, and a
+            // finish must not wait for a commit that may never come.
+            Ok(())
+        }
     }
+}
+
+/// Resolve and check a `StartDrag` icon (`docs/wire.md` § `StartDrag`):
+/// one of the sender's own window roots, not a popup, not the window the
+/// drag starts from, created `UNDECORATED | NO_FOCUS`. Anything else is a
+/// lie rather than a race, so it is fatal.
+fn drag_icon(
+    client: &WireClient,
+    scene: &Scene,
+    id: NodeId,
+    window: WindowKey,
+) -> Result<WindowKey, ApplyError> {
+    let bad = |why: &str| {
+        ApplyError::new(
+            ErrorCode::Protocol,
+            format!("StartDrag: icon {} {why}", id.raw()),
+        )
+    };
+    let icon = client
+        .windows
+        .get(&id)
+        .copied()
+        .ok_or_else(|| bad("is not one of this client's windows"))?;
+    if icon == window {
+        return Err(bad("is the window the drag starts from"));
+    }
+    let info = scene
+        .window_info(icon)
+        .map_err(|e| scene_err("StartDrag", e))?;
+    if info.is_popup() {
+        return Err(bad("is a popup"));
+    }
+    let flags = info.flags();
+    if flags.decorated || flags.focusable {
+        return Err(bad("was not created UNDECORATED | NO_FOCUS"));
+    }
+    Ok(icon)
 }
 
 /// Refuse reserved constraint bits: they are reserved so that a future bit

@@ -107,3 +107,24 @@ fn a_window_created_while_filtered_follows_the_filter() {
     settle(&mut s);
     assert!(painted(&s).contains(&r));
 }
+
+#[test]
+fn a_hit_exempt_window_is_painted_but_the_pointer_passes_through() {
+    let mut s = scene();
+    let (app, app_rect, lock, lock_rect) = two_clients(&mut s);
+    assert_eq!(
+        s.hit_test(OUT, Point::new(10.0, 10.0)).unwrap().window,
+        lock
+    );
+    s.set_hit_exempt(lock, true).unwrap();
+    settle(&mut s);
+    assert_eq!(painted(&s), vec![app_rect, lock_rect], "still painted");
+    let hit = s.hit_test(OUT, Point::new(10.0, 10.0)).unwrap();
+    assert_eq!((hit.window, hit.node), (app, app_rect), "hit falls through");
+    assert!(s.window_info(lock).unwrap().is_hit_exempt());
+    s.set_hit_exempt(lock, false).unwrap();
+    assert_eq!(
+        s.hit_test(OUT, Point::new(10.0, 10.0)).unwrap().window,
+        lock
+    );
+}

@@ -466,8 +466,10 @@ impl Connection {
         }))
     }
 
-    /// End a drag this client started, after its
-    /// [`DragFinished`](crate::msg::DragFinished) (needs `caps::DATA`).
+    /// Finish a drag (needs `caps::DATA`): as its **target**, after
+    /// [`DragDrop`](crate::msg::ServerMsg::DragDrop) and reading the data;
+    /// as its **source**, after
+    /// [`DragFinished`](crate::msg::DragFinished), to release the offer.
     ///
     /// # Errors
     /// As [`Connection::send`].

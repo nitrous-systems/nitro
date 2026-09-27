@@ -358,7 +358,7 @@ impl Scene {
             let Some(window) = self.windows.get(win) else {
                 continue;
             };
-            if !self.admit.admits(window.client) {
+            if !self.admit.admits(window.client) || window.hit_exempt {
                 continue;
             }
             let root = window.root;

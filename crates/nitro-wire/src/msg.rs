@@ -866,9 +866,13 @@ impl Body for ListOutputs {
 /// End a drag this client started (needs
 /// [`caps::DATA`](crate::types::caps::DATA)).
 ///
-/// Sent by the drag **source** after it has been told the outcome with a
-/// [`DragFinished`]: it releases the offer and the server drops the drag
-/// icon. A source that disconnects instead is equivalent.
+/// Sent by **both ends**, told apart by the drag's phase: by the
+/// **target** after [`DragDrop`](ServerMsg::DragDrop), once it has read
+/// the data — which completes the drop and earns the source its
+/// [`DragFinished`](ServerMsg::DragFinished) — and by the **source** after
+/// that, which releases the offer. A source that disconnects instead is
+/// equivalent. From anyone else it is a race and ignored; there is no
+/// timeout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FinishDrag;
 
@@ -1090,11 +1094,16 @@ impl Body for SendSelection {
 /// Wayland Ozone backend never calls, so the source learning the action
 /// only at the end matches what the backend nitro is modelled on does.
 ///
-/// `icon` is a node the server draws under the pointer for the duration;
-/// [`NodeId::NONE`] means "no drag icon".
+/// `icon` is a window root of the sender's, created `UNDECORATED |
+/// NO_FOCUS`, that the server adopts and draws centred under the pointer
+/// until the grab ends; [`NodeId::NONE`] means "no drag icon". Anything
+/// else is `Error { Protocol }`.
 ///
 /// Authorized by pointer focus plus a button actually being down, not by
-/// an input serial. `mimes` is last because it is the variable field.
+/// an input serial, and silently ignored when that fails. Buffered to the
+/// commit, so the icon may be created in the same batch. The source loses
+/// pointer focus for the drag and never sees its press's `Released`.
+/// `mimes` is last because it is the variable field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartDrag {
     /// The window the drag starts from, by the sender's own node id.
@@ -1146,7 +1155,9 @@ impl Body for StartDrag {
 /// was pressed). An empty `mime`, or [`DragAction::None`], **rejects** the
 /// offer, which is how the source's cursor learns it cannot drop here.
 ///
-/// `action` must be one of the actions [`DragEnter`] advertised. `mime` is
+/// `action` must be one of the actions [`DragEnter`] advertised, and
+/// `mime` one of its types; a mismatch counts as a rejection, not an
+/// error. Ignored after the drop, and from anyone but the target. `mime` is
 /// last, being the variable field — a reordering against the M5-A sketch,
 /// like [`SetAppId`]'s.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2675,9 +2686,9 @@ fixed_msg! {
     /// The user dropped over a window (needs
     /// [`caps::DATA`](crate::types::caps::DATA)).
     ///
-    /// The destination may still read the data — the drag window stays
-    /// open until the transfer finishes — and should have said what it
-    /// would do with [`AcceptDrop`] before now.
+    /// Sent only to a target that accepted with [`AcceptDrop`]. It may
+    /// still read the data, and answers [`FinishDrag`] once it has — which
+    /// is what tells the source the drop succeeded.
     DragDrop {
         /// The window dropped on.
         window: NodeId,

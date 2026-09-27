@@ -626,7 +626,7 @@ fn reusing_an_outstanding_request_id_is_fatal() {
 }
 
 #[test]
-fn a_drag_request_is_refused_until_m5_i() {
+fn a_drag_request_outside_a_drag_is_fatal() {
     let _fds = shared();
     let h = Harness::start("drag");
     let mut b = h.client("b");
