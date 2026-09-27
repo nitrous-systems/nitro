@@ -4614,3 +4614,433 @@ fn a_client_cannot_restart_a_drag_already_in_flight() {
     drop(conn);
     h.quit();
 }
+
+// ------------------------------------------------------------ overview mode
+//
+// Overview mode (#3788), driven through the `overview` control request —
+// the test hook until the triggers exist. `docs/wm.md` §Overview mode.
+
+/// Where each window's thumbnail goes: the same `overview::layout` call
+/// the server makes, over the whole output (no shell, so no zones).
+/// Returned in `wins` order.
+fn expected_slots(wins: &[Win]) -> Vec<nitro_server::overview::Slot> {
+    use nitro_server::overview::{Thumb, layout};
+    let key = |i: usize| nitro_scene::WindowKey::from_parts(u32::try_from(i).unwrap(), 1);
+    let thumbs: Vec<Thumb> = wins
+        .iter()
+        .enumerate()
+        .map(|(i, w)| Thumb {
+            window: key(i),
+            size: w.size,
+            centre: Point::new(w.pos.x + w.size.w / 2.0, w.pos.y + w.size.h / 2.0),
+        })
+        .collect();
+    let slots = layout(
+        &thumbs,
+        Rect::new(0.0, 0.0, OUT.0 as f32, OUT.1 as f32),
+        OUT.1 as f32,
+    );
+    (0..wins.len())
+        .map(|i| *slots.iter().find(|s| s.window == key(i)).expect("a slot"))
+        .collect()
+}
+
+fn centre(s: &nitro_server::overview::Slot) -> (f32, f32) {
+    (s.pos.x + s.size.w / 2.0, s.pos.y + s.size.h / 2.0)
+}
+
+fn overview(h: &Harness, on: bool) {
+    let reply = h.request_line(if on {
+        "overview on\n"
+    } else {
+        "overview off\n"
+    });
+    assert_eq!(reply, "ok");
+    h.settle();
+}
+
+/// Whether `px` is `under` dimmed by the scrim: every channel darker.
+fn dimmed(px: u32, under: u32) -> bool {
+    let ch = |v: u32, s: u32| (v >> s) & 0xff;
+    // Pure black cannot get darker; its low 24 bits are all zero.
+    [16, 8, 0].iter().all(|s| ch(px, *s) < ch(under, *s)) || under.trailing_zeros() >= 24
+}
+
+#[test]
+#[allow(clippy::many_single_char_names)] // h, a, b, x, y: as the rest of this file
+fn a_click_on_a_thumbnail_selects_it_and_never_reaches_its_client() {
+    let mut h = Harness::start("ov-click", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("ov-click");
+    let a = make_window(&mut conn, &mut inbox, 1, "a", WIN, RED, 0, 1);
+    let b = make_window(&mut conn, &mut inbox, 3, "b", WIN, GREEN, 0, 2);
+    park(&mut h);
+    await_focus(&mut conn, &mut inbox, b.root, "the newest window");
+    let before = h.shot();
+
+    overview(&h, true);
+    assert_eq!(h.stat("overview"), 1);
+    assert_eq!(h.stat("overview_thumbs"), 2);
+    let slots = expected_slots(&[a, b]);
+    let shot = h.shot();
+    for (s, c) in slots.iter().zip([RED, GREEN]) {
+        let (x, y) = centre(s);
+        assert_eq!(rgb(shot.pixel(x as u32, y as u32)), to_rgb(c), "{s:?}");
+    }
+
+    conn.flush().unwrap();
+    let _ = conn.poll(&mut inbox.0);
+    inbox.0.clear();
+    let (x, y) = centre(&slots[0]);
+    h.point_at(x, y, OUT);
+    h.settle();
+    h.point_at(x + 2.0, y + 1.0, OUT);
+    h.settle();
+    h.button(BTN_LEFT, ButtonState::Pressed);
+    h.settle();
+    h.button(BTN_LEFT, ButtonState::Released);
+    h.settle();
+
+    assert_eq!(h.stat("overview"), 0, "a click on a thumbnail leaves");
+    await_focus(&mut conn, &mut inbox, a.root, "the selected window");
+    conn.flush().unwrap();
+    let _ = conn.poll(&mut inbox.0);
+    assert!(
+        !inbox
+            .0
+            .iter()
+            .any(|m| matches!(m, ServerMsg::PointerButton(_))),
+        "neither the press nor its release reached a client: {:?}",
+        inbox.0
+    );
+    assert!(
+        !inbox
+            .0
+            .iter()
+            .any(|m| matches!(m, ServerMsg::PointerMotion(p) if p.window == a.root)),
+        "no motion over the thumbnail reached its client"
+    );
+    // Raised: `a` is now on top where the two overlap, and back in place.
+    park(&mut h);
+    let after = h.shot();
+    let (ax, ay) = a.content();
+    assert_eq!(rgb(after.pixel(ax as u32, ay as u32)), to_rgb(RED));
+    assert_eq!(rgb(before.pixel(ax as u32, ay as u32)), to_rgb(GREEN));
+
+    drop(conn);
+    h.quit();
+}
+
+#[test]
+#[allow(clippy::many_single_char_names)] // h, a, b, x, y: as the rest of this file
+fn an_overlay_window_still_takes_clicks_in_overview() {
+    let mut h = Harness::start("ov-overlay", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("ov-overlay");
+    let a = make_window(&mut conn, &mut inbox, 1, "a", WIN, RED, 0, 1);
+    let mut shell_inbox = Inbox::default();
+    let mut shell = h.shell("ov-search");
+    let root = NodeId(11);
+    let rect = NodeId(12);
+    let size = Size::new(200.0, 40.0);
+    shell
+        .tx()
+        .create_window_with(
+            root,
+            "search",
+            size,
+            Layer::Overlay,
+            window_flags::UNDECORATED | window_flags::NO_FOCUS,
+        )
+        .create_rect(rect, root, Rect::new(0.0, 0.0, size.w, size.h))
+        .fill_solid(rect, BLUE)
+        .commit(1)
+        .unwrap();
+    shell.flush().unwrap();
+    let pos = expect(&mut shell, &mut shell_inbox.0, "Configure", |m| match m {
+        ServerMsg::Configure(c) if c.window == root => Some(c.position),
+        _ => None,
+    });
+    park(&mut h);
+    overview(&h, true);
+
+    h.point_at(pos.x + 20.0, pos.y + 20.0, OUT);
+    h.settle();
+    h.button(BTN_LEFT, ButtonState::Pressed);
+    h.button(BTN_LEFT, ButtonState::Released);
+    h.settle();
+    shell.flush().unwrap();
+    let _ = shell.poll(&mut shell_inbox.0);
+    let buttons = shell_inbox
+        .0
+        .iter()
+        .filter(|m| matches!(m, ServerMsg::PointerButton(p) if p.window == root))
+        .count();
+    assert_eq!(buttons, 2, "the overlay got its press and its release");
+    assert_eq!(h.stat("overview"), 1, "and the overview stayed up");
+    let _ = a;
+
+    drop((conn, shell));
+    h.quit();
+}
+
+#[test]
+#[allow(clippy::many_single_char_names)] // h, a, b, x, y: as the rest of this file
+fn a_settled_overview_paints_nothing() {
+    let mut h = Harness::start("ov-idle", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("ov-idle");
+    let _a = make_window(&mut conn, &mut inbox, 1, "a", WIN, RED, 0, 1);
+    let _b = make_window(&mut conn, &mut inbox, 3, "b", WIN, GREEN, 0, 2);
+    park(&mut h);
+    overview(&h, true);
+    let frames = h.stat("frames");
+    std::thread::sleep(Duration::from_millis(120));
+    assert_eq!(
+        h.stat("frames"),
+        frames,
+        "a settled overview must not repaint: a scaled grid costs ~17 ms a frame"
+    );
+    drop(conn);
+    h.quit();
+}
+
+#[test]
+#[allow(clippy::many_single_char_names)] // h, a, b, x, y: as the rest of this file
+fn leaving_the_overview_restores_the_desktop_exactly() {
+    let mut h = Harness::start("ov-restore", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("ov-restore");
+    let _a = make_window(&mut conn, &mut inbox, 1, "a", WIN, RED, 0, 1);
+    let _b = make_window(
+        &mut conn,
+        &mut inbox,
+        3,
+        "b",
+        WIN,
+        GREEN,
+        window_flags::UNDECORATED,
+        2,
+    );
+    park(&mut h);
+    let before = h.shot();
+    overview(&h, true);
+    assert_ne!(
+        h.shot().data,
+        before.data,
+        "the overview changed the screen"
+    );
+    overview(&h, false);
+    assert_eq!(h.stat("overview"), 0);
+    assert!(
+        h.shot().data == before.data,
+        "leaving puts back every pixel"
+    );
+    drop(conn);
+    h.quit();
+}
+
+#[test]
+#[allow(clippy::many_single_char_names)] // h, a, b, x, y: as the rest of this file
+fn a_minimized_window_gets_a_thumbnail_and_goes_back_hidden() {
+    let mut h = Harness::start("ov-min", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("ov-min");
+    let a = make_window(&mut conn, &mut inbox, 1, "a", WIN, RED, 0, 1);
+    let b = make_window(&mut conn, &mut inbox, 3, "b", WIN, GREEN, 0, 2);
+    h.key(KEY_LEFTMETA, true);
+    h.key(KEY_H, true);
+    h.key(KEY_H, false);
+    h.key(KEY_LEFTMETA, false);
+    park(&mut h);
+    assert_eq!(h.stat("minimized"), 1);
+
+    overview(&h, true);
+    assert_eq!(
+        h.stat("overview_thumbs"),
+        2,
+        "the minimized window is in the grid"
+    );
+    let slots = expected_slots(&[a, b]);
+    let (x, y) = centre(&slots[1]);
+    assert_eq!(rgb(h.shot().pixel(x as u32, y as u32)), to_rgb(GREEN));
+
+    overview(&h, false);
+    assert_eq!(h.stat("minimized"), 1, "still minimized");
+    let (bx, by) = b.content();
+    let (ax, ay) = a.content();
+    // `b` sits over `a` down-right; a point of `b` that `a` does not cover.
+    let (px, py) = (bx + b.size.w / 2.0 - 4.0, by + b.size.h / 2.0 - 4.0);
+    let _ = (ax, ay);
+    assert_ne!(
+        rgb(h.shot().pixel(px as u32, py as u32)),
+        to_rgb(GREEN),
+        "hidden again"
+    );
+
+    // Selecting it un-minimizes and focuses it.
+    overview(&h, true);
+    h.point_at(x, y, OUT);
+    h.settle();
+    h.button(BTN_LEFT, ButtonState::Pressed);
+    h.button(BTN_LEFT, ButtonState::Released);
+    h.settle();
+    await_focus(&mut conn, &mut inbox, b.root, "the un-minimized window");
+    assert_eq!(h.stat("minimized"), 0);
+    park(&mut h);
+    assert_eq!(rgb(h.shot().pixel(px as u32, py as u32)), to_rgb(GREEN));
+
+    drop(conn);
+    h.quit();
+}
+
+#[test]
+#[allow(clippy::many_single_char_names)] // h, a, b, x, y: as the rest of this file
+fn the_scrim_stays_under_a_window_mapped_during_overview() {
+    let mut h = Harness::start("ov-map", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("ov-map");
+    let a = make_window(&mut conn, &mut inbox, 1, "a", WIN, RED, 0, 1);
+    park(&mut h);
+    overview(&h, true);
+    assert_eq!(h.stat("overview_thumbs"), 1);
+    let b = make_window(&mut conn, &mut inbox, 3, "b", WIN, GREEN, 0, 2);
+    h.settle();
+    assert_eq!(h.stat("overview"), 1, "still in overview");
+    assert_eq!(
+        h.stat("overview_thumbs"),
+        2,
+        "the new window joined the grid"
+    );
+    let slots = expected_slots(&[a, b]);
+    let shot = h.shot();
+    for (s, c) in slots.iter().zip([RED, GREEN]) {
+        let (x, y) = centre(s);
+        assert_eq!(rgb(shot.pixel(x as u32, y as u32)), to_rgb(c), "{s:?}");
+    }
+    drop(conn);
+    h.quit();
+}
+
+#[test]
+#[allow(clippy::many_single_char_names)] // h, a, b, x, y: as the rest of this file
+fn overview_on_one_output_leaves_the_other_alone() {
+    let mut h = Harness::start("ov-two", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("ov-two");
+    let _a = make_window(&mut conn, &mut inbox, 1, "a", WIN, RED, 0, 1);
+    let mut b = make_window(&mut conn, &mut inbox, 3, "b", WIN, GREEN, 0, 2);
+    assert_eq!(h.request_line("plug 400x300\n"), "ok");
+    wait_for("the second output", || h.stat("outputs") == 2);
+    h.settle();
+    let (bx, by) = b.title_bar();
+    h.drag((bx, by), (OUT.0 as f32 + 150.0, 100.0), OUT);
+    await_configure(&mut conn, &mut inbox, &mut b, "the move");
+    park(&mut h);
+    let shot2 = || {
+        let mut c = h.connect();
+        c.get_mut().write_all(b"shot Virtual-2\n").unwrap();
+        let mut header = String::new();
+        c.read_line(&mut header).unwrap();
+        let f: Vec<u32> = header
+            .trim_end()
+            .strip_prefix("ok ")
+            .unwrap_or_else(|| panic!("{header}"))
+            .split(' ')
+            .map(|v| v.parse().unwrap())
+            .collect();
+        let mut data = vec![0u8; (f[2] * f[1]) as usize];
+        c.read_exact(&mut data).unwrap();
+        data
+    };
+    let before = shot2();
+    overview(&h, true);
+    assert_eq!(
+        h.stat("overview_thumbs"),
+        1,
+        "only the first output's window"
+    );
+    assert!(shot2() == before, "the other output is untouched");
+    overview(&h, false);
+    drop(conn);
+    h.quit();
+}
+
+#[test]
+#[allow(clippy::many_single_char_names)] // h, a, b, x, y: as the rest of this file
+fn an_empty_overview_is_just_the_scrim() {
+    let mut h = Harness::start("ov-empty", OUT.0, OUT.1);
+    park(&mut h);
+    let before = h.shot();
+    overview(&h, true);
+    assert_eq!(h.stat("overview"), 1);
+    assert_eq!(h.stat("overview_thumbs"), 0);
+    let shot = h.shot();
+    for (x, y) in [(100, 100), (320, 240), (500, 400)] {
+        assert!(
+            dimmed(rgb(shot.pixel(x, y)), rgb(before.pixel(x, y))),
+            "({x}, {y}) is under the scrim"
+        );
+    }
+    // A click on the bare scrim leaves.
+    h.point_at(320.0, 240.0, OUT);
+    h.settle();
+    h.button(BTN_LEFT, ButtonState::Pressed);
+    h.button(BTN_LEFT, ButtonState::Released);
+    h.settle();
+    assert_eq!(h.stat("overview"), 0);
+    h.quit();
+}
+
+#[test]
+#[allow(clippy::many_single_char_names)] // h, a, b, x, y: as the rest of this file
+fn decorations_are_hidden_in_overview_and_the_badge_is_drawn() {
+    let mut h = Harness::start("ov-decor", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("ov-decor");
+    let a = make_window(&mut conn, &mut inbox, 1, "a", WIN, RED, 0, 1);
+    let b = make_window(&mut conn, &mut inbox, 3, "b", WIN, GREEN, 0, 2);
+    let c = make_window(&mut conn, &mut inbox, 5, "c", WIN, BLUE, 0, 3);
+    park(&mut h);
+    let desktop = h.shot();
+    overview(&h, true);
+    let shot = h.shot();
+    let slots = expected_slots(&[a, b, c]);
+    for s in &slots {
+        // Just above the thumbnail, where its scaled title bar would be,
+        // is the scrim over the desktop and nothing else.
+        let (x, _) = centre(s);
+        let y = s.pos.y - 3.0;
+        let px = rgb(shot.pixel(x as u32, y as u32));
+        assert!(
+            px != to_rgb(bar(true)) && px != to_rgb(bar(false)),
+            "no title bar above {s:?}"
+        );
+        // The badge: the icon's lower 30 % and the caption pill hang below
+        // the thumbnail, where there is otherwise only scrim.
+        let below = Rect::new(
+            x - 32.0,
+            s.pos.y + s.size.h + 2.0,
+            64.0,
+            nitro_server::overview::ROW_SPACING - 4.0,
+        );
+        let differ = crop(&shot, below)
+            .iter()
+            .zip(crop(&desktop, below))
+            .filter(|(p, d)| !dimmed(rgb(**p), rgb(*d)))
+            .count();
+        assert!(
+            differ > 50,
+            "a badge below {s:?}: {differ} non-scrim pixels"
+        );
+    }
+    overview(&h, false);
+    let (x, y) = a.title_bar();
+    assert_eq!(
+        rgb(h.shot().pixel(x as u32, y as u32)),
+        rgb(desktop.pixel(x as u32, y as u32)),
+        "the title bars are back"
+    );
+    drop(conn);
+    h.quit();
+}

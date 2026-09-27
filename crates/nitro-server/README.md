@@ -100,6 +100,7 @@ tests.
 | `unplug`             | `ok\n`; fake backend only — removes the last output, which is the half that matters to the window manager: removing an output orphans its windows, and migrating them is the behaviour under test. |
 | `theme`              | `ok <scheme> <serial>\n`, one `role #rrggbb[aa]` line per colour role, blank line. Read-only, and the cheap way to answer "what colour is the desktop actually using" with no client and no screenshot: the palette is server state, so the server is the only thing that can say. The role names are the `server.conf` keys, so any line of the output is one `theme.` prefix away from being the config that pins it. See `docs/theme.md`. |
 | `focus`              | `ok\n`; gives keyboard focus to the topmost window. Test-only, and it exists because focus otherwise *follows the click*: a toolkit test of Tab traversal would have to synthesise a click to get focus, which moves the focus to whatever widget was under the pointer — the very state it is about to assert on. `err no windows` when there are none. |
+| `overview [on\|off] [name]` | `ok\n`; enters overview mode on the named output (the first when unnamed) or leaves it. A test and debug hook for the primitive built in #3788 — the triggers in #3789 replace it as the way in. `docs/wm.md` §Overview mode. |
 | anything else        | `err <message>\n`                                                     |
 
 Several requests per connection are fine; a request line longer than 256
@@ -915,6 +916,8 @@ looking for.
 | `decorated`              | Windows carrying a server-drawn frame. `windows - decorated` is how many opted out with `UNDECORATED`. |
 | `minimized`              | Windows hidden by `Minimized`. They are still in `windows` and still in the `Alt+Tab` order. |
 | `dragging`               | 1 while a move or resize drag is in flight. A drag that is still 1 with nothing on the desk is a stuck grab. |
+| `overview`               | 1 while an output is in overview mode. |
+| `overview_thumbs`        | Thumbnails in the overview in force; 0 without one. The scrim counts under `windows`. |
 | `focused`                | 1 when some window has keyboard focus. 0 with windows on screen means every one of them is `NO_FOCUS` or minimized — or that the focus was dropped and not handed on, which is a bug. |
 | `shell_clients`          | Connections on the **privileged** shell socket. The first key to look at when a bar "is not working": zero means it never got there. |
 | `remote_clients`         | Connections that arrived over **TCP** (`docs/remote.md`). Counted separately from `clients`, which is the total: a remote client is an ordinary client in every other respect, and this is the one fact about it that is not visible anywhere else. |

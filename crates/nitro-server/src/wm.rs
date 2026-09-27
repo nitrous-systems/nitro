@@ -551,6 +551,10 @@ pub struct WindowManager {
     placed: u32,
     /// The last title-bar press, for double-click detection.
     last_title_click: Option<(WindowKey, u64)>,
+    /// Overview mode, when one output is in it (`docs/wm.md` §Overview
+    /// mode). An `Option` rather than a flag because leaving has to put
+    /// every thumbnail back exactly as it was, and that state lives here.
+    overview: Option<crate::overview::Overview>,
 }
 
 impl WindowManager {
@@ -582,6 +586,28 @@ impl WindowManager {
     #[must_use]
     pub fn drag(&self) -> Option<Drag> {
         self.drag
+    }
+
+    /// The overview in force, if any.
+    #[must_use]
+    pub fn overview(&self) -> Option<&crate::overview::Overview> {
+        self.overview.as_ref()
+    }
+
+    /// The overview in force, mutably.
+    pub fn overview_mut(&mut self) -> Option<&mut crate::overview::Overview> {
+        self.overview.as_mut()
+    }
+
+    /// Record an overview just entered. The caller has already left any
+    /// previous one.
+    pub fn begin_overview(&mut self, overview: crate::overview::Overview) {
+        self.overview = Some(overview);
+    }
+
+    /// Forget the overview, handing its restore state to the caller.
+    pub fn take_overview(&mut self) -> Option<crate::overview::Overview> {
+        self.overview.take()
     }
 
     /// Start a drag.

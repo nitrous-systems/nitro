@@ -982,6 +982,11 @@ struct Server {
     /// gone): swallow every button event until all are up, so no client
     /// sees a `Released` whose press it never saw.
     dnd_swallow: bool,
+    /// A button whose press overview mode consumed (a thumbnail
+    /// selection): its release is dropped too, even though the overview
+    /// has ended by then, so the window just selected never sees a
+    /// `Released` whose press it never saw.
+    overview_swallow: Option<u32>,
     /// Escape cancelled a drag; its release is swallowed.
     dnd_escape_consumed: bool,
     /// Drops delivered to an accepting target, cumulative. `stats`.
@@ -1305,6 +1310,7 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         pending_drag_finished: Vec::new(),
         drag_icons: HashSet::new(),
         dnd_swallow: false,
+        overview_swallow: None,
         dnd_escape_consumed: false,
         dnd_drops: 0,
         dnd_cancels: 0,
@@ -1706,6 +1712,13 @@ impl Server {
 
     fn sync_outputs(&mut self) {
         let infos: Vec<OutputInfo> = self.backend.outputs().to_vec();
+        // An overview on an output about to go is over: its thumbnails
+        // are put back before they become orphans to migrate.
+        if let Some(out) = self.overview_output()
+            && !infos.iter().any(|i| SceneOutputId(i.id.0) == out)
+        {
+            self.leave_overview(None);
+        }
         let mut lost = false;
         let mut gone: Vec<u32> = Vec::new();
         self.outputs.retain(|o| {
@@ -2999,6 +3012,8 @@ impl Server {
         for win in framed {
             self.restyle(win, self.focus == Some(win));
         }
+        // The captions and pills were styled from the old palette.
+        self.relayout_overview();
         let theme = msg::Theme::from_palette(self.theme_serial, &self.palette);
         for client in self.wire_clients.values_mut() {
             // Not before the handshake. `wire_clients` holds a client
@@ -3307,12 +3322,20 @@ impl Server {
         // `button_hover_at`, each doing its own hit test — which is two
         // z-order walks per motion event where #3713's review had just
         // finished getting it down to one.
-        let frame_hit = self.pointer_desktop().and_then(|p| self.frame_hit(p));
+        // In overview no frame affordance applies anywhere on that
+        // output: every frame is hidden or scaled, and the pointer over a
+        // thumbnail belongs to the window manager (`input::overview_hit`).
+        let in_overview = output.is_some() && output == self.overview_output();
+        let frame_hit = if in_overview {
+            None
+        } else {
+            self.pointer_desktop().and_then(|p| self.frame_hit(p))
+        };
         self.set_resize_hint(
             frame_hit.and_then(|(win, region)| matches!(region, Region::Resize(_)).then_some(win)),
         );
         self.set_button_hover(frame_hit.filter(|(_, region)| region.is_button()));
-        let target = output.and_then(|id| input::hit(&self.scene, id, point));
+        let target = output.and_then(|id| self.pointer_target(id, point));
         let now_over = target.map(|t| t.window);
         if now_over != self.pointer.over {
             if let Some(left) = self.pointer.over {
@@ -3355,7 +3378,14 @@ impl Server {
         // And the cursor shape, off that same one walk — decided **after**
         // enter/leave, so a client's request is judged against the window
         // the pointer is on now, not the one it just left.
-        self.set_cursor(self.cursor_choice(frame_hit));
+        // In overview the only client the pointer can be over is a
+        // `Top`/`Overlay` one, whose content honours its own cursor.
+        let cursor_hit = if in_overview {
+            self.pointer.over.map(|w| (w, Region::Content))
+        } else {
+            frame_hit
+        };
+        self.set_cursor(self.cursor_choice(cursor_hit));
         self.cursor_stale = false;
         self.note_input(time_ns);
     }
@@ -3376,9 +3406,9 @@ impl Server {
 
         // The grabs go **first** — above the release/drag branch: a
         // drag-and-drop (which holds the pointer, so no popup grab can
-        // coexist with it), then the popup grab. See `Server::dnd_button`
-        // and `Server::popup_grab_button`.
-        if self.dnd_button(state, time_ns) || self.popup_grab_button(state, time_ns) {
+        // coexist with it), then the popup grab, then overview mode. See
+        // `Server::button_grabs`.
+        if self.button_grabs(button, state, time_ns) {
             return;
         }
 
@@ -3435,7 +3465,7 @@ impl Server {
             .as_ref()
             .map_or_else(Mods::default, Keyboard::named_mods);
         if state == ButtonState::Pressed
-            && let Some(point) = self.pointer_desktop()
+            && let Some(point) = self.frame_point()
         {
             // Super + drag: the server moves and resizes any window,
             // decorated or not. Checked before the frame regions so it
@@ -4013,6 +4043,13 @@ impl Server {
     /// is the one thing the user can always see; a chord with nothing
     /// focused is a no-op rather than a guess.
     fn hotkey(&mut self, hotkey: Hotkey) {
+        // Every window-management chord leaves the overview first: Super+M
+        // on a scaled thumbnail would maximize a window drawn at a quarter
+        // of its size, with no decorations. Quitting and VT switching do
+        // not touch windows, and are left alone.
+        if !matches!(hotkey, Hotkey::Quit | Hotkey::SwitchVt(_)) {
+            self.leave_overview(None);
+        }
         match hotkey {
             Hotkey::Quit => {
                 info!("Ctrl+Alt+Backspace: quitting");
@@ -4084,6 +4121,15 @@ impl Server {
     /// scene destroys; the shaped run does not — it lives in the text
     /// store, keyed by owner, and this is the only place it can be freed.
     fn forget_window(&mut self, win: WindowKey) {
+        // A thumbnail's nodes died with its subtree; its caption run did
+        // not, and the grid has a hole. Drop it, then lay out again.
+        if let Some(ov) = self.wm.overview_mut()
+            && let Some(i) = ov.thumbs.iter().position(|t| t.window == win)
+        {
+            let t = ov.thumbs.remove(i);
+            self.text.release(t.caption_text);
+            self.relayout_overview();
+        }
         self.drag_icons.remove(&win);
         self.dnd_step(|d| d.forget_window(win));
         self.decorations.remove(&win);
@@ -4156,6 +4202,15 @@ impl Server {
             TouchPhase::Down => {
                 let point = self.normalised_to_device(norm_x, norm_y);
                 let output = input::output_at(&self.scene, point);
+                if let Some(out) = output
+                    && Some(out) == self.overview_output()
+                    && input::overview_hit(&self.scene, out, point).is_none()
+                {
+                    // A touch on a thumbnail or the scrim is a click.
+                    self.overview_click(out, point);
+                    self.note_input(time_ns);
+                    return;
+                }
                 let Some(t) = output.and_then(|out| input::hit(&self.scene, out, point)) else {
                     return;
                 };
@@ -4918,7 +4973,11 @@ impl Server {
             self.set_cursor(Some(self.dnd_shape()));
             return;
         }
-        let hit = self.pointer_desktop().and_then(|p| self.frame_hit(p));
+        let hit = if self.pointer_in_overview() {
+            self.pointer.over.map(|w| (w, Region::Content))
+        } else {
+            self.pointer_desktop().and_then(|p| self.frame_hit(p))
+        };
         self.set_cursor(self.cursor_choice(hit));
     }
 
@@ -5541,7 +5600,7 @@ impl Server {
                 let Ok(info) = self.scene.window_info(win) else {
                     continue;
                 };
-                if !self.on_screen(win) || self.drag_icons.contains(&win) {
+                if !self.on_screen(win) || self.drag_icons.contains(&win) || self.is_scrim(win) {
                     continue;
                 }
                 if !info.is_framed() {
@@ -5720,6 +5779,7 @@ impl Server {
             }
             Ok(Request::Unplug) => self.unplug(),
             Ok(Request::Focus) => self.focus_topmost(),
+            Ok(Request::Overview { on, output }) => self.overview_request(on, output.as_deref()),
             Ok(Request::Theme) => protocol::theme_reply(
                 self.settings.theme.scheme.unwrap_or_default(),
                 self.theme_serial,
@@ -5887,6 +5947,13 @@ impl Server {
             .count();
         pairs.push(("minimized", minimized as u64));
         pairs.push(("dragging", u64::from(self.wm.drag().is_some())));
+        // Overview mode: whether one is up, and how many thumbnails it
+        // has. The scrim counts under `windows`, as the scene window it is.
+        pairs.push(("overview", u64::from(self.wm.overview().is_some())));
+        pairs.push((
+            "overview_thumbs",
+            self.wm.overview().map_or(0, |o| o.thumbs.len()) as u64,
+        ));
         pairs.push(("focused", u64::from(self.focus.is_some())));
         // The shell's view. `shell_clients` counts connections on the
         // privileged socket, which is the number to look at when a bar is
@@ -6747,6 +6814,8 @@ impl Server {
     /// `Lock` from a shell client. See [`lock`] for the rules.
     fn shell_lock(&mut self, token: u64) -> bool {
         let was_locked = self.lock.is_locked();
+        // The lock screen must not come up over a desktop of thumbnails.
+        self.leave_overview(None);
         match self.lock.claim(token) {
             Ok(how) => {
                 match how {
@@ -7538,6 +7607,12 @@ impl Server {
         // rather than at creation because this is the first moment it has an
         // output and a place to report.
         self.notify_window(win);
+        // A window mapped on the output in overview joins the grid. After
+        // the `Configure` and the announcement: an undecorated thumbnail
+        // is *moved* to its slot, and that position is not the client's.
+        if self.overview_output() == Some(scene_id) && overview::wants_thumb(&self.scene, win) {
+            self.relayout_overview();
+        }
     }
 
     /// Push queued bytes at every client, dropping the ones whose socket
@@ -7721,7 +7796,11 @@ impl Server {
         // Scene output ids mirror the backend's, one for one; see where
         // outputs are registered in `rescan`.
         let scene_output = SceneOutputId(output.0);
-        let Some(window) = self.scene.windows_front_to_back(scene_output).next() else {
+        let Some(window) = self
+            .scene
+            .windows_front_to_back(scene_output)
+            .find(|w| !self.is_scrim(*w))
+        else {
             return protocol::err_reply("no windows");
         };
         self.set_focus(Some(window));
@@ -8188,7 +8267,7 @@ impl Server {
         let time_ns = monotonic_ns();
         let point = self.pointer.position();
         let target =
-            input::output_at(&self.scene, point).and_then(|id| input::hit(&self.scene, id, point));
+            input::output_at(&self.scene, point).and_then(|id| self.pointer_target(id, point));
         let now_over = target.as_ref().map(|t| t.window);
         if now_over == self.pointer.over {
             return;
@@ -8668,6 +8747,391 @@ impl Server {
         }
         self.dnd_step(|d| d.finish(token));
         true
+    }
+}
+
+// ------------------------------------------------------------ overview mode
+
+/// Overview mode: entering, leaving and selecting. The design is
+/// `docs/wm.md` §Overview mode; the scene-level helpers are in
+/// [`overview`], and this is the part that needs the server's state —
+/// which windows, the work area, the text and icon engines, focus.
+impl Server {
+    /// The output in overview, if any.
+    fn overview_output(&self) -> Option<SceneOutputId> {
+        self.wm.overview().map(|o| o.output)
+    }
+
+    /// The pointer in desktop coordinates for a **frame** press: `None`
+    /// on the output in overview, where no Super-drag and no frame region
+    /// means anything (every frame is hidden or scaled).
+    fn frame_point(&self) -> Option<Point> {
+        self.pointer_desktop()
+            .filter(|_| !self.pointer_in_overview())
+    }
+
+    /// Whether the pointer is on the output in overview.
+    fn pointer_in_overview(&self) -> bool {
+        self.pointer.output.is_some() && self.pointer.output == self.overview_output()
+    }
+
+    /// Whether `win` is the overview's scrim, which is a scene window but
+    /// not an application's and must never be treated as one.
+    fn is_scrim(&self, win: WindowKey) -> bool {
+        self.wm.overview().is_some_and(|o| o.scrim == win)
+    }
+
+    /// An app icon for `app_id`, falling back to the `window` glyph: the
+    /// chain [`Server::reicon`] uses for the title bar.
+    fn resolve_app_icon(&mut self, app_id: &str, tint: nitro_core::Role) -> Option<(u32, u8)> {
+        self.icons
+            .lookup_app(app_id)
+            .map(|icon| (icon.handle(), icon.role(tint)))
+            .or_else(|| {
+                self.icons
+                    .lookup(wm::icon_names::FALLBACK_APP)
+                    .map(|handle| (handle, wm::role_byte(tint)))
+            })
+    }
+
+    /// Put `output` into overview mode, leaving any other overview first.
+    ///
+    /// Every `Normal`-layer toplevel on the output — **including
+    /// `Minimized` ones** — is scaled onto a slot of
+    /// [`overview::layout`] over the output's **work area** (so the bar
+    /// keeps its strip and stays usable), its decorations are hidden, and
+    /// it gets an unscaled icon-and-caption badge. The scrim goes under
+    /// all of them. Zero windows is a valid overview: just the scrim.
+    fn enter_overview(&mut self, output: SceneOutputId) {
+        if self.wm.overview().is_some() {
+            self.leave_overview(None);
+        }
+        if self.lock.is_locked() {
+            return;
+        }
+        let Some((rect, scale)) = self.scene.output_info(output) else {
+            return;
+        };
+        let s = if scale > 0.0 { scale } else { 1.0 };
+        let size = Size::new(rect.w as f32 / s, rect.h as f32 / s);
+        // A drag must not carry on under a scaled window.
+        let _ = self.wm.end_drag();
+        let wins: Vec<WindowKey> = self
+            .scene
+            .windows(output)
+            .filter(|w| !self.drag_icons.contains(w) && overview::wants_thumb(&self.scene, *w))
+            .collect();
+        for w in &wins {
+            self.dismiss_popups_of(*w);
+        }
+        let thumbs: Vec<overview::Thumb> = wins
+            .iter()
+            .filter_map(|w| {
+                self.scene
+                    .window_info(*w)
+                    .ok()
+                    .map(|i| overview::thumb_of(*w, i))
+            })
+            .collect();
+        let area = self.local_work_area(output);
+        let slots = overview::layout(&thumbs, area, size.h);
+        let scrim = match overview::create_scrim(&mut self.scene, output, size) {
+            Ok(w) => w,
+            Err(e) => {
+                warn!("creating the overview scrim: {e}");
+                return;
+            }
+        };
+        let scrim_root = self.scene.window_info(scrim).map(nitro_scene::Window::root);
+        let states: Vec<overview::ThumbState> = slots
+            .into_iter()
+            .filter_map(|slot| self.make_thumb(slot, scrim_root.as_ref().ok().copied()))
+            .collect();
+        info!(
+            "overview on output {}: {} thumbnail(s)",
+            output.0,
+            states.len()
+        );
+        self.wm.begin_overview(overview::Overview {
+            output,
+            scrim,
+            thumbs: states,
+        });
+        // No frame affordance survives: every frame on this output is
+        // hidden or scaled, and a lit border would be drawn on nothing.
+        self.set_resize_hint(None);
+        self.set_button_hover(None);
+        self.popup_seat.pointer_refresh = true;
+        self.cursor_stale = true;
+    }
+
+    /// Turn one window into a thumbnail on `slot`: scale it, hide its
+    /// decorations, un-hide it if minimized, badge it. `None` when the
+    /// window is gone or the scene refuses the transform.
+    fn make_thumb(
+        &mut self,
+        slot: overview::Slot,
+        scrim_root: Option<nitro_scene::NodeKey>,
+    ) -> Option<overview::ThumbState> {
+        let win = slot.window;
+        let info = self.scene.window_info(win).ok()?;
+        let (root, framed, inset, size, minimized) = (
+            info.root(),
+            info.is_framed(),
+            info.inset(),
+            info.size(),
+            info.state() == WindowState::Minimized,
+        );
+        let (title, app_id) = (info.title().to_owned(), info.app_id().to_owned());
+        let (saved_transform, saved_position) =
+            match overview::apply_thumb(&mut self.scene, win, &slot) {
+                Ok(saved) => saved,
+                Err(e) => {
+                    warn!("scaling a thumbnail: {e}");
+                    return None;
+                }
+            };
+        if framed {
+            self.set_frame_visible(win, false);
+        }
+        let unhid = minimized && self.scene.set_visible(ClientId::SERVER, root, true).is_ok();
+        let frame = framed.then_some((root, inset, size));
+        let (badge, caption_text) =
+            self.build_thumb_badge(&slot, &title, &app_id, frame, scrim_root);
+        let r = slot.rect();
+        let below = overview::OVERVIEW_ICON * (1.0 - overview::ICON_OVERLAP)
+            + overview::ICON_TITLE_SPACING
+            + overview::CAPTION_H;
+        Some(overview::ThumbState {
+            window: win,
+            slot,
+            hit: Rect::new(r.x, r.y, r.w, r.h + below),
+            saved_transform,
+            saved_position,
+            unhid,
+            badge,
+            caption_text,
+        })
+    }
+
+    /// One thumbnail's badge: the app icon and the caption pill, drawn
+    /// unscaled. Returns the group and the caption's text run.
+    ///
+    /// `frame` is the framed window's `(root, inset, content size)`: the
+    /// badge hangs off its (scaled) frame root with a counter-scale. An
+    /// undecorated window's root is the client's clipping content group,
+    /// where a badge would be cut off at the window's edge, so its badge
+    /// goes in the scrim instead, at the slot's bottom-centre — under the
+    /// thumbnail, which covers the top 70 % of the icon.
+    fn build_thumb_badge(
+        &mut self,
+        slot: &overview::Slot,
+        title: &str,
+        app_id: &str,
+        frame: Option<(nitro_scene::NodeKey, nitro_scene::Insets, Size)>,
+        scrim_root: Option<nitro_scene::NodeKey>,
+    ) -> (Option<nitro_scene::NodeKey>, Option<nitro_text::TextKey>) {
+        let (parent, origin, inv) = if let Some((root, inset, size)) = frame {
+            (
+                root,
+                Point::new(inset.left + size.w / 2.0, inset.top + size.h),
+                1.0 / slot.scale,
+            )
+        } else {
+            let Some(root) = scrim_root else {
+                return (None, None);
+            };
+            (
+                root,
+                Point::new(slot.pos.x + slot.size.w / 2.0, slot.pos.y + slot.size.h),
+                1.0,
+            )
+        };
+        let icon = self.resolve_app_icon(app_id, nitro_core::Role::Text);
+        let mut key = None;
+        let mut caption = None;
+        let request = StyleRequest::new("sans", overview::CAPTION_SIZE_PX, 400, false, 0.0, false);
+        let elided = self
+            .text
+            .elide(&request, title, overview::caption_width(slot.size.w));
+        if !elided.is_empty() {
+            let (k, shaped) = self.text.shape(ClientId::SERVER.0, &request, &elided);
+            caption = Some(nitro_scene::TextRef {
+                key: k.0,
+                size: Size::new(shaped.width, shaped.height),
+                ascent: shaped.ascent,
+                color: self.palette.get(nitro_core::Role::Text),
+                align: nitro_scene::TextAlign::Center,
+            });
+            key = Some(k);
+        }
+        let badge = overview::Badge {
+            icon,
+            caption,
+            pill: self.palette.get(nitro_core::Role::WindowBackground),
+        };
+        match overview::build_badge(&mut self.scene, parent, origin, inv, &badge) {
+            Ok(group) => (Some(group), key),
+            Err(e) => {
+                warn!("building a thumbnail badge: {e}");
+                self.text.release(key);
+                (None, None)
+            }
+        }
+    }
+
+    /// Leave overview mode, putting every window back exactly as it was,
+    /// then — when `select` names a thumbnail — un-minimize, raise and
+    /// focus it.
+    fn leave_overview(&mut self, select: Option<WindowKey>) {
+        let Some(ov) = self.wm.take_overview() else {
+            return;
+        };
+        let s = ClientId::SERVER;
+        for t in &ov.thumbs {
+            self.text.release(t.caption_text);
+            let Ok(info) = self.scene.window_info(t.window) else {
+                continue;
+            };
+            let (root, framed, state) = (info.root(), info.is_framed(), info.state());
+            // An undecorated window's badge lives in the scrim and goes
+            // with it; a framed one's hangs off the frame root.
+            if framed && let Some(badge) = t.badge {
+                let _ = self.scene.destroy_node(s, badge);
+            }
+            if let Err(e) = overview::restore_thumb(
+                &mut self.scene,
+                t.window,
+                t.saved_transform,
+                t.saved_position,
+            ) {
+                warn!("restoring a thumbnail: {e}");
+            }
+            // Decorations come back unless the window is fullscreen, whose
+            // are hidden anyway — asked of the state *now*, so a window
+            // that changed state in between gets what its state implies.
+            if framed && state != WindowState::Fullscreen {
+                self.set_frame_visible(t.window, true);
+            }
+            // Re-hide exactly the set this overview un-hid, and only those
+            // still minimized: one un-minimized meanwhile is showing.
+            if t.unhid && state == WindowState::Minimized {
+                let _ = self.scene.set_visible(s, root, false);
+            }
+        }
+        if let Err(e) = self.scene.destroy_window(s, ov.scrim) {
+            warn!("destroying the overview scrim: {e}");
+        }
+        info!("overview off");
+        if let Some(win) = select.filter(|w| ov.contains(*w)) {
+            // Un-minimize first: `focusable` refuses a minimized window.
+            if self
+                .scene
+                .window_info(win)
+                .is_ok_and(|i| i.state() == WindowState::Minimized)
+            {
+                self.set_state(win, WindowState::Normal);
+            }
+            self.raise_and_focus(win);
+        }
+        self.popup_seat.pointer_refresh = true;
+        self.cursor_stale = true;
+    }
+
+    /// Leave and re-enter on the same output: a window came or went, the
+    /// palette changed, or a thumbnail's geometry did.
+    fn relayout_overview(&mut self) {
+        if let Some(output) = self.overview_output() {
+            self.leave_overview(None);
+            self.enter_overview(output);
+        }
+    }
+
+    /// A click (or a touch-down) at device point `point` on `output`,
+    /// over no `Top`/`Overlay` window: select the thumbnail under it, or
+    /// leave without selecting when it is on the bare scrim — GNOME's
+    /// behaviour.
+    fn overview_click(&mut self, output: SceneOutputId, point: Point) {
+        let Some(ov) = self.wm.overview().filter(|o| o.output == output) else {
+            return;
+        };
+        let Some((rect, scale)) = self.scene.output_info(output) else {
+            return;
+        };
+        let s = if scale > 0.0 { scale } else { 1.0 };
+        let local = Point::new((point.x - rect.x as f32) / s, (point.y - rect.y as f32) / s);
+        let select = ov.slot_at(local);
+        self.leave_overview(select);
+    }
+
+    /// What the pointer at device `point` on `output` is over, for pointer
+    /// focus: [`input::hit`], except on the output in overview, where a
+    /// `Normal`-layer hit belongs to the window manager and is `None` —
+    /// so the thumbnail's client gets a `PointerLeave` and nothing after.
+    fn pointer_target(&self, output: SceneOutputId, point: Point) -> Option<input::PointerTarget> {
+        if self.overview_output() == Some(output) {
+            input::overview_hit(&self.scene, output, point)
+        } else {
+            input::hit(&self.scene, output, point)
+        }
+    }
+
+    /// Everything that may consume a button event before the ordinary
+    /// path sees it, in order: a drag-and-drop, a popup grab, overview
+    /// mode. See `Server::dnd_button` and `Server::popup_grab_button`.
+    fn button_grabs(&mut self, button: u32, state: ButtonState, time_ns: u64) -> bool {
+        self.dnd_button(state, time_ns)
+            || self.popup_grab_button(state, time_ns)
+            || self.overview_button(button, state, time_ns)
+    }
+
+    /// Overview mode's share of a button event; returns whether it was
+    /// consumed. Runs after the drag-and-drop and popup grabs.
+    ///
+    /// Over a `Top` or `Overlay` window (`pointer.over` is set) the event
+    /// falls through to the ordinary client path. Anywhere else on the
+    /// output in overview a left press selects (or, on the bare scrim,
+    /// leaves) and every other button event is dropped — including the
+    /// release of that press, which arrives after the overview is gone.
+    fn overview_button(&mut self, button: u32, state: ButtonState, time_ns: u64) -> bool {
+        if state == ButtonState::Released && self.overview_swallow == Some(button) {
+            self.overview_swallow = None;
+            self.note_input(time_ns);
+            return true;
+        }
+        let point = self.pointer.position();
+        let Some(output) = self.overview_output() else {
+            return false;
+        };
+        if input::output_at(&self.scene, point) != Some(output) || self.pointer.over.is_some() {
+            return false;
+        }
+        if state == ButtonState::Pressed && button == input::BTN_LEFT {
+            self.hotkeys.cancel_tap();
+            self.overview_swallow = Some(button);
+            self.overview_click(output, point);
+        }
+        self.note_input(time_ns);
+        true
+    }
+
+    /// The `overview` control request: the test and debug way in, until
+    /// the triggers (#3789) exist.
+    fn overview_request(&mut self, on: bool, output: Option<&str>) -> Vec<u8> {
+        if on {
+            let id = match self.shot_output(output) {
+                Ok(id) => SceneOutputId(id.0),
+                Err(reply) => return reply,
+            };
+            if self.lock.is_locked() {
+                return protocol::err_reply("the session is locked");
+            }
+            self.enter_overview(id);
+        } else {
+            self.leave_overview(None);
+        }
+        self.settle();
+        protocol::ok_reply()
     }
 }
 

@@ -190,6 +190,22 @@ impl TestServer {
         assert_eq!(reply, "ok", "focus refused: {reply}");
     }
 
+    /// Enter (`true`) or leave overview mode on the first output, and
+    /// wait for the result to be on screen. The `overview` control
+    /// request, which is a test hook until the triggers exist.
+    ///
+    /// # Panics
+    /// If the server refuses.
+    pub fn set_overview(&self, on: bool) {
+        let reply = self.request_line(if on {
+            "overview on\n"
+        } else {
+            "overview off\n"
+        });
+        assert_eq!(reply, "ok", "overview refused: {reply}");
+        self.settle();
+    }
+
     /// A control request whose answer is a status line plus a body
     /// terminated by a blank line (`outputs`, `stats`).
     ///

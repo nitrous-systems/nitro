@@ -839,8 +839,10 @@ hotplug, not the keyboard it already has.
 
 ## Overview mode
 
-Designed in #3785, not yet built; the chain that builds it hangs off that
-task. The GNOME study the design is drawn from, with the measurements
+Designed in #3785; the primitive — entering, leaving, selecting — is
+built (#3788), the triggers are #3789. Until they land the only way in is
+the `overview [on|off] [output]` control request. See §The primitive, as
+built, below. The GNOME study the design is drawn from, with the measurements
 below in full, is `docs/research/overview.md`.
 
 An **overview** is a WM mode in which every `Normal`-layer window on an
@@ -951,6 +953,53 @@ the same, for its own reasons.
   windows sorted vertically into rows and horizontally within one, slots
   floored to the pixel grid. `docs/research/overview.md` §2 has the
   algorithm and the constants.
+
+### The primitive, as built
+
+`Server::enter_overview` / `leave_overview` in `lib.rs`, over the
+scene-level helpers in `overview.rs`. The state is
+`WindowManager::overview: Option<Overview>` — one output at a time;
+entering on another output leaves the first.
+
+* **A thumbnail is the content rectangle, not the frame.** The
+  decorations are hidden (`set_frame_visible(false)`, no inset change, so
+  no `Configure`), and scaling the frame would leave an empty 28 px band
+  where the title bar was. A framed window's frame root gets
+  `translate(slot - pos - k·inset) ∘ scale(k)`, which puts the content's
+  top-left exactly on the floored slot. An undecorated window's root *is*
+  its clipping content group, whose clip is evaluated before its own
+  transform, so it is instead **moved** to the slot (a server-side
+  `place_window`, no `Configure`) and scaled about its origin. Both are
+  put back exactly on leave.
+* **The scrim is a server-owned `Layer::Normal` window, lowered to the
+  bottom of its layer**: above the wallpaper, below every real window. It
+  stays there because nothing in the server calls `lower` and `raise` /
+  `place_window` only push to the front. `overview::scene_tests::
+  the_scrim_stays_under_every_thumbnail_whatever_is_raised` pins it. It
+  is in no MRU list and no wire client's window map, and `frame_hit` and
+  `focus_topmost` skip it.
+* **The badge is drawn unscaled by counter-scaling.** A framed window's
+  icon-and-caption group hangs off its scaled frame root with
+  `scale(1/k)`, so its world scale is the output's and nothing is
+  rasterized at a fractional size. An undecorated window's badge would be
+  clipped by its content group, so it goes in the scrim at the slot's
+  bottom-centre instead — under the thumbnail, which covers the top 70 %
+  of its icon.
+* **Selection is by slot geometry**, not by the node hit. A left press on
+  the output in overview that is not over a `Top`/`Overlay` window
+  selects the thumbnail under it — leave, un-minimize, raise, focus — or,
+  on the bare scrim, **leaves without selecting**, as GNOME does. Its
+  release is swallowed too (after the overview has ended), so the
+  selected client never sees an orphan `Released`. A touch-down is a
+  click. Motion over a thumbnail sends its client a `PointerLeave` and
+  nothing after; axis events follow `pointer.over` and are dropped with it.
+* **Lifecycle.** A `Normal` window mapped on that output, a thumbnail
+  window closing, or a palette change re-lays the grid (leave + enter).
+  The output going away, a session lock, and every window-management
+  hotkey (all but quit and VT switch) leave first. Entering ends a drag in
+  flight and dismisses the thumbnails' popups.
+* **Minimized windows** are un-hidden on entry (state untouched) and
+  exactly that set is re-hidden on leave, if still minimized.
 
 The search UI stays in `nitro-launcher` as an `Overlay` client — the seam
 is layers, which already work — so the server draws only scaled windows it

@@ -17,6 +17,7 @@
 //! | `unplug`             | `ok\n`; fake backend only — removes the last output          |
 //! | `focus`              | `ok\n`; focuses the topmost window, for tests                |
 //! | `theme`              | `ok <scheme> <serial>\n` + `role #rrggbb[aa]\n` lines + `\n` |
+//! | `overview [on\|off] [name]` | `ok\n`; enters/leaves overview mode, for tests      |
 //!
 //! This module only parses and formats; it never touches a socket.
 
@@ -85,6 +86,16 @@ pub enum Request {
     /// `hey`: the palette is server state, so the server is the only
     /// thing that can say.
     Theme,
+    /// Enter or leave overview mode on an output (the first when unnamed).
+    ///
+    /// A test and debug hook, and the only way in until the triggers
+    /// (#3789) exist: `overview [on|off] [output-name]`, `on` by default.
+    Overview {
+        /// Enter (`true`) or leave.
+        on: bool,
+        /// The output to enter on; ignored when leaving.
+        output: Option<String>,
+    },
 }
 
 /// Parse one request line (without or with its trailing newline).
@@ -97,6 +108,9 @@ pub fn parse(line: &str) -> Result<Request, String> {
     let Some(cmd) = words.next() else {
         return Err("empty request".to_owned());
     };
+    if cmd == "overview" {
+        return parse_overview(words);
+    }
     let arg = words.next();
     if words.next().is_some() {
         return Err(format!("too many arguments for `{cmd}`"));
@@ -127,6 +141,26 @@ pub fn parse(line: &str) -> Result<Request, String> {
         ) => Err(format!("`{cmd}` takes no argument")),
         _ => Err(format!("unknown request `{cmd}`")),
     }
+}
+
+/// `overview [on|off] [output-name]`.
+fn parse_overview<'a>(mut words: impl Iterator<Item = &'a str>) -> Result<Request, String> {
+    let (on, output) = match words.next() {
+        None => (true, None),
+        Some("on") => (true, words.next()),
+        Some("off") => (false, words.next()),
+        Some(name) => (true, Some(name)),
+    };
+    if words.next().is_some() {
+        return Err("too many arguments for `overview`".to_owned());
+    }
+    if !on && output.is_some() {
+        return Err("`overview off` takes no output".to_owned());
+    }
+    Ok(Request::Overview {
+        on,
+        output: output.map(str::to_owned),
+    })
 }
 
 /// Split the first complete line off `buf`, returning it (without the
@@ -376,6 +410,19 @@ mod tests {
             Err("`unplug` takes no argument".to_owned())
         );
         assert_eq!(parse("focus\n"), Ok(Request::Focus));
+        let ov = |on, output: Option<&str>| {
+            Ok(Request::Overview {
+                on,
+                output: output.map(str::to_owned),
+            })
+        };
+        assert_eq!(parse("overview\n"), ov(true, None));
+        assert_eq!(parse("overview on"), ov(true, None));
+        assert_eq!(parse("overview off"), ov(false, None));
+        assert_eq!(parse("overview on HDMI-A-1"), ov(true, Some("HDMI-A-1")));
+        assert_eq!(parse("overview VGA-1"), ov(true, Some("VGA-1")));
+        assert!(parse("overview off VGA-1").is_err());
+        assert!(parse("overview on a b").is_err());
         assert_eq!(
             parse("focus now"),
             Err("`focus` takes no argument".to_owned())

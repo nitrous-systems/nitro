@@ -31,8 +31,12 @@
 //! spacing between cells, [`COLUMN_SPACING`] and [`ROW_SPACING`]; their
 //! doc comments say where the numbers come from.
 
-use nitro_core::{Point, Rect, Size};
-use nitro_scene::WindowKey;
+use nitro_core::{Color, Point, Rect, Size, Transform};
+use nitro_scene::{
+    ClientId, Error as SceneError, Fill, IconRef, Insets, Layer, NodeKey, NodeKind, OutputId,
+    Scene, TextAlign, TextRef, WindowFlags, WindowKey, WindowState,
+};
+use nitro_text::TextKey;
 
 /// The largest scale a thumbnail is ever drawn at: a thumbnail is never
 /// nearly full size. `WINDOW_PREVIEW_MAXIMUM_SCALE` in `workspace.js`.
@@ -68,7 +72,10 @@ pub const ROW_SPACING: f32 = 64.0;
 pub struct Thumb {
     /// Which window this slot is for; opaque to the algorithm.
     pub window: WindowKey,
-    /// The window's *frame* size, i.e. what will be scaled.
+    /// The window's *content* size, i.e. what will be scaled. Not the
+    /// frame's: overview mode hides the decorations, so a thumbnail is
+    /// the client's own pixels and nothing else (`docs/wm.md` §Overview
+    /// mode).
     pub size: Size,
     /// The window's current centre, which decides row assignment (by `y`)
     /// and order within a row (by `x`).
@@ -428,4 +435,652 @@ fn window_slots(windows: &[Win], cand: &Candidate, area: &Area) -> Vec<Slot> {
         }
     }
     slots
+}
+
+// ------------------------------------------------------------ overview mode
+//
+// Everything above is the layout: pure arithmetic. Everything below turns
+// a layout into scene state and back — the primitive task #3788 built —
+// and is still free of server state: the caller (`Server::enter_overview`
+// and friends in `lib.rs`) decides *which* windows and *when*, these
+// helpers only know how to scale one window, build one badge and make the
+// scrim. `docs/wm.md` §Overview mode has the design.
+
+/// The scrim's colour: black at 5/8 alpha, over the whole output.
+///
+/// A constant rather than a palette role because it is a *dimming*, not
+/// a colour — it has to read the same over a light desktop and a dark
+/// one — which is also why GNOME's is not themed.
+pub const SCRIM: Color = Color::rgba(0, 0, 0, 0xA0);
+
+/// The app icon hanging off each thumbnail's bottom edge, logical pixels.
+pub const OVERVIEW_ICON: f32 = 64.0;
+
+/// How much of the icon overlaps the thumbnail: 70 %, so 30 % hangs below
+/// it. GNOME's `ICON_OVERLAP`. [`ROW_SPACING`] is derived from it.
+pub const ICON_OVERLAP: f32 = 0.7;
+
+/// Gap between the icon's bottom and the caption pill. `ICON_TITLE_SPACING`.
+pub const ICON_TITLE_SPACING: f32 = 6.0;
+
+/// The caption pill's height; its radius is half this.
+pub const CAPTION_H: f32 = 32.0;
+
+/// The widest a caption pill gets, however wide its thumbnail is.
+pub const CAPTION_MAX_W: f32 = 240.0;
+
+/// Horizontal padding inside the pill, each side.
+pub const CAPTION_PAD: f32 = 12.0;
+
+/// The caption's font size, logical pixels: the title bar's.
+pub const CAPTION_SIZE_PX: f32 = 13.0;
+
+/// What overview mode remembers about one thumbnail, so leaving can put
+/// the window back exactly as it was.
+#[derive(Debug, Clone)]
+pub struct ThumbState {
+    /// The window.
+    pub window: WindowKey,
+    /// Where its content went, output-local logical pixels.
+    pub slot: Slot,
+    /// What a click selects: the slot, grown by the badge hanging below
+    /// it. Output-local logical pixels.
+    pub hit: Rect,
+    /// The transform of the node we overwrote: the frame root's for a
+    /// framed window (the server's own, so identity in practice), the
+    /// client's own root's for an undecorated one.
+    pub saved_transform: Transform,
+    /// An undecorated window is **moved** to its slot as well as scaled
+    /// (see [`apply_thumb`]); this is where it was.
+    pub saved_position: Option<Point>,
+    /// Whether we made a `Minimized` window's root visible, and so owe it
+    /// a re-hide.
+    pub unhid: bool,
+    /// The group holding the icon and caption, if one was built.
+    pub badge: Option<NodeKey>,
+    /// The caption's shaped run, released on leave.
+    pub caption_text: Option<TextKey>,
+}
+
+/// One output's overview: the scrim plus every thumbnail's restore state.
+#[derive(Debug, Clone)]
+pub struct Overview {
+    /// The output it is on. Only one output is in overview at a time.
+    pub output: OutputId,
+    /// The server-owned window that dims the desktop; see [`create_scrim`].
+    pub scrim: WindowKey,
+    /// One per thumbnail, in slot order.
+    pub thumbs: Vec<ThumbState>,
+}
+
+impl Overview {
+    /// The window whose thumbnail (or badge) is under an output-local
+    /// point, if any.
+    ///
+    /// Selection is by **geometry**, not by which node the scene hit: that
+    /// makes it indifferent to badges, the scrim, and whether a window is
+    /// framed.
+    #[must_use]
+    pub fn slot_at(&self, point: Point) -> Option<WindowKey> {
+        self.thumbs
+            .iter()
+            .find(|t| t.slot.rect().contains(point))
+            .or_else(|| self.thumbs.iter().find(|t| t.hit.contains(point)))
+            .map(|t| t.window)
+    }
+
+    /// Whether `win` has a thumbnail here.
+    #[must_use]
+    pub fn contains(&self, win: WindowKey) -> bool {
+        self.thumbs.iter().any(|t| t.window == win)
+    }
+}
+
+/// A window as the layout sees it: its **content** rectangle, in its
+/// output's logical space.
+#[must_use]
+pub fn thumb_of(win: WindowKey, info: &nitro_scene::Window) -> Thumb {
+    let pos = info.content_position();
+    let size = info.size();
+    Thumb {
+        window: win,
+        size,
+        centre: Point::new(pos.x + size.w / 2.0, pos.y + size.h / 2.0),
+    }
+}
+
+/// The frame-root transform that puts a framed window's content exactly
+/// on `slot`: `translate(slot.pos - pos - k*inset) ∘ scale(k)`.
+///
+/// `pos` is the frame's top-left, output-local. The content sits at
+/// `inset` inside the frame, so after the transform it lands at
+/// `pos + t + k*inset = slot.pos` — whole pixels, because slots are
+/// floored.
+#[must_use]
+pub fn thumb_transform(pos: Point, inset: Insets, slot: &Slot) -> Transform {
+    let k = slot.scale;
+    Transform::translate(
+        slot.pos.x - pos.x - k * inset.left,
+        slot.pos.y - pos.y - k * inset.top,
+    )
+    .then(&Transform::scale(k, k))
+}
+
+/// Scale one window onto its slot. Returns the transform overwritten and,
+/// for an undecorated window, the position it was moved from.
+///
+/// **Framed:** only the frame root's transform changes — the server's own
+/// node, so the client's tree is untouched and cannot notice.
+///
+/// **Undecorated:** the root *is* the client's content group, and that
+/// group clips to its own bounds under its *pre-transform* world
+/// transform. A translate on it would carry the content outside that
+/// clip and nothing would be drawn, so the window is instead moved to the
+/// slot (a server-side `place_window`, which sends no `Configure`) and
+/// only scaled about its origin. The clip then spans the unscaled size at
+/// the slot, which contains the scaled content.
+///
+/// # Errors
+/// Anything the scene refuses; in practice a dead key.
+pub fn apply_thumb(
+    scene: &mut Scene,
+    win: WindowKey,
+    slot: &Slot,
+) -> Result<(Transform, Option<Point>), SceneError> {
+    let info = scene.window_info(win)?;
+    let (root, framed, pos, inset, output) = (
+        info.root(),
+        info.is_framed(),
+        info.position(),
+        info.inset(),
+        info.output(),
+    );
+    let saved = scene.node(root)?.transform();
+    if framed {
+        scene.set_transform(ClientId::SERVER, root, thumb_transform(pos, inset, slot))?;
+        Ok((saved, None))
+    } else {
+        scene.place_window(win, output, slot.pos)?;
+        let k = slot.scale;
+        scene.set_transform(ClientId::SERVER, root, Transform::scale(k, k))?;
+        Ok((saved, Some(pos)))
+    }
+}
+
+/// Undo [`apply_thumb`].
+///
+/// # Errors
+/// Anything the scene refuses; in practice a dead key.
+pub fn restore_thumb(
+    scene: &mut Scene,
+    win: WindowKey,
+    saved_transform: Transform,
+    saved_position: Option<Point>,
+) -> Result<(), SceneError> {
+    let info = scene.window_info(win)?;
+    let (root, output) = (info.root(), info.output());
+    scene.set_transform(ClientId::SERVER, root, saved_transform)?;
+    if let Some(pos) = saved_position {
+        scene.place_window(win, output, pos)?;
+    }
+    Ok(())
+}
+
+/// Create the scrim: a server-owned, undecorated, unfocusable
+/// `Layer::Normal` window covering the output, **lowered to the bottom of
+/// its layer** — above every `Background` window (the wallpaper), below
+/// every real window.
+///
+/// Why a window: `create_node` needs a parent and every node hangs off
+/// some window's tree, and no existing window spans the output at the
+/// right depth. Why it stays at the bottom: nothing in the server calls
+/// `lower`, and `raise` and `place_window` only ever push to the *front*
+/// of a layer, so no later raise can put a thumbnail under it. A unit test
+/// pins that.
+///
+/// It is never added to the window manager's MRU list and belongs to no
+/// wire client, so no shell ever lists it.
+///
+/// # Errors
+/// Anything the scene refuses; in practice an unknown output.
+pub fn create_scrim(
+    scene: &mut Scene,
+    output: OutputId,
+    size: Size,
+) -> Result<WindowKey, SceneError> {
+    let s = ClientId::SERVER;
+    let win = scene.create_window_with(
+        s,
+        "overview",
+        size,
+        Layer::Normal,
+        WindowFlags {
+            decorated: false,
+            fixed_size: true,
+            focusable: false,
+        },
+    );
+    let build = |scene: &mut Scene| -> Result<(), SceneError> {
+        scene.place_window(win, Some(output), Point::ZERO)?;
+        scene.lower(win)?;
+        let root = scene.window_info(win)?.root();
+        let rect = scene.create_node(s, NodeKind::Rect, root, None)?;
+        scene.set_bounds(s, rect, Rect::new(0.0, 0.0, size.w, size.h))?;
+        scene.set_fill(s, rect, Fill::Solid(SCRIM))
+    };
+    if let Err(e) = build(scene) {
+        let _ = scene.destroy_window(s, win);
+        return Err(e);
+    }
+    Ok(win)
+}
+
+/// What goes in one thumbnail's badge.
+#[derive(Debug, Clone, Copy)]
+pub struct Badge {
+    /// The app icon, `(handle, role)` as `IconEngine` resolved it.
+    pub icon: Option<(u32, u8)>,
+    /// The shaped caption; `None` for an untitled window, which gets no
+    /// pill either.
+    pub caption: Option<TextRef>,
+    /// The pill's fill.
+    pub pill: Color,
+}
+
+/// Build one thumbnail's icon-and-caption group under `parent`, on top of
+/// its siblings.
+///
+/// `origin` is the thumbnail's bottom-centre in `parent`'s coordinates
+/// and `inv_scale` undoes whatever scale `parent` is under: for a framed
+/// window the group hangs off the *scaled* frame root and is given
+/// `scale(1/k)`, so its world scale is exactly the output's and the
+/// `TextEngine`/`IconEngine` rasterize at their ordinary size — no fresh
+/// glyph set for a fractional size, which is the whole reason the title
+/// bar is hidden rather than scaled. (`GlyphKey`'s 1/64-px quantization
+/// absorbs the float error in `k * (1/k)`.)
+///
+/// # Errors
+/// Anything the scene refuses.
+pub fn build_badge(
+    scene: &mut Scene,
+    parent: NodeKey,
+    origin: Point,
+    inv_scale: f32,
+    badge: &Badge,
+) -> Result<NodeKey, SceneError> {
+    let s = ClientId::SERVER;
+    let group = scene.create_node(s, NodeKind::Group, parent, None)?;
+    scene.set_bounds(s, group, Rect::new(origin.x, origin.y, 0.0, 0.0))?;
+    scene.set_transform(s, group, Transform::scale(inv_scale, inv_scale))?;
+    let [icon_box, pill_box, text_box] = badge_rects(badge.caption.map(|c| c.size.w));
+    if let (Some((handle, role)), Some(b)) = (badge.icon, icon_box) {
+        let icon = scene.create_node(s, NodeKind::Icon, group, None)?;
+        scene.set_bounds(s, icon, b)?;
+        scene.set_icon(s, icon, Some(IconRef::new(handle, OVERVIEW_ICON, role)))?;
+    }
+    if let (Some(text), Some(pill_box), Some(text_box)) = (badge.caption, pill_box, text_box) {
+        let pill = scene.create_node(s, NodeKind::Rect, group, None)?;
+        scene.set_bounds(s, pill, pill_box)?;
+        scene.set_corner_radius(s, pill, CAPTION_H / 2.0)?;
+        scene.set_fill(s, pill, Fill::Solid(badge.pill))?;
+        let node = scene.create_node(s, NodeKind::Text, group, None)?;
+        scene.set_bounds(s, node, text_box)?;
+        scene.set_text(
+            s,
+            node,
+            Some(TextRef {
+                align: TextAlign::Center,
+                ..text
+            }),
+        )?;
+    }
+    Ok(group)
+}
+
+/// The badge's three boxes relative to the thumbnail's bottom-centre, in
+/// unscaled logical pixels: the icon, the pill, the text line. The pill
+/// and text are `None` without a caption; `caption_w` is its measured
+/// width.
+///
+/// Each is rounded to whole pixels, so an odd-width pill does not land on
+/// a half pixel and blur.
+#[must_use]
+pub fn badge_rects(caption_w: Option<f32>) -> [Option<Rect>; 3] {
+    let icon = Rect::new(
+        -OVERVIEW_ICON / 2.0,
+        -(OVERVIEW_ICON * ICON_OVERLAP).round(),
+        OVERVIEW_ICON,
+        OVERVIEW_ICON,
+    );
+    let Some(w) = caption_w else {
+        return [Some(icon), None, None];
+    };
+    let pill_w = (w + 2.0 * CAPTION_PAD).ceil();
+    let pill_y = icon.y + OVERVIEW_ICON + ICON_TITLE_SPACING;
+    let pill = Rect::new(-(pill_w / 2.0).round(), pill_y, pill_w, CAPTION_H);
+    let line = (CAPTION_SIZE_PX * 1.4).round();
+    let text = Rect::new(
+        pill.x,
+        pill_y + ((CAPTION_H - line) / 2.0).round(),
+        pill_w,
+        line,
+    );
+    [Some(icon), Some(pill), Some(text)]
+}
+
+/// The widest a caption's *text* may be for a thumbnail `slot_w` wide.
+#[must_use]
+pub fn caption_width(slot_w: f32) -> f32 {
+    (slot_w.min(CAPTION_MAX_W) - 2.0 * CAPTION_PAD).max(0.0)
+}
+
+/// Whether a window takes part in overview mode: a `Normal`-layer
+/// toplevel, minimized or on screen.
+#[must_use]
+pub fn wants_thumb(scene: &Scene, win: WindowKey) -> bool {
+    let Ok(info) = scene.window_info(win) else {
+        return false;
+    };
+    if info.layer() != Layer::Normal || info.is_popup() {
+        return false;
+    }
+    info.state() == WindowState::Minimized
+        || scene
+            .node(info.content())
+            .is_ok_and(nitro_scene::Node::visible)
+}
+
+#[cfg(test)]
+mod scene_tests {
+    //! Overview mode on a bare [`Scene`]: the transforms, the scrim's
+    //! z-position and the settled-damage guard: the scene state a layout
+    //! turns into, rather than the layout arithmetic itself.
+
+    // Every number here is whole-pixel arithmetic on whole-pixel inputs.
+    #![allow(clippy::float_cmp)]
+
+    use super::*;
+    use nitro_core::{Damage, IRect};
+    use nitro_scene::DamageSink;
+
+    const OUT: OutputId = OutputId(1);
+    const CLIENT: ClientId = ClientId(7);
+
+    fn update(scene: &mut Scene) -> Damage {
+        let mut damage = Damage::new();
+        scene.update(&mut DamageSink::new(&mut [(OUT, &mut damage)]));
+        damage
+    }
+
+    /// A client window with one solid rect, framed when `framed`.
+    fn window(scene: &mut Scene, pos: Point, size: Size, framed: bool) -> WindowKey {
+        let win = scene.create_window(CLIENT, "w", size, Layer::Normal);
+        let content = scene.window_info(win).unwrap().content();
+        let rect = scene
+            .create_node(CLIENT, NodeKind::Rect, content, None)
+            .unwrap();
+        scene
+            .set_bounds(CLIENT, rect, Rect::new(0.0, 0.0, size.w, size.h))
+            .unwrap();
+        scene
+            .set_fill(CLIENT, rect, Fill::Solid(Color::rgb(0xff, 0, 0)))
+            .unwrap();
+        if framed {
+            scene.frame_window(win, crate::wm::frame_insets()).unwrap();
+        }
+        scene.place_window(win, Some(OUT), pos).unwrap();
+        win
+    }
+
+    /// Two framed windows, one undecorated one and a minimized framed one
+    /// over a wallpaper, on a 1000x800 output.
+    fn desktop() -> (Scene, Vec<WindowKey>, WindowKey) {
+        let mut scene = Scene::new();
+        scene.add_output(OUT, IRect::new(0, 0, 1000, 800), 1.0);
+        let wallpaper =
+            scene.create_window(CLIENT, "bg", Size::new(1000.0, 800.0), Layer::Background);
+        scene
+            .place_window(wallpaper, Some(OUT), Point::ZERO)
+            .unwrap();
+        let a = window(
+            &mut scene,
+            Point::new(100.0, 100.0),
+            Size::new(400.0, 300.0),
+            true,
+        );
+        let b = window(
+            &mut scene,
+            Point::new(500.0, 300.0),
+            Size::new(300.0, 200.0),
+            true,
+        );
+        let c = window(
+            &mut scene,
+            Point::new(50.0, 500.0),
+            Size::new(200.0, 150.0),
+            false,
+        );
+        let d = window(
+            &mut scene,
+            Point::new(600.0, 50.0),
+            Size::new(200.0, 100.0),
+            true,
+        );
+        scene.set_window_state(d, WindowState::Minimized).unwrap();
+        update(&mut scene);
+        (scene, vec![a, b, c, d], wallpaper)
+    }
+
+    fn slots_for(scene: &Scene, wins: &[WindowKey]) -> Vec<Slot> {
+        let thumbs: Vec<Thumb> = wins
+            .iter()
+            .map(|w| thumb_of(*w, scene.window_info(*w).unwrap()))
+            .collect();
+        layout(&thumbs, Rect::new(0.0, 0.0, 1000.0, 800.0), 800.0)
+    }
+
+    /// Everything `Server::enter_overview` does to the scene, minus the
+    /// server: scale, hide the decorations, badge, scrim.
+    fn enter(scene: &mut Scene, wins: &[WindowKey]) -> (WindowKey, Vec<Slot>) {
+        let slots = slots_for(scene, wins);
+        let scrim = create_scrim(scene, OUT, Size::new(1000.0, 800.0)).unwrap();
+        let scrim_root = scene.window_info(scrim).unwrap().root();
+        for slot in &slots {
+            apply_thumb(scene, slot.window, slot).unwrap();
+            let info = scene.window_info(slot.window).unwrap();
+            let (root, framed, inset, size) =
+                (info.root(), info.is_framed(), info.inset(), info.size());
+            if framed {
+                // The decorations: every child of the frame root but the
+                // content, which is what `FrameNodes::all()` names.
+                let content = scene.window_info(slot.window).unwrap().content();
+                let kids: Vec<NodeKey> = scene.node(root).unwrap().children().to_vec();
+                for k in kids.into_iter().filter(|k| *k != content) {
+                    scene.set_visible(ClientId::SERVER, k, false).unwrap();
+                }
+            }
+            scene.set_visible(ClientId::SERVER, root, true).unwrap();
+            let badge = Badge {
+                icon: Some((0, 0)),
+                caption: None,
+                pill: Color::WHITE,
+            };
+            if framed {
+                let origin = Point::new(inset.left + size.w / 2.0, inset.top + size.h);
+                build_badge(scene, root, origin, 1.0 / slot.scale, &badge).unwrap();
+            } else {
+                let origin = Point::new(slot.pos.x + slot.size.w / 2.0, slot.pos.y + slot.size.h);
+                build_badge(scene, scrim_root, origin, 1.0, &badge).unwrap();
+            }
+        }
+        (scrim, slots)
+    }
+
+    #[test]
+    fn a_thumbnail_s_content_lands_exactly_on_its_slot() {
+        let (mut scene, wins, _) = desktop();
+        let (_, slots) = enter(&mut scene, &wins);
+        update(&mut scene);
+        assert_eq!(slots.len(), 4, "the minimized window is a thumbnail too");
+        for slot in &slots {
+            // The client's own rect at (0, 0) in its content: its origin
+            // is the slot's top-left and its scale the slot's (the
+            // output's scale is 1). The rect rather than the content group,
+            // because a group's own transform applies to its children only
+            // and an undecorated window's content group *is* its root.
+            let content = scene.window_info(slot.window).unwrap().content();
+            let rect = scene.node(content).unwrap().children()[0];
+            let t = scene.node(rect).unwrap().world_transform();
+            assert_eq!((t.e, t.f), (slot.pos.x, slot.pos.y), "{slot:?}");
+            assert!((t.a - slot.scale).abs() < 1e-6, "{} vs {}", t.a, slot.scale);
+        }
+    }
+
+    #[test]
+    fn a_settled_overview_produces_no_damage() {
+        let (mut scene, wins, _) = desktop();
+        enter(&mut scene, &wins);
+        let first = update(&mut scene);
+        assert!(!first.is_empty(), "entering repaints the output");
+        // The guard `docs/wm.md` §Overview mode is about: a scaled blit is
+        // ~57x the 1:1 one, so anything that re-dirtied the grid every
+        // update would cost ~17 ms a frame.
+        let settled = update(&mut scene);
+        assert!(
+            settled.is_empty(),
+            "settled overview damaged {:?}",
+            settled.rects()
+        );
+    }
+
+    #[test]
+    fn the_scrim_stays_under_every_thumbnail_whatever_is_raised() {
+        let (mut scene, wins, wallpaper) = desktop();
+        let (scrim, _) = enter(&mut scene, &wins);
+        let order = |scene: &Scene| scene.windows(OUT).collect::<Vec<_>>();
+        assert_eq!(&order(&scene)[..2], &[wallpaper, scrim]);
+        for w in &wins {
+            scene.raise(*w).unwrap();
+            assert_eq!(
+                &order(&scene)[..2],
+                &[wallpaper, scrim],
+                "after raising {w:?}"
+            );
+        }
+        // A window mapped during overview goes to the front, not under it.
+        let late = window(
+            &mut scene,
+            Point::new(10.0, 10.0),
+            Size::new(50.0, 50.0),
+            true,
+        );
+        let now = order(&scene);
+        assert_eq!(&now[..2], &[wallpaper, scrim]);
+        assert_eq!(now.last(), Some(&late));
+    }
+
+    #[test]
+    fn a_badge_is_drawn_at_the_output_s_own_scale() {
+        let (mut scene, wins, _) = desktop();
+        enter(&mut scene, &wins);
+        update(&mut scene);
+        let mut checked = 0;
+        for w in &wins[..2] {
+            let root = scene.window_info(*w).unwrap().root();
+            let badge = *scene.node(root).unwrap().children().last().unwrap();
+            for child in scene.node(badge).unwrap().children() {
+                let t = scene.node(*child).unwrap().world_transform();
+                assert!((t.a - 1.0).abs() < 1e-5, "icon/caption scale {}", t.a);
+                assert!((t.d - 1.0).abs() < 1e-5);
+                checked += 1;
+            }
+        }
+        assert!(checked > 0);
+    }
+
+    #[test]
+    fn only_the_server_may_scale_a_frame() {
+        let (mut scene, wins, _) = desktop();
+        let root = scene.window_info(wins[0]).unwrap().root();
+        assert_eq!(
+            scene.set_transform(CLIENT, root, Transform::scale(0.25, 0.25)),
+            Err(SceneError::NotOwner)
+        );
+        assert!(
+            scene
+                .set_transform(ClientId::SERVER, root, Transform::scale(0.25, 0.25))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn restoring_puts_every_window_back() {
+        let (mut scene, wins, _) = desktop();
+        let before: Vec<(Point, Transform)> = wins
+            .iter()
+            .map(|w| {
+                let i = scene.window_info(*w).unwrap();
+                (i.position(), scene.node(i.root()).unwrap().transform())
+            })
+            .collect();
+        let slots = slots_for(&scene, &wins);
+        let saved: Vec<_> = slots
+            .iter()
+            .map(|s| apply_thumb(&mut scene, s.window, s).unwrap())
+            .collect();
+        for (slot, (t, p)) in slots.iter().zip(saved) {
+            restore_thumb(&mut scene, slot.window, t, p).unwrap();
+        }
+        for (w, want) in wins.iter().zip(before) {
+            let i = scene.window_info(*w).unwrap();
+            assert_eq!(
+                (i.position(), scene.node(i.root()).unwrap().transform()),
+                want
+            );
+        }
+    }
+
+    #[test]
+    fn a_click_selects_by_slot_geometry() {
+        let (scene, wins, _) = desktop();
+        let slots = slots_for(&scene, &wins);
+        let ov = Overview {
+            output: OUT,
+            scrim: wins[0],
+            thumbs: slots
+                .iter()
+                .map(|s| ThumbState {
+                    window: s.window,
+                    slot: *s,
+                    hit: s.rect(),
+                    saved_transform: Transform::IDENTITY,
+                    saved_position: None,
+                    unhid: false,
+                    badge: None,
+                    caption_text: None,
+                })
+                .collect(),
+        };
+        for s in &slots {
+            let centre = Point::new(s.pos.x + s.size.w / 2.0, s.pos.y + s.size.h / 2.0);
+            assert_eq!(ov.slot_at(centre), Some(s.window));
+        }
+        assert_eq!(ov.slot_at(Point::new(-5.0, -5.0)), None);
+    }
+
+    #[test]
+    fn the_badge_hangs_thirty_percent_below_the_thumbnail() {
+        let [icon, pill, text] = badge_rects(Some(100.0));
+        let icon = icon.unwrap();
+        assert_eq!(icon.w, OVERVIEW_ICON);
+        assert_eq!(
+            icon.y + icon.h,
+            (OVERVIEW_ICON * (1.0 - ICON_OVERLAP)).round()
+        );
+        let pill = pill.unwrap();
+        assert_eq!(pill.y, icon.y + icon.h + ICON_TITLE_SPACING);
+        assert!(pill.y + pill.h <= ROW_SPACING, "fits in the row gap");
+        assert!(text.unwrap().y >= pill.y);
+        assert_eq!(badge_rects(None)[1], None, "no caption, no pill");
+    }
 }

@@ -424,6 +424,22 @@ pub fn hit(scene: &Scene, output: OutputId, point: Point) -> Option<PointerTarge
     })
 }
 
+/// [`hit`], with overview mode's layer rule applied: a hit on a
+/// `Layer::Normal` window (a thumbnail, or the scrim) is `None`, because
+/// the window manager owns those pointer events and reinterprets them as
+/// thumbnail selection. `Top` and `Overlay` hits route normally — the
+/// search UI is itself a client, and a global mute would make its field
+/// unclickable. `hit_test` resolves topmost-first, so an overlay above a
+/// thumbnail wins by construction. See `docs/wm.md` §Overview mode.
+#[must_use]
+pub fn overview_hit(scene: &Scene, output: OutputId, point: Point) -> Option<PointerTarget> {
+    hit(scene, output, point).filter(|t| {
+        scene
+            .window_info(t.window)
+            .is_ok_and(|w| w.layer() != nitro_scene::Layer::Normal)
+    })
+}
+
 /// A device point in a window's own coordinate space.
 ///
 /// "Its own" means the **client's** space: for a decorated window that is
@@ -877,6 +893,49 @@ mod tests {
         assert_eq!(target.local, Point::new(20.0, 20.0));
         // Outside every window: nothing is hit.
         assert!(hit(&scene, output, Point::new(150.0, 90.0)).is_none());
+    }
+
+    #[test]
+    fn overview_hits_swallow_normal_windows_and_route_overlays() {
+        let (mut scene, output, win) = scene_with_window(Point::new(10.0, 20.0));
+        // Scaled like a thumbnail: the plain hit still reaches the client,
+        // at scaled-down local coordinates — the hazard the rule is for.
+        let root = scene.window_info(win).unwrap().root();
+        scene
+            .set_transform(
+                ClientId::SERVER,
+                root,
+                nitro_core::Transform::scale(0.5, 0.5),
+            )
+            .unwrap();
+        let client = ClientId(2);
+        let over = scene.create_window(client, "o", Size::new(20.0, 10.0), Layer::Overlay);
+        scene
+            .place_window(over, Some(output), Point::new(150.0, 70.0))
+            .unwrap();
+        let r = scene.window_info(over).unwrap().root();
+        let rect = scene.create_node(client, NodeKind::Rect, r, None).unwrap();
+        scene
+            .set_bounds(client, rect, Rect::new(0.0, 0.0, 20.0, 10.0))
+            .unwrap();
+        scene
+            .set_fill(client, rect, Fill::Solid(nitro_core::Color::WHITE))
+            .unwrap();
+        let mut damage = nitro_core::Damage::new();
+        scene.update(&mut nitro_scene::DamageSink::new(&mut [(
+            output,
+            &mut damage,
+        )]));
+
+        let thumb = Point::new(15.0, 25.0);
+        assert_eq!(hit(&scene, output, thumb).map(|t| t.window), Some(win));
+        assert_eq!(
+            overview_hit(&scene, output, thumb),
+            None,
+            "a thumbnail is the WM's"
+        );
+        let t = overview_hit(&scene, output, Point::new(155.0, 75.0)).expect("the overlay");
+        assert_eq!(t.window, over, "an Overlay window routes normally");
     }
 
     #[test]
