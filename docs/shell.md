@@ -74,7 +74,7 @@ follows what each one is:
 | ops | when | why |
 |---|---|---|
 | `SetLayer`, `SetExclusiveZone`, `SetAnchor`, `GrabKeyboard` | at the sender's `Commit` | they name the sender's **own** window, and a bar sends `CreateWindow` and `SetAnchor` in one transaction |
-| `BindKey`, `UnbindKey`, `WindowList`, `Outputs`, `FocusWindow`, `CloseWindow`, `SetWindowStateFor`, `Lock`, `Unlock` | on receipt | questions and registrations, ops on *another* client's window, or the whole session — none of which the sender's commit has anything to do with |
+| `BindKey`, `UnbindKey`, `WindowList`, `Outputs`, `FocusWindow`, `CloseWindow`, `SetWindowStateFor`, `Lock`, `Unlock`, `SetOverview` | on receipt | questions and registrations, ops on *another* client's window, or the whole session — none of which the sender's commit has anything to do with |
 
 The first row is the hardware probe's finding, and worth recording because
 the first implementation got it wrong in a way no unit test caught: the
@@ -309,6 +309,25 @@ whose positions depend on the compiled keymap, so it cannot be compared
 against a constant and a shell could not express "Super+Return" in it at
 all. `Mods::mask`/`Mods::from_mask` convert at the one boundary.
 
+**What the launcher's triggers do (#3789).** The launcher was absorbed
+into the overview: there is one Super-triggered overlay, not two.
+
+| trigger | before #3789 | now |
+|---|---|---|
+| bare-Super tap | opened the launcher | opens the **overview**, with an empty, unfocused search field |
+| bar's menu button | counted a press (a stub) | the same path as the tap: `SetOverview(Toggle)` |
+| `Super+Space` | opened the launcher | opens the overview with the search field **focused** |
+| second trigger / `Escape` | closed the launcher | leaves the overview (`Escape` is a ladder: see §The overview) |
+
+The tap and the chord are still the **launcher's** bindings, not the
+server's: a desktop with no shell connected does not swallow Super, and
+§A binding buys its client a turn keeps working unchanged. On a `HotKey`
+the launcher sends `SetOverview(Toggle)` without committing; it commits
+its show-and-grab when the `OverviewState` answer arrives, so keys stay
+withheld across the extra hop. `Super+Space` stays because a user whose
+Super is also their window-management modifier cancels the tap
+constantly, and a chord always works.
+
 **One chord, one owner.** A chord another client holds is
 `Error { Protocol }`; re-binding your own `id` replaces it. A client's
 bindings are all released when it disconnects, so a launcher that crashed
@@ -351,6 +370,59 @@ shape, and the button is the only thing that distinguishes them.
 `super_drag_still_moves_a_window_with_the_shell_connected` in
 `tests/shell.rs` asserts both halves — the window moves, and no `HotKey`
 fires.
+
+## The overview
+
+Overview mode is the server's (`docs/wm.md` §Overview mode): it owns the
+windows it scales, and it owns the tap state machine that opens it. The
+shell needs to talk to it in **both** directions, so there are two
+messages, and neither is optional:
+
+* **server → shell, `OverviewState { active, output }`.** Entering or
+  leaving can originate server-side — a thumbnail or scrim click, the lock,
+  an output going away, a window-management hotkey, the control request —
+  and the launcher has to follow.
+* **shell → server, `SetOverview { request }`.** The shell has to be able
+  to leave: launching from the search field exits the overview, and
+  `Escape` goes to the grab holder (the launcher), not the server. The
+  bar's button is a client-side press too.
+
+**The server is authoritative.** `SetOverview` is a *request*
+(`Watch`, `Leave`, `Enter`, `Toggle`), answered with an `OverviewState`;
+`OverviewState` is the only thing that changes rendered state. `Toggle`
+is resolved server-side, so the tap, the button and the chord can race
+without anyone holding a stale bool. `Enter` opens on the output under
+the pointer (else the primary), and is refused while locked — the refusal
+is the answer, `active: false`.
+
+**Subscription.** Sending any `SetOverview` subscribes the connection;
+only subscribers are sent `OverviewState`, so no capability bit is
+needed (`docs/wire.md` §`OverviewState`). The launcher sends `Watch` at
+start-up. Every request is answered — to the requester alone if nothing
+changed — and every change is pushed to every subscriber.
+
+**Applied at `settle`.** Requests are subscribed on receipt and applied
+at the end of the wakeup (`Server::pending_overview`), for the
+`pending_drag_starts` reason: entering dismisses popups and sends to other
+clients, and the sender may be lifted out of the client map. `settle`
+then announces once, comparing with the last state announced — so a
+re-layout (leave + enter on the same output, when a window maps during an
+overview) sends **nothing**, and every server-side leave is caught
+without touching its call site.
+
+**The launcher is the overview's search field.** It shows on
+`active: true` and hides on `active: false`, never on its own request.
+Opened by a tap the field is empty and unfocused, and the first printable
+key engages it; opened by `Super+Space` it is focused. `Escape` is a
+**ladder** (GNOME's, shortened — nitro has no app grid): a non-empty query
+is cleared, an empty one sends `Leave`. Two rungs, each undoing exactly
+one thing. A launch sends `Leave` after the spawn succeeds; a failure
+stays up with the reason. Another window taking focus sends `Leave`.
+
+`stats` reports `overview_requests` (cumulative) and `overview_watchers`.
+`tests/shell.rs` covers the request/answer and push semantics, the silent
+relayout and the lock; `nitro-launcher/tests/launcher.rs` covers the
+triggers and the ladder.
 
 ## Keyboard grabs
 

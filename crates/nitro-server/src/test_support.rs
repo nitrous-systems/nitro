@@ -192,7 +192,7 @@ impl TestServer {
 
     /// Enter (`true`) or leave overview mode on the first output, and
     /// wait for the result to be on screen. The `overview` control
-    /// request, which is a test hook until the triggers exist.
+    /// request: the test and debug way in (the shell's is `SetOverview`).
     ///
     /// # Panics
     /// If the server refuses.

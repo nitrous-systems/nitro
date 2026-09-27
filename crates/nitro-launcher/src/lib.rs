@@ -1,5 +1,6 @@
-//! `nitro-launcher` — the desktop's application launcher: a Super-tap
-//! overlay that searches `.desktop` files and starts what you pick.
+//! `nitro-launcher` — the overview's search field: the overlay that
+//! comes up with the overview (a bare-Super tap, `Super+Space`, the bar's
+//! button), searches `.desktop` files and starts what you pick.
 //!
 //! ```text
 //!                        ┌────────────────────────────────┐
@@ -47,6 +48,31 @@
 //! does not outrank the bindings: a launcher opened by a tap has to be
 //! closable by a second tap *while it holds the keyboard*.
 //!
+//! # It is the overview's, and the server owns the overview
+//!
+//! The launcher was absorbed into the overview (#3789): there is one
+//! Super-triggered overlay, not two. A trigger does not show the launcher;
+//! it sends [`SetOverview`](nitro_ui::Ui::set_overview)`(Toggle)`, a
+//! **request**. The server applies it and answers with an
+//! `OverviewState`, and that answer — pushed too whenever anything else
+//! enters or leaves the overview (a thumbnail click, the lock, the bar's
+//! button) — is the **only** thing that shows or hides the launcher on a
+//! shell connection. So the two ends can never disagree about whether the
+//! overview is up: the server decides, and the launcher follows.
+//!
+//! Leaving is a request the same way: `Escape` on an empty query, a
+//! launch, and another window taking focus all send `Leave` and wait for
+//! the answer. `Escape` is a two-rung ladder — a non-empty query is
+//! cleared first, and only an empty one leaves.
+//!
+//! A tap opens the field **unfocused**, over the grid, and the first
+//! printable key engages it; `Super+Space` opens it focused. Search
+//! replacing the grid is not done here (#3790): today the field searches
+//! applications only, over the thumbnails.
+//!
+//! Without the shell socket (no overview to ask for) the launcher falls
+//! back to showing and hiding itself, so the crate still runs anywhere.
+//!
 //! # Everything it does is addressable
 //!
 //! ```console
@@ -73,7 +99,7 @@ pub mod search;
 pub mod spawn;
 
 use nitro_ui::build::{ContainerBuilder as _, StyleBuilder as _};
-use nitro_ui::shell::{ShellEvent, Surface, WindowInfo};
+use nitro_ui::shell::{OverviewRequest, ShellEvent, Surface, WindowInfo};
 use nitro_ui::widgets::{
     Button, Label, TextField, button as button_widget, column, label, scroll, text_field,
 };
@@ -107,8 +133,20 @@ pub const HOTKEY_TAP: u32 = 1;
 ///
 /// A second trigger, because the tap is a gesture and a chord is not:
 /// a user whose Super key is also their window-management modifier ends
-/// up cancelling the tap constantly, and `Super+Space` always works.
+/// up cancelling the tap constantly, and `Super+Space` always works. It
+/// opens the overview like the tap, with the search field focused.
 pub const HOTKEY_CHORD: u32 = 2;
+
+/// What asked for the overview the launcher is about to show, which
+/// decides only one thing: whether the query field starts focused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Trigger {
+    /// The bare tap, the bar's button, or anything server-side: the
+    /// field is shown empty and unfocused, and typing engages it.
+    Tap,
+    /// `Super+Space`: the field is focused at once.
+    Chord,
+}
 
 /// X11 keysym for `space`, which is what [`nitro_ui::Ui::bind_key`]
 /// takes.
@@ -164,6 +202,12 @@ pub struct Launcher {
     query: String,
     /// Whether the overlay is on screen.
     visible: bool,
+    /// A launch failed while hidden and asked to come up: the next show
+    /// keeps `last_error` rather than clearing it.
+    error_pending: bool,
+    /// What the pending overview request came from; reset to
+    /// [`Trigger::Tap`] once a show has used it.
+    opened_by: Trigger,
     /// How many times another window taking focus has hidden the
     /// overlay, for the tests and for `hey`.
     focus_hides: u64,
@@ -217,6 +261,8 @@ impl Launcher {
             selected: 0,
             query: String::new(),
             visible: false,
+            opened_by: Trigger::Tap,
+            error_pending: false,
             focus_hides: 0,
             focused: None,
             fingerprint: (0, 0),
@@ -537,6 +583,11 @@ fn install(ui: &mut Ui<Launcher>, ids: Ids) {
                 eprintln!("nitro-launcher: bind {id}: {e}");
             }
         }
+        // Subscribe to overview state: every enter and leave, whoever
+        // causes it, now arrives as `ShellEvent::Overview`.
+        if let Err(e) = ui.set_overview(OverviewRequest::Watch) {
+            eprintln!("nitro-launcher: overview: {e}");
+        }
     }
 
     ui.on_shell(
@@ -547,11 +598,32 @@ fn install(ui: &mut Ui<Launcher>, ids: Ids) {
             // rather than the start of a chord. A chord arrives twice, so
             // the release is ignored or the launcher would toggle twice
             // per press.
+            //
+            // The handler **must not commit**: the server withholds keys
+            // from everyone else until this client's next commit
+            // (`docs/shell.md` §A binding buys its client a turn), and
+            // that commit has to be the show-and-grab the
+            // `OverviewState` answer produces. `set_overview` is sent
+            // without one, and `opened_by` is state, not tree.
             ShellEvent::HotKey { id, pressed } if *id == HOTKEY_TAP && !*pressed => {
-                toggle(s, ui);
+                s.opened_by = Trigger::Tap;
+                request_toggle(s, ui);
             }
             ShellEvent::HotKey { id, pressed } if *id == HOTKEY_CHORD && *pressed => {
-                toggle(s, ui);
+                s.opened_by = Trigger::Chord;
+                request_toggle(s, ui);
+            }
+            // The server's decision, and the only thing that shows or
+            // hides the launcher on a shell connection.
+            ShellEvent::Overview { active: true, .. } => {
+                if !s.visible {
+                    show(s, ui);
+                }
+            }
+            ShellEvent::Overview { active: false, .. } => {
+                if s.visible {
+                    hide(s, ui);
+                }
             }
             // Focus loss, as near as a `NO_FOCUS` overlay can observe it.
             // See [`focus_moved`] for why it is somebody *else* taking
@@ -578,14 +650,20 @@ fn install(ui: &mut Ui<Launcher>, ids: Ids) {
         eprintln!("nitro-launcher: window list: {e}");
     }
 
-    // Escape hides. An app-level handler rather than a widget's, because
-    // the focused widget is the text field and a field that consumed
-    // Escape would swallow it; `on_key` is offered exactly the presses no
-    // widget took, which is the definition of what this wants.
+    // Escape is a ladder. An app-level handler rather than a widget's,
+    // because the focused widget is the text field and a field that
+    // consumed Escape would swallow it; `on_key` is offered exactly the
+    // presses no widget took, which is the definition of what this wants.
     ui.on_key(
         move |s: &mut Launcher, ui: &mut Ui<Launcher>, k: &nitro_ui::KeyEvent| match k.keycode {
             nitro_ui::event::key::ESC => {
-                hide(s, ui);
+                escape(s, ui);
+                nitro_ui::Handled::Yes
+            }
+            // Enter with the field not yet engaged (a tap, nothing typed):
+            // the field's own `on_submit` never sees it.
+            nitro_ui::event::key::ENTER if s.visible => {
+                launch_selected(s, ui);
                 nitro_ui::Handled::Yes
             }
             nitro_ui::event::key::UP => {
@@ -594,6 +672,12 @@ fn install(ui: &mut Ui<Launcher>, ids: Ids) {
             }
             nitro_ui::event::key::DOWN => {
                 move_selection(s, ui, 1);
+                nitro_ui::Handled::Yes
+            }
+            // Typing engages search: the first printable key after a tap,
+            // which reached no widget because nothing was focused.
+            _ if s.visible && is_typed(k) => {
+                engage(s, ui, &k.text);
                 nitro_ui::Handled::Yes
             }
             _ => nitro_ui::Handled::No,
@@ -620,7 +704,85 @@ fn install(ui: &mut Ui<Launcher>, ids: Ids) {
     });
 }
 
-/// Show the launcher if it is hidden, hide it if it is shown.
+/// A trigger fired: ask the server to toggle the overview, or — with no
+/// shell socket, so no overview — toggle the overlay locally.
+fn request_toggle(s: &mut Launcher, ui: &mut Ui<Launcher>) {
+    if ui.is_shell() {
+        if let Err(e) = ui.set_overview(OverviewRequest::Toggle) {
+            eprintln!("nitro-launcher: overview: {e}");
+        }
+    } else {
+        toggle(s, ui);
+    }
+}
+
+/// Come up: ask the server to enter the overview (the answer shows the
+/// launcher), or show locally without a shell socket.
+fn request_enter(s: &mut Launcher, ui: &mut Ui<Launcher>) {
+    if ui.is_shell() {
+        if let Err(e) = ui.set_overview(OverviewRequest::Enter) {
+            eprintln!("nitro-launcher: overview: {e}");
+            show(s, ui);
+        }
+    } else {
+        show(s, ui);
+    }
+}
+
+/// Get out of the way: ask the server to leave the overview (the answer
+/// hides the launcher), or hide locally without a shell socket.
+fn request_leave(s: &mut Launcher, ui: &mut Ui<Launcher>) {
+    if ui.is_shell() {
+        if let Err(e) = ui.set_overview(OverviewRequest::Leave) {
+            eprintln!("nitro-launcher: overview: {e}");
+            hide(s, ui);
+        }
+    } else {
+        hide(s, ui);
+    }
+}
+
+/// `Escape`: two rungs, each undoing exactly one thing. A non-empty
+/// query is cleared (and the list comes back whole); an empty one leaves
+/// the overview.
+fn escape(s: &mut Launcher, ui: &mut Ui<Launcher>) {
+    if s.query.is_empty() {
+        request_leave(s, ui);
+        return;
+    }
+    set_query(s, ui, "");
+}
+
+/// Replace the query: the field, the mirror, the ranking and the rows,
+/// which is what the field's `on_change` does for a typed key.
+fn set_query(s: &mut Launcher, ui: &mut Ui<Launcher>, text: &str) {
+    let Some(ids) = s.ids else { return };
+    if let Ok(mut f) = ui.widget_mut::<TextField<Launcher>>(ids.query) {
+        f.set_text(text);
+    }
+    text.clone_into(&mut s.query);
+    s.rerank();
+    refresh(s, ui);
+}
+
+/// Whether a key no widget took is one that should start a search: it
+/// produced printable text, with no Ctrl held.
+fn is_typed(k: &nitro_ui::KeyEvent) -> bool {
+    !k.text.is_empty() && !k.text.chars().any(char::is_control) && !k.ctrl()
+}
+
+/// The first key typed into an unfocused field (after a tap): focus it
+/// and append the text, through the same path a typed key takes.
+fn engage(s: &mut Launcher, ui: &mut Ui<Launcher>, text: &str) {
+    let Some(ids) = s.ids else { return };
+    ui.focus(ids.query);
+    let next = format!("{}{text}", s.query);
+    set_query(s, ui, &next);
+}
+
+/// Show the launcher if it is hidden, hide it if it is shown — locally,
+/// for a launcher with no shell socket. On a shell connection the
+/// overview decides, see [`request_toggle`].
 pub fn toggle(s: &mut Launcher, ui: &mut Ui<Launcher>) {
     if s.visible {
         hide(s, ui);
@@ -679,7 +841,10 @@ fn focus_moved(s: &mut Launcher, ui: &mut Ui<Launcher>, info: &WindowInfo) {
         return;
     }
     s.focus_hides += 1;
-    hide(s, ui);
+    // A request: the overview goes, and its answer takes the launcher
+    // with it. A thumbnail click has already left server-side; this is
+    // for focus moving any other way.
+    request_leave(s, ui);
 }
 
 /// A window is gone: forget it if it was the focused one.
@@ -698,6 +863,11 @@ fn focus_gone(s: &mut Launcher, window: nitro_ui::shell::WindowRef) {
 /// Put the overlay on screen: rescan if anything changed, clear the
 /// query, take the keyboard, and make the window visible.
 ///
+/// On a shell connection only an `OverviewState { active: true }` calls
+/// this. Opened by `Super+Space` the query field is focused; opened any
+/// other way it is not, and the first printable key focuses it (see
+/// [`engage`]).
+///
 /// The order matters. The query is cleared and the list re-ranked
 /// *before* the window is shown, so the user never sees the previous
 /// search for a frame; and the grab rides the same commit as the
@@ -708,13 +878,19 @@ pub fn show(s: &mut Launcher, ui: &mut Ui<Launcher>) {
     let Some(ids) = s.ids else { return };
     s.rescan_if_stale();
     s.query.clear();
-    s.last_error = None;
+    // A launch that failed while hidden asked for this show to say why.
+    if !std::mem::take(&mut s.error_pending) {
+        s.last_error = None;
+    }
     if let Ok(mut f) = ui.widget_mut::<TextField<Launcher>>(ids.query) {
         f.set_text("");
     }
     s.rerank();
     refresh(s, ui);
-    ui.focus(ids.query);
+    match std::mem::replace(&mut s.opened_by, Trigger::Tap) {
+        Trigger::Chord => ui.focus(ids.query),
+        Trigger::Tap => ui.unfocus(),
+    }
     s.visible = true;
     s.shows += 1;
     let _ = ui.set_window_visible(true);
@@ -752,6 +928,7 @@ pub fn show(s: &mut Launcher, ui: &mut Ui<Launcher>) {
 /// drifting looks like.
 pub fn hide(s: &mut Launcher, ui: &mut Ui<Launcher>) {
     s.visible = false;
+    s.opened_by = Trigger::Tap;
     let _ = ui.set_window_visible(false);
 }
 
@@ -775,7 +952,7 @@ pub fn move_selection(s: &mut Launcher, ui: &mut Ui<Launcher>, delta: isize) {
     restyle_rows(s, ui);
 }
 
-/// Launch whatever is selected, and hide.
+/// Launch whatever is selected, and leave.
 fn launch_selected(s: &mut Launcher, ui: &mut Ui<Launcher>) {
     let Some(index) = s.matches.get(s.selected).copied() else {
         return;
@@ -783,12 +960,15 @@ fn launch_selected(s: &mut Launcher, ui: &mut Ui<Launcher>) {
     launch_index(s, ui, index);
 }
 
-/// Launch `entries[index]`, and hide on success.
+/// Launch `entries[index]`, and leave the overview on success.
 ///
-/// The launcher hides **before** the spawn is attempted so the user sees
-/// it go immediately, and comes back on failure with the reason in place
-/// of the list. A launcher that stayed up while a program started would
-/// cover the window it just opened.
+/// The spawn comes first and the `Leave` after it, so a failure never
+/// leaves at all: the launcher stays up with the reason in place of the
+/// list. (Before the overview, it hid first and re-showed on failure;
+/// with the hide a server round trip away, that would be a leave and an
+/// enter for nothing.) `fork`/`exec` returns long before the child maps a
+/// window, so the overview is gone before the new window arrives, and a
+/// launcher that stayed up would cover the window it just opened.
 fn launch_index(s: &mut Launcher, ui: &mut Ui<Launcher>, index: usize) {
     let Some(entry) = s.entries.get(index).cloned() else {
         return;
@@ -803,7 +983,6 @@ fn launch_index(s: &mut Launcher, ui: &mut Ui<Launcher>, index: usize) {
         show_error(s, ui);
         return;
     }
-    hide(s, ui);
     match s.children.spawn_in(&entry.argv, entry.path.as_deref()) {
         Ok(_) => {
             // The child's pidfd joins the loop, so its exit is reaped the
@@ -812,16 +991,21 @@ fn launch_index(s: &mut Launcher, ui: &mut Ui<Launcher>, index: usize) {
             s.launches += 1;
             s.last_launch = Some(entry.program().to_owned());
             s.last_error = None;
+            request_leave(s, ui);
         }
         Err(e) => {
-            // Back on screen *first*, and the reason set afterwards:
-            // `show` clears `last_error`, because a launcher reopened by
-            // a fresh tap should not still be showing the last failure.
-            // Setting it before the show would therefore wipe exactly the
-            // message this branch exists to display.
-            show(s, ui);
+            // Still on screen: nothing was left, so the reason goes where
+            // the eye already is. (`show` clears `last_error`, so a fresh
+            // open does not show a stale failure.)
             s.last_error = Some(format!("{}: {e}", entry.name));
             show_error(s, ui);
+            // Launched while hidden (`hey … do results/0 click`): come
+            // up to say so. `error_pending` makes that one show keep the
+            // reason rather than clear it.
+            if !s.visible {
+                s.error_pending = true;
+                request_enter(s, ui);
+            }
         }
     }
 }

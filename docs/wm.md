@@ -840,9 +840,11 @@ hotplug, not the keyboard it already has.
 ## Overview mode
 
 Designed in #3785; the primitive — entering, leaving, selecting — is
-built (#3788), the triggers are #3789. Until they land the only way in is
-the `overview [on|off] [output]` control request. See §The primitive, as
-built, below. The GNOME study the design is drawn from, with the measurements
+built (#3788), and the triggers are wired (#3789): a bare-Super tap, the
+bar's button and `Super+Space` all open it, through the shell's
+`SetOverview` request (`docs/shell.md` §The overview). The
+`overview [on|off] [output]` control request is the test and debug way
+in. See §The primitive, as built, below. The GNOME study the design is drawn from, with the measurements
 below in full, is `docs/research/overview.md`.
 
 An **overview** is a WM mode in which every `Normal`-layer window on an
@@ -1005,9 +1007,10 @@ The search UI stays in `nitro-launcher` as an `Overlay` client — the seam
 is layers, which already work — so the server draws only scaled windows it
 already owns, a scrim, and per-thumbnail icon and caption nodes, all of
 which are `Rect`/`Icon`/`Text` nodes `wm::build_frame` already builds.
-The trigger rework and the launcher's absorption are a behaviour change to
-a working interaction; they are specified with the task that makes them,
-and `docs/shell.md` §Hotkeys changes there rather than here.
+The trigger rework and the launcher's absorption (#3789) are specified in
+`docs/shell.md` §Hotkeys and §The overview: the launcher is the overview's
+search field, and it shows and hides on the server's `OverviewState`.
+Search replacing the grid is #3790.
 
 
 ## Damage

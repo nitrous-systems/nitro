@@ -42,7 +42,7 @@ pub use nitro_wire::msg::{OutputInfo, WindowInfo};
 /// the one constant it needs. Deliberately *not* the xkb mask a
 /// [`KeyEvent`](crate::KeyEvent) carries — see `Ui::bind_key`.
 pub use nitro_wire::types::mod_mask;
-pub use nitro_wire::types::{Edge, Layer, WindowRef, WindowState};
+pub use nitro_wire::types::{Edge, Layer, OverviewRequest, WindowRef, WindowState};
 
 /// Which edges a surface sticks to, and how far from them.
 ///
@@ -232,6 +232,18 @@ pub enum ShellEvent {
         id: u32,
         /// Whether this is the press.
         pressed: bool,
+    },
+    /// Overview mode's state, as the server decided it. The answer to
+    /// every [`Ui::set_overview`](crate::Ui::set_overview), and pushed
+    /// unasked afterwards whenever it changes, whoever changed it.
+    ///
+    /// The server is authoritative: show or hide overview UI on this and
+    /// on nothing else, never on the request.
+    Overview {
+        /// Whether an overview is up.
+        active: bool,
+        /// The output it is on (an [`OutputInfo`] id); 0 when not active.
+        output: u32,
     },
 }
 

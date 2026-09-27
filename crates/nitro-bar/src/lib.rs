@@ -544,9 +544,11 @@ pub fn build(ui: &mut Ui<Bar>) -> WidgetId {
 
     // -- left: the launcher button and the window list ----------------
     //
-    // The launcher button does not open the launcher itself: it fires the
-    // same bare-Super path the launcher already listens on (#3691), so
-    // there is one trigger rather than two that must agree.
+    // The launcher button does not open the launcher itself: it asks the
+    // server for the overview (`SetOverview(Toggle)`), the same request
+    // the launcher sends on a bare-Super tap, so there is one trigger path
+    // rather than two that must agree. The server answers every overview
+    // watcher, the launcher among them, which is what shows it.
     //
     // The glyph is an **icon**, not a character. `☰` used to be a
     // codepoint in the label, which meant it came from whatever font on
@@ -562,12 +564,20 @@ pub fn build(ui: &mut Ui<Bar>) -> WidgetId {
             .name(names::LAUNCHER)
             .size(TEXT_SIZE)
             .height_percent(1.0)
-            .on_click(|s: &mut Bar, _ui: &mut Ui<Bar>| {
-                // Counted rather than acted on: the process that owns the
-                // launcher is #3691, and wiring this to a binary that is
-                // not there yet would be a half-feature. The count is
-                // what `hey nitro-bar do launcher click` can assert on.
+            .on_click(|s: &mut Bar, ui: &mut Ui<Bar>| {
+                // Counted as well as sent: the count is what
+                // `hey nitro-bar do launcher click` can assert on without
+                // a server in the loop.
                 s.launcher_presses += 1;
+                // A request, fire and forget. The bar does not render
+                // anything for the overview; the server answers it an
+                // `OverviewState`, which it ignores. Checked, because a
+                // shell op on the wire socket is fatal.
+                if ui.is_shell()
+                    && let Err(e) = ui.set_overview(nitro_ui::shell::OverviewRequest::Toggle)
+                {
+                    eprintln!("nitro-bar: overview: {e}");
+                }
             }),
     );
     // `shrink_to_zero` on the window-list **row**, and nowhere else in

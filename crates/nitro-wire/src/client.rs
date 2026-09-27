@@ -20,13 +20,13 @@ use crate::msg::{
     FocusWindow, GrabKeyboard, Hello, ListOutputs, Lock, MeasureText, Outputs, Reparent,
     RepositionPopup, RequestFrame, RequestSelection, SendSelection, ServerMsg, SetAnchor, SetAppId,
     SetBorder, SetBounds, SetClip, SetCorners, SetCursor, SetExclusiveZone, SetFill, SetIcon,
-    SetImage, SetLayer, SetOpacity, SetSelection, SetText, SetTransform, SetVisible,
+    SetImage, SetLayer, SetOpacity, SetOverview, SetSelection, SetText, SetTransform, SetVisible,
     SetWindowLimits, SetWindowState, SetWindowStateFor, SetWindowTitle, StartDrag, StartMove,
     StartResize, UnbindKey, Unlock, WindowList,
 };
 use crate::types::{
     Align, BufferId, CursorShape, DataSource, DragAction, Edge, Layer, NodeId, NodeKind,
-    PopupAnchor, PopupGravity, WindowRef, WindowState, caps,
+    OverviewRequest, PopupAnchor, PopupGravity, WindowRef, WindowState, caps,
 };
 
 /// Where the shell socket lives; see [`crate::shell_socket_path`].
@@ -298,6 +298,18 @@ impl Connection {
     /// As [`Connection::send`].
     pub fn unlock(&mut self) -> Result<(), Error> {
         self.send(&ClientMsg::Unlock(Unlock))
+    }
+
+    /// Ask to enter or leave overview mode, and subscribe to its state
+    /// (needs `caps::SHELL`). See [`SetOverview`].
+    ///
+    /// Answered with an [`OverviewState`](crate::msg::OverviewState),
+    /// which is what the shell should act on — not the request.
+    ///
+    /// # Errors
+    /// As [`Connection::send`].
+    pub fn set_overview(&mut self, request: OverviewRequest) -> Result<(), Error> {
+        self.send(&ClientMsg::SetOverview(SetOverview { request }))
     }
 
     /// Declare which server→client messages this client understands

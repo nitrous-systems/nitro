@@ -27,7 +27,7 @@ use nitro_core::{Color, Rect, Size};
 use nitro_server::input::{FakeInput, InputEvent};
 use nitro_server::{BackendKind, Config, run, wm};
 use nitro_wire::client::Connection;
-use nitro_wire::msg::{OutputInfo, OutputWorkArea, ServerMsg};
+use nitro_wire::msg::{OutputInfo, OutputWorkArea, OverviewState, ServerMsg};
 use nitro_wire::types::{
     Edge, Layer, NodeId, WindowRef, WindowState, anchor, caps, mod_mask, window_flags,
 };
@@ -560,6 +560,7 @@ fn every_shell_op_is_refused_on_the_ordinary_socket() {
         ("Outputs", 10),
         ("Lock", 11),
         ("Unlock", 12),
+        ("SetOverview", 13),
     ] {
         let mut inbox = Inbox::default();
         let mut conn = h.client(name);
@@ -590,7 +591,8 @@ fn every_shell_op_is_refused_on_the_ordinary_socket() {
             9 => conn.set_window_state_for(WindowRef(1), WindowState::Minimized),
             10 => conn.outputs(),
             11 => conn.lock(),
-            _ => conn.unlock(),
+            12 => conn.unlock(),
+            _ => conn.set_overview(nitro_wire::types::OverviewRequest::Watch),
         }
         .unwrap();
         conn.flush().unwrap();
@@ -3274,5 +3276,194 @@ fn a_watcher_that_narrows_its_caps_is_sent_no_output_messages() {
     assert!(!conn.is_closed());
     assert_eq!(h.stat("clients"), 1);
     drop(conn);
+    h.quit();
+}
+
+// ------------------------------------------------------------ overview
+
+/// Send one `SetOverview` and wait for its answer; the answer is removed
+/// from the inbox, so the next call sees only what came after.
+fn ask_overview(
+    conn: &mut Connection,
+    inbox: &mut Inbox,
+    request: nitro_wire::types::OverviewRequest,
+) -> OverviewState {
+    conn.set_overview(request).unwrap();
+    conn.flush().unwrap();
+    await_overview(conn, inbox, "an OverviewState")
+}
+
+/// Wait for the first `OverviewState` and remove it (and all before it).
+fn await_overview(conn: &mut Connection, inbox: &mut Inbox, what: &str) -> OverviewState {
+    wait_for(what, || {
+        pump(conn, inbox);
+        inbox
+            .0
+            .iter()
+            .any(|m| matches!(m, ServerMsg::OverviewState(_)))
+    });
+    let at = inbox
+        .0
+        .iter()
+        .position(|m| matches!(m, ServerMsg::OverviewState(_)))
+        .unwrap();
+    let ServerMsg::OverviewState(s) = inbox.0.drain(..=at).next_back().unwrap() else {
+        unreachable!()
+    };
+    s
+}
+
+fn overview_msgs(conn: &mut Connection, inbox: &mut Inbox) -> Vec<OverviewState> {
+    pump(conn, inbox);
+    inbox
+        .0
+        .iter()
+        .filter_map(|m| match m {
+            ServerMsg::OverviewState(s) => Some(*s),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn set_overview_is_answered_and_the_server_decides() {
+    use nitro_wire::types::OverviewRequest as R;
+    let h = Harness::start("overview-ask", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut shell = h.shell("launcher");
+    let off = OverviewState {
+        active: false,
+        output: 0,
+    };
+
+    // `Watch` changes nothing and still answers.
+    assert_eq!(ask_overview(&mut shell, &mut inbox, R::Watch), off);
+    assert_eq!(h.stat("overview"), 0);
+    assert_eq!(h.stat("overview_watchers"), 1);
+
+    // `Enter` opens on the only output.
+    let on = ask_overview(&mut shell, &mut inbox, R::Enter);
+    assert!(on.active);
+    assert_ne!(on.output, 0);
+    assert_eq!(h.stat("overview"), 1);
+    // `Enter` again: nothing changes, the requester is answered anyway.
+    assert_eq!(ask_overview(&mut shell, &mut inbox, R::Enter), on);
+    assert_eq!(h.stat("overview"), 1);
+
+    // `Toggle` leaves, then enters again.
+    assert_eq!(ask_overview(&mut shell, &mut inbox, R::Toggle), off);
+    assert_eq!(h.stat("overview"), 0);
+    assert_eq!(ask_overview(&mut shell, &mut inbox, R::Toggle), on);
+    assert_eq!(ask_overview(&mut shell, &mut inbox, R::Leave), off);
+    // `Leave` while off still answers.
+    assert_eq!(ask_overview(&mut shell, &mut inbox, R::Leave), off);
+    assert_eq!(h.stat("overview_requests"), 7);
+    assert!(!shell.is_closed());
+    h.quit();
+}
+
+#[test]
+fn every_overview_change_is_pushed_to_every_watcher_whoever_caused_it() {
+    use nitro_wire::types::OverviewRequest as R;
+    let mut h = Harness::start("overview-push", OUT.0, OUT.1);
+    let mut a_inbox = Inbox::default();
+    let mut a = h.shell("launcher");
+    let mut b_inbox = Inbox::default();
+    let mut b = h.shell("bar");
+    ask_overview(&mut a, &mut a_inbox, R::Watch);
+    ask_overview(&mut b, &mut b_inbox, R::Watch);
+
+    // `a` enters; `b` hears it without asking.
+    let on = ask_overview(&mut a, &mut a_inbox, R::Enter);
+    assert_eq!(
+        await_overview(&mut b, &mut b_inbox, "b hearing the enter"),
+        on
+    );
+
+    // A server-side leave: the control request.
+    assert_eq!(h.request_line("overview off\n"), "ok");
+    let off = OverviewState {
+        active: false,
+        output: 0,
+    };
+    assert_eq!(
+        await_overview(&mut a, &mut a_inbox, "a hearing the leave"),
+        off
+    );
+    assert_eq!(
+        await_overview(&mut b, &mut b_inbox, "b hearing the leave"),
+        off
+    );
+
+    // Another: a click on the bare scrim.
+    assert_eq!(h.request_line("overview on\n"), "ok");
+    assert_eq!(await_overview(&mut a, &mut a_inbox, "control enter"), on);
+    await_overview(&mut b, &mut b_inbox, "control enter");
+    {
+        use nitro_server::input::BTN_LEFT;
+        use nitro_wire::types::ButtonState;
+        h.point_at(10.0, 400.0, OUT);
+        h.button(BTN_LEFT, ButtonState::Pressed);
+        h.button(BTN_LEFT, ButtonState::Released);
+    }
+    assert_eq!(await_overview(&mut a, &mut a_inbox, "the scrim click"), off);
+    assert_eq!(await_overview(&mut b, &mut b_inbox, "the scrim click"), off);
+    assert_eq!(h.stat("overview"), 0);
+    h.quit();
+}
+
+#[test]
+fn a_relayout_during_overview_is_not_announced() {
+    use nitro_wire::types::OverviewRequest as R;
+    let h = Harness::start("overview-relayout", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut shell = h.shell("launcher");
+    let on = {
+        ask_overview(&mut shell, &mut inbox, R::Watch);
+        ask_overview(&mut shell, &mut inbox, R::Enter)
+    };
+    assert!(on.active);
+    assert_eq!(h.stat("overview_thumbs"), 0);
+
+    // A window mapped while the overview is up is re-laid-out into it:
+    // a leave and an enter on the same output, which is no change.
+    let mut app_inbox = Inbox::default();
+    let mut app = h.client("app");
+    make_window(
+        &mut app,
+        &mut app_inbox,
+        1,
+        "app",
+        WIN,
+        RED,
+        0,
+        Layer::Normal,
+        1,
+    );
+    wait_for("the new window's thumbnail", || {
+        h.stat("overview_thumbs") == 1
+    });
+    h.settle();
+    assert_eq!(overview_msgs(&mut shell, &mut inbox), Vec::new());
+    assert_eq!(h.stat("overview"), 1);
+    drop(app);
+    h.quit();
+}
+
+#[test]
+fn entering_the_overview_while_locked_is_refused_and_says_so() {
+    use nitro_wire::types::OverviewRequest as R;
+    let h = Harness::start("overview-locked", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut shell = h.shell("launcher");
+    ask_overview(&mut shell, &mut inbox, R::Watch);
+    assert!(ask_overview(&mut shell, &mut inbox, R::Enter).active);
+
+    // The lock leaves the overview, and the watcher is told.
+    let (_lock, _lock_inbox, _) = make_lock_screen(&h, "lock");
+    assert!(!await_overview(&mut shell, &mut inbox, "the lock's leave").active);
+    // And an `Enter` now is refused, which is the answer.
+    assert!(!ask_overview(&mut shell, &mut inbox, R::Enter).active);
+    assert_eq!(h.stat("overview"), 0);
     h.quit();
 }

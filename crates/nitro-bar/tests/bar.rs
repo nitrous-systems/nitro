@@ -547,15 +547,26 @@ fn every_section_is_addressable_for_hey() {
 
 #[test]
 fn the_launcher_button_is_clickable_from_a_script() {
-    // The launcher itself is #3691; what this pins down is that the
-    // button is wired to the same callback a real click runs, through the
-    // action a script uses.
+    // The button is wired to the same callback a real click runs, through
+    // the action a script uses — and that callback asks the server for
+    // the overview, the same request a bare-Super tap makes (#3789).
     let mut h = harness();
     h.settle();
+    assert_eq!(h.server().stat("overview"), 0);
     let id = named(&mut h, names::LAUNCHER).expect("the launcher button");
     h.click(id);
     h.settle();
     assert_eq!(h.state().launcher_presses(), 1);
+    until(&mut h, "the overview to open", |h| {
+        h.server().stat("overview") == 1
+    });
+    // A second press is a `Toggle` too: it leaves.
+    h.click(id);
+    h.settle();
+    assert_eq!(h.state().launcher_presses(), 2);
+    until(&mut h, "the overview to close", |h| {
+        h.server().stat("overview") == 0
+    });
     h.quit();
 }
 

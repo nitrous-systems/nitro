@@ -42,8 +42,8 @@ use crate::error::{DecodeError, EncodeError};
 use crate::types::WindowState as WindowStateValue;
 use crate::types::{
     Align, AxisSource, BufferId, ButtonState, CursorPos, CursorShape, DataSource, DragAction, Edge,
-    ErrorCode, KeymapFormat, Layer, NodeId, NodeKind, PopupAnchor, PopupGravity, TouchPhase,
-    WindowRef,
+    ErrorCode, KeymapFormat, Layer, NodeId, NodeKind, OverviewRequest, PopupAnchor, PopupGravity,
+    TouchPhase, WindowRef,
 };
 use crate::wire::Plain;
 
@@ -2144,6 +2144,33 @@ fixed_msg! {
         /// State to put it in.
         state: WindowStateValue,
     }
+
+    /// Ask to enter or leave **overview mode** (shell only; needs
+    /// [`caps::SHELL`](crate::types::caps::SHELL)).
+    ///
+    /// A *request*, never a command: the server owns overview mode and
+    /// answers every `SetOverview` with an [`OverviewState`] saying what
+    /// is now true — which may not be what was asked (`Enter` while the
+    /// session is locked answers `active: false`). `OverviewState` is the
+    /// only thing a shell should change its rendering on. See
+    /// [`OverviewRequest`] for the values; `Toggle` is resolved
+    /// server-side, so two triggers racing cannot leave a stale bool on
+    /// either end.
+    ///
+    /// Sending it — any value, `Watch` included — **subscribes** the
+    /// connection: from then on every change of overview state, whoever
+    /// caused it (a thumbnail click, the lock, a hotplug, another shell
+    /// client), is pushed as an `OverviewState`. That is also why the
+    /// message needs no capability bit: a connection is only ever sent
+    /// the answer after it has proved it knows the question.
+    ///
+    /// There is no output field on purpose: `Enter` opens on the output
+    /// under the pointer, else the primary one. Answered on receipt,
+    /// applied before the next frame.
+    SetOverview {
+        /// What to do.
+        request: OverviewRequest,
+    }
 }
 
 msg_enum! {
@@ -2260,6 +2287,9 @@ msg_enum! {
         Lock = 0x040c,
         /// Unlock the session; lock owner only (needs `caps::SHELL`).
         Unlock = 0x040d,
+        /// Ask to enter or leave overview mode, and subscribe (needs
+        /// `caps::SHELL`).
+        SetOverview = 0x040e,
     }
 }
 
@@ -2739,6 +2769,23 @@ fixed_msg! {
         /// The output id that is no longer valid.
         id: u32,
     }
+
+    /// Overview mode's state (shell only; sent to connections that have
+    /// sent a [`SetOverview`]).
+    ///
+    /// The answer to every `SetOverview` — to the sender alone when
+    /// nothing changed — and pushed to every subscriber whenever the
+    /// state changes, whatever changed it. The server is authoritative:
+    /// a shell shows or hides its overview UI on this message and on
+    /// nothing else. A re-layout of an overview that stays up (a window
+    /// mapped while it is open) is not a change and sends nothing.
+    OverviewState {
+        /// Whether an overview is up.
+        active: bool,
+        /// The output it is on, the id [`OutputInfo`] carries; 0 when
+        /// `active` is false.
+        output: u32,
+    }
 }
 
 msg_enum! {
@@ -2809,6 +2856,8 @@ msg_enum! {
         OutputGone = 0x8407,
         /// An output's work area (needs `caps::SHELL` or `caps::OUTPUTS`).
         OutputWorkArea = 0x8408,
+        /// Overview mode's state (needs `caps::SHELL`; subscribers only).
+        OverviewState = 0x8409,
         /// A new clipboard selection exists (needs `caps::DATA`).
         SelectionOffer = 0x8501,
         /// Answer to a `RequestSelection` (needs `caps::DATA`; carries one

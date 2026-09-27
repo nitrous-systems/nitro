@@ -403,6 +403,7 @@ an app because one of its widgets named an icon a newer set has.
 | `DragAction` | `None` 0, `Copy` 1, `Move` 2, `Link` 3 *(M5-A)* |
 | `KeymapFormat` | `XkbV1` 1 *(M5-A)* |
 | `DataSource` | `Clipboard` 0, `Drag` 1 *(M5-A)* |
+| `OverviewRequest` | `Watch` 0, `Leave` 1, `Enter` 2, `Toggle` 3 *(shell, #3789)* |
 | `CursorShape` (`u16`) | `None` 0, then `wp_cursor_shape_device_v1` 1–34 — see below *(M5-A)* |
 
 A value outside the list is a decode error, not a silently-ignored
@@ -556,6 +557,7 @@ Assigned in blocks of 0x100 so a block can grow without renumbering.
 | `0x040b` | `Outputs` | shell (see `SHELL`) |
 | `0x040c` | `Lock` | shell (see `SHELL`) |
 | `0x040d` | `Unlock` | shell (see `SHELL`) |
+| `0x040e` | `SetOverview` | shell (see `SHELL`) |
 
 ### Server → client
 
@@ -592,6 +594,7 @@ Assigned in blocks of 0x100 so a block can grow without renumbering.
 | `0x8406` | `OutputsEnd` | shell (see `SHELL` **or** `OUTPUTS`) |
 | `0x8407` | `OutputGone` | shell (see `SHELL` **or** `OUTPUTS`) |
 | `0x8408` | `OutputWorkArea` | shell (see `SHELL` **or** `OUTPUTS`) |
+| `0x8409` | `OverviewState` | shell (see `SHELL`; subscribers only) |
 | `0x8501` | `SelectionOffer` | data transfer (see `DATA`) |
 | `0x8502` | `SelectionData` | data transfer (see `DATA`) — **carries 1 fd** |
 | `0x8503` | `SelectionRequest` | data transfer (see `DATA`) |
@@ -2151,6 +2154,26 @@ is unlocked, every window is drawn again, and the window that had focus
 when the lock was taken gets it back. From anyone else, or when the
 session is not locked, it is `Error { Protocol }`.
 
+### `SetOverview` — 0x040e
+
+| field | type | meaning |
+|---|---|---|
+| `request` | `u8` (`OverviewRequest`) | `Watch`, `Leave`, `Enter` or `Toggle` |
+
+Fixed head 1 byte. Ask to enter or leave **overview mode** (`docs/wm.md`
+§Overview mode). A **request**, not a command: the server owns overview
+mode and answers every `SetOverview` with an `OverviewState` saying what
+is now true — which need not be what was asked (`Enter` while the session
+is locked is answered `active: false`). `Watch` changes nothing and just
+asks. `Enter` opens on the output under the pointer, else the primary one;
+there is no output field on purpose. `Toggle` is resolved **server-side**,
+so a bare-Super tap, the bar's button and `Super+Space` can race without
+either end holding a stale bool.
+
+Subscribes on receipt; applied, and answered, in the same wakeup, before
+the next frame (at `settle`, because entering dismisses popups and sends
+to other clients). An unknown `request` value is a decode error.
+
 ### `HotKey` — 0x8401
 
 | field | type | meaning |
@@ -2273,6 +2296,33 @@ output list has a **terminator**: the snapshot is complete at
 window list has no per-window terminator, which is why that case went the
 other way. The Versioning policy has the rest of the argument, including
 why #3697's exemption cannot simply be reused here.
+
+### `OverviewState` — 0x8409
+
+| field | type | meaning |
+|---|---|---|
+| `active` | `bool` | whether an overview is up |
+| `output` | `u32` | the output it is on (`OutputInfo.id`); 0 when not active |
+
+Fixed head 5 bytes. The answer to every `SetOverview` — to the sender
+alone when nothing changed — and **pushed to every subscriber** whenever
+overview state changes, whatever changed it: a thumbnail or scrim click,
+the lock, an output going away, a window-management hotkey, the
+`overview` control request, another shell client's `SetOverview`. The
+server is authoritative: a shell shows or hides its overview UI on this
+message and on nothing else. Changes are coalesced per wakeup, so a
+re-layout (a window mapped while the overview is up, a leave and an enter
+on the same output) sends nothing.
+
+**A subscription instead of a capability bit.** A connection is
+subscribed by sending `SetOverview` — any value, `Watch` included — and
+`OverviewState` is sent **only** to subscribers. A client that has sent
+the op has proved it knows the answer, so an older shell client that has
+never heard of overview mode is never sent an op it cannot decode, and
+no new `Welcome` bit or `ClientCaps` entry is needed. It is the
+`WindowList` pattern: asking is what opts in. The two ops are new in the
+`SHELL` block; an older server refuses `SetOverview` as an unknown op,
+which is the right answer from a server with no overview.
 
 ## Data transfer (caps `DATA`)
 
@@ -2773,6 +2823,10 @@ to.
   new capability bit is needed: an older server refuses them as unknown
   ops, which is the right answer for a server that cannot lock. `VERSION`
   stays **1**.
+* `SetOverview` (`0x040e`) and `OverviewState` (`0x8409`) join the shell
+  block for overview mode (#3789). No capability bit: the answer goes
+  only to a connection that sent the question (see `OverviewState`).
+  `VERSION` stays **1**.
 * M3-B also **removes a compositor chord**: `Super+Return` was reserved
   for "the launcher" in M3-A and is now bindable through `BindKey`,
   because the launcher exists and binds it. Nothing on the wire changed —

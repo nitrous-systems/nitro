@@ -107,6 +107,23 @@ fn super_tap(h: &mut Harness<Launcher>) {
     h.settle();
 }
 
+/// Whether the query field has the keyboard.
+fn query_focused(h: &mut Harness<Launcher>) -> bool {
+    let id = named(h, names::QUERY);
+    id.is_some() && h.ui().focused() == id
+}
+
+/// Evdev keycode of the space bar.
+const KEY_SPACE: u32 = 57;
+
+/// `Super+Space`: the chord trigger.
+fn super_space(h: &mut Harness<Launcher>) {
+    h.key_down(KEY_LEFTMETA);
+    h.key(KEY_SPACE);
+    h.key_up(KEY_LEFTMETA);
+    h.settle();
+}
+
 /// Open an ordinary client window on the harness's **wire** socket.
 ///
 /// A real second client, so the focus it takes is the focus a desktop
@@ -179,9 +196,13 @@ fn a_bare_super_tap_shows_the_launcher_and_a_second_hides_it() {
     until(&mut h, "the launcher to show", |h| h.state().is_visible());
     assert_eq!(h.state().shows(), 1);
     assert_eq!(h.server().stat("grabbed"), 1, "and it took the keyboard");
+    // The tap opens the **overview**, and the launcher is its search field
+    // (#3789): the server entered it, and the show was its answer.
+    assert_eq!(h.server().stat("overview"), 1, "the server is in overview");
 
     super_tap(&mut h);
     until(&mut h, "the launcher to hide", |h| !h.state().is_visible());
+    assert_eq!(h.server().stat("overview"), 0, "and the second tap left it");
 
     // The grab goes with the window — the server drops a grab whose
     // window stops **showing**, so hiding is a complete release and the
@@ -232,11 +253,16 @@ fn the_grab_is_what_delivers_keys_and_hiding_gives_it_back() {
 
     // And the focused window never saw it: a global overlay that also
     // leaked keystrokes into the window behind it would be a keylogger.
+    // Escape is a ladder: the first clears the query, the second leaves.
+    h.key(key::ESC);
+    h.settle();
+    assert_eq!(h.state().query(), "", "the first Escape cleared the query");
+    assert!(h.state().is_visible(), "and did not leave");
     h.key(key::ESC);
     until(&mut h, "the hide", |h| !h.state().is_visible());
     h.key(48); // b
     h.settle();
-    assert_eq!(h.state().query(), "c", "a hidden launcher receives nothing");
+    assert_eq!(h.state().query(), "", "a hidden launcher receives nothing");
     assert_eq!(h.server().stat("grabbed"), 0, "and the grab went with it");
 
     drop(conn);
@@ -1475,5 +1501,127 @@ fn a_launched_process_is_reaped_the_moment_it_exits() {
         "and no hook is left watching a descriptor that is readable for ever"
     );
 
+    h.quit();
+}
+
+// ------------------------------------------------------------ the overview
+
+#[test]
+fn super_space_opens_the_overview_with_the_query_focused() {
+    let (mut h, dir) = harness();
+    super_space(&mut h);
+    until(&mut h, "the show", |h| h.state().is_visible());
+    assert_eq!(h.server().stat("overview"), 1);
+    assert!(query_focused(&mut h), "the chord focuses the field");
+    h.key(46); // c
+    h.settle();
+    assert_eq!(h.state().query(), "c");
+
+    // A tap, by contrast, opens it unfocused.
+    super_space(&mut h);
+    until(&mut h, "the hide", |h| !h.state().is_visible());
+    super_tap(&mut h);
+    until(&mut h, "the tap's show", |h| h.state().is_visible());
+    assert!(!query_focused(&mut h), "a tap leaves it unfocused");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}
+
+#[test]
+fn after_a_tap_typing_engages_the_search() {
+    let (mut h, dir) = harness();
+    super_tap(&mut h);
+    until(&mut h, "the show", |h| h.state().is_visible());
+    assert!(!query_focused(&mut h));
+
+    for code in [46u32, 30] {
+        // c, a
+        h.key(code);
+    }
+    h.settle();
+    assert_eq!(h.state().query(), "ca", "the first key engaged the field");
+    assert!(query_focused(&mut h), "and focused it");
+    let id = named(&mut h, names::QUERY).expect("the field");
+    assert_eq!(h.widget::<TextField<Launcher>>(id).text(), "ca");
+    assert_eq!(h.state().match_names(), vec!["Calculator".to_owned()]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}
+
+#[test]
+fn escape_is_a_ladder_clear_then_leave() {
+    let (mut h, dir) = harness();
+    super_tap(&mut h);
+    until(&mut h, "the show", |h| h.state().is_visible());
+    h.key(46); // c
+    h.settle();
+    assert_eq!(h.state().query(), "c");
+
+    // Rung one: the query goes, the overview stays.
+    h.key(key::ESC);
+    h.settle();
+    assert_eq!(h.state().query(), "");
+    let id = named(&mut h, names::QUERY).expect("the field");
+    assert_eq!(h.widget::<TextField<Launcher>>(id).text(), "");
+    assert_eq!(h.state().match_count(), 3, "the whole list is back");
+    assert!(h.state().is_visible());
+    assert_eq!(h.server().stat("overview"), 1);
+
+    // Rung two: the overview goes.
+    h.key(key::ESC);
+    until(&mut h, "the hide", |h| !h.state().is_visible());
+    assert_eq!(h.server().stat("overview"), 0);
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}
+
+#[test]
+fn a_server_side_leave_hides_the_launcher() {
+    // The server is authoritative: an overview left by anything else — a
+    // thumbnail click, the lock, here the control request — takes the
+    // launcher with it.
+    let (mut h, dir) = harness();
+    super_tap(&mut h);
+    until(&mut h, "the show", |h| h.state().is_visible());
+    assert_eq!(h.server().request_line("overview off\n"), "ok");
+    until(&mut h, "the hide", |h| !h.state().is_visible());
+
+    // And a server-side enter shows it.
+    assert_eq!(h.server().request_line("overview on\n"), "ok");
+    until(&mut h, "the show", |h| h.state().is_visible());
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}
+
+#[test]
+fn a_launch_leaves_the_overview() {
+    let (mut h, dir) = harness();
+    super_tap(&mut h);
+    until(&mut h, "the show", |h| h.state().is_visible());
+    h.key(46); // c
+    h.key(key::ENTER);
+    until(&mut h, "the launch", |h| h.state().launches() == 1);
+    until(&mut h, "the hide", |h| !h.state().is_visible());
+    assert_eq!(h.server().stat("overview"), 0);
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}
+
+#[test]
+fn enter_after_a_tap_launches_without_engaging_the_field() {
+    // Nothing typed, nothing focused: Enter still launches the first row.
+    let (mut h, dir) = harness();
+    super_tap(&mut h);
+    until(&mut h, "the show", |h| h.state().is_visible());
+    h.key(key::ENTER);
+    until(&mut h, "the launch", |h| h.state().launches() == 1);
+    until(&mut h, "the hide", |h| !h.state().is_visible());
+
+    let _ = std::fs::remove_dir_all(&dir);
     h.quit();
 }

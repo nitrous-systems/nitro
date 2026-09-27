@@ -13,20 +13,20 @@ use nitro_wire::msg::{
     DestroyNode, DragDrop, DragEnter, DragFinished, DragLeave, DragMotion, Error as ErrorMsg, Fill,
     FinishDrag, Focus, FocusWindow, Frame, GrabKeyboard, Hello, HotKey, IconRefused, Key, Keymap,
     ListOutputs, Lock, MeasureText, Modifiers, OutputGone, OutputInfo, OutputWorkArea, Outputs,
-    OutputsEnd, PointerAxis, PointerButton, PointerEnter, PointerLeave, PointerMotion, PopupDone,
-    Presented, Reparent, RepositionPopup, RequestFrame, RequestSelection, SelectionData,
-    SelectionOffer, SelectionRequest, SendSelection, ServerMsg, SetAnchor, SetAppId, SetBorder,
-    SetBounds, SetClip, SetCorners, SetCursor, SetExclusiveZone, SetFill, SetIcon, SetImage,
-    SetLayer, SetOpacity, SetSelection, SetText, SetTransform, SetVisible, SetWindowLimits,
-    SetWindowState, SetWindowStateFor, SetWindowTitle, StartDrag, StartMove, StartResize,
-    TextMeasured, TextMetrics, Theme, Touch, UnbindKey, Unlock, Welcome, WindowGone, WindowInfo,
-    WindowList, WindowListEnd, WindowState,
+    OutputsEnd, OverviewState, PointerAxis, PointerButton, PointerEnter, PointerLeave,
+    PointerMotion, PopupDone, Presented, Reparent, RepositionPopup, RequestFrame, RequestSelection,
+    SelectionData, SelectionOffer, SelectionRequest, SendSelection, ServerMsg, SetAnchor, SetAppId,
+    SetBorder, SetBounds, SetClip, SetCorners, SetCursor, SetExclusiveZone, SetFill, SetIcon,
+    SetImage, SetLayer, SetOpacity, SetOverview, SetSelection, SetText, SetTransform, SetVisible,
+    SetWindowLimits, SetWindowState, SetWindowStateFor, SetWindowTitle, StartDrag, StartMove,
+    StartResize, TextMeasured, TextMetrics, Theme, Touch, UnbindKey, Unlock, Welcome, WindowGone,
+    WindowInfo, WindowList, WindowListEnd, WindowState,
 };
 use nitro_wire::types::{
     Align, AxisSource, BufferId, ButtonState, CursorPos, CursorShape, DataSource, DragAction, Edge,
-    ErrorCode, KeymapFormat, Layer, NodeId, NodeKind, PopupAnchor, PopupGravity, TouchPhase,
-    WindowRef, WindowState as WindowStateValue, anchor, caps, constraint_adjust, drag_actions,
-    format, mod_mask, popup_flags, resize_edges, window_flags,
+    ErrorCode, KeymapFormat, Layer, NodeId, NodeKind, OverviewRequest, PopupAnchor, PopupGravity,
+    TouchPhase, WindowRef, WindowState as WindowStateValue, anchor, caps, constraint_adjust,
+    drag_actions, format, mod_mask, popup_flags, resize_edges, window_flags,
 };
 use nitro_wire::{DecodeError, VERSION, header};
 
@@ -330,6 +330,14 @@ fn client_messages() -> Vec<ClientMsg> {
             state: WindowStateValue::Minimized,
         }
         .into(),
+        SetOverview {
+            request: OverviewRequest::Watch,
+        }
+        .into(),
+        SetOverview {
+            request: OverviewRequest::Toggle,
+        }
+        .into(),
         // M5-A (#3767).
         ClientCaps {
             caps: caps::POPUP | caps::DATA | caps::KEYMAP,
@@ -621,6 +629,16 @@ fn server_messages() -> Vec<ServerMsg> {
         WindowListEnd.into(),
         WindowGone {
             window: WindowRef(0x00de_0002),
+        }
+        .into(),
+        OverviewState {
+            active: true,
+            output: 2,
+        }
+        .into(),
+        OverviewState {
+            active: false,
+            output: 0,
         }
         .into(),
         OutputInfo {
@@ -1235,6 +1253,38 @@ fn payload_layouts_are_frozen() {
     }
 
     let mut w = Writer::new();
+    ClientMsg::from(SetOverview {
+        request: OverviewRequest::Enter,
+    })
+    .encode(&mut w)
+    .unwrap();
+    assert_eq!(
+        w.bytes(),
+        &[
+            // header: len=1, op=0x040e, fds=0, flags=0
+            0x01, 0x00, 0x00, 0x00, 0x0e, 0x04, 0x00, 0x00, //
+            0x02, // request Enter
+        ]
+    );
+
+    let mut w = Writer::new();
+    ServerMsg::from(OverviewState {
+        active: true,
+        output: 0x0102_0304,
+    })
+    .encode(&mut w)
+    .unwrap();
+    assert_eq!(
+        w.bytes(),
+        &[
+            // header: len=5, op=0x8409, fds=0, flags=0
+            0x05, 0x00, 0x00, 0x00, 0x09, 0x84, 0x00, 0x00, //
+            0x01, // active
+            0x04, 0x03, 0x02, 0x01, // output
+        ]
+    );
+
+    let mut w = Writer::new();
     ServerMsg::from(HotKey {
         id: 0x0102_0304,
         pressed: true,
@@ -1827,6 +1877,7 @@ fn the_shell_ops_live_in_their_own_block() {
         Outputs::OP,
         Lock::OP,
         Unlock::OP,
+        SetOverview::OP,
     ] {
         assert_eq!(op & 0xff00, 0x0400, "client shell op {op:#06x}");
         assert!(ClientMsg::is_op(op));
@@ -1841,11 +1892,35 @@ fn the_shell_ops_live_in_their_own_block() {
         OutputsEnd::OP,
         OutputGone::OP,
         OutputWorkArea::OP,
+        OverviewState::OP,
     ] {
         assert_eq!(op & 0xff00, 0x8400, "server shell op {op:#06x}");
         assert!(ServerMsg::is_op(op));
         assert!(!ClientMsg::is_op(op));
     }
+}
+
+#[test]
+fn the_overview_ops_are_where_the_doc_says() {
+    assert_eq!(SetOverview::OP, 0x040e);
+    assert_eq!(OverviewState::OP, 0x8409);
+    // An `OverviewRequest` past `Toggle` is a decode error, not a guess.
+    let mut q = FdQueue::new();
+    assert_eq!(
+        ClientMsg::decode(SetOverview::OP, &[4], &mut q),
+        Err(DecodeError::BadValue)
+    );
+    assert_eq!(
+        ClientMsg::decode(SetOverview::OP, &[3], &mut q),
+        Ok(ClientMsg::SetOverview(SetOverview {
+            request: OverviewRequest::Toggle
+        }))
+    );
+    // `active` is a bool: 2 is not one.
+    assert_eq!(
+        ServerMsg::decode(OverviewState::OP, &[2, 0, 0, 0, 0], &mut q),
+        Err(DecodeError::BadValue)
+    );
 }
 
 #[test]

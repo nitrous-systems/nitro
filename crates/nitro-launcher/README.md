@@ -1,7 +1,9 @@
 # nitro-launcher
 
-The desktop's **application launcher**: a Super-tap overlay that searches
-`.desktop` files and starts what you pick.
+The desktop's **application launcher**, and since #3789 the **overview's
+search field**: the overlay that comes up with the overview (a bare-Super
+tap, `Super+Space`, the bar's button), searches `.desktop` files and
+starts what you pick. Search replacing the overview's grid is #3790.
 
 ```text
                    ┌────────────────────────────────┐
@@ -48,6 +50,16 @@ did *not* happen, which a client cannot see. The same binding closes the
 launcher, which is precisely why a keyboard grab deliberately does not
 outrank the bindings.
 
+**The overview is the server's.** A trigger does not show the launcher: it
+sends `SetOverview(Toggle)`, a request. The server enters or leaves the
+overview and answers with `OverviewState`, pushed too whenever anything
+else changes it (a thumbnail click, the lock, the bar's button). That
+answer is the only thing that shows or hides the launcher on the shell
+socket; without one, it falls back to showing and hiding itself. A tap
+opens the field unfocused and the first printable key engages it;
+`Super+Space` opens it focused. `docs/shell.md` §The overview has the
+model.
+
 **Keys arrive through the grab, not through focus.** The overlay is
 `NO_FOCUS`: taking focus would make the window behind it look inactive
 and would move the MRU order. `the_grab_is_what_delivers_keys_and_hiding_gives_it_back`
@@ -56,8 +68,11 @@ opens a second, ordinary client to hold the focus, so the test can tell
 
 ## What closes it
 
-Escape, a second Super tap (or `Super+Space`), a successful launch, and
-**another window taking focus**.
+Escape on an empty query (Escape on a non-empty one clears it first — a
+two-rung ladder), a second Super tap (or `Super+Space`), a successful
+launch, **another window taking focus**, and anything else that leaves the
+overview server-side. Each of the launcher's own sends `SetOverview(Leave)`
+and hides on the answer.
 
 That last one is the spec's "focus-loss hides it", and it has to be
 written backwards: a `NO_FOCUS` overlay cannot *lose* focus, because it

@@ -1003,6 +1003,19 @@ struct Server {
     window_watchers: Vec<u64>,
     /// Shell clients subscribed to output hotplug, by token.
     output_watchers: Vec<u64>,
+    /// Shell clients subscribed to overview state, by token: every
+    /// connection that has sent a `SetOverview`.
+    overview_watchers: Vec<u64>,
+    /// The overview state the watchers were last told: the output in
+    /// overview, or `None`. `announce_overview` compares against it, which
+    /// is what makes a relayout (leave + enter on one output) say nothing.
+    overview_announced: Option<SceneOutputId>,
+    /// `SetOverview`s received this wakeup, by token, waiting for
+    /// `settle`: entering dismisses popups and sends to other clients,
+    /// the `pending_drag_starts` trap.
+    pending_overview: Vec<(u64, nitro_wire::types::OverviewRequest)>,
+    /// `SetOverview`s applied, cumulative. `stats`.
+    overview_requests: u64,
     /// The window holding an explicit keyboard grab: every key goes there
     /// instead of to the focused window. See
     /// [`GrabKeyboard`](nitro_wire::msg::GrabKeyboard).
@@ -1316,6 +1329,10 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         dnd_cancels: 0,
         window_watchers: Vec::new(),
         output_watchers: Vec::new(),
+        overview_watchers: Vec::new(),
+        overview_announced: None,
+        pending_overview: Vec::new(),
+        overview_requests: 0,
         grab: None,
         hotkey_pending: None,
         keys_withheld: 0,
@@ -1415,6 +1432,7 @@ fn is_shell_op(msg: &ClientMsg) -> bool {
             | ClientMsg::Outputs(_)
             | ClientMsg::Lock(_)
             | ClientMsg::Unlock(_)
+            | ClientMsg::SetOverview(_)
     )
 }
 
@@ -2356,6 +2374,19 @@ impl Server {
         for (token, start) in std::mem::take(&mut self.pending_drag_starts) {
             self.start_dnd(token, start);
         }
+        // Overview requests, for the same reason: entering dismisses
+        // popups (a `PopupDone` to their owner) and moves pointer focus.
+        // Each one is answered as it is applied, so a requester always
+        // hears what its own request did.
+        for (token, request) in std::mem::take(&mut self.pending_overview) {
+            self.apply_overview_request(request);
+            self.announce_overview(Some(token));
+        }
+        // Whatever else changed overview state this wakeup — a scrim
+        // click, the lock, a hotplug, a WM hotkey, the control request —
+        // is announced here, once. After every leave and enter of the
+        // wakeup, so a relayout's leave + enter nets out to nothing.
+        self.announce_overview(None);
         // The same deferral for `PopupDone`: dismissal can run with the
         // owning client out of the map. Drained before the update, so the
         // unmap is already recorded when the client hears (unmap, then
@@ -5954,6 +5985,8 @@ impl Server {
             "overview_thumbs",
             self.wm.overview().map_or(0, |o| o.thumbs.len()) as u64,
         ));
+        pairs.push(("overview_requests", self.overview_requests));
+        pairs.push(("overview_watchers", self.overview_watchers.len() as u64));
         pairs.push(("focused", u64::from(self.focus.is_some())));
         // The shell's view. `shell_clients` counts connections on the
         // privileged socket, which is the number to look at when a bar is
@@ -6772,6 +6805,15 @@ impl Server {
             }
             ClientMsg::Lock(_) => self.shell_lock(token),
             ClientMsg::Unlock(_) => self.shell_unlock(token),
+            // Subscribes on receipt; applied (and answered) at `settle`,
+            // see `pending_overview`.
+            ClientMsg::SetOverview(m) => {
+                if !self.overview_watchers.contains(&token) {
+                    self.overview_watchers.push(token);
+                }
+                self.pending_overview.push((token, m.request));
+                true
+            }
             // The four that name the sender's *own* window are buffered and
             // applied at its `Commit`, by `Server::apply_shell_op`: a bar
             // sends `CreateWindow` and `SetAnchor` in one transaction, so an
@@ -7758,6 +7800,8 @@ impl Server {
         }
         self.window_watchers.retain(|t| *t != token);
         self.output_watchers.retain(|t| *t != token);
+        self.overview_watchers.retain(|t| *t != token);
+        self.pending_overview.retain(|(t, _)| *t != token);
         // The clipboard: requests this client owed are answered at EOF so
         // their requesters see an end rather than a hang, and a selection
         // it owned is cleared for everyone. After `wire_clients.remove`, so
@@ -9139,8 +9183,64 @@ impl Server {
         true
     }
 
-    /// The `overview` control request: the test and debug way in, until
-    /// the triggers (#3789) exist.
+    /// Apply one shell `SetOverview`. The server is authoritative: this
+    /// is a request, and whatever it did is what `announce_overview`
+    /// then reports. `Enter` opens on the output under the pointer, else
+    /// the primary one, and is refused while locked (`enter_overview`
+    /// refuses it).
+    fn apply_overview_request(&mut self, request: nitro_wire::types::OverviewRequest) {
+        use nitro_wire::types::OverviewRequest as R;
+        self.overview_requests += 1;
+        let target = self.pointer.output.or_else(|| self.primary_output());
+        let active = self.overview_output();
+        match request {
+            R::Watch => {}
+            R::Leave => self.leave_overview(None),
+            R::Enter => {
+                if let Some(out) = target
+                    && active != Some(out)
+                {
+                    self.enter_overview(out);
+                }
+            }
+            R::Toggle => {
+                if active.is_some() {
+                    self.leave_overview(None);
+                } else if let Some(out) = target {
+                    self.enter_overview(out);
+                }
+            }
+        }
+    }
+
+    /// Tell the overview watchers what changed. When the state differs
+    /// from the last one announced every watcher hears it; otherwise only
+    /// `requester` does, because every `SetOverview` gets an answer.
+    fn announce_overview(&mut self, requester: Option<u64>) {
+        let now = self.overview_output();
+        let state = ServerMsg::OverviewState(msg::OverviewState {
+            active: now.is_some(),
+            output: now.map_or(0, |o| o.0),
+        });
+        let to: Vec<u64> = if now == self.overview_announced {
+            requester
+                .filter(|t| self.overview_watchers.contains(t))
+                .into_iter()
+                .collect()
+        } else {
+            self.overview_announced = now;
+            self.overview_watchers.clone()
+        };
+        for token in to {
+            if let Some(client) = self.wire_clients.get_mut(&token) {
+                client.send(&state);
+            }
+        }
+    }
+
+    /// The `overview` control request: the test and debug way in. The
+    /// shell's is `SetOverview`; both end at `settle`, which announces
+    /// the change to the shell's watchers.
     fn overview_request(&mut self, on: bool, output: Option<&str>) -> Vec<u8> {
         if on {
             let id = match self.shot_output(output) {
@@ -9336,6 +9436,10 @@ mod tests {
             msg::Outputs.into(),
             msg::Lock.into(),
             msg::Unlock.into(),
+            msg::SetOverview {
+                request: nitro_wire::types::OverviewRequest::Toggle,
+            }
+            .into(),
             msg::FocusWindow {
                 window: WindowRef(1),
             }

@@ -629,6 +629,26 @@ tag_enum! {
     }
 }
 
+tag_enum! {
+    /// What a [`SetOverview`](crate::msg::SetOverview) asks of overview
+    /// mode.
+    ///
+    /// Every value is a **request**: the server decides, and answers with
+    /// an [`OverviewState`](crate::msg::OverviewState) saying what it did.
+    /// `Toggle` is resolved server-side, so the tap, the bar's button and
+    /// `Super+Space` can race without either end holding a stale bool.
+    OverviewRequest: u8 {
+        /// Change nothing: just answer, and subscribe.
+        Watch = 0,
+        /// Leave overview mode (a no-op when it is not up).
+        Leave = 1,
+        /// Enter overview mode on the output under the pointer.
+        Enter = 2,
+        /// Leave if it is up anywhere, else enter.
+        Toggle = 3,
+    }
+}
+
 /// Constraint adjustments for [`CreatePopup`](crate::msg::CreatePopup):
 /// what the server may do when the popup does not fit on its output.
 ///
@@ -782,6 +802,8 @@ mod tests {
         assert_eq!(KeymapFormat::from_raw(0), Err(DecodeError::BadValue));
         assert_eq!(DataSource::from_raw(1), Ok(DataSource::Drag));
         assert_eq!(DataSource::from_raw(2), Err(DecodeError::BadValue));
+        assert_eq!(OverviewRequest::from_raw(3), Ok(OverviewRequest::Toggle));
+        assert_eq!(OverviewRequest::from_raw(4), Err(DecodeError::BadValue));
     }
 
     #[test]

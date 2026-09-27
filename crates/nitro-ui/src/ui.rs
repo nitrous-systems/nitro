@@ -2907,6 +2907,15 @@ impl<S: 'static> Ui<S> {
             ServerMsg::OutputsEnd(_) => {
                 self.dispatch_shell(state, &crate::shell::ShellEvent::OutputsEnd);
             }
+            ServerMsg::OverviewState(o) => {
+                self.dispatch_shell(
+                    state,
+                    &crate::shell::ShellEvent::Overview {
+                        active: o.active,
+                        output: o.output,
+                    },
+                );
+            }
             ServerMsg::HotKey(h) => {
                 self.dispatch_shell(
                     state,
@@ -3432,6 +3441,24 @@ impl<S: 'static> Ui<S> {
     pub fn bind_key(&mut self, id: u32, mods: u32, keysym: u32) -> Result<(), Error> {
         self.wire.send_now(&nitro_wire::msg::ClientMsg::BindKey(
             nitro_wire::msg::BindKey { id, mods, keysym },
+        ))
+    }
+
+    /// Ask the server to enter or leave overview mode, and subscribe to
+    /// its state.
+    ///
+    /// A **request**: the answer is a
+    /// [`ShellEvent::Overview`](crate::shell::ShellEvent::Overview), and
+    /// that is what a shell acts on — `Enter` while the session is locked
+    /// is answered `active: false`. `Toggle` is resolved server-side, so
+    /// two triggers racing cannot leave a stale bool here. Sent at once,
+    /// without a commit: it is not a scene mutation.
+    ///
+    /// # Errors
+    /// As [`Ui::window_list`].
+    pub fn set_overview(&mut self, request: crate::shell::OverviewRequest) -> Result<(), Error> {
+        self.wire.send_now(&nitro_wire::msg::ClientMsg::SetOverview(
+            nitro_wire::msg::SetOverview { request },
         ))
     }
 
