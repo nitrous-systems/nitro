@@ -357,7 +357,7 @@ impl<S: 'static> FilePicker<S> {
             p.model = Some(Box::new(model));
         }
         ui.on_window_closed(win, move |s: &mut S, ui: &mut Ui<S>| {
-            finish(s, ui, root, None)
+            finish(s, ui, root, None);
         });
         navigate(ui, root, start, false);
         if let Some(name) = ids.name {
