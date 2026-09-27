@@ -2599,25 +2599,41 @@ Frame budget: 60 Hz = 16667 µs, 120 Hz = 8335 µs.
 
 ```sh
 just bench                       # the whole matrix once at the box's current mode (~12 min, 54 runs plus a bandwidth probe)
-just bench '1920x1080@60\ 1920x1080@120\ 720p240' 6   # the three-rate sweep behind §9 (~17 min, 140 runs)
-just bench '1920x1080@60\ 720p240' 6                  # the two-arm sweep behind §7.10b (~11 min, 86 runs)
+just bench "1920x1080@60 1920x1080@120 720p240" 6   # the three-rate sweep behind §9 (~17 min, 140 runs)
+just bench "1920x1080@60 720p240" 6                 # the two-arm sweep behind §7.10b (~11 min, 86 runs)
 just bench-report                # tmp/bench/box.jsonl → the markdown above
 just bench-bandwidth box         # the box's memcpy rate: copy 3.43 GB/s (3.56 on the §7.10b sitting)
 ```
 
-**The backslashes are load-bearing and are not a typo.** A multi-word
-`--modes` argument written the obvious way — `just bench "60 120"` —
-**exits 2 with `unknown argument 120`**. `just` passes the string to
-`ssh` as one argv element, but ssh joins its argv with spaces into a
-single command string and the *remote* shell re-splits it, so every arm
-after the first arrives at `deploy/bench.sh` as a stray positional. The
-escaped space survives the second split. This section documented the
-double-quoted spelling from its first version and **that spelling has
-never worked**; the 140-run `1f35491` ledger reached the box some other
-way. Filed as **#618**, which owns the `justfile` fix and the other two
-doc sites; this line is corrected here because a command that exits 2 in
-a section headed "Reproducing" is the exact failure this document is
-about.
+**Those multi-arm lines did not work until #3843, and this section
+printed them anyway from its first version.** `just` passed the modes
+string to `ssh` as one argv element, correctly — but ssh does not
+preserve argv: it joins its remaining arguments with spaces into a single
+command string and hands that to the remote login shell, which splits it
+again. Every arm after the first therefore reached `deploy/bench.sh` as a
+stray positional, and its parser exited 2 with `unknown argument
+720p240`, running nothing. Single-arm invocations were unaffected, which
+is how it went unnoticed: the 140-run `1f35491` ledger is genuine, so
+that sweep reached the box some other way — someone ran the script on the
+box directly, or escaped the argument ad hoc — and the clean spelling was
+written into this section without being re-run.
+
+That is §11.1's genre aimed at a command instead of a test: **a reproduce
+line that was written down rather than executed.** The one command that
+re-derives the largest ledger in this document had never worked as
+printed.
+
+The recipe now quotes the string twice (`quote(quote(modes))` in
+`justfile`), one layer for each shell, so the obvious spelling above is
+also the correct one — no escaping, and the earlier `'…\ …'` workaround
+this section briefly carried is now *wrong* (the backslash survives into
+the arm name and that arm is refused). And the commands printed above are
+now **executed** by `crates/nitro-bench/tests/bench_recipe.rs`, which
+extracts every `just bench "…"` line from this file, `docs/testbox.md`
+and the `justfile` and runs each one through `just` against a stub `ssh`
+that reproduces the argv-join, asserting the arms arrive intact. A
+`deploy/bench.sh --dry-run` flag makes that a unit test rather than a
+twenty-minute box booking. Filed as **#618** / **#3843**.
 
 and, for one scenario at a time, on the box:
 

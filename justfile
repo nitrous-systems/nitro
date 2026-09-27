@@ -179,8 +179,19 @@ box-push:
 # the binaries are whatever `just deploy` last built: a sweep stamped
 # with the clone's sha names a tree that did not build what it measured.
 # (#3722 lost a run to exactly that.)
+#
+# The modes string is shell-quoted **twice** (`quote(quote(modes))`) on
+# purpose: ssh does not preserve argv, it joins its arguments into one
+# command string and hands that to the remote login shell, which splits
+# it again. One layer of quoting is eaten locally, the second by the
+# remote shell, so the multi-arm form arrives as a single `--modes`
+# argument. Simplify it back to `'{{modes}}'` and every arm after the
+# first becomes a stray positional and `deploy/bench.sh` exits 2 — which
+# is what #618/#3843 found, after the spelling below had been documented
+# and unrunnable since `c4f51f1`. `crates/nitro-bench/tests/bench_recipe.rs`
+# pins it.
 bench modes="" seconds="10":
-    ssh {{box}} 'NITRO_BENCH_SHA='"$(git rev-parse --short HEAD)"' bash -s' -- --seconds {{seconds}} {{ if modes == "" { "" } else { "--modes '" + modes + "'" } }} < deploy/bench.sh
+    ssh {{box}} 'NITRO_BENCH_SHA='"$(git rev-parse --short HEAD)"' bash -s' -- --seconds {{seconds}} {{ if modes == "" { "" } else { "--modes " + quote(quote(modes)) } }} < deploy/bench.sh
     mkdir -p tmp/bench
     ssh {{box}} 'cat ~/tmp/bench/*.jsonl' > tmp/bench/box.jsonl
     @echo "wrote tmp/bench/box.jsonl"

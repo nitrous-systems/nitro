@@ -73,14 +73,27 @@
 # Usage, on the box:
 #   deploy/bench.sh [--seconds N] [--out FILE]
 #                   [--modes "1920x1080@60 1920x1080@120 720p240"]
-#                   [--connector HDMI-A-1] [--quick]
+#                   [--connector HDMI-A-1] [--quick] [--dry-run]
+#
+# `--dry-run` parses the arguments, reports one line per arm, and exits
+# before any side effect: it touches no config, no unit, no ledger, and
+# does not need the box. It exists so the commands `docs/bench.md` §10
+# prints can be *executed* by a test rather than only written down —
+# `crates/nitro-bench/tests/bench_recipe.rs` runs them through `just`
+# against a stub `ssh` (#618, #3843).
 set -euo pipefail
+# `arm_spec` validates an arm name with `+([0-9])` before doing
+# arithmetic on it; without extglob that pattern is a literal and a
+# typo'd arm leaks a bash arithmetic error instead of this script's own
+# `REFUSING` line. Do not tidy this away.
+shopt -s extglob
 
 seconds=10
 out=""
 modes=""
 connector="HDMI-A-1"
 quick=0
+dry_run=0
 bin="${NITRO_BENCH_BIN:-$HOME/nitro-bin/nitro-bench}"
 
 while (($#)); do
@@ -90,7 +103,11 @@ while (($#)); do
     --modes) modes="$2"; shift 2 ;;
     --connector) connector="$2"; shift 2 ;;
     --quick) quick=1; seconds=3; shift ;;
-    -h | --help) sed -n '2,72p' "$0"; exit 0 ;;
+    --dry-run) dry_run=1; shift ;;
+    # The header, up to `set -euo pipefail`. A hard-coded line range was
+    # here and had already rotted past the Usage block; anything that
+    # counts lines rots again the next time this comment grows.
+    -h | --help) sed -n '2,/^set -euo/p' "$0" | head -n -1; exit 0 ;;
     *) echo "unknown argument $1" >&2; exit 2 ;;
     esac
 done
@@ -99,6 +116,77 @@ done
 export XDG_RUNTIME_DIR
 
 say() { printf '### %s\n' "$*" >&2; }
+
+# The one modeline this script knows, by nickname.
+#
+# CVT-RB 1280x720@240 = 279.75 MHz, inside HDMI 1.4's ~300 MHz TMDS
+# ceiling where 1080p@240's 606.5 MHz is not. #3718 set it, the kernel
+# took it, `outputs` reported `1280x720@239840 (custom)` — and the human
+# looked at the panel and said "720p 240hz!", which is the only
+# instrument that can answer that question (`just shot` reads the shadow
+# buffer and returns a perfect frame at a dark panel).
+#
+# CVT rounds the pixel clock down to a 0.25 MHz step, so the arm asks for
+# 240 and the hardware gives **239.840** — which the 0.5 Hz tolerance in
+# `set_mode` absorbs, and which is why that tolerance is a rule rather
+# than slack.
+MODELINE_720P240="279750 1280 1328 1360 1440 720 723 727 810 +hsync -vsync"
+
+# Expand an arm name into `WIDTH HEIGHT MHZ KIND VALUE`.
+#
+# `KIND` is `mode` or `modeline`, `VALUE` the text that goes after the
+# `=`. A bare number is 1080p at that rate, so `--modes "60 120"` — the
+# spelling in the justfile and in `docs/bench.md` §10 — keeps working.
+#
+# Defined this high up because `--dry-run` reports the arms and has to
+# exit above every side effect, `BINS_BEFORE` included.
+arm_spec() {
+    case "$1" in
+    720p240)
+        printf '1280 720 240000 modeline %s\n' "$MODELINE_720P240"
+        ;;
+    *x*@*)
+        local wh="${1%@*}" hz="${1#*@}"
+        # Validate before the arithmetic: `$((hz * 1000))` on a
+        # not-quite-numeric arm (`60\`, from the escaped spelling
+        # `docs/bench.md` used to print) aborts under `set -e` with a
+        # bash syntax error on stderr, which reads like a bug in this
+        # script rather than a bad arm name.
+        [[ $hz == +([0-9]) && $wh == +([0-9])x+([0-9]) ]] || return 1
+        printf '%s %s %s mode %s\n' "${wh%x*}" "${wh#*x}" "$((hz * 1000))" "$1"
+        ;;
+    '' | *[!0-9]*)
+        return 1
+        ;;
+    *)
+        printf '1920 1080 %s mode 1920x1080@%s\n' "$(($1 * 1000))" "$1"
+        ;;
+    esac
+}
+
+# Parse, report, touch nothing.
+#
+# Deliberately above `BINS_BEFORE` (which refuses off-box) and above the
+# `server.conf` backup, the `trap restore_conf`, the `mkdir -p` of the
+# ledger directory and every `systemctl` call: a dry run that left debris
+# would be useless as the cheap acceptance test it exists to be.
+if ((dry_run)); then
+    printf 'seconds=%s connector=%s quick=%s\n' "$seconds" "$connector" "$quick"
+    if [[ -z $modes ]]; then
+        echo 'arms: none (one matrix at the box current mode)'
+        exit 0
+    fi
+    dry_rc=0
+    for arm in $modes; do
+        if spec="$(arm_spec "$arm")"; then
+            printf 'arm %s -> %s\n' "$arm" "$spec"
+        else
+            printf 'arm %s -> REFUSED\n' "$arm"
+            dry_rc=2
+        fi
+    done
+    exit "$dry_rc"
+fi
 
 # The sha the ledger stamps on every row.
 #
@@ -271,44 +359,6 @@ bench() {
     # frames and a back-to-back start would read the previous scenario's
     # tail as its own baseline.
     sleep 1
-}
-
-# The one modeline this script knows, by nickname.
-#
-# CVT-RB 1280x720@240 = 279.75 MHz, inside HDMI 1.4's ~300 MHz TMDS
-# ceiling where 1080p@240's 606.5 MHz is not. #3718 set it, the kernel
-# took it, `outputs` reported `1280x720@239840 (custom)` — and the human
-# looked at the panel and said "720p 240hz!", which is the only
-# instrument that can answer that question (`just shot` reads the shadow
-# buffer and returns a perfect frame at a dark panel).
-#
-# CVT rounds the pixel clock down to a 0.25 MHz step, so the arm asks for
-# 240 and the hardware gives **239.840** — which the 0.5 Hz tolerance in
-# `set_mode` absorbs, and which is why that tolerance is a rule rather
-# than slack.
-MODELINE_720P240="279750 1280 1328 1360 1440 720 723 727 810 +hsync -vsync"
-
-# Expand an arm name into `WIDTH HEIGHT MHZ KIND VALUE`.
-#
-# `KIND` is `mode` or `modeline`, `VALUE` the text that goes after the
-# `=`. A bare number is 1080p at that rate, so `--modes "60 120"` — the
-# spelling in the justfile and in `docs/bench.md` §10 — keeps working.
-arm_spec() {
-    case "$1" in
-    720p240)
-        printf '1280 720 240000 modeline %s\n' "$MODELINE_720P240"
-        ;;
-    *x*@*)
-        local wh="${1%@*}" hz="${1#*@}"
-        printf '%s %s %s mode %s\n' "${wh%x*}" "${wh#*x}" "$((hz * 1000))" "$1"
-        ;;
-    '' | *[!0-9]*)
-        return 1
-        ;;
-    *)
-        printf '1920 1080 %s mode 1920x1080@%s\n' "$(($1 * 1000))" "$1"
-        ;;
-    esac
 }
 
 # Drop this connector's mode and modeline lines from the human's file.
