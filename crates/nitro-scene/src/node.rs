@@ -274,6 +274,10 @@ impl Dirty {
     /// Some descendant carries a flag; this node is only a waypoint on the
     /// path to it. Set by the scene, never by a mutation directly.
     pub const SUBTREE: Self = Self(32);
+    /// Part of an image node's buffer changed: only the sub-rects the scene
+    /// recorded for it (from `BufferDamage`) need repainting, not the whole
+    /// node. Subsumed by [`PAINT`](Self::PAINT) and by any geometry change.
+    pub const PARTIAL: Self = Self(64);
 
     /// Whether any of `other`'s flags are set.
     pub const fn any(self, other: Self) -> bool {

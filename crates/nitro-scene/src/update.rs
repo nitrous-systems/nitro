@@ -14,7 +14,7 @@ use nitro_core::{Damage, IRect, Rect, Transform};
 
 use crate::{
     Configure, NodeKey, OutputId, Scene, UpdateStats,
-    node::{DESCEND, Dirty},
+    node::{DESCEND, Dirty, NodeData},
 };
 
 /// Everything an [`update`](Scene::update) produced.
@@ -102,6 +102,9 @@ impl Scene {
     /// and visits nothing.
     pub fn update(&mut self, sink: &mut DamageSink<'_>) -> UpdateResult {
         self.stats = UpdateStats::default();
+        // Damage remembered for a later same-size swap only lives until the
+        // commit(s) it arrived with are drawn.
+        self.recent.clear();
 
         // Damage banked by mutations whose cached bounds were about to become
         // unreachable (a destroyed node, an unplaced or restacked window).
@@ -182,9 +185,17 @@ impl Scene {
         force: bool,
     ) -> IRect {
         self.stats.visited_nodes += 1;
+        let dirty = self.node_ref(key).dirty;
+        let self_changed = force || dirty.any(DESCEND.union(Dirty::PAINT).union(Dirty::PARTIAL));
+        // An entry exists exactly while the flag is set; taking it here (and
+        // in `clear_subtree`) means it never outlives the flag, whichever
+        // path below ends up damaging the node.
+        let partial = if dirty.any(Dirty::PARTIAL) {
+            self.partial.remove(&key)
+        } else {
+            None
+        };
         let node = self.node_ref(key);
-        let dirty = node.dirty;
-        let self_changed = force || dirty.any(DESCEND.union(Dirty::PAINT));
 
         let old_bounds = node.world_bounds;
         let old_painted = node.painted;
@@ -253,6 +264,35 @@ impl Scene {
                 sink.add_clipped(target.id, old_bounds, target.rect);
                 sink.add_clipped(target.id, world_bounds, target.rect);
                 self.stats.damaged_nodes += 1;
+            } else if paints && let Some(partial) = partial {
+                // Only part of the image's buffer changed. Nothing moved, so
+                // the old and new footprints agree and the damaged texels
+                // map to one device rect each — or, where the mapping is not
+                // a plain translate or integer scale, the whole node.
+                let node = self.node_ref(key);
+                let src = match node.data {
+                    NodeData::Image(Some(image)) => Some(image.src),
+                    _ => None,
+                };
+                let size = (node.bounds.w, node.bounds.h);
+                // All or nothing: one rect needing the fallback makes the
+                // whole node the damage, which covers the rest anyway.
+                let mapped: Option<Vec<IRect>> = src.and_then(|src| {
+                    partial
+                        .rects()
+                        .iter()
+                        .map(|r| partial_device_rect(&world_transform, size, src, *r))
+                        .collect()
+                });
+                match mapped {
+                    Some(rects) => {
+                        for d in rects {
+                            sink.add_clipped(target.id, d.intersect(&world_bounds), target.rect);
+                        }
+                    }
+                    None => sink.add_clipped(target.id, world_bounds, target.rect),
+                }
+                self.stats.damaged_nodes += 1;
             }
         }
 
@@ -293,6 +333,8 @@ impl Scene {
         while let Some(key) = scratch.pop() {
             let node = self.node_mut_ref(key);
             node.dirty = Dirty::NONE;
+            self.partial.remove(&key);
+            let node = self.node_mut_ref(key);
             node.world_bounds = IRect::EMPTY;
             node.subtree_bounds = IRect::EMPTY;
             node.painted = false;
@@ -329,4 +371,62 @@ pub(crate) fn device_rect(transform: &Transform, local: Rect) -> IRect {
         return IRect::EMPTY;
     }
     transform.apply_rect(&local).round_out()
+}
+
+/// How far a scale may be from an integer and a device origin from a whole
+/// pixel and still be treated as exact — the rasterizer's own tolerance for
+/// its 1:1 blit (`nitro-raster`'s `blit_impl`).
+const EXACT: f32 = 1e-4;
+
+/// Device-pixel rect covering the output of damaged buffer texels `rect` of
+/// an image node sampling `src` into a `size` box under `world`, or `None`
+/// when the mapping is too general to bound tightly (rotation, shear, a
+/// fractional or non-integer scale, a sub-pixel origin), in which case the
+/// caller damages the whole node.
+///
+/// At scale 1 on a whole-pixel origin the rasterizer copies texels 1:1, so
+/// the rect maps exactly. At an integer scale above 1 it samples bilinearly,
+/// so a destination pixel next to a damaged texel blends it in too: the
+/// source rect is widened by one texel on each side before mapping.
+pub(crate) fn partial_device_rect(
+    world: &Transform,
+    size: (f32, f32),
+    src: IRect,
+    rect: IRect,
+) -> Option<IRect> {
+    let rect = rect.intersect(&src);
+    if rect.is_empty() {
+        return Some(IRect::EMPTY);
+    }
+    if !world.is_axis_aligned() || src.w <= 0 || src.h <= 0 {
+        return None;
+    }
+    let sx = world.a * size.0 / src.w as f32;
+    let sy = world.d * size.1 / src.h as f32;
+    let integral = |v: f32| v.is_finite() && v >= 1.0 - EXACT && (v - v.round()).abs() < EXACT;
+    if !integral(sx) || !integral(sy) {
+        return None;
+    }
+    // The device origin of the node's box: whole pixels only.
+    let (ox, oy) = (world.e, world.f);
+    if !ox.is_finite() || !oy.is_finite() {
+        return None;
+    }
+    if (ox - ox.round()).abs() >= EXACT || (oy - oy.round()).abs() >= EXACT {
+        return None;
+    }
+    let (sx, sy) = (sx.round() as i32, sy.round() as i32);
+    let rect = if sx == 1 && sy == 1 {
+        rect
+    } else {
+        IRect::from_edges(rect.x - 1, rect.y - 1, rect.right() + 1, rect.bottom() + 1)
+            .intersect(&src)
+    };
+    let (ox, oy) = (ox.round() as i32, oy.round() as i32);
+    Some(IRect::from_edges(
+        ox + (rect.x - src.x) * sx,
+        oy + (rect.y - src.y) * sy,
+        ox + (rect.right() - src.x) * sx,
+        oy + (rect.bottom() - src.y) * sy,
+    ))
 }

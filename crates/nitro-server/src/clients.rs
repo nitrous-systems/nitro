@@ -843,8 +843,10 @@ fn apply_msg(
         ClientMsg::BufferDamage(m) => {
             let key = buffer_key(client, m.id)?;
             // The pixels are already there: the scene's buffer is a live
-            // mapping of the client's memfd, so the only work is marking
-            // the image nodes that sample the damaged rows for repaint.
+            // mapping of the client's memfd, so the only work is recording
+            // the damaged rects on the image nodes that sample them (and
+            // for a same-size `SetImage` swap in this commit) — the scene
+            // repaints just those sub-rects (docs/wire.md, `SetImage`).
             scene
                 .buffer_damaged(client.id, key, &m.rects)
                 .map_err(|e| scene_err("BufferDamage", e))

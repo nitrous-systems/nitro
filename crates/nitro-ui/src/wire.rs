@@ -961,6 +961,10 @@ impl Wire {
             self.set_bounds(node, rect)?;
         }
         if changed_image {
+            // No `BufferDamage` goes with this: every upload is a fresh
+            // buffer, never shown before, and the server repaints the whole
+            // node for those. Reusing a shown buffer of the same size here
+            // would need full-rect damage (docs/wire.md, `SetImage`).
             self.send(
                 &ClientMsg::SetImage(SetImage {
                     id: node,

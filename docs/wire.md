@@ -1267,8 +1267,10 @@ point. See `crates/nitro-shm/README.md` for the full argument and its
 residuals.
 
 The client keeps writing into the buffer and announces changes with
-`BufferDamage`, which is now purely "repaint the nodes that sample these
-rows": the server re-reads nothing, because it never had a copy.
+`BufferDamage`, which is now purely "repaint these pixels of the nodes
+that sample them": the server re-reads nothing, because it never had a
+copy. Damage is honoured per region, not per node — see
+[`BufferDamage`](#bufferdamage--0x0303).
 
 **The tearing contract.** Because the mapping is live, the bytes the server
 blits are whatever is in the buffer at the moment it paints. A client that
@@ -1296,6 +1298,18 @@ The server drops its mapping; the id may be reused after the next
 
 An empty vector means "nothing changed" and is legal.
 
+The server repaints only the damaged rects of each `Image` node sampling
+the buffer (the part inside its `src`, mapped to the screen), not the whole
+node. Where the node's mapping is not a plain translate or an integer scale
+— rotation, a fractional scale, a sub-pixel position, a `src` stretched to
+different bounds — it falls back to repainting the whole node. So the rects
+must cover **every** changed pixel: a pixel changed outside them may stay
+stale on screen until something else repaints it.
+
+Damage names the buffer, not a frame: rects sent for a buffer apply to every
+node showing it, and — until the next frame is drawn — also to a
+`SetImage` that swaps a node onto that buffer (see below).
+
 ### `SetImage` — 0x0304
 
 | field | type | meaning |
@@ -1303,6 +1317,23 @@ An empty vector means "nothing changed" and is legal.
 | `id` | `NodeId` | the `Image` node |
 | `buffer` | `BufferId` | `NONE` detaches |
 | `src` | `IRect` | source rectangle in buffer pixels |
+
+**Buffer swaps (the damage contract).** When `SetImage` replaces the node's
+buffer with *another* buffer of the same width, height and format (and
+opacity), sampled at the same `src`, and the new buffer has been shown by
+some `Image` node before, the server assumes the new buffer's content equals
+the old one's **outside the rects of the `BufferDamage` sent for the new
+buffer in the same commit** (before or after the `SetImage`; either order
+works). Only those rects are repainted — Wayland's `attach` + `damage`
+semantics, which is what a client cycling a ring of buffers (Chromium's
+three) relies on to repaint only what changed.
+
+Any other change repaints the whole node: a different size, format or
+`src`, detaching (`NONE`) or attaching to an empty node, or a buffer never
+shown before. A client that does not track damage across its buffers
+either uses a fresh buffer per frame or sends a full-rect `BufferDamage`
+with each swap. This is a clarification of existing semantics, not a new
+op; the protocol version is unchanged.
 
 ### `SetSelection` — 0x0305
 

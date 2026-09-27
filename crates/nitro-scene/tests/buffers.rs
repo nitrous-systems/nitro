@@ -694,3 +694,319 @@ fn a_destroyed_or_never_attached_buffer_is_not_released() {
     s.destroy_buffer(CLIENT, third).unwrap();
     assert!(released(&mut s).is_empty());
 }
+
+// ------------------------------------------------------ sub-rect damage
+
+/// A 64x64 image at `bounds` on a fresh buffer sampling all of it, settled.
+fn partial_setup(s: &mut Scene, parent: NodeKey, bounds: Rect) -> (NodeKey, BufferKey) {
+    let d = desc();
+    let buffer = s.create_buffer(CLIENT, d, vec![0; d.byte_len()]).unwrap();
+    let node = image_node(s, parent, buffer, bounds, d.full_rect());
+    settle(s);
+    (node, buffer)
+}
+
+#[test]
+fn buffer_damage_on_a_one_to_one_image_repaints_only_the_sub_rect() {
+    let mut s = scene();
+    let (_, root) = common::window_at(
+        &mut s,
+        nitro_core::Point::new(100.0, 50.0),
+        Size::new(400.0, 300.0),
+    );
+    let (_, buffer) = partial_setup(&mut s, root, Rect::new(10.0, 20.0, 64.0, 64.0));
+
+    s.buffer_damaged(CLIENT, buffer, &[IRect::new(5, 6, 3, 2)])
+        .unwrap();
+    let (dmg, stats) = update(&mut s);
+    assert_eq!(dmg.rects(), &[IRect::new(115, 76, 3, 2)]);
+    assert_eq!(stats.damaged_nodes, 1);
+    // Nothing stale is left for the next frame.
+    assert!(damage(&mut s).is_empty());
+}
+
+#[test]
+fn sub_rect_damage_follows_group_offsets_and_src_origin() {
+    let mut s = scene();
+    let (_, root) = window(&mut s);
+    let g = group(&mut s, root, Rect::new(30.0, 40.0, 200.0, 200.0));
+    let d = desc();
+    let buffer = s.create_buffer(CLIENT, d, vec![0; d.byte_len()]).unwrap();
+    // Samples the bottom-right quarter of the buffer.
+    image_node(
+        &mut s,
+        g,
+        buffer,
+        Rect::new(1.0, 2.0, 32.0, 32.0),
+        IRect::new(32, 32, 32, 32),
+    );
+    settle(&mut s);
+
+    // Partly outside src: clipped to it.
+    s.buffer_damaged(CLIENT, buffer, &[IRect::new(28, 30, 8, 8)])
+        .unwrap();
+    assert_eq!(damage(&mut s).rects(), &[IRect::new(31, 42, 4, 6)]);
+
+    // Wholly outside src: nothing at all.
+    s.buffer_damaged(CLIENT, buffer, &[IRect::new(0, 0, 16, 16)])
+        .unwrap();
+    let (dmg, stats) = update(&mut s);
+    assert!(dmg.is_empty());
+    assert_eq!(stats.visited_nodes, 0);
+}
+
+#[test]
+fn sub_rect_damage_is_clipped_like_the_node() {
+    let mut s = scene();
+    let (_, root) = window(&mut s);
+    let g = group(&mut s, root, Rect::new(0.0, 0.0, 40.0, 40.0));
+    s.set_clip(CLIENT, g, true).unwrap();
+    let (_, buffer) = partial_setup(&mut s, g, Rect::new(0.0, 0.0, 64.0, 64.0));
+
+    s.buffer_damaged(CLIENT, buffer, &[IRect::new(30, 30, 20, 20)])
+        .unwrap();
+    assert_eq!(damage(&mut s).rects(), &[IRect::new(30, 30, 10, 10)]);
+    s.buffer_damaged(CLIENT, buffer, &[IRect::new(50, 50, 4, 4)])
+        .unwrap();
+    assert!(damage(&mut s).is_empty());
+}
+
+#[test]
+fn an_integer_scale_maps_and_widens_by_one_texel() {
+    let mut s = Scene::new();
+    s.add_output(OUT, IRect::new(0, 0, 1600, 1200), 2.0);
+    let (_, root) = common::window_at(&mut s, nitro_core::Point::ZERO, Size::new(400.0, 300.0));
+    let (_, buffer) = partial_setup(&mut s, root, Rect::new(10.0, 10.0, 64.0, 64.0));
+
+    s.buffer_damaged(CLIENT, buffer, &[IRect::new(10, 10, 4, 4)])
+        .unwrap();
+    // Texels 9..15 (widened), at 2x from device origin 20.
+    assert_eq!(damage(&mut s).rects(), &[IRect::new(38, 38, 12, 12)]);
+
+    // At the edge the widening stops at src.
+    s.buffer_damaged(CLIENT, buffer, &[IRect::new(0, 0, 2, 2)])
+        .unwrap();
+    assert_eq!(damage(&mut s).rects(), &[IRect::new(20, 20, 6, 6)]);
+}
+
+#[test]
+fn awkward_mappings_fall_back_to_the_whole_node() {
+    let whole = |setup: &dyn Fn(&mut Scene, NodeKey) -> NodeKey| {
+        let mut s = scene();
+        let (_, root) = window(&mut s);
+        let parent = setup(&mut s, root);
+        let (node, buffer) = partial_setup(&mut s, parent, Rect::new(10.0, 10.0, 64.0, 64.0));
+        s.buffer_damaged(CLIENT, buffer, &[IRect::new(1, 1, 2, 2)])
+            .unwrap();
+        let dmg = damage(&mut s);
+        assert_eq!(dmg.bounds(), s.node(node).unwrap().world_bounds());
+        assert!(!dmg.is_empty());
+    };
+    // Fractional scale.
+    whole(&|s, root| {
+        let g = group(s, root, Rect::new(0.0, 0.0, 400.0, 300.0));
+        s.set_transform(CLIENT, g, Transform::scale(0.5, 0.5))
+            .unwrap();
+        g
+    });
+    whole(&|s, root| {
+        let g = group(s, root, Rect::new(0.0, 0.0, 400.0, 300.0));
+        s.set_transform(CLIENT, g, Transform::scale(1.5, 1.5))
+            .unwrap();
+        g
+    });
+    // Rotation (90°).
+    whole(&|s, root| {
+        let g = group(s, root, Rect::new(200.0, 0.0, 400.0, 300.0));
+        let rot = Transform {
+            a: 0.0,
+            b: 1.0,
+            c: -1.0,
+            d: 0.0,
+            e: 0.0,
+            f: 0.0,
+        };
+        s.set_transform(CLIENT, g, rot).unwrap();
+        g
+    });
+    // Sub-pixel translate.
+    whole(&|s, root| group(s, root, Rect::new(0.25, 0.0, 400.0, 300.0)));
+    // Image bounds that stretch the source.
+    let mut s = scene();
+    let (_, root) = window(&mut s);
+    let d = desc();
+    let buffer = s.create_buffer(CLIENT, d, vec![0; d.byte_len()]).unwrap();
+    image_node(
+        &mut s,
+        root,
+        buffer,
+        Rect::new(0.0, 0.0, 100.0, 64.0),
+        d.full_rect(),
+    );
+    settle(&mut s);
+    s.buffer_damaged(CLIENT, buffer, &[IRect::new(1, 1, 2, 2)])
+        .unwrap();
+    assert_eq!(damage(&mut s).rects(), &[IRect::new(0, 0, 100, 64)]);
+
+    // Fractional output scale (the overview's case in miniature).
+    let mut s = Scene::new();
+    s.add_output(OUT, IRect::new(0, 0, 1600, 1200), 1.5);
+    let (_, root) = common::window_at(&mut s, nitro_core::Point::ZERO, Size::new(400.0, 300.0));
+    let (node, buffer) = partial_setup(&mut s, root, Rect::new(10.0, 10.0, 64.0, 64.0));
+    s.buffer_damaged(CLIENT, buffer, &[IRect::new(1, 1, 2, 2)])
+        .unwrap();
+    assert_eq!(
+        damage(&mut s).bounds(),
+        s.node(node).unwrap().world_bounds()
+    );
+}
+
+/// An image on `a`, then swapped to `b` and back, so both have been shown.
+fn swapped_pair(s: &mut Scene) -> (NodeKey, BufferKey, BufferKey) {
+    let (_, image, a, b) = two_buffers(s);
+    s.set_image(CLIENT, image, Some(ImageRef::new(a, src())))
+        .unwrap();
+    s.set_image(CLIENT, image, Some(ImageRef::new(b, src())))
+        .unwrap();
+    s.set_image(CLIENT, image, Some(ImageRef::new(a, src())))
+        .unwrap();
+    settle(s);
+    (image, a, b)
+}
+
+#[test]
+fn a_same_size_swap_repaints_only_the_damage_sent_with_it() {
+    let mut s = scene();
+    let (image, a, b) = swapped_pair(&mut s);
+
+    // Swap alone: the client promises identical content.
+    s.set_image(CLIENT, image, Some(ImageRef::new(b, src())))
+        .unwrap();
+    assert!(damage(&mut s).is_empty());
+
+    // Swap, then damage (Chromium's order).
+    s.set_image(CLIENT, image, Some(ImageRef::new(a, src())))
+        .unwrap();
+    s.buffer_damaged(CLIENT, a, &[IRect::new(4, 4, 2, 2)])
+        .unwrap();
+    assert_eq!(damage(&mut s).rects(), &[IRect::new(4, 4, 2, 2)]);
+
+    // Damage, then swap, in one commit.
+    s.buffer_damaged(CLIENT, b, &[IRect::new(8, 8, 3, 3)])
+        .unwrap();
+    s.set_image(CLIENT, image, Some(ImageRef::new(b, src())))
+        .unwrap();
+    assert_eq!(damage(&mut s).rects(), &[IRect::new(8, 8, 3, 3)]);
+
+    // Damage remembered from an earlier, already drawn commit does not leak
+    // into a later swap.
+    s.buffer_damaged(CLIENT, a, &[IRect::new(20, 20, 2, 2)])
+        .unwrap();
+    settle(&mut s);
+    s.set_image(CLIENT, image, Some(ImageRef::new(a, src())))
+        .unwrap();
+    assert!(damage(&mut s).is_empty());
+}
+
+#[test]
+fn any_other_image_change_repaints_the_whole_node() {
+    let node_rect = IRect::new(0, 0, 32, 32);
+
+    // A never-shown buffer.
+    let mut s = scene();
+    let (_, image, a, b) = two_buffers(&mut s);
+    s.set_image(CLIENT, image, Some(ImageRef::new(a, src())))
+        .unwrap();
+    settle(&mut s);
+    s.set_image(CLIENT, image, Some(ImageRef::new(b, src())))
+        .unwrap();
+    s.buffer_damaged(CLIENT, b, &[IRect::new(0, 0, 1, 1)])
+        .unwrap();
+    assert_eq!(damage(&mut s).rects(), &[node_rect]);
+
+    // A src change.
+    let mut s = scene();
+    let (image, _, b) = swapped_pair(&mut s);
+    s.set_image(
+        CLIENT,
+        image,
+        Some(ImageRef::new(b, IRect::new(1, 0, 32, 32))),
+    )
+    .unwrap();
+    assert_eq!(damage(&mut s).rects(), &[node_rect]);
+
+    // Some -> None -> Some.
+    let mut s = scene();
+    let (image, _, b) = swapped_pair(&mut s);
+    s.set_image(CLIENT, image, None).unwrap();
+    assert_eq!(damage(&mut s).rects(), &[node_rect]);
+    s.set_image(CLIENT, image, Some(ImageRef::new(b, src())))
+        .unwrap();
+    assert_eq!(damage(&mut s).rects(), &[node_rect]);
+
+    // A size or format change, even to a buffer shown elsewhere.
+    for other in [
+        BufferDesc::new(48, 64, 48 * 4, 0x3458_5242),
+        BufferDesc::new(64, 64, 64 * 4, 0x3432_5241),
+        desc().with_opaque(true),
+    ] {
+        let mut s = scene();
+        let (root, image, a, _) = two_buffers(&mut s);
+        let c = s
+            .create_buffer(CLIENT, other, vec![0; other.byte_len()])
+            .unwrap();
+        image_node(&mut s, root, c, Rect::new(200.0, 0.0, 32.0, 32.0), src());
+        s.set_image(CLIENT, image, Some(ImageRef::new(a, src())))
+            .unwrap();
+        settle(&mut s);
+        s.set_image(CLIENT, image, Some(ImageRef::new(c, src())))
+            .unwrap();
+        assert_eq!(damage(&mut s).rects(), &[node_rect], "{other:?}");
+    }
+}
+
+#[test]
+fn partial_damage_merges_into_a_whole_node_change() {
+    let mut s = scene();
+    let (_, root) = window(&mut s);
+    let (node, buffer) = partial_setup(&mut s, root, Rect::new(0.0, 0.0, 64.0, 64.0));
+
+    // Damage then a move: old ∪ new, nothing narrower.
+    s.buffer_damaged(CLIENT, buffer, &[IRect::new(1, 1, 2, 2)])
+        .unwrap();
+    s.set_bounds(CLIENT, node, Rect::new(100.0, 0.0, 64.0, 64.0))
+        .unwrap();
+    let dmg = damage(&mut s);
+    assert!(dmg.intersects(&IRect::new(0, 0, 64, 64)));
+    assert_eq!(dmg.bounds(), IRect::new(0, 0, 164, 64));
+    assert!(damage(&mut s).is_empty(), "no stale partial damage");
+
+    // A whole repaint first, then partial damage: still whole.
+    s.set_opacity(CLIENT, node, 0.5).unwrap();
+    s.buffer_damaged(CLIENT, buffer, &[IRect::new(1, 1, 2, 2)])
+        .unwrap();
+    assert_eq!(damage(&mut s).rects(), &[IRect::new(100, 0, 64, 64)]);
+    assert!(damage(&mut s).is_empty());
+}
+
+#[test]
+fn partial_damage_on_an_unplaced_or_destroyed_node_goes_nowhere() {
+    let mut s = scene();
+    let (win, root) = window(&mut s);
+    let (node, buffer) = partial_setup(&mut s, root, Rect::new(0.0, 0.0, 64.0, 64.0));
+
+    s.buffer_damaged(CLIENT, buffer, &[IRect::new(1, 1, 2, 2)])
+        .unwrap();
+    s.place_window(win, None, nitro_core::Point::ZERO).unwrap();
+    settle(&mut s);
+    s.place_window(win, Some(OUT), nitro_core::Point::ZERO)
+        .unwrap();
+    // Coming back repaints the whole image, not a leftover sub-rect.
+    assert_eq!(damage(&mut s).rects(), &[IRect::new(0, 0, 64, 64)]);
+    assert!(damage(&mut s).is_empty());
+
+    s.buffer_damaged(CLIENT, buffer, &[IRect::new(1, 1, 2, 2)])
+        .unwrap();
+    s.destroy_node(CLIENT, node).unwrap();
+    assert_eq!(damage(&mut s).rects(), &[IRect::new(0, 0, 64, 64)]);
+}

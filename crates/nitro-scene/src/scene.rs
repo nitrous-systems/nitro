@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use nitro_core::{IRect, Point, Rect, Size, Transform};
+use nitro_core::{Damage, IRect, Point, Rect, Size, Transform};
 
 use crate::{
     Admit, Border, Buffer, BufferDesc, BufferKey, ClientId, Configure, Error, Fill, IconRef,
@@ -52,6 +52,16 @@ pub struct Scene {
     /// [`take_released_buffers`](Scene::take_released_buffers); filtered
     /// there, so re-attaches and destroys in the same batch are harmless.
     unreferenced: Vec<BufferKey>,
+    /// Sub-rect damage waiting on image nodes flagged [`Dirty::PARTIAL`],
+    /// in buffer pixels and already clipped to the node's `src`. Consumed
+    /// (and mapped to device pixels) by the next `update`; an entry exists
+    /// only while its node carries the flag.
+    pub(crate) partial: HashMap<NodeKey, Damage>,
+    /// Every `buffer_damaged` rect since the last `update`, per buffer, so a
+    /// same-size buffer swap can pick up damage that arrived *before* the
+    /// `SetImage` naming it in the same commit. A superset of what one
+    /// commit sent is harmless: it only repaints a little more.
+    pub(crate) recent: HashMap<BufferKey, Damage>,
 
     /// Window roots carrying dirt, deduplicated by `Node::queued`.
     pub(crate) dirty_roots: Vec<NodeKey>,
@@ -85,6 +95,8 @@ impl Scene {
             outputs: Vec::new(),
             buffer_users: HashMap::new(),
             unreferenced: Vec::new(),
+            partial: HashMap::new(),
+            recent: HashMap::new(),
 
             dirty_roots: Vec::new(),
             pending: Vec::new(),
@@ -1428,6 +1440,7 @@ impl Scene {
         }
         let old = slot.take();
         *slot = image;
+        let swap = self.same_size_swap(old, image);
         if let Some(old) = old
             && let Some(users) = self.buffer_users.get_mut(&old.buffer)
         {
@@ -1438,9 +1451,52 @@ impl Scene {
         }
         if let Some(image) = image {
             self.buffer_users.entry(image.buffer).or_default().push(key);
+            if let Some(buffer) = self.buffers.get_mut(image.buffer) {
+                buffer.shown = true;
+            }
         }
-        self.mark(key, Dirty::PAINT);
+        if swap {
+            // The client promises the new buffer matches the old one outside
+            // the rects it damages in this commit (`docs/wire.md`), so only
+            // those need repainting — whether they arrived before this call
+            // (`recent`) or arrive after it (`buffer_damaged` finds the node
+            // on its new buffer).
+            if let Some(image) = image
+                && let Some(recent) = self.recent.get(&image.buffer)
+            {
+                let rects: Vec<IRect> = recent.rects().to_vec();
+                self.mark_partial(key, image.src, &rects);
+            }
+        } else {
+            self.mark(key, Dirty::PAINT);
+        }
         Ok(())
+    }
+
+    /// Whether replacing `old` by `new` is a swap between two buffers of the
+    /// same shape, sampled at the same `src`, the new one shown before — the
+    /// case where the node's pixels change only where the client says so.
+    ///
+    /// Anything else (a size, format or `src` change, `None` ↔ `Some`, a
+    /// buffer never shown yet) has no previous frame to be relative to and
+    /// repaints the whole node.
+    fn same_size_swap(&self, old: Option<ImageRef>, new: Option<ImageRef>) -> bool {
+        let (Some(old), Some(new)) = (old, new) else {
+            return false;
+        };
+        if old.buffer == new.buffer || old.src != new.src {
+            return false;
+        }
+        let (Some(a), Some(b)) = (self.buffers.get(old.buffer), self.buffers.get(new.buffer))
+        else {
+            return false;
+        };
+        let (da, db) = (a.desc, b.desc);
+        b.shown
+            && da.w == db.w
+            && da.h == db.h
+            && da.format == db.format
+            && da.is_opaque() == db.is_opaque()
     }
 
     // --------------------------------------------------------------- buffers
@@ -1462,6 +1518,7 @@ impl Scene {
             desc,
             client,
             data: Box::new(data),
+            shown: false,
         }))
     }
 
@@ -1483,8 +1540,15 @@ impl Scene {
 
     /// Declare which parts of a buffer changed, in buffer pixels.
     ///
-    /// Every image node sampling an overlapping source rect is marked for
-    /// repaint; the rest of the tree is untouched.
+    /// Every image node sampling an overlapping source rect gets the
+    /// overlap as sub-rect damage: the next [`update`](Scene::update) maps it
+    /// into device pixels and repaints only that, falling back to the whole
+    /// node where the mapping is not a plain translate or integer scale. The
+    /// rest of the tree is untouched.
+    ///
+    /// The rects are also remembered until the next `update`, so a
+    /// [`set_image`](Scene::set_image) swapping to this buffer afterwards
+    /// in the same commit repaints just them.
     ///
     /// # Errors
     /// [`Error::StaleKey`], [`Error::NotOwner`].
@@ -1497,6 +1561,10 @@ impl Scene {
         let buffer = self.buffers.get(key).ok_or(Error::StaleKey)?;
         if !client.may_touch(buffer.client) {
             return Err(Error::NotOwner);
+        }
+        let recent = self.recent.entry(key).or_default();
+        for r in rects {
+            recent.add(*r);
         }
         let Some(users) = self.buffer_users.get(&key) else {
             return Ok(());
@@ -1514,9 +1582,7 @@ impl Scene {
             if image.buffer != key {
                 continue;
             }
-            if rects.iter().any(|r| r.intersects(&image.src)) {
-                self.mark(node_key, Dirty::PAINT);
-            }
+            self.mark_partial(node_key, image.src, rects);
         }
         self.scratch = scratch;
         self.prune_buffer_users(key);
@@ -1547,6 +1613,7 @@ impl Scene {
             }
         }
         self.buffers.remove(key);
+        self.recent.remove(&key);
         Ok(())
     }
 
@@ -1622,6 +1689,29 @@ impl Scene {
             }
             p.dirty.insert(Dirty::SUBTREE);
             cur = parent;
+        }
+    }
+
+    /// Record `rects` (buffer pixels) clipped to `src` as sub-rect damage on
+    /// an image node. A node already due a whole repaint needs nothing more;
+    /// rects missing `src` entirely do not dirty the node at all.
+    pub(crate) fn mark_partial(&mut self, key: NodeKey, src: IRect, rects: &[IRect]) {
+        let Some(node) = self.nodes.get(key) else {
+            return;
+        };
+        if node.dirty.any(Dirty::PAINT) {
+            return;
+        }
+        let mut any = false;
+        for r in rects {
+            let r = r.intersect(&src);
+            if !r.is_empty() {
+                self.partial.entry(key).or_default().add(r);
+                any = true;
+            }
+        }
+        if any {
+            self.mark(key, Dirty::PARTIAL);
         }
     }
 
@@ -1735,6 +1825,7 @@ impl Scene {
                     self.unreferenced.push(image.buffer);
                 }
             }
+            self.partial.remove(&k);
             self.nodes.remove(k);
         }
         scratch.clear();

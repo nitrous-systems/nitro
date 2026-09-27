@@ -136,6 +136,10 @@ pub struct Buffer {
     pub(crate) desc: BufferDesc,
     pub(crate) client: ClientId,
     pub(crate) data: Box<dyn PixelStore>,
+    /// Whether an image node has ever been pointed at this buffer. A buffer
+    /// that has never been shown has no "previous frame" its damage could
+    /// be relative to, so swapping to it repaints the whole node.
+    pub(crate) shown: bool,
 }
 
 impl Buffer {
