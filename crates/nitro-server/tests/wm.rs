@@ -933,6 +933,43 @@ fn alt_tab_walks_three_windows_in_mru_order() {
 }
 
 #[test]
+fn alt_tab_raises_the_window_while_alt_is_held() {
+    let mut h = Harness::start("alt-tab-raise", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("alt-tab-raise");
+    let a = make_window(&mut conn, &mut inbox, 1, "a", WIN, RED, 0, 1);
+    let b = make_window(&mut conn, &mut inbox, 3, "b", WIN, GREEN, 0, 2);
+    park(&mut h);
+    await_focus(&mut conn, &mut inbox, b.root, "the newest window has focus");
+
+    // `b` was created last, so it covers `a`'s content.
+    let (ax, ay) = a.content();
+    assert_eq!(rgb(h.shot().pixel(ax as u32, ay as u32)), to_rgb(GREEN));
+
+    // One Tab with Alt still held: `a` is focused *and* on top already,
+    // before Alt comes up.
+    h.key(KEY_LEFTALT, true);
+    h.key(KEY_TAB, true);
+    h.key(KEY_TAB, false);
+    h.settle();
+    park(&mut h);
+    await_focus(&mut conn, &mut inbox, a.root, "Alt+Tab with Alt held");
+    assert_eq!(
+        rgb(h.shot().pixel(ax as u32, ay as u32)),
+        to_rgb(RED),
+        "the cycled-to window is raised while Alt is held"
+    );
+
+    h.key(KEY_LEFTALT, false);
+    h.settle();
+    park(&mut h);
+    assert_eq!(rgb(h.shot().pixel(ax as u32, ay as u32)), to_rgb(RED));
+
+    drop(conn);
+    h.quit();
+}
+
+#[test]
 fn a_minimized_window_leaves_the_screen_but_not_the_alt_tab_order() {
     let mut h = Harness::start("minimize", OUT.0, OUT.1);
     let mut inbox = Inbox::default();

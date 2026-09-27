@@ -3953,8 +3953,10 @@ impl Server {
             return;
         }
         // Releasing Alt ends an `Alt+Tab` cycle: the window it landed on
-        // is raised and becomes the most recently used, so the *next*
-        // Alt+Tab starts from there.
+        // is already raised (each Tab raises), and now it becomes the most
+        // recently used, so the *next* Alt+Tab starts from there. The raise
+        // here is idempotent and kept for safety.
+
         if !pressed && keyboard::is_alt(resolved.keysym) && self.wm.cycling() {
             self.wm.end_cycle();
             if let Some(win) = self.focus {
@@ -4161,10 +4163,13 @@ impl Server {
         }
     }
 
-    /// Walk the MRU order one step. The focus moves at once — so the user
-    /// sees where they are — but the MRU list is only reordered when Alt
-    /// comes up, which is what makes repeated Tabs walk further back
-    /// instead of bouncing between two windows.
+    /// Walk the MRU order one step. The focus moves and the window is
+    /// raised at once — so the user sees where they are — but the MRU list
+    /// is only reordered when Alt comes up, which is what makes repeated
+    /// Tabs walk further back instead of bouncing between two windows.
+    /// Windows walked past stay raised in walk order; the pre-cycle
+    /// stacking is not restored.
+
     fn cycle_focus(&mut self, forward: bool) {
         let candidates = wm::cycle_candidates(&self.scene, self.wm.mru());
         let Some(win) = self.wm.cycle_next(&candidates, forward) else {
@@ -4179,7 +4184,11 @@ impl Server {
         {
             self.set_state(win, WindowState::Normal);
         }
+        if let Err(e) = self.scene.raise(win) {
+            warn!("raise: {e}");
+        }
         self.set_focus(Some(win));
+
     }
 
     /// Drop every scrap of window-management state a closed window left

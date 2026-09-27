@@ -651,11 +651,15 @@ back. A new window joins at the *back*: it exists but has never been used,
 so `Alt+Tab` reaches it last.
 
 `Alt+Tab` is a *cycle*, not a step. While `Alt` is held the focus moves
-but the MRU list is **not** reordered, so `Alt+Tab+Tab` reaches the third
-window rather than bouncing between two; the list is reordered and the
-window raised when `Alt` comes up. The first press of a cycle lands on the
+**and the window is raised** with each Tab, so the user sees where they
+are, but the MRU list is **not** reordered, so `Alt+Tab+Tab` reaches the
+third window rather than bouncing between two; only the MRU reorder waits
+for `Alt` to come up. The first press of a cycle lands on the
 second entry, which is what makes a single `Alt+Tab` a toggle between the
-last two windows.
+last two windows. Trade-off: windows walked past stay raised in walk order;
+the pre-cycle stacking is not restored (a centred switcher overlay would be
+the eventual answer to that).
+
 
 ## States
 
