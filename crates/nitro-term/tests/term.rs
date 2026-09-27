@@ -16,7 +16,7 @@
 use std::time::{Duration, Instant};
 
 use nitro_term::pty::Pty;
-use nitro_term::widget::{TermGrid, TermGridMut as _};
+use nitro_term::widget::{DEFAULT_FONT_SIZE, TermGrid, TermGridMut as _};
 use nitro_term::{GRID_NAME, TermApp};
 use nitro_ui::event::key;
 use nitro_ui::test::Harness;
@@ -34,6 +34,12 @@ const DEADLINE: Duration = Duration::from_secs(10);
 /// and a test about cell counts should not be a test about clipping.
 fn harness_running(argv: &[&str]) -> (Harness<TermApp>, WidgetId) {
     let pty = Pty::spawn_command(argv, 80, 24).expect("pty");
+    harness_for(TermApp::new(pty))
+}
+
+/// [`harness_running`] on an already-built app, for a test that needs
+/// to configure it (a config directory, say) first.
+fn harness_for(app: TermApp) -> (Harness<TermApp>, WidgetId) {
     // `term_theme()`, the same one `run()` passes: the window backdrop
     // *is* the terminal's default background, and the grid paints no
     // rect for a default-background run because of it. A harness on the
@@ -42,7 +48,7 @@ fn harness_running(argv: &[&str]) -> (Harness<TermApp>, WidgetId) {
     // shipped — a light backdrop under a dark palette.
     let mut h = Harness::with(
         "nitro-term",
-        TermApp::new(pty),
+        app,
         Some(Size::new(640.0, 400.0)),
         nitro_term::term_theme(&Palette::default()),
         nitro_term::build,
@@ -325,6 +331,106 @@ fn a_resize_reaches_the_shell() {
     type_text(&mut h, grid, "stty size\n");
     pump_until(&mut h, "the shell's window size", |h| {
         screen(h, grid).contains(&format!("{want_rows} {want_cols}"))
+    });
+    h.quit();
+}
+
+/// The grid's cols and rows.
+fn cells(h: &mut Harness<TermApp>, grid: WidgetId) -> (usize, usize) {
+    let g = h.widget::<TermGrid>(grid).term().grid();
+    (g.cols(), g.rows())
+}
+
+/// A unique scratch config directory under the target's temp dir.
+fn scratch_dir(name: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!("nitro-term-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    d
+}
+
+#[test]
+#[allow(clippy::float_cmp)] // exact by construction
+fn ctrl_plus_and_minus_change_the_font_and_the_cell_count() {
+    let (mut h, grid) = harness_shell();
+    let cell = h.widget::<TermGrid>(grid).cell_size();
+    assert!(cell.w > 0.0);
+    // A window 40×10 cells at the default font; zooming keeps the
+    // window and changes the count.
+    let window = Size::new(cell.w * 40.0, cell.h * 10.0);
+    h.configure(window);
+    assert_eq!(cells(&mut h, grid), (40, 10));
+    assert_eq!(h.widget::<TermGrid>(grid).font_size(), DEFAULT_FONT_SIZE);
+
+    // Ctrl-=: bigger font, bigger cell, fewer cells in the same window.
+    h.key_with(key::LEFT_CTRL, 13);
+    let g = h.widget::<TermGrid>(grid);
+    assert!(g.font_size() > DEFAULT_FONT_SIZE, "Ctrl-= zooms in");
+    let big = g.cell_size();
+    assert!(big.w > cell.w, "the cell grew: {big:?} vs {cell:?}");
+    let (cols, rows) = cells(&mut h, grid);
+    assert!(cols < 40, "fewer columns in the same window: {cols}");
+    assert_eq!(h.ui().window_size(), window, "the window kept its size");
+
+    // The child was told, through TIOCSWINSZ.
+    type_text(&mut h, grid, "stty size\n");
+    pump_until(&mut h, "the zoomed window size", |h| {
+        screen(h, grid).contains(&format!("{rows} {cols}"))
+    });
+
+    // Ctrl-- twice: below where it started.
+    h.key_with(key::LEFT_CTRL, 12);
+    h.key_with(key::LEFT_CTRL, 12);
+    assert!(h.widget::<TermGrid>(grid).font_size() < DEFAULT_FONT_SIZE);
+    assert!(cells(&mut h, grid).0 > 40, "more columns when smaller");
+
+    // Ctrl-0: back to the default, and the original count.
+    h.key_with(key::LEFT_CTRL, 11);
+    assert_eq!(h.widget::<TermGrid>(grid).font_size(), DEFAULT_FONT_SIZE);
+    assert_eq!(cells(&mut h, grid), (40, 10));
+    h.quit();
+}
+
+#[test]
+#[allow(clippy::float_cmp)] // exact by construction
+fn the_font_size_is_persisted() {
+    let dir = scratch_dir("font");
+    let pty = Pty::spawn_command(&["/bin/sh", "-c", "sleep 5"], 80, 24).expect("pty");
+    let (mut h, grid) = harness_for(TermApp::new(pty).with_config_dir(Some(dir.clone())));
+    h.key_with(key::LEFT_CTRL, 13);
+    let px = h.widget::<TermGrid>(grid).font_size();
+    assert_eq!(px, DEFAULT_FONT_SIZE + 1.0);
+    let text = std::fs::read_to_string(dir.join("term.conf")).expect("term.conf written");
+    assert!(text.contains("font_size=14"), "{text:?}");
+    assert_eq!(nitro_term::load_font_size(Some(&dir)), px);
+    h.quit();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[allow(clippy::float_cmp)] // exact by construction
+fn ctrl_shift_minus_still_reaches_the_pty() {
+    // Ctrl-_ (0x1f) is readline's undo; the zoom bindings must not take it.
+    let (mut h, grid) = harness_running(&[
+        "/bin/sh",
+        "-c",
+        "stty raw -echo; printf ready; dd bs=1 count=2 status=none | od -An -t u1",
+    ]);
+    pump_until(&mut h, "the byte dumper to be ready", |h| {
+        screen(h, grid).contains("ready")
+    });
+    h.key_down(key::LEFT_CTRL);
+    h.key_with(key::LEFT_SHIFT, 12);
+    h.key_up(key::LEFT_CTRL);
+    assert_eq!(
+        h.widget::<TermGrid>(grid).font_size(),
+        DEFAULT_FONT_SIZE,
+        "Ctrl-Shift-- does not zoom"
+    );
+    h.key(key::ENTER);
+    pump_until(&mut h, "od to print Ctrl-_", |h| {
+        let output = screen(h, grid);
+        let bytes = output.split_whitespace().collect::<Vec<_>>();
+        bytes.windows(2).any(|pair| pair == ["31", "13"])
     });
     h.quit();
 }

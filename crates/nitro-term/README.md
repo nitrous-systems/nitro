@@ -22,8 +22,17 @@ $ cargo run -p nitro-term -- --scrollback 50000
 
 `Ctrl+Shift+Q` quits — **not** `Ctrl+Q`, which is XON and belongs to the
 program inside. That is the general rule here: a terminal must not steal
-a chord its child might want, so the only two bindings it keeps for
-itself are that one and `Shift+PgUp`/`PgDn` for the scrollback.
+a chord its child might want, so the bindings it keeps for itself are
+that one, `Shift+PgUp`/`PgDn` for the scrollback, and font zoom.
+
+`Ctrl+=` (or `Ctrl++`, or keypad `+`) makes the font bigger, `Ctrl+-` (or
+keypad `-`) smaller, and `Ctrl+0` resets it to 13 px. None of these has a
+C0 meaning, so no program inside could have received them anyway;
+`Ctrl+Shift+-` (`Ctrl+_`, readline's undo) is deliberately left to the
+pty. The window keeps its size and the cell count follows, so the child
+gets a `SIGWINCH`. The size is remembered in
+`$XDG_CONFIG_HOME/nitro/term.conf` (`~/.config/nitro/term.conf`) as
+`font_size=N`.
 
 ## What it supports
 

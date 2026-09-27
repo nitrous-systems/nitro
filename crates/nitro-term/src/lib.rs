@@ -86,10 +86,11 @@ pub mod widget;
 
 use nitro_ui::build::StyleBuilder as _;
 use nitro_ui::event::{Handled, KeyEvent, mods};
-use nitro_ui::{App, ColorRole, Error, Palette, Size, Ui, WidgetId};
+use nitro_ui::{App, ColorRole, Error, Palette, Size, TextStyle, Ui, WidgetId};
+use std::path::{Path, PathBuf};
 
 use crate::pty::Pty;
-use crate::widget::{TermGrid, TermGridMut as _};
+use crate::widget::{DEFAULT_FONT_SIZE, TermGrid, TermGridMut as _, clamp_font_size};
 
 /// The name the app registers under, and so the first argument to `hey`.
 pub const APP_NAME: &str = "nitro-term";
@@ -126,6 +127,9 @@ pub struct TermApp {
     /// Frame callbacks served, ditto. The ratio of this to `bytes_read`
     /// is the claim the throughput number rests on.
     frames: u64,
+    /// Where `term.conf` lives, or `None` to persist nothing — the
+    /// tests' default, so a test run never writes to `$HOME`.
+    config_dir: Option<PathBuf>,
 }
 
 impl TermApp {
@@ -138,7 +142,16 @@ impl TermApp {
             buf: vec![0; 64 * 1024],
             bytes_read: 0,
             frames: 0,
+            config_dir: None,
         }
+    }
+
+    /// Persist settings (the font size) under `dir`; `None` persists
+    /// nothing.
+    #[must_use]
+    pub fn with_config_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.config_dir = dir;
+        self
     }
 
     /// Bytes read from the pty since start-up.
@@ -299,9 +312,18 @@ pub fn sync_size(state: &mut TermApp, ui: &mut Ui<TermApp>) {
 /// Never in practice: the only `attach` names an id built one line
 /// above, and a fresh id cannot be stale.
 pub fn build(ui: &mut Ui<TermApp>) -> WidgetId {
+    build_with_font(ui, DEFAULT_FONT_SIZE)
+}
+
+/// [`build`], with the grid's font at `px` logical pixels.
+///
+/// # Panics
+/// As [`build`]: never in practice.
+pub fn build_with_font(ui: &mut Ui<TermApp>, px: f32) -> WidgetId {
     let grid = ui.build(
         crate::widget::term_grid()
             .name(GRID_NAME)
+            .font_size(clamp_font_size(px))
             .cells(80, 24)
             .scrollback(default_scrollback())
             // The grid takes whatever size the server gives; the cell
@@ -326,9 +348,9 @@ pub fn grid_of(ui: &Ui<TermApp>) -> Option<WidgetId> {
 
 /// How many lines of scrollback, from `--scrollback N` or the default.
 ///
-/// Read from the command line rather than a config file because there is
-/// no config system yet and inventing one for a single integer would be
-/// the wrong order to do things in.
+/// Read from the command line. The only thing persisted in `term.conf`
+/// is the font size (see [`load_font_size`]), which is set by a key
+/// rather than typed.
 #[must_use]
 pub fn default_scrollback() -> usize {
     scrollback_from(std::env::args().skip(1))
@@ -357,6 +379,127 @@ pub fn scrollback_from(args: impl IntoIterator<Item = String>) -> usize {
 
 /// Lines of scrollback kept by default.
 pub const DEFAULT_SCROLLBACK: usize = 10_000;
+
+/// How far one Ctrl-+ or Ctrl-- moves the font, in logical pixels.
+pub const FONT_STEP: f32 = 1.0;
+
+/// The settings file, inside [`config_dir`].
+const CONF_FILE: &str = "term.conf";
+
+/// `$XDG_CONFIG_HOME/nitro` (absolute values only, as the spec asks),
+/// else `~/.config/nitro`. The same directory `nitro-amp` uses.
+#[must_use]
+pub fn config_dir() -> Option<PathBuf> {
+    if let Some(d) = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from)
+        && d.is_absolute()
+    {
+        return Some(d.join("nitro"));
+    }
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config").join("nitro"))
+}
+
+/// The `font_size=` value in a `term.conf`, clamped, if there is a
+/// usable one. Blank lines and `#` comments are ignored; the last
+/// `font_size` line wins.
+#[must_use]
+pub fn parse_font_size(text: &str) -> Option<f32> {
+    let mut found = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        if k.trim() != "font_size" {
+            continue;
+        }
+        if let Ok(px) = v.trim().parse::<f32>()
+            && px.is_finite()
+        {
+            found = Some(clamp_font_size(px));
+        }
+    }
+    found
+}
+
+/// The persisted font size under `dir`, or [`DEFAULT_FONT_SIZE`] when
+/// there is none (no directory, no file, or nothing usable in it).
+#[must_use]
+pub fn load_font_size(dir: Option<&Path>) -> f32 {
+    dir.and_then(|d| std::fs::read_to_string(d.join(CONF_FILE)).ok())
+        .and_then(|t| parse_font_size(&t))
+        .unwrap_or(DEFAULT_FONT_SIZE)
+}
+
+/// Write `px` to `term.conf` under `dir`. Best-effort: a terminal that
+/// cannot save its zoom level still zooms. Written to a temporary and
+/// renamed, so a crash never leaves a half-written file.
+fn save_font_size(dir: Option<&Path>, px: f32) {
+    let Some(dir) = dir else { return };
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let tmp = dir.join(format!("{CONF_FILE}.tmp"));
+    let body = format!("# nitro-term settings\nfont_size={px}\n");
+    if std::fs::write(&tmp, body).is_ok() && std::fs::rename(&tmp, dir.join(CONF_FILE)).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Change the grid's font to `px` (clamped), reflow the grid to the
+/// unchanged window, tell the child, and persist the size.
+///
+/// The window keeps its size and the cell count follows, as with a
+/// resize: `sync_size` sends `TIOCSWINSZ`, so the child gets `SIGWINCH`.
+pub fn set_font_size(state: &mut TermApp, ui: &mut Ui<TermApp>, px: f32) {
+    let Some(grid) = state.grid else { return };
+    let px = clamp_font_size(px);
+    let current = match ui.widget::<TermGrid>(grid) {
+        Ok(g) => g.font_size(),
+        Err(_) => return,
+    };
+    #[allow(clippy::float_cmp)]
+    if px == current {
+        return;
+    }
+    let cell = ui
+        .measure_text("M", &TextStyle::new("mono", px), 0.0)
+        .map_or(Size::ZERO, |m| {
+            Size::new(m.width.max(1.0), m.height.max(1.0))
+        });
+    if let Ok(mut g) = ui.widget_mut::<TermGrid>(grid) {
+        g.set_font(px, cell);
+    }
+    let _ = apply_limits(ui, grid);
+    sync_size(state, ui);
+    let _ = crate::widget::request_frame_if_dirty(ui, grid);
+    save_font_size(state.config_dir.as_deref(), px);
+}
+
+/// Move the font size by `delta` logical pixels.
+pub fn zoom(state: &mut TermApp, ui: &mut Ui<TermApp>, delta: f32) {
+    let Some(grid) = state.grid else { return };
+    let Ok(current) = ui.widget::<TermGrid>(grid).map(TermGrid::font_size) else {
+        return;
+    };
+    set_font_size(state, ui, current + delta);
+}
+
+/// Put the font back to [`DEFAULT_FONT_SIZE`].
+pub fn reset_zoom(state: &mut TermApp, ui: &mut Ui<TermApp>) {
+    set_font_size(state, ui, DEFAULT_FONT_SIZE);
+}
+
+/// Evdev key codes for the zoom chords the toolkit has no names for.
+mod code {
+    pub const KEY_0: u32 = 11;
+    pub const MINUS: u32 = 12;
+    pub const EQUAL: u32 = 13;
+    pub const KP_MINUS: u32 = 74;
+    pub const KP_PLUS: u32 = 78;
+}
 
 /// Install the hooks that make the app a terminal: the pty's descriptor,
 /// the frame callback, and the quit shortcut.
@@ -433,6 +576,20 @@ pub fn install(ui: &mut Ui<TermApp>, state: &mut TermApp, grid: WidgetId) -> Res
         nitro_ui::event::key::Q,
         |_s: &mut TermApp, ui: &mut Ui<TermApp>| ui.quit(),
     );
+    // Font zoom. These chords are safe to take from the pty because
+    // none has a C0 meaning — `keys::encode` maps Ctrl with `=`, `+`,
+    // `-`, `0` and the keypad to nothing, so the grid declines them and
+    // they reach the shortcut table. Ctrl-Shift-- (Ctrl-_ on US, 0x1f,
+    // undo in readline and emacs) *does* mean something and is
+    // deliberately not bound. Masks are exact, so only these match.
+    let zoom_in = |s: &mut TermApp, ui: &mut Ui<TermApp>| zoom(s, ui, FONT_STEP);
+    let zoom_out = |s: &mut TermApp, ui: &mut Ui<TermApp>| zoom(s, ui, -FONT_STEP);
+    ui.set_shortcut(mods::CTRL, code::EQUAL, zoom_in);
+    ui.set_shortcut(mods::CTRL | mods::SHIFT, code::EQUAL, zoom_in);
+    ui.set_shortcut(mods::CTRL, code::KP_PLUS, zoom_in);
+    ui.set_shortcut(mods::CTRL, code::MINUS, zoom_out);
+    ui.set_shortcut(mods::CTRL, code::KP_MINUS, zoom_out);
+    ui.set_shortcut(mods::CTRL, code::KEY_0, reset_zoom);
     // Keys the grid did not take still belong to the pty: the widget
     // only has focus once something has clicked or tabbed into it, and a
     // terminal whose first keystroke went nowhere would look broken.
@@ -470,7 +627,11 @@ pub fn run() -> Result<(), Error> {
              (Ctrl-C will not reach the foreground program). Install util-linux."
         );
     }
-    let mut state = TermApp::new(pty);
+    // The persisted font is read before the tree is built so the first
+    // measurement, the limits and the first size sync all see it.
+    let dir = config_dir();
+    let px = load_font_size(dir.as_deref());
+    let mut state = TermApp::new(pty).with_config_dir(dir);
     let mut ui = App::new(APP_NAME)?
         .title(APP_NAME)
         .size(Size::new(720.0, 420.0))
@@ -485,7 +646,7 @@ pub fn run() -> Result<(), Error> {
         // is exactly what a screenshot of a bare shell prompt showed on
         // the box.
         .theme(term_theme(&Palette::default()))
-        .build(build)?;
+        .build(move |ui| build_with_font(ui, px))?;
     let grid = grid_of(&ui).ok_or(Error::NoRoot)?;
     install(&mut ui, &mut state, grid)?;
     // The limits and the first size sync ride the first commit: a
@@ -571,5 +732,24 @@ mod tests {
         assert_eq!(of(&["--scrollback"]), DEFAULT_SCROLLBACK);
         // A flag elsewhere in the line is still found.
         assert_eq!(of(&["--other", "--scrollback", "7"]), 7);
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)] // exact by construction
+    fn the_font_size_is_read_from_term_conf() {
+        use crate::widget::{MAX_FONT_SIZE, MIN_FONT_SIZE};
+        assert_eq!(parse_font_size("font_size=15\n"), Some(15.0));
+        assert_eq!(
+            parse_font_size("# nitro-term settings\n  font_size = 14.5  \n"),
+            Some(14.5)
+        );
+        assert_eq!(parse_font_size("font_size=big"), None);
+        assert_eq!(parse_font_size("other=3\n"), None);
+        assert_eq!(parse_font_size(""), None);
+        assert_eq!(parse_font_size("font_size=NaN"), None);
+        assert_eq!(parse_font_size("font_size=inf"), None);
+        assert_eq!(parse_font_size("font_size=1"), Some(MIN_FONT_SIZE));
+        assert_eq!(parse_font_size("font_size=500"), Some(MAX_FONT_SIZE));
+        assert_eq!(load_font_size(None), DEFAULT_FONT_SIZE);
     }
 }

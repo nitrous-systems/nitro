@@ -98,6 +98,23 @@ fn cursor_slot(rows: usize) -> Slot {
 /// The default font size, in logical pixels.
 pub const DEFAULT_FONT_SIZE: f32 = 13.0;
 
+/// The smallest font size zooming out will reach, in logical pixels.
+pub const MIN_FONT_SIZE: f32 = 6.0;
+
+/// The largest font size zooming in will reach, in logical pixels.
+pub const MAX_FONT_SIZE: f32 = 48.0;
+
+/// `px` clamped to [`MIN_FONT_SIZE`]..=[`MAX_FONT_SIZE`]; a non-finite
+/// value is the default rather than a NaN that would poison every cell.
+#[must_use]
+pub fn clamp_font_size(px: f32) -> f32 {
+    if px.is_finite() {
+        px.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
+    } else {
+        DEFAULT_FONT_SIZE
+    }
+}
+
 /// The smallest grid the window may be resized to, in cells.
 pub const MIN_CELLS: (usize, usize) = (20, 5);
 
@@ -190,6 +207,12 @@ impl TermGrid {
     #[must_use]
     pub fn cell_size(&self) -> Size {
         self.cell
+    }
+
+    /// The font size, in logical pixels.
+    #[must_use]
+    pub fn font_size(&self) -> f32 {
+        self.style.size_px
     }
 
     /// The colour table.
@@ -674,6 +697,16 @@ pub trait TermGridMut {
 
     /// Replace the colour table.
     fn set_palette(&mut self, palette: Palette);
+
+    /// Change the font size to `px`, with `cell` the metric already
+    /// measured for it.
+    ///
+    /// The cell is passed in rather than left to the next `measure`
+    /// because the caller has to recompute the cell count in the same
+    /// turn; `measure` recomputes the identical value from the
+    /// toolkit's cache. A non-positive `cell` is ignored. Every row is
+    /// re-sent: every run's style and every rect changes.
+    fn set_font(&mut self, px: f32, cell: Size);
 }
 
 impl<S: 'static> TermGridMut for WidgetMut<'_, TermGrid, S> {
@@ -729,6 +762,15 @@ impl<S: 'static> TermGridMut for WidgetMut<'_, TermGrid, S> {
         self.palette = palette;
         self.term.grid_mut().damage_all();
         self.request_paint();
+    }
+
+    fn set_font(&mut self, px: f32, cell: Size) {
+        self.style.size_px = px;
+        if cell.w > 0.0 && cell.h > 0.0 {
+            self.cell = cell;
+        }
+        self.term.grid_mut().damage_all();
+        self.request_layout();
     }
 }
 
