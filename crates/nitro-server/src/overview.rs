@@ -511,6 +511,9 @@ pub struct Overview {
     pub scrim: WindowKey,
     /// One per thumbnail, in slot order.
     pub thumbs: Vec<ThumbState>,
+    /// When the badges started fading in (`CLOCK_MONOTONIC` ns): `Some`
+    /// while they are fading, `None` once settled. See [`badge_opacity`].
+    pub fade_start_ns: Option<u64>,
 }
 
 impl Overview {
@@ -774,6 +777,40 @@ pub fn caption_width(slot_w: f32) -> f32 {
     (slot_w.min(CAPTION_MAX_W) - 2.0 * CAPTION_PAD).max(0.0)
 }
 
+/// How long the badges take to fade in on entry:
+/// `WINDOW_OVERLAY_FADE_TIME` in GNOME's `windowPreview.js`.
+///
+/// Only the badges animate. The thumbnails are the live buffers under
+/// `scale(k)`, so any per-frame damage over them (a scrim fade, slot
+/// motion) goes through the scaled blit at ~17 ms a frame; that waits
+/// on a downscale cache. See `docs/wm.md` §Overview mode.
+pub const BADGE_FADE_NS: u64 = 200_000_000;
+
+/// The badges' opacity `elapsed_ns` into the fade: ease-out-quad from
+/// exactly `0.0` to exactly `1.0` at [`BADGE_FADE_NS`] and beyond.
+#[must_use]
+pub fn badge_opacity(elapsed_ns: u64) -> f32 {
+    if elapsed_ns >= BADGE_FADE_NS {
+        return 1.0;
+    }
+    #[allow(clippy::cast_precision_loss)] // both are below 2^28
+    let t = (elapsed_ns as f64 / BADGE_FADE_NS as f64).clamp(0.0, 1.0);
+    #[allow(clippy::cast_possible_truncation)] // in 0..=1
+    {
+        (t * (2.0 - t)) as f32
+    }
+}
+
+/// Set every thumbnail's badge group to `opacity`. A framed window's
+/// badge hangs off its frame root, an undecorated one's lives in the
+/// scrim; both are server nodes. A badge the scene refuses (its window
+/// went) is skipped.
+pub fn set_badge_opacity(scene: &mut Scene, thumbs: &[ThumbState], opacity: f32) {
+    for badge in thumbs.iter().filter_map(|t| t.badge) {
+        let _ = scene.set_opacity(ClientId::SERVER, badge, opacity);
+    }
+}
+
 /// Whether a window takes part in overview mode: a `Normal`-layer
 /// toplevel, minimized or on screen.
 #[must_use]
@@ -882,6 +919,13 @@ mod scene_tests {
     /// Everything `Server::enter_overview` does to the scene, minus the
     /// server: scale, hide the decorations, badge, scrim.
     fn enter(scene: &mut Scene, wins: &[WindowKey]) -> (WindowKey, Vec<Slot>) {
+        let (scrim, slots, _) = enter_badged(scene, wins);
+        (scrim, slots)
+    }
+
+    /// [`enter`], also returning each thumbnail's badge group.
+    fn enter_badged(scene: &mut Scene, wins: &[WindowKey]) -> (WindowKey, Vec<Slot>, Vec<NodeKey>) {
+        let mut badges = Vec::new();
         let slots = slots_for(scene, wins);
         let scrim = create_scrim(scene, OUT, Size::new(1000.0, 800.0)).unwrap();
         let scrim_root = scene.window_info(scrim).unwrap().root();
@@ -907,13 +951,13 @@ mod scene_tests {
             };
             if framed {
                 let origin = Point::new(inset.left + size.w / 2.0, inset.top + size.h);
-                build_badge(scene, root, origin, 1.0 / slot.scale, &badge).unwrap();
+                badges.push(build_badge(scene, root, origin, 1.0 / slot.scale, &badge).unwrap());
             } else {
                 let origin = Point::new(slot.pos.x + slot.size.w / 2.0, slot.pos.y + slot.size.h);
-                build_badge(scene, scrim_root, origin, 1.0, &badge).unwrap();
+                badges.push(build_badge(scene, scrim_root, origin, 1.0, &badge).unwrap());
             }
         }
-        (scrim, slots)
+        (scrim, slots, badges)
     }
 
     #[test]
@@ -951,6 +995,79 @@ mod scene_tests {
             "settled overview damaged {:?}",
             settled.rects()
         );
+    }
+
+    #[test]
+    fn a_badge_fade_damages_only_the_badges_and_then_goes_quiet() {
+        let (mut scene, wins, _) = desktop();
+        let (_, slots, badges) = enter_badged(&mut scene, &wins);
+        assert!(!badges.is_empty());
+        let thumbs: Vec<ThumbState> = slots
+            .iter()
+            .zip(&badges)
+            .map(|(s, b)| ThumbState {
+                window: s.window,
+                slot: *s,
+                hit: s.rect(),
+                saved_transform: Transform::IDENTITY,
+                saved_position: None,
+                unhid: false,
+                badge: Some(*b),
+                caption_text: None,
+            })
+            .collect();
+        set_badge_opacity(&mut scene, &thumbs, 0.0);
+        assert!(!update(&mut scene).is_empty(), "entering repaints");
+        assert!(update(&mut scene).is_empty());
+
+        // The icon's box in output coordinates: what one badge may damage,
+        // plus a pixel of anti-aliasing slack.
+        let [icon, _, _] = badge_rects(None);
+        let icon = icon.unwrap();
+        let boxes: Vec<Rect> = slots
+            .iter()
+            .map(|s| {
+                Rect::new(
+                    s.pos.x + s.size.w / 2.0 + icon.x - 1.0,
+                    s.pos.y + s.size.h + icon.y - 1.0,
+                    icon.w + 2.0,
+                    icon.h + 2.0,
+                )
+            })
+            .collect();
+        let output_area = 1000 * 800;
+        for step in 1..=4u64 {
+            let o = badge_opacity(step * BADGE_FADE_NS / 5);
+            set_badge_opacity(&mut scene, &thumbs, o);
+            let damage = update(&mut scene);
+            assert!(!damage.is_empty(), "step {step} repaints the badges");
+            let mut area = 0;
+            for r in damage.rects() {
+                area += r.w * r.h;
+                let inside = boxes.iter().any(|b| {
+                    r.x as f32 >= b.x.floor()
+                        && r.y as f32 >= b.y.floor()
+                        && (r.x + r.w) as f32 <= b.right().ceil()
+                        && (r.y + r.h) as f32 <= b.bottom().ceil()
+                });
+                assert!(inside, "step {step}: {r:?} is outside every badge");
+            }
+            assert!(
+                area * 20 < output_area,
+                "step {step}: {area} px damaged — the grid, not the badges"
+            );
+        }
+        set_badge_opacity(&mut scene, &thumbs, badge_opacity(BADGE_FADE_NS));
+        assert!(!update(&mut scene).is_empty(), "the last step lands");
+        let settled = update(&mut scene);
+        assert!(
+            settled.is_empty(),
+            "faded in, damaged {:?}",
+            settled.rects()
+        );
+        // Re-asserting the settled opacity is free too.
+        set_badge_opacity(&mut scene, &thumbs, 1.0);
+        assert!(update(&mut scene).is_empty());
     }
 
     #[test]
@@ -1060,6 +1177,7 @@ mod scene_tests {
                     caption_text: None,
                 })
                 .collect(),
+            fade_start_ns: None,
         };
         for s in &slots {
             let centre = Point::new(s.pos.x + s.size.w / 2.0, s.pos.y + s.size.h / 2.0);

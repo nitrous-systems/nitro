@@ -2756,6 +2756,18 @@ impl Server {
         // while this very flip was in flight, so its cursor damage is
         // sitting here waiting and the client's answer may still be a
         // wakeup away. Same rule, same deadline.
+        //
+        // The overview badges' fade steps here, per vblank: see
+        // `step_overview_fade` for why no timer is needed. On *now*, not
+        // the flip's `time_ns`: the vblank of a frame already in flight
+        // when overview was entered predates the fade's start stamp, and
+        // a step at elapsed 0 would set the opacity it already has,
+        // damage nothing, flip nothing — and stall the fade.
+        // `paint` does not update the scene itself, so the step's damage
+        // is folded into the outputs here.
+        if self.overview_output() == Some(scene_id) && self.step_overview_fade(monotonic_ns()) {
+            self.update_scene();
+        }
         self.paint_or_defer();
     }
 
@@ -5985,6 +5997,14 @@ impl Server {
             "overview_thumbs",
             self.wm.overview().map_or(0, |o| o.thumbs.len()) as u64,
         ));
+        pairs.push((
+            "overview_fading",
+            u64::from(
+                self.wm
+                    .overview()
+                    .is_some_and(|o| o.fade_start_ns.is_some()),
+            ),
+        ));
         pairs.push(("overview_requests", self.overview_requests));
         pairs.push(("overview_watchers", self.overview_watchers.len() as u64));
         pairs.push(("focused", u64::from(self.focus.is_some())));
@@ -8870,7 +8890,11 @@ impl Server {
     /// keeps its strip and stays usable), its decorations are hidden, and
     /// it gets an unscaled icon-and-caption badge. The scrim goes under
     /// all of them. Zero windows is a valid overview: just the scrim.
-    fn enter_overview(&mut self, output: SceneOutputId) {
+    ///
+    /// With `animate` the badges fade in over [`overview::BADGE_FADE_NS`]
+    /// (see [`Server::step_overview_fade`]); a relayout passes `false`, so
+    /// a window mapping or closing does not re-flash every badge.
+    fn enter_overview(&mut self, output: SceneOutputId, animate: bool) {
         if self.wm.overview().is_some() {
             self.leave_overview(None);
         }
@@ -8920,10 +8944,18 @@ impl Server {
             output.0,
             states.len()
         );
+        // Only with a badge to fade: a step that changes nothing damages
+        // nothing, so no flip would come to finish the fade — and an
+        // empty overview (just the scrim) would never read as settled.
+        let fade_start_ns = (animate && states.iter().any(|t| t.badge.is_some())).then(|| {
+            overview::set_badge_opacity(&mut self.scene, &states, 0.0);
+            monotonic_ns()
+        });
         self.wm.begin_overview(overview::Overview {
             output,
             scrim,
             thumbs: states,
+            fade_start_ns,
         });
         // No frame affordance survives: every frame on this output is
         // hidden or scaled, and a lit border would be drawn on nothing.
@@ -9111,8 +9143,38 @@ impl Server {
     fn relayout_overview(&mut self) {
         if let Some(output) = self.overview_output() {
             self.leave_overview(None);
-            self.enter_overview(output);
+            self.enter_overview(output, false);
         }
+    }
+
+    /// Advance the overview badges' fade-in to `now_ns`
+    /// (`CLOCK_MONOTONIC`, the clock `enter_overview` stamped the start
+    /// with). `now_ns` must be strictly after the start stamp, or the
+    /// step changes nothing and no further flip comes to step again.
+    ///
+    /// Driven from `on_flip`, not a timer: each step changes only the
+    /// badges' opacity, which damages only their rects, which paints
+    /// and flips, which steps again. The last step sets exactly `1.0`
+    /// and clears `fade_start_ns`, so nothing is dirty afterwards and
+    /// the desktop goes quiet — no timerfd is left running. With no
+    /// flips (the output inactive, the VT switched away) the fade simply
+    /// waits and, time having passed, snaps to `1.0` on the next flip.
+    ///
+    /// Returns whether it stepped, i.e. the scene needs an update.
+    fn step_overview_fade(&mut self, now_ns: u64) -> bool {
+        let Some(ov) = self.wm.overview_mut() else {
+            return false;
+        };
+        let Some(start) = ov.fade_start_ns else {
+            return false;
+        };
+        let elapsed = now_ns.saturating_sub(start);
+        let opacity = overview::badge_opacity(elapsed);
+        if elapsed >= overview::BADGE_FADE_NS {
+            ov.fade_start_ns = None;
+        }
+        overview::set_badge_opacity(&mut self.scene, &ov.thumbs, opacity);
+        true
     }
 
     /// A click (or a touch-down) at device point `point` on `output`,
@@ -9200,14 +9262,14 @@ impl Server {
                 if let Some(out) = target
                     && active != Some(out)
                 {
-                    self.enter_overview(out);
+                    self.enter_overview(out, true);
                 }
             }
             R::Toggle => {
                 if active.is_some() {
                     self.leave_overview(None);
                 } else if let Some(out) = target {
-                    self.enter_overview(out);
+                    self.enter_overview(out, true);
                 }
             }
         }
@@ -9250,7 +9312,7 @@ impl Server {
             if self.lock.is_locked() {
                 return protocol::err_reply("the session is locked");
             }
-            self.enter_overview(id);
+            self.enter_overview(id, true);
         } else {
             self.leave_overview(None);
         }

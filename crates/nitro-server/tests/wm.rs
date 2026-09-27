@@ -4923,6 +4923,47 @@ fn the_scrim_stays_under_a_window_mapped_during_overview() {
 }
 
 #[test]
+fn the_badges_fade_in_on_entry_and_then_the_desktop_goes_quiet() {
+    let mut h = Harness::start("ov-fade", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("ov-fade");
+    let _a = make_window(&mut conn, &mut inbox, 1, "a", WIN, RED, 0, 1);
+    park(&mut h);
+    overview(&h, true);
+    // The fade is vblank-driven: `settle` saw the frames stop, so it is
+    // over — and nothing is left ticking.
+    wait_for("the badge fade", || h.stat("overview_fading") == 0);
+    h.settle();
+    let frames = h.stat("frames");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert_eq!(h.stat("overview"), 1);
+    assert_eq!(
+        h.stat("frames"),
+        frames,
+        "a settled overview does not paint"
+    );
+    assert_eq!(h.stat("overview_fading"), 0);
+
+    // A relayout (a window mapping) re-badges without a fade.
+    let _b = make_window(&mut conn, &mut inbox, 3, "b", WIN, GREEN, 0, 2);
+    wait_for("the relayout", || h.stat("overview_thumbs") == 2);
+    assert_eq!(h.stat("overview_fading"), 0, "a relayout does not re-fade");
+    h.settle();
+    drop(conn);
+    h.quit();
+}
+
+#[test]
+fn an_empty_overview_has_nothing_to_fade_and_settles() {
+    let mut h = Harness::start("ov-fade-empty", OUT.0, OUT.1);
+    park(&mut h);
+    overview(&h, true);
+    assert_eq!(h.stat("overview_thumbs"), 0);
+    assert_eq!(h.stat("overview_fading"), 0, "no badge, no fade");
+    h.quit();
+}
+
+#[test]
 #[allow(clippy::many_single_char_names)] // h, a, b, x, y: as the rest of this file
 fn overview_on_one_output_leaves_the_other_alone() {
     let mut h = Harness::start("ov-two", OUT.0, OUT.1);

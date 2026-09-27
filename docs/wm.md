@@ -906,15 +906,47 @@ nothing: a scale change damages old ∪ new once, and the next update
 produces empty damage. A settled 16-window overview with one animating
 client costs about 1 ms.
 
-So: **animating position is affordable, animating scale is not.** Entering
-and leaving interpolate the slots' positions and fade a scrim; the scale
-itself is set once. A scale animation would rescale every thumbnail every
-frame and regress the desktop to missed vsync. Anything that later wants
-one must first add a downscale cache in `nitro-raster` — measured at
-1.04 ms per thumbnail paid on change, turning the 17.3 ms per-frame cost
-into 0.37 ms. **This is the easiest regression in the tree to reintroduce
-by accident**, so overview mode carries a test asserting that a settled
-overview produces no damage.
+So, **without a downscale cache, nothing over the grid animates.** The
+0.37 ms/frame figure (`docs/research/overview.md` §7.2) is the *cached*
+row: 16 thumbnails blitted 1:1 from a pre-scaled copy. Today a thumbnail
+is the live buffer under `scale(k)`, and a repaint of any part of it goes
+through the scaled path. Flooring the slots doesn't help, because
+`one_to_one` also needs the scale to be 1. A scrim fade damages the whole
+output every frame, and a position interpolation damages old ∪ new for
+every thumbnail every frame. Both are the ~17 ms case. The scale itself is
+set once, on enter and on leave, and so is the position. Entering and
+leaving **snap**.
+
+What does animate is the **badges**. On entry each thumbnail's icon and
+caption group fades in from opacity 0 over 200 ms, with ease-out-quad
+(`overview::BADGE_FADE_NS`, `overview::badge_opacity`; GNOME's
+`WINDOW_OVERLAY_FADE_TIME`). The badges are unscaled, and an opacity change
+damages only their rects. The fade is **driven by vblank, not a timer**:
+`on_flip` calls `Server::step_overview_fade`, which damages the badges,
+which paints and flips, which steps again. The last step sets exactly 1.0
+and clears `Overview::fade_start_ns`, so the desktop then goes quiet with
+nothing left armed (`overview_fading` in `stats`). A relayout (a window
+mapping or closing) re-badges at full opacity rather than re-flashing
+every badge, and leaving is instant. An overview with no badges (no
+windows) starts no fade, since a step that changes nothing would flip
+nothing and never finish. With no flips (an inactive output, or
+the VT switched away) the fade waits, then snaps to 1.0 on the next flip.
+
+Measured cost of one fade frame (release, FakeBackend, 1920x1080, 800x600
+windows): **0.26 ms** with 4 thumbnails and **0.73 ms** with 8. With 16 it
+is **3.7 ms**. Sixteen badges are 32 damage rects (icon and pill), which
+overflows `Damage::MAX_RECTS` (16), and the region collapses to one
+1407x396 box over two rows of scaled thumbnails. With the cap at 32 the
+same frame is 1.5 ms. That is recorded as issue #649, not changed here. The
+cost holds for the ~12 frames of the fade and is well inside a 60 Hz frame.
+
+Anything that later wants the scrim fade, slot motion or a scale animation
+must first add a downscale cache in `nitro-raster`. It was measured at
+1.04 ms per thumbnail, paid on change, and turns the 17.3 ms per-frame
+cost into 0.37 ms. **This is the easiest regression in the tree to
+reintroduce by accident**, so overview mode carries a test asserting that
+a settled overview produces no damage, and another asserting that a
+badge fade damages only the badges and then goes quiet.
 
 ### Two hazards of the scaled transform
 
@@ -1368,11 +1400,13 @@ and a drag-and-drop is not started during a window drag.
   second set to switch between. GNOME's overview carries a workspace strip
   and a rounded workspace-background card; nitro's has neither, and
   adding workspaces later would add a strip rather than rework the grid.
-* **Per-window opacity in overview.** The scrim fades and the slots
-  interpolate their positions; the *scale* does not animate, on measured
-  grounds (§Overview mode). A scale animation needs a downscale cache in
-  `nitro-raster` first — the lever is recorded with its number so nobody
-  re-measures it.
+* **Overview scrim fade and slot animation.** Only the badges fade in.
+  The scrim appears at once and the windows snap to their slots, on
+  measured grounds (§Overview mode): without a downscale cache in
+  `nitro-raster`, any per-frame damage over the scaled grid (a scrim fade,
+  position interpolation, a scale animation) costs ~17 ms a frame. The
+  lever is recorded with its numbers (1.04 ms per thumbnail on change;
+  17.3 → 0.37 ms/frame) so nobody re-measures it.
 * **Cursor *themes*.** The shapes (six in M4, seventeen since M5-E) are
   compiled-in ASCII art (§Cursor shapes); loading an XCursor theme off
   the box — a file format, a search path and a fallback policy — is not

@@ -304,7 +304,9 @@ impl TestServer {
                     .unwrap_or(0)
             };
             let frames = value("frames");
-            if value("flips_pending") == 0 && frames == last {
+            // A fading overview is mid-animation even across a deferred
+            // paint that leaves `frames` still for a few polls.
+            if value("flips_pending") == 0 && value("overview_fading") == 0 && frames == last {
                 stable += 1;
             } else {
                 stable = 0;

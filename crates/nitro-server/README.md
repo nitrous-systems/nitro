@@ -926,6 +926,7 @@ looking for.
 | `dragging`               | 1 while a move or resize drag is in flight. A drag that is still 1 with nothing on the desk is a stuck grab. |
 | `overview`               | 1 while an output is in overview mode. |
 | `overview_thumbs`        | Thumbnails in the overview in force; 0 without one. The scrim counts under `windows`. |
+| `overview_fading`        | 1 while the overview's badges are fading in on entry, 0 once settled (or without an overview). |
 | `focused`                | 1 when some window has keyboard focus. 0 with windows on screen means every one of them is `NO_FOCUS` or minimized — or that the focus was dropped and not handed on, which is a bug. |
 | `shell_clients`          | Connections on the **privileged** shell socket. The first key to look at when a bar "is not working": zero means it never got there. |
 | `remote_clients`         | Connections that arrived over **TCP** (`docs/remote.md`). Counted separately from `clients`, which is the total: a remote client is an ordinary client in every other respect, and this is the one fact about it that is not visible anywhere else. |

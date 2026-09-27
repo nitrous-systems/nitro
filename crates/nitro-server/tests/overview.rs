@@ -10,7 +10,9 @@
 
 use nitro_core::{Point, Rect, Size};
 use nitro_scene::WindowKey;
-use nitro_server::overview::{self, Slot, Thumb, WINDOW_PREVIEW_MAXIMUM_SCALE};
+use nitro_server::overview::{
+    self, BADGE_FADE_NS, Slot, Thumb, WINDOW_PREVIEW_MAXIMUM_SCALE, badge_opacity,
+};
 
 /// Slack for `f32` rounding when comparing rect edges.
 const EPS: f32 = 1e-3;
@@ -343,4 +345,24 @@ fn read_ahead_raises_the_row_left_behind() {
     assert_eq!(c.pos, Point::new(325.0, 572.0), "{c:?}");
     assert!((a.size.w - 635.0).abs() < EPS && (a.size.h - 127.0).abs() < EPS);
     assert!((c.size.w - 1270.0).abs() < EPS && (c.size.h - 508.0).abs() < EPS);
+}
+
+#[test]
+fn the_badge_fade_eases_out_from_zero_to_exactly_one() {
+    assert_eq!(badge_opacity(0), 0.0);
+    assert_eq!(badge_opacity(BADGE_FADE_NS), 1.0);
+    assert_eq!(badge_opacity(BADGE_FADE_NS + 1), 1.0);
+    assert_eq!(badge_opacity(u64::MAX), 1.0);
+    let mut last = 0.0;
+    for i in 0..=100 {
+        let o = badge_opacity(BADGE_FADE_NS * i / 100);
+        assert!(
+            o >= last && (0.0..=1.0).contains(&o),
+            "{i}: {o} after {last}"
+        );
+        last = o;
+    }
+    // Ease-out: ahead of linear at the midpoint (exactly 0.75 for a quad).
+    let mid = badge_opacity(BADGE_FADE_NS / 2);
+    assert!(mid > 0.5 && (mid - 0.75).abs() < 1e-6, "{mid}");
 }

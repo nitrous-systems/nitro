@@ -487,6 +487,14 @@ animation is out: it would need a downscale cache in `nitro-raster`, which is
 recorded as a lever with its number (1.04 ms per thumbnail on change) rather
 than built speculatively.
 
+> **Correction (task #3791).** The 0.37 ms/frame figure is §7.2's *cached*
+> row, and the cache does not exist. Without it every thumbnail is the live
+> buffer under `scale(k)`. A scrim fade damages the whole output each frame,
+> and a position interpolation damages every slot each frame. Both repaint
+> the scaled grid at ~17 ms, the same as a scale animation. What shipped is
+> only a 200 ms ease-out-quad fade-in of the unscaled badges, stepped from
+> `on_flip`. The scrim and the slots snap. See `docs/wm.md` §Overview mode.
+
 **Multi-output**: the overview is per-output, like the MRU list and the z-order
 (`docs/wm.md` §Multi-output), and the layout's `area` is the **work area** — the
 output rect with the bar's exclusive zone subtracted, via
