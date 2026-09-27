@@ -356,7 +356,9 @@ impl<S: 'static> FilePicker<S> {
         if let Ok(mut p) = ui.widget_mut::<Picker<S>>(root) {
             p.model = Some(Box::new(model));
         }
-        ui.on_window_closed(win, move |s: &mut S, ui: &mut Ui<S>| finish(s, ui, root, None));
+        ui.on_window_closed(win, move |s: &mut S, ui: &mut Ui<S>| {
+            finish(s, ui, root, None)
+        });
         navigate(ui, root, start, false);
         if let Some(name) = ids.name {
             ui.focus(name);
@@ -394,7 +396,13 @@ fn describe(mimes: &[String]) -> String {
 /// parameters (`; charset=…`) are ignored.
 #[must_use]
 pub fn mime_matches(pattern: &str, mime: &str) -> bool {
-    let clean = |s: &str| s.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let clean = |s: &str| {
+        s.split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase()
+    };
     let (pattern, mime) = (clean(pattern), clean(mime));
     if pattern == "*" || pattern == "*/*" {
         return true;
@@ -523,7 +531,8 @@ impl<S: 'static> Widget<S> for Picker<S> {
                     .defer(move |s: &mut S, ui: &mut Ui<S>| finish(s, ui, root, None));
             }
             (mods::NONE, key::ENTER) => {
-                cx.ui.defer(move |s: &mut S, ui: &mut Ui<S>| accept(s, ui, root));
+                cx.ui
+                    .defer(move |s: &mut S, ui: &mut Ui<S>| accept(s, ui, root));
             }
             (mods::CTRL, key::H) => {
                 cx.ui.defer(move |_s: &mut S, ui: &mut Ui<S>| {
@@ -545,10 +554,12 @@ impl<S: 'static> Widget<S> for Picker<S> {
                 });
             }
             (mods::NONE, key::BACKSPACE) | (mods::ALT, key::UP) => {
-                cx.ui.defer(move |_s: &mut S, ui: &mut Ui<S>| go_up(ui, root));
+                cx.ui
+                    .defer(move |_s: &mut S, ui: &mut Ui<S>| go_up(ui, root));
             }
             (mods::ALT, key::LEFT) => {
-                cx.ui.defer(move |_s: &mut S, ui: &mut Ui<S>| go_back(ui, root));
+                cx.ui
+                    .defer(move |_s: &mut S, ui: &mut Ui<S>| go_back(ui, root));
             }
             _ => return Handled::No,
         }
@@ -714,11 +725,15 @@ fn build_tree<S: 'static>(
             .grow(1.0),
     );
     let filter = if filters.len() > 1 {
-        Some(ui.build(button(filters[0].label.clone()).name(names::FILTER).on_click(
-            move |_s: &mut S, ui: &mut Ui<S>| {
-                ui.defer(move |_s: &mut S, ui: &mut Ui<S>| cycle_filter(ui, root));
-            },
-        )))
+        Some(
+            ui.build(
+                button(filters[0].label.clone())
+                    .name(names::FILTER)
+                    .on_click(move |_s: &mut S, ui: &mut Ui<S>| {
+                        ui.defer(move |_s: &mut S, ui: &mut Ui<S>| cycle_filter(ui, root));
+                    }),
+            ),
+        )
     } else {
         None
     };

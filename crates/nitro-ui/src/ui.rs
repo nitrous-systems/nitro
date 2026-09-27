@@ -816,7 +816,6 @@ impl<S: 'static> Ui<S> {
         }
     }
 
-
     /// Run `handler` once when `win` goes, whether the app removed it or
     /// the server closed it. Not called for the main window, whose
     /// closing ends the app. Registering on a window that does not exist

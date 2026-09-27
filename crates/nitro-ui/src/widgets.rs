@@ -1821,7 +1821,10 @@ pub fn spacer<S: 'static>() -> SpacerBuilder<S> {
 
 /// The intrinsic size of a container: the flex solver's own arithmetic,
 /// over the children's measurements.
-pub(crate) fn measure_container<S: 'static>(cx: &mut MeasureCx<'_, S>, constraints: Constraints) -> Size {
+pub(crate) fn measure_container<S: 'static>(
+    cx: &mut MeasureCx<'_, S>,
+    constraints: Constraints,
+) -> Size {
     let style = cx.ui.style(cx.id);
     let inner = constraints.loosen().deflate(style.padding);
     let children = cx.children();

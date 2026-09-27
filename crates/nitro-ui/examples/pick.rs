@@ -46,23 +46,24 @@ fn open(ui: &mut Ui<State>, picker: FilePicker<State>) {
 fn main() -> Result<(), Error> {
     App::new("pick")?.run(State { result: None }, |ui: &mut Ui<State>| {
         let result = ui.build(label("Nothing picked yet.").name("result"));
-        let buttons = ui.build(
-            row()
-                .gap(8.0)
-                .child(button("Open…").name("open").on_click(
-                    |_s: &mut State, ui: &mut Ui<State>| {
-                        open(ui, FilePicker::open().multiple(true).mime(["image/*"]));
-                    },
-                ))
-                .child(button("Folder…").name("folder").on_click(
-                    |_s: &mut State, ui: &mut Ui<State>| open(ui, FilePicker::folder()),
-                ))
-                .child(button("Save…").name("save").on_click(
-                    |_s: &mut State, ui: &mut Ui<State>| {
-                        open(ui, FilePicker::save("untitled.txt"));
-                    },
-                )),
-        );
+        let buttons =
+            ui.build(
+                row()
+                    .gap(8.0)
+                    .child(button("Open…").name("open").on_click(
+                        |_s: &mut State, ui: &mut Ui<State>| {
+                            open(ui, FilePicker::open().multiple(true).mime(["image/*"]));
+                        },
+                    ))
+                    .child(button("Folder…").name("folder").on_click(
+                        |_s: &mut State, ui: &mut Ui<State>| open(ui, FilePicker::folder()),
+                    ))
+                    .child(button("Save…").name("save").on_click(
+                        |_s: &mut State, ui: &mut Ui<State>| {
+                            open(ui, FilePicker::save("untitled.txt"));
+                        },
+                    )),
+            );
         let root = ui.build(column().gap(12.0).padding(16.0).width(420.0));
         ui.attach(root, buttons).expect("fresh ids");
         ui.attach(root, result).expect("fresh ids");

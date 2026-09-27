@@ -327,7 +327,11 @@ fn save_answers_the_typed_name_and_asks_twice_before_replacing() {
     let (mut h, win) = open(&dir, FilePicker::save("out.txt"));
     assert_eq!(h.ui().window_title_of(win), "Save As");
     let name = named(&mut h, "picker_name");
-    assert_eq!(h.ui().focused_in(win), Some(name), "the name field has focus");
+    assert_eq!(
+        h.ui().focused_in(win),
+        Some(name),
+        "the name field has focus"
+    );
     assert_eq!(
         h.widget::<nitro_ui::widgets::TextField<St>>(name)
             .selected_text(),
@@ -344,7 +348,11 @@ fn save_answers_the_typed_name_and_asks_twice_before_replacing() {
     let ok = named(&mut h, "picker_ok");
     act(&mut h, ok, "click", None);
     assert!(h.state().answers.is_empty(), "an existing file needs a yes");
-    assert!(status(&mut h).contains("press Save again"), "{}", status(&mut h));
+    assert!(
+        status(&mut h).contains("press Save again"),
+        "{}",
+        status(&mut h)
+    );
     act(&mut h, ok, "click", None);
     assert_eq!(h.state().answers, [Some(vec![dir.join("a.txt")])]);
     assert!(!h.ui().has_window(win));
@@ -379,7 +387,6 @@ fn the_mime_matcher_takes_families_and_ignores_case_and_parameters() {
     assert!(!mime_matches("image/png", "image/jpeg"));
     assert!(!mime_matches("image/*", "imagex/png"));
 }
-
 
 #[test]
 fn the_host_window_keeps_working_while_the_picker_is_open() {
