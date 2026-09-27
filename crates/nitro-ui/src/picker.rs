@@ -292,10 +292,11 @@ impl<S: 'static> FilePicker<S> {
             .title
             .take()
             .unwrap_or_else(|| self.default_title().to_owned());
-        let globs = self
+        let globs: std::sync::Arc<[Glob]> = self
             .globs
             .take()
-            .unwrap_or_else(|| mime::load_globs2(Path::new(GLOBS2)));
+            .unwrap_or_else(|| mime::load_globs2(Path::new(GLOBS2)))
+            .into();
         // The trash is a place for a file manager, not somewhere a file
         // is opened from or saved to.
         let places: Vec<Place> = self
@@ -438,7 +439,7 @@ struct Model<S> {
     filters: Vec<Filter>,
     active: usize,
     hidden: bool,
-    globs: Vec<Glob>,
+    globs: std::sync::Arc<[Glob]>,
     cwd: PathBuf,
     entries: Vec<Entry>,
     /// Each entry's MIME type, parallel to `entries`; `None` for a
@@ -885,9 +886,10 @@ fn navigate_in<S: 'static>(m: &mut Model<S>, ui: &mut Ui<S>, to: PathBuf, rememb
 fn relist<S: 'static>(m: &mut Model<S>, ui: &mut Ui<S>) {
     drop_scan(m, ui);
     let cwd = m.cwd.clone();
-    // A directory too big to read inside a frame is read on a thread,
-    // as `nitro-files` does; the count itself costs no `stat`.
-    if dir::count_at_most(&cwd, dir::BIG_DIR + 1) > dir::BIG_DIR {
+    // A directory too big to read inside a frame, or holding a symlink
+    // whose follow has no bound, is read on a thread, as `nitro-files`
+    // does; the survey itself costs no `stat`.
+    if dir::reads_on_a_thread(&cwd) {
         start_scan(m, ui, &cwd);
         return;
     }
@@ -905,7 +907,11 @@ fn relist<S: 'static>(m: &mut Model<S>, ui: &mut Ui<S>) {
 }
 
 fn start_scan<S: 'static>(m: &mut Model<S>, ui: &mut Ui<S>, cwd: &Path) {
-    let scan = match dir::Scan::start(cwd.to_path_buf(), dir::Sort::Name, m.globs.clone()) {
+    let scan = match dir::Scan::start(
+        cwd.to_path_buf(),
+        dir::Sort::Name,
+        std::sync::Arc::clone(&m.globs),
+    ) {
         Ok(scan) => scan,
         Err(e) => {
             m.message = Some(format!("background read failed ({e}), reading inline"));

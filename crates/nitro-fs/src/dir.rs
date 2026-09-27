@@ -95,6 +95,15 @@ impl Entry {
     ///
     /// A directory, or a symlink that points at one — the follow happened
     /// when the listing was read, so asking costs nothing here.
+    ///
+    /// The answer is **the listing's**, not now's. A link retargeted
+    /// between the `read_dir` and the click is answered from the stale
+    /// `stat`; the inotify watch does not help, because it watches the
+    /// *directory* and a change to a link's target is not an event in it.
+    /// The failure is benign — `nitro_files::navigate` re-`stat`s and puts
+    /// "not a directory" in the status line — and the payoff is that the
+    /// icon and the behaviour come from the same answer, so within one
+    /// listing a row that draws a folder cannot fail to enter one.
     #[must_use]
     pub fn opens_a_directory(&self) -> bool {
         self.kind == Kind::Dir || (self.kind == Kind::Symlink && self.symlink_dir)
@@ -186,7 +195,9 @@ impl Sort {
 /// * a **`metadata` call per symlink**, and only per symlink, to learn
 ///   whether it points at a directory. That is the one place this module
 ///   follows a link, and it is bounded by the number of links in the
-///   directory rather than by its size;
+///   directory rather than by its size. It is also why a directory
+///   holding even one symlink is read on a thread rather than on the
+///   loop — see [`reads_on_a_thread`];
 /// * a **glob match per regular file** ([`crate::mime::type_of`]), which
 ///   is a suffix comparison against the table and no I/O at all.
 ///
@@ -218,7 +229,8 @@ pub fn read_dir(path: &Path, globs: &[crate::mime::Glob]) -> std::io::Result<Vec
         // One `stat` *through* the link, for links only. A link into a
         // dead NFS mount can block here — which is the cost the `Kind`
         // doc comment refuses to pay per row, and pays only for the rows
-        // that are actually links, once per listing.
+        // that are actually links, once per listing. `reads_on_a_thread`
+        // keeps that block off the event loop.
         let symlink_dir =
             kind == Kind::Symlink && std::fs::metadata(entry.path()).is_ok_and(|m| m.is_dir());
         let icon = icon_of(kind, &name, symlink_dir, globs);
@@ -501,32 +513,79 @@ fn lexically_normal(path: &Path) -> PathBuf {
 /// people open when they want to know whether a file manager is slow.
 /// Below it the synchronous path is simpler and finishes inside one
 /// frame; above it, a frame is the wrong unit.
+///
+/// It is **not** the only reason to take the thread: see
+/// [`reads_on_a_thread`], for which one symlink is enough whatever the
+/// count.
 pub const BIG_DIR: usize = 2_000;
 
-/// How many entries a directory has, counted no further than `cap`.
+/// Whether reading `path` must go on a thread rather than on the loop.
 ///
-/// Names only: no `stat`, no metadata, nothing but the `getdents` the
-/// kernel is doing anyway, so the cost of asking is a fraction of the
-/// cost of the listing it decides about. Capped because the answer is
-/// only ever compared against [`BIG_DIR`] — "at least this many" is the
-/// whole question, and counting a 200 000-entry directory to the end to
-/// find out it is big would be the pause we are trying to avoid.
+/// Two independent reasons, and either is enough:
 ///
-/// A directory that cannot be read counts as empty: the caller is about
-/// to try to read it properly and report the error from there.
+/// * **more than [`BIG_DIR`] entries**, the original rule; or
+/// * **at least one symlink**, because [`read_dir`] follows each link
+///   once for the icon column and a single link into an unreachable
+///   mount is a `stat` that does not return. "Bounded by the link
+///   *count*" was the argument that made the follow acceptable; it is
+///   not an argument about the *loop*, where one is already too many.
+///
+/// Names and `d_type` only: no `stat`, no metadata, nothing but the
+/// `getdents` the kernel is doing anyway, so the cost of asking is a
+/// fraction of the cost of the listing it decides about. It **early
+/// exits** on the first symlink or the entry past `BIG_DIR`, so the walk
+/// is never longer than a plain count would have been, and counting a
+/// 200 000-entry directory to the end to find out it is big would be the
+/// pause we are trying to avoid.
+///
+/// `rustix::fs::Dir` rather than `std::fs::read_dir`, deliberately:
+/// `std::fs::DirEntry::file_type` silently falls back to an `lstat` when
+/// `d_type` is `DT_UNKNOWN`, which would put a `stat` per row back on
+/// exactly the network filesystems this is defending against. `rustix`
+/// hands back [`rustix::fs::FileType::Unknown`] instead, and this counts
+/// it **as if it were a symlink**: cheap and conservative, since the only
+/// cost of being wrong is a thread for a small directory.
+///
+/// A directory that cannot be opened reads **inline**: the caller is
+/// about to try to read it properly and report the error from there.
 #[must_use]
-pub fn count_at_most(path: &Path, cap: usize) -> usize {
-    let Ok(rd) = std::fs::read_dir(path) else {
-        return 0;
+pub fn reads_on_a_thread(path: &Path) -> bool {
+    use rustix::fs::{FileType, Mode, OFlags};
+
+    // `OFlags::DIRECTORY` makes "this is not a directory" an `open` error
+    // rather than something to discover mid-iteration, which is what lets
+    // the inline fallback stay a one-liner.
+    let Ok(fd) = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::DIRECTORY,
+        Mode::empty(),
+    ) else {
+        return false;
+    };
+    let Ok(dir) = rustix::fs::Dir::new(fd) else {
+        return false;
     };
     let mut n = 0;
-    for _ in rd {
+    for entry in dir {
+        let Ok(entry) = entry else {
+            // A read that failed partway through tells us nothing about
+            // the rest; the real `read_dir` will report it.
+            continue;
+        };
+        // `getdents` yields `.` and `..`, which `std` filters and we must.
+        let name = entry.file_name().to_bytes();
+        if name == b"." || name == b".." {
+            continue;
+        }
+        if matches!(entry.file_type(), FileType::Symlink | FileType::Unknown) {
+            return true;
+        }
         n += 1;
-        if n >= cap {
-            break;
+        if n > BIG_DIR {
+            return true;
         }
     }
-    n
+    false
 }
 
 /// A directory being read on a background thread.
@@ -573,16 +632,21 @@ impl Scan {
     /// it on the loop would give back the pause the thread exists to
     /// avoid. The MIME lookups go with them, for the same reason and with
     /// more force: a thousand glob matches on the loop is the cost this
-    /// whole module exists to keep off it. The table is **cloned** onto
-    /// the thread — a `globs2` on this box is ~2 000 small rules and the
-    /// alternative is an `Arc` in the app state for a copy made once per
-    /// big directory.
+    /// whole module exists to keep off it. The table is **shared** with
+    /// the thread rather than copied onto it: a `globs2` on this box is
+    /// ~2 000 small rules, and since a directory holding a single symlink
+    /// now takes this path (see [`reads_on_a_thread`]) the copy would be
+    /// once per ordinary listing rather than once per big directory.
     ///
     /// # Errors
     /// If the pipe cannot be created or the thread cannot be spawned.
     /// Reading the directory itself fails *later*, as the value
     /// [`Scan::take`] hands back.
-    pub fn start(path: PathBuf, by: Sort, globs: Vec<crate::mime::Glob>) -> std::io::Result<Scan> {
+    pub fn start(
+        path: PathBuf,
+        by: Sort,
+        globs: std::sync::Arc<[crate::mime::Glob]>,
+    ) -> std::io::Result<Scan> {
         let (read, write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
         let flags = rustix::fs::fcntl_getfl(&read)?;
         rustix::fs::fcntl_setfl(&read, flags | rustix::fs::OFlags::NONBLOCK)?;
@@ -1121,16 +1185,48 @@ mod tests {
     }
 
     #[test]
-    fn count_at_most_stops_at_the_cap() {
-        let dir = scratch("count");
-        for i in 0..20 {
+    fn a_directory_with_a_symlink_is_read_on_a_thread_whatever_its_size() {
+        // The predicate's whole truth table. Two independent reasons, and
+        // the interesting one is the link: a three-entry directory with a
+        // link in it is a `stat` with no bound, so it is not the cheap
+        // case the threshold was chosen for.
+        let dir = scratch("onthread");
+        for i in 0..3 {
             std::fs::write(dir.join(format!("f{i}")), b"").expect("write");
         }
-        assert_eq!(count_at_most(&dir, 5), 5, "counting stops at the cap");
-        assert_eq!(count_at_most(&dir, 1_000), 20);
-        // A directory that cannot be read counts as empty rather than
-        // failing: the caller is about to read it properly and report.
-        assert_eq!(count_at_most(&dir.join("nope"), 10), 0);
+        assert!(
+            !reads_on_a_thread(&dir),
+            "three plain files are read inline"
+        );
+
+        // A dangling link counts too: the `stat` that would resolve it is
+        // the one that can hang, and whether it *would* have succeeded is
+        // not knowable without making it.
+        std::os::unix::fs::symlink(dir.join("nowhere"), dir.join("dangling")).expect("symlink");
+        assert!(reads_on_a_thread(&dir), "one link is enough");
+        std::fs::remove_file(dir.join("dangling")).expect("rm");
+        std::os::unix::fs::symlink(dir.join("f0"), dir.join("live")).expect("symlink");
+        assert!(reads_on_a_thread(&dir), "a live link too");
+        std::fs::remove_file(dir.join("live")).expect("rm");
+
+        // And the original rule still holds on its own: past the cap with
+        // no link in sight.
+        for i in 3..BIG_DIR {
+            std::fs::write(dir.join(format!("f{i}")), b"").expect("write");
+        }
+        assert!(
+            !reads_on_a_thread(&dir),
+            "exactly BIG_DIR entries is still the inline path"
+        );
+        std::fs::write(dir.join("one-more"), b"").expect("write");
+        assert!(reads_on_a_thread(&dir), "past BIG_DIR takes the thread");
+
+        // A path that cannot be opened, and one that is not a directory,
+        // both read inline: the caller is about to read it properly and
+        // report the error from there.
+        assert!(!reads_on_a_thread(&dir.join("nope")));
+        assert!(!reads_on_a_thread(&dir.join("f0")));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1142,7 +1238,8 @@ mod tests {
         }
         std::fs::create_dir(dir.join("adir")).expect("mkdir");
 
-        let mut scan = Scan::start(dir.clone(), Sort::Name, Vec::new()).expect("start the scan");
+        let mut scan = Scan::start(dir.clone(), Sort::Name, std::sync::Arc::from(vec![]))
+            .expect("start the scan");
         assert_eq!(scan.path(), dir.as_path());
 
         // Exactly what the app loop does: sleep on the descriptor until
@@ -1165,7 +1262,8 @@ mod tests {
     #[test]
     fn a_scan_of_a_missing_directory_delivers_the_error_not_a_panic() {
         let missing = std::env::temp_dir().join(format!("nitro-fs-gone-{}", std::process::id()));
-        let mut scan = Scan::start(missing, Sort::Name, Vec::new()).expect("start");
+        let mut scan =
+            Scan::start(missing, Sort::Name, std::sync::Arc::from(vec![])).expect("start");
         assert!(wait_readable(&scan, 10), "the doorbell rang");
         let result = scan.take().expect("a result");
         assert!(result.is_err(), "the failure arrives as a value");
@@ -1180,11 +1278,13 @@ mod tests {
         for i in 0..50 {
             std::fs::write(dir.join(format!("f{i}")), b"").expect("write");
         }
-        let scan = Scan::start(dir.clone(), Sort::Name, Vec::new()).expect("start");
+        let scan =
+            Scan::start(dir.clone(), Sort::Name, std::sync::Arc::from(vec![])).expect("start");
         drop(scan);
         std::thread::sleep(std::time::Duration::from_millis(50));
-        // Still here.
-        assert_eq!(count_at_most(&dir, 100), 50);
+        // Still here. A plain count, because this is an "is the process
+        // alive" assertion and its cost is irrelevant.
+        assert_eq!(std::fs::read_dir(&dir).expect("read").count(), 50);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

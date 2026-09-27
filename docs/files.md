@@ -95,16 +95,30 @@ what activating it does — so `read_dir` does one `metadata` call **per
 symlink**, and records the answer in `Entry::symlink_dir`. The cost is
 bounded by the number of links in the directory rather than by its size,
 which is the distinction that mattered in the original argument: what was
-refused was a `stat` per *row*, and this is not that. It is still the case
-that a link into a dead mount can block here; what has changed is that the
-blocking is paid by the listing rather than by `activate`, and a listing
-already reads the directory.
+refused was a `stat` per *row*, and this is not that. A link into a dead
+mount can still block that `metadata`; what has changed is that the
+blocking is paid by the listing rather than by `activate` — and since
+#3847, by the listing's **thread**, never by the loop: `dir::reads_on_a_thread`
+sends a directory holding even one symlink to the scan thread whatever its
+size. See *Long work off the loop*.
 
 The payoff is that `activate` costs no syscall at all — it asks
 `Entry::opens_a_directory()`, which is the same field the icon came from,
 so "enter the directory this points at" and "draw it as a folder" cannot
-disagree. Before, they were two separate `metadata` calls that could in
-principle answer differently.
+disagree **within one listing**. Before, they were two separate `metadata`
+calls that could in principle answer differently.
+
+"Within one listing" is the honest scope rather than a hedge, and it names
+the one case the field gets wrong: a symlink **retargeted between the
+listing and the double-click** is answered from the listing's `stat`. The
+inotify watch does not close that window, because it watches the
+*directory* and a change to a link's *target* is not an event in it. It
+needs a retarget inside the window between a listing and a click, so it is
+rare; and the failure is benign, because `navigate` re-`stat`s and puts
+`not a directory: …` in the status line rather than doing anything wrong.
+Re-`stat`ing in `activate` would buy a fresher answer at the price of the
+guarantee above — two independent `stat`s that can disagree — which is the
+worse trade.
 
 **The icon is a field, not a method**, and that is the third decision.
 `Entry::icon` is the *name* of a symbolic icon, resolved when the listing
@@ -356,32 +370,63 @@ either between two `epoll_wait`s freezes the window — not "is slow", but
 *freezes*: no repaint, no keystroke, no response to the server, for as
 long as the kernel takes.
 
-So the rule is a number, and the number is **2 000**
-(`dir::BIG_DIR`). Below it the directory is read inline, because a thread
-and a wakeup cost more than reading forty entries and the synchronous
-path finishes inside one frame. Above it the read goes on a thread. Two
-thousand is roughly where a `read_dir` plus a `stat` each stops being
-free on a warm cache and starts being a visible pause on a cold one, and
-`/usr/bin` sits about there — which matters, because `/usr/bin` is the
-directory people open when they want to know whether a file manager is
-slow.
+So the rule has two clauses, and either is enough:
 
-"About there" is the honest phrasing rather than a hedge: the dev box's
-`/usr/bin` is **1 765 entries**, so it comes in just *under* the
-threshold and is read inline, with no perceptible pause. That is the
-threshold working rather than missing — the synchronous path is the
-simpler one and should be taken whenever it is safe — but it does mean
-the directory people reach for first is not the one that exercises the
-thread. The 50 000-entry measurement below is, and it exists precisely
-because the obvious test case turned out to be on the other side of the
-line.
+1. **more than 2 000 entries** (`dir::BIG_DIR`), or
+2. **at least one symlink**.
+
+Below the threshold, and with no link in the directory, the read is inline,
+because a thread and a wakeup cost more than reading forty entries and the
+synchronous path finishes inside one frame. Two thousand is roughly where a
+`read_dir` plus a `stat` each stops being free on a warm cache and starts
+being a visible pause on a cold one, and `/usr/bin` sits about there —
+which matters, because `/usr/bin` is the directory people open when they
+want to know whether a file manager is slow.
+
+The second clause is #3847's, and it is why the rule is no longer one
+number. `read_dir` follows each symlink once, for the icon column
+(*A row is six fields*), and that `metadata` is a `stat` with **no bound**:
+a link into an unreachable NFS mount does not return for as long as the
+kernel takes. "Bounded by the number of links rather than by the number of
+rows" is the argument that made the follow acceptable, and it is a real
+argument — but it is an argument about the *listing's* cost, not about the
+loop, where one unbounded `stat` is already one too many. So forty entries
+with a link among them is not the cheap case the threshold was chosen for,
+and it takes the thread. The undo — dropping the follow — is not available:
+the icon column needs it.
+
+The dev box's `/usr/bin` illustrates the new rule better than it ever
+illustrated the old one: 2 221 entries of which **943 are symlinks**, so it
+is read on a thread — and it would be even at a tenth the size, because of
+the links rather than the count. (Before #3847 it came in just under the
+threshold and was read inline; the M4-I measurements below were taken that
+way and are left as they were.)
 
 Deciding which path to take must itself be cheap, which is what
-`dir::count_at_most` is for: names only, no `stat`, nothing but the
-`getdents` the kernel is doing anyway, and **capped** at `BIG_DIR + 1`.
-The only question is "at least this many?", and counting a 200 000-entry
+`dir::reads_on_a_thread` is for: names and `d_type` only, no `stat`,
+nothing but the `getdents` the kernel is doing anyway, **capped** at
+`BIG_DIR + 1`, and **early-exiting on the first link** — so the walk is
+never longer than a plain count would have been. Counting a 200 000-entry
 directory to the end to discover it is big would be precisely the pause
 being avoided.
+
+It reads the directory through `rustix::fs::Dir` rather than
+`std::fs::read_dir`, and that is not a stylistic preference:
+`std::fs::DirEntry::file_type` silently falls back to an `lstat` when
+`d_type` is `DT_UNKNOWN`, which would put a `stat` per row back on exactly
+the network filesystems this clause is defending against. `rustix` returns
+`FileType::Unknown` instead, and the survey counts it **as if it were a
+symlink**: cheap and conservative, since the only cost of being wrong is a
+thread for a small directory.
+
+**What the second clause costs, stated plainly.** A small directory holding
+a link now takes the scan path, so the previous directory's rows stay on
+screen and the status line says `reading …` until the pipe wakes the loop —
+the documented big-directory behaviour, applied to a new case. On the very
+first listing at app start there are no previous rows, so the list is empty
+for one frame. That is the price of never blocking the loop on a `stat`
+with no deadline, and it is why the survey early-exits rather than being a
+`stat` walk of its own.
 
 ### A worker, a channel and a pipe
 
@@ -991,11 +1036,14 @@ tempting report is "0 app ticks, 2 frames". Running the same minute with
 minute clock, not this app. A measurement with no control could not have
 told those apart.
 
-**The 25 ms for `/usr/bin` is the inline path, deliberately.** At 1 860
-entries it is under the `BIG_DIR` threshold, so it is read on the loop —
-and 25 ms is the answer to "is that acceptable?", measured rather than
-assumed. The threshold is where it is because 2 000 entries is roughly
-where that number starts to be felt.
+**The 25 ms for `/usr/bin` is the inline path, deliberately — as measured.**
+At 1 860 entries it was under the `BIG_DIR` threshold, so it was read on the
+loop, and 25 ms is the answer to "is that acceptable?", measured rather than
+assumed. The threshold is where it is because 2 000 entries is roughly where
+that number starts to be felt. Under the **current** rule the same directory
+would take the thread, because it holds symlinks (#3847, *Long work off the
+loop*); the 25 ms stands as the measurement of what the inline path costs at
+that size, which is what the threshold was chosen against.
 
 **`nitro-term` really is spawned, and it really does ignore `-e`.** The
 process table shows `nitro-term -e vi /…/notes.txt`, which is the argv
@@ -1242,9 +1290,18 @@ regrets.
 * **A symlinked directory sorts with the files**, because its `Kind` is
   what `symlink_metadata` says. Since M4-I the listing *does* follow each
   link once — one `metadata` per symlink, for the icon column and for
-  `activate` — so a link into a dead mount can block the listing. What is
-  still refused is a `stat` per **row**; the follow is bounded by the
-  number of links. Argued above.
+  `activate` — so a link into a dead mount blocks the **scan thread**,
+  never the loop: since #3847 a directory holding a symlink is read off the
+  loop whatever its size. What is still refused is a `stat` per **row**;
+  the follow is bounded by the number of links. Argued above.
+* **`Entry::symlink_dir` is the listing's answer, not now's.** A symlink
+  retargeted between the listing and the double-click is activated from the
+  stale `stat`, and the inotify watch cannot help because it watches the
+  *directory* and a change to a link's *target* is not an event in it. The
+  icon and the behaviour therefore cannot disagree **within one listing**,
+  which is the honest scope; the failure mode is benign — `navigate`
+  re-`stat`s and says `not a directory: …` in the status line. Argued
+  above.
 * **`nitro-term` does not honour `-e` yet**, so the `text/*` editor
   fallback opens a terminal rather than the editor. The argv is already
   the conventional `term -e EDITOR path`, so this closes with a change in
@@ -1296,7 +1353,10 @@ integration tests (`event`). `DEPENDENCIES.md` carries the rows.
   names, the total order asserted from two starting permutations, the
   hidden-file filter, 1000-based sizes with the 999 999-byte rollover,
   UTC civil time including 1900 and 2000, the path bar's `~` and `..`
-  resolution with `$HOME` handed in rather than set, the capped count,
+  resolution with `$HOME` handed in rather than set, the survey that
+  decides thread-versus-loop (three plain files inline; one link — live or
+  dangling — on a thread whatever the size; past `BIG_DIR` with no link on
+  a thread; an unreadable path and a non-directory inline),
   and the background scan — woken through a real `poll`, delivering
   sorted entries, delivering a failure as a value, and surviving being
   dropped mid-read.
@@ -1329,3 +1389,11 @@ integration tests (`event`). `DEPENDENCIES.md` carries the rows.
 * `tests/files.rs` drives the assembled app through the harness — a real
   server on the fake backend, a real client, real pixels — which is where
   the widget half, the key handling and the addressing are checked.
+  `a_big_directory_is_read_off_the_loop_and_the_ui_answers_while_it_is` is
+  the 50 000-entry case, and
+  `a_directory_holding_a_symlink_is_listed_off_the_loop` is the other
+  clause of the rule: a **three-entry** directory with one link in it,
+  asserted to be `scanning()` with `reading` in the status line before its
+  pipe is drained, and to produce the same folder icon, `→ <dir>` detail
+  and activation afterwards. That is the dead-mount hazard being off the
+  loop, in the only form the harness can state it.

@@ -28,15 +28,19 @@
 //! `/usr/bin` is two thousand entries and a `stat` each; a directory on
 //! a sleeping NFS mount is a `read_dir` that returns in thirty seconds.
 //! Doing either between two `epoll_wait`s would freeze the window, so a
-//! directory of more than [`dir::BIG_DIR`] entries is read on a
+//! directory [`dir::reads_on_a_thread`] says yes about is read on a
 //! **thread**, and the result arrives through a pipe registered with
 //! [`Ui::add_fd`]. The toolkit has no thread integration of its own and
 //! does not need one: a descriptor is already something the loop waits
 //! on, so "long work off the loop" is a worker plus a pipe plus
 //! `add_fd`, and `docs/ui.md` records it as the general pattern.
 //!
-//! Small directories are read inline, because a thread and a wakeup cost
-//! more than reading forty entries.
+//! The rule is two clauses, not one number: more than [`dir::BIG_DIR`]
+//! entries, **or** at least one symlink. Small directories are otherwise
+//! read inline, because a thread and a wakeup cost more than reading
+//! forty entries — but a symlink is a `stat` with no bound (the listing
+//! follows each link once, for the icon column), and forty entries with a
+//! link into a dead mount among them is not the cheap case.
 //!
 //! # The listing refreshes itself
 //!
@@ -217,7 +221,12 @@ pub struct Files {
     /// pasted here. Recorded in `docs/files.md`.
     clipboard: Vec<PathBuf>,
     /// The system MIME glob table, loaded once at start.
-    globs: Vec<mime::Glob>,
+    ///
+    /// Shared rather than owned: a background [`dir::Scan`] resolves the
+    /// icon column on its thread, so the ~2 000 rules travel by refcount
+    /// rather than by copy — which matters now that a directory holding
+    /// one symlink takes that path.
+    globs: std::sync::Arc<[mime::Glob]>,
     /// Where the `.desktop` associations live.
     assoc: mime::Assoc,
     /// The trash.
@@ -257,7 +266,7 @@ impl Files {
             confirm: None,
             editing: Editing::None,
             clipboard: Vec::new(),
-            globs: mime::load_globs2(Path::new("/usr/share/mime/globs2")),
+            globs: mime::load_globs2(Path::new("/usr/share/mime/globs2")).into(),
             assoc: mime::Assoc::from_env(),
             trash: trash::Trash::from_env(),
             children: nitro_launcher::spawn::Children::new(),
@@ -291,7 +300,7 @@ impl Files {
         assoc: mime::Assoc,
         trash: trash::Trash,
     ) -> Self {
-        self.globs = globs;
+        self.globs = globs.into();
         self.assoc = assoc;
         self.trash = trash;
         self
@@ -1113,11 +1122,11 @@ pub fn relist(s: &mut Files, ui: &mut Ui<Files>) {
     arm_watch(s, ui);
     drop_scan(s, ui);
     let cwd = s.cwd.clone();
-    // The count is a `getdents` walk with no `stat` at all, so asking it
-    // of a fifty-thousand-entry directory costs a few milliseconds and
-    // answers the only question that matters here: is reading this thing
-    // going to stall the loop?
-    if dir::count_at_most(&cwd, dir::BIG_DIR + 1) > dir::BIG_DIR {
+    // The survey is a `getdents` walk with names and `d_type` only — no
+    // `stat` at all — and answers the only question that matters here: is
+    // reading this thing going to stall the loop? Two ways it can: too
+    // many entries, or a symlink, whose follow has no bound.
+    if dir::reads_on_a_thread(&cwd) {
         start_scan(s, ui, &cwd);
         return;
     }
@@ -1141,7 +1150,7 @@ pub fn relist(s: &mut Files, ui: &mut Ui<Files>) {
 /// directory for the fifty milliseconds it takes is better than a blank
 /// window, and the status line says what is happening.
 fn start_scan(s: &mut Files, ui: &mut Ui<Files>, cwd: &Path) {
-    let scan = match dir::Scan::start(cwd.to_path_buf(), s.sort, s.globs.clone()) {
+    let scan = match dir::Scan::start(cwd.to_path_buf(), s.sort, std::sync::Arc::clone(&s.globs)) {
         Ok(scan) => scan,
         Err(e) => {
             // A thread we could not start is not a reason to show
@@ -1273,7 +1282,7 @@ fn watch_fired(s: &mut Files, ui: &mut Ui<Files>) {
     // watch, which is two syscalls and a window in which a change is
     // missed.
     let cwd = s.cwd.clone();
-    if dir::count_at_most(&cwd, dir::BIG_DIR + 1) > dir::BIG_DIR {
+    if dir::reads_on_a_thread(&cwd) {
         drop_scan(s, ui);
         start_scan(s, ui, &cwd);
         return;
@@ -1358,9 +1367,16 @@ pub fn activate(s: &mut Files, ui: &mut Ui<Files>, index: usize) {
     let path = s.cwd.join(&entry.name);
     // A symlink's target was resolved when the listing was read (one
     // `metadata` per link, `dir::read_dir`), which is also what put a
-    // folder in its icon column — so "enter the directory this points at"
-    // and "show it as a folder" cannot disagree, and activating a row
-    // costs no syscall at all.
+    // folder in its icon column — so *within one listing* "enter the
+    // directory this points at" and "show it as a folder" cannot
+    // disagree, and activating a row costs no syscall at all.
+    //
+    // The scope is honest rather than absolute: a link retargeted between
+    // the listing and the click is answered from the listing's `stat`, and
+    // the inotify watch cannot close that window because it watches the
+    // *directory* and a change to a link's target is not an event in it.
+    // The failure is benign — `navigate` re-`stat`s and reports "not a
+    // directory" in the status line.
     if entry.opens_a_directory() {
         navigate(s, ui, path);
         return;

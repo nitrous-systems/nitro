@@ -1346,6 +1346,10 @@ fn every_type_gets_its_own_icon_and_the_server_draws_them() {
     std::os::unix::fs::symlink(dir.join("adir"), dir.join("i-to-dir")).expect("symlink");
     std::os::unix::fs::symlink(dir.join("b.txt"), dir.join("j-to-file")).expect("symlink");
     let (mut h, ids) = app(&dir, &root.join("xdg"));
+    // A directory holding symlinks is read on the scan thread whatever
+    // its size (`dir::reads_on_a_thread`), so the listing arrives with the
+    // pipe's wakeup rather than inline.
+    drive_scan(&mut h);
 
     let got: Vec<(String, String)> = rows(&h, ids)
         .into_iter()
@@ -1458,6 +1462,71 @@ fn every_type_gets_its_own_icon_and_the_server_draws_them() {
 }
 
 #[test]
+fn a_directory_holding_a_symlink_is_listed_off_the_loop() {
+    // The dead-mount hazard, in the only form the harness can state it.
+    // `dir::read_dir` follows each symlink once for the icon column, and a
+    // link into an unreachable mount is a `stat` that does not return — so
+    // a directory with a link in it is read on the scan thread *whatever
+    // its size*, not just past `dir::BIG_DIR`. Three entries here, which
+    // before #3847 would have been read inline on the loop.
+    let (root, dir) = fixture("symlink-thread");
+    std::fs::create_dir_all(dir.join("real")).expect("a subdirectory");
+    write(&dir.join("a.txt"), "x");
+    std::os::unix::fs::symlink(dir.join("real"), dir.join("to-real")).expect("symlink");
+    let (mut h, ids) = app(&dir, &root.join("xdg"));
+
+    // The scan is in flight before its pipe is drained: the listing has
+    // not been read yet, and the loop is free.
+    assert!(
+        h.state().scanning(),
+        "a directory holding a symlink is read on a thread, not here"
+    );
+    assert!(
+        status(&h, ids).contains("reading"),
+        "and the status line says what it is doing: {:?}",
+        status(&h, ids)
+    );
+
+    drive_scan(&mut h);
+    assert!(!h.state().scanning(), "the scan finished and was unhooked");
+
+    // And the listing that arrives is the same one the inline path would
+    // have produced: the icon came from the follow, the detail column
+    // still says it is a link, and activating it enters the directory.
+    let (icon, detail) = rows(&h, ids)
+        .into_iter()
+        .find(|(_, t, _)| t == "to-real")
+        .map_or_else(|| panic!("no row to-real"), |(i, _, d)| (i, d));
+    assert_eq!(icon, "folder-fill", "the follow happened on the thread");
+    assert_eq!(detail, "→ <dir>");
+
+    let index = names_of(&h, ids)
+        .iter()
+        .position(|n| n == "to-real")
+        .expect("the row");
+    {
+        let (ui, state) = h.parts();
+        nitro_ui::introspect::invoke(
+            ui,
+            state,
+            &format!("window/{}", names::LIST),
+            "activate",
+            Some(&index.to_string()),
+        )
+        .expect("activate the link");
+    }
+    h.settle();
+    assert_eq!(
+        h.state().cwd(),
+        dir.join("to-real"),
+        "activating the link entered the directory"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    h.quit();
+}
+
+#[test]
 fn a_symlinked_directory_is_a_folder_icon_and_still_marked_as_a_link() {
     // The one row where the icon deliberately lies about the *kind*: a
     // symlink to a directory draws a folder, because activating it enters
@@ -1470,6 +1539,9 @@ fn a_symlinked_directory_is_a_folder_icon_and_still_marked_as_a_link() {
     std::os::unix::fs::symlink(dir.join("target.txt"), dir.join("to-file")).expect("symlink");
     std::os::unix::fs::symlink(dir.join("nowhere"), dir.join("dangling")).expect("symlink");
     let (mut h, ids) = app(&dir, &root.join("xdg"));
+    // Three links, so this directory is read off the loop; see
+    // `a_directory_holding_a_symlink_is_listed_off_the_loop`.
+    drive_scan(&mut h);
 
     let by = |h: &Harness<Files>, name: &str| -> (String, String) {
         rows(h, ids)
@@ -1536,6 +1608,11 @@ fn a_selection_move_does_not_re_resolve_a_single_mime_type() {
     }
     std::os::unix::fs::symlink(dir.join("f00.txt"), dir.join("link")).expect("symlink");
     let (mut h, ids) = app(&dir, &root.join("xdg"));
+    // The link puts this listing on the scan thread, and the baseline has
+    // to be taken *after* it arrives — a `listings` counter read before
+    // the first listing would be compared against a listing that was
+    // still in flight.
+    drive_scan(&mut h);
     let before = h.state().listings();
     let first = rows(&h, ids);
 

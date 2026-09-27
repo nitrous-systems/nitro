@@ -463,12 +463,22 @@ fn is_font(mime: &str) -> bool {
 /// "a file", which is true, rather than guessing.
 #[must_use]
 pub fn icon_for(mime: &str) -> &'static str {
-    // Lowercased and stripped of any `; charset=…` parameter: a `globs2`
-    // table holds bare types, but a MIME type is case-insensitive
-    // (RFC 2045 §5.1) and this string need not always come from there.
+    // Stripped of any `; charset=…` parameter, then lowercased — a MIME
+    // type is case-insensitive (RFC 2045 §5.1) and this string need not
+    // come from a `globs2` table, which holds bare lowercase types.
+    //
+    // `split`/`trim` borrow, so the copy is paid **only** by a type that
+    // is actually mixed-case: neither `builtin_type` nor a `globs2` table
+    // produces one, and this is once per file per listing.
     let mime = mime.split(';').next().unwrap_or(mime).trim();
-    let lower = mime.to_ascii_lowercase();
-    let mime = lower.as_str();
+    if mime.bytes().any(|b| b.is_ascii_uppercase()) {
+        return icon_for_lower(&mime.to_ascii_lowercase());
+    }
+    icon_for_lower(mime)
+}
+
+/// [`icon_for`]'s map, on a type already bare and lowercase.
+fn icon_for_lower(mime: &str) -> &'static str {
     if is_code(mime) {
         return "file-earmark-code";
     }
