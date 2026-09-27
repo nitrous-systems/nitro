@@ -50,26 +50,48 @@ that disconnects — the descriptors can never arrive, so the two ends
 disagree about the byte stream, and a desynchronised stream cannot be
 resynchronised.
 
-In v1 exactly one message carries a descriptor, `CreateBuffer`, so the
-rule in practice is: **no buffers, and therefore no `Image` content, on
-a remote link.** The server answers a remote **buffer op** with
-`Error { BadBuffer }` but keeps the client connected, which is the one
-place an error is not fatal to the connection.
+Four messages carry a descriptor: `CreateBuffer` (0x0301) and
+`SendSelection` (0x0307) client → server, `Keymap` (0x8208) and
+`SelectionData` (0x8502) server → client. (One did in M1; the rest arrived
+with M5-A. v1 grows ops behind capability bits, which is the documented
+versioning policy.) None of them can cross TCP, but they are refused on
+**two different terms**, because only one of them has a useful
+"the feature is simply absent" story:
 
-That covers all three of `CreateBuffer`, `BufferDamage` and `SetImage`,
-not only the one carrying the fd: the other two merely *name* a buffer,
-but a remote client can never have registered one, so all three are
-equally impossible and get the same message. Refusing only the first
+* **Buffers** — the rule in practice is **no buffers, and therefore no
+  `Image` content, on a remote link.** The server answers a remote
+  **buffer op** with `Error { BadBuffer }` but keeps the client connected,
+  which is the one place an error is not fatal to the connection.
+* **Clipboard and keymap** — handled by **withholding `caps::DATA` /
+  `caps::KEYMAP`** rather than by a non-fatal refusal (see below and
+  [File descriptors](#file-descriptors)), so a conformant client never
+  sends one at all. One sent anyway is fatal `Error { Protocol }`, naming
+  the message. It is not answered with the buffers sentence: the code and
+  the explanation would both be about the wrong feature.
+
+The receive side splits on exactly that, before decoding (decoding an fd
+op with no descriptors attached is the fatal `MissingFd` above):
+`needs_fd(op) && is_buffer_op(op)` is the non-fatal `Error::RemoteNoFds`,
+and any other fd-carrying op is `Error::Unexpected` and so `Protocol`. A
+future fd-carrying op therefore defaults to fatal, which is the safe
+direction.
+
+The buffers rule covers all three of `CreateBuffer`, `BufferDamage` and
+`SetImage`, not only the one carrying the fd: the other two merely *name*
+a buffer, but a remote client can never have registered one, so all three
+are equally impossible and get the same message. Refusing only the first
 would leave a client disconnected by the `SetImage` that follows it,
 with the worse error arriving after the recoverable one. `SetImage`
 naming `BufferId::NONE` is exempt — it *clears* an image node, names no
 buffer, and is the one op here a remote client may legitimately send.
 
-The clipboard is handled by **not advertising `DATA`** on a remote link
-rather than by a non-fatal refusal: every leg of a transfer carries a
-descriptor, so there is no useful subset to allow, and a conformant client
-never sends a `DATA` op without the bit. One that does anyway is
-`Error { Protocol }`.
+The clipboard gets the *other* treatment because there is nothing to keep
+working: **every** leg of a transfer carries a descriptor, so there is no
+useful subset to allow, and withholding `DATA` says so once at handshake
+time instead of refusing op after op. A conformant client therefore never
+sends a `DATA` op at all, and one that does anyway has ignored its own
+capability mask — `Error { Protocol }`, and the connection goes. `KEYMAP`
+is withheld for the same reason.
 
 A remote receive does `recvmsg` with **no ancillary buffer** at all: a
 TCP socket cannot produce an `SCM_RIGHTS` cmsg, so asking for one would
@@ -138,7 +160,10 @@ consequences are worth naming, because three places used to assume the
 server never sent one:
 
 * `needs_fd` is **direction-agnostic**. Ops are numerically disjoint
-  between the directions, so one function classifies both.
+  between the directions, so one function classifies both. What it means
+  on the *receive* side splits on `is_buffer_op` — non-fatal for buffers,
+  fatal for everything else; see [Descriptors on a remote
+  link](#descriptors-on-a-remote-link).
 * The server's `send` refuses an fd-carrying message on a **remote** (TCP)
   link before encoding it, exactly as the client's has since M4-E1. A
   frame whose header promises descriptors that can never arrive would

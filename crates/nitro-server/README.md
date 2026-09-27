@@ -67,11 +67,16 @@ reload may create, move or close it without disturbing a connected
 client. A connection accepted there gets `REMOTE` (bit 3) on top of the
 usual bits and **never `SHELL`** — the shell privilege is having opened a
 `0700` path, and a port proves nothing of the sort. It also cannot carry
-file descriptors, so `CreateBuffer` is answered with
+file descriptors, so `CreateBuffer` — the *buffer* op that carries one —
+is answered with
 `Error { BadBuffer, "buffers are not available on a remote link" }` and
 the client is *kept*: this is the one error that does not close the
 connection, because a client that missed the capability bit is better
-served by an explanation than by a dead socket. Everything else — node
+served by an explanation than by a dead socket. The other fd-carrying ops
+(`SendSelection`, `Keymap`, `SelectionData`) are handled by **withholding
+their capability bit** instead — `caps::DATA` and `caps::KEYMAP` are
+absent on a remote link — so a conformant client never sends one, and one
+sent anyway is a fatal `Error { Protocol }`. Everything else — node
 ownership, damage, window management, decorations, input — is the
 identical code path. **There is no authentication**; the documented
 model is loopback plus an SSH port-forward, and a non-loopback bind

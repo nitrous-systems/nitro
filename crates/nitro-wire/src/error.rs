@@ -105,7 +105,8 @@ pub enum Error {
         theirs: u32,
     },
     /// The peer sent a well-formed message that does not belong here (for
-    /// example anything but `Welcome` in answer to `Hello`).
+    /// example anything but `Welcome` in answer to `Hello`, or an
+    /// fd-carrying non-buffer op from a remote peer).
     Unexpected(&'static str),
     /// The server answered with a fatal `Error` message.
     Rejected {
@@ -129,6 +130,13 @@ pub enum Error {
     /// `upload_image` and carries on drawing the rest of the tree. A
     /// caller that instead propagates it will stop, which for a paint
     /// pass means the app exits — see `docs/remote.md`.
+    ///
+    /// On the **receive** side (`ClientStream::next_msg`) it is raised
+    /// only for a **buffer** op, which is what makes that non-fatal
+    /// "there is no buffer here" answer correct. A remote peer's
+    /// fd-carrying *non-buffer* op — `SendSelection`, whose capability
+    /// bit is never advertised on a remote link — is
+    /// [`Error::Unexpected`] instead, and fatal.
     RemoteNoFds,
     /// `NITRO_SOCKET` (or `remote.listen`) named something unusable.
     BadEndpoint(String),

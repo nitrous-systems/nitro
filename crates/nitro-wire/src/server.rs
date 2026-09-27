@@ -306,21 +306,41 @@ impl ClientStream {
     /// answer with [`ClientStream::fail`] and drop the client.
     ///
     /// The **one exception** is [`Error::RemoteNoFds`], which is not
-    /// fatal: it means a remote peer sent an op that needs a descriptor
-    /// (`CreateBuffer`) with none declared. The frame was consumed whole,
-    /// so the stream is still synchronised and the caller may keep the
-    /// client and carry on — which is what the server does, because a
-    /// client that ignored `caps::REMOTE` deserves an explanation and not
-    /// a dead socket. A frame that *declares* descriptors on a remote
-    /// link is a different thing and stays fatal: the descriptors can
-    /// never arrive, so the peer and the receiver disagree about the byte
+    /// fatal: it means a remote peer sent a **buffer** op that needs a
+    /// descriptor (`CreateBuffer`) with none declared. The frame was
+    /// consumed whole, so the stream is still synchronised and the caller
+    /// may keep the client and carry on — which is what the server does,
+    /// because a client that ignored `caps::REMOTE` deserves an
+    /// explanation and not a dead socket.
+    ///
+    /// A remote peer's **non-buffer** fd op ([`needs_fd`] but not
+    /// [`is_buffer_op`]: `SendSelection` today) is instead
+    /// [`Error::Unexpected`], and so fatal `Error { Protocol }`. That is
+    /// the clipboard and keymap rule rather than the buffer one: those
+    /// features are withheld by *not advertising* `caps::DATA` /
+    /// `caps::KEYMAP` on a remote link, so a conformant client cannot
+    /// send one at all, and the non-fatal "no buffers here" sentence
+    /// would be both the wrong code and the wrong explanation. See
+    /// `docs/wire.md` §*Descriptors on a remote link*.
+    ///
+    /// A frame that *declares* descriptors on a remote link is a
+    /// different thing again and stays fatal: the descriptors can never
+    /// arrive, so the peer and the receiver disagree about the byte
     /// stream, and that is [`DecodeError::MissingFd`].
     pub fn next_msg(&mut self) -> Result<Option<ClientMsg>, Error> {
         let Some(frame) = self.framer.next_frame()? else {
             return Ok(None);
         };
         if self.socket.is_remote() && needs_fd(frame.op) {
-            return Err(Error::RemoteNoFds);
+            // Refused before decoding, because decoding an fd op with no
+            // fds attached is the fatal `DecodeError::MissingFd`. The op
+            // is all we know, so classify on it: a buffer op is the
+            // non-fatal "no buffers on a remote link" story, anything
+            // else is the withheld-capability story and fatal.
+            if is_buffer_op(frame.op) {
+                return Err(Error::RemoteNoFds);
+            }
+            return Err(Error::Unexpected(remote_fd_op_reason(frame.op)));
         }
         let mut fds = FdQueue::from_vec(frame.fds);
         let msg = ClientMsg::decode(frame.op, &frame.payload, &mut fds)?;
@@ -409,6 +429,11 @@ impl ClientStream {
 /// `matches!` at the call site so that adding another fd-carrying message
 /// is a change in one place, and so the rule is greppable from the remote
 /// code that depends on it.
+///
+/// On the **receive** side the refusal it drives splits on
+/// [`is_buffer_op`]: a buffer op is the non-fatal [`Error::RemoteNoFds`],
+/// any other fd op is a fatal [`Error::Unexpected`]. See
+/// [`ClientStream::next_msg`].
 #[must_use]
 pub fn needs_fd(op: u16) -> bool {
     op == msg::CreateBuffer::OP
@@ -420,10 +445,17 @@ pub fn needs_fd(op: u16) -> bool {
 /// Whether an op is about a **buffer**, and so cannot mean anything on a
 /// remote link.
 ///
-/// A superset of [`needs_fd`], and the distinction matters. Only
-/// `CreateBuffer` carries a descriptor; `BufferDamage` and `SetImage`
-/// merely *name* a buffer. But a remote client can never have registered
-/// one, so all three are equally impossible — and a client that ignored
+/// This and [`needs_fd`] **overlap** rather than nest: they share only
+/// `CreateBuffer`. `is_buffer_op` reaches past descriptors to
+/// `BufferDamage` and `SetImage`, which merely *name* a buffer; since
+/// M5-A `needs_fd` reaches past buffers to `SendSelection`, `Keymap` and
+/// `SelectionData`. The receive-side split in
+/// [`ClientStream::next_msg`] depends on that difference being real:
+/// `needs_fd(op) && !is_buffer_op(op)` is the fatal half.
+///
+/// Of the buffer ops only `CreateBuffer` carries a descriptor. But a
+/// remote client can never have registered a buffer, so all three are
+/// equally impossible — and a client that ignored
 /// `caps::REMOTE` should hear the same clear sentence for each, rather
 /// than surviving its `CreateBuffer` and then being disconnected by the
 /// `SetImage` that follows it two messages later with "no buffer with
@@ -437,6 +469,24 @@ pub fn needs_fd(op: u16) -> bool {
 #[must_use]
 pub fn is_buffer_op(op: u16) -> bool {
     op == msg::CreateBuffer::OP || op == msg::BufferDamage::OP || op == msg::SetImage::OP
+}
+
+/// Why a remote peer's fd-carrying **non-buffer** op is refused, as the
+/// `&'static str` [`Error::Unexpected`] carries.
+///
+/// A `match` on the op rather than one generic sentence so the server's
+/// log and the client's `Error` detail name the message. `SendSelection`
+/// is the only client op in the set, and [`ClientStream::next_msg`] is
+/// the only caller, so the fallback is unreachable today — it exists so
+/// that a *future* client-side fd op defaults to the fatal half, which is
+/// the safe direction: a new op is never silently folded into the
+/// buffers story.
+fn remote_fd_op_reason(op: u16) -> &'static str {
+    if op == msg::SendSelection::OP {
+        "SendSelection needs a file descriptor, which a remote link cannot carry"
+    } else {
+        "this op needs a file descriptor, which a remote link cannot carry"
+    }
 }
 
 /// The [`ErrorCode`] to report for a protocol-level failure.

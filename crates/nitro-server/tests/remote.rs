@@ -408,6 +408,81 @@ fn a_buffer_from_a_remote_client_is_refused_and_the_client_survives() {
     h.quit();
 }
 
+/// The **other half** of the receive-side split: a clipboard fd op is a
+/// fatal `Protocol`, not the buffers story.
+///
+/// M5-A widened `needs_fd` past `CreateBuffer`, but `next_msg`'s remote
+/// refusal stayed one blanket `RemoteNoFds`, so a remote `SendSelection`
+/// earned `Error { BadBuffer, "buffers are not available on a remote
+/// link" }` — the wrong code and a sentence about the wrong feature. The
+/// split on `is_buffer_op` sends it to the generic fatal arm instead,
+/// which is the policy `docs/wire.md` already documents for the clipboard:
+/// `caps::DATA` is withheld on a remote link, so a client that sends one
+/// anyway is `Error { Protocol }` and goes.
+///
+/// A client built on `nitro-wire` cannot produce the frame —
+/// `Connection::send` refuses an fd op on a remote link before encoding —
+/// so this drives raw bytes down a handshaked connection. It declares
+/// `fds: 0`: `fds: 1` is the pre-existing fatal `MissingFd` case, covered
+/// by `a_frame_declaring_descriptors_is_fatal_on_a_remote_link`.
+#[test]
+fn a_clipboard_fd_op_from_a_remote_client_is_a_protocol_error_not_a_buffer_one() {
+    let h = Harness::start("clipfd", "remote.listen = 127.0.0.1:0\n");
+    let mut honest = h.remote_client("remote-honest");
+    let mut seen = Vec::new();
+    make_window(&mut honest, &mut seen, 1, 1);
+    h.settle();
+    assert_eq!(h.stat("remote_clients"), 1);
+
+    // A second client, handshaked normally so the frame below lands after
+    // the `Hello` bookkeeping rather than in the "message before Hello"
+    // arm, which would pass this test for the wrong reason.
+    let mut conn = h.remote_client("remote-clipfd");
+    let mut seen = Vec::new();
+    make_window(&mut conn, &mut seen, 2, 1);
+    h.settle();
+    assert_eq!(h.stat("remote_clients"), 2);
+
+    // SendSelection { request } with no descriptor declared. Written
+    // straight to the socket: everything queued has been flushed, so this
+    // cannot interleave with a partial frame.
+    let mut frame = nitro_wire::header::encode(4, nitro_wire::msg::SendSelection::OP, 0).to_vec();
+    frame.extend_from_slice(&7u32.to_le_bytes());
+    let mut at = 0;
+    while at < frame.len() {
+        at += rustix::io::write(conn.as_fd(), &frame[at..]).expect("write the raw frame");
+    }
+
+    let (code, msg) = expect(&mut conn, &mut seen, "the clipboard refusal", |m| match m {
+        ServerMsg::Error(e) => Some((e.code, e.msg.clone())),
+        _ => None,
+    });
+    assert_eq!(
+        code,
+        nitro_wire::types::ErrorCode::Protocol,
+        "a clipboard op is not a buffer problem: {msg}"
+    );
+    assert!(
+        msg.contains("SendSelection"),
+        "the detail names the message: {msg}"
+    );
+    assert!(
+        !msg.contains("buffer"),
+        "and does not explain it as a buffer: {msg}"
+    );
+
+    // Fatal: the connection goes, unlike the buffers refusal. The honest
+    // client is untouched.
+    drop(conn);
+    wait_for("the clipboard liar to be disconnected", || {
+        h.stat("remote_clients") == 1
+    });
+    h.settle();
+    assert_eq!(h.stat("windows"), 1, "the honest client kept its window");
+    drop(honest);
+    h.quit();
+}
+
 /// The **follow-up** ops, which is the half a client that ignores
 /// `caps::REMOTE` actually meets.
 ///

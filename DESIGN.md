@@ -776,15 +776,19 @@ client that speaks its four-message socket protocol, hosted by
     descriptor-carrying message is refused **before it is encoded**
     (`Error::RemoteNoFds`, nothing queued, connection untouched), refused
     again at the socket as a backstop so no half-frame can ever reach the
-    wire, and answered by the server with an `Error` that **keeps the
-    client connected** — the one error in the protocol that is not fatal,
-    because a client that ignored the capability bit is better served by
-    an explanation than a dead socket. All *three* buffer ops are refused
-    on those terms, not just the one carrying the descriptor: an app
+    wire, and — for the **buffer** ops — answered by the server with an
+    `Error` that **keeps the client connected**: the one error in the
+    protocol that is not fatal, because a client that ignored the
+    capability bit is better served by an explanation than a dead socket.
+    All *three* buffer ops are refused on those terms, not just the one
+    carrying the descriptor: an app
     sends `CreateBuffer`, then the `SetImage` naming it, then
     `BufferDamage`, and refusing only the first would hand the client a
     clear sentence and then disconnect it two messages later with `no
-    buffer with id 1`.
+    buffer with id 1`. The *other* fd-carrying ops M5-A added are handled
+    by withholding their capability bit instead of by a non-fatal
+    refusal, so one sent anyway is a fatal `Protocol` — `docs/wire.md`
+    §*Descriptors on a remote link*.
 
     In the toolkit the refusal is **not an error value at all**, and that
     is the difference between a feature and a footgun: `upload_image`

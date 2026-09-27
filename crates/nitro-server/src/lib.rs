@@ -111,9 +111,10 @@ pub const SERVER_NAME: &str = "nitro";
 /// What a **remote** client is told when it sends a buffer op.
 ///
 /// One constant because it is sent from two places — the decoder's
-/// refusal of an fd-carrying `CreateBuffer`, and the check on the two
-/// ops that only *name* a buffer — and a client that meets both should
-/// not get two different explanations of one rule.
+/// refusal of the fd-carrying buffer op (`CreateBuffer`; the decoder's
+/// other fd ops are a fatal `Protocol`, not this), and the check on the
+/// two ops that only *name* a buffer — and a client that meets both
+/// should not get two different explanations of one rule.
 const REMOTE_NO_BUFFERS: &str = "buffers are not available on a remote link: \
      file descriptors cannot be passed over TCP (caps::REMOTE, docs/remote.md)";
 
@@ -6221,6 +6222,16 @@ impl Server {
                 // socket. It keeps its windows and its connection; only
                 // the image is missing, which is exactly what "no pixels
                 // cross the link" means (`docs/remote.md`).
+                //
+                // "Buffer op" is accurate by construction, not by
+                // accident: `next_msg` splits its remote fd refusal on
+                // `nitro_wire::server::is_buffer_op`, so `RemoteNoFds`
+                // reaches this arm only for a buffer op — which is what
+                // makes `BadBuffer` and the `REMOTE_NO_BUFFERS` sentence
+                // right here. Any other fd-carrying op from a remote
+                // client arrives as `Error::Unexpected` and falls into
+                // the generic fatal arm below as `Protocol`, which is the
+                // withheld-`DATA`/`KEYMAP` rule (`docs/wire.md`).
                 Err(nitro_wire::error::Error::RemoteNoFds) => {
                     let Some(client) = self.wire_clients.get_mut(&token) else {
                         return false;

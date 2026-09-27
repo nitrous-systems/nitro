@@ -11,9 +11,11 @@ use nitro_core::{Rect, Size};
 use nitro_wire::client::Connection;
 use nitro_wire::codec::Writer;
 use nitro_wire::io::Socket;
-use nitro_wire::msg::{ClientMsg, Commit, CreateBuffer, Keymap, ServerMsg, SetBounds, SetIcon};
+use nitro_wire::msg::{
+    ClientMsg, Commit, CreateBuffer, Keymap, SendSelection, ServerMsg, SetBounds, SetIcon,
+};
 use nitro_wire::server::{ClientStream, TcpListener};
-use nitro_wire::types::{BufferId, KeymapFormat, Layer, NodeId, caps, format};
+use nitro_wire::types::{BufferId, ErrorCode, KeymapFormat, Layer, NodeId, caps, format};
 use nitro_wire::{Endpoint, Error, header};
 
 mod common;
@@ -279,6 +281,107 @@ fn the_server_refuses_an_fd_frame_on_a_remote_link() {
         msgs.iter().all(|m| !matches!(m, ServerMsg::Keymap(_))),
         "no half-keymap reached the client: {msgs:#?}"
     );
+}
+
+/// The receive side's **split**, which is the bug this test pins.
+///
+/// M5-A widened `needs_fd` past `CreateBuffer`, but `next_msg`'s remote
+/// refusal stayed one blanket `Err(Error::RemoteNoFds)` — which the server
+/// answers with `Error { BadBuffer, "buffers are not available on a
+/// remote link" }`. A remote `SendSelection` therefore earned a clipboard
+/// op a buffer code and a sentence about buffers. It now splits on
+/// `is_buffer_op`: buffers stay the non-fatal buffers story, anything else
+/// is the fatal `Protocol` the withheld-`DATA` policy already promises.
+///
+/// Two frames rather than one, so the test means "these differ" and not
+/// "one of them errors". Both declare `fds: 0`: `fds: 1` is the *other*,
+/// pre-existing fatal case (`DecodeError::MissingFd` in the framer) and
+/// would test nothing new. And both arrive *after* the handshake, because
+/// the remote check sits before the `Hello` bookkeeping — an
+/// un-handshaked frame is `Unexpected("message before Hello")` and would
+/// pass this test for the wrong reason.
+#[test]
+fn a_remote_buffer_op_and_a_remote_clipboard_op_are_refused_differently() {
+    let listener = TcpListener::bind("127.0.0.1:0".parse().expect("literal")).expect("bind");
+    let addr = listener.addr();
+
+    let client = thread::spawn(move || {
+        let endpoint = Endpoint::parse(&format!("tcp://{addr}")).expect("parse");
+        let conn = Connection::connect_endpoint(&endpoint, "split-client").expect("connect");
+        assert!(conn.is_remote());
+        // Raw frames: `Connection::send` would refuse both on the sender
+        // side (correctly), so a conformant client cannot produce them.
+        // Its out buffer is empty after the handshake, so writing past it
+        // cannot interleave with a queued frame.
+        let mut bytes = header::encode(0, CreateBuffer::OP, 0).to_vec();
+        bytes.extend_from_slice(&header::encode(4, SendSelection::OP, 0));
+        bytes.extend_from_slice(&7u32.to_le_bytes());
+        let mut at = 0;
+        while at < bytes.len() {
+            wait_writable(conn.as_fd());
+            at += rustix::io::write(conn.as_fd(), &bytes[at..]).expect("write raw frames");
+        }
+        // Hold the socket open until the server has read both.
+        thread::sleep(std::time::Duration::from_millis(200));
+    });
+
+    let mut stream = accept_blocking(&listener);
+    let hello = next_blocking(&mut stream);
+    assert!(matches!(hello, ClientMsg::Hello(_)), "{hello:?}");
+    stream
+        .welcome("nitro-test", caps::WM | caps::REMOTE)
+        .expect("welcome");
+    assert!(stream.flush().expect("flush"));
+
+    // Frame 1, `CreateBuffer`: the buffers story, unchanged since M4-E1.
+    let first = loop {
+        match stream.next_msg() {
+            Ok(Some(m)) => panic!("a buffer op decoded: {m:?}"),
+            Ok(None) => {
+                wait_readable(stream.as_fd());
+                stream.read().expect("read");
+            }
+            Err(e) => break e,
+        }
+    };
+    assert!(
+        matches!(first, Error::RemoteNoFds),
+        "a remote buffer op is still RemoteNoFds, got {first:?}"
+    );
+    // `code_for` is the *decoder's* mapping and says `Protocol` for every
+    // wire error; the `BadBuffer` the client actually hears is the
+    // server's own choice for this variant, pinned in
+    // `nitro-server/tests/remote.rs`.
+
+    // Frame 2, `SendSelection`: not a buffer op, so fatal `Protocol` —
+    // and the sentence must name the message, not buffers.
+    let second = loop {
+        match stream.next_msg() {
+            Ok(Some(m)) => panic!("a clipboard fd op decoded: {m:?}"),
+            Ok(None) => {
+                wait_readable(stream.as_fd());
+                stream.read().expect("read");
+            }
+            Err(e) => break e,
+        }
+    };
+    assert!(
+        matches!(second, Error::Unexpected(_)),
+        "a remote clipboard fd op is Unexpected, got {second:?}"
+    );
+    assert_eq!(
+        nitro_wire::server::code_for(&second),
+        ErrorCode::Protocol,
+        "and so a fatal protocol error, not a buffer one"
+    );
+    let detail = second.to_string();
+    assert!(detail.contains("SendSelection"), "{detail}");
+    assert!(
+        !detail.contains("buffer"),
+        "a clipboard op must not be explained as a buffer: {detail}"
+    );
+
+    client.join().expect("client thread");
 }
 
 /// The byte image of one message, spelled out.

@@ -80,6 +80,8 @@ capability bit and a new op, on a frozen v1. It is not this task.
 | window management, focus, `Alt+Tab`, decorations | **yes** | server-side, and the server does not care where a client is |
 | input: pointer, keyboard, touch | **yes** | events go out on the same socket |
 | `CreateBuffer` / `BufferDamage` / `Image` | **no** | a buffer *is* a file descriptor |
+| the clipboard (`caps::DATA`) | **no** / **the bit is withheld** | every leg of a transfer carries a descriptor |
+| the keymap (`caps::KEYMAP`) | **no** / **the bit is withheld** | `Keymap` hands over a descriptor |
 | the wallpaper | **no** | it is an `Image` and nothing else |
 | the shell socket (`caps::SHELL`) | **no** | the privilege is having opened a `0700` path |
 | `hey` against a remote app | **local to the app's machine** | the introspection socket is the app's, not the server's |
@@ -97,17 +99,28 @@ So it is refused, in three places, each doing a different job:
 1. **`Connection::send`** returns `Error::RemoteNoFds` for an
    fd-carrying message on a remote link, **before encoding**. Nothing is
    queued and nothing is written, so the connection is exactly as it was.
+   This step is fd-op-*general*, not buffer-specific: since M5-A that is
+   four messages (`CreateBuffer`, `SendSelection`, `Keymap`,
+   `SelectionData`), not one.
 2. **`Socket::send_once`** refuses again if one somehow got queued. A
    frame whose header declares descriptors that never arrive leaves the
    receiver waiting for bytes that do not exist, and a desynchronised
    stream is a dead connection. This is the backstop that makes the
    invariant "no half-frame ever reaches the wire" true rather than
-   merely intended.
+   merely intended. Also fd-op-general, and it works from frame offsets
+   rather than ops, so it could not be buffer-specific if it wanted to be.
 3. **The server** answers a remote buffer op with
    `Error { BadBuffer, "buffers are not available on a remote link" }`
    and **keeps the client**. A client that ignored `caps::REMOTE` is
    better served by an explanation than by a dead socket; only its image
-   is missing.
+   is missing. This step *is* buffer-specific, and provably so:
+   `ClientStream::next_msg` splits its remote refusal on `is_buffer_op`,
+   so `RemoteNoFds` reaches that arm for a buffer op and nothing else.
+   A remote client's **non-buffer** fd op — a `SendSelection` — is
+   instead `Error::Unexpected`, and so a fatal `Error { Protocol }`
+   naming the message: `caps::DATA` and `caps::KEYMAP` were never
+   advertised on that link, so there is no feature to keep half-working
+   and nothing about buffers to explain.
 
 **All three buffer ops, not just the one carrying a descriptor.** Only
 `CreateBuffer` passes an fd; `BufferDamage` and `SetImage` merely *name*
