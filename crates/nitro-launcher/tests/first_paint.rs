@@ -100,9 +100,12 @@ fn median(mut v: Vec<Duration>) -> Duration {
 fn time_shows(dir: &Path, label: &str) -> (Vec<Duration>, usize) {
     let mut h = Harness::shell(
         "nitro-launcher",
+        // The fixtures run `/bin/true`, so the native-only filter (see
+        // `NATIVE_PROGRAMS`) would empty them.
         Launcher::new()
             .with_dirs(vec![dir.to_path_buf()])
-            .with_builtins(Vec::new()),
+            .with_builtins(Vec::new())
+            .with_native_only(false),
         Surface::overlay(),
         Some(Size::new(300.0, 220.0)),
         build,

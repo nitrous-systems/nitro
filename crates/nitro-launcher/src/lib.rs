@@ -256,6 +256,18 @@ pub struct Launcher {
     /// Extra entries merged into every scan: the nitro binaries next to
     /// the launcher, so a box with no desktop files still works.
     builtins: Vec<Entry>,
+    /// Whether the scan keeps only nitro-native applications, as
+    /// [`is_native`] decides. On by default.
+    ///
+    /// A foreign application — firefox, a terminal emulator, anything
+    /// packaged by the distribution — is an X11 or Wayland client, and
+    /// nitro speaks neither yet: launching one puts a process on the box
+    /// that never shows a window. Listing them offers the user a row that
+    /// cannot work, so until Wayland support lands the list is restricted
+    /// to the programs in [`NATIVE_PROGRAMS`]. Temporary; see task 3842.
+    ///
+    /// Turned off by the tests, whose fixtures run `/bin/true`.
+    native_only: bool,
     /// The icon last **asked for** on each row, by row position.
     ///
     /// Held for the same reason `nitro-bar`'s `Entry::icon` is, and the
@@ -297,6 +309,7 @@ impl Launcher {
             shows: 0,
             dirs: desktop::search_dirs(),
             builtins: builtins(),
+            native_only: true,
             row_icons: Vec::new(),
             ids: None,
         }
@@ -320,6 +333,19 @@ impl Launcher {
     #[must_use]
     pub fn with_builtins(mut self, builtins: Vec<Entry>) -> Self {
         self.builtins = builtins;
+        self
+    }
+
+    /// Keep (`true`, the default) or drop (`false`) the restriction to
+    /// nitro-native applications. See the `native_only` field.
+    ///
+    /// For the tests, whose fixtures run `/bin/true` and would otherwise
+    /// be filtered out of their own scan. Consumed **before** the tree is
+    /// built, for the same reason [`Launcher::with_dirs`] is: the first
+    /// scan happens as the tree is built.
+    #[must_use]
+    pub fn with_native_only(mut self, on: bool) -> Self {
+        self.native_only = on;
         self
     }
 
@@ -419,8 +445,18 @@ impl Launcher {
     /// better name and a better command than "the binary is called
     /// nitro-calc", and the fallback should lose to it rather than
     /// duplicate it.
+    ///
+    /// Unless `native_only` is off, a scanned entry that is not a nitro
+    /// application is dropped: it could not run until Wayland support
+    /// lands. See [`NATIVE_PROGRAMS`] and task 3842.
     pub fn rescan(&mut self) {
-        let scanned = desktop::scan(&self.dirs);
+        // Filtered **before** the dedupe below, so a foreign `.desktop`
+        // that happened to name a built-in's program cannot delete the
+        // built-in it is not a replacement for.
+        let scanned: Vec<Entry> = desktop::scan(&self.dirs)
+            .into_iter()
+            .filter(|e| !self.native_only || is_native(e))
+            .collect();
         // A built-in is dropped when a real `.desktop` file names the
         // same program: a packaged entry has a better name and a better
         // command than "the binary is called nitro-calc", and the
@@ -484,6 +520,39 @@ impl Default for Launcher {
 fn program_file_name(entry: &Entry) -> &str {
     let p = entry.program();
     p.rsplit('/').next().unwrap_or(p)
+}
+
+/// The nitro applications the launcher is willing to list.
+///
+/// **Temporary.** A row that cannot work is worse than no row: nitro
+/// runs nitro-wire clients only, so every foreign `.desktop` file on the
+/// box — firefox, the distribution's terminal, a file manager — names an
+/// X11 or Wayland client that would start as a process and never show a
+/// window. Until Wayland support lands the list is restricted to these
+/// programs; the filter, this list and [`Launcher::with_native_only`]
+/// all go away with it. See task 3842.
+///
+/// The entries are program **file names**, which is what makes one list
+/// cover both kinds of entry: a deployed `.desktop` file says
+/// `Exec=nitro-calc`, and a built-in names an absolute path in the
+/// launcher's own directory. It also keeps the built-in dedupe honest —
+/// a packaged `/usr/share/applications/nitro-calc.desktop` still
+/// replaces the `nitro-calc` built-in — and still lists `nitro-amp`,
+/// which ships a `.desktop` file and has no built-in.
+pub const NATIVE_PROGRAMS: &[&str] = &[
+    "nitro-calc",
+    "nitro-term",
+    "nitro-settings",
+    "nitro-files",
+    "nitro-amp",
+    "nitro-demo",
+    "hello_dialog",
+];
+
+/// Whether `entry` runs one of the [`NATIVE_PROGRAMS`].
+#[must_use]
+pub fn is_native(entry: &Entry) -> bool {
+    NATIVE_PROGRAMS.contains(&program_file_name(entry))
 }
 
 /// The nitro binaries that sit next to the launcher.
@@ -1585,11 +1654,68 @@ mod tests {
         }
         let mut l = Launcher::new()
             .with_dirs(vec![dir.clone()])
-            .with_builtins(Vec::new());
+            .with_builtins(Vec::new())
+            // The fixtures run `/bin/true`, not a nitro program.
+            .with_native_only(false);
         l.rescan();
         let names: Vec<&str> = l.entries().iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["Alpha", "Beta"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_foreign_application_is_not_listed() {
+        // Until Wayland support lands, a row for firefox is a row that
+        // starts a process and never shows a window. See task 3842.
+        let dir =
+            std::env::temp_dir().join(format!("nitro-launcher-foreign-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("firefox.desktop"),
+            "[Desktop Entry]\nName=Firefox\nExec=firefox %u\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("nitro-amp.desktop"),
+            "[Desktop Entry]\nName=Amp\nExec=nitro-amp %F\n",
+        )
+        .unwrap();
+
+        let mut l = Launcher::new()
+            .with_dirs(vec![dir.clone()])
+            .with_builtins(Vec::new());
+        l.rescan();
+        let names: Vec<&str> = l.entries().iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["Amp"], "only the nitro application is listed");
+
+        let mut l = Launcher::new()
+            .with_dirs(vec![dir.clone()])
+            .with_builtins(Vec::new())
+            .with_native_only(false);
+        l.rescan();
+        let names: Vec<&str> = l.entries().iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["Amp", "Firefox"], "the knob turns it off");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_native_program_is_recognised_by_its_file_name() {
+        // A built-in names an absolute path in the launcher's own
+        // directory; a deployed `.desktop` file names a bare program. One
+        // list has to cover both, so the check is on the file name.
+        let entry = |prog: &str| Entry {
+            name: "X".to_owned(),
+            argv: vec![prog.to_owned()],
+            terminal: false,
+            icon: None,
+            path: None,
+            source: Source::Builtin,
+        };
+        assert!(is_native(&entry("/home/x/nitro-bin/nitro-calc")));
+        assert!(is_native(&entry("nitro-calc")));
+        assert!(!is_native(&entry("nitro-calcx")));
+        assert!(!is_native(&entry("/usr/bin/firefox")));
     }
 
     #[test]

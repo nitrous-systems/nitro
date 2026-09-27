@@ -36,7 +36,12 @@ const KEY_LEFTMETA: u32 = 125;
 fn launcher(dirs: Vec<PathBuf>, builtins: Vec<Entry>) -> Harness<Launcher> {
     Harness::shell(
         "nitro-launcher",
-        Launcher::new().with_dirs(dirs).with_builtins(builtins),
+        // The fixtures run `/bin/true`, so the native-only filter (see
+        // `NATIVE_PROGRAMS`) would empty every one of them.
+        Launcher::new()
+            .with_dirs(dirs)
+            .with_builtins(builtins)
+            .with_native_only(false),
         Surface::overlay(),
         // Smaller than the real 600×400: the harness runs a 320×240
         // output, and a window bigger than the output is cropped by
