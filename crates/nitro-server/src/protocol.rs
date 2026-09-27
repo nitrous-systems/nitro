@@ -798,6 +798,10 @@ mod tests {
                 press: Press::Up
             }
         );
+    }
+
+    #[test]
+    fn parses_wheel_and_key_inputs() {
         assert_eq!(
             input("input wheel 0 15").action,
             InputAction::Wheel {

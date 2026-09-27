@@ -241,8 +241,30 @@ fn injected_pointer_and_keys_reach_the_client_through_the_real_path() {
         [(15.0, AxisSource::Wheel), (-2.5, AxisSource::Finger)]
     );
 
-    // Keys by evdev code, and `type`.
+    // Errors.
+    assert!(
+        h.input("motion 1 2 NOPE").starts_with("err "),
+        "unknown output"
+    );
+    assert!(h.input("bogus").starts_with("err "));
+    assert!(h.input("wheel 0 15 every=16").starts_with("err "));
+
+    drop(conn);
+    h.quit();
+}
+
+#[test]
+fn injected_keys_and_text_reach_the_focused_window() {
+    let h = Harness::start("keys");
+    let mut conn = Connection::connect(&h.wire_path, "inject").expect("wire connect");
+    let mut seen = Vec::new();
+    let (win, _) = make_window(&mut conn, &mut seen);
+    expect(&mut conn, &mut seen, "focus", |m| match m {
+        ServerMsg::Focus(f) if f.window == win && f.focused => Some(()),
+        _ => None,
+    });
     let has_keymap = Keyboard::new().is_some();
+
     seen.clear();
     assert_eq!(h.input("key 30 tap"), "ok 2");
     expect(&mut conn, &mut seen, "key release", |m| match m {
@@ -287,14 +309,6 @@ fn injected_pointer_and_keys_reach_the_client_through_the_real_path() {
             .collect();
         assert_eq!(typed, "Ab");
     }
-
-    // Errors.
-    assert!(
-        h.input("motion 1 2 NOPE").starts_with("err "),
-        "unknown output"
-    );
-    assert!(h.input("bogus").starts_with("err "));
-    assert!(h.input("wheel 0 15 every=16").starts_with("err "));
 
     drop(conn);
     h.quit();
