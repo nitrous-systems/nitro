@@ -4225,6 +4225,38 @@ fn a_client_can_start_a_move_and_the_window_follows_the_pointer() {
     h.settle();
     assert_eq!(h.stat("dragging"), 0, "the release ended the drag");
 
+    // The drag took pointer focus away, as a Wayland grab does: the client
+    // saw the press but will never see the release, so the leave is what
+    // tells it the button is no longer its business.
+    let root = win.root;
+    expect(&mut conn, &mut inbox.0, "PointerLeave", |m| match m {
+        ServerMsg::PointerLeave(l) if l.window == root => Some(()),
+        _ => None,
+    });
+    let leave_idx = inbox
+        .0
+        .iter()
+        .position(|m| matches!(m, ServerMsg::PointerLeave(l) if l.window == root))
+        .unwrap();
+    // The first motion after the release, still over the window, is a
+    // fresh enter rather than a plain motion.
+    h.point_at(cx - 60.0 + 1.0, cy + 40.0, OUT);
+    h.settle();
+    wait_for("a PointerEnter after the leave", || {
+        conn.flush().unwrap();
+        let _ = conn.poll(&mut inbox.0);
+        inbox.0[leave_idx..]
+            .iter()
+            .any(|m| matches!(m, ServerMsg::PointerEnter(e) if e.window == root))
+    });
+    assert!(
+        !inbox.0.iter().any(|m| matches!(
+            m,
+            ServerMsg::PointerButton(b) if b.state == ButtonState::Released
+        )),
+        "the release belongs to the drag, not the client"
+    );
+
     await_configure(&mut conn, &mut inbox, &mut win, "the client move");
     let after = win.frame(false);
     assert_eq!((after.x - before.x, after.y - before.y), (-60.0, 40.0));

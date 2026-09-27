@@ -810,6 +810,9 @@ fn scroll(dx: f64, dy: f64, source: AxisSource, time_ns: u64) -> InputEvent {
 mod tests {
     use super::*;
 
+    use nitro_core::{IRect, Rect, Size};
+    use nitro_scene::{ClientId, Fill, Layer, NodeKind};
+
     #[test]
     fn button_state_tracks_presses_and_releases() {
         let mut p = Pointer::default();
@@ -826,8 +829,6 @@ mod tests {
         p.buttons.clear();
         assert!(!p.any_button_down(), "a VT switch forgets held buttons");
     }
-    use nitro_core::{IRect, Rect, Size};
-    use nitro_scene::{ClientId, Fill, Layer, NodeKind};
 
     fn scene_with_window(position: Point) -> (Scene, OutputId, WindowKey) {
         let mut scene = Scene::new();

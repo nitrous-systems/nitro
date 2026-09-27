@@ -3541,13 +3541,34 @@ impl Server {
     /// motion. The stamp uses the monotonic clock input events carry, so
     /// latency accounting attributes the drag's first frame to the request
     /// that caused it.
+    ///
+    /// It also takes pointer focus away from the client with a
+    /// `PointerLeave`, as a Wayland move/resize grab does. Unlike a frame
+    /// drag, the client *saw* the press — that is what it answered — but
+    /// the drag swallows every motion and the release, so without a leave
+    /// it would believe the button held for ever, and its next ordinary
+    /// motion would look like a drag with no press behind it. Focus is
+    /// dropped to `None`, so the first motion after the release re-derives
+    /// it and sends a fresh `PointerEnter`. A live `SetCursor` request goes
+    /// with it, by `set_pointer_over`'s rule: one period of focus ended.
     fn begin_client_drag(&mut self) {
         let Some(drag) = self.wm.drag() else {
-            debug!("StartResize: the window is not resizable: ignored");
+            debug!("client drag request: the window refused it: ignored");
             return;
         };
+        let now = monotonic_ns();
+        if let Some(left) = self.pointer.over {
+            let sent_to = self.send_input(left, |id| {
+                ServerMsg::PointerLeave(msg::PointerLeave {
+                    window: id,
+                    time_ns: now,
+                })
+            });
+            self.note_client_input(sent_to);
+        }
+        self.set_pointer_over(None);
         self.set_cursor(Some(Self::drag_shape(drag)));
-        self.note_input(monotonic_ns());
+        self.note_input(now);
     }
 
     /// Toggle a window between `Maximized` and `Normal`.

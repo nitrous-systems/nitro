@@ -931,6 +931,13 @@ unconditionally — it always runs the drag state machine — and:
   a resize; it still moves. Limits and the 64×32 content floor apply.
 * The drag ends on the button's release, as a frame drag does; there is
   no end-drag op.
+* **Pointer focus is taken away** when the drag begins: the client gets a
+  `PointerLeave` for the window under the pointer, as a Wayland move grab
+  sends `wl_pointer.leave`. It saw the press but sees neither the drag's
+  motions nor the release, and the leave is what tells it to drop its
+  pressed state. The first motion after the release sends a fresh
+  `PointerEnter`. A live `SetCursor` request ends with that period of
+  focus and must be re-sent.
 
 ### `ListOutputs` — 0x001b
 

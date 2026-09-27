@@ -584,7 +584,10 @@ beside them rather than being replaced — see §Cursor shapes above.
   `FIXED_SIZE` window still refuses the resize (but moves). A request is
   honoured only while a button is down, the pointer is over one of the
   sender's windows, and no drag is already in flight; otherwise it is
-  silently dropped. So an undecorated window can be moved two ways:
+  silently dropped. An honoured request sends the client a
+  `PointerLeave` (it saw the press but will not see the release), and the
+  first motion after the drag a fresh `PointerEnter`. So an undecorated
+  window can be moved two ways:
   `Super`+drag, and by asking.
 * A drag in flight owns every motion: the window follows the pointer and
   the client is never consulted. Both a move and a resize send one
