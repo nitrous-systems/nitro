@@ -1335,8 +1335,14 @@ mod tests {
                 ..Edges::NONE
             })
         );
-        assert_eq!(Edges::from_wire(re::BOTTOM | re::RIGHT), Some(Edges::corner(true, true)));
-        assert_eq!(Edges::from_wire(re::TOP | re::LEFT), Some(Edges::corner(false, false)));
+        assert_eq!(
+            Edges::from_wire(re::BOTTOM | re::RIGHT),
+            Some(Edges::corner(true, true))
+        );
+        assert_eq!(
+            Edges::from_wire(re::TOP | re::LEFT),
+            Some(Edges::corner(false, false))
+        );
         assert_eq!(Edges::from_wire(0), None, "0 is the caller's to resolve");
         assert_eq!(Edges::from_wire(re::LEFT | re::RIGHT), None);
         assert_eq!(Edges::from_wire(re::TOP | re::BOTTOM), None);

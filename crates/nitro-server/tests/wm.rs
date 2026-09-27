@@ -4169,7 +4169,16 @@ fn client_drag(
 /// Assert the client is still connected and was sent no `Error`: a
 /// window made now still gets its `Configure`.
 fn assert_survived(conn: &mut Connection, inbox: &mut Inbox, id: u32, serial: u32) {
-    make_window(conn, inbox, id, "alive", Size::new(80.0, 60.0), BLUE, 0, serial);
+    make_window(
+        conn,
+        inbox,
+        id,
+        "alive",
+        Size::new(80.0, 60.0),
+        BLUE,
+        0,
+        serial,
+    );
     assert!(
         !inbox.0.iter().any(|m| matches!(m, ServerMsg::Error(_))),
         "an ignored drag request is not an error: {:?}",
@@ -4260,7 +4269,11 @@ fn a_client_can_start_a_move_and_the_window_follows_the_pointer() {
     await_configure(&mut conn, &mut inbox, &mut win, "the client move");
     let after = win.frame(false);
     assert_eq!((after.x - before.x, after.y - before.y), (-60.0, 40.0));
-    assert_eq!((after.w, after.h), (before.w, before.h), "a move does not resize");
+    assert_eq!(
+        (after.w, after.h),
+        (before.w, before.h),
+        "a move does not resize"
+    );
 
     // The pointer moving on after the release moves nothing.
     h.point_at(cx + 100.0, cy, OUT);
@@ -4293,8 +4306,16 @@ fn a_client_resize_from_every_edge_and_corner_pulls_the_right_edges() {
         let before = win.frame(false);
         let at = win.content();
         // Pull outward on every named edge, so the window always grows.
-        let dx = if edges & re::LEFT != 0 { -step_x } else { step_x };
-        let dy = if edges & re::TOP != 0 { -step_y } else { step_y };
+        let dx = if edges & re::LEFT != 0 {
+            -step_x
+        } else {
+            step_x
+        };
+        let dy = if edges & re::TOP != 0 {
+            -step_y
+        } else {
+            step_y
+        };
         let root = win.root;
         client_drag(&mut h, &mut conn, at, (dx, dy), |c| {
             c.start_resize(root, edges).unwrap();
@@ -4308,13 +4329,21 @@ fn a_client_resize_from_every_edge_and_corner_pulls_the_right_edges() {
             edges & re::BOTTOM != 0,
         );
         let moved = |on: bool, by: f32| if on { by } else { 0.0 };
-        assert_eq!(after.x - before.x, moved(left, -step_x), "left edge, {edges:#x}");
+        assert_eq!(
+            after.x - before.x,
+            moved(left, -step_x),
+            "left edge, {edges:#x}"
+        );
         assert_eq!(
             (after.x + after.w) - (before.x + before.w),
             moved(right, step_x),
             "right edge, {edges:#x}"
         );
-        assert_eq!(after.y - before.y, moved(top, -step_y), "top edge, {edges:#x}");
+        assert_eq!(
+            after.y - before.y,
+            moved(top, -step_y),
+            "top edge, {edges:#x}"
+        );
         assert_eq!(
             (after.y + after.h) - (before.y + before.h),
             moved(bottom, step_y),
@@ -4383,7 +4412,11 @@ fn a_client_resize_with_edges_zero_picks_the_nearest_corner() {
     await_configure(&mut conn, &mut inbox, &mut win, "the corner resize");
     let after = win.frame(false);
     assert_eq!((after.w - before.w, after.h - before.h), (40.0, 30.0));
-    assert_eq!((after.x, after.y), (before.x, before.y), "the far corner held");
+    assert_eq!(
+        (after.x, after.y),
+        (before.x, before.y),
+        "the far corner held"
+    );
     drop(conn);
     h.quit();
 }
@@ -4483,7 +4516,12 @@ fn reserved_or_contradictory_edge_bits_are_ignored_rather_than_fatal() {
     let mut win = bare(&mut conn, &mut inbox, 0);
     let before = win.frame(false);
     let root = win.root;
-    for edges in [0xF0, re::TOP | 0x10, re::LEFT | re::RIGHT, re::TOP | re::BOTTOM] {
+    for edges in [
+        0xF0,
+        re::TOP | 0x10,
+        re::LEFT | re::RIGHT,
+        re::TOP | re::BOTTOM,
+    ] {
         let at = win.content();
         client_drag(&mut h, &mut conn, at, (30.0, 30.0), |c| {
             c.start_resize(root, edges).unwrap();
@@ -4514,7 +4552,11 @@ fn a_fixed_size_window_refuses_a_client_resize_but_still_moves() {
     conn.start_resize(root, re::BOTTOM | re::RIGHT).unwrap();
     conn.flush().unwrap();
     h.settle();
-    assert_eq!(h.stat("dragging"), 0, "a fixed-size window refuses a resize");
+    assert_eq!(
+        h.stat("dragging"),
+        0,
+        "a fixed-size window refuses a resize"
+    );
     h.point_at(at.0 + 40.0, at.1 + 40.0, OUT);
     h.settle();
     h.button(BTN_LEFT, ButtonState::Released);

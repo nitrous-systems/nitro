@@ -1378,9 +1378,7 @@ fn is_shell_op(msg: &ClientMsg) -> bool {
 fn is_m5_op(msg: &ClientMsg) -> bool {
     matches!(
         msg,
-        ClientMsg::StartDrag(_)
-            | ClientMsg::AcceptDrop(_)
-            | ClientMsg::FinishDrag(_)
+        ClientMsg::StartDrag(_) | ClientMsg::AcceptDrop(_) | ClientMsg::FinishDrag(_)
     )
 }
 
@@ -8005,10 +8003,7 @@ mod tests {
             .into(),
             // `StartMove` / `StartResize` (M5-F) are open to every client
             // holding the pointer with a button down.
-            msg::StartMove {
-                window: NodeId(1),
-            }
-            .into(),
+            msg::StartMove { window: NodeId(1) }.into(),
             msg::StartResize {
                 window: NodeId(1),
                 edges: 0,
