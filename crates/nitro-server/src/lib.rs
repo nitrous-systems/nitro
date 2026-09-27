@@ -1354,7 +1354,9 @@ fn is_shell_op(msg: &ClientMsg) -> bool {
 /// The protocol surface landed ahead of the behaviour (task #3767), so the
 /// ops below decode but are refused: `Server::caps` advertises none
 /// of their bits, so no conformant client sends one, and a client that
-/// does anyway hears why instead of being silently ignored. The two popup
+/// does anyway hears why instead of being silently ignored. `StartMove`
+/// and `StartResize` left with #3772 (`caps::DRAG`); see
+/// `Server::start_move`. The two popup
 /// ops left this list with #3773 (`caps::POPUP`), and the three clipboard
 /// ops with #3774 (`caps::DATA`). The drag ops share `DATA` but stay here
 /// until M5-I implements them: a client that saw the bit for the
@@ -1376,9 +1378,7 @@ fn is_shell_op(msg: &ClientMsg) -> bool {
 fn is_m5_op(msg: &ClientMsg) -> bool {
     matches!(
         msg,
-        ClientMsg::StartMove(_)
-            | ClientMsg::StartResize(_)
-            | ClientMsg::StartDrag(_)
+        ClientMsg::StartDrag(_)
             | ClientMsg::AcceptDrop(_)
             | ClientMsg::FinishDrag(_)
     )
@@ -2488,6 +2488,10 @@ impl Server {
                     }
                     self.hotkeys.reset();
                     self.hotkey_pending = None;
+                    // Held buttons, for the keyboard's reason: a release on
+                    // the other VT was never seen, and a button believed
+                    // down for ever would let any client start a drag.
+                    self.pointer.buttons.clear();
                     for output in &mut self.outputs {
                         output.invalidate();
                     }
@@ -3229,6 +3233,16 @@ impl Server {
         /// Linux evdev `BTN_RIGHT`.
         const BTN_RIGHT: u32 = 0x111;
 
+        // Button state is recorded before *anything* else, because every
+        // branch below may return early — and the release that ends a drag,
+        // the commonest release there is, is one of them. A release missed
+        // here leaves the server believing a button is held for ever, which
+        // is exactly the hole the `StartMove`/`StartResize` guard closes.
+        match state {
+            ButtonState::Pressed => self.pointer.press(button),
+            ButtonState::Released => self.pointer.release(button),
+        }
+
         // The popup grab goes **first** — above the release/drag branch;
         // see `Server::popup_grab_button`.
         if self.popup_grab_button(state, time_ns) {
@@ -3414,6 +3428,126 @@ impl Server {
             point.y >= rect.y + rect.h / 2.0,
         );
         self.begin_resize(win, edges, point);
+    }
+
+    /// The window a client-initiated drag (`StartMove`/`StartResize`)
+    /// names, if the request is authorized. `None` means "ignore it" —
+    /// silently, the client survives.
+    ///
+    /// Silent rather than `Error { Protocol }` because every error in this
+    /// protocol is fatal, and each check below is one a well-behaved
+    /// client can fail by losing a race it cannot see: pointer focus moves
+    /// with no round trip, and the canonical sequence — `PointerButton`
+    /// pressed, the client decides, `StartMove` — meets a user who let go
+    /// in between. An id the client does not own is not a race, but it is
+    /// ignored too rather than answered with `UnknownNode`: the op is an
+    /// advisory hint about a gesture, with no serial to blame, and one rule
+    /// ("if it cannot be honoured it is dropped") is smaller than two.
+    ///
+    /// The checks, cheapest and likeliest-to-fail first:
+    ///
+    /// 1. no drag is already in flight — one is never restarted;
+    /// 2. a pointer button is actually down — what stops a client starting
+    ///    an unprovoked drag that hijacks the pointer;
+    /// 3. the window is one of this client's own;
+    /// 4. the client holds pointer focus: the pointer is over **any** of
+    ///    its windows, not necessarily the one named — a client may start
+    ///    a move of its main window from a press on another of its own
+    ///    surfaces, as Wayland allows.
+    fn drag_request(&self, token: u64, id: NodeId, what: &str) -> Option<WindowKey> {
+        if self.wm.drag().is_some() {
+            debug!("{what}: a drag is already in flight: ignored");
+            return None;
+        }
+        if !self.pointer.any_button_down() {
+            debug!("{what}: no pointer button is down: ignored");
+            return None;
+        }
+        let client = self.wire_clients.get(&token)?;
+        let Some(win) = client.windows.get(&id).copied() else {
+            debug!("{what}: {id:?} is not one of this client's windows: ignored");
+            return None;
+        };
+        if !self.pointer.over.is_some_and(|w| client.owns_window(w)) {
+            debug!("{what}: the client does not hold pointer focus: ignored");
+            return None;
+        }
+        Some(win)
+    }
+
+    /// `StartMove` (M5-F): a client asking the server to begin a move drag
+    /// of one of its windows, typically a client-side-decorated window
+    /// whose title bar the user just grabbed. Always returns `true`: see
+    /// [`Server::drag_request`] for why a refusal is silent.
+    fn start_move(&mut self, token: u64, id: NodeId) -> bool {
+        // The client has answered the press, whatever becomes of the
+        // request: release a flip held for it, as `SetCursor` does.
+        self.defer.forget(token);
+        let Some(win) = self.drag_request(token, id, "StartMove") else {
+            return true;
+        };
+        let Some(point) = self.pointer_desktop() else {
+            return true;
+        };
+        self.raise_and_focus(win);
+        self.begin_move(win, point);
+        self.begin_client_drag();
+        true
+    }
+
+    /// `StartResize` (M5-F): as [`Server::start_move`], for a resize from
+    /// the named edges. `0` lets the server pick the corner nearest the
+    /// pointer, exactly as `Super`+right-drag does.
+    ///
+    /// A mask with reserved bits drops the whole request — unlike
+    /// `SetAnchor`, which answers them with `Protocol`: that is a commit
+    /// mutation with a serial to blame, this is advisory, and a reserved
+    /// bit is most plausibly a newer toolkit. Masking the bit off instead
+    /// would hand a client that meant `TOP|<future>` a plain `TOP` drag
+    /// it did not ask for. `LEFT|RIGHT` and `TOP|BOTTOM` are dropped for
+    /// the same reason (see [`Edges::from_wire`]). A `FIXED_SIZE` window
+    /// refuses inside `begin_resize`, silently, as it refuses `Maximized`.
+    fn start_resize(&mut self, token: u64, id: NodeId, edges: u8) -> bool {
+        self.defer.forget(token);
+        let wanted = if edges == 0 {
+            None
+        } else if let Some(e) = Edges::from_wire(edges) {
+            Some(e)
+        } else {
+            debug!("StartResize: edges {edges:#x} name no resize: ignored");
+            return true;
+        };
+        let Some(win) = self.drag_request(token, id, "StartResize") else {
+            return true;
+        };
+        let Some(point) = self.pointer_desktop() else {
+            return true;
+        };
+        self.raise_and_focus(win);
+        match wanted {
+            Some(e) => self.begin_resize(win, e, point),
+            None => self.begin_corner_resize(win, point),
+        }
+        self.begin_client_drag();
+        true
+    }
+
+    /// The tail both client-initiated drags share: show the drag's shape
+    /// on the press rather than on the first motion, and stamp the input.
+    ///
+    /// Reads the drag back rather than assuming one began: `begin_resize`
+    /// refuses a window that is not resizable without saying so, and a
+    /// shape for a drag that does not exist would stick until the next
+    /// motion. The stamp uses the monotonic clock input events carry, so
+    /// latency accounting attributes the drag's first frame to the request
+    /// that caused it.
+    fn begin_client_drag(&mut self) {
+        let Some(drag) = self.wm.drag() else {
+            debug!("StartResize: the window is not resizable: ignored");
+            return;
+        };
+        self.set_cursor(Some(Self::drag_shape(drag)));
+        self.note_input(monotonic_ns());
     }
 
     /// Toggle a window between `Maximized` and `Normal`.
@@ -5836,6 +5970,13 @@ impl Server {
             // must show atomically, and a client that had to commit before
             // its I-beam appeared would show it a frame late.
             ClientMsg::SetCursor(m) => self.set_cursor_request(token, m.shape),
+            // Acted on at receipt too: an input gesture, not a scene
+            // mutation. Parked in `pending` until the next commit, the drag
+            // would start a round trip after the user's hand moved — and
+            // the button might well be up by then, so the guard would judge
+            // a stale world.
+            ClientMsg::StartMove(m) => self.start_move(token, m.window),
+            ClientMsg::StartResize(m) => self.start_resize(token, m.window, m.edges),
             // The one unprivileged op answered in the shell block. It has
             // its own arm, *before* the catch-all, so it never reaches
             // `is_shell_op` or `handle_shell_msg`: it shares no code path
@@ -5948,12 +6089,20 @@ impl Server {
     /// `CURSOR` (M5-E) is unconditional for the same reason: the server
     /// always draws a cursor, so `SetCursor` is always a request it can
     /// honour.
+    ///
+    /// `DRAG` (M5-F) is unconditional, like `WM`: the server always runs
+    /// the drag state machine, so a client may always ask to enter it. The
+    /// guard on *using* it is pointer focus plus a button down, not a
+    /// capability — and it carries no server→client message (the drag is
+    /// reported through the ordinary `Configure` stream), so nothing needs
+    /// a `ClientCaps` gate either.
     fn caps(&self, shell: bool, remote: bool) -> u32 {
         let mut caps = nitro_wire::types::caps::WM
             | nitro_wire::types::caps::THEME
             | nitro_wire::types::caps::POPUP
             | nitro_wire::types::caps::OUTPUTS
-            | nitro_wire::types::caps::CURSOR;
+            | nitro_wire::types::caps::CURSOR
+            | nitro_wire::types::caps::DRAG;
         if self.text.has_fonts() {
             caps |= nitro_wire::types::caps::TEXT;
         }
@@ -7831,6 +7980,17 @@ mod tests {
             // pointer; see `Server::set_cursor_request`.
             msg::SetCursor {
                 shape: nitro_wire::types::CursorShape::Text,
+            }
+            .into(),
+            // `StartMove` / `StartResize` (M5-F) are open to every client
+            // holding the pointer with a button down.
+            msg::StartMove {
+                window: NodeId(1),
+            }
+            .into(),
+            msg::StartResize {
+                window: NodeId(1),
+                edges: 0,
             }
             .into(),
         ] {

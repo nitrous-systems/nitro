@@ -402,7 +402,7 @@ frame (`crates/nitro-server/src/cursor.rs`):
 | a top or bottom band | `size_ver` ↕ |
 | a top-left / bottom-right corner | `size_fdiag` ╲ |
 | a top-right / bottom-left corner | `size_bdiag` ╱ |
-| a drag in flight | the drag's own: `move` for a title drag, the grabbed edges' shape for a resize |
+| a drag in flight | the drag's own: `move` for a title drag, the grabbed edges' shape for a resize — a client-initiated one (`StartMove`/`StartResize`) included, shown on the request rather than on the first motion |
 | the client's content, with a live `SetCursor` | the client's shape, or nothing if it asked for `None` |
 
 **Precedence**, highest first: a drag in flight; the server's chrome (a
@@ -575,6 +575,17 @@ beside them rather than being replaced — see §Cursor shapes above.
 * `Super` + left-drag moves, `Super` + right-drag resizes from the nearest
   corner — on any window, decorated or not. That is the whole of what an
   undecorated window loses by opting out.
+* **Client-initiated move and resize** (M5-F, #3772). A client that draws
+  its own title bar — Chromium, by default — asks for the drag with
+  `StartMove` / `StartResize` (`docs/wire.md`, cap `DRAG`) after it sees
+  the press. The server enters the same drag state machine a frame grab
+  does: same restore-on-move for a maximized window, same `MIN_CONTENT`
+  floor and client limits, same end on the button's release, and a
+  `FIXED_SIZE` window still refuses the resize (but moves). A request is
+  honoured only while a button is down, the pointer is over one of the
+  sender's windows, and no drag is already in flight; otherwise it is
+  silently dropped. So an undecorated window can be moved two ways:
+  `Super`+drag, and by asking.
 * A drag in flight owns every motion: the window follows the pointer and
   the client is never consulted. Both a move and a resize send one
   one-way `Configure` per motion — a move because `Configure.position` is

@@ -149,6 +149,33 @@ impl Edges {
             bottom,
         }
     }
+
+    /// The [`resize_edges`](nitro_wire::types::resize_edges) bitmask a
+    /// client sent in `StartResize`, as edges.
+    ///
+    /// `None` for a mask with reserved bits set, for a mask naming both
+    /// edges of one axis — which the drag arithmetic cannot express
+    /// ([`resize_rect`] tests `right` before `left`, so `LEFT|RIGHT` would
+    /// silently become a right-edge drag) — and for `0`, which means "the
+    /// server picks" and needs the pointer to answer, so the caller
+    /// handles it before calling this.
+    #[must_use]
+    pub fn from_wire(mask: u8) -> Option<Self> {
+        use nitro_wire::types::resize_edges as re;
+        if mask == 0 || mask & !re::ALL != 0 {
+            return None;
+        }
+        let e = Self {
+            left: mask & re::LEFT != 0,
+            right: mask & re::RIGHT != 0,
+            top: mask & re::TOP != 0,
+            bottom: mask & re::BOTTOM != 0,
+        };
+        if (e.left && e.right) || (e.top && e.bottom) {
+            return None;
+        }
+        Some(e)
+    }
 }
 
 /// What the pointer is over, in a window's frame.
@@ -1297,6 +1324,25 @@ pub fn title_role(focused: bool) -> Role {
 #[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wire_edges_map_to_edges_and_refuse_what_a_drag_cannot_mean() {
+        use nitro_wire::types::resize_edges as re;
+        assert_eq!(
+            Edges::from_wire(re::TOP),
+            Some(Edges {
+                top: true,
+                ..Edges::NONE
+            })
+        );
+        assert_eq!(Edges::from_wire(re::BOTTOM | re::RIGHT), Some(Edges::corner(true, true)));
+        assert_eq!(Edges::from_wire(re::TOP | re::LEFT), Some(Edges::corner(false, false)));
+        assert_eq!(Edges::from_wire(0), None, "0 is the caller's to resolve");
+        assert_eq!(Edges::from_wire(re::LEFT | re::RIGHT), None);
+        assert_eq!(Edges::from_wire(re::TOP | re::BOTTOM), None);
+        assert_eq!(Edges::from_wire(re::ALL), None);
+        assert_eq!(Edges::from_wire(0x10 | re::TOP), None, "reserved bit");
+    }
 
     fn frame() -> Rect {
         Rect::new(100.0, 50.0, 300.0, 200.0)

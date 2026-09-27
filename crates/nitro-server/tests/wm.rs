@@ -4137,3 +4137,406 @@ fn setting_the_clip_a_window_already_has_is_accepted() {
     drop(conn);
     h.quit();
 }
+
+// ------------------------------------------------ client-initiated drags
+
+/// Press at `at`, let the *client* ask for the drag with `begin`, then
+/// move by `delta` in four steps and release. The mirror of
+/// `Harness::drag`, for the `StartMove` / `StartResize` path (M5-F).
+fn client_drag(
+    h: &mut Harness,
+    conn: &mut Connection,
+    at: (f32, f32),
+    delta: (f32, f32),
+    begin: impl FnOnce(&mut Connection),
+) {
+    h.point_at(at.0, at.1, OUT);
+    h.settle();
+    h.button(BTN_LEFT, ButtonState::Pressed);
+    h.settle();
+    begin(conn);
+    conn.flush().unwrap();
+    h.settle();
+    for i in 1..=4 {
+        let t = i as f32 / 4.0;
+        h.point_at(at.0 + delta.0 * t, at.1 + delta.1 * t, OUT);
+        h.settle();
+    }
+    h.button(BTN_LEFT, ButtonState::Released);
+    h.settle();
+}
+
+/// Assert the client is still connected and was sent no `Error`: a
+/// window made now still gets its `Configure`.
+fn assert_survived(conn: &mut Connection, inbox: &mut Inbox, id: u32, serial: u32) {
+    make_window(conn, inbox, id, "alive", Size::new(80.0, 60.0), BLUE, 0, serial);
+    assert!(
+        !inbox.0.iter().any(|m| matches!(m, ServerMsg::Error(_))),
+        "an ignored drag request is not an error: {:?}",
+        inbox.0
+    );
+}
+
+fn bare(conn: &mut Connection, inbox: &mut Inbox, flags: u32) -> Win {
+    make_window(
+        conn,
+        inbox,
+        1,
+        "csd",
+        WIN,
+        RED,
+        window_flags::UNDECORATED | flags,
+        1,
+    )
+}
+
+#[test]
+fn the_server_advertises_the_drag_capability() {
+    let h = Harness::start("dragcap", OUT.0, OUT.1);
+    let conn = h.client("dragcap");
+    assert_eq!(conn.caps() & caps::DRAG, caps::DRAG);
+    drop(conn);
+    h.quit();
+}
+
+#[test]
+fn a_client_can_start_a_move_and_the_window_follows_the_pointer() {
+    let mut h = Harness::start("cmove", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("cmove");
+    let mut win = bare(&mut conn, &mut inbox, 0);
+    let before = win.frame(false);
+    let (cx, cy) = win.content();
+
+    h.point_at(cx, cy, OUT);
+    h.settle();
+    h.button(BTN_LEFT, ButtonState::Pressed);
+    h.settle();
+    conn.start_move(win.root).unwrap();
+    conn.flush().unwrap();
+    wait_for("the client's drag to begin", || h.stat("dragging") == 1);
+    for i in 1..=4 {
+        let t = i as f32 / 4.0;
+        h.point_at(cx - 60.0 * t, cy + 40.0 * t, OUT);
+        h.settle();
+    }
+    assert_eq!(h.stat("dragging"), 1, "still dragging mid-gesture");
+    h.button(BTN_LEFT, ButtonState::Released);
+    h.settle();
+    assert_eq!(h.stat("dragging"), 0, "the release ended the drag");
+
+    await_configure(&mut conn, &mut inbox, &mut win, "the client move");
+    let after = win.frame(false);
+    assert_eq!((after.x - before.x, after.y - before.y), (-60.0, 40.0));
+    assert_eq!((after.w, after.h), (before.w, before.h), "a move does not resize");
+
+    // The pointer moving on after the release moves nothing.
+    h.point_at(cx + 100.0, cy, OUT);
+    h.settle();
+    refresh(&mut conn, &mut inbox, &mut win);
+    assert_eq!(win.frame(false), after);
+
+    drop(conn);
+    h.quit();
+}
+
+#[test]
+fn a_client_resize_from_every_edge_and_corner_pulls_the_right_edges() {
+    use nitro_wire::types::resize_edges as re;
+    let mut h = Harness::start("cresize", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("cresize");
+    let mut win = bare(&mut conn, &mut inbox, 0);
+    let (step_x, step_y) = (20.0, 12.0);
+    for edges in [
+        re::TOP,
+        re::BOTTOM,
+        re::LEFT,
+        re::RIGHT,
+        re::TOP | re::LEFT,
+        re::TOP | re::RIGHT,
+        re::BOTTOM | re::LEFT,
+        re::BOTTOM | re::RIGHT,
+    ] {
+        let before = win.frame(false);
+        let at = win.content();
+        // Pull outward on every named edge, so the window always grows.
+        let dx = if edges & re::LEFT != 0 { -step_x } else { step_x };
+        let dy = if edges & re::TOP != 0 { -step_y } else { step_y };
+        let root = win.root;
+        client_drag(&mut h, &mut conn, at, (dx, dy), |c| {
+            c.start_resize(root, edges).unwrap();
+        });
+        await_configure(&mut conn, &mut inbox, &mut win, "the client resize");
+        let after = win.frame(false);
+        let (left, right, top, bottom) = (
+            edges & re::LEFT != 0,
+            edges & re::RIGHT != 0,
+            edges & re::TOP != 0,
+            edges & re::BOTTOM != 0,
+        );
+        let moved = |on: bool, by: f32| if on { by } else { 0.0 };
+        assert_eq!(after.x - before.x, moved(left, -step_x), "left edge, {edges:#x}");
+        assert_eq!(
+            (after.x + after.w) - (before.x + before.w),
+            moved(right, step_x),
+            "right edge, {edges:#x}"
+        );
+        assert_eq!(after.y - before.y, moved(top, -step_y), "top edge, {edges:#x}");
+        assert_eq!(
+            (after.y + after.h) - (before.y + before.h),
+            moved(bottom, step_y),
+            "bottom edge, {edges:#x}"
+        );
+    }
+    drop(conn);
+    h.quit();
+}
+
+#[test]
+fn a_client_resize_honours_the_declared_limits_and_the_content_floor() {
+    use nitro_wire::types::resize_edges as re;
+    let mut h = Harness::start("climits", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("climits");
+    let mut win = bare(&mut conn, &mut inbox, 0);
+    let root = win.root;
+
+    // No limits: the content floor holds.
+    let at = win.content();
+    client_drag(&mut h, &mut conn, at, (-300.0, -300.0), |c| {
+        c.start_resize(root, re::BOTTOM | re::RIGHT).unwrap();
+    });
+    await_configure(&mut conn, &mut inbox, &mut win, "the floored shrink");
+    assert_eq!(win.size, wm::MIN_CONTENT, "shrunk to the content floor");
+
+    conn.tx()
+        .set_window_limits(root, Size::new(150.0, 100.0), Size::new(260.0, 200.0))
+        .commit(2)
+        .unwrap();
+    conn.flush().unwrap();
+    h.settle();
+    refresh(&mut conn, &mut inbox, &mut win);
+
+    let at = win.content();
+    client_drag(&mut h, &mut conn, at, (400.0, 0.0), |c| {
+        c.start_resize(root, re::RIGHT).unwrap();
+    });
+    refresh(&mut conn, &mut inbox, &mut win);
+    assert_eq!(win.size.w, 260.0, "clamped to the declared maximum");
+
+    let at = win.content();
+    client_drag(&mut h, &mut conn, at, (-400.0, 0.0), |c| {
+        c.start_resize(root, re::RIGHT).unwrap();
+    });
+    await_configure(&mut conn, &mut inbox, &mut win, "the clamped shrink");
+    assert_eq!(win.size.w, 150.0, "clamped to the declared minimum");
+
+    drop(conn);
+    h.quit();
+}
+
+#[test]
+fn a_client_resize_with_edges_zero_picks_the_nearest_corner() {
+    let mut h = Harness::start("ccorner", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("ccorner");
+    let mut win = bare(&mut conn, &mut inbox, 0);
+    let before = win.frame(false);
+    let near = (before.x + before.w * 0.9, before.y + before.h * 0.9);
+    let root = win.root;
+    client_drag(&mut h, &mut conn, near, (40.0, 30.0), |c| {
+        c.start_resize(root, 0).unwrap();
+    });
+    await_configure(&mut conn, &mut inbox, &mut win, "the corner resize");
+    let after = win.frame(false);
+    assert_eq!((after.w - before.w, after.h - before.h), (40.0, 30.0));
+    assert_eq!((after.x, after.y), (before.x, before.y), "the far corner held");
+    drop(conn);
+    h.quit();
+}
+
+#[test]
+fn a_drag_request_without_a_button_down_is_ignored_and_the_client_survives() {
+    let mut h = Harness::start("cnobutton", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("cnobutton");
+    let mut win = bare(&mut conn, &mut inbox, 0);
+    let before = win.frame(false);
+    let (cx, cy) = win.content();
+
+    // Pointer focus, but no button.
+    h.point_at(cx, cy, OUT);
+    h.settle();
+    conn.start_move(win.root).unwrap();
+    conn.start_resize(win.root, 0).unwrap();
+    conn.flush().unwrap();
+    h.settle();
+    assert_eq!(h.stat("dragging"), 0);
+    h.point_at(cx + 50.0, cy + 50.0, OUT);
+    h.settle();
+    refresh(&mut conn, &mut inbox, &mut win);
+    assert_eq!(win.frame(false), before, "nothing followed the pointer");
+    assert_survived(&mut conn, &mut inbox, 10, 2);
+
+    drop(conn);
+    h.quit();
+}
+
+#[test]
+fn a_drag_request_without_pointer_focus_or_for_a_foreign_window_is_ignored() {
+    let mut h = Harness::start("cnofocus", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("cnofocus");
+    let mut win = bare(&mut conn, &mut inbox, 0);
+    let before = win.frame(false);
+
+    // Button down over the bare desktop: nobody holds pointer focus.
+    park(&mut h);
+    h.button(BTN_LEFT, ButtonState::Pressed);
+    h.settle();
+    conn.start_move(win.root).unwrap();
+    conn.flush().unwrap();
+    h.settle();
+    assert_eq!(h.stat("dragging"), 0, "no pointer focus, no drag");
+    h.button(BTN_LEFT, ButtonState::Released);
+    h.settle();
+
+    // Button down over *another* client's window.
+    let mut other_inbox = Inbox::default();
+    let mut other = h.client("other");
+    let theirs = make_window(
+        &mut other,
+        &mut other_inbox,
+        1,
+        "theirs",
+        Size::new(100.0, 80.0),
+        GREEN,
+        window_flags::UNDECORATED,
+        1,
+    );
+    let (tx, ty) = theirs.content();
+    h.point_at(tx, ty, OUT);
+    h.settle();
+    h.button(BTN_LEFT, ButtonState::Pressed);
+    h.settle();
+    conn.start_move(win.root).unwrap();
+    conn.flush().unwrap();
+    h.settle();
+    assert_eq!(h.stat("dragging"), 0, "focus is the other client's");
+
+    // With focus and a button, but naming an id this client does not own.
+    other.start_move(NodeId(9999)).unwrap();
+    other.flush().unwrap();
+    h.settle();
+    assert_eq!(h.stat("dragging"), 0, "an unknown id is ignored");
+    h.button(BTN_LEFT, ButtonState::Released);
+    h.settle();
+
+    refresh(&mut conn, &mut inbox, &mut win);
+    assert_eq!(win.frame(false), before);
+    assert_survived(&mut conn, &mut inbox, 10, 2);
+    assert_survived(&mut other, &mut other_inbox, 10, 2);
+
+    drop((conn, other));
+    h.quit();
+}
+
+#[test]
+fn reserved_or_contradictory_edge_bits_are_ignored_rather_than_fatal() {
+    use nitro_wire::types::resize_edges as re;
+    let mut h = Harness::start("creserved", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("creserved");
+    let mut win = bare(&mut conn, &mut inbox, 0);
+    let before = win.frame(false);
+    let root = win.root;
+    for edges in [0xF0, re::TOP | 0x10, re::LEFT | re::RIGHT, re::TOP | re::BOTTOM] {
+        let at = win.content();
+        client_drag(&mut h, &mut conn, at, (30.0, 30.0), |c| {
+            c.start_resize(root, edges).unwrap();
+        });
+        refresh(&mut conn, &mut inbox, &mut win);
+        assert_eq!(win.frame(false), before, "edges {edges:#x}");
+    }
+    assert_survived(&mut conn, &mut inbox, 10, 2);
+    drop(conn);
+    h.quit();
+}
+
+#[test]
+fn a_fixed_size_window_refuses_a_client_resize_but_still_moves() {
+    use nitro_wire::types::resize_edges as re;
+    let mut h = Harness::start("cfixed", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("cfixed");
+    let mut win = bare(&mut conn, &mut inbox, window_flags::FIXED_SIZE);
+    let before = win.frame(false);
+    let root = win.root;
+
+    let at = win.content();
+    h.point_at(at.0, at.1, OUT);
+    h.settle();
+    h.button(BTN_LEFT, ButtonState::Pressed);
+    h.settle();
+    conn.start_resize(root, re::BOTTOM | re::RIGHT).unwrap();
+    conn.flush().unwrap();
+    h.settle();
+    assert_eq!(h.stat("dragging"), 0, "a fixed-size window refuses a resize");
+    h.point_at(at.0 + 40.0, at.1 + 40.0, OUT);
+    h.settle();
+    h.button(BTN_LEFT, ButtonState::Released);
+    h.settle();
+    refresh(&mut conn, &mut inbox, &mut win);
+    assert_eq!(win.frame(false), before);
+
+    let at = win.content();
+    client_drag(&mut h, &mut conn, at, (-30.0, 20.0), |c| {
+        c.start_move(root).unwrap();
+    });
+    await_configure(&mut conn, &mut inbox, &mut win, "the fixed window's move");
+    let after = win.frame(false);
+    assert_eq!((after.x - before.x, after.y - before.y), (-30.0, 20.0));
+    assert_eq!((after.w, after.h), (before.w, before.h));
+
+    drop(conn);
+    h.quit();
+}
+
+#[test]
+fn a_client_cannot_restart_a_drag_already_in_flight() {
+    use nitro_wire::types::resize_edges as re;
+    let mut h = Harness::start("crestart", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("crestart");
+    let mut win = bare(&mut conn, &mut inbox, 0);
+    let before = win.frame(false);
+    let (cx, cy) = win.content();
+
+    h.point_at(cx, cy, OUT);
+    h.settle();
+    h.button(BTN_LEFT, ButtonState::Pressed);
+    h.settle();
+    conn.start_move(win.root).unwrap();
+    conn.flush().unwrap();
+    wait_for("the move to begin", || h.stat("dragging") == 1);
+    h.point_at(cx + 20.0, cy, OUT);
+    h.settle();
+    // Mid-drag, the client asks again — for a resize this time.
+    conn.start_resize(win.root, re::BOTTOM | re::RIGHT).unwrap();
+    conn.flush().unwrap();
+    h.settle();
+    h.point_at(cx + 40.0, cy + 10.0, OUT);
+    h.settle();
+    h.button(BTN_LEFT, ButtonState::Released);
+    h.settle();
+
+    await_configure(&mut conn, &mut inbox, &mut win, "the move");
+    let after = win.frame(false);
+    assert_eq!((after.x - before.x, after.y - before.y), (40.0, 10.0));
+    assert_eq!((after.w, after.h), (before.w, before.h), "never resized");
+    assert_survived(&mut conn, &mut inbox, 10, 2);
+
+    drop(conn);
+    h.quit();
+}

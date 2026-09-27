@@ -123,7 +123,10 @@ pub struct WireClient {
     /// shell clients included. `CURSOR` (M5-E) gates `SetCursor`: a
     /// client that did not list it and sends one is `Error { Protocol }`,
     /// even though the bit carries no server→client message, so that
-    /// `ClientCaps` stays a complete declaration. The bits not yet
+    /// `ClientCaps` stays a complete declaration. `DRAG` (M5-F) is not
+    /// read: it carries no server→client message, and `StartMove` /
+    /// `StartResize` are authorized by pointer focus and a held button
+    /// instead. The bits not yet
     /// advertised are still recorded, because the rule this exists for
     /// cannot be honoured retroactively by a server that threw the list
     /// away.
@@ -631,6 +634,12 @@ fn apply_msg(
             outcome.text_metrics.push((m.node, metrics));
             Ok(())
         }
+        ClientMsg::StartMove(_) | ClientMsg::StartResize(_) => {
+            // Never buffered: `handle_wire_msg` acts on them at receipt. A
+            // drag is an input gesture, and one started a commit late may
+            // meet a button already released.
+            Ok(())
+        }
         ClientMsg::SetCursor(_) => {
             // Never buffered: `handle_wire_msg` acts on it at receipt. The
             // cursor belongs to the pointer, not to a frame, and a client
@@ -877,9 +886,7 @@ fn apply_msg(
         // already disconnects on receipt and none of these ever reaches
         // `pending`; this arm is belt and braces, and exists because the
         // match above is the op table and deliberately has no `_`.
-        ClientMsg::StartMove(_)
-        | ClientMsg::StartResize(_)
-        | ClientMsg::StartDrag(_)
+        ClientMsg::StartDrag(_)
         | ClientMsg::AcceptDrop(_)
         | ClientMsg::FinishDrag(_) => Err(ApplyError::new(
             ErrorCode::Protocol,

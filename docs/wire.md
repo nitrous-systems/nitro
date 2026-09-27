@@ -250,9 +250,9 @@ offer, the MIME list and the descriptor relay are shared, and
 `RequestSelection` names which of the two it means with a one-byte
 `DataSource`. Two bits would mean two copies of the same four messages.
 
-**Of bits 8–14, only `POPUP`, `CURSOR`, `OUTPUTS` and `DATA` are
-advertised yet**: `POPUP` (M5-G, #3773), `CURSOR` (M5-E, #3771) and
-`OUTPUTS` (M5-D, #3770) always, `DATA` (M5-H, #3774) on every **local**
+**Of bits 8–14, only `POPUP`, `CURSOR`, `DRAG`, `OUTPUTS` and `DATA` are
+advertised yet**: `POPUP` (M5-G, #3773), `CURSOR` (M5-E, #3771), `DRAG`
+(M5-F, #3772) and `OUTPUTS` (M5-D, #3770) always, `DATA` (M5-H, #3774) on every **local**
 link and
 never on a remote one — every leg of a transfer carries a descriptor,
 which TCP cannot (see [Descriptors on a remote link](#descriptors-on-a-remote-link)).
@@ -908,6 +908,29 @@ otherwise, on the same terms as `SetCursor`.
 
 Fixed head **5 bytes**. Requires `DRAG`. Two bits are a corner; `0` lets
 the server choose. Same authorization as `StartMove`.
+
+**As implemented (M5-F, #3772).** The server advertises `DRAG`
+unconditionally — it always runs the drag state machine — and:
+
+* **Acted on at receipt**, never buffered for a commit: a drag started a
+  commit late may meet a button already released.
+* **No `ClientCaps` gate.** `DRAG` carries no server→client message; the
+  drag is reported through the ordinary `Configure` stream.
+* **Authorization**, all silent on failure (the client survives): no drag
+  is already in flight (one is never restarted); a pointer button is down
+  as the server saw it; `window` is one of the sender's own (an unknown id
+  is ignored, *not* `UnknownNode` — the op is advisory, with no serial to
+  blame); and the pointer is over **any** of the sender's windows, not
+  necessarily the one named.
+* **Edges.** `0` picks the corner nearest the pointer, as `Super`+right
+  drag does. A mask with reserved bits, or naming both edges of one axis
+  (`LEFT|RIGHT`, `TOP|BOTTOM`), drops the whole request — unlike
+  `SetAnchor`'s `Protocol`, because this op is advisory and a reserved bit
+  is most plausibly a newer toolkit.
+* A `FIXED_SIZE` window, or one not `Normal`/`Maximized`, silently refuses
+  a resize; it still moves. Limits and the 64×32 content floor apply.
+* The drag ends on the button's release, as a frame drag does; there is
+  no end-drag op.
 
 ### `ListOutputs` — 0x001b
 

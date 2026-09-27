@@ -289,9 +289,37 @@ pub struct Pointer {
     /// no arrow, which is the right answer and is also what the
     /// screenshots of a headless server should show.
     pub present: bool,
+    /// Pointer buttons currently held, by evdev code.
+    ///
+    /// The `StartMove`/`StartResize` guard (`docs/wire.md`) is "a button is
+    /// actually down", and this is the only fact that answers it: the drag
+    /// state machine cannot, because a client-initiated drag is precisely
+    /// the case where no server-side drag has begun. A `Vec` rather than a
+    /// bitset: a hand holds at most a few buttons, and evdev codes are
+    /// sparse.
+    pub buttons: Vec<u32>,
 }
 
 impl Pointer {
+    /// Note a button going down. Idempotent: a repeated press (a device
+    /// that reports one twice) does not need two releases.
+    pub fn press(&mut self, button: u32) {
+        if !self.buttons.contains(&button) {
+            self.buttons.push(button);
+        }
+    }
+
+    /// Note a button coming up.
+    pub fn release(&mut self, button: u32) {
+        self.buttons.retain(|b| *b != button);
+    }
+
+    /// Whether any pointer button is held.
+    #[must_use]
+    pub fn any_button_down(&self) -> bool {
+        !self.buttons.is_empty()
+    }
+
     /// Note that a pointer device reported something: from now on the
     /// cursor is drawn. Returns whether this was the first time, which
     /// damages the cursor rect that just appeared.
@@ -781,6 +809,23 @@ fn scroll(dx: f64, dy: f64, source: AxisSource, time_ns: u64) -> InputEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn button_state_tracks_presses_and_releases() {
+        let mut p = Pointer::default();
+        assert!(!p.any_button_down());
+        p.press(BTN_LEFT);
+        p.press(BTN_LEFT);
+        assert!(p.any_button_down());
+        p.press(0x111);
+        p.release(BTN_LEFT);
+        assert!(p.any_button_down(), "the right button is still down");
+        p.release(0x111);
+        assert!(!p.any_button_down(), "one release undoes a doubled press");
+        p.press(BTN_LEFT);
+        p.buttons.clear();
+        assert!(!p.any_button_down(), "a VT switch forgets held buttons");
+    }
     use nitro_core::{IRect, Rect, Size};
     use nitro_scene::{ClientId, Fill, Layer, NodeKind};
 
