@@ -912,6 +912,10 @@ fn apply_msg(
                 shell::WindowOp::Anchor {
                     edges: m.edges,
                     margin: m.margin,
+                    // Not validated here: an id that is not connected is a
+                    // shell that lost a hotplug race, and `apply_anchor`
+                    // falls back to the window's current output.
+                    output: (m.output != 0).then(|| nitro_scene::OutputId(m.output)),
                 },
             ));
             Ok(())

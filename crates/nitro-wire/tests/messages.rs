@@ -284,12 +284,14 @@ fn client_messages() -> Vec<ClientMsg> {
             window: NodeId(44),
             edges: anchor::TOP | anchor::LEFT | anchor::RIGHT,
             margin: 6,
+            output: 2,
         }
         .into(),
         SetAnchor {
             window: NodeId(45),
             edges: 0,
             margin: 0,
+            output: 0,
         }
         .into(),
         BindKey {
@@ -1342,6 +1344,30 @@ fn payload_layouts_are_frozen() {
             0x02, // layer Top
             0x02, 0x00, 0x00, 0x00, b'a', b'b', // app_id
             0x02, 0x00, 0x00, 0x00, b'c', b'd', // title
+        ]
+    );
+
+    let mut w = Writer::new();
+    // `output` was added in place in #3844, moving this body from 9 to 13
+    // bytes: the same `SHELL`-block exemption as `WindowInfo.layer` above
+    // (only reachable over `shell.sock`, every reader in-tree).
+    ClientMsg::from(SetAnchor {
+        window: NodeId(0x0102_0304),
+        edges: anchor::TOP | anchor::LEFT | anchor::RIGHT,
+        margin: 6,
+        output: 2,
+    })
+    .encode(&mut w)
+    .unwrap();
+    assert_eq!(
+        w.bytes(),
+        &[
+            // header: len=13, op=0x0403, fds=0, flags=0
+            0x0d, 0x00, 0x00, 0x00, 0x03, 0x04, 0x00, 0x00, //
+            0x04, 0x03, 0x02, 0x01, // window
+            0x0d, // edges TOP|LEFT|RIGHT
+            0x06, 0x00, 0x00, 0x00, // margin
+            0x02, 0x00, 0x00, 0x00, // output
         ]
     );
 

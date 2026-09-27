@@ -3476,3 +3476,331 @@ fn entering_the_overview_while_locked_is_refused_and_says_so() {
     assert_eq!(h.stat("overview"), 0);
     h.quit();
 }
+
+/// The `output` of the newest `Configure` for `root`, if any arrived.
+fn last_configure_output(inbox: &Inbox, root: NodeId) -> Option<u32> {
+    inbox.0.iter().rev().find_map(|m| match m {
+        ServerMsg::Configure(c) if c.window == root => Some(c.output),
+        _ => None,
+    })
+}
+
+/// Wait until the newest `Configure` for `win` names `output` and take its
+/// geometry.
+fn await_output(conn: &mut Connection, inbox: &mut Inbox, win: &mut Win, output: u32, what: &str) {
+    wait_for(what, || {
+        refresh(conn, inbox, win);
+        last_configure_output(inbox, win.root) == Some(output)
+    });
+}
+
+/// Wait until an `OUTPUTS` watcher has seen `area` for output `id`.
+fn await_work_area(conn: &mut Connection, inbox: &mut Inbox, id: u32, area: nitro_core::IRect) {
+    wait_for(&format!("work area {area:?} on output {id}"), || {
+        pump(conn, inbox);
+        inbox
+            .0
+            .iter()
+            .any(|m| matches!(m, ServerMsg::OutputWorkArea(a) if a.id == id && a.area == area))
+    });
+}
+
+/// Two outputs, an `OUTPUTS` watcher, and a bar anchored by name on the
+/// second: what tests 1–2 of `SetAnchor { output }` share.
+struct TwoOutputs {
+    h: Harness,
+    watcher: Connection,
+    watcher_inbox: Inbox,
+    shell: Connection,
+    inbox: Inbox,
+    bar: Win,
+    first: u32,
+    second: u32,
+}
+
+fn bar_on_second_output(name: &str) -> TwoOutputs {
+    let h = Harness::start(name, OUT.0, OUT.1);
+    assert_eq!(h.request_line("plug 800x600\n"), "ok");
+    h.settle();
+    let mut watcher_inbox = Inbox::default();
+    let mut watcher = h.client("chrome");
+    watcher.client_caps(caps::OUTPUTS).unwrap();
+    watcher.list_outputs().unwrap();
+    let (infos, _) = await_snapshot(&mut watcher, &mut watcher_inbox, "the snapshot");
+    assert_eq!(infos.len(), 2);
+    let first = infos[0].id;
+    let second = infos
+        .iter()
+        .find(|i| (i.w, i.h) == (800, 600))
+        .expect("the plugged output")
+        .id;
+    assert_ne!(first, second);
+
+    // The bar: `CreateWindow`, `SetAnchor { output }` and `SetExclusiveZone`
+    // in one transaction, in the order a real bar (`nitro-ui`) sends them:
+    // shell ops apply in order, so anchoring first puts the window on its
+    // output *before* the zone is taken off a work area.
+    let mut inbox = Inbox::default();
+    let mut shell = h.shell("bar");
+    let root = NodeId(100);
+    let fill = NodeId(101);
+    let size = Size::new(10.0, ZONE as f32);
+    shell
+        .tx()
+        .create_window_with(
+            root,
+            "bar",
+            size,
+            Layer::Top,
+            window_flags::UNDECORATED | window_flags::NO_FOCUS,
+        )
+        .create_rect(fill, root, Rect::new(0.0, 0.0, size.w, size.h))
+        .fill_solid(fill, BAR_BLUE)
+        .set_anchor_on(root, anchor::TOP | anchor::LEFT | anchor::RIGHT, 0, second)
+        .set_exclusive_zone(root, Edge::Top, ZONE)
+        .commit(1)
+        .unwrap();
+    shell.flush().unwrap();
+    let mut bar = Win {
+        root,
+        pos: nitro_core::Point::ZERO,
+        size,
+    };
+    await_output(
+        &mut shell,
+        &mut inbox,
+        &mut bar,
+        second,
+        "the bar on the second output",
+    );
+    h.settle();
+    TwoOutputs {
+        h,
+        watcher,
+        watcher_inbox,
+        shell,
+        inbox,
+        bar,
+        first,
+        second,
+    }
+}
+
+#[test]
+fn a_bar_anchored_to_a_named_output_lands_there() {
+    // `SetAnchor { output }` names the output; the window is moved there
+    // before it is anchored, so a bar can open on a screen it was never
+    // placed on and its zone comes off *that* screen's work area.
+    let mut t = bar_on_second_output("anchor-named");
+    let (w, hgt, z) = (OUT.0.cast_signed(), OUT.1.cast_signed(), ZONE.cast_signed());
+    refresh(&mut t.shell, &mut t.inbox, &mut t.bar);
+    assert_eq!(
+        t.bar.size.w, 800.0,
+        "spans the second output, not the first"
+    );
+    assert_eq!(
+        t.bar.pos,
+        nitro_core::Point::ZERO,
+        "at its own output's origin"
+    );
+    assert_eq!(t.h.stat("exclusive_zones"), 1);
+    // The zone landed on the second output's work area and left the first
+    // one whole.
+    await_work_area(
+        &mut t.watcher,
+        &mut t.watcher_inbox,
+        t.second,
+        nitro_core::IRect::new(w, z, 800, 600 - z),
+    );
+    let first_shrunk = nitro_core::IRect::new(0, z, w, hgt - z);
+    assert!(
+        !t.watcher_inbox.0.iter().any(
+            |m| matches!(m, ServerMsg::OutputWorkArea(a) if a.id == t.first && a.area == first_shrunk)
+        ),
+        "the first output's work area is untouched; got {:?}",
+        t.watcher_inbox.0
+    );
+    drop((t.shell, t.watcher));
+    t.h.quit();
+}
+
+#[test]
+fn a_bar_on_an_unplugged_output_re_homes_to_the_primary() {
+    // The named output goes away: the window is migrated to the primary
+    // with everything else and its anchor is re-applied *there* — a bar
+    // must not become an invisible orphan holding a zone on nothing.
+    let mut t = bar_on_second_output("anchor-unplug");
+    let (w, hgt, z) = (OUT.0.cast_signed(), OUT.1.cast_signed(), ZONE.cast_signed());
+    // A window-list watcher sees the migration as a `WindowInfo` change.
+    let mut list_inbox = Inbox::default();
+    let mut list = t.h.shell("watcher");
+    list.window_list().unwrap();
+    wait_for("the bar in the list", || {
+        pump(&mut list, &mut list_inbox);
+        window_map(&list_inbox)
+            .values()
+            .any(|i| i.title == "bar" && i.output == t.second)
+    });
+
+    assert_eq!(t.h.request_line("unplug\n"), "ok");
+    await_output(
+        &mut t.shell,
+        &mut t.inbox,
+        &mut t.bar,
+        t.first,
+        "the bar re-homed",
+    );
+    t.h.settle();
+    assert_eq!(t.bar.size.w, OUT.0 as f32, "spans the primary now");
+    assert_eq!(t.h.stat("exclusive_zones"), 1, "the zone moved with it");
+    await_work_area(
+        &mut t.watcher,
+        &mut t.watcher_inbox,
+        t.first,
+        nitro_core::IRect::new(0, z, w, hgt - z),
+    );
+    wait_for("the watcher to see the move", || {
+        pump(&mut list, &mut list_inbox);
+        window_map(&list_inbox)
+            .values()
+            .any(|i| i.title == "bar" && i.output == t.first)
+    });
+    drop((t.shell, t.watcher, list));
+    t.h.quit();
+}
+
+#[test]
+fn re_anchoring_moves_a_bar_between_outputs() {
+    // A second `SetAnchor` naming another output moves the bar over, and
+    // `output: 0` afterwards means "stay where you are", not "go to the
+    // primary" — otherwise every plain `set_anchor` would drag a moved bar
+    // home.
+    let h = Harness::start("anchor-move", OUT.0, OUT.1);
+    assert_eq!(h.request_line("plug 800x600\n"), "ok");
+    h.settle();
+    let mut watcher_inbox = Inbox::default();
+    let mut watcher = h.client("chrome");
+    watcher.client_caps(caps::OUTPUTS).unwrap();
+    watcher.list_outputs().unwrap();
+    let (infos, _) = await_snapshot(&mut watcher, &mut watcher_inbox, "the snapshot");
+    let first = infos[0].id;
+    let second = infos[1].id;
+    let (w, hgt, z) = (OUT.0.cast_signed(), OUT.1.cast_signed(), ZONE.cast_signed());
+
+    let mut inbox = Inbox::default();
+    let mut shell = h.shell("bar");
+    let mut bar = make_bar(&h, &mut shell, &mut inbox, 1);
+    await_output(
+        &mut shell,
+        &mut inbox,
+        &mut bar,
+        first,
+        "the bar on the primary",
+    );
+    assert_eq!(bar.size.w, OUT.0 as f32);
+    await_work_area(
+        &mut watcher,
+        &mut watcher_inbox,
+        first,
+        nitro_core::IRect::new(0, z, w, hgt - z),
+    );
+
+    watcher_inbox.0.clear();
+    shell
+        .tx()
+        .set_anchor_on(
+            bar.root,
+            anchor::TOP | anchor::LEFT | anchor::RIGHT,
+            0,
+            second,
+        )
+        .commit(3)
+        .unwrap();
+    shell.flush().unwrap();
+    await_output(
+        &mut shell,
+        &mut inbox,
+        &mut bar,
+        second,
+        "the bar moved over",
+    );
+    assert_eq!(bar.size.w, 800.0);
+    // The work areas swapped: the first is whole again, the second is short.
+    await_work_area(
+        &mut watcher,
+        &mut watcher_inbox,
+        first,
+        nitro_core::IRect::new(0, 0, w, hgt),
+    );
+    await_work_area(
+        &mut watcher,
+        &mut watcher_inbox,
+        second,
+        nitro_core::IRect::new(w, z, 800, 600 - z),
+    );
+
+    // Output 0: stays on the second.
+    shell
+        .tx()
+        .set_anchor(bar.root, anchor::TOP | anchor::LEFT | anchor::RIGHT, 4)
+        .commit(4)
+        .unwrap();
+    shell.flush().unwrap();
+    await_configure(&mut shell, &mut inbox, &mut bar, "the margin");
+    assert_eq!(last_configure_output(&inbox, bar.root), Some(second));
+    assert_eq!(bar.size.w, 800.0 - 8.0);
+    h.settle();
+    assert_eq!(h.stat("exclusive_zones"), 1);
+
+    drop((shell, watcher));
+    h.quit();
+}
+
+#[test]
+fn an_anchor_naming_an_unknown_output_is_not_an_error() {
+    // A shell that named an output which was unplugged between the
+    // `OutputInfo` and its commit lost a race; it is not lying. The anchor
+    // falls back to the window's current output and the connection lives.
+    let h = Harness::start("anchor-unknown", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut shell = h.shell("bar");
+    let root = NodeId(100);
+    let fill = NodeId(101);
+    let size = Size::new(10.0, ZONE as f32);
+    shell
+        .tx()
+        .create_window_with(
+            root,
+            "bar",
+            size,
+            Layer::Top,
+            window_flags::UNDECORATED | window_flags::NO_FOCUS,
+        )
+        .create_rect(fill, root, Rect::new(0.0, 0.0, size.w, size.h))
+        .fill_solid(fill, BAR_BLUE)
+        .set_exclusive_zone(root, Edge::Top, ZONE)
+        .set_anchor_on(root, anchor::TOP | anchor::LEFT | anchor::RIGHT, 0, 999)
+        .commit(1)
+        .unwrap();
+    shell.flush().unwrap();
+    let mut bar = Win {
+        root,
+        pos: nitro_core::Point::ZERO,
+        size,
+    };
+    wait_for("the bar's Configure", || {
+        refresh(&mut shell, &mut inbox, &mut bar);
+        bar.size.w == OUT.0 as f32
+    });
+    h.settle();
+    assert!(!shell.is_closed(), "not a protocol error");
+    assert!(
+        !inbox.0.iter().any(|m| matches!(m, ServerMsg::Error(_))),
+        "no Error; got {:?}",
+        inbox.0
+    );
+    assert_eq!(h.stat("exclusive_zones"), 1);
+    assert_eq!(h.stat("shell_clients"), 1);
+    drop(shell);
+    h.quit();
+}

@@ -1995,6 +1995,9 @@ impl Server {
                 self.apply_state_geometry(win, state);
             }
             self.configure(win);
+            // `WindowInfo.output` changed: a shell following windows per
+            // output has to hear which screen this one is on now.
+            self.notify_window(win);
         }
     }
 
@@ -6970,8 +6973,12 @@ impl Server {
                 // its strip immediately, not at the next maximize.
                 self.work_area_changed();
             }
-            shell::WindowOp::Anchor { edges, margin } => {
-                self.zones.set_anchor(win, edges, margin);
+            shell::WindowOp::Anchor {
+                edges,
+                margin,
+                output,
+            } => {
+                self.zones.set_anchor(win, edges, margin, output);
                 self.apply_anchor(win);
             }
             shell::WindowOp::Grab(on) => {
@@ -7202,6 +7209,16 @@ impl Server {
     /// Against the output's **full** logical rectangle, not its work area:
     /// a bar that anchored into the work area would be pushed off the screen
     /// by its own exclusive zone.
+    ///
+    /// An anchor that names an output moves the window there first. That
+    /// move is deliberately *not* in `set_frame_rect` ("a resize never
+    /// changes which output a window is on"), so it is explicit here. An
+    /// output that is not connected — unplugged between the `OutputInfo`
+    /// and the commit, or after the anchor was set — falls back to the
+    /// window's current one, which after `migrate_orphans` is the primary:
+    /// that fall-back *is* the re-homing on unplug, and the same anchor
+    /// springs back if the named output returns (ids are never reused, so
+    /// it cannot).
     fn apply_anchor(&mut self, win: WindowKey) {
         let Some(a) = self.zones.anchor(win) else {
             return;
@@ -7210,7 +7227,9 @@ impl Server {
             return;
         };
         let size = info.frame_size();
-        let output = info.output().or_else(|| self.primary_output());
+        let current = info.output();
+        let named = a.output.filter(|id| self.scene.output_info(*id).is_some());
+        let output = named.or(current).or_else(|| self.primary_output());
         let Some(output) = output else {
             // No output yet; `sync_outputs` re-applies anchors when one
             // appears, so the window simply waits where it is.
@@ -7219,11 +7238,33 @@ impl Server {
         let Some((rect, scale)) = self.scene.output_info(output) else {
             return;
         };
+        let moved = current.is_some_and(|c| c != output);
+        if moved && let Err(e) = self.scene.place_window(win, Some(output), Point::ZERO) {
+            warn!("moving an anchored window to its output: {e}");
+            return;
+        }
         let s = if scale > 0.0 { scale } else { 1.0 };
         let origin = self.desktop_origin(output);
         let full = Rect::new(origin.x, origin.y, rect.w as f32 / s, rect.h as f32 / s);
         let target = shell::anchor_rect(full, size, a);
         self.set_frame_rect(win, target);
+        if !moved {
+            return;
+        }
+        // The window's `WindowInfo.output` changed for the watchers, and if
+        // it carries a zone, that strip left one output and arrived on the
+        // other: maximized windows on both reflow and `OUTPUTS` watchers
+        // get fresh work areas. Order: place → frame → notify → work area.
+        self.notify_window(win);
+        if self.zones.zone(win).is_some() {
+            self.work_area_changed();
+        }
+        if let Some(ov) = self.overview_output()
+            && (ov == output || Some(ov) == current)
+            && overview::wants_thumb(&self.scene, win)
+        {
+            self.relayout_overview();
+        }
     }
 
     /// Re-apply every anchor. Called when an output's geometry changes, so a
@@ -9714,6 +9755,7 @@ mod tests {
                 window: NodeId(1),
                 edges: 0,
                 margin: 0,
+                output: 0,
             }
             .into(),
             msg::BindKey {

@@ -61,6 +61,8 @@ pub enum WindowOp {
         edges: u8,
         /// Gap held on each anchored edge.
         margin: u32,
+        /// The output to anchor on, or `None` for the window's current one.
+        output: Option<OutputId>,
     },
     /// `GrabKeyboard`: take or release the keyboard.
     Grab(bool),
@@ -82,6 +84,11 @@ pub struct Anchor {
     pub edges: u8,
     /// Gap held on each anchored edge, in logical pixels.
     pub margin: u32,
+    /// The output the window asked to be on, or `None` for "wherever it
+    /// is". Kept even after that output is unplugged: ids are never
+    /// reused, so a stale one can never spring back to life, and keeping
+    /// it makes the fall-back to the current output stateless.
+    pub output: Option<OutputId>,
 }
 
 /// Every shell window's zone and anchor, keyed by window.
@@ -113,8 +120,21 @@ impl Zones {
     }
 
     /// Set a window's anchoring intent.
-    pub fn set_anchor(&mut self, win: WindowKey, edges: u8, margin: u32) {
-        self.anchors.insert(win, Anchor { edges, margin });
+    pub fn set_anchor(&mut self, win: WindowKey, edges: u8, margin: u32, output: Option<OutputId>) {
+        self.anchors.insert(
+            win,
+            Anchor {
+                edges,
+                margin,
+                output,
+            },
+        );
+    }
+
+    /// A window's exclusive zone, if it holds one.
+    #[must_use]
+    pub fn zone(&self, win: WindowKey) -> Option<Zone> {
+        self.zones.get(&win).copied()
     }
 
     /// A window's anchor, if it set one.
@@ -581,6 +601,7 @@ mod tests {
             Anchor {
                 edges: anchor::TOP | anchor::LEFT | anchor::RIGHT,
                 margin: 0,
+                output: None,
             },
         );
         assert_eq!(r, Rect::new(0.0, 0.0, 1280.0, 32.0));
@@ -594,6 +615,7 @@ mod tests {
             Anchor {
                 edges: anchor::BOTTOM | anchor::LEFT | anchor::RIGHT,
                 margin: 8,
+                output: None,
             },
         );
         assert_eq!(r, Rect::new(8.0, 720.0 - 8.0 - 32.0, 1264.0, 32.0));
@@ -607,6 +629,7 @@ mod tests {
             Anchor {
                 edges: 0,
                 margin: 0,
+                output: None,
             },
         );
         assert_eq!(r, Rect::new(440.0, 210.0, 400.0, 300.0));
@@ -622,6 +645,7 @@ mod tests {
             Anchor {
                 edges: anchor::TOP | anchor::LEFT | anchor::RIGHT,
                 margin: 0,
+                output: None,
             },
         );
         assert_eq!(r, Rect::new(1280.0, 0.0, 1920.0, 32.0));

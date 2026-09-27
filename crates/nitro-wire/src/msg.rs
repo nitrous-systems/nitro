@@ -2042,6 +2042,18 @@ fixed_msg! {
     /// its work area: a bar must not be pushed off the screen by its own
     /// exclusive zone. Re-applied whenever the output's mode or scale
     /// changes, so a bar keeps spanning after a hotplug.
+    ///
+    /// `output` picks **which** output: `0` is the output the window is
+    /// on (ids start at 1, so 0 never names one), anything else is an
+    /// [`OutputInfo::id`]. Naming an output moves the window there before
+    /// anchoring, and the anchor keeps following it — re-applied on every
+    /// output change, and re-homed to the primary output when that output
+    /// is unplugged. An id that is not connected (unplugged between the
+    /// `OutputInfo` and the commit) is **not** an error: the window is
+    /// anchored against its current output, exactly as `0` would, because
+    /// a shell that lost a race is racing, not lying. `0` means "stay",
+    /// not "primary": a bar that was moved to a second output and re-sent
+    /// with `output: 0` stays there.
     SetAnchor {
         /// The window, by the sender's own node id.
         window: NodeId,
@@ -2049,6 +2061,8 @@ fixed_msg! {
         edges: u8,
         /// Gap in logical pixels on each anchored edge.
         margin: u32,
+        /// `0` for the window's current output, else an [`OutputInfo::id`].
+        output: u32,
     }
 
     /// Bind a server-global hotkey (shell only; needs

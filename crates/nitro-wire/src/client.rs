@@ -791,15 +791,28 @@ impl Transaction<'_> {
     }
 
     /// Anchor a window to its output's edges (needs `caps::SHELL`).
-    /// `edges` is a bitmask from [`anchor`](crate::types::anchor).
+    /// `edges` is a bitmask from [`anchor`](crate::types::anchor). Anchors
+    /// against the output the window is on; see [`set_anchor_on`] to pick
+    /// one.
+    ///
+    /// [`set_anchor_on`]: Transaction::set_anchor_on
     #[must_use]
-    pub fn set_anchor(mut self, window: NodeId, edges: u8, margin: u32) -> Self {
+    pub fn set_anchor(self, window: NodeId, edges: u8, margin: u32) -> Self {
+        self.set_anchor_on(window, edges, margin, 0)
+    }
+
+    /// Anchor a window to the edges of output `output` (an `OutputInfo.id`,
+    /// or 0 for the window's current output), moving it there first if it
+    /// is somewhere else (needs `caps::SHELL`).
+    #[must_use]
+    pub fn set_anchor_on(mut self, window: NodeId, edges: u8, margin: u32, output: u32) -> Self {
         push!(
             self,
             SetAnchor {
                 window,
                 edges,
                 margin,
+                output,
             }
         )
     }
