@@ -244,12 +244,30 @@ fn the_osc_title_reaches_the_window() {
 fn the_alt_screen_is_entered_and_left_without_losing_the_primary() {
     // What `vim` does on start-up and on `:q`, reduced to its two escape
     // sequences. The primary screen has to come back exactly.
+    //
+    // The child advances on a *newline from the test*, not on a sleep.
+    // An earlier version paced itself with `sleep 0.2` / `sleep 0.4`,
+    // which made the test a race: the harness has no `epoll`, so it only
+    // sees the pty when `pump_until` drains it, and "on the alt screen"
+    // is a state the child holds for 0.4s and then leaves. A harness
+    // descheduled past that window — ordinary `just test` parallelism is
+    // enough — drains once, finds 1049h *and* 1049l already in the same
+    // batch, and waits out the 10s deadline for an alt screen that has
+    // already come and gone. With a handshake the child cannot pass a
+    // state the test has not observed yet, so there is no window to miss.
     let (mut h, grid) = harness_running(&[
         "/bin/sh",
         "-c",
-        "printf 'primary\\n'; sleep 0.2; printf '\\033[?1049h\\033[Halt screen'; \
-         sleep 0.4; printf '\\033[?1049l'; sleep 5",
+        // `-echo` so the handshake newlines do not land on the screen the
+        // assertions read.
+        "stty -echo; printf 'primary\\n'; read -r _; \
+         printf '\\033[?1049h\\033[Halt screen'; read -r _; \
+         printf '\\033[?1049l'; sleep 5",
     ]);
+    pump_until(&mut h, "the primary screen", |h| {
+        screen(h, grid).contains("primary")
+    });
+    type_text(&mut h, grid, "\n");
     pump_until(&mut h, "the alt screen", |h| {
         h.widget::<TermGrid>(grid).term().alt_screen()
     });
@@ -258,6 +276,7 @@ fn the_alt_screen_is_entered_and_left_without_losing_the_primary() {
         !screen(&mut h, grid).contains("primary"),
         "the alt screen must not show the primary one"
     );
+    type_text(&mut h, grid, "\n");
     pump_until(&mut h, "the primary screen back", |h| {
         !h.widget::<TermGrid>(grid).term().alt_screen()
     });
