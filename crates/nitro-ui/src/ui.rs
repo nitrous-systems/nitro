@@ -1897,7 +1897,7 @@ impl<S: 'static> Ui<S> {
     /// Collapsed subtrees count for nothing, as they do in layout.
     #[must_use]
     pub fn natural_size(&mut self) -> Size {
-        let Some(root) = self.root else {
+        let Some(root) = self.root() else {
             return Size::ZERO;
         };
         let m = self.measure(root, Constraints::unbounded());
@@ -1920,7 +1920,7 @@ impl<S: 'static> Ui<S> {
     /// # Errors
     /// A wire failure, which is fatal.
     pub fn request_window_size(&mut self, size: Size) -> Result<(), Error> {
-        let size = match self.window_limits {
+        let size = match self.windows[0].limits {
             Some((min, max)) => {
                 let axis = |v: f32, lo: f32, hi: f32| {
                     let v = if lo > 0.0 { v.max(lo) } else { v };
@@ -1931,12 +1931,12 @@ impl<S: 'static> Ui<S> {
             None => size,
         };
         let size = Size::new(size.w.max(1.0).ceil(), size.h.max(1.0).ceil());
-        if !self.window_open || self.window_size == size {
+        if !self.windows[0].open || self.windows[0].size == size {
             return Ok(());
         }
         self.resize(size);
         self.wire
-            .set_bounds(WINDOW, Rect::new(0.0, 0.0, size.w, size.h))
+            .set_bounds(WindowId::MAIN.0, Rect::new(0.0, 0.0, size.w, size.h))
     }
 
     /// Ask the server for a frame callback: it answers with one
