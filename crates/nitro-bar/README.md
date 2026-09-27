@@ -169,26 +169,34 @@ path itself — it never touched focus, so it answers `false` whether the
 suppression is there or not. Focus, hover and press state can only be
 checked by moving the pointer and pressing it.
 
-## One bar, on the primary output
+## One bar per output
 
-The bar opens **one window, on whichever output the server places it**.
-"One bar per output, following hotplug" is not implementable on today's
-protocol, and the bar deliberately does not pretend otherwise:
+The bar is **one process, one shell connection, one `Ui`** — and one
+*panel* (a window with its own copy of the tree) per connected output.
+The main window is the panel on whichever output the server placed it;
+every other output gets a panel opened with `Ui::add_surface_window` and
+an anchor that names the output (`Anchor::top().on(id)`). That is what
+`SetAnchor { output }` is for: the server moves the window to the named
+output before anchoring it, so its exclusive zone comes off *that*
+screen's work area, and it keeps the anchor following the output through
+mode changes.
 
-* `CreateWindow` carries no output, and the server places every new
-  window on the primary one;
-* `SetAnchor` anchors to whichever output the window is *already* on;
-* nothing moves a window between outputs but a user's drag.
+The panels follow hotplug by one rule, `reconcile`: **the extra panels'
+outputs are exactly the last `Outputs` snapshot minus the main window's
+output.** It runs at every `OutputsEnd` and whenever the server
+re-places the main window (`Ui::on_window_placed`), and it is idempotent,
+so the order those two arrive in does not matter. An unplug is handled
+twice over: the server migrates the orphaned panel to the primary output,
+and the rule then closes it because its output is gone — the two bars on
+one screen that leaves last one commit. The bar keys on
+`on_window_placed` rather than `on_resize` because the `Outputs` snapshot
+is answered *before* the main window's first `Configure`, and until that
+`Configure` the bar cannot know which output it must not duplicate.
 
-So N bar windows would all land on the primary output — N overlapping
-bars and N×32 px of exclusive zone on one screen, which is worse than one
-bar. `docs/shell.md` §Deferred records the gap under **"Per-output shell
-surfaces"**, and the fix is an `output` field on `SetAnchor`.
-
-The bar is structured so that adding it is small: all of the per-bar
-state lives in one `Bar` behind one tree, so a second output means a
-second `Ui` (one window each — a `Ui` owns exactly one window) and no
-change to the layout, the window list or the sensors.
+Every panel shows the same thing: the window list, the clock and the
+sensors write to every panel's labels, and the idle contract holds per
+label. `hey nitro-bar` reaches the main panel at `window/...` and the
+others at `window[N]/...`.
 
 ## Layout
 
@@ -241,7 +249,11 @@ on the shell socket:
 * the clock updates **exactly once** at the minute boundary and not at
   all inside the minute, costing one `SetText`;
 * idle silence, with the sensors polling throughout;
-* every section resolves by name, so `hey nitro-bar list` finds it.
+* every section resolves by name, so `hey nitro-bar list` finds it;
+* a hotplugged output gets a second panel on the same connection, listing
+  the same windows and showing the same clock, and the unplug takes it
+  away; the extra panels' outputs are exactly the snapshot minus the main
+  window's.
 
 The wall clock is faked (`Bar::with_fake_time_ms`) and so are the sensor
 readings (`Bar::with_sensors`) — the latter because the idle claim is "a

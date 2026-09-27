@@ -2018,6 +2018,7 @@ height).
 | `window` | `u32` (`NodeId`) | one of the sender's own windows |
 | `edges` | `u8` | bitmask from `anchor` |
 | `margin` | `u32` | gap in logical pixels on each anchored edge |
+| `output` | `u32` | `0` for the output the window is on, else an `OutputInfo.id` |
 
 Opposite edges together mean "span that axis", so the window is **resized**
 to fit; neither means "centre on it", rounded to a whole logical pixel. A
@@ -2031,7 +2032,20 @@ every time a panel appeared. Anchors are re-applied on every output
 change, so a bar keeps spanning after a mode change, a scale change or a
 hotplug.
 
-The answer is a `Configure`, like any other server-decided geometry.
+`output` picks **which** output (#3844). Naming one **moves the window
+there** before anchoring — the one way on this protocol for a client to
+put a window on a chosen output, which is what lets a bar open a panel per
+screen — and the anchor keeps following it: re-applied on every output
+change, and if that output is unplugged the window is re-homed to the
+primary with everything else and anchored *there*. `0` means **"stay"**,
+not "primary": a bar moved to a second output and re-sent with `output: 0`
+stays on the second. An id that is not connected — unplugged between the
+`OutputInfo` and the commit — is **not** an error: the window is anchored
+against its current output, exactly as `0` would. A shell that lost a
+hotplug race is racing, not lying (the same split `SetCursor` makes).
+
+The answer is a `Configure`, like any other server-decided geometry; its
+`output` names where the window ended up.
 
 ### `BindKey` — 0x0404
 
@@ -2279,7 +2293,9 @@ The id is retired and will never be issued again.
 
 Fixed head 28 bytes, then the name. Outputs are reported in device-x
 order, which is the left-to-right connector order the server lays them out
-in (`docs/wm.md`).
+in (`docs/wm.md`). Ids start at **1** and are never reused, so `0` is free
+to mean "the output the window is on" in `SetAnchor` and "none" in
+`OverviewState`.
 
 ### `OutputsEnd` — 0x8406
 
@@ -3093,6 +3109,17 @@ to.
   serials it expects forwarded. The backend drops them. Nothing upstream
   inspects what it does with them.
 
+* `SetAnchor` (0x0403) grew `output` **in place**, moving its body from
+  9 to 13 bytes (#3844). The same exemption as `WindowInfo.layer` above,
+  and the same premise: the op is in the `SHELL` block, reachable only
+  over `shell.sock`, and every reader — the bar, the wallpaper, the
+  launcher, `shell_probe`, `nitro-ui` — is in this tree. Unlike
+  `OutputInfo`, which `ListOutputs` opened to unprivileged clients and
+  which therefore *cannot* take this route any more, nothing but a shell
+  can send a `SetAnchor`. A new `SetAnchorOn` op would have left every
+  existing anchor unable to name an output and two ops that must agree
+  about everything but one field. `VERSION` stays **1**; a golden byte
+  string for `SetAnchor` was added to `payload_layouts_are_frozen`.
 * `VERSION` is bumped only for a change that is not expressible that way —
   a different framing, a changed field, a removed op. A version mismatch is
   fatal at handshake: there is no negotiation and no compatibility shim.

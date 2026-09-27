@@ -17,22 +17,24 @@
 //! $ nitro-wallpaper --image bg.ppm    # a picture (binary PPM only)
 //! ```
 //!
-//! # One window, and what "per output" really costs
+//! # One window, and what "per output" now costs
 //!
-//! The spec asks for one surface per output. That is **not implementable
-//! on this protocol**, for exactly the reason `crates/nitro-bar` records
-//! and `docs/shell.md` §Deferred states: `CreateWindow` carries no
-//! output, every new window is placed on the primary one, and `SetAnchor`
-//! anchors to whichever output its window is already on. N wallpaper
-//! windows would all land on the primary output — N stacked backdrops on
-//! one screen and none on the others, which is worse than one.
+//! The spec asks for one surface per output. The wallpaper still opens
+//! **one** window anchored to all edges, so the honest description of
+//! what that gets you is: the output the server placed it on is covered,
+//! and a second output shows the compositor's own background.
 //!
-//! So the wallpaper opens **one** window anchored to all edges, and the
-//! honest description of what that gets you is: the primary output is
-//! covered, and a second output shows the compositor's own background.
-//! Closing the gap needs the `output` field on `SetAnchor` that
-//! `docs/shell.md` already names as the fix; the README says so where a
-//! reader of this crate will find it.
+//! It used to be *not implementable*: `CreateWindow` carries no output
+//! and `SetAnchor` anchored to whichever output the window was already
+//! on. That gap closed in #3844 — `SetAnchor` carries an `output`, and
+//! `nitro-ui`'s `add_surface_window` opens a second surface anchored to
+//! it, which is how `crates/nitro-bar` runs one panel per output on one
+//! connection. Following it here is a small change (one
+//! `Surface::wallpaper().anchored(Anchor::fill().on(id))` per other
+//! output, reconciled on `OutputsEnd`) plus the work that is not small:
+//! loading and scaling the image once per output. Filed as a follow-up
+//! rather than done in #3844; the README says so where a reader of this
+//! crate will find it.
 //!
 //! # Hotplug is followed without watching anything
 //!

@@ -256,10 +256,10 @@ leave a stale strip reserved on the screen a bar used to be on.
 
 ## Anchors
 
-`SetAnchor { window, edges, margin }` sticks a window to its output's
-edges. Opposite edges together mean "span that axis" — so the window is
-**resized** — and neither means "centre on it", rounded to a whole logical
-pixel so a bar's text does not land between pixels.
+`SetAnchor { window, edges, margin, output }` sticks a window to an
+output's edges. Opposite edges together mean "span that axis" — so the
+window is **resized** — and neither means "centre on it", rounded to a
+whole logical pixel so a bar's text does not land between pixels.
 
 | shell surface | `edges` |
 |---|---|
@@ -280,6 +280,42 @@ re-applied from `sync_outputs`, so a bar keeps spanning across a mode
 change, a scale change and a hotplug — unconditionally, because
 `set_frame_rect` is idempotent and an anchor that silently stopped holding
 is the harder bug to notice.
+
+**`output` picks which output** (#3844). `0` is the output the window is
+on; anything else is an `OutputInfo.id`, and `apply_anchor` **moves the
+window there** (`Scene::place_window`) before anchoring. That move is
+deliberately not in `set_frame_rect` — "a resize never changes which
+output a window is on" — so it is explicit and lives in `apply_anchor`
+alone. Three rules follow:
+
+* **Unplug re-homes.** When the named output goes, `sync_outputs` runs
+  `migrate_orphans` (window → primary) and then `reflow_anchors`;
+  `apply_anchor` finds the named output gone and falls back to the
+  window's current — now primary — output. That fall-back *is* the
+  re-homing; there is no second code path. The stale id stays in the
+  `Anchor`, because ids are never reused so it cannot spring back to life,
+  and keeping it makes the fall-back stateless.
+* **`0` means "stay", not "primary".** A bar moved to a second output and
+  re-sent with `output: 0` (every existing `set_anchor` caller) stays
+  there; otherwise a margin change would drag a moved bar home.
+* **An unknown id is not an error.** A shell that named an output which
+  was unplugged between the `OutputInfo` and its commit lost a race; it
+  is anchored against its current output as `0` would be, and the
+  connection lives.
+
+A move drags the window's zone with it (`Zones` are keyed by window, see
+above), so `apply_anchor` calls `work_area_changed` after moving a window
+that holds one — maximized windows on both outputs reflow and `OUTPUTS`
+watchers get fresh `OutputWorkArea`s — and `notify_window`, because
+`WindowInfo.output` changed. `migrate_orphans` sends the same
+`notify_window` for the same reason: a bar that follows windows per output
+has to hear which screen a migrated one is on now.
+
+This is also **the one way a client can put a window on a chosen output**:
+`CreateWindow` carries none, and a shell sends the `SetAnchor` in the same
+transaction, so the window is on the right output from its first
+`Configure`. `nitro-ui`'s `add_surface_window` is the toolkit form, and
+`nitro-bar` opens one panel per output with it (§Deferred, below).
 
 ## Hotkeys
 
@@ -828,7 +864,14 @@ not working":
   tap still fires under the grab); `Super`-drag still working with a shell
   connected and not looking like a
   tap; outputs listed, hotplugged and unplugged; an anchored bar
-  re-spanning after a hotplug; and, for M5-D's `ListOutputs`, an ordinary client that listed `OUTPUTS` getting the snapshot (`OutputInfo` + `OutputWorkArea` per output, `OutputsEnd`) and hotplug, the same list a shell client gets field for field, a zone change pushing only a fresh `OutputWorkArea`, `ListOutputs` without `OUTPUTS` listed refused with `Protocol`, a pre-`ClientCaps` shell client never sent a work area, and a watcher that narrowed its caps sent nothing.
+  re-spanning after a hotplug; `SetAnchor { output }` (#3844): a bar
+  anchored by name onto a hotplugged second output landing there with its
+  zone off *that* work area and the first untouched, re-homing to the
+  primary (with its zone, and a `WindowInfo` to the list watcher) when
+  that output is unplugged, a second `SetAnchor` moving a bar between
+  outputs and swapping the work areas with `output: 0` then keeping it
+  where it is, and an unknown output id anchoring against the current
+  output with no `Error`; and, for M5-D's `ListOutputs`, an ordinary client that listed `OUTPUTS` getting the snapshot (`OutputInfo` + `OutputWorkArea` per output, `OutputsEnd`) and hotplug, the same list a shell client gets field for field, a zone change pushing only a fresh `OutputWorkArea`, `ListOutputs` without `OUTPUTS` listed refused with `Protocol`, a pre-`ClientCaps` shell client never sent a work area, and a watcher that narrowed its caps sent nothing.
 * The session lock: `src/lock.rs` unit-tests the ownership rules,
   `nitro-scene/tests/admit.rs` the paint and hit-test filter and its
   damage, and eleven cases in `tests/shell.rs` drive it through the event
@@ -877,30 +920,22 @@ protocol has room (a new field is a new op code and a new capability bit),
 but the server's input path assumes one seat throughout and that is the
 work.
 
-**Per-output shell surfaces.** A bar currently anchors to whichever output
-its window is on. "One bar per output" is a shell-side decision today (open
-one window per output); an `output` field on `SetAnchor` would let the
-server place it, and is worth adding when a shell actually wants it.
+**Per-output shell surfaces — resolved in #3844.** `SetAnchor` carries an
+`output` (§Anchors), which both places the window on the named output and
+keeps it there through hotplug, and `nitro-ui` grew `add_surface_window`
+plus `on_window_placed` so a shell can open a panel per output from one
+`Ui` on one connection. `crates/nitro-bar` does exactly that: one panel per
+output in the last `Outputs` snapshot, the main window's output excepted,
+reconciled at every `OutputsEnd` and every time the server re-places the
+main window; `shell_clients` reads **1** however many outputs there are.
 
-One now does, and it turns out "open one window per output" is not
-actually available to a shell. `crates/nitro-bar` (M3-C) therefore opens
-**one** bar, on whichever output the server placed its window: a client
-cannot choose the output, because `CreateWindow` carries none and every
-new window is placed on the primary one, and nothing moves a window
-between outputs afterwards but a user's drag. N bar windows would all
-land on the same output — N overlapping bars and N×32 px of zone on one
-screen, which is worse than one bar. Closing this needs the `output`
-field on `SetAnchor` *and* a way to place the window there to begin with;
-the bar's README states the limitation where a reader of the bar will
-find it.
-
-`crates/nitro-wallpaper` (M3-D) hits the same wall and answers it the
-same way, which is worth recording because a wallpaper is the surface
-where "one per output" is most obviously wanted: N wallpaper windows
-would all land on the primary output — N stacked backdrops on one screen
-and none on the others. So it opens one, and its README says plainly that
-the primary output is covered and a second output shows the compositor's
-own background.
+What is *still* one window: `crates/nitro-wallpaper` (M3-D) covers the
+output its window is on and a second output shows the compositor's own
+background. Following the bar is now a small change — one
+`add_surface_window` with `Surface::wallpaper().anchored(Anchor::fill().on(id))`
+per other output, and the same reconcile rule — filed as a follow-up
+rather than done here, since a wallpaper also has to load and scale its
+image per output.
 
 **Stacking order in the window list.** The list is ordered by window
 identity. A shell that wants z-order, or the MRU order for a task

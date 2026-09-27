@@ -1231,16 +1231,30 @@ ui.remove_window(state, dialog)?;
 
 `add_window` takes a built, parentless widget as the window's root and
 creates the window in the next commit, with the app id, the same way the
-main window is created. Each window keeps its own root, size, position,
-scale, title, limits, visibility, backdrop, focus, hover chain and resize
-handlers (`on_window_resize`); the `*_of(win, ..)` accessors reach them.
-`flush` passes every window's tree and sends **one** commit, so a change
-touching two windows lands at once.
+main window is created. It is an ordinary `Normal`-layer window;
+**`add_surface_window(title, size, root, surface)`** is the same call for
+a shell opening another panel: the window is created on the `Surface`'s
+layer with its flags, and its anchor and exclusive zone ride the **same
+commit** as the `CreateWindow`, as they do for the main window. With
+`Anchor::top().on(output)` the anchor names an output, and the server
+puts the window there before anchoring it — which is how `nitro-bar`
+opens one panel per output from one `Ui`. Each window keeps its own root,
+size, position, scale, title, limits, visibility, backdrop, focus, hover
+chain and resize handlers (`on_window_resize`); the `*_of(win, ..)`
+accessors reach them. `flush` passes every window's tree and sends
+**one** commit, so a change touching two windows lands at once.
 
 Every `ServerMsg` names its window, and the toolkit routes by it:
 
 * `Configure` resizes that window and runs its resize handlers.
-  `on_resize` is the main window's.
+  `on_resize` is the main window's. It also carries the **output** the
+  window is on: `window_output(win)` reads it, and
+  `on_window_placed(win, |s, ui, output| ..)` runs when it *changes* —
+  on the first `Configure` and on every move or migration, never on a
+  bare resize. That is the hook a per-output shell keys on: the `Outputs`
+  snapshot is answered before the main window's first `Configure`, so
+  until that arrives a bar cannot know which output it must not open a
+  second panel on, and a resize handler says nothing about it.
 * Pointer events hit-test from that window's root against that window's
   hover chain. Hovering a dialog does not un-hover the main window.
 * A `Key` goes to the focused widget of the window it names, then bubbles

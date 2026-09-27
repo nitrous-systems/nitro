@@ -38,24 +38,21 @@ to its bottom, so the server recomputes it when the node is resized and a
 mode change costs the repaint the `Configure` already caused and nothing
 more.
 
-## One window, and what "per output" really costs
+## One window, and what "per output" now costs
 
-The spec asks for one surface per output. That is **not implementable on
-this protocol** — the same gap [`nitro-bar`](../nitro-bar) records and
-[`docs/shell.md`](../../docs/shell.md) §Deferred states under *Per-output
-shell surfaces*:
+The spec asks for one surface per output. The wallpaper opens **one**
+window, and the honest description is: the output the server placed it on
+is covered, and a second output shows the compositor's own background.
 
-* `CreateWindow` carries no output, and the server places every new
-  window on the primary one;
-* `SetAnchor` anchors to whichever output the window is *already* on;
-* nothing moves a window between outputs but a user's drag.
-
-N wallpaper windows would therefore all land on the primary output: N
-stacked backdrops on one screen and none on the others, which is worse
-than one. So the wallpaper opens **one** window, and the honest
-description is: the primary output is covered, and a second output shows
-the compositor's own background. The fix is the `output` field on
-`SetAnchor`.
+This used to be a protocol gap — `CreateWindow` carries no output and
+`SetAnchor` anchored to whichever output the window was already on. It
+closed in #3844: `SetAnchor` carries an `output`, and `nitro-ui`'s
+`add_surface_window` opens a second surface anchored to it, which is how
+[`nitro-bar`](../nitro-bar) now runs one panel per output on one
+connection ([`docs/shell.md`](../../docs/shell.md) §Anchors). Following
+it here is one `Surface::wallpaper().anchored(Anchor::fill().on(id))` per
+other output plus loading and scaling the image once per output; that is
+a follow-up, not part of #3844.
 
 ## Images: P6 PPM, and why only that
 
