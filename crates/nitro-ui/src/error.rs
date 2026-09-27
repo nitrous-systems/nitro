@@ -25,6 +25,11 @@ pub enum Error {
     },
     /// No root widget has been set.
     NoRoot,
+    /// The widget cannot be a window's root: it has a parent, or it is
+    /// already the root of a window.
+    NotRoot,
+    /// The window id names no window this app has (any more).
+    NoWindow,
     /// The connection failed, which is fatal: the wire protocol has no
     /// recoverable errors.
     Wire(nitro_wire::Error),
@@ -39,6 +44,8 @@ impl fmt::Display for Error {
             Error::Busy => write!(f, "widget is already borrowed (re-entrant access)"),
             Error::WrongType { expected } => write!(f, "widget is not a {expected}"),
             Error::NoRoot => write!(f, "no root widget"),
+            Error::NotRoot => write!(f, "widget has a parent or is already a window's root"),
+            Error::NoWindow => write!(f, "no such window"),
             Error::Wire(e) => write!(f, "wire: {e}"),
             Error::Io(e) => write!(f, "io: {e}"),
         }

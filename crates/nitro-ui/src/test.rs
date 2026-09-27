@@ -37,7 +37,7 @@ use crate::app::App;
 use crate::arena::WidgetId;
 use crate::event::button;
 use crate::theme::Theme;
-use crate::ui::Ui;
+use crate::ui::{Ui, WindowId};
 use crate::widget::Widget;
 use crate::wire::Mutation;
 
@@ -76,9 +76,6 @@ pub struct Harness<S> {
     server: TestServer,
     ui: Ui<S>,
     state: S,
-    /// Where the window landed on the output; input is injected in output
-    /// coordinates, so a test that says "click this widget" needs it.
-    origin: Point,
     time_ns: u64,
     /// The app's introspection socket, once a test has asked for one.
     socket: Option<crate::introspect::Socket>,
@@ -232,7 +229,6 @@ impl<S: 'static> Harness<S> {
             server,
             ui,
             state,
-            origin: Point::ZERO,
             time_ns: 2_000_000,
             socket: None,
         };
@@ -390,7 +386,6 @@ impl<S: 'static> Harness<S> {
         self.serve_socket();
         let _ = self.ui.flush().expect("flush");
         self.server.settle();
-        self.locate_window();
     }
 
     /// One non-blocking drain-and-dispatch pass.
@@ -414,16 +409,57 @@ impl<S: 'static> Harness<S> {
         false
     }
 
-    /// Find where the server placed our window.
+    /// Where the server placed one of our windows on the output.
     ///
     /// Since M3 the server decorates windows and places them
     /// centred-cascade inside the work area, so "the first window is at
     /// the origin" is no longer true — and the harness's coordinates are
     /// *window* coordinates, which have to be shifted onto the output. The
-    /// server tells us exactly where the content landed in every
-    /// `Configure`, so use that rather than re-deriving the policy here.
-    fn locate_window(&mut self) {
-        self.origin = self.ui.window_position();
+    /// server tells us exactly where each window's content landed in
+    /// every `Configure`, so use that rather than re-deriving the policy
+    /// here.
+    fn origin(&self, win: WindowId) -> Point {
+        self.ui.window_position_of(win)
+    }
+
+    // -- several windows ----------------------------------------------
+
+    /// Open another window, built by `build`, and settle until the server
+    /// has placed it. The server focuses a newly placed window and puts
+    /// it on top, so input injected afterwards goes to it.
+    ///
+    /// # Panics
+    /// If the window cannot be created.
+    pub fn open_window(
+        &mut self,
+        title: &str,
+        size: Option<Size>,
+        build: impl FnOnce(&mut Ui<S>) -> WidgetId,
+    ) -> WindowId {
+        let root = build(&mut self.ui);
+        let win = self.ui.add_window(title, size, root).expect("add window");
+        self.settle();
+        win
+    }
+
+    /// Close a window from the app's side ([`Ui::remove_window`]) and
+    /// settle.
+    ///
+    /// # Panics
+    /// If the window does not exist.
+    pub fn remove_window(&mut self, win: WindowId) {
+        self.ui
+            .remove_window(&mut self.state, win)
+            .expect("remove window");
+        self.settle();
+    }
+
+    /// Deliver a `Closed` for `win`, as the server sends when the user
+    /// closes it, and settle.
+    pub fn close_from_server(&mut self, win: WindowId) {
+        let msg = nitro_wire::msg::ServerMsg::Closed(nitro_wire::msg::Closed { window: win.raw() });
+        self.ui.dispatch(&mut self.state, &msg);
+        self.settle();
     }
 
     // -- input --------------------------------------------------------
@@ -433,13 +469,23 @@ impl<S: 'static> Harness<S> {
     /// # Panics
     /// On a wire failure.
     pub fn move_pointer(&mut self, pos: Point) {
+        self.move_pointer_in(WindowId::MAIN, pos);
+    }
+
+    /// Move the pointer to `pos` in `win`'s coordinates. The pointer goes
+    /// to the output, so the window has to be the one on top there.
+    ///
+    /// # Panics
+    /// On a wire failure.
+    pub fn move_pointer_in(&mut self, win: WindowId, pos: Point) {
+        let origin = self.origin(win);
         self.time_ns += 1_000_000;
         // An absolute device reports in its own unit square; the server
         // scales that onto the first output, so window coordinates have
         // to go back through the same division.
         self.server.push_input(InputEvent::PointerAbsolute {
-            x: f64::from(self.origin.x + pos.x) / f64::from(OUTPUT.0),
-            y: f64::from(self.origin.y + pos.y) / f64::from(OUTPUT.1),
+            x: f64::from(origin.x + pos.x) / f64::from(OUTPUT.0),
+            y: f64::from(origin.y + pos.y) / f64::from(OUTPUT.1),
             time_ns: self.time_ns,
         });
         self.settle();
@@ -485,19 +531,28 @@ impl<S: 'static> Harness<S> {
     /// # Panics
     /// On a wire failure.
     pub fn click_at(&mut self, pos: Point) {
-        self.move_pointer(pos);
+        self.click_at_in(WindowId::MAIN, pos);
+    }
+
+    /// Press and release the left button at `pos` in `win`'s coordinates.
+    ///
+    /// # Panics
+    /// On a wire failure.
+    pub fn click_at_in(&mut self, win: WindowId, pos: Point) {
+        self.move_pointer_in(win, pos);
         self.press(button::LEFT);
         self.release(button::LEFT);
     }
 
-    /// Click the centre of `id`.
+    /// Click the centre of `id`, in whichever window it is in.
     ///
     /// # Panics
     /// On a wire failure, or if the widget has no area.
     pub fn click(&mut self, id: WidgetId) {
         let b = self.bounds(id);
         assert!(!b.is_empty(), "widget {id} has no bounds to click");
-        self.click_at(Point::new(b.x + b.w / 2.0, b.y + b.h / 2.0));
+        let win = self.ui.window_of(id).unwrap_or(WindowId::MAIN);
+        self.click_at_in(win, Point::new(b.x + b.w / 2.0, b.y + b.h / 2.0));
     }
 
     /// Press a pointer button where the pointer is.
@@ -551,6 +606,36 @@ impl<S: 'static> Harness<S> {
     pub fn key(&mut self, keycode: u32) {
         self.key_down(keycode);
         self.key_up(keycode);
+    }
+
+    /// Press and release a key **addressed to `win`**, whichever window
+    /// the server has focused.
+    ///
+    /// The keys above go through the server, which sends them to the
+    /// window it focused; this synthesises the `Key` messages the server
+    /// would send to `win` and dispatches them, the way
+    /// [`Harness::configure`] does, so a test can say which window a key
+    /// is for. No text is attached: it is for keycodes (Tab, Return,
+    /// Escape, arrows), not typing.
+    pub fn key_in(&mut self, win: WindowId, keycode: u32) {
+        for pressed in [true, false] {
+            self.time_ns += 1_000_000;
+            let msg = nitro_wire::msg::ServerMsg::Key(nitro_wire::msg::Key {
+                window: win.raw(),
+                keycode,
+                state: if pressed {
+                    ButtonState::Pressed
+                } else {
+                    ButtonState::Released
+                },
+                mods: 0,
+                keysym: 0,
+                time_ns: self.time_ns,
+                utf8: String::new(),
+            });
+            self.ui.dispatch(&mut self.state, &msg);
+            self.settle();
+        }
     }
 
     /// Inject a key press **without** settling.
@@ -629,11 +714,25 @@ impl<S: 'static> Harness<S> {
     /// # Panics
     /// On a wire failure.
     pub fn configure(&mut self, size: Size) {
+        self.configure_window(WindowId::MAIN, size);
+    }
+
+    /// [`Harness::configure`] for one window. Its position is kept, so
+    /// input and screenshots still find it.
+    ///
+    /// # Panics
+    /// On a wire failure.
+    pub fn configure_window(&mut self, win: WindowId, size: Size) {
+        let position = if win == WindowId::MAIN {
+            nitro_core::Point::ZERO
+        } else {
+            self.ui.window_position_of(win)
+        };
         let msg = nitro_wire::msg::ServerMsg::Configure(nitro_wire::msg::Configure {
-            window: crate::ui::WINDOW,
+            window: win.raw(),
             size,
-            position: nitro_core::Point::ZERO,
-            scale: self.ui.scale(),
+            position,
+            scale: self.ui.scale_of(win),
             output: 0,
         });
         self.ui.dispatch(&mut self.state, &msg);
@@ -656,10 +755,22 @@ impl<S: 'static> Harness<S> {
     /// If the control socket answers with an error.
     #[must_use]
     pub fn shot(&self) -> Image {
+        self.shot_window(WindowId::MAIN)
+    }
+
+    /// [`Harness::shot`] of one window: pixel `(0, 0)` is that window's
+    /// top-left content corner. Whatever is on top of it on the output
+    /// is in the picture too.
+    ///
+    /// # Panics
+    /// If the control socket answers with an error.
+    #[must_use]
+    pub fn shot_window(&self, win: WindowId) -> Image {
         let img = self.output_shot();
-        let size = self.ui.window_size();
-        let x0 = self.origin.x.max(0.0) as u32;
-        let y0 = self.origin.y.max(0.0) as u32;
+        let size = self.ui.window_size_of(win);
+        let origin = self.origin(win);
+        let x0 = origin.x.max(0.0) as u32;
+        let y0 = origin.y.max(0.0) as u32;
         let w = (size.w.max(0.0) as u32).min(img.width.saturating_sub(x0));
         let h = (size.h.max(0.0) as u32).min(img.height.saturating_sub(y0));
         let stride = w * 4;

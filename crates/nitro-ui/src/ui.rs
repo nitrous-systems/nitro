@@ -39,9 +39,115 @@ use crate::theme::{TextStyle, Theme};
 use crate::widget::{AnyWidget, EventCx, LayoutCx, MeasureCx, PaintCx, Widget};
 use crate::wire::{Mutation, TextMetrics, Wire};
 
-/// The one window's root node id. Client-allocated, so it is simply the
-/// first id; [`Wire`] hands out everything from 2 up.
-pub(crate) const WINDOW: NodeId = NodeId(1);
+/// A handle to one of this app's windows.
+///
+/// Every `Ui` has [`WindowId::MAIN`], the window [`Ui::open_window`]
+/// opens and [`App`](crate::App) builds; [`Ui::add_window`] opens more.
+/// The id is the window's root node id on the wire, which is what every
+/// `ServerMsg` names it by, so routing an event is a lookup rather than
+/// a translation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WindowId(NodeId);
+
+impl WindowId {
+    /// The main window. Client-allocated, so it is simply the first id;
+    /// [`Wire`] hands out everything from 2 up. Closing it quits the app.
+    pub const MAIN: WindowId = WindowId(NodeId(1));
+
+    /// The window's node id, as the wire names it.
+    #[must_use]
+    pub fn raw(self) -> NodeId {
+        self.0
+    }
+}
+
+/// Everything the toolkit keeps per window.
+///
+/// One of these per open window, in [`Ui::windows`] order; index 0 is
+/// always [`WindowId::MAIN`], created with the `Ui` and opened by
+/// [`Ui::open_window`].
+struct Window<S> {
+    id: WindowId,
+    root: Option<WidgetId>,
+    open: bool,
+    size: Size,
+    /// Where the server put the window on its output, from the last
+    /// `Configure`. The introspection socket's `shot` needs it to crop
+    /// an output screenshot down to this window.
+    position: Point,
+    scale: f32,
+    /// Whether the root's group has been told to clip to the window.
+    ///
+    /// One `SetClip`, remembered: the rectangle it clips to is the root
+    /// widget's own bounds, which the layout pass keeps equal to the
+    /// window on every `Configure`, so a resize needs no second message.
+    /// See [`Ui::pass_clip`].
+    root_clipped: bool,
+    /// The window's background: a `Rect` node under everything, filled
+    /// with the theme's `background`. `None` for a transparent window
+    /// ([`App::transparent`](crate::App::transparent)).
+    ///
+    /// The root widget paints nothing by default, so without this a
+    /// dialog's dark text lands on whatever the desktop is showing.
+    backdrop: Option<NodeId>,
+    /// The colour and size the backdrop was last sent, so a resize or a
+    /// theme change costs one mutation and an idle tree costs none.
+    backdrop_sent: Option<(Size, nitro_core::Color)>,
+    /// The widget keys go to when the server names this window.
+    focused: Option<WidgetId>,
+    hover_chain: Vec<WidgetId>,
+    /// The last hit-test walk in this window, kept for `local_pos`; see
+    /// [`Ui::pointer_move`].
+    chain: Vec<(WidgetId, Point)>,
+    /// The title last sent, so an unchanged title costs nothing. A
+    /// terminal re-sends one per OSC and a shell prompt that carries one
+    /// sends the same string on every line.
+    title: String,
+    /// The size limits last sent; `None` until something set them.
+    limits: Option<(Size, Size)>,
+    /// Whether the window is shown, so an unchanged
+    /// [`Ui::set_window_visible`] costs no mutation and so no commit.
+    /// The only copy: the wire layer just sends.
+    visible: bool,
+    /// Resize handlers, in registration order; see [`Ui::on_resize`].
+    ///
+    /// `Option` for the same reason a widget leaves its arena slot: a
+    /// handler is handed `&mut Ui<S>`, so it must not be reachable
+    /// through the tree it is holding.
+    resize_handlers: Vec<Option<ResizeHandler<S>>>,
+    /// Run once when the window goes; see [`Ui::on_window_closed`].
+    close_handlers: Vec<OnceCallback<S>>,
+}
+
+impl<S> Window<S> {
+    fn new(id: WindowId) -> Self {
+        Self {
+            id,
+            root: None,
+            open: false,
+            size: Size::ZERO,
+            position: Point::ZERO,
+            scale: 1.0,
+            root_clipped: false,
+            backdrop: None,
+            backdrop_sent: None,
+            focused: None,
+            hover_chain: Vec::new(),
+            chain: Vec::new(),
+            title: String::new(),
+            limits: None,
+            visible: true,
+            resize_handlers: Vec::new(),
+            close_handlers: Vec::new(),
+        }
+    }
+}
+
+/// The window `id` names, out of the list, borrowing only the list —
+/// which is what lets a caller hold it while it talks to the wire.
+fn find_mut<S>(windows: &mut [Window<S>], id: WindowId) -> Option<&mut Window<S>> {
+    windows.iter_mut().find(|w| w.id == id)
+}
 
 /// How many times [`Ui::run_deferred`] drains a queue that keeps
 /// refilling itself before giving up.
@@ -133,12 +239,12 @@ pub struct TimerId(u64);
 
 /// The widget tree and everything the passes need.
 ///
-/// One `Ui` owns one window. It is generic over the app's state type `S`,
-/// which is what callbacks are handed alongside the tree itself.
-#[allow(clippy::struct_excessive_bools)] // Independent facts about one window, not a state machine: `quit`, `window_open`, `backdrop_wanted`, `root_clipped` and `frame_requested` have no shared vocabulary to collapse into.
+/// One `Ui` owns every window of an app: [`WindowId::MAIN`], and any
+/// opened with [`Ui::add_window`]. It is generic over the app's state
+/// type `S`, which is what callbacks are handed alongside the tree itself.
+#[allow(clippy::struct_excessive_bools)] // Independent facts, not a state machine: `quit`, `backdrop_wanted` and `frame_requested` have no shared vocabulary to collapse into.
 pub struct Ui<S> {
     arena: Arena<S>,
-    root: Option<WidgetId>,
     theme: Theme,
     /// The colours the server pushed, which `theme` is a view on.
     ///
@@ -147,34 +253,19 @@ pub struct Ui<S> {
     /// the built-in widgets have no field for.
     palette: nitro_core::Palette,
     wire: Wire,
-    window_open: bool,
-    window_size: Size,
-    /// Where the server put the window on its output, from the last
-    /// `Configure`. The introspection socket's `shot` needs it to crop
-    /// an output screenshot down to this window.
-    window_position: Point,
-    scale: f32,
-    /// The window's background: a `Rect` node under everything, filled
-    /// with the theme's `background`. `None` for a transparent window
-    /// ([`App::transparent`](crate::App::transparent)).
-    ///
-    /// The root widget paints nothing by default, so without this a
-    /// dialog's dark text lands on whatever the desktop is showing.
-    backdrop: Option<NodeId>,
+    /// Every window, [`WindowId::MAIN`] first; see [`Window`].
+    windows: Vec<Window<S>>,
+    /// The window that last got keyboard focus from the server, and so
+    /// the one [`Ui::focused`] and Tab traversal speak about.
+    active: WindowId,
+    /// Secondary windows this app has already torn down, so a late
+    /// `Closed` naming one is dropped quietly rather than logged as a
+    /// stray. Bounded; see [`Ui::drop_window`].
+    gone_windows: Vec<NodeId>,
+    /// Whether windows paint the theme's background behind the tree.
     backdrop_wanted: bool,
-    /// Whether the root's group has been told to clip to the window.
-    ///
-    /// One `SetClip`, remembered: the rectangle it clips to is the root
-    /// widget's own bounds, which the layout pass keeps equal to the
-    /// window on every `Configure`, so a resize needs no second message.
-    /// See [`Ui::pass_clip`].
-    root_clipped: bool,
-    /// The colour and size the backdrop was last sent, so a resize or a
-    /// theme change costs one mutation and an idle tree costs none.
-    backdrop_sent: Option<(Size, nitro_core::Color)>,
     /// Override for the server control socket `shot` talks to.
     control_path: Option<std::path::PathBuf>,
-    focused: Option<WidgetId>,
     /// Focus changes waiting to be reported, oldest first.
     ///
     /// [`Ui::focus`] can be called from inside a widget's own `event`,
@@ -193,7 +284,6 @@ pub struct Ui<S> {
     /// work and running it once every widget is back in place is the
     /// same answer `focus` already takes for the same reason.
     pending_deferred: Vec<OnceCallback<S>>,
-    hover_chain: Vec<WidgetId>,
     /// Widgets activated since the last drain, oldest first.
     ///
     /// A value change is visible by diffing the introspection tree, but
@@ -216,7 +306,6 @@ pub struct Ui<S> {
     id_pool: Vec<Vec<WidgetId>>,
     item_pool: Vec<Vec<FlexItem>>,
     rect_pool: Vec<Vec<Rect>>,
-    chain: Vec<(WidgetId, Point)>,
     fds: Vec<FdHook<S>>,
     /// Next never-used descriptor-hook id. Monotonic, because a
     /// descriptor *number* is recycled the moment it is closed; see
@@ -251,25 +340,12 @@ pub struct Ui<S> {
     /// handler is handed `&mut Ui<S>`, so it must not be reachable
     /// through the tree it is holding.
     frame_handlers: Vec<Option<FrameHandler<S>>>,
-    /// Window-resize handlers, in registration order; see
-    /// [`Ui::on_resize`].
-    ///
-    /// `Option` for the same reason a widget leaves its arena slot: a
-    /// handler is handed `&mut Ui<S>`, so it must not be reachable
-    /// through the tree it is holding.
-    resize_handlers: Vec<Option<ResizeHandler<S>>>,
     /// Palette-change handlers, in registration order; see
     /// [`Ui::on_theme`]. `Option` for the same reason the others are.
     theme_handlers: Vec<Option<ThemeHandler<S>>>,
     /// Whether a `RequestFrame` is outstanding, so asking twice in one
     /// turn does not put two requests on the wire.
     frame_requested: bool,
-    /// The window title last sent, so an unchanged title costs nothing.
-    /// A terminal re-sends one per OSC and a shell prompt that carries
-    /// one sends the same string on every line.
-    window_title: String,
-    /// The size limits last sent; `None` until something set them.
-    window_limits: Option<(Size, Size)>,
 }
 
 /// A shell-event handler; see [`Ui::on_shell`].
@@ -335,30 +411,22 @@ impl<S: 'static> Ui<S> {
     pub fn new(conn: Connection, theme: Theme) -> Self {
         Self {
             arena: Arena::default(),
-            root: None,
             theme,
             palette: nitro_core::Palette::default(),
             wire: Wire::new(conn),
-            window_open: false,
-            window_size: Size::ZERO,
-            window_position: Point::ZERO,
-            scale: 1.0,
-            backdrop: None,
+            windows: vec![Window::new(WindowId::MAIN)],
+            active: WindowId::MAIN,
+            gone_windows: Vec::new(),
             backdrop_wanted: true,
-            root_clipped: false,
-            backdrop_sent: None,
             control_path: None,
-            focused: None,
             pending_focus: Vec::new(),
             pending_deferred: Vec::new(),
-            hover_chain: Vec::new(),
             activations: Vec::new(),
             quit: false,
             last_server_error: None,
             id_pool: Vec::new(),
             item_pool: Vec::new(),
             rect_pool: Vec::new(),
-            chain: Vec::new(),
             fds: Vec::new(),
             next_fd_token: 1,
             timers: Vec::new(),
@@ -368,11 +436,8 @@ impl<S: 'static> Ui<S> {
             app_id: String::new(),
             shell_handlers: Vec::new(),
             frame_handlers: Vec::new(),
-            resize_handlers: Vec::new(),
             theme_handlers: Vec::new(),
             frame_requested: false,
-            window_title: String::new(),
-            window_limits: None,
         }
     }
 
@@ -467,6 +532,18 @@ impl<S: 'static> Ui<S> {
     /// [`Error::StaleWidget`] if the id is dead, [`Error::Wire`] if the
     /// connection failed.
     pub fn remove(&mut self, id: WidgetId) -> Result<(), Error> {
+        self.remove_subtree(id, true)
+    }
+
+    /// The body of [`Ui::remove`], with the `DestroyNode` optional.
+    ///
+    /// A window's teardown ([`Ui::remove_window`], or a `Closed` from the
+    /// server) destroys the window node itself, which takes every group
+    /// under it along; a second `DestroyNode` for the root group would
+    /// name a node the server has already freed. Everything else — the
+    /// arena, the focus, every hover chain, the queued focus events —
+    /// is the same path either way.
+    fn remove_subtree(&mut self, id: WidgetId, send_destroy: bool) -> Result<(), Error> {
         if !self.arena.is_live(id) {
             return Err(Error::StaleWidget);
         }
@@ -476,8 +553,12 @@ impl<S: 'static> Ui<S> {
         {
             slot.state.children.retain(|c| *c != id);
             self.mark(p, Dirty::TREE | Dirty::LAYOUT);
-        } else if self.root == Some(id) {
-            self.root = None;
+        } else {
+            for w in &mut self.windows {
+                if w.root == Some(id) {
+                    w.root = None;
+                }
+            }
         }
         // One `DestroyNode` on the subtree's outermost group takes the
         // whole scene subtree with it. The ids underneath it are *not*
@@ -491,13 +572,21 @@ impl<S: 'static> Ui<S> {
         self.collect_subtree(id, &mut doomed);
         for d in &doomed {
             if self.arena.slot(*d).is_some_and(|s| s.state.focused) {
-                self.focused = None;
+                for w in &mut self.windows {
+                    if w.focused == Some(*d) {
+                        w.focused = None;
+                    }
+                }
             }
             self.arena.remove(*d);
         }
-        self.hover_chain.retain(|h| !doomed.contains(h));
+        for w in &mut self.windows {
+            w.hover_chain.retain(|h| !doomed.contains(h));
+            w.chain.retain(|(h, _)| !doomed.contains(h));
+        }
         self.pending_focus.retain(|(id, _)| !doomed.contains(id));
-        if let Some(n) = node {
+        self.activations.retain(|a| !doomed.contains(a));
+        if send_destroy && let Some(n) = node {
             self.wire.destroy_node(n)?;
         }
         Ok(())
@@ -520,17 +609,250 @@ impl<S: 'static> Ui<S> {
         if !self.arena.is_live(id) {
             return Err(Error::StaleWidget);
         }
-        self.root = Some(id);
+        let main = &mut self.windows[0];
+        main.root = Some(id);
         // A new root is a new group, and the clip rides the group.
-        self.root_clipped = false;
+        main.root_clipped = false;
         self.mark(id, Dirty::LAYOUT | Dirty::PAINT | Dirty::TREE);
         Ok(())
     }
 
-    /// The root widget, if one is set.
+    /// The main window's root widget, if one is set.
     #[must_use]
     pub fn root(&self) -> Option<WidgetId> {
-        self.root
+        self.windows[0].root
+    }
+
+    // -- windows ------------------------------------------------------
+
+    fn win(&self, id: WindowId) -> Option<&Window<S>> {
+        self.windows.iter().find(|w| w.id == id)
+    }
+
+    fn win_mut(&mut self, id: WindowId) -> Option<&mut Window<S>> {
+        find_mut(&mut self.windows, id)
+    }
+
+    fn main(&self) -> &Window<S> {
+        &self.windows[0]
+    }
+
+    /// The window a server message names, if it is one of ours.
+    fn window_by_node(&self, node: NodeId) -> Option<WindowId> {
+        self.windows.iter().find(|w| w.id.0 == node).map(|w| w.id)
+    }
+
+    /// Every window this app has, [`WindowId::MAIN`] first, in the order
+    /// they were opened.
+    ///
+    /// The index into this list is what the introspection socket calls a
+    /// window: `window[1]` is the second entry.
+    #[must_use]
+    pub fn windows(&self) -> Vec<WindowId> {
+        self.windows.iter().map(|w| w.id).collect()
+    }
+
+    /// Whether `win` is a window this app still has.
+    #[must_use]
+    pub fn has_window(&self, win: WindowId) -> bool {
+        self.win(win).is_some()
+    }
+
+    /// A window's root widget.
+    #[must_use]
+    pub fn root_of(&self, win: WindowId) -> Option<WidgetId> {
+        self.win(win).and_then(|w| w.root)
+    }
+
+    /// The window `id` is in: walk to the top of its tree and find the
+    /// window whose root that is. `None` for a stale id or a widget that
+    /// is not (yet) attached to any window.
+    #[must_use]
+    pub fn window_of(&self, id: WidgetId) -> Option<WindowId> {
+        let mut top = id;
+        if !self.arena.is_live(top) {
+            return None;
+        }
+        while let Some(p) = self.parent(top) {
+            top = p;
+        }
+        self.windows
+            .iter()
+            .find(|w| w.root == Some(top))
+            .map(|w| w.id)
+    }
+
+    /// The window that last got keyboard focus from the server —
+    /// [`WindowId::MAIN`] until something else did.
+    #[must_use]
+    pub fn active_window(&self) -> WindowId {
+        self.active
+    }
+
+    /// Open another window with `root` as its tree.
+    ///
+    /// The window gets its own focus, hover, size, title, limits and
+    /// resize handlers; events the server sends for it are routed to it
+    /// and nowhere else. It is created in the next commit, with the app
+    /// id, exactly as [`Ui::open_window`] creates the main window, and
+    /// sized to `size` or to the root's measured size. It is always an
+    /// ordinary (`Normal`-layer) window: shell surfaces are a property of
+    /// the main window.
+    ///
+    /// Closing it — from the app with [`Ui::remove_window`], or by the
+    /// user through the server — destroys its tree and runs the handlers
+    /// registered with [`Ui::on_window_closed`]. The app keeps running;
+    /// only the main window's `Closed` quits.
+    ///
+    /// # Errors
+    /// [`Error::StaleWidget`] for a dead root, [`Error::NotRoot`] for a
+    /// widget that has a parent or is already some window's root, or a
+    /// wire error.
+    pub fn add_window(
+        &mut self,
+        title: &str,
+        size: Option<Size>,
+        root: WidgetId,
+    ) -> Result<WindowId, Error> {
+        if !self.arena.is_live(root) {
+            return Err(Error::StaleWidget);
+        }
+        if self.parent(root).is_some() || self.windows.iter().any(|w| w.root == Some(root)) {
+            return Err(Error::NotRoot);
+        }
+        let size = if let Some(s) = size {
+            s
+        } else {
+            let m = self.measure(root, Constraints::unbounded());
+            Size::new(m.w.max(1.0).ceil(), m.h.max(1.0).ceil())
+        };
+        let id = WindowId(self.wire.alloc_node());
+        self.wire
+            .create_window(id.0, title, size, nitro_wire::types::Layer::Normal, 0)?;
+        if !self.app_id.is_empty() {
+            let app_id = std::mem::take(&mut self.app_id);
+            let sent = self.wire.set_app_id(id.0, &app_id);
+            self.app_id = app_id;
+            sent?;
+        }
+        let mut w = Window::new(id);
+        w.root = Some(root);
+        w.open = true;
+        w.size = size;
+        w.scale = self.main().scale;
+        title.clone_into(&mut w.title);
+        self.windows.push(w);
+        self.mark(root, Dirty::LAYOUT | Dirty::PAINT | Dirty::TREE);
+        Ok(id)
+    }
+
+    /// Close a window this app opened with [`Ui::add_window`].
+    ///
+    /// One `DestroyNode` on the window takes the window and its whole
+    /// scene subtree with it; the widgets are dropped from the tree and
+    /// the [`Ui::on_window_closed`] handlers run. Removing
+    /// [`WindowId::MAIN`] is [`Ui::quit`].
+    ///
+    /// Needs the app state because the close handlers do; from inside a
+    /// callback that has only `&mut Ui<S>`, [`Ui::defer`] it.
+    ///
+    /// # Errors
+    /// [`Error::NoWindow`] for a window this app does not have, or a wire
+    /// error.
+    pub fn remove_window(&mut self, state: &mut S, win: WindowId) -> Result<(), Error> {
+        if win == WindowId::MAIN {
+            self.quit();
+            return Ok(());
+        }
+        if self.win(win).is_none() {
+            return Err(Error::NoWindow);
+        }
+        self.wire.destroy_node(win.0)?;
+        self.drop_window(state, win);
+        Ok(())
+    }
+
+    /// Forget a secondary window locally: its widgets, its state, and
+    /// then its close handlers. The caller has queued the window's
+    /// `DestroyNode`, which takes the whole scene subtree with it, so no
+    /// widget sends one of its own.
+    fn drop_window(&mut self, state: &mut S, win: WindowId) {
+        let Some(i) = self.windows.iter().position(|w| w.id == win) else {
+            return;
+        };
+        if i == 0 {
+            return;
+        }
+        if let Some(root) = self.windows[i].root {
+            let _ = self.remove_subtree(root, false);
+        }
+        let w = self.windows.remove(i);
+        if self.active == win {
+            self.active = WindowId::MAIN;
+        }
+        // The server answers our own `DestroyNode` with a `Closed` too;
+        // that one is expected, not a stray. A handful is plenty: a late
+        // `Closed` arrives within a round trip.
+        if self.gone_windows.len() >= 16 {
+            self.gone_windows.remove(0);
+        }
+        self.gone_windows.push(win.0);
+        for h in w.close_handlers {
+            h(state, self);
+        }
+    }
+
+    /// Run `handler` once when `win` goes, whether the app removed it or
+    /// the server closed it. Not called for the main window, whose
+    /// closing ends the app. Registering on a window that does not exist
+    /// does nothing.
+    pub fn on_window_closed(
+        &mut self,
+        win: WindowId,
+        handler: impl FnOnce(&mut S, &mut Ui<S>) + 'static,
+    ) {
+        if let Some(w) = self.win_mut(win) {
+            w.close_handlers.push(Box::new(handler));
+        }
+    }
+
+    /// Register a resize handler for one window; see [`Ui::on_resize`],
+    /// which is this for [`WindowId::MAIN`].
+    pub fn on_window_resize(
+        &mut self,
+        win: WindowId,
+        handler: impl FnMut(&mut S, &mut Ui<S>, Size) + 'static,
+    ) {
+        if let Some(w) = self.win_mut(win) {
+            w.resize_handlers.push(Some(Box::new(handler)));
+        }
+    }
+
+    /// A window's content size in logical pixels; zero for an unknown
+    /// window.
+    #[must_use]
+    pub fn window_size_of(&self, win: WindowId) -> Size {
+        self.win(win).map_or(Size::ZERO, |w| w.size)
+    }
+
+    /// Where the server placed a window, from its last `Configure`.
+    #[must_use]
+    pub fn window_position_of(&self, win: WindowId) -> Point {
+        self.win(win).map_or(Point::ZERO, |w| w.position)
+    }
+
+    /// A window's output scale, from its last `Configure`.
+    #[must_use]
+    pub fn scale_of(&self, win: WindowId) -> f32 {
+        self.win(win).map_or(1.0, |w| w.scale)
+    }
+
+    /// The focused widget in one window. Each window keeps its own: a
+    /// dialog taking the keyboard does not lose the main window's focus,
+    /// it only stops being where keys go.
+    #[must_use]
+    pub fn focused_in(&self, win: WindowId) -> Option<WidgetId> {
+        self.win(win).and_then(|w| w.focused)
     }
 
     // -- accessors ----------------------------------------------------
@@ -549,7 +871,9 @@ impl<S: 'static> Ui<S> {
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
         // The backdrop is not a widget, so no widget's repaint covers it.
-        self.backdrop_sent = None;
+        for w in &mut self.windows {
+            w.backdrop_sent = None;
+        }
         let ids: Vec<WidgetId> = self.all_ids();
         for id in ids {
             self.mark(id, Dirty::LAYOUT | Dirty::PAINT);
@@ -678,26 +1002,26 @@ impl<S: 'static> Ui<S> {
         self.wire.is_remote()
     }
 
-    /// The window's current size in logical pixels.
+    /// The main window's current size in logical pixels.
     #[must_use]
     pub fn window_size(&self) -> Size {
-        self.window_size
+        self.main().size
     }
 
-    /// The output scale reported by the last `Configure`.
+    /// The output scale reported by the main window's last `Configure`.
     #[must_use]
     pub fn scale(&self) -> f32 {
-        self.scale
+        self.main().scale
     }
 
-    /// Where the server placed this window on its output, in logical
+    /// Where the server placed the main window on its output, in logical
     /// pixels, from the last `Configure`.
     ///
     /// The introspection socket's `shot` needs it: the server screenshots
     /// a whole output, and this is what crops it to one window.
     #[must_use]
     pub fn window_position(&self) -> Point {
-        self.window_position
+        self.main().position
     }
 
     /// Where this window's introspection `shot` asks for pixels.
@@ -1075,8 +1399,13 @@ impl<S: 'static> Ui<S> {
     /// widget that is out of its slot (one running a callback that asked
     /// to introspect) is skipped rather than failing the walk.
     pub fn introspect(&self, out: &mut Vec<Node>) {
+        self.introspect_window(WindowId::MAIN, out);
+    }
+
+    /// [`Ui::introspect`] for one window's tree.
+    pub fn introspect_window(&self, win: WindowId, out: &mut Vec<Node>) {
         out.clear();
-        if let Some(root) = self.root {
+        if let Some(root) = self.root_of(win) {
             self.introspect_into(root, out);
         }
     }
@@ -1385,25 +1714,26 @@ impl<S: 'static> Ui<S> {
     /// # Errors
     /// [`Error::NoRoot`] without a root, or a wire error.
     pub fn open_window(&mut self, title: &str, size: Option<Size>) -> Result<(), Error> {
-        let root = self.root.ok_or(Error::NoRoot)?;
+        let root = self.root().ok_or(Error::NoRoot)?;
         let size = if let Some(s) = size {
             s
         } else {
             let m = self.measure(root, Constraints::unbounded());
             Size::new(m.w.max(1.0).ceil(), m.h.max(1.0).ceil())
         };
-        self.window_size = size;
+        self.windows[0].size = size;
+        let main = WindowId::MAIN.0;
         let surface = self.surface;
         let (layer, flags) = surface.map_or((nitro_wire::types::Layer::Normal, 0), |s| {
             (s.layer, s.flags)
         });
-        self.wire.create_window(WINDOW, title, size, layer, flags)?;
+        self.wire.create_window(main, title, size, layer, flags)?;
         // The app id, in the same commit: it is what a window list names
         // the program by, and a window that existed for one frame without
         // one would appear in a bar as an anonymous row.
         if !self.app_id.is_empty() {
             let app_id = std::mem::take(&mut self.app_id);
-            self.wire.set_app_id(WINDOW, &app_id)?;
+            self.wire.set_app_id(main, &app_id)?;
             self.app_id = app_id;
         }
         // In the *same* transaction, which is the whole reason the server
@@ -1413,24 +1743,24 @@ impl<S: 'static> Ui<S> {
         // placeholder size above and then jump. See `docs/shell.md`.
         if let Some(s) = surface {
             if let Some(a) = s.anchor {
-                self.wire.set_anchor(WINDOW, a.edges, a.margin)?;
+                self.wire.set_anchor(main, a.edges, a.margin)?;
             }
             if let Some((edge, px)) = s.zone {
-                self.wire.set_exclusive_zone(WINDOW, edge, px)?;
+                self.wire.set_exclusive_zone(main, edge, px)?;
             }
         }
-        self.window_open = true;
+        self.windows[0].open = true;
         // Limits set before the window existed ride its first commit, for
         // the reason the anchor above does: a window that appeared
         // without them could be resized below its minimum in the frame
         // between.
-        if let Some((min, max)) = self.window_limits {
-            self.wire.set_window_limits(WINDOW, min, max)?;
+        if let Some((min, max)) = self.windows[0].limits {
+            self.wire.set_window_limits(main, min, max)?;
         }
         // The window was created with `title`, so record it rather than
         // re-sending it: that is what makes the first `set_window_title`
         // with the same string free.
-        title.clone_into(&mut self.window_title);
+        title.clone_into(&mut self.windows[0].title);
         self.mark(root, Dirty::LAYOUT | Dirty::PAINT | Dirty::TREE);
         Ok(())
     }
@@ -1456,24 +1786,46 @@ impl<S: 'static> Ui<S> {
     /// # Errors
     /// A wire failure, which is fatal.
     pub fn set_window_title(&mut self, title: impl Into<String>) -> Result<(), Error> {
+        self.set_window_title_of(WindowId::MAIN, title)
+    }
+
+    /// [`Ui::set_window_title`] for any of this app's windows. A window
+    /// that does not exist is ignored.
+    ///
+    /// # Errors
+    /// A wire failure, which is fatal.
+    pub fn set_window_title_of(
+        &mut self,
+        win: WindowId,
+        title: impl Into<String>,
+    ) -> Result<(), Error> {
         let title = title.into();
-        if title == self.window_title {
+        let Some(w) = find_mut(&mut self.windows, win) else {
+            return Ok(());
+        };
+        if title == w.title {
             return Ok(());
         }
-        self.window_title = title;
-        if !self.window_open {
+        w.title = title;
+        if !w.open {
             // The title the window is *created* with is `open_window`'s
             // argument; setting one before there is a window would name
             // a node the server has not seen.
             return Ok(());
         }
-        self.wire.set_window_title(WINDOW, &self.window_title)
+        self.wire.set_window_title(win.0, &w.title)
     }
 
     /// The title last set with [`Ui::set_window_title`].
     #[must_use]
     pub fn window_title(&self) -> &str {
-        &self.window_title
+        &self.main().title
+    }
+
+    /// A window's title; empty for an unknown window.
+    #[must_use]
+    pub fn window_title_of(&self, win: WindowId) -> &str {
+        self.win(win).map_or("", |w| w.title.as_str())
     }
 
     /// Tell the server the smallest and largest content size this window
@@ -1488,14 +1840,31 @@ impl<S: 'static> Ui<S> {
     /// # Errors
     /// A wire failure, which is fatal.
     pub fn set_window_limits(&mut self, min: Size, max: Size) -> Result<(), Error> {
-        if self.window_limits == Some((min, max)) {
+        self.set_window_limits_of(WindowId::MAIN, min, max)
+    }
+
+    /// [`Ui::set_window_limits`] for any of this app's windows. A window
+    /// that does not exist is ignored.
+    ///
+    /// # Errors
+    /// A wire failure, which is fatal.
+    pub fn set_window_limits_of(
+        &mut self,
+        win: WindowId,
+        min: Size,
+        max: Size,
+    ) -> Result<(), Error> {
+        let Some(w) = find_mut(&mut self.windows, win) else {
+            return Ok(());
+        };
+        if w.limits == Some((min, max)) {
             return Ok(());
         }
-        self.window_limits = Some((min, max));
-        if !self.window_open {
+        w.limits = Some((min, max));
+        if !w.open {
             return Ok(());
         }
-        self.wire.set_window_limits(WINDOW, min, max)
+        self.wire.set_window_limits(win.0, min, max)
     }
 
     /// The size the tree wants with nothing constraining it: what a
@@ -1577,13 +1946,15 @@ impl<S: 'static> Ui<S> {
     /// # Errors
     /// A wire failure, which is fatal.
     pub fn request_frame(&mut self) -> Result<(), Error> {
-        if self.frame_requested || !self.window_open {
+        if self.frame_requested || !self.main().open {
             return Ok(());
         }
         self.frame_requested = true;
         self.wire
             .send_now(&nitro_wire::msg::ClientMsg::RequestFrame(
-                nitro_wire::msg::RequestFrame { window: WINDOW },
+                nitro_wire::msg::RequestFrame {
+                    window: WindowId::MAIN.0,
+                },
             ))
     }
 
@@ -1660,30 +2031,43 @@ impl<S: 'static> Ui<S> {
     /// nothing to consume. A `Configure` that does not change the size
     /// fires nothing.
     pub fn on_resize(&mut self, handler: impl FnMut(&mut S, &mut Ui<S>, Size) + 'static) {
-        self.resize_handlers.push(Some(Box::new(handler)));
+        self.on_window_resize(WindowId::MAIN, handler);
     }
 
-    /// How many resize handlers are registered.
+    /// How many resize handlers the main window has.
     #[must_use]
     pub fn resize_handler_count(&self) -> usize {
-        self.resize_handlers.len()
+        self.main().resize_handlers.len()
     }
 
-    /// Offer a new window size to the resize handlers, oldest first.
+    /// Offer a new window size to the main window's resize handlers,
+    /// oldest first.
     ///
     /// Public for the same reason [`Ui::dispatch_frame`] is: an app
     /// driving `Ui` by hand, and the test harness, dispatch messages
     /// themselves. [`Ui::dispatch`] calls it for a real `Configure`.
     pub fn dispatch_resize(&mut self, state: &mut S, size: Size) {
-        for i in 0..self.resize_handlers.len() {
+        self.dispatch_resize_in(state, WindowId::MAIN, size);
+    }
+
+    /// [`Ui::dispatch_resize`] for one window's handlers.
+    pub fn dispatch_resize_in(&mut self, state: &mut S, win: WindowId, size: Size) {
+        let n = self.win(win).map_or(0, |w| w.resize_handlers.len());
+        for i in 0..n {
             // Out of the list for the call, for the same reason a widget
             // leaves its slot: the handler is handed the `Ui` the list
             // lives in.
-            let Some(mut h) = self.resize_handlers.get_mut(i).and_then(Option::take) else {
+            let Some(mut h) = self
+                .win_mut(win)
+                .and_then(|w| w.resize_handlers.get_mut(i))
+                .and_then(Option::take)
+            else {
                 continue;
             };
             h(state, self, size);
-            if let Some(slot) = self.resize_handlers.get_mut(i) {
+            // The window may have gone inside the handler; then the
+            // handler goes with it.
+            if let Some(slot) = self.win_mut(win).and_then(|w| w.resize_handlers.get_mut(i)) {
                 *slot = Some(h);
             }
         }
@@ -1796,14 +2180,36 @@ impl<S: 'static> Ui<S> {
     /// # Errors
     /// A wire failure, which is fatal.
     pub fn set_window_visible(&mut self, visible: bool) -> Result<(), Error> {
-        self.wire.set_visible(WINDOW, visible)
+        self.set_window_visible_of(WindowId::MAIN, visible)
     }
 
-    /// Whether the window is currently shown; `true` until something
-    /// hides it.
+    /// [`Ui::set_window_visible`] for any of this app's windows. A window
+    /// that does not exist is ignored.
+    ///
+    /// # Errors
+    /// A wire failure, which is fatal.
+    pub fn set_window_visible_of(&mut self, win: WindowId, visible: bool) -> Result<(), Error> {
+        let Some(w) = find_mut(&mut self.windows, win) else {
+            return Ok(());
+        };
+        if w.visible == visible {
+            return Ok(());
+        }
+        w.visible = visible;
+        self.wire.set_visible(win.0, visible)
+    }
+
+    /// Whether the main window is currently shown; `true` until
+    /// something hides it.
     #[must_use]
     pub fn window_visible(&self) -> bool {
-        self.wire.window_visible()
+        self.main().visible
+    }
+
+    /// Whether a window is currently shown; `false` for an unknown one.
+    #[must_use]
+    pub fn window_visible_of(&self, win: WindowId) -> bool {
+        self.win(win).is_some_and(|w| w.visible)
     }
 
     /// Take or release the keyboard grab on this window.
@@ -1825,39 +2231,56 @@ impl<S: 'static> Ui<S> {
     /// A wire failure. On an unprivileged connection the server closes
     /// the connection instead — check [`Ui::is_shell`].
     pub fn grab_keyboard(&mut self, on: bool) -> Result<(), Error> {
-        self.wire.grab_keyboard(WINDOW, on)
+        self.wire.grab_keyboard(WindowId::MAIN.0, on)
     }
 
     /// Resize the window's content area; the next flush re-lays out.
     pub fn resize(&mut self, size: Size) {
-        if self.window_size == size {
+        self.resize_window(WindowId::MAIN, size);
+    }
+
+    /// [`Ui::resize`] for one window.
+    fn resize_window(&mut self, win: WindowId, size: Size) {
+        let Some(w) = self.win_mut(win) else {
+            return;
+        };
+        if w.size == size {
             return;
         }
-        self.window_size = size;
-        if let Some(root) = self.root {
+        w.size = size;
+        if let Some(root) = w.root {
             self.mark(root, Dirty::LAYOUT | Dirty::PAINT);
         }
     }
 
     /// Run the passes and commit, if anything is dirty.
     ///
-    /// Returns whether a commit was sent. **Nothing dirty means no
-    /// commit**, which is what makes an idle app cost zero bytes.
+    /// Every open window's tree is passed, and the lot goes out as
+    /// **one** commit, so a change that touches two windows lands on
+    /// screen at once. Returns whether a commit was sent. **Nothing
+    /// dirty means no commit**, which is what makes an idle app cost
+    /// zero bytes.
     ///
     /// # Errors
     /// Any wire failure; they are all fatal.
     pub fn flush(&mut self) -> Result<bool, Error> {
-        let Some(root) = self.root else {
-            return Ok(false);
-        };
-        if !self.window_open {
-            return Ok(false);
+        // By index: a window cannot be added or removed during the
+        // passes, which run no app code.
+        for i in 0..self.windows.len() {
+            let w = &self.windows[i];
+            let Some(root) = w.root else {
+                continue;
+            };
+            if !w.open {
+                continue;
+            }
+            let win = w.id;
+            self.pass_tree(root)?;
+            self.pass_layout(win, root)?;
+            self.pass_clip(win, root)?;
+            self.pass_paint(root)?;
+            self.pass_backdrop(win)?;
         }
-        self.pass_tree(root)?;
-        self.pass_layout(root)?;
-        self.pass_clip(root)?;
-        self.pass_paint(root)?;
-        self.pass_backdrop()?;
         self.wire.commit()
     }
 
@@ -1902,55 +2325,60 @@ impl<S: 'static> Ui<S> {
     /// here is what makes an overflowing layout show up as cut-off in
     /// `nitro-ui`'s own tests, against its own harness, instead of only
     /// on a desktop.
-    fn pass_clip(&mut self, root: WidgetId) -> Result<(), Error> {
-        if self.root_clipped {
+    fn pass_clip(&mut self, win: WindowId, root: WidgetId) -> Result<(), Error> {
+        if self.win(win).is_none_or(|w| w.root_clipped) {
             return Ok(());
         }
         let Some(node) = self.arena.slot(root).and_then(|s| s.state.node) else {
             return Ok(());
         };
         self.wire.set_clip(node, true)?;
-        self.root_clipped = true;
+        if let Some(w) = self.win_mut(win) {
+            w.root_clipped = true;
+        }
         Ok(())
     }
 
     /// The window background: one `Rect` node, created before anything
     /// else under the window root so it is behind the whole tree, and
-    /// re-sent only when the size or the theme colour changed.
-    fn pass_backdrop(&mut self) -> Result<(), Error> {
-        if !self.backdrop_wanted {
-            if let Some(node) = self.backdrop.take() {
-                self.backdrop_sent = None;
+    /// re-sent only when the size or the theme colour changed. Each
+    /// window has its own, parented to that window's node.
+    fn pass_backdrop(&mut self, win: WindowId) -> Result<(), Error> {
+        let wanted = self.backdrop_wanted;
+        let color = self.theme.background;
+        let Some(w) = find_mut(&mut self.windows, win) else {
+            return Ok(());
+        };
+        if !wanted {
+            if let Some(node) = w.backdrop.take() {
+                w.backdrop_sent = None;
                 self.wire.destroy_node(node)?;
             }
             return Ok(());
         }
-        let color = self.theme.background;
-        let size = self.window_size;
-        if self.backdrop_sent == Some((size, color)) {
+        let size = w.size;
+        if w.backdrop_sent == Some((size, color)) {
             return Ok(());
         }
         let rect = Rect::new(0.0, 0.0, size.w, size.h);
-        let node = if let Some(n) = self.backdrop {
+        let node = if let Some(n) = w.backdrop {
             n
         } else {
-            {
-                let n = self.wire.alloc_node();
-                // `before` is the root widget's group, which the TREE
-                // pass created first: the backdrop goes in front of it in
-                // sibling order, which is *behind* it on screen.
-                let before = self
-                    .root
-                    .and_then(|r| self.arena.slot(r))
-                    .and_then(|s| s.state.node)
-                    .unwrap_or(NodeId::NONE);
-                self.wire.create_rect(n, WINDOW, before)?;
-                self.backdrop = Some(n);
-                n
-            }
+            let n = self.wire.alloc_node();
+            // `before` is the root widget's group, which the TREE
+            // pass created first: the backdrop goes in front of it in
+            // sibling order, which is *behind* it on screen.
+            let before = w
+                .root
+                .and_then(|r| self.arena.slot(r))
+                .and_then(|s| s.state.node)
+                .unwrap_or(NodeId::NONE);
+            self.wire.create_rect(n, win.0, before)?;
+            w.backdrop = Some(n);
+            n
         };
         self.wire.set_backdrop(node, rect, color)?;
-        self.backdrop_sent = Some((size, color));
+        w.backdrop_sent = Some((size, color));
         Ok(())
     }
 
@@ -1966,13 +2394,20 @@ impl<S: 'static> Ui<S> {
         }
         // The root's own group hangs off the window.
         if slot.state.node.is_none() {
+            // A root hangs off the node of the window it is the root of.
+            let window_node = || {
+                self.windows
+                    .iter()
+                    .find(|w| w.root == Some(id))
+                    .map_or(WindowId::MAIN.0, |w| w.id.0)
+            };
             let parent_node = match slot.state.parent {
                 Some(p) => self
                     .arena
                     .slot(p)
                     .and_then(|s| s.state.content)
-                    .unwrap_or(WINDOW),
-                None => WINDOW,
+                    .unwrap_or_else(window_node),
+                None => window_node(),
             };
             let node = self.wire.alloc_node();
             self.wire.create_group(node, parent_node, NodeId::NONE)?;
@@ -2092,15 +2527,16 @@ impl<S: 'static> Ui<S> {
     }
 
     /// LAYOUT: measure and place the dirty subtrees.
-    fn pass_layout(&mut self, root: WidgetId) -> Result<(), Error> {
+    fn pass_layout(&mut self, win: WindowId, root: WidgetId) -> Result<(), Error> {
         let Some(slot) = self.arena.slot(root) else {
             return Ok(());
         };
         if !slot.state.flags.has(Dirty::LAYOUT | Dirty::SUB_LAYOUT) {
             return Ok(());
         }
-        let rect = Rect::new(0.0, 0.0, self.window_size.w, self.window_size.h);
-        self.measure(root, Constraints::tight(self.window_size));
+        let size = self.window_size_of(win);
+        let rect = Rect::new(0.0, 0.0, size.w, size.h);
+        self.measure(root, Constraints::tight(size));
         self.layout_widget(root, rect)?;
         Ok(())
     }
@@ -2362,32 +2798,32 @@ impl<S: 'static> Ui<S> {
     pub fn dispatch(&mut self, state: &mut S, msg: &ServerMsg) {
         match msg {
             ServerMsg::Configure(c) => {
-                self.scale = c.scale;
-                self.window_position = c.position;
-                let changed = self.window_size != c.size;
-                self.resize(c.size);
+                let Some(win) = self.window_by_node(c.window) else {
+                    return;
+                };
+                let Some(w) = self.win_mut(win) else {
+                    return;
+                };
+                w.scale = c.scale;
+                w.position = c.position;
+                let changed = w.size != c.size;
+                self.resize_window(win, c.size);
                 // After the resize, so a handler sees the new size in
                 // `window_size` and can mark the tree itself; and only
                 // when the size actually moved, because the server also
                 // sends a `Configure` for a move or a scale change and
                 // an app should not reflow its content for those.
                 if changed {
-                    self.dispatch_resize(state, c.size);
+                    self.dispatch_resize_in(state, win, c.size);
                 }
             }
-            // Only our own window: the toolkit binds exactly one
-            // (`WINDOW`, see `open_window`), and a `Closed` naming any
-            // other id is not ours to act on. Quitting on it turned every
-            // stray into the quietest exit in the tree — exit 0, no
-            // output.
-            ServerMsg::Closed(c) if c.window == WINDOW => self.quit = true,
-            ServerMsg::Closed(c) => {
-                eprintln!(
-                    "nitro-ui: ignoring Closed for window {} (ours is {})",
-                    c.window.raw(),
-                    WINDOW.raw()
-                );
-            }
+            // Only our own windows: a `Closed` naming any other id is not
+            // ours to act on. Quitting on it turned every stray into the
+            // quietest exit in the tree — exit 0, no output. The main
+            // window closing ends the app; a secondary one closing ends
+            // only that window.
+            ServerMsg::Closed(c) if c.window == WindowId::MAIN.0 => self.quit = true,
+            ServerMsg::Closed(c) => self.window_closed(state, c.window),
             // The desktop's colours changed (or arrived for the first
             // time, right behind the `Welcome`). Not routed to a widget:
             // every widget is affected, so this marks the whole tree and
@@ -2402,20 +2838,18 @@ impl<S: 'static> Ui<S> {
                     self.dispatch_theme(state);
                 }
             }
-            ServerMsg::PointerEnter(e) => self.pointer_move(state, e.pos),
-            ServerMsg::PointerMotion(e) => self.pointer_move(state, e.pos),
-            ServerMsg::PointerLeave(_) => self.pointer_leave(state),
-            ServerMsg::PointerButton(b) => {
-                self.pointer_button(state, b.button, b.state == ButtonState::Pressed);
-            }
-            ServerMsg::PointerAxis(a) => {
-                let ev = Event::Scroll { dx: a.dx, dy: a.dy };
-                let target = self.hover_chain.last().copied();
-                if let Some(t) = target {
-                    self.bubble(state, t, &ev);
+            ServerMsg::PointerEnter(_)
+            | ServerMsg::PointerMotion(_)
+            | ServerMsg::PointerLeave(_)
+            | ServerMsg::PointerButton(_)
+            | ServerMsg::PointerAxis(_) => self.dispatch_pointer(state, msg),
+            ServerMsg::Key(k) => {
+                // A key for a window we no longer have (a dialog that
+                // closed with the key in flight) goes nowhere.
+                if let Some(win) = self.window_by_node(k.window) {
+                    self.key_in(state, win, k);
                 }
             }
-            ServerMsg::Key(k) => self.key(state, k),
             ServerMsg::Frame(f) => self.dispatch_frame(
                 state,
                 Frame {
@@ -2423,7 +2857,15 @@ impl<S: 'static> Ui<S> {
                     refresh_ns: f.refresh_ns,
                 },
             ),
-            ServerMsg::Focus(f) if !f.focused => self.blur(state),
+            ServerMsg::Focus(f) => {
+                if let Some(win) = self.window_by_node(f.window) {
+                    if f.focused {
+                        self.active = win;
+                    } else {
+                        self.blur_in(state, win);
+                    }
+                }
+            }
             // The shell socket's news. Not input, so not routed to a
             // widget: offered to the handlers `on_shell` registered.
             ServerMsg::WindowInfo(i) => {
@@ -2461,6 +2903,60 @@ impl<S: 'static> Ui<S> {
                 self.bad_icon(e);
             }
             ServerMsg::Error(e) => self.server_error(e),
+            _ => {}
+        }
+    }
+
+    /// A `Closed` for a window other than the main one.
+    fn window_closed(&mut self, state: &mut S, node: NodeId) {
+        if let Some(win) = self.window_by_node(node) {
+            // `Closed` is the server *asking*: it tears the window
+            // down only when the client destroys its root
+            // (`Server::close_window`). So a dialog closed by the
+            // user is destroyed here, on its way out of the tree.
+            if let Err(e) = self.wire.destroy_node(win.0) {
+                eprintln!("nitro-ui: closing window {}: {e}", win.0.raw());
+            }
+            self.drop_window(state, win);
+        } else if !self.gone_windows.contains(&node) {
+            eprintln!(
+                "nitro-ui: ignoring Closed for window {}, which is not ours",
+                node.raw(),
+            );
+        }
+    }
+
+    /// Route a pointer message to the window it names; one for a window
+    /// this app does not have goes nowhere.
+    fn dispatch_pointer(&mut self, state: &mut S, msg: &ServerMsg) {
+        match msg {
+            ServerMsg::PointerEnter(nitro_wire::msg::PointerEnter { window, pos, .. })
+            | ServerMsg::PointerMotion(nitro_wire::msg::PointerMotion { window, pos, .. }) => {
+                if let Some(win) = self.window_by_node(*window) {
+                    self.pointer_move_in(state, win, *pos);
+                }
+            }
+            ServerMsg::PointerLeave(e) => {
+                if let Some(win) = self.window_by_node(e.window) {
+                    self.pointer_leave_in(state, win);
+                }
+            }
+            ServerMsg::PointerButton(b) => {
+                if let Some(win) = self.window_by_node(b.window) {
+                    let pressed = b.state == ButtonState::Pressed;
+                    self.pointer_button_in(state, win, b.button, pressed);
+                }
+            }
+            ServerMsg::PointerAxis(a) => {
+                let ev = Event::Scroll { dx: a.dx, dy: a.dy };
+                let target = self
+                    .window_by_node(a.window)
+                    .and_then(|win| self.win(win))
+                    .and_then(|w| w.hover_chain.last().copied());
+                if let Some(t) = target {
+                    self.bubble(state, t, &ev);
+                }
+            }
             _ => {}
         }
     }
@@ -2570,10 +3066,19 @@ impl<S: 'static> Ui<S> {
     /// Route a pointer position: hover bookkeeping, then a move event
     /// offered deepest-first.
     pub fn pointer_move(&mut self, state: &mut S, pos: Point) {
-        let mut chain = std::mem::take(&mut self.chain);
-        self.hit_chain(pos, &mut chain);
+        self.pointer_move_in(state, WindowId::MAIN, pos);
+    }
+
+    /// [`Ui::pointer_move`] in one window: hit-tested from that window's
+    /// root, against that window's hover chain.
+    fn pointer_move_in(&mut self, state: &mut S, win: WindowId, pos: Point) {
+        let Some(w) = self.win_mut(win) else {
+            return;
+        };
+        let mut chain = std::mem::take(&mut w.chain);
+        let old = std::mem::take(&mut w.hover_chain);
+        self.hit_chain(win, pos, &mut chain);
         let new: Vec<WidgetId> = chain.iter().map(|(id, _)| *id).collect();
-        let old = std::mem::take(&mut self.hover_chain);
         for id in old.iter().rev() {
             if !new.contains(id) {
                 self.set_hovered(*id, false);
@@ -2586,7 +3091,13 @@ impl<S: 'static> Ui<S> {
                 self.bubble_one(state, *id, &Event::PointerEnter { pos: *local });
             }
         }
-        self.hover_chain = new;
+        // Filtered on the way back in: a handler above may have removed a
+        // widget that was in the chain, or the whole window.
+        let alive = |id: &WidgetId| self.arena.is_live(*id);
+        let new: Vec<WidgetId> = new.into_iter().filter(alive).collect();
+        if let Some(w) = self.win_mut(win) {
+            w.hover_chain = new;
+        }
         for (id, local) in chain.iter().rev() {
             if self
                 .bubble_one(state, *id, &Event::PointerMove { pos: *local })
@@ -2602,24 +3113,43 @@ impl<S: 'static> Ui<S> {
         // version reported every press at the widget's top-left corner,
         // which no widget noticed until one cared *where* it was
         // clicked. `hit_chain` clears it on the next move.
-        self.chain = chain;
+        chain.retain(|(id, _)| self.arena.is_live(*id));
+        if let Some(w) = self.win_mut(win) {
+            w.chain = chain;
+        }
     }
 
-    /// The pointer left the window.
+    /// The pointer left the main window.
     pub fn pointer_leave(&mut self, state: &mut S) {
-        self.chain.clear();
-        let old = std::mem::take(&mut self.hover_chain);
+        self.pointer_leave_in(state, WindowId::MAIN);
+    }
+
+    /// The pointer left one window.
+    fn pointer_leave_in(&mut self, state: &mut S, win: WindowId) {
+        let Some(w) = self.win_mut(win) else {
+            return;
+        };
+        w.chain.clear();
+        let old = std::mem::take(&mut w.hover_chain);
         for id in old.iter().rev() {
             self.set_hovered(*id, false);
             self.bubble_one(state, *id, &Event::PointerLeave);
         }
     }
 
-    /// Route a button press or release to the hovered chain.
+    /// Route a button press or release to the main window's hovered
+    /// chain.
     pub fn pointer_button(&mut self, state: &mut S, button: u32, pressed: bool) {
-        let chain: Vec<WidgetId> = self.hover_chain.clone();
+        self.pointer_button_in(state, WindowId::MAIN, button, pressed);
+    }
+
+    /// Route a button press or release to one window's hovered chain.
+    fn pointer_button_in(&mut self, state: &mut S, win: WindowId, button: u32, pressed: bool) {
+        let Some(chain) = self.win(win).map(|w| w.hover_chain.clone()) else {
+            return;
+        };
         for id in chain.iter().rev() {
-            let local = self.local_pos(*id);
+            let local = self.local_pos(win, *id);
             let ev = if pressed {
                 Event::PointerDown { pos: local, button }
             } else {
@@ -2649,7 +3179,17 @@ impl<S: 'static> Ui<S> {
     ///
     /// A widget therefore always wins over an app shortcut, and an app
     /// shortcut always gets the keys no widget wanted.
+    ///
+    /// The key goes to the window it names: its focused widget, and Tab
+    /// moves the focus within that window. A key naming a window this
+    /// app does not have goes to the main window.
     pub fn key(&mut self, state: &mut S, k: &nitro_wire::msg::Key) {
+        let win = self.window_by_node(k.window).unwrap_or(WindowId::MAIN);
+        self.key_in(state, win, k);
+    }
+
+    /// [`Ui::key`] for a known window.
+    fn key_in(&mut self, state: &mut S, win: WindowId, k: &nitro_wire::msg::Key) {
         let pressed = k.state == ButtonState::Pressed;
         let ev = KeyEvent {
             keycode: k.keycode,
@@ -2657,7 +3197,7 @@ impl<S: 'static> Ui<S> {
             mods: k.mods,
             text: k.utf8.clone(),
         };
-        let target = self.focused.or(self.root);
+        let target = self.win(win).and_then(|w| w.focused.or(w.root));
         let mut handled = Handled::No;
         if let Some(target) = target {
             handled = if pressed {
@@ -2682,7 +3222,7 @@ impl<S: 'static> Ui<S> {
             handled = self.run_key_handlers(state, &ev);
         }
         if pressed && k.keycode == key::TAB && !handled.is_handled() {
-            self.focus_next(state, ev.shift());
+            self.focus_next_in(state, win, ev.shift());
         }
     }
 
@@ -2979,10 +3519,9 @@ impl<S: 'static> Ui<S> {
     }
 
     /// Where the pointer sits inside `id`, from the last hover walk.
-    fn local_pos(&self, id: WidgetId) -> Point {
-        self.chain
-            .iter()
-            .find(|(w, _)| *w == id)
+    fn local_pos(&self, win: WindowId, id: WidgetId) -> Point {
+        self.win(win)
+            .and_then(|w| w.chain.iter().find(|(w, _)| *w == id))
             .map_or(Point::ZERO, |(_, p)| *p)
     }
 
@@ -2994,9 +3533,11 @@ impl<S: 'static> Ui<S> {
     /// the group they hang under, so the point has to travel the same
     /// way the pixels did or a scrolled row is clickable where it used
     /// to be.
-    fn hit_chain(&self, pos: Point, out: &mut Vec<(WidgetId, Point)>) {
+    fn hit_chain(&self, win: WindowId, pos: Point, out: &mut Vec<(WidgetId, Point)>) {
         out.clear();
-        let Some(root) = self.root else { return };
+        let Some(root) = self.root_of(win) else {
+            return;
+        };
         let mut id = root;
         let mut p = pos;
         loop {
@@ -3040,8 +3581,12 @@ impl<S: 'static> Ui<S> {
 
     /// Whether `id` has the keyboard focus.
     #[must_use]
+    ///
+    /// Each window keeps its own focus, so this is true for the focused
+    /// widget of a window that is not the active one too: it is where
+    /// keys will go when that window is focused again.
     pub fn is_focused(&self, id: WidgetId) -> bool {
-        self.focused == Some(id)
+        self.arena.slot(id).is_some_and(|s| s.state.focused)
     }
 
     /// Whether the pointer is inside `id`.
@@ -3050,13 +3595,20 @@ impl<S: 'static> Ui<S> {
         self.arena.slot(id).is_some_and(|s| s.state.hovered)
     }
 
-    /// The focused widget, if any.
+    /// The focused widget of the active window, if any; see
+    /// [`Ui::active_window`] and [`Ui::focused_in`].
     #[must_use]
     pub fn focused(&self) -> Option<WidgetId> {
-        self.focused
+        self.focused_in(self.active)
     }
 
-    /// Move the focus to `id`.
+    /// The window a focus change for `id` belongs to: its own, or the
+    /// active one for a widget not attached to any window yet.
+    fn focus_window_of(&self, id: WidgetId) -> WindowId {
+        self.window_of(id).unwrap_or(self.active)
+    }
+
+    /// Move the focus to `id`, within the window `id` is in.
     ///
     /// Callable without an `&mut S`, which is what
     /// [`EventCx::request_focus`](crate::EventCx::request_focus) needs:
@@ -3066,17 +3618,21 @@ impl<S: 'static> Ui<S> {
     /// once the dispatch that caused them has finished and every widget
     /// is back in its slot.
     pub fn focus(&mut self, id: WidgetId) {
-        if self.focused == Some(id) {
+        let win = self.focus_window_of(id);
+        let Some(w) = self.win_mut(win) else {
+            return;
+        };
+        if w.focused == Some(id) {
             return;
         }
-        if let Some(old) = self.focused
+        let old = w.focused.replace(id);
+        if let Some(old) = old
             && let Some(slot) = self.arena.slot_mut(old)
         {
             slot.state.focused = false;
             self.mark(old, Dirty::PAINT);
             self.pending_focus.push((old, false));
         }
-        self.focused = Some(id);
         if let Some(slot) = self.arena.slot_mut(id) {
             slot.state.focused = true;
         }
@@ -3175,7 +3731,8 @@ impl<S: 'static> Ui<S> {
     /// `FocusChanged` is queued like [`Ui::focus`]'s and delivered by
     /// [`Ui::deliver_focus_events`].
     pub fn unfocus(&mut self) {
-        if let Some(old) = self.focused.take() {
+        let win = self.active;
+        if let Some(old) = self.win_mut(win).and_then(|w| w.focused.take()) {
             if let Some(slot) = self.arena.slot_mut(old) {
                 slot.state.focused = false;
             }
@@ -3184,9 +3741,14 @@ impl<S: 'static> Ui<S> {
         }
     }
 
-    /// Drop the focus entirely.
+    /// Drop the active window's focus entirely.
     pub fn blur(&mut self, state: &mut S) {
-        if let Some(old) = self.focused.take() {
+        self.blur_in(state, self.active);
+    }
+
+    /// Drop one window's focus entirely.
+    pub fn blur_in(&mut self, state: &mut S, win: WindowId) {
+        if let Some(old) = self.win_mut(win).and_then(|w| w.focused.take()) {
             if let Some(slot) = self.arena.slot_mut(old) {
                 slot.state.focused = false;
             }
@@ -3195,16 +3757,21 @@ impl<S: 'static> Ui<S> {
         }
     }
 
-    /// Move the focus to the next (or previous) focusable widget, in tree
-    /// order. Wraps around.
+    /// Move the focus to the next (or previous) focusable widget of the
+    /// active window, in tree order. Wraps around.
     pub fn focus_next(&mut self, state: &mut S, backwards: bool) {
-        let order = self.focus_order();
+        self.focus_next_in(state, self.active, backwards);
+    }
+
+    /// [`Ui::focus_next`] within one window: Tab never leaves the window
+    /// the key was sent to.
+    pub fn focus_next_in(&mut self, state: &mut S, win: WindowId, backwards: bool) {
+        let order = self.focus_order_in(win);
         if order.is_empty() {
             return;
         }
-        let cur = self
-            .focused
-            .and_then(|f| order.iter().position(|id| *id == f));
+        let focused = self.focused_in(win);
+        let cur = focused.and_then(|f| order.iter().position(|id| *id == f));
         let next = match (cur, backwards) {
             (Some(i), false) => (i + 1) % order.len(),
             (Some(i), true) => (i + order.len() - 1) % order.len(),
@@ -3212,17 +3779,21 @@ impl<S: 'static> Ui<S> {
             (None, true) => order.len() - 1,
         };
         let target = order[next];
-        if self.focused == Some(target) {
+        if focused == Some(target) {
             return;
         }
-        if let Some(old) = self.focused.take() {
+        if let Some(old) = self.win_mut(win).and_then(|w| w.focused.take()) {
             if let Some(slot) = self.arena.slot_mut(old) {
                 slot.state.focused = false;
             }
             self.mark(old, Dirty::PAINT);
             self.bubble_one(state, old, &Event::FocusChanged { focused: false });
         }
-        self.focused = Some(target);
+        // The window may have gone inside the handler above.
+        let Some(w) = self.win_mut(win) else {
+            return;
+        };
+        w.focused = Some(target);
         self.pending_focus.retain(|(id, _)| *id != target);
         if let Some(slot) = self.arena.slot_mut(target) {
             slot.state.focused = true;
@@ -3231,11 +3802,18 @@ impl<S: 'static> Ui<S> {
         self.bubble_one(state, target, &Event::FocusChanged { focused: true });
     }
 
-    /// Every focusable widget, in pre-order: the Tab order.
+    /// Every focusable widget of the active window, in pre-order: the
+    /// Tab order.
     #[must_use]
     pub fn focus_order(&self) -> Vec<WidgetId> {
+        self.focus_order_in(self.active)
+    }
+
+    /// One window's Tab order.
+    #[must_use]
+    pub fn focus_order_in(&self, win: WindowId) -> Vec<WidgetId> {
         let mut out = Vec::new();
-        if let Some(root) = self.root {
+        if let Some(root) = self.root_of(win) {
             self.collect_focusable(root, &mut out);
         }
         out
@@ -3260,8 +3838,10 @@ impl<S: 'static> Ui<S> {
 
     fn all_ids(&self) -> Vec<WidgetId> {
         let mut out = Vec::new();
-        if let Some(root) = self.root {
-            self.collect_subtree(root, &mut out);
+        for w in &self.windows {
+            if let Some(root) = w.root {
+                self.collect_subtree(root, &mut out);
+            }
         }
         out
     }

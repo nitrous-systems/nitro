@@ -230,7 +230,7 @@ backslash inside a value is escaped `\t`, `\n`, `\\`.
 | `set <path> <prop> <value>` | `ok\n\n` or `err <msg>\n\n` |
 | `do <path> <action> [arg]` | `ok\n\n` or `err <msg>\n\n` |
 | `watch <path\|*>` | `ok\n` then `event …` lines until the connection closes |
-| `shot` | `ok <w> <h> <stride>\n` + `stride*h` bytes of `XRGB8888` |
+| `shot [path]` | `ok <w> <h> <stride>\n` + `stride*h` bytes of `XRGB8888` |
 | `tree` | as `list`, but indented by depth — for humans |
 | `quit` | `ok\n\n`, then the app exits |
 
@@ -338,10 +338,11 @@ AT-SPI's `Component::getExtents`. A widget scrolled out of its viewport
 reports a rectangle outside the viewport rather than being hidden — the
 clip is a paint-time fact, and `list` does not filter by visibility.
 
-### `shot`
+### `shot [path]`
 
 `ok <w> <h> <stride>` and then `stride × h` bytes of `XRGB8888`: the
-server's control `shot` of the whole output, **cropped to this window**.
+server's control `shot` of the whole output, **cropped to this window**
+— the main window, or the window `path` is in (`shot window[1]`).
 The crop needs the window's position, which the app keeps from the
 `Configure` message the server sends when it places or moves the window.
 
@@ -357,7 +358,11 @@ path    := segment ( "/" segment )*
 segment := name | role "[" index "]"
 ```
 
-The root widget is always `window`. Below it, a widget with an
+The main window's root widget is always `window`. An app with several
+windows (`Ui::add_window`) names the others' roots `window[N]`, where `N`
+is the window's index in `Ui::windows()`; `window[0]` is `window`. `list`,
+`tree` and `shot` without a path are about the main window, and
+`watch *` reports changes in every window. Below a root, a widget with an
 addressable **name** (set with `.name("ok")` or `WidgetMut::set_name`) is
 addressed by that name; a widget without one is `role[i]`, where `i`
 counts from 0 **among the siblings of the same role**. So the third

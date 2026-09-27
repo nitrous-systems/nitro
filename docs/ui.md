@@ -1213,6 +1213,59 @@ In a test, `Harness::configure(size)` goes through the ordinary dispatch
 path, so it fires the hook — which is what lets a resize test assert that
 *a resize* works rather than that the app's resize function works.
 
+### Several windows
+
+One `Ui` owns every window of an app. `WindowId::MAIN` is the one
+`open_window` opens and `App` builds, and every single-window call
+(`root`, `window_size`, `set_window_title`, `on_resize`, …) is about it,
+so a single-window app is unchanged. More come from
+
+```rust,ignore
+let root = ui.build(column().child(button("Open").name("open")));
+let dialog = ui.add_window("Pick a file", Some(Size::new(400.0, 300.0)), root)?;
+ui.on_window_closed(dialog, |s, ui| s.picker = None);
+// … later
+ui.remove_window(state, dialog)?;
+```
+
+`add_window` takes a built, parentless widget as the window's root and
+creates the window in the next commit, with the app id, the same way the
+main window is created. Each window keeps its own root, size, position,
+scale, title, limits, visibility, backdrop, focus, hover chain and resize
+handlers (`on_window_resize`); the `*_of(win, ..)` accessors reach them.
+`flush` passes every window's tree and sends **one** commit, so a change
+touching two windows lands at once.
+
+Every `ServerMsg` names its window, and the toolkit routes by it:
+
+* `Configure` resizes that window and runs its resize handlers.
+  `on_resize` is the main window's.
+* Pointer events hit-test from that window's root against that window's
+  hover chain. Hovering a dialog does not un-hover the main window.
+* A `Key` goes to the focused widget of the window it names, then bubbles
+  and falls back to the app's `on_key` handlers, which are shared. Tab
+  moves the focus within that window only.
+* `Focus { focused: true }` makes the window the **active** one, which is
+  what `focused()`, `focus_order()` and `unfocus()` speak about.
+  `focus(id)` moves the focus within the window `id` is in.
+* `Closed` for the main window quits. For a secondary window it is the
+  server asking, so the toolkit destroys the window, drops its widgets
+  through the same path `remove` uses, and runs its `on_window_closed`
+  handlers. The app keeps running.
+  `remove_window` does the same from the app's side; the `Closed` the
+  server answers it with is expected and dropped quietly.
+
+In a test, `Harness::open_window(title, size, build)` opens one and
+settles; the server focuses and raises a newly placed window, so input
+injected afterwards goes to it. `click(id)` finds the window `id` is in;
+`click_at_in`, `move_pointer_in`, `configure_window` and `shot_window`
+take the window explicitly. `key_in(win, keycode)` dispatches a `Key`
+addressed to `win`, whichever window the server focused, and
+`close_from_server(win)` delivers a `Closed`.
+
+The introspection socket names a secondary window's root `window[N]`,
+its index in `ui.windows()`; see `docs/introspection.md`.
+
 ## Shell surfaces
 
 A bar, a dock, a launcher and a wallpaper are `nitro-ui` apps like any
@@ -1602,8 +1655,11 @@ regrets:
   (which marks it anyway).
 * **No wrapping, no `order`, no baselines** in layout; no `Adaptive`
   widget yet (M3, and it is a widget, not a new mechanism).
-* **`Ui` owns exactly one window.** Multi-window is a shell concern and
-  M3; nothing in the arena assumes one window, only `open_window` does.
+* **A secondary window is always an ordinary window.** Shell surfaces
+  (layer, anchor, zone, keyboard grab) and frame callbacks belong to the
+  main window. There is no transient-for relation yet, so a dialog is
+  placed by the server's ordinary policy rather than centred on and kept
+  above its parent.
 * **The introspection protocol is monomorphised per app-state type**, so
   it costs ~68 KB of binary in each app rather than being shared. The
   `dyn`-interface fix is argued under *Measured* above and is M3.

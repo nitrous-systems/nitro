@@ -186,9 +186,6 @@ pub(crate) struct Wire {
     /// Next never-used buffer id. `BufferId(0)` is "no buffer".
     next_buffer: u32,
     pub(crate) text_cache: TextMeasureCache,
-    /// Whether the window's subtree is shown, so an unchanged
-    /// [`Wire::set_visible`] costs no mutation and therefore no commit.
-    window_visible: bool,
     /// Whether to answer [`Wire::has_icons`] with `false` however the
     /// server answered.
     ///
@@ -214,7 +211,6 @@ impl Wire {
             next_request: 1,
             next_buffer: 1,
             text_cache: TextMeasureCache::default(),
-            window_visible: true,
             hide_icons: false,
         }
     }
@@ -517,23 +513,12 @@ impl Wire {
     /// is untouched, so nothing else is dirty and the commit carries this
     /// and nothing more.
     ///
-    /// The window's own last-sent value is cached here rather than in
-    /// [`Ui`](crate::Ui), because this is the layer that already answers
-    /// "has this property changed?" for every paint slot — a second copy
-    /// of the same question upstairs is how the two drift.
+    /// Unconditional: the callers keep the last-sent value — a widget's
+    /// `sent_visible`, a window's `visible` in [`Ui`](crate::Ui) — and
+    /// only call this for a change. One copy per fact, so the two cannot
+    /// drift.
     pub(crate) fn set_visible(&mut self, id: NodeId, visible: bool) -> Result<(), Error> {
-        if id == crate::ui::WINDOW {
-            if self.window_visible == visible {
-                return Ok(());
-            }
-            self.window_visible = visible;
-        }
         self.send(&ClientMsg::SetVisible(msg::SetVisible { id, visible }), id)
-    }
-
-    /// Whether the window is currently shown.
-    pub(crate) fn window_visible(&self) -> bool {
-        self.window_visible
     }
 
     /// Take or release the keyboard grab on one of this client's windows

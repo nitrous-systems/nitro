@@ -45,6 +45,33 @@ pub const DIR_ENV: &str = "NITRO_APPS_DIR";
 /// The root widget's path segment.
 pub const ROOT: &str = "window";
 
+/// The root segment of a window: `window` for the main one, `window[N]`
+/// for the N-th in [`Ui::windows`] order.
+fn window_segment<S: 'static>(ui: &Ui<S>, win: crate::WindowId) -> Option<String> {
+    let index = ui.windows().iter().position(|w| *w == win)?;
+    Some(if index == 0 {
+        ROOT.to_owned()
+    } else {
+        format!("{ROOT}[{index}]")
+    })
+}
+
+/// The window a path's first segment names: `window` (or `window[0]`)
+/// is the main window, `window[N]` the N-th. `None` for anything else,
+/// including an index past the last window.
+fn window_by_segment<S: 'static>(ui: &Ui<S>, seg: &str) -> Option<crate::WindowId> {
+    if seg == ROOT {
+        return Some(crate::WindowId::MAIN);
+    }
+    let index: usize = seg
+        .strip_prefix(ROOT)?
+        .strip_prefix('[')?
+        .strip_suffix(']')?
+        .parse()
+        .ok()?;
+    ui.windows().get(index).copied()
+}
+
 // ---------------------------------------------------------------------
 // paths
 // ---------------------------------------------------------------------
@@ -66,17 +93,19 @@ pub fn addressable(name: &str) -> bool {
 
 /// The path of `id` in `ui`'s tree, or `None` if the id is stale.
 ///
-/// The root is always `window`; below it a widget with an addressable
-/// name is that name, and one without is `role[i]` counting among the
-/// siblings of the same role.
+/// The root is `window` for the main window and `window[N]` for the
+/// app's N-th window (see [`Ui::windows`]); below it a widget with an
+/// addressable name is that name, and one without is `role[i]` counting
+/// among the siblings of the same role.
 #[must_use]
 pub fn path_of<S: 'static>(ui: &Ui<S>, id: WidgetId) -> Option<String> {
-    let root = ui.root()?;
+    let win = ui.window_of(id)?;
+    let root = ui.root_of(win)?;
     let mut segments = Vec::new();
     let mut cur = id;
     loop {
         if cur == root {
-            segments.push(ROOT.to_owned());
+            segments.push(window_segment(ui, win)?);
             break;
         }
         let parent = ui.parent(cur)?;
@@ -110,7 +139,9 @@ fn segment_of<S: 'static>(ui: &Ui<S>, parent: WidgetId, child: WidgetId) -> Opti
 
 /// Resolve a path against the live tree.
 ///
-/// An empty path, `window` and `/` all name the root. Names are matched
+/// An empty path, `window` and `/` all name the main window's root, and
+/// `window[N]` names the root of the app's N-th window (see
+/// [`Ui::windows`]; `window[0]` is `window`). Names are matched
 /// before `role[i]` segments, so `window/ok` finds the widget named `ok`
 /// whatever its role index would have been.
 ///
@@ -135,8 +166,8 @@ pub fn resolve<S: 'static>(ui: &Ui<S>, path: &str) -> Option<WidgetId> {
     // An absolute path starts at `window`; a relative one is taken from
     // the root anyway, because there is nowhere else to start.
     let first = segments.next()?;
-    let mut cur = if first == ROOT {
-        root
+    let mut cur = if let Some(win) = window_by_segment(ui, first) {
+        ui.root_of(win)?
     } else {
         child_by_segment(ui, root, first).or_else(|| unique_in_subtree(ui, root, first))?
     };
@@ -732,7 +763,7 @@ impl Socket {
                 self.take_snapshot(ui);
                 b"ok\n".to_vec()
             }
-            "shot" => shot(ui),
+            "shot" => shot(ui, words.next().unwrap_or(ROOT)),
             "quit" => {
                 ui.quit();
                 self.clients[client].done = true;
@@ -754,7 +785,7 @@ impl Socket {
             return;
         }
         let mut scratch = std::mem::take(&mut self.scratch);
-        ui.introspect(&mut scratch);
+        introspect_all(ui, &mut scratch);
         let mut events: Vec<(String, &'static str, String)> = Vec::new();
         for id in &activated {
             if let Some(path) = path_of(ui, *id) {
@@ -809,7 +840,7 @@ impl Socket {
 
     fn take_snapshot<S: 'static>(&mut self, ui: &Ui<S>) {
         let mut scratch = std::mem::take(&mut self.scratch);
-        ui.introspect(&mut scratch);
+        introspect_all(ui, &mut scratch);
         self.snapshot.clear();
         self.snapshot.extend(
             scratch
@@ -860,6 +891,17 @@ pub fn watch_matches(watch: &str, path: &str) -> bool {
         || path
             .strip_prefix(watch)
             .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Every window's introspection tree, main window first, so `watch`
+/// sees changes in a dialog as well as in the main window.
+fn introspect_all<S: 'static>(ui: &Ui<S>, out: &mut Vec<Node>) {
+    out.clear();
+    let mut one = Vec::new();
+    for win in ui.windows() {
+        ui.introspect_window(win, &mut one);
+        out.append(&mut one);
+    }
 }
 
 fn resolve_watch<S: 'static>(ui: &Ui<S>, path: &str) -> Option<WidgetId> {
@@ -1151,12 +1193,15 @@ pub fn set<S: 'static>(
     }
 }
 
-/// `shot`: the server's screenshot of the output, cropped to this
-/// window.
-fn shot<S: 'static>(ui: &Ui<S>) -> Vec<u8> {
-    let size = ui.window_size();
-    let origin = ui.window_position();
-    let scale = ui.scale();
+/// `shot [path]`: the server's screenshot of the output, cropped to the
+/// window `path` is in — the main window without one.
+fn shot<S: 'static>(ui: &Ui<S>, path: &str) -> Vec<u8> {
+    let Some(win) = resolve(ui, path).and_then(|id| ui.window_of(id)) else {
+        return err("no such widget");
+    };
+    let size = ui.window_size_of(win);
+    let origin = ui.window_position_of(win);
+    let scale = ui.scale_of(win);
     let path = ui.control_path();
     match crate::shot::window_shot_at(&path, origin, size, scale) {
         Ok(img) => {
