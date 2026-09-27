@@ -3,7 +3,10 @@
 The desktop's **application launcher**, and since #3789 the **overview's
 search field**: the overlay that comes up with the overview (a bare-Super
 tap, `Super+Space`, the bar's button), searches `.desktop` files and
-starts what you pick. Search replacing the overview's grid is #3790.
+starts what you pick. Typing replaces the overview's window grid with the
+results (`SetOverview(Search)`), and clearing the query brings the grid back
+(`Grid`). What a query searches is a `SearchScope`: only `Apps` for now, with
+`Windows` and `Files` named as the variants still to come.
 
 ```text
                    ┌────────────────────────────────┐

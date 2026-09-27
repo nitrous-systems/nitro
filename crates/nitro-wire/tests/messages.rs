@@ -338,6 +338,14 @@ fn client_messages() -> Vec<ClientMsg> {
             request: OverviewRequest::Toggle,
         }
         .into(),
+        SetOverview {
+            request: OverviewRequest::Search,
+        }
+        .into(),
+        SetOverview {
+            request: OverviewRequest::Grid,
+        }
+        .into(),
         // M5-A (#3767).
         ClientCaps {
             caps: caps::POPUP | caps::DATA | caps::KEYMAP,
@@ -1904,10 +1912,10 @@ fn the_shell_ops_live_in_their_own_block() {
 fn the_overview_ops_are_where_the_doc_says() {
     assert_eq!(SetOverview::OP, 0x040e);
     assert_eq!(OverviewState::OP, 0x8409);
-    // An `OverviewRequest` past `Toggle` is a decode error, not a guess.
+    // An `OverviewRequest` past `Grid` is a decode error, not a guess.
     let mut q = FdQueue::new();
     assert_eq!(
-        ClientMsg::decode(SetOverview::OP, &[4], &mut q),
+        ClientMsg::decode(SetOverview::OP, &[6], &mut q),
         Err(DecodeError::BadValue)
     );
     assert_eq!(

@@ -646,6 +646,17 @@ tag_enum! {
         Enter = 2,
         /// Leave if it is up anywhere, else enter.
         Toggle = 3,
+        /// Search results replace the grid: hide the window thumbnails
+        /// and stop selecting them (GNOME's `reactive = false` on the
+        /// faded-out workspaces display). Sent by the shell that owns the
+        /// search field when its query becomes non-empty. A no-op when
+        /// overview mode is not up; a fresh `Enter` always starts with the
+        /// grid shown.
+        Search = 4,
+        /// Bring the grid back after [`Search`](Self::Search): the query
+        /// was cleared. A no-op when overview mode is not up or the grid
+        /// is already shown.
+        Grid = 5,
     }
 }
 
@@ -803,7 +814,9 @@ mod tests {
         assert_eq!(DataSource::from_raw(1), Ok(DataSource::Drag));
         assert_eq!(DataSource::from_raw(2), Err(DecodeError::BadValue));
         assert_eq!(OverviewRequest::from_raw(3), Ok(OverviewRequest::Toggle));
-        assert_eq!(OverviewRequest::from_raw(4), Err(DecodeError::BadValue));
+        assert_eq!(OverviewRequest::from_raw(4), Ok(OverviewRequest::Search));
+        assert_eq!(OverviewRequest::from_raw(5), Ok(OverviewRequest::Grid));
+        assert_eq!(OverviewRequest::from_raw(6), Err(DecodeError::BadValue));
     }
 
     #[test]

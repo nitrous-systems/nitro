@@ -66,9 +66,25 @@
 //! cleared first, and only an empty one leaves.
 //!
 //! A tap opens the field **unfocused**, over the grid, and the first
-//! printable key engages it; `Super+Space` opens it focused. Search
-//! replacing the grid is not done here (#3790): today the field searches
-//! applications only, over the thumbnails.
+//! printable key engages it; `Super+Space` opens it focused.
+//!
+//! # Search replaces the grid
+//!
+//! With an empty query only the field is on screen, over the window grid,
+//! and the rest of the overlay is transparent and unpainted — so the
+//! thumbnails around the field are still clickable. A non-empty query
+//! shows the results panel and sends `SetOverview(Search)`, and the server
+//! hides the thumbnails and stops selecting them; clearing the query
+//! hides the panel and sends `Grid` (GNOME's `_onSearchChanged`,
+//! `docs/research/overview.md` §4). Both happen in one place,
+//! `sync_search`, which every query change goes through — a typed key,
+//! the Escape ladder's first rung, and `hey set query value` alike. The
+//! switch is instant rather than GNOME's 250 ms cross-fade: see
+//! `docs/wm.md` §Overview mode for why that is deferred.
+//!
+//! What a query searches is a [`search::SearchScope`]. Only
+//! [`Apps`](search::SearchScope::Apps) exists; `Windows` and `Files` are
+//! named there as the variants still to come.
 //!
 //! Without the shell socket (no overview to ask for) the launcher falls
 //! back to showing and hiding itself, so the crate still runs anywhere.
@@ -101,11 +117,12 @@ pub mod spawn;
 use nitro_ui::build::{ContainerBuilder as _, StyleBuilder as _};
 use nitro_ui::shell::{OverviewRequest, ShellEvent, Surface, WindowInfo};
 use nitro_ui::widgets::{
-    Button, Label, TextField, button as button_widget, column, label, scroll, text_field,
+    Button, Label, TextField, button as button_widget, column, label, panel, scroll, text_field,
 };
 use nitro_ui::{App, ColorRole, Error, IconTint, Size, Ui, WidgetId};
 
 use desktop::{Entry, Source};
+use search::SearchScope;
 
 /// The name the launcher registers under, and so the first argument to
 /// `hey`.
@@ -202,6 +219,11 @@ pub struct Launcher {
     query: String,
     /// Whether the overlay is on screen.
     visible: bool,
+    /// What the query searches. Always [`SearchScope::Apps`] today.
+    scope: SearchScope,
+    /// Whether search results currently replace the overview's grid: the
+    /// last `Search`/`Grid` this launcher sent. See [`sync_search`].
+    searching: bool,
     /// A launch failed while hidden and asked to come up: the next show
     /// keeps `last_error` rather than clearing it.
     error_pending: bool,
@@ -261,6 +283,8 @@ impl Launcher {
             selected: 0,
             query: String::new(),
             visible: false,
+            scope: SearchScope::Apps,
+            searching: false,
             opened_by: Trigger::Tap,
             error_pending: false,
             focus_hides: 0,
@@ -303,6 +327,19 @@ impl Launcher {
     #[must_use]
     pub fn is_visible(&self) -> bool {
         self.visible
+    }
+
+    /// What the query searches.
+    #[must_use]
+    pub fn scope(&self) -> SearchScope {
+        self.scope
+    }
+
+    /// Whether search results replace the overview's grid right now: a
+    /// non-empty query on a shown launcher.
+    #[must_use]
+    pub fn is_searching(&self) -> bool {
+        self.searching
     }
 
     /// How many times the overlay has been shown.
@@ -431,11 +468,7 @@ impl Launcher {
 
     /// Re-rank the entries against the current query.
     fn rerank(&mut self) {
-        self.matches = search::rank(
-            self.entries.iter().map(|e| e.name.as_str()),
-            &self.query,
-            MAX_RESULTS,
-        );
+        self.matches = self.scope.rank(&self.entries, &self.query, MAX_RESULTS);
         self.selected = 0;
     }
 }
@@ -513,6 +546,10 @@ struct Ids {
     /// to. The scroller itself is what `results` names.
     list: WidgetId,
     empty: WidgetId,
+    /// The panel holding `empty` and the results scroller: shown only
+    /// while searching (or saying why a launch failed). See
+    /// [`sync_search`].
+    body: WidgetId,
 }
 
 /// Build the whole tree and return its root.
@@ -527,7 +564,7 @@ pub fn build(ui: &mut Ui<Launcher>) -> WidgetId {
     let query = ui.build(
         text_field("")
             .name(names::QUERY)
-            .placeholder("Search applications…")
+            .placeholder(SearchScope::Apps.placeholder())
             .size(TEXT_SIZE)
             .width_percent(1.0)
             .on_change(|s: &mut Launcher, ui: &mut Ui<Launcher>, text: &str| {
@@ -556,12 +593,46 @@ pub fn build(ui: &mut Ui<Launcher>) -> WidgetId {
     let results = ui.build(scroll().name(names::RESULTS).grow(1.0).width_percent(1.0));
     ui.attach(results, list).unwrap();
 
-    let root = ui.build(column().gap(GAP).padding(PAD).width(WIDTH).height(HEIGHT));
-    for child in [query, empty, results] {
+    // Two panels in an otherwise transparent window: the field, always,
+    // and the results, only while searching. With an empty query the
+    // area below the field paints nothing — an unpainted node is not hit
+    // — so the window grid shows, and takes clicks, around the field.
+    // The window itself keeps its size and is never rebuilt; hiding the
+    // results is one `SetVisible` on `body`.
+    let top = ui.build(
+        panel()
+            .background_role(ColorRole::WindowBackground)
+            .padding(PAD)
+            .width_percent(1.0),
+    );
+    ui.attach(top, query).unwrap();
+    let body = ui.build(
+        panel()
+            .background_role(ColorRole::WindowBackground)
+            .padding(PAD)
+            .gap(GAP)
+            .grow(1.0)
+            .width_percent(1.0),
+    );
+    for child in [empty, results] {
+        ui.attach(body, child).unwrap();
+    }
+    ui.set_node_visible(body, false);
+
+    let root = ui.build(column().gap(GAP).width(WIDTH).height(HEIGHT));
+    for child in [top, body] {
         ui.attach(root, child).unwrap();
     }
 
-    install(ui, Ids { query, list, empty });
+    install(
+        ui,
+        Ids {
+            query,
+            list,
+            empty,
+            body,
+        },
+    );
     root
 }
 
@@ -743,8 +814,8 @@ fn request_leave(s: &mut Launcher, ui: &mut Ui<Launcher>) {
 }
 
 /// `Escape`: two rungs, each undoing exactly one thing. A non-empty
-/// query is cleared (and the list comes back whole); an empty one leaves
-/// the overview.
+/// query is cleared (and the grid comes back, through [`sync_search`]);
+/// an empty one leaves the overview.
 fn escape(s: &mut Launcher, ui: &mut Ui<Launcher>) {
     if s.query.is_empty() {
         request_leave(s, ui);
@@ -928,6 +999,9 @@ pub fn show(s: &mut Launcher, ui: &mut Ui<Launcher>) {
 /// drifting looks like.
 pub fn hide(s: &mut Launcher, ui: &mut Ui<Launcher>) {
     s.visible = false;
+    // Nothing to send: leaving the overview ends its grid state
+    // server-side, and a fresh enter starts with the grid shown.
+    s.searching = false;
     s.opened_by = Trigger::Tap;
     let _ = ui.set_window_visible(false);
 }
@@ -953,7 +1027,15 @@ pub fn move_selection(s: &mut Launcher, ui: &mut Ui<Launcher>, delta: isize) {
 }
 
 /// Launch whatever is selected, and leave.
+///
+/// A no-op on an empty query: the rows are hidden then (the grid is what
+/// is on screen), and Enter launching an application the user cannot
+/// see would be a surprise. `hey … do results/0 click` still works on an
+/// empty query — it names the row, and hidden rows resolve.
 fn launch_selected(s: &mut Launcher, ui: &mut Ui<Launcher>) {
+    if s.query.trim().is_empty() {
+        return;
+    }
     let Some(index) = s.matches.get(s.selected).copied() else {
         return;
     };
@@ -1016,6 +1098,45 @@ fn show_error(s: &mut Launcher, ui: &mut Ui<Launcher>) {
     let text = s.last_error.clone().unwrap_or_default();
     if let Ok(mut l) = ui.widget_mut::<Label>(ids.empty) {
         l.set_text(text);
+    }
+    sync_search(s, ui);
+}
+
+/// Make the grid-or-results state match the query: the **one** place
+/// that decides it, reached from [`refresh`] and [`show_error`] and so
+/// from every query change — a typed key (the field's `on_change`), the
+/// Escape ladder and `hey set query value` all go through `refresh`.
+///
+/// Two facts, kept separately because they differ in one case:
+///
+/// * **Searching** — a non-empty query on a shown launcher. On a change
+///   the server is told (`SetOverview(Search | Grid)`, shell only: with
+///   no shell there is no grid), and it hides or restores the thumbnails.
+/// * **The results panel is shown** — searching, or a launch failure to
+///   explain. A failed launch from `hey` on an empty query comes up over
+///   the grid with the reason, rather than hiding it.
+///
+/// Each is sent only when it changes (`set_node_visible` drops an
+/// unchanged value), so a keystroke that keeps the query non-empty costs
+/// nothing here.
+fn sync_search(s: &mut Launcher, ui: &mut Ui<Launcher>) {
+    let Some(ids) = s.ids else { return };
+    let typed = !s.query.trim().is_empty();
+    ui.set_node_visible(ids.body, typed || s.last_error.is_some());
+    let want = s.visible && typed;
+    if want == s.searching {
+        return;
+    }
+    s.searching = want;
+    if ui.is_shell() {
+        let request = if want {
+            OverviewRequest::Search
+        } else {
+            OverviewRequest::Grid
+        };
+        if let Err(e) = ui.set_overview(request) {
+            eprintln!("nitro-launcher: overview: {e}");
+        }
     }
 }
 
@@ -1126,6 +1247,7 @@ fn refresh(s: &mut Launcher, ui: &mut Ui<Launcher>) {
     if let Ok(mut l) = ui.widget_mut::<Label>(ids.empty) {
         l.set_text(note);
     }
+    sync_search(s, ui);
     // Not `restyle_rows` here: every row above was written already
     // decorated, so a second pass would re-mark each one to produce the
     // string it already has. It stays the *selection-move* path's job,
@@ -1352,6 +1474,8 @@ pub fn decorate(text: &str, selected: bool) -> String {
 pub fn run() -> Result<(), Error> {
     App::shell(APP_NAME)?
         .title("nitro-launcher")
+        // Only the panels paint: the grid shows around the field.
+        .transparent()
         .surface(Surface::overlay())
         .size(Size::new(WIDTH, HEIGHT))
         .run(Launcher::new(), build)

@@ -5993,17 +5993,16 @@ impl Server {
         // Overview mode: whether one is up, and how many thumbnails it
         // has. The scrim counts under `windows`, as the scene window it is.
         pairs.push(("overview", u64::from(self.wm.overview().is_some())));
-        pairs.push((
-            "overview_thumbs",
-            self.wm.overview().map_or(0, |o| o.thumbs.len()) as u64,
-        ));
+        let ov = self.wm.overview();
+        pairs.push(("overview_thumbs", ov.map_or(0, |o| o.thumbs.len()) as u64));
         pairs.push((
             "overview_fading",
-            u64::from(
-                self.wm
-                    .overview()
-                    .is_some_and(|o| o.fade_start_ns.is_some()),
-            ),
+            u64::from(ov.is_some_and(|o| o.fade_start_ns.is_some())),
+        ));
+        // Whether search results have replaced the grid (`Search`).
+        pairs.push((
+            "overview_grid_hidden",
+            u64::from(ov.is_some_and(|o| o.grid_hidden)),
         ));
         pairs.push(("overview_requests", self.overview_requests));
         pairs.push(("overview_watchers", self.overview_watchers.len() as u64));
@@ -8956,6 +8955,7 @@ impl Server {
             scrim,
             thumbs: states,
             fade_start_ns,
+            grid_hidden: false,
         });
         // No frame affordance survives: every frame on this output is
         // hidden or scaled, and a lit border would be drawn on nothing.
@@ -9088,6 +9088,12 @@ impl Server {
             return;
         };
         let s = ClientId::SERVER;
+        // Search had hidden the grid: show it again first, so the restore
+        // below starts from the state it was written against — and the
+        // minimized re-hide re-hides exactly the set this overview un-hid.
+        if ov.grid_hidden {
+            overview::set_grid_visible(&mut self.scene, &ov, true);
+        }
         for t in &ov.thumbs {
             self.text.release(t.caption_text);
             let Ok(info) = self.scene.window_info(t.window) else {
@@ -9140,11 +9146,50 @@ impl Server {
 
     /// Leave and re-enter on the same output: a window came or went, the
     /// palette changed, or a thumbnail's geometry did.
+    ///
+    /// Carries [`overview::Overview::grid_hidden`] across: a window mapping
+    /// while the shell is showing search results must not bring the grid
+    /// back. The leave shows the roots and the enter hides them again, all
+    /// before the next scene update, so the round trip is one repaint of
+    /// the relaid-out output like any relayout.
     fn relayout_overview(&mut self) {
         if let Some(output) = self.overview_output() {
+            let hidden = self.wm.overview().is_some_and(|o| o.grid_hidden);
             self.leave_overview(None);
             self.enter_overview(output, false);
+            if hidden {
+                self.set_overview_grid(false);
+            }
         }
+    }
+
+    /// Search results replace the grid (`visible == false`) or the grid
+    /// comes back. A no-op outside overview mode or when nothing changes.
+    ///
+    /// Instant: one `SetVisible` per thumbnail root (and per scrim-held
+    /// badge), no cross-fade — `docs/wm.md` §Overview mode says why that
+    /// is deferred. While hidden, [`overview::Overview::slot_at`] selects
+    /// nothing, so a click on the hidden grid leaves without selecting.
+    /// Focus is untouched: nothing here asks [`Server::showing`] or
+    /// [`Server::focusable`], and neither looks at the root this hides.
+    fn set_overview_grid(&mut self, visible: bool) {
+        let Some(ov) = self.wm.overview_mut() else {
+            return;
+        };
+        if ov.grid_hidden != visible {
+            return;
+        }
+        ov.grid_hidden = !visible;
+        // A badge fade still running would step nodes that are no longer
+        // drawn: no damage, no flip, and the fade would never read as
+        // settled. Finish it now instead.
+        if !visible && ov.fade_start_ns.take().is_some() {
+            overview::set_badge_opacity(&mut self.scene, &ov.thumbs, 1.0);
+        }
+        let Some(ov) = self.wm.overview() else {
+            return;
+        };
+        overview::set_grid_visible(&mut self.scene, ov, visible);
     }
 
     /// Advance the overview badges' fade-in to `now_ns`
@@ -9272,6 +9317,8 @@ impl Server {
                     self.enter_overview(out, true);
                 }
             }
+            R::Search => self.set_overview_grid(false),
+            R::Grid => self.set_overview_grid(true),
         }
     }
 

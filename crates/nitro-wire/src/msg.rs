@@ -2167,6 +2167,13 @@ fixed_msg! {
     /// There is no output field on purpose: `Enter` opens on the output
     /// under the pointer, else the primary one. Answered on receipt,
     /// applied before the next frame.
+    ///
+    /// `Search` and `Grid` do not change whether overview mode is up, only
+    /// whether its window grid is shown (search results replace the grid).
+    /// They are still answered with an `OverviewState` like every other
+    /// value; that message carries no grid flag, because the shell that
+    /// sends them owns the query and so already knows whether it is
+    /// searching.
     SetOverview {
         /// What to do.
         request: OverviewRequest,

@@ -159,6 +159,50 @@ where
     scored.into_iter().map(|(_, i)| i).collect()
 }
 
+/// **What** a query searches: which kind of result the rows show.
+///
+/// Only [`Apps`](Self::Apps) exists, and that is the issue's "for now only
+/// searches applications" taken literally. The enum is here from day one
+/// anyway, because the alternative is a launcher whose ranking, rows and
+/// launch path all assume there is one kind of result, and adding a
+/// second would be a refactor of every one of them. With the scope
+/// named, a new kind of result is a new variant and a new match arm —
+/// the compiler then lists every place that has to learn about it.
+///
+/// The variants GNOME's overview has and this one does not, **yet** —
+/// named so the next reader knows where they go, not implemented:
+///
+/// * `Windows` — open windows by title and app id. Picking one would
+///   select its thumbnail (the server's overview already knows how), so
+///   it would rank the shell's window list rather than `.desktop` files.
+/// * `Files` — files by name, from an index the launcher does not have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchScope {
+    /// Launchable applications: `.desktop` entries and the built-ins,
+    /// matched on their display name.
+    #[default]
+    Apps,
+}
+
+impl SearchScope {
+    /// Rank this scope's candidates in `entries` against `query`, best
+    /// first, at most `limit`: indices into `entries`, as [`rank`].
+    #[must_use]
+    pub fn rank(self, entries: &[crate::desktop::Entry], query: &str, limit: usize) -> Vec<usize> {
+        match self {
+            Self::Apps => rank(entries.iter().map(|e| e.name.as_str()), query, limit),
+        }
+    }
+
+    /// The query field's placeholder: what this scope finds.
+    #[must_use]
+    pub fn placeholder(self) -> &'static str {
+        match self {
+            Self::Apps => "Search applications…",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

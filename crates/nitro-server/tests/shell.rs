@@ -3350,6 +3350,12 @@ fn set_overview_is_answered_and_the_server_decides() {
     assert_eq!(ask_overview(&mut shell, &mut inbox, R::Enter), on);
     assert_eq!(h.stat("overview"), 1);
 
+    // `Search` and `Grid` change only the grid, and are answered.
+    assert_eq!(ask_overview(&mut shell, &mut inbox, R::Search), on);
+    assert_eq!(h.stat("overview_grid_hidden"), 1);
+    assert_eq!(ask_overview(&mut shell, &mut inbox, R::Grid), on);
+    assert_eq!(h.stat("overview_grid_hidden"), 0);
+
     // `Toggle` leaves, then enters again.
     assert_eq!(ask_overview(&mut shell, &mut inbox, R::Toggle), off);
     assert_eq!(h.stat("overview"), 0);
@@ -3357,7 +3363,10 @@ fn set_overview_is_answered_and_the_server_decides() {
     assert_eq!(ask_overview(&mut shell, &mut inbox, R::Leave), off);
     // `Leave` while off still answers.
     assert_eq!(ask_overview(&mut shell, &mut inbox, R::Leave), off);
-    assert_eq!(h.stat("overview_requests"), 7);
+    // `Search` while off is a no-op, and still answers.
+    assert_eq!(ask_overview(&mut shell, &mut inbox, R::Search), off);
+    assert_eq!(h.stat("overview_grid_hidden"), 0);
+    assert_eq!(h.stat("overview_requests"), 10);
     assert!(!shell.is_closed());
     h.quit();
 }

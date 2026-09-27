@@ -403,7 +403,7 @@ an app because one of its widgets named an icon a newer set has.
 | `DragAction` | `None` 0, `Copy` 1, `Move` 2, `Link` 3 *(M5-A)* |
 | `KeymapFormat` | `XkbV1` 1 *(M5-A)* |
 | `DataSource` | `Clipboard` 0, `Drag` 1 *(M5-A)* |
-| `OverviewRequest` | `Watch` 0, `Leave` 1, `Enter` 2, `Toggle` 3 *(shell, #3789)* |
+| `OverviewRequest` | `Watch` 0, `Leave` 1, `Enter` 2, `Toggle` 3 *(shell, #3789)*, `Search` 4, `Grid` 5 *(#3790)* |
 | `CursorShape` (`u16`) | `None` 0, then `wp_cursor_shape_device_v1` 1–34 — see below *(M5-A)* |
 
 A value outside the list is a decode error, not a silently-ignored
@@ -2158,7 +2158,7 @@ session is not locked, it is `Error { Protocol }`.
 
 | field | type | meaning |
 |---|---|---|
-| `request` | `u8` (`OverviewRequest`) | `Watch`, `Leave`, `Enter` or `Toggle` |
+| `request` | `u8` (`OverviewRequest`) | `Watch`, `Leave`, `Enter`, `Toggle`, `Search` or `Grid` |
 
 Fixed head 1 byte. Ask to enter or leave **overview mode** (`docs/wm.md`
 §Overview mode). A **request**, not a command: the server owns overview
@@ -2169,6 +2169,14 @@ asks. `Enter` opens on the output under the pointer, else the primary one;
 there is no output field on purpose. `Toggle` is resolved **server-side**,
 so a bare-Super tap, the bar's button and `Super+Space` can race without
 either end holding a stale bool.
+
+`Search` and `Grid` (#3790) do not enter or leave: search results replace
+the window grid, so `Search` hides the thumbnails and stops them being
+selectable, and `Grid` brings them back. Both are no-ops outside overview
+mode, and a fresh `Enter` always starts with the grid shown. They are
+answered with an `OverviewState` like every other value; that message has
+no grid flag, because the shell that sends them owns the query and
+already knows whether it is searching.
 
 Subscribes on receipt; applied, and answered, in the same wakeup, before
 the next frame (at `settle`, because entering dismisses popups and sends

@@ -5085,3 +5085,170 @@ fn decorations_are_hidden_in_overview_and_the_badge_is_drawn() {
     drop(conn);
     h.quit();
 }
+
+// ------------------------------------------------ search replaces the grid
+//
+// `SetOverview { Search | Grid }` (#3790): the shell's query hides the
+// thumbnails and makes them unselectable; clearing it brings them back.
+
+/// Send one `SetOverview` from `shell` and wait until the server has
+/// applied it (`overview_requests` moved past `before`).
+fn ask_grid(h: &Harness, shell: &mut Connection, request: nitro_wire::types::OverviewRequest) {
+    let before = h.stat("overview_requests");
+    shell.set_overview(request).unwrap();
+    shell.flush().unwrap();
+    wait_for("the SetOverview", || h.stat("overview_requests") > before);
+    h.settle();
+}
+
+#[test]
+#[allow(clippy::many_single_char_names)] // h, a, b, x, y: as the rest of this file
+fn search_hides_the_grid_and_a_click_on_it_selects_nothing() {
+    use nitro_wire::types::OverviewRequest as R;
+    let mut h = Harness::start("ov-search", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("ov-search");
+    let a = make_window(&mut conn, &mut inbox, 1, "a", WIN, RED, 0, 1);
+    let b = make_window(&mut conn, &mut inbox, 3, "b", WIN, GREEN, 0, 2);
+    let mut shell = h.shell("ov-search-field");
+    park(&mut h);
+    await_focus(&mut conn, &mut inbox, b.root, "the newest window");
+    let before = h.shot();
+
+    overview(&h, true);
+    let slots = expected_slots(&[a, b]);
+    ask_grid(&h, &mut shell, R::Search);
+    assert_eq!(h.stat("overview"), 1, "search does not leave");
+    assert_eq!(h.stat("overview_grid_hidden"), 1);
+    let shot = h.shot();
+    for (s, c) in slots.iter().zip([RED, GREEN]) {
+        let (x, y) = centre(s);
+        assert_ne!(
+            rgb(shot.pixel(x as u32, y as u32)),
+            to_rgb(c),
+            "{s:?} hidden"
+        );
+    }
+    // Hidden and settled paints nothing, as a settled grid does not.
+    let frames = h.stat("frames");
+    std::thread::sleep(Duration::from_millis(120));
+    assert_eq!(h.stat("frames"), frames, "a hidden grid must not repaint");
+
+    // A click where `a`'s thumbnail was leaves without selecting it.
+    conn.flush().unwrap();
+    let _ = conn.poll(&mut inbox.0);
+    inbox.0.clear();
+    let (x, y) = centre(&slots[0]);
+    h.point_at(x, y, OUT);
+    h.settle();
+    h.button(BTN_LEFT, ButtonState::Pressed);
+    h.button(BTN_LEFT, ButtonState::Released);
+    h.settle();
+    assert_eq!(h.stat("overview"), 0, "the click left");
+    assert_eq!(h.stat("overview_grid_hidden"), 0);
+    conn.flush().unwrap();
+    let _ = conn.poll(&mut inbox.0);
+    assert!(
+        !inbox
+            .0
+            .iter()
+            .any(|m| matches!(m, ServerMsg::Focus(f) if f.focused && f.window == a.root)),
+        "nothing was selected: {:?}",
+        inbox.0
+    );
+    // Every pixel back, `b` still focused on top.
+    park(&mut h);
+    assert!(h.shot().data == before.data, "leaving restores the desktop");
+
+    drop((conn, shell));
+    h.quit();
+}
+
+#[test]
+#[allow(clippy::many_single_char_names)] // h, a, b, x, y: as the rest of this file
+fn grid_restores_and_a_relayout_keeps_it_hidden() {
+    use nitro_wire::types::OverviewRequest as R;
+    let mut h = Harness::start("ov-grid", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("ov-grid");
+    let a = make_window(&mut conn, &mut inbox, 1, "a", WIN, RED, 0, 1);
+    let mut shell = h.shell("ov-grid-field");
+    park(&mut h);
+
+    // Outside overview: a no-op.
+    ask_grid(&h, &mut shell, R::Search);
+    assert_eq!(h.stat("overview"), 0);
+    assert_eq!(h.stat("overview_grid_hidden"), 0);
+
+    overview(&h, true);
+    ask_grid(&h, &mut shell, R::Search);
+    assert_eq!(h.stat("overview_grid_hidden"), 1);
+
+    // A window mapping mid-search relays out, and stays hidden.
+    let b = make_window(&mut conn, &mut inbox, 3, "b", WIN, GREEN, 0, 2);
+    wait_for("the relayout", || h.stat("overview_thumbs") == 2);
+    h.settle();
+    assert_eq!(h.stat("overview_grid_hidden"), 1, "the relayout kept it");
+    let shot = h.shot();
+    for (s, c) in expected_slots(&[a, b]).iter().zip([RED, GREEN]) {
+        let (x, y) = centre(s);
+        assert_ne!(
+            rgb(shot.pixel(x as u32, y as u32)),
+            to_rgb(c),
+            "{s:?} hidden"
+        );
+    }
+
+    // `Grid` brings every thumbnail back.
+    ask_grid(&h, &mut shell, R::Grid);
+    assert_eq!(h.stat("overview_grid_hidden"), 0);
+    let shot = h.shot();
+    for (s, c) in expected_slots(&[a, b]).iter().zip([RED, GREEN]) {
+        let (x, y) = centre(s);
+        assert_eq!(
+            rgb(shot.pixel(x as u32, y as u32)),
+            to_rgb(c),
+            "{s:?} shown"
+        );
+    }
+
+    // A fresh enter after a hidden leave starts with the grid shown.
+    ask_grid(&h, &mut shell, R::Search);
+    overview(&h, false);
+    overview(&h, true);
+    assert_eq!(h.stat("overview_grid_hidden"), 0);
+    let shot = h.shot();
+    let (x, y) = centre(&expected_slots(&[a, b])[0]);
+    assert_eq!(rgb(shot.pixel(x as u32, y as u32)), to_rgb(RED));
+
+    drop((conn, shell));
+    h.quit();
+}
+
+#[test]
+#[allow(clippy::many_single_char_names)] // h, a, b, x, y: as the rest of this file
+fn a_minimized_window_goes_back_hidden_after_a_search() {
+    use nitro_wire::types::OverviewRequest as R;
+    let mut h = Harness::start("ov-search-min", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("ov-search-min");
+    let _a = make_window(&mut conn, &mut inbox, 1, "a", WIN, RED, 0, 1);
+    let _b = make_window(&mut conn, &mut inbox, 3, "b", WIN, GREEN, 0, 2);
+    let mut shell = h.shell("ov-search-min-field");
+    h.key(KEY_LEFTMETA, true);
+    h.key(KEY_H, true);
+    h.key(KEY_H, false);
+    h.key(KEY_LEFTMETA, false);
+    park(&mut h);
+    assert_eq!(h.stat("minimized"), 1);
+    let before = h.shot();
+
+    overview(&h, true);
+    ask_grid(&h, &mut shell, R::Search);
+    overview(&h, false);
+    assert_eq!(h.stat("minimized"), 1, "still minimized");
+    assert!(h.shot().data == before.data, "and hidden again");
+
+    drop((conn, shell));
+    h.quit();
+}

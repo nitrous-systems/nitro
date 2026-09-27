@@ -514,6 +514,11 @@ pub struct Overview {
     /// When the badges started fading in (`CLOCK_MONOTONIC` ns): `Some`
     /// while they are fading, `None` once settled. See [`badge_opacity`].
     pub fade_start_ns: Option<u64>,
+    /// Whether search results have replaced the grid (the shell sent
+    /// [`OverviewRequest::Search`](nitro_wire::types::OverviewRequest::Search)):
+    /// every thumbnail and badge is hidden and [`Overview::slot_at`]
+    /// selects nothing. See [`set_grid_visible`].
+    pub grid_hidden: bool,
 }
 
 impl Overview {
@@ -523,8 +528,20 @@ impl Overview {
     /// Selection is by **geometry**, not by which node the scene hit: that
     /// makes it indifferent to badges, the scrim, and whether a window is
     /// framed.
+    ///
+    /// While the grid is hidden behind search results this is `None`
+    /// everywhere — GNOME's `_workspacesDisplay.reactive = false`. Hiding
+    /// the thumbnails' nodes is not enough on its own, and neither is the
+    /// overview swallowing `Normal`-layer pointer events (#3788): that
+    /// only stops the *clients* hearing them, while selection here is by
+    /// slot geometry and would still pick an invisible thumbnail. So a
+    /// click on the hidden grid leaves without selecting, like a click on
+    /// the bare scrim.
     #[must_use]
     pub fn slot_at(&self, point: Point) -> Option<WindowKey> {
+        if self.grid_hidden {
+            return None;
+        }
         self.thumbs
             .iter()
             .find(|t| t.slot.rect().contains(point))
@@ -811,6 +828,37 @@ pub fn set_badge_opacity(scene: &mut Scene, thumbs: &[ThumbState], opacity: f32)
     }
 }
 
+/// Show or hide the whole window grid: each thumbnail's window root and
+/// each badge, one `SetVisible` apiece. Nothing is rebuilt, moved or
+/// faded — see `docs/wm.md` §Overview mode for why the search/grid
+/// cross-fade is deferred (an opacity ramp over the scaled grid is the
+/// measured ~17 ms/frame case until a downscale cache exists).
+///
+/// A framed window's badge hangs off its root and goes with it; an
+/// undecorated one's lives in the scrim and is toggled separately.
+/// Showing skips a window that is minimized and whose root the overview
+/// did not un-hide (it was minimized after entry), so it does not
+/// reappear. Nodes the scene refuses (the window went) are skipped.
+pub fn set_grid_visible(scene: &mut Scene, ov: &Overview, visible: bool) {
+    let s = ClientId::SERVER;
+    for t in &ov.thumbs {
+        let Ok(info) = scene.window_info(t.window) else {
+            continue;
+        };
+        let (root, framed, minimized) = (
+            info.root(),
+            info.is_framed(),
+            info.state() == WindowState::Minimized,
+        );
+        if !visible || !minimized || t.unhid {
+            let _ = scene.set_visible(s, root, visible);
+        }
+        if !framed && let Some(badge) = t.badge {
+            let _ = scene.set_visible(s, badge, visible);
+        }
+    }
+}
+
 /// Whether a window takes part in overview mode: a `Normal`-layer
 /// toplevel, minimized or on screen.
 #[must_use]
@@ -998,6 +1046,61 @@ mod scene_tests {
     }
 
     #[test]
+    fn hiding_the_grid_hides_every_thumbnail_and_badge_then_goes_quiet() {
+        let (mut scene, wins, _) = desktop();
+        let (scrim, slots, badges) = enter_badged(&mut scene, &wins);
+        let minimized = wins[3];
+        let ov = Overview {
+            output: OUT,
+            scrim,
+            thumbs: slots
+                .iter()
+                .zip(&badges)
+                .map(|(s, b)| ThumbState {
+                    window: s.window,
+                    slot: *s,
+                    hit: s.rect(),
+                    saved_transform: Transform::IDENTITY,
+                    saved_position: None,
+                    unhid: s.window == minimized,
+                    badge: Some(*b),
+                    caption_text: None,
+                })
+                .collect(),
+            fade_start_ns: None,
+            grid_hidden: true,
+        };
+        update(&mut scene);
+        assert!(update(&mut scene).is_empty());
+
+        set_grid_visible(&mut scene, &ov, false);
+        assert!(!update(&mut scene).is_empty(), "hiding repaints");
+        for (s, b) in slots.iter().zip(&badges) {
+            let root = scene.window_info(s.window).unwrap().root();
+            assert!(!scene.node(root).unwrap().visible(), "{s:?}");
+            // A framed badge hangs off the (hidden) root; an undecorated
+            // one is in the scrim and must be hidden itself.
+            let framed = scene.window_info(s.window).unwrap().is_framed();
+            assert!(framed || !scene.node(*b).unwrap().visible());
+        }
+        let settled = update(&mut scene);
+        assert!(
+            settled.is_empty(),
+            "hidden grid damaged {:?}",
+            settled.rects()
+        );
+
+        set_grid_visible(&mut scene, &ov, true);
+        assert!(!update(&mut scene).is_empty(), "showing repaints");
+        for (s, b) in slots.iter().zip(&badges) {
+            let root = scene.window_info(s.window).unwrap().root();
+            assert!(scene.node(root).unwrap().visible(), "{s:?}");
+            assert!(scene.node(*b).unwrap().visible());
+        }
+        assert!(update(&mut scene).is_empty());
+    }
+
+    #[test]
     fn a_badge_fade_damages_only_the_badges_and_then_goes_quiet() {
         let (mut scene, wins, _) = desktop();
         let (_, slots, badges) = enter_badged(&mut scene, &wins);
@@ -1178,12 +1281,22 @@ mod scene_tests {
                 })
                 .collect(),
             fade_start_ns: None,
+            grid_hidden: false,
         };
         for s in &slots {
             let centre = Point::new(s.pos.x + s.size.w / 2.0, s.pos.y + s.size.h / 2.0);
             assert_eq!(ov.slot_at(centre), Some(s.window));
         }
         assert_eq!(ov.slot_at(Point::new(-5.0, -5.0)), None);
+        // Search results replaced the grid: nothing is selectable.
+        let hidden = Overview {
+            grid_hidden: true,
+            ..ov
+        };
+        for s in &slots {
+            let centre = Point::new(s.pos.x + s.size.w / 2.0, s.pos.y + s.size.h / 2.0);
+            assert_eq!(hidden.slot_at(centre), None);
+        }
     }
 
     #[test]

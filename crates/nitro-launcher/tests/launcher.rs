@@ -952,6 +952,9 @@ fn enter_launches_the_selected_entry_and_hides() {
     until(&mut h, "the show", |h| h.state().is_visible());
     assert_eq!(h.state().match_count(), 1, "the stub is the only entry");
 
+    // Something typed: Enter on an empty query launches nothing, because
+    // the rows are hidden and the grid is what is on screen.
+    h.key(31); // s
     h.key(key::ENTER);
     until(&mut h, "the launch", |h| h.state().launches() == 1);
     assert!(
@@ -1061,6 +1064,7 @@ fn a_terminal_entry_is_shown_marked_and_refused() {
     until(&mut h, "the show", |h| h.state().is_visible());
     assert!(row(&mut h, 0).contains("(terminal)"), "{}", row(&mut h, 0));
 
+    h.key(50); // m
     h.key(key::ENTER);
     h.settle();
     assert_eq!(h.state().launches(), 0, "nothing was started");
@@ -1086,6 +1090,7 @@ fn a_launch_that_fails_brings_the_launcher_back_with_the_reason() {
     super_tap(&mut h);
     until(&mut h, "the show", |h| h.state().is_visible());
 
+    h.key(34); // g
     h.key(key::ENTER);
     until(&mut h, "the failure", |h| h.state().last_error().is_some());
     assert_eq!(h.state().launches(), 0);
@@ -1192,6 +1197,7 @@ fn a_builtin_is_launchable_with_no_desktop_files_at_all() {
     until(&mut h, "the show", |h| h.state().is_visible());
     assert_eq!(h.state().match_names(), vec!["Calculator".to_owned()]);
 
+    h.key(46); // c
     h.key(key::ENTER);
     until(&mut h, "the launch", |h| h.state().launches() == 1);
     until(&mut h, "the process", |_| marker.exists());
@@ -1613,14 +1619,132 @@ fn a_launch_leaves_the_overview() {
 }
 
 #[test]
-fn enter_after_a_tap_launches_without_engaging_the_field() {
-    // Nothing typed, nothing focused: Enter still launches the first row.
+fn enter_after_a_tap_and_a_keystroke_launches_the_first_row() {
+    // A tap, one key (which engages the field), Enter: the first row.
+    let (mut h, dir) = harness();
+    super_tap(&mut h);
+    until(&mut h, "the show", |h| h.state().is_visible());
+    h.key(46); // c
+    h.key(key::ENTER);
+    until(&mut h, "the launch", |h| h.state().launches() == 1);
+    assert_eq!(h.state().last_launch(), Some("/bin/true"));
+    until(&mut h, "the hide", |h| !h.state().is_visible());
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}
+
+#[test]
+fn enter_on_an_empty_query_launches_nothing() {
+    // With nothing typed the rows are hidden and the grid is on screen:
+    // Enter launching an application the user cannot see would be a
+    // surprise, so it does nothing and the overview stays up.
     let (mut h, dir) = harness();
     super_tap(&mut h);
     until(&mut h, "the show", |h| h.state().is_visible());
     h.key(key::ENTER);
-    until(&mut h, "the launch", |h| h.state().launches() == 1);
+    h.settle();
+    assert_eq!(h.state().launches(), 0);
+    assert!(h.state().is_visible());
+    assert_eq!(h.server().stat("overview"), 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}
+
+// ------------------------------------------------ search replaces the grid
+
+/// Whether the results panel (the parent of `results`) is shown.
+fn results_shown(h: &mut Harness<Launcher>) -> bool {
+    let id = named(h, names::RESULTS).expect("the results");
+    h.ui().is_visible(id)
+}
+
+#[test]
+fn typing_replaces_the_grid_and_deleting_brings_it_back() {
+    let (mut h, dir) = harness();
+    super_tap(&mut h);
+    until(&mut h, "the show", |h| h.state().is_visible());
+    assert_eq!(h.state().scope(), nitro_launcher::search::SearchScope::Apps);
+    assert!(!h.state().is_searching());
+    assert!(!results_shown(&mut h), "an empty query shows the grid");
+    assert_eq!(h.server().stat("overview_grid_hidden"), 0);
+
+    // The first typed character: results up, grid hidden server-side.
+    h.key(46); // c
+    until(&mut h, "the grid to hide", |h| {
+        h.server().stat("overview_grid_hidden") == 1
+    });
+    assert!(h.state().is_searching());
+    assert!(results_shown(&mut h));
+    // A second key keeps searching and sends nothing more.
+    let requests = h.server().stat("overview_requests");
+    h.key(30); // a
+    h.settle();
+    assert_eq!(h.server().stat("overview_requests"), requests);
+
+    // Deleting back to empty restores the grid.
+    h.key(key::BACKSPACE);
+    h.key(key::BACKSPACE);
+    until(&mut h, "the grid to come back", |h| {
+        h.server().stat("overview_grid_hidden") == 0
+    });
+    assert_eq!(h.state().query(), "");
+    assert!(!h.state().is_searching());
+    assert!(!results_shown(&mut h));
+    assert_eq!(h.server().stat("overview"), 1, "still in the overview");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}
+
+#[test]
+fn escape_rung_one_restores_the_grid_and_rung_two_leaves() {
+    let (mut h, dir) = harness();
+    super_tap(&mut h);
+    until(&mut h, "the show", |h| h.state().is_visible());
+    h.key(46); // c
+    until(&mut h, "the grid to hide", |h| {
+        h.server().stat("overview_grid_hidden") == 1
+    });
+
+    h.key(key::ESC);
+    until(&mut h, "the grid to come back", |h| {
+        h.server().stat("overview_grid_hidden") == 0
+    });
+    assert_eq!(h.server().stat("overview"), 1, "rung one stays");
+    assert!(!results_shown(&mut h));
+
+    h.key(key::ESC);
     until(&mut h, "the hide", |h| !h.state().is_visible());
+    assert_eq!(h.server().stat("overview"), 0, "rung two leaves");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.quit();
+}
+
+#[test]
+fn hey_set_query_then_click_results_0_searches_and_launches() {
+    // The scripted path is the keystroke path: `set query value` runs the
+    // field's `on_change`, which hides the grid exactly as typing does.
+    let (mut h, dir) = harness();
+    super_tap(&mut h);
+    until(&mut h, "the show", |h| h.state().is_visible());
+    {
+        let (ui, state) = h.parts();
+        nitro_ui::introspect::set(ui, state, "window/query", "value", "calc").expect("set");
+    }
+    until(&mut h, "the grid to hide", |h| {
+        h.server().stat("overview_grid_hidden") == 1
+    });
+    assert_eq!(h.state().match_names(), vec!["Calculator".to_owned()]);
+    {
+        let (ui, state) = h.parts();
+        nitro_ui::introspect::invoke(ui, state, "window/results/0", "click", None).expect("click");
+    }
+    until(&mut h, "the launch", |h| h.state().launches() == 1);
+    until(&mut h, "the leave", |h| !h.state().is_visible());
+    assert_eq!(h.server().stat("overview"), 0);
 
     let _ = std::fs::remove_dir_all(&dir);
     h.quit();

@@ -388,7 +388,7 @@ messages, and neither is optional:
   bar's button is a client-side press too.
 
 **The server is authoritative.** `SetOverview` is a *request*
-(`Watch`, `Leave`, `Enter`, `Toggle`), answered with an `OverviewState`;
+(`Watch`, `Leave`, `Enter`, `Toggle`, `Search`, `Grid`), answered with an `OverviewState`;
 `OverviewState` is the only thing that changes rendered state. `Toggle`
 is resolved server-side, so the tap, the button and the chord can race
 without anyone holding a stale bool. `Enter` opens on the output under
@@ -419,7 +419,21 @@ is cleared, an empty one sends `Leave`. Two rungs, each undoing exactly
 one thing. A launch sends `Leave` after the spawn succeeds; a failure
 stays up with the reason. Another window taking focus sends `Leave`.
 
-`stats` reports `overview_requests` (cumulative) and `overview_watchers`.
+**Search replaces the grid** (#3790, GNOME's `_onSearchChanged`). With an
+empty query only the field is painted, over the grid; the rest of the
+overlay is transparent and unpainted, so thumbnails around the field stay
+clickable. The query becoming non-empty shows the results panel and sends
+`SetOverview(Search)`, and the server hides the thumbnails and makes them
+unselectable; the query becoming empty again (Backspace, or `Escape`'s
+first rung) hides the panel and sends `Grid`. The `Escape` ladder is
+unchanged: rung one clears the query, so the grid comes back, and rung
+two leaves. Enter on an empty query launches nothing. `hey … set query
+value` goes through the same path as a typed key. Leaving needs no `Grid`,
+because a fresh enter always starts with the grid shown. The switch is
+instant; `docs/wm.md` §What is deferred says why there is no cross-fade.
+
+`stats` reports `overview_requests` (cumulative), `overview_watchers` and
+`overview_grid_hidden`.
 `tests/shell.rs` covers the request/answer and push semantics, the silent
 relayout and the lock; `nitro-launcher/tests/launcher.rs` covers the
 triggers and the ladder.

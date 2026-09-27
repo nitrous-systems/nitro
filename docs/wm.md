@@ -1034,6 +1034,24 @@ entering on another output leaves the first.
   flight and dismisses the thumbnails' popups.
 * **Minimized windows** are un-hidden on entry (state untouched) and
   exactly that set is re-hidden on leave, if still minimized.
+* **Search replaces the grid (#3790).** `SetOverview(Search)` sets
+  `Overview::grid_hidden` and hides every thumbnail's window root, and
+  every scrim-held badge, with one `SetVisible` each
+  (`overview::set_grid_visible`); `Grid` shows them again. While hidden
+  the grid is also **not selectable**: `Overview::slot_at` returns `None`,
+  so a click on it leaves without selecting, like a bare-scrim click.
+  That is GNOME's `_workspacesDisplay.reactive = false`, and the
+  `Normal`-layer pointer swallowing alone would not give it, because it only
+  stops clients hearing the click and selection is by slot geometry. A
+  relayout carries the flag across its leave and enter, so a window
+  mapping mid-search does not bring the grid back. Leaving shows the roots
+  before the restore, so the minimized re-hide still re-hides exactly the
+  un-hid set. A fresh enter always starts with the grid shown. Hiding
+  touches neither focus nor `showing` (both look at the content node and
+  state, not the root). It is **instant**, not GNOME's 250 ms
+  `EASE_OUT_QUAD` cross-fade: an opacity ramp over the scaled grid is the
+  ~17 ms/frame case above (see §What is deferred). `stats` reports
+  `overview_grid_hidden`.
 
 The search UI stays in `nitro-launcher` as an `Overlay` client — the seam
 is layers, which already work — so the server draws only scaled windows it
@@ -1042,7 +1060,8 @@ which are `Rect`/`Icon`/`Text` nodes `wm::build_frame` already builds.
 The trigger rework and the launcher's absorption (#3789) are specified in
 `docs/shell.md` §Hotkeys and §The overview: the launcher is the overview's
 search field, and it shows and hides on the server's `OverviewState`.
-Search replacing the grid is #3790.
+Its query decides grid-or-results through `SetOverview(Search | Grid)`
+(see the last bullet above).
 
 
 ## Damage
@@ -1407,6 +1426,11 @@ and a drag-and-drop is not started during a window drag.
   position interpolation, a scale animation) costs ~17 ms a frame. The
   lever is recorded with its numbers (1.04 ms per thumbnail on change;
   17.3 → 0.37 ms/frame) so nobody re-measures it.
+* **The search/grid cross-fade.** GNOME cross-fades the grid and the
+  search results over 250 ms (`SIDE_CONTROLS_ANIMATION_TIME`,
+  `EASE_OUT_QUAD`). nitro's `Search`/`Grid` switch is instant, for the
+  same reason as the scrim fade: a thumbnail opacity ramp is per-frame
+  damage over the scaled grid. It comes with the downscale cache.
 * **Cursor *themes*.** The shapes (six in M4, seventeen since M5-E) are
   compiled-in ASCII art (§Cursor shapes); loading an XCursor theme off
   the box — a file format, a search path and a fallback policy — is not
