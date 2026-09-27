@@ -440,6 +440,11 @@ pub enum Hotkey {
     /// Super+Left / Super+Right: tile to that half of the work area.
     /// `true` = left.
     Tile(bool),
+    /// Super+Up: maximize (fill the work area).
+    Maximize,
+    /// Super+Down: leave Maximized/Fullscreen, back to the remembered
+    /// rectangle.
+    Restore,
 }
 
 /// Map a keysym and the modifiers held to a compositor hotkey.
@@ -503,6 +508,8 @@ pub fn hotkey(keysym: u32, mods: Mods) -> Option<Hotkey> {
         xkb::keysyms::KEY_h | xkb::keysyms::KEY_H => Some(Hotkey::Minimize),
         xkb::keysyms::KEY_Left => Some(Hotkey::Tile(true)),
         xkb::keysyms::KEY_Right => Some(Hotkey::Tile(false)),
+        xkb::keysyms::KEY_Up => Some(Hotkey::Maximize),
+        xkb::keysyms::KEY_Down => Some(Hotkey::Restore),
         _ => None,
     }
 }
@@ -645,6 +652,14 @@ mod tests {
         assert_eq!(
             hotkey(xkb::keysyms::KEY_Right, LOGO),
             Some(Hotkey::Tile(false))
+        );
+        assert_eq!(hotkey(xkb::keysyms::KEY_Up, LOGO), Some(Hotkey::Maximize));
+        assert_eq!(hotkey(xkb::keysyms::KEY_Down, LOGO), Some(Hotkey::Restore));
+        // The vertical pair is Super's alone: the Ctrl+Super guard above
+        // the match keeps a chord an application might want out of it.
+        assert_eq!(
+            hotkey(xkb::keysyms::KEY_Up, Mods { ctrl: true, ..LOGO }),
+            None
         );
         // Super+Return is *not* a compositor chord any more: the launcher
         // binds it through `BindKey`, and a chord the table still claimed

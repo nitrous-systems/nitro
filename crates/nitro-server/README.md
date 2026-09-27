@@ -799,7 +799,8 @@ the console escape hatches (Backspace quits, F1..F12 switch VT),
 **Alt+Tab** for the MRU focus cycle, **Alt+F4** to close (by convention
 alone, so only the bare chord), and **Super** for the
 window-management shortcuts (`Q` close, `M` maximize, `F` fullscreen,
-`H` minimize, `←`/`→` tile). `Super+Enter` was reserved for the launcher
+`H` minimize, `←`/`→` tile, `↑` maximize, `↓` back to the previous
+size). `Super+Enter` was reserved for the launcher
 in M3-A and is no longer a compositor chord: a shell client binds it with
 `BindKey` on the shell socket, which is why the table had to give it up
 (`docs/shell.md`).

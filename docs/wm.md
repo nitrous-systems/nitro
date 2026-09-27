@@ -621,6 +621,7 @@ application's.
 | `Super+F` | toggle fullscreen |
 | `Super+H` | minimize |
 | `Super+←` / `Super+→` | tile to that half of the work area |
+| `Super+↑` / `Super+↓` | maximize / back to the previous size |
 
 `Super+Enter` was **reserved** here in M3-A for "the launcher", and is no
 longer a compositor chord: M3-B's shell socket lets the launcher claim it

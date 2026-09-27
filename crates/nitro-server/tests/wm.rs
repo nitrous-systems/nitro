@@ -46,6 +46,8 @@ const KEY_F4: u32 = 62;
 const KEY_LEFTMETA: u32 = 125;
 const KEY_LEFT: u32 = 105;
 const KEY_RIGHT: u32 = 106;
+const KEY_UP: u32 = 103;
+const KEY_DOWN: u32 = 108;
 
 /// Wait for a condition, polling. Every wait in this file has a deadline:
 /// a test that hangs tells you nothing.
@@ -1716,6 +1718,56 @@ fn super_arrows_tile_the_focused_window_to_half_the_work_area() {
     assert_eq!(right.x, OUT.0 as f32 / 2.0);
     assert_eq!(right.w, left.w, "the halves are the same size");
     assert_eq!(left.x + left.w, right.x, "and they meet exactly");
+
+    drop(conn);
+    h.quit();
+}
+
+/// Super+Up / Super+Down are the vertical half of the resize chords: one
+/// fills the work area, the other puts the window back where it was. The
+/// "previous size" is whatever the window had when it grew, so a tiled
+/// window comes back to its *tile*, not to the size it was created at —
+/// which is what makes the pair a cycle rather than a reset.
+#[test]
+fn super_up_maximizes_and_super_down_restores_the_previous_size() {
+    let mut h = Harness::start("updown", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("updown");
+    let mut win = make_window(&mut conn, &mut inbox, 1, "updown", WIN, RED, 0, 1);
+    h.settle();
+
+    // Tile left first, so the remembered rectangle is the tile and not the
+    // window's original geometry.
+    h.key(KEY_LEFTMETA, true);
+    h.key(KEY_LEFT, true);
+    h.key(KEY_LEFT, false);
+    h.key(KEY_LEFTMETA, false);
+    h.settle();
+    await_configure(&mut conn, &mut inbox, &mut win, "the left tile");
+    let left = win.frame(true);
+    assert_eq!(left.w, OUT.0 as f32 / 2.0, "half the work area");
+
+    h.key(KEY_LEFTMETA, true);
+    h.key(KEY_UP, true);
+    h.key(KEY_UP, false);
+    h.key(KEY_LEFTMETA, false);
+    h.settle();
+    await_configure(&mut conn, &mut inbox, &mut win, "Super+Up");
+    let full = win.frame(true);
+    assert_eq!(full.w, OUT.0 as f32, "Super+Up filled the work area");
+
+    h.key(KEY_LEFTMETA, true);
+    h.key(KEY_DOWN, true);
+    h.key(KEY_DOWN, false);
+    h.key(KEY_LEFTMETA, false);
+    h.settle();
+    await_configure(&mut conn, &mut inbox, &mut win, "Super+Down");
+    let back = win.frame(true);
+    assert_eq!(
+        (back.x, back.y, back.w, back.h),
+        (left.x, left.y, left.w, left.h),
+        "Super+Down came back to the tile, the previous size"
+    );
 
     drop(conn);
     h.quit();

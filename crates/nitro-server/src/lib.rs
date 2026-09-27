@@ -3803,6 +3803,21 @@ impl Server {
         self.note_input(now);
     }
 
+    /// Super+Down: take a `Maximized` or `Fullscreen` window back to
+    /// `Normal` — the rectangle `set_state` remembered when it grew, which
+    /// for a tiled window is its half of the work area and not its original
+    /// size. A `Normal` or `Minimized` window is left alone: Super+Down is
+    /// the other half of the Super+Up cycle, never a minimize.
+    fn unmaximize(&mut self, win: WindowKey) {
+        if self
+            .scene
+            .window_info(win)
+            .is_ok_and(|i| matches!(i.state(), WindowState::Maximized | WindowState::Fullscreen))
+        {
+            self.set_state(win, WindowState::Normal);
+        }
+    }
+
     /// Toggle a window between `Maximized` and `Normal`.
     fn toggle_maximize(&mut self, win: WindowKey) {
         let Ok(state) = self.scene.window_info(win).map(nitro_scene::Window::state) else {
@@ -4157,6 +4172,16 @@ impl Server {
             Hotkey::Tile(left) => {
                 if let Some(win) = self.focus {
                     self.tile(win, left);
+                }
+            }
+            Hotkey::Maximize => {
+                if let Some(win) = self.focus {
+                    self.set_state(win, WindowState::Maximized);
+                }
+            }
+            Hotkey::Restore => {
+                if let Some(win) = self.focus {
+                    self.unmaximize(win);
                 }
             }
         }
