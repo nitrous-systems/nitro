@@ -250,9 +250,10 @@ offer, the MIME list and the descriptor relay are shared, and
 `RequestSelection` names which of the two it means with a one-byte
 `DataSource`. Two bits would mean two copies of the same four messages.
 
-**Of bits 8–14, only `POPUP`, `OUTPUTS` and `DATA` are advertised yet**:
-`POPUP` (M5-G, #3773) and `OUTPUTS` (M5-D, #3770) always, `DATA` (M5-H,
-#3774) on every **local** link and
+**Of bits 8–14, only `POPUP`, `CURSOR`, `OUTPUTS` and `DATA` are
+advertised yet**: `POPUP` (M5-G, #3773), `CURSOR` (M5-E, #3771) and
+`OUTPUTS` (M5-D, #3770) always, `DATA` (M5-H, #3774) on every **local**
+link and
 never on a remote one — every leg of a transfer carries a descriptor,
 which TCP cannot (see [Descriptors on a remote link](#descriptors-on-a-remote-link)).
 The drag half of `DATA` is still refused until M5-I. M5-A froze the protocol surface ahead of the behaviour, deliberately,
@@ -853,6 +854,34 @@ a cursor at the output's scale, which is the argument `wp_cursor_shape_v1`
 itself makes, and it is why the enum is that protocol's list verbatim. See
 [Enumerations](#enumerations) for the table and the Versioning policy for
 why `CursorType::kCustom` is unsupported.
+
+**As implemented (M5-E, #3771).** The server advertises `CURSOR`
+unconditionally — it always draws a cursor — and:
+
+* **Acted on at receipt**, never buffered for a commit: the cursor
+  belongs to the pointer, and a client that had to commit before its
+  I-beam appeared would show it a frame late.
+* **ClientCaps rule 3 applies.** A `SetCursor` from a client that did not
+  list `CURSOR` in its `ClientCaps` is `Error { Protocol }`, even though
+  the bit carries no server→client message, so that `ClientCaps` stays a
+  complete declaration. Note the asymmetry: a **missing capability is
+  fatal** (confusion), a **missing pointer focus is silent** (a race).
+* **Pointer focus** means the pointer is over one of the sender's
+  windows. A frame's decorations are part of its window.
+* **The server's chrome wins.** Over a resize band that would really
+  resize, the band's double arrow shows; over the title bar and its
+  buttons, the arrow — whatever the client asked for. The request shows
+  only over the client's own content, and comes back without a re-send
+  when the pointer returns to the content from the frame.
+* **A request lasts one continuous period of pointer focus.** When the
+  pointer leaves the window the request is forgotten, and after
+  re-entering the client must send it again — `wl_pointer`'s rule, and
+  what Chromium already does by re-applying its cursor on every enter.
+* **It answers a motion.** A client that answers a `PointerMotion` with a
+  `SetCursor` and no `Commit` has spoken, and a flip the server was
+  holding for its answer is released at once, exactly as a commit would.
+* The 35 shapes map onto 17 drawn glyphs; the alias table is in
+  `docs/wm.md` §Cursor shapes.
 
 ### `StartMove` — 0x0019
 
@@ -2441,6 +2470,17 @@ first, or where a name was ambiguous. Every difference:
     every other one safe: without it a pushed server→client message kills
     a client that does not know the op. See
     [Capability opt-in](#capability-opt-in-clientcaps).
+18. **M5-E draws three cursor shapes as a neighbour's glyph** where the
+    glyphs would *not* be identical (the identical aliases are not
+    deviations and are listed in `docs/wm.md`). `Progress` shows `Wait`'s
+    hourglass: the real difference is animation or an arrow composite,
+    and nitro animates nothing. `Cell` shows `Crosshair`: a fat hollow
+    plus versus a thin cross, the same "aim at a point" affordance.
+    `ContextMenu`, `Alias` and `Copy` show the plain arrow: they are
+    arrow **plus a badge**, and nitro draws no badges — the
+    drag-and-drop tasks (#3773/#3774) are where that would be revisited.
+    The wire values stay distinct, so drawing them properly later changes
+    no byte.
 
 ## Receive-side limits
 

@@ -37,7 +37,7 @@ fn background_word(x: u32, y: u32, width: u32, height: u32) -> u32 {
 use nitro_server::{BackendKind, Config, run, wm};
 use nitro_wire::client::Connection;
 use nitro_wire::msg::{Configure, ServerMsg};
-use nitro_wire::types::{ButtonState, Layer, NodeId};
+use nitro_wire::types::{ButtonState, CursorShape, Layer, NodeId, caps};
 
 /// Wait for a condition, polling. Every wait in this file has a deadline:
 /// a test that hangs tells you nothing.
@@ -1835,6 +1835,84 @@ fn a_client_that_answers_a_motion_rides_the_same_flip_as_the_cursor() {
         stat(&s, "defer_timeouts"),
         0,
         "a client that answers must never hit the deadline: {s:?}"
+    );
+    h_.quit();
+}
+
+/// A client may answer a motion with a **cursor shape and no commit** —
+/// a pointer moving onto a link changes the cursor and repaints nothing —
+/// and that answer releases the held flip just as a commit does (#3771).
+///
+/// Without `defer.forget` on `SetCursor` the token would stay awaited, the
+/// shape change would be held to the deadline again, and every one of
+/// these motions would cost a `defer_timeouts` and a frame of latency on
+/// exactly the hover this op exists for.
+#[test]
+fn a_client_that_answers_a_motion_with_a_cursor_shape_rides_the_same_flip() {
+    let (w, h) = (320, 200);
+    let h_ = Harness::start("defer-cursor", w, h);
+    let mut conn = h_.client("hover");
+    conn.client_caps(caps::CURSOR).unwrap();
+    let mut seen = Vec::new();
+    let win = make_window(
+        &mut conn,
+        1,
+        Size::new(120.0, 80.0),
+        Color::rgb(0, 0, 0xFF),
+        1,
+    );
+    let configure = expect(&mut conn, &mut seen, "Configure", |m| match m {
+        ServerMsg::Configure(c) if c.window == win.root => Some(*c),
+        _ => None,
+    });
+    h_.point_at(&configure, Point::new(20.0, 20.0), 1_000_000);
+    expect(&mut conn, &mut seen, "PointerEnter", |m| match m {
+        ServerMsg::PointerEnter(e) => Some(*e),
+        _ => None,
+    });
+    h_.settle();
+    seen.clear();
+    let base = h_.request_text("stats\n");
+    let timeouts = stat(&base, "defer_timeouts");
+    let deferred = stat(&base, "flips_deferred");
+
+    let before = h_.frames();
+    for step in 0..4u32 {
+        at_frame_start(&mut conn, &mut seen, win.root, 100 + step * 32);
+        h_.point_at(
+            &configure,
+            Point::new(30.0 + step as f32 * 8.0, 30.0),
+            u64::from(2 + step) * 1_000_000,
+        );
+        expect(&mut conn, &mut seen, "PointerMotion", |m| match m {
+            ServerMsg::PointerMotion(m) => Some(*m),
+            _ => None,
+        });
+        seen.retain(|m| !matches!(m, ServerMsg::PointerMotion(_)));
+        // The answer: a new shape, and no commit.
+        let shape = if step % 2 == 0 {
+            CursorShape::Text
+        } else {
+            CursorShape::Pointer
+        };
+        conn.set_cursor(shape).unwrap();
+        conn.flush().unwrap();
+        h_.settle();
+    }
+    let flips = h_.frames() - before;
+    // The answered-motion case's count: two per move, the age-2 cost of
+    // the cursor alone. The shape change rides the motion's flip rather
+    // than taking one of its own after the deadline.
+    assert_eq!(
+        flips, 8,
+        "expected 2 flips per motion answered with a SetCursor; got {flips}"
+    );
+    let s = h_.request_text("stats\n");
+    assert!(stat(&s, "flips_deferred") > deferred, "{s:?}");
+    assert_eq!(
+        stat(&s, "defer_timeouts"),
+        timeouts,
+        "a SetCursor answer must release the held flip, not wait out the deadline: {s:?}"
     );
     h_.quit();
 }

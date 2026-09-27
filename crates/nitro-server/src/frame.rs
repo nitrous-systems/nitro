@@ -587,17 +587,21 @@ pub struct CursorState {
     pub x: i32,
     /// Hotspot position in device pixels.
     pub y: i32,
-    /// Which shape the server has chosen for the pointer's position.
+    /// Which shape the pointer is showing.
     ///
-    /// Chosen by the server alone, from the frame region under the
-    /// pointer — there is no client request for one yet
-    /// (`docs/wire.md`'s deferred list).
+    /// Until M5-E (#3771) this said "chosen by the server alone — there is
+    /// no client request for one yet". There is now: a client with pointer
+    /// focus may choose over its own content with `SetCursor`, and the
+    /// server's chrome still wins (`Server::cursor_choice`). When a client
+    /// has hidden the cursor this is a placeholder and `visible` is false.
     pub shape: crate::cursor::Shape,
     /// The whole factor the cursor is magnified by on this output, so a
     /// 2× output gets a 48-device-pixel cursor rather than a physically
     /// half-size one. See [`Cursor::paint_scale`].
     pub scale: i32,
-    /// Whether the cursor is drawn at all (no pointer device: no cursor).
+    /// Whether the cursor is drawn at all: false with no pointer device,
+    /// and false when a client with pointer focus hid it
+    /// (`CursorShape::None`).
     pub visible: bool,
 }
 

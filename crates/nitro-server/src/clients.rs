@@ -120,7 +120,10 @@ pub struct WireClient {
     /// messages (`Server::output_gate`, read by `send_output_list`,
     /// `notify_outputs` and `work_area_changed`): `ListOutputs` needs it
     /// listed, and `OutputWorkArea` goes only to clients that listed it —
-    /// shell clients included. The bits not yet
+    /// shell clients included. `CURSOR` (M5-E) gates `SetCursor`: a
+    /// client that did not list it and sends one is `Error { Protocol }`,
+    /// even though the bit carries no server→client message, so that
+    /// `ClientCaps` stays a complete declaration. The bits not yet
     /// advertised are still recorded, because the rule this exists for
     /// cannot be honoured retroactively by a server that threw the list
     /// away.
@@ -628,6 +631,13 @@ fn apply_msg(
             outcome.text_metrics.push((m.node, metrics));
             Ok(())
         }
+        ClientMsg::SetCursor(_) => {
+            // Never buffered: `handle_wire_msg` acts on it at receipt. The
+            // cursor belongs to the pointer, not to a frame, and a client
+            // that had to commit before its I-beam showed would show it a
+            // frame late — the `MeasureText` reasoning, for a request.
+            Ok(())
+        }
         ClientMsg::MeasureText(_) => {
             // Answered on receipt, never buffered: a measurement a client
             // has to commit for is a measurement it cannot lay out with.
@@ -867,8 +877,7 @@ fn apply_msg(
         // already disconnects on receipt and none of these ever reaches
         // `pending`; this arm is belt and braces, and exists because the
         // match above is the op table and deliberately has no `_`.
-        ClientMsg::SetCursor(_)
-        | ClientMsg::StartMove(_)
+        ClientMsg::StartMove(_)
         | ClientMsg::StartResize(_)
         | ClientMsg::StartDrag(_)
         | ClientMsg::AcceptDrop(_)

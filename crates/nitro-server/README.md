@@ -518,11 +518,14 @@ ARGB image blitted like anything else, inside the frame's damage clip —
 into the shadow, like everything else — and a pointer move damages the old
 and the new cursor rect.
 
-Since #3724 there are **six** such images — the arrow, four resize double
-arrows and a move cross — and the server picks one from the frame region
-under the pointer, off the same `frame_hit` per motion that drives the
-resize hint and the button hover. A shape change is cursor damage and
-nothing else. On a scaled output the cursor is magnified by that output's
+Since #3724 there were **six** such images — the arrow, four resize
+double arrows and a move cross — and the server alone picked one from the
+frame region under the pointer, off the same `frame_hit` per motion that
+drives the resize hint and the button hover. Both halves changed with
+M5-E (#3771): there are now **seventeen**, and a client holding pointer
+focus may choose one over its own content with `SetCursor` — the server's
+own chrome (resize bands, title bar) still wins. A shape change, the
+server's or a client's, is cursor damage and nothing else. On a scaled output the cursor is magnified by that output's
 whole scale factor with nearest-neighbour blocks, so a 2× screen gets a
 48-device-pixel pointer rather than a physically half-size one. See
 `docs/wm.md` §Cursor shapes.

@@ -810,15 +810,28 @@ struct Server {
     /// frames' buttons are different buttons — sliding from one window's
     /// close to another's has to unlight the first.
     button_hover: Option<(WindowKey, Region)>,
-    /// Which cursor shape the pointer is showing.
+    /// Which cursor shape the pointer is showing; `None` means **hidden** —
+    /// a client asked for `CursorShape::None` and still holds pointer
+    /// focus over its content.
     ///
     /// Cached for the same reason [`Server::resize_hint`] is, and with the
     /// same damage rule: a shape change damages the **old rect ∪ the new**
     /// (they differ, because the hotspots do) and nothing else — no scene
     /// node moved, so no scene damage and no restyle. Chosen from the same
     /// single `frame_hit` per motion that already drives the hint and the
-    /// hover; see [`Server::set_cursor_shape`].
-    cursor_shape: crate::cursor::Shape,
+    /// hover; see [`Server::set_cursor`] and [`Server::cursor_choice`].
+    cursor_shown: Option<crate::cursor::Shape>,
+    /// The shape a client asked for with `SetCursor` (M5-E), and the
+    /// window it held pointer focus on when it asked. An inner `None` is
+    /// "hide".
+    ///
+    /// One field, not a per-client map: only the client under the pointer
+    /// can have a live request. It lasts one continuous period of pointer
+    /// focus — cleared wherever `pointer.over` changes and when the owning
+    /// client goes — and is read only through
+    /// [`Server::requested_cursor`], which re-validates the window, so a
+    /// stale entry can never be honoured.
+    client_cursor: Option<(WindowKey, Option<crate::cursor::Shape>)>,
     /// The shaped title run of each framed window, so a retitle can release
     /// the old one.
     frame_titles: HashMap<WindowKey, nitro_text::TextKey>,
@@ -1184,7 +1197,8 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         decorations: HashMap::new(),
         resize_hint: None,
         button_hover: None,
-        cursor_shape: crate::cursor::Shape::Arrow,
+        cursor_shown: Some(crate::cursor::Shape::Arrow),
+        client_cursor: None,
         frame_titles: HashMap::new(),
         scale_overrides: std::mem::take(&mut config.scales),
         mode_overrides: std::mem::take(&mut config.modes),
@@ -1326,7 +1340,7 @@ fn is_shell_op(msg: &ClientMsg) -> bool {
 /// implement.
 ///
 /// The protocol surface landed ahead of the behaviour (task #3767), so the
-/// six ops below decode but are refused: `Server::caps` advertises none
+/// ops below decode but are refused: `Server::caps` advertises none
 /// of their bits, so no conformant client sends one, and a client that
 /// does anyway hears why instead of being silently ignored. The two popup
 /// ops left this list with #3773 (`caps::POPUP`), and the three clipboard
@@ -1334,7 +1348,9 @@ fn is_shell_op(msg: &ClientMsg) -> bool {
 /// until M5-I implements them: a client that saw the bit for the
 /// clipboard and starts a drag is told so rather than ignored.
 /// `ListOutputs` left with #3770 (`caps::OUTPUTS`); it is answered by
-/// `Server::list_outputs` and never reaches this function.
+/// `Server::list_outputs` and never reaches this function. `SetCursor`
+/// left with #3771 (`caps::CURSOR`); it is acted on at receipt by
+/// `Server::set_cursor_request`.
 ///
 /// `ClientCaps` (0x0003) is deliberately **not** here: it is accepted and
 /// recorded, because the rule that makes it safe — the server must not
@@ -1348,8 +1364,7 @@ fn is_shell_op(msg: &ClientMsg) -> bool {
 fn is_m5_op(msg: &ClientMsg) -> bool {
     matches!(
         msg,
-        ClientMsg::SetCursor(_)
-            | ClientMsg::StartMove(_)
+        ClientMsg::StartMove(_)
             | ClientMsg::StartResize(_)
             | ClientMsg::StartDrag(_)
             | ClientMsg::AcceptDrop(_)
@@ -2135,13 +2150,15 @@ impl Server {
         CursorState {
             x: x - origin.0,
             y: y - origin.1,
-            shape: self.cursor_shape,
+            // A hidden cursor still reports a shape, for the damage
+            // arithmetic's sake; `visible` is what stops it painting.
+            shape: self.cursor_shown.unwrap_or_default(),
             // Per **output**: the cursor is painted in device pixels, so
             // a 2x output needs a 2x cursor to be the same physical size,
             // and the pointer can be on either screen of a mixed-scale
             // desk. Each output paints it at its own factor.
             scale: Cursor::paint_scale(scale),
-            visible: self.pointer.present,
+            visible: self.pointer.present && self.cursor_shown.is_some(),
         }
     }
 
@@ -3082,19 +3099,22 @@ impl Server {
     fn move_pointer(&mut self, x: f64, y: f64, time_ns: u64) {
         let bounds = input::output_union(&self.scene);
         let (old_x, old_y) = self.pointer.device();
-        let old_shape = self.cursor_shape;
+        let old_shape = self.cursor_shown;
         let appeared = self.pointer.seen();
-        if appeared {
-            self.damage_cursor_at(old_x, old_y, old_shape);
+        if appeared && let Some(shape) = old_shape {
+            self.damage_cursor_at(old_x, old_y, shape);
         }
         if !self.pointer.move_to(x, y, bounds) && !appeared {
             return;
         }
         let (new_x, new_y) = self.pointer.device();
-        if (old_x, old_y) != (new_x, new_y) {
-            // Old ∪ new, exactly like the scene's own damage rule.
-            self.damage_cursor_at(old_x, old_y, old_shape);
-            self.damage_cursor_at(new_x, new_y, old_shape);
+        if (old_x, old_y) != (new_x, new_y)
+            && let Some(shape) = old_shape
+        {
+            // Old ∪ new, exactly like the scene's own damage rule. A
+            // hidden cursor draws nothing, so moving it damages nothing.
+            self.damage_cursor_at(old_x, old_y, shape);
+            self.damage_cursor_at(new_x, new_y, shape);
         }
         let point = self.pointer.position();
         let output = input::output_at(&self.scene, point);
@@ -3113,7 +3133,7 @@ impl Server {
             // run past them. Neither can be re-derived from the region
             // under the pointer, because during a drag the pointer is
             // routinely nowhere near the frame it is moving.
-            self.set_cursor_shape(Self::drag_shape(drag));
+            self.set_cursor(Some(Self::drag_shape(drag)));
             self.note_input(time_ns);
             return;
         }
@@ -3138,8 +3158,6 @@ impl Server {
             frame_hit.and_then(|(win, region)| matches!(region, Region::Resize(_)).then_some(win)),
         );
         self.set_button_hover(frame_hit.filter(|(_, region)| region.is_button()));
-        // And the cursor shape, off that same one walk.
-        self.set_cursor_shape(Self::shape_for(frame_hit, |w| self.resizable(w)));
         let target = output.and_then(|id| input::hit(&self.scene, id, point));
         let now_over = target.map(|t| t.window);
         if now_over != self.pointer.over {
@@ -3155,7 +3173,7 @@ impl Server {
                 // as the motion that caused it.
                 self.note_client_input(sent_to);
             }
-            self.pointer.over = now_over;
+            self.set_pointer_over(now_over);
             if let Some(t) = target {
                 let node = self.node_id_for(t.window, t.hit.node);
                 let sent_to = self.send_input(t.window, |id| {
@@ -3180,6 +3198,10 @@ impl Server {
             });
             self.note_client_input(sent_to);
         }
+        // And the cursor shape, off that same one walk — decided **after**
+        // enter/leave, so a client's request is judged against the window
+        // the pointer is on now, not the one it just left.
+        self.set_cursor(self.cursor_choice(frame_hit));
         self.note_input(time_ns);
     }
 
@@ -3679,7 +3701,7 @@ impl Server {
             self.focus = None;
         }
         if self.pointer.over == Some(win) {
-            self.pointer.over = None;
+            self.set_pointer_over(None);
         }
         self.touch_targets.retain(|_, (w, _)| *w != win);
         self.popup_window_gone(win);
@@ -4175,13 +4197,19 @@ impl Server {
     /// restyle, it shapes no text, it re-rasterises no icon, and
     /// [`frame::OutputState::cursor_only`] still calls the frame it causes
     /// a cursor-only flip. That is what
-    /// `hovering_a_band_changes_the_cursor_and_nothing_else` pins.
-    fn set_cursor_shape(&mut self, shape: crate::cursor::Shape) {
-        if self.cursor_shape == shape {
+    /// `hovering_a_band_changes_the_cursor_and_nothing_else` pins, and
+    /// what `a_client_shape_change_is_cursor_damage_and_nothing_else`
+    /// pins for a client's `SetCursor`.
+    ///
+    /// `None` hides the cursor (a client's `CursorShape::None`). Hiding
+    /// damages exactly the old rect and showing exactly the new one — the
+    /// same rule, with one side empty.
+    fn set_cursor(&mut self, want: Option<crate::cursor::Shape>) {
+        if self.cursor_shown == want {
             return;
         }
-        let old = self.cursor_shape;
-        self.cursor_shape = shape;
+        let old = self.cursor_shown;
+        self.cursor_shown = want;
         if !self.pointer.present {
             // Nothing is drawn, so nothing changed on screen. The shape is
             // still recorded: the first motion that makes the pointer
@@ -4189,51 +4217,155 @@ impl Server {
             return;
         }
         let (x, y) = self.pointer.device();
-        self.damage_cursor_at(x, y, old);
-        self.damage_cursor_at(x, y, shape);
+        for shape in [old, want].into_iter().flatten() {
+            self.damage_cursor_at(x, y, shape);
+        }
     }
 
-    /// The shape a frame region calls for, given a way to ask whether a
-    /// window is resizable.
+    /// Point `pointer.over` at a (possibly) different window, dropping a
+    /// client's cursor request when it does.
     ///
-    /// A band the window can **actually** be resized by takes the shape
-    /// that points along it; everything else takes the arrow. `resizable`
-    /// is the same filter [`Server::set_resize_hint`] applies, and for the
-    /// same reason — a diagonal cursor over a `FIXED_SIZE` window would
-    /// promise a grab that does nothing, which is worse than promising
-    /// none.
+    /// Every reassignment goes through here, because a `SetCursor` lasts
+    /// exactly one continuous period of pointer focus: `wl_pointer`'s own
+    /// rule, and the one Chromium already follows by re-applying its
+    /// cursor on every enter (`wayland_window.cc`).
+    fn set_pointer_over(&mut self, over: Option<WindowKey>) {
+        if self.pointer.over != over {
+            self.client_cursor = None;
+        }
+        self.pointer.over = over;
+    }
+
+    /// A client's live cursor request, re-validated against the window
+    /// the pointer is on now.
     ///
-    /// A free function of the hit rather than a method, because the two
-    /// callers hold `self` differently: the motion path has already
-    /// borrowed it for the hit test, and the release path has not looked
-    /// yet. Having one rule matters more than the shape of the call —
-    /// the release exists precisely so a drag cannot leave a stale cursor
-    /// behind, and a second copy of the rule would be a second thing to
-    /// get wrong.
-    fn shape_for(
-        hit: Option<(WindowKey, Region)>,
-        resizable: impl Fn(WindowKey) -> bool,
-    ) -> crate::cursor::Shape {
+    /// The outer `Option` is "a live request exists"; the inner is the
+    /// request itself, where `None` means "hide". A request recorded for
+    /// any window but `pointer.over` answers the outer `None` — the field
+    /// is cleared on every focus change anyway, so this is belt and
+    /// braces rather than the mechanism.
+    // Two distinct absences, deliberately: "no request" falls back to the
+    // arrow, "a request to hide" must not. A three-case enum would be this
+    // type with new names on it, and the doc comment names the cases.
+    #[allow(clippy::option_option)]
+    fn requested_cursor(&self) -> Option<Option<crate::cursor::Shape>> {
+        let (win, shape) = self.client_cursor?;
+        (self.pointer.over == Some(win)).then_some(shape)
+    }
+
+    /// `SetCursor` (M5-E): a client choosing the pointer's shape over its
+    /// own content. Returns whether the client survives.
+    ///
+    /// Three steps, in this order:
+    ///
+    /// 1. **The capability**, fatal: a client that did not list `CURSOR`
+    ///    in its `ClientCaps` is `Error { Protocol }` (`docs/wire.md`
+    ///    rule 3) — confusion, not a race.
+    /// 2. **Release the deferral.** The client has spoken: a `SetCursor`
+    ///    with no commit is exactly how a client answers the motion that
+    ///    put the pointer over a link, so a flip held for its answer is
+    ///    released on `commit`'s reasoning. Before the focus test, because
+    ///    a client that just lost focus was very plausibly answering the
+    ///    `PointerLeave` that took it; `forget` is per-token, so this
+    ///    never releases another client's wait.
+    /// 3. **Pointer focus**, silent: a client whose window is not under
+    ///    the pointer is ignored, no error — focus can legitimately leave
+    ///    between the send and the receipt, and every error is fatal.
+    ///
+    /// Then the effective cursor is re-derived at once, so the shape shows
+    /// without waiting for a motion — through [`Server::cursor_choice`],
+    /// so the server's own chrome still wins.
+    fn set_cursor_request(&mut self, token: u64, shape: nitro_wire::types::CursorShape) -> bool {
+        let Some(client) = self.wire_clients.get(&token) else {
+            return false;
+        };
+        let listed = client.client_caps & nitro_wire::types::caps::CURSOR != 0;
+        let focused = self.pointer.over.filter(|w| client.owns_window(*w));
+        if !listed {
+            self.disconnect(
+                token,
+                Some((
+                    0,
+                    ErrorCode::Protocol,
+                    "SetCursor needs `CURSOR` listed in ClientCaps".to_owned(),
+                )),
+            );
+            return false;
+        }
+        self.defer.forget(token);
+        let Some(win) = focused else {
+            debug!("SetCursor from a client without pointer focus: ignored");
+            return true;
+        };
+        self.client_cursor = Some((win, crate::cursor::Shape::from_wire(shape)));
+        self.update_cursor_shape();
+        true
+    }
+
+    /// What the cursor should show, given the frame region under the
+    /// pointer; `None` is hidden.
+    ///
+    /// The precedence, below a drag (which short-circuits before this in
+    /// `move_pointer`):
+    ///
+    /// 1. A band the window can **actually** be resized by takes the shape
+    ///    that points along it. `resizable` is the filter
+    ///    [`Server::set_resize_hint`] applies, and for the same reason — a
+    ///    diagonal cursor over a `FIXED_SIZE` window would promise a grab
+    ///    that does nothing.
+    /// 2. The client's own content honours the client's request, if it
+    ///    has a live one.
+    /// 3. Everything else takes the arrow.
+    ///
+    /// The server's chrome wins over a request because it is the server's
+    /// affordance, not the client's: a client cannot know where nitro's
+    /// bands are. Decorations are part of the window, so moving off them
+    /// back onto the content brings the request back without a re-send.
+    ///
+    /// Two independent mechanisms make "leaving the window forgets the
+    /// shape" true, and both are intended: this function never consults
+    /// the request off the content, and [`Server::set_pointer_over`]
+    /// drops the stored request outright on a focus change. The second is
+    /// what makes re-entry need a re-send; the first is why the desktop
+    /// shows an arrow even if the clearing were ever missed.
+    ///
+    /// One rule for both callers — the motion path (with the hit it
+    /// already has, so no second z-order walk) and the release that ends
+    /// a drag — because a second copy would be a second thing to get
+    /// wrong.
+    fn cursor_choice(&self, hit: Option<(WindowKey, Region)>) -> Option<crate::cursor::Shape> {
+        use crate::cursor::Shape;
         match hit {
-            Some((win, Region::Resize(edges))) if resizable(win) => {
-                crate::cursor::Shape::for_edges(edges)
+            // The server's own affordance: a band that would really resize.
+            Some((win, Region::Resize(edges))) if self.resizable(win) => {
+                Some(Shape::for_edges(edges))
             }
-            _ => crate::cursor::Shape::Arrow,
+            // The client's own content: the one place a request is honoured.
+            Some((_, Region::Content)) => self.requested_cursor().unwrap_or(Some(Shape::Arrow)),
+            // Everything else takes the arrow: server-drawn chrome (title
+            // bar, buttons, a FIXED_SIZE window's band) and the bare
+            // desktop.
+            //
+            // The desktop is `None` here, and it is deliberately *not*
+            // routed through `requested_cursor()`: off every window nobody
+            // holds pointer focus, so it could only ever re-validate to
+            // `None` and answer the arrow anyway.
+            _ => Some(Shape::Arrow),
         }
     }
 
     /// Re-derive the cursor shape from whatever is under the pointer now.
     ///
     /// The motion path does this inline, off the `frame_hit` it already
-    /// has. This is for the one place that has no hit in hand and cannot
-    /// skip the question: the **release** that ends a drag. A drag owns
+    /// has. This is for the places that have no hit in hand: a client's
+    /// `SetCursor`, and the **release** that ends a drag. A drag owns
     /// the shape while it lasts and the pointer is routinely nowhere near
     /// the frame by the time it ends, so without this a release over the
     /// bare desktop leaves the move cross there until the next motion —
     /// indefinitely, if the user lets go and does not move.
     fn update_cursor_shape(&mut self) {
         let hit = self.pointer_desktop().and_then(|p| self.frame_hit(p));
-        self.set_cursor_shape(Self::shape_for(hit, |w| self.resizable(w)));
+        self.set_cursor(self.cursor_choice(hit));
     }
 
     /// The shape a drag in flight shows.
@@ -5678,6 +5810,11 @@ impl Server {
             }
             ClientMsg::Commit(commit) => self.commit(token, commit.serial),
             ClientMsg::ClientCaps(m) => self.record_client_caps(token, m.caps),
+            // Acted on at receipt, never buffered for a commit: the cursor
+            // is a property of the pointer, not a scene mutation a frame
+            // must show atomically, and a client that had to commit before
+            // its I-beam appeared would show it a frame late.
+            ClientMsg::SetCursor(m) => self.set_cursor_request(token, m.shape),
             // The one unprivileged op answered in the shell block. It has
             // its own arm, *before* the catch-all, so it never reaches
             // `is_shell_op` or `handle_shell_msg`: it shares no code path
@@ -5786,11 +5923,16 @@ impl Server {
     /// always owns an output list, so `ListOutputs` is a promise it can
     /// always keep — on every link, a remote one included, since output
     /// geometry carries no descriptor.
+    ///
+    /// `CURSOR` (M5-E) is unconditional for the same reason: the server
+    /// always draws a cursor, so `SetCursor` is always a request it can
+    /// honour.
     fn caps(&self, shell: bool, remote: bool) -> u32 {
         let mut caps = nitro_wire::types::caps::WM
             | nitro_wire::types::caps::THEME
             | nitro_wire::types::caps::POPUP
-            | nitro_wire::types::caps::OUTPUTS;
+            | nitro_wire::types::caps::OUTPUTS
+            | nitro_wire::types::caps::CURSOR;
         if self.text.has_fonts() {
             caps |= nitro_wire::types::caps::TEXT;
         }
@@ -6840,7 +6982,7 @@ impl Server {
                 self.focus = None;
             }
             if self.pointer.over == Some(win) {
-                self.pointer.over = None;
+                self.set_pointer_over(None);
             }
             self.touch_targets.retain(|_, (w, _)| *w != win);
             self.popup_window_gone(win);
@@ -7417,7 +7559,7 @@ impl Server {
                 })
             });
         }
-        self.pointer.over = now_over;
+        self.set_pointer_over(now_over);
         if let Some(t) = target {
             let node = self.node_id_for(t.window, t.hit.node);
             self.send_to_window(t.window, |id| {
@@ -7664,6 +7806,12 @@ mod tests {
             // shell op: folding it into `handle_shell_msg` would make
             // output enumeration a privilege again (M5-D).
             msg::ListOutputs.into(),
+            // `SetCursor` (M5-E) is open to every client holding the
+            // pointer; see `Server::set_cursor_request`.
+            msg::SetCursor {
+                shape: nitro_wire::types::CursorShape::Text,
+            }
+            .into(),
         ] {
             assert!(!is_m5_op(&m), "{} is implemented", m.name());
             assert!(!is_shell_op(&m), "{} is not a shell op", m.name());

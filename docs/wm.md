@@ -389,8 +389,11 @@ there.
 
 ### Cursor shapes
 
-The pointer shows one of six shapes, and the **server** picks it
-(`crates/nitro-server/src/cursor.rs`):
+Until M5-E (#3771) the pointer showed one of six shapes and the
+**server** alone picked it. There are now seventeen, and a client holding
+pointer focus may pick one over its own content with `SetCursor`
+(`docs/wire.md`); the server's own choices below still win over its
+frame (`crates/nitro-server/src/cursor.rs`):
 
 | where the pointer is | shape |
 |---|---|
@@ -400,6 +403,53 @@ The pointer shows one of six shapes, and the **server** picks it
 | a top-left / bottom-right corner | `size_fdiag` ╲ |
 | a top-right / bottom-left corner | `size_bdiag` ╱ |
 | a drag in flight | the drag's own: `move` for a title drag, the grabbed edges' shape for a resize |
+| the client's content, with a live `SetCursor` | the client's shape, or nothing if it asked for `None` |
+
+**Precedence**, highest first: a drag in flight; the server's chrome (a
+band that would really resize takes its double arrow; the title bar, its
+buttons and a `FIXED_SIZE` window's edges take the arrow); the client's
+request, over its content only; the arrow. One `Server::cursor_choice`
+answers it for both the motion path and the drag release, off the hit
+test the caller already has.
+
+**Focus leaving and returning.** A request lasts one continuous period of
+pointer focus. Moving from the content onto the window's own frame and
+back keeps it (decorations are part of the window, focus never left).
+Leaving the window forgets it — the stored request is dropped wherever
+`pointer.over` changes, and independently the bare desktop never consults
+one — so after re-entering the client must send it again, `wl_pointer`'s
+rule, which Chromium already follows by re-applying its cursor on enter.
+A `SetCursor` from a client that does not hold the pointer is silently
+ignored. **Hiding** (`CursorShape::None`) damages exactly the old rect
+and nothing is painted until a shape comes back.
+
+The 17 drawn glyphs, each 24×24 in the same black-outline/white-fill
+art, magnified by `round(scale)` like the rest:
+
+| glyph | hotspot | wire shapes (`CursorShape`) |
+|---|---|---|
+| arrow | tip (0, 0) | `Default`; `ContextMenu`, `Alias`, `Copy` (arrow + badge; no badges drawn — `docs/wire.md` deviation 18) |
+| `size_hor` ↔ | centre | `EResize`, `WResize`, `EwResize`, `ColResize` |
+| `size_ver` ↕ | centre | `NResize`, `SResize`, `NsResize`, `RowResize` |
+| `size_fdiag` ╲ | centre | `NwResize`, `SeResize`, `NwseResize` |
+| `size_bdiag` ╱ | centre | `NeResize`, `SwResize`, `NeswResize` |
+| move cross | centre | `Move`, `AllScroll` |
+| I-beam | centre | `Text` |
+| vertical I-beam | centre | `VerticalText` |
+| hand | fingertip | `Pointer` |
+| open hand | centre | `Grab` |
+| closed hand | centre | `Grabbing` |
+| hourglass | centre | `Wait`, `Progress` (nitro animates nothing) |
+| arrow + `?` | tip (0, 0) | `Help` |
+| crosshair | centre | `Crosshair`, `Cell` (same affordance, thinner stroke) |
+| slashed ring | centre | `NotAllowed`, `NoDrop` |
+| magnifier `+` | lens centre | `ZoomIn` |
+| magnifier `−` | lens centre | `ZoomOut` |
+
+A one-way resize shows its axis's double arrow and a column/row resize
+the same arrow without the divider: identical glyphs, so aliases rather
+than art. `None` hides. A bitmap cursor (CSS `cursor: url(…)`) has no
+path at all, deliberately.
 
 Three properties, each of which was a review finding on #3713 or #3715
 before it was a rule here:
@@ -449,8 +499,9 @@ smear. `Cursor::rect_scaled` is what both the paint and the damage derive
 from, so they cannot disagree, and the factor is per **output**: the
 pointer can cross from a 2× screen to a 1× one.
 
-Clients still **cannot request a shape**: that is a `SetCursor` wire
-message, deferred to M5 with its argument in `docs/wire.md`.
+Until M5-E this section ended "clients still **cannot request a
+shape**", deferring `SetCursor` to M5. They can now, over their own
+content — see the precedence and focus rules above.
 
 ### Which windows resize
 
@@ -1223,13 +1274,13 @@ Chains are capped at 16 levels.
   grounds (§Overview mode). A scale animation needs a downscale cache in
   `nitro-raster` first — the lever is recorded with its number so nobody
   re-measures it.
-* **Cursor *themes*.** The six shapes are compiled-in ASCII art
-  (§Cursor shapes); loading an XCursor theme off the box — a file format,
-  a search path and a fallback policy — is not in M4. Nor is
-  `SetCursor`, the wire message that would let a *client* ask for a shape
-  (an I-beam over a text field, a hand over a link): it is deferred to M5
-  with its argument in `docs/wire.md`, because a useful one carries a
-  client-supplied bitmap and a hotspot as well as a named shape.
+* **Cursor *themes*.** The shapes (six in M4, seventeen since M5-E) are
+  compiled-in ASCII art (§Cursor shapes); loading an XCursor theme off
+  the box — a file format, a search path and a fallback policy — is not
+  in M4. This entry used to add that `SetCursor` was deferred to M5 too;
+  it landed in M5-E as **named shapes only** (an I-beam over a text
+  field, a hand over a link), and the client-supplied bitmap it once
+  argued for is declined — `docs/wire.md` § Versioning policy.
 * **Rotation.** Position, scale and the primary flag per connector are
   persistent since M4-C (`server.conf`, `docs/settings.md`); rotation is
   not, because nothing in the scene applies one yet.

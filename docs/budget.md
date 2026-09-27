@@ -479,16 +479,18 @@ hover damages its old rectangle *and* its new one, where three fixed
 discs each damage only themselves: twice the pixels per hover, paid on
 the motion path, to save half a kilobyte of a 9.5 MB process.
 
-### The cursor's six shapes: 13 824 bytes, once (#3724)
+### The cursor's seventeen shapes: 39 168 bytes, once (#3724, #3771)
 
 The software cursor used to be one 24 × 24 arrow converted to ARGB8888 at
 startup: 2 304 bytes, too small to appear on this page. #3724 made it six
-shapes — the arrow, four resize double-arrows and the move cross — so the
-figure is **6 × 24 × 24 × 4 = 13 824 bytes**, pinned by
-`every_shape_has_the_documented_size`.
+shapes — the arrow, four resize double-arrows and the move cross — at
+6 × 24 × 24 × 4 = 13 824 bytes. M5-E (#3771) added eleven more for
+clients' `SetCursor` (the I-beam, the hand, the hourglass and the rest a
+browser needs), so the figure is now **17 × 24 × 24 × 4 = 39 168 bytes**,
+pinned by `every_shape_has_the_documented_size`.
 
-That is 11.5 kB of a 2.5 MB `RssAnon` line, or **0.5 %**, and it is a
-constant: one allocation per server, not per output, per window or per
+That is 38.25 kB of a 2.5 MB `RssAnon` line, or **1.5 %** (it was 11.5 kB,
+0.5 %), and it is a constant: one allocation per server, not per output, per window or per
 pointer. What it buys is the affordance the frame could not carry — a
 band that says what it does before you press it — and it buys it without
 touching the two things this page is strict about:
@@ -497,6 +499,13 @@ touching the two things this page is strict about:
   node in it, so 11 nodes per decorated frame is unchanged.
 * **No per-motion allocation.** The masks are converted once and
   immutable; a shape change is two damage rects and a different index.
+
+Why the extra 25 kB is the right trade: a browser without an I-beam over
+text and a hand over links is not a browser, and the alternative —
+converting a mask on demand — puts a 2 304-byte conversion on the motion
+path, which is the path this page is strictest about. Against the
+`RssAnon ≤ 2.5 MB` budget line, the 38 kB is spent out of the headroom
+that line has left, and it is spent once.
 
 The alternative was converting on demand and caching one shape, which
 would save 11.5 kB and put a 2 304-byte conversion on the *motion* path

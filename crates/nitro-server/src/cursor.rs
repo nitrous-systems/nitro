@@ -38,12 +38,31 @@
 //! file) by decoding its 24 px frame and comparing the silhouette; nothing
 //! is vendored, the art here is drawn from the geometry.
 //!
-//! The other five are **resize and move** shapes the *server* picks, from
+//! Five more are **resize and move** shapes the *server* picks, from
 //! the same `frame_hit` per motion event that already drives the resize
 //! hint and the button hover: a band resolves to the shape for the edges
 //! it pulls, a title drag in flight to [`Shape::Move`], and everything
-//! else to the arrow. Clients cannot ask for a shape — that is a
-//! `SetCursor` wire message, deferred to M5 (`docs/wire.md`).
+//! else to the arrow.
+//!
+//! Until M5-E (#3771) this paragraph ended "clients cannot ask for a
+//! shape — deferred to M5". That is no longer true. A client that holds
+//! pointer focus may name one with `SetCursor` (`CursorShape`, which is
+//! `wp_cursor_shape_device_v1`'s list), and the eleven shapes after
+//! [`Shape::Move`] exist for it: the I-beam, the hand, the hourglass and
+//! the rest a browser needs. [`Shape::from_wire`] maps the wire's 35
+//! values onto these 17 masks, and says on each arm why an alias is one.
+//! Still **named shapes only**: `CursorType::kCustom` (CSS
+//! `cursor: url(…)`) has no bitmap path, deliberately — Chromium's own
+//! Wayland backend prefers compositor-drawn shapes for the same reason
+//! nitro draws its cursor at all.
+//!
+//! Who wins, in order (`Server::cursor_choice`): a drag in flight owns
+//! the shape; then the server's own chrome — a band that would really
+//! resize takes its double arrow, and the title bar and buttons take the
+//! arrow — whatever the client asked for; then, over the client's own
+//! content only, the client's request; then the arrow. A request lasts
+//! one continuous period of pointer focus: leave the window and the
+//! client must ask again, `wl_pointer`'s rule.
 //!
 //! # Not themed, and deliberately
 //!
@@ -70,6 +89,7 @@
 
 use nitro_core::{Color, IRect, Rect};
 use nitro_raster::{Canvas, Image, PixelFormat};
+use nitro_wire::types::CursorShape;
 
 /// Width and height of a cursor image in **logical** pixels: the side of
 /// the ASCII art, and the device side at scale 1.
@@ -88,9 +108,11 @@ type Mask = [&'static [u8; 24]; 24];
 
 /// Which cursor the pointer is showing.
 ///
-/// The server chooses, from the frame region under the pointer; there is
-/// no client-facing request for one yet. The order is the order of
-/// [`Shape::ALL`], which is the order the masks are stored in.
+/// The server chooses from the frame region under the pointer, and a
+/// client with pointer focus may choose over its own content
+/// ([`Shape::from_wire`]). The order is the order of [`Shape::ALL`],
+/// which is the order the masks are stored in — so new variants are
+/// **appended**, never inserted, or [`Shape::index`] would mispaint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Shape {
     /// The ordinary pointer: `left_ptr`, hotspot at its tip.
@@ -106,18 +128,51 @@ pub enum Shape {
     SizeBDiag,
     /// A title-bar drag in flight: the four-way move cross.
     Move,
+    /// Selectable text: the I-beam.
+    Text,
+    /// Selectable vertical text: the I-beam on its side.
+    VerticalText,
+    /// A link or button: the pointing hand.
+    Hand,
+    /// Something can be grabbed: the open hand.
+    Grab,
+    /// Something is being dragged: the closed hand.
+    Grabbing,
+    /// Busy: the hourglass.
+    Wait,
+    /// Help is available: the arrow with a question mark.
+    Help,
+    /// Precise selection: a thin cross.
+    Crosshair,
+    /// Not allowed here: the slashed ring.
+    NotAllowed,
+    /// Zoom in: the magnifier with a plus.
+    ZoomIn,
+    /// Zoom out: the magnifier with a minus.
+    ZoomOut,
 }
 
 impl Shape {
     /// Every shape, in storage order. `Cursor` holds one converted mask
     /// per entry.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 17] = [
         Self::Arrow,
         Self::SizeHor,
         Self::SizeVer,
         Self::SizeFDiag,
         Self::SizeBDiag,
         Self::Move,
+        Self::Text,
+        Self::VerticalText,
+        Self::Hand,
+        Self::Grab,
+        Self::Grabbing,
+        Self::Wait,
+        Self::Help,
+        Self::Crosshair,
+        Self::NotAllowed,
+        Self::ZoomIn,
+        Self::ZoomOut,
     ];
 
     /// Index into [`Shape::ALL`] and into `Cursor`'s mask array.
@@ -148,17 +203,109 @@ impl Shape {
     /// Where this shape's hotspot sits inside its image, in **logical**
     /// pixels of the art.
     ///
-    /// The arrow's is its tip, at `(0, 0)`, which is what makes its
-    /// covered rect simply the square at the pointer position. Every other
-    /// shape is symmetric about its middle and is centred, because a
-    /// double arrow that resized from its corner would point at one edge
-    /// while grabbing another.
+    /// The rule: **the hotspot is the pixel the glyph points at.** The
+    /// arrow's is its tip, at `(0, 0)`, which is what makes its covered
+    /// rect simply the square at the pointer position, and [`Shape::Help`]
+    /// shares it because its arrow half is the same art. The hand's is
+    /// its fingertip; a magnifier's is the centre of its lens, the point
+    /// a zoom is about. Everything else points at nothing in particular —
+    /// double arrows, the I-beam, the hourglass, the open hand — and is
+    /// symmetric about (or simply centred on) its middle, because a double
+    /// arrow that resized from its corner would point at one edge while
+    /// grabbing another.
+    ///
+    /// An explicit match with no `_`, so a new shape has to say where it
+    /// points.
     #[must_use]
     pub fn hotspot(self) -> (i32, i32) {
+        const CENTRE: (i32, i32) = (CURSOR_SIZE / 2, CURSOR_SIZE / 2);
         match self {
-            Self::Arrow => (0, 0),
-            _ => (CURSOR_SIZE / 2, CURSOR_SIZE / 2),
+            Self::Arrow | Self::Help => (0, 0),
+            // The outline pixel capping the index finger (`HAND` row 0).
+            Self::Hand => (6, 0),
+            // The lens centre (`ZOOM_IN` rows 2–18 are the lens).
+            Self::ZoomIn | Self::ZoomOut => (10, 10),
+            Self::SizeHor
+            | Self::SizeVer
+            | Self::SizeFDiag
+            | Self::SizeBDiag
+            | Self::Move
+            | Self::Text
+            | Self::VerticalText
+            | Self::Grab
+            | Self::Grabbing
+            | Self::Wait
+            | Self::Crosshair
+            | Self::NotAllowed => CENTRE,
         }
+    }
+
+    /// The shape a client's `SetCursor` names, or `None` for
+    /// [`CursorShape::None`] — "hide the cursor".
+    ///
+    /// Every one of the wire's 35 values answers. Seventeen masks cover
+    /// them: where a wire shape has a glyph of its own it gets one, and
+    /// where its glyph would be **identical** to one nitro already draws it
+    /// is an alias, said so on the arm. Three aliases are *not* identical
+    /// glyphs and carry a one-line argument instead: `Progress`, `Cell`,
+    /// and the arrow-plus-badge family (`ContextMenu`, `Alias`, `Copy`).
+    ///
+    /// Exhaustive, with **no `_` arm**: a value added to the wire enum
+    /// fails to compile here rather than silently painting an arrow.
+    #[must_use]
+    pub fn from_wire(shape: CursorShape) -> Option<Self> {
+        Some(match shape {
+            CursorShape::None => return None,
+            // `Default` is the arrow itself. The other three are arrow +
+            // badge (a menu, a link arrow, a plus). nitro draws no
+            // badges today; the arrow is the honest part of the glyph. The
+            // drag-and-drop tasks (#3773/#3774) are where badges would be
+            // revisited — they are not drawn now.
+            CursorShape::Default
+            | CursorShape::ContextMenu
+            | CursorShape::Alias
+            | CursorShape::Copy => Self::Arrow,
+            CursorShape::Help => Self::Help,
+            CursorShape::Pointer => Self::Hand,
+            // `Progress` is "busy but still interactive": elsewhere an
+            // animated or arrow-composited hourglass. nitro animates
+            // nothing, and a second static glyph would claim a difference
+            // in interactivity it cannot show — so the hourglass.
+            CursorShape::Progress | CursorShape::Wait => Self::Wait,
+            // `Cell` is a fat hollow plus where `Crosshair` is a thin
+            // cross; the affordance — aim at a point — is the same and the
+            // art would differ only in stroke weight.
+            CursorShape::Cell | CursorShape::Crosshair => Self::Crosshair,
+            CursorShape::Text => Self::Text,
+            CursorShape::VerticalText => Self::VerticalText,
+            // Identical glyph: the four-way cross, for moving and for
+            // panning in every direction alike.
+            CursorShape::Move | CursorShape::AllScroll => Self::Move,
+            // `NoDrop` is the one of the drag family with a real glyph of
+            // its own elsewhere, and it is this one.
+            CursorShape::NoDrop | CursorShape::NotAllowed => Self::NotAllowed,
+            CursorShape::Grab => Self::Grab,
+            CursorShape::Grabbing => Self::Grabbing,
+            // Identical glyph: a one-way resize shows the double arrow of
+            // its axis in every mainstream theme, and a column/row resize
+            // is the same arrow over a divider nitro does not draw.
+            CursorShape::EResize
+            | CursorShape::WResize
+            | CursorShape::EwResize
+            | CursorShape::ColResize => Self::SizeHor,
+            CursorShape::NResize
+            | CursorShape::SResize
+            | CursorShape::NsResize
+            | CursorShape::RowResize => Self::SizeVer,
+            CursorShape::NwResize | CursorShape::SeResize | CursorShape::NwseResize => {
+                Self::SizeFDiag
+            }
+            CursorShape::NeResize | CursorShape::SwResize | CursorShape::NeswResize => {
+                Self::SizeBDiag
+            }
+            CursorShape::ZoomIn => Self::ZoomIn,
+            CursorShape::ZoomOut => Self::ZoomOut,
+        })
     }
 
     /// The art for this shape.
@@ -170,6 +317,17 @@ impl Shape {
             Self::SizeFDiag => &SIZE_FDIAG,
             Self::SizeBDiag => &SIZE_BDIAG,
             Self::Move => &MOVE,
+            Self::Text => &TEXT,
+            Self::VerticalText => &VERTICAL_TEXT,
+            Self::Hand => &HAND,
+            Self::Grab => &GRAB,
+            Self::Grabbing => &GRABBING,
+            Self::Wait => &WAIT,
+            Self::Help => &HELP,
+            Self::Crosshair => &CROSSHAIR,
+            Self::NotAllowed => &NOT_ALLOWED,
+            Self::ZoomIn => &ZOOM_IN,
+            Self::ZoomOut => &ZOOM_OUT,
         }
     }
 }
@@ -357,9 +515,329 @@ const MOVE: Mask = [
     b"                        ",
 ];
 
+/// Selectable text: the I-beam — a two-pixel stem with serif bars top and
+/// bottom, the shape every toolkit's `xterm`/`text` cursor has. Centred
+/// hotspot: it is symmetric, and the caret lands where its middle is.
+const TEXT: Mask = [
+    b"                        ",
+    b"                        ",
+    b"                        ",
+    b"      ############      ",
+    b"      #..........#      ",
+    b"      #####..#####      ",
+    b"          #..#          ",
+    b"          #..#          ",
+    b"          #..#          ",
+    b"          #..#          ",
+    b"          #..#          ",
+    b"          #..#          ",
+    b"          #..#          ",
+    b"          #..#          ",
+    b"          #..#          ",
+    b"          #..#          ",
+    b"          #..#          ",
+    b"          #..#          ",
+    b"      #####..#####      ",
+    b"      #..........#      ",
+    b"      ############      ",
+    b"                        ",
+    b"                        ",
+    b"                        ",
+];
+
+/// Selectable vertical text: [`TEXT`] turned a quarter, drawn out rather
+/// than rotated at startup so the art stays what is painted.
+const VERTICAL_TEXT: Mask = [
+    b"                        ",
+    b"                        ",
+    b"                        ",
+    b"                        ",
+    b"                        ",
+    b"                        ",
+    b"   ###            ###   ",
+    b"   #.#            #.#   ",
+    b"   #.#            #.#   ",
+    b"   #.#            #.#   ",
+    b"   #.##############.#   ",
+    b"   #................#   ",
+    b"   #................#   ",
+    b"   #.##############.#   ",
+    b"   #.#            #.#   ",
+    b"   #.#            #.#   ",
+    b"   #.#            #.#   ",
+    b"   ###            ###   ",
+    b"                        ",
+    b"                        ",
+    b"                        ",
+    b"                        ",
+    b"                        ",
+    b"                        ",
+];
+
+/// A link or a button: the pointing hand, index finger up, three fingers
+/// curled beside it and the thumb out to the left. Its hotspot is the
+/// **fingertip** — the pixel the glyph points at — not the middle.
+const HAND: Mask = [
+    b"     ####               ",
+    b"     #..#               ",
+    b"     #..#               ",
+    b"     #..#               ",
+    b"     #..####            ",
+    b"     #..#..####         ",
+    b"     #..#..#..####      ",
+    b"     #..#..#..#..#      ",
+    b" #####..#..#..#..#      ",
+    b" #..##..#..#..#..#      ",
+    b" #...#..#..#..#..#      ",
+    b" ##.............##      ",
+    b"  #.............#       ",
+    b"  ##............#       ",
+    b"   #............#       ",
+    b"   ##...........#       ",
+    b"    #..........##       ",
+    b"    ##.........#        ",
+    b"     #.........#        ",
+    b"     #.........#        ",
+    b"     ###########        ",
+    b"                        ",
+    b"                        ",
+    b"                        ",
+];
+
+/// Something can be grabbed: the open hand, four fingers up and the thumb
+/// out. Centred hotspot: an open hand points at nothing in particular.
+const GRAB: Mask = [
+    b"                        ",
+    b"                        ",
+    b"                        ",
+    b"         ####           ",
+    b"      ####..####        ",
+    b"      #..#..#..#        ",
+    b"      #..#..#..####     ",
+    b"      #..#..#..#..#     ",
+    b"      #..#..#..#..#     ",
+    b"  #####..#..#..#..#     ",
+    b"  #..##..#..#..#..#     ",
+    b"  #...#..#..#..#..#     ",
+    b"  ##.............##     ",
+    b"   #.............#      ",
+    b"   ##............#      ",
+    b"    #............#      ",
+    b"    ##...........#      ",
+    b"     #..........##      ",
+    b"     ##.........#       ",
+    b"      #.........#       ",
+    b"      ###########       ",
+    b"                        ",
+    b"                        ",
+    b"                        ",
+];
+
+/// Something is being dragged: [`GRAB`] closed into a fist, knuckles on
+/// top. Centred hotspot, for [`GRAB`]'s reason.
+const GRABBING: Mask = [
+    b"                        ",
+    b"                        ",
+    b"                        ",
+    b"                        ",
+    b"                        ",
+    b"                        ",
+    b"                        ",
+    b"       ##########       ",
+    b"    ####..#..#..###     ",
+    b"    #..#..#..#..#.#     ",
+    b"   ##.............#     ",
+    b"   #..............#     ",
+    b"   #.............##     ",
+    b"   ##............#      ",
+    b"    #............#      ",
+    b"    ##...........#      ",
+    b"     #..........##      ",
+    b"     ##.........#       ",
+    b"      #.........#       ",
+    b"      ###########       ",
+    b"                        ",
+    b"                        ",
+    b"                        ",
+    b"                        ",
+];
+
+/// Busy: an hourglass, with the frame's two bars drawn as closed boxes so
+/// it reads at 1×. Centred hotspot.
+const WAIT: Mask = [
+    b"                        ",
+    b"                        ",
+    b"     ##############     ",
+    b"     #............#     ",
+    b"     #............#     ",
+    b"     ##############     ",
+    b"      #..........#      ",
+    b"      ##........##      ",
+    b"       ##......##       ",
+    b"        ##....##        ",
+    b"         ##..##         ",
+    b"          #..#          ",
+    b"          #..#          ",
+    b"         ##..##         ",
+    b"        ##....##        ",
+    b"       ##......##       ",
+    b"      ##........##      ",
+    b"      #..........#      ",
+    b"     ##############     ",
+    b"     #............#     ",
+    b"     #............#     ",
+    b"     ##############     ",
+    b"                        ",
+    b"                        ",
+];
+
+/// Help is available: the arrow with a question mark beside it. The arrow
+/// half is [`ARROW`]'s art verbatim, so its hotspot is the arrow's tip.
+const HELP: Mask = [
+    b"#                       ",
+    b"##             ######   ",
+    b"#.#           ##....##  ",
+    b"#..#          #......#  ",
+    b"#...#         #..##..#  ",
+    b"#....#        #####..#  ",
+    b"#.....#         ##..##  ",
+    b"#......#        #..##   ",
+    b"#.......#       #..#    ",
+    b"#........#      ####    ",
+    b"#.........#     #..#    ",
+    b"#..........#    #..#    ",
+    b"#......#####    ####    ",
+    b"#...#..#                ",
+    b"#..# #..#               ",
+    b"#.#  #..#               ",
+    b"##    #..#              ",
+    b"#     #..#              ",
+    b"       #..#             ",
+    b"       #..#             ",
+    b"        #..#            ",
+    b"        #..#            ",
+    b"         ##             ",
+    b"                        ",
+];
+
+/// Precise selection: a thin cross whose centre is a 2×2 black spot, so
+/// the aimed-at pixel is visible rather than hidden under white. Centred.
+const CROSSHAIR: Mask = [
+    b"                        ",
+    b"                        ",
+    b"          ####          ",
+    b"          #..#          ",
+    b"          #..#          ",
+    b"          #..#          ",
+    b"          #..#          ",
+    b"          #..#          ",
+    b"          #..#          ",
+    b"          #..#          ",
+    b"  #########..#########  ",
+    b"  #........##........#  ",
+    b"  #........##........#  ",
+    b"  #########..#########  ",
+    b"          #..#          ",
+    b"          #..#          ",
+    b"          #..#          ",
+    b"          #..#          ",
+    b"          #..#          ",
+    b"          #..#          ",
+    b"          #..#          ",
+    b"          ####          ",
+    b"                        ",
+    b"                        ",
+];
+
+/// The action is not allowed: a ring with a `╲` bar across it. Centred.
+const NOT_ALLOWED: Mask = [
+    b"                        ",
+    b"                        ",
+    b"       ##########       ",
+    b"      ##........##      ",
+    b"    ###..........###    ",
+    b"    #....######....#    ",
+    b"   ##...##    ##...##   ",
+    b"  ##.....##    ##...##  ",
+    b"  #...#...##    ##...#  ",
+    b"  #..###...##    ##..#  ",
+    b"  #..# ##...##    #..#  ",
+    b"  #..#  ##...##   #..#  ",
+    b"  #..#   ##...##  #..#  ",
+    b"  #..#    ##...## #..#  ",
+    b"  #..##    ##...###..#  ",
+    b"  #...##    ##...#...#  ",
+    b"  ##...##    ##.....##  ",
+    b"   ##...##    ##...##   ",
+    b"    #....######....#    ",
+    b"    ###..........###    ",
+    b"      ##........##      ",
+    b"       ##########       ",
+    b"                        ",
+    b"                        ",
+];
+
+/// Zoom in: a magnifier with `+` in the lens. Its hotspot is the **lens
+/// centre**, `(10, 10)`, which is the point the zoom is about — not the
+/// image's middle, which falls on the rim.
+const ZOOM_IN: Mask = [
+    b"                        ",
+    b"                        ",
+    b"        #####           ",
+    b"      ###...###         ",
+    b"    ###.......###       ",
+    b"    #...........#       ",
+    b"   ##...........##      ",
+    b"   #......#......#      ",
+    b"  ##......#......##     ",
+    b"  #.......#.......#     ",
+    b"  #....#######....#     ",
+    b"  #.......#.......#     ",
+    b"  ##......#......##     ",
+    b"   #......#......#      ",
+    b"   ##...........##      ",
+    b"    #...........###     ",
+    b"    ###.......##..##    ",
+    b"      ###...#####..##   ",
+    b"        #####   ##..##  ",
+    b"                 ##..## ",
+    b"                  ##..##",
+    b"                   ##..#",
+    b"                    ####",
+    b"                        ",
+];
+
+/// Zoom out: [`ZOOM_IN`] with `−` in the lens, and the same hotspot.
+const ZOOM_OUT: Mask = [
+    b"                        ",
+    b"                        ",
+    b"        #####           ",
+    b"      ###...###         ",
+    b"    ###.......###       ",
+    b"    #...........#       ",
+    b"   ##...........##      ",
+    b"   #.............#      ",
+    b"  ##.............##     ",
+    b"  #...............#     ",
+    b"  #....#######....#     ",
+    b"  #...............#     ",
+    b"  ##.............##     ",
+    b"   #.............#      ",
+    b"   ##...........##      ",
+    b"    #...........###     ",
+    b"    ###.......##..##    ",
+    b"      ###...#####..##   ",
+    b"        #####   ##..##  ",
+    b"                 ##..## ",
+    b"                  ##..##",
+    b"                   ##..#",
+    b"                    ####",
+    b"                        ",
+];
+
 /// Every cursor's ARGB8888 pixels, built once.
 ///
-/// One allocation per shape, at startup: `6 × 24 × 24 × 4` = **13 824
+/// One allocation per shape, at startup: `17 × 24 × 24 × 4` = **39 168
 /// bytes**, noted in `docs/budget.md`. The value is immutable afterwards,
 /// so painting never allocates and never touches a mask again — which is
 /// what makes a shape change cost the two damage rects and nothing else.
@@ -566,7 +1044,7 @@ impl Default for Cursor {
 
 #[cfg(test)]
 mod tests {
-    use super::{CURSOR_SIZE, Cursor, HOTSPOT, Shape};
+    use super::{CURSOR_SIZE, Cursor, CursorShape, HOTSPOT, Shape};
     use crate::wm::Edges;
     use nitro_core::IRect;
     use nitro_raster::Canvas;
@@ -612,16 +1090,82 @@ mod tests {
         }
         // The figure `docs/budget.md` carries.
         let bytes: usize = c.shapes.iter().map(Vec::len).sum();
-        assert_eq!(bytes, 13_824);
+        assert_eq!(bytes, 39_168);
+        // Storage order is variant order: `index()` is `self as usize`, so
+        // a reordered `ALL` would mispaint every cursor silently.
+        for (i, s) in Shape::ALL.iter().enumerate() {
+            assert_eq!(s.index(), i, "{s:?}");
+        }
     }
 
+    /// Every wire value answers, and `None` is the only one that hides.
     #[test]
-    fn tip_pixel_is_opaque() {
+    fn every_wire_shape_maps_to_a_drawable_shape() {
+        let mut hidden = 0;
+        for raw in 0..=34u16 {
+            let wire = CursorShape::from_raw(raw).expect("0..=34 are all listed");
+            match Shape::from_wire(wire) {
+                None => {
+                    assert_eq!(wire, CursorShape::None);
+                    hidden += 1;
+                }
+                Some(s) => assert!(Shape::ALL.contains(&s), "{wire:?}"),
+            }
+        }
+        assert_eq!(hidden, 1);
+        // And every mask is reachable from the wire, or it is dead art.
+        for s in Shape::ALL {
+            assert!(
+                (0..=34u16)
+                    .filter_map(|r| CursorShape::from_raw(r).ok())
+                    .any(|w| Shape::from_wire(w) == Some(s)),
+                "{s:?} is unreachable from SetCursor"
+            );
+        }
+    }
+
+    /// The aliases are the glyph they claim to be.
+    #[test]
+    fn the_aliases_are_the_glyph_they_claim() {
+        let same = |a: CursorShape, b: CursorShape| {
+            assert_eq!(Shape::from_wire(a), Shape::from_wire(b), "{a:?} vs {b:?}");
+        };
+        same(CursorShape::ColResize, CursorShape::EResize);
+        same(CursorShape::EwResize, CursorShape::WResize);
+        same(CursorShape::RowResize, CursorShape::NResize);
+        same(CursorShape::NwseResize, CursorShape::SeResize);
+        same(CursorShape::NeswResize, CursorShape::SwResize);
+        same(CursorShape::AllScroll, CursorShape::Move);
+        same(CursorShape::Progress, CursorShape::Wait);
+        same(CursorShape::Cell, CursorShape::Crosshair);
+        same(CursorShape::NoDrop, CursorShape::NotAllowed);
+        same(CursorShape::Copy, CursorShape::Default);
+        assert_eq!(Shape::from_wire(CursorShape::Default), Some(Shape::Arrow));
+        assert_eq!(Shape::from_wire(CursorShape::Text), Some(Shape::Text));
+        assert_eq!(Shape::from_wire(CursorShape::Pointer), Some(Shape::Hand));
+        assert_eq!(
+            Shape::from_wire(CursorShape::ColResize),
+            Some(Shape::SizeHor)
+        );
+    }
+
+    /// The hotspot is ink: the pixel the glyph points at is drawn, so a
+    /// hotspot that drifted off the art (a mask edited without its
+    /// `hotspot()` arm) fails here.
+    #[test]
+    fn each_shape_hotspot_is_inside_its_art() {
         let c = Cursor::new();
-        let (hx, hy) = HOTSPOT;
-        assert_eq!(pixel(&c, Shape::Arrow, hx as usize, hy as usize)[3], 0xFF);
-        // The tip is outline, so black.
-        assert_eq!(pixel(&c, Shape::Arrow, 0, 0), [0x00, 0x00, 0x00, 0xFF]);
+        for s in Shape::ALL {
+            let (hx, hy) = s.hotspot();
+            assert!((0..CURSOR_SIZE).contains(&hx) && (0..CURSOR_SIZE).contains(&hy));
+            let (x, y) = (hx as usize, hy as usize);
+            let art = rows(&c, s);
+            assert_ne!(
+                art[y].as_bytes()[x],
+                b' ',
+                "{s:?}'s hotspot ({x}, {y}) is not ink:\n{art:#?}"
+            );
+        }
     }
 
     #[test]
@@ -694,6 +1238,11 @@ mod tests {
             Shape::SizeFDiag,
             Shape::SizeBDiag,
             Shape::Move,
+            Shape::Text,
+            Shape::VerticalText,
+            Shape::Wait,
+            Shape::Crosshair,
+            Shape::NotAllowed,
         ] {
             let art = rows(&c, shape);
             for y in 0..n {

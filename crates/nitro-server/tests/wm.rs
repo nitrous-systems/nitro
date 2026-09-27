@@ -27,7 +27,9 @@ use nitro_server::wm;
 use nitro_server::{BackendKind, Config, run};
 use nitro_wire::client::Connection;
 use nitro_wire::msg::ServerMsg;
-use nitro_wire::types::{ButtonState, Layer, NodeId, WindowState, caps, window_flags};
+use nitro_wire::types::{
+    ButtonState, CursorShape, ErrorCode, Layer, NodeId, WindowState, caps, window_flags,
+};
 
 /// evdev `BTN_RIGHT`.
 const BTN_RIGHT: u32 = 0x111;
@@ -3108,7 +3110,7 @@ fn the_cursor_changes_shape_over_a_resize_band() {
 ///
 /// The claim the spec was reaching for is that a shape change *by
 /// itself* adds no scene damage, and that is held where it is true:
-/// `Server::set_cursor_shape` damages through `damage_cursor_at`, which
+/// `Server::set_cursor` damages through `damage_cursor_at`, which
 /// calls `OutputState::damage_cursor` — the accounting
 /// `cursor_only_is_true_only_when_nothing_else_is_pending` exists to
 /// keep separable from content damage. Asserting a number here would be
@@ -3148,6 +3150,384 @@ fn hovering_a_band_changes_the_cursor_and_nothing_else() {
     );
 
     drop(conn);
+    h.quit();
+}
+
+// ---------------------------------------------------------------------
+// #3771 (M5-E): a client choosing the cursor shape with `SetCursor`
+// ---------------------------------------------------------------------
+
+/// A client connection that has opted into `CURSOR`.
+fn cursor_client(h: &Harness, name: &str) -> Connection {
+    let mut conn = h.client(name);
+    assert_ne!(
+        conn.caps() & caps::CURSOR,
+        0,
+        "the server advertises CURSOR"
+    );
+    conn.client_caps(caps::CURSOR).unwrap();
+    conn.flush().unwrap();
+    conn
+}
+
+/// Send one `SetCursor` and wait for the server to have acted on it.
+fn set_cursor(h: &Harness, conn: &mut Connection, shape: CursorShape) {
+    conn.set_cursor(shape).unwrap();
+    conn.flush().unwrap();
+    // No reply exists to wait for; a round trip through the control
+    // socket after the server has drained the wire is what `settle` is.
+    std::thread::sleep(Duration::from_millis(20));
+    h.settle();
+}
+
+/// The I-beam is centred on the pointer and taller than it is wide: the
+/// two facts that tell it from the arrow (whose ink starts *at* the
+/// pointer) and from `size_hor` (wider than tall) without naming a pixel.
+fn assert_ibeam(ink: &[(u32, u32)], at: (f32, f32), what: &str) {
+    assert!(!ink.is_empty(), "{what}: no cursor drawn");
+    let (bx, by, bw, bh) = bbox(ink);
+    assert!(
+        bx < at.0 as u32 && by < at.1 as u32,
+        "{what}: the ink starts at ({bx}, {by}) for a pointer at {at:?} — \
+         hung off the pointer like the arrow, not centred like the I-beam"
+    );
+    assert!(bh > bw, "{what}: the cursor is {bw}x{bh}, not an I-beam");
+}
+
+/// A client holding pointer focus picks a shape and the screen shows it;
+/// `CursorShape::None` hides the cursor entirely.
+#[test]
+fn a_client_that_holds_the_pointer_sets_the_cursor_shape() {
+    let mut h = Harness::start("set-cursor", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = cursor_client(&h, "set-cursor");
+    let win = make_window(&mut conn, &mut inbox, 1, "text", WIN, RED, 0, 1);
+    park(&mut h);
+    let control = h.shot();
+    let f = win.frame(true);
+
+    let (cx, cy) = win.content();
+    h.point_at(cx, cy, OUT);
+    h.settle();
+    set_cursor(&h, &mut conn, CursorShape::Text);
+    let area = Rect::new(cx - 30.0, cy - 30.0, 60.0, 60.0);
+    assert_ibeam(
+        &cursor_ink(&h.shot(), &control, area, f),
+        (cx, cy),
+        "Text over the content",
+    );
+
+    // Hidden: nothing of the cursor at all, so the area is the control.
+    set_cursor(&h, &mut conn, CursorShape::None);
+    let ink = cursor_ink(&h.shot(), &control, area, f);
+    assert!(
+        ink.is_empty(),
+        "a hidden cursor still drew {} px",
+        ink.len()
+    );
+
+    // And back: a request replaces the previous one.
+    set_cursor(&h, &mut conn, CursorShape::Default);
+    let ink = cursor_ink(&h.shot(), &control, area, f);
+    assert_eq!(
+        (bbox(&ink).0, bbox(&ink).1),
+        (cx as u32, cy as u32),
+        "Default is the arrow, hung off its tip"
+    );
+
+    drop(conn);
+    h.quit();
+}
+
+/// A client without pointer focus is **ignored, not disconnected**: the
+/// focus can leave between its send and the server's receipt, and every
+/// error in this protocol is fatal.
+#[test]
+fn a_client_without_the_pointer_is_ignored_and_survives() {
+    let mut h = Harness::start("set-cursor-nofocus", OUT.0, OUT.1);
+    let mut inbox_a = Inbox::default();
+    let mut a = cursor_client(&h, "a");
+    let win_a = make_window(&mut a, &mut inbox_a, 1, "a", WIN, RED, 0, 1);
+    let mut inbox_b = Inbox::default();
+    let mut b = cursor_client(&h, "b");
+    let win_b = make_window(&mut b, &mut inbox_b, 1, "b", WIN, BLUE, 0, 1);
+    park(&mut h);
+
+    // On the bare desktop: nobody holds the pointer.
+    let (px, py) = (OUT.0 as f32 - 40.0, OUT.1 as f32 - 40.0);
+    h.point_at(px, py, OUT);
+    h.settle();
+    let before = h.shot();
+    set_cursor(&h, &mut a, CursorShape::Text);
+    let area = Rect::new(px - 30.0, py - 30.0, 60.0, 30.0 + 38.0);
+    assert!(
+        cursor_ink(&h.shot(), &before, area, Rect::new(0.0, 0.0, 0.0, 0.0)).is_empty(),
+        "a request with the pointer on the desktop changed the cursor"
+    );
+
+    // Over the *other* client's window: A still does not hold it.
+    let (cx, cy) = win_b.content();
+    h.point_at(cx, cy, OUT);
+    h.settle();
+    let before = h.shot();
+    set_cursor(&h, &mut a, CursorShape::Text);
+    let area = Rect::new(cx - 30.0, cy - 30.0, 60.0, 60.0);
+    assert!(
+        cursor_ink(&h.shot(), &before, area, win_b.frame(true)).is_empty(),
+        "A's request changed the cursor over B's window"
+    );
+    assert_eq!(h.stat("clients"), 2, "an unfocused SetCursor is not fatal");
+
+    // A is still a working connection: a commit is still presented.
+    a.tx().fill_solid(NodeId(2), GREEN).commit(2).unwrap();
+    a.flush().unwrap();
+    park(&mut h);
+    let shot = h.shot();
+    let (ax, ay) = win_a.content();
+    // B was created second and sits on top in the cascade; sample the
+    // part of A that B does not cover.
+    let fa = win_a.frame(true);
+    let fb = win_b.frame(true);
+    let sample = if fa.x < fb.x {
+        (fa.x + 4.0, ay)
+    } else {
+        (ax, fa.y + fa.h - 4.0)
+    };
+    assert_eq!(
+        rgb(shot.pixel(sample.0 as u32, sample.1 as u32)),
+        to_rgb(GREEN),
+        "A's commit after the ignored SetCursor was not presented"
+    );
+
+    drop(a);
+    drop(b);
+    h.quit();
+}
+
+/// The server's own chrome beats a client's shape: over a resize band the
+/// double arrow shows, over the title bar the arrow — and back on the
+/// content the client's shape returns **without a re-send**, because the
+/// decorations are part of the window and pointer focus never left it.
+#[test]
+fn the_servers_own_chrome_beats_a_client_shape() {
+    let mut h = Harness::start("set-cursor-chrome", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = cursor_client(&h, "chrome");
+    let win = make_window(&mut conn, &mut inbox, 1, "chrome", WIN, RED, 0, 1);
+    park(&mut h);
+    let control = h.shot();
+    let f = win.frame(true);
+
+    let (cx, cy) = win.content();
+    h.point_at(cx, cy, OUT);
+    h.settle();
+    set_cursor(&h, &mut conn, CursorShape::Text);
+    let area = |x: f32, y: f32| Rect::new(x - 30.0, y - 30.0, 60.0, 60.0);
+    assert_ibeam(
+        &cursor_ink(&h.shot(), &control, area(cx, cy), f),
+        (cx, cy),
+        "Text over the content",
+    );
+
+    // The right band, mid-height: `size_hor`, wider than tall.
+    let (ex, ey) = (f.x + f.w - 0.5, f.y + f.h / 2.0);
+    h.point_at(ex, ey, OUT);
+    h.settle();
+    let (_, _, bw, bh) = bbox(&cursor_ink(&h.shot(), &control, area(ex, ey), f));
+    assert!(
+        bw > bh,
+        "over the band the cursor is {bw}x{bh}: the client's I-beam beat the server's chrome"
+    );
+
+    // The title bar: the arrow, hung off its tip.
+    let (tx, ty) = win.title_bar();
+    h.point_at(tx, ty, OUT);
+    h.settle();
+    let ink = cursor_ink(&h.shot(), &control, area(tx, ty), f);
+    let (bx, by, _, _) = bbox(&ink);
+    assert_eq!(
+        (bx, by),
+        (tx as u32, ty as u32),
+        "over the title bar the arrow wins"
+    );
+
+    // Back on the content, no re-send: the I-beam again.
+    h.point_at(cx, cy, OUT);
+    h.settle();
+    assert_ibeam(
+        &cursor_ink(&h.shot(), &control, area(cx, cy), f),
+        (cx, cy),
+        "back on the content without a re-send",
+    );
+
+    drop(conn);
+    h.quit();
+}
+
+/// The documented rule for focus leaving and returning: a request lasts
+/// **one continuous period of pointer focus**. Off the window and back,
+/// the arrow shows until the client asks again — `wl_pointer`'s rule, and
+/// what Chromium already does by re-applying its cursor on every enter.
+#[test]
+fn leaving_the_window_forgets_the_clients_shape() {
+    let mut h = Harness::start("set-cursor-leave", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = cursor_client(&h, "leave");
+    let win = make_window(&mut conn, &mut inbox, 1, "leave", WIN, RED, 0, 1);
+    park(&mut h);
+    let control = h.shot();
+    let f = win.frame(true);
+    let (cx, cy) = win.content();
+    let area = Rect::new(cx - 30.0, cy - 30.0, 60.0, 60.0);
+
+    h.point_at(cx, cy, OUT);
+    h.settle();
+    set_cursor(&h, &mut conn, CursorShape::Text);
+    assert_ibeam(&cursor_ink(&h.shot(), &control, area, f), (cx, cy), "Text");
+
+    // Off the window entirely, then back onto the content.
+    park(&mut h);
+    h.point_at(cx, cy, OUT);
+    h.settle();
+    let ink = cursor_ink(&h.shot(), &control, area, f);
+    assert_eq!(
+        (bbox(&ink).0, bbox(&ink).1),
+        (cx as u32, cy as u32),
+        "re-entering the window shows the arrow until the client re-sends"
+    );
+
+    // And the re-send works.
+    set_cursor(&h, &mut conn, CursorShape::Text);
+    assert_ibeam(
+        &cursor_ink(&h.shot(), &control, area, f),
+        (cx, cy),
+        "Text re-sent",
+    );
+
+    drop(conn);
+    h.quit();
+}
+
+/// A client's shape change is cursor damage and nothing else, exactly
+/// like a hover-driven one — and it **answers** the motion that put the
+/// pointer there, so no deferred flip waits out its deadline for it.
+///
+/// Baselines are read after the pointer is parked on the content and the
+/// server has gone quiet, so no deferral episode from the setup is
+/// outstanding and the counters speak for the thirty `SetCursor`s alone.
+#[test]
+fn a_client_shape_change_is_cursor_damage_and_nothing_else() {
+    let mut h = Harness::start("set-cursor-cost", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = cursor_client(&h, "cost");
+    let win = make_window(&mut conn, &mut inbox, 1, "cost", WIN, RED, 0, 1);
+    park(&mut h);
+    let (cx, cy) = win.content();
+    h.point_at(cx, cy, OUT);
+    h.settle();
+
+    let layouts = h.stat("text_layouts");
+    let renders = h.stat("icon_renders");
+    let timeouts = h.stat("defer_timeouts");
+    for i in 0..30 {
+        let shape = if i % 2 == 0 {
+            CursorShape::Text
+        } else {
+            CursorShape::Pointer
+        };
+        set_cursor(&h, &mut conn, shape);
+    }
+    assert_eq!(h.stat("text_layouts"), layouts, "SetCursor shaped text");
+    assert_eq!(
+        h.stat("icon_renders"),
+        renders,
+        "SetCursor rasterised an icon"
+    );
+    assert_eq!(
+        h.stat("defer_timeouts"),
+        timeouts,
+        "a SetCursor must not sit out a deferral deadline"
+    );
+
+    drop(conn);
+    h.quit();
+}
+
+/// `ClientCaps` rule 3 applies to `SetCursor` although `CURSOR` carries
+/// no server→client message: a client that never listed it is confused,
+/// which — unlike losing pointer focus — is fatal.
+#[test]
+fn a_set_cursor_without_the_capability_is_fatal() {
+    let mut h = Harness::start("set-cursor-nocap", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("nocap");
+    let win = make_window(&mut conn, &mut inbox, 1, "nocap", WIN, RED, 0, 1);
+    let (cx, cy) = win.content();
+    h.point_at(cx, cy, OUT);
+    h.settle();
+    conn.set_cursor(CursorShape::Text).unwrap();
+    conn.flush().unwrap();
+    let (code, detail) = expect(&mut conn, &mut inbox.0, "Error", |m| match m {
+        ServerMsg::Error(e) => Some((e.code, e.msg.clone())),
+        _ => None,
+    });
+    assert_eq!(code, ErrorCode::Protocol);
+    assert!(detail.contains("CURSOR"), "{detail}");
+    wait_for("the client to be gone", || h.stat("clients") == 0);
+    h.quit();
+}
+
+/// Strict enums, as everywhere: a shape the wire does not list is a
+/// decode error and the connection dies. The pure-decode half is pinned in
+/// `nitro-wire`; this pins the server's handling of it.
+#[test]
+fn an_unlisted_cursor_shape_is_a_decode_error() {
+    let h = Harness::start("set-cursor-bad", OUT.0, OUT.1);
+    let mut raw = UnixStream::connect(&h.wire_path).expect("connect");
+    raw.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let frame = |op: u16, payload: &[u8]| -> Vec<u8> {
+        let mut f = nitro_wire::header::encode(payload.len() as u32, op, 0).to_vec();
+        f.extend_from_slice(payload);
+        f
+    };
+    let name = b"bad-shape";
+    let mut hello = Vec::new();
+    hello.extend_from_slice(&nitro_wire::VERSION.to_le_bytes());
+    hello.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    hello.extend_from_slice(name);
+    raw.write_all(&frame(nitro_wire::msg::Hello::OP, &hello))
+        .expect("send Hello");
+    // `ClientCaps { CURSOR }`, so the only thing wrong is the shape.
+    raw.write_all(&frame(
+        nitro_wire::msg::ClientCaps::OP,
+        &caps::CURSOR.to_le_bytes(),
+    ))
+    .expect("send ClientCaps");
+    // Shape 35: one past `ZoomOut`.
+    raw.write_all(&frame(nitro_wire::msg::SetCursor::OP, &35u16.to_le_bytes()))
+        .expect("send SetCursor");
+
+    // Read frames until the `Error`, then the connection closes.
+    let mut error = None;
+    loop {
+        let mut head = [0u8; nitro_wire::header::SIZE];
+        if raw.read_exact(&mut head).is_err() {
+            break;
+        }
+        let hdr = nitro_wire::header::decode(&head).expect("a valid header");
+        let mut body = vec![0u8; hdr.len as usize];
+        raw.read_exact(&mut body).expect("a body");
+        if hdr.op == nitro_wire::msg::Error::OP {
+            let m = ServerMsg::decode(hdr.op, &body, &mut nitro_wire::FdQueue::new())
+                .expect("the Error decodes");
+            error = Some(m);
+        }
+    }
+    let Some(ServerMsg::Error(e)) = error else {
+        panic!("no Error before the close");
+    };
+    assert_eq!(e.code, ErrorCode::Protocol, "{}", e.msg);
+    wait_for("the client to be gone", || h.stat("clients") == 0);
     h.quit();
 }
 
