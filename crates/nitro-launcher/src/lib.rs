@@ -694,8 +694,15 @@ fn install(ui: &mut Ui<Launcher>, ids: Ids) {
             ShellEvent::Overview { active: false, .. } => {
                 if s.visible {
                     hide(s, ui);
+                } else {
+                    // A refused `Enter`/`Toggle` (locked) is answered
+                    // `active: false`: what it was asked for must not
+                    // outlive it into the next, unrelated show.
+                    s.error_pending = false;
+                    s.opened_by = Trigger::Tap;
                 }
             }
+
             // Focus loss, as near as a `NO_FOCUS` overlay can observe it.
             // See [`focus_moved`] for why it is somebody *else* taking
             // focus rather than this window losing it.
