@@ -486,10 +486,14 @@ client that speaks its four-message socket protocol, hosted by
     and a skipped line — never a stopped desktop. Scales are clamped to
     0.5–8 rather than trusted: `scale = 20` would render the desktop at
     twenty times and leave nothing clickable with which to undo it,
-    including the settings app. `keyboard.repeat` is refused **by name**
-    rather than falling into "unknown key", because nothing in nitro
-    repeats keys yet and a setting that appears to work and changes
-    nothing costs a user an afternoon.
+    including the settings app. `keyboard.repeat` (`<delay_ms>,<rate_hz>`,
+    default `600,25`, rate `0` = off) is refused — with a warning, not
+    clamped — outside 100–2000 ms and 0–100/s, so a typo cannot make a
+    key fire hundreds of times a second. It is also the key that waited
+    for its engine: until the server synthesised repeats it was refused
+    **by name**, because a setting that appears to work and changes
+    nothing costs a user an afternoon. The key landed with the repeat
+    timer, not before it (`docs/settings.md` § `keyboard.repeat`).
 
     A configured position moves the output in **both** spaces — the
     desktop layout windows are placed in and the device rectangle the

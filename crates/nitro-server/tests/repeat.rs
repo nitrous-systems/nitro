@@ -15,7 +15,7 @@ use nitro_server::keyboard::Keyboard;
 use nitro_server::{Config, run};
 use nitro_wire::client::Connection;
 use nitro_wire::msg::ServerMsg;
-use nitro_wire::types::{ButtonState, Layer, NodeId, caps};
+use nitro_wire::types::{ButtonState, Layer, NodeId, caps, mod_mask};
 
 const OUT: (u32, u32) = (640, 480);
 const WIN: Size = Size::new(200.0, 120.0);
@@ -42,6 +42,7 @@ struct Harness {
     dir: PathBuf,
     path: PathBuf,
     wire_path: PathBuf,
+    shell_path: PathBuf,
     config_dir: PathBuf,
     config_path: PathBuf,
     input: FakeInput,
@@ -63,11 +64,13 @@ impl Harness {
         let input = FakeInput::new().expect("eventfd");
         config.fake_input = Some(input.clone());
         let wire_path = config.wire_path.clone();
+        let shell_path = config.shell_path.clone();
         let thread = std::thread::spawn(move || run(config));
         let h = Self {
             dir,
             path,
             wire_path,
+            shell_path,
             config_dir,
             config_path,
             input,
@@ -78,7 +81,12 @@ impl Harness {
             UnixStream::connect(&h.path).is_ok()
         });
         wait_for("the wire socket", || h.wire_path.exists());
+        wait_for("the shell socket", || h.shell_path.exists());
         h
+    }
+
+    fn shell(&self, name: &str) -> Connection {
+        Connection::connect(&self.shell_path, name).expect("shell connect")
     }
 
     fn client(&self, name: &str) -> Connection {
@@ -482,5 +490,76 @@ fn an_idle_server_is_not_woken_by_the_repeat_timer() {
     assert_eq!(h.stat("key_repeats"), before);
     assert_eq!(h.stat("key_repeating"), 0);
     drop(conn);
+    h.quit();
+}
+
+#[test]
+fn a_release_withheld_for_a_shell_still_ends_the_repeat() {
+    // The tripwire for where the cancel lives. A shell's binding fires
+    // while `a` is held; the release of `a` then arrives inside the
+    // withheld window and is *not delivered*. The repeat must end anyway:
+    // the cancel sits at the top of `route_key`, before every early
+    // return. Were it moved onto the delivery path, the release would be
+    // swallowed with the repeat still armed, and once the shell answered
+    // the timer would type `a` into the app for ever.
+    //
+    // A long delay (400 ms) so the whole sequence happens before the
+    // first repeat is due: the per-fire backstop never gets a chance to
+    // stop it for us, and the only thing that can is the release.
+    if !has_keymap() {
+        return;
+    }
+    let mut h = Harness::start("withheld", "keyboard.repeat = 400,5\n");
+    let mut seen = Vec::new();
+    let mut app = h.client("withheld-app");
+    let win = make_window(&mut app, &mut seen, 1);
+
+    let mut shell = h.shell("withheld-shell");
+    let mut shell_seen = Vec::new();
+    shell.bind_key(9, mod_mask::SUPER, 0).unwrap();
+    shell.flush().unwrap();
+    wait_for("the binding", || h.stat("hotkeys") == 1);
+    let withheld_before = h.stat("keys_withheld");
+
+    h.key(KEY_A, true);
+    assert_eq!(h.stat("key_repeating"), 1, "armed");
+    // The bare-Super tap: the binding fires on the Super release.
+    h.key(KEY_LEFTMETA, true);
+    h.key(KEY_LEFTMETA, false);
+    h.key(KEY_A, false);
+    assert!(
+        h.stat("keys_withheld") > withheld_before,
+        "the release of `a` was withheld (else this test proves nothing)"
+    );
+    assert_eq!(
+        h.stat("key_repeating"),
+        0,
+        "the withheld release still cancelled"
+    );
+
+    // The shell answers; ordinary routing resumes.
+    expect(&mut shell, &mut shell_seen, "the HotKey", |m| match m {
+        ServerMsg::HotKey(k) if k.id == 9 => Some(()),
+        _ => None,
+    });
+    shell.commit(1).unwrap();
+    shell.flush().unwrap();
+
+    // The original press may still be unread in the socket; it carries
+    // the harness's input clock. A synthesised repeat is stamped with the
+    // monotonic clock, far beyond it.
+    collect(&mut app, &mut seen, 700);
+    let repeats: Vec<_> = presses(&seen, win, KEY_A)
+        .into_iter()
+        .filter(|k| k.time_ns > h.time_ns)
+        .collect();
+    assert!(
+        repeats.is_empty(),
+        "`a` kept repeating after its release: {repeats:?}"
+    );
+    assert_eq!(h.stat("key_repeating"), 0);
+
+    drop(shell);
+    drop(app);
     h.quit();
 }

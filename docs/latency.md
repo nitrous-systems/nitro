@@ -405,6 +405,10 @@ Three further things, unchanged and re-confirmed:
 
 - **Idle really is zero.** Not "low" — zero frames in five seconds with a
   client connected and visible, and now also with a timerfd in the loop.
+  (The key-repeat timer added later is a second timerfd on the same rule —
+  armed only while a key is held — so it does not change this; its
+  `key_repeating` stat is 0 at idle, pinned by
+  `an_idle_server_is_not_woken_by_the_repeat_timer`.)
 - **Frame pacing is exact.** 16 666 µs mean, min 16 654, max 16 675.
 - **The two views of latency agree**, now to 0.2 ms.
 

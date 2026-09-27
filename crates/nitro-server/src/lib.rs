@@ -7,8 +7,9 @@
 //! [`nitro_kms::FakeBackend`] with a [`input::FakeSource`]; `main.rs` only
 //! turns environment variables into a `Config`.
 //!
-//! Event loop (level-triggered epoll, no timers — an idle server never
-//! wakes):
+//! Event loop (level-triggered epoll; two timerfds, the deferred-flip
+//! deadline and key repeat, each armed only while it has something to do —
+//! so an idle server still never wakes):
 //!
 //! | fd                 | on readable                                         |
 //! |--------------------|-----------------------------------------------------|
@@ -3937,7 +3938,8 @@ impl Server {
     /// go to — grab, focus, lock, a shell's pending hotkey — and stops
     /// instead of sending if it is not. Every path that moves the
     /// recipient already stops the repeat; this is the backstop for the
-    /// ones that do so lazily (a grab on a window that stopped showing).
+    /// ones that do so lazily (a grab on a window that stopped showing),
+    /// and it covers the session going inactive too.
     ///
     /// The key is re-resolved against the **current** modifier state
     /// ([`Keyboard::resolve_held`]), and its `time_ns` is now: a repeat
@@ -3954,7 +3956,9 @@ impl Server {
         };
         let grab = self.grab_target().filter(|w| self.scene.admits_window(*w));
         let focus = self.focus.filter(|w| self.scene.admits_window(*w));
-        if grab.or(focus) != Some(held.window) || self.withheld(held.window) {
+        // Inactive (a VT switch): the `Disable` arm already stopped it;
+        // this is the half that catches a missed cancel.
+        if !self.active || grab.or(focus) != Some(held.window) || self.withheld(held.window) {
             self.stop_key_repeat();
             return;
         }

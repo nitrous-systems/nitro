@@ -254,15 +254,16 @@ runs it locally, `just fake-shot` grabs a PNG from it.
 
 ## Event loop
 
-Level-triggered epoll, and exactly one timer. An idle server never
+Level-triggered epoll, and exactly two timers. An idle server never
 wakes: with nothing changing there is no damage, so no frame is painted,
 so no flip completes, so nothing becomes readable. `top` shows 0.0 % and
 `voluntary_ctxt_switches` stops counting — including with a client
-connected and its window on screen. The one timer is the deferred-flip
-deadline below, and it is armed **only** while a flip is actually being
-held, so it does not cost the idle case anything: measured on the box,
-five seconds of idle after a deferral is 0 frames, 0 CPU ticks and
-`voluntary_ctxt_switches` flat.
+connected and its window on screen. The two timers are the deferred-flip
+deadline below and the key-repeat timer (see [Key repeat](#key-repeat)),
+and each is armed **only** while it has something to do — a flip actually
+being held, a key actually held down — so **idle is still zero wakeups**:
+measured on the box, five seconds of idle after a deferral is 0 frames,
+0 CPU ticks and `voluntary_ctxt_switches` flat, and `key_repeating` is 0.
 
 | fd                        | on readable                                                              |
 |---------------------------|--------------------------------------------------------------------------|
@@ -271,6 +272,7 @@ five seconds of idle after a deferral is 0 frames, 0 CPU ticks and
 | libinput                  | dispatch, convert to `InputEvent`, route, then update the scene and paint if anything moved |
 | input uevent socket       | a device appeared or went away: rescan `NITRO_INPUT_DIR`, add/remove libinput paths, register any new fd, reset xkb if a device left |
 | defer timer               | a held cursor-only flip's deadline passed: count a `defer_timeouts` and paint without the client's answer |
+| repeat timer              | the held key's next repeat is due: re-check the recipient, send it one more `Key` press resolved against the current modifiers, re-arm for the next one. Armed on a delivered press, disarmed on release — see [Key repeat](#key-repeat) |
 | config inotify            | something changed in the directory `server.conf` lives in: drain the queue, and if our file was named, reload the configuration. An inotify fd with nothing queued is simply not readable, so a desktop nobody is configuring pays one fd in the set and **zero wakeups** — the same bargain the defer timerfd and the uevent socket make |
 | signal self-pipe          | SIGTERM/SIGINT → orderly shutdown (`signal-hook`'s `low_level::pipe` on a `UnixDatagram` pair) |
 | SIGHUP self-pipe          | re-read and apply `server.conf`. A **second** datagram pair with its own fd and token, because a self-pipe carries no payload: with one pair the loop would learn that *a* signal arrived and could not tell "reload" from "shut down" |
@@ -833,6 +835,37 @@ sit waiting to be reported as a multi-second latency by some unrelated
 frame later on — which is precisely what an earlier version did, once
 reporting 33 seconds.
 
+### Key repeat
+
+libinput reports one press and one release however long a key is held,
+so the server synthesises the presses in between (`src/repeat.rs`): every
+client gets repeat at the one rate `keyboard.repeat` sets
+(`docs/settings.md`). A delivered press arms an absolute-deadline
+`CLOCK_MONOTONIC` timerfd for `delay_ms`; each expiry sends the key again
+and re-arms `1/rate_hz` after the previous deadline — never before now, so
+a late wakeup sends one repeat rather than a burst. A `KEYMAP` client is
+never repeated into: it repeats on its own from `Keymap`'s
+`rate_hz`/`delay_ms`.
+
+Only a key that reached a client repeats — hotkeys, shell bindings, a
+popup's Escape and withheld keys return before delivery — and never a
+modifier or lock key. One key repeats at a time, the newest; a modifier
+press leaves it running and each repeat is re-resolved against the
+current state, so `a` then Shift repeats `A`.
+
+**The cancellation invariant:** a repeat stops on its key's release
+**whatever happens to that release** — the check sits at the top of
+`route_key`, before every early return, so a release swallowed as
+withheld (a shell's pending hotkey) or consumed by a chord still ends it.
+Moving it onto the delivery path would leave a key typing for ever; the
+test `a_release_withheld_for_a_shell_still_ends_the_repeat` pins it. It
+also stops on the press of another non-modifier key, a focus change, a
+grab change, every xkb reset (VT switch, keyboard unplugged, keymap
+reload), `SeatEvent::Disable`, and a reload that changes the repeat. As a
+backstop, each expiry re-checks that the session is active and the
+recipient is still the window the press went to, and stops instead of
+sending if not.
+
 ## Statistics
 
 `stats` returns these keys, in this order. The paint and latency windows
@@ -890,6 +923,8 @@ looking for.
 | `exclusive_zones`        | Windows reserving screen space off an output edge. |
 | `grabbed`                | 1 while a shell client holds a keyboard grab. A 1 with no launcher on screen is a stuck grab. |
 | `keys_withheld`          | Keys dropped because a shell's `BindKey` binding had fired and the shell had not answered yet, so routing them by focus would have typed them into whatever application was focused (`docs/shell.md` §A binding buys its client a turn). Cumulative, and normally 0: a non-zero value means someone types faster than the shell wakes, which is the race the counter exists to make visible. |
+| `key_repeats`            | Key presses synthesised by key repeat, cumulative (`keyboard.repeat`). |
+| `key_repeating`          | 1 while a key is being repeated, else 0. **0 on an idle desktop** — a 1 with no key held is a stuck repeat, which is what this is here to catch. |
 | `selection_transfers`    | Owner descriptors relayed to a requester (`SendSelection` → `SelectionData`), cumulative. |
 | `selection_eof`          | Clipboard requests the server answered itself with an EOF descriptor — no selection, a type not offered, the owner gone or replaced, or the per-connection cap — cumulative. |
 | `selections_pending`     | Requests parked waiting for an owner's `SendSelection`. Returns to 0 once every owner has answered; a stuck non-zero value names a slow owner. |

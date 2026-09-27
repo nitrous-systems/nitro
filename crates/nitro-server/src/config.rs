@@ -962,7 +962,6 @@ mod tests {
             "output.X.primary = maybe",
             "output.X.rotation = 90",
             "keyboard = de",
-            "keyboard.repeat = 300,25",
             "keyboard.repeat = 300",
             "keyboard.repeat = ,",
             "keyboard.repeat = -1,25",

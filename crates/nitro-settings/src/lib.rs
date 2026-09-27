@@ -658,6 +658,13 @@ pub struct Settings {
     /// Empty when there is no server to ask, which is exactly when the
     /// row should say nothing extra.
     modes: Vec<(String, String)>,
+    /// The repeat sliders' seed when the file said nothing about
+    /// `keyboard.repeat` — [`conf::REPEAT_DEFAULT`] — and `None` when it
+    /// did. `Row::seeded_scale`'s rule: sliders still sitting on the seed
+    /// write no line, so an untouched Apply does not pin today's default
+    /// into the file; but a file that spelled a value out, even the
+    /// default, has it written back, because that was the user's choice.
+    seeded_repeat: Option<(u32, u32)>,
 }
 
 impl Settings {
@@ -677,6 +684,7 @@ impl Settings {
             status: String::new(),
             scheme_writes: 0,
             modes: Vec::new(),
+            seeded_repeat: Some(conf::REPEAT_DEFAULT),
         }
     }
 
@@ -1332,6 +1340,7 @@ fn init(s: &mut Settings, ui: &mut Ui<Settings>, ids: Ids) {
     load_audio(s, ui, ids);
 
     let conf = load_conf(s);
+    s.seeded_repeat = seed_repeat(&conf.keyboard);
     fill_keyboard(ui, ids, &conf.keyboard);
     fill_appearance(ui, ids, &conf.theme);
 
@@ -1861,12 +1870,17 @@ fn collect(s: &Settings, ui: &Ui<Settings>, ids: Ids) -> (Conf, Vec<String>) {
         layout: field_text(ui, ids.layout),
         variant: field_text(ui, ids.variant),
         options: field_text(ui, ids.options),
-        // The sliders showing exactly the default write **no** line, as an
-        // untouched scale writes none: a `keyboard.repeat = 600,25` the
-        // user never chose would pin today's default into their file. A
-        // file that spelled the default out loses the line on Apply, which
-        // changes nothing the server does.
-        repeat: Some(repeat_values(ui, ids)).filter(|r| *r != conf::REPEAT_DEFAULT),
+        // Sliders still on their seed write **no** line, as an untouched
+        // scale writes none — see `Settings::seeded_repeat`. A file that
+        // named a value (the default included) has no seed, so its line
+        // is always written back.
+        repeat: {
+            let now = repeat_values(ui, ids);
+            match s.seeded_repeat {
+                Some(seed) if seed == now => None,
+                _ => Some(now),
+            }
+        },
     };
     // The colour section is carried over from the file rather than
     // rendered from the widgets, and it is the one place this dialog
@@ -1916,6 +1930,8 @@ fn apply(s: &mut Settings, ui: &mut Ui<Settings>, ids: Ids) {
         set_status(s, ui, ids, &format!("could not save: {e}"));
         return;
     }
+    // The file now says what it says: a written line is the user's.
+    s.seeded_repeat = seed_repeat(&conf.keyboard);
     let verdict = match control::wait_for_reload(&control, before, s.reload_wait) {
         control::Applied::Reloaded => "applied".to_owned(),
         control::Applied::Rejected => "server rejected: see log".to_owned(),
@@ -1938,6 +1954,7 @@ fn apply(s: &mut Settings, ui: &mut Ui<Settings>, ids: Ids) {
 fn revert(s: &mut Settings, ui: &mut Ui<Settings>, ids: Ids) {
     s.reverts += 1;
     let conf = load_conf(s);
+    s.seeded_repeat = seed_repeat(&conf.keyboard);
     fill_keyboard(ui, ids, &conf.keyboard);
     fill_appearance(ui, ids, &conf.theme);
     for r in s.rows.clone() {
@@ -2079,6 +2096,15 @@ pub fn rate_text(v: f32) -> String {
         "off".to_owned()
     } else {
         format!("{r} /s")
+    }
+}
+
+/// The repeat sliders' seed for a file: the default when it says
+/// nothing, none when it names a value. See `Settings::seeded_repeat`.
+fn seed_repeat(k: &KeyboardConf) -> Option<(u32, u32)> {
+    match k.repeat {
+        Some(_) => None,
+        None => Some(conf::REPEAT_DEFAULT),
     }
 }
 

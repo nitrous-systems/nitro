@@ -355,6 +355,47 @@ fn the_server_parser_reads_back_what_we_write() {
 }
 
 #[test]
+fn an_explicit_repeat_line_survives_an_untouched_apply_and_no_line_stays_none() {
+    // `seeded_scale`'s rule for the repeat sliders. A file that says
+    // nothing gets no line from an Apply that did not touch them — the
+    // default stays free to change — while a file that spelled one out,
+    // even the default itself, keeps it.
+    for (seed, expect_line) in [
+        (
+            "keyboard.repeat = 600,25\n",
+            Some("keyboard.repeat = 600,25\n"),
+        ),
+        (
+            "keyboard.repeat = 300,40\n",
+            Some("keyboard.repeat = 300,40\n"),
+        ),
+        ("keyboard.layout = de\n", None),
+    ] {
+        let dir = scratch("repeat-seed");
+        let path = dir.join(conf::FILE_NAME);
+        std::fs::write(&path, seed).expect("seed");
+        let mut h = harness_in(
+            &dir,
+            Settings::new()
+                .with_config_path(path.clone())
+                .with_audio_dirs(Vec::new())
+                .with_reload_wait(Duration::from_millis(50)),
+        );
+        h.settle();
+        // Change something else, then Apply.
+        set_field(&mut h, names::VARIANT, "nodeadkeys");
+        do_action(&mut h, names::APPLY, "click");
+        let text = std::fs::read_to_string(&path).expect("written");
+        match expect_line {
+            Some(line) => assert!(text.contains(line), "{seed:?} lost its line:\n{text}"),
+            None => assert!(!text.contains("keyboard.repeat"), "{seed:?}:\n{text}"),
+        }
+        h.quit();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
 fn the_repeat_sliders_write_keyboard_repeat_and_zero_is_off() {
     let dir = scratch("repeat");
     let path = dir.join(conf::FILE_NAME);
@@ -387,12 +428,13 @@ fn the_repeat_sliders_write_keyboard_repeat_and_zero_is_off() {
     assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
     assert!(!parsed.keyboard.repeat().enabled());
 
-    // Back to the default: no line at all, as an untouched scale.
+    // Moved back to the default values: the file named a value, so the
+    // line is the user's and is written, default or not.
     set_value(&mut h, names::REPEAT_DELAY, "600");
     set_value(&mut h, names::REPEAT_RATE, "25");
     do_action(&mut h, names::APPLY, "click");
     let text = std::fs::read_to_string(&path).expect("written");
-    assert!(!text.contains("keyboard.repeat"), "{text}");
+    assert!(text.contains("keyboard.repeat = 600,25\n"), "{text}");
 
     // Revert puts the sliders back from the file.
     std::fs::write(&path, "keyboard.repeat = 200,60\n").expect("rewrite");

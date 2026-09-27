@@ -881,7 +881,7 @@ fn garbage_in_the_file_does_not_stop_the_server_or_lose_the_configuration() {
          =\n\
          output.Virtual-1.scale = wide\n\
          output.Virtual-1.rotation = 90\n\
-         keyboard.repeat = 300,25\n\
+         keyboard.repeat = fast\n\
          \u{0}\u{0}\u{0}\n",
     );
     assert_eq!(h.request_line("reload\n"), "ok");
