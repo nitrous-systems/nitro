@@ -1717,7 +1717,6 @@ still lists the bit sends nothing. Never on a remote link, where `KEYMAP`
 is not advertised; once advertised, the bit does not retract for the
 session (a failed re-export keeps the previous keymap).
 
-
 **The descriptor.** A **sealed memfd** — `memfd_create(MFD_ALLOW_SEALING)`
 plus `F_ADD_SEALS` with `F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL`, as
 `CreateBuffer` demands and for the same `SIGBUS` reason — to be mapped
@@ -1729,7 +1728,6 @@ frame's descriptors per `sendmsg`, header included, as always. The server
 additionally seals it `F_SEAL_WRITE`; a client must not rely on that (it
 maps `MAP_PRIVATE` anyway), but it is what lets one file be shared by every
 client without any of them being able to change what the others map.
-
 
 **`rate_hz` and `delay_ms` are for the client to repeat with.** They
 are `server.conf`'s `keyboard.repeat` (default 25/s after 600 ms), or
@@ -1774,7 +1772,6 @@ describe the state *after*. `Modifiers` follows the `Key` (Wayland's
 order), so a client evaluating the keycode through its own `xkb_state`
 does so before applying the change the key caused, and then converges on
 the server's post-event masks. Unchanged masks are silence.
-
 
 ### `TextMetrics` — 0x8301
 
