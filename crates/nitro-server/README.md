@@ -755,7 +755,8 @@ without keysym or text, which is a far better failure mode for a display
 server than refusing to start. The chords that never reach a client are
 the compositor's, and `docs/wm.md` has the whole table: **Ctrl+Alt** for
 the console escape hatches (Backspace quits, F1..F12 switch VT),
-**Alt+Tab** for the MRU focus cycle, and **Super** for the
+**Alt+Tab** for the MRU focus cycle, **Alt+F4** to close (by convention
+alone, so only the bare chord), and **Super** for the
 window-management shortcuts (`Q` close, `M` maximize, `F` fullscreen,
 `H` minimize, `←`/`→` tile). `Super+Enter` was reserved for the launcher
 in M3-A and is no longer a compositor chord: a shell client binds it with

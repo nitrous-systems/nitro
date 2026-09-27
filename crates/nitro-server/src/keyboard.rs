@@ -338,7 +338,7 @@ pub enum Hotkey {
     /// Alt+Tab / Alt+Shift+Tab: walk the MRU order. `true` = forward, to
     /// the less recently used.
     CycleFocus(bool),
-    /// Super+Q: close the focused window.
+    /// Super+Q or Alt+F4: close the focused window.
     Close,
     /// Super+M: toggle maximize.
     ToggleMaximize,
@@ -358,9 +358,17 @@ pub enum Hotkey {
 ///
 /// The compositor's own chords are Ctrl+Alt (the VT and quit escape
 /// hatches, which every Linux console user already knows), Alt+Tab (which
-/// no application may have, because it is how you leave one) and Super
+/// no application may have, because it is how you leave one), Super
 /// (which is reserved for the desktop by convention, so no client loses a
-/// binding it could reasonably expect).
+/// binding it could reasonably expect) and one Alt chord, Alt+F4. That one
+/// is *not* in a reserved namespace — an application could in principle
+/// want it — and is taken purely on convention: it has closed the window
+/// on every mainstream desktop for decades, it is the first thing a user
+/// arriving from one reaches for, and an application that binds it anyway
+/// would surprise its own users. Only the bare chord: Ctrl+Alt+F4 is a VT
+/// switch (handled above it), and Alt+Shift+F4 / Super+Alt+F4 stay the
+/// application's.
+
 #[must_use]
 pub fn hotkey(keysym: u32, mods: Mods) -> Option<Hotkey> {
     if mods.ctrl_alt() {
@@ -388,6 +396,11 @@ pub fn hotkey(keysym: u32, mods: Mods) -> Option<Hotkey> {
     {
         return Some(Hotkey::CycleFocus(!mods.shift));
     }
+    // Alt+F4, bare: close. Ctrl+Alt+F4 never gets here (VT switch above).
+    if mods.alt && !mods.logo && !mods.ctrl && !mods.shift && keysym == xkb::keysyms::KEY_F4 {
+        return Some(Hotkey::Close);
+    }
+
     if !mods.logo || mods.alt || mods.ctrl {
         return None;
     }
@@ -601,6 +614,29 @@ mod tests {
         );
         assert!(is_alt(xkb::keysyms::KEY_Alt_L));
         assert!(!is_alt(xkb::keysyms::KEY_Tab));
+    }
+
+    /// Alt+F4 closes; Ctrl+Alt+F4 is still a VT switch, and the other
+    /// Alt+F4 variants stay the application's.
+    #[test]
+    fn alt_f4_closes_but_ctrl_alt_f4_switches_vt() {
+        assert_eq!(hotkey(xkb::keysyms::KEY_F4, ALT), Some(Hotkey::Close));
+        assert_eq!(
+            hotkey(xkb::keysyms::KEY_F4, CTRL_ALT),
+            Some(Hotkey::SwitchVt(4))
+        );
+        assert_eq!(
+            hotkey(xkb::keysyms::KEY_F4, Mods { shift: true, ..ALT }),
+            None
+        );
+        assert_eq!(
+            hotkey(xkb::keysyms::KEY_F4, Mods { logo: true, ..ALT }),
+            None
+        );
+        assert_eq!(hotkey(xkb::keysyms::KEY_F4, LOGO), None);
+        // Only F4: the rest of the F row under Alt belongs to applications.
+        assert_eq!(hotkey(xkb::keysyms::KEY_F3, ALT), None);
+        assert_eq!(hotkey(xkb::keysyms::KEY_F5, ALT), None);
     }
 
     /// Skipped, not failed, on a machine with no xkb keymap data.

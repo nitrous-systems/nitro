@@ -534,14 +534,20 @@ Server-global, and deliberately confined to three chord families nothing
 else can reasonably claim: `Ctrl+Alt` (the console escape hatches every
 Linux user already knows), `Alt+Tab` (which no application may have,
 because it is how you leave one) and `Super` (reserved for the desktop by
-convention).
+convention) — plus one exception, `Alt+F4`. That chord is *not* in a
+reserved namespace, and an application could in principle want it; it is
+taken purely on convention, because it has closed the window on every
+mainstream desktop for decades and is the first thing a user arriving from
+one reaches for. Only the bare chord: `Ctrl+Alt+F4` stays a VT switch, and
+`Alt+Shift+F4`, `Super+Alt+F4` and the rest of the `Alt+F`*n* row stay the
+application's.
 
 | chord | action |
 |---|---|
 | `Ctrl+Alt+Backspace` | quit the server (development safety valve) |
 | `Ctrl+Alt+F1`…`F12` | switch VT |
 | `Alt+Tab` / `Alt+Shift+Tab` | cycle focus in MRU order |
-| `Super+Q` | close the focused window |
+| `Super+Q` / `Alt+F4` | close the focused window |
 | `Super+M` | toggle maximize |
 | `Super+F` | toggle fullscreen |
 | `Super+H` | minimize |

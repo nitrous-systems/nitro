@@ -291,8 +291,8 @@ on the release, so a shell can implement press-and-hold.
 
 Three priorities, in this order, in `Server::key`:
 
-1. **The compositor's own chords.** `Ctrl+Alt+*`, `Alt+Tab` and the
-   `Super` window-management table (`docs/wm.md`). Not bindable: `BindKey`
+1. **The compositor's own chords.** `Ctrl+Alt+*`, `Alt+Tab`, `Alt+F4` and
+   the `Super` window-management table (`docs/wm.md`). Not bindable: `BindKey`
    on one is `Error { Protocol }`. `Ctrl+Alt+F2` must switch VT with a
    wedged shell, and `Alt+Tab` is how you leave an application that has
    taken the keyboard.

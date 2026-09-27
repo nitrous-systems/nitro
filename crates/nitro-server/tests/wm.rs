@@ -39,6 +39,8 @@ const KEY_M: u32 = 50;
 const KEY_H: u32 = 35;
 const KEY_TAB: u32 = 15;
 const KEY_LEFTALT: u32 = 56;
+const KEY_LEFTCTRL: u32 = 29;
+const KEY_F4: u32 = 62;
 const KEY_LEFTMETA: u32 = 125;
 const KEY_LEFT: u32 = 105;
 const KEY_RIGHT: u32 = 106;
@@ -1016,6 +1018,64 @@ fn super_q_closes_and_super_m_maximizes_the_focused_window() {
     h.key(KEY_Q, true);
     h.key(KEY_Q, false);
     h.key(KEY_LEFTMETA, false);
+    h.settle();
+    expect(&mut conn, &mut inbox.0, "Closed", |m| match m {
+        ServerMsg::Closed(c) if c.window == win.root => Some(()),
+        _ => None,
+    });
+
+    drop(conn);
+    h.quit();
+}
+
+/// Alt+F4 is the conventional close chord and maps to the same action as
+/// Super+Q; Ctrl+Alt+F4 must stay a VT switch, and Alt+F4 with nothing
+/// focused is a no-op.
+#[test]
+fn alt_f4_closes_the_focused_window_and_ctrl_alt_f4_does_not() {
+    let mut h = Harness::start("altf4", OUT.0, OUT.1);
+
+    // Nothing to close: no panic, the server carries on.
+    h.key(KEY_LEFTALT, true);
+    h.key(KEY_F4, true);
+    h.key(KEY_F4, false);
+    h.key(KEY_LEFTALT, false);
+    h.settle();
+    assert_eq!(h.stat("windows"), 0);
+
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("altf4");
+    let win = make_window(&mut conn, &mut inbox, 1, "altf4", WIN, RED, 0, 1);
+    h.settle();
+
+    // Ctrl+Alt+F4 is a VT switch (a no-op here, with no seat): the window
+    // must not be asked to close.
+    h.key(KEY_LEFTCTRL, true);
+    h.key(KEY_LEFTALT, true);
+    h.key(KEY_F4, true);
+    h.key(KEY_F4, false);
+    h.key(KEY_LEFTALT, false);
+    h.key(KEY_LEFTCTRL, false);
+    h.settle();
+    // Give a wrongly sent `Closed` time to arrive before looking for it.
+    let until = Instant::now() + Duration::from_millis(200);
+    while Instant::now() < until {
+        conn.flush().unwrap();
+        conn.poll(&mut inbox.0).unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        !inbox
+            .0
+            .iter()
+            .any(|m| matches!(m, ServerMsg::Closed(c) if c.window == win.root)),
+        "Ctrl+Alt+F4 closed the window"
+    );
+
+    h.key(KEY_LEFTALT, true);
+    h.key(KEY_F4, true);
+    h.key(KEY_F4, false);
+    h.key(KEY_LEFTALT, false);
     h.settle();
     expect(&mut conn, &mut inbox.0, "Closed", |m| match m {
         ServerMsg::Closed(c) if c.window == win.root => Some(()),
