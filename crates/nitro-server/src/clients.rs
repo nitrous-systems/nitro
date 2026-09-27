@@ -116,7 +116,11 @@ pub struct WireClient {
     /// `PopupDone` unconditionally safe — a client that never listed the
     /// bit can never own a popup to be told about. The clipboard reads it
     /// too: a `DATA` op needs the bit listed, and `SelectionOffer` is
-    /// pushed only to clients that listed it. The bits not yet
+    /// pushed only to clients that listed it. `OUTPUTS` gates the output
+    /// messages (`Server::output_gate`, read by `send_output_list`,
+    /// `notify_outputs` and `work_area_changed`): `ListOutputs` needs it
+    /// listed, and `OutputWorkArea` goes only to clients that listed it —
+    /// shell clients included. The bits not yet
     /// advertised are still recorded, because the rule this exists for
     /// cannot be honoured retroactively by a server that threw the list
     /// away.
@@ -758,7 +762,10 @@ fn apply_msg(
         | ClientMsg::SetWindowStateFor(_)
         | ClientMsg::Outputs(_)
         | ClientMsg::Lock(_)
-        | ClientMsg::Unlock(_) => Ok(()),
+        | ClientMsg::Unlock(_)
+        // `ListOutputs` (M5-D) is not a shell op, but is answered on
+        // receipt for `Outputs`' reason, by `Server::list_outputs`.
+        | ClientMsg::ListOutputs(_) => Ok(()),
         ClientMsg::CreatePopup(m) => {
             if m.id.is_none() || client.nodes.contains_key(&m.id) {
                 return Err(ApplyError::new(
@@ -863,7 +870,6 @@ fn apply_msg(
         ClientMsg::SetCursor(_)
         | ClientMsg::StartMove(_)
         | ClientMsg::StartResize(_)
-        | ClientMsg::ListOutputs(_)
         | ClientMsg::StartDrag(_)
         | ClientMsg::AcceptDrop(_)
         | ClientMsg::FinishDrag(_) => Err(ApplyError::new(

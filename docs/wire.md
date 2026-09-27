@@ -250,8 +250,9 @@ offer, the MIME list and the descriptor relay are shared, and
 `RequestSelection` names which of the two it means with a one-byte
 `DataSource`. Two bits would mean two copies of the same four messages.
 
-**Of bits 8–14, only `POPUP` and `DATA` are advertised yet**: `POPUP`
-(M5-G, #3773) always, `DATA` (M5-H, #3774) on every **local** link and
+**Of bits 8–14, only `POPUP`, `OUTPUTS` and `DATA` are advertised yet**:
+`POPUP` (M5-G, #3773) and `OUTPUTS` (M5-D, #3770) always, `DATA` (M5-H,
+#3774) on every **local** link and
 never on a remote one — every leg of a transfer carries a descriptor,
 which TCP cannot (see [Descriptors on a remote link](#descriptors-on-a-remote-link)).
 The drag half of `DATA` is still refused until M5-I. M5-A froze the protocol surface ahead of the behaviour, deliberately,
@@ -584,8 +585,8 @@ Assigned in blocks of 0x100 so a block can grow without renumbering.
 | `0x8402` | `WindowInfo` | shell (see `SHELL`) |
 | `0x8403` | `WindowListEnd` | shell (see `SHELL`) |
 | `0x8404` | `WindowGone` | shell (see `SHELL`) |
-| `0x8405` | `OutputInfo` | shell (see `SHELL`) |
-| `0x8406` | `OutputsEnd` | shell (see `SHELL`) |
+| `0x8405` | `OutputInfo` | shell (see `SHELL` **or** `OUTPUTS`) |
+| `0x8406` | `OutputsEnd` | shell (see `SHELL` **or** `OUTPUTS`) |
 | `0x8407` | `OutputGone` | shell (see `SHELL` **or** `OUTPUTS`) |
 | `0x8408` | `OutputWorkArea` | shell (see `SHELL` **or** `OUTPUTS`) |
 | `0x8501` | `SelectionOffer` | data transfer (see `DATA`) |
@@ -894,6 +895,14 @@ The snapshot is **complete at `OutputsEnd`** — that terminator is what
 makes it safe for the work area to arrive in a second message rather than
 as a field on `OutputInfo`; see
 [`OutputWorkArea`](#outputworkarea--0x8408).
+
+A client that has not listed `OUTPUTS` in its `ClientCaps` is refused
+with `Error { Protocol }` (rule 3) — a shell client included; a shell that
+wants the list without opting in sends `Outputs`. If a watcher later
+narrows `OUTPUTS` away with a second `ClientCaps`, it stays subscribed but
+is sent no output message until it widens again (rule 1). A work-area
+change sends each opted-in watcher one `OutputWorkArea` per output and
+nothing else — no `OutputInfo`, no `OutputsEnd`.
 
 The answers live in the `0x84xx` shell block. That wart is deliberate: see
 the note under the op-code tables, and the access rule under
@@ -1938,7 +1947,10 @@ a `WindowState` event, so it learns what actually happened.
 ### `Outputs` — 0x040b
 
 Empty payload. Answered on receipt with one `OutputInfo` per connected
-output and an `OutputsEnd`, and subscribes the connection to hotplug.
+output — each followed by its `OutputWorkArea` if the client listed
+`OUTPUTS` in `ClientCaps` — and an `OutputsEnd`, and subscribes the
+connection to hotplug. A shell client that listed no `ClientCaps` never
+receives an `OutputWorkArea`.
 
 ### `Lock` — 0x040c
 

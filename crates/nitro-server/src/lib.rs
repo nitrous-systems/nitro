@@ -1326,13 +1326,15 @@ fn is_shell_op(msg: &ClientMsg) -> bool {
 /// implement.
 ///
 /// The protocol surface landed ahead of the behaviour (task #3767), so the
-/// seven ops below decode but are refused: `Server::caps` advertises none
+/// six ops below decode but are refused: `Server::caps` advertises none
 /// of their bits, so no conformant client sends one, and a client that
 /// does anyway hears why instead of being silently ignored. The two popup
 /// ops left this list with #3773 (`caps::POPUP`), and the three clipboard
 /// ops with #3774 (`caps::DATA`). The drag ops share `DATA` but stay here
 /// until M5-I implements them: a client that saw the bit for the
 /// clipboard and starts a drag is told so rather than ignored.
+/// `ListOutputs` left with #3770 (`caps::OUTPUTS`); it is answered by
+/// `Server::list_outputs` and never reaches this function.
 ///
 /// `ClientCaps` (0x0003) is deliberately **not** here: it is accepted and
 /// recorded, because the rule that makes it safe — the server must not
@@ -1349,7 +1351,6 @@ fn is_m5_op(msg: &ClientMsg) -> bool {
         ClientMsg::SetCursor(_)
             | ClientMsg::StartMove(_)
             | ClientMsg::StartResize(_)
-            | ClientMsg::ListOutputs(_)
             | ClientMsg::StartDrag(_)
             | ClientMsg::AcceptDrop(_)
             | ClientMsg::FinishDrag(_)
@@ -3656,7 +3657,7 @@ impl Server {
         }
         self.notify_window_gone(win);
         if had_zone {
-            self.reflow_work_area();
+            self.work_area_changed();
         }
         if self.focus == Some(win) {
             self.focus = None;
@@ -4600,7 +4601,7 @@ impl Server {
         // re-sized for it. Guarded on the zone map being non-empty, so a
         // desktop with no shell running pays one `is_empty` per state change.
         if !self.zones.is_empty() {
-            self.reflow_work_area();
+            self.work_area_changed();
         }
         if state == WindowState::Minimized {
             // A window that stops showing takes its menus with it.
@@ -5677,6 +5678,12 @@ impl Server {
             }
             ClientMsg::Commit(commit) => self.commit(token, commit.serial),
             ClientMsg::ClientCaps(m) => self.record_client_caps(token, m.caps),
+            // The one unprivileged op answered in the shell block. It has
+            // its own arm, *before* the catch-all, so it never reaches
+            // `is_shell_op` or `handle_shell_msg`: it shares no code path
+            // with the eleven shell ops, and so grants nothing they do.
+            // Answered on receipt, for `Outputs`' reason: a question.
+            ClientMsg::ListOutputs(_) => self.list_outputs(token),
             // The clipboard ops are answered on receipt, never buffered for
             // the commit. For `SendSelection` that is load-bearing:
             // buffering it would park a descriptor in `pending` until a
@@ -5774,10 +5781,16 @@ impl Server {
     /// advertising it there would be a promise the transport cannot keep.
     /// It is the fact `REMOTE` states about buffers, expressed as the
     /// absence of a bit because `DATA` has one.
+    ///
+    /// `OUTPUTS` (M5-D) is unconditional, for `WM`'s reason: the server
+    /// always owns an output list, so `ListOutputs` is a promise it can
+    /// always keep — on every link, a remote one included, since output
+    /// geometry carries no descriptor.
     fn caps(&self, shell: bool, remote: bool) -> u32 {
         let mut caps = nitro_wire::types::caps::WM
             | nitro_wire::types::caps::THEME
-            | nitro_wire::types::caps::POPUP;
+            | nitro_wire::types::caps::POPUP
+            | nitro_wire::types::caps::OUTPUTS;
         if self.text.has_fonts() {
             caps |= nitro_wire::types::caps::TEXT;
         }
@@ -5942,7 +5955,7 @@ impl Server {
                 // The work area just changed, so every window *sized by* it
                 // has to be re-sized: a maximized window must give the bar
                 // its strip immediately, not at the next maximize.
-                self.reflow_work_area();
+                self.work_area_changed();
             }
             shell::WindowOp::Anchor { edges, margin } => {
                 self.zones.set_anchor(win, edges, margin);
@@ -6202,14 +6215,45 @@ impl Server {
         }
     }
 
-    /// Re-apply the geometry of every window whose rectangle is *derived*
-    /// from the work area, after an exclusive zone changed it.
+    /// The work area may have changed (an exclusive zone moved, a bar was
+    /// hidden or went away). Two duties, kept together so a fifth call
+    /// site cannot do one and forget the other:
     ///
-    /// Only `Maximized` windows: a floating window is where the user put it,
-    /// and a fullscreen one covers the output work area or not. This is also
-    /// why a zone is cheap — the reflow is proportional to the number of
-    /// maximized windows, not to the number of windows.
-    fn reflow_work_area(&mut self) {
+    /// 1. re-apply the geometry of every window whose rectangle is
+    ///    *derived* from the work area. Only `Maximized` windows: a
+    ///    floating window is where the user put it, and a fullscreen one
+    ///    covers the output work area or not. This is also why a zone is
+    ///    cheap — the reflow is proportional to the number of maximized
+    ///    windows, not to the number of windows;
+    /// 2. tell the output watchers that listed `OUTPUTS`: one
+    ///    `OutputWorkArea` per output and nothing else — no `OutputInfo`,
+    ///    no `OutputsEnd`, because this is an update, not a snapshot. That
+    ///    cadence is the reason the work area is its own message.
+    fn work_area_changed(&mut self) {
+        self.reflow_maximized();
+        if self.output_watchers.is_empty() {
+            return;
+        }
+        let areas: Vec<msg::OutputWorkArea> = self
+            .output_snapshot()
+            .into_iter()
+            .filter_map(|(_, area)| area)
+            .collect();
+        for token in self.output_watchers.clone() {
+            if !self.output_gate(token).1 {
+                continue;
+            }
+            let Some(client) = self.wire_clients.get_mut(&token) else {
+                continue;
+            };
+            for area in &areas {
+                client.send(&ServerMsg::OutputWorkArea(*area));
+            }
+        }
+    }
+
+    /// Duty 1 of [`Server::work_area_changed`].
+    fn reflow_maximized(&mut self) {
         let maximized: Vec<WindowKey> = self
             .wire_clients
             .values()
@@ -6352,16 +6396,124 @@ impl Server {
         out
     }
 
-    /// Answer an `Outputs`: a snapshot, then `OutputsEnd`.
+    /// An output's work area as the wire carries it: **global device
+    /// pixels**, like `OutputInfo.x/y/w/h`.
+    ///
+    /// The origin is the scene's device `rect`, *not* `desktop_origin`
+    /// (which is the logical desktop space), so the work area and its
+    /// `OutputInfo` share an origin by construction whatever the scale.
+    /// The zone subtraction is `local_work_area`'s, not re-implemented
+    /// here: a hidden bar reserves nothing on the wire either.
+    fn work_area_msg(&self, id: SceneOutputId) -> Option<msg::OutputWorkArea> {
+        let (rect, scale) = self.scene.output_info(id)?;
+        let s = if scale > 0.0 { scale } else { 1.0 };
+        let area = self.local_work_area(id);
+        #[allow(clippy::cast_possible_truncation)]
+        let px = |v: f32| (v * s).round() as i32;
+        Some(msg::OutputWorkArea {
+            id: id.0,
+            area: nitro_core::IRect::new(
+                rect.x + px(area.x),
+                rect.y + px(area.y),
+                px(area.w),
+                px(area.h),
+            ),
+        })
+    }
+
+    /// Every output as the pair a snapshot sends for it, in
+    /// `output_infos` order. One place decides the interleaving.
+    fn output_snapshot(&self) -> Vec<(msg::OutputInfo, Option<msg::OutputWorkArea>)> {
+        self.output_infos()
+            .into_iter()
+            .map(|info| {
+                let area = self
+                    .outputs
+                    .iter()
+                    .find(|o| o.scene_id.0 == info.id)
+                    .and_then(|o| self.work_area_msg(o.scene_id));
+                (info, area)
+            })
+            .collect()
+    }
+
+    /// What this watcher may be sent of the output messages: `(any, work
+    /// areas)`.
+    ///
+    /// `docs/wire.md` § Capability opt-in rule 1: the four output
+    /// messages belong to `SHELL` **or** `OUTPUTS`, and `OutputWorkArea`
+    /// is new with `OUTPUTS`. A shell client (`SHELL`, grandfathered)
+    /// gets `OutputInfo`/`OutputsEnd`/`OutputGone` regardless, but a work
+    /// area only once it listed `OUTPUTS` — which keeps `nitro-bar`, a
+    /// pre-`ClientCaps` client, byte-identical. An ordinary watcher that
+    /// narrowed `OUTPUTS` away with a second `ClientCaps` (rule 5) stays
+    /// subscribed but is sent nothing until it widens again.
+    fn output_gate(&self, token: u64) -> (bool, bool) {
+        let listed = self
+            .wire_clients
+            .get(&token)
+            .is_some_and(|c| c.client_caps & nitro_wire::types::caps::OUTPUTS != 0);
+        (Self::is_shell(token) || listed, listed)
+    }
+
+    /// Answer an `Outputs` or a `ListOutputs`: a snapshot, then
+    /// `OutputsEnd`. The same messages for both, so one function.
     fn send_output_list(&mut self, token: u64) {
-        let infos = self.output_infos();
+        let (any, areas) = self.output_gate(token);
+        if !any {
+            return;
+        }
+        let snapshot = self.output_snapshot();
         let Some(client) = self.wire_clients.get_mut(&token) else {
             return;
         };
-        for info in infos {
+        for (info, area) in snapshot {
             client.send(&ServerMsg::OutputInfo(info));
+            if let Some(area) = area.filter(|_| areas) {
+                client.send(&ServerMsg::OutputWorkArea(area));
+            }
         }
         client.send(&ServerMsg::OutputsEnd(msg::OutputsEnd));
+    }
+
+    /// `ListOutputs` (M5-D): the output snapshot for an unprivileged
+    /// client, and a hotplug subscription. Returns whether the client
+    /// survives.
+    ///
+    /// Grants output enumeration and nothing else: it shares the
+    /// subscription set and the snapshot with the shell's `Outputs`, but
+    /// no code path with `handle_shell_msg`.
+    ///
+    /// `OUTPUTS` must be listed in `ClientCaps` (`docs/wire.md` rule 3):
+    /// a client asking for outputs while claiming not to understand the
+    /// answer is confused. That holds for a **shell** client too — rule 3
+    /// keys on `ClientCaps`, not on the socket; a shell that wants the
+    /// list without opting in sends `Outputs`.
+    fn list_outputs(&mut self, token: u64) -> bool {
+        let listed = self
+            .wire_clients
+            .get(&token)
+            .map(|c| c.client_caps & nitro_wire::types::caps::OUTPUTS != 0);
+        match listed {
+            None => return false,
+            Some(false) => {
+                self.disconnect(
+                    token,
+                    Some((
+                        0,
+                        ErrorCode::Protocol,
+                        "ListOutputs needs `OUTPUTS` listed in ClientCaps".to_owned(),
+                    )),
+                );
+                return false;
+            }
+            Some(true) => {}
+        }
+        if !self.output_watchers.contains(&token) {
+            self.output_watchers.push(token);
+        }
+        self.send_output_list(token);
+        true
     }
 
     /// Tell every subscribed shell client the output list changed.
@@ -6374,16 +6526,23 @@ impl Server {
         if self.output_watchers.is_empty() {
             return;
         }
-        let infos = self.output_infos();
+        let snapshot = self.output_snapshot();
         for token in self.output_watchers.clone() {
+            let (any, areas) = self.output_gate(token);
+            if !any {
+                continue;
+            }
             let Some(client) = self.wire_clients.get_mut(&token) else {
                 continue;
             };
             for id in gone {
                 client.send(&ServerMsg::OutputGone(msg::OutputGone { id: *id }));
             }
-            for info in &infos {
+            for (info, area) in &snapshot {
                 client.send(&ServerMsg::OutputInfo(info.clone()));
+                if let Some(area) = area.filter(|_| areas) {
+                    client.send(&ServerMsg::OutputWorkArea(area));
+                }
             }
             client.send(&ServerMsg::OutputsEnd(msg::OutputsEnd));
         }
@@ -7224,7 +7383,7 @@ impl Server {
     /// down with it (ungated on zones: that part is about popups).
     fn visibility_changed(&mut self, windows: Vec<WindowKey>) {
         if !windows.is_empty() && !self.zones.is_empty() {
-            self.reflow_work_area();
+            self.work_area_changed();
         }
         for win in windows {
             if !self.showing(win) {
@@ -7501,6 +7660,10 @@ mod tests {
                 mime: "text/plain".to_owned(),
             }
             .into(),
+            // `ListOutputs` is answered in the shell block but is not a
+            // shell op: folding it into `handle_shell_msg` would make
+            // output enumeration a privilege again (M5-D).
+            msg::ListOutputs.into(),
         ] {
             assert!(!is_m5_op(&m), "{} is implemented", m.name());
             assert!(!is_shell_op(&m), "{} is not a shell op", m.name());

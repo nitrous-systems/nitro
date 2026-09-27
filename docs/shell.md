@@ -243,7 +243,7 @@ because `clients.rs` cannot know whether the window it just hid holds a
 zone.
 
 **The reflow is immediate and proportional.** When a zone changes,
-`reflow_work_area` re-applies the geometry of every `Maximized` window —
+`work_area_changed` re-applies the geometry of every `Maximized` window —
 and only those. A floating window is where the user put it, and a
 fullscreen one covers the output regardless. So the cost of a zone change
 is the number of maximized windows, not the number of windows, and a
@@ -674,6 +674,19 @@ rather than from `OutputState.refresh_ns`, which stores a period: round-
 tripping it through nanoseconds would report a refresh rate slightly
 different from the mode the kernel actually set.
 
+**The same snapshot is reachable unprivileged** (M5-D). An ordinary client
+that lists `OUTPUTS` in its `ClientCaps` sends `ListOutputs` (0x001b) and
+gets exactly these messages; it joins the same subscription set, so hotplug
+reaches both kinds of watcher identically. `ListOutputs` has its own arm in
+`handle_wire_msg` ahead of the shell dispatch — it never reaches
+`handle_shell_msg`, so it grants output enumeration and nothing else. A
+client that lists `OUTPUTS` (shell or not) also gets one `OutputWorkArea`
+per output in every snapshot, and a fresh one — alone, with no
+`OutputsEnd` — whenever an exclusive zone changes the work area; a shell
+client that sent no `ClientCaps` (today's `nitro-bar`) never sees one.
+Sending `ListOutputs` without `OUTPUTS` listed is `Error { Protocol }`, on
+either socket.
+
 ## Statistics
 
 Seven keys in `stats`, and the first is the one to look at when a bar "is
@@ -702,7 +715,7 @@ not working":
 * `src/lib.rs` unit-tests the two things the privilege check is made of:
   that only shell tokens read as privileged, and that `is_shell_op`
   classifies every shell op and no ordinary one.
-* `tests/shell.rs` drives 28 cases through the real event loop on the fake
+* `tests/shell.rs` drives 37 cases through the real event loop on the fake
   backend: the two sockets' capability bits and three shell clients at
   once; **every** shell op refused on the wire socket, one connection
   each, and refused *without a commit*; a bar creating, anchoring and
@@ -728,8 +741,8 @@ not working":
   **not** outranking a bound chord (which arrives as a `HotKey`, while the
   tap still fires under the grab); `Super`-drag still working with a shell
   connected and not looking like a
-  tap; outputs listed, hotplugged and unplugged; and an anchored bar
-  re-spanning after a hotplug.
+  tap; outputs listed, hotplugged and unplugged; an anchored bar
+  re-spanning after a hotplug; and, for M5-D's `ListOutputs`, an ordinary client that listed `OUTPUTS` getting the snapshot (`OutputInfo` + `OutputWorkArea` per output, `OutputsEnd`) and hotplug, the same list a shell client gets field for field, a zone change pushing only a fresh `OutputWorkArea`, `ListOutputs` without `OUTPUTS` listed refused with `Protocol`, a pre-`ClientCaps` shell client never sent a work area, and a watcher that narrowed its caps sent nothing.
 * The session lock: `src/lock.rs` unit-tests the ownership rules,
   `nitro-scene/tests/admit.rs` the paint and hit-test filter and its
   damage, and eleven cases in `tests/shell.rs` drive it through the event

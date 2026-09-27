@@ -27,7 +27,7 @@ use nitro_core::{Color, Rect, Size};
 use nitro_server::input::{FakeInput, InputEvent};
 use nitro_server::{BackendKind, Config, run, wm};
 use nitro_wire::client::Connection;
-use nitro_wire::msg::ServerMsg;
+use nitro_wire::msg::{OutputInfo, OutputWorkArea, ServerMsg};
 use nitro_wire::types::{
     Edge, Layer, NodeId, WindowRef, WindowState, anchor, caps, mod_mask, window_flags,
 };
@@ -610,7 +610,71 @@ fn every_shell_op_is_refused_on_the_ordinary_socket() {
         drop(conn);
         wait_for("the client to be gone", || h.stat("clients") == 0);
     }
+
+    // And the one thing M5-D *did* grant, next to the eleven it did not:
+    // an ordinary client that opts into `OUTPUTS` and sends `ListOutputs`
+    // gets the output snapshot and stays connected.
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("list-outputs");
+    assert_eq!(conn.caps() & caps::OUTPUTS, caps::OUTPUTS);
+    conn.client_caps(caps::OUTPUTS).unwrap();
+    conn.list_outputs().unwrap();
+    let (infos, _) = await_snapshot(&mut conn, &mut inbox, "the ListOutputs snapshot");
+    assert_eq!(infos.len(), 1);
+    assert!(!inbox.0.iter().any(|m| matches!(m, ServerMsg::Error(_))));
+    assert!(!conn.is_closed(), "ListOutputs is not a shell op");
+    assert_eq!(h.stat("clients"), 1);
+    drop(conn);
     h.quit();
+}
+
+/// Drain until the first `OutputsEnd`, and return the snapshot before it:
+/// every `OutputInfo` and `OutputWorkArea`, in arrival order. Removes the
+/// snapshot (and its terminator) from the inbox, so a later call sees only
+/// what came after.
+fn await_snapshot(
+    conn: &mut Connection,
+    inbox: &mut Inbox,
+    what: &str,
+) -> (Vec<OutputInfo>, Vec<OutputWorkArea>) {
+    wait_for(what, || {
+        pump(conn, inbox);
+        inbox.0.iter().any(|m| matches!(m, ServerMsg::OutputsEnd(_)))
+    });
+    let end = inbox
+        .0
+        .iter()
+        .position(|m| matches!(m, ServerMsg::OutputsEnd(_)))
+        .unwrap();
+    let snapshot: Vec<ServerMsg> = inbox.0.drain(..=end).collect();
+    let infos = snapshot
+        .iter()
+        .filter_map(|m| match m {
+            ServerMsg::OutputInfo(i) => Some(i.clone()),
+            _ => None,
+        })
+        .collect();
+    let areas = snapshot
+        .iter()
+        .filter_map(|m| match m {
+            ServerMsg::OutputWorkArea(a) => Some(*a),
+            _ => None,
+        })
+        .collect();
+    (infos, areas)
+}
+
+/// Whether any of the four output messages is in the inbox.
+fn any_output_msg(inbox: &Inbox) -> bool {
+    inbox.0.iter().any(|m| {
+        matches!(
+            m,
+            ServerMsg::OutputInfo(_)
+                | ServerMsg::OutputsEnd(_)
+                | ServerMsg::OutputGone(_)
+                | ServerMsg::OutputWorkArea(_)
+        )
+    })
 }
 
 #[test]
@@ -2976,5 +3040,224 @@ fn the_shell_cannot_focus_a_hidden_window_while_locked() {
         "FocusWindow focused a hidden window"
     );
     drop((app, bar, lock));
+    h.quit();
+}
+
+// ------------------------------------------------ ListOutputs (M5-D)
+
+#[test]
+fn an_unprivileged_client_lists_outputs_and_sees_hotplug() {
+    let h = Harness::start("list-outputs", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("chrome");
+    conn.client_caps(caps::OUTPUTS).unwrap();
+    conn.list_outputs().unwrap();
+
+    // One `OutputInfo` and one `OutputWorkArea` per output, then the
+    // terminator. With no zones the work area is the whole output.
+    let (infos, areas) = await_snapshot(&mut conn, &mut inbox, "the snapshot");
+    assert_eq!(infos.len(), 1);
+    assert_eq!((infos[0].w, infos[0].h), OUT);
+    assert_eq!((infos[0].x, infos[0].y), (0, 0));
+    assert_eq!(infos[0].scale, 1.0);
+    assert_eq!(areas.len(), 1);
+    assert_eq!(areas[0].id, infos[0].id);
+    assert_eq!(
+        areas[0].area,
+        nitro_core::IRect::new(0, 0, OUT.0.cast_signed(), OUT.1.cast_signed())
+    );
+
+    // Hotplug: the whole list again, the new output to the right.
+    assert_eq!(h.request_line("plug 800x600\n"), "ok");
+    let (infos, areas) = await_snapshot(&mut conn, &mut inbox, "the hotplug");
+    assert_eq!(infos.len(), 2);
+    assert_eq!(areas.len(), 2);
+    let second = infos
+        .iter()
+        .find(|i| (i.w, i.h) == (800, 600))
+        .expect("the new output")
+        .clone();
+    assert_eq!(second.x, OUT.0.cast_signed());
+    let second_area = areas.iter().find(|a| a.id == second.id).expect("its work area");
+    assert_eq!(
+        second_area.area,
+        nitro_core::IRect::new(OUT.0.cast_signed(), 0, 800, 600),
+        "global device pixels, like OutputInfo"
+    );
+
+    // Unplug: `OutputGone` naming it, then the remaining list.
+    assert_eq!(h.request_line("unplug\n"), "ok");
+    wait_for("the unplug", || {
+        pump(&mut conn, &mut inbox);
+        inbox.0.iter().any(|m| matches!(m, ServerMsg::OutputsEnd(_)))
+    });
+    let gone = inbox
+        .0
+        .iter()
+        .position(|m| matches!(m, ServerMsg::OutputGone(g) if g.id == second.id))
+        .expect("OutputGone for the unplugged output");
+    let first_info = inbox
+        .0
+        .iter()
+        .position(|m| matches!(m, ServerMsg::OutputInfo(_)))
+        .expect("the remaining list");
+    assert!(gone < first_info, "OutputGone comes before the list");
+    let (infos, areas) = await_snapshot(&mut conn, &mut inbox, "the remaining list");
+    assert_eq!(infos.len(), 1);
+    assert_eq!(areas.len(), 1);
+    assert!(!conn.is_closed());
+
+    drop(conn);
+    h.quit();
+}
+
+#[test]
+fn the_output_list_is_the_same_for_a_shell_and_an_ordinary_client() {
+    let h = Harness::start("same-outputs", OUT.0, OUT.1);
+    assert_eq!(h.request_line("plug 800x600\n"), "ok");
+    h.settle();
+
+    let mut shell_inbox = Inbox::default();
+    let mut shell = h.shell("bar");
+    shell.outputs().unwrap();
+    let (shell_infos, shell_areas) = await_snapshot(&mut shell, &mut shell_inbox, "shell list");
+
+    let mut plain_inbox = Inbox::default();
+    let mut plain = h.client("chrome");
+    plain.client_caps(caps::OUTPUTS).unwrap();
+    plain.list_outputs().unwrap();
+    let (plain_infos, plain_areas) = await_snapshot(&mut plain, &mut plain_inbox, "plain list");
+
+    assert_eq!(shell_infos.len(), 2);
+    assert_eq!(plain_infos, shell_infos, "field for field, in the same order");
+    assert!(shell_infos[0].x < shell_infos[1].x);
+    // The shell listed no `ClientCaps`, so it gets no work area (rule 1).
+    assert!(shell_areas.is_empty());
+    assert_eq!(plain_areas.len(), 2);
+
+    drop((shell, plain));
+    h.quit();
+}
+
+#[test]
+fn a_zone_change_pushes_a_fresh_work_area_to_an_ordinary_client() {
+    let h = Harness::start("zone-area", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("chrome");
+    conn.client_caps(caps::OUTPUTS).unwrap();
+    conn.list_outputs().unwrap();
+    let (infos, _) = await_snapshot(&mut conn, &mut inbox, "the snapshot");
+    let id = infos[0].id;
+    let (w, hgt) = (OUT.0.cast_signed(), OUT.1.cast_signed());
+    let z = ZONE.cast_signed();
+
+    let mut shell_inbox = Inbox::default();
+    let mut shell = h.shell("bar");
+    let bar = make_bar(&h, &mut shell, &mut shell_inbox, 1);
+
+    let shrunk = nitro_core::IRect::new(0, z, w, hgt - z);
+    wait_for("the shrunk work area", || {
+        pump(&mut conn, &mut inbox);
+        inbox
+            .0
+            .iter()
+            .any(|m| matches!(m, ServerMsg::OutputWorkArea(a) if a.id == id && a.area == shrunk))
+    });
+    // An update, not a snapshot: only work areas.
+    assert!(
+        inbox.0.iter().all(|m| !matches!(
+            m,
+            ServerMsg::OutputInfo(_) | ServerMsg::OutputsEnd(_) | ServerMsg::OutputGone(_)
+        )),
+        "a zone change sends only OutputWorkArea; got {:?}",
+        inbox.0
+    );
+
+    // Releasing the zone gives it back.
+    inbox.0.clear();
+    shell
+        .tx()
+        .set_exclusive_zone(bar.root, Edge::Top, 0)
+        .commit(3)
+        .unwrap();
+    shell.flush().unwrap();
+    let full = nitro_core::IRect::new(0, 0, w, hgt);
+    wait_for("the full work area", || {
+        pump(&mut conn, &mut inbox);
+        inbox
+            .0
+            .iter()
+            .any(|m| matches!(m, ServerMsg::OutputWorkArea(a) if a.id == id && a.area == full))
+    });
+    assert!(!conn.is_closed());
+
+    drop((conn, shell));
+    h.quit();
+}
+
+#[test]
+fn list_outputs_without_the_capability_listed_is_a_protocol_error() {
+    // `docs/wire.md` § Capability opt-in rule 3: asking for outputs while
+    // claiming not to understand the answer.
+    let h = Harness::start("list-nocaps", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("confused");
+    conn.list_outputs().unwrap();
+    conn.flush().unwrap();
+    protocol_error(&mut conn, &mut inbox, "ListOutputs without ClientCaps");
+    wait_for("the connection to close", || {
+        pump(&mut conn, &mut inbox);
+        conn.is_closed()
+    });
+    assert!(!any_output_msg(&inbox), "nothing was answered");
+    drop(conn);
+    h.quit();
+}
+
+#[test]
+fn a_shell_client_that_listed_no_caps_is_not_pushed_a_work_area() {
+    // The `nitro-bar` regression: a pre-`ClientCaps` shell client sees
+    // exactly the v1 output messages, before and after a zone change.
+    let h = Harness::start("bar-no-area", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut shell = h.shell("bar");
+    shell.outputs().unwrap();
+    let (infos, areas) = await_snapshot(&mut shell, &mut inbox, "the snapshot");
+    assert_eq!(infos.len(), 1);
+    assert!(areas.is_empty());
+
+    let _bar = make_bar(&h, &mut shell, &mut inbox, 1);
+    h.settle();
+    pump(&mut shell, &mut inbox);
+    assert!(
+        !inbox.0.iter().any(|m| matches!(m, ServerMsg::OutputWorkArea(_))),
+        "no 0x8408 for a client that did not list OUTPUTS"
+    );
+    assert!(!shell.is_closed());
+    drop(shell);
+    h.quit();
+}
+
+#[test]
+fn a_watcher_that_narrows_its_caps_is_sent_no_output_messages() {
+    // Rule 5 allows narrowing; rule 1 then forbids sending what was
+    // dropped. The subscription survives, silent.
+    let h = Harness::start("list-narrow", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("fickle");
+    conn.client_caps(caps::OUTPUTS).unwrap();
+    conn.list_outputs().unwrap();
+    await_snapshot(&mut conn, &mut inbox, "the snapshot");
+    conn.client_caps(0).unwrap();
+    conn.flush().unwrap();
+    h.settle();
+
+    assert_eq!(h.request_line("plug 800x600\n"), "ok");
+    h.settle();
+    pump(&mut conn, &mut inbox);
+    assert!(!any_output_msg(&inbox), "got {:?}", inbox.0);
+    assert!(!conn.is_closed());
+    assert_eq!(h.stat("clients"), 1);
+    drop(conn);
     h.quit();
 }

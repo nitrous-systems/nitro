@@ -1012,7 +1012,7 @@ limit of 1024 — but real.
   `unplug` migrating it back; and a scale-2 output drawing twice the
   device pixels for the same logical window.
 - `tests/shell.rs` drives the M3-B shell socket through the same real loop,
-  28 cases: the two sockets' capability bits and three shell clients at
+  37 cases: the two sockets' capability bits and three shell clients at
   once; **every one of the eleven shell ops** refused with `Protocol` on the
   ordinary socket, one connection each and *without a commit* — the
   privilege check is on receipt (a check that covered ten would look
@@ -1042,7 +1042,7 @@ limit of 1024 — but real.
   than a `Key`, while the bare-Super tap still fires under the grab, so a
   launcher can close itself the way it opened; `Super`-drag still moving a window with a shell connected and not
   looking like a tap; outputs listed, hotplugged and unplugged; an anchored
-  bar re-spanning after a hotplug.
+  bar re-spanning after a hotplug; and, for M5-D's `ListOutputs`, an ordinary client that listed `OUTPUTS` getting the snapshot (`OutputInfo` + `OutputWorkArea` per output, `OutputsEnd`) and hotplug, the same list a shell client gets field for field, a zone change pushing only a fresh `OutputWorkArea`, `ListOutputs` without `OUTPUTS` listed refused with `Protocol`, a pre-`ClientCaps` shell client never sent a work area, and a watcher that narrowed its caps sent nothing.
 - `tests/config.rs` drives `server.conf` through the same real loop, with
   each harness owning a configuration directory of its own (the
   environment is process-global and these run in threads of one process,
@@ -1179,7 +1179,7 @@ bare-Super tap bound) and two `nitro-calc` windows, driven with `ydotool`.
 
 | what | value |
 |---|---|
-| sockets | `wire.sock`, `shell.sock` and `control.sock` in one `0700` directory; the probe's `Welcome` is `caps=0x32` (`TEXT|WM|SHELL`) and an ordinary client's is `0x12` |
+| sockets | `wire.sock`, `shell.sock` and `control.sock` in one `0700` directory; the probe's `Welcome` is `caps=0x32` (`TEXT|WM|SHELL`) and an ordinary client's lacks `SHELL` (both also carry the always-on bits: `THEME`, `ICONS`, `POPUP`, `OUTPUTS`, and `DATA` locally) |
 | anchor | asked for 400 px wide, `Configure`d to **1920×32 at (0,0)** and re-`Configure`d after answering — a bar that ignores that `Configure` paints its original width, which is how the probe found the bug below |
 | exclusive zone | a maximized `nitro-calc`'s own title bar starts at **y=33**, with the bar owning y=0..31; the strip is **given back** when the probe is killed (title bar back at y=0..27) |
 | layers | the bar's pixels win over the maximized window's throughout its strip, which is the `Top`-over-`Normal` ordering |
