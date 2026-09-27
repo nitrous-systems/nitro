@@ -1156,3 +1156,105 @@ fn a_minimized_entry_dims_its_label_and_leaves_its_icon_alone() {
     drop(conn);
     h.quit();
 }
+
+#[test]
+fn one_bar_per_output_following_hotplug() {
+    // The headline of #3844: a second output gets a second panel — on one
+    // connection, from one `Ui` — listing the same windows and showing the
+    // same clock, and an unplug takes it away again.
+    let mut h = harness();
+    h.settle();
+    assert_eq!(h.state().panel_count(), 1);
+    assert_eq!(h.state().outputs().len(), 1, "the snapshot arrived");
+    let main_out = h.state().main_output().expect("the main window is placed");
+
+    assert_eq!(h.server().request_line("plug 800x600\n"), "ok");
+    until(&mut h, "the second panel", |h| h.state().panel_count() == 2);
+    h.settle();
+    assert_eq!(h.ui().windows().len(), 2, "two windows in one Ui");
+    assert_eq!(h.server().stat("shell_clients"), 1, "on one connection");
+    assert_eq!(h.server().stat("exclusive_zones"), 2, "each with its zone");
+    let outs = h.state().panel_outputs();
+    assert_eq!(outs[0], main_out);
+    assert_ne!(
+        outs[1], main_out,
+        "the second panel is on the *other* output"
+    );
+    assert!(h.state().outputs().contains(&outs[1]));
+    // And it spans that output, not the first.
+    let second = h.ui().windows()[1];
+    assert_eq!(h.ui().window_size_of(second).w, 800.0);
+    assert_eq!(h.ui().window_output(second), Some(outs[1]));
+
+    // A window opened now is listed on both panels, at the `hey` paths a
+    // script would use for each.
+    let conn = open_window(&h, "app", Size::new(120.0, 90.0));
+    until(&mut h, "the window to be listed", |h| {
+        h.state().window_count() == 1
+    });
+    h.settle();
+    let name = nitro_bar::entry_name(h.state().windows()[0]);
+    let main_path = format!("window/{}/{name}", names::WINDOWS);
+    let other_path = format!("window[1]/{}/{name}", names::WINDOWS);
+    assert!(named(&mut h, &format!("{}/{name}", names::WINDOWS)).is_some());
+    assert!(
+        nitro_ui::introspect::resolve(h.ui(), &main_path).is_some(),
+        "{main_path}"
+    );
+    assert!(
+        nitro_ui::introspect::resolve(h.ui(), &other_path).is_some(),
+        "{other_path}"
+    );
+    // The clock reads the same on both.
+    let clock_main =
+        nitro_ui::introspect::get_prop(h.ui(), &format!("window/{}", names::CLOCK), "value")
+            .expect("main clock");
+    let clock_other =
+        nitro_ui::introspect::get_prop(h.ui(), &format!("window[1]/{}", names::CLOCK), "value")
+            .expect("other clock");
+    assert_eq!(clock_main, clock_other);
+    assert!(!clock_main.is_empty());
+
+    // Unplug: the server re-homes the panel to the primary and the bar
+    // closes it, so one output has one bar and one zone.
+    assert_eq!(h.server().request_line("unplug\n"), "ok");
+    until(&mut h, "the panel to close", |h| {
+        h.state().panel_count() == 1
+    });
+    h.settle();
+    assert_eq!(h.ui().windows().len(), 1);
+    assert_eq!(h.server().stat("exclusive_zones"), 1);
+    assert_eq!(h.state().window_count(), 1, "the list survives");
+
+    drop(conn);
+    h.quit();
+}
+
+#[test]
+fn the_bar_does_not_duplicate_its_own_output() {
+    // The rule `reconcile` implements: the extra panels' outputs are the
+    // snapshot minus the main window's output — never the main window's,
+    // whatever order `OutputsEnd` and the main `Configure` arrived in.
+    let mut h = harness();
+    h.settle();
+    assert_eq!(h.server().request_line("plug 800x600\n"), "ok");
+    until(&mut h, "the second panel", |h| h.state().panel_count() == 2);
+    h.settle();
+    let main_out = h.state().main_output().unwrap();
+    let mut outs = h.state().panel_outputs();
+    let mut snapshot = h.state().outputs().to_vec();
+    outs.sort_unstable();
+    snapshot.sort_unstable();
+    assert_eq!(outs, snapshot, "one panel per output, exactly");
+    assert!(
+        h.state().panel_outputs()[1..]
+            .iter()
+            .all(|o| *o != main_out),
+        "no extra panel on the main window's output"
+    );
+    // A third output is a third panel; still one connection.
+    assert_eq!(h.server().request_line("plug 1024x768\n"), "ok");
+    until(&mut h, "the third panel", |h| h.state().panel_count() == 3);
+    assert_eq!(h.server().stat("shell_clients"), 1);
+    h.quit();
+}

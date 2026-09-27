@@ -55,32 +55,40 @@
 //! asserts it from the outside, by counting commits over a window in
 //! which the sensors are polled several times.
 //!
-//! # One bar, on the primary output
+//! # One bar per output
 //!
-//! The spec asked for one bar per output, following hotplug. **That is
-//! not implementable on this protocol**, and the bar deliberately does
-//! not fake it: a client cannot choose which output its window opens on,
-//! `SetAnchor` anchors to whichever output the window is already on, and
-//! nothing moves a window between outputs but a user's drag. N bar
-//! windows would therefore all land on the primary output — N overlapping
-//! bars and N×32 px of zone on one screen, which is worse than one bar.
+//! One process, **one shell connection**, one [`Ui`] — and one *panel*
+//! (a window with its own copy of the tree) per connected output. The
+//! main window is the panel on whichever output the server placed it;
+//! every other output gets a panel opened with
+//! [`Ui::add_surface_window`] and an anchor that names it
+//! ([`Anchor::on`]), which is what `SetAnchor { output }` is for: the
+//! server moves the window there before anchoring it, and the zone comes
+//! off *that* output's work area.
 //!
-//! `docs/shell.md` §Deferred already records the gap ("Per-output shell
-//! surfaces"), and the fix is an `output` field on `SetAnchor`. The bar
-//! is structured so that adding it is small: everything below is per-bar
-//! state reached through one [`Bar`] and one tree, so a second output
-//! means a second `Ui` (one window each — `Ui` owns exactly one window)
-//! rather than any change to the layout, the window list or the sensors.
-//! The crate README says the same thing to a reader who is not in the
-//! source.
+//! The set of panels follows hotplug by one rule, [`reconcile`]: **the
+//! extra panels' outputs are exactly the last `Outputs` snapshot minus
+//! the main window's output**. It is re-run at every `OutputsEnd` and
+//! whenever the server re-places the main window
+//! ([`Ui::on_window_placed`]), and it is idempotent, so the order those
+//! two arrive in does not matter. An unplug is handled by the server
+//! first — it migrates the orphaned panel to the primary output — and
+//! by the rule second, which closes it because its output is gone; the
+//! two bars on one screen that leaves last one commit.
+//!
+//! Every panel shows the same thing. The window list, the clock and the
+//! sensors write to *every* panel's labels, and the idle contract above
+//! holds per label: an unchanged string costs nothing, on one panel or
+//! on four. `hey nitro-bar` reaches the main panel at `window/...` and
+//! the others at `window[N]/...`.
 
 pub mod clock;
 pub mod sensors;
 
 use nitro_ui::build::{ContainerBuilder as _, StyleBuilder as _};
-use nitro_ui::shell::{Layer, ShellEvent, Surface, WindowInfo, WindowRef, WindowState};
+use nitro_ui::shell::{Anchor, Layer, ShellEvent, Surface, WindowInfo, WindowRef, WindowState};
 use nitro_ui::widgets::{Button, Label, button as button_widget, icon, label, row, spacer};
-use nitro_ui::{App, ColorRole, Error, IconTint, Size, Ui, WidgetId};
+use nitro_ui::{App, ColorRole, Error, IconTint, Size, Ui, WidgetId, WindowId};
 
 /// The name the bar registers under, and so the first argument to `hey`.
 pub const APP_NAME: &str = "nitro-bar";
@@ -205,6 +213,25 @@ struct Entry {
     id: WidgetId,
 }
 
+/// One panel: a bar window on one output, with its own copy of the tree.
+///
+/// Index 0 of [`Bar::panels`] is always the main window; the rest were
+/// opened by [`open_panel`] for the other outputs.
+struct Panel {
+    /// The output the window is on, from its `Configure`. `None` for the
+    /// main panel until the server has placed it; always known for the
+    /// others, because they are opened *for* an output.
+    output: Option<u32>,
+    /// The window.
+    win: WindowId,
+    /// This panel's widget ids.
+    ids: Ids,
+    /// This panel's window-list buttons, in the order the server reports
+    /// the windows (by window identity, so the list does not reshuffle
+    /// when a window is raised).
+    entries: Vec<Entry>,
+}
+
 /// The three readouts, as one poll produced them.
 ///
 /// `None` is "nothing to show" — an empty widget rather than a zero that
@@ -245,9 +272,17 @@ type SensorSource = Box<dyn Fn() -> Readings>;
 /// `&mut S` alongside `&mut Ui<S>`. No `Rc`, no `RefCell`, no observer
 /// list — a callback that has both of those does not need one.
 pub struct Bar {
-    /// The window list, in the order the server reports it (by window
-    /// identity, so the list does not reshuffle when a window is raised).
-    entries: Vec<Entry>,
+    /// The panels, main window first. See [`Panel`] and [`reconcile`].
+    panels: Vec<Panel>,
+    /// The last `WindowInfo` for every window the list shows: the source
+    /// of truth a new panel's buttons are built from, so a panel opened
+    /// after the snapshot lists the same windows as the first one.
+    infos: Vec<WindowInfo>,
+    /// The output ids of the last complete `Outputs` snapshot.
+    outputs: Vec<u32>,
+    /// The snapshot being received: ids accumulate here between the
+    /// `Output` events and the `OutputsEnd` that makes them `outputs`.
+    pending_outputs: Vec<u32>,
     /// The local time zone, read once at start-up.
     ///
     /// Re-reading `/etc/localtime` every minute would be three syscalls a
@@ -284,7 +319,10 @@ impl Bar {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            entries: Vec::new(),
+            panels: Vec::new(),
+            infos: Vec::new(),
+            outputs: Vec::new(),
+            pending_outputs: Vec::new(),
             zone: clock::Zone::local(),
             fake_time_ms: fake_time_ms(),
             clock_text: String::new(),
@@ -329,10 +367,40 @@ impl Bar {
         self
     }
 
+    /// The main panel's entries; empty before the tree exists.
+    fn entries(&self) -> &[Entry] {
+        self.panels.first().map_or(&[], |p| p.entries.as_slice())
+    }
+
     /// The listed windows, in order. For the tests.
     #[must_use]
     pub fn windows(&self) -> Vec<WindowRef> {
-        self.entries.iter().map(|e| e.window).collect()
+        self.entries().iter().map(|e| e.window).collect()
+    }
+
+    /// How many panels are open, the main window included.
+    #[must_use]
+    pub fn panel_count(&self) -> usize {
+        self.panels.len()
+    }
+
+    /// The output of every panel, main window first; 0 for a panel the
+    /// server has not placed yet. For the tests.
+    #[must_use]
+    pub fn panel_outputs(&self) -> Vec<u32> {
+        self.panels.iter().map(|p| p.output.unwrap_or(0)).collect()
+    }
+
+    /// The output the main window is on, once the server has said.
+    #[must_use]
+    pub fn main_output(&self) -> Option<u32> {
+        self.panels.first().and_then(|p| p.output)
+    }
+
+    /// The output ids of the last `Outputs` snapshot. For the tests.
+    #[must_use]
+    pub fn outputs(&self) -> &[u32] {
+        &self.outputs
     }
 
     /// How many sensor polls have run.
@@ -350,19 +418,19 @@ impl Bar {
     /// How many windows the list currently holds.
     #[must_use]
     pub fn window_count(&self) -> usize {
-        self.entries.len()
+        self.entries().len()
     }
 
     /// The labels of the window list, in order. For the tests.
     #[must_use]
     pub fn window_labels(&self) -> Vec<String> {
-        self.entries.iter().map(|e| e.text.clone()).collect()
+        self.entries().iter().map(|e| e.text.clone()).collect()
     }
 
     /// Which window the list draws as focused, if any.
     #[must_use]
     pub fn focused_window(&self) -> Option<WindowRef> {
-        self.entries.iter().find(|e| e.focused).map(|e| e.window)
+        self.entries().iter().find(|e| e.focused).map(|e| e.window)
     }
 
     /// The windows the list draws as minimized. For the tests, and for
@@ -371,7 +439,7 @@ impl Bar {
     /// that marked the row and forgot to tint it.
     #[must_use]
     pub fn minimized_windows(&self) -> Vec<WindowRef> {
-        self.entries
+        self.entries()
             .iter()
             .filter(|e| e.minimized)
             .map(|e| e.window)
@@ -435,14 +503,15 @@ fn fake_time_ms() -> Option<i64> {
         .ok()
 }
 
-/// The bar's widget ids, gathered by [`build`].
+/// One panel's widget ids, gathered by [`build_panel`].
 ///
 /// `build` only has the tree — the state does not exist yet when the
 /// callbacks are written, and the callbacks need the ids. So the ids are
-/// `Copy` and captured into the closures, and [`install`] writes the same
-/// set into [`Bar`] on the first turn of the loop. That is the
-/// calculator's `Screen` trick, and it is what lets the state be built
-/// before the tree it will drive.
+/// `Copy` and captured into the closures, and every callback starts with
+/// [`ensure_main`], which writes the same set into [`Bar`] as its first
+/// [`Panel`] the first time any of them runs. That is the calculator's
+/// `Screen` trick, and it is what lets the state be built before the tree
+/// it will drive.
 #[derive(Debug, Clone, Copy)]
 struct Ids {
     windows: WidgetId,
@@ -531,7 +600,7 @@ pub fn elide(s: &str, max: usize) -> String {
     out
 }
 
-/// Build the whole tree and return its root.
+/// Build the main panel's tree, wire the bar up, and return the root.
 ///
 /// Public because the tests build the tree the binary builds: a test that
 /// built its own would be testing a second bar.
@@ -540,6 +609,14 @@ pub fn elide(s: &str, max: usize) -> String {
 /// Never in practice — every `attach` names an id this function has just
 /// created, and a fresh id cannot be stale.
 pub fn build(ui: &mut Ui<Bar>) -> WidgetId {
+    let (root, ids) = build_panel(ui);
+    install(ui, ids);
+    root
+}
+
+/// Build one panel's tree: the same tree for the main window and for
+/// every other output's panel, so they cannot drift apart.
+fn build_panel(ui: &mut Ui<Bar>) -> (WidgetId, Ids) {
     let h = height();
 
     // -- left: the launcher button and the window list ----------------
@@ -684,8 +761,8 @@ pub fn build(ui: &mut Ui<Bar>) -> WidgetId {
         ui.attach(root, child).unwrap();
     }
 
-    install(
-        ui,
+    (
+        root,
         Ids {
             windows,
             clock: clock_id,
@@ -693,44 +770,189 @@ pub fn build(ui: &mut Ui<Bar>) -> WidgetId {
             load,
             mem,
         },
-    );
-    root
+    )
 }
 
-/// Wire the tree up: stash the ids, subscribe to the window list, and
-/// arm the clock and sensor timers.
+/// Wire the tree up: subscribe to the window list and the outputs, watch
+/// where the main window lands, and arm the clock and sensor timers.
 ///
 /// Everything the bar *does* is registered here, and all of it is
-/// event-driven: a subscription rather than a poll for the window list, a
-/// minute-aligned timer for the clock, and a 30 s timer for the sensors
-/// that writes to the tree only when a string actually changed.
+/// event-driven: a subscription rather than a poll for the window list
+/// and the outputs, a minute-aligned timer for the clock, and a 30 s
+/// timer for the sensors that writes to the tree only when a string
+/// actually changed.
 fn install(ui: &mut Ui<Bar>, ids: Ids) {
-    ui.on_shell(
-        move |s: &mut Bar, ui: &mut Ui<Bar>, ev: &ShellEvent| match ev {
-            ShellEvent::Window(info) => upsert(s, ui, ids, info),
+    ui.on_shell(move |s: &mut Bar, ui: &mut Ui<Bar>, ev: &ShellEvent| {
+        ensure_main(s, ids);
+        match ev {
+            ShellEvent::Window(info) => upsert(s, ui, info),
             ShellEvent::WindowGone(w) => remove(s, ui, *w),
-            // The snapshot's end needs no special case: every window in it
-            // arrived as an ordinary `Window` and was upserted. Keying on it
-            // would be a second code path that has to agree with the first.
-            _ => {}
-        },
-    );
+            // The window snapshot's end needs no special case: every
+            // window in it arrived as an ordinary `Window` and was
+            // upserted. Keying on it would be a second code path that has
+            // to agree with the first.
+            ShellEvent::WindowListEnd => {}
+            // The output snapshot's end *is* the moment: a hotplug re-sends
+            // the whole list, and the panels are reconciled against the
+            // complete list rather than against each output as it arrives.
+            ShellEvent::Output(info) => s.pending_outputs.push(info.id),
+            ShellEvent::OutputsEnd => {
+                s.outputs = std::mem::take(&mut s.pending_outputs);
+                reconcile(s, ui);
+            }
+            // The snapshot that follows would close it too; closing it
+            // here shortens the moment the server's migration leaves two
+            // bars on the primary output.
+            ShellEvent::OutputGone(id) => {
+                let gone: Vec<WindowId> = s
+                    .panels
+                    .iter()
+                    .skip(1)
+                    .filter(|p| p.output == Some(*id))
+                    .map(|p| p.win)
+                    .collect();
+                close_panels(s, ui, &gone);
+            }
+            ShellEvent::HotKey { .. } | ShellEvent::Overview { .. } => {}
+        }
+    });
 
-    // The window list. Asking subscribes, so this is the only request the
-    // bar ever makes about windows: everything after it arrives unasked.
-    // A bar on an unprivileged connection would be *disconnected* for
-    // sending this, so the capability is checked rather than assumed.
-    if ui.is_shell()
-        && let Err(e) = ui.window_list()
-    {
+    // Where the main window landed. `Outputs` is answered before the main
+    // window's first `Configure`, so this is what tells the bar which
+    // output it must *not* open a second panel on; a resize says nothing
+    // about that, which is why it is not `on_resize`.
+    ui.on_window_placed(WindowId::MAIN, move |s: &mut Bar, ui: &mut Ui<Bar>, out| {
+        ensure_main(s, ids);
+        s.panels[0].output = Some(out);
+        reconcile(s, ui);
+    });
+
+    // The window list and the outputs. Asking subscribes, so these are the
+    // only requests the bar ever makes about either: everything after
+    // them arrives unasked. A bar on an unprivileged connection would be
+    // *disconnected* for sending them, so the capability is checked
+    // rather than assumed.
+    if ui.is_shell() {
         // Not fatal: a bar with no window list is still a clock and
         // three readouts, and dying here would take the whole panel
         // off the screen over one failed request.
-        eprintln!("nitro-bar: window list: {e}");
+        if let Err(e) = ui.window_list() {
+            eprintln!("nitro-bar: window list: {e}");
+        }
+        if let Err(e) = ui.outputs() {
+            eprintln!("nitro-bar: outputs: {e}");
+        }
     }
 
     tick_clock(ui, ids);
     arm_first_sensor_poll(ui, ids);
+}
+
+/// Make the main window the first [`Panel`], if it is not yet.
+///
+/// Called at the top of every callback rather than once from `build`,
+/// because `build` has no state to write into; see [`Ids`].
+fn ensure_main(s: &mut Bar, ids: Ids) {
+    if s.panels.is_empty() {
+        s.panels.push(Panel {
+            output: None,
+            win: WindowId::MAIN,
+            ids,
+            entries: Vec::new(),
+        });
+    }
+}
+
+/// Make the panels match the outputs: one on every output in the last
+/// snapshot, the main window's excepted.
+///
+/// Idempotent, and safe in any order: before the main window is placed
+/// nothing is known about which output to skip, so nothing is done; before
+/// the first `OutputsEnd` there are no outputs and no extra panels. Also
+/// closes a panel whose output the main window was migrated *onto* — the
+/// server re-homes an orphaned window to the primary, and a bar that
+/// followed only the output list would be two bars on that screen.
+fn reconcile(s: &mut Bar, ui: &mut Ui<Bar>) {
+    let Some(main) = s.main_output() else {
+        return;
+    };
+    let stale: Vec<WindowId> = s
+        .panels
+        .iter()
+        .skip(1)
+        .filter(|p| {
+            p.output
+                .is_none_or(|o| o == main || !s.outputs.contains(&o))
+        })
+        .map(|p| p.win)
+        .collect();
+    close_panels(s, ui, &stale);
+    for out in s.outputs.clone() {
+        if out != main && !s.panels.iter().any(|p| p.output == Some(out)) {
+            open_panel(s, ui, out);
+        }
+    }
+}
+
+/// Close the given extra panels' windows and forget them.
+fn close_panels(s: &mut Bar, ui: &mut Ui<Bar>, wins: &[WindowId]) {
+    for win in wins {
+        if *win == WindowId::MAIN {
+            continue;
+        }
+        // The window's close handler forgets the panel; this is the same
+        // forgetting for a `remove_window` that failed, which only means
+        // the server had closed it already.
+        let _ = ui.remove_window(s, *win);
+        s.panels.retain(|p| p.win != *win);
+    }
+}
+
+/// Open a panel on `output`: the same tree as the main window, anchored
+/// to that output, listing the same windows and showing the same clock
+/// and readouts.
+fn open_panel(s: &mut Bar, ui: &mut Ui<Bar>, output: u32) {
+    let h = height();
+    let (root, ids) = build_panel(ui);
+    let surface = Surface::bar(h as u32).anchored(Anchor::top().on(output));
+    // A width the anchor immediately overrides, as in `run`.
+    let win = match ui.add_surface_window("nitro-bar", Some(Size::new(640.0, h)), root, surface) {
+        Ok(win) => win,
+        Err(e) => {
+            // Not fatal: the primary output still has its bar. The tree
+            // built above would otherwise sit in the arena unreachable.
+            eprintln!("nitro-bar: panel on output {output}: {e}");
+            let _ = ui.remove(root);
+            return;
+        }
+    };
+    // Should the server close it (it does not, today), forget it rather
+    // than keep a panel whose window is gone.
+    ui.on_window_closed(win, move |s: &mut Bar, _ui: &mut Ui<Bar>| {
+        s.panels.retain(|p| p.win != win);
+    });
+    s.panels.push(Panel {
+        output: Some(output),
+        win,
+        ids,
+        entries: Vec::new(),
+    });
+    let idx = s.panels.len() - 1;
+    for info in s.infos.clone() {
+        upsert_in(s, ui, idx, &info);
+    }
+    if let Ok(mut l) = ui.widget_mut::<Label>(ids.clock) {
+        l.set_text(s.clock_text.clone());
+    }
+    for (id, reading) in [
+        (ids.battery, &s.last.battery),
+        (ids.load, &s.last.load),
+        (ids.mem, &s.last.mem),
+    ] {
+        if let Ok(mut l) = ui.widget_mut::<Label>(id) {
+            l.set_text(reading.clone().unwrap_or_default());
+        }
+    }
 }
 
 /// The label a window-list button shows: the window's label, with a
@@ -797,7 +1019,7 @@ pub fn entry_text_role(minimized: bool) -> ColorRole {
     }
 }
 
-/// Insert or update one window's entry.
+/// Insert or update one window's entry, on every panel.
 ///
 /// There is no separate "added" path: the server sends the same
 /// `WindowInfo` for the snapshot and for every later change, so keying on
@@ -818,7 +1040,7 @@ pub fn entry_text_role(minimized: bool) -> ColorRole {
 /// alone was not enough — it only ever hid *this* bar, so with the
 /// wallpaper and the launcher running the list showed `nitro-wallpaper`
 /// and `nitro-launcher` as windows.
-fn upsert(s: &mut Bar, ui: &mut Ui<Bar>, ids: Ids, info: &WindowInfo) {
+fn upsert(s: &mut Bar, ui: &mut Ui<Bar>, info: &WindowInfo) {
     if info.app_id == APP_NAME || info.layer != Layer::Normal {
         // A window can change layer, so this is a *removal*, not just a
         // skip: an application that became a shell surface after it was
@@ -826,11 +1048,26 @@ fn upsert(s: &mut Bar, ui: &mut Ui<Bar>, ids: Ids, info: &WindowInfo) {
         remove(s, ui, info.window);
         return;
     }
+    // Remembered first, so a panel opened later lists it too.
+    if let Some(i) = s.infos.iter_mut().find(|i| i.window == info.window) {
+        i.clone_from(info);
+    } else {
+        s.infos.push(info.clone());
+    }
+    for idx in 0..s.panels.len() {
+        upsert_in(s, ui, idx, info);
+    }
+}
+
+/// [`upsert`] for one panel, whose `WindowInfo` has already passed the
+/// filter above.
+fn upsert_in(s: &mut Bar, ui: &mut Ui<Bar>, idx: usize, info: &WindowInfo) {
     let text = entry_label(info);
     let icon = entry_icon(info);
     let window = info.window;
     let minimized = info.state == WindowState::Minimized;
-    if let Some(e) = s.entries.iter_mut().find(|e| e.window == window) {
+    let panel = &mut s.panels[idx];
+    if let Some(e) = panel.entries.iter_mut().find(|e| e.window == window) {
         let id = e.id;
         e.text.clone_from(&text);
         e.focused = info.focused;
@@ -934,8 +1171,14 @@ fn upsert(s: &mut Bar, ui: &mut Ui<Bar>, ids: Ids, info: &WindowInfo) {
                 //   the focused row was a button that did nothing.
                 //
                 // No new wire message: minimizing goes out as the
-                // `SetWindowStateFor` the bar could already send.
-                let entry = s.entries.iter().find(|e| e.window == window);
+                // `SetWindowStateFor` the bar could already send. Every
+                // panel's entry for the window says the same, so the
+                // first one found is the answer.
+                let entry = s
+                    .panels
+                    .iter()
+                    .flat_map(|p| p.entries.iter())
+                    .find(|e| e.window == window);
                 let put_away = entry.is_some_and(|e| e.focused && !e.minimized);
                 if put_away {
                     let _ = ui.set_window_state_for(window, WindowState::Minimized);
@@ -952,7 +1195,8 @@ fn upsert(s: &mut Bar, ui: &mut Ui<Bar>, ids: Ids, info: &WindowInfo) {
                 let _ = ui.close_window(window);
             }),
     );
-    if ui.attach(ids.windows, id).is_err() {
+    let panel = &mut s.panels[idx];
+    if ui.attach(panel.ids.windows, id).is_err() {
         // Unreachable while `ids.windows` outlives the tree, which it
         // does — but a button left in the arena with no parent and
         // nothing pointing at it would be a leak that never announced
@@ -960,7 +1204,7 @@ fn upsert(s: &mut Bar, ui: &mut Ui<Bar>, ids: Ids, info: &WindowInfo) {
         let _ = ui.remove(id);
         return;
     }
-    s.entries.push(Entry {
+    panel.entries.push(Entry {
         window,
         text,
         icon,
@@ -970,15 +1214,18 @@ fn upsert(s: &mut Bar, ui: &mut Ui<Bar>, ids: Ids, info: &WindowInfo) {
     });
 }
 
-/// Drop a window's entry and its button.
+/// Drop a window's entry and its button, on every panel.
 fn remove(s: &mut Bar, ui: &mut Ui<Bar>, window: WindowRef) {
-    let Some(i) = s.entries.iter().position(|e| e.window == window) else {
-        return;
-    };
-    let e = s.entries.remove(i);
-    // One `DestroyNode` on the button's group frees the subtree
-    // server-side; a stale id afterwards is an error, never a panic.
-    let _ = ui.remove(e.id);
+    s.infos.retain(|i| i.window != window);
+    for panel in &mut s.panels {
+        let Some(i) = panel.entries.iter().position(|e| e.window == window) else {
+            continue;
+        };
+        let e = panel.entries.remove(i);
+        // One `DestroyNode` on the button's group frees the subtree
+        // server-side; a stale id afterwards is an error, never a panic.
+        let _ = ui.remove(e.id);
+    }
 }
 
 /// The `hey`-addressable name of a window-list entry.
@@ -1009,13 +1256,16 @@ fn tick_clock(ui: &mut Ui<Bar>, ids: Ids) {
 /// long until the next :00", recomputed each time. A fixed 60 s repeat
 /// would drift off the boundary over hours and eventually tick at :30.
 fn apply_clock(s: &mut Bar, ui: &mut Ui<Bar>, ids: Ids) {
+    ensure_main(s, ids);
     let now = s.now_ms();
     let text = clock::format_hm(now.div_euclid(1_000), &s.zone);
     if text != s.clock_text {
         s.clock_text.clone_from(&text);
         s.ticks += 1;
-        if let Ok(mut l) = ui.widget_mut::<Label>(ids.clock) {
-            l.set_text(text);
+        for p in &s.panels {
+            if let Ok(mut l) = ui.widget_mut::<Label>(p.ids.clock) {
+                l.set_text(text.clone());
+            }
         }
     }
     let ms = clock::ms_to_next_minute(now);
@@ -1049,17 +1299,20 @@ fn arm_first_sensor_poll(ui: &mut Ui<Bar>, ids: Ids) {
 /// nothing on the wire: the poll happens, the tree does not move, and
 /// `flush` sends no commit.
 fn poll_sensors(s: &mut Bar, ui: &mut Ui<Bar>, ids: Ids) {
+    ensure_main(s, ids);
     let now = (s.source)();
     s.polls += 1;
     if now != s.last {
-        for (id, reading) in [
-            (ids.battery, &now.battery),
-            (ids.load, &now.load),
-            (ids.mem, &now.mem),
-        ] {
-            let text = reading.clone().unwrap_or_default();
-            if let Ok(mut l) = ui.widget_mut::<Label>(id) {
-                l.set_text(text);
+        for p in &s.panels {
+            for (id, reading) in [
+                (p.ids.battery, &now.battery),
+                (p.ids.load, &now.load),
+                (p.ids.mem, &now.mem),
+            ] {
+                let text = reading.clone().unwrap_or_default();
+                if let Ok(mut l) = ui.widget_mut::<Label>(id) {
+                    l.set_text(text);
+                }
             }
         }
         s.last = now;
