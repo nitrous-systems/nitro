@@ -1422,7 +1422,6 @@ impl Scene {
             if users.is_empty() {
                 self.unreferenced.push(old.buffer);
             }
-
         }
         if let Some(image) = image {
             self.buffer_users.entry(image.buffer).or_default().push(key);
@@ -1569,7 +1568,6 @@ impl Scene {
         self.unreferenced = pending;
     }
 
-
     fn prune_buffer_users(&mut self, key: BufferKey) {
         let live = &self.nodes;
         if let Some(users) = self.buffer_users.get_mut(&key) {
@@ -1582,7 +1580,6 @@ impl Scene {
             if before > 0 && users.is_empty() {
                 self.unreferenced.push(key);
             }
-
         }
     }
 
@@ -1724,7 +1721,6 @@ impl Scene {
                 if users.is_empty() {
                     self.unreferenced.push(image.buffer);
                 }
-
             }
             self.nodes.remove(k);
         }

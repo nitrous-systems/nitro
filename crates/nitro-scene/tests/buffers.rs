@@ -686,7 +686,9 @@ fn a_destroyed_or_never_attached_buffer_is_not_released() {
     assert!(released(&mut s).is_empty());
     // Destroying an attached buffer empties the image without a release.
     let fresh = desc();
-    let third = s.create_buffer(CLIENT, fresh, vec![0; fresh.byte_len()]).unwrap();
+    let third = s
+        .create_buffer(CLIENT, fresh, vec![0; fresh.byte_len()])
+        .unwrap();
     s.set_image(CLIENT, image, Some(ImageRef::new(third, src())))
         .unwrap();
     s.destroy_buffer(CLIENT, third).unwrap();

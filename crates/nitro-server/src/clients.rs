@@ -191,7 +191,10 @@ impl WireClient {
     /// The client's id for a scene buffer, if it still names one. A linear
     /// scan: the map holds a handful of buffers.
     pub fn buffer_id(&self, key: BufferKey) -> Option<BufferId> {
-        self.buffers.iter().find(|&(_, &k)| k == key).map(|(&id, _)| id)
+        self.buffers
+            .iter()
+            .find(|&(_, &k)| k == key)
+            .map(|(&id, _)| id)
     }
 
     /// Queue a message, ignoring an encode failure (the only way one can

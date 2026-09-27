@@ -209,7 +209,10 @@ impl Harness {
     fn sweep(&mut self, c: &Configure) {
         for i in 0..=8 {
             let t = i as f32 / 8.0;
-            self.point_at(c.position.x + t * SIDE as f32, c.position.y + t * SIDE as f32);
+            self.point_at(
+                c.position.x + t * SIDE as f32,
+                c.position.y + t * SIDE as f32,
+            );
             self.settle();
         }
         self.park();
@@ -368,7 +371,11 @@ fn a_client_that_waits_for_release_never_tears() {
     let mut seen = Vec::new();
     let mut a = Buf::new(1, RED);
     let b = Buf::new(2, GREEN);
-    conn.tx().create_buffer(a.create()).create_buffer(b.create()).commit(1).unwrap();
+    conn.tx()
+        .create_buffer(a.create())
+        .create_buffer(b.create())
+        .commit(1)
+        .unwrap();
     conn.flush().unwrap();
     presented(&mut conn, &mut seen, 1);
     let (_, image, c) = image_window(&mut conn, &mut seen, 10, &a, 2);
@@ -393,7 +400,10 @@ fn a_client_that_waits_for_release_never_tears() {
         .iter()
         .position(|m| matches!(m, ServerMsg::Presented(p) if p.serial == 3))
         .unwrap();
-    assert!(rel < pres, "the release is not held back to the flip: {seen:?}");
+    assert!(
+        rel < pres,
+        "the release is not held back to the flip: {seen:?}"
+    );
 
     // The client takes it at its word and scribbles into A. Nothing the
     // server repaints may show it.
@@ -488,7 +498,11 @@ fn without_the_cap_no_buffer_released_is_sent() {
     let mut seen = Vec::new();
     let a = Buf::new(1, RED);
     let b = Buf::new(2, GREEN);
-    conn.tx().create_buffer(a.create()).create_buffer(b.create()).commit(1).unwrap();
+    conn.tx()
+        .create_buffer(a.create())
+        .create_buffer(b.create())
+        .commit(1)
+        .unwrap();
     conn.flush().unwrap();
     presented(&mut conn, &mut seen, 1);
     let (_, image, c) = image_window(&mut conn, &mut seen, 10, &a, 2);
@@ -538,7 +552,11 @@ fn releases_cause_no_flip_and_no_wakeup_when_idle() {
     // An image node that is never on screen: hidden.
     let offscreen = NodeId(30);
     conn.tx()
-        .create_image(offscreen, root, Rect::new(0.0, 0.0, SIDE as f32, SIDE as f32))
+        .create_image(
+            offscreen,
+            root,
+            Rect::new(0.0, 0.0, SIDE as f32, SIDE as f32),
+        )
         .visible(offscreen, false)
         .image(offscreen, hidden.id, full())
         .commit(4)
