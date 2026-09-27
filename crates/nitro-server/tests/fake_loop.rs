@@ -1281,7 +1281,6 @@ fn releasing_buffers_restores_headroom() {
     h_.quit();
 }
 
-
 /// The name `cycling_buffers_does_not_leak_the_clients_mappings` gives
 /// its memfds, and the string `mapped_buffers` recognises them by.
 const BUFFER_MEMFD_NAME: &str = "nitro-cycle";

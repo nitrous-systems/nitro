@@ -120,7 +120,6 @@ const _: () = assert!(
 /// reached; if this ever fires in practice, that is the follow-up.
 pub const MAX_MAPPED_BYTES_ALL_CLIENTS: u64 = 1024 * 1024 * 1024;
 
-
 /// Maximum nodes one client may hold. The scene is a shared resource and a
 /// client in a loop must not be able to exhaust it.
 pub const MAX_NODES_PER_CLIENT: usize = 20_000;
@@ -163,7 +162,6 @@ pub struct BufferBudget {
     /// in by the caller, the only thing that can see the other clients.
     pub all_clients_bytes: u64,
 }
-
 
 /// One connected wire client.
 #[derive(Debug)]
@@ -307,7 +305,6 @@ impl WireClient {
             all_clients_bytes: bytes,
         }
     }
-
 
     /// Queue a message, ignoring an encode failure (the only way one can
     /// happen is a string longer than the protocol allows, which the server
@@ -510,7 +507,6 @@ pub fn apply(
                     .create_buffer(client.id, desc, data)
                     .map_err(|e| scene_err("CreateBuffer", e))?;
                 client.buffers.insert(id, HeldBuffer { key, bytes });
-
             }
             Pending::Msg(msg) => apply_msg(client, scene, text, icons, *msg, &mut outcome)?,
         }
@@ -538,7 +534,6 @@ fn before_key(client: &WireClient, id: NodeId) -> Result<Option<NodeKey>, ApplyE
 
 fn buffer_key(client: &WireClient, id: BufferId) -> Result<BufferKey, ApplyError> {
     client.buffers.get(&id).map(|h| h.key).ok_or_else(|| {
-
         ApplyError::new(
             ErrorCode::BadBuffer,
             format!("no buffer with id {}", id.raw()),
