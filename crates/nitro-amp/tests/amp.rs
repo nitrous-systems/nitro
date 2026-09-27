@@ -671,3 +671,60 @@ fn paths_from_the_command_line_fill_the_list_and_play() {
     run_until(&mut h, "playing", |h| h.state().status().token > 0);
     run_until(&mut h, "the list to finish", |h| !h.state().is_ticking());
 }
+
+/// Every widget with a size inside the window's width and height, or
+/// the widget's path.
+fn spills(h: &mut Harness<Amp>) -> Vec<String> {
+    let win = h.ui().window_size();
+    let root = h.ui().root().expect("a root");
+    let mut out = Vec::new();
+    let mut stack = h.ui().children(root);
+    while let Some(id) = stack.pop() {
+        stack.extend(h.ui().children(id));
+        let b = h.bounds(id);
+        if b.w <= 0.0 || b.h <= 0.0 {
+            continue;
+        }
+        if b.x < -0.5 || b.x + b.w > win.w + 0.5 || b.y < -0.5 || b.y + b.h > win.h + 0.5 {
+            let path = nitro_ui::introspect::path_of(h.ui(), id).unwrap_or_default();
+            out.push(format!("{path} {b:?} in {win:?}"));
+        }
+    }
+    out
+}
+
+#[test]
+fn nothing_spills_out_of_the_narrowest_window() {
+    let mut h = harness();
+    let long = "A Very Long Artist Name — An Even Longer Track Title (Extended Remix)";
+    for name in ["title", "status"] {
+        let id = named(&mut h, name);
+        h.ui().widget_mut::<Label>(id).unwrap().set_text(long);
+    }
+    h.settle();
+    let tall = h.ui().window_size().h;
+
+    // The window will not go narrower than the transport row needs.
+    let _ = h.ui().request_window_size(Size::new(100.0, tall));
+    h.settle();
+    let narrowest = h.ui().window_size().w;
+    h.configure(Size::new(narrowest, tall));
+    h.settle();
+    let s = spills(&mut h);
+    assert!(s.is_empty(), "spilled at {narrowest} px: {s:#?}");
+
+    // Squeezed down to the list's floor.
+    h.configure(Size::new(narrowest, 1.0));
+    h.settle();
+    let s = spills(&mut h);
+    assert!(s.is_empty(), "spilled at the list's floor: {s:#?}");
+
+    // And with the sections folded away.
+    act(&mut h, "pl", "activate", None);
+    act(&mut h, "eq", "activate", None);
+    let folded = h.ui().natural_size().h;
+    h.configure(Size::new(narrowest, folded));
+    h.settle();
+    let s = spills(&mut h);
+    assert!(s.is_empty(), "spilled folded: {s:#?}");
+}

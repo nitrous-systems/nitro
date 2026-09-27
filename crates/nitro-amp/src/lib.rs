@@ -140,9 +140,12 @@ const TITLE_CELLS: usize = 34;
 /// Seconds `←` and `→` seek by.
 const SEEK_STEP: f64 = 5.0;
 
-/// The narrowest the window may be: the transport row's buttons and
-/// toggles, side by side.
-const MIN_WIDTH: f32 = 440.0;
+/// The narrowest the window may be: the transport row — six buttons,
+/// a spacer, `shuffle` and `repeat`, about 437 px — plus the main
+/// panel's padding (2 × 10) and the root's (2 × 8), 473 px, rounded up
+/// for slack in font metrics. Not `natural_size().w`: that is measured
+/// unbounded, so it grows with the track title.
+const MIN_WIDTH: f32 = 480.0;
 
 /// The playlist's natural height, and the least it may be squeezed to.
 const LIST_HEIGHT: f32 = 180.0;
@@ -1230,7 +1233,9 @@ pub fn build(ui: &mut Ui<Amp>) -> WidgetId {
             .width_percent(1.0),
     );
     let readout = ui.build(
-        column().gap(2.0).grow(1.0).child(
+        // Shrinks to zero so the title elides instead of pushing past
+        // the window.
+        column().gap(2.0).grow(1.0).shrink_to_zero().child(
             row()
                 .gap(10.0)
                 .cross_align(CrossAlign::End)
