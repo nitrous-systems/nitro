@@ -1084,6 +1084,124 @@ reasoning**, and the second is the one worth carrying:
   control that must succeed**, and the calibration has to be measured
   from the ink, not taken from the tool's flag name.
 
+## Popups
+
+Menus and tooltips (M5-G, #3773): `CreatePopup` / `RepositionPopup` /
+`PopupDone` behind `caps::POPUP`. What Wayland calls a popup is Chromium's
+`kMenu`/`kTooltip`; `kPopup`/`kBubble` are subsurfaces and use ordinary
+nodes in the parent window.
+
+### A popup is a window with a parent
+
+Not a node kind. `Scene::create_popup` makes an ordinary `Window` with
+`Window::parent` set, so the popup:
+
+* **escapes the parent's clip by construction.** Paint and hit testing
+  walk per-window roots, and one window's content clip never applies to
+  another window's tree. `set_clip` still refuses to unclip a content
+  group; a menu does not need it to.
+* is placed in output space in its own right, hit-tests as its own
+  surface, and gets its own `Configure` (output-global, like every other).
+* is created **undecorated, fixed-size and unfocusable**. It never goes
+  through `place_new_window`, so it cannot be framed, and `focusable:
+  false` keeps it out of deferred focus, `raise_and_focus` and `Alt+Tab`.
+* is **not** a desktop window: it is absent from the shell's window list.
+
+### Stacking
+
+A popup inherits its parent's `Layer` and sits **immediately above its
+parent's block** (the parent plus its popup descendants). So a menu is
+above its window and below another client's toplevel, and a menu off a
+`Top` panel is itself `Top` — above the panel, below `Overlay` — with no
+new layer and no special case. `raise`/`lower`/`set_layer` move the whole
+block, keeping its internal order, and a raise naming a popup is
+redirected to the chain root: a click inside a menu reaches
+`raise_and_focus` like any other click, and without the redirect it would
+pull the menu to the front and leave its parent behind.
+
+### Placement
+
+`src/popup.rs` is pure geometry. The anchor rectangle is in the parent's
+**content** space; the server offsets it by the parent's content position
+and constrains against the parent output's **work area** (shell zones
+subtracted, so a menu flips away from a bar rather than under it). The
+anchor picks a point of the rectangle, the gravity says which way the
+popup grows from it, and then, per axis and in `xdg_positioner`'s order:
+
+1. **flip** — invert anchor and gravity on that axis, and keep the result
+   **only if it fits**; an unhelpful flip reverts;
+2. **slide** — translate back inside, never pushing the near edge past
+   the area's origin;
+3. **resize** — shrink to the intersection (the new size is in the
+   `Configure`).
+
+A bit that is not set lets the popup overflow. Positions are rounded to
+whole logical pixels.
+
+**No anchor.** An empty `anchor_rect` (w or h ≤ 0) is the trigger for
+Chromium's own fallback (`xdg_popup.cc:246-251`): a 1×1 rectangle at
+`anchor_rect`'s origin, `TopLeft`, `BottomRight`, `FLIP_Y`, whatever the
+other fields say. This is the one place the spec was transposed: nitro's
+`CreatePopup` has no `bounds` to collapse, so the rectangle's own origin
+stands in for it.
+
+`RepositionPopup` replaces the stored positioner and re-places (anchor
+first, then the bounds that follow, the order `submenu_view.cc:579-586`
+uses). A parent that **moves or resizes** re-places its chain from the
+stored positioners rather than dismissing it. That runs on the drag path,
+so it allocates nothing: the walk reuses a scratch vector, a desktop with
+no popups pays one `is_empty`, and a drag with an open chain sends one
+extra `Configure` per popup per motion (chains are 1–3 deep).
+
+### The grab, Escape, and dismissal
+
+`popup_flags::GRAB` makes the chain's root hold the **pointer grab**. The
+check is the very first thing in `pointer_button`, above the release/drag
+branch and the frame regions: a press whose window under the pointer (hit
+tested fresh, not read from `pointer.over`) is outside the chain dismisses
+the **whole chain** and is **consumed** — not delivered, not a raise, not
+a focus change — and its release is swallowed too, so no client ever sees
+an unpaired `Released`. Below the frame branches, a title-bar press with a
+menu open would start a drag instead.
+
+Pointer **motion** is deliberately not redirected during a grab: hover in
+another window while a menu is open is harmless, and redirecting would
+mean synthesising coordinates for a client that never asked for them.
+
+**Escape** with a grabbing chain open dismisses the **whole chain** and is
+consumed (release included). It is checked after the compositor's own
+hotkeys and before the shell's bindings, and calls `cancel_tap` so a
+Super held at the time does not later fire the launcher. The trade is
+deliberate: because a popup never takes focus, an unconsumed Escape would
+reach the parent and let Chromium's menu controller close one submenu
+level at a time; the compositor takes that away in exchange for Escape
+always working. Only chains whose root took `GRAB` consume it — a tooltip
+never eats an Escape.
+
+**Unwinding.** Dismissing level *n* unmaps *n* and everything below it,
+**deepest first**, each **unmapped before it is notified** (the ordering
+Chromium expects, `xdg_popup.cc:351-358`). Unmapped means unplaced: in no
+z-order, neither painted nor hit, and not undoable by the client. The
+window itself survives until the client destroys its node, exactly like
+`Closed`; a `RepositionPopup` on a dismissed popup is ignored.
+
+**`PopupDone` is deferred.** Dismissal only ever enqueues; `settle` is
+the only sender, before its scene update. A parent destroyed by its own
+client's `DestroyNode` is dismissed while `commit` holds that client out
+of the client map, where a direct send would silently vanish — the
+`pending_focus` hazard, with the same answer.
+
+A chain is dismissed when: a click lands outside it, Escape, its parent is
+destroyed or its client disconnects, the parent is minimized or hidden
+(`SetVisible(false)`), or the parent is orphaned by an output going away
+(dismissed before the orphan migration, so no popup is ever migrated as a
+toplevel). A client destroying its own popup gets no `PopupDone` for it —
+it already knows — but its submenus do. A parent that is on **no output**
+when `CreatePopup` arrives is a hotplug race, not a lie: the popup is
+created and immediately dismissed, never an error.
+
+Chains are capped at 16 levels.
+
 ## What is deferred
 
 * **Workspaces / virtual desktops.** Not in M3 at all. The MRU list and

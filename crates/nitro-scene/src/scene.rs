@@ -804,8 +804,9 @@ impl Scene {
         window.position = position;
         if let Some(id) = output
             && let Some(index) = self.output_index(id)
+            && !self.outputs[index].layers[layer.index()].contains(&win)
         {
-            if !self.outputs[index].layers[layer.index()].contains(&win) {
+            {
                 // A popup goes immediately above its parent's block, not at
                 // the front of the layer: the front is where an unrelated
                 // toplevel belongs, and a menu that jumped there would float

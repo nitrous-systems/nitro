@@ -244,12 +244,13 @@ offer, the MIME list and the descriptor relay are shared, and
 `RequestSelection` names which of the two it means with a one-byte
 `DataSource`. Two bits would mean two copies of the same four messages.
 
-**None of bits 8–14 is advertised yet.** M5-A froze the protocol surface
-ahead of the behaviour, deliberately, so that the eight follow-up tasks
-implement against bytes nobody can still change. Until each lands, the
-server advertises no bit above 7 and refuses every M5-A client op with
-`Error { Protocol }` — which is the correct answer rather than a stub,
-because no conformant client sends one without the bit.
+**Of bits 8–14, only `POPUP` is advertised yet** (M5-G, #3773; always
+set). M5-A froze the protocol surface ahead of the behaviour, deliberately,
+so that the eight follow-up tasks implement against bytes nobody can still
+change. Until each of the rest lands, the server does not advertise its
+bit and refuses its client ops with `Error { Protocol }` — which is the
+correct answer rather than a stub, because no conformant client sends one
+without the bit.
 
 `SHELL` is bit 5, not bit 3: bit 3 is `REMOTE` and was taken in M1. It is
 *reported*, never negotiated — a client cannot ask for it. See
@@ -778,7 +779,26 @@ reported with [`PopupDone`](#popupdone--0x8106), after the popup has
 already been unmapped — the unmap-then-notify ordering Chromium expects.
 
 Authorized by **owning the parent window**, not by an input serial; see
-the Versioning policy.
+the Versioning policy. A `parent` the sender does not own is
+`Error { UnknownNode }` — another client's window is unnameable. A popup
+op from a client that did not list `POPUP` in its `ClientCaps` is
+`Error { Protocol }` at receipt (rule 3), which is also what makes
+`PopupDone` safe to push unconditionally.
+
+**No anchor: an empty `anchor_rect`.** A client with no positioner to
+send (Chromium creating a `kMenu` with no `ui::OwnedWindowAnchor`) sends an
+`anchor_rect` whose width or height is ≤ 0. The server then substitutes
+Chromium's own fallback (`ui/ozone/platform/wayland/host/xdg_popup.cc:246-251`)
+and **ignores** the other three positioner fields: the anchor rectangle
+becomes 1×1 at `anchor_rect`'s own origin (the point where the client
+wanted the popup — nitro has no `bounds` field to take it from), anchor
+`TopLeft`, gravity `BottomRight`, constraint `FLIP_Y`.
+
+A parent that is on no output when the popup arrives (a monitor unplugged
+between the click and the request) is a race, not a protocol violation:
+the popup is created and immediately answered with `PopupDone`, never an
+error. Chains are capped at 16 levels (`Error { Limit }`). See
+`docs/wm.md` § Popups for placement, the grab and dismissal.
 
 ### `RepositionPopup` — 0x0017
 
