@@ -295,3 +295,52 @@ fn window_scale_lerp() {
     // Clamped: taller than the monitor is treated as full height.
     assert_eq!(overview::window_scale(5000.0, 1000.0), 1.0);
 }
+
+/// GNOME's read-ahead quirk (`docs/research/overview.md` §2.2, the module
+/// doc's "Fidelity"): in the greedy row loop the height bump runs *before*
+/// the keep-same-row test, so the window that breaks out to the next row
+/// has already raised the height of the row it left.
+///
+/// `monitor_h = 100` puts every window above the monitor height, so
+/// `window_scale` is 1 for all of them and the arithmetic stays plain.
+/// A and B (1000×200) sit on top, C (2000×800) below; Σ width = 4000.
+///
+/// * 1 row: width 4000, height 800. Scale = min((1920-32)/4000,
+///   1080/800) = 0.472, space ≈ 0.350.
+/// * 2 rows, ideal 2000: A, B fit (1000, then 2000 ≤ 2000). C would make
+///   4000 (ratio 2 vs 1), so it breaks out — but has already bumped row 0's
+///   `full_height` from 200 to 800. Rows: 800 + 800 = 1600 tall, 2000 wide,
+///   2 columns. Scale = min((1920-16)/2000 = 0.952, (1080-64)/1600 =
+///   0.635, 0.95) = 0.635, space = 1286·1080/2073600 ≈ 0.670: better on
+///   both counts, taken.
+/// * 3 rows, ideal 1333: A | B | C, heights 200 + 800 (C's read-ahead
+///   again) + 800 = 1800, 1 column. Scale = min(1920/2000, 952/1800 ≈
+///   0.529) — worse on both counts, so the search stops at 2 rows.
+///
+/// Without the quirk, row 0 would be 200 tall, the 2-row grid 1000, and
+/// the scale the 0.95 cap (vertical 1016/1000, horizontal 0.952).
+///
+/// With it, at 0.635: rows are 508 + 64 + 508 = 1080, so row 0 starts at
+/// y = 0 and row 1 at 572. Row 0 is 635 + 16 + 635 = 1286 wide, x =
+/// (1920-1286)/2 = 317; A and B are 635×127, bottom-aligned in a 508 px
+/// row, so y = 508 - 127 = 381 — the 381 px above them is the row height C
+/// left behind. Row 1: C is 1270×508 at x = (1920-1270)/2 = 325.
+#[test]
+fn read_ahead_raises_the_row_left_behind() {
+    let t = [
+        thumb(0, 1000.0, 200.0, 400.0, 100.0),
+        thumb(1, 1000.0, 200.0, 1400.0, 100.0),
+        thumb(2, 2000.0, 800.0, 960.0, 700.0),
+    ];
+    let slots = overview::layout(&t, SCREEN, 100.0);
+    check(&t, SCREEN, &slots);
+    let [a, b, c] = [0, 1, 2].map(|i| slot_of(&slots, i));
+    for s in [a, b, c] {
+        assert!((s.scale - 0.635).abs() < 1e-5, "{s:?}");
+    }
+    assert_eq!(a.pos, Point::new(317.0, 381.0), "{a:?}");
+    assert_eq!(b.pos, Point::new(968.0, 381.0), "{b:?}");
+    assert_eq!(c.pos, Point::new(325.0, 572.0), "{c:?}");
+    assert!((a.size.w - 635.0).abs() < EPS && (a.size.h - 127.0).abs() < EPS);
+    assert!((c.size.w - 1270.0).abs() < EPS && (c.size.h - 508.0).abs() < EPS);
+}
