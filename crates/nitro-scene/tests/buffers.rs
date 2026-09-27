@@ -588,3 +588,107 @@ fn a_format_the_server_would_reject_is_never_an_occluder() {
     settle(&mut s);
     assert_eq!(paint_one(&s).opaque_cover(), None);
 }
+
+/// Drain the scene's released buffers.
+fn released(s: &mut Scene) -> Vec<(ClientId, BufferKey)> {
+    let mut out = Vec::new();
+    s.take_released_buffers(&mut out);
+    out
+}
+
+/// A window with one 32x32 image node, and two buffers.
+fn two_buffers(s: &mut Scene) -> (NodeKey, NodeKey, BufferKey, BufferKey) {
+    let (_, root) = window(s);
+    let d = desc();
+    let a = s.create_buffer(CLIENT, d, vec![0; d.byte_len()]).unwrap();
+    let b = s.create_buffer(CLIENT, d, vec![0; d.byte_len()]).unwrap();
+    let image = s.create_node(CLIENT, NodeKind::Image, root, None).unwrap();
+    s.set_bounds(CLIENT, image, Rect::new(0.0, 0.0, 32.0, 32.0))
+        .unwrap();
+    (root, image, a, b)
+}
+
+fn src() -> IRect {
+    IRect::new(0, 0, 32, 32)
+}
+
+#[test]
+fn switching_an_image_releases_the_old_buffer_only() {
+    let mut s = scene();
+    let (_, image, a, b) = two_buffers(&mut s);
+    s.set_image(CLIENT, image, Some(ImageRef::new(a, src())))
+        .unwrap();
+    assert!(released(&mut s).is_empty());
+    s.set_image(CLIENT, image, Some(ImageRef::new(b, src())))
+        .unwrap();
+    assert_eq!(released(&mut s), vec![(CLIENT, a)]);
+    assert!(released(&mut s).is_empty(), "reported once");
+    s.set_image(CLIENT, image, None).unwrap();
+    assert_eq!(released(&mut s), vec![(CLIENT, b)]);
+}
+
+#[test]
+fn a_shared_buffer_is_released_once_after_the_last_user() {
+    let mut s = scene();
+    let (root, image, a, _) = two_buffers(&mut s);
+    let other = s.create_node(CLIENT, NodeKind::Image, root, None).unwrap();
+    s.set_image(CLIENT, image, Some(ImageRef::new(a, src())))
+        .unwrap();
+    s.set_image(CLIENT, other, Some(ImageRef::new(a, src())))
+        .unwrap();
+    s.set_image(CLIENT, image, None).unwrap();
+    assert!(released(&mut s).is_empty());
+    s.set_image(CLIENT, other, None).unwrap();
+    assert_eq!(released(&mut s), vec![(CLIENT, a)]);
+    assert!(released(&mut s).is_empty());
+}
+
+#[test]
+fn destroying_the_node_or_window_releases() {
+    let mut s = scene();
+    let (_, image, a, b) = two_buffers(&mut s);
+    s.set_image(CLIENT, image, Some(ImageRef::new(a, src())))
+        .unwrap();
+    s.destroy_node(CLIENT, image).unwrap();
+    assert_eq!(released(&mut s), vec![(CLIENT, a)]);
+
+    let (win, root) = window(&mut s);
+    let image = s.create_node(CLIENT, NodeKind::Image, root, None).unwrap();
+    s.set_image(CLIENT, image, Some(ImageRef::new(b, src())))
+        .unwrap();
+    s.destroy_window(CLIENT, win).unwrap();
+    assert_eq!(released(&mut s), vec![(CLIENT, b)]);
+}
+
+#[test]
+fn detach_and_reattach_in_one_batch_releases_nothing() {
+    let mut s = scene();
+    let (_, image, a, b) = two_buffers(&mut s);
+    s.set_image(CLIENT, image, Some(ImageRef::new(a, src())))
+        .unwrap();
+    s.set_image(CLIENT, image, Some(ImageRef::new(b, src())))
+        .unwrap();
+    s.set_image(CLIENT, image, Some(ImageRef::new(a, src())))
+        .unwrap();
+    // b went unreferenced too, and stays so.
+    assert_eq!(released(&mut s), vec![(CLIENT, b)]);
+}
+
+#[test]
+fn a_destroyed_or_never_attached_buffer_is_not_released() {
+    let mut s = scene();
+    let (_, image, a, b) = two_buffers(&mut s);
+    s.set_image(CLIENT, image, Some(ImageRef::new(a, src())))
+        .unwrap();
+    s.set_image(CLIENT, image, None).unwrap();
+    s.destroy_buffer(CLIENT, a).unwrap();
+    s.destroy_buffer(CLIENT, b).unwrap();
+    assert!(released(&mut s).is_empty());
+    // Destroying an attached buffer empties the image without a release.
+    let d = desc();
+    let c = s.create_buffer(CLIENT, d, vec![0; d.byte_len()]).unwrap();
+    s.set_image(CLIENT, image, Some(ImageRef::new(c, src())))
+        .unwrap();
+    s.destroy_buffer(CLIENT, c).unwrap();
+    assert!(released(&mut s).is_empty());
+}

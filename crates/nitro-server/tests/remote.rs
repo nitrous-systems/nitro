@@ -725,6 +725,9 @@ fn data_is_not_advertised_on_a_remote_link() {
 
     let mut conn = h.remote_client("remote-data");
     assert_eq!(conn.caps() & caps::DATA, 0, "a remote link does not");
+    // Nor `RELEASE` (M5-B): a remote link cannot create buffers at all.
+    assert!(local.has_caps(caps::RELEASE), "a local link has releases");
+    assert_eq!(conn.caps() & caps::RELEASE, 0, "a remote link does not");
     let mut seen = Vec::new();
     // Raw rather than through `Connection::client_caps`, which masks the
     // bits to what the server advertised and so cannot make this mistake.

@@ -126,7 +126,9 @@ pub struct WireClient {
     /// `ClientCaps` stays a complete declaration. `DRAG` (M5-F) is not
     /// read: it carries no server→client message, and `StartMove` /
     /// `StartResize` are authorized by pointer focus and a held button
-    /// instead. `KEYMAP` (M5-C) is read twice: the `ClientCaps` that
+    /// instead. `RELEASE` (M5-B) gates `BufferReleased`: sent only to
+    /// clients that listed it (`Server::send_buffer_releases`).
+    /// `KEYMAP` (M5-C) is read twice: the `ClientCaps` that
     /// first lists it is what sends the `Keymap` + `Modifiers` snapshot
     /// (`Server::send_keymap`), and both messages — including the
     /// re-send after a layout change and every `Modifiers` after a key —
@@ -184,6 +186,12 @@ impl WireClient {
     #[must_use]
     pub fn owns_window(&self, win: WindowKey) -> bool {
         self.window_ids.contains_key(&win)
+    }
+
+    /// The client's id for a scene buffer, if it still names one. A linear
+    /// scan: the map holds a handful of buffers.
+    pub fn buffer_id(&self, key: BufferKey) -> Option<BufferId> {
+        self.buffers.iter().find(|&(_, &k)| k == key).map(|(&id, _)| id)
     }
 
     /// Queue a message, ignoring an encode failure (the only way one can

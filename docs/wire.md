@@ -250,15 +250,14 @@ offer, the MIME list and the descriptor relay are shared, and
 `RequestSelection` names which of the two it means with a one-byte
 `DataSource`. Two bits would mean two copies of the same four messages.
 
-**Of bits 8–14, only `POPUP`, `CURSOR`, `DRAG`, `OUTPUTS`, `KEYMAP` and
-`DATA` are advertised yet**: `POPUP` (M5-G, #3773), `CURSOR` (M5-E, #3771), `DRAG`
+**Of bits 8–14, all of `POPUP`, `CURSOR`, `DRAG`, `OUTPUTS`, `KEYMAP`,
+`RELEASE` and `DATA` are advertised**: `POPUP` (M5-G, #3773), `CURSOR` (M5-E, #3771), `DRAG`
 (M5-F, #3772) and `OUTPUTS` (M5-D, #3770) always, `KEYMAP` (M5-C, #3769)
-on every **local** link whose server compiled a keymap, `DATA` (M5-H, #3774) on every **local**
-link and
-
-never on a remote one (nor `KEYMAP`) — every leg of a transfer carries a descriptor,
-
-which TCP cannot (see [Descriptors on a remote link](#descriptors-on-a-remote-link)).
+on every **local** link whose server compiled a keymap, `RELEASE` (M5-B,
+#3768) on every **local** link and never on a remote one (which cannot
+create buffers at all), and `DATA` (M5-H, #3774) on every **local**
+link and never on a remote one (nor `KEYMAP`) — every leg of a transfer
+carries a descriptor, which TCP cannot (see [Descriptors on a remote link](#descriptors-on-a-remote-link)).
 The drag half of `DATA` is still refused until M5-I. M5-A froze the protocol surface ahead of the behaviour, deliberately,
 so that the eight follow-up tasks implement against bytes nobody can still
 change. Until each of the rest lands, the server does not advertise its
@@ -1763,10 +1762,29 @@ client still receives `Error { BadIcon }`, whatever its `ClientCaps` says.
 Fixed head **4 bytes**. Requires `RELEASE`.
 
 The server maps a client's pages and reads them at paint time, so a client
-that redraws into a buffer still being composited tears. `Presented` is a
-usable but **conservative** substitute — a buffer is free once blitted
-into the shadow, well before scanout — and this is the exact answer, which
-is what lets a two-buffer client avoid a frame of latency.
+that redraws into a buffer the server may still read tears.
+
+**The rule.** `BufferReleased` is sent **once** when a buffer stops being
+referenced by any `Image` node — through `SetImage` to another buffer or
+`NONE`, `DestroyNode`, or `DestroyWindow` — and is still unreferenced when
+the server has finished processing that wakeup. Painting always reads the
+*current* scene, so from then on the server never reads those pages
+again, on any output, whatever flips are pending. A buffer shown by nodes
+on several outputs is released once, when the last node lets go.
+
+**Why an attached buffer is never released.** Being blitted once does not
+make it free: any repaint of its area re-reads it — cursor motion over
+it, a window dragged across it, an expose, a lost shadow. A client that
+wants to redraw must therefore attach *another* buffer (double or triple
+buffering); the release of the old one arrives in reply to that commit.
+
+It is **not** sent for a buffer that was destroyed (`DestroyBuffer`, or a
+disconnect), nor for one that was never attached, nor for one detached
+and re-attached before the server settled. It rides the same write as the
+commit's other replies (`Presented`, `Configure`), so it never costs a
+wakeup, a flip or a timer of its own — and it typically arrives *before*
+that commit's `Presented`, which is what lets a two-buffer client avoid a
+frame of latency.
 
 It does **not** release the id: that is still `DestroyBuffer`. It says
 only that the pixels may be overwritten.

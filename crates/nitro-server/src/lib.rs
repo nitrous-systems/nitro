@@ -78,7 +78,9 @@ use nitro_kms::{
     OutputId as KmsOutputId, OutputInfo, Rect as KmsRect,
 };
 use nitro_raster::Canvas;
-use nitro_scene::{ClientId, DamageSink, OutputId as SceneOutputId, Scene, WindowKey, WindowState};
+use nitro_scene::{
+    BufferKey, ClientId, DamageSink, OutputId as SceneOutputId, Scene, WindowKey, WindowState,
+};
 use nitro_seat::{Device, Seat, SeatEvent};
 use nitro_wire::msg::{self, ClientMsg, ServerMsg};
 use nitro_wire::server::Listener as WireListener;
@@ -900,6 +902,9 @@ struct Server {
     /// A window placed this wakeup that should take focus once its
     /// client is back in `wire_clients`; see `place_new_window`.
     pending_focus: Option<WindowKey>,
+    /// Scratch for `send_buffer_releases`, kept to avoid an allocation per
+    /// settle.
+    released: Vec<(ClientId, BufferKey)>,
     /// Which window each live touch point started on, and where it is in
     /// that window's coordinates.
     touch_targets: HashMap<i32, (WindowKey, Point)>,
@@ -1244,6 +1249,7 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         input_dir: config.input_dir.clone(),
         focus: None,
         pending_focus: None,
+        released: Vec::new(),
         touch_targets: HashMap::new(),
         unplaced: Vec::new(),
         popups: HashMap::new(),
@@ -2332,7 +2338,33 @@ impl Server {
         self.claim_input_stamp();
         self.paint_or_defer();
         self.answer_idle_clients();
+        self.send_buffer_releases();
         self.flush_wire_clients();
+    }
+
+    /// Queue `BufferReleased` for every buffer no image node references
+    /// any more (`Scene::take_released_buffers`), to owners that listed
+    /// `caps::RELEASE`. Called just before the flush, so a release rides
+    /// the same write as the commit's other replies and never costs a
+    /// wakeup of its own. Releases for clients without the cap, or already
+    /// gone, are drained and dropped.
+    fn send_buffer_releases(&mut self) {
+        let mut released = std::mem::take(&mut self.released);
+        released.clear();
+        self.scene.take_released_buffers(&mut released);
+        for &(owner, key) in &released {
+            let Some(client) = self.wire_clients.values_mut().find(|c| c.id == owner) else {
+                continue;
+            };
+            if client.client_caps & nitro_wire::types::caps::RELEASE == 0 {
+                continue;
+            }
+            if let Some(id) = client.buffer_id(key) {
+                client.send(&ServerMsg::BufferReleased(msg::BufferReleased { id }));
+            }
+        }
+        released.clear();
+        self.released = released;
     }
 
     /// Answer the clients whose commit or frame request will not be
@@ -6286,6 +6318,12 @@ impl Server {
     /// It is the fact `REMOTE` states about buffers, expressed as the
     /// absence of a bit because `DATA` has one.
     ///
+    /// `RELEASE` (M5-B) is set on every **local** link and withheld on a
+    /// remote one, which cannot create buffers at all
+    /// (`refuse_remote_buffer_op`). `BufferReleased` goes out once a buffer is
+    /// referenced by no image node — painting reads the current scene, so
+    /// such a buffer is never read again (`send_buffer_releases`).
+    ///
     /// `OUTPUTS` (M5-D) is unconditional, for `WM`'s reason: the server
     /// always owns an output list, so `ListOutputs` is a promise it can
     /// always keep — on every link, a remote one included, since output
@@ -6328,7 +6366,7 @@ impl Server {
         if remote {
             caps |= nitro_wire::types::caps::REMOTE;
         } else {
-            caps |= nitro_wire::types::caps::DATA;
+            caps |= nitro_wire::types::caps::DATA | nitro_wire::types::caps::RELEASE;
             if self.keymap_fd.is_some() {
                 caps |= nitro_wire::types::caps::KEYMAP;
             }

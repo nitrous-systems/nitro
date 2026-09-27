@@ -48,6 +48,11 @@ pub struct Scene {
     /// rather than a tree walk. Entries may name dead nodes; they are pruned
     /// when walked.
     buffer_users: HashMap<BufferKey, Vec<NodeKey>>,
+    /// Buffers whose user list went empty since the last
+    /// [`take_released_buffers`](Scene::take_released_buffers); filtered
+    /// there, so re-attaches and destroys in the same batch are harmless.
+    unreferenced: Vec<BufferKey>,
+
     /// Window roots carrying dirt, deduplicated by `Node::queued`.
     pub(crate) dirty_roots: Vec<NodeKey>,
     /// Damage from things that are no longer where their cache says (nodes
@@ -79,6 +84,8 @@ impl Scene {
             buffers: Arena::new(),
             outputs: Vec::new(),
             buffer_users: HashMap::new(),
+            unreferenced: Vec::new(),
+
             dirty_roots: Vec::new(),
             pending: Vec::new(),
             admit: Admit::All,
@@ -1412,6 +1419,10 @@ impl Scene {
             && let Some(users) = self.buffer_users.get_mut(&old.buffer)
         {
             users.retain(|n| *n != key);
+            if users.is_empty() {
+                self.unreferenced.push(old.buffer);
+            }
+
         }
         if let Some(image) = image {
             self.buffer_users.entry(image.buffer).or_default().push(key);
@@ -1527,14 +1538,51 @@ impl Scene {
         Ok(())
     }
 
+    /// Drain the buffers no image node references any more, with their
+    /// owning clients, into `out` (which is not cleared).
+    ///
+    /// Painting always reads the *current* scene, so a live buffer that no
+    /// `Image` node references will never be read again, on any output —
+    /// its owner may rewrite it. Each buffer is reported once per transition
+    /// to unreferenced; a buffer re-attached since, destroyed since, or never
+    /// attached is not reported.
+    pub fn take_released_buffers(&mut self, out: &mut Vec<(ClientId, BufferKey)>) {
+        let mut pending = std::mem::take(&mut self.unreferenced);
+        pending.sort_unstable();
+        pending.dedup();
+        for key in pending.drain(..) {
+            let Some(buffer) = self.buffers.get(key) else {
+                continue;
+            };
+            let nodes = &self.nodes;
+            let used = self.buffer_users.get(&key).is_some_and(|users| {
+                users.iter().any(|n| {
+                    nodes.get(*n).is_some_and(
+                        |node| matches!(node.data, NodeData::Image(Some(i)) if i.buffer == key),
+                    )
+                })
+            });
+            if !used {
+                out.push((buffer.client, key));
+            }
+        }
+        self.unreferenced = pending;
+    }
+
+
     fn prune_buffer_users(&mut self, key: BufferKey) {
         let live = &self.nodes;
         if let Some(users) = self.buffer_users.get_mut(&key) {
+            let before = users.len();
             users.retain(|n| {
                 live.get(*n).is_some_and(
                     |node| matches!(node.data, NodeData::Image(Some(i)) if i.buffer == key),
                 )
             });
+            if before > 0 && users.is_empty() {
+                self.unreferenced.push(key);
+            }
+
         }
     }
 
@@ -1673,6 +1721,10 @@ impl Scene {
                 && let Some(users) = self.buffer_users.get_mut(&image.buffer)
             {
                 users.retain(|n| *n != k);
+                if users.is_empty() {
+                    self.unreferenced.push(image.buffer);
+                }
+
             }
             self.nodes.remove(k);
         }
