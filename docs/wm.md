@@ -938,11 +938,13 @@ the VT switched away) the fade waits, then snaps to 1.0 on the next flip.
 
 Measured cost of one fade frame (release, FakeBackend, 1920x1080, 800x600
 windows): **0.26 ms** with 4 thumbnails and **0.73 ms** with 8. With 16 it
-is **3.7 ms**. Sixteen badges are 32 damage rects (icon and pill), which
-overflows `Damage::MAX_RECTS` (16), and the region collapses to one
-1407x396 box over two rows of scaled thumbnails. With the cap at 32 the
-same frame is 1.5 ms. That is recorded as issue #649, not changed here. The
-cost holds for the ~12 frames of the fade and is well inside a 60 Hz frame.
+was **3.7 ms** while overflow collapsed the region to a bounding box:
+sixteen badges are 32 damage rects (icon and pill), which overflows
+`Damage::MAX_RECTS` (16), and the whole region became one 1407x396 box
+over two rows of scaled thumbnails. Overflow now merges the pair whose
+union wastes the least area, so each badge's icon and pill pair up into
+16 rects (~126k px), and the frame costs about the 1.5 ms measured with a
+cap of 32. The cost holds for the ~12 frames of the fade and is well inside a 60 Hz frame.
 
 Anything that later wants the scrim fade, slot motion or a scale animation
 must first add a downscale cache in `nitro-raster`. It was measured at
