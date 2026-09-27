@@ -1191,7 +1191,7 @@ pub struct Switch<S> {
     label: String,
     checked: bool,
     enabled: bool,
-    style: Option<TextStyle>,
+    style: crate::TextStyleOverride,
     on_toggle: Option<ToggleFn<S>>,
     metrics: crate::wire::TextMetrics,
 }
@@ -1225,9 +1225,7 @@ impl<S> Switch<S> {
     }
 
     fn resolved_style(&self, theme: &crate::Theme) -> TextStyle {
-        self.style
-            .clone()
-            .unwrap_or_else(|| TextStyle::from_theme(theme))
+        self.style.resolve(theme)
     }
 }
 
@@ -1490,7 +1488,7 @@ pub fn switch<S: 'static>(text: impl Into<String>) -> SwitchBuilder<S> {
             label: text.into(),
             checked: false,
             enabled: true,
-            style: None,
+            style: crate::TextStyleOverride::default(),
             on_toggle: None,
             metrics: crate::wire::TextMetrics::default(),
         },

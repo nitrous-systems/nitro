@@ -239,7 +239,7 @@ pub fn panel<S: 'static>() -> PanelBuilder<S> {
 #[derive(Debug)]
 pub struct Label {
     text: String,
-    style: Option<TextStyle>,
+    style: crate::TextStyleOverride,
     color: Option<Color>,
     /// A colour named by *role* rather than by value.
     ///
@@ -341,10 +341,14 @@ impl Label {
         self.elisions
     }
 
-    /// The explicit text style, if one was set.
+    /// The text-style fields this label overrode, if any.
+    ///
+    /// Sparse on purpose: a field left `None` is not "unset", it is
+    /// "whatever the theme says", resolved at paint time. See
+    /// [`crate::TextStyleOverride`].
     #[must_use]
-    pub fn style(&self) -> Option<&TextStyle> {
-        self.style.as_ref()
+    pub fn style(&self) -> &crate::TextStyleOverride {
+        &self.style
     }
 
     /// The explicit colour, if one was set.
@@ -360,9 +364,7 @@ impl Label {
     }
 
     fn resolved_style(&self, theme: &crate::Theme) -> TextStyle {
-        self.style
-            .clone()
-            .unwrap_or_else(|| TextStyle::from_theme(theme))
+        self.style.resolve(theme)
     }
 
     /// Forget any elision, so the next `measure` recomputes it.
@@ -610,8 +612,12 @@ impl<S: 'static> WidgetMut<'_, Label, S> {
     }
 
     /// Replace the text style.
+    ///
+    /// Unlike a builder setter this pins **all four** fields: a caller
+    /// handing over a whole [`TextStyle`] really does mean one exact
+    /// style, so nothing is left for the theme to decide.
     pub fn set_text_style(&mut self, style: TextStyle) {
-        self.style = Some(style);
+        self.style = crate::TextStyleOverride::all(style);
         self.invalidate_elision();
         self.request_layout();
     }
@@ -658,36 +664,28 @@ impl<S: 'static> LabelBuilder<S> {
     /// Set the font size in logical pixels.
     #[must_use]
     pub fn size(mut self, px: f32) -> Self {
-        let mut s = self.label.style.unwrap_or_default();
-        s.size_px = px;
-        self.label.style = Some(s);
+        self.label.style.size_px = Some(px);
         self
     }
 
     /// Set the font family: a name, or one of `sans`, `serif`, `mono`.
     #[must_use]
     pub fn family(mut self, family: impl Into<String>) -> Self {
-        let mut s = self.label.style.unwrap_or_default();
-        s.family = family.into();
-        self.label.style = Some(s);
+        self.label.style.family = Some(family.into());
         self
     }
 
     /// Set the weight (400 regular, 700 bold).
     #[must_use]
     pub fn weight(mut self, weight: u16) -> Self {
-        let mut s = self.label.style.unwrap_or_default();
-        s.weight = weight;
-        self.label.style = Some(s);
+        self.label.style.weight = Some(weight);
         self
     }
 
     /// Select an italic face.
     #[must_use]
     pub fn italic(mut self) -> Self {
-        let mut s = self.label.style.unwrap_or_default();
-        s.italic = true;
-        self.label.style = Some(s);
+        self.label.style.italic = Some(true);
         self
     }
 
@@ -792,7 +790,7 @@ impl<S: 'static> IntoWidget<S> for LabelBuilder<S> {
 pub fn label<S: 'static>(text: impl Into<String>) -> LabelBuilder<S> {
     let label = Label {
         text: text.into(),
-        style: None,
+        style: crate::TextStyleOverride::default(),
         color: None,
         color_role: None,
         align: Align::Left,
@@ -861,7 +859,7 @@ pub struct Button<S> {
     /// A pinned role for the label, or `None` for the one the button's
     /// current state implies; see [`ButtonBuilder::text_role`].
     text_role: Option<nitro_core::Role>,
-    style: Option<TextStyle>,
+    style: crate::TextStyleOverride,
     on_click: Option<ClickFn<S>>,
     /// The **middle**-button callback; see [`ButtonBuilder::on_alt_click`].
     on_alt_click: Option<ClickFn<S>>,
@@ -1000,9 +998,7 @@ impl<S> Button<S> {
     }
 
     fn resolved_style(&self, theme: &crate::Theme) -> TextStyle {
-        self.style
-            .clone()
-            .unwrap_or_else(|| TextStyle::from_theme(theme))
+        self.style.resolve(theme)
     }
 }
 
@@ -1721,9 +1717,7 @@ impl<S: 'static> ButtonBuilder<S> {
     /// Set the label's font size.
     #[must_use]
     pub fn size(mut self, px: f32) -> Self {
-        let mut s = self.button.style.unwrap_or_default();
-        s.size_px = px;
-        self.button.style = Some(s);
+        self.button.style.size_px = Some(px);
         self
     }
 }
@@ -1760,7 +1754,7 @@ pub fn button<S: 'static>(text: impl Into<String>) -> ButtonBuilder<S> {
         enabled: true,
         pressed: false,
         text_role: None,
-        style: None,
+        style: crate::TextStyleOverride::default(),
         on_click: None,
         on_alt_click: None,
         metrics: crate::wire::TextMetrics::default(),
@@ -1909,7 +1903,7 @@ pub struct TextField<S> {
     /// none.
     anchor: usize,
     enabled: bool,
-    style: Option<TextStyle>,
+    style: crate::TextStyleOverride,
     on_change: Option<ChangeFn<S>>,
     on_submit: Option<ChangeFn<S>>,
     metrics: crate::wire::TextMetrics,
@@ -2000,9 +1994,7 @@ impl<S> TextField<S> {
     }
 
     fn resolved_style(&self, theme: &crate::Theme) -> TextStyle {
-        self.style
-            .clone()
-            .unwrap_or_else(|| TextStyle::from_theme(theme))
+        self.style.resolve(theme)
     }
 
     /// Whether the field masks its text.
@@ -2720,9 +2712,7 @@ impl<S: 'static> TextFieldBuilder<S> {
     /// Set the font size.
     #[must_use]
     pub fn size(mut self, px: f32) -> Self {
-        let mut s = self.field.style.take().unwrap_or_default();
-        s.size_px = px;
-        self.field.style = Some(s);
+        self.field.style.size_px = Some(px);
         self
     }
 }
@@ -2760,7 +2750,7 @@ pub fn text_field<S: 'static>(text: impl Into<String>) -> TextFieldBuilder<S> {
         cursor,
         anchor: cursor,
         enabled: true,
-        style: None,
+        style: crate::TextStyleOverride::default(),
         on_change: None,
         on_submit: None,
         metrics: crate::wire::TextMetrics::default(),
@@ -2785,7 +2775,7 @@ pub struct Checkbox<S> {
     label: String,
     checked: bool,
     enabled: bool,
-    style: Option<TextStyle>,
+    style: crate::TextStyleOverride,
     on_toggle: Option<ToggleFn<S>>,
     metrics: crate::wire::TextMetrics,
 }
@@ -2819,9 +2809,7 @@ impl<S> Checkbox<S> {
     }
 
     fn resolved_style(&self, theme: &crate::Theme) -> TextStyle {
-        self.style
-            .clone()
-            .unwrap_or_else(|| TextStyle::from_theme(theme))
+        self.style.resolve(theme)
     }
 }
 
@@ -3088,7 +3076,7 @@ pub fn checkbox<S: 'static>(label: impl Into<String>) -> CheckboxBuilder<S> {
         label: label.into(),
         checked: false,
         enabled: true,
-        style: None,
+        style: crate::TextStyleOverride::default(),
         on_toggle: None,
         metrics: crate::wire::TextMetrics::default(),
     };

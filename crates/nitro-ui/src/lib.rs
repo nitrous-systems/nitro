@@ -149,7 +149,7 @@ pub use nitro_wire::msg::Fill;
 pub use nitro_wire::msg::Error as ServerError;
 pub use nitro_wire::types::ErrorCode;
 pub use shell::{Anchor, ShellEvent, Surface};
-pub use theme::{TextStyle, Theme};
+pub use theme::{TextStyle, TextStyleOverride, Theme};
 pub use ui::{FdToken, Frame, Node, TimerId, Ui, WidgetMut, WindowId};
 pub use widget::{
     Access, EventCx, IconTint, LayoutCx, MeasureCx, PaintCx, Role, Slot, TextRun, Widget,

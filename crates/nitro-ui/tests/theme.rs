@@ -316,3 +316,114 @@ fn a_re_sent_palette_runs_no_theme_handler() {
     assert_eq!(*h.ui().palette(), Palette::dark());
     h.quit();
 }
+
+/// Build two labels with the same text under a `mono` theme — one plain,
+/// one that only asked for a size — and report the widths the tree gave
+/// them plus what `mono` and `sans` measure at that size.
+///
+/// The four numbers are the whole argument: plain must equal mono, sized
+/// must equal plain, and mono must differ from sans or the box has one
+/// font and nothing was proved.
+fn sized_vs_plain(
+    setter: impl FnOnce(nitro_ui::widgets::LabelBuilder<()>) -> nitro_ui::widgets::LabelBuilder<()>,
+    weight: u16,
+) -> Option<(f32, f32, f32, f32)> {
+    const TEXT: &str = "MMMMMMMMMM";
+    let theme = Theme {
+        font_family: "mono".to_owned(),
+        ..Theme::default()
+    };
+    let px = theme.font_size;
+
+    let mut h = Harness::with(
+        "sized-keeps-family",
+        (),
+        Some(Size::new(400.0, 120.0)),
+        theme,
+        |ui: &mut Ui<()>| {
+            let plain = ui.build(label(TEXT).name("plain"));
+            let sized = ui.build(setter(label(TEXT).name("sized")));
+            let root = ui.build(column().padding(0.0).gap(0.0));
+            ui.attach(root, plain).unwrap();
+            ui.attach(root, sized).unwrap();
+            root
+        },
+    );
+    h.settle();
+    if !h.has_text() {
+        h.quit();
+        return None;
+    }
+    let root = h.ui().root().expect("root");
+    let kids = h.ui().children(root);
+    assert_eq!(kids.len(), 2);
+    let plain_w = h.bounds(kids[0]).w;
+    let sized_w = h.bounds(kids[1]).w;
+
+    let mut style = nitro_ui::TextStyle::new("mono", px);
+    style.weight = weight;
+    let mono = h
+        .ui()
+        .measure_text(TEXT, &style, 0.0)
+        .expect("measure mono")
+        .width;
+    "sans".clone_into(&mut style.family);
+    let sans = h
+        .ui()
+        .measure_text(TEXT, &style, 0.0)
+        .expect("measure sans")
+        .width;
+    h.quit();
+    Some((plain_w, sized_w, mono, sans))
+}
+
+#[test]
+fn a_sized_label_keeps_the_themes_family() {
+    // The bug: a builder's `.size(..)` used to materialise a whole
+    // `TextStyle` out of `TextStyle::default()`, whose family is `sans`.
+    // So `.size(theme.font_size)` — asking for the size the theme
+    // *already had* — silently moved the label off the theme's face.
+    // Measured before the fix, under a `mono` theme: plain 102 px, sized
+    // 146.7 px, i.e. the sized label was drawn in `sans`.
+    let px = Theme::default().font_size;
+    let Some((plain, sized, mono, sans)) = sized_vs_plain(|b| b.size(px), 400) else {
+        return;
+    };
+    assert!(
+        (mono - sans).abs() > 1.0,
+        "this box cannot tell mono from sans (both {mono}), so the test \
+         would pass for the wrong reason"
+    );
+    assert!(
+        (plain - mono).abs() <= 0.51,
+        "the plain label should measure as the theme's mono: {plain} vs {mono}"
+    );
+    // Against the *mono measurement*, not just against the sibling: a
+    // future bug that moved both labels off the theme would still pass a
+    // plain-vs-sized comparison.
+    assert!(
+        (sized - mono).abs() <= 0.51,
+        "the .size() label took sans, not the theme's mono: {sized} vs \
+         {mono} (sans is {sans})"
+    );
+}
+
+#[test]
+fn a_sized_and_weighted_label_still_keeps_the_themes_family() {
+    // The same failure mode, pinned independently of which setter ran
+    // first: whichever one materialised the style used to decide the
+    // family for all of them.
+    let px = Theme::default().font_size;
+    let Some((plain, sized, mono, sans)) = sized_vs_plain(|b| b.size(px).weight(700), 700) else {
+        return;
+    };
+    assert!(
+        (mono - sans).abs() > 1.0,
+        "this box cannot tell bold mono from bold sans (both {mono})"
+    );
+    assert!(
+        (sized - mono).abs() <= 0.51,
+        "the .size().weight() label took sans, not the theme's mono: \
+         {sized} vs {mono} (sans is {sans}); plain is {plain}"
+    );
+}

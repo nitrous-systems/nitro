@@ -200,6 +200,70 @@ impl Default for TextStyle {
     }
 }
 
+/// The text-style fields a builder actually set, each `None` for "take
+/// the theme's".
+///
+/// Why sparse rather than a whole [`TextStyle`]: a setter runs at build
+/// time, before the widget is attached, so it cannot see the theme. A
+/// setter that materialised a whole `TextStyle` out of `default()` — which
+/// is what these did until this type existed — silently pinned the other
+/// three fields to `sans`/14/400/upright, so `.size(18.0)` meant "**sans**
+/// at 18 px" and a theme with its own `font_family` drew two faces in one
+/// window depending on whether a builder setter happened to be called.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TextStyleOverride {
+    /// Family name, or `None` for the theme's.
+    pub family: Option<String>,
+    /// Size in logical pixels, or `None` for the theme's.
+    pub size_px: Option<f32>,
+    /// CSS-style weight, or `None` for regular.
+    pub weight: Option<u16>,
+    /// Whether to select an italic face, or `None` for upright.
+    pub italic: Option<bool>,
+}
+
+impl TextStyleOverride {
+    /// Whether any field was set.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.family.is_none()
+            && self.size_px.is_none()
+            && self.weight.is_none()
+            && self.italic.is_none()
+    }
+
+    /// The theme's style with whichever fields were set applied.
+    #[must_use]
+    pub fn resolve(&self, theme: &Theme) -> TextStyle {
+        let mut s = TextStyle::from_theme(theme);
+        if let Some(f) = &self.family {
+            s.family.clone_from(f);
+        }
+        if let Some(px) = self.size_px {
+            s.size_px = px;
+        }
+        if let Some(w) = self.weight {
+            s.weight = w;
+        }
+        if let Some(i) = self.italic {
+            s.italic = i;
+        }
+        s
+    }
+
+    /// Every field pinned to `style`'s, for a caller that really does mean
+    /// one exact style.
+    #[must_use]
+    pub fn all(style: TextStyle) -> Self {
+        Self {
+            family: Some(style.family),
+            size_px: Some(style.size_px),
+            weight: Some(style.weight),
+            italic: Some(style.italic),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,6 +284,53 @@ mod tests {
             t.font_size.to_bits()
         );
         assert_eq!(TextStyle::from_theme(&t).family, t.font_family);
+    }
+
+    #[test]
+    fn an_empty_override_is_exactly_the_themes_style() {
+        let t = Theme {
+            font_family: "mono".into(),
+            font_size: 17.0,
+            ..Theme::default()
+        };
+        let o = TextStyleOverride::default();
+        assert!(o.is_empty());
+        assert_eq!(o.resolve(&t), TextStyle::from_theme(&t));
+    }
+
+    #[test]
+    fn a_size_only_override_keeps_the_themes_family() {
+        // The bug this type exists for: asking for a size must not also
+        // pin the family to `TextStyle::default()`'s `sans`.
+        let t = Theme {
+            font_family: "mono".into(),
+            ..Theme::default()
+        };
+        let o = TextStyleOverride {
+            size_px: Some(18.0),
+            ..TextStyleOverride::default()
+        };
+        assert!(!o.is_empty());
+        let s = o.resolve(&t);
+        assert_eq!(s.family, "mono");
+        assert_eq!(s.size_px.to_bits(), 18.0f32.to_bits());
+        assert_eq!(s.weight, 400);
+        assert!(!s.italic);
+    }
+
+    #[test]
+    fn all_pins_every_field() {
+        let t = Theme {
+            font_family: "mono".into(),
+            ..Theme::default()
+        };
+        let style = TextStyle {
+            family: "serif".into(),
+            size_px: 9.5,
+            weight: 700,
+            italic: true,
+        };
+        assert_eq!(TextStyleOverride::all(style.clone()).resolve(&t), style);
     }
 
     #[test]

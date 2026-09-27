@@ -325,6 +325,15 @@ font size, radius, paddings. Those are not colours and a scheme switch
 leaves them alone (`Theme::with_palette`). An app does not normally call
 it.
 
+A builder's text-style setters — `.size(..)`, `.family(..)`, `.weight(..)`,
+`.italic()` — are *overrides on* the theme's style, not a replacement for
+it: each one pins its own field and leaves the rest to the theme, so
+`.size(18.0)` means "the theme's face at 18 px" rather than "sans at
+18 px". A setter runs at build time, before the widget is attached and can
+see a theme, so the fields it did not set are resolved at paint time
+(`TextStyleOverride`). `Label::set_text_style` is the exception, and says
+so: handing over a whole `TextStyle` pins all four fields.
+
 ### The three toolkit entry points
 
 | you want | you call |
