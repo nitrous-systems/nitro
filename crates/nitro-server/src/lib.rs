@@ -2795,7 +2795,6 @@ impl Server {
         // `painting`; if nothing is left to paint, no frame will carry it.
         self.answer_idle_clients();
         self.flush_wire_clients();
-
     }
 
     fn on_accept(&mut self) -> Result<(), Error> {

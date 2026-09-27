@@ -598,7 +598,11 @@ fn an_empty_commit_right_after_a_swap_is_presented() {
     let mut seen = Vec::new();
     let a = Buf::new(1, RED);
     let b = Buf::new(2, GREEN);
-    conn.tx().create_buffer(a.create()).create_buffer(b.create()).commit(1).unwrap();
+    conn.tx()
+        .create_buffer(a.create())
+        .create_buffer(b.create())
+        .commit(1)
+        .unwrap();
     conn.flush().unwrap();
     presented(&mut conn, &mut seen, 1);
     let (_, image, _) = image_window(&mut conn, &mut seen, 10, &a, 2);
