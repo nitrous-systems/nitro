@@ -419,6 +419,10 @@ Leaving the window forgets it — the stored request is dropped wherever
 `pointer.over` changes, and independently the bare desktop never consults
 one — so after re-entering the client must send it again, `wl_pointer`'s
 rule, which Chromium already follows by re-applying its cursor on enter.
+The displayed cursor reverts at once even when focus moves under a
+still pointer — a window closed, its client gone, a popup mapped or
+unmapped beneath it — so a client that hid the cursor and then died
+cannot leave the pointer invisible until the next motion (#644).
 A `SetCursor` from a client that does not hold the pointer is silently
 ignored. **Hiding** (`CursorShape::None`) damages exactly the old rect
 and nothing is painted until a shape comes back.

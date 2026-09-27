@@ -756,6 +756,10 @@ struct PopupSeat {
 /// sockets, then input (whose device fds belong to the seat), then the
 /// backend (which holds a dup of the DRM fd), then the seat's `Device`, and
 /// the seat last.
+// Independent flags about unrelated subsystems (the cursor's staleness
+// among them), not a state machine a bool cluster is hiding; an enum would
+// have to invent combinations nobody names.
+#[allow(clippy::struct_excessive_bools)]
 struct Server {
     wire_clients: HashMap<u64, WireClient>,
     clients: HashMap<u64, Client>,
@@ -832,6 +836,13 @@ struct Server {
     /// [`Server::requested_cursor`], which re-validates the window, so a
     /// stale entry can never be honoured.
     client_cursor: Option<(WindowKey, Option<crate::cursor::Shape>)>,
+    /// Pointer focus changed without a motion to re-derive the cursor —
+    /// a window closed or its client went under a still pointer, or a
+    /// popup mapped or unmapped beneath it. `settle` consumes it, so a
+    /// client that hid the cursor and then died cannot leave the pointer
+    /// invisible until the next motion (#644). `move_pointer` clears it
+    /// after its own choice, so the motion path pays no second hit test.
+    cursor_stale: bool,
     /// The shaped title run of each framed window, so a retitle can release
     /// the old one.
     frame_titles: HashMap<WindowKey, nitro_text::TextKey>,
@@ -1199,6 +1210,7 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         button_hover: None,
         cursor_shown: Some(crate::cursor::Shape::Arrow),
         client_cursor: None,
+        cursor_stale: false,
         frame_titles: HashMap::new(),
         scale_overrides: std::mem::take(&mut config.scales),
         mode_overrides: std::mem::take(&mut config.modes),
@@ -2300,6 +2312,13 @@ impl Server {
         if std::mem::take(&mut self.popup_seat.pointer_refresh) {
             self.refresh_pointer_over();
         }
+        // Pointer focus moved under a still pointer: the displayed cursor
+        // reverts to the server's own choice now, not at the next motion.
+        // After the scene update, so the hit test sees the window gone. A
+        // drag in flight owns the shape and is left alone.
+        if std::mem::take(&mut self.cursor_stale) && self.wm.drag().is_none() {
+            self.update_cursor_shape();
+        }
         self.claim_input_stamp();
         self.paint_or_defer();
         self.answer_idle_clients();
@@ -3202,6 +3221,7 @@ impl Server {
         // enter/leave, so a client's request is judged against the window
         // the pointer is on now, not the one it just left.
         self.set_cursor(self.cursor_choice(frame_hit));
+        self.cursor_stale = false;
         self.note_input(time_ns);
     }
 
@@ -4232,6 +4252,7 @@ impl Server {
     fn set_pointer_over(&mut self, over: Option<WindowKey>) {
         if self.pointer.over != over {
             self.client_cursor = None;
+            self.cursor_stale = true;
         }
         self.pointer.over = over;
     }

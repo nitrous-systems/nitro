@@ -489,11 +489,12 @@ clients' `SetCursor` (the I-beam, the hand, the hourglass and the rest a
 browser needs), so the figure is now **17 × 24 × 24 × 4 = 39 168 bytes**,
 pinned by `every_shape_has_the_documented_size`.
 
-That is 38.25 kB of a 2.5 MB `RssAnon` line, or **1.5 %** (it was 11.5 kB,
-0.5 %), and it is a constant: one allocation per server, not per output, per window or per
-pointer. What it buys is the affordance the frame could not carry — a
-band that says what it does before you press it — and it buys it without
-touching the two things this page is strict about:
+That is 38.25 kB of a 2.5 MB `RssAnon` line, or **1.5 %** (it was
+11.5 kB, 0.5 %), and it is a constant: one allocation per server, not
+per output, per window or per pointer. What it buys is the affordance the
+frame could not carry — a band that says what it does before you press
+it — and it buys it without touching the two things this page is strict
+about:
 
 * **No scene nodes.** The cursor is a blit after the paint list, not a
   node in it, so 11 nodes per decorated frame is unchanged.

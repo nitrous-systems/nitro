@@ -3408,6 +3408,52 @@ fn leaving_the_window_forgets_the_clients_shape() {
     h.quit();
 }
 
+/// A client that hid the cursor and then goes away must not leave the
+/// pointer invisible: the server's own choice comes back at once, with no
+/// motion to prompt it (#644). Both ways a window leaves from under a
+/// still pointer — its client disconnecting, and the window being
+/// destroyed by a live client — are checked.
+#[test]
+fn a_hidden_cursor_comes_back_when_its_window_goes_without_a_motion() {
+    let mut h = Harness::start("set-cursor-gone", OUT.0, OUT.1);
+    for destroy in [true, false] {
+        let mut inbox = Inbox::default();
+        let mut conn = cursor_client(&h, "gone");
+        let win = make_window(&mut conn, &mut inbox, 1, "gone", WIN, RED, 0, 1);
+        park(&mut h);
+        let (cx, cy) = win.content();
+        h.point_at(cx, cy, OUT);
+        h.settle();
+        set_cursor(&h, &mut conn, CursorShape::None);
+        let hidden = h.shot();
+        let px = |img: &Image| rgb(img.pixel(cx as u32 + 3, cy as u32 + 6));
+        assert_eq!(px(&hidden), to_rgb(RED), "the cursor is hidden");
+
+        if destroy {
+            conn.tx().destroy_node(win.root).commit(2).unwrap();
+            conn.flush().unwrap();
+        } else {
+            drop(conn);
+        }
+        wait_for("the window to go", || h.stat("windows") == 0);
+        h.settle();
+        // The arrow's tip sits at the pointer: its outline is black there
+        // and its interior white just inside — ink, whatever the desktop.
+        let shot = h.shot();
+        assert_eq!(
+            rgb(shot.pixel(cx as u32, cy as u32)),
+            0,
+            "no arrow tip at the pointer after the window went (destroy: {destroy})"
+        );
+        assert_eq!(
+            px(&shot),
+            0x00ff_ffff,
+            "no arrow interior below the tip (destroy: {destroy})"
+        );
+    }
+    h.quit();
+}
+
 /// A client's shape change is cursor damage and nothing else, exactly
 /// like a hover-driven one — and it **answers** the motion that put the
 /// pointer there, so no deferred flip waits out its deadline for it.
