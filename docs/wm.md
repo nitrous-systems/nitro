@@ -944,7 +944,8 @@ sixteen badges are 32 damage rects (icon and pill), which overflows
 over two rows of scaled thumbnails. Overflow now merges the pair whose
 union wastes the least area, so each badge's icon and pill pair up into
 16 rects (~126k px), and the frame costs about the 1.5 ms measured with a
-cap of 32. The cost holds for the ~12 frames of the fade and is well inside a 60 Hz frame.
+cap of 32. The cost holds for the ~12 frames of the fade and is well
+inside a 60 Hz frame.
 
 Anything that later wants the scrim fade, slot motion or a scale animation
 must first add a downscale cache in `nitro-raster`. It was measured at

@@ -9,7 +9,6 @@ use crate::IRect;
 /// needed, the pair whose merge wastes the least area is merged (repeatedly)
 /// until the list fits again, so nearby rects pair up rather than the whole
 /// region collapsing to one bounding box. This keeps the
-
 /// list cheap to produce, cheap to hand to `FB_DAMAGE_CLIPS`, and cheap to
 /// send over a wire, at the cost of occasionally repainting a few extra
 /// pixels.
@@ -20,7 +19,6 @@ pub struct Damage {
 
 impl Damage {
     /// Maximum number of rects kept; beyond it the least-wasteful pairs merge.
-
     pub const MAX_RECTS: usize = 16;
 
     /// Empty damage.
@@ -81,7 +79,6 @@ impl Damage {
         if self.rects.len() > Self::MAX_RECTS {
             self.reduce();
         }
-
     }
 
     /// Add every rect of another region.
@@ -135,7 +132,6 @@ impl Damage {
     }
 
     /// After a merge, remove rects now contained in another.
-
     fn coalesce(&mut self) {
         let mut i = 0;
         while i < self.rects.len() {
@@ -234,7 +230,6 @@ mod tests {
         for r in &input {
             assert!(d.rects().iter().any(|o| o.contains_rect(r)), "{r:?}");
         }
-
     }
 
     #[test]
