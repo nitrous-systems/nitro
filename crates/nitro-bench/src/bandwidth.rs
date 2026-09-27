@@ -113,6 +113,10 @@ pub const DEFAULT_BYTES: usize = 64 << 20;
 
 /// Copy `bytes` from one buffer to another, `rounds` times.
 ///
+/// Counts **destination bytes only**. STREAM COPY counts both the read and
+/// the write, so multiply by 2 before comparing with a STREAM table
+/// (`docs/external.md` §4).
+///
 /// Uses `copy_from_slice`, which is `memcpy`: measuring a hand-written
 /// byte loop would produce a smaller number that no real code path pays,
 /// since every copy in the tree is a slice copy.

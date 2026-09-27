@@ -309,6 +309,12 @@ library", which is how the server's "≤ 8 MB" line survived
 as long as it did. The server's current, audited line is in
 **"The server's 17.8 MB, audited"**; `just box-ps` prints all three.
 
+No compositor publishes these columns. No public source reports
+`RssAnon`, `RssFile` or PSS for Xorg, gnome-shell, kwin, sway or weston,
+only `ps rss`, `top RES` or whole-system `free -m`. So there is no
+external figure to hold against the numbers below. The nearest ones are
+collected, with caveats, in [`external.md`](external.md) §2.
+
 ### Test box (real KMS, 1920×1080@60)
 
 | process | windows | VmRSS | VmHWM | budget | verdict |

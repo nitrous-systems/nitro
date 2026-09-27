@@ -41,6 +41,9 @@ anywhere. Every run in the ledger had the real desktop up —
 that is the realistic baseline and a benchmark against a bare server
 would be measuring a machine nobody has.
 
+For published figures from other desktops, and the reasons most of them
+cannot be compared with these, see [`external.md`](external.md).
+
 ## 1. What each benchmark is
 
 These names are not decoration. Each of them is the oldest, most quoted
@@ -84,6 +87,12 @@ them into a single frame — correctly, by design, because that is what
 node a million times. The resulting "operations per second" would be a
 measurement of the socket and the client's own `write` loop: a large
 number, reproducible, and about nothing.
+
+The primary source agrees. Carl Worth confirmed with `xtrace` that
+x11perf sends **one rectangle per request**. His batched equivalent ran
+about **200× faster** on identical hardware drawing the identical
+primitive (cworth.org/exa/mystery_solved/). The protocol's shape was the
+variable, not the drawing ([`external.md`](external.md) §3).
 
 The honest transposition is **mutations per frame sustained at the
 output's refresh rate**. Each scenario has a sweep parameter N; the
@@ -237,6 +246,12 @@ write-combined mapping is the entire reason the shadow buffer exists
 | **copy** (`dst[i] = src[i]`, one read + one write per byte) | **3.61** | **435.1** |
 | **write** (`dst[i] = v`, no read) | **6.60** | 795.9 |
 | **read** (sum every byte) | **8.50** | 1024.5 |
+
+The copy row counts **destination bytes only**. STREAM counts read and
+write, so 3.61 is ≈7.2 GB/s in STREAM's convention. Holding the raw
+figure against a published STREAM table makes the box look ~3.4× slower
+than it is ([`external.md`](external.md) §4). The arithmetic below is
+consistent because it counts payload bytes too.
 
 The frame arithmetic follows from one number, `1920 × 1080 × 4 =
 **8 294 400 bytes** per 1080p BGRA frame`. At 60 Hz that is **497.7 MB/s
@@ -952,6 +967,13 @@ dramatic factor is the *client's*, which is the half a battery notices.
 And the bytes/frame columns are 56 and 52, which look identical — because
 the pixel arm's 8 MB never crosses the socket either; it goes through a
 memfd. The wire is not where the pixel path is expensive. Memory is.
+
+The nearest published analogue points the same way. KWin removed one
+CPU-side `wl_shm` copy and went from 80–90 % of a core to 20 % while
+scrolling on an iGPU, ≈13–15 → ≈3.3 ms of CPU per frame if the scroll
+ran at 60 fps (zamundaaa, 2026). No compositor has published a
+quantified saving from damage tracking itself, so this pair may be the
+first ([`external.md`](external.md) §3).
 
 And the historical note, which belongs here rather than in a commit
 message. **The first version of `boing-node` was four times *worse* than
@@ -2704,6 +2726,9 @@ of a benchmark document is a reader who takes it for more than it is.
   Throughput and latency are different properties and a system can be
   excellent at one and terrible at the other; `docs/latency.md` is the
   other dossier and the one a desktop is judged by.
+- **No other desktop.** Nothing here was run against KWin, GNOME or
+  XFCE. [`external.md`](external.md) collects the published figures,
+  and explains why x11perf absolutes are not comparable.
 - **One client.** Every run is a single benchmark window plus the shell.
   Nothing here says what happens with five animating clients, which is a
   materially different scheduling problem — the server's paint is serial

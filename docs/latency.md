@@ -8,6 +8,15 @@ criterion: an input-to-photon number that was *measured*, not assumed.
 samples** — inside one refresh period, against a budget of one. The
 budget is **met**.
 
+Only one published external figure is in the same class. Stock KWin
+6.6.4 measured about **9.78 ms** from input to present on an idle
+desktop, at **120 Hz** on a Zen 4 + RTX Ada machine (farnoy.dev, 2026).
+At 120 Hz this box measures a mean of **≈6.3 ms** (§5). Halving the frame
+period moved our mean by −3 983 µs, so the 60 Hz headline should not be
+held against KWin's 120 Hz figure. Published click-to-photon numbers add
+the mouse and the panel and are not comparable at all. See
+[`external.md`](external.md) §1.
+
 It was not, when this document was first written. The original
 measurement is kept below in full, because the diagnosis it made is the
 reason the number moved and a before/after is worth more than an
