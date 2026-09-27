@@ -109,6 +109,47 @@ pub fn parse_repeat(value: &str) -> Option<(u32, u32)> {
     Some((d.trim().parse().ok()?, r.trim().parse().ok()?))
 }
 
+/// What the `pointer.*` keys say.
+///
+/// Every field is `Option`, for [`KeyboardConf::repeat`]'s reason: each
+/// has a default that is not "nothing" (the device's libinput default,
+/// traditional scrolling), and a line the user never asked for would pin
+/// today's default into their file. `None` writes no line.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PointerConf {
+    /// `pointer.speed`, `-1.0..=1.0`.
+    pub speed: Option<f32>,
+    /// `pointer.accel`: `Some(true)` is `adaptive`, `Some(false)` is
+    /// `flat`.
+    pub adaptive: Option<bool>,
+    /// `pointer.natural_scroll`.
+    pub natural_scroll: Option<bool>,
+}
+
+/// The server's `PointerSettings::DEFAULT_SPEED`: libinput's 0. What the
+/// speed slider shows when the file says nothing.
+pub const POINTER_SPEED_DEFAULT: f32 = 0.0;
+
+/// What the acceleration switch shows when the file says nothing:
+/// adaptive, libinput's default for a mouse.
+pub const POINTER_ADAPTIVE_DEFAULT: bool = true;
+
+/// What the natural-scrolling switch shows when the file says nothing:
+/// off, the server's default.
+pub const NATURAL_SCROLL_DEFAULT: bool = false;
+
+/// Format a pointer speed the way the file spells it: at most two
+/// decimals, no trailing zeros, and never `-0`.
+#[must_use]
+pub fn format_speed(speed: f32) -> String {
+    let r = (speed * 100.0).round() / 100.0;
+    if r == 0.0 {
+        "0".to_owned()
+    } else {
+        format!("{r}")
+    }
+}
+
 /// What the `theme.*` keys say, as far as this app models them.
 ///
 /// The scheme and nothing else. Per-role overrides (`theme.accent =
@@ -148,6 +189,8 @@ pub struct Conf {
     pub outputs: BTreeMap<String, OutputConf>,
     /// The keyboard section.
     pub keyboard: KeyboardConf,
+    /// The pointer section.
+    pub pointer: PointerConf,
     /// The colour section.
     pub theme: ThemeConf,
 }
@@ -247,8 +290,9 @@ pub fn format_scale(scale: f32) -> String {
 /// The layout is pinned by `apply_writes_exactly_the_expected_file`: two
 /// header comment lines, a blank line, one block per output in connector
 /// order with a blank line between blocks, a blank line, the three
-/// keyboard lines, and — when there is anything to say about colours — a
-/// blank line and the `theme.*` block. Within an output the order is
+/// keyboard lines, and — when there is anything to say — a blank line and
+/// the `pointer.*` block, then a blank line and the `theme.*` block.
+/// Within an output the order is
 /// scale, position, primary — biggest effect first, and `primary` last
 /// because it is the one line that may be missing.
 #[must_use]
@@ -278,6 +322,22 @@ pub fn render(conf: &Conf) -> String {
     out.push_str(&keyboard_line("keyboard.options", &k.options));
     if let Some((delay, rate)) = k.repeat {
         let _ = writeln!(out, "keyboard.repeat = {delay},{rate}");
+    }
+    // The pointer block, like the theme's, only when there is something
+    // to say: every key in it has a default worth leaving free.
+    let p = &conf.pointer;
+    if *p != PointerConf::default() {
+        out.push('\n');
+        if let Some(speed) = p.speed {
+            let _ = writeln!(out, "pointer.speed = {}", format_speed(speed));
+        }
+        if let Some(adaptive) = p.adaptive {
+            let name = if adaptive { "adaptive" } else { "flat" };
+            let _ = writeln!(out, "pointer.accel = {name}");
+        }
+        if let Some(natural) = p.natural_scroll {
+            let _ = writeln!(out, "pointer.natural_scroll = {natural}");
+        }
     }
     // The theme block is written only when there is something to say,
     // unlike the keyboard's three always-present lines. A `theme.scheme`
@@ -378,6 +438,26 @@ pub fn parse(text: &str) -> Conf {
             "keyboard.repeat" => {
                 if let Some(r) = parse_repeat(value) {
                     conf.keyboard.repeat = Some(r);
+                }
+            }
+            // The same shapes the server takes; a value it would refuse
+            // (a speed out of range) is still read, and the slider clamps
+            // it into view, as it does a scale.
+            "pointer.speed" => {
+                if let Ok(s) = value.parse::<f32>()
+                    && s.is_finite()
+                {
+                    conf.pointer.speed = Some(s);
+                }
+            }
+            "pointer.accel" => match value.to_ascii_lowercase().as_str() {
+                "adaptive" => conf.pointer.adaptive = Some(true),
+                "flat" => conf.pointer.adaptive = Some(false),
+                _ => {}
+            },
+            "pointer.natural_scroll" => {
+                if let Some(b) = parse_bool(value) {
+                    conf.pointer.natural_scroll = Some(b);
                 }
             }
             "theme.scheme" => conf.theme.scheme = Scheme::from_name(value),
@@ -645,6 +725,44 @@ keyboard.options = ctrl:nocaps
             Some((250, 40))
         );
         assert_eq!(parse("keyboard.repeat = 300\n").keyboard.repeat, None);
+    }
+
+    #[test]
+    fn pointer_block_is_written_only_when_set_and_round_trips() {
+        let mut c = example();
+        assert!(!render(&c).contains("pointer."), "nothing when all None");
+        c.pointer = PointerConf {
+            speed: Some(-0.3),
+            adaptive: Some(false),
+            natural_scroll: Some(true),
+        };
+        let text = render(&c);
+        assert!(
+            text.contains(
+                "\n\npointer.speed = -0.3\npointer.accel = flat\npointer.natural_scroll = true\n"
+            ),
+            "{text}"
+        );
+        assert_eq!(parse(&text).pointer, c.pointer);
+        c.pointer = PointerConf {
+            speed: None,
+            adaptive: Some(true),
+            natural_scroll: None,
+        };
+        let text = render(&c);
+        assert!(text.contains("pointer.accel = adaptive\n"), "{text}");
+        assert!(!text.contains("pointer.speed"), "{text}");
+        assert_eq!(parse(&text).pointer, c.pointer);
+    }
+
+    #[test]
+    fn speed_is_written_with_at_most_two_decimals() {
+        assert_eq!(format_speed(0.0), "0");
+        assert_eq!(format_speed(-0.0001), "0");
+        assert_eq!(format_speed(1.0), "1");
+        assert_eq!(format_speed(0.3), "0.3");
+        assert_eq!(format_speed(0.1 + 0.2), "0.3");
+        assert_eq!(format_speed(-0.25), "-0.25");
     }
 
     #[test]

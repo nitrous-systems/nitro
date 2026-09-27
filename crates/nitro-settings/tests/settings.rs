@@ -323,6 +323,11 @@ fn the_server_parser_reads_back_what_we_write() {
         options: "ctrl:nocaps".to_owned(),
         repeat: Some((300, 40)),
     };
+    c.pointer = conf::PointerConf {
+        speed: Some(-0.35),
+        adaptive: Some(false),
+        natural_scroll: Some(true),
+    };
 
     let text = conf::render(&c);
     let parsed = nitro_server::config::parse(&text);
@@ -352,6 +357,109 @@ fn the_server_parser_reads_back_what_we_write() {
     // The sliders' "say nothing" value is the server's default.
     let d = nitro_server::config::Repeat::DEFAULT;
     assert_eq!((d.delay_ms, d.rate_hz), conf::REPEAT_DEFAULT);
+    assert_eq!(parsed.pointer.speed, Some(-0.35));
+    assert_eq!(
+        parsed.pointer.accel,
+        Some(nitro_server::config::AccelProfile::Flat)
+    );
+    assert_eq!(parsed.pointer.natural_scroll, Some(true));
+    // And the controls' "say nothing" values are the server's defaults.
+    let none = nitro_server::config::PointerSettings::default();
+    assert!((none.speed() - f64::from(conf::POINTER_SPEED_DEFAULT)).abs() < 1e-9);
+    assert_eq!(none.natural_scroll(), conf::NATURAL_SCROLL_DEFAULT);
+    let adaptive = conf::PointerConf {
+        adaptive: Some(true),
+        ..conf::PointerConf::default()
+    };
+    let mut c = conf::Conf::new();
+    c.pointer = adaptive;
+    assert_eq!(
+        nitro_server::config::parse(&conf::render(&c)).pointer.accel,
+        Some(nitro_server::config::AccelProfile::Adaptive)
+    );
+}
+
+#[test]
+fn the_mouse_controls_write_pointer_lines_and_revert_restores_them() {
+    let dir = scratch("mouse");
+    let path = dir.join(conf::FILE_NAME);
+    std::fs::write(&path, "keyboard.layout = de\n").expect("seed");
+    let mut h = harness_in(
+        &dir,
+        Settings::new()
+            .with_config_path(path.clone())
+            .with_audio_dirs(Vec::new())
+            .with_reload_wait(Duration::from_millis(50)),
+    );
+    h.settle();
+    let speed = named(&mut h, names::POINTER_SPEED);
+    let speed_label = named(&mut h, names::POINTER_SPEED_VALUE);
+    let accel = named(&mut h, names::POINTER_ACCEL);
+    let natural = named(&mut h, names::NATURAL_SCROLL);
+    assert_eq!(
+        h.widget::<Slider<Settings>>(speed).value().to_bits(),
+        0f32.to_bits()
+    );
+    assert_eq!(h.widget::<Label>(speed_label).text(), "0");
+    assert!(
+        h.widget::<Switch<Settings>>(accel).is_checked(),
+        "adaptive by default"
+    );
+    assert!(!h.widget::<Switch<Settings>>(natural).is_checked());
+
+    // An untouched Apply writes no pointer line.
+    do_action(&mut h, names::APPLY, "click");
+    let text = std::fs::read_to_string(&path).expect("written");
+    assert!(!text.contains("pointer."), "{text}");
+
+    // Move all three: each writes its line.
+    set_value(&mut h, names::POINTER_SPEED, "0.3");
+    assert_eq!(h.widget::<Label>(speed_label).text(), "+0.3");
+    do_action(&mut h, names::POINTER_ACCEL, "toggle");
+    do_action(&mut h, names::NATURAL_SCROLL, "toggle");
+    do_action(&mut h, names::APPLY, "click");
+    let text = std::fs::read_to_string(&path).expect("written");
+    assert!(
+        text.contains("pointer.speed = 0.3\npointer.accel = flat\npointer.natural_scroll = true\n"),
+        "{text}"
+    );
+    let parsed = nitro_server::config::parse(&text);
+    assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+    assert!(parsed.pointer.natural_scroll());
+
+    // Back to the defaults: the file now names them, so the lines stay.
+    set_value(&mut h, names::POINTER_SPEED, "0");
+    do_action(&mut h, names::POINTER_ACCEL, "toggle");
+    do_action(&mut h, names::NATURAL_SCROLL, "toggle");
+    do_action(&mut h, names::APPLY, "click");
+    let text = std::fs::read_to_string(&path).expect("written");
+    assert!(
+        text.contains(
+            "pointer.speed = 0\npointer.accel = adaptive\npointer.natural_scroll = false\n"
+        ),
+        "{text}"
+    );
+
+    // Revert restores from the file.
+    std::fs::write(&path, "pointer.speed = -0.5\npointer.natural_scroll = on\n").expect("rewrite");
+    do_action(&mut h, names::REVERT, "click");
+    assert_eq!(
+        h.widget::<Slider<Settings>>(speed).value().to_bits(),
+        (-0.5f32).to_bits()
+    );
+    assert_eq!(h.widget::<Label>(speed_label).text(), "-0.5");
+    assert!(h.widget::<Switch<Settings>>(accel).is_checked());
+    assert!(h.widget::<Switch<Settings>>(natural).is_checked());
+    // And after that Revert an untouched Apply keeps exactly what the
+    // file named, adding no accel line.
+    do_action(&mut h, names::APPLY, "click");
+    let text = std::fs::read_to_string(&path).expect("written");
+    assert!(text.contains("pointer.speed = -0.5\n"), "{text}");
+    assert!(text.contains("pointer.natural_scroll = true\n"), "{text}");
+    assert!(!text.contains("pointer.accel"), "{text}");
+
+    h.quit();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -772,6 +880,11 @@ fn every_section_is_hey_addressable() {
         ("keyboard/repeat_rate", "slider"),
         ("keyboard/repeat_rate_value", "label"),
         ("keyboard/test", "textfield"),
+        ("mouse", "container"),
+        ("mouse/pointer_speed", "slider"),
+        ("mouse/pointer_speed_value", "label"),
+        ("mouse/pointer_accel", "checkbox"),
+        ("mouse/natural_scroll", "checkbox"),
         ("audio", "container"),
         ("audio/volume", "slider"),
         ("audio/volume_value", "label"),
@@ -783,6 +896,7 @@ fn every_section_is_hey_addressable() {
         ("sidebar", "container"),
         ("sidebar/nav_displays", "button"),
         ("sidebar/nav_keyboard", "button"),
+        ("sidebar/nav_mouse", "button"),
         ("sidebar/nav_audio", "button"),
         ("sidebar/nav_appearance", "button"),
         ("pages", "container"),
@@ -2035,7 +2149,7 @@ fn the_window_declares_its_tree_as_its_minimum_size() {
 #[test]
 fn the_window_holds_every_page() {
     // `WINDOW_SIZE` is *measured*, so anything added to the tree has to
-    // re-measure it. With the split view there are four pages, and the
+    // re-measure it. With the split view there are five pages, and the
     // one on screen is the only one a person can see overhang — so each
     // is shown in turn and checked. The sidebar icons keep their full
     // square, and a sidebar row is exactly the blueprint's height.
@@ -2069,6 +2183,7 @@ fn the_window_holds_every_page() {
     for name in [
         nitro_settings::names::DISPLAYS_ICON,
         nitro_settings::names::KEYBOARD_ICON,
+        nitro_settings::names::MOUSE_ICON,
         nitro_settings::names::AUDIO_ICON,
         nitro_settings::names::APPEARANCE_ICON,
     ] {
@@ -2182,6 +2297,10 @@ fn every_heading_carries_its_icon_by_name() {
         (
             nitro_settings::names::KEYBOARD_ICON,
             nitro_settings::icons::KEYBOARD,
+        ),
+        (
+            nitro_settings::names::MOUSE_ICON,
+            nitro_settings::icons::MOUSE,
         ),
         (
             nitro_settings::names::AUDIO_ICON,

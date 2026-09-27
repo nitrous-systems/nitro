@@ -23,7 +23,9 @@
 //! # Pointer routing
 //!
 //! The pointer has one position in device pixels, clamped to the union of
-//! the outputs, and acceleration is whatever libinput applied. Every motion
+//! the outputs, and acceleration is whatever libinput applied — tuned by
+//! `pointer.speed` / `pointer.accel` through
+//! [`InputSource::configure_pointer`]. Every motion
 //! hit-tests the scene: the window under the pointer gets `PointerMotion`
 //! with window-local coordinates and the node hit, and a change of window
 //! produces `PointerLeave` on the old one and `PointerEnter` on the new.
@@ -41,6 +43,7 @@ use nitro_core::Point;
 use nitro_scene::{Hit, OutputId, Scene, WindowKey};
 use nitro_wire::types::{AxisSource, ButtonState, TouchPhase};
 
+use crate::config::{AccelProfile, PointerSettings};
 use crate::{debug, info, warn};
 
 /// Evdev code of the left mouse button — the one that raises and focuses.
@@ -160,6 +163,14 @@ pub trait InputSource {
     fn rescan(&mut self, _dir: &Path) -> (usize, usize) {
         (0, 0)
     }
+
+    /// Apply the `pointer.*` speed and acceleration to every pointer device,
+    /// now and on every device that appears later. Scroll direction is not
+    /// here: the server inverts axis events itself (see `route_input`).
+    ///
+    /// The default does nothing, which is right for a source with no
+    /// devices.
+    fn configure_pointer(&mut self, _settings: &PointerSettings) {}
 }
 
 /// A handle a test uses to inject input into a running server.
@@ -173,6 +184,9 @@ pub trait InputSource {
 pub struct FakeInput {
     queue: Arc<Mutex<VecDeque<InputEvent>>>,
     notify: Arc<OwnedFd>,
+    /// Every pointer configuration the server handed the source, oldest
+    /// first, so a test can see what was applied and when.
+    pointer: Arc<Mutex<Vec<PointerSettings>>>,
 }
 
 impl FakeInput {
@@ -188,6 +202,7 @@ impl FakeInput {
         Ok(Self {
             queue: Arc::new(Mutex::new(VecDeque::new())),
             notify: Arc::new(notify),
+            pointer: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -206,6 +221,18 @@ impl FakeInput {
     #[must_use]
     pub fn is_drained(&self) -> bool {
         self.queue.lock().is_ok_and(|q| q.is_empty())
+    }
+
+    /// The last pointer configuration the server applied, if any.
+    #[must_use]
+    pub fn pointer_config(&self) -> Option<PointerSettings> {
+        self.pointer.lock().ok().and_then(|p| p.last().copied())
+    }
+
+    /// How many times the server applied a pointer configuration.
+    #[must_use]
+    pub fn pointer_configs(&self) -> usize {
+        self.pointer.lock().map_or(0, |p| p.len())
     }
 }
 
@@ -268,6 +295,12 @@ impl InputSource for FakeSource {
 
     fn describe(&self) -> String {
         String::from("fake input source")
+    }
+
+    fn configure_pointer(&mut self, settings: &PointerSettings) {
+        if let Ok(mut p) = self.shared.pointer.lock() {
+            p.push(*settings);
+        }
     }
 }
 
@@ -480,6 +513,12 @@ pub struct LibinputSource {
     /// libinput's handle for each open path, which is what
     /// `path_remove_device` wants when a device goes away.
     open_devices: HashMap<PathBuf, input::Device>,
+    /// Every device libinput currently reports, from its `DeviceAdded` /
+    /// `DeviceRemoved` events — which, unlike `open_devices`, also covers
+    /// the fresh objects libinput re-adds on `resume`.
+    live: Vec<input::Device>,
+    /// The `pointer.*` configuration applied to each device as it appears.
+    pointer: PointerSettings,
     suspended: bool,
 }
 
@@ -625,6 +664,8 @@ impl LibinputSource {
             context,
             devices: added,
             open_devices,
+            live: Vec::new(),
+            pointer: PointerSettings::default(),
             suspended: false,
         }
     }
@@ -642,14 +683,36 @@ impl InputSource for LibinputSource {
     }
 
     fn dispatch(&mut self, out: &mut Vec<InputEvent>) {
+        use input::event::DeviceEvent;
+        use input::event::EventTrait as _;
         if let Err(e) = self.context.dispatch() {
             warn!("libinput dispatch: {e}");
             return;
         }
         for event in self.context.by_ref() {
-            if let Some(converted) = convert(&event) {
-                out.push(converted);
+            match &event {
+                input::Event::Device(DeviceEvent::Added(_)) => {
+                    let mut device = event.device();
+                    apply_pointer(&mut device, &self.pointer);
+                    self.live.push(device);
+                }
+                input::Event::Device(DeviceEvent::Removed(_)) => {
+                    let device = event.device();
+                    self.live.retain(|d| *d != device);
+                }
+                _ => {
+                    if let Some(converted) = convert(&event) {
+                        out.push(converted);
+                    }
+                }
             }
+        }
+    }
+
+    fn configure_pointer(&mut self, settings: &PointerSettings) {
+        self.pointer = *settings;
+        for device in &mut self.live {
+            apply_pointer(device, settings);
         }
     }
 
@@ -717,6 +780,38 @@ impl InputSource for LibinputSource {
             }
         }
         (added, removed)
+    }
+}
+
+/// Apply `pointer.speed` and `pointer.accel` to one device, if it has
+/// acceleration at all (keyboards, touchscreens and tablets do not).
+///
+/// A setting the file does not name is set back to the device's own
+/// default, so deleting a line and reloading really reverts it. A refused
+/// setting is a warning: a device that cannot do flat acceleration still
+/// moves the pointer.
+fn apply_pointer(device: &mut input::Device, settings: &PointerSettings) {
+    if !device.config_accel_is_available() {
+        return;
+    }
+    let speed = settings
+        .speed
+        .unwrap_or_else(|| device.config_accel_default_speed());
+    if let Err(e) = device.config_accel_set_speed(speed) {
+        warn!("{}: pointer speed {speed} refused: {e:?}", device.sysname());
+    }
+    let profile = match settings.accel {
+        Some(AccelProfile::Adaptive) => Some(input::AccelProfile::Adaptive),
+        Some(AccelProfile::Flat) => Some(input::AccelProfile::Flat),
+        None => device.config_accel_default_profile(),
+    };
+    if let Some(profile) = profile
+        && let Err(e) = device.config_accel_set_profile(profile)
+    {
+        warn!(
+            "{}: acceleration profile {profile:?} refused: {e:?}",
+            device.sysname()
+        );
     }
 }
 

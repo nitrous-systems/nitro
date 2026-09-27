@@ -66,6 +66,9 @@ broken desktop and a text console.
 | `keyboard.variant` | an xkb variant, e.g. `nodeadkeys` | none |
 | `keyboard.options` | xkb options, comma-separated, e.g. `ctrl:nocaps`; see below | none |
 | `keyboard.repeat` | `<delay_ms>,<rate_hz>` — key repeat; rate `0` = off; see below | `600,25` |
+| `pointer.speed` | `-1.0`–`1.0` — libinput pointer speed; see below | the device's libinput default (`0`) |
+| `pointer.accel` | `adaptive` or `flat` — libinput acceleration profile | the device's libinput default |
+| `pointer.natural_scroll` | `true`/`false` (the `primary` spellings) — invert scrolling | `false` |
 | `theme.scheme` | `light` or `dark` — the desktop's colour scheme | `light` |
 | `theme.<role>` | `#rrggbb` or `#rrggbbaa`, overriding one role on top of the scheme | the scheme's value |
 | `theme.icons` | the **XDG icon theme** application icons come from, e.g. `hicolor`, `Adwaita` | `hicolor` |
@@ -483,6 +486,42 @@ and a **Repeat rate** slider (rate 0 reads `off`); left at the default,
 Apply writes no `keyboard.repeat` line at all, so the default stays free
 to change in a later release.
 
+### `pointer.*`: speed, acceleration and scroll direction
+
+```text
+pointer.speed          = 0.3
+pointer.accel          = flat
+pointer.natural_scroll = true
+```
+
+`pointer.speed` is libinput's pointer speed, `-1.0` (slowest) to `1.0`
+(fastest), `0` being libinput's default. `pointer.accel` picks libinput's
+acceleration profile: `adaptive` (acceleration grows with how fast the
+mouse moves — libinput's default for most mice) or `flat` (a constant
+ratio). A speed outside the range, or that is not a number, and an accel
+that is neither word, are **refused with a warning, not clamped** — the
+`keyboard.repeat` policy. Both apply to every device that has
+acceleration at all (mice, touchpads, trackpoints), at startup and to
+every device that appears later: hotplug and the fresh devices libinput
+re-adds after a VT switch. A key the file does not name is set back to
+the **device's own default**, so deleting the line and reloading really
+reverts it. A device that refuses a setting logs a warning and keeps
+working.
+
+`pointer.natural_scroll = true` inverts scrolling so content follows the
+fingers, like a touchscreen. It is done **by the server**, which negates
+both axes of every `PointerAxis` before a client sees it — for every
+axis source (wheel, finger, continuous) and every device, including ones
+libinput has no natural-scroll switch for, remote clients' servers and
+the fake backend. libinput's own natural-scroll setting is left alone,
+so nothing is inverted twice.
+
+All three take effect on **reload**, with nothing restarted; a reload
+that does not change the `pointer.*` section does not touch the devices.
+`nitro-settings`' **Mouse** page has a **Pointer speed** slider and
+**Acceleration** and **Natural scrolling** switches; a control left on
+the value it was seeded with writes no line.
+
 ### Colours: `theme.scheme` and `theme.<role>`
 
 `theme.scheme` picks one of two built-in palettes; each `theme.<role>`
@@ -649,20 +688,21 @@ ticks**.
 $ nitro-settings
 ```
 
-Four categories in a **split view** (`docs/ui.md`, "Split view
+Five categories in a **split view** (`docs/ui.md`, "Split view
 blueprint"): a sidebar on the left with a row per category, and the
 category's page on the right — a header with its title, a scrolling
 column of grouped cards, and the Apply/Revert row as a footer.
 **Displays** (two lines per output — name, mode, a scale slider and a
 `primary` checkbox on the first; position and the connector's other
 refresh rates on the second), **Keyboard** (layout, variant, options, a
-**Caps Lock is Ctrl** switch, and a field to type in afterwards), **Audio** (volume and mute) and
+**Caps Lock is Ctrl** switch, and a field to type in afterwards), **Mouse** (pointer speed,
+acceleration and natural scrolling), **Audio** (volume and mute) and
 **Appearance** (the dark scheme). **Apply** writes the file; **Revert**
 re-reads it.
 
 ![nitro-settings, the Displays page](settings-split.png)
 
-The four pages are a `Pages` stack: every page is laid out and only the
+The five pages are a `Pages` stack: every page is laid out and only the
 current one is shown, so `hey nitro-settings get keyboard/layout value`
 answers from any page and a switch costs `SetVisible` ×2, the two
 sidebar rows' faces, the title's `SetText` and one commit — no relayout

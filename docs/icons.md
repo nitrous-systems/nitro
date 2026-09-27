@@ -70,13 +70,13 @@ server, off a real readback) assert that inequality.
 ships beside the crate as `LICENSE.bootstrap-icons` and is recorded in
 `DEPENDENCIES.md`'s vendored-assets section.
 
-61 icons, in seven groups:
+62 icons, in seven groups:
 
 | group | names |
 |---|---|
 | shell | `list` `window` `house` `search` `terminal` `calculator` |
 | status | `battery` `battery-half` `battery-full` `battery-charging` `volume-up` `volume-down` `volume-mute` `wifi` `wifi-off` `cpu` `memory` `hdd` |
-| settings | `display` `keyboard` `speaker` `palette` `sliders` `gear` |
+| settings | `display` `keyboard` `mouse` `speaker` `palette` `sliders` `gear` |
 | window controls | `x` `dash` `square` `arrows-angle-expand` |
 | files | `folder-fill` `folder2-open` `file-earmark` `file-earmark-text` `file-earmark-image` `file-earmark-zip` `file-earmark-code` `file-earmark-font` `file-earmark-play` `file-earmark-music` `download` `headphones` `images` `film` `trash3` |
 | general | `sun` `moon` `arrow-left` `arrow-up` `chevron-right` `recycle` `check` `circle-fill` `exclamation-triangle` `info-circle` `plus-lg` |
@@ -206,8 +206,8 @@ Keyed by `(icon index, device px)` → an **A8 coverage mask**.
   is two entries, exactly as a glyph at two sizes is.
 
 **No eviction**, matching the glyph atlas, and for a sharper reason: the
-set is *closed*. 61 icons at the four recommended sizes is 61 × (256 +
-576 + 1 024 + 2 304) ≈ **254 KB** — the whole set, everywhere, at every
+set is *closed*. 62 icons at the four recommended sizes is 62 × (256 +
+576 + 1 024 + 2 304) ≈ **258 KB** — the whole set, everywhere, at every
 size a desktop lays out at. `IconEngine::MAX_BYTES` is 2 MiB, an order of
 magnitude past that, and a raster that would cross it is refused rather
 than evicting something: an LRU for a bounded set answers a question that
@@ -270,7 +270,7 @@ and asserts zero.
 
 **`nitro-settings`.** Each section heading gets its icon at 16 px in a
 row with the label, in `ColorRole::Text`: `display`, `keyboard`,
-`speaker`, `palette`.
+`mouse`, `speaker`, `palette`.
 
 **`nitro-files`.** Every row of the listing carries a **type** icon at
 16 px in `ColorRole::Text`: `folder-fill` for a directory and for a symlink

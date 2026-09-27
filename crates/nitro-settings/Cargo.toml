@@ -1,6 +1,6 @@
 [package]
 name = "nitro-settings"
-description = "Display, keyboard and audio settings: the app that writes the server's server.conf"
+description = "Display, keyboard, mouse and audio settings: the app that writes the server's server.conf"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

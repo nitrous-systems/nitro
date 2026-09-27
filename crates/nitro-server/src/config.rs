@@ -21,6 +21,10 @@
 //! keyboard.options = ctrl:nocaps
 //! keyboard.repeat  = 600,25
 //!
+//! pointer.speed          = 0.3
+//! pointer.accel          = adaptive
+//! pointer.natural_scroll = true
+//!
 //! theme.scheme = dark
 //! theme.accent = #6ca8f0
 //! theme.icons  = Adwaita
@@ -62,6 +66,9 @@
 //! | primary output | — | `output.<c>.primary` | the first connector |
 //! | keyboard | `XKB_DEFAULT_*` | `keyboard.*` | the `us` layout |
 //! | key repeat | — | `keyboard.repeat` | [`Repeat::DEFAULT`], 600 ms then 25/s |
+//! | pointer speed | — | `pointer.speed` | the device's libinput default (0) |
+//! | pointer acceleration | — | `pointer.accel` | the device's libinput default |
+//! | scroll direction | — | `pointer.natural_scroll` | traditional (`false`) |
 //! | colour scheme | — | `theme.scheme` | `light` |
 //! | one colour | — | `theme.<role>` | the scheme's value |
 //! | icon theme | — | `theme.icons` | `hicolor` |
@@ -273,6 +280,108 @@ impl Repeat {
     }
 }
 
+/// What the `pointer.*` keys say: speed, acceleration profile, and scroll
+/// direction.
+///
+/// Every field is `Option`: `None` means the file said nothing, and for
+/// speed and acceleration that means **the device's own libinput
+/// default**, restored on reload, so deleting a line really reverts it.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PointerSettings {
+    /// `pointer.speed`, libinput's `-1.0..=1.0` (0 is the default).
+    pub speed: Option<f64>,
+    /// `pointer.accel`, `adaptive` or `flat`.
+    pub accel: Option<AccelProfile>,
+    /// `pointer.natural_scroll`: invert every scroll axis, so content
+    /// follows the fingers (or the wheel) like on a touchscreen.
+    pub natural_scroll: Option<bool>,
+}
+
+impl PointerSettings {
+    /// The slowest speed a file may ask for (libinput's bound).
+    pub const MIN_SPEED: f64 = -1.0;
+    /// The fastest speed a file may ask for (libinput's bound).
+    pub const MAX_SPEED: f64 = 1.0;
+    /// The speed libinput uses when nothing is configured.
+    pub const DEFAULT_SPEED: f64 = 0.0;
+
+    /// Whether the file says anything about the pointer.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.speed.is_none() && self.accel.is_none() && self.natural_scroll.is_none()
+    }
+
+    /// The speed in force: the file's, else [`Self::DEFAULT_SPEED`].
+    #[must_use]
+    pub fn speed(&self) -> f64 {
+        self.speed.unwrap_or(Self::DEFAULT_SPEED)
+    }
+
+    /// The acceleration profile the file asks for, or `None` for the
+    /// device's default.
+    #[must_use]
+    pub fn accel(&self) -> Option<AccelProfile> {
+        self.accel
+    }
+
+    /// Whether scrolling is inverted. Defaults to `false`.
+    #[must_use]
+    pub fn natural_scroll(&self) -> bool {
+        self.natural_scroll.unwrap_or(false)
+    }
+
+    /// Parse a `pointer.speed` value, refusing (not clamping) anything
+    /// outside `-1.0..=1.0`, for the same reason [`Repeat::parse`] does.
+    ///
+    /// # Errors
+    /// A message naming the problem, for [`Settings::warnings`].
+    pub fn parse_speed(value: &str) -> Result<f64, String> {
+        let s: f64 = value
+            .parse()
+            .map_err(|_| "is not a number (want -1.0..=1.0)".to_owned())?;
+        if !s.is_finite() || !(Self::MIN_SPEED..=Self::MAX_SPEED).contains(&s) {
+            return Err(format!(
+                "is outside {}..={}",
+                Self::MIN_SPEED,
+                Self::MAX_SPEED
+            ));
+        }
+        Ok(s)
+    }
+}
+
+/// A pointer acceleration profile, libinput's two built-in ones — named
+/// here so this module does not depend on libinput.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccelProfile {
+    /// Acceleration grows with how fast the device moves (libinput's
+    /// default for most mice).
+    Adaptive,
+    /// A constant ratio of device motion to pointer motion.
+    Flat,
+}
+
+impl AccelProfile {
+    /// Parse `adaptive` or `flat`.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "adaptive" => Some(Self::Adaptive),
+            "flat" => Some(Self::Flat),
+            _ => None,
+        }
+    }
+
+    /// The name the file spells it with.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Adaptive => "adaptive",
+            Self::Flat => "flat",
+        }
+    }
+}
+
 /// What the `theme.*` keys say.
 ///
 /// A scheme plus a sparse list of per-role overrides, which is the whole
@@ -370,6 +479,8 @@ pub struct Settings {
     pub outputs: HashMap<String, OutputSettings>,
     /// The keyboard section.
     pub keyboard: KeyboardSettings,
+    /// The pointer section.
+    pub pointer: PointerSettings,
     /// The colour section.
     pub theme: ThemeSettings,
     /// The remote section.
@@ -410,6 +521,7 @@ impl Settings {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.keyboard.is_empty()
+            && self.pointer.is_empty()
             && self.theme.is_empty()
             && self.remote.is_empty()
             && self.outputs.values().all(OutputSettings::is_empty)
@@ -665,6 +777,24 @@ pub fn parse(text: &str) -> Settings {
                 Err(e) => settings
                     .warnings
                     .push(format!("line {number}: keyboard.repeat {value:?}: {e}")),
+            },
+            "pointer.speed" => match PointerSettings::parse_speed(value) {
+                Ok(s) => settings.pointer.speed = Some(s),
+                Err(e) => settings
+                    .warnings
+                    .push(format!("line {number}: pointer.speed {value:?} {e}")),
+            },
+            "pointer.accel" => match AccelProfile::parse(value) {
+                Some(p) => settings.pointer.accel = Some(p),
+                None => settings.warnings.push(format!(
+                    "line {number}: pointer.accel {value:?} is not `adaptive` or `flat`"
+                )),
+            },
+            "pointer.natural_scroll" => match parse_bool(value) {
+                Some(b) => settings.pointer.natural_scroll = Some(b),
+                None => settings.warnings.push(format!(
+                    "line {number}: pointer.natural_scroll {value:?} is not a boolean"
+                )),
             },
             other => settings
                 .warnings
@@ -967,6 +1097,16 @@ mod tests {
             "keyboard.repeat = -1,25",
             "keyboard.repeat = 300,1000",
             "keyboard.repeat = 99999999999,5",
+            "pointer",
+            "pointer.speed",
+            "pointer.speed = ",
+            "pointer.speed = NaN",
+            "pointer.speed = inf",
+            "pointer.speed = 2",
+            "pointer.accel = ",
+            "pointer.accel = fast",
+            "pointer.natural_scroll = maybe",
+            "pointer.wobble = 1",
             "remote.listen",
             "remote.listen = ",
             "remote.listen = :",
@@ -1229,6 +1369,51 @@ mod tests {
         assert_ne!(a, b);
         let c = parse("keyboard.layout = us\nkeyboard.repeat = 300,25\n").keyboard;
         assert!(!a.same_keymap(&c));
+    }
+
+    #[test]
+    fn pointer_keys_parse() {
+        let s = parse("pointer.speed = -0.4\npointer.accel = Flat\npointer.natural_scroll = yes\n");
+        assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+        assert_eq!(s.pointer.speed, Some(-0.4));
+        assert_eq!(s.pointer.accel(), Some(AccelProfile::Flat));
+        assert!(s.pointer.natural_scroll());
+        assert!(!s.is_empty());
+        let s = parse("pointer.accel = adaptive\npointer.natural_scroll = off\n");
+        assert_eq!(s.pointer.accel, Some(AccelProfile::Adaptive));
+        assert_eq!(s.pointer.natural_scroll, Some(false));
+        assert!(!s.pointer.natural_scroll());
+    }
+
+    #[test]
+    fn saying_nothing_about_the_pointer_is_the_default() {
+        let s = parse("");
+        assert!(s.pointer.is_empty());
+        assert!((s.pointer.speed() - PointerSettings::DEFAULT_SPEED).abs() < f64::EPSILON);
+        assert_eq!(s.pointer.accel(), None);
+        assert!(!s.pointer.natural_scroll());
+    }
+
+    #[test]
+    fn pointer_speed_is_bounded_and_refused_not_clamped() {
+        for value in ["-1", "1", "1.0", "0", "-1.0"] {
+            let s = parse(&format!("pointer.speed = {value}\n"));
+            assert!(s.warnings.is_empty(), "{value}: {:?}", s.warnings);
+            assert!(s.pointer.speed.is_some(), "{value}");
+        }
+        for value in ["1.01", "-1.5", "2", "fast", "", "NaN", "inf", "0.3,0.4"] {
+            let s = parse(&format!("pointer.speed = {value}\n"));
+            assert_eq!(s.warnings.len(), 1, "{value}: {:?}", s.warnings);
+            assert!(s.warnings[0].contains("pointer.speed"), "{:?}", s.warnings);
+            assert_eq!(s.pointer.speed, None, "{value}");
+        }
+    }
+
+    #[test]
+    fn bad_pointer_accel_and_scroll_values_are_warnings() {
+        let s = parse("pointer.accel = fast\npointer.natural_scroll = maybe\n");
+        assert_eq!(s.warnings.len(), 2, "{:?}", s.warnings);
+        assert!(s.pointer.is_empty());
     }
 
     #[test]

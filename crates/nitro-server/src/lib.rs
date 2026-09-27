@@ -1144,7 +1144,7 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         warn!("{w}");
     }
 
-    let input: Box<dyn InputSource> = match (&seat, config.input_dir.as_deref()) {
+    let mut input: Box<dyn InputSource> = match (&seat, config.input_dir.as_deref()) {
         (_, _) if config.fake_input.is_some() => {
             let Some(handle) = config.fake_input.take() else {
                 unreachable!("guarded by the match arm")
@@ -1171,6 +1171,9 @@ pub fn run(mut config: Config) -> Result<(), Error> {
     for fd in input.poll_fds() {
         add(&epoll, &fd, TOK_INPUT)?;
     }
+    // `pointer.speed` / `pointer.accel` before the first event: libinput
+    // applies them to each device as its `DeviceAdded` is dispatched.
+    input.configure_pointer(&settings.pointer);
 
     // Input-device hotplug, deferred from M1: the same kernel uevent
     // socket the DRM backend uses, on the `input` subsystem. It is opened
@@ -3149,6 +3152,7 @@ impl Server {
         }
         let keyboard_changed = !settings.keyboard.same_keymap(&self.settings.keyboard);
         let repeat_changed = settings.keyboard.repeat() != self.settings.keyboard.repeat();
+        let pointer_changed = settings.pointer != self.settings.pointer;
         let icons_changed = settings.theme.icon_theme() != self.settings.theme.icon_theme();
         let palette = settings.palette();
         self.settings = settings;
@@ -3228,6 +3232,14 @@ impl Server {
         if repeat_changed {
             self.stop_key_repeat();
         }
+        // Speed and acceleration, only when the section moved: libinput
+        // re-applies to every live device, which is cheap but not free,
+        // and a reload that touched a monitor should not touch the mouse.
+        // Scroll direction needs nothing here — `route_input` reads it
+        // from `self.settings` on every axis event.
+        if pointer_changed {
+            self.input.configure_pointer(&self.settings.pointer);
+        }
 
         // The icon theme, only when it moved, and for the same reason the
         // keyboard is diffed: re-reading it walks the whole search path
@@ -3298,6 +3310,16 @@ impl Server {
             } => {
                 let Some(window) = self.pointer.over else {
                     return;
+                };
+                // `pointer.natural_scroll`: inverted here, for every axis
+                // source (wheel, finger, continuous) and every device —
+                // including ones libinput has no natural-scroll switch
+                // for — rather than through libinput, so nothing is ever
+                // inverted twice.
+                let (dx, dy) = if self.settings.pointer.natural_scroll() {
+                    (-dx, -dy)
+                } else {
+                    (dx, dy)
                 };
                 let sent_to = self.send_input(window, |id| {
                     ServerMsg::PointerAxis(msg::PointerAxis {

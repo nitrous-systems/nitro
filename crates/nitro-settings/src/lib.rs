@@ -82,6 +82,8 @@
 //! hey nitro-settings set keyboard/layout value de
 //! hey nitro-settings do keyboard/nocaps toggle            # Caps Lock is Ctrl
 //! hey nitro-settings set keyboard/repeat_rate value 0     # key repeat off
+//! hey nitro-settings set mouse/pointer_speed value 0.3    # faster pointer
+//! hey nitro-settings do mouse/natural_scroll toggle       # invert scrolling
 //! hey nitro-settings do apply click
 //! hey nitro-settings get status value                      # applied
 //! ```
@@ -344,6 +346,14 @@ const REPEAT_DELAY_STEP: f32 = 50.0;
 /// `Repeat::MAX_RATE_HZ`. The bottom of the range, 0, is off.
 const REPEAT_RATE_MAX: f32 = 100.0;
 
+/// Slowest pointer speed the slider offers: libinput's -1.0, the
+/// server's `PointerSettings::MIN_SPEED`.
+const POINTER_SPEED_MIN: f32 = -1.0;
+/// Fastest pointer speed: libinput's 1.0.
+const POINTER_SPEED_MAX: f32 = 1.0;
+/// Speed slider step.
+const POINTER_SPEED_STEP: f32 = 0.1;
+
 /// Volume slider step: 5 %, which is what one press of a volume key is
 /// worth on most keyboards.
 const VOLUME_STEP: f32 = 0.05;
@@ -398,6 +408,9 @@ const NOTE_NO_SHELL: &str =
 
 /// What it says when the server has outputs but told us about none.
 const NOTE_NO_OUTPUTS: &str = "The server reported no outputs.";
+
+/// What the mouse page's footnote says.
+const NOTE_MOUSE: &str = "Applied on Apply, to every mouse and touchpad; nothing is restarted.";
 
 /// What the appearance note says.
 ///
@@ -472,6 +485,17 @@ pub mod names {
     /// The scratch field, to type in after Apply and see the new layout.
     pub const TEST: &str = "test";
 
+    /// The mouse section's card.
+    pub const MOUSE: &str = "mouse";
+    /// `pointer.speed`: the slider, -1 to 1.
+    pub const POINTER_SPEED: &str = "pointer_speed";
+    /// The label showing the speed.
+    pub const POINTER_SPEED_VALUE: &str = "pointer_speed_value";
+    /// `pointer.accel`: the switch, on = adaptive, off = flat.
+    pub const POINTER_ACCEL: &str = "pointer_accel";
+    /// `pointer.natural_scroll`: the switch.
+    pub const NATURAL_SCROLL: &str = "natural_scroll";
+
     /// The audio section's row.
     pub const AUDIO: &str = "audio";
     /// The volume slider.
@@ -510,12 +534,14 @@ pub mod names {
     pub const DISPLAYS_ICON: &str = "displays_icon";
     /// The icon in the Keyboard sidebar row.
     pub const KEYBOARD_ICON: &str = "keyboard_icon";
+    /// The icon in the Mouse sidebar row.
+    pub const MOUSE_ICON: &str = "mouse_icon";
     /// The icon in the Audio sidebar row.
     pub const AUDIO_ICON: &str = "audio_icon";
     /// The icon in the Appearance sidebar row.
     pub const APPEARANCE_ICON: &str = "appearance_icon";
 
-    /// The sidebar: the column the four category rows live in
+    /// The sidebar: the column the five category rows live in
     /// (`nitro_ui::split::names::SIDEBAR`).
     pub const SIDEBAR: &str = "sidebar";
     /// The sidebar row that shows the Displays page:
@@ -523,6 +549,8 @@ pub mod names {
     pub const NAV_DISPLAYS: &str = "nav_displays";
     /// The sidebar row for the Keyboard page.
     pub const NAV_KEYBOARD: &str = "nav_keyboard";
+    /// The sidebar row for the Mouse page.
+    pub const NAV_MOUSE: &str = "nav_mouse";
     /// The sidebar row for the Audio page.
     pub const NAV_AUDIO: &str = "nav_audio";
     /// The sidebar row for the Appearance page.
@@ -533,9 +561,9 @@ pub mod names {
     pub const TITLE: &str = "title";
 }
 
-/// The four pages, in sidebar order. The index is what [`names::PAGES`]
+/// The five pages, in sidebar order. The index is what [`names::PAGES`]
 /// answers and what `select_page` takes.
-pub const PAGE_TITLES: [&str; 4] = ["Displays", "Keyboard", "Audio", "Appearance"];
+pub const PAGE_TITLES: [&str; 5] = ["Displays", "Keyboard", "Mouse", "Audio", "Appearance"];
 
 /// The icons each section heading carries, named in one place so a
 /// rename is one edit and the tests assert on the same constants the
@@ -545,6 +573,8 @@ pub mod icons {
     pub const DISPLAYS: &str = "display";
     /// Beside "Keyboard".
     pub const KEYBOARD: &str = "keyboard";
+    /// Beside "Mouse".
+    pub const MOUSE: &str = "mouse";
     /// Beside "Audio".
     pub const AUDIO: &str = "speaker";
     /// Beside "Appearance".
@@ -665,6 +695,11 @@ pub struct Settings {
     /// into the file; but a file that spelled a value out, even the
     /// default, has it written back, because that was the user's choice.
     seeded_repeat: Option<(u32, u32)>,
+    /// The mouse controls' seeds, per field, on `seeded_repeat`'s rule:
+    /// `Some(default)` for a key the file does not name (a control still
+    /// on it writes no line), `None` for one it does (always written
+    /// back).
+    seeded_pointer: conf::PointerConf,
 }
 
 impl Settings {
@@ -685,6 +720,7 @@ impl Settings {
             scheme_writes: 0,
             modes: Vec::new(),
             seeded_repeat: Some(conf::REPEAT_DEFAULT),
+            seeded_pointer: seed_pointer(&conf::PointerConf::default()),
         }
     }
 
@@ -815,6 +851,10 @@ struct Ids {
     repeat_delay_value: WidgetId,
     repeat_rate: WidgetId,
     repeat_rate_value: WidgetId,
+    pointer_speed: WidgetId,
+    pointer_speed_value: WidgetId,
+    pointer_accel: WidgetId,
+    natural_scroll: WidgetId,
     volume: WidgetId,
     volume_value: WidgetId,
     mute: WidgetId,
@@ -828,7 +868,7 @@ struct Ids {
 /// Public because the tests build the tree the binary builds: a test that
 /// built its own would be testing a second dialog.
 ///
-/// The tree is the split-view blueprint (`docs/ui.md`): four category
+/// The tree is the split-view blueprint (`docs/ui.md`): five category
 /// rows in a sidebar, a page per category on the right, and the
 /// Apply/Revert row as the content footer. The pages are a
 /// [`Pages`] stack — every page is laid out and only the current one is
@@ -982,6 +1022,47 @@ pub fn build(ui: &mut Ui<Settings>) -> WidgetId {
         ui.attach(keyboard_page.column, child).unwrap();
     }
 
+    // -- mouse ---------------------------------------------------------
+    //
+    // `pointer.*`: one slider and two switches. Speed and acceleration
+    // are libinput's, applied by the server to every pointer device;
+    // natural scrolling is the server inverting the axis events. All
+    // three wait for Apply, like the keyboard.
+    let pointer_speed_value = ui.build(value_label(names::POINTER_SPEED_VALUE));
+    let pointer_speed = ui.build(
+        slider(conf::POINTER_SPEED_DEFAULT)
+            .name(names::POINTER_SPEED)
+            .range(POINTER_SPEED_MIN, POINTER_SPEED_MAX)
+            .step(POINTER_SPEED_STEP)
+            .width(SLIDER_WIDTH)
+            .min_width(80.0)
+            .on_change(move |_s: &mut Settings, ui: &mut Ui<Settings>, v: f32| {
+                set_label(ui, pointer_speed_value, &speed_text(v));
+            }),
+    );
+    let pointer_accel = ui.build(switch("").name(names::POINTER_ACCEL));
+    let natural_scroll = ui.build(switch("").name(names::NATURAL_SCROLL));
+    let mouse = ui.build(card().name(names::MOUSE));
+    let speed_row = ui.build(card_row("Pointer speed"));
+    for child in [pointer_speed, pointer_speed_value] {
+        ui.attach(speed_row, child).unwrap();
+    }
+    let accel_row =
+        ui.build(card_row("Acceleration").subtitle("Off: pointer moves at a constant ratio"));
+    ui.attach(accel_row, pointer_accel).unwrap();
+    let scroll_row = ui.build(
+        card_row("Natural scrolling").subtitle("Content follows the wheel, like a touchscreen"),
+    );
+    ui.attach(scroll_row, natural_scroll).unwrap();
+    for child in [speed_row, accel_row, scroll_row] {
+        ui.attach(mouse, child).unwrap();
+    }
+    let mouse_note = ui.build(footnote(NOTE_MOUSE));
+    let mouse_page = content_column().child(group_caption("Pointer")).build(ui);
+    for child in [mouse, mouse_note] {
+        ui.attach(mouse_page.column, child).unwrap();
+    }
+
     // -- audio ---------------------------------------------------------
     //
     // The two labels the audio callbacks write to are built first, so the
@@ -1088,29 +1169,38 @@ pub fn build(ui: &mut Ui<Settings>) -> WidgetId {
 
     // -- the pages, the sidebar, the footer ----------------------------
     let pages_id = ui.build(pages().name(names::PAGES));
-    for p in [displays_page, keyboard_page, audio_page, appearance_page] {
+    for p in [
+        displays_page,
+        keyboard_page,
+        mouse_page,
+        audio_page,
+        appearance_page,
+    ] {
         ui.attach(pages_id, p.page).unwrap();
     }
     let nav_names = [
         names::NAV_DISPLAYS,
         names::NAV_KEYBOARD,
+        names::NAV_MOUSE,
         names::NAV_AUDIO,
         names::NAV_APPEARANCE,
     ];
     let icon_names = [
         names::DISPLAYS_ICON,
         names::KEYBOARD_ICON,
+        names::MOUSE_ICON,
         names::AUDIO_ICON,
         names::APPEARANCE_ICON,
     ];
     let icon_glyphs = [
         icons::DISPLAYS,
         icons::KEYBOARD,
+        icons::MOUSE,
         icons::AUDIO,
         icons::APPEARANCE,
     ];
-    let mut nav = [pages_id; 4];
-    for i in 0..4 {
+    let mut nav = [pages_id; PAGE_TITLES.len()];
+    for i in 0..PAGE_TITLES.len() {
         nav[i] = ui.build(
             sidebar_row(icon_glyphs[i], PAGE_TITLES[i])
                 .name(nav_names[i])
@@ -1180,6 +1270,10 @@ pub fn build(ui: &mut Ui<Settings>) -> WidgetId {
         repeat_delay_value,
         repeat_rate,
         repeat_rate_value,
+        pointer_speed,
+        pointer_speed_value,
+        pointer_accel,
+        natural_scroll,
         volume,
         volume_value,
         mute,
@@ -1198,7 +1292,7 @@ pub fn build(ui: &mut Ui<Settings>) -> WidgetId {
     parts.root
 }
 
-/// Show page `index`: the page stack, the four sidebar rows and the
+/// Show page `index`: the page stack, the five sidebar rows and the
 /// header title move together.
 ///
 /// Public so a test (or an app embedding the dialog) can switch pages
@@ -1341,7 +1435,9 @@ fn init(s: &mut Settings, ui: &mut Ui<Settings>, ids: Ids) {
 
     let conf = load_conf(s);
     s.seeded_repeat = seed_repeat(&conf.keyboard);
+    s.seeded_pointer = seed_pointer(&conf.pointer);
     fill_keyboard(ui, ids, &conf.keyboard);
+    fill_pointer(ui, ids, &conf.pointer);
     fill_appearance(ui, ids, &conf.theme);
 
     // Asking for the outputs *subscribes*, so this is the only request
@@ -1882,6 +1978,18 @@ fn collect(s: &Settings, ui: &Ui<Settings>, ids: Ids) -> (Conf, Vec<String>) {
             }
         },
     };
+    // The pointer section, per field on the repeat sliders' rule: a
+    // control still on its seed writes no line.
+    let (speed, adaptive, natural) = pointer_values(ui, ids);
+    let seeded = s.seeded_pointer;
+    conf.pointer = conf::PointerConf {
+        speed: match seeded.speed {
+            Some(v) if (v - speed).abs() < 1e-4 => None,
+            _ => Some(speed),
+        },
+        adaptive: Some(adaptive).filter(|a| seeded.adaptive != Some(*a)),
+        natural_scroll: Some(natural).filter(|n| seeded.natural_scroll != Some(*n)),
+    };
     // The colour section is carried over from the file rather than
     // rendered from the widgets, and it is the one place this dialog
     // does that. The scheme checkbox already wrote it (`set_scheme`
@@ -1932,6 +2040,7 @@ fn apply(s: &mut Settings, ui: &mut Ui<Settings>, ids: Ids) {
     }
     // The file now says what it says: a written line is the user's.
     s.seeded_repeat = seed_repeat(&conf.keyboard);
+    s.seeded_pointer = seed_pointer(&conf.pointer);
     let verdict = match control::wait_for_reload(&control, before, s.reload_wait) {
         control::Applied::Reloaded => "applied".to_owned(),
         control::Applied::Rejected => "server rejected: see log".to_owned(),
@@ -1955,7 +2064,9 @@ fn revert(s: &mut Settings, ui: &mut Ui<Settings>, ids: Ids) {
     s.reverts += 1;
     let conf = load_conf(s);
     s.seeded_repeat = seed_repeat(&conf.keyboard);
+    s.seeded_pointer = seed_pointer(&conf.pointer);
     fill_keyboard(ui, ids, &conf.keyboard);
+    fill_pointer(ui, ids, &conf.pointer);
     fill_appearance(ui, ids, &conf.theme);
     for r in s.rows.clone() {
         let saved = conf.output(&r.connector);
@@ -2010,6 +2121,71 @@ fn fill_keyboard(ui: &mut Ui<Settings>, ids: Ids, k: &KeyboardConf) {
     let (delay, rate) = repeat_values(ui, ids);
     set_label(ui, ids.repeat_delay_value, &delay_text(delay as f32));
     set_label(ui, ids.repeat_rate_value, &rate_text(rate as f32));
+}
+
+/// Put the mouse section back to what the file says. Setters, so no
+/// callback runs; the speed label is set alongside. A speed outside the
+/// slider's range is clamped into it, visibly.
+fn fill_pointer(ui: &mut Ui<Settings>, ids: Ids, p: &conf::PointerConf) {
+    if let Ok(mut sl) = ui.widget_mut::<Slider<Settings>>(ids.pointer_speed) {
+        sl.set_value(p.speed.unwrap_or(conf::POINTER_SPEED_DEFAULT));
+    }
+    let (speed, _, _) = pointer_values(ui, ids);
+    set_label(ui, ids.pointer_speed_value, &speed_text(speed));
+    for (id, on) in [
+        (
+            ids.pointer_accel,
+            p.adaptive.unwrap_or(conf::POINTER_ADAPTIVE_DEFAULT),
+        ),
+        (
+            ids.natural_scroll,
+            p.natural_scroll.unwrap_or(conf::NATURAL_SCROLL_DEFAULT),
+        ),
+    ] {
+        if let Ok(mut sw) = ui.widget_mut::<Switch<Settings>>(id) {
+            sw.set_checked(on);
+        }
+    }
+}
+
+/// The mouse controls, as `(speed, adaptive, natural_scroll)`.
+fn pointer_values(ui: &Ui<Settings>, ids: Ids) -> (f32, bool, bool) {
+    let speed = ui
+        .widget::<Slider<Settings>>(ids.pointer_speed)
+        .map_or(conf::POINTER_SPEED_DEFAULT, Slider::value);
+    let on = |id| {
+        ui.widget::<Switch<Settings>>(id)
+            .is_ok_and(Switch::is_checked)
+    };
+    (speed, on(ids.pointer_accel), on(ids.natural_scroll))
+}
+
+/// The mouse controls' seeds for a file: each key's default when the
+/// file does not name it, `None` when it does. See
+/// `Settings::seeded_pointer`.
+fn seed_pointer(p: &conf::PointerConf) -> conf::PointerConf {
+    conf::PointerConf {
+        speed: p.speed.is_none().then_some(conf::POINTER_SPEED_DEFAULT),
+        adaptive: p
+            .adaptive
+            .is_none()
+            .then_some(conf::POINTER_ADAPTIVE_DEFAULT),
+        natural_scroll: p
+            .natural_scroll
+            .is_none()
+            .then_some(conf::NATURAL_SCROLL_DEFAULT),
+    }
+}
+
+/// The speed label: `+0.3`, `0`, `-0.5`.
+#[must_use]
+pub fn speed_text(v: f32) -> String {
+    let s = conf::format_speed(v);
+    if s.starts_with('-') || s == "0" {
+        s
+    } else {
+        format!("+{s}")
+    }
 }
 
 /// Put the appearance section back to what the file says.

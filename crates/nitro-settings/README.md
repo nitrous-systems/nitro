@@ -1,6 +1,6 @@
 # nitro-settings
 
-**Displays, keyboard and audio**, in one decorated window. It is the app
+**Displays, keyboard, mouse and audio**, in one decorated window. It is the app
 that writes the compositor's own configuration file — `server.conf`, the
 one `nitro-server` watches with inotify and reloads — and so the first
 nitro app whose output something else reads back.
@@ -11,9 +11,9 @@ nitro app whose output something else reads back.
 │              ├───────────────────────────────────────────────────┤
 │ ▣ Displays   │  Outputs                                          │
 │   Keyboard   │ ┌───────────────────────────────────────────────┐ │
-│   Audio      │ │ HDMI-A-1 1920×1080 @ 60 Hz [==o==] 2 ☑ primary │ │
-│   Appearance │ │    position [0   ] [0   ]                     │ │
-│              │ └───────────────────────────────────────────────┘ │
+│   Mouse      │ │ HDMI-A-1 1920×1080 @ 60 Hz [==o==] 2 ☑ primary │ │
+│   Audio      │ │    position [0   ] [0   ]                     │ │
+│   Appearance │ └───────────────────────────────────────────────┘ │
 │              │  Positions are typed; drag-arrange is not in M4.  │
 │              ├───────────────────────────────────────────────────┤
 │              │ [Apply] [Revert]                          applied │
@@ -167,6 +167,14 @@ the session — the dialog falls back to the ordinary socket, builds its
 rows from `server.conf` alone, and **says so in the note under the
 rows**. A dialog showing two of your four monitors with no explanation is
 worse than one that admits what it is working from.
+
+## Mouse
+
+**Pointer speed** (a slider, -1 to 1), **Acceleration** (on = adaptive,
+off = flat) and **Natural scrolling** write `pointer.speed`,
+`pointer.accel` and `pointer.natural_scroll` on Apply; the server applies
+them on the reload with nothing restarted. A control still on the value it
+was seeded with writes no line. See `docs/settings.md` § `pointer.*`.
 
 ## Audio is a remote control
 
