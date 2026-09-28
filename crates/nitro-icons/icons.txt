@@ -26,10 +26,14 @@ battery
 battery-charging
 battery-full
 battery-half
+bootstrap-reboot
+box-arrow-right
 calculator
 check
+chevron-left
 chevron-right
 circle-fill
+circle-half
 cpu
 dash
 display
@@ -55,6 +59,7 @@ images
 info-circle
 keyboard
 list
+lock
 memory
 moon
 mouse
@@ -62,6 +67,7 @@ palette
 pause-fill
 play-fill
 plus-lg
+power
 recycle
 repeat
 search

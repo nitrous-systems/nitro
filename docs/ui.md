@@ -1298,6 +1298,46 @@ addressed to `win`, whichever window the server focused, and
 The introspection socket names a secondary window's root `window[N]`,
 its index in `ui.windows()`; see `docs/introspection.md`.
 
+### Popups
+
+`ui.add_popup(parent, placement, size, root)` opens a **menu** hung off a
+rectangle of one of the app's windows (`nitro_ui::popup`). The server does
+the work (`docs/wm.md` §Popups): it places the popup against
+`placement.anchor_rect` (parent-window coordinates — `window_bounds` of
+the opening widget), constrained to the work area, and with
+`placement.grab` an outside press **dismisses it and is consumed**, as is
+Escape. `PopupPlacement::below(rect)` is the status-menu drop-down: right
+edges aligned, slide on x, flip on y, shrink on y as a last resort.
+
+To the app a popup is an ordinary secondary window — its own focus,
+hover, `window[N]/…` path, `shot_window` — created with `CreatePopup`
+instead of `CreateWindow`. The server's `PopupDone` is handled exactly
+like `Closed`: destroy, drop the widgets, run `on_window_closed`. That
+handler is the "menu closed" hook whoever closed it. `open_window` lists
+`caps::POPUP` in `ClientCaps` (masked to what the server advertises).
+`grab_keyboard_of(win, on)` lets a shell popup read Tab/Enter.
+
+Popups are **fixed-size** (`RepositionPopup` moves, never resizes). A
+drill-down that changes height adds the new popup and `remove_window`s
+the old one in the same turn: one commit, no empty frame
+(`tests/popup.rs::swapping_a_popup_for_a_taller_one_is_one_commit`).
+
+### Quick settings widgets
+
+`nitro_ui::quick` is what a status menu is built from — GNOME's
+structure with macOS touches, every colour a palette role and every size
+a `pub const` there (`QS_RADIUS` 24, `QS_PAD` 16, `QS_GAP` 10,
+`QS_WIDTH` 360, `TILE_H` 56, `BADGE` 32, `ROUND_BTN` 36, `CHUNKY_H` 24):
+
+| builder | what |
+|---|---|
+| `round_button(icon)` | circular icon button; `.label` (read by `hey`), `.accent(on)`, `.disabled()` |
+| `tile(title, icon)` | neutral raised tile; a round **badge** fills with `Accent` when on; bold title + dim `subtitle`; `.chevron(open)` for a drill-down; role `checkbox`, value `true`/`false` |
+| `section_card(heading)` | rounded `Surface` card with a small dim heading (the Sound card) |
+| `drill_header(title, on_back)` | back arrow (`back`) + bold title, for detail views |
+| `choice_row(label, selected)` | list row with an accent check when selected; hover face |
+| `slider(v).chunky()` | track as tall as the knob, accent fill up to it |
+
 ### The file picker
 
 `nitro_ui::picker::FilePicker` is the file / folder dialog, built on

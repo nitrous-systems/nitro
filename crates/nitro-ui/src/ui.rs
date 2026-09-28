@@ -783,6 +783,67 @@ impl<S: 'static> Ui<S> {
         self.add_window_with(title, size, root, Some(surface))
     }
 
+    /// Open a **popup** off `parent`: a menu hung from
+    /// `placement.anchor_rect` (in `parent`'s coordinates), sized to
+    /// `size` or to the root's measured size.
+    ///
+    /// Everything else is an ordinary secondary window — its own focus,
+    /// hover, pointer routing, `window[N]/…` introspection path and
+    /// [`Ui::on_window_closed`] handlers. The server places it (the
+    /// constrained geometry arrives as a `Configure`) and dismisses it
+    /// with `PopupDone` — an outside press or Escape when it grabs, its
+    /// parent going away — which the toolkit answers by destroying it
+    /// and running the close handlers, as it answers `Closed`.
+    ///
+    /// A popup is **fixed-size**: to change its height, add the new one
+    /// and [`Ui::remove_window`] the old one in the same turn, and the
+    /// swap is one commit.
+    ///
+    /// # Errors
+    /// [`Error::NoWindow`] for a parent this app does not have, else as
+    /// [`Ui::add_window`].
+    pub fn add_popup(
+        &mut self,
+        parent: WindowId,
+        placement: crate::popup::PopupPlacement,
+        size: Option<Size>,
+        root: WidgetId,
+    ) -> Result<WindowId, Error> {
+        if self.win(parent).is_none() {
+            return Err(Error::NoWindow);
+        }
+        if !self.arena.is_live(root) {
+            return Err(Error::StaleWidget);
+        }
+        if self.parent(root).is_some() || self.windows.iter().any(|w| w.root == Some(root)) {
+            return Err(Error::NotRoot);
+        }
+        let size = if let Some(s) = size {
+            s
+        } else {
+            let m = self.measure(root, Constraints::unbounded());
+            Size::new(m.w.max(1.0).ceil(), m.h.max(1.0).ceil())
+        };
+        let id = WindowId(self.wire.alloc_node());
+        self.wire.create_popup(id.0, parent.0, &placement, size)?;
+        let mut w = Window::new(id);
+        w.root = Some(root);
+        w.open = true;
+        w.size = size;
+        w.scale = self.win(parent).map_or(1.0, |p| p.scale);
+        // Where the server will put it, near enough for anything that
+        // reads the position before the first `Configure` arrives.
+        if let Some(p) = self.win(parent) {
+            w.position = Point::new(
+                p.position.x + placement.anchor_rect.x,
+                p.position.y + placement.anchor_rect.bottom(),
+            );
+        }
+        self.windows.push(w);
+        self.mark(root, Dirty::LAYOUT | Dirty::PAINT | Dirty::TREE);
+        Ok(id)
+    }
+
     fn add_window_with(
         &mut self,
         title: &str,
@@ -1890,7 +1951,7 @@ impl<S: 'static> Ui<S> {
         // and not sent at all to a server that cannot know the op.
         self.wire
             .conn_mut()
-            .client_caps(nitro_wire::types::caps::ICONS)?;
+            .client_caps(nitro_wire::types::caps::ICONS | nitro_wire::types::caps::POPUP)?;
         self.wire.create_window(main, title, size, layer, flags)?;
         // The app id, in the same commit: it is what a window list names
         // the program by, and a window that existed for one frame without
@@ -2391,6 +2452,20 @@ impl<S: 'static> Ui<S> {
     /// the connection instead — check [`Ui::is_shell`].
     pub fn grab_keyboard(&mut self, on: bool) -> Result<(), Error> {
         self.wire.grab_keyboard(WindowId::MAIN.0, on)
+    }
+
+    /// [`Ui::grab_keyboard`] naming one of this app's windows — a popup
+    /// menu reading Tab and Enter, say. The server drops the grab when
+    /// the window goes.
+    ///
+    /// # Errors
+    /// [`Error::NoWindow`] for a window this app does not have, or as
+    /// [`Ui::grab_keyboard`].
+    pub fn grab_keyboard_of(&mut self, win: WindowId, on: bool) -> Result<(), Error> {
+        if self.win(win).is_none() {
+            return Err(Error::NoWindow);
+        }
+        self.wire.grab_keyboard(win.0, on)
     }
 
     /// Resize the window's content area; the next flush re-lays out.
@@ -2990,6 +3065,12 @@ impl<S: 'static> Ui<S> {
             // only that window.
             ServerMsg::Closed(c) if c.window == WindowId::MAIN.0 => self.quit = true,
             ServerMsg::Closed(c) => self.window_closed(state, c.window),
+            // A popup the server dismissed (an outside press, Escape, its
+            // parent going away). The server has unmapped it already and
+            // waits for the client to destroy it — exactly `Closed`'s
+            // shape, so the same teardown: destroy, drop, run the close
+            // handlers. A popup we removed ourselves is not reported.
+            ServerMsg::PopupDone(p) => self.window_closed(state, p.popup),
             // The desktop's colours changed (or arrived for the first
             // time, right behind the `Welcome`). Not routed to a widget:
             // every widget is affected, so this marks the whole tree and

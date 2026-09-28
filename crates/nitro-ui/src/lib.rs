@@ -88,6 +88,8 @@ pub mod introspect;
 pub mod layout;
 pub mod list;
 pub mod picker;
+pub mod popup;
+pub mod quick;
 pub mod shell;
 pub mod shot;
 pub mod split;
@@ -117,6 +119,10 @@ pub use layout::{
 pub use list::{List, ListModel, Row, list};
 pub use nitro_core::{Color, Point, Rect, Size, Transform};
 pub use picker::{FilePicker, PickKind};
+pub use popup::PopupPlacement;
+pub use quick::{
+    ChoiceRow, RoundButton, Tile, choice_row, drill_header, round_button, section_card, tile,
+};
 pub use split::{
     Card, CardRow, ContentColumn, Pages, SidebarRow, SplitParts, Switch, card, card_row,
     content_column, footnote, group_caption, pages, sidebar_row, sidebar_section,

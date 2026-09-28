@@ -70,7 +70,7 @@ server, off a real readback) assert that inequality.
 ships beside the crate as `LICENSE.bootstrap-icons` and is recorded in
 `DEPENDENCIES.md`'s vendored-assets section.
 
-62 icons, in seven groups:
+68 icons, in eight groups:
 
 | group | names |
 |---|---|
@@ -79,7 +79,8 @@ ships beside the crate as `LICENSE.bootstrap-icons` and is recorded in
 | settings | `display` `keyboard` `mouse` `speaker` `palette` `sliders` `gear` |
 | window controls | `x` `dash` `square` `arrows-angle-expand` |
 | files | `folder-fill` `folder2-open` `file-earmark` `file-earmark-text` `file-earmark-image` `file-earmark-zip` `file-earmark-code` `file-earmark-font` `file-earmark-play` `file-earmark-music` `download` `headphones` `images` `film` `trash3` |
-| general | `sun` `moon` `arrow-left` `arrow-up` `chevron-right` `recycle` `check` `circle-fill` `exclamation-triangle` `info-circle` `plus-lg` |
+| general | `sun` `moon` `circle-half` `arrow-left` `arrow-up` `chevron-left` `chevron-right` `recycle` `check` `circle-fill` `exclamation-triangle` `info-circle` `plus-lg` |
+| session | `power` `lock` `box-arrow-right` `bootstrap-reboot` |
 | player | `play-fill` `pause-fill` `stop-fill` `skip-start-fill` `skip-end-fill` `eject-fill` `repeat` |
 
 **One substitution from the list the task named**, and it is worth
@@ -206,8 +207,8 @@ Keyed by `(icon index, device px)` → an **A8 coverage mask**.
   is two entries, exactly as a glyph at two sizes is.
 
 **No eviction**, matching the glyph atlas, and for a sharper reason: the
-set is *closed*. 62 icons at the four recommended sizes is 62 × (256 +
-576 + 1 024 + 2 304) ≈ **258 KB** — the whole set, everywhere, at every
+set is *closed*. 68 icons at the four recommended sizes is 68 × (256 +
+576 + 1 024 + 2 304) ≈ **283 KB** — the whole set, everywhere, at every
 size a desktop lays out at. `IconEngine::MAX_BYTES` is 2 MiB, an order of
 magnitude past that, and a raster that would cross it is refused rather
 than evicting something: an LRU for a bounded set answers a question that

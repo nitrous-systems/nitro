@@ -117,22 +117,22 @@ pub mod names {
 // A pressable face: the state machine SidebarRow and CardRow share
 // ---------------------------------------------------------------------
 
-type ClickFn<S> = Box<dyn Fn(&mut S, &mut Ui<S>)>;
+pub(crate) type ClickFn<S> = Box<dyn Fn(&mut S, &mut Ui<S>)>;
 
 /// The press/release/keyboard state of a clickable container, shared by
 /// [`SidebarRow`] and a navigation [`CardRow`]. Deliberately the same
 /// shape as [`Button`](crate::widgets::Button)'s so a scripted `click`
 /// and a real release are indistinguishable to the app.
-struct Pressable<S> {
+pub(crate) struct Pressable<S> {
     /// Painted active: pressed *and* the pointer over it.
-    pressed: bool,
+    pub(crate) pressed: bool,
     /// A left press is being captured; see `Button::held`.
     held: bool,
-    on_click: Option<ClickFn<S>>,
+    pub(crate) on_click: Option<ClickFn<S>>,
 }
 
 impl<S: 'static> Pressable<S> {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             pressed: false,
             held: false,
@@ -151,7 +151,7 @@ impl<S: 'static> Pressable<S> {
 
     /// The common event handling. Answers `None` for an event the caller
     /// should look at itself.
-    fn event(&mut self, cx: &mut EventCx<'_, S>, ev: &Event) -> Option<Handled> {
+    pub(crate) fn event(&mut self, cx: &mut EventCx<'_, S>, ev: &Event) -> Option<Handled> {
         match ev {
             Event::PointerDown { button, .. } if *button == button::LEFT => {
                 self.pressed = true;
@@ -209,7 +209,7 @@ impl<S: 'static> Pressable<S> {
         }
     }
 
-    fn action(&mut self, cx: &mut EventCx<'_, S>, action: &str) -> Handled {
+    pub(crate) fn action(&mut self, cx: &mut EventCx<'_, S>, action: &str) -> Handled {
         match action {
             "click" | "activate" | "press" => {
                 self.activate(cx);

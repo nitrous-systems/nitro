@@ -822,6 +822,7 @@ type ClickFn<S> = Box<dyn Fn(&mut S, &mut Ui<S>)>;
 /// and deliberately kept apart (see [`IconMode`]): *instead of* the
 /// label, which is what a toolbar glyph button is, or *in front of* it,
 /// which is what a launcher row and a window-list entry are.
+#[allow(clippy::struct_excessive_bools)] // Independent facts (enabled, pressed, held, …), not a state machine.
 pub struct Button<S> {
     text: String,
     /// An icon drawn instead of, or in front of, the label — by name.
@@ -3151,6 +3152,7 @@ type ValueFn<S> = Box<dyn Fn(&mut S, &mut Ui<S>, f32)>;
 /// [`vertical`](SliderBuilder::vertical) slider puts the minimum at the
 /// **bottom** — a fader, an equaliser band — because "up is more" is the
 /// convention every mixing desk has taught.
+#[allow(clippy::struct_excessive_bools)] // Independent facts (enabled, mid-drag, orientation, look), not a state machine.
 pub struct Slider<S> {
     value: f32,
     min: f32,
@@ -3159,6 +3161,8 @@ pub struct Slider<S> {
     enabled: bool,
     dragging: bool,
     vertical: bool,
+    /// The quick-settings look: track as tall as the knob.
+    chunky: bool,
     on_change: Option<ValueFn<S>>,
 }
 
@@ -3188,6 +3192,12 @@ impl<S> Slider<S> {
     #[must_use]
     pub fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Whether it draws the chunky quick-settings track.
+    #[must_use]
+    pub fn is_chunky(&self) -> bool {
+        self.chunky
     }
 
     /// Whether the track runs bottom-to-top rather than left-to-right.
@@ -3232,6 +3242,55 @@ impl<S: 'static> Slider<S> {
         self.on_change = Some(cb);
     }
 
+    /// The chunky look ([`SliderBuilder::chunky`]): one pill-shaped track
+    /// as tall as the knob, filled with the accent up to the knob's
+    /// centre, and a round knob the full height of the track.
+    fn paint_chunky(&self, cx: &mut PaintCx<'_, S>, focused: bool) {
+        let bounds = cx.bounds;
+        let h = crate::quick::CHUNKY_H.min(bounds.h);
+        let ty = ((bounds.h - h) / 2.0).max(0.0);
+        let usable = (bounds.w - h).max(0.0);
+        let x = h / 2.0 + usable * self.fraction();
+        let (filled, knob_face) = if self.enabled {
+            (
+                cx.color(nitro_core::Role::Accent),
+                cx.color(nitro_core::Role::Button),
+            )
+        } else {
+            (
+                cx.color(nitro_core::Role::ButtonDisabled),
+                cx.color(nitro_core::Role::ButtonDisabled),
+            )
+        };
+        let rest = cx.color(nitro_core::Role::Track);
+        let border = if focused {
+            (2.0, cx.color(nitro_core::Role::Focus))
+        } else {
+            (1.0, cx.color(nitro_core::Role::Hairline))
+        };
+        cx.rect(
+            0,
+            Rect::new(0.0, ty, bounds.w, h),
+            Fill::Solid(rest),
+            h / 2.0,
+            (0.0, Color::TRANSPARENT),
+        );
+        cx.rect(
+            1,
+            Rect::new(0.0, ty, x + h / 2.0, h),
+            Fill::Solid(filled),
+            h / 2.0,
+            (0.0, Color::TRANSPARENT),
+        );
+        cx.rect(
+            2,
+            Rect::new(x - h / 2.0, ty, h, h),
+            Fill::Solid(knob_face),
+            h / 2.0,
+            border,
+        );
+    }
+
     /// The value under the pointer at `pos` inside a track of `size`.
     ///
     /// Horizontal: left is the minimum. Vertical: the *bottom* is.
@@ -3252,7 +3311,11 @@ impl<S: 'static> Widget<S> for Slider<S> {
         let theme = cx.theme();
         // Long enough to be draggable, thick enough for the knob. The
         // length is a default: a slider is normally given one, or grows.
-        let (long, thick) = (theme.slider_knob * 8.0, theme.slider_knob);
+        let (long, thick) = if self.chunky {
+            (crate::quick::CHUNKY_H * 8.0, crate::quick::CHUNKY_H)
+        } else {
+            (theme.slider_knob * 8.0, theme.slider_knob)
+        };
         if self.vertical {
             constraints.constrain(Size::new(thick, long))
         } else {
@@ -3264,6 +3327,10 @@ impl<S: 'static> Widget<S> for Slider<S> {
         let theme = cx.theme();
         let (track_h, knob) = (theme.slider_track, theme.slider_knob);
         let focused = cx.ui.is_focused(cx.id);
+        if self.chunky && !self.vertical {
+            self.paint_chunky(cx, focused);
+            return;
+        }
         let theme = cx.theme();
         let (filled, rest, knob_face) = if self.enabled {
             (theme.accent, theme.track, theme.button)
@@ -3337,7 +3404,11 @@ impl<S: 'static> Widget<S> for Slider<S> {
         if !self.enabled {
             return Handled::No;
         }
-        let knob = cx.theme().slider_knob;
+        let knob = if self.chunky {
+            crate::quick::CHUNKY_H.min(cx.bounds.h)
+        } else {
+            cx.theme().slider_knob
+        };
         let size = cx.bounds.size();
         match ev {
             Event::PointerDown { pos, button } if *button == button::LEFT => {
@@ -3523,6 +3594,18 @@ impl<S: 'static> SliderBuilder<S> {
         self.slider.vertical = true;
         self
     }
+
+    /// The quick-settings look: the track is as tall as the knob
+    /// ([`CHUNKY_H`](crate::quick::CHUNKY_H)), filled with the accent up
+    /// to the knob. Horizontal only; the value semantics are unchanged.
+    #[must_use]
+    pub fn chunky(mut self) -> Self {
+        self.slider.chunky = true;
+        // It may shrink along its length, never across it: a crowded
+        // column must not squeeze the track away.
+        self.built.state_mut().style.min_height = Some(crate::quick::CHUNKY_H);
+        self
+    }
 }
 
 impl<S: 'static> StyleBuilder<S> for SliderBuilder<S> {
@@ -3558,6 +3641,7 @@ pub fn slider<S: 'static>(value: f32) -> SliderBuilder<S> {
         enabled: true,
         dragging: false,
         vertical: false,
+        chunky: false,
         on_change: None,
     };
     let mut built = Built::new(Flex);

@@ -542,6 +542,36 @@ impl Wire {
         )
     }
 
+    /// Create a popup window `id` off `parent` (needs `caps::POPUP`,
+    /// which [`Ui::open_window`](crate::Ui::open_window) lists in
+    /// `ClientCaps`). A scene mutation, so it rides the commit with the
+    /// content drawn into it.
+    pub(crate) fn create_popup(
+        &mut self,
+        id: NodeId,
+        parent: NodeId,
+        placement: &crate::popup::PopupPlacement,
+        size: Size,
+    ) -> Result<(), Error> {
+        self.send(
+            &ClientMsg::CreatePopup(msg::CreatePopup {
+                id,
+                parent,
+                anchor_rect: placement.anchor_rect.round_out(),
+                anchor: placement.anchor,
+                gravity: placement.gravity,
+                constraint: placement.constraint,
+                size,
+                flags: if placement.grab {
+                    nitro_wire::types::popup_flags::GRAB
+                } else {
+                    0
+                },
+            }),
+            id,
+        )
+    }
+
     pub(crate) fn destroy_node(&mut self, id: NodeId) -> Result<(), Error> {
         self.send(&ClientMsg::DestroyNode(DestroyNode { id }), id)?;
         self.free_node(id);
