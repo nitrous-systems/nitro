@@ -2,7 +2,10 @@
 
 mod common;
 
-use common::{CLIENT, OUT, group, rect, rect_colored, scene, settle, text, window, window_at};
+use common::{
+    CLIENT, OUT, OUT2, damage_bounds, group, rect, rect_colored, scene, settle, text, window,
+    window_at,
+};
 use nitro_core::{Color, IRect, Point, Rect, Size, Transform};
 use nitro_scene::{
     Border, Fill, Layer, NodeKey, NodeKind, PaintItem, PaintKind, Scene, TextAlign, TextRef,
@@ -700,4 +703,103 @@ fn a_text_node_with_no_run_or_no_colour_paints_nothing() {
     for key in [bare, clear, empty] {
         assert!(!s.node(key).unwrap().painted());
     }
+}
+
+/// A Normal window and a Top panel over it, both at the origin, plus an
+/// Overlay menu at (300, 0): `(normal, panel, menu)`.
+fn covered_panel(
+    s: &mut Scene,
+) -> (
+    nitro_scene::WindowKey,
+    nitro_scene::WindowKey,
+    nitro_scene::WindowKey,
+) {
+    let (normal, normal_root) = window_at(s, Point::ZERO, Size::new(800.0, 600.0));
+    rect(s, normal_root, Rect::new(0.0, 0.0, 800.0, 600.0));
+    let panel = s.create_window(CLIENT, "p", Size::new(800.0, 50.0), Layer::Top);
+    s.place_window(panel, Some(OUT), Point::ZERO).unwrap();
+    let panel_root = s.window_info(panel).unwrap().root();
+    rect(s, panel_root, Rect::new(0.0, 0.0, 800.0, 50.0));
+    let menu = s.create_window(CLIENT, "m", Size::new(100.0, 100.0), Layer::Overlay);
+    s.place_window(menu, Some(OUT), Point::new(300.0, 0.0))
+        .unwrap();
+    let menu_root = s.window_info(menu).unwrap().root();
+    rect(s, menu_root, Rect::new(0.0, 0.0, 100.0, 100.0));
+    settle(s);
+    (normal, panel, menu)
+}
+
+fn painted_windows(s: &Scene) -> Vec<nitro_scene::WindowKey> {
+    let mut out: Vec<_> = paint(s, ALL).into_iter().map(|i| i.window).collect();
+    out.dedup();
+    out
+}
+
+#[test]
+fn a_hidden_top_layer_is_neither_painted_nor_hit() {
+    let mut s = scene();
+    let (normal, panel, menu) = covered_panel(&mut s);
+    assert_eq!(painted_windows(&s), vec![normal, panel, menu]);
+    assert_eq!(
+        s.hit_test(OUT, Point::new(10.0, 10.0)).unwrap().window,
+        panel
+    );
+
+    s.set_top_layer_hidden(OUT, true);
+    assert!(s.top_layer_hidden(OUT));
+    assert!(s.is_layer_hidden(panel));
+    assert!(!s.is_layer_hidden(normal));
+    assert!(!s.is_layer_hidden(menu));
+    // The whole output is damaged.
+    assert_eq!(damage_bounds(&mut s), ALL);
+
+    assert_eq!(painted_windows(&s), vec![normal, menu]);
+    assert_eq!(
+        s.hit_test(OUT, Point::new(10.0, 10.0)).unwrap().window,
+        normal
+    );
+    // Overlay is unaffected.
+    assert_eq!(
+        s.hit_test(OUT, Point::new(310.0, 10.0)).unwrap().window,
+        menu
+    );
+
+    // Setting it again changes nothing, and damages nothing.
+    s.set_top_layer_hidden(OUT, true);
+    assert!(damage_bounds(&mut s).is_empty());
+
+    s.set_top_layer_hidden(OUT, false);
+    assert_eq!(damage_bounds(&mut s), ALL);
+    assert!(!s.is_layer_hidden(panel));
+    assert_eq!(painted_windows(&s), vec![normal, panel, menu]);
+    assert_eq!(
+        s.hit_test(OUT, Point::new(10.0, 10.0)).unwrap().window,
+        panel
+    );
+}
+
+#[test]
+fn hiding_the_top_layer_is_per_output() {
+    let mut s = scene();
+    s.add_output(OUT2, IRect::new(800, 0, 800, 600), 1.0);
+    let panel2 = s.create_window(CLIENT, "p2", Size::new(800.0, 50.0), Layer::Top);
+    s.place_window(panel2, Some(OUT2), Point::ZERO).unwrap();
+    let root2 = s.window_info(panel2).unwrap().root();
+    rect(&mut s, root2, Rect::new(0.0, 0.0, 800.0, 50.0));
+    let (_, panel, _) = covered_panel(&mut s);
+
+    s.set_top_layer_hidden(OUT, true);
+    settle(&mut s);
+    assert!(s.is_layer_hidden(panel));
+    assert!(!s.is_layer_hidden(panel2));
+    assert!(!s.top_layer_hidden(OUT2));
+    let hit = s.hit_test(OUT2, Point::new(810.0, 10.0)).unwrap();
+    assert_eq!(hit.window, panel2);
+    let mut out = Vec::new();
+    s.paint_list(OUT2, &IRect::new(800, 0, 800, 600), &mut out);
+    assert!(out.iter().any(|i| i.window == panel2));
+
+    // Replacing the output keeps the flag.
+    s.add_output(OUT, IRect::new(0, 0, 800, 600), 1.0);
+    assert!(s.top_layer_hidden(OUT));
 }

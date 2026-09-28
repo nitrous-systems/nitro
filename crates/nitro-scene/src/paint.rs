@@ -7,7 +7,7 @@
 use nitro_core::{Color, IRect, Point, Rect, Region, Transform};
 
 use crate::{
-    BufferKey, Fill, NodeKey, OutputId, Scene, WindowKey,
+    BufferKey, Fill, Layer, NodeKey, OutputId, Scene, WindowKey,
     node::{Border, IconRef, NodeData, TextAlign, TextRef},
     update::device_rect,
 };
@@ -289,7 +289,10 @@ impl Scene {
     /// children in order (later children on top).
     ///
     /// Invisible nodes, fully transparent nodes and subtrees whose cached
-    /// extent misses `clip` are skipped without being walked. `out` is
+    /// extent misses `clip` are skipped without being walked. So are the
+    /// windows the [`Admit`](crate::Admit) filter leaves out, and the
+    /// [`Layer::Top`] windows of an output whose top layer is hidden
+    /// ([`set_top_layer_hidden`](Scene::set_top_layer_hidden)). `out` is
     /// appended to, never cleared.
     ///
     /// Call after [`update`](Scene::update): the traversal reads the cached
@@ -301,12 +304,13 @@ impl Scene {
         let Some(index) = self.output_index(output) else {
             return;
         };
+        let top_hidden = self.output_at(index).top_hidden;
         let windows: Vec<WindowKey> = self.output_at(index).z_order().collect();
         for win in windows {
             let Some(window) = self.windows.get(win) else {
                 continue;
             };
-            if !self.admit.admits(window.client) {
+            if !self.admit.admits(window.client) || (top_hidden && window.layer == Layer::Top) {
                 continue;
             }
             let root = window.root;
@@ -461,12 +465,15 @@ impl Scene {
     /// back (later children are on top). Invisible and fully transparent
     /// subtrees are skipped, clip groups reject points outside their clip, and
     /// a node only counts as hit if it actually paints something. A group with
-    /// no content never swallows a click.
+    /// no content never swallows a click. Windows that
+    /// [`paint_list`](Scene::paint_list) leaves out (not admitted, or on a
+    /// hidden top layer) and hit-exempt windows are never hit.
     ///
     /// Call after [`update`](Scene::update).
     #[must_use]
     pub fn hit_test(&self, output: OutputId, point: Point) -> Option<Hit> {
         let index = self.output_index(output)?;
+        let top_hidden = self.output_at(index).top_hidden;
         let ids: Vec<WindowKey> = self.output_at(index).z_order().collect();
         for win in ids.into_iter().rev() {
             // Defensive: the z-order should only name live windows. Skip a
@@ -475,7 +482,10 @@ impl Scene {
             let Some(window) = self.windows.get(win) else {
                 continue;
             };
-            if !self.admit.admits(window.client) || window.hit_exempt {
+            if !self.admit.admits(window.client)
+                || window.hit_exempt
+                || (top_hidden && window.layer == Layer::Top)
+            {
                 continue;
             }
             let root = window.root;

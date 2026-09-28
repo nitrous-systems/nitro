@@ -683,7 +683,7 @@ back with a `WindowState` event whenever it actually changed.
 |---|---|---|
 | `Normal` | the remembered rectangle | shown |
 | `Maximized` | the output's work area | shown |
-| `Fullscreen` | the whole output | hidden |
+| `Fullscreen` | the whole output | hidden (and the output's `Top` layer too; see below) |
 | `Minimized` | unchanged | — (the window is hidden) |
 
 Entering `Maximized` or `Fullscreen` from `Normal` remembers the frame
@@ -695,6 +695,37 @@ Fullscreen **hides** the decorations rather than destroying them: the
 frame group stays, its insets go to zero, and leaving fullscreen puts them
 back. Adding or removing a frame for real would restructure the tree under
 a live client.
+
+### Fullscreen covers the panels
+
+A fullscreen window gets the whole output, but it stays on `Layer::Normal`,
+and the bar is on `Layer::Top`. On its own, layering would paint the bar
+over the window's top strip and give the bar its clicks. So while the
+**frontmost** `Normal` window on an output is `Fullscreen`, the `Top` layer
+**on that output** is neither painted nor hit-tested. The frontmost window
+is the first on-screen `Normal`-layer toplevel; popups, the overview scrim
+and drag icons don't count. `Server::sync_fullscreen_cover` decides this
+once per wakeup, just before the scene update, and flips
+`Scene::set_top_layer_hidden(output, _)`. The scene's `paint_list` and
+`hit_test` then skip that output's `Top` windows. `Server::on_screen`
+treats them as off screen, so a frame hit can't grab them either. When the
+flag turns on, any open menus of the panels are dismissed.
+
+The bar comes back when:
+- the window leaves fullscreen, is minimized or is closed;
+- another window on the same output is raised above it or takes the focus
+  (focus on another output, or no focus at all, keeps it hidden);
+- that output enters overview.
+
+The rule is per output, so other outputs keep their bars. The **work area
+does not change**: maximized windows still avoid the bar. `Overlay`
+(menus, the fullscreen window's own popups) is unaffected. Chromium's F11
+(`SetWindowState(Fullscreen)` from the client) and Super+F take the same
+path, and the `Configure` carries the full-output size.
+
+Hiding a layer was chosen over moving the fullscreen window up to `Top`
+because a popup inherits its parent's layer, and a fullscreen window on
+`Top` would compete with real panels for the order within that layer.
 
 A `FIXED_SIZE` window silently refuses `Maximized` and `Fullscreen`, and
 gets neither resize bands nor a maximize button — though it keeps close
@@ -868,6 +899,8 @@ output is scaled down in place and laid out so all of them are visible at
 once, each with its own (scaled) title bar and an app icon hanging off
 it, and a search field in a band reserved at the top. It is what a bare-Super tap will open instead of the plain
 launcher, and it absorbs the launcher rather than sitting beside it.
+The bar is shown in overview even when a fullscreen window was covering
+it (§Fullscreen covers the panels).
 
 ### Server-side, because the primitive is already here
 

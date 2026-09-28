@@ -227,6 +227,41 @@ impl Scene {
             .is_some_and(|w| self.admit.admits(w.client))
     }
 
+    /// Leave [`Layer::Top`] on `output` out of painting and hit-testing
+    /// (or put it back). A fullscreen window must cover the panels on its
+    /// output without losing its layer, so the windows stay where they are
+    /// and only the two walks skip them; [`Layer::Overlay`] is unaffected.
+    ///
+    /// A change damages the output whole. Setting the value already in
+    /// force, or naming an unknown output, does nothing.
+    pub fn set_top_layer_hidden(&mut self, output: OutputId, hidden: bool) {
+        let Some(o) = self.outputs.iter_mut().find(|o| o.id == output) else {
+            return;
+        };
+        if o.top_hidden == hidden {
+            return;
+        }
+        o.top_hidden = hidden;
+        self.pending.push((o.id, o.rect));
+    }
+
+    /// Whether [`Layer::Top`] on `output` is hidden. `false` for an unknown
+    /// output.
+    #[must_use]
+    pub fn top_layer_hidden(&self, output: OutputId) -> bool {
+        self.outputs.iter().any(|o| o.id == output && o.top_hidden)
+    }
+
+    /// Whether `win` sits on a hidden top layer: on [`Layer::Top`] of an
+    /// output whose top layer is hidden. Such a window is neither painted
+    /// nor hit. `false` for a window that does not exist or is unplaced.
+    #[must_use]
+    pub fn is_layer_hidden(&self, win: WindowKey) -> bool {
+        self.windows.get(win).is_some_and(|w| {
+            w.layer == Layer::Top && w.output.is_some_and(|o| self.top_layer_hidden(o))
+        })
+    }
+
     // --------------------------------------------------------------- outputs
 
     /// Add (or replace) an output.

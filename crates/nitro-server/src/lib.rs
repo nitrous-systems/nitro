@@ -2472,6 +2472,9 @@ impl Server {
         // unmap is already recorded when the client hears (unmap, then
         // notify).
         self.flush_popup_done();
+        // Last thing before the update: every path that can change which
+        // window is frontmost, its state or the focus has run by now.
+        self.sync_fullscreen_cover();
         self.update_scene();
         // A popup mapped or unmapped under a stationary pointer changed
         // what the pointer is over; hit testing needs the update above.
@@ -5427,6 +5430,86 @@ impl Server {
             // A window the session lock hides is not on screen: no title bar
             // to drag, no button to press, no edge to resize.
             && self.scene.admits_window(win)
+            // Nor is a panel a fullscreen window covers.
+            && !self.scene.is_layer_hidden(win)
+    }
+
+    /// Hide the [`nitro_scene::Layer::Top`] of every output whose frontmost window is
+    /// fullscreen, and show it again everywhere else: `docs/wm.md`
+    /// §States, "Fullscreen covers the panels".
+    ///
+    /// The frontmost window is the first `Normal`-layer toplevel on screen
+    /// (popups, the scrim and drag icons do not count). The panels stay
+    /// hidden while it is fullscreen, unless the output is in overview or
+    /// the focus is on some *other* window of the same output (focus on
+    /// another output, or nowhere, leaves them hidden). Run once per
+    /// wakeup, just before the scene update, so every trigger (state
+    /// change, raise, focus, minimize, destroy, overview, hotplug) is
+    /// covered from one place. Allocation-free unless something changes.
+    fn sync_fullscreen_cover(&mut self) {
+        for i in 0..self.outputs.len() {
+            let id = self.outputs[i].scene_id;
+            let hide = self.fullscreen_covers(id);
+            if hide == self.scene.top_layer_hidden(id) {
+                continue;
+            }
+            self.scene.set_top_layer_hidden(id, hide);
+            // Bar ↔ fullscreen window under a still pointer.
+            self.popup_seat.pointer_refresh = true;
+            self.cursor_stale = true;
+            if hide {
+                // A panel's menu must not stay open (and grabbing) while
+                // its panel is invisible.
+                let panels: Vec<WindowKey> = self
+                    .scene
+                    .windows(id)
+                    .filter(|w| {
+                        self.scene
+                            .window_info(*w)
+                            .is_ok_and(|i| i.layer() == nitro_scene::Layer::Top && !i.is_popup())
+                    })
+                    .collect();
+                for panel in panels {
+                    self.dismiss_popups_of(panel);
+                }
+            }
+        }
+    }
+
+    /// Whether a fullscreen window covers the panels on `output`; see
+    /// [`Server::sync_fullscreen_cover`].
+    fn fullscreen_covers(&self, output: SceneOutputId) -> bool {
+        if self.overview_output() == Some(output) {
+            return false;
+        }
+        let Some(front) = self.scene.windows_front_to_back(output).find(|w| {
+            self.scene
+                .window_info(*w)
+                .is_ok_and(|i| i.layer() == nitro_scene::Layer::Normal && !i.is_popup())
+                && !self.drag_icons.contains(w)
+                && !self.is_scrim(*w)
+                && self.on_screen(*w)
+        }) else {
+            return false;
+        };
+        if self
+            .scene
+            .window_info(front)
+            .map_or(true, |i| i.state() != WindowState::Fullscreen)
+        {
+            return false;
+        }
+        match self.focus {
+            Some(f)
+                if self
+                    .scene
+                    .window_info(f)
+                    .is_ok_and(|i| i.output() == Some(output)) =>
+            {
+                self.scene.chain_root(f) == front
+            }
+            _ => true,
+        }
     }
 
     /// Where an output's logical space starts in the desktop space.

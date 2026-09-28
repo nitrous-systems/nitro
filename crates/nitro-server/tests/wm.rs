@@ -39,6 +39,7 @@ const KEY_A: u32 = 30;
 const KEY_Q: u32 = 16;
 const KEY_M: u32 = 50;
 const KEY_H: u32 = 35;
+const KEY_F: u32 = 33;
 const KEY_TAB: u32 = 15;
 const KEY_LEFTALT: u32 = 56;
 const KEY_LEFTCTRL: u32 = 29;
@@ -72,12 +73,29 @@ struct Harness {
     thread: Option<JoinHandle<Result<(), nitro_server::Error>>>,
 }
 
+/// Lift the soft open-file limit to the hard one, once. Every test runs
+/// a whole server in-process, in parallel, and the default soft limit of
+/// 1024 is only a few dozen harnesses' worth of sockets, timers and
+/// buffers: past it, a harness fails with `EMFILE` for no reason of its own.
+fn raise_fd_limit() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        use rustix::process::{Resource, getrlimit, setrlimit};
+        let mut lim = getrlimit(Resource::Nofile);
+        if lim.current < lim.maximum {
+            lim.current = lim.maximum;
+            let _ = setrlimit(Resource::Nofile, lim);
+        }
+    });
+}
+
 impl Harness {
     fn start(name: &str, width: u32, height: u32) -> Self {
         Self::start_with(name, width, height, |_| {})
     }
 
     fn start_with(name: &str, width: u32, height: u32, tweak: impl FnOnce(&mut Config)) -> Self {
+        raise_fd_limit();
         let dir = std::env::temp_dir().join(format!("nitro-wm-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("nitro").join("control.sock");
@@ -5365,6 +5383,222 @@ fn a_minimized_window_goes_back_hidden_after_a_search() {
     overview(&h, false);
     assert_eq!(h.stat("minimized"), 1, "still minimized");
     assert!(h.shot().data == before.data, "and hidden again");
+
+    drop((conn, shell));
+    h.quit();
+}
+
+// ------------------------------------------------------- fullscreen covers
+
+/// A GREEN `Top`-layer panel from a shell client, as nitro-bar is:
+/// returns the connection, its inbox, the panel's root and its centre.
+fn make_panel(h: &Harness) -> (Connection, Inbox, NodeId, (f32, f32)) {
+    let mut shell_inbox = Inbox::default();
+    let mut shell = h.shell("panel");
+    let root = NodeId(11);
+    let rect = NodeId(12);
+    let size = Size::new(120.0, 40.0);
+    shell
+        .tx()
+        .create_window_with(
+            root,
+            "panel",
+            size,
+            Layer::Top,
+            window_flags::UNDECORATED | window_flags::NO_FOCUS,
+        )
+        .create_rect(rect, root, Rect::new(0.0, 0.0, size.w, size.h))
+        .fill_solid(rect, GREEN)
+        .commit(1)
+        .unwrap();
+    shell.flush().unwrap();
+    let (pos, size) = expect(&mut shell, &mut shell_inbox.0, "Configure", |m| match m {
+        ServerMsg::Configure(c) if c.window == root => Some((c.position, c.size)),
+        _ => None,
+    });
+    h.settle();
+    let centre = (pos.x + size.w / 2.0, pos.y + size.h / 2.0);
+    (shell, shell_inbox, root, centre)
+}
+
+fn pixel_at(h: &Harness, at: (f32, f32)) -> u32 {
+    rgb(h.shot().pixel(at.0 as u32, at.1 as u32))
+}
+
+fn set_state(conn: &mut Connection, win: &Win, state: WindowState, serial: u32) {
+    conn.tx()
+        .set_window_state(win.root, state)
+        .commit(serial)
+        .unwrap();
+    conn.flush().unwrap();
+}
+
+/// Grow a `make_window` window's rect to its configured size, as a real
+/// client would after a `Configure`.
+fn fill(conn: &mut Connection, win: &Win, serial: u32) {
+    let rect = NodeId(win.root.0 + 1);
+    conn.tx()
+        .bounds(rect, Rect::new(0.0, 0.0, win.size.w, win.size.h))
+        .commit(serial)
+        .unwrap();
+    conn.flush().unwrap();
+}
+
+/// Click at `at` and report whether `window` got a `PointerButton` on
+/// `conn`.
+fn clicked(
+    h: &mut Harness,
+    at: (f32, f32),
+    conn: &mut Connection,
+    inbox: &mut Inbox,
+    window: NodeId,
+) -> bool {
+    inbox.0.clear();
+    h.point_at(at.0, at.1, OUT);
+    h.settle();
+    h.button(BTN_LEFT, ButtonState::Pressed);
+    h.button(BTN_LEFT, ButtonState::Released);
+    h.settle();
+    conn.flush().unwrap();
+    let _ = conn.poll(&mut inbox.0);
+    inbox
+        .0
+        .iter()
+        .any(|m| matches!(m, ServerMsg::PointerButton(p) if p.window == window))
+}
+
+#[test]
+fn fullscreen_hides_the_bar_and_the_window_gets_its_clicks() {
+    let mut h = Harness::start("fs-cover", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("fs-cover");
+    let mut win = make_window(&mut conn, &mut inbox, 1, "a", WIN, RED, 0, 1);
+    let (mut shell, mut shell_inbox, panel, at) = make_panel(&h);
+    park(&mut h);
+    assert_eq!(pixel_at(&h, at), to_rgb(GREEN), "the bar shows");
+
+    set_state(&mut conn, &win, WindowState::Fullscreen, 2);
+    h.settle();
+    await_configure(&mut conn, &mut inbox, &mut win, "fullscreen");
+    assert_eq!(
+        (win.pos, win.size),
+        (Point::ZERO, Size::new(OUT.0 as f32, OUT.1 as f32)),
+        "the client is configured to the whole output"
+    );
+    fill(&mut conn, &win, 10);
+    h.settle();
+    park(&mut h);
+    assert_eq!(
+        pixel_at(&h, at),
+        to_rgb(RED),
+        "the fullscreen window covers the bar"
+    );
+    assert!(
+        clicked(&mut h, at, &mut conn, &mut inbox, win.root),
+        "a click where the bar is reaches the fullscreen window"
+    );
+    shell.flush().unwrap();
+    let _ = shell.poll(&mut shell_inbox.0);
+    assert!(
+        !shell_inbox
+            .0
+            .iter()
+            .any(|m| matches!(m, ServerMsg::PointerButton(p) if p.window == panel)),
+        "and not the hidden bar"
+    );
+
+    set_state(&mut conn, &win, WindowState::Normal, 3);
+    h.settle();
+    await_configure(&mut conn, &mut inbox, &mut win, "normal");
+    park(&mut h);
+    assert_eq!(pixel_at(&h, at), to_rgb(GREEN), "the bar is back");
+    assert!(
+        clicked(&mut h, at, &mut shell, &mut shell_inbox, panel),
+        "and takes its clicks again"
+    );
+
+    drop((conn, shell));
+    h.quit();
+}
+
+#[test]
+fn super_f_hides_the_bar_too_and_minimize_brings_it_back() {
+    let mut h = Harness::start("fs-super-f", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("fs-super-f");
+    let mut win = make_window(&mut conn, &mut inbox, 1, "a", WIN, RED, 0, 1);
+    let (shell, _shell_inbox, _panel, at) = make_panel(&h);
+    park(&mut h);
+
+    h.key(KEY_LEFTMETA, true);
+    h.key(KEY_F, true);
+    h.key(KEY_F, false);
+    h.key(KEY_LEFTMETA, false);
+    h.settle();
+    await_configure(&mut conn, &mut inbox, &mut win, "Super+F");
+    fill(&mut conn, &win, 10);
+    h.settle();
+    park(&mut h);
+    assert_eq!(pixel_at(&h, at), to_rgb(RED), "Super+F covers the bar");
+
+    // Super+H minimizes the fullscreen window: the bar comes back.
+    h.key(KEY_LEFTMETA, true);
+    h.key(KEY_H, true);
+    h.key(KEY_H, false);
+    h.key(KEY_LEFTMETA, false);
+    h.settle();
+    assert_eq!(h.stat("minimized"), 1);
+    assert_eq!(pixel_at(&h, at), to_rgb(GREEN), "minimizing shows the bar");
+
+    drop((conn, shell));
+    h.quit();
+}
+
+#[test]
+fn focusing_another_window_or_overview_brings_the_bar_back() {
+    let mut h = Harness::start("fs-focus", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("fs-focus");
+    let mut a = make_window(&mut conn, &mut inbox, 1, "a", WIN, RED, 0, 1);
+    let b = make_window(&mut conn, &mut inbox, 3, "b", WIN, BLUE, 0, 2);
+    let (shell, _shell_inbox, _panel, at) = make_panel(&h);
+    park(&mut h);
+
+    // Alt+Tab to `a`, then fullscreen it.
+    h.key(KEY_LEFTALT, true);
+    h.key(KEY_TAB, true);
+    h.key(KEY_TAB, false);
+    h.key(KEY_LEFTALT, false);
+    h.settle();
+    await_focus(&mut conn, &mut inbox, a.root, "Alt+Tab to a");
+    set_state(&mut conn, &a, WindowState::Fullscreen, 3);
+    h.settle();
+    await_configure(&mut conn, &mut inbox, &mut a, "fullscreen");
+    fill(&mut conn, &a, 10);
+    h.settle();
+    park(&mut h);
+    assert_eq!(pixel_at(&h, at), to_rgb(RED), "the bar is covered");
+
+    // Overview shows the bar; leaving it covers it again.
+    overview(&h, true);
+    assert_eq!(pixel_at(&h, at), to_rgb(GREEN), "overview shows the bar");
+    overview(&h, false);
+    park(&mut h);
+    assert_eq!(pixel_at(&h, at), to_rgb(RED), "and leaving covers it again");
+
+    // Alt+Tab to `b` raises and focuses it: the bar is back.
+    h.key(KEY_LEFTALT, true);
+    h.key(KEY_TAB, true);
+    h.key(KEY_TAB, false);
+    h.key(KEY_LEFTALT, false);
+    h.settle();
+    await_focus(&mut conn, &mut inbox, b.root, "Alt+Tab to b");
+    park(&mut h);
+    assert_eq!(
+        pixel_at(&h, at),
+        to_rgb(GREEN),
+        "focus elsewhere shows the bar"
+    );
 
     drop((conn, shell));
     h.quit();

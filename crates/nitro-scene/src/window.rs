@@ -104,6 +104,9 @@ pub(crate) struct Output {
     pub(crate) scale: f32,
     /// Z-order per layer, back to front.
     pub(crate) layers: [Vec<WindowKey>; 4],
+    /// Whether [`Layer::Top`] is left out of painting and hit-testing on
+    /// this output (a fullscreen window covers it).
+    pub(crate) top_hidden: bool,
 }
 
 impl Output {
@@ -113,6 +116,7 @@ impl Output {
             rect,
             scale,
             layers: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+            top_hidden: false,
         }
     }
 
