@@ -156,6 +156,19 @@ fn scene_gradient(c: &mut Canvas<'_>) {
     );
 }
 
+/// (h) the overview scrim: a translucent black over the whole screen,
+/// on top of whatever is there (here, a vertical gradient wallpaper).
+fn scene_scrim(c: &mut Canvas<'_>) {
+    let clip = full_clip();
+    c.fill_rect(
+        &clip,
+        &Rect::new(0.0, 0.0, WIDTH_F, HEIGHT_F),
+        &Fill::Solid(Color::rgba(0, 0, 0, 0xA0)),
+        0.0,
+        1.0,
+    );
+}
+
 const SRC_SIZE: u32 = 64;
 const SRC_STRIDE: u32 = SRC_SIZE * 4;
 const BLIT_COUNT: u32 = 200;
@@ -370,7 +383,7 @@ struct SceneSpec {
     default_iters: u32,
 }
 
-const SCENES: [SceneSpec; 7] = [
+const SCENES: [SceneSpec; 9] = [
     SceneSpec {
         letter: 'a',
         name: "solid_fill",
@@ -405,6 +418,16 @@ const SCENES: [SceneSpec; 7] = [
         letter: 'g',
         name: "glyphs_batch",
         default_iters: 2000,
+    },
+    SceneSpec {
+        letter: 'h',
+        name: "scrim",
+        default_iters: 300,
+    },
+    SceneSpec {
+        letter: 'i',
+        name: "grad+scrim",
+        default_iters: 300,
     },
 ];
 
@@ -471,6 +494,11 @@ fn main() {
                     'd' => scene_blits(&mut c, &img),
                     'e' => scene_ui_frame(&mut c, &damage),
                     'f' => scene_glyphs_loop(&mut c, &glyph_mask),
+                    'h' => scene_scrim(&mut c),
+                    'i' => {
+                        scene_gradient(&mut c);
+                        scene_scrim(&mut c);
+                    }
                     _ => scene_glyphs_batch(&mut c, &glyph_mask),
                 }
             }

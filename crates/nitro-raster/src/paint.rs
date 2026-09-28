@@ -107,17 +107,46 @@ pub(crate) fn mix(premul: u32, dst: u8, inv: u32) -> u8 {
 
 /// Source-over one straight-alpha colour with a uniform alpha over a row.
 ///
-/// `src * a` is loop-invariant, so it is hoisted and the inner loop is one
-/// multiply-add per channel — a shape the autovectorizer handles well.
+/// `src * a` is loop-invariant, so it is hoisted, and the loop does **two
+/// pixels per `u64`** (SWAR): the eight bytes are split into their even
+/// (`B`, `R`) and odd (`G`, `X`) bytes, each widened into four 16-bit
+/// lanes, and one scalar multiply-add then does four channels at once.
+/// The per-pixel form this replaced did not vectorize and cost about eight
+/// cycles a pixel, which made a full-screen translucent fill — the
+/// overview's scrim — take ~20 ms at idle clock on the test box: longer
+/// than a frame, on the path a Super tap waits for.
+///
+/// Bit-identical to [`mix`], lane by lane: `premul + dst * inv <=
+/// 255 * (a + inv) + 128 = 65153`, and the rounding step adds at most 255,
+/// so no lane ever carries into its neighbour. The `X` byte is cleared, as
+/// before.
 #[inline]
 pub(crate) fn blend_solid(row: &mut [u8], c: Color, alpha: u8) {
+    /// The low byte of every 16-bit lane.
+    const LANES: u64 = 0x00ff_00ff_00ff_00ff;
+    /// Everything but the two `X` bytes.
+    const KEEP: u64 = 0x00ff_ffff_00ff_ffff;
     let a = u32::from(alpha);
     let inv = 255 - a;
     // Premultiplied source, plus the `+128` of the rounding step folded in.
     let pb = u32::from(c.b) * a + 128;
     let pg = u32::from(c.g) * a + 128;
     let pr = u32::from(c.r) * a + 128;
-    for d in row.chunks_exact_mut(4) {
+    let even = u64::from(pb) | u64::from(pr) << 16;
+    let even = even | even << 32;
+    let odd = u64::from(pg) | u64::from(pg) << 32;
+    let inv64 = u64::from(inv);
+    let round = |t: u64| ((t + ((t >> 8) & LANES)) >> 8) & LANES;
+    let mut pairs = row.chunks_exact_mut(8);
+    for d in &mut pairs {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(d);
+        let src = u64::from_le_bytes(bytes);
+        let lo = round(even + (src & LANES) * inv64);
+        let hi = round(odd + ((src >> 8) & LANES) * inv64);
+        d.copy_from_slice(&((lo | hi << 8) & KEEP).to_le_bytes());
+    }
+    for d in pairs.into_remainder().chunks_exact_mut(4) {
         let out = [
             mix(pb, d[0], inv),
             mix(pg, d[1], inv),
@@ -238,8 +267,39 @@ pub(crate) fn paint_cov<F: Fn(i32) -> u8>(
 
 #[cfg(test)]
 mod tests {
-    use super::{RowPaint, lerp_color};
+    use super::{RowPaint, blend_solid, lerp_color, mix};
     use nitro_core::Color;
+
+    /// The SWAR path against the per-channel reference, exhaustively over
+    /// alpha and destination byte, for a few source colours; odd row
+    /// lengths exercise the one-pixel tail too.
+    #[test]
+    fn blend_solid_matches_mix_exactly() {
+        for c in [
+            Color::rgb(0, 0, 0),
+            Color::rgb(255, 255, 255),
+            Color::rgb(0x12, 0x80, 0xfe),
+        ] {
+            for alpha in 0..=255u8 {
+                let a = u32::from(alpha);
+                let inv = 255 - a;
+                for len in [3usize, 64] {
+                    let mut row: Vec<u8> = (0..len * 4).map(|i| (i * 37 + 11) as u8).collect();
+                    let orig = row.clone();
+                    blend_solid(&mut row, c, alpha);
+                    for (px, (got, dst)) in row.chunks(4).zip(orig.chunks(4)).enumerate() {
+                        let want = [
+                            mix(u32::from(c.b) * a + 128, dst[0], inv),
+                            mix(u32::from(c.g) * a + 128, dst[1], inv),
+                            mix(u32::from(c.r) * a + 128, dst[2], inv),
+                            0,
+                        ];
+                        assert_eq!(got, want, "alpha {alpha} px {px} dst {dst:?}");
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn lerp_endpoints_are_exact() {

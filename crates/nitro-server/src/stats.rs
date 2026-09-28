@@ -214,6 +214,10 @@ pub struct FrameStats {
     /// `flip_interval_*`), for `samples flip`. A caller drops the first
     /// sample of a run, which spans the idle before it.
     pub flip_log: SampleLog,
+    /// Every painted frame's raster time, µs, for `samples paint`.
+    pub paint_log: SampleLog,
+    /// Every painted frame's damaged pixels, for `samples damage`.
+    pub damage_log: SampleLog,
 }
 
 impl FrameStats {
@@ -229,6 +233,8 @@ impl FrameStats {
             i2p_us: Window::new(I2P_WINDOW),
             i2p_log: SampleLog::new(),
             flip_log: SampleLog::new(),
+            paint_log: SampleLog::new(),
+            damage_log: SampleLog::new(),
         }
     }
 

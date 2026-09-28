@@ -19,7 +19,7 @@
 //! | `theme`              | `ok <scheme> <serial>\n` + `role #rrggbb[aa]\n` lines + `\n` |
 //! | `overview [on\|off] [name]` | `ok\n`; enters/leaves overview mode, for tests      |
 //! | `input <action> ...` | `ok <n>\n`; injects input into the real input path (below)  |
-//! | `samples i2p\|flip`  | `ok <total>\n` + one µs value per line, oldest first, + `\n` |
+//! | `samples i2p\|flip\|paint\|damage` | `ok <total>\n` + one µs value per line, oldest first, + `\n` |
 //!
 //! # `input`: synthetic input, through the same path as hardware
 //!
@@ -146,6 +146,10 @@ pub enum SampleKind {
     I2p,
     /// Interval between consecutive flips of one output, µs, uncapped.
     Flip,
+    /// Raster time of every painted frame, µs.
+    Paint,
+    /// Damaged pixels of every painted frame.
+    Damage,
 }
 
 /// Pressed, released, or one then the other at the same instant.
@@ -278,7 +282,9 @@ pub fn parse(line: &str) -> Result<Request, String> {
         ("theme", None) => Ok(Request::Theme),
         ("samples", Some("i2p")) => Ok(Request::Samples(SampleKind::I2p)),
         ("samples", Some("flip")) => Ok(Request::Samples(SampleKind::Flip)),
-        ("samples", _) => Err("`samples` wants `i2p` or `flip`".to_owned()),
+        ("samples", Some("paint")) => Ok(Request::Samples(SampleKind::Paint)),
+        ("samples", Some("damage")) => Ok(Request::Samples(SampleKind::Damage)),
+        ("samples", _) => Err("`samples` wants `i2p`, `flip`, `paint` or `damage`".to_owned()),
         (
             "outputs" | "stats" | "quit" | "reload" | "focus" | "unplug" | "theme" | "modes",
             Some(_),
@@ -906,7 +912,11 @@ mod tests {
             Ok(Request::Samples(SampleKind::Flip))
         );
         assert!(parse("samples").is_err());
-        assert!(parse("samples paint").is_err());
+        assert_eq!(
+            parse("samples paint"),
+            Ok(Request::Samples(SampleKind::Paint))
+        );
+        assert!(parse("samples frob").is_err());
         assert_eq!(samples_reply(5, &[1, 2]), b"ok 5\n1\n2\n\n");
         assert_eq!(samples_reply(0, &[]), b"ok 0\n\n");
     }

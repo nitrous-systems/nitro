@@ -1040,6 +1040,14 @@ struct Server {
     /// `settle`: entering dismisses popups and sends to other clients,
     /// the `pending_drag_starts` trap.
     pending_overview: Vec<(u64, nitro_wire::types::OverviewRequest)>,
+    /// An overview change was just announced to a watcher that draws an
+    /// `Overlay` window (the launcher), and the frame that shows the
+    /// change is held for its answer even though it carries content
+    /// damage. Without it the scrim and thumbnails flip on their own and
+    /// the search field lands one refresh later: the "frame delay" on a
+    /// Super tap. Cleared when that frame paints. See
+    /// [`Server::should_defer`].
+    overview_hold: bool,
     /// `SetOverview`s applied, cumulative. `stats`.
     overview_requests: u64,
     /// The window holding an explicit keyboard grab: every key goes there
@@ -1365,6 +1373,7 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         overview_watchers: Vec::new(),
         overview_announced: None,
         pending_overview: Vec::new(),
+        overview_hold: false,
         overview_requests: 0,
         grab: None,
         hotkey_pending: None,
@@ -2274,6 +2283,8 @@ impl Server {
                 self.stats.raster_px.push(split.0);
                 self.stats.blit_px.push(split.1);
                 self.blit_frames += u64::from(split.2);
+                self.stats.paint_log.push(paint_us);
+                self.stats.damage_log.push(damage_px);
                 self.outputs[index].committed();
                 true
             }
@@ -2338,6 +2349,7 @@ impl Server {
         // would lose the answer it was holding for.
         if painted {
             self.defer.forget_all();
+            self.overview_hold = false;
         }
     }
 
@@ -2413,7 +2425,9 @@ impl Server {
             if !output.needs_paint() || self.backend.flip_pending(output.kms_id) {
                 continue;
             }
-            if !output.cursor_only() {
+            // An overview change is content, but its frame is only whole
+            // with the launcher's answer in it; see `overview_hold`.
+            if !output.cursor_only() && !self.overview_hold {
                 return false;
             }
             paintable = true;
@@ -2425,6 +2439,7 @@ impl Server {
     /// paint the cursor on its own after all. `defer_timeouts` counts it.
     fn on_defer_deadline(&mut self) {
         self.defer.expired();
+        self.overview_hold = false;
         debug!("deferred flip timed out");
         self.settle();
     }
@@ -6067,6 +6082,8 @@ impl Server {
                 let log = match kind {
                     protocol::SampleKind::I2p => &self.stats.i2p_log,
                     protocol::SampleKind::Flip => &self.stats.flip_log,
+                    protocol::SampleKind::Paint => &self.stats.paint_log,
+                    protocol::SampleKind::Damage => &self.stats.damage_log,
                 };
                 protocol::samples_reply(log.total, &log.values())
             }
@@ -9670,6 +9687,20 @@ impl Server {
         }
     }
 
+    /// Whether `token`'s client owns an `Overlay`-layer window — the
+    /// launcher, whose visibility follows `OverviewState`. A watcher with
+    /// no overlay (the bar, which only asks) has nothing to answer with,
+    /// and waiting for it would only spend the deadline.
+    fn draws_overlay(&self, token: u64) -> bool {
+        self.wire_clients.get(&token).is_some_and(|c| {
+            c.windows.values().any(|w| {
+                self.scene
+                    .window_info(*w)
+                    .is_ok_and(|i| i.layer() == nitro_scene::Layer::Overlay)
+            })
+        })
+    }
+
     /// Tell the overview watchers what changed. When the state differs
     /// from the last one announced every watcher hears it; otherwise only
     /// `requester` does, because every `SetOverview` gets an answer.
@@ -9686,6 +9717,15 @@ impl Server {
                 .collect()
         } else {
             self.overview_announced = now;
+            // A watcher that draws an overlay answers this with a show or
+            // a hide; hold the frame for it so scrim and search field
+            // arrive on the same vblank.
+            for token in &self.overview_watchers {
+                if self.draws_overlay(*token) {
+                    self.defer.expect(*token);
+                    self.overview_hold = true;
+                }
+            }
             self.overview_watchers.clone()
         };
         for token in to {
