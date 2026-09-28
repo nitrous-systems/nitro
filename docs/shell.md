@@ -446,10 +446,32 @@ re-layout (leave + enter on the same output, when a window maps during an
 overview) sends **nothing**, and every server-side leave is caught
 without touching its call site.
 
+**The search field has a reserved band at the top** (#3876). The server
+lays the thumbnails out in the work area minus `search_band()` at its top
+(`nitro_wire::types::overview`, re-exported as `nitro_ui::shell::overview`:
+`SEARCH_TOP` 16 + `SEARCH_FIELD_H` 56 + `SEARCH_GAP` 16 = 88 px), always,
+so the grid does not move when typing starts. The launcher's surface
+(`nitro_launcher::surface()`) is an overlay anchored **top-centre**
+(`Anchor::top_centre().margin(SEARCH_TOP)`), its field panel exactly
+`SEARCH_FIELD_H` tall, and its results panel drops down `SEARCH_GAP`
+below it. One set of constants is the single source of truth, and
+`nitro-launcher/tests/launcher.rs` checks the field's panel lands on it.
+
+**Top-anchored overlays hang off the work area.** For an `Overlay` window
+whose anchor has `TOP` and not `BOTTOM`, the server measures the vertical
+position from the output's **work area** top instead of the full output
+(`shell::overlay_anchor_rect`), so the launcher's field sits under the
+bar, in the band, rather than over it; it is re-applied whenever the work
+area changes. Every other anchor — the centred overlay, bars, wallpapers —
+still uses the full rectangle.
+
 **The launcher is the overview's search field.** It shows on
 `active: true` and hides on `active: false`, never on its own request.
-Opened by a tap the field is empty and unfocused, and the first printable
-key engages it; opened by `Super+Space` it is focused. `Escape` is a
+The field is **always** shown with the overview. Opened by a tap it is
+empty and unfocused, and the first printable key engages it; opened by
+`Super+Space` it is focused. The server does not hold the overview's
+frame for the launcher's show: the field may appear one refresh after
+the scrim and thumbnails (`docs/latency.md` §8). `Escape` is a
 **ladder** (GNOME's, shortened — nitro has no app grid): a non-empty query
 is cleared, an empty one sends `Leave`. Two rungs, each undoing exactly
 one thing. A launch sends `Leave` after the spawn succeeds; a failure

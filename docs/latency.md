@@ -829,3 +829,53 @@ NITRO_TCP_NODELAY=0 ...   # the same run with Nagle, for the A/B
 `--stats` is **not** useful remotely: it reads the server's control
 socket, which is a Unix socket on the other machine. Read the server's
 own figures there instead, with `nitro-shot --stats` on the box.
+
+## 8. Super tap → overview (#3876)
+
+A Super tap felt a frame late. Traced on the box (60 Hz): `SetOverview`
+arrives ~0.1 ms after the hotkey and the server paints the full-screen
+overview frame at once (wallpaper + scrim, 2 073 600 px damage, 12–31 ms
+at the idle clock). The launcher's show-and-grab commit arrives ~0.4 ms
+after that paint *started*, so its field rides the next flip — two flips
+per open. `fill_irect`/`store_solid` and `blend_solid` (the scrim) led
+the profile; `blend_solid` did not vectorize.
+
+What changed:
+
+* **SWAR `blend_solid`** (`nitro-raster/src/paint.rs`): two pixels per
+  `u64`, bit-identical to `mix` (exhaustive test). Scrim 5.3 → 2.5 ms on
+  the box. Bench scenes `h scrim`, `i grad+scrim`.
+* **A frame hold was tried and rejected.** Holding the overview frame
+  for the launcher's answer (a `defer.expect` on the overlay watcher) puts
+  scrim and field on one vblank, but it delays the scrim by the
+  launcher's round trip every time. The user's decision: flip the
+  overview as soon as it is painted, and let the field land one refresh
+  later — acceptable because the field now has a **reserved, empty band**
+  (`docs/shell.md` §The overview), so nothing moves when it arrives.
+* **`samples paint` / `samples damage`** on the control socket
+  (`nitro-shot --samples paint|damage`): per painted frame, raster µs and
+  damaged pixels, beside `i2p` and `flip`.
+
+Measured: 10 taps each, 1.4 s apart, injected with `input key 125 tap`,
+first two discarded; i2p is the per-open `samples i2p` value. Before is
+main `1ae7761` as deployed; after is `task-3876` (which also shows the
+scaled title bars). Taps are not phase-locked to vblank, so single values
+walk by ~1 ms per tap in a sawtooth; the median is the figure.
+
+| desktop | governor | build | i2p median | i2p range | open frame paint |
+|---|---|---|---|---|---|
+| empty (bar only) | schedutil | before | 34.6 ms | 17.0–43.5 | — |
+| empty (bar only) | schedutil | after | 27.4 ms | 17.8–34.1 | 14.2 ms, then the field (33 600 px) one flip later |
+| 4 apps | schedutil | before | 49.7 ms | 39.3–57.0 | — |
+| 4 apps | schedutil | after | 39.0 ms | 29.4–45.8 | 23.1 ms |
+| 4 apps | performance | after | 24.7 ms | 15.2–30.9 | 9.6 ms |
+
+(`samples paint` did not exist on the deployed build, hence the dashes.)
+The first frame after idle runs at a low clock: the same 4-app open frame
+paints in 23 ms on `schedutil` and 9.6 ms on `performance`, which is the
+difference between missing one vblank and two. With thumbnails, the open
+frame is dominated by the scaled blits (`docs/wm.md` §Overview mode, the
+~57× cliff) — larger now that a thumbnail is the whole frame. Not done
+here: folding the scrim into the opaque wallpaper rect under it (a
+pre-darkened gradient; no cached buffer, the memory was rejected), which
+would save the ~2.5 ms scrim pass on the open frame.

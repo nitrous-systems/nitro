@@ -865,8 +865,8 @@ below in full, is `docs/research/overview.md`.
 
 An **overview** is a WM mode in which every `Normal`-layer window on an
 output is scaled down in place and laid out so all of them are visible at
-once, with an app icon and a caption per thumbnail, and a search field
-over the top. It is what a bare-Super tap will open instead of the plain
+once, each with its own (scaled) title bar and an app icon hanging off
+it, and a search field in a band reserved at the top. It is what a bare-Super tap will open instead of the plain
 launcher, and it absorbs the launcher rather than sitting beside it.
 
 ### Server-side, because the primitive is already here
@@ -933,8 +933,8 @@ every thumbnail every frame. Both are the ~17 ms case. The scale itself is
 set once, on enter and on leave, and so is the position. Entering and
 leaving **snap**.
 
-What does animate is the **badges**. On entry each thumbnail's icon and
-caption group fades in from opacity 0 over 200 ms, with ease-out-quad
+What does animate is the **badges**. On entry each thumbnail's icon
+fades in from opacity 0 over 200 ms, with ease-out-quad
 (`overview::BADGE_FADE_NS`, `overview::badge_opacity`; GNOME's
 `WINDOW_OVERLAY_FADE_TIME`). The badges are unscaled, and an opacity change
 damages only their rects. The fade is **driven by vblank, not a timer**:
@@ -951,7 +951,8 @@ the VT switched away) the fade waits, then snaps to 1.0 on the next flip.
 Measured cost of one fade frame (release, FakeBackend, 1920x1080, 800x600
 windows): **0.26 ms** with 4 thumbnails and **0.73 ms** with 8. With 16 it
 was **3.7 ms** while overflow collapsed the region to a bounding box:
-sixteen badges are 32 damage rects (icon and pill), which overflows
+sixteen badges were 32 damage rects (icon and caption pill, before the
+pill went in #3876), which overflows
 `Damage::MAX_RECTS` (16), and the whole region became one 1407x396 box
 over two rows of scaled thumbnails. Overflow now merges the pair whose
 union wastes the least area, so each badge's icon and pill pair up into
@@ -981,17 +982,49 @@ topmost-first, so `Overlay` naturally wins over the thumbnails beneath it.
 
 **Scaling re-rasterizes text.** `TextEngine::paint` computes
 `device_size = run.size_px * scale` and `GlyphKey` quantizes size to
-1/64 px, so a scaled title bar rasterizes a fresh glyph set and pollutes
-the atlas. Decorations are therefore **hidden** in overview — which
-`FrameNodes::all()` already does for fullscreen (§States) — and each
-thumbnail's icon and caption are drawn **unscaled** instead. GNOME does
-the same, for its own reasons.
+1/64 px, so a title bar drawn at `13·k` for each thumbnail's own `k`
+rasterizes a fresh glyph set per thumbnail. Until #3876 the decorations
+were therefore hidden and each thumbnail got an unscaled icon-and-caption
+badge. Now the **frame is shown, scaled, and each title is reshaped at
+a snapped size** (`overview::snapped_text_size`: `round(13·k·s)/(k·s)`,
+`s` the output scale), so it rasterizes at a whole device size and the
+thumbnails share a handful of sizes (4, 5, 6 … px) that stay in the atlas
+across enters. Leaving reshapes at 13 px again (`Server::title_size_px`
+answers from the overview state). The title bar's app icon needs no
+snapping: `IconEngine` caches by whole device px already
+(`icons::device_px` rounds), so a scaled 16 px icon lands on a few whole
+sizes on its own. The caption pill went with it — the title bar shows the
+title — and the badge is the **icon alone**.
+
+Atlas churn, `glyphs_cached` / `glyph_renders` in `stats` (equal
+throughout: nothing was evicted; `atlas_pages` stayed 1), FakeBackend
+1920×1080, n windows of assorted sizes titled
+`Window number i — a title`, after the first enter (the second enter adds
+**nothing** in every column):
+
+| windows | desktop | before (chrome hidden, caption pill) | chrome, unsnapped | chrome, snapped |
+|---|---|---|---|---|
+| 4 | 27 | 66 | 52 | 53 |
+| 8 | 31 | 85 | 206 | 153 |
+| 16 | 34 | 118 | 396 | 179 |
+
+The caption pill was one extra 13 px set; unsnapped titles grow with the
+number of distinct scales (at 16 windows, 362 glyphs above the desktop
+for ~40 distinct characters). Snapping more than halves that, and what it
+costs is a few whole sizes of the title font — on the box with four apps,
+`glyphs_cached` was 778 across the whole session.
 
 ### Scope and geometry
 
 * **Per output**, like the MRU list and the z-order (§Multi-output).
 * The layout area is the **work area**, not the output rect: the bar stays
-  visible over the overview, because the bar is how you leave.
+  visible over the overview, because the bar is how you leave. Its top
+  `search_band()` (88 px: `SEARCH_TOP` 16 + `SEARCH_FIELD_H` 56 +
+  `SEARCH_GAP` 16, `nitro_wire::types::overview`) is **reserved** for
+  the launcher's search field (`overview::grid_area`), on every entry,
+  typing or not, so the thumbnails never move when a search starts.
+  `tests/overview.rs::no_thumbnail_reaches_into_the_search_band` pins it
+  for 1, 4, 8 and 16 windows.
 * The window set is `Layer::Normal` only — the bar, the wallpaper and the
   search overlay are not thumbnails — and **includes** `Minimized` ones. A
   minimized window keeps its geometry and its place in the MRU order
@@ -1014,12 +1047,16 @@ scene-level helpers in `overview.rs`. The state is
 `WindowManager::overview: Option<Overview>` — one output at a time;
 entering on another output leaves the first.
 
-* **A thumbnail is the content rectangle, not the frame.** The
-  decorations are hidden (`set_frame_visible(false)`, no inset change, so
-  no `Configure`), and scaling the frame would leave an empty 28 px band
-  where the title bar was. A framed window's frame root gets
-  `translate(slot - pos - k·inset) ∘ scale(k)`, which puts the content's
-  top-left exactly on the floored slot. An undecorated window's root *is*
+* **A thumbnail is the whole frame** (#3876): title bar, border and
+  buttons, scaled. The layout is fed the frame rectangle
+  (`overview::thumb_of`), and a framed window's frame root gets
+  `translate(slot - pos) ∘ scale(k)`, which puts the frame's top-left
+  exactly on the floored slot (the content lands at `slot + k·inset`).
+  The frame is **inert**: `frame_hit` skips the overview output and
+  pointer events over `Normal` windows are swallowed, so a click on a
+  thumbnail's close button selects the window
+  (`tests/wm.rs::a_thumbnail_keeps_its_title_bar_and_its_buttons_are_inert`).
+  A fullscreen window's decorations stay hidden, as they already were. An undecorated window's root *is*
   its clipping content group, whose clip is evaluated before its own
   transform, so it is instead **moved** to the slot (a server-side
   `place_window`, no `Configure`) and scaled about its origin. Both are
@@ -1032,7 +1069,7 @@ entering on another output leaves the first.
   is in no MRU list and no wire client's window map, and `frame_hit` and
   `focus_topmost` skip it.
 * **The badge is drawn unscaled by counter-scaling.** A framed window's
-  icon-and-caption group hangs off its scaled frame root with
+  icon group hangs off its scaled frame root with
   `scale(1/k)`, so its world scale is the output's and nothing is
   rasterized at a fractional size. An undecorated window's badge would be
   clipped by its content group, so it goes in the scrim at the slot's
@@ -1074,13 +1111,20 @@ entering on another output leaves the first.
 
 The search UI stays in `nitro-launcher` as an `Overlay` client — the seam
 is layers, which already work — so the server draws only scaled windows it
-already owns, a scrim, and per-thumbnail icon and caption nodes, all of
-which are `Rect`/`Icon`/`Text` nodes `wm::build_frame` already builds.
+already owns, a scrim, and per-thumbnail icon nodes, all of which are
+node kinds `wm::build_frame` already builds.
 The trigger rework and the launcher's absorption (#3789) are specified in
 `docs/shell.md` §Hotkeys and §The overview: the launcher is the overview's
 search field, and it shows and hides on the server's `OverviewState`.
 Its query decides grid-or-results through `SetOverview(Search | Grid)`
 (see the last bullet above).
+
+**No frame hold.** The frame that shows the overview goes out as soon as
+it is painted; it is not held for the launcher's show-and-grab commit. The
+launcher's field therefore may land one refresh later than the scrim and
+thumbnails — accepted, because the band it lands in is reserved and
+empty, so nothing moves when it arrives. `docs/latency.md` §8 has the
+measurement and the rejected hold.
 
 
 ## Damage
