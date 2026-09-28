@@ -256,9 +256,9 @@ fn make_window_image(opaque_content: bool) -> Vec<u8> {
     out
 }
 
-/// (j)/(k) one 1:1, unscaled blit of a WIN_W×WIN_H AR24 image over an
-/// opaque background (the background fill is outside the timed region's
-/// interest but inside it; it is a memset-speed store).
+/// (j)/(k) one 1:1, unscaled blit of a `WIN_W`×`WIN_H` AR24 image onto
+/// whatever the previous iteration left (no background fill: the timed
+/// region is the blit alone).
 fn scene_window_blit(c: &mut Canvas<'_>, img: &Image<'_>) {
     let clip = full_clip();
     c.blit(
