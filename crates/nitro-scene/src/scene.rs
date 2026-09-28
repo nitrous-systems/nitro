@@ -1476,6 +1476,36 @@ impl Scene {
         Ok(())
     }
 
+    /// Declare which pixels of an image node's buffer are fully opaque, in
+    /// buffer pixels; replaces any earlier region, and an empty slice
+    /// clears it. Persists across [`Scene::set_image`] swaps. A painter may
+    /// then copy those pixels instead of blending them (#3877).
+    ///
+    /// The node is repainted: output only changes if the client lied about
+    /// its alpha, but that is exactly the case the next frame must show.
+    ///
+    /// # Errors
+    /// [`Error::StaleKey`], [`Error::NotOwner`], [`Error::WrongKind`] for a
+    /// node that is not an `Image`.
+    pub fn set_opaque_region(
+        &mut self,
+        client: ClientId,
+        key: NodeKey,
+        rects: &[IRect],
+    ) -> Result<(), Error> {
+        let node = self.check_mut(client, key)?;
+        if !matches!(node.data, NodeData::Image(_)) {
+            return Err(Error::WrongKind);
+        }
+        let rects: Vec<IRect> = rects.iter().copied().filter(|r| !r.is_empty()).collect();
+        if node.opaque == rects {
+            return Ok(());
+        }
+        node.opaque = rects;
+        self.mark(key, Dirty::PAINT);
+        Ok(())
+    }
+
     /// Whether replacing `old` by `new` is a swap between two buffers of the
     /// same shape, sampled at the same `src`, the new one shown before — the
     /// case where the node's pixels change only where the client says so.

@@ -388,6 +388,11 @@ pub mod caps {
     /// names which of the two it means with a
     /// [`DataSource`](crate::types::DataSource).
     pub const DATA: u32 = 1 << 14;
+    /// [`SetOpaqueRegion`](crate::msg::SetOpaqueRegion): a client may tell
+    /// the server which pixels of an image are fully opaque, so the server
+    /// can copy them instead of alpha-blending (#3877). Client→server only;
+    /// like [`CURSOR`] it must still be listed in `ClientCaps` (rule 3).
+    pub const OPAQUE_REGION: u32 = 1 << 15;
     /// Every bit from M5-A onwards: the range
     /// [`ClientCaps`](crate::msg::ClientCaps) governs.
     ///
@@ -396,7 +401,8 @@ pub mod caps {
     /// knows the op, because the bits and the op arrived in the same
     /// change. A future milestone extends this constant rather than
     /// teaching every caller a new number.
-    pub const CAPS_M5_MASK: u32 = POPUP | CURSOR | DRAG | OUTPUTS | KEYMAP | RELEASE | DATA;
+    pub const CAPS_M5_MASK: u32 =
+        POPUP | CURSOR | DRAG | OUTPUTS | KEYMAP | RELEASE | DATA | OPAQUE_REGION;
 }
 
 /// Modifier mask for [`BindKey`](crate::msg::BindKey), by *name*.
@@ -867,7 +873,8 @@ mod tests {
         assert_eq!(caps::KEYMAP, 1 << 12);
         assert_eq!(caps::RELEASE, 1 << 13);
         assert_eq!(caps::DATA, 1 << 14);
-        assert_eq!(caps::CAPS_M5_MASK, 0x7f00);
+        assert_eq!(caps::OPAQUE_REGION, 1 << 15);
+        assert_eq!(caps::CAPS_M5_MASK, 0xff00);
         // Every M5 bit is in the mask, and nothing else is.
         for bit in [
             caps::POPUP,
@@ -877,6 +884,7 @@ mod tests {
             caps::KEYMAP,
             caps::RELEASE,
             caps::DATA,
+            caps::OPAQUE_REGION,
         ] {
             assert_eq!(caps::CAPS_M5_MASK & bit, bit);
         }

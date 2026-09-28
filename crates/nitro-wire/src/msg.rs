@@ -754,6 +754,40 @@ impl Body for BufferDamage {
     }
 }
 
+/// Declare which pixels of an image node are fully opaque (needs
+/// [`caps::OPAQUE_REGION`](crate::types::caps::OPAQUE_REGION), listed in
+/// `ClientCaps`; #3877).
+///
+/// `id` is an `Image` node of the sender's. `rects` are in **buffer pixel
+/// coordinates**, like [`BufferDamage`] and [`SetImage`]'s `src`, and
+/// **replace** any earlier region; an empty list clears it. Buffered to the
+/// [`Commit`] like every scene mutation, and it persists across `SetImage`
+/// buffer swaps. The client promises every pixel inside is opaque: the
+/// server may ignore the source alpha there (so a lie shows the colour
+/// channels unblended, which is the client's problem, not an error).
+/// At most as many rects as `BufferDamage` accepts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetOpaqueRegion {
+    /// The image node.
+    pub id: NodeId,
+    /// Opaque rectangles, in buffer pixel coordinates.
+    pub rects: Vec<IRect>,
+}
+
+impl Body for SetOpaqueRegion {
+    fn encode_body(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.put(self.id);
+        w.put_vec(&self.rects);
+        Ok(())
+    }
+    fn decode_body(r: &mut Reader<'_>, _fds: &mut FdQueue) -> Result<Self, DecodeError> {
+        Ok(Self {
+            id: r.get()?,
+            rects: r.get_vec()?,
+        })
+    }
+}
+
 /// Ask for the window list (shell only; needs
 /// [`caps::SHELL`](crate::types::caps::SHELL)).
 ///
@@ -2309,6 +2343,8 @@ msg_enum! {
         FinishDrag = 0x030a,
         /// Set a drag icon's hotspot offset (needs `caps::DATA`).
         SetDragIconOffset = 0x030b,
+        /// Declare an image's opaque pixels (needs `caps::OPAQUE_REGION`).
+        SetOpaqueRegion = 0x030c,
         /// Move one of this client's windows to another layer (needs
         /// `caps::SHELL`).
         SetLayer = 0x0401,

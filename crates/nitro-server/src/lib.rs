@@ -6968,7 +6968,8 @@ impl Server {
             | nitro_wire::types::caps::POPUP
             | nitro_wire::types::caps::OUTPUTS
             | nitro_wire::types::caps::CURSOR
-            | nitro_wire::types::caps::DRAG;
+            | nitro_wire::types::caps::DRAG
+            | nitro_wire::types::caps::OPAQUE_REGION;
         if self.text.has_fonts() {
             caps |= nitro_wire::types::caps::TEXT;
         }
@@ -8653,9 +8654,35 @@ impl Server {
         // commit, so their `DATA` gate is here; `AcceptDrop`/`FinishDrag` are answered at receipt and
         // check it themselves.
         match msg {
+            ClientMsg::SetOpaqueRegion(_) => !self.opaque_region_allowed(token),
             ClientMsg::StartDrag(_) => !self.data_allowed(token, "StartDrag"),
             ClientMsg::SetDragIconOffset(_) => !self.data_allowed(token, "SetDragIconOffset"),
             _ => false,
+        }
+    }
+
+    /// `SetOpaqueRegion` needs `OPAQUE_REGION` listed in `ClientCaps`
+    /// (`docs/wire.md` rule 3, as for `SetCursor`). Returns whether the
+    /// client may send it; if not, it has been disconnected.
+    fn opaque_region_allowed(&mut self, token: u64) -> bool {
+        let listed = self
+            .wire_clients
+            .get(&token)
+            .map(|c| c.client_caps & nitro_wire::types::caps::OPAQUE_REGION != 0);
+        match listed {
+            Some(true) => true,
+            Some(false) => {
+                self.disconnect(
+                    token,
+                    Some((
+                        0,
+                        ErrorCode::Protocol,
+                        "SetOpaqueRegion needs `OPAQUE_REGION` listed in ClientCaps".to_owned(),
+                    )),
+                );
+                false
+            }
+            None => false,
         }
     }
 

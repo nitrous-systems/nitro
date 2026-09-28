@@ -1003,7 +1003,10 @@ fn paint_item(
             let device = item
                 .transform
                 .apply_rect(&Rect::new(0.0, 0.0, size.0, size.1));
-            canvas.blit(&clip, &device, &image, &src, item.opacity);
+            let opaque = scene.node(item.node).map_or(&[][..], |n| n.opaque_region());
+            if !blit_with_opaque_region(canvas, &clip, item, &device, &image, &src, opaque) {
+                canvas.blit(&clip, &device, &image, &src, item.opacity);
+            }
         }
         PaintKind::Text { key, origin, color } => {
             // The glyphs themselves live in the text engine's atlas; the
@@ -1087,6 +1090,61 @@ fn raster_fill(fill: SceneFill, item: &PaintItem) -> Option<nitro_raster::Fill> 
 /// The rasterizer's layout for a client's fourcc, or `None` for a format
 /// the server does not accept (it rejected it at `CreateBuffer` time, so
 /// this is belt and braces).
+/// Paint an AR24 image whose client declared an opaque region
+/// (`SetOpaqueRegion`, #3877): the region through the opaque copy (the same
+/// pixels read as `Xrgb8888`, so the alpha byte is ignored), the rest through
+/// the straight-alpha blend. Returns `false`, having painted nothing, when
+/// the fast path does not apply — no region, an opaque format already,
+/// opacity below 1, or a mapping that is not 1:1 and pixel-aligned (a
+/// scaled window, an overview thumbnail) — so the caller blends it all.
+///
+/// Exactly equal to the plain blend whenever the client told the truth,
+/// because a straight-alpha blend at `a == 255` *is* a copy.
+fn blit_with_opaque_region(
+    canvas: &mut Canvas<'_>,
+    clip: &IRect,
+    item: &PaintItem,
+    device: &Rect,
+    image: &RasterImage<'_>,
+    src: &IRect,
+    opaque: &[IRect],
+) -> bool {
+    if opaque.is_empty()
+        || image.format != PixelFormat::Argb8888
+        || item.opacity < 1.0
+        || !item.shift_exact()
+    {
+        return false;
+    }
+    // `shift_exact` guarantees integer device coordinates and a 1:1 size.
+    #[allow(clippy::cast_possible_truncation)]
+    let (dx, dy) = (device.x as i32 - src.x, device.y as i32 - src.y);
+    let mapped: Vec<IRect> = opaque
+        .iter()
+        .map(|r| r.intersect(src).translate(dx, dy).intersect(clip))
+        .filter(|r| !r.is_empty())
+        .collect();
+    if mapped.is_empty() {
+        return false;
+    }
+    let region = Region::from_rects(&mapped);
+    let rest = Region::rect(*clip).subtract(&region);
+    if region.overflowed() || rest.overflowed() {
+        return false;
+    }
+    let as_opaque = RasterImage {
+        format: PixelFormat::Xrgb8888,
+        ..*image
+    };
+    for r in region.rects() {
+        canvas.blit(&r, device, &as_opaque, src, 1.0);
+    }
+    for r in rest.rects() {
+        canvas.blit(&r, device, image, src, 1.0);
+    }
+    true
+}
+
 fn pixel_format(fourcc: u32) -> Option<PixelFormat> {
     match fourcc {
         format::XR24 => Some(PixelFormat::Xrgb8888),
@@ -1800,5 +1858,156 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    // ------------------------------------------------ opaque region (#3877)
+
+    /// A 40×30 AR24 image: opaque everywhere except a transparent 4 px
+    /// border ring and a half-alpha stripe on row 10. `lie` sets alpha 0
+    /// at (20, 15), inside where the tests declare the region.
+    fn window_pixels(lie: bool) -> Vec<u8> {
+        let (w, h) = (40u32, 30u32);
+        let mut px = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let o = ((y * w + x) * 4) as usize;
+                let edge = x.min(y).min(w - 1 - x).min(h - 1 - y);
+                let a = if edge < 4 {
+                    (edge * 60) as u8
+                } else if y == 10 {
+                    128
+                } else {
+                    255
+                };
+                px[o] = (x * 5) as u8;
+                px[o + 1] = (y * 7) as u8;
+                px[o + 2] = (x * y) as u8;
+                px[o + 3] = if lie && x == 20 && y == 15 { 0 } else { a };
+            }
+        }
+        px
+    }
+
+    fn image_item(transform: nitro_core::Transform, opacity: f32) -> PaintItem {
+        PaintItem {
+            node: nitro_scene::NodeKey::from_parts(0, 0),
+            window: nitro_scene::WindowKey::from_parts(0, 0),
+            kind: PaintKind::Image {
+                size: (40.0, 30.0),
+                buffer: nitro_scene::BufferKey::from_parts(0, 0),
+                src: IRect::new(0, 0, 40, 30),
+                opaque: false,
+            },
+            transform,
+            clip: IRect::new(0, 0, 64, 48),
+            opacity,
+            bounds: IRect::new(0, 0, 64, 48),
+        }
+    }
+
+    /// Paint with the opaque-region path (falling back as `paint_item`
+    /// does) and with the plain blend; return both canvases.
+    fn paint_both(
+        px: &[u8],
+        item: &PaintItem,
+        clip: IRect,
+        opaque: &[IRect],
+    ) -> (Vec<u8>, Vec<u8>, bool) {
+        let (w, h) = (64u32, 48u32);
+        let image = RasterImage {
+            data: px,
+            width: 40,
+            height: 30,
+            stride: 160,
+            format: PixelFormat::Argb8888,
+        };
+        let src = IRect::new(0, 0, 40, 30);
+        let PaintKind::Image { size, .. } = item.kind else {
+            unreachable!()
+        };
+        let device = item
+            .transform
+            .apply_rect(&Rect::new(0.0, 0.0, size.0, size.1));
+        let bg: Vec<u8> = (0..w * h * 4)
+            .map(|i| if i % 4 == 3 { 0 } else { (i * 11) as u8 })
+            .collect();
+        let mut fast = bg.clone();
+        let mut canvas = Canvas::new(&mut fast, w, h, w * 4);
+        let took = blit_with_opaque_region(&mut canvas, &clip, item, &device, &image, &src, opaque);
+        if !took {
+            canvas.blit(&clip, &device, &image, &src, item.opacity);
+        }
+        let mut plain = bg;
+        let mut canvas = Canvas::new(&mut plain, w, h, w * 4);
+        canvas.blit(&clip, &device, &image, &src, item.opacity);
+        (fast, plain, took)
+    }
+
+    const INNER: IRect = IRect::new(4, 4, 32, 22);
+
+    #[test]
+    fn an_honest_opaque_region_paints_exactly_the_blend() {
+        let px = window_pixels(false);
+        let item = image_item(nitro_core::Transform::translate(7.0, 5.0), 1.0);
+        // Rows 4..10 and 11..26 inside the ring are opaque; row 10 is not.
+        let region = [IRect::new(4, 4, 32, 6), IRect::new(4, 11, 32, 15)];
+        for clip in [
+            IRect::new(0, 0, 64, 48),
+            // Partly overlapping the region and the ring.
+            IRect::new(9, 3, 20, 13),
+            IRect::new(30, 20, 30, 20),
+        ] {
+            let (fast, plain, took) = paint_both(&px, &item, clip, &region);
+            assert!(took, "the fast path must be taken for {clip:?}");
+            assert!(fast == plain, "clip {clip:?}");
+        }
+    }
+
+    #[test]
+    fn a_lying_region_paints_opaque_inside_it() {
+        let px = window_pixels(true);
+        let item = image_item(nitro_core::Transform::translate(7.0, 5.0), 1.0);
+        let region = [IRect::new(4, 4, 32, 6), IRect::new(4, 11, 32, 15)];
+        let (fast, plain, took) = paint_both(&px, &item, IRect::new(0, 0, 64, 48), &region);
+        assert!(took);
+        // The lie is at image (20, 15) = device (27, 20).
+        let o = (20 * 64 + 27) * 4;
+        assert_eq!(&fast[o..o + 4], &[100, 105, 44, 0], "copied, alpha ignored");
+        assert_ne!(&plain[o..o + 3], &fast[o..o + 3], "the blend skipped it");
+        // Everywhere else (the honest pixels) they agree.
+        let mut f = fast.clone();
+        f[o..o + 4].copy_from_slice(&plain[o..o + 4]);
+        assert!(f == plain, "only the lying pixel differs");
+    }
+
+    #[test]
+    fn scaled_offset_or_translucent_items_fall_back_to_the_blend() {
+        let px = window_pixels(false);
+        for (what, item) in [
+            (
+                "scaled (overview thumbnail)",
+                image_item(
+                    nitro_core::Transform::translate(2.0, 2.0)
+                        .then(&nitro_core::Transform::scale(0.5, 0.5)),
+                    1.0,
+                ),
+            ),
+            (
+                "sub-pixel offset",
+                image_item(nitro_core::Transform::translate(7.5, 5.0), 1.0),
+            ),
+            (
+                "opacity < 1",
+                image_item(nitro_core::Transform::translate(7.0, 5.0), 0.5),
+            ),
+        ] {
+            let (fast, plain, took) = paint_both(&px, &item, IRect::new(0, 0, 64, 48), &[INNER]);
+            assert!(!took, "{what}: must fall back");
+            assert!(fast == plain, "{what}");
+        }
+        // No region, or one entirely outside the clip: no fast path.
+        let item = image_item(nitro_core::Transform::translate(7.0, 5.0), 1.0);
+        assert!(!paint_both(&px, &item, IRect::new(0, 0, 64, 48), &[]).2);
+        assert!(!paint_both(&px, &item, IRect::new(0, 40, 64, 8), &[INNER]).2);
     }
 }

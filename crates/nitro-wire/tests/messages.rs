@@ -17,10 +17,10 @@ use nitro_wire::msg::{
     PointerMotion, PopupDone, Presented, Reparent, RepositionPopup, RequestFrame, RequestSelection,
     SelectionData, SelectionOffer, SelectionRequest, SendSelection, ServerMsg, SetAnchor, SetAppId,
     SetBorder, SetBounds, SetClip, SetCorners, SetCursor, SetDragIconOffset, SetExclusiveZone,
-    SetFill, SetIcon, SetImage, SetLayer, SetOpacity, SetOverview, SetSelection, SetText,
-    SetTransform, SetVisible, SetWindowLimits, SetWindowState, SetWindowStateFor, SetWindowTitle,
-    StartDrag, StartMove, StartResize, TextMeasured, TextMetrics, Theme, Touch, UnbindKey, Unlock,
-    Welcome, WindowGone, WindowInfo, WindowList, WindowListEnd, WindowState,
+    SetFill, SetIcon, SetImage, SetLayer, SetOpacity, SetOpaqueRegion, SetOverview, SetSelection,
+    SetText, SetTransform, SetVisible, SetWindowLimits, SetWindowState, SetWindowStateFor,
+    SetWindowTitle, StartDrag, StartMove, StartResize, TextMeasured, TextMetrics, Theme, Touch,
+    UnbindKey, Unlock, Welcome, WindowGone, WindowInfo, WindowList, WindowListEnd, WindowState,
 };
 use nitro_wire::types::{
     Align, AxisSource, BufferId, ButtonState, CursorPos, CursorShape, DataSource, DragAction, Edge,
@@ -463,6 +463,16 @@ fn client_messages() -> Vec<ClientMsg> {
         SetDragIconOffset {
             icon: NodeId(71),
             offset: Point::new(0.0, 0.0),
+        }
+        .into(),
+        SetOpaqueRegion {
+            id: NodeId(72),
+            rects: vec![IRect::new(0, 8, 1180, 980), IRect::new(4, 0, 2, 2)],
+        }
+        .into(),
+        SetOpaqueRegion {
+            id: NodeId(73),
+            rects: vec![],
         }
         .into(),
     ]
@@ -1537,6 +1547,27 @@ fn the_m5_payload_layouts_are_frozen() {
         ]
     );
 
+    let mut w = Writer::new();
+    ClientMsg::from(SetOpaqueRegion {
+        id: NodeId(0x0102_0304),
+        rects: vec![IRect::new(1, -2, 0x300, 4)],
+    })
+    .encode(&mut w)
+    .unwrap();
+    assert_eq!(
+        w.bytes(),
+        &[
+            // header: len=24, op=0x030c, fds=0, flags=0
+            0x18, 0x00, 0x00, 0x00, 0x0c, 0x03, 0x00, 0x00, //
+            0x04, 0x03, 0x02, 0x01, // id
+            0x01, 0x00, 0x00, 0x00, // count = 1
+            0x01, 0x00, 0x00, 0x00, // x = 1
+            0xfe, 0xff, 0xff, 0xff, // y = -2
+            0x00, 0x03, 0x00, 0x00, // w = 0x300
+            0x04, 0x00, 0x00, 0x00, // h = 4
+        ]
+    );
+
     // `ListOutputs` and `FinishDrag` are bare headers, like `WindowList`.
     for (msg, op) in [
         (ClientMsg::from(ListOutputs), 0x001bu16),
@@ -2007,6 +2038,7 @@ fn the_m5_ops_are_where_the_doc_says() {
         (AcceptDrop::OP, 0x0300),
         (FinishDrag::OP, 0x0300),
         (SetDragIconOffset::OP, 0x0300),
+        (SetOpaqueRegion::OP, 0x0300),
     ] {
         assert_eq!(op & 0xff00, block, "client M5 op {op:#06x}");
         assert!(ClientMsg::is_op(op), "client M5 op {op:#06x}");
@@ -2038,6 +2070,7 @@ fn the_m5_ops_are_where_the_doc_says() {
     assert_eq!(CreatePopup::OP, 0x0016);
     assert_eq!(FinishDrag::OP, 0x030a);
     assert_eq!(SetDragIconOffset::OP, 0x030b);
+    assert_eq!(SetOpaqueRegion::OP, 0x030c);
     assert_eq!(PopupDone::OP, 0x8106);
     assert_eq!(Keymap::OP, 0x8208);
     assert_eq!(IconRefused::OP, 0x8303);

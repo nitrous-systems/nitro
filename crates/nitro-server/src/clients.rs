@@ -856,6 +856,13 @@ fn apply_msg(
                 .buffer_damaged(client.id, key, &m.rects)
                 .map_err(|e| scene_err("BufferDamage", e))
         }
+        ClientMsg::SetOpaqueRegion(m) => {
+            // Gated on `OPAQUE_REGION` at receipt (`Server::refuse_at_receipt`).
+            let key = node_key(client, m.id)?;
+            scene
+                .set_opaque_region(client.id, key, &m.rects)
+                .map_err(|e| scene_err("SetOpaqueRegion", e))
+        }
         ClientMsg::SetImage(m) => {
             let key = node_key(client, m.id)?;
             let image = if m.buffer.is_none() {

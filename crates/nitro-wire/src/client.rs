@@ -20,9 +20,9 @@ use crate::msg::{
     FocusWindow, GrabKeyboard, Hello, ListOutputs, Lock, MeasureText, Outputs, Reparent,
     RepositionPopup, RequestFrame, RequestSelection, SendSelection, ServerMsg, SetAnchor, SetAppId,
     SetBorder, SetBounds, SetClip, SetCorners, SetCursor, SetDragIconOffset, SetExclusiveZone,
-    SetFill, SetIcon, SetImage, SetLayer, SetOpacity, SetOverview, SetSelection, SetText,
-    SetTransform, SetVisible, SetWindowLimits, SetWindowState, SetWindowStateFor, SetWindowTitle,
-    StartDrag, StartMove, StartResize, UnbindKey, Unlock, WindowList,
+    SetFill, SetIcon, SetImage, SetLayer, SetOpacity, SetOpaqueRegion, SetOverview, SetSelection,
+    SetText, SetTransform, SetVisible, SetWindowLimits, SetWindowState, SetWindowStateFor,
+    SetWindowTitle, StartDrag, StartMove, StartResize, UnbindKey, Unlock, WindowList,
 };
 use crate::types::{
     Align, BufferId, CursorShape, DataSource, DragAction, Edge, Layer, NodeId, NodeKind,
@@ -1041,6 +1041,13 @@ impl Transaction<'_> {
     #[must_use]
     pub fn buffer_damage(mut self, id: BufferId, rects: Vec<IRect>) -> Self {
         push!(self, BufferDamage { id, rects })
+    }
+
+    /// Declare an image node's fully opaque pixels, in buffer px (needs
+    /// `caps::OPAQUE_REGION` listed in `ClientCaps`); empty clears.
+    #[must_use]
+    pub fn opaque_region(mut self, id: NodeId, rects: Vec<IRect>) -> Self {
+        push!(self, SetOpaqueRegion { id, rects })
     }
 
     /// Point an image node at a buffer region.
