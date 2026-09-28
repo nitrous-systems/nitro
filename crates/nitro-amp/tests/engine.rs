@@ -44,8 +44,13 @@ impl Drop for TempDir {
 fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
     let p = dir.join(name);
-    std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Write under a temporary name and rename into place: a sibling test's
+    // `fork` inside the window where the script is still open for writing
+    // would make the exec of `p` fail with ETXTBSY.
+    let tmp = dir.join(format!(".{name}.tmp"));
+    std::fs::write(&tmp, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::rename(&tmp, &p).unwrap();
     p
 }
 
@@ -303,9 +308,15 @@ fn wait_for_file(path: &Path, len: usize) -> Vec<u8> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let pcm = std::fs::read(path).unwrap_or_default();
-        if pcm.len() >= len || Instant::now() > deadline {
+        if pcm.len() >= len {
             return pcm;
         }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {} to reach {len} bytes: got {}",
+            path.display(),
+            pcm.len()
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
 }
@@ -316,27 +327,51 @@ fn a_player_that_dies_at_once_hands_over_to_the_next_with_every_frame() {
     let bin = d.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let out = d.path().join("pcm");
+    let dead = d.path().join("dead");
     script(
         &bin,
         "pw-cat",
-        "echo 'error: pw_context_connect() failed: Host is down' >&2\nexit 1",
+        &format!(
+            "echo 'error: pw_context_connect() failed: Host is down' >&2\nexec 0<&-\necho x > '{}'\nexit 1",
+            dead.display()
+        ),
     );
     script(&bin, "paplay", &format!("cat > '{}'", out.display()));
-    let mut players = Backend::detect_all_in(&[bin]).into_iter();
-    let first = players.next().unwrap();
-    assert!(matches!(first, Backend::PwCat(_)), "{first:?}");
+    // A decoder that hands over its second half only once the player has
+    // closed its stdin and said it is dying: the engine's next write is
+    // then certain to find a closed pipe, rather than racing the player.
 
-    let f = tone(d.path(), "t.wav", 8_000, 0.25);
-    let mut p = Player::spawn_with_fallbacks(Tools::default(), first, players.collect()).unwrap();
+    let total = 2_000 * 8;
+    let first = 1_024 * 8;
+    script(
+        &bin,
+        "ffmpeg",
+        &format!(
+            "head -c {first} /dev/zero\nwhile [ ! -e '{}' ]; do sleep 0.01; done\nhead -c {} /dev/zero",
+            dead.display(),
+            total - first
+        ),
+    );
+    let tools = Tools::find_in(std::slice::from_ref(&bin));
+    let mut players = Backend::detect_all_in(std::slice::from_ref(&bin)).into_iter();
+    let first_player = players.next().unwrap();
+    assert!(
+        matches!(first_player, Backend::PwCat(_)),
+        "{first_player:?}"
+    );
+
+    let f = d.path().join("song.flac");
+    std::fs::write(&f, b"fLaC").unwrap();
+    let mut p = Player::spawn_with_fallbacks(tools, first_player, players.collect()).unwrap();
     p.send(Cmd::Load {
         path: f,
         play: true,
         token: 1,
     });
     let st = until(&p, "the end", |s| s.ended);
-    let pcm = wait_for_file(&out, 2_000 * 8);
+    let pcm = wait_for_file(&out, total);
     drop(p);
-    assert_eq!(pcm.len(), 2_000 * 8, "every frame, on the second player");
+    assert_eq!(pcm.len(), total, "every frame, on the second player");
     let err = st.error.unwrap_or_default();
     assert!(err.contains("pipewire"), "{err}");
     assert!(err.contains("Host is down"), "{err}");
@@ -349,15 +384,36 @@ fn a_lone_player_that_dies_says_why_and_the_track_still_ends() {
     let d = TempDir::new("dies");
     let bin = d.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
+    let dead = d.path().join("dead");
     script(
         &bin,
         "pw-cat",
-        "echo 'sndfile: failed to open audio file' >&2\necho 'error: open failed' >&2\nexit 1",
+        &format!(
+            "echo 'sndfile: failed to open audio file' >&2\necho 'error: open failed' >&2\nexec 0<&-\necho x > '{}'\nexit 1",
+            dead.display()
+        ),
     );
-    let mut players = Backend::detect_all_in(&[bin]).into_iter();
-    let first = players.next().unwrap();
-    let f = tone(d.path(), "t.wav", 8_000, 0.25);
-    let mut p = Player::spawn_with_fallbacks(Tools::default(), first, players.collect()).unwrap();
+    // Hold the decoder's tail back until the only player has closed its
+    // stdin and announced its death, so the engine must attempt — and
+    // fail — one more write before it ever reaches end-of-stream.
+
+    let total = 2_000 * 8;
+    let first = 1_024 * 8;
+    script(
+        &bin,
+        "ffmpeg",
+        &format!(
+            "head -c {first} /dev/zero\nwhile [ ! -e '{}' ]; do sleep 0.01; done\nhead -c {} /dev/zero",
+            dead.display(),
+            total - first
+        ),
+    );
+    let tools = Tools::find_in(std::slice::from_ref(&bin));
+    let mut players = Backend::detect_all_in(std::slice::from_ref(&bin)).into_iter();
+    let first_player = players.next().unwrap();
+    let f = d.path().join("song.flac");
+    std::fs::write(&f, b"fLaC").unwrap();
+    let mut p = Player::spawn_with_fallbacks(tools, first_player, players.collect()).unwrap();
     p.send(Cmd::Load {
         path: f,
         play: true,
