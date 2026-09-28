@@ -365,7 +365,7 @@ cd /home/kaspar/src/ai/chromium
 
 | | |
 |---|---|
-| branch | `nitro-ozone` @ `455459e465` |
+| branch | `nitro-ozone` @ `455459e465` (+ `15e595442e`, #3877 SetOpaqueRegion) |
 | targets | 56 777 |
 | wall time | **2 961 s (49 min 21 s)** at `-j 48`, from scratch |
 | `chrome` | 519 MB unstripped. `symbol_level=0` still leaves about 200 MB of `.symtab`/`.strtab`. **346 MB stripped** (`just deploy-chromium` strips a copy into `target/chromium-stage/`) |
