@@ -851,11 +851,32 @@ pub fn paint_region_shared(
     items.clear();
     scene.paint_list(output, &area, items);
     let mut local: Vec<PaintItem> = Vec::with_capacity(items.len());
+    // Declared opaque regions (#3877), in device px: splitting every damage
+    // rect along them lets `paint_clip`'s occlusion test skip whatever lies
+    // under a translucent-format window's opaque interior (the wallpaper,
+    // the background) exactly as it does for an XR24 one.
+    let covers: Vec<IRect> = items
+        .iter()
+        .flat_map(|item| opaque_region_device(scene, item))
+        .collect();
+    let covers = Region::from_rects(&covers);
+    let mut clips: Vec<IRect> = Vec::with_capacity(region.len());
     for clip in region {
         let clip = clip.intersect(&canvas.bounds());
         if clip.is_empty() {
             continue;
         }
+        let whole = Region::rect(clip);
+        let inside = whole.intersect(&covers);
+        let outside = whole.subtract(&covers);
+        if covers.is_empty() || inside.is_empty() || inside.overflowed() || outside.overflowed() {
+            clips.push(clip);
+        } else {
+            clips.extend(inside.rects());
+            clips.extend(outside.rects());
+        }
+    }
+    for clip in clips {
         local.clear();
         local.extend(items.iter().filter_map(|item| {
             let bounds = item.bounds.intersect(&clip);
@@ -892,12 +913,13 @@ fn paint_clip(
     // trusting it here cannot produce a wrong pixel.
     let first = items
         .iter()
-        .rposition(|item| {
-            item.opaque_cover()
-                .is_some_and(|cover| cover.contains_rect(clip))
-        })
+        .rposition(|item| covers_clip(scene, item, clip))
         .unwrap_or(0);
-    if first == 0 && !covers_all(items.first(), clip) {
+    if first == 0
+        && !items
+            .first()
+            .is_some_and(|item| covers_clip(scene, item, clip))
+    {
         paint_background(canvas, clip, width, height, palette);
     }
     for item in &items[first..] {
@@ -928,12 +950,53 @@ pub fn copy_region(shadow: &Shadow, buf: &mut BufferMut<'_>, region: &[IRect]) -
     duration_us(start.elapsed())
 }
 
-/// Whether the first item alone already hides the background.
-fn covers_all(first: Option<&PaintItem>, clip: &IRect) -> bool {
-    first.is_some_and(|item| {
-        item.opaque_cover()
-            .is_some_and(|cover| cover.contains_rect(clip))
-    })
+/// Whether `item` alone hides everything under `clip`: the scene's
+/// [`PaintItem::opaque_cover`], or one rect of the image's declared opaque
+/// region (`SetOpaqueRegion`, #3877) containing the whole clip.
+fn covers_clip(scene: &Scene, item: &PaintItem, clip: &IRect) -> bool {
+    item.opaque_cover()
+        .is_some_and(|cover| cover.contains_rect(clip))
+        || opaque_region_device(scene, item)
+            .iter()
+            .any(|r| r.contains_rect(clip))
+}
+
+/// An image item's declared opaque region mapped to device px and clipped
+/// to where the item paints — empty unless the item is an AR24 image drawn
+/// 1:1, pixel-aligned, at opacity 1 (the only mapping under which the
+/// region's pixels land on whole device pixels unblended).
+fn opaque_region_device(scene: &Scene, item: &PaintItem) -> Vec<IRect> {
+    let PaintKind::Image {
+        size, buffer, src, ..
+    } = item.kind
+    else {
+        return Vec::new();
+    };
+    let Ok(node) = scene.node(item.node) else {
+        return Vec::new();
+    };
+    let opaque = node.opaque_region();
+    if opaque.is_empty()
+        || item.opacity < 1.0
+        || !item.shift_exact()
+        || scene
+            .buffer(buffer)
+            .map_or(true, |b| b.desc().format != format::AR24)
+    {
+        return Vec::new();
+    }
+    let device = item
+        .transform
+        .apply_rect(&Rect::new(0.0, 0.0, size.0, size.1));
+    // `shift_exact` guarantees integer device coordinates and a 1:1 size.
+    #[allow(clippy::cast_possible_truncation)]
+    let (dx, dy) = (device.x as i32 - src.x, device.y as i32 - src.y);
+    let bound = item.clip.intersect(&item.bounds);
+    opaque
+        .iter()
+        .map(|r| r.intersect(&src).translate(dx, dy).intersect(&bound))
+        .filter(|r| !r.is_empty())
+        .collect()
 }
 
 /// Microseconds of a duration, saturating (a paint that took longer than
