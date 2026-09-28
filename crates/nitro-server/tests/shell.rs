@@ -988,6 +988,48 @@ fn an_anchor_with_no_edges_centres_an_overlay() {
 }
 
 #[test]
+fn a_top_anchored_overlay_hangs_off_the_work_area() {
+    // The launcher's search field: top-centre, `SEARCH_TOP` below the
+    // work area's top, i.e. under the bar and in the overview's reserved
+    // search band (`nitro_wire::types::overview`).
+    use nitro_wire::types::overview::SEARCH_TOP;
+    let h = Harness::start("anchor-overlay-top", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut shell = h.shell("launcher");
+    let _bar = make_bar(&h, &mut shell, &mut inbox, 1);
+    let size = Size::new(400.0, 300.0);
+    let mut win = make_window(
+        &mut shell,
+        &mut inbox,
+        1,
+        "launcher",
+        size,
+        BAR_BLUE,
+        window_flags::UNDECORATED | window_flags::NO_FOCUS,
+        Layer::Overlay,
+        3,
+    );
+    shell
+        .tx()
+        .set_anchor(win.root, anchor::TOP, SEARCH_TOP)
+        .commit(4)
+        .unwrap();
+    shell.flush().unwrap();
+    h.settle();
+    refresh(&mut shell, &mut inbox, &mut win);
+    assert_eq!(
+        win.pos,
+        nitro_core::Point::new(
+            (OUT.0 as f32 - size.w) / 2.0,
+            (ZONE + SEARCH_TOP) as f32
+        )
+    );
+    assert_eq!(win.size, size, "a one-edge anchor does not resize");
+    drop(shell);
+    h.quit();
+}
+
+#[test]
 fn an_anchor_with_a_margin_insets_a_docked_bar() {
     let h = Harness::start("anchor-margin", OUT.0, OUT.1);
     let mut inbox = Inbox::default();
