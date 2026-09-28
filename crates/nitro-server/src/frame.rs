@@ -72,6 +72,25 @@
 //! deliberately generous. The same deadline bounds a *deferred* flip —
 //! see [`crate::defer`].
 //!
+//! # Scroll blits
+//!
+//! When a scene update was, apart from other damage, a pure whole-pixel
+//! translation of one subtree ([`nitro_scene::Translation`]), the paint can
+//! move pixels the shadow already holds instead of rasterizing them again —
+//! `CopyArea`, inside the compositor. Only pixels provably the moved
+//! subtree's own opaque, shift-exact content are moved, and never where
+//! anything above the subtree, anything else that changed, or the cursor
+//! is or was: [`blit_region`] states the rule `D = (R ∩ S ∩ C∩(C+d)) \ (A∪F)
+//! \ ((A∪F)+d)`. Everything else of the rasterize region is painted as
+//! usual. The hint rides *alongside* the damage and never replaces it, so
+//! ignoring it (`NITRO_SCROLL_BLIT=0`) paints the same pixels.
+//!
+//! Two things it does **not** do. `damage_px` does not move: the copy out
+//! of the shadow is still `damage(n) ∪ damage(n-1)`, pixels that really
+//! differ in the age-2 back buffer. And that copy is not itself blitted —
+//! the buffer handed out at frame `n` was on screen at `n-2`, which would
+//! need a per-buffer translation accumulator. Only `paint_us` shrinks.
+//!
 //! # Cursor damage is tracked apart from everything else
 //!
 //! Damage arrives from two places that mean very different things to the
@@ -675,8 +694,9 @@ pub fn blit_region(
     foreign: &Region,
 ) -> Option<Region> {
     let (dx, dy) = delta;
-    let fixed = Region::rect(clip.intersect(&output))
-        .intersect(&Region::rect(clip.translate(dx, dy).intersect(&output.translate(dx, dy))));
+    let fixed = Region::rect(clip.intersect(&output)).intersect(&Region::rect(
+        clip.translate(dx, dy).intersect(&output.translate(dx, dy)),
+    ));
     let busy = above.union(foreign);
     let d = Region::from_rects(rasterize)
         .intersect(cover)
@@ -788,8 +808,6 @@ pub fn paint_region(
     palette: &Palette,
 ) -> u64 {
     let start = std::time::Instant::now();
-    let (width, height) = (canvas.width(), canvas.height());
-    let (cursor_image, cursor_state) = cursor;
     for clip in region {
         let clip = clip.intersect(&canvas.bounds());
         if clip.is_empty() {
@@ -797,36 +815,104 @@ pub fn paint_region(
         }
         items.clear();
         scene.paint_list(output, &clip, items);
-        // Everything below the last item that opaquely covers the whole
-        // clip is invisible — including the background. This is the scene's
-        // occlusion promise, and it is deliberately conservative there, so
-        // trusting it here cannot produce a wrong pixel.
-        let first = items
-            .iter()
-            .rposition(|item| {
-                item.opaque_cover()
-                    .is_some_and(|cover| cover.contains_rect(&clip))
-            })
-            .unwrap_or(0);
-        if first == 0 && !covers_all(items.first(), &clip) {
-            paint_background(canvas, &clip, width, height, palette);
-        }
-        for item in &items[first..] {
-            paint_item(canvas, &clip, item, scene, text, icons, palette);
-        }
-        if cursor_state.visible {
-            cursor_image.paint(
-                canvas,
-                &clip,
-                cursor_state.x,
-                cursor_state.y,
-                cursor_state.shape,
-                cursor_state.scale,
-            );
-        }
+        paint_clip(canvas, scene, text, icons, &clip, items, cursor, palette);
     }
     items.clear();
     duration_us(start.elapsed())
+}
+
+/// [`paint_region`] for many small rects close together — the thin
+/// leftovers of a scroll blit — with **one** paint-list walk over their
+/// bounding box instead of one per rect.
+///
+/// Pixel-identical to [`paint_region`]: each rect is drawn from the items
+/// of the shared list whose bounds reach it, in the same order, and every
+/// item is re-clipped to the rect, so an item's clip and bounds taken
+/// against the larger box are narrowed to exactly what the per-rect list
+/// would have held. Occlusion (`opaque_cover` containing the rect) asks
+/// the same question of the same world bounds.
+#[allow(clippy::too_many_arguments)] // As `paint_region`.
+pub fn paint_region_shared(
+    canvas: &mut Canvas<'_>,
+    scene: &Scene,
+    text: &mut TextEngine,
+    icons: &mut IconEngine,
+    output: OutputId,
+    region: &[IRect],
+    cursor: (&Cursor, CursorState),
+    items: &mut Vec<PaintItem>,
+    palette: &Palette,
+) -> u64 {
+    let start = std::time::Instant::now();
+    let area = region
+        .iter()
+        .fold(IRect::EMPTY, |acc, r| acc.union(r))
+        .intersect(&canvas.bounds());
+    items.clear();
+    scene.paint_list(output, &area, items);
+    let mut local: Vec<PaintItem> = Vec::with_capacity(items.len());
+    for clip in region {
+        let clip = clip.intersect(&canvas.bounds());
+        if clip.is_empty() {
+            continue;
+        }
+        local.clear();
+        local.extend(items.iter().filter_map(|item| {
+            let bounds = item.bounds.intersect(&clip);
+            (!bounds.is_empty()).then_some(PaintItem {
+                bounds,
+                clip: item.clip.intersect(&clip),
+                ..*item
+            })
+        }));
+        paint_clip(canvas, scene, text, icons, &clip, &local, cursor, palette);
+    }
+    items.clear();
+    duration_us(start.elapsed())
+}
+
+/// Paint one clip rect from its paint list: background unless occluded,
+/// the items, then the cursor.
+#[allow(clippy::too_many_arguments)] // One rect's inputs.
+fn paint_clip(
+    canvas: &mut Canvas<'_>,
+    scene: &Scene,
+    text: &mut TextEngine,
+    icons: &mut IconEngine,
+    clip: &IRect,
+    items: &[PaintItem],
+    cursor: (&Cursor, CursorState),
+    palette: &Palette,
+) {
+    let (width, height) = (canvas.width(), canvas.height());
+    let (cursor_image, cursor_state) = cursor;
+    // Everything below the last item that opaquely covers the whole
+    // clip is invisible — including the background. This is the scene's
+    // occlusion promise, and it is deliberately conservative there, so
+    // trusting it here cannot produce a wrong pixel.
+    let first = items
+        .iter()
+        .rposition(|item| {
+            item.opaque_cover()
+                .is_some_and(|cover| cover.contains_rect(clip))
+        })
+        .unwrap_or(0);
+    if first == 0 && !covers_all(items.first(), clip) {
+        paint_background(canvas, clip, width, height, palette);
+    }
+    for item in &items[first..] {
+        paint_item(canvas, clip, item, scene, text, icons, palette);
+    }
+    if cursor_state.visible {
+        cursor_image.paint(
+            canvas,
+            clip,
+            cursor_state.x,
+            cursor_state.y,
+            cursor_state.shape,
+            cursor_state.scale,
+        );
+    }
 }
 
 /// Stream `region` from `shadow` into `buf`, reporting the microseconds it
@@ -1546,6 +1632,173 @@ mod tests {
         assert!(
             inside > 10,
             "expected glyphs inside the box, found {inside} (block {block_w}x{block_h})"
+        );
+    }
+
+    /// `translate_region` against a naive copy out of a snapshot, in every
+    /// direction, with overlapping source and destination and ragged
+    /// regions: every pixel in `dst` is its source's old value, every
+    /// pixel outside is byte-identical.
+    #[test]
+    fn translate_region_matches_a_snapshot_copy() {
+        let (w, h, stride) = (40u32, 30u32, 192u32);
+        let dst = Region::from_rects(&[
+            IRect::new(3, 4, 20, 10),
+            IRect::new(10, 12, 25, 9),
+            IRect::new(0, 25, 7, 3),
+        ]);
+        for (dx, dy) in [(0, 5), (0, -5), (4, 0), (-4, 0), (3, -2), (-7, 6), (1, 1)] {
+            let mut shadow = Shadow::new(w, h);
+            shadow.ensure(w, h, stride);
+            paint_pattern(&mut shadow);
+            let before = shadow.image();
+            let valid = shadow_bounds(&shadow).intersect(&shadow_bounds(&shadow).translate(dx, dy));
+            let dst = dst.intersect(&Region::rect(valid));
+            shadow.translate_region(&dst, dx, dy);
+            let after = shadow.image();
+            for y in 0..h.cast_signed() {
+                for x in 0..w.cast_signed() {
+                    let (ux, uy) = (x.cast_unsigned(), y.cast_unsigned());
+                    let want = if dst.contains(x, y) {
+                        before.pixel((x - dx).cast_unsigned(), (y - dy).cast_unsigned())
+                    } else {
+                        before.pixel(ux, uy)
+                    };
+                    assert_eq!(after.pixel(ux, uy), want, "d=({dx},{dy}) at ({x},{y})");
+                }
+            }
+        }
+    }
+
+    fn shadow_bounds(s: &Shadow) -> IRect {
+        IRect::new(0, 0, s.width().cast_signed(), s.height().cast_signed())
+    }
+
+    fn hint() -> PendingScroll {
+        PendingScroll {
+            node: nitro_scene::NodeKey::from_parts(0, 0),
+            moves_node: true,
+            delta: (0, -16),
+            clip: IRect::new(0, 0, 100, 50),
+            foreign: Damage::new(),
+            blocked: false,
+        }
+    }
+
+    #[test]
+    fn a_scroll_hint_lives_until_the_next_paint_and_collects_foreign_damage() {
+        let mut s = state();
+        frame(&mut s);
+        frame(&mut s);
+        // Damage waiting before the hint: the shadow does not have it yet.
+        let early = IRect::new(0, 0, 5, 5);
+        s.damage_content(early);
+        s.damage_scroll(&[IRect::new(0, 0, 100, 50)], hint());
+        // And anything after it, content or cursor.
+        let later = IRect::new(60, 10, 4, 4);
+        s.damage_content(later);
+        let cursor = IRect::new(80, 30, 8, 8);
+        s.damage_cursor(cursor);
+        assert!(!s.cursor_only());
+        let h = s.take_scroll().expect("pending");
+        assert!(!h.blocked);
+        for r in [early, later, cursor] {
+            assert!(h.foreign.intersects(&r), "{r:?} in {:?}", h.foreign);
+        }
+        // Taken once.
+        assert!(s.take_scroll().is_none());
+    }
+
+    /// An invalidated output (plug, resume, mode set) has the whole output
+    /// waiting when the hint arrives, so everything is foreign and the
+    /// blit has nothing it may copy.
+    #[test]
+    fn a_hint_after_an_invalidate_leaves_nothing_to_copy() {
+        let mut s = state();
+        frame(&mut s);
+        frame(&mut s);
+        s.invalidate();
+        s.damage_scroll(&[IRect::new(0, 0, 100, 50)], hint());
+        let h = s.take_scroll().expect("pending");
+        let foreign = Region::from_rects(h.foreign.rects());
+        let out = s.bounds();
+        let d = blit_region(
+            h.delta,
+            h.clip,
+            out,
+            &s.rasterize_region(),
+            &Region::rect(out),
+            &Region::new(),
+            &foreign,
+        );
+        assert!(d.is_none(), "{d:?}");
+    }
+
+    #[test]
+    fn a_second_hint_before_a_paint_blocks_the_first() {
+        let mut s = state();
+        s.damage_scroll(&[IRect::new(0, 0, 100, 50)], hint());
+        s.damage_scroll(&[IRect::new(0, 0, 100, 50)], hint());
+        assert!(s.take_scroll().expect("pending").blocked);
+    }
+
+    #[test]
+    fn commit_invalidate_and_a_failed_commit_each_drop_the_hint() {
+        let mut s = state();
+        s.damage_scroll(&[IRect::new(0, 0, 100, 50)], hint());
+        s.committed();
+        assert!(s.take_scroll().is_none(), "committed");
+        s.damage_scroll(&[IRect::new(0, 0, 100, 50)], hint());
+        s.invalidate();
+        assert!(s.take_scroll().is_none(), "invalidate");
+        s.damage_scroll(&[IRect::new(0, 0, 100, 50)], hint());
+        s.commit_failed(&[IRect::new(0, 0, 100, 50)]);
+        assert!(s.take_scroll().is_none(), "a retry must never move twice");
+    }
+
+    /// The hint never replaces damage: the regions an output paints and
+    /// copies are the same with it as without it.
+    #[test]
+    fn a_hint_leaves_the_damage_exactly_as_it_was() {
+        let rects = [IRect::new(0, 0, 100, 20), IRect::new(0, 30, 100, 20)];
+        let mut a = state();
+        let mut b = state();
+        frame(&mut a);
+        frame(&mut b);
+        for r in rects {
+            a.damage_content(r);
+        }
+        b.damage_scroll(&rects, hint());
+        assert_eq!(a.rasterize_region(), b.rasterize_region());
+        assert_eq!(a.repaint_region(), b.repaint_region());
+    }
+
+    #[test]
+    fn the_blit_region_excludes_the_busy_pixels_and_their_sources() {
+        let out = IRect::new(0, 0, 100, 100);
+        let clip = IRect::new(0, 0, 100, 60);
+        let cover = Region::rect(IRect::new(0, 0, 100, 60));
+        let above = Region::rect(IRect::new(10, 10, 10, 10));
+        let d = blit_region((0, -5), clip, out, &[out], &cover, &above, &Region::new()).unwrap();
+        // The band exposed at the bottom of the clip has no source.
+        assert!(!d.contains(50, 57));
+        assert!(d.contains(50, 54));
+        // Neither the window above nor what would be copied out of it.
+        assert!(!d.contains(15, 15));
+        assert!(!d.contains(15, 7));
+        assert!(!d.contains(15, 60), "outside the clip");
+        // A delta that jumps past the whole clip leaves nothing to copy.
+        assert!(
+            blit_region(
+                (0, -70),
+                clip,
+                out,
+                &[out],
+                &cover,
+                &Region::new(),
+                &Region::new()
+            )
+            .is_none()
         );
     }
 }

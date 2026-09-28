@@ -156,6 +156,8 @@ pub enum BackendKind {
 
 /// Everything [`run`] needs.
 #[derive(Debug, Clone)]
+// Independent switches, each its own environment variable.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Config {
     /// Display backend.
     pub backend: BackendKind,
@@ -2189,16 +2191,8 @@ impl Server {
         let cursor_state = self.cursor_state(scene_id);
         // Spent whatever this paint does: see `OutputState::take_scroll`.
         let scroll = self.outputs[index].take_scroll();
-        // The cursor is drawn over whatever the blit moves, so its current
-        // rect is never copied into or out of.
-        let cursor_rect = Cursor::rect_scaled(
-            cursor_state.x,
-            cursor_state.y,
-            cursor_state.shape,
-            cursor_state.scale,
-        );
-        let mut blitted = false;
-        let mut raster_moved = (frame::region_area(&region), 0);
+        // (rasterized px, moved px, took the blit), for the statistics.
+        let mut split = (frame::region_area(&region), 0, false);
         let (paint_us, copy_us) = {
             let mut buf = match self.backend.back_buffer(id) {
                 Ok(b) => b,
@@ -2222,49 +2216,23 @@ impl Server {
                 if reset {
                     rasterize = vec![bounds];
                 }
-                // The scroll blit: move what the shadow already holds,
-                // rasterize only the rest. Every precondition is checked in
-                // `scroll_blit_region`; any failure is the ordinary paint.
-                let blit = scroll.filter(|_| !reset && shadow.is_complete()).and_then(|s| {
-                    scroll_blit_region(&self.scene, scene_id, bounds, &rasterize, &s, cursor_rect)
-                        .map(|d| (s.delta, d))
-                });
-                let start = Instant::now();
-                let mut raster_px = frame::region_area(&rasterize);
-                let mut moved_px = 0;
-                if let Some((delta, d)) = &blit {
-                    shadow.translate_region(d, delta.0, delta.1);
-                    let rest = nitro_core::Region::from_rects(&rasterize).subtract(d);
-                    let rest = rest.rects();
-                    raster_px = frame::region_area(&rest);
-                    moved_px = d.area().cast_unsigned();
-                    frame::paint_region(
-                        &mut shadow.canvas(),
-                        &self.scene,
-                        &mut self.text,
-                        &mut self.icons,
-                        scene_id,
-                        &rest,
-                        (&self.cursor, cursor_state),
-                        &mut self.paint_items,
-                        &self.palette,
-                    );
-                } else {
-                    frame::paint_region(
-                        &mut shadow.canvas(),
-                        &self.scene,
-                        &mut self.text,
-                        &mut self.icons,
-                        scene_id,
-                        &rasterize,
-                        (&self.cursor, cursor_state),
-                        &mut self.paint_items,
-                        &self.palette,
-                    );
-                }
-                let paint_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
-                blitted = blit.is_some();
-                raster_moved = (raster_px, moved_px);
+                let painted = paint_shadow(
+                    shadow,
+                    &mut ShadowPaint {
+                        scene: &self.scene,
+                        text: &mut self.text,
+                        icons: &mut self.icons,
+                        items: &mut self.paint_items,
+                        palette: &self.palette,
+                        output: scene_id,
+                        bounds,
+                        cursor: (&self.cursor, cursor_state),
+                    },
+                    &rasterize,
+                    scroll.filter(|_| !reset),
+                );
+                let paint_us = painted.paint_us;
+                split = (painted.raster_px, painted.moved_px, painted.blitted);
                 shadow.note_painted(&rasterize);
                 let copy_us = frame::copy_region(shadow, &mut buf, &region);
                 (paint_us, copy_us)
@@ -2303,11 +2271,9 @@ impl Server {
                 self.stats.paint_us.push(paint_us);
                 self.stats.copy_us.push(copy_us);
                 self.stats.damage_px.push(damage_px);
-                self.stats.raster_px.push(raster_moved.0);
-                self.stats.blit_px.push(raster_moved.1);
-                if blitted {
-                    self.blit_frames += 1;
-                }
+                self.stats.raster_px.push(split.0);
+                self.stats.blit_px.push(split.1);
+                self.blit_frames += u64::from(split.2);
                 self.outputs[index].committed();
                 true
             }
@@ -9891,6 +9857,86 @@ fn report_bad_icons(client: &mut clients::WireClient, serial: u32, bad: Vec<(Nod
     }
 }
 
+/// Everything [`paint_shadow`] borrows from the server, apart from the
+/// shadow itself (which lives in the output the server also borrows).
+struct ShadowPaint<'a> {
+    scene: &'a Scene,
+    text: &'a mut crate::text::TextEngine,
+    icons: &'a mut IconEngine,
+    items: &'a mut Vec<nitro_scene::PaintItem>,
+    palette: &'a nitro_core::Palette,
+    output: SceneOutputId,
+    bounds: nitro_core::IRect,
+    cursor: (&'a Cursor, CursorState),
+}
+
+/// What [`paint_shadow`] did, for the statistics.
+struct ShadowPainted {
+    paint_us: u64,
+    blitted: bool,
+    raster_px: u64,
+    moved_px: u64,
+}
+
+/// Rasterize `rasterize` into the shadow — through the scroll blit when a
+/// hint is pending and every precondition holds (`scroll_blit_region`),
+/// the ordinary paint otherwise. The timer covers the region arithmetic
+/// too: deciding what may be moved is part of what the blit costs.
+fn paint_shadow(
+    shadow: &mut frame::Shadow,
+    p: &mut ShadowPaint<'_>,
+    rasterize: &[nitro_core::IRect],
+    scroll: Option<frame::PendingScroll>,
+) -> ShadowPainted {
+    let start = Instant::now();
+    // The cursor is drawn over whatever the blit moves, so its current
+    // rect is never copied into or out of.
+    let (_, cs) = p.cursor;
+    let cursor_rect = Cursor::rect_scaled(cs.x, cs.y, cs.shape, cs.scale);
+    let blit = scroll.filter(|_| shadow.is_complete()).and_then(|s| {
+        scroll_blit_region(p.scene, p.output, p.bounds, rasterize, &s, cursor_rect)
+            .map(|d| (s.delta, d))
+    });
+    let mut raster_px = frame::region_area(rasterize);
+    let mut moved_px = 0;
+    if let Some((delta, moved)) = &blit {
+        shadow.translate_region(moved, delta.0, delta.1);
+        let leftover = nitro_core::Region::from_rects(rasterize)
+            .subtract(moved)
+            .rects();
+        raster_px = frame::region_area(&leftover);
+        moved_px = moved.area().cast_unsigned();
+        frame::paint_region_shared(
+            &mut shadow.canvas(),
+            p.scene,
+            &mut *p.text,
+            &mut *p.icons,
+            p.output,
+            &leftover,
+            p.cursor,
+            &mut *p.items,
+            p.palette,
+        );
+    } else {
+        frame::paint_region(
+            &mut shadow.canvas(),
+            p.scene,
+            &mut *p.text,
+            &mut *p.icons,
+            p.output,
+            rasterize,
+            p.cursor,
+            &mut *p.items,
+            p.palette,
+        );
+    }
+    ShadowPainted {
+        paint_us: u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX),
+        blitted: blit.is_some(),
+        raster_px,
+        moved_px,
+    }
+}
 
 /// The pixels this paint may move rather than rasterize, when every
 /// precondition of the scroll blit holds: the hint is not blocked, the
@@ -9913,7 +9959,8 @@ fn scroll_blit_region(
     if (rect.x, rect.y) != (0, 0) {
         return None;
     }
-    let (cover, above) = scene.translation_cover(output, scroll.node, scroll.moves_node, &scroll.clip)?;
+    let (cover, above) =
+        scene.translation_cover(output, scroll.node, scroll.moves_node, &scroll.clip)?;
     let mut foreign: Vec<nitro_core::IRect> = scroll.foreign.rects().to_vec();
     foreign.push(cursor);
     frame::blit_region(

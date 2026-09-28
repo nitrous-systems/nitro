@@ -264,7 +264,11 @@ impl Region {
 }
 
 /// Combine two sorted span lists pixel-wise with `keep`.
-fn combine(a: &[(i32, i32)], b: &[(i32, i32)], keep: &impl Fn(bool, bool) -> bool) -> Vec<(i32, i32)> {
+fn combine(
+    a: &[(i32, i32)],
+    b: &[(i32, i32)],
+    keep: &impl Fn(bool, bool) -> bool,
+) -> Vec<(i32, i32)> {
     let mut xs: Vec<i32> = a.iter().chain(b).flat_map(|&(p, q)| [p, q]).collect();
     xs.sort_unstable();
     xs.dedup();
@@ -371,7 +375,14 @@ mod tests {
         fn rects(&mut self) -> Vec<IRect> {
             let n = self.next(6);
             (0..n)
-                .map(|_| IRect::new(self.next(N) - 4, self.next(N) - 4, self.next(10), self.next(10)))
+                .map(|_| {
+                    IRect::new(
+                        self.next(N) - 4,
+                        self.next(N) - 4,
+                        self.next(10),
+                        self.next(10),
+                    )
+                })
                 .collect()
         }
     }

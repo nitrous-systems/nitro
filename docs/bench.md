@@ -843,8 +843,8 @@ referent is the ~30× claim the paragraphs above retire. The clean figure
 is what made the *reading* checkable, and checking it is what retired
 it.
 
-**The recoverable factor is ~2× on paint, not ~30× on damage**, and it is
-filed as **#592** with its ceiling attached. This section's own run puts
+**The recoverable factor is ~2× on paint, not ~30× on damage**, and it was
+filed as **#592** with its ceiling attached (landed; see below). This section's own run puts
 `paint_us` at 834 µs and `copy_us` at 361 (#592 quotes 815 and 373 from a
 neighbouring sitting; the difference is this box's run-to-run drift, not
 a disagreement). A `memmove` of 640 × 464 px XRGB8888 is 27 µs here, so
@@ -858,6 +858,38 @@ age-2 back buffer is behind by (`crates/nitro-server/src/frame.rs`).
 Those pixels genuinely differ between that buffer and the screen and must
 be written whatever the scene graph concludes. So roughly 1 616 → ~800
 µs/frame: real, worth having, and not 30×.
+
+**Landed (task 3780), and what it measured.** The blit exists now
+(`crates/nitro-server/src/frame.rs`, "Scroll blits"): the scene reports a
+pure whole-pixel translation as a hint beside the ordinary damage, and the
+paint moves the subtree's own opaque, shift-exact pixels inside the shadow
+and rasterizes only the rest. The scenario's 1-px row gaps show the desktop
+gradient, which does *not* move, so the copy is region-exact rather than a
+whole-viewport `memmove` — the gaps are rasterized with the exposed band.
+`NITRO_SCROLL_BLIT=0` is the A/B. Host `tau` (dev box, **fake backend**,
+1280×720, release build, `nitro-bench scroll --seconds 5`, three sittings
+each; not the test box):
+
+| | `NITRO_SCROLL_BLIT=0` | default |
+|---|---|---|
+| `raster_px_mean` | 306 560 | **29 072** |
+| `blit_px_mean` | 0 | 277 488 |
+| `paint_us_mean` | 248–340 µs | 234–243 µs |
+| `copy_us_mean` | 147–155 µs | 156–166 µs |
+| server CPU/frame | 517–625 µs | 517 µs |
+| `damage_px_mean` | 306 560 | 306 560 (unchanged, as argued above) |
+
+The pixel split is the deterministic part: 10.5× fewer rasterized pixels.
+The time is not 10×, and on this box not 2× either: the fill it replaces is
+itself a streaming write of solid rows, which costs about what a `memmove`
+of the same bytes costs (a microbenchmark here: 26 µs to move 640 × 450 px
+vs 27 µs to fill them, warm), and a moved row has to be *read* as well —
+from a 3.6 MB shadow that is cold between frames, ~100 µs in situ. The
+blit pays off in proportion to how expensive the content under it is to
+rasterize (text, borders, images), and least on solid rects. The test-box
+figures quoted above (815 µs paint) are what the ceiling was computed
+against and have **not** been re-measured with the blit; that run is the
+open follow-up.
 
 **One claim in the issue does need narrowing, and it is the issue's best
 paragraph.** "A 500-row list and a 50 000-row list scroll for the same
@@ -1944,7 +1976,7 @@ that ledger. The second and third kinds are worth filing for too.
 |---|---|---|
 | **#568** | ~~`paint_us_mean` **11 757 µs** for a fullscreen 1080p repaint — **71 %** of the 60 Hz frame~~ → **5 328–5 424 µs, 32–33 % of the frame** | **Fixed by #3728, re-measured on the box in §7.10b** (`docs/bench-5e4b02e.jsonl`). The finding was real and is stated below as it was measured; the numbers it rests on are the pre-#3728 ledger and the row above is the correction. Original: fullscreen rows across three scenarios — rotozoom, starfield at all three N, balls — do genuinely different work per frame (a per-pixel gather, two thousand moving stars, thirty-two circles) and reported near-identical server costs: **16 525–16 741 µs, paint 10 963–11 757**, because the server's work is a function of damaged area alone. A least-squares fit through `putimage`'s four damage/paint points extrapolated to ~3 060 µs at 2 073 600 px against the 11 000–11 800 measured, so **a fullscreen repaint was ~3.8× more expensive per pixel than a large partial one** — and §9.6 added the constraint that the excess is *proportional to area rather than fixed per frame*. **What closed it:** #3728 skipped passes fully occluded by an opaque 1:1 XR24 image and widened the 1:1 opaque blit's store, which is precisely a per-pixel-path change at full-surface damage — the thing §9.6 said to profile. Paint fell **2.1–2.8×** at 1080p, and the question that survived the fix is answered too: **ns/px fell at *both* sizes** — 1.07–2.77× at 1080p and 1.80–2.65× at 720p — so the remaining pass is genuinely cheaper per pixel rather than merely run fewer times. The residual against a recomputed `putimage` fit is 2.8×, down from 4.1× by the same method, and is now dominated by the fit's lever arm (#3726 clips the sweep's buffers to the window, so its largest point is 307 200 px); §7.10b.3 says why that is a fitting artefact and not a further lever. |
 | **#569** | ~~`upload_us` **2 570–6 044 µs/frame** at 1080p~~ → **0**, and the server's `pread` with it | **Fixed.** The client now renders straight into a mapping of its own sealed memfd and the server maps the same file read-only, so two of the frame's three passes over the pixels are gone. Measured either side in one sitting: `docs/bench-49d023b.jsonl` and §7.10 below. `upload_us` is 0 on every row, server CPU/frame falls 13–50 %, and `boing` crosses the 60 Hz budget and doubles to 60 fps. The seal check (`F_SEAL_SHRINK`, `F_SEAL_GROW`, `F_SEAL_SEAL`, verified with `F_GET_SEALS`) is what makes the mapping sound against a hostile client; `crates/nitro-shm/README.md` carries the argument and the residuals. Scope was always the escape hatch: the retained path never paid this (§7.7's 83.5 µs) and is unchanged — `boing-node` is the control row and does not move. |
-| **#570** | ~~a one-row scroll damages **304 768 px = 0.99× the viewport**, a factor of ~30 against `CopyArea`~~ → **damage is within 6 % of minimal; the finding was a misreading** | **Retired, and the measurement is the interesting part.** The number was right and the reasoning was wrong. A one-row scroll of heterogeneous content genuinely changes **450 of 480 viewport rows = 288 000 px** (the 30 that do not are the scenario's own 1-px inter-row gaps; with solid content it is 480 of 480), because shifting differently-coloured rows past a fixed viewport gives every pixel its neighbour's colour. Reported damage is **306 560 px against a true minimum of 288 000 — 1.06×**, the excess being `Damage`'s documented rect-merge policy (`crates/nitro-core/src/damage.rs`). So there is no 30× to reclaim: **what `CopyArea` bought was not less damage but cheaper pixels**, and the recommended fix (damage the symmetric difference) would have left 267 520 px stale — see §8 D, because the test it proposed as proof would have certified the bug. The real prize is ~2× on `paint_us`, filed as **#592** with its ceiling attached, and `damage_px_mean` cannot move at all: it is `damage(n) ∪ damage(n−1)`, pixels that genuinely differ from the age-2 back buffer. §7.5 carries the full argument. (The figure was 675 696 px in an earlier ledger, from a clipping group that clipped nothing.) |
+| **#570** | ~~a one-row scroll damages **304 768 px = 0.99× the viewport**, a factor of ~30 against `CopyArea`~~ → **damage is within 6 % of minimal; the finding was a misreading** | **Retired, and the measurement is the interesting part.** The number was right and the reasoning was wrong. A one-row scroll of heterogeneous content genuinely changes **450 of 480 viewport rows = 288 000 px** (the 30 that do not are the scenario's own 1-px inter-row gaps; with solid content it is 480 of 480), because shifting differently-coloured rows past a fixed viewport gives every pixel its neighbour's colour. Reported damage is **306 560 px against a true minimum of 288 000 — 1.06×**, the excess being `Damage`'s documented rect-merge policy (`crates/nitro-core/src/damage.rs`). So there is no 30× to reclaim: **what `CopyArea` bought was not less damage but cheaper pixels**, and the recommended fix (damage the symmetric difference) would have left 267 520 px stale — see §8 D, because the test it proposed as proof would have certified the bug. The real prize was ~2× on `paint_us` (filed as #592, **landed by task 3780** — the region-exact scroll blit; §7.5 has what it measured), and `damage_px_mean` cannot move at all: it is `damage(n) ∪ damage(n−1)`, pixels that genuinely differ from the age-2 back buffer. §7.5 carries the full argument. (The figure was 675 696 px in an earlier ledger, from a clipping group that clipped nothing.) |
 
 **#568 was about the server's cost being proportional to damaged area**,
 and that is a statement about the *rasterizer's* per-pixel path at full‑

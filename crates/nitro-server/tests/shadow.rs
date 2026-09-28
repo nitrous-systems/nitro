@@ -55,15 +55,22 @@ impl Harness {
     /// field rather than an environment variable precisely so two servers
     /// can differ on it inside one test process.
     fn start(name: &str, shadow: bool) -> Self {
+        Self::start_with(name, shadow, true, OUT)
+    }
+
+    /// As [`Harness::start`], choosing the scroll blit (`NITRO_SCROLL_BLIT`)
+    /// and the output size too.
+    fn start_with(name: &str, shadow: bool, scroll_blit: bool, out: (u32, u32)) -> Self {
         let dir = std::env::temp_dir().join(format!("nitro-shadow-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("nitro").join("control.sock");
         let mut config = Config::fake(1, 1, &path);
         config.backend = BackendKind::Fake {
-            width: OUT.0,
-            height: OUT.1,
+            width: out.0,
+            height: out.1,
         };
         config.shadow = shadow;
+        config.scroll_blit = scroll_blit;
         let input = FakeInput::new().expect("eventfd");
         config.fake_input = Some(input.clone());
         let wire_path = config.wire_path.clone();
@@ -617,4 +624,377 @@ fn an_image_with_alpha_does_not_occlude() {
     assert!(blue > 0x70 && blue < 0x90, "half blue, got {px:#010x}");
 
     h.quit();
+}
+
+// ---------------------------------------------------------------------------
+// The scroll blit (#592 / task 3780)
+//
+// Every test below drives two servers identically — one with the blit
+// (`scroll_blit: true`, the default) and a reference without it — and
+// compares **both whole buffers** after every step: the scanout buffer on
+// screen (`front`) and the shadow (`shot`). A blit that is wrong is wrong
+// somewhere in the middle of the screen, so nothing less will do. Each
+// test also says whether the fast path must have been taken
+// (`blit_frames` moved) or declined (it did not), so a test cannot pass by
+// quietly exercising the ordinary path.
+// ---------------------------------------------------------------------------
+
+use nitro_core::Transform;
+use nitro_wire::types::NodeKind;
+
+const CLIPPER: NodeId = NodeId(2);
+const CONTENT: NodeId = NodeId(3);
+const ROWS: u32 = 30;
+
+fn row_id(i: u32) -> NodeId {
+    NodeId(100 + i)
+}
+
+/// Two servers, blit on and off, each with one client.
+struct Pair {
+    on: Harness,
+    off: Harness,
+    c_on: Connection,
+    c_off: Connection,
+    serial: u32,
+}
+
+impl Pair {
+    fn new(name: &str, out: (u32, u32)) -> Self {
+        Self::with_shadow(name, out, true)
+    }
+
+    fn with_shadow(name: &str, out: (u32, u32), shadow: bool) -> Self {
+        let on = Harness::start_with(&format!("{name}-on"), shadow, true, out);
+        let off = Harness::start_with(&format!("{name}-off"), shadow, false, out);
+        let c_on = on.client("scroller");
+        let c_off = off.client("scroller");
+        Self {
+            on,
+            off,
+            c_on,
+            c_off,
+            serial: 1,
+        }
+    }
+
+    /// Apply the same transaction on both servers and wait for both.
+    fn step(
+        &mut self,
+        f: impl Fn(nitro_wire::client::Transaction<'_>) -> nitro_wire::client::Transaction<'_>,
+    ) {
+        self.serial += 1;
+        for (h, c) in [(&self.on, &mut self.c_on), (&self.off, &mut self.c_off)] {
+            f(c.tx()).commit(self.serial).unwrap();
+            c.flush().unwrap();
+            // Drain whatever the server sends so its socket never fills.
+            let mut seen = Vec::new();
+            let _ = c.poll(&mut seen);
+            h.settle();
+        }
+    }
+
+    fn input(&self, ev: InputEvent) {
+        self.on.input.push(ev.clone());
+        self.off.input.push(ev);
+        self.on.settle();
+        self.off.settle();
+    }
+
+    fn assert_same(&self, what: &str) {
+        assert_same(
+            &self.on.front(),
+            &self.off.front(),
+            &format!("{what}: front"),
+        );
+        assert_same(&self.on.shot(), &self.off.shot(), &format!("{what}: shot"));
+    }
+
+    fn blits(&self) -> u64 {
+        self.on.stat("blit_frames")
+    }
+
+    fn quit(self) {
+        self.on.quit();
+        self.off.quit();
+    }
+}
+
+/// The `nitro-bench scroll` shape: a clipping viewport, a content group
+/// of differently coloured 15-px rows with a 1-px gap (through which the
+/// desktop's vertical gradient shows), scrolled by `SetBounds`.
+fn bench_window(p: &mut Pair, size: Size, row_h: f32, gap: f32) {
+    let root = NodeId(1);
+    p.step(|tx| {
+        let mut tx = tx
+            .create_window(root, "scroll", size, Layer::Normal)
+            .create_group(CLIPPER, root)
+            .bounds(CLIPPER, Rect::new(0.0, 0.0, size.w, size.h))
+            .clip(CLIPPER, true)
+            .create_group(CONTENT, CLIPPER)
+            .bounds(CONTENT, Rect::new(0.0, 0.0, size.w, ROWS as f32 * row_h));
+        for i in 0..ROWS {
+            let c = Color::rgb(
+                (i * 37 % 256) as u8,
+                (i * 91 % 256) as u8,
+                (0x80 + i * 13 % 128) as u8,
+            );
+            tx = tx
+                .create_rect(
+                    row_id(i),
+                    CONTENT,
+                    Rect::new(0.0, i as f32 * row_h, size.w, row_h - gap),
+                )
+                .fill_solid(row_id(i), c);
+        }
+        tx
+    });
+}
+
+fn scroll_to(p: &mut Pair, size: Size, row_h: f32, x: f32, y: f32) {
+    p.step(|tx| tx.bounds(CONTENT, Rect::new(x, y, size.w, ROWS as f32 * row_h)));
+}
+
+#[test]
+fn a_scroll_blit_paints_what_a_full_rasterize_paints() {
+    let size = Size::new(160.0, 112.0);
+    let mut p = Pair::new("blit-bench", OUT);
+    bench_window(&mut p, size, 16.0, 1.0);
+    p.assert_same("initial");
+    let before = p.blits();
+    // Down, down, a non-row-multiple, back up, sideways, diagonal, and a
+    // jump larger than the viewport (nothing to copy: D is empty).
+    let steps = [
+        (0.0, -16.0),
+        (0.0, -32.0),
+        (0.0, -39.0),
+        (0.0, -23.0),
+        (5.0, -23.0),
+        (-3.0, -30.0),
+        (-3.0, -300.0),
+        (0.0, 0.0),
+    ];
+    for (i, (x, y)) in steps.iter().enumerate() {
+        scroll_to(&mut p, size, 16.0, *x, *y);
+        p.assert_same(&format!("step {i} to ({x}, {y})"));
+    }
+    assert!(p.blits() > before, "the fast path was taken");
+    p.quit();
+}
+
+#[test]
+fn a_scroll_blit_of_opaque_rows_with_text_by_transform() {
+    let size = Size::new(160.0, 112.0);
+    let mut p = Pair::new("blit-ui", OUT);
+    let root = NodeId(1);
+    p.step(|tx| {
+        let mut tx = tx
+            .create_window(root, "list", size, Layer::Normal)
+            .create_group(CLIPPER, root)
+            .bounds(CLIPPER, Rect::new(0.0, 0.0, size.w, size.h))
+            .clip(CLIPPER, true);
+        for i in 0..ROWS {
+            let c = if i % 2 == 0 {
+                Color::rgb(0xF0, 0xF0, 0xF0)
+            } else {
+                Color::rgb(0xE0, 0xE8, 0xF0)
+            };
+            let label = NodeId(1000 + i);
+            tx = tx
+                .create_rect(
+                    row_id(i),
+                    CLIPPER,
+                    Rect::new(0.0, i as f32 * 20.0, size.w, 20.0),
+                )
+                .fill_solid(row_id(i), c)
+                .create_node(label, NodeKind::Text, CLIPPER)
+                .bounds(label, Rect::new(4.0, i as f32 * 20.0 + 2.0, 120.0, 16.0))
+                .set_text(label, "sans", 12.0, Color::BLACK, &format!("row {i}"));
+        }
+        tx
+    });
+    p.assert_same("initial");
+    let before = p.blits();
+    for (i, y) in [-20.0f32, -40.0, -47.0, -27.0].iter().enumerate() {
+        p.step(|tx| tx.transform(CLIPPER, Transform::translate(0.0, *y)));
+        p.assert_same(&format!("step {i}"));
+    }
+    assert!(p.blits() > before, "the fast path was taken");
+    p.quit();
+}
+
+#[test]
+fn a_pointer_over_the_viewport_is_not_copied() {
+    let size = Size::new(160.0, 112.0);
+    let mut p = Pair::new("blit-cursor", OUT);
+    bench_window(&mut p, size, 16.0, 1.0);
+    // Into the middle of the window, which is centred on the output.
+    p.input(InputEvent::PointerAbsolute {
+        x: 0.5,
+        y: 0.5,
+        time_ns: 2_000_000,
+    });
+    p.assert_same("pointer parked");
+    let before = p.blits();
+    for (i, y) in [-16.0f32, -32.0, -48.0].iter().enumerate() {
+        scroll_to(&mut p, size, 16.0, 0.0, *y);
+        p.assert_same(&format!("step {i}"));
+    }
+    assert!(
+        p.blits() > before,
+        "the fast path was taken around the cursor"
+    );
+    p.quit();
+}
+
+/// Each declined precondition: the frames agree and `blit_frames` does
+/// not move.
+fn declined(name: &str, setup: impl Fn(&mut Pair, Size), step: impl Fn(&mut Pair, Size)) {
+    let size = Size::new(160.0, 112.0);
+    let mut p = Pair::new(name, OUT);
+    bench_window(&mut p, size, 16.0, 1.0);
+    setup(&mut p, size);
+    p.assert_same("setup");
+    let before = p.blits();
+    step(&mut p, size);
+    p.assert_same("declined step");
+    assert_eq!(p.blits(), before, "{name}: the fast path must be declined");
+    p.quit();
+}
+
+#[test]
+fn a_fractional_scroll_is_declined() {
+    declined(
+        "blit-frac",
+        |_, _| {},
+        |p, s| scroll_to(p, s, 16.0, 0.0, -7.5),
+    );
+}
+
+#[test]
+fn a_content_change_in_the_same_commit_is_declined() {
+    declined(
+        "blit-content",
+        |_, _| {},
+        |p, s| {
+            p.step(|tx| {
+                tx.bounds(CONTENT, Rect::new(0.0, -16.0, s.w, ROWS as f32 * 16.0))
+                    .fill_solid(row_id(3), Color::rgb(0xFF, 0, 0))
+            });
+        },
+    );
+}
+
+#[test]
+fn a_scale_change_is_declined() {
+    declined(
+        "blit-scale",
+        |_, _| {},
+        |p, _| p.step(|tx| tx.transform(CONTENT, Transform::scale(1.0, 2.0))),
+    );
+}
+
+/// A second client's window over the viewport: the blit may still run
+/// around it, but the picture must be exact — including under the window
+/// and where the viewport's content slides out from under it.
+#[test]
+fn a_window_above_the_viewport_is_never_copied() {
+    let size = Size::new(160.0, 112.0);
+    let mut p = Pair::new("blit-above", OUT);
+    bench_window(&mut p, size, 16.0, 1.0);
+    let mut o_on = p.on.client("overlay");
+    let mut o_off = p.off.client("overlay");
+    window(
+        &p.on,
+        &mut o_on,
+        Size::new(40.0, 30.0),
+        Color::rgb(0x10, 0xC0, 0x10),
+    );
+    window(
+        &p.off,
+        &mut o_off,
+        Size::new(40.0, 30.0),
+        Color::rgb(0x10, 0xC0, 0x10),
+    );
+    p.assert_same("overlay mapped");
+    for (i, y) in [-16.0f32, -32.0, -48.0].iter().enumerate() {
+        scroll_to(&mut p, size, 16.0, 0.0, *y);
+        p.assert_same(&format!("step {i}"));
+    }
+    p.quit();
+}
+
+#[test]
+fn without_a_shadow_there_is_no_blit() {
+    let size = Size::new(160.0, 112.0);
+    let mut p = Pair::with_shadow("blit-noshadow", OUT, false);
+    bench_window(&mut p, size, 16.0, 1.0);
+    for y in [-16.0f32, -32.0] {
+        scroll_to(&mut p, size, 16.0, 0.0, y);
+        p.assert_same("step");
+    }
+    assert_eq!(p.blits(), 0);
+    p.quit();
+}
+
+/// A scroll racing a plug: every kept output is invalidated, and whether
+/// the scroll lands in the invalidated frame or after it, the picture is
+/// exact. (Which of the two happens is timing; the deterministic halves —
+/// damage already waiting when a hint arrives is foreign, so a full
+/// invalidation leaves nothing to copy, and `invalidate` after a hint
+/// drops it — are `frame.rs` unit tests.)
+#[test]
+fn a_scroll_racing_an_invalidated_output_is_exact() {
+    let size = Size::new(160.0, 112.0);
+    let mut p = Pair::new("blit-plug", OUT);
+    bench_window(&mut p, size, 16.0, 1.0);
+    let plug = format!("plug {}x{}\n", OUT.0, OUT.1);
+    for h in [&p.on, &p.off] {
+        assert_eq!(h.request_line(&plug), "ok");
+    }
+    scroll_to(&mut p, size, 16.0, 0.0, -16.0);
+    p.assert_same("scroll after plug");
+    scroll_to(&mut p, size, 16.0, 0.0, -32.0);
+    p.assert_same("and the one after");
+    p.quit();
+}
+
+/// What the blit is for, measured: on a full-width scroll the rasterizer
+/// draws the exposed band and the gaps rather than the viewport,
+/// `paint_us` falls with it — and `damage_px` does not move at all.
+#[test]
+fn a_scroll_blit_rasterizes_a_band_and_leaves_the_damage_alone() {
+    let out = (640, 480);
+    let size = Size::new(560.0, 400.0);
+    let mut p = Pair::new("blit-measure", out);
+    bench_window(&mut p, size, 16.0, 0.0);
+    let before = p.blits();
+    // Each settled step is two frames (the move, then the age-2 carry), so
+    // 70 steps fill the 120-frame statistics window with scroll frames
+    // alone — the setup frames, whose batching is timing-dependent, have
+    // left it by the time it is read.
+    for i in 1..=70 {
+        scroll_to(&mut p, size, 16.0, 0.0, -16.0 * (i % 12) as f32);
+    }
+    assert!(p.blits() >= before + 50, "{} blits", p.blits() - before);
+    let (on, off) = (&p.on, &p.off);
+    let raster_on = on.stat("raster_px_mean");
+    let raster_off = off.stat("raster_px_mean");
+    assert!(
+        raster_on * 4 < raster_off,
+        "raster_px_mean {raster_on} with the blit vs {raster_off} without"
+    );
+    assert!(on.stat("blit_px_mean") > 0);
+    assert_eq!(off.stat("blit_px_mean"), 0);
+    assert_eq!(
+        on.stat("damage_px_mean"),
+        off.stat("damage_px_mean"),
+        "the copy region is the same either way"
+    );
+    let (us_on, us_off) = (on.stat("paint_us_mean"), off.stat("paint_us_mean"));
+    assert!(
+        us_on < us_off,
+        "paint_us_mean {us_on} with the blit vs {us_off} without"
+    );
+    p.quit();
 }

@@ -217,9 +217,13 @@ impl PaintItem {
     #[must_use]
     pub fn shift_exact(&self) -> bool {
         let aligned = |size: (f32, f32)| {
-            let exact = self.transform.apply_rect(&Rect::new(0.0, 0.0, size.0, size.1));
+            let exact = self
+                .transform
+                .apply_rect(&Rect::new(0.0, 0.0, size.0, size.1));
             self.transform.is_axis_aligned()
-                && [exact.x, exact.y, exact.w, exact.h].iter().all(|v| v.fract() == 0.0)
+                && [exact.x, exact.y, exact.w, exact.h]
+                    .iter()
+                    .all(|v| v.fract() == 0.0)
         };
         match self.kind {
             PaintKind::Rect {

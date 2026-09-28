@@ -315,11 +315,14 @@ impl Scene {
         };
 
         let size = (node.bounds.w, node.bounds.h);
-        let candidate = if force || self.tx.depth > 0 {
-            None
-        } else {
-            self.candidate(key, dirty, target, world_transform, child_transform, clip_rect, child_clip)
-        };
+        let candidate = self.candidate(
+            key,
+            dirty,
+            force,
+            target,
+            [world_transform, child_transform],
+            [clip_rect, child_clip],
+        );
 
         let node = self.node_mut_ref(key);
         node.world_child_transform = child_transform;
@@ -428,17 +431,23 @@ impl Scene {
     /// Whether `key`, not dragged along by an ancestor and not inside
     /// another candidate, moved its subtree rigidly this update. Reads the
     /// *old* cached state off the node, so call before overwriting it.
-    #[allow(clippy::too_many_arguments)] // The new world state, as `visit` computed it.
+    ///
+    /// `transforms` is the new `[world, child]` transform pair and `clips`
+    /// the new `[clip_rect, child_clip]`, as `visit` computed them.
     fn candidate(
         &self,
         key: NodeKey,
         dirty: Dirty,
+        force: bool,
         target: Target,
-        world_transform: Transform,
-        child_transform: Transform,
-        clip_rect: IRect,
-        child_clip: IRect,
+        transforms: [Transform; 2],
+        clips: [IRect; 2],
     ) -> Option<Translation> {
+        if force || self.tx.depth > 0 {
+            return None;
+        }
+        let [world_transform, child_transform] = transforms;
+        let [clip_rect, child_clip] = clips;
         let node = self.node_ref(key);
         let size = (node.bounds.w, node.bounds.h);
         if dirty.is_clean()
