@@ -1150,9 +1150,6 @@ fn raster_fill(fill: SceneFill, item: &PaintItem) -> Option<nitro_raster::Fill> 
     }
 }
 
-/// The rasterizer's layout for a client's fourcc, or `None` for a format
-/// the server does not accept (it rejected it at `CreateBuffer` time, so
-/// this is belt and braces).
 /// Paint an AR24 image whose client declared an opaque region
 /// (`SetOpaqueRegion`, #3877): the region through the opaque copy (the same
 /// pixels read as `Xrgb8888`, so the alpha byte is ignored), the rest through
@@ -1208,6 +1205,9 @@ fn blit_with_opaque_region(
     true
 }
 
+/// The rasterizer's layout for a client's fourcc, or `None` for a format
+/// the server does not accept (it rejected it at `CreateBuffer` time, so
+/// this is belt and braces).
 fn pixel_format(fourcc: u32) -> Option<PixelFormat> {
     match fourcc {
         format::XR24 => Some(PixelFormat::Xrgb8888),
