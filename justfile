@@ -23,6 +23,38 @@ BINDIR     := env_var_or_default("BINDIR", PREFIX / "bin")
 LIBDIR     := env_var_or_default("LIBDIR", PREFIX / "lib")
 DATADIR    := env_var_or_default("DATADIR", PREFIX / "share")
 SYSCONFDIR := env_var_or_default("SYSCONFDIR", if PREFIX == "/usr" { "/etc" } else { PREFIX / "etc" })
+# How to get write access to the destination. cargo always runs as you;
+# only the commands that write under $DESTDIR$PREFIX (install, rm, …) are
+# prefixed. `auto`: no prefix when the destination is writable (or you are
+# root), otherwise `sudo` if it is on PATH, else `doas`, else an error.
+# `SUDO=doas` / `SUDO=sudo` forces one; `SUDO=none` (or empty) never
+# escalates.
+SUDO       := env_var_or_default("SUDO", "auto")
+
+# Shared bash for the install recipes, pasted in as `{{_asroot}}`.
+# `asroot_for DIR` sets the array SU to the prefix needed to write under
+# DIR (checked on its first existing ancestor); `asroot_force` picks one
+# whenever we are not root (for apparmor_parser). Use as "${SU[@]}" cmd.
+_asroot := "asroot_mode='" + SUDO + "'\n" + '''
+asroot_force() {
+    SU=()
+    [[ $(id -u) -eq 0 ]] && return
+    case $asroot_mode in
+        ''|none) ;;
+        auto)
+            if command -v sudo >/dev/null; then SU=(sudo)
+            elif command -v doas >/dev/null; then SU=(doas)
+            else echo "just: $1 needs root; run as root, set PREFIX to a directory you own, or install sudo/doas" >&2; exit 1
+            fi ;;
+        *) SU=("$asroot_mode") ;;
+    esac
+}
+asroot_for() {
+    local d=$1
+    while [[ ! -e $d ]]; do d=$(dirname "$d"); done
+    if [[ -w $d ]]; then SU=(); else asroot_force "$1"; fi
+}
+'''
 
 # The shipped binaries. This is `box_bins` (deploy/dev.just) minus
 # nitro-demo and nitro-bench, and without the examples. Those are
@@ -60,9 +92,14 @@ install: install-bins install-desktop
 install-bins:
     #!/usr/bin/env bash
     set -euo pipefail
+    {{_asroot}}
+    if [[ $(id -u) -eq 0 && -n ${SUDO_USER:-} ]]; then
+        echo "install-bins: note: cargo runs as root; plain \`just install\` builds as you and uses sudo/doas only to copy" >&2
+    fi
     cargo build --release --workspace --bins
+    asroot_for '{{DESTDIR}}{{BINDIR}}'
     for b in {{install_bins}}; do
-        install -Dm755 "target/release/$b" '{{DESTDIR}}{{BINDIR}}'"/$b"
+        "${SU[@]}" install -Dm755 "target/release/$b" '{{DESTDIR}}{{BINDIR}}'"/$b"
     done
 
 # deploy/*.desktop → $DESTDIR$DATADIR/applications/.
@@ -79,8 +116,10 @@ install-bins:
 install-desktop:
     #!/usr/bin/env bash
     set -euo pipefail
+    {{_asroot}}
+    asroot_for '{{DESTDIR}}{{DATADIR}}'
     for f in deploy/*.desktop; do
-        install -Dm644 "$f" '{{DESTDIR}}{{DATADIR}}/applications/'"$(basename "$f")"
+        "${SU[@]}" install -Dm644 "$f" '{{DESTDIR}}{{DATADIR}}/applications/'"$(basename "$f")"
     done
 
 # The nitro-ozone Chromium build → $LIBDIR/nitro/chromium/, plus the
@@ -97,6 +136,7 @@ install-desktop:
 install-chromium:
     #!/usr/bin/env bash
     set -euo pipefail
+    {{_asroot}}
     out='{{chromium_out}}'
     if [[ ! -x $out/chrome ]]; then
         echo "install-chromium: no $out/chrome — build nitro-ozone Chromium first (set NITRO_CHROMIUM_OUT; see docs/chromium-build.md)" >&2
@@ -106,6 +146,9 @@ install-chromium:
     lib='{{DESTDIR}}{{LIBDIR}}/nitro/chromium'
     bindir='{{DESTDIR}}{{BINDIR}}'
     datadir='{{DESTDIR}}{{DATADIR}}'
+    asroot_for "$lib"; su_lib=("${SU[@]}")
+    asroot_for "$bindir"; su_bin=("${SU[@]}")
+    asroot_for "$datadir"; su_data=("${SU[@]}")
     # `symbol_level=0` still leaves a ~200 MB `.symtab`/`.strtab`; strip a
     # copy rather than touching the build (shared with deploy-chromium).
     stage=target/chromium-stage
@@ -113,31 +156,30 @@ install-chromium:
     if [[ ! $stage/chrome -nt $out/chrome ]]; then
         strip -o "$stage/chrome" "$out/chrome"
     fi
-    install -Dm755 "$stage/chrome" "$lib/chrome"
+    "${su_lib[@]}" install -Dm755 "$stage/chrome" "$lib/chrome"
     # The directories are replaced as a whole, so a file dropped from the
     # build goes with them. `*.info` are build-time translation manifests.
-    rm -rf "$lib/locales" "$lib/resources"
+    "${su_lib[@]}" rm -rf "$lib/locales" "$lib/resources"
     for f in {{chromium_files}}; do
         case $f in
             locales|resources)
-                (cd "$out" && find "$f" -type f ! -name '*.info' -exec install -Dm644 {} "$lib/{}" \;) ;;
+                (cd "$out" && "${su_lib[@]}" find "$f" -type f ! -name '*.info' -exec install -Dm644 {} "$lib/{}" \;) ;;
             chrome_crashpad_handler|*.so|*.so.*)
-                install -Dm755 "$out/$f" "$lib/$f" ;;
+                "${su_lib[@]}" install -Dm755 "$out/$f" "$lib/$f" ;;
             *)
-                install -Dm644 "$out/$f" "$lib/$f" ;;
+                "${su_lib[@]}" install -Dm644 "$out/$f" "$lib/$f" ;;
         esac
     done
     # The wrapper gets the installed path, without DESTDIR.
-    mkdir -p "$bindir"
     sed 's|@CHROMIUM_DIR@|{{LIBDIR}}/nitro/chromium|' deploy/chromium/chromium-nitro > "$stage/chromium-nitro.install"
-    install -Dm755 "$stage/chromium-nitro.install" "$bindir/chromium-nitro"
+    "${su_bin[@]}" install -Dm755 "$stage/chromium-nitro.install" "$bindir/chromium-nitro"
     for n in 16 24 48 64 128 256; do
-        install -Dm644 "$src/chrome/app/theme/chromium/product_logo_$n.png" \
+        "${su_data[@]}" install -Dm644 "$src/chrome/app/theme/chromium/product_logo_$n.png" \
             "$datadir/icons/hicolor/${n}x${n}/apps/chromium-nitro.png"
     done
     # The entry goes **last**: a failure above leaves no launcher entry
     # pointing at a half-installed browser.
-    install -Dm644 deploy/chromium/chromium-nitro.desktop "$datadir/applications/chromium-nitro.desktop"
+    "${su_data[@]}" install -Dm644 deploy/chromium/chromium-nitro.desktop "$datadir/applications/chromium-nitro.desktop"
 
 # The AppArmor profile that lets the installed chrome use its sandbox,
 # → $DESTDIR$SYSCONFDIR/apparmor.d/chromium-nitro. Opt-in. It loads the
@@ -147,12 +189,15 @@ install-chromium:
 install-apparmor:
     #!/usr/bin/env bash
     set -euo pipefail
+    {{_asroot}}
     dest='{{DESTDIR}}{{SYSCONFDIR}}/apparmor.d/chromium-nitro'
+    asroot_for "$dest"
     mkdir -p target/chromium-stage
     sed 's|@CHROME@|{{LIBDIR}}/nitro/chromium/chrome|' deploy/chromium/apparmor-chromium-nitro > target/chromium-stage/apparmor-chromium-nitro.install
-    install -Dm644 target/chromium-stage/apparmor-chromium-nitro.install "$dest"
+    "${SU[@]}" install -Dm644 target/chromium-stage/apparmor-chromium-nitro.install "$dest"
     if [[ -z '{{DESTDIR}}' ]] && command -v apparmor_parser >/dev/null; then
-        apparmor_parser -r "$dest"
+        asroot_force "$dest"
+        "${SU[@]}" apparmor_parser -r "$dest"
     else
         echo "install-apparmor: installed $dest; not loaded (run: apparmor_parser -r {{SYSCONFDIR}}/apparmor.d/chromium-nitro)"
     fi
@@ -163,18 +208,22 @@ install-apparmor:
 uninstall:
     #!/usr/bin/env bash
     set -euo pipefail
+    {{_asroot}}
+    asroot_for '{{DESTDIR}}{{BINDIR}}'; su_bin=("${SU[@]}")
+    asroot_for '{{DESTDIR}}{{DATADIR}}'; su_data=("${SU[@]}")
+    asroot_for '{{DESTDIR}}{{LIBDIR}}'; su_lib=("${SU[@]}")
     for b in {{install_bins}} chromium-nitro; do
-        rm -f '{{DESTDIR}}{{BINDIR}}'"/$b"
+        "${su_bin[@]}" rm -f '{{DESTDIR}}{{BINDIR}}'"/$b"
     done
     for f in deploy/*.desktop deploy/chromium/chromium-nitro.desktop; do
-        rm -f '{{DESTDIR}}{{DATADIR}}/applications/'"$(basename "$f")"
+        "${su_data[@]}" rm -f '{{DESTDIR}}{{DATADIR}}/applications/'"$(basename "$f")"
     done
     for n in 16 24 48 64 128 256; do
-        rm -f '{{DESTDIR}}{{DATADIR}}'"/icons/hicolor/${n}x${n}/apps/chromium-nitro.png"
+        "${su_data[@]}" rm -f '{{DESTDIR}}{{DATADIR}}'"/icons/hicolor/${n}x${n}/apps/chromium-nitro.png"
     done
-    rm -rf '{{DESTDIR}}{{LIBDIR}}/nitro/chromium'
+    "${su_lib[@]}" rm -rf '{{DESTDIR}}{{LIBDIR}}/nitro/chromium'
     if [[ -d '{{DESTDIR}}{{LIBDIR}}/nitro' ]]; then
-        rmdir --ignore-fail-on-non-empty '{{DESTDIR}}{{LIBDIR}}/nitro'
+        "${su_lib[@]}" rmdir --ignore-fail-on-non-empty '{{DESTDIR}}{{LIBDIR}}/nitro'
     fi
 
 # ---------------------------------------------------------------------------

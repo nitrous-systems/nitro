@@ -8,7 +8,9 @@ See [DESIGN.md](DESIGN.md) for the architecture sketch and milestones.
 
 ## Install
 
-`sudo just install` builds a release and installs into `/usr/local`.
+`just install` builds a release and installs into `/usr/local`, using sudo
+or doas only for the copy.
+
 `just PREFIX=$HOME/.local install` does a user install. `PREFIX`, `DESTDIR`
 and the other GNU directory variables work as a packager expects. See
 [docs/install.md](docs/install.md), which also covers the optional

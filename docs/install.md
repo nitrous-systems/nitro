@@ -6,16 +6,23 @@ checkout into a local prefix, and they are written so that a Linux package
 `sed` and `strip`: no rsync, no ssh, and no package manager.
 
 ```sh
-sudo just install                    # /usr/local, binaries + launcher entries
+just install                         # /usr/local; builds as you, sudo/doas only to copy
+
 just PREFIX=$HOME/.local install     # a user install, no sudo
 just DESTDIR=$PWD/pkg PREFIX=/usr install   # staging, what a package build does
 just install install-chromium        # also the optional Chromium build
 just uninstall                       # same variables as the install
 ```
 
-`sudo just install` runs `cargo build` as root. To avoid that, run
-`just build` first, or install into a prefix you own. Re-running an install
+Every recipe runs as you, so `cargo build` never runs as root. Only the
+commands that write into the destination (`install`, `rm`, `rmdir`,
+`apparmor_parser`) are prefixed, and only when the destination is not
+writable: with `sudo` if it is on PATH, else with `doas`. `SUDO=doas`
+forces doas, `SUDO=none` never escalates. `sudo just install` still works,
+but then cargo builds as root; if an earlier one left `target/` owned by
+root, `sudo chown -R $USER target` fixes it. Re-running an install
 updates the files in place.
+
 
 ## Variables
 
@@ -27,6 +34,8 @@ updates the files in place.
 | `LIBDIR` | `$PREFIX/lib` | Chromium goes to `$LIBDIR/nitro/chromium` |
 | `DATADIR` | `$PREFIX/share` | |
 | `SYSCONFDIR` | `/etc` if `PREFIX=/usr`, else `$PREFIX/etc` | only for `install-apparmor` |
+| `SUDO` | `auto` | privilege prefix for writes: `auto`, `sudo`, `doas`, or `none` |
+
 
 Both `just PREFIX=/usr install` and `PREFIX=/usr just install` work. Write
 `$HOME/.local`, not `~/.local`, in the first form: after `just PREFIX=`
