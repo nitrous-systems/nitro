@@ -7,7 +7,7 @@
 //! nitro-shot --stats                              frame counters
 //! nitro-shot --quit                               stop the server
 //! nitro-shot --input "ARGS"                       inject input: `input ARGS` (see nitro-server's protocol.rs)
-//! nitro-shot --samples i2p|flip                   raw recent samples, µs, oldest first
+//! nitro-shot --samples i2p|flip|paint|damage      raw recent samples, oldest first (µs; pixels for damage)
 //! ```
 //!
 //! The control socket is `$NITRO_CONTROL`, else
@@ -36,7 +36,7 @@ enum Mode {
     /// `input <args>`: synthetic input through the server's real input
     /// path. Prints the status line's count.
     Input(String),
-    /// `samples i2p|flip`.
+    /// `samples i2p|flip|paint|damage`.
     Samples(String),
 }
 
@@ -46,7 +46,7 @@ struct Args {
     file: Option<PathBuf>,
 }
 
-const USAGE: &str = "usage: nitro-shot [-o FILE] [--raw] [--output NAME] | --outputs | --modes | --stats | --quit | --input ARGS | --samples i2p|flip";
+const USAGE: &str = "usage: nitro-shot [-o FILE] [--raw] [--output NAME] | --outputs | --modes | --stats | --quit | --input ARGS | --samples i2p|flip|paint|damage";
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
     let mut file = None;
@@ -65,8 +65,8 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--quit" => cmd = Some(Mode::Quit),
             "--input" => cmd = Some(Mode::Input(it.next().ok_or("--input needs ARGS")?)),
             "--samples" => match it.next().as_deref() {
-                Some(k @ ("i2p" | "flip")) => cmd = Some(Mode::Samples(k.to_owned())),
-                _ => return Err("--samples needs i2p or flip".to_owned()),
+                Some(k @ ("i2p" | "flip" | "paint" | "damage")) => cmd = Some(Mode::Samples(k.to_owned())),
+                _ => return Err("--samples needs i2p, flip, paint or damage".to_owned()),
             },
             "-h" | "--help" => return Err(USAGE.to_owned()),
             other => return Err(format!("unknown argument {other:?}\n{USAGE}")),
@@ -268,7 +268,15 @@ mod tests {
             parse("--samples i2p").unwrap().mode,
             Mode::Samples("i2p".into())
         );
-        assert!(parse("--samples paint").is_err());
+        assert_eq!(
+            parse("--samples paint").unwrap().mode,
+            Mode::Samples("paint".into())
+        );
+        assert_eq!(
+            parse("--samples damage").unwrap().mode,
+            Mode::Samples("damage".into())
+        );
+        assert!(parse("--samples frob").is_err());
         assert!(parse("--input").is_err());
         assert!(parse("-o").is_err());
         assert!(parse("--frob").is_err());

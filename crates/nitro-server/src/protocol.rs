@@ -19,7 +19,7 @@
 //! | `theme`              | `ok <scheme> <serial>\n` + `role #rrggbb[aa]\n` lines + `\n` |
 //! | `overview [on\|off] [name]` | `ok\n`; enters/leaves overview mode, for tests      |
 //! | `input <action> ...` | `ok <n>\n`; injects input into the real input path (below)  |
-//! | `samples i2p\|flip\|paint\|damage` | `ok <total>\n` + one µs value per line, oldest first, + `\n` |
+//! | `samples i2p\|flip\|paint\|damage` | `ok <total>\n` + one value per line (µs; pixels for `damage`), oldest first, + `\n` |
 //!
 //! # `input`: synthetic input, through the same path as hardware
 //!
