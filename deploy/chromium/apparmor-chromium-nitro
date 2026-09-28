@@ -1,0 +1,25 @@
+# AppArmor profile for Chromium-on-nitro, installed by `just deploy-chromium`
+# as /etc/apparmor.d/chromium-nitro (#3865).
+#
+# Why it exists: Ubuntu sets `kernel.apparmor_restrict_unprivileged_userns=1`,
+# which denies unprivileged user namespaces to every *unconfined* program.
+# Chromium's Linux sandbox is built on a user namespace, so a chrome at a
+# custom path either runs with `--no-sandbox` or aborts at startup. Ubuntu
+# ships exactly this shape for Google Chrome (/etc/apparmor.d/chrome): an
+# otherwise-unconfined profile whose only purpose is to carry `userns,`.
+# This is the same thing for our path, and it is preferred over the SUID
+# `chrome-sandbox` helper because it needs no root-owned setuid binary that
+# an rsync could silently de-privilege.
+#
+# `/home/*/` so the file is not tied to one user name; it still only
+# matches a binary under `nitro-bin/chromium/`.
+
+abi <abi/4.0>,
+include <tunables/global>
+
+profile chromium-nitro /home/*/nitro-bin/chromium/chrome flags=(unconfined) {
+  userns,
+
+  # Site-specific additions and overrides. See local/README for details.
+  include if exists <local/chromium-nitro>
+}

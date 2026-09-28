@@ -7,7 +7,7 @@ snappy here, it is snappy.
 | | |
 |---|---|
 | OS / kernel | Ubuntu 26.04 LTS, kernel 7.0 |
-| CPU / RAM | Pentium G3240 (Haswell, 2 cores, SSE4.2, **no AVX2**), 3.3 GB, **no swap** |
+| CPU / RAM | Pentium G3240 (Haswell, 2 cores, SSE4.2, **no AVX2**), 3.3 GB, **no disk swap** (4 GB zram since ~Sep 2026, i.e. compressed RAM) |
 | GPU | Intel HD (HSW GT1), `i915`, `/dev/dri/card1`, `renderD128` |
 | Outputs | HDMI-A-1 1920×1080 connected, **running at 120 Hz** (see below); VGA-1 unused |
 | Seat | systemd-logind (seatd also present); user in `video`,`render`,`input` |
@@ -126,6 +126,43 @@ $ just box-session lock       # M4; refused, honestly
 err lock is not implemented yet (M4: …)
 $ just box-session suspend    # systemctl suspend, via the session
 ```
+
+## Chromium (#3865)
+
+`just deploy-chromium` puts Chromium on nitro's own Ozone backend on the
+box. It is **not** part of `just deploy`, and it does not restart
+`nitro-dev`. It does not build anything either: it rsyncs a release,
+non-component build from `out/Nitro` in the Chromium checkout
+(`NITRO_CHROMIUM_OUT` overrides; `tmp/chromium-build.md` has the args). It
+writes:
+
+| where | what |
+|---|---|
+| `~/nitro-bin/chromium/` | `chrome` (stripped, 346 MB) and its runtime files, 429 MB in all; `--delete` is scoped to this directory |
+| `~/nitro-bin/chromium-nitro` | the wrapper named by `Exec=`: flags, `--class`, and the profile `~/.config/chromium-nitro` |
+| `~/.local/share/icons/hicolor/*/apps/chromium-nitro.png` | Chromium's logo, found by app id |
+| `~/.local/share/applications/chromium-nitro.desktop` | "Chromium (nitro)" in the launcher, installed **last** |
+| `/etc/apparmor.d/chromium-nitro` | `userns` for this path, so the sandbox is on (below) |
+| apt: `libatk1.0-0t64 libatk-bridge2.0-0t64 libatspi2.0-0t64` | chrome links them, and the box did not have them |
+
+These are part of the deployed set now. `stats desktop_entries` is **14**
+with it and `nitro-amp` installed. The launcher lists it only because
+`chromium-nitro` is in its `NATIVE_PROGRAMS`. Add a `reload` on the
+control socket after a first install so the server indexes the new
+`.desktop` file (the launcher rescans on its own).
+
+**The sandbox works; do not add `--no-sandbox`.** Ubuntu's
+`kernel.apparmor_restrict_unprivileged_userns=1` denies user namespaces to
+unconfined programs, and a chrome at a custom path is one. The profile,
+Ubuntu's own `chrome` shape at our path, gives it `userns`. Renderers
+run in their own user namespace with seccomp-bpf (`Seccomp: 2`). No SUID
+`chrome-sandbox` is shipped.
+
+**Memory:** one tab idle is 10 processes, **~440–500 MB PSS** and
+~235–265 MB `RssAnon`. The `VmRSS` sum (~1.5 GB) double-counts the shared
+binary and is not the number to quote. `free` "used" moved +170 to +250 MB.
+
+Figures and the verdict are in `tmp/chromium-backend.md` §Test box.
 
 ## The panel runs at 120 Hz
 
@@ -279,7 +316,7 @@ get an answer.
 
 ## Rules learned the hard way
 
-- **No swap, 3.3 GB.** Never run overlapping `perf record`s; cap
+- **No disk swap, 3.3 GB** (the 4 GB of zram is compressed RAM and does not make memory free). Never run overlapping `perf record`s; cap
   `--call-graph=dwarf,N` at N ≤ 8192 or use `fp`. The unit has
   `MemoryMax=1G`. The box once needed a power cycle after a perf pile-up.
 - **The unit sets `MALLOC_MMAP_THRESHOLD_=131072`, and that is a

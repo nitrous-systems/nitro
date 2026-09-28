@@ -1,0 +1,31 @@
+[Desktop Entry]
+Type=Application
+Name=Chromium (nitro)
+GenericName=Web Browser
+Comment=Chromium on nitro's Ozone backend (software rendering)
+# Installed only by `just deploy-chromium`, never by `just deploy`: this
+# file lives in `deploy/chromium/` rather than `deploy/` precisely so the
+# `deploy/*.desktop` glob in `deploy-bins` cannot pick it up and put a
+# launcher entry on a box that has no Chromium build.
+#
+# `Exec=` is the bare name of a wrapper script, not the browser, for the
+# same reason `nitro-term.desktop` is bare: the launcher spawns without a
+# shell and does not expand `~` or `$HOME`, and `nitro-session` prepends
+# `~/nitro-bin` to every child's `PATH` (#3723). The wrapper
+# (`deploy/chromium/chromium-nitro`, installed as
+# `~/nitro-bin/chromium-nitro`) supplies the flags and the profile dir.
+Exec=chromium-nitro %U
+# The file name, the window's app id and this key are the same string,
+# `chromium-nitro`, on purpose. The wrapper passes `--class=chromium-nitro`,
+# which Chromium's nitro backend sends as `SetAppId`; the launcher asks the
+# server for this file's basename; and the server resolves an app id first
+# in the icon theme — where `just deploy-chromium` installs Chromium's own
+# logo as `hicolor/<N>x<N>/apps/chromium-nitro.png` under
+# `~/.local/share/icons` — and then through `<app_id>.desktop`'s `Icon=`.
+# So launcher row, bar entry and title bar all land on the same PNG.
+Icon=chromium-nitro
+Terminal=false
+StartupWMClass=chromium-nitro
+Categories=Network;WebBrowser;
+Keywords=browser;web;internet;chromium;
+MimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;

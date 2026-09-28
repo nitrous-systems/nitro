@@ -159,7 +159,9 @@ when its program's file name is in `NATIVE_PROGRAMS`. Everything else the
 box has installed — firefox, the distribution's terminal — is an X11 or
 Wayland client, and nitro speaks neither yet, so launching one would put a
 process on the box that never shows a window. A row that cannot work is
-worse than no row. The filter is **temporary**: it goes away with
+worse than no row. `chromium-nitro` is on the list because it is a
+nitro-wire client (Chromium's own nitro Ozone backend, #3865), not a
+Wayland one. The filter is **temporary**: it goes away with
 `NATIVE_PROGRAMS` and `Launcher::with_native_only` when Wayland support
 lands.
 

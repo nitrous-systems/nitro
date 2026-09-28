@@ -547,6 +547,10 @@ pub const NATIVE_PROGRAMS: &[&str] = &[
     "nitro-amp",
     "nitro-demo",
     "hello_dialog",
+    // Chromium on nitro's own Ozone backend (#3865): a nitro-wire client,
+    // not a Wayland one, started through the `~/nitro-bin/chromium-nitro`
+    // wrapper that `just deploy-chromium` installs with its `.desktop`.
+    "chromium-nitro",
 ];
 
 /// Whether `entry` runs one of the [`NATIVE_PROGRAMS`].

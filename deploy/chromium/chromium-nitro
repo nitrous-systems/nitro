@@ -1,0 +1,38 @@
+#!/bin/sh
+# Chromium on nitro — the launcher entry's `Exec=` (#3865).
+#
+# Installed by `just deploy-chromium` as `~/nitro-bin/chromium-nitro`, next
+# to the browser's own directory `~/nitro-bin/chromium/`. It exists because
+# the launcher spawns without a shell: an `Exec=` line cannot say `~` or
+# `$HOME`, and a bare name is house style (see nitro-term.desktop), so the
+# flags and the profile path live here instead.
+#
+# The flags, each necessary:
+#   --ozone-platform=nitro  the build's default already (ozone_platform =
+#                           "nitro"), spelled out so a stray flag in a
+#                           `chrome-flags.conf` cannot silently pick another
+#   --disable-gpu --in-process-gpu
+#                           software rendering, and the GPU thread in the
+#                           browser process: nitro scopes buffer and window
+#                           ids per client connection, so an out-of-process
+#                           GPU could create buffers but never attach them
+#                           to the browser's window (tmp/chromium-backend.md)
+#   --class=chromium-nitro  the window's app id, which is what the bar and
+#                           the title bar look an icon up by; it must equal
+#                           the .desktop file's basename (see that file)
+#   --user-data-dir         a dedicated profile, so this build never shares
+#                           (or migrates) a profile with any other Chromium
+#
+# The sandbox is ON: `just deploy-chromium` installs an AppArmor profile
+# (deploy/chromium/apparmor-chromium-nitro) granting `userns` to exactly
+# this binary, because Ubuntu's `kernel.apparmor_restrict_unprivileged_userns=1`
+# denies it to any unconfined program at a custom path.
+d="$HOME/nitro-bin/chromium"
+export CHROME_DESKTOP=chromium-nitro.desktop
+exec "$d/chrome" \
+    --ozone-platform=nitro \
+    --disable-gpu \
+    --in-process-gpu \
+    --class=chromium-nitro \
+    --user-data-dir="$HOME/.config/chromium-nitro" \
+    "$@"

@@ -121,6 +121,69 @@ deploy-bins:
     ssh {{box}} 'mkdir -p ~/.local/share/applications'
     rsync -az deploy/*.desktop {{box}}:.local/share/applications/
 
+# Chromium on nitro (#3865). A **release, non-component** build of the
+# `nitro-ozone` branch in the Chromium checkout; this recipe does not
+# build it (that needs `cr-env.sh` and about an hour — see
+# tmp/chromium-build.md) and fails clearly if it is missing.
+chromium_out := env_var_or_default("NITRO_CHROMIUM_OUT", "/home/kaspar/src/ai/chromium/src/out/Nitro")
+# What `chrome` needs at run time, from `gn desc out/Nitro //chrome:chrome
+# runtime_deps` filtered to what the software path loads. libEGL/libGLESv2
+# and SwiftShader are listed because `--disable-gpu` still probes them
+# at startup; without them chrome logs errors but runs.
+# `chrome` itself is copied separately, stripped (below).
+chromium_files := "chrome_crashpad_handler chrome_100_percent.pak chrome_200_percent.pak resources.pak icudtl.dat v8_context_snapshot.bin snapshot_blob.bin libEGL.so libGLESv2.so libvk_swiftshader.so vk_swiftshader_icd.json libvulkan.so.1 locales resources"
+
+# It does not restart nitro-dev and touches nothing in ~/nitro-bin but
+# `chromium/` and the `chromium-nitro` wrapper; see docs/testbox.md.
+#
+# Rsync the Chromium build + its launcher entry to the box.
+deploy-chromium:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out='{{chromium_out}}'
+    if [[ ! -x $out/chrome ]]; then
+        echo "deploy-chromium: no $out/chrome — build it first (tmp/chromium-build.md, target chrome in out/Nitro)" >&2
+        exit 1
+    fi
+    src=$(cd "$out/../.." && pwd)
+    ssh {{box}} 'mkdir -p ~/nitro-bin/chromium ~/.local/share/applications'
+    # `chrome` links ATK/AT-SPI (accessibility) and a desktop-less box
+    # does not have them: without these three it dies in the loader with
+    # `libatk-1.0.so.0: cannot open shared object file`. Idempotent.
+    ssh {{box}} 'dpkg -s libatk1.0-0t64 libatk-bridge2.0-0t64 libatspi2.0-0t64 >/dev/null 2>&1 || sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libatk1.0-0t64 libatk-bridge2.0-0t64 libatspi2.0-0t64'
+    # `--delete` is scoped to ~/nitro-bin/chromium/ — the directory is
+    # ours alone, so a file dropped from the list goes with it.
+    # `symbol_level=0` still leaves a ~200 MB `.symtab`/`.strtab` in a
+    # 519 MB binary; strip a copy rather than touching the build.
+    stage=target/chromium-stage
+    mkdir -p "$stage"
+    if [[ ! $stage/chrome -nt $out/chrome ]]; then
+        strip -o "$stage/chrome" "$out/chrome"
+    fi
+    # `P /chrome` protects the stripped binary from this `--delete`; it
+    # has its own rsync right after. `*.info` are build-time translation
+    # manifests, not loaded at run time (70 MB of the locales dir).
+    (cd "$out" && rsync -az --delete --exclude '*.info' --filter 'P /chrome' \
+        {{chromium_files}} {{box}}:nitro-bin/chromium/)
+    rsync -az "$stage/chrome" {{box}}:nitro-bin/chromium/chrome
+    rsync -az --chmod=F755 deploy/chromium/chromium-nitro {{box}}:nitro-bin/chromium-nitro
+    # The sandbox: an AppArmor profile granting `userns` to this path,
+    # because `kernel.apparmor_restrict_unprivileged_userns=1` denies the
+    # namespace sandbox to unconfined programs. See the profile's header.
+    scp -q deploy/chromium/apparmor-chromium-nitro {{box}}:/tmp/apparmor-chromium-nitro
+    ssh {{box}} 'sudo install -m 644 /tmp/apparmor-chromium-nitro /etc/apparmor.d/chromium-nitro && sudo apparmor_parser -r /etc/apparmor.d/chromium-nitro && rm /tmp/apparmor-chromium-nitro'
+    # Chromium's own logo, as `chromium-nitro` in the user's hicolor, so
+    # the launcher row, the bar and the title bar resolve it by app id.
+    for n in 16 24 48 64 128 256; do
+        ssh {{box}} "mkdir -p ~/.local/share/icons/hicolor/${n}x${n}/apps"
+        rsync -az "$src/chrome/app/theme/chromium/product_logo_$n.png" \
+            {{box}}:.local/share/icons/hicolor/${n}x${n}/apps/chromium-nitro.png
+    done
+    # The entry goes **last**, for the reason in `deploy-bins`: a failure
+    # above leaves no launcher entry pointing at a half-installed browser.
+    rsync -az deploy/chromium/chromium-nitro.desktop {{box}}:.local/share/applications/
+    ssh {{box}} 'md5sum ~/nitro-bin/chromium/chrome'
+
 # Install/refresh the systemd unit on the box (needs sudo there).
 box-install:
     # `daemon-reload` picks up a changed unit; disabling getty@tty2 frees
