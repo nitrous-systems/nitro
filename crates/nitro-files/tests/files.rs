@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 use nitro_files::{Confirm, Editing, Files, Ids, dir, mime, names, trash};
 use nitro_ui::event::key;
 use nitro_ui::split::SidebarRow;
-use nitro_ui::test::Harness;
+use nitro_ui::test::{ClipboardPeer, Harness};
 use nitro_ui::widgets::{Button, Label, TextField};
 use nitro_ui::{List, Point, Size};
 
@@ -1822,6 +1822,62 @@ fn the_trash_row_opens_the_trash_files_directory() {
     assert!(h.widget::<SidebarRow<Files>>(trash).is_selected());
     assert_eq!(names_of(&h, ids), ["doomed.txt"]);
 
+    let _ = std::fs::remove_dir_all(&root);
+    h.quit();
+}
+
+#[test]
+fn ctrl_c_offers_the_paths_as_a_uri_list_and_text() {
+    // Another program reads what the file manager copied: a uri-list with
+    // the space percent-encoded, and the plain paths as text.
+    let (root, dir) = fixture("uri-out");
+    write(&dir.join("my note.txt"), "x");
+    let (mut h, ids) = app(&dir, &root.join("xdg"));
+    assert_eq!(names_of(&h, ids), ["my note.txt"]);
+    let mut peer = ClipboardPeer::new(&h, "peer");
+    h.key_with(key::LEFT_CTRL, key::C);
+    h.settle();
+    let path = dir.join("my note.txt");
+    let want = format!("file://{}\r\n", path.display()).replace(' ', "%20");
+    assert_eq!(
+        String::from_utf8(peer.paste(&mut h, 1, "text/uri-list")).unwrap(),
+        want
+    );
+    assert_eq!(
+        peer.paste(&mut h, 2, "text/plain;charset=utf-8"),
+        path.to_str().unwrap().as_bytes()
+    );
+    let _ = std::fs::remove_dir_all(&root);
+    h.quit();
+}
+
+#[test]
+fn ctrl_v_copies_a_uri_list_another_program_offered() {
+    let (root, dir) = fixture("uri-in");
+    let elsewhere = root.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let src = elsewhere.join("from away.txt");
+    write(&src, "pasted");
+    let (mut h, ids) = app(&dir, &root.join("xdg"));
+    assert!(names_of(&h, ids).is_empty());
+    let mut peer = ClipboardPeer::new(&h, "peer");
+    peer.copy(&mut h, &["text/uri-list", "text/plain"]);
+    h.key_with(key::LEFT_CTRL, key::V);
+    let (id, mime) = peer.asked(&mut h);
+    assert_eq!(mime, "text/uri-list");
+    let list = format!(
+        "# from a test\r\n{}\r\n",
+        nitro_files::uri::path_to_file_uri(&src)
+    );
+    peer.answer_bytes(id, list.as_bytes());
+    h.wait_for("the paste", |_| dir.join("from away.txt").exists());
+    h.settle();
+    assert_eq!(
+        std::fs::read_to_string(dir.join("from away.txt")).unwrap(),
+        "pasted"
+    );
+    assert_eq!(names_of(&h, ids), ["from away.txt"]);
+    assert!(status(&h, ids).contains("copied 1 item"));
     let _ = std::fs::remove_dir_all(&root);
     h.quit();
 }

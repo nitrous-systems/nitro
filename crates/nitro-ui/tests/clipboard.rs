@@ -5,18 +5,15 @@
 //! never reaches EOF, and the app-local fallback on a remote link.
 
 use std::os::fd::OwnedFd;
-use std::time::{Duration, Instant};
 
-use nitro_core::{Color, Rect, Size};
+use nitro_core::{Color, Size};
 use nitro_ui::build::{ContainerBuilder as _, StyleBuilder as _};
 use nitro_ui::clipboard::{PLAIN_MIME, TEXT_MIME};
 use nitro_ui::event::key;
-use nitro_ui::test::Harness;
+use nitro_ui::test::{ClipboardPeer as Peer, Harness};
 use nitro_ui::widgets::{TextField, column, panel, text_field};
 use nitro_ui::{Ui, WidgetId};
-use nitro_wire::client::Connection;
-use nitro_wire::msg::ServerMsg;
-use nitro_wire::types::{DataSource, Layer, NodeId, caps, window_flags};
+
 
 #[derive(Default)]
 struct S {
@@ -89,130 +86,6 @@ fn paste_into(h: &mut Harness<S>, id: WidgetId, want: &str) {
     ctrl(h, key::V);
     h.wait_for("the paste", |h| text(h, id) == want);
     h.settle();
-}
-
-/// A raw wire client, the other side of a transfer.
-struct Peer {
-    conn: Connection,
-    seen: Vec<ServerMsg>,
-}
-
-impl Peer {
-    fn new(h: &Harness<S>, name: &str) -> Self {
-        let mut conn = Connection::connect(h.server().wire_path(), name).expect("connect");
-        conn.client_caps(caps::DATA).unwrap();
-        conn.flush().unwrap();
-        Self {
-            conn,
-            seen: Vec::new(),
-        }
-    }
-
-    fn take<T>(
-        &mut self,
-        h: &mut Harness<S>,
-        what: &str,
-        f: impl Fn(&ServerMsg) -> bool,
-        g: impl FnOnce(ServerMsg) -> T,
-    ) -> T {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Some(i) = self.seen.iter().position(&f) {
-                return g(self.seen.remove(i));
-            }
-            assert!(Instant::now() < deadline, "no {what}; got {:?}", self.seen);
-            self.conn.flush().unwrap();
-            self.conn.poll(&mut self.seen).unwrap();
-            // The harness is on this thread: give it its turns too.
-            h.pump();
-            std::thread::sleep(Duration::from_millis(2));
-        }
-    }
-
-    /// Offer `mimes` from a short-lived focused window, then hand focus
-    /// back to the harness's window.
-    fn copy(&mut self, h: &mut Harness<S>, mimes: &[&str]) {
-        let root = NodeId(1);
-        self.conn
-            .tx()
-            .create_window_with(
-                root,
-                "peer",
-                Size::new(40.0, 30.0),
-                Layer::Normal,
-                window_flags::UNDECORATED,
-            )
-            .create_rect(NodeId(2), root, Rect::new(0.0, 0.0, 40.0, 30.0))
-            .fill_solid(NodeId(2), Color::rgb(0x40, 0x40, 0x40))
-            .commit(1)
-            .unwrap();
-        self.take(
-            h,
-            "Focus",
-            |m| matches!(m, ServerMsg::Focus(f) if f.window == root && f.focused),
-            |_| (),
-        );
-        let mimes: Vec<String> = mimes.iter().map(|s| (*s).to_owned()).collect();
-        self.conn.set_selection(&mimes).unwrap();
-        self.conn.tx().destroy_node(root).commit(2).unwrap();
-        self.conn.flush().unwrap();
-        h.wait_for("the peer's offer", |h| h.ui().clipboard_mimes() == mimes);
-        h.server().focus_window();
-        h.settle();
-        assert!(h.ui().has_keyboard_focus());
-    }
-
-    /// The next `SelectionRequest`: (server id, mime).
-    fn asked(&mut self, h: &mut Harness<S>) -> (u32, String) {
-        self.take(
-            h,
-            "SelectionRequest",
-            |m| matches!(m, ServerMsg::SelectionRequest(_)),
-            |m| match m {
-                ServerMsg::SelectionRequest(r) => (r.request, r.mime),
-                _ => unreachable!(),
-            },
-        )
-    }
-
-    fn answer(&mut self, id: u32, fd: OwnedFd) {
-        self.conn.send_selection(id, fd).unwrap();
-        self.conn.flush().unwrap();
-    }
-
-    /// Read the selection in `mime`, to EOF.
-    fn paste(&mut self, h: &mut Harness<S>, request: u32, mime: &str) -> Vec<u8> {
-        self.conn
-            .request_selection(request, DataSource::Clipboard, mime)
-            .unwrap();
-        self.conn.flush().unwrap();
-        let fd = self.take(
-            h,
-            "SelectionData",
-            |m| matches!(m, ServerMsg::SelectionData(d) if d.request == request),
-            |m| match m {
-                ServerMsg::SelectionData(d) => d.fd,
-                _ => unreachable!(),
-            },
-        );
-        let flags = rustix::fs::fcntl_getfl(&fd).unwrap();
-        rustix::fs::fcntl_setfl(&fd, flags | rustix::fs::OFlags::NONBLOCK).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut out = Vec::new();
-        let mut buf = [0u8; 4096];
-        loop {
-            match rustix::io::read(&fd, &mut buf) {
-                Ok(0) => return out,
-                Ok(n) => out.extend_from_slice(&buf[..n]),
-                Err(rustix::io::Errno::AGAIN) => {
-                    assert!(Instant::now() < deadline, "no EOF");
-                    h.pump();
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-                Err(e) => panic!("read: {e}"),
-            }
-        }
-    }
 }
 
 fn memfd(bytes: &[u8]) -> OwnedFd {
@@ -357,21 +230,7 @@ fn a_remote_app_has_an_app_local_clipboard() {
 fn set_clipboard_without_keyboard_focus_is_refused_locally() {
     let (mut h, _f) = harness("clip-unfocused");
     let mut peer = Peer::new(&h, "peer");
-    let root = NodeId(1);
-    peer.conn
-        .tx()
-        .create_window_with(
-            root,
-            "peer",
-            Size::new(40.0, 30.0),
-            Layer::Normal,
-            window_flags::UNDECORATED,
-        )
-        .create_rect(NodeId(2), root, Rect::new(0.0, 0.0, 40.0, 30.0))
-        .fill_solid(NodeId(2), Color::rgb(0x40, 0x40, 0x40))
-        .commit(1)
-        .unwrap();
-    peer.conn.flush().unwrap();
+    peer.focus(&mut h);
     h.wait_for("focus to move away", |h| !h.ui().has_keyboard_focus());
     assert!(!h.ui().set_clipboard_text("nope").unwrap());
     h.settle();

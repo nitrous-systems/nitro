@@ -1032,3 +1032,182 @@ impl<S: 'static> Harness<S> {
 pub fn until(what: &str, f: impl FnMut() -> bool) {
     wait_for(what, f);
 }
+
+/// A second client on a harness's server, speaking the clipboard
+/// protocol on the raw wire: the other side of a copy or a paste.
+pub struct ClipboardPeer {
+    conn: Connection,
+    seen: Vec<nitro_wire::msg::ServerMsg>,
+    serial: u32,
+}
+
+impl ClipboardPeer {
+    /// Connect to `h`'s server and list `DATA`.
+    ///
+    /// # Panics
+    /// If the connection fails.
+    pub fn new<S: 'static>(h: &Harness<S>, name: &str) -> Self {
+        let mut conn = Connection::connect(h.server().wire_path(), name).expect("connect");
+        conn.client_caps(nitro_wire::types::caps::DATA)
+            .expect("client caps");
+        conn.flush().expect("flush");
+        Self {
+            conn,
+            seen: Vec::new(),
+            serial: 0,
+        }
+    }
+
+    /// The raw connection.
+    pub fn conn(&mut self) -> &mut Connection {
+        &mut self.conn
+    }
+
+    fn take<S: 'static, T>(
+        &mut self,
+        h: &mut Harness<S>,
+        what: &str,
+        f: impl Fn(&nitro_wire::msg::ServerMsg) -> bool,
+        g: impl FnOnce(nitro_wire::msg::ServerMsg) -> T,
+    ) -> T {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(i) = self.seen.iter().position(&f) {
+                return g(self.seen.remove(i));
+            }
+            assert!(Instant::now() < deadline, "no {what}; got {:?}", self.seen);
+            self.conn.flush().expect("flush");
+            self.conn.poll(&mut self.seen).expect("poll");
+            // The harness is on this thread: give it its turns too.
+            h.pump();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Open a small window and wait until it holds keyboard focus.
+    /// Returns its node id.
+    ///
+    /// # Panics
+    /// On a wire failure or a timeout.
+    pub fn focus<S: 'static>(&mut self, h: &mut Harness<S>) -> nitro_wire::types::NodeId {
+        use nitro_wire::types::{Layer, NodeId, window_flags};
+        let root = NodeId(1);
+        let rect = NodeId(2);
+        self.serial += 1;
+        self.conn
+            .tx()
+            .create_window_with(
+                root,
+                "peer",
+                Size::new(40.0, 30.0),
+                Layer::Normal,
+                window_flags::UNDECORATED,
+            )
+            .create_rect(rect, root, Rect::new(0.0, 0.0, 40.0, 30.0))
+            .fill_solid(rect, nitro_core::Color::rgb(0x40, 0x40, 0x40))
+            .commit(self.serial)
+            .expect("commit");
+        self.conn.flush().expect("flush");
+        self.take(
+            h,
+            "Focus",
+            |m| matches!(m, nitro_wire::msg::ServerMsg::Focus(f) if f.window == root && f.focused),
+            |_| (),
+        );
+        root
+    }
+
+    /// Offer `mimes` from a short-lived focused window, then hand focus
+    /// back to the harness's window.
+    ///
+    /// # Panics
+    /// On a wire failure or a timeout.
+    pub fn copy<S: 'static>(&mut self, h: &mut Harness<S>, mimes: &[&str]) {
+        let root = self.focus(h);
+        let mimes: Vec<String> = mimes.iter().map(|s| (*s).to_owned()).collect();
+        self.conn.set_selection(&mimes).expect("set selection");
+        self.serial += 1;
+        self.conn
+            .tx()
+            .destroy_node(root)
+            .commit(self.serial)
+            .expect("commit");
+        self.conn.flush().expect("flush");
+        h.wait_for("the peer's offer", |h| h.ui().clipboard_mimes() == mimes);
+        h.server().focus_window();
+        h.settle();
+        assert!(h.ui().has_keyboard_focus(), "focus came back");
+    }
+
+    /// The next `SelectionRequest` the server relayed: (server id, mime).
+    ///
+    /// # Panics
+    /// On a timeout.
+    pub fn asked<S: 'static>(&mut self, h: &mut Harness<S>) -> (u32, String) {
+        self.take(
+            h,
+            "SelectionRequest",
+            |m| matches!(m, nitro_wire::msg::ServerMsg::SelectionRequest(_)),
+            |m| match m {
+                nitro_wire::msg::ServerMsg::SelectionRequest(r) => (r.request, r.mime),
+                _ => unreachable!(),
+            },
+        )
+    }
+
+    /// Answer a `SelectionRequest` with `fd`.
+    ///
+    /// # Panics
+    /// On a wire failure.
+    pub fn answer(&mut self, id: u32, fd: std::os::fd::OwnedFd) {
+        self.conn.send_selection(id, fd).expect("send selection");
+        self.conn.flush().expect("flush");
+    }
+
+    /// Answer a `SelectionRequest` with `bytes`, in a memfd.
+    ///
+    /// # Panics
+    /// On a wire failure.
+    pub fn answer_bytes(&mut self, id: u32, bytes: &[u8]) {
+        let fd = nitro_shm::memfd_sealed_readonly("peer", bytes).expect("memfd");
+        self.answer(id, fd);
+    }
+
+    /// Read the selection in `mime`, to EOF. `request` must not be one
+    /// still outstanding.
+    ///
+    /// # Panics
+    /// On a wire failure or a timeout.
+    pub fn paste<S: 'static>(&mut self, h: &mut Harness<S>, request: u32, mime: &str) -> Vec<u8> {
+        self.conn
+            .request_selection(request, nitro_wire::types::DataSource::Clipboard, mime)
+            .expect("request selection");
+        self.conn.flush().expect("flush");
+        let fd = self.take(
+            h,
+            "SelectionData",
+            |m| matches!(m, nitro_wire::msg::ServerMsg::SelectionData(d) if d.request == request),
+            |m| match m {
+                nitro_wire::msg::ServerMsg::SelectionData(d) => d.fd,
+                _ => unreachable!(),
+            },
+        );
+        let flags = rustix::fs::fcntl_getfl(&fd).expect("getfl");
+        rustix::fs::fcntl_setfl(&fd, flags | rustix::fs::OFlags::NONBLOCK).expect("setfl");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match rustix::io::read(&fd, &mut buf) {
+                Ok(0) => return out,
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(rustix::io::Errno::AGAIN) => {
+                    assert!(Instant::now() < deadline, "no EOF on the selection");
+                    h.pump();
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(e) => panic!("read: {e}"),
+            }
+        }
+    }
+}

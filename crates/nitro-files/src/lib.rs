@@ -80,10 +80,12 @@ pub mod mime;
 pub mod ops;
 pub use nitro_fs::places;
 pub mod trash;
+pub mod uri;
 
 use std::path::{Path, PathBuf};
 
 use nitro_ui::build::{ContainerBuilder as _, StyleBuilder as _};
+use nitro_ui::clipboard::{PLAIN_MIME, TEXT_MIME, URI_LIST_MIME};
 use nitro_ui::event::{Handled, KeyEvent, key, mods};
 use nitro_ui::split::{SidebarRow, sidebar_row, sidebar_section, sidebar_separator, split_view};
 use nitro_ui::widgets::{Button, Label, TextField, button, column, label, text_field};
@@ -215,10 +217,9 @@ pub struct Files {
     editing: Editing,
     /// Paths copied with `Ctrl+C`, pasted with `Ctrl+V`.
     ///
-    /// The app's own clipboard, and **only** the app's: there is no
-    /// clipboard protocol yet, so copying here cannot be pasted into
-    /// another program and a file copied in another program cannot be
-    /// pasted here. Recorded in `docs/files.md`.
+    /// Also offered on the system clipboard as `text/uri-list` and
+    /// text; this copy is what a paste falls back to when the system
+    /// clipboard has no uri-list (a remote link, an old server).
     clipboard: Vec<PathBuf>,
     /// The system MIME glob table, loaded once at start.
     ///
@@ -1487,32 +1488,63 @@ fn commit_edit(s: &mut Files, ui: &mut Ui<Files>, text: &str) {
 
 // -- copy and paste ---------------------------------------------------
 
-/// Remember the selection for a later paste.
+/// Remember the selection for a later paste, and offer it on the system
+/// clipboard as `text/uri-list` plus the paths as text.
 fn copy_selection(s: &mut Files, ui: &mut Ui<Files>) {
     let paths = selected_paths(s, ui);
     if paths.is_empty() {
         return;
     }
-    s.message = Some(match paths.len() {
-        1 => format!("copied {}", short(&paths[0])),
-        n => format!("copied {n} items"),
+    let list = uri::uri_list(&paths).into_bytes();
+    let text = uri::plain_list(&paths);
+    let offered = ui.set_clipboard(vec![
+        (URI_LIST_MIME.to_owned(), list),
+        (TEXT_MIME.to_owned(), text.clone()),
+        (PLAIN_MIME.to_owned(), text),
+    ]);
+    s.message = Some(match (offered, paths.len()) {
+        (Ok(false), _) => "copied, but not to the system clipboard (no keyboard focus)".to_owned(),
+        (Err(e), _) => format!("copied, but not to the system clipboard: {e}"),
+        (Ok(true), 1) => format!("copied {}", short(&paths[0])),
+        (Ok(true), n) => format!("copied {n} items"),
     });
     s.clipboard = paths;
     show_status(s, ui);
 }
 
-/// Copy what `Ctrl+C` remembered into the current directory.
+/// Paste into the current directory: the system clipboard's
+/// `text/uri-list` when it offers one, else what `Ctrl+C` remembered.
 fn paste(s: &mut Files, ui: &mut Ui<Files>) {
-    if s.clipboard.is_empty() {
+    if ui.clipboard_mimes().iter().any(|m| m == URI_LIST_MIME) {
+        let into = s.cwd.clone();
+        ui.read_clipboard(&[URI_LIST_MIME], move |s: &mut Files, ui, got| {
+            if s.confirm.is_some() {
+                return;
+            }
+            let paths = got
+                .map(|(_, b)| uri::parse_uri_list(&String::from_utf8_lossy(&b)))
+                .unwrap_or_default();
+            paste_paths(s, ui, &paths, &into);
+        });
+        return;
+    }
+    let paths = s.clipboard.clone();
+    let into = s.cwd.clone();
+    paste_paths(s, ui, &paths, &into);
+}
+
+/// Copy each of `paths` into `into`, then say how it went and relist.
+fn paste_paths(s: &mut Files, ui: &mut Ui<Files>, paths: &[PathBuf], into: &Path) {
+    if paths.is_empty() {
         s.message = Some("nothing to paste".to_owned());
         show_status(s, ui);
         return;
     }
     let (mut done, mut failure) = (0usize, None);
-    for src in s.clipboard.clone() {
-        match ops::copy_into(&src, &s.cwd.clone()) {
+    for src in paths {
+        match ops::copy_into(src, into) {
             Ok(_) => done += 1,
-            Err(e) => failure = Some(format!("{}: {e}", short(&src))),
+            Err(e) => failure = Some(format!("{}: {e}", short(src))),
         }
     }
     s.message = Some(match failure {
