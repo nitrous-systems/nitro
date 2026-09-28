@@ -312,21 +312,22 @@ fn window_scale_lerp() {
 /// * 2 rows, ideal 2000: A, B fit (1000, then 2000 ≤ 2000). C would make
 ///   4000 (ratio 2 vs 1), so it breaks out — but has already bumped row 0's
 ///   `full_height` from 200 to 800. Rows: 800 + 800 = 1600 tall, 2000 wide,
-///   2 columns. Scale = min((1920-16)/2000 = 0.952, (1080-64)/1600 =
-///   0.635, 0.95) = 0.635, space = 1286·1080/2073600 ≈ 0.670: better on
+///   2 columns. Scale = min((1920-16)/2000 = 0.952, (1080-24)/1600 =
+///   0.66, 0.95) = 0.66, space = 1336·1080/2073600 ≈ 0.696: better on
 ///   both counts, taken.
 /// * 3 rows, ideal 1333: A | B | C, heights 200 + 800 (C's read-ahead
-///   again) + 800 = 1800, 1 column. Scale = min(1920/2000, 952/1800 ≈
-///   0.529) — worse on both counts, so the search stops at 2 rows.
+///   again) + 800 = 1800, 1 column. Scale = min(1920/2000, 1032/1800 ≈
+///   0.573) — worse on both counts, so the search stops at 2 rows.
 ///
 /// Without the quirk, row 0 would be 200 tall, the 2-row grid 1000, and
-/// the scale the 0.95 cap (vertical 1016/1000, horizontal 0.952).
+/// the scale the 0.95 cap.
 ///
-/// With it, at 0.635: rows are 508 + 64 + 508 = 1080, so row 0 starts at
-/// y = 0 and row 1 at 572. Row 0 is 635 + 16 + 635 = 1286 wide, x =
-/// (1920-1286)/2 = 317; A and B are 635×127, bottom-aligned in a 508 px
-/// row, so y = 508 - 127 = 381 — the 381 px above them is the row height C
-/// left behind. Row 1: C is 1270×508 at x = (1920-1270)/2 = 325.
+/// With it, at 0.66: rows are 528 + 24 + 528 = 1080 (`ROW_SPACING` = 24
+/// since the caption pill went; it was 64, and 0.635, before), so row 0
+/// starts at y = 0 and row 1 at 552. Row 0 is 660 + 16 + 660 = 1336 wide,
+/// x = (1920-1336)/2 = 292; A and B are 660×132, bottom-aligned in a
+/// 528 px row, so y = 528 - 132 = 396 — the 396 px above them is the row
+/// height C left behind. Row 1: C is 1320×528 at x = (1920-1320)/2 = 300.
 #[test]
 fn read_ahead_raises_the_row_left_behind() {
     let t = [
@@ -338,13 +339,13 @@ fn read_ahead_raises_the_row_left_behind() {
     check(&t, SCREEN, &slots);
     let [a, b, c] = [0, 1, 2].map(|i| slot_of(&slots, i));
     for s in [a, b, c] {
-        assert!((s.scale - 0.635).abs() < 1e-5, "{s:?}");
+        assert!((s.scale - 0.66).abs() < 1e-5, "{s:?}");
     }
-    assert_eq!(a.pos, Point::new(317.0, 381.0), "{a:?}");
-    assert_eq!(b.pos, Point::new(968.0, 381.0), "{b:?}");
-    assert_eq!(c.pos, Point::new(325.0, 572.0), "{c:?}");
-    assert!((a.size.w - 635.0).abs() < EPS && (a.size.h - 127.0).abs() < EPS);
-    assert!((c.size.w - 1270.0).abs() < EPS && (c.size.h - 508.0).abs() < EPS);
+    assert_eq!(a.pos, Point::new(292.0, 396.0), "{a:?}");
+    assert_eq!(b.pos, Point::new(968.0, 396.0), "{b:?}");
+    assert_eq!(c.pos, Point::new(300.0, 552.0), "{c:?}");
+    assert!((a.size.w - 660.0).abs() < EPS && (a.size.h - 132.0).abs() < EPS);
+    assert!((c.size.w - 1320.0).abs() < EPS && (c.size.h - 528.0).abs() < EPS);
 }
 
 #[test]
@@ -365,4 +366,25 @@ fn the_badge_fade_eases_out_from_zero_to_exactly_one() {
     // Ease-out: ahead of linear at the midpoint (exactly 0.75 for a quad).
     let mid = badge_opacity(BADGE_FADE_NS / 2);
     assert!(mid > 0.5 && (mid - 0.75).abs() < 1e-6, "{mid}");
+}
+
+/// The launcher's search field sits in a band at the top of the work area
+/// (`nitro_wire::types::overview`); no thumbnail may reach into it,
+/// however many windows there are.
+#[test]
+fn no_thumbnail_reaches_into_the_search_band() {
+    let band = nitro_wire::types::overview::search_band() as f32;
+    // A 32 px bar on top.
+    let work = Rect::new(0.0, 32.0, SCREEN.w, SCREEN.h - 32.0);
+    let area = overview::grid_area(work);
+    assert_eq!(area.y, work.y + band);
+    for n in [1, 4, 8, 16] {
+        let thumbs = varied(n);
+        let slots = run(&thumbs, area);
+        for s in &slots {
+            // The slot is the thumbnail's top (its title bar); the hit
+            // rect starts there too and only grows downwards.
+            assert!(s.pos.y >= work.y + band, "{n} windows: {s:?} is in the band");
+        }
+    }
 }

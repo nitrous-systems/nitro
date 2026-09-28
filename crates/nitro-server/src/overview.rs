@@ -33,10 +33,9 @@
 
 use nitro_core::{Color, Point, Rect, Size, Transform};
 use nitro_scene::{
-    ClientId, Error as SceneError, Fill, IconRef, Insets, Layer, NodeKey, NodeKind, OutputId,
-    Scene, TextAlign, TextRef, WindowFlags, WindowKey, WindowState,
+    ClientId, Error as SceneError, Fill, IconRef, Layer, NodeKey, NodeKind, OutputId,
+    Scene, WindowFlags, WindowKey, WindowState,
 };
-use nitro_text::TextKey;
 
 /// The largest scale a thumbnail is ever drawn at: a thumbnail is never
 /// nearly full size. `WINDOW_PREVIEW_MAXIMUM_SCALE` in `workspace.js`.
@@ -62,20 +61,22 @@ pub const COLUMN_SPACING: f32 = 16.0;
 /// Vertical gap between two rows, logical pixels.
 ///
 /// It must hold what hangs *below* a thumbnail: 30 % of the 64 px icon
-/// (`ICON_OVERLAP = 0.7`), `ICON_TITLE_SPACING = 6` and the 32 px caption
-/// pill — 57.2 px, rounded up. GNOME 3.20's measured row gap in §3 is 73 px
-/// for the same reason.
-pub const ROW_SPACING: f32 = 64.0;
+/// (`ICON_OVERLAP = 0.7`), 19.2 px, rounded up with a little slack. The
+/// badge is the icon alone since the thumbnail shows the window's own
+/// (scaled) title bar; with the old caption pill underneath it was 64.
+/// GNOME 3.20's measured row gap in `docs/research/overview.md` §3 is
+/// 73 px because GNOME still hangs a caption there.
+pub const ROW_SPACING: f32 = 24.0;
 
 /// One window to lay out.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Thumb {
     /// Which window this slot is for; opaque to the algorithm.
     pub window: WindowKey,
-    /// The window's *content* size, i.e. what will be scaled. Not the
-    /// frame's: overview mode hides the decorations, so a thumbnail is
-    /// the client's own pixels and nothing else (`docs/wm.md` §Overview
-    /// mode).
+    /// The window's *frame* size, i.e. what will be scaled: a thumbnail
+    /// is the whole window, title bar and border included (`docs/wm.md`
+    /// §Overview mode). For an undecorated (or fullscreen) window that is
+    /// its content size.
     pub size: Size,
     /// The window's current centre, which decides row assignment (by `y`)
     /// and order within a row (by `x`).
@@ -460,20 +461,35 @@ pub const OVERVIEW_ICON: f32 = 64.0;
 /// it. GNOME's `ICON_OVERLAP`. [`ROW_SPACING`] is derived from it.
 pub const ICON_OVERLAP: f32 = 0.7;
 
-/// Gap between the icon's bottom and the caption pill. `ICON_TITLE_SPACING`.
-pub const ICON_TITLE_SPACING: f32 = 6.0;
+/// The overview's grid area: the output's work area minus the reserved
+/// search band at its top ([`nitro_wire::types::overview::search_band`]),
+/// where the launcher's search field goes. Reserved on every entry,
+/// searching or not, so the thumbnails never move when typing starts.
+#[must_use]
+pub fn grid_area(work: Rect) -> Rect {
+    #[allow(clippy::cast_precision_loss)] // a few dozen pixels
+    let band = nitro_wire::types::overview::search_band() as f32;
+    let band = band.min(work.h.max(0.0));
+    Rect::new(work.x, work.y + band, work.w, work.h - band)
+}
 
-/// The caption pill's height; its radius is half this.
-pub const CAPTION_H: f32 = 32.0;
-
-/// The widest a caption pill gets, however wide its thumbnail is.
-pub const CAPTION_MAX_W: f32 = 240.0;
-
-/// Horizontal padding inside the pill, each side.
-pub const CAPTION_PAD: f32 = 12.0;
-
-/// The caption's font size, logical pixels: the title bar's.
-pub const CAPTION_SIZE_PX: f32 = 13.0;
+/// The size a thumbnail's title is shaped at so that, drawn under the
+/// thumbnail's scale `k`, it rasterizes at a **whole** pixel size:
+/// `round(px·k) / k` (at least `1 / k`).
+///
+/// Glyphs are cached per device size (`GlyphKey` quantizes to 1/64 px),
+/// so a title drawn at `13·k` for each thumbnail's own `k` would
+/// rasterize a fresh glyph set per thumbnail. Snapped, every thumbnail
+/// shares one of a few whole sizes (4, 5, 6 … px), and re-entering the
+/// overview finds them in the atlas. `docs/wm.md` §Overview mode has the
+/// measurements.
+#[must_use]
+pub fn snapped_text_size(px: f32, k: f32) -> f32 {
+    if !(k.is_finite() && k > 0.0) {
+        return px;
+    }
+    (px * k).round().max(1.0) / k
+}
 
 /// What overview mode remembers about one thumbnail, so leaving can put
 /// the window back exactly as it was.
@@ -481,9 +497,9 @@ pub const CAPTION_SIZE_PX: f32 = 13.0;
 pub struct ThumbState {
     /// The window.
     pub window: WindowKey,
-    /// Where its content went, output-local logical pixels.
+    /// Where its frame went, output-local logical pixels.
     pub slot: Slot,
-    /// What a click selects: the slot, grown by the badge hanging below
+    /// What a click selects: the slot, grown by the icon hanging below
     /// it. Output-local logical pixels.
     pub hit: Rect,
     /// The transform of the node we overwrote: the frame root's for a
@@ -496,10 +512,8 @@ pub struct ThumbState {
     /// Whether we made a `Minimized` window's root visible, and so owe it
     /// a re-hide.
     pub unhid: bool,
-    /// The group holding the icon and caption, if one was built.
+    /// The group holding the icon, if one was built.
     pub badge: Option<NodeKey>,
-    /// The caption's shaped run, released on leave.
-    pub caption_text: Option<TextKey>,
 }
 
 /// One output's overview: the scrim plus every thumbnail's restore state.
@@ -556,34 +570,29 @@ impl Overview {
     }
 }
 
-/// A window as the layout sees it: its **content** rectangle, in its
-/// output's logical space.
+/// A window as the layout sees it: its **frame** rectangle (the content
+/// rectangle for an undecorated or fullscreen window, whose insets are
+/// zero), in its output's logical space.
 #[must_use]
 pub fn thumb_of(win: WindowKey, info: &nitro_scene::Window) -> Thumb {
-    let pos = info.content_position();
-    let size = info.size();
+    let r = info.frame_rect();
     Thumb {
         window: win,
-        size,
-        centre: Point::new(pos.x + size.w / 2.0, pos.y + size.h / 2.0),
+        size: Size::new(r.w, r.h),
+        centre: Point::new(r.x + r.w / 2.0, r.y + r.h / 2.0),
     }
 }
 
-/// The frame-root transform that puts a framed window's content exactly
-/// on `slot`: `translate(slot.pos - pos - k*inset) ∘ scale(k)`.
+/// The frame-root transform that puts a framed window's frame exactly on
+/// `slot`: `translate(slot.pos - pos) ∘ scale(k)`.
 ///
-/// `pos` is the frame's top-left, output-local. The content sits at
-/// `inset` inside the frame, so after the transform it lands at
-/// `pos + t + k*inset = slot.pos` — whole pixels, because slots are
-/// floored.
+/// `pos` is the frame's top-left, output-local; after the transform it
+/// lands on `slot.pos` — whole pixels, because slots are floored — and
+/// the content at `slot.pos + k*inset`.
 #[must_use]
-pub fn thumb_transform(pos: Point, inset: Insets, slot: &Slot) -> Transform {
+pub fn thumb_transform(pos: Point, slot: &Slot) -> Transform {
     let k = slot.scale;
-    Transform::translate(
-        slot.pos.x - pos.x - k * inset.left,
-        slot.pos.y - pos.y - k * inset.top,
-    )
-    .then(&Transform::scale(k, k))
+    Transform::translate(slot.pos.x - pos.x, slot.pos.y - pos.y).then(&Transform::scale(k, k))
 }
 
 /// Scale one window onto its slot. Returns the transform overwritten and,
@@ -608,16 +617,15 @@ pub fn apply_thumb(
     slot: &Slot,
 ) -> Result<(Transform, Option<Point>), SceneError> {
     let info = scene.window_info(win)?;
-    let (root, framed, pos, inset, output) = (
+    let (root, framed, pos, output) = (
         info.root(),
         info.is_framed(),
         info.position(),
-        info.inset(),
         info.output(),
     );
     let saved = scene.node(root)?.transform();
     if framed {
-        scene.set_transform(ClientId::SERVER, root, thumb_transform(pos, inset, slot))?;
+        scene.set_transform(ClientId::SERVER, root, thumb_transform(pos, slot))?;
         Ok((saved, None))
     } else {
         scene.place_window(win, output, slot.pos)?;
@@ -695,29 +703,24 @@ pub fn create_scrim(
     Ok(win)
 }
 
-/// What goes in one thumbnail's badge.
+/// What goes in one thumbnail's badge: the app icon, `(handle, role)` as
+/// `IconEngine` resolved it. The title is not repeated under the
+/// thumbnail — the scaled title bar shows it.
 #[derive(Debug, Clone, Copy)]
 pub struct Badge {
-    /// The app icon, `(handle, role)` as `IconEngine` resolved it.
+    /// The app icon.
     pub icon: Option<(u32, u8)>,
-    /// The shaped caption; `None` for an untitled window, which gets no
-    /// pill either.
-    pub caption: Option<TextRef>,
-    /// The pill's fill.
-    pub pill: Color,
 }
 
-/// Build one thumbnail's icon-and-caption group under `parent`, on top of
-/// its siblings.
+/// Build one thumbnail's icon group under `parent`, on top of its
+/// siblings.
 ///
 /// `origin` is the thumbnail's bottom-centre in `parent`'s coordinates
 /// and `inv_scale` undoes whatever scale `parent` is under: for a framed
 /// window the group hangs off the *scaled* frame root and is given
 /// `scale(1/k)`, so its world scale is exactly the output's and the
-/// `TextEngine`/`IconEngine` rasterize at their ordinary size — no fresh
-/// glyph set for a fractional size, which is the whole reason the title
-/// bar is hidden rather than scaled. (`GlyphKey`'s 1/64-px quantization
-/// absorbs the float error in `k * (1/k)`.)
+/// `IconEngine` rasterizes the icon at its ordinary 64 px rather than a
+/// fresh size per thumbnail.
 ///
 /// # Errors
 /// Anything the scene refuses.
@@ -732,66 +735,32 @@ pub fn build_badge(
     let group = scene.create_node(s, NodeKind::Group, parent, None)?;
     scene.set_bounds(s, group, Rect::new(origin.x, origin.y, 0.0, 0.0))?;
     scene.set_transform(s, group, Transform::scale(inv_scale, inv_scale))?;
-    let [icon_box, pill_box, text_box] = badge_rects(badge.caption.map(|c| c.size.w));
-    if let (Some((handle, role)), Some(b)) = (badge.icon, icon_box) {
+    if let Some((handle, role)) = badge.icon {
         let icon = scene.create_node(s, NodeKind::Icon, group, None)?;
-        scene.set_bounds(s, icon, b)?;
+        scene.set_bounds(s, icon, badge_rect())?;
         scene.set_icon(s, icon, Some(IconRef::new(handle, OVERVIEW_ICON, role)))?;
-    }
-    if let (Some(text), Some(pill_box), Some(text_box)) = (badge.caption, pill_box, text_box) {
-        let pill = scene.create_node(s, NodeKind::Rect, group, None)?;
-        scene.set_bounds(s, pill, pill_box)?;
-        scene.set_corner_radius(s, pill, CAPTION_H / 2.0)?;
-        scene.set_fill(s, pill, Fill::Solid(badge.pill))?;
-        let node = scene.create_node(s, NodeKind::Text, group, None)?;
-        scene.set_bounds(s, node, text_box)?;
-        scene.set_text(
-            s,
-            node,
-            Some(TextRef {
-                align: TextAlign::Center,
-                ..text
-            }),
-        )?;
     }
     Ok(group)
 }
 
-/// The badge's three boxes relative to the thumbnail's bottom-centre, in
-/// unscaled logical pixels: the icon, the pill, the text line. The pill
-/// and text are `None` without a caption; `caption_w` is its measured
-/// width.
-///
-/// Each is rounded to whole pixels, so an odd-width pill does not land on
-/// a half pixel and blur.
+/// The badge's icon box relative to the thumbnail's bottom-centre, in
+/// unscaled logical pixels: 70 % over the thumbnail, 30 % below it.
 #[must_use]
-pub fn badge_rects(caption_w: Option<f32>) -> [Option<Rect>; 3] {
-    let icon = Rect::new(
+pub fn badge_rect() -> Rect {
+    Rect::new(
         -OVERVIEW_ICON / 2.0,
         -(OVERVIEW_ICON * ICON_OVERLAP).round(),
         OVERVIEW_ICON,
         OVERVIEW_ICON,
-    );
-    let Some(w) = caption_w else {
-        return [Some(icon), None, None];
-    };
-    let pill_w = (w + 2.0 * CAPTION_PAD).ceil();
-    let pill_y = icon.y + OVERVIEW_ICON + ICON_TITLE_SPACING;
-    let pill = Rect::new(-(pill_w / 2.0).round(), pill_y, pill_w, CAPTION_H);
-    let line = (CAPTION_SIZE_PX * 1.4).round();
-    let text = Rect::new(
-        pill.x,
-        pill_y + ((CAPTION_H - line) / 2.0).round(),
-        pill_w,
-        line,
-    );
-    [Some(icon), Some(pill), Some(text)]
+    )
 }
 
-/// The widest a caption's *text* may be for a thumbnail `slot_w` wide.
+/// How far the badge hangs below a thumbnail's bottom edge: what a click
+/// there still selects.
 #[must_use]
-pub fn caption_width(slot_w: f32) -> f32 {
-    (slot_w.min(CAPTION_MAX_W) - 2.0 * CAPTION_PAD).max(0.0)
+pub fn badge_below() -> f32 {
+    let r = badge_rect();
+    r.y + r.h
 }
 
 /// How long the badges take to fade in on entry:
@@ -980,25 +949,12 @@ mod scene_tests {
         for slot in &slots {
             apply_thumb(scene, slot.window, slot).unwrap();
             let info = scene.window_info(slot.window).unwrap();
-            let (root, framed, inset, size) =
-                (info.root(), info.is_framed(), info.inset(), info.size());
-            if framed {
-                // The decorations: every child of the frame root but the
-                // content, which is what `FrameNodes::all()` names.
-                let content = scene.window_info(slot.window).unwrap().content();
-                let kids: Vec<NodeKey> = scene.node(root).unwrap().children().to_vec();
-                for k in kids.into_iter().filter(|k| *k != content) {
-                    scene.set_visible(ClientId::SERVER, k, false).unwrap();
-                }
-            }
+            let (root, framed, size) = (info.root(), info.is_framed(), info.frame_size());
+            // The decorations stay: a thumbnail is the whole frame.
             scene.set_visible(ClientId::SERVER, root, true).unwrap();
-            let badge = Badge {
-                icon: Some((0, 0)),
-                caption: None,
-                pill: Color::WHITE,
-            };
+            let badge = Badge { icon: Some((0, 0)) };
             if framed {
-                let origin = Point::new(inset.left + size.w / 2.0, inset.top + size.h);
+                let origin = Point::new(size.w / 2.0, size.h);
                 badges.push(build_badge(scene, root, origin, 1.0 / slot.scale, &badge).unwrap());
             } else {
                 let origin = Point::new(slot.pos.x + slot.size.w / 2.0, slot.pos.y + slot.size.h);
@@ -1009,23 +965,52 @@ mod scene_tests {
     }
 
     #[test]
-    fn a_thumbnail_s_content_lands_exactly_on_its_slot() {
+    fn a_thumbnail_s_frame_lands_exactly_on_its_slot() {
         let (mut scene, wins, _) = desktop();
         let (_, slots) = enter(&mut scene, &wins);
         update(&mut scene);
         assert_eq!(slots.len(), 4, "the minimized window is a thumbnail too");
         for slot in &slots {
-            // The client's own rect at (0, 0) in its content: its origin
-            // is the slot's top-left and its scale the slot's (the
-            // output's scale is 1). The rect rather than the content group,
-            // because a group's own transform applies to its children only
-            // and an undecorated window's content group *is* its root.
-            let content = scene.window_info(slot.window).unwrap().content();
-            let rect = scene.node(content).unwrap().children()[0];
+            let info = scene.window_info(slot.window).unwrap();
+            let (inset, fsize) = (info.inset(), info.frame_size());
+            // The slot is the whole frame, at the frame's aspect.
+            assert!((slot.size.w - fsize.w * slot.scale).abs() < 1e-3, "{slot:?}");
+            assert!((slot.size.h - fsize.h * slot.scale).abs() < 1e-3, "{slot:?}");
+            // The client's own rect at (0, 0) in its content lands at the
+            // slot's top-left plus the scaled inset, at the slot's scale
+            // (the output's scale is 1). The rect rather than the content
+            // group, because a group's own transform applies to its
+            // children only and an undecorated window's content group *is*
+            // its root.
+            let rect = scene.node(info.content()).unwrap().children()[0];
             let t = scene.node(rect).unwrap().world_transform();
-            assert_eq!((t.e, t.f), (slot.pos.x, slot.pos.y), "{slot:?}");
-            assert!((t.a - slot.scale).abs() < 1e-6, "{} vs {}", t.a, slot.scale);
+            let k = slot.scale;
+            assert!((t.e - (slot.pos.x + k * inset.left)).abs() < 1e-3, "{slot:?}");
+            assert!((t.f - (slot.pos.y + k * inset.top)).abs() < 1e-3, "{slot:?}");
+            assert!((t.a - k).abs() < 1e-6, "{} vs {}", t.a, k);
         }
+    }
+
+    #[test]
+    fn a_snapped_title_lands_on_a_whole_device_size() {
+        for k in [0.1, 0.23, 0.37, 0.5, 0.618, 0.95] {
+            let px = snapped_text_size(13.0, k);
+            let device = px * k;
+            assert!((device - device.round()).abs() < 1e-4, "{k}: {device}");
+            assert!((device - 13.0 * k).abs() <= 0.5 + 1e-4, "{k}: {device}");
+        }
+        assert_eq!(snapped_text_size(13.0, 0.01) * 0.01, 1.0, "never below 1 px");
+        assert_eq!(snapped_text_size(13.0, 1.0), 13.0);
+    }
+
+    #[test]
+    fn the_grid_area_leaves_the_search_band_free() {
+        let band = nitro_wire::types::overview::search_band() as f32;
+        let work = Rect::new(0.0, 32.0, 1000.0, 768.0);
+        let area = grid_area(work);
+        assert_eq!(area, Rect::new(0.0, 32.0 + band, 1000.0, 768.0 - band));
+        // A work area shorter than the band collapses, never inverts.
+        assert_eq!(grid_area(Rect::new(0.0, 0.0, 10.0, 20.0)).h, 0.0);
     }
 
     #[test]
@@ -1064,7 +1049,6 @@ mod scene_tests {
                     saved_position: None,
                     unhid: s.window == minimized,
                     badge: Some(*b),
-                    caption_text: None,
                 })
                 .collect(),
             fade_start_ns: None,
@@ -1116,7 +1100,6 @@ mod scene_tests {
                 saved_position: None,
                 unhid: false,
                 badge: Some(*b),
-                caption_text: None,
             })
             .collect();
         set_badge_opacity(&mut scene, &thumbs, 0.0);
@@ -1125,8 +1108,7 @@ mod scene_tests {
 
         // The icon's box in output coordinates: what one badge may damage,
         // plus a pixel of anti-aliasing slack.
-        let [icon, _, _] = badge_rects(None);
-        let icon = icon.unwrap();
+        let icon = badge_rect();
         let boxes: Vec<Rect> = slots
             .iter()
             .map(|s| {
@@ -1277,7 +1259,6 @@ mod scene_tests {
                     saved_position: None,
                     unhid: false,
                     badge: None,
-                    caption_text: None,
                 })
                 .collect(),
             fade_start_ns: None,
@@ -1301,17 +1282,13 @@ mod scene_tests {
 
     #[test]
     fn the_badge_hangs_thirty_percent_below_the_thumbnail() {
-        let [icon, pill, text] = badge_rects(Some(100.0));
-        let icon = icon.unwrap();
+        let icon = badge_rect();
         assert_eq!(icon.w, OVERVIEW_ICON);
         assert_eq!(
             icon.y + icon.h,
             (OVERVIEW_ICON * (1.0 - ICON_OVERLAP)).round()
         );
-        let pill = pill.unwrap();
-        assert_eq!(pill.y, icon.y + icon.h + ICON_TITLE_SPACING);
-        assert!(pill.y + pill.h <= ROW_SPACING, "fits in the row gap");
-        assert!(text.unwrap().y >= pill.y);
-        assert_eq!(badge_rects(None)[1], None, "no caption, no pill");
+        assert_eq!(badge_below(), icon.y + icon.h);
+        assert!(badge_below() <= ROW_SPACING, "fits in the row gap");
     }
 }

@@ -4406,8 +4406,7 @@ impl Server {
         if let Some(ov) = self.wm.overview_mut()
             && let Some(i) = ov.thumbs.iter().position(|t| t.window == win)
         {
-            let t = ov.thumbs.remove(i);
-            self.text.release(t.caption_text);
+            ov.thumbs.remove(i);
             self.relayout_overview();
         }
         self.drag_icons.remove(&win);
@@ -4675,7 +4674,12 @@ impl Server {
         {
             return;
         }
-        if let Some(old) = self.focus {
+        let old = self.focus;
+        // Moved before the old window's restyle: `retitle` colours the
+        // title by `self.focus`, so restyling first re-shaped the window
+        // losing focus in the *focused* colour.
+        self.focus = window;
+        if let Some(old) = old {
             self.send_to_window(old, |id| {
                 ServerMsg::Focus(msg::Focus {
                     window: id,
@@ -4684,8 +4688,6 @@ impl Server {
             });
             self.restyle(old, false);
         }
-        let old = self.focus;
-        self.focus = window;
         self.wm.set_focus(window);
         // A key held while focus moves must not keep typing into the
         // window that just got it — the classic stuck-key bug.
@@ -5290,7 +5292,7 @@ impl Server {
         let focused = self.focus == Some(win);
         let request = StyleRequest::new(
             "sans",
-            wm::theme::TITLE_SIZE_PX,
+            self.title_size_px(win),
             600,
             false,
             // No wrapping: a title bar is one line, and a title too long
@@ -7403,6 +7405,7 @@ impl Server {
         };
         let size = info.frame_size();
         let current = info.output();
+        let overlay = info.layer() == nitro_scene::Layer::Overlay;
         let named = a.output.filter(|id| self.scene.output_info(*id).is_some());
         let output = named.or(current).or_else(|| self.primary_output());
         let Some(output) = output else {
@@ -7421,7 +7424,13 @@ impl Server {
         let s = if scale > 0.0 { scale } else { 1.0 };
         let origin = self.desktop_origin(output);
         let full = Rect::new(origin.x, origin.y, rect.w as f32 / s, rect.h as f32 / s);
-        let target = shell::anchor_rect(full, size, a);
+        let target = if overlay {
+            let work = self.local_work_area(output);
+            let work = Rect::new(work.x + origin.x, work.y + origin.y, work.w, work.h);
+            shell::overlay_anchor_rect(full, work, size, a)
+        } else {
+            shell::anchor_rect(full, size, a)
+        };
         self.set_frame_rect(win, target);
         if !moved {
             return;
@@ -7467,6 +7476,7 @@ impl Server {
     ///    cadence is the reason the work area is its own message.
     fn work_area_changed(&mut self) {
         self.reflow_maximized();
+        self.reflow_overlay_anchors();
         if self.output_watchers.is_empty() {
             return;
         }
@@ -7485,6 +7495,28 @@ impl Server {
             for area in &areas {
                 client.send(&ServerMsg::OutputWorkArea(*area));
             }
+        }
+    }
+
+    /// Re-apply the anchor of every top-anchored `Overlay` window, the
+    /// ones [`shell::overlay_anchor_rect`] places against the work area:
+    /// the launcher's field follows a bar that appears, resizes or hides.
+    /// Part of duty 1 of [`Server::work_area_changed`].
+    fn reflow_overlay_anchors(&mut self) {
+        use nitro_wire::types::anchor;
+        let wins: Vec<WindowKey> = self
+            .zones
+            .anchored()
+            .filter(|(_, a)| a.edges & (anchor::TOP | anchor::BOTTOM) == anchor::TOP)
+            .map(|(w, _)| w)
+            .filter(|w| {
+                self.scene
+                    .window_info(*w)
+                    .is_ok_and(|i| i.layer() == nitro_scene::Layer::Overlay)
+            })
+            .collect();
+        for win in wins {
+            self.apply_anchor(win);
         }
     }
 
@@ -9276,7 +9308,7 @@ impl Server {
                     .map(|i| overview::thumb_of(*w, i))
             })
             .collect();
-        let area = self.local_work_area(output);
+        let area = overview::grid_area(self.local_work_area(output));
         let slots = overview::layout(&thumbs, area, size.h);
         let scrim = match overview::create_scrim(&mut self.scene, output, size) {
             Ok(w) => w,
@@ -9309,17 +9341,30 @@ impl Server {
             fade_start_ns,
             grid_hidden: false,
         });
+        // Every thumbnail keeps its title bar, scaled; its title is
+        // reshaped at a size that lands on whole device pixels, so the
+        // thumbnails share a few glyph sizes instead of one each.
+        let framed: Vec<WindowKey> = self
+            .wm
+            .overview()
+            .map(|o| o.thumbs.iter().map(|t| t.window).collect())
+            .unwrap_or_default();
+        for win in framed {
+            if self.decorations.contains_key(&win) {
+                self.retitle(win);
+            }
+        }
         // No frame affordance survives: every frame on this output is
-        // hidden or scaled, and a lit border would be drawn on nothing.
+        // scaled and inert, and a lit border would be misleading.
         self.set_resize_hint(None);
         self.set_button_hover(None);
         self.popup_seat.pointer_refresh = true;
         self.cursor_stale = true;
     }
 
-    /// Turn one window into a thumbnail on `slot`: scale it, hide its
-    /// decorations, un-hide it if minimized, badge it. `None` when the
-    /// window is gone or the scene refuses the transform.
+    /// Turn one window into a thumbnail on `slot`: scale it (frame and
+    /// all), un-hide it if minimized, badge it. `None` when the window is
+    /// gone or the scene refuses the transform.
     fn make_thumb(
         &mut self,
         slot: overview::Slot,
@@ -9327,14 +9372,13 @@ impl Server {
     ) -> Option<overview::ThumbState> {
         let win = slot.window;
         let info = self.scene.window_info(win).ok()?;
-        let (root, framed, inset, size, minimized) = (
+        let (root, framed, frame_size, minimized) = (
             info.root(),
             info.is_framed(),
-            info.inset(),
-            info.size(),
+            info.frame_size(),
             info.state() == WindowState::Minimized,
         );
-        let (title, app_id) = (info.title().to_owned(), info.app_id().to_owned());
+        let app_id = info.app_id().to_owned();
         let (saved_transform, saved_position) =
             match overview::apply_thumb(&mut self.scene, win, &slot) {
                 Ok(saved) => saved,
@@ -9343,34 +9387,26 @@ impl Server {
                     return None;
                 }
             };
-        if framed {
-            self.set_frame_visible(win, false);
-        }
         let unhid = minimized && self.scene.set_visible(ClientId::SERVER, root, true).is_ok();
-        let frame = framed.then_some((root, inset, size));
-        let (badge, caption_text) =
-            self.build_thumb_badge(&slot, &title, &app_id, frame, scrim_root);
+        let frame = framed.then_some((root, frame_size));
+        let badge = self.build_thumb_badge(&slot, &app_id, frame, scrim_root);
         let r = slot.rect();
-        let below = overview::OVERVIEW_ICON * (1.0 - overview::ICON_OVERLAP)
-            + overview::ICON_TITLE_SPACING
-            + overview::CAPTION_H;
         Some(overview::ThumbState {
             window: win,
             slot,
-            hit: Rect::new(r.x, r.y, r.w, r.h + below),
+            hit: Rect::new(r.x, r.y, r.w, r.h + overview::badge_below()),
             saved_transform,
             saved_position,
             unhid,
             badge,
-            caption_text,
         })
     }
 
-    /// One thumbnail's badge: the app icon and the caption pill, drawn
-    /// unscaled. Returns the group and the caption's text run.
+    /// One thumbnail's badge: the app icon, drawn unscaled. Returns the
+    /// group.
     ///
-    /// `frame` is the framed window's `(root, inset, content size)`: the
-    /// badge hangs off its (scaled) frame root with a counter-scale. An
+    /// `frame` is the framed window's `(root, frame size)`: the badge
+    /// hangs off its (scaled) frame root with a counter-scale. An
     /// undecorated window's root is the client's clipping content group,
     /// where a badge would be cut off at the window's edge, so its badge
     /// goes in the scrim instead, at the slot's bottom-centre — under the
@@ -9378,58 +9414,47 @@ impl Server {
     fn build_thumb_badge(
         &mut self,
         slot: &overview::Slot,
-        title: &str,
         app_id: &str,
-        frame: Option<(nitro_scene::NodeKey, nitro_scene::Insets, Size)>,
+        frame: Option<(nitro_scene::NodeKey, Size)>,
         scrim_root: Option<nitro_scene::NodeKey>,
-    ) -> (Option<nitro_scene::NodeKey>, Option<nitro_text::TextKey>) {
-        let (parent, origin, inv) = if let Some((root, inset, size)) = frame {
-            (
-                root,
-                Point::new(inset.left + size.w / 2.0, inset.top + size.h),
-                1.0 / slot.scale,
-            )
+    ) -> Option<nitro_scene::NodeKey> {
+        let (parent, origin, inv) = if let Some((root, size)) = frame {
+            (root, Point::new(size.w / 2.0, size.h), 1.0 / slot.scale)
         } else {
-            let Some(root) = scrim_root else {
-                return (None, None);
-            };
             (
-                root,
+                scrim_root?,
                 Point::new(slot.pos.x + slot.size.w / 2.0, slot.pos.y + slot.size.h),
                 1.0,
             )
         };
         let icon = self.resolve_app_icon(app_id, nitro_core::Role::Text);
-        let mut key = None;
-        let mut caption = None;
-        let request = StyleRequest::new("sans", overview::CAPTION_SIZE_PX, 400, false, 0.0, false);
-        let elided = self
-            .text
-            .elide(&request, title, overview::caption_width(slot.size.w));
-        if !elided.is_empty() {
-            let (k, shaped) = self.text.shape(ClientId::SERVER.0, &request, &elided);
-            caption = Some(nitro_scene::TextRef {
-                key: k.0,
-                size: Size::new(shaped.width, shaped.height),
-                ascent: shaped.ascent,
-                color: self.palette.get(nitro_core::Role::Text),
-                align: nitro_scene::TextAlign::Center,
-            });
-            key = Some(k);
-        }
-        let badge = overview::Badge {
-            icon,
-            caption,
-            pill: self.palette.get(nitro_core::Role::WindowBackground),
-        };
+        let badge = overview::Badge { icon };
         match overview::build_badge(&mut self.scene, parent, origin, inv, &badge) {
-            Ok(group) => (Some(group), key),
+            Ok(group) => Some(group),
             Err(e) => {
                 warn!("building a thumbnail badge: {e}");
-                self.text.release(key);
-                (None, None)
+                None
             }
         }
+    }
+
+    /// The size a framed window's title is shaped at: the title bar's
+    /// own, or — for a thumbnail — that size snapped so it rasterizes at a
+    /// whole device pixel size under the thumbnail's scale (see
+    /// [`overview::snapped_text_size`]).
+    fn title_size_px(&self, win: WindowKey) -> f32 {
+        let px = wm::theme::TITLE_SIZE_PX;
+        let Some(ov) = self.wm.overview() else {
+            return px;
+        };
+        let Some(t) = ov.thumbs.iter().find(|t| t.window == win) else {
+            return px;
+        };
+        let out = self
+            .scene
+            .output_info(ov.output)
+            .map_or(1.0, |(_, s)| if s > 0.0 { s } else { 1.0 });
+        overview::snapped_text_size(px, t.slot.scale * out)
     }
 
     /// Leave overview mode, putting every window back exactly as it was,
@@ -9447,7 +9472,6 @@ impl Server {
             overview::set_grid_visible(&mut self.scene, &ov, true);
         }
         for t in &ov.thumbs {
-            self.text.release(t.caption_text);
             let Ok(info) = self.scene.window_info(t.window) else {
                 continue;
             };
@@ -9465,11 +9489,10 @@ impl Server {
             ) {
                 warn!("restoring a thumbnail: {e}");
             }
-            // Decorations come back unless the window is fullscreen, whose
-            // are hidden anyway — asked of the state *now*, so a window
-            // that changed state in between gets what its state implies.
-            if framed && state != WindowState::Fullscreen {
-                self.set_frame_visible(t.window, true);
+            // The title goes back to the title bar's own size: the
+            // overview is taken, so `title_size_px` answers that.
+            if framed {
+                self.retitle(t.window);
             }
             // Re-hide exactly the set this overview un-hid, and only those
             // still minimized: one un-minimized meanwhile is showing.

@@ -241,6 +241,25 @@ pub fn anchor_rect(output: Rect, size: Size, anchor_to: Anchor) -> Rect {
     Rect::new(x, y, width, height)
 }
 
+/// Where an anchored **`Overlay`** window goes: [`anchor_rect`], except
+/// that an overlay anchored to the top edge and not the bottom is placed
+/// vertically against the **work area's** top instead of the output's.
+///
+/// That is the launcher's search field: it sits in overview mode's
+/// reserved band (`nitro_wire::types::overview`), which the server cuts
+/// from the top of the work area, so a bar keeps its strip above both.
+/// Horizontal placement, and every other anchor, still uses the full
+/// rectangle — a centred launcher does not jump when a bar appears.
+/// `work` is in the same (desktop) coordinates as `output`.
+#[must_use]
+pub fn overlay_anchor_rect(output: Rect, work: Rect, size: Size, anchor_to: Anchor) -> Rect {
+    let mut r = anchor_rect(output, size, anchor_to);
+    if anchor_to.edges & (anchor::TOP | anchor::BOTTOM) == anchor::TOP {
+        r.y = work.y + anchor_to.margin as f32;
+    }
+    r
+}
+
 /// One axis of [`anchor_rect`]: origin and extent, given whether the low
 /// and/or high edge is anchored.
 fn axis(origin: f32, extent: f32, size: f32, margin: f32, low: bool, high: bool) -> (f32, f32) {
@@ -649,6 +668,35 @@ mod tests {
             },
         );
         assert_eq!(r, Rect::new(1280.0, 0.0, 1920.0, 32.0));
+    }
+
+    #[test]
+    fn a_top_anchored_overlay_hangs_off_the_work_area() {
+        // A 32 px bar above: the launcher's field goes under it, in the
+        // overview's search band, and stays centred on the full width.
+        let work = Rect::new(0.0, 32.0, 1280.0, 688.0);
+        let top = Anchor {
+            edges: anchor::TOP,
+            margin: 16,
+            output: None,
+        };
+        let r = overlay_anchor_rect(screen(), work, Size::new(600.0, 400.0), top);
+        assert_eq!(r, Rect::new(340.0, 32.0 + 16.0, 600.0, 400.0));
+        // Anything else is plain `anchor_rect`: centred, or spanning.
+        let centre = Anchor { edges: 0, ..top };
+        let size = Size::new(400.0, 300.0);
+        assert_eq!(
+            overlay_anchor_rect(screen(), work, size, centre),
+            anchor_rect(screen(), size, centre)
+        );
+        let both = Anchor {
+            edges: anchor::TOP | anchor::BOTTOM,
+            ..top
+        };
+        assert_eq!(
+            overlay_anchor_rect(screen(), work, size, both),
+            anchor_rect(screen(), size, both)
+        );
     }
 
     const SUPER_L: u32 = xkbcommon::xkb::keysyms::KEY_Super_L;

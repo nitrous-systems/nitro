@@ -4710,7 +4710,8 @@ fn a_client_cannot_restart_a_drag_already_in_flight() {
 // the test hook until the triggers exist. `docs/wm.md` §Overview mode.
 
 /// Where each window's thumbnail goes: the same `overview::layout` call
-/// the server makes, over the whole output (no shell, so no zones).
+/// the server makes, over the whole output (no shell, so no zones) less
+/// the search band, with each window's frame rectangle.
 /// Returned in `wins` order.
 fn expected_slots(wins: &[Win]) -> Vec<nitro_server::overview::Slot> {
     use nitro_server::overview::{Thumb, layout};
@@ -4718,15 +4719,19 @@ fn expected_slots(wins: &[Win]) -> Vec<nitro_server::overview::Slot> {
     let thumbs: Vec<Thumb> = wins
         .iter()
         .enumerate()
-        .map(|(i, w)| Thumb {
-            window: key(i),
-            size: w.size,
-            centre: Point::new(w.pos.x + w.size.w / 2.0, w.pos.y + w.size.h / 2.0),
+        .map(|(i, w)| {
+            // A thumbnail is the whole frame, title bar included.
+            let f = w.frame(true);
+            Thumb {
+                window: key(i),
+                size: Size::new(f.w, f.h),
+                centre: Point::new(f.x + f.w / 2.0, f.y + f.h / 2.0),
+            }
         })
         .collect();
     let slots = layout(
         &thumbs,
-        Rect::new(0.0, 0.0, OUT.0 as f32, OUT.1 as f32),
+        nitro_server::overview::grid_area(Rect::new(0.0, 0.0, OUT.0 as f32, OUT.1 as f32)),
         OUT.1 as f32,
     );
     (0..wins.len())
@@ -5124,7 +5129,7 @@ fn an_empty_overview_is_just_the_scrim() {
 
 #[test]
 #[allow(clippy::many_single_char_names)] // h, a, b, x, y: as the rest of this file
-fn decorations_are_hidden_in_overview_and_the_badge_is_drawn() {
+fn a_thumbnail_keeps_its_title_bar_and_its_buttons_are_inert() {
     let mut h = Harness::start("ov-decor", OUT.0, OUT.1);
     let mut inbox = Inbox::default();
     let mut conn = h.client("ov-decor");
@@ -5136,40 +5141,63 @@ fn decorations_are_hidden_in_overview_and_the_badge_is_drawn() {
     overview(&h, true);
     let shot = h.shot();
     let slots = expected_slots(&[a, b, c]);
+    let top = slots.iter().map(|s| s.pos.y).fold(f32::MAX, f32::min);
     for s in &slots {
-        // Just above the thumbnail, where its scaled title bar would be,
-        // is the scrim over the desktop and nothing else.
+        // The thumbnail is the whole frame: its top strip is the scaled
+        // title bar, in one of the two bar colours.
+        let k = s.scale;
         let (x, _) = centre(s);
-        let y = s.pos.y - 3.0;
-        let px = rgb(shot.pixel(x as u32, y as u32));
+        let y = s.pos.y + k * wm::TITLE_H / 2.0;
+        let px = rgb(shot.pixel((s.pos.x + 4.0) as u32, y as u32));
         assert!(
-            px != to_rgb(bar(true)) && px != to_rgb(bar(false)),
-            "no title bar above {s:?}"
+            px == to_rgb(bar(true)) || px == to_rgb(bar(false)),
+            "a title bar on {s:?}: {px:06x}"
         );
-        // The badge: the icon's lower 30 % and the caption pill hang below
-        // the thumbnail, where there is otherwise only scrim.
-        let below = Rect::new(
-            x - 32.0,
-            s.pos.y + s.size.h + 2.0,
-            64.0,
-            nitro_server::overview::ROW_SPACING - 4.0,
-        );
-        let differ = crop(&shot, below)
-            .iter()
-            .zip(crop(&desktop, below))
-            .filter(|(p, d)| !dimmed(rgb(**p), rgb(*d)))
-            .count();
-        assert!(
-            differ > 50,
-            "a badge below {s:?}: {differ} non-scrim pixels"
-        );
+        // Just above a top-row thumbnail is the scrim over the desktop
+        // and nothing else (a lower row has the icon of the one above).
+        if s.pos.y > top {
+            continue;
+        }
+        let above = rgb(shot.pixel(x as u32, (s.pos.y - 3.0) as u32));
+        let under = rgb(desktop.pixel(x as u32, (s.pos.y - 3.0) as u32));
+        assert!(dimmed(above, under), "scrim above {s:?}");
     }
-    overview(&h, false);
+    // A click on a thumbnail's close button selects the window rather than
+    // closing it: the frame is scaled, not live.
+    conn.flush().unwrap();
+    let _ = conn.poll(&mut inbox.0);
+    inbox.0.clear();
+    let s = slots[0];
+    let k = s.scale;
+    let f = a.frame(true);
+    let (_, close) = wm::buttons(Rect::new(0.0, 0.0, f.w, f.h), false)[0];
+    let (x, y) = (
+        s.pos.x + k * (close.x + close.w / 2.0),
+        s.pos.y + k * (close.y + close.h / 2.0),
+    );
+    h.point_at(x, y, OUT);
+    h.settle();
+    h.button(BTN_LEFT, ButtonState::Pressed);
+    h.settle();
+    h.button(BTN_LEFT, ButtonState::Released);
+    h.settle();
+    assert_eq!(h.stat("overview"), 0, "the click selected and left");
+    await_focus(&mut conn, &mut inbox, a.root, "the selected window");
+    conn.flush().unwrap();
+    let _ = conn.poll(&mut inbox.0);
+    assert!(
+        !inbox
+            .0
+            .iter()
+            .any(|m| matches!(m, ServerMsg::Closed(c) if c.window == a.root)),
+        "the thumbnail's close button did not close it"
+    );
+    park(&mut h);
     let (x, y) = a.title_bar();
     assert_eq!(
         rgb(h.shot().pixel(x as u32, y as u32)),
-        rgb(desktop.pixel(x as u32, y as u32)),
-        "the title bars are back"
+        to_rgb(bar(true)),
+        "the title bar is back where it was"
     );
     drop(conn);
     h.quit();

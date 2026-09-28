@@ -437,6 +437,35 @@ pub mod anchor {
     pub const ALL: u8 = TOP | BOTTOM | LEFT | RIGHT;
 }
 
+/// Overview mode's reserved search band: the one source of truth the
+/// server (which keeps thumbnails out of it) and the launcher (which puts
+/// its search field in it) share, in logical pixels.
+///
+/// The band sits at the top of the output's **work area**, so a bar keeps
+/// its strip above it. Top to bottom: [`SEARCH_TOP`] of gap, the field
+/// panel of exactly [`SEARCH_FIELD_H`], then [`SEARCH_GAP`] before the
+/// first row of thumbnails. The server reserves it on every entry, typing
+/// or not, so the grid never moves when a search starts. See
+/// `docs/shell.md` §The overview.
+pub mod overview {
+    /// Gap between the work area's top edge and the search field panel.
+    /// Also the launcher's anchor margin.
+    pub const SEARCH_TOP: u32 = 16;
+    /// The search field panel's height, fixed rather than derived from the
+    /// font so the band cannot drift from what the launcher draws.
+    pub const SEARCH_FIELD_H: u32 = 56;
+    /// Gap between the field panel's bottom and the thumbnails (and the
+    /// launcher's results panel, which drops down from the field).
+    pub const SEARCH_GAP: u32 = 16;
+
+    /// The whole band: what the server takes off the work area's top
+    /// before laying thumbnails out.
+    #[must_use]
+    pub const fn search_band() -> u32 {
+        SEARCH_TOP + SEARCH_FIELD_H + SEARCH_GAP
+    }
+}
+
 tag_enum! {
     /// A named cursor shape for [`SetCursor`](crate::msg::SetCursor).
     ///

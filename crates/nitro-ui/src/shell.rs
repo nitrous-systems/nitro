@@ -42,6 +42,9 @@ pub use nitro_wire::msg::{OutputInfo, WindowInfo};
 /// the one constant it needs. Deliberately *not* the xkb mask a
 /// [`KeyEvent`](crate::KeyEvent) carries — see `Ui::bind_key`.
 pub use nitro_wire::types::mod_mask;
+/// The overview's reserved search band, shared with the server: see
+/// [`nitro_wire::types::overview`].
+pub use nitro_wire::types::overview;
 pub use nitro_wire::types::{Edge, Layer, OverviewRequest, WindowRef, WindowState};
 
 /// Which edges a surface sticks to, and how far from them.
