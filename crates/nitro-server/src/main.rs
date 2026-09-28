@@ -123,6 +123,7 @@ fn config_from_env() -> Result<Config, String> {
         // escape hatch, not a configuration surface, and the default is
         // the one that ships.
         shadow: std::env::var("NITRO_SHADOW").as_deref() != Ok("0"),
+        scroll_blit: std::env::var("NITRO_SCROLL_BLIT").as_deref() != Ok("0"),
         locked: std::env::var("NITRO_LOCKED").as_deref() == Ok("1"),
         // `NITRO_CONFIG`, else the XDG path. `None` — a service with
         // neither `$XDG_CONFIG_HOME` nor `$HOME` — means no file and no

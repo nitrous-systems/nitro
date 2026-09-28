@@ -201,6 +201,12 @@ pub struct Config {
     /// off so the two can be measured against each other on hardware; a
     /// test sets it directly, for the same reason `scales` is a field.
     pub shadow: bool,
+    /// Serve a pure-translation scroll by moving pixels already in the
+    /// shadow and rasterizing only what that cannot provide
+    /// (`frame::blit_region`). Needs `shadow`. On by default;
+    /// `NITRO_SCROLL_BLIT=0` turns it off, so the two can be compared on
+    /// hardware and a test can drive a reference server beside it.
+    pub scroll_blit: bool,
     /// Start with the session **locked** and no lock owner: nothing but the
     /// background is drawn and no window receives input until a shell
     /// client sends `Lock` (and so owns the lock), and then only its
@@ -267,6 +273,7 @@ impl Config {
             modes: HashMap::new(),
             fake_modes: Vec::new(),
             shadow: true,
+            scroll_blit: true,
             locked: false,
             config_path: None,
             icon_dirs: None,
@@ -903,6 +910,11 @@ struct Server {
     /// (`NITRO_SHADOW`). Read when an output is added; see
     /// [`frame::Shadow`].
     shadow: bool,
+    /// Whether a scroll hint may be served from the shadow
+    /// (`NITRO_SCROLL_BLIT`); see [`Config::scroll_blit`].
+    scroll_blit: bool,
+    /// Frames that took the scroll blit, for `stats`.
+    blit_frames: u64,
     /// Watches `/sys` for input devices appearing and disappearing.
     input_hotplug: Option<nitro_kms::uevent::UeventSocket>,
     /// Where `event*` devices live, for the hotplug rescan.
@@ -1307,6 +1319,8 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         config_watch,
         config_reloads: 0,
         shadow: config.shadow,
+        scroll_blit: config.scroll_blit,
+        blit_frames: 0,
         lock: if config.locked {
             lock::Lock::locked()
         } else {
@@ -2070,8 +2084,34 @@ impl Server {
                 .scene
                 .output_info(id)
                 .map_or((0, 0), |(rect, _)| (rect.x, rect.y));
+            let local = |r: &nitro_core::IRect| r.translate(-origin.0, -origin.1);
+            // A scroll hint rides along with the damage, never instead of
+            // it: an output that ignores it is exactly as correct.
+            let hint = result
+                .translations
+                .iter()
+                .find(|t| t.output == id && self.scroll_blit && output.shadow.is_some());
+            if let Some(t) = hint {
+                let mut foreign = Damage::new();
+                for r in t.foreign.rects() {
+                    foreign.add(local(r));
+                }
+                let rects: Vec<nitro_core::IRect> = damage.rects().iter().map(local).collect();
+                output.damage_scroll(
+                    &rects,
+                    frame::PendingScroll {
+                        node: t.node,
+                        moves_node: t.moves_node,
+                        delta: t.delta,
+                        clip: local(&t.clip),
+                        foreign,
+                        blocked: false,
+                    },
+                );
+                continue;
+            }
             for r in damage.rects() {
-                output.damage_content(r.translate(-origin.0, -origin.1));
+                output.damage_content(local(r));
             }
         }
         result.configures
@@ -2147,6 +2187,18 @@ impl Server {
         }
         let scene_id = self.outputs[index].scene_id;
         let cursor_state = self.cursor_state(scene_id);
+        // Spent whatever this paint does: see `OutputState::take_scroll`.
+        let scroll = self.outputs[index].take_scroll();
+        // The cursor is drawn over whatever the blit moves, so its current
+        // rect is never copied into or out of.
+        let cursor_rect = Cursor::rect_scaled(
+            cursor_state.x,
+            cursor_state.y,
+            cursor_state.shape,
+            cursor_state.scale,
+        );
+        let mut blitted = false;
+        let mut raster_moved = (frame::region_area(&region), 0);
         let (paint_us, copy_us) = {
             let mut buf = match self.backend.back_buffer(id) {
                 Ok(b) => b,
@@ -2166,20 +2218,53 @@ impl Server {
                 // same reason. (The first frame of every output takes this
                 // branch on a backend whose pitch is not `width * 4`, and
                 // is a full repaint already.)
-                if shadow.ensure(buf.width, buf.height, buf.stride) {
+                let reset = shadow.ensure(buf.width, buf.height, buf.stride);
+                if reset {
                     rasterize = vec![bounds];
                 }
-                let paint_us = frame::paint_region(
-                    &mut shadow.canvas(),
-                    &self.scene,
-                    &mut self.text,
-                    &mut self.icons,
-                    scene_id,
-                    &rasterize,
-                    (&self.cursor, cursor_state),
-                    &mut self.paint_items,
-                    &self.palette,
-                );
+                // The scroll blit: move what the shadow already holds,
+                // rasterize only the rest. Every precondition is checked in
+                // `scroll_blit_region`; any failure is the ordinary paint.
+                let blit = scroll.filter(|_| !reset && shadow.is_complete()).and_then(|s| {
+                    scroll_blit_region(&self.scene, scene_id, bounds, &rasterize, &s, cursor_rect)
+                        .map(|d| (s.delta, d))
+                });
+                let start = Instant::now();
+                let mut raster_px = frame::region_area(&rasterize);
+                let mut moved_px = 0;
+                if let Some((delta, d)) = &blit {
+                    shadow.translate_region(d, delta.0, delta.1);
+                    let rest = nitro_core::Region::from_rects(&rasterize).subtract(d);
+                    let rest = rest.rects();
+                    raster_px = frame::region_area(&rest);
+                    moved_px = d.area().cast_unsigned();
+                    frame::paint_region(
+                        &mut shadow.canvas(),
+                        &self.scene,
+                        &mut self.text,
+                        &mut self.icons,
+                        scene_id,
+                        &rest,
+                        (&self.cursor, cursor_state),
+                        &mut self.paint_items,
+                        &self.palette,
+                    );
+                } else {
+                    frame::paint_region(
+                        &mut shadow.canvas(),
+                        &self.scene,
+                        &mut self.text,
+                        &mut self.icons,
+                        scene_id,
+                        &rasterize,
+                        (&self.cursor, cursor_state),
+                        &mut self.paint_items,
+                        &self.palette,
+                    );
+                }
+                let paint_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
+                blitted = blit.is_some();
+                raster_moved = (raster_px, moved_px);
                 shadow.note_painted(&rasterize);
                 let copy_us = frame::copy_region(shadow, &mut buf, &region);
                 (paint_us, copy_us)
@@ -2218,6 +2303,11 @@ impl Server {
                 self.stats.paint_us.push(paint_us);
                 self.stats.copy_us.push(copy_us);
                 self.stats.damage_px.push(damage_px);
+                self.stats.raster_px.push(raster_moved.0);
+                self.stats.blit_px.push(raster_moved.1);
+                if blitted {
+                    self.blit_frames += 1;
+                }
                 self.outputs[index].committed();
                 true
             }
@@ -6147,6 +6237,7 @@ impl Server {
             ("defer_timeouts", self.defer.timeouts),
         ];
         self.stats.write_pairs(&mut pairs);
+        pairs.push(("blit_frames", self.blit_frames));
         self.text.write_pairs(&mut pairs);
         self.icons.write_pairs(&mut pairs);
         pairs.push(("clients", self.wire_clients.len() as u64));
@@ -9798,6 +9889,42 @@ fn report_bad_icons(client: &mut clients::WireClient, serial: u32, bad: Vec<(Nod
             }));
         }
     }
+}
+
+
+/// The pixels this paint may move rather than rasterize, when every
+/// precondition of the scroll blit holds: the hint is not blocked, the
+/// output starts at the device origin (so its local pixels are the global
+/// ones `paint_list` works in, exactly as `frame::paint_region` uses it),
+/// the scene can describe the moved subtree's cover, and the resulting
+/// region is non-empty. See [`frame::blit_region`] for the rule.
+fn scroll_blit_region(
+    scene: &Scene,
+    output: SceneOutputId,
+    bounds: nitro_core::IRect,
+    rasterize: &[nitro_core::IRect],
+    scroll: &frame::PendingScroll,
+    cursor: nitro_core::IRect,
+) -> Option<nitro_core::Region> {
+    if scroll.blocked {
+        return None;
+    }
+    let (rect, _) = scene.output_info(output)?;
+    if (rect.x, rect.y) != (0, 0) {
+        return None;
+    }
+    let (cover, above) = scene.translation_cover(output, scroll.node, scroll.moves_node, &scroll.clip)?;
+    let mut foreign: Vec<nitro_core::IRect> = scroll.foreign.rects().to_vec();
+    foreign.push(cursor);
+    frame::blit_region(
+        scroll.delta,
+        scroll.clip,
+        bounds,
+        rasterize,
+        &cover,
+        &above,
+        &nitro_core::Region::from_rects(&foreign),
+    )
 }
 
 #[cfg(test)]

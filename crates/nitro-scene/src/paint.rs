@@ -4,7 +4,7 @@
 //! two can run on different threads and the scene can be mutated again while a
 //! frame is being drawn.
 
-use nitro_core::{Color, IRect, Point, Rect, Transform};
+use nitro_core::{Color, IRect, Point, Rect, Region, Transform};
 
 use crate::{
     BufferKey, Fill, NodeKey, OutputId, Scene, WindowKey,
@@ -194,6 +194,57 @@ impl PaintItem {
     }
 }
 
+impl PaintItem {
+    /// Whether drawing this item moved by a whole device pixel is
+    /// *guaranteed* to yield the same pixels, moved — the property a
+    /// scroll blit relies on for every item it copies.
+    ///
+    /// Deliberately narrow, like [`opaque_cover`](Self::opaque_cover):
+    ///
+    /// - a rect with a solid (or no) fill, square corners and an
+    ///   axis-aligned device rect on exact pixel boundaries, whose border,
+    ///   if visible, is a whole number of device pixels wide — every edge
+    ///   the rasterizer computes coverage from is then an integer, and
+    ///   stays one when shifted;
+    /// - an image drawn 1:1, axis-aligned, onto exact pixel boundaries.
+    ///
+    /// Everything else says `false`: a gradient's ramp and a resampled
+    /// image are evaluated per pixel in floating point; text and icons are
+    /// placed from `origin + transform.e`, and `f32` addition is not
+    /// shift-invariant for a fractional glyph offset (the sum's ulp grows
+    /// with its magnitude), so a glyph could land in a different subpixel
+    /// bucket after the move.
+    #[must_use]
+    pub fn shift_exact(&self) -> bool {
+        let aligned = |size: (f32, f32)| {
+            let exact = self.transform.apply_rect(&Rect::new(0.0, 0.0, size.0, size.1));
+            self.transform.is_axis_aligned()
+                && [exact.x, exact.y, exact.w, exact.h].iter().all(|v| v.fract() == 0.0)
+        };
+        match self.kind {
+            PaintKind::Rect {
+                size,
+                fill,
+                corner_radius,
+                border,
+            } => {
+                let scale = self.transform.a.abs().max(self.transform.b.abs());
+                let border_ok =
+                    border.is_none_or(|b| !b.is_visible() || (b.width * scale).fract() == 0.0);
+                !matches!(fill, Fill::Linear { .. })
+                    && corner_radius <= 0.0
+                    && border_ok
+                    && aligned(size)
+            }
+            PaintKind::Image { size, src, .. } => {
+                let device = device_rect(&self.transform, Rect::new(0.0, 0.0, size.0, size.1));
+                aligned(size) && device.w == src.w && device.h == src.h
+            }
+            PaintKind::Text { .. } | PaintKind::Icon { .. } => false,
+        }
+    }
+}
+
 /// Where a text node's shaped block starts inside bounds `width` units wide.
 ///
 /// Vertical placement is deliberately *not* aligned: a text node's box is its
@@ -261,6 +312,68 @@ impl Scene {
             }
             self.paint_node(root, clip, out);
         }
+    }
+
+    /// What a consumer of a [`Translation`](crate::Translation) hint needs
+    /// to know about the paint list inside `clip`: `(S, A)`, both exact
+    /// and in global device pixels.
+    ///
+    /// * `S` — the union of [`PaintItem::opaque_cover`] over the
+    ///   shift-exact ([`PaintItem::shift_exact`]) items `node`'s subtree
+    ///   paints, within `clip` — `node`'s own item only if `moves_node`. Where a
+    ///   subtree item is opaque, whatever is *below* the subtree cannot
+    ///   show, so those pixels are a function of the subtree alone.
+    /// * `A` — the union of the `bounds` of every item painted *after* the
+    ///   subtree (later siblings, windows above, overlays), within `clip`.
+    ///   Where one of those is, the subtree is not all there is.
+    ///
+    /// `paint_node` is a pre-order walk, so the subtree's items are one
+    /// contiguous run of the list; anything before it is below.
+    ///
+    /// `None` when the node is dead, when the regions would exceed
+    /// [`Region::MAX_SPANS`], or when the subtree paints nothing here.
+    /// Call after [`update`](Scene::update).
+    #[must_use]
+    pub fn translation_cover(
+        &self,
+        output: OutputId,
+        node: NodeKey,
+        moves_node: bool,
+        clip: &IRect,
+    ) -> Option<(Region, Region)> {
+        self.nodes.get(node)?;
+        let mut items = Vec::new();
+        self.paint_list(output, clip, &mut items);
+        let inside = |item: &PaintItem| item.node == node || self.is_ancestor(node, item.node);
+        let first = items.iter().position(inside)?;
+        let len = items[first..].iter().take_while(|i| inside(i)).count();
+        let (run, after) = items[first..].split_at(len);
+        // Contiguity is a property of the walk; were it ever violated the
+        // answer would be unsound, so check rather than assume.
+        if after.iter().any(inside) {
+            return None;
+        }
+        // With `moves_node == false` the node's own content stayed put
+        // while its descendants moved, so it is no part of what moved.
+        let covers: Vec<IRect> = run
+            .iter()
+            .filter(|i| moves_node || i.node != node)
+            .filter_map(PaintItem::opaque_cover)
+            .map(|r| r.intersect(clip))
+            .collect();
+        // Items whose pixels are computed per pixel in floating point from
+        // device coordinates (a gradient's ramp, a resampled image) are
+        // not guaranteed to come out bit-identical when shifted by a whole
+        // pixel, so their footprint is never copied.
+        let inexact: Vec<IRect> = run
+            .iter()
+            .filter(|i| !i.shift_exact())
+            .map(|i| i.bounds.intersect(clip))
+            .collect();
+        let above: Vec<IRect> = after.iter().map(|i| i.bounds.intersect(clip)).collect();
+        let s = Region::from_rects(&covers).subtract(&Region::from_rects(&inexact));
+        let a = Region::from_rects(&above);
+        (!s.overflowed() && !a.overflowed()).then_some((s, a))
     }
 
     fn paint_node(&self, key: NodeKey, clip: &IRect, out: &mut Vec<PaintItem>) {

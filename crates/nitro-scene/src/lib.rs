@@ -111,7 +111,7 @@ pub use node::{
 };
 pub use paint::{Hit, PaintItem, PaintKind};
 pub use scene::{MAX_DEPTH, Scene, UpdateStats};
-pub use update::{DamageSink, UpdateResult};
+pub use update::{DamageSink, Translation, UpdateResult};
 pub use window::{
     Admit, ClientId, Configure, Insets, Layer, OutputId, Window, WindowFlags, WindowKey,
     WindowState,

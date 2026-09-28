@@ -200,6 +200,12 @@ pub struct FrameStats {
     pub copy_us: Window,
     /// Damaged device pixels repainted, per frame.
     pub damage_px: Window,
+    /// Device pixels actually rasterized, per frame: the rasterize region,
+    /// less whatever a scroll blit moved instead.
+    pub raster_px: Window,
+    /// Device pixels a scroll blit moved inside the shadow, per frame
+    /// (0 on every frame that did not take it).
+    pub blit_px: Window,
     /// Input-to-photon latency in microseconds.
     pub i2p_us: Window,
     /// The same samples, raw, for `samples i2p`.
@@ -218,6 +224,8 @@ impl FrameStats {
             paint_us: Window::new(PAINT_WINDOW),
             copy_us: Window::new(PAINT_WINDOW),
             damage_px: Window::new(PAINT_WINDOW),
+            raster_px: Window::new(PAINT_WINDOW),
+            blit_px: Window::new(PAINT_WINDOW),
             i2p_us: Window::new(I2P_WINDOW),
             i2p_log: SampleLog::new(),
             flip_log: SampleLog::new(),
@@ -246,6 +254,11 @@ impl FrameStats {
         out.push(("copy_us_mean", self.copy_us.mean()));
         out.push(("copy_us_max", self.copy_us.max()));
         out.push(("damage_px_mean", self.damage_px.mean()));
+        // The scroll blit's split of the frame: what was rasterized and
+        // what was moved instead. `damage_px` is unaffected by it — the
+        // copy out of the shadow is the same region either way.
+        out.push(("raster_px_mean", self.raster_px.mean()));
+        out.push(("blit_px_mean", self.blit_px.mean()));
         out.push(("i2p_min_us", self.i2p_us.min()));
         out.push(("i2p_mean_us", self.i2p_us.mean()));
         out.push(("i2p_max_us", self.i2p_us.max()));
@@ -403,6 +416,12 @@ mod tests {
         for v in [5, 7, 8] {
             s.i2p_us.push(v);
         }
+        for v in [40, 60] {
+            s.raster_px.push(v);
+        }
+        for v in [0, 160] {
+            s.blit_px.push(v);
+        }
 
         let mut out = Vec::new();
         s.write_pairs(&mut out);
@@ -416,6 +435,8 @@ mod tests {
                 ("copy_us_mean", 2),
                 ("copy_us_max", 3),
                 ("damage_px_mean", 200),
+                ("raster_px_mean", 50),
+                ("blit_px_mean", 80),
                 ("i2p_min_us", 5),
                 ("i2p_mean_us", 6),
                 ("i2p_max_us", 8),
@@ -427,7 +448,7 @@ mod tests {
     fn write_pairs_on_empty_stats_is_all_zeros() {
         let mut out = Vec::new();
         FrameStats::new().write_pairs(&mut out);
-        assert_eq!(out.len(), 10);
+        assert_eq!(out.len(), 12);
         assert!(out.iter().all(|&(_, v)| v == 0));
     }
 
@@ -435,7 +456,7 @@ mod tests {
     fn write_pairs_appends_rather_than_replaces() {
         let mut out = vec![("frames", 42)];
         FrameStats::new().write_pairs(&mut out);
-        assert_eq!(out.len(), 11);
+        assert_eq!(out.len(), 13);
         assert_eq!(out[0], ("frames", 42));
     }
 }

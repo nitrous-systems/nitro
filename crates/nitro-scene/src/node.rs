@@ -341,6 +341,16 @@ pub struct Node {
     pub(crate) world_opacity: f32,
     pub(crate) world_visible: bool,
     pub(crate) painted: bool,
+    /// `world_transform.then(transform)` at the last update: what the
+    /// children were placed with. Compared against the new one to spot a
+    /// pure translation of the subtree (see `UpdateResult::translations`).
+    pub(crate) world_child_transform: Transform,
+    /// Local `bounds` size at the last update.
+    pub(crate) last_size: (f32, f32),
+    /// The output the node's cached world state was computed for, or
+    /// `None` when it has none (never updated, or unplaced since). A
+    /// translation is only a translation of something that was on screen.
+    pub(crate) last_output: Option<crate::OutputId>,
 
     pub(crate) dirty: Dirty,
     /// Whether the node is already in the scene's dirty list.
@@ -369,6 +379,9 @@ impl Node {
             world_opacity: 1.0,
             world_visible: true,
             painted: false,
+            world_child_transform: Transform::IDENTITY,
+            last_size: (0.0, 0.0),
+            last_output: None,
             dirty: ALL_DIRTY,
             queued: false,
         }

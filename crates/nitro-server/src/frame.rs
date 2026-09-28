@@ -85,7 +85,7 @@
 
 use std::time::Duration;
 
-use nitro_core::{Color, Damage, IRect, Palette, Rect};
+use nitro_core::{Color, Damage, IRect, Palette, Rect, Region};
 use nitro_kms::{BufferMut, Image, OutputId as KmsOutputId};
 use nitro_raster::{Canvas, Image as RasterImage, PixelFormat};
 use nitro_scene::{Fill as SceneFill, OutputId, PaintItem, PaintKind, Scene};
@@ -227,6 +227,50 @@ impl Shadow {
         Canvas::new(&mut self.data, self.width, self.height, self.stride)
     }
 
+    /// Copy `shadow[p] ← shadow[p − (dx, dy)]` for every pixel `p` of
+    /// `dst`, as if from a snapshot taken before the first write.
+    ///
+    /// Snapshot semantics without a snapshot: rows are visited so that a
+    /// row is always read before anything overwrites it (bottom to top
+    /// when the content moves down, top to bottom when it moves up), and
+    /// on a purely horizontal move the spans of one row are visited so
+    /// that each is read before its neighbour's write lands on it. Each
+    /// span is one `copy_within` — a `memmove`, so a span overlapping its
+    /// own source is fine.
+    ///
+    /// Pixels outside `dst` are not touched. A destination or source
+    /// outside the shadow is clipped away (and is a caller bug).
+    pub fn translate_region(&mut self, dst: &Region, dx: i32, dy: i32) {
+        let bounds = IRect::new(0, 0, self.width.cast_signed(), self.height.cast_signed());
+        let valid = bounds.intersect(&bounds.translate(dx, dy));
+        let mut rows: Vec<(i32, i32, i32)> = Vec::new();
+        for r in dst.rects() {
+            let r = r.intersect(&valid);
+            debug_assert!(!dst.overflowed());
+            for y in r.y..r.bottom() {
+                rows.push((y, r.x, r.right()));
+            }
+        }
+        // Readers before writers: see the doc comment.
+        rows.sort_unstable_by(|a, b| {
+            let by_y = if dy > 0 { b.0.cmp(&a.0) } else { a.0.cmp(&b.0) };
+            let by_x = if dx > 0 { b.1.cmp(&a.1) } else { a.1.cmp(&b.1) };
+            by_y.then(by_x)
+        });
+        let stride = self.stride as usize;
+        let bpp = BYTES_PER_PIXEL as usize;
+        for (y, x0, x1) in rows {
+            if x1 <= x0 {
+                continue;
+            }
+            let to = y.cast_unsigned() as usize * stride + x0.cast_unsigned() as usize * bpp;
+            let from = (y - dy).cast_unsigned() as usize * stride
+                + (x0 - dx).cast_unsigned() as usize * bpp;
+            let len = (x1 - x0).cast_unsigned() as usize * bpp;
+            self.data.copy_within(from..from + len, to);
+        }
+    }
+
     /// Stream `region` into the scanout buffer.
     ///
     /// Write-only and sequential, one row per `copy_from_slice`: no byte of
@@ -328,6 +372,9 @@ pub struct OutputState {
     pub in_flight_input_ns: u64,
     /// Newest input timestamp consumed by the frame being painted.
     pub painting_input_ns: u64,
+    /// A scroll-blit hint waiting for the next paint, in output-local
+    /// pixels; see [`PendingScroll`].
+    scroll: Option<PendingScroll>,
     /// The heap buffer this output is painted into, when the shadow is
     /// enabled. `None` under `NITRO_SHADOW=0`, where paint goes straight
     /// into the scanout buffer.
@@ -371,6 +418,7 @@ impl OutputState {
             painting: Vec::new(),
             in_flight_input_ns: 0,
             painting_input_ns: 0,
+            scroll: None,
             shadow: shadow.then(|| Shadow::new(width, height)),
         }
     }
@@ -396,6 +444,7 @@ impl OutputState {
         self.damage.clear();
         self.damage.add(self.bounds());
         self.content_damage = true;
+        self.scroll = None;
     }
 
     /// Add damage from the scene: a client's pixels, a window that moved,
@@ -404,6 +453,49 @@ impl OutputState {
     pub fn damage_content(&mut self, rect: IRect) {
         self.damage.add(rect);
         self.content_damage = true;
+        if let Some(scroll) = self.scroll.as_mut() {
+            scroll.foreign.add(rect);
+        }
+    }
+
+    /// Add the damage of a scene update that carried a translation hint
+    /// for this output, and remember the hint for the next paint.
+    ///
+    /// `rects` is the update's whole damage for this output, exactly as
+    /// [`OutputState::damage_content`] would have been given it — the hint
+    /// never *replaces* damage. What the shadow holds is the last
+    /// **painted** state, not the last updated one, so damage already
+    /// waiting here becomes foreign: those pixels are stale in the shadow
+    /// and must not be copied from. A second hint before a paint blocks
+    /// the fast path for that paint — the shadow is two moves behind.
+    pub fn damage_scroll(&mut self, rects: &[IRect], hint: PendingScroll) {
+        let mut hint = hint;
+        if self.scroll.is_some() {
+            if let Some(scroll) = self.scroll.as_mut() {
+                scroll.blocked = true;
+            }
+        } else {
+            hint.foreign.add_all(&self.damage);
+            self.scroll = Some(hint);
+        }
+        for r in rects {
+            self.damage.add(*r);
+            self.content_damage = true;
+        }
+        if let Some(scroll) = self.scroll.as_mut()
+            && scroll.blocked
+        {
+            for r in rects {
+                scroll.foreign.add(*r);
+            }
+        }
+    }
+
+    /// Take the pending scroll hint, if any, for the paint about to run.
+    /// Whatever happens to that paint, the hint is spent: after it the
+    /// shadow holds the new state (moved, or repainted).
+    pub fn take_scroll(&mut self) -> Option<PendingScroll> {
+        self.scroll.take()
     }
 
     /// Add damage the server made for its own software cursor.
@@ -413,6 +505,9 @@ impl OutputState {
     /// painted is the union either way.
     pub fn damage_cursor(&mut self, rect: IRect) {
         self.damage.add(rect);
+        if let Some(scroll) = self.scroll.as_mut() {
+            scroll.foreign.add(rect);
+        }
     }
 
     /// Whether a frame painted now would put nothing new on screen but a
@@ -493,6 +588,7 @@ impl OutputState {
     pub fn committed(&mut self) {
         self.previous = self.damage.take();
         self.content_damage = false;
+        self.scroll = None;
         self.damage.clear();
         self.retry = false;
         self.in_flight = std::mem::take(&mut self.painting);
@@ -510,6 +606,9 @@ impl OutputState {
             self.damage.add(*r);
         }
         self.retry = true;
+        // The shadow already holds the moved pixels; a retry must copy
+        // them out again, never move them a second time.
+        self.scroll = None;
     }
 
     /// When the next vblank is expected, in `CLOCK_MONOTONIC` nanoseconds.
@@ -523,6 +622,68 @@ impl OutputState {
     pub fn frame_deadline_ns(&self, now_ns: u64) -> u64 {
         frame_deadline(self.last_vblank_ns, self.refresh_ns, now_ns)
     }
+}
+
+/// A scroll-blit hint as an output keeps it between the scene update that
+/// produced it and the paint that may use it: the scene's
+/// [`Translation`](nitro_scene::Translation), shifted to output-local
+/// pixels, plus everything else damaged on the output in the meantime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingScroll {
+    /// The node whose subtree moved.
+    pub node: nitro_scene::NodeKey,
+    /// Whether `node`'s own content moved too (see
+    /// [`Translation::moves_node`](nitro_scene::Translation::moves_node)).
+    pub moves_node: bool,
+    /// Device-pixel delta, new minus old.
+    pub delta: (i32, i32),
+    /// The fixed clip the moved content is confined to, output-local.
+    pub clip: IRect,
+    /// Every rect that changed for a reason other than the move, output-
+    /// local: the update's own foreign damage, damage that was already
+    /// waiting, and anything added until the paint (cursor included).
+    pub foreign: Damage,
+    /// A second hint arrived before a paint: do not use this one.
+    pub blocked: bool,
+}
+
+/// The pixels a scroll blit may copy rather than rasterize, or `None`
+/// when it may copy nothing. All regions output-local.
+///
+/// With `d` the delta, `C` the fixed clip, `R` this frame's rasterize
+/// region, `S` the moved subtree's own opaque, shift-exact cover, `A`
+/// whatever the scene paints above the subtree and `F` everything else
+/// that changed (plus the cursor):
+///
+/// ```text
+/// D = (R ∩ S ∩ (C + d) ∩ out ∩ (out + d)) \ (A ∪ F) \ ((A ∪ F) + d)
+/// ```
+///
+/// For `p ∈ D` the previous frame showed, at `p − d`, the subtree's own
+/// opaque pixel with nothing on top of it and nothing else changed there
+/// since, and the new frame shows that same pixel at `p`. So
+/// `shadow[p] ← shadow[p − d]` is exact. Over-approximating `A` or `F`
+/// only shrinks `D`; `S`, `R` and the result are exact [`Region`]s.
+#[must_use]
+pub fn blit_region(
+    delta: (i32, i32),
+    clip: IRect,
+    output: IRect,
+    rasterize: &[IRect],
+    cover: &Region,
+    above: &Region,
+    foreign: &Region,
+) -> Option<Region> {
+    let (dx, dy) = delta;
+    let fixed = Region::rect(clip.intersect(&output))
+        .intersect(&Region::rect(clip.translate(dx, dy).intersect(&output.translate(dx, dy))));
+    let busy = above.union(foreign);
+    let d = Region::from_rects(rasterize)
+        .intersect(cover)
+        .intersect(&fixed)
+        .subtract(&busy)
+        .subtract(&busy.translate(dx, dy));
+    (!d.overflowed() && !d.is_empty()).then_some(d)
 }
 
 /// Nanoseconds per frame for a mode given in millihertz. A mode with no

@@ -17,6 +17,77 @@ use crate::{
     node::{DESCEND, Dirty, NodeData},
 };
 
+/// A **hint** that one output's change in an [`update`](Scene::update)
+/// was, apart from `foreign`, a pure integral translation of one subtree.
+///
+/// Everything is in global device pixels. The normal damage is reported
+/// exactly as it would be without the hint, so a consumer that ignores it
+/// is still correct; one that honours it may copy pixels it already has
+/// instead of repainting them. What it may copy is narrower than "the
+/// subtree": see [`Scene::translation_cover`] and the server's frame
+/// module for the rule.
+///
+/// Emitted only when every one of these held for the node, `node`:
+///
+/// * its only dirt was a transform and/or bounds change — no paint,
+///   opacity, visibility, clip or structure change on it, and **nothing
+///   dirty anywhere below it**;
+/// * the linear part of the transform its children are placed with is
+///   bitwise unchanged, and the translation part moved by a whole number of
+///   device pixels from a whole-pixel origin to a whole-pixel origin (so
+///   the rasterizer's output is the same pixels, shifted);
+/// * either the node itself stayed put (`moves_node == false`, the
+///   children scroll inside it and `clip` is its own clip for them), or it
+///   moved by the same delta as its children without changing size
+///   (`moves_node == true`, and `clip` is the clip it is itself inside);
+/// * it was on this output at the previous update, and no other node on
+///   the same output qualified in the same update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Translation {
+    /// The output the subtree is on.
+    pub output: OutputId,
+    /// The node whose subtree moved.
+    pub node: NodeKey,
+    /// Whether `node`'s own content moved too, or only its descendants.
+    pub moves_node: bool,
+    /// Device-pixel delta, new minus old.
+    pub delta: (i32, i32),
+    /// The fixed clip the moved content is confined to, before and after.
+    pub clip: IRect,
+    /// Every other rect this update damaged on `output`: nodes outside the
+    /// subtree, other windows, damage banked by earlier mutations. An
+    /// over-approximation (merged), which is the safe direction.
+    pub foreign: Damage,
+}
+
+/// Transient state of the translation detection during one update.
+#[derive(Debug, Default)]
+pub(crate) struct TxState {
+    /// How many candidate subtrees the walk is currently inside (0 or 1).
+    depth: u32,
+    /// Damage emitted outside any candidate, per output.
+    foreign: Vec<(OutputId, Damage)>,
+    /// Candidates found, `foreign` not filled in yet.
+    found: Vec<Translation>,
+}
+
+impl TxState {
+    fn foreign(&mut self, id: OutputId) -> &mut Damage {
+        if let Some(i) = self.foreign.iter().position(|(o, _)| *o == id) {
+            return &mut self.foreign[i].1;
+        }
+        self.foreign.push((id, Damage::new()));
+        &mut self.foreign.last_mut().expect("just pushed").1
+    }
+}
+
+/// Dirt that rules a node out as a translation candidate.
+const NOT_TRANSLATION: Dirty = Dirty::PAINT
+    .union(Dirty::INHERIT)
+    .union(Dirty::STRUCTURE)
+    .union(Dirty::SUBTREE)
+    .union(Dirty::PARTIAL);
+
 /// Everything an [`update`](Scene::update) produced.
 ///
 /// Damage is accumulated into the caller's per-output regions (so the server
@@ -28,6 +99,8 @@ pub struct UpdateResult {
     pub configures: Vec<Configure>,
     /// Counters for the walk just performed.
     pub stats: UpdateStats,
+    /// Pure-translation hints, at most one per output. See [`Translation`].
+    pub translations: Vec<Translation>,
 }
 
 /// Per-output damage sinks handed to [`Scene::update`].
@@ -69,11 +142,6 @@ impl<'a> DamageSink<'a> {
             }
         }
     }
-
-    /// Add a rect after clipping it to `bounds` (the output's device rect).
-    fn add_clipped(&mut self, id: OutputId, rect: IRect, bounds: IRect) {
-        self.add(id, rect.intersect(&bounds));
-    }
 }
 
 /// The output a walk is emitting damage for.
@@ -105,6 +173,7 @@ impl Scene {
         // Damage remembered for a later same-size swap only lives until the
         // commit(s) it arrived with are drawn.
         self.recent.clear();
+        self.tx = TxState::default();
 
         // Damage banked by mutations whose cached bounds were about to become
         // unreachable (a destroyed node, an unplaced or restacked window).
@@ -117,7 +186,11 @@ impl Scene {
                 .iter()
                 .find(|o| o.id == id)
                 .map_or(IRect::EMPTY, |o| o.rect);
-            sink.add_clipped(id, rect, bounds);
+            let rect = rect.intersect(&bounds);
+            sink.add(id, rect);
+            if !rect.is_empty() {
+                self.tx.foreign(id).add(rect);
+            }
             self.stats.damaged_nodes += 1;
         }
         if self.pending.is_empty() {
@@ -165,9 +238,24 @@ impl Scene {
 
         let mut configures = Vec::new();
         self.drain_configures(&mut configures);
+        let tx = std::mem::take(&mut self.tx);
+        let mut translations = tx.found;
+        // Two moved subtrees on one output cannot be served by one copy.
+        let crowded: Vec<OutputId> = translations
+            .iter()
+            .filter(|t| translations.iter().filter(|u| u.output == t.output).count() > 1)
+            .map(|t| t.output)
+            .collect();
+        translations.retain(|t| !crowded.contains(&t.output));
+        for t in &mut translations {
+            if let Some((_, d)) = tx.foreign.iter().find(|(o, _)| *o == t.output) {
+                t.foreign = d.clone();
+            }
+        }
         UpdateResult {
             configures,
             stats: self.stats,
+            translations,
         }
     }
 
@@ -226,7 +314,17 @@ impl Scene {
             IRect::EMPTY
         };
 
+        let size = (node.bounds.w, node.bounds.h);
+        let candidate = if force || self.tx.depth > 0 {
+            None
+        } else {
+            self.candidate(key, dirty, target, world_transform, child_transform, clip_rect, child_clip)
+        };
+
         let node = self.node_mut_ref(key);
+        node.world_child_transform = child_transform;
+        node.last_size = size;
+        node.last_output = Some(target.id);
         node.world_transform = world_transform;
         node.world_opacity = opacity;
         node.world_visible = visible;
@@ -234,6 +332,9 @@ impl Scene {
         node.child_clip = child_clip;
         node.world_bounds = world_bounds;
         node.painted = paints;
+        if candidate.is_some() {
+            self.tx.depth += 1;
+        }
 
         // A node's own pixels changed if it moved, appeared, vanished, or was
         // repainted in place. Damaging both the old and the new rectangle is
@@ -261,37 +362,11 @@ impl Scene {
                 // `old_bounds` was clipped to whichever output the node was on
                 // last time, which need not be this one; clip both to the
                 // output actually being damaged.
-                sink.add_clipped(target.id, old_bounds, target.rect);
-                sink.add_clipped(target.id, world_bounds, target.rect);
+                self.emit(sink, target, old_bounds);
+                self.emit(sink, target, world_bounds);
                 self.stats.damaged_nodes += 1;
             } else if paints && let Some(partial) = partial {
-                // Only part of the image's buffer changed. Nothing moved, so
-                // the old and new footprints agree and the damaged texels
-                // map to one device rect each — or, where the mapping is not
-                // a plain translate or integer scale, the whole node.
-                let node = self.node_ref(key);
-                let src = match node.data {
-                    NodeData::Image(Some(image)) => Some(image.src),
-                    _ => None,
-                };
-                let size = (node.bounds.w, node.bounds.h);
-                // All or nothing: one rect needing the fallback makes the
-                // whole node the damage, which covers the rest anyway.
-                let mapped: Option<Vec<IRect>> = src.and_then(|src| {
-                    partial
-                        .rects()
-                        .iter()
-                        .map(|r| partial_device_rect(&world_transform, size, src, *r))
-                        .collect()
-                });
-                match mapped {
-                    Some(rects) => {
-                        for d in rects {
-                            sink.add_clipped(target.id, d.intersect(&world_bounds), target.rect);
-                        }
-                    }
-                    None => sink.add_clipped(target.id, world_bounds, target.rect),
-                }
+                self.emit_partial(sink, target, key, &world_transform, world_bounds, &partial);
                 self.stats.damaged_nodes += 1;
             }
         }
@@ -316,6 +391,10 @@ impl Scene {
             }
         }
         self.put_children(key, children);
+        if let Some(t) = candidate {
+            self.tx.depth -= 1;
+            self.tx.found.push(t);
+        }
 
         let node = self.node_mut_ref(key);
         node.subtree_bounds = subtree;
@@ -338,11 +417,105 @@ impl Scene {
             node.world_bounds = IRect::EMPTY;
             node.subtree_bounds = IRect::EMPTY;
             node.painted = false;
+            node.last_output = None;
             scratch.extend(node.children.iter().copied());
             self.stats.visited_nodes += 1;
         }
         scratch.clear();
         self.scratch = scratch;
+    }
+
+    /// Whether `key`, not dragged along by an ancestor and not inside
+    /// another candidate, moved its subtree rigidly this update. Reads the
+    /// *old* cached state off the node, so call before overwriting it.
+    #[allow(clippy::too_many_arguments)] // The new world state, as `visit` computed it.
+    fn candidate(
+        &self,
+        key: NodeKey,
+        dirty: Dirty,
+        target: Target,
+        world_transform: Transform,
+        child_transform: Transform,
+        clip_rect: IRect,
+        child_clip: IRect,
+    ) -> Option<Translation> {
+        let node = self.node_ref(key);
+        let size = (node.bounds.w, node.bounds.h);
+        if dirty.is_clean()
+            || dirty.any(NOT_TRANSLATION)
+            || node.last_output != Some(target.id)
+            || node.last_size.0.to_bits() != size.0.to_bits()
+            || node.last_size.1.to_bits() != size.1.to_bits()
+        {
+            return None;
+        }
+        let (moves_node, delta, clip) = translation(
+            [node.world_transform, world_transform],
+            [node.world_child_transform, child_transform],
+            [node.clip_rect, clip_rect],
+            [node.child_clip, child_clip],
+        )?;
+        Some(Translation {
+            output: target.id,
+            node: key,
+            moves_node,
+            delta,
+            clip,
+            foreign: Damage::new(),
+        })
+    }
+
+    /// Damage the device rects an image node's partially-updated buffer
+    /// texels map to.
+    fn emit_partial(
+        &mut self,
+        sink: &mut DamageSink<'_>,
+        target: Target,
+        key: NodeKey,
+        world_transform: &Transform,
+        world_bounds: IRect,
+        partial: &Damage,
+    ) {
+        // Only part of the image's buffer changed. Nothing moved, so
+        // the old and new footprints agree and the damaged texels
+        // map to one device rect each — or, where the mapping is not
+        // a plain translate or integer scale, the whole node.
+        let node = self.node_ref(key);
+        let src = match node.data {
+            NodeData::Image(Some(image)) => Some(image.src),
+            _ => None,
+        };
+        let size = (node.bounds.w, node.bounds.h);
+        // All or nothing: one rect needing the fallback makes the
+        // whole node the damage, which covers the rest anyway.
+        let mapped: Option<Vec<IRect>> = src.and_then(|src| {
+            partial
+                .rects()
+                .iter()
+                .map(|r| partial_device_rect(world_transform, size, src, *r))
+                .collect()
+        });
+        match mapped {
+            Some(rects) => {
+                for d in rects {
+                    self.emit(sink, target, d.intersect(&world_bounds));
+                }
+            }
+            None => self.emit(sink, target, world_bounds),
+        }
+    }
+
+    /// Add one rect of damage for `target`, clipped to it, and note it as
+    /// foreign unless the walk is inside a translation candidate.
+    fn emit(&mut self, sink: &mut DamageSink<'_>, target: Target, rect: IRect) {
+        let rect = rect.intersect(&target.rect);
+        if rect.is_empty() {
+            return;
+        }
+        sink.add(target.id, rect);
+        if self.tx.depth == 0 {
+            self.tx.foreign(target.id).add(rect);
+        }
     }
 
     /// Borrow a node's children out of the arena so the walk can recurse with
@@ -363,6 +536,54 @@ impl Scene {
         );
         *slot = children;
     }
+}
+
+/// Given `[old, new]` pairs of a candidate's cached world state, whether
+/// its subtree moved rigidly: `(moves_node, delta, fixed clip)`.
+fn translation(
+    transform: [Transform; 2],
+    child_transform: [Transform; 2],
+    clip_rect: [IRect; 2],
+    child_clip: [IRect; 2],
+) -> Option<(bool, (i32, i32), IRect)> {
+    let delta = integral_delta(&child_transform[0], &child_transform[1])?;
+    if delta == (0, 0) {
+        return None;
+    }
+    let (moves_node, clip) = if same_transform(&transform[0], &transform[1]) {
+        // The node stayed; its children scroll inside its own clip.
+        (child_clip[0] == child_clip[1]).then_some((false, child_clip[1]))?
+    } else {
+        // The node moved with its children, inside its parent's clip.
+        let own = integral_delta(&transform[0], &transform[1])?;
+        (own == delta && clip_rect[0] == clip_rect[1]).then_some((true, clip_rect[1]))?
+    };
+    (!clip.is_empty()).then_some((moves_node, delta, clip))
+}
+
+/// Bitwise equality: "did this change", not "are these close".
+fn same_transform(a: &Transform, b: &Transform) -> bool {
+    [a.a, a.b, a.c, a.d, a.e, a.f]
+        .iter()
+        .zip([b.a, b.b, b.c, b.d, b.e, b.f])
+        .all(|(x, y)| x.to_bits() == y.to_bits())
+}
+
+/// The whole-pixel translation taking `old` to `new`, if that is all that
+/// changed: the linear parts bitwise equal and both origins on whole
+/// device pixels (so the shift is exact in `f32` and the rasterizer draws
+/// the same pixels, moved).
+fn integral_delta(old: &Transform, new: &Transform) -> Option<(i32, i32)> {
+    let linear = |t: &Transform| [t.a, t.b, t.c, t.d].map(f32::to_bits);
+    if linear(old) != linear(new) {
+        return None;
+    }
+    // Well inside `f32`'s exact-integer range, so `v + d` is exact too.
+    let whole = |v: f32| {
+        (v.is_finite() && v.round().to_bits() == v.to_bits() && v.abs() < 8_388_608.0)
+            .then_some(v as i32)
+    };
+    Some((whole(new.e)? - whole(old.e)?, whole(new.f)? - whole(old.f)?))
 }
 
 /// Device-pixel bounding box of a local rect under a transform.

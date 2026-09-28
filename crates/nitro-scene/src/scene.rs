@@ -76,6 +76,8 @@ pub struct Scene {
     /// Windows whose size changed since the last update.
     pub(crate) resized: Vec<WindowKey>,
     pub(crate) stats: UpdateStats,
+    /// Translation detection, live only during `update`.
+    pub(crate) tx: crate::update::TxState,
 }
 
 impl Default for Scene {
@@ -108,6 +110,7 @@ impl Scene {
                 damaged_nodes: 0,
                 dirty_roots: 0,
             },
+            tx: crate::update::TxState::default(),
         }
     }
 
@@ -1765,7 +1768,7 @@ impl Scene {
         Ok(node)
     }
 
-    fn is_ancestor(&self, ancestor: NodeKey, mut node: NodeKey) -> bool {
+    pub(crate) fn is_ancestor(&self, ancestor: NodeKey, mut node: NodeKey) -> bool {
         while let Some(parent) = self.node_ref(node).parent {
             if parent == ancestor {
                 return true;
