@@ -21,7 +21,6 @@ use nitro_launcher::desktop::{Entry, Source};
 use nitro_launcher::spawn::Children;
 use nitro_launcher::{Launcher, build, names};
 use nitro_ui::event::key;
-use nitro_ui::shell::Surface;
 use nitro_ui::test::Harness;
 use nitro_ui::widgets::{Button, Label, TextField, column};
 use nitro_ui::{Size, Ui, WidgetId};
@@ -42,7 +41,7 @@ fn launcher(dirs: Vec<PathBuf>, builtins: Vec<Entry>) -> Harness<Launcher> {
             .with_dirs(dirs)
             .with_builtins(builtins)
             .with_native_only(false),
-        Surface::overlay(),
+        nitro_launcher::surface(),
         // Smaller than the real 600×400: the harness runs a 320×240
         // output, and a window bigger than the output is cropped by
         // `shot` and clicked at coordinates the server clamps. The tree
@@ -1248,25 +1247,38 @@ fn a_hidden_launcher_is_silent_while_idle() {
 }
 
 #[test]
-fn the_overlay_paints_where_the_anchor_put_it() {
-    // A centred anchor is the absence of both edges on both axes, and the
-    // launcher is the only surface in the tree that uses it. The window
-    // keeps its own size — unlike a bar, which is resized by spanning —
-    // so what this asserts is that the anchor did not silently span.
+fn the_overlay_hangs_top_centre_in_the_overview_s_search_band() {
+    // Top-centre, `SEARCH_TOP` below the work area's top (the harness has
+    // no bar, so the output's top), with the field panel exactly
+    // `SEARCH_FIELD_H` tall: the band the server keeps thumbnails out of
+    // and this field line up by construction. The window keeps its own
+    // size — a one-edge anchor does not span.
+    use nitro_ui::shell::overview::{SEARCH_FIELD_H, SEARCH_TOP};
     let (mut h, dir) = harness();
     super_tap(&mut h);
     until(&mut h, "the show", |h| h.state().is_visible());
     let size = h.ui().window_size();
     assert!(
         (size.w - 300.0).abs() < 1.0 && (size.h - 220.0).abs() < 1.0,
-        "a centred anchor does not resize: {size:?}"
+        "a top anchor does not resize: {size:?}"
     );
-    // And there really are pixels there: the panel, the field and the
-    // rows, against the theme's background.
+    let pos = h.ui().window_position();
+    let out = nitro_ui::test::OUTPUT;
+    assert_eq!(pos.y, SEARCH_TOP as f32, "{pos:?}");
+    assert_eq!(pos.x, ((out.0 as f32 - size.w) / 2.0).round(), "{pos:?}");
+    // The field's panel: the query's parent, at the window's top and
+    // exactly the band's field height.
+    let query = named(&mut h, names::QUERY).expect("the query field");
+    let panel = h.ui().parent(query).expect("the field panel");
+    let r = h.bounds(panel);
+    assert_eq!(r.y, 0.0, "{r:?}");
+    assert_eq!(r.h, SEARCH_FIELD_H as f32, "{r:?}");
+    // And there really are pixels there: the panel and the field against
+    // the theme's background.
     let bg = h.ui().theme().background.to_u32() >> 8;
     assert!(
-        h.has_ink(nitro_core::Rect::new(0.0, 0.0, size.w, size.h), bg),
-        "the overlay painted something"
+        h.has_ink(nitro_core::Rect::new(0.0, 0.0, size.w, r.h), bg),
+        "the overlay painted its field"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

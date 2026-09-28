@@ -106,6 +106,21 @@ impl Anchor {
         }
     }
 
+    /// Top edge only, centred horizontally: the launcher's search field.
+    ///
+    /// For an `Overlay` window the server measures the top edge from the
+    /// output's **work area**, not its full rectangle, so the field sits
+    /// under a bar — in overview mode's reserved search band (see
+    /// [`overview`]) — rather than over it.
+    #[must_use]
+    pub const fn top_centre() -> Self {
+        Self {
+            edges: anchor::TOP,
+            margin: 0,
+            output: 0,
+        }
+    }
+
     /// The same anchor, inset by `px` on each anchored edge.
     #[must_use]
     pub const fn margin(mut self, px: u32) -> Self {

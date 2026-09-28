@@ -115,7 +115,8 @@ pub mod search;
 pub mod spawn;
 
 use nitro_ui::build::{ContainerBuilder as _, StyleBuilder as _};
-use nitro_ui::shell::{OverviewRequest, ShellEvent, Surface, WindowInfo};
+use nitro_ui::layout::MainAlign;
+use nitro_ui::shell::{Anchor, OverviewRequest, ShellEvent, Surface, WindowInfo, overview};
 use nitro_ui::widgets::{
     Button, Label, TextField, button as button_widget, column, label, panel, scroll, text_field,
 };
@@ -178,7 +179,8 @@ const TEXT_SIZE: f32 = 16.0;
 /// Padding inside the overlay panel.
 const PAD: f32 = 12.0;
 
-/// Gap between the query field and the list.
+/// Gap between the result rows' label and the list, inside the results
+/// panel.
 const GAP: f32 = 8.0;
 
 /// Height of one result row.
@@ -672,10 +674,17 @@ pub fn build(ui: &mut Ui<Launcher>) -> WidgetId {
     // — so the window grid shows, and takes clicks, around the field.
     // The window itself keeps its size and is never rebuilt; hiding the
     // results is one `SetVisible` on `body`.
+    // The field panel is exactly `SEARCH_FIELD_H` tall, the height of the
+    // overview's reserved band that the server keeps thumbnails out of;
+    // the field is centred in it vertically.
+    #[allow(clippy::cast_precision_loss)] // small constants
     let top = ui.build(
         panel()
             .background_role(ColorRole::WindowBackground)
-            .padding(PAD)
+            .padding_xy(PAD, 0.0)
+            .main_align(MainAlign::Center)
+            .height(overview::SEARCH_FIELD_H as f32)
+            .shrink(0.0)
             .width_percent(1.0),
     );
     ui.attach(top, query).unwrap();
@@ -692,7 +701,15 @@ pub fn build(ui: &mut Ui<Launcher>) -> WidgetId {
     }
     ui.set_node_visible(body, false);
 
-    let root = ui.build(column().gap(GAP).width(WIDTH).height(HEIGHT));
+    // The results panel drops down from the field, `SEARCH_GAP` below it:
+    // where the thumbnails would start.
+    #[allow(clippy::cast_precision_loss)] // small constants
+    let root = ui.build(
+        column()
+            .gap(overview::SEARCH_GAP as f32)
+            .width(WIDTH)
+            .height(HEIGHT),
+    );
     for child in [top, body] {
         ui.attach(root, child).unwrap();
     }
@@ -1543,6 +1560,16 @@ pub fn decorate(text: &str, selected: bool) -> String {
     }
 }
 
+/// The launcher's shell surface: an overlay anchored **top-centre**,
+/// `SEARCH_TOP` below the work area's top, so the query field sits exactly
+/// in the band the overview reserves for it
+/// ([`nitro_ui::shell::overview`]). The server places a top-anchored
+/// overlay against the work area, so a bar keeps its strip above it.
+#[must_use]
+pub fn surface() -> Surface {
+    Surface::overlay().anchored(Anchor::top_centre().margin(overview::SEARCH_TOP))
+}
+
 /// Connect, open the overlay and run the loop.
 ///
 /// # Errors
@@ -1556,7 +1583,7 @@ pub fn run() -> Result<(), Error> {
         .title("nitro-launcher")
         // Only the panels paint: the grid shows around the field.
         .transparent()
-        .surface(Surface::overlay())
+        .surface(surface())
         .size(Size::new(WIDTH, HEIGHT))
         .run(Launcher::new(), build)
 }

@@ -31,7 +31,6 @@ use std::time::{Duration, Instant};
 
 use nitro_launcher::{Launcher, build};
 use nitro_ui::Size;
-use nitro_ui::shell::Surface;
 use nitro_ui::test::Harness;
 use nitro_ui::widgets::Button;
 
@@ -106,7 +105,7 @@ fn time_shows(dir: &Path, label: &str) -> (Vec<Duration>, usize) {
             .with_dirs(vec![dir.to_path_buf()])
             .with_builtins(Vec::new())
             .with_native_only(false),
-        Surface::overlay(),
+        nitro_launcher::surface(),
         Some(Size::new(300.0, 220.0)),
         build,
     );
