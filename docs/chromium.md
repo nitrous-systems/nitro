@@ -189,6 +189,73 @@ CPU is the utime+stime jiffies of the whole chrome tree over the run. There are 
 **It does not use 120 Hz.** At 120 Hz Chromium still delivers about 61 fps; the frame interval p50 stays at exactly 16.7 ms. The cause is the server paint of the full 1.1 Mpx damage every frame, at about 11 ms per frame. That is already above the 8.3 ms budget before Chromium's own raster runs on the other core. The two processes together use about 130 % of the 2 cores.
 
 ### Next levers (in order of expected payoff)
-1. **Server paint cost per px: #3877.** Honouring `BufferDamage` on swap (#3833) was already in the tested build; the damage is still the whole window because the content moves. A scroll-blit hint would not help much: nitro's existing scroll blit (#3780, `docs/bench.md` §7.5) does not apply to scrolling inside one buffer, and a blit costs about what a copy costs. The suspected cause of the ~10 ns/px is the AR24 straight-alpha blend; #3877 tries an opaque region plus a SWAR blend.
+1. **Server paint cost per px: done in #3877**, see §Paint cost below. With the SWAR blend plus `SetOpaqueRegion`, paint is ~1.8 ns/px and 120 Hz holds.
 2. **Chromium side:** check `--num-raster-threads=1` against the default on 2 cores, and test a smaller window/tile size. An out-of-process GPU (option B/C above) would not help CPU on a 2-core box.
 3. **Launcher:** `NATIVE_PROGRAMS` is a hardcoded list. A `X-Nitro-Native=true` key in `.desktop` would stop each foreign nitro client from needing a launcher change.
+
+## Paint cost (#3877)
+
+**Cause, confirmed:** the main browser window's canvas is `AR24`
+(`nitro: canvas widget=1 format=AR24` in the log), because the frame is
+always `kTranslucent` on Linux. So nitro blended all 1.1 Mpx of every
+scroll frame with the per-pixel straight-alpha loop, and it painted the
+background under the window as well, since an alpha image cannot occlude.
+
+**What changed:**
+- **B (server):** `nitro-raster` SWAR straight-alpha blit: 2 px per `u64`,
+  with 255/255 → copy and 0/0 → skip. It is bit-exact. See `docs/bench.md`
+  §7.10c.
+- **A (wire + server + backend):** `SetOpaqueRegion` (`0x030c`, cap bit 15
+  `OPAQUE_REGION`, `docs/wire.md`).
+  - `NitroWindow::SetOpaqueRegion` stores Chromium's region, and
+    `PresentFrame` sends it before the next `Commit`, so it is atomic with
+    the pixels.
+  - Chromium calls it for the CSD frame via
+    `BrowserDesktopWindowTreeHostLinux` (`GetRestoredOpaqueRegion`). On the
+    box it sent 2 rects for a ~1185×1000 window (first `8,0 1169x8`): the
+    top strip between the rounded corners, and the body.
+  - The server paints the region with the opaque copy, and only the
+    corners and the shadow ring with the blend. The region also occludes
+    what lies under it.
+  - The server falls back to a full blend whenever the item is not 1:1,
+    pixel-aligned and at opacity 1 (overview thumbnails, scaled windows).
+- **Knobs (debug/bench only):**
+  - `NITRO_FORCE_OPAQUE=1` makes toplevels `XR24`. This loses the corner
+    transparency and the shadow.
+  - `NITRO_NO_OPAQUE_REGION=1` leaves the cap out of `ClientCaps`, which
+    gives the "B only" arm.
+- **Unpremultiply:** not skipped. It is already a load plus a branch per
+  pixel at a == 255, and the chrome-side CPU did not move measurably.
+
+**Box numbers:** `deploy/scroll-bench.py` on a 1500-row page, window about
+1180×1000, 1.10 Mpx damage per frame, 2 runs per arm. CPU is utime+stime
+over the run, as a percentage of one core (2 cores in total).
+
+| arm | fps | frame interval p50/p95/max ms | i2p p50/p95/max ms | paint mean | ns/px | chrome CPU | server CPU |
+|---|---|---|---|---|---|---|---|
+| baseline 60 Hz | 58.0–59.6 | 16.7/16.7–33.3/33–50 | 25.5–25.7/33.0–35.4/47–53 | 10.6–11.1 ms | 9.6–10.1 | 51 % | 61–62 % |
+| D forced-opaque 60 Hz | 61.6–62.1 | 16.7/16.7/16.7 | 25.1–25.2/32.4–32.5/33 | 2.2–2.4 ms | 2.0–2.1 | 53–55 % | 21 % |
+| B only 60 Hz | 61.6 | 16.7/16.7/16.7 | 25.3–25.4/32.2–32.6/33 | 5.4–5.5 ms | 4.9–5.0 | 57–58 % | 38 % |
+| **B+A 60 Hz** | 61.6–61.9 | 16.7/16.7/16.7 | 24.8–24.9/32.1–32.4/33 | **2.0 ms** | **1.8** | 58–61 % | **20 %** |
+| baseline 120 Hz | 60.4–61.0 | 16.7/16.7/25–33 | 25.7–26.0/32.6–32.8/41–50 | 10.8 ms | 9.8 | 65 % | 63–64 % |
+| D forced-opaque 120 Hz | 122.2–122.6 | 8.3/8.3/8.3–16.7 | 13.0–13.1/16.7–16.8/17–23 | 1.9–2.4 ms | 1.7–2.2 | 78–82 % | 38–40 % |
+| B only 120 Hz | 71.0–75.4 | 16.7/16.7/16.7 | 22.0–23.1/31.2–31.3/33 | 5.9 ms | 5.3–5.4 | 91 % | 45–46 % |
+| **B+A 120 Hz** | **120.6** | **8.3/8.3/16.7** | **13.0–13.2/16.9–17.1/25–27** | **1.9–2.3 ms** | **1.7–2.1** | 87–92 % | 41–42 % |
+
+**Verdict: 120 Hz is now sustained.** Scrolling runs at 120.6 fps, with an
+8.3 ms p50/p95 frame interval and i2p p50 halved (26 → 13 ms). That
+matches the forced-opaque upper bound while keeping the rounded corners
+and the shadow. B alone halves paint but does not reach 120 Hz: the
+leftover is the background painted under the window, which only A's
+occlusion removes. At 120 Hz Chrome now uses about 90 % of a core, which
+leaves about 70 % of the two cores free.
+
+**Visual check (B+A, box):**
+- The CSD corners are rounded, with no black or garbage pixels.
+- The right-click context menu still renders with rounded corners and a
+  shadow over the page. It is `AR24` with no region, so it takes the blend.
+
+**Bench gotcha:** after a chrome restart the pointer has to leave and
+re-enter the window, or wheel events do nothing (0 frames). Inject
+`motion` elsewhere and back before `scroll-bench.py`.
+

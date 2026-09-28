@@ -266,8 +266,9 @@ containing the transaction reached the screen.
 | 12 | `KEYMAP` | the server sends the xkb `Keymap` and `Modifiers` (M5-A) |
 | 13 | `RELEASE` | the server sends `BufferReleased` (M5-A) |
 | 14 | `DATA` | clipboard **and** drag-and-drop; see [Data transfer](#data-transfer-caps-data) (M5-A) |
+| 15 | `OPAQUE_REGION` | `SetOpaqueRegion` — a client may declare an image's opaque pixels (#3877) |
 
-Bits 8–14 together are `caps::CAPS_M5_MASK`, the range
+Bits 8–15 together are `caps::CAPS_M5_MASK`, the range
 [`ClientCaps`](#capability-opt-in-clientcaps) governs.
 
 `DATA` is **one** bit for two features because they are one mechanism: the
@@ -289,6 +290,12 @@ change. Until each of the rest lands, the server does not advertise its
 bit and refuses its client ops with `Error { Protocol }` — which is the
 correct answer rather than a stub, because no conformant client sends one
 without the bit.
+
+`OPAQUE_REGION` (bit 15, #3877) is advertised on every link, remote
+included (harmless there: a remote link has no images to mark). It
+carries no server→client message, but it sits inside `CAPS_M5_MASK` and
+follows rule 3 like `CURSOR`: a `SetOpaqueRegion` from a client that did
+not list it in `ClientCaps` is `Error { Protocol }`.
 
 `SHELL` is bit 5, not bit 3: bit 3 is `REMOTE` and was taken in M1. It is
 *reported*, never negotiated — a client cannot ask for it. See
@@ -570,6 +577,7 @@ Assigned in blocks of 0x100 so a block can grow without renumbering.
 | `0x0309` | `AcceptDrop` | data transfer (see `DATA`) |
 | `0x030a` | `FinishDrag` | data transfer (see `DATA`) |
 | `0x030b` | `SetDragIconOffset` | data transfer (see `DATA`) |
+| `0x030c` | `SetOpaqueRegion` | buffers (needs `OPAQUE_REGION`) |
 | `0x0401` | `SetLayer` | shell (see `SHELL`) |
 | `0x0402` | `SetExclusiveZone` | shell (see `SHELL`) |
 | `0x0403` | `SetAnchor` | shell (see `SHELL`) |
@@ -1549,6 +1557,40 @@ from `OSExchangeData::GetDragImageOffset()` (image origin → cursor), and
 `UpdateDragImage(image, offset)` changes it mid-drag. The backend sends
 `-GetDragImageOffset()` for both, as the Wayland backend passes it to
 `wl_surface_offset`.
+
+### `SetOpaqueRegion` — 0x030c
+
+| field | type | meaning |
+|---|---|---|
+| `id` | `u32` (`NodeId`) | an `Image` node of the sender's |
+| `rects` | `vec<IRect>` | opaque rectangles, **buffer pixel coordinates** |
+
+The client promises every pixel of the node's buffer inside `rects` has
+alpha 255. The server may then ignore the source alpha there: it copies
+those pixels instead of blending them, and treats what lies under them as
+occluded. Only the rest of the image goes through the straight-alpha
+blend. This is Wayland's `wl_surface.set_opaque_region`, in buffer
+coordinates like [`BufferDamage`](#bufferdamage--0x0303) and `SetImage.src`.
+
+* **Replaced** by each call; an empty list clears it.
+* **Buffered to the commit**, like every scene mutation, so it lands with
+  the pixels it describes.
+* **Persists** across `SetImage` buffer swaps (it belongs to the node,
+  not to a buffer).
+* A lie is the client's problem, not an error: inside the region the
+  colour channels show unblended.
+* The server uses it only where it is exact — an `AR24` buffer drawn 1:1,
+  pixel-aligned, at opacity 1. Scaled (an overview thumbnail), sub-pixel
+  or translucent drawing blends every pixel as before. For `XR24` it is
+  meaningless: the buffer is opaque already.
+* Requires `OPAQUE_REGION` listed in `ClientCaps` (`Error { Protocol }`
+  otherwise); a node that is not an `Image` is `Error { WrongKind }`.
+
+**Why:** Chromium's browser frame is always translucent on Linux (rounded
+CSD corners and a shadow), so the whole window is `AR24`, and blending
+1.1 Mpx per scroll frame cost ~10 ns/px on the test box. With the region
+the interior is a copy: ~1.8 ns/px, and 120 Hz holds (`docs/chromium.md`
+§Paint cost).
 
 ## Messages, server → client
 
@@ -3195,6 +3237,12 @@ to.
   serials it expects forwarded. The backend drops them. Nothing upstream
   inspects what it does with them.
 
+* `SetOpaqueRegion` (`0x030c`) joins the buffers block under a new
+  capability bit, `OPAQUE_REGION` (bit 15), which also joins
+  `CAPS_M5_MASK` (now `0xff00`) (#3877). An older server neither
+  advertises the bit nor knows the op, so a client that checks the bit
+  never sends it there. `VERSION` stays **1**; its golden bytes are in
+  `payload_layouts_are_frozen`.
 * `SetDragIconOffset` (`0x030b`) joins the data block, for a drag icon's
   hotspot (#3851). It is a new op behind the existing `DATA` bit, so a
   client sends it only after seeing `DATA`, and an older server refuses

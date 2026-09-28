@@ -1784,6 +1784,46 @@ the 60 Hz arm's fullscreen and `1280x720` the 240 Hz arm's.
 | balls-nodes n=32 640x480 | 59.8 | 60.0 | 32.0 | 1754.9 | 55.7 | 1207.0/1370.0 | 79.0 | 61003 | 920 | 0 | ok |
 | balls-nodes n=32 1920x1080 | 59.8 | 60.0 | 32.0 | 6100.3 | 83.6 | 3778.0/4447.0 | 1019.0 | 835574 | 920 | 0 | ok |
 
+### 7.10c The straight-alpha 1:1 blit, SWAR (#3877)
+
+Chromium on nitro sends its browser window as `AR24`: the frame is always
+translucent on Linux, for the rounded CSD corners and the shadow. So every
+scroll frame, all 1.1 Mpx of the window went through `blit_1to1`'s per-pixel
+`over_straight` loop, and the box measured **~10 ns/px** where §7.10b.2
+puts nitro's opaque paths at 0.8–2.6.
+
+`blend_straight_row` (`crates/nitro-raster/src/paint.rs`) now does two
+pixels per `u64`:
+
+- a masked copy when both alphas are 255;
+- nothing when both are 0;
+- otherwise a lane-split SWAR blend, **bit-identical** to `over_straight`
+  (the test is exhaustive over both alphas).
+
+The raster bench has two new scenes, each one 1180×1000 1:1 AR24 blit:
+`j` is mostly opaque (a 10 px alpha ramp and transparent corners), and `k`
+has every pixel partial.
+
+| scene | dev box before → after | test box after |
+|---|---|---|
+| `j argb_1to1_opq` | 3.71 → **0.53 ms** (3.1 → 0.45 ns/px) | 1.80 ms (1.5 ns/px) |
+| `k argb_1to1_mix` | 3.72 → **2.78 ms** (3.2 → 2.4 ns/px) | 4.03 ms (3.4 ns/px) |
+
+In the real Chromium scroll on the box (`deploy/scroll-bench.py`, 1.10 Mpx
+damage per frame), server paint went from 10.6 ms (9.6–10.1 ns/px) to
+**5.4–5.9 ms** (4.9–5.4 ns/px) with the SWAR blend alone.
+
+The remaining ~5 ns/px was not the blend. The frame also painted the
+background under the window, because an alpha image cannot occlude. The
+wire's `SetOpaqueRegion` (#3877, `docs/wire.md`) fixes both halves:
+
+- the declared-opaque interior is painted with the XR24 copy;
+- the scene treats that interior as occluding.
+
+Paint drops to **1.9–2.3 ms (1.7–2.1 ns/px)**, the same as forcing the
+window to XR24, and **120 Hz holds**. `docs/chromium.md` §Paint cost has
+the full matrix.
+
 ## 8. The `flip rise` column, and a lesson about instruments
 
 `flip_interval_max_us` is the server's **cumulative, all-time maximum**
