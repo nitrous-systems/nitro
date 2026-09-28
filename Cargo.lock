@@ -182,6 +182,7 @@ name = "nitro-bar"
 version = "0.0.1"
 dependencies = [
  "nitro-core",
+ "nitro-system",
  "nitro-ui",
  "nitro-wire",
  "rustix",
