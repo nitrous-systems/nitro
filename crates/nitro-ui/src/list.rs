@@ -982,8 +982,13 @@ impl<S: 'static> Widget<S> for List<S> {
 
     fn event(&mut self, cx: &mut EventCx<'_, S>, ev: &Event) -> Handled {
         match ev {
-            Event::Scroll { dy, .. } => {
-                let to = self.offset - dy * self.speed * self.row_h;
+            Event::Scroll { dy, source, .. } => {
+                // Positive is down, as on the wire. A wheel steps by
+                // `speed` rows a notch; a touchpad moves by its pixels.
+                let to = match crate::event::notches(*dy, *source) {
+                    Some(n) => self.offset + n * self.speed * self.row_h,
+                    None => self.offset + dy,
+                };
                 let id = cx.id;
                 if !self.scroll_to_offset(cx.ui, id, to) {
                     // Consumed even at the end, so a gesture does not

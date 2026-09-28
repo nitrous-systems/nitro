@@ -670,7 +670,8 @@ fn the_scroll_wheel_reaches_the_widget_under_the_pointer() {
             _cx: &mut nitro_ui::EventCx<'_, ()>,
             ev: &nitro_ui::Event,
         ) -> nitro_ui::Handled {
-            if let nitro_ui::Event::Scroll { dy, .. } = ev {
+            if let nitro_ui::Event::Scroll { dy, source, .. } = ev {
+                assert_eq!(*source, nitro_ui::AxisSource::Wheel);
                 self.dy += dy;
                 return nitro_ui::Handled::Yes;
             }

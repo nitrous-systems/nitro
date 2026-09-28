@@ -333,7 +333,7 @@ widgets on the wallpaper — before, **0** after (`docs/settings.md`).
 | `TextField` | `textfield` | its contents (the mask, if secret) | `set_value`, `submit`, `clear`, `focus` | caret, selection, click-to-place, h-scroll, secret mode |
 | `Checkbox` | `checkbox` | `true`/`false` | `toggle`, `set_value`, `focus` | Space toggles |
 | `Slider` | `slider` | the number | `set_value`, `focus` | drag, arrows, Home/End, optional step; `.vertical()` runs it bottom-to-top (a fader, an equaliser band), with Up still raising it |
-| `Scroll` | `scroll` | the offset | `scroll_to`, `scroll_by`, `focus` | wheel, arrows, PgUp/PgDn, Home/End |
+| `Scroll` | `scroll` | the offset | `scroll_to`, `scroll_by`, `focus` | wheel (`speed` px a notch, default 40; touchpad 1:1), arrows, PgUp/PgDn, Home/End |
 | `List` | `list` | the **visible** rows, one per line | `activate`, `select`, `scroll_to`, `scroll_by`, `focus` | virtualised: `visible + 2` rows materialised, whatever the model holds; a row's icon is a **name** |
 | `Separator` | `separator` | — | — | spans its container on the other axis |
 | `Image` | `image` | `WxH` | — | an `ARGB` buffer, uploaded once in a memfd |

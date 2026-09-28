@@ -1792,10 +1792,25 @@ grabbing window's, not a frame drag.
 | field | type | meaning |
 |---|---|---|
 | `window` | `NodeId` | |
-| `dx` | `f32` | horizontal scroll, logical pixels |
-| `dy` | `f32` | vertical scroll, logical pixels |
-| `source` | `AxisSource` | |
+| `dx` | `f32` | horizontal scroll, logical pixels; **positive = right** |
+| `dy` | `f32` | vertical scroll, logical pixels; **positive = down** |
+| `source` | `AxisSource` | `Wheel`, `Finger`, `Continuous`, `WheelTilt` |
 | `time_ns` | `u64` | |
+
+The sign convention is libinput's and Wayland's. Positive `dy` scrolls
+the view **down**, towards the end of the document, so the content moves
+up. That is what a wheel turned towards the user does with natural
+scrolling off. `pointer.natural_scroll` is applied **by the server**,
+which negates both axes before sending, so a client never inverts.
+
+Units per source:
+
+- `Wheel` / `WheelTilt`: `WHEEL_PX_PER_NOTCH` = **15** per detent
+  (`nitro_wire::types`), libinput's value passed through. A hi-res wheel
+  reports fractions of it, so there is no separate discrete/v120 field.
+  A client that steps by lines or rows divides by 15 to get notches
+  (`nitro_ui::event::notches`).
+- `Finger` / `Continuous`: real logical pixels, to be applied 1:1.
 
 ### `Key` — 0x8206
 

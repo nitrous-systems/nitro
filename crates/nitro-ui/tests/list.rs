@@ -979,3 +979,18 @@ fn a_row_inset_moves_the_selection_rect_and_nothing_else() {
     assert_eq!(painted, 0, "past the inset the row is the selection");
     h.quit();
 }
+
+#[test]
+fn one_wheel_notch_down_scrolls_speed_rows_down() {
+    let (mut h, id) = list_of(200, 200.0);
+    let b = h.bounds(id);
+    h.move_pointer(nitro_core::Point::new(b.x + 40.0, b.y + 40.0));
+    let row_h = h.widget::<List<Vec<usize>>>(id).row_height();
+    // Positive is down on the wire: the default three rows a notch.
+    h.wheel(1.0);
+    let got = h.widget::<List<Vec<usize>>>(id).offset();
+    assert!((got - 3.0 * row_h).abs() < 0.01, "{got} vs {}", 3.0 * row_h);
+    // And back up to the top, clamped there.
+    h.wheel(-2.0);
+    assert!(h.widget::<List<Vec<usize>>>(id).offset().abs() < 0.01);
+}

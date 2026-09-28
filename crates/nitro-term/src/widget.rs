@@ -166,6 +166,8 @@ pub struct TermGrid {
     /// Runs scratch, reused across rows and frames so a repaint of a
     /// settled screen allocates nothing.
     runs: Vec<Run>,
+    /// Touchpad scrolling not yet worth a whole row, in logical pixels.
+    scroll_px: f32,
 }
 
 impl std::fmt::Debug for TermGrid {
@@ -195,6 +197,7 @@ impl TermGrid {
             pty: None,
             focused: true,
             runs: Vec::new(),
+            scroll_px: 0.0,
         }
     }
 
@@ -562,13 +565,36 @@ impl<S: 'static> Widget<S> for TermGrid {
             // Spelled out rather than left to the wildcard because it is
             // the one arm a reader will look for.
             Event::Text { .. } | Event::KeyUp(_) => Handled::No,
-            Event::Scroll { dy, .. } => {
-                // Three rows a notch, as every terminal does.
-                let lines = (dy.abs() * 3.0).round().max(1.0) as usize;
-                if *dy > 0.0 {
-                    self.term.grid_mut().scroll_up(lines);
+            Event::Scroll { dy, source, .. } => {
+                // Positive is down, as on the wire: towards the live
+                // screen. Negative goes back into the history.
+                let lines = match nitro_ui::event::notches(*dy, *source) {
+                    // Three rows a notch, as every terminal does; a
+                    // hi-res wheel's fraction of a notch still moves one.
+                    Some(n) => {
+                        self.scroll_px = 0.0;
+                        let l = (n.abs() * 3.0).round().max(1.0);
+                        l.copysign(*dy)
+                    }
+                    // A touchpad reports pixels: move whole rows and
+                    // keep the remainder, so a slow swipe is not rounded
+                    // up to a row per event.
+                    None => {
+                        let row = self.cell.h.max(1.0);
+                        self.scroll_px += dy;
+                        let l = (self.scroll_px / row).trunc();
+                        self.scroll_px -= l * row;
+                        l
+                    }
+                };
+                if lines == 0.0 {
+                    return Handled::Yes;
+                }
+                let n = lines.abs() as usize;
+                if lines > 0.0 {
+                    self.term.grid_mut().scroll_down(n);
                 } else {
-                    self.term.grid_mut().scroll_down(lines);
+                    self.term.grid_mut().scroll_up(n);
                 }
                 cx.request_paint();
                 Handled::Yes

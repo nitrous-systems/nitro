@@ -28,7 +28,8 @@
 //! input rel DX DY             relative motion, device pixels, no acceleration
 //! input button BTN down|up|click     BTN = evdev code (272, 0x110) or left|right|middle
 //! input wheel DX DY [SRC]     scroll, logical px; SRC = wheel (default) | finger |
-//!                             continuous | tilt. libinput reports 15 per wheel notch.
+//!                             continuous | tilt. libinput reports 15 per wheel notch;
+//!                             positive DY = down, before natural_scroll.
 //! input key CODE down|up|tap  evdev keycode, without xkb's +8
 //! input type TEXT...          ASCII text, US layout, Shift for capitals/symbols
 //! options (key=value, any order, before TEXT for `type`):

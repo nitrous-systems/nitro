@@ -3211,7 +3211,11 @@ impl<S: 'static> Ui<S> {
                 }
             }
             ServerMsg::PointerAxis(a) => {
-                let ev = Event::Scroll { dx: a.dx, dy: a.dy };
+                let ev = Event::Scroll {
+                    dx: a.dx,
+                    dy: a.dy,
+                    source: a.source,
+                };
                 let target = self
                     .window_by_node(a.window)
                     .and_then(|win| self.win(win))

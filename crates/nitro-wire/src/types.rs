@@ -237,6 +237,19 @@ tag_enum! {
     }
 }
 
+/// Logical pixels one notch of a mouse wheel scrolls, in a
+/// [`PointerAxis`](crate::msg::PointerAxis) from an
+/// [`AxisSource::Wheel`] or [`AxisSource::WheelTilt`] — libinput's
+/// value, which the server passes through. A high-resolution wheel
+/// reports fractions of it.
+///
+/// The sign convention is libinput's (and Wayland's): positive `dy`
+/// scrolls *down* — the view moves towards the end, the content moves
+/// up — and positive `dx` scrolls right. `pointer.natural_scroll` is
+/// applied by the server before the event is sent, so a client never
+/// inverts.
+pub const WHEEL_PX_PER_NOTCH: f32 = 15.0;
+
 tag_enum! {
     /// Where a scroll event came from; clients use it to pick a scroll
     /// behaviour (stepped wheel versus kinetic finger scrolling).

@@ -8,6 +8,20 @@
 //! [`Harness::click`](crate::test::Harness::click).
 
 use nitro_core::Point;
+pub use nitro_wire::types::{AxisSource, WHEEL_PX_PER_NOTCH};
+
+/// A scroll delta in wheel notches, for widgets that step by rows or
+/// lines: a wheel (or tilt) delta divided by [`WHEEL_PX_PER_NOTCH`].
+/// Finger and continuous scrolling report real pixels and have no
+/// notches, so they return `None` — the widget should move by `d`
+/// pixels instead.
+#[must_use]
+pub fn notches(d: f32, source: AxisSource) -> Option<f32> {
+    match source {
+        AxisSource::Wheel | AxisSource::WheelTilt => Some(d / WHEEL_PX_PER_NOTCH),
+        _ => None,
+    }
+}
 
 /// Whether a widget consumed an event.
 ///
@@ -159,12 +173,19 @@ pub enum Event {
         /// Evdev button code; see [`button`].
         button: u32,
     },
-    /// Scrolling over this widget, in logical pixels.
+    /// Scrolling over this widget, in logical pixels, as the wire
+    /// reports it: positive `dy` scrolls down (towards the end, content
+    /// moves up), positive `dx` scrolls right. `pointer.natural_scroll`
+    /// is already applied, so a widget never inverts. A wheel notch is
+    /// [`WHEEL_PX_PER_NOTCH`]; see [`notches`].
     Scroll {
         /// Horizontal delta.
         dx: f32,
         /// Vertical delta.
         dy: f32,
+        /// What produced it: a notched wheel, or a finger/continuous
+        /// device reporting real pixels.
+        source: AxisSource,
     },
     /// A key went down while this widget had focus.
     KeyDown(KeyEvent),

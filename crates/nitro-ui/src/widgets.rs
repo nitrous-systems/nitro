@@ -3682,7 +3682,8 @@ pub struct Scroll {
     content_height: f32,
     /// The viewport height from the last layout.
     view_height: f32,
-    /// Pixels per wheel notch.
+    /// Pixels per wheel notch (and per arrow key). Finger scrolling
+    /// moves by the pixels the touchpad reported instead.
     speed: f32,
 }
 
@@ -3787,7 +3788,10 @@ impl<S: 'static> Widget<S> for Scroll {
 
     fn event(&mut self, cx: &mut EventCx<'_, S>, ev: &Event) -> Handled {
         let to = match ev {
-            Event::Scroll { dy, .. } => self.offset - dy * self.speed,
+            Event::Scroll { dy, source, .. } => match crate::event::notches(*dy, *source) {
+                Some(n) => self.offset + n * self.speed,
+                None => self.offset + dy,
+            },
             Event::KeyDown(k) => match k.keycode {
                 key::DOWN => self.offset + self.speed,
                 key::UP => self.offset - self.speed,

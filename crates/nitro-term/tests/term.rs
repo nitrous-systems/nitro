@@ -20,7 +20,7 @@ use nitro_term::widget::{DEFAULT_FONT_SIZE, TermGrid, TermGridMut as _};
 use nitro_term::{GRID_NAME, TermApp};
 use nitro_ui::event::key;
 use nitro_ui::test::Harness;
-use nitro_ui::{ColorRole, Palette, Size, WidgetId};
+use nitro_ui::{ColorRole, Palette, Point, Size, WidgetId};
 
 /// How long a test will wait for a shell to say something before giving
 /// up. Generous: a loaded CI box forks slowly, and a flaky timeout in a
@@ -828,6 +828,35 @@ fn scrolling_back_and_typing_snaps_to_the_bottom() {
         0,
         "any keypress snaps the view back to the bottom"
     );
+    h.quit();
+}
+
+#[test]
+fn the_wheel_scrolls_up_into_history_and_down_towards_the_live_screen() {
+    let (mut h, grid) = harness_running(&["/bin/sh", "-c", "sleep 30"]);
+    for _ in 0..60 {
+        h.ui()
+            .widget_mut::<TermGrid>(grid)
+            .expect("grid")
+            .feed(b"filler\r\n");
+    }
+    h.frame();
+    h.settle();
+    let offset = |h: &Harness<TermApp>| h.widget::<TermGrid>(grid).term().grid().scroll_offset();
+    let b = h.bounds(grid);
+    h.move_pointer(Point::new(b.x + b.w / 2.0, b.y + b.h / 2.0));
+
+    // Down at the live screen goes nowhere.
+    h.wheel(1.0);
+    assert_eq!(offset(&h), 0, "wheel down at the bottom stays there");
+    // Up (negative on the wire) goes three lines into the history.
+    h.wheel(-1.0);
+    assert_eq!(offset(&h), 3, "one notch up is three lines back");
+    h.wheel(-1.0);
+    assert_eq!(offset(&h), 6);
+    // Down comes back towards the live screen.
+    h.wheel(1.0);
+    assert_eq!(offset(&h), 3);
     h.quit();
 }
 

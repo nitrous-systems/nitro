@@ -2656,13 +2656,18 @@ fixed_msg! {
         time_ns: u64,
     }
 
-    /// Scrolling.
+    /// Scrolling. Signs follow libinput: positive scrolls down/right
+    /// (the view moves towards the end, the content moves up/left),
+    /// with `pointer.natural_scroll` already applied by the server.
     PointerAxis {
         /// The window.
         window: NodeId,
-        /// Horizontal scroll in logical pixels.
+        /// Horizontal scroll in logical pixels; positive is right. A
+        /// wheel tilt notch is [`WHEEL_PX_PER_NOTCH`](crate::types::WHEEL_PX_PER_NOTCH).
         dx: f32,
-        /// Vertical scroll in logical pixels.
+        /// Vertical scroll in logical pixels; positive is down. A wheel
+        /// notch is [`WHEEL_PX_PER_NOTCH`](crate::types::WHEEL_PX_PER_NOTCH);
+        /// finger and continuous scrolling are real pixels.
         dy: f32,
         /// Where the scroll came from.
         source: AxisSource,

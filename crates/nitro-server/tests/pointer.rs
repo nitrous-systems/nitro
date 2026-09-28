@@ -199,6 +199,9 @@ fn natural_scroll_inverts_every_axis_source_and_a_reload_reverts_it() {
     let mut seen = Vec::new();
     let win = window_under_pointer(&mut h, &mut conn, &mut seen);
 
+    // The wire convention (docs/wire.md): positive `dy` is down, 15 a
+    // wheel notch, libinput's values passed through. Clients never
+    // invert; the server does, here.
     assert_eq!(
         scrolled(&mut h, &mut conn, &mut seen, win, AxisSource::Wheel),
         (3.0, 15.0),

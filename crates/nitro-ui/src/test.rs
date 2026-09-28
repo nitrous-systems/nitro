@@ -205,6 +205,24 @@ impl<S: 'static> Harness<S> {
         Self::build_with(opts, state, build)
     }
 
+    /// As [`Harness::sized`], with the server started from a
+    /// `server.conf` holding `conf` — `pointer.natural_scroll = true`,
+    /// say, for a test of what the server does to input.
+    ///
+    /// # Panics
+    /// As [`Harness::new`].
+    pub fn configured(
+        name: &str,
+        state: S,
+        size: Size,
+        conf: &str,
+        build: impl FnOnce(&mut Ui<S>) -> WidgetId,
+    ) -> Self {
+        let mut opts = Options::new(name, Some(size), Theme::default(), true);
+        opts.server_conf = Some(conf.to_owned());
+        Self::build_with(opts, state, build)
+    }
+
     /// A harness on a **remote** (TCP) connection: the server binds
     /// `127.0.0.1:0`, the client connects to the port the kernel chose,
     /// and the `Welcome` carries `caps::REMOTE`.
@@ -639,16 +657,33 @@ impl<S: 'static> Harness<S> {
     }
 
     /// Scroll the wheel by `notches` where the pointer is; positive is
-    /// up, as the wire reports it.
+    /// down (towards the end, a wheel turned towards the user), as the
+    /// wire reports it with `pointer.natural_scroll` off. Each notch is
+    /// [`WHEEL_PX_PER_NOTCH`](nitro_wire::types::WHEEL_PX_PER_NOTCH),
+    /// as libinput reports it; the server applies natural scrolling.
     ///
     /// # Panics
     /// On a wire failure.
     pub fn wheel(&mut self, notches: f32) {
+        self.scroll(
+            0.0,
+            notches * nitro_wire::types::WHEEL_PX_PER_NOTCH,
+            nitro_wire::types::AxisSource::Wheel,
+        );
+    }
+
+    /// Send a raw scroll where the pointer is: `dx`/`dy` in logical
+    /// pixels, positive down/right, as libinput reports them before
+    /// the server applies `pointer.natural_scroll`.
+    ///
+    /// # Panics
+    /// On a wire failure.
+    pub fn scroll(&mut self, dx: f32, dy: f32, source: nitro_wire::types::AxisSource) {
         self.time_ns += 1_000_000;
         self.server.push_input(InputEvent::PointerAxis {
-            dx: 0.0,
-            dy: notches,
-            source: nitro_wire::types::AxisSource::Wheel,
+            dx,
+            dy,
+            source,
             time_ns: self.time_ns,
         });
         self.settle();

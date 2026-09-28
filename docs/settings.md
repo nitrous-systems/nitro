@@ -508,8 +508,10 @@ the **device's own default**, so deleting the line and reloading really
 reverts it. A device that refuses a setting logs a warning and keeps
 working.
 
-`pointer.natural_scroll = true` inverts scrolling so content follows the
-fingers, like a touchscreen. It is done **by the server**, which negates
+With the default `pointer.natural_scroll = false`, scrolling is
+traditional: turning the wheel towards you (or two fingers down) scrolls
+the view down and the content moves up. `pointer.natural_scroll = true`
+inverts scrolling so content follows the fingers, like a touchscreen. It is done **by the server**, which negates
 both axes of every `PointerAxis` before a client sees it — for every
 axis source (wheel, finger, continuous) and every device, including ones
 libinput has no natural-scroll switch for, remote clients' servers and

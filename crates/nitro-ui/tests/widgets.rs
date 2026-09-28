@@ -414,12 +414,77 @@ fn the_wheel_scrolls_the_viewport_under_the_pointer() {
     let view = kids(&mut h)[0];
     let b = h.bounds(view);
     h.move_pointer(Point::new(b.x + b.w / 2.0, b.y + b.h / 2.0));
-    h.wheel(-1.0);
+    // A wheel turned towards the user scrolls down: positive on the
+    // wire, `speed` pixels a notch.
+    h.wheel(1.0);
     same(h.widget::<Scroll>(view).offset(), 30.0);
     // Scrolling back up past the top stops at zero.
-    h.wheel(1.0);
-    h.wheel(1.0);
+    h.wheel(-1.0);
+    h.wheel(-1.0);
     same(h.widget::<Scroll>(view).offset(), 0.0);
+}
+
+/// A viewport scrolled by one wheel notch towards the user, under a
+/// server started with `conf`; the offset afterwards, starting from 60.
+fn one_notch_down(name: &str, conf: &str) -> f32 {
+    let mut h = Harness::configured(name, (), Size::new(200.0, 80.0), conf, |ui: &mut Ui<()>| {
+        let inner = ui.build(
+            column()
+                .gap(4.0)
+                .children((0..30).map(|i| label(format!("row {i}")))),
+        );
+        let view = ui.build(scroll().height(60.0).speed(30.0));
+        ui.attach(view, inner).unwrap();
+        let root = ui.build(panel().background(Color::WHITE).padding(8.0));
+        ui.attach(root, view).unwrap();
+        root
+    });
+    let view = kids(&mut h)[0];
+    let b = h.bounds(view);
+    h.move_pointer(Point::new(b.x + b.w / 2.0, b.y + b.h / 2.0));
+    // Start mid-content so both directions have room.
+    h.ui().widget_mut::<Scroll>(view).unwrap().scroll_to(60.0);
+    h.settle();
+    same(h.widget::<Scroll>(view).offset(), 60.0);
+    h.wheel(1.0);
+    h.widget::<Scroll>(view).offset()
+}
+
+#[test]
+fn the_wheel_scrolls_down_traditionally_and_up_with_natural_scrolling() {
+    // Traditional: the wheel towards the user moves the view down.
+    same(
+        one_notch_down("wheel-trad", "pointer.natural_scroll = false\n"),
+        90.0,
+    );
+    // Natural: the server negates it, and the content follows the wheel.
+    same(
+        one_notch_down("wheel-nat", "pointer.natural_scroll = true\n"),
+        30.0,
+    );
+}
+
+#[test]
+fn a_touchpad_scrolls_the_pixels_it_reports() {
+    let mut h = Harness::sized("finger", (), Size::new(200.0, 80.0), |ui: &mut Ui<()>| {
+        let inner = ui.build(
+            column()
+                .gap(4.0)
+                .children((0..12).map(|i| label(format!("row {i}")))),
+        );
+        let view = ui.build(scroll().height(60.0).speed(30.0));
+        ui.attach(view, inner).unwrap();
+        let root = ui.build(panel().background(Color::WHITE).padding(8.0));
+        ui.attach(root, view).unwrap();
+        root
+    });
+    let view = kids(&mut h)[0];
+    let b = h.bounds(view);
+    h.move_pointer(Point::new(b.x + b.w / 2.0, b.y + b.h / 2.0));
+    h.scroll(0.0, 10.0, nitro_ui::AxisSource::Finger);
+    same(h.widget::<Scroll>(view).offset(), 10.0);
+    h.scroll(0.0, -4.0, nitro_ui::AxisSource::Continuous);
+    same(h.widget::<Scroll>(view).offset(), 6.0);
 }
 
 #[test]

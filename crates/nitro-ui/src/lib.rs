@@ -111,7 +111,7 @@ pub use arena::{Dirty, WidgetId, WidgetState};
 // `Align` from.
 pub use build::{Built, ContainerBuilder, IntoWidget, StyleBuilder};
 pub use error::Error;
-pub use event::{Event, Handled, KeyEvent};
+pub use event::{AxisSource, Event, Handled, KeyEvent, WHEEL_PX_PER_NOTCH};
 pub use layout::{
     Constraints, CrossAlign, Direction, Edges, FlexItem, LayoutStyle, Length, MainAlign,
     ShrinkFloor,
