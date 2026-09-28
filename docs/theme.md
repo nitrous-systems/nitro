@@ -436,3 +436,11 @@ is what `the_sidebar_sits_a_shade_off_the_window` pins. The sidebar's
 own value is pinned in the other direction too: darker than the window in
 light and lighter in dark, which is how GNOME and macOS both make two
 panes read as two without a line between them.
+
+## Who writes `theme.scheme`
+
+`theme.scheme` has two writers. `nitro-settings` has an Appearance
+switch, and `nitro-bar`'s quick-settings menu has a **Dark Style** tile.
+Both call `nitro_system::conf::set_scheme`, which re-reads the file and
+changes that one key. The server's reload path (inotify, SIGHUP,
+`nitro-hey reload`) then pushes the new palette to every client.

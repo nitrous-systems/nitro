@@ -944,3 +944,14 @@ switcher, needs another op or a field; neither has a consumer yet.
 **Input regions and click-through.** A bar with a shadow, or a launcher
 dimming the desktop behind it, wants to say "this part of me is not
 clickable". Nothing in M3 needs it.
+
+## Shell menus are popups
+
+A shell menu, such as `nitro-bar`'s quick settings, needs no shell op.
+It is a `CreatePopup` with `popup_flags::GRAB` off the `Top` panel
+(`docs/wm.md` §Popups). The popup inherits `Top`. An outside press or
+Escape dismisses it and is consumed. Its parent being hidden or
+unplugged dismisses it too. `GrabKeyboard` accepts a popup's id, so the
+menu can read Tab and Enter. Popups are fixed-size, so a drill-down view
+re-creates the popup in the same commit (`Ui::add_popup` plus
+`Ui::remove_window`).

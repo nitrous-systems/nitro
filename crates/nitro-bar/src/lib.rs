@@ -83,12 +83,13 @@
 //! the others at `window[N]/...`.
 
 pub mod clock;
+pub mod quick;
 pub mod sensors;
 
 use nitro_ui::build::{ContainerBuilder as _, StyleBuilder as _};
 use nitro_ui::shell::{Anchor, Layer, ShellEvent, Surface, WindowInfo, WindowRef, WindowState};
 use nitro_ui::widgets::{Button, Label, button as button_widget, icon, label, row, spacer};
-use nitro_ui::{App, ColorRole, Error, IconTint, Size, Ui, WidgetId, WindowId};
+use nitro_ui::{App, ColorRole, Error, IconTint, Size, Ui, WidgetId, WindowId, status_pill};
 
 /// The name the bar registers under, and so the first argument to `hey`.
 pub const APP_NAME: &str = "nitro-bar";
@@ -150,8 +151,10 @@ pub mod names {
     pub const WINDOWS: &str = "windows";
     /// The clock.
     pub const CLOCK: &str = "clock";
-    /// The battery readout.
+    /// The battery readout, inside the status pill.
     pub const BATTERY: &str = "battery";
+    /// The status pill that opens the quick-settings menu.
+    pub const STATUS: &str = crate::quick::names::STATUS;
     /// The CPU load readout.
     pub const LOAD: &str = "load";
     /// The icon in front of the load readout.
@@ -312,6 +315,8 @@ pub struct Bar {
     /// when nothing moved, so "an unchanged poll costs nothing" is
     /// visible here rather than resting on a setter in another crate.
     last: Readings,
+    /// The quick-settings menu. See [`quick`].
+    quick: quick::Quick,
 }
 
 impl Bar {
@@ -332,7 +337,42 @@ impl Bar {
             poll_ms: POLL_MS,
             source: Box::new(read_sensors),
             last: Readings::default(),
+            quick: quick::Quick::new(),
         }
+    }
+
+    /// Look for `wpctl`/`pactl` in `dirs` instead of on `PATH`.
+    #[must_use]
+    pub fn with_audio_dirs(mut self, dirs: Vec<std::path::PathBuf>) -> Self {
+        self.quick.audio_dirs = dirs;
+        self
+    }
+
+    /// Talk to this `session.sock` instead of `$XDG_RUNTIME_DIR`'s.
+    #[must_use]
+    pub fn with_session_socket(mut self, path: std::path::PathBuf) -> Self {
+        self.quick.session_socket = Some(path);
+        self
+    }
+
+    /// Read and write this `server.conf` for the Dark Style tile.
+    #[must_use]
+    pub fn with_config_path(mut self, path: std::path::PathBuf) -> Self {
+        self.quick.config_path = Some(path);
+        self
+    }
+
+    /// What the settings button runs (default `nitro-settings`).
+    #[must_use]
+    pub fn with_settings_command(mut self, cmd: Vec<String>) -> Self {
+        self.quick.settings_cmd = cmd;
+        self
+    }
+
+    /// The quick-settings menu's state.
+    #[must_use]
+    pub fn quick(&self) -> &quick::Quick {
+        &self.quick
     }
 
     /// Take the readouts from `source` instead of from `/proc` and
@@ -519,6 +559,7 @@ struct Ids {
     battery: WidgetId,
     load: WidgetId,
     mem: WidgetId,
+    volume_icon: WidgetId,
 }
 
 /// The bar's height: `NITRO_BAR_HEIGHT`, else [`DEFAULT_HEIGHT`].
@@ -700,12 +741,29 @@ fn build_panel(ui: &mut Ui<Bar>) -> (WidgetId, Ids) {
     );
 
     // -- right: battery, load, memory ---------------------------------
+    // The status pill: the volume icon and the battery reading in one
+    // clickable group that opens the quick-settings menu. The icon is
+    // set by `quick::sync`, and only when its name changes.
+    let volume_icon = ui.build(
+        icon("sliders")
+            .name(quick::names::STATUS_VOLUME)
+            .size(ICON_PX)
+            .color_role(ColorRole::Text),
+    );
     let battery = ui.build(
         label("")
             .name(names::BATTERY)
             .size(TEXT_SIZE)
-            .color_role(ColorRole::TextDim),
+            .color_role(ColorRole::Text),
     );
+    let status = ui.build(
+        status_pill("Quick Settings")
+            .name(names::STATUS)
+            .height(h - 6.0),
+    );
+    ui.attach(status, volume_icon).unwrap();
+    ui.attach(status, battery).unwrap();
+    quick::hook_pill(ui, status);
     // The two readouts that are *numbers with no units* get an icon in
     // front of them, because `0.4  1.2/3.3G` says nothing about which is
     // which. The icons are static — they are painted once and never
@@ -756,7 +814,7 @@ fn build_panel(ui: &mut Ui<Bar>) -> (WidgetId, Ids) {
     let left_pad = ui.build(spacer().grow(1.0));
     let right_pad = ui.build(spacer().grow(1.0));
     for child in [
-        launcher, windows, left_pad, clock_id, right_pad, battery, load_icon, load, mem_icon, mem,
+        launcher, windows, left_pad, clock_id, right_pad, load_icon, load, mem_icon, mem, status,
     ] {
         ui.attach(root, child).unwrap();
     }
@@ -769,6 +827,7 @@ fn build_panel(ui: &mut Ui<Bar>) -> (WidgetId, Ids) {
             battery,
             load,
             mem,
+            volume_icon,
         },
     )
 }
@@ -846,6 +905,12 @@ fn install(ui: &mut Ui<Bar>, ids: Ids) {
 
     tick_clock(ui, ids);
     arm_first_sensor_poll(ui, ids);
+    // One mixer read for the pill's icon, before the first frame. Not a
+    // poll: nothing re-arms it.
+    ui.set_timer(0, move |s: &mut Bar, ui: &mut Ui<Bar>| {
+        ensure_main(s, ids);
+        quick::init(s, ui);
+    });
 }
 
 /// Make the main window the first [`Panel`], if it is not yet.
@@ -937,6 +1002,11 @@ fn open_panel(s: &mut Bar, ui: &mut Ui<Bar>, output: u32) {
         ids,
         entries: Vec::new(),
     });
+    if !s.quick.icon().is_empty()
+        && let Ok(mut i) = ui.widget_mut::<nitro_ui::widgets::Icon>(ids.volume_icon)
+    {
+        i.set_icon(s.quick.icon().to_owned());
+    }
     let idx = s.panels.len() - 1;
     for info in s.infos.clone() {
         upsert_in(s, ui, idx, &info);

@@ -34,7 +34,8 @@ reserves). `NITRO_SHELL_SOCKET` overrides the socket path.
 | launcher | `launcher` | fires the launcher's trigger (M3-D) |
 | window list | `windows` | one button per window: click focuses, **middle-click closes** |
 | clock | `clock` | local `HH:MM`, one update per minute |
-| battery | `battery` | `/sys/class/power_supply/*`, e.g. `87%+` |
+| status pill | `status` | volume icon (`status_volume`) + battery; opens the quick-settings menu |
+| battery | `battery` | inside the pill: `/sys/class/power_supply/*`, e.g. `87%+` |
 | load | `load` | the 1-minute average from `/proc/loadavg`, one decimal |
 | memory | `mem` | used/total from `/proc/meminfo`, e.g. `1.2/3.3G` |
 
@@ -136,6 +137,74 @@ and `the_sensors_render_no_more_often_than_every_thirty_seconds` pins the
 interval, which the idle test cannot see because it shortens it to 20 ms.
 The rendering half is `sensors.rs`'s own
 `the_second_decimal_of_the_load_is_dropped_rather_than_drawn`.
+
+## Quick settings
+
+The status pill at the right end opens a **quick-settings menu**
+(`src/quick.rs`): GNOME's structure with a few macOS touches, built from
+`nitro_ui::quick`.
+
+| light | dark |
+|---|---|
+| ![](../../docs/quick-settings-light.png) | ![](../../docs/quick-settings-dark.png) |
+| ![](../../docs/quick-settings-outputs-light.png) | ![](../../docs/quick-settings-outputs-dark.png) |
+
+* **Main view.** The top row has the battery reading plus round
+  buttons for Settings (launches `nitro-settings`), Lock (disabled
+  until `nitro-session` implements `lock`) and Power. Below it is the
+  **Sound** card: a mute toggle, a chunky volume slider, an output
+  button, and the current device's name. Last comes a two-column tile
+  grid, which holds only **Dark Style** for now. Wi-Fi, VPN and
+  Bluetooth will each be one more entry in `build_main`'s tile list.
+* **Outputs view** (drill-down): every sink from `wpctl status` /
+  `pactl list sinks`, with the current one checked. A click runs
+  `set-default` and returns to the main view.
+* **Power view** (drill-down, and it is the confirm step): Suspend,
+  Restart, Power Off and Log Out, each one request on `session.sock`
+  (`nitro_system::session`). An `err …` answer keeps the view open and
+  shows the reason.
+* **Dark Style** rewrites `theme.scheme` in `server.conf` and nothing
+  else (`nitro_system::conf::set_scheme`). The server's inotify reload
+  then recolours the whole desktop, the open menu included.
+
+The menu is a server **popup** with the pointer grab (`docs/wm.md`
+§Popups). A press outside it, or Escape, dismisses it and is consumed,
+so a second click on the pill closes the menu. Popups are fixed-size, so
+a drill-down opens the new view's popup and removes the old one in the
+same commit. The width stays at 360 px, so a view switch reads as a
+height change.
+
+With neither `wpctl` nor `pactl` installed, the card says so and its
+controls are disabled. The pill then shows the `sliders` icon.
+
+**Idle contract, extended.** A closed menu schedules nothing: no timer,
+no subprocess. The mixer is read once at start-up (for the pill's icon),
+when the menu opens, and after the menu changes something. The pill's
+icon is re-set only when its *name* changes. A volume changed elsewhere
+(a media key, another mixer) is therefore **stale in the pill until the
+menu next opens**. `nitro-settings` makes the same trade.
+
+```console
+$ hey nitro-bar do status click              # open it
+$ hey nitro-bar list                          # the menu is window[N]/quick/...
+$ hey nitro-bar do 'window[1]/volume' set_value 0.3
+$ hey nitro-bar do 'window[1]/dark' toggle
+```
+
+There is no global hotkey by default, because it would fight the
+existing Super bindings. That is a follow-up.
+
+Follow-ups: a now-playing card (paired with nitro-amp); Wi-Fi, network,
+VPN and Bluetooth tiles; a hotkey; enabling Lock once `nitro-session`
+implements it; live volume via a `pw-mon` subscription, if ever wanted.
+
+`tests/quick.rs` covers the menu with a fake `wpctl` (a shell script
+that keeps its state in files) and a fake `session.sock`. The
+screenshots are regenerated with
+`cargo test -p nitro-bar --test quick -- --ignored screenshots`. In the
+dark ones only the *client* palette is dark: the harness server's
+desktop and the icons it tints still use the light scheme, because the
+harness has no config file to reload.
 
 ## Driving it with `hey`
 

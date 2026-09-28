@@ -121,7 +121,8 @@ pub use nitro_core::{Color, Point, Rect, Size, Transform};
 pub use picker::{FilePicker, PickKind};
 pub use popup::PopupPlacement;
 pub use quick::{
-    ChoiceRow, RoundButton, Tile, choice_row, drill_header, round_button, section_card, tile,
+    ChoiceRow, RoundButton, StatusPill, Tile, choice_row, drill_header, round_button, section_card,
+    status_pill, tile,
 };
 pub use split::{
     Card, CardRow, ContentColumn, Pages, SidebarRow, SplitParts, Switch, card, card_row,

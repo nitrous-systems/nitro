@@ -13,6 +13,8 @@ workspace = true
 # The toolkit, and `rustix` for the two things the toolkit does not do:
 # the wall clock (`clock_gettime`) and reading `/sys`/`/proc`.
 nitro-ui = { workspace = true }
+# The mixer, `server.conf` and `session.sock`, shared with nitro-settings.
+nitro-system = { workspace = true }
 rustix = { workspace = true, features = ["time"] }
 
 [lib]

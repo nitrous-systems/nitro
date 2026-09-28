@@ -25,6 +25,8 @@ use nitro_wire::types::{Layer, NodeId, WindowState};
 
 /// The bar's height, and so the strip it reserves.
 const BAR_H: f32 = 32.0;
+/// The fake output's width (see [`bar`]).
+const OUTPUT_W: f32 = 480.0;
 
 /// A bar on the shell socket, spanning the harness's output.
 fn harness() -> Harness<Bar> {
@@ -33,11 +35,15 @@ fn harness() -> Harness<Bar> {
 
 /// A bar built around an already-configured state.
 fn bar(state: Bar) -> Harness<Bar> {
-    Harness::shell(
+    // 480 wide rather than the harness's 320: the status pill needs the
+    // room a real bar has, and at 320 the window list is squeezed to
+    // nothing.
+    Harness::shell_on(
         "nitro-bar",
         state,
         Surface::bar(BAR_H as u32),
         Some(Size::new(320.0, BAR_H)),
+        (OUTPUT_W as u32, 240),
         build,
     )
 }
@@ -575,12 +581,12 @@ fn the_bar_paints_across_its_whole_output() {
     // The probe's second finding, as a regression: a bar that ignores the
     // `Configure` its own anchor produces paints its original width and
     // the desktop shows through the rest of the strip. The window was
-    // asked for at 320 wide against a 320 output, so what this really
-    // checks is that the anchor's configure was honoured at all.
+    // asked for at 320 wide against a 480 output, so this checks that the
+    // anchor's configure was honoured.
     let mut h = harness();
     h.settle();
     assert!(
-        (h.ui().window_size().w - 320.0).abs() < 1.0,
+        (h.ui().window_size().w - OUTPUT_W).abs() < 1.0,
         "the anchor spanned the output: {:?}",
         h.ui().window_size()
     );

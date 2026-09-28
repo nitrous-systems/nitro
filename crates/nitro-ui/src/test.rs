@@ -56,6 +56,8 @@ struct Options {
     /// Connect over **TCP** rather than the Unix socket; see
     /// [`Harness::remote`].
     remote: bool,
+    /// The fake output's size.
+    output: (u32, u32),
 }
 
 impl Options {
@@ -67,6 +69,7 @@ impl Options {
             backdrop,
             surface: None,
             remote: false,
+            output: OUTPUT,
         }
     }
 }
@@ -79,6 +82,8 @@ pub struct Harness<S> {
     time_ns: u64,
     /// The app's introspection socket, once a test has asked for one.
     socket: Option<crate::introspect::Socket>,
+    /// The fake output's size, [`OUTPUT`] unless the test chose.
+    output: (u32, u32),
 }
 
 impl<S: 'static> Harness<S> {
@@ -155,6 +160,26 @@ impl<S: 'static> Harness<S> {
         Self::build_with(opts, state, build)
     }
 
+    /// [`Harness::shell`] on an output of `output` pixels rather than
+    /// [`OUTPUT`]: for a shell surface whose popups need a real desktop's
+    /// room (a 360 px menu does not fit a 320 px output).
+    ///
+    /// # Panics
+    /// As [`Harness::new`].
+    pub fn shell_on(
+        name: &str,
+        state: S,
+        surface: crate::shell::Surface,
+        size: Option<Size>,
+        output: (u32, u32),
+        build: impl FnOnce(&mut Ui<S>) -> WidgetId,
+    ) -> Self {
+        let mut opts = Options::new(name, size, Theme::default(), true);
+        opts.surface = Some(surface);
+        opts.output = output;
+        Self::build_with(opts, state, build)
+    }
+
     /// A harness on a **remote** (TCP) connection: the server binds
     /// `127.0.0.1:0`, the client connects to the port the kernel chose,
     /// and the `Welcome` carries `caps::REMOTE`.
@@ -180,11 +205,12 @@ impl<S: 'static> Harness<S> {
             backdrop,
             surface,
             remote,
+            output,
         } = opts;
         let server = if remote {
-            TestServer::start_remote(&name, OUTPUT.0, OUTPUT.1)
+            TestServer::start_remote(&name, output.0, output.1)
         } else {
-            TestServer::start(&name, OUTPUT.0, OUTPUT.1)
+            TestServer::start(&name, output.0, output.1)
         };
         // Park the pointer in a corner: the server puts it in the middle
         // of the output, where it would contaminate every pixel
@@ -231,6 +257,7 @@ impl<S: 'static> Harness<S> {
             state,
             time_ns: 2_000_000,
             socket: None,
+            output,
         };
         // `shot` over the introspection socket screenshots *this*
         // harness's server, not whatever `$NITRO_CONTROL` happens to
@@ -484,8 +511,8 @@ impl<S: 'static> Harness<S> {
         // scales that onto the first output, so window coordinates have
         // to go back through the same division.
         self.server.push_input(InputEvent::PointerAbsolute {
-            x: f64::from(origin.x + pos.x) / f64::from(OUTPUT.0),
-            y: f64::from(origin.y + pos.y) / f64::from(OUTPUT.1),
+            x: f64::from(origin.x + pos.x) / f64::from(self.output.0),
+            y: f64::from(origin.y + pos.y) / f64::from(self.output.1),
             time_ns: self.time_ns,
         });
         self.settle();

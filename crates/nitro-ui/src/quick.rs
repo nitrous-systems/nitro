@@ -920,3 +920,129 @@ pub fn choice_row<S: 'static>(label: impl Into<String>, selected: bool) -> Choic
         },
     }
 }
+
+// ---------------------------------------------------------------------
+// StatusPill
+// ---------------------------------------------------------------------
+
+/// The bar's status area: a clickable **container** (icons and short
+/// labels as children) on a pill-shaped face that shows only on hover or
+/// press — GNOME's one rounded group of status icons that opens the
+/// quick-settings menu.
+pub struct StatusPill<S> {
+    label: String,
+    press: Pressable<S>,
+}
+
+impl<S> std::fmt::Debug for StatusPill<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StatusPill")
+            .field("label", &self.label)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S: 'static> Widget<S> for StatusPill<S> {
+    fn measure(&mut self, cx: &mut MeasureCx<'_, S>, constraints: Constraints) -> Size {
+        crate::widgets::measure_container(cx, constraints)
+    }
+
+    fn paint(&mut self, cx: &mut PaintCx<'_, S>) {
+        let hovered = cx.ui.is_hovered(cx.id);
+        let face = if self.press.pressed {
+            cx.color(ColorRole::ButtonActive)
+        } else if hovered {
+            cx.color(ColorRole::ButtonHover)
+        } else {
+            Color::TRANSPARENT
+        };
+        let b = cx.bounds;
+        cx.rect(
+            0,
+            Rect::new(0.0, 0.0, b.w, b.h),
+            Fill::Solid(face),
+            b.h / 2.0,
+            (0.0, Color::TRANSPARENT),
+        );
+    }
+
+    fn event(&mut self, cx: &mut EventCx<'_, S>, ev: &Event) -> Handled {
+        self.press.event(cx, ev).unwrap_or(Handled::No)
+    }
+
+    fn role(&self) -> Role {
+        Role::Button
+    }
+
+    fn accessible(&self) -> Access {
+        Access {
+            name: Some(self.label.clone()),
+            value: Some(self.label.clone()),
+            actions: vec!["click", "activate"],
+        }
+    }
+
+    fn action(&mut self, cx: &mut EventCx<'_, S>, action: &str, _arg: Option<&str>) -> Handled {
+        self.press.action(cx, action)
+    }
+}
+
+/// Setters for a live [`StatusPill`].
+impl<S: 'static> WidgetMut<'_, StatusPill<S>, S> {
+    /// Replace what a click does — for a handler that needs the pill's
+    /// own id, which does not exist until it is built.
+    pub fn set_on_click(&mut self, f: impl Fn(&mut S, &mut Ui<S>) + 'static) {
+        self.press.on_click = Some(Box::new(f));
+    }
+}
+
+/// Builder for a [`StatusPill`].
+pub struct StatusPillBuilder<S> {
+    built: Built<S>,
+    pill: StatusPill<S>,
+}
+
+impl<S: 'static> StatusPillBuilder<S> {
+    /// What a click does.
+    #[must_use]
+    pub fn on_click(mut self, f: impl Fn(&mut S, &mut Ui<S>) + 'static) -> Self {
+        self.pill.press.on_click = Some(Box::new(f));
+        self
+    }
+}
+
+impl<S: 'static> StyleBuilder<S> for StatusPillBuilder<S> {
+    fn built_mut(&mut self) -> &mut Built<S> {
+        &mut self.built
+    }
+}
+
+impl<S: 'static> ContainerBuilder<S> for StatusPillBuilder<S> {}
+
+impl<S: 'static> IntoWidget<S> for StatusPillBuilder<S> {
+    fn into_widget(mut self) -> Built<S> {
+        self.built.replace_widget(self.pill);
+        self.built
+    }
+}
+
+/// A status pill whose accessible label is `label`; add its icons and
+/// labels as children.
+#[must_use]
+pub fn status_pill<S: 'static>(label: impl Into<String>) -> StatusPillBuilder<S> {
+    let mut built: Built<S> = Built::new(crate::widgets::Flex);
+    {
+        let st = built.state_mut();
+        st.style.direction = Direction::Row;
+        st.style.cross_align = CrossAlign::Center;
+        st.style.gap = 6.0;
+        st.style.padding = Edges::symmetric(10.0, 4.0);
+    }
+    StatusPillBuilder {
+        built,
+        pill: StatusPill {
+            label: label.into(),
+            press: Pressable::new(),
+        },
+    }
+}

@@ -129,6 +129,9 @@ struct Window<S> {
     /// Run when `output` changes; see [`Ui::on_window_placed`]. Taken out
     /// while running, like `resize_handlers`.
     placed_handlers: Vec<Option<PlacedHandler<S>>>,
+    /// A popup: never gets the rectangular backdrop, so a menu's root
+    /// can paint its own rounded panel with transparent corners.
+    popup: bool,
 }
 
 impl<S> Window<S> {
@@ -155,6 +158,7 @@ impl<S> Window<S> {
             close_handlers: Vec::new(),
             output: None,
             placed_handlers: Vec::new(),
+            popup: false,
         }
     }
 }
@@ -795,6 +799,9 @@ impl<S: 'static> Ui<S> {
     /// parent going away — which the toolkit answers by destroying it
     /// and running the close handlers, as it answers `Closed`.
     ///
+    /// A popup gets **no backdrop**: its root paints its own face (a
+    /// rounded panel), and the corners outside it stay transparent.
+    ///
     /// A popup is **fixed-size**: to change its height, add the new one
     /// and [`Ui::remove_window`] the old one in the same turn, and the
     /// swap is one commit.
@@ -829,6 +836,7 @@ impl<S: 'static> Ui<S> {
         let mut w = Window::new(id);
         w.root = Some(root);
         w.open = true;
+        w.popup = true;
         w.size = size;
         w.scale = self.win(parent).map_or(1.0, |p| p.scale);
         // Where the server will put it, near enough for anything that
@@ -2583,7 +2591,7 @@ impl<S: 'static> Ui<S> {
         let Some(w) = find_mut(&mut self.windows, win) else {
             return Ok(());
         };
-        if !wanted {
+        if !wanted || w.popup {
             if let Some(node) = w.backdrop.take() {
                 w.backdrop_sent = None;
                 self.wire.destroy_node(node)?;
