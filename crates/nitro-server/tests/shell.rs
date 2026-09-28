@@ -1019,10 +1019,7 @@ fn a_top_anchored_overlay_hangs_off_the_work_area() {
     refresh(&mut shell, &mut inbox, &mut win);
     assert_eq!(
         win.pos,
-        nitro_core::Point::new(
-            (OUT.0 as f32 - size.w) / 2.0,
-            (ZONE + SEARCH_TOP) as f32
-        )
+        nitro_core::Point::new((OUT.0 as f32 - size.w) / 2.0, (ZONE + SEARCH_TOP) as f32)
     );
     assert_eq!(win.size, size, "a one-edge anchor does not resize");
     drop(shell);

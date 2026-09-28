@@ -33,8 +33,8 @@
 
 use nitro_core::{Color, Point, Rect, Size, Transform};
 use nitro_scene::{
-    ClientId, Error as SceneError, Fill, IconRef, Layer, NodeKey, NodeKind, OutputId,
-    Scene, WindowFlags, WindowKey, WindowState,
+    ClientId, Error as SceneError, Fill, IconRef, Layer, NodeKey, NodeKind, OutputId, Scene,
+    WindowFlags, WindowKey, WindowState,
 };
 
 /// The largest scale a thumbnail is ever drawn at: a thumbnail is never
@@ -974,8 +974,14 @@ mod scene_tests {
             let info = scene.window_info(slot.window).unwrap();
             let (inset, fsize) = (info.inset(), info.frame_size());
             // The slot is the whole frame, at the frame's aspect.
-            assert!((slot.size.w - fsize.w * slot.scale).abs() < 1e-3, "{slot:?}");
-            assert!((slot.size.h - fsize.h * slot.scale).abs() < 1e-3, "{slot:?}");
+            assert!(
+                (slot.size.w - fsize.w * slot.scale).abs() < 1e-3,
+                "{slot:?}"
+            );
+            assert!(
+                (slot.size.h - fsize.h * slot.scale).abs() < 1e-3,
+                "{slot:?}"
+            );
             // The client's own rect at (0, 0) in its content lands at the
             // slot's top-left plus the scaled inset, at the slot's scale
             // (the output's scale is 1). The rect rather than the content
@@ -985,8 +991,14 @@ mod scene_tests {
             let rect = scene.node(info.content()).unwrap().children()[0];
             let t = scene.node(rect).unwrap().world_transform();
             let k = slot.scale;
-            assert!((t.e - (slot.pos.x + k * inset.left)).abs() < 1e-3, "{slot:?}");
-            assert!((t.f - (slot.pos.y + k * inset.top)).abs() < 1e-3, "{slot:?}");
+            assert!(
+                (t.e - (slot.pos.x + k * inset.left)).abs() < 1e-3,
+                "{slot:?}"
+            );
+            assert!(
+                (t.f - (slot.pos.y + k * inset.top)).abs() < 1e-3,
+                "{slot:?}"
+            );
             assert!((t.a - k).abs() < 1e-6, "{} vs {}", t.a, k);
         }
     }
@@ -999,7 +1011,11 @@ mod scene_tests {
             assert!((device - device.round()).abs() < 1e-4, "{k}: {device}");
             assert!((device - 13.0 * k).abs() <= 0.5 + 1e-4, "{k}: {device}");
         }
-        assert_eq!(snapped_text_size(13.0, 0.01) * 0.01, 1.0, "never below 1 px");
+        assert_eq!(
+            snapped_text_size(13.0, 0.01) * 0.01,
+            1.0,
+            "never below 1 px"
+        );
         assert_eq!(snapped_text_size(13.0, 1.0), 13.0);
     }
 

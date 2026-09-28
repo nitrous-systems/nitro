@@ -384,7 +384,10 @@ fn no_thumbnail_reaches_into_the_search_band() {
         for s in &slots {
             // The slot is the thumbnail's top (its title bar); the hit
             // rect starts there too and only grows downwards.
-            assert!(s.pos.y >= work.y + band, "{n} windows: {s:?} is in the band");
+            assert!(
+                s.pos.y >= work.y + band,
+                "{n} windows: {s:?} is in the band"
+            );
         }
     }
 }
