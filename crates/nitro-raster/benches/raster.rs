@@ -221,6 +221,55 @@ fn scene_blits(c: &mut Canvas<'_>, img: &Image<'_>) {
     }
 }
 
+/// Size of the 1:1 AR24 "browser window" blit (#3877): the Chromium
+/// window measured on the test box was about 1180×1000 device px.
+const WIN_W: u32 = 1180;
+const WIN_H: u32 = 1000;
+
+/// A straight-alpha AR24 window image. `opaque_content` true: the Chromium
+/// shape — alpha 255 everywhere except a 10 px translucent "shadow" border
+/// (alpha ramp) and fully transparent corners. false: every pixel has a
+/// partial alpha (the blend's worst case).
+fn make_window_image(opaque_content: bool) -> Vec<u8> {
+    let mut out = vec![0u8; (WIN_W * WIN_H * 4) as usize];
+    for y in 0..WIN_H {
+        for x in 0..WIN_W {
+            let o = ((y * WIN_W + x) * 4) as usize;
+            let edge = x.min(y).min(WIN_W - 1 - x).min(WIN_H - 1 - y);
+            let a = if opaque_content {
+                if edge >= 10 {
+                    255
+                } else if x.min(WIN_W - 1 - x) < 10 && y.min(WIN_H - 1 - y) < 10 {
+                    0
+                } else {
+                    (edge * 20) as u8
+                }
+            } else {
+                (((x * 7) ^ (y * 3)) % 253 + 1) as u8
+            };
+            out[o] = (x * 3) as u8;
+            out[o + 1] = (y * 5) as u8;
+            out[o + 2] = (x ^ y) as u8;
+            out[o + 3] = a;
+        }
+    }
+    out
+}
+
+/// (j)/(k) one 1:1, unscaled blit of a WIN_W×WIN_H AR24 image over an
+/// opaque background (the background fill is outside the timed region's
+/// interest but inside it; it is a memset-speed store).
+fn scene_window_blit(c: &mut Canvas<'_>, img: &Image<'_>) {
+    let clip = full_clip();
+    c.blit(
+        &clip,
+        &Rect::new(100.0, 40.0, WIN_W as f32, WIN_H as f32),
+        img,
+        &img.bounds(),
+        1.0,
+    );
+}
+
 const GLYPH_W: u32 = 8;
 const GLYPH_H: u32 = 12;
 const GLYPHS_PER_RUN: i32 = 50;
@@ -383,7 +432,7 @@ struct SceneSpec {
     default_iters: u32,
 }
 
-const SCENES: [SceneSpec; 9] = [
+const SCENES: [SceneSpec; 11] = [
     SceneSpec {
         letter: 'a',
         name: "solid_fill",
@@ -429,6 +478,16 @@ const SCENES: [SceneSpec; 9] = [
         name: "grad+scrim",
         default_iters: 300,
     },
+    SceneSpec {
+        letter: 'j',
+        name: "argb_1to1_opq",
+        default_iters: 300,
+    },
+    SceneSpec {
+        letter: 'k',
+        name: "argb_1to1_mix",
+        default_iters: 300,
+    },
 ];
 
 const WARMUP: u32 = 3;
@@ -471,6 +530,16 @@ fn main() {
         stride: SRC_STRIDE,
         format: PixelFormat::Argb8888,
     };
+    let win_opq = make_window_image(true);
+    let win_mix = make_window_image(false);
+    let win = |data| Image {
+        data,
+        width: WIN_W,
+        height: WIN_H,
+        stride: WIN_W * 4,
+        format: PixelFormat::Argb8888,
+    };
+    let (img_opq, img_mix) = (win(&win_opq), win(&win_mix));
     let damage = damage_rects();
     let glyph = make_glyph_mask();
     let glyph_mask = Mask {
@@ -495,6 +564,8 @@ fn main() {
                     'e' => scene_ui_frame(&mut c, &damage),
                     'f' => scene_glyphs_loop(&mut c, &glyph_mask),
                     'h' => scene_scrim(&mut c),
+                    'j' => scene_window_blit(&mut c, &img_opq),
+                    'k' => scene_window_blit(&mut c, &img_mix),
                     'i' => {
                         scene_gradient(&mut c);
                         scene_scrim(&mut c);

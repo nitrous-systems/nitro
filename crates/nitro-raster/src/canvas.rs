@@ -2,10 +2,10 @@
 
 use nitro_core::{Color, IRect, Point, Rect};
 
-use crate::blend::{div255, effective_alpha, over_premul, over_straight, unit_u8};
+use crate::blend::{div255, effective_alpha, over_premul, unit_u8};
 use crate::paint::{
-    RowPaint, blend_mask_row, blend_mask_row_opaque, blend_pixel, blend_solid, lerp_color, mix,
-    paint_cov, paint_full, store_solid,
+    RowPaint, blend_mask_row, blend_mask_row_opaque, blend_pixel, blend_solid, blend_straight_row,
+    lerp_color, mix, paint_cov, paint_full, store_solid,
 };
 use crate::shape::{RRect, RowSpans};
 
@@ -1092,25 +1092,7 @@ impl<'a> Canvas<'a> {
                     d.copy_from_slice(&[s[0], s[1], s[2], 0]);
                 }
             } else {
-                for (d, s) in drow.chunks_exact_mut(4).zip(srow.chunks_exact(4)) {
-                    let sa = if src.format.is_opaque() {
-                        255
-                    } else {
-                        u32::from(s[3])
-                    };
-                    let a = effective_alpha(sa as u8, 255, opacity);
-                    if a == 0 {
-                        continue;
-                    }
-                    let au = u32::from(a);
-                    let out = [
-                        over_straight(u32::from(s[0]), u32::from(d[0]), au),
-                        over_straight(u32::from(s[1]), u32::from(d[1]), au),
-                        over_straight(u32::from(s[2]), u32::from(d[2]), au),
-                        0,
-                    ];
-                    d.copy_from_slice(&out);
-                }
+                blend_straight_row(drow, srow, src.format.is_opaque(), opacity);
             }
         }
     }
