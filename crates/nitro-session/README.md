@@ -168,6 +168,11 @@ the `MAX_LINE` overflow rule, because the bar will eventually speak both
 and a desktop with two hand-rolled line protocols that differ in their
 details is a desktop with one of them written wrong.
 
+A client is a `UnixStream` and a `read_line`: `nitro_system::session`
+(`crates/nitro-system`) is the one the bar's power menu uses. This crate
+deliberately does **not** depend on it — the two sides share a protocol,
+not code — so a change to the replies here must be mirrored there.
+
 | request | effect |
 |---|---|
 | `lock` | M4. `err not implemented …` today. |

@@ -180,9 +180,11 @@
 //! changed by a media key while the window is open is stale until Revert,
 //! which is what the idle contract costs and is worth saying out loud.
 
-pub mod audio;
-pub mod conf;
 pub mod control;
+
+/// The audio and config modules live in `nitro-system`, shared with
+/// `nitro-bar`'s quick settings; re-exported so paths here are unchanged.
+pub use nitro_system::{audio, conf};
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -2224,9 +2226,8 @@ fn set_scheme(s: &mut Settings, ui: &mut Ui<Settings>, status: WidgetId, dark: b
         );
         return;
     };
-    let mut conf = load_conf(s);
-    conf.theme.scheme = Some(if dark { Scheme::Dark } else { Scheme::Light });
-    if let Err(e) = conf::write(&path, &conf) {
+    let scheme = if dark { Scheme::Dark } else { Scheme::Light };
+    if let Err(e) = conf::set_scheme(&path, scheme) {
         say(s, ui, format!("could not save the scheme: {e}"));
         return;
     }

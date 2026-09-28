@@ -10,15 +10,20 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-# The toolkit, and nothing else — the same rule `nitro-calc` states.
+# The toolkit and `nitro-system`, and nothing else — the same rule
+# `nitro-calc` states.
 #
 # In particular **not** `nitro-server`, even though this app reads and
 # writes the compositor's own configuration file: depending on it would
 # link the whole compositor (libinput, drm, xkbcommon, the rasterizer)
-# into a 700 KB budget binary to reuse forty lines of parser. `conf.rs`
-# renders and parses the format instead, and a round-trip test against
-# the server's real parser is what keeps the two copies honest.
+# into a 700 KB budget binary to reuse forty lines of parser.
+# `nitro_system::conf` renders and parses the format instead, and a
+# round-trip test against the server's real parser is what keeps the two
+# copies honest.
 nitro-ui = { workspace = true }
+# `audio` and `conf` live there, shared with nitro-bar's quick settings;
+# it depends on `nitro-core` only.
+nitro-system = { workspace = true }
 
 [lib]
 name = "nitro_settings"

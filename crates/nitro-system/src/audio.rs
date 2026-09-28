@@ -39,6 +39,16 @@
 //! `unsafe` and process-global, so one test's `PATH` would be every
 //! concurrently running test's `PATH`. This is the same reasoning that
 //! makes `nitro-bar` inject its sensor source.
+//!
+//! # Output devices
+//!
+//! [`Backend::sinks`] lists the sinks and which one is the default, and
+//! [`Backend::set_default_sink`] moves the default — the quick-settings
+//! "Sound Output" list. `wpctl status` is a tree drawn for people, so
+//! [`parse_wpctl_sinks`] reads it by shape (a `*`, an `id.`, a
+//! description, a `[vol: …]` suffix) inside the `Audio` → `Sinks:` block
+//! and nowhere else; `pactl list sinks` is read as `Name:`/`Description:`
+//! pairs by [`parse_pactl_sinks`].
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -57,6 +67,19 @@ pub struct Volume {
     pub level: f32,
     /// Whether the sink is muted.
     pub muted: bool,
+}
+
+/// One output device, as the mixer names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sink {
+    /// What [`Backend::set_default_sink`] passes back to the tool:
+    /// `wpctl`'s numeric object id, or `pactl`'s sink *name*
+    /// (`alsa_output.pci-0000_00_1f.3.analog-stereo`).
+    pub id: String,
+    /// The human description, for a list row.
+    pub name: String,
+    /// Whether this is the current default sink.
+    pub default: bool,
 }
 
 /// Which command-line mixer this machine has.
@@ -157,6 +180,40 @@ impl Backend {
         match self {
             Self::Wpctl(bin) => try_run(bin, &["set-volume", WPCTL_SINK, &percent]),
             Self::Pactl(bin) => try_run(bin, &["set-sink-volume", PACTL_SINK, &percent]),
+        }
+    }
+
+    /// The output devices, with the default marked.
+    ///
+    /// `None` when the tool fails or its output cannot be read; an empty
+    /// list when it reads fine and there are no sinks.
+    #[must_use]
+    pub fn sinks(&self) -> Option<Vec<Sink>> {
+        match self {
+            Self::Wpctl(bin) => parse_wpctl_sinks(&run(bin, &["status"])?),
+            Self::Pactl(bin) => {
+                let default = run(bin, &["get-default-sink"]);
+                let default = default.as_deref().map(str::trim).filter(|d| !d.is_empty());
+                run(bin, &["list", "sinks"])
+                    .and_then(|out| parse_pactl_sinks(&out, default))
+                    // The long listing is localised and verbose; the short
+                    // one is tab-separated columns and is not.
+                    .or_else(|| {
+                        parse_pactl_short_sinks(&run(bin, &["list", "short", "sinks"])?, default)
+                    })
+            }
+        }
+    }
+
+    /// Make `sink` the default output.
+    ///
+    /// # Errors
+    /// If the tool cannot be run or exits non-zero (an id that no longer
+    /// exists, for one).
+    pub fn set_default_sink(&self, sink: &Sink) -> Result<(), String> {
+        match self {
+            Self::Wpctl(bin) => try_run(bin, &["set-default", &sink.id]),
+            Self::Pactl(bin) => try_run(bin, &["set-default-sink", &sink.id]),
         }
     }
 
@@ -291,6 +348,155 @@ pub fn parse_pactl_mute(out: &str) -> Option<bool> {
     }
 }
 
+/// Box-drawing and indentation `wpctl status` draws its tree with.
+fn is_tree(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '│' | '├' | '└' | '─' | '|' | '`' | '-')
+}
+
+/// Parse `wpctl status`'s `Audio` → `Sinks:` block.
+///
+/// ```text
+/// Audio
+///  ├─ Devices:
+///  │      42. Built-in Audio                      [alsa]
+///  │
+///  ├─ Sinks:
+///  │  *   46. Built-in Audio Analog Stereo        [vol: 0.40]
+///  │      51. HDMI 1.2 Output                     [vol: 1.00 MUTED]
+///  │
+///  ├─ Sources:
+/// ```
+///
+/// By shape rather than by column: the tree characters are stripped, an
+/// entry is an optional `*` (the default), digits and a `.`, then the
+/// description with a trailing `[…]` removed. The block ends at the next
+/// header (`Sources:`, `Filters:`, …), a blank tree line, or the next
+/// top-level section (`Video` has a `Sinks:` of its own). `None` when
+/// there is no `Audio` → `Sinks:` block at all.
+#[must_use]
+pub fn parse_wpctl_sinks(out: &str) -> Option<Vec<Sink>> {
+    let mut in_audio = false;
+    let mut in_sinks = false;
+    let mut found = false;
+    let mut sinks = Vec::new();
+    for line in out.lines() {
+        let top_level = line.chars().next().is_some_and(|c| !is_tree(c));
+        if top_level {
+            in_audio = line.trim() == "Audio";
+            in_sinks = false;
+            continue;
+        }
+        if !in_audio {
+            continue;
+        }
+        let body = line.trim_start_matches(is_tree).trim_end();
+        if body.is_empty() {
+            in_sinks = false;
+            continue;
+        }
+        if body.ends_with(':') && !body.starts_with(|c: char| c == '*' || c.is_ascii_digit()) {
+            in_sinks = body == "Sinks:";
+            found |= in_sinks;
+            continue;
+        }
+        if in_sinks && let Some(sink) = wpctl_entry(body) {
+            sinks.push(sink);
+        }
+    }
+    found.then_some(sinks)
+}
+
+/// One `*   46. Description [vol: 0.40]` entry, tree already stripped.
+fn wpctl_entry(body: &str) -> Option<Sink> {
+    let (default, rest) = match body.strip_prefix('*') {
+        Some(rest) => (true, rest.trim_start()),
+        None => (false, body),
+    };
+    let (id, rest) = rest.split_once('.')?;
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let mut name = rest.trim();
+    if name.ends_with(']')
+        && let Some(open) = name.rfind('[')
+    {
+        name = name[..open].trim_end();
+    }
+    if name.is_empty() {
+        return None;
+    }
+    Some(Sink {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        default,
+    })
+}
+
+/// Parse `pactl list sinks`: one `Sink #N` record per sink, each with a
+/// `Name:` and a `Description:` line. `default` is
+/// `pactl get-default-sink`'s answer, matched against the names.
+///
+/// `None` when no record with a name was found — which is also what a
+/// localised `pactl` looks like, and why [`Backend::sinks`] then falls
+/// back to the short listing. A record with no description is listed
+/// under its name.
+#[must_use]
+pub fn parse_pactl_sinks(out: &str, default: Option<&str>) -> Option<Vec<Sink>> {
+    let mut records: Vec<(Option<String>, Option<String>)> = Vec::new();
+    for line in out.lines() {
+        let line = line.trim();
+        if line.starts_with("Sink #") {
+            records.push((None, None));
+        } else if let Some(record) = records.last_mut() {
+            if let Some(v) = line.strip_prefix("Name:") {
+                record.0.get_or_insert_with(|| v.trim().to_owned());
+            } else if let Some(v) = line.strip_prefix("Description:") {
+                record.1.get_or_insert_with(|| v.trim().to_owned());
+            }
+        }
+    }
+    let sinks: Vec<Sink> = records
+        .into_iter()
+        .filter_map(|(id, name)| {
+            let id = id.filter(|i| !i.is_empty())?;
+            let name = name.filter(|n| !n.is_empty()).unwrap_or_else(|| id.clone());
+            Some(Sink {
+                default: default == Some(id.as_str()),
+                id,
+                name,
+            })
+        })
+        .collect();
+    (!sinks.is_empty()).then_some(sinks)
+}
+
+/// Parse `pactl list short sinks`: `index<TAB>name<TAB>driver…`, the
+/// name (column 2) doubling as the description.
+///
+/// `None` for text that has lines but none of this shape; an empty
+/// output is `Some` of no sinks.
+#[must_use]
+pub fn parse_pactl_short_sinks(out: &str, default: Option<&str>) -> Option<Vec<Sink>> {
+    let mut any_line = false;
+    let mut sinks = Vec::new();
+    for line in out.lines().filter(|l| !l.trim().is_empty()) {
+        any_line = true;
+        let mut cols = line.split_whitespace();
+        let (Some(index), Some(name)) = (cols.next(), cols.next()) else {
+            continue;
+        };
+        if !index.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        sinks.push(Sink {
+            id: name.to_owned(),
+            name: name.to_owned(),
+            default: default == Some(name),
+        });
+    }
+    (!any_line || !sinks.is_empty()).then_some(sinks)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,7 +579,7 @@ mod tests {
     #[test]
     fn detection_prefers_wpctl_and_finds_nothing_in_an_empty_path() {
         let dir = std::env::temp_dir().join(format!(
-            "nitro-settings-audio-{}-{:?}",
+            "nitro-system-audio-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -398,7 +604,7 @@ mod tests {
         // A file that is not executable is not a backend: a stray
         // `wpctl.txt`-shaped thing must not be run.
         let plain =
-            std::env::temp_dir().join(format!("nitro-settings-audio-plain-{}", std::process::id()));
+            std::env::temp_dir().join(format!("nitro-system-audio-plain-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&plain);
         std::fs::create_dir_all(&plain).expect("temp dir");
         std::fs::write(plain.join("wpctl"), "not executable").expect("write");
@@ -406,6 +612,226 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&plain);
+    }
+
+    /// `wpctl status` as `PipeWire` 1.0 prints it, trimmed: a `Video`
+    /// section with its own `Sinks:` and an `Audio` `Sources:` block
+    /// that must not leak into the audio sinks.
+    const WPCTL_STATUS: &str = "\
+PipeWire 'pipewire-0' [1.0.5, kaspar@box, cookie:1234]
+ └─ Clients:
+        33. WirePlumber                         [1.0.5, kaspar@box, pid:811]
+
+Audio
+ ├─ Devices:
+ │      42. Built-in Audio                      [alsa]
+ │  
+ ├─ Sinks:
+ │      46. Built-in Audio Analog Stereo        [vol: 0.40]
+ │  *   51. HDMI 1.2 Output (LG 27UL500)        [vol: 1.00 MUTED]
+ │      63. USB-C Dock 2.0                      [vol: 0.75]
+ │  
+ ├─ Sink endpoints:
+ │  
+ ├─ Sources:
+ │  *   47. Built-in Audio Analog Stereo        [vol: 1.00]
+ │  
+ ├─ Source endpoints:
+ │  
+ └─ Streams:
+        70. Firefox
+
+Video
+ ├─ Devices:
+ │      50. Integrated Camera                   [v4l2]
+ │  
+ ├─ Sinks:
+ │      99. Not an audio sink
+ │  
+ └─ Streams:
+
+Settings
+ └─ Default Configured Node Names:
+         0. Audio/Sink    alsa_output.pci-0000_00_1f.3.analog-stereo
+";
+
+    fn sink(id: &str, name: &str, default: bool) -> Sink {
+        Sink {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            default,
+        }
+    }
+
+    #[test]
+    fn wpctl_status_yields_the_audio_sinks_and_nothing_else() {
+        assert_eq!(
+            parse_wpctl_sinks(WPCTL_STATUS),
+            Some(vec![
+                sink("46", "Built-in Audio Analog Stereo", false),
+                sink("51", "HDMI 1.2 Output (LG 27UL500)", true),
+                sink("63", "USB-C Dock 2.0", false),
+            ])
+        );
+    }
+
+    #[test]
+    fn wpctl_status_is_read_by_shape_not_by_column() {
+        // ASCII tree, different indentation, no `[vol: …]` suffix.
+        let text = "Audio\n |- Sinks:\n |   * 7. Speakers\n |     8. Headset 3.5mm [vol: 0.1]\n |- Sources:\n |     9. Mic\n";
+        assert_eq!(
+            parse_wpctl_sinks(text),
+            Some(vec![
+                sink("7", "Speakers", true),
+                sink("8", "Headset 3.5mm", false)
+            ])
+        );
+        // A sinks block that is there and empty is an empty list …
+        assert_eq!(
+            parse_wpctl_sinks("Audio\n ├─ Sinks:\n │  \n ├─ Sources:\n"),
+            Some(vec![])
+        );
+        // … and text with no such block is no reading at all.
+        assert_eq!(parse_wpctl_sinks(""), None);
+        assert_eq!(parse_wpctl_sinks("command not found\n"), None);
+        assert_eq!(
+            parse_wpctl_sinks("Video\n ├─ Sinks:\n │  *  3. Screen\n"),
+            None
+        );
+    }
+
+    /// `pactl list sinks`, trimmed to the lines that matter plus enough
+    /// noise to prove the rest is skipped.
+    const PACTL_LIST: &str = "\
+Sink #0
+\tState: SUSPENDED
+\tName: alsa_output.pci-0000_00_1f.3.analog-stereo
+\tDescription: Built-in Audio Analog Stereo
+\tDriver: PipeWire
+\tProperties:
+\t\tdevice.description = \"Built-in Audio\"
+
+Sink #1
+\tState: RUNNING
+\tName: alsa_output.usb-Dock_2.0-00.analog-stereo
+\tDescription: USB-C Dock 2.0
+\tDriver: PipeWire
+";
+
+    #[test]
+    fn pactl_sinks_are_name_description_pairs_with_the_default_marked() {
+        assert_eq!(
+            parse_pactl_sinks(
+                PACTL_LIST,
+                Some("alsa_output.usb-Dock_2.0-00.analog-stereo")
+            ),
+            Some(vec![
+                sink(
+                    "alsa_output.pci-0000_00_1f.3.analog-stereo",
+                    "Built-in Audio Analog Stereo",
+                    false
+                ),
+                sink(
+                    "alsa_output.usb-Dock_2.0-00.analog-stereo",
+                    "USB-C Dock 2.0",
+                    true
+                ),
+            ])
+        );
+        // No default known: nothing is marked.
+        let none = parse_pactl_sinks(PACTL_LIST, None).expect("sinks");
+        assert!(none.iter().all(|s| !s.default));
+        // Unparseable (or localised) text is `None`, so the caller falls back.
+        assert_eq!(parse_pactl_sinks("Senke #0\n\tNom: x\n", None), None);
+        assert_eq!(parse_pactl_sinks("", None), None);
+    }
+
+    #[test]
+    fn the_short_pactl_listing_is_the_fallback() {
+        let text = "0\talsa_output.pci-0000_00_1f.3.analog-stereo\tPipeWire\ts32le 2ch 48000Hz\tSUSPENDED\n\
+                    1\tbluez_output.00_11_22.1\tPipeWire\ts16le 2ch 48000Hz\tRUNNING\n";
+        assert_eq!(
+            parse_pactl_short_sinks(text, Some("bluez_output.00_11_22.1")),
+            Some(vec![
+                sink(
+                    "alsa_output.pci-0000_00_1f.3.analog-stereo",
+                    "alsa_output.pci-0000_00_1f.3.analog-stereo",
+                    false
+                ),
+                sink("bluez_output.00_11_22.1", "bluez_output.00_11_22.1", true),
+            ])
+        );
+        assert_eq!(parse_pactl_short_sinks("", None), Some(vec![]));
+        assert_eq!(parse_pactl_short_sinks("Connection failure\n", None), None);
+    }
+
+    #[test]
+    fn a_fake_wpctl_round_trips_status_and_set_default() {
+        let dir = std::env::temp_dir().join(format!(
+            "nitro-system-audio-fake-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        // State in files, so a read reflects the last write; every call
+        // appended to `log`.
+        std::fs::write(dir.join("default"), "46\n").expect("state");
+        let script = format!(
+            r#"#!/bin/sh
+d='{dir}'
+echo "$*" >> "$d/log"
+def=$(cat "$d/default")
+mark() {{ [ "$1" = "$def" ] && echo '*' || echo ' '; }}
+case "$1" in
+  status)
+    echo 'Audio'
+    echo ' ├─ Sinks:'
+    echo " │  $(mark 46)   46. Built-in Audio Analog Stereo [vol: 0.40]"
+    echo " │  $(mark 51)   51. HDMI 1.2 Output [vol: 1.00]"
+    echo ' │  '
+    echo ' ├─ Sources:'
+    echo ' │  *   47. Microphone [vol: 1.00]'
+    ;;
+  set-default)
+    case "$2" in 46|51) echo "$2" > "$d/default" ;; *) echo "no such node $2" >&2; exit 1 ;; esac
+    ;;
+  *) exit 1 ;;
+esac
+"#,
+            dir = dir.display()
+        );
+        let bin = dir.join("wpctl");
+        std::fs::write(&bin, script).expect("write");
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        let backend = Backend::detect_in(std::slice::from_ref(&dir)).expect("the fake");
+
+        let sinks = backend.sinks().expect("sinks");
+        assert_eq!(
+            sinks,
+            vec![
+                sink("46", "Built-in Audio Analog Stereo", true),
+                sink("51", "HDMI 1.2 Output", false),
+            ]
+        );
+        backend.set_default_sink(&sinks[1]).expect("set-default");
+        let after = backend.sinks().expect("sinks");
+        assert_eq!(
+            after.iter().find(|s| s.default).map(|s| s.id.as_str()),
+            Some("51")
+        );
+
+        let err = backend
+            .set_default_sink(&sink("9", "Gone", false))
+            .expect_err("unknown id");
+        assert!(err.contains("no such node 9"), "{err}");
+
+        let log = std::fs::read_to_string(dir.join("log")).expect("log");
+        assert_eq!(log, "status\nset-default 51\nstatus\nset-default 9\n");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Write an executable no-op script at `path`.

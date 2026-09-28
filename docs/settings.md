@@ -401,7 +401,7 @@ token or drops it, and every other entry — and their order — survives
 untouched. That matters because this field may well have been typed by
 hand, and a control that overwrote it would delete a configuration from
 a checkbox the user ticked to get one thing (`with_option` in
-`crates/nitro-settings/src/conf.rs`, pinned end to end by
+`crates/nitro-system/src/conf.rs`, pinned end to end by
 `the_caps_lock_switch_edits_only_its_own_option`). The switch and the
 `options` field show one value and each follows the other, so typing
 `ctrl:nocaps` into the field ticks the switch and vice versa.
@@ -954,7 +954,8 @@ the user hand-picked.
 
 ### Audio
 
-Volume and mute shell out to `wpctl` (PipeWire), falling back to `pactl`,
+Volume and mute shell out to `wpctl` (PipeWire), falling back to `pactl`
+(`crates/nitro-system/src/audio.rs`, shared with nitro-bar's quick settings),
 and the section says **no audio backend found** when neither is on
 `PATH`. That is the honest state of the test box, which has no sound
 server under nitro — the section reports it rather than showing a slider

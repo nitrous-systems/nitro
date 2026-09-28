@@ -21,6 +21,7 @@ nitro-launcher = { path = "crates/nitro-launcher" }
 nitro-wallpaper = { path = "crates/nitro-wallpaper" }
 nitro-term   = { path = "crates/nitro-term" }
 nitro-settings = { path = "crates/nitro-settings" }
+nitro-system = { path = "crates/nitro-system" }
 nitro-raster = { path = "crates/nitro-raster" }
 nitro-text   = { path = "crates/nitro-text" }
 nitro-png    = { path = "crates/nitro-png" }

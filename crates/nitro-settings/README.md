@@ -232,7 +232,8 @@ offers none) and `position` for the caption in front of `x` and `y`.
 
 ## Why there is a second copy of the config parser
 
-`src/conf.rs` renders and parses the same format as
+`nitro_system::conf` (`crates/nitro-system/src/conf.rs`, re-exported
+here as `conf`, shared with nitro-bar) renders and parses the same format as
 `nitro_server::config`, and does **not** depend on it. Depending on the
 compositor crate would link libinput, drm, xkbcommon and the rasterizer
 into a binary whose job is to render nine lines of text, for the benefit

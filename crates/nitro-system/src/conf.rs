@@ -1,4 +1,8 @@
-//! `server.conf`, as this app reads and writes it.
+//! `server.conf`, as nitro's apps read and write it.
+//!
+//! Moved here from `nitro-settings` so `nitro-bar`'s quick settings can
+//! flip the colour scheme with the same code ([`set_scheme`]);
+//! `nitro_settings::conf` re-exports this module unchanged.
 //!
 //! This is a **second implementation** of the format
 //! `nitro_server::config` defines, and that is a deliberate duplication
@@ -8,7 +12,8 @@
 //! render nine lines of text — for the benefit of forty lines of parser.
 //!
 //! What keeps the two copies honest is a test rather than a comment:
-//! `the_server_parser_reads_back_what_we_write` in `tests/settings.rs`
+//! `the_server_parser_reads_back_what_we_write` in
+//! `crates/nitro-settings/tests/settings.rs`
 //! feeds this module's output to `nitro_server::config::parse` (through
 //! the dev-dependency, where the compositor may be linked) and asserts
 //! that every value survives. A divergence in either direction fails
@@ -17,7 +22,7 @@
 //!
 //! # The file is rewritten wholesale
 //!
-//! [`render`] produces the *entire* file from a [`Conf`], and [`write`]
+//! [`render`] produces the *entire* file from a [`Conf`], and [`write()`]
 //! renames it over whatever was there. Comments a person typed, keys this
 //! app does not know about, and the order they were written in are all
 //! lost. That is a real limitation and it is documented in the crate docs
@@ -33,12 +38,12 @@
 //! new one, never a half-written one. Writing in place would let the
 //! compositor reload a file that is three lines long, apply a scale of
 //! `1` to the primary output and re-apply the real one a millisecond
-//! later. See [`write`].
+//! later. See [`write()`].
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use nitro_ui::Scheme;
+use nitro_core::Scheme;
 
 /// The file's name inside the configuration directory. Must agree with
 /// `nitro_server::config::FILE_NAME`.
@@ -609,6 +614,27 @@ pub fn write(path: &Path, conf: &Conf) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Set `theme.scheme` in the file at `path`, leaving every other key as
+/// the file had it.
+///
+/// "Every other key" with the caveat of the module docs: the file is
+/// re-rendered, so comments and unknown keys do not survive.
+///
+/// Re-reads the file, changes the one key and writes it back with
+/// [`write()`], so a caller that is not a whole settings dialog — the
+/// bar's dark-style tile, or `nitro-settings`' own scheme switch, which
+/// saves without waiting for Apply — cannot commit anything it did not
+/// mean to. The server's inotify watch reloads it and pushes the new
+/// theme to every client.
+///
+/// # Errors
+/// As [`write()`].
+pub fn set_scheme(path: &Path, scheme: Scheme) -> std::io::Result<()> {
+    let mut conf = load(path);
+    conf.theme.scheme = Some(scheme);
+    write(path, &conf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -858,7 +884,7 @@ keyboard.options = ctrl:nocaps
     #[test]
     fn writing_creates_the_directory_and_leaves_no_temporary_file() {
         let dir = std::env::temp_dir().join(format!(
-            "nitro-settings-conf-{}-{:?}",
+            "nitro-system-conf-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -877,8 +903,27 @@ keyboard.options = ctrl:nocaps
     }
 
     #[test]
+    fn set_scheme_changes_only_the_scheme() {
+        let dir = std::env::temp_dir().join(format!(
+            "nitro-system-scheme-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join(FILE_NAME);
+        write(&path, &example()).expect("write");
+        set_scheme(&path, Scheme::Dark).expect("set");
+        let mut want = example();
+        want.theme.scheme = Some(Scheme::Dark);
+        assert_eq!(load(&path), want);
+        set_scheme(&path, Scheme::Light).expect("set");
+        assert_eq!(load(&path).theme.scheme, Some(Scheme::Light));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn an_absent_file_loads_as_an_empty_configuration() {
-        let missing = std::env::temp_dir().join("nitro-settings-no-such-file.conf");
+        let missing = std::env::temp_dir().join("nitro-system-no-such-file.conf");
         let _ = std::fs::remove_file(&missing);
         assert_eq!(load(&missing), Conf::new());
     }

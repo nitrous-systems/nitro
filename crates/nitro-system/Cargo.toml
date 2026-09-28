@@ -1,0 +1,15 @@
+[package]
+name = "nitro-system"
+description = "The desktop's remote controls: audio mixer CLIs, server.conf, and the nitro-session socket — shared by nitro-settings and nitro-bar"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# `nitro-core` for `Scheme`, and nothing else: no toolkit, no compositor,
+# no external crate. Both consumers are budget binaries.
+nitro-core = { workspace = true }

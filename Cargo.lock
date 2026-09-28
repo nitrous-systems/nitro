@@ -337,6 +337,7 @@ name = "nitro-settings"
 version = "0.0.1"
 dependencies = [
  "nitro-server",
+ "nitro-system",
  "nitro-ui",
 ]
 
@@ -350,6 +351,13 @@ dependencies = [
 [[package]]
 name = "nitro-shot"
 version = "0.0.1"
+
+[[package]]
+name = "nitro-system"
+version = "0.0.1"
+dependencies = [
+ "nitro-core",
+]
 
 [[package]]
 name = "nitro-term"
