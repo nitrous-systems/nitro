@@ -92,6 +92,19 @@ const TYPE_AHEAD_GAP: Duration = Duration::from_millis(900);
 /// Two clicks closer together than this on the same row are a
 /// double-click, which activates it.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+
+/// How [`List::pick`] changes the selection when it moves the cursor.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pick {
+    /// The row alone; the anchor moves to it. A plain click or arrow.
+    Replace,
+    /// The anchor-to-row range, replacing the rest. Shift.
+    Extend,
+    /// Flip the row, keeping the rest; the anchor moves to it. Ctrl.
+    Toggle,
+    /// Add the anchor-to-row range to the rest. Ctrl+Shift.
+    ExtendAdd,
+}
 /// Side of a row's icon, and the width of the column it sits in.
 ///
 /// 16 is one of the four sizes the artwork is drawn for (`docs/icons.md`)
@@ -567,23 +580,40 @@ impl<S: 'static> List<S> {
     /// only the two rows whose selected-ness changed are re-drawn, and
     /// each of them costs one `SetFill`.
     fn move_cursor(&mut self, cx: &mut EventCx<'_, S>, index: usize, extend: bool) {
+        let how = if extend { Pick::Extend } else { Pick::Replace };
+        self.pick(cx, index, how);
+    }
+
+    /// Move the cursor to `index` and change the selection as `how`
+    /// says, firing `on_select` if the cursor or the selection changed.
+    fn pick(&mut self, cx: &mut EventCx<'_, S>, index: usize, how: Pick) {
         if self.model.is_empty() {
             return;
         }
         let index = index.min(self.model.len() - 1);
         let before = (self.cursor, self.selected.clone());
         self.cursor = index;
-        if extend {
-            let (lo, hi) = if self.extend_from <= index {
-                (self.extend_from, index)
-            } else {
-                (index, self.extend_from)
-            };
-            self.selected = (lo..=hi).collect();
+        let (lo, hi) = if self.extend_from <= index {
+            (self.extend_from, index)
         } else {
-            self.extend_from = index;
-            self.selected.clear();
-            self.selected.insert(index);
+            (index, self.extend_from)
+        };
+        match how {
+            Pick::Replace => {
+                self.extend_from = index;
+                self.selected.clear();
+                self.selected.insert(index);
+            }
+            Pick::Extend => self.selected = (lo..=hi).collect(),
+            Pick::Toggle => {
+                // The anchor follows the toggled row, as in GTK and Qt,
+                // so a Shift-click after it ranges from here.
+                self.extend_from = index;
+                if !self.selected.remove(&index) {
+                    self.selected.insert(index);
+                }
+            }
+            Pick::ExtendAdd => self.selected.extend(lo..=hi),
         }
         let id = cx.id;
         self.reveal(cx.ui, id, index);
@@ -678,13 +708,13 @@ impl<S: 'static> List<S> {
     /// Handle a press inside the list: select the row under the
     /// pointer, and activate it on the second click.
     ///
-    /// A click carries no modifier mask — [`Event::PointerDown`] has a
-    /// position and a button and nothing else — so Ctrl-click and
-    /// Shift-click are *not* the pointer half of the multi-selection
-    /// the keyboard has. Putting the mask on every pointer event to
-    /// give one widget two more gestures is a protocol change, and it
-    /// is not this widget's to make; the limitation is recorded in
-    /// `docs/ui.md`.
+    /// Modifiers come from [`EventCx::mods`] (a pointer event has no
+    /// mask of its own): a plain click replaces the selection,
+    /// Shift-click selects from the anchor to the row, Ctrl-click
+    /// toggles the row and moves the anchor to it, and Ctrl+Shift-click
+    /// adds the anchor-to-row range. Only a plain double-click
+    /// activates, and only a plain click arms one, so a quick
+    /// Ctrl-click then click on the same row does not open it.
     fn press(&mut self, cx: &mut EventCx<'_, S>, pos: nitro_core::Point) -> Handled {
         cx.request_focus();
         if self.row_h <= 0.0 || self.model.is_empty() {
@@ -694,12 +724,23 @@ impl<S: 'static> List<S> {
         if row >= self.model.len() {
             return Handled::Yes;
         }
+        let m = cx.mods() & mods::MASK;
+        let shift = m & mods::SHIFT != 0;
+        let ctrl = m & mods::CTRL != 0;
+        let how = match (ctrl, shift) {
+            (false, false) => Pick::Replace,
+            (false, true) => Pick::Extend,
+            (true, false) => Pick::Toggle,
+            (true, true) => Pick::ExtendAdd,
+        };
         let now = Instant::now();
-        let double = self
-            .last_click
-            .is_some_and(|(r, at)| r == row && now.duration_since(at) < DOUBLE_CLICK);
-        self.last_click = Some((row, now));
-        self.move_cursor(cx, row, false);
+        let plain = how == Pick::Replace;
+        let double = plain
+            && self
+                .last_click
+                .is_some_and(|(r, at)| r == row && now.duration_since(at) < DOUBLE_CLICK);
+        self.last_click = if plain { Some((row, now)) } else { None };
+        self.pick(cx, row, how);
         if double {
             self.fire_activate(cx, row);
         }

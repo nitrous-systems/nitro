@@ -284,6 +284,31 @@ fn multiple_returns_every_selected_file_and_single_only_the_cursor() {
 }
 
 #[test]
+fn ctrl_click_picks_several_files() {
+    let dir = scratch("ctrl-click");
+    let (mut h, win) = open(&dir, FilePicker::open().multiple(true));
+    let list = named(&mut h, "picker_list");
+    let b = h.bounds(list);
+    let row_h = h.widget::<nitro_ui::List<St>>(list).row_height();
+    let at = |row: usize| nitro_core::Point::new(b.x + 40.0, b.y + (row as f32 + 0.5) * row_h);
+    // Rows: sub, a.txt, b.png, c.png.
+    h.click_at_in(win, at(1));
+    h.settle();
+    h.key_down(key::LEFT_CTRL);
+    h.click_at_in(win, at(3));
+    h.settle();
+    h.key_up(key::LEFT_CTRL);
+    assert_eq!(status(&mut h), "4 items, 2 selected");
+    let ok = named(&mut h, "picker_ok");
+    act(&mut h, ok, "click", None);
+    assert_eq!(
+        h.state().answers,
+        [Some(vec![dir.join("a.txt"), dir.join("c.png")])]
+    );
+    h.quit();
+}
+
+#[test]
 fn open_on_a_directory_goes_into_it() {
     let dir = scratch("open-dir");
     let (mut h, win) = open(&dir, FilePicker::open());

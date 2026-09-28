@@ -522,6 +522,37 @@ fn every_selection_change_updates_the_status_line() {
 }
 
 #[test]
+fn shift_and_ctrl_clicks_select_several_rows_and_the_status_counts_them() {
+    let (root, dir) = fixture("clicksel");
+    for n in ["a.txt", "b.txt", "c.txt", "d.txt", "e.txt"] {
+        write(&dir.join(n), n);
+    }
+    let (mut h, ids) = app(&dir, &root.join("xdg"));
+    let b = h.bounds(ids.list);
+    let row_h = h.widget::<List<Files>>(ids.list).row_height();
+    let at = |row: usize| Point::new(b.x + 20.0, b.y + row_h * (row as f32 + 0.5));
+
+    h.click_at(at(1));
+    h.settle();
+    h.key_down(key::LEFT_SHIFT);
+    h.click_at(at(3));
+    h.settle();
+    h.key_up(key::LEFT_SHIFT);
+    assert_eq!(h.widget::<List<Files>>(ids.list).selection(), vec![1, 2, 3]);
+    assert_eq!(status(&h, ids), "5 items, 3 selected", "Shift-click counts");
+
+    h.key_down(key::LEFT_CTRL);
+    h.click_at(at(2));
+    h.settle();
+    h.key_up(key::LEFT_CTRL);
+    assert_eq!(h.widget::<List<Files>>(ids.list).selection(), vec![1, 3]);
+    assert_eq!(status(&h, ids), "5 items, 2 selected", "Ctrl-click counts");
+
+    let _ = std::fs::remove_dir_all(&root);
+    h.quit();
+}
+
+#[test]
 fn ctrl_s_cycles_name_size_date_and_the_rows_reorder() {
     // Three files whose name, size and date orders are all different, so
     // a cycle that changed the label without re-sorting the rows — or

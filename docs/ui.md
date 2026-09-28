@@ -614,6 +614,17 @@ half a second after the user stopped typing in order to do nothing;
 `a_settled_list_sends_nothing_while_idle` asserts `next_timeout() ==
 None` and then that the app is silent.
 
+**Multi-selection works from the keyboard and the pointer alike.** The
+keys are Shift+arrows (extend from the anchor) and Ctrl+Space (toggle the
+cursor's row). A plain click replaces the selection, Shift-click selects
+anchor-to-row, Ctrl-click toggles the row and moves the anchor to it
+(as GTK and Qt do), and Ctrl+Shift-click adds the anchor-to-row range.
+Only a plain double-click activates, and only a plain click arms one, so a
+quick Ctrl-click and click on one row does not open it. `on_select` fires
+whenever the cursor or the selection changes, including a Ctrl-click that
+toggles off the cursor's own row. The modifiers come from
+`EventCx::mods`; see *Deviations* for where that mask comes from.
+
 #### A row's icon is a name, in a column that costs width and never height
 
 `Row::icon("folder-fill")` names an icon from the server's symbolic set —
@@ -1443,9 +1454,8 @@ FilePicker::open()                 // or ::save("name.txt"), ::folder()
   `picker_name`, `picker_status`, `picker_ok`, `picker_cancel`,
   `picker_filter`, `picker_back`, `picker_up`, and `place_<key>` rows in
   `picker_places`, all under `window[N]`.
-* **Limitations.** Multiple selection is the list's keyboard one
-  (Shift+arrows, Ctrl+Space): pointer events carry no modifier mask, so
-  there is no Ctrl-click (see *Deviations*). The server has no
+* **Limitations.** Multiple selection is the list's own: Shift+arrows,
+  Ctrl+Space, Shift-click and Ctrl-click. The server has no
   transient-parent or modal relation yet, so the dialog is an ordinary
   window: it is not kept above or centred on the app, and the app's own
   window stays usable while it is open.
@@ -1893,14 +1903,18 @@ regrets:
   has no per-row callbacks or per-row state, only an index. A screenful
   of arbitrary widgets is still a screenful of widgets; `List` virtualises
   rows, not the tree.
-* **A pointer event carries no modifier mask.** `Event::PointerDown` has
-  a position and a button and nothing else, so Ctrl-click and
-  Shift-click cannot be distinguished from a plain click. A `List`'s
-  multi-selection is therefore **keyboard-only** (`Ctrl+Space`, Shift and
-  the arrows), and a pointer selects exactly one row. Fixing it means
-  carrying the mask on every pointer event on the wire, which is a
-  protocol change made for one widget's two extra gestures; it is worth
-  doing when a second widget wants it.
+* **A pointer event carries no modifier mask; the toolkit tracks one.**
+  `Event::PointerDown` has a position and a button and nothing else, so
+  `Ui::modifiers` (and `EventCx::mods`, for a widget) keeps the mask from
+  the `mods` of every `Key` the app receives — the post-event xkb mask, so
+  pressing or releasing Shift updates it — and clears it when a window
+  loses focus. That is what lets a `List` tell Shift- and Ctrl-click from a
+  plain click. The server's `Modifiers` message would be exact, but it goes
+  only to `KEYMAP` clients, and opting in turns off server key repeat. The
+  gap: a modifier pressed while another client had focus is not seen until
+  the next key here, so Shift held *before* clicking into an unfocused
+  window acts as a plain click. Clicks inside the focused window work,
+  because the server focuses a window on a left press before delivering it.
 * **Scrolling under a stationary pointer does not re-hover.** Hit testing
   and `window_bounds` *do* account for a content transform — a scrolled
   button is clicked and reported where it is drawn — but the hover chain

@@ -769,6 +769,8 @@ the trash module argues about above.
 | letters | type-ahead to the first matching row |
 | Enter, double-click | enter a directory, or open a file |
 | Ctrl+Space | toggle the cursor's row in the selection |
+| Shift+↑↓, Shift-click | extend the selection from the anchor |
+| Ctrl-click / Ctrl+Shift-click | toggle a row / add a range to the selection |
 | `F2` | rename the cursor's row |
 | `Delete` | move the selection to the trash, after a `y`/`n` |
 | `Ctrl+N` | new folder |
@@ -1315,13 +1317,9 @@ regrets.
   fallback opens a terminal rather than the editor. The argv is already
   the conventional `term -e EDITOR path`, so this closes with a change in
   `nitro-term` and none here.
-* **Selection by pointer is single.** `Event::PointerDown` carries a
-  position and a button and no modifier mask, so Ctrl-click and
-  Shift-click are not the pointer half of the multi-selection the
-  keyboard has (`Ctrl+Space`, `Shift`+arrows). Putting a modifier mask on
-  every pointer event to give one widget two more gestures is a protocol
-  change, and it is not a widget's to make; the limitation is recorded in
-  `docs/ui.md` too.
+* **Shift held before clicking into an unfocused window is a plain
+  click.** Modifiers for clicks come from key events (`docs/ui.md`,
+  *Deviations*), and none arrive while the window is unfocused.
 * **The type comes from the extension, never the content**, so an
   extensionless script has no type and nothing opens it. Argued above.
 * **`globs2` rules that are not plain suffixes are ignored**, as are

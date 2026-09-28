@@ -994,3 +994,150 @@ fn one_wheel_notch_down_scrolls_speed_rows_down() {
     h.wheel(-2.0);
     assert!(h.widget::<List<Vec<usize>>>(id).offset().abs() < 0.01);
 }
+
+// -- modifier-aware clicks ------------------------------------------------
+
+/// Click `row` with `modifier` (a keycode) held down through the server's
+/// xkb, the way a user would.
+fn click_row_with(h: &mut Harness<Vec<usize>>, id: WidgetId, modifier: &[u32], row: usize) {
+    for m in modifier {
+        h.key_down(*m);
+    }
+    click_row(h, id, row);
+    for m in modifier.iter().rev() {
+        h.key_up(*m);
+    }
+}
+
+fn sel(h: &Harness<Vec<usize>>, id: WidgetId) -> Vec<usize> {
+    h.widget::<List<Vec<usize>>>(id).selection()
+}
+
+#[test]
+fn a_plain_click_replaces_the_selection() {
+    let (mut h, id) = list_of(20, 300.0);
+    click_row(&mut h, id, 2);
+    click_row(&mut h, id, 5);
+    assert_eq!(sel(&h, id), vec![5]);
+}
+
+#[test]
+fn shift_click_extends_from_the_anchor() {
+    let (mut h, id) = list_of(20, 300.0);
+    click_row(&mut h, id, 2);
+    click_row_with(&mut h, id, &[key::LEFT_SHIFT], 5);
+    assert_eq!(sel(&h, id), vec![2, 3, 4, 5]);
+    assert_eq!(h.widget::<List<Vec<usize>>>(id).cursor(), 5);
+    click_row_with(&mut h, id, &[key::LEFT_SHIFT], 0);
+    assert_eq!(sel(&h, id), vec![0, 1, 2], "the anchor stayed on row 2");
+}
+
+#[test]
+fn ctrl_click_toggles_the_row_and_moves_the_cursor() {
+    let (mut h, id) = list_of(20, 300.0);
+    click_row(&mut h, id, 2);
+    click_row_with(&mut h, id, &[key::LEFT_CTRL], 5);
+    assert_eq!(sel(&h, id), vec![2, 5]);
+    assert_eq!(h.widget::<List<Vec<usize>>>(id).cursor(), 5);
+    click_row_with(&mut h, id, &[key::LEFT_CTRL], 2);
+    assert_eq!(sel(&h, id), vec![5]);
+    assert_eq!(h.widget::<List<Vec<usize>>>(id).cursor(), 2);
+}
+
+#[test]
+fn ctrl_shift_click_adds_a_range() {
+    let (mut h, id) = list_of(20, 300.0);
+    click_row(&mut h, id, 1);
+    click_row_with(&mut h, id, &[key::LEFT_CTRL], 4);
+    click_row_with(&mut h, id, &[key::LEFT_CTRL, key::LEFT_SHIFT], 6);
+    assert_eq!(sel(&h, id), vec![1, 4, 5, 6]);
+}
+
+#[test]
+fn a_modified_click_neither_activates_nor_arms_a_double_click() {
+    let (mut h, id) = list_of(20, 300.0);
+    // Plain, then Ctrl on the same row: no activation.
+    click_row(&mut h, id, 3);
+    click_row_with(&mut h, id, &[key::LEFT_CTRL], 3);
+    assert!(
+        h.state().is_empty(),
+        "a Ctrl second click does not activate"
+    );
+    // Ctrl, then plain on the same row: the Ctrl-click armed nothing.
+    click_row_with(&mut h, id, &[key::LEFT_CTRL], 7);
+    click_row(&mut h, id, 7);
+    assert!(h.state().is_empty(), "a Ctrl-click does not arm a double");
+    // Shift twice: no activation either.
+    click_row_with(&mut h, id, &[key::LEFT_SHIFT], 9);
+    click_row_with(&mut h, id, &[key::LEFT_SHIFT], 9);
+    assert!(
+        h.state().is_empty(),
+        "a Shift double-click does not activate"
+    );
+    // And a plain double-click still does.
+    click_row(&mut h, id, 7);
+    assert!(h.state().is_empty(), "the Shift-clicks disarmed the double");
+    click_row(&mut h, id, 7);
+    assert_eq!(h.state().as_slice(), [7]);
+}
+
+#[test]
+fn ctrl_click_toggling_the_cursors_row_fires_on_select() {
+    let mut h = Harness::sized(
+        "list-select",
+        Vec::new(),
+        Size::new(240.0, 300.0),
+        |ui: &mut Ui<Vec<usize>>| {
+            ui.build(
+                list()
+                    .name("rows")
+                    .rows(rows(20))
+                    .on_select(|s: &mut Vec<usize>, _ui: &mut Ui<Vec<usize>>, i: usize| {
+                        s.push(i);
+                    })
+                    .grow(1.0)
+                    .width_percent(1.0)
+                    .height_percent(1.0),
+            )
+        },
+    );
+    let id = h.ui().root().unwrap();
+    click_row(&mut h, id, 4);
+    let n = h.state().len();
+    // The cursor is already on 4; toggling it off changes only the
+    // selection, and that is still a selection change.
+    click_row_with(&mut h, id, &[key::LEFT_CTRL], 4);
+    assert_eq!(sel(&h, id), Vec::<usize>::new());
+    assert_eq!(h.state().len(), n + 1, "on_select fired");
+    assert_eq!(h.state().last(), Some(&4));
+    // Ctrl+Space fires too.
+    h.key_with(key::LEFT_CTRL, key::SPACE);
+    assert_eq!(sel(&h, id), vec![4]);
+    assert_eq!(h.state().len(), n + 2);
+}
+
+#[test]
+fn a_shift_left_over_from_before_a_blur_does_not_extend() {
+    let (mut h, id) = list_of(20, 300.0);
+    click_row(&mut h, id, 2);
+    // Shift goes down, then the window loses focus with it held: the
+    // release is never seen here.
+    h.key_down(key::LEFT_SHIFT);
+    assert_ne!(h.ui().modifiers() & nitro_ui::event::mods::SHIFT, 0);
+    {
+        let (ui, s) = h.parts();
+        ui.dispatch(
+            s,
+            &nitro_wire::msg::ServerMsg::Focus(nitro_wire::msg::Focus {
+                window: nitro_ui::WindowId::MAIN.raw(),
+                focused: false,
+            }),
+        );
+    }
+    assert_eq!(h.ui().modifiers(), 0, "focus loss clears the mask");
+    // Shift is still down on the server, but no key event says so
+    // again: the click must be plain.
+    click_row(&mut h, id, 5);
+    h.key_up(key::LEFT_SHIFT);
+    assert_eq!(sel(&h, id), vec![5]);
+}

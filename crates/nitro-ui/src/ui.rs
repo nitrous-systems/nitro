@@ -298,6 +298,16 @@ pub struct Ui<S> {
     gone_windows: Vec<NodeId>,
     /// Whether windows paint the theme's background behind the tree.
     backdrop_wanted: bool,
+    /// The keyboard's xkb modifier mask as of the last `Key` this app
+    /// received; see [`Ui::modifiers`].
+    ///
+    /// Taken from `Key.mods` (the post-event effective mask), because
+    /// the server's `Modifiers` message goes only to `KEYMAP` clients
+    /// and nitro-ui is not one. Cleared when a window loses focus: no
+    /// key events arrive while unfocused, so a stale Ctrl must not
+    /// survive into the next click. The gap: a modifier pressed while
+    /// another client had focus is not seen until the next key here.
+    mods: u32,
     /// Override for the server control socket `shot` talks to.
     control_path: Option<std::path::PathBuf>,
     /// Focus changes waiting to be reported, oldest first.
@@ -455,6 +465,7 @@ impl<S: 'static> Ui<S> {
             active: WindowId::MAIN,
             gone_windows: Vec::new(),
             backdrop_wanted: true,
+            mods: 0,
             control_path: None,
             pending_focus: Vec::new(),
             pending_deferred: Vec::new(),
@@ -3197,6 +3208,7 @@ impl<S: 'static> Ui<S> {
             if self.clipboard.focus == Some(f.window) {
                 self.clipboard.focus = None;
             }
+            self.mods = 0;
             self.blur_in(state, win);
         }
     }
@@ -3616,6 +3628,7 @@ impl<S: 'static> Ui<S> {
     /// [`Ui::key`] for a known window.
     fn key_in(&mut self, state: &mut S, win: WindowId, k: &nitro_wire::msg::Key) {
         let pressed = k.state == ButtonState::Pressed;
+        self.mods = k.mods;
         let ev = KeyEvent {
             keycode: k.keycode,
             keysym: k.keysym,
@@ -4047,6 +4060,19 @@ impl<S: 'static> Ui<S> {
         self.windows
             .iter()
             .any(|w| w.capture.as_ref().is_some_and(|c| c.chain.contains(&id)))
+    }
+
+    /// The xkb modifier mask as of the last key event this app
+    /// received; compare against [`mods`](crate::event::mods)`::*`
+    /// masked with [`mods::MASK`](crate::event::mods::MASK).
+    ///
+    /// Pointer events carry no mask of their own, so this is what a
+    /// widget reads to tell a Shift- or Ctrl-click from a plain one.
+    /// It is cleared when a window loses focus, and a modifier pressed
+    /// while another client had focus is not seen until the next key.
+    #[must_use]
+    pub fn modifiers(&self) -> u32 {
+        self.mods
     }
 
     /// The focused widget of the active window, if any; see

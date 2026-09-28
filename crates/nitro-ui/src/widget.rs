@@ -838,6 +838,14 @@ pub struct EventCx<'a, S> {
 }
 
 impl<S: 'static> EventCx<'_, S> {
+    /// The xkb modifier mask held right now, as far as the app knows;
+    /// see [`Ui::modifiers`]. Meaningful for pointer events, which
+    /// carry no mask of their own (a key event has its own `mods`).
+    #[must_use]
+    pub fn mods(&self) -> u32 {
+        self.ui.modifiers()
+    }
+
     /// Ask for a repaint of this widget.
     pub fn request_paint(&mut self) {
         self.ui.mark(self.id, Dirty::PAINT);
