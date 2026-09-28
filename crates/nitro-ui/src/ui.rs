@@ -380,6 +380,8 @@ pub struct Ui<S> {
     /// Whether a `RequestFrame` is outstanding, so asking twice in one
     /// turn does not put two requests on the wire.
     frame_requested: bool,
+    /// The system clipboard; see [`crate::clipboard`].
+    pub(crate) clipboard: crate::clipboard::Clipboard<S>,
 }
 
 /// A shell-event handler; see [`Ui::on_shell`].
@@ -473,6 +475,7 @@ impl<S: 'static> Ui<S> {
             frame_handlers: Vec::new(),
             theme_handlers: Vec::new(),
             frame_requested: false,
+            clipboard: crate::clipboard::Clipboard::new(),
         }
     }
 
@@ -1317,6 +1320,10 @@ impl<S: 'static> Ui<S> {
         &mut self.wire
     }
 
+    pub(crate) fn wire(&self) -> &Wire {
+        &self.wire
+    }
+
     /// Commits sent since the tree was created.
     #[must_use]
     pub fn commit_count(&self) -> u32 {
@@ -1959,7 +1966,15 @@ impl<S: 'static> Ui<S> {
         // and not sent at all to a server that cannot know the op.
         self.wire
             .conn_mut()
-            .client_caps(nitro_wire::types::caps::ICONS | nitro_wire::types::caps::POPUP)?;
+            .client_caps(
+                nitro_wire::types::caps::ICONS
+                    | nitro_wire::types::caps::POPUP
+                    | nitro_wire::types::caps::DATA,
+            )?;
+        // `client_caps` masks to what the server advertised: a remote
+        // link or an old server has no `DATA`, and the clipboard stays
+        // app-local.
+        self.clipboard.enabled = true;
         self.wire.create_window(main, title, size, layer, flags)?;
         // The app id, in the same commit: it is what a window list names
         // the program by, and a window that existed for one frame without
@@ -3018,6 +3033,9 @@ impl<S: 'static> Ui<S> {
         // while it waited in `stray`. Overwriting it here would drop the
         // very keystroke the queue exists to keep.
         self.wire.stray.append(&mut batch);
+        // A memfd answer is readable at once, so most pastes finish in
+        // the same pump that delivered them.
+        self.poll_clipboard(state);
         self.deliver_focus_events(state);
         self.run_deferred(state);
         // A latched error is fatal by construction (the non-fatal codes
@@ -3115,6 +3133,11 @@ impl<S: 'static> Ui<S> {
             ServerMsg::Focus(f) => {
                 if let Some(win) = self.window_by_node(f.window) {
                     if f.focused {
+                        self.clipboard.focus = Some(f.window);
+                    } else if self.clipboard.focus == Some(f.window) {
+                        self.clipboard.focus = None;
+                    }
+                    if f.focused {
                         self.active = win;
                     } else {
                         self.blur_in(state, win);
@@ -3166,6 +3189,10 @@ impl<S: 'static> Ui<S> {
             // is the cue for `.fallback(…)`.
             ServerMsg::IconRefused(r) => self.icon_refused(r),
             ServerMsg::Error(e) => self.server_error(e),
+            // The clipboard; see `crate::clipboard`.
+            ServerMsg::SelectionOffer(o) => self.clipboard_offer(o),
+            ServerMsg::SelectionRequest(r) => self.clipboard_serve(r),
+            ServerMsg::SelectionData(d) => self.clipboard_data(d),
             _ => {}
         }
     }
@@ -4286,8 +4313,7 @@ impl<S: 'static> Ui<S> {
         callback: impl FnMut(&mut S, &mut Ui<S>) + 'static,
     ) -> Result<FdToken, Error> {
         let owned = rustix::io::dup(fd)?;
-        let id = self.next_fd_token;
-        self.next_fd_token += 1;
+        let id = self.alloc_fd_token();
         let token = FdToken(id);
         self.fds.push(FdHook {
             id,
@@ -4327,7 +4353,18 @@ impl<S: 'static> Ui<S> {
     /// The descriptors registered with [`Ui::add_fd`], with a borrow of
     /// each so the loop can hand them to `epoll`.
     pub(crate) fn hook_fds(&self) -> Vec<(u64, BorrowedFd<'_>)> {
-        self.fds.iter().map(|h| (h.id, h.fd.as_fd())).collect()
+        self.fds
+            .iter()
+            .map(|h| (h.id, h.fd.as_fd()))
+            .chain(self.clipboard.fds())
+            .collect()
+    }
+
+    /// A never-used descriptor-hook token; see [`FdToken`].
+    pub(crate) fn alloc_fd_token(&mut self) -> u64 {
+        let id = self.next_fd_token;
+        self.next_fd_token += 1;
+        id
     }
 
     /// Bring every pending timer `by` closer to firing, as though that
@@ -4395,6 +4432,10 @@ impl<S: 'static> Ui<S> {
     pub fn run_fd(&mut self, state: &mut S, token: FdToken) {
         let id = token.0;
         let Some(i) = self.fds.iter().position(|h| h.id == id) else {
+            if self.clipboard.owns_token(id) {
+                self.poll_clipboard(state);
+                self.run_deferred(state);
+            }
             return;
         };
         // Take the callback out for the same reason a widget leaves its

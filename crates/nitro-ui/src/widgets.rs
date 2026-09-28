@@ -2221,8 +2221,66 @@ impl<S: 'static> TextField<S> {
         self.fire(cx, false);
     }
 
+    /// Copy the selection to the clipboard. A secret field never lets
+    /// its text out, so it copies nothing.
+    fn copy(&mut self, cx: &mut EventCx<'_, S>) -> bool {
+        let (a, b) = self.selection();
+        if self.secret || a == b {
+            return false;
+        }
+        match cx.ui.set_clipboard_text(&self.text[a..b]) {
+            Ok(ok) => ok,
+            Err(e) => {
+                eprintln!("nitro-ui: copy: {e}");
+                false
+            }
+        }
+    }
+
+    /// Ask for the clipboard's text; the answer arrives later and is
+    /// inserted through the `insert` action, because this widget is out
+    /// of its slot now and the callback runs after it is back.
+    fn paste(cx: &mut EventCx<'_, S>) {
+        let id = cx.id;
+        cx.ui.read_clipboard(
+            &[crate::clipboard::TEXT_MIME, crate::clipboard::PLAIN_MIME],
+            move |s, ui, got| {
+                let Some((_, bytes)) = got else { return };
+                let text = String::from_utf8_lossy(&bytes);
+                // A stale widget (the field went away) is not an error.
+                let _ = ui.action(s, id, "insert", Some(&text));
+            },
+        );
+    }
+
+    /// The clipboard chords: Ctrl+C / Ctrl+Insert copy, Ctrl+X cuts,
+    /// Ctrl+V / Shift+Insert paste. `None` for any other key. Consumed
+    /// even when there is nothing to do, so an app shortcut on the same
+    /// chord does not fire while the user edits text.
+    fn clipboard_key(&mut self, cx: &mut EventCx<'_, S>, k: &crate::event::KeyEvent) -> Option<bool> {
+        use crate::event::mods;
+        let m = k.mods & mods::MASK;
+        match (m, k.keycode) {
+            (mods::CTRL, key::C | key::INSERT) => {
+                self.copy(cx);
+            }
+            (mods::CTRL, key::X) => {
+                if self.copy(cx) {
+                    self.replace_selection("");
+                    self.after_edit(cx);
+                }
+            }
+            (mods::CTRL, key::V) | (mods::SHIFT, key::INSERT) => Self::paste(cx),
+            _ => return None,
+        }
+        Some(true)
+    }
+
     /// Handle one key. Returns whether it was consumed.
     fn key(&mut self, cx: &mut EventCx<'_, S>, k: &crate::event::KeyEvent) -> bool {
+        if let Some(done) = self.clipboard_key(cx, k) {
+            return done;
+        }
         let shift = k.shift();
         let (sel_a, sel_b) = self.selection();
         match k.keycode {
@@ -2506,7 +2564,7 @@ impl<S: 'static> Widget<S> for TextField<S> {
             name: None,
             value: Some(self.shown().into_owned()),
             actions: if self.enabled {
-                vec!["set_value", "focus", "submit", "clear"]
+                vec!["set_value", "focus", "submit", "clear", "insert"]
             } else {
                 Vec::new()
             },
@@ -2527,6 +2585,19 @@ impl<S: 'static> Widget<S> for TextField<S> {
                 self.anchor = self.cursor;
                 self.scroll = 0.0;
                 self.after_edit(cx);
+                Handled::Yes
+            }
+            // Replace the selection with the argument, as typing or a
+            // paste would: one line, so line breaks and tabs become
+            // spaces and other control characters are dropped.
+            "insert" => {
+                if !self.enabled {
+                    return Handled::No;
+                }
+                let clean = single_line(arg.unwrap_or_default());
+                if self.replace_selection(&clean) {
+                    self.after_edit(cx);
+                }
                 Handled::Yes
             }
             "clear" => {
@@ -2554,6 +2625,19 @@ impl<S: 'static> Widget<S> for TextField<S> {
             _ => Handled::No,
         }
     }
+}
+
+/// `s` as one line of text: `\r\n`, `\n`, `\r` and `\t` become a space,
+/// every other control character is dropped.
+fn single_line(s: &str) -> String {
+    let s = s.replace("\r\n", " ");
+    s.chars()
+        .filter_map(|c| match c {
+            '\n' | '\r' | '\t' => Some(' '),
+            c if c.is_control() => None,
+            c => Some(c),
+        })
+        .collect()
 }
 
 /// The character a secret [`TextField`] shows, and sends, for each

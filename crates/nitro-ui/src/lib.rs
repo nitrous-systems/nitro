@@ -70,6 +70,7 @@
 //! | [`list`] | `List`: a **virtualised** list, `visible + 2` nodes for any model |
 //! | [`picker`] | `FilePicker`: the file / folder dialog, a second window laid out like `nitro-files` |
 //! | [`split`] | the split-view blueprint: `SidebarRow`, `Card`, `CardRow`, `Pages`, `Switch`, `split_view` |
+//! | [`clipboard`] | the system clipboard: copy, serve, paste |
 //! | [`build`] | the builder traits |
 //! | [`layout`] | the flex model, as pure functions |
 //! | [`event`] | [`Event`], [`Handled`] and the key/button codes |
@@ -82,6 +83,7 @@
 pub mod app;
 pub mod arena;
 pub mod build;
+pub mod clipboard;
 pub mod error;
 pub mod event;
 pub mod introspect;

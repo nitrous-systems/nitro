@@ -100,6 +100,10 @@ pub mod key {
     pub const A: u32 = 30;
     /// The letter `c`, for `Ctrl-C`.
     pub const C: u32 = 46;
+    /// The letter `x`, for `Ctrl-X` (cut).
+    pub const X: u32 = 45;
+    /// `Insert`, for `Ctrl-Insert` (copy) and `Shift-Insert` (paste).
+    pub const INSERT: u32 = 110;
     /// The letter `h`, for `Ctrl-H`.
     pub const H: u32 = 35;
     /// The letter `l`, for `Ctrl-L` (focus the location bar).
