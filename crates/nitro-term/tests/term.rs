@@ -969,12 +969,8 @@ fn drag_select_and_ctrl_shift_c_puts_the_text_on_the_clipboard() {
     h.settle();
     let cell = h.widget::<TermGrid>(grid).cell_size();
     let b = h.bounds(grid);
-    let at = |col: f32, row: f32| {
-        Point::new(
-            b.x + (col + 0.5) * cell.w,
-            b.y + (row + 0.5) * cell.h,
-        )
-    };
+    let at =
+        |col: f32, row: f32| Point::new(b.x + (col + 0.5) * cell.w, b.y + (row + 0.5) * cell.h);
     // From the `w` of `world` to the `c` of `second`.
     h.move_pointer(at(6.0, 0.0));
     h.press(nitro_ui::event::button::LEFT);
@@ -1008,8 +1004,7 @@ fn ctrl_shift_v_pastes_bracketed_and_ctrl_shift_c_sends_nothing() {
          dd bs=1 count=15 status=none | od -An -t u1",
     ]);
     pump_until(&mut h, "the byte dumper to be ready", |h| {
-        screen(h, grid).contains("ready")
-            && h.widget::<TermGrid>(grid).term().bracketed_paste()
+        screen(h, grid).contains("ready") && h.widget::<TermGrid>(grid).term().bracketed_paste()
     });
     let mut peer = ClipboardPeer::new(&h, "peer");
     peer.copy(&mut h, &[nitro_ui::clipboard::TEXT_MIME]);
@@ -1018,8 +1013,7 @@ fn ctrl_shift_v_pastes_bracketed_and_ctrl_shift_c_sends_nothing() {
     let (id, _) = peer.asked(&mut h);
     peer.answer_bytes(id, b"a\nb");
     let want = [
-        "27", "91", "50", "48", "48", "126", "97", "13", "98", "27", "91", "50", "48", "49",
-        "126",
+        "27", "91", "50", "48", "48", "126", "97", "13", "98", "27", "91", "50", "48", "49", "126",
     ];
     pump_until(&mut h, "od to print the paste", |h| {
         let output = screen(h, grid);

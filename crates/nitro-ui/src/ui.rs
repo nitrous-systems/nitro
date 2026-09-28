@@ -1964,13 +1964,11 @@ impl<S: 'static> Ui<S> {
         // records `ClientCaps` on receipt, so even this window's first
         // refusals name their node. Masked to what the server advertised,
         // and not sent at all to a server that cannot know the op.
-        self.wire
-            .conn_mut()
-            .client_caps(
-                nitro_wire::types::caps::ICONS
-                    | nitro_wire::types::caps::POPUP
-                    | nitro_wire::types::caps::DATA,
-            )?;
+        self.wire.conn_mut().client_caps(
+            nitro_wire::types::caps::ICONS
+                | nitro_wire::types::caps::POPUP
+                | nitro_wire::types::caps::DATA,
+        )?;
         // `client_caps` masks to what the server advertised: a remote
         // link or an old server has no `DATA`, and the clipboard stays
         // app-local.
@@ -3130,20 +3128,7 @@ impl<S: 'static> Ui<S> {
                     refresh_ns: f.refresh_ns,
                 },
             ),
-            ServerMsg::Focus(f) => {
-                if let Some(win) = self.window_by_node(f.window) {
-                    if f.focused {
-                        self.clipboard.focus = Some(f.window);
-                    } else if self.clipboard.focus == Some(f.window) {
-                        self.clipboard.focus = None;
-                    }
-                    if f.focused {
-                        self.active = win;
-                    } else {
-                        self.blur_in(state, win);
-                    }
-                }
-            }
+            ServerMsg::Focus(f) => self.focus_msg(state, *f),
             // The shell socket's news. Not input, so not routed to a
             // widget: offered to the handlers `on_shell` registered.
             ServerMsg::WindowInfo(i) => {
@@ -3198,6 +3183,24 @@ impl<S: 'static> Ui<S> {
     }
 
     /// A `Closed` for a window other than the main one.
+    /// A window of ours gained or lost keyboard focus.
+    fn focus_msg(&mut self, state: &mut S, f: nitro_wire::msg::Focus) {
+        let Some(win) = self.window_by_node(f.window) else {
+            return;
+        };
+        // Tracked for the clipboard: `SetSelection` without keyboard
+        // focus is fatal, so `set_clipboard` checks this first.
+        if f.focused {
+            self.clipboard.focus = Some(f.window);
+            self.active = win;
+        } else {
+            if self.clipboard.focus == Some(f.window) {
+                self.clipboard.focus = None;
+            }
+            self.blur_in(state, win);
+        }
+    }
+
     fn window_closed(&mut self, state: &mut S, node: NodeId) {
         if let Some(win) = self.window_by_node(node) {
             // `Closed` is the server *asking*: it tears the window

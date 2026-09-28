@@ -14,7 +14,6 @@ use nitro_ui::test::{ClipboardPeer as Peer, Harness};
 use nitro_ui::widgets::{TextField, column, panel, text_field};
 use nitro_ui::{Ui, WidgetId};
 
-
 #[derive(Default)]
 struct S {
     /// Every value field `b`'s `on_change` reported.
@@ -164,7 +163,11 @@ fn a_secret_field_does_not_copy_or_cut() {
 fn a_multi_line_paste_becomes_one_line() {
     let (mut h, f) = harness("clip-lines");
     h.click(f.a);
-    assert!(h.ui().set_clipboard_text("one\ntwo\r\nthree\tfour\u{7}").unwrap());
+    assert!(
+        h.ui()
+            .set_clipboard_text("one\ntwo\r\nthree\tfour\u{7}")
+            .unwrap()
+    );
     paste_into(&mut h, f.b, "one two three four");
 }
 

@@ -377,12 +377,30 @@ Each of these is a real feature rather than a missing case, and each is
 recorded because the spec asks for them rather than because they are
 regrets.
 
-* **No clipboard.** `Ctrl+Shift+C`/`V` are deliberately unbound. A
-  clipboard is a server-side concept — a selection owner, and a protocol
-  for offering and requesting types — and nitro does not have one yet.
-  The *bracketed paste* plumbing is in place and tested (`keys::paste`,
-  DECSET 2004), so the day there is a selection owner the terminal side
-  is one call.
+* **The clipboard is keyboard and left-drag only.**
+  * A left drag selects a stream of cells. The selection is kept in
+    absolute line numbers (scrollback plus screen), so scrolling the view
+    does not move it. A click without a drag selects nothing.
+  * `Ctrl+Shift+C` copies the selection as text. Each line has its
+    trailing blanks trimmed and the lines are joined with `\n`. With no
+    selection it does nothing.
+  * `Ctrl+Shift+V` pastes the clipboard's text through the same path as
+    the `paste_text` action (`TermGrid::paste`), without the escape
+    interpretation.
+  * Neither chord is ever sent to the pty. They would encode to `^C` and
+    `^V`, the same bytes as `Ctrl+C` and `Ctrl+V`, so nothing is lost.
+  * There is no primary selection (middle-click paste), no double- or
+    triple-click word or line selection, and no rectangular selection.
+  * Typing, a resize and an alternate-screen switch clear the selection.
+    Other output does not, so the highlight can go stale when the
+    program rewrites the rows under it. The copy then takes whatever
+    those cells hold now.
+* **A paste is sanitised as xterm does it.** Line breaks are sent as `\r`
+  (the Return key). When the program asked for bracketed paste
+  (DECSET 2004) the text is wrapped in `ESC[200~` … `ESC[201~`, and
+  every `ESC[201~` inside the text is removed first. Otherwise pasted
+  text could close the bracket early and have the rest run as typed
+  commands.
 * **No scrollback rewrap.** Resizing reflows the screen but not the
   history: a narrowed window truncates old lines rather than re-wrapping
   them. Rewrap means re-deciding where every historical line broke, which
@@ -412,8 +430,8 @@ regrets.
   writes the bytes as keystrokes even when the program has asked for
   bracketed paste, because the markers tell readline "this is data, do
   not execute it" — which made every scripted command sit unrun on the
-  prompt under bash 5.1+. The `paste_text` action keeps the bracketed
-  path for the day there is a real clipboard.
+  prompt under bash 5.1+. The `paste_text` action is the bracketed
+  path, and it is the one `Ctrl+Shift+V` takes.
 * **`hey`'s value argument takes C-style escapes** (`\n`, `\t`, `\e`,
   `\0`, `\\`), because a control character cannot be written on a
   command line any other way and a terminal's scripted input is mostly

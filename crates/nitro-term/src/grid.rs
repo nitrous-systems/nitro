@@ -717,7 +717,11 @@ impl Grid {
             let cells = self.line_abs(line);
             let end = trimmed_len(cells);
             let c0 = if line == from.0 { from.1 } else { 0 };
-            let c1 = if line == to.0 { (to.1 + 1).min(end) } else { end };
+            let c1 = if line == to.0 {
+                (to.1 + 1).min(end)
+            } else {
+                end
+            };
             if line > from.0 {
                 out.push('\n');
             }

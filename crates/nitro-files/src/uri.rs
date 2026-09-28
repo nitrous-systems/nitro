@@ -18,7 +18,10 @@ pub fn path_to_file_uri(path: &Path) -> String {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'/') {
             out.push(char::from(b));
         } else {
-            out.push_str(&format!("%{b:02X}"));
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            out.push('%');
+            out.push(char::from(HEX[usize::from(b >> 4)]));
+            out.push(char::from(HEX[usize::from(b & 0xf)]));
         }
     }
     out
@@ -73,12 +76,13 @@ fn percent_decode(s: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(s.len());
     let mut i = 0;
     while i < s.len() {
-        if s[i] == b'%' && i + 2 < s.len() {
-            if let (Some(h), Some(l)) = (hex(s[i + 1]), hex(s[i + 2])) {
-                out.push(h << 4 | l);
-                i += 3;
-                continue;
-            }
+        if s[i] == b'%'
+            && i + 2 < s.len()
+            && let (Some(h), Some(l)) = (hex(s[i + 1]), hex(s[i + 2]))
+        {
+            out.push(h << 4 | l);
+            i += 3;
+            continue;
         }
         out.push(s[i]);
         i += 1;

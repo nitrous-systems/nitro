@@ -630,10 +630,7 @@ mod tests {
             b"\x1b[200~xrm -rf ~\r\x1b[201~"
         );
         // Nested so that one removal would leave a new marker behind.
-        assert_eq!(
-            paste("\x1b[20\x1b[201~1~y", true),
-            b"\x1b[200~y\x1b[201~"
-        );
+        assert_eq!(paste("\x1b[20\x1b[201~1~y", true), b"\x1b[200~y\x1b[201~");
         // Unbracketed text is the program's problem, not a marker.
         assert_eq!(paste("\x1b[201~", false), b"\x1b[201~");
     }

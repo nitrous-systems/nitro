@@ -740,11 +740,11 @@ impl<S: 'static> Widget<S> for TermGrid {
             }
             Event::PointerMove { pos } if self.selecting => {
                 let at = self.cell_at(*pos);
-                if let Some(sel) = &mut self.selection {
-                    if sel.head != at {
-                        sel.head = at;
-                        cx.request_paint();
-                    }
+                if let Some(sel) = &mut self.selection
+                    && sel.head != at
+                {
+                    sel.head = at;
+                    cx.request_paint();
                 }
                 Handled::Yes
             }

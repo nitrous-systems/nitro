@@ -602,10 +602,10 @@ pub fn install(ui: &mut Ui<TermApp>, state: &mut TermApp, grid: WidgetId) -> Res
                 .widget::<TermGrid>(grid)
                 .ok()
                 .and_then(TermGrid::selection_text);
-            if let Some(text) = text {
-                if let Err(e) = ui.set_clipboard_text(&text) {
-                    eprintln!("nitro-term: copy: {e}");
-                }
+            if let Some(text) = text
+                && let Err(e) = ui.set_clipboard_text(&text)
+            {
+                eprintln!("nitro-term: copy: {e}");
             }
         },
     );

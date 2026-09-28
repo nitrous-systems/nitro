@@ -1104,6 +1104,7 @@ impl ClipboardPeer {
                 window_flags::UNDECORATED,
             )
             .create_rect(rect, root, Rect::new(0.0, 0.0, 40.0, 30.0))
+            // lint-colors: allow — a test peer's window, painted only so it can take focus.
             .fill_solid(rect, nitro_core::Color::rgb(0x40, 0x40, 0x40))
             .commit(self.serial)
             .expect("commit");

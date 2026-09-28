@@ -330,7 +330,7 @@ widgets on the wallpaper — before, **0** after (`docs/settings.md`).
 | `Panel` | `container` | — | — | background, radius, border, each `None` = the theme's |
 | `Label` | `label` | its text | `set_value` | remembers the width it was measured at; `.elide(true)` shortens with `…` instead of overflowing |
 | `Button` | `button` | — | `click`, `activate`, `focus`, `alt_click` | hover/pressed/focused faces; `alt_click` is the middle button |
-| `TextField` | `textfield` | its contents (the mask, if secret) | `set_value`, `submit`, `clear`, `focus` | caret, selection, click-to-place, h-scroll, secret mode |
+| `TextField` | `textfield` | its contents (the mask, if secret) | `set_value`, `insert`, `submit`, `clear`, `focus` | caret, selection, click-to-place, h-scroll, secret mode, clipboard keys |
 | `Checkbox` | `checkbox` | `true`/`false` | `toggle`, `set_value`, `focus` | Space toggles |
 | `Slider` | `slider` | the number | `set_value`, `focus` | drag, arrows, Home/End, optional step; `.vertical()` runs it bottom-to-top (a fader, an equaliser band), with Up still raising it |
 | `Scroll` | `scroll` | the offset | `scroll_to`, `scroll_by`, `focus` | wheel (`speed` px a notch, default 40; touchpad 1:1), arrows, PgUp/PgDn, Home/End |
@@ -478,6 +478,17 @@ only per *new string* — which is one, on the way in.
 Its overflow scrolls **by composition**: the text node hangs under a
 clipping group whose transform is the scroll offset, so a caret past the
 right edge sends one `SetTransform` and no `SetText`.
+
+**`TextField` has the clipboard keys.** `Ctrl+C` and `Ctrl+Insert` copy
+the selection, `Ctrl+X` cuts it, `Ctrl+V` and `Shift+Insert` paste (see
+[The clipboard](#the-clipboard)). The field consumes these chords even
+when there is nothing to copy or paste, so an app shortcut on the same
+chord (`nitro-files`' `Ctrl+C`) does not fire while the user is typing. A
+paste arrives asynchronously and goes in through the `insert` action,
+which replaces the selection and fires `on_change`. The field is one
+line, so `insert` turns line breaks and tabs into spaces and drops every
+other control character. A **secret** field copies and cuts nothing, so
+its text never reaches the clipboard, but it can be pasted into.
 
 **A secret `TextField` never lets its text out of the process.**
 `text_field("").secret()` (or `set_secret(true)` on a live one, for a
@@ -1206,6 +1217,49 @@ relist its windows — once per command the user runs. Limits set before
 the window exists ride its first commit, for the reason a shell surface's
 anchor does.
 
+### The clipboard
+
+`nitro_ui::clipboard` is the toolkit's side of the server's clipboard
+(`caps::DATA`, `docs/wire.md` § Data transfer). `open_window` lists
+`DATA` in `ClientCaps`, masked to what the server advertised, and the
+`Ui` answers the protocol itself: it serves `SelectionRequest`s from what
+the app offered, and reads `SelectionData` descriptors for it. An app
+never touches a descriptor.
+
+| call | what |
+|---|---|
+| `ui.set_clipboard(vec![(mime, bytes), …])` | offer these types, most preferred first; empty clears |
+| `ui.set_clipboard_text(s)` | offer `s` as `text/plain;charset=utf-8` and `text/plain` |
+| `ui.clipboard_mimes()` | the types on offer now (the last `SelectionOffer`) |
+| `ui.read_clipboard(&[mime, …], cb)` | read the first wanted type that is on offer; `cb(state, ui, Option<(mime, bytes)>)` |
+| `ui.has_clipboard()` | whether this is the system clipboard or the app-local one |
+
+* **Reads are asynchronous.** `cb` never runs inside `read_clipboard`.
+  With nothing matching on offer it runs through `defer`. Otherwise it
+  runs once the transfer ends. The owner usually hands over a memfd,
+  which is readable at once, so the answer usually comes in the same
+  `pump` that delivered it.
+* **Reads never block.** The descriptor is made non-blocking and joins
+  the app loop's `epoll` set. A transfer larger than
+  `MAX_CLIPBOARD_BYTES` (16 MiB) is dropped. One that has not reached
+  EOF after `READ_TIMEOUT_MS` (5 s) is abandoned, because a hostile
+  owner can hand over a pipe it never closes. Both are answered `None`,
+  and so is an empty transfer.
+* **At most 16 requests are outstanding**, the server's per-client cap.
+  A 17th is answered `None` locally rather than sent. Request ids wrap,
+  and skip any id still outstanding, because reusing one is fatal.
+* **Setting the clipboard needs keyboard focus.** The server disconnects
+  a client that sends `SetSelection` without it. So the `Ui` tracks
+  `Focus` and `set_clipboard` answers `Ok(false)`, sending nothing,
+  while no window of the app is focused.
+* **Offered data is dropped when someone else copies.** The `Ui` counts
+  the echoes of its own `SetSelection`. An offer that is not one of them
+  means another client owns the selection, and the bytes are released.
+* **Without `DATA` the clipboard is app-local.** That covers a remote
+  link and an old server. `set_clipboard` stores the items and
+  `read_clipboard` reads them back, still asynchronously, so copy and
+  paste within the app work unchanged.
+
 ### Resizes, for an app whose content has its own units
 
 `ui.on_resize(|s, ui, size| ..)` is offered every `Configure` that
@@ -1822,10 +1876,11 @@ regrets:
   boundary as the X11 socket or `$XDG_RUNTIME_DIR/wayland-0`; a per-app
   allow policy is M3+ and belongs with the session manager that would
   issue the tokens.
-* **`TextField` is single-line, and has no clipboard, no undo and no
-  IME.** Each is a real feature rather than a missing case, and each
-  wants a server-side concept (a selection owner, a text-input protocol)
-  that M2 does not have.
+* **`TextField` is single-line, and has no undo and no IME.** Each is a
+  real feature rather than a missing case; an IME wants a server-side
+  text-input protocol that nitro does not have. The clipboard is there
+  (see [The clipboard](#the-clipboard)), but there is no primary
+  selection (middle-click paste).
 * **`Scroll` is vertical only** and scrolls by translating its content
   group, so its child is laid out at full height and a list of ten
   thousand rows put *inside a `Scroll`* still costs ten thousand widgets.

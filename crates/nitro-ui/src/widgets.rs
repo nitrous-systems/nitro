@@ -2257,7 +2257,11 @@ impl<S: 'static> TextField<S> {
     /// Ctrl+V / Shift+Insert paste. `None` for any other key. Consumed
     /// even when there is nothing to do, so an app shortcut on the same
     /// chord does not fire while the user edits text.
-    fn clipboard_key(&mut self, cx: &mut EventCx<'_, S>, k: &crate::event::KeyEvent) -> Option<bool> {
+    fn clipboard_key(
+        &mut self,
+        cx: &mut EventCx<'_, S>,
+        k: &crate::event::KeyEvent,
+    ) -> Option<bool> {
         use crate::event::mods;
         let m = k.mods & mods::MASK;
         match (m, k.keycode) {
