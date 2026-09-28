@@ -201,10 +201,10 @@ implements it; live volume via a `pw-mon` subscription, if ever wanted.
 `tests/quick.rs` covers the menu with a fake `wpctl` (a shell script
 that keeps its state in files) and a fake `session.sock`. The
 screenshots are regenerated with
-`cargo test -p nitro-bar --test quick -- --ignored screenshots`. In the
-dark ones only the *client* palette is dark: the harness server's
-desktop and the icons it tints still use the light scheme, because the
-harness has no config file to reload.
+`cargo test -p nitro-bar --test quick -- --ignored screenshots`. The
+harness server starts from a `server.conf` with that scheme
+(`Harness::shell_configured`), so the icons it tints get the right inks
+too.
 
 ## Driving it with `hey`
 

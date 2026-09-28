@@ -58,6 +58,8 @@ struct Options {
     remote: bool,
     /// The fake output's size.
     output: (u32, u32),
+    /// A `server.conf` for the server to start from.
+    server_conf: Option<String>,
 }
 
 impl Options {
@@ -70,6 +72,7 @@ impl Options {
             surface: None,
             remote: false,
             output: OUTPUT,
+            server_conf: None,
         }
     }
 }
@@ -180,6 +183,28 @@ impl<S: 'static> Harness<S> {
         Self::build_with(opts, state, build)
     }
 
+    /// [`Harness::shell_on`] with the server started from a `server.conf`
+    /// holding `conf` — `theme.scheme = dark` for a screenshot of the dark
+    /// desktop, where the server tints the icons too.
+    ///
+    /// # Panics
+    /// As [`Harness::new`].
+    pub fn shell_configured(
+        name: &str,
+        state: S,
+        surface: crate::shell::Surface,
+        size: Option<Size>,
+        output: (u32, u32),
+        conf: &str,
+        build: impl FnOnce(&mut Ui<S>) -> WidgetId,
+    ) -> Self {
+        let mut opts = Options::new(name, size, Theme::default(), true);
+        opts.surface = Some(surface);
+        opts.output = output;
+        opts.server_conf = Some(conf.to_owned());
+        Self::build_with(opts, state, build)
+    }
+
     /// A harness on a **remote** (TCP) connection: the server binds
     /// `127.0.0.1:0`, the client connects to the port the kernel chose,
     /// and the `Welcome` carries `caps::REMOTE`.
@@ -206,9 +231,12 @@ impl<S: 'static> Harness<S> {
             surface,
             remote,
             output,
+            server_conf,
         } = opts;
         let server = if remote {
             TestServer::start_remote(&name, output.0, output.1)
+        } else if let Some(conf) = &server_conf {
+            TestServer::start_configured(&name, output.0, output.1, conf)
         } else {
             TestServer::start(&name, output.0, output.1)
         };

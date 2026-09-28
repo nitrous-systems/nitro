@@ -77,7 +77,21 @@ impl TestServer {
         Self::start_with_remote(name, width, height, true)
     }
 
+    /// As [`TestServer::start`], with a `server.conf` holding `conf`
+    /// (`theme.scheme = dark`, say), read at start-up like the real one.
+    ///
+    /// # Panics
+    /// As [`TestServer::start`].
+    #[must_use]
+    pub fn start_configured(name: &str, width: u32, height: u32, conf: &str) -> Self {
+        Self::start_full(name, width, height, false, Some(conf))
+    }
+
     fn start_with_remote(name: &str, width: u32, height: u32, remote: bool) -> Self {
+        Self::start_full(name, width, height, remote, None)
+    }
+
+    fn start_full(name: &str, width: u32, height: u32, remote: bool, conf: Option<&str>) -> Self {
         let dir = std::env::temp_dir().join(format!(
             "nitro-ui-test-{}-{name}-{:?}",
             std::process::id(),
@@ -89,10 +103,14 @@ impl TestServer {
         config.backend = BackendKind::Fake { width, height };
         let input = FakeInput::new().expect("eventfd");
         config.fake_input = Some(input.clone());
-        if remote {
+        if remote || conf.is_some() {
             let config_path = dir.join("config").join(crate::config::FILE_NAME);
             std::fs::create_dir_all(config_path.parent().expect("a parent")).expect("config dir");
-            std::fs::write(&config_path, "remote.listen = 127.0.0.1:0\n").expect("server.conf");
+            let mut text = conf.unwrap_or_default().to_owned();
+            if remote {
+                text.push_str("\nremote.listen = 127.0.0.1:0\n");
+            }
+            std::fs::write(&config_path, text).expect("server.conf");
             config.config_path = Some(config_path);
         }
         let wire_path = config.wire_path.clone();

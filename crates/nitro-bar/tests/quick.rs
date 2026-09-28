@@ -354,7 +354,9 @@ fn the_dark_style_tile_flips_theme_scheme_and_keeps_the_rest() {
 
     // The server's reload pushes the new palette; the open menu repaints
     // through the normal path. (The harness server does not watch this
-    // file, so the push is simulated with the palette it would send.)
+    // file, so the push is simulated with the palette it would send.
+    // Client-side only: server-tinted icons keep the server's scheme,
+    // which is fine for a before/after pixel comparison of the panel.)
     let before = h.shot_window(popup(&h));
     h.ui().set_palette(nitro_ui::Palette::dark());
     h.settle();
@@ -416,16 +418,43 @@ mod png;
 #[ignore = "writes docs/quick-settings-*.png"]
 fn screenshots() {
     let docs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs");
-    for (scheme, palette) in [
-        ("light", nitro_ui::Palette::light()),
-        ("dark", nitro_ui::Palette::dark()),
-    ] {
+    for scheme in ["light", "dark"] {
         let dir = scratch(&format!("shot-{scheme}"));
         fake_wpctl(&dir);
-        let mut h = bar_with(&dir);
-        h.ui().set_palette(palette);
+        // Both halves of the scheme: the *server* starts dark, so the
+        // icons it tints (by role byte) get dark inks and the client is
+        // pushed the dark palette; and the bar's own `server.conf` says
+        // dark, so the Dark Style tile reads On.
+        let conf = format!("theme.scheme = {scheme}\n");
+        std::fs::write(dir.join("server.conf"), &conf).unwrap();
+        let state = Bar::new()
+            .with_audio_dirs(vec![dir.clone()])
+            .with_config_path(dir.join("server.conf"))
+            .with_fake_time_ms((9 * 3600 + 41 * 60 + 5) * 1000)
+            .with_sensors(|| nitro_bar::Readings {
+                battery: Some("87%".to_owned()),
+                load: None,
+                mem: None,
+            })
+            .with_settings_command(vec!["/bin/true".to_owned()]);
+        let mut h = Harness::shell_configured(
+            "nitro-bar",
+            state,
+            Surface::bar(BAR_H as u32),
+            Some(Size::new(320.0, BAR_H)),
+            OUT,
+            &conf,
+            build,
+        );
         h.settle();
         open(&mut h);
+        if scheme == "dark" {
+            let dark = in_menu(&mut h, q::DARK);
+            assert!(
+                h.widget::<Tile<Bar>>(dark).is_on(),
+                "the tile reads the file"
+            );
+        }
         write_crop(&mut h, &docs.join(format!("quick-settings-{scheme}.png")));
         let out = in_menu(&mut h, q::OUTPUT);
         act(&mut h, out, "click", None);
