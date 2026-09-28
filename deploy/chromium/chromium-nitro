@@ -21,7 +21,7 @@
 #                           browser process: nitro scopes buffer and window
 #                           ids per client connection, so an out-of-process
 #                           GPU could create buffers but never attach them
-#                           to the browser's window (tmp/chromium-backend.md)
+#                           to the browser's window (docs/chromium.md)
 #   --class=chromium-nitro  the window's app id, which is what the bar and
 #                           the title bar look an icon up by; it must equal
 #                           the .desktop file's basename (see that file)

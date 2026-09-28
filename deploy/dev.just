@@ -116,7 +116,7 @@ deploy-chromium:
     set -euo pipefail
     out='{{chromium_out}}'
     if [[ ! -x $out/chrome ]]; then
-        echo "deploy-chromium: no $out/chrome — build it first (tmp/chromium-build.md, target chrome in out/Nitro)" >&2
+        echo "deploy-chromium: no $out/chrome — build it first (docs/chromium-build.md, target chrome in out/Nitro)" >&2
         exit 1
     fi
     src=$(cd "$out/../.." && pwd)

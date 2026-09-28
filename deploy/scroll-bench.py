@@ -5,7 +5,7 @@ Reproduces #3778's scroll test on whatever client is under the pointer:
 N wheel events of +STEP, then N of -STEP, EVERY ms apart, injected
 server-side through the control socket's `input` request (the real input
 path, so focus, i2p accounting etc. are exactly as for a mouse). Reports
-one markdown row in the format of tmp/chromium-backend.md §Measurements:
+one markdown row in the format of docs/chromium.md §Measurements:
 
   | label | fps | frame interval p50 / p95 / max | submit→present | i2p p50 / p95 / max (n) |
 

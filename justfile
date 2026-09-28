@@ -36,7 +36,7 @@ install_bins := "nitro-server nitro-session nitro-shot nitro-calc nitro-amp nitr
 # Chromium on nitro (#3865). A **release, non-component** build of the
 # `nitro-ozone` branch in the Chromium checkout. Neither install-chromium
 # nor deploy-chromium builds it (that needs `cr-env.sh` and about an hour;
-# see tmp/chromium-build.md), and both fail clearly if it is missing.
+# see docs/chromium-build.md), and both fail clearly if it is missing.
 chromium_out := env_var_or_default("NITRO_CHROMIUM_OUT", "/home/kaspar/src/ai/chromium/src/out/Nitro")
 # What `chrome` needs at run time, from `gn desc out/Nitro //chrome:chrome
 # runtime_deps` filtered to what the software path loads. libEGL/libGLESv2
@@ -99,7 +99,7 @@ install-chromium:
     set -euo pipefail
     out='{{chromium_out}}'
     if [[ ! -x $out/chrome ]]; then
-        echo "install-chromium: no $out/chrome — build nitro-ozone Chromium first (set NITRO_CHROMIUM_OUT; see tmp/chromium-build.md)" >&2
+        echo "install-chromium: no $out/chrome — build nitro-ozone Chromium first (set NITRO_CHROMIUM_OUT; see docs/chromium-build.md)" >&2
         exit 1
     fi
     src=$(cd "$out/../.." && pwd)

@@ -137,7 +137,7 @@ $ just box-session suspend    # systemctl suspend, via the session
 box. It is **not** part of `just deploy`, and it does not restart
 `nitro-dev`. It does not build anything either: it rsyncs a release,
 non-component build from `out/Nitro` in the Chromium checkout
-(`NITRO_CHROMIUM_OUT` overrides; `tmp/chromium-build.md` has the args). It
+(`NITRO_CHROMIUM_OUT` overrides; `docs/chromium-build.md` §11 has the args). It
 writes:
 
 | where | what |
@@ -172,7 +172,7 @@ run in their own user namespace with seccomp-bpf (`Seccomp: 2`). No SUID
 ~235–265 MB `RssAnon`. The `VmRSS` sum (~1.5 GB) double-counts the shared
 binary and is not the number to quote. `free` "used" moved +170 to +250 MB.
 
-Figures and the verdict are in `tmp/chromium-backend.md` §Test box.
+Figures and the verdict are in `docs/chromium.md` §Test box.
 
 ## The panel runs at 120 Hz
 
