@@ -326,7 +326,9 @@ pub struct List<S> {
     painted_with: Option<RowPaint>,
     /// Invoked on Enter or a double-click.
     on_activate: Option<IndexFn<S>>,
-    /// Invoked whenever the cursor lands on a different row.
+    /// Invoked whenever the cursor lands on a different row or the
+    /// selection changes (Shift-extend, Ctrl-Space toggle, a click that
+    /// collapses a multi-selection).
     on_select: Option<IndexFn<S>>,
 }
 
@@ -569,7 +571,7 @@ impl<S: 'static> List<S> {
             return;
         }
         let index = index.min(self.model.len() - 1);
-        let moved = index != self.cursor;
+        let before = (self.cursor, self.selected.clone());
         self.cursor = index;
         if extend {
             let (lo, hi) = if self.extend_from <= index {
@@ -586,7 +588,7 @@ impl<S: 'static> List<S> {
         let id = cx.id;
         self.reveal(cx.ui, id, index);
         cx.request_paint();
-        if moved {
+        if before != (self.cursor, self.selected.clone()) {
             self.fire_select(cx);
         }
     }
@@ -661,6 +663,7 @@ impl<S: 'static> List<S> {
                     self.selected.insert(self.cursor);
                 }
                 cx.request_paint();
+                self.fire_select(cx);
                 return Handled::Yes;
             }
             _ => return Handled::No,
@@ -1219,7 +1222,8 @@ impl<S: 'static> ListBuilder<S> {
         self
     }
 
-    /// Called with the row index whenever the cursor moves.
+    /// Called with the cursor's row index whenever the cursor moves or
+    /// the selection changes.
     #[must_use]
     pub fn on_select(mut self, f: impl Fn(&mut S, &mut Ui<S>, usize) + 'static) -> Self {
         self.list.on_select = Some(Box::new(f));

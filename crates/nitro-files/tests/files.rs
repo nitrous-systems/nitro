@@ -38,7 +38,7 @@ use nitro_ui::event::key;
 use nitro_ui::split::SidebarRow;
 use nitro_ui::test::Harness;
 use nitro_ui::widgets::{Button, Label, TextField};
-use nitro_ui::{List, Size};
+use nitro_ui::{List, Point, Size};
 
 /// The terminal the text fallback is told to open an editor in.
 ///
@@ -473,6 +473,49 @@ fn ctrl_h_shows_and_hides_dotfiles_and_the_count_follows() {
     assert!(!h.state().shows_hidden(), "and hid them again");
     assert_eq!(names_of(&h, ids), ["plain.txt"]);
     assert_eq!(status(&h, ids), "1 items, 0 selected");
+
+    let _ = std::fs::remove_dir_all(&root);
+    h.quit();
+}
+
+#[test]
+fn every_selection_change_updates_the_status_line() {
+    // The status line counts the selection, so it has to follow it: a
+    // click, an arrow, Shift-extend and the Ctrl-Space toggle — the last
+    // two change the selection without (or besides) moving the cursor.
+    let (root, dir) = fixture("selcount");
+    for n in ["a.txt", "b.txt", "c.txt"] {
+        write(&dir.join(n), n);
+    }
+    let (mut h, ids) = app(&dir, &root.join("xdg"));
+    assert_eq!(status(&h, ids), "3 items, 0 selected");
+
+    // A click on the second row selects it.
+    let b = h.bounds(ids.list);
+    let row_h = h.widget::<List<Files>>(ids.list).row_height();
+    h.click_at(Point::new(b.x + 20.0, b.y + row_h * 1.5));
+    h.settle();
+    assert_eq!(h.widget::<List<Files>>(ids.list).cursor(), 1);
+    assert_eq!(status(&h, ids), "3 items, 1 selected", "a click counts");
+
+    // Shift-Up extends to two rows.
+    h.key_with(key::LEFT_SHIFT, key::UP);
+    h.settle();
+    assert_eq!(
+        status(&h, ids),
+        "3 items, 2 selected",
+        "Shift-extend counts"
+    );
+
+    // A plain arrow collapses it back to one.
+    h.key(key::DOWN);
+    h.settle();
+    assert_eq!(status(&h, ids), "3 items, 1 selected", "an arrow counts");
+
+    // Ctrl-Space toggles the cursor's row off, without moving.
+    h.key_with(key::LEFT_CTRL, key::SPACE);
+    h.settle();
+    assert_eq!(status(&h, ids), "3 items, 0 selected", "Ctrl-Space counts");
 
     let _ = std::fs::remove_dir_all(&root);
     h.quit();

@@ -660,6 +660,12 @@ pub fn build(ui: &mut Ui<Files>) -> WidgetId {
                 // with the tree whole.
                 let _ = s;
                 ui.defer(move |s: &mut Files, ui: &mut Ui<Files>| activate(s, ui, index));
+            })
+            .on_select(|_s: &mut Files, ui: &mut Ui<Files>, _index: usize| {
+                // The status line counts the selection, and the list —
+                // the widget it reads the count from — is out of its
+                // slot while this runs: deferred, like `on_activate`.
+                ui.defer(show_status);
             }),
     );
 

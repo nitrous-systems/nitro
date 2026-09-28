@@ -40,6 +40,10 @@ pub struct Mutation {
     pub op: &'static str,
     /// The node it applies to, or [`NodeId::NONE`] for `Commit`.
     pub node: NodeId,
+    /// For `CreateNode` and `Reparent`, the sibling the node was put in
+    /// front of ([`NodeId::NONE`] for "last"); [`NodeId::NONE`] for
+    /// everything else. Lets a test check z-order, not just traffic.
+    pub before: NodeId,
 }
 
 /// Measured extent of a shaped string.
@@ -116,6 +120,9 @@ pub(crate) struct SlotAt {
 pub(crate) struct PaintSlot {
     pub(crate) node: NodeId,
     kind: NodeKind,
+    /// The node this slot's node hangs under, so a slot created later
+    /// can find its siblings (see [`Wire::ensure_slot`]).
+    parent: NodeId,
     bounds: Rect,
     fill: Fill,
     radius: f32,
@@ -149,6 +156,7 @@ impl PaintSlot {
         Self {
             node: NodeId::NONE,
             kind,
+            parent: NodeId::NONE,
             bounds: Rect::EMPTY,
             fill: Fill::None,
             radius: 0.0,
@@ -264,9 +272,15 @@ impl Wire {
 
     fn send(&mut self, msg: &ClientMsg, node: NodeId) -> Result<(), Error> {
         if let Some(t) = &mut self.tap {
+            let before = match msg {
+                ClientMsg::CreateNode(c) => c.before,
+                ClientMsg::Reparent(r) => r.before,
+                _ => NodeId::NONE,
+            };
             t.push(Mutation {
                 op: msg.name(),
                 node,
+                before,
             });
         }
         self.pending += 1;
@@ -287,6 +301,7 @@ impl Wire {
             t.push(Mutation {
                 op: "Commit",
                 node: NodeId::NONE,
+                before: NodeId::NONE,
             });
         }
         self.conn.commit(serial)?;
@@ -1039,6 +1054,16 @@ impl Wire {
             slots[index].node = NodeId::NONE;
         }
         if slots[index].node.is_none() {
+            // Slot order is paint order. A slot that comes and goes (a
+            // text field's selection) is created after the higher slots
+            // already exist, so appending it would draw it on top of
+            // them: go in front of the first live higher slot that
+            // shares the parent instead, and only fall back to the
+            // caller's `before` when there is none.
+            let before = slots[index + 1..]
+                .iter()
+                .find(|s| !s.node.is_none() && s.parent == parent)
+                .map_or(before, |s| s.node);
             let node = self.alloc_node();
             self.send(
                 &ClientMsg::CreateNode(CreateNode {
@@ -1051,6 +1076,7 @@ impl Wire {
             )?;
             slots[index] = PaintSlot {
                 node,
+                parent,
                 used: true,
                 ..PaintSlot::empty(kind)
             };

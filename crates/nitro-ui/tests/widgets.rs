@@ -1209,3 +1209,51 @@ fn a_text_field_drag_selects_and_survives_leaving_the_field() {
     h.move_pointer(Point::new(b.x + 2.0, mid_y));
     assert_eq!(h.widget::<TextField<()>>(field).selection(), (0, 11));
 }
+
+/// A text field's selection rect is only painted while there is a
+/// selection, so its node is created long after the text's. It must
+/// still go *under* the text: created in front of the text node, not
+/// appended after it, or the highlight hides what it highlights.
+#[test]
+fn a_text_field_selection_is_painted_below_its_text() {
+    let mut h = Harness::sized("selz", (), Size::new(260.0, 60.0), |ui: &mut Ui<()>| {
+        let field = ui.build(text_field("hello"));
+        let root = ui.build(panel().background(Color::WHITE).padding(8.0));
+        ui.attach(root, field).unwrap();
+        root
+    });
+    let field = kids(&mut h)[0];
+    h.click(field);
+    h.settle();
+    h.tap();
+    h.clear_tap();
+
+    // Ctrl-A: the selection rect appears, as a new node.
+    h.key_with(key::LEFT_CTRL, key::A);
+    h.settle();
+    assert_eq!(h.widget::<TextField<()>>(field).selection(), (0, 5));
+    let created: Vec<_> = h
+        .mutations()
+        .iter()
+        .filter(|m| m.op == "CreateNode")
+        .cloned()
+        .collect();
+    assert_eq!(created.len(), 1, "one node for the selection: {created:?}");
+    let before = created[0].before;
+    assert!(!before.is_none(), "the selection was appended on top");
+
+    // Typing replaces the selection and re-sends the text: that
+    // `SetText` names the text node, which is what the selection had to
+    // be put in front of.
+    h.clear_tap();
+    h.key(key::A);
+    h.settle();
+    let text_node = h
+        .mutations()
+        .iter()
+        .find(|m| m.op == "SetText")
+        .expect("typing re-sends the text")
+        .node;
+    assert_eq!(before, text_node, "the selection sits below the text");
+    h.quit();
+}
