@@ -1,7 +1,9 @@
 //! Shared value types for every nitro crate: geometry, colour, the
-//! semantic colour [`palette`], 2-D affine transforms and damage regions.
+//! semantic colour [`palette`], 2-D affine transforms, damage regions and
+//! exact [`Region`]s.
 //!
-//! Zero dependencies, no I/O, no allocation except in [`Damage`]. Everything
+//! Zero dependencies, no I/O, no allocation except in [`Damage`] and
+//! [`Region`]. Everything
 //! is `Copy` where it can be. Logical coordinates are `f32`; pixel
 //! coordinates are `i32` ([`IRect`]).
 
@@ -11,10 +13,12 @@ mod color;
 mod damage;
 mod geom;
 pub mod palette;
+mod region;
 mod transform;
 
 pub use color::Color;
 pub use damage::Damage;
 pub use geom::{IRect, Point, Rect, Size};
 pub use palette::{Palette, Role, Scheme};
+pub use region::Region;
 pub use transform::Transform;
