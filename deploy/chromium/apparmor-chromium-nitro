@@ -1,5 +1,8 @@
-# AppArmor profile for Chromium-on-nitro, installed by `just deploy-chromium`
-# as /etc/apparmor.d/chromium-nitro (#3865).
+# AppArmor profile for Chromium-on-nitro (#3865). A template: `@CHROME@` is
+# the path of the `chrome` binary. `just deploy-chromium` renders it for the
+# box and installs it as /etc/apparmor.d/chromium-nitro; `just
+# install-apparmor` renders it with `$LIBDIR/nitro/chromium/chrome` into
+# `$SYSCONFDIR/apparmor.d/chromium-nitro`.
 #
 # Why it exists: Ubuntu sets `kernel.apparmor_restrict_unprivileged_userns=1`,
 # which denies unprivileged user namespaces to every *unconfined* program.
@@ -11,13 +14,14 @@
 # `chrome-sandbox` helper because it needs no root-owned setuid binary that
 # an rsync could silently de-privilege.
 #
-# `/home/*/` so the file is not tied to one user name; it still only
-# matches a binary under `nitro-bin/chromium/`.
+# On the box the path is `/home/*/nitro-bin/chromium/chrome`: `/home/*/` so
+# the file is not tied to one user name; it still only matches a binary
+# under `nitro-bin/chromium/`.
 
 abi <abi/4.0>,
 include <tunables/global>
 
-profile chromium-nitro /home/*/nitro-bin/chromium/chrome flags=(unconfined) {
+profile chromium-nitro @CHROME@ flags=(unconfined) {
   userns,
 
   # Site-specific additions and overrides. See local/README for details.

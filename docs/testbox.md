@@ -17,6 +17,10 @@ snappy here, it is snappy.
 
 ## Loop
 
+These recipes are defined in `deploy/dev.just`, which the `justfile`
+imports. They run from the repository root. For a local install, not the
+box, see [install.md](install.md).
+
 ```
 just box-install   # once: systemd unit nitro-dev on tty2 (replaces getty@tty2)
 just deploy        # build release → rsync ~/nitro-bin/ + ~/.local/share/applications/ → restart nitro-dev
@@ -144,6 +148,12 @@ writes:
 | `~/.local/share/applications/chromium-nitro.desktop` | "Chromium (nitro)" in the launcher, installed **last** |
 | `/etc/apparmor.d/chromium-nitro` | `userns` for this path, so the sandbox is on (below) |
 | apt: `libatk1.0-0t64 libatk-bridge2.0-0t64 libatspi2.0-0t64` | chrome links them, and the box did not have them |
+
+The wrapper and the profile in `deploy/chromium/` are templates
+(`@CHROMIUM_DIR@`, `@CHROME@`). For the box, `deploy-chromium` renders them
+into `target/chromium-stage/` with `$HOME/nitro-bin/chromium`, kept literal
+so the wrapper's shell expands it, and `/home/*/nitro-bin/chromium/chrome`.
+The deployed files are the same as before the templating.
 
 These are part of the deployed set now. `stats desktop_entries` is **14**
 with it and `nitro-amp` installed. The launcher lists it only because

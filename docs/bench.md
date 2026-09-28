@@ -2646,13 +2646,13 @@ re-derives the largest ledger in this document had never worked as
 printed.
 
 The recipe now quotes the string twice (`quote(quote(modes))` in
-`justfile`), one layer for each shell, so the obvious spelling above is
+`deploy/dev.just`), one layer for each shell, so the obvious spelling above is
 also the correct one — no escaping, and the earlier `'…\ …'` workaround
 this section briefly carried is now *wrong* (the backslash survives into
 the arm name and that arm is refused). And the commands printed above are
 now **executed** by `crates/nitro-bench/tests/bench_recipe.rs`, which
 extracts every `just bench "…"` line from this file, `docs/testbox.md`
-and the `justfile` and runs each one through `just` against a stub `ssh`
+and `deploy/dev.just` and runs each one through `just` against a stub `ssh`
 that reproduces the argv-join, asserting the arms arrive intact. A
 `deploy/bench.sh --dry-run` flag makes that a unit test rather than a
 twenty-minute box booking. Filed as **#618** / **#3843**.

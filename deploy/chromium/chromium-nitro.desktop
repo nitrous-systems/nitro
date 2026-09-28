@@ -3,7 +3,8 @@ Type=Application
 Name=Chromium (nitro)
 GenericName=Web Browser
 Comment=Chromium on nitro's Ozone backend (software rendering)
-# Installed only by `just deploy-chromium`, never by `just deploy`: this
+# Installed only by `just deploy-chromium` / `just install-chromium`, never
+# by `just deploy` / `just install-desktop`: this
 # file lives in `deploy/chromium/` rather than `deploy/` precisely so the
 # `deploy/*.desktop` glob in `deploy-bins` cannot pick it up and put a
 # launcher entry on a box that has no Chromium build.

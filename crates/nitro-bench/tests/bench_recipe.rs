@@ -24,7 +24,8 @@
 //!   test would pass against the *broken* recipe too — the join is the
 //!   bug, so the stub has to have it.
 //!
-//! The real `justfile` and the real `deploy/bench.sh` are driven, found
+//! The real `justfile` (which imports the `bench` recipe from
+//! `deploy/dev.just`) and the real `deploy/bench.sh` are driven, found
 //! from `CARGO_MANIFEST_DIR` (the `crates/nitro-launcher/tests/deployed.rs`
 //! precedent): a copy of the recipe pasted in here would pass for ever
 //! after somebody edited the real one, which is the failure genre this
@@ -281,7 +282,7 @@ fn every_documented_bench_command_runs() {
     }
     let root = repo_root();
     let mut found = 0;
-    for rel in ["docs/bench.md", "docs/testbox.md", "justfile"] {
+    for rel in ["docs/bench.md", "docs/testbox.md", "deploy/dev.just"] {
         let path = root.join(rel);
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("{} is missing: {e}", path.display()));

@@ -1,8 +1,13 @@
 #!/bin/sh
 # Chromium on nitro — the launcher entry's `Exec=` (#3865).
 #
-# Installed by `just deploy-chromium` as `~/nitro-bin/chromium-nitro`, next
-# to the browser's own directory `~/nitro-bin/chromium/`. It exists because
+# A template: `@CHROMIUM_DIR@` is the browser's directory, substituted at
+# install time. `just install-chromium` installs this as
+# `$BINDIR/chromium-nitro` with `$LIBDIR/nitro/chromium`. `just
+# deploy-chromium` installs it as `~/nitro-bin/chromium-nitro` with a literal
+# `$HOME/nitro-bin/chromium`, which this shell expands. A path relative to
+# the script was rejected because the two layouts differ (sibling
+# `chromium/` on the box, `../lib/nitro/chromium` installed). It exists because
 # the launcher spawns without a shell: an `Exec=` line cannot say `~` or
 # `$HOME`, and a bare name is house style (see nitro-term.desktop), so the
 # flags and the profile path live here instead.
@@ -23,11 +28,11 @@
 #   --user-data-dir         a dedicated profile, so this build never shares
 #                           (or migrates) a profile with any other Chromium
 #
-# The sandbox is ON: `just deploy-chromium` installs an AppArmor profile
+# The sandbox is ON: `just deploy-chromium` (or `just install-apparmor`) installs an AppArmor profile
 # (deploy/chromium/apparmor-chromium-nitro) granting `userns` to exactly
 # this binary, because Ubuntu's `kernel.apparmor_restrict_unprivileged_userns=1`
 # denies it to any unconfined program at a custom path.
-d="$HOME/nitro-bin/chromium"
+d="@CHROMIUM_DIR@"
 export CHROME_DESKTOP=chromium-nitro.desktop
 exec "$d/chrome" \
     --ozone-platform=nitro \

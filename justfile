@@ -1,275 +1,209 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
+# The development and test-box recipes (fake, icons-import, size, deploy*,
+# box-*, shot, bench*) live in deploy/dev.just. Their names are unchanged
+# (`just deploy`, `just bench`, …), and they run from this directory.
+import 'deploy/dev.just'
+
+# A bare `just` runs the checks (the recipes are at the end of this file).
+[group('check')]
 default: fmt build test lint-colors
 
+# ---------------------------------------------------------------------------
+# Install (see docs/install.md)
+# ---------------------------------------------------------------------------
+# These follow the GNU/packager conventions. Each variable can be set on
+# the command line (`just PREFIX=$HOME/.local install`) or in the
+# environment (`PREFIX=/usr just install`). DESTDIR is the staging root
+# that package builders use; it is empty for a direct install, and it is
+# never written into an installed file.
+PREFIX     := env_var_or_default("PREFIX", "/usr/local")
+DESTDIR    := env_var_or_default("DESTDIR", "")
+BINDIR     := env_var_or_default("BINDIR", PREFIX / "bin")
+LIBDIR     := env_var_or_default("LIBDIR", PREFIX / "lib")
+DATADIR    := env_var_or_default("DATADIR", PREFIX / "share")
+SYSCONFDIR := env_var_or_default("SYSCONFDIR", if PREFIX == "/usr" { "/etc" } else { PREFIX / "etc" })
+
+# The shipped binaries. This is `box_bins` (deploy/dev.just) minus
+# nitro-demo and nitro-bench, and without the examples. Those are
+# development and measurement tools: nitro-bench restarts and drives a
+# live server, and nitro-demo is a damage/frame test client. The
+# launcher lists nitro-demo only when it is present, so leaving it out
+# costs nothing. nitro-session finds the rest next to itself in $BINDIR
+# (crates/nitro-session/src/pieces.rs), so they are installed as one set.
+install_bins := "nitro-server nitro-session nitro-shot nitro-calc nitro-amp nitro-term nitro-files nitro-bar nitro-launcher nitro-wallpaper nitro-settings hey"
+
+# Chromium on nitro (#3865). A **release, non-component** build of the
+# `nitro-ozone` branch in the Chromium checkout. Neither install-chromium
+# nor deploy-chromium builds it (that needs `cr-env.sh` and about an hour;
+# see tmp/chromium-build.md), and both fail clearly if it is missing.
+chromium_out := env_var_or_default("NITRO_CHROMIUM_OUT", "/home/kaspar/src/ai/chromium/src/out/Nitro")
+# What `chrome` needs at run time, from `gn desc out/Nitro //chrome:chrome
+# runtime_deps` filtered to what the software path loads. libEGL/libGLESv2
+# and SwiftShader are listed because `--disable-gpu` still probes them
+# at startup; without them chrome logs errors but runs.
+# `chrome` itself is copied separately, stripped.
+chromium_files := "chrome_crashpad_handler chrome_100_percent.pak chrome_200_percent.pak resources.pak icudtl.dat v8_context_snapshot.bin snapshot_blob.bin libEGL.so libGLESv2.so libvk_swiftshader.so vk_swiftshader_icd.json libvulkan.so.1 locales resources"
+
+# Binaries, then launcher entries. Chromium is optional and external, so
+# it is not included: run `just install install-chromium` for it.
+#
+# There is no display-manager session entry (wayland-sessions/ or
+# xsessions/). nitro is neither a Wayland nor an X compositor, and it
+# needs a VT and DRM master. Start it from greetd or from tty1 with
+# `exec nitro-session` (docs/greeter.md, docs/install.md).
+[doc("Install binaries and launcher entries (PREFIX, DESTDIR, BINDIR, DATADIR)")]
+install: install-bins install-desktop
+
+# Release-build the shipped binaries and install them into $DESTDIR$BINDIR.
+[doc("Release-build the shipped binaries and install them into $DESTDIR$BINDIR")]
+install-bins:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release --workspace --bins
+    for b in {{install_bins}}; do
+        install -Dm755 "target/release/$b" '{{DESTDIR}}{{BINDIR}}'"/$b"
+    done
+
+# deploy/*.desktop → $DESTDIR$DATADIR/applications/.
+#
+# Run it *after* install-bins (as `install` does). The entries' `Exec=` is
+# a bare name. It resolves because nitro-session prepends its own
+# directory ($BINDIR) to every child's PATH, and an entry shadows the
+# launcher's built-in one for the same program. So entries next to old
+# binaries (a pre-#3723 nitro-session) break launching, while new
+# binaries without entries are harmless. See the long comment in
+# `deploy-bins` (deploy/dev.just). The glob does not include
+# deploy/chromium/chromium-nitro.desktop; install-chromium installs that.
+[doc("Install deploy/*.desktop into $DESTDIR$DATADIR/applications (after install-bins)")]
+install-desktop:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for f in deploy/*.desktop; do
+        install -Dm644 "$f" '{{DESTDIR}}{{DATADIR}}/applications/'"$(basename "$f")"
+    done
+
+# The nitro-ozone Chromium build → $LIBDIR/nitro/chromium/, plus the
+# `chromium-nitro` wrapper in $BINDIR, the icons and the launcher entry.
+#
+# No packages are installed from here. The runtime deps for packagers
+# are the usual Chromium set (nss, nspr, cups, dbus, expat, gbm, drm,
+# xkbcommon, glib, pango/cairo, alsa, udev) plus the accessibility libs
+# that a desktop-less system lacks: libatk1.0, libatk-bridge2.0,
+# libatspi2.0 (Debian: libatk1.0-0t64 libatk-bridge2.0-0t64
+# libatspi2.0-0t64). `ldd chrome | grep 'not found'` lists what is missing.
+# The sandbox needs the AppArmor profile on Ubuntu: `just install-apparmor`.
+[doc("Install the nitro-ozone Chromium build (NITRO_CHROMIUM_OUT) into $LIBDIR/nitro/chromium")]
+install-chromium:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out='{{chromium_out}}'
+    if [[ ! -x $out/chrome ]]; then
+        echo "install-chromium: no $out/chrome — build nitro-ozone Chromium first (set NITRO_CHROMIUM_OUT; see tmp/chromium-build.md)" >&2
+        exit 1
+    fi
+    src=$(cd "$out/../.." && pwd)
+    lib='{{DESTDIR}}{{LIBDIR}}/nitro/chromium'
+    bindir='{{DESTDIR}}{{BINDIR}}'
+    datadir='{{DESTDIR}}{{DATADIR}}'
+    # `symbol_level=0` still leaves a ~200 MB `.symtab`/`.strtab`; strip a
+    # copy rather than touching the build (shared with deploy-chromium).
+    stage=target/chromium-stage
+    mkdir -p "$stage"
+    if [[ ! $stage/chrome -nt $out/chrome ]]; then
+        strip -o "$stage/chrome" "$out/chrome"
+    fi
+    install -Dm755 "$stage/chrome" "$lib/chrome"
+    # The directories are replaced as a whole, so a file dropped from the
+    # build goes with them. `*.info` are build-time translation manifests.
+    rm -rf "$lib/locales" "$lib/resources"
+    for f in {{chromium_files}}; do
+        case $f in
+            locales|resources)
+                (cd "$out" && find "$f" -type f ! -name '*.info' -exec install -Dm644 {} "$lib/{}" \;) ;;
+            chrome_crashpad_handler|*.so|*.so.*)
+                install -Dm755 "$out/$f" "$lib/$f" ;;
+            *)
+                install -Dm644 "$out/$f" "$lib/$f" ;;
+        esac
+    done
+    # The wrapper gets the installed path, without DESTDIR.
+    mkdir -p "$bindir"
+    sed 's|@CHROMIUM_DIR@|{{LIBDIR}}/nitro/chromium|' deploy/chromium/chromium-nitro > "$stage/chromium-nitro.install"
+    install -Dm755 "$stage/chromium-nitro.install" "$bindir/chromium-nitro"
+    for n in 16 24 48 64 128 256; do
+        install -Dm644 "$src/chrome/app/theme/chromium/product_logo_$n.png" \
+            "$datadir/icons/hicolor/${n}x${n}/apps/chromium-nitro.png"
+    done
+    # The entry goes **last**: a failure above leaves no launcher entry
+    # pointing at a half-installed browser.
+    install -Dm644 deploy/chromium/chromium-nitro.desktop "$datadir/applications/chromium-nitro.desktop"
+
+# The AppArmor profile that lets the installed chrome use its sandbox,
+# → $DESTDIR$SYSCONFDIR/apparmor.d/chromium-nitro. Opt-in. It loads the
+# profile only for a direct install (DESTDIR empty); a package does
+# `apparmor_parser -r` in its postinst.
+[doc("Install (and, without DESTDIR, load) the Chromium AppArmor profile into $SYSCONFDIR")]
+install-apparmor:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dest='{{DESTDIR}}{{SYSCONFDIR}}/apparmor.d/chromium-nitro'
+    mkdir -p target/chromium-stage
+    sed 's|@CHROME@|{{LIBDIR}}/nitro/chromium/chrome|' deploy/chromium/apparmor-chromium-nitro > target/chromium-stage/apparmor-chromium-nitro.install
+    install -Dm644 target/chromium-stage/apparmor-chromium-nitro.install "$dest"
+    if [[ -z '{{DESTDIR}}' ]] && command -v apparmor_parser >/dev/null; then
+        apparmor_parser -r "$dest"
+    else
+        echo "install-apparmor: installed $dest; not loaded (run: apparmor_parser -r {{SYSCONFDIR}}/apparmor.d/chromium-nitro)"
+    fi
+
+# Remove what the install targets put down. The AppArmor profile stays;
+# remove {{SYSCONFDIR}}/apparmor.d/chromium-nitro by hand if you want it gone.
+[doc("Remove what the install recipes installed (except the AppArmor profile)")]
+uninstall:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for b in {{install_bins}} chromium-nitro; do
+        rm -f '{{DESTDIR}}{{BINDIR}}'"/$b"
+    done
+    for f in deploy/*.desktop deploy/chromium/chromium-nitro.desktop; do
+        rm -f '{{DESTDIR}}{{DATADIR}}/applications/'"$(basename "$f")"
+    done
+    for n in 16 24 48 64 128 256; do
+        rm -f '{{DESTDIR}}{{DATADIR}}'"/icons/hicolor/${n}x${n}/apps/chromium-nitro.png"
+    done
+    rm -rf '{{DESTDIR}}{{LIBDIR}}/nitro/chromium'
+    if [[ -d '{{DESTDIR}}{{LIBDIR}}/nitro' ]]; then
+        rmdir --ignore-fail-on-non-empty '{{DESTDIR}}{{LIBDIR}}/nitro'
+    fi
+
+# ---------------------------------------------------------------------------
+# Checks
+# ---------------------------------------------------------------------------
+
+[group('check')]
 fmt:
     cargo fmt --all -- --check
 
+[group('check')]
 build:
     cargo build --workspace --all-targets
 
+[group('check')]
 clippy: lint-colors
     cargo clippy --workspace --all-targets -- -D warnings
 
 # Fail on a hard-coded colour outside the palette. See the script's
 # header and docs/theme.md: colours come from roles, so that one
 # `theme.scheme` switch moves the whole desktop.
+[group('check')]
 lint-colors:
     bash deploy/lint-colors.sh
 
 # Everything a merge checks that is not a compile or a test.
+[group('check')]
 lint: lint-colors clippy
 
+[group('check')]
 test:
     cargo test --workspace
-
-# ---------------------------------------------------------------------------
-# Headless (the CI-able path)
-# ---------------------------------------------------------------------------
-fake_size := env_var_or_default("NITRO_FAKE_SIZE", "1280x720")
-
-# Run the server locally on the fake backend (Ctrl-C to stop).
-fake:
-    NITRO_BACKEND=fake NITRO_FAKE_SIZE={{fake_size}} cargo run -p nitro-server
-
-# Grab a PNG from a locally running `just fake` server.
-fake-shot out="tmp/fake-shot.png":
-    mkdir -p tmp && cargo run -q -p nitro-shot -- -o {{out}} && echo "wrote {{out}}"
-
-# ---------------------------------------------------------------------------
-# Icons (see docs/icons.md)
-# ---------------------------------------------------------------------------
-
-# Regenerate crates/nitro-icons/src/set.rs from the pinned upstream commit.
-# `just icons-import gear house` also adds those two names to icons.txt.
-# Idempotent: a run with no arguments must leave set.rs byte-identical.
-icons-import *names:
-    bash deploy/icons-import.sh {{names}}
-
-# ---------------------------------------------------------------------------
-# Budget (see docs/budget.md)
-# ---------------------------------------------------------------------------
-
-# Binary sizes and RSS/HWM of every shipped binary, release build.
-# `just size 5` measures the server with five windows open.
-size windows="1":
-    bash deploy/size.sh {{windows}}
-
-# ---------------------------------------------------------------------------
-# Test box (see docs/testbox.md)
-# ---------------------------------------------------------------------------
-box := env_var_or_default("NITRO_BOX", "kaspar@192.168.1.204")
-# Everything the box needs for a desktop. `nitro-session` is what the
-# unit runs; it finds the other four next to itself in ~/nitro-bin, which
-# is why they are deployed together and in one rsync — a session that
-# started yesterday's bar next to today's server is the failure mode the
-# sibling lookup exists to prevent.
-box_bins := "nitro-server nitro-session nitro-shot nitro-demo nitro-bench nitro-calc nitro-amp nitro-term nitro-files nitro-bar nitro-launcher nitro-wallpaper nitro-settings hey"
-box_examples := "hello_client hello_dialog shell_probe"
-
-# Build release, rsync binaries to the box, restart the dev session.
-deploy: (deploy-bins) 
-    ssh {{box}} 'sudo systemctl restart nitro-dev' && just box-status
-
-deploy-bins:
-    # `--examples` on its own does not build the binaries, so ask for both.
-    cargo build --release --workspace --bins --examples
-    cd target/release && rsync -az {{box_bins}} {{box}}:nitro-bin/
-    cd target/release/examples && rsync -az {{box_examples}} {{box}}:nitro-bin/
-    # `deploy/*.desktop` are installed too, and are part of the deployed
-    # set exactly like `~/nitro-bin` — a worker who "restores the box as
-    # found" must leave them (docs/testbox.md).
-    #
-    # They were deliberately *not* installed until #3723, and the reason
-    # is worth keeping because it is what had to be fixed rather than
-    # worked around: their `Exec=` is a bare name, as the freedesktop
-    # spec asks and a packager needs, and `~/nitro-bin` is on nobody's
-    # `PATH` — so `Exec=nitro-term` was an `execvp` that could only fail,
-    # and because a `.desktop` file *shadows* the launcher's built-in
-    # entry for the same program, installing one replaced a working
-    # launcher entry with "spawn: No such file or directory".
-    #
-    # `nitro-session` now prepends its own executable's directory to the
-    # `PATH` every child inherits (`crates/nitro-session/src/pieces.rs`),
-    # which is the same sibling lookup it already used to *find* the
-    # pieces, stated to the processes it starts. So the bare name
-    # resolves, the shadowing is now the behaviour we want — one Terminal
-    # entry, the packaged one — and the box gets what #3715 needs: an
-    # `<app_id>.desktop` for the server to resolve `nitro-calc` →
-    # `Icon=calculator` through, so the bar's window list and the title
-    # bars show real application icons instead of the generic `window`.
-    #
-    # Idempotent: rsync over the same four basenames, and the launcher
-    # and the server both key their indexes on the basename.
-    #
-    # **The files go last, and the order is deliberate.** A failure here
-    # leaves the box with new binaries and no entries, which is the
-    # benign half of the coupling below — the launcher falls back to its
-    # built-ins and everything still runs. The other order could leave
-    # entries next to old binaries, which is the half that breaks.
-    #
-    # ⚠ The files and the `PATH` prepend are **coupled, and the coupling
-    # is one-directional**: measured on the box during #3723, these four
-    # files installed next to a session that does *not* prepend (any
-    # build before #3723) reproduce the original regression exactly —
-    # launching Terminal from the launcher spawns nothing, because the
-    # packaged entry shadows the built-in and its bare `Exec=` does not
-    # resolve. The two halves therefore ship in one commit and must land
-    # together; installing the files from this recipe while an older
-    # `nitro-session` is deployed is the one way to get the old failure
-    # back.
-    ssh {{box}} 'mkdir -p ~/.local/share/applications'
-    rsync -az deploy/*.desktop {{box}}:.local/share/applications/
-
-# Chromium on nitro (#3865). A **release, non-component** build of the
-# `nitro-ozone` branch in the Chromium checkout; this recipe does not
-# build it (that needs `cr-env.sh` and about an hour — see
-# tmp/chromium-build.md) and fails clearly if it is missing.
-chromium_out := env_var_or_default("NITRO_CHROMIUM_OUT", "/home/kaspar/src/ai/chromium/src/out/Nitro")
-# What `chrome` needs at run time, from `gn desc out/Nitro //chrome:chrome
-# runtime_deps` filtered to what the software path loads. libEGL/libGLESv2
-# and SwiftShader are listed because `--disable-gpu` still probes them
-# at startup; without them chrome logs errors but runs.
-# `chrome` itself is copied separately, stripped (below).
-chromium_files := "chrome_crashpad_handler chrome_100_percent.pak chrome_200_percent.pak resources.pak icudtl.dat v8_context_snapshot.bin snapshot_blob.bin libEGL.so libGLESv2.so libvk_swiftshader.so vk_swiftshader_icd.json libvulkan.so.1 locales resources"
-
-# It does not restart nitro-dev and touches nothing in ~/nitro-bin but
-# `chromium/` and the `chromium-nitro` wrapper; see docs/testbox.md.
-#
-# Rsync the Chromium build + its launcher entry to the box.
-deploy-chromium:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    out='{{chromium_out}}'
-    if [[ ! -x $out/chrome ]]; then
-        echo "deploy-chromium: no $out/chrome — build it first (tmp/chromium-build.md, target chrome in out/Nitro)" >&2
-        exit 1
-    fi
-    src=$(cd "$out/../.." && pwd)
-    ssh {{box}} 'mkdir -p ~/nitro-bin/chromium ~/.local/share/applications'
-    # `chrome` links ATK/AT-SPI (accessibility) and a desktop-less box
-    # does not have them: without these three it dies in the loader with
-    # `libatk-1.0.so.0: cannot open shared object file`. Idempotent.
-    ssh {{box}} 'dpkg -s libatk1.0-0t64 libatk-bridge2.0-0t64 libatspi2.0-0t64 >/dev/null 2>&1 || sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libatk1.0-0t64 libatk-bridge2.0-0t64 libatspi2.0-0t64'
-    # `--delete` is scoped to ~/nitro-bin/chromium/ — the directory is
-    # ours alone, so a file dropped from the list goes with it.
-    # `symbol_level=0` still leaves a ~200 MB `.symtab`/`.strtab` in a
-    # 519 MB binary; strip a copy rather than touching the build.
-    stage=target/chromium-stage
-    mkdir -p "$stage"
-    if [[ ! $stage/chrome -nt $out/chrome ]]; then
-        strip -o "$stage/chrome" "$out/chrome"
-    fi
-    # `P /chrome` protects the stripped binary from this `--delete`; it
-    # has its own rsync right after. `*.info` are build-time translation
-    # manifests, not loaded at run time (70 MB of the locales dir).
-    (cd "$out" && rsync -az --delete --exclude '*.info' --filter 'P /chrome' \
-        {{chromium_files}} {{box}}:nitro-bin/chromium/)
-    rsync -az "$stage/chrome" {{box}}:nitro-bin/chromium/chrome
-    rsync -az --chmod=F755 deploy/chromium/chromium-nitro {{box}}:nitro-bin/chromium-nitro
-    # The sandbox: an AppArmor profile granting `userns` to this path,
-    # because `kernel.apparmor_restrict_unprivileged_userns=1` denies the
-    # namespace sandbox to unconfined programs. See the profile's header.
-    scp -q deploy/chromium/apparmor-chromium-nitro {{box}}:/tmp/apparmor-chromium-nitro
-    ssh {{box}} 'sudo install -m 644 /tmp/apparmor-chromium-nitro /etc/apparmor.d/chromium-nitro && sudo apparmor_parser -r /etc/apparmor.d/chromium-nitro && rm /tmp/apparmor-chromium-nitro'
-    # Chromium's own logo, as `chromium-nitro` in the user's hicolor, so
-    # the launcher row, the bar and the title bar resolve it by app id.
-    for n in 16 24 48 64 128 256; do
-        ssh {{box}} "mkdir -p ~/.local/share/icons/hicolor/${n}x${n}/apps"
-        rsync -az "$src/chrome/app/theme/chromium/product_logo_$n.png" \
-            {{box}}:.local/share/icons/hicolor/${n}x${n}/apps/chromium-nitro.png
-    done
-    # The entry goes **last**, for the reason in `deploy-bins`: a failure
-    # above leaves no launcher entry pointing at a half-installed browser.
-    rsync -az deploy/chromium/chromium-nitro.desktop {{box}}:.local/share/applications/
-    ssh {{box}} 'md5sum ~/nitro-bin/chromium/chrome'
-
-# Install/refresh the systemd unit on the box (needs sudo there).
-box-install:
-    # `daemon-reload` picks up a changed unit; disabling getty@tty2 frees
-    # the VT the session takes. tty1 keeps its getty for rescue.
-    scp deploy/nitro-dev.service {{box}}:/tmp/nitro-dev.service
-    ssh {{box}} 'sudo install -m 644 /tmp/nitro-dev.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl disable --now getty@tty2 2>/dev/null; true'
-
-box-status:
-    ssh {{box}} 'systemctl status nitro-dev --no-pager -n 20 || true'
-
-# Talk to the running session: `status`, `lock`, `suspend`, `logout`.
-box-session cmd="status":
-    # `-q1`: the session keeps the connection open after most replies, so
-    # nc is told to leave one second after its own stdin ends.
-    ssh {{box}} 'printf "{{cmd}}\n" | nc -q1 -U /run/user/$(id -u)/nitro/session.sock'
-
-# RSS/idle-CPU table for the whole desktop tree, for docs/budget.md.
-box-ps:
-    ssh {{box}} 'bash -s' < deploy/box-ps.sh
-
-box-log:
-    ssh {{box}} 'journalctl -u nitro-dev -f -o cat'
-
-box-stop:
-    ssh {{box}} 'sudo systemctl stop nitro-dev'
-
-# Screenshot of the live server, written to tmp/shot.png.
-shot out="tmp/shot.png":
-    mkdir -p tmp && ssh {{box}} '~/nitro-bin/nitro-shot' > {{out}} && echo "wrote {{out}}"
-
-# Switch the box's foreground VT (vt-switch survival test).
-box-chvt n:
-    ssh {{box}} 'sudo chvt {{n}}'
-
-# Push the repo to the box's clone (~/src/ai/nitro).
-box-push:
-    git push box main
-
-# ---------------------------------------------------------------------------
-# Benchmarks (see docs/bench.md)
-# ---------------------------------------------------------------------------
-
-# The whole throughput matrix on the box, written to ~/tmp/bench/<sha>.jsonl
-# there and fetched to tmp/bench/ here. `just bench "1920x1080@60
-# 1920x1080@120 720p240"` sweeps the refresh rate; a bare `60` still means
-# 1080p at that rate, and `720p240` is the CVT-RB modeline #3718 verified
-# on the panel.
-#
-# It restarts `nitro-dev` and, in the refresh sweep, writes a `mode` or
-# `modeline` line into the human's `server.conf` — backed up and restored
-# by the script. Announce in the `nitro-testbox` room before running it:
-# the box is shared, and the 720p arm changes what is on his screen.
-#
-# `NITRO_BENCH_SHA` is exported **from here**, not read from the box's
-# clone, because the clone is whatever `just box-push` last put there and
-# the binaries are whatever `just deploy` last built: a sweep stamped
-# with the clone's sha names a tree that did not build what it measured.
-# (#3722 lost a run to exactly that.)
-#
-# The modes string is shell-quoted **twice** (`quote(quote(modes))`) on
-# purpose: ssh does not preserve argv, it joins its arguments into one
-# command string and hands that to the remote login shell, which splits
-# it again. One layer of quoting is eaten locally, the second by the
-# remote shell, so the multi-arm form arrives as a single `--modes`
-# argument. Simplify it back to `'{{modes}}'` and every arm after the
-# first becomes a stray positional and `deploy/bench.sh` exits 2 — which
-# is what #618/#3843 found, after the spelling below had been documented
-# and unrunnable since `c4f51f1`. `crates/nitro-bench/tests/bench_recipe.rs`
-# pins it.
-bench modes="" seconds="10":
-    ssh {{box}} 'NITRO_BENCH_SHA='"$(git rev-parse --short HEAD)"' bash -s' -- --seconds {{seconds}} {{ if modes == "" { "" } else { "--modes " + quote(quote(modes)) } }} < deploy/bench.sh
-    mkdir -p tmp/bench
-    ssh {{box}} 'cat ~/tmp/bench/*.jsonl' > tmp/bench/box.jsonl
-    @echo "wrote tmp/bench/box.jsonl"
-
-# The markdown for docs/bench.md, from a ledger.
-bench-report file="tmp/bench/box.jsonl":
-    cargo run -q -p nitro-bench -- report {{file}}
-
-# This machine's memcpy bandwidth — the denominator the pixel-path
-# verdicts need. `just bench-bandwidth box` measures the box instead.
-bench-bandwidth where="here":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [[ "{{where}}" == box ]]; then
-        ssh {{box}} '~/nitro-bin/nitro-bench bandwidth'
-    else
-        cargo run -q --release -p nitro-bench -- bandwidth
-    fi
