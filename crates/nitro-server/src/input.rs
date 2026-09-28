@@ -31,6 +31,12 @@
 //! produces `PointerLeave` on the old one and `PointerEnter` on the new.
 //! Buttons and axis events go to the window the pointer is over, not to the
 //! focused one — the focus follows the click, not the other way round.
+//!
+//! Enter/leave is also re-derived when the scene changes under a *still*
+//! pointer — a window maps, closes, hides, is raised, moved or resized —
+//! so a window that appears under a parked pointer gets its `PointerEnter`
+//! (and with it the wheel) without waiting for a motion. See
+//! `Server::refresh_pointer_over`.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};

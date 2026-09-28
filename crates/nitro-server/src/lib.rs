@@ -765,12 +765,6 @@ struct PopupSeat {
     /// Escape dismissed a grabbing chain, so its release is swallowed for
     /// the same reason.
     escape_consumed: bool,
-    /// A popup mapped or unmapped this wakeup, so what is under a
-    /// *stationary* pointer changed: re-run enter/leave after the next
-    /// scene update. Without it a menu mapped under the pointer never gets
-    /// its first `PointerEnter`, and a client whose menu vanished under it
-    /// believes the pointer is still inside.
-    pointer_refresh: bool,
 }
 
 /// The running server. Field order is drop order: clients first, then the
@@ -868,6 +862,18 @@ struct Server {
     /// invisible until the next motion (#644). `move_pointer` clears it
     /// after its own choice, so the motion path pays no second hit test.
     cursor_stale: bool,
+    /// Something changed what is under a *stationary* pointer this wakeup —
+    /// a window (or popup) mapped, unmapped, closed, restacked, moved or
+    /// resized, a grab ended — so `settle` re-runs enter/leave after the
+    /// scene update. Without it a window mapped under the pointer never
+    /// gets its first `PointerEnter` (so the wheel goes nowhere until the
+    /// pointer moves, #3886), and a client whose window vanished from
+    /// under it believes the pointer is still inside.
+    ///
+    /// Set at the specific paths rather than on every settle: the re-check
+    /// is a z-order walk, and most wakeups (a frame commit that touched no
+    /// window geometry) cannot change its answer.
+    pointer_refresh: bool,
     /// The shaped title run of each framed window, so a retitle can release
     /// the old one.
     frame_titles: HashMap<WindowKey, nitro_text::TextKey>,
@@ -1310,6 +1316,7 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         cursor_shown: Some(crate::cursor::Shape::Arrow),
         client_cursor: None,
         cursor_stale: false,
+        pointer_refresh: false,
         frame_titles: HashMap::new(),
         scale_overrides: std::mem::take(&mut config.scales),
         mode_overrides: std::mem::take(&mut config.modes),
@@ -2012,6 +2019,7 @@ impl Server {
                 warn!("migrating a window: {e}");
                 continue;
             }
+            self.pointer_refresh = true;
             // A maximized or fullscreen window's geometry is the old
             // output's; re-derive it for the new one.
             if state != WindowState::Normal && state != WindowState::Minimized {
@@ -2476,9 +2484,10 @@ impl Server {
         // window is frontmost, its state or the focus has run by now.
         self.sync_fullscreen_cover();
         self.update_scene();
-        // A popup mapped or unmapped under a stationary pointer changed
-        // what the pointer is over; hit testing needs the update above.
-        if std::mem::take(&mut self.popup_seat.pointer_refresh) {
+        // A window mapped, unmapped or moved under a stationary pointer
+        // changed what the pointer is over; hit testing needs the update
+        // above.
+        if std::mem::take(&mut self.pointer_refresh) {
             self.refresh_pointer_over();
         }
         // Pointer focus moved under a still pointer: the displayed cursor
@@ -3638,6 +3647,9 @@ impl Server {
         if state == ButtonState::Released
             && let Some(drag) = self.wm.end_drag()
         {
+            // The window stopped following the pointer; whatever is under
+            // it now gets the enter the drag held back.
+            self.pointer_refresh = true;
             if let Drag::Button { window, region } = drag {
                 // A button fires on release *inside itself*, which is what
                 // lets a user change their mind by sliding off it.
@@ -3783,7 +3795,7 @@ impl Server {
     /// changed without it moving. The cursor is re-derived the same way.
     fn end_pointer_grab(&mut self) {
         if self.pointer.grab.take().is_some() {
-            self.popup_seat.pointer_refresh = true;
+            self.pointer_refresh = true;
             self.cursor_stale = true;
         }
     }
@@ -4161,6 +4173,7 @@ impl Server {
                 if let Err(e) = self.scene.raise(win) {
                     warn!("raise: {e}");
                 }
+                self.pointer_refresh = true;
             }
             self.note_input(time_ns);
             return;
@@ -4393,6 +4406,7 @@ impl Server {
         if let Err(e) = self.scene.raise(win) {
             warn!("raise: {e}");
         }
+        self.pointer_refresh = true;
         self.set_focus(Some(win));
     }
 
@@ -5455,7 +5469,7 @@ impl Server {
             }
             self.scene.set_top_layer_hidden(id, hide);
             // Bar ↔ fullscreen window under a still pointer.
-            self.popup_seat.pointer_refresh = true;
+            self.pointer_refresh = true;
             self.cursor_stale = true;
             if hide {
                 // A panel's menu must not stay open (and grabbing) while
@@ -5616,6 +5630,7 @@ impl Server {
             warn!("moving a window: {e}");
             return;
         }
+        self.pointer_refresh = true;
         self.configure(win);
         self.reflow_popups(win);
     }
@@ -5626,6 +5641,7 @@ impl Server {
         let Ok(info) = self.scene.window_info(win) else {
             return;
         };
+        self.pointer_refresh = true;
         let inset = info.inset();
         // A resize never changes which output a window is on: it is the
         // opposite edge that moves, and handing a window over mid-resize
@@ -5710,6 +5726,9 @@ impl Server {
         }
         self.apply_state_geometry(win, state);
         self.announce_state(win, state);
+        // Minimized, maximized, restored: the window grew, shrank or went
+        // away under a pointer that may not move.
+        self.pointer_refresh = true;
         // A window with an exclusive zone that became (or stopped being)
         // hidden changed the work area, and every maximized window has to be
         // re-sized for it. Guarded on the zone map being non-empty, so a
@@ -5868,6 +5887,7 @@ impl Server {
         {
             warn!("raise: {e}");
         }
+        self.pointer_refresh = true;
         if self.focusable(win) {
             self.focus_window(Some(win));
         }
@@ -7561,6 +7581,8 @@ impl Server {
     fn work_area_changed(&mut self) {
         self.reflow_maximized();
         self.reflow_overlay_anchors();
+        // Reflowed windows moved and resized under the pointer.
+        self.pointer_refresh = true;
         if self.output_watchers.is_empty() {
             return;
         }
@@ -8077,6 +8099,16 @@ impl Server {
             }
         }
         self.wire_clients.insert(token, client);
+        // Whatever this transaction did may have changed what is under a
+        // still pointer: a window's first content (a window is only
+        // hit-testable once something in it paints, which for Chromium is
+        // a later commit than its `CreateWindow`), a window closed or
+        // hidden, a `SetBounds` on a window root, a raise. Keying this on
+        // message kinds would miss the first of those, and it is the one
+        // #3886 was about: the wheel went nowhere until the pointer moved.
+        // One z-order walk per commit, and `refresh_pointer_over` sends
+        // nothing unless the window under the pointer actually changed.
+        self.pointer_refresh = true;
         true
     }
 
@@ -8227,6 +8259,8 @@ impl Server {
                 warn!("destroying window of client {}: {e}", id.0);
             }
             self.forget_window(win);
+            // The window below it, if any, is what the pointer is over now.
+            self.pointer_refresh = true;
         }
         for key in client.buffers.values().map(|h| h.key).collect::<Vec<_>>() {
             // Dropping the scene's buffer drops its mapping, which is the
@@ -8558,7 +8592,7 @@ impl Server {
                 output: output.0,
             }));
         }
-        self.popup_seat.pointer_refresh = true;
+        self.pointer_refresh = true;
     }
 
     /// Apply a `RepositionPopup`: anchor first, then the bounds that follow
@@ -8580,7 +8614,7 @@ impl Server {
             self.configure(win);
             self.reflow_popups(win);
         }
-        self.popup_seat.pointer_refresh = true;
+        self.pointer_refresh = true;
     }
 
     /// Re-place every popup below `parent` after the parent moved or
@@ -8602,7 +8636,7 @@ impl Server {
             }
         }
         if !chain.is_empty() {
-            self.popup_seat.pointer_refresh = true;
+            self.pointer_refresh = true;
         }
         chain.clear();
         self.popup_scratch = chain;
@@ -8642,7 +8676,7 @@ impl Server {
             self.pending_popup_done.push(win);
         }
         if !chain.is_empty() {
-            self.popup_seat.pointer_refresh = true;
+            self.pointer_refresh = true;
         }
     }
 
@@ -8670,7 +8704,7 @@ impl Server {
         }
         self.dismiss_popups_of(win);
         if self.popups.remove(&win).is_some() {
-            self.popup_seat.pointer_refresh = true;
+            self.pointer_refresh = true;
         }
         if self.popup_seat.grab == Some(win) {
             self.popup_seat.grab = None;
@@ -8813,11 +8847,19 @@ impl Server {
 
     /// Re-run pointer enter/leave at the pointer's current position.
     ///
-    /// The enter/leave half of `move_pointer`, for the one case where what
-    /// is under the pointer changes without the pointer moving: a popup
-    /// mapped under it, or a chain unmapped from under it.
+    /// The enter/leave half of `move_pointer`, for the case where what is
+    /// under the pointer changes without the pointer moving: a window or
+    /// popup mapped, unmapped, closed, restacked, moved or resized under
+    /// it, or a grab that ended. See [`Server::pointer_refresh`] for who
+    /// asks.
     fn refresh_pointer_over(&mut self) {
         if !self.pointer.present {
+            return;
+        }
+        // A window drag owns the pointer the way `move_pointer` lets it:
+        // no enter/leave while the window follows the pointer. The drag's
+        // end asks for the re-check (`pointer_button`).
+        if self.wm.drag().is_some() {
             return;
         }
         // During a drag-and-drop the pointer belongs to the drag: what
@@ -8970,7 +9012,7 @@ impl Server {
         // The first `DragEnter` (usually the source's own window) goes out
         // from `refresh_pointer_over`, after the scene update has seen the
         // icon placed.
-        self.popup_seat.pointer_refresh = true;
+        self.pointer_refresh = true;
         self.note_input(now);
     }
 
@@ -9244,7 +9286,7 @@ impl Server {
                 debug!("unmapping the drag icon: {e}");
             }
         }
-        self.popup_seat.pointer_refresh = true;
+        self.pointer_refresh = true;
         self.cursor_stale = true;
         if self.pointer.any_button_down() {
             self.dnd_swallow = true;
@@ -9468,7 +9510,7 @@ impl Server {
         // scaled and inert, and a lit border would be misleading.
         self.set_resize_hint(None);
         self.set_button_hover(None);
-        self.popup_seat.pointer_refresh = true;
+        self.pointer_refresh = true;
         self.cursor_stale = true;
     }
 
@@ -9625,7 +9667,7 @@ impl Server {
             }
             self.raise_and_focus(win);
         }
-        self.popup_seat.pointer_refresh = true;
+        self.pointer_refresh = true;
         self.cursor_stale = true;
     }
 

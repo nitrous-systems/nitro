@@ -1496,8 +1496,9 @@ rules:
 * The drag's button check runs above the popup's in `pointer_button`, and
   its Escape check above the popup's in key routing; with no popup grab
   possible during a drag, neither ever reaches the other.
-* The stationary enter/leave re-check (`pointer_refresh`) is shared: while
-  a drag holds the pointer it re-derives the **drop target** instead
+* The stationary enter/leave re-check (`Server::pointer_refresh`, set by
+  every commit and by the window manager's map/raise/move paths) is
+  shared: while a drag holds the pointer it re-derives the **drop target** instead
   (`DragEnter`/`DragLeave` for a window mapped or unmapped under a still
   pointer), and the end of the grab uses it to hand pointer focus back
   with a `PointerEnter`.

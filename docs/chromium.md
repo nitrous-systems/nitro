@@ -255,7 +255,9 @@ leaves about 70 % of the two cores free.
 - The right-click context menu still renders with rounded corners and a
   shadow over the page. It is `AR24` with no region, so it takes the blend.
 
-**Bench gotcha:** after a chrome restart the pointer has to leave and
-re-enter the window, or wheel events do nothing (0 frames). Inject
-`motion` elsewhere and back before `scroll-bench.py`.
+**Pointer at startup:** the server re-derives pointer focus whenever a
+window maps, unmaps, restacks or moves under a still pointer (#3886), so
+a chrome started under a parked pointer gets its `PointerEnter` with its
+first frame and the wheel scrolls at once. No motion is needed before
+`scroll-bench.py`.
 

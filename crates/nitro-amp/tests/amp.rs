@@ -513,11 +513,20 @@ fn eject_opens_files_and_replaces_the_playlist() {
 
     act_picker(&mut h, "picker_list", "select", Some("0"));
     h.key_with(key::LEFT_SHIFT, key::DOWN);
-    act_picker(&mut h, "picker_ok", "click", None);
+    // The click, without the settle `act_picker` adds: the unpaced
+    // backend ends a 50 ms tone as fast as it decodes, so by the end of a
+    // settle (the dialog closing is a round trip or two) the list may
+    // already have advanced to "b". What is checked here is that it
+    // *started* from the top of the new list.
+    let ok = picker(&mut h, "picker_ok");
+    let (ui, state) = h.parts();
+    ui.action(state, ok, "click", None)
+        .unwrap_or_else(|e| panic!("picker_ok click: {e}"));
+    assert_eq!(h.state().playlist().current(), Some(0));
+    h.settle();
     assert!(!h.ui().has_window(win), "the dialog closed");
     assert_eq!(titles(&h), ["a", "b"], "the old list is gone");
     run_until(&mut h, "playing", |h| h.state().status().token > 0);
-    assert_eq!(h.state().playlist().current(), Some(0));
     run_until(&mut h, "the list to finish", |h| !h.state().is_ticking());
 }
 
