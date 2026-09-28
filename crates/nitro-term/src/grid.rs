@@ -671,6 +671,68 @@ impl Grid {
         }
     }
 
+    /// Lines stored in all: the scrollback plus the screen.
+    #[must_use]
+    pub fn total_lines(&self) -> usize {
+        self.history.len() + self.lines.len()
+    }
+
+    /// The absolute index (into scrollback ++ screen) of display row
+    /// `i`; the inverse of [`Grid::display_of`].
+    #[must_use]
+    pub fn absolute_of(&self, i: usize) -> usize {
+        let hist = self.history.len();
+        hist - self.view_offset.min(hist) + i
+    }
+
+    /// The display row showing absolute line `abs`, if it is on screen.
+    #[must_use]
+    pub fn display_of(&self, abs: usize) -> Option<usize> {
+        let top = self.absolute_of(0);
+        (abs >= top && abs < top + self.rows).then(|| abs - top)
+    }
+
+    /// Absolute line `abs` as stored (a scrollback line is trimmed), or
+    /// empty past the end.
+    #[must_use]
+    pub fn line_abs(&self, abs: usize) -> &[Cell] {
+        let hist = self.history.len();
+        if abs < hist {
+            &self.history[abs]
+        } else {
+            self.lines.get(abs - hist).map_or(&[], Vec::as_slice)
+        }
+    }
+
+    /// The text of a stream selection between two `(absolute line, col)`
+    /// points, in either order, both ends inclusive. Trailing blanks are
+    /// trimmed per line, wide-character tails skipped, and lines joined
+    /// with `\n`.
+    #[must_use]
+    pub fn selection_text(&self, a: (usize, usize), b: (usize, usize)) -> String {
+        let (from, to) = if a <= b { (a, b) } else { (b, a) };
+        let mut out = String::new();
+        let last = to.0.min(self.total_lines().saturating_sub(1));
+        for line in from.0..=last {
+            let cells = self.line_abs(line);
+            let end = trimmed_len(cells);
+            let c0 = if line == from.0 { from.1 } else { 0 };
+            let c1 = if line == to.0 { (to.1 + 1).min(end) } else { end };
+            if line > from.0 {
+                out.push('\n');
+            }
+            if c0 < c1 {
+                let seg: String = cells[c0..c1]
+                    .iter()
+                    .filter(|c| c.wide != Wide::Tail)
+                    .map(|c| c.ch)
+                    .collect();
+                out.push_str(seg.trim_end_matches(' '));
+            }
+        }
+        out
+    }
+
     /// Row `i` as text, trailing blanks trimmed.
     ///
     /// # Panics
@@ -1416,6 +1478,32 @@ fn sanitize_line(line: &mut [Cell]) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn selection_text_spans_lines_and_trims() {
+        let mut g = Grid::new(10, 3, 100);
+        for ch in "ab  cd".chars() {
+            g.put_char(ch);
+        }
+        g.carriage_return();
+        g.line_feed();
+        for ch in "xyz".chars() {
+            g.put_char(ch);
+        }
+        let top = g.absolute_of(0);
+        assert_eq!(g.selection_text((top, 1), (top, 3)), "b");
+        assert_eq!(g.selection_text((top + 1, 1), (top, 4)), "cd\nxy");
+        assert_eq!(g.selection_text((top, 0), (top + 2, 9)), "ab  cd\nxyz\n");
+    }
+
+    #[test]
+    fn selection_text_skips_wide_tails() {
+        let mut g = Grid::new(10, 2, 0);
+        for ch in "a\u{4e2d}b".chars() {
+            g.put_char(ch);
+        }
+        assert_eq!(g.selection_text((0, 0), (0, 9)), "a\u{4e2d}b");
+    }
+
     use super::*;
 
     /// Write a string through `put_char`, as the parser would.

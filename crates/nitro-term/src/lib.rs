@@ -590,6 +590,45 @@ pub fn install(ui: &mut Ui<TermApp>, state: &mut TermApp, grid: WidgetId) -> Res
     ui.set_shortcut(mods::CTRL, code::MINUS, zoom_out);
     ui.set_shortcut(mods::CTRL, code::KP_MINUS, zoom_out);
     ui.set_shortcut(mods::CTRL, code::KEY_0, reset_zoom);
+    // The clipboard: Ctrl+Shift+C copies the mouse selection, and
+    // Ctrl+Shift+V pastes through the same path as the `paste_text`
+    // action (bracketed when the program asked). The grid and
+    // `type_key` decline both chords, so they reach this table.
+    ui.set_shortcut(
+        mods::CTRL | mods::SHIFT,
+        nitro_ui::event::key::C,
+        move |_s: &mut TermApp, ui: &mut Ui<TermApp>| {
+            let text = ui
+                .widget::<TermGrid>(grid)
+                .ok()
+                .and_then(TermGrid::selection_text);
+            if let Some(text) = text {
+                if let Err(e) = ui.set_clipboard_text(&text) {
+                    eprintln!("nitro-term: copy: {e}");
+                }
+            }
+        },
+    );
+    ui.set_shortcut(
+        mods::CTRL | mods::SHIFT,
+        nitro_ui::event::key::V,
+        move |_s: &mut TermApp, ui: &mut Ui<TermApp>| {
+            ui.read_clipboard(
+                &[
+                    nitro_ui::clipboard::TEXT_MIME,
+                    nitro_ui::clipboard::PLAIN_MIME,
+                ],
+                move |_s, ui, got| {
+                    let Some((_, bytes)) = got else { return };
+                    let text = String::from_utf8_lossy(&bytes);
+                    if let Ok(mut g) = ui.widget_mut::<TermGrid>(grid) {
+                        g.paste_text(&text);
+                    }
+                    let _ = crate::widget::request_frame_if_dirty(ui, grid);
+                },
+            );
+        },
+    );
     // Keys the grid did not take still belong to the pty: the widget
     // only has focus once something has clicked or tabbed into it, and a
     // terminal whose first keystroke went nowhere would look broken.

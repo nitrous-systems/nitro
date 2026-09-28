@@ -168,6 +168,28 @@ pub struct TermGrid {
     runs: Vec<Run>,
     /// Touchpad scrolling not yet worth a whole row, in logical pixels.
     scroll_px: f32,
+    /// The mouse selection: anchor and head as `(absolute line, col)`,
+    /// absolute meaning an index into scrollback ++ screen, so scrolling
+    /// the view does not move it. Cleared by typing, a resize and an
+    /// alternate-screen switch.
+    selection: Option<Selection>,
+    /// A left drag is extending the selection.
+    selecting: bool,
+}
+
+/// A stream selection in a [`TermGrid`]; see [`TermGrid::selection_text`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Selection {
+    anchor: (usize, usize),
+    head: (usize, usize),
+    /// Which screen it was made on; the other one has other lines.
+    alt: bool,
+}
+
+/// Slot of the selection highlight on display row `row`: above the
+/// cursor, so the dense slot table stays as short as it can.
+fn selection_slot(rows: usize, row: usize) -> Slot {
+    cursor_slot(rows) + 1 + row as Slot
 }
 
 impl std::fmt::Debug for TermGrid {
@@ -198,6 +220,8 @@ impl TermGrid {
             focused: true,
             runs: Vec::new(),
             scroll_px: 0.0,
+            selection: None,
+            selecting: false,
         }
     }
 
@@ -259,6 +283,82 @@ impl TermGrid {
         }
         if let Some(fd) = &self.pty {
             let _ = crate::pty::Pty::write_all(fd.as_fd(), bytes);
+        }
+    }
+
+    /// The selected text, if there is a non-empty selection.
+    #[must_use]
+    pub fn selection_text(&self) -> Option<String> {
+        let sel = self.selection?;
+        if sel.anchor == sel.head || sel.alt != self.term.alt_screen() {
+            return None;
+        }
+        Some(self.term.grid().selection_text(sel.anchor, sel.head))
+    }
+
+    /// Drop the selection. Returns whether there was one, so the caller
+    /// knows to repaint.
+    pub fn clear_selection(&mut self) -> bool {
+        self.selecting = false;
+        self.selection.take().is_some()
+    }
+
+    /// Paste `text`: line breaks sent as Return, bracketed (and
+    /// sanitised) when the program asked for it; see [`crate::keys::paste`].
+    /// The text is sent as it is, with no escape interpretation.
+    pub fn paste(&mut self, text: &str) {
+        let bytes = crate::keys::paste(text, self.term.bracketed_paste());
+        self.term.grid_mut().scroll_to_bottom();
+        self.write_input(&bytes);
+    }
+
+    /// The `(absolute line, col)` of the cell under a widget-local point,
+    /// clamped to the screen.
+    fn cell_at(&self, pos: nitro_ui::Point) -> (usize, usize) {
+        let g = self.term.grid();
+        let row = (pos.y / self.cell.h.max(1.0)).floor().max(0.0) as usize;
+        let col = (pos.x / self.cell.w.max(1.0)).floor().max(0.0) as usize;
+        let row = row.min(g.rows().saturating_sub(1));
+        (g.absolute_of(row), col.min(g.cols().saturating_sub(1)))
+    }
+
+    /// One translucent rect per visible selected row.
+    fn paint_selection<S: 'static>(&mut self, cx: &mut PaintCx<'_, S>) {
+        let Some(sel) = self.selection else {
+            return;
+        };
+        if sel.alt != self.term.alt_screen() {
+            self.selection = None;
+            return;
+        }
+        if sel.anchor == sel.head {
+            return;
+        }
+        let (from, to) = if sel.anchor <= sel.head {
+            (sel.anchor, sel.head)
+        } else {
+            (sel.head, sel.anchor)
+        };
+        let g = self.term.grid();
+        let (rows, cols) = (g.rows(), g.cols());
+        let scale = device_scale(cx);
+        let color = self.palette.get(ColorRole::Selection).with_alpha(0x90);
+        for line in from.0..=to.0 {
+            let Some(row) = g.display_of(line) else {
+                continue;
+            };
+            let c0 = if line == from.0 { from.1 } else { 0 };
+            let c1 = if line == to.0 { to.1 + 1 } else { cols };
+            if c0 >= c1 {
+                continue;
+            }
+            cx.rect(
+                selection_slot(rows, row),
+                self.cell_rect(scale, row, c0, c1 - c0),
+                Fill::Solid(color),
+                0.0,
+                (0.0, Color::TRANSPARENT),
+            );
         }
     }
 
@@ -467,6 +567,12 @@ impl TermGrid {
     /// declined to the same function, and a key cannot be typed twice
     /// because the widget consumed the ones it handled.
     pub fn type_key(&mut self, ev: &nitro_ui::KeyEvent) -> bool {
+        // Ctrl+Shift+C and Ctrl+Shift+V are the clipboard's, and the
+        // app binds them. They would otherwise encode to ^C and ^V, the
+        // same bytes as Ctrl+C and Ctrl+V, so the pty loses nothing.
+        if is_clipboard_chord(ev) {
+            return false;
+        }
         let modes = crate::keys::Modes {
             application_cursor: self.term.application_cursor(),
         };
@@ -478,8 +584,16 @@ impl TermGrid {
         // most confusing thing a terminal can do.
         self.term.grid_mut().scroll_to_bottom();
         self.write_input(&bytes);
+        // Typing ends a selection, as in every terminal.
+        self.clear_selection();
         true
     }
+}
+
+/// Whether `ev` is Ctrl+Shift+C or Ctrl+Shift+V, exactly.
+#[must_use]
+pub fn is_clipboard_chord(ev: &nitro_ui::KeyEvent) -> bool {
+    ev.mods & mods::MASK == mods::CTRL | mods::SHIFT && matches!(ev.keycode, key::C | key::V)
 }
 
 impl<S: 'static> Widget<S> for TermGrid {
@@ -527,6 +641,7 @@ impl<S: 'static> Widget<S> for TermGrid {
         }
         self.runs = runs;
         self.paint_cursor(cx);
+        self.paint_selection(cx);
         // The damage has been drawn; the next paint starts from clean.
         // Doing it here rather than in the frame callback is what makes
         // a paint the widget did not ask for (a resize, a theme change)
@@ -604,11 +719,44 @@ impl<S: 'static> Widget<S> for TermGrid {
             // widget paints a background rect at all: the server hit
             // tests painted content, so a widget that drew only text
             // would be clickable on its glyphs and nowhere else.
+            //
+            // A press also starts a selection at the cell under it, and
+            // the drag (captured, so it keeps coming past the edges)
+            // extends it. A click that did not move selects nothing.
             Event::PointerDown {
                 button: button::LEFT,
-                ..
+                pos,
             } => {
                 cx.request_focus();
+                let at = self.cell_at(*pos);
+                self.selection = Some(Selection {
+                    anchor: at,
+                    head: at,
+                    alt: self.term.alt_screen(),
+                });
+                self.selecting = true;
+                cx.request_paint();
+                Handled::Yes
+            }
+            Event::PointerMove { pos } if self.selecting => {
+                let at = self.cell_at(*pos);
+                if let Some(sel) = &mut self.selection {
+                    if sel.head != at {
+                        sel.head = at;
+                        cx.request_paint();
+                    }
+                }
+                Handled::Yes
+            }
+            Event::PointerUp {
+                button: button::LEFT,
+                ..
+            } if self.selecting => {
+                self.selecting = false;
+                if self.selection.is_some_and(|s| s.anchor == s.head) {
+                    self.selection = None;
+                    cx.request_paint();
+                }
                 Handled::Yes
             }
             Event::FocusChanged { focused } => {
@@ -663,8 +811,8 @@ impl<S: 'static> Widget<S> for TermGrid {
             // execute what arrives: the newline was inserted as a
             // literal character and every scripted command sat on the
             // prompt unrun. A script driving a terminal is a keyboard,
-            // not a clipboard. `paste_text` below is the action for the
-            // day there is a real clipboard.
+            // not a clipboard. `paste_text` below is the action a paste
+            // takes.
             "send" | "set_value" | "set_text" => {
                 let text = crate::keys::unescape(arg.unwrap_or_default());
                 self.term.grid_mut().scroll_to_bottom();
@@ -674,14 +822,12 @@ impl<S: 'static> Widget<S> for TermGrid {
             }
             // A genuine paste: bracketed when the program asked for it,
             // so an editor can tell it from typing and not auto-indent
-            // it. Nothing produces one yet — there is no clipboard — but
-            // the plumbing is here and tested, and it is the action a
-            // clipboard would call.
+            // it. The same path Ctrl+Shift+V takes (`TermGrid::paste`),
+            // after the escapes are interpreted; the clipboard's text is
+            // sent without that step.
             "paste_text" => {
                 let text = crate::keys::unescape(arg.unwrap_or_default());
-                let bytes = crate::keys::paste(&text, self.term.bracketed_paste());
-                self.term.grid_mut().scroll_to_bottom();
-                self.write_input(&bytes);
+                self.paste(&text);
                 cx.request_paint();
                 Handled::Yes
             }
@@ -746,6 +892,10 @@ pub trait TermGridMut {
     /// Replace the colour table.
     fn set_palette(&mut self, palette: Palette);
 
+    /// Paste `text` as it is (no escape interpretation); see
+    /// [`TermGrid::paste`].
+    fn paste_text(&mut self, text: &str);
+
     /// Change the font size to `px`, with `cell` the metric already
     /// measured for it.
     ///
@@ -790,6 +940,7 @@ impl<S: 'static> TermGridMut for WidgetMut<'_, TermGrid, S> {
             return;
         }
         self.term.resize(cols, rows);
+        self.clear_selection();
         self.term.grid_mut().damage_all();
         self.request_layout();
     }
@@ -809,6 +960,11 @@ impl<S: 'static> TermGridMut for WidgetMut<'_, TermGrid, S> {
     fn set_palette(&mut self, palette: Palette) {
         self.palette = palette;
         self.term.grid_mut().damage_all();
+        self.request_paint();
+    }
+
+    fn paste_text(&mut self, text: &str) {
+        self.paste(text);
         self.request_paint();
     }
 

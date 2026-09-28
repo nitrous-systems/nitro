@@ -212,21 +212,30 @@ pub fn unescape(text: &str) -> String {
 }
 
 /// Wrap `text` in the bracketed-paste markers when the terminal asked
-/// for them (DECSET 2004), else return it unchanged.
+/// for them (DECSET 2004), else return it unchanged but for newlines.
 ///
 /// The markers are what let an editor tell a paste from typing, so that
 /// pasted text is not auto-indented and a pasted newline does not run a
 /// half-finished command. A terminal that sent them unasked would break
 /// every program that has not opted in, so the flag is the host's, not
 /// ours.
+///
+/// Two sanitising steps, as xterm does. Line breaks (`\r\n`, `\n`) become
+/// `\r`, which is what the Return key sends. And inside the markers any
+/// `ESC [ 201 ~` is removed, so pasted content cannot end the bracket
+/// early and have the rest of it run as typed commands.
 #[must_use]
 pub fn paste(text: &str, bracketed: bool) -> Vec<u8> {
+    let mut body = text.replace("\r\n", "\r").replace('\n', "\r");
     if !bracketed {
-        return text.as_bytes().to_vec();
+        return body.into_bytes();
     }
-    let mut out = Vec::with_capacity(text.len() + 12);
+    while body.contains("\x1b[201~") {
+        body = body.replace("\x1b[201~", "");
+    }
+    let mut out = Vec::with_capacity(body.len() + 12);
     out.extend_from_slice(b"\x1b[200~");
-    out.extend_from_slice(text.as_bytes());
+    out.extend_from_slice(body.as_bytes());
     out.extend_from_slice(b"\x1b[201~");
     out
 }
@@ -606,5 +615,26 @@ mod tests {
         assert_eq!(paste("ls -l", false), b"ls -l");
         assert_eq!(paste("ls -l", true), b"\x1b[200~ls -l\x1b[201~");
         assert_eq!(paste("", true), b"\x1b[200~\x1b[201~");
+    }
+
+    #[test]
+    fn a_paste_sends_line_breaks_as_return() {
+        assert_eq!(paste("a\nb\r\nc\rd", false), b"a\rb\rc\rd");
+        assert_eq!(paste("a\nb", true), b"\x1b[200~a\rb\x1b[201~");
+    }
+
+    #[test]
+    fn a_bracketed_paste_cannot_close_its_own_bracket() {
+        assert_eq!(
+            paste("x\x1b[201~rm -rf ~\n", true),
+            b"\x1b[200~xrm -rf ~\r\x1b[201~"
+        );
+        // Nested so that one removal would leave a new marker behind.
+        assert_eq!(
+            paste("\x1b[20\x1b[201~1~y", true),
+            b"\x1b[200~y\x1b[201~"
+        );
+        // Unbracketed text is the program's problem, not a marker.
+        assert_eq!(paste("\x1b[201~", false), b"\x1b[201~");
     }
 }

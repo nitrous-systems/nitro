@@ -19,7 +19,7 @@ use nitro_term::pty::Pty;
 use nitro_term::widget::{DEFAULT_FONT_SIZE, TermGrid, TermGridMut as _};
 use nitro_term::{GRID_NAME, TermApp};
 use nitro_ui::event::key;
-use nitro_ui::test::Harness;
+use nitro_ui::test::{ClipboardPeer, Harness};
 use nitro_ui::{ColorRole, Palette, Point, Size, WidgetId};
 
 /// How long a test will wait for a shell to say something before giving
@@ -944,6 +944,92 @@ fn a_scheme_switch_repaints_the_backdrop_in_the_new_terminal_background() {
         middle(&h),
         want(Palette::dark().get(ColorRole::TerminalBackground)),
         "the backdrop followed the scheme"
+    );
+    h.quit();
+}
+
+// ---------------------------------------------------------------------
+// the clipboard
+// ---------------------------------------------------------------------
+
+/// Press Ctrl+Shift+`k`.
+fn ctrl_shift(h: &mut Harness<TermApp>, k: u32) {
+    h.key_down(key::LEFT_CTRL);
+    h.key_with(key::LEFT_SHIFT, k);
+    h.key_up(key::LEFT_CTRL);
+}
+
+#[test]
+fn drag_select_and_ctrl_shift_c_puts_the_text_on_the_clipboard() {
+    let (mut h, grid) = harness_running(&["/bin/sh", "-c", "sleep 30"]);
+    h.ui()
+        .widget_mut::<TermGrid>(grid)
+        .expect("grid")
+        .feed(b"hello world\r\nsecond line");
+    h.settle();
+    let cell = h.widget::<TermGrid>(grid).cell_size();
+    let b = h.bounds(grid);
+    let at = |col: f32, row: f32| {
+        Point::new(
+            b.x + (col + 0.5) * cell.w,
+            b.y + (row + 0.5) * cell.h,
+        )
+    };
+    // From the `w` of `world` to the `c` of `second`.
+    h.move_pointer(at(6.0, 0.0));
+    h.press(nitro_ui::event::button::LEFT);
+    h.move_pointer(at(2.0, 1.0));
+    h.release(nitro_ui::event::button::LEFT);
+    assert_eq!(
+        h.widget::<TermGrid>(grid).selection_text().as_deref(),
+        Some("world\nsec")
+    );
+    let mut peer = ClipboardPeer::new(&h, "peer");
+    ctrl_shift(&mut h, key::C);
+    assert_eq!(
+        peer.paste(&mut h, 1, nitro_ui::clipboard::TEXT_MIME),
+        b"world\nsec"
+    );
+    // Typing clears it.
+    h.key(key::ENTER);
+    assert_eq!(h.widget::<TermGrid>(grid).selection_text(), None);
+    h.quit();
+}
+
+#[test]
+fn ctrl_shift_v_pastes_bracketed_and_ctrl_shift_c_sends_nothing() {
+    // The dumper reads exactly the bracketed paste of "a\nb": 15 bytes.
+    // A Ctrl+Shift+C typed first (with no selection) must not reach the
+    // pty as ^C, or the dump would start with a 3.
+    let (mut h, grid) = harness_running(&[
+        "/bin/sh",
+        "-c",
+        "stty raw -echo; printf '\\033[?2004h'; printf ready; \
+         dd bs=1 count=15 status=none | od -An -t u1",
+    ]);
+    pump_until(&mut h, "the byte dumper to be ready", |h| {
+        screen(h, grid).contains("ready")
+            && h.widget::<TermGrid>(grid).term().bracketed_paste()
+    });
+    let mut peer = ClipboardPeer::new(&h, "peer");
+    peer.copy(&mut h, &[nitro_ui::clipboard::TEXT_MIME]);
+    ctrl_shift(&mut h, key::C);
+    ctrl_shift(&mut h, key::V);
+    let (id, _) = peer.asked(&mut h);
+    peer.answer_bytes(id, b"a\nb");
+    let want = [
+        "27", "91", "50", "48", "48", "126", "97", "13", "98", "27", "91", "50", "48", "49",
+        "126",
+    ];
+    pump_until(&mut h, "od to print the paste", |h| {
+        let output = screen(h, grid);
+        let bytes = output.split_whitespace().collect::<Vec<_>>();
+        bytes.windows(want.len()).any(|w| w == want)
+    });
+    let output = screen(&mut h, grid);
+    assert!(
+        !output.split_whitespace().any(|w| w == "3"),
+        "Ctrl+Shift+C reached the pty as ^C: {output:?}"
     );
     h.quit();
 }
