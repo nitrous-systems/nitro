@@ -95,6 +95,13 @@ fn cursor_slot(rows: usize) -> Slot {
     (rows * SLOTS_PER_ROW) as Slot
 }
 
+/// The device-pixels-per-logical-pixel of the window `cx` paints into,
+/// or 1 before the widget is attached.
+fn device_scale<S: 'static>(cx: &PaintCx<'_, S>) -> f32 {
+    let s = cx.ui.window_of(cx.id).map_or(1.0, |w| cx.ui.scale_of(w));
+    if s.is_finite() && s > 0.0 { s } else { 1.0 }
+}
+
 /// The default font size, in logical pixels.
 pub const DEFAULT_FONT_SIZE: f32 = 13.0;
 
@@ -330,6 +337,26 @@ impl TermGrid {
         }
     }
 
+    /// The box of `cols` cells from (`row`, `col`), its edges snapped to
+    /// whole device pixels.
+    ///
+    /// The cell metric comes from the font and is fractional (17.6 px is
+    /// typical), so unsnapped rects have anti-aliased edges. Two
+    /// same-coloured rects that meet at a fractional edge each cover
+    /// only part of the shared pixel, and the window's backdrop shows
+    /// through as a hairline seam between every row. Snapping each edge
+    /// (rather than rounding the cell size) makes neighbours share an
+    /// exact pixel boundary while leaving the text where the font's
+    /// own advances put it.
+    fn cell_rect(&self, scale: f32, row: usize, col: usize, cols: usize) -> Rect {
+        let snap = |v: f32| (v * scale).round() / scale;
+        let x0 = snap(col as f32 * self.cell.w);
+        let x1 = snap((col + cols) as f32 * self.cell.w);
+        let y0 = snap(row as f32 * self.cell.h);
+        let y1 = snap((row + 1) as f32 * self.cell.h);
+        Rect::new(x0, y0, x1 - x0, y1 - y0)
+    }
+
     /// Paint one row's runs into its slice of the slot space.
     ///
     /// A row that shrank from six runs to two simply stops emitting the
@@ -339,9 +366,9 @@ impl TermGrid {
         let base = (row * SLOTS_PER_ROW) as Slot;
         let y = row as f32 * self.cell.h;
         let row_w = self.term.grid().cols() as f32 * self.cell.w;
+        let scale = device_scale(cx);
         for (k, run) in runs.iter().take(RUNS_PER_ROW).enumerate() {
             let x = run.col as f32 * self.cell.w;
-            let w = run.cols as f32 * self.cell.w;
             let bg_slot = base + k as Slot;
             let text_slot = base + (RUNS_PER_ROW + k) as Slot;
             // The background first, and only when it is not the
@@ -352,7 +379,7 @@ impl TermGrid {
             if let Some(bg) = self.bg_of(run.style) {
                 cx.rect(
                     bg_slot,
-                    Rect::new(x, y, w, self.cell.h),
+                    self.cell_rect(scale, row, run.col, run.cols),
                     Fill::Solid(bg),
                     0.0,
                     (0.0, Color::TRANSPARENT),
@@ -401,12 +428,7 @@ impl TermGrid {
         let Some((row, col)) = self.term.grid().cursor() else {
             return;
         };
-        let rect = Rect::new(
-            col as f32 * self.cell.w,
-            row as f32 * self.cell.h,
-            self.cell.w,
-            self.cell.h,
-        );
+        let rect = self.cell_rect(device_scale(cx), row, col, 1);
         // Focused: a filled block, the convention every terminal uses.
         // Unfocused: an outline, so a screenshot of two terminals says
         // which one the keyboard is talking to.
