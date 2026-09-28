@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use nitro_amp::engine::State;
 use nitro_amp::vis::{Mode, Vis};
-use nitro_amp::{Amp, Config, build, wav};
+use nitro_amp::{Amp, Config, append, build, wav};
 use nitro_ui::event::key;
 use nitro_ui::picker::Picker;
 use nitro_ui::test::Harness;
@@ -92,10 +92,11 @@ fn run_until(h: &mut Harness<Amp>, what: &str, mut f: impl FnMut(&mut Harness<Am
     }
 }
 
-/// Add `path` through the path field and the add button.
+/// Append `path`, as the add buttons do.
 fn add(h: &mut Harness<Amp>, path: &Path) {
-    act(h, "path", "set_text", Some(&path.display().to_string()));
-    act(h, "add", "activate", None);
+    let (ui, s) = h.parts();
+    append(s, ui, &[path.to_path_buf()]);
+    h.settle();
 }
 
 #[test]
@@ -127,8 +128,6 @@ fn every_control_is_named_for_hey() {
         "eq_16k",
         "preset_rock",
         "playlist",
-        "path",
-        "add",
         "add_files",
         "add_folder",
         "remove",
@@ -136,6 +135,10 @@ fn every_control_is_named_for_hey() {
         "total",
     ] {
         named(&mut h, n);
+    }
+    // The free-form path field and its button are gone.
+    for n in ["path", "add"] {
+        assert!(nitro_ui::introspect::resolve(h.ui(), &format!("window/{n}")).is_none());
     }
     // Nothing is loaded and no output was found: the window says so
     // rather than showing a confident blank.

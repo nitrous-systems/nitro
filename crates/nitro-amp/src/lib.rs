@@ -22,7 +22,7 @@
 //! ├──────────────────────────────────────────────┤
 //! │ ► 1. First song                         3:12 │  playlist
 //! │   2. Second song                        4:05 │
-//! │ [ path or URL ] Add Files Folder Rm Clr      │
+//! │ Files Folder Rm Clr                 N tracks │
 //! └──────────────────────────────────────────────┘
 //! ```
 //!
@@ -56,8 +56,6 @@
 //! for it:
 //!
 //! ```text
-//! hey nitro-amp do window/path set_text ~/Music
-//! hey nitro-amp do window/add click
 //! hey nitro-amp do window/add_folder click
 //! hey nitro-amp do window[1]/picker_path set_text ~/Music
 //! hey nitro-amp do window[1]/picker_ok click
@@ -78,7 +76,7 @@
 //! **append** instead, and play nothing. One dialog at a time: asking
 //! for another while one is up only says so on the status line. The
 //! dialog starts where the last pick was made, remembered across runs.
-//! The path field (`Ctrl+L`) still takes a path or a URL typed out.
+//! Paths and URLs can also be named on the command line.
 //!
 //! # Keys
 //!
@@ -87,9 +85,9 @@
 //! `←`/`→` seek five seconds, `↑`/`↓` volume — each only when no widget
 //! wanted the key (a focused slider keeps its arrows), and only in the
 //! player's own window, never in the file dialog. `Ctrl+O` /
-//! `Ctrl+Shift+O` open files / a folder, `Ctrl+L` focuses the path
-//! field, `Ctrl+T` flips the clock, `Alt+G` the equaliser, `Alt+E` the
-//! playlist, `Delete` removes the selected track and `Ctrl+Q` quits.
+//! `Ctrl+Shift+O` open files / a folder, `Ctrl+T` flips the clock,
+//! `Alt+G` the equaliser, `Alt+E` the playlist, `Delete` removes the
+//! selected track and `Ctrl+Q` quits.
 
 pub mod dsp;
 pub mod engine;
@@ -107,8 +105,7 @@ use std::rc::Rc;
 use nitro_ui::build::{ContainerBuilder as _, StyleBuilder as _};
 use nitro_ui::event::{Handled, KeyEvent, key, mods};
 use nitro_ui::widgets::{
-    Checkbox, Label, Slider, TextField, button, checkbox, column, label, panel, row, slider,
-    spacer, text_field,
+    Checkbox, Label, Slider, button, checkbox, column, label, panel, row, slider, spacer,
 };
 use nitro_ui::{
     App, ColorRole, CrossAlign, FilePicker, List, ListModel, Row, Size, Ui, WidgetId, WindowId,
@@ -280,7 +277,6 @@ struct Ids {
     bands: [WidgetId; 10],
     pl_section: WidgetId,
     list: WidgetId,
-    path: WidgetId,
     total: WidgetId,
 }
 
@@ -581,6 +577,12 @@ pub fn play(s: &mut Amp, ui: &mut Ui<Amp>) {
 pub fn pause(s: &mut Amp, ui: &mut Ui<Amp>) {
     s.player.send(Cmd::Pause);
     ensure_ticking(s, ui);
+}
+
+/// Append every playable track under `paths` to the playlist, as the
+/// editor's *add files* / *add folder* do; plays nothing.
+pub fn append(s: &mut Amp, ui: &mut Ui<Amp>, paths: &[PathBuf]) {
+    add_picked(s, ui, paths, false);
 }
 
 /// Stop and rewind.
@@ -918,28 +920,6 @@ fn refresh_list(s: &Amp, ui: &mut Ui<Amp>) {
 
 // -- controls -------------------------------------------------------
 
-fn add_from_field(s: &mut Amp, ui: &mut Ui<Amp>, text: &str) {
-    let text = text.trim();
-    if text.is_empty() {
-        return;
-    }
-    let path = expand_tilde(text);
-    let entries = playlist::expand(&path);
-    let n = entries.len();
-    edit_list(s, ui, |p| p.extend(entries));
-    if let Some(ids) = s.ids
-        && let Ok(mut f) = ui.widget_mut::<TextField<Amp>>(ids.path)
-    {
-        f.set_text("");
-    }
-    let msg = if n == 0 {
-        Some(format!("{}: no audio files there", path.display()))
-    } else {
-        None
-    };
-    set_status(ui, s, msg.as_deref());
-}
-
 /// Whether the file dialog is up.
 fn picker_open(s: &Amp, ui: &Ui<Amp>) -> bool {
     s.picker.is_some_and(|w| ui.has_window(w))
@@ -1019,23 +999,6 @@ fn add_picked(s: &mut Amp, ui: &mut Ui<Amp>, paths: &[PathBuf], replace: bool) {
         edit_list(s, ui, |p| p.extend(entries));
         set_status(ui, s, None);
     }
-}
-
-/// Unfold the playlist and put the cursor in the path field.
-fn focus_path(s: &mut Amp, ui: &mut Ui<Amp>) {
-    if let Some(ids) = s.ids {
-        toggle_section(s, ui, false, true);
-        ui.focus(ids.path);
-    }
-}
-
-fn expand_tilde(text: &str) -> PathBuf {
-    if let Some(rest) = text.strip_prefix("~/")
-        && let Some(home) = std::env::var_os("HOME")
-    {
-        return Path::new(&home).join(rest);
-    }
-    PathBuf::from(text)
 }
 
 fn remove_selected(s: &mut Amp, ui: &mut Ui<Amp>) {
@@ -1445,26 +1408,6 @@ pub fn build(ui: &mut Ui<Amp>) -> WidgetId {
                 load(s, ui, i, true);
             }),
     );
-    let path = ui.build(
-        text_field("")
-            .name("path")
-            .placeholder("file, folder, playlist or URL")
-            .grow(1.0)
-            .on_submit(|s: &mut Amp, ui: &mut Ui<Amp>, t: &str| {
-                let t = t.to_owned();
-                add_from_field(s, ui, &t);
-            }),
-    );
-    let add = ui.build(button("").name("add").icon("plus-lg").on_click(
-        |s: &mut Amp, ui: &mut Ui<Amp>| {
-            let Some(ids) = s.ids else { return };
-            let text = ui
-                .widget::<TextField<Amp>>(ids.path)
-                .map(|f| f.text().to_owned())
-                .unwrap_or_default();
-            add_from_field(s, ui, &text);
-        },
-    ));
     let add_files = ui.build(
         button("")
             .name("add_files")
@@ -1501,7 +1444,7 @@ pub fn build(ui: &mut Ui<Amp>) -> WidgetId {
             .cross_align(CrossAlign::Center)
             .width_percent(1.0),
     );
-    for c in [path, add, add_files, add_folder, remove, clear, total] {
+    for c in [add_files, add_folder, remove, clear, total] {
         ui.attach(pl_bar, c).unwrap();
     }
     let pl_section = ui.build(
@@ -1543,7 +1486,6 @@ pub fn build(ui: &mut Ui<Amp>) -> WidgetId {
         bands,
         pl_section,
         list: list_w,
-        path,
         total,
     };
     ids_install(ui, ids);
@@ -1618,11 +1560,6 @@ fn install_keyboard(ui: &mut Ui<Amp>) {
         code::O,
         |s: &mut Amp, ui: &mut Ui<Amp>| open_picker(s, ui, true, true),
     );
-    ui.set_shortcut(mods::CTRL, key::L, |s: &mut Amp, ui: &mut Ui<Amp>| {
-        if keys_are_ours(s, ui) {
-            focus_path(s, ui);
-        }
-    });
     // The bare keys below are the player's only in its own window: the
     // file dialog's leftovers (an arrow its list did not want, Delete)
     // must not seek, change the volume or drop a track.
