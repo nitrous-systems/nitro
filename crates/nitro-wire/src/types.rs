@@ -247,6 +247,25 @@ tag_enum! {
     }
 }
 
+tag_enum! {
+    /// Why an [`AllocSurfaceBuffers`](crate::msg::AllocSurfaceBuffers) was
+    /// refused (#3914). Not fatal: the client falls back to its own
+    /// memfds and `CreateSurfaceBuffer`.
+    AllocRefusal: u8 {
+        /// The server has no scanout buffers to give: a backend without
+        /// them (the fake without support, or a remote link).
+        Unsupported = 1,
+        /// A dimension past 8192, or a buffer past the per-buffer cap.
+        TooBig = 2,
+        /// The client's (or the server's) buffer or byte cap.
+        Limit = 3,
+        /// Not an allocatable format (`NV12`, `YUYV`, `XR24`, `AR24`).
+        Format = 4,
+        /// The kernel refused the allocation or the export.
+        Failed = 5,
+    }
+}
+
 /// One cursor position: a byte offset into the text and the x it sits at.
 ///
 /// Reported by [`TextMeasured`](crate::msg::TextMeasured) so a text field

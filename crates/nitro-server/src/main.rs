@@ -122,6 +122,7 @@ fn config_from_env() -> Result<Config, String> {
         // one comes from a connector, and inventing modes for a headless
         // output is only ever a way to exercise the selection code.
         fake_modes: Vec::new(),
+        fake_planes: Vec::new(),
         // Anything but `0` leaves the shadow on: this is a measurement
         // escape hatch, not a configuration surface, and the default is
         // the one that ships.

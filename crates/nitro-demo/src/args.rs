@@ -36,6 +36,12 @@ pub struct VideoOpts {
     pub follow_hint: bool,
     /// Quit after this many `Presented` frames (`--frames N`, 0 = never).
     pub frames: u64,
+    /// Ask the server for scanout buffers (`--scanout`, #3914) instead of
+    /// making memfds; falls back to memfds if refused.
+    pub scanout: bool,
+    /// Pixel format (`--format nv12|yuyv|xr24`); 0 = the server's choice
+    /// with `--scanout`, NV12 otherwise.
+    pub format: u32,
 }
 
 impl Default for VideoOpts {
@@ -46,6 +52,8 @@ impl Default for VideoOpts {
             fullscreen: false,
             follow_hint: false,
             frames: 0,
+            scanout: false,
+            format: 0,
         }
     }
 }
@@ -104,6 +112,7 @@ usage: nitro-demo [--follow | --animate] [--windows N] [--damage] [--stats]
                   [--seconds S] [--save-small FILE]
        nitro-demo --video [--size WxH] [--fps 30|60] [--fullscreen]
                   [--follow-hint] [--frames N] [--seconds S]
+                  [--scanout] [--format nv12|yuyv|xr24]
 
   --follow           commit only on input (default); idle costs zero frames
   --animate          move a rect one step per Frame callback
@@ -119,6 +128,9 @@ usage: nitro-demo [--follow | --animate] [--windows N] [--damage] [--stats]
   --fullscreen       ask for fullscreen at start
   --follow-hint      reallocate buffers at the size a SurfaceHint asks for
   --frames N         quit after N presented video frames
+  --scanout          ask the server for scanout buffers (memfds if refused)
+  --format F         video pixel format: nv12, yuyv or xr24 (default: NV12,
+                     or the server's choice with --scanout)
 
 Environment: NITRO_SOCKET, NITRO_CONTROL, NITRO_DEMO_SHOW_DAMAGE=1.
 Keys: q quit, d toggle damage outlines, Esc close the window, n/p select.
@@ -154,6 +166,15 @@ pub fn parse(
             "--fullscreen" => out.video.fullscreen = true,
             "--follow-hint" => out.video.follow_hint = true,
             "--frames" => out.video.frames = number(&mut it, "--frames")?,
+            "--scanout" => out.video.scanout = true,
+            "--format" => {
+                out.video.format = match it.next().as_deref() {
+                    Some("nv12") => nitro_wire::types::format::NV12,
+                    Some("yuyv") => nitro_wire::types::format::YUYV,
+                    Some("xr24") => nitro_wire::types::format::XR24,
+                    other => return Err(format!("--format: {other:?} is not nv12, yuyv or xr24")),
+                };
+            }
             "--damage" => out.show_damage = true,
             "--stats" => out.stats = true,
             "--windows" => out.windows = number(&mut it, "--windows")?.max(1) as u32,
@@ -266,12 +287,21 @@ mod tests {
                 fullscreen: true,
                 follow_hint: true,
                 frames: 10,
+                ..VideoOpts::default()
             }
         );
         assert_eq!(
             args("--video --size 1920X1080").unwrap().video.size,
             (1920, 1080)
         );
+    }
+
+    #[test]
+    fn scanout_flags_are_parsed() {
+        let a = args("--video --scanout --format yuyv").unwrap();
+        assert!(a.video.scanout);
+        assert_eq!(a.video.format, nitro_wire::types::format::YUYV);
+        assert_eq!(args("--video").unwrap().video.format, 0);
     }
 
     #[test]
@@ -286,6 +316,7 @@ mod tests {
             );
         }
         assert!(args("--fps 50").unwrap_err().contains("not 30 or 60"));
+        assert!(args("--format rgb").unwrap_err().contains("nv12, yuyv"));
         assert!(args("--fps").unwrap_err().contains("needs a number"));
     }
 }

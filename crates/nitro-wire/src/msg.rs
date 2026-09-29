@@ -41,8 +41,8 @@ use crate::codec::{FdQueue, Reader, Writer};
 use crate::error::{DecodeError, EncodeError};
 use crate::types::WindowState as WindowStateValue;
 use crate::types::{
-    Align, AxisSource, BufferId, ButtonState, ColorMatrix, ColorRange, CursorPos, CursorShape,
-    DataSource, DragAction, Edge, ErrorCode, KeymapFormat, Layer, NodeId, NodeKind,
+    Align, AllocRefusal, AxisSource, BufferId, ButtonState, ColorMatrix, ColorRange, CursorPos,
+    CursorShape, DataSource, DragAction, Edge, ErrorCode, KeymapFormat, Layer, NodeId, NodeKind,
     OverviewRequest, PopupAnchor, PopupGravity, ShareToken, TouchPhase, WindowRef,
 };
 use crate::wire::Plain;
@@ -878,6 +878,112 @@ impl Body for CreateSurfaceBuffer {
             width: Plain::from_wire(f.width)?,
             height: Plain::from_wire(f.height)?,
             format: Plain::from_wire(f.format)?,
+            size: Plain::from_wire(f.size)?,
+            offset0: Plain::from_wire(f.offset0)?,
+            stride0: Plain::from_wire(f.stride0)?,
+            offset1: Plain::from_wire(f.offset1)?,
+            stride1: Plain::from_wire(f.stride1)?,
+            fd: fds.take()?,
+        })
+    }
+}
+
+/// One buffer answering an [`AllocSurfaceBuffers`] (needs
+/// [`caps::SURFACE`](crate::types::caps::SURFACE); carries one fd; #3914).
+///
+/// The fd is a dma-buf (a DRM PRIME export of a linear dumb buffer,
+/// `O_RDWR`) on real hardware, or a sealed memfd on the fake backend. The
+/// client maps `size` bytes of it `MAP_SHARED` read/write (see
+/// `nitro_shm::DmaBufMapping`), brackets its writes with
+/// `DMA_BUF_IOCTL_SYNC` (`ENOTTY` means "no sync needed"), and may close
+/// the fd once mapped. The layout fields mean what they mean in
+/// [`CreateSurfaceBuffer`]; the strides are the kernel's, often padded.
+///
+/// `PartialEq` compares the declared fields only.
+#[derive(Debug)]
+pub struct SurfaceBufferAllocated {
+    /// The surface node the request named.
+    pub node: NodeId,
+    /// This buffer's id, in the client's buffer id space.
+    pub id: BufferId,
+    /// DRM fourcc pixel format.
+    pub format: u32,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// Bytes to map.
+    pub size: u32,
+    /// Byte offset of plane 0.
+    pub offset0: u32,
+    /// Bytes per row of plane 0.
+    pub stride0: u32,
+    /// Byte offset of plane 1 (NV12 chroma; 0 otherwise).
+    pub offset1: u32,
+    /// Bytes per row of plane 1 (NV12 chroma; 0 otherwise).
+    pub stride1: u32,
+    /// The buffer's memory.
+    pub fd: OwnedFd,
+}
+
+impl PartialEq for SurfaceBufferAllocated {
+    fn eq(&self, o: &Self) -> bool {
+        self.node == o.node
+            && self.id == o.id
+            && self.format == o.format
+            && self.width == o.width
+            && self.height == o.height
+            && self.size == o.size
+            && self.offset0 == o.offset0
+            && self.stride0 == o.stride0
+            && self.offset1 == o.offset1
+            && self.stride1 == o.stride1
+    }
+}
+
+/// The fixed part of [`SurfaceBufferAllocated`].
+#[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct SurfaceBufferAllocatedFixed {
+    node: <NodeId as Plain>::Wire,
+    id: <BufferId as Plain>::Wire,
+    format: <u32 as Plain>::Wire,
+    width: <u32 as Plain>::Wire,
+    height: <u32 as Plain>::Wire,
+    size: <u32 as Plain>::Wire,
+    offset0: <u32 as Plain>::Wire,
+    stride0: <u32 as Plain>::Wire,
+    offset1: <u32 as Plain>::Wire,
+    stride1: <u32 as Plain>::Wire,
+}
+
+impl Body for SurfaceBufferAllocated {
+    fn encode_body(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.put_struct(&SurfaceBufferAllocatedFixed {
+            node: Plain::to_wire(self.node),
+            id: Plain::to_wire(self.id),
+            format: Plain::to_wire(self.format),
+            width: Plain::to_wire(self.width),
+            height: Plain::to_wire(self.height),
+            size: Plain::to_wire(self.size),
+            offset0: Plain::to_wire(self.offset0),
+            stride0: Plain::to_wire(self.stride0),
+            offset1: Plain::to_wire(self.offset1),
+            stride1: Plain::to_wire(self.stride1),
+        });
+        let dup = rustix::io::dup(self.fd.as_fd()).map_err(EncodeError::Fd)?;
+        w.put_fd(dup);
+        Ok(())
+    }
+
+    fn decode_body(r: &mut Reader<'_>, fds: &mut FdQueue) -> Result<Self, DecodeError> {
+        let f = r.get_struct::<SurfaceBufferAllocatedFixed>()?;
+        Ok(Self {
+            node: Plain::from_wire(f.node)?,
+            id: Plain::from_wire(f.id)?,
+            format: Plain::from_wire(f.format)?,
+            width: Plain::from_wire(f.width)?,
+            height: Plain::from_wire(f.height)?,
             size: Plain::from_wire(f.size)?,
             offset0: Plain::from_wire(f.offset0)?,
             stride0: Plain::from_wire(f.stride0)?,
@@ -2141,6 +2247,31 @@ fixed_msg! {
         id: NodeId,
     }
 
+    /// Ask the server for `count` (1..=4) **scanout-capable** buffers for
+    /// a `Surface` node (needs [`caps::SURFACE`](crate::types::caps::SURFACE),
+    /// listed in `ClientCaps`; #3914). Not buffered: answered at receipt
+    /// with one [`SurfaceBufferAllocated`] per buffer (each carrying a
+    /// dma-buf fd), or one [`AllocSurfaceBuffersFailed`]. The buffers get
+    /// the ids `first_id..first_id + count` in the client's own buffer id
+    /// space and are ordinary surface buffers from then on: presented
+    /// with [`PresentSurface`]/[`SetSurface`], freed with
+    /// [`DestroyBuffer`]. `format` 0 is the server's choice; `width` and
+    /// `height` 0 are the node's hinted size.
+    AllocSurfaceBuffers {
+        /// The surface node (committed, the sender's).
+        node: NodeId,
+        /// The first buffer id; the rest follow consecutively.
+        first_id: BufferId,
+        /// How many buffers, 1..=4.
+        count: u8,
+        /// DRM fourcc, or 0 for the server's choice.
+        format: u32,
+        /// Width in pixels, or 0 for the hinted width.
+        width: u32,
+        /// Height in pixels, or 0 for the hinted height.
+        height: u32,
+    }
+
     // ------------------------------------------------------- M5-A (M5)
 
     /// Create a **popup**: a menu or tooltip positioned against a
@@ -2573,6 +2704,10 @@ msg_enum! {
         /// Import another connection's exported surface (needs
         /// `caps::SHARE`).
         ImportSurface = 0x0311,
+        /// Ask for server-allocated scanout buffers (needs
+        /// `caps::SURFACE`); answered with `SurfaceBufferAllocated`s or
+        /// `AllocSurfaceBuffersFailed`.
+        AllocSurfaceBuffers = 0x0312,
         /// Move one of this client's windows to another layer (needs
         /// `caps::SHELL`).
         SetLayer = 0x0401,
@@ -3019,6 +3154,18 @@ fixed_msg! {
         /// The import id, in the importer's id space.
         id: NodeId,
     }
+
+    /// An [`AllocSurfaceBuffers`] was refused, as a whole (#3914). Not an
+    /// error: nothing was allocated and the connection carries on; the
+    /// client falls back to `CreateSurfaceBuffer`.
+    AllocSurfaceBuffersFailed {
+        /// The node the request named.
+        node: NodeId,
+        /// The request's `first_id`.
+        first_id: BufferId,
+        /// Why.
+        reason: AllocRefusal,
+    }
     /// [`caps::SHELL`](crate::types::caps::SHELL) or
     /// [`caps::OUTPUTS`](crate::types::caps::OUTPUTS)).
     ///
@@ -3202,6 +3349,11 @@ msg_enum! {
         SurfaceExported = 0x8307,
         /// An import is dead (needs `caps::SHARE`).
         SurfaceRevoked = 0x8308,
+        /// One server-allocated scanout buffer (needs `caps::SURFACE`;
+        /// carries one fd).
+        SurfaceBufferAllocated = 0x8309,
+        /// An `AllocSurfaceBuffers` was refused (needs `caps::SURFACE`).
+        AllocSurfaceBuffersFailed = 0x830a,
         /// A bound hotkey fired (needs `caps::SHELL`).
         HotKey = 0x8401,
         /// One window of the shell's list (needs `caps::SHELL`).

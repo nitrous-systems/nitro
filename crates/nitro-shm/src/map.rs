@@ -22,7 +22,9 @@
 //! Exactly one `mmap` and one `munmap` exist in the tree; both are in
 //! [`RawMap`]. [`Mapping`] (read-only, the server's) and [`MappingMut`]
 //! (read/write, the client's) are thin wrappers that fix the protection
-//! flags and expose slices.
+//! flags and expose slices. Since #3914 a third, `DmaBufMapping` in
+//! `dmabuf.rs`, maps a server-allocated scanout buffer (a dma-buf) for
+//! the client; it goes through the same [`RawMap`] and adds no `mmap`.
 //!
 //! # Miri cannot check any of this, and here is why
 //!
@@ -52,16 +54,40 @@ use rustix::mm::{MapFlags, ProtFlags};
 
 use crate::{MapError, check_seals};
 
+/// `DMA_BUF_MAGIC` from `<linux/magic.h>`: the `f_type` `fstatfs` reports
+/// for a file that is a dma-buf (`"DMAB"`).
+pub(crate) const DMA_BUF_MAGIC: i64 = 0x444d_4142;
+
+/// Which kinds of file a mapping accepts — the precondition token
+/// [`RawMap::map`] checks before anything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Accept {
+    /// A memfd carrying [`REQUIRED_SEALS`](crate::REQUIRED_SEALS), only.
+    Sealed,
+    /// A dma-buf (`fstatfs` says `DMA_BUF_MAGIC`), or else a sealed
+    /// memfd — the fake KMS backend exports the latter (#3914).
+    DmaBufOrSealed,
+}
+
+/// Whether the file behind `fd` is a dma-buf, by asking the kernel which
+/// filesystem it lives on. A dma-buf's inode is on the kernel-internal
+/// `dmabuf` pseudo-filesystem and nothing else reports that magic.
+pub(crate) fn is_dmabuf(fd: BorrowedFd<'_>) -> bool {
+    // `f_type` is a `c_long` here but `u32` on s390x; `from` covers both.
+    #[allow(clippy::useless_conversion)]
+    rustix::fs::fstatfs(fd).is_ok_and(|st| i64::from(st.f_type) == DMA_BUF_MAGIC)
+}
+
 /// A live `MAP_SHARED` mapping of the first `len` bytes of a sealed file.
 ///
 /// Owns its `munmap`. Private: the two public wrappers choose the
 /// protection and the slice types, and neither can be built without going
 /// through [`RawMap::map`], which is where the preconditions are checked.
-struct RawMap {
+pub(crate) struct RawMap {
     /// Page-aligned start of the mapping, as `mmap` returned it.
     ptr: NonNull<u8>,
     /// Length in bytes as passed to `mmap`; also what `munmap` gets.
-    len: usize,
+    pub(crate) len: usize,
     /// The file's size when it was mapped. Constant for the file's life
     /// because `F_SEAL_GROW | F_SEAL_SHRINK` were verified before mapping.
     file_len: u64,
@@ -70,13 +96,22 @@ struct RawMap {
 impl RawMap {
     /// Map `[0, len)` of the file behind `fd` with `prot`.
     ///
-    /// The order of the checks matters for the proof: seals first, size
-    /// second, `mmap` last. Only once the seals are known to be in force
-    /// does the size become a permanent fact rather than a snapshot.
-    fn map(fd: BorrowedFd<'_>, len: usize, prot: ProtFlags) -> Result<Self, MapError> {
-        // (1) The kernel enforces `F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL`
-        //     on the inode behind `fd`, or this returns `Err`.
-        check_seals(fd)?;
+    /// The order of the checks matters for the proof: kind (seals, or
+    /// dma-buf) first, size second, `mmap` last. Only once the size is
+    /// known to be fixed does it become a permanent fact rather than a
+    /// snapshot.
+    pub(crate) fn map(
+        fd: BorrowedFd<'_>,
+        len: usize,
+        prot: ProtFlags,
+        accept: Accept,
+    ) -> Result<Self, MapError> {
+        // (1) Either the kernel says the file is a dma-buf and `accept`
+        //     allows one, or it enforces `F_SEAL_SHRINK | F_SEAL_GROW |
+        //     F_SEAL_SEAL` on the inode behind `fd`; otherwise `Err`.
+        if !(accept == Accept::DmaBufOrSealed && is_dmabuf(fd)) {
+            check_seals(fd)?;
+        }
         // (2) The file is at least `len` bytes long. Because of (1) it will
         //     be exactly this long for as long as the inode exists.
         let st = rustix::fs::fstat(fd).map_err(MapError::Os)?;
@@ -129,6 +164,24 @@ impl RawMap {
         //   for as long as this `RawMap` exists, `st_size >= len` holds and
         //   no load through it can fault for "page beyond EOF".
         //
+        // * The dma-buf case (#3914, `Accept::DmaBufOrSealed` only): (1)
+        //   skipped the seal check because `fstatfs` reported
+        //   `DMA_BUF_MAGIC`. A dma-buf's size is fixed by its *exporter*
+        //   when it is created (`dma_buf_export` sets it, and
+        //   `dma_buf_getfile` copies it into `i_size`); the dma-buf file
+        //   has no `setattr`/truncate and no `fallocate`, so no process —
+        //   the client included — can make it shorter. That is the
+        //   property the seals provide for a memfd, provided by the file's
+        //   type instead. The exporter keeps the backing pages alive while
+        //   any mapping references the file, and the mapping holds that
+        //   reference. The `fstat` at (2) reads that `i_size`; it is used
+        //   rather than `lseek(SEEK_END)` because the file offset is
+        //   shared with every duplicate of the descriptor (the client's
+        //   copy included) and a size check has no business moving it.
+        //   The magic is a property of the inode's superblock, so it
+        //   cannot be faked by a client: a memfd, pipe or regular file
+        //   reports its own filesystem's magic and goes through the seals.
+        //
         // * `F_SEAL_GROW`: not load-bearing for `SIGBUS` — a longer file
         //   does not invalidate a fixed-length mapping of its start. It is
         //   required so that `file_len` is the file's size for its whole
@@ -159,7 +212,7 @@ impl RawMap {
     }
 
     /// The mapped bytes.
-    fn bytes(&self) -> &[u8] {
+    pub(crate) fn bytes(&self) -> &[u8] {
         // SAFETY (from_raw_parts): the preconditions of `slice::from_raw_parts`
         // are (a) `ptr` is valid for reads of `len` bytes, (b) it is aligned
         // for `u8`, (c) the bytes are initialised `u8`s, (d) nothing mutates
@@ -185,8 +238,8 @@ impl RawMap {
         //     never-written shmem page reads as zeros, so nothing here is
         //     uninitialised in the sense the kernel exposes.
         // (d) Within this process: `Mapping` hands out only `&[u8]` and is
-        //     `PROT_READ`; `MappingMut` hands out `&mut [u8]` only through
-        //     `&mut self`, so a `&[u8]` and a `&mut [u8]` from the same
+        //     `PROT_READ`; `MappingMut` and `DmaBufMapping` hand out
+        //     `&mut [u8]` only through `&mut self`, so a `&[u8]` and a `&mut [u8]` from the same
         //     mapping cannot coexist. Neither wrapper is `Clone`, and no
         //     other code in this process maps or writes the file (the
         //     server closes its fd after mapping; the client's `RawMap`
@@ -229,11 +282,13 @@ impl RawMap {
 
     /// The mapped bytes, writable. Only [`MappingMut`] calls this, and it
     /// is the wrapper that mapped with `PROT_WRITE`.
-    fn bytes_mut(&mut self) -> &mut [u8] {
+    pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
         // SAFETY (from_raw_parts_mut): (a), (b), (c) and (e) exactly as in
         // `bytes` above, plus the pages are mapped writable — the only
-        // caller is `MappingMut::as_bytes_mut`, and `MappingMut::map_mut`
-        // is the only constructor of a `RawMap` with `PROT_WRITE`.
+        // callers are `MappingMut::as_bytes_mut` and
+        // `DmaBufMapping::as_bytes_mut` (`dmabuf.rs`), and their
+        // constructors `MappingMut::map_mut` and `DmaBufMapping::map` are
+        // the only ones that build a `RawMap` with `PROT_WRITE`.
         // Uniqueness within this process: this method takes `&mut self`,
         // so no `&[u8]` from `bytes` and no other `&mut [u8]` from here can
         // be alive at the same time; and the same `Drop`-takes-`&mut self`
@@ -306,9 +361,23 @@ impl Mapping {
     /// message looked; [`MapError::TooShort`] if the file is shorter than
     /// `len`; [`MapError::Os`] if `fstat` or `mmap` fails, or `len == 0`.
     pub fn map(fd: OwnedFd, len: usize) -> Result<Self, MapError> {
-        let raw = RawMap::map(fd.as_fd(), len, ProtFlags::READ)?;
+        let raw = RawMap::map(fd.as_fd(), len, ProtFlags::READ, Accept::Sealed)?;
         // `fd` drops here: the mapping does not need it. Checked by
         // `tests/seals.rs` `the_fd_can_be_closed_once_mapped`.
+        drop(fd);
+        Ok(Self { raw })
+    }
+
+    /// Map the first `len` bytes of a **dma-buf** read-only — or of a
+    /// sealed memfd, which is what the fake KMS backend exports in its
+    /// place (#3914). The server's view of a scanout buffer it allocated
+    /// and handed to a client.
+    ///
+    /// # Errors
+    /// [`MapError::Seals`] if the fd is neither a dma-buf nor a sealed
+    /// memfd; otherwise as [`map`](Self::map).
+    pub fn map_dmabuf(fd: OwnedFd, len: usize) -> Result<Self, MapError> {
+        let raw = RawMap::map(fd.as_fd(), len, ProtFlags::READ, Accept::DmaBufOrSealed)?;
         drop(fd);
         Ok(Self { raw })
     }
@@ -362,7 +431,7 @@ impl MappingMut {
     /// # Errors
     /// As [`Mapping::map`].
     pub fn map_mut(fd: BorrowedFd<'_>, len: usize) -> Result<Self, MapError> {
-        let raw = RawMap::map(fd, len, ProtFlags::READ | ProtFlags::WRITE)?;
+        let raw = RawMap::map(fd, len, ProtFlags::READ | ProtFlags::WRITE, Accept::Sealed)?;
         Ok(Self { raw })
     }
 

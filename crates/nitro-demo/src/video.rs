@@ -37,10 +37,12 @@ use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::time::{Duration, Instant};
 
 use nitro_core::{Color, IRect, Point, Rect, Size};
-use nitro_shm::MappingMut;
+use nitro_shm::{DmaBufMapping, MappingMut, SyncAccess, sync_end, sync_start};
 use nitro_wire::Error as WireError;
 use nitro_wire::client::Connection;
-use nitro_wire::msg::{CreateSurfaceBuffer, PresentSurface, ServerMsg};
+use nitro_wire::msg::{
+    AllocSurfaceBuffers, CreateSurfaceBuffer, PresentSurface, ServerMsg, SurfaceBufferAllocated,
+};
 use nitro_wire::types::{
     BufferId, ButtonState, ColorMatrix, ColorRange, Layer, NodeId, NodeKind, WindowState, caps,
     format,
@@ -166,30 +168,91 @@ pub fn bar_rgb(i: usize) -> [u8; 3] {
     BARS[i].map(|c| quantize(c * 255.0))
 }
 
-// ------------------------------------------------------------ NV12
+// ------------------------------------------------------------ frames
 
-/// The geometry of one NV12 buffer: a `width × height` luma plane, then
-/// the interleaved `[Cb, Cr]` plane at half resolution. Both planes use
-/// a stride of `width` bytes. Width and height are even.
+/// The geometry of one buffer: format, size and the per-plane offsets and
+/// strides. A client-made (memfd) buffer is tight; a server-allocated
+/// scanout buffer (#3914) has the kernel's padded pitch. Width is even
+/// for the YUV formats, and height too for NV12.
+///
+/// - `NV12`: luma plane at `offset0`, interleaved `[Cb, Cr]` at `offset1`,
+///   half resolution both ways;
+/// - `YUYV`: packed `Y0 Cb Y1 Cr`, two pixels per four bytes;
+/// - `XR24`: `B G R X` bytes; the pattern's colours converted to RGB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Nv12 {
-    /// Width in pixels (even).
+pub struct Frame {
+    /// DRM fourcc: `NV12`, `YUYV` or `XR24`.
+    pub fourcc: u32,
+    /// Width in pixels.
     pub width: u32,
-    /// Height in pixels (even).
+    /// Height in pixels.
     pub height: u32,
+    /// Byte offset of plane 0.
+    pub offset0: u32,
+    /// Row stride of plane 0.
+    pub stride0: u32,
+    /// Byte offset of plane 1 (NV12 chroma; 0 otherwise).
+    pub offset1: u32,
+    /// Row stride of plane 1 (NV12 chroma; 0 otherwise).
+    pub stride1: u32,
 }
 
-impl Nv12 {
-    /// Bytes in the luma plane — also the chroma plane's offset.
+impl Frame {
+    /// A tight NV12 frame: stride = width, chroma right after luma.
     #[must_use]
-    pub fn luma_len(self) -> usize {
-        self.width as usize * self.height as usize
+    pub fn nv12(width: u32, height: u32) -> Self {
+        Self::tight(format::NV12, width, height)
     }
 
-    /// Bytes in the whole buffer.
+    /// A tight frame of `fourcc` (`NV12`, `YUYV`, anything else is XR24).
+    #[must_use]
+    pub fn tight(fourcc: u32, width: u32, height: u32) -> Self {
+        match fourcc {
+            format::NV12 => Self {
+                fourcc,
+                width,
+                height,
+                offset0: 0,
+                stride0: width,
+                offset1: width * height,
+                stride1: width,
+            },
+            format::YUYV => Self {
+                fourcc,
+                width,
+                height,
+                offset0: 0,
+                stride0: 2 * width,
+                offset1: 0,
+                stride1: 0,
+            },
+            _ => Self {
+                fourcc: format::XR24,
+                width,
+                height,
+                offset0: 0,
+                stride0: 4 * width,
+                offset1: 0,
+                stride1: 0,
+            },
+        }
+    }
+
+    /// Bytes the planes reach (what a tight buffer allocates).
     #[must_use]
     pub fn bytes(self) -> usize {
-        self.luma_len() * 3 / 2
+        let (h, o0, s0, o1, s1) = (
+            self.height as usize,
+            self.offset0 as usize,
+            self.stride0 as usize,
+            self.offset1 as usize,
+            self.stride1 as usize,
+        );
+        if self.fourcc == format::NV12 {
+            (o0 + s0 * h).max(o1 + s1 * h.div_ceil(2))
+        } else {
+            o0 + s0 * h
+        }
     }
 
     /// The whole frame as a rect.
@@ -209,28 +272,70 @@ impl Nv12 {
         let y0 = (rect.y & !1) as usize;
         let x1 = (((rect.right() + 1) & !1) as usize).min(width);
         let y1 = (((rect.bottom() + 1) & !1) as usize).min(height);
-        for row in y0..y1 {
-            buf[row * width + x0..row * width + x1].fill(color.y);
-        }
-        let base = self.luma_len();
-        for crow in y0 / 2..y1 / 2 {
-            let start = base + crow * width;
-            for px in buf[start + x0..start + x1].chunks_exact_mut(2) {
-                px[0] = color.u;
-                px[1] = color.v;
+        let (o0, s0) = (self.offset0 as usize, self.stride0 as usize);
+        match self.fourcc {
+            format::NV12 => {
+                for row in y0..y1 {
+                    buf[o0 + row * s0 + x0..o0 + row * s0 + x1].fill(color.y);
+                }
+                let (o1, s1) = (self.offset1 as usize, self.stride1 as usize);
+                for crow in y0 / 2..y1 / 2 {
+                    let start = o1 + crow * s1;
+                    for px in buf[start + x0..start + x1].chunks_exact_mut(2) {
+                        px[0] = color.u;
+                        px[1] = color.v;
+                    }
+                }
+            }
+            format::YUYV => {
+                let quad = [color.y, color.u, color.y, color.v];
+                for row in y0..y1 {
+                    let start = o0 + row * s0;
+                    for px in buf[start + 2 * x0..start + 2 * x1].chunks_exact_mut(4) {
+                        px.copy_from_slice(&quad);
+                    }
+                }
+            }
+            _ => {
+                let [r, g, b] = rgb709(color);
+                let px4 = [b, g, r, 0xff];
+                for row in y0..y1 {
+                    let start = o0 + row * s0;
+                    for px in buf[start + 4 * x0..start + 4 * x1].chunks_exact_mut(4) {
+                        px.copy_from_slice(&px4);
+                    }
+                }
             }
         }
     }
 
-    /// The sample at `(x, y)`.
+    /// The sample at `(x, y)` (for XR24: its RGB converted back).
     #[must_use]
     pub fn pixel(self, buf: &[u8], x: u32, y: u32) -> Yuv {
-        let w = self.width as usize;
-        let c = self.luma_len() + (y as usize / 2) * w + (x as usize & !1);
-        Yuv {
-            y: buf[y as usize * w + x as usize],
-            u: buf[c],
-            v: buf[c + 1],
+        let (x, y) = (x as usize, y as usize);
+        let (o0, s0) = (self.offset0 as usize, self.stride0 as usize);
+        match self.fourcc {
+            format::NV12 => {
+                let c = self.offset1 as usize + (y / 2) * self.stride1 as usize + (x & !1);
+                Yuv {
+                    y: buf[o0 + y * s0 + x],
+                    u: buf[c],
+                    v: buf[c + 1],
+                }
+            }
+            format::YUYV => {
+                let q = o0 + y * s0 + (x & !1) * 2;
+                Yuv {
+                    y: buf[q + (x & 1) * 2],
+                    u: buf[q + 1],
+                    v: buf[q + 3],
+                }
+            }
+            _ => {
+                let p = o0 + y * s0 + 4 * x;
+                let c = |i: usize| f32::from(buf[p + i]) / 255.0;
+                yuv709(c(2), c(1), c(0))
+            }
         }
     }
 }
@@ -242,7 +347,7 @@ impl Nv12 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Layout {
     /// The buffer.
-    pub fmt: Nv12,
+    pub fmt: Frame,
     /// Height of the bar band at the top.
     pub bars_h: i32,
     /// Edge of one counter block.
@@ -258,7 +363,7 @@ pub struct Layout {
 impl Layout {
     /// The layout for a `fmt` buffer at `fps`.
     #[must_use]
-    pub fn new(fmt: Nv12, fps: u32) -> Self {
+    pub fn new(fmt: Frame, fps: u32) -> Self {
         let (w, h) = (fmt.width.cast_signed(), fmt.height.cast_signed());
         let bars_h = (h * 2 / 3) & !1;
         let blk = (h / 48).max(2) & !1;
@@ -410,11 +515,42 @@ pub fn label_rect(size: Size) -> Rect {
 
 // ------------------------------------------------------------ the client
 
+/// Where a ring buffer's pixels live.
+#[derive(Debug)]
+enum Store {
+    /// The client's own sealed memfd (`CreateSurfaceBuffer`).
+    Memfd(MappingMut),
+    /// A server-allocated scanout buffer (`AllocSurfaceBuffers`, #3914):
+    /// the mapping, and the dma-buf fd kept for the sync bracket.
+    DmaBuf {
+        /// The client's read/write mapping.
+        map: DmaBufMapping,
+        /// The dma-buf (a memfd on the fake backend).
+        fd: OwnedFd,
+    },
+}
+
+impl Store {
+    /// Run `draw` over the pixels, bracketed by `DMA_BUF_IOCTL_SYNC` for a
+    /// dma-buf (a no-op answer on the fake's memfd).
+    fn write(&mut self, draw: impl FnOnce(&mut [u8])) -> Result<(), Error> {
+        match self {
+            Self::Memfd(m) => draw(m.as_bytes_mut()),
+            Self::DmaBuf { map, fd } => {
+                sync_start(&*fd, SyncAccess::Write)?;
+                draw(map.as_bytes_mut());
+                sync_end(&*fd, SyncAccess::Write)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// One ring buffer.
 #[derive(Debug)]
 struct Slot {
     id: BufferId,
-    map: MappingMut,
+    map: Store,
     /// Waiting for `BufferReleased`.
     busy: bool,
     /// The serial of the frame it is carrying, until released.
@@ -437,6 +573,9 @@ pub struct Video {
     /// server; destroyed as each is released.
     retired: Vec<Slot>,
     generation: u32,
+    /// An `AllocSurfaceBuffers` in flight (`--scanout`): its `first_id`.
+    /// No frame is drawn until the whole ring has arrived.
+    alloc_pending: Option<BufferId>,
     /// The current ring's layout.
     pub layout: Layout,
     serial: u32,
@@ -514,10 +653,15 @@ impl Video {
             },
         )?;
 
-        let fmt = Nv12 {
-            width: opts.size.0,
-            height: opts.size.1,
-        };
+        let fmt = Frame::tight(
+            if opts.format == 0 {
+                format::NV12
+            } else {
+                opts.format
+            },
+            opts.size.0,
+            opts.size.1,
+        );
         let now = Instant::now();
         let mut v = Self {
             conn,
@@ -525,6 +669,7 @@ impl Video {
             ring: Vec::with_capacity(RING),
             retired: Vec::new(),
             generation: 0,
+            alloc_pending: None,
             layout: Layout::new(fmt, opts.fps),
             serial: 0,
             frame: 0,
@@ -549,6 +694,28 @@ impl Video {
         Ok(v)
     }
 
+    /// Whether the ring is server-allocated scanout buffers (#3914).
+    #[must_use]
+    pub fn scanout(&self) -> bool {
+        self.ring
+            .first()
+            .is_some_and(|s| matches!(s.map, Store::DmaBuf { .. }))
+    }
+
+    /// An `AllocSurfaceBuffersFailed`: the tight memfd frame to fall back
+    /// to, at the size asked for, NV12 unless `--format` said otherwise.
+    fn fallback_frame(&mut self) -> Frame {
+        self.alloc_pending = None;
+        self.ring.clear();
+        let fmt = self.layout.fmt;
+        let fourcc = if self.opts.format == 0 {
+            format::NV12
+        } else {
+            self.opts.format
+        };
+        Frame::tight(fourcc, fmt.width, fmt.height)
+    }
+
     /// Server name from the handshake.
     #[must_use]
     pub fn server_name(&self) -> &str {
@@ -563,7 +730,13 @@ impl Video {
     /// The window, its surface, the first ring and the overlay, as one
     /// transaction.
     fn build(&mut self) -> Result<(), Error> {
-        let bufs = self.alloc_ring(self.layout.fmt)?;
+        // `--scanout`: the ring comes from the server after the commit
+        // that creates the node; the memfd ring is the fallback.
+        let bufs = if self.opts.scanout {
+            Vec::new()
+        } else {
+            self.alloc_ring(self.layout.fmt)?
+        };
         let size = self.window_size;
         let label = self.label();
         let has_text = self.conn.has_caps(caps::TEXT);
@@ -592,12 +765,65 @@ impl Video {
             tx = tx.set_window_state(WINDOW, WindowState::Fullscreen);
         }
         tx.commit(serial)?;
+        if self.opts.scanout {
+            let (w, h) = (self.layout.fmt.width, self.layout.fmt.height);
+            self.request_scanout(self.opts.format, w, h)?;
+        }
+        Ok(())
+    }
+
+    /// Ask the server for a ring of [`RING`] scanout buffers (#3914).
+    /// `format` 0 is the server's choice.
+    fn request_scanout(&mut self, format: u32, width: u32, height: u32) -> Result<(), Error> {
+        let first = BufferId(self.generation * RING as u32 + 1);
+        self.generation += 1;
+        self.alloc_pending = Some(first);
+        self.conn.alloc_surface_buffers(AllocSurfaceBuffers {
+            node: SURFACE,
+            first_id: first,
+            count: RING as u8,
+            format,
+            width,
+            height,
+        })?;
+        Ok(())
+    }
+
+    /// One `SurfaceBufferAllocated`: map it and add it to the ring. The
+    /// last one of the ring switches the layout to the server's geometry.
+    fn take_scanout(&mut self, a: &SurfaceBufferAllocated) -> Result<(), Error> {
+        let fd = rustix::io::dup(&a.fd)?;
+        let map = DmaBufMapping::map(fd.as_fd(), a.size as usize)?;
+        self.ring.push(Slot {
+            id: a.id,
+            map: Store::DmaBuf { map, fd },
+            busy: false,
+            inflight: None,
+            shown: false,
+            drawn: None,
+        });
+        if self.ring.len() == RING {
+            self.alloc_pending = None;
+            self.layout = Layout::new(
+                Frame {
+                    fourcc: a.format,
+                    width: a.width,
+                    height: a.height,
+                    offset0: a.offset0,
+                    stride0: a.stride0,
+                    offset1: a.offset1,
+                    stride1: a.stride1,
+                },
+                self.opts.fps,
+            );
+            self.last_box = None;
+        }
         Ok(())
     }
 
     /// A fresh ring of [`RING`] buffers for `fmt`, mapped, with the
     /// messages that register them.
-    fn alloc_ring(&mut self, fmt: Nv12) -> Result<Vec<CreateSurfaceBuffer>, Error> {
+    fn alloc_ring(&mut self, fmt: Frame) -> Result<Vec<CreateSurfaceBuffer>, Error> {
         let base = self.generation * RING as u32;
         self.generation += 1;
         let len = fmt.bytes();
@@ -610,17 +836,17 @@ impl Video {
                 id,
                 width: fmt.width,
                 height: fmt.height,
-                format: format::NV12,
+                format: fmt.fourcc,
                 size: len as u32,
-                offset0: 0,
-                stride0: fmt.width,
-                offset1: fmt.luma_len() as u32,
-                stride1: fmt.width,
+                offset0: fmt.offset0,
+                stride0: fmt.stride0,
+                offset1: fmt.offset1,
+                stride1: fmt.stride1,
                 fd,
             });
             self.ring.push(Slot {
                 id,
-                map,
+                map: Store::Memfd(map),
                 busy: false,
                 inflight: None,
                 shown: false,
@@ -740,6 +966,10 @@ impl Video {
     /// Draw the current frame into a free buffer and send it, or count a
     /// skip.
     fn present(&mut self) -> Result<(), Error> {
+        if self.alloc_pending.is_some() {
+            // The scanout ring has not arrived yet.
+            return Ok(());
+        }
         let Some(i) = self.ring.iter().position(|s| !s.busy) else {
             self.skipped += 1;
             return Ok(());
@@ -750,11 +980,11 @@ impl Video {
         let new_box = l.box_rect(frame);
         let damage = match slot.drawn {
             None => {
-                draw_full(slot.map.as_bytes_mut(), &l, frame);
+                slot.map.write(|b| draw_full(b, &l, frame))?;
                 vec![l.fmt.full()]
             }
             Some(old) => {
-                draw_update(slot.map.as_bytes_mut(), &l, old, frame);
+                slot.map.write(|b| draw_update(b, &l, old, frame))?;
                 damage(&l, new_box, old, last)
             }
         };
@@ -800,6 +1030,7 @@ impl Video {
     pub fn handle(&mut self, events: &[ServerMsg]) -> Result<(), Error> {
         let mut relayout = false;
         let mut realloc = None;
+        let mut fallback = None;
         let mut destroy = Vec::new();
         for msg in events {
             match msg {
@@ -841,17 +1072,26 @@ impl Video {
                 }
                 ServerMsg::SurfaceHint(h) if h.id == SURFACE => {
                     self.hint = Some((h.format, h.width, h.height));
-                    let want = Nv12 {
-                        width: (h.width & !1).max(2),
-                        height: (h.height & !1).max(2),
-                    };
+                    let (w, hh) = ((h.width & !1).max(2), (h.height & !1).max(2));
+                    let cur = self.layout.fmt;
                     if self.opts.follow_hint
                         && h.width > 0
                         && h.height > 0
-                        && want != self.layout.fmt
+                        && (w, hh) != (cur.width, cur.height)
+                        && self.alloc_pending.is_none()
                     {
-                        realloc = Some(want);
+                        realloc = Some(Frame::tight(cur.fourcc, w, hh));
                     }
+                }
+                ServerMsg::SurfaceBufferAllocated(a) if a.node == SURFACE => {
+                    self.take_scanout(a)?;
+                }
+                ServerMsg::AllocSurfaceBuffersFailed(f) if f.node == SURFACE => {
+                    eprintln!(
+                        "nitro-demo: scanout buffers refused ({:?}); using memfds",
+                        f.reason
+                    );
+                    fallback = Some(self.fallback_frame());
                 }
                 ServerMsg::Closed(c) if c.window == WINDOW => self.done = true,
                 ServerMsg::Key(k) if k.state == ButtonState::Pressed => self.key(k.keycode)?,
@@ -861,11 +1101,24 @@ impl Video {
                 _ => {}
             }
         }
+        self.apply_changes(relayout, realloc, fallback, destroy)
+    }
+
+    /// The tail of [`Video::handle`]: retire and replace the ring, fall
+    /// back to memfds, re-lay-out — one transaction for all of it.
+    fn apply_changes(
+        &mut self,
+        relayout: bool,
+        realloc: Option<Frame>,
+        fallback: Option<Frame>,
+        mut destroy: Vec<BufferId>,
+    ) -> Result<(), Error> {
         let mut bufs = Vec::new();
         if let Some(fmt) = realloc {
             // Retire the old ring: free buffers go now, busy ones when the
             // server releases them (the one on screen, when the first
             // frame of the new ring replaces it).
+            let was_scanout = self.scanout();
             for s in std::mem::take(&mut self.ring) {
                 if s.busy {
                     self.retired.push(s);
@@ -873,6 +1126,17 @@ impl Video {
                     destroy.push(s.id);
                 }
             }
+            if was_scanout {
+                // A new server-allocated ring at the hinted size, same
+                // format; the layout switches when it arrives.
+                self.request_scanout(fmt.fourcc, fmt.width, fmt.height)?;
+            } else {
+                bufs = self.alloc_ring(fmt)?;
+                self.layout = Layout::new(fmt, self.opts.fps);
+                self.last_box = None;
+            }
+        }
+        if let Some(fmt) = fallback {
             bufs = self.alloc_ring(fmt)?;
             self.layout = Layout::new(fmt, self.opts.fps);
             self.last_box = None;
@@ -961,11 +1225,76 @@ mod tests {
     use super::*;
 
     fn frame(w: u32, h: u32) -> (Layout, Vec<u8>) {
-        let fmt = Nv12 {
+        let fmt = Frame::nv12(w, h);
+        (Layout::new(fmt, 60), vec![0; fmt.bytes()])
+    }
+
+    /// A frame of `fourcc` with a 64-byte-aligned pitch (a dumb buffer's),
+    /// and NV12's chroma after a padded luma plane.
+    fn padded(fourcc: u32, w: u32, h: u32) -> (Layout, Vec<u8>) {
+        let bpp = match fourcc {
+            format::NV12 => 1,
+            format::YUYV => 2,
+            _ => 4,
+        };
+        let pitch = (w * bpp).div_ceil(64) * 64;
+        let fmt = Frame {
+            fourcc,
             width: w,
             height: h,
+            offset0: 0,
+            stride0: pitch,
+            offset1: if fourcc == format::NV12 { pitch * h } else { 0 },
+            stride1: if fourcc == format::NV12 { pitch } else { 0 },
         };
         (Layout::new(fmt, 60), vec![0; fmt.bytes()])
+    }
+
+    #[test]
+    fn every_format_draws_and_reads_back_with_a_padded_stride() {
+        for fourcc in [format::NV12, format::YUYV, format::XR24] {
+            let (l, mut buf) = padded(fourcc, 650, 360);
+            assert!(l.fmt.stride0 > l.fmt.width, "{fourcc:#x} is padded");
+            draw_full(&mut buf, &l, 1234);
+            assert_eq!(read_counter(&buf, &l), 1234, "{fourcc:#x}");
+            for i in 0..7 {
+                let r = l.bar(i);
+                let p = l.fmt.pixel(&buf, (r.x + r.w / 2) as u32, 100);
+                let want = bar_yuv(i);
+                if fourcc == format::XR24 {
+                    // Through RGB and back: close, not exact.
+                    assert!(p.y.abs_diff(want.y) <= 2, "{fourcc:#x} bar {i}");
+                } else {
+                    assert_eq!(p, want, "{fourcc:#x} bar {i}");
+                }
+            }
+            // The padding is never written.
+            let s0 = l.fmt.stride0 as usize;
+            let row_bytes = l.fmt.width as usize
+                * if fourcc == format::YUYV {
+                    2
+                } else if fourcc == format::NV12 {
+                    1
+                } else {
+                    4
+                };
+            assert!(buf[row_bytes..s0].iter().all(|&b| b == 0), "{fourcc:#x}");
+            // An update equals a full redraw.
+            let (_, mut b) = padded(fourcc, 650, 360);
+            draw_full(&mut b, &l, 40);
+            draw_full(&mut buf, &l, 3);
+            draw_update(&mut buf, &l, l.box_rect(3), 40);
+            assert!(buf == b, "{fourcc:#x}: incremental and full frames differ");
+        }
+    }
+
+    #[test]
+    fn a_yuyv_pixel_pair_shares_its_chroma() {
+        let (l, mut buf) = padded(format::YUYV, 8, 2);
+        l.fmt.fill(&mut buf, IRect::new(2, 0, 2, 2), WHITE);
+        assert_eq!(&buf[4..8], &[235, 128, 235, 128]);
+        assert_eq!(l.fmt.pixel(&buf, 3, 1), WHITE);
+        assert_eq!(l.fmt.pixel(&buf, 0, 0).y, 0);
     }
 
     #[test]
@@ -1085,7 +1414,7 @@ mod tests {
         let fd = nitro_shm::create_sealed("t", 64).unwrap();
         let mut s = Slot {
             id: BufferId(1),
-            map: MappingMut::map_mut(fd.as_fd(), 64).unwrap(),
+            map: Store::Memfd(MappingMut::map_mut(fd.as_fd(), 64).unwrap()),
             busy: true,
             inflight: Some(7),
             shown: false,

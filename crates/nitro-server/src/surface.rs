@@ -217,11 +217,7 @@ impl Hints {
             if node.kind() != NodeKind::Surface {
                 return false;
             }
-            let b = node.bounds();
-            let device = node
-                .world_transform()
-                .apply_rect(&Rect::new(0.0, 0.0, b.w, b.h))
-                .round_out();
+            let device = device_rect(node);
             if device.is_empty() {
                 return true;
             }
@@ -233,6 +229,41 @@ impl Hints {
             true
         });
         out
+    }
+}
+
+/// A Surface node's size in device pixels: its bounds through its world
+/// transform, rounded out. What `SurfaceHint` reports.
+fn device_rect(node: &nitro_scene::Node) -> IRect {
+    let b = node.bounds();
+    node.world_transform()
+        .apply_rect(&Rect::new(0.0, 0.0, b.w, b.h))
+        .round_out()
+}
+
+/// A Surface node's hinted size in device pixels, `None` while it has no
+/// device rect (#3914: the `0 × 0` of `AllocSurfaceBuffers`).
+#[must_use]
+pub fn hinted_size(scene: &Scene, key: NodeKey) -> Option<(u32, u32)> {
+    let d = device_rect(scene.node(key).ok()?);
+    (!d.is_empty()).then(|| (d.w.cast_unsigned(), d.h.cast_unsigned()))
+}
+
+/// The format a server-allocated scanout buffer gets when the client
+/// asks for "the server's choice" (#3914, v1): `NV12` if some plane of the
+/// node's output lists linear NV12, else `YUYV` if one lists it, else
+/// `XR24`. The planes module (#3899) replaces this with its own answer.
+#[must_use]
+pub fn default_scanout_format(planes: &[nitro_kms::PlaneInfo]) -> u32 {
+    use nitro_kms::{Fourcc, MOD_LINEAR};
+    use nitro_wire::types::format;
+    let listed = |f: Fourcc| planes.iter().any(|p| p.supports(f, MOD_LINEAR));
+    if listed(Fourcc::NV12) {
+        format::NV12
+    } else if listed(Fourcc::YUYV) {
+        format::YUYV
+    } else {
+        format::XR24
     }
 }
 

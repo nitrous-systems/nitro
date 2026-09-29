@@ -384,6 +384,11 @@ fn the_required_seals_are_exactly_the_three() {
 fn the_unsafe_surface_is_exactly_what_the_docs_claim() {
     const BLOCKS: usize = 4;
     const WORD: &str = "four";
+    // `dmabuf.rs` (#3914): its count is quoted as "two `unsafe` ioctl
+    // blocks" — the word `ioctl` inside the walk is what tells the two
+    // counts apart.
+    const IOCTL_BLOCKS: usize = 2;
+    const IOCTL_WORD: &str = "two";
     /// The number words a doc might use, so a stale one is caught rather
     /// than merely "not found".
     const NUMBER_WORDS: [&str; 6] = ["one", "two", "three", "four", "five", "six"];
@@ -396,6 +401,12 @@ fn the_unsafe_surface_is_exactly_what_the_docs_claim() {
          README.md, map.rs's header) all say {WORD}. Update them together \
          with the code, or an auditor reads a count that no longer \
          describes what they must audit."
+    );
+    let dmabuf = include_str!("../src/dmabuf.rs");
+    let ioctl_blocks = dmabuf.matches("unsafe {").count();
+    assert_eq!(
+        ioctl_blocks, IOCTL_BLOCKS,
+        "dmabuf.rs has {ioctl_blocks} `unsafe` blocks; the docs say {IOCTL_WORD}"
     );
     // And the two syscalls that must exist exactly once each, because
     // "one mmap and one munmap in the whole tree" is the claim that makes
@@ -415,6 +426,14 @@ fn the_unsafe_surface_is_exactly_what_the_docs_claim() {
         !include_str!("../src/lib.rs").contains(&mm_path),
         "src/lib.rs reaches for the mm module; the mapping must stay in map.rs"
     );
+    // `dmabuf.rs` may name `ProtFlags`, but never map or unmap itself: its
+    // mapping is `map.rs`'s `RawMap`.
+    for call in ["mmap(", "munmap("] {
+        assert!(
+            !dmabuf.contains(&format!("{mm_path}{call}")),
+            "src/dmabuf.rs calls {call}; it must go through RawMap"
+        );
+    }
 
     // Now the documents. Every place that quotes a count of this crate's
     // `unsafe` blocks must quote the right one.
@@ -446,7 +465,7 @@ fn the_unsafe_surface_is_exactly_what_the_docs_claim() {
     // is evidence only for the phrasing that was broken. Every phrasing
     // in the table below is exercised by
     // `the_doc_count_guard_catches_drift_in_every_phrasing`.
-    let quantifiers = |src: &str| -> Vec<String> {
+    let quantifiers = |src: &str| -> Vec<(String, bool)> {
         let bare = |w: &str| {
             w.trim_matches(|c: char| !c.is_alphanumeric())
                 .to_lowercase()
@@ -460,11 +479,16 @@ fn the_unsafe_surface_is_exactly_what_the_docs_claim() {
             }
             // Nearest number word within three, so "four `unsafe` blocks"
             // is judged and the walk stops at "four" before it can reach
-            // the "one" of "one `munmap` — four blocks".
+            // the "one" of "one `munmap` — four blocks". An `ioctl` passed
+            // on the way marks a `dmabuf.rs` count.
+            let mut ioctl = false;
             for j in (i.saturating_sub(3)..i).rev() {
                 let b = bare(words[j]);
+                if b == "ioctl" {
+                    ioctl = true;
+                }
                 if NUMBER_WORDS.contains(&b.as_str()) {
-                    found.push(b);
+                    found.push((b, ioctl));
                     break;
                 }
             }
@@ -472,12 +496,17 @@ fn the_unsafe_surface_is_exactly_what_the_docs_claim() {
         found
     };
     for (path, src) in DOCS_QUOTING_THE_COUNT {
-        for q in quantifiers(src) {
+        for (q, ioctl) in quantifiers(src) {
+            let (want, which) = if ioctl {
+                (IOCTL_WORD, "dmabuf.rs")
+            } else {
+                (WORD, "map.rs")
+            };
             assert!(
-                q == WORD,
-                "{path} quotes \"{q} block(s)\" where this crate's `unsafe` \
-                 block count is {WORD}. Every document quoting this number \
-                 must agree with `map.rs`. The count has drifted twice \
+                q == want,
+                "{path} quotes \"{q} block(s)\" where {which}'s `unsafe` \
+                 block count is {want}. Every document quoting this number \
+                 must agree with the code. The count has drifted twice \
                  already, and the second time a reviewer had to find it by \
                  hand."
             );
@@ -491,11 +520,12 @@ fn the_unsafe_surface_is_exactly_what_the_docs_claim() {
 /// list. **Its limit, stated rather than implied**: a document that
 /// starts quoting the number later is invisible to both until it is added
 /// here.
-const DOCS_QUOTING_THE_COUNT: [(&str, &str); 4] = [
+const DOCS_QUOTING_THE_COUNT: [(&str, &str); 5] = [
     ("DEPENDENCIES.md", include_str!("../../../DEPENDENCIES.md")),
     ("crates/nitro-shm/README.md", include_str!("../README.md")),
     ("crates/nitro-shm/src/map.rs", include_str!("../src/map.rs")),
     ("crates/nitro-shm/src/lib.rs", include_str!("../src/lib.rs")),
+    ("crates/nitro-shm/src/dmabuf.rs", include_str!("../src/dmabuf.rs")),
 ];
 
 /// The guard above, tested against **every phrasing the real files use**.
@@ -513,7 +543,7 @@ const DOCS_QUOTING_THE_COUNT: [(&str, &str); 4] = [
 #[test]
 fn the_doc_count_guard_catches_drift_in_every_phrasing() {
     // The matcher, in the same shape the guard uses.
-    fn quantifiers(src: &str) -> Vec<String> {
+    fn quantifiers(src: &str) -> Vec<(String, bool)> {
         let bare = |w: &str| {
             w.trim_matches(|c: char| !c.is_alphanumeric())
                 .to_lowercase()
@@ -525,10 +555,14 @@ fn the_doc_count_guard_catches_drift_in_every_phrasing() {
             if bare(w) != "block" && bare(w) != "blocks" {
                 continue;
             }
+            let mut ioctl = false;
             for j in (i.saturating_sub(3)..i).rev() {
                 let b = bare(words[j]);
+                if b == "ioctl" {
+                    ioctl = true;
+                }
                 if ["one", "two", "three", "four", "five", "six"].contains(&b.as_str()) {
-                    found.push(b);
+                    found.push((b, ioctl));
                     break;
                 }
             }
@@ -548,8 +582,11 @@ fn the_doc_count_guard_catches_drift_in_every_phrasing() {
              catch. Check how the claim is phrased there."
         );
         assert!(
-            found.iter().all(|q| q == "four"),
-            "{path} on clean text yields {found:?}, expected all \"four\""
+            found
+                .iter()
+                .all(|(q, ioctl)| q == if *ioctl { "two" } else { "four" }),
+            "{path} on clean text yields {found:?}, expected \"four\" \
+             (map.rs) and \"two\" (dmabuf.rs's ioctl blocks)"
         );
     }
 
@@ -562,11 +599,15 @@ fn the_doc_count_guard_catches_drift_in_every_phrasing() {
             .replace("four blocks", "three blocks")
             .replace("four `unsafe` blocks", "three `unsafe` blocks")
             .replace("four\nblocks", "three\nblocks")
-            .replace("four `unsafe`\nblocks", "three `unsafe`\nblocks");
+            .replace("four `unsafe`\nblocks", "three `unsafe`\nblocks")
+            .replace("two `unsafe` ioctl blocks", "three `unsafe` ioctl blocks")
+            .replace("two `unsafe` ioctl\nblocks", "three `unsafe` ioctl\nblocks")
+            .replace("two `unsafe`\nioctl blocks", "three `unsafe`\nioctl blocks")
+            .replace("two\n`unsafe` ioctl blocks", "three\n`unsafe` ioctl blocks");
         assert_ne!(drifted, src, "{path}: the drift rewrite matched nothing");
         let found = quantifiers(&drifted);
         assert!(
-            found.iter().any(|q| q == "three"),
+            found.iter().any(|(q, _)| q == "three"),
             "{path}: drifting the count to \"three\" was NOT caught — the \
              matcher reported {found:?}. The guard is blind to this \
              file's phrasing, which is how the last version shipped."
@@ -577,7 +618,7 @@ fn the_doc_count_guard_catches_drift_in_every_phrasing() {
     //    dead: the walk must stop at the nearer number.
     assert_eq!(
         quantifiers("one `munmap` — four blocks, all in map.rs"),
-        vec!["four".to_string()],
+        vec![("four".to_string(), false)],
         "the walk ran past `four` and judged the `one` of `one munmap`"
     );
 }
@@ -630,7 +671,15 @@ fn the_lint_that_scopes_this_exception_is_still_in_place() {
         .any(|l| l.starts_with("#![allow(unsafe_code)") || l.starts_with("#[allow(unsafe_code)"));
     assert!(
         !lib_allows,
-        "lib.rs allows unsafe_code; the exception must stay scoped to map.rs"
+        "lib.rs allows unsafe_code; the exception must stay scoped to map.rs and dmabuf.rs"
+    );
+    let dmabuf = include_str!("../src/dmabuf.rs");
+    assert!(
+        dmabuf
+            .lines()
+            .map(str::trim)
+            .any(|l| l == "#![allow(unsafe_code)]"),
+        "dmabuf.rs has lost its scoped allow"
     );
     let map = include_str!("../src/map.rs");
     assert!(

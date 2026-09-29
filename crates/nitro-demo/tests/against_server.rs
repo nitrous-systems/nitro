@@ -782,3 +782,61 @@ fn video_mode_presents_frames_and_the_bars_read_back_as_rgb() {
     }
     harness.quit();
 }
+
+/// `--video --scanout` (#3914): the ring comes from `AllocSurfaceBuffers`
+/// (sealed memfds on the fake backend, 64-byte-aligned pitch), frames are
+/// presented, and the bars read back exactly as with the client's memfds.
+#[test]
+fn video_scanout_mode_presents_into_server_allocated_buffers() {
+    use nitro_demo::args::VideoOpts;
+    use nitro_demo::video::{self, Video};
+
+    let harness = Harness::start("video-scanout", 1280, 720);
+    harness.park_cursor(0.99, 0.99);
+    let conn = Connection::connect(&harness.wire_path, "nitro-demo").expect("wire connect");
+    let opts = VideoOpts {
+        size: (650, 360),
+        fps: 60,
+        frames: 10,
+        scanout: true,
+        format: nitro_wire::types::format::YUYV,
+        ..VideoOpts::default()
+    };
+    let mut v = Video::with_connection(conn, opts).expect("video start");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !v.done {
+        assert!(Instant::now() < deadline, "timed out: {}", v.summary_line());
+        v.step(Some(Duration::from_millis(20)), None)
+            .expect("no protocol error");
+    }
+    assert!(v.scanout(), "the ring is server-allocated");
+    assert_eq!(v.layout.fmt.fourcc, nitro_wire::types::format::YUYV);
+    assert!(v.layout.fmt.stride0 > 2 * 650, "the fake pads the pitch");
+    assert!(v.presented >= 10, "{}", v.summary_line());
+    let lines = harness.request_text("stats\n");
+    assert_eq!(stat(&lines, "scanout_buffers"), 3);
+
+    v.paused = true;
+    harness.settle();
+    let img = harness.shot();
+    let (sx, sy) = (
+        v.window_size.w / v.layout.fmt.width as f32,
+        v.window_size.h / v.layout.fmt.height as f32,
+    );
+    for i in 0..video::BARS.len() {
+        let r = v.layout.bar(i);
+        let x = v.window_pos.x + (r.x as f32 + r.w as f32 / 2.0) * sx;
+        let y = v.window_pos.y + (r.h as f32 / 2.0) * sy;
+        let px = img.pixel(x as u32, y as u32);
+        let got = [(px >> 16) as u8, (px >> 8) as u8, px as u8];
+        let want = video::bar_rgb(i);
+        for c in 0..3 {
+            assert!(
+                got[c].abs_diff(want[c]) <= 8,
+                "bar {i} at ({x}, {y}): {got:?}, want {want:?}"
+            );
+        }
+    }
+    drop(v);
+    harness.quit();
+}

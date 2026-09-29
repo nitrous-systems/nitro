@@ -441,6 +441,7 @@ pub fn needs_fd(op: u16) -> bool {
         || op == msg::SendSelection::OP
         || op == msg::Keymap::OP
         || op == msg::SelectionData::OP
+        || op == msg::SurfaceBufferAllocated::OP
 }
 
 /// Whether an op is about a **buffer**, and so cannot mean anything on a
@@ -463,7 +464,11 @@ pub fn needs_fd(op: u16) -> bool {
 /// id 1".
 ///
 /// The Surface ops (`CreateSurfaceBuffer`, `SetSurface`, `PresentSurface`,
-/// #3897) are buffer ops for the same reason.
+/// #3897, and `AllocSurfaceBuffers`, #3914) are buffer ops for the same
+/// reason. `AllocSurfaceBuffers` carries no descriptor, so it reaches the
+/// server, which answers a remote peer `AllocSurfaceBuffersFailed {
+/// Unsupported }` — the reply is fd-free, and the client's fallback path
+/// is the same one it takes on a local server without scanout buffers.
 ///
 /// `SetImage` (or `SetSurface`) naming [`BufferId::NONE`](crate::types::BufferId) is
 /// **not** included: that is how an image node is *cleared*, it needs no
@@ -478,6 +483,7 @@ pub fn is_buffer_op(op: u16) -> bool {
         || op == msg::CreateSurfaceBuffer::OP
         || op == msg::SetSurface::OP
         || op == msg::PresentSurface::OP
+        || op == msg::AllocSurfaceBuffers::OP
 }
 
 /// Why a remote peer's fd-carrying **non-buffer** op is refused, as the

@@ -13,11 +13,14 @@
 //!   relies on ([`create_sealed`], [`memfd_with`]), and checking that an fd
 //!   someone *else* handed us carries them ([`check_seals`]);
 //! - [`map`] holds the four `unsafe` blocks (`mmap`, `from_raw_parts`,
-//!   `from_raw_parts_mut`, `munmap`) and the `SAFETY` proofs for each. It
-//!   is the only module in
-//!   the workspace with `#![allow(unsafe_code)]` besides one function in
-//!   `nitro-seat`; the exception is scoped to that file and recorded in
-//!   `DEPENDENCIES.md`.
+//!   `from_raw_parts_mut`, `munmap`) and the `SAFETY` proofs for each;
+//! - `dmabuf` (#3914) holds the two `unsafe` ioctl blocks
+//!   (`Setter::new` and `ioctl`, for `DMA_BUF_IOCTL_SYNC`), and [`DmaBufMapping`], a wrapper over
+//!   `map`'s mapping for server-allocated scanout buffers.
+//!
+//!   These two are the only modules in the workspace with
+//!   `#![allow(unsafe_code)]` besides one function in `nitro-seat`; each
+//!   exception is scoped to its file and recorded in `DEPENDENCIES.md`.
 //!
 //! # The seals, and what each one is for
 //!
@@ -62,14 +65,16 @@
 //! set.
 
 // No `#![forbid(unsafe_code)]` here, on purpose: a `forbid` cannot be
-// overridden by the `#![allow(unsafe_code)]` in `map.rs`. The workspace's
+// overridden by the `#![allow(unsafe_code)]` in `map.rs` and `dmabuf.rs`. The workspace's
 // `unsafe_code = "deny"` applies to every other line of this crate.
 
+mod dmabuf;
 mod map;
 
 use std::fmt;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
+pub use dmabuf::{DmaBufMapping, SyncAccess, is_dmabuf, sync_end, sync_start};
 pub use map::{Mapping, MappingMut};
 use rustix::fs::{MemfdFlags, SealFlags};
 pub use rustix::io::Errno;

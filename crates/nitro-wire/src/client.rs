@@ -15,15 +15,16 @@ use crate::error::Error;
 use crate::framing::Framer;
 use crate::io::Socket;
 use crate::msg::{
-    AcceptDrop, BindKey, BufferDamage, ClientCaps, ClientMsg, CloseWindow, Commit, CreateBuffer,
-    CreateNode, CreatePopup, CreateSurfaceBuffer, CreateWindow, DestroyBuffer, DestroyNode,
-    ExportSurface, Fill, FinishDrag, FocusWindow, GrabKeyboard, Hello, ImportSurface, ListOutputs,
-    Lock, MeasureText, Outputs, PresentSurface, Reparent, RepositionPopup, RequestFrame,
-    RequestSelection, SendSelection, ServerMsg, SetAnchor, SetAppId, SetBorder, SetBounds, SetClip,
-    SetCorners, SetCursor, SetDragIconOffset, SetExclusiveZone, SetFill, SetIcon, SetImage,
-    SetLayer, SetOpacity, SetOpaqueRegion, SetOverview, SetSelection, SetSurface, SetText,
-    SetTransform, SetVisible, SetWindowLimits, SetWindowState, SetWindowStateFor, SetWindowTitle,
-    StartDrag, StartMove, StartResize, UnbindKey, Unlock, WindowList,
+    AcceptDrop, AllocSurfaceBuffers, BindKey, BufferDamage, ClientCaps, ClientMsg, CloseWindow,
+    Commit, CreateBuffer, CreateNode, CreatePopup, CreateSurfaceBuffer, CreateWindow,
+    DestroyBuffer, DestroyNode, ExportSurface, Fill, FinishDrag, FocusWindow, GrabKeyboard, Hello,
+    ImportSurface, ListOutputs, Lock, MeasureText, Outputs, PresentSurface, Reparent,
+    RepositionPopup, RequestFrame, RequestSelection, SendSelection, ServerMsg, SetAnchor, SetAppId,
+    SetBorder, SetBounds, SetClip, SetCorners, SetCursor, SetDragIconOffset, SetExclusiveZone,
+    SetFill, SetIcon, SetImage, SetLayer, SetOpacity, SetOpaqueRegion, SetOverview, SetSelection,
+    SetSurface, SetText, SetTransform, SetVisible, SetWindowLimits, SetWindowState,
+    SetWindowStateFor, SetWindowTitle, StartDrag, StartMove, StartResize, UnbindKey, Unlock,
+    WindowList,
 };
 use crate::types::{
     Align, BufferId, ColorMatrix, ColorRange, CursorShape, DataSource, DragAction, Edge, Layer,
@@ -267,6 +268,18 @@ impl Connection {
     /// As [`Connection::send`].
     pub fn import_surface(&mut self, token: ShareToken, id: NodeId) -> Result<(), Error> {
         self.send(&ClientMsg::ImportSurface(ImportSurface { token, id }))
+    }
+
+    /// Ask the server for scanout-capable buffers for a `Surface` node
+    /// (needs `caps::SURFACE` listed in `ClientCaps`; #3914). Sent at
+    /// once, not buffered: the answer is one `SurfaceBufferAllocated` per
+    /// buffer (each with a dma-buf fd) or one `AllocSurfaceBuffersFailed`,
+    /// through [`Connection::poll`] like any other message.
+    ///
+    /// # Errors
+    /// As [`Connection::send`].
+    pub fn alloc_surface_buffers(&mut self, req: AllocSurfaceBuffers) -> Result<(), Error> {
+        self.send(&ClientMsg::AllocSurfaceBuffers(req))
     }
 
     /// Bind a server-global hotkey (needs `caps::SHELL`).

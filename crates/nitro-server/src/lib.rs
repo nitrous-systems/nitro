@@ -93,7 +93,7 @@ use nitro_wire::server::Listener as WireListener;
 use nitro_wire::types::{ButtonState, ErrorCode, NodeId, ShareToken};
 use rustix::event::epoll::{self, EventData, EventFlags};
 
-use crate::clients::{ApplyError, Pending, WireClient};
+use crate::clients::{ApplyError, HeldBuffer, Pending, WireClient};
 use crate::control::{Client, ReadOutcome};
 use crate::cursor::Cursor;
 use crate::defer::DeferredFlip;
@@ -140,6 +140,12 @@ const REMOTE_NO_BUFFERS: &str = "buffers are not available on a remote link: \
 /// that", so the bound costs no new error, and the client that feels it is
 /// the one misbehaving. See `docs/wire.md` § Receive-side limits.
 pub const MAX_PENDING_SELECTIONS: usize = 16;
+
+/// Most buffers one `AllocSurfaceBuffers` may ask for (#3914).
+pub const MAX_SCANOUT_ALLOC: u8 = 4;
+
+/// Largest width or height of a server-allocated scanout buffer (#3914).
+pub const MAX_SCANOUT_DIM: u32 = 8192;
 
 /// Which display backend to run on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,6 +211,10 @@ pub struct Config {
     /// from without a monitor — the same [`select_mode`](nitro_kms::drm::select::select_mode)
     /// the DRM backend runs, over a table a test wrote.
     pub fake_modes: Vec<(u32, u32, u32)>,
+    /// The fake output's plane inventory; empty is the fake's default
+    /// single XR24/AR24 primary. Tests of the scanout-buffer format default
+    /// (#3914) list an NV12 or YUYV overlay here.
+    pub fake_planes: Vec<nitro_kms::FakePlaneSpec>,
     /// Paint into a heap shadow buffer per output and stream the damage
     /// into the scanout buffer, rather than rasterizing straight into it.
     ///
@@ -291,6 +301,7 @@ impl Config {
             scales: HashMap::new(),
             modes: HashMap::new(),
             fake_modes: Vec::new(),
+            fake_planes: Vec::new(),
             shadow: true,
             scroll_blit: true,
             overview_atlas: true,
@@ -1170,6 +1181,11 @@ pub fn run(mut config: Config) -> Result<(), Error> {
                 spec
             } else {
                 spec.modes(&config.fake_modes)
+            };
+            let spec = if config.fake_planes.is_empty() {
+                spec
+            } else {
+                spec.planes(config.fake_planes.clone())
             };
             Box::new(FakeBackend::new(&[spec]).map_err(io_err("create fake backend"))?)
         }
@@ -6532,6 +6548,16 @@ impl Server {
         pairs.push(("thumb_renders", self.thumb_renders));
         pairs.push(("thumb_render_us", self.thumb_render_us));
         pairs.push(("buffers", self.scene.buffer_count() as u64));
+        // Server-allocated scanout buffers (#3914): how many clients hold,
+        // and their mapped bytes (dumb-buffer memory, not in RssAnon).
+        let scanout = self
+            .wire_clients
+            .values()
+            .flat_map(|c| c.buffers.values())
+            .filter(|h| h.scanout.is_some());
+        let (n, bytes) = scanout.fold((0u64, 0u64), |(n, b), h| (n + 1, b + h.bytes));
+        pairs.push(("scanout_buffers", n));
+        pairs.push(("scanout_buffer_bytes", bytes));
     }
 
     fn stats_reply(&self) -> Vec<u8> {
@@ -7214,6 +7240,8 @@ impl Server {
             ClientMsg::PresentSurface(frame) => {
                 self.surface_allowed(token, "PresentSurface") && self.present_surface(token, &frame)
             }
+            // Answered at receipt, like `PresentSurface` (#3914).
+            ClientMsg::AllocSurfaceBuffers(m) => self.alloc_surface_buffers(token, &m),
             // Answered at receipt, like `PresentSurface` (#3904).
             ClientMsg::ExportSurface(m) => {
                 self.share_allowed(token, "ExportSurface") && self.export_surface(token, m.id)
@@ -7394,6 +7422,10 @@ impl Server {
         match msg {
             ClientMsg::SetImage(m) => !m.buffer.is_none(),
             ClientMsg::SetSurface(m) => !m.buffer.is_none(),
+            // Answered `AllocSurfaceBuffersFailed { Unsupported }` by
+            // `Server::alloc_surface_buffers` instead (#3914): the reply is
+            // fd-free and sends the client down its memfd fallback.
+            ClientMsg::AllocSurfaceBuffers(_) => false,
             other => nitro_wire::server::is_buffer_op(other.op()),
         }
     }
@@ -8259,6 +8291,12 @@ impl Server {
             }
         }
         client.frame_requests.extend(outcome.frame_requests);
+        // Scanout buffers the batch destroyed (#3914): the scene already
+        // dropped the mapping; the backend defers the free while one is
+        // still on screen.
+        for k in outcome.freed_scanout {
+            self.backend.free_buffer(k);
+        }
         let surfaces_set = outcome.surfaces_set;
         if client.client_caps & nitro_wire::types::caps::SURFACE != 0 {
             for (id, key) in outcome.new_surfaces {
@@ -8546,12 +8584,17 @@ impl Server {
             // The window below it, if any, is what the pointer is over now.
             self.pointer_refresh = true;
         }
-        for key in client.buffers.values().map(|h| h.key).collect::<Vec<_>>() {
+        for held in client.buffers.values().copied().collect::<Vec<_>>() {
             // Dropping the scene's buffer drops its mapping, which is the
             // `munmap`. Since #569 there is no descriptor to release
             // alongside it: `Mapping::map` closed the client's fd the
             // moment the pages were mapped.
-            let _ = self.scene.destroy_buffer(id, key);
+            let _ = self.scene.destroy_buffer(id, held.key);
+            // A server-allocated scanout buffer (#3914) goes back to the
+            // backend after its mapping is gone.
+            if let Some(k) = held.scanout {
+                self.backend.free_buffer(k);
+            }
         }
         // Every shaped run the client's nodes held. The scene's destroy
         // walk drops the nodes, but the runs live in the text store, which
@@ -9155,6 +9198,333 @@ impl Server {
         };
         client.pending.push(Pending::Buffer(id, desc, pixels));
         true
+    }
+
+    /// `AllocSurfaceBuffers` (#3914): allocate `count` linear scanout
+    /// buffers through the backend, map each read-only for the CPU path,
+    /// register them as the client's surface buffers and send each one's
+    /// dma-buf. Acts at receipt against the committed scene. A malformed
+    /// request is fatal; anything the server merely cannot do is one
+    /// `AllocSurfaceBuffersFailed`, all or nothing. Returns whether the
+    /// client survives.
+    fn alloc_surface_buffers(&mut self, token: u64, req: &msg::AllocSurfaceBuffers) -> bool {
+        use nitro_wire::types::BufferId;
+        if !self.surface_allowed(token, "AllocSurfaceBuffers") {
+            return false;
+        }
+        let node = match self.check_alloc_request(token, req) {
+            Ok(Some(n)) => n,
+            Ok(None) => return false,
+            Err(ApplyError { code, detail }) => {
+                self.disconnect(token, Some((0, code, detail)));
+                return false;
+            }
+        };
+        let plan = match self.plan_alloc(token, node, req) {
+            Ok(p) => p,
+            Err((reason, why)) => {
+                self.refuse_alloc(token, req, reason, &why);
+                return true;
+            }
+        };
+        let (fmt, width, height) = plan;
+        let mut made: Vec<(BufferId, HeldBuffer, msg::SurfaceBufferAllocated)> = Vec::new();
+        let mut failure = None;
+        for i in 0..u32::from(req.count) {
+            let id = BufferId(req.first_id.raw() + i);
+            match self.alloc_one_scanout(token, req.node, id, fmt, width, height) {
+                Ok(one) => made.push(one),
+                Err(refusal) => {
+                    failure = Some(refusal);
+                    break;
+                }
+            }
+        }
+        let Some(client) = self.wire_clients.get_mut(&token) else {
+            return false;
+        };
+        if let Some((reason, why)) = failure {
+            // All or nothing: undo what was made.
+            for (_, held, _) in made {
+                let _ = self.scene.destroy_buffer(client.id, held.key);
+                if let Some(k) = held.scanout {
+                    self.backend.free_buffer(k);
+                }
+            }
+            self.refuse_alloc(token, req, reason, &why);
+            return true;
+        }
+        for (id, held, reply) in made {
+            client.buffers.insert(id, held);
+            client.send(&ServerMsg::SurfaceBufferAllocated(reply));
+        }
+        true
+    }
+
+    /// The fatal half of `AllocSurfaceBuffers`: what a correct client
+    /// never sends. `Ok(None)` when the client is gone.
+    fn check_alloc_request(
+        &self,
+        token: u64,
+        req: &msg::AllocSurfaceBuffers,
+    ) -> Result<Option<nitro_scene::NodeKey>, ApplyError> {
+        use nitro_wire::types::BufferId;
+        let Some(client) = self.wire_clients.get(&token) else {
+            return Ok(None);
+        };
+        if !(1..=MAX_SCANOUT_ALLOC).contains(&req.count) {
+            return Err(ApplyError::new(
+                ErrorCode::Protocol,
+                format!(
+                    "AllocSurfaceBuffers: count {} is not 1..={MAX_SCANOUT_ALLOC}",
+                    req.count
+                ),
+            ));
+        }
+        let node = client.nodes.get(&req.node).copied().ok_or_else(|| {
+            ApplyError::new(
+                ErrorCode::UnknownNode,
+                format!("AllocSurfaceBuffers: no node with id {}", req.node.raw()),
+            )
+        })?;
+        if self.scene.node(node).map(nitro_scene::Node::kind) != Ok(nitro_scene::NodeKind::Surface)
+        {
+            return Err(ApplyError::new(
+                ErrorCode::WrongKind,
+                format!(
+                    "AllocSurfaceBuffers: node {} is not a Surface",
+                    req.node.raw()
+                ),
+            ));
+        }
+        for i in 0..u32::from(req.count) {
+            let in_use = req
+                .first_id
+                .raw()
+                .checked_add(i)
+                .map(BufferId)
+                .is_none_or(|b| {
+                    b.is_none()
+                        || client.buffers.contains_key(&b)
+                        || client
+                            .pending
+                            .iter()
+                            .any(|p| matches!(p, Pending::Buffer(q, _, _) if *q == b))
+                });
+            if in_use {
+                return Err(ApplyError::new(
+                    ErrorCode::BadBuffer,
+                    format!(
+                        "AllocSurfaceBuffers: buffer ids {}..+{} include zero or one in use",
+                        req.first_id.raw(),
+                        req.count
+                    ),
+                ));
+            }
+        }
+        Ok(Some(node))
+    }
+
+    /// Resolve an `AllocSurfaceBuffers`' defaults and check it against the
+    /// caps: `(format, width, height)`, or the refusal.
+    fn plan_alloc(
+        &self,
+        token: u64,
+        node: nitro_scene::NodeKey,
+        req: &msg::AllocSurfaceBuffers,
+    ) -> Result<(u32, u32, u32), (nitro_wire::types::AllocRefusal, String)> {
+        use nitro_wire::types::{AllocRefusal, format};
+        if Self::is_remote(token) {
+            return Err((AllocRefusal::Unsupported, "remote link".to_owned()));
+        }
+        // Defaults: the node's output's planes pick the format, the hint
+        // the size.
+        let fmt = if req.format == 0 {
+            let kms = self
+                .scene
+                .node(node)
+                .ok()
+                .and_then(|n| self.scene.window_info(n.window()).ok())
+                .and_then(nitro_scene::Window::output)
+                .and_then(|o| self.outputs.iter().find(|s| s.scene_id == o))
+                .or_else(|| self.outputs.first())
+                .map(|o| o.kms_id);
+            surface::default_scanout_format(
+                &kms.map(|k| self.backend.planes(k)).unwrap_or_default(),
+            )
+        } else {
+            req.format
+        };
+        if ![format::NV12, format::YUYV, format::XR24, format::AR24].contains(&fmt) {
+            return Err((
+                AllocRefusal::Format,
+                format!("format {fmt:#010x} is not allocatable"),
+            ));
+        }
+        let (mut width, mut height) = (req.width, req.height);
+        if width == 0 || height == 0 {
+            let Some((hw, hh)) = surface::hinted_size(&self.scene, node) else {
+                return Err((
+                    AllocRefusal::TooBig,
+                    "no size given and none hinted".to_owned(),
+                ));
+            };
+            if width == 0 {
+                width = hw;
+            }
+            if height == 0 {
+                height = hh;
+            }
+        }
+        // 4:2:0 and 4:2:2 want even sizes; round up.
+        if fmt == format::NV12 || fmt == format::YUYV {
+            width += width % 2;
+        }
+        if fmt == format::NV12 {
+            height += height % 2;
+        }
+        if width > MAX_SCANOUT_DIM || height > MAX_SCANOUT_DIM {
+            return Err((
+                AllocRefusal::TooBig,
+                format!("{width}x{height} is past 8192"),
+            ));
+        }
+        // An estimate for the budget before anything is allocated: the
+        // tight size of the format. The kernel's padded layout is checked
+        // again per buffer.
+        let half_bytes_per_px = match fmt {
+            format::NV12 => 3,
+            format::YUYV => 4,
+            _ => 8,
+        };
+        let each = u64::from(width) * u64::from(height) * half_bytes_per_px / 2;
+        if each > clients::MAX_BUFFER_BYTES {
+            return Err((AllocRefusal::TooBig, "buffer past the byte cap".to_owned()));
+        }
+        let held = self.buffer_budget(token).unwrap_or_default();
+        let count = usize::from(req.count);
+        clients::check_budget(each * count as u64, count, held)
+            .map_err(|why| (AllocRefusal::Limit, why))?;
+        Ok((fmt, width, height))
+    }
+
+    /// Answer an `AllocSurfaceBuffers` with `AllocSurfaceBuffersFailed`.
+    fn refuse_alloc(
+        &mut self,
+        token: u64,
+        req: &msg::AllocSurfaceBuffers,
+        reason: nitro_wire::types::AllocRefusal,
+        why: &str,
+    ) {
+        info!("AllocSurfaceBuffers refused ({reason:?}): {why}");
+        if let Some(c) = self.wire_clients.get_mut(&token) {
+            c.send(&ServerMsg::AllocSurfaceBuffersFailed(
+                msg::AllocSurfaceBuffersFailed {
+                    node: req.node,
+                    first_id: req.first_id,
+                    reason,
+                },
+            ));
+        }
+    }
+
+    /// One buffer of [`Server::alloc_surface_buffers`]: allocate, export,
+    /// map, validate, register in the scene. On error nothing of it is
+    /// left behind.
+    fn alloc_one_scanout(
+        &mut self,
+        token: u64,
+        node: NodeId,
+        id: nitro_wire::types::BufferId,
+        fmt: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<
+        (
+            nitro_wire::types::BufferId,
+            HeldBuffer,
+            msg::SurfaceBufferAllocated,
+        ),
+        (nitro_wire::types::AllocRefusal, String),
+    > {
+        use nitro_wire::types::AllocRefusal;
+        let client = self
+            .wire_clients
+            .get(&token)
+            .map(|c| c.id)
+            .ok_or((AllocRefusal::Failed, "client gone".to_owned()))?;
+        let kms = match self.backend.alloc_buffer(nitro_kms::Fourcc(fmt), w, h) {
+            Ok(k) => k,
+            Err(KmsError::Unsupported(what)) => {
+                return Err((AllocRefusal::Unsupported, format!("backend: {what}")));
+            }
+            Err(e) => return Err((AllocRefusal::Failed, e.to_string())),
+        };
+        let result = (|| {
+            let fail = |e: String| (AllocRefusal::Failed, e);
+            let info = self
+                .backend
+                .buffer_info(kms)
+                .ok_or_else(|| fail("no layout for the new buffer".to_owned()))?;
+            let size =
+                u32::try_from(info.size).map_err(|_| (AllocRefusal::TooBig, "size".to_owned()))?;
+            let geo = clients::SurfaceGeometry {
+                width: w,
+                height: h,
+                format: fmt,
+                size,
+                offset0: info.offsets[0],
+                stride0: info.pitches[0],
+                offset1: info.offsets[1],
+                stride1: info.pitches[1],
+            };
+            let desc = clients::validate_surface_geometry(&geo).map_err(|e| {
+                let r = if e.code == ErrorCode::Limit {
+                    AllocRefusal::TooBig
+                } else {
+                    AllocRefusal::Failed
+                };
+                (r, e.detail)
+            })?;
+            // The whole export: with the kernel's padded pitch the scene's
+            // `byte_len` (stride × rows) runs past the last row's payload,
+            // and `size` is what the buffer really costs.
+            let map_len = (info.size as usize).max(clients::surface_map_len(&geo));
+            let fd = self
+                .backend
+                .export_buffer(kms)
+                .map_err(|e| fail(e.to_string()))?;
+            let mine = rustix::io::dup(&fd).map_err(|e| fail(format!("dup: {e}")))?;
+            let mapping = nitro_shm::Mapping::map_dmabuf(mine, map_len)
+                .map_err(|e| fail(format!("mapping the export: {e}")))?;
+            let key = self
+                .scene
+                .create_buffer(client, desc, clients::ScanoutPixels(mapping))
+                .map_err(|e| fail(e.to_string()))?;
+            let held = HeldBuffer {
+                key,
+                bytes: map_len as u64,
+                scanout: Some(kms),
+            };
+            let reply = msg::SurfaceBufferAllocated {
+                node,
+                id,
+                format: fmt,
+                width: w,
+                height: h,
+                size,
+                offset0: geo.offset0,
+                stride0: geo.stride0,
+                offset1: geo.offset1,
+                stride1: geo.stride1,
+                fd,
+            };
+            Ok((id, held, reply))
+        })();
+        if result.is_err() {
+            self.backend.free_buffer(kms);
+        }
+        result
     }
 
     /// `PresentSurface` (#3897): validate against the *committed* scene

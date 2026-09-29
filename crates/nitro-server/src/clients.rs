@@ -149,6 +149,12 @@ pub struct HeldBuffer {
     pub key: BufferKey,
     /// Bytes mapped for it (`BufferDesc::byte_len`).
     pub bytes: u64,
+    /// The KMS scanout buffer behind it, for a buffer the server allocated
+    /// with `AllocSurfaceBuffers` (#3914): freed with
+    /// `Backend::free_buffer` when the client destroys the buffer or goes
+    /// away. `None` for a client's own memfd. The planes module (#3899)
+    /// reads this to put the buffer on a plane.
+    pub scanout: Option<nitro_kms::BufferId>,
 }
 
 /// What a client holds against the buffer caps, as [`map_buffer`] checks
@@ -481,6 +487,10 @@ pub struct ApplyOutcome {
     pub new_surfaces: Vec<(NodeId, NodeKey)>,
     /// Import ids this transaction's `DestroyNode`s dropped (#3904).
     pub dropped_imports: Vec<NodeId>,
+    /// Scanout buffers this transaction's `DestroyBuffer`s let go of
+    /// (#3914): the server frees them with `Backend::free_buffer` after
+    /// the scene dropped its mapping.
+    pub freed_scanout: Vec<nitro_kms::BufferId>,
 }
 
 /// A validated `StartDrag`; see [`ApplyOutcome::start_drags`].
@@ -531,7 +541,14 @@ pub fn apply(
                 let key = scene
                     .create_buffer(client.id, desc, data)
                     .map_err(|e| scene_err("CreateBuffer", e))?;
-                client.buffers.insert(id, HeldBuffer { key, bytes });
+                client.buffers.insert(
+                    id,
+                    HeldBuffer {
+                        key,
+                        bytes,
+                        scanout: None,
+                    },
+                );
             }
             Pending::Msg(msg) => apply_msg(client, scene, text, icons, *msg, &mut outcome)?,
         }
@@ -880,7 +897,9 @@ fn apply_msg(
         }
         ClientMsg::DestroyBuffer(m) => {
             let key = buffer_key(client, m.id)?;
-            client.buffers.remove(&m.id);
+            if let Some(scanout) = client.buffers.remove(&m.id).and_then(|h| h.scanout) {
+                outcome.freed_scanout.push(scanout);
+            }
             // The scene drops the `Buffer`, and with it the mapping: the
             // `munmap` is the store's `Drop`, so there is no descriptor for
             // the server to remember to release.
@@ -930,9 +949,13 @@ fn apply_msg(
             outcome.surfaces_set.push(key);
             Ok(())
         }
-        ClientMsg::PresentSurface(_) | ClientMsg::ExportSurface(_) | ClientMsg::ImportSurface(_) => {
+        ClientMsg::PresentSurface(_)
+        | ClientMsg::ExportSurface(_)
+        | ClientMsg::ImportSurface(_)
+        | ClientMsg::AllocSurfaceBuffers(_) => {
             // Never buffered: handled at receipt (`Server::present_surface`,
-            // `Server::export_surface`, `Server::import_surface`).
+            // `Server::export_surface`, `Server::import_surface`,
+            // `Server::alloc_surface_buffers`).
             Ok(())
         }
         ClientMsg::SetImage(m) => {
@@ -1413,6 +1436,24 @@ impl PixelStore for MappedPixels {
     }
 }
 
+/// A server-allocated scanout buffer's pixels as the scene sees them
+/// (#3914): the server's read-only mapping of its own dma-buf export (a
+/// sealed memfd on the fake backend). Read-only like [`MappedPixels`]: the
+/// client writes, the server only reads.
+#[derive(Debug)]
+pub struct ScanoutPixels(pub Mapping);
+
+impl PixelStore for ScanoutPixels {
+    fn bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+
+    /// `None`, always: the mapping is `PROT_READ`.
+    fn bytes_mut(&mut self) -> Option<&mut [u8]> {
+        None
+    }
+}
+
 /// Validate a `CreateBuffer` and map its memfd.
 ///
 /// The bytes are **mapped**, not copied, and the precondition for that is
@@ -1467,8 +1508,9 @@ pub fn map_surface_buffer(
     m: msg::CreateSurfaceBuffer,
     held: BufferBudget,
 ) -> Result<(BufferDesc, MappedPixels), ApplyError> {
-    let desc = validate_surface_buffer(&m)?;
-    let len = surface_map_len(&m);
+    let geo = SurfaceGeometry::of(&m);
+    let desc = validate_surface_geometry(&geo)?;
+    let len = surface_map_len(&geo);
     map_checked(m.fd, m.size, desc, len, held)
 }
 
@@ -1481,36 +1523,7 @@ fn map_checked(
     map_len: usize,
     held: BufferBudget,
 ) -> Result<(BufferDesc, MappedPixels), ApplyError> {
-    let need = map_len as u64;
-    if held.buffers >= MAX_BUFFERS_PER_CLIENT {
-        return Err(ApplyError::new(
-            ErrorCode::Limit,
-            format!(
-                "client already holds {} buffers, the cap is {MAX_BUFFERS_PER_CLIENT}",
-                held.buffers
-            ),
-        ));
-    }
-    if held.bytes.saturating_add(need) > MAX_MAPPED_BYTES_PER_CLIENT {
-        return Err(ApplyError::new(
-            ErrorCode::Limit,
-            format!(
-                "client holds {} mapped bytes; {need} more exceeds the per-client \
-                 {MAX_MAPPED_BYTES_PER_CLIENT} byte cap",
-                held.bytes
-            ),
-        ));
-    }
-    if held.all_clients_bytes.saturating_add(need) > MAX_MAPPED_BYTES_ALL_CLIENTS {
-        return Err(ApplyError::new(
-            ErrorCode::Limit,
-            format!(
-                "all clients hold {} mapped bytes; {need} more exceeds the server-wide \
-                 {MAX_MAPPED_BYTES_ALL_CLIENTS} byte cap",
-                held.all_clients_bytes
-            ),
-        ));
-    }
+    check_budget(map_len as u64, 1, held).map_err(|e| ApplyError::new(ErrorCode::Limit, e))?;
     let bad = |detail: String| ApplyError::new(ErrorCode::BadBuffer, detail);
     let file_len = nitro_shm::sealed_len(&fd).map_err(|e| match e {
         MapError::Seals(s) => bad(format!("buffer {s}")),
@@ -1531,12 +1544,83 @@ fn map_checked(
     Ok((desc, MappedPixels(mapping)))
 }
 
+/// Whether `n` more buffers of `need` bytes in all fit under the three
+/// buffer caps, given what is `held`. Non-fatal on its own: `map_checked`
+/// turns a refusal into a `Limit` error, `AllocSurfaceBuffers` (#3914)
+/// into an `AllocSurfaceBuffersFailed { Limit }`.
+///
+/// # Errors
+/// A sentence naming the cap that would be passed.
+pub fn check_budget(need: u64, n: usize, held: BufferBudget) -> Result<(), String> {
+    if held.buffers + n > MAX_BUFFERS_PER_CLIENT {
+        return Err(format!(
+            "client already holds {} buffers, the cap is {MAX_BUFFERS_PER_CLIENT}",
+            held.buffers
+        ));
+    }
+    if held.bytes.saturating_add(need) > MAX_MAPPED_BYTES_PER_CLIENT {
+        return Err(format!(
+            "client holds {} mapped bytes; {need} more exceeds the per-client \
+             {MAX_MAPPED_BYTES_PER_CLIENT} byte cap",
+            held.bytes
+        ));
+    }
+    if held.all_clients_bytes.saturating_add(need) > MAX_MAPPED_BYTES_ALL_CLIENTS {
+        return Err(format!(
+            "all clients hold {} mapped bytes; {need} more exceeds the server-wide \
+             {MAX_MAPPED_BYTES_ALL_CLIENTS} byte cap",
+            held.all_clients_bytes
+        ));
+    }
+    Ok(())
+}
+
+/// A surface buffer's layout: `CreateSurfaceBuffer`'s fields without the
+/// descriptor, so a buffer the server allocated (#3914) is validated by
+/// the same rules as one a client brought.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SurfaceGeometry {
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// DRM fourcc.
+    pub format: u32,
+    /// Bytes the planes may reach.
+    pub size: u32,
+    /// Plane 0 offset.
+    pub offset0: u32,
+    /// Plane 0 stride.
+    pub stride0: u32,
+    /// Plane 1 offset (NV12 chroma).
+    pub offset1: u32,
+    /// Plane 1 stride (NV12 chroma).
+    pub stride1: u32,
+}
+
+impl SurfaceGeometry {
+    /// The layout a `CreateSurfaceBuffer` declares.
+    #[must_use]
+    pub fn of(m: &msg::CreateSurfaceBuffer) -> Self {
+        Self {
+            width: m.width,
+            height: m.height,
+            format: m.format,
+            size: m.size,
+            offset0: m.offset0,
+            stride0: m.stride0,
+            offset1: m.offset1,
+            stride1: m.stride1,
+        }
+    }
+}
+
 /// The exact bytes a validated `CreateSurfaceBuffer`'s planes reach: the
 /// end of the furthest plane's last row *payload*, which is what the
 /// rasterizer reads (at most `size`, which validation checked). The
 /// scene's [`BufferDesc::byte_len`] is looser, since it does not know row
 /// widths.
-fn surface_map_len(m: &msg::CreateSurfaceBuffer) -> usize {
+pub fn surface_map_len(m: &SurfaceGeometry) -> usize {
     let (w, h) = (u64::from(m.width), u64::from(m.height));
     let end = |off: u32, stride: u32, rows: u64, row: u64| {
         u64::from(off) + u64::from(stride) * (rows - 1) + row
@@ -1569,6 +1653,14 @@ fn surface_map_len(m: &msg::CreateSurfaceBuffer) -> usize {
 /// [`ErrorCode::BadBuffer`] for anything that does not add up;
 /// [`ErrorCode::Limit`] for a `size` past [`MAX_BUFFER_BYTES`].
 pub fn validate_surface_buffer(m: &msg::CreateSurfaceBuffer) -> Result<BufferDesc, ApplyError> {
+    validate_surface_geometry(&SurfaceGeometry::of(m))
+}
+
+/// [`validate_surface_buffer`] on a bare layout.
+///
+/// # Errors
+/// As [`validate_surface_buffer`].
+pub fn validate_surface_geometry(m: &SurfaceGeometry) -> Result<BufferDesc, ApplyError> {
     fn bad<T>(detail: String) -> Result<T, ApplyError> {
         Err(ApplyError::new(ErrorCode::BadBuffer, detail))
     }
@@ -2057,9 +2149,14 @@ mod tests {
                     .1,
             )
             .unwrap();
-        client
-            .buffers
-            .insert(BufferId(2), HeldBuffer { key, bytes: 256 });
+        client.buffers.insert(
+            BufferId(2),
+            HeldBuffer {
+                key,
+                bytes: 256,
+                scanout: None,
+            },
+        );
         let held = client.held_buffers();
         assert_eq!((held.buffers, held.bytes), (2, 320));
         client.buffers.remove(&BufferId(2));

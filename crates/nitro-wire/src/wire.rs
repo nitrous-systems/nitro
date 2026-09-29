@@ -12,8 +12,8 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use crate::error::DecodeError;
 use crate::types::{
-    Align, AxisSource, BufferId, ButtonState, ColorMatrix, ColorRange, CursorPos, CursorShape,
-    DataSource, DragAction, Edge, ErrorCode, KeymapFormat, Layer, NodeId, NodeKind,
+    Align, AllocRefusal, AxisSource, BufferId, ButtonState, ColorMatrix, ColorRange, CursorPos,
+    CursorShape, DataSource, DragAction, Edge, ErrorCode, KeymapFormat, Layer, NodeId, NodeKind,
     OverviewRequest, PopupAnchor, PopupGravity, ShareToken, TouchPhase, WindowRef, WindowState,
 };
 
@@ -116,6 +116,7 @@ plain_tag!(DragAction, u8, u8);
 plain_tag!(KeymapFormat, u8, u8);
 plain_tag!(DataSource, u8, u8);
 plain_tag!(ColorMatrix, u8, u8);
+plain_tag!(AllocRefusal, u8, u8);
 plain_tag!(ColorRange, u8, u8);
 plain_tag!(OverviewRequest, u8, u8);
 

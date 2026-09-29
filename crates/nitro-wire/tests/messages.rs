@@ -8,25 +8,26 @@
 use nitro_core::{Color, IRect, Palette, Point, Rect, Role, Size, Transform};
 use nitro_wire::codec::{FdQueue, Writer};
 use nitro_wire::msg::{
-    AcceptDrop, BindKey, BufferDamage, BufferReleased, ClientCaps, ClientMsg, CloseWindow, Closed,
-    Commit, Configure, CreateBuffer, CreateNode, CreatePopup, CreateSurfaceBuffer, CreateWindow,
-    DestroyBuffer, DestroyNode, DragDrop, DragEnter, DragFinished, DragLeave, DragMotion,
-    Error as ErrorMsg, ExportSurface, Fill, FinishDrag, Focus, FocusWindow, Frame, GrabKeyboard,
-    Hello, HotKey, IconRefused, ImportSurface, Key, Keymap, ListOutputs, Lock, MeasureText,
-    Modifiers, OutputGone, OutputInfo, OutputWorkArea, Outputs, OutputsEnd, OverviewState,
-    PointerAxis, PointerButton, PointerEnter, PointerLeave, PointerMotion, PopupDone,
-    PresentSurface, Presented, Reparent, RepositionPopup, RequestFrame, RequestSelection,
-    SelectionData, SelectionOffer, SelectionRequest, SendSelection, ServerMsg, SetAnchor, SetAppId,
-    SetBorder, SetBounds, SetClip, SetCorners, SetCursor, SetDragIconOffset, SetExclusiveZone,
-    SetFill, SetIcon, SetImage, SetLayer, SetOpacity, SetOpaqueRegion, SetOverview, SetSelection,
-    SetSurface, SetText, SetTransform, SetVisible, SetWindowLimits, SetWindowState,
-    SetWindowStateFor, SetWindowTitle, StartDrag, StartMove, StartResize, SurfaceExported,
-    SurfaceHint, SurfaceRevoked, TextMeasured, TextMetrics, Theme, Touch, UnbindKey, Unlock,
-    Welcome, WindowGone, WindowInfo, WindowList, WindowListEnd, WindowState,
+    AcceptDrop, AllocSurfaceBuffers, AllocSurfaceBuffersFailed, BindKey, BufferDamage,
+    BufferReleased, ClientCaps, ClientMsg, CloseWindow, Closed, Commit, Configure, CreateBuffer,
+    CreateNode, CreatePopup, CreateSurfaceBuffer, CreateWindow, DestroyBuffer, DestroyNode,
+    DragDrop, DragEnter, DragFinished, DragLeave, DragMotion, Error as ErrorMsg, ExportSurface,
+    Fill, FinishDrag, Focus, FocusWindow, Frame, GrabKeyboard, Hello, HotKey, IconRefused,
+    ImportSurface, Key, Keymap, ListOutputs, Lock, MeasureText, Modifiers, OutputGone, OutputInfo,
+    OutputWorkArea, Outputs, OutputsEnd, OverviewState, PointerAxis, PointerButton, PointerEnter,
+    PointerLeave, PointerMotion, PopupDone, PresentSurface, Presented, Reparent, RepositionPopup,
+    RequestFrame, RequestSelection, SelectionData, SelectionOffer, SelectionRequest, SendSelection,
+    ServerMsg, SetAnchor, SetAppId, SetBorder, SetBounds, SetClip, SetCorners, SetCursor,
+    SetDragIconOffset, SetExclusiveZone, SetFill, SetIcon, SetImage, SetLayer, SetOpacity,
+    SetOpaqueRegion, SetOverview, SetSelection, SetSurface, SetText, SetTransform, SetVisible,
+    SetWindowLimits, SetWindowState, SetWindowStateFor, SetWindowTitle, StartDrag, StartMove,
+    StartResize, SurfaceBufferAllocated, SurfaceExported, SurfaceHint, SurfaceRevoked,
+    TextMeasured, TextMetrics, Theme, Touch, UnbindKey, Unlock, Welcome, WindowGone, WindowInfo,
+    WindowList, WindowListEnd, WindowState,
 };
 use nitro_wire::types::{
-    Align, AxisSource, BufferId, ButtonState, ColorMatrix, ColorRange, CursorPos, CursorShape,
-    DataSource, DragAction, Edge, ErrorCode, KeymapFormat, Layer, NodeId, NodeKind,
+    Align, AllocRefusal, AxisSource, BufferId, ButtonState, ColorMatrix, ColorRange, CursorPos,
+    CursorShape, DataSource, DragAction, Edge, ErrorCode, KeymapFormat, Layer, NodeId, NodeKind,
     OverviewRequest, PopupAnchor, PopupGravity, ShareToken, TouchPhase, WindowRef,
     WindowState as WindowStateValue, anchor, caps, constraint_adjust, drag_actions, format,
     mod_mask, popup_flags, resize_edges, window_flags,
@@ -533,6 +534,24 @@ fn client_messages() -> Vec<ClientMsg> {
             id: NodeId(83),
         }
         .into(),
+        AllocSurfaceBuffers {
+            node: NodeId(84),
+            first_id: BufferId(85),
+            count: 3,
+            format: format::NV12,
+            width: 1920,
+            height: 1080,
+        }
+        .into(),
+        AllocSurfaceBuffers {
+            node: NodeId(86),
+            first_id: BufferId(87),
+            count: 1,
+            format: 0,
+            width: 0,
+            height: 0,
+        }
+        .into(),
     ]
 }
 
@@ -826,6 +845,26 @@ fn server_messages() -> Vec<ServerMsg> {
         }
         .into(),
         SurfaceRevoked { id: NodeId(85) }.into(),
+        SurfaceBufferAllocated {
+            node: NodeId(86),
+            id: BufferId(87),
+            format: format::NV12,
+            width: 1920,
+            height: 1080,
+            size: 1920 * 1088 * 3 / 2,
+            offset0: 0,
+            stride0: 1920,
+            offset1: 1920 * 1088,
+            stride1: 1920,
+            fd: memfd("scanout", 4096),
+        }
+        .into(),
+        AllocSurfaceBuffersFailed {
+            node: NodeId(88),
+            first_id: BufferId(89),
+            reason: AllocRefusal::Limit,
+        }
+        .into(),
         OutputWorkArea {
             id: 2,
             area: IRect::new(-1920, 32, 2560, 1408),
@@ -926,7 +965,9 @@ fn every_client_message_round_trips() {
 /// message still carries none.
 fn server_fd_count(msg: &ServerMsg) -> usize {
     match msg {
-        ServerMsg::Keymap(_) | ServerMsg::SelectionData(_) => 1,
+        ServerMsg::Keymap(_)
+        | ServerMsg::SelectionData(_)
+        | ServerMsg::SurfaceBufferAllocated(_) => 1,
         _ => 0,
     }
 }
@@ -2124,6 +2165,7 @@ fn the_m5_ops_are_where_the_doc_says() {
         (PresentSurface::OP, 0x0300),
         (ExportSurface::OP, 0x0300),
         (ImportSurface::OP, 0x0300),
+        (AllocSurfaceBuffers::OP, 0x0300),
     ] {
         assert_eq!(op & 0xff00, block, "client M5 op {op:#06x}");
         assert!(ClientMsg::is_op(op), "client M5 op {op:#06x}");
@@ -2138,6 +2180,8 @@ fn the_m5_ops_are_where_the_doc_says() {
         (SurfaceHint::OP, 0x8300),
         (SurfaceExported::OP, 0x8300),
         (SurfaceRevoked::OP, 0x8300),
+        (SurfaceBufferAllocated::OP, 0x8300),
+        (AllocSurfaceBuffersFailed::OP, 0x8300),
         (OutputWorkArea::OP, 0x8400),
         (SelectionOffer::OP, 0x8500),
         (SelectionData::OP, 0x8500),
@@ -2171,6 +2215,9 @@ fn the_m5_ops_are_where_the_doc_says() {
     assert_eq!(ImportSurface::OP, 0x0311);
     assert_eq!(SurfaceExported::OP, 0x8307);
     assert_eq!(SurfaceRevoked::OP, 0x8308);
+    assert_eq!(AllocSurfaceBuffers::OP, 0x0312);
+    assert_eq!(SurfaceBufferAllocated::OP, 0x8309);
+    assert_eq!(AllocSurfaceBuffersFailed::OP, 0x830a);
     assert_eq!(OutputWorkArea::OP, 0x8408);
     assert_eq!(DragFinished::OP, 0x8508);
     // 0x8304 is deliberately unused.

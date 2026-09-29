@@ -24,10 +24,10 @@ use nitro_server::{BackendKind, Config, run};
 use nitro_shm::MappingMut;
 use nitro_wire::client::Connection;
 use nitro_wire::msg::{
-    ClientMsg, Configure, CreateSurfaceBuffer, PresentSurface, ServerMsg, SetBounds,
+    AllocSurfaceBuffers, ClientMsg, SurfaceBufferAllocated, Configure, CreateSurfaceBuffer, PresentSurface, ServerMsg, SetBounds,
 };
 use nitro_wire::types::{
-    BufferId, ColorMatrix, ColorRange, ErrorCode, Layer, NodeId, caps, format,
+    AllocRefusal, BufferId, ColorMatrix, ColorRange, ErrorCode, Layer, NodeId, caps, format,
 };
 
 const OUT: (u32, u32) = (320, 240);
@@ -52,6 +52,11 @@ struct Harness {
 impl Harness {
     /// A fake output at `mhz` millihertz.
     fn start(name: &str, mhz: u32) -> Self {
+        Self::start_with(name, mhz, Vec::new())
+    }
+
+    /// As [`Harness::start`], with a plane inventory for the fake output.
+    fn start_with(name: &str, mhz: u32, planes: Vec<nitro_kms::FakePlaneSpec>) -> Self {
         let dir = std::env::temp_dir().join(format!("nitro-surf-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("nitro").join("control.sock");
@@ -61,6 +66,7 @@ impl Harness {
             height: OUT.1,
         };
         config.fake_modes = vec![(OUT.0, OUT.1, mhz)];
+        config.fake_planes = planes;
         let wire_path = config.wire_path.clone();
         let thread = std::thread::spawn(move || run(config));
         let h = Self {
@@ -685,5 +691,283 @@ fn destroy_or_disconnect_with_a_queued_frame_is_quiet() {
     drop(other);
     h.settle();
     assert!(h.stat("frames") > 0);
+    h.quit();
+}
+
+// ------------------------------------------------ server-allocated (#3914)
+
+fn alloc(conn: &mut Connection, first: u32, count: u8, fmt: u32, w: u32, h: u32) {
+    conn.alloc_surface_buffers(AllocSurfaceBuffers {
+        node: SURF,
+        first_id: BufferId(first),
+        count,
+        format: fmt,
+        width: w,
+        height: h,
+    })
+    .unwrap();
+    conn.flush().unwrap();
+}
+
+/// Wait for `count` `SurfaceBufferAllocated`s starting at `first`, and
+/// take them out of `seen`.
+fn allocated(
+    conn: &mut Connection,
+    seen: &mut Vec<ServerMsg>,
+    first: u32,
+    count: u32,
+) -> Vec<SurfaceBufferAllocated> {
+    let last = BufferId(first + count - 1);
+    expect(conn, seen, "SurfaceBufferAllocated", |m| {
+        matches!(m, ServerMsg::SurfaceBufferAllocated(a) if a.id == last).then_some(())
+    });
+    let mut out = Vec::new();
+    let mut rest = Vec::new();
+    for m in seen.drain(..) {
+        match m {
+            ServerMsg::SurfaceBufferAllocated(a) => out.push(a),
+            other => rest.push(other),
+        }
+    }
+    *seen = rest;
+    out.sort_by_key(|a| a.id.raw());
+    assert_eq!(out.len(), count as usize, "{out:?}");
+    out
+}
+
+fn refused(conn: &mut Connection, seen: &mut Vec<ServerMsg>) -> AllocRefusal {
+    let r = expect(conn, seen, "AllocSurfaceBuffersFailed", |m| match m {
+        ServerMsg::AllocSurfaceBuffersFailed(f) => Some(f.reason),
+        _ => None,
+    });
+    seen.retain(|m| !matches!(m, ServerMsg::AllocSurfaceBuffersFailed(_)));
+    r
+}
+
+/// Fill a server-allocated NV12 buffer with a pattern through its
+/// dma-buf mapping, and return what the rasterizer makes of it at 1:1.
+fn fill_scanout_nv12(a: &SurfaceBufferAllocated, seed: u32) -> Vec<u8> {
+    use nitro_shm::{DmaBufMapping, SyncAccess, sync_end, sync_start};
+    let mut map = DmaBufMapping::map(a.fd.as_fd(), a.size as usize).unwrap();
+    // The fake exports a memfd: no sync needed, and the bracket says so.
+    assert_eq!(sync_start(&a.fd, SyncAccess::Write), Ok(false));
+    let bytes = map.as_bytes_mut();
+    for (i, b) in bytes.iter_mut().enumerate() {
+        let i = i as u32;
+        *b = ((i * 7 + (i / a.stride0) * 13 + seed * 41) % 220 + 16) as u8;
+    }
+    assert_eq!(sync_end(&a.fd, SyncAccess::Write), Ok(false));
+    let (w, h) = (a.width, a.height);
+    let mut out = vec![0u8; (w * h * 4) as usize];
+    let mut canvas = Canvas::new(&mut out, w, h, w * 4);
+    let dst = IRect::new(0, 0, w.cast_signed(), h.cast_signed());
+    let data = map.as_bytes();
+    let src = Nv12 {
+        y: &data[a.offset0 as usize..],
+        y_stride: a.stride0,
+        uv: &data[a.offset1 as usize..],
+        uv_stride: a.stride1,
+        width: w,
+        height: h,
+    };
+    canvas.blit_nv12(
+        &dst,
+        &dst,
+        &src,
+        &dst,
+        YuvEncoding::new(YuvMatrix::Bt709, YuvRange::Limited),
+    );
+    out
+}
+
+#[test]
+fn server_allocated_buffers_are_written_presented_and_freed() {
+    let h = Harness::start("scanout", 60_000);
+    let (mut conn, mut seen) = surface_client(&h, "scanout");
+    let c = window(&mut conn, &mut seen, &[], (SIDE as f32, SIDE as f32));
+    alloc(&mut conn, 10, 3, format::NV12, SIDE, SIDE);
+    let bufs = allocated(&mut conn, &mut seen, 10, 3);
+    for (i, a) in bufs.iter().enumerate() {
+        assert_eq!(a.node, SURF);
+        assert_eq!(a.id, BufferId(10 + i as u32));
+        assert_eq!((a.format, a.width, a.height), (format::NV12, SIDE, SIDE));
+        // The fake's pitch is 64-byte aligned, like a dumb buffer's.
+        assert_eq!(a.stride0, 64);
+        assert!(!nitro_shm::is_dmabuf(&a.fd));
+    }
+    assert_eq!(h.stat("scanout_buffers"), 3);
+    let per = u64::from(bufs[0].size);
+    assert_eq!(h.stat("scanout_buffer_bytes"), 3 * per);
+
+    // Write through the client's mapping, present, see it on the CPU path.
+    for (serial, (a, seed)) in bufs.iter().zip([1, 2, 3]).enumerate() {
+        let want = fill_scanout_nv12(a, seed);
+        let serial = 20 + serial as u32;
+        conn.present_surface(PresentSurface {
+            id: SURF,
+            buffer: a.id,
+            serial,
+            src: full(),
+            matrix: ColorMatrix::Bt709,
+            range: ColorRange::Limited,
+            damage: vec![],
+        })
+        .unwrap();
+        conn.flush().unwrap();
+        presented(&mut conn, &mut seen, serial);
+        h.settle();
+        assert_eq!(rgb(&grab(&h, &c, SIDE, SIDE)), rgb(&want), "buffer {seed}");
+    }
+
+    // DestroyBuffer frees it (the one not on screen).
+    conn.tx().destroy_buffer(bufs[0].id).commit(30).unwrap();
+    conn.flush().unwrap();
+    presented(&mut conn, &mut seen, 30);
+    assert_eq!(h.stat("scanout_buffers"), 2);
+    assert_eq!(h.stat("scanout_buffer_bytes"), 2 * per);
+    // The id is free again for the client's own use.
+    alloc(&mut conn, 10, 1, format::YUYV, SIDE, SIDE);
+    let y = allocated(&mut conn, &mut seen, 10, 1);
+    assert_eq!((y[0].format, y[0].stride0, y[0].offset1), (format::YUYV, 64, 0));
+    assert_eq!(h.stat("scanout_buffers"), 3);
+
+    // Disconnect cleanup.
+    drop(conn);
+    wait_for("the scanout buffers to go", || h.stat("scanout_buffers") == 0);
+    assert_eq!(h.stat("scanout_buffer_bytes"), 0);
+    h.quit();
+}
+
+#[test]
+fn refusals_are_not_fatal() {
+    let h = Harness::start("scanout-refuse", 60_000);
+    let (mut conn, mut seen) = surface_client(&h, "refuse");
+    window(&mut conn, &mut seen, &[], (SIDE as f32, SIDE as f32));
+    alloc(&mut conn, 10, 1, format::NV12, 8193, 16);
+    assert_eq!(refused(&mut conn, &mut seen), AllocRefusal::TooBig);
+    alloc(&mut conn, 10, 1, format::fourcc(b"RG16"), 16, 16);
+    assert_eq!(refused(&mut conn, &mut seen), AllocRefusal::Format);
+    alloc(&mut conn, 10, 1, format::UYVY, 16, 16);
+    assert_eq!(refused(&mut conn, &mut seen), AllocRefusal::Format);
+    // 4 × 4096² XR24 = 256 MiB: past the per-client byte cap.
+    alloc(&mut conn, 10, 4, format::XR24, 4096, 4096);
+    assert_eq!(refused(&mut conn, &mut seen), AllocRefusal::Limit);
+    // Past the buffer-count cap: 30 of its own, then 4 more.
+    let mut tx = conn.tx();
+    let own: Vec<Buf> = (100..130).map(|i| Buf::new(i, format::NV12, 1)).collect();
+    for b in &own {
+        tx = tx.create_surface_buffer(b.create());
+    }
+    tx.commit(2).unwrap();
+    conn.flush().unwrap();
+    presented(&mut conn, &mut seen, 2);
+    alloc(&mut conn, 10, 4, format::NV12, 16, 16);
+    assert_eq!(refused(&mut conn, &mut seen), AllocRefusal::Limit);
+    assert_eq!(h.stat("scanout_buffers"), 0);
+    // And the connection survived all of it.
+    alloc(&mut conn, 10, 2, format::NV12, 16, 16);
+    allocated(&mut conn, &mut seen, 10, 2);
+    h.quit();
+}
+
+fn fatal(h: &Harness, name: &str, req: impl FnOnce(&mut Connection)) -> ErrorCode {
+    let (mut conn, mut seen) = surface_client(h, name);
+    window(&mut conn, &mut seen, &[&Buf::new(7, format::NV12, 1)], (16.0, 16.0));
+    req(&mut conn);
+    let _ = conn.flush();
+    expect(&mut conn, &mut seen, "Error", |m| match m {
+        ServerMsg::Error(e) => Some(e.code),
+        _ => None,
+    })
+}
+
+#[test]
+fn malformed_requests_are_fatal() {
+    let h = Harness::start("scanout-fatal", 60_000);
+    for count in [0, 5] {
+        let code = fatal(&h, "count", |c| alloc(c, 10, count, format::NV12, 16, 16));
+        assert_eq!(code, ErrorCode::Protocol, "count {count}");
+    }
+    // Id 7 is already a buffer; id 0 is NONE.
+    let code = fatal(&h, "dup", |c| alloc(c, 6, 2, format::NV12, 16, 16));
+    assert_eq!(code, ErrorCode::BadBuffer);
+    let code = fatal(&h, "zero", |c| alloc(c, 0, 1, format::NV12, 16, 16));
+    assert_eq!(code, ErrorCode::BadBuffer);
+    // Not a Surface.
+    let code = fatal(&h, "kind", |c| {
+        c.alloc_surface_buffers(AllocSurfaceBuffers {
+            node: ROOT,
+            first_id: BufferId(10),
+            count: 1,
+            format: 0,
+            width: 16,
+            height: 16,
+        })
+        .unwrap();
+    });
+    assert_eq!(code, ErrorCode::WrongKind);
+    // Unknown node.
+    let code = fatal(&h, "unknown", |c| {
+        c.alloc_surface_buffers(AllocSurfaceBuffers {
+            node: NodeId(99),
+            first_id: BufferId(10),
+            count: 1,
+            format: 0,
+            width: 16,
+            height: 16,
+        })
+        .unwrap();
+    });
+    assert_eq!(code, ErrorCode::UnknownNode);
+
+    // Without `SURFACE` in ClientCaps.
+    let mut conn = h.client("nocap");
+    let mut seen = Vec::new();
+    alloc(&mut conn, 10, 1, format::NV12, 16, 16);
+    let (code, msg) = expect(&mut conn, &mut seen, "Error", |m| match m {
+        ServerMsg::Error(e) => Some((e.code, e.msg.clone())),
+        _ => None,
+    });
+    assert_eq!(code, ErrorCode::Protocol);
+    assert!(msg.contains("SURFACE"), "{msg}");
+    h.quit();
+}
+
+#[test]
+fn defaults_come_from_the_planes_and_the_hint() {
+    use nitro_kms::{FakePlaneSpec, Fourcc};
+    // No YUV plane: XR24, at the hinted 30×21.
+    let h = Harness::start("scanout-default", 60_000);
+    let (mut conn, mut seen) = surface_client(&h, "default");
+    window(&mut conn, &mut seen, &[], (30.0, 21.0));
+    alloc(&mut conn, 10, 1, 0, 0, 0);
+    let a = allocated(&mut conn, &mut seen, 10, 1);
+    assert_eq!((a[0].format, a[0].width, a[0].height), (format::XR24, 30, 21));
+    h.quit();
+
+    // A YUYV overlay (HSW's shape): YUYV, width rounded up to even.
+    let planes = vec![
+        FakePlaneSpec::default_primary(),
+        FakePlaneSpec::overlay().formats(&[Fourcc::XRGB8888, Fourcc::YUYV]),
+    ];
+    let h = Harness::start_with("scanout-yuyv", 60_000, planes);
+    let (mut conn, mut seen) = surface_client(&h, "yuyv");
+    window(&mut conn, &mut seen, &[], (31.0, 21.0));
+    alloc(&mut conn, 10, 1, 0, 0, 0);
+    let a = allocated(&mut conn, &mut seen, 10, 1);
+    assert_eq!((a[0].format, a[0].width, a[0].height), (format::YUYV, 32, 21));
+    h.quit();
+
+    // NV12 listed: NV12 wins, both dimensions rounded up to even.
+    let planes = vec![
+        FakePlaneSpec::default_primary(),
+        FakePlaneSpec::overlay().formats(&[Fourcc::YUYV, Fourcc::NV12]),
+    ];
+    let h = Harness::start_with("scanout-nv12", 60_000, planes);
+    let (mut conn, mut seen) = surface_client(&h, "nv12");
+    window(&mut conn, &mut seen, &[], (31.0, 21.0));
+    alloc(&mut conn, 10, 1, 0, 40, 0);
+    let a = allocated(&mut conn, &mut seen, 10, 1);
+    assert_eq!((a[0].format, a[0].width, a[0].height), (format::NV12, 40, 22));
     h.quit();
 }
