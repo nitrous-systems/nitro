@@ -50,7 +50,8 @@ impl Counters {
             shadow_path,
             drm_total: drm.total,
             drm_resident: drm.resident,
-            rss: vm_rss(),
+            rss: proc_kib("/proc/self/status", "VmRSS:"),
+            pss: proc_kib("/proc/self/smaps_rollup", "Pss:"),
         }
     }
 }
@@ -131,16 +132,19 @@ pub fn drm_memory_of(proc_dir: &str) -> DrmMemory {
     sum
 }
 
-/// This process's `VmRSS`, bytes (0 if unreadable).
+/// A `<key> <n> kB` line of a `/proc` file, in bytes (0 if unreadable).
 #[must_use]
-pub fn vm_rss() -> u64 {
-    std::fs::read_to_string("/proc/self/status")
+pub fn proc_kib(path: &str, key: &str) -> u64 {
+    std::fs::read_to_string(path)
         .ok()
         .and_then(|s| {
-            s.lines()
-                .find_map(|l| l.strip_prefix("VmRSS:").map(parse_size))
+            s.lines().find_map(|l| {
+                l.strip_prefix(key)
+                    .and_then(|v| v.split_whitespace().next())
+                    .and_then(|n| n.parse::<u64>().ok())
+            })
         })
-        .unwrap_or(0)
+        .map_or(0, |kib| kib * 1024)
 }
 
 #[cfg(test)]
@@ -167,5 +171,6 @@ mod tests {
         let s = c.snapshot(1, 0, ShadowPath::Staging);
         assert_eq!((s.frames, s.submit_us_avg, s.submit_us_max), (2, 20, 30));
         assert!(s.rss > 0);
+        assert!(s.pss > 0);
     }
 }

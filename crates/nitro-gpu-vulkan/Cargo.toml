@@ -1,0 +1,27 @@
+[package]
+name = "nitro-gpu-vulkan"
+description = "The nitro GPU helper's Vulkan backend: dma-buf import, one damage-clipped render pass of textured quads, sync_file out"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# `workspace = true` makes the crate-level `#![allow(unsafe_code)]` in
+# `src/lib.rs` the scoped exception it claims to be (DEPENDENCIES.md).
+[lints]
+workspace = true
+
+[[bin]]
+name = "nitro-gpu-vulkan"
+path = "src/main.rs"
+
+[dependencies]
+nitro-core = { workspace = true }
+nitro-gpu  = { workspace = true }
+nitro-shm  = { workspace = true }
+nitro-wire = { workspace = true }
+ash        = { workspace = true }
+# `fs` for `open`/`stat`/`fstat`/`major`/`minor`; `param` for the page
+# size (udmabuf wants page-aligned sizes); `ioctl` (no feature flag)
+# for `UDMABUF_CREATE` and `DMA_BUF_IOCTL_IMPORT_SYNC_FILE`.
+rustix     = { workspace = true, features = ["fs", "param"] }

@@ -280,6 +280,7 @@ fn every_message_round_trips() {
                 drm_total: 8,
                 drm_resident: 9,
                 rss: 10,
+                pss: 11,
             }),
             0,
         ),

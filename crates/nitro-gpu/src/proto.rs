@@ -263,6 +263,10 @@ pub struct Stats {
     pub drm_resident: u64,
     /// The helper's own `VmRSS`, bytes.
     pub rss: u64,
+    /// The helper's own proportional set size (`smaps_rollup` `Pss`),
+    /// bytes. Reported by the helper because it is non-dumpable: no other
+    /// process may read its `/proc` files.
+    pub pss: u64,
 }
 
 /// Error codes of [`FromHelper::Error`]. Every error is **non-fatal**:
@@ -984,6 +988,7 @@ impl Message for FromHelper {
                 w.put_u64(s.drm_total);
                 w.put_u64(s.drm_resident);
                 w.put_u64(s.rss);
+                w.put_u64(s.pss);
             }
         }
     }
@@ -1051,6 +1056,7 @@ impl Message for FromHelper {
                 drm_total: r.get_u64()?,
                 drm_resident: r.get_u64()?,
                 rss: r.get_u64()?,
+                pss: r.get_u64()?,
             }),
             other => return Err(DecodeError::UnknownOp(other)),
         })
