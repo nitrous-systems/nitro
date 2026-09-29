@@ -347,7 +347,8 @@ impl Scene {
     /// extent misses `clip` are skipped without being walked. So are the
     /// windows the [`Admit`](crate::Admit) filter leaves out, and the
     /// [`Layer::Top`] windows of an output whose top layer is hidden
-    /// ([`set_top_layer_hidden`](Scene::set_top_layer_hidden)). `out` is
+    /// ([`set_top_layer_hidden`](Scene::set_top_layer_hidden)), and
+    /// offscreen windows ([`set_offscreen`](Scene::set_offscreen)). `out` is
     /// appended to, never cleared.
     ///
     /// Call after [`update`](Scene::update): the traversal reads the cached
@@ -365,7 +366,10 @@ impl Scene {
             let Some(window) = self.windows.get(win) else {
                 continue;
             };
-            if !self.admit.admits(window.client) || (top_hidden && window.layer == Layer::Top) {
+            if !self.admit.admits(window.client)
+                || window.offscreen
+                || (top_hidden && window.layer == Layer::Top)
+            {
                 continue;
             }
             let root = window.root;
@@ -375,6 +379,28 @@ impl Scene {
             }
             self.paint_node(root, clip, out);
         }
+    }
+
+    /// Append the items of one window's tree inside `clip` (global device
+    /// pixels), in painter's order, with exactly
+    /// [`paint_list`](Scene::paint_list)'s item semantics — but for that
+    /// window alone, and whether or not it is
+    /// [offscreen](Scene::set_offscreen), admitted or on a hidden layer.
+    /// This is how an offscreen window is rendered somewhere else.
+    ///
+    /// A dead or unplaced window appends nothing. Call after
+    /// [`update`](Scene::update).
+    pub fn paint_window(&self, win: WindowKey, clip: &IRect, out: &mut Vec<PaintItem>) {
+        if clip.is_empty() {
+            return;
+        }
+        let Some(window) = self.windows.get(win) else {
+            return;
+        };
+        if window.output.is_none() {
+            return;
+        }
+        self.paint_node(window.root, clip, out);
     }
 
     /// What a consumer of a [`Translation`](crate::Translation) hint needs
@@ -537,8 +563,8 @@ impl Scene {
     /// subtrees are skipped, clip groups reject points outside their clip, and
     /// a node only counts as hit if it actually paints something. A group with
     /// no content never swallows a click. Windows that
-    /// [`paint_list`](Scene::paint_list) leaves out (not admitted, or on a
-    /// hidden top layer) and hit-exempt windows are never hit.
+    /// [`paint_list`](Scene::paint_list) leaves out (not admitted, offscreen,
+    /// or on a hidden top layer) and hit-exempt windows are never hit.
     ///
     /// Call after [`update`](Scene::update).
     #[must_use]
@@ -555,6 +581,7 @@ impl Scene {
             };
             if !self.admit.admits(window.client)
                 || window.hit_exempt
+                || window.offscreen
                 || (top_hidden && window.layer == Layer::Top)
             {
                 continue;

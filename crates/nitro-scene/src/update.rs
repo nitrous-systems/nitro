@@ -13,7 +13,7 @@
 use nitro_core::{Damage, IRect, Rect, Transform};
 
 use crate::{
-    Configure, NodeKey, OutputId, Scene, UpdateStats,
+    Configure, NodeKey, OutputId, Scene, UpdateStats, WindowKey,
     node::{DESCEND, Dirty},
 };
 
@@ -69,6 +69,8 @@ pub(crate) struct TxState {
     foreign: Vec<(OutputId, Damage)>,
     /// Candidates found, `foreign` not filled in yet.
     found: Vec<Translation>,
+    /// Damage inside offscreen windows, per window.
+    offscreen: Vec<(WindowKey, IRect)>,
 }
 
 impl TxState {
@@ -101,6 +103,13 @@ pub struct UpdateResult {
     pub stats: UpdateStats,
     /// Pure-translation hints, at most one per output. See [`Translation`].
     pub translations: Vec<Translation>,
+    /// Damage inside [offscreen](Scene::set_offscreen) windows, in global
+    /// device pixels clipped to the window's output, one entry per rect
+    /// (unmerged, possibly overlapping). None of it is in the sink: these
+    /// pixels are not on any output, so nothing here is in a
+    /// [`Translation`]'s `foreign` either, and no hint comes from inside
+    /// an offscreen window.
+    pub offscreen: Vec<(WindowKey, IRect)>,
 }
 
 /// Per-output damage sinks handed to [`Scene::update`].
@@ -150,6 +159,9 @@ struct Target {
     id: OutputId,
     /// The output's device rect; every emitted rect is clipped to it.
     rect: IRect,
+    /// The window being walked, when it is offscreen: its damage goes to
+    /// [`UpdateResult::offscreen`] instead of the sink.
+    offscreen: Option<WindowKey>,
 }
 
 /// State carried down the recursive walk.
@@ -213,6 +225,11 @@ impl Scene {
                     let target = Target {
                         id: self.outputs[index].id,
                         rect: self.outputs[index].rect,
+                        offscreen: self
+                            .windows
+                            .get(window)
+                            .is_some_and(|w| w.offscreen)
+                            .then_some(window),
                     };
                     let inherited = Inherited {
                         transform,
@@ -256,6 +273,7 @@ impl Scene {
             configures,
             stats: self.stats,
             translations,
+            offscreen: tx.offscreen,
         }
     }
 
@@ -443,7 +461,7 @@ impl Scene {
         transforms: [Transform; 2],
         clips: [IRect; 2],
     ) -> Option<Translation> {
-        if force || self.tx.depth > 0 {
+        if force || self.tx.depth > 0 || target.offscreen.is_some() {
             return None;
         }
         let [world_transform, child_transform] = transforms;
@@ -512,10 +530,15 @@ impl Scene {
     }
 
     /// Add one rect of damage for `target`, clipped to it, and note it as
-    /// foreign unless the walk is inside a translation candidate.
+    /// foreign unless the walk is inside a translation candidate — or, for
+    /// an offscreen window, record it per window and nothing else.
     fn emit(&mut self, sink: &mut DamageSink<'_>, target: Target, rect: IRect) {
         let rect = rect.intersect(&target.rect);
         if rect.is_empty() {
+            return;
+        }
+        if let Some(win) = target.offscreen {
+            self.tx.offscreen.push((win, rect));
             return;
         }
         sink.add(target.id, rect);

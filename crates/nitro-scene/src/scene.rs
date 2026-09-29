@@ -219,6 +219,47 @@ impl Scene {
         Ok(())
     }
 
+    /// Take a window **offscreen** (or bring it back): it stays placed,
+    /// laid out and updated exactly as before, but
+    /// [`paint_list`](Scene::paint_list) and [`hit_test`](Scene::hit_test)
+    /// skip it, and every rect of damage an [`update`](Scene::update)
+    /// finds inside it is reported per window in
+    /// [`UpdateResult::offscreen`](crate::UpdateResult::offscreen) instead
+    /// of on its output. [`paint_window`](Scene::paint_window) still lists
+    /// its items.
+    ///
+    /// What it is for: the server renders an offscreen window into a
+    /// buffer of its own (the overview's thumbnail atlas) and shows that,
+    /// so the window's own changes must reach the renderer as "this
+    /// window changed here" rather than as output pixels.
+    ///
+    /// A change banks damage for the window's cached extent on its output
+    /// (it appears or disappears there). Setting the value already in
+    /// force does nothing.
+    ///
+    /// Damage *banked* for an offscreen window by a mutation that makes a
+    /// cached rect unreachable (a restack, `place_window`, a destroyed
+    /// node) still goes to the output. That over-repaints a little and is
+    /// never wrong.
+    ///
+    /// # Errors
+    /// [`Error::StaleKey`].
+    pub fn set_offscreen(&mut self, win: WindowKey, offscreen: bool) -> Result<(), Error> {
+        let window = self.windows.get_mut(win).ok_or(Error::StaleKey)?;
+        if window.offscreen == offscreen {
+            return Ok(());
+        }
+        window.offscreen = offscreen;
+        let (root, output) = (window.root, window.output);
+        if let Some(id) = output {
+            let bounds = self.node_ref(root).subtree_bounds;
+            if !bounds.is_empty() {
+                self.pending.push((id, bounds));
+            }
+        }
+        Ok(())
+    }
+
     /// Whose windows are painted and hit-tested.
     #[must_use]
     pub fn admit(&self) -> Admit {
@@ -440,6 +481,7 @@ impl Scene {
             parent: None,
             popup: false,
             hit_exempt: false,
+            offscreen: false,
         });
         self.note_resized(win);
         let node = self.node_mut_ref(root);
@@ -1454,6 +1496,7 @@ impl Scene {
                 && node.last_output == Some(output)
                 && window.output == Some(output)
                 && self.admit.admits(window.client)
+                && !window.offscreen
                 && !(out.top_hidden && window.layer == Layer::Top)
                 && node.world_bounds.intersects(&out.rect)
         })

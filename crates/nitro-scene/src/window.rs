@@ -281,6 +281,9 @@ pub struct Window {
     /// What a drag icon is — it sits under the pointer for the whole drag,
     /// and a hit test that found it would never find the drop target.
     pub(crate) hit_exempt: bool,
+    /// Kept up to date but never painted to, or hit on, its output: see
+    /// [`Scene::set_offscreen`](crate::Scene::set_offscreen).
+    pub(crate) offscreen: bool,
 }
 
 impl Window {
@@ -409,6 +412,12 @@ impl Window {
     /// [`Scene::set_hit_exempt`](crate::Scene::set_hit_exempt).
     pub fn is_hit_exempt(&self) -> bool {
         self.hit_exempt
+    }
+
+    /// Whether the window is offscreen; see
+    /// [`Scene::set_offscreen`](crate::Scene::set_offscreen).
+    pub fn is_offscreen(&self) -> bool {
+        self.offscreen
     }
 }
 
