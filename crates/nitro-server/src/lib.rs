@@ -7056,23 +7056,19 @@ impl Server {
     /// `SetSelection`: take (or clear) the clipboard. Returns whether the
     /// client survives.
     ///
-    /// Authorized by **keyboard focus**, and a violation is fatal: there is
-    /// no legitimate race (unlike `SetCursor`), and a background process
-    /// silently replacing the clipboard is exactly what the rule stops.
+    /// Authorized by **keyboard focus**. Without it the request is dropped,
+    /// not fatal: focus can leave between the client's send and our
+    /// receive (the `SetCursor` race; Chromium hit it on a slow copy), and
+    /// a background process still cannot replace the clipboard. Nothing is
+    /// sent back: no echo arrives, which a client that saw its `Focus`
+    /// go before the echo reads as "dropped" (docs/wire.md).
     fn set_selection(&mut self, token: u64, mimes: Vec<String>) -> bool {
         if !self.data_allowed(token, "SetSelection") {
             return false;
         }
         if self.focus_token() != Some(token) {
-            self.disconnect(
-                token,
-                Some((
-                    0,
-                    ErrorCode::Protocol,
-                    "SetSelection needs keyboard focus".to_owned(),
-                )),
-            );
-            return false;
+            info!("wire client {token}: SetSelection without keyboard focus: dropped");
+            return true;
         }
         if let Err(e) = data::validate_mimes(&mimes) {
             let code = if e.is_limit() {

@@ -346,14 +346,29 @@ fn a_client_without_keyboard_focus_cannot_take_the_selection() {
     let mut a = h.client("a");
     a.window(1, 1);
     a.copy(&["text/plain"]);
-    b.offer();
-    // B's window lost focus to A's.
+    assert_eq!(b.offer(), ["text/plain"]);
+    assert_eq!(a.offer(), ["text/plain"]);
+    // B's window lost focus to A's. Its SetSelection is the race a client
+    // cannot avoid (the Focus was in flight), so it is dropped, not fatal.
     b.copy(&["image/png"]);
-    let (code, msg) = b.error();
-    assert_eq!(code, ErrorCode::Protocol);
-    assert!(msg.contains("keyboard focus"), "{msg}");
-    wait_for("B to be gone", || h.stat("windows") == 1);
-    // A's selection is untouched, and A is still here.
+    // A round trip on B proves the server has processed the copy.
+    b.paste(5, "image/png");
+    assert!(read_all(&b.data(5)).is_empty(), "image/png is not on offer");
+    assert!(b.pump(), "B is still connected");
+    assert!(
+        !b.seen.iter().any(|m| matches!(m, ServerMsg::Error(_))),
+        "no Error: {:?}",
+        b.seen
+    );
+    assert!(
+        !b.seen
+            .iter()
+            .chain(a.seen.iter())
+            .any(|m| matches!(m, ServerMsg::SelectionOffer(_))),
+        "no offer, echo or otherwise"
+    );
+    assert_eq!(h.stat("windows"), 2);
+    // A still owns the selection, and serves it.
     let mut c = h.client("c");
     assert_eq!(
         c.offer(),

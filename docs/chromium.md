@@ -71,6 +71,7 @@ All of this was verified on a fake-backend nitro server (1280x720@60), driven by
 - **Titlebar drag** moves the window via `StartMove`. Edge resize works via `StartResize`, and the resulting `Configure` redraws at the new size.
   - The `PointerLeave` sent at the start of a client drag is swallowed, so the drag isn't cancelled.
 - **Minimize** (titlebar button): the window unmaps, chrome stays alive, and the server's frame count stays flat, so there is no busy loop and no stall.
+- **Clipboard** (#3943): copy and paste both ways with native nitro clients, on testhost2. See [Clipboard](#clipboard-3943).
 
 ## What doesn't / is not verified
 
@@ -79,10 +80,33 @@ All of this was verified on a fake-backend nitro server (1280x720@60), driven by
 - **HiDPI:** nitro logical = DIP, buffers = physical px, scale from `OutputInfo`. Since #3940 every logical size Chromium sends (`CreateWindow.size`, `CreatePopup.size`, the root/Image/Surface `SetBounds`) is the exact float `px / scale`, divided rather than multiplied by `1/scale` and not ceiled. At 1.25, `f32(px/1.25)*1.25 == px` for every integer px below 4000, so the server maps the buffer back to exactly its own size. The server snaps window roots to whole device pixels, so the buffer is drawn 1:1 (opaque copy, no resampling) at a fractional scale; see §testhost2 (#3940).
 - **Popup types:** `kPopup`/`kBubble` windows are nitro popups too; there is no subsurface equivalent. They are placed by the server, and only `kMenu` grabs.
 - **Drag and drop:** not wired. `platform_shows_drag_image=false`, and DnD start is a no-op.
-- **Clipboard:** not verified end to end.
 - **Real hardware:** not tested on a real (non-fake) backend. All numbers are fake-backend.
 - **Raster time:** not measured on the Chromium side. The server-side paint/copy cost is below.
 - **Restore after minimize:** not exercised by the harness, which has no way to un-minimize.
+
+## Clipboard (#3943)
+
+`NitroClipboard` (`nitro_clipboard.{h,cc}`, Chromium `nitro-ozone` at `6bdd793e3c`) is the `PlatformClipboard`, over the DATA ops ([wire.md § Data transfer](wire.md#data-transfer-caps-data)). The backend README in the Chromium tree has the details.
+
+- **Copy:** `SetSelection` with the `DataMap`'s types in this order: `text/plain;charset=utf-8`, `text/plain`, `UTF8_STRING`, `STRING`, `TEXT`, `text/html`, `text/uri-list`, `image/png`, then the rest (Chromium's own `chromium/x-*`). The first two are what nitro-ui clients read. The server needs keyboard focus. Without it the copy stays local and goes out on the next focus-in.
+- **Serve:** a `SelectionRequest` gets a sealed memfd. It is built on the thread pool, so an 8 MB copy never touches the UI thread.
+- **Paste:** `RequestSelection` for the mapped type (`text/plain` maps to the best offered alias, as on Wayland). The `SelectionData` fd is read on the thread pool, non-blocking, with a 5 s idle timeout and a 64 MiB cap.
+- **Ownership:** a `SelectionOffer` that isn't our expected echo means another client took the selection. The backend drops its data and fires the clipboard-changed callback, which drives Chromium's `ClipboardMonitor` observers.
+- **Primary selection:** the wire has none, so `IsSelectionBufferAvailable()` is false.
+- **Drag and drop:** not wired.
+- **Server fix found on the box:** a `SetSelection` that raced a focus-out (seen when copying 8 MB) used to be a fatal `Error { Protocol }`, which killed the browser. It is now dropped, like `SetCursor` ([wire.md § SetSelection](wire.md#setselection--0x0305)). The backend treats echoes still pending at focus-out as maybe-lost and re-offers on the next focus.
+
+`just box=testhost2 chromium-clipboard` (`deploy/chromium-clipboard.sh`) runs two browsers, nitro-term and nitro-files in a live session, and prints PASS/FAIL. On testhost2, 2026-09-29, 3 runs, all 7 checks passed each time:
+
+| check | result |
+|---|---|
+| Chromium → nitro-term (Ctrl+Shift+V) | text arrives |
+| nitro-ui textfield → Chromium | `text/plain` |
+| rich selection, browser A → browser B | `text/plain,text/html`, `<b>` kept |
+| same selection → nitro-term | plain text, no markup |
+| file copied in nitro-files → page | `Files`, `files[0].name` = the file (via `text/uri-list`) |
+| 8 MB text, A → B | all 8 388 608 bytes. B's worst `requestAnimationFrame` gap during the paste was 33–65 ms |
+| owner SIGKILLed after copying, then paste in nitro-term | nitro-term stays alive, gets an empty paste |
 
 ## Measurements
 

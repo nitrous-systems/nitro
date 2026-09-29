@@ -254,6 +254,18 @@ chromium-bench mode="oop" runs="2":
     rsync -az deploy/chromium-bench.sh deploy/scroll-bench.py {{box}}:nitro-stage/
     ssh {{box}} 'bash ~/nitro-stage/chromium-bench.sh {{mode}} {{runs}}'
 
+# Chromium clipboard end to end on the box (#3943): two browsers,
+# nitro-term and nitro-files copy and paste to each other through the DATA
+# ops; prints PASS/FAIL per check (see the script) and fails if any fail.
+# Needs `deploy-chromium` and a logged-in session; `KEEP=1` on the box
+# keeps the logs.
+[doc("Chromium clipboard end-to-end check on the box (PASS/FAIL per check)")]
+[group('dev')]
+chromium-clipboard:
+    ssh {{box}} 'mkdir -p ~/nitro-stage'
+    rsync -az deploy/chromium-clipboard.sh {{box}}:nitro-stage/
+    ssh {{box}} 'bash ~/nitro-stage/chromium-clipboard.sh'
+
 # Install/refresh the systemd unit on the box (needs sudo there). On a
 # `gdm` box there is no unit (it would fight GDM for tty2): this makes
 # the clone pushable and checks the GDM session entry instead.

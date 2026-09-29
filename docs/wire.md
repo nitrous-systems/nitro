@@ -1446,7 +1446,11 @@ selection, and the server then pushes `SelectionOffer { mimes: [] }` to
 everyone.
 
 Authorized by **keyboard focus**, not by an input serial; a client without
-it is `Error { Protocol }`. Focus is per *client*: any window of the
+it has the request **dropped** (logged, no reply, no echo). It is the
+`SetCursor` class of race: focus can leave between the client's send and
+the server's receive (Chromium hit it copying 8 MB, #3943), so it is not
+a protocol violation, and a background client still cannot replace the
+clipboard. Focus is per *client*: any window of the
 focused client may take the selection. See [Data transfer](#data-transfer-caps-data).
 
 The list is bounded: at most **64** types (`MAX_MIMES`), each **1–256**
@@ -3784,7 +3788,7 @@ to.
   | `SetCursor` | holds **pointer focus** | silently ignored — focus can legitimately leave between send and receive |
   | `CreatePopup` / `RepositionPopup` | **owns the parent** window or popup | `Error { UnknownNode }` |
   | `StartMove` / `StartResize` | holds pointer focus **and** a button is down | silently ignored, as `SetCursor` |
-  | `SetSelection` | holds **keyboard focus** | `Error { Protocol }` |
+  | `SetSelection` | holds **keyboard focus** | silently dropped, as `SetCursor` — focus can leave between send and receive (#3943) |
   | `StartDrag` | holds pointer focus **and** a button is down | silently ignored |
   | `RequestSelection { source: Drag }` | is the **current drop target** (had a `DragEnter`, no `DragLeave`, drag not finished) | `Error { Protocol }` |
 
