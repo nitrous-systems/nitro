@@ -9,13 +9,13 @@ number we watch.
 
 | crate | used by | why | cost / notes |
 |---|---|---|---|
-| `rustix` | seat, kms, server, shm, wire, demo, session, launcher, files, fs | Safe Linux syscalls (epoll, mmap, sockets + `SCM_RIGHTS`, timerfd, netlink) with no libc. The one crate that lets the rest of the tree be `unsafe`-free — with the two exceptions listed below, both of which are a *kernel* contract rather than a C one. | + `bitflags`, `linux-raw-sys` |
+| `rustix` | seat, kms, server, shm, wire, demo, session, launcher, files, fs | Safe Linux syscalls (epoll, mmap, sockets + `SCM_RIGHTS`, timerfd, netlink) with no libc. The one crate that lets the rest of the tree be `unsafe`-free — with the three exceptions listed below, all of which are a *kernel* contract rather than a C one. | + `bitflags`, `linux-raw-sys` |
 | `zerocopy` (+ `zerocopy-derive`) | wire | The wire format *is* `#[repr(C)]` layout: `U32<LittleEndian>`/`F32<LE>`/… give guaranteed little-endian fields, `Unaligned` lets a payload be decoded in place from any `&[u8]`, and `ref_from_bytes`/`as_bytes` replace the pointer casts we would otherwise write by hand. Validated, total, and `unsafe`-free in our tree. | +3 crates: `zerocopy`, `zerocopy-derive`, and **`syn` 2.x**. Note `drm` → `bytemuck_derive` pins `syn` **3.x**, so the two do *not* share a build: syn is compiled twice. **Measured and left alone** — see "`syn` is compiled twice" below; deduplicating it makes the wall-clock build *slower* on a many-core box. |
 | `drm` (+ `drm-ffi`, `drm-sys`, `drm-fourcc`) | kms | Safe wrappers over the ~30 DRM/KMS ioctls (atomic commit, dumb buffers, AddFB2, properties, events). Hand-rolling them is precisely the `unsafe` we forbid. **`drm-ffi` is named directly since #3718**, for one type: `drm_mode_modeinfo`, which `output.<c>.modeline` fills in so a user-supplied mode can be handed to the CRTC as a `MODE_ID` blob. `drm::control::Mode` is a `#[repr(transparent)]` wrapper over it with a `From` impl, so building one needs no `unsafe`; the alternative is transcribing a 68-byte kernel ABI struct by hand. **No new external name and no new lock entry** — it was already in the graph as `drm`'s own dependency, at the same 0.9.1 resolution. **Since #3895 it has a second use:** `drm_ffi::mode::get_property`, called directly because `drm`'s `get_property` drops the enum names of BITMASK properties (`rotation`), and plane discovery needs those names along with the ones for `COLOR_ENCODING`/`COLOR_RANGE`/`pixel blend mode`. It is a safe function, so this adds no `unsafe` of ours. | pulls `bytemuck` + `bytemuck_derive` → `syn` 3.x (proc-macro, compile time). `bytemuck_derive` is a *direct* dependency of `drm`, so `default-features = false` cannot drop it. Measured: see "`syn` is compiled twice" below. |
 | `signal-hook` (+ `signal-hook-registry`) | server, demo, session | SIGTERM/SIGINT → self-pipe without `unsafe` in our tree: `sigaction` and an async-signal-safe handler are exactly the shim we would otherwise have to write ourselves. `default-features = false` (no iterator/channel). The demo uses it so Ctrl-C prints its latency summary instead of killing the process mid-histogram. `nitro-session` uses it for the same reason the server does, and it is the crate's third consumer rather than a new dependency. | + `libc` (already pulled by `libseat`). Only `low_level::pipe::register` is used. |
 | `libseat` (+ `libseat-sys`) | seat | Bindings to the C libseat: one interface over logind / seatd / raw VT for DRM master + input fds without root. The single deliberate C dependency. | + `errno`, `libc`, `log`. `default-features = false`: the `custom_logger` feature builds a C shim (`cc`) to route libseat's log lines through `log`; we do not log. |
 | `input` (+ `input-sys`) | server | Bindings to libinput, which is the only sane way to read evdev: tap detection, pointer acceleration, scroll-source classification and touchpad state are thousands of lines of hard-won device quirks we are not going to re-derive. `default-features = false, features = ["libinput_1_21"]` — the `udev` feature is **off**, so `libudev` never enters the tree: the server finds devices by reading `/dev/input` and opens them through `nitro-seat`. | + `libc` (already there via `libseat`). The FFI `unsafe` lives in the dependency; `LibinputInterface` is a safe trait we implement. Input-device hotplug is M3: it needs the netlink uevent socket `nitro-kms` already has, plus a directory diff. |
-| `xkbcommon` | server | Keycode → keysym → UTF-8 with the user's own layout, dead keys, levels and modifier semantics. The alternative is shipping a keymap format and a compose engine, which is a project, not a dependency. It reads `XKB_DEFAULT_*`, so it honours whatever the user already configured. | + `xkeysym`, `memmap2`. The FFI `unsafe` (and the `mmap` of the keymap file) lives **inside the `xkbcommon` crate**, not in ours — we write none of it here, and the two exceptions our own tree does take are listed under "`unsafe` exceptions" below. |
+| `xkbcommon` | server | Keycode → keysym → UTF-8 with the user's own layout, dead keys, levels and modifier semantics. The alternative is shipping a keymap format and a compose engine, which is a project, not a dependency. It reads `XKB_DEFAULT_*`, so it honours whatever the user already configured. | + `xkeysym`, `memmap2`. The FFI `unsafe` (and the `mmap` of the keymap file) lives **inside the `xkbcommon` crate**, not in ours — we write none of it here, and the three exceptions our own tree does take are listed under "`unsafe` exceptions" below. |
 | `vte` | term | The VT/ANSI escape-sequence **state machine** (Paul Williams' DEC parser), which is a table of transitions nobody should transcribe twice: C0, CSI with its parameters and intermediates, OSC with both terminators, DCS, and UTF-8 decode across buffer boundaries. Crucially it assigns **no meaning** — it hands back `print`/`execute`/`csi_dispatch`/`osc_dispatch` and every escape sequence's *effect* is ours, in `nitro-term`'s own `vt.rs`, where it is tested. No `serde`, no allocator tricks, `default-features = false`. | **+2 crates** (`arrayvec`, `memchr`); `memchr` was already in the tree via nothing else, so it is genuinely two. The alternative is roughly 600 lines of state table and the bugs that come with hand-rolling one — and the failure mode of a wrong transition is a terminal that garbles output on a rare sequence, months later. |
 | `swash` | text | OpenType shaping, scaling and hinted glyph rasterization in one pure-Rust crate. Text is the one part of a display server nobody should write twice: the shaper alone is the OpenType GSUB/GPOS state machines, script itemization and mark attachment. Clients never see any of it — the server shapes, so the wire carries strings. | **+7 net crates** (`swash`, `skrifa`, `read-fonts`, `font-types`, `yazi`, `zeno`, `once_cell`); the other five of its seventeen (`bytemuck`, `syn`, `proc-macro2`, `quote`, `unicode-ident`) are already in our tree. **The one place untrusted bytes are parsed by a dependency** — see below. |
 
@@ -476,9 +476,10 @@ And 80 KB of `nitro-server` is not nothing against a binary this file's
 sibling `docs/budget.md` watches to the byte.
 
 The `unsafe` row is worth naming separately. This tree's deliberate
-exceptions are two and small — eleven lines in `nitro-seat` and four
-blocks in `nitro-shm`, both of them a *kernel* contract (an fd we own, a
-mapping of a file the kernel has sealed against us) with a written proof
+exceptions are three and small — eleven lines in `nitro-seat`, four
+blocks in `nitro-shm`'s `map.rs` and two `unsafe` ioctl blocks in its
+`dmabuf.rs`, all of them a *kernel* contract (an fd we own, a mapping of a
+file the kernel has sealed against us, a cache-sync ioctl on a dma-buf) with a written proof
 and tests that assert the kernel's half of it. The crate route adds 43
 sites across three dependencies, all of them in code that parses
 **untrusted bytes**, which is a different kind of risk and not one we can
@@ -488,7 +489,7 @@ pure safe Rust. Icons come from the same place fonts do — system
 directories — so the exposure is comparable, but the mitigation that made
 fonts acceptable (a malformed table is a panic, not memory corruption)
 does not hold for `flate2`, which wraps a C-shaped API even in its Rust
-backend. Ours is `unsafe_code = "deny"` with the two audited exceptions
+backend. Ours is `unsafe_code = "deny"` with the three audited exceptions
 above and none in a parser, and `tests/fuzz.rs` asserts no input panics.
 
 ### What the comparison itself bought
@@ -560,7 +561,7 @@ the syscall families it uses.
 |---|---|---|
 | `nitro-wire` | `event`, `fs`, `net`, `process` | `poll` for the blocking handshake; `memfd_create`/`fstat`/`ftruncate` (tests) and `unlinkat`/`mkdir` for the socket path; `socket`/`bind`/`listen`/`accept`/`sendmsg`/`recvmsg` + `SCM_RIGHTS`; **TCP sockets and `sockopt` (`TCP_NODELAY`, `SO_KEEPALIVE` + the three keepalive timers, `SO_REUSEADDR`) for the remote transport — the same feature, not a new one**; `getuid` for the `/tmp` fallback path |
 | `nitro-server` | `event`, `fs`, `net`, `process`, `time` | epoll loop, control socket, signals, timers, and `eventfd` for the test input source. Client buffers are **mapped, not read**, since #569 — the `mmap` lives in `nitro-shm` |
-| `nitro-shm` | `fs`, `mm` | `memfd_create`/`ftruncate`/`fcntl_add_seals`/`fcntl_get_seals`/`fstat` for sealed buffers; `mmap`/`munmap` for the one sanctioned mapping of them. The **only** crate besides `nitro-kms` that enables `mm`, and the tree's second `unsafe` exception |
+| `nitro-shm` | `fs`, `mm` | `memfd_create`/`ftruncate`/`fcntl_add_seals`/`fcntl_get_seals`/`fstat` for sealed buffers, `fstatfs` to recognise a dma-buf (#3914); `mmap`/`munmap` for the one sanctioned mapping of them; `ioctl` (no feature flag in rustix 1.x) for `DMA_BUF_IOCTL_SYNC`. The **only** crate besides `nitro-kms` that enables `mm`, and the tree's second and third `unsafe` exceptions |
 | `nitro-kms` | `event`, `fs`, `mm`, `net`, `time` | DRM fds, `mmap` of dumb buffers, udev netlink |
 | `nitro-demo` | `event`, `fs`, `process`, `time` | `poll` for the event loop; `getuid` for the `/tmp` fallback of the control-socket path; `clock_gettime` for the delivery-leg breakdown. Its image buffer comes from `nitro-shm` (sealed memfd) since #569 |
 | `nitro-ui` | `event`, `fs`, `process`, `time` | `epoll` for the app loop, `poll` for the synchronous text measurement, `Timespec` for `ui.set_timer`; `getuid`/`getpid` for the introspection socket's path. An `Image` widget's pixel buffer comes from `nitro-shm` (sealed memfd) since #569 |
@@ -574,7 +575,7 @@ the syscall families it uses.
 
 ## `unsafe` exceptions
 
-Two.
+Three.
 
 **One, in `nitro-seat`**: `close_device_fd` reclaims a device descriptor with
 `OwnedFd::from_raw_fd` so the `OwnedFd`'s own `Drop` closes it. libseat
@@ -629,6 +630,36 @@ argument is in `crates/nitro-shm/README.md`; the shape of it:
   `F_ADD_SEALS`/`F_GET_SEALS` or file-backed `mmap`; rustix's `linux_raw`
   backend is inline asm), which is why the tests assert kernel behaviour
   directly.
+
+**Three, in `nitro-shm`** (#3914, approved by the project's human in
+ask#430): server-allocated **scanout buffers**. The server allocates a
+linear dumb buffer through KMS, exports it as a PRIME dma-buf and hands
+the fd to the client, which decodes straight into it. Two pieces:
+
+- **The mapping adds no `unsafe`.** `DmaBufMapping` (the client's,
+  read/write) and `Mapping::map_dmabuf` (the server's, read-only) go
+  through `map.rs`'s `RawMap`, so the tree still has one `mmap` and one
+  `munmap`. `RawMap` now accepts a file the kernel reports as a dma-buf
+  (`fstatfs` → `DMA_BUF_MAGIC`, a property of the inode's superblock that
+  a client cannot fake) *in place of* the seal check: a dma-buf's size is
+  fixed by its exporter and the file has no truncate or `fallocate`, so
+  the `SIGBUS` hazard the seals close cannot arise. Anything else must
+  still carry the seals — which the fake backend's sealed-memfd export
+  does. The argument is in `map.rs`'s `mmap` SAFETY block.
+- **`DMA_BUF_IOCTL_SYNC`**: two `unsafe` ioctl blocks in
+  `crates/nitro-shm/src/dmabuf.rs` (`Setter::new` for the opcode/argument
+  type, and `rustix::ioctl::ioctl`), the second file in the workspace with
+  `#![allow(unsafe_code)]`. The request is `_IOW('b', 0, u64)` and the
+  kernel only reads our 8 bytes. `ENOTTY` (a memfd) is "no sync needed".
+
+The residual is the one `map.rs` already states, from the client's side:
+a client that writes outside the `START`/`END` bracket, or after
+`PresentSurface` and before `BufferReleased`, tears **its own** frame; the
+server's readers index by geometry only. Real-kernel tests are in
+`crates/nitro-shm/tests/dmabuf.rs` (memfd and ENOTTY paths; a real dma-buf
+needs a DRM or udmabuf exporter, so that half runs on hardware), and
+`tests/seals.rs` counts both files' `unsafe` blocks against every document
+that quotes them.
 
 The FFI-binding crates above (`libseat-sys`, `drm-ffi`,
 `input-sys`, `xkbcommon`) contain their own, which is exactly why each is

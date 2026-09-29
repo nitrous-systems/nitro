@@ -18,14 +18,17 @@ another process controls is the one thing in this tree that needs `unsafe`.
 |---|---|---|
 | `src/lib.rs` | no | `create_sealed`, `memfd_with`, `check_seals`, `sealed_len`, the error types |
 | `src/map.rs` | **yes**, scoped | `Mapping` (read-only), `MappingMut` (read/write), and the four `unsafe` blocks with their proofs |
+| `src/dmabuf.rs` | **yes**, scoped (#3914) | `DmaBufMapping` (a `RawMap` wrapper, no `unsafe` of its own), `sync_start`/`sync_end`, and the two `unsafe` ioctl blocks for `DMA_BUF_IOCTL_SYNC` |
 
-The workspace lint is `unsafe_code = "deny"`; `src/map.rs` carries
-`#![allow(unsafe_code)]` and nothing else in the crate does, so `unsafe`
+The workspace lint is `unsafe_code = "deny"`; `src/map.rs` and
+`src/dmabuf.rs` carry `#![allow(unsafe_code)]` and nothing else in the
+crate does, so `unsafe`
 anywhere else in it fails the build. (`Cargo.toml` must keep
 `[lints] workspace = true`, or the `deny` never applies and the `allow`
-allows nothing.) There are exactly four `unsafe` blocks in the crate
-(`mmap`, `slice::from_raw_parts`, `slice::from_raw_parts_mut`, `munmap`)
-and exactly one `mmap` and one `munmap` in the whole tree.
+allows nothing.) There are exactly four `unsafe` blocks in `map.rs`
+(`mmap`, `slice::from_raw_parts`, `slice::from_raw_parts_mut`, `munmap`),
+two `unsafe` ioctl blocks in `dmabuf.rs`, and exactly one `mmap` and one
+`munmap` in the whole tree.
 
 ## The seals, and what each one is for
 
@@ -104,9 +107,43 @@ it is acceptable" is worth more than a false total:
 4. **Memory pressure** on shmem faults is an OOM kill, not a signal on our
    thread, and is outside what seals can address.
 
+## Scanout buffers: dma-bufs (#3914)
+
+The server can hand a client a **dma-buf** — a PRIME export of a linear
+dumb buffer it allocated through KMS — for the client to decode into
+(`AllocSurfaceBuffers` in `docs/wire.md`). Both ends map it through the
+same `RawMap`: the client with `DmaBufMapping` (read/write), the server
+with `Mapping::map_dmabuf` (read-only, like every other buffer it reads).
+
+**Why no seals.** A dma-buf cannot be sealed, and does not need to be:
+its size is set by the exporter when the file is created, and the dma-buf
+file has no truncate and no `fallocate`, so nobody can make it shorter
+than a mapping of it — the property `F_SEAL_SHRINK` gives a memfd, here
+by the file's type. `RawMap` recognises a dma-buf by asking the kernel
+which filesystem the inode lives on (`fstatfs` → `DMA_BUF_MAGIC`); a
+client cannot fake that. Anything that is not a dma-buf goes through the
+seal check as before, and the fake KMS backend exports exactly such a
+sealed memfd. The size check uses `fstat`, not `lseek(SEEK_END)`: the
+file offset is shared with the client's duplicate and a check has no
+business moving it.
+
+**The sync bracket.** `sync_start(fd, access)` / `sync_end(fd, access)`
+issue `DMA_BUF_IOCTL_SYNC` (`_IOW('b', 0, u64)`, flags `START`=0,
+`END`=4, `READ`=1, `WRITE`=2) — the crate's two `unsafe` ioctl blocks,
+with their argument in `dmabuf.rs`. `ENOTTY` (a memfd, a socket) returns
+`Ok(false)`, "no sync needed"; `EINTR`/`EAGAIN` are retried. It is a
+cache-coherency hint to the exporter, not a lock.
+
+**The residual.** The same as (1) above, from the other side: a client
+that writes outside the bracket, or after `PresentSurface` and before
+`BufferReleased`, tears its own frame. The server's readers index by
+geometry only, so nothing worse follows.
+
 ## Tests
 
-`tests/seals.rs`, all real-kernel, 21 of them. The ones that carry the
+`tests/seals.rs`, all real-kernel, 25 of them, and `tests/dmabuf.rs`
+(#3914: the memfd and `ENOTTY` paths of the dma-buf mapping and sync; a
+real dma-buf needs a DRM or udmabuf exporter, exercised on hardware). The ones that carry the
 argument:
 
 - **per-seal negatives** — each required seal missing on its own is

@@ -139,6 +139,52 @@ The display controller is **not** the GPU. Planes work with no GPU driver
 loaded at all; that is what makes (b) available on the same machines as
 (a).
 
+### As built: server-allocated scanout buffers (#3914)
+
+The allocation half of (b) exists. `AllocSurfaceBuffers` (wire op
+`0x0312`, `docs/wire.md` § Server-allocated scanout buffers) asks for 1–4
+buffers for a Surface node; the server allocates each with
+`Backend::alloc_buffer` (a linear dumb buffer on DRM), reads its layout
+with `buffer_info`, exports it with `export_buffer` (PRIME, `O_RDWR`) and
+sends the fd in a `SurfaceBufferAllocated`. The client maps it
+(`nitro_shm::DmaBufMapping`), writes each frame inside a
+`DMA_BUF_IOCTL_SYNC` bracket and presents it with the ordinary
+`PresentSurface`.
+
+- **The server's CPU path is unchanged.** It maps its own duplicate of
+  the export read-only (`Mapping::map_dmabuf`) and registers the buffer in
+  the scene as an ordinary surface buffer (`ScanoutPixels`); the
+  `HeldBuffer` records the KMS `BufferId` for the planes module (#3899)
+  to find. Mapping the export was chosen over the kms dumb mapping: it
+  needs no new kms API and is the same code on the fake backend (whose
+  export is a sealed memfd).
+- **Defaults (v1).** Format 0 → `NV12` if a plane on the node's output
+  lists linear NV12, else `YUYV`, else `XR24`
+  (`surface::default_scanout_format`, which #3899 replaces). Size 0 → the
+  `SurfaceHint` size, rounded up to even.
+- **Accounting.** The buffers count against the per-client buffer and
+  byte caps like memfds; `stats` reports `scanout_buffers` and
+  `scanout_buffer_bytes`. `DestroyBuffer` and disconnect free them with
+  `free_buffer` after the scene dropped its mapping; nitro-kms defers the
+  free while the buffer is on screen.
+- **No server-side sync bracket.** The server reads without
+  `DMA_BUF_IOCTL_SYNC`. For a linear i915 dumb buffer on x86 the CPU
+  mapping is coherent (write-combined), so the bracket is a hint there and
+  the client's half is what matters. Residual: on an exporter whose CPU
+  mapping is *not* coherent, the CPU path could read stale lines of a
+  frame — a torn picture, the same class as a client writing while
+  presenting, and never more than its own window. The plane path does not
+  read the pixels on the CPU at all.
+- **Reading cost.** Dumb-buffer mappings are write-combined, so CPU
+  **reads** from them are uncached: the CPU path pays more per pixel than
+  with a memfd. On box1 that is the number in `docs/budget.md` §
+  "Server-allocated scanout buffers (#3914)"; it is a reason for #3899 to
+  put these buffers on a plane rather than composite them.
+- **Client.** `nitro-demo --video --scanout [--format nv12|yuyv|xr24]`
+  allocates its ring this way (falling back to memfds on
+  `AllocSurfaceBuffersFailed`) and draws NV12, YUYV (HSW's only
+  overlay YUV format) or XR24 at the kernel's padded pitch.
+
 ## Protocol needs
 
 | need | status |

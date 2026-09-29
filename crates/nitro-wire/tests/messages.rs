@@ -1577,6 +1577,63 @@ fn the_m5_payload_layouts_are_frozen() {
     .unwrap();
     assert_eq!(w.bytes(), &GOLDEN_IMPORT_SURFACE);
 
+    // #3914: `AllocSurfaceBuffers` (21-byte head), `SurfaceBufferAllocated`
+    // (40 bytes + 1 fd), `AllocSurfaceBuffersFailed` (9 bytes).
+    let mut w = Writer::new();
+    ClientMsg::from(AllocSurfaceBuffers {
+        node: NodeId(0x0102_0304),
+        first_id: BufferId(0x0506_0708),
+        count: 3,
+        format: format::NV12,
+        width: 1920,
+        height: 1080,
+    })
+    .encode(&mut w)
+    .unwrap();
+    assert_eq!(
+        w.bytes(),
+        &[
+            // header: len=21, op=0x0312, fds=0, flags=0
+            0x15, 0x00, 0x00, 0x00, 0x12, 0x03, 0x00, 0x00, //
+            0x04, 0x03, 0x02, 0x01, // node
+            0x08, 0x07, 0x06, 0x05, // first_id
+            0x03, // count
+            b'N', b'V', b'1', b'2', // format
+            0x80, 0x07, 0x00, 0x00, // width 1920
+            0x38, 0x04, 0x00, 0x00, // height 1080
+        ]
+    );
+    let mut w = Writer::new();
+    ServerMsg::from(SurfaceBufferAllocated {
+        node: NodeId(1),
+        id: BufferId(2),
+        format: format::YUYV,
+        width: 3,
+        height: 4,
+        size: 5,
+        offset0: 6,
+        stride0: 7,
+        offset1: 8,
+        stride1: 9,
+        fd: memfd("golden", 16),
+    })
+    .encode(&mut w)
+    .unwrap();
+    assert_eq!(&w.bytes()[..8], &[0x28, 0, 0, 0, 0x09, 0x83, 0x01, 0x00]);
+    assert_eq!(w.bytes().len(), 8 + 40);
+    let mut w = Writer::new();
+    ServerMsg::from(AllocSurfaceBuffersFailed {
+        node: NodeId(1),
+        first_id: BufferId(2),
+        reason: AllocRefusal::Format,
+    })
+    .encode(&mut w)
+    .unwrap();
+    assert_eq!(
+        w.bytes(),
+        &[0x09, 0, 0, 0, 0x0a, 0x83, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 4]
+    );
+
     let mut w = Writer::new();
     ClientMsg::from(RepositionPopup {
         id: NodeId(0x0102_0304),

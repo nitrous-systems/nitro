@@ -151,8 +151,8 @@ carries their frame's **header**. Two rules bind the sender:
 2. That call must include the bytes of that frame's header.
 
 **Both directions carry descriptors.** Until M5-A only the client did
-(`CreateBuffer`); the server now sends `Keymap` (0x8208) and
-`SelectionData` (0x8502), and the client also sends `SendSelection`
+(`CreateBuffer`); the server now sends `Keymap` (0x8208),
+`SelectionData` (0x8502) and `SurfaceBufferAllocated` (0x8309, #3914), and the client also sends `SendSelection`
 (0x0307). The two rules above are unchanged and apply to the server's
 writes exactly as to the client's — the `Writer` and `Socket::send_all`
 that implement the split are the same code in both directions. Three
@@ -268,7 +268,7 @@ containing the transaction reached the screen.
 | 13 | `RELEASE` | the server sends `BufferReleased` (M5-A) |
 | 14 | `DATA` | clipboard **and** drag-and-drop; see [Data transfer](#data-transfer-caps-data) (M5-A) |
 | 15 | `OPAQUE_REGION` | `SetOpaqueRegion` — a client may declare an image's opaque pixels (#3877) |
-| 16 | `SURFACE` | shm-backed `Surface` nodes: `CreateSurfaceBuffer`, `SetSurface`, `PresentSurface`, `SurfaceHint` (#3897); see [Surfaces](#surfaces-caps-surface) |
+| 16 | `SURFACE` | shm-backed `Surface` nodes: `CreateSurfaceBuffer`, `SetSurface`, `PresentSurface`, `SurfaceHint` (#3897), and server-allocated scanout buffers: `AllocSurfaceBuffers`, `SurfaceBufferAllocated`, `AllocSurfaceBuffersFailed` (#3914); see [Surfaces](#surfaces-caps-surface) |
 | 17 | `SHARE` | cross-client Surface sharing: `ExportSurface`, `ImportSurface`, `SurfaceExported`, `SurfaceRevoked` (#3904); see [Surface sharing](#surface-sharing-caps-share) |
 
 Bits 8–17 together are `caps::CAPS_M5_MASK`, the range
@@ -455,6 +455,7 @@ an app because one of its widgets named an icon a newer set has.
 | `OverviewRequest` | `Watch` 0, `Leave` 1, `Enter` 2, `Toggle` 3 *(shell, #3789)*, `Search` 4, `Grid` 5 *(#3790)* |
 | `ColorMatrix` | `Bt601` 0, `Bt709` 1, `Bt2020` 2 *(#3897)* |
 | `ColorRange` | `Limited` 0, `Full` 1 *(#3897)* |
+| `AllocRefusal` | `Unsupported` 1, `TooBig` 2, `Limit` 3, `Format` 4, `Failed` 5 *(#3914)* |
 | `CursorShape` (`u16`) | `None` 0, then `wp_cursor_shape_device_v1` 1–34 — see below *(M5-A)* |
 
 A value outside the list is a decode error, not a silently-ignored
@@ -603,6 +604,7 @@ Assigned in blocks of 0x100 so a block can grow without renumbering.
 | `0x030f` | `PresentSurface` | buffers (needs `SURFACE`); **not buffered** |
 | `0x0310` | `ExportSurface` | buffers (needs `SHARE`); **not buffered**, answered with `SurfaceExported` |
 | `0x0311` | `ImportSurface` | buffers (needs `SHARE`); **not buffered** |
+| `0x0312` | `AllocSurfaceBuffers` | buffers (needs `SURFACE`); **not buffered**, answered with `SurfaceBufferAllocated`s or `AllocSurfaceBuffersFailed` |
 | `0x0401` | `SetLayer` | shell (see `SHELL`) |
 | `0x0402` | `SetExclusiveZone` | shell (see `SHELL`) |
 | `0x0403` | `SetAnchor` | shell (see `SHELL`) |
@@ -648,6 +650,8 @@ Assigned in blocks of 0x100 so a block can grow without renumbering.
 | `0x8306` | `SurfaceHint` | replies about content (see `SURFACE`) |
 | `0x8307` | `SurfaceExported` | replies about content (see `SHARE`) |
 | `0x8308` | `SurfaceRevoked` | replies about content (see `SHARE`) |
+| `0x8309` | `SurfaceBufferAllocated` | replies about content (see `SURFACE`) — **carries 1 fd** |
+| `0x830a` | `AllocSurfaceBuffersFailed` | replies about content (see `SURFACE`) |
 | `0x8401` | `HotKey` | shell (see `SHELL`) |
 | `0x8402` | `WindowInfo` | shell (see `SHELL`) |
 | `0x8403` | `WindowListEnd` | shell (see `SHELL`) |
@@ -2190,6 +2194,99 @@ given. On the v1 CPU path the answer is `NV12` at the node's device size;
 the planes work (#3899) is where e.g. `YUYV` at display size on hardware
 that can only scan out packed 4:2:2 will come from.
 
+### Server-allocated scanout buffers (#3914)
+
+A client may ask the server for a small pool of **scanout-capable**
+buffers instead of making its own memfds. The server allocates linear
+dumb buffers through KMS, exports each as a dma-buf and passes the fds
+over. The client decodes straight into them and presents them with the
+ordinary `PresentSurface`/`SetSurface`; from then on they are surface
+buffers like any other — same id space, same caps, freed with
+`DestroyBuffer`. On the CPU path the server reads them exactly as it reads
+a memfd; the planes module (#3899) can put them on a hardware plane
+without a copy. No new capability bit: the three messages ride `SURFACE`.
+
+#### `AllocSurfaceBuffers` — 0x0312
+
+| field | type | meaning |
+|---|---|---|
+| `node` | `NodeId` | the `Surface` node (committed, the sender's) |
+| `first_id` | `BufferId` | ids are `first_id .. first_id + count`, in the client's buffer id space |
+| `count` | `u8` | 1..=4 |
+| `format` | `u32` | `NV12`, `YUYV`, `XR24` or `AR24`; **0 = the server's choice** |
+| `width`, `height` | `u32` | pixels; **0 = the node's hinted size** |
+
+Fixed head **21 bytes**. **Not buffered**: acted on at receipt against
+the committed scene, like `PresentSurface`. The client picks the ids so
+it can name the buffers in `PresentSurface` without a lookup.
+
+The server's choice of format (v1): `NV12` if some plane on the node's
+output lists linear NV12, else `YUYV` if one lists it, else `XR24`
+(#3899 will replace this with the planes module's answer). A 0 size takes
+the `SurfaceHint` size, rounded up to even for the YUV formats (NV12:
+both sides; YUYV: the width).
+
+**Fatal** (`Error`, the connection closes) — what a correct client never
+sends: no `SURFACE` in `ClientCaps` (`Protocol`), `count` outside 1..=4
+(`Protocol`), an unknown node (`UnknownNode`), a node that is not a
+`Surface` (`WrongKind`), an id in the range that is zero, held or pending
+(`BadBuffer`).
+
+**Refused** (`AllocSurfaceBuffersFailed`, the connection carries on) —
+everything the server merely cannot do, **all or nothing** (a failure
+part-way frees what was made):
+
+| `reason` | when |
+|---|---|
+| `Unsupported` = 1 | the backend has no scanout buffers, or the link is remote |
+| `TooBig` = 2 | a side past 8192, a buffer past the per-buffer cap, or no size given and none hinted |
+| `Limit` = 3 | the buffer-count or byte caps `CreateBuffer` counts against |
+| `Format` = 4 | not an allocatable format (e.g. `UYVY`) |
+| `Failed` = 5 | the kernel refused the allocation or the export |
+
+On a remote link the op carries no fd, so it reaches the server and is
+answered `AllocSurfaceBuffersFailed { Unsupported }` — the same fallback
+a client takes on a local server without scanout buffers — rather than the
+generic `BadBuffer` refusal of the other buffer ops.
+
+#### `SurfaceBufferAllocated` — 0x8309 — **carries 1 fd**
+
+| field | type | meaning |
+|---|---|---|
+| `node` | `NodeId` | the node the request named |
+| `id` | `BufferId` | this buffer's id |
+| `format` | `u32` | fourcc |
+| `width`, `height` | `u32` | pixels |
+| `size` | `u32` | bytes to map |
+| `offset0`, `stride0` | `u32` | plane 0 |
+| `offset1`, `stride1` | `u32` | plane 1 (NV12 chroma; 0 otherwise) |
+
+Fixed head **40 bytes**, then the descriptor. One per buffer, in id
+order, all before any other reply to later messages. The layout fields
+mean what they mean in `CreateSurfaceBuffer`, but the strides are the
+**kernel's** (a dumb buffer's pitch is 64-byte aligned, so usually wider
+than the row). Map `size` bytes `MAP_SHARED`, read/write.
+
+**The sync contract.** Bracket every CPU write with
+`DMA_BUF_IOCTL_SYNC` (`START | WRITE` before, `END | WRITE` after;
+`nitro_shm::sync_start`/`sync_end`). `ENOTTY` means the fd is not a
+dma-buf (the fake backend's memfd) and no sync is needed. Write a buffer
+only while the server does not hold it: before its first present, or
+after its `BufferReleased`. A client that writes outside the bracket or
+while the buffer is presented tears **its own** frame and nothing else.
+The server does not bracket its own reads (see `docs/surfaces.md`).
+
+#### `AllocSurfaceBuffersFailed` — 0x830a
+
+| field | type | meaning |
+|---|---|---|
+| `node` | `NodeId` | the node the request named |
+| `first_id` | `BufferId` | the request's `first_id` |
+| `reason` | `AllocRefusal` (`u8`) | the table above |
+
+Fixed head **9 bytes**. Nothing was allocated; the ids are still free.
+The client falls back to `CreateSurfaceBuffer` with its own memfds.
+
 ## Surface sharing (caps `SHARE`)
 
 A second connection may present into a `Surface` node that another
@@ -2985,6 +3082,7 @@ a remote client, is `Error { Protocol }`.
 | `SendSelection` 0x0307 | the selection **owner** | the server, once relayed (or at once if stale) | "I cannot serve that MIME type" |
 | `SelectionData` 0x8502 | relayed, not created | the **requester** | end of the data, or the refusal above |
 | `SelectionRequest` 0x8503 | — **no fd** | — | — |
+| `SurfaceBufferAllocated` 0x8309 | the server (a DRM PRIME dma-buf, `O_RDWR`; a sealed memfd on the fake backend) | the client, when it is done with the sync bracket (it may close right after mapping if it never syncs) | n/a — `size` is exact |
 
 The two `sendmsg` rules under [File descriptors](#file-descriptors) are
 unchanged and apply in both directions: one frame's descriptors per call,
@@ -3550,6 +3648,14 @@ to.
   and the server sends the two new messages only to clients that listed
   the bit. `VERSION` stays **1**; `ImportSurface`'s golden bytes are in
   `payload_layouts_are_frozen`.
+* `AllocSurfaceBuffers` (`0x0312`), `SurfaceBufferAllocated` (`0x8309`,
+  carries 1 fd) and `AllocSurfaceBuffersFailed` (`0x830a`) join behind
+  the existing `SURFACE` bit (#3914), with a new enum `AllocRefusal`. An
+  older server refuses it as an unknown op, like `SetOverview`, so a
+  client that must run against one keeps using `CreateSurfaceBuffer`
+  there. The server sends the two replies
+  only in answer to the op, so an older client never sees them.
+  `VERSION` stays **1**.
 * `SetDragIconOffset` (`0x030b`) joins the data block, for a drag icon's
   hotspot (#3851). It is a new op behind the existing `DATA` bit, so a
   client sends it only after seeing `DATA`, and an older server refuses
