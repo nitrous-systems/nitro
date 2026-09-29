@@ -172,6 +172,36 @@ The clients pay 0.5–1 KB each for the `Icon` widget and nothing for the
 artwork, which is the whole point of the server owning it: `hey` links no
 toolkit and is byte-identical.
 
+### Surface step 1: plane discovery + `TEST_ONLY` (#3895)
+
+Measured with `just footprint 60` at `cccc30e` after `just deploy` of the
+branch (md5s matched), against the baseline above.
+
+| | baseline | #3895 | delta |
+|---|---|---|---|
+| `nitro-server` bytes | 2 977 592 | 3 043 688 | **+66 096** (+2.2 %) |
+| every other binary | | | byte-identical |
+| `cargo tree` lines / external names | 89 / 37 | 89 / 37 | 0 / 0 |
+| server VmRSS / RssAnon (kB) | 18 404 / 10 388 | 18 468 / 10 452 | +64 / **+64** |
+| tree TOTAL RssAnon (kB) | 11 384 | 11 432 | +48 |
+
+The binary growth is the new `nitro-kms` code the server links but does
+not call yet. That covers the `planes` vocabulary, the DRM discovery
+(IN_FORMATS parser, enum-name reads), scanout buffers and `test_layout`,
+plus the fake backend's plane inventory and rule-based acceptor: the
+server builds `FakeBackend` for `--fake`, so it links both backends.
+Each new `Backend` method adds a vtable entry and a body per backend. No
+dependency was added: `drm_ffi::mode::get_property` was already
+reachable.
+
+The RSS delta is one 64 kB step in server RssAnon. The heap discovery
+actually holds is three `PlaneInfo`s with their format lists (about
+2 kB on the box). That is below the allocator's granularity, so the
+step is noise in the idle measurement, not a cost this change adds. No
+budget was stated before the work began, which the rule asks for; the
+budget it should have stated is "≤ 100 kB of binary, no RSS", and the
+measurement is within it.
+
 ### M4-H2: the frame's icons and the `.desktop` hop (#3715)
 
 The title bar's application icon, the three symbolic button glyphs, and
