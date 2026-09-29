@@ -40,8 +40,7 @@ use rustix::time::{
 use crate::drm::select::{ModeCandidate, ModeRequest, select_mode};
 use crate::planes::{
     BufferId, ColorEncoding, ColorRange, Fourcc, MOD_LINEAR, PlaneAssignment, PlaneConfig, PlaneId,
-    PlaneInfo, PlaneKind, PlaneSource, PlaneTrack, ScanoutBufferInfo, Verdict, Zpos,
-    rotation,
+    PlaneInfo, PlaneKind, PlaneSource, PlaneTrack, ScanoutBufferInfo, Verdict, Zpos, rotation,
 };
 use crate::{BYTES_PER_PIXEL, Backend, BufferMut, Error, Event, Image, OutputId, OutputInfo, Rect};
 
@@ -782,8 +781,7 @@ impl FakeBackend {
     /// A freed buffer that is still on screen stays here until the flip
     /// that stops using it, which is when the real backend destroys it.
     pub fn buffer(&self, id: BufferId) -> Option<(Fourcc, u32, u32)> {
-        find_buf(&self.buffers, id.0)
-            .map(|b| (b.info.format, b.info.width, b.info.height))
+        find_buf(&self.buffers, id.0).map(|b| (b.info.format, b.info.width, b.info.height))
     }
 
     /// The layout `output`'s most recent successful commit showed, flipped
@@ -1193,18 +1191,20 @@ impl Backend for FakeBackend {
             .find(|(k, _)| *k == id.0)
             .ok_or(Error::NoSuchObject("buffer", id.0))?;
         if b.memfd.is_none() {
-            let fd = nitro_shm::create_sealed("nitro-kms-fake-scanout", b.info.size).map_err(|e| {
-                Error::Io {
-                    op: "export fake scanout buffer",
-                    source: e.into(),
-                }
-            })?;
+            let fd =
+                nitro_shm::create_sealed("nitro-kms-fake-scanout", b.info.size).map_err(|e| {
+                    Error::Io {
+                        op: "export fake scanout buffer",
+                        source: e.into(),
+                    }
+                })?;
             b.memfd = Some(fd);
         }
         b.memfd
             .as_ref()
             .map_or(Err(Error::NoSuchObject("buffer", id.0)), |fd| {
-                fd.try_clone().map_err(Error::io("export fake scanout buffer"))
+                fd.try_clone()
+                    .map_err(Error::io("export fake scanout buffer"))
             })
     }
 
@@ -2101,12 +2101,24 @@ mod tests {
             .unwrap();
         b.set_plane_fence(id, p[0].id, fence()).unwrap();
         let e = b.commit(id, &[]).unwrap_err();
-        assert!(matches!(e, Error::Io { op: "atomic page flip", .. }), "{e}");
+        assert!(
+            matches!(
+                e,
+                Error::Io {
+                    op: "atomic page flip",
+                    ..
+                }
+            ),
+            "{e}"
+        );
         assert!(!b.flip_pending(id));
         assert_eq!(b.read_front(id).unwrap(), before);
         assert!(b.plane_state(id).unwrap().is_empty());
         assert!(b.damage_log().is_empty());
-        assert!(b.fence_log(id).is_empty(), "the fence was consumed, not logged");
+        assert!(
+            b.fence_log(id).is_empty(),
+            "the fence was consumed, not logged"
+        );
         assert!(b.commit_planes(id).is_err());
         // The caller falls back to the default, which goes through.
         b.set_plane_state(id, &[]).unwrap();
@@ -2143,17 +2155,17 @@ mod tests {
             &b.back_buffer(id).unwrap().data[0..4],
             &0x0022_2222u32.to_le_bytes()
         );
-        assert!(b.damage_log().is_empty(), "commit_planes is not in the damage log");
+        assert!(
+            b.damage_log().is_empty(),
+            "commit_planes is not in the damage log"
+        );
     }
 
     #[test]
     fn commit_planes_needs_a_lit_output() {
         let (mut b, id) = fake();
         assert!(matches!(b.commit_planes(id), Err(Error::NotLit(_))));
-        assert!(matches!(
-            b.set_plane_state(id, &[]),
-            Err(Error::NotLit(_))
-        ));
+        assert!(matches!(b.set_plane_state(id, &[]), Err(Error::NotLit(_))));
         b.pause();
         assert!(matches!(b.commit_planes(id), Err(Error::Paused)));
     }
@@ -2198,7 +2210,10 @@ mod tests {
         assert!(b.buffer(v).is_some(), "the replacing flip has not happened");
         b.tick(&mut Vec::new());
         assert!(b.buffer(v).is_none());
-        assert!(b.take_released_buffers().is_empty(), "freed, so not reported");
+        assert!(
+            b.take_released_buffers().is_empty(),
+            "freed, so not reported"
+        );
         // A buffer never shown goes at once.
         let x = b.alloc_buffer(Fourcc::YUYV, 64, 64).unwrap();
         b.free_buffer(x);
@@ -2216,7 +2231,10 @@ mod tests {
         assert!(b.plane_state(id).unwrap().is_empty());
         assert_eq!(b.take_released_buffers(), vec![v]);
         b.commit(id, &[]).unwrap();
-        assert!(b.plane_state(id).unwrap().is_empty(), "the staged layout went too");
+        assert!(
+            b.plane_state(id).unwrap().is_empty(),
+            "the staged layout went too"
+        );
 
         // a resize
         let spec = FakeOutputSpec::new(1920, 1080)
@@ -2290,7 +2308,11 @@ mod tests {
         b.commit_planes(id).unwrap();
         b.tick(&mut Vec::new());
         b.commit_planes(id).unwrap();
-        assert_eq!(b.fence_log(id), vec![vec![p[1].id]], "consumed by one commit");
+        assert_eq!(
+            b.fence_log(id),
+            vec![vec![p[1].id]],
+            "consumed by one commit"
+        );
     }
 
     #[test]
@@ -2298,7 +2320,10 @@ mod tests {
         let (mut b, _, _) = with_planes();
         let nv12 = b.alloc_buffer(Fourcc::NV12, 100, 50).unwrap();
         let i = b.buffer_info(nv12).unwrap();
-        assert_eq!((i.format, i.width, i.height, i.modifier), (Fourcc::NV12, 100, 50, MOD_LINEAR));
+        assert_eq!(
+            (i.format, i.width, i.height, i.modifier),
+            (Fourcc::NV12, 100, 50, MOD_LINEAR)
+        );
         assert_eq!(i.pitches, [128, 128]);
         assert_eq!(i.offsets, [0, 128 * 50]);
         assert_eq!(i.size, 128 * 75);

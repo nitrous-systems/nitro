@@ -549,7 +549,10 @@ fn show(
         println!("    freed while on screen (deferred)");
     }
     let t0 = Instant::now();
-    if let Err(e) = kms.set_plane_state(id, &[]).and_then(|()| kms.commit_planes(id)) {
+    if let Err(e) = kms
+        .set_plane_state(id, &[])
+        .and_then(|()| kms.commit_planes(id))
+    {
         println!("    back to default: ERROR: {e}");
         return;
     }
@@ -569,7 +572,10 @@ fn flip_output(kms: &mut DrmBackend<'_>, out: &OutputInfo) {
         return;
     };
     let (w, h) = (out.width, out.height);
-    println!("{} {} {w}x{h}: multi-plane flips (--flip)", out.id, out.name);
+    println!(
+        "{} {} {w}x{h}: multi-plane flips (--flip)",
+        out.id, out.name
+    );
     let yuv = |c: PlaneConfig| PlaneConfig {
         color_encoding: Some(ColorEncoding::Bt709),
         color_range: Some(ColorRange::Limited),

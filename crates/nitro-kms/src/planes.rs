@@ -589,7 +589,8 @@ impl PlaneTrack {
 
     /// Whether the screen or the commit in flight reads `id`.
     pub(crate) fn references(&self, id: BufferId) -> bool {
-        self.screen_refs.contains(&id) || self.pending_refs.as_ref().is_some_and(|p| p.contains(&id))
+        self.screen_refs.contains(&id)
+            || self.pending_refs.as_ref().is_some_and(|p| p.contains(&id))
     }
 }
 

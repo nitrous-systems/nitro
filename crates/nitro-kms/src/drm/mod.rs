@@ -1143,7 +1143,9 @@ impl<'fd> DrmBackend<'fd> {
 
     /// A live (allocated, not freed) scanout buffer.
     fn live(&self, id: BufferId) -> Option<&planes::ScanoutBuf> {
-        self.buffers.get(&id.0).filter(|_| !self.doomed.contains(&id.0))
+        self.buffers
+            .get(&id.0)
+            .filter(|_| !self.doomed.contains(&id.0))
     }
 
     /// Plane `raw`'s discovery record, when it can go on CRTC bit `bit`.
@@ -1292,9 +1294,7 @@ impl<'fd> DrmBackend<'fd> {
             let fb = match c.source {
                 PlaneSource::OutputFront => o.bufs[target].scanout_fb(o.alpha),
                 PlaneSource::Buffer(id) => {
-                    self.live(id)
-                        .ok_or(Error::NoSuchObject("buffer", id.0))?
-                        .fb
+                    self.live(id).ok_or(Error::NoSuchObject("buffer", id.0))?.fb
                 }
             };
             let fence = fences
@@ -1662,8 +1662,8 @@ impl Backend for DrmBackend<'_> {
     }
 
     fn free_buffer(&mut self, id: BufferId) {
-        let on_screen = self.outputs.iter().any(|o| o.track.references(id))
-            || self.orphan_refs.contains(&id);
+        let on_screen =
+            self.outputs.iter().any(|o| o.track.references(id)) || self.orphan_refs.contains(&id);
         if on_screen {
             if self.buffers.contains_key(&id.0) && !self.doomed.contains(&id.0) {
                 self.doomed.push(id.0);
@@ -1734,7 +1734,12 @@ impl Backend for DrmBackend<'_> {
         fence: OwnedFd,
     ) -> Result<(), Error> {
         let o = self.output(output).ok_or(Error::NoSuchOutput(output))?;
-        if self.plane_on(plane.0, 1 << o.crtc_idx)?.props.in_fence_fd.is_none() {
+        if self
+            .plane_on(plane.0, 1 << o.crtc_idx)?
+            .props
+            .in_fence_fd
+            .is_none()
+        {
             return Err(Error::Unsupported("IN_FENCE_FD on this plane"));
         }
         self.output_mut(output)?.track.set_fence(plane, fence);
@@ -1768,9 +1773,7 @@ impl Backend for DrmBackend<'_> {
             let fb = match a.source {
                 PlaneSource::OutputFront => out.bufs[out.front].scanout_fb(out.alpha),
                 PlaneSource::Buffer(id) => {
-                    self.live(id)
-                        .ok_or(Error::NoSuchObject("buffer", id.0))?
-                        .fb
+                    self.live(id).ok_or(Error::NoSuchObject("buffer", id.0))?.fb
                 }
             };
             // The optional properties. Asking for one the plane lacks (or an
