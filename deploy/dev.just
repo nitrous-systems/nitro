@@ -40,7 +40,7 @@ size windows="1":
 # Binary sizes, dep count and box idle RSS: the docs/budget.md baseline.
 [group('dev')]
 footprint secs="10":
-    FOOTPRINT_BINS="{{box_bins}} nitro-gpu" NITRO_BOX={{box}} NITRO_BOX_BINDIR='{{box_bindir}}' bash deploy/footprint.sh {{secs}}
+    FOOTPRINT_BINS="{{box_bins}} nitro-gpu-vulkan" NITRO_BOX={{box}} NITRO_BOX_BINDIR='{{box_bindir}}' bash deploy/footprint.sh {{secs}}
 
 # ---------------------------------------------------------------------------
 # Test box (see docs/testbox.md)
@@ -285,6 +285,35 @@ shot out="tmp/shot.png":
 [group('dev')]
 box-chvt n:
     ssh {{box}} 'sudo chvt {{n}}'
+
+# GPU helper pixel tests (crates/nitro-gpu-vulkan/tests/pixels.rs) on the
+# box's render node, footprint included. The working tree (not a commit)
+# is rsynced to ~/tmp/nitro-gpu-test there, so the box's clone and the
+# running session are untouched. `NITRO_GPU_TEST=require` turns "no GPU"
+# skips into failures. NV12 cases need /dev/udmabuf access (box1: yes via
+# the seat ACL; testhost2: only for the GDM seat user).
+[group('dev')]
+box-gpu-test:
+    rsync -az --delete --exclude target --exclude .git --exclude tmp ./ {{box}}:tmp/nitro-gpu-test/
+    ssh {{box}} 'cd ~/tmp/nitro-gpu-test && NITRO_GPU_TEST=require ~/.cargo/bin/cargo test --release -p nitro-gpu-vulkan -- --include-ignored --test-threads=1 --nocapture'
+
+# Regenerate the helper's SPIR-V from the GLSL next to it. Needs
+# glslangValidator (installed on both boxes; `just box=... gpu-shaders`
+# compiles there when it is missing locally). The .spv files are checked
+# in, so a normal build needs no shader compiler.
+[group('dev')]
+gpu-shaders:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd crates/nitro-gpu-vulkan/shaders
+    if command -v glslangValidator >/dev/null; then
+        for s in quad.vert rgba.frag; do glslangValidator -V --target-env vulkan1.2 -o $s.spv $s; done
+    else
+        ssh {{box}} 'mkdir -p ~/tmp/nitro-shaders'
+        scp -q quad.vert rgba.frag {{box}}:tmp/nitro-shaders/
+        ssh {{box}} 'cd ~/tmp/nitro-shaders && for s in quad.vert rgba.frag; do glslangValidator -V --target-env vulkan1.2 -o $s.spv $s; done'
+        scp -q {{box}}:tmp/nitro-shaders/quad.vert.spv {{box}}:tmp/nitro-shaders/rgba.frag.spv .
+    fi
 
 # Push the repo to the box's clone (~/src/ai/nitro on both boxes).
 [group('dev')]

@@ -8,9 +8,9 @@
 #              are already stripped (`[profile.release] strip = true`).
 #              The list comes from `just` (FOOTPRINT_BINS, built from
 #              `box_bins` in deploy/dev.just) so there is one source of
-#              truth; a name that is not built yet (nitro-gpu,
-#              nitro-video before they exist) prints `absent` rather
-#              than failing, so the row is already in the table.
+#              truth; a name that is not built prints `absent` rather
+#              than failing. `nitro-gpu-vulkan` (#3920) is the GPU
+#              helper; it is built but not yet installed on the box.
 #   deps     — the two `cargo tree` numbers docs/budget.md's "Dependency
 #              count" section defines: sorted unique lines, and distinct
 #              external crate names.
@@ -29,7 +29,7 @@ box="${NITRO_BOX:-kaspar@192.168.1.204}"
 # Where the box keeps the binaries: ~/nitro-bin (box1, `unit` profile) or
 # /usr/local/bin (testhost2, `gdm`). Expanded by the remote shell.
 bindir="${NITRO_BOX_BINDIR:-~/nitro-bin}"
-bins="${FOOTPRINT_BINS:-nitro-server nitro-gpu nitro-video}"
+bins="${FOOTPRINT_BINS:-nitro-server nitro-gpu-vulkan nitro-video}"
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 
