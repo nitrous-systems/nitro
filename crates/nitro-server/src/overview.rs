@@ -1023,7 +1023,12 @@ pub fn place_thumb_images(scene: &mut Scene, thumbs: &[ThumbState], t: f32, scal
                 (from * scale + (to - from * scale) * t).round() as i32
             }
         };
-        let device = IRect::new(at(th.start.x, slot.x), at(th.start.y, slot.y), slot.w, slot.h);
+        let device = IRect::new(
+            at(th.start.x, slot.x),
+            at(th.start.y, slot.y),
+            slot.w,
+            slot.h,
+        );
         if let Some(image) = th.image {
             let _ = scene.set_bounds(s, image, logical(device, scale));
         }
@@ -1031,7 +1036,10 @@ pub fn place_thumb_images(scene: &mut Scene, thumbs: &[ThumbState], t: f32, scal
             // The badge rides the same path unrounded, landing exactly
             // where `build_thumb_badge` puts it on an unanimated entry.
             let lerp = |a: f32, b: f32| if t >= 1.0 { b } else { a + (b - a) * t };
-            let pos = Point::new(lerp(th.start.x, th.slot.pos.x), lerp(th.start.y, th.slot.pos.y));
+            let pos = Point::new(
+                lerp(th.start.x, th.slot.pos.x),
+                lerp(th.start.y, th.slot.pos.y),
+            );
             let origin = Point::new(pos.x + th.slot.size.w / 2.0, pos.y + th.slot.size.h);
             let _ = scene.set_bounds(s, badge, Rect::new(origin.x, origin.y, 0.0, 0.0));
         }
@@ -1588,6 +1596,112 @@ mod scene_tests {
             let centre = Point::new(s.pos.x + s.size.w / 2.0, s.pos.y + s.size.h / 2.0);
             assert_eq!(hidden.slot_at(centre), None);
         }
+    }
+
+    /// Atlas-mode entry on a bare scene: every thumbnail offscreen, an
+    /// image per slot in the scrim, started at its window's centre.
+    fn enter_atlas(scene: &mut Scene, wins: &[WindowKey]) -> (Vec<ThumbState>, Option<NodeKey>) {
+        let atlas = Atlas::allocate(scene, 1000, 800).unwrap();
+        let slots = slots_for(scene, wins);
+        let scrim = create_scrim(scene, OUT, Size::new(1000.0, 800.0)).unwrap();
+        let scrim_root = scene.window_info(scrim).unwrap().root();
+        let mut thumbs = Vec::new();
+        for slot in &slots {
+            let f = scene.window_info(slot.window).unwrap().frame_rect();
+            apply_thumb(scene, slot.window, slot).unwrap();
+            scene.set_offscreen(slot.window, true).unwrap();
+            let image = build_thumb_image(scene, scrim_root, &atlas, slot, 1.0).unwrap();
+            thumbs.push(ThumbState {
+                window: slot.window,
+                slot: *slot,
+                hit: slot.rect(),
+                saved_transform: Transform::IDENTITY,
+                saved_position: None,
+                unhid: false,
+                badge: None,
+                image: Some(image),
+                start: Point::new(
+                    f.x + f.w / 2.0 - slot.size.w / 2.0,
+                    f.y + f.h / 2.0 - slot.size.h / 2.0,
+                ),
+            });
+        }
+        (thumbs, scrim_rect(scene, scrim))
+    }
+
+    fn no_scaled_image(scene: &Scene, what: &str) {
+        let mut items = Vec::new();
+        scene.paint_list(OUT, &IRect::new(0, 0, 1000, 800), &mut items);
+        let images: Vec<_> = items
+            .iter()
+            .filter(|i| matches!(i.kind, nitro_scene::PaintKind::Image { .. }))
+            .collect();
+        assert!(!images.is_empty(), "{what}: the atlas images are painted");
+        for i in images {
+            assert!(
+                i.shift_exact(),
+                "{what}: a scaled image on the output: {i:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn in_atlas_mode_the_output_paints_no_scaled_image_at_any_step() {
+        let (mut scene, wins, _) = desktop();
+        let (thumbs, scrim) = enter_atlas(&mut scene, &wins);
+        set_scrim_opacity(&mut scene, scrim, 0.0);
+        place_thumb_images(&mut scene, &thumbs, 0.0, 1.0);
+        update(&mut scene);
+        no_scaled_image(&scene, "entry");
+        for step in 1..=5u64 {
+            let t = enter_progress(step * BADGE_FADE_NS / 5);
+            set_scrim_opacity(&mut scene, scrim, t);
+            place_thumb_images(&mut scene, &thumbs, t, 1.0);
+            assert!(!update(&mut scene).is_empty(), "step {step} animates");
+            no_scaled_image(&scene, &format!("step {step}"));
+        }
+        // Settled: the images sit exactly on their slots and nothing is
+        // left dirty.
+        for t in &thumbs {
+            let b = scene.device_bounds(t.image.unwrap());
+            assert_eq!(b, slot_device_rect(&t.slot, 1.0));
+        }
+        assert!(update(&mut scene).is_empty(), "the animation goes quiet");
+    }
+
+    #[test]
+    fn a_thumbnail_s_own_change_is_offscreen_damage_inside_its_window() {
+        let (mut scene, wins, _) = desktop();
+        let (thumbs, _) = enter_atlas(&mut scene, &wins);
+        update(&mut scene);
+        let win = thumbs[0].window;
+        let content = scene.window_info(win).unwrap().content();
+        let rect = scene.node(content).unwrap().children()[0];
+        scene
+            .set_fill(CLIENT, rect, Fill::Solid(Color::rgb(0, 0, 0xff)))
+            .unwrap();
+        let mut damage = Damage::new();
+        let result = scene.update(&mut DamageSink::new(&mut [(OUT, &mut damage)]));
+        assert!(damage.is_empty(), "no output damage: {:?}", damage.rects());
+        let slot = slot_device_rect(&thumbs[0].slot, 1.0);
+        assert!(!result.offscreen.is_empty());
+        for (w, r) in &result.offscreen {
+            assert_eq!(*w, win);
+            assert!(slot.contains_rect(r), "{r:?} outside {slot:?}");
+        }
+    }
+
+    #[test]
+    fn an_atlas_is_output_sized_and_given_back() {
+        let mut scene = Scene::new();
+        let before = scene.buffer_count();
+        let atlas = Atlas::allocate(&mut scene, 1920, 1080).unwrap();
+        assert_eq!(atlas.bytes, 1920 * 1080 * 4);
+        assert_eq!(scene.buffer_count(), before + 1);
+        assert!(scene.buffer(atlas.buffer).unwrap().desc().is_opaque());
+        atlas.free(&mut scene);
+        assert_eq!(scene.buffer_count(), before);
+        assert!(Atlas::allocate(&mut scene, 0, 10).is_none());
     }
 
     #[test]

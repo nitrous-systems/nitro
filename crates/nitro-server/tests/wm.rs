@@ -4896,6 +4896,148 @@ fn an_overlay_window_still_takes_clicks_in_overview() {
     h.quit();
 }
 
+/// Two windows, parked, overview not yet entered; `tweak` configures the
+/// server (the snap fallback turns the atlas off).
+fn atlas_desktop(
+    name: &str,
+    tweak: impl FnOnce(&mut Config),
+) -> (Harness, Connection, Inbox, Win, Win) {
+    let mut h = Harness::start_with(name, OUT.0, OUT.1, tweak);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client(name);
+    let a = make_window(&mut conn, &mut inbox, 1, "a", WIN, RED, 0, 1);
+    let b = make_window(&mut conn, &mut inbox, 3, "b", WIN, GREEN, 0, 2);
+    park(&mut h);
+    (h, conn, inbox, a, b)
+}
+
+#[test]
+fn pressing_super_allocates_no_buffer() {
+    let (h, mut conn, mut inbox, _a, _b) = atlas_desktop("ov-alloc", |_| {});
+    assert_eq!(h.stat("overview_atlas"), 1);
+    assert_eq!(
+        h.stat("overview_atlas_bytes"),
+        u64::from(OUT.0) * u64::from(OUT.1) * 4,
+        "one output-sized atlas, paid at startup"
+    );
+    let before = h.stat("buffers");
+    overview(&h, true);
+    assert_eq!(h.stat("buffers"), before, "entering allocates no buffer");
+    // A window mapping relayouts the overview: still nothing allocated.
+    let _c = make_window(&mut conn, &mut inbox, 5, "c", WIN, BLUE, 0, 3);
+    wait_for("the relayout", || h.stat("overview_thumbs") == 3);
+    h.settle();
+    assert_eq!(h.stat("buffers"), before, "a relayout allocates no buffer");
+    overview(&h, false);
+    assert_eq!(h.stat("buffers"), before, "leaving frees nothing");
+    drop(conn);
+
+    h.quit();
+}
+
+#[test]
+#[allow(clippy::many_single_char_names, clippy::similar_names)] // h, a, b, x, y: as the rest of this file
+fn a_thumbnail_commit_re_renders_just_its_slot_and_is_presented() {
+    let (h, mut conn, mut inbox, a, b) = atlas_desktop("ov-render", |_| {});
+    overview(&h, true);
+    assert_eq!(h.stat("thumb_renders"), 2, "every thumbnail once on entry");
+    let slots = expected_slots(&[a, b]);
+    let shot = h.shot();
+    for (s, c) in slots.iter().zip([RED, GREEN]) {
+        let (x, y) = centre(s);
+        assert_eq!(rgb(shot.pixel(x as u32, y as u32)), to_rgb(c), "{s:?}");
+    }
+
+    // `a` repaints itself: one render, and the screen follows.
+    conn.flush().unwrap();
+    let _ = conn.poll(&mut inbox.0);
+    inbox.0.clear();
+    conn.tx().fill_solid(NodeId(2), BLUE).commit(40).unwrap();
+    conn.flush().unwrap();
+    expect(&mut conn, &mut inbox.0, "Presented", |m| match m {
+        ServerMsg::Presented(p) if p.serial == 40 => Some(()),
+        _ => None,
+    });
+    h.settle();
+    assert_eq!(h.stat("thumb_renders"), 3, "one more render, for `a` only");
+    let shot = h.shot();
+    let (x, y) = centre(&slots[0]);
+    assert_eq!(rgb(shot.pixel(x as u32, y as u32)), to_rgb(BLUE));
+    let (x, y) = centre(&slots[1]);
+    assert_eq!(rgb(shot.pixel(x as u32, y as u32)), to_rgb(GREEN));
+
+    // And a settled overview still paints nothing.
+    let frames = h.stat("frames");
+    std::thread::sleep(Duration::from_millis(120));
+    assert_eq!(h.stat("frames"), frames);
+    drop(conn);
+
+    h.quit();
+}
+
+#[test]
+#[allow(clippy::many_single_char_names, clippy::similar_names)] // h, a, b, x, y: as the rest of this file
+fn the_snap_fallback_has_no_atlas_and_still_works() {
+    let (h, conn, _inbox, a, b) = atlas_desktop("ov-snap", |c| c.overview_atlas = false);
+    assert_eq!(h.stat("overview_atlas"), 0);
+    assert_eq!(h.stat("overview_atlas_bytes"), 0);
+    overview(&h, true);
+    assert_eq!(h.stat("thumb_renders"), 0);
+    let slots = expected_slots(&[a, b]);
+    let shot = h.shot();
+    for (s, c) in slots.iter().zip([RED, GREEN]) {
+        let (x, y) = centre(s);
+        assert_eq!(rgb(shot.pixel(x as u32, y as u32)), to_rgb(c), "{s:?}");
+    }
+    drop(conn);
+
+    h.quit();
+}
+
+#[test]
+#[allow(clippy::many_single_char_names, clippy::similar_names)] // h, a, b, x, y: as the rest of this file
+fn atlas_thumbnails_match_the_snapped_ones() {
+    let shots: Vec<(Image, Vec<nitro_server::overview::Slot>)> = [true, false]
+        .into_iter()
+        .map(|atlas| {
+            let name = if atlas { "ov-px-atlas" } else { "ov-px-snap" };
+            let (h, conn, _inbox, a, b) = atlas_desktop(name, |c| c.overview_atlas = atlas);
+            overview(&h, true);
+            wait_for("the fade", || h.stat("overview_fading") == 0);
+            h.settle();
+            let shot = h.shot();
+            drop(conn);
+
+            h.quit();
+            (shot, expected_slots(&[a, b]))
+        })
+        .collect();
+    let (atlas, slots) = &shots[0];
+    let (snap, _) = &shots[1];
+    // Inside each slot, off its outermost pixels and its rounded corners.
+    let corner = 12;
+    for s in slots {
+        let (x0, y0) = (s.pos.x.ceil() as u32 + 1, s.pos.y.ceil() as u32 + 1);
+        let (x1, y1) = (
+            (s.pos.x + s.size.w).floor() as u32 - 1,
+            (s.pos.y + s.size.h).floor() as u32 - 1,
+        );
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let near = |v: u32, lo: u32, hi: u32| v < lo + corner || v + corner >= hi;
+                if near(x, x0, x1) && near(y, y0, y1) {
+                    continue;
+                }
+                let (p, q) = (atlas.pixel(x, y), snap.pixel(x, y));
+                for sh in [0, 8, 16] {
+                    let d = ((p >> sh) & 0xff).abs_diff((q >> sh) & 0xff);
+                    assert!(d <= 2, "({x}, {y}) in {s:?}: {p:06x} vs {q:06x}");
+                }
+            }
+        }
+    }
+}
+
 #[test]
 #[allow(clippy::many_single_char_names)] // h, a, b, x, y: as the rest of this file
 fn a_settled_overview_paints_nothing() {

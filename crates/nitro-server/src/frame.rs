@@ -1089,7 +1089,12 @@ pub fn paint_items(
 /// axis-aligned and not 1:1, stored with [`Canvas::blit_xrgb_scaled`]
 /// onto its device rect rounded to whole pixels. Returns `false`, having
 /// painted nothing, when it does not apply.
-fn paint_xrgb_scaled(canvas: &mut Canvas<'_>, clip: &IRect, item: &PaintItem, scene: &Scene) -> bool {
+fn paint_xrgb_scaled(
+    canvas: &mut Canvas<'_>,
+    clip: &IRect,
+    item: &PaintItem,
+    scene: &Scene,
+) -> bool {
     let PaintKind::Image {
         size, buffer, src, ..
     } = item.kind

@@ -2263,7 +2263,14 @@ impl Server {
         };
         let mut any = false;
         for (win, rect) in jobs {
-            match overview::render_thumb(&mut self.scene, &atlas, &mut paint, win, rect, (orect.x, orect.y)) {
+            match overview::render_thumb(
+                &mut self.scene,
+                &atlas,
+                &mut paint,
+                win,
+                rect,
+                (orect.x, orect.y),
+            ) {
                 Ok(us) => {
                     self.thumb_renders += 1;
                     self.thumb_render_us += us;
@@ -6461,6 +6468,56 @@ impl Server {
         protocol::modes_reply(&lines)
     }
 
+    /// The overview lines of `stats`.
+    fn overview_stats(&self, pairs: &mut Vec<(&'static str, u64)>) {
+        // Overview mode: whether one is up, and how many thumbnails it
+        // has. The scrim counts under `windows`, as the scene window it is.
+        pairs.push(("overview", u64::from(self.wm.overview().is_some())));
+        let ov = self.wm.overview();
+        pairs.push(("overview_thumbs", ov.map_or(0, |o| o.thumbs.len()) as u64));
+        pairs.push((
+            "overview_fading",
+            u64::from(ov.is_some_and(|o| o.fade_start_ns.is_some())),
+        ));
+        // Whether search results have replaced the grid (`Search`).
+        pairs.push((
+            "overview_grid_hidden",
+            u64::from(ov.is_some_and(|o| o.grid_hidden)),
+        ));
+        self.atlas_stats(pairs);
+    }
+
+    /// The thumbnail-atlas lines of `stats`.
+    fn atlas_stats(&self, pairs: &mut Vec<(&'static str, u64)>) {
+        // The thumbnail atlas (#3902): whether the output in overview (or
+        // else the first output) has one, the heap they hold, and the
+        // damage-driven re-renders into them.
+        let atlas_output = self
+            .wm
+            .overview()
+            .map(|o| o.output)
+            .or_else(|| self.outputs.first().map(|o| o.scene_id));
+        pairs.push((
+            "overview_atlas",
+            u64::from(
+                self.outputs
+                    .iter()
+                    .any(|o| Some(o.scene_id) == atlas_output && o.atlas.is_some()),
+            ),
+        ));
+        pairs.push((
+            "overview_atlas_bytes",
+            self.outputs
+                .iter()
+                .filter_map(|o| o.atlas)
+                .map(|a| a.bytes)
+                .sum(),
+        ));
+        pairs.push(("thumb_renders", self.thumb_renders));
+        pairs.push(("thumb_render_us", self.thumb_render_us));
+        pairs.push(("buffers", self.scene.buffer_count() as u64));
+    }
+
     fn stats_reply(&self) -> Vec<u8> {
         let pending = self
             .backend
@@ -6525,41 +6582,7 @@ impl Server {
             .count();
         pairs.push(("minimized", minimized as u64));
         pairs.push(("dragging", u64::from(self.wm.drag().is_some())));
-        // Overview mode: whether one is up, and how many thumbnails it
-        // has. The scrim counts under `windows`, as the scene window it is.
-        pairs.push(("overview", u64::from(self.wm.overview().is_some())));
-        let ov = self.wm.overview();
-        pairs.push(("overview_thumbs", ov.map_or(0, |o| o.thumbs.len()) as u64));
-        pairs.push((
-            "overview_fading",
-            u64::from(ov.is_some_and(|o| o.fade_start_ns.is_some())),
-        ));
-        // Whether search results have replaced the grid (`Search`).
-        pairs.push((
-            "overview_grid_hidden",
-            u64::from(ov.is_some_and(|o| o.grid_hidden)),
-        ));
-        // The thumbnail atlas (#3902): whether the output in overview (or
-        // else the first output) has one, the heap they hold, and the
-        // damage-driven re-renders into them.
-        let atlas_output = ov
-            .map(|o| o.output)
-            .or_else(|| self.outputs.first().map(|o| o.scene_id));
-        pairs.push((
-            "overview_atlas",
-            u64::from(
-                self.outputs
-                    .iter()
-                    .any(|o| Some(o.scene_id) == atlas_output && o.atlas.is_some()),
-            ),
-        ));
-        pairs.push((
-            "overview_atlas_bytes",
-            self.outputs.iter().filter_map(|o| o.atlas).map(|a| a.bytes).sum(),
-        ));
-        pairs.push(("thumb_renders", self.thumb_renders));
-        pairs.push(("thumb_render_us", self.thumb_render_us));
-        pairs.push(("buffers", self.scene.buffer_count() as u64));
+        self.overview_stats(&mut pairs);
         pairs.push(("overview_requests", self.overview_requests));
         pairs.push(("overview_watchers", self.overview_watchers.len() as u64));
         pairs.push(("focused", u64::from(self.focus.is_some())));
@@ -9940,14 +9963,7 @@ impl Server {
         // it draws on top of them. The frame roots are offscreen, so a
         // badge hung off one would not paint.
         if atlas.is_some() {
-            for t in &mut states {
-                let app_id = self
-                    .scene
-                    .window_info(t.window)
-                    .map(|i| i.app_id().to_owned())
-                    .unwrap_or_default();
-                t.badge = self.build_thumb_badge(&t.slot, &app_id, None, scrim_root);
-            }
+            self.build_scrim_badges(&mut states, scrim_root);
         }
         let scrim_rect = atlas.and_then(|_| overview::scrim_rect(&self.scene, scrim));
         info!(
@@ -9965,14 +9981,14 @@ impl Server {
         let fade_start_ns = (animate
             && !states.is_empty()
             && (atlas.is_some() || states.iter().any(|t| t.badge.is_some())))
-            .then(|| {
-                overview::set_badge_opacity(&mut self.scene, &states, 0.0);
-                if atlas.is_some() {
-                    overview::set_scrim_opacity(&mut self.scene, scrim_rect, 0.0);
-                    overview::place_thumb_images(&mut self.scene, &states, 0.0, s);
-                }
-                monotonic_ns()
-            });
+        .then(|| {
+            overview::set_badge_opacity(&mut self.scene, &states, 0.0);
+            if atlas.is_some() {
+                overview::set_scrim_opacity(&mut self.scene, scrim_rect, 0.0);
+                overview::place_thumb_images(&mut self.scene, &states, 0.0, s);
+            }
+            monotonic_ns()
+        });
         self.wm.begin_overview(overview::Overview {
             output,
             scrim,
@@ -10047,20 +10063,20 @@ impl Server {
                 }
             };
         let unhid = minimized && self.scene.set_visible(ClientId::SERVER, root, true).is_ok();
-        let (badge, image) = match (atlas, scrim_root) {
-            (Some((atlas, scale)), Some(parent)) => {
-                if let Err(e) = self.scene.set_offscreen(win, true) {
-                    warn!("taking a thumbnail offscreen: {e}");
-                }
-                let image = overview::build_thumb_image(&mut self.scene, parent, &atlas, &slot, scale)
-                    .map_err(|e| warn!("building a thumbnail image: {e}"))
-                    .ok();
-                (None, image)
+        let (badge, image) = if let (Some((atlas, scale)), Some(parent)) = (atlas, scrim_root) {
+            if let Err(e) = self.scene.set_offscreen(win, true) {
+                warn!("taking a thumbnail offscreen: {e}");
             }
-            _ => {
-                let frame = framed.then_some((root, frame_size));
-                (self.build_thumb_badge(&slot, &app_id, frame, scrim_root), None)
-            }
+            let image = overview::build_thumb_image(&mut self.scene, parent, &atlas, &slot, scale)
+                .map_err(|e| warn!("building a thumbnail image: {e}"))
+                .ok();
+            (None, image)
+        } else {
+            let frame = framed.then_some((root, frame_size));
+            (
+                self.build_thumb_badge(&slot, &app_id, frame, scrim_root),
+                None,
+            )
         };
         let r = slot.rect();
         Some(overview::ThumbState {
@@ -10074,6 +10090,23 @@ impl Server {
             image,
             start,
         })
+    }
+
+    /// Atlas mode's badges: every one in the scrim, built after every
+    /// image so it draws on top.
+    fn build_scrim_badges(
+        &mut self,
+        states: &mut [overview::ThumbState],
+        scrim_root: Option<nitro_scene::NodeKey>,
+    ) {
+        for t in states {
+            let app_id = self
+                .scene
+                .window_info(t.window)
+                .map(|i| i.app_id().to_owned())
+                .unwrap_or_default();
+            t.badge = self.build_thumb_badge(&t.slot, &app_id, None, scrim_root);
+        }
     }
 
     /// One thumbnail's badge: the app icon, drawn unscaled. Returns the
