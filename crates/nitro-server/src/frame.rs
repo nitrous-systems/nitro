@@ -112,8 +112,8 @@ use std::time::Duration;
 use nitro_core::{Color, Damage, IRect, Palette, Rect, Region};
 use nitro_kms::{BufferMut, Image, OutputId as KmsOutputId};
 use nitro_raster::{
-    Canvas, Image as RasterImage, Nv12, Overlay, Packed422, Packed422Order, PixelFormat, YuvEncoding,
-    YuvMatrix, YuvRange,
+    Canvas, Image as RasterImage, Nv12, Overlay, Packed422, Packed422Order, PixelFormat,
+    YuvEncoding, YuvMatrix, YuvRange,
 };
 use nitro_scene::{
     ColorMatrix as SceneColorMatrix, ColorRange as SceneColorRange, Fill as SceneFill, OutputId,
@@ -1100,7 +1100,12 @@ fn clip_overlay(item: &PaintItem, clip: &IRect) -> Option<Overlay> {
 /// Only a square-cornered, borderless rect with an opaque fill at opacity
 /// 1 qualifies; `false`, having painted nothing, otherwise (an image
 /// wallpaper, say: that is painted and then blended as before).
-fn fill_overlaid(canvas: &mut Canvas<'_>, clip: &IRect, item: &PaintItem, overlay: Overlay) -> bool {
+fn fill_overlaid(
+    canvas: &mut Canvas<'_>,
+    clip: &IRect,
+    item: &PaintItem,
+    overlay: Overlay,
+) -> bool {
     let PaintKind::Rect {
         fill,
         corner_radius,
@@ -2711,7 +2716,8 @@ mod overlay_tests {
             Base::None => {}
             Base::Solid | Base::Gradient => {
                 let r = s.create_node(C, NodeKind::Rect, root, None).unwrap();
-                s.set_bounds(C, r, Rect::new(0.0, 0.0, size.w, size.h)).unwrap();
+                s.set_bounds(C, r, Rect::new(0.0, 0.0, size.w, size.h))
+                    .unwrap();
                 let fill = if let Base::Solid = base {
                     SceneFill::Solid(Color::rgb(30, 60, 90))
                 } else {
@@ -2728,17 +2734,24 @@ mod overlay_tests {
                 let desc = BufferDesc::new(W, H, W * 4, format::XR24).with_opaque(true);
                 let b = s.create_buffer(C, desc, pixels(W, H, |_, _| 0)).unwrap();
                 let i = s.create_node(C, NodeKind::Image, root, None).unwrap();
-                s.set_bounds(C, i, Rect::new(0.0, 0.0, size.w, size.h)).unwrap();
-                s.set_image(C, i, Some(ImageRef::new(b, IRect::new(0, 0, W as i32, H as i32))))
+                s.set_bounds(C, i, Rect::new(0.0, 0.0, size.w, size.h))
                     .unwrap();
+                s.set_image(
+                    C,
+                    i,
+                    Some(ImageRef::new(b, IRect::new(0, 0, W as i32, H as i32))),
+                )
+                .unwrap();
             }
         }
         let ov = s.create_window(C, "scrim", size, Layer::Normal);
         s.place_window(ov, Some(OUT), Point::ZERO).unwrap();
         let root = s.window_info(ov).unwrap().root();
         let r = s.create_node(C, NodeKind::Rect, root, None).unwrap();
-        s.set_bounds(C, r, Rect::new(0.0, 0.0, size.w, size.h)).unwrap();
-        s.set_fill(C, r, SceneFill::Solid(Color::rgba(0, 0, 0, 0xA0))).unwrap();
+        s.set_bounds(C, r, Rect::new(0.0, 0.0, size.w, size.h))
+            .unwrap();
+        s.set_fill(C, r, SceneFill::Solid(Color::rgba(0, 0, 0, 0xA0)))
+            .unwrap();
         s.set_opacity(C, r, scrim).unwrap();
         for (i, (fmt, at, k)) in [
             (format::XR24, (7.3, 9.0), 0.37),
@@ -2749,7 +2762,11 @@ mod overlay_tests {
         {
             let (bw, bh) = (90u32, 70u32);
             let px = pixels(bw, bh, |x, y| {
-                if x.min(y).min(bw - 1 - x).min(bh - 1 - y) < 5 { (x * 40) as u8 } else { 255 }
+                if x.min(y).min(bw - 1 - x).min(bh - 1 - y) < 5 {
+                    (x * 40) as u8
+                } else {
+                    255
+                }
             });
             let desc = BufferDesc::new(bw, bh, bw * 4, fmt).with_opaque(fmt == format::XR24);
             let b = s.create_buffer(C, desc, px).unwrap();
@@ -2757,14 +2774,24 @@ mod overlay_tests {
             s.place_window(win, Some(OUT), Point::ZERO).unwrap();
             let root = s.window_info(win).unwrap().root();
             let g = s.create_node(C, NodeKind::Group, root, None).unwrap();
-            s.set_transform(C, g, Transform::translate(at.0, at.1).then(&Transform::scale(k, k)))
-                .unwrap();
+            s.set_transform(
+                C,
+                g,
+                Transform::translate(at.0, at.1).then(&Transform::scale(k, k)),
+            )
+            .unwrap();
             let img = s.create_node(C, NodeKind::Image, g, None).unwrap();
-            s.set_bounds(C, img, Rect::new(0.0, 0.0, bw as f32, bh as f32)).unwrap();
-            s.set_image(C, img, Some(ImageRef::new(b, IRect::new(0, 0, bw as i32, bh as i32))))
+            s.set_bounds(C, img, Rect::new(0.0, 0.0, bw as f32, bh as f32))
                 .unwrap();
+            s.set_image(
+                C,
+                img,
+                Some(ImageRef::new(b, IRect::new(0, 0, bw as i32, bh as i32))),
+            )
+            .unwrap();
             if fmt == format::AR24 {
-                s.set_opaque_region(C, img, &[IRect::new(5, 5, 80, 60)]).unwrap();
+                s.set_opaque_region(C, img, &[IRect::new(5, 5, 80, 60)])
+                    .unwrap();
             }
         }
         let mut d = Damage::new();
@@ -2816,7 +2843,15 @@ mod overlay_tests {
                 if fast && paint_xrgb_scaled(&mut canvas, clip, item, s) {
                     continue;
                 }
-                paint_item(&mut canvas, clip, item, s, &mut text, &mut icons, &Palette::default());
+                paint_item(
+                    &mut canvas,
+                    clip,
+                    item,
+                    s,
+                    &mut text,
+                    &mut icons,
+                    &Palette::default(),
+                );
             }
         }
         data
@@ -2891,6 +2926,9 @@ mod overlay_tests {
             opaque_texels_to_device(&IRect::new(10, 10, 80, 80), &src, &dst),
             Some(IRect::from_edges(16, 16, 54, 54))
         );
-        assert_eq!(opaque_texels_to_device(&IRect::new(40, 40, 2, 2), &src, &dst), None);
+        assert_eq!(
+            opaque_texels_to_device(&IRect::new(40, 40, 2, 2), &src, &dst),
+            None
+        );
     }
 }

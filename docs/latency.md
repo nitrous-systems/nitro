@@ -875,10 +875,11 @@ The first frame after idle runs at a low clock: the same 4-app open frame
 paints in 23 ms on `schedutil` and 9.6 ms on `performance`, which is the
 difference between missing one vblank and two. With thumbnails, the open
 frame is dominated by the scaled blits (`docs/wm.md` §Overview mode, the
-~57× cliff) — larger now that a thumbnail is the whole frame. Not done
-here: folding the scrim into the opaque wallpaper rect under it (a
-pre-darkened gradient; no cached buffer, the memory was rejected), which
-would save the ~2.5 ms scrim pass on the open frame.
+~57× cliff) — larger now that a thumbnail is the whole frame. #3929 then
+folded the scrim into the wallpaper's store, per row, with no cached
+buffer. It also stopped painting under an opaque gradient wallpaper and
+under snap thumbnails: the empty entry frame went from ~8 to ~2 ms on the
+box (`docs/wm.md` §Overview mode, "Snap").
 
 ## 9. ARGB shadow (#3898)
 

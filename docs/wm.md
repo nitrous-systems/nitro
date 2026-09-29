@@ -1027,22 +1027,62 @@ work area, so there is no packing. In atlas mode:
   paint takes `frame::paint_region`'s `fast_scaled` path: an opaque XR24
   thumbnail at opacity 1 goes through `Canvas::blit_xrgb_scaled`
   (~4 ns/px) instead of the general resampling blend (~12 ns/px), the
-  same path the atlas render uses. AR24 windows (translucent clients,
-  `nitro-demo`, most `nitro-ui` apps) still take the general blit.
-  Measured on box1, entry frame `paint_us`, `nitro-bench plasma` (an XR24
-  800×500 buffer) ×N, stopped so the frame is the entry alone:
+  same path the atlas render uses. An AR24 thumbnail takes it too inside
+  the opaque region its client declared (`SetOpaqueRegion`, #3877): each
+  region rect is inset one texel where it is not the crop's edge (the
+  bilinear footprint), mapped through the rounded destination and rounded
+  inward, and only those pixels are stored; the rest of the thumbnail is
+  blended as before. **No in-tree client declares a region today**
+  (`nitro-ui` windows are scene nodes, not buffers, and `nitro-demo`'s
+  AR24 images have real alpha), so this is for clients such as Chromium.
 
-  | box1, 1920×1080 | N=0 | N=4 | N=8 | N=16 |
+  **The entry frame's floor (#3929).** Profiled on box1 (`perf`, Super
+  taps with no windows), the entry frame was three full-output passes:
+  the server background (16 % of samples), the wallpaper gradient's store
+  (22 %) and the scrim's `blend_solid` (16 %), plus the shadow-to-scanout
+  copy, which is outside `paint_us`. Three changes remove two of them,
+  and none changes a pixel (`frame::overlay_tests`, byte equality against
+  a paint of every layer in full):
+
+  * **An opaque gradient occludes.** `PaintItem::opaque_cover` accepts a
+    `Fill::Linear` whose two stops are opaque, so the server background
+    under the default wallpaper is no longer painted, on any frame.
+  * **The scrim is fused.** When the item just above the clip's base is a
+    full-clip translucent solid rect (the scrim), `paint_clip` folds it into
+    the base's store with `nitro_raster::Overlay` (the same `mix`
+    arithmetic as the blend, composited once per row). The base can be
+    the background, or a solid or gradient wallpaper. An image wallpaper
+    is painted and then blended, as before. `overview::render_thumb`'s
+    backdrop uses the same fusion.
+  * **Thumbnails occlude.** In `fast_scaled` mode, every rect the fast
+    blit stores (a whole XR24 thumbnail, or an AR24 one's mapped opaque
+    region) is an exact cover. `paint_region` splits the damage along
+    them, as it already did for declared opaque regions. The result is
+    that neither the wallpaper nor the scrim is painted under a
+    thumbnail.
+
+  Measured entry frame `paint_us`, `nitro-bench plasma` (an XR24 800×500
+  buffer) ×N, stopped so the frame is the entry alone, 8 Super taps each,
+  typical range. Main is `d286a1f`, built from the same tree, and the two
+  arms run on the same box. Box1 was at 60 Hz (`schedutil`); testhost2 is
+  2560×1440 at scale 1.25 (`powersave`/`balance_performance`):
+
+  | entry frame | N=0 | N=4 | N=8 | N=16 |
   |---|---|---|---|---|
-  | before (main `8076a2d`, `ATLAS=0`) | 21–23 ms | 36–76 ms | 26–70 ms | 27–73 ms |
-  | fast snap (#3916) | 21–25 ms | 17–37 ms | 20–36 ms | 16–41 ms |
+  | box1, main | 7.7–8.6 ms | 12.6–14.7 ms | 13.6–16.0 ms | 15.2–17.1 ms |
+  | box1, #3929 | 1.9–2.6 ms | 6.9–7.5 ms | 7.2–8.0 ms | 9.2–9.8 ms |
+  | testhost2, main | 6.6–7.6 ms | 17.8–22.7 ms | 18.5–21.2 ms | 20.7–22.7 ms |
+  | testhost2, #3929 | 2.0–3.2 ms | 10.3–11.9 ms | 11.6–15.0 ms | 13.5–16.8 ms |
 
-  The thumbnails' share roughly halves, but the ~17 ms → ~6 ms estimate
-  did not hold: the entry frame has a **~21 ms floor with no windows at
-  all**, which is the full-output repaint (the wallpaper and the scrim's
-  alpha fill), not the thumbnails. That floor is the next lever and is
-  not addressed here. With AR24 `nitro-demo` windows nothing moved
-  (18–36 ms either side), as expected.
+  On box1 every N now fits in a 60 Hz frame, and N ≤ 8 fits in a 120 Hz
+  one. What remains with thumbnails is the scaled blits themselves and
+  the chrome.
+
+  > The #3916 figures (21 ms floor, 16–41 ms with windows) were taken
+  > while a stray second session (`nitro-session --help`, started by hand
+  > at 15:45) had its own wallpaper and bar connected to the box's
+  > server. Every frame painted two wallpapers. The "main" rows above
+  > were measured with it killed, so they are the fair baseline.
 
 Known, accepted differences from the snap path:
 
@@ -1073,6 +1113,16 @@ whole slot, and it is paid once on entry and then only on a thumbnail's
 own damage. An animation frame repaints the whole output, because the
 scrim fades, but only through fills, 1:1 copies and the badges: about
 4 ms against the 17 ms of the scaled grid, and inside a 60 Hz frame.
+
+On box1 at 60 Hz, the animated entry (`NITRO_OVERVIEW_ATLAS=1`) with
+8 plasma windows cost **10.4–16.3 ms** per fade frame on main. The fade
+repaints the full output: background, wallpaper, the scrim blend, then the
+1:1 copies. With #3929 the same frames cost **3.8–6.2 ms**, because the
+background is occluded and the fading scrim is fused into the wallpaper
+store at whatever opacity it has reached. On testhost2 it went from
+8.7–10.0 ms to 3.9–6.8 ms. Every frame is inside a 60 Hz frame on both
+boxes, so the per-frame cost reported in #668 is fixed. Folding the fade
+into the atlas is not needed for it.
 
 **The guards.** A scaled blit on the output is the easiest regression in
 the tree to reintroduce by accident, so overview mode carries several

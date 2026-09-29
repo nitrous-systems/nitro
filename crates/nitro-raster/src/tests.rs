@@ -3350,7 +3350,7 @@ mod dest_alpha {
 #[test]
 fn an_overlaid_opaque_fill_equals_the_fill_then_the_overlay() {
     use crate::Overlay;
-    let (w, h) = (37, 23);
+    let (cw, ch) = (37, 23);
     let full = Rect::new(0.0, 0.0, 37.0, 23.0);
     let fills = [
         Fill::Solid(Color::rgb(0x12, 0x80, 0xfe)),
@@ -3377,20 +3377,21 @@ fn an_overlaid_opaque_fill_equals_the_fill_then_the_overlay() {
             (Color::rgba(40, 90, 200, 17), 0.37),
         ] {
             for _ in 0..8 {
-                let x = iw(rng.next_u32() % w);
-                let y = iw(rng.next_u32() % h);
-                let clip = IRect::new(x, y, iw(rng.next_u32() % w), iw(rng.next_u32() % h));
-                let mut want = Surface::new(w, h);
+                let x = iw(rng.next_u32() % cw);
+                let y = iw(rng.next_u32() % ch);
+                let clip = IRect::new(x, y, iw(rng.next_u32() % cw), iw(rng.next_u32() % ch));
+                let mut want = Surface::new(cw, ch);
                 {
                     let mut c = want.canvas();
                     c.fill_rect(&clip, &full, &fill, 0.0, 1.0);
                     c.fill_rect(&clip, &full, &Fill::Solid(color), 0.0, opacity);
                 }
-                let mut got = Surface::new(w, h);
-                assert!(
-                    got.canvas()
-                        .fill_opaque_overlaid(&clip, &fill, Overlay::new(color, opacity))
-                );
+                let mut got = Surface::new(cw, ch);
+                assert!(got.canvas().fill_opaque_overlaid(
+                    &clip,
+                    &fill,
+                    Overlay::new(color, opacity)
+                ));
                 assert_eq!(got.data, want.data, "{fill:?} {color:?} {opacity} {clip:?}");
             }
         }
@@ -3410,7 +3411,11 @@ fn overlay_over_matches_fill_irect_blend_for_every_alpha() {
     use crate::Overlay;
     for a in 0..=255u8 {
         let top = Color::rgba(0x33, 0x99, 0xEE, a);
-        for base in [Color::rgb(0, 0, 0), Color::rgb(255, 255, 255), Color::rgb(7, 130, 251)] {
+        for base in [
+            Color::rgb(0, 0, 0),
+            Color::rgb(255, 255, 255),
+            Color::rgb(7, 130, 251),
+        ] {
             let mut s = Surface::new(3, 1);
             let r = IRect::new(0, 0, 3, 1);
             s.canvas().fill_irect(&r, &r, base);

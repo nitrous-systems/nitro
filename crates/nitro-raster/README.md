@@ -95,6 +95,7 @@ a fast path that skips the coverage walk entirely; see
 |---|---|
 | `fill_irect` | an integer rect in one colour; opaque colours are stored, not blended |
 | `fill_rect` | a rounded rect, anti-aliased, `Fill::Solid` or `Fill::Linear` |
+| `fill_opaque_overlaid` | an opaque `Fill` over a whole clip with an `Overlay` (a translucent colour, the overview's scrim) already composited in: one store per pixel, byte-equal to the fill then the overlay's blend (#3929) |
 | `stroke_rect_inside` | a rounded-rect border lying entirely inside the rect |
 | `blit` | an `Image` (XRGB8888 or straight-alpha ARGB8888), 1:1 or bilinear-scaled |
 | `blit_nv12` | an `Nv12` video frame into an integer rect: fused YUV → RGB + scale, stored (see [Video](#video-nv12-blit)) |
