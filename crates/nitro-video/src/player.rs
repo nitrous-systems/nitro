@@ -154,6 +154,8 @@ pub struct Player {
     frame_timer: Option<TimerId>,
     last_down_ns: u64,
     started: bool,
+    /// Re-anchor the clock at the next `Presented` (see `on_surface`).
+    calibrate: bool,
     /// Counters for `--stats`.
     pub stats: Stats,
     /// A fatal error, reported when the loop ends.
@@ -312,6 +314,7 @@ impl Player {
             frame_timer: None,
             last_down_ns: 0,
             started: false,
+            calibrate: false,
             stats: Stats::default(),
             error: None,
         })
@@ -564,6 +567,7 @@ impl Player {
         if !self.clock.is_running() {
             let first = self.ready.iter().map(|r| r.1).min().unwrap_or(0);
             self.clock.anchor(t, first);
+            self.calibrate = true;
         }
         let target = self.clock.media_at(t).unwrap_or(0);
         let pts: Vec<i64> = self.ready.iter().map(|r| r.1).collect();
@@ -618,7 +622,13 @@ impl Player {
                 if self.stats.shown.len() < 4096 {
                     self.stats.shown.push(pts_us);
                 }
-                if let Some(due) = self.clock.mono_at(pts_us)
+                // The first frame of a run calibrates the clock to when
+                // frames really reach the screen: the frame callback's
+                // deadline is the server's estimate, and anchoring on it
+                // would call every frame late by the estimate's error.
+                if std::mem::take(&mut self.calibrate) && self.clock.is_running() {
+                    self.clock.anchor(time_ns, pts_us);
+                } else if let Some(due) = self.clock.mono_at(pts_us)
                     && time_ns > due + LATE_NS
                 {
                     self.stats.late += 1;

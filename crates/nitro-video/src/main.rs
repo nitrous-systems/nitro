@@ -55,6 +55,13 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
     Ok(a)
 }
 
+/// Decoder threads: one per core up to four. libavcodec's frame threading
+/// holds a frame per thread, so its own default (one per core) costs a
+/// many-core machine tens of MB for no gain at 1080p.
+fn decode_threads() -> u32 {
+    std::thread::available_parallelism().map_or(2, |n| n.get().min(4) as u32)
+}
+
 fn main() -> ExitCode {
     let args = match parse(std::env::args().skip(1)) {
         Ok(a) => a,
@@ -64,7 +71,7 @@ fn main() -> ExitCode {
         }
     };
     let dec: Box<dyn Decoder> = match &args.file {
-        Some(f) if !args.synthetic => match LibavDecoder::open(f, 0) {
+        Some(f) if !args.synthetic => match LibavDecoder::open(f, decode_threads()) {
             Ok(d) => Box::new(d),
             Err(e) => {
                 eprintln!("nitro-video: {e}");
