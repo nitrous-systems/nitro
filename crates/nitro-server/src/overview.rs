@@ -458,6 +458,7 @@ fn window_slots(windows: &[Win], cand: &Candidate, area: &Area) -> Vec<Slot> {
 /// A constant rather than a palette role because it is a *dimming*, not
 /// a colour — it has to read the same over a light desktop and a dark
 /// one — which is also why GNOME's is not themed.
+// lint-colors: allow — a dimming, not a colour; must read the same over light and dark desktops
 pub const SCRIM: Color = Color::rgba(0, 0, 0, 0xA0);
 
 /// The app icon hanging off each thumbnail's bottom edge, logical pixels.

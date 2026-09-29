@@ -14,14 +14,16 @@ use std::process::Command;
 use nitro_seat::{ErrorKind, Seat, SeatEvent};
 
 fn rerun_with_noop(inner: &str) {
-    let status = Command::new(std::env::current_exe().unwrap())
+    let output = Command::new(std::env::current_exe().unwrap())
         .env("LIBSEAT_BACKEND", "noop")
-        .args(["--exact", inner, "--ignored", "--nocapture"])
-        .status()
+        .args(["--exact", inner, "--ignored"])
+        .output()
         .expect("re-exec test binary");
     assert!(
-        status.success(),
-        "{inner} failed under LIBSEAT_BACKEND=noop"
+        output.status.success(),
+        "{inner} failed under LIBSEAT_BACKEND=noop\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
     );
 }
 
