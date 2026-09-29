@@ -1,6 +1,6 @@
 [package]
 name = "nitro-video"
-description = "A native video player: MP4/H.264 demux, software decode through an ffmpeg child, NV12 frames into a Surface node, nitro-ui controls"
+description = "A native video player: FFmpeg demux, VA-API or software decode (system libav*), NV12 frames (shm or dma-buf) into a Surface node, nitro-ui controls"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

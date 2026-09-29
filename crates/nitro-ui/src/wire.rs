@@ -1041,6 +1041,29 @@ impl Wire {
         self.send(&ClientMsg::CreateSurfaceBuffer(buffer), NodeId::NONE)
     }
 
+    /// Queue a `CreateDmabufBuffer` into the current transaction (the
+    /// server validates it at receipt and adds it at the commit). Refused
+    /// on a remote link.
+    pub(crate) fn create_dmabuf_buffer(
+        &mut self,
+        buffer: msg::CreateDmabufBuffer,
+    ) -> Result<(), Error> {
+        if self.conn.has_caps(caps::REMOTE) {
+            return Err(Error::Wire(nitro_wire::Error::RemoteNoFds));
+        }
+        self.send(&ClientMsg::CreateDmabufBuffer(buffer), NodeId::NONE)
+    }
+
+    /// Send a `PresentSurfaceFenced` now, outside any transaction.
+    pub(crate) fn present_surface_fenced(
+        &mut self,
+        frame: msg::PresentSurface,
+        fence: std::os::fd::OwnedFd,
+    ) -> Result<(), Error> {
+        self.conn.present_surface_fenced(frame, fence)?;
+        self.flush_all()
+    }
+
     /// Send a `PresentSurface` now, outside any transaction.
     pub(crate) fn present_surface(&mut self, frame: msg::PresentSurface) -> Result<(), Error> {
         self.conn.present_surface(frame)?;

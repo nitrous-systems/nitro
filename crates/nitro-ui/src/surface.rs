@@ -51,6 +51,14 @@ pub enum SurfaceEvent {
         /// Preferred height, device pixels.
         height: u32,
     },
+    /// A `DmabufFeedback` arrived for `node` ([`NodeId::NONE`] for the
+    /// default feedback); read it with
+    /// [`Ui::dmabuf_feedback`](crate::Ui::dmabuf_feedback). Only after
+    /// [`Ui::enable_dmabuf`](crate::Ui::enable_dmabuf).
+    Feedback {
+        /// The surface node, or `NONE` for the default feedback.
+        node: NodeId,
+    },
 }
 
 /// Where an overlay child sits over the surface.

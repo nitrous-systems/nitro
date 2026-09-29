@@ -1,21 +1,29 @@
-//! `nitro-video FILE [--fullscreen] [--frames N] [--stats] [--synthetic]`.
+//! `nitro-video FILE [--fullscreen] [--frames N] [--stats] [--hwdec MODE]
+//! [--vaapi-device PATH] [--synthetic]`.
 
 use std::os::fd::AsFd as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use nitro_ui::{App, Size};
-use nitro_video::decode::{Decoder, SyntheticDecoder};
-use nitro_video::ffmpeg::LibavDecoder;
+use nitro_video::decode::{Decoder, HwDec, SyntheticDecoder};
+use nitro_video::ffmpeg;
 use nitro_video::player::{self, Opts, Player};
 
 const USAGE: &str = "usage: nitro-video FILE [--fullscreen] [--frames N] [--stats]
+                   [--hwdec auto|dmabuf|download|off] [--vaapi-device PATH]
        nitro-video --synthetic [--fullscreen] [--frames N] [--stats]
 
   --fullscreen   start fullscreen (F / F11 / double-click toggle it)
   --frames N     quit after N presented frames
   --stats        print presented/dropped/late/skipped counts on exit
   --synthetic    a generated 720p30 test stream instead of a file
+  --hwdec MODE   VA-API decode: auto (default: VA-API when the hardware
+                 takes the stream, dma-bufs when the server shows them
+                 as they are), dmabuf (always present VA surfaces, a
+                 tiled one is a placeholder until direct scanout),
+                 download (copy frames into shm), off (software)
+  --vaapi-device PATH  the render node (default /dev/dri/renderD128)
 
 keys: Space play/pause, Left/Right seek 5 s, F fullscreen, Esc leave
 fullscreen, Q quit";
@@ -24,6 +32,7 @@ struct Args {
     file: Option<PathBuf>,
     synthetic: bool,
     stats: bool,
+    device: String,
     opts: Opts,
 }
 
@@ -32,6 +41,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         file: None,
         synthetic: false,
         stats: false,
+        device: ffmpeg::DEFAULT_VAAPI_DEVICE.to_owned(),
         opts: Opts::default(),
     };
     while let Some(arg) = it.next() {
@@ -39,6 +49,11 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
             "--fullscreen" => a.opts.fullscreen = true,
             "--stats" => a.stats = true,
             "--synthetic" => a.synthetic = true,
+            "--hwdec" => {
+                let m = it.next().ok_or("--hwdec needs a mode")?;
+                a.opts.hwdec = HwDec::parse(&m)?;
+            }
+            "--vaapi-device" => a.device = it.next().ok_or("--vaapi-device needs a path")?,
             "--frames" => {
                 let n = it.next().ok_or("--frames needs a number")?;
                 a.opts.frames = n
@@ -74,9 +89,21 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let mut fallback = None;
     let dec: Box<dyn Decoder> = match &args.file {
-        Some(f) if !args.synthetic => match LibavDecoder::open(f, decode_threads()) {
-            Ok(d) => Box::new(d),
+        Some(f) if !args.synthetic => match ffmpeg::open(
+            f,
+            args.opts.hwdec,
+            &args.device,
+            decode_threads(),
+        ) {
+            Ok(o) => {
+                if let Some(why) = &o.fallback {
+                    eprintln!("nitro-video: software decode: {why}");
+                }
+                fallback = o.fallback;
+                Box::new(o.decoder)
+            }
             Err(e) => {
                 eprintln!("nitro-video: {e}");
                 return ExitCode::FAILURE;
@@ -90,7 +117,10 @@ fn main() -> ExitCode {
         |n| n.to_string_lossy().into_owned(),
     );
     let player = match Player::new(dec, args.opts) {
-        Ok(p) => p,
+        Ok(mut p) => {
+            p.set_fallback(fallback);
+            p
+        }
         Err(e) => {
             eprintln!("nitro-video: {e}");
             return ExitCode::FAILURE;
@@ -125,6 +155,11 @@ fn main() -> ExitCode {
     let mut player = player;
     let socket = nitro_ui::introspect::Socket::bind("nitro-video").ok();
     let r = nitro_ui::app::event_loop_with(&mut ui, &mut player, socket);
+    if player.decode_mode() == "vaapi-download"
+        && let Some(why) = player.fallback()
+    {
+        eprintln!("nitro-video: VA-API frames are downloaded: {why}");
+    }
     if args.stats {
         eprintln!("{}", player.summary_line());
     }

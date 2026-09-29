@@ -6,10 +6,10 @@ use std::path::Path;
 
 use nitro_ui::Size;
 use nitro_ui::test::Harness;
-use nitro_video::decode::{Decoder, Matrix, Nv12Layout, SyntheticDecoder};
+use nitro_video::decode::{Decoder, HwDec, Matrix, Nv12Layout, Output, SyntheticDecoder};
 use nitro_video::ffmpeg::LibavDecoder;
 use nitro_video::player::{self, HIDE_MS, Opts, Player, State};
-use nitro_wire::types::WindowState;
+use nitro_wire::types::{WindowState, modifier};
 
 const TINY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/tiny.mp4");
 
@@ -45,7 +45,10 @@ struct Built {
 }
 
 fn harness(frames: u32, opts: Opts) -> Built {
-    let dec = SyntheticDecoder::new(64, 36, 30, frames);
+    harness_on(SyntheticDecoder::new(64, 36, 30, frames), opts)
+}
+
+fn harness_on(dec: SyntheticDecoder, opts: Opts) -> Built {
     let info = dec.info().clone();
     let p = Player::new(Box::new(dec), opts).expect("player");
     let wake = rustix::io::dup(p.wake_fd()).expect("dup");
@@ -153,7 +156,7 @@ fn a_short_stream_ends() {
         6,
         Opts {
             frames: 0,
-            fullscreen: false,
+            ..Opts::default()
         },
     );
     let h = &mut b.h;
@@ -170,7 +173,7 @@ fn frames_limit_quits() {
         300,
         Opts {
             frames: 5,
-            fullscreen: false,
+            ..Opts::default()
         },
     );
     let h = &mut b.h;
@@ -178,4 +181,152 @@ fn frames_limit_quits() {
         h.settle();
         h.ui().should_quit()
     });
+}
+
+fn hw(pool: usize, m: u64, hwdec: HwDec) -> Built {
+    let dec = SyntheticDecoder::with_dmabuf(64, 36, 30, 3000, pool, m).expect("synthetic hw");
+    harness_on(
+        dec,
+        Opts {
+            hwdec,
+            ..Opts::default()
+        },
+    )
+}
+
+fn wait_output(h: &mut Harness<Player>) -> Output {
+    h.wait_for("the output choice", |h| {
+        h.settle();
+        h.state().output().is_some()
+    });
+    h.state().output().expect("chosen")
+}
+
+#[test]
+fn a_linear_hw_decoder_presents_its_surfaces_as_dmabufs() {
+    let mut b = hw(6, modifier::LINEAR, HwDec::Auto);
+    let h = &mut b.h;
+    assert_eq!(wait_output(h), Output::DmaBuf);
+    wait_presented(h, 20);
+    let p = h.state();
+    assert!(p.error.is_none(), "{:?}", p.error);
+    assert_eq!(p.decode_mode(), "vaapi-dmabuf");
+    assert!(p.fallback().is_none(), "{:?}", p.fallback());
+    // Each surface registered once, whatever the frame count.
+    assert!(p.buffer_count() <= 6, "{}", p.buffer_count());
+    let shown = p.stats.shown.clone();
+    assert!(shown.windows(2).all(|w| w[0] < w[1]), "{shown:?}");
+    // Seeks keep working and never over-hold the pool (the synthetic
+    // decoder errors out if the player keeps every surface).
+    h.key(nitro_ui::event::key::SPACE);
+    let (ui, p) = h.parts();
+    p.request_seek(ui, 40.0);
+    h.wait_for("the seek to land", |h| {
+        h.settle();
+        h.state().stats.shown.last() == Some(&40_000_000)
+    });
+    h.key(nitro_ui::event::key::SPACE);
+    let n = h.state().stats.presented;
+    wait_presented(h, n + 10);
+    assert!(h.state().error.is_none(), "{:?}", h.state().error);
+    assert!(h.state().buffer_count() <= 6);
+}
+
+#[test]
+fn a_big_pool_is_capped_at_the_registration_limit() {
+    let mut b = hw(30, modifier::LINEAR, HwDec::Auto);
+    let h = &mut b.h;
+    assert_eq!(wait_output(h), Output::DmaBuf);
+    wait_presented(h, 60);
+    let p = h.state();
+    assert!(p.error.is_none(), "{:?}", p.error);
+    assert_eq!(
+        p.buffer_count(),
+        nitro_video::decode::MAX_DMABUF_BUFFERS,
+        "30 surfaces round-robin fill the cap and evict"
+    );
+}
+
+#[test]
+fn a_tiled_hw_decoder_downloads_while_the_server_cannot_show_it() {
+    // The fake server imports only linear NV12 (no planes): auto and a
+    // forced dmabuf both fall back to download with a reason, and never
+    // send a CreateDmabufBuffer the server would refuse.
+    for pref in [HwDec::Auto, HwDec::DmaBuf] {
+        let mut b = hw(6, modifier::I915_Y_TILED, pref);
+        let h = &mut b.h;
+        assert_eq!(wait_output(h), Output::Shm, "{pref:?}");
+        wait_presented(h, 5);
+        let p = h.state();
+        assert!(p.error.is_none(), "{:?}", p.error);
+        assert_eq!(p.decode_mode(), "vaapi-download");
+        let why = p.fallback().expect("a reason");
+        assert!(why.contains("does not import"), "{why}");
+        assert!(p.summary_line().contains("decode=vaapi-download"));
+    }
+}
+
+#[test]
+fn download_is_honoured() {
+    let mut b = hw(6, modifier::LINEAR, HwDec::Download);
+    let h = &mut b.h;
+    assert_eq!(wait_output(h), Output::Shm);
+    wait_presented(h, 3);
+    assert!(h.state().fallback().is_none());
+}
+
+#[test]
+fn software_says_so() {
+    let mut b = harness(300, Opts::default());
+    let h = &mut b.h;
+    wait_presented(h, 3);
+    assert_eq!(h.state().decode_mode(), "software");
+    assert!(h.state().summary_line().contains("decode=software"));
+}
+
+#[test]
+fn open_falls_back_to_software_without_a_vaapi_device() {
+    let o = nitro_video::ffmpeg::open(Path::new(TINY), HwDec::Auto, "/nonexistent/renderD128", 1)
+        .expect("software fallback");
+    assert!(o.decoder.hw().is_none());
+    let why = o.fallback.expect("a reason");
+    assert!(why.contains("/nonexistent/renderD128"), "{why}");
+    let o = nitro_video::ffmpeg::open(Path::new(TINY), HwDec::Off, "/nonexistent/renderD128", 1)
+        .expect("software");
+    assert!(o.fallback.is_none());
+}
+
+/// Runs only where a VA-API device takes H.264 (skips, saying why,
+/// elsewhere — CI has no /dev/dri).
+#[test]
+fn vaapi_decodes_the_clip_like_software_when_present() {
+    let dev = nitro_video::ffmpeg::DEFAULT_VAAPI_DEVICE;
+    let mut hw = match LibavDecoder::open_hw(Path::new(TINY), dev) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skipped: no VA-API here: {e:?}");
+            return;
+        }
+    };
+    let info = hw.info().clone();
+    assert!(hw.hw().is_some());
+    let l = Nv12Layout::for_video(info.width, info.height);
+    let mut buf = vec![0; l.frame_len()];
+    let mut pts = Vec::new();
+    // Download half, dma-buf the rest: both come out in pts order.
+    while pts.len() < 15 {
+        let Some(p) = hw.next_frame(&mut buf, l).expect("download") else { break };
+        pts.push(p);
+    }
+    while let Some(f) = hw.next_dmabuf().expect("dmabuf") {
+        assert_eq!(f.desc.planes.len(), 2);
+        pts.push(f.pts_us);
+        hw.release(f.key);
+    }
+    let mut sw = LibavDecoder::open(Path::new(TINY), 1).expect("sw");
+    let mut sw_pts = Vec::new();
+    while let Some(p) = sw.next_frame(&mut buf, l).expect("decode") {
+        sw_pts.push(p);
+    }
+    assert_eq!(pts, sw_pts);
 }

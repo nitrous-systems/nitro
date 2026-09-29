@@ -393,6 +393,10 @@ pub struct Ui<S> {
     frame_requested: bool,
     /// Whether [`Ui::enable_surfaces`] asked for `SURFACE | RELEASE`.
     surfaces_wanted: bool,
+    /// Whether [`Ui::enable_dmabuf`] asked for `DMABUF` too.
+    dmabuf_wanted: bool,
+    /// The latest `DmabufFeedback` per id (0 = the default feedback).
+    dmabuf_feedback: Vec<nitro_wire::msg::DmabufFeedback>,
     /// Surface-event handlers; see [`Ui::on_surface`]. `Option` for the
     /// same reason the others are.
     surface_handlers: Vec<Option<SurfaceHandler<S>>>,
@@ -503,6 +507,8 @@ impl<S: 'static> Ui<S> {
             theme_handlers: Vec::new(),
             frame_requested: false,
             surfaces_wanted: false,
+            dmabuf_wanted: false,
+            dmabuf_feedback: Vec::new(),
             surface_handlers: Vec::new(),
             window_state: nitro_wire::types::WindowState::Normal,
             window_state_handlers: Vec::new(),
@@ -2002,6 +2008,10 @@ impl<S: 'static> Ui<S> {
             nitro_wire::types::caps::SURFACE | nitro_wire::types::caps::RELEASE
         } else {
             0
+        } | if self.dmabuf_wanted {
+            nitro_wire::types::caps::DMABUF
+        } else {
+            0
         };
         self.wire.conn_mut().client_caps(
             nitro_wire::types::caps::ICONS
@@ -3225,6 +3235,7 @@ impl<S: 'static> Ui<S> {
             ServerMsg::Presented(_)
             | ServerMsg::BufferReleased(_)
             | ServerMsg::SurfaceHint(_)
+            | ServerMsg::DmabufFeedback(_)
             | ServerMsg::WindowState(_) => self.dispatch_surface_msg(state, msg),
             ServerMsg::Error(e) => self.server_error(e),
             // The clipboard; see `crate::clipboard`.
@@ -3258,6 +3269,14 @@ impl<S: 'static> Ui<S> {
                     height: h.height,
                 },
             ),
+            ServerMsg::DmabufFeedback(f) => {
+                let node = f.id;
+                match self.dmabuf_feedback.iter_mut().find(|o| o.id == node) {
+                    Some(o) => *o = f.clone(),
+                    None => self.dmabuf_feedback.push(f.clone()),
+                }
+                self.dispatch_surface(state, &crate::surface::SurfaceEvent::Feedback { node });
+            }
             ServerMsg::WindowState(w) if w.window == WindowId::MAIN.0 => {
                 self.window_state = w.state;
                 self.dispatch_window_state(state, w.state);
@@ -4419,6 +4438,75 @@ impl<S: 'static> Ui<S> {
             && conn.has_caps(caps::SURFACE)
             && conn.has_caps(caps::RELEASE)
             && !conn.has_caps(caps::REMOTE)
+    }
+
+    /// Ask for client dma-bufs too (#3918): implies
+    /// [`Ui::enable_surfaces`] and adds `caps::DMABUF` to `ClientCaps`.
+    /// The server then sends the default
+    /// [`DmabufFeedback`](nitro_wire::msg::DmabufFeedback), announced as
+    /// [`SurfaceEvent::Feedback`](crate::surface::SurfaceEvent::Feedback)
+    /// and kept for [`Ui::dmabuf_feedback`]. Call it **before** the
+    /// window opens.
+    pub fn enable_dmabuf(&mut self) {
+        self.surfaces_wanted = true;
+        self.dmabuf_wanted = true;
+    }
+
+    /// Whether dma-bufs were asked for and granted: [`Ui::has_surfaces`]
+    /// and the server listed `DMABUF`.
+    #[must_use]
+    pub fn has_dmabuf(&self) -> bool {
+        self.dmabuf_wanted
+            && self.has_surfaces()
+            && self
+                .wire
+                .conn()
+                .has_caps(nitro_wire::types::caps::DMABUF)
+    }
+
+    /// Whether the server scans client buffers out directly
+    /// (`caps::DIRECT_SCANOUT`): a `SCANOUT`-only dma-buf is then really
+    /// shown, not a placeholder.
+    #[must_use]
+    pub fn has_direct_scanout(&self) -> bool {
+        self.wire
+            .conn()
+            .has_caps(nitro_wire::types::caps::DIRECT_SCANOUT)
+    }
+
+    /// The latest `DmabufFeedback` for `node` ([`NodeId::NONE`] / 0 for
+    /// the default feedback), if one arrived.
+    #[must_use]
+    pub fn dmabuf_feedback(&self, node: NodeId) -> Option<&nitro_wire::msg::DmabufFeedback> {
+        self.dmabuf_feedback.iter().find(|f| f.id == node)
+    }
+
+    /// Register a client-allocated dma-buf (needs [`Ui::has_dmabuf`]).
+    /// Buffered into the next commit like [`Ui::create_surface_buffer`],
+    /// so a `PresentSurface` naming it must wait for a [`Ui::flush`].
+    /// The (format, modifier) must be one the feedback lists with
+    /// `IMPORT`: anything else is a fatal `BadBuffer`.
+    ///
+    /// # Errors
+    /// `RemoteNoFds` on a remote link; a wire failure otherwise.
+    pub fn create_dmabuf_buffer(
+        &mut self,
+        buffer: nitro_wire::msg::CreateDmabufBuffer,
+    ) -> Result<(), Error> {
+        self.wire.create_dmabuf_buffer(buffer)
+    }
+
+    /// [`Ui::present_surface`] with an explicit acquire fence (a
+    /// `sync_file`); the server latches the frame once it signals.
+    ///
+    /// # Errors
+    /// A wire failure.
+    pub fn present_surface_fenced(
+        &mut self,
+        frame: nitro_wire::msg::PresentSurface,
+        fence: std::os::fd::OwnedFd,
+    ) -> Result<(), Error> {
+        self.wire.present_surface_fenced(frame, fence)
     }
 
     /// A never-used buffer id, from the counter image buffers use, for a

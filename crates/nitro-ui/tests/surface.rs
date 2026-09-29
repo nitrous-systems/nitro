@@ -162,3 +162,104 @@ fn fullscreen_is_configured_to_the_output() {
     let view = h.state().view.expect("view");
     assert_eq!(h.bounds(view).size(), Size::new(w as f32, h_ as f32));
 }
+
+#[derive(Default)]
+struct Dma {
+    view: Option<WidgetId>,
+    events: Vec<SurfaceEvent>,
+}
+
+#[test]
+fn dmabuf_feedback_arrives_and_a_linear_dmabuf_presents() {
+    use nitro_wire::msg::{CreateDmabufBuffer, DmabufPlane};
+    use nitro_wire::types::{NodeId, dmabuf_flags, modifier};
+    let mut h = Harness::sized("dmabuf", Dma::default(), Size::new(200.0, 100.0), |ui| {
+        ui.enable_dmabuf();
+        ui.on_surface(|s: &mut Dma, _ui: &mut Ui<Dma>, ev: &SurfaceEvent| s.events.push(*ev));
+        ui.build(surface_view())
+    });
+    let root = h.ui().root().expect("root");
+    h.state_mut().view = Some(root);
+    assert!(h.ui().has_surfaces());
+    assert!(h.ui().has_dmabuf());
+    h.wait_for("the default DmabufFeedback", |h| {
+        h.pump();
+        h.state()
+            .events
+            .contains(&SurfaceEvent::Feedback { node: NodeId::NONE })
+    });
+    let fb = h.ui().dmabuf_feedback(NodeId::NONE).expect("stored").clone();
+    let nv12 = fb
+        .formats
+        .iter()
+        .find(|f| f.format == format::NV12 && f.modifier == modifier::LINEAR)
+        .expect("linear NV12");
+    assert_eq!(
+        nv12.flags & (dmabuf_flags::CPU | dmabuf_flags::IMPORT),
+        dmabuf_flags::CPU | dmabuf_flags::IMPORT
+    );
+    h.settle();
+
+    // A sealed memfd stands in for a dma-buf on the fake backend.
+    let len = (W * H * 3 / 2) as usize;
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let fd = nitro_shm::create_sealed("dmabuf-test", len as u64).expect("memfd");
+        let dup = fd.try_clone().expect("dup");
+        let id = h.ui().alloc_buffer_id();
+        h.ui()
+            .create_dmabuf_buffer(CreateDmabufBuffer {
+                id,
+                width: W,
+                height: H,
+                format: format::NV12,
+                modifier: modifier::LINEAR,
+                planes: vec![
+                    DmabufPlane {
+                        fd,
+                        offset: 0,
+                        stride: W,
+                    },
+                    DmabufPlane {
+                        fd: dup,
+                        offset: W * H,
+                        stride: W,
+                    },
+                ],
+            })
+            .expect("create");
+        ids.push(id);
+    }
+    h.ui().flush().expect("flush");
+    h.settle();
+    let node = h.widget::<SurfaceView<Dma>>(root).node();
+    let present = |h: &mut Harness<Dma>, buffer| {
+        let serial = h.ui().next_serial();
+        h.ui()
+            .present_surface(PresentSurface {
+                id: node,
+                buffer,
+                serial,
+                src: IRect::new(0, 0, W.cast_signed(), H.cast_signed()),
+                matrix: ColorMatrix::Bt709,
+                range: ColorRange::Limited,
+                damage: Vec::new(),
+            })
+            .expect("present");
+        serial
+    };
+    let s1 = present(&mut h, ids[0]);
+    h.wait_for("Presented", |h| {
+        h.pump();
+        h.state()
+            .events
+            .iter()
+            .any(|e| matches!(e, SurfaceEvent::Presented { serial, .. } if *serial == s1))
+    });
+    let _ = present(&mut h, ids[1]);
+    h.wait_for("the first dma-buf released", |h| {
+        h.pump();
+        h.state().events.contains(&SurfaceEvent::Released(ids[0]))
+    });
+    assert!(h.ui().last_server_error().is_none());
+}

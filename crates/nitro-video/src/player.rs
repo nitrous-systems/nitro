@@ -8,14 +8,30 @@
 //! loop watches with [`Ui::add_fd`], so a finished frame wakes the app
 //! the way a key press does.
 //!
-//! # The ring
+//! # Buffers
 //!
-//! [`RING`] sealed memfds of one NV12 frame each: one on screen, one
-//! latched, two decoded ahead. A slot is **with the decoder** until it is
-//! filled, then **ready** (`pts`), then **queued** to the server by
-//! `PresentSurface`, and back to the decoder at `BufferReleased`. A full
-//! ring is the back-pressure: the decode thread blocks on its command
-//! channel until a slot comes back.
+//! Frames reach the server one of two ways, chosen once at start
+//! ([`crate::decode::choose_output`], #3923):
+//!
+//! - **shm**: [`RING`] sealed memfds of one NV12 frame each (one on
+//!   screen, one latched, two decoded ahead), filled by a software decoder
+//!   or downloaded from VA-API.
+//! - **dma-buf**: a VA-API decoder's own surfaces, exported as NV12
+//!   dma-bufs. Each surface is registered (`CreateDmabufBuffer`) the first
+//!   time it comes out and reused after that. At most
+//!   [`MAX_DMABUF_BUFFERS`] stay registered; past that, the least recently
+//!   used idle one is destroyed to make room. The decode thread keeps at
+//!   most [`RING`] surfaces out of the decoder's pool.
+//!
+//! Either way a buffer is **with the decoder** until it is filled, then
+//! **ready** (`pts`), then **queued** to the server by `PresentSurface`,
+//! and back to the decoder at `BufferReleased`. That is the
+//! back-pressure: the decode thread blocks on its command channel until a
+//! buffer comes back.
+//!
+//! With dma-bufs the acquire fence is implicit: the shim's export syncs
+//! the VA surface, so a frame is complete before it is presented, and the
+//! server snapshots the buffer's fences at `PresentSurface` anyway.
 //!
 //! # Pacing
 //!
@@ -36,11 +52,14 @@ use nitro_ui::event::{Handled, KeyEvent, key};
 use nitro_ui::surface::{SurfaceEvent, SurfacePointer, SurfaceView};
 use nitro_ui::widgets::{Button, Label, Slider};
 use nitro_ui::{Frame, TimerId, Ui, WidgetId};
-use nitro_wire::msg::{CreateSurfaceBuffer, PresentSurface};
+use nitro_wire::msg::{CreateDmabufBuffer, CreateSurfaceBuffer, PresentSurface};
 use nitro_wire::types::{BufferId, ColorMatrix, ColorRange, NodeId, WindowState, format};
 
 use crate::controls::{self, ICON_PAUSE, ICON_PLAY, Ids};
-use crate::decode::{Decoder, Matrix, Nv12Layout, StreamInfo};
+use crate::decode::{
+    Decoder, DmabufDesc, FrameBuf, HwDec, HwInfo, MAX_DMABUF_BUFFERS, Matrix, Nv12Layout, Output,
+    StreamInfo, choose_output,
+};
 use crate::pacing::{self, Clock};
 
 /// Buffers in the ring.
@@ -51,6 +70,9 @@ pub const HIDE_MS: u64 = 3000;
 pub const DOUBLE_CLICK_NS: u64 = 400_000_000;
 /// The seek step of the arrow keys, seconds.
 pub const STEP_SECS: f64 = 5.0;
+/// How long [`Player`] waits for the server's `DmabufFeedback` before
+/// deciding without it (download).
+const FEEDBACK_WAIT_MS: u64 = 200;
 /// A presented frame this far behind its due time counts as late.
 const LATE_NS: u64 = 20_000_000;
 
@@ -63,8 +85,10 @@ mod keys {
 /// Commands to the decode thread.
 #[derive(Debug)]
 enum Cmd {
-    /// Slot `n` is free again.
-    Free(usize),
+    /// Start decoding into `output`; `fds` are the shm ring's memfds.
+    Start { output: Output, fds: Vec<OwnedFd> },
+    /// The buffer is free again.
+    Free(FrameBuf),
     /// Restart from the keyframe before `secs`, drop frames before
     /// `secs`, and tag what follows with `generation`.
     Seek { generation: u32, secs: f64 },
@@ -75,8 +99,10 @@ enum Cmd {
 enum Msg {
     Frame {
         generation: u32,
-        slot: usize,
+        buf: FrameBuf,
         pts_us: i64,
+        /// A dma-buf frame's export (fds dropped if already registered).
+        desc: Option<DmabufDesc>,
     },
     Eof {
         generation: u32,
@@ -117,6 +143,8 @@ pub struct Opts {
     pub frames: u64,
     /// Start fullscreen.
     pub fullscreen: bool,
+    /// `--hwdec`: the output policy for a VA-API decoder.
+    pub hwdec: HwDec,
 }
 
 /// Counters for `--stats`.
@@ -146,10 +174,22 @@ pub struct Player {
     rx: Receiver<Msg>,
     wake: OwnedFd,
     thread: Option<JoinHandle<()>>,
-    /// The memfds, until [`Player::start`] registers them.
-    fds: Vec<Option<OwnedFd>>,
+    /// The decoder's hardware facts, `None` for software.
+    hw: Option<HwInfo>,
+    /// Chosen at [`Player::begin`].
+    output: Option<Output>,
+    /// Why a VA-API decoder is not presenting dma-bufs (or why VA-API
+    /// was not used at all, from [`Player::set_fallback`]).
+    fallback: Option<String>,
+    /// Waiting for the default `DmabufFeedback` to choose the output.
+    awaiting_feedback: bool,
+    /// Per buffer (index = "slot"): the frame buffer it is, its server
+    /// id, where it is, and when it was last used (dma-buf eviction).
+    keys: Vec<FrameBuf>,
     buffers: Vec<BufferId>,
     slots: Vec<Slot>,
+    used: Vec<u64>,
+    use_clock: u64,
     /// Ready frames: `(slot, pts_us)`.
     ready: Vec<(usize, i64)>,
     clock: Clock,
@@ -189,10 +229,11 @@ fn wire_matrix(m: Matrix) -> ColorMatrix {
 }
 
 /// The decode thread's body. See the module docs.
+#[allow(clippy::needless_pass_by_value)] // `dec` is the thread's to own and drop.
+#[allow(clippy::too_many_lines)] // One loop over one command channel; split, it would pass eight locals around.
 fn decode_loop(
     mut dec: Box<dyn Decoder>,
     layout: Nv12Layout,
-    fds: Vec<OwnedFd>,
     rx: &Receiver<Cmd>,
     tx: &Sender<Msg>,
     wake: &OwnedFd,
@@ -202,6 +243,32 @@ fn decode_loop(
         // Non-blocking; a full pipe already has a wakeup in it.
         let _ = rustix::io::write(wake, &[1]);
     };
+    let mut generation = 0;
+    let mut skip_before: Option<i64> = None;
+    let seek = |dec: &mut Box<dyn Decoder>,
+                g: u32,
+                secs: f64,
+                generation: &mut u32,
+                skip_before: &mut Option<i64>| {
+        *generation = g;
+        *skip_before = Some((secs * 1e6) as i64);
+        dec.seek(secs)
+    };
+    // Idle until the player has chosen the output; seeks still apply.
+    let (output, fds) = loop {
+        match rx.recv() {
+            Ok(Cmd::Start { output, fds }) => break (output, fds),
+            Ok(Cmd::Seek { generation: g, secs }) => {
+                if let Err(e) = seek(&mut dec, g, secs, &mut generation, &mut skip_before) {
+                    send(Msg::Error(e));
+                    return;
+                }
+            }
+            Ok(Cmd::Free(_)) => {}
+            Err(_) => return,
+        }
+    };
+    let dma = output == Output::DmaBuf;
     let mut maps = Vec::with_capacity(fds.len());
     for fd in &fds {
         match MappingMut::map_mut(fd.as_fd(), layout.frame_len()) {
@@ -214,11 +281,12 @@ fn decode_loop(
     }
     drop(fds);
     let mut free: Vec<usize> = (0..maps.len()).rev().collect();
-    let mut generation = 0;
-    let mut skip_before: Option<i64> = None;
+    // dma-buf frames out of the decoder's pool, with the player.
+    let mut held = 0usize;
     let mut eof = false;
     loop {
-        let cmd = if eof || free.is_empty() {
+        let full = if dma { held >= RING } else { free.is_empty() };
+        let cmd = if eof || full {
             match rx.recv() {
                 Ok(c) => Some(c),
                 Err(_) => return,
@@ -231,32 +299,49 @@ fn decode_loop(
             }
         };
         match cmd {
-            Some(Cmd::Free(i)) => free.push(i),
-            Some(Cmd::Seek {
-                generation: g,
-                secs,
-            }) => {
-                generation = g;
+            Some(Cmd::Free(FrameBuf::Shm(i))) => free.push(i),
+            Some(Cmd::Free(FrameBuf::DmaBuf(k))) => {
+                dec.release(k);
+                held = held.saturating_sub(1);
+            }
+            Some(Cmd::Start { .. }) => {}
+            Some(Cmd::Seek { generation: g, secs }) => {
                 eof = false;
-                skip_before = Some((secs * 1e6) as i64);
-                if let Err(e) = dec.seek(secs) {
+                if let Err(e) = seek(&mut dec, g, secs, &mut generation, &mut skip_before) {
                     send(Msg::Error(e));
                     return;
                 }
             }
             None => {
-                let slot = free[free.len() - 1];
-                match dec.next_frame(maps[slot].as_bytes_mut(), layout) {
-                    Ok(Some(pts_us)) => {
+                let r = if dma {
+                    dec.next_dmabuf().map(|f| {
+                        f.map(|f| (f.pts_us, FrameBuf::DmaBuf(f.key), Some(f.desc)))
+                    })
+                } else {
+                    let slot = free[free.len() - 1];
+                    dec.next_frame(maps[slot].as_bytes_mut(), layout)
+                        .map(|p| p.map(|p| (p, FrameBuf::Shm(slot), None)))
+                };
+                match r {
+                    Ok(Some((pts_us, buf, export))) => {
                         if skip_before.is_some_and(|t| pts_us < t) {
+                            if let FrameBuf::DmaBuf(k) = buf {
+                                dec.release(k);
+                            }
                             continue;
                         }
                         skip_before = None;
-                        free.pop();
+                        match buf {
+                            FrameBuf::Shm(_) => {
+                                free.pop();
+                            }
+                            FrameBuf::DmaBuf(_) => held += 1,
+                        }
                         send(Msg::Frame {
                             generation,
-                            slot,
+                            buf,
                             pts_us,
+                            desc: export,
                         });
                     }
                     Ok(None) => {
@@ -274,22 +359,15 @@ fn decode_loop(
 }
 
 impl Player {
-    /// Allocate the ring and start the decode thread on `dec`.
+    /// Start the decode thread on `dec`; it waits for the output choice
+    /// [`install`] makes once the window is open.
     ///
     /// # Errors
-    /// A memfd, pipe or thread failure.
+    /// A pipe or thread failure.
     pub fn new(dec: Box<dyn Decoder>, opts: Opts) -> Result<Self, String> {
         let info = dec.info().clone();
+        let hw = dec.hw();
         let layout = Nv12Layout::for_video(info.width, info.height);
-        let len = layout.frame_len();
-        let mut mine = Vec::with_capacity(RING);
-        let mut theirs = Vec::with_capacity(RING);
-        for _ in 0..RING {
-            let fd = nitro_shm::create_sealed("nitro-video", len as u64)
-                .map_err(|e| format!("memfd: {e}"))?;
-            theirs.push(rustix::io::dup(&fd).map_err(|e| format!("dup: {e}"))?);
-            mine.push(Some(fd));
-        }
         let (wake_r, wake_w) = rustix::pipe::pipe_with(
             rustix::pipe::PipeFlags::CLOEXEC | rustix::pipe::PipeFlags::NONBLOCK,
         )
@@ -298,7 +376,7 @@ impl Player {
         let (mtx, mrx) = mpsc::channel();
         let thread = std::thread::Builder::new()
             .name("nitro-video-decode".to_owned())
-            .spawn(move || decode_loop(dec, layout, theirs, &crx, &mtx, &wake_w))
+            .spawn(move || decode_loop(dec, layout, &crx, &mtx, &wake_w))
             .map_err(|e| format!("decode thread: {e}"))?;
         Ok(Self {
             opts,
@@ -308,9 +386,15 @@ impl Player {
             rx: mrx,
             wake: wake_r,
             thread: Some(thread),
-            fds: mine,
+            hw,
+            output: None,
+            fallback: None,
+            awaiting_feedback: false,
+            keys: Vec::new(),
             buffers: Vec::new(),
-            slots: vec![Slot::Decoder; RING],
+            slots: Vec::new(),
+            used: Vec::new(),
+            use_clock: 0,
             ready: Vec::new(),
             clock: Clock::new(1_000_000),
             state: State::Playing,
@@ -361,21 +445,61 @@ impl Player {
         self.ids
     }
 
+    /// Note why VA-API is not used (from [`crate::ffmpeg::open`]), for
+    /// the `--stats` line.
+    pub fn set_fallback(&mut self, why: Option<String>) {
+        self.fallback = why;
+    }
+
+    /// Why VA-API is not used, or not with dma-bufs.
+    #[must_use]
+    pub fn fallback(&self) -> Option<&str> {
+        self.fallback.as_deref()
+    }
+
+    /// The output chosen at start; `None` before.
+    #[must_use]
+    pub fn output(&self) -> Option<Output> {
+        self.output
+    }
+
+    /// Buffers registered with the server (tests).
+    #[must_use]
+    pub fn buffer_count(&self) -> usize {
+        self.buffers.len()
+    }
+
+    /// `software`, `vaapi-download` or `vaapi-dmabuf`.
+    #[must_use]
+    pub fn decode_mode(&self) -> &'static str {
+        match (self.hw, self.output) {
+            (None, _) => "software",
+            (Some(_), Some(Output::DmaBuf)) => "vaapi-dmabuf",
+            (Some(_), _) => "vaapi-download",
+        }
+    }
+
     /// The `--stats` line.
     #[must_use]
     pub fn summary_line(&self) -> String {
         let s = &self.stats;
-        format!(
-            "video: {}x{} {} sent={} presented={} dropped={} late={} skipped={}",
+        let mut line = format!(
+            "video: {}x{} {} decode={} buffers={} sent={} presented={} dropped={} late={} skipped={}",
             self.info.width,
             self.info.height,
             self.info.codec,
+            self.decode_mode(),
+            self.buffers.len(),
             s.sent,
             s.presented,
             s.dropped,
             s.late,
             s.skipped
-        )
+        );
+        if let Some(f) = &self.fallback {
+            line = format!("{line} fallback=\"{f}\"");
+        }
+        line
     }
 
     // -- setup --------------------------------------------------------
@@ -394,27 +518,16 @@ impl Player {
             );
             return;
         }
-        let l = self.layout;
-        for fd in &mut self.fds {
-            let Some(fd) = fd.take() else { continue };
-            let id = ui.alloc_buffer_id();
-            let r = ui.create_surface_buffer(CreateSurfaceBuffer {
-                id,
-                width: l.width,
-                height: l.height,
-                format: format::NV12,
-                size: l.frame_len() as u32,
-                offset0: 0,
-                stride0: l.width,
-                offset1: l.luma_len() as u32,
-                stride1: l.width,
-                fd,
-            });
-            if let Err(e) = r {
-                self.fail(ui, format!("registering a frame buffer: {e}"));
-                return;
-            }
-            self.buffers.push(id);
+        // A hardware decoder that may present dma-bufs needs the server's
+        // feedback to choose; it comes right after the window opens.
+        let may_dma = self.hw.is_some()
+            && matches!(self.opts.hwdec, HwDec::Auto | HwDec::DmaBuf)
+            && ui.has_dmabuf();
+        if may_dma && ui.dmabuf_feedback(NodeId::NONE).is_none() {
+            self.awaiting_feedback = true;
+            ui.set_timer(FEEDBACK_WAIT_MS, |p: &mut Self, ui: &mut Ui<Self>| p.begin(ui));
+        } else {
+            self.begin(ui);
         }
         if self.opts.fullscreen {
             let _ = ui.set_window_state(WindowState::Fullscreen);
@@ -424,6 +537,126 @@ impl Player {
         self.arm_hide(ui);
         self.tick(ui);
         let _ = ui.request_frame();
+    }
+
+    /// Choose the output and start the decode thread on it: once, when
+    /// the default feedback arrived or waiting for it timed out.
+    fn begin(&mut self, ui: &mut Ui<Self>) {
+        if self.output.is_some() || self.error.is_some() {
+            return;
+        }
+        self.awaiting_feedback = false;
+        let (output, why) = choose_output(
+            self.opts.hwdec,
+            self.hw,
+            ui.has_dmabuf(),
+            ui.has_direct_scanout(),
+            ui.dmabuf_feedback(NodeId::NONE)
+                .map(|f| f.formats.as_slice()),
+        );
+        if why.is_some() {
+            self.fallback = why;
+        }
+        self.output = Some(output);
+        let mut theirs = Vec::new();
+        if output == Output::Shm {
+            let l = self.layout;
+            for i in 0..RING {
+                let r = nitro_shm::create_sealed("nitro-video", l.frame_len() as u64)
+                    .map_err(|e| format!("memfd: {e}"))
+                    .and_then(|fd| {
+                        let dup = rustix::io::dup(&fd).map_err(|e| format!("dup: {e}"))?;
+                        Ok((fd, dup))
+                    });
+                let (fd, dup) = match r {
+                    Ok(p) => p,
+                    Err(e) => return self.fail(ui, e),
+                };
+                theirs.push(dup);
+                let id = ui.alloc_buffer_id();
+                let r = ui.create_surface_buffer(CreateSurfaceBuffer {
+                    id,
+                    width: l.width,
+                    height: l.height,
+                    format: format::NV12,
+                    size: l.frame_len() as u32,
+                    offset0: 0,
+                    stride0: l.width,
+                    offset1: l.luma_len() as u32,
+                    stride1: l.width,
+                    fd,
+                });
+                if let Err(e) = r {
+                    self.fail(ui, format!("registering a frame buffer: {e}"));
+                    return;
+                }
+                self.keys.push(FrameBuf::Shm(i));
+                self.buffers.push(id);
+                self.slots.push(Slot::Decoder);
+                self.used.push(0);
+            }
+            let _ = ui.flush();
+        }
+        let _ = self.tx.send(Cmd::Start {
+            output,
+            fds: theirs,
+        });
+    }
+
+    /// The index of dma-buf surface `key`, registering it (and making
+    /// room under [`MAX_DMABUF_BUFFERS`]) the first time it is seen.
+    fn dmabuf_index(
+        &mut self,
+        ui: &mut Ui<Self>,
+        key: u32,
+        desc: Option<DmabufDesc>,
+    ) -> Result<usize, String> {
+        if let Some(i) = self.keys.iter().position(|k| *k == FrameBuf::DmaBuf(key)) {
+            return Ok(i);
+        }
+        let desc = desc.ok_or("a new VA surface without its export")?;
+        let slot = if self.keys.len() < MAX_DMABUF_BUFFERS {
+            self.keys.push(FrameBuf::DmaBuf(key));
+            self.buffers.push(BufferId(0));
+            self.slots.push(Slot::Decoder);
+            self.used.push(0);
+            self.keys.len() - 1
+        } else {
+            // The least recently used buffer that is back with the
+            // decoder: neither ready nor with the server.
+            let i = (0..self.keys.len())
+                .filter(|&i| self.slots[i] == Slot::Decoder)
+                .min_by_key(|&i| self.used[i])
+                .ok_or("every registered dma-buf is in use")?;
+            ui.destroy_surface_buffer(self.buffers[i])
+                .map_err(|e| format!("destroying a dma-buf: {e}"))?;
+            self.keys[i] = FrameBuf::DmaBuf(key);
+            i
+        };
+        let l = self.layout;
+        let id = ui.alloc_buffer_id();
+        ui.create_dmabuf_buffer(CreateDmabufBuffer {
+            id,
+            width: l.width,
+            height: l.height,
+            format: format::NV12,
+            modifier: desc.modifier,
+            planes: desc
+                .planes
+                .into_iter()
+                .map(|p| nitro_wire::msg::DmabufPlane {
+                    fd: p.fd,
+                    offset: p.offset,
+                    stride: p.stride,
+                })
+                .collect(),
+        })
+        .map_err(|e| format!("registering a dma-buf: {e}"))?;
+        // The destroy and the create land at this commit, before any
+        // PresentSurface names the new id.
+        ui.flush().map_err(|e| format!("registering a dma-buf: {e}"))?;
+        self.buffers[slot] = id;
+        Ok(slot)
     }
 
     fn fail(&mut self, ui: &mut Ui<Self>, e: String) {
@@ -445,7 +678,7 @@ impl Player {
 
     fn free(&mut self, slot: usize) {
         self.slots[slot] = Slot::Decoder;
-        let _ = self.tx.send(Cmd::Free(slot));
+        let _ = self.tx.send(Cmd::Free(self.keys[slot]));
     }
 
     // -- the decode thread's news ----------------------------------------
@@ -457,9 +690,31 @@ impl Player {
             match self.rx.try_recv() {
                 Ok(Msg::Frame {
                     generation,
-                    slot,
+                    buf,
                     pts_us,
-                }) => self.on_decoded(ui, generation, slot, pts_us),
+                    desc,
+                }) => {
+                    if generation != self.generation {
+                        if let Some(i) = self.keys.iter().position(|k| *k == buf) {
+                            self.slots[i] = Slot::Decoder;
+                        }
+                        let _ = self.tx.send(Cmd::Free(buf));
+                        continue;
+                    }
+                    let slot = match buf {
+                        FrameBuf::Shm(i) => i,
+                        FrameBuf::DmaBuf(k) => match self.dmabuf_index(ui, k, desc) {
+                            Ok(i) => i,
+                            Err(e) => {
+                                self.fail(ui, e);
+                                return;
+                            }
+                        },
+                    };
+                    self.use_clock += 1;
+                    self.used[slot] = self.use_clock;
+                    self.on_decoded(ui, generation, slot, pts_us);
+                }
                 Ok(Msg::Eof { generation }) if generation == self.generation => {
                     self.decoder_eof = true;
                     if self.seek_in_flight == Some(generation) {
@@ -672,6 +927,11 @@ impl Player {
                         self.stats.dropped += 1;
                     }
                     self.free(i);
+                }
+            }
+            SurfaceEvent::Feedback { node } => {
+                if node.is_none() && self.awaiting_feedback {
+                    self.begin(ui);
                 }
             }
             SurfaceEvent::Hint { .. } => {}
@@ -890,7 +1150,9 @@ pub fn install(
     info: &StreamInfo,
     wake: std::os::fd::BorrowedFd<'_>,
 ) -> WidgetId {
-    ui.enable_surfaces();
+    // DMABUF too: a VA-API decoder may present its surfaces directly;
+    // the default feedback decides (`Player::begin`).
+    ui.enable_dmabuf();
     ui.on_surface(|p: &mut Player, ui: &mut Ui<Player>, ev: &SurfaceEvent| p.on_surface(ui, ev));
     ui.on_frame(|p: &mut Player, ui: &mut Ui<Player>, f| p.on_frame(ui, f));
     ui.on_key(|p: &mut Player, ui: &mut Ui<Player>, k: &KeyEvent| p.on_key(ui, k));
