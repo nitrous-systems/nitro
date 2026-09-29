@@ -57,6 +57,7 @@ pub mod protocol;
 pub mod remote;
 pub mod render;
 pub mod repeat;
+pub mod share;
 pub mod shell;
 pub mod signals;
 pub mod stats;
@@ -89,7 +90,7 @@ use nitro_scene::{
 use nitro_seat::{Device, Seat, SeatEvent};
 use nitro_wire::msg::{self, ClientMsg, ServerMsg};
 use nitro_wire::server::Listener as WireListener;
-use nitro_wire::types::{ButtonState, ErrorCode, NodeId};
+use nitro_wire::types::{ButtonState, ErrorCode, NodeId, ShareToken};
 use rustix::event::epoll::{self, EventData, EventFlags};
 
 use crate::clients::{ApplyError, Pending, WireClient};
@@ -108,6 +109,14 @@ use crate::wm::{Drag, Edges, FrameNodes, Region, WindowManager};
 
 /// Server name reported in `Welcome`.
 pub const SERVER_NAME: &str = "nitro";
+
+/// The uid of a local socket's peer (`SO_PEERCRED`), for the share
+/// token's same-uid check (#3904).
+fn peer_uid(fd: std::os::fd::BorrowedFd<'_>) -> Option<u32> {
+    rustix::net::sockopt::socket_peercred(fd)
+        .ok()
+        .map(|c| c.uid.as_raw())
+}
 
 /// What a **remote** client is told when it sends a buffer op.
 ///
@@ -956,6 +965,8 @@ struct Server {
     latch: surface::Latch,
     /// The `SurfaceHint` last sent per Surface node (#3897).
     surface_hints: surface::Hints,
+    /// Exported Surface nodes and their imports (#3904).
+    shares: share::Shares,
     /// Which window each live touch point started on, and where it is in
     /// that window's coordinates.
     touch_targets: HashMap<i32, (WindowKey, Point)>,
@@ -1367,6 +1378,7 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         released: Vec::new(),
         latch: surface::Latch::default(),
         surface_hints: surface::Hints::default(),
+        shares: share::Shares::default(),
         touch_targets: HashMap::new(),
         unplaced: Vec::new(),
         popups: HashMap::new(),
@@ -3111,7 +3123,9 @@ impl Server {
             self.next_wire += 1;
             add(&self.epoll, &stream.as_fd(), token)?;
             debug!("wire client {} connected", id.0);
-            self.wire_clients.insert(token, WireClient::new(stream, id));
+            let mut client = WireClient::new(stream, id);
+            client.peer_uid = peer_uid(client.as_fd());
+            self.wire_clients.insert(token, client);
         }
     }
 
@@ -3137,7 +3151,9 @@ impl Server {
             self.next_shell += 1;
             add(&self.epoll, &stream.as_fd(), token)?;
             debug!("shell client {} connected", id.0);
-            self.wire_clients.insert(token, WireClient::new(stream, id));
+            let mut client = WireClient::new(stream, id);
+            client.peer_uid = peer_uid(client.as_fd());
+            self.wire_clients.insert(token, client);
         }
     }
 
@@ -7198,6 +7214,14 @@ impl Server {
             ClientMsg::PresentSurface(frame) => {
                 self.surface_allowed(token, "PresentSurface") && self.present_surface(token, &frame)
             }
+            // Answered at receipt, like `PresentSurface` (#3904).
+            ClientMsg::ExportSurface(m) => {
+                self.share_allowed(token, "ExportSurface") && self.export_surface(token, m.id)
+            }
+            ClientMsg::ImportSurface(m) => {
+                self.share_allowed(token, "ImportSurface")
+                    && self.import_surface(token, m.token, m.id)
+            }
             other => {
                 // Refused **at receipt**, not at the commit; see
                 // `Server::refuse_at_receipt`.
@@ -7298,7 +7322,8 @@ impl Server {
     ///
     /// `SURFACE` (#3897) has `RELEASE`'s shape: local links only, since
     /// every Surface buffer is a descriptor. `DMABUF` stays unset until
-    /// dma-buf import exists.
+    /// dma-buf import exists. `SHARE` (#3904) likewise: its only check
+    /// is the peer uid, which a TCP link cannot prove.
     fn caps(&self, shell: bool, remote: bool) -> u32 {
         let mut caps = nitro_wire::types::caps::WM
             | nitro_wire::types::caps::THEME
@@ -7321,7 +7346,8 @@ impl Server {
         } else {
             caps |= nitro_wire::types::caps::DATA
                 | nitro_wire::types::caps::RELEASE
-                | nitro_wire::types::caps::SURFACE;
+                | nitro_wire::types::caps::SURFACE
+                | nitro_wire::types::caps::SHARE;
             if self.keymap_fd.is_some() {
                 caps |= nitro_wire::types::caps::KEYMAP;
             }
@@ -8266,8 +8292,15 @@ impl Server {
         // A committed `SetSurface` wins over a queued frame: the frame is
         // dropped and its buffer released now (unless something shows it).
         for node in surfaces_set {
-            if let Some(buffer) = self.latch.cancel(node) {
-                self.release_now(token, buffer);
+            if let Some(q) = self.latch.cancel(node) {
+                self.release_now(q.token, q.buffer);
+            }
+        }
+        // Imports this batch destroyed (#3904): a frame the client still
+        // had queued through one is dropped and released.
+        for id in outcome.dropped_imports {
+            if let Some(node) = self.shares.drop_import(token, id) {
+                self.end_import(token, node);
             }
         }
         // The shell ops go *before* the state requests and after everything
@@ -8528,6 +8561,11 @@ impl Server {
         self.text.release_owner(id.0);
         self.latch.forget_client(token);
         self.surface_hints.forget_client(token);
+        // Its exports die with it; their importers hear at once. Its
+        // imports simply go (the tokens stay valid for a restart).
+        for r in self.shares.forget_client(token) {
+            self.revoke_import(r);
+        }
         for output in &mut self.outputs {
             output.painting.retain(|(c, _)| *c != id.0);
             output.in_flight.retain(|(c, _)| *c != id.0);
@@ -9127,20 +9165,19 @@ impl Server {
             return false;
         };
         let checked = (|| {
-            let node = client.nodes.get(&frame.id).copied().ok_or_else(|| {
-                ApplyError::new(
-                    ErrorCode::UnknownNode,
-                    format!("PresentSurface: no node with id {}", frame.id.raw()),
-                )
-            })?;
-            if self.scene.node(node).map(nitro_scene::Node::kind)
-                != Ok(nitro_scene::NodeKind::Surface)
-            {
-                return Err(ApplyError::new(
-                    ErrorCode::WrongKind,
-                    format!("PresentSurface: node {} is not a Surface", frame.id.raw()),
-                ));
-            }
+            let node = match client.nodes.get(&frame.id) {
+                Some(key) => Some(*key),
+                // An import (#3904): live, or dead (`None`).
+                None if client.imports.contains(&frame.id) => {
+                    self.shares.live_import(token, frame.id)
+                }
+                None => {
+                    return Err(ApplyError::new(
+                        ErrorCode::UnknownNode,
+                        format!("PresentSurface: no node with id {}", frame.id.raw()),
+                    ));
+                }
+            };
             let buffer = client
                 .buffers
                 .get(&frame.buffer)
@@ -9160,7 +9197,19 @@ impl Server {
                     "PresentSurface: src is empty or leaves the buffer",
                 ));
             }
-            Ok((node, buffer))
+            let Some(node) = node else {
+                return Ok((None, buffer));
+            };
+            if self.scene.node(node).map(nitro_scene::Node::kind)
+                != Ok(nitro_scene::NodeKind::Surface)
+            {
+                return Err(ApplyError::new(
+                    ErrorCode::WrongKind,
+                    format!("PresentSurface: node {} is not a Surface", frame.id.raw()),
+                ));
+            }
+
+            Ok((Some(node), buffer))
         })();
         let (node, buffer) = match checked {
             Ok(pair) => pair,
@@ -9168,6 +9217,11 @@ impl Server {
                 self.disconnect(token, Some((frame.serial, code, detail)));
                 return false;
             }
+        };
+        let Some(node) = node else {
+            // A revoked import: not an error, but never shown (#3904).
+            self.release_now(token, buffer);
+            return true;
         };
         let queued = surface::Queued {
             token,
@@ -9180,9 +9234,177 @@ impl Server {
             whole: false,
         };
         if let Some(old) = self.latch.queue(node, queued, &frame.damage) {
-            self.release_now(token, old);
+            self.release_now(old.token, old.buffer);
         }
         true
+    }
+
+    /// The sharing ops need `SHARE` listed in `ClientCaps` and a local
+    /// link (#3904, `docs/wire.md` § Surface sharing). Returns whether the
+    /// client may send `name`; if not, it has been disconnected.
+    fn share_allowed(&mut self, token: u64, name: &str) -> bool {
+        let Some(client) = self.wire_clients.get(&token) else {
+            return false;
+        };
+        let why = if Self::is_remote(token) {
+            format!("{name} is not available on a remote link")
+        } else if client.client_caps & nitro_wire::types::caps::SHARE == 0 {
+            format!("{name} needs `SHARE` listed in ClientCaps")
+        } else {
+            return true;
+        };
+        self.disconnect(token, Some((0, ErrorCode::Protocol, why)));
+        false
+    }
+
+    /// `ExportSurface` (#3904): mint a token for one of the client's
+    /// committed Surface nodes and answer `SurfaceExported`. A previous
+    /// token for the node dies, and its importer is told.
+    fn export_surface(&mut self, token: u64, id: NodeId) -> bool {
+        let Some(client) = self.wire_clients.get(&token) else {
+            return false;
+        };
+        let (uid, node) = (client.peer_uid, client.nodes.get(&id).copied());
+        let failure = match node {
+            None if client.imports.contains(&id) => Some((
+                ErrorCode::WrongKind,
+                format!("ExportSurface: node {} is an import", id.raw()),
+            )),
+            None => Some((
+                ErrorCode::UnknownNode,
+                format!("ExportSurface: no node with id {}", id.raw()),
+            )),
+            Some(key)
+                if self.scene.node(key).map(nitro_scene::Node::kind)
+                    != Ok(nitro_scene::NodeKind::Surface) =>
+            {
+                Some((
+                    ErrorCode::WrongKind,
+                    format!("ExportSurface: node {} is not a Surface", id.raw()),
+                ))
+            }
+            Some(_) => None,
+        };
+        if let Some((code, detail)) = failure {
+            self.disconnect(token, Some((0, code, detail)));
+            return false;
+        }
+        let Some(node) = node else {
+            return false;
+        };
+        let share = match share::mint() {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("ExportSurface: getrandom: {e}");
+                self.disconnect(
+                    token,
+                    Some((
+                        0,
+                        ErrorCode::Limit,
+                        format!("ExportSurface: no randomness: {e}"),
+                    )),
+                );
+                return false;
+            }
+        };
+        if let Some(r) = self.shares.export(token, uid, node, share) {
+            self.revoke_import(r);
+        }
+        if let Some(client) = self.wire_clients.get_mut(&token) {
+            client.send(&ServerMsg::SurfaceExported(msg::SurfaceExported {
+                id,
+                token: share,
+            }));
+        }
+        true
+    }
+
+    /// `ImportSurface` (#3904): bind `id` in the client's id space to the
+    /// node `share` names — or bind it dead and say so at once.
+    fn import_surface(&mut self, token: u64, share: ShareToken, id: NodeId) -> bool {
+        let Some(client) = self.wire_clients.get(&token) else {
+            return false;
+        };
+        let failure = if clients::id_taken(client, id) {
+            Some((
+                ErrorCode::Protocol,
+                format!("ImportSurface: id {} is zero or already in use", id.raw()),
+            ))
+        } else if client.imports.len() >= share::MAX_IMPORTS_PER_CLIENT {
+            Some((
+                ErrorCode::Limit,
+                "ImportSurface: too many imports".to_owned(),
+            ))
+        } else {
+            None
+        };
+        if let Some((code, detail)) = failure {
+            self.disconnect(token, Some((0, code, detail)));
+            return false;
+        }
+        let uid = client.peer_uid;
+        let surface_caps = client.client_caps & nitro_wire::types::caps::SURFACE != 0;
+        let imported = match self.shares.import(share, token, uid, id) {
+            Ok(i) => i,
+            Err(share::ImportError::OwnToken) => {
+                self.disconnect(
+                    token,
+                    Some((
+                        0,
+                        ErrorCode::Protocol,
+                        "ImportSurface: the token is this client's own export".to_owned(),
+                    )),
+                );
+                return false;
+            }
+        };
+        if let Some(client) = self.wire_clients.get_mut(&token) {
+            client.imports.insert(id);
+        }
+        if let Some(r) = imported.displaced {
+            self.revoke_import(r);
+        }
+        if let Some(node) = imported.node {
+            debug!("client token {token}: imported a surface as {}", id.raw());
+            if surface_caps {
+                self.surface_hints.track(node, token, id);
+            }
+        } else {
+            debug!("client token {token}: dead import {}", id.raw());
+            if let Some(client) = self.wire_clients.get_mut(&token) {
+                client.send(&ServerMsg::SurfaceRevoked(msg::SurfaceRevoked { id }));
+            }
+        }
+        true
+    }
+
+    /// An import of `node` by `token` ended (revoked or dropped): stop
+    /// hinting it and release whatever frame the importer had queued.
+    fn end_import(&mut self, token: u64, node: nitro_scene::NodeKey) {
+        self.surface_hints.untrack(node, token);
+        if let Some(q) = self.latch.cancel_from(node, token) {
+            self.release_now(q.token, q.buffer);
+        }
+    }
+
+    /// Tell an importer its import is dead (#3904).
+    fn revoke_import(&mut self, r: share::Revoked) {
+        self.end_import(r.importer, r.node);
+        if let Some(client) = self.wire_clients.get_mut(&r.importer) {
+            client.send(&ServerMsg::SurfaceRevoked(msg::SurfaceRevoked { id: r.id }));
+        }
+    }
+
+    /// Revoke the imports of every exported node that died this wakeup.
+    /// Before the latch, so a frame the importer queued on the dead node is
+    /// released rather than dropped silently.
+    fn sweep_shares(&mut self) {
+        if self.shares.is_empty() {
+            return;
+        }
+        for r in self.shares.sweep(&self.scene) {
+            self.revoke_import(r);
+        }
     }
 
     /// Send `BufferReleased` for a buffer that never reached the scene (a
@@ -9209,6 +9431,9 @@ impl Server {
     /// `answer_idle_clients` if the latch painted nothing. Returns whether
     /// anything latched.
     fn latch_surfaces(&mut self) -> bool {
+        // A frame an importer queued on a node that died must be released
+        // to it, not dropped silently with the node (#3904).
+        self.sweep_shares();
         if self.latch.is_empty() {
             return false;
         }

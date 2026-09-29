@@ -311,7 +311,13 @@ Alongside, and feeding into the items above:
   helper minimum is met on both boxes, ICD restriction is mandatory, and
   VA-API is the Intel decode API
   ([`research/gpu-testbox.md`](research/gpu-testbox.md)).
-- Cross-client Surface sharing for Chromium's out-of-process GPU — #3904.
+- Cross-client Surface sharing for Chromium's out-of-process GPU — #3904,
+  done. Token attach (option B): the owner's `ExportSurface` mints a bearer
+  token, and a same-uid local connection's `ImportSurface` lets it
+  `PresentSurface` into the node through this latch. The newest frame wins
+  whoever sent it; releases and `Presented` go to the presenter. Contract:
+  `wire.md` § Surface sharing; server side: `crates/nitro-server/src/share.rs`.
+  Why B over C: [`chromium.md`](chromium.md#out-of-process-gpu-b-vs-c-3904).
 - Chromium Ozone GPU rendering — #3905.
 - `nitro-video` player — #3906.
 - `just footprint` budget gate — #3907.

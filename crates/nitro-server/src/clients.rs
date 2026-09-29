@@ -28,7 +28,7 @@
 //! authority — destroying "everything of client X" is a walk of one hash
 //! map, not a search of the scene.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::fd::{BorrowedFd, OwnedFd};
 
 use nitro_core::{Point, Rect, Role, Size};
@@ -231,6 +231,13 @@ pub struct WireClient {
     /// state is silence. `None` = never sent, or must be re-sent (it lost
     /// keyboard focus, and missed every change since).
     pub last_mods: Option<crate::keyboard::ModMasks>,
+    /// The peer's uid (`SO_PEERCRED`), for `ImportSurface`'s same-uid
+    /// check (#3904). `None` on a remote link or if the kernel refused.
+    pub peer_uid: Option<u32>,
+    /// Ids this client bound with `ImportSurface` (#3904), live or dead.
+    /// They share the node id space, so `CreateNode` may not reuse one;
+    /// which of them are live is `share::Shares`' business.
+    pub imports: HashSet<NodeId>,
 }
 
 impl WireClient {
@@ -251,6 +258,8 @@ impl WireClient {
             texts: HashMap::new(),
             client_caps: 0,
             last_mods: None,
+            peer_uid: None,
+            imports: HashSet::new(),
         }
     }
 
@@ -470,6 +479,8 @@ pub struct ApplyOutcome {
     pub surfaces_set: Vec<NodeKey>,
     /// Surface nodes created, for the `SurfaceHint` tracker.
     pub new_surfaces: Vec<(NodeId, NodeKey)>,
+    /// Import ids this transaction's `DestroyNode`s dropped (#3904).
+    pub dropped_imports: Vec<NodeId>,
 }
 
 /// A validated `StartDrag`; see [`ApplyOutcome::start_drags`].
@@ -528,14 +539,32 @@ pub fn apply(
     Ok(outcome)
 }
 
-/// Look up a node the client named, or fail with `UnknownNode`.
+/// Look up a node the client named, or fail with `UnknownNode` — or
+/// `WrongKind` for an import id (#3904), which accepts only
+/// `PresentSurface` and `DestroyNode`.
 fn node_key(client: &WireClient, id: NodeId) -> Result<NodeKey, ApplyError> {
-    client.nodes.get(&id).copied().ok_or_else(|| {
-        ApplyError::new(
-            ErrorCode::UnknownNode,
-            format!("no node with id {}", id.raw()),
-        )
-    })
+    if let Some(key) = client.nodes.get(&id) {
+        return Ok(*key);
+    }
+    if client.imports.contains(&id) {
+        return Err(ApplyError::new(
+            ErrorCode::WrongKind,
+            format!(
+                "node {} is an import: only PresentSurface and DestroyNode apply",
+                id.raw()
+            ),
+        ));
+    }
+    Err(ApplyError::new(
+        ErrorCode::UnknownNode,
+        format!("no node with id {}", id.raw()),
+    ))
+}
+
+/// Whether `id` is free for a new node, window or popup: non-zero and
+/// naming neither a node nor an import.
+pub(crate) fn id_taken(client: &WireClient, id: NodeId) -> bool {
+    id.is_none() || client.nodes.contains_key(&id) || client.imports.contains(&id)
 }
 
 /// Resolve an optional `before` sibling: `NodeId::NONE` means "append".
@@ -582,7 +611,7 @@ fn apply_msg(
             Ok(())
         }
         ClientMsg::CreateWindow(m) => {
-            if m.id.is_none() || client.nodes.contains_key(&m.id) {
+            if id_taken(client, m.id) {
                 return Err(ApplyError::new(
                     ErrorCode::Protocol,
                     format!("window id {} is zero or already in use", m.id.raw()),
@@ -654,7 +683,7 @@ fn apply_msg(
             Ok(())
         }
         ClientMsg::CreateNode(m) => {
-            if m.id.is_none() || client.nodes.contains_key(&m.id) {
+            if id_taken(client, m.id) {
                 return Err(ApplyError::new(
                     ErrorCode::Protocol,
                     format!("node id {} is zero or already in use", m.id.raw()),
@@ -676,6 +705,11 @@ fn apply_msg(
             Ok(())
         }
         ClientMsg::DestroyNode(m) => {
+            if client.imports.remove(&m.id) {
+                // Dropping an import (#3904): the node is not ours.
+                outcome.dropped_imports.push(m.id);
+                return Ok(());
+            }
             let key = node_key(client, m.id)?;
             if let Some(win) = client.windows.get(&m.id).copied() {
                 // Destroying a window's root closes the window.
@@ -896,8 +930,9 @@ fn apply_msg(
             outcome.surfaces_set.push(key);
             Ok(())
         }
-        ClientMsg::PresentSurface(_) => {
-            // Never buffered: handled at receipt (`Server::present_surface`).
+        ClientMsg::PresentSurface(_) | ClientMsg::ExportSurface(_) | ClientMsg::ImportSurface(_) => {
+            // Never buffered: handled at receipt (`Server::present_surface`,
+            // `Server::export_surface`, `Server::import_surface`).
             Ok(())
         }
         ClientMsg::SetImage(m) => {
@@ -1005,7 +1040,7 @@ fn apply_msg(
         // receipt for `Outputs`' reason, by `Server::list_outputs`.
         | ClientMsg::ListOutputs(_) => Ok(()),
         ClientMsg::CreatePopup(m) => {
-            if m.id.is_none() || client.nodes.contains_key(&m.id) {
+            if id_taken(client, m.id) {
                 return Err(ApplyError::new(
                     ErrorCode::Protocol,
                     format!("popup id {} is zero or already in use", m.id.raw()),

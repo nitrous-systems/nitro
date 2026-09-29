@@ -16,18 +16,19 @@ use crate::framing::Framer;
 use crate::io::Socket;
 use crate::msg::{
     AcceptDrop, BindKey, BufferDamage, ClientCaps, ClientMsg, CloseWindow, Commit, CreateBuffer,
-    CreateNode, CreatePopup, ExportSurface, ImportSurface, CreateSurfaceBuffer, CreateWindow, DestroyBuffer, DestroyNode, Fill,
-    FinishDrag, FocusWindow, GrabKeyboard, Hello, ListOutputs, Lock, MeasureText, Outputs,
-    PresentSurface, Reparent, RepositionPopup, RequestFrame, RequestSelection, SendSelection,
-    ServerMsg, SetAnchor, SetAppId, SetBorder, SetBounds, SetClip, SetCorners, SetCursor,
-    SetDragIconOffset, SetExclusiveZone, SetFill, SetIcon, SetImage, SetLayer, SetOpacity,
-    SetOpaqueRegion, SetOverview, SetSelection, SetSurface, SetText, SetTransform, SetVisible,
-    SetWindowLimits, SetWindowState, SetWindowStateFor, SetWindowTitle, StartDrag, StartMove,
-    StartResize, UnbindKey, Unlock, WindowList,
+    CreateNode, CreatePopup, CreateSurfaceBuffer, CreateWindow, DestroyBuffer, DestroyNode,
+    ExportSurface, Fill, FinishDrag, FocusWindow, GrabKeyboard, Hello, ImportSurface, ListOutputs,
+    Lock, MeasureText, Outputs, PresentSurface, Reparent, RepositionPopup, RequestFrame,
+    RequestSelection, SendSelection, ServerMsg, SetAnchor, SetAppId, SetBorder, SetBounds, SetClip,
+    SetCorners, SetCursor, SetDragIconOffset, SetExclusiveZone, SetFill, SetIcon, SetImage,
+    SetLayer, SetOpacity, SetOpaqueRegion, SetOverview, SetSelection, SetSurface, SetText,
+    SetTransform, SetVisible, SetWindowLimits, SetWindowState, SetWindowStateFor, SetWindowTitle,
+    StartDrag, StartMove, StartResize, UnbindKey, Unlock, WindowList,
 };
 use crate::types::{
     Align, BufferId, ColorMatrix, ColorRange, CursorShape, DataSource, DragAction, Edge, Layer,
-    NodeId, NodeKind, OverviewRequest, PopupAnchor, PopupGravity, ShareToken, WindowRef, WindowState, caps,
+    NodeId, NodeKind, OverviewRequest, PopupAnchor, PopupGravity, ShareToken, WindowRef,
+    WindowState, caps,
 };
 
 /// Where the shell socket lives; see [`crate::shell_socket_path`].

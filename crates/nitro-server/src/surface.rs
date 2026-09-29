@@ -20,9 +20,10 @@ use nitro_wire::types::NodeId;
 /// One queued frame.
 #[derive(Debug, Clone)]
 pub struct Queued {
-    /// The owning connection.
+    /// The presenting connection. Not necessarily the node's owner: an
+    /// importer (#3904) presents into another client's node.
     pub token: u64,
-    /// The owning client, as the scene knows it.
+    /// The presenting client, as the scene knows it.
     pub client: ClientId,
     /// The buffer to show.
     pub buffer: BufferKey,
@@ -59,15 +60,11 @@ pub struct Latch {
 
 impl Latch {
     /// Queue `frame` on `node`, superseding any frame already queued.
-    /// Returns the superseded frame's buffer, for the caller to release if
-    /// nothing shows it — or `None` when there was none or it is the new
-    /// frame's buffer too. The damage accumulates across supersedes.
-    pub fn queue(
-        &mut self,
-        node: NodeKey,
-        mut frame: Queued,
-        rects: &[IRect],
-    ) -> Option<BufferKey> {
+    /// Returns the superseded frame, for the caller to release its buffer
+    /// to its presenter if nothing shows it — or `None` when there was none
+    /// or it is the new frame's buffer too. The damage accumulates across
+    /// supersedes.
+    pub fn queue(&mut self, node: NodeKey, mut frame: Queued, rects: &[IRect]) -> Option<Queued> {
         if rects.is_empty() {
             frame.whole = true;
         }
@@ -80,14 +77,23 @@ impl Latch {
             frame.damage.add_all(&old.damage);
         }
         self.queued.insert(node, frame);
-        old.map(|o| o.buffer)
-            .filter(|b| Some(*b) != self.queued.get(&node).map(|q| q.buffer))
+        let new = self.queued.get(&node).map(|q| (q.token, q.buffer));
+        old.filter(|o| Some((o.token, o.buffer)) != new)
     }
 
     /// Drop `node`'s queued frame (a committed `SetSurface` won), returning
-    /// its buffer for the caller to release.
-    pub fn cancel(&mut self, node: NodeKey) -> Option<BufferKey> {
-        self.queued.remove(&node).map(|q| q.buffer)
+    /// it for the caller to release its buffer to its presenter.
+    pub fn cancel(&mut self, node: NodeKey) -> Option<Queued> {
+        self.queued.remove(&node)
+    }
+
+    /// Drop `node`'s queued frame only if `token` presented it (an import
+    /// was revoked or dropped, #3904).
+    pub fn cancel_from(&mut self, node: NodeKey, token: u64) -> Option<Queued> {
+        if self.queued.get(&node)?.token != token {
+            return None;
+        }
+        self.queued.remove(&node)
     }
 
     /// Forget everything a disconnected client queued, silently.
@@ -138,8 +144,11 @@ impl Latch {
                 q.damage.rects().to_vec()
             };
             let surface = SurfaceRef::new(q.buffer, q.src, q.color);
+            // The server acts: the presenter may be an importer that owns
+            // the buffer but not the node (#3904). Both were checked at
+            // receipt, and a stale key fails here anyway.
             if scene
-                .set_surface_with_damage(q.client, node, surface, &rects)
+                .set_surface_with_damage(ClientId::SERVER, node, surface, &rects)
                 .is_ok()
             {
                 out.push(Latched {
@@ -166,20 +175,28 @@ struct HintState {
 pub type Hint = (u64, NodeId, u32, u32, u32);
 
 /// Tracks the Surface nodes of clients that listed `SURFACE` and what
-/// `SurfaceHint` each was last sent.
+/// `SurfaceHint` each was last sent. Keyed by node *and* connection: a
+/// shared Surface (#3904) hints its owner and its importer, each under
+/// its own id.
 #[derive(Debug, Default)]
 pub struct Hints {
-    nodes: HashMap<NodeKey, HintState>,
+    nodes: HashMap<(NodeKey, u64), HintState>,
 }
 
 impl Hints {
-    /// Start tracking a Surface node.
+    /// Start tracking a Surface node for connection `token`, which names
+    /// it `id`.
     pub fn track(&mut self, node: NodeKey, token: u64, id: NodeId) {
-        self.nodes.entry(node).or_insert(HintState {
+        self.nodes.entry((node, token)).or_insert(HintState {
             token,
             id,
             sent: None,
         });
+    }
+
+    /// Stop tracking `node` for `token` (an import went away).
+    pub fn untrack(&mut self, node: NodeKey, token: u64) {
+        self.nodes.remove(&(node, token));
     }
 
     /// Stop tracking a client's nodes.
@@ -193,7 +210,7 @@ impl Hints {
     /// nodes are dropped; an empty device rect sends nothing.
     pub fn changed(&mut self, scene: &Scene, format: u32) -> Vec<Hint> {
         let mut out = Vec::new();
-        self.nodes.retain(|key, h| {
+        self.nodes.retain(|(key, _), h| {
             let Ok(node) = scene.node(*key) else {
                 return false;
             };
@@ -261,13 +278,20 @@ mod tests {
     fn a_newer_frame_supersedes_and_unions_damage() {
         let (mut s, n, b) = world();
         let mut l = Latch::default();
-        assert_eq!(l.queue(n, frame(b[0], 1), &[IRect::new(0, 0, 2, 2)]), None);
+        assert!(
+            l.queue(n, frame(b[0], 1), &[IRect::new(0, 0, 2, 2)])
+                .is_none()
+        );
         assert_eq!(
-            l.queue(n, frame(b[1], 2), &[IRect::new(4, 4, 2, 2)]),
+            l.queue(n, frame(b[1], 2), &[IRect::new(4, 4, 2, 2)])
+                .map(|q| q.buffer),
             Some(b[0])
         );
         // Same buffer re-queued: nothing to release.
-        assert_eq!(l.queue(n, frame(b[1], 3), &[IRect::new(8, 8, 1, 1)]), None);
+        assert!(
+            l.queue(n, frame(b[1], 3), &[IRect::new(8, 8, 1, 1)])
+                .is_none()
+        );
         let q = l.get(n).unwrap();
         assert_eq!(q.serial, 3);
         assert_eq!(q.damage.rects().len(), 3);
@@ -304,7 +328,10 @@ mod tests {
         let (mut s, n, b) = world();
         let mut l = Latch::default();
         l.queue(n, frame(b[2], 1), &[]);
-        assert_eq!(l.cancel(n), Some(b[2]));
+        assert_eq!(l.cancel(n).map(|q| q.buffer), Some(b[2]));
+        l.queue(n, frame(b[2], 1), &[]);
+        assert!(l.cancel_from(n, 8).is_none(), "another presenter's frame");
+        assert_eq!(l.cancel_from(n, 7).map(|q| q.buffer), Some(b[2]));
         assert!(l.is_empty());
         l.queue(n, frame(b[2], 2), &[]);
         s.destroy_buffer(C, b[2]).unwrap();

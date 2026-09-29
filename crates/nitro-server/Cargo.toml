@@ -24,7 +24,7 @@ nitro-icons = { path = "../nitro-icons" }
 nitro-png = { path = "../nitro-png" }
 nitro-seat = { path = "../nitro-seat" }
 nitro-kms = { path = "../nitro-kms" }
-rustix = { version = "1", features = ["event", "fs", "net", "pipe", "process", "time"] }
+rustix = { version = "1", features = ["event", "fs", "net", "pipe", "process", "rand", "time"] }
 # Self-pipe for SIGTERM/SIGINT without `unsafe` in our tree. Default
 # features (iterator/channel) are off; only `low_level::pipe` is used.
 signal-hook = { version = "0.4", default-features = false }
