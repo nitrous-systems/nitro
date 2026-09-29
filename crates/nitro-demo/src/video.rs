@@ -761,6 +761,12 @@ impl Video {
                 .bounds(LABEL, label_rect(size))
                 .set_text(LABEL, "sans", 16.0, Color::WHITE, &label);
         }
+        if self.opts.no_controls {
+            tx = tx.visible(BAR, false).visible(PROGRESS, false);
+            if has_text {
+                tx = tx.visible(LABEL, false);
+            }
+        }
         if fullscreen {
             tx = tx.set_window_state(WINDOW, WindowState::Fullscreen);
         }

@@ -523,6 +523,10 @@ pub struct PlannerStats {
     pub fallbacks: u64,
     /// Changes of layout shape (each a full repaint).
     pub switches: u64,
+    /// Candidates at the last decision.
+    pub candidates: u64,
+    /// ... of which obscured.
+    pub obscured: u64,
 }
 
 /// Per-output decision state: cache, hysteresis, counters.
@@ -549,6 +553,8 @@ impl Planner {
         now_ns: u64,
         test: &mut dyn FnMut(&[PlaneAssignment<'_>]) -> Option<Verdict>,
     ) -> Decision {
+        self.stats.candidates = inp.candidates.len() as u64;
+        self.stats.obscured = inp.candidates.iter().filter(|c| c.obscured).count() as u64;
         if inp.candidates.is_empty() {
             self.pending = None;
             return self.set(None, Decision::default());

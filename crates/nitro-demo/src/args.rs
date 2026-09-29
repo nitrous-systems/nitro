@@ -42,6 +42,9 @@ pub struct VideoOpts {
     /// Pixel format (`--format nv12|yuyv|xr24`); 0 = the server's choice
     /// with `--scanout`, NV12 otherwise.
     pub format: u32,
+    /// Hide the control bar, progress and counter (`--no-controls`), so
+    /// nothing is drawn over the video: what a plane needs (#3899).
+    pub no_controls: bool,
 }
 
 impl Default for VideoOpts {
@@ -54,6 +57,7 @@ impl Default for VideoOpts {
             frames: 0,
             scanout: false,
             format: 0,
+            no_controls: false,
         }
     }
 }
@@ -112,7 +116,7 @@ usage: nitro-demo [--follow | --animate] [--windows N] [--damage] [--stats]
                   [--seconds S] [--save-small FILE]
        nitro-demo --video [--size WxH] [--fps 30|60] [--fullscreen]
                   [--follow-hint] [--frames N] [--seconds S]
-                  [--scanout] [--format nv12|yuyv|xr24]
+                  [--scanout] [--format nv12|yuyv|xr24] [--no-controls]
 
   --follow           commit only on input (default); idle costs zero frames
   --animate          move a rect one step per Frame callback
@@ -131,6 +135,7 @@ usage: nitro-demo [--follow | --animate] [--windows N] [--damage] [--stats]
   --scanout          ask the server for scanout buffers (memfds if refused)
   --format F         video pixel format: nv12, yuyv or xr24 (default: NV12,
                      or the server's choice with --scanout)
+  --no-controls      hide the control bar over the video (plane testing)
 
 Environment: NITRO_SOCKET, NITRO_CONTROL, NITRO_DEMO_SHOW_DAMAGE=1.
 Keys: q quit, d toggle damage outlines, Esc close the window, n/p select.
@@ -167,6 +172,7 @@ pub fn parse(
             "--follow-hint" => out.video.follow_hint = true,
             "--frames" => out.video.frames = number(&mut it, "--frames")?,
             "--scanout" => out.video.scanout = true,
+            "--no-controls" => out.video.no_controls = true,
             "--format" => {
                 out.video.format = match it.next().as_deref() {
                     Some("nv12") => nitro_wire::types::format::NV12,

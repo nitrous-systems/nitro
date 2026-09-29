@@ -10720,6 +10720,8 @@ impl Server {
         pairs.push(("planes_cache_hits", sum(|s| s.cache_hits)));
         pairs.push(("planes_fallbacks", sum(|s| s.fallbacks)));
         pairs.push(("planes_switches", sum(|s| s.switches)));
+        pairs.push(("planes_candidates", sum(|s| s.candidates)));
+        pairs.push(("planes_obscured", sum(|s| s.obscured)));
         pairs.push(("plane_flips", self.plane_flips));
         pairs.push(("plane_releases_held", self.held_releases.len() as u64));
     }
