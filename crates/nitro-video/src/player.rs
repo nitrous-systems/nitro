@@ -570,7 +570,13 @@ impl Player {
             self.clock.anchor(t, first);
             self.calibrate = true;
         }
-        let target = self.clock.media_at(t).unwrap_or(0);
+        // Nearest vblank, not "strictly before": a frame due half a
+        // refresh after this flip is closer to it than to the next one,
+        // and the deadline is an extrapolation that jitters by that much.
+        let target = self
+            .clock
+            .media_at(t + u64::from(f.refresh_ns) / 2)
+            .unwrap_or(0);
         let pts: Vec<i64> = self.ready.iter().map(|r| r.1).collect();
         let pick = pacing::pick(&pts, target);
         let chosen = pick.show.map(|i| self.ready[i]);

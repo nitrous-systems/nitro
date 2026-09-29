@@ -1420,6 +1420,25 @@ kernel (`AllocSurfaceBuffersFailed { Failed }`: i915 on Gen7 rejects an
 NV12 framebuffer at `AddFB2`), and the demo fell back to memfds as
 designed.
 
+## nitro-video (#3906)
+
+box1, nitro-dev on main `76d438e`, x264 High 30 fps clips, 450 frames,
+software decode through the system FFmpeg (details:
+`crates/nitro-video/README.md`).
+
+| run | player CPU | RSS | libav* resident | `paint_us` mean | dropped |
+|---|---|---|---|---|---|
+| 720p windowed | 38 % | 63 MB | 8.8 MB | ≈ 5.8 ms | 0 |
+| 1080p windowed | 53 % | 87 MB | 8.9 MB | ≈ 10.7 ms | 0 |
+| 1080p fullscreen | 51 % | 87 MB | 8.9 MB | ≈ 10.1 ms | 0 |
+
+Stripped `nitro-video`: **805 KB**. Mapped shared libraries: libavcodec
+28.3 MB, libavformat 3.2 MB, libavutil 1.2 MB, libswresample 0.2 MB on
+disk. **No new crate**: the dependency tree grows by the `nitro-video`
+workspace crate only; FFmpeg is a dynamically linked C dependency
+(`DEPENDENCIES.md`). The paint cost is full-frame NV12 conversion on the
+CPU composite path; the planes path (#3899) removes it.
+
 ## Dependency count
 
 `cargo tree -e normal --prefix none | sort -u | wc -l` = **74** at M4-A
