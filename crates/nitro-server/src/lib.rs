@@ -210,6 +210,13 @@ pub struct Config {
     /// `NITRO_SCROLL_BLIT=0` turns it off, so the two can be compared on
     /// hardware and a test can drive a reference server beside it.
     pub scroll_blit: bool,
+    /// Give every output an overview thumbnail atlas (#3902): one opaque
+    /// buffer of the output's size, allocated when the output appears, so
+    /// the overview animates out of 1:1 copies and pressing Super
+    /// allocates nothing. On by default; `NITRO_OVERVIEW_ATLAS=0` gives
+    /// the memory back and overview snaps with a direct repaint, which is
+    /// also what a failed allocation falls back to.
+    pub overview_atlas: bool,
     /// Start with the session **locked** and no lock owner: nothing but the
     /// background is drawn and no window receives input until a shell
     /// client sends `Lock` (and so owns the lock), and then only its
@@ -277,6 +284,7 @@ impl Config {
             fake_modes: Vec::new(),
             shadow: true,
             scroll_blit: true,
+            overview_atlas: true,
             locked: false,
             config_path: None,
             icon_dirs: None,
@@ -922,6 +930,13 @@ struct Server {
     /// Whether a scroll hint may be served from the shadow
     /// (`NITRO_SCROLL_BLIT`); see [`Config::scroll_blit`].
     scroll_blit: bool,
+    /// Whether outputs get an overview thumbnail atlas; see
+    /// [`Config::overview_atlas`].
+    overview_atlas: bool,
+    /// Thumbnails rendered into an atlas, cumulative, and the
+    /// microseconds they took. `stats`.
+    thumb_renders: u64,
+    thumb_render_us: u64,
     /// Frames that took the scroll blit, for `stats`.
     blit_frames: u64,
     /// Watches `/sys` for input devices appearing and disappearing.
@@ -1335,6 +1350,9 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         config_reloads: 0,
         shadow: config.shadow,
         scroll_blit: config.scroll_blit,
+        overview_atlas: config.overview_atlas,
+        thumb_renders: 0,
+        thumb_render_us: 0,
         blit_frames: 0,
         lock: if config.locked {
             lock::Lock::locked()
@@ -1789,10 +1807,13 @@ impl Server {
         }
         let mut lost = false;
         let mut gone: Vec<u32> = Vec::new();
-        self.outputs.retain(|o| {
+        self.outputs.retain_mut(|o| {
             let keep = infos.iter().any(|i| i.id == o.kms_id);
             if !keep {
                 info!("{} gone", o.kms_id);
+                if let Some(atlas) = o.atlas.take() {
+                    atlas.free(&mut self.scene);
+                }
                 self.scene.remove_output(o.scene_id);
                 gone.push(o.scene_id.0);
                 lost = true;
@@ -1901,6 +1922,26 @@ impl Server {
             if was.is_some_and(|s| s != scale) {
                 rescaled.push(scene_id);
             }
+            // The atlas is the output's size too; a new one is paid here,
+            // on the mode change, never on the overview path. Leaving
+            // overview on this output first puts every thumbnail back
+            // before its images lose their buffer.
+            let resized_atlas = self
+                .outputs
+                .iter()
+                .find(|o| o.kms_id == info.id)
+                .and_then(|o| o.atlas)
+                .filter(|a| a.size != (info.width, info.height));
+            if let Some(stale) = resized_atlas {
+                if self.wm.overview().is_some_and(|o| o.output == scene_id) {
+                    self.leave_overview(None);
+                }
+                stale.free(&mut self.scene);
+                let atlas = overview::Atlas::allocate(&mut self.scene, info.width, info.height);
+                if let Some(existing) = self.outputs.iter_mut().find(|o| o.kms_id == info.id) {
+                    existing.atlas = atlas;
+                }
+            }
             if let Some(existing) = self.outputs.iter_mut().find(|o| o.kms_id == info.id) {
                 existing.width = info.width;
                 existing.height = info.height;
@@ -1912,6 +1953,7 @@ impl Server {
                 {
                     *shadow = frame::Shadow::new(info.width, info.height);
                 }
+
                 // A mode change replaces the backend's buffers, which come
                 // back as XRGB8888; the next paint re-selects the format.
                 if existing.alpha && self.backend.set_scanout_alpha(info.id, false).is_err() {
@@ -1932,14 +1974,20 @@ impl Server {
                 origin.x,
                 origin.y
             );
-            self.outputs.push(OutputState::new(
+            let mut state = OutputState::new(
                 info.id,
                 scene_id,
                 info.width,
                 info.height,
                 info.refresh_mhz,
                 self.shadow,
-            ));
+            );
+            // The overview atlas is paid here, when the output appears,
+            // and pre-faulted: nothing on the Super path allocates.
+            if self.overview_atlas {
+                state.atlas = overview::Atlas::allocate(&mut self.scene, info.width, info.height);
+            }
+            self.outputs.push(state);
         }
         self.origins = origins;
         rescaled
@@ -2052,7 +2100,7 @@ impl Server {
 
     /// Run the scene's update pass and fold the damage into every output.
     fn update_scene(&mut self) {
-        let configures = self.update_scene_once();
+        let (configures, mut offscreen) = self.update_scene_once();
         // A resize the server decided on has already re-laid its frame
         // (`set_frame_rect`). A client's own `SetBounds` on its window
         // root has not: the scene resized the content and the frame
@@ -2076,8 +2124,17 @@ impl Server {
         if relaid {
             // Decorations never resize content, so this pass has no
             // configures of its own to send.
-            let again = self.update_scene_once();
+            let (again, more) = self.update_scene_once();
             debug_assert!(again.is_empty(), "a frame re-layout resized content");
+            offscreen.extend(more);
+        }
+        // Overview thumbnails are offscreen in atlas mode: their changes
+        // came back per window. Re-render those parts of the atlas, then
+        // one more pass carries the atlas images' damage to the output.
+        if self.render_thumbs(&offscreen) {
+            let (again, more) = self.update_scene_once();
+            debug_assert!(again.is_empty(), "rendering the atlas resized content");
+            debug_assert!(more.is_empty(), "rendering the atlas dirtied a thumbnail");
         }
         // Every resize is told to the client, which lays out for it.
         for configure in configures {
@@ -2086,8 +2143,14 @@ impl Server {
     }
 
     /// One scene update: fold its damage into the outputs and return the
-    /// windows whose size it changed.
-    fn update_scene_once(&mut self) -> Vec<nitro_scene::Configure> {
+    /// windows whose size it changed, and the damage inside offscreen
+    /// windows (the overview's thumbnails in atlas mode).
+    fn update_scene_once(
+        &mut self,
+    ) -> (
+        Vec<nitro_scene::Configure>,
+        Vec<(WindowKey, nitro_core::IRect)>,
+    ) {
         let mut regions: Vec<(SceneOutputId, Damage)> = self
             .outputs
             .iter()
@@ -2138,7 +2201,78 @@ impl Server {
                 output.damage_content(local(r));
             }
         }
-        result.configures
+        (result.configures, result.offscreen)
+    }
+
+    /// Re-render the overview thumbnails `damage` (global device pixels,
+    /// per offscreen window) touches into the output's atlas — or, right
+    /// after entry, every thumbnail whole. One render per window per call,
+    /// over the bounding box of its damage inside its slot. Returns
+    /// whether anything was rendered (the atlas images then need a scene
+    /// pass to reach the output).
+    fn render_thumbs(&mut self, damage: &[(WindowKey, nitro_core::IRect)]) -> bool {
+        let Some(ov) = self.wm.overview().filter(|o| o.atlas) else {
+            debug_assert!(damage.is_empty(), "offscreen damage outside atlas mode");
+            return false;
+        };
+        let output = ov.output;
+        let Some(atlas) = self
+            .outputs
+            .iter()
+            .find(|o| o.scene_id == output)
+            .and_then(|o| o.atlas)
+        else {
+            return false;
+        };
+        let Some((orect, scale)) = self.scene.output_info(output) else {
+            return false;
+        };
+        let scale = if scale > 0.0 { scale } else { 1.0 };
+        let mut jobs: Vec<(WindowKey, nitro_core::IRect)> = Vec::new();
+        if ov.rendered {
+            for (win, rect) in damage {
+                let Some(t) = ov.thumbs.iter().find(|t| t.window == *win) else {
+                    debug_assert!(false, "offscreen damage for a window that is no thumbnail");
+                    continue;
+                };
+                let slot = overview::slot_device_rect(&t.slot, scale);
+                let local = rect.translate(-orect.x, -orect.y).intersect(&slot);
+                if local.is_empty() {
+                    continue;
+                }
+                match jobs.iter_mut().find(|(w, _)| w == win) {
+                    Some((_, r)) => *r = r.union(&local),
+                    None => jobs.push((*win, local)),
+                }
+            }
+        } else {
+            jobs.extend(
+                ov.thumbs
+                    .iter()
+                    .map(|t| (t.window, overview::slot_device_rect(&t.slot, scale))),
+            );
+        }
+        if let Some(ov) = self.wm.overview_mut() {
+            ov.rendered = true;
+        }
+        let mut paint = overview::ThumbPaint {
+            text: &mut self.text,
+            icons: &mut self.icons,
+            palette: &self.palette,
+            items: &mut self.paint_items,
+        };
+        let mut any = false;
+        for (win, rect) in jobs {
+            match overview::render_thumb(&mut self.scene, &atlas, &mut paint, win, rect, (orect.x, orect.y)) {
+                Ok(us) => {
+                    self.thumb_renders += 1;
+                    self.thumb_render_us += us;
+                    any = true;
+                }
+                Err(e) => warn!("rendering a thumbnail: {e}"),
+            }
+        }
+        any
     }
 
     fn send_configure(&mut self, win: WindowKey, size: Size) {
@@ -6405,6 +6539,27 @@ impl Server {
             "overview_grid_hidden",
             u64::from(ov.is_some_and(|o| o.grid_hidden)),
         ));
+        // The thumbnail atlas (#3902): whether the output in overview (or
+        // else the first output) has one, the heap they hold, and the
+        // damage-driven re-renders into them.
+        let atlas_output = ov
+            .map(|o| o.output)
+            .or_else(|| self.outputs.first().map(|o| o.scene_id));
+        pairs.push((
+            "overview_atlas",
+            u64::from(
+                self.outputs
+                    .iter()
+                    .any(|o| Some(o.scene_id) == atlas_output && o.atlas.is_some()),
+            ),
+        ));
+        pairs.push((
+            "overview_atlas_bytes",
+            self.outputs.iter().filter_map(|o| o.atlas).map(|a| a.bytes).sum(),
+        ));
+        pairs.push(("thumb_renders", self.thumb_renders));
+        pairs.push(("thumb_render_us", self.thumb_render_us));
+        pairs.push(("buffers", self.scene.buffer_count() as u64));
         pairs.push(("overview_requests", self.overview_requests));
         pairs.push(("overview_watchers", self.overview_watchers.len() as u64));
         pairs.push(("focused", u64::from(self.focus.is_some())));
@@ -9763,11 +9918,38 @@ impl Server {
                 return;
             }
         };
-        let scrim_root = self.scene.window_info(scrim).map(nitro_scene::Window::root);
-        let states: Vec<overview::ThumbState> = slots
+        let scrim_root = self
+            .scene
+            .window_info(scrim)
+            .map(nitro_scene::Window::root)
+            .ok();
+        // Atlas mode when this output has one (allocated with the output;
+        // nothing here allocates a buffer). Without it: the snap path,
+        // exactly as before the atlas.
+        let atlas = self
+            .outputs
+            .iter()
+            .find(|o| o.scene_id == output)
+            .and_then(|o| o.atlas)
+            .filter(|_| scrim_root.is_some());
+        let mut states: Vec<overview::ThumbState> = slots
             .into_iter()
-            .filter_map(|slot| self.make_thumb(slot, scrim_root.as_ref().ok().copied()))
+            .filter_map(|slot| self.make_thumb(slot, scrim_root, atlas.map(|a| (a, s))))
             .collect();
+        // Atlas mode: every badge goes in the scrim, after every image so
+        // it draws on top of them. The frame roots are offscreen, so a
+        // badge hung off one would not paint.
+        if atlas.is_some() {
+            for t in &mut states {
+                let app_id = self
+                    .scene
+                    .window_info(t.window)
+                    .map(|i| i.app_id().to_owned())
+                    .unwrap_or_default();
+                t.badge = self.build_thumb_badge(&t.slot, &app_id, None, scrim_root);
+            }
+        }
+        let scrim_rect = atlas.and_then(|_| overview::scrim_rect(&self.scene, scrim));
         info!(
             "overview on output {}: {} thumbnail(s)",
             output.0,
@@ -9776,16 +9958,30 @@ impl Server {
         // Only with a badge to fade: a step that changes nothing damages
         // nothing, so no flip would come to finish the fade — and an
         // empty overview (just the scrim) would never read as settled.
-        let fade_start_ns = (animate && states.iter().any(|t| t.badge.is_some())).then(|| {
-            overview::set_badge_opacity(&mut self.scene, &states, 0.0);
-            monotonic_ns()
-        });
+        // In atlas mode the scrim fades too, and the thumbnails slide in
+        // from where their windows were. Only with a thumbnail: an empty
+        // overview's scrim at opacity 0 would damage nothing, so no flip
+        // would come to step the fade and it would never settle.
+        let fade_start_ns = (animate
+            && !states.is_empty()
+            && (atlas.is_some() || states.iter().any(|t| t.badge.is_some())))
+            .then(|| {
+                overview::set_badge_opacity(&mut self.scene, &states, 0.0);
+                if atlas.is_some() {
+                    overview::set_scrim_opacity(&mut self.scene, scrim_rect, 0.0);
+                    overview::place_thumb_images(&mut self.scene, &states, 0.0, s);
+                }
+                monotonic_ns()
+            });
         self.wm.begin_overview(overview::Overview {
             output,
             scrim,
             thumbs: states,
             fade_start_ns,
             grid_hidden: false,
+            atlas: atlas.is_some(),
+            rendered: false,
+            scrim_rect,
         });
         // Every thumbnail keeps its title bar, scaled; its title is
         // reshaped at a size that lands on whole device pixels, so the
@@ -9811,13 +10007,30 @@ impl Server {
     /// Turn one window into a thumbnail on `slot`: scale it (frame and
     /// all), un-hide it if minimized, badge it. `None` when the window is
     /// gone or the scene refuses the transform.
+    ///
+    /// With `atlas` (the output's atlas and scale) the window also goes
+    /// offscreen and gets an image node in the scrim instead of a badge;
+    /// the caller builds the badges afterwards, on top of every image.
     fn make_thumb(
         &mut self,
         slot: overview::Slot,
         scrim_root: Option<nitro_scene::NodeKey>,
+        atlas: Option<(overview::Atlas, f32)>,
     ) -> Option<overview::ThumbState> {
         let win = slot.window;
         let info = self.scene.window_info(win).ok()?;
+        // Where the entry slide starts: the thumbnail centred on the
+        // window as it was. A minimized window was nowhere; it starts on
+        // its slot.
+        let start = if info.state() == WindowState::Minimized {
+            slot.pos
+        } else {
+            let f = info.frame_rect();
+            Point::new(
+                f.x + f.w / 2.0 - slot.size.w / 2.0,
+                f.y + f.h / 2.0 - slot.size.h / 2.0,
+            )
+        };
         let (root, framed, frame_size, minimized) = (
             info.root(),
             info.is_framed(),
@@ -9834,8 +10047,21 @@ impl Server {
                 }
             };
         let unhid = minimized && self.scene.set_visible(ClientId::SERVER, root, true).is_ok();
-        let frame = framed.then_some((root, frame_size));
-        let badge = self.build_thumb_badge(&slot, &app_id, frame, scrim_root);
+        let (badge, image) = match (atlas, scrim_root) {
+            (Some((atlas, scale)), Some(parent)) => {
+                if let Err(e) = self.scene.set_offscreen(win, true) {
+                    warn!("taking a thumbnail offscreen: {e}");
+                }
+                let image = overview::build_thumb_image(&mut self.scene, parent, &atlas, &slot, scale)
+                    .map_err(|e| warn!("building a thumbnail image: {e}"))
+                    .ok();
+                (None, image)
+            }
+            _ => {
+                let frame = framed.then_some((root, frame_size));
+                (self.build_thumb_badge(&slot, &app_id, frame, scrim_root), None)
+            }
+        };
         let r = slot.rect();
         Some(overview::ThumbState {
             window: win,
@@ -9845,6 +10071,8 @@ impl Server {
             saved_position,
             unhid,
             badge,
+            image,
+            start,
         })
     }
 
@@ -9923,9 +10151,18 @@ impl Server {
             };
             let (root, framed, state) = (info.root(), info.is_framed(), info.state());
             // An undecorated window's badge lives in the scrim and goes
-            // with it; a framed one's hangs off the frame root.
-            if framed && let Some(badge) = t.badge {
+            // with it; a framed one's hangs off the frame root — except in
+            // atlas mode, where every badge and image is in the scrim.
+            if framed
+                && !ov.atlas
+                && let Some(badge) = t.badge
+            {
                 let _ = self.scene.destroy_node(s, badge);
+            }
+            // Back on the output before the restore, so the move back is
+            // ordinary output damage.
+            if ov.atlas {
+                let _ = self.scene.set_offscreen(t.window, false);
             }
             if let Err(e) = overview::restore_thumb(
                 &mut self.scene,
@@ -10005,7 +10242,7 @@ impl Server {
         // drawn: no damage, no flip, and the fade would never read as
         // settled. Finish it now instead.
         if !visible && ov.fade_start_ns.take().is_some() {
-            overview::set_badge_opacity(&mut self.scene, &ov.thumbs, 1.0);
+            self.finish_overview_anim();
         }
         let Some(ov) = self.wm.overview() else {
             return;
@@ -10035,12 +10272,37 @@ impl Server {
             return false;
         };
         let elapsed = now_ns.saturating_sub(start);
-        let opacity = overview::badge_opacity(elapsed);
         if elapsed >= overview::BADGE_FADE_NS {
             ov.fade_start_ns = None;
         }
-        overview::set_badge_opacity(&mut self.scene, &ov.thumbs, opacity);
+        let t = overview::enter_progress(elapsed);
+        self.set_overview_anim(t);
         true
+    }
+
+    /// Put the entry animation at progress `t` (`1.0` is settled): the
+    /// badges' opacity, and in atlas mode the scrim's opacity and every
+    /// thumbnail image's position. All server nodes; the images are 1:1
+    /// copies of the atlas wherever they are, so no frame downscales.
+    fn set_overview_anim(&mut self, t: f32) {
+        let Some(ov) = self.wm.overview() else {
+            return;
+        };
+        overview::set_badge_opacity(&mut self.scene, &ov.thumbs, t);
+        if ov.atlas {
+            let scale = self
+                .scene
+                .output_info(ov.output)
+                .map_or(1.0, |(_, s)| if s > 0.0 { s } else { 1.0 });
+            overview::set_scrim_opacity(&mut self.scene, ov.scrim_rect, t);
+            overview::place_thumb_images(&mut self.scene, &ov.thumbs, t, scale);
+        }
+    }
+
+    /// Jump the entry animation to its settled state (exact final values).
+    /// The caller has cleared the stamp.
+    fn finish_overview_anim(&mut self) {
+        self.set_overview_anim(1.0);
     }
 
     /// A click (or a touch-down) at device point `point` on `output`,

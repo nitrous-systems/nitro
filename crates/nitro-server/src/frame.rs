@@ -422,6 +422,12 @@ pub struct OutputState {
     /// Holes were on this output while its plane cannot scan out alpha,
     /// and that was logged once.
     pub alpha_warned: std::cell::Cell<bool>,
+    /// The overview's thumbnail atlas for this output (#3902): allocated
+    /// by the server when the output appears (the scene owns the buffer,
+    /// so it is not built here), re-allocated on a size change, freed with
+    /// the output. `None` when disabled (`NITRO_OVERVIEW_ATLAS=0`) or when
+    /// the allocation failed, and overview then snaps.
+    pub atlas: Option<crate::overview::Atlas>,
 }
 
 impl OutputState {
@@ -462,6 +468,7 @@ impl OutputState {
             shadow: shadow.then(|| Shadow::new(width, height)),
             alpha: false,
             alpha_warned: std::cell::Cell::new(false),
+            atlas: None,
         }
     }
 
@@ -1026,6 +1033,102 @@ fn opaque_region_device(scene: &Scene, item: &PaintItem) -> Vec<IRect> {
 /// 584 000 years is not a case worth a `u128`).
 fn duration_us(d: Duration) -> u64 {
     u64::try_from(d.as_micros()).unwrap_or(u64::MAX)
+}
+
+/// Draw `items` (a [`Scene::paint_list`] or [`Scene::paint_window`]
+/// list, global device pixels) into `canvas`, clipped to `clip`
+/// (canvas pixels), each item moved by `offset` first — the canvas's
+/// origin in global device pixels, `(0, 0)` for an output at the origin.
+/// No background and no cursor: this is the item loop alone, for a
+/// canvas that is not an output (the overview's thumbnail atlas).
+///
+/// `fast_scaled` sends an opaque (XR24) image drawn scaled, at opacity 1
+/// and axis-aligned, through [`Canvas::blit_xrgb_scaled`] (~4 ns/px)
+/// onto its device rect rounded to whole pixels, rather than the general
+/// resampling blend (~12 ns/px) onto the exact one. They agree to ±1
+/// inside the rect; the rect's fractional edge pixels are the
+/// difference. The live output path never sets it, so no live pixel
+/// changes.
+#[allow(clippy::too_many_arguments)] // One paint call's inputs, as `paint_region`.
+pub fn paint_items(
+    canvas: &mut Canvas<'_>,
+    clip: &IRect,
+    offset: (i32, i32),
+    items: &[PaintItem],
+    scene: &Scene,
+    text: &mut TextEngine,
+    icons: &mut IconEngine,
+    palette: &Palette,
+    fast_scaled: bool,
+) {
+    let clip = clip.intersect(&canvas.bounds());
+    if clip.is_empty() {
+        return;
+    }
+    #[allow(clippy::cast_precision_loss)] // device coordinates, far below 2^24
+    let shift = nitro_core::Transform::translate(-offset.0 as f32, -offset.1 as f32);
+    for item in items {
+        let item = if offset == (0, 0) {
+            *item
+        } else {
+            PaintItem {
+                transform: shift.then(&item.transform),
+                clip: item.clip.translate(-offset.0, -offset.1),
+                bounds: item.bounds.translate(-offset.0, -offset.1),
+                ..*item
+            }
+        };
+        if fast_scaled && paint_xrgb_scaled(canvas, &clip, &item, scene) {
+            continue;
+        }
+        paint_item(canvas, &clip, &item, scene, text, icons, palette);
+    }
+}
+
+/// [`paint_items`]' fast path: an opaque XR24 image at opacity 1, drawn
+/// axis-aligned and not 1:1, stored with [`Canvas::blit_xrgb_scaled`]
+/// onto its device rect rounded to whole pixels. Returns `false`, having
+/// painted nothing, when it does not apply.
+fn paint_xrgb_scaled(canvas: &mut Canvas<'_>, clip: &IRect, item: &PaintItem, scene: &Scene) -> bool {
+    let PaintKind::Image {
+        size, buffer, src, ..
+    } = item.kind
+    else {
+        return false;
+    };
+    if item.opacity < 1.0 || !item.transform.is_axis_aligned() || item.shift_exact() {
+        return false;
+    }
+    let Ok(buffer) = scene.buffer(buffer) else {
+        return false;
+    };
+    let desc = buffer.desc();
+    if desc.format != format::XR24 {
+        return false;
+    }
+    let exact = item
+        .transform
+        .apply_rect(&Rect::new(0.0, 0.0, size.0, size.1));
+    #[allow(clippy::cast_possible_truncation)] // device pixels
+    let dst = IRect::from_edges(
+        exact.x.round() as i32,
+        exact.y.round() as i32,
+        exact.right().round() as i32,
+        exact.bottom().round() as i32,
+    );
+    let clip = clip.intersect(&item.clip);
+    if dst.is_empty() || clip.is_empty() {
+        return true;
+    }
+    let image = RasterImage {
+        data: buffer.data(),
+        width: desc.w,
+        height: desc.h,
+        stride: desc.stride,
+        format: PixelFormat::Xrgb8888,
+    };
+    canvas.blit_xrgb_scaled(&clip, &dst, &image, &src);
+    true
 }
 
 /// Draw one paint item, already clipped by the caller to a damage rect.

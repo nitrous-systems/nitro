@@ -31,11 +31,17 @@
 //! spacing between cells, [`COLUMN_SPACING`] and [`ROW_SPACING`]; their
 //! doc comments say where the numbers come from.
 
-use nitro_core::{Color, Point, Rect, Size, Transform};
+use nitro_core::{Color, IRect, Palette, Point, Rect, Size, Transform};
+use nitro_raster::Canvas;
 use nitro_scene::{
-    ClientId, Error as SceneError, Fill, IconRef, Layer, NodeKey, NodeKind, OutputId, Scene,
-    WindowFlags, WindowKey, WindowState,
+    BufferDesc, BufferKey, ClientId, Error as SceneError, Fill, IconRef, ImageRef, Layer, NodeKey,
+    NodeKind, OutputId, PaintItem, Scene, WindowFlags, WindowKey, WindowState,
 };
+use nitro_wire::types::format;
+
+use crate::icons::IconEngine;
+use crate::text::TextEngine;
+use crate::warn;
 
 /// The largest scale a thumbnail is ever drawn at: a thumbnail is never
 /// nearly full size. `WINDOW_PREVIEW_MAXIMUM_SCALE` in `workspace.js`.
@@ -514,6 +520,14 @@ pub struct ThumbState {
     pub unhid: bool,
     /// The group holding the icon, if one was built.
     pub badge: Option<NodeKey>,
+    /// Atlas mode only: the scrim's Image node showing this thumbnail's
+    /// slot of the output's [`Atlas`] 1:1. See [`build_thumb_image`].
+    pub image: Option<NodeKey>,
+    /// Where the entry animation starts the thumbnail's top-left, in
+    /// output-local logical pixels: the thumbnail centred on the window's
+    /// pre-overview frame (its slot, for a minimized window). Only read
+    /// in atlas mode.
+    pub start: Point,
 }
 
 /// One output's overview: the scrim plus every thumbnail's restore state.
@@ -533,6 +547,18 @@ pub struct Overview {
     /// every thumbnail and badge is hidden and [`Overview::slot_at`]
     /// selects nothing. See [`set_grid_visible`].
     pub grid_hidden: bool,
+    /// Whether the thumbnails are drawn from the output's [`Atlas`]
+    /// (offscreen windows, Image nodes in the scrim, an entry animation)
+    /// rather than by the live windows scaled in place (the snap
+    /// fallback). See `docs/wm.md` §Overview mode.
+    pub atlas: bool,
+    /// Atlas mode: whether every thumbnail has been rendered into the
+    /// atlas since entry. `false` straight after [`Server::enter_overview`]
+    /// so the next scene update renders them all, damage or not.
+    pub rendered: bool,
+    /// Atlas mode: the scrim's dimming rect, which the entry animation
+    /// fades ([`set_scrim_opacity`]).
+    pub scrim_rect: Option<NodeKey>,
 }
 
 impl Overview {
@@ -763,13 +789,15 @@ pub fn badge_below() -> f32 {
     r.y + r.h
 }
 
-/// How long the badges take to fade in on entry:
-/// `WINDOW_OVERLAY_FADE_TIME` in GNOME's `windowPreview.js`.
+/// How long the entry animation takes: `WINDOW_OVERLAY_FADE_TIME` in
+/// GNOME's `windowPreview.js`.
 ///
-/// Only the badges animate. The thumbnails are the live buffers under
-/// `scale(k)`, so any per-frame damage over them (a scrim fade, slot
-/// motion) goes through the scaled blit at ~17 ms a frame; that waits
-/// on a downscale cache. See `docs/wm.md` §Overview mode.
+/// With the thumbnail [`Atlas`] one clock ([`enter_progress`]) drives the
+/// badges' fade, the scrim's fade and each thumbnail's slide from where
+/// its window was to its slot: every frame is 1:1 copies out of the
+/// atlas. In the snap fallback (no atlas) only the badges fade, because
+/// per-frame damage over the live scaled windows goes through the scaled
+/// blit at ~17 ms a frame. See `docs/wm.md` §Overview mode.
 pub const BADGE_FADE_NS: u64 = 200_000_000;
 
 /// The badges' opacity `elapsed_ns` into the fade: ease-out-quad from
@@ -798,7 +826,8 @@ pub fn set_badge_opacity(scene: &mut Scene, thumbs: &[ThumbState], opacity: f32)
 }
 
 /// Show or hide the whole window grid: each thumbnail's window root and
-/// each badge, one `SetVisible` apiece. Nothing is rebuilt, moved or
+/// each badge, one `SetVisible` apiece — in atlas mode, each thumbnail's
+/// image node and badge instead. Nothing is rebuilt, moved or
 /// faded — see `docs/wm.md` §Overview mode for why the search/grid
 /// cross-fade is deferred (an opacity ramp over the scaled grid is the
 /// measured ~17 ms/frame case until a downscale cache exists).
@@ -810,6 +839,16 @@ pub fn set_badge_opacity(scene: &mut Scene, thumbs: &[ThumbState], opacity: f32)
 /// reappear. Nodes the scene refuses (the window went) are skipped.
 pub fn set_grid_visible(scene: &mut Scene, ov: &Overview, visible: bool) {
     let s = ClientId::SERVER;
+    if ov.atlas {
+        // Atlas mode: the windows are offscreen already; what shows is
+        // each thumbnail's image and badge, all in the scrim.
+        for t in &ov.thumbs {
+            for node in [t.image, t.badge].into_iter().flatten() {
+                let _ = scene.set_visible(s, node, visible);
+            }
+        }
+        return;
+    }
     for t in &ov.thumbs {
         let Ok(info) = scene.window_info(t.window) else {
             continue;
@@ -826,6 +865,246 @@ pub fn set_grid_visible(scene: &mut Scene, ov: &Overview, visible: bool) {
             let _ = scene.set_visible(s, badge, visible);
         }
     }
+}
+
+// ------------------------------------------------------ the thumbnail atlas
+
+/// One output's thumbnail atlas: a server-owned, opaque `XR24` scene
+/// buffer of the output's **device size**, in the output's own (local)
+/// device coordinates. A thumbnail's pixels live at its slot's device
+/// rect ([`slot_device_rect`]); slots never overlap and all lie inside
+/// the work area, so nothing needs packing.
+///
+/// Allocated once, when the output appears, and kept: pressing Super
+/// allocates nothing that scales with the window count
+/// (`docs/surfaces.md` §Overview memory rule). `docs/budget.md` has the
+/// line item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Atlas {
+    /// The scene buffer.
+    pub buffer: BufferKey,
+    /// Its size, device pixels: the output's.
+    pub size: (u32, u32),
+    /// Heap bytes it holds, `w * h * 4`.
+    pub bytes: u64,
+}
+
+impl Atlas {
+    /// Allocate a `w × h` atlas and hand it to the scene, or `None` (with
+    /// a warning) when the memory or the scene refuses — overview then
+    /// snaps with a direct repaint instead, as it did before the atlas.
+    ///
+    /// The zero fill is an explicit write over every byte, so the pages
+    /// are faulted in **now** and the RSS is paid when the output
+    /// appears, not on the first Super press.
+    #[must_use]
+    pub fn allocate(scene: &mut Scene, w: u32, h: u32) -> Option<Self> {
+        let stride = w.checked_mul(4)?;
+        let n = usize::try_from(u64::from(stride) * u64::from(h)).ok()?;
+        if n == 0 {
+            return None;
+        }
+        let mut data: Vec<u8> = Vec::new();
+        if data.try_reserve_exact(n).is_err() {
+            warn!("overview atlas: cannot allocate {n} bytes; overview will snap");
+            return None;
+        }
+        data.resize(n, 0);
+        let desc = BufferDesc::new(w, h, stride, format::XR24).with_opaque(true);
+        match scene.create_buffer(ClientId::SERVER, desc, data) {
+            Ok(buffer) => Some(Self {
+                buffer,
+                size: (w, h),
+                bytes: n as u64,
+            }),
+            Err(e) => {
+                warn!("overview atlas: {e}; overview will snap");
+                None
+            }
+        }
+    }
+
+    /// Give the buffer back to the scene (the output went, or its size
+    /// changed). An image node still sampling it paints nothing after.
+    pub fn free(self, scene: &mut Scene) {
+        let _ = scene.destroy_buffer(ClientId::SERVER, self.buffer);
+    }
+
+    /// The whole atlas as a rect.
+    #[must_use]
+    pub fn bounds(&self) -> IRect {
+        IRect::new(0, 0, self.size.0.cast_signed(), self.size.1.cast_signed())
+    }
+}
+
+/// A slot's rect in its output's **local device pixels**, rounded to
+/// whole pixels: its rect in the atlas, and where its image node lands.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)] // device pixels
+pub fn slot_device_rect(slot: &Slot, scale: f32) -> IRect {
+    let r = slot.rect();
+    let d = |v: f32| (v * scale).round() as i32;
+    IRect::from_edges(d(r.x), d(r.y), d(r.right()), d(r.bottom()))
+}
+
+/// The logical rect whose device rect under `scale` is `device`.
+#[allow(clippy::cast_precision_loss)] // device pixels
+fn logical(device: IRect, scale: f32) -> Rect {
+    Rect::new(
+        device.x as f32 / scale,
+        device.y as f32 / scale,
+        device.w as f32 / scale,
+        device.h as f32 / scale,
+    )
+}
+
+/// The scrim's dimming rect: the first child of its root, as
+/// [`create_scrim`] builds it.
+#[must_use]
+pub fn scrim_rect(scene: &Scene, scrim: WindowKey) -> Option<NodeKey> {
+    let root = scene.window_info(scrim).ok()?.root();
+    scene.node(root).ok()?.children().first().copied()
+}
+
+/// One thumbnail's Image node under `parent` (a group in the scrim):
+/// the slot's device rect of the atlas, shown 1:1 on the slot — so it
+/// takes the rasterizer's copy path, which is what makes the scrim fade
+/// and the slide affordable. `scale` is the output's.
+///
+/// # Errors
+/// Anything the scene refuses.
+pub fn build_thumb_image(
+    scene: &mut Scene,
+    parent: NodeKey,
+    atlas: &Atlas,
+    slot: &Slot,
+    scale: f32,
+) -> Result<NodeKey, SceneError> {
+    let s = ClientId::SERVER;
+    let device = slot_device_rect(slot, scale).intersect(&atlas.bounds());
+    let node = scene.create_node(s, NodeKind::Image, parent, None)?;
+    scene.set_bounds(s, node, logical(device, scale))?;
+    if !device.is_empty() {
+        scene.set_image(s, node, Some(ImageRef::new(atlas.buffer, device)))?;
+    }
+    Ok(node)
+}
+
+/// The entry animation's progress `elapsed_ns` in: the badges' own
+/// ease-out-quad over [`BADGE_FADE_NS`], `0.0` to exactly `1.0` — one
+/// clock for the badges, the scrim and the slide.
+#[must_use]
+pub fn enter_progress(elapsed_ns: u64) -> f32 {
+    badge_opacity(elapsed_ns)
+}
+
+/// Set the scrim's dimming rect to `opacity`. A dead rect is skipped.
+pub fn set_scrim_opacity(scene: &mut Scene, scrim_rect: Option<NodeKey>, opacity: f32) {
+    if let Some(rect) = scrim_rect {
+        let _ = scene.set_opacity(ClientId::SERVER, rect, opacity);
+    }
+}
+
+/// Put every thumbnail's image (and badge) `t` of the way from its
+/// [`ThumbState::start`] to its slot: `0.0` is the start, `1.0` exactly
+/// the slot. Positions land on whole device pixels, so each image stays
+/// a 1:1 copy; the size is the slot's throughout (no zoom).
+pub fn place_thumb_images(scene: &mut Scene, thumbs: &[ThumbState], t: f32, scale: f32) {
+    let s = ClientId::SERVER;
+    for th in thumbs {
+        let slot = slot_device_rect(&th.slot, scale);
+        #[allow(clippy::cast_possible_truncation)] // device pixels
+        let at = |from: f32, to: i32| {
+            if t >= 1.0 {
+                to
+            } else {
+                #[allow(clippy::cast_precision_loss)]
+                let to = to as f32;
+                (from * scale + (to - from * scale) * t).round() as i32
+            }
+        };
+        let device = IRect::new(at(th.start.x, slot.x), at(th.start.y, slot.y), slot.w, slot.h);
+        if let Some(image) = th.image {
+            let _ = scene.set_bounds(s, image, logical(device, scale));
+        }
+        if let Some(badge) = th.badge {
+            // The badge rides the same path unrounded, landing exactly
+            // where `build_thumb_badge` puts it on an unanimated entry.
+            let lerp = |a: f32, b: f32| if t >= 1.0 { b } else { a + (b - a) * t };
+            let pos = Point::new(lerp(th.start.x, th.slot.pos.x), lerp(th.start.y, th.slot.pos.y));
+            let origin = Point::new(pos.x + th.slot.size.w / 2.0, pos.y + th.slot.size.h);
+            let _ = scene.set_bounds(s, badge, Rect::new(origin.x, origin.y, 0.0, 0.0));
+        }
+    }
+}
+
+/// Everything [`render_thumb`] draws with, borrowed from the server.
+pub struct ThumbPaint<'a> {
+    /// Shaped text.
+    pub text: &'a mut TextEngine,
+    /// Icons.
+    pub icons: &'a mut IconEngine,
+    /// The palette in force.
+    pub palette: &'a Palette,
+    /// Scratch for the paint list; cleared before and after.
+    pub items: &'a mut Vec<PaintItem>,
+}
+
+/// Re-render `rect` (output-local device pixels, inside the thumbnail's
+/// slot) of the offscreen thumbnail window `win` into `atlas`, and tell
+/// the scene which atlas pixels changed. `origin` is the output's device
+/// origin. Returns the microseconds it took.
+///
+/// The backdrop is the server's background gradient with [`SCRIM`] over
+/// it — what the settled overview shows around the thumbnail — so the
+/// frame's rounded corners, and anything a translucent window lets
+/// through, show that rather than the wallpaper window (sampling the
+/// output's paint list here would be circular: the atlas images are in
+/// it) and show the *settled* scrim during the fade: a 1–2 px mismatch
+/// at the corners for 200 ms. Then the window's own items, through
+/// [`crate::frame::paint_items`] with the fast scaled path.
+///
+/// Writes the atlas only, through a canvas over its bytes; never the
+/// shadow.
+///
+/// # Errors
+/// Anything the scene refuses; in practice a freed atlas.
+pub fn render_thumb(
+    scene: &mut Scene,
+    atlas: &Atlas,
+    paint: &mut ThumbPaint<'_>,
+    win: WindowKey,
+    rect: IRect,
+    origin: (i32, i32),
+) -> Result<u64, SceneError> {
+    let start = std::time::Instant::now();
+    let rect = rect.intersect(&atlas.bounds());
+    if rect.is_empty() {
+        return Ok(0);
+    }
+    let (w, h) = atlas.size;
+    let global = rect.translate(origin.0, origin.1);
+    scene.with_buffer_detached(ClientId::SERVER, atlas.buffer, |scene, bytes| {
+        let mut canvas = Canvas::new(bytes, w, h, w * 4);
+        crate::render::paint_background(&mut canvas, &rect, w, h, paint.palette);
+        canvas.fill_irect(&rect, &rect, SCRIM);
+        paint.items.clear();
+        scene.paint_window(win, &global, paint.items);
+        crate::frame::paint_items(
+            &mut canvas,
+            &rect,
+            origin,
+            paint.items,
+            scene,
+            paint.text,
+            paint.icons,
+            paint.palette,
+            true,
+        );
+        paint.items.clear();
+    })?;
+    scene.buffer_damaged(ClientId::SERVER, atlas.buffer, &[rect])?;
+    Ok(u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX))
 }
 
 /// Whether a window takes part in overview mode: a `Normal`-layer
@@ -1065,10 +1344,15 @@ mod scene_tests {
                     saved_position: None,
                     unhid: s.window == minimized,
                     badge: Some(*b),
+                    image: None,
+                    start: Point::ZERO,
                 })
                 .collect(),
             fade_start_ns: None,
             grid_hidden: true,
+            atlas: false,
+            rendered: false,
+            scrim_rect: None,
         };
         update(&mut scene);
         assert!(update(&mut scene).is_empty());
@@ -1116,6 +1400,8 @@ mod scene_tests {
                 saved_position: None,
                 unhid: false,
                 badge: Some(*b),
+                image: None,
+                start: Point::ZERO,
             })
             .collect();
         set_badge_opacity(&mut scene, &thumbs, 0.0);
@@ -1275,10 +1561,15 @@ mod scene_tests {
                     saved_position: None,
                     unhid: false,
                     badge: None,
+                    image: None,
+                    start: Point::ZERO,
                 })
                 .collect(),
             fade_start_ns: None,
             grid_hidden: false,
+            atlas: false,
+            rendered: false,
+            scrim_rect: None,
         };
         for s in &slots {
             let centre = Point::new(s.pos.x + s.size.w / 2.0, s.pos.y + s.size.h / 2.0);
@@ -1288,6 +1579,9 @@ mod scene_tests {
         // Search results replaced the grid: nothing is selectable.
         let hidden = Overview {
             grid_hidden: true,
+            atlas: false,
+            rendered: false,
+            scrim_rect: None,
             ..ov
         };
         for s in &slots {

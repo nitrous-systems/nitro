@@ -1833,6 +1833,43 @@ impl Scene {
         buffer.data.bytes_mut().ok_or(Error::ReadOnly)
     }
 
+    /// Write a buffer's pixels while still reading the rest of the scene:
+    /// `f` gets the scene and the buffer's bytes at once.
+    ///
+    /// The buffer's store is taken out for the length of the call (a
+    /// swap with an empty placeholder, which allocates nothing), so inside
+    /// `f` that one buffer reads as **empty** — an image node sampling it
+    /// paints nothing — and every other buffer is as usual. This is how
+    /// the server renders scene content *into* a server-owned buffer (the
+    /// overview's thumbnail atlas) that the scene also shows elsewhere.
+    ///
+    /// Like [`buffer_mut`](Scene::buffer_mut), it changes nothing on
+    /// screen until [`buffer_damaged`](Scene::buffer_damaged).
+    ///
+    /// # Errors
+    /// [`Error::StaleKey`], [`Error::NotOwner`], [`Error::ReadOnly`].
+    pub fn with_buffer_detached<R>(
+        &mut self,
+        client: ClientId,
+        key: BufferKey,
+        f: impl FnOnce(&Self, &mut [u8]) -> R,
+    ) -> Result<R, Error> {
+        let buffer = self.buffers.get_mut(key).ok_or(Error::StaleKey)?;
+        if !client.may_touch(buffer.client) {
+            return Err(Error::NotOwner);
+        }
+        let mut store = std::mem::replace(&mut buffer.data, Box::new(Detached));
+        let result = match store.bytes_mut() {
+            Some(bytes) => Ok(f(self, bytes)),
+            None => Err(Error::ReadOnly),
+        };
+        // `f` only had `&Self`, so the buffer is still there.
+        if let Some(buffer) = self.buffers.get_mut(key) {
+            buffer.data = store;
+        }
+        result
+    }
+
     /// Declare which parts of a buffer changed, in buffer pixels.
     ///
     /// Every image node sampling an overlapping source rect gets the
@@ -2160,5 +2197,21 @@ fn child_position(parent: &Node, before: Option<NodeKey>) -> Result<usize, Error
             .iter()
             .position(|c| *c == sibling)
             .ok_or(Error::BadSibling),
+    }
+}
+
+/// The placeholder a buffer's store is swapped for by
+/// [`Scene::with_buffer_detached`]: zero-sized, so boxing it allocates
+/// nothing, and empty.
+#[derive(Debug)]
+struct Detached;
+
+impl crate::PixelStore for Detached {
+    fn bytes(&self) -> &[u8] {
+        &[]
+    }
+
+    fn bytes_mut(&mut self) -> Option<&mut [u8]> {
+        None
     }
 }
