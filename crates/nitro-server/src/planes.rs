@@ -649,7 +649,7 @@ impl Planner {
 }
 
 #[cfg(test)]
-#[allow(clippy::many_single_char_names)]
+#[allow(clippy::many_single_char_names, clippy::cast_possible_wrap)]
 mod tests {
     use super::*;
     use nitro_kms::{Backend as _, FakeBackend, FakeOutputSpec, FakePlaneSpec, OutputId};

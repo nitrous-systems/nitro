@@ -1135,7 +1135,7 @@ fn clip_overlay(item: &PaintItem, clip: &IRect) -> Option<Overlay> {
         return None;
     };
     if corner_radius > 0.0
-        || border.is_some_and(|b| b.is_visible())
+        || border.is_some_and(nitro_scene::Border::is_visible)
         || !item.transform.is_axis_aligned()
         || !item.clip.contains_rect(clip)
     {
@@ -1173,7 +1173,7 @@ fn fill_overlaid(
         return false;
     };
     if corner_radius > 0.0
-        || border.is_some_and(|b| b.is_visible())
+        || border.is_some_and(nitro_scene::Border::is_visible)
         || item.opacity < 1.0
         || !item.clip.contains_rect(clip)
     {
@@ -2733,6 +2733,7 @@ mod tests {
 /// #3929: the fused scrim and the snap overview's thumbnail covers change
 /// no pixel.
 #[cfg(test)]
+#[allow(clippy::cast_possible_wrap)] // small test dimensions
 mod overlay_tests {
     use super::*;
     use nitro_core::{Point, Size, Transform};
@@ -2955,8 +2956,7 @@ mod overlay_tests {
         s.paint_list(OUT, &full[0], &mut items);
         let ar24 = items
             .iter()
-            .filter(|i| matches!(i.kind, PaintKind::Image { .. }))
-            .next_back()
+            .rfind(|i| matches!(i.kind, PaintKind::Image { .. }))
             .unwrap();
         let covers = fast_scaled_covers(&s, ar24);
         assert_eq!(covers.len(), 1, "the region maps to one device rect");

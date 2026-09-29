@@ -574,7 +574,7 @@ impl Player {
         if may_dma && ui.dmabuf_feedback(NodeId::NONE).is_none() {
             self.awaiting_feedback = true;
             ui.set_timer(FEEDBACK_WAIT_MS, |p: &mut Self, ui: &mut Ui<Self>| {
-                p.begin(ui)
+                p.begin(ui);
             });
         } else {
             self.begin(ui);

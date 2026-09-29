@@ -511,6 +511,7 @@ impl FontDb {
 
     /// What the memo knows about which chain face covers `ch` for `style`:
     /// `None` when unknown, `Some(None)` when no face does.
+    #[allow(clippy::option_option)] // three states: unknown / no face / face
     pub(crate) fn covering(&self, style: &TextStyle, ch: char) -> Option<Option<FontId>> {
         self.chains
             .borrow()

@@ -255,6 +255,7 @@ fn the_latch_takes_its_damage_from_the_frame() {
 }
 
 #[test]
+#[allow(clippy::many_single_char_names)]
 fn an_output_scale_of_1_25_keeps_surface_damage_partial() {
     let mut s = Scene::new();
     s.add_output(OUT, IRect::new(0, 0, 1000, 750), 1.25);
