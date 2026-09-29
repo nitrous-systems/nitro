@@ -992,6 +992,15 @@ struct Server {
     feedback: dmabuf::FeedbackTracker,
     /// Client dma-bufs the KMS import refused (#3918), cumulative.
     dmabuf_kms_refused: u64,
+    /// KMS framebuffers a committed plane layout has shown and the
+    /// backend has not yet reported released (#3899): a client buffer
+    /// among them is still read by the display.
+    on_kms: HashSet<nitro_kms::BufferId>,
+    /// `BufferReleased`s held back until the display lets go of the
+    /// framebuffer: `(framebuffer, owner, buffer)`.
+    held_releases: Vec<(nitro_kms::BufferId, ClientId, BufferKey)>,
+    /// Plane-only commits (`Backend::commit_planes`), cumulative.
+    plane_flips: u64,
     /// Acquire fences that had to be waited for, cumulative.
     fence_waits: u64,
     /// Implicit fences taken by polling the dma-buf itself because
@@ -1417,6 +1426,9 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         fences: dmabuf::FenceSet::new(TOK_FENCE_BASE),
         feedback: dmabuf::FeedbackTracker::default(),
         dmabuf_kms_refused: 0,
+        on_kms: HashSet::new(),
+        held_releases: Vec::new(),
+        plane_flips: 0,
         fence_waits: 0,
         implicit_fence_fallbacks: 0,
         touch_targets: HashMap::new(),
@@ -1839,7 +1851,10 @@ impl Server {
     fn apply_modes(&mut self) {
         let modes = resolve_modes(&self.mode_overrides, &self.settings);
         match self.backend.set_modes(&modes) {
-            Ok(true) => info!("output modes re-applied"),
+            Ok(true) => {
+                info!("output modes re-applied");
+                self.planes_reset(None);
+            }
             Ok(false) => {}
             Err(e) => warn!("applying the configured modes: {e}"),
         }
@@ -2016,6 +2031,8 @@ impl Server {
                     warn!("{}: could not reset the scanout format", info.id);
                 }
                 existing.alpha = false;
+                existing.plane_info = self.backend.planes(info.id);
+                existing.hint_format = planes::hint_format(&existing.plane_info);
                 existing.invalidate();
                 continue;
             }
@@ -2038,6 +2055,8 @@ impl Server {
                 info.refresh_mhz,
                 self.shadow,
             );
+            state.plane_info = self.backend.planes(info.id);
+            state.hint_format = planes::hint_format(&state.plane_info);
             // The overview atlas is paid here, when the output appears,
             // and pre-faulted: nothing on the Super path allocates.
             if self.wants_atlas() {
@@ -2403,6 +2422,18 @@ impl Server {
         if !self.outputs[index].needs_paint() {
             return false;
         }
+        // Which Surfaces go on planes this frame (#3899), before anything
+        // is rasterized: a switch invalidates the output.
+        self.plan_planes(index);
+        let output = &mut self.outputs[index];
+        if output.decision.mode == planes::Mode::Direct {
+            // The output buffer is not on screen: nothing to paint into
+            // it. Leaving direct scanout invalidates it again.
+            output.discard_damage();
+        }
+        if !output.needs_raster() {
+            return output.planes_dirty && self.flip_planes(index);
+        }
         let region = self.outputs[index].repaint_region();
         if region.is_empty() {
             return false;
@@ -2491,8 +2522,15 @@ impl Server {
             .map(|r| KmsRect::new(r.x, r.y, r.w.cast_unsigned(), r.h.cast_unsigned()))
             .collect();
         self.select_scanout_alpha(index);
+        let first = !self.outputs[index].lit;
         match self.backend.commit(id, &kms_damage) {
             Ok(()) => {
+                if first {
+                    // Lighting an output modesets the others, which drops
+                    // their plane layouts.
+                    self.planes_reset(Some(index));
+                }
+                self.note_on_kms(index);
                 if self.first_frame_ms.is_none() {
                     let ms = self.started.elapsed().as_millis() as u64;
                     self.first_frame_ms = Some(ms);
@@ -2516,6 +2554,11 @@ impl Server {
                 // shadow keeps what was painted into it — it is never
                 // stale — so the retry only has to copy again.
                 self.outputs[index].commit_failed(&region);
+                // A layout the kernel refused at commit time after
+                // accepting it in a test: composite from here on.
+                if !self.outputs[index].decision.layout.is_empty() {
+                    self.planes_fallback(index);
+                }
                 false
             }
         }
@@ -2529,7 +2572,9 @@ impl Server {
     /// else happens.
     fn select_scanout_alpha(&mut self, index: usize) {
         let output = &mut self.outputs[index];
-        let holes = self.scene.has_holes(output.scene_id);
+        // Only underlays need the holes to be transparent; an overlay
+        // above covers its hole whatever its alpha (#3899).
+        let holes = output.decision.need_alpha() && self.scene.has_holes(output.scene_id);
         frame::select_scanout_alpha(self.backend.as_mut(), output, holes);
     }
 
@@ -2763,6 +2808,19 @@ impl Server {
             if client.client_caps & nitro_wire::types::caps::RELEASE == 0 {
                 continue;
             }
+            // Still scanned out by a plane (#3899): released when the
+            // flip that replaces it completes.
+            if !self.on_kms.is_empty()
+                && let Some(k) = client
+                    .buffers
+                    .values()
+                    .find(|h| h.key == key)
+                    .and_then(|h| h.scanout)
+                && self.on_kms.contains(&k)
+            {
+                self.held_releases.push((k, owner, key));
+                continue;
+            }
             if let Some(id) = client.buffer_id(key) {
                 client.send(&ServerMsg::BufferReleased(msg::BufferReleased { id }));
             }
@@ -2933,7 +2991,9 @@ impl Server {
                 }
                 SeatEvent::Enable => {
                     info!("session active: resuming");
-                    match self.backend.resume() {
+                    let resumed = self.backend.resume();
+                    self.planes_reset(None);
+                    match resumed {
                         Ok(()) => self.active = true,
                         Err(e) => {
                             error!("resume failed: {e}");
@@ -2971,6 +3031,9 @@ impl Server {
         let mut events = std::mem::take(&mut self.events);
         events.clear();
         self.backend.dispatch(&mut events)?;
+        // Plane buffers a flip stopped reading (#3899), before the flip's
+        // `Presented` goes out.
+        self.drain_kms_releases();
         let mut hotplug = false;
         for ev in events.drain(..) {
             match ev {
@@ -3004,7 +3067,11 @@ impl Server {
         if hotplug {
             info!("hotplug");
             self.unregister_backend();
-            match self.backend.rescan() {
+            let rescan = self.backend.rescan();
+            // A rescan modesets the lit outputs: every layout is back to
+            // the default.
+            self.planes_reset(None);
+            match rescan {
                 Ok(changed) => {
                     if changed {
                         self.sync_outputs();
@@ -6617,6 +6684,7 @@ impl Server {
             dma.iter().filter(|h| h.scanout.is_some()).count() as u64,
         ));
         pairs.push(("dmabuf_kms_refused", self.dmabuf_kms_refused));
+        self.planes_stats(pairs);
         pairs.push(("dmabuf_placeholder_paints", frame::placeholder_paints()));
         pairs.push(("fences_pending", self.fences.len() as u64));
         pairs.push(("fence_waits", self.fence_waits));
@@ -9469,9 +9537,7 @@ impl Server {
                 .and_then(|o| self.outputs.iter().find(|s| s.scene_id == o))
                 .or_else(|| self.outputs.first())
                 .map(|o| o.kms_id);
-            surface::default_scanout_format(
-                &kms.map(|k| self.backend.planes(k)).unwrap_or_default(),
-            )
+            planes::alloc_format(&kms.map(|k| self.backend.planes(k)).unwrap_or_default())
         } else {
             req.format
         };
@@ -10120,6 +10186,16 @@ impl Server {
         if client.client_caps & nitro_wire::types::caps::RELEASE == 0 {
             return;
         }
+        if let Some(k) = client
+            .buffers
+            .values()
+            .find(|h| h.key == key)
+            .and_then(|h| h.scanout)
+            && self.on_kms.contains(&k)
+        {
+            self.held_releases.push((k, client.id, key));
+            return;
+        }
         if let Some(id) = client.buffer_id(key) {
             client.send(&ServerMsg::BufferReleased(msg::BufferReleased { id }));
         }
@@ -10172,6 +10248,13 @@ impl Server {
                 self.dmabuf_sync(prev, false);
             }
             let output = output_of(&self.scene, l.node);
+            // A new frame of a Surface on a plane is a plane-only flip
+            // (#3899): the scene damages nothing for it.
+            for o in &mut self.outputs {
+                if o.decision.places(l.node) {
+                    o.planes_dirty = true;
+                }
+            }
             let Some(client) = self.wire_clients.get_mut(&l.token) else {
                 continue;
             };
@@ -10220,9 +10303,19 @@ impl Server {
     /// module (#3899) is where another answer will come from.
     fn send_surface_hints(&mut self) {
         self.send_node_feedback();
-        let hints = self
-            .surface_hints
-            .changed(&self.scene, nitro_wire::types::format::NV12);
+        let outputs = &self.outputs;
+        let hints = self.surface_hints.changed(&self.scene, |scene, node| {
+            let output = scene
+                .node(node)
+                .ok()
+                .and_then(|n| scene.window_info(n.window()).ok())
+                .and_then(nitro_scene::Window::output);
+            outputs
+                .iter()
+                .find(|o| Some(o.scene_id) == output)
+                .or_else(|| outputs.first())
+                .map_or(nitro_wire::types::format::NV12, |o| o.hint_format)
+        });
         for (token, id, format, width, height) in hints {
             if let Some(client) = self.wire_clients.get_mut(&token) {
                 client.send(&ServerMsg::SurfaceHint(msg::SurfaceHint {
@@ -10350,6 +10443,280 @@ impl Server {
         for win in std::mem::take(&mut self.pending_popup_done) {
             self.send_to_window(win, |popup| ServerMsg::PopupDone(msg::PopupDone { popup }));
         }
+    }
+}
+
+// ------------------------------------------------------------ planes (#3899)
+
+impl Server {
+    /// Which visible Surfaces on output `index` could go on a plane, bottom
+    /// to top: backed by a KMS framebuffer (server-allocated, or an
+    /// imported dma-buf), opaque, axis-aligned, at full opacity. Each says
+    /// whether anything painted above it — or the software cursor —
+    /// touches its visible rect.
+    fn plane_candidates(&self, index: usize, out: &mut Vec<planes::Candidate>) {
+        use nitro_scene::PaintKind;
+        let o = &self.outputs[index];
+        let Some((orect, _)) = self.scene.output_info(o.scene_id) else {
+            return;
+        };
+        let kms_of: HashMap<BufferKey, nitro_kms::BufferId> = self
+            .wire_clients
+            .values()
+            .flat_map(|c| c.buffers.values())
+            .filter_map(|h| Some((h.key, h.scanout?)))
+            .collect();
+        if kms_of.is_empty() {
+            return;
+        }
+        let mut items = Vec::new();
+        self.scene.paint_list(o.scene_id, &orect, &mut items);
+        let cs = self.cursor_state(o.scene_id);
+        let cursor = cs
+            .visible
+            .then(|| Cursor::rect_scaled(cs.x, cs.y, cs.shape, cs.scale).translate(orect.x, orect.y));
+        for (i, item) in items.iter().enumerate() {
+            let size = match item.kind {
+                PaintKind::Surface { size, .. } | PaintKind::Hole { size } => size,
+                _ => continue,
+            };
+            let t = item.transform;
+            if !t.is_axis_aligned() || t.a <= 0.0 || t.d <= 0.0 || item.opacity < 1.0 {
+                continue;
+            }
+            let Some(content) = self
+                .scene
+                .node(item.node)
+                .ok()
+                .and_then(nitro_scene::Node::surface)
+                .and_then(|s| s.content)
+            else {
+                continue;
+            };
+            let Some(&kms) = kms_of.get(&content.buffer) else {
+                continue;
+            };
+            if !self
+                .scene
+                .buffer(content.buffer)
+                .is_ok_and(|b| b.desc().is_opaque())
+            {
+                continue;
+            }
+            let Some(info) = self.backend.buffer_info(kms) else {
+                continue;
+            };
+            let dst = t.apply_rect(&Rect::new(0.0, 0.0, size.0, size.1)).round_out();
+            let visible = dst.intersect(&item.clip).intersect(&orect);
+            if visible.is_empty() {
+                continue;
+            }
+            let obscured = items[i + 1..].iter().any(|l| l.bounds.intersects(&visible))
+                || cursor.is_some_and(|c| c.intersects(&visible));
+            let local = |r: nitro_core::IRect| r.translate(-orect.x, -orect.y);
+            out.push(planes::Candidate {
+                node: item.node,
+                buffer: kms,
+                format: info.format,
+                modifier: info.modifier,
+                src: planes::crop(content.src, local(dst), local(visible)),
+                dst: local(visible),
+                obscured,
+                color: content.color,
+            });
+        }
+    }
+
+    /// Decide output `index`'s plane layout for the frame about to be
+    /// painted, and stage it if it changed.
+    fn plan_planes(&mut self, index: usize) {
+        let o = &self.outputs[index];
+        if o.plane_info.is_empty() || !o.lit || !self.active {
+            return;
+        }
+        let mut cands = Vec::new();
+        self.plane_candidates(index, &mut cands);
+        let now = monotonic_ns();
+        let o = &mut self.outputs[index];
+        let id = o.kms_id;
+        let inp = planes::Inputs {
+            candidates: &cands,
+            planes: &o.plane_info,
+            size: (o.width, o.height),
+            alpha: self.backend.scanout_alpha(id),
+        };
+        let backend = &mut self.backend;
+        let d = o
+            .planner
+            .decide(&inp, now, &mut |a| backend.test_layout(id, a).ok());
+        self.apply_decision(index, d);
+    }
+
+    /// Make `d` output `index`'s layout: flag the placed Surfaces as holes,
+    /// stage the planes, and — when more than the buffers changed —
+    /// repaint the output in full.
+    fn apply_decision(&mut self, index: usize, d: planes::Decision) {
+        let o = &mut self.outputs[index];
+        if d == o.decision {
+            return;
+        }
+        let id = o.kms_id;
+        let reshaped = !d.same_shape(&o.decision);
+        if reshaped {
+            info!(
+                "{id}: planes {:?} -> {:?} ({} placed)",
+                o.decision.mode,
+                d.mode,
+                d.placed.len()
+            );
+            for (n, _) in &o.decision.placed {
+                if !d.places(*n) {
+                    let _ = self.scene.set_surface_on_plane(*n, false);
+                }
+            }
+            for (n, _) in &d.placed {
+                let _ = self.scene.set_surface_on_plane(*n, true);
+            }
+        }
+        // IN_FENCE_FD: every frame placed here latched only once its
+        // acquire fence signalled (#3918), and server-allocated buffers
+        // are CPU-written, so no plane has a fence to wait on today. A
+        // pre-latch fenced path would hand it over with
+        // `Backend::set_plane_fence` here.
+        let staged = self.backend.set_plane_state(id, &d.layout);
+        let o = &mut self.outputs[index];
+        o.decision = d;
+        o.planes_dirty = true;
+        if reshaped {
+            o.invalidate();
+        }
+        if let Err(e) = staged {
+            warn!("{id}: staging planes: {e}");
+            self.planes_fallback(index);
+        }
+    }
+
+    /// A plane-only commit: the staged layout with the current output
+    /// buffer, no raster, no copy — a video frame on a plane.
+    fn flip_planes(&mut self, index: usize) -> bool {
+        self.select_scanout_alpha(index);
+        let id = self.outputs[index].kms_id;
+        match self.backend.commit_planes(id) {
+            Ok(()) => {
+                self.plane_flips += 1;
+                self.outputs[index].planes_committed();
+                self.note_on_kms(index);
+                true
+            }
+            Err(e) => {
+                warn!("{id}: plane commit: {e}");
+                self.planes_fallback(index);
+                false
+            }
+        }
+    }
+
+    /// The kernel refused a layout it had accepted in a test (or it could
+    /// not be staged): back to the default and composite that shape.
+    fn planes_fallback(&mut self, index: usize) {
+        let o = &mut self.outputs[index];
+        o.planner.fallback();
+        let old = std::mem::take(&mut o.decision);
+        o.planes_dirty = false;
+        o.invalidate();
+        let id = o.kms_id;
+        for (n, _) in old.placed {
+            let _ = self.scene.set_surface_on_plane(n, false);
+        }
+        let _ = self.backend.set_plane_state(id, &[]);
+    }
+
+    /// A modeset put every output's planes (but `except`'s) back to the
+    /// default: forget their decisions and repaint them fully.
+    fn planes_reset(&mut self, except: Option<usize>) {
+        for (i, o) in self.outputs.iter_mut().enumerate() {
+            if Some(i) == except {
+                continue;
+            }
+            o.planner.reset();
+            if o.decision == planes::Decision::default() {
+                continue;
+            }
+            let old = std::mem::take(&mut o.decision);
+            o.planes_dirty = false;
+            o.invalidate();
+            for (n, _) in old.placed {
+                let _ = self.scene.set_surface_on_plane(n, false);
+            }
+        }
+        self.drain_kms_releases();
+    }
+
+    /// Remember the framebuffers output `index`'s committed layout reads.
+    fn note_on_kms(&mut self, index: usize) {
+        let ids: Vec<nitro_kms::BufferId> = self.outputs[index].decision.buffers().collect();
+        self.on_kms.extend(ids);
+    }
+
+    /// Framebuffers the display stopped reading: send the `BufferReleased`s
+    /// held back for them.
+    fn drain_kms_releases(&mut self) {
+        for id in self.backend.take_released_buffers() {
+            self.on_kms.remove(&id);
+        }
+        if !self.on_kms.is_empty() {
+            // Freed ids (the client destroyed the buffer) are not reported.
+            let backend = &self.backend;
+            self.on_kms.retain(|k| backend.buffer_info(*k).is_some());
+        }
+        if self.held_releases.is_empty() {
+            return;
+        }
+        let held = std::mem::take(&mut self.held_releases);
+        for (k, owner, key) in held {
+            if self.on_kms.contains(&k) {
+                self.held_releases.push((k, owner, key));
+                continue;
+            }
+            // Shown again since: the scene will release it again.
+            if self.scene.buffer_in_use(key) {
+                continue;
+            }
+            let Some(client) = self.wire_clients.values_mut().find(|c| c.id == owner) else {
+                continue;
+            };
+            if let Some(id) = client.buffer_id(key) {
+                client.send(&ServerMsg::BufferReleased(msg::BufferReleased { id }));
+            }
+        }
+    }
+
+    /// The `planes_*` lines of `stats`.
+    fn planes_stats(&self, pairs: &mut Vec<(&'static str, u64)>) {
+        let sum = |f: fn(&planes::PlannerStats) -> u64| {
+            self.outputs.iter().map(|o| f(&o.planner.stats)).sum::<u64>()
+        };
+        pairs.push((
+            "planes_mode",
+            self.outputs
+                .iter()
+                .map(|o| o.decision.mode.number())
+                .max()
+                .unwrap_or(0),
+        ));
+        pairs.push((
+            "planes_in_use",
+            self.outputs
+                .iter()
+                .map(|o| o.decision.placed.len() as u64)
+                .sum(),
+        ));
+        pairs.push(("planes_tests", sum(|s| s.tests)));
+        pairs.push(("planes_cache_hits", sum(|s| s.cache_hits)));
+        pairs.push(("planes_fallbacks", sum(|s| s.fallbacks)));
+        pairs.push(("planes_switches", sum(|s| s.switches)));
+        pairs.push(("plane_flips", self.plane_flips));
+        pairs.push(("plane_releases_held", self.held_releases.len() as u64));
     }
 }
 

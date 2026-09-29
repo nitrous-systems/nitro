@@ -535,12 +535,14 @@ pub struct Planner {
 }
 
 impl Planner {
-    /// Decide the layout for this frame. `test` asks the kernel.
+    /// Decide the layout for this frame. `test` asks the kernel; `None`
+    /// means the question could not be asked (output not lit yet,
+    /// paused), which counts as a refusal but is not cached.
     pub fn decide(
         &mut self,
         inp: &Inputs<'_>,
         now_ns: u64,
-        test: &mut dyn FnMut(&[PlaneAssignment<'_>]) -> Verdict,
+        test: &mut dyn FnMut(&[PlaneAssignment<'_>]) -> Option<Verdict>,
     ) -> Decision {
         if inp.candidates.is_empty() {
             self.pending = None;
@@ -555,15 +557,24 @@ impl Planner {
             d
         } else {
             let tests = &mut self.stats.tests;
+            let mut asked = true;
             let d = search(inp, &mut |l: &[PlaneConfig]| {
                 *tests += 1;
                 let a: Vec<PlaneAssignment<'_>> = l.iter().map(|c| c.assignment(None)).collect();
-                test(&a).accepted()
+                match test(&a) {
+                    Some(v) => v.accepted(),
+                    None => {
+                        asked = false;
+                        false
+                    }
+                }
             });
-            if self.cache.len() >= CACHE_ENTRIES {
-                self.cache.remove(0);
+            if asked {
+                if self.cache.len() >= CACHE_ENTRIES {
+                    self.cache.remove(0);
+                }
+                self.cache.push((sig, d.clone()));
             }
-            self.cache.push((sig, d.clone()));
             d
         };
         want.rebind(inp.candidates);
@@ -612,6 +623,12 @@ impl Planner {
         self.current = Decision::default();
         self.current_sig = None;
         self.pending = None;
+    }
+
+    /// The decision in force.
+    #[must_use]
+    pub fn current(&self) -> &Decision {
+        &self.current
     }
 
     /// Cached decisions (for tests and `stats`).
@@ -744,7 +761,7 @@ mod tests {
             };
             let (be, id) = (&mut self.be, self.id);
             self.planner
-                .decide(&inp, self.now, &mut |a| be.test_layout(id, a).unwrap())
+                .decide(&inp, self.now, &mut |a| be.test_layout(id, a).ok())
         }
 
         fn plane(&self, i: usize) -> PlaneId {

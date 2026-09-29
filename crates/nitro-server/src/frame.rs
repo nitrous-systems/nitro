@@ -428,6 +428,27 @@ pub struct OutputState {
     /// the output. `None` when `overview.animate` is off (the default) or when
     /// the allocation failed, and overview then snaps.
     pub atlas: Option<crate::overview::Atlas>,
+    /// Which Surfaces go on hardware planes, with its cache and
+    /// hysteresis (#3899).
+    pub planner: crate::planes::Planner,
+    /// The plane layout staged on the backend, and which Surfaces it
+    /// places. Default: composite, nothing staged.
+    pub decision: crate::planes::Decision,
+    /// The staged layout changed (new buffers on the same planes, or a
+    /// hysteresis wait wants another decision) and must be committed
+    /// even with nothing to paint: a plane-only flip.
+    pub planes_dirty: bool,
+    /// The `SurfaceHint` format for Surfaces on this output
+    /// ([`crate::planes::hint_format`]), read from the planes when the
+    /// output appears or changes, not per settle.
+    pub hint_format: u32,
+    /// The output's planes, re-read when the output appears or changes.
+    /// Empty on a backend without planes, which keeps the planes module
+    /// off entirely.
+    pub plane_info: Vec<nitro_kms::PlaneInfo>,
+    /// A commit went in: the backend lit it. The first commit of an
+    /// output modesets every other lit one, which drops their layouts.
+    pub lit: bool,
 }
 
 impl OutputState {
@@ -469,6 +490,12 @@ impl OutputState {
             alpha: false,
             alpha_warned: std::cell::Cell::new(false),
             atlas: None,
+            planner: crate::planes::Planner::default(),
+            decision: crate::planes::Decision::default(),
+            planes_dirty: false,
+            hint_format: nitro_wire::types::format::NV12,
+            plane_info: Vec::new(),
+            lit: false,
         }
     }
 
@@ -577,7 +604,7 @@ impl OutputState {
     /// exactly the bug this is here to fix.
     #[must_use]
     pub fn cursor_only(&self) -> bool {
-        !self.content_damage && !self.retry
+        !self.content_damage && !self.retry && !self.planes_dirty
     }
 
     /// Whether there is damage waiting for a frame at all (ignoring the
@@ -590,7 +617,24 @@ impl OutputState {
     /// Whether a frame would put anything new on screen.
     #[must_use]
     pub fn needs_paint(&self) -> bool {
+        self.needs_raster() || self.planes_dirty
+    }
+
+    /// Whether the output buffer has anything to catch up on — as
+    /// [`OutputState::needs_paint`], without a plane-only change.
+    #[must_use]
+    pub fn needs_raster(&self) -> bool {
         self.retry || !self.damage.is_empty() || !self.previous.is_empty()
+    }
+
+    /// Drop every pending repaint: the output buffer is not on screen
+    /// (direct scanout, #3899), and leaving that mode invalidates.
+    pub fn discard_damage(&mut self) {
+        self.previous.clear();
+        self.damage.clear();
+        self.content_damage = false;
+        self.retry = false;
+        self.scroll = None;
     }
 
     /// The damage this frame alone carries: what the *rasterizer* has to
@@ -635,11 +679,23 @@ impl OutputState {
     /// buffers permanently missing that client's pixels, which shows up as
     /// a window that flickers away every other frame.
     pub fn committed(&mut self) {
+        self.planes_dirty = false;
+        self.lit = true;
         self.previous = self.damage.take();
         self.content_damage = false;
         self.scroll = None;
         self.damage.clear();
         self.retry = false;
+        self.in_flight = std::mem::take(&mut self.painting);
+        self.in_flight_input_ns = self.painting_input_ns;
+        self.painting_input_ns = 0;
+    }
+
+    /// Note that a plane-only commit (`Backend::commit_planes`) went in:
+    /// the serials latched for it ride that flip. No buffer swapped, so
+    /// the damage history stays exactly as it was.
+    pub fn planes_committed(&mut self) {
+        self.planes_dirty = false;
         self.in_flight = std::mem::take(&mut self.painting);
         self.in_flight_input_ns = self.painting_input_ns;
         self.painting_input_ns = 0;

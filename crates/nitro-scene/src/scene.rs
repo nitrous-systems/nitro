@@ -1467,6 +1467,18 @@ impl Scene {
         Ok(())
     }
 
+    /// Whether `key` is a Surface flagged on a plane
+    /// ([`Scene::set_surface_on_plane`]). Its content changes damage
+    /// nothing: it paints as a hole.
+    #[must_use]
+    pub fn surface_on_plane(&self, key: NodeKey) -> bool {
+        !self.on_plane.is_empty()
+            && self
+                .nodes
+                .get(key)
+                .is_some_and(|n| matches!(n.data, NodeData::Surface(s) if s.on_plane))
+    }
+
     /// Whether `output`'s paint list contains any
     /// [`PaintKind::Hole`](crate::PaintKind::Hole): an on-plane Surface that
     /// painted on `output` at the last [`update`](Scene::update), in a
@@ -1663,7 +1675,9 @@ impl Scene {
         if old == surface {
             // Re-presenting the current buffer: the client rewrote it in
             // place (it may, once released... or it tears; its problem).
-            if let (Some(s), Some(rects)) = (surface, rects) {
+            if let (Some(s), Some(rects)) = (surface, rects)
+                && !self.surface_on_plane(key)
+            {
                 if rects.is_empty() {
                     self.mark(key, Dirty::PAINT);
                 } else {
@@ -1680,7 +1694,7 @@ impl Scene {
             surface.map(|s| (s.buffer, s.src)),
             rects,
         );
-        if color_changed {
+        if color_changed && !self.surface_on_plane(key) {
             self.mark(key, Dirty::PAINT);
         }
         Ok(())
@@ -1700,6 +1714,10 @@ impl Scene {
         damage: Option<&[IRect]>,
     ) {
         let swap = self.same_size_swap(old, new);
+        // A Surface on a hardware plane paints as a hole whatever it shows
+        // (#3899): a new buffer there changes the plane, not a pixel of the
+        // output buffer, so it damages nothing.
+        let on_plane = self.surface_on_plane(key);
         if let Some((old, _)) = old
             && let Some(users) = self.buffer_users.get_mut(&old)
         {
@@ -1714,7 +1732,9 @@ impl Scene {
                 buffer.shown = true;
             }
         }
-        if swap && let Some((buffer, src)) = new {
+        if on_plane {
+            // Nothing to repaint.
+        } else if swap && let Some((buffer, src)) = new {
             // The client promises the new buffer matches the old one outside
             // the rects it damages in this commit (`docs/wire.md`), so only
             // those need repainting — whether they arrived before this call
@@ -1911,7 +1931,7 @@ impl Scene {
             let Some((buffer, src)) = node.data.buffer_ref() else {
                 continue;
             };
-            if buffer != key {
+            if buffer != key || self.surface_on_plane(node_key) {
                 continue;
             }
             self.mark_partial(node_key, src, rects);

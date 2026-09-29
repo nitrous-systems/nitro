@@ -319,10 +319,11 @@ impl Hints {
     }
 
     /// Recompute every tracked node's preferred format and device size
-    /// (`format` at the node's device-pixel size, v1's CPU-path answer)
-    /// and return the ones that changed. Call after a scene update. Dead
-    /// nodes are dropped; an empty device rect sends nothing.
-    pub fn changed(&mut self, scene: &Scene, format: u32) -> Vec<Hint> {
+    /// (`format(scene, node)` — the node's output's answer, #3899 — at
+    /// the node's device-pixel size) and return the ones that changed.
+    /// Call after a scene update. Dead nodes are dropped; an empty device
+    /// rect sends nothing.
+    pub fn changed(&mut self, scene: &Scene, format: impl Fn(&Scene, NodeKey) -> u32) -> Vec<Hint> {
         let mut out = Vec::new();
         self.nodes.retain(|(key, _), h| {
             let Ok(node) = scene.node(*key) else {
@@ -335,7 +336,11 @@ impl Hints {
             if device.is_empty() {
                 return true;
             }
-            let now = (format, device.w.cast_unsigned(), device.h.cast_unsigned());
+            let now = (
+                format(scene, *key),
+                device.w.cast_unsigned(),
+                device.h.cast_unsigned(),
+            );
             if h.sent != Some(now) {
                 h.sent = Some(now);
                 out.push((h.token, h.id, now.0, now.1, now.2));
@@ -364,21 +369,10 @@ pub fn hinted_size(scene: &Scene, key: NodeKey) -> Option<(u32, u32)> {
 }
 
 /// The format a server-allocated scanout buffer gets when the client
-/// asks for "the server's choice" (#3914, v1): `NV12` if some plane of the
-/// node's output lists linear NV12, else `YUYV` if one lists it, else
-/// `XR24`. The planes module (#3899) replaces this with its own answer.
+/// asks for "the server's choice": [`crate::planes::alloc_format`].
 #[must_use]
 pub fn default_scanout_format(planes: &[nitro_kms::PlaneInfo]) -> u32 {
-    use nitro_kms::{Fourcc, MOD_LINEAR};
-    use nitro_wire::types::format;
-    let listed = |f: Fourcc| planes.iter().any(|p| p.supports(f, MOD_LINEAR));
-    if listed(Fourcc::NV12) {
-        format::NV12
-    } else if listed(Fourcc::YUYV) {
-        format::YUYV
-    } else {
-        format::XR24
-    }
+    crate::planes::alloc_format(planes)
 }
 
 #[cfg(test)]
@@ -585,15 +579,15 @@ mod tests {
             nitro_scene::OutputId(0),
             &mut d,
         )]));
-        assert_eq!(h.changed(&s, 1), vec![(7, NodeId(5), 1, 16, 16)]);
-        assert!(h.changed(&s, 1).is_empty());
+        assert_eq!(h.changed(&s, |_, _| 1), vec![(7, NodeId(5), 1, 16, 16)]);
+        assert!(h.changed(&s, |_, _| 1).is_empty());
         s.set_bounds(C, n, Rect::new(0.0, 0.0, 32.0, 8.0)).unwrap();
         s.update(&mut nitro_scene::DamageSink::new(&mut [(
             nitro_scene::OutputId(0),
             &mut d,
         )]));
-        assert_eq!(h.changed(&s, 1), vec![(7, NodeId(5), 1, 32, 8)]);
+        assert_eq!(h.changed(&s, |_, _| 1), vec![(7, NodeId(5), 1, 32, 8)]);
         s.destroy_node(C, n).unwrap();
-        assert!(h.changed(&s, 1).is_empty());
+        assert!(h.changed(&s, |_, _| 1).is_empty());
     }
 }
