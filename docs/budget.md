@@ -117,9 +117,40 @@ The two output-sized buffers are 1.78× box1's because the panel is. The
 rest is ~5× box1's ~2.4 MB, and it is the box's **content**, not the
 build: this Arch install indexes **856 fonts** (box1: 47) and
 **313 `.desktop` entries** (box1: 14), and three 3.4–4.4 MB anonymous
-mappings sit next to a 2.6 MB heap. That figure is not audited further
-here. It is the number to watch on a normal desktop install, where box1's
-near-empty font set flatters the server.
+mappings sit next to a 2.6 MB heap. It is the number to watch on a
+normal desktop install, where box1's near-empty font set flatters the
+server.
+
+**Audited by #3928.** The anonymous blocks are not font files. `font_bytes`
+is 0–0.6 MB, and the lazy loader and idle sweep work. They are swash's
+**shaping cache**: strace -k on a debuginfo build shows each block growing
+by `mremap` doubling inside `Layout::run` → `ShapeContext`
+(`FeatureEntry` vectors, `CharmapProxy::from_font`). Every cached face
+keeps its compiled GSUB/GPOS feature store, which is hundreds of KB for
+Noto Sans and the fallback faces testhost2 resolves to. Before #3926 each
+shape minted a fresh cache key, so all 16 default entries filled. After
+#3926 the keys are stable, but the cache still holds the entries for the
+server's lifetime. The rest, from a bare-server bisect at 640×480: the
+856-face font index is ~0.25 MB, and the 313-entry desktop index plus
+icon-theme data is ~0.5 MB.
+
+The fix: the shaper and scaler caches are bounded to 4 faces, and
+`TextEngine::release_idle_fonts` hands them back at the idle point after
+any shape or glyph render (`shape_cache_releases` in `stats`). The two
+indexes drop their growth slack. Idle server under the temporary
+`nitro-dev` unit, 2560×1440 at scale 1.25, full session, overview atlas
+off (the #3916 default):
+
+| testhost2, idle (kB) | VmRSS | RssAnon | anon blocks > 500 kB |
+|---|---|---|---|
+| main `d286a1f` | 30 856 | **21 312** | shadow 15 028, **3 784**, `[heap]` 2 020 |
+| #3928 | 27 208 | **17 680** | shadow 15 192, `[heap]` 2 016 |
+
+That is −3.6 MB. The server is now shadow + ~2.7 MB, the same shape as
+box1. `shape_us_mean` stays in the few-hundred-µs lifetime range of a
+cold start on this box (282 → 384 µs over ~50 layouts, mostly startup
+labels with font reads). The cost of a release is one feature-store
+rebuild on the next shape after idle.
 
 ### The rule
 

@@ -954,6 +954,7 @@ looking for.
 | `text_runs`              | Shaped runs held in the text store: one per text node with content. A `MeasureText` stores nothing, so it never moves this. |
 | `shape_us_mean`          | Mean microseconds per shaping call, over the last 120 (shapes *and* measurements — they run the same layout). |
 | `text_layouts`           | Layout passes since start: every shape and every measure. Monotonic, so a test can assert an interaction did **no** text work — a mean cannot, because real work keeps the mean plausible. |
+| `shape_cache_releases`   | Times the idle point handed swash's shaper and scaler caches back (#3928). Rises once per idle point that followed text work; climbing on a desktop where nothing changes means the gate is broken. |
 | `clients`                | Connected wire clients.                                                  |
 | `windows`                | Windows in the scene.                                                    |
 | `nodes`                  | Nodes in the scene, across every window — the server's own frame nodes included. A decorated window costs the server **eleven** of them (the frame group, the background, the title bar, the application icon, the title text, and three buttons of a hover disc plus a glyph each; **nine** on a `FIXED_SIZE` window, which has no maximize), pinned by `tests/wm.rs::a_frame_costs_eleven_scene_nodes_and_a_fixed_window_nine`. Everything above that in the count is the client's own tree. |
