@@ -34,6 +34,14 @@ icons-import *names:
 size windows="1":
     bash deploy/size.sh {{windows}}
 
+# Every surface-tagged task pastes its delta against the baseline in
+# docs/budget.md. `NITRO_FOOTPRINT_NO_BOX=1 just footprint` skips the box.
+#
+# Binary sizes, dep count and box idle RSS: the docs/budget.md baseline.
+[group('dev')]
+footprint secs="10":
+    FOOTPRINT_BINS="{{box_bins}} nitro-gpu nitro-video" NITRO_BOX={{box}} bash deploy/footprint.sh {{secs}}
+
 # ---------------------------------------------------------------------------
 # Test box (see docs/testbox.md)
 # ---------------------------------------------------------------------------

@@ -28,6 +28,7 @@ just shot          # front-buffer readback → tmp/shot.png
 just box-log       # journalctl -f
 just box-session   # what is running, from the session's own socket
 just box-ps        # RSS + 60 s idle CPU for the whole tree
+just footprint     # binary sizes + dep count + box idle RSS (docs/budget.md baseline)
 just bench         # the throughput matrix; see docs/bench.md
 just bench-report  # that ledger as the markdown docs/bench.md carries
 just bench-bandwidth box   # the box's memcpy rate: copy 3.61 GB/s

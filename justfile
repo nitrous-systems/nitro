@@ -1,8 +1,9 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
-# The development and test-box recipes (fake, icons-import, size, deploy*,
-# box-*, shot, bench*) live in deploy/dev.just. Their names are unchanged
-# (`just deploy`, `just bench`, …), and they run from this directory.
+# The development and test-box recipes (fake, icons-import, size,
+# footprint, deploy*, box-*, shot, bench*) live in deploy/dev.just. Their
+# names are unchanged (`just deploy`, `just bench`, …), and they run from
+# this directory.
 import 'deploy/dev.just'
 
 # A bare `just` runs the checks (the recipes are at the end of this file).

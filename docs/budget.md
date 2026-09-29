@@ -21,6 +21,95 @@ independent of how the compositor stores its fonts.
 stripped and a separate `strip(1)` pass would measure nothing but whether
 the tool is installed.
 
+## Footprint baseline and the surface delta rule
+
+`just footprint [SECS]` (`deploy/footprint.sh`) prints one report with
+three parts. The first is the stripped size of every binary in
+`box_bins` plus `nitro-gpu` and `nitro-video`, which show as `absent`
+until those crates exist. The second is the two `cargo tree` numbers
+from "Dependency count" below. The third is the box's idle desktop tree
+from `deploy/box-ps.sh`. Before it measures, it compares the md5 of the
+local `nitro-server` with the box's and prints a WARNING if they differ.
+In that case run `just deploy` first. `NITRO_FOOTPRINT_NO_BOX=1` skips
+the box part.
+
+The script builds with `--bins --examples`, exactly like
+`just deploy-bins`. A `--bins`-only build unifies features differently:
+eight of the client binaries come out 1–2 KB smaller and the server's
+md5 differs, so a report from that build would not describe what is
+deployed.
+
+### Baseline
+
+Taken at `13f69e2` on 2026-09-29. Before measuring, `just deploy` put
+that same build on the box, so the md5s matched. The tree was
+"dirty" only because of this task's script and docs, which change no
+binary. The desktop was idle: session, wallpaper, bar and launcher, no
+apps open. The idle window was 60 s.
+
+| binary | bytes |
+|---|---|
+| `nitro-server` | 2 977 592 |
+| `nitro-session` | 510 608 |
+| `nitro-shot` | 333 352 |
+| `nitro-demo` | 527 760 |
+| `nitro-bench` | 664 560 |
+| `nitro-calc` | 664 872 |
+| `nitro-amp` | 1 241 856 |
+| `nitro-term` | 785 904 |
+| `nitro-files` | 1 015 832 |
+| `nitro-bar` | 874 928 |
+| `nitro-launcher` | 822 240 |
+| `nitro-wallpaper` | 594 672 |
+| `nitro-settings` | 944 608 |
+| `hey` | 370 384 |
+| `nitro-gpu` | absent |
+| `nitro-video` | absent |
+| **sum** | **12 329 168** |
+
+| dependencies | |
+|---|---|
+| `cargo tree -e normal --prefix none \| sort -u \| wc -l` | **89** |
+| distinct external crate names | **37** |
+
+| box, idle (kB) | VmRSS | RssAnon | RssFile | VmHWM | cpu % |
+|---|---|---|---|---|---|
+| `nitro-session` | 2 808 | 228 | 2 580 | 2 808 | 0.00 |
+| `nitro-server` | 18 404 | **10 388** | 8 016 | 19 076 | 0.02 |
+| `nitro-wallpaper` | 2 752 | 224 | 2 528 | 2 752 | 0.00 |
+| `nitro-bar` | 3 032 | 268 | 2 764 | 3 032 | 0.00 |
+| `nitro-launcher` | 3 056 | 276 | 2 780 | 3 056 | 0.00 |
+| **TOTAL** (without `(sd-pam)`) | 30 052 | **11 384** | 18 668 | | |
+
+RssShmem was 0 on every row.
+
+### The rule
+
+Every task tagged `surface` (the GPU/video work of design #3894) must
+do the following:
+
+1. **State a budget up front** in its plan: the growth it expects in
+   server RssAnon and in each binary it touches.
+2. **Run `just footprint`** after `just deploy` of its branch, so there
+   is no md5 WARNING. It then reports **the delta against this table**
+   (or against a `just footprint` run on its merge base, if main has
+   moved) in its final task message. The report covers:
+   - bytes for every binary it changed, including new ones such as
+     `nitro-gpu` and `nitro-video`. For the rest, a statement that they
+     are byte-identical;
+   - both dependency numbers;
+   - server VmRSS and **RssAnon**, plus the tree TOTAL RssAnon.
+3. **Justify any overrun.** If server RSS or any binary grows by more
+   than the stated budget, the message must justify it. The
+   justification is also recorded as a section on this page, the way the
+   M4-G/H sections below do it. An unjustified overrun is a review
+   failure.
+
+RssAnon is the RSS number that counts. RssFile moves with what the
+binary links, and that is already measured by the binary-size column.
+A new dependency is a delta even if it costs zero bytes: say which crate
+it is and why.
+
 ## Binaries
 
 | binary | bytes | budget | verdict |
@@ -1113,7 +1202,9 @@ recorded so a future milestone can re-open the decision on the same terms:
 ## Dependency count
 
 `cargo tree -e normal --prefix none | sort -u | wc -l` = **74** at M4-A
-(70 at M3, 60 at M2, 48 at M1), matching `DEPENDENCIES.md`. **Distinct
+(70 at M3, 60 at M2, 48 at M1), matching `DEPENDENCIES.md`. It is **89**
+at the footprint baseline (`13f69e2`, above). The milestone figures here
+are history. **Distinct
 external crate names are 37.**
 
 That line count is three different kinds of line added together, which is
