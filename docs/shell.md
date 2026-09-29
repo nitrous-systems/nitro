@@ -951,13 +951,13 @@ output in the last `Outputs` snapshot, the main window's output excepted,
 reconciled at every `OutputsEnd` and every time the server re-places the
 main window; `shell_clients` reads **1** however many outputs there are.
 
-What is *still* one window: `crates/nitro-wallpaper` (M3-D) covers the
-output its window is on and a second output shows the compositor's own
-background. Following the bar is now a small change — one
-`add_surface_window` with `Surface::wallpaper().anchored(Anchor::fill().on(id))`
-per other output, and the same reconcile rule — filed as a follow-up
-rather than done here, since a wallpaper also has to load and scale its
-image per output.
+`crates/nitro-wallpaper` follows the same rule since #3931: one
+`Background` surface per output, anchored with
+`Surface::wallpaper().anchored(Anchor::fill().on(id))`, reconciled at
+every `OutputsEnd`, with an `--image` decoded once and scaled to each
+output's own size. Still open on the server side: an output not at the
+desktop origin is painted shifted by that origin (#3936), which is why
+the wallpaper's second-output pixel test is ignored for now.
 
 **Stacking order in the window list.** The list is ordered by window
 identity. A shell that wants z-order, or the MRU order for a task

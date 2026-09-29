@@ -10,49 +10,58 @@ $ nitro-wallpaper --image bg.ppm     # a picture (binary PPM)
 ```
 
 It is the **smallest possible shell client**, and that is the interesting
-part. A wallpaper has no input, no timers and nothing to subscribe to: it
-opens one window on the `Background` layer, anchors it to all four edges,
-paints once, and then never sends another byte until an output changes
-size.
+part. A wallpaper has no input and no timers: it opens one window per
+output on the `Background` layer, anchors each to all four edges, paints
+once, and then never sends another byte until an output changes.
 
 `a_settled_wallpaper_sends_nothing_at_all` asserts exactly that — not
 even a timer is armed — because a program that sits on screen for the
 whole session and costs nothing to be there is a claim worth checking
 rather than assuming.
 
-## Hotplug is followed without watching anything
+## One surface per output
 
-The wallpaper does **not** subscribe to `Outputs`, and does not need to.
-The server re-applies an anchor from `sync_outputs` on every mode change,
-scale change and hotplug, and tells the client the only way it ever tells
-a client about its own geometry — a `Configure`. The toolkit turns that
-into a relayout and one repaint.
+One process, one shell connection, one `Ui` — and one backdrop window per
+output, exactly as [`nitro-bar`](../nitro-bar) runs one panel per output.
+The main window covers the output the server placed it on; every other
+output gets `add_surface_window` with
+`Surface::wallpaper().anchored(Anchor::fill().on(id))`
+([`docs/shell.md`](../../docs/shell.md) §Anchors).
 
-The obvious implementation (ask for `Outputs`, react to `OutputInfo`)
-would be strictly worse: it subscribes to a stream of events to learn
-something the `Configure` already said, and it creates a second opinion
-about the window's size that has to agree with the server's.
+The wallpaper subscribes to `Outputs` and follows the bar's rule: **the
+extra windows' outputs are the last snapshot minus the main window's
+output**, reconciled at every `OutputsEnd` and whenever the server
+re-places the main window. Plug an output and a window opens on it;
+unplug it and that window closes (at the `OutputGone`, before the
+snapshot that follows). `shell_clients` stays **1**.
+
+## Sizes are still `Configure`-driven
+
+The `Outputs` subscription decides *which* windows exist, never how big
+they are. The server re-applies each anchor on every mode change, scale
+change and hotplug and tells the window with a `Configure`; the toolkit
+relayouts and repaints. Taking sizes from the snapshot instead would be
+a second opinion about a window's size that has to agree with the
+server's.
 
 The gradient is expressed in the **node's own** space, from its top edge
 to its bottom, so the server recomputes it when the node is resized and a
 mode change costs the repaint the `Configure` already caused and nothing
 more.
 
-## One window, and what "per output" now costs
+## An image is decoded once, scaled per output
 
-The spec asks for one surface per output. The wallpaper opens **one**
-window, and the honest description is: the output the server placed it on
-is covered, and a second output shows the compositor's own background.
-
-This used to be a protocol gap — `CreateWindow` carries no output and
-`SetAnchor` anchored to whichever output the window was already on. It
-closed in #3844: `SetAnchor` carries an `output`, and `nitro-ui`'s
-`add_surface_window` opens a second surface anchored to it, which is how
-[`nitro-bar`](../nitro-bar) now runs one panel per output on one
-connection ([`docs/shell.md`](../../docs/shell.md) §Anchors). Following
-it here is one `Surface::wallpaper().anchored(Anchor::fill().on(id))` per
-other output plus loading and scaling the image once per output; that is
-a follow-up, not part of #3844.
+`--image` is decoded **once**, at start-up, and the decoded pixels stay
+in the state: an output plugged in an hour later needs its own copy, and
+re-reading the file (which may have changed or gone) would be worse.
+Each window gets a copy **scaled bilinearly to its own size in device
+pixels**, so a 1920x1080 and a 2560x1440 screen are each sharp rather
+than one stretched from the other. That copy moves into the window's
+`Image` widget, goes to the server in a memfd and is dropped client-side
+at the next paint; unplugging the output releases its buffer. A window
+is scaled for only after it reaches its own output (it is first placed
+on the primary at a placeholder size), and again only when its size
+changes. The tests count both.
 
 ## Images: P6 PPM, and why only that
 
@@ -111,7 +120,10 @@ every other nitro app has.
 
 ## Limitations
 
-* **One output**, argued above.
+* **Output 2's pixels are not asserted yet.** The server currently
+  paints an output that is not at the desktop origin shifted by that
+  origin (#3936), so `a_second_output_is_painted` is `#[ignore]`d until
+  that lands; the geometry, the counts and the scaled sizes are asserted.
 * **P6 PPM only**, argued above.
 * **The image is stretched**, not letterboxed or tiled. Aspect-ratio
   modes are a flag and a rectangle calculation, and nothing in M3 needs
@@ -142,19 +154,15 @@ kilobyte of `hello_dialog` — which is the honest summary of what a
 wallpaper is: the toolkit, one widget, and no application.
 
 The RSS figure is worth a paragraph, because writing this table is what
-caught the one real bug in the crate. A 1920x1080 `--image` wallpaper is
-8 MB of pixels; they reach the server in a memfd and the `Image` widget
-drops its copy at the first paint, so the resident cost is the server's
-mapping rather than a picture in both processes. But the first version
-also handed the whole `Paint` to `App::run` as the app's *state* — which
-lives for the session — so an image wallpaper kept a second 8 MB copy
-that nothing ever read, because a wallpaper has no callbacks to read it
-with.
-
-The state is now `Kind`: `Gradient`, `Solid`, or `Image(w, h)`. It is
-`Copy`, and `the_state_does_not_keep_a_copy_of_the_pixels` asserts that —
-a type holding a `Vec` cannot be `Copy`, so the test stops compiling the
-moment somebody puts the pixels back.
+caught the one real bug in the one-window crate: it kept the whole
+`Paint` as the app's state, so an image wallpaper held a second 8 MB copy
+that nothing ever read. Per-output surfaces changed that trade on
+purpose. The decoded source is now kept (`w * h * 4` anon bytes for the
+session: 8 MB for a 1920x1080 picture), because a later output needs it;
+`the_state_keeps_exactly_one_copy_of_the_pixels` pins it at exactly one.
+Each output's scaled copy is transient in this process and lives on as
+the server's mapping of its memfd — `docs/budget.md` has the per-output
+arithmetic. A gradient or a colour keeps no pixels at all.
 
 ## Tests
 
@@ -170,5 +178,8 @@ whole output with every corner inside the gradient; the gradient really
 being one, lighter at the top; a solid colour painted *exactly*; a 2×2
 image blown up to the output with each quadrant in the right place (which
 is what catches a byte-order bug a "it is not black" assertion would
-miss); zero traffic while idle; and a mode change resizing it — followed
-by silence again.
+miss); zero traffic while idle; a mode change resizing it — followed by
+silence again; a second output getting its own surface on the same
+connection, losing it on unplug and getting one again on plug; and an
+image decoded once and scaled once per output, to each output's own
+size, with the unplugged output's buffer released.

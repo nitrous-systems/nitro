@@ -282,3 +282,217 @@ fn an_explicit_colour_does_not_follow_the_scheme() {
     );
     h.quit();
 }
+
+// ---------------------------------------------------------------------
+// One surface per output
+// ---------------------------------------------------------------------
+
+/// A screenshot of the output named `name`: `(width, height, pixels)`,
+/// each pixel `0xRRGGBB`. The harness's own `output_shot` reads only the
+/// first output.
+fn shot_of(h: &Harness<Wallpaper>, name: &str) -> (u32, u32, Vec<u32>) {
+    use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+    let stream =
+        std::os::unix::net::UnixStream::connect(h.server().control_path()).expect("control");
+    let mut conn = BufReader::new(stream);
+    conn.get_mut()
+        .write_all(format!("shot {name}\n").as_bytes())
+        .unwrap();
+    let mut header = String::new();
+    conn.read_line(&mut header).unwrap();
+    let fields: Vec<u32> = header
+        .trim_end()
+        .strip_prefix("ok ")
+        .unwrap_or_else(|| panic!("shot {name}: {header}"))
+        .split(' ')
+        .map(|v| v.parse().unwrap())
+        .collect();
+    let (width, height, stride) = (fields[0], fields[1], fields[2]);
+    let mut data = vec![0u8; (stride * height) as usize];
+    conn.read_exact(&mut data).unwrap();
+    let mut px = Vec::with_capacity((width * height) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            let o = (y * stride + x * 4) as usize;
+            px.push(u32::from_le_bytes([data[o], data[o + 1], data[o + 2], 0]));
+        }
+    }
+    (width, height, px)
+}
+
+/// The output names and sizes, from the control socket's `outputs`.
+fn output_names(h: &Harness<Wallpaper>) -> Vec<(String, u32, u32)> {
+    h.server()
+        .request("outputs\n")
+        .iter()
+        .filter_map(|l| {
+            let mut w = l.split(' ');
+            let name = w.next()?.to_owned();
+            let mode = w.next()?.split('@').next()?;
+            let (x, y) = mode.split_once('x')?;
+            Some((name, x.parse().ok()?, y.parse().ok()?))
+        })
+        .collect()
+}
+
+/// Settle until `f` holds.
+fn until(h: &mut Harness<Wallpaper>, what: &str, f: impl Fn(&Harness<Wallpaper>) -> bool) {
+    for _ in 0..400 {
+        if f(h) {
+            return;
+        }
+        h.settle();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("timed out waiting for {what}");
+}
+
+/// The 2×2 red/green/blue/yellow test image.
+fn quadrants() -> Paint {
+    let mut file = b"P6\n2 2\n255\n".to_vec();
+    file.extend_from_slice(&[
+        0xff, 0x00, 0x00, 0x00, 0xff, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0x00,
+    ]);
+    Paint::Image(ppm::parse_ppm(&file).expect("a P6 file"))
+}
+
+#[test]
+fn a_second_output_gets_its_own_wallpaper_and_loses_it_on_unplug() {
+    // The headline of #657: on two outputs both show wallpaper, on one
+    // connection, and an unplug closes the surface that output had.
+    let want = Color::rgb(0x20, 0x24, 0x30);
+    let mut h = wallpaper(&Paint::Solid(want));
+    h.settle();
+    until(&mut h, "the snapshot", |h| h.state().outputs().len() == 1);
+    assert_eq!(h.state().surface_count(), 1, "one output, one surface");
+
+    assert_eq!(h.server().request_line("plug 400x300\n"), "ok");
+    until(&mut h, "the second surface", |h| {
+        h.state().surface_count() == 2
+    });
+    h.settle();
+    assert_eq!(h.ui().windows().len(), 2, "two windows in one Ui");
+    assert_eq!(h.server().stat("shell_clients"), 1, "on one connection");
+    let outs = h.state().surface_outputs();
+    assert_ne!(outs[0], outs[1], "one surface on each output");
+    let second = h.ui().windows()[1];
+    assert_eq!(h.ui().window_size_of(second), Size::new(400.0, 300.0));
+
+    // The first output is still covered. The second's *pixels* are
+    // asserted in `a_second_output_is_painted`, ignored until #3936.
+    let (sw, sh, px) = shot_of(&h, &output_names(&h)[0].0);
+    for (x, y) in [(0, 0), (sw - 1, 0), (0, sh - 1), (sw / 2, sh / 2)] {
+        assert_eq!(px[(y * sw + x) as usize], 0x0020_2430, "({x}, {y})");
+    }
+
+    // Unplug: the surface on that output goes, the main one stays.
+    assert_eq!(h.server().request_line("unplug\n"), "ok");
+    until(&mut h, "the surface to close", |h| {
+        h.state().surface_count() == 1
+    });
+    h.settle();
+    assert_eq!(h.ui().windows().len(), 1);
+    assert_eq!(h.server().stat("windows"), 1, "and the server agrees");
+
+    // Plug again: back to two. And then quiet.
+    assert_eq!(h.server().request_line("plug 640x480\n"), "ok");
+    until(&mut h, "a surface again", |h| {
+        h.state().surface_count() == 2
+    });
+    h.settle();
+    h.assert_idle(100);
+    h.quit();
+}
+
+#[test]
+fn an_image_is_decoded_once_and_scaled_per_output() {
+    // Different sizes on the two outputs: each gets a copy scaled to its
+    // own size, from the one decoded source the state holds.
+    let paint = quadrants();
+    let mut h = wallpaper(&paint);
+    h.settle();
+    until(&mut h, "the main window fitted", |h| {
+        h.state().fitted().first().copied().flatten().is_some()
+    });
+    let resident = h.state().resident_bytes();
+    assert_eq!(resident, 16, "the 2×2 source, once");
+    let buffers_one = h.server().stat("buffers");
+
+    assert_eq!(h.server().request_line("plug 400x200\n"), "ok");
+    until(&mut h, "the second surface fitted", |h| {
+        h.state().fitted().len() == 2 && h.state().fitted()[1].is_some()
+    });
+    h.settle();
+    assert_eq!(
+        h.state().fitted(),
+        vec![Some((320, 240)), Some((400, 200))],
+        "each output's copy is its own size"
+    );
+    assert_eq!(h.state().scales(), 2, "one scale per output");
+    assert_eq!(h.state().resident_bytes(), resident, "still one source");
+    assert_eq!(
+        h.server().stat("buffers"),
+        buffers_one + 1,
+        "one per output"
+    );
+
+    // The quadrants land in the right place on the first output; the
+    // second's pixels wait on #3936 (see `a_second_output_is_painted`).
+    let (name, _, _) = output_names(&h)[0].clone();
+    assert_quadrants(&h, &name);
+
+    // Unplugging drops that output's copy: its buffer is released.
+    assert_eq!(h.server().request_line("unplug\n"), "ok");
+    until(&mut h, "the surface to close", |h| {
+        h.state().surface_count() == 1
+    });
+    h.settle();
+    assert_eq!(h.server().stat("buffers"), buffers_one, "its copy is gone");
+    h.assert_idle(100);
+    h.quit();
+}
+
+/// The four quadrants of [`quadrants`] on the output named `name`,
+/// sampled well inside each.
+fn assert_quadrants(h: &Harness<Wallpaper>, name: &str) {
+    let (sw, sh, px) = shot_of(h, name);
+    let at = |x: u32, y: u32| px[(y * sw + x) as usize];
+    assert_eq!(at(sw / 8, sh / 8), 0x00ff_0000, "{name} top-left red");
+    assert_eq!(
+        at(sw * 7 / 8, sh / 8),
+        0x0000_ff00,
+        "{name} top-right green"
+    );
+    assert_eq!(
+        at(sw / 8, sh * 7 / 8),
+        0x0000_00ff,
+        "{name} bottom-left blue"
+    );
+    assert_eq!(
+        at(sw * 6 / 8, sh * 6 / 8),
+        0x00ff_ff00,
+        "{name} bottom-right yellow"
+    );
+}
+
+#[test]
+#[ignore = "#3936: nitro-server paints an output not at (0, 0) offset by its origin"]
+fn a_second_output_is_painted() {
+    // Pixels on the second output, each output's copy scaled to its own
+    // size. The wallpaper's side is right (the geometry and the scaled
+    // sizes are asserted above); the server draws output 2 shifted by
+    // its desktop origin, so its left 320 columns show the background.
+    let mut h = wallpaper(&quadrants());
+    h.settle();
+    assert_eq!(h.server().request_line("plug 400x200\n"), "ok");
+    until(&mut h, "the second surface fitted", |h| {
+        h.state().fitted().len() == 2 && h.state().fitted()[1].is_some()
+    });
+    h.settle();
+    for (name, w, hh) in output_names(&h) {
+        let (sw, sh, _) = shot_of(&h, &name);
+        assert_eq!((sw, sh), (w, hh));
+        assert_quadrants(&h, &name);
+    }
+    h.quit();
+}

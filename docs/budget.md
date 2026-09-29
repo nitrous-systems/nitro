@@ -809,6 +809,28 @@ having; the constant is what to attack if 3 MB is a hard limit, and the
 first place to look is the 64 KiB `recv` scratch buffer each `Socket`
 allocates.
 
+### A wallpaper per output: what each extra output costs (#3931)
+
+Arithmetic, not a box measurement: the change landed while the server's
+second-output paint was broken (#3936), so there is no honest two-screen
+RSS row yet. The costs, for an `--image` wallpaper:
+
+| where | cost | lifetime |
+|---|---|---|
+| `nitro-wallpaper` RssAnon: the decoded source | `w * h * 4` of the **image** (8 MB for 1920x1080) | the session — once, however many outputs |
+| `nitro-wallpaper`: each output's scaled copy | `W * H * 4` of **that output** (8 MB at 1080p, 14.7 MB at 1440p) | transient: built, written to a memfd, dropped at the next paint |
+| server `RssShmem`: each output's buffer | `W * H * 4` of that output | while the output is plugged; released on unplug |
+| scene: one window, two widgets' nodes | a few hundred bytes | while the output is plugged |
+
+So each extra output costs **one output-sized buffer**, shared between the
+client (its memfd pages) and the server (the mapping) rather than one copy
+each; the client's peak rises by one output's copy while it scales. The
+one-window wallpaper kept no source at all (its state was `Copy`); keeping
+it is the price of scaling for an output plugged in later without
+re-reading the file. A gradient or a solid colour costs nothing per output
+beyond the window. Re-measure the M3 table's wallpaper row on two screens
+once #3936 lands.
+
 ### The M3 desktop (whole tree, real KMS, 1920×1080@60)
 
 The M3-E exit measurement: `nitro-session` supervising the compositor,
