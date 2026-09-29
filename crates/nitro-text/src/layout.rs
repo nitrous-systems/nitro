@@ -168,7 +168,7 @@ impl Layout {
         // Only the faces this string actually needs are read off disk; see
         // `load_chain`. `loaded` owns the bytes for the rest of the call, so an
         // eviction mid-shape cannot invalidate a `FontRef` built from them.
-        let loaded = load_chain(db, &chain, text);
+        let loaded = load_chain(db, style, &chain, text);
         let fonts: Vec<(FontId, FontRef<'_>)> = loaded
             .iter()
             .filter_map(|(id, data)| data.font_ref().map(|f| (*id, f)))
@@ -298,7 +298,19 @@ impl Layout {
 /// case, Latin text in the UI font, touches exactly one font file, which is
 /// the whole point of the lazy db. A face that fails to load is skipped, so a
 /// font deleted since the scan costs a fallback rather than a blank label.
-fn load_chain(db: &FontDb, chain: &[FontId], text: &str) -> Vec<(FontId, FaceData)> {
+///
+/// Which chain face covers a missing character is memoized in the db
+/// ([`FontDb::fallbacks`]'s memo), **including "no face does"**: a character
+/// nothing installed has used to read every file in the chain on every shape
+/// — 213 reads and as many cap evictions per label on a box with 856 faces
+/// (#3926). Now it costs one walk, ever, and renders as the primary's
+/// `.notdef`, exactly as before.
+fn load_chain(
+    db: &FontDb,
+    style: &TextStyle,
+    chain: &[FontId],
+    text: &str,
+) -> Vec<(FontId, FaceData)> {
     let mut out: Vec<(FontId, FaceData)> = Vec::new();
     let mut rest = chain.iter();
     // Walk to the first face that loads; that one is the primary.
@@ -326,6 +338,32 @@ fn load_chain(db: &FontDb, chain: &[FontId], text: &str) -> Vec<(FontId, FaceDat
     }
     missing.sort_unstable();
     missing.dedup();
+    // Characters the memo already answers: load the named face (once), and
+    // drop the ones nobody covers.
+    let mut known: Vec<FontId> = Vec::new();
+    missing.retain(|c| match db.covering(style, *c) {
+        Some(Some(id)) => {
+            if !known.contains(&id) {
+                known.push(id);
+            }
+            false
+        }
+        Some(None) => false,
+        None => true,
+    });
+    // Keep chain order so `split_runs` picks the same face it would have.
+    for id in chain.iter().filter(|id| known.contains(id)) {
+        if out.iter().any(|(o, _)| o == id) {
+            continue;
+        }
+        if let Some(data) = db.face(*id) {
+            out.push((*id, data));
+        }
+    }
+    if missing.is_empty() {
+        return sort_by_chain(out, chain);
+    }
+    let unknown = missing.clone();
     for id in rest {
         let Some(data) = db.face(*id) else {
             continue;
@@ -339,12 +377,31 @@ fn load_chain(db: &FontDb, chain: &[FontId], text: &str) -> Vec<(FontId, FaceDat
             // pick it, so loading it would be a disk read for nothing.
             continue;
         }
-        missing.retain(|c| charmap.map(*c) == 0);
-        out.push((*id, data));
+        missing.retain(|c| {
+            let covered = charmap.map(*c) != 0;
+            if covered {
+                db.record_covering(style, *c, Some(*id));
+            }
+            !covered
+        });
+        if !out.iter().any(|(o, _)| o == id) {
+            out.push((*id, data));
+        }
         if missing.is_empty() {
             break;
         }
     }
+    // What is still missing after the whole chain is covered by nothing.
+    for c in unknown.iter().filter(|c| missing.contains(c)) {
+        db.record_covering(style, *c, None);
+    }
+    sort_by_chain(out, chain)
+}
+
+/// Order loaded faces as in the chain (primary first), so run splitting
+/// prefers the same face whether it came from the memo or from a walk.
+fn sort_by_chain(mut out: Vec<(FontId, FaceData)>, chain: &[FontId]) -> Vec<(FontId, FaceData)> {
+    out.sort_by_key(|(id, _)| chain.iter().position(|c| c == id).unwrap_or(usize::MAX));
     out
 }
 

@@ -447,6 +447,11 @@ impl TextEngine {
         out.push(("font_loads", self.db.loads()));
         out.push(("font_releases", self.db.releases()));
         out.push(("font_evictions", self.db.evictions()));
+        // Fallback-chain memo misses and uncached coverage walks (#3926):
+        // both settle at a handful on a live desktop. Either climbing with
+        // the frame count means text is walking the font index per label.
+        out.push(("font_chain_builds", self.db.chain_builds()));
+        out.push(("font_fallback_walks", self.db.fallback_walks()));
         out.push(("glyphs_cached", self.atlas.glyph_count() as u64));
         out.push(("glyph_renders", self.atlas.renders()));
         out.push(("atlas_pages", self.atlas.page_count() as u64));
@@ -720,6 +725,11 @@ mod tests {
         engine.write_pairs(&mut pairs);
         let loads = get(&pairs, "font_loads");
         assert!(loads > 0, "shaping read a file: {pairs:?}");
+        assert_eq!(get(&pairs, "font_chain_builds"), 1, "one style, one chain");
+        engine.shape(2, &request, "Another title");
+        pairs.clear();
+        engine.write_pairs(&mut pairs);
+        assert_eq!(get(&pairs, "font_chain_builds"), 1, "the chain is memoized");
         assert_eq!(get(&pairs, "font_releases"), 0, "and has not let go yet");
 
         engine.next_frame();

@@ -945,6 +945,8 @@ looking for.
 | `font_loads`             | Font files read from disk since startup — the miss counter. |
 | `font_releases`          | Files handed back by the **idle sweep** since startup. `font_bytes` is an instant and cannot tell "the sweep is working" from "no face was ever loaded": both settle at 0. `font_releases` tracking `font_loads` is the sweep doing its job, and a `font_loads` far ahead of it is the leak the sweep exists to prevent (#538). |
 | `font_evictions`         | Files dropped by the **cap** (`NITRO_FONT_CACHE_MB`), never by the sweep. Non-zero means one frame's working set genuinely overran the cap — a distinct and more alarming fact than an ordinary idle release. |
+| `font_chain_builds`      | Fallback chains built from scratch — the memo's miss counter. One per distinct (family, weight, slant) on screen; climbing with `frames` means every label is walking the whole font index again (#3926). |
+| `font_fallback_walks`    | Characters looked up along a fallback chain because no earlier shape had, including ones no installed face covers (remembered as "none"). Settles at a handful; climbing means the coverage memo is missing (#3926). |
 | `glyphs_cached`          | Distinct glyph masks in the atlas (font, glyph, quantized size, subpixel bucket). |
 | `glyph_renders`          | Masks actually rasterized since startup. It stops rising once a UI's glyphs are all cached; a number that keeps climbing on a static screen means the cache key is churning. |
 | `atlas_pages`            | 1024x1024 A8 pages allocated, 1 MiB each.                                |

@@ -14,12 +14,12 @@
 //! second boot does not have to re-read every font file to rebuild it.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use swash::{FontDataRef, FontRef, StringId};
+use swash::{CacheKey, FontDataRef, FontRef, StringId};
 
 use crate::index::{self, FaceRecord};
 
@@ -32,7 +32,7 @@ use crate::index::{self, FaceRecord};
 pub struct FontId(pub u32);
 
 /// A font family request: one of the three generic aliases, or a name.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub enum Family {
     /// The generic sans-serif alias.
     #[default]
@@ -151,6 +151,8 @@ const DEFAULT_CACHE_MB: f64 = 8.0;
 pub struct FaceData {
     bytes: Arc<Vec<u8>>,
     index: u32,
+    /// The face's swash cache key; see [`FaceData::font_ref`].
+    key: CacheKey,
 }
 
 impl FaceData {
@@ -168,9 +170,21 @@ impl FaceData {
 
     /// A `swash::FontRef` over these bytes, or `None` if the file has changed
     /// under us since the index was built.
+    ///
+    /// The ref carries the face's **stable** cache key, one per [`FontId`]
+    /// minted when the index was ingested. swash's `ShapeContext` and
+    /// `ScaleContext` key their per-font caches (the compiled GSUB/GPOS
+    /// feature store, the scaler state) on `FontRef::key`, and
+    /// `FontRef::from_index` mints a fresh key on every call — so before
+    /// #3926 every shape rebuilt the feature tables from scratch: 35–50 µs a
+    /// label with Noto Sans's large layout tables. The key belongs to the
+    /// face id, not to the bytes, and stays right across an eviction and a
+    /// reload because swash caches table offsets, never pointers.
     #[must_use]
     pub fn font_ref(&self) -> Option<FontRef<'_>> {
-        FontRef::from_index(self.bytes.as_slice(), self.index as usize)
+        let mut font = FontRef::from_index(self.bytes.as_slice(), self.index as usize)?;
+        font.key = self.key;
+        Some(font)
     }
 }
 
@@ -229,6 +243,30 @@ fn env_cache_bytes() -> usize {
     (mb.clamp(0.0, 1024.0) * 1024.0 * 1024.0) as usize
 }
 
+/// What a fallback chain is memoized under: everything
+/// [`FontDb::fallbacks`] selects on. The size is not in it — it does not
+/// affect selection.
+type ChainKey = (Family, u16, bool);
+
+/// Upper bound on memoized chains. `Family::Named` is client-controlled, so
+/// the memo is cleared rather than allowed to grow without limit.
+const MAX_CHAINS: usize = 64;
+
+/// Upper bound on the characters one chain remembers a coverer for.
+const MAX_COVERED: usize = 4096;
+
+/// One memoized fallback chain.
+#[derive(Debug)]
+struct Chain {
+    ids: Arc<[FontId]>,
+    /// For a character the chain's primary has no glyph for: the first face
+    /// after the primary that has one, or `None` when no face in the chain
+    /// does. Recording the `None` is the point — a character nothing
+    /// installed covers otherwise re-reads every file in the chain on every
+    /// shape.
+    cover: HashMap<char, Option<FontId>>,
+}
+
 /// The font index.
 ///
 /// Built once at startup and never mutated. Holds **no font bytes** until a
@@ -246,6 +284,17 @@ pub struct FontDb {
     /// every font file.
     from_cache: bool,
     cache: RefCell<Cache>,
+    /// One swash cache key per face, parallel to `faces`; see
+    /// [`FaceData::font_ref`].
+    keys: Vec<CacheKey>,
+    /// Memoized fallback chains. The index is immutable after the scan, so a
+    /// chain never goes stale and the memo is never invalidated, only
+    /// bounded.
+    chains: RefCell<HashMap<ChainKey, Chain>>,
+    /// Chains built from scratch (memo misses), for tests and stats.
+    chain_builds: std::cell::Cell<u64>,
+    /// Characters looked up along a chain because the memo did not know them.
+    fallback_walks: std::cell::Cell<u64>,
 }
 
 impl FontDb {
@@ -347,6 +396,7 @@ impl FontDb {
             } = record;
             let family_lower = family.to_ascii_lowercase();
             let id = self.faces.len() as u32;
+            self.keys.push(CacheKey::new());
             let info = self.by_family.entry(family_lower.clone()).or_default();
             info.faces.push(id);
             info.mono |= monospace || family_lower.contains("mono");
@@ -413,8 +463,68 @@ impl FontDb {
     /// This is a list of *ids*: nothing is read off disk by building it, which
     /// is what lets the shaper load the primary face only and touch the rest
     /// of the chain solely when a character needs it.
+    ///
+    /// Memoized per (family, weight, italic): building a chain walks every
+    /// family in the index, which on a box with 856 faces was 87 µs — more
+    /// than the shape itself, paid on every label (#3926).
     #[must_use]
-    pub fn fallbacks(&self, style: &TextStyle) -> Vec<FontId> {
+    pub fn fallbacks(&self, style: &TextStyle) -> Arc<[FontId]> {
+        let key = chain_key(style);
+        if let Some(chain) = self.chains.borrow().get(&key) {
+            return Arc::clone(&chain.ids);
+        }
+        let ids: Arc<[FontId]> = self.build_fallbacks(style).into();
+        self.chain_builds.set(self.chain_builds.get() + 1);
+        let mut chains = self.chains.borrow_mut();
+        if chains.len() >= MAX_CHAINS {
+            chains.clear();
+        }
+        chains.insert(
+            key,
+            Chain {
+                ids: Arc::clone(&ids),
+                cover: HashMap::new(),
+            },
+        );
+        ids
+    }
+
+    /// Fallback chains built from scratch since startup — the memo's miss
+    /// counter. One per distinct (family, weight, slant) in steady state.
+    #[must_use]
+    pub fn chain_builds(&self) -> u64 {
+        self.chain_builds.get()
+    }
+
+    /// Characters the shaper had to look up along a fallback chain because
+    /// no earlier shape had: each costs up to one read per chain face, once.
+    #[must_use]
+    pub fn fallback_walks(&self) -> u64 {
+        self.fallback_walks.get()
+    }
+
+    /// What the memo knows about which chain face covers `ch` for `style`:
+    /// `None` when unknown, `Some(None)` when no face does.
+    pub(crate) fn covering(&self, style: &TextStyle, ch: char) -> Option<Option<FontId>> {
+        self.chains
+            .borrow()
+            .get(&chain_key(style))
+            .and_then(|chain| chain.cover.get(&ch).copied())
+    }
+
+    /// Record the result of a chain walk for `ch`.
+    pub(crate) fn record_covering(&self, style: &TextStyle, ch: char, font: Option<FontId>) {
+        self.fallback_walks.set(self.fallback_walks.get() + 1);
+        if let Some(chain) = self.chains.borrow_mut().get_mut(&chain_key(style)) {
+            if chain.cover.len() >= MAX_COVERED {
+                chain.cover.clear();
+            }
+            chain.cover.insert(ch, font);
+        }
+    }
+
+    /// The uncached fallback chain.
+    fn build_fallbacks(&self, style: &TextStyle) -> Vec<FontId> {
         let mut out = Vec::new();
         if let Some(id) = self.select(style) {
             out.push(id);
@@ -424,17 +534,17 @@ impl FontDb {
             Family::Mono => Family::Mono,
             Family::Serif => Family::Serif,
         };
-        let mut seen: Vec<&str> = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
         if let Some(first) = out.first() {
-            seen.push(&self.faces[first.0 as usize].family_lower);
+            seen.insert(&self.faces[first.0 as usize].family_lower);
         }
         for family in self.alias_families(&generic) {
-            if seen.contains(&family.as_str()) {
+            if seen.contains(family) {
                 continue;
             }
-            if let Some(id) = self.pick_in_family(&family, style) {
+            if let Some(id) = self.pick_in_family(family, style) {
                 out.push(id);
-                seen.push(&self.faces[id.0 as usize].family_lower);
+                seen.insert(&self.faces[id.0 as usize].family_lower);
             }
         }
         out
@@ -465,6 +575,7 @@ impl FontDb {
         Some(FaceData {
             bytes,
             index: face.index,
+            key: self.keys[font.0 as usize],
         })
     }
 
@@ -638,22 +749,22 @@ impl FontDb {
 
     /// Every family in a generic alias list that is present, alias order first
     /// then the class-matching families in name order.
-    fn alias_families(&self, generic: &Family) -> Vec<String> {
+    fn alias_families(&self, generic: &Family) -> Vec<&str> {
         let prefs = prefs_for(generic);
-        let mut out: Vec<String> = Vec::new();
+        let mut out: Vec<&str> = Vec::new();
         for pref in prefs {
-            if self.by_family.contains_key(*pref) {
-                out.push((*pref).to_string());
+            if let Some((key, _)) = self.by_family.get_key_value(*pref) {
+                out.push(key.as_str());
             }
         }
         let mut rest: Vec<&str> = self
             .by_family
             .keys()
             .map(String::as_str)
-            .filter(|name| self.family_matches(name, generic) && !out.iter().any(|o| o == name))
+            .filter(|name| self.family_matches(name, generic) && !prefs.contains(name))
             .collect();
         rest.sort_unstable();
-        out.extend(rest.into_iter().map(ToString::to_string));
+        out.extend(rest);
         out
     }
 
@@ -725,6 +836,11 @@ impl Cache {
             }
         }
     }
+}
+
+/// The memo key for a style's fallback chain.
+fn chain_key(style: &TextStyle) -> ChainKey {
+    (style.family.clone(), style.weight, style.italic)
 }
 
 /// The preference list for a generic alias.
@@ -871,6 +987,103 @@ mod tests {
             italic,
             ..TextStyle::default()
         }
+    }
+
+    /// A synthetic index the size of testhost2's (856 faces): many sans
+    /// families, a few mono and serif ones. No bytes behind it — building a
+    /// chain must not need any.
+    fn big_db(families: usize) -> FontDb {
+        let mut faces = Vec::new();
+        for i in 0..families {
+            let family = match i % 10 {
+                0 => format!("Fam{i:04} Mono"),
+                1 => format!("Fam{i:04} Serif"),
+                _ => format!("Fam{i:04} Sans"),
+            };
+            for (weight, italic) in [(400, false), (700, false), (400, true)] {
+                faces.push(FaceRecord {
+                    file: 0,
+                    index: 0,
+                    family: family.clone(),
+                    weight,
+                    stretch: 100,
+                    italic,
+                    monospace: false,
+                });
+            }
+        }
+        faces.push(FaceRecord {
+            file: 0,
+            index: 0,
+            family: "Noto Sans".into(),
+            weight: 400,
+            stretch: 100,
+            italic: false,
+            monospace: false,
+        });
+        let mut db = FontDb::default();
+        db.ingest(index::Index {
+            dirs: Vec::new(),
+            files: Vec::new(),
+            faces,
+        });
+        db
+    }
+
+    #[test]
+    fn a_large_index_builds_each_fallback_chain_once_and_in_the_uncached_order() {
+        let db = big_db(300);
+        assert!(db.len() > 856);
+        let sans = TextStyle::default();
+        let chain = db.fallbacks(&sans);
+        assert_eq!(db.chain_builds(), 1);
+        assert_eq!(&chain[..], db.build_fallbacks(&sans).as_slice());
+        assert_eq!(db.family_name(chain[0]), Some("Noto Sans"), "the preference wins");
+        assert_eq!(chain.len(), 1 + 300 - 60, "one face per sans family");
+        for _ in 0..100 {
+            // Size does not select, so it does not miss the memo either.
+            let resized = TextStyle {
+                size_px: 30.0,
+                ..TextStyle::default()
+            };
+            assert!(Arc::ptr_eq(&db.fallbacks(&resized), &chain));
+        }
+        assert_eq!(db.chain_builds(), 1, "every later label hits the memo");
+        let bold = TextStyle {
+            weight: 700,
+            ..TextStyle::default()
+        };
+        assert_eq!(&db.fallbacks(&bold)[..], db.build_fallbacks(&bold).as_slice());
+        let mono = TextStyle {
+            family: Family::Mono,
+            ..TextStyle::default()
+        };
+        assert_eq!(&db.fallbacks(&mono)[..], db.build_fallbacks(&mono).as_slice());
+        assert_eq!(db.chain_builds(), 3);
+    }
+
+    #[test]
+    fn the_chain_memo_is_bounded_against_client_chosen_names() {
+        let db = big_db(20);
+        for i in 0..(MAX_CHAINS * 3) {
+            let style = TextStyle {
+                family: Family::Named(format!("nope {i}")),
+                ..TextStyle::default()
+            };
+            let _ = db.fallbacks(&style);
+        }
+        assert!(db.chains.borrow().len() <= MAX_CHAINS);
+        assert_eq!(db.chain_builds(), (MAX_CHAINS * 3) as u64);
+    }
+
+    #[test]
+    fn every_face_gets_its_own_cache_key() {
+        let db = big_db(5);
+        let mut keys: Vec<CacheKey> = db.keys.clone();
+        assert_eq!(keys.len(), db.len());
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), db.len());
     }
 
     #[test]

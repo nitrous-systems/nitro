@@ -749,3 +749,146 @@ fn an_idle_release_returns_the_bytes_and_keeps_every_mask() {
         db.releases()
     );
 }
+
+/// Shaping many labels in one style builds the fallback chain once: the
+/// chain walks every family in the index, which with 856 faces installed
+/// cost more than the shape itself on every label (#3926).
+#[test]
+fn the_fallback_chain_is_built_once_per_style() {
+    let Some(db) = db() else { return };
+    let mut layout = Layout::new();
+    for i in 0..100 {
+        layout.shape(&db, &format!("label {i}"), &style(), None, false);
+    }
+    assert_eq!(db.chain_builds(), 1);
+    let bold = TextStyle {
+        weight: 700,
+        ..style()
+    };
+    layout.shape(&db, "bold", &bold, None, false);
+    layout.measure(&db, "bold", &bold, None, false);
+    assert_eq!(db.chain_builds(), 2);
+}
+
+/// swash keys its shaping and scaling caches on `FontRef::key`; a fresh key
+/// per call (what `FontRef::from_index` gives) made every shape rebuild the
+/// face's GSUB/GPOS feature store (#3926).
+#[test]
+fn font_ref_keeps_one_cache_key_per_face() {
+    let Some(db) = db() else { return };
+    let chain = db.fallbacks(&style());
+    let a = db.face(chain[0]).expect("primary loads");
+    let b = db.face(chain[0]).expect("primary loads");
+    let key = a.font_ref().expect("parses").key;
+    assert_eq!(key, a.font_ref().expect("parses").key);
+    assert_eq!(key, b.font_ref().expect("parses").key);
+    // Across an eviction and a reload too: the key is the face id's.
+    db.set_cache_limit(0);
+    db.next_frame();
+    db.release_idle();
+    let c = db.face(chain[0]).expect("reloads");
+    assert_eq!(key, c.font_ref().expect("parses").key);
+    if let Some(other) = chain.get(1).and_then(|id| db.face(*id)) {
+        assert_ne!(key, other.font_ref().expect("parses").key);
+    }
+}
+
+/// A character no installed face covers used to read every file in the
+/// chain on every shape — 213 loads and as many cap evictions per label on
+/// testhost2. The walk now happens once and its "nobody" is remembered.
+#[test]
+fn an_uncoverable_char_walks_the_chain_once() {
+    let Some(db) = db() else { return };
+    db.set_cache_limit(1);
+    let text = "a\u{10FFF0}";
+    let mut layout = Layout::new();
+    let first = layout.shape(&db, text, &style(), None, false);
+    let walks = db.fallback_walks();
+    assert_eq!(walks, 1, "one unknown char, one walk");
+    // With a 1-byte cap the walk leaves its last face resident, so the
+    // second shape reads the primary back once; from then on nothing moves.
+    let second = layout.shape(&db, text, &style(), None, false);
+    assert_eq!(second, first);
+    let (loads, evictions) = (db.loads(), db.evictions());
+    for _ in 0..3 {
+        let again = layout.shape(&db, text, &style(), None, false);
+        assert_eq!(again, first, "same result from the memo");
+    }
+    assert_eq!(db.fallback_walks(), walks, "no second walk");
+    assert_eq!(db.evictions(), evictions, "no eviction storm");
+    assert_eq!(db.loads(), loads, "the primary stayed loaded; nothing else read");
+}
+
+/// A character the primary lacks but a fallback has keeps rendering with that
+/// fallback when the answer comes from the memo instead of a walk.
+#[test]
+fn a_memoized_fallback_shapes_like_a_walked_one() {
+    let Some(db) = db() else { return };
+    let chain = db.fallbacks(&style());
+    let primary = db.face(chain[0]).expect("primary loads");
+    let charmap = primary.font_ref().expect("parses").charmap();
+    // Something the primary lacks and some later face has.
+    let found = ['\u{2603}', '\u{263A}', '\u{4E2D}', '\u{0915}', '\u{05D0}', '\u{2192}']
+        .into_iter()
+        .find(|c| {
+            charmap.map(*c) == 0
+                && chain[1..].iter().any(|id| {
+                    db.face(*id)
+                        .and_then(|d| d.font_ref().map(|f| f.charmap().map(*c) != 0))
+                        .unwrap_or(false)
+                })
+        });
+    let Some(ch) = found else {
+        eprintln!("skipping: no probe char needs a fallback here");
+        return;
+    };
+    let text = format!("x{ch}y");
+    let mut layout = Layout::new();
+    let walked = layout.shape(&db, &text, &style(), None, false);
+    let walks = db.fallback_walks();
+    let memo = layout.shape(&db, &text, &style(), None, false);
+    assert_eq!(db.fallback_walks(), walks);
+    assert_eq!(walked, memo);
+    assert!(
+        memo.lines[0].glyphs.iter().any(|g| g.font != chain[0]),
+        "the fallback face is still used"
+    );
+}
+
+/// Timing check for a big font set (testhost2 has 856 faces). Ignored by
+/// default: timings are for a release build on a real box —
+/// `cargo test --release -p nitro-text -- --ignored --nocapture`.
+#[test]
+#[ignore = "timing; run in release on a box with a large font set"]
+fn shaping_scales_with_a_large_font_set() {
+    let Some(db) = db() else { return };
+    let mut layout = Layout::new();
+    let n = 2000u32;
+    let t = Instant::now();
+    for _ in 0..n {
+        let _ = db.fallbacks(&style());
+    }
+    let chain_us = t.elapsed().as_secs_f64() * 1e6 / f64::from(n);
+    layout.shape(&db, "0123", &style(), None, false);
+    let t = Instant::now();
+    for _ in 0..n {
+        layout.shape(&db, "0123", &style(), None, false);
+    }
+    let shape_us = t.elapsed().as_secs_f64() * 1e6 / f64::from(n);
+    let t = Instant::now();
+    for _ in 0..n {
+        layout.shape(&db, "q\u{10FFF0}", &style(), None, false);
+    }
+    let missing_us = t.elapsed().as_secs_f64() * 1e6 / f64::from(n);
+    eprintln!(
+        "faces {} chain {} | fallbacks {chain_us:.2} µs | shape(\"0123\") {shape_us:.2} µs | \
+         shape(uncoverable) {missing_us:.2} µs | loads {} evictions {}",
+        db.len(),
+        db.fallbacks(&style()).len(),
+        db.loads(),
+        db.evictions()
+    );
+    if db.len() > 500 {
+        assert!(shape_us < 50.0, "shape of \"0123\" took {shape_us:.1} µs");
+    }
+}
