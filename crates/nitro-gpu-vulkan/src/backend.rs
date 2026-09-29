@@ -1024,7 +1024,7 @@ impl Backend for VkBackend {
         Ok(t)
     }
 
-    #[allow(clippy::many_single_char_names)]
+    #[allow(clippy::many_single_char_names, clippy::too_many_lines)] // CPU copy + GPU copy, one sequence
     fn upload_damage(&mut self, t: &mut Tex, rects: &[IRect]) -> Result<(), BackendError> {
         let Some(st) = t.staging.as_mut() else {
             return Ok(()); // udmabuf: the GPU reads the memfd's pages
