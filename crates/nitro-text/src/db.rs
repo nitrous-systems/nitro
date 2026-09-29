@@ -412,7 +412,13 @@ impl FontDb {
         }
         for (name, info) in &mut self.by_family {
             info.serif = !info.mono && name.contains("serif") && !name.contains("sans");
+            info.faces.shrink_to_fit();
         }
+        // The index lives as long as the server; drop the doubling slack
+        // (#3928).
+        self.faces.shrink_to_fit();
+        self.keys.shrink_to_fit();
+        self.by_family.shrink_to_fit();
     }
 
     /// True when nothing was found.

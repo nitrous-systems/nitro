@@ -167,10 +167,13 @@ impl DesktopIndex {
     fn scan(&mut self) {
         for dir in self.dirs.clone() {
             if self.icons.len() >= MAX_ENTRIES {
-                return;
+                break;
             }
             self.scan_dir(&dir);
         }
+        // The map grew by doubling; hand back the slack, since it lives for
+        // the server's lifetime (#3928).
+        self.icons.shrink_to_fit();
     }
 
     fn scan_dir(&mut self, dir: &Path) {

@@ -190,6 +190,35 @@ fn atlas_packs_three_thousand_keys_into_few_pages() {
     atlas.next_frame();
 }
 
+/// #3928: releasing the shaper's and scaler's caches changes nothing a
+/// caller can see: the same string shapes to the same glyphs, and a new
+/// glyph still rasterizes, while masks already packed stay put.
+#[test]
+fn releasing_the_swash_caches_keeps_output_identical() {
+    let Some(db) = db() else { return };
+    let mut layout = Layout::new();
+    let text = "Release the caches, 0123 — ok";
+    let first = layout.shape(&db, text, &style(), None, false);
+    let again = layout.shape(&db, text, &style(), None, false);
+    assert_eq!(first, again, "a cache hit shapes the same");
+    layout.release_caches();
+    let after = layout.shape(&db, text, &style(), None, false);
+    assert_eq!(first, after, "a released shaper shapes the same");
+
+    let glyphs: Vec<_> = first.lines.iter().flat_map(|l| l.glyphs.iter()).collect();
+    let mut atlas = Atlas::new();
+    let Some(a) = glyphs.first() else { return };
+    let key = GlyphKey::new(a.font, a.id, first.size_px, 0.0);
+    let mask = atlas.get(&db, key);
+    atlas.release_caches();
+    assert_eq!(atlas.get(&db, key), mask, "a packed mask survives a release");
+    let renders = atlas.renders();
+    if let Some(b) = glyphs.iter().find(|g| g.id != a.id) {
+        atlas.get(&db, GlyphKey::new(b.font, b.id, first.size_px, 0.0));
+        assert_eq!(atlas.renders(), renders + 1, "a new glyph still renders");
+    }
+}
+
 #[test]
 fn a_space_has_no_mask() {
     let Some(db) = db() else { return };

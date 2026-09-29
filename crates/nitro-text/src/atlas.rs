@@ -188,11 +188,16 @@ impl Atlas {
     /// Hinting is on at or below this size, where it earns its stem snapping.
     const HINT_MAX_PX: f32 = 24.0;
 
+    /// How many faces swash's scaler cache holds (its default is 8): the
+    /// primary face and a couple of fallbacks, which is what a frame of
+    /// new glyphs touches. See [`Atlas::release_caches`].
+    const SCALE_CACHE_ENTRIES: usize = 4;
+
     /// An empty atlas with no pages allocated.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            scale_cx: ScaleContext::new(),
+            scale_cx: ScaleContext::with_max_entries(Self::SCALE_CACHE_ENTRIES),
             pages: Vec::new(),
             entries: HashMap::new(),
             frame: 0,
@@ -314,6 +319,17 @@ impl Atlas {
     #[must_use]
     pub fn renders(&self) -> u64 {
         self.renders
+    }
+
+    /// Drop swash's scaler caches and scratch buffers; the pages and every
+    /// packed mask stay.
+    ///
+    /// For an idle caller (#3928): a glyph already in the atlas never
+    /// reaches the scaler again, so the per-face scaler state and the
+    /// rasterizer scratch are dead weight between new glyphs. The next
+    /// render rebuilds them.
+    pub fn release_caches(&mut self) {
+        self.scale_cx = ScaleContext::with_max_entries(Self::SCALE_CACHE_ENTRIES);
     }
 
     /// Bump the frame stamp the LRU records. Call once per frame.

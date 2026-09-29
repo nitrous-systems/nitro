@@ -2,7 +2,10 @@
 //!
 //! LTR only, one script for the whole string, greedy whitespace wrapping.
 //! [`Layout`] owns swash's `ShapeContext` (its caches and scratch buffers), so
-//! the server keeps one and reuses it.
+//! the server keeps one and reuses it. The cache is keyed on each face's
+//! stable `CacheKey` (see `FaceData::font_ref`), bounded to
+//! [`SHAPE_CACHE_ENTRIES`] faces, and released by [`Layout::release_caches`]
+//! when the server goes idle.
 
 use swash::shape::ShapeContext;
 use swash::text::{Script, analyze};
@@ -89,7 +92,21 @@ pub struct Metrics {
     pub cursor_x: Vec<(u32, f32)>,
 }
 
+/// How many faces swash's shaping cache holds (its default is 16).
+///
+/// Each entry keeps the face's compiled GSUB/GPOS feature store (lookups,
+/// subtables, a coverage bitmap) plus a charmap proxy. For a large face such
+/// as Noto Sans that is hundreds of KB, so the default 16 could pin several
+/// MB of heap on a box with a big fallback chain (#3928 measured three
+/// glibc blocks of 4–4.8 MB on testhost2). A label uses its primary face
+/// and, rarely, a fallback or two; four entries keep those hits and cap the
+/// rest. A miss costs one feature-store build, tens of µs.
+pub const SHAPE_CACHE_ENTRIES: usize = 4;
+
 /// The shaper. Holds swash's shaping caches; keep one per server.
+///
+/// The caches are bounded ([`SHAPE_CACHE_ENTRIES`]) and can be handed back
+/// whole with [`Layout::release_caches`] when the caller goes idle.
 pub struct Layout {
     shape_cx: ShapeContext,
 }
@@ -111,8 +128,18 @@ impl Layout {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            shape_cx: ShapeContext::new(),
+            shape_cx: ShapeContext::with_max_entries(SHAPE_CACHE_ENTRIES),
         }
+    }
+
+    /// Drop swash's shaping caches and scratch buffers, keeping the shaper.
+    ///
+    /// For an idle caller: once labels are shaped nothing shapes again until
+    /// something changes, and the cached feature stores are the largest heap
+    /// the text path keeps (#3928). The next shape rebuilds the entry it
+    /// needs, which costs microseconds; the output is identical.
+    pub fn release_caches(&mut self) {
+        self.shape_cx = ShapeContext::with_max_entries(SHAPE_CACHE_ENTRIES);
     }
 
     /// Shape and lay out `text`.

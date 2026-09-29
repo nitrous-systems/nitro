@@ -143,6 +143,13 @@ pub struct TextEngine {
     /// Device-space glyph positions, reused across paint calls so a run of
     /// glyphs costs no allocation. See [`TextEngine::paint`].
     batch: Vec<(i32, i32, GlyphKey)>,
+    /// `(layouts, glyph renders)` at the last swash-cache release; the idle
+    /// release is skipped while both still match, so an idle loop does not
+    /// reallocate the contexts every turn. See
+    /// [`TextEngine::release_idle_fonts`].
+    released_at: (u64, u64),
+    /// How many times the shaper and scaler caches were handed back.
+    cache_releases: u64,
 }
 
 impl TextEngine {
@@ -186,6 +193,8 @@ impl TextEngine {
             shape_us: Window::new(SHAPE_WINDOW),
             layouts: 0,
             batch: Vec::new(),
+            released_at: (0, 0),
+            cache_releases: 0,
         }
     }
 
@@ -330,8 +339,22 @@ impl TextEngine {
     /// neither, so the megabytes go back and cost one re-read the next time a
     /// new glyph appears. The atlas keeps every mask, so nothing on screen
     /// changes and no glyph is re-rendered.
+    ///
+    /// swash's shaping and scaling caches go back too (#3928): each shaped
+    /// face leaves a compiled feature store in the shaper, hundreds of KB for
+    /// a large face, and on a box with a big font set they were the largest
+    /// heap the server kept after the shadow buffer. They are only dropped
+    /// when something was shaped or rasterized since the last release, so an
+    /// idle loop costs nothing.
     pub fn release_idle_fonts(&mut self) {
         self.db.release_idle();
+        let mark = (self.layouts, self.atlas.renders());
+        if mark != self.released_at {
+            self.layout.release_caches();
+            self.atlas.release_caches();
+            self.released_at = mark;
+            self.cache_releases += 1;
+        }
     }
 
     /// Look up a stored run.
@@ -461,6 +484,10 @@ impl TextEngine {
         out.push(("text_runs", self.store.len() as u64));
         out.push(("shape_us_mean", self.shape_us.mean()));
         out.push(("text_layouts", self.layouts));
+        // Idle hand-backs of swash's shaper and scaler caches (#3928). Rises
+        // at most once per idle point that followed text work; climbing on a
+        // desktop where nothing changes means the gate is broken.
+        out.push(("shape_cache_releases", self.cache_releases));
     }
 }
 
@@ -756,6 +783,43 @@ mod tests {
         pairs.clear();
         engine.write_pairs(&mut pairs);
         assert_eq!(get(&pairs, "font_releases"), loads, "idempotent when idle");
+    }
+
+    /// #3928: the idle point hands swash's shaper and scaler caches back,
+    /// but only after text work, so an idle loop does not rebuild them every
+    /// turn; and shaping after a release gives the same glyphs.
+    #[test]
+    fn the_idle_point_releases_the_shape_caches_once_per_burst_of_work() {
+        let mut engine = super::TextEngine::new();
+        if !engine.has_fonts() {
+            return;
+        }
+        let mut pairs: Vec<(&'static str, u64)> = Vec::new();
+        let releases = |engine: &super::TextEngine, pairs: &mut Vec<(&'static str, u64)>| {
+            pairs.clear();
+            engine.write_pairs(pairs);
+            pairs
+                .iter()
+                .find(|(k, _)| *k == "shape_cache_releases")
+                .map(|(_, v)| *v)
+                .expect("shape_cache_releases is reported")
+        };
+        engine.release_idle_fonts();
+        assert_eq!(releases(&engine, &mut pairs), 0, "nothing to release yet");
+
+        let request = super::StyleRequest::new("sans", 14.0, 400, false, 0.0, false);
+        let before = engine.shape(1, &request, "Hello, world").1.clone();
+        engine.next_frame();
+        engine.release_idle_fonts();
+        assert_eq!(releases(&engine, &mut pairs), 1);
+        engine.next_frame();
+        engine.release_idle_fonts();
+        assert_eq!(releases(&engine, &mut pairs), 1, "idle turns do not churn");
+
+        let after = engine.shape(2, &request, "Hello, world").1.clone();
+        assert_eq!(before, after, "a released shaper shapes identically");
+        engine.release_idle_fonts();
+        assert_eq!(releases(&engine, &mut pairs), 2);
     }
 
     /// The desktop, the calculator and the launcher all fit in one atlas
