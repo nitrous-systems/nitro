@@ -45,6 +45,7 @@ pub mod defer;
 pub mod desktop_index;
 pub mod dmabuf;
 pub mod frame;
+pub mod gpu;
 pub mod icon_theme;
 pub mod icons;
 pub mod inject;
@@ -269,6 +270,16 @@ pub struct Config {
     /// `/usr/share/applications` would assert about whatever is
     /// installed there.
     pub desktop_dirs: Option<Vec<PathBuf>>,
+    /// The environment's override of `gpu.helper` (`NITRO_GPU`), #3922.
+    /// [`Config::fake`] sets `Some(Off)`, so a test that does not ask for
+    /// the helper never starts one.
+    pub gpu: Option<config::GpuHelper>,
+    /// The helper binary (`NITRO_GPU_HELPER`); `None` finds
+    /// `nitro-gpu-vulkan` next to the server, else on `$PATH`.
+    pub gpu_helper: Option<PathBuf>,
+    /// Tests: run the helper in-process on the socket end this is handed,
+    /// instead of `exec`ing a binary.
+    pub gpu_spawner: Option<gpu::Spawner>,
 }
 
 impl Config {
@@ -313,6 +324,9 @@ impl Config {
             config_path: None,
             icon_dirs: None,
             desktop_dirs: Some(Vec::new()),
+            gpu: Some(config::GpuHelper::Off),
+            gpu_helper: None,
+            gpu_spawner: None,
         }
     }
 }
@@ -566,6 +580,10 @@ const TOK_REPEAT: u64 = 12;
 /// The injected-input timerfd; see [`inject`]. Armed only while a scripted
 /// `input` sequence has events still to come.
 const TOK_INJECT: u64 = 13;
+/// The GPU helper's socket (#3922); see [`gpu`].
+const TOK_GPU: u64 = 14;
+/// The GPU helper's timerfd: restart backoff, `Hello` and hang deadlines.
+const TOK_GPU_TIMER: u64 = 15;
 /// How long an unanswered input keeps waiting for a frame to claim it.
 /// Beyond this the number would not be a latency any more: nothing
 /// responded to the event, and attributing the next unrelated frame to it
@@ -603,6 +621,41 @@ const TOK_REMOTE_BASE: u64 = 1 << 35;
 /// Pending acquire fences (#3918), one token each, above every client
 /// range: `dmabuf::FenceSet` hands out `TOK_FENCE_BASE + key`.
 const TOK_FENCE_BASE: u64 = 1 << 36;
+/// Completion fences of GPU-helper frames (#3922), `base + serial`: the
+/// buffers a frame samples are held against `BufferReleased` until it
+/// signals. Above the acquire fences, so its match arm comes first.
+const TOK_GPU_FENCE_BASE: u64 = 1 << 37;
+
+/// The server's epoll as [`gpu::Poll`].
+struct EpollPoll<'a>(&'a OwnedFd);
+
+impl gpu::Poll for EpollPoll<'_> {
+    fn add(&self, fd: std::os::fd::BorrowedFd<'_>, token: u64, out: bool) {
+        let flags = if out {
+            EventFlags::IN | EventFlags::OUT
+        } else {
+            EventFlags::IN
+        };
+        if let Err(e) = epoll::add(self.0, fd, EventData::new_u64(token), flags) {
+            warn!("epoll add (gpu): {e}");
+        }
+    }
+
+    fn modify(&self, fd: std::os::fd::BorrowedFd<'_>, token: u64, out: bool) {
+        let flags = if out {
+            EventFlags::IN | EventFlags::OUT
+        } else {
+            EventFlags::IN
+        };
+        if let Err(e) = epoll::modify(self.0, fd, EventData::new_u64(token), flags) {
+            warn!("epoll modify (gpu): {e}");
+        }
+    }
+
+    fn remove(&self, fd: std::os::fd::BorrowedFd<'_>) {
+        let _ = epoll::delete(self.0, fd);
+    }
+}
 
 /// Flip-interval statistics for `stats` and the log.
 #[derive(Debug, Default)]
@@ -1001,6 +1054,12 @@ struct Server {
     held_releases: Vec<(nitro_kms::BufferId, ClientId, BufferKey)>,
     /// Plane-only commits (`Backend::commit_planes`), cumulative.
     plane_flips: u64,
+    /// The GPU helper: composite mode 2 (#3922).
+    gpu: gpu::Helper,
+    /// `NITRO_GPU`, which beats `gpu.helper` on every reload.
+    gpu_env: Option<config::GpuHelper>,
+    /// The mode-2 output's shadow was reallocated: import it again.
+    gpu_reshadow: bool,
     /// Acquire fences that had to be waited for, cumulative.
     fence_waits: u64,
     /// Frames latched early onto a plane, their fence still pending
@@ -1363,7 +1422,17 @@ pub fn run(mut config: Config) -> Result<(), Error> {
     add(&epoll, &shell_listener.as_fd(), TOK_SHELL_LISTENER)?;
     info!("shell socket at {}", config.shell_path.display());
 
+    let gpu_helper = gpu::Helper::new(
+        config.gpu.unwrap_or_else(|| settings.gpu.helper()),
+        settings.gpu.idle_exit(),
+        config.gpu_helper.clone(),
+        config.gpu_spawner.clone(),
+    )
+    .map_err(errno("create the gpu helper timer"))?;
     let mut server = Server {
+        gpu: gpu_helper,
+        gpu_env: config.gpu,
+        gpu_reshadow: false,
         wire_clients: HashMap::new(),
         clients: HashMap::new(),
         wire_listener,
@@ -1503,6 +1572,12 @@ pub fn run(mut config: Config) -> Result<(), Error> {
     add(&server.epoll, &server.key_repeat.as_fd(), TOK_REPEAT)?;
     // And the injection timer: armed only while an `input` sequence runs.
     add(&server.epoll, &server.injector.as_fd(), TOK_INJECT)?;
+    // And the GPU helper's timer: armed only for a restart, a `Hello` or
+    // a frame outstanding.
+    add(&server.epoll, &server.gpu.timer_fd(), TOK_GPU_TIMER)?;
+    if server.gpu.mode == config::GpuHelper::On {
+        server.gpu_spawn();
+    }
     // The third listener, and the only one that is optional. Applied here
     // through the same function the reload path uses, so "what
     // `remote.listen` means" has exactly one implementation.
@@ -1883,6 +1958,12 @@ impl Server {
             && !infos.iter().any(|i| SceneOutputId(i.id.0) == out)
         {
             self.leave_overview(None);
+        }
+        // The mode-2 output going away takes its ring with it (#3922).
+        if let Some(owner) = self.gpu.owner
+            && !infos.iter().any(|i| i.id == owner)
+        {
+            self.gpu_drop_owner(false);
         }
         let mut lost = false;
         let mut gone: Vec<u32> = Vec::new();
@@ -2437,6 +2518,9 @@ impl Server {
         // Which Surfaces go on planes this frame (#3899), before anything
         // is rasterized: a switch invalidates the output.
         self.plan_planes(index);
+        if self.outputs[index].decision.mode == planes::Mode::Gpu {
+            return self.paint_gpu(index);
+        }
         let output = &mut self.outputs[index];
         if output.decision.mode == planes::Mode::Direct {
             // The output buffer is not on screen: nothing to paint into
@@ -2485,6 +2569,10 @@ impl Server {
                 let reset = shadow.ensure(buf.width, buf.height, buf.stride);
                 if reset {
                     rasterize = vec![bounds];
+                    // A shadow the helper imported was just replaced.
+                    if self.gpu.owner == Some(id) {
+                        self.gpu_reshadow = true;
+                    }
                 }
                 let painted = paint_shadow(
                     shadow,
@@ -2834,12 +2922,18 @@ impl Server {
                 self.held_releases.push((k, owner, key));
                 continue;
             }
+            // Sampled by a GPU-helper frame still running (#3922).
+            if self.gpu.borrows.holds(key) {
+                self.gpu.held.push((owner, key));
+                continue;
+            }
             if let Some(id) = client.buffer_id(key) {
                 client.send(&ServerMsg::BufferReleased(msg::BufferReleased { id }));
             }
         }
         released.clear();
         self.released = released;
+        self.gpu_prune();
     }
 
     /// Answer the clients whose commit or frame request will not be
@@ -2857,6 +2951,7 @@ impl Server {
         // An output with a paint pending will flip, and `on_flip` is the
         // right place to answer everything riding on that frame.
         if self.outputs.iter().any(frame::OutputState::needs_paint)
+            || self.outputs.iter().any(|o| o.gpu_pending.is_some())
             || self
                 .backend
                 .outputs()
@@ -2954,12 +3049,15 @@ impl Server {
                     TOK_DEFER => self.on_defer_deadline(),
                     TOK_REPEAT => self.on_key_repeat(),
                     TOK_INJECT => self.on_inject(),
+                    TOK_GPU => self.on_gpu(),
+                    TOK_GPU_TIMER => self.on_gpu_timer(),
                     // Shell tokens sort above wire tokens, so this arm has
                     // to come first; both end up in `on_wire_client`,
                     // because a shell client *is* a wire client with an
                     // extra capability bit. Remote tokens sort above both,
                     // for the same reason and with the same answer.
                     // Fences sort above every client range (#3918).
+                    t if t >= TOK_GPU_FENCE_BASE => self.on_gpu_fence(t - TOK_GPU_FENCE_BASE),
                     t if t >= TOK_FENCE_BASE => self.on_fence(t),
                     t if t >= TOK_REMOTE_BASE => self.on_wire_client(t, flags),
                     t if t >= TOK_SHELL_BASE => self.on_wire_client(t, flags),
@@ -2996,6 +3094,9 @@ impl Server {
                     // A drag cannot survive the pointer going to another
                     // session: the release will never arrive here.
                     self.dnd_step(data::Dnd::cancel);
+                    // The helper goes with the VT (#3922): it is
+                    // respawned on the way back.
+                    self.gpu_pause();
                     self.backend.pause();
                     self.active = false;
                     if let Some(seat) = self.seat.as_ref() {
@@ -3006,6 +3107,10 @@ impl Server {
                     info!("session active: resuming");
                     let resumed = self.backend.resume();
                     self.planes_reset(None);
+                    self.gpu.forgive();
+                    if self.gpu.mode == config::GpuHelper::On {
+                        self.gpu_spawn();
+                    }
                     match resumed {
                         Ok(()) => self.active = true,
                         Err(e) => {
@@ -3198,6 +3303,10 @@ impl Server {
         // more, so the newest queued Surface frame on it becomes current
         // and rides the paint below. The buffer it replaces is released
         // in the same write, well before this frame's `Presented`.
+        // A helper frame that finished while this flip was pending (#3922).
+        if let Some(i) = self.outputs.iter().position(|o| o.kms_id == id) {
+            self.gpu_commit(i);
+        }
         let latched = self.latch_surfaces();
         if faded || latched {
             self.update_scene();
@@ -3572,7 +3681,22 @@ impl Server {
         let pointer_changed = settings.pointer != self.settings.pointer;
         let icons_changed = settings.theme.icon_theme() != self.settings.theme.icon_theme();
         let palette = settings.palette();
+        let gpu_mode = self.gpu_env.unwrap_or_else(|| settings.gpu.helper());
+        let gpu_idle = settings.gpu.idle_exit();
         self.settings = settings;
+        // The GPU helper (#3922): a reload (SIGHUP included) forgives a
+        // give-up, and a changed mode starts or stops it.
+        self.gpu.forgive();
+        if self.gpu.configure(gpu_mode, gpu_idle) {
+            info!("gpu.helper = {gpu_mode:?}");
+            if self.gpu.running() {
+                self.gpu_pause();
+            }
+            self.gpu.configure(gpu_mode, gpu_idle);
+        }
+        if gpu_mode == config::GpuHelper::On && !self.gpu.running() && self.active {
+            self.gpu_spawn();
+        }
         // The palette *is* diffed, unlike everything else here, and for a
         // reason the rest does not have: applying it is not idempotent
         // from the outside. It restyles every decoration, repaints every
@@ -6494,7 +6618,14 @@ impl Server {
             Err(msg) => protocol::err_reply(&msg),
             Ok(Request::Outputs) => self.outputs_reply(),
             Ok(Request::Modes) => self.modes_reply(),
-            Ok(Request::Stats) => self.stats_reply(),
+            Ok(Request::Stats) => {
+                // The helper is non-dumpable: its memory comes from its
+                // own `Stats`, answered after this reply (the previous
+                // answer is reported).
+                self.gpu
+                    .query_stats(&EpollPoll(&self.epoll), TOK_GPU);
+                self.stats_reply()
+            }
             Ok(Request::Shot(name)) => self.shot(name.as_deref()),
             Ok(Request::ShotFront(name)) => self.shot_front(name.as_deref()),
             Ok(Request::Quit) => {
@@ -6700,6 +6831,7 @@ impl Server {
         ));
         pairs.push(("dmabuf_kms_refused", self.dmabuf_kms_refused));
         self.planes_stats(pairs);
+        self.gpu_stats(pairs);
         pairs.push(("dmabuf_placeholder_paints", frame::placeholder_paints()));
         pairs.push(("fences_pending", self.fences.len() as u64));
         pairs.push(("fence_waits", self.fence_waits));
@@ -8475,6 +8607,12 @@ impl Server {
         // the hook the planes module (#3899) reads. A refusal is not an
         // error: the buffer is shown on the CPU path or as a placeholder.
         for (id, import) in outcome.dmabuf_imports {
+            if self.gpu.enabled()
+                && let Some(h) = client.buffers.get(&id)
+                && let Some(src) = gpu_source(&import)
+            {
+                self.gpu.sources.insert(h.key, src);
+            }
             let has_planes = self
                 .outputs
                 .first()
@@ -10213,6 +10351,10 @@ impl Server {
             self.held_releases.push((k, client.id, key));
             return;
         }
+        if self.gpu.borrows.holds(key) {
+            self.gpu.held.push((client.id, key));
+            return;
+        }
         if let Some(id) = client.buffer_id(key) {
             client.send(&ServerMsg::BufferReleased(msg::BufferReleased { id }));
         }
@@ -10293,7 +10435,7 @@ impl Server {
             // A new frame of a Surface on a plane is a plane-only flip
             // (#3899): the scene damages nothing for it.
             for o in &mut self.outputs {
-                if o.decision.places(l.node) {
+                if o.decision.shows(l.node) {
                     o.planes_dirty = true;
                 }
             }
@@ -10609,6 +10751,7 @@ impl Server {
         }
         let mut cands = Vec::new();
         self.plane_candidates(index, &mut cands);
+        let (gpu_nodes, helper) = self.gpu_inputs(index);
         let now = monotonic_ns();
         let o = &mut self.outputs[index];
         let id = o.kms_id;
@@ -10617,11 +10760,16 @@ impl Server {
             planes: &o.plane_info,
             size: (o.width, o.height),
             alpha: self.backend.scanout_alpha(id),
+            gpu: &gpu_nodes,
+            helper,
         };
         let backend = &mut self.backend;
         let d = o
             .planner
             .decide(&inp, now, &mut |a| backend.test_layout(id, a).ok());
+        if !gpu_nodes.is_empty() || self.gpu.owner == Some(id) {
+            self.gpu_want(index, &d);
+        }
         self.apply_decision(index, d);
     }
 
@@ -10642,18 +10790,23 @@ impl Server {
                 d.mode,
                 d.placed.len()
             );
-            for (n, _) in &o.decision.placed {
-                if !d.places(*n) {
-                    let _ = self.scene.set_surface_on_plane(*n, false);
+            for n in o.decision.nodes() {
+                if !d.shows(n) {
+                    let _ = self.scene.set_surface_on_plane(n, false);
                 }
             }
-            for (n, _) in &d.placed {
-                let _ = self.scene.set_surface_on_plane(*n, true);
+            for n in d.nodes() {
+                let _ = self.scene.set_surface_on_plane(n, true);
             }
         }
         // IN_FENCE_FD (#3938): an early-latched frame's fence is handed
-        // over just before the commit, `stage_plane_fences`.
-        let staged = self.backend.set_plane_state(id, &d.layout);
+        // over just before the commit, `stage_plane_fences`. Mode 2 stages
+        // at its commit, when the helper's buffer is known (#3922).
+        let staged = if d.mode == planes::Mode::Gpu {
+            Ok(())
+        } else {
+            self.backend.set_plane_state(id, &d.layout)
+        };
         let o = &mut self.outputs[index];
         o.decision = d;
         o.planes_dirty = true;
@@ -10716,9 +10869,10 @@ impl Server {
         o.plane_fences.clear();
         let old = std::mem::take(&mut o.decision);
         o.planes_dirty = false;
+        o.gpu_pending = None;
         o.invalidate();
         let id = o.kms_id;
-        for (n, _) in old.placed {
+        for n in old.nodes() {
             let _ = self.scene.set_surface_on_plane(n, false);
         }
         let _ = self.backend.set_plane_state(id, &[]);
@@ -10738,8 +10892,9 @@ impl Server {
             }
             let old = std::mem::take(&mut o.decision);
             o.planes_dirty = false;
+            o.gpu_pending = None;
             o.invalidate();
-            for (n, _) in old.placed {
+            for n in old.nodes() {
                 let _ = self.scene.set_surface_on_plane(n, false);
             }
         }
@@ -10757,6 +10912,12 @@ impl Server {
     fn drain_kms_releases(&mut self) {
         for id in self.backend.take_released_buffers() {
             self.on_kms.remove(&id);
+            // A helper ring slot the display stopped reading (#3922).
+            if let Some(i) = self.gpu.ring.slot_of(id)
+                && self.gpu.ring.slots[i].state == gpu::SlotState::Shown
+            {
+                self.gpu.ring.slots[i].state = gpu::SlotState::Free;
+            }
         }
         if !self.on_kms.is_empty() {
             // Freed ids (the client destroyed the buffer) are not reported.
@@ -12420,5 +12581,919 @@ mod tests {
         ] {
             assert!(!is_shell_op(&m), "{} is not a shell op", m.name());
         }
+    }
+}
+
+// ------------------------------------------------- the GPU helper (#3922)
+
+/// A client dma-buf's layout and fds as a helper texture source, when the
+/// helper knows the format.
+fn gpu_source(import: &dmabuf::ImportRequest) -> Option<gpu::Source> {
+    let d = &import.desc;
+    let n = nitro_gpu::proto::plane_count(d.format.0)?;
+    if n != usize::from(d.planes) {
+        return None;
+    }
+    let mut fds = Vec::with_capacity(n);
+    for fd in &import.fds {
+        fds.push(fd.try_clone().ok()?);
+    }
+    Some(gpu::Source {
+        desc: nitro_gpu::proto::DmabufDesc {
+            id: 0,
+            w: d.width,
+            h: d.height,
+            fourcc: d.format.0,
+            modifier: d.modifier,
+            planes: (0..n)
+                .map(|i| nitro_gpu::proto::PlaneDesc {
+                    offset: d.offsets[i],
+                    pitch: d.pitches[i],
+                })
+                .collect(),
+            ..nitro_gpu::proto::DmabufDesc::default()
+        },
+        fds,
+    })
+}
+
+const fn gpu_encoding(m: nitro_scene::ColorMatrix) -> nitro_gpu::proto::ColorEncoding {
+    use nitro_gpu::proto::ColorEncoding as E;
+    match m {
+        nitro_scene::ColorMatrix::Bt601 => E::Bt601,
+        nitro_scene::ColorMatrix::Bt709 => E::Bt709,
+        nitro_scene::ColorMatrix::Bt2020 => E::Bt2020,
+    }
+}
+
+const fn gpu_range(r: nitro_scene::ColorRange) -> nitro_gpu::proto::ColorRange {
+    match r {
+        nitro_scene::ColorRange::Limited => nitro_gpu::proto::ColorRange::Limited,
+        nitro_scene::ColorRange::Full => nitro_gpu::proto::ColorRange::Full,
+    }
+}
+
+/// At most [`nitro_gpu::proto::MAX_RECTS`] rects, in `bounds`: the
+/// bounding box when there are more.
+fn gpu_rects(rects: &[nitro_core::IRect], bounds: nitro_core::IRect) -> Vec<nitro_core::IRect> {
+    let v: Vec<nitro_core::IRect> = rects
+        .iter()
+        .map(|r| r.intersect(&bounds))
+        .filter(|r| !r.is_empty())
+        .collect();
+    if v.len() <= nitro_gpu::proto::MAX_RECTS {
+        return v;
+    }
+    let b = v.iter().skip(1).fold(v[0], |a, r| a.union(r));
+    vec![b]
+}
+
+impl Server {
+    /// Start the helper (always-on at startup and resume, on demand when
+    /// an output first wants mode 2).
+    fn gpu_spawn(&mut self) {
+        if self.gpu.running() {
+            return;
+        }
+        // The helper refuses to start holding a DRM primary node or an
+        // input device; every such fd of ours must be close-on-exec.
+        for (fd, target) in gpu::inheritable_fds() {
+            if target.starts_with("/dev/dri/card") || target.starts_with("/dev/input/") {
+                warn!("fd {fd} ({target}) is not close-on-exec: the gpu helper will refuse it");
+            }
+        }
+        self.gpu.spawn(&EpollPoll(&self.epoll), TOK_GPU);
+    }
+
+    /// The helper socket is ready.
+    fn on_gpu(&mut self) {
+        let (replies, gone) = self.gpu.pump(&EpollPoll(&self.epoll), TOK_GPU);
+        for r in replies {
+            self.on_gpu_reply(r);
+        }
+        if gone {
+            self.gpu_lost();
+        }
+        self.settle();
+    }
+
+    fn on_gpu_reply(&mut self, r: gpu::Reply) {
+        match r {
+            gpu::Reply::Ready => {
+                // Outputs with helper-able Surfaces decide again.
+                for o in &mut self.outputs {
+                    if !o.gpu_layers.is_empty() {
+                        o.planes_dirty = true;
+                    }
+                }
+            }
+            gpu::Reply::Ring {
+                size,
+                fourcc,
+                modifier,
+                slots,
+            } => self.gpu_import_ring(size, fourcc, modifier, slots),
+            gpu::Reply::RingFailed => warn!("gpu helper: no output ring; mode 2 off for this output"),
+            gpu::Reply::ShadowRefused => {
+                warn!("gpu helper: shadow import refused; mode 2 off for this output");
+            }
+            gpu::Reply::Composited { serial, fence } => {
+                let poll = EpollPoll(&self.epoll);
+                let Some(f) = self
+                    .gpu
+                    .ring
+                    .in_flight
+                    .take()
+                    .filter(|f| f.serial == serial)
+                else {
+                    // A frame of a ring since dropped: only its borrows.
+                    self.gpu.keep_fence(
+                        &poll,
+                        TOK_GPU_FENCE_BASE + serial,
+                        serial,
+                        &fence,
+                        Instant::now(),
+                    );
+                    return;
+                };
+                self.gpu
+                    .composite_us
+                    .push(f.sent.elapsed().as_micros() as u64);
+                self.gpu.counters.frames += 1;
+                self.gpu
+                    .keep_fence(&poll, TOK_GPU_FENCE_BASE + serial, serial, &fence, f.sent);
+                self.gpu.ring.composited = Some(gpu::Composited {
+                    serial,
+                    slot: f.slot,
+                    fence,
+                });
+                self.gpu.arm();
+                if let Some(owner) = self.gpu.owner
+                    && let Some(i) = self.outputs.iter().position(|o| o.kms_id == owner)
+                {
+                    self.gpu_commit(i);
+                }
+            }
+            gpu::Reply::CompositeFailed { serial, code } => {
+                self.gpu.counters.refused_frames += 1;
+                self.gpu.borrows.done(serial);
+                if let Some(f) = self.gpu.ring.in_flight.take() {
+                    if let Some(s) = self.gpu.ring.slots.get_mut(f.slot) {
+                        s.state = gpu::SlotState::Free;
+                    }
+                }
+                self.gpu.arm();
+                debug!("gpu frame {serial} refused: {code:?}");
+                if let Some(owner) = self.gpu.owner
+                    && let Some(o) = self.outputs.iter_mut().find(|o| o.kms_id == owner)
+                    && o.gpu_pending == Some(serial)
+                {
+                    o.gpu_pending = None;
+                    // The damage went with the frame: repaint.
+                    o.invalidate();
+                }
+            }
+        }
+    }
+
+    /// `OutputRing`: `AddFB2` every slot once.
+    fn gpu_import_ring(
+        &mut self,
+        size: (u32, u32),
+        fourcc: u32,
+        modifier: u64,
+        slots: Vec<(nitro_gpu::proto::SlotLayout, OwnedFd)>,
+    ) {
+        let Some(owner) = self.gpu.owner else {
+            return;
+        };
+        if self.gpu.ring.size != size {
+            return;
+        }
+        let mut fbs = Vec::new();
+        for (layout, fd) in &slots {
+            let desc = nitro_kms::ImportDesc {
+                format: nitro_kms::Fourcc(fourcc),
+                width: size.0,
+                height: size.1,
+                modifier,
+                planes: 1,
+                offsets: [layout.offset, 0, 0, 0],
+                pitches: [layout.pitch, 0, 0, 0],
+            };
+            match self.backend.import_buffer(&desc, &[fd.as_fd()]) {
+                Ok(fb) => fbs.push(fb),
+                Err(e) => {
+                    warn!("gpu ring: AddFB2: {e}; mode 2 off for {owner}");
+                    for fb in fbs {
+                        self.backend.free_buffer(fb);
+                    }
+                    return;
+                }
+            }
+        }
+        info!(
+            "{owner}: gpu ring of {} ({}x{}, modifier {modifier:#x})",
+            fbs.len(),
+            size.0,
+            size.1
+        );
+        self.gpu.ring.slots = fbs
+            .into_iter()
+            .map(|fb| gpu::Slot {
+                fb,
+                state: gpu::SlotState::Free,
+                last: None,
+            })
+            .collect();
+        if let Some(o) = self.outputs.iter_mut().find(|o| o.kms_id == owner) {
+            o.planes_dirty = true;
+        }
+    }
+
+    /// The helper's timer: a restart is due, or it is not answering.
+    fn on_gpu_timer(&mut self) {
+        let (respawn, hung) = self.gpu.on_timer();
+        if hung {
+            self.gpu.kill(&EpollPoll(&self.epoll));
+            self.gpu_lost();
+        }
+        if respawn {
+            if self.gpu.mode == config::GpuHelper::On {
+                self.gpu_spawn();
+            } else {
+                // On demand: the next decision that wants it starts it.
+                for o in &mut self.outputs {
+                    if !o.gpu_layers.is_empty() {
+                        o.planes_dirty = true;
+                    }
+                }
+            }
+        }
+        self.settle();
+    }
+
+    /// A helper frame's completion fence signalled: the buffers it
+    /// borrowed may go back.
+    fn on_gpu_fence(&mut self, serial: u64) {
+        self.gpu.fence_signalled(&EpollPoll(&self.epoll), serial);
+        self.send_gpu_releases();
+        // A slot may be usable again for damage that waited for one.
+        self.settle();
+    }
+
+    /// `BufferReleased`s held for helper frames that are done now.
+    fn send_gpu_releases(&mut self) {
+        if self.gpu.held.is_empty() {
+            return;
+        }
+        for (owner, key) in std::mem::take(&mut self.gpu.held) {
+            if self.gpu.borrows.holds(key) {
+                self.gpu.held.push((owner, key));
+                continue;
+            }
+            if self.scene.buffer_in_use(key) {
+                continue;
+            }
+            let Some(client) = self.wire_clients.values_mut().find(|c| c.id == owner) else {
+                continue;
+            };
+            if let Some(id) = client.buffer_id(key) {
+                client.send(&ServerMsg::BufferReleased(msg::BufferReleased { id }));
+            }
+        }
+    }
+
+    /// The helper is gone (EOF, hung and killed): fall back, count, and
+    /// schedule a restart.
+    fn gpu_lost(&mut self) {
+        let idle = self.gpu.idle();
+        self.gpu_drop_owner(true);
+        if let Some(f) = self.gpu.ring.in_flight.take() {
+            self.gpu.borrows.done(f.serial);
+        }
+        self.gpu.died(idle);
+        // Borrows whose fence dup is registered go when it signals; with
+        // the helper dead a Vulkan fence signals or errors on its own.
+        self.send_gpu_releases();
+    }
+
+    /// Give up the mode-2 output's resources: the ring framebuffers (the
+    /// backend defers the free while one is on screen) and, when the
+    /// output is in mode 2, its decision — a full repaint on the CPU or
+    /// planes follows. `fallback` counts it as a helper fallback.
+    fn gpu_drop_owner(&mut self, fallback: bool) {
+        let Some(owner) = self.gpu.owner.take() else {
+            return;
+        };
+        let ring = std::mem::take(&mut self.gpu.ring);
+        for s in &ring.slots {
+            self.backend.free_buffer(s.fb);
+        }
+        if let Some(f) = ring.in_flight
+            && !self.gpu.running()
+        {
+            self.gpu.borrows.done(f.serial);
+        }
+        self.gpu.arm();
+        let Some(index) = self.outputs.iter().position(|o| o.kms_id == owner) else {
+            return;
+        };
+        let o = &mut self.outputs[index];
+        o.gpu_pending = None;
+        o.gpu_last.clear();
+        o.planner.helper_lost();
+        if o.decision.mode != planes::Mode::Gpu {
+            return;
+        }
+        let old = std::mem::take(&mut o.decision);
+        o.planes_dirty = false;
+        o.plane_fences.clear();
+        o.invalidate();
+        for n in old.nodes() {
+            let _ = self.scene.set_surface_on_plane(n, false);
+        }
+        let _ = self.backend.set_plane_state(owner, &[]);
+        if fallback {
+            self.gpu.counters.fallbacks += 1;
+            info!("{owner}: gpu helper gone: back to planes and the CPU");
+        }
+    }
+
+    /// VT switch away: stop the helper and drop what it held.
+    fn gpu_pause(&mut self) {
+        self.gpu_drop_owner(false);
+        self.gpu.stop(&EpollPoll(&self.epoll), TOK_GPU);
+    }
+
+    /// Release the textures (and sources) of buffers that are gone.
+    fn gpu_prune(&mut self) {
+        if self.gpu.sources.is_empty() && self.gpu.textures() == 0 {
+            return;
+        }
+        let scene = &self.scene;
+        self.gpu
+            .prune(&EpollPoll(&self.epoll), TOK_GPU, |k| scene.buffer(k).is_ok());
+    }
+
+    /// The first time output `index` wants mode 2: its shadow into a
+    /// memfd the helper imports, and a ring for its primary.
+    fn gpu_prepare(&mut self, index: usize) {
+        if self.gpu.owner.is_some() || !self.gpu.ready() {
+            return;
+        }
+        let o = &mut self.outputs[index];
+        let id = o.kms_id;
+        let Some(primary) = o
+            .plane_info
+            .iter()
+            .find(|p| p.kind == nitro_kms::PlaneKind::Primary)
+        else {
+            return;
+        };
+        let mods: Vec<u64> = primary
+            .formats
+            .iter()
+            .find(|(f, _)| *f == nitro_kms::Fourcc::XRGB8888)
+            .map(|(_, m)| m.clone())
+            .unwrap_or_default();
+        let mods = self.gpu.ring_modifiers(nitro_gpu::proto::XR24, &mods);
+        if mods.is_empty() {
+            debug!("{id}: no ring modifier both the helper and the primary take");
+            return;
+        }
+        let Some(shadow) = o.shadow.as_mut() else {
+            return;
+        };
+        if let Err(e) = shadow.to_memfd() {
+            warn!("{id}: shadow memfd: {e}");
+            return;
+        }
+        let Some(fd) = shadow.memfd().and_then(|f| f.try_clone_to_owned().ok()) else {
+            return;
+        };
+        let desc = nitro_gpu::proto::ShadowDesc {
+            id: 0,
+            w: shadow.width(),
+            h: shadow.height(),
+            stride: shadow.stride(),
+            fourcc: nitro_gpu::proto::AR24,
+        };
+        let (w, h) = (o.width, o.height);
+        let poll = EpollPoll(&self.epoll);
+        let sid = self.gpu.tex_id();
+        let ok = self.gpu.send(
+            &poll,
+            TOK_GPU,
+            &nitro_gpu::ToHelper::ImportShadow(nitro_gpu::proto::ShadowDesc { id: sid, ..desc }),
+            vec![fd],
+        ) && self.gpu.send(
+            &poll,
+            TOK_GPU,
+            &nitro_gpu::ToHelper::AllocOutputRing {
+                n: gpu::RING_SLOTS,
+                w,
+                h,
+                fourcc: nitro_gpu::proto::XR24,
+                modifiers: mods,
+            },
+            Vec::new(),
+        );
+        if !ok {
+            return;
+        }
+        info!("{id}: preparing gpu composite ({w}x{h})");
+        self.gpu.owner = Some(id);
+        self.gpu.ring = gpu::Ring {
+            size: (w, h),
+            requested: true,
+            shadow: Some(sid),
+            ..gpu::Ring::default()
+        };
+        self.gpu_reshadow = false;
+    }
+
+    /// Re-import the owner's shadow after it was reallocated.
+    fn gpu_reimport_shadow(&mut self, index: usize) {
+        let Some(old) = self.gpu.ring.shadow else {
+            return;
+        };
+        let Some(shadow) = self.outputs[index].shadow.as_mut() else {
+            return;
+        };
+        if shadow.to_memfd().is_err() {
+            return;
+        }
+        let Some(fd) = shadow.memfd().and_then(|f| f.try_clone_to_owned().ok()) else {
+            return;
+        };
+        let (w, h, stride) = (shadow.width(), shadow.height(), shadow.stride());
+        let poll = EpollPoll(&self.epoll);
+        let sid = self.gpu.tex_id();
+        self.gpu.send(
+            &poll,
+            TOK_GPU,
+            &nitro_gpu::ToHelper::Release { id: old },
+            Vec::new(),
+        );
+        self.gpu.send(
+            &poll,
+            TOK_GPU,
+            &nitro_gpu::ToHelper::ImportShadow(nitro_gpu::proto::ShadowDesc {
+                id: sid,
+                w,
+                h,
+                stride,
+                fourcc: nitro_gpu::proto::AR24,
+            }),
+            vec![fd],
+        );
+        self.gpu.ring.shadow = Some(sid);
+    }
+
+    /// Leaving mode 2 on demand: give everything back so the helper can
+    /// idle-exit.
+    fn gpu_release_owner(&mut self) {
+        let shadow = self.gpu.ring.shadow;
+        self.gpu_drop_owner(false);
+        let poll = EpollPoll(&self.epoll);
+        if let Some(id) = shadow {
+            self.gpu
+                .send(&poll, TOK_GPU, &nitro_gpu::ToHelper::Release { id }, Vec::new());
+        }
+        self.gpu.release_all(&poll, TOK_GPU);
+    }
+
+    /// Helper texture sources for server-allocated scanout buffers
+    /// (`export_buffer`), made on first sight.
+    fn gpu_export_scanouts(&mut self) {
+        let want: Vec<(BufferKey, nitro_kms::BufferId)> = self
+            .wire_clients
+            .values()
+            .flat_map(|c| c.buffers.values())
+            .filter(|h| !h.dmabuf && !self.gpu.sources.contains_key(&h.key))
+            .filter_map(|h| Some((h.key, h.scanout?)))
+            .collect();
+        for (key, k) in want {
+            let Some(info) = self.backend.buffer_info(k) else {
+                continue;
+            };
+            let Some(n) = nitro_gpu::proto::plane_count(info.format.0) else {
+                continue;
+            };
+            let Ok(fd) = self.backend.export_buffer(k) else {
+                continue;
+            };
+            let mut fds = Vec::with_capacity(n);
+            for _ in 1..n {
+                let Ok(d) = fd.try_clone() else {
+                    break;
+                };
+                fds.push(d);
+            }
+            fds.insert(0, fd);
+            if fds.len() != n {
+                continue;
+            }
+            self.gpu.sources.insert(
+                key,
+                gpu::Source {
+                    desc: nitro_gpu::proto::DmabufDesc {
+                        id: 0,
+                        w: info.width,
+                        h: info.height,
+                        fourcc: info.format.0,
+                        modifier: info.modifier,
+                        planes: (0..n)
+                            .map(|i| nitro_gpu::proto::PlaneDesc {
+                                offset: info.offsets[i.min(1)],
+                                pitch: info.pitches[i.min(1)],
+                            })
+                            .collect(),
+                        ..nitro_gpu::proto::DmabufDesc::default()
+                    },
+                    fds,
+                },
+            );
+        }
+    }
+
+    /// Visible Surfaces on output `index` the helper could composite,
+    /// bottom to top: a dma-buf (a client's, or an exported scanout
+    /// buffer) the helper samples, opaque, axis-aligned, fully opaque.
+    fn gpu_layers(&self, index: usize, out: &mut Vec<gpu::Layer>) {
+        use nitro_scene::PaintKind;
+        if self.gpu.sources.is_empty() {
+            return;
+        }
+        let o = &self.outputs[index];
+        let Some((orect, _)) = self.scene.output_info(o.scene_id) else {
+            return;
+        };
+        let mut items = Vec::new();
+        self.scene.paint_list(o.scene_id, &orect, &mut items);
+        for item in &items {
+            let (PaintKind::Surface { size, .. } | PaintKind::Hole { size }) = item.kind else {
+                continue;
+            };
+            let t = item.transform;
+            if !t.is_axis_aligned() || t.a <= 0.0 || t.d <= 0.0 || item.opacity < 1.0 {
+                continue;
+            }
+            let Some(content) = self
+                .scene
+                .node(item.node)
+                .ok()
+                .and_then(nitro_scene::Node::surface)
+                .and_then(|s| s.content)
+            else {
+                continue;
+            };
+            let Some(src) = self.gpu.sources.get(&content.buffer) else {
+                continue;
+            };
+            if self.gpu.refused(content.buffer)
+                || (self.gpu.info.is_some()
+                    && !self.gpu.samples(src.desc.fourcc, src.desc.modifier))
+                || !self
+                    .scene
+                    .buffer(content.buffer)
+                    .is_ok_and(|b| b.desc().is_opaque())
+            {
+                continue;
+            }
+            let dst = t
+                .apply_rect(&Rect::new(0.0, 0.0, size.0, size.1))
+                .round_out();
+            let visible = dst.intersect(&item.clip).intersect(&orect);
+            if visible.is_empty() || dst.is_empty() || content.src.is_empty() {
+                continue;
+            }
+            let fx = content.src.w as f32 / dst.w as f32;
+            let fy = content.src.h as f32 / dst.h as f32;
+            let s = [
+                content.src.x as f32 + (visible.x - dst.x) as f32 * fx,
+                content.src.y as f32 + (visible.y - dst.y) as f32 * fy,
+                visible.w as f32 * fx,
+                visible.h as f32 * fy,
+            ];
+            out.push(gpu::Layer {
+                node: item.node,
+                key: content.buffer,
+                dst: visible.translate(-orect.x, -orect.y),
+                src: s,
+                encoding: gpu_encoding(content.color.matrix),
+                range: gpu_range(content.color.range),
+            });
+        }
+        // One layer is the shadow.
+        let max = nitro_gpu::proto::MAX_LAYERS - 1;
+        if out.len() > max {
+            out.drain(..out.len() - max);
+        }
+    }
+
+    /// A frame in mode 2: rasterize the damage into the shadow, and hand
+    /// the helper `{slot, damage, layers}`. Never waits: the commit
+    /// follows `Composited` (`gpu_commit`).
+    fn paint_gpu(&mut self, index: usize) -> bool {
+        if self.outputs[index].gpu_pending.is_some() {
+            return false;
+        }
+        let poll = EpollPoll(&self.epoll);
+        let gpu = &self.gpu;
+        let Some(slot) = gpu::pick_free(&gpu.ring.slots, |s| gpu.fence_pending(s)) else {
+            // Keep the damage; a released slot or a signalled fence
+            // brings the paint back.
+            self.gpu.counters.busy_slots += 1;
+            return false;
+        };
+        let _ = &poll;
+        let scene_id = self.outputs[index].scene_id;
+        let cursor_state = self.cursor_state(scene_id);
+        let scroll = self.outputs[index].take_scroll();
+        let fast_scaled = self
+            .wm
+            .overview()
+            .is_some_and(|o| o.output == scene_id && !o.atlas);
+        let output = &mut self.outputs[index];
+        let bounds = output.bounds();
+        let mut rasterize = output.rasterize_region();
+        let Some(shadow) = output.shadow.as_mut() else {
+            return false;
+        };
+        let stride = shadow.stride().max(output.width * 4);
+        if shadow.ensure(output.width, output.height, stride) {
+            rasterize = vec![bounds];
+            self.gpu_reshadow = true;
+        }
+        let painted = if rasterize.is_empty() {
+            None
+        } else {
+            let p = paint_shadow(
+                shadow,
+                &mut ShadowPaint {
+                    scene: &self.scene,
+                    text: &mut self.text,
+                    icons: &mut self.icons,
+                    items: &mut self.paint_items,
+                    palette: &self.palette,
+                    output: scene_id,
+                    bounds,
+                    cursor: (&self.cursor, cursor_state),
+                    fast_scaled,
+                },
+                &rasterize,
+                scroll.filter(|_| true),
+            );
+            shadow.note_painted(&rasterize);
+            Some(p)
+        };
+        self.text.next_frame();
+        if std::mem::take(&mut self.gpu_reshadow) {
+            self.gpu_reimport_shadow(index);
+        }
+        let Some(shadow_id) = self.gpu.ring.shadow else {
+            return false;
+        };
+        // Damage: the raster, and every helper layer that changed or
+        // moved (both where it is and where it was).
+        let o = &self.outputs[index];
+        let now: Vec<(nitro_scene::NodeKey, BufferKey, nitro_core::IRect)> = o
+            .gpu_layers
+            .iter()
+            .filter(|l| o.decision.gpu.contains(&l.node))
+            .map(|l| (l.node, l.key, l.dst))
+            .collect();
+        let mut damage = Damage::new();
+        for r in &rasterize {
+            damage.add(*r);
+        }
+        for l in &now {
+            if !o.gpu_last.contains(l) {
+                damage.add(l.2);
+            }
+        }
+        for l in &o.gpu_last {
+            if !now.contains(l) {
+                damage.add(l.2);
+            }
+        }
+        let damage = gpu_rects(damage.rects(), bounds);
+        let upload = gpu_rects(&rasterize, bounds);
+        let layers_in: Vec<gpu::Layer> = o
+            .gpu_layers
+            .iter()
+            .filter(|l| o.decision.gpu.contains(&l.node))
+            .copied()
+            .collect();
+        let poll = EpollPoll(&self.epoll);
+        let mut layers = Vec::with_capacity(layers_in.len() + 1);
+        let mut keys = Vec::with_capacity(layers_in.len());
+        for l in &layers_in {
+            let Some(tex) = self
+                .gpu
+                .texture(&poll, TOK_GPU, l.key, l.encoding, l.range)
+            else {
+                continue;
+            };
+            layers.push(nitro_gpu::proto::Layer {
+                tex,
+                src: l.src,
+                dst: l.dst,
+                blend: nitro_gpu::proto::Blend::Opaque,
+            });
+            keys.push(l.key);
+        }
+        layers.push(nitro_gpu::proto::Layer {
+            tex: shadow_id,
+            src: [0.0, 0.0, bounds.w as f32, bounds.h as f32],
+            dst: bounds,
+            blend: nitro_gpu::proto::Blend::PremulOver,
+        });
+        if !upload.is_empty() {
+            self.gpu.send(
+                &poll,
+                TOK_GPU,
+                &nitro_gpu::ToHelper::UploadDamage {
+                    id: shadow_id,
+                    rects: upload,
+                },
+                Vec::new(),
+            );
+        }
+        let serial = self.gpu.serial();
+        let sent = self.gpu.send(
+            &poll,
+            TOK_GPU,
+            &nitro_gpu::ToHelper::Composite(nitro_gpu::proto::Composite {
+                serial,
+                out_idx: slot as u32,
+                damage: damage.clone(),
+                layers,
+                fence_mask: 0,
+            }),
+            Vec::new(),
+        );
+        if !sent {
+            return false;
+        }
+        self.gpu.borrows.add(serial, keys);
+        let s = &mut self.gpu.ring.slots[slot];
+        s.state = gpu::SlotState::Submitted(serial);
+        s.last = Some(serial);
+        self.gpu.ring.in_flight = Some(gpu::InFlight {
+            serial,
+            slot,
+            sent: Instant::now(),
+            keys: Vec::new(),
+        });
+        self.gpu.arm();
+        let o = &mut self.outputs[index];
+        o.gpu_last = now;
+        o.gpu_submitted(serial);
+        if let Some(p) = painted {
+            self.stats.paint_us.push(p.paint_us);
+            self.stats.raster_px.push(p.raster_px);
+            self.stats.blit_px.push(p.moved_px);
+            self.blit_frames += u64::from(p.blitted);
+            self.stats.paint_log.push(p.paint_us);
+        }
+        let damage_px = frame::region_area(&damage);
+        self.stats.damage_px.push(damage_px);
+        self.stats.damage_log.push(damage_px);
+        true
+    }
+
+    /// Commit the helper's finished frame on output `index`: its slot on
+    /// the primary with the completion `sync_file` as `IN_FENCE_FD`. The
+    /// display waits on the fence, the server does not. Deferred to
+    /// `on_flip` while a flip is pending.
+    fn gpu_commit(&mut self, index: usize) {
+        let id = self.outputs[index].kms_id;
+        if self.gpu.owner != Some(id) || self.backend.flip_pending(id) {
+            return;
+        }
+        let Some(c) = self.gpu.ring.composited.take() else {
+            return;
+        };
+        let Some(fb) = self.gpu.ring.slots.get(c.slot).map(|s| s.fb) else {
+            return;
+        };
+        let o = &mut self.outputs[index];
+        if o.decision.mode != planes::Mode::Gpu || o.decision.layout.is_empty() {
+            // Left mode 2 meanwhile: the frame is not shown.
+            if let Some(s) = self.gpu.ring.slots.get_mut(c.slot) {
+                s.state = gpu::SlotState::Free;
+            }
+            o.gpu_pending = None;
+            return;
+        }
+        o.decision.layout[0].source = nitro_kms::PlaneSource::Buffer(fb);
+        let primary = o.decision.layout[0].plane;
+        let layout = o.decision.layout.clone();
+        let r = self.backend.set_plane_state(id, &layout).and_then(|()| {
+            self.stage_plane_fences(index);
+            self.backend.set_plane_fence(id, primary, c.fence)?;
+            self.backend.commit_planes(id)
+        });
+        match r {
+            Ok(()) => {
+                self.plane_fences += 1;
+                if let Some(s) = self.gpu.ring.slots.get_mut(c.slot) {
+                    s.state = gpu::SlotState::Shown;
+                }
+                self.gpu.ring.shown = Some(c.slot);
+                self.outputs[index].gpu_committed();
+                self.note_on_kms(index);
+            }
+            Err(e) => {
+                warn!("{id}: gpu commit: {e}");
+                if let Some(s) = self.gpu.ring.slots.get_mut(c.slot) {
+                    s.state = gpu::SlotState::Free;
+                }
+                self.outputs[index].gpu_pending = None;
+                self.planes_fallback(index);
+            }
+        }
+    }
+
+    /// Output `index`'s helper inputs for the planner, and whether it
+    /// wants the helper at all. Starts it (on demand) or prepares the
+    /// output's resources (first entry) as needed.
+    fn gpu_inputs(&mut self, index: usize) -> (Vec<nitro_scene::NodeKey>, Option<nitro_kms::BufferId>) {
+        let id = self.outputs[index].kms_id;
+        if !self.gpu.enabled()
+            || self.outputs[index].shadow.is_none()
+            || self.gpu.owner.is_some_and(|o| o != id)
+        {
+            self.outputs[index].gpu_layers.clear();
+            return (Vec::new(), None);
+        }
+        if self.gpu.owner == Some(id)
+            && self.gpu.ring.size != (self.outputs[index].width, self.outputs[index].height)
+        {
+            // A mode change: a new ring for the new size.
+            self.gpu_drop_owner(false);
+        }
+        self.gpu_export_scanouts();
+        let mut layers = Vec::new();
+        self.gpu_layers(index, &mut layers);
+        let nodes = layers.iter().map(|l| l.node).collect();
+        self.outputs[index].gpu_layers = layers;
+        let in_fence = self.outputs[index]
+            .plane_info
+            .iter()
+            .any(|p| p.kind == nitro_kms::PlaneKind::Primary && p.in_fence);
+        let ring = &self.gpu.ring;
+        let helper = (in_fence && self.gpu.ready() && self.gpu.owner == Some(id) && ring.ready())
+            .then(|| ring.slots[ring.shown.unwrap_or(0)].fb);
+        (nodes, helper)
+    }
+
+    /// After a decision without the helper: does output `index` want it?
+    /// (A helper-able Surface the planes did not take.)
+    fn gpu_want(&mut self, index: usize, d: &planes::Decision) {
+        let o = &self.outputs[index];
+        let want = o.gpu_layers.iter().any(|l| !d.places(l.node));
+        let id = o.kms_id;
+        if !want {
+            if self.gpu.owner == Some(id)
+                && d.mode != planes::Mode::Gpu
+                && self.gpu.mode == config::GpuHelper::OnDemand
+            {
+                self.gpu_release_owner();
+            }
+            return;
+        }
+        if !self.gpu.running() && self.gpu.state == gpu::State::Off {
+            self.gpu_spawn();
+        } else if self.gpu.ready() && self.gpu.owner.is_none() {
+            self.gpu_prepare(index);
+        }
+    }
+
+    /// The `gpu_*` lines of `stats`.
+    fn gpu_stats(&self, pairs: &mut Vec<(&'static str, u64)>) {
+        let g = &self.gpu;
+        let c = g.counters;
+        pairs.push(("gpu_state", g.state.number()));
+        pairs.push(("gpu_spawns", c.spawns));
+        pairs.push(("gpu_crashes", c.crashes));
+        pairs.push(("gpu_fallbacks", c.fallbacks));
+        pairs.push(("gpu_frames", c.frames));
+        pairs.push(("gpu_busy_slots", c.busy_slots));
+        pairs.push(("gpu_refused_frames", c.refused_frames));
+        pairs.push(("gpu_composite_us_avg", g.composite_us.mean()));
+        pairs.push(("gpu_composite_us_max", g.composite_us.max()));
+        pairs.push(("gpu_busy_us", c.busy_us));
+        pairs.push(("gpu_textures", g.textures() as u64));
+        pairs.push(("gpu_import_refused", c.import_refused));
+        pairs.push(("gpu_releases_held", g.held.len() as u64));
+        pairs.push(("gpu_fences_pending", g.fences_pending() as u64));
+        pairs.push(("gpu_ring_slots", g.ring.slots.len() as u64));
+        pairs.push(("gpu_helper_rss", g.last_stats.rss));
+        pairs.push(("gpu_helper_pss", g.last_stats.pss));
+        pairs.push(("gpu_helper_drm_total", g.last_stats.drm_total));
     }
 }

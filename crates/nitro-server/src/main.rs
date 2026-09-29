@@ -152,6 +152,14 @@ fn config_from_env() -> Result<Config, String> {
         // .desktop → Icon=` hop. A field for the tests, for exactly the
         // reason `icon_dirs` is one.
         desktop_dirs: None,
+        // The GPU helper (#3922): `NITRO_GPU=0|1|ondemand` beats
+        // `gpu.helper`; `NITRO_GPU_HELPER` names the binary (default:
+        // `nitro-gpu-vulkan` next to this one, else `$PATH`).
+        gpu: std::env::var("NITRO_GPU")
+            .ok()
+            .and_then(|v| nitro_server::config::GpuHelper::parse(&v)),
+        gpu_helper: std::env::var_os("NITRO_GPU_HELPER").map(PathBuf::from),
+        gpu_spawner: None,
     })
 }
 

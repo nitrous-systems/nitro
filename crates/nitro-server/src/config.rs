@@ -32,6 +32,9 @@
 //! remote.listen    = 127.0.0.1:7700
 //!
 //! overview.animate = true
+//!
+//! gpu.helper    = on
+//! gpu.idle_exit = 30
 //! ```
 //!
 //! # Why `key = value` and not TOML
@@ -76,6 +79,8 @@
 //! | icon theme | — | `theme.icons` | `hicolor` |
 //! | remote listener | — | `remote.listen` | off |
 //! | overview animation | `NITRO_OVERVIEW_ATLAS` | `overview.animate` | off (snap) |
+//! | GPU helper | `NITRO_GPU=0\|1\|ondemand` | `gpu.helper` | `on` |
+//! | helper idle exit | — | `gpu.idle_exit` | 30 s (on-demand only) |
 //!
 //! The environment wins because it is the *development* channel — a
 //! `NITRO_SCALE=HDMI-A-1=2 just fake` must not be silently overridden by
@@ -503,6 +508,63 @@ impl OverviewSettings {
     }
 }
 
+/// When the GPU helper (#3922) runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GpuHelper {
+    /// Never: composite mode 2 is off, today's behaviour.
+    Off,
+    /// Always on: started with the server, restarted when it dies.
+    #[default]
+    On,
+    /// Started when an output first wants mode 2; exits on its own after
+    /// `gpu.idle_exit` seconds holding nothing.
+    OnDemand,
+}
+
+impl GpuHelper {
+    /// `on | off | on-demand` (and the boolean spellings), or `None`.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "on-demand" | "ondemand" | "demand" => Some(Self::OnDemand),
+            v => parse_bool(v).map(|b| if b { Self::On } else { Self::Off }),
+        }
+    }
+}
+
+/// What the `gpu.*` keys say (#3922).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GpuSettings {
+    /// `gpu.helper`: when the helper runs. `NITRO_GPU` wins over it.
+    pub helper: Option<GpuHelper>,
+    /// `gpu.idle_exit`: seconds an on-demand helper stays up holding
+    /// nothing.
+    pub idle_exit: Option<u32>,
+}
+
+impl GpuSettings {
+    /// The default idle exit, seconds.
+    pub const IDLE_EXIT: u32 = 30;
+
+    /// Whether the file says anything about the helper.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.helper.is_none() && self.idle_exit.is_none()
+    }
+
+    /// When the helper runs; `on` by default.
+    #[must_use]
+    pub fn helper(&self) -> GpuHelper {
+        self.helper.unwrap_or_default()
+    }
+
+    /// The on-demand idle exit, seconds.
+    #[must_use]
+    pub fn idle_exit(&self) -> u32 {
+        self.idle_exit.unwrap_or(Self::IDLE_EXIT)
+    }
+}
+
 /// A parsed `server.conf`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Settings {
@@ -518,6 +580,8 @@ pub struct Settings {
     pub remote: RemoteSettings,
     /// The overview section.
     pub overview: OverviewSettings,
+    /// The GPU helper section.
+    pub gpu: GpuSettings,
     /// Every line that was skipped, and why. The caller logs these; they
     /// are not errors, because a configuration file cannot be allowed to
     /// stop a running compositor.
@@ -558,6 +622,7 @@ impl Settings {
             && self.theme.is_empty()
             && self.remote.is_empty()
             && self.overview.is_empty()
+            && self.gpu.is_empty()
             && self.outputs.values().all(OutputSettings::is_empty)
     }
 
@@ -837,6 +902,20 @@ pub fn parse(text: &str) -> Settings {
                 Some(b) => settings.overview.animate = Some(b),
                 None => settings.warnings.push(format!(
                     "line {number}: overview.animate {value:?} is not a boolean"
+                )),
+            },
+            "gpu.helper" if value.is_empty() => settings.gpu.helper = None,
+            "gpu.helper" => match GpuHelper::parse(value) {
+                Some(h) => settings.gpu.helper = Some(h),
+                None => settings.warnings.push(format!(
+                    "line {number}: gpu.helper {value:?} is not `on`, `off` or `on-demand`"
+                )),
+            },
+            "gpu.idle_exit" if value.is_empty() => settings.gpu.idle_exit = None,
+            "gpu.idle_exit" => match value.parse::<u32>() {
+                Ok(n) if n > 0 => settings.gpu.idle_exit = Some(n),
+                _ => settings.warnings.push(format!(
+                    "line {number}: gpu.idle_exit {value:?} is not a positive number of seconds"
                 )),
             },
             other => settings
@@ -1450,6 +1529,33 @@ mod tests {
             assert!(s.warnings[0].contains("pointer.speed"), "{:?}", s.warnings);
             assert_eq!(s.pointer.speed, None, "{value}");
         }
+    }
+
+    #[test]
+    fn gpu_helper_parses_and_defaults_to_on() {
+        let s = parse("");
+        assert!(s.gpu.is_empty());
+        assert_eq!(s.gpu.helper(), GpuHelper::On);
+        assert_eq!(s.gpu.idle_exit(), 30);
+        for (value, want) in [
+            ("on", GpuHelper::On),
+            ("off", GpuHelper::Off),
+            ("false", GpuHelper::Off),
+            ("on-demand", GpuHelper::OnDemand),
+            ("ondemand", GpuHelper::OnDemand),
+        ] {
+            let s = parse(&format!("gpu.helper = {value}\n"));
+            assert!(s.warnings.is_empty(), "{value}: {:?}", s.warnings);
+            assert_eq!(s.gpu.helper(), want, "{value}");
+            assert!(!s.is_empty());
+        }
+        let s = parse("gpu.idle_exit = 5\ngpu.helper =\n");
+        assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+        assert_eq!(s.gpu.idle_exit(), 5);
+        assert_eq!(s.gpu.helper, None);
+        let s = parse("gpu.helper = sometimes\ngpu.idle_exit = 0\ngpu.idle_exit = x\n");
+        assert_eq!(s.warnings.len(), 3, "{:?}", s.warnings);
+        assert!(s.gpu.is_empty());
     }
 
     #[test]

@@ -359,6 +359,7 @@ version = "0.0.1"
 dependencies = [
  "input",
  "nitro-core",
+ "nitro-gpu",
  "nitro-icons",
  "nitro-kms",
  "nitro-png",

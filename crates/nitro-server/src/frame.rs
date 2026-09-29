@@ -170,8 +170,59 @@ pub struct Shadow {
     width: u32,
     height: u32,
     stride: u32,
-    data: Vec<u8>,
+    data: Storage,
     complete: bool,
+}
+
+/// Where a shadow's pixels live: the heap, or — once its output has
+/// entered GPU composite mode (#3922) — a sealed memfd the helper imports
+/// (`udmabuf`, zero copy). The memfd is page-padded; only the first
+/// `stride * height` bytes are pixels.
+#[derive(Debug)]
+enum Storage {
+    Heap(Vec<u8>),
+    Memfd {
+        fd: std::os::fd::OwnedFd,
+        map: nitro_shm::MappingMut,
+        len: usize,
+    },
+}
+
+impl Storage {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Heap(v) => v,
+            Self::Memfd { map, len, .. } => &map.as_bytes()[..*len],
+        }
+    }
+
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        match self {
+            Self::Heap(v) => v,
+            Self::Memfd { map, len, .. } => &mut map.as_bytes_mut()[..*len],
+        }
+    }
+
+    /// Zeroed storage of `len` bytes, of the same kind as `self`.
+    fn same_kind(&self, len: usize) -> Self {
+        match self {
+            Self::Heap(_) => Self::Heap(vec![0; len]),
+            Self::Memfd { .. } => Self::memfd(len).unwrap_or_else(|e| {
+                crate::warn!("shadow memfd: {e}; back on the heap");
+                Self::Heap(vec![0; len])
+            }),
+        }
+    }
+
+    /// A zeroed sealed memfd of `len` bytes, rounded up to the page.
+    fn memfd(len: usize) -> Result<Self, String> {
+        const PAGE: usize = 4096;
+        let padded = len.max(1).div_ceil(PAGE) * PAGE;
+        let fd = nitro_shm::create_sealed("nitro-shadow", padded as u64).map_err(|e| e.to_string())?;
+        let map = nitro_shm::MappingMut::map_mut(std::os::fd::AsFd::as_fd(&fd), padded)
+            .map_err(|e| e.to_string())?;
+        Ok(Self::Memfd { fd, map, len })
+    }
 }
 
 impl Shadow {
@@ -189,7 +240,7 @@ impl Shadow {
             width,
             height,
             stride,
-            data: vec![0; (stride as usize) * (height as usize)],
+            data: Storage::Heap(vec![0; (stride as usize) * (height as usize)]),
             complete: false,
         }
     }
@@ -204,11 +255,16 @@ impl Shadow {
         // Built here rather than via `Shadow::new` + a fix-up, so the one
         // allocation made is the one kept: `new` assumes a tight stride and
         // the scanout buffer's is often padded.
+        // Rebuilt in the same kind of storage: a shadow the GPU helper
+        // imported stays a memfd (the caller re-imports it, #3922).
+        let data = self
+            .data
+            .same_kind((stride as usize) * (height as usize));
         *self = Self {
             width,
             height,
             stride,
-            data: vec![0; (stride as usize) * (height as usize)],
+            data,
             complete: false,
         };
         true
@@ -239,7 +295,39 @@ impl Shadow {
     /// Resident bytes, for the `shadow_bytes` statistic.
     #[must_use]
     pub fn bytes(&self) -> u64 {
-        self.data.len() as u64
+        self.data.bytes().len() as u64
+    }
+
+    /// Row stride in bytes.
+    #[must_use]
+    pub fn stride(&self) -> u32 {
+        self.stride
+    }
+
+    /// Move the pixels into a sealed memfd (keeping them), for the GPU
+    /// helper to import (#3922). A no-op when already there.
+    ///
+    /// # Errors
+    /// The memfd could not be created or mapped; the shadow stays on the
+    /// heap.
+    pub fn to_memfd(&mut self) -> Result<(), String> {
+        if matches!(self.data, Storage::Memfd { .. }) {
+            return Ok(());
+        }
+        let mut m = Storage::memfd(self.data.bytes().len())?;
+        m.bytes_mut().copy_from_slice(self.data.bytes());
+        self.data = m;
+        Ok(())
+    }
+
+    /// The memfd behind the pixels, when [`Shadow::to_memfd`] put them in
+    /// one.
+    #[must_use]
+    pub fn memfd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        match &self.data {
+            Storage::Heap(_) => None,
+            Storage::Memfd { fd, .. } => Some(std::os::fd::AsFd::as_fd(fd)),
+        }
     }
 
     /// Width in pixels.
@@ -256,7 +344,7 @@ impl Shadow {
 
     /// A canvas over the whole shadow, for the rasterizer.
     pub fn canvas(&mut self) -> Canvas<'_> {
-        Canvas::new(&mut self.data, self.width, self.height, self.stride)
+        Canvas::new(self.data.bytes_mut(), self.width, self.height, self.stride)
     }
 
     /// Copy `shadow[p] ← shadow[p − (dx, dy)]` for every pixel `p` of
@@ -299,7 +387,7 @@ impl Shadow {
             let from = (y - dy).cast_unsigned() as usize * stride
                 + (x0 - dx).cast_unsigned() as usize * bpp;
             let len = (x1 - x0).cast_unsigned() as usize * bpp;
-            self.data.copy_within(from..from + len, to);
+            self.data.bytes_mut().copy_within(from..from + len, to);
         }
     }
 
@@ -332,13 +420,14 @@ impl Shadow {
             if left == 0 && cols == width && src_stride == dst_stride {
                 let start = (top as usize) * src_stride;
                 let len = (rows as usize) * src_stride;
-                dst.data[start..start + len].copy_from_slice(&self.data[start..start + len]);
+                dst.data[start..start + len].copy_from_slice(&self.data.bytes()[start..start + len]);
                 continue;
             }
             for row in top..top + rows {
                 let from = (row as usize) * src_stride + x_off;
                 let to = (row as usize) * dst_stride + x_off;
-                dst.data[to..to + row_bytes].copy_from_slice(&self.data[from..from + row_bytes]);
+                dst.data[to..to + row_bytes]
+                    .copy_from_slice(&self.data.bytes()[from..from + row_bytes]);
             }
         }
     }
@@ -352,7 +441,7 @@ impl Shadow {
         let mut data = Vec::with_capacity(row * self.height as usize);
         for y in 0..self.height as usize {
             let start = y * self.stride as usize;
-            data.extend_from_slice(&self.data[start..start + row]);
+            data.extend_from_slice(&self.data.bytes()[start..start + row]);
         }
         Image {
             width: self.width,
@@ -443,6 +532,15 @@ pub struct OutputState {
     /// ([`crate::planes::hint_format`]), read from the planes when the
     /// output appears or changes, not per settle.
     pub hint_format: u32,
+    /// Mode 2 (#3922): the helper-able Surfaces of the last decision,
+    /// bottom to top, with where and what they show.
+    pub gpu_layers: Vec<crate::gpu::Layer>,
+    /// A `Composite` for this output is out (serial): nothing more is
+    /// painted until its buffer is committed.
+    pub gpu_pending: Option<u64>,
+    /// What the helper's last frame showed, `(node, buffer, dst)`: a
+    /// layer that changed or moved is damage for the next.
+    pub gpu_last: Vec<(nitro_scene::NodeKey, nitro_scene::BufferKey, IRect)>,
     /// The output's planes, re-read when the output appears or changes.
     /// Empty on a backend without planes, which keeps the planes module
     /// off entirely.
@@ -498,6 +596,9 @@ impl OutputState {
             decision: crate::planes::Decision::default(),
             planes_dirty: false,
             hint_format: nitro_wire::types::format::NV12,
+            gpu_layers: Vec::new(),
+            gpu_pending: None,
+            gpu_last: Vec::new(),
             plane_info: Vec::new(),
             plane_fences: Vec::new(),
             lit: false,
@@ -622,7 +723,7 @@ impl OutputState {
     /// Whether a frame would put anything new on screen.
     #[must_use]
     pub fn needs_paint(&self) -> bool {
-        self.needs_raster() || self.planes_dirty
+        (self.needs_raster() || self.planes_dirty) && self.gpu_pending.is_none()
     }
 
     /// Whether the output buffer has anything to catch up on — as
@@ -701,6 +802,30 @@ impl OutputState {
     /// the damage history stays exactly as it was.
     pub fn planes_committed(&mut self) {
         self.planes_dirty = false;
+        self.in_flight = std::mem::take(&mut self.painting);
+        self.in_flight_input_ns = self.painting_input_ns;
+        self.painting_input_ns = 0;
+    }
+
+    /// Note that a GPU-helper frame (#3922) went out with this damage.
+    /// The dumb output buffer is not on screen in mode 2 (leaving it
+    /// invalidates), and the helper keeps its own buffer-age history, so
+    /// the damage is simply spent. `painting` stays until the commit.
+    pub fn gpu_submitted(&mut self, serial: u64) {
+        self.gpu_pending = Some(serial);
+        self.planes_dirty = false;
+        self.previous.clear();
+        self.damage.clear();
+        self.content_damage = false;
+        self.retry = false;
+        self.scroll = None;
+    }
+
+    /// Note that the helper's frame (#3922) was committed: the serials
+    /// painted into it ride this flip.
+    pub fn gpu_committed(&mut self) {
+        self.gpu_pending = None;
+        self.lit = true;
         self.in_flight = std::mem::take(&mut self.painting);
         self.in_flight_input_ns = self.painting_input_ns;
         self.painting_input_ns = 0;

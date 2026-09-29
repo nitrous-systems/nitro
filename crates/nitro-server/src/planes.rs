@@ -72,16 +72,21 @@ pub enum Mode {
     Underlay,
     /// One Surface is the whole screen; the UI is not scanned out.
     Direct,
+    /// The GPU helper (#3922) composites what the planes cannot take: the
+    /// primary shows its output ring, overlays above it may still carry
+    /// unobscured Surfaces.
+    Gpu,
 }
 
 impl Mode {
-    /// The number `docs/surfaces.md` gives the mode (0, 1 or 3; 2 is
-    /// the GPU helper, not built).
+    /// The number `docs/surfaces.md` gives the mode (0, 1, 2 — the GPU
+    /// helper — or 3).
     #[must_use]
     pub const fn number(self) -> u64 {
         match self {
             Mode::Composite => 0,
             Mode::Overlay | Mode::Underlay => 1,
+            Mode::Gpu => 2,
             Mode::Direct => 3,
         }
     }
@@ -122,6 +127,14 @@ pub struct Inputs<'a> {
     /// The output buffer can scan out `ARGB8888`, which every underlay
     /// needs for its hole.
     pub alpha: bool,
+    /// Visible dma-buf Surfaces the GPU helper could composite (#3922),
+    /// bottom to top: opaque, axis-aligned, a format it samples. A
+    /// superset of nothing in particular: a node may also be a candidate.
+    pub gpu: &'a [NodeKey],
+    /// A framebuffer of this output's helper ring, when the helper is
+    /// ready to composite here (`None` keeps mode 2 out of the search).
+    /// Tests put it on the primary; the frame path rebinds it per frame.
+    pub helper: Option<BufferId>,
 }
 
 /// A layout for one output.
@@ -136,6 +149,9 @@ pub struct Decision {
     /// The subset of `placed` below the UI: their holes must be
     /// transparent, so the output scans out `ARGB8888`.
     pub underlays: Vec<NodeKey>,
+    /// Mode 2: the Surfaces the GPU helper composites, bottom to top.
+    /// They paint as holes in the shadow, which is the helper's top layer.
+    pub gpu: Vec<NodeKey>,
 }
 
 impl Decision {
@@ -149,6 +165,18 @@ impl Decision {
     #[must_use]
     pub fn places(&self, node: NodeKey) -> bool {
         self.placed.iter().any(|(n, _)| *n == node)
+    }
+
+    /// Whether `node` is shown by anything but the CPU raster: a plane or
+    /// the GPU helper. It paints as a hole.
+    #[must_use]
+    pub fn shows(&self, node: NodeKey) -> bool {
+        self.places(node) || self.gpu.contains(&node)
+    }
+
+    /// Every Surface shown by a plane or the helper.
+    pub fn nodes(&self) -> impl Iterator<Item = NodeKey> + '_ {
+        self.placed.iter().map(|(n, _)| *n).chain(self.gpu.iter().copied())
     }
 
     /// The framebuffers the layout reads.
@@ -173,6 +201,7 @@ impl Decision {
         self.mode == other.mode
             && self.placed == other.placed
             && self.underlays == other.underlays
+            && self.gpu == other.gpu
             && self.layout.len() == other.layout.len()
             && self
                 .layout
@@ -183,7 +212,12 @@ impl Decision {
 
     /// Point every placed Surface's plane at its candidate's current
     /// buffer (a cached decision carries the buffers of when it was made).
-    fn rebind(&mut self, candidates: &[Candidate]) {
+    fn rebind(&mut self, candidates: &[Candidate], helper: Option<BufferId>) {
+        if self.mode == Mode::Gpu
+            && let (Some(ring), Some(primary)) = (helper, self.layout.first_mut())
+        {
+            primary.source = PlaneSource::Buffer(ring);
+        }
         for (node, plane) in &self.placed {
             let Some(c) = candidates.iter().find(|c| c.node == *node) else {
                 continue;
@@ -355,7 +389,81 @@ fn above(p: &PlaneInfo, primary: &PlaneInfo) -> bool {
 #[allow(clippy::too_many_lines, clippy::many_single_char_names)] // The strategies in order; splitting them would scatter the shared layout state.
 /// The search behind [`Planner::decide`]: the best layout the kernel
 /// accepts, with no cache and no hysteresis. `test` counts on its own.
+///
+/// Planes first; then, if a helper-able Surface is left over and the
+/// helper is ready ([`Inputs::helper`]), mode 2 — the fallback chain of
+/// `docs/surfaces.md` (plane, helper, CPU).
 pub fn search(inp: &Inputs<'_>, test: &mut dyn FnMut(&[PlaneConfig]) -> bool) -> Decision {
+    let d = search_planes(inp, test);
+    if inp.helper.is_none() || inp.gpu.iter().all(|n| d.places(*n)) {
+        return d;
+    }
+    gpu_decision(inp, test, true).unwrap_or(d)
+}
+
+/// Mode 2: the primary shows the helper's ring, every helper-able Surface
+/// not on an overlay is composited by the helper. With `overlays`, an
+/// unobscured candidate (topmost first) may still take an overlay above
+/// the primary — never an underlay or direct scanout, which conflict with
+/// "the primary is the composite". `None` when there is nothing for the
+/// helper or the kernel refuses.
+pub fn gpu_decision(
+    inp: &Inputs<'_>,
+    test: &mut dyn FnMut(&[PlaneConfig]) -> bool,
+    overlays: bool,
+) -> Option<Decision> {
+    let ring = inp.helper?;
+    let primary = inp.planes.iter().find(|p| p.kind == PlaneKind::Primary)?;
+    let (w, h) = inp.size;
+    let full = IRect::new(0, 0, w.cast_signed(), h.cast_signed());
+    let mut d = Decision {
+        mode: Mode::Gpu,
+        layout: vec![PlaneConfig::new(
+            primary.id,
+            PlaneSource::Buffer(ring),
+            SrcRect::whole(w, h),
+            kms_rect(full),
+        )],
+        ..Decision::default()
+    };
+    if overlays {
+        let mut free: Vec<&PlaneInfo> = inp
+            .planes
+            .iter()
+            .filter(|p| p.kind == PlaneKind::Overlay && above(p, primary))
+            .collect();
+        free.sort_by_key(|p| (zpos(p), p.id));
+        for c in inp.candidates.iter().rev().filter(|c| !c.obscured) {
+            let hit = free.iter().enumerate().find_map(|(i, p)| {
+                let cfg = config(c, p)?;
+                let mut l = d.layout.clone();
+                l.push(cfg);
+                test(&l).then_some((i, l))
+            });
+            if let Some((i, l)) = hit {
+                d.layout = l;
+                d.placed.push((c.node, free[i].id));
+                free.remove(i);
+            }
+        }
+    }
+    d.gpu = inp
+        .gpu
+        .iter()
+        .copied()
+        .filter(|n| !d.places(*n))
+        .collect();
+    if d.gpu.is_empty() {
+        return None;
+    }
+    // With overlays the last test was of this very layout.
+    if d.placed.is_empty() && !test(&d.layout) {
+        return None;
+    }
+    Some(d)
+}
+
+fn search_planes(inp: &Inputs<'_>, test: &mut dyn FnMut(&[PlaneConfig]) -> bool) -> Decision {
     let Some(primary) = inp.planes.iter().find(|p| p.kind == PlaneKind::Primary) else {
         return Decision::default();
     };
@@ -384,6 +492,7 @@ pub fn search(inp: &Inputs<'_>, test: &mut dyn FnMut(&[PlaneConfig]) -> bool) ->
                     layout: vec![cfg],
                     placed: vec![(c.node, p.id)],
                     underlays: Vec::new(),
+                    gpu: Vec::new(),
                 };
             }
         }
@@ -401,6 +510,7 @@ pub fn search(inp: &Inputs<'_>, test: &mut dyn FnMut(&[PlaneConfig]) -> bool) ->
         layout: vec![front],
         placed: Vec::new(),
         underlays: Vec::new(),
+        gpu: Vec::new(),
     };
     let mut free = overlays.clone();
     let mut swapped = false;
@@ -498,6 +608,8 @@ fn signature(inp: &Inputs<'_>) -> u64 {
     let mut h = DefaultHasher::new();
     inp.size.hash(&mut h);
     inp.alpha.hash(&mut h);
+    inp.helper.is_some().hash(&mut h);
+    inp.gpu.hash(&mut h);
     for p in inp.planes {
         p.id.hash(&mut h);
     }
@@ -540,6 +652,10 @@ pub struct Planner {
     current_sig: Option<u64>,
     /// An upgrade being waited for: `(signature, decisions, first ns)`.
     pending: Option<(u64, u32, u64)>,
+    /// The next decision applies at once, whatever it is: the GPU helper
+    /// went away (#3922), and what it showed must reach a plane or the
+    /// CPU in the very next frame, not after the hysteresis.
+    immediate: bool,
     /// Counters.
     pub stats: PlannerStats,
 }
@@ -556,7 +672,8 @@ impl Planner {
     ) -> Decision {
         self.stats.candidates = inp.candidates.len() as u64;
         self.stats.obscured = inp.candidates.iter().filter(|c| c.obscured).count() as u64;
-        if inp.candidates.is_empty() {
+        if inp.candidates.is_empty() && (inp.helper.is_none() || inp.gpu.is_empty()) {
+            self.immediate = false;
             self.pending = None;
             return self.set(None, Decision::default());
         }
@@ -587,8 +704,11 @@ impl Planner {
             }
             d
         };
-        want.rebind(inp.candidates);
-        if want.placed.len() <= self.current.placed.len() || self.current_sig == Some(sig) {
+        want.rebind(inp.candidates, inp.helper);
+        if std::mem::take(&mut self.immediate)
+            || want.placed.len() <= self.current.placed.len()
+            || self.current_sig == Some(sig)
+        {
             self.pending = None;
             return self.set(Some(sig), want);
         }
@@ -602,8 +722,28 @@ impl Planner {
             return self.set(Some(sig), want);
         }
         self.pending = Some((sig, frames, since));
-        // Meanwhile: composite. What was applied was for another shape.
-        self.set(None, Decision::default())
+        // Meanwhile: composite — through the helper when it is there
+        // (mode 2 with no overlay, #3922), the CPU otherwise. What was
+        // applied was for another shape.
+        // Only as the status quo: a mode 2 in force stays through the
+        // wait, but a Surface never enters mode 2 just to wait for a plane.
+        let meanwhile = if inp.helper.is_some() && self.current.mode == Mode::Gpu {
+            let overlays = !self.current.placed.is_empty();
+            let tests = &mut self.stats.tests;
+            gpu_decision(
+                inp,
+                &mut |l: &[PlaneConfig]| {
+                    *tests += 1;
+                    let a: Vec<PlaneAssignment<'_>> =
+                        l.iter().map(|c| c.assignment(None)).collect();
+                    test(&a).is_some_and(|v| v.accepted())
+                },
+                overlays,
+            )
+        } else {
+            None
+        };
+        self.set(None, meanwhile.unwrap_or_default())
     }
 
     fn set(&mut self, sig: Option<u64>, d: Decision) -> Decision {
@@ -625,6 +765,13 @@ impl Planner {
             *d = Decision::default();
         }
         self.reset();
+    }
+
+    /// The GPU helper went away (#3922): forget the decision, and take
+    /// whatever the next one is at once.
+    pub fn helper_lost(&mut self) {
+        self.reset();
+        self.immediate = true;
     }
 
     /// The backend dropped the layout (a modeset): start again from the
@@ -715,6 +862,8 @@ mod tests {
         planes: Vec<PlaneInfo>,
         planner: Planner,
         now: u64,
+        gpu: Vec<NodeKey>,
+        helper: Option<BufferId>,
     }
 
     impl Rig {
@@ -729,6 +878,8 @@ mod tests {
                 planes,
                 planner: Planner::default(),
                 now: 1_000_000_000,
+                gpu: Vec::new(),
+                helper: None,
             }
         }
 
@@ -753,6 +904,8 @@ mod tests {
                 planes: &self.planes,
                 size: (W, H),
                 alpha: true,
+                gpu: &self.gpu,
+                helper: self.helper,
             };
             let (be, id) = (&mut self.be, self.id);
             search(&inp, &mut |l: &[PlaneConfig]| {
@@ -768,6 +921,8 @@ mod tests {
                 planes: &self.planes,
                 size: (W, H),
                 alpha: true,
+                gpu: &self.gpu,
+                helper: self.helper,
             };
             let (be, id) = (&mut self.be, self.id);
             self.planner
