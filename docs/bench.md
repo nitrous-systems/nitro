@@ -2689,6 +2689,237 @@ Frame budget: 60 Hz = 16667 µs, 120 Hz = 8335 µs.
 | balls-nodes n=32 fullscreen | 6044.6 | 59.8 | ok | 4687.1 | 119.8 | ok | ? | ? | ? |
 | rects n=500 640x480 (control: shell down) | 10000.0 | 60.0 | ok | 6699.7 | 101.0 | **slow** | 3758.3 | 201.3 | **slow** |
 
+## 9a. testhost2 (Kaby Lake R), against box1 (#3917)
+
+The same `deploy/bench.sh` matrix, 6 s per row, on the second box
+(`docs/testbox.md` §testbox2): i5-8250U (4c/8t, AVX2), UHD 620, eDP-1
+**2560×1440 at 59.997 Hz**, cpufreq `intel_pstate` / governor `powersave`
+/ EPP `balance_performance` (as found; not pinned). Main `76d438e`, run
+under a temporary copy of box1's `nitro-dev` unit so the session has the
+same shape; `binaries unchanged across the whole run` on both ledgers.
+Run twice, because this box's `server.conf` carries `scale = 1.25`: at
+**1.25** (the human's setting) and at **scale 1** (the like-for-like
+arm: box1 runs at scale 1). Ledgers: `docs/bench-testhost2-76d438e.jsonl`
+(1.25) and `docs/bench-testhost2-76d438e-scale1.jsonl` (1).
+
+**The box1 column is its 60 Hz arm** from `bench-1f35491.jsonl`, not its
+everyday 120 Hz, so all three columns share a frame budget of 16.7 ms.
+The ledgers are different shas (1f35491 vs 76d438e); the raster work in
+between (#3877 SWAR, #3898 ARGB shadow) moves a few percent, not the
+factors below.
+
+**Bandwidth** (`nitro-bench bandwidth`, 64 MB buffers): copy **6.8–7.3**
+GB/s, write 17.6–21.8, read 17.5–17.7 — about **2×** box1's copy (3.43)
+and 2.7–3.4× its write. A 2560×1440 frame is 14.7 MB, 1.78× a 1080p one,
+so the fullscreen pixel budget per frame is roughly box1's 1080p budget
+plus 10 %.
+
+### 9a.1 Headline rows
+
+Each cell is **presented/s / server µs per frame / paint µs mean/max**.
+"FS" is fullscreen: 1920×1080 on box1; on testhost2 2048×1152 at scale
+1.25 (the logical size) and 2560×1440 at scale 1 — the *device* buffer is
+2560×1440 in both, so `damage px` is 3 686 400 either way.
+
+| run | box1 (HSW, 1080p@60) | testhost2, scale 1.25 | testhost2, scale 1 |
+|---|---|---|---|
+| rects n=500 | 59.8 / 10 223 / 8 904 | 59.8 / 7 215 / 6 224 | 59.7 / 7 486 / 6 359 |
+| rects n=2000 | 57.3 / 12 616 / 10 953 | **30.0** / 19 667 / 18 620 | 59.0 / 9 576 / 8 511 |
+| rects-move n=1000 | 59.8 / 11 671 / 10 401 | 59.3 / 12 809 / 12 040 | 59.7 / 7 821 / 6 215 |
+| text n=100 | 60.0 / 7 000 / 658 | 59.8 / **13 649** / 314 | 59.8 / **13 371** / 222 |
+| text n=500 | 59.8 / 12 145 / 1 449 | **16.5** / **61 515** / 1 038 | **16.5** / **61 818** / 742 |
+| text-static n=500 | 60.0 / 4 556 / 3 021 | 60.0 / 6 083 / 3 581 | 60.0 / 5 417 / 3 053 |
+| scroll n=500 | 59.8 / 1 616 / 834 | 59.8 / 3 259 / 2 413 | 59.8 / 1 699 / 767 |
+| create n=50 | 60.0 / 694 / 243 | 59.7 / 1 229 / 524 | 59.7 / 922 / 303 |
+| putimage 1080 (640×480 clip) | 30.0 / 5 167 / 887 | 30.0 / 1 667 / 323 | 30.0 / 1 000 / 173 |
+| plasma FS | 15.0 / 14 444 / 3 511 | 12.2 / 5 890 / 1 458 | 12.2 / 5 480 / 1 408 |
+| fire FS | 30.0 / 16 667 / 3 697 | 30.2 / 6 133 / 1 165 | 30.0 / 5 667 / 1 065 |
+| rotozoom FS | 59.0 / 16 525 / 10 963 | 59.8 / 4 373 / 2 618 | 59.8 / 3 928 / 2 320 |
+| boing FS | 30.0 / 20 278 / 5 912 | 30.2 / 8 453 / 2 153 | 30.2 / 7 956 / 1 964 |
+| boing-node FS | 59.8 / 10 000 / 9 572 | 60.0 / 7 139 / 6 864 | 60.0 / 7 167 / 7 083 |
+| starfield n=2000 FS | 59.8 / 16 741 / 11 757 | 60.0 / 7 750 / 4 812 | 60.0 / 8 083 / 4 968 |
+| starfield-nodes n=2000 FS | 60.0 / 11 361 / 6 581 | 60.2 / 7 368 / 4 455 | 60.2 / 7 258 / 3 715 |
+| balls n=32 FS | 59.8 / 16 657 / 11 663 | 60.2 / 7 784 / 4 381 | 60.0 / 7 639 / 5 012 |
+| balls-nodes n=32 FS | 59.8 / 6 045 / 3 743 | 60.0 / 4 778 / 3 390 | 59.8 / 4 875 / 3 643 |
+
+### 9a.2 What the comparison says
+
+- **The fullscreen pixel path is 2–4× cheaper per frame on a 1.78× larger
+  screen.** rotozoom 10 963 → 2 320 µs paint, starfield/balls ~11.7 ms →
+  ~5 ms, boing 5.9 → 2.0 ms, and server CPU per frame falls 2–4×. That
+  is more than the 2× bandwidth: AVX2 and the larger cache pay too. Every
+  fullscreen row that was `ok` on box1 is `ok` here with ≥ 8 ms left in
+  the frame. The `slow` pixel rows (plasma 12 fps, fire and boing 30) are
+  **client**-bound (`client µs/frame` 18–74 ms, as in §7.10): the client
+  now computes 1.78× the pixels.
+- **Scale 1.25 costs the retained path ~1.5–2× paint.** Node scenes at
+  1.25 paint 1.56× the device pixels (`damage px` 449 400 vs 287 520 for
+  the same rects scene) and non-integer scaling puts more edges on
+  fractional pixels. `rects n=2000` presents at **30/s at 1.25** (18.6 ms
+  paint) and at **59/s at 1** (8.5 ms); `scroll` 2 413 vs 767 µs;
+  `rects-move n=1000` 12.0 vs 6.2 ms. The human's everyday setting is the
+  expensive one, and the one where this box is *not* faster than box1 on
+  small-scene work.
+- **`text` is the one scenario where testhost2 is clearly worse, at
+  either scale: `text n=500` presents at 16.5/s (server 61.5 ms/frame)
+  against box1's 59.8/s (12.1 ms).** Paint is fine (0.7–1 ms); the time is
+  in the server's shaping, not the raster: `shape_us_mean` is **114 µs**
+  against 16 on box1, and the stats show why — **856 fonts** indexed
+  (Arch with a full font set) against box1's 47, `font_evictions` 226,
+  `font_loads` 1 798 with `fonts_loaded` 0 at the end. Font files are
+  being loaded and evicted under the reshape load, i.e. fallback lookup
+  or the font cache thrashing on a large system font set. `text-static`
+  (the retained arm) is unaffected: 60/s, 5.4 ms. Not investigated
+  further here; it is a real finding about font handling on a
+  normal-sized desktop font install, not about this CPU.
+- Nothing else regresses. `create` and `text-static` are 1.2–1.3× box1's
+  CPU at scale 1: small-scene fixed costs (protocol, damage, `pread`) do
+  not scale with the faster core as much as the pixel loops do.
+
+<details><summary>The generated tables for the scale-1 ledger (54 runs)</summary>
+
+<!-- generated by `nitro-bench report`: 54 runs -->
+
+#### rects
+
+| run | presented/s | commits/s | mutations/frame | server µs/frame | client µs/frame | paint µs mean/max | copy µs mean | damage px | bytes/frame | flip rise µs | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| rects n=10 640x480 | 59.8 | 60.0 | 10.0 | 919.2 | 83.6 | 378.0/424.0 | 139.0 | 119201 | 194 | 0 | ok |
+| rects n=100 640x480 | 59.7 | 59.8 | 100.0 | 2681.6 | 83.8 | 1899.0/2105.0 | 244.0 | 287520 | 1724 | 0 | ok |
+| rects n=500 640x480 | 59.7 | 59.8 | 500.0 | 7486.0 | 111.7 | 6359.0/7600.0 | 212.0 | 287520 | 8524 | 0 | ok |
+| rects n=1000 640x480 | 59.7 | 59.7 | 1000.0 | 8072.6 | 167.6 | 7809.0/8519.0 | 134.0 | 287520 | 17024 | 0 | ok |
+| rects n=2000 640x480 | 59.0 | 59.0 | 2000.0 | 9576.3 | 113.0 | 8511.0/21556.0 | 70.0 | 287520 | 34024 | 1 | **dropped** |
+| rects n=500 640x480 | 59.3 | 59.3 | 500.0 | 7696.6 | 56.2 | 6068.0/7307.0 | 215.0 | 318574 | 8524 | 0 | ok |
+
+#### rects-move
+
+| run | presented/s | commits/s | mutations/frame | server µs/frame | client µs/frame | paint µs mean/max | copy µs mean | damage px | bytes/frame | flip rise µs | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| rects-move n=10 640x480 | 59.8 | 60.0 | 10.0 | 1002.8 | 83.6 | 391.0/428.0 | 138.0 | 120801 | 304 | 0 | ok |
+| rects-move n=100 640x480 | 59.7 | 59.8 | 100.0 | 2681.6 | 83.8 | 1881.0/2118.0 | 232.0 | 288480 | 2824 | 0 | ok |
+| rects-move n=500 640x480 | 59.8 | 59.8 | 500.0 | 7576.6 | 111.4 | 6274.0/6481.0 | 214.0 | 288480 | 14024 | 0 | ok |
+| rects-move n=1000 640x480 | 59.7 | 59.8 | 1000.0 | 7821.2 | 167.6 | 6215.0/12039.0 | 106.0 | 288480 | 28024 | 0 | ok |
+| rects-move n=2000 640x480 | 59.8 | 59.8 | 2000.0 | 11253.5 | 111.4 | 8024.0/8672.0 | 85.0 | 288480 | 56024 | 0 | ok |
+
+#### text
+
+| run | presented/s | commits/s | mutations/frame | server µs/frame | client µs/frame | paint µs mean/max | copy µs mean | damage px | bytes/frame | flip rise µs | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| text n=10 640x480 | 59.8 | 60.0 | 10.0 | 6239.6 | 139.3 | 100.0/568.0 | 4.0 | 8160 | 474 | 0 | ok |
+| text n=10 640x480 | 59.8 | 60.0 | 10.0 | 6295.3 | 139.3 | 222.0/635.0 | 25.0 | 39168 | 474 | 0 | ok |
+| text n=100 640x480 | 59.8 | 60.0 | 100.0 | 13370.5 | 83.6 | 222.0/712.0 | 31.0 | 84240 | 4524 | 0 | ok |
+| text n=100 640x480 | 60.0 | 60.0 | 100.0 | 14000.0 | 83.3 | 659.0/737.0 | 145.0 | 271296 | 4524 | 0 | ok |
+| text n=500 640x480 | 16.5 | 16.7 | 500.0 | 61818.2 | 101.0 | 742.0/999.0 | 99.0 | 283776 | 22524 | 33333 | **dropped** |
+| text n=500 640x480 | 16.5 | 16.5 | 500.0 | 61515.2 | 101.0 | 1681.0/3141.0 | 103.0 | 272736 | 22524 | 0 | **slow** |
+
+#### text-static
+
+| run | presented/s | commits/s | mutations/frame | server µs/frame | client µs/frame | paint µs mean/max | copy µs mean | damage px | bytes/frame | flip rise µs | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| text-static n=10 640x480 | 59.8 | 60.0 | 10.0 | 557.1 | 83.6 | 103.0/592.0 | 6.0 | 8421 | 304 | 0 | ok |
+| text-static n=100 640x480 | 59.8 | 60.0 | 100.0 | 1448.5 | 83.6 | 724.0/1044.0 | 76.0 | 84240 | 2824 | 0 | ok |
+| text-static n=500 640x480 | 60.0 | 60.2 | 500.0 | 5416.7 | 166.7 | 3053.0/3710.0 | 246.0 | 293914 | 14024 | 0 | ok |
+
+#### putimage
+
+| run | presented/s | commits/s | mutations/frame | server µs/frame | client µs/frame | paint µs mean/max | copy µs mean | damage px | bytes/frame | flip rise µs | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| putimage 640x480 | 59.8 | 60.0 | 1.0 | 529.2 | 557.1 | 34.0/38.0 | 11.0 | 10000 | 56 | 0 | ok |
+| putimage 640x480 | 59.7 | 59.8 | 1.0 | 586.6 | 2933.0 | 112.0/139.0 | 86.0 | 62500 | 56 | 0 | ok |
+| putimage 640x480 | 59.7 | 59.8 | 1.0 | 642.5 | 7514.0 | 222.0/281.0 | 170.0 | 240000 | 56 | 0 | ok |
+| putimage 640x480 | 30.0 | 30.0 | 1.0 | 1000.0 | 22388.9 | 173.0/375.0 | 244.0 | 307200 | 56 | 0 | **slow** |
+
+#### scroll
+
+| run | presented/s | commits/s | mutations/frame | server µs/frame | client µs/frame | paint µs mean/max | copy µs mean | damage px | bytes/frame | flip rise µs | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| scroll n=500 640x480 | 59.8 | 60.0 | 1.0 | 1699.2 | 83.6 | 767.0/883.0 | 382.0 | 306560 | 52 | 0 | ok |
+
+#### create
+
+| run | presented/s | commits/s | mutations/frame | server µs/frame | client µs/frame | paint µs mean/max | copy µs mean | damage px | bytes/frame | flip rise µs | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| create n=50 640x480 | 59.7 | 59.8 | 153.0 | 921.8 | 111.7 | 303.0/366.0 | 22.0 | 29281 | 3385 | 0 | ok |
+
+#### plasma
+
+| run | presented/s | commits/s | mutations/frame | server µs/frame | client µs/frame | paint µs mean/max | copy µs mean | damage px | bytes/frame | flip rise µs | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| plasma 640x480 | 59.7 | 59.8 | 1.0 | 642.5 | 7849.2 | 221.0/326.0 | 174.0 | 307200 | 56 | 0 | ok |
+| plasma 2560x1440 | 12.2 | 12.0 | 1.0 | 5479.5 | 73698.6 | 1408.0/3162.0 | 1280.0 | 3686400 | 56 | 0 | **slow** |
+
+#### fire
+
+| run | presented/s | commits/s | mutations/frame | server µs/frame | client µs/frame | paint µs mean/max | copy µs mean | damage px | bytes/frame | flip rise µs | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| fire 640x480 | 59.8 | 60.0 | 1.0 | 1169.9 | 6740.9 | 396.0/504.0 | 355.0 | 307200 | 56 | 0 | ok |
+| fire 2560x1440 | 30.0 | 30.0 | 1.0 | 5666.7 | 24611.1 | 1065.0/2174.0 | 1667.0 | 3686400 | 56 | 0 | **slow** |
+
+#### rotozoom
+
+| run | presented/s | commits/s | mutations/frame | server µs/frame | client µs/frame | paint µs mean/max | copy µs mean | damage px | bytes/frame | flip rise µs | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| rotozoom 640x480 | 59.8 | 60.0 | 1.0 | 1309.2 | 3621.2 | 475.0/552.0 | 400.0 | 307200 | 56 | 0 | ok |
+| rotozoom 2560x1440 | 59.8 | 59.8 | 1.0 | 3927.6 | 12200.6 | 2320.0/4377.0 | 1500.0 | 3686400 | 56 | 0 | ok |
+
+#### boing
+
+| run | presented/s | commits/s | mutations/frame | server µs/frame | client µs/frame | paint µs mean/max | copy µs mean | damage px | bytes/frame | flip rise µs | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| boing 640x480 | 59.8 | 60.0 | 1.0 | 1392.8 | 5013.9 | 496.0/885.0 | 462.0 | 307200 | 56 | 0 | ok |
+| boing 2560x1440 | 30.2 | 30.0 | 1.0 | 7955.8 | 17624.3 | 1964.0/5077.0 | 1900.0 | 3686400 | 56 | 0 | **slow** |
+| boing 640x480 | 59.7 | 59.8 | 1.0 | 1340.8 | 4944.1 | 534.0/843.0 | 439.0 | 307200 | 56 | 0 | ok |
+| boing 2560x1440 | 30.1 | 29.9 | 1.0 | 7790.1 | 17569.1 | 1588.0/5204.0 | 2005.0 | 3686400 | 56 | 0 | **slow** |
+
+#### boing-node
+
+| run | presented/s | commits/s | mutations/frame | server µs/frame | client µs/frame | paint µs mean/max | copy µs mean | damage px | bytes/frame | flip rise µs | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| boing-node 640x480 | 59.8 | 60.0 | 1.0 | 2200.6 | 83.6 | 1786.0/1886.0 | 50.0 | 32891 | 52 | 0 | ok |
+| boing-node 2560x1440 | 60.0 | 60.0 | 1.0 | 7166.7 | 27.8 | 7083.0/12625.0 | 123.0 | 299863 | 52 | 0 | ok |
+
+#### starfield
+
+| run | presented/s | commits/s | mutations/frame | server µs/frame | client µs/frame | paint µs mean/max | copy µs mean | damage px | bytes/frame | flip rise µs | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| starfield n=100 640x480 | 59.8 | 60.0 | 1.0 | 1448.5 | 501.4 | 676.0/1091.0 | 395.0 | 307200 | 56 | 0 | ok |
+| starfield n=100 2560x1440 | 60.0 | 60.0 | 1.0 | 8361.1 | 3722.2 | 5350.0/6912.0 | 2958.0 | 3686400 | 56 | 0 | ok |
+| starfield n=500 640x480 | 59.7 | 59.8 | 1.0 | 1452.5 | 502.8 | 624.0/879.0 | 484.0 | 307200 | 56 | 0 | ok |
+| starfield n=500 2560x1440 | 60.0 | 60.0 | 1.0 | 6694.4 | 3111.1 | 4249.0/6384.0 | 2291.0 | 3686400 | 56 | 0 | ok |
+| starfield n=2000 640x480 | 59.7 | 59.8 | 1.0 | 1424.6 | 670.4 | 637.0/1055.0 | 427.0 | 307206 | 56 | 0 | ok |
+| starfield n=2000 2560x1440 | 60.0 | 60.0 | 1.0 | 8083.3 | 3805.6 | 4968.0/6151.0 | 2701.0 | 3686400 | 56 | 0 | ok |
+
+#### starfield-nodes
+
+| run | presented/s | commits/s | mutations/frame | server µs/frame | client µs/frame | paint µs mean/max | copy µs mean | damage px | bytes/frame | flip rise µs | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| starfield-nodes n=100 640x480 | 59.8 | 60.0 | 100.0 | 2507.0 | 111.4 | 593.0/1210.0 | 229.0 | 120335 | 2824 | 0 | ok |
+| starfield-nodes n=100 2560x1440 | 60.0 | 60.0 | 100.0 | 5083.3 | 83.3 | 1982.0/2608.0 | 1476.0 | 1316559 | 2824 | 0 | ok |
+| starfield-nodes n=500 640x480 | 59.7 | 59.8 | 500.0 | 4553.1 | 167.6 | 1220.0/1720.0 | 300.0 | 308455 | 14024 | 0 | ok |
+| starfield-nodes n=500 2560x1440 | 60.0 | 60.0 | 500.0 | 8416.7 | 111.1 | 4241.0/5641.0 | 2019.0 | 3702862 | 14024 | 0 | ok |
+| starfield-nodes n=2000 640x480 | 59.7 | 59.8 | 2000.0 | 6620.1 | 307.3 | 2402.0/2880.0 | 224.0 | 307200 | 56024 | 0 | ok |
+| starfield-nodes n=2000 2560x1440 | 60.2 | 60.2 | 2000.0 | 7257.6 | 166.2 | 3715.0/7034.0 | 1320.0 | 3686400 | 56024 | 0 | ok |
+
+#### balls
+
+| run | presented/s | commits/s | mutations/frame | server µs/frame | client µs/frame | paint µs mean/max | copy µs mean | damage px | bytes/frame | flip rise µs | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| balls n=32 640x480 | 59.8 | 60.0 | 1.0 | 1392.8 | 752.1 | 592.0/923.0 | 467.0 | 307200 | 56 | 0 | ok |
+| balls n=32 2560x1440 | 60.0 | 60.0 | 1.0 | 7638.9 | 5416.7 | 5012.0/7027.0 | 3011.0 | 3686400 | 56 | 0 | ok |
+
+#### balls-nodes
+
+| run | presented/s | commits/s | mutations/frame | server µs/frame | client µs/frame | paint µs mean/max | copy µs mean | damage px | bytes/frame | flip rise µs | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| balls-nodes n=32 640x480 | 60.0 | 60.0 | 32.0 | 1944.4 | 83.3 | 1130.0/1295.0 | 72.0 | 60215 | 920 | 0 | ok |
+| balls-nodes n=32 2560x1440 | 59.8 | 59.8 | 32.0 | 4874.7 | 83.6 | 3643.0/4047.0 | 575.0 | 466785 | 920 | 0 | ok |
+
+
+
+</details>
+
+The scale-1.25 tables: `just bench-report docs/bench-testhost2-76d438e.jsonl`.
+
 ## 10. Reproducing
 
 ```sh

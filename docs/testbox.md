@@ -95,8 +95,9 @@ supervises all four. So `pgrep nitro` shows five processes, a
 ## testbox2: i5-8250U (Kaby Lake R, Gen9), `testhost2`
 
 `ssh testhost2` (user kaspar, passwordless sudo, key access; host name
-`ng`, 192.168.1.193). A laptop, and **the human's daily desktop**: GDM
-starts nitro from `/usr/local/bin`. It is here for what box1 cannot do:
+`ng`, 192.168.1.193). A laptop on which GDM starts nitro from
+`/usr/local/bin`. The human uses it now and then but has released it for
+measurements (#3917). It is here for what box1 cannot do:
 Gen9 display planes with NV12 and scalers, full anv Vulkan, and VA-API
 on iHD.
 
@@ -105,7 +106,8 @@ on iHD.
 | OS / kernel | Arch Linux, kernel 7.2.2 |
 | CPU / RAM | i5-8250U (Kaby Lake R, 4c/8t), 23.9 GB |
 | GPU | Intel UHD 620 (KBL GT2, 8086:5917), `i915`, `/dev/dri/card1`, `renderD128`; display version 9, cdclk 337.5 MHz (max 675) |
-| Outputs | eDP-1 2560×1440@60 connected (scale 1.25 in `~/.config/nitro/server.conf`, `de` keymap); DP-1, HDMI-A-1, DP-2 disconnected |
+| Power | **suspend disabled** (#3917, at the human's request, after the box went to sleep at the greeter): `sleep`/`suspend`/`hibernate`/`hybrid-sleep`/`suspend-then-hibernate.target` masked, `/etc/systemd/logind.conf.d/nitro-no-sleep.conf` ignores lid and idle. cpufreq `intel_pstate` (active), governor `powersave`, EPP `balance_performance`, left as found for every measurement |
+| Outputs | eDP-1 2560×1440@60 (`2560x1440@59997`) connected (scale 1.25 in `~/.config/nitro/server.conf`, `de` keymap); DP-1, HDMI-A-1, DP-2 disconnected |
 | Planes | per pipe: primary + 1 overlay + cursor; 2 scalers on pipes A/B, 1 on C. Measured in [`crates/nitro-kms/README.md`](../crates/nitro-kms/README.md#testbox2-intel-uhd-620-kaby-lake-r-gen9-i915-kernel-722-25601440-edp--2026-09-29) |
 | Seat | GDM + logind (session on seat0/tty2); seatd 0.9.3 present |
 | Libs | Mesa 26.2.3, vulkan-intel (anv) 26.2.3, intel-media-driver (iHD) 26.2.4 + libva-intel-driver, libva 2.24.1, libinput 1.32, libxkbcommon 1.13.2, libdrm 2.4.134 |
@@ -122,15 +124,35 @@ JPEG, VP8, HEVC Main/Main10. Plus VideoProc (scaling/CSC).
 
 Rules for this box:
 
-- **It is the human's live session.** `just box=testhost2 deploy`
+- **Free for measurements** (the human, 2026-09-29): stopping and
+  restarting GDM and nitro is fine. `just box=testhost2 deploy`
   installs into `/usr/local/bin` and does **not** restart anything; the
   new build runs from the next login. GDM autologin is off, so
-  `box-restart` / `box-stop` end his session and leave the greeter.
-- Stopping GDM to get DRM master (probes, `kms_fill`) is allowed — the
-  human's standing OK, 2026-09-29 — but start it again afterwards
-  (`sudo systemctl start gdm`) and say so, because he has to log in again.
-- There is no `nitro-dev` unit and none should be installed (it would
-  fight GDM for tty2). `just bench` refuses on this box.
+  `box-restart` / `box-stop` leave the greeter.
+- **Leave a working session behind**: `sudo systemctl start gdm` at the
+  end, with a build that runs, and say in `nitro-testbox` what is
+  deployed.
+- There is no *permanent* `nitro-dev` unit (it would fight GDM for tty2),
+  and `just bench` refuses on this box. For a measurement window, #3917
+  installed box1's unit **temporarily** and ran the box1 scripts
+  directly, which gives the same shape as box1 (a logind session on tty2,
+  `MALLOC_MMAP_THRESHOLD_=131072`), so the numbers compare:
+
+  ```console
+  $ sed 's#/home/kaspar/nitro-bin/nitro-session#/usr/local/bin/nitro-session#' \
+      deploy/nitro-dev.service | ssh testhost2 'sudo tee /etc/systemd/system/nitro-dev.service >/dev/null &&
+      sudo systemctl daemon-reload && sudo systemctl stop gdm && sudo systemctl start nitro-dev'
+  $ ssh testhost2 'ln -sf /usr/local/bin/nitro-server /usr/local/bin/nitro-bench ~/nitro-bin/'  # bench.sh fingerprints ~/nitro-bin
+  $ ssh testhost2 'NITRO_BENCH_SHA='$(git rev-parse --short HEAD)' bash -s' -- --seconds 6 < deploy/bench.sh
+  $ just box=testhost2 footprint 60      # box-ps finds the tree under the oldest nitro-session
+  # afterwards: stop nitro-dev, rm the unit and the two symlinks, daemon-reload, start gdm
+  ```
+
+  Remove the unit afterwards. A unit left enabled alongside GDM is the
+  tty2 fight.
+- The box has **no `ydotool`**. Input goes through the control socket's
+  `input` request (`docs/latency.md` §7), which is the better instrument
+  anyway.
 - The session's control socket is in `/run/user/1000/nitro/`, so `shot`
   and `box-session` work over ssh as the same user while he is logged in.
 - `/sys/kernel/debug` needs sudo: `sudo cat /sys/kernel/debug/dri/1/i915_display_info`.

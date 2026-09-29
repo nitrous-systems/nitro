@@ -919,3 +919,70 @@ paints, that is ~25 µs on a 50-glyph run and ~0.2 ms on a full-screen mixed-alp
 `paint_us` on the box was not re-measured with a deploy: the task
 direction was not to spend effort on hardware. The raster deltas above bound the change, and
 `copy_us` is unchanged by construction.
+
+## 10. testhost2 (Kaby Lake R, eDP 2560×1440@60), against box1 (#3917)
+
+The second box (`docs/testbox.md` §testbox2): i5-8250U, eDP-1
+`2560x1440@59997`, cpufreq `intel_pstate` / `powersave` / EPP
+`balance_performance` (as found). Main `76d438e`, under a temporary copy
+of box1's `nitro-dev` unit, measured at the human's `scale = 1.25` and
+again at scale 1. The box has no `ydotool`, so **input is injected
+through the control socket** (`input rel 4 3` / `input rel -4 -3`,
+`count=100 every=120` with the second train offset 60 ms: one move every
+60 ms, ~17 moves/s, a flip demand of ~33/s, **unsaturated** at 60 Hz).
+That skips the USB/evdev stage the ydotool runs had, and it stamps the
+event with its due time, so the figure is from the server's input path
+onwards, the same interval §1 defines.
+
+| | box1 (§4.1, 60 Hz) | testhost2, scale 1.25 | testhost2, scale 1 |
+|---|---|---|---|
+| `--follow`, client `i2p[total]` median | 9.3 ms | **10.3 / 10.1 ms** | **10.2 / 10.2 ms** |
+| p95 | 17.1 ms | 17.2 / 17.0 | 17.2 / 17.2 |
+| min / max | 1.3 / 19.2 ms | 2.4 / 23.4–35.8 | 2.8 / 23.4–26.2 |
+| server `i2p` median | — | 10.1 / 10.0 ms | 10.2 / 10.2 ms |
+| flips/s during the run | 56.1 (sleep 0.03) | 32.3 / 32.2 | 32.2 / 32.2 |
+| `paint_us` p50 / p95 per frame | ~17 mean (§5) | 63 / 91 µs | 22 / 51 µs |
+| `copy_us_mean` | 5–7 | 6–7 | 4–5 |
+| idle, 45 s, bar + launcher | 0–2 frames | **2 frames** | 4 frames |
+
+Two runs each, separated by `/`. The median is half a frame plus a little,
+as on box1: it is the wait for the vblank, and the work in it (paint
+≤ 0.1 ms, copy ~5 µs) is noise next to that. The ~1 ms over box1's 9.3 is
+the pacing (box1's recipe demanded 56 flips/s; this one 32, so fewer
+moves arrive just before a vblank) rather than a slower pipeline. The idle
+frames are the bar's clock and sensor poll, as §5 explains; nothing flips
+on vblank for nothing.
+
+**Typing** (`input type every=100`, 120 characters into `nitro-term`,
+each character a key down + up 100 ms apart, 9.7 frames/s):
+
+| | scale 1.25 | scale 1 |
+|---|---|---|
+| i2p p50 / p95 / max | 7.4 / 7.6–7.7 / 23.7 ms | 7.3–7.4 / 7.6–7.7 / 23.7 ms |
+| `paint_us` mean / p95 | 115–163 / 298–590 µs | 82–146 / 214–576 µs |
+| `damage_px` mean | 18 845–19 632 | 12 568–12 983 |
+
+The injected keys land at a fixed phase against the 100 ms train, which
+is why the p50–p95 band is so narrow (a ydotool run would spread over a
+whole frame); the one 23.7 ms max per run is the first key. Read it as
+"one frame, paint well under 1 ms", not as a 7.4 ms typing latency.
+
+**Scrolling** (`deploy/scroll-bench.py`, 150 wheel steps of +15 then −15,
+16 ms apart, `nitro-files /usr/bin`):
+
+| | fps | frame interval p50 / p95 / max | i2p p50 / p95 / max | paint mean | damage mean |
+|---|---|---|---|---|---|
+| scale 1.25, run 1 | 30.2 | 16.7 / 16.7 / 16.7 ms | 25.3 / 32.1 / 32.7 ms | 2.17 ms | 422 218 px |
+| scale 1.25, run 2 | 60.1 | 16.7 / 16.7 / 16.7 | 24.8 / 32.1 / 32.9 | 2.25 | 422 218 |
+| scale 1, run 1 | 30.2 | 16.7 / 16.7 / 16.7 | 25.6 / 32.3 / 33.0 | 1.16 | 269 759 |
+| scale 1, run 2 | 60.1 | 16.7 / 16.7 / 16.7 | 25.4 / 32.1 / 33.4 | 1.16 | 269 759 |
+
+The first run after launching `nitro-files` counts 145 frames in 4.8 s and
+the second 289 (the script's `fps` is frames over its own wall time; the
+first run's window is the one §7 already flags, "30 frames for 300 events",
+and was not investigated here either). Every frame interval is exactly one
+refresh and nothing is dropped. The i2p of ~25 ms is 1.5 frames at a
+16 ms input train, which queues one event behind the frame in flight: the
+number is a property of the input pacing (an event every 16 ms against a
+16.67 ms frame), not a latency regression. Paint is 1.9× cheaper at
+scale 1, following the damaged area (1.56×).

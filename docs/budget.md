@@ -83,6 +83,44 @@ apps open. The idle window was 60 s.
 
 RssShmem was 0 on every row.
 
+### Baseline: testhost2 (#3917)
+
+The same report for the second box (`docs/testbox.md` §testbox2), at
+`76d438e` (main) on 2026-09-29, `just box=testhost2 deploy` first
+(md5 `ea1fbf68…` on both ends). The session ran under a temporary copy
+of box1's `nitro-dev` unit (same `MALLOC_MMAP_THRESHOLD_`), not GDM,
+so the rows compare with box1's. eDP-1 **2560×1440@60**, idle desktop, 60 s
+window. Binary sizes and dependencies are the build's, not the box's:
+at this sha `nitro-server` is 3 176 280 bytes, the sum 12 603 144, and
+`cargo tree` is still 89 / 37.
+
+| testhost2, idle (kB) | VmRSS | RssAnon | RssFile | VmHWM | cpu % |
+|---|---|---|---|---|---|
+| `nitro-session` | 3 028 | 224 | 2 804 | 3 028 | 0.00 |
+| `nitro-server`, scale 1.25 | 50 352 | **40 796** | 9 556 | 68 080 | 0.00 |
+| `nitro-server`, scale 1 | 51 620 | **42 080** | 9 540 | 68 048 | 0.00 |
+| `nitro-wallpaper` | 2 868 | 220 | 2 648 | 2 868 | 0.00 |
+| `nitro-bar` | 3 104 | 268 | 2 836 | 3 104 | 0.00 |
+| `nitro-launcher` | 3 356 | 412 | 2 944 | 3 356 | 0.00 |
+| **TOTAL**, scale 1.25 (without `(sd-pam)`) | 62 708 | **41 920** | 20 788 | | |
+
+The server's RssAnon is **~2.2× box1's 18.6 MB** (with the atlas), and it
+splits like this, from `/proc/PID/smaps` and a fresh restart per arm:
+
+| part | kB |
+|---|---|
+| shadow buffer (`shadow_bytes` 14 745 600) | 14 400 |
+| overview atlas (`overview_atlas_bytes` 14 745 600) | 14 400 (measured: 43 788 on, **28 888** with `NITRO_OVERVIEW_ATLAS=0`, Δ 14 900) |
+| everything else | ~12 000–13 000 |
+
+The two output-sized buffers are 1.78× box1's because the panel is. The
+rest is ~5× box1's ~2.4 MB, and it is the box's **content**, not the
+build: this Arch install indexes **856 fonts** (box1: 47) and
+**313 `.desktop` entries** (box1: 14), and three 3.4–4.4 MB anonymous
+mappings sit next to a 2.6 MB heap. That figure is not audited further
+here. It is the number to watch on a normal desktop install, where box1's
+near-empty font set flatters the server.
+
 ### The rule
 
 Every task tagged `surface` (the GPU/video work of design #3894) must
@@ -1205,6 +1243,39 @@ frames. So the atlas's gain is a cheap *first* frame (2.6 ms against
 12–15 ms on box1), bought with ~14 whole-output frames that each cost
 about what the snap path's single frame did.
 
+### testhost2 on real KMS (#3917)
+
+The #3915 rows above were a fake backend, because the live session could
+not be restarted then. With the box released this is the real thing:
+main `76d438e`, eDP-1 2560×1440@60, the same method (`nitro-demo --windows
+N`, `overview on`/`off`, three repetitions, `samples paint`). #3916
+(snap default + `overview.animate`) had not merged, so the arms are the
+atlas default and `NITRO_OVERVIEW_ATLAS=0`. Governor `powersave` (intel_pstate).
+
+| testhost2 KMS, scale 1.25 | N=4 | N=8 | N=16 |
+|---|---|---|---|
+| one thumbnail render | 2.5–2.9 ms | 1.2–1.7 ms | 0.68–0.94 ms |
+| all renders, one entry | 9.9–11.6 ms | 9.6–13.8 ms | 10.9–15.0 ms |
+| entry frame 1 `paint_us` | **2.0–2.3 ms** | **2.4–2.5 ms** | **2.4–2.6 ms** |
+| entry frames 2… `paint_us` | 7.3–8.6 ms | 7.3–8.8 ms | 7.9–8.6 ms |
+| snap (`ATLAS=0`), frame 1 | **20.0–37.3 ms** | **12.9–35.0 ms** | **15.4–18.9 ms** |
+| snap, frames 2… | 0.15–0.98 ms | 0.40–1.2 ms | 0.90–2.2 ms |
+
+| testhost2 KMS, scale 1 | N=4 | N=8 | N=16 |
+|---|---|---|---|
+| one thumbnail render | 1.8–2.3 ms | 1.3–1.6 ms | 0.74–0.94 ms |
+| entry frame 1 `paint_us` | 1.7 ms | 1.9–2.0 ms | 2.0 ms |
+| entry frames 2… `paint_us` | 7.4–9.8 ms | 7.5–8.1 ms (one rep 10–17) | 7.9–9.2 ms |
+
+(Snap was measured at 1.25 only.) Against box1: the atlas path's
+animation frames cost **7.3–9.8 ms here against 10–15 ms on box1**, on a
+1.78× larger output, and are flat in N as there. They fit a 60 Hz frame
+with ~8 ms to spare. The snap path's single frame is the expensive one:
+**13–37 ms**, i.e. one or two missed vblanks at the governor's idle clock
+(the first frame after idle, `docs/latency.md` §8). The atlas buys a
+2–2.6 ms first frame against that. The snap numbers are what #3916's
+`blit_xrgb_scaled` change is meant to cut.
+
 ## First frame on the wire
 
 What a client spends to get its first pixels on screen, counted by
@@ -1357,6 +1428,41 @@ path (#3899) is what removes it.
 720p, **9.3 MB** at 1080p, mapped read-only by the server (no copy) and
 counted against the per-client buffer caps.
 
+
+### testhost2 (#3917)
+
+The same runs on testhost2 (i5-8250U, eDP-1 2560×1440@60, governor
+`powersave`), main `76d438e`, 8 s, first 30 paints dropped; `paint_us`
+per *video* frame (non-zero paints; at 30 fps the carry frames are ~1 µs
+as above).
+
+| run | scale | `paint_us` p50 | p95 | max | `damage_px` mean | presented / dropped |
+|---|---|---|---|---|---|---|
+| 1280×720 windowed, 30 fps | 1 | 646 | 675 | 1 904 | 51 439 | 239 / 0 |
+| 1280×720 windowed, 60 fps | 1 | 610 | 644 | 3 379 | 49 280 | 478 / 0 |
+| 2560×1440 fullscreen, 60 fps | 1 | **2 060** | 2 144 | 3 527 | 198 725 | 478 / 0 |
+| 1280×720 windowed, 30 fps | 1.25 | 14 150 | 14 676 | 14 859 | **1 441 939** | 239 / 0 |
+| 1280×720 windowed, 60 fps | 1.25 | **12 659** | 12 868 | 12 968 | **1 441 935** | 478 / 0 |
+| 2560×1440 fullscreen, 60 fps | 1.25 | 2 087 | 2 143 | 3 560 | 198 864 | 478 / 0 |
+
+At scale 1 the windowed partial update costs what it costs on box1
+(~600–650 µs), and a **full 2560×1440 NV12 frame is ~11.6 ms**
+(`max` over the run, i.e. the first full paint, 11 925–12 303 µs; it
+includes the rest of the desktop under the window) against box1's 6.1 ms for
+1080p: 1.78× the pixels at roughly the same ns/px (~3.2 against 2.95).
+Fullscreen streams at 2.1 ms/frame because only the moving box is damaged.
+
+**At scale 1.25 a windowed video is ~20× more expensive**: every video
+frame damages the whole 1600×900 device rectangle (1.44 M px, not ~50 k)
+and paints in 12.7–14.2 ms. With a non-integer scale the Surface is
+scaled onto the output, and the damage figure is consistent with the
+scaled path redrawing the whole node instead of propagating the
+client's damage rects. That cause was inferred from `damage_px`; the
+code was not traced. That is 76 % of a
+60 Hz frame for one 720p window, and it is the human's everyday setting.
+Fullscreen at 1.25 is unaffected (the buffer is 2560×1440 device, 1:1).
+It is a finding for the plane path (#3899) and for damage propagation
+through a scaled Surface, not fixed here.
 
 ## Multi-plane frame path in nitro-kms (#3913)
 
