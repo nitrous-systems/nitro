@@ -153,7 +153,8 @@ carries their frame's **header**. Two rules bind the sender:
 **Both directions carry descriptors.** Until M5-A only the client did
 (`CreateBuffer`); the server now sends `Keymap` (0x8208),
 `SelectionData` (0x8502) and `SurfaceBufferAllocated` (0x8309, #3914), and the client also sends `SendSelection`
-(0x0307). The two rules above are unchanged and apply to the server's
+(0x0307), `CreateDmabufBuffer` (0x0313, one per plane) and
+`PresentSurfaceFenced` (0x0314, #3918). The two rules above are unchanged and apply to the server's
 writes exactly as to the client's — the `Writer` and `Socket::send_all`
 that implement the split are the same code in both directions. Three
 consequences are worth naming, because three places used to assume the
@@ -254,7 +255,7 @@ containing the transaction reached the screen.
 |---|---|---|
 | 0 | `DIRECT_SCANOUT` | the server can scan a client buffer out without compositing |
 | 1 | `TEXT` | the server has fonts, so `Text` nodes will actually draw (M2) |
-| 2 | `DMABUF` | `Surface` nodes backed by dma-bufs are accepted (M5) |
+| 2 | `DMABUF` | client-allocated dma-bufs for `Surface` nodes: `CreateDmabufBuffer`, `PresentSurfaceFenced`, `DmabufFeedback` (#3918); see [Client dma-bufs](#client-dma-bufs-caps-dmabuf) |
 | 3 | `REMOTE` | the link is remote: buffers are expensive, text is cheap |
 | 4 | `WM` | the server manages windows: decorations, states, limits, app ids (M3) |
 | 5 | `SHELL` | the connection arrived on the **shell socket** and may send the shell ops (M3) |
@@ -304,8 +305,18 @@ not list it in `ClientCaps` is `Error { Protocol }`.
 never on a remote one: every Surface buffer is a descriptor. It follows
 rule 3: a Surface op from a client that did not list it in `ClientCaps`
 is `Error { Protocol }`, and `SurfaceHint` goes only to clients that
-listed it. `DMABUF` (bit 2) is still not advertised; it is the dma-buf
-import that comes later.
+listed it.
+
+`DMABUF` (bit 2, #3918) has `SURFACE`'s shape: advertised on every
+**local** link (the fake backend included — linear buffers take the CPU
+path there) and never on a remote one, because a dma-buf is a descriptor.
+Although it is below bit 8, it is an **explicit opt-in exception** like
+`IconRefused` under `ICONS`: `DmabufFeedback` goes only to clients that
+listed `DMABUF` in `ClientCaps`, and `CreateDmabufBuffer` /
+`PresentSurfaceFenced` from a client that did not list it — or did not
+list `SURFACE`, or is on a remote link — is `Error { Protocol }` (rule 3).
+`DIRECT_SCANOUT` (bit 0) stays **unset**: nothing scans a client buffer
+out until the planes module (#3899) places them; it turns the bit on.
 
 `SHARE` (bit 17, #3904) has `SURFACE`'s shape: it is advertised on every
 **local** link and never on a remote one, because the token is a bearer
@@ -605,6 +616,8 @@ Assigned in blocks of 0x100 so a block can grow without renumbering.
 | `0x0310` | `ExportSurface` | buffers (needs `SHARE`); **not buffered**, answered with `SurfaceExported` |
 | `0x0311` | `ImportSurface` | buffers (needs `SHARE`); **not buffered** |
 | `0x0312` | `AllocSurfaceBuffers` | buffers (needs `SURFACE`); **not buffered**, answered with `SurfaceBufferAllocated`s or `AllocSurfaceBuffersFailed` |
+| `0x0313` | `CreateDmabufBuffer` | buffers (needs `DMABUF` + `SURFACE`) — **carries 1 fd per plane** |
+| `0x0314` | `PresentSurfaceFenced` | buffers (needs `DMABUF` + `SURFACE`); **not buffered** — **carries 1 fd** |
 | `0x0401` | `SetLayer` | shell (see `SHELL`) |
 | `0x0402` | `SetExclusiveZone` | shell (see `SHELL`) |
 | `0x0403` | `SetAnchor` | shell (see `SHELL`) |
@@ -652,6 +665,7 @@ Assigned in blocks of 0x100 so a block can grow without renumbering.
 | `0x8308` | `SurfaceRevoked` | replies about content (see `SHARE`) |
 | `0x8309` | `SurfaceBufferAllocated` | replies about content (see `SURFACE`) — **carries 1 fd** |
 | `0x830a` | `AllocSurfaceBuffersFailed` | replies about content (see `SURFACE`) |
+| `0x830b` | `DmabufFeedback` | replies about content (see `DMABUF`) |
 | `0x8401` | `HotKey` | shell (see `SHELL`) |
 | `0x8402` | `WindowInfo` | shell (see `SHELL`) |
 | `0x8403` | `WindowListEnd` | shell (see `SHELL`) |
@@ -2063,7 +2077,11 @@ is released at once, in the same wakeup, unless a node shows that buffer.
 `PresentSurface` on a revoked import is released at once, and a frame an
 importer had queued when its import was revoked or dropped is released
 at once. A release always goes to the **buffer's owner**, which for a
-shared Surface may not be the node's owner.
+shared Surface may not be the node's owner. A client dma-buf
+([`CreateDmabufBuffer`](#createdmabufbuffer--0x0313--carries-1-fd-per-plane))
+is released under exactly the same rules: once no node references it,
+the server's CPU path never reads its pages again; a buffer on a hardware
+plane (#3899) is released after the flip that replaces it.
 
 ## Surfaces (caps `SURFACE`)
 
@@ -2140,18 +2158,26 @@ buffer or a `src` outside it `BadBuffer` (all fatal, carrying `serial`).
 **The latch.** Precisely:
 
 1. **Queue.** The frame is queued on the node, outside the transaction
-   machinery. At most one frame is queued per node. A newer one
-   **supersedes** it: the superseded buffer gets `BufferReleased` at
-   once, in the same wakeup, unless it is the node's current buffer (or
-   the new frame's). A superseded frame never gets a `Presented`: it was
-   **dropped**.
+   machinery, behind any frames still waiting there. A **ready** frame
+   (no pending fence) **supersedes** every frame queued before it; an
+   unready one waits behind them. At most **4** frames are queued per
+   node; a fifth drops the oldest. A superseded or dropped frame's
+   buffer gets `BufferReleased` at once, in the same wakeup, unless it is
+   the node's current buffer or still queued, and its fence is closed. A
+   superseded frame never gets a `Presented`: it was **dropped**. Without
+   fences — every shm client — this is exactly "at most one queued, the
+   newest wins".
 2. **Latch point.** A queued frame is latched — it becomes the node's
    current buffer exactly as a committed `SetSurface` would — at the
    first paint opportunity of its window's output, i.e. when that output
    has no flip pending. In steady state that is the wakeup right after a
    vblank (the flip-complete event); on an idle output it is immediate.
-   The newest ready frame wins. For shm, "ready" means "arrived"; with
-   acquire fences (#3900) it will mean the fence has signalled.
+   The newest **ready** frame wins: for shm "ready" means "arrived"; a
+   frame with an acquire fence (#3918, an explicit
+   [`PresentSurfaceFenced`](#presentsurfacefenced--0x0314--carries-1-fd)
+   or the implicit snapshot of a dma-buf's write fences) is ready once
+   the fence has signalled. Every older queued frame is superseded
+   (rule 1); newer frames still waiting on their fences stay queued.
 3. **Damage.** The latched frame's damage is the union of the damage of
    every frame queued since the last latch (an empty list in any of them
    means the whole node). The swap rule is `SetImage`'s: if the new
@@ -2167,8 +2193,9 @@ buffer or a `src` outside it `BadBuffer` (all fatal, carrying `serial`).
    (off-screen node, a window on no output), the same rule as a commit.
 6. **Transactions.** A committed `SetSurface` on the node cancels its
    queued frame (the frame's buffer is released, it gets no `Presented`)
-   and wins. `DestroyNode`, `DestroyBuffer` of the queued buffer, or a
-   disconnect drops the queue silently: no release, no `Presented`.
+   and wins; this covers every queued frame. `DestroyNode`,
+   `DestroyBuffer` of the queued buffer, or a disconnect drops the queue
+   silently: no release, no `Presented`, pending fences closed.
 7. **Tearing contract.** Do not write a buffer between `PresentSurface`
    and its `BufferReleased`. A ring of three buffers keeps one on
    screen, one queued and one being drawn.
@@ -2286,6 +2313,118 @@ The server does not bracket its own reads (see `docs/surfaces.md`).
 
 Fixed head **9 bytes**. Nothing was allocated; the ids are still free.
 The client falls back to `CreateSurfaceBuffer` with its own memfds.
+
+## Client dma-bufs (caps `DMABUF`)
+
+A client that already has its frame in a dma-buf — VA-API decode, a GPU
+render, a camera — hands it over instead of copying it into a memfd
+(#3918). The buffer is a surface buffer like any other: same id space and
+32-buffer cap, presented into `Surface` nodes (its own or, through
+[sharing](#surface-sharing-caps-share), an imported one; Chromium's GPU
+process presents that way), destroyed with `DestroyBuffer`. Two things
+differ: content reaches the screen **only through the latch**, where fence
+readiness is defined, and what the server can do with it depends on its
+layout.
+
+* **Linear, `NV12`/`YUYV`/`UYVY`/`XR24`/`AR24`, all planes in one
+  buffer** (the `CPU` flag below): mapped read-only and painted by the
+  CPU path exactly like a memfd. The server brackets its reads with
+  `DMA_BUF_IOCTL_SYNC` (`START|READ` at the latch, `END|READ` when the
+  buffer stops being shown).
+* **Anything else importable** (tiled, compressed, split): accepted and
+  kept, imported as a KMS framebuffer when the output has planes, and
+  painted as a **placeholder** (opaque 50 % grey, `stats`
+  `dmabuf_placeholder_paints`) until the planes module (#3899) scans it
+  out. Never a crash, never a read of unmapped memory.
+
+**Render at display size or smaller.** Display planes upscale but barely
+downscale (Kaby Lake: 0.94× accepted, 0.75× rejected), so a buffer larger
+than the output cannot go on a plane. `DmabufFeedback` carries the
+output's size for this; `SurfaceHint` still carries the node's.
+
+**`SetSurface` naming a dma-buf buffer is `BadBuffer`** (fatal). A
+committed attach would have to block the transaction on a fence or show
+an unsignalled buffer; neither is allowed. `SetSurface NONE` and memfd
+buffers are unchanged. A Wayland adapter maps `wl_surface.commit` of a
+dma-buf to a present.
+
+**Remote.** Both client ops carry descriptors, so on a remote link they
+are the non-fatal `BadBuffer` refusal of every buffer op (and
+`Error::RemoteNoFds` in the client library before anything is sent);
+`DMABUF` is never advertised there.
+
+### `CreateDmabufBuffer` — 0x0313 — **carries 1 fd per plane**
+
+| field | type | meaning |
+|---|---|---|
+| `id` | `BufferId` | allocated by the client; shares the id space with `CreateBuffer` |
+| `width`, `height` | `u32` | pixels, 1..=16384 |
+| `format` | `u32` | DRM fourcc |
+| `modifier` | `u64` | DRM format modifier, shared by all planes |
+| `planes` | `u8` | 1..=4; exactly this many fds follow the frame |
+| `offset[i]`, `stride[i]` | 4 × (`u32`, `u32`) | per plane; unused slots 0 |
+
+Fixed head **57 bytes**. The fds may be dups of one dma-buf. A plane
+count above 4, or an fd count that does not match, is a decode error
+(fatal). Acts at receipt like `CreateSurfaceBuffer`: validated, mapped if
+it takes the CPU path, then registered at the next commit.
+
+Fatal `BadBuffer` for: fewer planes than the format needs (`NV12` 2,
+others 1; extra planes are allowed for auxiliary data); a zero or too
+large size; a zero stride; `DRM_FORMAT_MOD_INVALID`; a format + modifier
+not listed with `IMPORT` in the default `DmabufFeedback`; an fd that is
+neither a dma-buf nor a sealed memfd (the fake backend's stand-in); a
+plane outside its buffer (exact for linear: `offset + stride·(rows−1) +
+row_bytes ≤ size`; `offset < size` otherwise). `Limit` past the buffer
+caps (bytes count only when CPU-mapped). A dma-buf's memory is the
+client's and does not count against the server's RSS.
+
+### `PresentSurfaceFenced` — 0x0314 — **carries 1 fd**
+
+The fields of [`PresentSurface`](#presentsurface--0x030f), followed by
+one descriptor: the **acquire fence**, a `sync_file` that becomes readable
+when the buffer's content is complete. The frame is not latched before it
+signals; everything else is `PresentSurface`'s. Works on any buffer kind.
+
+**Implicit sync.** A plain `PresentSurface` on a dma-buf buffer makes the
+server snapshot the buffer's write fences itself
+(`DMA_BUF_IOCTL_EXPORT_SYNC_FILE`, `DMA_BUF_SYNC_READ`) and wait for that,
+so a producer that relies on implicit sync (VA-API, Mesa) needs nothing
+more. On a kernel without the ioctl (< 6.0) the server polls the dma-buf
+itself, which is readable once its writers are done
+(`implicit_fence_fallbacks`).
+
+**The server never blocks on a fence.** It polls it once at receipt (an
+already-signalled fence costs nothing more) and otherwise waits for it in
+its event loop. The fence is not validated as a `sync_file` — any
+pollable fd works, and one that never signals stalls only the sender's
+own surface: a newer ready frame still supersedes it. At most 64 fences
+may be pending per client (`Limit` beyond).
+
+### `DmabufFeedback` — 0x830b
+
+| field | type | meaning |
+|---|---|---|
+| `id` | `NodeId` | 0 = the default feedback; else a `Surface` node (own or import) |
+| `main_device` | `u64` | `dev_t` of the KMS device; 0 when unknown |
+| `max_width`, `max_height` | `u32` | the output's size in device pixels: render at this size or smaller |
+| `formats` | `vec<{format u32, modifier u64, flags u32}>` | sorted by format, then modifier |
+
+Head **20 bytes**, then the vector (16 bytes per entry). Sent only to
+clients that listed `DMABUF`. The same data a Wayland adapter needs for
+`zwp_linux_dmabuf` feedback. `flags`:
+
+| bit | name | meaning |
+|---|---|---|
+| 0 | `SCANOUT` | a plane of the output lists this pair in `IN_FORMATS` (advertised is not usable: a `TEST_ONLY` commit decides) |
+| 1 | `CPU` | linear and convertible by the CPU path: shown correctly today |
+| 2 | `IMPORT` | accepted by `CreateDmabufBuffer` at all |
+
+**When.** The default (the union over every output, `max_*` the largest
+output) when the client lists `DMABUF`, and again whenever the outputs
+change (hotplug, mode change, rescan). Per Surface node — for the output
+the node's window is on — when it first lands on an output and whenever
+that output or its feedback changes.
 
 ## Surface sharing (caps `SHARE`)
 
@@ -3083,6 +3222,8 @@ a remote client, is `Error { Protocol }`.
 | `SelectionData` 0x8502 | relayed, not created | the **requester** | end of the data, or the refusal above |
 | `SelectionRequest` 0x8503 | — **no fd** | — | — |
 | `SurfaceBufferAllocated` 0x8309 | the server (a DRM PRIME dma-buf, `O_RDWR`; a sealed memfd on the fake backend) | the client, when it is done with the sync bracket (it may close right after mapping if it never syncs) | n/a — `size` is exact |
+| `CreateDmabufBuffer` 0x0313 | the client's exporter (VA-API, a GPU driver, udmabuf) | the server keeps plane 0's fd for the buffer's life (implicit fences) and the rest only until the KMS import; all closed at `DestroyBuffer` or disconnect. The client may close its copies at once | n/a |
+| `PresentSurfaceFenced` 0x0314 | the client (a `sync_file`) | the server, once signalled, or when its frame is dropped | n/a |
 
 The two `sendmsg` rules under [File descriptors](#file-descriptors) are
 unchanged and apply in both directions: one frame's descriptors per call,

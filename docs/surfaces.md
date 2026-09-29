@@ -28,7 +28,8 @@ around this content are optional and never a reason to spend memory.
 ## The `Surface` node
 
 `Surface` (`NodeKind` 5, reserved in [`wire.md`](wire.md), together with
-capability bits `DIRECT_SCANOUT` 0 and `DMABUF` 2) is the **single
+capability bits `DIRECT_SCANOUT` 0 and `DMABUF` 2 — the latter
+advertised since #3918) is the **single
 abstraction for foreign pixels**. There is no second mechanism for video,
 another for GPU windows and a third for fullscreen games.
 
@@ -189,15 +190,66 @@ sends the fd in a `SurfaceBufferAllocated`. The client maps it
   `AllocSurfaceBuffersFailed`) and draws NV12, YUYV (HSW's only
   overlay YUV format) or XR24 at the kernel's padded pitch.
 
+### As built: client dma-bufs (#3918)
+
+Clients hand over dma-bufs they allocated (`CreateDmabufBuffer`, one fd
+per plane, format + modifier; `docs/wire.md` § Client dma-bufs). Server
+side: `crates/nitro-server/src/dmabuf.rs`.
+
+- **Import.** Validated at receipt against the default feedback's
+  `IMPORT` set and the buffer caps. Linear buffers in a CPU format, all
+  planes in one inode, are mapped read-only (`Mapping::map_dmabuf`) and
+  painted by the ordinary CPU path. Anything else gets a store that is
+  not CPU-readable (`PixelStore::cpu_readable`), and `frame::paint_surface`
+  fills its rect with `HOLE_PLACEHOLDER` grey
+  (`dmabuf_placeholder_paints`). When the output backend reports planes
+  the buffer is also imported at commit with `Backend::import_buffer`
+  (PRIME import + AddFB2 with modifiers). The result goes into
+  `HeldBuffer.scanout` (`dmabuf_kms_imported` / `dmabuf_kms_refused`),
+  and `DestroyBuffer` or disconnect frees it with `free_buffer`.
+- **Fences.** A frame is latched only once its acquire fence has
+  signalled. The latch queue holds up to 4 frames per node; the newest
+  ready one wins and older ones are superseded. The fence is `poll`ed
+  once at receipt; if it is still pending it goes into the server's epoll
+  (`FenceSet`, tokens from `1 << 36`) and never blocks the loop.
+  - Explicit fences come from `PresentSurfaceFenced`.
+  - Implicit fences are a `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` snapshot taken
+    at `PresentSurface` (a third ioctl in nitro-shm's `unsafe`
+    exception). On kernels older than 6.0 the server polls the dma-buf
+    itself instead.
+  - On the CPU path the server brackets its reads with
+    `DMA_BUF_IOCTL_SYNC` `READ`: it starts the bracket at latch and ends
+    it when the buffer is replaced. This is correct on non-LLC hardware
+    too.
+- **Feedback.** `DmabufFeedback` is a per-output (or default, union) list
+  of format + modifier pairs, flagged `SCANOUT` (from `IN_FORMATS`, non-cursor
+  planes), `CPU` (linear CPU formats), `IMPORT`. It also carries
+  `main_device` (`Backend::device_id`) and the output size as
+  `max_width`/`max_height`, meaning "render at display size or smaller".
+- **Hooks for the planes module (#3899).** #3899 builds on these:
+  - `HeldBuffer.scanout` holds the imported KMS framebuffer.
+  - `surface::Queued::fence` is reachable, so a plane-placed frame can
+    latch early and hand its fence to `Backend::set_plane_fence` as
+    `IN_FENCE_FD` instead of waiting.
+  - `dmabuf::direct_scanout()` is `false`, and so is the `DIRECT_SCANOUT`
+    cap. #3899 turns both on.
+  - The feedback's `SCANOUT` flags drive the placement.
+  - Releases after the replacing flip already flow through
+    `take_released_buffers`.
+- **Not in v1.** `SetSurface` with a dma-buf is refused, because readiness
+  is defined only at the latch. The server does not check that a fence
+  fd is a `sync_file`: a fence that never signals stalls only the
+  sender's surface.
+
 ## Protocol needs
 
 | need | status |
 |---|---|
 | buffer release | exists: `BufferReleased` (`RELEASE` cap) |
-| acquire fences | new |
-| latch the newest *ready* frame at vblank — video updates skip the transaction round-trip | new |
+| acquire fences | **done** (#3918): `PresentSurfaceFenced` (explicit), `EXPORT_SYNC_FILE` snapshot on `PresentSurface` (implicit) |
+| latch the newest *ready* frame at vblank — video updates skip the transaction round-trip | **done** (#3897; fence-aware queue #3918) |
 | colour metadata: BT.601 / 709 / 2020, full / limited range → plane `COLOR_ENCODING` / `COLOR_RANGE` | new |
-| format / modifier feedback, so producers allocate scanout-capable buffers | new (`DMABUF` cap) |
+| format / modifier feedback, so producers allocate scanout-capable buffers | **done** (#3918): `DmabufFeedback`, `DMABUF` cap |
 
 ## GPU helper: `nitro-gpu` (feature-gated)
 
@@ -353,7 +405,8 @@ In order; tasks carry the `surface` tag on the task board.
    `IN_FORMATS`, with server-allocated dumb buffers in a format the
    plane accepts (NV12 on Gen9+, YUYV on Haswell) — #3899.
 6. Client dma-buf import + fences + format feedback (`DMABUF` cap) —
-   #3900.
+   #3918 (refiled from #3900). **Built**; see "As built: client
+   dma-bufs" above.
 7. Overview thumbnail atlas — #3902.
 8. `nitro-gpu` helper, always-on by default — #3901 (held; design first).
 

@@ -961,6 +961,14 @@ looking for.
 | `shadow_bytes`           | Heap held by the shadow buffers, summed over the outputs: one scanout-sized `XRGB8888` buffer each (8 294 400 bytes at 1080p), 0 under `NITRO_SHADOW=0`. It is the server's one allocation proportional to pixels rather than to work, and `docs/budget.md` argues for it explicitly rather than leaving it to be inferred from `outputs`. |
 | `scanout_buffers`        | Server-allocated scanout buffers (`AllocSurfaceBuffers`, #3914) that wire clients hold right now. Each is a linear KMS dumb buffer exported to its client as a dma-buf; freed on `DestroyBuffer` or disconnect (the backend defers the free while one is on screen). |
 | `scanout_buffer_bytes`   | Bytes of those buffers the server maps (the whole export each). Dumb-buffer memory: **not** in the server's `RssAnon`, but counted against the per-client buffer caps like a memfd. |
+| `dmabuf_buffers`         | Client-allocated dma-bufs (`CreateDmabufBuffer`, #3918) held right now. |
+| `dmabuf_cpu_mapped`      | Of those, the ones the CPU path maps (linear, CPU format, one buffer). The rest paint as a placeholder. |
+| `dmabuf_kms_imported`    | Of those, the ones imported as KMS framebuffers (`Backend::import_buffer`; only when the output has planes). The hook the planes module (#3899) reads. |
+| `dmabuf_kms_refused`     | KMS imports refused, cumulative. Not an error: the buffer stays on the CPU path or placeholder. |
+| `dmabuf_placeholder_paints` | Surface paints that showed the grey placeholder because the buffer is not CPU-readable (tiled/compressed), cumulative. |
+| `fences_pending`         | Acquire fences waiting in the epoll set right now. |
+| `fence_waits`            | Acquire fences that were not yet signalled at receipt and had to be waited for, cumulative. |
+| `implicit_fence_fallbacks` | Implicit fences taken by polling the dma-buf because `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` is missing (kernel < 6.0), cumulative. |
 | `decorated`              | Windows carrying a server-drawn frame. `windows - decorated` is how many opted out with `UNDECORATED`. |
 | `minimized`              | Windows hidden by `Minimized`. They are still in `windows` and still in the `Alt+Tab` order. |
 | `dragging`               | 1 while a move or resize drag is in flight. A drag that is still 1 with nothing on the desk is a stuck grab. |
@@ -1384,5 +1392,8 @@ buffer's fourcc dispatched to `blit_nv12`, `blit_yuyv` (YUYV/UYVY),
 are stores and ignore node opacity in v1. The latch (`surface::Latch`)
 runs in `settle` and `on_flip` for outputs with no flip pending; latched
 serials join the output's `painting` list, so `Presented` goes out
-exactly like a commit's. `SURFACE` is advertised on local links only;
-`DMABUF` is not advertised.
+exactly like a commit's. `SURFACE` and `DMABUF` are advertised on local
+links only. A client dma-buf (#3918, `src/dmabuf.rs`) that is not
+CPU-readable paints as `HOLE_PLACEHOLDER` grey; frames wait in the latch
+queue (up to 4 per node) until their acquire fence signals, which the
+server learns from epoll (`TOK_FENCE_BASE`), never by blocking.
