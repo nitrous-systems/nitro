@@ -41,7 +41,9 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
             "--synthetic" => a.synthetic = true,
             "--frames" => {
                 let n = it.next().ok_or("--frames needs a number")?;
-                a.opts.frames = n.parse().map_err(|_| format!("--frames: bad number {n:?}"))?;
+                a.opts.frames = n
+                    .parse()
+                    .map_err(|_| format!("--frames: bad number {n:?}"))?;
             }
             "-h" | "--help" => return Err(USAGE.to_owned()),
             s if s.starts_with('-') => return Err(format!("unknown option {s}\n{USAGE}")),
@@ -81,11 +83,10 @@ fn main() -> ExitCode {
         _ => Box::new(SyntheticDecoder::new(1280, 720, 30, 30 * 60)),
     };
     let info = dec.info().clone();
-    let title = args
-        .file
-        .as_ref()
-        .and_then(|f| f.file_name())
-        .map_or_else(|| "nitro-video".to_owned(), |n| n.to_string_lossy().into_owned());
+    let title = args.file.as_ref().and_then(|f| f.file_name()).map_or_else(
+        || "nitro-video".to_owned(),
+        |n| n.to_string_lossy().into_owned(),
+    );
     let player = match Player::new(dec, args.opts) {
         Ok(p) => p,
         Err(e) => {

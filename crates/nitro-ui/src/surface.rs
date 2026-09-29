@@ -145,7 +145,11 @@ impl<S: 'static> Widget<S> for SurfaceView<S> {
                         .measure(c, Constraints::loose(Size::new(w, h)))
                         .h
                         .min(h);
-                    let y = if align == OverlayAlign::Top { 0.0 } else { h - m };
+                    let y = if align == OverlayAlign::Top {
+                        0.0
+                    } else {
+                        h - m
+                    };
                     Rect::new(0.0, y, w, m)
                 }
             };
@@ -164,13 +168,23 @@ impl<S: 'static> Widget<S> for SurfaceView<S> {
             let l = (content.x - bounds.x).max(0.0);
             (
                 Rect::new(bounds.x, bounds.y, l, bounds.h),
-                Rect::new(content.x + content.w, bounds.y, bounds.w - l - content.w, bounds.h),
+                Rect::new(
+                    content.x + content.w,
+                    bounds.y,
+                    bounds.w - l - content.w,
+                    bounds.h,
+                ),
             )
         } else {
             let t = (content.y - bounds.y).max(0.0);
             (
                 Rect::new(bounds.x, bounds.y, bounds.w, t),
-                Rect::new(bounds.x, content.y + content.h, bounds.w, bounds.h - t - content.h),
+                Rect::new(
+                    bounds.x,
+                    content.y + content.h,
+                    bounds.w,
+                    bounds.h - t - content.h,
+                ),
             )
         };
         if a.w > 0.0 && a.h > 0.0 {
@@ -195,7 +209,10 @@ impl<S: 'static> Widget<S> for SurfaceView<S> {
         }
         // Moves bubble through untouched; a press on the bare video is
         // the view's.
-        Handled::from(matches!(p, SurfacePointer::Down(..) | SurfacePointer::Up(..)))
+        Handled::from(matches!(
+            p,
+            SurfacePointer::Down(..) | SurfacePointer::Up(..)
+        ))
     }
 
     fn role(&self) -> Role {

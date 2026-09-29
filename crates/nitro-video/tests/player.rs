@@ -49,9 +49,10 @@ fn harness(frames: u32, opts: Opts) -> Built {
     let info = dec.info().clone();
     let p = Player::new(Box::new(dec), opts).expect("player");
     let wake = rustix::io::dup(p.wake_fd()).expect("dup");
-    let h = Harness::sized("nitro-video", p, Size::new(256.0, 144.0), move |ui| {
+    let mut h = Harness::sized("nitro-video", p, Size::new(256.0, 144.0), move |ui| {
         player::install(ui, &info, wake.as_fd())
     });
+    h.auto_fds(true);
     Built { h }
 }
 
@@ -100,7 +101,8 @@ fn a_seek_reanchors_at_the_target() {
     p.request_seek(ui, 40.0);
     h.wait_for("the seek to land", |h| {
         h.settle();
-        (h.state().position() - 40.0).abs() < 0.05 && h.state().stats.shown.last() == Some(&40_000_000)
+        (h.state().position() - 40.0).abs() < 0.05
+            && h.state().stats.shown.last() == Some(&40_000_000)
     });
     // Right steps 5 s on from there.
     h.key(nitro_ui::event::key::RIGHT);

@@ -35,8 +35,7 @@ struct NvCtx {
 // every pointer argument is either the context `nv_open` returned or a
 // buffer whose length is passed alongside it.
 unsafe extern "C" {
-    fn nv_open(path: *const c_char, threads: c_int, err: *mut c_char, errlen: c_int)
-    -> *mut NvCtx;
+    fn nv_open(path: *const c_char, threads: c_int, err: *mut c_char, errlen: c_int) -> *mut NvCtx;
     fn nv_info(
         c: *const NvCtx,
         width: *mut c_int,
@@ -114,8 +113,8 @@ impl LibavDecoder {
         // SAFETY: `cpath` is NUL-terminated and outlives the call; `err`
         // is 256 writable bytes and says so.
         let raw = unsafe { nv_open(cpath.as_ptr(), threads, err.ptr(), err.len()) };
-        let ctx = NonNull::new(raw)
-            .ok_or_else(|| format!("{name}: {}", err.message("cannot open")))?;
+        let ctx =
+            NonNull::new(raw).ok_or_else(|| format!("{name}: {}", err.message("cannot open")))?;
         let (mut w, mut h, mut cs, mut full) = (0, 0, 0, 0);
         let mut duration = 0.0;
         let mut codec = ErrBuf::new();
@@ -145,7 +144,11 @@ impl LibavDecoder {
             info: StreamInfo {
                 width,
                 height,
-                duration: if duration.is_finite() { duration.max(0.0) } else { 0.0 },
+                duration: if duration.is_finite() {
+                    duration.max(0.0)
+                } else {
+                    0.0
+                },
                 matrix,
                 full_range: full != 0,
                 codec: codec.message("?"),
@@ -170,8 +173,10 @@ impl Decoder for LibavDecoder {
     }
 
     fn next_frame(&mut self, dst: &mut [u8], layout: Nv12Layout) -> Result<Option<i64>, String> {
-        let (Ok(w), Ok(h)) = (c_int::try_from(layout.width), c_int::try_from(layout.height))
-        else {
+        let (Ok(w), Ok(h)) = (
+            c_int::try_from(layout.width),
+            c_int::try_from(layout.height),
+        ) else {
             return Err("frame too large".to_owned());
         };
         if dst.len() < layout.frame_len() {

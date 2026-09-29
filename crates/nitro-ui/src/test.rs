@@ -87,6 +87,8 @@ pub struct Harness<S> {
     socket: Option<crate::introspect::Socket>,
     /// The fake output's size, [`OUTPUT`] unless the test chose.
     output: (u32, u32),
+    /// See [`Harness::auto_fds`].
+    auto_fds: bool,
 }
 
 impl<S: 'static> Harness<S> {
@@ -304,6 +306,7 @@ impl<S: 'static> Harness<S> {
             time_ns: 2_000_000,
             socket: None,
             output,
+            auto_fds: false,
         };
         // `shot` over the introspection socket screenshots *this*
         // harness's server, not whatever `$NITRO_CONTROL` happens to
@@ -467,7 +470,19 @@ impl<S: 'static> Harness<S> {
     /// On a wire failure.
     pub fn pump(&mut self) -> usize {
         let n = self.ui.pump(&mut self.state).expect("pump");
-        n + self.run_ready_fds()
+        if self.auto_fds {
+            n + self.run_ready_fds()
+        } else {
+            n
+        }
+    }
+
+    /// Run [`Ui::add_fd`] hooks whose descriptors are readable in every
+    /// [`Harness::pump`], as the app loop's `epoll` would. Off by
+    /// default: most tests drive their hooks by hand to control *when*
+    /// a background result lands.
+    pub fn auto_fds(&mut self, on: bool) {
+        self.auto_fds = on;
     }
 
     /// Run every [`Ui::add_fd`] hook whose descriptor is readable now,

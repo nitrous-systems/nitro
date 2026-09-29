@@ -659,11 +659,7 @@ impl<S: 'static> PaintCx<'_, S> {
     /// could not be created; the error is reported by the pass.
     pub fn surface(&mut self, slot: Slot, rect: Rect) -> NodeId {
         let at = self.slot_at(slot);
-        match self
-            .ui
-            .wire_mut()
-            .paint_surface(&mut self.slots, at, rect)
-        {
+        match self.ui.wire_mut().paint_surface(&mut self.slots, at, rect) {
             Ok(n) => n,
             Err(e) => {
                 self.note(Err(e));

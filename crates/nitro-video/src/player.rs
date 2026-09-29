@@ -73,8 +73,14 @@ enum Cmd {
 /// News from the decode thread.
 #[derive(Debug)]
 enum Msg {
-    Frame { generation: u32, slot: usize, pts_us: i64 },
-    Eof { generation: u32 },
+    Frame {
+        generation: u32,
+        slot: usize,
+        pts_us: i64,
+    },
+    Eof {
+        generation: u32,
+    },
     Error(String),
 }
 
@@ -86,7 +92,11 @@ enum Slot {
     /// Decoded and waiting for its moment.
     Ready,
     /// Sent to the server.
-    Queued { serial: u32, pts_us: i64, shown: bool },
+    Queued {
+        serial: u32,
+        pts_us: i64,
+        shown: bool,
+    },
 }
 
 /// Playback state.
@@ -425,7 +435,11 @@ impl Player {
 
     fn node(&self, ui: &Ui<Self>) -> NodeId {
         self.ids
-            .and_then(|ids| ui.widget::<SurfaceView<Self>>(ids.view).ok().map(SurfaceView::node))
+            .and_then(|ids| {
+                ui.widget::<SurfaceView<Self>>(ids.view)
+                    .ok()
+                    .map(SurfaceView::node)
+            })
             .unwrap_or(NodeId::NONE)
     }
 
@@ -581,7 +595,11 @@ impl Player {
         let pick = pacing::pick(&pts, target);
         let chosen = pick.show.map(|i| self.ready[i]);
         let skipped: Vec<usize> = pick.skip.iter().map(|&i| self.ready[i].0).collect();
-        let gone: Vec<usize> = chosen.iter().map(|c| c.0).chain(skipped.iter().copied()).collect();
+        let gone: Vec<usize> = chosen
+            .iter()
+            .map(|c| c.0)
+            .chain(skipped.iter().copied())
+            .collect();
         self.ready.retain(|r| !gone.contains(&r.0));
         for s in skipped {
             self.stats.skipped += 1;
@@ -611,7 +629,9 @@ impl Player {
 
     fn on_surface(&mut self, ui: &mut Ui<Self>, ev: &SurfaceEvent) {
         match *ev {
-            SurfaceEvent::Presented { serial, time_ns, .. } => {
+            SurfaceEvent::Presented {
+                serial, time_ns, ..
+            } => {
                 let Some(i) = self.slots.iter().position(
                     |s| matches!(s, Slot::Queued { serial: q, shown: false, .. } if *q == serial),
                 ) else {
@@ -865,7 +885,11 @@ fn every_second(ui: &mut Ui<Player>) {
 ///
 /// # Panics
 /// If the wake pipe cannot be duplicated (out of descriptors at start).
-pub fn install(ui: &mut Ui<Player>, info: &StreamInfo, wake: std::os::fd::BorrowedFd<'_>) -> WidgetId {
+pub fn install(
+    ui: &mut Ui<Player>,
+    info: &StreamInfo,
+    wake: std::os::fd::BorrowedFd<'_>,
+) -> WidgetId {
     ui.enable_surfaces();
     ui.on_surface(|p: &mut Player, ui: &mut Ui<Player>, ev: &SurfaceEvent| p.on_surface(ui, ev));
     ui.on_frame(|p: &mut Player, ui: &mut Ui<Player>, f| p.on_frame(ui, f));
