@@ -127,6 +127,7 @@ pub struct Stats {
 }
 
 /// The whole app state: `S` for the nitro-ui tree.
+#[allow(clippy::struct_excessive_bools)] // Independent facts (eof, overlay shown, started, calibrate), not a state machine.
 pub struct Player {
     opts: Opts,
     info: StreamInfo,
