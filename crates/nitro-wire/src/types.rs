@@ -146,7 +146,11 @@ tag_enum! {
         /// shaping. Always accepted; [`caps::TEXT`] reports whether the
         /// server has a font, and so whether the text will be *visible*.
         Text = 4,
-        /// External surface (dma-buf, Wayland adapter). Reserved for M5.
+        /// A video/external surface: an shm buffer in NV12, YUYV, UYVY,
+        /// XR24 or AR24 with colour metadata, attached with
+        /// [`SetSurface`](crate::msg::SetSurface) or latched at vblank with
+        /// [`PresentSurface`](crate::msg::PresentSurface). Needs
+        /// [`caps::SURFACE`] (listed in `ClientCaps`).
         Surface = 5,
         /// A symbolic icon, named by the client and drawn by the server
         /// with [`SetIcon`](crate::msg::SetIcon).
@@ -201,6 +205,29 @@ tag_enum! {
         Center = 1,
         /// Lines end at the right edge.
         Right = 2,
+    }
+}
+
+tag_enum! {
+    /// The YUV → RGB matrix of a `Surface`'s buffer
+    /// ([`SetSurface`](crate::msg::SetSurface)). Ignored for RGB formats.
+    ColorMatrix: u8 {
+        /// ITU-R BT.601 (SD video, JPEG).
+        Bt601 = 0,
+        /// ITU-R BT.709 (HD video).
+        Bt709 = 1,
+        /// ITU-R BT.2020 non-constant luminance (UHD).
+        Bt2020 = 2,
+    }
+}
+
+tag_enum! {
+    /// The quantisation range of a `Surface`'s YUV buffer.
+    ColorRange: u8 {
+        /// "TV" range: Y 16..=235, chroma 16..=240.
+        Limited = 0,
+        /// "PC" range: every component 0..=255.
+        Full = 1,
     }
 }
 
@@ -406,6 +433,13 @@ pub mod caps {
     /// can copy them instead of alpha-blending (#3877). Client→server only;
     /// like [`CURSOR`] it must still be listed in `ClientCaps` (rule 3).
     pub const OPAQUE_REGION: u32 = 1 << 15;
+    /// shm-backed `Surface` nodes: [`CreateSurfaceBuffer`](crate::msg::CreateSurfaceBuffer),
+    /// [`SetSurface`](crate::msg::SetSurface),
+    /// [`PresentSurface`](crate::msg::PresentSurface) and the server's
+    /// [`SurfaceHint`](crate::msg::SurfaceHint) (#3897). Local links only;
+    /// must be listed in `ClientCaps`. Not [`DMABUF`], which is the
+    /// dma-buf import that comes later.
+    pub const SURFACE: u32 = 1 << 16;
     /// Every bit from M5-A onwards: the range
     /// [`ClientCaps`](crate::msg::ClientCaps) governs.
     ///
@@ -415,7 +449,7 @@ pub mod caps {
     /// change. A future milestone extends this constant rather than
     /// teaching every caller a new number.
     pub const CAPS_M5_MASK: u32 =
-        POPUP | CURSOR | DRAG | OUTPUTS | KEYMAP | RELEASE | DATA | OPAQUE_REGION;
+        POPUP | CURSOR | DRAG | OUTPUTS | KEYMAP | RELEASE | DATA | OPAQUE_REGION | SURFACE;
 }
 
 /// Modifier mask for [`BindKey`](crate::msg::BindKey), by *name*.
@@ -791,6 +825,15 @@ pub mod format {
     pub const XR24: u32 = fourcc(b"XR24");
     /// `AR24`: 32 bpp little-endian `[b, g, r, a]`, straight alpha.
     pub const AR24: u32 = fourcc(b"AR24");
+    /// `NV12`: 8-bit Y plane, then an interleaved `[u, v]` plane at half
+    /// resolution in both axes. Surface buffers only.
+    pub const NV12: u32 = fourcc(b"NV12");
+    /// `YUYV`: packed 4:2:2, `[y0, u, y1, v]` per two pixels. Surface
+    /// buffers only.
+    pub const YUYV: u32 = fourcc(b"YUYV");
+    /// `UYVY`: packed 4:2:2, `[u, y0, v, y1]` per two pixels. Surface
+    /// buffers only.
+    pub const UYVY: u32 = fourcc(b"UYVY");
 
     /// Build a fourcc code from four ASCII bytes.
     #[must_use]
@@ -887,7 +930,8 @@ mod tests {
         assert_eq!(caps::RELEASE, 1 << 13);
         assert_eq!(caps::DATA, 1 << 14);
         assert_eq!(caps::OPAQUE_REGION, 1 << 15);
-        assert_eq!(caps::CAPS_M5_MASK, 0xff00);
+        assert_eq!(caps::SURFACE, 1 << 16);
+        assert_eq!(caps::CAPS_M5_MASK, 0x1ff00);
         // Every M5 bit is in the mask, and nothing else is.
         for bit in [
             caps::POPUP,
@@ -898,6 +942,7 @@ mod tests {
             caps::RELEASE,
             caps::DATA,
             caps::OPAQUE_REGION,
+            caps::SURFACE,
         ] {
             assert_eq!(caps::CAPS_M5_MASK & bit, bit);
         }

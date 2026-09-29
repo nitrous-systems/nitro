@@ -41,9 +41,9 @@ use crate::codec::{FdQueue, Reader, Writer};
 use crate::error::{DecodeError, EncodeError};
 use crate::types::WindowState as WindowStateValue;
 use crate::types::{
-    Align, AxisSource, BufferId, ButtonState, CursorPos, CursorShape, DataSource, DragAction, Edge,
-    ErrorCode, KeymapFormat, Layer, NodeId, NodeKind, OverviewRequest, PopupAnchor, PopupGravity,
-    TouchPhase, WindowRef,
+    Align, AxisSource, BufferId, ButtonState, ColorMatrix, ColorRange, CursorPos, CursorShape,
+    DataSource, DragAction, Edge, ErrorCode, KeymapFormat, Layer, NodeId, NodeKind,
+    OverviewRequest, PopupAnchor, PopupGravity, TouchPhase, WindowRef,
 };
 use crate::wire::Plain;
 
@@ -784,6 +784,177 @@ impl Body for SetOpaqueRegion {
         Ok(Self {
             id: r.get()?,
             rects: r.get_vec()?,
+        })
+    }
+}
+/// Register a shared-memory buffer for a `Surface` node, with an optional
+/// second plane (needs [`caps::SURFACE`](crate::types::caps::SURFACE),
+/// listed in `ClientCaps`; carries one fd).
+///
+/// Shares the id space, the sealed-memfd rule and every limit with
+/// [`CreateBuffer`]. `format` is one of
+/// [`format`](crate::types::format)'s `NV12`, `YUYV`, `UYVY`, `XR24`,
+/// `AR24`. Plane 0 is luma (NV12), the packed pixels (YUYV/UYVY) or the
+/// RGB pixels; plane 1 is NV12's interleaved chroma and must be zero for
+/// the single-plane formats. The per-format rules are in `docs/wire.md`.
+///
+/// `PartialEq` compares the declared fields only — the [`CreateBuffer`]
+/// precedent.
+#[derive(Debug)]
+pub struct CreateSurfaceBuffer {
+    /// Buffer id, allocated by the client.
+    pub id: BufferId,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// DRM fourcc pixel format.
+    pub format: u32,
+    /// Size of the mapping in bytes.
+    pub size: u32,
+    /// Byte offset of plane 0.
+    pub offset0: u32,
+    /// Bytes per row of plane 0.
+    pub stride0: u32,
+    /// Byte offset of plane 1 (NV12 chroma; 0 otherwise).
+    pub offset1: u32,
+    /// Bytes per row of plane 1 (NV12 chroma; 0 otherwise).
+    pub stride1: u32,
+    /// The sealed memfd, exactly as for [`CreateBuffer`].
+    pub fd: OwnedFd,
+}
+
+impl PartialEq for CreateSurfaceBuffer {
+    fn eq(&self, o: &Self) -> bool {
+        self.id == o.id
+            && self.width == o.width
+            && self.height == o.height
+            && self.format == o.format
+            && self.size == o.size
+            && self.offset0 == o.offset0
+            && self.stride0 == o.stride0
+            && self.offset1 == o.offset1
+            && self.stride1 == o.stride1
+    }
+}
+
+/// The fixed part of [`CreateSurfaceBuffer`].
+#[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct CreateSurfaceBufferFixed {
+    id: <BufferId as Plain>::Wire,
+    width: <u32 as Plain>::Wire,
+    height: <u32 as Plain>::Wire,
+    format: <u32 as Plain>::Wire,
+    size: <u32 as Plain>::Wire,
+    offset0: <u32 as Plain>::Wire,
+    stride0: <u32 as Plain>::Wire,
+    offset1: <u32 as Plain>::Wire,
+    stride1: <u32 as Plain>::Wire,
+}
+
+impl Body for CreateSurfaceBuffer {
+    fn encode_body(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.put_struct(&CreateSurfaceBufferFixed {
+            id: Plain::to_wire(self.id),
+            width: Plain::to_wire(self.width),
+            height: Plain::to_wire(self.height),
+            format: Plain::to_wire(self.format),
+            size: Plain::to_wire(self.size),
+            offset0: Plain::to_wire(self.offset0),
+            stride0: Plain::to_wire(self.stride0),
+            offset1: Plain::to_wire(self.offset1),
+            stride1: Plain::to_wire(self.stride1),
+        });
+        let dup = rustix::io::dup(self.fd.as_fd()).map_err(EncodeError::Fd)?;
+        w.put_fd(dup);
+        Ok(())
+    }
+
+    fn decode_body(r: &mut Reader<'_>, fds: &mut FdQueue) -> Result<Self, DecodeError> {
+        let f = r.get_struct::<CreateSurfaceBufferFixed>()?;
+        Ok(Self {
+            id: Plain::from_wire(f.id)?,
+            width: Plain::from_wire(f.width)?,
+            height: Plain::from_wire(f.height)?,
+            format: Plain::from_wire(f.format)?,
+            size: Plain::from_wire(f.size)?,
+            offset0: Plain::from_wire(f.offset0)?,
+            stride0: Plain::from_wire(f.stride0)?,
+            offset1: Plain::from_wire(f.offset1)?,
+            stride1: Plain::from_wire(f.stride1)?,
+            fd: fds.take()?,
+        })
+    }
+}
+
+/// Queue a frame on a `Surface` node, to be **latched at the next paint
+/// opportunity** of its output (needs
+/// [`caps::SURFACE`](crate::types::caps::SURFACE)).
+///
+/// **Not** buffered to a [`Commit`]: it acts on arrival, against the
+/// committed scene. At most one frame is queued per node and the newest
+/// wins; a superseded frame's buffer gets [`BufferReleased`] at once and
+/// never a [`Presented`]. `serial` shares the client's `Commit` serial
+/// space and is answered with `Presented{serial}` when the flip carrying
+/// the frame completes. `damage` is in buffer pixels; empty means the
+/// whole `src`. The precise rules are in `docs/wire.md` under
+/// `PresentSurface`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PresentSurface {
+    /// The surface node (committed, the sender's).
+    pub id: NodeId,
+    /// The buffer to show (must exist).
+    pub buffer: BufferId,
+    /// Answered with `Presented{serial}`.
+    pub serial: u32,
+    /// Source rectangle in buffer pixels.
+    pub src: IRect,
+    /// YUV matrix (ignored for RGB formats).
+    pub matrix: ColorMatrix,
+    /// YUV range (ignored for RGB formats).
+    pub range: ColorRange,
+    /// Changed rectangles since this buffer was last shown, in buffer
+    /// pixels.
+    pub damage: Vec<IRect>,
+}
+
+/// The fixed part of [`PresentSurface`].
+#[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct PresentSurfaceFixed {
+    id: <NodeId as Plain>::Wire,
+    buffer: <BufferId as Plain>::Wire,
+    serial: <u32 as Plain>::Wire,
+    src: <IRect as Plain>::Wire,
+    matrix: <ColorMatrix as Plain>::Wire,
+    range: <ColorRange as Plain>::Wire,
+}
+
+impl Body for PresentSurface {
+    fn encode_body(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.put_struct(&PresentSurfaceFixed {
+            id: Plain::to_wire(self.id),
+            buffer: Plain::to_wire(self.buffer),
+            serial: Plain::to_wire(self.serial),
+            src: Plain::to_wire(self.src),
+            matrix: Plain::to_wire(self.matrix),
+            range: Plain::to_wire(self.range),
+        });
+        w.put_vec(&self.damage);
+        Ok(())
+    }
+
+    fn decode_body(r: &mut Reader<'_>, _fds: &mut FdQueue) -> Result<Self, DecodeError> {
+        let f = r.get_struct::<PresentSurfaceFixed>()?;
+        Ok(Self {
+            id: Plain::from_wire(f.id)?,
+            buffer: Plain::from_wire(f.buffer)?,
+            serial: Plain::from_wire(f.serial)?,
+            src: Plain::from_wire(f.src)?,
+            matrix: Plain::from_wire(f.matrix)?,
+            range: Plain::from_wire(f.range)?,
+            damage: r.get_vec()?,
         })
     }
 }
@@ -1928,6 +2099,24 @@ fixed_msg! {
         src: IRect,
     }
 
+    /// Point a `Surface` node at a region of a surface buffer, with its
+    /// colour metadata (needs
+    /// [`caps::SURFACE`](crate::types::caps::SURFACE)). Buffered to the
+    /// [`Commit`] like [`SetImage`], with the same swap/damage contract;
+    /// it cancels (and releases) a frame queued by [`PresentSurface`].
+    SetSurface {
+        /// The surface node.
+        id: NodeId,
+        /// Buffer to sample; [`BufferId::NONE`] detaches.
+        buffer: BufferId,
+        /// Source rectangle in buffer pixels.
+        src: IRect,
+        /// YUV matrix (ignored for RGB formats).
+        matrix: ColorMatrix,
+        /// YUV range (ignored for RGB formats).
+        range: ColorRange,
+    }
+
     // ------------------------------------------------------- M5-A (M5)
 
     /// Create a **popup**: a menu or tooltip positioned against a
@@ -2345,6 +2534,15 @@ msg_enum! {
         SetDragIconOffset = 0x030b,
         /// Declare an image's opaque pixels (needs `caps::OPAQUE_REGION`).
         SetOpaqueRegion = 0x030c,
+        /// Register a surface buffer (needs `caps::SURFACE`; carries one
+        /// fd).
+        CreateSurfaceBuffer = 0x030d,
+        /// Attach a buffer and colour metadata to a surface node (needs
+        /// `caps::SURFACE`).
+        SetSurface = 0x030e,
+        /// Queue a frame for the vblank latch; not buffered (needs
+        /// `caps::SURFACE`).
+        PresentSurface = 0x030f,
         /// Move one of this client's windows to another layer (needs
         /// `caps::SHELL`).
         SetLayer = 0x0401,
@@ -2754,6 +2952,25 @@ fixed_msg! {
         id: BufferId,
     }
 
+    /// The server's preferred format and size for a `Surface` node's
+    /// buffers (needs [`caps::SURFACE`](crate::types::caps::SURFACE),
+    /// listed in `ClientCaps`).
+    ///
+    /// Sent when the node first has a non-empty device rect, and again
+    /// whenever that size or the preferred format changes. Advisory: the
+    /// server converts and scales whatever it gets. `width`/`height` are
+    /// device pixels.
+    SurfaceHint {
+        /// The surface node.
+        id: NodeId,
+        /// Preferred DRM fourcc.
+        format: u32,
+        /// Preferred width in pixels.
+        width: u32,
+        /// Preferred height in pixels.
+        height: u32,
+    }
+
     /// An output's **work area** (needs
     /// [`caps::SHELL`](crate::types::caps::SHELL) or
     /// [`caps::OUTPUTS`](crate::types::caps::OUTPUTS)).
@@ -2931,6 +3148,9 @@ msg_enum! {
         /// The server has finished reading a buffer (needs
         /// `caps::RELEASE`).
         BufferReleased = 0x8305,
+        /// Preferred format and size of a surface's buffers (needs
+        /// `caps::SURFACE`).
+        SurfaceHint = 0x8306,
         /// A bound hotkey fired (needs `caps::SHELL`).
         HotKey = 0x8401,
         /// One window of the shell's list (needs `caps::SHELL`).

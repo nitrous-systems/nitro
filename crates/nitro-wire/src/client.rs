@@ -16,17 +16,18 @@ use crate::framing::Framer;
 use crate::io::Socket;
 use crate::msg::{
     AcceptDrop, BindKey, BufferDamage, ClientCaps, ClientMsg, CloseWindow, Commit, CreateBuffer,
-    CreateNode, CreatePopup, CreateWindow, DestroyBuffer, DestroyNode, Fill, FinishDrag,
-    FocusWindow, GrabKeyboard, Hello, ListOutputs, Lock, MeasureText, Outputs, Reparent,
-    RepositionPopup, RequestFrame, RequestSelection, SendSelection, ServerMsg, SetAnchor, SetAppId,
-    SetBorder, SetBounds, SetClip, SetCorners, SetCursor, SetDragIconOffset, SetExclusiveZone,
-    SetFill, SetIcon, SetImage, SetLayer, SetOpacity, SetOpaqueRegion, SetOverview, SetSelection,
-    SetText, SetTransform, SetVisible, SetWindowLimits, SetWindowState, SetWindowStateFor,
-    SetWindowTitle, StartDrag, StartMove, StartResize, UnbindKey, Unlock, WindowList,
+    CreateNode, CreatePopup, CreateSurfaceBuffer, CreateWindow, DestroyBuffer, DestroyNode, Fill,
+    FinishDrag, FocusWindow, GrabKeyboard, Hello, ListOutputs, Lock, MeasureText, Outputs,
+    PresentSurface, Reparent, RepositionPopup, RequestFrame, RequestSelection, SendSelection,
+    ServerMsg, SetAnchor, SetAppId, SetBorder, SetBounds, SetClip, SetCorners, SetCursor,
+    SetDragIconOffset, SetExclusiveZone, SetFill, SetIcon, SetImage, SetLayer, SetOpacity,
+    SetOpaqueRegion, SetOverview, SetSelection, SetSurface, SetText, SetTransform, SetVisible,
+    SetWindowLimits, SetWindowState, SetWindowStateFor, SetWindowTitle, StartDrag, StartMove,
+    StartResize, UnbindKey, Unlock, WindowList,
 };
 use crate::types::{
-    Align, BufferId, CursorShape, DataSource, DragAction, Edge, Layer, NodeId, NodeKind,
-    OverviewRequest, PopupAnchor, PopupGravity, WindowRef, WindowState, caps,
+    Align, BufferId, ColorMatrix, ColorRange, CursorShape, DataSource, DragAction, Edge, Layer,
+    NodeId, NodeKind, OverviewRequest, PopupAnchor, PopupGravity, WindowRef, WindowState, caps,
 };
 
 /// Where the shell socket lives; see [`crate::shell_socket_path`].
@@ -236,6 +237,15 @@ impl Connection {
     /// As [`Connection::send`].
     pub fn commit(&mut self, serial: u32) -> Result<(), Error> {
         self.send(&ClientMsg::Commit(Commit { serial }))
+    }
+
+    /// Queue a [`PresentSurface`] frame for the vblank latch (needs
+    /// `caps::SURFACE`). Sent at once, outside any transaction.
+    ///
+    /// # Errors
+    /// As [`Connection::send`].
+    pub fn present_surface(&mut self, frame: PresentSurface) -> Result<(), Error> {
+        self.send(&ClientMsg::PresentSurface(frame))
     }
 
     /// Bind a server-global hotkey (needs `caps::SHELL`).
@@ -890,6 +900,14 @@ impl Transaction<'_> {
             .bounds(id, rect)
     }
 
+    /// Create a surface node under `parent` with its bounds set (needs
+    /// `caps::SURFACE`).
+    #[must_use]
+    pub fn create_surface(self, id: NodeId, parent: NodeId, rect: Rect) -> Self {
+        self.create_node(id, NodeKind::Surface, parent)
+            .bounds(id, rect)
+    }
+
     /// Create an icon node under `parent` with its bounds set.
     #[must_use]
     pub fn create_icon(self, id: NodeId, parent: NodeId, rect: Rect) -> Self {
@@ -1054,6 +1072,35 @@ impl Transaction<'_> {
     #[must_use]
     pub fn image(mut self, id: NodeId, buffer: BufferId, src: IRect) -> Self {
         push!(self, SetImage { id, buffer, src })
+    }
+
+    /// Register a surface buffer (needs `caps::SURFACE`), passing its fd.
+    #[must_use]
+    pub fn create_surface_buffer(mut self, buffer: CreateSurfaceBuffer) -> Self {
+        push!(self, buffer)
+    }
+
+    /// Point a surface node at a buffer region with colour metadata
+    /// (needs `caps::SURFACE`); [`BufferId::NONE`] detaches.
+    #[must_use]
+    pub fn set_surface(
+        mut self,
+        id: NodeId,
+        buffer: BufferId,
+        src: IRect,
+        matrix: ColorMatrix,
+        range: ColorRange,
+    ) -> Self {
+        push!(
+            self,
+            SetSurface {
+                id,
+                buffer,
+                src,
+                matrix,
+                range
+            }
+        )
     }
 
     /// Create a popup — a menu or tooltip anchored to a rectangle of its

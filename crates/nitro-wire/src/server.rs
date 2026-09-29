@@ -437,6 +437,7 @@ impl ClientStream {
 #[must_use]
 pub fn needs_fd(op: u16) -> bool {
     op == msg::CreateBuffer::OP
+        || op == msg::CreateSurfaceBuffer::OP
         || op == msg::SendSelection::OP
         || op == msg::Keymap::OP
         || op == msg::SelectionData::OP
@@ -461,14 +462,22 @@ pub fn needs_fd(op: u16) -> bool {
 /// `SetImage` that follows it two messages later with "no buffer with
 /// id 1".
 ///
-/// `SetImage` naming [`BufferId::NONE`](crate::types::BufferId) is
+/// The Surface ops (`CreateSurfaceBuffer`, `SetSurface`, `PresentSurface`,
+/// #3897) are buffer ops for the same reason.
+///
+/// `SetImage` (or `SetSurface`) naming [`BufferId::NONE`](crate::types::BufferId) is
 /// **not** included: that is how an image node is *cleared*, it needs no
 /// buffer, and it is the one thing in this group a remote client may
 /// legitimately want to do. The caller checks the field; this function
 /// only classifies the op.
 #[must_use]
 pub fn is_buffer_op(op: u16) -> bool {
-    op == msg::CreateBuffer::OP || op == msg::BufferDamage::OP || op == msg::SetImage::OP
+    op == msg::CreateBuffer::OP
+        || op == msg::BufferDamage::OP
+        || op == msg::SetImage::OP
+        || op == msg::CreateSurfaceBuffer::OP
+        || op == msg::SetSurface::OP
+        || op == msg::PresentSurface::OP
 }
 
 /// Why a remote peer's fd-carrying **non-buffer** op is refused, as the

@@ -9,24 +9,26 @@ use nitro_core::{Color, IRect, Palette, Point, Rect, Role, Size, Transform};
 use nitro_wire::codec::{FdQueue, Writer};
 use nitro_wire::msg::{
     AcceptDrop, BindKey, BufferDamage, BufferReleased, ClientCaps, ClientMsg, CloseWindow, Closed,
-    Commit, Configure, CreateBuffer, CreateNode, CreatePopup, CreateWindow, DestroyBuffer,
-    DestroyNode, DragDrop, DragEnter, DragFinished, DragLeave, DragMotion, Error as ErrorMsg, Fill,
-    FinishDrag, Focus, FocusWindow, Frame, GrabKeyboard, Hello, HotKey, IconRefused, Key, Keymap,
-    ListOutputs, Lock, MeasureText, Modifiers, OutputGone, OutputInfo, OutputWorkArea, Outputs,
-    OutputsEnd, OverviewState, PointerAxis, PointerButton, PointerEnter, PointerLeave,
-    PointerMotion, PopupDone, Presented, Reparent, RepositionPopup, RequestFrame, RequestSelection,
-    SelectionData, SelectionOffer, SelectionRequest, SendSelection, ServerMsg, SetAnchor, SetAppId,
-    SetBorder, SetBounds, SetClip, SetCorners, SetCursor, SetDragIconOffset, SetExclusiveZone,
-    SetFill, SetIcon, SetImage, SetLayer, SetOpacity, SetOpaqueRegion, SetOverview, SetSelection,
-    SetText, SetTransform, SetVisible, SetWindowLimits, SetWindowState, SetWindowStateFor,
-    SetWindowTitle, StartDrag, StartMove, StartResize, TextMeasured, TextMetrics, Theme, Touch,
-    UnbindKey, Unlock, Welcome, WindowGone, WindowInfo, WindowList, WindowListEnd, WindowState,
+    Commit, Configure, CreateBuffer, CreateNode, CreatePopup, CreateSurfaceBuffer, CreateWindow,
+    DestroyBuffer, DestroyNode, DragDrop, DragEnter, DragFinished, DragLeave, DragMotion,
+    Error as ErrorMsg, Fill, FinishDrag, Focus, FocusWindow, Frame, GrabKeyboard, Hello, HotKey,
+    IconRefused, Key, Keymap, ListOutputs, Lock, MeasureText, Modifiers, OutputGone, OutputInfo,
+    OutputWorkArea, Outputs, OutputsEnd, OverviewState, PointerAxis, PointerButton, PointerEnter,
+    PointerLeave, PointerMotion, PopupDone, PresentSurface, Presented, Reparent, RepositionPopup,
+    RequestFrame, RequestSelection, SelectionData, SelectionOffer, SelectionRequest, SendSelection,
+    ServerMsg, SetAnchor, SetAppId, SetBorder, SetBounds, SetClip, SetCorners, SetCursor,
+    SetDragIconOffset, SetExclusiveZone, SetFill, SetIcon, SetImage, SetLayer, SetOpacity,
+    SetOpaqueRegion, SetOverview, SetSelection, SetSurface, SetText, SetTransform, SetVisible,
+    SetWindowLimits, SetWindowState, SetWindowStateFor, SetWindowTitle, StartDrag, StartMove,
+    StartResize, SurfaceHint, TextMeasured, TextMetrics, Theme, Touch, UnbindKey, Unlock, Welcome,
+    WindowGone, WindowInfo, WindowList, WindowListEnd, WindowState,
 };
 use nitro_wire::types::{
-    Align, AxisSource, BufferId, ButtonState, CursorPos, CursorShape, DataSource, DragAction, Edge,
-    ErrorCode, KeymapFormat, Layer, NodeId, NodeKind, OverviewRequest, PopupAnchor, PopupGravity,
-    TouchPhase, WindowRef, WindowState as WindowStateValue, anchor, caps, constraint_adjust,
-    drag_actions, format, mod_mask, popup_flags, resize_edges, window_flags,
+    Align, AxisSource, BufferId, ButtonState, ColorMatrix, ColorRange, CursorPos, CursorShape,
+    DataSource, DragAction, Edge, ErrorCode, KeymapFormat, Layer, NodeId, NodeKind,
+    OverviewRequest, PopupAnchor, PopupGravity, TouchPhase, WindowRef,
+    WindowState as WindowStateValue, anchor, caps, constraint_adjust, drag_actions, format,
+    mod_mask, popup_flags, resize_edges, window_flags,
 };
 use nitro_wire::{DecodeError, VERSION, header};
 
@@ -475,6 +477,55 @@ fn client_messages() -> Vec<ClientMsg> {
             rects: vec![],
         }
         .into(),
+        CreateSurfaceBuffer {
+            id: BufferId(74),
+            width: 1280,
+            height: 720,
+            format: format::NV12,
+            size: 1280 * 720 * 3 / 2,
+            offset0: 0,
+            stride0: 1280,
+            offset1: 1280 * 720,
+            stride1: 1280,
+            fd: memfd("surface", 4096),
+        }
+        .into(),
+        SetSurface {
+            id: NodeId(75),
+            buffer: BufferId(74),
+            src: IRect::new(2, 4, 1276, 712),
+            matrix: ColorMatrix::Bt709,
+            range: ColorRange::Limited,
+        }
+        .into(),
+        SetSurface {
+            id: NodeId(76),
+            buffer: BufferId::NONE,
+            src: IRect::new(0, 0, 0, 0),
+            matrix: ColorMatrix::Bt2020,
+            range: ColorRange::Full,
+        }
+        .into(),
+        PresentSurface {
+            id: NodeId(77),
+            buffer: BufferId(78),
+            serial: 79,
+            src: IRect::new(0, 0, 640, 360),
+            matrix: ColorMatrix::Bt601,
+            range: ColorRange::Full,
+            damage: vec![IRect::new(8, 16, 32, 64), IRect::new(0, 0, 1, 1)],
+        }
+        .into(),
+        PresentSurface {
+            id: NodeId(80),
+            buffer: BufferId(81),
+            serial: 0,
+            src: IRect::new(0, 0, 1, 1),
+            matrix: ColorMatrix::Bt709,
+            range: ColorRange::Limited,
+            damage: vec![],
+        }
+        .into(),
     ]
 }
 
@@ -755,6 +806,13 @@ fn server_messages() -> Vec<ServerMsg> {
         }
         .into(),
         BufferReleased { id: BufferId(72) }.into(),
+        SurfaceHint {
+            id: NodeId(73),
+            format: format::YUYV,
+            width: 1920,
+            height: 1080,
+        }
+        .into(),
         OutputWorkArea {
             id: 2,
             area: IRect::new(-1920, 32, 2560, 1408),
@@ -2039,6 +2097,9 @@ fn the_m5_ops_are_where_the_doc_says() {
         (FinishDrag::OP, 0x0300),
         (SetDragIconOffset::OP, 0x0300),
         (SetOpaqueRegion::OP, 0x0300),
+        (CreateSurfaceBuffer::OP, 0x0300),
+        (SetSurface::OP, 0x0300),
+        (PresentSurface::OP, 0x0300),
     ] {
         assert_eq!(op & 0xff00, block, "client M5 op {op:#06x}");
         assert!(ClientMsg::is_op(op), "client M5 op {op:#06x}");
@@ -2050,6 +2111,7 @@ fn the_m5_ops_are_where_the_doc_says() {
         (Modifiers::OP, 0x8200),
         (IconRefused::OP, 0x8300),
         (BufferReleased::OP, 0x8300),
+        (SurfaceHint::OP, 0x8300),
         (OutputWorkArea::OP, 0x8400),
         (SelectionOffer::OP, 0x8500),
         (SelectionData::OP, 0x8500),
@@ -2075,6 +2137,10 @@ fn the_m5_ops_are_where_the_doc_says() {
     assert_eq!(Keymap::OP, 0x8208);
     assert_eq!(IconRefused::OP, 0x8303);
     assert_eq!(BufferReleased::OP, 0x8305);
+    assert_eq!(CreateSurfaceBuffer::OP, 0x030d);
+    assert_eq!(SetSurface::OP, 0x030e);
+    assert_eq!(PresentSurface::OP, 0x030f);
+    assert_eq!(SurfaceHint::OP, 0x8306);
     assert_eq!(OutputWorkArea::OP, 0x8408);
     assert_eq!(DragFinished::OP, 0x8508);
     // 0x8304 is deliberately unused.
@@ -2111,6 +2177,29 @@ fn the_m5_tags_reject_unlisted_values() {
         ClientMsg::decode(CreatePopup::OP, &bytes, &mut FdQueue::new()),
         Err(DecodeError::BadValue)
     );
+
+    // A `ColorMatrix` byte outside 0..=2 and a `ColorRange` outside 0..=1.
+    let mut w = Writer::new();
+    ClientMsg::from(PresentSurface {
+        id: NodeId(1),
+        buffer: BufferId(2),
+        serial: 3,
+        src: IRect::new(0, 0, 4, 4),
+        matrix: ColorMatrix::Bt709,
+        range: ColorRange::Full,
+        damage: vec![],
+    })
+    .encode(&mut w)
+    .unwrap();
+    // id 4 + buffer 4 + serial 4 + src 16 = 28: matrix, then range.
+    for (at, bad) in [(28usize, 3u8), (29, 2)] {
+        let mut bytes = w.bytes()[header::SIZE..].to_vec();
+        bytes[at] = bad;
+        assert_eq!(
+            ClientMsg::decode(PresentSurface::OP, &bytes, &mut FdQueue::new()),
+            Err(DecodeError::BadValue)
+        );
+    }
 
     // A `DragAction` byte outside 0..=3.
     let mut w = Writer::new();
