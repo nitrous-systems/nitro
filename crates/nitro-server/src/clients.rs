@@ -138,6 +138,9 @@ pub enum Pending {
     /// transaction commits, so a buffer that fails the seal check is
     /// refused before anything else in the batch is looked at.
     Buffer(BufferId, BufferDesc, MappedPixels),
+    /// `CreateDmabufBuffer` (#3918), validated and (on the CPU path)
+    /// mapped on receipt, like `Buffer`.
+    Dmabuf(BufferId, Box<crate::dmabuf::Validated>),
 }
 
 /// A buffer a client holds: the scene's key and the bytes it mapped. The
@@ -155,6 +158,9 @@ pub struct HeldBuffer {
     /// away. `None` for a client's own memfd. The planes module (#3899)
     /// reads this to put the buffer on a plane.
     pub scanout: Option<nitro_kms::BufferId>,
+    /// A client dma-buf (#3918): shown only through the latch, so
+    /// `SetSurface` refuses it; its `scanout` is the KMS import, if any.
+    pub dmabuf: bool,
 }
 
 /// What a client holds against the buffer caps, as [`map_buffer`] checks
@@ -313,6 +319,7 @@ impl WireClient {
         let committed = self.buffers.values().map(|h| h.bytes);
         let pending = self.pending.iter().filter_map(|p| match p {
             Pending::Buffer(_, _, data) => Some(data.bytes().len() as u64),
+            Pending::Dmabuf(_, v) => Some(v.pixels.bytes().len() as u64),
             Pending::Msg(_) => None,
         });
         let (buffers, bytes) = committed
@@ -491,6 +498,10 @@ pub struct ApplyOutcome {
     /// (#3914): the server frees them with `Backend::free_buffer` after
     /// the scene dropped its mapping.
     pub freed_scanout: Vec<nitro_kms::BufferId>,
+    /// Client dma-bufs this transaction registered (#3918): the server
+    /// imports each into KMS when the output backend has planes, the
+    /// #3899 hook.
+    pub dmabuf_imports: Vec<(BufferId, crate::dmabuf::ImportRequest)>,
 }
 
 /// A validated `StartDrag`; see [`ApplyOutcome::start_drags`].
@@ -547,8 +558,36 @@ pub fn apply(
                         key,
                         bytes,
                         scanout: None,
+                        dmabuf: false,
                     },
                 );
+            }
+            Pending::Dmabuf(id, v) => {
+                if client.buffers.contains_key(&id) || id.is_none() {
+                    return Err(ApplyError::new(
+                        ErrorCode::BadBuffer,
+                        format!("buffer id {} is zero or already in use", id.raw()),
+                    ));
+                }
+                let crate::dmabuf::Validated {
+                    desc,
+                    pixels,
+                    import,
+                } = *v;
+                let bytes = pixels.bytes().len() as u64;
+                let key = scene
+                    .create_buffer(client.id, desc, pixels)
+                    .map_err(|e| scene_err("CreateDmabufBuffer", e))?;
+                client.buffers.insert(
+                    id,
+                    HeldBuffer {
+                        key,
+                        bytes,
+                        scanout: None,
+                        dmabuf: true,
+                    },
+                );
+                outcome.dmabuf_imports.push((id, import));
             }
             Pending::Msg(msg) => apply_msg(client, scene, text, icons, *msg, &mut outcome)?,
         }
@@ -925,8 +964,9 @@ fn apply_msg(
                 .set_opaque_region(client.id, key, &m.rects)
                 .map_err(|e| scene_err("SetOpaqueRegion", e))
         }
-        ClientMsg::CreateSurfaceBuffer(_) => {
-            // Mapped on receipt into `Pending::Buffer`, like `CreateBuffer`.
+        ClientMsg::CreateSurfaceBuffer(_) | ClientMsg::CreateDmabufBuffer(_) => {
+            // Mapped on receipt into `Pending::Buffer`/`Pending::Dmabuf`,
+            // like `CreateBuffer`.
             Ok(())
         }
         ClientMsg::SetSurface(m) => {
@@ -935,6 +975,15 @@ fn apply_msg(
             let surface = if m.buffer.is_none() {
                 None
             } else {
+                if client.buffers.get(&m.buffer).is_some_and(|h| h.dmabuf) {
+                    // Fence readiness is defined on the latch only
+                    // (#3918): a committed attach would block the
+                    // transaction on a fence or show an unsignalled buffer.
+                    return Err(ApplyError::new(
+                        ErrorCode::BadBuffer,
+                        "SetSurface: a dma-buf buffer is shown with PresentSurface",
+                    ));
+                }
                 let buffer = buffer_key(client, m.buffer)?;
                 Some(SurfaceRef::new(
                     buffer,
@@ -950,6 +999,7 @@ fn apply_msg(
             Ok(())
         }
         ClientMsg::PresentSurface(_)
+        | ClientMsg::PresentSurfaceFenced(_)
         | ClientMsg::ExportSurface(_)
         | ClientMsg::ImportSurface(_)
         | ClientMsg::AllocSurfaceBuffers(_) => {
@@ -2155,6 +2205,7 @@ mod tests {
                 key,
                 bytes: 256,
                 scanout: None,
+                dmabuf: false,
             },
         );
         let held = client.held_buffers();

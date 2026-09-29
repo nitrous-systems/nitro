@@ -1409,6 +1409,15 @@ fn paint_surface(
     // Outward, like the scene's `bounds`: a video surface lands on whole
     // pixels, and the damage it was given is exactly that rect.
     let dst = exact.round_out();
+    if !buffer.cpu_readable() {
+        // A client dma-buf the CPU cannot read (tiled, compressed; #3918):
+        // the documented placeholder until the planes module scans it
+        // out. Never a read of pages that are not there.
+        let [b, g, r] = HOLE_PLACEHOLDER;
+        canvas.fill_irect(clip, &dst, Color::rgb(r, g, b));
+        PLACEHOLDER_PAINTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
     let enc = yuv_encoding(color);
     let from = |off: u32| data.get(off as usize..).unwrap_or(&[]);
     match desc.format {
@@ -1510,6 +1519,17 @@ pub fn select_scanout_alpha(
         Ok(()) => output.alpha = want,
         Err(e) => crate::warn!("{id}: scanout alpha {want}: {e}"),
     }
+}
+
+/// Surface paints that showed [`HOLE_PLACEHOLDER`] because the buffer was
+/// a client dma-buf the CPU cannot read (#3918). Process-wide because
+/// painting may run on a worker thread; `stats` reads it.
+static PLACEHOLDER_PAINTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The `dmabuf_placeholder_paints` stat.
+#[must_use]
+pub fn placeholder_paints() -> u64 {
+    PLACEHOLDER_PAINTS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// What `shot` shows where the screen has a hole and the Surface behind it

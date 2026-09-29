@@ -9,14 +9,14 @@ use nitro_core::{Color, IRect, Palette, Point, Rect, Role, Size, Transform};
 use nitro_wire::codec::{FdQueue, Writer};
 use nitro_wire::msg::{
     AcceptDrop, AllocSurfaceBuffers, AllocSurfaceBuffersFailed, BindKey, BufferDamage,
-    CreateDmabufBuffer, DmabufFeedback, DmabufPlane, PresentSurfaceFenced,
     BufferReleased, ClientCaps, ClientMsg, CloseWindow, Closed, Commit, Configure, CreateBuffer,
-    CreateNode, CreatePopup, CreateSurfaceBuffer, CreateWindow, DestroyBuffer, DestroyNode,
-    DragDrop, DragEnter, DragFinished, DragLeave, DragMotion, Error as ErrorMsg, ExportSurface,
-    Fill, FinishDrag, Focus, FocusWindow, Frame, GrabKeyboard, Hello, HotKey, IconRefused,
-    ImportSurface, Key, Keymap, ListOutputs, Lock, MeasureText, Modifiers, OutputGone, OutputInfo,
-    OutputWorkArea, Outputs, OutputsEnd, OverviewState, PointerAxis, PointerButton, PointerEnter,
-    PointerLeave, PointerMotion, PopupDone, PresentSurface, Presented, Reparent, RepositionPopup,
+    CreateDmabufBuffer, CreateNode, CreatePopup, CreateSurfaceBuffer, CreateWindow, DestroyBuffer,
+    DestroyNode, DmabufFeedback, DmabufPlane, DragDrop, DragEnter, DragFinished, DragLeave,
+    DragMotion, Error as ErrorMsg, ExportSurface, Fill, FinishDrag, Focus, FocusWindow, Frame,
+    GrabKeyboard, Hello, HotKey, IconRefused, ImportSurface, Key, Keymap, ListOutputs, Lock,
+    MeasureText, Modifiers, OutputGone, OutputInfo, OutputWorkArea, Outputs, OutputsEnd,
+    OverviewState, PointerAxis, PointerButton, PointerEnter, PointerLeave, PointerMotion,
+    PopupDone, PresentSurface, PresentSurfaceFenced, Presented, Reparent, RepositionPopup,
     RequestFrame, RequestSelection, SelectionData, SelectionOffer, SelectionRequest, SendSelection,
     ServerMsg, SetAnchor, SetAppId, SetBorder, SetBounds, SetClip, SetCorners, SetCursor,
     SetDragIconOffset, SetExclusiveZone, SetFill, SetIcon, SetImage, SetLayer, SetOpacity,
@@ -27,11 +27,11 @@ use nitro_wire::msg::{
     WindowList, WindowListEnd, WindowState,
 };
 use nitro_wire::types::{
-    Align, AllocRefusal, AxisSource, DmabufFormat, dmabuf_flags, modifier, BufferId, ButtonState, ColorMatrix, ColorRange, CursorPos,
-    CursorShape, DataSource, DragAction, Edge, ErrorCode, KeymapFormat, Layer, NodeId, NodeKind,
-    OverviewRequest, PopupAnchor, PopupGravity, ShareToken, TouchPhase, WindowRef,
-    WindowState as WindowStateValue, anchor, caps, constraint_adjust, drag_actions, format,
-    mod_mask, popup_flags, resize_edges, window_flags,
+    Align, AllocRefusal, AxisSource, BufferId, ButtonState, ColorMatrix, ColorRange, CursorPos,
+    CursorShape, DataSource, DmabufFormat, DragAction, Edge, ErrorCode, KeymapFormat, Layer,
+    NodeId, NodeKind, OverviewRequest, PopupAnchor, PopupGravity, ShareToken, TouchPhase,
+    WindowRef, WindowState as WindowStateValue, anchor, caps, constraint_adjust, dmabuf_flags,
+    drag_actions, format, mod_mask, modifier, popup_flags, resize_edges, window_flags,
 };
 use nitro_wire::{DecodeError, VERSION, header};
 

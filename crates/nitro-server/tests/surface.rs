@@ -373,7 +373,10 @@ fn rgb(v: &[u8]) -> Vec<[u8; 3]> {
 fn surface_client(h: &Harness, name: &str) -> (Connection, Vec<ServerMsg>) {
     let mut conn = h.client(name);
     assert!(conn.has_caps(caps::SURFACE), "caps = {:#x}", conn.caps());
-    assert!(!conn.has_caps(caps::DMABUF), "DMABUF is #3's, not v1's");
+    assert!(
+        conn.has_caps(caps::DMABUF),
+        "DMABUF is advertised locally (#3918)"
+    );
     conn.client_caps(caps::SURFACE | caps::RELEASE).unwrap();
     (conn, Vec::new())
 }

@@ -111,7 +111,7 @@ impl BufferDesc {
     }
 
     /// Reject descriptions the scene cannot index.
-    pub(crate) fn validate(&self, data_len: usize) -> Result<(), Error> {
+    pub(crate) fn validate(&self, data_len: Option<usize>) -> Result<(), Error> {
         if self.w == 0 || self.h == 0 || self.stride == 0 {
             return Err(Error::BadBuffer);
         }
@@ -123,7 +123,7 @@ impl BufferDesc {
         if (self.stride as usize) < (self.w as usize) {
             return Err(Error::BadBuffer);
         }
-        if data_len < self.byte_len() {
+        if data_len.is_some_and(|n| n < self.byte_len()) {
             return Err(Error::BadBuffer);
         }
         Ok(())
@@ -156,6 +156,21 @@ pub trait PixelStore: fmt::Debug {
     fn bytes(&self) -> &[u8];
     /// The pixel bytes, writable, or `None` if the store is read-only.
     fn bytes_mut(&mut self) -> Option<&mut [u8]>;
+    /// Whether [`bytes`](Self::bytes) holds the pixels at all. `false` for
+    /// a client dma-buf the server cannot map (tiled or compressed,
+    /// #3918): the description is still the buffer's geometry, so source
+    /// rects are checked against it, but the length check is skipped and
+    /// a painter shows a placeholder instead of reading.
+    fn cpu_readable(&self) -> bool {
+        true
+    }
+    /// The descriptor whose implicit fences guard these pixels: a client
+    /// dma-buf's first plane (#3918), which the server snapshots with
+    /// `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` at present time and brackets its
+    /// CPU reads on. `None` for memory the CPU alone writes.
+    fn fence_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        None
+    }
 }
 
 impl PixelStore for Vec<u8> {
@@ -199,5 +214,16 @@ impl Buffer {
     /// The pixel bytes.
     pub fn data(&self) -> &[u8] {
         self.data.bytes()
+    }
+
+    /// Whether [`data`](Self::data) holds the pixels
+    /// ([`PixelStore::cpu_readable`]).
+    pub fn cpu_readable(&self) -> bool {
+        self.data.cpu_readable()
+    }
+
+    /// [`PixelStore::fence_fd`].
+    pub fn fence_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        self.data.fence_fd()
     }
 }

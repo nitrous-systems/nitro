@@ -17,6 +17,14 @@ use nitro_core::{Damage, IRect, Rect};
 use nitro_scene::{BufferKey, ClientId, NodeKey, NodeKind, Scene, SurfaceColor, SurfaceRef};
 use nitro_wire::types::NodeId;
 
+/// Most frames queued per node (#3918). With acquire fences a node can
+/// hold several: frames whose fences have not signalled wait behind the
+/// shown one. On overflow the oldest is dropped at once, like a supersede.
+pub const MAX_QUEUED: usize = 4;
+
+/// A pending acquire fence, as [`crate::dmabuf::FenceSet`] names it.
+pub type FenceKey = u64;
+
 /// One queued frame.
 #[derive(Debug, Clone)]
 pub struct Queued {
@@ -33,10 +41,22 @@ pub struct Queued {
     pub src: IRect,
     /// Colour metadata.
     pub color: SurfaceColor,
-    /// Union of the damage of every frame queued since the last latch.
+    /// Union of this frame's damage and that of every frame it superseded.
     pub damage: Damage,
-    /// Some frame since the last latch damaged everything (empty damage).
+    /// Some frame folded into this one damaged everything (empty damage).
     pub whole: bool,
+    /// The acquire fence still pending (#3918); `None` once the frame is
+    /// ready. A frame is never latched while this is `Some`. The planes
+    /// module (#3899) may instead latch early and hand the fence to the
+    /// display as `IN_FENCE_FD` (`Backend::set_plane_fence`).
+    pub fence: Option<FenceKey>,
+}
+
+impl Queued {
+    fn absorb(&mut self, older: &Queued) {
+        self.whole |= older.whole;
+        self.damage.add_all(&older.damage);
+    }
 }
 
 /// A frame latched into the scene: whom to answer and with what serial.
@@ -50,55 +70,117 @@ pub struct Latched {
     pub serial: u32,
     /// The node it landed on.
     pub node: NodeKey,
+    /// The buffer it showed.
+    pub buffer: BufferKey,
+    /// What the node showed before, if anything: the server ends its CPU
+    /// read bracket on a dma-buf (#3918).
+    pub previous: Option<BufferKey>,
 }
 
-/// The per-node frame queue.
+/// What one [`Latch::latch_ready`] pass did.
+#[derive(Debug, Default)]
+pub struct LatchOutcome {
+    /// Frames now current.
+    pub latched: Vec<Latched>,
+    /// Frames an older position lost to a newer ready one: the caller
+    /// releases their buffers (unless shown) and drops their fences. No
+    /// `Presented`.
+    pub superseded: Vec<Queued>,
+    /// Frames on a node or buffer that no longer exists: dropped silently
+    /// (a destroy wins), fences to drop.
+    pub dropped: Vec<Queued>,
+}
+
+/// The per-node frame queues, oldest first.
 #[derive(Debug, Default)]
 pub struct Latch {
-    queued: HashMap<NodeKey, Queued>,
+    queued: HashMap<NodeKey, Vec<Queued>>,
 }
 
 impl Latch {
-    /// Queue `frame` on `node`, superseding any frame already queued.
-    /// Returns the superseded frame, for the caller to release its buffer
-    /// to its presenter if nothing shows it — or `None` when there was none
-    /// or it is the new frame's buffer too. The damage accumulates across
-    /// supersedes.
-    pub fn queue(&mut self, node: NodeKey, mut frame: Queued, rects: &[IRect]) -> Option<Queued> {
+    /// Queue `frame` on `node`. A **ready** frame (no fence) supersedes
+    /// every frame queued before it, ready or not: the latch would pick
+    /// it over them anyway. An unready one waits behind them. Returns the
+    /// frames that lost, for the caller to release (unless their buffer
+    /// is still queued, [`Latch::holds`]) and to drop their fences.
+    /// Their damage carries into the frame that replaced them.
+    pub fn queue(&mut self, node: NodeKey, mut frame: Queued, rects: &[IRect]) -> Vec<Queued> {
         if rects.is_empty() {
             frame.whole = true;
         }
         for r in rects {
             frame.damage.add(*r);
         }
-        let old = self.queued.remove(&node);
-        if let Some(old) = &old {
-            frame.whole |= old.whole;
-            frame.damage.add_all(&old.damage);
+        let q = self.queued.entry(node).or_default();
+        let mut lost = Vec::new();
+        if frame.fence.is_none() {
+            for old in q.drain(..) {
+                frame.absorb(&old);
+                lost.push(old);
+            }
         }
-        self.queued.insert(node, frame);
-        let new = self.queued.get(&node).map(|q| (q.token, q.buffer));
-        old.filter(|o| Some((o.token, o.buffer)) != new)
-    }
-
-    /// Drop `node`'s queued frame (a committed `SetSurface` won), returning
-    /// it for the caller to release its buffer to its presenter.
-    pub fn cancel(&mut self, node: NodeKey) -> Option<Queued> {
-        self.queued.remove(&node)
-    }
-
-    /// Drop `node`'s queued frame only if `token` presented it (an import
-    /// was revoked or dropped, #3904).
-    pub fn cancel_from(&mut self, node: NodeKey, token: u64) -> Option<Queued> {
-        if self.queued.get(&node)?.token != token {
-            return None;
+        q.push(frame);
+        while q.len() > MAX_QUEUED {
+            let old = q.remove(0);
+            q[0].absorb(&old);
+            lost.push(old);
         }
-        self.queued.remove(&node)
+        lost
     }
 
-    /// Forget everything a disconnected client queued, silently.
-    pub fn forget_client(&mut self, token: u64) {
-        self.queued.retain(|_, q| q.token != token);
+    /// Whether a frame `token` presented with `buffer` is still queued
+    /// anywhere: such a buffer is not released yet.
+    #[must_use]
+    pub fn holds(&self, token: u64, buffer: BufferKey) -> bool {
+        self.queued
+            .values()
+            .flatten()
+            .any(|f| f.token == token && f.buffer == buffer)
+    }
+
+    /// Mark the frame waiting on `fence` ready. Returns whether one was.
+    pub fn fence_signalled(&mut self, fence: FenceKey) -> bool {
+        for f in self.queued.values_mut().flatten() {
+            if f.fence == Some(fence) {
+                f.fence = None;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Drop `node`'s queued frames (a committed `SetSurface` won),
+    /// returning them for the caller to release and un-fence.
+    pub fn cancel(&mut self, node: NodeKey) -> Vec<Queued> {
+        self.queued.remove(&node).unwrap_or_default()
+    }
+
+    /// Drop `node`'s frames that `token` presented (an import was revoked
+    /// or dropped, #3904).
+    pub fn cancel_from(&mut self, node: NodeKey, token: u64) -> Vec<Queued> {
+        let Some(q) = self.queued.get_mut(&node) else {
+            return Vec::new();
+        };
+        let (gone, keep): (Vec<_>, Vec<_>) = q.drain(..).partition(|f| f.token == token);
+        if keep.is_empty() {
+            self.queued.remove(&node);
+        } else {
+            *q = keep;
+        }
+        gone
+    }
+
+    /// Forget everything a disconnected client queued, returning it so the
+    /// fences can be dropped.
+    pub fn forget_client(&mut self, token: u64) -> Vec<Queued> {
+        let mut out = Vec::new();
+        self.queued.retain(|_, q| {
+            let (gone, keep): (Vec<_>, Vec<_>) = q.drain(..).partition(|f| f.token == token);
+            out.extend(gone);
+            *q = keep;
+            !q.is_empty()
+        });
+        out
     }
 
     /// Whether any frame is queued.
@@ -107,43 +189,69 @@ impl Latch {
         self.queued.is_empty()
     }
 
-    /// The node's queued frame, if any.
+    /// The node's newest queued frame, if any.
     #[must_use]
     pub fn get(&self, node: NodeKey) -> Option<&Queued> {
-        self.queued.get(&node)
+        self.queued.get(&node)?.last()
     }
 
-    /// Latch every queued frame whose node `ready` says may be latched
-    /// now, into `scene`. Frames on a node or buffer that no longer exists
-    /// are dropped silently (a destroy wins, `docs/wire.md`).
+    /// How many frames `node` has queued.
+    #[must_use]
+    pub fn depth(&self, node: NodeKey) -> usize {
+        self.queued.get(&node).map_or(0, Vec::len)
+    }
+
+    /// For every node `ready` says may be latched now, latch its **newest
+    /// ready** frame into `scene`. Older frames lose (superseded, their
+    /// damage carried in); newer, still-fenced frames stay queued. Frames
+    /// on a node or buffer that no longer exists are dropped silently (a
+    /// destroy wins, `docs/wire.md`).
+    ///
+    /// # Panics
+    /// Never: the picked index is in range by construction.
     pub fn latch_ready(
         &mut self,
         scene: &mut Scene,
         mut ready: impl FnMut(&Scene, NodeKey) -> bool,
-    ) -> Vec<Latched> {
-        let mut out = Vec::new();
+    ) -> LatchOutcome {
+        let mut out = LatchOutcome::default();
         let keys: Vec<NodeKey> = self.queued.keys().copied().collect();
         for node in keys {
-            let alive = scene.node(node).is_ok() && {
-                let q = &self.queued[&node];
-                scene.buffer(q.buffer).is_ok()
-            };
-            if !alive {
-                self.queued.remove(&node);
-                continue;
-            }
-            if !ready(scene, node) {
-                continue;
-            }
-            let Some(q) = self.queued.remove(&node) else {
+            let Some(mut q) = self.queued.remove(&node) else {
                 continue;
             };
-            let rects: Vec<IRect> = if q.whole {
+            if scene.node(node).is_err() {
+                out.dropped.extend(q);
+                continue;
+            }
+            let (dead, live): (Vec<_>, Vec<_>) =
+                q.drain(..).partition(|f| scene.buffer(f.buffer).is_err());
+            out.dropped.extend(dead);
+            q = live;
+            let pick = q.iter().rposition(|f| f.fence.is_none());
+            let Some(i) = pick.filter(|_| ready(scene, node)) else {
+                if !q.is_empty() {
+                    self.queued.insert(node, q);
+                }
+                continue;
+            };
+            let rest = q.split_off(i + 1);
+            let mut f = q.pop().expect("index i exists");
+            for old in &q {
+                f.absorb(old);
+            }
+            let rects: Vec<IRect> = if f.whole {
                 Vec::new()
             } else {
-                q.damage.rects().to_vec()
+                f.damage.rects().to_vec()
             };
-            let surface = SurfaceRef::new(q.buffer, q.src, q.color);
+            let previous = scene
+                .node(node)
+                .ok()
+                .and_then(nitro_scene::Node::surface)
+                .and_then(|d| d.content)
+                .map(|c| c.buffer);
+            let surface = SurfaceRef::new(f.buffer, f.src, f.color);
             // The server acts: the presenter may be an importer that owns
             // the buffer but not the node (#3904). Both were checked at
             // receipt, and a stale key fails here anyway.
@@ -151,12 +259,18 @@ impl Latch {
                 .set_surface_with_damage(ClientId::SERVER, node, surface, &rects)
                 .is_ok()
             {
-                out.push(Latched {
-                    token: q.token,
-                    client: q.client,
-                    serial: q.serial,
+                out.latched.push(Latched {
+                    token: f.token,
+                    client: f.client,
+                    serial: f.serial,
                     node,
+                    buffer: f.buffer,
+                    previous,
                 });
+            }
+            out.superseded.extend(q);
+            if !rest.is_empty() {
+                self.queued.insert(node, rest);
             }
         }
         out
@@ -302,7 +416,25 @@ mod tests {
             color: SurfaceColor::default(),
             damage: Damage::new(),
             whole: false,
+            fence: None,
         }
+    }
+
+    fn fenced(buffer: BufferKey, serial: u32, fence: FenceKey) -> Queued {
+        Queued {
+            fence: Some(fence),
+            ..frame(buffer, serial)
+        }
+    }
+
+    fn shown(s: &Scene, n: NodeKey) -> BufferKey {
+        s.node(n)
+            .unwrap()
+            .surface()
+            .unwrap()
+            .content
+            .unwrap()
+            .buffer
     }
 
     #[test]
@@ -311,25 +443,21 @@ mod tests {
         let mut l = Latch::default();
         assert!(
             l.queue(n, frame(b[0], 1), &[IRect::new(0, 0, 2, 2)])
-                .is_none()
+                .is_empty()
         );
-        assert_eq!(
-            l.queue(n, frame(b[1], 2), &[IRect::new(4, 4, 2, 2)])
-                .map(|q| q.buffer),
-            Some(b[0])
-        );
-        // Same buffer re-queued: nothing to release.
-        assert!(
-            l.queue(n, frame(b[1], 3), &[IRect::new(8, 8, 1, 1)])
-                .is_none()
-        );
+        let lost = l.queue(n, frame(b[1], 2), &[IRect::new(4, 4, 2, 2)]);
+        assert_eq!(lost.iter().map(|q| q.buffer).collect::<Vec<_>>(), [b[0]]);
+        // Same buffer re-queued: the caller sees it is still held.
+        let lost = l.queue(n, frame(b[1], 3), &[IRect::new(8, 8, 1, 1)]);
+        assert_eq!(lost.len(), 1);
+        assert!(l.holds(7, lost[0].buffer));
         let q = l.get(n).unwrap();
         assert_eq!(q.serial, 3);
         assert_eq!(q.damage.rects().len(), 3);
         assert!(!q.whole);
         // Held back while not ready.
-        assert!(l.latch_ready(&mut s, |_, _| false).is_empty());
-        let latched = l.latch_ready(&mut s, |_, _| true);
+        assert!(l.latch_ready(&mut s, |_, _| false).latched.is_empty());
+        let latched = l.latch_ready(&mut s, |_, _| true).latched;
         assert_eq!(latched.len(), 1);
         assert_eq!(latched[0].serial, 3);
         assert!(l.is_empty());
@@ -359,18 +487,92 @@ mod tests {
         let (mut s, n, b) = world();
         let mut l = Latch::default();
         l.queue(n, frame(b[2], 1), &[]);
-        assert_eq!(l.cancel(n).map(|q| q.buffer), Some(b[2]));
+        assert_eq!(l.cancel(n)[0].buffer, b[2]);
         l.queue(n, frame(b[2], 1), &[]);
-        assert!(l.cancel_from(n, 8).is_none(), "another presenter's frame");
-        assert_eq!(l.cancel_from(n, 7).map(|q| q.buffer), Some(b[2]));
+        assert!(l.cancel_from(n, 8).is_empty(), "another presenter's frame");
+        assert_eq!(l.cancel_from(n, 7)[0].buffer, b[2]);
         assert!(l.is_empty());
         l.queue(n, frame(b[2], 2), &[]);
         s.destroy_buffer(C, b[2]).unwrap();
-        assert!(l.latch_ready(&mut s, |_, _| true).is_empty());
+        let o = l.latch_ready(&mut s, |_, _| true);
+        assert!(o.latched.is_empty());
+        assert_eq!(o.dropped.len(), 1);
         assert!(l.is_empty());
-        l.queue(n, frame(b[0], 3), &[]);
-        l.forget_client(7);
+        l.queue(n, fenced(b[0], 3, 9), &[]);
+        assert_eq!(l.forget_client(7)[0].fence, Some(9));
         assert!(l.is_empty());
+    }
+
+    #[test]
+    fn a_ready_frame_latches_while_a_newer_one_waits_for_its_fence() {
+        let (mut s, n, b) = world();
+        let mut l = Latch::default();
+        l.queue(n, frame(b[0], 1), &[]);
+        assert!(l.queue(n, fenced(b[1], 2, 5), &[]).is_empty());
+        let o = l.latch_ready(&mut s, |_, _| true);
+        assert_eq!(o.latched[0].serial, 1);
+        assert!(o.superseded.is_empty());
+        assert_eq!(shown(&s, n), b[0]);
+        assert_eq!(l.depth(n), 1, "B waits");
+        // Not ready yet: nothing more latches.
+        assert!(l.latch_ready(&mut s, |_, _| true).latched.is_empty());
+        assert!(l.fence_signalled(5));
+        assert!(!l.fence_signalled(5));
+        let o = l.latch_ready(&mut s, |_, _| true);
+        assert_eq!(o.latched[0].serial, 2);
+        assert_eq!(shown(&s, n), b[1]);
+        assert!(l.is_empty());
+    }
+
+    #[test]
+    fn a_newer_ready_frame_overtakes_an_unready_one() {
+        let (mut s, n, b) = world();
+        let mut l = Latch::default();
+        l.queue(n, fenced(b[0], 1, 5), &[IRect::new(0, 0, 1, 1)]);
+        // A ready frame supersedes everything queued before it.
+        let lost = l.queue(n, frame(b[1], 2), &[IRect::new(2, 2, 1, 1)]);
+        assert_eq!(lost.len(), 1);
+        assert_eq!((lost[0].serial, lost[0].fence), (1, Some(5)));
+        assert_eq!(l.get(n).unwrap().damage.rects().len(), 2);
+        let o = l.latch_ready(&mut s, |_, _| true);
+        assert_eq!(o.latched[0].serial, 2);
+        assert!(!l.fence_signalled(5), "the dropped frame's fence is gone");
+    }
+
+    #[test]
+    fn the_newest_ready_frame_wins_and_older_ones_are_superseded() {
+        let (mut s, n, b) = world();
+        let mut l = Latch::default();
+        l.queue(n, fenced(b[0], 1, 5), &[]);
+        l.queue(n, fenced(b[1], 2, 6), &[]);
+        l.queue(n, fenced(b[2], 3, 7), &[]);
+        // Signal out of order: the second becomes ready first.
+        l.fence_signalled(6);
+        l.fence_signalled(5);
+        let o = l.latch_ready(&mut s, |_, _| true);
+        assert_eq!(o.latched[0].serial, 2);
+        assert_eq!(
+            o.superseded.iter().map(|q| q.serial).collect::<Vec<_>>(),
+            [1]
+        );
+        assert_eq!(l.depth(n), 1);
+        assert_eq!(l.get(n).unwrap().fence, Some(7));
+    }
+
+    #[test]
+    fn overflow_drops_the_oldest() {
+        let (_, n, b) = world();
+        let mut l = Latch::default();
+        for i in 0..MAX_QUEUED {
+            assert!(
+                l.queue(n, fenced(b[i % 3], i as u32, i as u64), &[])
+                    .is_empty()
+            );
+        }
+        let lost = l.queue(n, fenced(b[0], 99, 99), &[IRect::new(0, 0, 1, 1)]);
+        assert_eq!(lost.len(), 1);
+        assert_eq!(lost[0].serial, 0);
+        assert_eq!(l.depth(n), MAX_QUEUED);
     }
 
     #[test]

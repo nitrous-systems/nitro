@@ -1808,7 +1808,7 @@ impl Scene {
         desc: BufferDesc,
         data: impl PixelStore + 'static,
     ) -> Result<BufferKey, Error> {
-        desc.validate(data.bytes().len())?;
+        desc.validate(data.cpu_readable().then(|| data.bytes().len()))?;
         Ok(self.buffers.insert(Buffer {
             desc,
             client,

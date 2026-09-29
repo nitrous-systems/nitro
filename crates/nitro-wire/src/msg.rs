@@ -1209,7 +1209,6 @@ impl Body for DmabufFeedback {
     }
 }
 
-
 /// Queue a frame on a `Surface` node, to be **latched at the next paint
 /// opportunity** of its output (needs
 /// [`caps::SURFACE`](crate::types::caps::SURFACE)).

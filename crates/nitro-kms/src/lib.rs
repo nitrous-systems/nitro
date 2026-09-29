@@ -34,7 +34,7 @@ pub use crate::fake::{FakeBackend, FakeOutputSpec, FakePlaneSpec, TestRecord};
 pub use crate::planes::{
     BufferId, ColorEncoding, ColorRange, Fourcc, ImportDesc, MOD_LINEAR, PlaneAssignment,
     PlaneConfig, PlaneId, PlaneInfo, PlaneKind, PlaneSource, ScanoutBufferInfo, SrcRect, Verdict,
-    Zpos,
+    Zpos, modifier_name,
 };
 
 use std::collections::HashMap;

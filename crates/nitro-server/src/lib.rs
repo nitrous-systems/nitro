@@ -43,6 +43,7 @@ pub mod cursor;
 pub mod data;
 pub mod defer;
 pub mod desktop_index;
+pub mod dmabuf;
 pub mod frame;
 pub mod icon_theme;
 pub mod icons;
@@ -598,6 +599,9 @@ const TOK_SHELL_BASE: u64 = 1 << 34;
 /// `caps::REMOTE` and the buffer refusal are decided from one fact rather
 /// than from a per-client flag that could drift from it.
 const TOK_REMOTE_BASE: u64 = 1 << 35;
+/// Pending acquire fences (#3918), one token each, above every client
+/// range: `dmabuf::FenceSet` hands out `TOK_FENCE_BASE + key`.
+const TOK_FENCE_BASE: u64 = 1 << 36;
 
 /// Flip-interval statistics for `stats` and the log.
 #[derive(Debug, Default)]
@@ -980,6 +984,18 @@ struct Server {
     surface_hints: surface::Hints,
     /// Exported Surface nodes and their imports (#3904).
     shares: share::Shares,
+    /// Acquire fences waiting to signal (#3918).
+    fences: dmabuf::FenceSet,
+    /// Which `DmabufFeedback` each tracked Surface node was last sent
+    /// (#3918).
+    feedback: dmabuf::FeedbackTracker,
+    /// Client dma-bufs the KMS import refused (#3918), cumulative.
+    dmabuf_kms_refused: u64,
+    /// Acquire fences that had to be waited for, cumulative.
+    fence_waits: u64,
+    /// Implicit fences taken by polling the dma-buf itself because
+    /// `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` is missing, cumulative.
+    implicit_fence_fallbacks: u64,
     /// Which window each live touch point started on, and where it is in
     /// that window's coordinates.
     touch_targets: HashMap<i32, (WindowKey, Point)>,
@@ -1397,6 +1413,11 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         latch: surface::Latch::default(),
         surface_hints: surface::Hints::default(),
         shares: share::Shares::default(),
+        fences: dmabuf::FenceSet::new(TOK_FENCE_BASE),
+        feedback: dmabuf::FeedbackTracker::default(),
+        dmabuf_kms_refused: 0,
+        fence_waits: 0,
+        implicit_fence_fallbacks: 0,
         touch_targets: HashMap::new(),
         unplaced: Vec::new(),
         popups: HashMap::new(),
@@ -1905,6 +1926,10 @@ impl Server {
         self.reflow_anchors();
         self.reconfigure_rescaled(&rescaled);
         self.notify_outputs(&gone);
+        // Output set or modes changed: the dma-buf feedback may have too
+        // (#3918). Per-node feedback follows from `send_surface_hints`.
+        self.send_default_feedback(None);
+        self.feedback.invalidate();
     }
 
     /// Give every connected output its scale, its device rect and its
@@ -2862,6 +2887,8 @@ impl Server {
                     // because a shell client *is* a wire client with an
                     // extra capability bit. Remote tokens sort above both,
                     // for the same reason and with the same answer.
+                    // Fences sort above every client range (#3918).
+                    t if t >= TOK_FENCE_BASE => self.on_fence(t),
                     t if t >= TOK_REMOTE_BASE => self.on_wire_client(t, flags),
                     t if t >= TOK_SHELL_BASE => self.on_wire_client(t, flags),
                     t if t >= TOK_WIRE_BASE => self.on_wire_client(t, flags),
@@ -6572,6 +6599,27 @@ impl Server {
         let (n, bytes) = scanout.fold((0u64, 0u64), |(n, b), h| (n + 1, b + h.bytes));
         pairs.push(("scanout_buffers", n));
         pairs.push(("scanout_buffer_bytes", bytes));
+        // Client dma-bufs (#3918).
+        let dma: Vec<&HeldBuffer> = self
+            .wire_clients
+            .values()
+            .flat_map(|c| c.buffers.values())
+            .filter(|h| h.dmabuf)
+            .collect();
+        pairs.push(("dmabuf_buffers", dma.len() as u64));
+        pairs.push((
+            "dmabuf_cpu_mapped",
+            dma.iter().filter(|h| h.bytes > 0).count() as u64,
+        ));
+        pairs.push((
+            "dmabuf_kms_imported",
+            dma.iter().filter(|h| h.scanout.is_some()).count() as u64,
+        ));
+        pairs.push(("dmabuf_kms_refused", self.dmabuf_kms_refused));
+        pairs.push(("dmabuf_placeholder_paints", frame::placeholder_paints()));
+        pairs.push(("fences_pending", self.fences.len() as u64));
+        pairs.push(("fence_waits", self.fence_waits));
+        pairs.push(("implicit_fence_fallbacks", self.implicit_fence_fallbacks));
     }
 
     fn stats_reply(&self) -> Vec<u8> {
@@ -6877,6 +6925,12 @@ impl Server {
         if keymap_now {
             self.send_keymap(token);
         }
+        // A client opting into `DMABUF` hears the default feedback now
+        // (#3918): which dma-bufs it may create at all.
+        let dma = nitro_wire::types::caps::DMABUF;
+        if before & dma == 0 && caps & dma != 0 {
+            self.send_default_feedback(Some(token));
+        }
         true
     }
 
@@ -7141,6 +7195,7 @@ impl Server {
 
     /// Buffer, or act on, one decoded client message. Returns whether the
     /// client survives it.
+    #[allow(clippy::too_many_lines)] // one arm per op
     fn handle_wire_msg(&mut self, token: u64, message: ClientMsg) -> bool {
         match message {
             ClientMsg::Hello(hello) => {
@@ -7252,10 +7307,21 @@ impl Server {
             }
             // Never buffered: the latch path is outside the transactions.
             ClientMsg::PresentSurface(frame) => {
-                self.surface_allowed(token, "PresentSurface") && self.present_surface(token, &frame)
+                self.surface_allowed(token, "PresentSurface")
+                    && self.present_surface(token, &frame, None)
             }
             // Answered at receipt, like `PresentSurface` (#3914).
             ClientMsg::AllocSurfaceBuffers(m) => self.alloc_surface_buffers(token, &m),
+            // Client dma-bufs (#3918): validated at receipt like
+            // `CreateSurfaceBuffer`; the fenced present like `PresentSurface`.
+            ClientMsg::CreateDmabufBuffer(m) => {
+                self.dmabuf_allowed(token, "CreateDmabufBuffer")
+                    && self.create_dmabuf_buffer(token, m)
+            }
+            ClientMsg::PresentSurfaceFenced(m) => {
+                self.dmabuf_allowed(token, "PresentSurfaceFenced")
+                    && self.present_surface(token, &m.frame, Some(m.fence))
+            }
             // Answered at receipt, like `PresentSurface` (#3904).
             ClientMsg::ExportSurface(m) => {
                 self.share_allowed(token, "ExportSurface") && self.export_surface(token, m.id)
@@ -7296,8 +7362,9 @@ impl Server {
     /// client may always send the M3 window ops. `TEXT` is set only when a
     /// font was actually found: the bit means "you may send `Text` nodes",
     /// and on a box with no fonts at all that would be a promise the server
-    /// cannot keep. `DIRECT_SCANOUT` and `DMABUF` remain later milestones,
-    /// and a zero bit is the protocol's way of saying "do not use this".
+    /// cannot keep. `DIRECT_SCANOUT` stays unset until the planes module
+    /// (#3899) scans client buffers out (`dmabuf::direct_scanout`), and a
+    /// zero bit is the protocol's way of saying "do not use this".
     ///
     /// `SHELL` is set for, and only for, a connection accepted on the shell
     /// socket — which is what `shell` says. It is reported rather than
@@ -7363,9 +7430,11 @@ impl Server {
     /// disconnected for naming one it was granted.
     ///
     /// `SURFACE` (#3897) has `RELEASE`'s shape: local links only, since
-    /// every Surface buffer is a descriptor. `DMABUF` stays unset until
-    /// dma-buf import exists. `SHARE` (#3904) likewise: its only check
-    /// is the peer uid, which a TCP link cannot prove.
+    /// every Surface buffer is a descriptor. `DMABUF` (#3918) likewise:
+    /// a dma-buf is a descriptor, and every local backend (the fake
+    /// included) takes linear ones on the CPU path. `SHARE` (#3904)
+    /// likewise: its only check is the peer uid, which a TCP link cannot
+    /// prove.
     fn caps(&self, shell: bool, remote: bool) -> u32 {
         let mut caps = nitro_wire::types::caps::WM
             | nitro_wire::types::caps::THEME
@@ -7389,7 +7458,11 @@ impl Server {
             caps |= nitro_wire::types::caps::DATA
                 | nitro_wire::types::caps::RELEASE
                 | nitro_wire::types::caps::SURFACE
+                | nitro_wire::types::caps::DMABUF
                 | nitro_wire::types::caps::SHARE;
+            if dmabuf::direct_scanout() {
+                caps |= nitro_wire::types::caps::DIRECT_SCANOUT;
+            }
             if self.keymap_fd.is_some() {
                 caps |= nitro_wire::types::caps::KEYMAP;
             }
@@ -8311,10 +8384,41 @@ impl Server {
         for k in outcome.freed_scanout {
             self.backend.free_buffer(k);
         }
+        // Client dma-bufs this batch registered (#3918): imported as KMS
+        // framebuffers when the output backend has planes to put them on,
+        // the hook the planes module (#3899) reads. A refusal is not an
+        // error: the buffer is shown on the CPU path or as a placeholder.
+        for (id, import) in outcome.dmabuf_imports {
+            let has_planes = self
+                .outputs
+                .first()
+                .is_some_and(|o| !self.backend.planes(o.kms_id).is_empty());
+            if !has_planes {
+                continue;
+            }
+            let fds: Vec<_> = import.fds.iter().map(AsFd::as_fd).collect();
+            match self.backend.import_buffer(&import.desc, &fds) {
+                Ok(k) => {
+                    if let Some(h) = client.buffers.get_mut(&id) {
+                        h.scanout = Some(k);
+                    } else {
+                        self.backend.free_buffer(k);
+                    }
+                }
+                Err(e) => {
+                    debug!("dma-buf {}: KMS import refused: {e}", id.raw());
+                    self.dmabuf_kms_refused += 1;
+                }
+            }
+        }
         let surfaces_set = outcome.surfaces_set;
         if client.client_caps & nitro_wire::types::caps::SURFACE != 0 {
+            let dma = client.client_caps & nitro_wire::types::caps::DMABUF != 0;
             for (id, key) in outcome.new_surfaces {
                 self.surface_hints.track(key, token, id);
+                if dma {
+                    self.feedback.track(key, token, id);
+                }
             }
         }
         for win in outcome.closed_windows {
@@ -8344,9 +8448,8 @@ impl Server {
         // A committed `SetSurface` wins over a queued frame: the frame is
         // dropped and its buffer released now (unless something shows it).
         for node in surfaces_set {
-            if let Some(q) = self.latch.cancel(node) {
-                self.release_now(q.token, q.buffer);
-            }
+            let dropped = self.latch.cancel(node);
+            self.drop_frames(dropped);
         }
         // Imports this batch destroyed (#3904): a frame the client still
         // had queued through one is dropped and released.
@@ -8616,8 +8719,10 @@ impl Server {
         // freed, and a shell that restarts its clients would otherwise leak
         // a glyph vector per label per restart.
         self.text.release_owner(id.0);
-        self.latch.forget_client(token);
+        let _ = self.latch.forget_client(token);
+        self.fences.forget_client(&self.epoll, token);
         self.surface_hints.forget_client(token);
+        self.feedback.forget_client(token);
         // Its exports die with it; their importers hear at once. Its
         // imports simply go (the tokens stay valid for a restart).
         for r in self.shares.forget_client(token) {
@@ -9323,7 +9428,7 @@ impl Server {
                         || client
                             .pending
                             .iter()
-                            .any(|p| matches!(p, Pending::Buffer(q, _, _) if *q == b))
+                            .any(|p| matches!(p, Pending::Buffer(q, _, _) | Pending::Dmabuf(q, _) if *q == b))
                 });
             if in_use {
                 return Err(ApplyError::new(
@@ -9519,6 +9624,7 @@ impl Server {
                 key,
                 bytes: map_len as u64,
                 scanout: Some(kms),
+                dmabuf: false,
             };
             let reply = msg::SurfaceBufferAllocated {
                 node,
@@ -9544,7 +9650,12 @@ impl Server {
     /// `PresentSurface` (#3897): validate against the *committed* scene
     /// and queue the frame for the latch. A superseded frame's buffer is
     /// released at once unless something still shows it.
-    fn present_surface(&mut self, token: u64, frame: &msg::PresentSurface) -> bool {
+    fn present_surface(
+        &mut self,
+        token: u64,
+        frame: &msg::PresentSurface,
+        fence: Option<OwnedFd>,
+    ) -> bool {
         let Some(client) = self.wire_clients.get(&token) else {
             return false;
         };
@@ -9607,20 +9718,221 @@ impl Server {
             self.release_now(token, buffer);
             return true;
         };
+        let client_id = client.id;
+        // The acquire fence (#3918): the explicit one, or a snapshot of a
+        // dma-buf's write fences. Never waited on here.
+        let fence = match self.acquire_fence(token, buffer, fence) {
+            Ok(f) => f,
+            Err(e) => {
+                self.disconnect(token, Some((frame.serial, e.code, e.detail)));
+                return false;
+            }
+        };
         let queued = surface::Queued {
             token,
-            client: client.id,
+            client: client_id,
             buffer,
             serial: frame.serial,
             src: frame.src,
             color: clients::scene_color(frame.matrix, frame.range),
             damage: Damage::new(),
             whole: false,
+            fence,
         };
-        if let Some(old) = self.latch.queue(node, queued, &frame.damage) {
-            self.release_now(old.token, old.buffer);
-        }
+        let lost = self.latch.queue(node, queued, &frame.damage);
+        self.drop_frames(lost);
         true
+    }
+
+    /// The fence a frame on `buffer` waits for (#3918): `explicit` if the
+    /// client sent one, else an implicit snapshot for a dma-buf, else
+    /// none. A fence already signalled costs nothing more; a pending one
+    /// is registered with epoll and named by its key.
+    fn acquire_fence(
+        &mut self,
+        token: u64,
+        buffer: BufferKey,
+        explicit: Option<OwnedFd>,
+    ) -> Result<Option<surface::FenceKey>, ApplyError> {
+        let fd = if let Some(fd) = explicit {
+            fd
+        } else {
+            let Some(dfd) = self
+                .scene
+                .buffer(buffer)
+                .ok()
+                .and_then(nitro_scene::Buffer::fence_fd)
+            else {
+                return Ok(None);
+            };
+            match nitro_shm::export_sync_file(dfd, nitro_shm::SyncAccess::Read) {
+                Ok(Some(f)) => f,
+                // Not a dma-buf (the fake's memfd): nothing to wait on.
+                Ok(None) => return Ok(None),
+                Err(e) => {
+                    // A kernel before 6.0: the dma-buf itself polls
+                    // readable once its writers are done.
+                    self.implicit_fence_fallbacks += 1;
+                    debug!("EXPORT_SYNC_FILE: {e}; polling the dma-buf instead");
+                    rustix::io::dup(dfd)
+                        .map_err(|e| ApplyError::new(ErrorCode::Limit, format!("dup: {e}")))?
+                }
+            }
+        };
+        if dmabuf::signalled(fd.as_fd()) {
+            return Ok(None);
+        }
+        if self.fences.count_for(token) >= dmabuf::MAX_FENCES_PER_CLIENT {
+            return Err(ApplyError::new(
+                ErrorCode::Limit,
+                format!(
+                    "more than {} acquire fences pending",
+                    dmabuf::MAX_FENCES_PER_CLIENT
+                ),
+            ));
+        }
+        self.fence_waits += 1;
+        self.fences
+            .add(&self.epoll, token, fd)
+            .map(Some)
+            .map_err(|e| ApplyError::new(ErrorCode::Limit, format!("epoll_ctl: {e}")))
+    }
+
+    /// An acquire fence signalled: its frame is ready, and latches at the
+    /// next paint opportunity like any arriving frame.
+    fn on_fence(&mut self, epoll_token: u64) {
+        let Some(key) = self.fences.key_of(epoll_token) else {
+            return;
+        };
+        self.fences.remove(&self.epoll, key);
+        self.latch.fence_signalled(key);
+        self.settle();
+    }
+
+    /// Frames the latch let go of without showing (superseded, cancelled,
+    /// overflowed): release each buffer to its presenter unless still
+    /// shown or queued, and drop its fence.
+    fn drop_frames(&mut self, frames: Vec<surface::Queued>) {
+        for q in frames {
+            if let Some(k) = q.fence {
+                self.fences.remove(&self.epoll, k);
+            }
+            if !self.latch.holds(q.token, q.buffer) {
+                self.release_now(q.token, q.buffer);
+            }
+        }
+    }
+
+    /// The dma-buf ops need `DMABUF` and `SURFACE` listed in `ClientCaps`
+    /// and a local link (#3918, `docs/wire.md` rule 3). `DMABUF` is bit 2,
+    /// below the M5 mask, so it is checked here by name. Returns whether
+    /// the client may send `name`; if not, it has been disconnected.
+    fn dmabuf_allowed(&mut self, token: u64, name: &str) -> bool {
+        use nitro_wire::types::caps::{DMABUF, SURFACE};
+        let Some(client) = self.wire_clients.get(&token) else {
+            return false;
+        };
+        let why = if Self::is_remote(token) {
+            format!("{name} is not available on a remote link")
+        } else if client.client_caps & DMABUF == 0 {
+            format!("{name} needs `DMABUF` listed in ClientCaps")
+        } else if client.client_caps & SURFACE == 0 {
+            format!("{name} needs `SURFACE` listed in ClientCaps")
+        } else {
+            return true;
+        };
+        self.disconnect(token, Some((0, ErrorCode::Protocol, why)));
+        false
+    }
+
+    /// `CreateDmabufBuffer` (#3918): validated (and on the CPU path
+    /// mapped) at receipt, parked in the batch like `CreateSurfaceBuffer`.
+    fn create_dmabuf_buffer(&mut self, token: u64, m: msg::CreateDmabufBuffer) -> bool {
+        let id = m.id;
+        let Some(held) = self.buffer_budget(token) else {
+            return false;
+        };
+        let importable = self.default_feedback();
+        let v = match dmabuf::validate(m, &importable, held) {
+            Ok(v) => v,
+            Err(e) => {
+                self.disconnect(token, Some((0, e.code, e.detail)));
+                return false;
+            }
+        };
+        let Some(client) = self.wire_clients.get_mut(&token) else {
+            return false;
+        };
+        client.pending.push(Pending::Dmabuf(id, Box::new(v)));
+        true
+    }
+
+    /// The default feedback (#3918): the union over every output.
+    fn default_feedback(&self) -> Vec<nitro_wire::types::DmabufFormat> {
+        let mut all = dmabuf::feedback(&[]);
+        for o in &self.outputs {
+            all.extend(dmabuf::feedback(&self.backend.planes(o.kms_id)));
+        }
+        dmabuf::merge(all)
+    }
+
+    /// Send the default `DmabufFeedback` to `only`, or to every client that
+    /// listed `DMABUF`.
+    fn send_default_feedback(&mut self, only: Option<u64>) {
+        let formats = self.default_feedback();
+        let (w, h) = self
+            .outputs
+            .iter()
+            .fold((0, 0), |(w, h), o| (w.max(o.width), h.max(o.height)));
+        let main_device = self.backend.device_id().unwrap_or(0);
+        for (t, client) in &mut self.wire_clients {
+            if only.is_some_and(|o| o != *t)
+                || client.client_caps & nitro_wire::types::caps::DMABUF == 0
+            {
+                continue;
+            }
+            client.send(&ServerMsg::DmabufFeedback(msg::DmabufFeedback {
+                id: NodeId(0),
+                main_device,
+                max_width: w,
+                max_height: h,
+                formats: formats.clone(),
+            }));
+        }
+    }
+
+    /// Send the per-node `DmabufFeedback`s whose output or output feedback
+    /// changed (#3918).
+    fn send_node_feedback(&mut self) {
+        if self.feedback.is_empty() {
+            return;
+        }
+        let mut per_output: Vec<(
+            SceneOutputId,
+            u32,
+            u32,
+            Vec<nitro_wire::types::DmabufFormat>,
+        )> = Vec::new();
+        for o in &self.outputs {
+            let f = dmabuf::feedback(&self.backend.planes(o.kms_id));
+            per_output.push((o.scene_id, o.width, o.height, f));
+        }
+        let main_device = self.backend.device_id().unwrap_or(0);
+        let changed = self.feedback.changed(&self.scene, &per_output);
+        for (token, id, out) in changed {
+            let Some((_, w, h, formats)) = per_output.iter().find(|p| p.0 == out) else {
+                continue;
+            };
+            if let Some(client) = self.wire_clients.get_mut(&token) {
+                client.send(&ServerMsg::DmabufFeedback(msg::DmabufFeedback {
+                    id,
+                    main_device,
+                    max_width: *w,
+                    max_height: *h,
+                    formats: formats.clone(),
+                }));
+            }
+        }
     }
 
     /// The sharing ops need `SHARE` listed in `ClientCaps` and a local
@@ -9728,6 +10040,7 @@ impl Server {
         }
         let uid = client.peer_uid;
         let surface_caps = client.client_caps & nitro_wire::types::caps::SURFACE != 0;
+        let dma_caps = client.client_caps & nitro_wire::types::caps::DMABUF != 0;
         let imported = match self.shares.import(share, token, uid, id) {
             Ok(i) => i,
             Err(share::ImportError::OwnToken) => {
@@ -9752,6 +10065,9 @@ impl Server {
             debug!("client token {token}: imported a surface as {}", id.raw());
             if surface_caps {
                 self.surface_hints.track(node, token, id);
+                if dma_caps {
+                    self.feedback.track(node, token, id);
+                }
             }
         } else {
             debug!("client token {token}: dead import {}", id.raw());
@@ -9766,9 +10082,9 @@ impl Server {
     /// hinting it and release whatever frame the importer had queued.
     fn end_import(&mut self, token: u64, node: nitro_scene::NodeKey) {
         self.surface_hints.untrack(node, token);
-        if let Some(q) = self.latch.cancel_from(node, token) {
-            self.release_now(q.token, q.buffer);
-        }
+        self.feedback.untrack(node, token);
+        let dropped = self.latch.cancel_from(node, token);
+        self.drop_frames(dropped);
     }
 
     /// Tell an importer its import is dead (#3904).
@@ -9835,11 +10151,25 @@ impl Server {
                 .and_then(nitro_scene::Window::output)
         };
         let mut latch = std::mem::take(&mut self.latch);
-        let latched = latch.latch_ready(&mut self.scene, |scene, node| {
+        let outcome = latch.latch_ready(&mut self.scene, |scene, node| {
             output_of(scene, node).is_none_or(|o| !busy.contains(&o))
         });
         self.latch = latch;
+        for q in outcome.dropped {
+            if let Some(k) = q.fence {
+                self.fences.remove(&self.epoll, k);
+            }
+        }
+        self.drop_frames(outcome.superseded);
+        let latched = outcome.latched;
         for l in &latched {
+            // The CPU read bracket on a client dma-buf (#3918): begun at
+            // the latch, when the fence has signalled so the ioctl cannot
+            // block, and ended when the buffer stops being shown.
+            self.dmabuf_sync(l.buffer, true);
+            if let Some(prev) = l.previous.filter(|p| *p != l.buffer) {
+                self.dmabuf_sync(prev, false);
+            }
             let output = output_of(&self.scene, l.node);
             let Some(client) = self.wire_clients.get_mut(&l.token) else {
                 continue;
@@ -9865,10 +10195,30 @@ impl Server {
         !latched.is_empty()
     }
 
+    /// Begin (`start`) or end the CPU read bracket on a client dma-buf the
+    /// CPU path maps. A no-op for anything else (`ENOTTY` on a memfd).
+    fn dmabuf_sync(&self, key: BufferKey, start: bool) {
+        let Some(b) = self.scene.buffer(key).ok().filter(|b| b.cpu_readable()) else {
+            return;
+        };
+        let Some(fd) = b.fence_fd() else {
+            return;
+        };
+        let r = if start {
+            nitro_shm::sync_start(fd, nitro_shm::SyncAccess::Read)
+        } else {
+            nitro_shm::sync_end(fd, nitro_shm::SyncAccess::Read)
+        };
+        if let Err(e) = r {
+            debug!("DMA_BUF_IOCTL_SYNC: {e}");
+        }
+    }
+
     /// Send the `SurfaceHint`s whose size changed since the last one. v1's
     /// CPU path always prefers NV12 at the node's device size; the planes
     /// module (#3899) is where another answer will come from.
     fn send_surface_hints(&mut self) {
+        self.send_node_feedback();
         let hints = self
             .surface_hints
             .changed(&self.scene, nitro_wire::types::format::NV12);
