@@ -7,6 +7,7 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 import 'deploy/dev.just'
 
 # A bare `just` runs the checks (the recipes are at the end of this file).
+[doc("Run the standard checks: fmt, build, test, lint-colors")]
 [group('check')]
 default: fmt build test lint-colors
 
@@ -231,14 +232,17 @@ uninstall:
 # Checks
 # ---------------------------------------------------------------------------
 
+[doc("Check formatting (cargo fmt --check)")]
 [group('check')]
 fmt:
     cargo fmt --all -- --check
 
+[doc("Build the whole workspace, all targets")]
 [group('check')]
 build:
     cargo build --workspace --all-targets
 
+[doc("Run clippy on the workspace with warnings as errors")]
 [group('check')]
 clippy: lint-colors
     cargo clippy --workspace --all-targets -- -D warnings
@@ -246,14 +250,17 @@ clippy: lint-colors
 # Fail on a hard-coded colour outside the palette. See the script's
 # header and docs/theme.md: colours come from roles, so that one
 # `theme.scheme` switch moves the whole desktop.
+[doc("Fail on hard-coded colours outside the theme palette")]
 [group('check')]
 lint-colors:
     bash deploy/lint-colors.sh
 
 # Everything a merge checks that is not a compile or a test.
+[doc("Everything a merge checks that is not a compile or a test")]
 [group('check')]
 lint: lint-colors clippy
 
+[doc("Run the workspace tests")]
 [group('check')]
 test:
     cargo test --workspace

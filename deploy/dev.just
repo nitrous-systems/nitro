@@ -4,11 +4,13 @@
 fake_size := env_var_or_default("NITRO_FAKE_SIZE", "1280x720")
 
 # Run the server locally on the fake backend (Ctrl-C to stop).
+[doc("Run the server locally on the fake backend (Ctrl-C to stop)")]
 [group('dev')]
 fake:
     NITRO_BACKEND=fake NITRO_FAKE_SIZE={{fake_size}} cargo run -p nitro-server
 
 # Grab a PNG from a locally running `just fake` server.
+[doc("Grab a PNG from a locally running `just fake` server")]
 [group('dev')]
 fake-shot out="tmp/fake-shot.png":
     mkdir -p tmp && cargo run -q -p nitro-shot -- -o {{out}} && echo "wrote {{out}}"
@@ -20,6 +22,7 @@ fake-shot out="tmp/fake-shot.png":
 # Regenerate crates/nitro-icons/src/set.rs from the pinned upstream commit.
 # `just icons-import gear house` also adds those two names to icons.txt.
 # Idempotent: a run with no arguments must leave set.rs byte-identical.
+[doc("Regenerate nitro-icons set.rs; names given are added to icons.txt")]
 [group('dev')]
 icons-import *names:
     bash deploy/icons-import.sh {{names}}
@@ -30,6 +33,7 @@ icons-import *names:
 
 # Binary sizes and RSS/HWM of every shipped binary, release build.
 # `just size 5` measures the server with five windows open.
+[doc("Binary sizes and RSS/HWM of the shipped binaries (arg: window count)")]
 [group('dev')]
 size windows="1":
     bash deploy/size.sh {{windows}}
@@ -38,6 +42,7 @@ size windows="1":
 # docs/budget.md. `NITRO_FOOTPRINT_NO_BOX=1 just footprint` skips the box.
 #
 # Binary sizes, dep count and box idle RSS: the docs/budget.md baseline.
+[doc("Binary sizes, dep count and box idle RSS: the docs/budget.md baseline")]
 [group('dev')]
 footprint secs="10":
     FOOTPRINT_BINS="{{box_bins}} nitro-gpu-vulkan" NITRO_BOX={{box}} NITRO_BOX_BINDIR='{{box_bindir}}' bash deploy/footprint.sh {{secs}}
@@ -77,6 +82,7 @@ box_examples := "hello_client hello_dialog shell_probe"
 
 # Build release, rsync binaries to the box, restart the dev session
 # (on a `gdm` box: install only; log out/in or `just box-restart`).
+[doc("Build release, deploy to the box and restart the session (gdm: install only)")]
 [group('dev')]
 deploy: (deploy-bins)
     #!/usr/bin/env bash
@@ -89,10 +95,12 @@ deploy: (deploy-bins)
 
 # Restart the box's session. On a `gdm` box this restarts GDM, which
 # ends the logged-in session and leaves the greeter.
+[doc("Restart the box session (gdm box: restarts GDM, back to the greeter)")]
 [group('dev')]
 box-restart:
     ssh {{box}} {{ if box_profile == "gdm" { "'sudo systemctl restart gdm'" } else { "'sudo systemctl restart nitro-dev'" } }}
 
+[doc("Build release and copy binaries + launcher entries to the box")]
 [group('dev')]
 deploy-bins:
     # `--examples` on its own does not build the binaries, so ask for both.
@@ -169,6 +177,7 @@ _deploy-bins-gdm:
 # `chromium/` and the `chromium-nitro` wrapper; see docs/testbox.md.
 #
 # Rsync the Chromium build + its launcher entry to the box.
+[doc("Rsync the Chromium build and its launcher entry to the box")]
 [group('dev')]
 deploy-chromium:
     #!/usr/bin/env bash
@@ -238,6 +247,7 @@ deploy-chromium:
 # running session: `just chromium-bench oop`, `just box=testhost2
 # chromium-bench inproc 3`. MODE is inproc | oop | gpu (see the script).
 # Needs `deploy-chromium` first; leaves nothing behind but /tmp files.
+[doc("Chromium scroll/i2p/memory benchmark on the box (mode: inproc|oop|gpu)")]
 [group('dev')]
 chromium-bench mode="oop" runs="2":
     ssh {{box}} 'mkdir -p ~/nitro-stage'
@@ -247,6 +257,7 @@ chromium-bench mode="oop" runs="2":
 # Install/refresh the systemd unit on the box (needs sudo there). On a
 # `gdm` box there is no unit (it would fight GDM for tty2): this makes
 # the clone pushable and checks the GDM session entry instead.
+[doc("Install/refresh the nitro-dev systemd unit on the box (gdm: check setup)")]
 [group('dev')]
 box-install:
     #!/usr/bin/env bash
@@ -260,11 +271,13 @@ box-install:
     scp deploy/nitro-dev.service {{box}}:/tmp/nitro-dev.service
     ssh {{box}} 'sudo install -m 644 /tmp/nitro-dev.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl disable --now getty@tty2 2>/dev/null; true'
 
+[doc("Show the status of nitro on the box")]
 [group('dev')]
 box-status:
     ssh {{box}} {{ if box_profile == "gdm" { "'loginctl list-sessions --no-pager; pgrep -a nitro || echo no nitro processes; systemctl is-active gdm || true'" } else { "'systemctl status nitro-dev --no-pager -n 20 || true'" } }}
 
 # Talk to the running session: `status`, `lock`, `suspend`, `logout`.
+[doc("Send a command to the running session: status, lock, suspend, logout")]
 [group('dev')]
 box-session cmd="status":
     # `-q1`: the session keeps the connection open after most replies, so
@@ -272,26 +285,31 @@ box-session cmd="status":
     ssh {{box}} 'printf "{{cmd}}\n" | nc -q1 -U /run/user/$(id -u)/nitro/session.sock'
 
 # RSS/idle-CPU table for the whole desktop tree, for docs/budget.md.
+[doc("RSS/idle-CPU table for the whole desktop tree on the box")]
 [group('dev')]
 box-ps:
     ssh {{box}} 'bash -s' < deploy/box-ps.sh
 
+[doc("Follow the box's nitro logs (journalctl -f)")]
 [group('dev')]
 box-log:
     ssh {{box}} {{ if box_profile == "gdm" { "'journalctl -f -o cat _COMM=nitro-server + _COMM=nitro-session + _COMM=nitro-bar + _COMM=nitro-launcher + _COMM=nitro-wallpaper'" } else { "'journalctl -u nitro-dev -f -o cat'" } }}
 
 # On a `gdm` box this stops GDM (the human's standing OK; start it again
 # with `just box=testhost2 box-restart`).
+[doc("Stop nitro on the box (gdm box: stops GDM)")]
 [group('dev')]
 box-stop:
     ssh {{box}} {{ if box_profile == "gdm" { "'sudo systemctl stop gdm'" } else { "'sudo systemctl stop nitro-dev'" } }}
 
 # Screenshot of the live server, written to tmp/shot.png.
+[doc("Screenshot the live server on the box into tmp/shot.png")]
 [group('dev')]
 shot out="tmp/shot.png":
     mkdir -p tmp && ssh {{box}} '{{box_bindir}}/nitro-shot' > {{out}} && echo "wrote {{out}}"
 
 # Switch the box's foreground VT (vt-switch survival test).
+[doc("Switch the box's foreground VT (vt-switch survival test)")]
 [group('dev')]
 box-chvt n:
     ssh {{box}} 'sudo chvt {{n}}'
@@ -302,6 +320,7 @@ box-chvt n:
 # running session are untouched. `NITRO_GPU_TEST=require` turns "no GPU"
 # skips into failures. NV12 cases need /dev/udmabuf access (box1: yes via
 # the seat ACL; testhost2: only for the GDM seat user).
+[doc("Run the GPU helper pixel tests on the box's render node")]
 [group('dev')]
 box-gpu-test:
     rsync -az --delete --exclude target --exclude .git --exclude tmp ./ {{box}}:tmp/nitro-gpu-test/
@@ -311,6 +330,7 @@ box-gpu-test:
 # glslangValidator (installed on both boxes; `just box=... gpu-shaders`
 # compiles there when it is missing locally). The .spv files are checked
 # in, so a normal build needs no shader compiler.
+[doc("Regenerate the GPU helper SPIR-V from its GLSL")]
 [group('dev')]
 gpu-shaders:
     #!/usr/bin/env bash
@@ -326,6 +346,7 @@ gpu-shaders:
     fi
 
 # Push the repo to the box's clone (~/src/ai/nitro on both boxes).
+[doc("Push main to the box's clone (~/src/ai/nitro)")]
 [group('dev')]
 box-push:
     git push {{box}}:src/ai/nitro main
@@ -364,6 +385,7 @@ box-push:
 #
 # A `gdm` box has no nitro-dev unit to restart between arms, so bench
 # refuses there.
+[doc("Run the throughput benchmark matrix on the box (restarts nitro-dev)")]
 [group('dev')]
 bench modes="" seconds="10":
     {{ if box_profile == "gdm" { "echo 'bench: " + box + " runs nitro under GDM, with no nitro-dev unit to restart between arms (docs/testbox.md)' >&2; exit 1" } else { "" } }}
@@ -373,12 +395,14 @@ bench modes="" seconds="10":
     @echo "wrote tmp/bench/box.jsonl"
 
 # The markdown for docs/bench.md, from a ledger.
+[doc("Render the docs/bench.md markdown from a bench ledger")]
 [group('dev')]
 bench-report file="tmp/bench/box.jsonl":
     cargo run -q -p nitro-bench -- report {{file}}
 
 # This machine's memcpy bandwidth — the denominator the pixel-path
 # verdicts need. `just bench-bandwidth box` measures the box instead.
+[doc("Measure memcpy bandwidth here (or on the box with `box`)")]
 [group('dev')]
 bench-bandwidth where="here":
     #!/usr/bin/env bash
