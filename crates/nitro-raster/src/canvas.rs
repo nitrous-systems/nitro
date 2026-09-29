@@ -156,6 +156,59 @@ impl CastI32 for u32 {
     }
 }
 
+/// A uniform translucent colour laid over opaque pixels: the overview's
+/// scrim, folded into the pass that paints what is under it (#3929).
+///
+/// [`Overlay::over`] is **bit-identical** to painting the base opaquely and
+/// then filling the same pixels with `color` at `opacity` through
+/// [`Canvas::fill_rect`] (or [`Canvas::fill_irect`] at opacity 1): the same
+/// effective alpha, the same `mix` rounding, byte 3 staying 255. That is
+/// what lets a caller skip the second, read-modify-write pass without a
+/// single pixel changing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Overlay {
+    color: Color,
+    alpha: u8,
+}
+
+impl Overlay {
+    /// `color` (straight alpha) at the global `opacity` in `[0, 1]`, as
+    /// [`Canvas::fill_rect`] would paint it.
+    #[must_use]
+    pub fn new(color: Color, opacity: f32) -> Self {
+        Self {
+            color,
+            alpha: effective_alpha(color.a, 255, unit_u8(opacity)),
+        }
+    }
+
+    /// Whether it changes nothing.
+    #[must_use]
+    pub fn is_invisible(self) -> bool {
+        self.alpha == 0
+    }
+
+    /// The opaque colour `base` becomes under the overlay. `base`'s alpha
+    /// is ignored: the base is opaque by contract.
+    #[must_use]
+    pub fn over(self, base: Color) -> Color {
+        if self.alpha == 0 {
+            return Color::rgb(base.r, base.g, base.b);
+        }
+        if self.alpha == 255 {
+            return Color::rgb(self.color.r, self.color.g, self.color.b);
+        }
+        let a = u32::from(self.alpha);
+        let inv = 255 - a;
+        let ch = |s: u8, d: u8| mix(u32::from(s) * a + 128, d, inv);
+        Color::rgb(
+            ch(self.color.r, base.r),
+            ch(self.color.g, base.g),
+            ch(self.color.b, base.b),
+        )
+    }
+}
+
 /// Bytes per pixel of the only destination format: XRGB8888.
 pub const BYTES_PER_PIXEL: usize = 4;
 
@@ -459,6 +512,38 @@ impl<'a> Canvas<'a> {
                 blend_solid(self.row(y, x0, x1), color, color.a);
             }
         }
+    }
+
+    /// Paint `clip` with an **opaque** `fill` as if it were a square-cornered
+    /// rect covering all of `clip` at opacity 1, with `overlay` already laid
+    /// over it: one store per pixel instead of a store and a blend.
+    ///
+    /// Byte-equal to `fill_rect(clip, r, fill, 0.0, 1.0)` for any pixel-
+    /// aligned `r` containing `clip`, followed by the overlay's fill of the
+    /// same pixels. A vertical gradient (and a solid) is one colour per row,
+    /// composited once per row; a horizontal one is composited per pixel.
+    /// Returns `false`, having painted nothing, when `fill` is not opaque.
+    pub fn fill_opaque_overlaid(&mut self, clip: &IRect, fill: &Fill, overlay: Overlay) -> bool {
+        if !fill.is_opaque() {
+            return false;
+        }
+        let r = self.clip_to_surface(clip);
+        if r.is_empty() {
+            return true;
+        }
+        let (x0, x1) = (r.x, r.right());
+        for y in r.y..r.bottom() {
+            match fill.row_paint(y) {
+                RowPaint::Solid(c) => store_solid(self.row(y, x0, x1), overlay.over(c)),
+                paint @ RowPaint::Linear { .. } => {
+                    for (x, d) in (x0..).zip(self.row(y, x0, x1).chunks_exact_mut(4)) {
+                        let c = overlay.over(paint.color_at(x));
+                        d.copy_from_slice(&[c.b, c.g, c.r, 255]);
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// Clear an integer rect to fully transparent — every byte 0, alpha 0.

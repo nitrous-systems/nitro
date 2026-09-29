@@ -107,7 +107,7 @@ mod paint;
 mod shape;
 mod yuv;
 
-pub use canvas::{BYTES_PER_PIXEL, Canvas, Fill, Image, Mask, PixelFormat};
+pub use canvas::{BYTES_PER_PIXEL, Canvas, Fill, Image, Mask, Overlay, PixelFormat};
 pub use yuv::{Nv12, Packed422, Packed422Order, YuvEncoding, YuvMatrix, YuvRange};
 
 #[cfg(test)]

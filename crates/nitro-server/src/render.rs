@@ -20,7 +20,7 @@
 //! nothing on top?".
 
 use nitro_core::{Color, IRect, Palette, Role};
-use nitro_raster::Canvas;
+use nitro_raster::{Canvas, Overlay};
 
 /// Width of the frame around the output, in pixels.
 pub const FRAME: u32 = 4;
@@ -89,6 +89,22 @@ pub fn paint_background(
     height: u32,
     palette: &Palette,
 ) {
+    paint_background_overlaid(canvas, clip, width, height, palette, None);
+}
+
+/// [`paint_background`] with `overlay` (the overview's scrim) already laid
+/// over every pixel: still one store per pixel, and byte-equal to painting
+/// the background and then filling the clip with the overlay (#3929).
+pub fn paint_background_overlaid(
+    canvas: &mut Canvas<'_>,
+    clip: &IRect,
+    width: u32,
+    height: u32,
+    palette: &Palette,
+    overlay: Option<Overlay>,
+) {
+    let over = |c: Color| overlay.map_or(c, |o| o.over(c));
+    let frame_color = over(FRAME_COLOR);
     let area = clip.intersect(&canvas.bounds());
     if area.is_empty() {
         return;
@@ -98,15 +114,15 @@ pub fn paint_background(
     for y in area.y..area.bottom() {
         let row = IRect::new(area.x, y, area.w, 1);
         if y < frame || y + frame >= h {
-            canvas.fill_irect(&area, &row, FRAME_COLOR);
+            canvas.fill_irect(&area, &row, frame_color);
             continue;
         }
         // Interior row: left frame, gradient, right frame. Each piece is
         // clipped by `fill_irect`, so an empty one costs nothing.
-        let gradient = gradient_color(y.cast_unsigned(), height, palette);
-        canvas.fill_irect(&area, &IRect::new(0, y, frame, 1), FRAME_COLOR);
+        let gradient = over(gradient_color(y.cast_unsigned(), height, palette));
+        canvas.fill_irect(&area, &IRect::new(0, y, frame, 1), frame_color);
         canvas.fill_irect(&area, &IRect::new(frame, y, w - 2 * frame, 1), gradient);
-        canvas.fill_irect(&area, &IRect::new(w - frame, y, frame, 1), FRAME_COLOR);
+        canvas.fill_irect(&area, &IRect::new(w - frame, y, frame, 1), frame_color);
     }
 }
 
@@ -164,6 +180,34 @@ mod tests {
         let p = Palette::default();
         assert_eq!(gradient_color(0, 1, &p), p.get(Role::DesktopTop));
         assert_eq!(gradient_color(0, 0, &p), p.get(Role::DesktopTop));
+    }
+
+    #[test]
+    fn the_overlaid_background_equals_the_background_then_the_overlay() {
+        let (w, h) = (32, 16);
+        let stride = w * 4;
+        let p = Palette::default();
+        for opacity in [1.0, 0.5, 0.0] {
+            let scrim = Color::rgba(0, 0, 0, 0xA0);
+            let clip = IRect::new(2, 1, 25, 14);
+            let mut want = vec![0x11u8; (stride * h) as usize];
+            {
+                let mut c = Canvas::new(&mut want, w, h, stride);
+                paint_background(&mut c, &clip, w, h, &p);
+                c.fill_rect(
+                    &clip,
+                    &nitro_core::Rect::new(0.0, 0.0, 32.0, 16.0),
+                    &nitro_raster::Fill::Solid(scrim),
+                    0.0,
+                    opacity,
+                );
+            }
+            let mut got = vec![0x11u8; (stride * h) as usize];
+            let mut c = Canvas::new(&mut got, w, h, stride);
+            let overlay = Some(Overlay::new(scrim, opacity));
+            paint_background_overlaid(&mut c, &clip, w, h, &p, overlay);
+            assert_eq!(got, want, "opacity {opacity}");
+        }
     }
 
     #[test]

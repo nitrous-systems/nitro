@@ -156,8 +156,9 @@ impl PaintItem {
     /// here, since over-reporting would let a caller skip content that is in
     /// fact visible through a partially covered pixel. Two kinds qualify:
     ///
-    /// - a fully opaque, square-cornered, axis-aligned solid rect whose
-    ///   device rect lands on exact pixel boundaries;
+    /// - a fully opaque, square-cornered, axis-aligned rect whose device
+    ///   rect lands on exact pixel boundaries, filled with a solid colour or
+    ///   a gradient between two opaque stops;
     /// - an image on a buffer whose format was declared opaque
     ///   ([`BufferDesc::is_opaque`](crate::BufferDesc::is_opaque)), drawn
     ///   axis-aligned, pixel-aligned and 1:1 with its source rect.
@@ -189,12 +190,20 @@ impl PaintItem {
         match self.kind {
             PaintKind::Rect {
                 size,
-                fill: Fill::Solid(c),
+                fill,
                 corner_radius,
                 border,
             } => {
+                // A gradient whose two stops are opaque is opaque at every
+                // pixel: each channel, alpha included, is interpolated
+                // between two 255s (#3929). The wallpaper is one.
+                let fill_opaque = match fill {
+                    Fill::Solid(c) => c.is_opaque(),
+                    Fill::Linear { c0, c1, .. } => c0.is_opaque() && c1.is_opaque(),
+                    Fill::None => false,
+                };
                 let border_opaque = border.is_none_or(|b| !b.is_visible() || b.color.is_opaque());
-                if !(c.is_opaque()
+                if !(fill_opaque
                     && corner_radius <= 0.0
                     && border_opaque
                     && self.transform.is_axis_aligned())

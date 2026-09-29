@@ -1095,8 +1095,9 @@ pub fn render_thumb(
     let global = rect.translate(origin.0, origin.1);
     scene.with_buffer_detached(ClientId::SERVER, atlas.buffer, |scene, bytes| {
         let mut canvas = Canvas::new(bytes, w, h, w * 4);
-        crate::render::paint_background(&mut canvas, &rect, w, h, paint.palette);
-        canvas.fill_irect(&rect, &rect, SCRIM);
+        // One store pass: the scrim is folded into the gradient (#3929).
+        let scrim = Some(nitro_raster::Overlay::new(SCRIM, 1.0));
+        crate::render::paint_background_overlaid(&mut canvas, &rect, w, h, paint.palette, scrim);
         paint.items.clear();
         scene.paint_window(win, &global, paint.items);
         crate::frame::paint_items(

@@ -240,6 +240,30 @@ fn an_opaque_border_does_not_spoil_the_cover() {
 }
 
 #[test]
+fn an_opaque_gradient_covers_and_a_translucent_stop_does_not() {
+    let mut s = scene();
+    let (_, root) = window(&mut s);
+    let r = rect(&mut s, root, Rect::new(0.0, 0.0, 100.0, 100.0));
+    let gradient = |c1: Color| Fill::Linear {
+        start: Point::new(0.0, 0.0),
+        end: Point::new(0.0, 100.0),
+        c0: Color::rgb(10, 20, 30),
+        c1,
+    };
+    s.set_fill(CLIENT, r, gradient(Color::rgb(200, 100, 0)))
+        .unwrap();
+    settle(&mut s);
+    assert_eq!(
+        paint(&s, ALL)[0].opaque_cover(),
+        Some(IRect::new(0, 0, 100, 100))
+    );
+    s.set_fill(CLIENT, r, gradient(Color::rgb(200, 100, 0).with_alpha(254)))
+        .unwrap();
+    settle(&mut s);
+    assert_eq!(paint(&s, ALL)[0].opaque_cover(), None);
+}
+
+#[test]
 fn paint_list_for_an_unknown_output_is_empty() {
     let mut s = scene();
     let (_, root) = window(&mut s);

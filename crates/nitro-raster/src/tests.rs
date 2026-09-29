@@ -3342,3 +3342,81 @@ mod dest_alpha {
         s.assert_untouched_outside(&clip);
     }
 }
+
+// ---------------------------------------------------------------------------
+// fill_opaque_overlaid (#3929): one store equals a store and a blend
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_overlaid_opaque_fill_equals_the_fill_then_the_overlay() {
+    use crate::Overlay;
+    let (w, h) = (37, 23);
+    let full = Rect::new(0.0, 0.0, 37.0, 23.0);
+    let fills = [
+        Fill::Solid(Color::rgb(0x12, 0x80, 0xfe)),
+        Fill::Linear {
+            start: Point::new(0.0, 0.0),
+            end: Point::new(0.0, 23.0),
+            c0: Color::rgb(10, 200, 30),
+            c1: Color::rgb(250, 3, 99),
+        },
+        Fill::Linear {
+            start: Point::new(3.0, 0.0),
+            end: Point::new(30.0, 0.0),
+            c0: Color::rgb(0, 0, 0),
+            c1: Color::rgb(255, 255, 255),
+        },
+    ];
+    let mut rng = Rng::new(0x3929);
+    for fill in fills {
+        for (color, opacity) in [
+            (Color::rgba(0, 0, 0, 0xA0), 1.0),
+            (Color::rgba(0, 0, 0, 0xA0), 0.5),
+            (Color::rgba(0, 0, 0, 0xA0), 0.0),
+            (Color::rgba(40, 90, 200, 255), 1.0),
+            (Color::rgba(40, 90, 200, 17), 0.37),
+        ] {
+            for _ in 0..8 {
+                let x = iw(rng.next_u32() % w);
+                let y = iw(rng.next_u32() % h);
+                let clip = IRect::new(x, y, iw(rng.next_u32() % w), iw(rng.next_u32() % h));
+                let mut want = Surface::new(w, h);
+                {
+                    let mut c = want.canvas();
+                    c.fill_rect(&clip, &full, &fill, 0.0, 1.0);
+                    c.fill_rect(&clip, &full, &Fill::Solid(color), 0.0, opacity);
+                }
+                let mut got = Surface::new(w, h);
+                assert!(
+                    got.canvas()
+                        .fill_opaque_overlaid(&clip, &fill, Overlay::new(color, opacity))
+                );
+                assert_eq!(got.data, want.data, "{fill:?} {color:?} {opacity} {clip:?}");
+            }
+        }
+    }
+    let mut s = Surface::new(4, 4);
+    let translucent = Fill::Solid(Color::rgba(1, 2, 3, 4));
+    assert!(!s.canvas().fill_opaque_overlaid(
+        &IRect::new(0, 0, 4, 4),
+        &translucent,
+        Overlay::new(Color::BLACK, 1.0)
+    ));
+    s.assert_untouched_outside(&IRect::EMPTY);
+}
+
+#[test]
+fn overlay_over_matches_fill_irect_blend_for_every_alpha() {
+    use crate::Overlay;
+    for a in 0..=255u8 {
+        let top = Color::rgba(0x33, 0x99, 0xEE, a);
+        for base in [Color::rgb(0, 0, 0), Color::rgb(255, 255, 255), Color::rgb(7, 130, 251)] {
+            let mut s = Surface::new(3, 1);
+            let r = IRect::new(0, 0, 3, 1);
+            s.canvas().fill_irect(&r, &r, base);
+            s.canvas().fill_irect(&r, &r, top);
+            assert_eq!(s.bgr(1, 0), rgb(Overlay::new(top, 1.0).over(base)), "a {a}");
+            assert_eq!(s.data[7], 255);
+        }
+    }
+}
