@@ -604,10 +604,12 @@ The server decides, the backend executes. Per output:
 
 `planes_probe --flip` shows each layout for 2 s through
 `set_plane_state` + `commit_planes`, then goes back to the default and
-prints the `Flipped` events and the releases. The video buffers are left
-zeroed (solid green in YCbCr), which is enough to see which plane shows
-what; they are exported and the PRIME fd's size checked against
-`buffer_info`. In (b2) the buffer is freed while on screen.
+prints the `Flipped` events and the releases. The video buffers are
+exported, the PRIME fd's size checked against `buffer_info`, and filled
+through that mapping with BT.709 limited 75 % colour bars (white,
+yellow, cyan, green, magenta, red, blue, black left to right over the
+top two thirds, a black-to-white ramp below; zeroed buffers before
+#3935). In (b2) the buffer is freed while on screen.
 
 box1 (HSW GT1, HDMI 1920×1080, nitro-dev stopped):
 
@@ -662,9 +664,14 @@ output#1 eDP-1 2560x1440: multi-plane flips (--flip)
   and not reported.
 - The PRIME fd is the dumb buffer's size, rounded up to a page (HSW
   1080p YUYV: 4 149 248 bytes against 4 147 200).
-- Not looked at by a human: the probe's output is what the kernel
-  reported. Whether the panel really showed green where expected was not
-  checked on either box.
+- Looked at by the human on testbox2 (#3935, colour bars, each layout
+  alone with `PLANES_PROBE_ONLY` and `PLANES_PROBE_HOLD=10`): (a), (b2)
+  and (c) all correct: bars in order left to right, ramp dark to light
+  at the bottom, no mirroring or flip, no wrong colours. In (c) only
+  the middle of the card shows through the hole, which looks like a
+  different bar order when you glance at it next to (a) and (b2); on its own it is right. box1
+  ran (a) and (b2) with the bars without error but nobody looked at the
+  screen.
 
 ### dma-buf import (#3918), testbox2, 2026-09-29
 

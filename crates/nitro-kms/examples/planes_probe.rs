@@ -22,6 +22,10 @@
 //! eye, as is a wrong matrix or range (washed-out or crushed bars). The
 //! `Flipped` events and buffer releases are printed.
 //!
+//! `PLANES_PROBE_HOLD=SECS` holds each layout longer than 2 s, and
+//! `PLANES_PROBE_ONLY=a|b2|c` shows just that one, for checking one
+//! picture by eye.
+//!
 //! The output is plain text meant to be pasted into `README.md`.
 
 use std::os::fd::OwnedFd;
@@ -540,10 +544,7 @@ fn bar_at(x: u32, y: u32, w: u32, h: u32) -> (u8, u8, u8) {
 /// Fill a linear YUYV or NV12 buffer with the test card through a
 /// mapping of its exported fd.
 #[allow(clippy::many_single_char_names)]
-fn paint_bars(
-    fd: &OwnedFd,
-    info: &nitro_kms::planes::ScanoutBufferInfo,
-) -> Result<(), String> {
+fn paint_bars(fd: &OwnedFd, info: &nitro_kms::planes::ScanoutBufferInfo) -> Result<(), String> {
     use nitro_shm::{DmaBufMapping, SyncAccess, sync_end, sync_start};
     use std::os::fd::AsFd as _;
     let len = usize::try_from(info.size).map_err(|e| e.to_string())?;
@@ -588,7 +589,22 @@ fn paint_bars(
     Ok(())
 }
 
-/// Test, show for 2 s, go back to the default, report the release.
+/// How long `--flip` shows each layout: `PLANES_PROBE_HOLD` seconds,
+/// 2 by default.
+fn hold() -> Duration {
+    std::env::var("PLANES_PROBE_HOLD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map_or(Duration::from_secs(2), Duration::from_secs)
+}
+
+/// Whether `--flip` shows layout `name`: every one unless
+/// `PLANES_PROBE_ONLY` names another (`a`, `b2` or `c`).
+fn wanted(name: &str) -> bool {
+    std::env::var("PLANES_PROBE_ONLY").map_or(true, |v| v == name)
+}
+
+/// Test, show (see [`hold`]), go back to the default, report the release.
 /// `free_early` frees the buffer while it is still on screen.
 fn show(
     kms: &mut DrmBackend<'_>,
@@ -624,7 +640,7 @@ fn show(
         return;
     }
     wait_flip(kms, id, "on", t0);
-    std::thread::sleep(Duration::from_secs(2));
+    std::thread::sleep(hold());
     if free_early {
         kms.free_buffer(buf);
         println!("    freed while on screen (deferred)");
@@ -645,6 +661,7 @@ fn show(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn flip_output(kms: &mut DrmBackend<'_>, out: &OutputInfo) {
     let planes = kms.planes(out.id);
     let of = |k: PlaneKind| planes.iter().find(|p| p.kind == k).map(|p| p.id);
@@ -671,54 +688,61 @@ fn flip_output(kms: &mut DrmBackend<'_>, out: &OutputInfo) {
 
     // (a) a 1280x720 YUYV window on the overlay above the primary.
     let (vw, vh) = (1280.min(w), 720.min(h));
-    match video_buffer(kms, Fourcc::YUYV, vw, vh) {
-        Ok(b) => {
-            let win = Rect::new(
-                (w - vw).cast_signed() / 2,
-                (h - vh).cast_signed() / 2,
-                vw,
-                vh,
-            );
-            let ovc = yuv(PlaneConfig::new(
-                ov,
-                PlaneSource::Buffer(b),
-                SrcRect::whole(vw, vh),
-                win,
-            ));
-            show(
-                kms,
-                out.id,
-                "(a) YUYV window above the primary",
-                &[front, ovc],
-                b,
-                false,
-            );
+    if wanted("a") {
+        match video_buffer(kms, Fourcc::YUYV, vw, vh) {
+            Ok(b) => {
+                let win = Rect::new(
+                    (w - vw).cast_signed() / 2,
+                    (h - vh).cast_signed() / 2,
+                    vw,
+                    vh,
+                );
+                let ovc = yuv(PlaneConfig::new(
+                    ov,
+                    PlaneSource::Buffer(b),
+                    SrcRect::whole(vw, vh),
+                    win,
+                ));
+                show(
+                    kms,
+                    out.id,
+                    "(a) YUYV window above the primary",
+                    &[front, ovc],
+                    b,
+                    false,
+                );
+            }
+            Err(e) => println!("  (a) SKIP: {e}"),
         }
-        Err(e) => println!("  (a) SKIP: {e}"),
     }
 
     // (b2) YUYV full-screen on the overlay, primary off; freed while on
     // screen, to see the deferred free go through.
-    match video_buffer(kms, Fourcc::YUYV, w, h) {
-        Ok(b) => {
-            let ovc = yuv(PlaneConfig::new(
-                ov,
-                PlaneSource::Buffer(b),
-                SrcRect::whole(w, h),
-                Rect::new(0, 0, w, h),
-            ));
-            show(
-                kms,
-                out.id,
-                "(b2) YUYV full-screen overlay, primary off",
-                &[ovc],
-                b,
-                true,
-            );
+    if wanted("b2") {
+        match video_buffer(kms, Fourcc::YUYV, w, h) {
+            Ok(b) => {
+                let ovc = yuv(PlaneConfig::new(
+                    ov,
+                    PlaneSource::Buffer(b),
+                    SrcRect::whole(w, h),
+                    Rect::new(0, 0, w, h),
+                ));
+                show(
+                    kms,
+                    out.id,
+                    "(b2) YUYV full-screen overlay, primary off",
+                    &[ovc],
+                    b,
+                    true,
+                );
+            }
+            Err(e) => println!("  (b2) SKIP: {e}"),
         }
-        Err(e) => println!("  (b2) SKIP: {e}"),
     }
 
+    if !wanted("c") {
+        return;
+    }
     // (c) NV12 on the primary, the output buffer as AR24 on the overlay
     // with a transparent hole in the middle.
     println!("  (c) NV12 on the primary, AR24 output buffer on the overlay");

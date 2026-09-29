@@ -285,7 +285,9 @@ pub(super) fn add_optional(
 /// bottom, where a primary sits by default) when zpos is mutable. A
 /// Surface layout may have left either behind, and the modeset's other
 /// properties (FB, CRTC, rectangles) do not touch them.
-pub(super) fn default_props(disc: &Discovered) -> Vec<(property::Handle, property::Value<'static>)> {
+pub(super) fn default_props(
+    disc: &Discovered,
+) -> Vec<(property::Handle, property::Value<'static>)> {
     let mut v = Vec::new();
     if let Some(h) = disc.props.rotation {
         v.push((h, property::Value::Bitmask(rotation::ROTATE_0.into())));
@@ -649,7 +651,10 @@ mod tests {
         assert_eq!(
             names(&disc(true, Some(z(false)))),
             vec![
-                (10, format!("{:?}", property::Value::Bitmask(rotation::ROTATE_0.into()))),
+                (
+                    10,
+                    format!("{:?}", property::Value::Bitmask(rotation::ROTATE_0.into()))
+                ),
                 (11, format!("{:?}", property::Value::UnsignedRange(0))),
             ]
         );
