@@ -243,6 +243,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nitro-gpu"
+version = "0.0.1"
+dependencies = [
+ "nitro-core",
+ "nitro-shm",
+ "nitro-wire",
+ "rustix",
+]
+
+[[package]]
 name = "nitro-hey"
 version = "0.0.1"
 dependencies = [

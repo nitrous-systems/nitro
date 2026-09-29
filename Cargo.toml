@@ -30,6 +30,7 @@ nitro-seat   = { path = "crates/nitro-seat" }
 nitro-kms    = { path = "crates/nitro-kms" }
 nitro-shm    = { path = "crates/nitro-shm" }
 nitro-fs     = { path = "crates/nitro-fs" }
+nitro-gpu    = { path = "crates/nitro-gpu" }
 rustix       = { version = "1", default-features = false, features = ["std"] }
 drm          = "0.15"
 libseat      = { version = "0.2", default-features = false }
@@ -40,6 +41,9 @@ zerocopy     = { version = "0.8", features = ["derive"] }
 swash        = "0.2"
 zeno         = "0.3"
 vte          = { version = "0.15", default-features = false, features = ["std"] }
+# Vulkan for the GPU helper only (`nitro-gpu-vulkan`): dlopen'd libvulkan
+# (`loaded`), no Debug impls (`debug` off) to keep the binary small.
+ash          = { version = "0.38", default-features = false, features = ["loaded", "std"] }
 
 [profile.release]
 lto = "fat"
