@@ -5814,3 +5814,107 @@ fn overview_animate_allocates_and_frees_the_atlas_live() {
     h.quit();
     let _ = std::fs::remove_dir_all(&conf_dir);
 }
+
+/// Assert a framed window is maximized with its decorations showing: the
+/// frame fills the work area (the whole output here), the content sits
+/// inside the full frame insets, and the title bar is actually painted.
+/// The pixel is what catches #653 — the geometry was right all along.
+fn assert_maximized_with_frame(h: &mut Harness, win: &Win, what: &str) {
+    let i = wm::frame_insets();
+    assert_eq!(
+        win.pos,
+        Point::new(i.left, i.top),
+        "{what}: the content is inset by the frame"
+    );
+    let frame = win.frame(true);
+    assert_eq!(
+        (frame.x, frame.y, frame.w, frame.h),
+        (0.0, 0.0, OUT.0 as f32, OUT.1 as f32),
+        "{what}: the frame fills the work area"
+    );
+    park(h);
+    assert_eq!(
+        pixel_at(h, win.title_bar()),
+        to_rgb(bar(true)),
+        "{what}: the title bar is showing again"
+    );
+    assert_eq!(h.stat("decorated"), 1);
+}
+
+#[test]
+fn super_m_on_a_fullscreen_window_brings_the_decorations_back() {
+    let mut h = Harness::start("fs-max", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("fs-max");
+    let mut win = make_window(&mut conn, &mut inbox, 1, "a", WIN, RED, 0, 1);
+    park(&mut h);
+
+    set_state(&mut conn, &win, WindowState::Fullscreen, 2);
+    h.settle();
+    await_configure(&mut conn, &mut inbox, &mut win, "fullscreen");
+    fill(&mut conn, &win, 10);
+    h.settle();
+
+    h.key(KEY_LEFTMETA, true);
+    h.key(KEY_M, true);
+    h.key(KEY_M, false);
+    h.key(KEY_LEFTMETA, false);
+    h.settle();
+    await_configure(&mut conn, &mut inbox, &mut win, "Super+M");
+    assert_maximized_with_frame(&mut h, &win, "Super+M");
+
+    drop(conn);
+    h.quit();
+}
+
+#[test]
+fn a_client_maximizing_its_fullscreen_window_gets_its_decorations_back() {
+    let mut h = Harness::start("fs-max-client", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("fs-max-client");
+    let mut win = make_window(&mut conn, &mut inbox, 1, "a", WIN, RED, 0, 1);
+    park(&mut h);
+
+    set_state(&mut conn, &win, WindowState::Fullscreen, 2);
+    h.settle();
+    await_configure(&mut conn, &mut inbox, &mut win, "fullscreen");
+    fill(&mut conn, &win, 10);
+    h.settle();
+
+    set_state(&mut conn, &win, WindowState::Maximized, 3);
+    h.settle();
+    await_configure(&mut conn, &mut inbox, &mut win, "SetState Maximized");
+    assert_maximized_with_frame(&mut h, &win, "SetState Maximized");
+
+    drop(conn);
+    h.quit();
+}
+
+#[test]
+fn super_up_on_a_super_f_window_brings_the_decorations_back() {
+    let mut h = Harness::start("fs-up", OUT.0, OUT.1);
+    let mut inbox = Inbox::default();
+    let mut conn = h.client("fs-up");
+    let mut win = make_window(&mut conn, &mut inbox, 1, "a", WIN, RED, 0, 1);
+    park(&mut h);
+
+    h.key(KEY_LEFTMETA, true);
+    h.key(KEY_F, true);
+    h.key(KEY_F, false);
+    h.key(KEY_LEFTMETA, false);
+    h.settle();
+    await_configure(&mut conn, &mut inbox, &mut win, "Super+F");
+    fill(&mut conn, &win, 10);
+    h.settle();
+
+    h.key(KEY_LEFTMETA, true);
+    h.key(KEY_UP, true);
+    h.key(KEY_UP, false);
+    h.key(KEY_LEFTMETA, false);
+    h.settle();
+    await_configure(&mut conn, &mut inbox, &mut win, "Super+Up");
+    assert_maximized_with_frame(&mut h, &win, "Super+Up");
+
+    drop(conn);
+    h.quit();
+}
