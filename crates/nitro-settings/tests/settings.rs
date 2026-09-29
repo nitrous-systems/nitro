@@ -1237,6 +1237,49 @@ fn the_dark_checkbox_writes_the_scheme_at_once() {
 }
 
 #[test]
+fn the_overview_switch_writes_overview_animate_at_once_and_apply_keeps_it() {
+    let dir = scratch("ov-animate");
+    let path = dir.join(conf::FILE_NAME);
+    std::fs::write(&path, "theme.scheme = dark\nkeyboard.layout = us\n").expect("write");
+    let mut h = harness(&dir);
+    let sw = named(&mut h, names::OVERVIEW_ANIMATE);
+    assert!(
+        !h.widget::<Switch<Settings>>(sw).is_checked(),
+        "off by default: the overview snaps"
+    );
+    let applies = h.state().applies();
+
+    do_action(&mut h, names::OVERVIEW_ANIMATE, "toggle");
+    let text = std::fs::read_to_string(&path).expect("read back");
+    assert!(text.contains("overview.animate = true"), "{text}");
+    assert!(
+        text.contains("theme.scheme = dark"),
+        "other keys kept:\n{text}"
+    );
+    let parsed = nitro_server::config::parse(&text);
+    assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+    assert!(parsed.overview.animate());
+    assert_eq!(h.state().applies(), applies, "no Apply involved");
+    assert_eq!(h.state().overview_writes(), 1);
+    assert_eq!(status(&mut h), "overview: animated");
+
+    // Apply keeps it; Revert shows it without writing.
+    set_value(&mut h, names::LAYOUT, "de");
+    do_action(&mut h, names::APPLY, "click");
+    let text = std::fs::read_to_string(&path).expect("read back");
+    assert!(text.contains("keyboard.layout = de"), "{text}");
+    assert!(
+        text.contains("overview.animate = true"),
+        "Apply kept it:\n{text}"
+    );
+    std::fs::write(&path, "overview.animate = false\n").expect("rewrite");
+    do_action(&mut h, names::REVERT, "click");
+    assert!(!h.widget::<Switch<Settings>>(sw).is_checked());
+    assert_eq!(h.state().overview_writes(), 1, "Revert did not write");
+    h.quit();
+}
+
+#[test]
 fn the_checkbox_starts_on_what_the_file_says() {
     let dir = scratch("scheme-start");
     std::fs::write(dir.join(conf::FILE_NAME), "theme.scheme = dark\n").expect("write");

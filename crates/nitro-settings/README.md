@@ -100,6 +100,14 @@ press Revert. That is what the idle contract costs, and it is why
 `nothing_is_sent_while_it_sits_there` can assert that a settled dialog
 leaves no timer armed at all.
 
+**Two switches skip Apply.** The Appearance page's *Dark* and *Animate
+overview* switches write their one key (`theme.scheme`,
+`overview.animate`) at once, because both are judged by looking — the
+desktop recolours, or the next Super press fades and slides. Apply carries
+both keys over from disk rather than from the widgets. *Animate overview*
+says what it costs: one screen-sized buffer per display (~8 MB at 1080p),
+which is why it is off by default (`docs/settings.md`).
+
 ## Validation is the server's job
 
 Apply does not check your keyboard layout, and that is deliberate: the
@@ -211,6 +219,7 @@ $ hey nitro-settings get displays/HDMI-A-1/scale_value value   # 2
 $ hey nitro-settings set keyboard/layout value de
 $ hey nitro-settings do keyboard/nocaps toggle                 # Caps Lock is Ctrl
 $ hey nitro-settings set keyboard/repeat_rate value 0          # key repeat off
+$ hey nitro-settings do appearance/overview_animate toggle     # animate the overview
 $ hey nitro-settings do apply click
 $ hey nitro-settings get status value                          # applied
 ```

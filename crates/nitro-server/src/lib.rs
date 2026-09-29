@@ -229,13 +229,15 @@ pub struct Config {
     /// `NITRO_SCROLL_BLIT=0` turns it off, so the two can be compared on
     /// hardware and a test can drive a reference server beside it.
     pub scroll_blit: bool,
-    /// Give every output an overview thumbnail atlas (#3902): one opaque
-    /// buffer of the output's size, allocated when the output appears, so
-    /// the overview animates out of 1:1 copies and pressing Super
-    /// allocates nothing. On by default; `NITRO_OVERVIEW_ATLAS=0` gives
-    /// the memory back and overview snaps with a direct repaint, which is
-    /// also what a failed allocation falls back to.
-    pub overview_atlas: bool,
+    /// The environment's override of `overview.animate`
+    /// (`NITRO_OVERVIEW_ATLAS=0|1`): `Some(true)` gives every output an
+    /// overview thumbnail atlas (#3902) — one opaque buffer of the
+    /// output's size, allocated when the output appears, so the overview
+    /// animates out of 1:1 copies and pressing Super allocates nothing —
+    /// and `Some(false)` never allocates one. `None` (the default) follows
+    /// the file, whose default is **off**: overview snaps with a direct
+    /// repaint, which is also what a failed allocation falls back to.
+    pub overview_atlas: Option<bool>,
     /// Start with the session **locked** and no lock owner: nothing but the
     /// background is drawn and no window receives input until a shell
     /// client sends `Lock` (and so owns the lock), and then only its
@@ -304,7 +306,7 @@ impl Config {
             fake_planes: Vec::new(),
             shadow: true,
             scroll_blit: true,
-            overview_atlas: true,
+            overview_atlas: None,
             locked: false,
             config_path: None,
             icon_dirs: None,
@@ -950,9 +952,9 @@ struct Server {
     /// Whether a scroll hint may be served from the shadow
     /// (`NITRO_SCROLL_BLIT`); see [`Config::scroll_blit`].
     scroll_blit: bool,
-    /// Whether outputs get an overview thumbnail atlas; see
-    /// [`Config::overview_atlas`].
-    overview_atlas: bool,
+    /// The environment's override of `overview.animate`; see
+    /// [`Config::overview_atlas`] and [`Server::wants_atlas`].
+    overview_atlas: Option<bool>,
     /// Thumbnails rendered into an atlas, cumulative, and the
     /// microseconds they took. `stats`.
     thumb_renders: u64,
@@ -2012,7 +2014,7 @@ impl Server {
             );
             // The overview atlas is paid here, when the output appears,
             // and pre-faulted: nothing on the Super path allocates.
-            if self.overview_atlas {
+            if self.wants_atlas() {
                 state.atlas = overview::Atlas::allocate(&mut self.scene, info.width, info.height);
             }
             self.outputs.push(state);
@@ -2383,6 +2385,13 @@ impl Server {
         let cursor_state = self.cursor_state(scene_id);
         // Spent whatever this paint does: see `OutputState::take_scroll`.
         let scroll = self.outputs[index].take_scroll();
+        // A snap overview's scaled items are all thumbnails: they take the
+        // fast XR24 blit (~4 ns/px against ~12), as an atlas render does.
+        // Nowhere else, so no live pixel outside one changes.
+        let fast_scaled = self
+            .wm
+            .overview()
+            .is_some_and(|o| o.output == scene_id && !o.atlas);
         // (rasterized px, moved px, took the blit), for the statistics.
         let mut split = (frame::region_area(&region), 0, false);
         let (paint_us, copy_us) = {
@@ -2419,6 +2428,7 @@ impl Server {
                         output: scene_id,
                         bounds,
                         cursor: (&self.cursor, cursor_state),
+                        fast_scaled,
                     },
                     &rasterize,
                     scroll.filter(|_| !reset),
@@ -2441,6 +2451,7 @@ impl Server {
                     (&self.cursor, cursor_state),
                     &mut self.paint_items,
                     &self.palette,
+                    fast_scaled,
                 );
                 (paint_us, 0)
             }
@@ -3567,6 +3578,9 @@ impl Server {
         // be the one the scene is told about, not the one it was before.
         self.apply_modes();
         self.sync_outputs();
+        // `overview.animate`: allocate or free every output's atlas now,
+        // not on the next Super press.
+        self.apply_overview_atlas();
         // The remote listener, which may appear, move or go away. Done
         // unconditionally like everything else here, and idempotent: an
         // unchanged `remote.listen` is a comparison and nothing more, so
@@ -10759,6 +10773,47 @@ impl Server {
         overview::snapped_text_size(px, t.slot.scale * out)
     }
 
+    /// Whether outputs should carry an overview thumbnail atlas: the
+    /// environment's override, else `overview.animate` (default off).
+    fn wants_atlas(&self) -> bool {
+        self.overview_atlas
+            .unwrap_or_else(|| self.settings.overview.animate())
+    }
+
+    /// Bring every output's atlas in line with [`Server::wants_atlas`]:
+    /// allocate the missing ones (a failure leaves that output snapping,
+    /// as at startup) or free them. An overview animating out of an atlas
+    /// about to be freed is left first — its images reference the buffer
+    /// — exactly as the resize path in `layout_outputs` does. Turning the
+    /// setting on while a snap overview is open only allocates: that
+    /// overview stays snap, and the next entry animates. Idempotent.
+    fn apply_overview_atlas(&mut self) {
+        let want = self.wants_atlas();
+        for i in 0..self.outputs.len() {
+            let (scene_id, w, h) = {
+                let o = &self.outputs[i];
+                (o.scene_id, o.width, o.height)
+            };
+            match (want, self.outputs[i].atlas) {
+                (true, None) => {
+                    self.outputs[i].atlas = overview::Atlas::allocate(&mut self.scene, w, h);
+                }
+                (false, Some(atlas)) => {
+                    if self
+                        .wm
+                        .overview()
+                        .is_some_and(|o| o.output == scene_id && o.atlas)
+                    {
+                        self.leave_overview(None);
+                    }
+                    atlas.free(&mut self.scene);
+                    self.outputs[i].atlas = None;
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Leave overview mode, putting every window back exactly as it was,
     /// then — when `select` names a thumbnail — un-minimize, raise and
     /// focus it.
@@ -11231,6 +11286,9 @@ struct ShadowPaint<'a> {
     output: SceneOutputId,
     bounds: nitro_core::IRect,
     cursor: (&'a Cursor, CursorState),
+    /// [`frame::paint_region`]'s `fast_scaled`: this output shows a snap
+    /// overview.
+    fast_scaled: bool,
 }
 
 /// What [`paint_shadow`] did, for the statistics.
@@ -11279,6 +11337,7 @@ fn paint_shadow(
             p.cursor,
             &mut *p.items,
             p.palette,
+            p.fast_scaled,
         );
     } else {
         frame::paint_region(
@@ -11291,6 +11350,7 @@ fn paint_shadow(
             p.cursor,
             &mut *p.items,
             p.palette,
+            p.fast_scaled,
         );
     }
     ShadowPainted {

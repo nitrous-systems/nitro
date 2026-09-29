@@ -27,9 +27,11 @@
 //! - `NITRO_SHADOW=0` paints straight into the scanout buffer instead of
 //!   into a per-output heap shadow (the default). For A/B measurement on
 //!   real hardware; see `crates/nitro-server/src/frame.rs`.
-//! - `NITRO_OVERVIEW_ATLAS=0` drops the per-output overview thumbnail
-//!   atlas (~8 MB per 1080p output): overview then snaps with a direct
-//!   repaint instead of animating. See `docs/wm.md` §Overview mode.
+//! - `NITRO_OVERVIEW_ATLAS=1` / `=0` overrides `overview.animate`: `1`
+//!   gives every output the overview thumbnail atlas (~8 MB per 1080p
+//!   output) and animates the overview, `0` never allocates it and the
+//!   overview snaps. Unset follows the file (default: snap). See
+//!   `docs/wm.md` §Overview mode.
 //! - `NITRO_LOCKED=1` starts with the session locked: nothing is drawn and
 //!   no window gets input until a shell client sends `Lock`. See
 //!   `crates/nitro-server/src/lock.rs` and `docs/shell.md`.
@@ -129,8 +131,13 @@ fn config_from_env() -> Result<Config, String> {
         shadow: std::env::var("NITRO_SHADOW").as_deref() != Ok("0"),
         scroll_blit: std::env::var("NITRO_SCROLL_BLIT").as_deref() != Ok("0"),
         // The overview's thumbnail atlas (~8 MB per 1080p output, paid
-        // when the output appears): `0` gives it back and overview snaps.
-        overview_atlas: std::env::var("NITRO_OVERVIEW_ATLAS").as_deref() != Ok("0"),
+        // when the output appears): overrides `overview.animate`, `0` off
+        // and `1` on; anything else follows the file.
+        overview_atlas: match std::env::var("NITRO_OVERVIEW_ATLAS").as_deref() {
+            Ok("0") => Some(false),
+            Ok("1") => Some(true),
+            _ => None,
+        },
         locked: std::env::var("NITRO_LOCKED").as_deref() == Ok("1"),
         // `NITRO_CONFIG`, else the XDG path. `None` — a service with
         // neither `$XDG_CONFIG_HOME` nor `$HOME` — means no file and no

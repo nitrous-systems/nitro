@@ -143,6 +143,11 @@ pub const POINTER_ADAPTIVE_DEFAULT: bool = true;
 /// off, the server's default.
 pub const NATURAL_SCROLL_DEFAULT: bool = false;
 
+/// What the animate-overview switch shows when the file says nothing:
+/// off, the server's default (the overview snaps and no thumbnail atlas
+/// is allocated).
+pub const OVERVIEW_ANIMATE_DEFAULT: bool = false;
+
 /// Format a pointer speed the way the file spells it: at most two
 /// decimals, no trailing zeros, and never `-0`.
 #[must_use]
@@ -198,6 +203,9 @@ pub struct Conf {
     pub pointer: PointerConf,
     /// The colour section.
     pub theme: ThemeConf,
+    /// `overview.animate`. `None` writes no line and the server's default
+    /// ([`OVERVIEW_ANIMATE_DEFAULT`]) applies.
+    pub overview_animate: Option<bool>,
 }
 
 impl Conf {
@@ -296,7 +304,8 @@ pub fn format_scale(scale: f32) -> String {
 /// header comment lines, a blank line, one block per output in connector
 /// order with a blank line between blocks, a blank line, the three
 /// keyboard lines, and — when there is anything to say — a blank line and
-/// the `pointer.*` block, then a blank line and the `theme.*` block.
+/// the `pointer.*` block, then a blank line and the `theme.*` block, then
+/// a blank line and `overview.animate` when it is set.
 /// Within an output the order is
 /// scale, position, primary — biggest effect first, and `primary` last
 /// because it is the one line that may be missing.
@@ -358,6 +367,10 @@ pub fn render(conf: &Conf) -> String {
         for (role, value) in &t.overrides {
             let _ = writeln!(out, "theme.{role} = {value}");
         }
+    }
+    // Only when set, for the theme's reason: the default stays free.
+    if let Some(animate) = conf.overview_animate {
+        let _ = writeln!(out, "\noverview.animate = {animate}");
     }
     out
 }
@@ -465,6 +478,7 @@ pub fn parse(text: &str) -> Conf {
                     conf.pointer.natural_scroll = Some(b);
                 }
             }
+            "overview.animate" => conf.overview_animate = parse_bool(value),
             "theme.scheme" => conf.theme.scheme = Scheme::from_name(value),
             // Any other `theme.<something>` is a per-role override. It is
             // not validated here: this app cannot render it and does not
@@ -635,6 +649,19 @@ pub fn set_scheme(path: &Path, scheme: Scheme) -> std::io::Result<()> {
     write(path, &conf)
 }
 
+/// Set `overview.animate` in the file at `path`, leaving every other key
+/// as the file had it — [`set_scheme`]'s shape, for `nitro-settings`'
+/// animate-overview switch, which saves at once. The server's reload
+/// allocates (or frees) every output's thumbnail atlas immediately.
+///
+/// # Errors
+/// As [`write()`].
+pub fn set_overview_animate(path: &Path, animate: bool) -> std::io::Result<()> {
+    let mut conf = load(path);
+    conf.overview_animate = Some(animate);
+    write(path, &conf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -779,6 +806,40 @@ keyboard.options = ctrl:nocaps
         assert!(text.contains("pointer.accel = adaptive\n"), "{text}");
         assert!(!text.contains("pointer.speed"), "{text}");
         assert_eq!(parse(&text).pointer, c.pointer);
+    }
+
+    #[test]
+    fn overview_animate_is_written_only_when_set_and_round_trips() {
+        let mut c = example();
+        assert!(!render(&c).contains("overview."), "nothing when None");
+        c.theme.scheme = Some(Scheme::Dark);
+        c.overview_animate = Some(true);
+        let text = render(&c);
+        assert!(
+            text.ends_with("theme.scheme = dark\n\noverview.animate = true\n"),
+            "{text}"
+        );
+        assert_eq!(parse(&text), c);
+        c.overview_animate = Some(false);
+        assert_eq!(parse(&render(&c)), c);
+        assert_eq!(
+            parse("overview.animate = yes\n").overview_animate,
+            Some(true)
+        );
+        assert_eq!(parse("overview.animate = maybe\n").overview_animate, None);
+    }
+
+    #[test]
+    fn set_overview_animate_changes_one_key() {
+        let dir = std::env::temp_dir().join(format!("nitro-conf-ov-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join(FILE_NAME);
+        write(&path, &example()).unwrap();
+        set_overview_animate(&path, true).unwrap();
+        let mut want = example();
+        want.overview_animate = Some(true);
+        assert_eq!(load(&path), want);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

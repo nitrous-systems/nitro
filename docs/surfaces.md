@@ -302,7 +302,7 @@ once measured. Every figure below is an **estimate** unless marked
 
 | item | when paid | cost |
 |---|---|---|
-| overview thumbnail atlas | always (allocated when the output appears, pre-faulted) | **measured** (#3902): exactly `w × h × 4` = 8 294 400 bytes at 1080p (`stats overview_atlas_bytes`) |
+| overview thumbnail atlas | only with `overview.animate = true` (default off, #3916); then allocated when the output appears or the setting turns on, pre-faulted | **measured** (#3902): exactly `w × h × 4` = 8 294 400 bytes at 1080p (`stats overview_atlas_bytes`) |
 | `nitro-gpu` helper, process RSS | always, by default (on-demand config: only while compositing) | **measured** with the #3903 probe (no helper yet), vendor ICD only, start → first submit: +8.7 MB RSS / +6.6 MB PSS (HSW), +10.9 / +8.4 MB (KBL); the full NV12 chain adds +9.4 / +12.3 MB PSS. Confirm with the real helper in #3901 |
 | `nitro-gpu` helper, driver memory (Vulkan instance/device, command pools, pipelines; system RAM on iGPUs, not counted in RSS) | same | unmeasured; measure in #3901 |
 | server-allocated NV12 dumb buffers | per plane-placed Surface | 1.5 bytes/px × buffer count (~3 MB per 1080p buffer) |

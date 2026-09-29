@@ -4897,7 +4897,7 @@ fn an_overlay_window_still_takes_clicks_in_overview() {
 }
 
 /// Two windows, parked, overview not yet entered; `tweak` configures the
-/// server (the snap fallback turns the atlas off).
+/// server (the atlas tests turn it on; snap is the default).
 fn atlas_desktop(
     name: &str,
     tweak: impl FnOnce(&mut Config),
@@ -4913,7 +4913,8 @@ fn atlas_desktop(
 
 #[test]
 fn pressing_super_allocates_no_buffer() {
-    let (h, mut conn, mut inbox, _a, _b) = atlas_desktop("ov-alloc", |_| {});
+    let (h, mut conn, mut inbox, _a, _b) =
+        atlas_desktop("ov-alloc", |c| c.overview_atlas = Some(true));
     assert_eq!(h.stat("overview_atlas"), 1);
     assert_eq!(
         h.stat("overview_atlas_bytes"),
@@ -4938,7 +4939,8 @@ fn pressing_super_allocates_no_buffer() {
 #[test]
 #[allow(clippy::many_single_char_names, clippy::similar_names)] // h, a, b, x, y: as the rest of this file
 fn a_thumbnail_commit_re_renders_just_its_slot_and_is_presented() {
-    let (h, mut conn, mut inbox, a, b) = atlas_desktop("ov-render", |_| {});
+    let (h, mut conn, mut inbox, a, b) =
+        atlas_desktop("ov-render", |c| c.overview_atlas = Some(true));
     overview(&h, true);
     assert_eq!(h.stat("thumb_renders"), 2, "every thumbnail once on entry");
     let slots = expected_slots(&[a, b]);
@@ -4978,7 +4980,8 @@ fn a_thumbnail_commit_re_renders_just_its_slot_and_is_presented() {
 #[test]
 #[allow(clippy::many_single_char_names, clippy::similar_names)] // h, a, b, x, y: as the rest of this file
 fn the_snap_fallback_has_no_atlas_and_still_works() {
-    let (h, conn, _inbox, a, b) = atlas_desktop("ov-snap", |c| c.overview_atlas = false);
+    // Snap is the default: nothing in the config asks for the atlas.
+    let (h, conn, _inbox, a, b) = atlas_desktop("ov-snap", |_| {});
     assert_eq!(h.stat("overview_atlas"), 0);
     assert_eq!(h.stat("overview_atlas_bytes"), 0);
     overview(&h, true);
@@ -5001,7 +5004,7 @@ fn atlas_thumbnails_match_the_snapped_ones() {
         .into_iter()
         .map(|atlas| {
             let name = if atlas { "ov-px-atlas" } else { "ov-px-snap" };
-            let (h, conn, _inbox, a, b) = atlas_desktop(name, |c| c.overview_atlas = atlas);
+            let (h, conn, _inbox, a, b) = atlas_desktop(name, |c| c.overview_atlas = Some(atlas));
             overview(&h, true);
             wait_for("the fade", || h.stat("overview_fading") == 0);
             h.settle();
@@ -5744,4 +5747,70 @@ fn focusing_another_window_or_overview_brings_the_bar_back() {
 
     drop((conn, shell));
     h.quit();
+}
+
+/// Write `server.conf` atomically, as an editor or nitro-settings does.
+fn write_conf(path: &std::path::Path, conf: &str) {
+    let tmp = path.with_extension("conf.tmp");
+    std::fs::write(&tmp, conf).expect("write temp");
+    std::fs::rename(&tmp, path).expect("rename into place");
+}
+
+#[test]
+#[allow(clippy::similar_names)] // `conn` and `conf`
+fn overview_animate_allocates_and_frees_the_atlas_live() {
+    let conf_dir =
+        std::env::temp_dir().join(format!("nitro-wm-{}-ov-conf-cfg", std::process::id()));
+    let _ = std::fs::remove_dir_all(&conf_dir);
+    std::fs::create_dir_all(&conf_dir).unwrap();
+    let conf = conf_dir.join("server.conf");
+    write_conf(&conf, "overview.animate = true\n");
+    let bytes = u64::from(OUT.0) * u64::from(OUT.1) * 4;
+    let path = conf.clone();
+    let (h, conn, _inbox, _a, _b) = atlas_desktop("ov-conf", move |c| c.config_path = Some(path));
+    assert_eq!(
+        h.stat("overview_atlas_bytes"),
+        bytes,
+        "the file turns it on"
+    );
+
+    // Off while an atlas overview is open: it is left, then freed.
+    overview(&h, true);
+    assert_eq!(h.stat("overview"), 1);
+    let reloads = h.stat("config_reloads");
+    write_conf(&conf, "overview.animate = false\n");
+    wait_for("the reload", || h.stat("config_reloads") > reloads);
+    assert_eq!(h.stat("overview_atlas_bytes"), 0);
+    assert_eq!(h.stat("overview_atlas"), 0);
+    assert_eq!(h.stat("overview"), 0, "the overview was left first");
+    assert_eq!(h.stat("overview_fading"), 0);
+
+    // On again: allocated at once, without a Super press.
+    let reloads = h.stat("config_reloads");
+    write_conf(&conf, "overview.animate = yes\n");
+    wait_for("the reload", || h.stat("config_reloads") > reloads);
+    assert_eq!(h.stat("overview_atlas_bytes"), bytes);
+    overview(&h, true);
+    assert_eq!(h.stat("overview"), 1);
+    overview(&h, false);
+
+    // Deleting the line is the default: snap.
+    let reloads = h.stat("config_reloads");
+    write_conf(&conf, "# nothing\n");
+    wait_for("the reload", || h.stat("config_reloads") > reloads);
+    assert_eq!(h.stat("overview_atlas_bytes"), 0);
+    drop(conn);
+    h.quit();
+
+    // The environment beats the file.
+    write_conf(&conf, "overview.animate = true\n");
+    let path = conf.clone();
+    let (h, conn, _inbox, _a, _b) = atlas_desktop("ov-conf-env", move |c| {
+        c.config_path = Some(path);
+        c.overview_atlas = Some(false);
+    });
+    assert_eq!(h.stat("overview_atlas_bytes"), 0);
+    drop(conn);
+    h.quit();
+    let _ = std::fs::remove_dir_all(&conf_dir);
 }

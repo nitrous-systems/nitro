@@ -84,6 +84,7 @@
 //! hey nitro-settings set keyboard/repeat_rate value 0     # key repeat off
 //! hey nitro-settings set mouse/pointer_speed value 0.3    # faster pointer
 //! hey nitro-settings do mouse/natural_scroll toggle       # invert scrolling
+//! hey nitro-settings do appearance/overview_animate toggle # animate the overview
 //! hey nitro-settings do apply click
 //! hey nitro-settings get status value                      # applied
 //! ```
@@ -513,6 +514,8 @@ pub mod names {
     pub const APPEARANCE: &str = "appearance";
     /// The dark-scheme checkbox: `theme.scheme`.
     pub const DARK: &str = "dark";
+    /// The animate-overview switch: `overview.animate`.
+    pub const OVERVIEW_ANIMATE: &str = "overview_animate";
     /// The line saying which scheme is in force and that it is live.
     pub const APPEARANCE_NOTE: &str = "appearance_note";
 
@@ -681,6 +684,9 @@ pub struct Settings {
     /// click really did reach the disk" that is not "read the file and
     /// hope".
     scheme_writes: u64,
+    /// How many times the animate-overview switch has written the file;
+    /// `scheme_writes`' twin.
+    overview_writes: u64,
     /// Every mode each connector offers, from the server's `modes`
     /// command, as `(connector, mode)` in the order it listed them.
     ///
@@ -720,6 +726,7 @@ impl Settings {
             reverts: 0,
             status: String::new(),
             scheme_writes: 0,
+            overview_writes: 0,
             modes: Vec::new(),
             seeded_repeat: Some(conf::REPEAT_DEFAULT),
             seeded_pointer: seed_pointer(&conf::PointerConf::default()),
@@ -823,6 +830,13 @@ impl Settings {
         self.scheme_writes
     }
 
+    /// How many times the animate-overview switch has written
+    /// `server.conf` (it saves outside Apply, as the scheme does).
+    #[must_use]
+    pub fn overview_writes(&self) -> u64 {
+        self.overview_writes
+    }
+
     /// What the status line last said.
     #[must_use]
     pub fn status(&self) -> &str {
@@ -862,6 +876,7 @@ struct Ids {
     mute: WidgetId,
     audio_status: WidgetId,
     dark: WidgetId,
+    overview_animate: WidgetId,
     status: WidgetId,
 }
 
@@ -1161,6 +1176,18 @@ pub fn build(ui: &mut Ui<Settings>) -> WidgetId {
     let dark_row = ui.build(card_row("Dark").subtitle("Applied at once; no Apply needed"));
     ui.attach(dark_row, dark).unwrap();
     ui.attach(appearance, dark_row).unwrap();
+    // The overview's animation, on the scheme's terms: saved at once and
+    // judged by pressing Super. Its subtitle names the cost, because the
+    // cost is the reason it is off by default (`docs/wm.md`).
+    let overview_animate = ui.build(switch("").name(names::OVERVIEW_ANIMATE).on_toggle(
+        move |s: &mut Settings, ui: &mut Ui<Settings>, on: bool| {
+            set_overview_animate(s, ui, status, on);
+        },
+    ));
+    let overview_row =
+        ui.build(card_row("Animate overview").subtitle("Fade and slide; ~8 MB per 1080p display"));
+    ui.attach(overview_row, overview_animate).unwrap();
+    ui.attach(appearance, overview_row).unwrap();
     let appearance_note = ui.build(footnote(NOTE_APPEARANCE).name(names::APPEARANCE_NOTE));
     let appearance_page = content_column()
         .child(group_caption("Colour scheme"))
@@ -1281,6 +1308,7 @@ pub fn build(ui: &mut Ui<Settings>) -> WidgetId {
         mute,
         audio_status,
         dark,
+        overview_animate,
         status,
     };
     if let Ok(mut b) = ui.widget_mut::<Button<Settings>>(apply_button) {
@@ -1440,7 +1468,7 @@ fn init(s: &mut Settings, ui: &mut Ui<Settings>, ids: Ids) {
     s.seeded_pointer = seed_pointer(&conf.pointer);
     fill_keyboard(ui, ids, &conf.keyboard);
     fill_pointer(ui, ids, &conf.pointer);
-    fill_appearance(ui, ids, &conf.theme);
+    fill_appearance(ui, ids, &conf);
 
     // Asking for the outputs *subscribes*, so this is the only request
     // the dialog ever makes about them: everything after it arrives
@@ -2000,7 +2028,10 @@ fn collect(s: &Settings, ui: &Ui<Settings>, ids: Ids) -> (Conf, Vec<String>) {
     // back what is on disk. Collecting it from the tree would mean Apply
     // deleting a user's hand-picked `theme.accent`, from a button that
     // promises to save.
-    conf.theme = load_conf(s).theme;
+    // `overview.animate` likewise: its switch saved on the spot.
+    let disk = load_conf(s);
+    conf.theme = disk.theme;
+    conf.overview_animate = disk.overview_animate;
     (conf, unreadable)
 }
 
@@ -2069,7 +2100,7 @@ fn revert(s: &mut Settings, ui: &mut Ui<Settings>, ids: Ids) {
     s.seeded_pointer = seed_pointer(&conf.pointer);
     fill_keyboard(ui, ids, &conf.keyboard);
     fill_pointer(ui, ids, &conf.pointer);
-    fill_appearance(ui, ids, &conf.theme);
+    fill_appearance(ui, ids, &conf);
     for r in s.rows.clone() {
         let saved = conf.output(&r.connector);
         let scale = saved
@@ -2191,8 +2222,8 @@ pub fn speed_text(v: f32) -> String {
 }
 
 /// Put the appearance section back to what the file says.
-fn fill_appearance(ui: &mut Ui<Settings>, ids: Ids, t: &conf::ThemeConf) {
-    let dark = t.scheme.unwrap_or_default() == Scheme::Dark;
+fn fill_appearance(ui: &mut Ui<Settings>, ids: Ids, conf: &conf::Conf) {
+    let dark = conf.theme.scheme.unwrap_or_default() == Scheme::Dark;
     if let Ok(mut c) = ui.widget_mut::<Switch<Settings>>(ids.dark) {
         // `set_checked` does not fire `on_change`, which is what makes
         // this safe to call from Revert: a setter that re-entered
@@ -2200,6 +2231,28 @@ fn fill_appearance(ui: &mut Ui<Settings>, ids: Ids, t: &conf::ThemeConf) {
         // and a Revert that writes is not a revert.
         c.set_checked(dark);
     }
+    let animate = conf
+        .overview_animate
+        .unwrap_or(conf::OVERVIEW_ANIMATE_DEFAULT);
+    if let Ok(mut c) = ui.widget_mut::<Switch<Settings>>(ids.overview_animate) {
+        c.set_checked(animate);
+    }
+}
+
+/// Write `overview.animate` to `server.conf`; the server's reload
+/// allocates or frees the thumbnail atlas at once. [`set_scheme`]'s
+/// shape and reasons: one key changed, the rest of the dialog untouched.
+fn set_overview_animate(s: &mut Settings, ui: &mut Ui<Settings>, status: WidgetId, on: bool) {
+    s.overview_writes += 1;
+    let text = match s.path.clone() {
+        None => "no config path: set $HOME or $NITRO_CONFIG".to_owned(),
+        Some(path) => match conf::set_overview_animate(&path, on) {
+            Ok(()) => format!("overview: {}", if on { "animated" } else { "snap" }),
+            Err(e) => format!("could not save the overview setting: {e}"),
+        },
+    };
+    text.clone_into(&mut s.status);
+    set_label(ui, status, &text);
 }
 
 /// Write the scheme to `server.conf` and let the server push it.

@@ -73,6 +73,7 @@ broken desktop and a text console.
 | `theme.<role>` | `#rrggbb` or `#rrggbbaa`, overriding one role on top of the scheme | the scheme's value |
 | `theme.icons` | the **XDG icon theme** application icons come from, e.g. `hicolor`, `Adwaita` | `hicolor` |
 | `remote.listen` | `<addr>:<port>` — bind a **TCP** listener for remote apps | absent: no TCP socket at all |
+| `overview.animate` | `true`/`false` (the `primary` spellings) — animate the overview; see below | `false` (snap) |
 
 `<connector>` is the name the kernel gives the connector — `HDMI-A-1`,
 `VGA-1`, `DP-1.2` — which is exactly what `nitro-shot --outputs` prints.
@@ -377,6 +378,31 @@ On **reload** (below), the key behaves as you would want:
 | nothing (key removed) | the listener closes; **clients already connected keep working**, because a connection lives on the socket it was accepted on |
 | something unusable | a `warn` and no listener — a typo must not cost you your desktop |
 
+### `overview.animate`
+
+```text
+overview.animate = true
+```
+
+Animates the overview (Super): the scrim fades in and each thumbnail
+slides from its window to its slot, out of a per-output **thumbnail
+atlas** (`docs/wm.md` §The thumbnail atlas). The atlas is one
+output-sized buffer per output, resident for as long as the key is on —
+**8.1 MB at 1920×1080, 14.4 MB at 2560×1440** (measured, #3915;
+`stats overview_atlas_bytes`). That is why the default is **off**: the
+overview then snaps, scaling the live windows in place, and allocates
+nothing.
+
+`NITRO_OVERVIEW_ATLAS=1` / `=0` overrides the file (the development
+channel, as below). An empty value is "say nothing", i.e. the default.
+
+On **reload** the atlas follows the key at once, not on the next Super
+press: turning it on allocates every output's atlas, turning it off frees
+them. An animated overview open at the time is left first (its
+thumbnails draw from the buffer being freed); a snap overview open while
+it is turned on stays snap, and the next entry animates. An allocation
+that fails leaves that output snapping, with a `warn`.
+
 ### `keyboard.options`, and the one option with a control
 
 ```text
@@ -619,6 +645,7 @@ leave nothing clickable with which to fix it — including this app.
 | colour scheme | — | `theme.scheme` | `light` |
 | one colour | — | `theme.<role>` | the scheme's value |
 | icon theme | `NITRO_ICON_PATH` (the search path, not the name) | `theme.icons` | `hicolor` |
+| overview animation | `NITRO_OVERVIEW_ATLAS=0\|1` | `overview.animate` | off (snap) |
 
 The environment wins because it is the **development** channel: a
 `NITRO_SCALE=HDMI-A-1=2 just fake` must not be silently overridden by
@@ -953,6 +980,12 @@ from disk rather than rendering it from the widgets. That is the one
 exception to "Apply rewrites the file wholesale" above, and it earns it,
 because the alternative is a save button that silently deletes a colour
 the user hand-picked.
+
+A second switch, **Animate overview**, writes `overview.animate` on the
+same terms: saved at once (you judge it by pressing Super), carried over
+from disk by Apply, set without writing by Revert. Its subtitle names the
+cost, ~8 MB per 1080p display, because that cost is why it is off by
+default. `hey nitro-settings do appearance/overview_animate toggle`.
 
 ### Audio
 

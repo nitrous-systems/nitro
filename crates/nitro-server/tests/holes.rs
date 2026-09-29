@@ -94,6 +94,7 @@ impl World {
             (&Cursor::new(), state),
             &mut items,
             &Palette::light(),
+            false,
         );
         data
     }

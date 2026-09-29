@@ -30,6 +30,8 @@
 //! theme.icons  = Adwaita
 //!
 //! remote.listen    = 127.0.0.1:7700
+//!
+//! overview.animate = true
 //! ```
 //!
 //! # Why `key = value` and not TOML
@@ -73,6 +75,7 @@
 //! | one colour | — | `theme.<role>` | the scheme's value |
 //! | icon theme | — | `theme.icons` | `hicolor` |
 //! | remote listener | — | `remote.listen` | off |
+//! | overview animation | `NITRO_OVERVIEW_ATLAS` | `overview.animate` | off (snap) |
 //!
 //! The environment wins because it is the *development* channel — a
 //! `NITRO_SCALE=HDMI-A-1=2 just fake` must not be silently overridden by
@@ -472,6 +475,34 @@ impl RemoteSettings {
     }
 }
 
+/// What the `overview.*` keys say.
+///
+/// One key: whether the overview animates (scrim fade, thumbnail slide)
+/// out of a per-output thumbnail atlas, or snaps. The atlas costs one
+/// output-sized buffer per output for as long as the setting is on, which
+/// is why it is off unless the file asks — see `docs/wm.md`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OverviewSettings {
+    /// `overview.animate`: `true` allocates the thumbnail atlas for every
+    /// output and animates the overview; `false` (the default) snaps and
+    /// allocates nothing. `NITRO_OVERVIEW_ATLAS` still wins over it.
+    pub animate: Option<bool>,
+}
+
+impl OverviewSettings {
+    /// Whether the file says anything about the overview.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.animate.is_none()
+    }
+
+    /// Whether the overview animates. Defaults to `false` (snap).
+    #[must_use]
+    pub fn animate(&self) -> bool {
+        self.animate.unwrap_or(false)
+    }
+}
+
 /// A parsed `server.conf`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Settings {
@@ -485,6 +516,8 @@ pub struct Settings {
     pub theme: ThemeSettings,
     /// The remote section.
     pub remote: RemoteSettings,
+    /// The overview section.
+    pub overview: OverviewSettings,
     /// Every line that was skipped, and why. The caller logs these; they
     /// are not errors, because a configuration file cannot be allowed to
     /// stop a running compositor.
@@ -524,6 +557,7 @@ impl Settings {
             && self.pointer.is_empty()
             && self.theme.is_empty()
             && self.remote.is_empty()
+            && self.overview.is_empty()
             && self.outputs.values().all(OutputSettings::is_empty)
     }
 
@@ -794,6 +828,15 @@ pub fn parse(text: &str) -> Settings {
                 Some(b) => settings.pointer.natural_scroll = Some(b),
                 None => settings.warnings.push(format!(
                     "line {number}: pointer.natural_scroll {value:?} is not a boolean"
+                )),
+            },
+            // Empty is "say nothing", the default, on the same terms as
+            // `output.<c>.mode =`.
+            "overview.animate" if value.is_empty() => settings.overview.animate = None,
+            "overview.animate" => match parse_bool(value) {
+                Some(b) => settings.overview.animate = Some(b),
+                None => settings.warnings.push(format!(
+                    "line {number}: overview.animate {value:?} is not a boolean"
                 )),
             },
             other => settings
@@ -1407,6 +1450,31 @@ mod tests {
             assert!(s.warnings[0].contains("pointer.speed"), "{:?}", s.warnings);
             assert_eq!(s.pointer.speed, None, "{value}");
         }
+    }
+
+    #[test]
+    fn overview_animate_parses_and_defaults_to_snap() {
+        let s = parse("");
+        assert!(s.overview.is_empty());
+        assert!(!s.overview.animate());
+        for (value, want) in [("true", true), ("yes", true), ("off", false), ("0", false)] {
+            let s = parse(&format!("overview.animate = {value}\n"));
+            assert!(s.warnings.is_empty(), "{value}: {:?}", s.warnings);
+            assert_eq!(s.overview.animate, Some(want), "{value}");
+            assert_eq!(s.overview.animate(), want, "{value}");
+            assert!(!s.is_empty());
+        }
+        let s = parse("overview.animate = true\noverview.animate =\n");
+        assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+        assert_eq!(s.overview.animate, None);
+        let s = parse("overview.animate = sometimes\n");
+        assert_eq!(s.warnings.len(), 1, "{:?}", s.warnings);
+        assert!(
+            s.warnings[0].contains("overview.animate"),
+            "{:?}",
+            s.warnings
+        );
+        assert!(s.overview.is_empty());
     }
 
     #[test]

@@ -425,7 +425,7 @@ pub struct OutputState {
     /// The overview's thumbnail atlas for this output (#3902): allocated
     /// by the server when the output appears (the scene owns the buffer,
     /// so it is not built here), re-allocated on a size change, freed with
-    /// the output. `None` when disabled (`NITRO_OVERVIEW_ATLAS=0`) or when
+    /// the output. `None` when `overview.animate` is off (the default) or when
     /// the allocation failed, and overview then snaps.
     pub atlas: Option<crate::overview::Atlas>,
 }
@@ -825,6 +825,10 @@ pub struct CursorState {
 ///
 /// Returns the microseconds spent, which is what the `paint_us` statistic
 /// records: it covers the rasterization only, not the copy or the commit.
+///
+/// `fast_scaled` is [`paint_items`]' flag: scaled opaque XR24 images go
+/// through [`Canvas::blit_xrgb_scaled`]. The server sets it only on the
+/// output of a **snap** overview, where every scaled item is a thumbnail.
 #[allow(clippy::too_many_arguments)] // One paint call's inputs, not a structure: bundling them would be a struct built per frame to satisfy a lint.
 pub fn paint_region(
     canvas: &mut Canvas<'_>,
@@ -836,6 +840,7 @@ pub fn paint_region(
     cursor: (&Cursor, CursorState),
     items: &mut Vec<PaintItem>,
     palette: &Palette,
+    fast_scaled: bool,
 ) -> u64 {
     let start = std::time::Instant::now();
     for clip in region {
@@ -845,7 +850,17 @@ pub fn paint_region(
         }
         items.clear();
         scene.paint_list(output, &clip, items);
-        paint_clip(canvas, scene, text, icons, &clip, items, cursor, palette);
+        paint_clip(
+            canvas,
+            scene,
+            text,
+            icons,
+            &clip,
+            items,
+            cursor,
+            palette,
+            fast_scaled,
+        );
     }
     items.clear();
     duration_us(start.elapsed())
@@ -872,6 +887,7 @@ pub fn paint_region_shared(
     cursor: (&Cursor, CursorState),
     items: &mut Vec<PaintItem>,
     palette: &Palette,
+    fast_scaled: bool,
 ) -> u64 {
     let start = std::time::Instant::now();
     let area = region
@@ -916,7 +932,17 @@ pub fn paint_region_shared(
                 ..*item
             })
         }));
-        paint_clip(canvas, scene, text, icons, &clip, &local, cursor, palette);
+        paint_clip(
+            canvas,
+            scene,
+            text,
+            icons,
+            &clip,
+            &local,
+            cursor,
+            palette,
+            fast_scaled,
+        );
     }
     items.clear();
     duration_us(start.elapsed())
@@ -934,6 +960,7 @@ fn paint_clip(
     items: &[PaintItem],
     cursor: (&Cursor, CursorState),
     palette: &Palette,
+    fast_scaled: bool,
 ) {
     let (width, height) = (canvas.width(), canvas.height());
     let (cursor_image, cursor_state) = cursor;
@@ -953,6 +980,9 @@ fn paint_clip(
         paint_background(canvas, clip, width, height, palette);
     }
     for item in &items[first..] {
+        if fast_scaled && paint_xrgb_scaled(canvas, clip, item, scene) {
+            continue;
+        }
         paint_item(canvas, clip, item, scene, text, icons, palette);
     }
     if cursor_state.visible {
@@ -1047,8 +1077,9 @@ fn duration_us(d: Duration) -> u64 {
 /// onto its device rect rounded to whole pixels, rather than the general
 /// resampling blend (~12 ns/px) onto the exact one. They agree to ±1
 /// inside the rect; the rect's fractional edge pixels are the
-/// difference. The live output path never sets it, so no live pixel
-/// changes.
+/// difference. The live output path sets it only on the output of a
+/// snap overview (whose scaled items are all thumbnails), so no live
+/// pixel outside one changes.
 #[allow(clippy::too_many_arguments)] // One paint call's inputs, as `paint_region`.
 pub fn paint_items(
     canvas: &mut Canvas<'_>,
