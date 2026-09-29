@@ -1247,6 +1247,7 @@ fn a_hidden_launcher_is_silent_while_idle() {
 }
 
 #[test]
+#[allow(clippy::float_cmp)] // layout lands on whole pixels; exact is the claim
 fn the_overlay_hangs_top_centre_in_the_overview_s_search_band() {
     // Top-centre, `SEARCH_TOP` below the work area's top (the harness has
     // no bar, so the output's top), with the field panel exactly

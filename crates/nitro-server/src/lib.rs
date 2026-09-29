@@ -7925,6 +7925,7 @@ impl Server {
     }
 
     /// Apply a client's transaction. Returns whether the client survives.
+    #[allow(clippy::too_many_lines)] // One transaction, applied in order: the steps share the commit's state and ordering rules.
     fn commit(&mut self, token: u64, serial: u32) -> bool {
         // This is the answer a deferred flip was waiting for. Noted before
         // the transaction is applied rather than after: the client has

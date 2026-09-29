@@ -2,6 +2,7 @@
 //! shell socket, a fake `wpctl` shell script and a fake `session.sock`.
 
 use std::io::{BufRead as _, BufReader, Write as _};
+use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 
@@ -59,7 +60,6 @@ esac
     );
     let bin = dir.join("wpctl");
     std::fs::write(&bin, script).unwrap();
-    use std::os::unix::fs::PermissionsExt as _;
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 

@@ -66,6 +66,7 @@ impl WindowId {
 /// One of these per open window, in [`Ui::windows`] order; index 0 is
 /// always [`WindowId::MAIN`], created with the `Ui` and opened by
 /// [`Ui::open_window`].
+#[allow(clippy::struct_excessive_bools)] // Independent per-window flags, not a state machine.
 struct Window<S> {
     id: WindowId,
     root: Option<WidgetId>,

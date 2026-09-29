@@ -208,6 +208,7 @@ pub fn row_name(i: usize) -> String {
 }
 
 /// The launcher's state.
+#[allow(clippy::struct_excessive_bools)] // Independent UI flags, not a state machine.
 pub struct Launcher {
     /// Everything launchable, as the last scan found it.
     entries: Vec<Entry>,

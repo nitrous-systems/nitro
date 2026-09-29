@@ -1164,6 +1164,7 @@ fn a_minimized_entry_dims_its_label_and_leaves_its_icon_alone() {
 }
 
 #[test]
+#[allow(clippy::float_cmp)] // layout lands on whole pixels; exact is the claim
 fn one_bar_per_output_following_hotplug() {
     // The headline of #3844: a second output gets a second panel — on one
     // connection, from one `Ui` — listing the same windows and showing the

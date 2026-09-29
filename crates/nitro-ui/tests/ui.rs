@@ -1764,6 +1764,7 @@ fn a_child_moved_past_the_window_paints_nothing_on_the_desktop() {
 }
 
 #[test]
+#[allow(clippy::float_cmp)] // layout lands on whole pixels; exact is the claim
 fn a_surface_window_is_created_anchored_and_reserved_in_one_commit() {
     // `add_surface_window` is what a bar opens its second panel with, so
     // it has to do what `open_window` does for the first: the layer on

@@ -412,6 +412,7 @@ fn closing_the_window_under_a_still_pointer_enters_the_one_below() {
 }
 
 #[test]
+#[allow(clippy::many_single_char_names)] // h/a/b/x/y: harness, the two windows, and the point between them
 fn hiding_the_window_under_a_still_pointer_enters_the_one_below() {
     let mut h = Harness::start("hiding", "");
     let mut below = h.client("below");

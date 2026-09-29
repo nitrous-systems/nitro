@@ -831,6 +831,7 @@ fn a_click_focuses_and_raises_over_another_window() {
 /// coordinates, even outside its content, and the release — until the
 /// button is up, whatever is under the pointer meanwhile. Only then is
 /// focus re-derived, with the leave/enter that says where it ended up.
+#[allow(clippy::too_many_lines)] // one scripted press/drag/release sequence, read top to bottom
 #[test]
 fn a_held_button_keeps_the_pointer_on_the_pressed_window() {
     let (w, h) = (320, 200);

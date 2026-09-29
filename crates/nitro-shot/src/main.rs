@@ -66,7 +66,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--input" => cmd = Some(Mode::Input(it.next().ok_or("--input needs ARGS")?)),
             "--samples" => match it.next().as_deref() {
                 Some(k @ ("i2p" | "flip" | "paint" | "damage")) => {
-                    cmd = Some(Mode::Samples(k.to_owned()))
+                    cmd = Some(Mode::Samples(k.to_owned()));
                 }
                 _ => return Err("--samples needs i2p, flip, paint or damage".to_owned()),
             },

@@ -846,11 +846,6 @@ fn install(ui: &mut Ui<Bar>, ids: Ids) {
         match ev {
             ShellEvent::Window(info) => upsert(s, ui, info),
             ShellEvent::WindowGone(w) => remove(s, ui, *w),
-            // The window snapshot's end needs no special case: every
-            // window in it arrived as an ordinary `Window` and was
-            // upserted. Keying on it would be a second code path that has
-            // to agree with the first.
-            ShellEvent::WindowListEnd => {}
             // The output snapshot's end *is* the moment: a hotplug re-sends
             // the whole list, and the panels are reconciled against the
             // complete list rather than against each output as it arrives.
@@ -872,7 +867,12 @@ fn install(ui: &mut Ui<Bar>, ids: Ids) {
                     .collect();
                 close_panels(s, ui, &gone);
             }
-            ShellEvent::HotKey { .. } | ShellEvent::Overview { .. } => {}
+            // The window snapshot's end needs no special case: every
+            // window in it arrived as an ordinary `Window` and was
+            // upserted. Keying on it would be a second code path that has
+            // to agree with the first.
+            ShellEvent::WindowListEnd | ShellEvent::HotKey { .. } | ShellEvent::Overview { .. } => {
+            }
         }
     });
 

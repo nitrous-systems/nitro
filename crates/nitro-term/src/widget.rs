@@ -683,24 +683,21 @@ impl<S: 'static> Widget<S> for TermGrid {
             Event::Scroll { dy, source, .. } => {
                 // Positive is down, as on the wire: towards the live
                 // screen. Negative goes back into the history.
-                let lines = match nitro_ui::event::notches(*dy, *source) {
-                    // Three rows a notch, as every terminal does; a
-                    // hi-res wheel's fraction of a notch still moves one.
-                    Some(n) => {
-                        self.scroll_px = 0.0;
-                        let l = (n.abs() * 3.0).round().max(1.0);
-                        l.copysign(*dy)
-                    }
+                // Three rows a notch, as every terminal does; a hi-res
+                // wheel's fraction of a notch still moves one.
+                let lines = if let Some(n) = nitro_ui::event::notches(*dy, *source) {
+                    self.scroll_px = 0.0;
+                    let l = (n.abs() * 3.0).round().max(1.0);
+                    l.copysign(*dy)
+                } else {
                     // A touchpad reports pixels: move whole rows and
                     // keep the remainder, so a slow swipe is not rounded
                     // up to a row per event.
-                    None => {
-                        let row = self.cell.h.max(1.0);
-                        self.scroll_px += dy;
-                        let l = (self.scroll_px / row).trunc();
-                        self.scroll_px -= l * row;
-                        l
-                    }
+                    let row = self.cell.h.max(1.0);
+                    self.scroll_px += dy;
+                    let l = (self.scroll_px / row).trunc();
+                    self.scroll_px -= l * row;
+                    l
                 };
                 if lines == 0.0 {
                     return Handled::Yes;
