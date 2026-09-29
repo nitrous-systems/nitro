@@ -18,11 +18,9 @@ The backend lives in the Chromium tree, not in this repo: `ui/ozone/platform/nit
   - `BufferReleased`/`Presented` to a buffer-id registry that posts back to the owning canvas's sequence.
 
   All wire sends happen on the UI thread. `NitroCanvas`, on the viz thread, posts its `CreateBuffer`/`SetImage`/`BufferDamage`/`Commit` work there.
-- **`--in-process-gpu` is required.** The spec wanted the GPU process to open its own connection, but that cannot work, because nitro scopes node, buffer and window ids per client connection (`clients.rs`; `wire.md:207`). A second connection could create buffers, but it could never `SetImage` them onto the browser's window. The human chose option A (ask#419).
+- **`--in-process-gpu` is required (today).** nitro scopes node, buffer and window ids per client connection (`clients.rs`; `wire.md` § Ids and transactions), so a GPU process's own connection could create buffers but never put them on the browser's window. The human chose option A (ask#419) for the first backend.
   - If the GPU process is out of process, `InitializeForGPU` logs an error and `CreateCanvasForWidget` returns nullptr, so it fails clearly.
-  - Follow-ups if out-of-process GPU is ever wanted:
-    - **B:** a nitro "embed/share buffer across clients" op, e.g. a token that a second connection can attach to.
-    - **C:** a Mojo host/gpu split like Wayland's, where the GPU side sends shm fds to the browser.
+  - **Out-of-process GPU: option B (#3904, nitro side done; Chromium side #3905).** See [Out-of-process GPU: B vs C](#out-of-process-gpu-b-vs-c-3904) below and `wire.md` § Surface sharing.
 - **Canvas:**
   - 3 shm buffers (`UnsafeSharedMemoryRegion`), with Skia rastering straight into the mapping via `SkSurfaces::WrapPixels`.
   - Per-buffer `SkRegion` dirty tracking, with stale damage copied forward from the last attached buffer (the Wayland scheme).
@@ -73,7 +71,7 @@ All of this was verified on a fake-backend nitro server (1280x720@60), driven by
 
 ## What doesn't / is not verified
 
-- **No out-of-process GPU** (see above).
+- **No out-of-process GPU** yet on the Chromium side (#3905); nitro supports it since #3904 (see above).
 - **HiDPI:** only scale 1 was exercised. The model is nitro logical = DIP, buffers = physical px, and scale comes from `OutputInfo`.
 - **Popup types:** `kPopup`/`kBubble` windows are nitro popups too; there is no subsurface equivalent. They are placed by the server, and only `kMenu` grabs.
 - **Drag and drop:** not wired. `platform_shows_drag_image=false`, and DnD start is a no-op.
@@ -109,13 +107,30 @@ Fake backend, 60 Hz. The fake flip takes about 21 ms, which is the throughput ce
 
 ## nitro-side gaps the audit missed
 
-1. **No cross-client buffer or node sharing.** Ids are per-connection, so a GPU process cannot present into a browser window. This forces `--in-process-gpu`. A nitro embed/share op would unblock Chromium's normal process model.
+1. **No cross-client buffer or node sharing.** Ids are per-connection, so a GPU process could not present into a browser window, which forced `--in-process-gpu`. **Fixed by #3904**: `ExportSurface`/`ImportSurface` (caps `SHARE`, `wire.md` § Surface sharing) let a second connection of the same uid present into a Surface node of the browser's window.
 2. **No premultiplied ARGB format.** `AR24` is straight alpha, while Skia (and most toolkits) produce premultiplied pixels. The workaround costs a CPU unpremultiply per translucent frame, and copying unpremultiplied pixels forward between buffers is a subtle blending hazard. Suggest adding a premultiplied fourcc or a per-buffer flag.
 3. **`BufferDamage` was ignored on buffer swap.** `SetImage` with a new buffer marked the whole node dirty, so every frame repainted the full image (735k px per frame measured, even for a caret blink). **Fixed by #3833**: `BufferDamage` is honoured when a same-size buffer is swapped in (see the caret-blink idle number under Test box).
 4. **No input-injection command on the control socket.** `FakeInput` was test-only, so this work needed a custom harness. **Fixed by #3834**: the control socket has `input` (`nitro-shot --input "wheel 0 15 count=3"`) and `samples`.
 5. **`PointerAbsolute` is normalised 0..1, not pixels.** This isn't a bug, but it is undocumented at the injection level and cost a debugging cycle.
 6. **WM ops are gated on the v1 `Welcome` WM bit, not `ClientCaps`.** This is easy to miss: sending `SetWindowState` without it is a protocol error. Worth a line in `wire.md` next to `ClientCaps`.
 7. **No way to restore a minimized window from the client side,** and nothing in the harness to do it. Fine for a compositor with a taskbar, but worth checking that the shell path works for foreign clients.
+
+## Out-of-process GPU: B vs C (#3904)
+
+Two ways to let Chromium's GPU process draw into a window that the browser process's connection owns:
+
+- **C: a browser-side relay over Mojo, no nitro change.** This is Wayland's shape: `WaylandBufferManagerHost` in the browser and `WaylandBufferManagerGpu` in the GPU process, a mojom between them, a buffer registry on the host side and a proxy on the GPU side.
+  - Porting it is several thousand lines of Chromium code.
+  - Every frame takes an extra hop, GPU → browser UI thread → nitro. Each fd is passed twice, and the busy browser UI thread stays on the present path. Taking the UI thread off the present path is half the point of an out-of-process GPU.
+  - `Presented`/`BufferReleased` would also have to be relayed back.
+- **B: token attach in nitro.** The browser exports a Surface node of its window and gets an unguessable 16-byte token (`ExportSurface`). It hands the token to the GPU process in a small per-widget message. The GPU process opens its **own** nitro connection before the sandbox engages, as X11 Ozone's GPU process does with its own display connection, and redeems the token (`ImportSurface`). It then presents with `PresentSurface` on its own buffers and gets `Presented`/`BufferReleased` directly.
+  - About 600–900 lines in nitro, most of it tests, and very little on the Chromium side.
+  - Its costs are a bearer-token security model (same uid, local links only) and a larger protocol.
+  - It also serves other split-process producers later, such as a decoder process presenting into a player window.
+
+C is not cheaper, so **B**. The browser keeps owning geometry, visibility, input and `Frame`/`Configure`. The GPU process only feeds the Surface's vblank latch (#3897): newest frame wins, whoever sent it. The exact rules (lifetime, revocation, interleaving, event routing) are in `wire.md` § Surface sharing.
+
+One limit applies to both options: an out-of-process GPU does not reduce CPU on a 2-core box (see the next levers above). It is about Chromium's normal process model and sandboxing.
 
 ## Other gotchas
 
