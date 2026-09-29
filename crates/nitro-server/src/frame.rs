@@ -112,7 +112,7 @@ use std::time::Duration;
 use nitro_core::{Color, Damage, IRect, Palette, Rect, Region};
 use nitro_kms::{BufferMut, Image, OutputId as KmsOutputId};
 use nitro_raster::{
-    Canvas, Image as RasterImage, Nv12, Packed422, Packed422Order, PixelFormat, YuvEncoding,
+    Canvas, Image as RasterImage, Nv12, Overlay, Packed422, Packed422Order, PixelFormat, YuvEncoding,
     YuvMatrix, YuvRange,
 };
 use nitro_scene::{
@@ -123,7 +123,7 @@ use nitro_wire::types::format;
 
 use crate::cursor::Cursor;
 use crate::icons::IconEngine;
-use crate::render::paint_background;
+use crate::render::{paint_background, paint_background_overlaid};
 use crate::text::TextEngine;
 
 /// How long before the next vblank a client should have committed, so the
@@ -842,6 +842,22 @@ pub fn paint_region(
     palette: &Palette,
     fast_scaled: bool,
 ) -> u64 {
+    if fast_scaled {
+        // A snap overview's thumbnails are exact covers: split the damage
+        // along them so nothing under them is painted (#3929).
+        return paint_region_shared(
+            canvas,
+            scene,
+            text,
+            icons,
+            output,
+            region,
+            cursor,
+            items,
+            palette,
+            fast_scaled,
+        );
+    }
     let start = std::time::Instant::now();
     for clip in region {
         let clip = clip.intersect(&canvas.bounds());
@@ -901,9 +917,16 @@ pub fn paint_region_shared(
     // rect along them lets `paint_clip`'s occlusion test skip whatever lies
     // under a translucent-format window's opaque interior (the wallpaper,
     // the background) exactly as it does for an XR24 one.
+    // In `fast_scaled` mode the thumbnails' stored rects are covers too.
     let covers: Vec<IRect> = items
         .iter()
-        .flat_map(|item| opaque_region_device(scene, item))
+        .flat_map(|item| {
+            let mut c = opaque_region_device(scene, item);
+            if fast_scaled {
+                c.extend(fast_scaled_covers(scene, item));
+            }
+            c
+        })
         .collect();
     let covers = Region::from_rects(&covers);
     let mut clips: Vec<IRect> = Vec::with_capacity(region.len());
@@ -968,18 +991,30 @@ fn paint_clip(
     // clip is invisible — including the background. This is the scene's
     // occlusion promise, and it is deliberately conservative there, so
     // trusting it here cannot produce a wrong pixel.
-    let first = items
+    let covered = items
         .iter()
-        .rposition(|item| covers_clip(scene, item, clip))
-        .unwrap_or(0);
-    if first == 0
-        && !items
-            .first()
-            .is_some_and(|item| covers_clip(scene, item, clip))
-    {
-        paint_background(canvas, clip, width, height, palette);
-    }
-    for item in &items[first..] {
+        .rposition(|item| covers_clip(scene, item, clip, fast_scaled));
+    // A full-clip translucent solid rect right above the base (the
+    // overview's scrim) is folded into the base's store: one pass instead
+    // of a store and a blend, byte for byte the same pixels (#3929).
+    let above = covered.map_or(0, |i| i + 1);
+    let overlay = items.get(above).and_then(|item| clip_overlay(item, clip));
+    let fused = overlay.is_some_and(|overlay| match covered {
+        None => {
+            paint_background_overlaid(canvas, clip, width, height, palette, Some(overlay));
+            true
+        }
+        Some(i) => fill_overlaid(canvas, clip, &items[i], overlay),
+    });
+    let first = if fused {
+        above + 1
+    } else {
+        if covered.is_none() {
+            paint_background(canvas, clip, width, height, palette);
+        }
+        covered.unwrap_or(0)
+    };
+    for item in items.get(first..).unwrap_or(&[]) {
         if fast_scaled && paint_xrgb_scaled(canvas, clip, item, scene) {
             continue;
         }
@@ -1012,13 +1047,77 @@ pub fn copy_region(shadow: &Shadow, buf: &mut BufferMut<'_>, region: &[IRect]) -
 
 /// Whether `item` alone hides everything under `clip`: the scene's
 /// [`PaintItem::opaque_cover`], or one rect of the image's declared opaque
-/// region (`SetOpaqueRegion`, #3877) containing the whole clip.
-fn covers_clip(scene: &Scene, item: &PaintItem, clip: &IRect) -> bool {
+/// region (`SetOpaqueRegion`, #3877) containing the whole clip. With
+/// `fast_scaled`, also a rect [`paint_xrgb_scaled`] stores in full
+/// ([`fast_scaled_covers`]).
+fn covers_clip(scene: &Scene, item: &PaintItem, clip: &IRect, fast_scaled: bool) -> bool {
     item.opaque_cover()
         .is_some_and(|cover| cover.contains_rect(clip))
         || opaque_region_device(scene, item)
             .iter()
             .any(|r| r.contains_rect(clip))
+        || (fast_scaled
+            && fast_scaled_covers(scene, item)
+                .iter()
+                .any(|r| r.contains_rect(clip)))
+}
+
+/// The overlay `item` lays over all of `clip`, if it is one: a solid rect
+/// with square corners and no visible border, axis-aligned, whose exact
+/// device rect and clip contain the whole of `clip`, so that
+/// [`Canvas::fill_rect`] would give every pixel of `clip` the same blend.
+/// The overview's scrim is the case this exists for.
+fn clip_overlay(item: &PaintItem, clip: &IRect) -> Option<Overlay> {
+    let PaintKind::Rect {
+        size,
+        fill: SceneFill::Solid(c),
+        corner_radius,
+        border,
+    } = item.kind
+    else {
+        return None;
+    };
+    if corner_radius > 0.0
+        || border.is_some_and(|b| b.is_visible())
+        || !item.transform.is_axis_aligned()
+        || !item.clip.contains_rect(clip)
+    {
+        return None;
+    }
+    let exact = item
+        .transform
+        .apply_rect(&Rect::new(0.0, 0.0, size.0, size.1));
+    #[allow(clippy::cast_precision_loss)] // device coordinates, far below 2^24
+    let inside = exact.x <= clip.x as f32
+        && exact.y <= clip.y as f32
+        && exact.right() >= clip.right() as f32
+        && exact.bottom() >= clip.bottom() as f32;
+    inside.then(|| Overlay::new(c, item.opacity))
+}
+
+/// Paint the covering `item` over all of `clip` with `overlay` folded in,
+/// exactly as `paint_item` followed by the overlay's own fill would.
+/// Only a square-cornered, borderless rect with an opaque fill at opacity
+/// 1 qualifies; `false`, having painted nothing, otherwise (an image
+/// wallpaper, say: that is painted and then blended as before).
+fn fill_overlaid(canvas: &mut Canvas<'_>, clip: &IRect, item: &PaintItem, overlay: Overlay) -> bool {
+    let PaintKind::Rect {
+        fill,
+        corner_radius,
+        border,
+        ..
+    } = item.kind
+    else {
+        return false;
+    };
+    if corner_radius > 0.0
+        || border.is_some_and(|b| b.is_visible())
+        || item.opacity < 1.0
+        || !item.clip.contains_rect(clip)
+    {
+        return false;
+    }
+    raster_fill(fill, item).is_some_and(|f| canvas.fill_opaque_overlaid(clip, &f, overlay))
 }
 
 /// An image item's declared opaque region mapped to device px and clipped
@@ -1116,32 +1215,38 @@ pub fn paint_items(
     }
 }
 
-/// [`paint_items`]' fast path: an opaque XR24 image at opacity 1, drawn
-/// axis-aligned and not 1:1, stored with [`Canvas::blit_xrgb_scaled`]
-/// onto its device rect rounded to whole pixels. Returns `false`, having
-/// painted nothing, when it does not apply.
-fn paint_xrgb_scaled(
-    canvas: &mut Canvas<'_>,
-    clip: &IRect,
-    item: &PaintItem,
-    scene: &Scene,
-) -> bool {
+/// What [`paint_xrgb_scaled`] needs of an item it applies to.
+struct ScaledTarget<'a> {
+    /// The device rect, rounded to whole pixels.
+    dst: IRect,
+    /// The source crop.
+    src: IRect,
+    /// The pixels, read as `Xrgb8888` (alpha ignored).
+    image: RasterImage<'a>,
+    /// The straight-alpha format, for an AR24 image: its declared opaque
+    /// region is what may be stored, mapped into `dst` (device px,
+    /// already inset and rounded inward). `None` for XR24: all of it.
+    opaque: Option<Vec<IRect>>,
+    /// The exact (fractional) device rect, for the general blit.
+    exact: Rect,
+}
+
+/// Whether [`paint_xrgb_scaled`] applies to `item`, and with what: an
+/// image at opacity 1, drawn axis-aligned and not 1:1, that is XR24 or an
+/// AR24 whose client declared an opaque region (`SetOpaqueRegion`) that
+/// maps onto at least one whole device pixel.
+fn scaled_target<'a>(scene: &'a Scene, item: &PaintItem) -> Option<ScaledTarget<'a>> {
     let PaintKind::Image {
         size, buffer, src, ..
     } = item.kind
     else {
-        return false;
+        return None;
     };
     if item.opacity < 1.0 || !item.transform.is_axis_aligned() || item.shift_exact() {
-        return false;
+        return None;
     }
-    let Ok(buffer) = scene.buffer(buffer) else {
-        return false;
-    };
+    let buffer = scene.buffer(buffer).ok()?;
     let desc = buffer.desc();
-    if desc.format != format::XR24 {
-        return false;
-    }
     let exact = item
         .transform
         .apply_rect(&Rect::new(0.0, 0.0, size.0, size.1));
@@ -1152,10 +1257,6 @@ fn paint_xrgb_scaled(
         exact.right().round() as i32,
         exact.bottom().round() as i32,
     );
-    let clip = clip.intersect(&item.clip);
-    if dst.is_empty() || clip.is_empty() {
-        return true;
-    }
     let image = RasterImage {
         data: buffer.data(),
         width: desc.w,
@@ -1163,7 +1264,135 @@ fn paint_xrgb_scaled(
         stride: desc.stride,
         format: PixelFormat::Xrgb8888,
     };
-    canvas.blit_xrgb_scaled(&clip, &dst, &image, &src);
+    let opaque = match desc.format {
+        format::XR24 => None,
+        format::AR24 => {
+            let node = scene.node(item.node).ok()?;
+            let mapped: Vec<IRect> = node
+                .opaque_region()
+                .iter()
+                .filter_map(|r| opaque_texels_to_device(r, &src, &dst))
+                .collect();
+            if mapped.is_empty() {
+                return None;
+            }
+            Some(mapped)
+        }
+        _ => return None,
+    };
+    Some(ScaledTarget {
+        dst,
+        src,
+        image,
+        opaque,
+        exact,
+    })
+}
+
+/// The device pixels of `dst` whose bilinear taps (from `src` stretched
+/// onto `dst`) all land inside the opaque source rect `r`.
+///
+/// The rect is inset by one texel on every side that is not the crop's
+/// edge — a tap reaches one texel past the sample point, and at the crop's
+/// edge the sampler clamps instead — then mapped and rounded **inward**. A
+/// pixel `d` inside then samples at `s ≥ x0 − ½` and `s < x1 − ½` (in the
+/// inset rect `[x0, x1)`), so both its taps `⌊s⌋` and `⌊s⌋ + 1` are
+/// texels of `r`.
+fn opaque_texels_to_device(r: &IRect, src: &IRect, dst: &IRect) -> Option<IRect> {
+    let r = r.intersect(src);
+    if r.is_empty() || src.is_empty() || dst.is_empty() {
+        return None;
+    }
+    let inset = |lo: i32, hi: i32, first: i32, end: i32| {
+        (
+            if lo > first { lo + 1 } else { lo },
+            if hi < end { hi - 1 } else { hi },
+        )
+    };
+    let (x0, x1) = inset(r.x, r.right(), src.x, src.right());
+    let (y0, y1) = inset(r.y, r.bottom(), src.y, src.bottom());
+    if x0 >= x1 || y0 >= y1 {
+        return None;
+    }
+    // Device coordinate of source edge `v`: `d0 + (v − s0) · dlen / slen`,
+    // rounded up for a leading edge and down for a trailing one, in exact
+    // integer arithmetic.
+    let map = |v: i32, s0: i32, slen: i32, d0: i32, dlen: i32, up: bool| -> i32 {
+        let num = i64::from(v - s0) * i64::from(dlen);
+        let den = i64::from(slen);
+        let q = if up {
+            num.div_euclid(den) + i64::from(num.rem_euclid(den) != 0)
+        } else {
+            num.div_euclid(den)
+        };
+        d0 + i32::try_from(q).unwrap_or(i32::MAX - d0)
+    };
+    let out = IRect::from_edges(
+        map(x0, src.x, src.w, dst.x, dst.w, true),
+        map(y0, src.y, src.h, dst.y, dst.h, true),
+        map(x1, src.x, src.w, dst.x, dst.w, false),
+        map(y1, src.y, src.h, dst.y, dst.h, false),
+    )
+    .intersect(dst);
+    (!out.is_empty()).then_some(out)
+}
+
+/// The device rects [`paint_xrgb_scaled`] **stores** for `item`, clipped
+/// to the item's clip: exact covers, so in `fast_scaled` mode nothing
+/// under them needs painting. Empty when the fast path does not apply.
+fn fast_scaled_covers(scene: &Scene, item: &PaintItem) -> Vec<IRect> {
+    let Some(t) = scaled_target(scene, item) else {
+        return Vec::new();
+    };
+    let rects = t.opaque.unwrap_or_else(|| vec![t.dst]);
+    rects
+        .iter()
+        .map(|r| r.intersect(&item.clip))
+        .filter(|r| !r.is_empty())
+        .collect()
+}
+
+/// [`paint_items`]' fast path: an opaque image at opacity 1, drawn
+/// axis-aligned and not 1:1, stored with [`Canvas::blit_xrgb_scaled`]
+/// onto its device rect rounded to whole pixels. An XR24 image goes that
+/// way whole; an AR24 one only inside its declared opaque region
+/// ([`scaled_target`]), and the rest of it through the general blend onto
+/// the exact rect, as before. A client that lies about its region gets
+/// opaque pixels there, as with the 1:1 `blit_with_opaque_region`.
+/// Returns `false`, having painted nothing, when it does not apply.
+fn paint_xrgb_scaled(
+    canvas: &mut Canvas<'_>,
+    clip: &IRect,
+    item: &PaintItem,
+    scene: &Scene,
+) -> bool {
+    let Some(t) = scaled_target(scene, item) else {
+        return false;
+    };
+    let clip = clip.intersect(&item.clip);
+    if t.dst.is_empty() || clip.is_empty() {
+        return true;
+    }
+    let Some(opaque) = t.opaque else {
+        canvas.blit_xrgb_scaled(&clip, &t.dst, &t.image, &t.src);
+        return true;
+    };
+    let stored = Region::from_rects(&opaque).intersect(&Region::rect(clip));
+    let rest = Region::rect(clip).subtract(&stored);
+    let straight = RasterImage {
+        format: PixelFormat::Argb8888,
+        ..t.image
+    };
+    if stored.overflowed() || rest.overflowed() {
+        canvas.blit(&clip, &t.exact, &straight, &t.src, 1.0);
+        return true;
+    }
+    for r in stored.rects() {
+        canvas.blit_xrgb_scaled(&r, &t.dst, &t.image, &t.src);
+    }
+    for r in rest.rects() {
+        canvas.blit(&r, &t.exact, &straight, &t.src, 1.0);
+    }
     true
 }
 
@@ -2428,5 +2657,240 @@ mod tests {
         let item = image_item(nitro_core::Transform::translate(7.0, 5.0), 1.0);
         assert!(!paint_both(&px, &item, IRect::new(0, 0, 64, 48), &[]).2);
         assert!(!paint_both(&px, &item, IRect::new(0, 40, 64, 8), &[INNER]).2);
+    }
+}
+
+/// #3929: the fused scrim and the snap overview's thumbnail covers change
+/// no pixel.
+#[cfg(test)]
+mod overlay_tests {
+    use super::*;
+    use nitro_core::{Point, Size, Transform};
+    use nitro_scene::{BufferDesc, ClientId, DamageSink, ImageRef, Layer, NodeKind};
+
+    const OUT: OutputId = OutputId(0);
+    const C: ClientId = ClientId(1);
+    const W: u32 = 160;
+    const H: u32 = 100;
+
+    #[derive(Clone, Copy)]
+    enum Base {
+        None,
+        Solid,
+        Gradient,
+        Image,
+    }
+
+    fn pixels(w: u32, h: u32, alpha: impl Fn(u32, u32) -> u8) -> Vec<u8> {
+        let mut px = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let o = ((y * w + x) * 4) as usize;
+                px[o..o + 4].copy_from_slice(&[
+                    (x * 13) as u8,
+                    (y * 7 + x) as u8,
+                    (x * y) as u8,
+                    alpha(x, y),
+                ]);
+            }
+        }
+        px
+    }
+
+    /// A desktop: `base` as the wallpaper, a scrim at `scrim` opacity, and
+    /// two scaled thumbnails — XR24, and AR24 with an opaque region (an
+    /// alpha ring around an opaque interior).
+    fn world(base: Base, scrim: f32) -> Scene {
+        let mut s = Scene::new();
+        s.add_output(OUT, IRect::new(0, 0, W as i32, H as i32), 1.0);
+        let size = Size::new(W as f32, H as f32);
+        let wall = s.create_window(C, "wall", size, Layer::Background);
+        s.place_window(wall, Some(OUT), Point::ZERO).unwrap();
+        let root = s.window_info(wall).unwrap().root();
+        match base {
+            Base::None => {}
+            Base::Solid | Base::Gradient => {
+                let r = s.create_node(C, NodeKind::Rect, root, None).unwrap();
+                s.set_bounds(C, r, Rect::new(0.0, 0.0, size.w, size.h)).unwrap();
+                let fill = if let Base::Solid = base {
+                    SceneFill::Solid(Color::rgb(30, 60, 90))
+                } else {
+                    SceneFill::Linear {
+                        start: Point::new(0.0, 0.0),
+                        end: Point::new(0.0, size.h),
+                        c0: Color::rgb(10, 200, 30),
+                        c1: Color::rgb(250, 3, 99),
+                    }
+                };
+                s.set_fill(C, r, fill).unwrap();
+            }
+            Base::Image => {
+                let desc = BufferDesc::new(W, H, W * 4, format::XR24).with_opaque(true);
+                let b = s.create_buffer(C, desc, pixels(W, H, |_, _| 0)).unwrap();
+                let i = s.create_node(C, NodeKind::Image, root, None).unwrap();
+                s.set_bounds(C, i, Rect::new(0.0, 0.0, size.w, size.h)).unwrap();
+                s.set_image(C, i, Some(ImageRef::new(b, IRect::new(0, 0, W as i32, H as i32))))
+                    .unwrap();
+            }
+        }
+        let ov = s.create_window(C, "scrim", size, Layer::Normal);
+        s.place_window(ov, Some(OUT), Point::ZERO).unwrap();
+        let root = s.window_info(ov).unwrap().root();
+        let r = s.create_node(C, NodeKind::Rect, root, None).unwrap();
+        s.set_bounds(C, r, Rect::new(0.0, 0.0, size.w, size.h)).unwrap();
+        s.set_fill(C, r, SceneFill::Solid(Color::rgba(0, 0, 0, 0xA0))).unwrap();
+        s.set_opacity(C, r, scrim).unwrap();
+        for (i, (fmt, at, k)) in [
+            (format::XR24, (7.3, 9.0), 0.37),
+            (format::AR24, (70.0, 20.0), 0.6),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (bw, bh) = (90u32, 70u32);
+            let px = pixels(bw, bh, |x, y| {
+                if x.min(y).min(bw - 1 - x).min(bh - 1 - y) < 5 { (x * 40) as u8 } else { 255 }
+            });
+            let desc = BufferDesc::new(bw, bh, bw * 4, fmt).with_opaque(fmt == format::XR24);
+            let b = s.create_buffer(C, desc, px).unwrap();
+            let win = s.create_window(C, format!("t{i}"), size, Layer::Normal);
+            s.place_window(win, Some(OUT), Point::ZERO).unwrap();
+            let root = s.window_info(win).unwrap().root();
+            let g = s.create_node(C, NodeKind::Group, root, None).unwrap();
+            s.set_transform(C, g, Transform::translate(at.0, at.1).then(&Transform::scale(k, k)))
+                .unwrap();
+            let img = s.create_node(C, NodeKind::Image, g, None).unwrap();
+            s.set_bounds(C, img, Rect::new(0.0, 0.0, bw as f32, bh as f32)).unwrap();
+            s.set_image(C, img, Some(ImageRef::new(b, IRect::new(0, 0, bw as i32, bh as i32))))
+                .unwrap();
+            if fmt == format::AR24 {
+                s.set_opaque_region(C, img, &[IRect::new(5, 5, 80, 60)]).unwrap();
+            }
+        }
+        let mut d = Damage::new();
+        s.update(&mut DamageSink::new(&mut [(OUT, &mut d)]));
+        s
+    }
+
+    fn cursor() -> (Cursor, CursorState) {
+        let state = CursorState {
+            x: 0,
+            y: 0,
+            shape: crate::cursor::Shape::Arrow,
+            scale: 1,
+            visible: false,
+        };
+        (Cursor::new(), state)
+    }
+
+    fn painted(s: &Scene, region: &[IRect], fast: bool) -> Vec<u8> {
+        let mut data = vec![0x5Au8; (W * H * 4) as usize];
+        let mut canvas = Canvas::new(&mut data, W, H, W * 4);
+        let (cur, state) = cursor();
+        paint_region(
+            &mut canvas,
+            s,
+            &mut TextEngine::new(),
+            &mut IconEngine::new(),
+            OUT,
+            region,
+            (&cur, state),
+            &mut Vec::new(),
+            &Palette::default(),
+            fast,
+        );
+        data
+    }
+
+    /// Every layer painted in full, one after the other: no occlusion, no
+    /// fusion, no split.
+    fn reference(s: &Scene, region: &[IRect], fast: bool) -> Vec<u8> {
+        let mut data = vec![0x5Au8; (W * H * 4) as usize];
+        let mut canvas = Canvas::new(&mut data, W, H, W * 4);
+        let (mut text, mut icons) = (TextEngine::new(), IconEngine::new());
+        for clip in region {
+            let mut items = Vec::new();
+            s.paint_list(OUT, clip, &mut items);
+            paint_background(&mut canvas, clip, W, H, &Palette::default());
+            for item in &items {
+                if fast && paint_xrgb_scaled(&mut canvas, clip, item, s) {
+                    continue;
+                }
+                paint_item(&mut canvas, clip, item, s, &mut text, &mut icons, &Palette::default());
+            }
+        }
+        data
+    }
+
+    #[test]
+    fn fusing_the_scrim_and_skipping_covered_pixels_changes_nothing() {
+        let regions: [&[IRect]; 3] = [
+            &[IRect::new(0, 0, 160, 100)],
+            &[IRect::new(3, 2, 50, 41), IRect::new(60, 30, 99, 70)],
+            &[IRect::new(20, 20, 1, 1), IRect::new(0, 99, 160, 1)],
+        ];
+        for base in [Base::None, Base::Solid, Base::Gradient, Base::Image] {
+            for scrim in [1.0, 0.5, 0.0] {
+                let s = world(base, scrim);
+                for region in regions {
+                    for fast in [false, true] {
+                        assert!(
+                            painted(&s, region, fast) == reference(&s, region, fast),
+                            "base {} scrim {scrim} fast {fast} {region:?}",
+                            base as u8
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_fast_path_stores_an_opaque_region_and_blends_the_rest() {
+        let s = world(Base::Gradient, 1.0);
+        let full = [IRect::new(0, 0, 160, 100)];
+        let (fast, slow) = (painted(&s, &full, true), painted(&s, &full, false));
+        // The AR24 thumbnail: 90x70 at 0.6 from (70, 20): 54x42, whole px.
+        let mut items = Vec::new();
+        s.paint_list(OUT, &full[0], &mut items);
+        let ar24 = items
+            .iter()
+            .filter(|i| matches!(i.kind, PaintKind::Image { .. }))
+            .next_back()
+            .unwrap();
+        let covers = fast_scaled_covers(&s, ar24);
+        assert_eq!(covers.len(), 1, "the region maps to one device rect");
+        let inner = covers[0];
+        // Well inside the region, and the ring outside it, strictly.
+        assert!(inner.x > 70 && inner.y > 21 && inner.right() < 125 && inner.bottom() < 63);
+        let mut max = 0;
+        for y in 0..H as i32 {
+            for x in 0..W as i32 {
+                let o = ((y * W as i32 + x) * 4) as usize;
+                for c in 0..4 {
+                    let d = fast[o + c].abs_diff(slow[o + c]);
+                    if inner.contains(x, y) {
+                        max = max.max(d);
+                    } else if !(ar24.bounds.contains(x, y) || x < 45 && y < 40) {
+                        assert_eq!(d, 0, "({x},{y}) outside both thumbnails");
+                    }
+                }
+            }
+        }
+        assert!(max <= 2, "inside the opaque region: ±{max}");
+    }
+
+    #[test]
+    fn the_opaque_texels_map_inward() {
+        let src = IRect::new(0, 0, 100, 100);
+        let dst = IRect::new(10, 10, 50, 50);
+        // Whole crop: the edges clamp, no inset.
+        assert_eq!(opaque_texels_to_device(&src, &src, &dst), Some(dst));
+        // Inset one texel inside, then rounded inward at scale 1/2.
+        assert_eq!(
+            opaque_texels_to_device(&IRect::new(10, 10, 80, 80), &src, &dst),
+            Some(IRect::from_edges(16, 16, 54, 54))
+        );
+        assert_eq!(opaque_texels_to_device(&IRect::new(40, 40, 2, 2), &src, &dst), None);
     }
 }
