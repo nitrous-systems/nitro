@@ -21,6 +21,9 @@ use nitro_wire::types::{
 
 const OUT: (u32, u32) = (200, 150);
 const SIDE: u32 = 16;
+/// `SIDE` as the `i32` that `IRect` wants.
+const SIDE_I32: i32 = 16;
+const _: () = assert!(SIDE_I32 as i64 == SIDE as i64);
 
 fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -280,7 +283,7 @@ fn on_a_surface_node_the_region_skips_the_alpha_too() {
         id: surf,
         buffer: BufferId(1),
         serial: 2,
-        src: IRect::new(0, 0, SIDE as i32, SIDE as i32),
+        src: IRect::new(0, 0, SIDE_I32, SIDE_I32),
         matrix: ColorMatrix::Bt709,
         range: ColorRange::Full,
         damage: vec![],
