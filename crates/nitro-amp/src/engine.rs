@@ -439,6 +439,26 @@ impl Engine {
             }
         };
         if n == 0 {
+            // A player that died without a write failing — the whole
+            // track fitted in the pipe — has played none of it: fail
+            // over as a failed write would, rather than call it an end.
+            // `check` may wait (boundedly) for a young player to show
+            // whether it is dying; `Sink::check` says why.
+            if let Some(sink) = &mut self.sink
+                && let Err(e) = sink.check()
+            {
+                let failed = format!("{}: {e}", self.backend.name());
+                match self.sink.take().and_then(Sink::into_unheard) {
+                    Some(samples) => {
+                        if !self.hand_over(failed, samples, rate, true) {
+                            return;
+                        }
+                    }
+                    // Past a pipe's worth: some of it was heard. Say so,
+                    // and have the next track use the next player.
+                    None => self.sink = Some(self.next_backend(&failed, rate)),
+                }
+            }
             // The end. The output is kept: the next track (if the window
             // loads one straight away) queues behind what is still in
             // the pipe, which is as close to gapless as a pipe gets.
@@ -480,31 +500,58 @@ impl Engine {
         if let Some(sink) = &mut self.sink
             && let Err(e) = sink.write(chunk)
         {
-            let mut failed = format!("{}: {e}", self.backend.name());
-            let mut unheard = self.sink.take().and_then(Sink::into_unheard);
+            let failed = format!("{}: {e}", self.backend.name());
             // A player that died before it can have played anything
             // (no server, arguments it refuses) is replaced by the next
             // one, which gets everything the dead one was given.
-            loop {
-                let Some(samples) = unheard else {
-                    self.error = Some(failed);
-                    self.state = State::Stopped;
-                    return;
-                };
-                let mut sink = self.next_backend(&failed, rate);
-                match sink.write(&samples) {
-                    Ok(()) => {
-                        self.sink = Some(sink);
-                        break;
-                    }
-                    Err(e) => {
-                        failed = format!("{failed}; {}: {e}", self.backend.name());
-                        unheard = sink.into_unheard();
-                    }
-                }
+            let Some(samples) = self.sink.take().and_then(Sink::into_unheard) else {
+                self.error = Some(failed);
+                self.state = State::Stopped;
+                return;
+            };
+            if !self.hand_over(failed, samples, rate, false) {
+                return;
             }
         }
         self.written += (n / 2) as u64;
+    }
+
+    /// Replace a player that died having played nothing — its failure is
+    /// `failed` — with the next one that takes `samples`, everything the
+    /// dead one was given. With `verify`, a player must also still be
+    /// running once it has them ([`Sink::check`]): at the end of a
+    /// stream no later write would notice it die. `false`, with the
+    /// error set and the player stopped, if none can.
+    fn hand_over(
+        &mut self,
+        mut failed: String,
+        mut samples: Vec<f32>,
+        rate: u32,
+        verify: bool,
+    ) -> bool {
+        loop {
+            let mut sink = self.next_backend(&failed, rate);
+            let taken = sink
+                .write(&samples)
+                .and_then(|()| if verify { sink.check() } else { Ok(()) });
+            match taken {
+                Ok(()) => {
+                    self.sink = Some(sink);
+                    return true;
+                }
+                Err(e) => {
+                    failed = format!("{failed}; {}: {e}", self.backend.name());
+                    // Silence never fails, so this ends when the
+                    // fallbacks run out.
+                    let Some(again) = sink.into_unheard() else {
+                        self.error = Some(failed);
+                        self.state = State::Stopped;
+                        return false;
+                    };
+                    samples = again;
+                }
+            }
+        }
     }
 
     /// Give up on the current player, whose failure `failed` describes,

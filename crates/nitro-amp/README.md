@@ -125,6 +125,16 @@ clock and the visualiser subtract that, and pausing rewinds the decoder
 to the heard position, so the audio still in the pipe when the output is
 stopped is played again on resume rather than lost.
 
+**A player that dies is replaced, even on a short track.** An installed
+player that will not start (no sound server, an argument it refuses) is
+replaced by the next installed one, else silence, and the status line
+says why; what the dead one was given is written again. A track shorter
+than a pipe's worth (~0.2 s) fits in the pipe before the player has
+died, so no write fails: at the end of the stream the engine checks the
+player is still running, waiting up to half a second from its start for
+one that is still dying, and fails over the same way if it is not. A
+healthy player is still kept open from one track to the next.
+
 **A long playlist costs nothing per track change.** The list widget's
 model is the playlist's own entries, shared behind an `Rc` and formatted
 into a row only when that row is on screen, so next, previous and

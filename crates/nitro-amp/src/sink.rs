@@ -19,6 +19,12 @@
 //! moves on to the next installed one ([`Backend::detect_all`]) and
 //! writes the same samples again ([`Sink::into_unheard`]).
 //!
+//! A track shorter than a pipe's worth never gets that far: every write
+//! lands in the pipe before the player has died, and the stream ends
+//! with no write having failed. So at the end of a stream the engine
+//! asks [`Sink::check`] whether the player is still there, and fails
+//! over the same way if it is not.
+//!
 //! # The pipe is the clock
 //!
 //! Nothing here sleeps or counts time when a real player is attached: a
@@ -55,6 +61,12 @@ const STDERR_KEEP: usize = 1024;
 /// How long a failed write waits for the player to exit and its stderr
 /// to be read, so the error can say why.
 const EXPLAIN_WAIT: Duration = Duration::from_millis(500);
+
+/// How long a player has to die at start-up before [`Sink::check`]
+/// believes it alive. A player that will not start (no server, an
+/// argument it refuses) exits within this; one that is still running
+/// after it is taken to be playing.
+const STARTUP_WAIT: Duration = EXPLAIN_WAIT;
 
 /// Which output to use.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,6 +224,7 @@ impl Backend {
                 stderr,
                 given: 0,
                 head: Vec::new(),
+                started: Instant::now(),
             },
             bytes: Vec::new(),
         })
@@ -237,6 +250,8 @@ enum Out {
         /// pipe's worth: what to replay on another player if this one
         /// turns out never to have started.
         head: Vec<f32>,
+        /// When the player was started.
+        started: Instant,
     },
     Silent {
         /// When the first frame was "played", or `None` for unpaced.
@@ -287,6 +302,7 @@ impl Sink {
                 stderr,
                 given,
                 head,
+                ..
             } => {
                 self.bytes.clear();
                 for s in samples {
@@ -317,6 +333,53 @@ impl Sink {
 }
 
 impl Sink {
+    /// Whether the player is still running: `Err`, saying why it is not
+    /// (its exit status and the last line of its stderr), if it has
+    /// exited. Silent outputs are always alive.
+    ///
+    /// A player that has been given no more than a pipe's worth may be
+    /// one that is dying at start-up but has not finished yet — every
+    /// write into the pipe succeeded without it — so for such a player
+    /// this waits, until it exits or until it has been running for
+    /// [`STARTUP_WAIT`], whichever is first. That wait is bounded, is
+    /// paid only while a young player has taken less than a pipe, and
+    /// costs nothing audible: a healthy player is playing the pipe
+    /// meanwhile. Past a pipe's worth, it only looks.
+    ///
+    /// # Errors
+    /// The player has exited.
+    pub fn check(&mut self) -> io::Result<()> {
+        let Out::Process {
+            child,
+            stderr,
+            given,
+            started,
+            ..
+        } = &mut self.out
+        else {
+            return Ok(());
+        };
+        let settled = if *given <= PIPE_BYTES {
+            *started + STARTUP_WAIT
+        } else {
+            Instant::now()
+        };
+        loop {
+            // `Err` (cannot tell) counts as alive: a write will find out.
+            if let Ok(Some(status)) = child.try_wait() {
+                let e = io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    format!("player exited ({status})"),
+                );
+                return Err(explain(e, child, stderr));
+            }
+            if Instant::now() >= settled {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// For an output whose player failed before it can have played
     /// anything — it was given no more than a pipe's worth — every
     /// sample it was given, to write again elsewhere. `None` once it has

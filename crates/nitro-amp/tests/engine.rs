@@ -426,3 +426,83 @@ fn a_lone_player_that_dies_says_why_and_the_track_still_ends() {
     assert!(err.contains("playing silently"), "{err}");
     assert_eq!(st.output, "silent");
 }
+
+#[test]
+fn a_player_that_dies_after_taking_a_whole_short_track_still_fails_over() {
+    let d = TempDir::new("shortdeath");
+    let bin = d.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let out = d.path().join("pcm");
+    // Takes nothing, then dies a little later: the whole track (well
+    // under a pipe's worth) is written before it does, so no write
+    // fails and only the end-of-stream check can notice.
+    script(
+        &bin,
+        "pw-cat",
+        "echo 'error: pw_context_connect() failed: Host is down' >&2\nsleep 0.2\nexit 1",
+    );
+    script(&bin, "paplay", &format!("cat > '{}'", out.display()));
+    let mut players = Backend::detect_all_in(std::slice::from_ref(&bin)).into_iter();
+    let first_player = players.next().unwrap();
+    assert!(
+        matches!(first_player, Backend::PwCat(_)),
+        "{first_player:?}"
+    );
+
+    let f = tone(d.path(), "t.wav", 8_000, 0.25);
+    let total = 2_000 * 8;
+    assert!(total < 64 * 1024, "the track must fit in the pipe");
+    let mut p =
+        Player::spawn_with_fallbacks(Tools::default(), first_player, players.collect()).unwrap();
+    p.send(Cmd::Load {
+        path: f,
+        play: true,
+        token: 1,
+    });
+    let st = until(&p, "the end", |s| s.ended);
+    let pcm = wait_for_file(&out, total);
+    drop(p);
+    assert_eq!(pcm.len(), total, "every frame, on the second player");
+    let err = st.error.unwrap_or_default();
+    assert!(err.contains("pipewire"), "{err}");
+    assert!(err.contains("Host is down"), "{err}");
+    assert!(err.contains("using pulseaudio"), "{err}");
+    assert_eq!(st.output, "pulseaudio");
+}
+
+#[test]
+fn a_healthy_player_is_kept_open_across_tracks() {
+    let d = TempDir::new("keep");
+    let bin = d.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let out = d.path().join("pcm");
+    let starts = d.path().join("starts");
+    script(
+        &bin,
+        "pw-cat",
+        &format!(
+            "echo x >> '{}'\ncat >> '{}'",
+            starts.display(),
+            out.display()
+        ),
+    );
+    let backend = Backend::detect_in(&[bin]);
+    let a = tone(d.path(), "a.wav", 8_000, 0.25);
+    let b = tone(d.path(), "b.wav", 8_000, 0.25);
+    let mut p = Player::spawn(Tools::default(), backend).unwrap();
+    for (token, path) in [(1, a), (2, b)] {
+        p.send(Cmd::Load {
+            path,
+            play: true,
+            token,
+        });
+        let st = until(&p, "the end", |s| s.token == token && s.ended);
+        assert!(st.error.is_none(), "{:?}", st.error);
+        assert_eq!(st.output, "pipewire");
+    }
+    let pcm = wait_for_file(&out, 2 * 2_000 * 8);
+    drop(p);
+    assert_eq!(pcm.len(), 2 * 2_000 * 8, "both tracks, through one player");
+    let started = std::fs::read_to_string(&starts).unwrap();
+    assert_eq!(started.lines().count(), 1, "the player was reopened");
+}
