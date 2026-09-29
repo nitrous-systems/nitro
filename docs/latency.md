@@ -879,3 +879,43 @@ frame is dominated by the scaled blits (`docs/wm.md` §Overview mode, the
 here: folding the scrim into the opaque wallpaper rect under it (a
 pre-darkened gradient; no cached buffer, the memory was rejected), which
 would save the ~2.5 ms scrim pass on the open frame.
+
+## 9. ARGB shadow (#3898)
+
+Since #3898 byte 3 of the shadow is premultiplied alpha. It is 255 everywhere
+except the holes punched for Surfaces on an underlay plane. The shadow and scanout are the same bytes as before,
+so `copy_us` cannot move: the copy is the same `memcpy` of the same rows.
+Only the rasterizer's arithmetic changed. It now composites byte 3 instead of
+zeroing it, and it takes a branch that keeps an opaque destination at 255
+without the multiply. The testbox primary plane cannot scan out AR24 and zpos is immutable, so there are no holes there. The
+server stays on XR24, and `Scene::has_holes` is an O(1) `false` per frame.
+
+`nitro-raster` bench, box (Pentium G3240, `--iters 40`, min of two runs,
+main 7defd98 vs branch; dev machine within noise except where noted):
+
+| scene | main ms | #3898 ms | Δ |
+|---|---|---|---|
+| a solid_fill | 1.846 | 1.854 | 0 |
+| b rrects_alpha | 9.919 | 9.934 | 0 |
+| c gradient | 1.853 | 1.853 | 0 |
+| d blits (scaled, bilinear) | 36.28 | 36.40 | 0 |
+| e ui_frame | 4.894 | 4.995 | +2 % |
+| f glyphs_loop | 0.314 | 0.340 | **+8 %** |
+| h scrim | 2.497 | 2.524 | +1 % |
+| j argb_1to1_opq | 1.791 | 1.793 | 0 |
+| k argb_1to1_mix | 4.034 | 4.232 | **+5 %** |
+| l–o nv12 | — | — | ±1 % |
+| p xrgb scaled | 11.62 | 11.88 | +2 % |
+| r clear_1080 (new) | — | 0.678 (0.33 ns/px) | |
+
+The first cut lost 8–14 % on a, c, d and p. Two causes: `store_solid`
+changed from a 0 constant to 255, which caused a codegen artefact on SSE4.2 in the fill scenes, and the
+bilinear texel blend always multiplied for alpha. Adding the `d_a == 255` shortcut to the texel
+blend recovered d and p. A branchless `d + div255((255−d)·a)` measured worse than the
+branch on every scene. What remains is the per-pixel blends (`blend_pixel` for
+glyph masks, the SWAR straight-alpha row for mixed ARGB windows), which now write a
+computed byte instead of a constant. At the sizes the server
+paints, that is ~25 µs on a 50-glyph run and ~0.2 ms on a full-screen mixed-alpha window.
+`paint_us` on the box was not re-measured with a deploy: the task
+direction was not to spend effort on hardware. The raster deltas above bound the change, and
+`copy_us` is unchanged by construction.
