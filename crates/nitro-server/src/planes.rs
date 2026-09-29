@@ -44,8 +44,8 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 
 use nitro_core::IRect;
 use nitro_kms::{
-    BufferId, ColorEncoding, ColorRange, Fourcc, MOD_LINEAR, PlaneAssignment, PlaneConfig,
-    PlaneId, PlaneInfo, PlaneKind, PlaneSource, Rect as KmsRect, SrcRect, Verdict,
+    BufferId, ColorEncoding, ColorRange, Fourcc, MOD_LINEAR, PlaneAssignment, PlaneConfig, PlaneId,
+    PlaneInfo, PlaneKind, PlaneSource, Rect as KmsRect, SrcRect, Verdict,
 };
 use nitro_scene::{ColorMatrix, NodeKey, SurfaceColor};
 
@@ -287,7 +287,12 @@ pub const fn range(r: nitro_scene::ColorRange) -> ColorRange {
 }
 
 fn kms_rect(r: IRect) -> KmsRect {
-    KmsRect::new(r.x, r.y, r.w.max(0).cast_unsigned(), r.h.max(0).cast_unsigned())
+    KmsRect::new(
+        r.x,
+        r.y,
+        r.w.max(0).cast_unsigned(),
+        r.h.max(0).cast_unsigned(),
+    )
 }
 
 /// `c` on `p`, if the plane can take it at all: format and modifier

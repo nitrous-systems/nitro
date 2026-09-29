@@ -10472,9 +10472,9 @@ impl Server {
         let mut items = Vec::new();
         self.scene.paint_list(o.scene_id, &orect, &mut items);
         let cs = self.cursor_state(o.scene_id);
-        let cursor = cs
-            .visible
-            .then(|| Cursor::rect_scaled(cs.x, cs.y, cs.shape, cs.scale).translate(orect.x, orect.y));
+        let cursor = cs.visible.then(|| {
+            Cursor::rect_scaled(cs.x, cs.y, cs.shape, cs.scale).translate(orect.x, orect.y)
+        });
         for (i, item) in items.iter().enumerate() {
             let size = match item.kind {
                 PaintKind::Surface { size, .. } | PaintKind::Hole { size } => size,
@@ -10506,7 +10506,9 @@ impl Server {
             let Some(info) = self.backend.buffer_info(kms) else {
                 continue;
             };
-            let dst = t.apply_rect(&Rect::new(0.0, 0.0, size.0, size.1)).round_out();
+            let dst = t
+                .apply_rect(&Rect::new(0.0, 0.0, size.0, size.1))
+                .round_out();
             let visible = dst.intersect(&item.clip).intersect(&orect);
             if visible.is_empty() {
                 continue;
@@ -10694,7 +10696,10 @@ impl Server {
     /// The `planes_*` lines of `stats`.
     fn planes_stats(&self, pairs: &mut Vec<(&'static str, u64)>) {
         let sum = |f: fn(&planes::PlannerStats) -> u64| {
-            self.outputs.iter().map(|o| f(&o.planner.stats)).sum::<u64>()
+            self.outputs
+                .iter()
+                .map(|o| f(&o.planner.stats))
+                .sum::<u64>()
         };
         pairs.push((
             "planes_mode",
