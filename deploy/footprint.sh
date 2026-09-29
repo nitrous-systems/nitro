@@ -26,6 +26,9 @@ set -euo pipefail
 
 secs="${1:-10}"
 box="${NITRO_BOX:-kaspar@192.168.1.204}"
+# Where the box keeps the binaries: ~/nitro-bin (box1, `unit` profile) or
+# /usr/local/bin (testhost2, `gdm`). Expanded by the remote shell.
+bindir="${NITRO_BOX_BINDIR:-~/nitro-bin}"
 bins="${FOOTPRINT_BINS:-nitro-server nitro-gpu nitro-video}"
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
@@ -70,12 +73,12 @@ if [[ ${NITRO_FOOTPRINT_NO_BOX:-0} == 1 ]]; then
     exit 0
 fi
 if ! remote=$(ssh -o ConnectTimeout=5 -o BatchMode=yes "$box" \
-        'md5sum ~/nitro-bin/nitro-server' 2>/dev/null); then
+        "md5sum $bindir/nitro-server" 2>/dev/null); then
     echo "box unreachable, skipped"
     exit 0
 fi
 local_md5=$(md5sum target/release/nitro-server | awk '{print $1}')
 if [[ ${remote%% *} != "$local_md5" ]]; then
-    echo "WARNING: box is not running this build's nitro-server; run \`just deploy\` first"
+    echo "WARNING: box is not running this build's nitro-server; run \`just box=$box deploy\` first"
 fi
 ssh "$box" 'bash -s' "$secs" < deploy/box-ps.sh

@@ -1,6 +1,35 @@
-# Test box
+# Test boxes
 
-`kaspar@192.168.1.204` (override with `NITRO_BOX`). Passwordless sudo,
+There are two boxes. Every box recipe in `deploy/dev.just` targets
+**box1** by default and either box with `box=` or `NITRO_BOX`:
+
+```
+just deploy                          # box1
+just box=testhost2 deploy            # testbox2 (Kaby Lake laptop)
+NITRO_BOX=testhost2 just footprint   # the same, from the environment
+```
+
+The box's **profile** (`box_profile`) says how it runs nitro. It is
+guessed from the host name (`testhost2` / `192.168.1.193` → `gdm`,
+anything else → `unit`), and `NITRO_BOX_PROFILE` forces it.
+`NITRO_BOX_BINDIR` overrides where the binaries live. Both boxes keep
+their clone at `~/src/ai/nitro`, and `just box-push` pushes `main` to it.
+
+| recipe | `unit` (box1) | `gdm` (testbox2) |
+|---|---|---|
+| `deploy-bins` | rsync → `~/nitro-bin`, entries → `~/.local/share/applications` | stage in `~/nitro-stage`, `sudo install` → `/usr/local/bin`, entries → `/usr/local/share/applications`; examples → `~/nitro-bin` |
+| `deploy` | + restart `nitro-dev` | install only (no autologin: a restart would leave the greeter) |
+| `box-restart` | restart `nitro-dev` | restart `gdm` (ends the session, greeter) |
+| `box-status` / `box-log` / `box-stop` | the `nitro-dev` unit | `loginctl` + `pgrep`, the journal by `_COMM`, stop `gdm` |
+| `box-install` | install the unit | make the clone pushable, check the GDM session entry |
+| `box-ps`, `footprint` | tree under the unit's MainPID | tree under the oldest `nitro-session` |
+| `shot`, `bench-bandwidth` | `~/nitro-bin/…` | `/usr/local/bin/…` |
+| `bench` | runs | **refuses** (no unit to restart between arms) |
+| `deploy-chromium` | apt + AppArmor profile | pacman `at-spi2-core`, no AppArmor step |
+
+## box1: Pentium G3240 (Haswell)
+
+`kaspar@192.168.1.204` (the default `box`). Passwordless sudo,
 ssh key access from the dev machine. Deliberately weak hardware — if it is
 snappy here, it is snappy.
 
@@ -13,7 +42,7 @@ snappy here, it is snappy.
 | Seat | systemd-logind (seatd also present); user in `video`,`render`,`input` |
 | Libs | libseat 0.9, libinput 1.31, libdrm 2.4.131, libxkbcommon 1.13 |
 | Tools | `perf`, `ydotool`, `chvt`, rustup (`~/.cargo/bin`) |
-| Repo | `~/src/ai/nitro` — git remote `box`, push with `just box-push` |
+| Repo | `~/src/ai/nitro` — push with `just box-push` (the `box` git remote is the same URL) |
 
 ## Loop
 
@@ -62,6 +91,49 @@ supervises all four. So `pgrep nitro` shows five processes, a
 `pkill nitro-bar` is repaired within about a second, and
 `systemctl stop nitro-dev` takes the whole desktop down in order. See
 [`crates/nitro-session/README.md`](../crates/nitro-session/README.md).
+
+## testbox2: i5-8250U (Kaby Lake R, Gen9), `testhost2`
+
+`ssh testhost2` (user kaspar, passwordless sudo, key access; host name
+`ng`, 192.168.1.193). A laptop, and **the human's daily desktop**: GDM
+starts nitro from `/usr/local/bin`. It is here for what box1 cannot do:
+Gen9 display planes with NV12 and scalers, full anv Vulkan, and VA-API
+on iHD.
+
+| | |
+|---|---|
+| OS / kernel | Arch Linux, kernel 7.2.2 |
+| CPU / RAM | i5-8250U (Kaby Lake R, 4c/8t), 23.9 GB |
+| GPU | Intel UHD 620 (KBL GT2, 8086:5917), `i915`, `/dev/dri/card1`, `renderD128`; display version 9, cdclk 337.5 MHz (max 675) |
+| Outputs | eDP-1 2560×1440@60 connected (scale 1.25 in `~/.config/nitro/server.conf`, `de` keymap); DP-1, HDMI-A-1, DP-2 disconnected |
+| Planes | per pipe: primary + 1 overlay + cursor; 2 scalers on pipes A/B, 1 on C. Measured in [`crates/nitro-kms/README.md`](../crates/nitro-kms/README.md#testbox2-intel-uhd-620-kaby-lake-r-gen9-i915-kernel-722-25601440-edp--2026-09-29) |
+| Seat | GDM + logind (session on seat0/tty2); seatd 0.9.3 present |
+| Libs | Mesa 26.2.3, vulkan-intel (anv) 26.2.3, intel-media-driver (iHD) 26.2.4 + libva-intel-driver, libva 2.24.1, libinput 1.32, libxkbcommon 1.13.2, libdrm 2.4.134 |
+| Tools | `perf`, `chvt`, `sqlite3`, `python3`, `vulkaninfo` (vulkan-tools), `vainfo` (libva-utils), rustc 1.95 |
+| Repo | `~/src/ai/nitro` (moved from `~/src/nitro` in #3911; `receive.denyCurrentBranch=updateInstead`) |
+
+Vulkan (`vulkaninfo --summary`): Intel(R) UHD Graphics 620 (KBL GT2),
+Mesa 26.2.3 anv, API 1.4.354, conformance 1.4.0.0.
+
+VA-API (`vainfo --display drm`): iHD 26.2.4. Decode (VLD): MPEG-2, H.264
+(CB/Main/High), VC-1, JPEG, VP8, HEVC Main and **Main10**, VP9 Profile 0
+and **Profile 2** (10-bit). Encode: MPEG-2, H.264 (incl. low-power),
+JPEG, VP8, HEVC Main/Main10. Plus VideoProc (scaling/CSC).
+
+Rules for this box:
+
+- **It is the human's live session.** `just box=testhost2 deploy`
+  installs into `/usr/local/bin` and does **not** restart anything; the
+  new build runs from the next login. GDM autologin is off, so
+  `box-restart` / `box-stop` end his session and leave the greeter.
+- Stopping GDM to get DRM master (probes, `kms_fill`) is allowed — the
+  human's standing OK, 2026-09-29 — but start it again afterwards
+  (`sudo systemctl start gdm`) and say so, because he has to log in again.
+- There is no `nitro-dev` unit and none should be installed (it would
+  fight GDM for tty2). `just bench` refuses on this box.
+- The session's control socket is in `/run/user/1000/nitro/`, so `shot`
+  and `box-session` work over ssh as the same user while he is logged in.
+- `/sys/kernel/debug` needs sudo: `sudo cat /sys/kernel/debug/dri/1/i915_display_info`.
 
 ## The deployed set is two directories, not one
 

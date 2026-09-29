@@ -264,19 +264,18 @@ default is considered settled.
 
 ## Plane counts
 
-**Measured on the test box** (#3895; the full inventory and `TEST_ONLY`
-results are in [`crates/nitro-kms/README.md`](../crates/nitro-kms/README.md#planes-discovery-test_only-and-the-hsw-gt1-inventory-measured)):
+**Measured on the test boxes** (#3895, #3911; the full inventories and
+`TEST_ONLY` results are in [`crates/nitro-kms/README.md`](../crates/nitro-kms/README.md#planes-discovery-test_only-and-the-hsw-gt1-inventory-measured)):
 
 | hardware | planes per CRTC (measured) |
 |---|---|
 | Intel Haswell GT1 (test box) | primary + **1 overlay** + cursor, all fixed zpos (0/1/2). Overlay: packed YUV 4:2:2 (YUYV…) and XRGB, **no NV12** (refused at AddFB2), **no ARGB**, no scaling accepted with linear buffers. The primary must cover the CRTC and cannot scale. |
-| Intel Kaby Lake R, UHD 620 (testhost2, #3903) | 2 NV12-capable planes per pipe (primary + sprite): NV12, XYUV, YUYV family, AR24; pipe C has no NV12. VA's Y-tiled NV12 passes AddFB2. |
+| Intel Kaby Lake R, UHD 620, Gen9 (testbox2, #3911; #3903) | primary + **1 overlay** + cursor per pipe, all fixed zpos (0/1/2); 2 scalers on pipes A/B, 1 on C. Primary *and* overlay take NV12 (linear, X, Y, Yf), XYUV, YUYV family, XR24/AR24 (+CCS), have `pixel blend mode` and `alpha`; the primary can be a window and can scale. **Linear NV12 accepted** 1:1, windowed, at odd positions/sizes. **Upscaling accepted** (NV12/YUYV/RGB, and primary + overlay scaled together); **downscaling only to ~0.94×** — 0.75× and 0.5× rejected at this panel's 337.5 MHz cdclk. AR24 on the overlay accepted. Pipe C has no NV12 (#3903). VA's Y-tiled NV12 passes AddFB2 (#3903). |
 
 For comparison, **from memory, unverified**:
 
 | hardware | usable planes (rough) |
 |---|---|
-| Intel Gen9 | 3 + cursor, 2 scalers per pipe |
 | Intel Gen11+ | 5–7 |
 | AMD DCN | primary + 1 overlay |
 | Rockchip / Qualcomm | 3–6 |

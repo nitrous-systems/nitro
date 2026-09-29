@@ -40,12 +40,33 @@ size windows="1":
 # Binary sizes, dep count and box idle RSS: the docs/budget.md baseline.
 [group('dev')]
 footprint secs="10":
-    FOOTPRINT_BINS="{{box_bins}} nitro-gpu nitro-video" NITRO_BOX={{box}} bash deploy/footprint.sh {{secs}}
+    FOOTPRINT_BINS="{{box_bins}} nitro-gpu nitro-video" NITRO_BOX={{box}} NITRO_BOX_BINDIR='{{box_bindir}}' bash deploy/footprint.sh {{secs}}
 
 # ---------------------------------------------------------------------------
 # Test box (see docs/testbox.md)
 # ---------------------------------------------------------------------------
+#
+# Two boxes (docs/testbox.md). `box` picks one, `box_profile` says how it
+# runs nitro, and every box recipe follows both:
+#
+#   just deploy                          # box1, kaspar@192.168.1.204
+#   just box=testhost2 deploy            # box2, the Kaby Lake laptop
+#   NITRO_BOX=testhost2 just footprint   # the same, from the environment
+#
+# Profiles:
+#   unit — box1. nitro runs as the `nitro-dev` system unit from
+#          ~/nitro-bin, and `deploy` restarts it.
+#   gdm  — testhost2. nitro is the human's GDM session
+#          (/usr/share/wayland-sessions/nitro.desktop →
+#          /usr/local/bin/nitro-session). Binaries go to /usr/local/bin
+#          through sudo; `deploy` does not restart anything, because GDM
+#          has no autologin and a restart drops to the greeter.
+# The profile is guessed from the host name and can be forced with
+# NITRO_BOX_PROFILE; NITRO_BOX_BINDIR overrides where the binaries are.
+# Both boxes keep their clone at ~/src/ai/nitro.
 box := env_var_or_default("NITRO_BOX", "kaspar@192.168.1.204")
+box_profile := env_var_or_default("NITRO_BOX_PROFILE", if box =~ '(^|@)(testhost2|192\.168\.1\.193)$' { "gdm" } else { "unit" })
+box_bindir := env_var_or_default("NITRO_BOX_BINDIR", if box_profile == "gdm" { "/usr/local/bin" } else { "~/nitro-bin" })
 # Everything the box needs for a desktop. `nitro-session` is what the
 # unit runs; it finds the other four next to itself in ~/nitro-bin, which
 # is why they are deployed together and in one rsync — a session that
@@ -54,15 +75,32 @@ box := env_var_or_default("NITRO_BOX", "kaspar@192.168.1.204")
 box_bins := "nitro-server nitro-session nitro-shot nitro-demo nitro-bench nitro-calc nitro-amp nitro-term nitro-files nitro-bar nitro-launcher nitro-wallpaper nitro-settings hey"
 box_examples := "hello_client hello_dialog shell_probe"
 
-# Build release, rsync binaries to the box, restart the dev session.
+# Build release, rsync binaries to the box, restart the dev session
+# (on a `gdm` box: install only; log out/in or `just box-restart`).
 [group('dev')]
-deploy: (deploy-bins) 
-    ssh {{box}} 'sudo systemctl restart nitro-dev' && just box-status
+deploy: (deploy-bins)
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ {{box_profile}} == gdm ]]; then
+        echo "installed on {{box}}; log out and in (or \`just box={{box}} box-restart\`) to pick it up"
+    else
+        ssh {{box}} 'sudo systemctl restart nitro-dev' && just box={{box}} box-status
+    fi
+
+# Restart the box's session. On a `gdm` box this restarts GDM, which
+# ends the logged-in session and leaves the greeter.
+[group('dev')]
+box-restart:
+    ssh {{box}} {{ if box_profile == "gdm" { "'sudo systemctl restart gdm'" } else { "'sudo systemctl restart nitro-dev'" } }}
 
 [group('dev')]
 deploy-bins:
     # `--examples` on its own does not build the binaries, so ask for both.
     cargo build --release --workspace --bins --examples
+    just box={{box}} _deploy-bins-{{box_profile}}
+
+# box1: everything into ~/nitro-bin, entries into ~/.local.
+_deploy-bins-unit:
     cd target/release && rsync -az {{box_bins}} {{box}}:nitro-bin/
     cd target/release/examples && rsync -az {{box_examples}} {{box}}:nitro-bin/
     # `deploy/*.desktop` are installed too, and are part of the deployed
@@ -110,6 +148,19 @@ deploy-bins:
     ssh {{box}} 'mkdir -p ~/.local/share/applications'
     rsync -az deploy/*.desktop {{box}}:.local/share/applications/
 
+# testhost2: the session runs from /usr/local/bin (root-owned), so the
+# binaries are staged in ~/nitro-stage and `sudo install`ed; the
+# examples (probes, not part of the session) go to ~/nitro-bin. The
+# .desktop entries go last into /usr/local/share/applications, for the
+# reason spelled out above.
+_deploy-bins-gdm:
+    ssh {{box}} 'mkdir -p ~/nitro-stage ~/nitro-bin'
+    cd target/release && rsync -az {{box_bins}} {{box}}:nitro-stage/
+    cd target/release/examples && rsync -az {{box_examples}} planes_probe {{box}}:nitro-bin/
+    ssh {{box}} 'cd ~/nitro-stage && sudo install -m 755 {{box_bins}} {{box_bindir}}/'
+    rsync -az deploy/*.desktop {{box}}:nitro-stage/
+    ssh {{box}} 'sudo install -d /usr/local/share/applications && sudo install -m 644 ~/nitro-stage/*.desktop /usr/local/share/applications/'
+
 # Chromium on nitro (#3865). `chromium_out` and `chromium_files` are
 # defined in the root justfile, because `install-chromium` uses them too.
 # This recipe does not build Chromium and fails clearly if it is missing.
@@ -132,7 +183,12 @@ deploy-chromium:
     # `chrome` links ATK/AT-SPI (accessibility) and a desktop-less box
     # does not have them: without these three it dies in the loader with
     # `libatk-1.0.so.0: cannot open shared object file`. Idempotent.
-    ssh {{box}} 'dpkg -s libatk1.0-0t64 libatk-bridge2.0-0t64 libatspi2.0-0t64 >/dev/null 2>&1 || sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libatk1.0-0t64 libatk-bridge2.0-0t64 libatspi2.0-0t64'
+    # On the Arch box (`gdm` profile) the same libraries are `at-spi2-core`.
+    if [[ {{box_profile}} == gdm ]]; then
+        ssh {{box}} 'pacman -Q at-spi2-core >/dev/null 2>&1 || sudo pacman -S --needed --noconfirm at-spi2-core'
+    else
+        ssh {{box}} 'dpkg -s libatk1.0-0t64 libatk-bridge2.0-0t64 libatspi2.0-0t64 >/dev/null 2>&1 || sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libatk1.0-0t64 libatk-bridge2.0-0t64 libatspi2.0-0t64'
+    fi
     # `--delete` is scoped to ~/nitro-bin/chromium/ — the directory is
     # ours alone, so a file dropped from the list goes with it.
     # `symbol_level=0` still leaves a ~200 MB `.symtab`/`.strtab` in a
@@ -158,8 +214,14 @@ deploy-chromium:
     # The sandbox: an AppArmor profile granting `userns` to this path,
     # because `kernel.apparmor_restrict_unprivileged_userns=1` denies the
     # namespace sandbox to unconfined programs. See the profile's header.
-    scp -q "$stage/apparmor-chromium-nitro" {{box}}:/tmp/apparmor-chromium-nitro
-    ssh {{box}} 'sudo install -m 644 /tmp/apparmor-chromium-nitro /etc/apparmor.d/chromium-nitro && sudo apparmor_parser -r /etc/apparmor.d/chromium-nitro && rm /tmp/apparmor-chromium-nitro'
+    # A box without AppArmor (Arch) does not restrict userns, so there
+    # is nothing to grant and the step is skipped.
+    if ssh {{box}} 'command -v apparmor_parser >/dev/null'; then
+        scp -q "$stage/apparmor-chromium-nitro" {{box}}:/tmp/apparmor-chromium-nitro
+        ssh {{box}} 'sudo install -m 644 /tmp/apparmor-chromium-nitro /etc/apparmor.d/chromium-nitro && sudo apparmor_parser -r /etc/apparmor.d/chromium-nitro && rm /tmp/apparmor-chromium-nitro'
+    else
+        echo "no apparmor_parser on {{box}}; sandbox profile skipped"
+    fi
     # Chromium's own logo, as `chromium-nitro` in the user's hicolor, so
     # the launcher row, the bar and the title bar resolve it by app id.
     for n in 16 24 48 64 128 256; do
@@ -172,9 +234,17 @@ deploy-chromium:
     rsync -az deploy/chromium/chromium-nitro.desktop {{box}}:.local/share/applications/
     ssh {{box}} 'md5sum ~/nitro-bin/chromium/chrome'
 
-# Install/refresh the systemd unit on the box (needs sudo there).
+# Install/refresh the systemd unit on the box (needs sudo there). On a
+# `gdm` box there is no unit (it would fight GDM for tty2): this makes
+# the clone pushable and checks the GDM session entry instead.
 [group('dev')]
 box-install:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ {{box_profile}} == gdm ]]; then
+        ssh {{box}} 'git -C ~/src/ai/nitro config receive.denyCurrentBranch updateInstead && test -f /usr/share/wayland-sessions/nitro.desktop && echo "GDM session entry present"'
+        exit
+    fi
     # `daemon-reload` picks up a changed unit; disabling getty@tty2 frees
     # the VT the session takes. tty1 keeps its getty for rescue.
     scp deploy/nitro-dev.service {{box}}:/tmp/nitro-dev.service
@@ -182,7 +252,7 @@ box-install:
 
 [group('dev')]
 box-status:
-    ssh {{box}} 'systemctl status nitro-dev --no-pager -n 20 || true'
+    ssh {{box}} {{ if box_profile == "gdm" { "'loginctl list-sessions --no-pager; pgrep -a nitro || echo no nitro processes; systemctl is-active gdm || true'" } else { "'systemctl status nitro-dev --no-pager -n 20 || true'" } }}
 
 # Talk to the running session: `status`, `lock`, `suspend`, `logout`.
 [group('dev')]
@@ -198,26 +268,28 @@ box-ps:
 
 [group('dev')]
 box-log:
-    ssh {{box}} 'journalctl -u nitro-dev -f -o cat'
+    ssh {{box}} {{ if box_profile == "gdm" { "'journalctl -f -o cat _COMM=nitro-server + _COMM=nitro-session + _COMM=nitro-bar + _COMM=nitro-launcher + _COMM=nitro-wallpaper'" } else { "'journalctl -u nitro-dev -f -o cat'" } }}
 
+# On a `gdm` box this stops GDM (the human's standing OK; start it again
+# with `just box=testhost2 box-restart`).
 [group('dev')]
 box-stop:
-    ssh {{box}} 'sudo systemctl stop nitro-dev'
+    ssh {{box}} {{ if box_profile == "gdm" { "'sudo systemctl stop gdm'" } else { "'sudo systemctl stop nitro-dev'" } }}
 
 # Screenshot of the live server, written to tmp/shot.png.
 [group('dev')]
 shot out="tmp/shot.png":
-    mkdir -p tmp && ssh {{box}} '~/nitro-bin/nitro-shot' > {{out}} && echo "wrote {{out}}"
+    mkdir -p tmp && ssh {{box}} '{{box_bindir}}/nitro-shot' > {{out}} && echo "wrote {{out}}"
 
 # Switch the box's foreground VT (vt-switch survival test).
 [group('dev')]
 box-chvt n:
     ssh {{box}} 'sudo chvt {{n}}'
 
-# Push the repo to the box's clone (~/src/ai/nitro).
+# Push the repo to the box's clone (~/src/ai/nitro on both boxes).
 [group('dev')]
 box-push:
-    git push box main
+    git push {{box}}:src/ai/nitro main
 
 # ---------------------------------------------------------------------------
 # Benchmarks (see docs/bench.md)
@@ -250,8 +322,12 @@ box-push:
 # is what #618/#3843 found, after the spelling below had been documented
 # and unrunnable since `c4f51f1`. `crates/nitro-bench/tests/bench_recipe.rs`
 # pins it.
+#
+# A `gdm` box has no nitro-dev unit to restart between arms, so bench
+# refuses there.
 [group('dev')]
 bench modes="" seconds="10":
+    {{ if box_profile == "gdm" { "echo 'bench: " + box + " runs nitro under GDM, with no nitro-dev unit to restart between arms (docs/testbox.md)' >&2; exit 1" } else { "" } }}
     ssh {{box}} 'NITRO_BENCH_SHA='"$(git rev-parse --short HEAD)"' bash -s' -- --seconds {{seconds}} {{ if modes == "" { "" } else { "--modes " + quote(quote(modes)) } }} < deploy/bench.sh
     mkdir -p tmp/bench
     ssh {{box}} 'cat ~/tmp/bench/*.jsonl' > tmp/bench/box.jsonl
@@ -269,7 +345,7 @@ bench-bandwidth where="here":
     #!/usr/bin/env bash
     set -euo pipefail
     if [[ "{{where}}" == box ]]; then
-        ssh {{box}} '~/nitro-bin/nitro-bench bandwidth'
+        ssh {{box}} '{{box_bindir}}/nitro-bench bandwidth'
     else
         cargo run -q --release -p nitro-bench -- bandwidth
     fi

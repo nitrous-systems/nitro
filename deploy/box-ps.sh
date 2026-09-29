@@ -45,9 +45,18 @@ set -euo pipefail
 secs="${1:-60}"
 hz=$(getconf CLK_TCK)
 
-main=$(systemctl show nitro-dev -p MainPID --value)
+main=$(systemctl show nitro-dev -p MainPID --value 2>/dev/null || true)
+root="nitro-dev"
 if [[ -z $main || $main == 0 ]]; then
-    echo "nitro-dev is not running" >&2
+    # A box without the unit (testhost2, where GDM starts
+    # /usr/local/bin/nitro-session, docs/testbox.md): the oldest
+    # `nitro-session` is the root of the same tree. Still a walk down
+    # from one known process, not a pattern match over everything.
+    main=$(pgrep -xo nitro-session || true)
+    root="nitro-session (no nitro-dev unit)"
+fi
+if [[ -z $main || $main == 0 ]]; then
+    echo "nitro-dev is not running, and there is no nitro-session" >&2
     exit 1
 fi
 # The session and its children. One level is enough: the session starts
@@ -75,7 +84,7 @@ jiffies() {
 declare -A before
 for p in "${pids[@]}"; do before[$p]=$(jiffies "$p"); done
 
-echo "== nitro-dev tree: measuring ${secs}s of idle =="
+echo "== $root tree: measuring ${secs}s of idle =="
 sleep "$secs"
 
 printf '%-16s %8s %10s %10s %10s %10s %10s %8s\n' \

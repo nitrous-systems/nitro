@@ -291,9 +291,18 @@ format fails here with `Error::Io`, before any test runs.
 
 ```sh
 cargo build --release -p nitro-kms --example planes_probe
-rsync target/release/examples/planes_probe kaspar@192.168.1.204:tmp/
-ssh kaspar@192.168.1.204 'sudo systemctl stop nitro-dev; sudo ~/tmp/planes_probe /dev/dri/card1; sudo systemctl start nitro-dev'
+# box1 (Haswell, nitro-dev unit)
+box=kaspar@192.168.1.204
+rsync target/release/examples/planes_probe $box:tmp/
+ssh $box 'sudo systemctl stop nitro-dev; sudo ~/tmp/planes_probe /dev/dri/card1; sudo systemctl start nitro-dev'
+# testbox2 (Kaby Lake, GDM; the human's session, see docs/testbox.md)
+box=testhost2
+rsync target/release/examples/planes_probe $box:nitro-bin/
+ssh $box 'sudo systemctl stop gdm; sleep 3; sudo ~/nitro-bin/planes_probe /dev/dri/card1; sudo systemctl start gdm'
 ```
+
+`just box=testhost2 deploy-bins` also puts `planes_probe` in
+`~/nitro-bin` there.
 
 The probe lights each output with one black frame and prints the
 inventory. It then test-commits a fixed set of layouts:
@@ -301,8 +310,16 @@ inventory. It then test-commits a fixed set of layouts:
 - NV12 and YUYV overlays at 1:1, as a window, scaled, and below the
   primary
 - two overlays
-- XRGB/ARGB overlays at 1:1, 2× and 0.5×
+- XRGB/ARGB overlays at 1:1, 2×, output-size → window, 0.94× and 0.75×
 - cursor sizes
+- added for Gen9 (#3911): video-sized (1920×1080) source downscaled
+  into a 960×540 window (d3), a 1:1 window at an odd position (f), an
+  odd 961×541 destination (f2), and two scaled planes on one pipe
+  (i: primary 1280×720 → full + overlay 960×540 → 1280×720)
+
+Every buffer is a linear dumb buffer: `alloc_buffer` allocates nothing
+else, so tiled (X/Y/Yf) scanout is listed by `IN_FORMATS` but not
+exercised by any `TEST_ONLY` here.
 
 A buffer the kernel refuses at `AddFB2` shows as `SKIP`.
 
@@ -385,6 +402,111 @@ What this means for the `planes` module (#3899) on this box:
 - No plane has `FB_DAMAGE_CLIPS` on this kernel. Every plane has
   `IN_FENCE_FD` and `rotate-0|rotate-180`. There is no `alpha` and no
   `pixel blend mode`.
+
+### testbox2: Intel UHD 620 (Kaby Lake R, Gen9), i915, kernel 7.2.2, 2560×1440 eDP — 2026-09-29
+
+GDM stopped for the run (#3911). The HSW rows above predate (d3), (f),
+(f2), (g4), (g5) and (i).
+
+```text
+output#1 eDP-1 2560x1440: 3 planes
+  plane#35 primary crtcs=0b01 zpos=0 [0..0] immutable rotation=rotate-0|rotate-90|rotate-180|rotate-270
+    COLOR_ENCODING: ITU-R BT.601 YCbCr, ITU-R BT.709 YCbCr; COLOR_RANGE: YCbCr limited range, YCbCr full range
+    blend: Pre-multiplied, Coverage, None; alpha=true damage_clips=false in_fence=true
+    [I915_Y_TILED, I915_X_TILED, LINEAR]: C8   XR4H XB4H
+    [I915_Yf_TILED, I915_Y_TILED, I915_X_TILED, LINEAR]: RG16 XR30 XB30 YUYV YVYU UYVY VYUY NV12 XYUV
+    [I915_Yf_TILED_CCS, I915_Y_TILED_CCS, I915_Yf_TILED, I915_Y_TILED, I915_X_TILED, LINEAR]: XR24 XB24 AR24 AB24
+  plane#44 overlay crtcs=0b01 zpos=1 [1..1] immutable rotation=rotate-0|rotate-90|rotate-180|rotate-270
+    COLOR_ENCODING: ITU-R BT.601 YCbCr, ITU-R BT.709 YCbCr; COLOR_RANGE: YCbCr limited range, YCbCr full range
+    blend: Pre-multiplied, Coverage, None; alpha=true damage_clips=false in_fence=true
+    [I915_Y_TILED, I915_X_TILED, LINEAR]: C8   XR4H XB4H
+    [I915_Yf_TILED, I915_Y_TILED, I915_X_TILED, LINEAR]: RG16 XR30 XB30 YUYV YVYU UYVY VYUY NV12 XYUV
+    [I915_Yf_TILED_CCS, I915_Y_TILED_CCS, I915_Yf_TILED, I915_Y_TILED, I915_X_TILED, LINEAR]: XR24 XB24 AR24 AB24
+  plane#53 cursor  crtcs=0b01 zpos=2 [2..2] immutable rotation=rotate-0|rotate-180
+    COLOR_ENCODING: -; COLOR_RANGE: -
+    blend: -; alpha=false damage_clips=false in_fence=true
+    [LINEAR]: AR24
+  layouts (TEST_ONLY, no ALLOW_MODESET; unlisted planes on the CRTC disabled):
+  (a) XRGB fullscreen on primary                             ACCEPT
+  (a2) XRGB 2560x1440 buffer on primary                      ACCEPT
+  (a3) XRGB primary scaled 1280x720 -> fullscreen            ACCEPT
+  (a4) XRGB primary as a 960x540 window                      ACCEPT
+  (b) NV12 2560x1440 overlay 1:1 above primary               ACCEPT
+  (b2) NV12 2560x1440 overlay 1:1 alone (primary off)        ACCEPT
+  (b3) NV12 960x540 overlay 1:1 window above primary         ACCEPT
+  (c) NV12 on primary, XRGB UI on overlay (fixed zpos)       ACCEPT
+  (d) NV12 1280x720 scaled to fullscreen                     ACCEPT
+  (d2) NV12 1280x720 scaled to a 960x540 window              REJECT EINVAL
+  (d3) NV12 1920x1080 scaled down to a 960x540 window        REJECT ERANGE
+  (f) NV12 960x540 1:1 window at an odd position             ACCEPT
+  (f2) NV12 960x540 scaled to an odd 961x541 window          ACCEPT
+  (i) XRGB primary 1280x720 up + NV12 960x540 up to 1280x720 ACCEPT
+  (e) two NV12 overlays                                      SKIP: one overlay plane
+  (b) YUYV 2560x1440 overlay 1:1 above primary               ACCEPT
+  (b2) YUYV 2560x1440 overlay 1:1 alone (primary off)        ACCEPT
+  (b3) YUYV 960x540 overlay 1:1 window above primary         ACCEPT
+  (c) YUYV on primary, XRGB UI on overlay (fixed zpos)       ACCEPT
+  (d) YUYV 1280x720 scaled to fullscreen                     ACCEPT
+  (d2) YUYV 1280x720 scaled to a 960x540 window              REJECT EINVAL
+  (d3) YUYV 1920x1080 scaled down to a 960x540 window        REJECT EINVAL
+  (f) YUYV 960x540 1:1 window at an odd position             ACCEPT
+  (f2) YUYV 960x540 scaled to an odd 961x541 window          ACCEPT
+  (i) XRGB primary 1280x720 up + YUYV 960x540 up to 1280x720 ACCEPT
+  (e) two YUYV overlays                                      SKIP: one overlay plane
+  (g) XR24 960x540 overlay 1:1 above primary                 ACCEPT
+  (g2) XR24 960x540 overlay 2x to fullscreen                 ACCEPT
+  (g3) XR24 2560x1440 overlay downscaled to 960x540          REJECT EINVAL
+  (g5) XR24 1024x576 overlay 0.94x to 960x540                ACCEPT
+  (g4) XR24 1280x720 overlay 0.75x to 960x540                REJECT EINVAL
+  (g) AR24 960x540 overlay 1:1 above primary                 ACCEPT
+  (g2) AR24 960x540 overlay 2x to fullscreen                 ACCEPT
+  (g3) AR24 2560x1440 overlay downscaled to 960x540          REJECT EINVAL
+  (g5) AR24 1024x576 overlay 0.94x to 960x540                ACCEPT
+  (g4) AR24 1280x720 overlay 0.75x to 960x540                REJECT EINVAL
+  (h) ARGB 64x64 on cursor + primary                         ACCEPT
+  (h) ARGB 128x128 on cursor + primary                       ACCEPT
+  (h) ARGB 256x256 on cursor + primary                       ACCEPT
+  (h2) ARGB 64x64 cursor + YUYV overlay + primary            ACCEPT
+```
+
+debugfs (`i915_display_info`): `num_scalers=2` on pipes A and B, 1 on
+pipe C; each pipe has `plane 1x` (PRI), `plane 2x` (OVL) and a cursor.
+Display version 9, cdclk 337.5 MHz (max 675 MHz), FBC on, PSR on.
+
+What this means for the `planes` module (#3899) on Gen9:
+
+- **Still one overlay per CRTC, still fixed zpos.** primary 0, overlay 1,
+  cursor 2, all immutable. No underlay by zpos. But unlike HSW the
+  **primary takes YUV** (NV12, YUYV family, XYUV) and **can be a
+  window**, so "video on the primary, UI on the overlay" is accepted (c)
+  — the UI would have to be an opaque rectangle or an AR24 layer with
+  per-pixel alpha, which the overlay also takes.
+- **NV12 works with linear dumb buffers**, on the overlay and on the
+  primary: fullscreen 1:1, as a 960×540 window, at an odd position and
+  into an odd-sized (961×541) destination. `IN_FORMATS` lists NV12 with
+  LINEAR, X-, Y- and Yf-tiled on both planes (no CCS for YUV; CCS only
+  for XR24/XB24/AR24/AB24). Tiled NV12 is advertised but not tested
+  here (see above).
+- **Scaling: upscale yes, downscale barely.** Upscale is accepted for
+  every format tried: NV12/YUYV 1280×720 → 2560×1440, XR24/AR24 2×, and
+  a 1280×720 primary scaled to fullscreen. **Two scaled planes on one
+  pipe** (primary + overlay, i) are accepted — that is both of pipe A's
+  scalers. Downscale is refused beyond a little: 0.94× (1024×576 →
+  960×540) is accepted for XR24/AR24, but 0.75× (EINVAL for RGB and
+  YUYV, from 1280×720), 0.5× (EINVAL) and NV12 1920×1080 → 960×540
+  (ERANGE) are not. Gen9's scaler itself goes down to ~0.5× at best
+  (1/2 minus ε per axis); the extra limit here is most likely the
+  plane-rate/cdclk check at the 337.5 MHz cdclk this panel runs, which
+  a `TEST_ONLY` without `ALLOW_MODESET` cannot raise. Not established;
+  treat a Surface displayed smaller than its buffer by more than ~6 % as
+  composited (or scale it in the producer / VA VideoProc).
+- **AR24 on the overlay: yes** (1:1 and 2×), and the planes have
+  `pixel blend mode` (Pre-multiplied, Coverage, None) and plane `alpha`.
+  AR24 is on the primary too, so the #3898 `scanout_alpha` path is live
+  on this box.
+- Rotation: 0/90/180/270 on primary and overlay (90/270 need Y-tiled
+  buffers on Gen9; not tested). Cursor: ARGB 64/128/256 alongside a YUYV
+  overlay. No plane has `FB_DAMAGE_CLIPS`; all have `IN_FENCE_FD`.
 
 ## ARGB scanout (#3898)
 

@@ -231,7 +231,7 @@ fn probe_output(kms: &mut DrmBackend<'_>, out: &OutputInfo) {
         &[(primary, front, (w, h), fullscreen)],
     );
     pr.test(
-        "(a2) XRGB 1920x1080 buffer on primary",
+        &format!("(a2) XRGB {w}x{h} buffer on primary"),
         &[(primary, Some(Fourcc::XRGB8888), (w, h), fullscreen)],
     );
     pr.test(
@@ -322,6 +322,46 @@ fn probe_output(kms: &mut DrmBackend<'_>, out: &OutputInfo) {
                 (ov, Some(fmt), (1280, 720), window),
             ],
         );
+        // Gen9+ additions (#3911): a video-sized source downscaled into a
+        // window, and NV12's alignment rules (odd position, odd size).
+        pr.test(
+            &format!("(d3) {tag} 1920x1080 scaled down to a 960x540 window"),
+            &[
+                (primary, front, (w, h), fullscreen),
+                (ov, Some(fmt), (1920, 1080), window),
+            ],
+        );
+        pr.test(
+            &format!("(f) {tag} 960x540 1:1 window at an odd position"),
+            &[
+                (primary, front, (w, h), fullscreen),
+                (
+                    ov,
+                    Some(fmt),
+                    (960, 540),
+                    Rect::new(window.x + 1, window.y + 1, 960, 540),
+                ),
+            ],
+        );
+        pr.test(
+            &format!("(f2) {tag} 960x540 scaled to an odd 961x541 window"),
+            &[
+                (primary, front, (w, h), fullscreen),
+                (
+                    ov,
+                    Some(fmt),
+                    (960, 540),
+                    Rect::new(window.x, window.y, 961, 541),
+                ),
+            ],
+        );
+        pr.test(
+            &format!("(i) XRGB primary 1280x720 up + {tag} 960x540 up to 1280x720"),
+            &[
+                (primary, Some(Fourcc::XRGB8888), (1280, 720), fullscreen),
+                (ov, Some(fmt), (960, 540), Rect::new(0, 0, 1280, 720)),
+            ],
+        );
         if let Some(&ov2) = overlays.get(1) {
             pr.test(
                 &format!("(e) two {tag} 960x540 overlays + primary"),
@@ -354,10 +394,24 @@ fn probe_output(kms: &mut DrmBackend<'_>, out: &OutputInfo) {
             ],
         );
         pr.test(
-            &format!("(g3) {fmt} 1920x1080 overlay 0.5x to 960x540"),
+            &format!("(g3) {fmt} {w}x{h} overlay downscaled to 960x540"),
             &[
                 (primary, front, (w, h), fullscreen),
                 (ov, Some(fmt), (w, h), window),
+            ],
+        );
+        pr.test(
+            &format!("(g5) {fmt} 1024x576 overlay 0.94x to 960x540"),
+            &[
+                (primary, front, (w, h), fullscreen),
+                (ov, Some(fmt), (1024, 576), window),
+            ],
+        );
+        pr.test(
+            &format!("(g4) {fmt} 1280x720 overlay 0.75x to 960x540"),
+            &[
+                (primary, front, (w, h), fullscreen),
+                (ov, Some(fmt), (1280, 720), window),
             ],
         );
     }
