@@ -1486,6 +1486,28 @@ Fullscreen at 1.25 is unaffected (the buffer is 2560×1440 device, 1:1).
 It is a finding for the plane path (#3899) and for damage propagation
 through a scaled Surface, not fixed here.
 
+**Fixed by #3927.** The cause was in the scene, not the painter:
+`partial_device_rect` (nitro-scene `update.rs`) only mapped buffer damage
+for a whole-pixel translate or an integer scale and damaged the whole node
+otherwise, and at 1.25 every window root carries a 1.25 scale. It now
+bounds every axis-aligned mapping (texels rounded out to chroma pairs,
+widened by the samplers' reach, mapped as floats, rounded out and padded
+by one device pixel). Only rotated, sheared or flipped mappings still
+damage the whole node. Re-measured on testhost2 at
+scale 1.25 (task-3927, same method, two runs each, `nitro-dev` unit as
+above):
+
+| run | scale | `paint_us` p50 | p95 | max | `damage_px` mean | video paints |
+|---|---|---|---|---|---|---|
+| 1280×720 windowed, 30 fps | 1.25 | 2 565–2 569 | 2 631–2 645 | 4 389 | **82 264–82 308** | 255 |
+| 1280×720 windowed, 60 fps | 1.25 | **2 420–2 430** | 2 470–2 488 | 3 929 | **78 885–78 887** | 510 |
+
+Damage is ~1.56× the scale-1 figure, the area ratio of 1.25², instead of
+18× it, and paint drops ~5× (12.7 → 2.4 ms). The remaining gap to scale 1
+(~0.6 ms) is the per-pixel cost of the scaled NV12 path against the 1:1
+one, on ~1.6× the pixels. That is the plane path's work (#3899), not
+damage's.
+
 ## Multi-plane frame path in nitro-kms (#3913)
 
 `just footprint` (release, stripped), base `e25e494` → task-3913:
