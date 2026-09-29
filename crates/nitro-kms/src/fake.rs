@@ -18,6 +18,11 @@
 //! - Hotplug is simulated with `plug()` / `unplug()`: they queue an
 //!   `Event::Hotplug` **and make the poll fd readable**, so an idle
 //!   server wakes for it; the change takes effect on `rescan`.
+//! - Planes: each output has a configurable inventory
+//!   ([`FakeOutputSpec::planes`], default one non-scaling XRGB/ARGB
+//!   primary). `test_layout` is a rule-based acceptor (the rules are
+//!   listed on `FakeBackend::check_layout`), overridable with
+//!   `set_test_hook`, and every question is recorded in `test_log()`.
 
 use std::collections::HashMap;
 use std::io;
@@ -30,7 +35,184 @@ use rustix::time::{
 };
 
 use crate::drm::select::{ModeCandidate, ModeRequest, select_mode};
+use crate::planes::{
+    BufferId, ColorEncoding, ColorRange, Fourcc, MOD_LINEAR, PlaneAssignment, PlaneId, PlaneInfo,
+    PlaneKind, PlaneSource, Verdict, Zpos, rotation,
+};
 use crate::{BYTES_PER_PIXEL, Backend, BufferMut, Error, Event, Image, OutputId, OutputInfo, Rect};
+
+/// Description of one virtual plane. Build with [`FakePlaneSpec::primary`],
+/// [`FakePlaneSpec::overlay`] or [`FakePlaneSpec::cursor`] and the
+/// builder methods.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FakePlaneSpec {
+    /// Primary, overlay or cursor.
+    pub kind: PlaneKind,
+    /// Formats with their modifiers.
+    pub formats: Vec<(Fourcc, Vec<u64>)>,
+    /// Stacking; `None` for no `zpos` property.
+    pub zpos: Option<Zpos>,
+    /// Whether source and destination sizes may differ.
+    pub scaling: bool,
+    /// Allowed `dst / src` ratio per axis in percent, inclusive, when
+    /// `scaling` (e.g. `(50, 800)`: down to half, up to 8×).
+    pub scale_pct: (u32, u32),
+    /// Supported `rotation` bits; `ROTATE_0` is always accepted.
+    pub rotations: u32,
+    /// `COLOR_ENCODING` values offered.
+    pub color_encodings: Vec<ColorEncoding>,
+    /// `COLOR_RANGE` values offered.
+    pub color_ranges: Vec<ColorRange>,
+    /// Has `IN_FENCE_FD`.
+    pub in_fence: bool,
+}
+
+impl FakePlaneSpec {
+    fn new(kind: PlaneKind) -> Self {
+        Self {
+            kind,
+            formats: Vec::new(),
+            zpos: None,
+            scaling: false,
+            scale_pct: (0, u32::MAX),
+            rotations: rotation::ROTATE_0,
+            color_encodings: Vec::new(),
+            color_ranges: Vec::new(),
+            in_fence: true,
+        }
+    }
+
+    /// A primary plane with no formats yet.
+    #[must_use]
+    pub fn primary() -> Self {
+        Self::new(PlaneKind::Primary)
+    }
+
+    /// An overlay plane with no formats yet.
+    #[must_use]
+    pub fn overlay() -> Self {
+        Self::new(PlaneKind::Overlay)
+    }
+
+    /// A cursor plane with no formats yet.
+    #[must_use]
+    pub fn cursor() -> Self {
+        Self::new(PlaneKind::Cursor)
+    }
+
+    /// The default inventory's plane: a primary taking linear
+    /// `XRGB8888` and `ARGB8888`, no scaling.
+    #[must_use]
+    pub fn default_primary() -> Self {
+        Self::primary().formats(&[Fourcc::XRGB8888, Fourcc::ARGB8888])
+    }
+
+    /// Add formats, each with the linear modifier only.
+    #[must_use]
+    pub fn formats(mut self, formats: &[Fourcc]) -> Self {
+        for &f in formats {
+            self = self.format_mods(f, &[MOD_LINEAR]);
+        }
+        self
+    }
+
+    /// Add one format with the given modifiers.
+    #[must_use]
+    pub fn format_mods(mut self, format: Fourcc, mods: &[u64]) -> Self {
+        self.formats.push((format, mods.to_vec()));
+        self
+    }
+
+    /// Give it a `zpos` property.
+    #[must_use]
+    pub fn zpos(mut self, current: u64, min: u64, max: u64, immutable: bool) -> Self {
+        self.zpos = Some(Zpos {
+            current,
+            min,
+            max,
+            immutable,
+        });
+        self
+    }
+
+    /// Let it scale, by any ratio.
+    #[must_use]
+    pub fn scaling(mut self) -> Self {
+        self.scaling = true;
+        self
+    }
+
+    /// Let it scale, with `dst / src` between `min_pct` and `max_pct`
+    /// percent on each axis.
+    #[must_use]
+    pub fn scale_limits(mut self, min_pct: u32, max_pct: u32) -> Self {
+        self.scaling = true;
+        self.scale_pct = (min_pct, max_pct);
+        self
+    }
+
+    /// Supported `rotation` bits.
+    #[must_use]
+    pub fn rotations(mut self, mask: u32) -> Self {
+        self.rotations = mask | rotation::ROTATE_0;
+        self
+    }
+
+    /// `COLOR_ENCODING` / `COLOR_RANGE` values.
+    #[must_use]
+    pub fn color(mut self, encodings: &[ColorEncoding], ranges: &[ColorRange]) -> Self {
+        self.color_encodings = encodings.to_vec();
+        self.color_ranges = ranges.to_vec();
+        self
+    }
+
+    /// Whether it has `IN_FENCE_FD` (default yes).
+    #[must_use]
+    pub fn in_fence(mut self, yes: bool) -> Self {
+        self.in_fence = yes;
+        self
+    }
+
+    fn info(&self, id: PlaneId, crtc_mask: u32) -> PlaneInfo {
+        PlaneInfo {
+            id,
+            kind: self.kind,
+            crtc_mask,
+            formats: self.formats.clone(),
+            zpos: self.zpos,
+            rotations: self.rotations,
+            color_encodings: self
+                .color_encodings
+                .iter()
+                .map(|e| e.kernel_name().to_owned())
+                .collect(),
+            color_ranges: self
+                .color_ranges
+                .iter()
+                .map(|r| r.kernel_name().to_owned())
+                .collect(),
+            blend_modes: Vec::new(),
+            alpha: false,
+            damage_clips: self.kind == PlaneKind::Primary,
+            in_fence: self.in_fence,
+            scaling: Some(self.scaling),
+        }
+    }
+}
+
+/// One `test_layout` question and its answer, for tests to assert on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestRecord {
+    /// The output asked about.
+    pub output: OutputId,
+    /// The planes in the layout, in the order given.
+    pub planes: Vec<PlaneId>,
+    /// The answer.
+    pub verdict: Verdict,
+}
+
+/// A test's replacement for the rule-based acceptor.
+pub type TestHook = Box<dyn FnMut(OutputId, &[PlaneAssignment<'_>]) -> Verdict>;
 
 /// Description of one virtual output.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +237,9 @@ pub struct FakeOutputSpec {
     /// same fallback, same warning — which is what makes a mode test
     /// runnable without a monitor.
     pub modes: Vec<ModeCandidate>,
+    /// The planes this output's CRTC has. Empty means the default: one
+    /// [`FakePlaneSpec::default_primary`].
+    pub planes: Vec<FakePlaneSpec>,
 }
 
 impl FakeOutputSpec {
@@ -68,7 +253,15 @@ impl FakeOutputSpec {
             refresh_mhz: 60_000,
             phys_mm: (width * 254 / 960, height * 254 / 960),
             modes: Vec::new(),
+            planes: Vec::new(),
         }
+    }
+
+    /// Set the plane inventory (replacing the default single primary).
+    #[must_use]
+    pub fn planes(mut self, planes: Vec<FakePlaneSpec>) -> Self {
+        self.planes = planes;
+        self
     }
 
     /// Set the name.
@@ -137,10 +330,17 @@ struct FakeOutput {
     front: usize,
     pending: bool,
     sequence: u64,
+    /// Committed at least once (the DRM backend's "lit").
+    lit: bool,
+    planes: Vec<(PlaneId, FakePlaneSpec)>,
 }
 
 impl FakeOutput {
-    fn new(id: OutputId, spec: &FakeOutputSpec) -> Self {
+    fn crtc_mask(&self) -> u32 {
+        1 << ((self.info.id.0 - 1) % 32)
+    }
+
+    fn new(id: OutputId, spec: &FakeOutputSpec, planes: Vec<(PlaneId, FakePlaneSpec)>) -> Self {
         let stride = (spec.width * BYTES_PER_PIXEL).div_ceil(64) * 64;
         let len = (stride * spec.height) as usize;
         Self {
@@ -160,6 +360,8 @@ impl FakeOutput {
             front: 0,
             pending: false,
             sequence: 0,
+            lit: false,
+            planes,
         }
     }
 }
@@ -182,6 +384,13 @@ pub struct FakeBackend {
     /// The mode requests in force, by connector name.
     modes: HashMap<String, ModeRequest>,
     warnings: Vec<String>,
+    next_plane: u32,
+    next_buffer: u32,
+    /// `(format, width, height)` by buffer id.
+    buffers: HashMap<u32, (Fourcc, u32, u32)>,
+    max_active_planes: Option<usize>,
+    test_hook: Option<TestHook>,
+    test_log: Vec<TestRecord>,
 }
 
 impl FakeBackend {
@@ -209,6 +418,12 @@ impl FakeBackend {
             specs: Vec::new(),
             modes: HashMap::new(),
             warnings: Vec::new(),
+            next_plane: 1,
+            next_buffer: 1,
+            buffers: HashMap::new(),
+            max_active_planes: None,
+            test_hook: None,
+            test_log: Vec::new(),
         };
         for s in specs {
             this.add_output(s);
@@ -227,7 +442,20 @@ impl FakeBackend {
     fn add_output(&mut self, spec: &FakeOutputSpec) {
         let id = OutputId(self.next_id);
         self.next_id += 1;
-        self.outputs.push(FakeOutput::new(id, spec));
+        let specs = if spec.planes.is_empty() {
+            vec![FakePlaneSpec::default_primary()]
+        } else {
+            spec.planes.clone()
+        };
+        let planes = specs
+            .into_iter()
+            .map(|p| {
+                let pid = PlaneId(self.next_plane);
+                self.next_plane += 1;
+                (pid, p)
+            })
+            .collect();
+        self.outputs.push(FakeOutput::new(id, spec, planes));
         self.specs.push(spec.clone());
         self.apply_mode(self.outputs.len() - 1);
         self.infos.push(self.outputs.last().unwrap().info.clone());
@@ -441,6 +669,139 @@ impl FakeBackend {
         img.write_ppm(path)
     }
 
+    /// A layout limit standing in for shared scalers and memory
+    /// bandwidth: a layout with more than `n` planes is rejected with
+    /// `ENOSPC`. `None` (the default) is no limit.
+    pub fn set_max_active_planes(&mut self, n: Option<usize>) {
+        self.max_active_planes = n;
+    }
+
+    /// Replace the rule-based acceptor. The hook is asked only after the
+    /// ids have been checked (unknown planes and buffers are still `Err`).
+    pub fn set_test_hook(&mut self, hook: Option<TestHook>) {
+        self.test_hook = hook;
+    }
+
+    /// Every `test_layout` question that got a verdict, oldest first.
+    #[must_use]
+    pub fn test_log(&self) -> &[TestRecord] {
+        &self.test_log
+    }
+
+    /// Forget the test log.
+    pub fn clear_test_log(&mut self) {
+        self.test_log.clear();
+    }
+
+    /// The `(format, width, height)` of each live scanout buffer.
+    #[must_use]
+    pub fn buffer(&self, id: BufferId) -> Option<(Fourcc, u32, u32)> {
+        self.buffers.get(&id.0).copied()
+    }
+
+    /// The rules of the fake's `TEST_ONLY`. `EINVAL` when:
+    ///
+    /// - a plane appears twice;
+    /// - the source's format is not in the plane's list with the linear
+    ///   modifier (the output front is linear `XRGB8888`, buffers are
+    ///   linear);
+    /// - `src` is empty or leaves the buffer, or `dst` is empty or misses
+    ///   the output entirely;
+    /// - the plane must scale and cannot, or the ratio is outside its
+    ///   `scale_pct`;
+    /// - a requested `zpos` is outside the range or differs from an
+    ///   immutable one, or two planes end up with the same mutable zpos;
+    /// - a rotation, `COLOR_ENCODING`, `COLOR_RANGE` or `IN_FENCE_FD` the
+    ///   plane does not offer is requested.
+    ///
+    /// `ENOSPC` when the layout has more planes than
+    /// [`FakeBackend::set_max_active_planes`] allows.
+    fn check_layout(
+        o: &FakeOutput,
+        buffers: &HashMap<u32, (Fourcc, u32, u32)>,
+        max_active: Option<usize>,
+        layout: &[(&FakePlaneSpec, &PlaneAssignment<'_>)],
+    ) -> Verdict {
+        let no = Verdict::einval();
+        if let Some(n) = max_active
+            && layout.len() > n
+        {
+            return Verdict::Rejected(rustix::io::Errno::NOSPC.raw_os_error());
+        }
+        let mut zs: Vec<(u64, bool)> = Vec::new();
+        for (i, (spec, a)) in layout.iter().enumerate() {
+            if layout[..i].iter().any(|(_, b)| b.plane == a.plane) {
+                return no;
+            }
+            let (format, bw, bh) = match a.source {
+                PlaneSource::OutputFront => (Fourcc::XRGB8888, o.info.width, o.info.height),
+                PlaneSource::Buffer(id) => buffers[&id.0],
+            };
+            if !spec
+                .formats
+                .iter()
+                .any(|(f, m)| *f == format && m.contains(&MOD_LINEAR))
+            {
+                return no;
+            }
+            let (sx, sy, sw, sh) = (
+                u64::from(a.src.x),
+                u64::from(a.src.y),
+                u64::from(a.src.w),
+                u64::from(a.src.h),
+            );
+            if sw == 0 || sh == 0 || sx + sw > u64::from(bw) << 16 || sy + sh > u64::from(bh) << 16
+            {
+                return no;
+            }
+            if a.dst.clipped_to(o.info.width, o.info.height).is_none() {
+                return no;
+            }
+            if a.scales() {
+                if !spec.scaling {
+                    return no;
+                }
+                let pct = |d: u32, s: u64| u64::from(d) * 100 * 65536 / s;
+                let (lo, hi) = (u64::from(spec.scale_pct.0), u64::from(spec.scale_pct.1));
+                for r in [pct(a.dst.w, sw), pct(a.dst.h, sh)] {
+                    if r < lo || r > hi {
+                        return no;
+                    }
+                }
+            }
+            match (a.zpos, spec.zpos) {
+                (Some(_), None) => return no,
+                (Some(z), Some(zp)) if z < zp.min || z > zp.max => return no,
+                (Some(z), Some(zp)) if zp.immutable && z != zp.current => return no,
+                _ => {}
+            }
+            if let Some(zp) = spec.zpos {
+                let z = a.zpos.unwrap_or(zp.current);
+                if zs
+                    .iter()
+                    .any(|&(other, imm)| other == z && !(imm && zp.immutable))
+                {
+                    return no;
+                }
+                zs.push((z, zp.immutable));
+            }
+            if let Some(r) = a.rotation
+                && r & !(spec.rotations | rotation::ROTATE_0) != 0
+            {
+                return no;
+            }
+            if a.color_encoding
+                .is_some_and(|e| !spec.color_encodings.contains(&e))
+                || a.color_range
+                    .is_some_and(|r| !spec.color_ranges.contains(&r))
+                || (a.in_fence.is_some() && !spec.in_fence)
+            {
+                return no;
+            }
+        }
+        Verdict::Accepted
+    }
+
     fn output_mut(&mut self, id: OutputId) -> Result<&mut FakeOutput, Error> {
         self.outputs
             .iter_mut()
@@ -494,6 +855,7 @@ impl Backend for FakeBackend {
         }
         o.front = 1 - o.front;
         o.pending = true;
+        o.lit = true;
         self.damage_log.push((output, damage.to_vec()));
         self.arm()
     }
@@ -573,6 +935,84 @@ impl Backend for FakeBackend {
             .position(|o| o.info.id == output)
             .map(|i| self.specs[i].mode_table())
             .unwrap_or_default()
+    }
+
+    fn planes(&self, output: OutputId) -> Vec<PlaneInfo> {
+        let Some(o) = self.outputs.iter().find(|o| o.info.id == output) else {
+            return Vec::new();
+        };
+        let mask = o.crtc_mask();
+        let mut v: Vec<PlaneInfo> = o.planes.iter().map(|(id, s)| s.info(*id, mask)).collect();
+        v.sort_by_key(|p| {
+            let k = match p.kind {
+                PlaneKind::Primary => 0,
+                PlaneKind::Overlay => 1,
+                PlaneKind::Cursor => 2,
+            };
+            (k, p.id)
+        });
+        v
+    }
+
+    fn alloc_buffer(&mut self, format: Fourcc, width: u32, height: u32) -> Result<BufferId, Error> {
+        if width == 0 || height == 0 {
+            return Err(Error::Unsupported("empty scanout buffers"));
+        }
+        if format == Fourcc::NV12 && (!width.is_multiple_of(2) || !height.is_multiple_of(2)) {
+            return Err(Error::Unsupported("odd NV12 sizes"));
+        }
+        let id = self.next_buffer;
+        self.next_buffer += 1;
+        self.buffers.insert(id, (format, width, height));
+        Ok(BufferId(id))
+    }
+
+    fn free_buffer(&mut self, id: BufferId) {
+        self.buffers.remove(&id.0);
+    }
+
+    fn test_layout(
+        &mut self,
+        output: OutputId,
+        layout: &[PlaneAssignment<'_>],
+    ) -> Result<Verdict, Error> {
+        if self.paused {
+            return Err(Error::Paused);
+        }
+        let o = self
+            .outputs
+            .iter()
+            .find(|o| o.info.id == output)
+            .ok_or(Error::NoSuchOutput(output))?;
+        if !o.lit {
+            return Err(Error::NotLit(output));
+        }
+        let mut pairs = Vec::with_capacity(layout.len());
+        for a in layout {
+            let spec = o
+                .planes
+                .iter()
+                .find(|(id, _)| *id == a.plane)
+                .map(|(_, s)| s)
+                .ok_or(Error::NoSuchObject("plane on this output", a.plane.0))?;
+            if let PlaneSource::Buffer(b) = a.source
+                && !self.buffers.contains_key(&b.0)
+            {
+                return Err(Error::NoSuchObject("buffer", b.0));
+            }
+            pairs.push((spec, a));
+        }
+        let verdict = if let Some(hook) = self.test_hook.as_mut() {
+            hook(output, layout)
+        } else {
+            Self::check_layout(o, &self.buffers, self.max_active_planes, &pairs)
+        };
+        self.test_log.push(TestRecord {
+            output,
+            planes: layout.iter().map(|a| a.plane).collect(),
+            verdict,
+        });
+        Ok(verdict)
     }
 
     fn pause(&mut self) {
@@ -922,6 +1362,236 @@ mod tests {
         assert_eq!(&bytes[11..14], &[0x12, 0x34, 0x56]);
         assert_eq!(bytes.len(), 11 + 8 * 4 * 3);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // -- planes ----------------------------------------------------------------
+
+    use crate::planes::SrcRect;
+
+    /// A 1920×1080 output with an HSW-like inventory: XRGB primary, a
+    /// scaling YUYV/NV12 overlay with fixed zpos above it, a cursor.
+    fn with_planes() -> (FakeBackend, OutputId, Vec<PlaneInfo>) {
+        let spec = FakeOutputSpec::new(1920, 1080).planes(vec![
+            FakePlaneSpec::default_primary().zpos(0, 0, 0, true),
+            FakePlaneSpec::overlay()
+                .formats(&[Fourcc::XRGB8888, Fourcc::YUYV, Fourcc::NV12])
+                .zpos(1, 1, 1, true)
+                .scale_limits(50, 800)
+                .color(
+                    &[ColorEncoding::Bt601, ColorEncoding::Bt709],
+                    &[ColorRange::Limited],
+                ),
+            FakePlaneSpec::cursor()
+                .formats(&[Fourcc::ARGB8888])
+                .zpos(2, 2, 2, true),
+        ]);
+        let mut b = FakeBackend::new(&[spec]).unwrap();
+        let id = b.outputs()[0].id;
+        b.commit(id, &[]).unwrap();
+        let planes = b.planes(id);
+        (b, id, planes)
+    }
+
+    fn full(plane: PlaneId, src: PlaneSource, w: u32, h: u32) -> PlaneAssignment<'static> {
+        PlaneAssignment::new(plane, src, SrcRect::whole(w, h), Rect::new(0, 0, w, h))
+    }
+
+    #[test]
+    fn default_inventory_is_one_linear_primary() {
+        let (mut b, id) = fake();
+        let p = b.planes(id);
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].kind, PlaneKind::Primary);
+        assert!(p[0].supports(Fourcc::XRGB8888, MOD_LINEAR));
+        assert!(!p[0].supports(Fourcc::NV12, MOD_LINEAR));
+        assert_eq!(p[0].scaling, Some(false));
+        assert!(b.planes(OutputId(99)).is_empty());
+        // Not lit before its first commit, like the DRM backend.
+        let a = full(p[0].id, PlaneSource::OutputFront, 8, 4);
+        assert!(matches!(b.test_layout(id, &[a]), Err(Error::NotLit(_))));
+        b.commit(id, &[]).unwrap();
+        assert_eq!(b.test_layout(id, &[a]).unwrap(), Verdict::Accepted);
+    }
+
+    #[test]
+    fn plane_ids_are_unique_across_outputs() {
+        let b = FakeBackend::new(&[FakeOutputSpec::new(4, 4), FakeOutputSpec::new(4, 4)]).unwrap();
+        let a = b.planes(b.outputs()[0].id);
+        let c = b.planes(b.outputs()[1].id);
+        assert_ne!(a[0].id, c[0].id);
+        assert_ne!(a[0].crtc_mask, c[0].crtc_mask);
+    }
+
+    #[test]
+    fn nv12_overlay_accepted_by_format_and_rejected_on_the_primary() {
+        let (mut b, id, p) = with_planes();
+        let (primary, overlay) = (p[0].id, p[1].id);
+        let nv12 = b.alloc_buffer(Fourcc::NV12, 1920, 1080).unwrap();
+        let ok = [
+            full(primary, PlaneSource::OutputFront, 1920, 1080),
+            PlaneAssignment {
+                color_encoding: Some(ColorEncoding::Bt709),
+                color_range: Some(ColorRange::Limited),
+                ..full(overlay, PlaneSource::Buffer(nv12), 1920, 1080)
+            },
+        ];
+        assert_eq!(b.test_layout(id, &ok).unwrap(), Verdict::Accepted);
+        let bad = [full(primary, PlaneSource::Buffer(nv12), 1920, 1080)];
+        assert_eq!(b.test_layout(id, &bad).unwrap(), Verdict::einval());
+        // An encoding the plane does not offer.
+        let bt2020 = [PlaneAssignment {
+            color_encoding: Some(ColorEncoding::Bt2020),
+            ..full(overlay, PlaneSource::Buffer(nv12), 1920, 1080)
+        }];
+        assert_eq!(b.test_layout(id, &bt2020).unwrap(), Verdict::einval());
+        let log = b.test_log();
+        assert_eq!(log.len(), 3);
+        assert_eq!(log[0].planes, vec![primary, overlay]);
+        assert!(log[0].verdict.accepted());
+    }
+
+    #[test]
+    fn scaling_follows_the_plane() {
+        let (mut b, id, p) = with_planes();
+        let buf = b.alloc_buffer(Fourcc::XRGB8888, 960, 540).unwrap();
+        let scaled = |plane| {
+            PlaneAssignment::new(
+                plane,
+                PlaneSource::Buffer(buf),
+                SrcRect::whole(960, 540),
+                Rect::new(0, 0, 1920, 1080),
+            )
+        };
+        assert_eq!(
+            b.test_layout(id, &[scaled(p[0].id)]).unwrap(),
+            Verdict::einval()
+        );
+        assert_eq!(
+            b.test_layout(id, &[scaled(p[1].id)]).unwrap(),
+            Verdict::Accepted
+        );
+        // Beyond 8× is outside the overlay's limits.
+        let tiny = b.alloc_buffer(Fourcc::XRGB8888, 100, 100).unwrap();
+        let too_far = PlaneAssignment::new(
+            p[1].id,
+            PlaneSource::Buffer(tiny),
+            SrcRect::whole(100, 100),
+            Rect::new(0, 0, 1000, 1000),
+        );
+        assert_eq!(b.test_layout(id, &[too_far]).unwrap(), Verdict::einval());
+        // A source rectangle outside the buffer.
+        let oob = PlaneAssignment::new(
+            p[1].id,
+            PlaneSource::Buffer(tiny),
+            SrcRect::pixels(50, 0, 100, 100),
+            Rect::new(0, 0, 100, 100),
+        );
+        assert_eq!(b.test_layout(id, &[oob]).unwrap(), Verdict::einval());
+    }
+
+    #[test]
+    fn zpos_rules() {
+        let (mut b, id, p) = with_planes();
+        let front = |pl| full(pl, PlaneSource::OutputFront, 1920, 1080);
+        // Immutable zpos: its own value is fine, moving it is not.
+        assert!(
+            b.test_layout(id, &[front(p[1].id).with_zpos(1)])
+                .unwrap()
+                .accepted()
+        );
+        assert_eq!(
+            b.test_layout(id, &[front(p[1].id).with_zpos(0)]).unwrap(),
+            Verdict::einval()
+        );
+        // Mutable zpos: two planes may not share a value.
+        let spec = FakeOutputSpec::new(64, 64).planes(vec![
+            FakePlaneSpec::default_primary().zpos(0, 0, 3, false),
+            FakePlaneSpec::overlay()
+                .formats(&[Fourcc::XRGB8888])
+                .zpos(1, 0, 3, false),
+        ]);
+        let mut m = FakeBackend::new(&[spec]).unwrap();
+        let mid = m.outputs()[0].id;
+        m.commit(mid, &[]).unwrap();
+        let mp = m.planes(mid);
+        let f = |pl| full(pl, PlaneSource::OutputFront, 64, 64);
+        let under = [f(mp[0].id).with_zpos(2), f(mp[1].id).with_zpos(1)];
+        assert!(m.test_layout(mid, &under).unwrap().accepted());
+        let clash = [f(mp[0].id).with_zpos(1), f(mp[1].id)];
+        assert_eq!(m.test_layout(mid, &clash).unwrap(), Verdict::einval());
+        let range = [f(mp[0].id).with_zpos(4)];
+        assert_eq!(m.test_layout(mid, &range).unwrap(), Verdict::einval());
+    }
+
+    #[test]
+    fn duplicate_plane_and_plane_budget() {
+        let (mut b, id, p) = with_planes();
+        let f = |pl| full(pl, PlaneSource::OutputFront, 1920, 1080);
+        assert_eq!(
+            b.test_layout(id, &[f(p[0].id), f(p[0].id)]).unwrap(),
+            Verdict::einval()
+        );
+        let cur = b.alloc_buffer(Fourcc::ARGB8888, 64, 64).unwrap();
+        let three = [
+            f(p[0].id),
+            f(p[1].id),
+            full(p[2].id, PlaneSource::Buffer(cur), 64, 64),
+        ];
+        assert!(b.test_layout(id, &three).unwrap().accepted());
+        b.set_max_active_planes(Some(2));
+        assert_eq!(
+            b.test_layout(id, &three).unwrap(),
+            Verdict::Rejected(rustix::io::Errno::NOSPC.raw_os_error())
+        );
+    }
+
+    #[test]
+    fn unknown_ids_and_pause_are_errors_not_verdicts() {
+        let (mut b, id, p) = with_planes();
+        let buf = b.alloc_buffer(Fourcc::YUYV, 32, 32).unwrap();
+        b.free_buffer(buf);
+        let gone = [full(p[1].id, PlaneSource::Buffer(buf), 32, 32)];
+        assert!(matches!(
+            b.test_layout(id, &gone),
+            Err(Error::NoSuchObject("buffer", _))
+        ));
+        let alien = [full(PlaneId(999), PlaneSource::OutputFront, 1920, 1080)];
+        assert!(matches!(
+            b.test_layout(id, &alien),
+            Err(Error::NoSuchObject(..))
+        ));
+        assert!(matches!(
+            b.test_layout(OutputId(9), &[]),
+            Err(Error::NoSuchOutput(_))
+        ));
+        b.pause();
+        assert!(matches!(b.test_layout(id, &[]), Err(Error::Paused)));
+        assert!(b.test_log().is_empty(), "errors are not logged as verdicts");
+        assert!(b.alloc_buffer(Fourcc::NV12, 3, 2).is_err());
+    }
+
+    #[test]
+    fn a_test_hook_replaces_the_rules() {
+        let (mut b, id, p) = with_planes();
+        b.set_test_hook(Some(Box::new(|_, layout| {
+            if layout.len() > 1 {
+                Verdict::Rejected(28)
+            } else {
+                Verdict::Accepted
+            }
+        })));
+        let f = |pl| full(pl, PlaneSource::OutputFront, 1920, 1080);
+        assert!(b.test_layout(id, &[f(p[0].id)]).unwrap().accepted());
+        assert_eq!(
+            b.test_layout(id, &[f(p[0].id), f(p[1].id)]).unwrap(),
+            Verdict::Rejected(28)
+        );
+        b.set_test_hook(None);
+        assert!(
+            b.test_layout(id, &[f(p[0].id), f(p[1].id)])
+                .unwrap()
+                .accepted()
+        );
     }
 
     #[test]

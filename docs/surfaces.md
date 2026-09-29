@@ -74,7 +74,9 @@ decide.
 
 Underlay on hardware with fixed zpos (Intel) is achieved by assignment,
 not by reordering: the video goes on the lowest plane and the UI on a
-plane above it.
+plane above it. On the Haswell test box that works only for RGB video: its
+primary lists no YUV format, so YUV Surfaces there can only be overlays
+*above* the UI (measured, #3895; see "Plane counts").
 
 - Candidate configurations are validated with **`TEST_ONLY` atomic
   commits** — advertised capability is not the truth, the kernel's answer
@@ -213,8 +215,14 @@ default is considered settled.
 
 ## Plane counts
 
-**From memory, unverified — to be replaced by probe data** from the
-plane-discovery tool (work item 1):
+**Measured on the test box** (#3895; the full inventory and `TEST_ONLY`
+results are in [`crates/nitro-kms/README.md`](../crates/nitro-kms/README.md#planes-discovery-test_only-and-the-hsw-gt1-inventory-measured)):
+
+| hardware | planes per CRTC (measured) |
+|---|---|
+| Intel Haswell GT1 (test box) | primary + **1 overlay** + cursor, all fixed zpos (0/1/2). Overlay: packed YUV 4:2:2 (YUYV…) and XRGB, **no NV12** (refused at AddFB2), **no ARGB**, no scaling accepted with linear buffers. The primary must cover the CRTC and cannot scale. |
+
+For comparison, **from memory, unverified**:
 
 | hardware | usable planes (rough) |
 |---|---|

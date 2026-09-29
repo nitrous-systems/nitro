@@ -23,6 +23,7 @@
 //!    `Event::Flipped`; uevents off the netlink socket become
 //!    `Event::Hotplug`.
 
+mod planes;
 pub mod select;
 
 use std::collections::HashMap;
@@ -38,6 +39,9 @@ use ::drm::control::{
 };
 use ::drm::{ClientCapability, Device as BasicDevice};
 
+use crate::planes::{
+    BufferId, Fourcc, PlaneAssignment, PlaneInfo, PlaneKind, PlaneSource, Verdict,
+};
 use crate::uevent::UeventSocket;
 use crate::{BYTES_PER_PIXEL, Backend, BufferMut, Error, Event, Image, OutputId, OutputInfo, Rect};
 use select::{Assignment, ConnectorCandidate, ModeCandidate, PlaneCandidate};
@@ -467,6 +471,11 @@ pub struct DrmBackend<'fd> {
     /// Non-fatal complaints about the mode configuration, for the caller
     /// to log. See [`DrmBackend::take_warnings`].
     warnings: Vec<String>,
+    /// What each plane can do, by plane id; rebuilt on every rescan.
+    discovered: HashMap<u32, planes::Discovered>,
+    /// Scanout buffers from `alloc_buffer`, by [`BufferId`].
+    buffers: HashMap<u32, planes::ScanoutBuf>,
+    next_buffer: u32,
 }
 
 impl<'fd> DrmBackend<'fd> {
@@ -520,6 +529,9 @@ impl<'fd> DrmBackend<'fd> {
             damage_scratch: Vec::new(),
             opts: opts.clone(),
             warnings: Vec::new(),
+            discovered: HashMap::new(),
+            buffers: HashMap::new(),
+            next_buffer: 1,
         };
         this.rescan()?;
         Ok(this)
@@ -574,10 +586,13 @@ impl<'fd> DrmBackend<'fd> {
             );
         }
         self.plane_props.clear();
+        self.discovered.clear();
         for &p in &self.planes {
             let map = props_of(&self.card, p)?;
             self.plane_props
                 .insert(p.into(), PlaneProps::from_map(&map)?);
+            self.discovered
+                .insert(p.into(), planes::discover(&self.card, &self.res, p, &map));
         }
         Ok(())
     }
@@ -1361,6 +1376,125 @@ impl Backend for DrmBackend<'_> {
         info.modes().iter().map(mode_candidate).collect()
     }
 
+    fn planes(&self, output: OutputId) -> Vec<PlaneInfo> {
+        let Some(o) = self.output(output) else {
+            return Vec::new();
+        };
+        let bit = 1u32 << o.crtc_idx;
+        let mut v: Vec<PlaneInfo> = self
+            .discovered
+            .values()
+            .filter(|d| d.info.crtc_mask & bit != 0)
+            .map(|d| d.info.clone())
+            .collect();
+        v.sort_by_key(|p| {
+            let k = match p.kind {
+                PlaneKind::Primary => 0,
+                PlaneKind::Overlay => 1,
+                PlaneKind::Cursor => 2,
+            };
+            (k, p.id)
+        });
+        v
+    }
+
+    fn alloc_buffer(&mut self, format: Fourcc, width: u32, height: u32) -> Result<BufferId, Error> {
+        let b = planes::ScanoutBuf::create(&self.card, format, width, height)?;
+        let id = self.next_buffer;
+        self.next_buffer += 1;
+        self.buffers.insert(id, b);
+        Ok(BufferId(id))
+    }
+
+    fn free_buffer(&mut self, id: BufferId) {
+        if let Some(b) = self.buffers.remove(&id.0) {
+            b.destroy(&self.card);
+        }
+    }
+
+    fn test_layout(
+        &mut self,
+        output: OutputId,
+        layout: &[PlaneAssignment<'_>],
+    ) -> Result<Verdict, Error> {
+        if self.paused {
+            return Err(Error::Paused);
+        }
+        let out = self.output(output).ok_or(Error::NoSuchOutput(output))?;
+
+        if !out.lit {
+            return Err(Error::NotLit(output));
+        }
+        let bit = 1u32 << out.crtc_idx;
+
+        let mut req = AtomicModeReq::new();
+        for a in layout {
+            let disc = self
+                .discovered
+                .get(&a.plane.0)
+                .filter(|d| d.info.crtc_mask & bit != 0)
+                .ok_or(Error::NoSuchObject("plane on this output", a.plane.0))?;
+            let pp = &self.plane_props[&a.plane.0];
+            let p = plane::Handle::from(
+                ::drm::control::RawResourceHandle::new(a.plane.0)
+                    .ok_or(Error::NoSuchObject("plane", a.plane.0))?,
+            );
+            let fb = match a.source {
+                PlaneSource::OutputFront => out.bufs[out.front].fb,
+
+                PlaneSource::Buffer(id) => {
+                    self.buffers
+                        .get(&id.0)
+                        .ok_or(Error::NoSuchObject("buffer", id.0))?
+                        .fb
+                }
+            };
+            req.add_property(p, pp.fb_id, property::Value::Framebuffer(Some(fb)));
+            req.add_property(p, pp.crtc_id, property::Value::CRTC(Some(out.crtc)));
+
+            req.add_property(p, pp.src_x, property::Value::UnsignedRange(a.src.x.into()));
+            req.add_property(p, pp.src_y, property::Value::UnsignedRange(a.src.y.into()));
+            req.add_property(p, pp.src_w, property::Value::UnsignedRange(a.src.w.into()));
+            req.add_property(p, pp.src_h, property::Value::UnsignedRange(a.src.h.into()));
+            req.add_property(p, pp.crtc_x, property::Value::SignedRange(a.dst.x.into()));
+            req.add_property(p, pp.crtc_y, property::Value::SignedRange(a.dst.y.into()));
+            req.add_property(p, pp.crtc_w, property::Value::UnsignedRange(a.dst.w.into()));
+            req.add_property(p, pp.crtc_h, property::Value::UnsignedRange(a.dst.h.into()));
+            // The optional properties. Asking for one the plane lacks (or an
+            // immutable zpos other than its own) is answered here with the
+            // EINVAL the kernel would give, without a round trip.
+            if !planes::add_optional(&mut req, p, disc, a) {
+                return Ok(Verdict::einval());
+            }
+        }
+        // The test describes the whole CRTC: every other plane that can go
+        // on it is switched off, so what is left on it from before cannot
+        // make the answer depend on history.
+        for &p in &self.planes {
+            let raw: u32 = p.into();
+            let on_crtc = self
+                .discovered
+                .get(&raw)
+                .is_some_and(|d| d.info.crtc_mask & bit != 0);
+            if !on_crtc || layout.iter().any(|a| a.plane.0 == raw) {
+                continue;
+            }
+            let pp = &self.plane_props[&raw];
+            req.add_property(p, pp.fb_id, property::Value::Framebuffer(None));
+            req.add_property(p, pp.crtc_id, property::Value::CRTC(None));
+        }
+        match self.card.atomic_commit(AtomicCommitFlags::TEST_ONLY, req) {
+            Ok(()) => Ok(Verdict::Accepted),
+            Err(e) => match e.raw_os_error() {
+                Some(errno) => Ok(Verdict::Rejected(errno)),
+                None => Err(Error::Io {
+                    op: "atomic test commit",
+                    source: e,
+                }),
+            },
+        }
+    }
+
     fn read_front(&mut self, output: OutputId) -> Result<Image, Error> {
         let o = self.output(output).ok_or(Error::NoSuchOutput(output))?;
         let (w, h) = (o.info.width, o.info.height);
@@ -1384,6 +1518,9 @@ impl Drop for DrmBackend<'_> {
     fn drop(&mut self) {
         for o in self.outputs.drain(..) {
             o.destroy(&self.card);
+        }
+        for (_, b) in self.buffers.drain() {
+            b.destroy(&self.card);
         }
         // CRTC state is left as is: the kernel restores fbcon (or the next
         // master sets its own) when the fd's master status goes away.

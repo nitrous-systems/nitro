@@ -22,11 +22,16 @@
 
 pub mod drm;
 pub mod fake;
+pub mod planes;
 pub mod uevent;
 
 pub use crate::drm::select::ModeCandidate;
 pub use crate::drm::{DrmBackend, DrmFd, DrmOptions, ModeRequest, Modeline};
-pub use crate::fake::{FakeBackend, FakeOutputSpec};
+pub use crate::fake::{FakeBackend, FakeOutputSpec, FakePlaneSpec, TestRecord};
+pub use crate::planes::{
+    BufferId, ColorEncoding, ColorRange, Fourcc, MOD_LINEAR, PlaneAssignment, PlaneId, PlaneInfo,
+    PlaneKind, PlaneSource, SrcRect, Verdict, Zpos,
+};
 
 use std::collections::HashMap;
 use std::fmt;
@@ -251,6 +256,11 @@ pub enum Error {
     /// A connector is connected but no CRTC + primary plane could be found
     /// for it. Carries the connector name.
     NoCrtc(String),
+    /// The output has not been committed yet, so its CRTC is not ours
+    /// and a `TEST_ONLY` layout on it would answer the wrong question.
+    NotLit(OutputId),
+    /// No such plane on this output, or no such scanout buffer.
+    NoSuchObject(&'static str, u32),
 }
 
 impl fmt::Display for Error {
@@ -265,6 +275,8 @@ impl fmt::Display for Error {
             Error::FlipPending(id) => write!(f, "{id}: commit already in flight"),
             Error::Paused => write!(f, "backend is paused"),
             Error::NoCrtc(name) => write!(f, "{name}: no free CRTC + primary plane"),
+            Error::NotLit(id) => write!(f, "{id}: not lit yet (commit a frame first)"),
+            Error::NoSuchObject(what, id) => write!(f, "no such {what}: {id}"),
         }
     }
 }
@@ -443,6 +455,62 @@ pub trait Backend {
     /// command.
     fn available_modes(&self, _output: OutputId) -> Vec<ModeCandidate> {
         Vec::new()
+    }
+
+    /// Every plane that can go on `output`'s CRTC, primary first, then
+    /// overlays, then cursors (each group by id).
+    ///
+    /// Read once per [`Backend::rescan`], so this is cheap. An unknown
+    /// id, or a backend that does not report planes, gives an empty list.
+    fn planes(&self, _output: OutputId) -> Vec<PlaneInfo> {
+        Vec::new()
+    }
+
+    /// Allocate a linear scanout buffer of `format` (`XRGB8888`,
+    /// `ARGB8888`, `YUYV`/`UYVY` or `NV12`) for use in a
+    /// [`PlaneAssignment`]. Contents are unspecified (zeroed today).
+    ///
+    /// # Errors
+    /// [`Error::Unsupported`] on a backend without scanout buffers or for
+    /// a format it cannot allocate; [`Error::Io`] when the kernel refuses
+    /// the buffer or its framebuffer (i915 checks the format at `AddFB2`,
+    /// so an unsupported format can fail here, before any test).
+    fn alloc_buffer(
+        &mut self,
+        _format: Fourcc,
+        _width: u32,
+        _height: u32,
+    ) -> Result<BufferId, Error> {
+        Err(Error::Unsupported("scanout buffers"))
+    }
+
+    /// Free a buffer from [`Backend::alloc_buffer`]. Unknown ids are
+    /// ignored. A buffer must not be freed while a layout using it is on
+    /// screen; after a `TEST_ONLY` it can go at once.
+    fn free_buffer(&mut self, _id: BufferId) {}
+
+    /// Ask whether `layout` would work as `output`'s next commit, without
+    /// touching the screen (`DRM_MODE_ATOMIC_TEST_ONLY`).
+    ///
+    /// The layout describes the **whole** CRTC: every plane that can go
+    /// on it and is not listed is disabled in the test, the primary
+    /// included. No `ALLOW_MODESET`, so a layout that would need a
+    /// modeset is rejected — the truth for a decision taken at flip time.
+    ///
+    /// `Ok(Rejected(errno))` means the display engine said no. `Err`
+    /// means the question could not be asked.
+    ///
+    /// # Errors
+    /// [`Error::Unsupported`] on a backend without planes,
+    /// [`Error::NoSuchOutput`], [`Error::NotLit`] before the output's
+    /// first commit, [`Error::Paused`], [`Error::NoSuchObject`] for a
+    /// plane that is not this output's or an unknown buffer.
+    fn test_layout(
+        &mut self,
+        _output: OutputId,
+        _layout: &[PlaneAssignment<'_>],
+    ) -> Result<Verdict, Error> {
+        Err(Error::Unsupported("plane layouts"))
     }
 }
 

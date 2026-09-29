@@ -199,6 +199,27 @@ forbid; that failure is non-fatal and reported by `hotplug_error()`.
   next `dispatch` or `tick`) and take effect on `rescan`.
 - `read_front` returns the front buffer; `write_ppm(id, path)` dumps it as
   P6 for eyeballing.
+- Planes: `FakeOutputSpec::planes(vec![FakePlaneSpec::…])` sets an output's
+  inventory. Without it the output gets one primary plane with linear
+  XRGB8888 + ARGB8888 and no scaling. Plane ids are unique per backend.
+  Each output is its own CRTC (`crtc_mask` bit `(id - 1) % 32`).
+- `alloc_buffer` / `free_buffer` only record `(format, w, h)`
+  (`buffer(id)` reads it back). Odd NV12 sizes are refused.
+- `test_layout` follows the DRM contract (`Paused`, `NotLit` before the
+  first commit, `NoSuchObject` for a foreign plane or an unknown buffer).
+  The verdict comes from a rule-based acceptor, which says `EINVAL` for:
+  - a duplicate plane
+  - a format that is not listed with LINEAR
+  - `src` outside the buffer, or `dst` off the output
+  - scaling on a non-scaling plane, or outside its `scale_limits`
+  - zpos outside its range, an immutable zpos being moved, or two planes
+    with equal mutable zpos
+  - a rotation, `COLOR_*` value or in-fence the plane doesn't offer
+
+  It says `ENOSPC` beyond `set_max_active_planes(n)`, which stands in
+  for shared scalers and bandwidth. `set_test_hook` replaces the rules
+  outright. `test_log()` records `(output, planes, verdict)` for every
+  answered question.
 
 ## Hardware smoke test
 
@@ -212,3 +233,147 @@ Opens the card directly (no libseat; needs root or a VT with no other
 master), modesets every output, shows a gradient with a bar moving one
 column per flip for 3 s, prints flip-interval stats, then exercises
 `rescan` and `pause`/`resume`. Expect ~16.7 ms mean at 60 Hz.
+
+## Planes: discovery, `TEST_ONLY` and the HSW GT1 inventory (measured)
+
+`Backend::planes(output)` lists every plane that can go on the output's
+CRTC: primary first, then overlays, then cursors. For each plane it
+reports:
+- kind and `possible_crtcs`
+- formats with their modifiers, parsed from the `IN_FORMATS` blob, or
+  `formats()` + LINEAR when the plane has no such blob
+- `zpos` (current value, range, and whether it is immutable)
+- the `rotation` bits
+- the `COLOR_ENCODING` / `COLOR_RANGE` / `pixel blend mode` names as the
+  kernel spells them
+- `alpha`, `FB_DAMAGE_CLIPS` and `IN_FENCE_FD`
+
+Discovery runs once per `rescan`, never per frame, and a property that
+cannot be read is reported as absent rather than failing. `scaling` is
+`None` on DRM: no property says whether a plane scales, so only a test
+commit can tell.
+
+`alloc_buffer(format, w, h)` makes a linear dumb scanout buffer.
+Supported formats are XRGB/ARGB/XBGR (32 bpp), YUYV/UYVY (16 bpp), and
+NV12 (one dumb buffer of `h * 3/2` rows, with the CbCr plane at
+`pitch * h`). i915 validates the format at `AddFB2`, so an unsupported
+format fails here with `Error::Io`, before any test runs.
+
+`test_layout(output, &[PlaneAssignment])` sends one atomic commit with
+`DRM_MODE_ATOMIC_TEST_ONLY`. The contract:
+- **The layout is the whole CRTC.** Every plane that can go on the CRTC
+  and is not listed is disabled in the test, the primary included, so
+  the answer doesn't depend on what is on screen.
+- **No `ALLOW_MODESET`.** A layout that would need a modeset is
+  rejected, which is the right answer for a decision made at flip time.
+- **The output must be lit** (committed once): `Error::NotLit` before
+  then, and `Error::Paused` while paused.
+- `Ok(Verdict::Rejected(errno))` means the display engine said no. `Err`
+  means the question could not be asked: a stale output, a plane that
+  isn't this output's, or an unknown buffer.
+- If a zpos, rotation, `COLOR_*` value or in-fence is requested on a
+  plane without that property, or an immutable zpos is asked to move,
+  the answer is `Rejected(EINVAL)` without a round trip, because that is
+  what the kernel would say.
+- `PlaneSource::OutputFront` is the output's current front buffer.
+  The frame path (`commit`, `flip`, the modesets) is untouched; it still
+  uses the primary plane only.
+
+### Probe
+
+```sh
+cargo build --release -p nitro-kms --example planes_probe
+rsync target/release/examples/planes_probe kaspar@192.168.1.204:tmp/
+ssh kaspar@192.168.1.204 'sudo systemctl stop nitro-dev; sudo ~/tmp/planes_probe /dev/dri/card1; sudo systemctl start nitro-dev'
+```
+
+The probe lights each output with one black frame and prints the
+inventory. It then test-commits a fixed set of layouts:
+- XRGB on the primary
+- NV12 and YUYV overlays at 1:1, as a window, scaled, and below the
+  primary
+- two overlays
+- XRGB/ARGB overlays at 1:1, 2× and 0.5×
+- cursor sizes
+
+A buffer the kernel refuses at `AddFB2` shows as `SKIP`.
+
+### Test box: Intel HD (Haswell GT1), i915, kernel 7.0.0-15-generic, 1920×1080 HDMI — 2026-09-29
+
+```text
+output#1 HDMI-A-1 1920x1080: 3 planes
+  plane#34 primary crtcs=0b01 zpos=0 [0..0] immutable rotation=rotate-0|rotate-180
+    COLOR_ENCODING: -; COLOR_RANGE: -
+    blend: -; alpha=false damage_clips=false in_fence=true
+    [I915_X_TILED, LINEAR]: C8   RG16 XR24 XB24 XR30 XB30 XB4H
+  plane#39 overlay crtcs=0b01 zpos=1 [1..1] immutable rotation=rotate-0|rotate-180
+    COLOR_ENCODING: ITU-R BT.601 YCbCr, ITU-R BT.709 YCbCr; COLOR_RANGE: YCbCr limited range, YCbCr full range
+    blend: -; alpha=false damage_clips=false in_fence=true
+    [I915_X_TILED, LINEAR]: XR24 XB24 XR30 XB30 XR4H XB4H YUYV YVYU UYVY VYUY
+  plane#46 cursor  crtcs=0b01 zpos=2 [2..2] immutable rotation=rotate-0|rotate-180
+    COLOR_ENCODING: -; COLOR_RANGE: -
+    blend: -; alpha=false damage_clips=false in_fence=true
+    [LINEAR]: AR24
+  layouts (TEST_ONLY, no ALLOW_MODESET; unlisted planes on the CRTC disabled):
+  (a) XRGB fullscreen on primary                             ACCEPT
+  (a2) XRGB 1920x1080 buffer on primary                      ACCEPT
+  (a3) XRGB primary scaled 1280x720 -> fullscreen            REJECT ERANGE
+  (a4) XRGB primary as a 960x540 window                      REJECT EINVAL
+  (b) NV12 1920x1080 overlay 1:1 above primary               SKIP: addfb NV12 1920x1080 failed (EINVAL)
+  (b2) NV12 1920x1080 overlay 1:1 alone (primary off)        SKIP: addfb NV12 1920x1080 failed (EINVAL)
+  (b3) NV12 960x540 overlay 1:1 window above primary         SKIP: addfb NV12 960x540 failed (EINVAL)
+  (c) NV12 on primary, XRGB UI on overlay (fixed zpos)       SKIP: addfb NV12 1920x1080 failed (EINVAL)
+  (d) NV12 1280x720 scaled to fullscreen                     SKIP: addfb NV12 1280x720 failed (EINVAL)
+  (d2) NV12 1280x720 scaled to a 960x540 window              SKIP: addfb NV12 1280x720 failed (EINVAL)
+  (e) two NV12 overlays                                      SKIP: one overlay plane
+  (b) YUYV 1920x1080 overlay 1:1 above primary               ACCEPT
+  (b2) YUYV 1920x1080 overlay 1:1 alone (primary off)        ACCEPT
+  (b3) YUYV 960x540 overlay 1:1 window above primary         ACCEPT
+  (c) YUYV on primary, XRGB UI on overlay (fixed zpos)       REJECT EINVAL
+  (d) YUYV 1280x720 scaled to fullscreen                     REJECT ERANGE
+  (d2) YUYV 1280x720 scaled to a 960x540 window              REJECT ERANGE
+  (e) two YUYV overlays                                      SKIP: one overlay plane
+  (g) XR24 960x540 overlay 1:1 above primary                 ACCEPT
+  (g2) XR24 960x540 overlay 2x to fullscreen                 REJECT ERANGE
+  (g3) XR24 1920x1080 overlay 0.5x to 960x540                REJECT ERANGE
+  (g) AR24 960x540 overlay 1:1 above primary                 REJECT EINVAL
+  (g2) AR24 960x540 overlay 2x to fullscreen                 REJECT EINVAL
+  (g3) AR24 1920x1080 overlay 0.5x to 960x540                REJECT EINVAL
+  (h) ARGB 64x64 on cursor + primary                         ACCEPT
+  (h) ARGB 128x128 on cursor + primary                       ACCEPT
+  (h) ARGB 256x256 on cursor + primary                       ACCEPT
+  (h2) ARGB 64x64 cursor + YUYV overlay + primary            ACCEPT
+```
+
+What this means for the `planes` module (#3899) on this box:
+
+- **One overlay plane per CRTC, plus the cursor.** The primary is at
+  zpos 0, the sprite at 1 and the cursor at 2, and all three are
+  immutable. Underlay is therefore impossible: nothing can go below the
+  primary. The video can go *on* the primary only if it is RGB (the
+  primary lists no YUV), and the UI would then sit on the overlay. So on
+  HSW, "Surface on a plane" means **overlay above the UI, with the
+  Surface's rectangle unobscured**. Anything else is composited.
+- **No NV12 anywhere.** The overlay doesn't list it and `AddFB2` refuses
+  NV12 framebuffers outright (EINVAL). Scanout-capable YUV on HSW is
+  **packed 4:2:2 only** (YUYV/YVYU/UYVY/VYUY, BT.601/709, limited or
+  full range, on the overlay). Server-allocated video buffers for this
+  box must be YUYV, not NV12.
+- **No scaling observed with linear buffers.** The overlay rejected every
+  scaled layout with ERANGE: 2× up, 0.5× down, and 0.75×
+  (1280×720 → 960×540). Only 1:1 was accepted, both fullscreen and as a
+  window. The primary cannot scale (ERANGE) and must cover the whole
+  CRTC (a 960×540 window gives EINVAL). Whether sprite scaling needs a
+  tiled buffer or is off for another reason on this kernel is not
+  established. Only linear dumb buffers were tried, because the API
+  allocates nothing else. Until that is settled, treat a scaled Surface
+  as composited on this box.
+- **The overlay has no ARGB.** Only XR24 and friends are listed, and AR24
+  is refused. An overlay is opaque; there is no per-pixel blending with
+  what is below it.
+- The cursor plane takes ARGB at 64, 128 and 256, alongside an active
+  YUYV overlay. The 3-plane layout (primary + YUYV overlay + cursor) is
+  accepted.
+- No plane has `FB_DAMAGE_CLIPS` on this kernel. Every plane has
+  `IN_FENCE_FD` and `rotate-0|rotate-180`. There is no `alpha` and no
+  `pixel blend mode`.
