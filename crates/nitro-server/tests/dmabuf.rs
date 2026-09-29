@@ -1095,7 +1095,11 @@ fn a_placed_dmabuf_latches_early_and_hands_its_fence_to_the_plane() {
     let w = present_fenced(&mut conn, SURF, bufs[serial as usize % 2], serial);
     presented(&mut conn, &mut seen, serial);
     assert_eq!(h.stat("plane_fence_latches"), latches + 1);
-    assert_eq!(h.stat("plane_fences"), fences + 1, "IN_FENCE_FD on the plane");
+    assert_eq!(
+        h.stat("plane_fences"),
+        fences + 1,
+        "IN_FENCE_FD on the plane"
+    );
     assert_eq!(h.stat("fences_pending"), 0, "the server holds no fence");
     assert_eq!(h.stat("fence_waits"), waits + 1);
     assert_eq!(h.stat("planes_in_use"), 1);
@@ -1123,7 +1127,10 @@ fn a_placed_dmabuf_latches_early_and_hands_its_fence_to_the_plane() {
     wait_for("the fence to be pending", || h.stat("fences_pending") == 1);
     h.settle();
     drain(&mut conn, &mut seen);
-    assert!(!was_presented(&seen, serial), "not before its fence: {seen:?}");
+    assert!(
+        !was_presented(&seen, serial),
+        "not before its fence: {seen:?}"
+    );
     signal(&w);
     presented(&mut conn, &mut seen, serial);
     assert_eq!(h.stat("plane_fences"), 0);
@@ -1154,10 +1161,17 @@ fn a_modifier_no_free_plane_lists_keeps_the_placeholder() {
     let bufs = [BufferId(10), BufferId(11)];
     let mut serial = 3;
     let mut n = 0;
-    play(&mut conn, &mut seen, &bufs, &mut serial, "20 frames", || {
-        n += 1;
-        n > 20
-    });
+    play(
+        &mut conn,
+        &mut seen,
+        &bufs,
+        &mut serial,
+        "20 frames",
+        || {
+            n += 1;
+            n > 20
+        },
+    );
     assert_eq!(h.stat("planes_in_use"), 0);
     h.settle();
     let px = grab(&h, &c);
@@ -1171,9 +1185,14 @@ fn a_modifier_no_free_plane_lists_keeps_the_placeholder() {
     let (a, b) = (Dma::new(20, 1), Dma::new(21, 2));
     register(&mut conn, &mut seen, &[&a, &b], serial);
     serial += 1;
-    play(&mut conn, &mut seen, &[a.id, b.id], &mut serial, "overlay", || {
-        h.stat("planes_mode") == 1
-    });
+    play(
+        &mut conn,
+        &mut seen,
+        &[a.id, b.id],
+        &mut serial,
+        "overlay",
+        || h.stat("planes_mode") == 1,
+    );
     assert_eq!(h.stat("planes_in_use"), 1);
     h.quit();
 }

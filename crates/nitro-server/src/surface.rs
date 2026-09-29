@@ -468,7 +468,11 @@ mod tests {
         assert_eq!(q.damage.rects().len(), 3);
         assert!(!q.whole);
         // Held back while not ready.
-        assert!(l.latch_ready(&mut s, |_, _| false, |_, _| false).latched.is_empty());
+        assert!(
+            l.latch_ready(&mut s, |_, _| false, |_, _| false)
+                .latched
+                .is_empty()
+        );
         let latched = l.latch_ready(&mut s, |_, _| true, |_, _| false).latched;
         assert_eq!(latched.len(), 1);
         assert_eq!(latched[0].serial, 3);
@@ -527,7 +531,11 @@ mod tests {
         assert_eq!(shown(&s, n), b[0]);
         assert_eq!(l.depth(n), 1, "B waits");
         // Not ready yet: nothing more latches.
-        assert!(l.latch_ready(&mut s, |_, _| true, |_, _| false).latched.is_empty());
+        assert!(
+            l.latch_ready(&mut s, |_, _| true, |_, _| false)
+                .latched
+                .is_empty()
+        );
         assert!(l.fence_signalled(5));
         assert!(!l.fence_signalled(5));
         let o = l.latch_ready(&mut s, |_, _| true, |_, _| false);
@@ -579,7 +587,11 @@ mod tests {
         l.queue(n, fenced(b[1], 2, 5), &[]);
         l.queue(n, fenced(b[2], 3, 6), &[]);
         // Not ready (output busy): nothing, early or not.
-        assert!(l.latch_ready(&mut s, |_, _| false, |_, _| true).latched.is_empty());
+        assert!(
+            l.latch_ready(&mut s, |_, _| false, |_, _| true)
+                .latched
+                .is_empty()
+        );
         let o = l.latch_ready(&mut s, |_, _| true, |k, _| k == n);
         assert_eq!(o.latched.len(), 1);
         assert_eq!((o.latched[0].serial, o.latched[0].fence), (3, Some(6)));

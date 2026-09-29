@@ -345,8 +345,7 @@ pub fn merge(mut v: Vec<DmabufFormat>) -> Vec<DmabufFormat> {
 pub fn direct_scanout(planes: &[PlaneInfo]) -> bool {
     planes.iter().any(|p| {
         p.kind != PlaneKind::Cursor
-            && p
-                .formats
+            && p.formats
                 .iter()
                 .any(|(_, mods)| mods.iter().any(|&m| m != modifier::INVALID))
     })
