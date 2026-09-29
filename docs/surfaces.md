@@ -290,7 +290,12 @@ In order; tasks carry the `surface` tag on the task board.
 1. `nitro-kms` plane discovery + `TEST_ONLY` + a probe tool — #3895.
 2. NV12 fast path in `nitro-raster` — #3896.
 3. Surface v1: shm `Surface` node, CPU path, vblank latch, colour
-   metadata, test client — #3897.
+   metadata, test client — #3897. **Built**: `SURFACE` cap (bit 16),
+   `CreateSurfaceBuffer` (NV12, YUYV, UYVY, XR24, AR24), `SetSurface`,
+   `PresentSurface` (latch semantics in `docs/wire.md` § Surfaces) and
+   `SurfaceHint` (preferred format + device size; NV12 on the CPU path,
+   the planes module will answer e.g. YUYV on Haswell). `nitro-demo
+   --video`; box numbers in `docs/budget.md` § Surface CPU path.
 4. ARGB shadow buffer + hole primitive — #3898.
 5. `planes` module: underlay / overlay / direct scanout, driven by
    `IN_FORMATS`, with server-allocated dumb buffers in a format the
