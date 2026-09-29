@@ -6102,10 +6102,9 @@ impl Server {
     ///
     /// `Fullscreen` covers the whole output and hides the decorations;
     /// `Maximized` fills the work area and shows them (re-showing them when
-    /// coming out of fullscreen); `Normal` goes back
-
-    /// to the remembered rectangle; `Minimized` does not move anything, so
-    /// un-minimizing lands where it was.
+    /// coming out of fullscreen); `Normal` goes back to the remembered
+    /// rectangle; `Minimized` does not move anything, so un-minimizing lands
+    /// where it was.
     fn apply_state_geometry(&mut self, win: WindowKey, state: WindowState) {
         let Ok(info) = self.scene.window_info(win) else {
             return;
@@ -6128,7 +6127,6 @@ impl Server {
                 if framed {
                     let _ = self.scene.set_window_inset(win, wm::frame_insets());
                     self.set_frame_visible(win, true);
-
                 }
                 self.set_frame_rect(win, area);
             }
