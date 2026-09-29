@@ -447,6 +447,9 @@ pub struct OutputState {
     /// Empty on a backend without planes, which keeps the planes module
     /// off entirely.
     pub plane_info: Vec<nitro_kms::PlaneInfo>,
+    /// Acquire fences of frames latched early onto this output's planes
+    /// (#3938), by node, for the next commit's `IN_FENCE_FD`.
+    pub plane_fences: Vec<(nitro_scene::NodeKey, std::os::fd::OwnedFd)>,
     /// A commit went in: the backend lit it. The first commit of an
     /// output modesets every other lit one, which drops their layouts.
     pub lit: bool,
@@ -496,6 +499,7 @@ impl OutputState {
             planes_dirty: false,
             hint_format: nitro_wire::types::format::NV12,
             plane_info: Vec::new(),
+            plane_fences: Vec::new(),
             lit: false,
         }
     }

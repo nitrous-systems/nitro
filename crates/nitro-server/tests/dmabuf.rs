@@ -9,8 +9,10 @@
 //! Covered: the `DMABUF` cap and its gate, every fatal `BadBuffer` of the
 //! import checks, the CPU path's pixels, the placeholder for a layout the
 //! CPU cannot read, the fenced latch queue's orderings and its limits,
-//! presenting into a shared node, `SetSurface` refusing a dma-buf, and the
-//! default and per-node `DmabufFeedback`.
+//! presenting into a shared node, `SetSurface` refusing a dma-buf, the
+//! default and per-node `DmabufFeedback`, and client dma-bufs on planes
+//! (#3938): early latch with `IN_FENCE_FD`, an unlisted modifier keeping
+//! the placeholder, and `DIRECT_SCANOUT` following the planes.
 
 #![allow(clippy::many_single_char_names)]
 
@@ -74,6 +76,28 @@ impl Harness {
         };
         config.fake_modes = vec![(OUT.0, OUT.1, mhz)];
         config.fake_planes = planes;
+        let wire_path = config.wire_path.clone();
+        let thread = std::thread::spawn(move || run(config));
+        let h = Self {
+            dir,
+            path,
+            wire_path,
+            thread: Some(thread),
+        };
+        wait_for("the control socket", || {
+            UnixStream::connect(&h.path).is_ok()
+        });
+        wait_for("the wire socket", || h.wire_path.exists());
+        h
+    }
+
+    /// A fake backend with no outputs (so no planes at all).
+    fn start_headless(name: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("nitro-dmabuf-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("nitro").join("control.sock");
+        let mut config = Config::fake(1, 1, &path);
+        config.backend = BackendKind::FakeHeadless;
         let wire_path = config.wire_path.clone();
         let thread = std::thread::spawn(move || run(config));
         let h = Self {
@@ -988,5 +1012,216 @@ fn a_surface_node_gets_its_outputs_feedback_and_again_after_a_hotplug() {
         "still on the first output"
     );
     assert_eq!(d.formats, expected_feedback());
+    h.quit();
+}
+
+// ---------------------------------------------------------- planes (#3938)
+
+/// KBL-shaped: a primary taking XR24/AR24 linear, an overlay above it
+/// taking NV12 with `overlay_mods` (and XR24/AR24 linear when `ui`, so a
+/// primary swap is possible), both with BT.709 and `IN_FENCE_FD` as given.
+fn kbl(overlay_mods: &[u64], in_fence: bool) -> Vec<FakePlaneSpec> {
+    use nitro_kms::{ColorEncoding, ColorRange as KmsRange};
+    let color = |s: FakePlaneSpec| {
+        s.color(
+            &[ColorEncoding::Bt601, ColorEncoding::Bt709],
+            &[KmsRange::Limited, KmsRange::Full],
+        )
+        .in_fence(in_fence)
+    };
+    vec![
+        color(FakePlaneSpec::default_primary()).zpos(0, 0, 0, true),
+        color(FakePlaneSpec::overlay().format_mods(Fourcc::NV12, overlay_mods)).zpos(1, 1, 1, true),
+    ]
+}
+
+/// A SIDE×SIDE Y-tiled NV12 "dma-buf" (a sealed memfd: the fake only
+/// fstat's it), not CPU-readable.
+fn tiled(id: u32) -> CreateDmabufBuffer {
+    let fd = sealed(8192);
+    CreateDmabufBuffer {
+        id: BufferId(id),
+        width: SIDE,
+        height: SIDE,
+        format: format::NV12,
+        modifier: modifier::I915_Y_TILED,
+        planes: vec![plane(fd.try_clone().unwrap(), 0, 128), plane(fd, 4096, 128)],
+    }
+}
+
+/// Present `bufs` round-robin, one per `Presented`, until `until` holds
+/// (the planner's hysteresis wants a few steady frames).
+fn play(
+    conn: &mut Connection,
+    seen: &mut Vec<ServerMsg>,
+    bufs: &[BufferId],
+    serial: &mut u32,
+    what: &str,
+    mut until: impl FnMut() -> bool,
+) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !until() {
+        assert!(Instant::now() < deadline, "timed out playing until {what}");
+        present(conn, SURF, bufs[*serial as usize % bufs.len()], *serial);
+        presented(conn, seen, *serial);
+        *serial += 1;
+    }
+}
+
+#[test]
+fn a_placed_dmabuf_latches_early_and_hands_its_fence_to_the_plane() {
+    let h = Harness::start_with(
+        "in-fence",
+        60_000,
+        kbl(&[modifier::LINEAR, modifier::I915_Y_TILED], true),
+    );
+    let (mut conn, mut seen) = dma_client(&h, "in-fence", 0);
+    window(&mut conn, &mut seen);
+    conn.create_dmabuf_buffer(tiled(10)).unwrap();
+    conn.create_dmabuf_buffer(tiled(11)).unwrap();
+    conn.commit(2).unwrap();
+    conn.flush().unwrap();
+    presented(&mut conn, &mut seen, 2);
+    let bufs = [BufferId(10), BufferId(11)];
+    let mut serial = 3;
+    play(&mut conn, &mut seen, &bufs, &mut serial, "overlay", || {
+        h.stat("planes_mode") == 1
+    });
+    assert_eq!(h.stat("planes_in_use"), 1);
+    let (fences, latches) = (h.stat("plane_fences"), h.stat("plane_fence_latches"));
+    let waits = h.stat("fence_waits");
+
+    // An unsignalled fence: shown anyway, the display waits on it.
+    let w = present_fenced(&mut conn, SURF, bufs[serial as usize % 2], serial);
+    presented(&mut conn, &mut seen, serial);
+    assert_eq!(h.stat("plane_fence_latches"), latches + 1);
+    assert_eq!(h.stat("plane_fences"), fences + 1, "IN_FENCE_FD on the plane");
+    assert_eq!(h.stat("fences_pending"), 0, "the server holds no fence");
+    assert_eq!(h.stat("fence_waits"), waits + 1);
+    assert_eq!(h.stat("planes_in_use"), 1);
+    drop(w);
+    h.quit();
+
+    // The same plane without IN_FENCE_FD: the frame waits for its fence.
+    let h = Harness::start_with(
+        "no-in-fence",
+        60_000,
+        kbl(&[modifier::LINEAR, modifier::I915_Y_TILED], false),
+    );
+    let (mut conn, mut seen) = dma_client(&h, "no-in-fence", 0);
+    window(&mut conn, &mut seen);
+    conn.create_dmabuf_buffer(tiled(10)).unwrap();
+    conn.create_dmabuf_buffer(tiled(11)).unwrap();
+    conn.commit(2).unwrap();
+    conn.flush().unwrap();
+    presented(&mut conn, &mut seen, 2);
+    let mut serial = 3;
+    play(&mut conn, &mut seen, &bufs, &mut serial, "overlay", || {
+        h.stat("planes_mode") == 1
+    });
+    let w = present_fenced(&mut conn, SURF, bufs[serial as usize % 2], serial);
+    wait_for("the fence to be pending", || h.stat("fences_pending") == 1);
+    h.settle();
+    drain(&mut conn, &mut seen);
+    assert!(!was_presented(&seen, serial), "not before its fence: {seen:?}");
+    signal(&w);
+    presented(&mut conn, &mut seen, serial);
+    assert_eq!(h.stat("plane_fences"), 0);
+    assert_eq!(h.stat("plane_fence_latches"), 0);
+    h.quit();
+}
+
+#[test]
+fn a_modifier_no_free_plane_lists_keeps_the_placeholder() {
+    // The overlay takes NV12 linear only. Y-tiled is listed on the primary
+    // alone (so it validates), which a windowed Surface could only take by
+    // a primary swap — and no overlay here takes the UI for one. It is not
+    // CPU-readable either: the placeholder.
+    let h = Harness::start_with("unlisted", 60_000, {
+        let mut p = kbl(&[modifier::LINEAR], true);
+        p[0] = p[0]
+            .clone()
+            .format_mods(Fourcc::NV12, &[modifier::I915_Y_TILED]);
+        p
+    });
+    let (mut conn, mut seen) = dma_client(&h, "unlisted", 0);
+    let c = window(&mut conn, &mut seen);
+    conn.create_dmabuf_buffer(tiled(10)).unwrap();
+    conn.create_dmabuf_buffer(tiled(11)).unwrap();
+    conn.commit(2).unwrap();
+    conn.flush().unwrap();
+    presented(&mut conn, &mut seen, 2);
+    let bufs = [BufferId(10), BufferId(11)];
+    let mut serial = 3;
+    let mut n = 0;
+    play(&mut conn, &mut seen, &bufs, &mut serial, "20 frames", || {
+        n += 1;
+        n > 20
+    });
+    assert_eq!(h.stat("planes_in_use"), 0);
+    h.settle();
+    let px = grab(&h, &c);
+    assert!(
+        px.iter().all(|p| *p == [0x80, 0x80, 0x80]),
+        "the placeholder: {:?}",
+        &px[..4]
+    );
+
+    // A linear one in the same spot goes on the overlay.
+    let (a, b) = (Dma::new(20, 1), Dma::new(21, 2));
+    register(&mut conn, &mut seen, &[&a, &b], serial);
+    serial += 1;
+    play(&mut conn, &mut seen, &[a.id, b.id], &mut serial, "overlay", || {
+        h.stat("planes_mode") == 1
+    });
+    assert_eq!(h.stat("planes_in_use"), 1);
+    h.quit();
+}
+
+#[test]
+fn direct_scanout_follows_the_planes() {
+    // No outputs, no planes: not set.
+    let h = Harness::start_headless("cap-headless");
+    let conn = h.client("cap-headless");
+    assert!(conn.has_caps(caps::DMABUF));
+    assert!(!conn.has_caps(caps::DIRECT_SCANOUT));
+    drop(conn);
+    h.quit();
+
+    // A plane that takes NV12 Y-tiled: set, and the feedback says so.
+    let h = Harness::start_with("cap-kbl", 60_000, planes());
+    let (mut conn, mut seen) = dma_client(&h, "cap-kbl", 0);
+    assert!(conn.has_caps(caps::DIRECT_SCANOUT));
+    let d = feedback_for(&mut conn, &mut seen, "the default feedback", |d| {
+        d.id == NodeId(0)
+    });
+    assert!(d.formats.iter().any(|f| f.format == format::NV12
+        && f.modifier == modifier::I915_Y_TILED
+        && f.flags & dmabuf_flags::SCANOUT != 0));
+    h.quit();
+
+    // HSW-shaped (no NV12 anywhere): XR24 is still placeable, so the bit
+    // is set, but NV12 is only ever CPU.
+    let h = Harness::start_with(
+        "cap-hsw",
+        60_000,
+        vec![
+            FakePlaneSpec::default_primary(),
+            FakePlaneSpec::overlay().formats(&[Fourcc::XRGB8888, Fourcc::YUYV]),
+        ],
+    );
+    let (mut conn, mut seen) = dma_client(&h, "cap-hsw", 0);
+    assert!(conn.has_caps(caps::DIRECT_SCANOUT));
+    let d = feedback_for(&mut conn, &mut seen, "the default feedback", |d| {
+        d.id == NodeId(0)
+    });
+    assert!(
+        d.formats
+            .iter()
+            .filter(|f| f.format == format::NV12)
+            .all(|f| f.modifier == modifier::LINEAR && f.flags & dmabuf_flags::SCANOUT == 0),
+        "{:?}",
+        d.formats
+    );
     h.quit();
 }

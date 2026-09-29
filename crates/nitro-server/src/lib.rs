@@ -1003,6 +1003,15 @@ struct Server {
     plane_flips: u64,
     /// Acquire fences that had to be waited for, cumulative.
     fence_waits: u64,
+    /// Frames latched early onto a plane, their fence still pending
+    /// (#3938), cumulative.
+    plane_fence_latches: u64,
+    /// Fences handed to the display as `IN_FENCE_FD`, cumulative.
+    plane_fences: u64,
+    /// CPU-readable dma-bufs latched early (#3938): their read bracket
+    /// was never begun (`DMA_BUF_IOCTL_SYNC` would block on the fence),
+    /// so it is not ended either.
+    unbracketed: HashSet<BufferKey>,
     /// Implicit fences taken by polling the dma-buf itself because
     /// `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` is missing, cumulative.
     implicit_fence_fallbacks: u64,
@@ -1430,6 +1439,9 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         held_releases: Vec::new(),
         plane_flips: 0,
         fence_waits: 0,
+        plane_fence_latches: 0,
+        plane_fences: 0,
+        unbracketed: HashSet::new(),
         implicit_fence_fallbacks: 0,
         touch_targets: HashMap::new(),
         unplaced: Vec::new(),
@@ -2522,6 +2534,7 @@ impl Server {
             .map(|r| KmsRect::new(r.x, r.y, r.w.cast_unsigned(), r.h.cast_unsigned()))
             .collect();
         self.select_scanout_alpha(index);
+        self.stage_plane_fences(index);
         let first = !self.outputs[index].lit;
         match self.backend.commit(id, &kms_damage) {
             Ok(()) => {
@@ -7433,9 +7446,12 @@ impl Server {
     /// client may always send the M3 window ops. `TEXT` is set only when a
     /// font was actually found: the bit means "you may send `Text` nodes",
     /// and on a box with no fonts at all that would be a promise the server
-    /// cannot keep. `DIRECT_SCANOUT` stays unset until the planes module
-    /// (#3899) scans client buffers out (`dmabuf::direct_scanout`), and a
-    /// zero bit is the protocol's way of saying "do not use this".
+    /// cannot keep. `DIRECT_SCANOUT` is set when some output has a
+    /// non-cursor plane the planner could put a client dma-buf on
+    /// (`dmabuf::direct_scanout`, #3938); the per-node feedback says which
+    /// format/modifier pairs. A zero bit is the protocol's way of saying
+    /// "do not use this".
+
     ///
     /// `SHELL` is set for, and only for, a connection accepted on the shell
     /// socket — which is what `shell` says. It is reported rather than
@@ -7531,7 +7547,11 @@ impl Server {
                 | nitro_wire::types::caps::SURFACE
                 | nitro_wire::types::caps::DMABUF
                 | nitro_wire::types::caps::SHARE;
-            if dmabuf::direct_scanout() {
+            if self
+                .outputs
+                .iter()
+                .any(|o| dmabuf::direct_scanout(&o.plane_info))
+            {
                 caps |= nitro_wire::types::caps::DIRECT_SCANOUT;
             }
             if self.keymap_fd.is_some() {
@@ -10229,10 +10249,17 @@ impl Server {
                 .and_then(|n| scene.window_info(n.window()).ok())
                 .and_then(nitro_scene::Window::output)
         };
+        let early = self.early_latch_nodes();
+        if !self.unbracketed.is_empty() {
+            let scene = &self.scene;
+            self.unbracketed.retain(|k| scene.buffer(*k).is_ok());
+        }
         let mut latch = std::mem::take(&mut self.latch);
-        let outcome = latch.latch_ready(&mut self.scene, |scene, node| {
-            output_of(scene, node).is_none_or(|o| !busy.contains(&o))
-        });
+        let outcome = latch.latch_ready(
+            &mut self.scene,
+            |scene, node| output_of(scene, node).is_none_or(|o| !busy.contains(&o)),
+            |node, buffer| early.contains(&(node, buffer)),
+        );
         self.latch = latch;
         for q in outcome.dropped {
             if let Some(k) = q.fence {
@@ -10242,12 +10269,30 @@ impl Server {
         self.drop_frames(outcome.superseded);
         let latched = outcome.latched;
         for l in &latched {
-            // The CPU read bracket on a client dma-buf (#3918): begun at
-            // the latch, when the fence has signalled so the ioctl cannot
-            // block, and ended when the buffer stops being shown.
-            self.dmabuf_sync(l.buffer, true);
-            if let Some(prev) = l.previous.filter(|p| *p != l.buffer) {
+            if let Some(prev) = l.previous.filter(|p| *p != l.buffer)
+                && !self.unbracketed.remove(&prev)
+            {
                 self.dmabuf_sync(prev, false);
+            }
+            if let Some(k) = l.fence {
+                // Latched early onto a plane (#3938): the display waits
+                // on the fence (`stage_plane_fences`), never the server,
+                // and there is no CPU read bracket to begin.
+                self.plane_fence_latches += 1;
+                self.unbracketed.insert(l.buffer);
+                if let Some(fd) = self.fences.take(&self.epoll, k)
+                    && let Some(o) = self.outputs.iter_mut().find(|o| o.decision.places(l.node))
+                {
+                    o.plane_fences.retain(|(n, _)| *n != l.node);
+                    o.plane_fences.push((l.node, fd));
+                }
+            } else {
+                // The CPU read bracket on a client dma-buf (#3918): begun
+                // at the latch, when the fence has signalled so the ioctl
+                // cannot block, and ended when the buffer stops being
+                // shown.
+                self.unbracketed.remove(&l.buffer);
+                self.dmabuf_sync(l.buffer, true);
             }
             let output = output_of(&self.scene, l.node);
             // A new frame of a Surface on a plane is a plane-only flip
@@ -10279,6 +10324,36 @@ impl Server {
             }
         }
         !latched.is_empty()
+    }
+
+    /// The `(node, buffer)` pairs whose frames may latch before their
+    /// acquire fence signals (#3938): the node is on a plane with
+    /// `IN_FENCE_FD` in the current decision, and the buffer is a KMS
+    /// framebuffer that plane lists the format and modifier of — so the
+    /// frame goes to the plane, and the display waits on the fence.
+    fn early_latch_nodes(&self) -> HashSet<(nitro_scene::NodeKey, BufferKey)> {
+        let mut out = HashSet::new();
+        if self.outputs.iter().all(|o| o.decision.placed.is_empty()) {
+            return out;
+        }
+        for c in self.wire_clients.values() {
+            for h in c.buffers.values() {
+                let Some(info) = h.scanout.and_then(|k| self.backend.buffer_info(k)) else {
+                    continue;
+                };
+                for o in &self.outputs {
+                    for (node, plane) in &o.decision.placed {
+                        let fits = o.plane_info.iter().any(|p| {
+                            p.id == *plane && p.in_fence && p.supports(info.format, info.modifier)
+                        });
+                        if fits {
+                            out.insert((*node, h.key));
+                        }
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Begin (`start`) or end the CPU read bracket on a client dma-buf the
@@ -10581,11 +10656,8 @@ impl Server {
                 let _ = self.scene.set_surface_on_plane(*n, true);
             }
         }
-        // IN_FENCE_FD: every frame placed here latched only once its
-        // acquire fence signalled (#3918), and server-allocated buffers
-        // are CPU-written, so no plane has a fence to wait on today. A
-        // pre-latch fenced path would hand it over with
-        // `Backend::set_plane_fence` here.
+        // IN_FENCE_FD (#3938): an early-latched frame's fence is handed
+        // over just before the commit, `stage_plane_fences`.
         let staged = self.backend.set_plane_state(id, &d.layout);
         let o = &mut self.outputs[index];
         o.decision = d;
@@ -10603,6 +10675,7 @@ impl Server {
     /// buffer, no raster, no copy — a video frame on a plane.
     fn flip_planes(&mut self, index: usize) -> bool {
         self.select_scanout_alpha(index);
+        self.stage_plane_fences(index);
         let id = self.outputs[index].kms_id;
         match self.backend.commit_planes(id) {
             Ok(()) => {
@@ -10619,11 +10692,33 @@ impl Server {
         }
     }
 
+    /// Hand the acquire fences of early-latched frames (#3938) to the
+    /// planes that show them, as `IN_FENCE_FD` for the coming commit. A
+    /// fence whose node is no longer placed is dropped: that frame is
+    /// composited instead (the residual in `docs/surfaces.md`).
+    fn stage_plane_fences(&mut self, index: usize) {
+        let o = &mut self.outputs[index];
+        if o.plane_fences.is_empty() {
+            return;
+        }
+        let id = o.kms_id;
+        for (node, fd) in std::mem::take(&mut o.plane_fences) {
+            let Some(&(_, plane)) = o.decision.placed.iter().find(|(n, _)| *n == node) else {
+                continue;
+            };
+            match self.backend.set_plane_fence(id, plane, fd) {
+                Ok(()) => self.plane_fences += 1,
+                Err(e) => debug!("{id}: IN_FENCE_FD on {plane:?}: {e}"),
+            }
+        }
+    }
+
     /// The kernel refused a layout it had accepted in a test (or it could
     /// not be staged): back to the default and composite that shape.
     fn planes_fallback(&mut self, index: usize) {
         let o = &mut self.outputs[index];
         o.planner.fallback();
+        o.plane_fences.clear();
         let old = std::mem::take(&mut o.decision);
         o.planes_dirty = false;
         o.invalidate();
@@ -10642,6 +10737,7 @@ impl Server {
                 continue;
             }
             o.planner.reset();
+            o.plane_fences.clear();
             if o.decision == planes::Decision::default() {
                 continue;
             }
@@ -10724,6 +10820,8 @@ impl Server {
         pairs.push(("planes_candidates", sum(|s| s.candidates)));
         pairs.push(("planes_obscured", sum(|s| s.obscured)));
         pairs.push(("plane_flips", self.plane_flips));
+        pairs.push(("plane_fences", self.plane_fences));
+        pairs.push(("plane_fence_latches", self.plane_fence_latches));
         pairs.push(("plane_releases_held", self.held_releases.len() as u64));
     }
 }

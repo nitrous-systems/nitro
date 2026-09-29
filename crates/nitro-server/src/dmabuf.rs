@@ -11,10 +11,14 @@
 //! - **Anything else** (tiled, compressed, split across buffers): it
 //!   validates and is kept, but its store is not CPU-readable and paints
 //!   as a documented placeholder (`frame::HOLE_PLACEHOLDER` grey,
-//!   counted in `dmabuf_placeholder_paints`) until the planes module
-//!   (#3899) scans it out. The hook for that is `HeldBuffer::scanout`:
-//!   when the output backend has planes, every dma-buf is also imported
-//!   as a KMS framebuffer at commit (`Backend::import_buffer`).
+//!   counted in `dmabuf_placeholder_paints`) unless the planes module
+//!   (#3899) scans it out. When the output backend has planes, every
+//!   dma-buf is also imported as a KMS framebuffer at commit
+//!   (`Backend::import_buffer`, AddFB2 with the modifier), kept in
+//!   `HeldBuffer::scanout` for the buffer's life, and is a plane
+//!   candidate like a server-allocated one; the planner pre-filters on
+//!   each plane's `IN_FORMATS`. [`direct_scanout`] says whether any plane
+//!   could take one, which sets `DIRECT_SCANOUT` (#3938).
 //!
 //! **Fences.** A frame is never latched — sampled or scanned out — before
 //! its acquire fence signals, and the server never blocks on one: the
@@ -24,10 +28,10 @@
 //! write fences taken with `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` at
 //! `PresentSurface` (implicit sync). On a kernel without that ioctl the
 //! dma-buf fd itself is polled (a dma-buf is readable once its writers are
-//! done), counted in `implicit_fence_fallbacks`. A plane placed by #3899
-//! may instead latch early and pass the fence on as `IN_FENCE_FD`
-//! (`Backend::set_plane_fence`); `surface::Queued::fence` stays reachable
-//! for that.
+//! done), counted in `implicit_fence_fallbacks`. A frame of a Surface
+//! placed on a plane with `IN_FENCE_FD` latches early instead (#3938):
+//! its fence leaves the set ([`FenceSet::take`]) and goes to the display
+//! with `Backend::set_plane_fence`, so the kernel waits, not the server.
 
 use std::collections::HashMap;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -333,12 +337,19 @@ pub fn merge(mut v: Vec<DmabufFormat>) -> Vec<DmabufFormat> {
     out
 }
 
-/// Whether client dma-bufs are ever scanned out directly. `false` until
-/// the planes module (#3899) places them: then this turns on, and with it
-/// the `DIRECT_SCANOUT` capability bit.
+/// Whether the planes module (#3899) can place a client dma-buf on these
+/// planes at all (#3938): some non-cursor plane lists a real format and
+/// modifier. Exactly the pairs [`feedback`] flags `SCANOUT`, so the
+/// `DIRECT_SCANOUT` capability bit and the feedback agree.
 #[must_use]
-pub const fn direct_scanout() -> bool {
-    false
+pub fn direct_scanout(planes: &[PlaneInfo]) -> bool {
+    planes.iter().any(|p| {
+        p.kind != PlaneKind::Cursor
+            && p
+                .formats
+                .iter()
+                .any(|(_, mods)| mods.iter().any(|&m| m != modifier::INVALID))
+    })
 }
 
 /// A pending acquire fence's key; its epoll token is `base + key`.
@@ -430,6 +441,15 @@ impl FenceSet {
         if let Some((_, fd)) = self.pending.remove(&key) {
             let _ = epoll::delete(epoll, &fd);
         }
+    }
+
+    /// Deregister a fence and hand its fd over instead of closing it: its
+    /// frame latched early onto a plane and the display waits on it as
+    /// `IN_FENCE_FD` (#3938). `None` for an unknown key.
+    pub fn take(&mut self, epoll: &OwnedFd, key: FenceKey) -> Option<OwnedFd> {
+        let (_, fd) = self.pending.remove(&key)?;
+        let _ = epoll::delete(epoll, &fd);
+        Some(fd)
     }
 
     /// Drop every fence `token` registered.
@@ -692,6 +712,37 @@ mod tests {
         let mut m = msg(format::XR24, 0, vec![(sealed(4096), 0, 64)]);
         m.width = 0;
         refuse(m);
+    }
+
+    #[test]
+    fn direct_scanout_follows_the_planes() {
+        assert!(!direct_scanout(&[]));
+        let cursor = plane(
+            PlaneKind::Cursor,
+            vec![(Fourcc::ARGB8888, vec![modifier::LINEAR])],
+        );
+        assert!(!direct_scanout(std::slice::from_ref(&cursor)));
+        let invalid = plane(
+            PlaneKind::Overlay,
+            vec![(Fourcc::NV12, vec![modifier::INVALID])],
+        );
+        assert!(!direct_scanout(&[cursor.clone(), invalid]));
+        assert!(direct_scanout(&planes()));
+    }
+
+    #[test]
+    fn a_taken_fence_leaves_the_set_open() {
+        let epoll = epoll::create(epoll::CreateFlags::CLOEXEC).unwrap();
+        let mut set = FenceSet::new(100);
+        let (r, w) = rustix::pipe::pipe().unwrap();
+        let k = set.add(&epoll, 7, r).unwrap();
+        assert_eq!(set.count_for(7), 1);
+        let fd = set.take(&epoll, k).unwrap();
+        assert!(set.is_empty());
+        assert!(set.take(&epoll, k).is_none());
+        // Still the same pipe, still open.
+        rustix::io::write(&w, b"x").unwrap();
+        assert!(signalled(fd.as_fd()));
     }
 
     #[test]

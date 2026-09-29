@@ -21,7 +21,7 @@ const USAGE: &str = "usage: nitro-video FILE [--fullscreen] [--frames N] [--stat
   --hwdec MODE   VA-API decode: auto (default: VA-API when the hardware
                  takes the stream, dma-bufs when the server shows them
                  as they are, else software), dmabuf (always present VA surfaces, a
-                 tiled one is a placeholder until direct scanout),
+                 tiled one off a plane is a placeholder),
                  download (copy frames into shm), off (software)
   --vaapi-device PATH  the render node (default /dev/dri/renderD128)
 

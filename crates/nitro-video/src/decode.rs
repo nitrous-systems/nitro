@@ -161,8 +161,8 @@ pub enum HwDec {
     #[default]
     Auto,
     /// VA-API, presenting its surfaces as dma-bufs whenever the server
-    /// imports them at all (a tiled one shows a placeholder until direct
-    /// scanout, #3899).
+    /// imports them at all (a tiled one the server cannot put on a plane
+    /// shows a placeholder, #3938).
     DmaBuf,
     /// VA-API, downloading every frame into the shm ring.
     Download,
@@ -248,7 +248,7 @@ pub fn choose_output(
         || (f.flags & dmabuf_flags::SCANOUT != 0 && direct_scanout);
     if pref == HwDec::Auto && !shown {
         return why(format!(
-            "NV12 with modifier {:#x} would be a placeholder until direct scanout (#3899)",
+            "NV12 with modifier {:#x} is neither CPU-readable nor scanned out by the server",
             hw.modifier
         ));
     }

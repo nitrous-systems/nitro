@@ -871,6 +871,16 @@ mod tests {
         // Scaled YUYV on HSW (no scaler).
         let c = r.cand(2, Fourcc::YUYV, (160, 90), window());
         assert_eq!(r.search(&[c]), Decision::default());
+
+        // A client dma-buf's modifier no plane lists (#3938): Y-tiled NV12
+        // on KBL planes that list NV12 linear only.
+        let mut r = Rig::new(kbl());
+        let mut c = r.cand(1, Fourcc::NV12, (320, 180), window());
+        c.modifier = nitro_wire::types::modifier::I915_Y_TILED;
+        let before = r.be.test_log().len();
+        assert_eq!(r.search(&[c]), Decision::default());
+        assert_eq!(r.be.test_log().len(), before, "pre-filtered");
+
     }
 
     #[test]

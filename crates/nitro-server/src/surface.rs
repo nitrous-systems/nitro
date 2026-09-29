@@ -46,9 +46,10 @@ pub struct Queued {
     /// Some frame folded into this one damaged everything (empty damage).
     pub whole: bool,
     /// The acquire fence still pending (#3918); `None` once the frame is
-    /// ready. A frame is never latched while this is `Some`. The planes
-    /// module (#3899) may instead latch early and hand the fence to the
-    /// display as `IN_FENCE_FD` (`Backend::set_plane_fence`).
+    /// ready. A frame is not latched while this is `Some`, except early
+    /// onto a plane (#3938): then the fence goes to the display as
+    /// `IN_FENCE_FD` (`Backend::set_plane_fence`) and
+    /// [`Latched::fence`] carries it.
     pub fence: Option<FenceKey>,
 }
 
@@ -75,6 +76,9 @@ pub struct Latched {
     /// What the node showed before, if anything: the server ends its CPU
     /// read bracket on a dma-buf (#3918).
     pub previous: Option<BufferKey>,
+    /// The frame's acquire fence, still pending: it latched early onto a
+    /// plane (#3938) and the caller hands the fence to the display.
+    pub fence: Option<FenceKey>,
 }
 
 /// What one [`Latch::latch_ready`] pass did.
@@ -207,12 +211,18 @@ impl Latch {
     /// on a node or buffer that no longer exists are dropped silently (a
     /// destroy wins, `docs/wire.md`).
     ///
+    /// For a node (and its newest frame's buffer) `early` says goes on a
+    /// plane that takes `IN_FENCE_FD` (#3938), the **newest** frame
+    /// latches whether or not its fence has signalled; [`Latched::fence`]
+    /// then names the fence the display waits on instead of the server.
+    ///
     /// # Panics
     /// Never: the picked index is in range by construction.
     pub fn latch_ready(
         &mut self,
         scene: &mut Scene,
         mut ready: impl FnMut(&Scene, NodeKey) -> bool,
+        mut early: impl FnMut(NodeKey, BufferKey) -> bool,
     ) -> LatchOutcome {
         let mut out = LatchOutcome::default();
         let keys: Vec<NodeKey> = self.queued.keys().copied().collect();
@@ -228,7 +238,11 @@ impl Latch {
                 q.drain(..).partition(|f| scene.buffer(f.buffer).is_err());
             out.dropped.extend(dead);
             q = live;
-            let pick = q.iter().rposition(|f| f.fence.is_none());
+            let pick = if q.last().is_some_and(|f| early(node, f.buffer)) {
+                Some(q.len() - 1)
+            } else {
+                q.iter().rposition(|f| f.fence.is_none())
+            };
             let Some(i) = pick.filter(|_| ready(scene, node)) else {
                 if !q.is_empty() {
                     self.queued.insert(node, q);
@@ -266,7 +280,11 @@ impl Latch {
                     node,
                     buffer: f.buffer,
                     previous,
+                    fence: f.fence,
                 });
+            } else {
+                // Its fence, if it latched early, must still be dropped.
+                out.dropped.push(f);
             }
             out.superseded.extend(q);
             if !rest.is_empty() {
@@ -450,8 +468,8 @@ mod tests {
         assert_eq!(q.damage.rects().len(), 3);
         assert!(!q.whole);
         // Held back while not ready.
-        assert!(l.latch_ready(&mut s, |_, _| false).latched.is_empty());
-        let latched = l.latch_ready(&mut s, |_, _| true).latched;
+        assert!(l.latch_ready(&mut s, |_, _| false, |_, _| false).latched.is_empty());
+        let latched = l.latch_ready(&mut s, |_, _| true, |_, _| false).latched;
         assert_eq!(latched.len(), 1);
         assert_eq!(latched[0].serial, 3);
         assert!(l.is_empty());
@@ -488,7 +506,7 @@ mod tests {
         assert!(l.is_empty());
         l.queue(n, frame(b[2], 2), &[]);
         s.destroy_buffer(C, b[2]).unwrap();
-        let o = l.latch_ready(&mut s, |_, _| true);
+        let o = l.latch_ready(&mut s, |_, _| true, |_, _| false);
         assert!(o.latched.is_empty());
         assert_eq!(o.dropped.len(), 1);
         assert!(l.is_empty());
@@ -503,16 +521,16 @@ mod tests {
         let mut l = Latch::default();
         l.queue(n, frame(b[0], 1), &[]);
         assert!(l.queue(n, fenced(b[1], 2, 5), &[]).is_empty());
-        let o = l.latch_ready(&mut s, |_, _| true);
+        let o = l.latch_ready(&mut s, |_, _| true, |_, _| false);
         assert_eq!(o.latched[0].serial, 1);
         assert!(o.superseded.is_empty());
         assert_eq!(shown(&s, n), b[0]);
         assert_eq!(l.depth(n), 1, "B waits");
         // Not ready yet: nothing more latches.
-        assert!(l.latch_ready(&mut s, |_, _| true).latched.is_empty());
+        assert!(l.latch_ready(&mut s, |_, _| true, |_, _| false).latched.is_empty());
         assert!(l.fence_signalled(5));
         assert!(!l.fence_signalled(5));
-        let o = l.latch_ready(&mut s, |_, _| true);
+        let o = l.latch_ready(&mut s, |_, _| true, |_, _| false);
         assert_eq!(o.latched[0].serial, 2);
         assert_eq!(shown(&s, n), b[1]);
         assert!(l.is_empty());
@@ -528,7 +546,7 @@ mod tests {
         assert_eq!(lost.len(), 1);
         assert_eq!((lost[0].serial, lost[0].fence), (1, Some(5)));
         assert_eq!(l.get(n).unwrap().damage.rects().len(), 2);
-        let o = l.latch_ready(&mut s, |_, _| true);
+        let o = l.latch_ready(&mut s, |_, _| true, |_, _| false);
         assert_eq!(o.latched[0].serial, 2);
         assert!(!l.fence_signalled(5), "the dropped frame's fence is gone");
     }
@@ -543,7 +561,7 @@ mod tests {
         // Signal out of order: the second becomes ready first.
         l.fence_signalled(6);
         l.fence_signalled(5);
-        let o = l.latch_ready(&mut s, |_, _| true);
+        let o = l.latch_ready(&mut s, |_, _| true, |_, _| false);
         assert_eq!(o.latched[0].serial, 2);
         assert_eq!(
             o.superseded.iter().map(|q| q.serial).collect::<Vec<_>>(),
@@ -551,6 +569,30 @@ mod tests {
         );
         assert_eq!(l.depth(n), 1);
         assert_eq!(l.get(n).unwrap().fence, Some(7));
+    }
+
+    #[test]
+    fn an_early_node_latches_its_newest_frame_fenced() {
+        let (mut s, n, b) = world();
+        let mut l = Latch::default();
+        l.queue(n, frame(b[0], 1), &[]);
+        l.queue(n, fenced(b[1], 2, 5), &[]);
+        l.queue(n, fenced(b[2], 3, 6), &[]);
+        // Not ready (output busy): nothing, early or not.
+        assert!(l.latch_ready(&mut s, |_, _| false, |_, _| true).latched.is_empty());
+        let o = l.latch_ready(&mut s, |_, _| true, |k, _| k == n);
+        assert_eq!(o.latched.len(), 1);
+        assert_eq!((o.latched[0].serial, o.latched[0].fence), (3, Some(6)));
+        assert_eq!(
+            o.superseded.iter().map(|q| q.serial).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert_eq!(shown(&s, n), b[2]);
+        assert!(l.is_empty());
+        // Not early: the ready path is unchanged and says no fence.
+        l.queue(n, frame(b[0], 4), &[]);
+        let o = l.latch_ready(&mut s, |_, _| true, |_, _| false);
+        assert_eq!((o.latched[0].serial, o.latched[0].fence), (4, None));
     }
 
     #[test]
