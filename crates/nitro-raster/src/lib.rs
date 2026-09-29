@@ -94,8 +94,10 @@
 //!
 //! [`Canvas::blit_nv12`] stores an [`Nv12`] frame (fused YUV → RGB with a
 //! [`YuvEncoding`], 1:1 nearest or bilinear-scaled, clip-invariant) into an
-//! integer rect; [`Canvas::blit_xrgb_scaled`] is the same machinery for an
-//! opaque XRGB source. Both are stores: video surfaces are opaque.
+//! integer rect; [`Canvas::blit_yuyv`] does the same for a packed 4:2:2
+//! [`Packed422`] frame (YUYV or UYVY, [`Packed422Order`]);
+//! [`Canvas::blit_xrgb_scaled`] is the same machinery for an
+//! opaque XRGB source. All are stores: video surfaces are opaque.
 
 #![forbid(unsafe_code)]
 
@@ -106,7 +108,7 @@ mod shape;
 mod yuv;
 
 pub use canvas::{BYTES_PER_PIXEL, Canvas, Fill, Image, Mask, PixelFormat};
-pub use yuv::{Nv12, YuvEncoding, YuvMatrix, YuvRange};
+pub use yuv::{Nv12, Packed422, Packed422Order, YuvEncoding, YuvMatrix, YuvRange};
 
 #[cfg(test)]
 mod tests;

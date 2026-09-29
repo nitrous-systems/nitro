@@ -38,7 +38,8 @@ use std::time::{Duration, Instant};
 
 use nitro_core::{Color, IRect, Point, Rect};
 use nitro_raster::{
-    Canvas, Fill, Image, Mask, Nv12, PixelFormat, YuvEncoding, YuvMatrix, YuvRange,
+    Canvas, Fill, Image, Mask, Nv12, Packed422, Packed422Order, PixelFormat, YuvEncoding,
+    YuvMatrix, YuvRange,
 };
 
 const WIDTH: u32 = 1920;
@@ -425,7 +426,8 @@ fn scene_ui_frame(c: &mut Canvas<'_>, damage: &[IRect]) {
 }
 
 // ---------------------------------------------------------------------------
-// Video: NV12 → XRGB (l, m, n, o) and the generic XRGB scaled blit (p)
+// Video: NV12 → XRGB (l, m, n, o), the XRGB scaled blits (p, q) and
+// packed YUYV → XRGB (s, t)
 // ---------------------------------------------------------------------------
 
 /// An owned NV12 frame: `(y, uv, width, height)`, tight strides. A noisy
@@ -468,6 +470,29 @@ fn scene_nv12(c: &mut Canvas<'_>, src: &Nv12<'_>, w: i32, h: i32, enc: YuvEncodi
     c.blit_nv12(&full_clip(), &dst, src, &src.bounds(), enc);
 }
 
+/// An owned YUYV frame (tight stride) with the same content as
+/// [`make_nv12`]'s, chroma taken from the NV12 row pair covering each row.
+fn make_yuyv(w: u32, h: u32) -> Vec<u8> {
+    let (luma, uv, _, _) = make_nv12(w, h);
+    let cw = w.div_ceil(2);
+    let mut out = vec![0u8; (2 * w * h) as usize];
+    for row in 0..h {
+        for j in 0..w / 2 {
+            let ci = ((row / 2) * 2 * cw + 2 * j) as usize;
+            let li = (row * w + 2 * j) as usize;
+            let oi = (row * 2 * w + 4 * j) as usize;
+            out[oi..oi + 4].copy_from_slice(&[luma[li], uv[ci], luma[li + 1], uv[ci + 1]]);
+        }
+    }
+    out
+}
+
+/// Blit a whole packed 4:2:2 frame into a `w × h` rect at the origin.
+fn scene_yuyv(c: &mut Canvas<'_>, src: &Packed422<'_>, w: i32, h: i32, enc: YuvEncoding) {
+    let dst = IRect::new(0, 0, w, h);
+    c.blit_yuyv(&full_clip(), &dst, src, &src.bounds(), enc);
+}
+
 /// The generic scaled blit on an opaque 1920×1080 XRGB source into
 /// 1280×720: the reference the NV12 path is compared against.
 fn scene_xrgb_scaled(c: &mut Canvas<'_>, src: &Image<'_>) {
@@ -494,8 +519,8 @@ fn make_xrgb_1080() -> Vec<u8> {
 /// where the figure means nothing (mixed work, overdraw).
 fn scene_pixels(letter: char) -> Option<u64> {
     match letter {
-        'l' | 'n' | 'r' => Some(1920 * 1080),
-        'm' | 'o' | 'p' | 'q' => Some(1280 * 720),
+        'l' | 'n' | 'r' | 's' => Some(1920 * 1080),
+        'm' | 'o' | 'p' | 'q' | 't' => Some(1280 * 720),
         _ => None,
     }
 }
@@ -510,7 +535,7 @@ struct SceneSpec {
     default_iters: u32,
 }
 
-const SCENES: [SceneSpec; 18] = [
+const SCENES: [SceneSpec; 20] = [
     SceneSpec {
         letter: 'a',
         name: "solid_fill",
@@ -601,6 +626,16 @@ const SCENES: [SceneSpec; 18] = [
         name: "clear_1080",
         default_iters: 1000,
     },
+    SceneSpec {
+        letter: 's',
+        name: "yuyv_1080_1080",
+        default_iters: 200,
+    },
+    SceneSpec {
+        letter: 't',
+        name: "yuyv_1080_720",
+        default_iters: 300,
+    },
 ];
 
 const WARMUP: u32 = 3;
@@ -666,6 +701,14 @@ fn main() {
     let v1080 = make_nv12(1920, 1080);
     let v720 = make_nv12(1280, 720);
     let (nv1080, nv720) = (nv12_of(&v1080), nv12_of(&v720));
+    let y1080 = make_yuyv(1920, 1080);
+    let yuyv1080 = Packed422 {
+        data: &y1080,
+        stride: 1920 * 2,
+        width: 1920,
+        height: 1080,
+        order: Packed422Order::Yuyv,
+    };
     let bt709 = YuvEncoding::new(YuvMatrix::Bt709, YuvRange::Limited);
     let bt601f = YuvEncoding::new(YuvMatrix::Bt601, YuvRange::Full);
     let xrgb_src = make_xrgb_1080();
@@ -706,6 +749,8 @@ fn main() {
                         &IRect::new(0, 0, 1920, 1080),
                     ),
                     'r' => c.clear_irect(&full_clip(), &full_clip()),
+                    's' => scene_yuyv(&mut c, &yuyv1080, 1920, 1080, bt709),
+                    't' => scene_yuyv(&mut c, &yuyv1080, 1280, 720, bt709),
                     'i' => {
                         scene_gradient(&mut c);
                         scene_scrim(&mut c);

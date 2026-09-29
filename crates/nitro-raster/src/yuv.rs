@@ -1,5 +1,5 @@
-//! Video: an NV12 source blitted into the XRGB canvas, with fused YUV → RGB
-//! conversion and scaling.
+//! Video: an NV12 or packed 4:2:2 (YUYV / UYVY) source blitted into the
+//! XRGB canvas, with fused YUV → RGB conversion and scaling.
 //!
 //! This is the CPU path for video surfaces, the one that has to work
 //! everywhere (simpledrm, VMs, no Mesa). It is a *store*: a video surface is
@@ -36,6 +36,19 @@
 //! Chroma columns are clamped to the samples that cover the crop,
 //! `sr.x >> 1 ..= (sr.right() − 1) >> 1`, so an odd crop offset resolves to
 //! the right chroma column.
+//!
+//! ## Packed 4:2:2 ([`Packed422`])
+//!
+//! One plane; each 4-byte group carries two pixels, `Y0 U Y1 V`
+//! ([`Packed422Order::Yuyv`]) or `U Y0 V Y1` ([`Packed422Order::Uyvy`]).
+//! Chroma is subsampled horizontally only: group `j` of row `ly` holds
+//! chroma sample `(j, ly)`, **co-sited with luma column `2j`** (the same
+//! horizontal siting as NV12) and on the luma row itself vertically. In luma
+//! coordinates chroma `x = lx / 2`, `y = ly`. The 1:1 path takes the group
+//! covering the pixel, `lx >> 1`; the scaled path samples bilinearly at
+//! exactly that position, with chroma sharing the luma rows and vertical
+//! weight. Chroma columns clamp to `sr.x >> 1 ..= (sr.right() − 1) >> 1`
+//! as for NV12.
 //!
 //! # Conversion
 //!
@@ -149,6 +162,62 @@ impl Nv12<'_> {
             && self.y.len() as u64 >= (h - 1) * ys + w
             && self.uv.len() as u64 >= (ch - 1) * uvs + 2 * cw
     }
+}
+
+/// The byte order of a [`Packed422`] image's 4-byte groups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Packed422Order {
+    /// `Y0 U Y1 V` (V4L2 `YUYV`, DRM `YUYV`, a.k.a. YUY2). The default.
+    #[default]
+    Yuyv,
+    /// `U Y0 V Y1` (V4L2 `UYVY`, DRM `UYVY`).
+    Uyvy,
+}
+
+/// A borrowed packed 4:2:2 image: one plane of 4-byte groups, each holding
+/// two horizontally adjacent pixels and the chroma pair they share (byte
+/// order per [`Packed422Order`]).
+///
+/// The width must be even (every group is whole). As for [`Nv12`], the last
+/// row only needs its `2 * width` payload bytes, not a whole stride.
+#[derive(Debug, Clone, Copy)]
+pub struct Packed422<'a> {
+    /// The packed bytes, `2 * width` per row, rows `stride` apart.
+    pub data: &'a [u8],
+    /// Bytes per row; `>= 2 * width`.
+    pub stride: u32,
+    /// Width in (luma) pixels; must be even.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// Byte order of the groups.
+    pub order: Packed422Order,
+}
+
+impl Packed422<'_> {
+    /// The whole image as a rect at the origin.
+    pub fn bounds(&self) -> IRect {
+        IRect::new(0, 0, cast_i32(self.width), cast_i32(self.height))
+    }
+
+    /// Whether the declared geometry fits in the plane: a non-zero, even
+    /// width, `stride >= 2 * width`, and `stride * (height − 1) + 2 * width`
+    /// bytes.
+    pub fn is_valid(&self) -> bool {
+        let (w, h) = (u64::from(self.width), u64::from(self.height));
+        if w == 0 || h == 0 || w > i32::MAX as u64 || h > i32::MAX as u64 || w % 2 != 0 {
+            return false;
+        }
+        let s = u64::from(self.stride);
+        s >= 2 * w && self.data.len() as u64 >= (h - 1) * s + 2 * w
+    }
+}
+
+/// `(luma, u, v)` byte offsets inside a packed 4:2:2 group: pixel `2j + i`'s
+/// luma is byte `4j + luma + 2i`, its chroma bytes `4j + u` and `4j + v`.
+#[inline]
+const fn packed_offsets<const UYVY: bool>() -> (usize, usize, usize) {
+    if UYVY { (1, 0, 2) } else { (0, 1, 3) }
 }
 
 fn cast_i32(v: u32) -> i32 {
@@ -366,6 +435,126 @@ impl Canvas<'_> {
             nv12_run_edge(head, &row, base, &edge, c);
             nv12_run_inner(mid, &row, map_x.at(in_lo), c);
             nv12_run_edge(tail, &row, map_x.at(in_hi), &edge, c);
+        }
+    }
+}
+
+impl Canvas<'_> {
+    /// Blit (a crop of) a packed 4:2:2 video frame (YUYV or UYVY, per
+    /// `src.order`) into `dst`, converting to RGB with `enc` and scaling to
+    /// fit. Same contract as [`Canvas::blit_nv12`]: writes only inside
+    /// `clip ∩ dst ∩ surface`, stores opaque pixels, nearest sampling when
+    /// `dst` and the crop have the same size and bilinear otherwise,
+    /// clip-invariant. `src_rect` is intersected with `src.bounds()`; an
+    /// invalid source, an empty crop, an empty `dst` or an empty clip is a
+    /// no-op. See the [module docs](crate::yuv) for the chroma siting.
+    pub fn blit_yuyv(
+        &mut self,
+        clip: &IRect,
+        dst: &IRect,
+        src: &Packed422<'_>,
+        src_rect: &IRect,
+        enc: YuvEncoding,
+    ) {
+        if !src.is_valid() || dst.is_empty() {
+            return;
+        }
+        let sr = src_rect.intersect(&src.bounds());
+        if sr.is_empty() {
+            return;
+        }
+        let r = clip.intersect(&self.bounds()).intersect(dst);
+        if r.is_empty() {
+            return;
+        }
+        let region = Region {
+            y0: r.y,
+            y1: r.bottom(),
+            x0: r.x,
+            x1: r.right(),
+        };
+        let one = dst.w == sr.w && dst.h == sr.h;
+        let c = Coeffs::new(enc, if one { 0 } else { 8 });
+        match (src.order, one) {
+            (Packed422Order::Yuyv, true) => self.packed_1to1::<false>(region, dst, src, &sr, &c),
+            (Packed422Order::Uyvy, true) => self.packed_1to1::<true>(region, dst, src, &sr, &c),
+            (Packed422Order::Yuyv, false) => self.packed_scaled::<false>(region, dst, src, &sr, &c),
+            (Packed422Order::Uyvy, false) => self.packed_scaled::<true>(region, dst, src, &sr, &c),
+        }
+    }
+
+    /// Unscaled packed 4:2:2: exact luma, the covering group's chroma.
+    fn packed_1to1<const UYVY: bool>(
+        &mut self,
+        r: Region,
+        dst: &IRect,
+        src: &Packed422<'_>,
+        sr: &IRect,
+        c: &Coeffs,
+    ) {
+        let stride = self.stride() as usize;
+        let ps = src.stride as usize;
+        // Odd `lx0`: the first pixel is the second of its group.
+        let lx0 = sr.x + (r.x0 - dst.x);
+        let n = (r.x1 - r.x0) as usize;
+        let data = self.data_mut();
+        for y in r.y0..r.y1 {
+            let ly = (sr.y + (y - dst.y)) as usize;
+            let srow = &src.data[ly * ps + (lx0 as usize >> 1) * 4..];
+            let start = y as usize * stride + r.x0 as usize * BYTES_PER_PIXEL;
+            let drow = &mut data[start..start + n * BYTES_PER_PIXEL];
+            packed_row_1to1::<UYVY>(drow, srow, lx0 & 1 == 1, c);
+        }
+    }
+
+    /// Scaled packed 4:2:2: bilinear luma, bilinear chroma at half
+    /// horizontal resolution on the luma rows.
+    fn packed_scaled<const UYVY: bool>(
+        &mut self,
+        r: Region,
+        dst: &IRect,
+        src: &Packed422<'_>,
+        sr: &IRect,
+        c: &Coeffs,
+    ) {
+        let stride = self.stride() as usize;
+        let ps = src.stride as usize;
+        let map_x = Axis::new(sr.x, sr.w, dst.x, dst.w);
+        let map_y = Axis::new(sr.y, sr.h, dst.y, dst.h);
+        let (lx_first, lx_last) = (sr.x, sr.right() - 1);
+        let (cx_first, cx_last) = (sr.x >> 1, (sr.right() - 1) >> 1);
+        let (lo, hi) = (r.x0, r.x1);
+        let base = map_x.at(lo);
+        let step = map_x.step;
+        // The same interior split as `nv12_scaled`.
+        let (a0, a1) = texels_in_range(base, step, lo, hi, lx_first, lx_last);
+        let (b0, b1) = texels_in_range(base, step, lo, hi, 2 * cx_first, 2 * cx_last);
+        let (in_lo, in_hi) = if a0.max(b0) < a1.min(b1) {
+            (a0.max(b0), a1.min(b1))
+        } else {
+            (lo, lo)
+        };
+        let edge = EdgeClamp {
+            lx: (lx_first, lx_last),
+            cx: (cx_first, cx_last),
+        };
+        let data = self.data_mut();
+        for y in r.y0..r.y1 {
+            let sy = map_y.at(y);
+            let (y0, y1) = clamp_shift(sy, sr.y, sr.bottom() - 1);
+            let row = PackedRow {
+                r0: &src.data[y0 as usize * ps..],
+                r1: &src.data[y1 as usize * ps..],
+                ty: ((sy >> 8) & 0xFF) as i32,
+                step,
+            };
+            let start = y as usize * stride + lo as usize * BYTES_PER_PIXEL;
+            let drow = &mut data[start..start + (hi - lo) as usize * BYTES_PER_PIXEL];
+            let (head, rest) = drow.split_at_mut((in_lo - lo) as usize * BYTES_PER_PIXEL);
+            let (mid, tail) = rest.split_at_mut((in_hi - in_lo) as usize * BYTES_PER_PIXEL);
+            packed_run_edge::<UYVY>(head, &row, base, &edge, c);
+            packed_run_inner::<UYVY>(mid, &row, map_x.at(in_lo), c);
+            packed_run_edge::<UYVY>(tail, &row, map_x.at(in_hi), &edge, c);
         }
     }
 }
@@ -743,5 +932,142 @@ fn nv12_row_1to1(drow: &mut [u8], yrow: &[u8], uvrow: &[u8], odd: bool, c: &Coef
     if let (Some(&y), Some(uv)) = (yt.first(), uvrow.get(pairs * 2..pairs * 2 + 2)) {
         let ch = c.chroma(i32::from(uv[0]), i32::from(uv[1]));
         dt.copy_from_slice(&c.pack(c.luma(i32::from(y)), ch).to_le_bytes());
+    }
+}
+
+/// The two source rows and vertical weight of one packed 4:2:2 destination
+/// row (luma and chroma share both).
+#[derive(Debug, Clone, Copy)]
+struct PackedRow<'a> {
+    r0: &'a [u8],
+    r1: &'a [u8],
+    ty: i32,
+    step: i64,
+}
+
+/// The interior of a packed 4:2:2 scaled row: vertical pass over the
+/// contiguous packed span (luma and chroma bytes together) into `u16` stack
+/// bytes, then per pixel one horizontal lerp per channel, then the
+/// conversion. Bit-identical to the four-tap edge form, as in
+/// [`nv12_run_inner`].
+#[inline]
+fn packed_run_inner<const UYVY: bool>(row: &mut [u8], s: &PackedRow<'_>, base: i64, c: &Coeffs) {
+    let (yo, uo, vo) = packed_offsets::<UYVY>();
+    // A chunk's luma span is at most `SPAN − 1` columns, so its groups span
+    // at most `2 * SPAN + 8` bytes (see `chunk_cols`).
+    let mut vb = [0u16; 2 * SPAN + 8];
+    let (mut hy, mut hu, mut hv) = ([0i32; CHUNK], [0i32; CHUNK], [0i32; CHUNK]);
+    let max_n = chunk_cols(s.step);
+    let (w1, w0) = (s.ty as u16, 256 - s.ty as u16);
+    let mut fixed = base;
+    let mut rest = row;
+    while !rest.is_empty() {
+        let n = (rest.len() / BYTES_PER_PIXEL).min(max_n);
+        let (dchunk, tail) = rest.split_at_mut(n * BYTES_PER_PIXEL);
+        rest = tail;
+        let last = fixed + i64::from((n - 1) as u32) * s.step;
+        // Groups `[g0, g1]` cover every luma column and chroma pair (with
+        // their `+1` neighbours) the chunk reads; in range by contract.
+        let b0 = (fixed >> 17) as usize * 4;
+        let b1 = ((last >> 17) as usize + 2) * 4;
+        for ((d, &a), &b) in vb[..b1 - b0]
+            .iter_mut()
+            .zip(&s.r0[b0..b1])
+            .zip(&s.r1[b0..b1])
+        {
+            *d = u16::from(a) * w0 + u16::from(b) * w1;
+        }
+        let (hy, hu, hv) = (&mut hy[..n], &mut hu[..n], &mut hv[..n]);
+        for ((y, u), v) in hy.iter_mut().zip(hu.iter_mut()).zip(hv.iter_mut()) {
+            let o = (fixed >> 16) as usize * 2 + yo - b0;
+            let tx = ((fixed >> 8) & 0xFF) as i32;
+            let cf = fixed >> 1;
+            let co = (cf >> 16) as usize * 4 - b0;
+            let tcx = ((cf >> 8) & 0xFF) as i32;
+            fixed += s.step;
+            let h = |a: u16, b: u16, t: i32| (i32::from(a) * (256 - t) + i32::from(b) * t) >> 8;
+            *y = h(vb[o], vb[o + 2], tx);
+            *u = h(vb[co + uo], vb[co + uo + 4], tcx);
+            *v = h(vb[co + vo], vb[co + vo + 4], tcx);
+        }
+        for (((d, &y), &u), &v) in dchunk.chunks_exact_mut(4).zip(&*hy).zip(&*hu).zip(&*hv) {
+            d.copy_from_slice(&c.pack(c.luma(y), c.chroma(u, v)).to_le_bytes());
+        }
+    }
+}
+
+/// The leading/trailing columns of a packed 4:2:2 scaled row: edge-clamped
+/// four-tap sampling.
+fn packed_run_edge<const UYVY: bool>(
+    row: &mut [u8],
+    s: &PackedRow<'_>,
+    base: i64,
+    e: &EdgeClamp,
+    c: &Coeffs,
+) {
+    let (yo, uo, vo) = packed_offsets::<UYVY>();
+    let mut fixed = base;
+    for d in row.chunks_exact_mut(4) {
+        let (xa, xb) = clamp_shift(fixed, e.lx.0, e.lx.1);
+        let tx = ((fixed >> 8) & 0xFF) as i32;
+        let cf = fixed >> 1;
+        let (ca, cb) = clamp_shift(cf, e.cx.0, e.cx.1);
+        let tcx = ((cf >> 8) & 0xFF) as i32;
+        fixed = fixed.saturating_add(s.step);
+        let (xa, xb) = (xa as usize * 2 + yo, xb as usize * 2 + yo);
+        let (ca, cb) = (ca as usize * 4, cb as usize * 4);
+        let tap = |a: usize, b: usize, t: i32| bilerp(s.r0[a], s.r0[b], s.r1[a], s.r1[b], t, s.ty);
+        let l = tap(xa, xb, tx);
+        let u = tap(ca + uo, cb + uo, tcx);
+        let v = tap(ca + vo, cb + vo, tcx);
+        d.copy_from_slice(&c.pack(c.luma(l), c.chroma(u, v)).to_le_bytes());
+    }
+}
+
+/// One unscaled packed 4:2:2 row. `srow` starts at the group of the first
+/// pixel; `odd` says that pixel is the *second* of its group.
+fn packed_row_1to1<const UYVY: bool>(drow: &mut [u8], srow: &[u8], odd: bool, c: &Coeffs) {
+    let (yo, uo, vo) = packed_offsets::<UYVY>();
+    let (drow, srow) = if odd && !drow.is_empty() {
+        let g = &srow[..4];
+        let ch = c.chroma(i32::from(g[uo]), i32::from(g[vo]));
+        let px = c.pack(c.luma(i32::from(g[yo + 2])), ch);
+        let (first, rest) = drow.split_at_mut(BYTES_PER_PIXEL);
+        first.copy_from_slice(&px.to_le_bytes());
+        (rest, &srow[4..])
+    } else {
+        (drow, srow)
+    };
+    // Per chunk: deinterleave into stack arrays (a trailing odd pixel reads
+    // its whole group, which a valid image always has), then one
+    // straight-line conversion pass, as in `nv12_row_1to1`.
+    let (mut ay, mut au, mut av) = ([0i32; CHUNK], [0i32; CHUNK], [0i32; CHUNK]);
+    for (dc, sc) in drow
+        .chunks_mut(CHUNK * BYTES_PER_PIXEL)
+        .zip(srow.chunks(CHUNK * 2))
+    {
+        let m = dc.len() / BYTES_PER_PIXEL;
+        let groups = m.div_ceil(2);
+        for (((g, y), u), v) in sc[..4 * groups]
+            .chunks_exact(4)
+            .zip(ay.chunks_exact_mut(2))
+            .zip(au.chunks_exact_mut(2))
+            .zip(av.chunks_exact_mut(2))
+        {
+            y[0] = i32::from(g[yo]);
+            y[1] = i32::from(g[yo + 2]);
+            u[0] = i32::from(g[uo]);
+            u[1] = u[0];
+            v[0] = i32::from(g[vo]);
+            v[1] = v[0];
+        }
+        for (((d, &y), &u), &v) in dc
+            .chunks_exact_mut(4)
+            .zip(&ay[..m])
+            .zip(&au[..m])
+            .zip(&av[..m])
+        {
+            d.copy_from_slice(&c.pack(c.luma(y), c.chroma(u, v)).to_le_bytes());
+        }
     }
 }

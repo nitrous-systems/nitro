@@ -2503,6 +2503,402 @@ mod nv12 {
             .blit_nv12(&all, &far, &big.nv12(), &big.nv12().bounds(), enc);
         assert_eq!(x_byte(&s, 3, 3), 255);
     }
+
+    // ---- packed 4:2:2 (YUYV / UYVY) -----------------------------------------
+
+    mod packed {
+        use super::super::{Rng, Surface, iw};
+        use super::{assert_near, encodings, rgb_at, to_u8, x_byte, yuv_to_rgb, yuv_to_rgb_f};
+        use crate::{Packed422, Packed422Order, YuvEncoding, YuvMatrix, YuvRange};
+        use nitro_core::IRect;
+
+        /// An owned YUYV frame, padded stride, tight last row.
+        struct Frame {
+            data: Vec<u8>,
+            w: u32,
+            h: u32,
+            stride: u32,
+        }
+
+        impl Frame {
+            /// Luma from `fy(x, y)`, chroma of group `(j, y)` from `fc(j, y)`.
+            fn new(
+                w: u32,
+                h: u32,
+                fy: impl Fn(u32, u32) -> u8,
+                fc: impl Fn(u32, u32) -> (u8, u8),
+            ) -> Self {
+                let stride = 2 * w + 6;
+                let mut data = vec![0xEE; ((h - 1) * stride + 2 * w) as usize];
+                for r in 0..h {
+                    for j in 0..w / 2 {
+                        let o = (r * stride + 4 * j) as usize;
+                        let (u, v) = fc(j, r);
+                        data[o..o + 4].copy_from_slice(&[fy(2 * j, r), u, fy(2 * j + 1, r), v]);
+                    }
+                }
+                Self { data, w, h, stride }
+            }
+
+            fn src(&self) -> Packed422<'_> {
+                Packed422 {
+                    data: &self.data,
+                    stride: self.stride,
+                    width: self.w,
+                    height: self.h,
+                    order: Packed422Order::Yuyv,
+                }
+            }
+
+            /// The same image in UYVY byte order.
+            fn swapped(&self) -> Vec<u8> {
+                let mut d = self.data.clone();
+                for r in 0..self.h as usize {
+                    let row = &mut d[r * self.stride as usize..][..2 * self.w as usize];
+                    for g in row.chunks_exact_mut(4) {
+                        g.swap(0, 1);
+                        g.swap(2, 3);
+                    }
+                }
+                d
+            }
+
+            fn luma(&self, x: i32, y: i32) -> f64 {
+                f64::from(self.data[y as usize * self.stride as usize + 2 * x as usize])
+            }
+
+            fn chroma(&self, j: i32, y: i32) -> (f64, f64) {
+                let o = y as usize * self.stride as usize + 4 * j as usize;
+                (f64::from(self.data[o + 1]), f64::from(self.data[o + 3]))
+            }
+
+            fn ref_1to1(&self, enc: YuvEncoding, x: i32, y: i32) -> (u8, u8, u8) {
+                let (u, v) = self.chroma(x >> 1, y);
+                yuv_to_rgb(enc, self.luma(x, y), u, v)
+            }
+
+            /// Float bilinear reference: chroma at `x = lx / 2`, `y = ly`.
+            fn ref_scaled(
+                &self,
+                enc: YuvEncoding,
+                dst: &IRect,
+                sr: &IRect,
+                dx: i32,
+                dy: i32,
+            ) -> [f64; 3] {
+                let sx = (f64::from(dx - dst.x) + 0.5) * f64::from(sr.w) / f64::from(dst.w)
+                    + f64::from(sr.x)
+                    - 0.5;
+                let sy = (f64::from(dy - dst.y) + 0.5) * f64::from(sr.h) / f64::from(dst.h)
+                    + f64::from(sr.y)
+                    - 0.5;
+                let lerp2 = |pos: f64, first: i32, last: i32| {
+                    let f = pos.floor();
+                    let i = f as i32;
+                    (i.clamp(first, last), (i + 1).clamp(first, last), pos - f)
+                };
+                let (x0, x1, tx) = lerp2(sx, sr.x, sr.right() - 1);
+                let (y0, y1, ty) = lerp2(sy, sr.y, sr.bottom() - 1);
+                let l = (self.luma(x0, y0) * (1.0 - tx) + self.luma(x1, y0) * tx) * (1.0 - ty)
+                    + (self.luma(x0, y1) * (1.0 - tx) + self.luma(x1, y1) * tx) * ty;
+                let (j0, j1, tcx) = lerp2(sx / 2.0, sr.x >> 1, (sr.right() - 1) >> 1);
+                let mix = |a: (f64, f64), b: (f64, f64), t: f64| {
+                    (a.0 * (1.0 - t) + b.0 * t, a.1 * (1.0 - t) + b.1 * t)
+                };
+                let top = mix(self.chroma(j0, y0), self.chroma(j1, y0), tcx);
+                let bot = mix(self.chroma(j0, y1), self.chroma(j1, y1), tcx);
+                let (u, v) = mix(top, bot, ty);
+                yuv_to_rgb_f(enc, l, u, v)
+            }
+        }
+
+        fn smooth(w: u32, h: u32) -> Frame {
+            Frame::new(
+                w,
+                h,
+                |x, y| (30 + (x * 3 + y * 2) % 190) as u8,
+                |j, y| {
+                    (
+                        (60 + (j * 5 + y) % 130) as u8,
+                        (200 - (j + 3 * y) % 140) as u8,
+                    )
+                },
+            )
+        }
+
+        fn noisy(w: u32, h: u32) -> Frame {
+            Frame::new(
+                w,
+                h,
+                |x, y| (x.wrapping_mul(2_654_435_761) ^ y.wrapping_mul(40503)) as u8,
+                |j, k| {
+                    (
+                        (j.wrapping_mul(97) ^ k.wrapping_mul(7919)) as u8,
+                        (j.wrapping_mul(193) + k.wrapping_mul(389)) as u8,
+                    )
+                },
+            )
+        }
+
+        fn blit(
+            s: &mut Surface,
+            clip: &IRect,
+            dst: &IRect,
+            src: &Packed422<'_>,
+            sr: &IRect,
+            enc: YuvEncoding,
+        ) {
+            s.canvas().blit_yuyv(clip, dst, src, sr, enc);
+        }
+
+        #[test]
+        fn one_to_one_matches_the_float_reference() {
+            let f = noisy(34, 13);
+            let mut rng = Rng::new(0x1234_5678_9ABC_DEF0);
+            for enc in encodings() {
+                let mut s = Surface::new(40, 16);
+                let all = s.canvas().bounds();
+                let dst = IRect::new(3, 2, 34, 13);
+                blit(&mut s, &all, &dst, &f.src(), &f.src().bounds(), enc);
+                for y in 0..13 {
+                    for x in 0..34 {
+                        let got = rgb_at(&s, 3 + x, 2 + y);
+                        assert_near(
+                            got,
+                            f.ref_1to1(enc, x, y),
+                            1,
+                            &format!("{enc:?} ({x}, {y})"),
+                        );
+                        assert_eq!(x_byte(&s, 3 + x, 2 + y), 255);
+                    }
+                }
+                s.assert_untouched_outside(&dst);
+                // Random single triples through a 2x1 frame.
+                for _ in 0..500 {
+                    let (y, u, v) = (rng.byte(), rng.byte(), rng.byte());
+                    let f = Frame::new(2, 1, |_, _| y, |_, _| (u, v));
+                    let mut s = Surface::new(2, 1);
+                    let all = s.canvas().bounds();
+                    blit(&mut s, &all, &all, &f.src(), &all, enc);
+                    let want = yuv_to_rgb(enc, f64::from(y), f64::from(u), f64::from(v));
+                    assert_near(rgb_at(&s, 1, 0), want, 1, &format!("{enc:?} {y}/{u}/{v}"));
+                }
+            }
+        }
+
+        #[test]
+        fn one_to_one_with_odd_crops_uses_the_covering_group() {
+            let f = Frame::new(
+                18,
+                7,
+                |x, y| (20 + x * 11 + y * 7) as u8,
+                |j, y| ((40 + j * 19 + y * 3) as u8, (220 - j * 13 - y * 5) as u8),
+            );
+            let crops = [
+                IRect::new(0, 0, 18, 7),
+                IRect::new(1, 1, 17, 6),
+                IRect::new(3, 0, 13, 7),
+                IRect::new(3, 1, 5, 3),
+                IRect::new(17, 6, 1, 1),
+                IRect::new(1, 0, 1, 7),
+                IRect::new(5, 2, 12, 5),
+            ];
+            for enc in encodings() {
+                for sr in &crops {
+                    for (ox, oy) in [(0, 0), (1, 2), (4, 1)] {
+                        let mut s = Surface::new(24, 12);
+                        let all = s.canvas().bounds();
+                        let dst = IRect::new(ox, oy, sr.w, sr.h);
+                        blit(&mut s, &all, &dst, &f.src(), sr, enc);
+                        for y in 0..sr.h {
+                            for x in 0..sr.w {
+                                let want = f.ref_1to1(enc, sr.x + x, sr.y + y);
+                                assert_near(
+                                    rgb_at(&s, ox + x, oy + y),
+                                    want,
+                                    1,
+                                    &format!("{enc:?} crop {sr:?} ({x}, {y})"),
+                                );
+                            }
+                        }
+                        s.assert_untouched_outside(&dst);
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn scaled_matches_the_bilinear_reference_with_siting() {
+            let frames = [smooth(18, 9), smooth(2, 1), smooth(40, 31)];
+            let geoms = [
+                (IRect::new(0, 0, 40, 23), None),
+                (IRect::new(2, 1, 9, 5), None),
+                (IRect::new(0, 0, 33, 7), Some(IRect::new(1, 1, 7, 5))),
+                (IRect::new(1, 2, 13, 29), Some(IRect::new(3, 0, 5, 7))),
+                (IRect::new(0, 0, 1, 1), None),
+                (IRect::new(0, 0, 41, 17), None),
+            ];
+            for enc in encodings() {
+                for f in &frames {
+                    for (dst, crop) in &geoms {
+                        let b = f.src().bounds();
+                        let sr = crop.unwrap_or(b).intersect(&b);
+                        if sr.is_empty() || (sr.w == dst.w && sr.h == dst.h) {
+                            continue;
+                        }
+                        let mut s = Surface::new(48, 36);
+                        let all = s.canvas().bounds();
+                        blit(&mut s, &all, dst, &f.src(), &sr, enc);
+                        for y in dst.y..dst.bottom() {
+                            for x in dst.x..dst.right() {
+                                let [r, g, b] = f.ref_scaled(enc, dst, &sr, x, y);
+                                assert_near(
+                                    rgb_at(&s, x, y),
+                                    (to_u8(r), to_u8(g), to_u8(b)),
+                                    2,
+                                    &format!("{enc:?} {}x{} {dst:?} {sr:?} ({x}, {y})", f.w, f.h),
+                                );
+                            }
+                        }
+                        s.assert_untouched_outside(dst);
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn clipped_is_byte_identical_to_unclipped() {
+            let f = smooth(38, 21);
+            let mut rng = Rng::new(0xDEAD_BEEF_1234_5678);
+            let cases = [
+                (IRect::new(2, 1, 38, 21), IRect::new(0, 0, 38, 21)), // 1:1
+                (IRect::new(1, 3, 29, 19), IRect::new(5, 1, 29, 19)), // 1:1, odd crop
+                (IRect::new(-7, 2, 70, 41), IRect::new(0, 0, 38, 21)), // up
+                (IRect::new(3, 3, 19, 9), IRect::new(1, 1, 35, 19)),  // down
+                (IRect::new(0, 0, 51, 13), IRect::new(3, 2, 30, 17)), // mixed
+                (IRect::new(0, 0, 9, 40), IRect::new(0, 0, 38, 21)),  // strong down x
+            ];
+            for enc in encodings() {
+                for (dst, sr) in &cases {
+                    let mut full = Surface::new(64, 48);
+                    let all = full.canvas().bounds();
+                    blit(&mut full, &all, dst, &f.src(), sr, enc);
+                    for _ in 0..12 {
+                        let x = iw(rng.next_u32() % 64);
+                        let y = iw(rng.next_u32() % 48);
+                        let w = 1 + iw(rng.next_u32() % 40);
+                        let h = 1 + iw(rng.next_u32() % 30);
+                        let clip = IRect::new(x, y, w, h);
+                        let mut part = Surface::new(64, 48);
+                        blit(&mut part, &clip, dst, &f.src(), sr, enc);
+                        let inside = clip.intersect(dst).intersect(&all);
+                        for py in inside.y..inside.bottom() {
+                            for px in inside.x..inside.right() {
+                                assert_eq!(
+                                    part.px(px, py),
+                                    full.px(px, py),
+                                    "{enc:?} dst {dst:?} clip {clip:?} at ({px}, {py})"
+                                );
+                            }
+                        }
+                        part.assert_untouched_outside(&inside);
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn uyvy_equals_yuyv_after_swapping_bytes() {
+            let f = noisy(26, 11);
+            let swapped = f.swapped();
+            let uyvy = Packed422 {
+                data: &swapped,
+                order: Packed422Order::Uyvy,
+                ..f.src()
+            };
+            let enc = YuvEncoding::new(YuvMatrix::Bt601, YuvRange::Limited);
+            let geoms = [
+                (IRect::new(1, 1, 26, 11), IRect::new(0, 0, 26, 11)),
+                (IRect::new(0, 2, 13, 9), IRect::new(3, 1, 13, 9)),
+                (IRect::new(0, 0, 40, 30), IRect::new(0, 0, 26, 11)),
+                (IRect::new(2, 0, 11, 5), IRect::new(1, 1, 23, 9)),
+            ];
+            for (dst, sr) in &geoms {
+                let mut a = Surface::new(44, 32);
+                let mut b = Surface::new(44, 32);
+                let clip = IRect::new(0, 1, 30, 25);
+                blit(&mut a, &clip, dst, &f.src(), sr, enc);
+                blit(&mut b, &clip, dst, &uyvy, sr, enc);
+                assert_eq!(a.data, b.data, "{dst:?} {sr:?}");
+            }
+        }
+
+        #[test]
+        fn validity_and_no_ops() {
+            let f = smooth(8, 5);
+            assert!(f.src().is_valid(), "tight buffer must be accepted");
+            let short = Packed422 {
+                data: &f.data[..f.data.len() - 1],
+                ..f.src()
+            };
+            let odd_w = Packed422 {
+                width: 7,
+                ..f.src()
+            };
+            let bad_stride = Packed422 {
+                stride: 15,
+                ..f.src()
+            };
+            let empty = Packed422 {
+                height: 0,
+                ..f.src()
+            };
+            for bad in [short, odd_w, bad_stride, empty] {
+                assert!(!bad.is_valid(), "{bad:?}");
+                let mut s = Surface::new(16, 16);
+                let all = s.canvas().bounds();
+                blit(
+                    &mut s,
+                    &all,
+                    &all,
+                    &bad,
+                    &IRect::new(0, 0, 8, 5),
+                    YuvEncoding::default(),
+                );
+                s.assert_untouched_outside(&IRect::EMPTY);
+            }
+            let mut s = Surface::new(16, 16);
+            let all = s.canvas().bounds();
+            let src = f.src();
+            let enc = YuvEncoding::default();
+            blit(&mut s, &all, &all, &src, &IRect::new(0, 0, 0, 5), enc);
+            blit(
+                &mut s,
+                &all,
+                &IRect::new(0, 0, 0, 9),
+                &src,
+                &src.bounds(),
+                enc,
+            );
+            blit(&mut s, &IRect::EMPTY, &all, &src, &src.bounds(), enc);
+            blit(&mut s, &all, &all, &src, &IRect::new(8, 0, 3, 3), enc);
+            s.assert_untouched_outside(&IRect::EMPTY);
+            // Extreme geometry does not panic.
+            let huge = IRect::new(-1_000_000_000, -1_000_000_000, 2_000_000_000, 2_000_000_000);
+            blit(&mut s, &all, &huge, &src, &src.bounds(), enc);
+            blit(
+                &mut s,
+                &all,
+                &IRect::new(3, 3, 1, 1),
+                &src,
+                &src.bounds(),
+                enc,
+            );
+            let far = IRect::new(1_000_000_000, 5, 1_000_000_000, 4);
+            blit(&mut s, &all, &far, &src, &src.bounds(), enc);
+            assert_eq!(x_byte(&s, 3, 3), 255);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

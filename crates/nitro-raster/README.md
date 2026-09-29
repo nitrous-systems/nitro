@@ -98,6 +98,7 @@ a fast path that skips the coverage walk entirely; see
 | `stroke_rect_inside` | a rounded-rect border lying entirely inside the rect |
 | `blit` | an `Image` (XRGB8888 or straight-alpha ARGB8888), 1:1 or bilinear-scaled |
 | `blit_nv12` | an `Nv12` video frame into an integer rect: fused YUV → RGB + scale, stored (see [Video](#video-nv12-blit)) |
+| `blit_yuyv` | a `Packed422` (YUYV or UYVY) video frame into an integer rect: same contract as `blit_nv12` (see [Video](#packed-422-yuyv--uyvy)) |
 | `blit_xrgb_scaled` | an opaque XRGB8888 `Image` scaled into an integer rect, stored; ~3× faster than `blit` on that case |
 | `blit_mask` | an A8 coverage `Mask` tinted with one colour, source-over |
 | `blit_masks` | a batch of masks sharing a colour and an opacity |
@@ -261,6 +262,29 @@ vectorizable part (arithmetic):
 ARGB sources stay on the generic blending `blit` — straight alpha cannot be
 stored.
 
+### Packed 4:2:2 (YUYV / UYVY)
+
+`Canvas::blit_yuyv(clip, dst: &IRect, src: &Packed422, src_rect: &IRect, enc: YuvEncoding)`
+has the same contract as `blit_nv12` (store, clip-invariant, 1:1 nearest or
+bilinear, same `Coeffs`/`Axis` machinery and accuracy bounds).
+
+- **Source.** `Packed422 { data, stride, width, height, order }`, one plane
+  of 4-byte groups, two pixels each: `Y0 U Y1 V` (`Packed422Order::Yuyv`,
+  the default) or `U Y0 V Y1` (`Uyvy`). Width must be even; `stride >=
+  2·width`; the last row needs only its `2·width` payload bytes.
+- **Chroma siting.** Horizontal only subsampling: group `j` of row `ly` is
+  co-sited with luma column `2j` on row `ly`, i.e. chroma `x = lx/2`,
+  `y = ly`. 1:1 takes the covering group (`lx >> 1`); scaled interpolates
+  there, sharing the luma rows' vertical weight.
+- **Scaled path.** The vertical pass blends the packed bytes (luma and
+  chroma together) of the chunk's group span into one `u16` stack row; the
+  horizontal pass reads luma at stride 2 and chroma at stride 4 from it. The
+  byte order is a const generic, so YUYV and UYVY compile to separate loops.
+- **Tests.** 1:1 within ±1 of the float reference (frame + random triples,
+  every matrix × range), odd crop offsets, scaled within ±2 of a float
+  bilinear reference with this siting, clipped == unclipped (1:1 and
+  scaled), UYVY byte-identical to YUYV after swapping bytes.
+
 ### Numbers
 
 `cargo bench -p nitro-raster --bench raster -- --iters 40` (box: `--iters
@@ -275,6 +299,14 @@ stored.
 | **o** `nv12_1080_720_601f` (BT.601 full) | 4.95 ns/px | 6.46 ns/px |
 | **p** `xrgb_1080_720`, generic `blit` | 10.86 ns/px | 12.57 ns/px |
 | **q** `xrgb_fast_1080_720`, `blit_xrgb_scaled` | **3.82 ns/px** | **4.11 ns/px** |
+| **s** `yuyv_1080_1080` (1:1) | **2.00 ns/px** (4.14 ms) | — |
+| **t** `yuyv_1080_720` | **6.03 ns/px** (5.56 ms) | — |
+
+Scenes s/t were measured on dev only (`--iters 40`, min of 3 runs; the same
+runs gave l = 1.82 and m = 4.98 ns/px, so the dev figures above are still
+current). YUYV costs ~10 % more than NV12 at 1:1 (it reads 2 bytes/px
+against 1.5) and ~20 % more scaled (the vertical pass blends 4 bytes per
+luma pair where NV12 blends 3, and the horizontal gathers are strided).
 
 The matrix and range do not matter (m vs o). Against the target: 1080p30
 fullscreen is 1920·1080·30 = 62.2 Mpx/s. At 1:1 on dev that is 113 ms/s,
