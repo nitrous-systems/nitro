@@ -33,3 +33,5 @@ path = "src/main.rs"
 # The in-process harness: a real server on the fake backend. Never
 # linked into the shipped binary.
 nitro-ui = { workspace = true, features = ["test-support"] }
+# Tests name wire types (window state) directly.
+nitro-wire = { workspace = true }

@@ -2236,7 +2236,14 @@ impl<S: 'static> Ui<S> {
                 nitro_wire::msg::RequestFrame {
                     window: WindowId::MAIN.0,
                 },
-            ))
+            ))?;
+        // The server buffers `RequestFrame` into the transaction like a
+        // scene op, so it takes effect at the next `Commit`. An app that
+        // asks for a frame with nothing dirty (a video presenting through
+        // `PresentSurface`) would otherwise never be answered: the next
+        // flush commits even when nothing else is queued.
+        self.wire.want_commit();
+        Ok(())
     }
 
     /// Whether a frame callback is outstanding.

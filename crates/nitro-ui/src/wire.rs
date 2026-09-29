@@ -288,6 +288,13 @@ impl Wire {
         Ok(())
     }
 
+    /// Make the next [`Wire::commit`] send a `Commit` even with no
+    /// mutation queued: an op the server applies at commit time (a
+    /// `RequestFrame`) is otherwise never applied by an idle app.
+    pub(crate) fn want_commit(&mut self) {
+        self.pending = self.pending.max(1);
+    }
+
     /// End the transaction and push it at the socket. Does nothing when
     /// no mutation was queued — an idle app sends no bytes at all.
     pub(crate) fn commit(&mut self) -> Result<bool, Error> {

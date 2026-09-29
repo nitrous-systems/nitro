@@ -1,11 +1,13 @@
 //! `nitro-video`: a native video player (#3906).
 //!
-//! MP4/H.264 demuxed in-process ([`mp4`], [`annexb`]), decoded by an
-//! `ffmpeg` child ([`ffmpeg`]) behind the [`decode::Decoder`] seam, and
-//! presented as NV12 frames on a `Surface` node ([`player`]), paced by
-//! [`pacing`], with nitro-ui controls over the video ([`controls`]).
+//! The system `FFmpeg` demuxes and decodes ([`ffmpeg`], behind the
+//! [`decode::Decoder`] seam). A decode thread writes NV12 frames into a
+//! ring of shared-memory buffers, and [`player`] presents them on a
+//! `Surface` node, paced against the server's frame callbacks
+//! ([`pacing`]), with nitro-ui controls over the video ([`controls`]).
 
-pub mod annexb;
+pub mod controls;
 pub mod decode;
 pub mod ffmpeg;
-pub mod mp4;
+pub mod pacing;
+pub mod player;

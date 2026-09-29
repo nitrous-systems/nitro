@@ -466,7 +466,42 @@ impl<S: 'static> Harness<S> {
     /// # Panics
     /// On a wire failure.
     pub fn pump(&mut self) -> usize {
-        self.ui.pump(&mut self.state).expect("pump")
+        let n = self.ui.pump(&mut self.state).expect("pump");
+        n + self.run_ready_fds()
+    }
+
+    /// Run every [`Ui::add_fd`] hook whose descriptor is readable now,
+    /// as the app loop's `epoll` would; returns how many ran.
+    fn run_ready_fds(&mut self) -> usize {
+        use rustix::event::{PollFd, PollFlags};
+        let ready: Vec<u64> = {
+            let hooks = self.ui.hook_fds();
+            let mut fds: Vec<PollFd<'_>> = hooks
+                .iter()
+                .map(|(_, fd)| PollFd::new(fd, PollFlags::IN))
+                .collect();
+            if fds.is_empty() {
+                return 0;
+            }
+            let zero = rustix::time::Timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            if rustix::event::poll(&mut fds, Some(&zero)).is_err() {
+                return 0;
+            }
+            hooks
+                .iter()
+                .zip(&fds)
+                .filter(|(_, f)| f.revents().intersects(PollFlags::IN | PollFlags::HUP))
+                .map(|((id, _), _)| *id)
+                .collect()
+        };
+        for id in &ready {
+            self.ui
+                .run_fd(&mut self.state, crate::ui::FdToken::from_raw(*id));
+        }
+        ready.len()
     }
 
     /// Whether anything arrived in a short window. Used to decide whether
