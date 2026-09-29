@@ -1115,6 +1115,96 @@ scene nodes (an image and a badge group), and only while in overview.
 a direct repaint, as it did before #3902. A failed allocation falls back
 the same way. Design: `docs/wm.md` §The thumbnail atlas.
 
+### Measured on both boxes (#3915)
+
+#3902 merged with an estimate and no `just footprint` report. These are
+the measured figures, at `e2124f7` (main, #3902's last commit), with
+`just deploy` on both boxes and matching md5s. The pre-#3902 reference is
+its merge base `43f95bf`.
+
+**Binaries and dependencies.** `nitro-server` is 3 120 800 → **3 134 720**
+bytes (**+13 920**, +0.45 %). Every other binary is byte-identical, and
+`cargo tree` is still 89 lines / 37 external names.
+
+**box1 (HSW, HDMI-A-1 1920×1080@120), idle desktop, 30 s window, fresh
+`nitro-dev` restart for each row:**
+
+| server, kB | VmRSS | RssAnon | tree TOTAL RssAnon |
+|---|---|---|---|
+| before (`feff632`, pre-#3902) | 18 504 | 10 456 | 11 444 |
+| `e2124f7` | 26 628 | **18 568** | 19 544 |
+| `e2124f7`, `NITRO_OVERVIEW_ATLAS=0` | 18 644 | 10 456 | 11 444 |
+| **delta** | +8 124 | **+8 112** | +8 100 |
+
+The estimate was right, and **the full atlas is resident from startup
+whether or not the overview is ever opened.** The 8 112 kB matches the
+8 100 kB atlas (`overview_atlas_bytes` 8 294 400) to within one allocator
+step. The zero fill pre-faults it, and nothing on this idle desktop
+pressed Super. With the atlas switched off the server's RssAnon comes
+back to the pre-#3902 number exactly, so none of the rest of #3902
+(offscreen windows, scene changes) is resident cost. Server RssAnon is
+now ~1.8× its pre-#3902 size on this box: the shadow buffer and the atlas
+are 16.2 MB of its 18.6 MB.
+
+**testhost2 (KBL, eDP-1 2560×1440).** The new build is installed in
+`/usr/local/bin` (md5 matches), but the live session still runs the
+previous one. Getting the new build live means restarting GDM, which ends
+the human's session, and this measurement is not worth that. The atlas
+term was instead measured on the same machine as an A/B pair of private
+fake-backend servers at 2560×1440 (`NITRO_BACKEND=fake`, own
+`XDG_RUNTIME_DIR`, `MALLOC_MMAP_THRESHOLD_=131072`, the deployed binary):
+
+| fake 2560×1440 server, kB | VmRSS | RssAnon |
+|---|---|---|
+| `NITRO_OVERVIEW_ATLAS=0` | 52 076 | 44 864 |
+| atlas on | 66 580 | **59 268** |
+| **delta** | +14 504 | **+14 404** |
+
+`overview_atlas_bytes` is 14 745 600 = 14 400 kB, so the atlas again
+costs exactly its size, from startup. The fake backend's absolute numbers
+include its heap framebuffers (see §Dev machine), so only the delta
+transfers to the live session. For reference, the live pre-#3902 server
+there read VmRSS 70 752 / RssAnon **61 380 kB** idle, against 10.4 MB on
+box1. That gap predates #3902 and is not explained here. Adding the
+atlas would put it at ~75.8 MB after the next login.
+
+**Paint cost.** Each row is `nitro-demo --windows N` (800×500 windows),
+then `overview on` / `overview off` over the control socket, three
+repetitions. `thumb_render_us` is the delta of that stat across one entry.
+Entry-frame `paint_us` is every frame logged by `samples paint` during
+the animation, excluding the settled 1 µs frames. Ranges span all three
+repetitions.
+
+| box1, 1920×1080 | N=4 | N=8 | N=16 |
+|---|---|---|---|
+| one thumbnail render | 1.7–2.3 ms | 0.77–0.90 ms | 0.45–0.60 ms |
+| all renders, one entry | 6.8–9.2 ms | 6.1–7.2 ms | 7.2–9.7 ms |
+| entry frame 1 `paint_us` | 2.6 ms | 2.7 ms | 2.6–2.8 ms |
+| entry frames 2… `paint_us` | **10.3–13.7 ms** | **10.4–13.3 ms** | **10.6–15.4 ms** |
+| snap path (`ATLAS=0`), frame 1 / rest | | 11.7–15.0 / 0.47–1.05 ms | |
+
+| testhost2 fake, 2560×1440 | N=4 | N=8 | N=16 |
+|---|---|---|---|
+| one thumbnail render | 1.6–2.0 ms | 1.2–1.4 ms | 0.69–0.86 ms |
+| all renders, one entry | 6.3–7.9 ms | 9.7–11.4 ms | 11.1–13.7 ms |
+| entry frame 1 `paint_us` | 0.9 ms | 1.8–2.0 ms | 1.9–2.0 ms |
+| entry frames 2… `paint_us` | 5.8–13.1 ms | 6.0–14.0 ms | 6.0–14.6 ms |
+| snap path, frame 1 / rest | 9.2–10.9 / 0.13–0.44 ms | 11.5–13.5 / 0.24–0.74 ms | 13.1–15.8 / 0.43–1.36 ms |
+
+The thumbnail renders agree with #3902's fake-backend figures
+(`docs/wm.md` §The thumbnail atlas). The animation frames do not. #3902
+quoted 1.6–4.0 ms at 1080p. On box1 every animation frame after the first
+costs **10–15 ms, independent of N**, so the cost is the full-output
+repaint and not the thumbnails. That is over the **8.3 ms frame at
+120 Hz**, the rate box1 runs at, and just inside a 60 Hz frame. On
+testhost2 the frames grow from ~6 to ~14 ms as the animation proceeds,
+which is consistent with the scrim's alpha fill getting more expensive
+as its opacity rises. That cause is not isolated here. The snap path
+inverts the profile: one 12–16 ms frame of scaled blits, then ~1 ms
+frames. So the atlas's gain is a cheap *first* frame (2.6 ms against
+12–15 ms on box1), bought with ~14 whole-output frames that each cost
+about what the snap path's single frame did.
+
 ## First frame on the wire
 
 What a client spends to get its first pixels on screen, counted by
