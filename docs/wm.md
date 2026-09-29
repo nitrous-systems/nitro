@@ -962,10 +962,17 @@ for every thumbnail, and each is the ~17 ms case. **The thumbnail atlas
 
 #### The thumbnail atlas
 
-Each output owns one **atlas**: an opaque XR24 scene buffer the size of the
+**The atlas is opt-in** (#3916): `overview.animate = true` in
+`server.conf` (or the *Animate overview* switch in `nitro-settings`;
+`NITRO_OVERVIEW_ATLAS=1|0` overrides the file). The default is the snap
+path below, which allocates nothing.
+
+With the setting on, each output owns one **atlas**: an opaque XR24 scene buffer the size of the
 output, in the output's own device coordinates (`overview::Atlas`). It is
 allocated, and pre-faulted by an explicit zero fill, **when the output
-appears** (and again on a mode change), and freed with the output.
+appears**, when a reload turns the setting on (`Server::apply_overview_atlas`),
+and again on a mode change. It is freed with the output or when a reload
+turns the setting off, after leaving an animated overview that uses it.
 **Pressing Super allocates nothing** that scales with the window count
 (`tests/wm.rs::pressing_super_allocates_no_buffer`, which also covers a
 relayout). The atlas costs `w·h·4` bytes per output (8 294 400 at 1080p;
@@ -1012,11 +1019,30 @@ work area, so there is no packing. In atlas mode:
   sets exact final values and clears the stamp, so the desktop goes
   quiet afterwards. A relayout does not animate, and leaving is instant.
   There is no scale (zoom) animation: the size is the slot's throughout.
-* **Snap fallback.** With `NITRO_OVERVIEW_ATLAS=0`
-  (`Config::overview_atlas`), or when the allocation failed, the output
-  has no atlas. Overview then does exactly what it did before #3902: the
-  live windows are scaled in place, only the badges fade, and the scrim
-  and slots snap. `overview_atlas` reads 0.
+* **Snap (the default).** With `overview.animate` off (the default since
+  #3916), or when the allocation failed, the output has no atlas.
+  Overview then does exactly what it did before #3902: the live windows
+  are scaled in place, only the badges fade, and the scrim and slots
+  snap. `overview_atlas` reads 0. On a snap overview's output only, the
+  paint takes `frame::paint_region`'s `fast_scaled` path: an opaque XR24
+  thumbnail at opacity 1 goes through `Canvas::blit_xrgb_scaled`
+  (~4 ns/px) instead of the general resampling blend (~12 ns/px), the
+  same path the atlas render uses. AR24 windows (translucent clients,
+  `nitro-demo`, most `nitro-ui` apps) still take the general blit.
+  Measured on box1, entry frame `paint_us`, `nitro-bench plasma` (an XR24
+  800×500 buffer) ×N, stopped so the frame is the entry alone:
+
+  | box1, 1920×1080 | N=0 | N=4 | N=8 | N=16 |
+  |---|---|---|---|---|
+  | before (main `8076a2d`, `ATLAS=0`) | 21–23 ms | 36–76 ms | 26–70 ms | 27–73 ms |
+  | fast snap (#3916) | 21–25 ms | 17–37 ms | 20–36 ms | 16–41 ms |
+
+  The thumbnails' share roughly halves, but the ~17 ms → ~6 ms estimate
+  did not hold: the entry frame has a **~21 ms floor with no windows at
+  all**, which is the full-output repaint (the wallpaper and the scrim's
+  alpha fill), not the thumbnails. That floor is the next lever and is
+  not addressed here. With AR24 `nitro-demo` windows nothing moved
+  (18–36 ms either side), as expected.
 
 Known, accepted differences from the snap path:
 

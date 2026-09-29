@@ -1149,9 +1149,31 @@ scales with window count. The only per-thumbnail additions are two
 scene nodes (an image and a badge group), and only while in overview.
 `stats` reports it as `overview_atlas_bytes`.
 
-`NITRO_OVERVIEW_ATLAS=0` gives the memory back. Overview then snaps with
-a direct repaint, as it did before #3902. A failed allocation falls back
-the same way. Design: `docs/wm.md` §The thumbnail atlas.
+**Since #3916 the atlas is opt-in** (`overview.animate = true`, default
+off; `NITRO_OVERVIEW_ATLAS=1|0` overrides), so an idle server's RssAnon
+is back at its pre-#3902 baseline by default. With the setting off,
+overview snaps with a direct repaint, as it did before #3902. A failed
+allocation falls back the same way. Design: `docs/wm.md` §The thumbnail
+atlas; the key: `docs/settings.md` §`overview.animate`.
+
+### #3916: off by default, measured on box1
+
+`just footprint 30` on box1 (HSW, 1920×1080@120), branch task-3916
+deployed, idle desktop, fresh `nitro-dev` restart per row. The "on" row
+uses a temporary `NITRO_OVERVIEW_ATLAS=1` drop-in (server.conf untouched):
+
+| server, kB | VmRSS | RssAnon | tree TOTAL RssAnon |
+|---|---|---|---|
+| pre-#3902 (`feff632`, from §Measured on both boxes) | 18 504 | 10 456 | 11 444 |
+| task-3916, default (setting off) | 18 780 | **10 540** | 11 520 |
+| task-3916, setting on | 26 760 | **18 580** | 19 572 |
+
+Off: +84 kB RssAnon against pre-#3902, which is allocator noise at this
+scale, and **−8 028 kB** against main with #3902. On: +8 040 kB, the
+8 100 kB atlas (`overview_atlas_bytes` 8 294 400) as before. The
+`nitro-server` binary is 3 191 904 bytes, and the dependency count is
+unchanged (89 lines, 37 names). The snap path's entry-frame cost after
+the fast scaled blit is in `docs/wm.md` §The thumbnail atlas.
 
 ### Measured on both boxes (#3915)
 

@@ -286,8 +286,9 @@ memcpy), so N feeds cost one plane. Later work.
 together fit on one output, so the thumbnail cache is **one fixed,
 output-sized atlas** — 8 294 400 bytes at 1080p (1920 × 1080 × 4; built in #3902),
 allocated once, when the output appears, and counted in the budget
-([`budget.md`](budget.md)). If it is unavailable the overview snaps
-instead of animating.
+([`budget.md`](budget.md)). Since #3916 it exists only with
+`overview.animate = true`; by default, or if it is unavailable, the
+overview snaps instead of animating and nothing is allocated.
 
 Anything whose memory scales with window count must be optional. On
 discrete GPUs, retained per-window textures may live in VRAM while the
