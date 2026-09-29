@@ -12,11 +12,15 @@
 //! multi-plane frame path (`set_plane_state` + `commit_planes`): a YUYV
 //! window on the overlay above the primary, YUYV full-screen with the
 //! primary off, and NV12 on the primary with the output buffer as AR24
-//! on the overlay (a hole cut in it). The video buffers are left as
-//! allocated (zero), which is solid green in YCbCr: no `unsafe` mapping
-//! of the exported dma-buf is needed to see which plane is which. Each
-//! is exported (PRIME) and the fd's size checked against `buffer_info`,
-//! and the `Flipped` events and buffer releases are printed.
+//! on the overlay (a hole cut in it). Each video buffer is exported
+//! (PRIME), the fd's size checked against `buffer_info`, and then filled
+//! through that mapping (bracketed by `DMA_BUF_IOCTL_SYNC`) with BT.709
+//! limited-range 75 % colour bars: the top two thirds are the eight bars
+//! white, yellow, cyan, green, magenta, red, blue, black from left to
+//! right, the bottom third a grey ramp from black (left) to white
+//! (right). A mirrored or upside-down picture is therefore obvious by
+//! eye, as is a wrong matrix or range (washed-out or crushed bars). The
+//! `Flipped` events and buffer releases are printed.
 //!
 //! The output is plain text meant to be pasted into `README.md`.
 
@@ -501,10 +505,87 @@ fn video_buffer(kms: &mut DrmBackend<'_>, f: Fourcc, w: u32, h: u32) -> Result<B
                 "    {f} {w}x{h}: pitches={:?} offsets={:?} size={} PRIME fd size={len}",
                 info.pitches, info.offsets, info.size
             );
+            if let Err(e) = paint_bars(&fd, &info) {
+                println!("    {f} {w}x{h}: colour bars ERROR: {e} (left as allocated)");
+            }
         }
         Err(e) => println!("    {f} {w}x{h}: export ERROR: {e}"),
     }
     Ok(id)
+}
+
+/// BT.709 limited-range 75 % colour bars, `(Y, Cb, Cr)`, left to right.
+const BARS: [(u8, u8, u8); 8] = [
+    (180, 128, 128), // white
+    (168, 44, 136),  // yellow
+    (145, 147, 44),  // cyan
+    (133, 63, 52),   // green
+    (63, 193, 204),  // magenta
+    (51, 109, 212),  // red
+    (28, 212, 120),  // blue
+    (16, 128, 128),  // black
+];
+
+/// The colour at `(x, y)` of a `w`x`h` test card: [`BARS`] across the
+/// top two thirds, a black-to-white luma ramp (16..=235) below.
+fn bar_at(x: u32, y: u32, w: u32, h: u32) -> (u8, u8, u8) {
+    if y < h * 2 / 3 {
+        BARS[(x * 8 / w) as usize]
+    } else {
+        let ramp = 16 + u64::from(x) * 219 / u64::from(w.max(2) - 1);
+        (u8::try_from(ramp).unwrap_or(235), 128, 128)
+    }
+}
+
+/// Fill a linear YUYV or NV12 buffer with the test card through a
+/// mapping of its exported fd.
+#[allow(clippy::many_single_char_names)]
+fn paint_bars(
+    fd: &OwnedFd,
+    info: &nitro_kms::planes::ScanoutBufferInfo,
+) -> Result<(), String> {
+    use nitro_shm::{DmaBufMapping, SyncAccess, sync_end, sync_start};
+    use std::os::fd::AsFd as _;
+    let len = usize::try_from(info.size).map_err(|e| e.to_string())?;
+    let mut map = DmaBufMapping::map(fd.as_fd(), len).map_err(|e| format!("map: {e}"))?;
+    sync_start(fd, SyncAccess::Write).map_err(|e| format!("sync start: {e}"))?;
+    let px = map.as_bytes_mut();
+    let (w, h) = (info.width, info.height);
+    let [o0, o1] = info.offsets.map(|o| o as usize);
+    let [p0, p1] = info.pitches.map(|p| p as usize);
+    match info.format {
+        Fourcc::YUYV => {
+            for y in 0..h {
+                let row = o0 + y as usize * p0;
+                for x in (0..w).step_by(2) {
+                    let (y0, u, v) = bar_at(x, y, w, h);
+                    let (y1, ..) = bar_at((x + 1).min(w - 1), y, w, h);
+                    let i = row + x as usize * 2;
+                    px[i..i + 4].copy_from_slice(&[y0, u, y1, v]);
+                }
+            }
+        }
+        Fourcc::NV12 => {
+            for y in 0..h {
+                let luma = o0 + y as usize * p0;
+                let chroma = o1 + (y / 2) as usize * p1;
+                for x in 0..w {
+                    let (l, u, v) = bar_at(x, y, w, h);
+                    px[luma + x as usize] = l;
+                    if x % 2 == 0 && y % 2 == 0 {
+                        let i = chroma + x as usize;
+                        px[i..i + 2].copy_from_slice(&[u, v]);
+                    }
+                }
+            }
+        }
+        f => {
+            let _ = sync_end(fd, SyncAccess::Write);
+            return Err(format!("no colour bars for {f}"));
+        }
+    }
+    sync_end(fd, SyncAccess::Write).map_err(|e| format!("sync end: {e}"))?;
+    Ok(())
 }
 
 /// Test, show for 2 s, go back to the default, report the release.

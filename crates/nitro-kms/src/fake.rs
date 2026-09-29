@@ -1264,8 +1264,12 @@ impl Backend for FakeBackend {
         }
         if changed {
             self.infos = self.outputs.iter().map(|o| o.info.clone()).collect();
-            // The DRM backend modesets every lit output after a change.
-            self.reset_planes();
+            // The DRM backend modesets every lit output after a change,
+            // but not while paused: then the modeset waits for `resume`,
+            // which resets the planes anyway.
+            if !self.paused {
+                self.reset_planes();
+            }
         }
         self.route(gone);
         Ok(changed)
@@ -1282,7 +1286,10 @@ impl Backend for FakeBackend {
         }
         if changed {
             self.infos = self.outputs.iter().map(|o| o.info.clone()).collect();
-            self.reset_planes();
+            // As `rescan`: the DRM backend's modeset waits for `resume`.
+            if !self.paused {
+                self.reset_planes();
+            }
         }
         Ok(changed)
     }
@@ -2318,6 +2325,27 @@ mod tests {
         let other = b.outputs()[1].id;
         b.commit(other, &[]).unwrap();
         assert!(b.plane_state(id).unwrap().is_empty());
+        assert_eq!(b.take_released_buffers(), vec![v]);
+    }
+
+    #[test]
+    fn a_paused_rescan_defers_the_plane_reset_to_resume() {
+        // DRM modesets on a hotplug only when not paused; the fake must
+        // not drop the layout any earlier either.
+        let (mut b, id, p, v) = video();
+        let layout = overlay_layout(&p, v);
+        b.set_plane_state(id, &layout).unwrap();
+        b.commit_planes(id).unwrap();
+        b.tick(&mut Vec::new());
+        b.pause();
+        b.plug(FakeOutputSpec::new(64, 64).named("Virtual-2"));
+        assert!(b.rescan().unwrap());
+        assert_eq!(b.outputs[0].track.staged, layout, "still staged");
+        assert_eq!(b.plane_state(id).unwrap(), layout, "still shown");
+        assert!(b.take_released_buffers().is_empty());
+        b.resume().unwrap();
+        assert!(b.outputs[0].track.staged.is_empty());
+        assert!(b.plane_state(id).unwrap().is_empty(), "resume modesets");
         assert_eq!(b.take_released_buffers(), vec![v]);
     }
 

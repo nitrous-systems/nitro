@@ -279,6 +279,25 @@ pub(super) fn add_optional(
     true
 }
 
+/// The `rotation` and `zpos` values that put plane `disc` back to the
+/// default layout, as `(property, value)` pairs for a modeset:
+/// `ROTATE_0` when it has a rotation property, and its lowest zpos (the
+/// bottom, where a primary sits by default) when zpos is mutable. A
+/// Surface layout may have left either behind, and the modeset's other
+/// properties (FB, CRTC, rectangles) do not touch them.
+pub(super) fn default_props(disc: &Discovered) -> Vec<(property::Handle, property::Value<'static>)> {
+    let mut v = Vec::new();
+    if let Some(h) = disc.props.rotation {
+        v.push((h, property::Value::Bitmask(rotation::ROTATE_0.into())));
+    }
+    if let (Some(h), Some(zp)) = (disc.props.zpos, disc.info.zpos)
+        && !zp.immutable
+    {
+        v.push((h, property::Value::UnsignedRange(zp.min)));
+    }
+    v
+}
+
 fn u32_at(b: &[u8], off: usize) -> Result<u32, &'static str> {
     b.get(off..off + 4)
         .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
@@ -583,6 +602,60 @@ mod tests {
             b.extend_from_slice(&m.to_le_bytes());
         }
         b
+    }
+
+    fn disc(rotation: bool, zpos: Option<Zpos>) -> Discovered {
+        let h = |n: u32| property::Handle::from(::drm::control::RawResourceHandle::new(n).unwrap());
+        Discovered {
+            info: PlaneInfo {
+                id: PlaneId(1),
+                kind: PlaneKind::Primary,
+                crtc_mask: 1,
+                formats: Vec::new(),
+                zpos,
+                rotations: if rotation { 0xf } else { 0 },
+                color_encodings: Vec::new(),
+                color_ranges: Vec::new(),
+                blend_modes: Vec::new(),
+                alpha: false,
+                damage_clips: false,
+                in_fence: false,
+                scaling: None,
+            },
+            props: ExtraProps {
+                rotation: rotation.then(|| h(10)),
+                zpos: zpos.map(|_| h(11)),
+                zpos_immutable: zpos.is_some_and(|z| z.immutable),
+                ..ExtraProps::default()
+            },
+        }
+    }
+
+    #[test]
+    fn modeset_resets_primary_rotation_and_mutable_zpos() {
+        let z = |immutable| Zpos {
+            current: 2,
+            min: 0,
+            max: 3,
+            immutable,
+        };
+        let names = |d: &Discovered| {
+            default_props(d)
+                .into_iter()
+                .map(|(h, v)| (u32::from(h), format!("{v:?}")))
+                .collect::<Vec<_>>()
+        };
+        // Rotation property: ROTATE_0. Mutable zpos: its minimum.
+        assert_eq!(
+            names(&disc(true, Some(z(false)))),
+            vec![
+                (10, format!("{:?}", property::Value::Bitmask(rotation::ROTATE_0.into()))),
+                (11, format!("{:?}", property::Value::UnsignedRange(0))),
+            ]
+        );
+        // Immutable zpos is never written; no rotation property, nothing.
+        assert_eq!(names(&disc(true, Some(z(true)))).len(), 1);
+        assert!(names(&disc(false, None)).is_empty());
     }
 
     #[test]

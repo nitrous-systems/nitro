@@ -394,11 +394,8 @@ pub trait Backend {
     /// may have been revoked and re-granted; CRTC state does not survive
     /// that, buffers do). An output that has not been committed yet has
     /// nothing of its own to restore, and is left to its first
-    /// [`Backend::commit`].
-    ///
-    /// the caller must repaint fully. The modeset also drops every
-    /// output's staged plane layout back to the default (see
-    /// [`Backend::set_plane_state`]).
+    /// [`Backend::commit`]. The modeset also drops every output's staged
+    /// plane layout back to the default (see [`Backend::set_plane_state`]).
     ///
     /// **Post-condition:** any flip in flight is abandoned, so
     /// [`Backend::flip_pending`] is false for every output afterwards and

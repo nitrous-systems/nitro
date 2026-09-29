@@ -1105,6 +1105,12 @@ impl<'fd> DrmBackend<'fd> {
                 req.add_property(p, pp.crtc_y, property::Value::SignedRange(0));
                 req.add_property(p, pp.crtc_w, property::Value::UnsignedRange(w));
                 req.add_property(p, pp.crtc_h, property::Value::UnsignedRange(h));
+                // Undo a rotation or zpos a Surface layout left behind.
+                if let Some(d) = self.discovered.get(&p.into()) {
+                    for (h, v) in planes::default_props(d) {
+                        req.add_property(p, h, v);
+                    }
+                }
             } else {
                 req.add_property(p, pp.fb_id, property::Value::Framebuffer(None));
                 req.add_property(p, pp.crtc_id, property::Value::CRTC(None));
