@@ -81,6 +81,22 @@ impl WindowRef {
     }
 }
 
+/// An opaque, unguessable **share token** for one exported `Surface` node
+/// (caps [`SHARE`](caps::SHARE), #3904): 16 random bytes minted by the
+/// server in [`SurfaceExported`](crate::msg::SurfaceExported) and redeemed
+/// by another connection with [`ImportSurface`](crate::msg::ImportSurface).
+/// A bearer secret: whoever holds it (and runs as the same uid, on a local
+/// link) may present into the node.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct ShareToken(pub [u8; 16]);
+
+impl std::fmt::Debug for ShareToken {
+    // Never print the secret in full: logs are not a safe place for it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ShareToken({:02x}{:02x}…)", self.0[0], self.0[1])
+    }
+}
+
 /// Macro for the small `u8`-tagged enumerations: one `repr(u8)` enum plus a
 /// checked `from_u8`.
 macro_rules! tag_enum {
@@ -440,6 +456,13 @@ pub mod caps {
     /// must be listed in `ClientCaps`. Not [`DMABUF`], which is the
     /// dma-buf import that comes later.
     pub const SURFACE: u32 = 1 << 16;
+    /// Cross-client Surface sharing (#3904):
+    /// [`ExportSurface`](crate::msg::ExportSurface) /
+    /// [`SurfaceExported`](crate::msg::SurfaceExported) and
+    /// [`ImportSurface`](crate::msg::ImportSurface) /
+    /// [`SurfaceRevoked`](crate::msg::SurfaceRevoked). Local links only;
+    /// must be listed in `ClientCaps`.
+    pub const SHARE: u32 = 1 << 17;
     /// Every bit from M5-A onwards: the range
     /// [`ClientCaps`](crate::msg::ClientCaps) governs.
     ///
@@ -449,7 +472,7 @@ pub mod caps {
     /// change. A future milestone extends this constant rather than
     /// teaching every caller a new number.
     pub const CAPS_M5_MASK: u32 =
-        POPUP | CURSOR | DRAG | OUTPUTS | KEYMAP | RELEASE | DATA | OPAQUE_REGION | SURFACE;
+        POPUP | CURSOR | DRAG | OUTPUTS | KEYMAP | RELEASE | DATA | OPAQUE_REGION | SURFACE | SHARE;
 }
 
 /// Modifier mask for [`BindKey`](crate::msg::BindKey), by *name*.
@@ -931,7 +954,8 @@ mod tests {
         assert_eq!(caps::DATA, 1 << 14);
         assert_eq!(caps::OPAQUE_REGION, 1 << 15);
         assert_eq!(caps::SURFACE, 1 << 16);
-        assert_eq!(caps::CAPS_M5_MASK, 0x1ff00);
+        assert_eq!(caps::SHARE, 1 << 17);
+        assert_eq!(caps::CAPS_M5_MASK, 0x3ff00);
         // Every M5 bit is in the mask, and nothing else is.
         for bit in [
             caps::POPUP,
@@ -943,6 +967,7 @@ mod tests {
             caps::DATA,
             caps::OPAQUE_REGION,
             caps::SURFACE,
+            caps::SHARE,
         ] {
             assert_eq!(caps::CAPS_M5_MASK & bit, bit);
         }

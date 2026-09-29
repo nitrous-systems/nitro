@@ -216,6 +216,7 @@ All integers little-endian. No padding anywhere.
 | `Transform` | 24 | `a, b, c, d, e, f: f32`, mapping `(x,y)` to `(ax+cy+e, bx+dy+f)` |
 | `NodeId` | 4 | `u32`; **0 = none** |
 | `BufferId` | 4 | `u32`; **0 = none** |
+| `ShareToken` | 16 | 16 opaque bytes, verbatim; see [Surface sharing](#surface-sharing-caps-share) |
 | `CursorPos` | 8 | `offset: u32` (byte offset into the text), `x: f32` (logical pixels from the text's left edge) |
 
 A declared length larger than `MAX_PAYLOAD` is rejected before anything is
@@ -268,8 +269,9 @@ containing the transaction reached the screen.
 | 14 | `DATA` | clipboard **and** drag-and-drop; see [Data transfer](#data-transfer-caps-data) (M5-A) |
 | 15 | `OPAQUE_REGION` | `SetOpaqueRegion` — a client may declare an image's opaque pixels (#3877) |
 | 16 | `SURFACE` | shm-backed `Surface` nodes: `CreateSurfaceBuffer`, `SetSurface`, `PresentSurface`, `SurfaceHint` (#3897); see [Surfaces](#surfaces-caps-surface) |
+| 17 | `SHARE` | cross-client Surface sharing: `ExportSurface`, `ImportSurface`, `SurfaceExported`, `SurfaceRevoked` (#3904); see [Surface sharing](#surface-sharing-caps-share) |
 
-Bits 8–16 together are `caps::CAPS_M5_MASK`, the range
+Bits 8–17 together are `caps::CAPS_M5_MASK`, the range
 [`ClientCaps`](#capability-opt-in-clientcaps) governs.
 
 `DATA` is **one** bit for two features because they are one mechanism: the
@@ -304,6 +306,13 @@ rule 3: a Surface op from a client that did not list it in `ClientCaps`
 is `Error { Protocol }`, and `SurfaceHint` goes only to clients that
 listed it. `DMABUF` (bit 2) is still not advertised; it is the dma-buf
 import that comes later.
+
+`SHARE` (bit 17, #3904) has `SURFACE`'s shape: it is advertised on every
+**local** link and never on a remote one, because the token is a bearer
+secret whose only check is the peer uid, which TCP cannot prove. It
+follows rule 3: a sharing op from a client that did not list it in
+`ClientCaps` is `Error { Protocol }`, and so is one from a remote link.
+`SurfaceExported` and `SurfaceRevoked` go only to clients that listed it.
 
 `SHELL` is bit 5, not bit 3: bit 3 is `REMOTE` and was taken in M1. It is
 *reported*, never negotiated — a client cannot ask for it. See
@@ -592,6 +601,8 @@ Assigned in blocks of 0x100 so a block can grow without renumbering.
 | `0x030d` | `CreateSurfaceBuffer` | buffers (needs `SURFACE`) — **carries 1 fd** |
 | `0x030e` | `SetSurface` | buffers (needs `SURFACE`) |
 | `0x030f` | `PresentSurface` | buffers (needs `SURFACE`); **not buffered** |
+| `0x0310` | `ExportSurface` | buffers (needs `SHARE`); **not buffered**, answered with `SurfaceExported` |
+| `0x0311` | `ImportSurface` | buffers (needs `SHARE`); **not buffered** |
 | `0x0401` | `SetLayer` | shell (see `SHELL`) |
 | `0x0402` | `SetExclusiveZone` | shell (see `SHELL`) |
 | `0x0403` | `SetAnchor` | shell (see `SHELL`) |
@@ -635,6 +646,8 @@ Assigned in blocks of 0x100 so a block can grow without renumbering.
 | `0x8303` | `IconRefused` | replies about content (see `ICONS`) |
 | `0x8305` | `BufferReleased` | replies about content (see `RELEASE`) |
 | `0x8306` | `SurfaceHint` | replies about content (see `SURFACE`) |
+| `0x8307` | `SurfaceExported` | replies about content (see `SHARE`) |
+| `0x8308` | `SurfaceRevoked` | replies about content (see `SHARE`) |
 | `0x8401` | `HotKey` | shell (see `SHELL`) |
 | `0x8402` | `WindowInfo` | shell (see `SHELL`) |
 | `0x8403` | `WindowListEnd` | shell (see `SHELL`) |
@@ -2042,6 +2055,11 @@ only that the pixels may be overwritten.
 Surface frames add one case ([`PresentSurface`](#presentsurface--0x030f)):
 a queued frame that is superseded or cancelled before it was ever latched
 is released at once, in the same wakeup, unless a node shows that buffer.
+[Surface sharing](#surface-sharing-caps-share) adds two more: a
+`PresentSurface` on a revoked import is released at once, and a frame an
+importer had queued when its import was revoked or dropped is released
+at once. A release always goes to the **buffer's owner**, which for a
+shared Surface may not be the node's owner.
 
 ## Surfaces (caps `SURFACE`)
 
@@ -2171,6 +2189,124 @@ fullscreen). **Advisory**: the server converts and scales whatever it is
 given. On the v1 CPU path the answer is `NV12` at the node's device size;
 the planes work (#3899) is where e.g. `YUYV` at display size on hardware
 that can only scan out packed 4:2:2 will come from.
+
+## Surface sharing (caps `SHARE`)
+
+A second connection may present into a `Surface` node that another
+connection owns. The case this exists for is Chromium's out-of-process
+GPU: the browser process owns the window, the GPU process renders, and
+the GPU process's buffers should reach nitro without passing through the
+browser (`docs/chromium.md` § Out-of-process GPU: B vs C). The owner
+**exports** the node and gets a bearer token; it hands the token to the
+producer out of band; the producer **imports** it under an id of its own
+and feeds the node's vblank latch with `PresentSurface`.
+
+The owner keeps everything else: geometry, visibility, stacking, input,
+`Frame` and `Configure` are the owner's, through its own transactions.
+The importer only presents.
+
+All four messages need `SHARE` listed in `ClientCaps`
+(`Error { Protocol }` otherwise). On a remote link the bit is never
+advertised, and the two ops are `Error { Protocol }` even from a client
+that lists it anyway.
+
+### `ExportSurface` — 0x0310
+
+| field | type | meaning |
+|---|---|---|
+| `id` | `NodeId` | a committed `Surface` node of the sender's |
+
+Fixed head **4 bytes**. **Not buffered**: answered at receipt, against the
+committed scene, like `PresentSurface`. An unknown node is `UnknownNode`,
+a non-Surface `WrongKind` (both fatal). The answer is `SurfaceExported`.
+
+There is **one token per node**. Exporting a node again mints a fresh
+token: the old one stops working, and a live import of it is revoked
+(`SurfaceRevoked`). That is how an owner revokes access without an op of
+its own.
+
+### `ImportSurface` — 0x0311
+
+| field | type | meaning |
+|---|---|---|
+| `token` | `ShareToken` | from another connection's `SurfaceExported` |
+| `id` | `NodeId` | the id this client will name the import by |
+
+Fixed head **20 bytes**. **Not buffered**: acted on at receipt.
+
+* `id` lives in the importer's own node id space. An `id` that is 0, or
+  already names one of the importer's nodes or imports, is `Protocol`.
+  Importing a token the importer exported itself is `Protocol`.
+* The importer's peer uid (`SO_PEERCRED`) must equal the exporter's.
+* An unknown, stale or rotated token, or a uid mismatch, is **not an
+  error**. The import is bound **dead** and `SurfaceRevoked { id }`
+  follows at once. A stale token is a legitimate race — the owner closed
+  the window while the producer was importing — and the server cannot
+  tell stale from forged without remembering every token forever.
+* At most one live import per token, and **the newest wins**: a previous
+  importer is sent `SurfaceRevoked`. This covers a restarted producer
+  racing the old connection's hang-up.
+* At most **256** imports per client, live or dead (`Limit`).
+
+**What the import id accepts:**
+
+* `PresentSurface`, with the importer's own buffers. It behaves exactly
+  as on an own node (the latch, rules 1–7 of
+  [`PresentSurface`](#presentsurface--0x030f)); the node must still be a
+  committed Surface, which an import guarantees until it is revoked.
+* `DestroyNode` (buffered, at the commit) drops the import and frees the
+  id. The node itself is untouched; the last latched frame stays shown
+  until the importer destroys that buffer or the owner replaces it.
+* Anything else naming the id — `SetSurface`, `SetBounds`, `CreateNode`
+  with it as parent, … — is `WrongKind` (fatal). The owner's transactions
+  own the node.
+
+### Interleaving with the owner
+
+* **Newest frame wins, whoever sent it.** The owner may still
+  `PresentSurface` its own node. A frame superseded by another
+  connection's is released to **its** sender (its presenter).
+* **A committed `SetSurface` from the owner cancels** any queued frame,
+  whoever queued it; the release goes to the frame's presenter.
+* `Presented { serial }` for a latched frame goes to its presenter, in the
+  presenter's own serial space.
+* `BufferReleased` always goes to the buffer's owner.
+* `SurfaceHint` goes to the importer too, under its import id, if it
+  listed `SURFACE`.
+
+### Lifetime and revocation
+
+A token lives until the node is destroyed, its owner disconnects or its
+owner re-exports. `SurfaceRevoked` is sent to the importer when any of
+these happens, or when a newer importer displaces it. After it:
+
+* a `PresentSurface` on the id is **not** an error: its buffer is
+  released at once and it never gets a `Presented`;
+* a frame the importer had queued is dropped and released the same way;
+* the id stays bound (dead) until the importer's `DestroyNode`.
+
+An importer that disconnects takes its buffers with it, so the node
+blanks; the owner is not told. The token stays valid, so a restarted
+producer re-imports it.
+
+### `SurfaceExported` — 0x8307
+
+| field | type | meaning |
+|---|---|---|
+| `id` | `NodeId` | the exported node, in the exporter's id space |
+| `token` | `ShareToken` | the bearer token |
+
+Fixed head **20 bytes**. The token is 16 bytes from the kernel's CSPRNG
+(`getrandom`). It is a secret: pass it only to the process that should
+present, over a channel only it can read.
+
+### `SurfaceRevoked` — 0x8308
+
+| field | type | meaning |
+|---|---|---|
+| `id` | `NodeId` | the import id, in the importer's id space |
+
+Fixed head **4 bytes**. Sent to the importer only, once per revocation.
 
 ## Shell (caps `SHELL`)
 
@@ -3402,9 +3538,17 @@ to.
 
 * `SetOpaqueRegion` (`0x030c`) joins the buffers block under a new
   capability bit, `OPAQUE_REGION` (bit 15), which also joins
-  `CAPS_M5_MASK` (now `0xff00`) (#3877). An older server neither
+  `CAPS_M5_MASK` (then `0xff00`) (#3877). An older server neither
   advertises the bit nor knows the op, so a client that checks the bit
   never sends it there. `VERSION` stays **1**; its golden bytes are in
+  `payload_layouts_are_frozen`.
+* `ExportSurface` (`0x0310`), `ImportSurface` (`0x0311`),
+  `SurfaceExported` (`0x8307`) and `SurfaceRevoked` (`0x8308`) join
+  under a new bit, `SHARE` (bit 17), which also joins `CAPS_M5_MASK`
+  (now `0x3ff00`) (#3904). The new primitive `ShareToken` appears only in
+  them. An older server neither advertises the bit nor knows the ops,
+  and the server sends the two new messages only to clients that listed
+  the bit. `VERSION` stays **1**; `ImportSurface`'s golden bytes are in
   `payload_layouts_are_frozen`.
 * `SetDragIconOffset` (`0x030b`) joins the data block, for a drag icon's
   hotspot (#3851). It is a new op behind the existing `DATA` bit, so a

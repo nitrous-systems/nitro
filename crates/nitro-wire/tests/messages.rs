@@ -11,8 +11,8 @@ use nitro_wire::msg::{
     AcceptDrop, BindKey, BufferDamage, BufferReleased, ClientCaps, ClientMsg, CloseWindow, Closed,
     Commit, Configure, CreateBuffer, CreateNode, CreatePopup, CreateSurfaceBuffer, CreateWindow,
     DestroyBuffer, DestroyNode, DragDrop, DragEnter, DragFinished, DragLeave, DragMotion,
-    Error as ErrorMsg, Fill, FinishDrag, Focus, FocusWindow, Frame, GrabKeyboard, Hello, HotKey,
-    IconRefused, Key, Keymap, ListOutputs, Lock, MeasureText, Modifiers, OutputGone, OutputInfo,
+    Error as ErrorMsg, ExportSurface, Fill, FinishDrag, Focus, FocusWindow, Frame, GrabKeyboard, Hello, HotKey,
+    IconRefused, ImportSurface, Key, Keymap, ListOutputs, Lock, MeasureText, Modifiers, OutputGone, OutputInfo,
     OutputWorkArea, Outputs, OutputsEnd, OverviewState, PointerAxis, PointerButton, PointerEnter,
     PointerLeave, PointerMotion, PopupDone, PresentSurface, Presented, Reparent, RepositionPopup,
     RequestFrame, RequestSelection, SelectionData, SelectionOffer, SelectionRequest, SendSelection,
@@ -20,13 +20,13 @@ use nitro_wire::msg::{
     SetDragIconOffset, SetExclusiveZone, SetFill, SetIcon, SetImage, SetLayer, SetOpacity,
     SetOpaqueRegion, SetOverview, SetSelection, SetSurface, SetText, SetTransform, SetVisible,
     SetWindowLimits, SetWindowState, SetWindowStateFor, SetWindowTitle, StartDrag, StartMove,
-    StartResize, SurfaceHint, TextMeasured, TextMetrics, Theme, Touch, UnbindKey, Unlock, Welcome,
+    StartResize, SurfaceExported, SurfaceHint, SurfaceRevoked, TextMeasured, TextMetrics, Theme, Touch, UnbindKey, Unlock, Welcome,
     WindowGone, WindowInfo, WindowList, WindowListEnd, WindowState,
 };
 use nitro_wire::types::{
     Align, AxisSource, BufferId, ButtonState, ColorMatrix, ColorRange, CursorPos, CursorShape,
     DataSource, DragAction, Edge, ErrorCode, KeymapFormat, Layer, NodeId, NodeKind,
-    OverviewRequest, PopupAnchor, PopupGravity, TouchPhase, WindowRef,
+    OverviewRequest, PopupAnchor, PopupGravity, ShareToken, TouchPhase, WindowRef,
     WindowState as WindowStateValue, anchor, caps, constraint_adjust, drag_actions, format,
     mod_mask, popup_flags, resize_edges, window_flags,
 };
@@ -526,6 +526,12 @@ fn client_messages() -> Vec<ClientMsg> {
             damage: vec![],
         }
         .into(),
+        ExportSurface { id: NodeId(82) }.into(),
+        ImportSurface {
+            token: ShareToken([0xa5; 16]),
+            id: NodeId(83),
+        }
+        .into(),
     ]
 }
 
@@ -813,6 +819,12 @@ fn server_messages() -> Vec<ServerMsg> {
             height: 1080,
         }
         .into(),
+        SurfaceExported {
+            id: NodeId(84),
+            token: ShareToken(*b"0123456789abcdef"),
+        }
+        .into(),
+        SurfaceRevoked { id: NodeId(85) }.into(),
         OutputWorkArea {
             id: 2,
             area: IRect::new(-1920, 32, 2560, 1408),
@@ -1515,6 +1527,15 @@ fn the_m5_payload_layouts_are_frozen() {
     assert_eq!(w.bytes(), &GOLDEN_CREATE_POPUP);
 
     let mut w = Writer::new();
+    ClientMsg::from(ImportSurface {
+        token: ShareToken(core::array::from_fn(|i| i as u8)),
+        id: NodeId(0x0102_0304),
+    })
+    .encode(&mut w)
+    .unwrap();
+    assert_eq!(w.bytes(), &GOLDEN_IMPORT_SURFACE);
+
+    let mut w = Writer::new();
     ClientMsg::from(RepositionPopup {
         id: NodeId(0x0102_0304),
         anchor_rect: IRect::new(1, 2, 3, 4),
@@ -2100,6 +2121,8 @@ fn the_m5_ops_are_where_the_doc_says() {
         (CreateSurfaceBuffer::OP, 0x0300),
         (SetSurface::OP, 0x0300),
         (PresentSurface::OP, 0x0300),
+        (ExportSurface::OP, 0x0300),
+        (ImportSurface::OP, 0x0300),
     ] {
         assert_eq!(op & 0xff00, block, "client M5 op {op:#06x}");
         assert!(ClientMsg::is_op(op), "client M5 op {op:#06x}");
@@ -2112,6 +2135,8 @@ fn the_m5_ops_are_where_the_doc_says() {
         (IconRefused::OP, 0x8300),
         (BufferReleased::OP, 0x8300),
         (SurfaceHint::OP, 0x8300),
+        (SurfaceExported::OP, 0x8300),
+        (SurfaceRevoked::OP, 0x8300),
         (OutputWorkArea::OP, 0x8400),
         (SelectionOffer::OP, 0x8500),
         (SelectionData::OP, 0x8500),
@@ -2141,6 +2166,10 @@ fn the_m5_ops_are_where_the_doc_says() {
     assert_eq!(SetSurface::OP, 0x030e);
     assert_eq!(PresentSurface::OP, 0x030f);
     assert_eq!(SurfaceHint::OP, 0x8306);
+    assert_eq!(ExportSurface::OP, 0x0310);
+    assert_eq!(ImportSurface::OP, 0x0311);
+    assert_eq!(SurfaceExported::OP, 0x8307);
+    assert_eq!(SurfaceRevoked::OP, 0x8308);
     assert_eq!(OutputWorkArea::OP, 0x8408);
     assert_eq!(DragFinished::OP, 0x8508);
     // 0x8304 is deliberately unused.
@@ -2481,6 +2510,16 @@ const GOLDEN_CREATE_POPUP: [u8; 8 + 42] = [
     0x00, 0x00, 0x80, 0x3f, // size.w 1.0
     0x00, 0x00, 0x00, 0x40, // size.h 2.0
     0x01, 0x00, 0x00, 0x00, // flags GRAB
+];
+
+/// Golden frame for a fixed [`ImportSurface`] (#3904): the 16 token bytes
+/// verbatim, then the importer's `NodeId`.
+const GOLDEN_IMPORT_SURFACE: [u8; 8 + 20] = [
+    // header: len=20, op=0x0311, fds=0, flags=0
+    0x14, 0x00, 0x00, 0x00, 0x11, 0x03, 0x00, 0x00, //
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, // token[0..8]
+    0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, // token[8..16]
+    0x04, 0x03, 0x02, 0x01, // id
 ];
 
 /// Golden frame for a fixed [`Keymap`] — head 13 bytes, plus one fd the

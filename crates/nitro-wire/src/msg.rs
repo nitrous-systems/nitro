@@ -43,7 +43,7 @@ use crate::types::WindowState as WindowStateValue;
 use crate::types::{
     Align, AxisSource, BufferId, ButtonState, ColorMatrix, ColorRange, CursorPos, CursorShape,
     DataSource, DragAction, Edge, ErrorCode, KeymapFormat, Layer, NodeId, NodeKind,
-    OverviewRequest, PopupAnchor, PopupGravity, TouchPhase, WindowRef,
+    OverviewRequest, PopupAnchor, PopupGravity, ShareToken, TouchPhase, WindowRef,
 };
 use crate::wire::Plain;
 
@@ -2117,6 +2117,30 @@ fixed_msg! {
         range: ColorRange,
     }
 
+    /// Export one of this client's committed `Surface` nodes for another
+    /// connection to present into (needs
+    /// [`caps::SHARE`](crate::types::caps::SHARE)). Not buffered: answered
+    /// at receipt with [`SurfaceExported`]. Re-exporting mints a new token,
+    /// invalidating the old one and revoking any live import.
+    ExportSurface {
+        /// The surface node.
+        id: NodeId,
+    }
+
+    /// Redeem a [`ShareToken`] from another connection's
+    /// [`SurfaceExported`], binding `id` in **this** client's node id space
+    /// to the exported node (needs
+    /// [`caps::SHARE`](crate::types::caps::SHARE)). Not buffered. The only
+    /// ops the import id accepts are [`PresentSurface`] and
+    /// [`DestroyNode`]. An unknown, stale or foreign token is not an
+    /// error: the import is bound dead and [`SurfaceRevoked`] follows.
+    ImportSurface {
+        /// The token.
+        token: ShareToken,
+        /// The id this client will name the imported node by.
+        id: NodeId,
+    }
+
     // ------------------------------------------------------- M5-A (M5)
 
     /// Create a **popup**: a menu or tooltip positioned against a
@@ -2543,6 +2567,12 @@ msg_enum! {
         /// Queue a frame for the vblank latch; not buffered (needs
         /// `caps::SURFACE`).
         PresentSurface = 0x030f,
+        /// Export a surface node for another connection (needs
+        /// `caps::SHARE`); answered with `SurfaceExported`.
+        ExportSurface = 0x0310,
+        /// Import another connection's exported surface (needs
+        /// `caps::SHARE`).
+        ImportSurface = 0x0311,
         /// Move one of this client's windows to another layer (needs
         /// `caps::SHELL`).
         SetLayer = 0x0401,
@@ -2971,7 +3001,24 @@ fixed_msg! {
         height: u32,
     }
 
-    /// An output's **work area** (needs
+    /// Answer to [`ExportSurface`]: the node's share token (needs
+    /// [`caps::SHARE`](crate::types::caps::SHARE)).
+    SurfaceExported {
+        /// The exported node, in the exporter's id space.
+        id: NodeId,
+        /// The bearer token to hand to the importing process.
+        token: ShareToken,
+    }
+
+    /// An import is dead (needs
+    /// [`caps::SHARE`](crate::types::caps::SHARE)): the node was
+    /// destroyed, its owner went away or re-exported, a newer importer
+    /// displaced this one, or the token was never valid. Presents on `id`
+    /// are released at once and never presented; `DestroyNode` frees the id.
+    SurfaceRevoked {
+        /// The import id, in the importer's id space.
+        id: NodeId,
+    }
     /// [`caps::SHELL`](crate::types::caps::SHELL) or
     /// [`caps::OUTPUTS`](crate::types::caps::OUTPUTS)).
     ///
@@ -3151,6 +3198,10 @@ msg_enum! {
         /// Preferred format and size of a surface's buffers (needs
         /// `caps::SURFACE`).
         SurfaceHint = 0x8306,
+        /// A surface's share token (needs `caps::SHARE`).
+        SurfaceExported = 0x8307,
+        /// An import is dead (needs `caps::SHARE`).
+        SurfaceRevoked = 0x8308,
         /// A bound hotkey fired (needs `caps::SHELL`).
         HotKey = 0x8401,
         /// One window of the shell's list (needs `caps::SHELL`).

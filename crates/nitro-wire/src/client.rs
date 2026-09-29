@@ -16,7 +16,7 @@ use crate::framing::Framer;
 use crate::io::Socket;
 use crate::msg::{
     AcceptDrop, BindKey, BufferDamage, ClientCaps, ClientMsg, CloseWindow, Commit, CreateBuffer,
-    CreateNode, CreatePopup, CreateSurfaceBuffer, CreateWindow, DestroyBuffer, DestroyNode, Fill,
+    CreateNode, CreatePopup, ExportSurface, ImportSurface, CreateSurfaceBuffer, CreateWindow, DestroyBuffer, DestroyNode, Fill,
     FinishDrag, FocusWindow, GrabKeyboard, Hello, ListOutputs, Lock, MeasureText, Outputs,
     PresentSurface, Reparent, RepositionPopup, RequestFrame, RequestSelection, SendSelection,
     ServerMsg, SetAnchor, SetAppId, SetBorder, SetBounds, SetClip, SetCorners, SetCursor,
@@ -27,7 +27,7 @@ use crate::msg::{
 };
 use crate::types::{
     Align, BufferId, ColorMatrix, ColorRange, CursorShape, DataSource, DragAction, Edge, Layer,
-    NodeId, NodeKind, OverviewRequest, PopupAnchor, PopupGravity, WindowRef, WindowState, caps,
+    NodeId, NodeKind, OverviewRequest, PopupAnchor, PopupGravity, ShareToken, WindowRef, WindowState, caps,
 };
 
 /// Where the shell socket lives; see [`crate::shell_socket_path`].
@@ -246,6 +246,26 @@ impl Connection {
     /// As [`Connection::send`].
     pub fn present_surface(&mut self, frame: PresentSurface) -> Result<(), Error> {
         self.send(&ClientMsg::PresentSurface(frame))
+    }
+
+    /// Export surface node `id` for another connection (needs
+    /// `caps::SHARE`). Sent at once; the answer is a `SurfaceExported`
+    /// carrying the token.
+    ///
+    /// # Errors
+    /// As [`Connection::send`].
+    pub fn export_surface(&mut self, id: NodeId) -> Result<(), Error> {
+        self.send(&ClientMsg::ExportSurface(ExportSurface { id }))
+    }
+
+    /// Redeem another connection's share `token`, naming the imported
+    /// surface `id` in this client's id space (needs `caps::SHARE`). Sent
+    /// at once; a dead token is answered with `SurfaceRevoked { id }`.
+    ///
+    /// # Errors
+    /// As [`Connection::send`].
+    pub fn import_surface(&mut self, token: ShareToken, id: NodeId) -> Result<(), Error> {
+        self.send(&ClientMsg::ImportSurface(ImportSurface { token, id }))
     }
 
     /// Bind a server-global hotkey (needs `caps::SHELL`).

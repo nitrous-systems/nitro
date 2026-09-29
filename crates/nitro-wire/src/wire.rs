@@ -14,7 +14,7 @@ use crate::error::DecodeError;
 use crate::types::{
     Align, AxisSource, BufferId, ButtonState, ColorMatrix, ColorRange, CursorPos, CursorShape,
     DataSource, DragAction, Edge, ErrorCode, KeymapFormat, Layer, NodeId, NodeKind,
-    OverviewRequest, PopupAnchor, PopupGravity, TouchPhase, WindowRef, WindowState,
+    OverviewRequest, PopupAnchor, PopupGravity, ShareToken, TouchPhase, WindowRef, WindowState,
 };
 
 /// A type with a fixed-size, little-endian wire representation.
@@ -137,6 +137,17 @@ macro_rules! plain_id {
 plain_id!(NodeId);
 plain_id!(BufferId);
 plain_id!(WindowRef);
+
+/// A [`ShareToken`] travels as its 16 bytes, verbatim; every value is valid.
+impl Plain for ShareToken {
+    type Wire = [u8; 16];
+    fn to_wire(self) -> [u8; 16] {
+        self.0
+    }
+    fn from_wire(w: [u8; 16]) -> Result<Self, DecodeError> {
+        Ok(Self(w))
+    }
+}
 
 /// Wire twin of [`Point`]: `x, y` as `f32`.
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
