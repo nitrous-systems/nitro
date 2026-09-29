@@ -29,6 +29,8 @@ without pointer motion while playing.
 itself; it decodes into a free slot, sends `(slot, pts)` over a channel
 and pokes a wake pipe the UI loop watches (`Ui::add_fd`). A full ring
 blocks it — that is the back-pressure. The UI thread never touches pixels.
+Up to 1080p libavcodec decodes on the decode thread alone; frame threads
+(one per core, up to four) only above that (see *Memory* below).
 
 **Ring.** 4 sealed memfds (one on screen, one latched, two ahead),
 ≈ 5.5 MB at 720p and 12.4 MB at 1080p. A slot is *decoder* → *ready* →
@@ -75,3 +77,75 @@ Binary: stripped `nitro-video` **805 KB** (release). The libav* files it
 maps: libavcodec 28.3 MB, libavformat 3.2 MB, libavutil 1.2 MB and
 (transitively) libswresample 0.2 MB on disk, shared with any other FFmpeg
 user; ≈ 9 MB of them is resident while playing.
+
+## Memory (#3924)
+
+Where the 87 MB went at 1080p, and what was cut. `/proc/<pid>/smaps_rollup`
+and per-mapping `Rss` from `smaps`, sampled 10 s into a 450-frame run,
+x264 High 30 fps `testsrc2`, `--stats`. CPU is (utime + stime) / wall of the
+whole process, as a share of one core.
+
+box1 (Pentium G3240, 2 cores, FFmpeg 8.0.1, real session on HDMI 1080p):
+
+| 1080p windowed | before (`d286a1f`) | after |
+|---|---|---|
+| RSS | 87.1 MB | **75.2 MB** |
+| anon: libavcodec mmaps (DPB, pools, contexts) | 33.9 MB | 23.8 MB |
+| anon: `[heap]` | 3.2 MB | 1.7 MB |
+| anon: dirty pages of libraries, stacks | 4.6 MB | 4.6 MB |
+| shm: NV12 ring (`memfd:nitro-video`, 4 × 3.1 MB) | 12.2 MB | 12.2 MB |
+| file: libav* (`libavcodec` 5.2, `libavformat` 2.8, `libavutil` 0.7) | 8.8 MB | 8.8 MB |
+| file: other libraries, the binary | 24.4 MB | 24.2 MB |
+| threads | 4 | 2 |
+| CPU | 51 % | **35 %** |
+| dropped / late (of 450) | 0 / 164–188 | 0 / 98–127 |
+
+| run | RSS before → after | CPU before → after | dropped | late before → after |
+|---|---|---|---|---|
+| 720p windowed | 62.4 → **56.2 MB** | 40 % → 34 % | 0 | 1–3 → 2–3 |
+| 1080p fullscreen | 87.1 → **75.3 MB** | 49 % → 33 % | 0 | 253–277 → 31–53 |
+
+testhost2 (i5-8250U, 8 threads, FFmpeg 9.0.2; a fake-backend 1080p server,
+so "late" means nothing there and is not shown):
+
+| run | RSS before → after | threads | CPU before → after | dropped |
+|---|---|---|---|---|
+| 1080p | 96.3 → **71.2 MB** | 6 → 2 | 30 % → 36 % | 0 |
+| 720p | 63.9 → **51.7 MB** | 6 → 2 | 30 % → 26 % | 0 |
+
+What each lever was worth (1080p, box1 unless noted):
+
+- **Decoder frame threads: the cut.** Each frame thread keeps its own H.264
+  context and a picture in flight: +10.5–11.6 MB per thread at 1080p,
+  +6.3 MB at 720p. On box1 (2 threads) the frame-threaded decoder also cost
+  *more* CPU than one thread (51 % vs 35 %) and more late frames, because it
+  competes with the UI thread and the server for two cores. One thread
+  decodes 1080p30 comfortably on the weakest box, so up to 1080p the shim
+  forces `thread_count = 1`; above it, `min(cores, 4)` as before. On
+  testhost2 the price is +6 % of one core at 1080p for −25 MB.
+- **Slice threads**: no alternative. x264 writes one slice per frame by
+  default, so `FF_THREAD_SLICE` adds a thread and saves nothing over one
+  thread (box1 1080p: 75.5 MB, same as one thread).
+- **What remains in anon (≈ 24 MB at 1080p, 12 MB at 720p)** is the
+  single-threaded H.264 decoder: the DPB (up to 16 references plus the
+  current picture, sized by the stream's level) and libavcodec's
+  frame/buffer pool. Frames are `av_frame_unref`ed right after the copy,
+  so the pool is libavcodec's own and there is no knob for it short of a
+  decoder that allocates less; `malloc_trim(0)` after `nv_open` (the
+  probe decoder of `avformat_find_stream_info` is freed, and trimming
+  moved nothing: 29.9 vs 30.1 MB anon) was not taken.
+- **malloc arenas**: `mallopt(M_ARENA_MAX, 1/2)` changed RSS by ≤ 0.2 MB on
+  both boxes; with one or two threads glibc's per-thread arenas are not
+  where the memory is. Not taken.
+- **Ring 4 → 3**: saves one frame (3.0 MB at 1080p, 1.4 MB at 720p) with 0
+  dropped, but box1 showed more late frames at 1080p windowed (136–139 vs
+  113–127 with one decoder thread). Kept at 4.
+- **Per-frame copies**: exactly one, decoder frame → the shm NV12 slot in
+  `to_nv12`, no per-frame allocation. The zero-copy path is VA-API +
+  `DmaBuf`.
+- **File-backed (≈ 33 MB, 24 of it not libav*)**: the system FFmpeg pulls
+  in its whole codec/protocol world (libcrypto, libstdc++, librsvg,
+  libopenmpt, gnutls, libx265, …, each 0.2–1.9 MB resident from
+  relocation and init). Those pages are clean and shared with any other
+  user of the libraries (`Pss` 59.9 MB vs `Rss` 75.2 MB); cutting them
+  needs a narrower FFmpeg build, not a change here.

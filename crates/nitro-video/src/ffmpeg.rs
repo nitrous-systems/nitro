@@ -98,7 +98,8 @@ unsafe impl Send for LibavDecoder {}
 
 impl LibavDecoder {
     /// Open `path` and its best video stream. `threads` is the decoder's
-    /// thread count (0 lets `FFmpeg` choose).
+    /// thread count (0 lets `FFmpeg` choose) for streams above 1080p; up
+    /// to 1080p the shim decodes on one thread (#3924).
     ///
     /// # Errors
     /// A message for the user: the file is missing, not a video, or has

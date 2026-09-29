@@ -106,6 +106,15 @@ nv_ctx *nv_open(const char *path, int threads, char *err, int errlen) {
         nv_close(c);
         return NULL;
     }
+    /* Frame threads only above 1080p (#3924). Each frame thread holds its
+     * own H.264 context and a picture in flight: +10.5 MB per thread at
+     * 1080p. One thread decodes 1080p30 x264 High in ~37 % of box1's
+     * Pentium core, and on box1's two cores the frame-threaded decoder
+     * cost *more* CPU (51 % vs 37 %) and more late frames, because it
+     * competes with the UI thread and the server. Slice threads are no
+     * alternative: x264 writes one slice per frame by default, so they
+     * add a thread and no parallelism. */
+    if ((int64_t)c->dec->width * c->dec->height <= 1920 * 1088) threads = 1;
     c->dec->thread_count = threads;
     c->dec->pkt_timebase = st->time_base;
     r = avcodec_open2(c->dec, codec, NULL);

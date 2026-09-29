@@ -57,9 +57,11 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
     Ok(a)
 }
 
-/// Decoder threads: one per core up to four. libavcodec's frame threading
-/// holds a frame per thread, so its own default (one per core) costs a
-/// many-core machine tens of MB for no gain at 1080p.
+/// Decoder threads for streams above 1080p: one per core up to four.
+/// libavcodec's frame threading holds a context and a frame per thread
+/// (+10.5 MB each at 1080p), so its own default (one per core) costs a
+/// many-core machine tens of MB. Up to 1080p the shim decodes on one
+/// thread whatever this says (#3924).
 fn decode_threads() -> u32 {
     std::thread::available_parallelism().map_or(2, |n| n.get().min(4) as u32)
 }

@@ -1664,6 +1664,40 @@ workspace crate only; FFmpeg is a dynamically linked C dependency
 (`DEPENDENCIES.md`). The paint cost is full-frame NV12 conversion on the
 CPU composite path; the planes path (#3899) removes it.
 
+### #3924: player RSS
+
+Up to 1080p the decoder runs on one thread instead of `min(cores, 4)`
+frame threads. Each frame thread held its own H.264 context and a picture
+in flight, about 10.5 MB at 1080p. On box1's two cores the extra thread
+cost CPU as well: it competed with the UI thread and the server. The
+budget asked for at least 10 MB off at 1080p, with 0 dropped frames and
+CPU no more than a few % worse.
+
+| box1 run | RSS | CPU | dropped | late |
+|---|---|---|---|---|
+| 720p windowed | 62.4 → **56.2 MB** | 40 → 34 % | 0 | 1–3 → 2–3 |
+| 1080p windowed | 87.1 → **75.2 MB** | 51 → 35 % | 0 | 164–188 → 98–127 |
+| 1080p fullscreen | 87.1 → **75.3 MB** | 49 → 33 % | 0 | 253–277 → 31–53 |
+
+On testhost2 (8 threads, FFmpeg 9) 1080p goes from 96.3 to 71.2 MB for
++6 % of one core, and 720p from 63.9 to 51.7 MB.
+
+At 1080p the remaining 75 MB is:
+- 24 MB: the single-threaded decoder's DPB and pool.
+- 12.2 MB: the 4-slot NV12 ring.
+- 8.8 MB: libav* code.
+- ≈ 24 MB: clean, shared pages of the libraries the system FFmpeg links.
+- ≈ 6 MB: heap plus dirty library pages.
+
+Not taken:
+- Slice threads: x264 writes one slice per frame, so there is nothing to split.
+- `M_ARENA_MAX`: ≤ 0.2 MB.
+- `malloc_trim`: nothing freed.
+- Ring 3: −3 MB but more late frames on box1.
+
+Per-lever detail is in `crates/nitro-video/README.md` §Memory. The
+binary grows by 32 bytes (809 384 B); no crate added.
+
 ## Dependency count
 
 `cargo tree -e normal --prefix none | sort -u | wc -l` = **74** at M4-A
