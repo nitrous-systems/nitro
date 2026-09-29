@@ -241,7 +241,8 @@ fn on_a_node_that_is_neither_image_nor_surface_it_is_wrong_kind() {
 fn on_a_surface_node_the_region_skips_the_alpha_too() {
     let h = Harness::start("surface");
     let mut conn = h.client("opq-surface");
-    conn.client_caps(caps::OPAQUE_REGION | caps::SURFACE).unwrap();
+    conn.client_caps(caps::OPAQUE_REGION | caps::SURFACE)
+        .unwrap();
     let (root, back, surf) = (NodeId(1), NodeId(2), NodeId(3));
     let stride = SIDE * 4;
     let pixels: Vec<u8> = (0..stride * SIDE)

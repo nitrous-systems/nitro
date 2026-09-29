@@ -268,7 +268,7 @@ containing the transaction reached the screen.
 | 12 | `KEYMAP` | the server sends the xkb `Keymap` and `Modifiers` (M5-A) |
 | 13 | `RELEASE` | the server sends `BufferReleased` (M5-A) |
 | 14 | `DATA` | clipboard **and** drag-and-drop; see [Data transfer](#data-transfer-caps-data) (M5-A) |
-| 15 | `OPAQUE_REGION` | `SetOpaqueRegion` — a client may declare an image's opaque pixels (#3877) |
+| 15 | `OPAQUE_REGION` | `SetOpaqueRegion` — a client may declare an image's or surface's opaque pixels (#3877, Surfaces #3919) |
 | 16 | `SURFACE` | shm-backed `Surface` nodes: `CreateSurfaceBuffer`, `SetSurface`, `PresentSurface`, `SurfaceHint` (#3897), and server-allocated scanout buffers: `AllocSurfaceBuffers`, `SurfaceBufferAllocated`, `AllocSurfaceBuffersFailed` (#3914); see [Surfaces](#surfaces-caps-surface) |
 | 17 | `SHARE` | cross-client Surface sharing: `ExportSurface`, `ImportSurface`, `SurfaceExported`, `SurfaceRevoked` (#3904); see [Surface sharing](#surface-sharing-caps-share) |
 
@@ -1608,7 +1608,7 @@ from `OSExchangeData::GetDragImageOffset()` (image origin → cursor), and
 
 | field | type | meaning |
 |---|---|---|
-| `id` | `u32` (`NodeId`) | an `Image` node of the sender's |
+| `id` | `u32` (`NodeId`) | an `Image` or `Surface` node of the sender's |
 | `rects` | `vec<IRect>` | opaque rectangles, **buffer pixel coordinates** |
 
 The client promises every pixel of the node's buffer inside `rects` has
@@ -1621,8 +1621,13 @@ coordinates like [`BufferDamage`](#bufferdamage--0x0303) and `SetImage.src`.
 * **Replaced** by each call; an empty list clears it.
 * **Buffered to the commit**, like every scene mutation, so it lands with
   the pixels it describes.
-* **Persists** across `SetImage` buffer swaps (it belongs to the node,
-  not to a buffer).
+* **Persists** across `SetImage` / `SetSurface` buffer swaps and latched
+  `PresentSurface` frames (it belongs to the node, not to a buffer).
+* **On a `Surface` (#3919)** it is the owner's, like the node's geometry:
+  an importer cannot send it (its import id accepts only `PresentSurface`
+  and `DestroyNode`), but its AR24 frames are painted with the owner's
+  region. This is how Chromium's GPU process keeps the opaque copy for the
+  browser's translucent window.
 * A lie is the client's problem, not an error: inside the region the
   colour channels show unblended.
 * The server uses it only where it is exact — an `AR24` buffer drawn 1:1,
@@ -1630,7 +1635,8 @@ coordinates like [`BufferDamage`](#bufferdamage--0x0303) and `SetImage.src`.
   or translucent drawing blends every pixel as before. For `XR24` it is
   meaningless: the buffer is opaque already.
 * Requires `OPAQUE_REGION` listed in `ClientCaps` (`Error { Protocol }`
-  otherwise); a node that is not an `Image` is `Error { WrongKind }`.
+  otherwise); a node that is neither an `Image` nor a `Surface` is
+  `Error { WrongKind }`.
 
 **Why:** Chromium's browser frame is always translucent on Linux (rounded
 CSD corners and a shadow), so the whole window is `AR24`, and blending

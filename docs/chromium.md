@@ -1,4 +1,4 @@
-# Chromium on nitro: the Ozone backend (#3778, #3865)
+# Chromium on nitro: the Ozone backend (#3778, #3865, #3919)
 
 The backend lives in the Chromium tree, not in this repo: `ui/ozone/platform/nitro/` on branch `nitro-ozone` of the Chromium checkout (`/home/kaspar/src/ai/chromium/src` by default). How to build it, and the `NITRO_CHROMIUM_OUT` override the justfile uses, is in [chromium-build.md](chromium-build.md). Its companion wire client is `wire/`, from #3777.
 
@@ -6,21 +6,24 @@ The backend lives in the Chromium tree, not in this repo: `ui/ozone/platform/nit
 - **GN args:** `out/Default/args.gn` has `ozone_platform_nitro = true`, with headless kept.
 - **Run:**
   ```
-  chrome --ozone-platform=nitro --disable-gpu --in-process-gpu
+  chrome --ozone-platform=nitro --disable-gpu
   ```
-- **Size:** about 3,150 lines across `ozone_platform_nitro`, `nitro_connection_host`, `nitro_surface_factory` (`NitroCanvas`), `nitro_window`, `nitro_window_manager`, `nitro_screen`, `nitro_event_source`, `client_native_pixmap_factory_nitro`, `BUILD.gn` and `DEPS`.
+  The GPU process runs out of process, as on every other Chromium (#3919).
+  `--in-process-gpu` still works and brings back the #3778 path, in which the
+  browser presents.
+- **Size:** about 3,900 lines across `ozone_platform_nitro`, `nitro_connection_host`, `nitro_gpu_connection`, `nitro_presenter.h`, `nitro_surface_factory` (`NitroCanvas`), `nitro_gl_readback` (measurement only), `nitro_window`, `nitro_window_manager`, `nitro_screen`, `nitro_event_source`, `client_native_pixmap_factory_nitro`, `mojom/nitro_gpu.mojom`, `BUILD.gn` and `DEPS`.
 
 ## Architecture
 
-- **One nitro connection, owned by the browser UI thread** (`NitroConnectionHost`). It watches the fd with `WatchFileDescriptor` and routes server events:
-  - by window/node to `NitroWindow`;
-  - outputs to `NitroScreen`;
-  - `BufferReleased`/`Presented` to a buffer-id registry that posts back to the owning canvas's sequence.
-
-  All wire sends happen on the UI thread. `NitroCanvas`, on the viz thread, posts its `CreateBuffer`/`SetImage`/`BufferDamage`/`Commit` work there.
-- **`--in-process-gpu` is required (today).** nitro scopes node, buffer and window ids per client connection (`clients.rs`; `wire.md` § Ids and transactions), so a GPU process's own connection could create buffers but never put them on the browser's window. The human chose option A (ask#419) for the first backend.
-  - If the GPU process is out of process, `InitializeForGPU` logs an error and `CreateCanvasForWidget` returns nullptr, so it fails clearly.
-  - **Out-of-process GPU: option B (#3904, nitro side done; Chromium side #3905).** See [Out-of-process GPU: B vs C](#out-of-process-gpu-b-vs-c-3904) below and `wire.md` § Surface sharing.
+- **Two nitro connections: the browser's and the GPU process's** (#3919, option B of [B vs C](#out-of-process-gpu-b-vs-c-3904)).
+  - **Browser** (`NitroConnectionHost`, on the UI thread). It owns every window: geometry, visibility, stacking, input, `Configure`, popups and the opaque region. It watches its fd with `WatchFileDescriptor` and routes server events by window/node to `NitroWindow` and outputs to `NitroScreen`. Each window's content is a **`Surface` node**. After the commit that creates the node, the browser sends `ExportSurface`, and `SurfaceExported` returns a token. The browser hands the token to the GPU process over `ui.nitro.mojom.NitroGpu`, a three-method interface (`SetTranslucent`, `SetSurfaceToken`, `RemoveSurface`) bound through `GpuPlatformSupportHost::OnGpuServiceLaunched` → `OzonePlatform::AddInterfaces`. A popup is re-created on every show, so each show brings a new node and a new token; the old import is revoked with its node.
+  - **GPU process** (`NitroGpuConnection`). It connects in `InitializeForGPU`, which runs before the seccomp sandbox engages, the same way X11 Ozone opens its display. The connection runs on its own IO thread (`NitroGpu`, `kPresentation` priority). For each token it sends `ImportSurface` under an id of its own and feeds the node with `PresentSurface` (the vblank latch: no transaction, newest frame wins). The canvas's buffers are ordinary sealed-memfd `CreateBuffer`s, and an XR24/AR24 buffer may be presented on a Surface. `BufferReleased` and `Presented` come straight back to this connection. **The browser never sees a pixel, a release or a present**, so the busy UI thread is off the present path.
+  - **`SurfaceRevoked`** (a stale token, a replaced popup node, a re-export) finishes the import's pending frames so viz never waits. The id stays bound until the next token replaces it. A frame drawn before the token arrives is kept as the widget's current buffer and shown as soon as an import exists.
+  - **A GPU process that loses its connection exits.** The browser restarts it, the tokens are still valid (they live as long as the node), and the browser replays them. The newest import wins over the dead process's (`wire.md` § Surface sharing).
+  - **Resize:** the browser resizes the root and Surface nodes when views changes the size (it no longer sees the frame that carries the new pixels). Until the GPU process's first frame at the new size, the latch scales the old buffer into the new rect, so a drag-resize shows one stretched frame at most. In-process, the resize rides the frame.
+  - **Cost of the split:** `CreateBuffer` is registered at the next `Commit` while `PresentSurface` acts at receipt, so the GPU process commits once per new buffer (3 per window size), not per frame.
+- **`--in-process-gpu`** keeps the #3778 path: one connection, an **Image** node per window, and `NitroCanvas` on the in-process viz thread posts `CreateBuffer`/`SetImage`/`BufferDamage`/`Commit` to the UI thread. Both paths share `NitroCanvas`; it talks to a `NitroPresenter`, which is either `NitroConnectionHost` or `NitroGpuConnection`.
+- **Server requirement:** `SURFACE` and `SHARE` (#3897, #3904). An older server makes the out-of-process path fail at startup with a message naming the missing caps; use `--in-process-gpu` against it.
 - **Canvas:**
   - 3 shm buffers (`UnsafeSharedMemoryRegion`), with Skia rastering straight into the mapping via `SkSurfaces::WrapPixels`.
   - Per-buffer `SkRegion` dirty tracking, with stale damage copied forward from the last attached buffer (the Wayland scheme).
@@ -71,7 +74,8 @@ All of this was verified on a fake-backend nitro server (1280x720@60), driven by
 
 ## What doesn't / is not verified
 
-- **No out-of-process GPU** yet on the Chromium side (#3905); nitro supports it since #3904 (see above).
+- **GPU rendering** without a readback: the zero-copy dma-buf path is the follow-up task "Chromium Ozone nitro: GPU rendering via dma-buf". Until then GPU raster exists only as the `NITRO_GPU_READBACK=1` measurement knob (see [Out-of-process GPU measurements](#out-of-process-gpu-measurements-3919)).
+- **Drag-resize** can show one stretched frame while the GPU process catches up (see Architecture).
 - **HiDPI:** only scale 1 was exercised. The model is nitro logical = DIP, buffers = physical px, and scale comes from `OutputInfo`.
 - **Popup types:** `kPopup`/`kBubble` windows are nitro popups too; there is no subsurface equivalent. They are placed by the server, and only `kMenu` grabs.
 - **Drag and drop:** not wired. `platform_shows_drag_image=false`, and DnD start is a no-op.
@@ -107,7 +111,7 @@ Fake backend, 60 Hz. The fake flip takes about 21 ms, which is the throughput ce
 
 ## nitro-side gaps the audit missed
 
-1. **No cross-client buffer or node sharing.** Ids are per-connection, so a GPU process could not present into a browser window, which forced `--in-process-gpu`. **Fixed by #3904**: `ExportSurface`/`ImportSurface` (caps `SHARE`, `wire.md` § Surface sharing) let a second connection of the same uid present into a Surface node of the browser's window.
+1. **No cross-client buffer or node sharing.** Ids are per-connection, so a GPU process could not present into a browser window, which forced `--in-process-gpu`. **Fixed by #3904** (`ExportSurface`/`ImportSurface`, caps `SHARE`, `wire.md` § Surface sharing) **and used since #3919**: the GPU process presents into the browser's windows, and `--in-process-gpu` is gone from the wrapper. The one server change the backend needed was `SetOpaqueRegion` on a `Surface` node (#3919), which keeps #3877's opaque copy for the translucent CSD window.
 2. **No premultiplied ARGB format.** `AR24` is straight alpha, while Skia (and most toolkits) produce premultiplied pixels. The workaround costs a CPU unpremultiply per translucent frame, and copying unpremultiplied pixels forward between buffers is a subtle blending hazard. Suggest adding a premultiplied fourcc or a per-buffer flag.
 3. **`BufferDamage` was ignored on buffer swap.** `SetImage` with a new buffer marked the whole node dirty, so every frame repainted the full image (735k px per frame measured, even for a caret blink). **Fixed by #3833**: `BufferDamage` is honoured when a same-size buffer is swapped in (see the caret-blink idle number under Test box).
 4. **No input-injection command on the control socket.** `FakeInput` was test-only, so this work needed a custom harness. **Fixed by #3834**: the control socket has `input` (`nitro-shot --input "wheel 0 15 count=3"`) and `samples`.
@@ -128,14 +132,96 @@ Two ways to let Chromium's GPU process draw into a window that the browser proce
   - Its costs are a bearer-token security model (same uid, local links only) and a larger protocol.
   - It also serves other split-process producers later, such as a decoder process presenting into a player window.
 
-C is not cheaper, so **B**. The browser keeps owning geometry, visibility, input and `Frame`/`Configure`. The GPU process only feeds the Surface's vblank latch (#3897): newest frame wins, whoever sent it. The exact rules (lifetime, revocation, interleaving, event routing) are in `wire.md` § Surface sharing.
+C is not cheaper, so **B**. Implemented in #3919; see Architecture. The browser keeps owning geometry, visibility, input and `Frame`/`Configure`. The GPU process only feeds the Surface's vblank latch (#3897): newest frame wins, whoever sent it. The exact rules (lifetime, revocation, interleaving, event routing) are in `wire.md` § Surface sharing.
 
 One limit applies to both options: an out-of-process GPU does not reduce CPU on a 2-core box (see the next levers above). It is about Chromium's normal process model and sandboxing.
+
+## Out-of-process GPU measurements (#3919)
+
+`just chromium-bench MODE [RUNS]` (`deploy/chromium-bench.sh`) runs on the
+box against the running session. It starts a fresh-profile chrome on a
+1 500-row page, waits 12 s, samples PSS/RSS of the browser and GPU
+processes while idle, runs `scroll-bench.py` (150 + 150 wheel events,
+16 ms apart) and samples the chrome tree's CPU over the scroll. The arms:
+
+| arm | flags |
+|---|---|
+| `inproc` | `--disable-gpu --in-process-gpu` (the #3877 baseline) |
+| `oop` | `--disable-gpu` (**the default now**) |
+| `gpu` | `NITRO_GPU_READBACK=1 --use-angle=vulkan --enable-features=Vulkan,DefaultANGLEVulkan,VulkanFromANGLE`: ANGLE-on-Vulkan raster, then `glReadPixels` of the whole frame into the same shm canvas. **Measurement only**, and it runs out of process |
+
+Each arm ran twice. All arms used the same server (this branch) and the
+same `out/Nitro` chrome. The `gpu` arm's renderer, confirmed through CDP
+`SystemInfo`, was `ANGLE (Intel, Vulkan 1.2 (HSW GT1), Mesa 26.0.8)` on box1,
+hardware hasvk and not SwiftShader.
+
+Chromium tree: `nitro-ozone` at `b06f29bbd7` (#3919's three commits on top of `8b9e445b34`).
+
+### box1: Pentium G3240, HSW GT1, 1920×1080 **@60** (the panel was at 60 that day), window ~1050×830 device px
+
+| arm | fps | frame p50/p95/max ms | i2p p50/p95/max ms | server paint mean | browser PSS / RSS | GPU proc PSS / RSS | tree PSS | chrome CPU |
+|---|---|---|---|---|---|---|---|---|
+| inproc | 61.6–61.7 | 16.7/16.7/16.7 | 25.1/32.4–32.5/33.1 | 1.50–1.53 ms | 135–138 / 291–293 MB | – | 487–488 MB | 60 % |
+| **oop** | 61.9 | 16.7/16.7/16.7 | 24.9–25.7/32.2–32.6/32.9–33.3 | 1.44–1.48 ms | 123–140 / 274–290 MB | 30–31 / 113–116 MB | 491–505 MB | 62–73 % |
+| gpu (readback) | 52.7–53.3 | 16.7/33.3/33.3 | 23.0–23.5/31.6–35.9/38–40 | 3.6–3.9 ms | 120–124 / 271–273 MB | 103–111 / 198–202 MB | 560–567 MB | 80 % |
+
+Caret-blink idle with oop (focused `<textarea>`, 20 s): chrome tree **2 % CPU**,
+**4 frames/s**, damage 14.7k px mean (the stats window still carried the
+page load), paint 26 µs. That matches the in-process 1.8 % / 4 frames/s.
+
+### testhost2: i5-8250U, UHD 620 (KBL), eDP 2560×1440@60
+
+At the box's usual **scale 1.25**, every arm is limited by the server,
+not by Chromium. The window is about 1.4 Mpx, and at a fractional scale
+the Surface/Image is not drawn 1:1, so #3877's opaque copy never applies
+and the whole window is blended and scaled: paint is about 21–26 ms per
+frame, for 14–16 fps in every arm (inproc 16.0, oop 14.3–15.2, gpu 16.0;
+i2p p50 40–44 ms). That is a separate server issue (scaled-blend cost at
+fractional scale, the same family as #3927) and says nothing about the
+GPU process. The arms were therefore re-run at **scale 1**, which
+`server.conf` restored afterwards:
+
+| arm (scale 1) | fps | frame p50/p95/max ms | i2p p50/p95/max ms | server paint mean | browser PSS / RSS | GPU proc PSS / RSS | tree PSS | chrome CPU |
+|---|---|---|---|---|---|---|---|---|
+| inproc | 31.4 | 16.7/16.7/16.7–33.3 | 24.6–24.7/31.9–32.1/32.6–34.0 | 1.12–1.21 ms | 153–155 / 315–316 MB | – | 515–519 MB | 44–47 % |
+| **oop** | 31.2 | 16.7/16.7/16.7 | 25.1–25.3/32.1–32.4/34.6–35.7 | 0.97–1.05 ms | 136–138 / 286–290 MB | 34 / 123 MB | 520–522 MB | 40–55 % |
+| gpu (readback) | 29.2–30.4 | 16.7/16.7–33.3/33.3 | 17.2–19.0/30.4–32.7/35–41 | 1.62 ms | 134–149 / 283–301 MB | 81–82 / 182 MB | 556–574 MB | 57–63 % |
+
+At scale 1 the window is 1.63 Mpx of damage per frame, and every arm
+delivers ~31 fps on 60 Hz with 16.7 ms frame intervals. Chromium produces
+a frame every other vblank, so the event rate, not the present path, is
+what the fps column shows there. i2p is the same for inproc and oop.
+
+### Reading
+
+- **Out of process costs nothing measurable on the present path.** fps,
+  frame intervals, i2p and server paint are within run-to-run noise of
+  in-process on both boxes. The extra hop (GPU process → its own socket)
+  replaces the old one (viz thread → UI thread task → socket).
+- **Memory:** the GPU process is +30–34 MB PSS (~115–125 MB RSS, most of
+  it the shared binary). The browser drops by 12–17 MB PSS because viz
+  moved out, so the whole tree is +3–15 MB PSS. On box1's 3.3 GB that is
+  noise.
+- **CPU:** the chrome tree's CPU during the scroll is the same within
+  noise (60 % vs 62–73 % on box1). On a 2-core box an out-of-process GPU
+  does not save CPU, as predicted, but it does not cost any measurable
+  CPU either.
+- **GPU raster with a readback is not worth shipping.** On box1 it
+  *loses* fps (53 vs 62): the whole-frame `glReadPixels` on HSW GT1 plus
+  whole-frame damage (a readback has none; server paint 1.5 → 3.7 ms)
+  cost more than Skia software raster saves. On testhost2 it trades about
+  1 fps for a 6–8 ms better i2p p50 (17–19 vs 25 ms: raster finishes
+  sooner, the copy comes later) and +45–50 MB of GPU-process memory. The
+  benefit of GPU raster only shows once the readback **and** the
+  whole-frame damage go away, which is exactly what the dma-buf follow-up
+  removes. Expect it on testhost2 (KBL, full anv) far more than on box1,
+  where hasvk is "incomplete" and the GPU is GT1.
 
 ## Other gotchas
 
 - `headless_shell` forces `--ozone-platform=headless` (`headless_content_main_delegate.cc:272`). Use it as a compile check only, and run `chrome` for real tests.
-- `--enable-logging=stderr` is needed to see the `nitro-frame`/`nitro-trace` output.
+- `--enable-logging=stderr` is needed to see the `nitro-frame`/`nitro-trace` output. Out of process, `nitro-frame` lines come from the GPU process and carry no i2p (the input is the browser's); use the server's `samples i2p` or `scroll-bench.py`.
+- `NITRO_GPU_READBACK=1` is a measurement knob, not a feature: without it the platform offers no GL, and Chromium rasters in software whatever `--use-angle` says.
 - The DBus, BlueZ and GCM errors in the log are environmental noise.
 
 ## Reproducing
@@ -143,7 +229,7 @@ One limit applies to both options: an out-of-process GPU does not reduce CPU on 
 - **Build:** [chromium-build.md](chromium-build.md), `-j 48` via `cr-env.sh`; §11 is the shippable `out/Nitro` build.
 - **Deploy:** `just deploy-chromium` (box) or `just install-chromium` (local); see `docs/testbox.md` §Chromium.
 - **Input:** `nitro-shot --input ARGS` injects input server-side through the control socket (`wheel`, keys, pointer), so no harness is needed.
-- **Scroll benchmark:** `deploy/scroll-bench.py` injects the wheel test above against whatever client is under the pointer and prints a row in the format of the Measurements tables.
+- **Scroll benchmark:** `deploy/scroll-bench.py` injects the wheel test above against whatever client is under the pointer and prints a row in the format of the Measurements tables. `just chromium-bench inproc|oop|gpu [RUNS]` wraps it with a chrome launch and memory/CPU sampling (#3919).
 
 ## Test box (#3865)
 

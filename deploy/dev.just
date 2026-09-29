@@ -234,6 +234,16 @@ deploy-chromium:
     rsync -az deploy/chromium/chromium-nitro.desktop {{box}}:.local/share/applications/
     ssh {{box}} 'md5sum ~/nitro-bin/chromium/chrome'
 
+# Chromium scroll/i2p/memory benchmark on the box (#3919), against the
+# running session: `just chromium-bench oop`, `just box=testhost2
+# chromium-bench inproc 3`. MODE is inproc | oop | gpu (see the script).
+# Needs `deploy-chromium` first; leaves nothing behind but /tmp files.
+[group('dev')]
+chromium-bench mode="oop" runs="2":
+    ssh {{box}} 'mkdir -p ~/nitro-stage'
+    rsync -az deploy/chromium-bench.sh deploy/scroll-bench.py {{box}}:nitro-stage/
+    ssh {{box}} 'bash ~/nitro-stage/chromium-bench.sh {{mode}} {{runs}}'
+
 # Install/refresh the systemd unit on the box (needs sudo there). On a
 # `gdm` box there is no unit (it would fight GDM for tty2): this makes
 # the clone pushable and checks the GDM session entry instead.

@@ -269,6 +269,16 @@ binary and is not the number to quote. `free` "used" moved +170 to +250 MB.
 
 Figures and the verdict are in `docs/chromium.md` §Test box.
 
+**Out-of-process GPU (#3919).** The wrapper no longer passes
+`--in-process-gpu`: the GPU process presents into the browser's windows
+through `ExportSurface`/`ImportSurface`, so the box's server must have
+`SURFACE` and `SHARE` (#3897/#3904). Deploy the server first. `just
+chromium-bench inproc|oop|gpu [RUNS]` (either box, `box=testhost2`) runs
+the scroll/i2p/memory comparison against the running session and leaves
+only `/tmp` files behind. On testhost2 it needs a session, so bring up the
+temporary `nitro-dev` unit above first. Numbers are in `docs/chromium.md`
+§Out-of-process GPU measurements.
+
 ## The panel runs at 120 Hz
 
 **By the human's choice, and the line is in his `server.conf` to stay**
