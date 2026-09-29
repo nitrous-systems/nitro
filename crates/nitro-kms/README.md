@@ -227,7 +227,28 @@ forbid; that failure is non-fatal and reported by `hotplug_error()`.
   It says `ENOSPC` beyond `set_max_active_planes(n)`, which stands in
   for shared scalers and bandwidth. `set_test_hook` replaces the rules
   outright. `test_log()` records `(output, planes, verdict)` for every
-  answered question.
+  answered question. `OutputFront` is `XRGB8888`, or `ARGB8888` while
+  scanout alpha is on.
+- Multi-plane frame path, with the DRM contract below:
+  - `commit`/`commit_planes` validate a non-default staged layout with
+    the same acceptor (or the test hook), without logging it to
+    `test_log`. A rejection is `Err(Io { op: "atomic page flip" })` with
+    the acceptor's errno, and nothing moves (front, pending, damage log,
+    plane state); fences are consumed.
+  - `plane_state(id)` is the layout of the most recent successful commit
+    (empty = default). `fence_log(id)` lists, per commit that carried
+    fences, the planes that had one. `commit_planes` is not recorded in
+    `damage_log`.
+  - Resets mirror the DRM modesets: `resume`, a `rescan` or `set_modes`
+    that changed something, and an output's first commit (resets the
+    *other* outputs).
+  - `buffer_info`: pitches padded to 64 bytes (4 B/px RGB, 2 YUYV/UYVY,
+    1 NV12), NV12's CbCr at `pitch * h`. `export_buffer` is a sealed
+    memfd (`nitro_shm::create_sealed`) of `size` bytes, made on the first
+    export and shared by later ones; `DMA_BUF_IOCTL_SYNC` on it fails
+    with `ENOTTY`. A freed buffer still on screen stays visible to
+    `buffer(id)` until its release, like the real one stays allocated.
+  - `read_front` is still the output buffer only.
 
 ## Hardware smoke test
 
@@ -284,8 +305,8 @@ format fails here with `Error::Io`, before any test runs.
   the answer is `Rejected(EINVAL)` without a round trip, because that is
   what the kernel would say.
 - `PlaneSource::OutputFront` is the output's current front buffer.
-  The frame path (`commit`, `flip`, the modesets) is untouched; it still
-  uses the primary plane only.
+  The frame path uses the planes through a *staged* layout; see
+  "Multi-plane frame path (#3913)" below.
 
 ### Probe
 
@@ -507,6 +528,125 @@ What this means for the `planes` module (#3899) on Gen9:
 - Rotation: 0/90/180/270 on primary and overlay (90/270 need Y-tiled
   buffers on Gen9; not tested). Cursor: ARGB 64/128/256 alongside a YUYV
   overlay. No plane has `FB_DAMAGE_CLIPS`; all have `IN_FENCE_FD`.
+
+## Multi-plane frame path (#3913)
+
+The server decides, the backend executes. Per output:
+
+- **`set_plane_state(output, &[PlaneConfig])`** stages the whole CRTC
+  layout for the next commit, with `test_layout`'s rule: every plane on
+  the CRTC that is not listed is off, the primary included (a layout
+  without it turns the primary off). Empty is the default, the output
+  buffer full-screen on the primary. `OutputFront` in a commit is the
+  output buffer *that commit flips to*, scanned out AR24 while scanout
+  alpha is on, so the shadow can sit on the overlay with holes while a
+  Surface buffer is on the primary (KBL (c)). Needs a lit, unpaused
+  output; the planes must be this output's and the buffers live
+  (`NoSuchObject` otherwise). Nothing is asked of the kernel here: call
+  `test_layout` first.
+- **The layout persists** across commits until changed, or until a
+  modeset puts every lit output back to the default: `resume`, a
+  `rescan`/`set_modes` that changed anything (retime, resize, replace,
+  plug, unplug), and **the first commit of another output** (lighting
+  modesets every lit output). The buffers a reset drops show up in
+  `take_released_buffers`; that is how the server notices, re-decides and
+  repaints fully.
+- **`commit`** builds the request from the staged layout: each listed
+  plane gets `FB_ID`, `CRTC_ID`, `SRC_*`, `CRTC_*` plus zpos, rotation,
+  `COLOR_*` and in-fence when set; the planes that were on and are no
+  longer listed get `FB_ID=0`, `CRTC_ID=0`; `FB_DAMAGE_CLIPS` goes on the
+  plane showing `OutputFront`. When the staged and on-screen layouts are
+  both the default the per-output template flip is used unchanged, so
+  today's frame path costs nothing more. A rejected commit is `Err` and
+  changes nothing (screen, buffer roles, bookkeeping, staged layout);
+  the server falls back to the default.
+- **`commit_planes(output)`** re-commits the current front buffer with
+  the staged layout: no swap, full damage, `Flipped` as usual,
+  `FlipPending` as for `commit`. A video frame flips without a paint.
+- **`set_plane_fence(output, plane, fd)`**: `IN_FENCE_FD` for the next
+  commit, consumed whether it succeeds or not; `Unsupported` on a plane
+  without the property. CPU-written buffers need none.
+- **Release after the replacing flip.** The backend tracks which buffers
+  the on-screen and the in-flight layout read. When the `Flipped` of a
+  commit that stopped reading one is dispatched (or a modeset reset the
+  layout), `take_released_buffers()` reports it, once. A method rather
+  than an `Event` variant, so `dispatch`'s callers need no new arm; call
+  it after `dispatch` (and after `resume`/`rescan`/`set_modes`/a first
+  commit).
+- **Deferred free.** `free_buffer` of a buffer still read (on screen or
+  in flight) makes the id unusable at once and destroys it at its
+  release; it is then not reported.
+- **`buffer_info(id)`** gives format, size, modifier (`LINEAR`), byte
+  size, and per-plane offsets/pitches (index 1 is NV12's CbCr).
+  **`export_buffer(id)`** is a PRIME fd (`DRM_CLOEXEC | DRM_RDWR`), so a
+  client can map it for writing; every export shares the memory. Buffer
+  ids leave room for dma-buf import (#3900).
+
+### Measured (`planes_probe --flip`), 2026-09-29
+
+`planes_probe --flip` shows each layout for 2 s through
+`set_plane_state` + `commit_planes`, then goes back to the default and
+prints the `Flipped` events and the releases. The video buffers are left
+zeroed (solid green in YCbCr), which is enough to see which plane shows
+what; they are exported and the PRIME fd's size checked against
+`buffer_info`. In (b2) the buffer is freed while on screen.
+
+box1 (HSW GT1, HDMI 1920×1080, nitro-dev stopped):
+
+```text
+output#1 HDMI-A-1 1920x1080: multi-plane flips (--flip)
+    YUYV 1280x720: pitches=[2560, 0] offsets=[0, 0] size=1843200 PRIME fd size=1843200
+  (a) YUYV window above the primary
+    on: Flipped seq=117441540 after 12.7 ms
+    off: Flipped seq=117441661 after 16.8 ms
+    released: [BufferId(1)] (buffer buffer#1)
+    YUYV 1920x1080: pitches=[3840, 0] offsets=[0, 0] size=4147200 PRIME fd size=4149248
+  (b2) YUYV full-screen overlay, primary off
+    on: Flipped seq=117441662 after 16.8 ms
+    freed while on screen (deferred)
+    off: Flipped seq=117441783 after 16.9 ms
+    released: [] (buffer buffer#2)
+  (c) NV12 on the primary, AR24 output buffer on the overlay
+    SKIP: device does not support ARGB8888 scanout
+```
+
+testhost2 (KBL-R UHD 620, eDP 2560×1440, gdm stopped):
+
+```text
+output#1 eDP-1 2560x1440: multi-plane flips (--flip)
+    YUYV 1280x720: pitches=[2560, 0] offsets=[0, 0] size=1843200 PRIME fd size=1843200
+  (a) YUYV window above the primary
+    on: Flipped seq=1618706873 after 13.0 ms
+    off: Flipped seq=1618706993 after 22.8 ms
+    released: [BufferId(1)] (buffer buffer#1)
+    YUYV 2560x1440: pitches=[5120, 0] offsets=[0, 0] size=7372800 PRIME fd size=7372800
+  (b2) YUYV full-screen overlay, primary off
+    on: Flipped seq=1618706994 after 15.2 ms
+    freed while on screen (deferred)
+    off: Flipped seq=1618707116 after 23.3 ms
+    released: [] (buffer buffer#2)
+  (c) NV12 on the primary, AR24 output buffer on the overlay
+    shadow (primary, AR24): Flipped seq=1618707117 after 7.0 ms
+    NV12 2560x1440: pitches=[2560, 2560] offsets=[0, 3686400] size=5529600 PRIME fd size=5529600
+      layout
+    on: Flipped seq=1618707118 after 17.2 ms
+    off: Flipped seq=1618707240 after 23.5 ms
+    released: [BufferId(3)] (buffer buffer#3)
+```
+
+- Every layout the `TEST_ONLY` inventory accepted also flips for real:
+  a YUYV window above the primary (both boxes), YUYV alone with the
+  primary off (both), and on KBL NV12 on the primary under the AR24
+  output buffer on the overlay. HSW skips (c) (no AR24 primary, no NV12).
+- Every commit's `Flipped` arrives within one or two refresh periods.
+  Going back to the default releases the buffer at that flip. The buffer
+  freed while on screen is destroyed at the release flip with no error
+  and not reported.
+- The PRIME fd is the dumb buffer's size, rounded up to a page (HSW
+  1080p YUYV: 4 149 248 bytes against 4 147 200).
+- Not looked at by a human: the probe's output is what the kernel
+  reported. Whether the panel really showed green where expected was not
+  checked on either box.
 
 ## ARGB scanout (#3898)
 

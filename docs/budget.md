@@ -1358,6 +1358,31 @@ path (#3899) is what removes it.
 counted against the per-client buffer caps.
 
 
+## Multi-plane frame path in nitro-kms (#3913)
+
+`just footprint` (release, stripped), base `e25e494` → task-3913:
+
+| binary | before | after | Δ |
+|---|---|---|---|
+| nitro-server | 3 134 720 | 3 155 112 | **+20 392** |
+| every other binary | — | — | 0 (byte-identical) |
+
+That is the `set_plane_state`/`commit_planes`/fence/release/export
+surface on both backends, since the server links the fake one too: the
+DRM request builder (`flip_layout`, `add_config`, shared with
+`test_layout`), `PlaneTrack` (one copy, used by both backends), and the
+fake's parity. The first measurement was +25.5 KB. Three changes brought
+it inside the +20 KB surface rule: `Vec`s instead of a `HashSet` and a
+second `HashMap` (each hashbrown instantiation costs ~1.3 KiB of rehash
+code), and dropping the fake's check of the default layout. The
+`nitro-shm` edge adds nothing, because the server links it already.
+Dependencies are unchanged: 37 external names.
+
+**RssAnon: ~0.** Per output there are a few empty `Vec`s (staged and
+shown layouts, fences, refs) until a layout is staged. A staged layout
+is a handful of 64-byte `PlaneConfig`s. The default frame path still
+clones the same template request and allocates nothing more.
+
 ## Dependency count
 
 `cargo tree -e normal --prefix none | sort -u | wc -l` = **74** at M4-A

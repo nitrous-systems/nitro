@@ -29,7 +29,7 @@
 mod planes;
 pub mod select;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
@@ -532,7 +532,7 @@ pub struct DrmBackend<'fd> {
     buffers: HashMap<u32, planes::ScanoutBuf>,
     next_buffer: u32,
     /// Freed by the caller while still scanned out: destroyed on release.
-    doomed: HashSet<u32>,
+    doomed: Vec<u32>,
     /// Released and not yet taken ([`Backend::take_released_buffers`]).
     released: Vec<BufferId>,
     /// Buffers a replaced or vanished output's planes may still scan
@@ -594,7 +594,7 @@ impl<'fd> DrmBackend<'fd> {
             discovered: HashMap::new(),
             buffers: HashMap::new(),
             next_buffer: 1,
-            doomed: HashSet::new(),
+            doomed: Vec::new(),
             released: Vec::new(),
             orphan_refs: Vec::new(),
         };
@@ -1130,7 +1130,8 @@ impl<'fd> DrmBackend<'fd> {
             {
                 continue;
             }
-            if self.doomed.remove(&id.0) {
+            if let Some(i) = self.doomed.iter().position(|d| *d == id.0) {
+                self.doomed.swap_remove(i);
                 if let Some(b) = self.buffers.remove(&id.0) {
                     b.destroy(&self.card);
                 }
@@ -1664,8 +1665,8 @@ impl Backend for DrmBackend<'_> {
         let on_screen = self.outputs.iter().any(|o| o.track.references(id))
             || self.orphan_refs.contains(&id);
         if on_screen {
-            if self.buffers.contains_key(&id.0) {
-                self.doomed.insert(id.0);
+            if self.buffers.contains_key(&id.0) && !self.doomed.contains(&id.0) {
+                self.doomed.push(id.0);
             }
         } else if !self.doomed.contains(&id.0)
             && let Some(b) = self.buffers.remove(&id.0)

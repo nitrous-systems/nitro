@@ -27,7 +27,7 @@
 //!   capability; `scanout_alpha_on()` / `scanout_alpha_sets()` expose the
 //!   state and the call count.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::time::Duration;
@@ -40,7 +40,7 @@ use rustix::time::{
 use crate::drm::select::{ModeCandidate, ModeRequest, select_mode};
 use crate::planes::{
     BufferId, ColorEncoding, ColorRange, Fourcc, MOD_LINEAR, PlaneAssignment, PlaneConfig, PlaneId,
-    PlaneInfo, PlaneKind, PlaneSource, PlaneTrack, ScanoutBufferInfo, SrcRect, Verdict, Zpos,
+    PlaneInfo, PlaneKind, PlaneSource, PlaneTrack, ScanoutBufferInfo, Verdict, Zpos,
     rotation,
 };
 use crate::{BYTES_PER_PIXEL, Backend, BufferMut, Error, Event, Image, OutputId, OutputInfo, Rect};
@@ -436,6 +436,10 @@ impl FakeOutput {
     }
 }
 
+fn find_buf(buffers: &[(u32, FakeBuf)], id: u32) -> Option<&FakeBuf> {
+    buffers.iter().find(|(k, _)| *k == id).map(|(_, b)| b)
+}
+
 /// The headless backend. See the [module docs](self) for guarantees.
 pub struct FakeBackend {
     outputs: Vec<FakeOutput>,
@@ -457,9 +461,9 @@ pub struct FakeBackend {
     next_plane: u32,
     next_buffer: u32,
     /// Scanout buffers by id, freed ones still on screen included.
-    buffers: HashMap<u32, FakeBuf>,
+    buffers: Vec<(u32, FakeBuf)>,
     /// Freed by the caller, still scanned out: destroyed on release.
-    doomed: HashSet<u32>,
+    doomed: Vec<u32>,
     /// Released and not yet taken.
     released: Vec<BufferId>,
     max_active_planes: Option<usize>,
@@ -494,8 +498,8 @@ impl FakeBackend {
             warnings: Vec::new(),
             next_plane: 1,
             next_buffer: 1,
-            buffers: HashMap::new(),
-            doomed: HashSet::new(),
+            buffers: Vec::new(),
+            doomed: Vec::new(),
             released: Vec::new(),
             max_active_planes: None,
             test_hook: None,
@@ -778,8 +782,7 @@ impl FakeBackend {
     /// A freed buffer that is still on screen stays here until the flip
     /// that stops using it, which is when the real backend destroys it.
     pub fn buffer(&self, id: BufferId) -> Option<(Fourcc, u32, u32)> {
-        self.buffers
-            .get(&id.0)
+        find_buf(&self.buffers, id.0)
             .map(|b| (b.info.format, b.info.width, b.info.height))
     }
 
@@ -807,7 +810,7 @@ impl FakeBackend {
 
     /// A live (allocated, not freed) buffer.
     fn live(&self, id: BufferId) -> Option<&FakeBuf> {
-        self.buffers.get(&id.0).filter(|_| !self.doomed.contains(&id.0))
+        find_buf(&self.buffers, id.0).filter(|_| !self.doomed.contains(&id.0))
     }
 
     /// Buffers the screen stopped reading: destroy the doomed ones,
@@ -818,8 +821,9 @@ impl FakeBackend {
             if self.outputs.iter().any(|o| o.track.references(id)) {
                 continue;
             }
-            if self.doomed.remove(&id.0) {
-                self.buffers.remove(&id.0);
+            if let Some(i) = self.doomed.iter().position(|d| *d == id.0) {
+                self.doomed.swap_remove(i);
+                self.buffers.retain(|(k, _)| *k != id.0);
             } else if !self.released.contains(&id) {
                 self.released.push(id);
             }
@@ -852,27 +856,12 @@ impl FakeBackend {
             return Ok(());
         }
         let fences = o.track.take_fences();
-        let layout = if o.track.staged.is_empty() {
-            let (w, h) = (o.info.width, o.info.height);
-            o.planes
-                .iter()
-                .find(|(_, s)| s.kind == PlaneKind::Primary)
-                .map(|(id, _)| {
-                    PlaneConfig::new(
-                        *id,
-                        PlaneSource::OutputFront,
-                        SrcRect::whole(w, h),
-                        Rect::new(0, 0, w, h),
-                    )
-                })
-                .into_iter()
-                .collect()
-        } else {
-            o.track.staged.clone()
-        };
+        // Leaving a layout for the default needs no check: the default
+        // was accepted when the output was lit.
+        let layout = o.track.staged.clone();
         for c in &layout {
             if let PlaneSource::Buffer(b) = c.source
-                && (!buffers.contains_key(&b.0) || doomed.contains(&b.0))
+                && (find_buf(buffers, b.0).is_none() || doomed.contains(&b.0))
             {
                 return Err(Error::NoSuchObject("buffer", b.0));
             }
@@ -964,7 +953,7 @@ impl FakeBackend {
     /// [`FakeBackend::set_max_active_planes`] allows.
     fn check_layout(
         o: &FakeOutput,
-        buffers: &HashMap<u32, FakeBuf>,
+        buffers: &[(u32, FakeBuf)],
         max_active: Option<usize>,
         layout: &[(&FakePlaneSpec, &PlaneAssignment<'_>)],
     ) -> Verdict {
@@ -982,7 +971,10 @@ impl FakeBackend {
             let (format, bw, bh) = match a.source {
                 PlaneSource::OutputFront => (o.scanout_format, o.info.width, o.info.height),
                 PlaneSource::Buffer(id) => {
-                    let i = &buffers[&id.0].info;
+                    let Some(b) = find_buf(buffers, id.0) else {
+                        return no;
+                    };
+                    let i = &b.info;
                     (i.format, i.width, i.height)
                 }
             };
@@ -1195,9 +1187,10 @@ impl Backend for FakeBackend {
         if self.doomed.contains(&id.0) {
             return Err(Error::NoSuchObject("buffer", id.0));
         }
-        let b = self
+        let (_, b) = self
             .buffers
-            .get_mut(&id.0)
+            .iter_mut()
+            .find(|(k, _)| *k == id.0)
             .ok_or(Error::NoSuchObject("buffer", id.0))?;
         if b.memfd.is_none() {
             let fd = nitro_shm::create_sealed("nitro-kms-fake-scanout", b.info.size).map_err(|e| {
@@ -1323,17 +1316,17 @@ impl Backend for FakeBackend {
         }
         let id = self.next_buffer;
         self.next_buffer += 1;
-        self.buffers.insert(id, FakeBuf::new(format, width, height));
+        self.buffers.push((id, FakeBuf::new(format, width, height)));
         Ok(BufferId(id))
     }
 
     fn free_buffer(&mut self, id: BufferId) {
         if self.outputs.iter().any(|o| o.track.references(id)) {
-            if self.buffers.contains_key(&id.0) {
-                self.doomed.insert(id.0);
+            if find_buf(&self.buffers, id.0).is_some() && !self.doomed.contains(&id.0) {
+                self.doomed.push(id.0);
             }
         } else if !self.doomed.contains(&id.0) {
-            self.buffers.remove(&id.0);
+            self.buffers.retain(|(k, _)| *k != id.0);
         }
     }
 
