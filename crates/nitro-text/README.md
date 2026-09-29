@@ -180,6 +180,24 @@ and the faces after the primary are read only when the primary cannot map a
 character, stopping as soon as the remainder is covered. Latin text in the UI
 font therefore touches exactly one file however long the chain is.
 
+Three things keep this cheap on a box with hundreds of faces (#3926;
+testhost2 has 856, and shaping there took 114 µs a label before this change):
+
+- **The chain is memoized** per (family, weight, slant). Building it walks
+  every family in the index, which took 87 µs on testhost2. The memo is
+  never invalidated, because the index is immutable after the scan, and it
+  is cleared past 64 entries because `Family::Named` is client-chosen.
+  `FontDb::chain_builds()` counts the misses.
+- **So is coverage**: which chain face has a character the primary lacks,
+  and **"none"** for a character nothing installed has. Without the "none",
+  such a character read every file in the chain on every shape.
+  `FontDb::fallback_walks()` counts the lookups.
+- **Each face keeps one swash `CacheKey`**, minted at ingest and set on every
+  `FaceData::font_ref()`. swash keys its shaping cache (the compiled
+  GSUB/GPOS feature store) and its scaler cache on it, and
+  `FontRef::from_index` makes a fresh key per call. Without a stable key,
+  every label rebuilt the feature tables.
+
 ### The index cache
 
 The scan still has to *walk* the directories and, on a cold cache, read every

@@ -816,7 +816,11 @@ fn an_uncoverable_char_walks_the_chain_once() {
     }
     assert_eq!(db.fallback_walks(), walks, "no second walk");
     assert_eq!(db.evictions(), evictions, "no eviction storm");
-    assert_eq!(db.loads(), loads, "the primary stayed loaded; nothing else read");
+    assert_eq!(
+        db.loads(),
+        loads,
+        "the primary stayed loaded; nothing else read"
+    );
 }
 
 /// A character the primary lacks but a fallback has keeps rendering with that
@@ -828,16 +832,18 @@ fn a_memoized_fallback_shapes_like_a_walked_one() {
     let primary = db.face(chain[0]).expect("primary loads");
     let charmap = primary.font_ref().expect("parses").charmap();
     // Something the primary lacks and some later face has.
-    let found = ['\u{2603}', '\u{263A}', '\u{4E2D}', '\u{0915}', '\u{05D0}', '\u{2192}']
-        .into_iter()
-        .find(|c| {
-            charmap.map(*c) == 0
-                && chain[1..].iter().any(|id| {
-                    db.face(*id)
-                        .and_then(|d| d.font_ref().map(|f| f.charmap().map(*c) != 0))
-                        .unwrap_or(false)
-                })
-        });
+    let found = [
+        '\u{2603}', '\u{263A}', '\u{4E2D}', '\u{0915}', '\u{05D0}', '\u{2192}',
+    ]
+    .into_iter()
+    .find(|c| {
+        charmap.map(*c) == 0
+            && chain[1..].iter().any(|id| {
+                db.face(*id)
+                    .and_then(|d| d.font_ref().map(|f| f.charmap().map(*c) != 0))
+                    .unwrap_or(false)
+            })
+    });
     let Some(ch) = found else {
         eprintln!("skipping: no probe char needs a fallback here");
         return;

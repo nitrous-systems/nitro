@@ -2769,12 +2769,67 @@ Each cell is **presented/s / server µs per frame / paint µs mean/max**.
   `font_loads` 1 798 with `fonts_loaded` 0 at the end. Font files are
   being loaded and evicted under the reshape load, i.e. fallback lookup
   or the font cache thrashing on a large system font set. `text-static`
-  (the retained arm) is unaffected: 60/s, 5.4 ms. Not investigated
-  further here; it is a real finding about font handling on a
-  normal-sized desktop font install, not about this CPU.
+  (the retained arm) is unaffected: 60/s, 5.4 ms. **Fixed by #3926**,
+  see §9a.3.
 - Nothing else regresses. `create` and `text-static` are 1.2–1.3× box1's
   CPU at scale 1: small-scene fixed costs (protocol, damage, `pread`) do
   not scale with the faster core as much as the pixel loops do.
+
+### 9a.3 The text collapse, fixed (#3926)
+
+The cause was three defects in `nitro-text`. A large font set exposed them,
+and all three hit every box:
+
+1. **The fallback chain was rebuilt on every shape and measure.**
+   `FontDb::fallbacks` walks every family in the index. With testhost2's
+   856 faces the chain is 213 long and building it cost **75–87 µs**, more
+   than the shape itself. It is now memoized per (family, weight, slant):
+   0.13 µs.
+2. **swash's shaping cache always missed.** `FontRef::from_index` mints a
+   fresh `CacheKey` per call, and `ShapeContext` keys its compiled
+   GSUB/GPOS feature store on it. So every label rebuilt Noto Sans's large
+   layout tables (`CoverageBuilder::add` plus `build_stage` were 78 % of
+   the profile). Each face now keeps one key from ingest onwards.
+3. **A character no installed face covers was looked up through the whole
+   chain on every shape**, reading all 213 files and evicting them against
+   the 8 MB cap: **19.7 ms and 213 loads per label**. Coverage is now
+   memoized per chain, including "no face has it", so the walk happens once.
+
+Microbench on testhost2 (`shaping_scales_with_a_large_font_set`, release,
+`--ignored`): `shape("0123")` **114 → 2.2 µs**; a string with an uncoverable
+char **19 697 → 10.7 µs**; loads over 6 000 such shapes **426 000 → 214**.
+
+The `text` rows, before (main 76d438e) against after (task-3926), 6 s each, 60 Hz,
+testhost2 at scale 1.25. Ledgers: `docs/bench-box1-3926-text.jsonl`,
+`docs/bench-testhost2-3926-text.jsonl`. Cells are presented/s / server µs per frame /
+`shape_us_mean`:
+
+| run | box1 before | box1 after | testhost2 before | testhost2 after |
+|---|---|---|---|---|
+| text n=100 | 59.8 / 7 186 / 50 | 59.8 / 3 983 / 18 | 60.0 / 13 916 / 126 | 59.8 / 3 816 / 15 |
+| text n=500 | 60.0 / 12 083 / 15 | 60.0 / 11 416 / 6 | **15.8 / 64 315 / 119** | **59.8 / 8 077 / 5** |
+| text-static n=500 | 60.2 / 6 343 / 20 | 60.2 / 6 260 / 4 | 60.0 / 5 833 / 189 | 59.8 / 5 766 / 30 |
+
+(`shape_us_mean` is the server's lifetime window, so the text-static cell
+still carries the earlier rows' samples.)
+
+- The new counters are `font_chain_builds` 1 and `font_fallback_walks`
+  0–1 on both boxes for the whole run. Both settle after the first label.
+- `font_loads` is **1 per frame** in the reshaping rows on both boxes,
+  before and after (360 loads over 360 frames). That is the idle sweep
+  (`release_idle` at turn end) dropping the primary face between commits,
+  so the next commit re-reads it. `font_evictions` is 0–1, so the cap is
+  not involved. It is the deliberate RSS trade documented in `db.rs`. A
+  re-read of the ~620 KB NotoSans is inside the 8 ms server frame above,
+  so I left the policy unchanged.
+- `paint_us_mean` in the `text n=500` row reads higher after the fix
+  (box1 1 556 → 3 082 µs, testhost2 863 → 2 311). The change does not
+  touch paint: a painted glyph is an atlas hit and never reaches the font
+  db. `text-static` paints the same 500 labels at ~3.4 ms before and after
+  on both boxes, so the "after" figure is the scene's real paint cost.
+  One unverified explanation for the lower "before" mean: the
+  shaping-bound server ran at a different clock or phase. Server CPU per
+  frame, the number that includes paint, fell on every row.
 
 <details><summary>The generated tables for the scale-1 ledger (54 runs)</summary>
 

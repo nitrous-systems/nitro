@@ -1038,7 +1038,11 @@ mod tests {
         let chain = db.fallbacks(&sans);
         assert_eq!(db.chain_builds(), 1);
         assert_eq!(&chain[..], db.build_fallbacks(&sans).as_slice());
-        assert_eq!(db.family_name(chain[0]), Some("Noto Sans"), "the preference wins");
+        assert_eq!(
+            db.family_name(chain[0]),
+            Some("Noto Sans"),
+            "the preference wins"
+        );
         assert_eq!(chain.len(), 1 + 300 - 60, "one face per sans family");
         for _ in 0..100 {
             // Size does not select, so it does not miss the memo either.
@@ -1053,12 +1057,18 @@ mod tests {
             weight: 700,
             ..TextStyle::default()
         };
-        assert_eq!(&db.fallbacks(&bold)[..], db.build_fallbacks(&bold).as_slice());
+        assert_eq!(
+            &db.fallbacks(&bold)[..],
+            db.build_fallbacks(&bold).as_slice()
+        );
         let mono = TextStyle {
             family: Family::Mono,
             ..TextStyle::default()
         };
-        assert_eq!(&db.fallbacks(&mono)[..], db.build_fallbacks(&mono).as_slice());
+        assert_eq!(
+            &db.fallbacks(&mono)[..],
+            db.build_fallbacks(&mono).as_slice()
+        );
         assert_eq!(db.chain_builds(), 3);
     }
 
