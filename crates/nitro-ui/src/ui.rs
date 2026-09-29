@@ -3285,7 +3285,6 @@ impl<S: 'static> Ui<S> {
         }
     }
 
-    /// A `Closed` for a window other than the main one.
     /// A window of ours gained or lost keyboard focus.
     fn focus_msg(&mut self, state: &mut S, f: nitro_wire::msg::Focus) {
         let Some(win) = self.window_by_node(f.window) else {
@@ -3305,6 +3304,7 @@ impl<S: 'static> Ui<S> {
         }
     }
 
+    /// A `Closed` for a window other than the main one.
     fn window_closed(&mut self, state: &mut S, node: NodeId) {
         if let Some(win) = self.window_by_node(node) {
             // `Closed` is the server *asking*: it tears the window

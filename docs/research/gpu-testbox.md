@@ -29,7 +29,8 @@ PSS is the fairer comparison, because shared libraries dominate RSS.
   incomplete". KBL/anv is therefore the development target. HSW is a
   "works, verified narrow slice" tier, with the CPU path as the safety net.
 - **ICD restriction is mandatory.** With the loader's default ICD discovery,
-  llvmpipe maps libLLVM (46.7 MB), and the helper pays 5–7× its real cost.
+  llvmpipe maps libLLVM (46.7 MB), and the helper pays about 3–9× its real cost
+  (≈3× on KBL: 32/10.9 MB; 7–9× on HSW: 63/8.7 MB RSS, 59/6.6 MB PSS).
 - **Vulkan costs far less memory than EGL/GLES on both boxes:** 8–11 MB PSS
   against 38–65 MB PSS. There is no case for a GLES backend.
 - **Planes differ decisively.** KBL scans out VA's Y-tiled NV12 directly. HSW

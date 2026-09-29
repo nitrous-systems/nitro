@@ -1672,9 +1672,6 @@ fn blit_with_opaque_region(
     true
 }
 
-/// The rasterizer's layout for a client's fourcc, or `None` for a format
-/// the server does not accept (it rejected it at `CreateBuffer` time, so
-/// this is belt and braces).
 /// Draw a CPU-composited Surface (#3897): the node's device rect rounded
 /// to whole pixels, the buffer converted by its fourcc. YUV and XR24 are
 /// stores and ignore `item.opacity` in v1 (translucent video is later work,
@@ -1780,6 +1777,9 @@ fn yuv_encoding(color: SurfaceColor) -> YuvEncoding {
     )
 }
 
+/// The rasterizer's layout for a client's fourcc, or `None` for a format
+/// the server does not accept (it rejected it at `CreateBuffer` time, so
+/// this is belt and braces).
 fn pixel_format(fourcc: u32) -> Option<PixelFormat> {
     match fourcc {
         format::XR24 => Some(PixelFormat::Xrgb8888),
