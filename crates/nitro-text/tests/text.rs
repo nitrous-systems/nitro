@@ -211,7 +211,11 @@ fn releasing_the_swash_caches_keeps_output_identical() {
     let key = GlyphKey::new(a.font, a.id, first.size_px, 0.0);
     let mask = atlas.get(&db, key);
     atlas.release_caches();
-    assert_eq!(atlas.get(&db, key), mask, "a packed mask survives a release");
+    assert_eq!(
+        atlas.get(&db, key),
+        mask,
+        "a packed mask survives a release"
+    );
     let renders = atlas.renders();
     if let Some(b) = glyphs.iter().find(|g| g.id != a.id) {
         atlas.get(&db, GlyphKey::new(b.font, b.id, first.size_px, 0.0));
