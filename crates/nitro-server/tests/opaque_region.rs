@@ -1,7 +1,9 @@
 //! `SetOpaqueRegion` (#3877) end to end on the fake backend: the cap is
 //! advertised, the op is refused without it in `ClientCaps`, refused on a
 //! non-image node, and — with it — the server paints the region without
-//! looking at the source alpha (proved by a client that lies).
+//! looking at the source alpha (proved by a client that lies). Since #3919
+//! the same holds for an AR24 buffer presented on a `Surface` node (the
+//! Chromium GPU process's window).
 
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::os::unix::net::UnixStream;
@@ -12,8 +14,10 @@ use std::time::{Duration, Instant};
 use nitro_core::{Color, IRect, Rect, Size};
 use nitro_server::{BackendKind, Config, run};
 use nitro_wire::client::Connection;
-use nitro_wire::msg::{Configure, CreateBuffer, Fill, ServerMsg};
-use nitro_wire::types::{BufferId, ErrorCode, Layer, NodeId, caps, format};
+use nitro_wire::msg::{Configure, CreateBuffer, Fill, PresentSurface, ServerMsg};
+use nitro_wire::types::{
+    BufferId, ColorMatrix, ColorRange, ErrorCode, Layer, NodeId, caps, format,
+};
 
 const OUT: (u32, u32) = (200, 150);
 const SIDE: u32 = 16;
@@ -219,7 +223,7 @@ fn without_the_cap_listed_it_is_a_protocol_error() {
 }
 
 #[test]
-fn on_a_non_image_node_it_is_wrong_kind() {
+fn on_a_node_that_is_neither_image_nor_surface_it_is_wrong_kind() {
     let h = Harness::start("kind");
     let mut conn = h.client("opq");
     conn.client_caps(caps::OPAQUE_REGION).unwrap();
@@ -230,5 +234,62 @@ fn on_a_non_image_node_it_is_wrong_kind() {
         .unwrap();
     conn.flush().unwrap();
     assert_eq!(protocol_error(&mut conn).0, ErrorCode::WrongKind);
+    h.quit();
+}
+
+#[test]
+fn on_a_surface_node_the_region_skips_the_alpha_too() {
+    let h = Harness::start("surface");
+    let mut conn = h.client("opq-surface");
+    conn.client_caps(caps::OPAQUE_REGION | caps::SURFACE).unwrap();
+    let (root, back, surf) = (NodeId(1), NodeId(2), NodeId(3));
+    let stride = SIDE * 4;
+    let pixels: Vec<u8> = (0..stride * SIDE)
+        .map(|i| if i % 4 == 2 { 0xff } else { 0 })
+        .collect();
+    let fd = nitro_shm::memfd_with("nitro-opaque-surface", &pixels).unwrap();
+    let r = Rect::new(0.0, 0.0, SIDE as f32, SIDE as f32);
+    conn.tx()
+        .create_window(root, "opq", Size::new(32.0, 32.0), Layer::Normal)
+        .create_rect(back, root, r)
+        .fill(back, Fill::Solid(Color::WHITE))
+        .create_buffer(CreateBuffer {
+            id: BufferId(1),
+            width: SIDE,
+            height: SIDE,
+            stride,
+            format: format::AR24,
+            size: stride * SIDE,
+            fd,
+        })
+        .create_surface(surf, root, r)
+        .opaque_region(surf, vec![IRect::new(0, 0, 8, 16)])
+        .commit(1)
+        .unwrap();
+    conn.flush().unwrap();
+    let c = expect(&mut conn, "Configure", |m| match m {
+        ServerMsg::Configure(c) if c.window == root => Some(*c),
+        _ => None,
+    });
+    expect(&mut conn, "Presented 1", |m| {
+        matches!(m, ServerMsg::Presented(p) if p.serial == 1).then_some(())
+    });
+    // Through the latch, as the GPU process presents.
+    conn.present_surface(PresentSurface {
+        id: surf,
+        buffer: BufferId(1),
+        serial: 2,
+        src: IRect::new(0, 0, SIDE as i32, SIDE as i32),
+        matrix: ColorMatrix::Bt709,
+        range: ColorRange::Full,
+        damage: vec![],
+    })
+    .unwrap();
+    conn.flush().unwrap();
+    expect(&mut conn, "Presented 2", |m| {
+        matches!(m, ServerMsg::Presented(p) if p.serial == 2).then_some(())
+    });
+    assert_eq!(pixel(&h, &c, 4, 4), [0, 0, 0xff], "copied, alpha ignored");
+    assert_eq!(pixel(&h, &c, 12, 4), [0xff, 0xff, 0xff], "still blended");
     h.quit();
 }

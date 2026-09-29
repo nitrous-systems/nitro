@@ -1755,9 +1755,10 @@ impl Scene {
         }
     }
 
-    /// Declare which pixels of an image node's buffer are fully opaque, in
-    /// buffer pixels; replaces any earlier region, and an empty slice
-    /// clears it. Persists across [`Scene::set_image`] swaps. A painter may
+    /// Declare which pixels of an image or surface node's buffer are fully
+    /// opaque, in buffer pixels; replaces any earlier region, and an empty
+    /// slice clears it. Persists across buffer swaps (`set_image`,
+    /// `set_surface`, a latched `PresentSurface`). A painter may
     /// then copy those pixels instead of blending them (#3877).
     ///
     /// The node is repainted: output only changes if the client lied about
@@ -1765,7 +1766,7 @@ impl Scene {
     ///
     /// # Errors
     /// [`Error::StaleKey`], [`Error::NotOwner`], [`Error::WrongKind`] for a
-    /// node that is not an `Image`.
+    /// node that is neither an `Image` nor a `Surface`.
     pub fn set_opaque_region(
         &mut self,
         client: ClientId,
@@ -1773,7 +1774,10 @@ impl Scene {
         rects: &[IRect],
     ) -> Result<(), Error> {
         let node = self.check_mut(client, key)?;
-        if !matches!(node.data, NodeData::Image(_)) {
+        // Image, and Surface since #3919: Chromium's out-of-process GPU
+        // presents its AR24 window into an exported Surface, and the frame
+        // must keep #3877's opaque copy there.
+        if !matches!(node.data, NodeData::Image(_) | NodeData::Surface(_)) {
             return Err(Error::WrongKind);
         }
         let rects: Vec<IRect> = rects.iter().copied().filter(|r| !r.is_empty()).collect();

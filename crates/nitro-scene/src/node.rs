@@ -442,9 +442,10 @@ pub struct Node {
     /// translation is only a translation of something that was on screen.
     pub(crate) last_output: Option<crate::OutputId>,
 
-    /// `Image` nodes only: rects of the buffer, in buffer pixels, the
-    /// client promised are fully opaque (`SetOpaqueRegion`, #3877). Empty
-    /// for every other node and until set.
+    /// `Image` and `Surface` nodes only: rects of the buffer, in buffer
+    /// pixels, the client promised are fully opaque (`SetOpaqueRegion`,
+    /// #3877, Surfaces since #3919). Empty for every other node and until
+    /// set.
     pub(crate) opaque: Vec<IRect>,
 
     pub(crate) dirty: Dirty,
@@ -568,7 +569,7 @@ impl Node {
         }
     }
 
-    /// The opaque region of an `Image` node, in buffer pixels (see
+    /// The opaque region of an `Image` or `Surface` node, in buffer pixels (see
     /// [`Scene::set_opaque_region`](crate::Scene::set_opaque_region));
     /// empty when none was declared.
     pub fn opaque_region(&self) -> &[IRect] {

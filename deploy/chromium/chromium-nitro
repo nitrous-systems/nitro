@@ -16,12 +16,13 @@
 #   --ozone-platform=nitro  the build's default already (ozone_platform =
 #                           "nitro"), spelled out so a stray flag in a
 #                           `chrome-flags.conf` cannot silently pick another
-#   --disable-gpu --in-process-gpu
-#                           software rendering, and the GPU thread in the
-#                           browser process: nitro scopes buffer and window
-#                           ids per client connection, so an out-of-process
-#                           GPU could create buffers but never attach them
-#                           to the browser's window (docs/chromium.md)
+#   --disable-gpu           software (Skia) raster into shm buffers. The
+#                           GPU process still runs out of process, as on any
+#                           Chromium: it opens its own nitro connection and
+#                           presents into each window through the Surface the
+#                           browser exports (#3919, docs/chromium.md). Add
+#                           `--in-process-gpu` to go back to the browser
+#                           presenting (the #3778 path)
 #   --class=chromium-nitro  the window's app id, which is what the bar and
 #                           the title bar look an icon up by; it must equal
 #                           the .desktop file's basename (see that file)
@@ -37,7 +38,6 @@ export CHROME_DESKTOP=chromium-nitro.desktop
 exec "$d/chrome" \
     --ozone-platform=nitro \
     --disable-gpu \
-    --in-process-gpu \
     --class=chromium-nitro \
     --user-data-dir="$HOME/.config/chromium-nitro" \
     "$@"

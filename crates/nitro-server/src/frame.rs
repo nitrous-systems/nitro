@@ -1187,9 +1187,12 @@ fn fill_overlaid(
 /// 1:1, pixel-aligned, at opacity 1 (the only mapping under which the
 /// region's pixels land on whole device pixels unblended).
 fn opaque_region_device(scene: &Scene, item: &PaintItem) -> Vec<IRect> {
-    let PaintKind::Image {
+    let (PaintKind::Image {
         size, buffer, src, ..
-    } = item.kind
+    }
+    | PaintKind::Surface {
+        size, buffer, src, ..
+    }) = item.kind
     else {
         return Vec::new();
     };
@@ -1751,7 +1754,12 @@ fn paint_surface(
             };
             let one_to_one = dst.w == src.w && dst.h == src.h;
             if desc.format == format::AR24 {
-                canvas.blit(clip, &exact, &image, &src, item.opacity);
+                // A declared opaque region (#3919: Chromium's GPU process
+                // presents its CSD window here) takes the copy path.
+                let opaque = scene.node(item.node).map_or(&[][..], |n| n.opaque_region());
+                if !blit_with_opaque_region(canvas, clip, item, &exact, &image, &src, opaque) {
+                    canvas.blit(clip, &exact, &image, &src, item.opacity);
+                }
             } else if one_to_one {
                 canvas.blit(clip, &dst.to_rect(), &image, &src, 1.0);
             } else {
