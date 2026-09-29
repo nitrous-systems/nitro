@@ -1658,6 +1658,44 @@ kernel (`AllocSurfaceBuffersFailed { Failed }`: i915 on Gen7 rejects an
 NV12 framebuffer at `AddFB2`), and the demo fell back to memfds as
 designed.
 
+## Planes (#3899)
+
+The `planes` module (`crates/nitro-server/src/planes.rs`) puts a visible
+Surface with a KMS framebuffer on a hardware plane. Its later frames flip
+with `commit_planes`: no raster, no copy. The runs below use `nitro-demo
+--video --scanout` at 60 fps. Server CPU is utime+stime over 10 s after a
+10 s warm-up (100 ticks = one core-second). `plane_flips`/`paints` are
+deltas over the same 10 s.
+
+**box1** (HSW, 1920×1080, YUYV: the overlay's format):
+
+| run | mode | server CPU | plane flips | paints |
+|---|---|---|---|---|
+| 1080p fullscreen, `--no-controls` | 3 (overlay, primary off) | **2.0 %** | 602 | 0 |
+| 720p windowed, `--no-controls` | 1 (overlay above the UI) | **2.1 %** | 602 | 0 |
+| 720p windowed, control bar over it | 0 (composite) | 7.1 % | 0 | 602 |
+| 1080p fullscreen, control bar over it | 0 (composite) | 12.0 % | 0 | 602 |
+
+**testhost2** (KBL, 2560×1440, NV12):
+
+| run | mode | server CPU | plane flips |
+|---|---|---|---|
+| 1080p fullscreen, upscaled on the primary | 3 | 2.7 % | 602 |
+| 720p fullscreen (2× upscale) | 3 | 2.7 % | 601 |
+| 720p windowed, `--no-controls` | 1 (overlay above) | 2.9 % | 602 |
+| 720p windowed, control bar over it | 1 (**underlay by primary swap**: video on the primary, AR24 UI with a hole on the overlay) | 3.1 % | 580 |
+
+HSW has no underlay, so any nitro content over the video puts it back on
+the CPU path (the #3897 numbers above). What remains in the ~2 % is the
+per-frame wire/latch/flip work and the demo's own commits. A plane frame
+is never painted (`samples paint` unchanged over the window).
+
+**Cost.** The server binary is +44 KB (3 282 800 → 3 326 880 bytes,
+release, x86-64), 4 KB over the +40 KB budget. The module is ~500 lines
+plus glue. Heap: at most 8 cached decisions per output (each a few
+`PlaneConfig`s), under 2 KB, so RssAnon does not move. Buffers are the
+#3914 scanout buffers, already counted above.
+
 ## Client dma-bufs (#3918)
 
 Release builds, stripped, with main `a769355` as the base:

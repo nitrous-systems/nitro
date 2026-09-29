@@ -109,6 +109,61 @@ YUYV/UYVY or as helper-converted XRGB.
 - A mode switch loses the age-2 buffer history, so it costs **one full
   repaint**. That cost is why hysteresis matters.
 
+### As built (#3899)
+
+`planes::Planner::decide` runs in `Server::paint` before anything is
+rasterized. Its inputs:
+
+- candidates from the paint list: Surfaces whose buffer has a KMS
+  framebuffer (server-allocated, or a KMS-imported dma-buf), of an opaque
+  format, axis-aligned, at opacity 1;
+- for each candidate, whether any later item or the software cursor
+  touches its visible rect (*obscured*).
+
+Strategies, in order, each pre-filtered by `IN_FORMATS`, the scale rule
+(never below 0.94×) and the plane's `COLOR_ENCODING`/`COLOR_RANGE`, then
+`TEST_ONLY`'d:
+
+1. **Direct (mode 3):** an unobscured Surface covering the output goes on
+   the primary, else on an overlay with the primary off (HSW).
+2. Greedy from the topmost Surface:
+   - **overlay-above** (unobscured only; no alpha needed);
+   - **underlay by mutable zpos** (AMD-like);
+   - **underlay by primary swap**: the Surface on the primary, the UI as
+     AR24 on an overlay (KBL).
+3. **Composite (mode 0).**
+
+Placed Surfaces are flagged `on_plane` and paint as holes. While a
+Surface is flagged, the scene ignores its buffer changes: they damage
+nothing. The output scans out AR24 only for underlays.
+
+**Cache and hysteresis.** Decisions are cached per shape signature
+(buffer ids excluded; ≤ 8 per output), so steady state asks nothing of
+the kernel. Fewer planes applies at once. More planes needs the same
+shape for 15 decisions **and** 250 ms. A shape change invalidates the
+output (a full repaint); a layout that fails at commit time falls back
+to composite and is pinned there.
+
+**Release rule.** A `BufferReleased` for a buffer whose framebuffer a
+committed layout reads is held (`plane_releases_held`) until
+`take_released_buffers` reports it, i.e. until the replacing flip lands.
+A modeset (resume, rescan, `set_modes`, another output lighting) resets
+every decision.
+
+**IN_FENCE_FD** is not used yet. Every placed frame latched after its
+fence signalled, and server-allocated buffers are CPU-written. The hook
+point is in `Server::apply_decision`.
+
+**SurfaceHint** reports YUYV where a plane lists YUYV but none lists
+NV12 (HSW), and NV12 otherwise. `AllocSurfaceBuffers` with format 0
+takes `planes::alloc_format`: NV12, else YUYV, else XR24.
+
+Stats: `planes_mode` (max over outputs), `planes_in_use`,
+`planes_candidates`, `planes_obscured`, `planes_tests`,
+`planes_cache_hits`, `planes_fallbacks`, `planes_switches`,
+`plane_flips`, `plane_releases_held`. Numbers:
+[`budget.md`](budget.md) "Planes (#3899)".
+
 ## Fallback chain for one Surface
 
 1. its own plane, or direct scanout;

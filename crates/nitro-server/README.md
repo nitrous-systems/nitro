@@ -1398,3 +1398,16 @@ links only. A client dma-buf (#3918, `src/dmabuf.rs`) that is not
 CPU-readable paints as `HOLE_PLACEHOLDER` grey; frames wait in the latch
 queue (up to 4 per node) until their acquire fence signals, which the
 server learns from epoll (`TOK_FENCE_BASE`), never by blocking.
+
+## Planes (#3899)
+
+`src/planes.rs` decides, per output and per paint, which visible Surfaces
+go on hardware planes: direct scanout (mode 3), overlay-above, or
+underlay by zpos or by primary swap (mode 1). Everything else is
+composited (mode 0). The module is pure, with a `TEST_ONLY` callback, and
+is unit-tested against fake-backend profiles shaped like HSW, KBL, AMD
+and Gen11. `Server::plan_planes` stages the decision. A frame of a placed
+Surface flips with `commit_planes`, with no paint. `BufferReleased` for a
+buffer still on a plane waits for the replacing flip. Design and stats:
+`docs/surfaces.md` "As built (#3899)"; measurements: `docs/budget.md`
+"Planes (#3899)". End-to-end tests: `tests/planes.rs`.
