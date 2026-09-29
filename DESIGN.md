@@ -96,6 +96,7 @@ Sub-modules, each a contained blob behind a narrow trait:
   netlink (raw socket, no libudev). Buffers are **dumb buffers** by default
   (works everywhere, zero Mesa); a `gpu` feature adds Vulkan (`ash`) images
   exported as dma-bufs behind the same `Buffer + Fence → Plane` interface.
+  Plane discovery and `TEST_ONLY` commits: see [`docs/surfaces.md`](docs/surfaces.md).
 - **scene** — the retained tree. Node kinds: `Group{transform, clip,
   opacity}`, `Rect{rrect, fill, border}`, `Text{run, colour, align}`, `Image{buf,
 
@@ -111,7 +112,9 @@ Sub-modules, each a contained blob behind a narrow trait:
   thin and every app binary small.
 - **planes** — decides per frame whether a node can be scanned out directly
   (fullscreen surface, video, cursor) instead of composited. Zero-copy
-  scanout is the single largest power win on phones.
+  scanout is the single largest power win on phones. The `Surface` node,
+  per-output modes and the fallback chain are in
+  [`docs/surfaces.md`](docs/surfaces.md).
 - **input** — `libinput` for devices; routing by hit-testing the scene;
   keyboard via `xkbcommon`. Pointer/touch/pen/keyboard unified into one
   small event enum. Gestures (pinch, swipe) are recognised in the server so
@@ -919,7 +922,9 @@ client that speaks its four-message socket protocol, hosted by
     answering a question that cannot be asked; `icon_refusals` in
     `stats` is how the server would say that reasoning was wrong.
 
-- **M5** — Wayland adapter; GPU backend.
+- **M5** — Wayland adapter; GPU backend. The GPU backend is a separate
+  `nitro-gpu` helper process that only composites finished buffers; the
+  design and ordered work plan are in [`docs/surfaces.md`](docs/surfaces.md).
 
 ## What we take from the old repo
 
