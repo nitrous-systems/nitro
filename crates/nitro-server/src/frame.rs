@@ -218,7 +218,8 @@ impl Storage {
     fn memfd(len: usize) -> Result<Self, String> {
         const PAGE: usize = 4096;
         let padded = len.max(1).div_ceil(PAGE) * PAGE;
-        let fd = nitro_shm::create_sealed("nitro-shadow", padded as u64).map_err(|e| e.to_string())?;
+        let fd =
+            nitro_shm::create_sealed("nitro-shadow", padded as u64).map_err(|e| e.to_string())?;
         let map = nitro_shm::MappingMut::map_mut(std::os::fd::AsFd::as_fd(&fd), padded)
             .map_err(|e| e.to_string())?;
         Ok(Self::Memfd { fd, map, len })
@@ -257,9 +258,7 @@ impl Shadow {
         // the scanout buffer's is often padded.
         // Rebuilt in the same kind of storage: a shadow the GPU helper
         // imported stays a memfd (the caller re-imports it, #3922).
-        let data = self
-            .data
-            .same_kind((stride as usize) * (height as usize));
+        let data = self.data.same_kind((stride as usize) * (height as usize));
         *self = Self {
             width,
             height,
@@ -420,7 +419,8 @@ impl Shadow {
             if left == 0 && cols == width && src_stride == dst_stride {
                 let start = (top as usize) * src_stride;
                 let len = (rows as usize) * src_stride;
-                dst.data[start..start + len].copy_from_slice(&self.data.bytes()[start..start + len]);
+                dst.data[start..start + len]
+                    .copy_from_slice(&self.data.bytes()[start..start + len]);
                 continue;
             }
             for row in top..top + rows {

@@ -176,7 +176,10 @@ impl Decision {
 
     /// Every Surface shown by a plane or the helper.
     pub fn nodes(&self) -> impl Iterator<Item = NodeKey> + '_ {
-        self.placed.iter().map(|(n, _)| *n).chain(self.gpu.iter().copied())
+        self.placed
+            .iter()
+            .map(|(n, _)| *n)
+            .chain(self.gpu.iter().copied())
     }
 
     /// The framebuffers the layout reads.
@@ -451,12 +454,7 @@ pub fn gpu_decision(
             }
         }
     }
-    d.gpu = inp
-        .gpu
-        .iter()
-        .copied()
-        .filter(|n| !d.places(*n))
-        .collect();
+    d.gpu = inp.gpu.iter().copied().filter(|n| !d.places(*n)).collect();
     if d.gpu.is_empty() {
         return None;
     }
@@ -712,9 +710,8 @@ impl Planner {
         want.rebind(inp.candidates, inp.helper);
         // Leaving mode 2 for a plane layout is an upgrade too (#3922):
         // each switch is a full repaint.
-        let leaves_gpu = self.current.mode == Mode::Gpu
-            && want.mode != Mode::Gpu
-            && !want.placed.is_empty();
+        let leaves_gpu =
+            self.current.mode == Mode::Gpu && want.mode != Mode::Gpu && !want.placed.is_empty();
         if std::mem::take(&mut self.immediate)
             || (want.placed.len() <= self.current.placed.len() && !leaves_gpu)
             || self.current_sig == Some(sig)

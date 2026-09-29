@@ -6622,8 +6622,7 @@ impl Server {
                 // The helper is non-dumpable: its memory comes from its
                 // own `Stats`, answered after this reply (the previous
                 // answer is reported).
-                self.gpu
-                    .query_stats(&EpollPoll(&self.epoll), TOK_GPU);
+                self.gpu.query_stats(&EpollPoll(&self.epoll), TOK_GPU);
                 self.stats_reply()
             }
             Ok(Request::Shot(name)) => self.shot(name.as_deref()),
@@ -12486,7 +12485,9 @@ impl Server {
                 modifier,
                 slots,
             } => self.gpu_import_ring(size, fourcc, modifier, &slots),
-            gpu::Reply::RingFailed => warn!("gpu helper: no output ring; mode 2 off for this output"),
+            gpu::Reply::RingFailed => {
+                warn!("gpu helper: no output ring; mode 2 off for this output");
+            }
             gpu::Reply::ShadowRefused => {
                 warn!("gpu helper: shadow import refused; mode 2 off for this output");
             }
@@ -12725,8 +12726,9 @@ impl Server {
             return;
         }
         let scene = &self.scene;
-        self.gpu
-            .prune(&EpollPoll(&self.epoll), TOK_GPU, |k| scene.buffer(k).is_ok());
+        self.gpu.prune(&EpollPoll(&self.epoll), TOK_GPU, |k| {
+            scene.buffer(k).is_ok()
+        });
     }
 
     /// The first time output `index` wants mode 2: its shadow into a
@@ -12851,8 +12853,12 @@ impl Server {
         self.gpu_drop_owner(false);
         let poll = EpollPoll(&self.epoll);
         if let Some(id) = shadow {
-            self.gpu
-                .send(&poll, TOK_GPU, &nitro_gpu::ToHelper::Release { id }, Vec::new());
+            self.gpu.send(
+                &poll,
+                TOK_GPU,
+                &nitro_gpu::ToHelper::Release { id },
+                Vec::new(),
+            );
         }
         self.gpu.release_all(&poll, TOK_GPU);
     }
@@ -13101,10 +13107,7 @@ impl Server {
         let mut layers = Vec::with_capacity(layers_in.len() + 1);
         let mut keys = Vec::with_capacity(layers_in.len());
         for l in &layers_in {
-            let Some(tex) = self
-                .gpu
-                .texture(&poll, TOK_GPU, l.key, l.encoding, l.range)
-            else {
+            let Some(tex) = self.gpu.texture(&poll, TOK_GPU, l.key, l.encoding, l.range) else {
                 continue;
             };
             layers.push(nitro_gpu::proto::Layer {
@@ -13231,7 +13234,10 @@ impl Server {
     /// Output `index`'s helper inputs for the planner, and whether it
     /// wants the helper at all. Starts it (on demand) or prepares the
     /// output's resources (first entry) as needed.
-    fn gpu_inputs(&mut self, index: usize) -> (Vec<nitro_scene::NodeKey>, Option<nitro_kms::BufferId>) {
+    fn gpu_inputs(
+        &mut self,
+        index: usize,
+    ) -> (Vec<nitro_scene::NodeKey>, Option<nitro_kms::BufferId>) {
         let id = self.outputs[index].kms_id;
         if !self.gpu.enabled()
             || self.outputs[index].shadow.is_none()
@@ -13514,4 +13520,3 @@ mod tests {
         }
     }
 }
-

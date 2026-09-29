@@ -149,6 +149,8 @@ closed.
 | `NITRO_FONT_DIRS` | colon-separated font directories | `/usr/share/fonts:/usr/local/share/fonts:~/.local/share/fonts` (read by `nitro-text`) |
 | `NITRO_FONT_CACHE_MB` | cap on resident font-file bytes | `8` (read by `nitro-text`; `0` keeps only the file currently in use — the file that overran the cap is never its own victim, so a too-small cap does not turn into one disk read per glyph) |
 | `NITRO_FONT_INDEX_CACHE` | path of the font index cache, or `off` | `$XDG_CACHE_HOME/nitro/fonts.idx` (read by `nitro-text`) |
+| `NITRO_GPU`       | `0`, `1`, `ondemand`             | `server.conf`'s `gpu.helper`, else `on`: the GPU helper (#3922, composite mode 2). See `docs/surfaces.md` § As built: mode 2. |
+| `NITRO_GPU_HELPER` | helper binary path              | `nitro-gpu-vulkan` next to the server binary, else `$PATH` |
 | `NITRO_LOG`       | `error`, `warn`, `info`, `debug` | `info`                         |
 
 The keyboard layout comes from the `XKB_DEFAULT_{RULES,MODEL,LAYOUT,VARIANT,OPTIONS}`
@@ -175,6 +177,9 @@ keyboard.options = ctrl:nocaps
 
 theme.scheme = dark
 theme.accent = #6ca8f0
+
+gpu.helper    = on          # on | off | on-demand (NITRO_GPU wins)
+gpu.idle_exit = 30          # seconds, on-demand only
 ```
 
 ### Precedence
@@ -1003,6 +1008,22 @@ The key naming is inconsistent on purpose — `paint_us_min` but
 format outranks tidiness. There is no histogram and no percentile:
 percentiles over 120 samples are mostly noise, and a real latency
 distribution needs a real sampling story, which is a later decision.
+
+### GPU helper (#3922)
+
+`planes_mode` is 2 while an output is composited by the helper.
+
+| key | meaning |
+|---|---|
+| `gpu_state` | 0 off, 1 starting, 2 ready, 3 backing off, 4 gave up |
+| `gpu_spawns`, `gpu_crashes`, `gpu_fallbacks` | helper starts; deaths that were not a clean idle exit; outputs thrown out of mode 2 by one |
+| `gpu_frames`, `gpu_busy_slots`, `gpu_refused_frames` | frames composited; paints deferred for want of a free ring slot; frames the helper refused |
+| `gpu_composite_us_avg`, `gpu_composite_us_max` | `Composite` sent → `Composited` received, last 120 frames |
+| `gpu_busy_us` | sum over frames of fence signalled − submit (GPU-awake time, as the server sees it) |
+| `gpu_textures`, `gpu_import_refused` | textures the helper holds for client buffers; imports it refused |
+| `gpu_releases_held`, `gpu_fences_pending` | `BufferReleased`s waiting on a helper frame; frames whose fence has not signalled |
+| `gpu_ring_slots` | ring slots imported (0 until an output enters mode 2) |
+| `gpu_helper_rss`, `gpu_helper_pss`, `gpu_helper_drm_total` | from the helper's last `Stats` (asked for on every `stats`, so one query behind) |
 
 ## VT-switch contract
 

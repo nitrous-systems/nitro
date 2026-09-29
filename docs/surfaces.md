@@ -347,8 +347,7 @@ GLES backend can be added without touching the server. Tested headless
 by readback on both boxes (9/9 on hasvk and anv; `just box-gpu-test`).
 The shadow reaches the GPU by **memfd → udmabuf** (zero copy) when
 `/dev/udmabuf` opens, else by damage-rect copies through a staging
-buffer. seccomp (and `no_new_privs`) is deferred. Not yet wired into
-nitro-server; that is the integration task after the planes module.
+buffer. seccomp (and `no_new_privs`) is deferred. Wired into nitro-server as mode 2 by #3922 (below).
 Measured footprint: [`budget.md`](budget.md) § GPU helper.
 
 A **separate process**, started with the session and **running by default**.
@@ -406,6 +405,53 @@ remainder.
 - It is needed mainly for overlapping GPU windows from different clients
   (a desktop of Wayland/Chromium windows) once planes run out. A single
   video or a fullscreen game should never need it.
+
+### As built: mode 2 in the server (#3922)
+
+`crates/nitro-server/src/gpu.rs` supervises the helper and
+`planes.rs` decides mode 2 (`Mode::Gpu`, `planes_mode 2`):
+
+- **Which Surfaces.** A visible, opaque, axis-aligned Surface whose buffer
+  is a dma-buf the helper samples: a client `CreateDmabufBuffer`, or a
+  server-allocated scanout buffer (`export_buffer`). The planner takes
+  planes first (overlay-above only in mode 2); what is left goes to the
+  helper. shm/memfd Surfaces stay on the CPU path (importing them through
+  udmabuf is a follow-up).
+- **Layout.** The primary shows a slot of the helper's ring (XR24, one
+  `AddFB2` per slot at allocation) with the frame's `sync_file` as
+  `IN_FENCE_FD`; overlays above it may still carry unobscured Surfaces.
+  The helper draws the composited Surfaces bottom-first as opaque quads
+  and the shadow on top (`PremulOver`); those Surfaces paint as holes in
+  the shadow. The dumb output buffer is not on screen.
+- **Never waits.** `paint` rasterizes into the shadow, sends
+  `UploadDamage` + `Composite{slot, damage, layers}` and returns. The
+  commit happens when `Composited` arrives (or at the next `Flipped` if a
+  flip is pending). The damage is the raster region plus every helper
+  layer that changed or moved; the helper adds buffer age. With no free
+  slot the damage is kept and retried; nothing blocks.
+- **Borrowed buffers.** A `BufferReleased` for a buffer an unsignalled
+  helper frame samples is held until that frame's fence signals (a dup is
+  in epoll). Textures are imported lazily on first use and `Release`d when
+  the buffer goes. An import the helper refused marks the buffer
+  CPU/placeholder.
+- **Hysteresis.** Mode 2 goes through the same rules. Entering it with more
+  planes in use waits 15 decisions and 250 ms; leaving it for a plane
+  layout is an upgrade too, and waits the same way. A switch in or out
+  invalidates the output (full repaint).
+- **Supervision.** Spawned with the socket on fd 0. `Hello` must be
+  answered in 2 s, and a `Composite` within 250 ms, or the helper is
+  killed. Restarts back off 100 ms doubling to 30 s (reset after 60 s
+  healthy); after 5 crashes in 5 min the server gives up until a VT
+  resume or SIGHUP. Death in mode 2 falls back at once, skipping the
+  hysteresis: planes for what fits, CPU for linear buffers, the
+  placeholder otherwise, with a full repaint. A VT switch stops the
+  helper; the resume restarts it. `gpu.helper = on-demand` spawns on the
+  first mode-2 decision and releases everything when leaving mode 2, so
+  the helper can idle-exit.
+- **Limits.** The protocol has one output ring, so only one output is in
+  mode 2 at a time (the others use planes/CPU). The ring lives as long as
+  the helper. Entering mode 2 moves that output's shadow into a sealed
+  memfd: the same 8 MB, counted as RssShmem instead of RssAnon.
 
 ## Video decode belongs to clients
 
@@ -509,7 +555,7 @@ In order; tasks carry the `surface` tag on the task board.
    #3918 (refiled from #3900). **Built**; see "As built: client
    dma-bufs" above.
 7. Overview thumbnail atlas — #3902.
-8. `nitro-gpu` helper, always-on by default — #3901 → **#3920 built standalone** (crates + headless pixel tests); server integration follows the planes module.
+8. `nitro-gpu` helper, always-on by default — #3901 → **#3920 built standalone** (crates + headless pixel tests); **#3922 integrated as mode 2** (above; fake-helper tests, hardware verification pending).
 
 Alongside, and feeding into the items above:
 

@@ -33,6 +33,13 @@ changed every other binary's bytes (measured), so it waits for seccomp.
 Both are the next hardening step. The allowlist is small: ioctl on the render node,
 mmap/munmap, futex, memfd_create, poll, sendmsg/recvmsg, close, exit.
 
+## In nitro-server (#3922)
+
+nitro-server spawns and supervises the helper (`crates/nitro-server/src/gpu.rs`)
+and uses it as composite mode 2: see `docs/surfaces.md` § As built: mode 2.
+Its tests run `nitro_gpu::run` with `fake::FakeBackend` on a thread
+(`Config::gpu_spawner`), so the fake is linked only by tests.
+
 ## Protocol
 
 These are `nitro-wire` frames: an 8-byte header, and fds on the header's

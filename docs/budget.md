@@ -1696,6 +1696,32 @@ plus glue. Heap: at most 8 cached decisions per output (each a few
 `PlaneConfig`s), under 2 KB, so RssAnon does not move. Buffers are the
 #3914 scanout buffers, already counted above.
 
+## GPU helper in the server (#3922)
+
+Stated budget: server binary +≤80 KB, RssAnon +≤200 KB, helper
+byte-identical, other binaries byte-identical.
+
+- **Server binary: +140 KB** (3 337 416 → 3 481 184 bytes, release,
+  x86-64), **60 KB over budget**. Most of it is the `nitro-gpu` codec
+  (every message's encode and decode, `DeviceInfo` tables) plus
+  `gpu.rs` and the mode-2 frame path. A follow-up could split the codec
+  so the server links only the halves it uses (encode `ToHelper`,
+  decode `FromHelper`).
+- **RssAnon:** the texture map, the fence dups and the ring bookkeeping
+  are a few KB. The shadow of the output in mode 2 moves from RssAnon to
+  RssShmem (8 MB at 1080p, page-padded), only on an output that has
+  entered mode 2.
+- **nitro-gpu-vulkan and nitro-gpu:** unchanged, so byte-identical. Other
+  binaries do not link `nitro-server` and are unchanged.
+- **Helper process** (always-on, `gpu.helper = on`): ~11–13 MB RSS /
+  ~7 MB PSS idle, and 33–42 MB driver memory while compositing (#3920
+  numbers). The server reports the live figures as `gpu_helper_rss`,
+  `gpu_helper_pss` and `gpu_helper_drm_total`. `gpu.helper = on-demand`
+  pays this only while something is composited; `off` pays nothing.
+- **Not yet measured on testhost2**: composite latency
+  (`gpu_composite_us_*`), GPU-awake time (`gpu_busy_us`), and helper
+  RSS with two overlapping videos.
+
 ## Client dma-bufs (#3918)
 
 Release builds, stripped, with main `a769355` as the base:

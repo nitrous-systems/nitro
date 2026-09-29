@@ -58,8 +58,12 @@ fn kbl() -> Vec<FakePlaneSpec> {
         .scale_limits(90, 800)
     };
     vec![
-        p(FakePlaneSpec::primary()).zpos(0, 0, 0, true).in_fence(true),
-        p(FakePlaneSpec::overlay()).zpos(1, 1, 1, true).in_fence(true),
+        p(FakePlaneSpec::primary())
+            .zpos(0, 0, 0, true)
+            .in_fence(true),
+        p(FakePlaneSpec::overlay())
+            .zpos(1, 1, 1, true)
+            .in_fence(true),
     ]
 }
 
@@ -383,23 +387,27 @@ fn a_buffer_the_helper_samples_is_released_after_its_fence() {
     // From now on fences stay pending until signalled by hand.
     h.fake.state().auto_signal = false;
     s.seen.clear();
+    // X: the first buffer of A a pending-fence frame samples. The next
+    // step replaces it; its release must wait for that fence.
+    let x = s.a[s.serial as usize % 3].id;
     s.step();
     s.step();
     wait_for("a held release", || h.stat("gpu_releases_held") > 0);
-    // A buffer of A was replaced; its release waits for the fence.
-    let released_a = |seen: &[ServerMsg]| {
-        seen.iter().any(|m| {
-            matches!(m, ServerMsg::BufferReleased(r) if (10..13).contains(&r.id.raw()))
-        })
+    let released_x = |seen: &[ServerMsg]| {
+        seen.iter()
+            .any(|m| matches!(m, ServerMsg::BufferReleased(r) if r.id == x))
     };
     let _ = s.conn.poll(&mut s.seen);
-    let before = released_a(&s.seen);
+    assert!(
+        !released_x(&s.seen),
+        "released before its fence: {:?}",
+        s.seen
+    );
     while h.fake.signal() {}
     wait_for("the release", || h.stat("gpu_releases_held") == 0);
-    expect(&mut s.conn, &mut s.seen, "A's release", |m| {
-        matches!(m, ServerMsg::BufferReleased(r) if (10..13).contains(&r.id.raw())).then_some(())
+    expect(&mut s.conn, &mut s.seen, "X's release", |m| {
+        matches!(m, ServerMsg::BufferReleased(r) if r.id == x).then_some(())
     });
-    let _ = before;
     h.fake.state().auto_signal = true;
     while h.fake.signal() {}
     h.quit();

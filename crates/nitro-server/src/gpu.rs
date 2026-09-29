@@ -635,7 +635,16 @@ impl Helper {
                 match conn.next_reply() {
                     Ok(Some((msg, fds))) => {
                         any = true;
-                        if let Some(r) = Self::decode(&mut self.state, &mut self.info, &mut self.ring, &mut self.texs, &mut self.counters, &mut self.last_stats, msg, fds) {
+                        if let Some(r) = Self::decode(
+                            &mut self.state,
+                            &mut self.info,
+                            &mut self.ring,
+                            &mut self.texs,
+                            &mut self.counters,
+                            &mut self.last_stats,
+                            msg,
+                            fds,
+                        ) {
                             out.push(r);
                         }
                     }
@@ -1028,7 +1037,14 @@ impl Helper {
 
     /// Frame `serial`'s fence: keep a dup (in epoll under `token`) until
     /// it signals.
-    pub fn keep_fence(&mut self, poll: &dyn Poll, token: u64, serial: u64, fence: &OwnedFd, sent: Instant) {
+    pub fn keep_fence(
+        &mut self,
+        poll: &dyn Poll,
+        token: u64,
+        serial: u64,
+        fence: &OwnedFd,
+        sent: Instant,
+    ) {
         match fence.try_clone() {
             Ok(dup) => {
                 poll.add(dup.as_fd(), token, false);
@@ -1167,7 +1183,10 @@ mod tests {
         }
         let mut b = Backoff::default();
         for i in 0..12u64 {
-            assert!(b.crashed(t0 + Duration::from_secs(i * 80), Duration::ZERO).is_some());
+            assert!(
+                b.crashed(t0 + Duration::from_secs(i * 80), Duration::ZERO)
+                    .is_some()
+            );
         }
         assert_eq!(b.next, Some(BACKOFF_MAX));
     }
