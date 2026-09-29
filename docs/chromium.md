@@ -76,7 +76,7 @@ All of this was verified on a fake-backend nitro server (1280x720@60), driven by
 
 - **GPU rendering** without a readback: the zero-copy dma-buf path is the follow-up task "Chromium Ozone nitro: GPU rendering via dma-buf". Until then GPU raster exists only as the `NITRO_GPU_READBACK=1` measurement knob (see [Out-of-process GPU measurements](#out-of-process-gpu-measurements-3919)).
 - **Drag-resize** can show one stretched frame while the GPU process catches up (see Architecture).
-- **HiDPI:** only scale 1 was exercised. The model is nitro logical = DIP, buffers = physical px, and scale comes from `OutputInfo`.
+- **HiDPI:** nitro logical = DIP, buffers = physical px, scale from `OutputInfo`. Since #3940 every logical size Chromium sends (`CreateWindow.size`, `CreatePopup.size`, the root/Image/Surface `SetBounds`) is the exact float `px / scale`, divided rather than multiplied by `1/scale` and not ceiled. At 1.25, `f32(px/1.25)*1.25 == px` for every integer px below 4000, so the server maps the buffer back to exactly its own size. The server snaps window roots to whole device pixels, so the buffer is drawn 1:1 (opaque copy, no resampling) at a fractional scale; see §testhost2 (#3940).
 - **Popup types:** `kPopup`/`kBubble` windows are nitro popups too; there is no subsurface equivalent. They are placed by the server, and only `kMenu` grabs.
 - **Drag and drop:** not wired. `platform_shows_drag_image=false`, and DnD start is a no-op.
 - **Clipboard:** not verified end to end.
@@ -171,15 +171,46 @@ page load), paint 26 µs. That matches the in-process 1.8 % / 4 frames/s.
 
 ### testhost2: i5-8250U, UHD 620 (KBL), eDP 2560×1440@60
 
-At the box's usual **scale 1.25**, every arm is limited by the server,
-not by Chromium. The window is about 1.4 Mpx, and at a fractional scale
-the Surface/Image is not drawn 1:1, so #3877's opaque copy never applies
-and the whole window is blended and scaled: paint is about 21–26 ms per
-frame, for 14–16 fps in every arm (inproc 16.0, oop 14.3–15.2, gpu 16.0;
-i2p p50 40–44 ms). That is a separate server issue (scaled-blend cost at
-fractional scale, the same family as #3927) and says nothing about the
-GPU process. The arms were therefore re-run at **scale 1**, which
-`server.conf` restored afterwards:
+**Scale 1.25 (the box's usual setting), #3940.** Before #3940, every arm
+was limited by the server rather than by Chromium. At a fractional
+scale, a window at a logical position that is not a multiple of 4 had a
+fractional device origin. On top of that, the out-of-process path
+ceiled its logical size, so `ceil(px/1.25)*1.25 != px`. Either one
+meant the ~1.4 Mpx Surface/Image was not drawn 1:1: #3877's opaque copy
+never applied, and the whole window was blended and scaled (21–26 ms of
+paint per frame, 14–16 fps in every arm). #3940 fixes both. The server
+rounds each window root's device origin to a whole pixel
+(`Scene::root_placement`), and Chromium sends `px/scale` exactly (see
+HiDPI above). The same scroll, before and after (temporary nitro-dev
+unit, `NITRO_SCALE=eDP-1=1.25`, 2 runs each):
+
+| arm (scale 1.25) | fps | frame p50/p95/max ms | i2p p50/p95/max ms | server paint mean | server i2p mean |
+|---|---|---|---|---|---|
+| inproc, before | 16.2 | 33.3/33.3/33.3 | 42.1–42.7/48.8–49.5/62.7–70.1 | 20.9–21.2 ms | 42.3 ms |
+| oop, before | 15.2–15.4 | 33.3/50.0/50.0 | 41.4–43.3/57.9–58.0/67.2–69.4 | 20.9–21.8 ms | 42.7–42.9 ms |
+| **inproc, after** | 31.0–31.2 | 16.7/16.7/16.7–33.3 | 24.6–24.8/31.9–32.1/32.8–33.9 | 1.12 ms | 25.0–25.3 ms |
+| **oop, after** | 31.5–31.7 | 16.7/16.7/16.7 | 24.7–25.5/32.0–32.8/32.7–38.2 | 1.00–1.02 ms | 25.1 ms |
+| new server, old chrome: inproc | 31.4 | 16.7/16.7/16.7 | 24.7/32.0/33.2 | 1.11 ms | 25.1 ms |
+| new server, old chrome: oop | 15.8 | 33.3/50.0/– | 41.1/59.1/73.1 | 17.1 ms | 36.3 ms |
+
+(One oop run's frame max, 1.6 s, is the idle gap before the scroll.) Both
+parts are needed. The in-process path already sent exact `px/scale`
+bounds, so the server snap alone fixes it. The out-of-process path also
+needs the Chromium change. After the fix, 1.25 matches scale 1: ~31 fps,
+which is the event rate, as at scale 1 below. Memory and CPU are
+unchanged. At **scale 1** after #3940: inproc 31.4 fps, paint 1.22 ms,
+i2p p50 25.1; oop 31.5 fps, paint 1.02 ms, i2p p50 25.1. That is the
+same as the table below, so there is no regression. Text at 1.25 is
+Chromium's own device-resolution raster, copied 1:1, so it is exactly
+as crisp as Chromium drew it. A `nitro-shot` crop is sharp. Against the
+old chrome's near-1:1 resample (a buffer about 1 px off), the difference
+is too small to see at 8× zoom: the Laplacian means are 0.210 and 0.213.
+So the screenshot shows the text is crisp, but it does not prove the
+copy path. The paint time does: 1 ms for a copy against 17–21 ms for a
+scaled blend.
+
+The pre-#3940 arms were also run at **scale 1**, which `server.conf`
+restored afterwards:
 
 | arm (scale 1) | fps | frame p50/p95/max ms | i2p p50/p95/max ms | server paint mean | browser PSS / RSS | GPU proc PSS / RSS | tree PSS | chrome CPU |
 |---|---|---|---|---|---|---|---|---|

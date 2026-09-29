@@ -1390,6 +1390,18 @@ different bounds — it falls back to repainting the whole node. So the rects
 must cover **every** changed pixel: a pixel changed outside them may stay
 stale on screen until something else repaints it.
 
+A window's root is placed on a **whole device pixel**: its device origin
+is `round(output origin + position * scale)` (#3940). At a fractional
+scale, a node whose bounds are `px / scale` (divide, don't multiply by
+`1/scale`), sampling a `px`-sized `src`, is therefore a plain 1:1
+translate. It gets exact sub-rect damage, the opaque copy of an `XR24`
+buffer or a declared opaque region, and no resampling. That is how a
+client renders at device resolution at 1.25 (Chromium does, see
+docs/chromium.md). A node *inside* a server frame is offset by the frame
+insets (a 1 px border and a 28 px title bar, logical), which are not
+whole device pixels at 1.25. A decorated window's content is therefore
+not 1:1 at a fractional scale; only undecorated windows are.
+
 Damage names the buffer, not a frame: rects sent for a buffer apply to every
 node showing it, and — until the next frame is drawn — also to a
 `SetImage` that swaps a node onto that buffer (see below).

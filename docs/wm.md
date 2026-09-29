@@ -851,7 +851,12 @@ layout is no longer an environment variable that is obviously temporary.
 A window's logical geometry does not change with the scale; the output
 scale lives in the window root's transform, so the rasterizer never needs
 to know about it and a 2× output simply gets twice the device pixels for
-the same logical rectangle.
+the same logical rectangle. That transform's translation is rounded to
+whole device pixels (#3940). At a scale set by hand to a fraction (1.25),
+a window's positions stay logical integers but its origin lands on the
+device grid. So an undecorated client whose buffer is its device size is
+copied 1:1 and not resampled (docs/wire.md, `BufferDamage`). At 1× and 2×
+the rounding is a no-op.
 
 ### Hotplug
 
