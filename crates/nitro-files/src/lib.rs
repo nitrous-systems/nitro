@@ -198,6 +198,23 @@ pub enum Editing {
     NewFolder,
 }
 
+/// A background scan in flight: the worker, the hook on its pipe, and
+/// whether the status line announces it.
+///
+/// The scan does **not** own the status message. `reading …` is derived
+/// from this while the scan runs (see [`Files::status`]) rather than
+/// written over [`Files::message`], so an operation's confirmation —
+/// `renamed to …`, `copied 1 item` — is still there when the listing
+/// arrives, and a scan nobody asked for (an inotify rescan) changes
+/// nothing on the status line at all.
+struct InFlight {
+    scan: dir::Scan,
+    token: nitro_ui::FdToken,
+    /// `false` for a rescan the watch triggered: the user did nothing, so
+    /// the status line should not flicker to `reading …` and back.
+    announce: bool,
+}
+
 /// The app's state.
 pub struct Files {
     /// The directory on screen.
@@ -235,7 +252,7 @@ pub struct Files {
     /// Launched children, reaped through their pidfds.
     children: nitro_launcher::spawn::Children,
     /// The background scan in flight, if any, and the hook watching it.
-    scan: Option<(dir::Scan, nitro_ui::FdToken)>,
+    scan: Option<InFlight>,
     /// The inotify watch on `cwd`, and its hook.
     watch: Option<(std::os::fd::OwnedFd, nitro_ui::FdToken)>,
     /// The widget ids, filled in by [`build`].
@@ -371,6 +388,11 @@ impl Files {
         if let Some(c) = &self.confirm {
             return c.prompt();
         }
+        if let Some(f) = &self.scan
+            && f.announce
+        {
+            return format!("reading {}…", f.scan.path().display());
+        }
         if let Some(m) = &self.message {
             return m.clone();
         }
@@ -413,6 +435,26 @@ impl Files {
         &self.children
     }
 
+    /// Put a finished scan's listing on the model.
+    ///
+    /// On success the message is **not** touched: whatever the operation
+    /// that asked for this listing said — `renamed to …`, `copied 1 item`
+    /// — is still true, and it is what the status line goes back to now
+    /// `reading …` is gone. A failed read replaces it, because an empty
+    /// list needs explaining more than the operation needs confirming.
+    fn take_listing(&mut self, result: std::io::Result<Vec<Entry>>) {
+        match result {
+            Ok(entries) => {
+                self.entries = entries;
+                self.listings += 1;
+            }
+            Err(e) => {
+                self.entries.clear();
+                self.message = Some(format!("{}: {e}", self.cwd.display()));
+            }
+        }
+    }
+
     /// Whether a background scan is in flight.
     #[must_use]
     pub fn scanning(&self) -> bool {
@@ -430,9 +472,7 @@ impl Files {
     /// is the half that is worth asserting.
     #[must_use]
     pub fn scan_hook(&self) -> Option<(std::os::fd::BorrowedFd<'_>, nitro_ui::FdToken)> {
-        self.scan
-            .as_ref()
-            .map(|(scan, token)| (scan.as_fd(), *token))
+        self.scan.as_ref().map(|f| (f.scan.as_fd(), f.token))
     }
 
     /// The inotify watch's descriptor and its hook, if the watch is
@@ -1134,7 +1174,7 @@ pub fn relist(s: &mut Files, ui: &mut Ui<Files>) {
     // reading this thing going to stall the loop? Two ways it can: too
     // many entries, or a symlink, whose follow has no bound.
     if dir::reads_on_a_thread(&cwd) {
-        start_scan(s, ui, &cwd);
+        start_scan(s, ui, &cwd, true);
         return;
     }
     match dir::read_dir(&cwd, &s.globs) {
@@ -1155,8 +1195,10 @@ pub fn relist(s: &mut Files, ui: &mut Ui<Files>) {
 ///
 /// The list is **not** cleared while the scan runs: showing the previous
 /// directory for the fifty milliseconds it takes is better than a blank
-/// window, and the status line says what is happening.
-fn start_scan(s: &mut Files, ui: &mut Ui<Files>, cwd: &Path) {
+/// window, and the status line says what is happening — when `announce`
+/// asks it to. The message already there is left alone either way: it is
+/// shown again once the listing arrives.
+fn start_scan(s: &mut Files, ui: &mut Ui<Files>, cwd: &Path, announce: bool) {
     let scan = match dir::Scan::start(cwd.to_path_buf(), s.sort, std::sync::Arc::clone(&s.globs)) {
         Ok(scan) => scan,
         Err(e) => {
@@ -1185,8 +1227,11 @@ fn start_scan(s: &mut Files, ui: &mut Ui<Files>, cwd: &Path) {
             return;
         }
     };
-    s.message = Some(format!("reading {}…", cwd.display()));
-    s.scan = Some((scan, token));
+    s.scan = Some(InFlight {
+        scan,
+        token,
+        announce,
+    });
     show_status(s, ui);
 }
 
@@ -1197,7 +1242,7 @@ fn start_scan(s: &mut Files, ui: &mut Ui<Files>, cwd: &Path) {
 /// the tree settled, and with the same `&mut Files` and `&mut Ui` every
 /// callback gets.
 fn scan_ready(s: &mut Files, ui: &mut Ui<Files>) {
-    let Some((scan, _)) = &mut s.scan else {
+    let Some(InFlight { scan, .. }) = &mut s.scan else {
         return;
     };
     let Some(result) = scan.take() else {
@@ -1212,17 +1257,7 @@ fn scan_ready(s: &mut Files, ui: &mut Ui<Files>) {
     if stale {
         return;
     }
-    match result {
-        Ok(entries) => {
-            s.entries = entries;
-            s.listings += 1;
-            s.message = None;
-        }
-        Err(e) => {
-            s.entries.clear();
-            s.message = Some(format!("{}: {e}", s.cwd.display()));
-        }
-    }
+    s.take_listing(result);
     refresh_rows(s, ui);
 }
 
@@ -1233,8 +1268,8 @@ fn scan_ready(s: &mut Files, ui: &mut Ui<Files>) {
 /// behind would spin the loop — the same hazard the launcher's pidfd
 /// reaping has, and the same answer.
 fn drop_scan(s: &mut Files, ui: &mut Ui<Files>) {
-    if let Some((_, token)) = s.scan.take() {
-        ui.remove_fd(token);
+    if let Some(f) = s.scan.take() {
+        ui.remove_fd(f.token);
     }
 }
 
@@ -1290,8 +1325,12 @@ fn watch_fired(s: &mut Files, ui: &mut Ui<Files>) {
     // missed.
     let cwd = s.cwd.clone();
     if dir::reads_on_a_thread(&cwd) {
+        // A rescan replacing a scan the user is waiting for keeps saying
+        // `reading …`; one that replaces nothing, or another rescan, says
+        // nothing, so a busy directory does not make the status flicker.
+        let announce = s.scan.as_ref().is_some_and(|f| f.announce);
         drop_scan(s, ui);
-        start_scan(s, ui, &cwd);
+        start_scan(s, ui, &cwd, announce);
         return;
     }
     if let Ok(mut entries) = dir::read_dir(&cwd, &s.globs) {
@@ -1608,5 +1647,24 @@ mod tests {
         // the `.desktop` file calls the program.
         assert_eq!(title_for(Path::new("/")), TITLE);
         assert_eq!(TITLE, "Files");
+    }
+
+    #[test]
+    fn a_finished_scan_keeps_the_message_and_a_failed_one_replaces_it() {
+        let mut s = Files::new("/nonexistent-nitro-files-test");
+        s.message = Some("renamed to new.txt".to_owned());
+        s.take_listing(Ok(Vec::new()));
+        assert_eq!(s.message(), Some("renamed to new.txt"));
+        assert_eq!(s.listings(), 1);
+
+        s.take_listing(Err(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        )));
+        let said = s.message().expect("the error is shown");
+        assert!(
+            said.starts_with("/nonexistent-nitro-files-test: "),
+            "the scan error replaced the confirmation: {said:?}"
+        );
+        assert_eq!(s.listings(), 1, "a failed read is not a listing");
     }
 }

@@ -1912,3 +1912,130 @@ fn ctrl_v_copies_a_uri_list_another_program_offered() {
     let _ = std::fs::remove_dir_all(&root);
     h.quit();
 }
+
+/// A fixture directory holding `a.txt` and a symlink to it, so every
+/// listing of it — the first one and every refresh after an operation —
+/// goes through the scan thread (#3847). Returns the harness with the
+/// first scan already driven home.
+fn linked_app(name: &str) -> (PathBuf, PathBuf, Harness<Files>, Ids) {
+    let (root, dir) = fixture(name);
+    write(&dir.join("a.txt"), "contents");
+    std::os::unix::fs::symlink(dir.join("a.txt"), dir.join("z-link")).expect("symlink");
+    let (mut h, ids) = app(&dir, &root.join("xdg"));
+    drive_scan(&mut h);
+    assert_eq!(names_of(&h, ids), ["a.txt", "z-link"]);
+    (root, dir, h, ids)
+}
+
+/// Drive the refresh an operation started and check its confirmation
+/// outlived it (#658): the scan's `reading …` is what the status line
+/// shows meanwhile, and the operation's message is what it goes back to.
+fn assert_message_survives_the_scan(h: &mut Harness<Files>, ids: Ids, said: &str) {
+    assert!(
+        h.state().scanning(),
+        "a directory holding a symlink is refreshed on the scan thread"
+    );
+    assert!(
+        status(h, ids).contains("reading"),
+        "the status says a read is in flight: {:?}",
+        status(h, ids)
+    );
+    drive_scan(h);
+    assert!(!h.state().scanning());
+    assert_eq!(h.state().message(), Some(said));
+    assert!(
+        status(h, ids).contains(said),
+        "the confirmation is back on the status line after the scan: {:?}",
+        status(h, ids)
+    );
+}
+
+#[test]
+fn a_rename_in_a_linked_directory_keeps_its_message_across_the_scan() {
+    let (root, _dir, mut h, ids) = linked_app("msg-rename");
+    h.key(key::F2);
+    h.settle();
+    type_text(&mut h, "new.txt");
+    h.key(key::ENTER);
+    h.settle();
+    assert_message_survives_the_scan(&mut h, ids, "renamed to new.txt");
+    assert_eq!(names_of(&h, ids), ["new.txt", "z-link"]);
+
+    let _ = std::fs::remove_dir_all(&root);
+    h.quit();
+}
+
+#[test]
+fn a_new_folder_in_a_linked_directory_keeps_its_message_across_the_scan() {
+    let (root, _dir, mut h, ids) = linked_app("msg-newfolder");
+    h.key_with(key::LEFT_CTRL, key::N);
+    h.settle();
+    type_text(&mut h, "made");
+    h.key(key::ENTER);
+    h.settle();
+    assert_message_survives_the_scan(&mut h, ids, "created made");
+    assert_eq!(names_of(&h, ids)[0], "made");
+
+    let _ = std::fs::remove_dir_all(&root);
+    h.quit();
+}
+
+#[test]
+fn a_paste_in_a_linked_directory_keeps_its_message_across_the_scan() {
+    let (root, _dir, mut h, ids) = linked_app("msg-paste");
+    h.key_with(key::LEFT_CTRL, key::C);
+    h.settle();
+    h.key_with(key::LEFT_CTRL, key::V);
+    h.settle();
+    assert_message_survives_the_scan(&mut h, ids, "copied 1 item");
+    assert_eq!(names_of(&h, ids).len(), 3, "the copy is in the list");
+
+    let _ = std::fs::remove_dir_all(&root);
+    h.quit();
+}
+
+#[test]
+fn a_trash_in_a_linked_directory_keeps_its_message_across_the_scan() {
+    let (root, _dir, mut h, ids) = linked_app("msg-trash");
+    h.key(key::DELETE);
+    h.settle();
+    h.key(key::Y);
+    h.settle();
+    assert_message_survives_the_scan(&mut h, ids, "moved 1 item to the trash");
+    assert_eq!(names_of(&h, ids), ["z-link"]);
+
+    let _ = std::fs::remove_dir_all(&root);
+    h.quit();
+}
+
+#[test]
+fn an_inotify_rescan_neither_wipes_the_message_nor_flickers() {
+    let (root, dir, mut h, ids) = linked_app("msg-inotify");
+    h.key(key::F2);
+    h.settle();
+    type_text(&mut h, "new.txt");
+    h.key(key::ENTER);
+    h.settle();
+    drive_scan(&mut h);
+    let before = status(&h, ids);
+    assert!(before.contains("renamed to new.txt"), "{before:?}");
+
+    // Something else writes into the directory: the watch fires and the
+    // rescan goes to the thread, because the directory holds a link.
+    write(&dir.join("b.txt"), "from elsewhere");
+    drive_watch(&mut h, "a file created by another program");
+    assert!(h.state().scanning(), "the rescan is on the thread");
+    assert_eq!(
+        status(&h, ids),
+        before,
+        "a rescan nobody asked for does not flash `reading …`"
+    );
+
+    drive_scan(&mut h);
+    assert_eq!(names_of(&h, ids), ["b.txt", "new.txt", "z-link"]);
+    assert_eq!(h.state().message(), Some("renamed to new.txt"));
+    assert!(status(&h, ids).contains("renamed to new.txt"));
+
+    let _ = std::fs::remove_dir_all(&root);
+    h.quit();
+}

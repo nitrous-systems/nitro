@@ -480,6 +480,23 @@ pattern looking like it works:
 * **A thread that cannot be started is not a failure**, it is a slower
   path: the directory is read inline, the status line says so, and the
   user gets a pause instead of an empty window.
+* **The scan does not own the status message** (#658). `reading …` is
+  *derived* from the scan in flight by `Files::status`, not written over
+  `Files::message`, and a listing that arrives leaves the message alone.
+  So an operation's confirmation — `renamed to …`, `created …`,
+  `copied 1 item`, `moved 1 item to the trash` — is shown again the
+  moment its refresh lands, which since #3847 means any directory holding
+  a symlink. Before, `start_scan` overwrote it with `reading …` and
+  `scan_ready` cleared it, so the confirmation of every operation in such
+  a directory vanished. A **failed** read still replaces the message: an
+  empty list needs explaining more than the operation needs confirming.
+  And a rescan the **inotify watch** started is not announced at all —
+  the user did nothing, so the status line neither flickers to
+  `reading …` nor loses what it said (a rescan replacing an *announced*
+  scan stays announced, since someone is still waiting for that one).
+  The `*_in_a_linked_directory_keeps_its_message_across_the_scan` tests
+  and `an_inotify_rescan_neither_wipes_the_message_nor_flickers` hold
+  this.
 
 The worker writing into a pipe whose read end has gone gets `EPIPE`,
 which it ignores — Rust's runtime ignores `SIGPIPE`, so abandoning a scan
