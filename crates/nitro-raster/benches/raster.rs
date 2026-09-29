@@ -37,7 +37,9 @@
 use std::time::{Duration, Instant};
 
 use nitro_core::{Color, IRect, Point, Rect};
-use nitro_raster::{Canvas, Fill, Image, Mask, PixelFormat};
+use nitro_raster::{
+    Canvas, Fill, Image, Mask, Nv12, PixelFormat, YuvEncoding, YuvMatrix, YuvRange,
+};
 
 const WIDTH: u32 = 1920;
 const HEIGHT: u32 = 1080;
@@ -423,6 +425,82 @@ fn scene_ui_frame(c: &mut Canvas<'_>, damage: &[IRect]) {
 }
 
 // ---------------------------------------------------------------------------
+// Video: NV12 → XRGB (l, m, n, o) and the generic XRGB scaled blit (p)
+// ---------------------------------------------------------------------------
+
+/// An owned NV12 frame: `(y, uv, width, height)`, tight strides. A noisy
+/// gradient, so neither plane is flat (no branch or cache shortcut helps).
+fn make_nv12(w: u32, h: u32) -> (Vec<u8>, Vec<u8>, u32, u32) {
+    let mut rng = Rng::new();
+    let mut y = vec![0u8; (w * h) as usize];
+    for r in 0..h {
+        for c in 0..w {
+            let g = (c * 160 / w + r * 60 / h) as u8;
+            y[(r * w + c) as usize] = 16 + g.wrapping_add(rng.next_range(16) as u8) % 220;
+        }
+    }
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let mut uv = vec![0u8; (2 * cw * ch) as usize];
+    for k in 0..ch {
+        for j in 0..cw {
+            let o = (k * 2 * cw + 2 * j) as usize;
+            uv[o] = (32 + j * 192 / cw) as u8 ^ (rng.next_range(8) as u8);
+            uv[o + 1] = (224 - k * 192 / ch) as u8 ^ (rng.next_range(8) as u8);
+        }
+    }
+    (y, uv, w, h)
+}
+
+fn nv12_of(f: &(Vec<u8>, Vec<u8>, u32, u32)) -> Nv12<'_> {
+    Nv12 {
+        y: &f.0,
+        y_stride: f.2,
+        uv: &f.1,
+        uv_stride: 2 * f.2.div_ceil(2),
+        width: f.2,
+        height: f.3,
+    }
+}
+
+/// Blit a whole NV12 frame into a `w × h` rect at the origin.
+fn scene_nv12(c: &mut Canvas<'_>, src: &Nv12<'_>, w: i32, h: i32, enc: YuvEncoding) {
+    let dst = IRect::new(0, 0, w, h);
+    c.blit_nv12(&full_clip(), &dst, src, &src.bounds(), enc);
+}
+
+/// The generic scaled blit on an opaque 1920×1080 XRGB source into
+/// 1280×720: the reference the NV12 path is compared against.
+fn scene_xrgb_scaled(c: &mut Canvas<'_>, src: &Image<'_>) {
+    c.blit(
+        &full_clip(),
+        &Rect::new(0.0, 0.0, 1280.0, 720.0),
+        src,
+        &IRect::new(0, 0, 1920, 1080),
+        1.0,
+    );
+}
+
+/// A 1920×1080 opaque XRGB source (the window image, tiled).
+fn make_xrgb_1080() -> Vec<u8> {
+    make_window_image(true)
+        .iter()
+        .copied()
+        .cycle()
+        .take((WIDTH * HEIGHT * 4) as usize)
+        .collect()
+}
+
+/// Destination pixels each scene paints, for ns/px; `None` for the scenes
+/// where the figure means nothing (mixed work, overdraw).
+fn scene_pixels(letter: char) -> Option<u64> {
+    match letter {
+        'l' | 'n' => Some(1920 * 1080),
+        'm' | 'o' | 'p' | 'q' => Some(1280 * 720),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
 
@@ -432,7 +510,7 @@ struct SceneSpec {
     default_iters: u32,
 }
 
-const SCENES: [SceneSpec; 11] = [
+const SCENES: [SceneSpec; 17] = [
     SceneSpec {
         letter: 'a',
         name: "solid_fill",
@@ -488,10 +566,41 @@ const SCENES: [SceneSpec; 11] = [
         name: "argb_1to1_mix",
         default_iters: 300,
     },
+    SceneSpec {
+        letter: 'l',
+        name: "nv12_1080_1080",
+        default_iters: 200,
+    },
+    SceneSpec {
+        letter: 'm',
+        name: "nv12_1080_720",
+        default_iters: 300,
+    },
+    SceneSpec {
+        letter: 'n',
+        name: "nv12_720_1080",
+        default_iters: 200,
+    },
+    SceneSpec {
+        letter: 'o',
+        name: "nv12_1080_720_601f",
+        default_iters: 300,
+    },
+    SceneSpec {
+        letter: 'p',
+        name: "xrgb_1080_720",
+        default_iters: 100,
+    },
+    SceneSpec {
+        letter: 'q',
+        name: "xrgb_fast_1080_720",
+        default_iters: 300,
+    },
 ];
 
 const WARMUP: u32 = 3;
 
+#[allow(clippy::too_many_lines)] // setup + a flat scene dispatch table
 fn main() {
     let mut json = false;
     let mut iters_override: Option<u32> = None;
@@ -549,6 +658,20 @@ fn main() {
         stride: GLYPH_W,
     };
 
+    let v1080 = make_nv12(1920, 1080);
+    let v720 = make_nv12(1280, 720);
+    let (nv1080, nv720) = (nv12_of(&v1080), nv12_of(&v720));
+    let bt709 = YuvEncoding::new(YuvMatrix::Bt709, YuvRange::Limited);
+    let bt601f = YuvEncoding::new(YuvMatrix::Bt601, YuvRange::Full);
+    let xrgb_src = make_xrgb_1080();
+    let xrgb = Image {
+        data: &xrgb_src,
+        width: WIDTH,
+        height: HEIGHT,
+        stride: STRIDE,
+        format: PixelFormat::Xrgb8888,
+    };
+
     for spec in &SCENES {
         let iters = iters_override.unwrap_or(spec.default_iters).max(1);
         let mut times: Vec<Duration> = Vec::with_capacity(iters as usize);
@@ -566,6 +689,17 @@ fn main() {
                     'h' => scene_scrim(&mut c),
                     'j' => scene_window_blit(&mut c, &img_opq),
                     'k' => scene_window_blit(&mut c, &img_mix),
+                    'l' => scene_nv12(&mut c, &nv1080, 1920, 1080, bt709),
+                    'm' => scene_nv12(&mut c, &nv1080, 1280, 720, bt709),
+                    'n' => scene_nv12(&mut c, &nv720, 1920, 1080, bt709),
+                    'o' => scene_nv12(&mut c, &nv1080, 1280, 720, bt601f),
+                    'p' => scene_xrgb_scaled(&mut c, &xrgb),
+                    'q' => c.blit_xrgb_scaled(
+                        &full_clip(),
+                        &IRect::new(0, 0, 1280, 720),
+                        &xrgb,
+                        &IRect::new(0, 0, 1920, 1080),
+                    ),
                     'i' => {
                         scene_gradient(&mut c);
                         scene_scrim(&mut c);
@@ -581,19 +715,24 @@ fn main() {
         times.sort_unstable();
         let min = times[0].as_secs_f64() * 1e6;
         let med = times[times.len() / 2].as_secs_f64() * 1e6;
+        let px = scene_pixels(spec.letter);
+        let ns_px = px.map(|n| min * 1000.0 / n as f64);
         if json {
+            let extra = ns_px.map_or(String::new(), |v| format!(",\"ns_per_px\":{v:.3}"));
             println!(
-                "{{\"scene\":\"{}\",\"name\":\"{}\",\"iters\":{},\"min_us\":{:.1},\"median_us\":{:.1}}}",
-                spec.letter, spec.name, iters, min, med
+                "{{\"scene\":\"{}\",\"name\":\"{}\",\"iters\":{},\"min_us\":{:.1},\"median_us\":{:.1}{}}}",
+                spec.letter, spec.name, iters, min, med, extra
             );
         } else {
+            let extra = ns_px.map_or(String::new(), |v| format!("  {v:.2} ns/px"));
             println!(
-                "scene {}  {:<13} min={:.3}ms  median={:.3}ms  iters={}",
+                "scene {}  {:<13} min={:.3}ms  median={:.3}ms  iters={}{}",
                 spec.letter,
                 spec.name,
                 min / 1000.0,
                 med / 1000.0,
-                iters
+                iters,
+                extra
             );
         }
     }

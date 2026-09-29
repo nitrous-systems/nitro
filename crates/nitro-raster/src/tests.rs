@@ -1841,3 +1841,778 @@ fn blit_output_matches_the_golden_hash() {
         "blit output changed against the pre-split reference (329faf3)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// NV12 video blit
+// ---------------------------------------------------------------------------
+
+// Y/U/V/R/G/B, x/y/w/h: the domain's names.
+#[allow(clippy::many_single_char_names, clippy::similar_names)]
+mod nv12 {
+    use super::{Rng, SENTINEL, Surface, iw};
+    use crate::{Nv12, YuvEncoding, YuvMatrix, YuvRange};
+    use nitro_core::IRect;
+
+    const MATRICES: [YuvMatrix; 3] = [YuvMatrix::Bt601, YuvMatrix::Bt709, YuvMatrix::Bt2020];
+    const RANGES: [YuvRange; 2] = [YuvRange::Limited, YuvRange::Full];
+
+    fn encodings() -> impl Iterator<Item = YuvEncoding> {
+        MATRICES
+            .into_iter()
+            .flat_map(|m| RANGES.into_iter().map(move |r| YuvEncoding::new(m, r)))
+    }
+
+    // ---- float references --------------------------------------------------
+
+    /// `(luma scale, chroma scale, luma offset)`.
+    fn range_params(r: YuvRange) -> (f64, f64, f64) {
+        match r {
+            YuvRange::Limited => (255.0 / 219.0, 255.0 / 224.0, 16.0),
+            YuvRange::Full => (1.0, 1.0, 0.0),
+        }
+    }
+
+    /// Unrounded float RGB of (possibly fractional) YUV.
+    fn yuv_to_rgb_f(enc: YuvEncoding, y: f64, u: f64, v: f64) -> [f64; 3] {
+        let (kr, kb) = enc.matrix.kr_kb();
+        let kg = 1.0 - kr - kb;
+        let (ys, cs, yoff) = range_params(enc.range);
+        let l = (y - yoff) * ys;
+        let (u, v) = ((u - 128.0) * cs, (v - 128.0) * cs);
+        [
+            l + 2.0 * (1.0 - kr) * v,
+            l - 2.0 * kb * (1.0 - kb) / kg * u - 2.0 * kr * (1.0 - kr) / kg * v,
+            l + 2.0 * (1.0 - kb) * u,
+        ]
+    }
+
+    fn to_u8(x: f64) -> u8 {
+        x.round().clamp(0.0, 255.0) as u8
+    }
+
+    /// Rounded, clamped `(r, g, b)`.
+    fn yuv_to_rgb(enc: YuvEncoding, y: f64, u: f64, v: f64) -> (u8, u8, u8) {
+        let [r, g, b] = yuv_to_rgb_f(enc, y, u, v);
+        (to_u8(r), to_u8(g), to_u8(b))
+    }
+
+    /// Forward: RGB bytes → rounded YUV bytes.
+    fn rgb_to_yuv(enc: YuvEncoding, rgb: (u8, u8, u8)) -> (u8, u8, u8) {
+        let (kr, kb) = enc.matrix.kr_kb();
+        let kg = 1.0 - kr - kb;
+        let r = f64::from(rgb.0) / 255.0;
+        let g = f64::from(rgb.1) / 255.0;
+        let b = f64::from(rgb.2) / 255.0;
+        let y = kr * r + kg * g + kb * b;
+        let pb = (b - y) / (2.0 * (1.0 - kb));
+        let pr = (r - y) / (2.0 * (1.0 - kr));
+        match enc.range {
+            YuvRange::Limited => (
+                to_u8(16.0 + 219.0 * y),
+                to_u8(128.0 + 224.0 * pb),
+                to_u8(128.0 + 224.0 * pr),
+            ),
+            YuvRange::Full => (
+                to_u8(255.0 * y),
+                to_u8(128.0 + 255.0 * pb),
+                to_u8(128.0 + 255.0 * pr),
+            ),
+        }
+    }
+
+    // ---- an owned NV12 image -----------------------------------------------
+
+    /// An owned NV12 frame with padded strides and *tight* last rows (the
+    /// buffers end right after the last row's payload).
+    struct Frame {
+        y: Vec<u8>,
+        uv: Vec<u8>,
+        w: u32,
+        h: u32,
+        ys: u32,
+        uvs: u32,
+    }
+
+    impl Frame {
+        /// Luma from `fy(x, y)`, chroma pair `(j, k)` from `fc(j, k)`.
+        fn new(
+            w: u32,
+            h: u32,
+            fy: impl Fn(u32, u32) -> u8,
+            fc: impl Fn(u32, u32) -> (u8, u8),
+        ) -> Self {
+            let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+            let ys = w + 5;
+            let uvs = 2 * cw + 6;
+            let mut y = vec![0xEE; ((h - 1) * ys + w) as usize];
+            let mut uv = vec![0xEE; ((ch - 1) * uvs + 2 * cw) as usize];
+            for r in 0..h {
+                for c in 0..w {
+                    y[(r * ys + c) as usize] = fy(c, r);
+                }
+            }
+            for k in 0..ch {
+                for j in 0..cw {
+                    let (u, v) = fc(j, k);
+                    uv[(k * uvs + 2 * j) as usize] = u;
+                    uv[(k * uvs + 2 * j + 1) as usize] = v;
+                }
+            }
+            Self {
+                y,
+                uv,
+                w,
+                h,
+                ys,
+                uvs,
+            }
+        }
+
+        fn nv12(&self) -> Nv12<'_> {
+            Nv12 {
+                y: &self.y,
+                y_stride: self.ys,
+                uv: &self.uv,
+                uv_stride: self.uvs,
+                width: self.w,
+                height: self.h,
+            }
+        }
+
+        fn luma(&self, x: i32, y: i32) -> f64 {
+            f64::from(self.y[y as usize * self.ys as usize + x as usize])
+        }
+
+        fn chroma(&self, j: i32, k: i32) -> (f64, f64) {
+            let o = k as usize * self.uvs as usize + 2 * j as usize;
+            (f64::from(self.uv[o]), f64::from(self.uv[o + 1]))
+        }
+
+        /// Nearest-chroma reference for the 1:1 path, source pixel `(x, y)`.
+        fn ref_1to1(&self, enc: YuvEncoding, x: i32, y: i32) -> (u8, u8, u8) {
+            let (u, v) = self.chroma(x >> 1, y >> 1);
+            yuv_to_rgb(enc, self.luma(x, y), u, v)
+        }
+
+        /// Float bilinear reference for the scaled path, with the documented
+        /// siting and edge clamps, at destination pixel `(dx, dy)`.
+        fn ref_scaled(
+            &self,
+            enc: YuvEncoding,
+            dst: &IRect,
+            sr: &IRect,
+            dx: i32,
+            dy: i32,
+        ) -> [f64; 3] {
+            let sx = (f64::from(dx - dst.x) + 0.5) * f64::from(sr.w) / f64::from(dst.w)
+                + f64::from(sr.x)
+                - 0.5;
+            let sy = (f64::from(dy - dst.y) + 0.5) * f64::from(sr.h) / f64::from(dst.h)
+                + f64::from(sr.y)
+                - 0.5;
+            let lerp2 = |pos: f64, first: i32, last: i32| {
+                let f = pos.floor();
+                let t = pos - f;
+                let i = f as i32;
+                (i.clamp(first, last), (i + 1).clamp(first, last), t)
+            };
+            let (x0, x1, tx) = lerp2(sx, sr.x, sr.right() - 1);
+            let (y0, y1, ty) = lerp2(sy, sr.y, sr.bottom() - 1);
+            let l = (self.luma(x0, y0) * (1.0 - tx) + self.luma(x1, y0) * tx) * (1.0 - ty)
+                + (self.luma(x0, y1) * (1.0 - tx) + self.luma(x1, y1) * tx) * ty;
+            let (j0, j1, tcx) = lerp2(sx / 2.0, sr.x >> 1, (sr.right() - 1) >> 1);
+            let (k0, k1, tcy) = lerp2((sy - 0.5) / 2.0, sr.y >> 1, (sr.bottom() - 1) >> 1);
+            let c = |j, k| self.chroma(j, k);
+            let mix = |a: (f64, f64), b: (f64, f64), t: f64| {
+                (a.0 * (1.0 - t) + b.0 * t, a.1 * (1.0 - t) + b.1 * t)
+            };
+            let top = mix(c(j0, k0), c(j1, k0), tcx);
+            let bot = mix(c(j0, k1), c(j1, k1), tcx);
+            let (u, v) = mix(top, bot, tcy);
+            yuv_to_rgb_f(enc, l, u, v)
+        }
+    }
+
+    fn smooth_frame(w: u32, h: u32) -> Frame {
+        // Gentle gradients: the fixed-point position quantization (1/256 px)
+        // then moves a sample by far less than one code value.
+        Frame::new(
+            w,
+            h,
+            |x, y| (30 + (x * 3 + y * 2) % 190) as u8,
+            |j, k| {
+                (
+                    (60 + (j * 5 + k) % 130) as u8,
+                    (200 - (j + 3 * k) % 140) as u8,
+                )
+            },
+        )
+    }
+
+    fn assert_near(got: (u8, u8, u8), want: (u8, u8, u8), tol: i32, what: &str) {
+        let d = |a: u8, b: u8| (i32::from(a) - i32::from(b)).abs();
+        assert!(
+            d(got.0, want.0) <= tol && d(got.1, want.1) <= tol && d(got.2, want.2) <= tol,
+            "{what}: got {got:?}, want {want:?} (±{tol})"
+        );
+    }
+
+    /// `(r, g, b)` of a surface pixel.
+    fn rgb_at(s: &Surface, x: i32, y: i32) -> (u8, u8, u8) {
+        let (b, g, r) = s.bgr(x, y);
+        (r, g, b)
+    }
+
+    /// Byte 3 of a surface pixel.
+    fn x_byte(s: &Surface, x: i32, y: i32) -> u8 {
+        s.data[y as usize * s.stride as usize + x as usize * 4 + 3]
+    }
+
+    fn blit(s: &mut Surface, clip: &IRect, dst: &IRect, f: &Frame, sr: &IRect, enc: YuvEncoding) {
+        s.canvas().blit_nv12(clip, dst, &f.nv12(), sr, enc);
+    }
+
+    const BARS: [(u8, u8, u8); 8] = [
+        (255, 255, 255),
+        (255, 255, 0),
+        (0, 255, 255),
+        (0, 255, 0),
+        (255, 0, 255),
+        (255, 0, 0),
+        (0, 0, 255),
+        (0, 0, 0),
+    ];
+
+    #[test]
+    fn colour_bars_round_trip_for_every_matrix_and_range() {
+        const BAR_W: u32 = 4;
+        for enc in encodings() {
+            let yuv: Vec<_> = BARS.iter().map(|&c| rgb_to_yuv(enc, c)).collect();
+            let f = Frame::new(
+                BAR_W * 8,
+                6,
+                |x, _| yuv[(x / BAR_W) as usize].0,
+                |j, _| {
+                    let b = yuv[(2 * j / BAR_W) as usize];
+                    (b.1, b.2)
+                },
+            );
+            let mut s = Surface::new(40, 10);
+            let all = s.canvas().bounds();
+            let dst = IRect::new(3, 2, iw(f.w), iw(f.h));
+            blit(&mut s, &all, &dst, &f, &f.nv12().bounds(), enc);
+            for (i, &bar) in (0..).zip(BARS.iter()) {
+                for dx in 0..iw(BAR_W) {
+                    let x = 3 + iw(BAR_W) * i + dx;
+                    assert_near(rgb_at(&s, x, 4), bar, 1, &format!("{enc:?} bar {i}"));
+                    assert_eq!(x_byte(&s, x, 4), 0);
+                }
+            }
+            s.assert_untouched_outside(&dst);
+        }
+    }
+
+    #[test]
+    fn published_limited_range_values_decode() {
+        let bt601 = YuvEncoding::new(YuvMatrix::Bt601, YuvRange::Limited);
+        let bt709 = YuvEncoding::new(YuvMatrix::Bt709, YuvRange::Limited);
+        let cases = [
+            (bt601, (81, 90, 240), (255, 0, 0)),
+            (bt709, (63, 102, 240), (255, 0, 0)),
+            (bt601, (235, 128, 128), (255, 255, 255)),
+            (bt709, (235, 128, 128), (255, 255, 255)),
+            (bt709, (16, 128, 128), (0, 0, 0)),
+            // Super-white and super-black clamp.
+            (bt709, (250, 128, 128), (255, 255, 255)),
+            (bt709, (4, 128, 128), (0, 0, 0)),
+        ];
+        for (enc, (y, u, v), want) in cases {
+            let f = Frame::new(2, 2, |_, _| y, |_, _| (u, v));
+            let mut s = Surface::new(2, 2);
+            let all = s.canvas().bounds();
+            blit(&mut s, &all, &all, &f, &all, enc);
+            assert_near(rgb_at(&s, 1, 1), want, 1, &format!("{enc:?} {y}/{u}/{v}"));
+        }
+    }
+
+    #[test]
+    fn one_to_one_matches_the_float_reference_on_random_input() {
+        let mut rng = Rng::new(0x9E37_79B9_7F4A_7C15);
+        let (w, h) = (33, 20);
+        let f = Frame::new(
+            w,
+            h,
+            |x, y| (x.wrapping_mul(2_654_435_761) ^ y.wrapping_mul(40503)) as u8,
+            |j, k| {
+                (
+                    (j.wrapping_mul(97) ^ k.wrapping_mul(7919)) as u8,
+                    (j.wrapping_mul(193) + k.wrapping_mul(389)) as u8,
+                )
+            },
+        );
+        // And every (Y, U, V) corner and a random cloud through a 2x2 frame.
+        let mut samples: Vec<(u8, u8, u8)> = Vec::new();
+        for y in [0, 16, 128, 235, 255] {
+            for u in [0, 16, 128, 240, 255] {
+                for v in [0, 16, 128, 240, 255] {
+                    samples.push((y, u, v));
+                }
+            }
+        }
+        for _ in 0..2000 {
+            samples.push((rng.byte(), rng.byte(), rng.byte()));
+        }
+        for enc in encodings() {
+            let mut s = Surface::new(w, h);
+            let all = s.canvas().bounds();
+            blit(&mut s, &all, &all, &f, &all, enc);
+            for y in 0..iw(h) {
+                for x in 0..iw(w) {
+                    assert_near(rgb_at(&s, x, y), f.ref_1to1(enc, x, y), 1, "frame");
+                }
+            }
+            for &(y, u, v) in &samples {
+                let f = Frame::new(2, 2, |_, _| y, |_, _| (u, v));
+                let mut s = Surface::new(1, 1);
+                let one = IRect::new(0, 0, 1, 1);
+                blit(&mut s, &one, &one, &f, &one, enc);
+                let want = yuv_to_rgb(enc, f64::from(y), f64::from(u), f64::from(v));
+                assert_near(rgb_at(&s, 0, 0), want, 1, &format!("{enc:?} {y}/{u}/{v}"));
+            }
+        }
+    }
+
+    #[test]
+    fn a_flat_field_scales_to_itself_everywhere() {
+        let f = Frame::new(17, 9, |_, _| 140, |_, _| (90, 170));
+        let enc = YuvEncoding::default();
+        let mut s = Surface::new(2, 2);
+        let all = s.canvas().bounds();
+        blit(&mut s, &all, &all, &f, &IRect::new(0, 0, 2, 2), enc);
+        let want = rgb_at(&s, 0, 0);
+        for (w, h) in [
+            (40, 23),
+            (5, 3),
+            (17, 9),
+            (1, 30),
+            (31, 1),
+            (1, 1),
+            (26, 13),
+        ] {
+            let mut s = Surface::new(w + 4, h + 4);
+            let all = s.canvas().bounds();
+            let dst = IRect::new(2, 2, iw(w), iw(h));
+            blit(&mut s, &all, &dst, &f, &IRect::new(1, 1, 15, 7), enc);
+            for y in dst.y..dst.bottom() {
+                for x in dst.x..dst.right() {
+                    assert_eq!(rgb_at(&s, x, y), want, "{w}x{h} at ({x}, {y})");
+                    assert_eq!(x_byte(&s, x, y), 0);
+                }
+            }
+            s.assert_untouched_outside(&dst);
+        }
+    }
+
+    #[test]
+    fn never_writes_outside_clip_and_dst() {
+        let f = smooth_frame(23, 15);
+        let enc = YuvEncoding::new(YuvMatrix::Bt601, YuvRange::Full);
+        let dsts = [
+            IRect::new(-5, -3, 30, 20),
+            IRect::new(10, 8, 40, 30),
+            IRect::new(4, 4, 23, 15),
+            IRect::new(30, 20, 23, 15),
+        ];
+        let clips = [
+            IRect::new(0, 0, 64, 48),
+            IRect::new(3, 5, 17, 9),
+            IRect::new(11, 0, 1, 48),
+            IRect::new(7, 13, 20, 1),
+            IRect::new(-10, -10, 25, 21),
+            IRect::new(50, 40, 40, 40),
+        ];
+        for dst in &dsts {
+            for clip in &clips {
+                for sr in [IRect::new(0, 0, 23, 15), IRect::new(3, 1, 9, 7)] {
+                    let mut s = Surface::new(48, 36);
+                    blit(&mut s, clip, dst, &f, &sr, enc);
+                    let allowed = clip.intersect(dst);
+                    s.assert_untouched_outside(&allowed);
+                    let inside = allowed.intersect(&s.canvas().bounds());
+                    for y in inside.y..inside.bottom() {
+                        for x in inside.x..inside.right() {
+                            assert_ne!(s.px(x, y), SENTINEL, "({x}, {y}) not painted");
+                            assert_eq!(x_byte(&s, x, y), 0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn clipped_is_byte_identical_to_unclipped() {
+        let f = smooth_frame(37, 21);
+        let mut rng = Rng::new(0xDEAD_BEEF_1234_5678);
+        let cases = [
+            (IRect::new(2, 1, 37, 21), IRect::new(0, 0, 37, 21)), // 1:1
+            (IRect::new(1, 3, 29, 19), IRect::new(5, 3, 29, 19)), // 1:1, odd crop
+            (IRect::new(-7, 2, 70, 41), IRect::new(0, 0, 37, 21)), // up
+            (IRect::new(3, 3, 19, 9), IRect::new(1, 1, 35, 19)),  // down
+            (IRect::new(0, 0, 51, 13), IRect::new(3, 2, 30, 17)), // mixed
+        ];
+        for enc in encodings() {
+            for (dst, sr) in &cases {
+                let mut full = Surface::new(64, 48);
+                let all = full.canvas().bounds();
+                blit(&mut full, &all, dst, &f, sr, enc);
+                for _ in 0..12 {
+                    let x = iw(rng.next_u32() % 64);
+                    let y = iw(rng.next_u32() % 48);
+                    let w = 1 + iw(rng.next_u32() % 40);
+                    let h = 1 + iw(rng.next_u32() % 30);
+                    let clip = IRect::new(x, y, w, h);
+                    let mut part = Surface::new(64, 48);
+                    blit(&mut part, &clip, dst, &f, sr, enc);
+                    let inside = clip.intersect(dst).intersect(&all);
+                    for py in inside.y..inside.bottom() {
+                        for px in inside.x..inside.right() {
+                            assert_eq!(
+                                part.px(px, py),
+                                full.px(px, py),
+                                "{enc:?} dst {dst:?} clip {clip:?} at ({px}, {py})"
+                            );
+                        }
+                    }
+                    part.assert_untouched_outside(&inside);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn one_to_one_with_odd_sizes_and_crops_uses_the_covering_chroma() {
+        // Distinct chroma per column and row, so a wrong pair is visible.
+        let f = Frame::new(
+            17,
+            9,
+            |x, y| (20 + x * 11 + y * 7) as u8,
+            |j, k| ((40 + j * 19 + k * 3) as u8, (220 - j * 13 - k * 5) as u8),
+        );
+        let crops = [
+            IRect::new(0, 0, 17, 9),
+            IRect::new(1, 1, 16, 8),
+            IRect::new(3, 0, 13, 9),
+            IRect::new(3, 1, 5, 3),
+            IRect::new(16, 8, 1, 1),
+            IRect::new(1, 0, 1, 9),
+            IRect::new(5, 2, 12, 7),
+        ];
+        for enc in encodings() {
+            for sr in &crops {
+                for (ox, oy) in [(0, 0), (1, 2), (4, 1)] {
+                    let mut s = Surface::new(24, 14);
+                    let all = s.canvas().bounds();
+                    let dst = IRect::new(ox, oy, sr.w, sr.h);
+                    blit(&mut s, &all, &dst, &f, sr, enc);
+                    for y in 0..sr.h {
+                        for x in 0..sr.w {
+                            let want = f.ref_1to1(enc, sr.x + x, sr.y + y);
+                            assert_near(
+                                rgb_at(&s, ox + x, oy + y),
+                                want,
+                                1,
+                                &format!("{enc:?} crop {sr:?} src ({}, {})", sr.x + x, sr.y + y),
+                            );
+                        }
+                    }
+                    s.assert_untouched_outside(&dst);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scaled_matches_the_bilinear_reference_with_siting() {
+        let frames = [
+            smooth_frame(17, 9),
+            smooth_frame(1, 1),
+            smooth_frame(40, 31),
+        ];
+        let geoms = [
+            (IRect::new(0, 0, 40, 23), None),
+            (IRect::new(2, 1, 9, 5), None),
+            (IRect::new(0, 0, 33, 7), Some(IRect::new(1, 1, 7, 5))),
+            (IRect::new(1, 2, 13, 29), Some(IRect::new(3, 0, 5, 7))),
+            (IRect::new(0, 0, 1, 1), None),
+            (IRect::new(0, 0, 41, 17), None),
+        ];
+        for enc in encodings() {
+            for f in &frames {
+                for (dst, crop) in &geoms {
+                    let sr = crop
+                        .unwrap_or_else(|| f.nv12().bounds())
+                        .intersect(&f.nv12().bounds());
+                    if sr.is_empty() || (sr.w == dst.w && sr.h == dst.h) {
+                        continue;
+                    }
+                    let mut s = Surface::new(48, 36);
+                    let all = s.canvas().bounds();
+                    blit(&mut s, &all, dst, f, &sr, enc);
+                    for y in dst.y..dst.bottom() {
+                        for x in dst.x..dst.right() {
+                            let [r, g, b] = f.ref_scaled(enc, dst, &sr, x, y);
+                            let want = (to_u8(r), to_u8(g), to_u8(b));
+                            assert_near(
+                                rgb_at(&s, x, y),
+                                want,
+                                2,
+                                &format!("{enc:?} {}x{} {dst:?} {sr:?} ({x}, {y})", f.w, f.h),
+                            );
+                        }
+                    }
+                    s.assert_untouched_outside(dst);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scaled_chroma_is_sited_between_rows_and_on_even_columns() {
+        // Chroma rows alternate 64/192 in U; luma is flat. At 2x vertical
+        // upscale of a 4x4 source, destination rows land at source
+        // y = 0.25 + 0.5 k, so chroma y = (y - 0.5) / 2 lies between chroma
+        // rows 0 and 1 for the middle rows — the siting is observable.
+        let f = Frame::new(
+            4,
+            4,
+            |_, _| 128,
+            |_, k| (if k == 0 { 64 } else { 192 }, 128),
+        );
+        let enc = YuvEncoding::new(YuvMatrix::Bt709, YuvRange::Full);
+        let mut s = Surface::new(8, 8);
+        let all = s.canvas().bounds();
+        blit(
+            &mut s,
+            &all,
+            &IRect::new(0, 0, 4, 8),
+            &f,
+            &f.nv12().bounds(),
+            enc,
+        );
+        for y in 0..8 {
+            let [_, _, b] = f.ref_scaled(enc, &IRect::new(0, 0, 4, 8), &f.nv12().bounds(), 0, y);
+            let got = i32::from(rgb_at(&s, 0, y).2);
+            assert!(
+                (got - i32::from(to_u8(b))).abs() <= 2,
+                "row {y}: {got} vs {b}"
+            );
+        }
+        // Destination row y samples luma y (y + 0.5) / 2 - 0.5 and chroma
+        // row (luma - 0.5) / 2: rows 0 and 1 land at -0.375 and -0.125
+        // (clamped to chroma row 0), rows 6 and 7 at 1.125 and 1.375
+        // (clamped to row 1), and rows 2..=5 interpolate strictly between.
+        // A chroma y of `luma / 2` (the wrong, co-sited siting) would start
+        // interpolating one destination row earlier.
+        assert_eq!(rgb_at(&s, 0, 0), rgb_at(&s, 0, 1));
+        assert_eq!(rgb_at(&s, 0, 6), rgb_at(&s, 0, 7));
+        let blue = |y| rgb_at(&s, 0, y).2;
+        assert!(blue(1) < blue(2) && blue(2) < blue(3) && blue(3) < blue(4) && blue(5) < blue(6));
+    }
+
+    #[test]
+    fn validity_uses_tight_last_rows_and_invalid_is_a_no_op() {
+        let f = smooth_frame(7, 5);
+        assert!(f.nv12().is_valid(), "tight buffers must be accepted");
+        let short_y = Nv12 {
+            y: &f.y[..f.y.len() - 1],
+            ..f.nv12()
+        };
+        let short_uv = Nv12 {
+            uv: &f.uv[..f.uv.len() - 1],
+            ..f.nv12()
+        };
+        let bad_ys = Nv12 {
+            y_stride: 6,
+            ..f.nv12()
+        };
+        let bad_uvs = Nv12 {
+            uv_stride: 7, // needs 2 * ceil(7 / 2) = 8
+            ..f.nv12()
+        };
+        let empty = Nv12 {
+            width: 0,
+            ..f.nv12()
+        };
+        for bad in [short_y, short_uv, bad_ys, bad_uvs, empty] {
+            assert!(!bad.is_valid(), "{bad:?}");
+            let mut s = Surface::new(16, 16);
+            let all = s.canvas().bounds();
+            s.canvas().blit_nv12(
+                &all,
+                &all,
+                &bad,
+                &IRect::new(0, 0, 7, 5),
+                YuvEncoding::default(),
+            );
+            s.assert_untouched_outside(&IRect::EMPTY);
+        }
+        // Empty crop, empty dst, empty clip, crop outside the source.
+        let mut s = Surface::new(16, 16);
+        let all = s.canvas().bounds();
+        let src = f.nv12();
+        let enc = YuvEncoding::default();
+        s.canvas()
+            .blit_nv12(&all, &all, &src, &IRect::new(0, 0, 0, 5), enc);
+        s.canvas()
+            .blit_nv12(&all, &IRect::new(0, 0, 0, 9), &src, &src.bounds(), enc);
+        s.canvas()
+            .blit_nv12(&IRect::EMPTY, &all, &src, &src.bounds(), enc);
+        s.canvas()
+            .blit_nv12(&all, &all, &src, &IRect::new(7, 0, 3, 3), enc);
+        s.assert_untouched_outside(&IRect::EMPTY);
+    }
+
+    #[test]
+    fn extreme_geometry_does_not_panic() {
+        let f = smooth_frame(1, 1);
+        let big = smooth_frame(64, 64);
+        let enc = YuvEncoding::default();
+        let mut s = Surface::new(16, 16);
+        let all = s.canvas().bounds();
+        let huge = IRect::new(-1_000_000_000, -1_000_000_000, 2_000_000_000, 2_000_000_000);
+        s.canvas()
+            .blit_nv12(&all, &huge, &f.nv12(), &f.nv12().bounds(), enc);
+        s.canvas()
+            .blit_nv12(&all, &huge, &big.nv12(), &big.nv12().bounds(), enc);
+        let tiny = IRect::new(3, 3, 1, 1);
+        s.canvas()
+            .blit_nv12(&all, &tiny, &big.nv12(), &big.nv12().bounds(), enc);
+        let far = IRect::new(1_000_000_000, 5, 1_000_000_000, 4);
+        s.canvas()
+            .blit_nv12(&all, &far, &big.nv12(), &big.nv12().bounds(), enc);
+        assert_eq!(x_byte(&s, 3, 3), 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// blit_xrgb_scaled
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::many_single_char_names)] // x/y/w/h and surface pairs
+mod xrgb_scaled {
+    use super::{Rng, Surface, iw};
+    use crate::{Image, PixelFormat};
+    use nitro_core::{IRect, Rect};
+
+    /// A smooth opaque XRGB image with garbage in byte 3.
+    fn smooth(w: u32, h: u32) -> Vec<u8> {
+        let mut v = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let o = ((y * w + x) * 4) as usize;
+                v[o] = (20 + x * 4 + y) as u8;
+                v[o + 1] = (200 - x * 2 - y * 3) as u8;
+                v[o + 2] = (60 + (x + y) * 3) as u8;
+                v[o + 3] = 0x5A;
+            }
+        }
+        v
+    }
+
+    fn img(data: &[u8], w: u32, h: u32, format: PixelFormat) -> Image<'_> {
+        Image {
+            data,
+            width: w,
+            height: h,
+            stride: w * 4,
+            format,
+        }
+    }
+
+    #[test]
+    fn agrees_with_the_generic_blit() {
+        let data = smooth(31, 19);
+        let src = img(&data, 31, 19, PixelFormat::Xrgb8888);
+        let geoms = [
+            (IRect::new(0, 0, 60, 40), IRect::new(0, 0, 31, 19)),
+            (IRect::new(3, 2, 17, 11), IRect::new(0, 0, 31, 19)),
+            (IRect::new(1, 1, 31, 19), IRect::new(0, 0, 31, 19)),
+            (IRect::new(0, 5, 45, 7), IRect::new(4, 3, 20, 9)),
+        ];
+        for (dst, sr) in &geoms {
+            let mut a = Surface::new(64, 48);
+            let mut b = Surface::new(64, 48);
+            let all = a.canvas().bounds();
+            a.canvas().blit_xrgb_scaled(&all, dst, &src, sr);
+            let dstf = Rect::new(dst.x as f32, dst.y as f32, dst.w as f32, dst.h as f32);
+            b.canvas().blit(&all, &dstf, &src, sr, 1.0);
+            for y in dst.y..dst.bottom() {
+                for x in dst.x..dst.right() {
+                    let (p, q) = (a.bgr(x, y), b.bgr(x, y));
+                    let d = |m: u8, n: u8| (i32::from(m) - i32::from(n)).abs();
+                    assert!(
+                        d(p.0, q.0) <= 1 && d(p.1, q.1) <= 1 && d(p.2, q.2) <= 1,
+                        "{dst:?} ({x}, {y}): {p:?} vs {q:?}"
+                    );
+                    assert_eq!(
+                        a.data[y as usize * a.stride as usize + x as usize * 4 + 3],
+                        0
+                    );
+                }
+            }
+            a.assert_untouched_outside(dst);
+        }
+    }
+
+    #[test]
+    fn is_clip_invariant_and_ignores_argb() {
+        let data = smooth(23, 17);
+        let src = img(&data, 23, 17, PixelFormat::Xrgb8888);
+        let mut rng = Rng::new(0x0123_4567_89AB_CDEF);
+        for dst in [
+            IRect::new(-3, 2, 57, 39),
+            IRect::new(4, 4, 11, 7),
+            IRect::new(0, 0, 23, 17),
+        ] {
+            let mut full = Surface::new(48, 40);
+            let all = full.canvas().bounds();
+            full.canvas()
+                .blit_xrgb_scaled(&all, &dst, &src, &IRect::new(1, 1, 21, 15));
+            for _ in 0..20 {
+                let clip = IRect::new(
+                    iw(rng.next_u32() % 48),
+                    iw(rng.next_u32() % 40),
+                    1 + iw(rng.next_u32() % 30),
+                    1 + iw(rng.next_u32() % 30),
+                );
+                let mut part = Surface::new(48, 40);
+                part.canvas()
+                    .blit_xrgb_scaled(&clip, &dst, &src, &IRect::new(1, 1, 21, 15));
+                let inside = clip.intersect(&dst).intersect(&all);
+                for y in inside.y..inside.bottom() {
+                    for x in inside.x..inside.right() {
+                        assert_eq!(part.px(x, y), full.px(x, y), "{dst:?} {clip:?} ({x}, {y})");
+                    }
+                }
+                part.assert_untouched_outside(&inside);
+            }
+        }
+        let argb = img(&data, 23, 17, PixelFormat::Argb8888);
+        let mut s = Surface::new(16, 16);
+        let all = s.canvas().bounds();
+        s.canvas()
+            .blit_xrgb_scaled(&all, &all, &argb, &argb.bounds());
+        s.assert_untouched_outside(&IRect::EMPTY);
+        // 1x1 source to a huge rect, and a huge source into one pixel.
+        let one = smooth(1, 1);
+        let one = img(&one, 1, 1, PixelFormat::Xrgb8888);
+        let huge = IRect::new(-1_000_000_000, -1_000_000_000, 2_000_000_000, 2_000_000_000);
+        s.canvas()
+            .blit_xrgb_scaled(&all, &huge, &one, &one.bounds());
+        s.canvas()
+            .blit_xrgb_scaled(&all, &huge, &src, &src.bounds());
+        s.canvas()
+            .blit_xrgb_scaled(&all, &IRect::new(2, 2, 1, 1), &src, &src.bounds());
+    }
+}

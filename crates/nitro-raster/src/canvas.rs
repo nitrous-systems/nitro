@@ -1253,7 +1253,7 @@ impl RowSampler<'_> {
 /// clamps rects long before this, and not a regression — the pre-split
 /// `fixed += step` overflowed on the same input — but free to close here
 /// (issue #553).
-fn texels_in_range(
+pub(crate) fn texels_in_range(
     base: i64,
     step: i64,
     lo: i32,

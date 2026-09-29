@@ -87,8 +87,10 @@ mod blend;
 mod canvas;
 mod paint;
 mod shape;
+mod yuv;
 
 pub use canvas::{BYTES_PER_PIXEL, Canvas, Fill, Image, Mask, PixelFormat};
+pub use yuv::{Nv12, YuvEncoding, YuvMatrix, YuvRange};
 
 #[cfg(test)]
 mod tests;
