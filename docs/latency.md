@@ -908,10 +908,10 @@ main 7defd98 vs branch; dev machine within noise except where noted):
 | p xrgb scaled | 11.62 | 11.88 | +2 % |
 | r clear_1080 (new) | — | 0.678 (0.33 ns/px) | |
 
-The first cut lost 8–14 % on a, c, d and p. Two causes: `store_solid`
-changed from a 0 constant to 255, which caused a codegen artefact on SSE4.2 in the fill scenes, and the
-bilinear texel blend always multiplied for alpha. Adding the `d_a == 255` shortcut to the texel
-blend recovered d and p. A branchless `d + div255((255−d)·a)` measured worse than the
+The first cut lost 12 % on d and p, because the bilinear texel blend
+always multiplied for alpha. Adding the `d_a == 255` shortcut to the texel
+blend recovered them. a and c are bimodal on the box, at 1.85 or 2.0 ms from run to run, on
+main as well as on the branch, so a single run can show a false ±8 %. A branchless `d + div255((255−d)·a)` measured worse than the
 branch on every scene. What remains is the per-pixel blends (`blend_pixel` for
 glyph masks, the SWAR straight-alpha row for mixed ARGB windows), which now write a
 computed byte instead of a constant. At the sizes the server
