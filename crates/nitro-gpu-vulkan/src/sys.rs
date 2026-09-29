@@ -19,8 +19,6 @@ struct UdmabufCreate {
     size: u64,
 }
 
-const _: () = assert!(std::mem::size_of::<UdmabufCreate>() == 24);
-
 /// `UDMABUF_CREATE`: `_IOW('u', 0x42, struct udmabuf_create)`.
 const UDMABUF_CREATE: Opcode = opcode::write::<UdmabufCreate>(b'u', 0x42);
 /// `UDMABUF_FLAGS_CLOEXEC`.
@@ -31,7 +29,7 @@ struct Create(UdmabufCreate);
 
 // SAFETY: `opcode` is `UDMABUF_CREATE`, whose argument is `struct
 // udmabuf_create` — `UdmabufCreate` reproduces it field for field (size 24,
-// asserted above, which is also the size the opcode encodes). `as_ptr`
+// asserted in `udmabuf`, which is also the size the opcode encodes). `as_ptr`
 // points at that struct, alive and exclusively borrowed for the call.
 // `IS_MUTATING = false` is right: `_IOW` means the kernel only reads it.
 // `output_from_ptr` (below) turns the return value into an fd.
@@ -67,6 +65,7 @@ unsafe impl Ioctl for Create {
 /// `ENOENT`/`EACCES` from opening `/dev/udmabuf` (no module, no access),
 /// `EINVAL` for a bad memfd/range, or any other errno.
 pub fn udmabuf(memfd: impl AsFd, offset: u64, size: u64) -> Result<OwnedFd, Errno> {
+    const { assert!(std::mem::size_of::<UdmabufCreate>() == 24) };
     let dev = rustix::fs::open(
         "/dev/udmabuf",
         rustix::fs::OFlags::RDWR | rustix::fs::OFlags::CLOEXEC,
@@ -95,8 +94,6 @@ struct ImportSyncFile {
     fd: i32,
 }
 
-const _: () = assert!(std::mem::size_of::<ImportSyncFile>() == 8);
-
 /// `DMA_BUF_IOCTL_IMPORT_SYNC_FILE`: `_IOW('b', 3, struct dma_buf_import_sync_file)`.
 const DMA_BUF_IOCTL_IMPORT_SYNC_FILE: Opcode = opcode::write::<ImportSyncFile>(b'b', 3);
 /// `DMA_BUF_SYNC_WRITE`: the fence is a write; readers must wait for it.
@@ -108,6 +105,7 @@ const DMA_BUF_SYNC_WRITE: u32 = 2;
 /// # Errors
 /// `ENOTTY` on an older kernel, or any other errno.
 pub fn import_sync_file(buf: impl AsFd, sync_file: impl AsFd) -> Result<(), Errno> {
+    const { assert!(std::mem::size_of::<ImportSyncFile>() == 8) };
     let arg = ImportSyncFile {
         flags: DMA_BUF_SYNC_WRITE,
         fd: rustix::fd::AsRawFd::as_raw_fd(&sync_file.as_fd()),
@@ -115,7 +113,7 @@ pub fn import_sync_file(buf: impl AsFd, sync_file: impl AsFd) -> Result<(), Errn
     loop {
         // SAFETY: (Setter::new) the opcode is `_IOW('b', 3, struct
         // dma_buf_import_sync_file)` and `ImportSyncFile` is that struct
-        // (`{ __u32 flags; __s32 fd; }`, size 8, asserted above).
+        // (`{ __u32 flags; __s32 fd; }`, size 8, asserted at the top of this function).
         let op = unsafe { Setter::<DMA_BUF_IOCTL_IMPORT_SYNC_FILE, ImportSyncFile>::new(arg) };
         // SAFETY: (ioctl) `op` describes the request truthfully. Every
         // caller passes a dma-buf the helper exported itself, so the
