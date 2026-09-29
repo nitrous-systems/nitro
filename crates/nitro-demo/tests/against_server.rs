@@ -19,6 +19,8 @@
 //! 3. `--animate` commits exactly once per `Frame` callback.
 //! 4. The damage outlines appear in a screenshot when they are on.
 //! 5. `--windows N` opens N windows and the cascade separates them.
+//! 6. `--video` feeds a `Surface` node NV12 frames that come back
+//!    `Presented`, and the colour bars read back as the right RGB.
 //!
 //! Since M3 the server places a window itself — decorated, and centred in
 //! the output's work area rather than at its origin — so none of the pixel
@@ -726,5 +728,57 @@ fn the_pacing_mark_survives_several_frame_callbacks_in_one_wakeup() {
         "{commits} commits for {callbacks} callbacks"
     );
 
+    harness.quit();
+}
+
+/// `--video`: ten frames through `PresentSurface`, each answered
+/// `Presented`, no protocol error, and the 75% bars on screen as the RGB a
+/// BT.709 limited-range conversion gives (±8 per channel).
+#[test]
+fn video_mode_presents_frames_and_the_bars_read_back_as_rgb() {
+    use nitro_demo::args::VideoOpts;
+    use nitro_demo::video::{self, Video};
+
+    let harness = Harness::start("video", 1280, 720);
+    harness.park_cursor(0.99, 0.99);
+    let conn = Connection::connect(&harness.wire_path, "nitro-demo").expect("wire connect");
+    let opts = VideoOpts {
+        size: (640, 360),
+        fps: 60,
+        frames: 10,
+        ..VideoOpts::default()
+    };
+    let mut v = Video::with_connection(conn, opts).expect("video start");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !v.done {
+        assert!(Instant::now() < deadline, "timed out: {}", v.summary_line());
+        v.step(Some(Duration::from_millis(20)), None)
+            .expect("no protocol error");
+    }
+    assert!(v.presented >= 10, "{}", v.summary_line());
+    assert!(v.sent >= v.presented);
+
+    // Pause so the picture holds still, then read it back.
+    v.paused = true;
+    harness.settle();
+    let img = harness.shot();
+    let (sx, sy) = (
+        v.window_size.w / v.layout.fmt.width as f32,
+        v.window_size.h / v.layout.fmt.height as f32,
+    );
+    for i in 0..video::BARS.len() {
+        let r = v.layout.bar(i);
+        let x = v.window_pos.x + (r.x as f32 + r.w as f32 / 2.0) * sx;
+        let y = v.window_pos.y + (r.h as f32 / 2.0) * sy;
+        let px = img.pixel(x as u32, y as u32);
+        let got = [(px >> 16) as u8, (px >> 8) as u8, px as u8];
+        let want = video::bar_rgb(i);
+        for c in 0..3 {
+            assert!(
+                got[c].abs_diff(want[c]) <= 8,
+                "bar {i} at ({x}, {y}): {got:?}, want {want:?}"
+            );
+        }
+    }
     harness.quit();
 }

@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use nitro_demo::app::{App, Error, SUMMARY_INTERVAL, emit};
 use nitro_demo::args::{self, Args, Mode};
+use nitro_demo::video::Video;
 use nitro_demo::{control, latency, png, scene};
 use rustix::event::{PollFd, PollFlags};
 
@@ -50,6 +51,9 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // SIGINT before connecting, so Ctrl-C during the handshake still
     // exits cleanly rather than leaving a half-built window behind.
     let signals = Signals::install()?;
+    if args.mode == Mode::Video {
+        return run_video(&args, &signals);
+    }
     let mut app = App::start(args)?;
     emit(&format!(
         "connected to {:?}: mode={} windows={} damage={}",
@@ -94,6 +98,46 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     report(&mut app, true)?;
+    Ok(())
+}
+
+/// `--video`: one poll over the connection, the frame timer and SIGINT,
+/// until `q`, `--frames`, `--seconds` or Ctrl-C; then the counts.
+fn run_video(args: &Args, signals: &Signals) -> Result<(), Box<dyn std::error::Error>> {
+    let mut video = Video::start(args.video)?;
+    emit(&format!(
+        "connected to {:?}: mode=video size={}x{} fps={} (space pause, f fullscreen, q quit)",
+        video.server_name(),
+        args.video.size.0,
+        args.video.size.1,
+        args.video.fps,
+    ))?;
+    let limit = (args.seconds > 0).then(|| Duration::from_secs(args.seconds));
+    let mut hint = None;
+    while !video.done {
+        let left = limit.map(|l| l.saturating_sub(video.started.elapsed()));
+        if left == Some(Duration::ZERO) {
+            break;
+        }
+        if video.step(left, Some(signals.as_fd()))? && signals.drain() {
+            emit("SIGINT")?;
+            break;
+        }
+        if video.hint != hint {
+            hint = video.hint;
+            if let Some((_, w, h)) = hint {
+                emit(&format!(
+                    "surface hint: {w}x{h}{}",
+                    if args.video.follow_hint {
+                        " (following)"
+                    } else {
+                        ""
+                    }
+                ))?;
+            }
+        }
+    }
+    emit(&video.summary_line())?;
     Ok(())
 }
 

@@ -30,6 +30,8 @@ nitro-demo --follow --windows 5      # cascade/z-order/focus
 nitro-demo --follow --stats          # + the server's view and the cross-check
 nitro-demo --damage                  # outline the damage rects
 nitro-demo --save-small docs/x.png   # downscaled screenshot, no ImageMagick
+nitro-demo --video                   # NV12 Surface test client, 1280x720@60
+nitro-demo --video --size 1920x1080 --fps 30 --fullscreen --follow-hint
 ```
 
 On the box: `ssh box 'XDG_RUNTIME_DIR=/run/user/1000 ~/nitro-bin/nitro-demo
@@ -60,6 +62,32 @@ commit no callback asked for and there is always exactly one
 `RequestFrame` in flight, so the totals differ by a small constant
 forever. Comparing them would report that constant as a violation.
 
+## Video mode
+
+**`--video`** exercises `Surface` nodes (`caps::SURFACE`, #3897). One
+window holds a single `Surface` filling it, fed by a ring of three NV12
+buffers in sealed memfds that the client maps writable. Each frame is 75%
+SMPTE-style colour bars (BT.709, limited range), a white box bouncing
+across the lower third and a 16-bit frame counter drawn as luma blocks,
+sent with `PresentSurface` (outside any transaction, latched at the next
+vblank, newest wins). Frames are paced by a timerfd at `--fps 30|60`.
+
+A buffer is rewritten only after its `BufferReleased`; if none is free
+when the timer fires the frame is **skipped**. A frame released without a
+`Presented` was superseded at the latch and is counted **dropped**. Each
+buffer is two frames behind the screen, so a frame's damage is the box
+where that buffer last had it ∪ the box of the last frame sent ∪ the new
+box ∪ the counter; a buffer's first use is damaged in full.
+
+Above the surface sit ordinary nodes: a translucent bar along the bottom,
+a progress rect advanced by a transaction once a second, and — with
+`caps::TEXT` — a label `▶ 60 fps / dropped N`. `SurfaceHint` is printed;
+with `--follow-hint` the ring is reallocated at the hinted size (old
+buffers are destroyed as the server releases them). Keys: `space` pauses,
+`f` toggles fullscreen (`SetWindowState`), `q` quits. On exit it prints
+`video: sent= presented= dropped= skipped=`. `--frames N` quits after N
+presented frames; `--seconds S` works too.
+
 ## Layout
 
 | module | what |
@@ -71,6 +99,7 @@ forever. Comparing them would report that constant as a violation.
 | `control` | the v0 control socket (`stats`, `shot`) |
 | `png` | a size-conscious PNG writer for `--save-small` |
 | `app` | the event loop |
+| `video` | `--video`: NV12 frame generator, buffer ring, `PresentSurface` loop |
 
 `scene` returns `Vec<ClientMsg>` rather than driving the `Transaction`
 builder, for two reasons: the demo reports the bytes its first frame costs

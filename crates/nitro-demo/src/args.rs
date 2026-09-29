@@ -17,6 +17,37 @@ pub enum Mode {
     /// frame. Verifies frame pacing and that a client aiming at the
     /// deadline never commits twice for one flip.
     Animate,
+    /// Feed a `Surface` node NV12 frames with `PresentSurface`: colour
+    /// bars, a moving box and a frame counter ([`crate::video`]).
+    Video,
+}
+
+/// The `--video` options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoOpts {
+    /// Buffer size in pixels (`--size WxH`), both even.
+    pub size: (u32, u32),
+    /// Frame rate (`--fps 30|60`).
+    pub fps: u32,
+    /// Ask for fullscreen at start (`--fullscreen`).
+    pub fullscreen: bool,
+    /// Reallocate the ring at the size a `SurfaceHint` asks for
+    /// (`--follow-hint`).
+    pub follow_hint: bool,
+    /// Quit after this many `Presented` frames (`--frames N`, 0 = never).
+    pub frames: u64,
+}
+
+impl Default for VideoOpts {
+    fn default() -> Self {
+        Self {
+            size: (1280, 720),
+            fps: 60,
+            fullscreen: false,
+            follow_hint: false,
+            frames: 0,
+        }
+    }
 }
 
 impl fmt::Display for Mode {
@@ -24,6 +55,7 @@ impl fmt::Display for Mode {
         f.write_str(match self {
             Mode::Follow => "follow",
             Mode::Animate => "animate",
+            Mode::Video => "video",
         })
     }
 }
@@ -48,6 +80,8 @@ pub struct Args {
     /// this path and exit. The fallback for a box without `ImageMagick`;
     /// see [`crate::scene::save_small`].
     pub save_small: Option<String>,
+    /// The `--video` options (ignored in the other modes).
+    pub video: VideoOpts,
 }
 
 impl Default for Args {
@@ -59,6 +93,7 @@ impl Default for Args {
             stats: false,
             seconds: 0,
             save_small: None,
+            video: VideoOpts::default(),
         }
     }
 }
@@ -67,6 +102,8 @@ impl Default for Args {
 pub const USAGE: &str = "\
 usage: nitro-demo [--follow | --animate] [--windows N] [--damage] [--stats]
                   [--seconds S] [--save-small FILE]
+       nitro-demo --video [--size WxH] [--fps 30|60] [--fullscreen]
+                  [--follow-hint] [--frames N] [--seconds S]
 
   --follow           commit only on input (default); idle costs zero frames
   --animate          move a rect one step per Frame callback
@@ -76,8 +113,16 @@ usage: nitro-demo [--follow | --animate] [--windows N] [--damage] [--stats]
   --seconds S        quit after S seconds
   --save-small FILE  write a downscaled PNG of the demo image and exit
 
+  --video            NV12 Surface test client: colour bars, moving box, counter
+  --size WxH         video buffer size (default 1280x720; even)
+  --fps 30|60        video frame rate (default 60)
+  --fullscreen       ask for fullscreen at start
+  --follow-hint      reallocate buffers at the size a SurfaceHint asks for
+  --frames N         quit after N presented video frames
+
 Environment: NITRO_SOCKET, NITRO_CONTROL, NITRO_DEMO_SHOW_DAMAGE=1.
 Keys: q quit, d toggle damage outlines, Esc close the window, n/p select.
+Video keys: space pause, f toggle fullscreen, q quit.
 Selecting tints a window's follower: v1 has no client-initiated stacking
 message, so a client cannot raise itself (the server raises on a click).";
 
@@ -98,6 +143,17 @@ pub fn parse(
         match a.as_str() {
             "--follow" => out.mode = Mode::Follow,
             "--animate" => out.mode = Mode::Animate,
+            "--video" => out.mode = Mode::Video,
+            "--size" => out.video.size = size(it.next())?,
+            "--fps" => {
+                out.video.fps = match number(&mut it, "--fps")? {
+                    f @ (30 | 60) => f as u32,
+                    f => return Err(format!("--fps: {f} is not 30 or 60")),
+                };
+            }
+            "--fullscreen" => out.video.fullscreen = true,
+            "--follow-hint" => out.video.follow_hint = true,
+            "--frames" => out.video.frames = number(&mut it, "--frames")?,
             "--damage" => out.show_damage = true,
             "--stats" => out.stats = true,
             "--windows" => out.windows = number(&mut it, "--windows")?.max(1) as u32,
@@ -110,6 +166,20 @@ pub fn parse(
         }
     }
     Ok(out)
+}
+
+/// Parse `--size`'s `WxH`: both positive, even, at most 8192.
+fn size(raw: Option<String>) -> Result<(u32, u32), String> {
+    let raw = raw.ok_or("--size needs WxH")?;
+    let bad = || format!("--size: {raw:?} is not WxH with even sides in 2..=8192");
+    let (w, h) = raw.split_once(['x', 'X']).ok_or_else(bad)?;
+    let (w, h): (u32, u32) = (w.parse().map_err(|_| bad())?, h.parse().map_err(|_| bad())?);
+    let ok = |v: u32| (2..=8192).contains(&v) && v.is_multiple_of(2);
+    if ok(w) && ok(h) {
+        Ok((w, h))
+    } else {
+        Err(bad())
+    }
 }
 
 /// Read the next argument as a `u64`.
@@ -171,5 +241,51 @@ mod tests {
         assert!(args("--save-small").unwrap_err().contains("needs a FILE"));
         assert!(args("--wat").unwrap_err().contains("unknown argument"));
         assert!(args("--help").unwrap_err().contains("usage:"));
+    }
+
+    #[test]
+    fn video_defaults_are_720p60_windowed() {
+        let a = args("--video").unwrap();
+        assert_eq!(a.mode, Mode::Video);
+        assert_eq!(a.video, VideoOpts::default());
+        assert_eq!((a.video.size, a.video.fps), ((1280, 720), 60));
+        assert!(!a.video.fullscreen && !a.video.follow_hint);
+        assert_eq!(a.video.frames, 0);
+        assert_eq!(Mode::Video.to_string(), "video");
+    }
+
+    #[test]
+    fn video_flags_are_parsed() {
+        let a =
+            args("--video --size 640x360 --fps 30 --fullscreen --follow-hint --frames 10").unwrap();
+        assert_eq!(
+            a.video,
+            VideoOpts {
+                size: (640, 360),
+                fps: 30,
+                fullscreen: true,
+                follow_hint: true,
+                frames: 10,
+            }
+        );
+        assert_eq!(
+            args("--video --size 1920X1080").unwrap().video.size,
+            (1920, 1080)
+        );
+    }
+
+    #[test]
+    fn bad_video_arguments_explain_themselves() {
+        assert!(args("--size").unwrap_err().contains("needs WxH"));
+        for bad in ["1280", "x720", "1281x720", "0x0", "99999x2", "axb"] {
+            assert!(
+                args(&format!("--size {bad}"))
+                    .unwrap_err()
+                    .contains("not WxH"),
+                "{bad}"
+            );
+        }
+        assert!(args("--fps 50").unwrap_err().contains("not 30 or 60"));
+        assert!(args("--fps").unwrap_err().contains("needs a number"));
     }
 }

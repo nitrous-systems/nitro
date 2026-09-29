@@ -37,6 +37,8 @@
 //! * [`control`] — the v0 control socket, for the server's own view.
 //! * [`png`] — a size-conscious PNG writer for `--save-small`.
 //! * [`app`] — the event loop that ties them together.
+//! * [`video`] — `--video`: an NV12 `Surface` test client (colour bars,
+//!   a moving box, a frame counter) presented with `PresentSurface`.
 //!
 //! The split is what lets `tests/against_server.rs` drive the real server
 //! loop in-process with the real demo scene, rather than a reimplementation
@@ -51,6 +53,7 @@ pub mod geom;
 pub mod latency;
 pub mod png;
 pub mod scene;
+pub mod video;
 
 /// `CLOCK_MONOTONIC` nanoseconds, the clock every timestamp on the wire
 /// uses.

@@ -62,8 +62,12 @@ pub mod keys {
     pub const P: u32 = 25;
     /// `KEY_D`.
     pub const D: u32 = 32;
+    /// `KEY_F` (`--video`: toggle fullscreen).
+    pub const F: u32 = 33;
     /// `KEY_N`.
     pub const N: u32 = 49;
+    /// `KEY_SPACE` (`--video`: pause).
+    pub const SPACE: u32 = 57;
 }
 
 /// How often the running summary is printed.
@@ -662,6 +666,10 @@ pub enum Error {
     Io(rustix::io::Errno),
     /// The server sent a fatal `Error` message.
     Server(String),
+    /// Mapping a buffer failed (`--video`).
+    Map(nitro_shm::MapError),
+    /// The server lacks a capability the mode needs.
+    Unsupported(&'static str),
 }
 
 impl std::fmt::Display for Error {
@@ -670,6 +678,8 @@ impl std::fmt::Display for Error {
             Error::Wire(e) => write!(f, "wire: {e}"),
             Error::Io(e) => write!(f, "io: {e}"),
             Error::Server(m) => write!(f, "server error: {m}"),
+            Error::Map(e) => write!(f, "map: {e}"),
+            Error::Unsupported(m) => write!(f, "unsupported: {m}"),
         }
     }
 }
@@ -679,6 +689,12 @@ impl std::error::Error for Error {}
 impl From<WireError> for Error {
     fn from(e: WireError) -> Self {
         Error::Wire(e)
+    }
+}
+
+impl From<nitro_shm::MapError> for Error {
+    fn from(e: nitro_shm::MapError) -> Self {
+        Error::Map(e)
     }
 }
 
@@ -740,8 +756,16 @@ mod tests {
         // The values a `KEY_*` header gives; a typo here would silently
         // make `q` not quit on the box.
         assert_eq!(
-            (keys::ESC, keys::Q, keys::D, keys::N, keys::P),
-            (1, 16, 32, 49, 25)
+            (
+                keys::ESC,
+                keys::Q,
+                keys::D,
+                keys::N,
+                keys::P,
+                keys::F,
+                keys::SPACE
+            ),
+            (1, 16, 32, 49, 25, 33, 57)
         );
     }
 }
