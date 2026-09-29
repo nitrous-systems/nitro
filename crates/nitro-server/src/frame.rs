@@ -366,6 +366,7 @@ impl Shadow {
 /// Per-output frame bookkeeping: damage, the one-frame history the age-2
 /// rule needs, and the vblank clock the frame deadlines come from.
 #[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)] // Independent per-output flags, not a state machine.
 pub struct OutputState {
     /// The KMS id, which is also what `Presented` reports to clients.
     pub kms_id: KmsOutputId,

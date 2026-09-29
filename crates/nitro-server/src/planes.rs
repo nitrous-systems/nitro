@@ -352,6 +352,7 @@ fn above(p: &PlaneInfo, primary: &PlaneInfo) -> bool {
     }
 }
 
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)] // The strategies in order; splitting them would scatter the shared layout state.
 /// The search behind [`Planner::decide`]: the best layout the kernel
 /// accepts, with no cache and no hysteresis. `test` counts on its own.
 pub fn search(inp: &Inputs<'_>, test: &mut dyn FnMut(&[PlaneConfig]) -> bool) -> Decision {
@@ -572,13 +573,11 @@ impl Planner {
             let d = search(inp, &mut |l: &[PlaneConfig]| {
                 *tests += 1;
                 let a: Vec<PlaneAssignment<'_>> = l.iter().map(|c| c.assignment(None)).collect();
-                match test(&a) {
-                    Some(v) => v.accepted(),
-                    None => {
-                        asked = false;
-                        false
-                    }
-                }
+                let Some(v) = test(&a) else {
+                    asked = false;
+                    return false;
+                };
+                v.accepted()
             });
             if asked {
                 if self.cache.len() >= CACHE_ENTRIES {

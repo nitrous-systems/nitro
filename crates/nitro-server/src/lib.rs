@@ -10476,9 +10476,8 @@ impl Server {
             Cursor::rect_scaled(cs.x, cs.y, cs.shape, cs.scale).translate(orect.x, orect.y)
         });
         for (i, item) in items.iter().enumerate() {
-            let size = match item.kind {
-                PaintKind::Surface { size, .. } | PaintKind::Hole { size } => size,
-                _ => continue,
+            let (PaintKind::Surface { size, .. } | PaintKind::Hole { size }) = item.kind else {
+                continue;
             };
             let t = item.transform;
             if !t.is_axis_aligned() || t.a <= 0.0 || t.d <= 0.0 || item.opacity < 1.0 {

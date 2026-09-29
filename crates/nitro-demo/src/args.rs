@@ -24,6 +24,7 @@ pub enum Mode {
 
 /// The `--video` options.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // One flag per command-line switch.
 pub struct VideoOpts {
     /// Buffer size in pixels (`--size WxH`), both even.
     pub size: (u32, u32),
