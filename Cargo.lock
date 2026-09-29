@@ -215,6 +215,7 @@ version = "0.0.1"
 name = "nitro-demo"
 version = "0.0.1"
 dependencies = [
+ "drm",
  "nitro-core",
  "nitro-kms",
  "nitro-server",

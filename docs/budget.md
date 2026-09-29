@@ -1548,6 +1548,50 @@ kernel (`AllocSurfaceBuffersFailed { Failed }`: i915 on Gen7 rejects an
 NV12 framebuffer at `AddFB2`), and the demo fell back to memfds as
 designed.
 
+## Client dma-bufs (#3918)
+
+Release builds, stripped, with main `a769355` as the base:
+
+| binary | before | after | Δ | stated budget |
+|---|---|---|---|---|
+| nitro-server | 3 213 472 | 3 245 272 | **+31 800** | ≤ +25 KB |
+| nitro-demo | 575 584 | 579 264 | **+3 680** | ≤ +3 KB |
+
+**Over budget, and accepted.** The server's overrun is ~7 KB. Most of it
+is the fence-aware latch queue, which replaced a map of single frames
+with a map of small vectors. That adds three result vectors and the
+generic partition/drain code, instantiated for `Queued`. The rest is
+two `Hints`-style trackers, now that per-node feedback exists. Every
+client binary pays for the three new `nitro-wire` messages. For the
+demo that is +3.7 KB against a planned 3 KB, because
+`CreateDmabufBuffer` carries a fixed four-plane layout table. No new
+crate: rustix `event::poll`/`fs::fstat` and the `drm` crate are
+already in the tree, and `drm` is a dev-dependency of the demo example
+only.
+
+**Memory.** A dma-buf's pages belong to its exporter. They are not in
+the server's `RssAnon` and not counted against the byte caps, except
+when a CPU-path buffer is mapped: its mapped bytes then count like a
+memfd's. Each buffer costs the server one `HeldBuffer`, plane 0's fd,
+and a read-only mapping (page tables) when it is on the CPU path. A
+pending fence costs one fd and one epoll entry. An idle server holds
+none of these.
+
+**testhost2 (KBL, i915, 2560×1440 at scale 1.25)**, `nitro-demo`
+example `dmabuf_import`:
+
+| source | layout | path | `dmabuf_*` stats | send → `Presented` |
+|---|---|---|---|---|
+| DRM dumb buffer, PRIME export (`--linear`) | NV12 LINEAR 1920×1080 | CPU (`blit_nv12`), colour bars correct | cpu_mapped 1, kms_imported 1, placeholder_paints 0 | 59.2 ms (first frame) |
+| VA-API surface, `vaExportSurfaceHandle` (`va_export.c`) | NV12 I915_Y_TILED, one object, planes at 0 / 2 088 960, pitch 1920 | grey placeholder, no crash | cpu_mapped 0, kms_imported 1 (AddFB2 with modifiers accepted), placeholder_paints 1 | 32.9 ms |
+
+The default `DmabufFeedback` listed 69 pairs, with `main_device` 226:1
+and max 2560×1440. It matches the README §testbox2 `IN_FORMATS`: NV12
+LINEAR/X/Y-tiled flagged `SCANOUT` on the sprites. On both paths the
+implicit fence had already signalled at present time: `fence_waits` 0,
+no `implicit_fence_fallbacks`, so the kernel has
+`EXPORT_SYNC_FILE`.
+
 ## nitro-video (#3906)
 
 box1, nitro-dev on main `76d438e`, x264 High 30 fps clips, 450 frames,

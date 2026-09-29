@@ -6595,7 +6595,7 @@ impl Server {
             .wire_clients
             .values()
             .flat_map(|c| c.buffers.values())
-            .filter(|h| h.scanout.is_some());
+            .filter(|h| h.scanout.is_some() && !h.dmabuf);
         let (n, bytes) = scanout.fold((0u64, 0u64), |(n, b), h| (n + 1, b + h.bytes));
         pairs.push(("scanout_buffers", n));
         pairs.push(("scanout_buffer_bytes", bytes));

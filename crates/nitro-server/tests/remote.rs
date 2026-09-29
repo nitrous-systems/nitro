@@ -926,3 +926,93 @@ fn keymap_is_not_advertised_on_a_remote_link() {
     drop(conn);
     h.quit();
 }
+
+/// Client dma-bufs (#3918) are descriptors: `DMABUF` is not advertised on
+/// a remote link, `Connection` refuses `CreateDmabufBuffer` and
+/// `PresentSurfaceFenced` before encoding them, and a raw
+/// `CreateDmabufBuffer` frame that reaches the server anyway (declaring no
+/// descriptors) is the non-fatal buffers refusal, like `CreateBuffer`.
+#[test]
+fn dmabuf_ops_are_refused_on_a_remote_link() {
+    use nitro_wire::msg::{CreateDmabufBuffer, DmabufPlane, PresentSurface};
+    let h = Harness::start("dmabuf", "remote.listen = 127.0.0.1:0\n");
+    let mut conn = h.remote_client("remote-dmabuf");
+    assert!(!conn.has_caps(caps::DMABUF), "caps = {:#x}", conn.caps());
+    let mut seen = Vec::new();
+    make_window(&mut conn, &mut seen, 1, 1);
+    h.settle();
+
+    // Client side: RemoteNoFds, nothing sent.
+    let fd = nitro_shm::create_sealed("remote-dmabuf", 4096).expect("memfd");
+    let err = conn
+        .create_dmabuf_buffer(CreateDmabufBuffer {
+            id: BufferId(1),
+            width: 32,
+            height: 32,
+            format: format::XR24,
+            modifier: nitro_wire::types::modifier::LINEAR,
+            planes: vec![DmabufPlane {
+                fd,
+                offset: 0,
+                stride: 128,
+            }],
+        })
+        .expect_err("a dma-buf cannot go out over TCP");
+    assert!(
+        matches!(err, WireError::RemoteNoFds),
+        "want RemoteNoFds, got {err:?}"
+    );
+    let (fence, _w) = rustix::pipe::pipe().unwrap();
+    let err = conn
+        .present_surface_fenced(
+            PresentSurface {
+                id: NodeId(2),
+                buffer: BufferId(1),
+                serial: 5,
+                src: nitro_core::IRect::new(0, 0, 32, 32),
+                matrix: nitro_wire::types::ColorMatrix::Bt709,
+                range: nitro_wire::types::ColorRange::Limited,
+                damage: vec![],
+            },
+            fence,
+        )
+        .expect_err("a fence cannot go out over TCP");
+    assert!(
+        matches!(err, WireError::RemoteNoFds),
+        "want RemoteNoFds, got {err:?}"
+    );
+
+    // Server side: a raw CreateDmabufBuffer declaring no fds. Everything
+    // queued has been flushed, so this cannot interleave with a frame.
+    conn.flush().unwrap();
+    let body = [0u8; 57];
+    let mut frame =
+        nitro_wire::header::encode(body.len() as u32, CreateDmabufBuffer::OP, 0).to_vec();
+    frame.extend_from_slice(&body);
+    let mut at = 0;
+    while at < frame.len() {
+        at += rustix::io::write(conn.as_fd(), &frame[at..]).expect("write the raw frame");
+    }
+    let (code, msg) = expect(&mut conn, &mut seen, "the dma-buf refusal", |m| match m {
+        ServerMsg::Error(e) => Some((e.code, e.msg.clone())),
+        _ => None,
+    });
+    assert_eq!(code, nitro_wire::types::ErrorCode::BadBuffer, "{msg}");
+    assert!(msg.contains("not available on a remote link"), "{msg}");
+
+    // Not fatal: the client keeps its window and still paints.
+    conn.tx()
+        .fill_solid(NodeId(2), Color::rgb(0x00, 0xFF, 0x00))
+        .commit(2)
+        .unwrap();
+    conn.flush().unwrap();
+    h.settle();
+    assert_eq!(h.stat("remote_clients"), 1, "the client survived");
+    assert_eq!(h.stat("windows"), 1);
+    assert_eq!(
+        pixel(&h.shot(), OUT.0 / 2, OUT.1 / 2),
+        (0x00, 0xFF, 0x00),
+        "still painting after the refusal"
+    );
+    h.quit();
+}

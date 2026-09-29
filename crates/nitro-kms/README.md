@@ -666,6 +666,17 @@ output#1 eDP-1 2560x1440: multi-plane flips (--flip)
   reported. Whether the panel really showed green where expected was not
   checked on either box.
 
+### dma-buf import (#3918), testbox2, 2026-09-29
+
+`import_buffer` on i915 (KBL, kernel 7.2.2) accepted both a linear NV12
+PRIME export of a dumb buffer and a VA-API `vaExportSurfaceHandle` NV12
+surface with `I915_Y_TILED` (one object, planes at 0 / 2 088 960, pitch
+1920). The Y-tiled one needed `AddFB2` with `DRM_MODE_FB_MODIFIERS`.
+`device_id` reported 226:1 (`/dev/dri/card1`). Driven by
+`crates/nitro-demo/examples/dmabuf_import.rs` and
+`docs/research/gpu-testbox/va_export.c`; server-side numbers are in
+`docs/budget.md` § Client dma-bufs.
+
 ## ARGB scanout (#3898)
 
 `Backend::scanout_alpha(output)` says whether the primary plane can scan

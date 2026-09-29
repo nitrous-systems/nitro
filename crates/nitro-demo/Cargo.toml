@@ -29,3 +29,7 @@ signal-hook = { version = "0.4", default-features = false }
 nitro-server = { path = "../nitro-server" }
 # For `Image`, the shape a `shot` readback comes back in.
 nitro-kms = { workspace = true }
+# `examples/dmabuf_import.rs --linear` (#3918): a DRM dumb buffer exported
+# with PRIME, as a real linear dma-buf. Already in the tree (nitro-kms);
+# safe wrappers, so the example needs no `unsafe`.
+drm = { workspace = true }
