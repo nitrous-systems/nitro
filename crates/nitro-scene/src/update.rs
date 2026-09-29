@@ -505,8 +505,8 @@ impl Scene {
     ) {
         // Only part of the image's buffer changed. Nothing moved, so
         // the old and new footprints agree and the damaged texels
-        // map to one device rect each — or, where the mapping is not
-        // a plain translate or integer scale, the whole node.
+        // map to one device rect each — or, where the mapping is
+        // rotated, sheared or flipped, the whole node.
         let node = self.node_ref(key);
         let src = node.data.buffer_ref().map(|(_, src)| src);
         let size = (node.bounds.w, node.bounds.h);
@@ -631,13 +631,21 @@ const EXACT: f32 = 1e-4;
 /// Device-pixel rect covering the output of damaged buffer texels `rect` of
 /// an image node sampling `src` into a `size` box under `world`, or `None`
 /// when the mapping is too general to bound tightly (rotation, shear, a
-/// fractional or non-integer scale, a sub-pixel origin), in which case the
-/// caller damages the whole node.
+/// flipped or degenerate scale), in which case the caller damages the whole
+/// node.
 ///
 /// At scale 1 on a whole-pixel origin the rasterizer copies texels 1:1, so
 /// the rect maps exactly. At an integer scale above 1 it samples bilinearly,
 /// so a destination pixel next to a damaged texel blends it in too: the
 /// source rect is widened by one texel on each side before mapping.
+///
+/// Any other axis-aligned mapping (a fractional output scale such as 1.25,
+/// a downscale, a sub-pixel origin, a stretched image) is bounded
+/// conservatively: the texel rect is rounded out to even edges (4:2:0 and
+/// 4:2:2 chroma covers texel pairs) and widened by the samplers' reach —
+/// two texels, or more when downscaling — then mapped as floats, rounded
+/// out and padded by one device pixel, which absorbs the painters' own
+/// rounding of the destination rect.
 pub(crate) fn partial_device_rect(
     world: &Transform,
     size: (f32, f32),
@@ -654,16 +662,13 @@ pub(crate) fn partial_device_rect(
     let sx = world.a * size.0 / src.w as f32;
     let sy = world.d * size.1 / src.h as f32;
     let integral = |v: f32| v.is_finite() && v >= 1.0 - EXACT && (v - v.round()).abs() < EXACT;
-    if !integral(sx) || !integral(sy) {
-        return None;
-    }
-    // The device origin of the node's box: whole pixels only.
     let (ox, oy) = (world.e, world.f);
-    if !ox.is_finite() || !oy.is_finite() {
+    if !sx.is_finite() || !sy.is_finite() || !ox.is_finite() || !oy.is_finite() {
         return None;
     }
-    if (ox - ox.round()).abs() >= EXACT || (oy - oy.round()).abs() >= EXACT {
-        return None;
+    let whole_origin = (ox - ox.round()).abs() < EXACT && (oy - oy.round()).abs() < EXACT;
+    if !integral(sx) || !integral(sy) || !whole_origin {
+        return fractional_device_rect((ox, oy), (sx, sy), src, rect);
     }
     let (sx, sy) = (sx.round() as i32, sy.round() as i32);
     let rect = if sx == 1 && sy == 1 {
@@ -678,5 +683,49 @@ pub(crate) fn partial_device_rect(
         oy + (rect.y - src.y) * sy,
         ox + (rect.right() - src.x) * sx,
         oy + (rect.bottom() - src.y) * sy,
+    ))
+}
+
+/// The general axis-aligned case of [`partial_device_rect`]: the node's box
+/// has device origin `origin` and maps one texel to `scale` device pixels.
+fn fractional_device_rect(
+    origin: (f32, f32),
+    scale: (f32, f32),
+    src: IRect,
+    rect: IRect,
+) -> Option<IRect> {
+    let (sx, sy) = scale;
+    if sx <= 0.0 || sy <= 0.0 {
+        return None;
+    }
+    // The texels a destination pixel can read beyond the damaged ones:
+    // bilinear taps plus chroma pairs, or the footprint when downscaling.
+    let reach = |s: f32| ((1.0 / s).ceil() as i32 + 1).max(2);
+    let (wx, wy) = (reach(sx), reach(sy));
+    let even_down = |v: i32| v.div_euclid(2) * 2;
+    let even_up = |v: i32| (v + 1).div_euclid(2) * 2;
+    let texels = IRect::from_edges(
+        even_down(rect.x) - wx,
+        even_down(rect.y) - wy,
+        even_up(rect.right()) + wx,
+        even_up(rect.bottom()) + wy,
+    )
+    .intersect(&src);
+    if texels.is_empty() {
+        return Some(IRect::EMPTY);
+    }
+    let (ox, oy) = origin;
+    let exact = Rect::new(
+        ox + (texels.x - src.x) as f32 * sx,
+        oy + (texels.y - src.y) as f32 * sy,
+        texels.w as f32 * sx,
+        texels.h as f32 * sy,
+    );
+    let r = exact.round_out();
+    Some(IRect::from_edges(
+        r.x - 1,
+        r.y - 1,
+        r.right() + 1,
+        r.bottom() + 1,
     ))
 }

@@ -58,6 +58,17 @@ impl Harness {
 
     /// As [`Harness::start`], with a plane inventory for the fake output.
     fn start_with(name: &str, mhz: u32, planes: Vec<nitro_kms::FakePlaneSpec>) -> Self {
+        Self::start_config(name, mhz, |c| c.fake_planes = planes)
+    }
+
+    /// As [`Harness::start`], with the output at `scale`.
+    fn start_scaled(name: &str, mhz: u32, scale: &str) -> Self {
+        let scales = nitro_server::parse_scales(&format!("Virtual-1={scale}"));
+        Self::start_config(name, mhz, |c| c.scales = scales)
+    }
+
+    /// As [`Harness::start`], with `f` adjusting the config.
+    fn start_config(name: &str, mhz: u32, f: impl FnOnce(&mut Config)) -> Self {
         let dir = std::env::temp_dir().join(format!("nitro-surf-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("nitro").join("control.sock");
@@ -67,7 +78,7 @@ impl Harness {
             height: OUT.1,
         };
         config.fake_modes = vec![(OUT.0, OUT.1, mhz)];
-        config.fake_planes = planes;
+        f(&mut config);
         let wire_path = config.wire_path.clone();
         let thread = std::thread::spawn(move || run(config));
         let h = Self {
@@ -596,6 +607,104 @@ fn only_the_surface_rect_or_its_damage_is_repainted() {
     let new = &vals[vals.len() - (after - before) as usize..];
     assert_eq!(new[0], 8 * 6, "only the frame's damage: {new:?}");
     h.quit();
+}
+
+/// Rewrite the luma texels of `r` and every chroma pair they touch.
+fn scribble(buf: &mut Buf, r: IRect) {
+    let bytes = buf.map.as_bytes_mut();
+    for y in r.y..r.bottom() {
+        for x in r.x..r.right() {
+            let i = (y * SIDE.cast_signed() + x) as usize;
+            bytes[i] = bytes[i].wrapping_add(97) % 220 + 16;
+        }
+    }
+    let luma = (SIDE * SIDE) as usize;
+    for cy in r.y / 2..(r.bottom() + 1) / 2 {
+        for cx in (r.x / 2) * 2..((r.right() + 1) / 2) * 2 {
+            let i = luma + (cy * SIDE.cast_signed() + cx) as usize;
+            bytes[i] = bytes[i].wrapping_add(61) % 220 + 16;
+        }
+    }
+}
+
+/// At fractional output scale a partial frame damages a small rect, and
+/// repainting only that rect is byte-identical to a fresh full paint of
+/// the same frame (#3927). `size` is the surface node's logical size.
+fn fractional_damage_is_partial_and_exact(name: &str, size: f32) {
+    let damaged = IRect::new(5, 7, 8, 8);
+    let h = Harness::start_scaled(name, 60_000, "1.25");
+    let (mut conn, mut seen) = surface_client(&h, name);
+    // B starts as A's twin: the swap rule's damage is relative to the
+    // frame shown before, so only the scribbled texels may differ.
+    let (mut a, b) = (Buf::new(1, format::NV12, 1), Buf::new(2, format::NV12, 1));
+    window(&mut conn, &mut seen, &[&a, &b], (size, size));
+    // Show both once, so the swap rule applies afterwards.
+    present(&mut conn, &a, 2, vec![]);
+    presented(&mut conn, &mut seen, 2);
+    present(&mut conn, &b, 3, vec![]);
+    presented(&mut conn, &mut seen, 3);
+    h.settle();
+
+    // Change A's texels (and chroma) under the rect, then swap back to A
+    // with just that damage.
+    scribble(&mut a, damaged);
+    let (before, _) = h.damage_samples();
+    present(&mut conn, &a, 4, vec![damaged]);
+    presented(&mut conn, &mut seen, 4);
+    h.settle();
+    let (after, vals) = h.damage_samples();
+    let new = &vals[vals.len() - (after - before) as usize..];
+    let node = f64::from(size * 1.25).powi(2) as u64;
+    assert!(
+        new[0] > 0 && new[0] * 2 < node,
+        "a small part of the {node}-px node: {new:?}"
+    );
+    let partial = h.shot();
+    h.quit();
+
+    // A fresh server painting the final A whole.
+    let fresh = format!("{name}-fresh");
+    let h = Harness::start_scaled(&fresh, 60_000, "1.25");
+    let (mut conn, mut seen) = surface_client(&h, &fresh);
+    window(&mut conn, &mut seen, &[&a], (size, size));
+    present(&mut conn, &a, 2, vec![]);
+    presented(&mut conn, &mut seen, 2);
+    h.settle();
+    let full = h.shot();
+    h.quit();
+    assert_eq!(partial.0, full.0);
+    let diff = partial
+        .1
+        .iter()
+        .zip(&full.1)
+        .filter(|(p, f)| p != f)
+        .count();
+    let bbox = partial
+        .1
+        .iter()
+        .zip(&full.1)
+        .enumerate()
+        .filter(|(_, (p, f))| p != f)
+        .fold((u32::MAX, u32::MAX, 0, 0), |(x0, y0, x1, y1), (i, _)| {
+            let (x, y) = ((i as u32 % partial.0) / 4, i as u32 / partial.0);
+            (x0.min(x), y0.min(y), x1.max(x), y1.max(y))
+        });
+    assert_eq!(
+        diff, 0,
+        "the partial repaint differs from a full one: {bbox:?}"
+    );
+}
+
+#[test]
+fn fractional_scale_damage_is_partial_and_exact() {
+    fractional_damage_is_partial_and_exact("frac-up", SIDE as f32);
+}
+
+#[test]
+fn fractional_scale_downscaled_damage_is_partial_and_exact() {
+    // 32 texels into 15 device pixels: every destination pixel reads
+    // more than two texels.
+    fractional_damage_is_partial_and_exact("frac-down", 12.0);
 }
 
 #[test]

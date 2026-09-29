@@ -1875,7 +1875,7 @@ impl Scene {
     /// Every image node sampling an overlapping source rect gets the
     /// overlap as sub-rect damage: the next [`update`](Scene::update) maps it
     /// into device pixels and repaints only that, falling back to the whole
-    /// node where the mapping is not a plain translate or integer scale. The
+    /// node only where the mapping is rotated, sheared or flipped. The
     /// rest of the tree is untouched.
     ///
     /// The rects are also remembered until the next `update`, so a

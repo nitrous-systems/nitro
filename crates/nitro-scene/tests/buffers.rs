@@ -117,8 +117,10 @@ fn buffer_damage_reaches_only_the_images_that_sample_it() {
     s.buffer_mut(CLIENT, buffer).unwrap()[0] = 1;
     s.buffer_damaged(CLIENT, buffer, &[IRect::new(0, 0, 8, 8)])
         .unwrap();
+    // The image halves the source vertically: the damaged texels widen
+    // by the samplers' reach and map to a corner of the node.
     let d1 = damage(&mut s);
-    assert_eq!(d1.rects(), &[IRect::new(0, 0, 32, 32)]);
+    assert_eq!(d1.rects(), &[IRect::new(0, 0, 11, 7)]);
 
     // Damage spanning both halves touches both.
     s.buffer_damaged(CLIENT, buffer, &[IRect::new(0, 0, 64, 4)])
@@ -137,7 +139,7 @@ fn buffer_damage_reaches_only_the_images_that_sample_it() {
     s.buffer_damaged(CLIENT, other, &[IRect::new(0, 0, 1, 1)])
         .unwrap();
     let d4 = damage(&mut s);
-    assert_eq!(d4.rects(), &[IRect::new(200, 0, 32, 32)]);
+    assert_eq!(d4.rects(), &[IRect::new(200, 0, 4, 4)]);
     assert_eq!(
         s.node(stranger).unwrap().world_bounds(),
         IRect::new(200, 0, 32, 32)
@@ -802,19 +804,6 @@ fn awkward_mappings_fall_back_to_the_whole_node() {
         assert_eq!(dmg.bounds(), s.node(node).unwrap().world_bounds());
         assert!(!dmg.is_empty());
     };
-    // Fractional scale.
-    whole(&|s, root| {
-        let g = group(s, root, Rect::new(0.0, 0.0, 400.0, 300.0));
-        s.set_transform(CLIENT, g, Transform::scale(0.5, 0.5))
-            .unwrap();
-        g
-    });
-    whole(&|s, root| {
-        let g = group(s, root, Rect::new(0.0, 0.0, 400.0, 300.0));
-        s.set_transform(CLIENT, g, Transform::scale(1.5, 1.5))
-            .unwrap();
-        g
-    });
     // Rotation (90°).
     whole(&|s, root| {
         let g = group(s, root, Rect::new(200.0, 0.0, 400.0, 300.0));
@@ -829,36 +818,164 @@ fn awkward_mappings_fall_back_to_the_whole_node() {
         s.set_transform(CLIENT, g, rot).unwrap();
         g
     });
+    // A flip.
+    whole(&|s, root| {
+        let g = group(s, root, Rect::new(200.0, 0.0, 400.0, 300.0));
+        s.set_transform(CLIENT, g, Transform::scale(-1.0, 1.0))
+            .unwrap();
+        g
+    });
+}
+
+/// Damage for texels `texels` of a 64x64 image node whose device origin
+/// is `origin` and which maps one texel to `scale` device pixels: must be
+/// non-empty, inside the node, much smaller than it, and cover the exact
+/// float image of the damaged texels.
+fn assert_bounded(
+    dmg: &nitro_core::Damage,
+    node: IRect,
+    origin: (f32, f32),
+    scale: (f32, f32),
+    texels: IRect,
+) {
+    assert!(!dmg.is_empty());
+    let b = dmg.bounds();
+    assert_eq!(b.intersect(&node), b, "{b:?} inside {node:?}");
+    assert!(
+        b.area() * 8 < node.area(),
+        "{b:?} is a small part of {node:?}"
+    );
+    let exact = Rect::new(
+        origin.0 + texels.x as f32 * scale.0,
+        origin.1 + texels.y as f32 * scale.1,
+        texels.w as f32 * scale.0,
+        texels.h as f32 * scale.1,
+    )
+    .round_out();
+    assert_eq!(b.intersect(&exact), exact, "{b:?} covers {exact:?}");
+}
+
+#[test]
+fn fractional_mappings_damage_a_bounded_sub_rect() {
+    let texels = IRect::new(20, 30, 2, 2);
+    let bounded =
+        |setup: &dyn Fn(&mut Scene, NodeKey) -> NodeKey, origin: (f32, f32), scale: (f32, f32)| {
+            let mut s = scene();
+            let (_, root) = window(&mut s);
+            let parent = setup(&mut s, root);
+            let (node, buffer) = partial_setup(&mut s, parent, Rect::new(10.0, 10.0, 64.0, 64.0));
+            s.buffer_damaged(CLIENT, buffer, &[texels]).unwrap();
+            let dmg = damage(&mut s);
+            assert_bounded(
+                &dmg,
+                s.node(node).unwrap().world_bounds(),
+                origin,
+                scale,
+                texels,
+            );
+        };
+    // Downscale.
+    bounded(
+        &|s, root| {
+            let g = group(s, root, Rect::new(0.0, 0.0, 400.0, 300.0));
+            s.set_transform(CLIENT, g, Transform::scale(0.5, 0.5))
+                .unwrap();
+            g
+        },
+        (5.0, 5.0),
+        (0.5, 0.5),
+    );
+    // Fractional upscale.
+    bounded(
+        &|s, root| {
+            let g = group(s, root, Rect::new(0.0, 0.0, 400.0, 300.0));
+            s.set_transform(CLIENT, g, Transform::scale(1.5, 1.5))
+                .unwrap();
+            g
+        },
+        (15.0, 15.0),
+        (1.5, 1.5),
+    );
     // Sub-pixel translate.
-    whole(&|s, root| group(s, root, Rect::new(0.25, 0.0, 400.0, 300.0)));
+    bounded(
+        &|s, root| group(s, root, Rect::new(0.25, 0.0, 400.0, 300.0)),
+        (10.25, 10.0),
+        (1.0, 1.0),
+    );
+
     // Image bounds that stretch the source.
     let mut s = scene();
     let (_, root) = window(&mut s);
     let d = desc();
     let buffer = s.create_buffer(CLIENT, d, vec![0; d.byte_len()]).unwrap();
-    image_node(
+    let node = image_node(
         &mut s,
         root,
         buffer,
-        Rect::new(0.0, 0.0, 100.0, 64.0),
+        Rect::new(0.0, 0.0, 200.0, 64.0),
         d.full_rect(),
     );
     settle(&mut s);
-    s.buffer_damaged(CLIENT, buffer, &[IRect::new(1, 1, 2, 2)])
-        .unwrap();
-    assert_eq!(damage(&mut s).rects(), &[IRect::new(0, 0, 100, 64)]);
+    s.buffer_damaged(CLIENT, buffer, &[texels]).unwrap();
+    let dmg = damage(&mut s);
+    assert_bounded(
+        &dmg,
+        s.node(node).unwrap().world_bounds(),
+        (0.0, 0.0),
+        (200.0 / 64.0, 1.0),
+        texels,
+    );
 
     // Fractional output scale (the overview's case in miniature).
     let mut s = Scene::new();
     s.add_output(OUT, IRect::new(0, 0, 1600, 1200), 1.5);
     let (_, root) = common::window_at(&mut s, nitro_core::Point::ZERO, Size::new(400.0, 300.0));
     let (node, buffer) = partial_setup(&mut s, root, Rect::new(10.0, 10.0, 64.0, 64.0));
-    s.buffer_damaged(CLIENT, buffer, &[IRect::new(1, 1, 2, 2)])
-        .unwrap();
-    assert_eq!(
-        damage(&mut s).bounds(),
-        s.node(node).unwrap().world_bounds()
+    s.buffer_damaged(CLIENT, buffer, &[texels]).unwrap();
+    let dmg = damage(&mut s);
+    assert_bounded(
+        &dmg,
+        s.node(node).unwrap().world_bounds(),
+        (15.0, 15.0),
+        (1.5, 1.5),
+        texels,
     );
+}
+
+#[test]
+fn an_output_scale_of_1_25_keeps_damage_partial() {
+    let mut s = Scene::new();
+    s.add_output(OUT, IRect::new(0, 0, 2000, 1500), 1.25);
+    // Logical (80, 40) is device (100, 50); the image at (10, 20) inside
+    // sits at device (112.5, 75), 1.25 device pixels per texel.
+    let (_, root) = common::window_at(
+        &mut s,
+        nitro_core::Point::new(80.0, 40.0),
+        Size::new(400.0, 300.0),
+    );
+    let (node, buffer) = partial_setup(&mut s, root, Rect::new(10.0, 20.0, 64.0, 64.0));
+    assert_eq!(
+        s.node(node).unwrap().world_bounds(),
+        IRect::new(112, 75, 81, 80)
+    );
+
+    // Texels [8, 12) widen to [6, 14): device x [120, 130), y [82.5,
+    // 92.5) → rounded out and padded by one pixel.
+    s.buffer_damaged(CLIENT, buffer, &[IRect::new(8, 8, 4, 4)])
+        .unwrap();
+    assert_eq!(damage(&mut s).rects(), &[IRect::new(119, 81, 12, 13)]);
+
+    // An odd single texel rounds out to its chroma pair: [5, 6) → [4, 6)
+    // → [2, 8): device x [115, 122.5), y [77.5, 85).
+    s.buffer_damaged(CLIENT, buffer, &[IRect::new(5, 5, 1, 1)])
+        .unwrap();
+    assert_eq!(damage(&mut s).rects(), &[IRect::new(114, 76, 10, 10)]);
+
+    // Near the edge the widening clips to the buffer and the node: [62,
+    // 64) → [60, 64): device x [187.5, 192.5), y [150, 155).
+    s.buffer_damaged(CLIENT, buffer, &[IRect::new(62, 62, 2, 2)])
+        .unwrap();
+    assert_eq!(damage(&mut s).rects(), &[IRect::new(186, 149, 7, 6)]);
 }
 
 /// An image on `a`, then swapped to `b` and back, so both have been shown.

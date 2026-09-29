@@ -253,3 +253,62 @@ fn the_latch_takes_its_damage_from_the_frame() {
     .unwrap();
     assert_eq!(damage(&mut s).rects(), &[IRect::new(10, 10, 64, 64)]);
 }
+
+#[test]
+fn an_output_scale_of_1_25_keeps_surface_damage_partial() {
+    let mut s = Scene::new();
+    s.add_output(OUT, IRect::new(0, 0, 1000, 750), 1.25);
+    // The node at logical (10, 10) sits at device (12.5, 12.5), 1.25
+    // device pixels per texel.
+    let n = surface(&mut s);
+    let a = nv12(&mut s);
+    let b = nv12(&mut s);
+    s.set_surface(CLIENT, n, Some(SurfaceRef::new(b, full(), color())))
+        .unwrap();
+    s.set_surface(CLIENT, n, Some(SurfaceRef::new(a, full(), color())))
+        .unwrap();
+    settle(&mut s);
+    let whole = s.node(n).unwrap().world_bounds();
+    assert_eq!(whole, IRect::new(12, 12, 81, 81));
+
+    // buffer_damaged: texels [4, 12) widen to [2, 14) → device [15, 30),
+    // padded by a pixel.
+    s.buffer_damaged(CLIENT, a, &[IRect::new(4, 4, 8, 8)])
+        .unwrap();
+    assert_eq!(damage(&mut s).rects(), &[IRect::new(14, 14, 17, 17)]);
+
+    // The latch, swapping to a buffer shown before: texels [8, 10) round
+    // to [8, 10), widen to [6, 12) → device [20, 27.5), padded.
+    s.set_surface_with_damage(
+        CLIENT,
+        n,
+        SurfaceRef::new(b, full(), color()),
+        &[IRect::new(8, 8, 2, 2)],
+    )
+    .unwrap();
+    assert_eq!(damage(&mut s).rects(), &[IRect::new(19, 19, 10, 10)]);
+
+    // Re-presenting the current buffer: an odd texel rounds to its chroma
+    // pair, [1, 2) → [0, 2) → [0, 4) → device [12.5, 17.5), clipped.
+    s.set_surface_with_damage(
+        CLIENT,
+        n,
+        SurfaceRef::new(b, full(), color()),
+        &[IRect::new(1, 1, 1, 1)],
+    )
+    .unwrap();
+    let d = damage(&mut s);
+    assert_eq!(d.rects(), &[IRect::new(12, 12, 7, 7)]);
+    assert!(d.bounds().area() * 50 < whole.area());
+
+    // A never-shown buffer still repaints the whole node.
+    let c = nv12(&mut s);
+    s.set_surface_with_damage(
+        CLIENT,
+        n,
+        SurfaceRef::new(c, full(), color()),
+        &[IRect::new(0, 0, 1, 1)],
+    )
+    .unwrap();
+    assert_eq!(damage(&mut s).rects(), &[whole]);
+}
