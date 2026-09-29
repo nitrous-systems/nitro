@@ -59,6 +59,17 @@ fn harness_on(dec: SyntheticDecoder, opts: Opts) -> Built {
     Built { h }
 }
 
+/// Press and release `keycode`, delivered straight to the window.
+///
+/// Not [`Harness::key`]: that presses through the server and settles on
+/// the wall clock between press and release, and a settle slower than the
+/// server's key-repeat delay (as under a loaded test run) gets a repeated
+/// press — a second SPACE toggles playback back, a second RIGHT steps
+/// twice.
+fn key(h: &mut Harness<Player>, keycode: u32) {
+    h.key_in(nitro_ui::WindowId::MAIN, keycode);
+}
+
 fn wait_presented(h: &mut Harness<Player>, n: u64) {
     h.wait_for("frames presented", |h| {
         h.settle();
@@ -82,14 +93,14 @@ fn pause_stops_presents_and_play_resumes() {
     let mut b = harness(600, Opts::default());
     let h = &mut b.h;
     wait_presented(h, 3);
-    h.key(nitro_ui::event::key::SPACE);
+    key(h, nitro_ui::event::key::SPACE);
     assert_eq!(h.state().state(), State::Paused);
     h.settle();
     let sent = h.state().stats.sent;
     std::thread::sleep(std::time::Duration::from_millis(200));
     h.settle();
     assert_eq!(h.state().stats.sent, sent, "no presents while paused");
-    h.key(nitro_ui::event::key::SPACE);
+    key(h, nitro_ui::event::key::SPACE);
     let n = h.state().stats.presented;
     wait_presented(h, n + 3);
 }
@@ -99,7 +110,7 @@ fn a_seek_reanchors_at_the_target() {
     let mut b = harness(3000, Opts::default());
     let h = &mut b.h;
     wait_presented(h, 2);
-    h.key(nitro_ui::event::key::SPACE); // pause, so the landing frame stays
+    key(h, nitro_ui::event::key::SPACE); // pause, so the landing frame stays
     let (ui, p) = h.parts();
     p.request_seek(ui, 40.0);
     h.wait_for("the seek to land", |h| {
@@ -108,7 +119,7 @@ fn a_seek_reanchors_at_the_target() {
             && h.state().stats.shown.last() == Some(&40_000_000)
     });
     // Right steps 5 s on from there.
-    h.key(nitro_ui::event::key::RIGHT);
+    key(h, nitro_ui::event::key::RIGHT);
     h.wait_for("the step to land", |h| {
         h.settle();
         h.state().stats.shown.last() == Some(&45_000_000)
@@ -136,14 +147,14 @@ fn f_toggles_fullscreen() {
     let mut b = harness(3000, Opts::default());
     let h = &mut b.h;
     wait_presented(h, 1);
-    h.key(33); // KEY_F
+    key(h, 33); // KEY_F
     h.wait_for("fullscreen", |h| {
         h.settle();
         h.ui().window_state() == WindowState::Fullscreen
     });
     let (w, hh) = nitro_ui::test::OUTPUT;
     assert_eq!(h.ui().window_size(), Size::new(w as f32, hh as f32));
-    h.key(nitro_ui::event::key::ESC);
+    key(h, nitro_ui::event::key::ESC);
     h.wait_for("windowed", |h| {
         h.settle();
         h.ui().window_state() == WindowState::Normal
