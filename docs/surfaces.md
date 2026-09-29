@@ -56,6 +56,17 @@ Consequences:
 - Initially **every Surface is treated as opaque**. Translucent Surfaces
   (a blended hole) are a later problem and nothing here depends on them.
 
+As built (#3898): the shadow holds **premultiplied** ARGB and every raster
+op composites byte 3 as a fourth channel with source value 255, so alpha
+stays 255 over opaque pixels and content over a hole comes out as a
+correct premultiplied pixel. `Scene::set_surface_on_plane` flags a Surface,
+which then paints `PaintKind::Hole` (`Canvas::clear_irect`). The server
+switches the primary's framebuffer to AR24 (same dumb buffer, second
+AddFB2) only while `Scene::has_holes` is true and the plane lists ARGB8888;
+the test box's primary does not, so it stays XR24. `shot` fills holes with
+`frame::HOLE_PLACEHOLDER` grey until Surfaces carry CPU-readable buffers
+(#3897).
+
 ## Per-output modes: the `planes` module
 
 Mode selection lives in a `planes` module **inside `nitro-server`** —
