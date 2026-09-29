@@ -97,6 +97,8 @@ a fast path that skips the coverage walk entirely; see
 | `fill_rect` | a rounded rect, anti-aliased, `Fill::Solid` or `Fill::Linear` |
 | `stroke_rect_inside` | a rounded-rect border lying entirely inside the rect |
 | `blit` | an `Image` (XRGB8888 or straight-alpha ARGB8888), 1:1 or bilinear-scaled |
+| `blit_nv12` | an `Nv12` video frame into an integer rect: fused YUV → RGB + scale, stored (see [Video](#video-nv12-blit)) |
+| `blit_xrgb_scaled` | an opaque XRGB8888 `Image` scaled into an integer rect, stored; ~3× faster than `blit` on that case |
 | `blit_mask` | an A8 coverage `Mask` tinted with one colour, source-over |
 | `blit_masks` | a batch of masks sharing a colour and an opacity |
 | `blend_pixel_at` | one pixel; for tests and debug markers |
@@ -189,6 +191,103 @@ None of either. The loops slice a row once and then run
 contains a few hundred packed-integer SSE instructions across these loops.
 Nothing is `target_feature`-gated, so the same binary runs on the
 SSE4.2-only test box.
+
+## Video: NV12 blit
+
+`Canvas::blit_nv12(clip, dst: &IRect, src: &Nv12, src_rect: &IRect, enc: YuvEncoding)`
+is the CPU path for video surfaces — the one that has to work everywhere
+(simpledrm, VMs, no Mesa). Code: `src/yuv.rs`.
+
+- **Source.** `Nv12 { y, y_stride, uv, uv_stride, width, height }`: a
+  full-resolution Y plane and a `ceil(w/2) × ceil(h/2)` plane of interleaved
+  `[U, V]` pairs, arbitrary strides, odd sizes allowed. `is_valid` uses the
+  `Mask` rule: the last row of each plane needs only its payload, not a
+  whole stride.
+- **Encoding.** `YuvMatrix::{Bt601, Bt709, Bt2020}` × `YuvRange::{Limited,
+  Full}`; the default is BT.709 limited, the right guess for untagged HD.
+  Limited-range super-white/super-black clamp to 255/0.
+- **Store only, integer destination.** Video surfaces are opaque (for now),
+  so the blit never reads the destination and has no opacity. A video
+  surface sits on whole pixels, so `dst` is an `IRect`: no anti-aliased
+  edges, no coverage maths. Byte 3 is written as 0.
+- **Sampling.** Destination size == crop size: nearest, i.e. exact luma and
+  the chroma pair covering the pixel, `(x >> 1, y >> 1)`. Otherwise
+  bilinear on luma and bilinear on chroma at half resolution, 16.16 fixed
+  point positions, 8-bit weights, edge-clamped to the crop.
+- **Chroma siting.** The H.264/HEVC default (`chroma_sample_loc_type` 0):
+  chroma is co-sited with even luma columns and centred between luma rows
+  `2k` and `2k+1`; in luma coordinates chroma `x = lx/2`, `y = (ly − 0.5)/2`.
+  The scaled path samples exactly there (a test observes the half-row
+  offset). Chroma columns clamp to the samples covering the crop
+  (`sr.x >> 1 ..= (sr.right() − 1) >> 1`), so odd crop offsets pick the
+  right pair.
+- **Accuracy.** Coefficients are the float matrix × 4096, rounded (i32
+  headroom: < 6·10⁸ in the worst term sum). 1:1 output is **within ±1** of
+  the float reference (nearest-chroma) for every tested input, including all
+  YUV corners and 2000 random triples per matrix × range. Scaled output is
+  **within ±2** of a float bilinear reference with the documented siting
+  (the extra step is the 1/256-px position and 8-bit weight quantization).
+- **Clip invariance.** Source positions are affine in the *absolute*
+  destination pixel, so a clipped blit is byte-identical to the same region
+  of an unclipped one; tested over random clips, 1:1 and scaled.
+- **Overflow.** Mapping arithmetic is i64 and saturating: a 1×1 source
+  scaled to 2·10⁹ px, or a 64×64 source into one pixel, renders without a
+  panic.
+
+### How it is fast
+
+Both paths are chunked (128 destination columns) with small stack arrays —
+no allocation — and separate the non-vectorizable part (gathers) from the
+vectorizable part (arithmetic):
+
+- **1:1**: widen luma and duplicate each chroma pair into three `[i32; 128]`
+  arrays, then one straight-line conversion pass. The fused
+  two-pixels-per-pair `u64` loop measured 3.0 ns/px; the split form
+  **1.8 ns/px**.
+- **Scaled**: separable bilinear. A vertical pass blends the two luma rows
+  (and two chroma rows) over the contiguous source span the chunk touches
+  into `u16` stack rows; a horizontal pass does two loads and one lerp per
+  channel into `[i32; 128]` arrays; a third pass converts. This is
+  bit-identical to the direct four-tap form (the same exact sum before the
+  one `>> 8`). Measured on dev at 1080→720: direct fused 10.9 ns/px →
+  sample-then-convert 8.5 → separable 6.7 → separable + separate convert
+  pass **4.9 ns/px**.
+- LUT gathers were not tried: the convert pass is already multiply-only and
+  vectorized, and a LUT would turn it back into gathers.
+
+`blit_xrgb_scaled` is the same separable row machinery for an opaque
+`Xrgb8888` source (no conversion): **3.8 ns/px against 10.9 for the generic
+`blit`** on the same 1080→720 geometry, agreeing with it to ±1. It is kept.
+ARGB sources stay on the generic blending `blit` — straight alpha cannot be
+stored.
+
+### Numbers
+
+`cargo bench -p nitro-raster --bench raster -- --iters 40` (box: `--iters
+25`), min of 3 runs, 1920×1080 canvas, BT.709 limited unless noted. ns/px is
+`min / destination pixels`.
+
+| scene | dev | box |
+|---|---|---|
+| **l** `nv12_1080_1080` (1:1) | **1.81 ns/px** (3.76 ms) | **3.27 ns/px** (6.79 ms) |
+| **m** `nv12_1080_720` | **4.95 ns/px** (4.56 ms) | **6.46 ns/px** (5.96 ms) |
+| **n** `nv12_720_1080` | **4.88 ns/px** (10.12 ms) | **6.19 ns/px** (12.83 ms) |
+| **o** `nv12_1080_720_601f` (BT.601 full) | 4.95 ns/px | 6.46 ns/px |
+| **p** `xrgb_1080_720`, generic `blit` | 10.86 ns/px | 12.57 ns/px |
+| **q** `xrgb_fast_1080_720`, `blit_xrgb_scaled` | **3.82 ns/px** | **4.11 ns/px** |
+
+The matrix and range do not matter (m vs o). Against the target: 1080p30
+fullscreen is 1920·1080·30 = 62.2 Mpx/s. At 1:1 on dev that is 113 ms/s,
+**11 % of one core**; the worst case, 720p upscaled to 1080p, is 304 ms/s,
+30 %. On the box
+(Pentium G3240, SSE4.2, no AVX2) 1:1 is 203 ms/s, **20 % of one of its two
+cores**, and 720p→1080p 385 ms/s, 39 %: 1080p30 fits, with room for the rest
+of the frame. The box's 1:1 figure is close to its store bandwidth (scene a,
+a pure fill, is 0.88 ns/px there), so it has little left to gain on the CPU.
+
+The other scenes (a–k) did not change code, but this adds ~400 lines to the
+binary; per [measuring this crate](#measuring-this-crate), movements there
+of a few percent are code layout, not work.
 
 ## Limitations (M1)
 

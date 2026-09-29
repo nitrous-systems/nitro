@@ -80,6 +80,13 @@
 //!   no font dependency.
 //! - No radial/sweep gradients, no blur, no blend modes other than
 //!   source-over.
+//!
+//! # Video
+//!
+//! [`Canvas::blit_nv12`] stores an [`Nv12`] frame (fused YUV → RGB with a
+//! [`YuvEncoding`], 1:1 nearest or bilinear-scaled, clip-invariant) into an
+//! integer rect; [`Canvas::blit_xrgb_scaled`] is the same machinery for an
+//! opaque XRGB source. Both are stores: video surfaces are opaque.
 
 #![forbid(unsafe_code)]
 
