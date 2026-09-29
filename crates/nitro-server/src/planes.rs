@@ -880,7 +880,6 @@ mod tests {
         let before = r.be.test_log().len();
         assert_eq!(r.search(&[c]), Decision::default());
         assert_eq!(r.be.test_log().len(), before, "pre-filtered");
-
     }
 
     #[test]
