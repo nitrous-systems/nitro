@@ -43,8 +43,9 @@ use ::drm::control::{
 use ::drm::{ClientCapability, Device as BasicDevice};
 
 use crate::planes::{
-    BufferId, Fourcc, PlaneAssignment, PlaneConfig, PlaneId, PlaneInfo, PlaneKind, PlaneSource,
-    PlaneTrack, ScanoutBufferInfo, SrcRect, Verdict, damage_plane, rotation, to_disable,
+    BufferId, Fourcc, ImportDesc, PlaneAssignment, PlaneConfig, PlaneId, PlaneInfo, PlaneKind,
+    PlaneSource, PlaneTrack, ScanoutBufferInfo, SrcRect, Verdict, damage_plane, rotation,
+    to_disable,
 };
 use crate::uevent::UeventSocket;
 use crate::{BYTES_PER_PIXEL, Backend, BufferMut, Error, Event, Image, OutputId, OutputInfo, Rect};
@@ -1659,6 +1660,24 @@ impl Backend for DrmBackend<'_> {
         self.next_buffer += 1;
         self.buffers.insert(id, b);
         Ok(BufferId(id))
+    }
+
+    fn import_buffer(
+        &mut self,
+        desc: &ImportDesc,
+        fds: &[BorrowedFd<'_>],
+    ) -> Result<BufferId, Error> {
+        let b = planes::ScanoutBuf::import(&self.card, desc, fds)?;
+        let id = self.next_buffer;
+        self.next_buffer += 1;
+        self.buffers.insert(id, b);
+        Ok(BufferId(id))
+    }
+
+    fn device_id(&self) -> Option<u64> {
+        rustix::fs::fstat(self.card.as_fd())
+            .ok()
+            .map(|st| st.st_rdev)
     }
 
     fn free_buffer(&mut self, id: BufferId) {

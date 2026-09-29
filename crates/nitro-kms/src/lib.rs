@@ -32,8 +32,9 @@ pub use crate::drm::select::ModeCandidate;
 pub use crate::drm::{DrmBackend, DrmFd, DrmOptions, ModeRequest, Modeline};
 pub use crate::fake::{FakeBackend, FakeOutputSpec, FakePlaneSpec, TestRecord};
 pub use crate::planes::{
-    BufferId, ColorEncoding, ColorRange, Fourcc, MOD_LINEAR, PlaneAssignment, PlaneConfig, PlaneId,
-    PlaneInfo, PlaneKind, PlaneSource, ScanoutBufferInfo, SrcRect, Verdict, Zpos,
+    BufferId, ColorEncoding, ColorRange, Fourcc, ImportDesc, MOD_LINEAR, PlaneAssignment,
+    PlaneConfig, PlaneId, PlaneInfo, PlaneKind, PlaneSource, ScanoutBufferInfo, SrcRect, Verdict,
+    Zpos,
 };
 
 use std::collections::HashMap;
@@ -541,6 +542,36 @@ pub trait Backend {
     /// [`Error::Io`] if the export fails.
     fn export_buffer(&mut self, _id: BufferId) -> Result<OwnedFd, Error> {
         Err(Error::Unsupported("buffer export"))
+    }
+
+    /// Import a client's dma-buf (one fd per plane; fds may be dups of one
+    /// buffer) as a framebuffer usable in a [`PlaneAssignment`]. The
+    /// caller keeps its fds.
+    ///
+    /// The id shares the space of [`Backend::alloc_buffer`]:
+    /// [`Backend::free_buffer`] (deferred while on screen),
+    /// [`Backend::buffer_info`] (the first two planes of `desc`, `size`
+    /// 0) and [`Backend::take_released_buffers`] work the same.
+    /// [`Backend::export_buffer`] of an import is
+    /// [`Error::Unsupported`].
+    ///
+    /// # Errors
+    /// [`Error::Unsupported`] by default, for a bad shape (`planes` not
+    /// in 1..=4 or not `fds.len()`, zero width or height), or a
+    /// format+modifier that is not scanout-able; [`Error::Io`] when the
+    /// kernel refuses (PRIME import, `AddFB2`).
+    fn import_buffer(
+        &mut self,
+        _desc: &ImportDesc,
+        _fds: &[BorrowedFd<'_>],
+    ) -> Result<BufferId, Error> {
+        Err(Error::Unsupported("dma-buf import"))
+    }
+
+    /// `dev_t` (`st_rdev`) of the KMS device, for Wayland-style dmabuf
+    /// feedback `main_device`. `None` when unknown (default, fake).
+    fn device_id(&self) -> Option<u64> {
+        None
     }
 
     /// Stage the **whole CRTC layout** for `output`'s next

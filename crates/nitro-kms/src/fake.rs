@@ -39,8 +39,9 @@ use rustix::time::{
 
 use crate::drm::select::{ModeCandidate, ModeRequest, select_mode};
 use crate::planes::{
-    BufferId, ColorEncoding, ColorRange, Fourcc, MOD_LINEAR, PlaneAssignment, PlaneConfig, PlaneId,
-    PlaneInfo, PlaneKind, PlaneSource, PlaneTrack, ScanoutBufferInfo, Verdict, Zpos, rotation,
+    BufferId, ColorEncoding, ColorRange, Fourcc, ImportDesc, MOD_LINEAR, PlaneAssignment,
+    PlaneConfig, PlaneId, PlaneInfo, PlaneKind, PlaneSource, PlaneTrack, ScanoutBufferInfo,
+    Verdict, Zpos, rotation,
 };
 use crate::{BYTES_PER_PIXEL, Backend, BufferMut, Error, Event, Image, OutputId, OutputInfo, Rect};
 
@@ -365,6 +366,8 @@ struct FakeBuf {
     info: ScanoutBufferInfo,
     /// Made by the first `export_buffer`, shared by every later one.
     memfd: Option<OwnedFd>,
+    /// From `import_buffer`: no memory of ours, not exportable.
+    imported: bool,
 }
 
 impl FakeBuf {
@@ -395,6 +398,7 @@ impl FakeBuf {
                 pitches,
             },
             memfd: None,
+            imported: false,
         }
     }
 }
@@ -966,20 +970,22 @@ impl FakeBackend {
             if layout[..i].iter().any(|(_, b)| b.plane == a.plane) {
                 return no;
             }
-            let (format, bw, bh) = match a.source {
-                PlaneSource::OutputFront => (o.scanout_format, o.info.width, o.info.height),
+            let (format, modifier, bw, bh) = match a.source {
+                PlaneSource::OutputFront => {
+                    (o.scanout_format, MOD_LINEAR, o.info.width, o.info.height)
+                }
                 PlaneSource::Buffer(id) => {
                     let Some(b) = find_buf(buffers, id.0) else {
                         return no;
                     };
                     let i = &b.info;
-                    (i.format, i.width, i.height)
+                    (i.format, i.modifier, i.width, i.height)
                 }
             };
             if !spec
                 .formats
                 .iter()
-                .any(|(f, m)| *f == format && m.contains(&MOD_LINEAR))
+                .any(|(f, m)| *f == format && m.contains(&modifier))
             {
                 return no;
             }
@@ -1190,6 +1196,9 @@ impl Backend for FakeBackend {
             .iter_mut()
             .find(|(k, _)| *k == id.0)
             .ok_or(Error::NoSuchObject("buffer", id.0))?;
+        if b.imported {
+            return Err(Error::Unsupported("export of an imported buffer"));
+        }
         if b.memfd.is_none() {
             let fd =
                 nitro_shm::create_sealed("nitro-kms-fake-scanout", b.info.size).map_err(|e| {
@@ -1317,6 +1326,42 @@ impl Backend for FakeBackend {
         let id = self.next_buffer;
         self.next_buffer += 1;
         self.buffers.push((id, FakeBuf::new(format, width, height)));
+        Ok(BufferId(id))
+    }
+
+    fn import_buffer(
+        &mut self,
+        desc: &ImportDesc,
+        fds: &[BorrowedFd<'_>],
+    ) -> Result<BufferId, Error> {
+        desc.validate(fds.len())?;
+        let scanout = desc.modifier == MOD_LINEAR
+            || self.outputs.iter().any(|o| {
+                o.planes.iter().any(|(_, p)| {
+                    p.formats
+                        .iter()
+                        .any(|(f, m)| *f == desc.format && m.contains(&desc.modifier))
+                })
+            });
+        if !scanout {
+            return Err(Error::Unsupported("format/modifier not scanout-capable"));
+        }
+        for fd in fds {
+            rustix::fs::fstat(fd).map_err(|e| Error::Io {
+                op: "import PRIME fd",
+                source: e.into(),
+            })?;
+        }
+        let id = self.next_buffer;
+        self.next_buffer += 1;
+        self.buffers.push((
+            id,
+            FakeBuf {
+                info: desc.info(),
+                memfd: None,
+                imported: true,
+            },
+        ));
         Ok(BufferId(id))
     }
 
@@ -2377,6 +2422,143 @@ mod tests {
         b.set_scanout_alpha(id, true).unwrap();
         b.commit(id, &[]).unwrap();
         assert_eq!(b.plane_state(id).unwrap(), layout.to_vec());
+    }
+
+    const Y_TILED: u64 = (0x01 << 56) | 2;
+
+    fn import_desc(format: Fourcc, modifier: u64, planes: u8) -> ImportDesc {
+        ImportDesc {
+            format,
+            width: 1920,
+            height: 1080,
+            modifier,
+            planes,
+            offsets: [0, 1920 * 1080, 0, 0],
+            pitches: [1920, 1920, 0, 0],
+        }
+    }
+
+    /// `with_planes`, plus an overlay that scans out Y-tiled NV12.
+    fn with_tiled() -> (FakeBackend, OutputId, Vec<PlaneInfo>) {
+        let spec = FakeOutputSpec::new(1920, 1080).planes(vec![
+            FakePlaneSpec::default_primary().zpos(0, 0, 0, true),
+            FakePlaneSpec::overlay()
+                .format_mods(Fourcc::NV12, &[MOD_LINEAR, Y_TILED])
+                .zpos(1, 1, 1, true),
+        ]);
+        let mut b = FakeBackend::new(&[spec]).unwrap();
+        let id = b.outputs()[0].id;
+        b.commit(id, &[]).unwrap();
+        b.tick(&mut Vec::new());
+        let planes = b.planes(id);
+        (b, id, planes)
+    }
+
+    #[test]
+    fn import_accepts_listed_modifiers_and_linear() {
+        let (mut b, id, p) = with_tiled();
+        let fd = fence();
+        let fds = [fd.as_fd(), fd.as_fd()];
+        let v = b
+            .import_buffer(&import_desc(Fourcc::NV12, Y_TILED, 2), &fds)
+            .unwrap();
+        // Linear is always accepted, even for a format no plane lists.
+        let l = b
+            .import_buffer(&import_desc(Fourcc::XBGR8888, MOD_LINEAR, 1), &fds[..1])
+            .unwrap();
+        assert_ne!(v, l);
+        let layout = [
+            cfg(p[0].id, PlaneSource::OutputFront, 1920, 1080),
+            cfg(p[1].id, PlaneSource::Buffer(v), 1920, 1080),
+        ];
+        let test: Vec<_> = layout.iter().map(|c| c.assignment(None)).collect();
+        assert!(b.test_layout(id, &test).unwrap().accepted());
+        b.set_plane_state(id, &layout).unwrap();
+        b.commit_planes(id).unwrap();
+        assert_eq!(b.plane_state(id).unwrap(), layout);
+    }
+
+    #[test]
+    fn import_refuses_unlisted_modifiers_and_bad_shapes() {
+        let (mut b, _, _) = with_tiled();
+        let fd = fence();
+        let two = [fd.as_fd(), fd.as_fd()];
+        assert!(matches!(
+            b.import_buffer(&import_desc(Fourcc::YUYV, Y_TILED, 1), &two[..1]),
+            Err(Error::Unsupported(_))
+        ));
+        // Plane count must match the fds, and be 1..=4.
+        assert!(matches!(
+            b.import_buffer(&import_desc(Fourcc::NV12, Y_TILED, 2), &two[..1]),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            b.import_buffer(&import_desc(Fourcc::NV12, Y_TILED, 0), &[]),
+            Err(Error::Unsupported(_))
+        ));
+        let mut empty = import_desc(Fourcc::NV12, Y_TILED, 2);
+        empty.width = 0;
+        assert!(matches!(
+            b.import_buffer(&empty, &two),
+            Err(Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn an_import_reports_its_layout_and_is_not_exportable() {
+        let (mut b, _, _) = with_tiled();
+        let fd = fence();
+        let desc = import_desc(Fourcc::NV12, Y_TILED, 2);
+        let v = b.import_buffer(&desc, &[fd.as_fd(), fd.as_fd()]).unwrap();
+        let i = b.buffer_info(v).unwrap();
+        assert_eq!(
+            (i.format, i.width, i.height, i.modifier, i.size),
+            (Fourcc::NV12, 1920, 1080, Y_TILED, 0)
+        );
+        assert_eq!((i.offsets, i.pitches), ([0, 1920 * 1080], [1920, 1920]));
+        assert!(matches!(
+            b.export_buffer(v),
+            Err(Error::Unsupported("export of an imported buffer"))
+        ));
+        assert_eq!(b.buffer(v), Some((Fourcc::NV12, 1920, 1080)));
+        drop(fd);
+        assert!(b.buffer_info(v).is_some(), "the caller keeps its fds");
+        b.free_buffer(v);
+        assert!(b.buffer_info(v).is_none());
+        assert!(b.buffer(v).is_none());
+    }
+
+    #[test]
+    fn freeing_an_on_screen_import_is_deferred() {
+        let (mut b, id, p) = with_tiled();
+        let fd = fence();
+        let v = b
+            .import_buffer(
+                &import_desc(Fourcc::NV12, Y_TILED, 2),
+                &[fd.as_fd(), fd.as_fd()],
+            )
+            .unwrap();
+        let layout = [
+            cfg(p[0].id, PlaneSource::OutputFront, 1920, 1080),
+            cfg(p[1].id, PlaneSource::Buffer(v), 1920, 1080),
+        ];
+        b.set_plane_state(id, &layout).unwrap();
+        b.commit_planes(id).unwrap();
+        b.tick(&mut Vec::new());
+        b.free_buffer(v);
+        assert!(b.buffer(v).is_some(), "still scanned out");
+        assert!(b.buffer_info(v).is_none(), "but unusable");
+        b.set_plane_state(id, &[]).unwrap();
+        b.commit_planes(id).unwrap();
+        b.tick(&mut Vec::new());
+        assert!(b.buffer(v).is_none());
+        assert!(b.take_released_buffers().is_empty());
+    }
+
+    #[test]
+    fn the_fake_has_no_device_id() {
+        let (b, _) = fake();
+        assert_eq!(b.device_id(), None);
     }
 
     #[test]

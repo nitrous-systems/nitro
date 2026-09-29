@@ -42,8 +42,9 @@ use crate::error::{DecodeError, EncodeError};
 use crate::types::WindowState as WindowStateValue;
 use crate::types::{
     Align, AllocRefusal, AxisSource, BufferId, ButtonState, ColorMatrix, ColorRange, CursorPos,
-    CursorShape, DataSource, DragAction, Edge, ErrorCode, KeymapFormat, Layer, NodeId, NodeKind,
-    OverviewRequest, PopupAnchor, PopupGravity, ShareToken, TouchPhase, WindowRef,
+    CursorShape, DataSource, DmabufFormat, DragAction, Edge, ErrorCode, KeymapFormat, Layer,
+    NodeId, NodeKind, OverviewRequest, PopupAnchor, PopupGravity, ShareToken, TouchPhase,
+    WindowRef,
 };
 use crate::wire::Plain;
 
@@ -993,6 +994,221 @@ impl Body for SurfaceBufferAllocated {
         })
     }
 }
+
+/// One plane of a [`CreateDmabufBuffer`]: its descriptor and layout.
+#[derive(Debug)]
+pub struct DmabufPlane {
+    /// The dma-buf (a dup of one buffer's fd is fine for every plane).
+    pub fd: OwnedFd,
+    /// Byte offset of the plane in `fd`.
+    pub offset: u32,
+    /// Bytes per row (the pitch).
+    pub stride: u32,
+}
+
+/// Register a **client-allocated dma-buf** for a `Surface` node (needs
+/// [`caps::DMABUF`](crate::types::caps::DMABUF) *and*
+/// [`caps::SURFACE`](crate::types::caps::SURFACE) listed in `ClientCaps`;
+/// carries one fd per plane; #3918).
+///
+/// Shares [`CreateBuffer`]'s id space and buffer cap, and acts at receipt
+/// like [`CreateSurfaceBuffer`]. `modifier` is the DRM format modifier
+/// (`DRM_FORMAT_MOD_INVALID` is refused); the pair must be one the
+/// server's [`DmabufFeedback`] lists with `IMPORT`. At most 4 planes: more
+/// is a decode error. Content reaches the screen **only** through
+/// [`PresentSurface`] (implicit sync: the server snapshots the buffer's
+/// write fences) or [`PresentSurfaceFenced`] (explicit sync); `SetSurface`
+/// naming a dma-buf buffer is `BadBuffer`. See `docs/wire.md`.
+///
+/// `PartialEq` compares the declared fields only.
+#[derive(Debug)]
+pub struct CreateDmabufBuffer {
+    /// Buffer id, allocated by the client.
+    pub id: BufferId,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// DRM fourcc pixel format.
+    pub format: u32,
+    /// DRM format modifier, shared by every plane.
+    pub modifier: u64,
+    /// The planes, 1..=4, in the format's plane order.
+    pub planes: Vec<DmabufPlane>,
+}
+
+impl PartialEq for CreateDmabufBuffer {
+    fn eq(&self, o: &Self) -> bool {
+        self.id == o.id
+            && self.width == o.width
+            && self.height == o.height
+            && self.format == o.format
+            && self.modifier == o.modifier
+            && self.planes.len() == o.planes.len()
+            && self
+                .planes
+                .iter()
+                .zip(&o.planes)
+                .all(|(a, b)| a.offset == b.offset && a.stride == b.stride)
+    }
+}
+
+/// Most planes a [`CreateDmabufBuffer`] carries.
+pub const MAX_DMABUF_PLANES: usize = 4;
+
+/// The fixed part of [`CreateDmabufBuffer`]: 57 bytes.
+#[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct CreateDmabufBufferFixed {
+    id: <BufferId as Plain>::Wire,
+    width: <u32 as Plain>::Wire,
+    height: <u32 as Plain>::Wire,
+    format: <u32 as Plain>::Wire,
+    modifier: <u64 as Plain>::Wire,
+    planes: u8,
+    layout: [[<u32 as Plain>::Wire; 2]; MAX_DMABUF_PLANES],
+}
+
+impl Body for CreateDmabufBuffer {
+    fn encode_body(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        if self.planes.len() > MAX_DMABUF_PLANES {
+            return Err(EncodeError::TooManyFds);
+        }
+        let mut layout = [[Plain::to_wire(0u32); 2]; MAX_DMABUF_PLANES];
+        for (slot, p) in layout.iter_mut().zip(&self.planes) {
+            *slot = [Plain::to_wire(p.offset), Plain::to_wire(p.stride)];
+        }
+        w.put_struct(&CreateDmabufBufferFixed {
+            id: Plain::to_wire(self.id),
+            width: Plain::to_wire(self.width),
+            height: Plain::to_wire(self.height),
+            format: Plain::to_wire(self.format),
+            modifier: Plain::to_wire(self.modifier),
+            #[allow(clippy::cast_possible_truncation)] // checked above
+            planes: self.planes.len() as u8,
+            layout,
+        });
+        for p in &self.planes {
+            let dup = rustix::io::dup(p.fd.as_fd()).map_err(EncodeError::Fd)?;
+            w.put_fd(dup);
+        }
+        Ok(())
+    }
+
+    fn decode_body(r: &mut Reader<'_>, fds: &mut FdQueue) -> Result<Self, DecodeError> {
+        let f = r.get_struct::<CreateDmabufBufferFixed>()?;
+        let n = usize::from(f.planes);
+        if n > MAX_DMABUF_PLANES {
+            return Err(DecodeError::BadValue);
+        }
+        let mut planes = Vec::with_capacity(n);
+        for [off, stride] in &f.layout[..n] {
+            planes.push(DmabufPlane {
+                fd: fds.take()?,
+                offset: Plain::from_wire(*off)?,
+                stride: Plain::from_wire(*stride)?,
+            });
+        }
+        Ok(Self {
+            id: Plain::from_wire(f.id)?,
+            width: Plain::from_wire(f.width)?,
+            height: Plain::from_wire(f.height)?,
+            format: Plain::from_wire(f.format)?,
+            modifier: Plain::from_wire(f.modifier)?,
+            planes,
+        })
+    }
+}
+
+/// [`PresentSurface`] with an explicit **acquire fence** (needs
+/// [`caps::DMABUF`](crate::types::caps::DMABUF) and
+/// [`caps::SURFACE`](crate::types::caps::SURFACE) listed; carries one fd;
+/// #3918).
+///
+/// `fence` is a `sync_file` (or any pollable fd) that becomes readable
+/// when the buffer's content is complete. The frame is not latched — not
+/// scanned out, not sampled — before it signals, and the server never
+/// blocks on it. Otherwise exactly [`PresentSurface`], on any buffer
+/// kind.
+///
+/// `PartialEq` compares the frame only.
+#[derive(Debug)]
+pub struct PresentSurfaceFenced {
+    /// The frame.
+    pub frame: PresentSurface,
+    /// The acquire fence.
+    pub fence: OwnedFd,
+}
+
+impl PartialEq for PresentSurfaceFenced {
+    fn eq(&self, o: &Self) -> bool {
+        self.frame == o.frame
+    }
+}
+
+impl Body for PresentSurfaceFenced {
+    fn encode_body(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        self.frame.encode_body(w)?;
+        let dup = rustix::io::dup(self.fence.as_fd()).map_err(EncodeError::Fd)?;
+        w.put_fd(dup);
+        Ok(())
+    }
+
+    fn decode_body(r: &mut Reader<'_>, fds: &mut FdQueue) -> Result<Self, DecodeError> {
+        let frame = PresentSurface::decode_body(r, fds)?;
+        Ok(Self {
+            frame,
+            fence: fds.take()?,
+        })
+    }
+}
+
+/// Which dma-buf formats and modifiers the server takes, and which of
+/// them an output can scan out (needs
+/// [`caps::DMABUF`](crate::types::caps::DMABUF) listed; #3918). The data a
+/// Wayland adapter needs for `zwp_linux_dmabuf` feedback.
+///
+/// `id` 0 is the **default** feedback (the union over every output),
+/// sent when the client lists `DMABUF` and again when outputs change. A
+/// Surface node's id (its own or an import) is that node's output's
+/// feedback, sent when the node first lands on an output and whenever the
+/// output or its feedback changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DmabufFeedback {
+    /// 0 for the default feedback, else a `Surface` node.
+    pub id: NodeId,
+    /// `dev_t` of the KMS device; 0 when unknown.
+    pub main_device: u64,
+    /// The output's width in device pixels: render at this size or
+    /// smaller (display planes barely downscale).
+    pub max_width: u32,
+    /// The output's height in device pixels.
+    pub max_height: u32,
+    /// The pairs, sorted by format then modifier.
+    pub formats: Vec<DmabufFormat>,
+}
+
+impl Body for DmabufFeedback {
+    fn encode_body(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.put(self.id);
+        w.put(self.main_device);
+        w.put(self.max_width);
+        w.put(self.max_height);
+        w.put_vec(&self.formats);
+        Ok(())
+    }
+
+    fn decode_body(r: &mut Reader<'_>, _fds: &mut FdQueue) -> Result<Self, DecodeError> {
+        Ok(Self {
+            id: r.get()?,
+            main_device: r.get()?,
+            max_width: r.get()?,
+            max_height: r.get()?,
+            formats: r.get_vec()?,
+        })
+    }
+}
+
 
 /// Queue a frame on a `Surface` node, to be **latched at the next paint
 /// opportunity** of its output (needs
@@ -2708,6 +2924,12 @@ msg_enum! {
         /// `caps::SURFACE`); answered with `SurfaceBufferAllocated`s or
         /// `AllocSurfaceBuffersFailed`.
         AllocSurfaceBuffers = 0x0312,
+        /// Register a client-allocated dma-buf (needs `caps::DMABUF`;
+        /// carries one fd per plane).
+        CreateDmabufBuffer = 0x0313,
+        /// `PresentSurface` with an acquire fence (needs `caps::DMABUF`;
+        /// carries one fd).
+        PresentSurfaceFenced = 0x0314,
         /// Move one of this client's windows to another layer (needs
         /// `caps::SHELL`).
         SetLayer = 0x0401,
@@ -3354,6 +3576,8 @@ msg_enum! {
         SurfaceBufferAllocated = 0x8309,
         /// An `AllocSurfaceBuffers` was refused (needs `caps::SURFACE`).
         AllocSurfaceBuffersFailed = 0x830a,
+        /// Importable dma-buf formats/modifiers (needs `caps::DMABUF`).
+        DmabufFeedback = 0x830b,
         /// A bound hotkey fired (needs `caps::SHELL`).
         HotKey = 0x8401,
         /// One window of the shell's list (needs `caps::SHELL`).

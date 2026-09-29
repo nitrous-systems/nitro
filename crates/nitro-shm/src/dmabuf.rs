@@ -1,9 +1,13 @@
 //! Scanout buffers the server allocated (#3914): the client's mapping of
-//! a dma-buf, and the `DMA_BUF_IOCTL_SYNC` bracket around its writes.
+//! a dma-buf, the `DMA_BUF_IOCTL_SYNC` bracket around its writes, and
+//! `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` for the server's implicit-sync fence.
 //!
 //! **`unsafe` exception** (the tree's third; task 3914, granted by the
-//! project's human in ask#430): two `unsafe` ioctl blocks, both for the
-//! one `DMA_BUF_IOCTL_SYNC` request. Recorded under "`unsafe` exceptions" in `DEPENDENCIES.md`, with
+//! project's human in ask#430, extended for #3918 in ask#434):
+//! five `unsafe` ioctl blocks — two for the `DMA_BUF_IOCTL_SYNC` request
+//! (`Setter::new`, `ioctl`) and three for
+//! `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` (`Updater::new`, `ioctl`, and
+//! `OwnedFd::from_raw_fd` for the fd the kernel returns). Recorded under "`unsafe` exceptions" in `DEPENDENCIES.md`, with
 //! the narrative in this crate's `README.md`. Like `map.rs`, this file and
 //! only this file (besides `map.rs`) carries `#![allow(unsafe_code)]`; the
 //! workspace's `unsafe_code = "deny"` covers every other line of the crate.
@@ -42,10 +46,10 @@
 
 #![allow(unsafe_code)]
 
-use std::os::fd::{AsFd, BorrowedFd};
+use std::os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd};
 
 use rustix::io::Errno;
-use rustix::ioctl::{Opcode, Setter, opcode};
+use rustix::ioctl::{Opcode, Setter, Updater, opcode};
 use rustix::mm::ProtFlags;
 
 use crate::MapError;
@@ -195,6 +199,102 @@ fn sync(fd: BorrowedFd<'_>, flags: u64) -> Result<bool, Errno> {
         match unsafe { rustix::ioctl::ioctl(fd, op) } {
             Ok(()) => return Ok(true),
             Err(Errno::NOTTY) => return Ok(false),
+            Err(Errno::INTR | Errno::AGAIN) => {}
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// `struct dma_buf_export_sync_file { __u32 flags; __s32 fd; }` from
+/// `<linux/dma-buf.h>`: `flags` in, `fd` out.
+#[repr(C)]
+struct ExportSyncFile {
+    flags: u32,
+    fd: i32,
+}
+
+const _: () = assert!(std::mem::size_of::<ExportSyncFile>() == 8);
+
+/// `DMA_BUF_IOCTL_EXPORT_SYNC_FILE`:
+/// `_IOWR('b', 2, struct dma_buf_export_sync_file)`.
+const DMA_BUF_IOCTL_EXPORT_SYNC_FILE: Opcode = opcode::read_write::<ExportSyncFile>(b'b', 2);
+
+/// Snapshot the fences of the dma-buf behind `fd` as a `sync_file`
+/// (`DMA_BUF_IOCTL_EXPORT_SYNC_FILE`, Linux 6.0+).
+///
+/// What it is for (#3918): a client that presents a dma-buf without an
+/// explicit acquire fence relies on implicit sync — the GPU work that
+/// renders into the buffer is tracked in the dma-buf's reservation
+/// object. The server extracts that as a `sync_file` and waits for it in
+/// its event loop instead of reading (or scanning out) a half-rendered
+/// frame. The call itself **never blocks**: it snapshots the fences that
+/// exist now; waiting is the caller's business, by polling the result.
+///
+/// `access` [`SyncAccess::Read`] waits for writers only
+/// (`DMA_BUF_SYNC_READ`); [`SyncAccess::Write`] waits for all fences;
+/// [`SyncAccess::ReadWrite`] is the same as `Write`.
+///
+/// - `Ok(Some(fd))`: a `sync_file` that becomes readable (`POLLIN`) when
+///   signalled (immediately, if there was nothing to wait for).
+/// - `Ok(None)`: `fd` is not a dma-buf (e.g. a sealed memfd, the fake
+///   backend's export) — nothing to wait for. Decided by [`is_dmabuf`]
+///   *before* issuing the ioctl, so it is never confused with an old
+///   kernel.
+///
+/// `EINTR`/`EAGAIN` are retried.
+///
+/// # Errors
+/// For a real dma-buf, any errno from the ioctl — including
+/// `ENOTTY`/`EINVAL` on a kernel older than 6.0 that lacks it; the
+/// caller then falls back to polling the dma-buf fd itself.
+pub fn export_sync_file(fd: impl AsFd, access: SyncAccess) -> Result<Option<OwnedFd>, Errno> {
+    let fd = fd.as_fd();
+    if !is_dmabuf(fd) {
+        return Ok(None);
+    }
+    // `bits()` is at most `SYNC_READ | SYNC_WRITE` = 3; it fits a `u32`.
+    let flags = u32::try_from(access.bits()).unwrap_or(3);
+    loop {
+        let mut arg = ExportSyncFile { flags, fd: -1 };
+        // SAFETY (Updater::new): the preconditions are that the opcode is
+        // valid and that `ExportSyncFile` is the type the kernel expects
+        // for it. `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` is
+        // `_IOWR('b', 2, struct dma_buf_export_sync_file)` in
+        // `<linux/dma-buf.h>`; that struct is `{ __u32 flags; __s32 fd; }`,
+        // which `#[repr(C)] ExportSyncFile { u32, i32 }` reproduces field
+        // for field — size 8 (asserted at compile time above), the size
+        // `opcode::read_write::<ExportSyncFile>` encodes, so the opcode is
+        // bit-for-bit the header's. The kernel `copy_from_user`s 8 bytes
+        // and `copy_to_user`s 8 bytes back; `Updater` passes a pointer to
+        // `arg`, a live, exclusively borrowed local valid for 8 bytes of
+        // reads and writes for the whole call, and any bit pattern the
+        // kernel writes is a valid `u32`/`i32`.
+        let op =
+            unsafe { Updater::<DMA_BUF_IOCTL_EXPORT_SYNC_FILE, ExportSyncFile>::new(&mut arg) };
+        // SAFETY (ioctl): the pattern object describes the request
+        // truthfully (the `Updater::new` argument above). `fd` was just
+        // confirmed a dma-buf by `fstatfs` → `DMA_BUF_MAGIC`, so the
+        // request reaches the dma-buf ioctl table, where `'b'`/2 only
+        // snapshots the reservation object's fences into a new sync_file
+        // and writes its fd number into `arg`. It touches no memory of
+        // this process beyond those 8 bytes, and does not block.
+        match unsafe { rustix::ioctl::ioctl(fd, op) } {
+            Ok(()) => {
+                // SAFETY (from_raw_fd): on success the kernel has just
+                // installed a fresh file (the sync_file, `O_CLOEXEC`) into
+                // this process's fd table and reported its number only to
+                // us, through `arg.fd`. Nothing else in the process knows
+                // that number, so nothing else owns it: taking ownership
+                // here is the single owner, and dropping the `OwnedFd`
+                // closes it exactly once. A successful return always
+                // carries a valid, non-negative fd (`fd_install` precedes
+                // the `copy_to_user`); the check below keeps a broken
+                // kernel from handing `-1` to `OwnedFd`.
+                if arg.fd < 0 {
+                    return Err(Errno::BADF);
+                }
+                return Ok(Some(unsafe { OwnedFd::from_raw_fd(arg.fd) }));
+            }
             Err(Errno::INTR | Errno::AGAIN) => {}
             Err(e) => return Err(e),
         }

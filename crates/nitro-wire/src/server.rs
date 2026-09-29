@@ -442,6 +442,8 @@ pub fn needs_fd(op: u16) -> bool {
         || op == msg::Keymap::OP
         || op == msg::SelectionData::OP
         || op == msg::SurfaceBufferAllocated::OP
+        || op == msg::CreateDmabufBuffer::OP
+        || op == msg::PresentSurfaceFenced::OP
 }
 
 /// Whether an op is about a **buffer**, and so cannot mean anything on a
@@ -469,6 +471,9 @@ pub fn needs_fd(op: u16) -> bool {
 /// server, which answers a remote peer `AllocSurfaceBuffersFailed {
 /// Unsupported }` — the reply is fd-free, and the client's fallback path
 /// is the same one it takes on a local server without scanout buffers.
+/// `CreateDmabufBuffer` and `PresentSurfaceFenced` (#3918) carry
+/// descriptors, so on a remote link they are the non-fatal
+/// [`Error::RemoteNoFds`] like `CreateBuffer`.
 ///
 /// `SetImage` (or `SetSurface`) naming [`BufferId::NONE`](crate::types::BufferId) is
 /// **not** included: that is how an image node is *cleared*, it needs no
@@ -484,6 +489,8 @@ pub fn is_buffer_op(op: u16) -> bool {
         || op == msg::SetSurface::OP
         || op == msg::PresentSurface::OP
         || op == msg::AllocSurfaceBuffers::OP
+        || op == msg::CreateDmabufBuffer::OP
+        || op == msg::PresentSurfaceFenced::OP
 }
 
 /// Why a remote peer's fd-carrying **non-buffer** op is refused, as the

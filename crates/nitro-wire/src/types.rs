@@ -884,6 +884,49 @@ pub mod format {
     }
 }
 
+/// DRM format modifiers a client names in
+/// [`CreateDmabufBuffer`](crate::msg::CreateDmabufBuffer) and the server
+/// lists in [`DmabufFeedback`](crate::msg::DmabufFeedback) (#3918). Any
+/// 64-bit value may travel; these are the ones the server's CPU path and
+/// the Intel hardware it was measured on name.
+pub mod modifier {
+    /// `DRM_FORMAT_MOD_LINEAR`: plain row-major memory.
+    pub const LINEAR: u64 = 0;
+    /// `DRM_FORMAT_MOD_INVALID`: "implicit layout". Always refused.
+    pub const INVALID: u64 = 0x00ff_ffff_ffff_ffff;
+    /// `I915_FORMAT_MOD_X_TILED`.
+    pub const I915_X_TILED: u64 = (1 << 56) | 1;
+    /// `I915_FORMAT_MOD_Y_TILED`: what VA-API decodes into on Kaby Lake.
+    pub const I915_Y_TILED: u64 = (1 << 56) | 2;
+}
+
+/// The `flags` of one [`DmabufFormat`] entry (#3918).
+pub mod dmabuf_flags {
+    /// Some plane on the output lists this format + modifier in
+    /// `IN_FORMATS`: a buffer like it *may* be scanned out directly once
+    /// the planes module places it (advertised is not usable).
+    pub const SCANOUT: u32 = 1 << 0;
+    /// Linear and convertible by the server's CPU path (`NV12`, `YUYV`,
+    /// `UYVY`, `XR24`, `AR24`): shown correctly today, on any output.
+    pub const CPU: u32 = 1 << 1;
+    /// Accepted by `CreateDmabufBuffer` at all: `SCANOUT | CPU`'s union.
+    /// A buffer that is only `IMPORT` (not `CPU`) is shown as a
+    /// placeholder until it is on a plane.
+    pub const IMPORT: u32 = 1 << 2;
+}
+
+/// One format + modifier pair of a
+/// [`DmabufFeedback`](crate::msg::DmabufFeedback) (#3918).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DmabufFormat {
+    /// DRM fourcc.
+    pub format: u32,
+    /// DRM format modifier.
+    pub modifier: u64,
+    /// [`dmabuf_flags`] bits.
+    pub flags: u32,
+}
+
 /// Window flags for [`CreateWindow`](crate::msg::CreateWindow). Unknown
 /// bits are reserved and must be zero.
 pub mod window_flags {

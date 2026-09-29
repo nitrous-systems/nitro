@@ -477,9 +477,10 @@ sibling `docs/budget.md` watches to the byte.
 
 The `unsafe` row is worth naming separately. This tree's deliberate
 exceptions are three and small — eleven lines in `nitro-seat`, four
-blocks in `nitro-shm`'s `map.rs` and two `unsafe` ioctl blocks in its
+blocks in `nitro-shm`'s `map.rs` and five `unsafe` ioctl blocks in its
 `dmabuf.rs`, all of them a *kernel* contract (an fd we own, a mapping of a
-file the kernel has sealed against us, a cache-sync ioctl on a dma-buf) with a written proof
+file the kernel has sealed against us, a cache-sync ioctl on a dma-buf, a
+fence snapshot of one) with a written proof
 and tests that assert the kernel's half of it. The crate route adds 43
 sites across three dependencies, all of them in code that parses
 **untrusted bytes**, which is a different kind of risk and not one we can
@@ -595,7 +596,7 @@ the syscall families it uses.
 |---|---|---|
 | `nitro-wire` | `event`, `fs`, `net`, `process` | `poll` for the blocking handshake; `memfd_create`/`fstat`/`ftruncate` (tests) and `unlinkat`/`mkdir` for the socket path; `socket`/`bind`/`listen`/`accept`/`sendmsg`/`recvmsg` + `SCM_RIGHTS`; **TCP sockets and `sockopt` (`TCP_NODELAY`, `SO_KEEPALIVE` + the three keepalive timers, `SO_REUSEADDR`) for the remote transport — the same feature, not a new one**; `getuid` for the `/tmp` fallback path |
 | `nitro-server` | `event`, `fs`, `net`, `process`, `time` | epoll loop, control socket, signals, timers, and `eventfd` for the test input source. Client buffers are **mapped, not read**, since #569 — the `mmap` lives in `nitro-shm` |
-| `nitro-shm` | `fs`, `mm` | `memfd_create`/`ftruncate`/`fcntl_add_seals`/`fcntl_get_seals`/`fstat` for sealed buffers, `fstatfs` to recognise a dma-buf (#3914); `mmap`/`munmap` for the one sanctioned mapping of them; `ioctl` (no feature flag in rustix 1.x) for `DMA_BUF_IOCTL_SYNC`. The **only** crate besides `nitro-kms` that enables `mm`, and the tree's second and third `unsafe` exceptions |
+| `nitro-shm` | `fs`, `mm` | `memfd_create`/`ftruncate`/`fcntl_add_seals`/`fcntl_get_seals`/`fstat` for sealed buffers, `fstatfs` to recognise a dma-buf (#3914); `mmap`/`munmap` for the one sanctioned mapping of them; `ioctl` (no feature flag in rustix 1.x) for `DMA_BUF_IOCTL_SYNC` and `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` (#3918). The **only** crate besides `nitro-kms` that enables `mm`, and the tree's second and third `unsafe` exceptions |
 | `nitro-kms` | `event`, `fs`, `mm`, `net`, `time` | DRM fds, `mmap` of dumb buffers, udev netlink |
 | `nitro-demo` | `event`, `fs`, `process`, `time` | `poll` for the event loop; `getuid` for the `/tmp` fallback of the control-socket path; `clock_gettime` for the delivery-leg breakdown. Its image buffer comes from `nitro-shm` (sealed memfd) since #569 |
 | `nitro-ui` | `event`, `fs`, `process`, `time` | `epoll` for the app loop, `poll` for the synchronous text measurement, `Timespec` for `ui.set_timer`; `getuid`/`getpid` for the introspection socket's path. An `Image` widget's pixel buffer comes from `nitro-shm` (sealed memfd) since #569 |
@@ -681,11 +682,21 @@ the fd to the client, which decodes straight into it. Two pieces:
   the `SIGBUS` hazard the seals close cannot arise. Anything else must
   still carry the seals — which the fake backend's sealed-memfd export
   does. The argument is in `map.rs`'s `mmap` SAFETY block.
-- **`DMA_BUF_IOCTL_SYNC`**: two `unsafe` ioctl blocks in
-  `crates/nitro-shm/src/dmabuf.rs` (`Setter::new` for the opcode/argument
-  type, and `rustix::ioctl::ioctl`), the second file in the workspace with
-  `#![allow(unsafe_code)]`. The request is `_IOW('b', 0, u64)` and the
+- **`DMA_BUF_IOCTL_SYNC`** and **`DMA_BUF_IOCTL_EXPORT_SYNC_FILE`**: five
+  `unsafe` ioctl blocks in `crates/nitro-shm/src/dmabuf.rs`, the second
+  file in the workspace with `#![allow(unsafe_code)]`. For the sync
+  bracket: `Setter::new` for the opcode/argument type, and
+  `rustix::ioctl::ioctl`; the request is `_IOW('b', 0, u64)` and the
   kernel only reads our 8 bytes. `ENOTTY` (a memfd) is "no sync needed".
+  For the fence export (#3918, extension approved in ask#434):
+  `Updater::new`, `ioctl`, and `OwnedFd::from_raw_fd` taking ownership of
+  the sync_file fd the kernel just installed and reported only to us. The
+  request is `_IOWR('b', 2, {u32 flags; i32 fd})` (Linux 6.0+), issued
+  only after `is_dmabuf` confirmed the fd; the server uses it to extract
+  an implicit-sync acquire fence for a client dma-buf presented without
+  an explicit one, and polls the result — it never blocks. A non-dma-buf
+  is `Ok(None)`; an old kernel's `ENOTTY`/`EINVAL` is an error the caller
+  answers by polling the dma-buf fd itself.
 
 The residual is the one `map.rs` already states, from the client's side:
 a client that writes outside the `START`/`END` bracket, or after

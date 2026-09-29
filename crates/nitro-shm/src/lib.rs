@@ -14,8 +14,11 @@
 //!   someone *else* handed us carries them ([`check_seals`]);
 //! - [`map`] holds the four `unsafe` blocks (`mmap`, `from_raw_parts`,
 //!   `from_raw_parts_mut`, `munmap`) and the `SAFETY` proofs for each;
-//! - `dmabuf` (#3914) holds the two `unsafe` ioctl blocks
-//!   (`Setter::new` and `ioctl`, for `DMA_BUF_IOCTL_SYNC`), and [`DmaBufMapping`], a wrapper over
+//! - `dmabuf` (#3914, #3918) holds the five `unsafe` ioctl blocks
+//!   (`Setter::new` and `ioctl` for `DMA_BUF_IOCTL_SYNC`; `Updater::new`,
+//!   `ioctl` and `OwnedFd::from_raw_fd` for `DMA_BUF_IOCTL_EXPORT_SYNC_FILE`,
+//!   which [`export_sync_file`] uses to give the server an implicit-sync
+//!   acquire fence without blocking), and [`DmaBufMapping`], a wrapper over
 //!   `map`'s mapping for server-allocated scanout buffers.
 //!
 //!   These two are the only modules in the workspace with
@@ -74,7 +77,7 @@ mod map;
 use std::fmt;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
-pub use dmabuf::{DmaBufMapping, SyncAccess, is_dmabuf, sync_end, sync_start};
+pub use dmabuf::{DmaBufMapping, SyncAccess, export_sync_file, is_dmabuf, sync_end, sync_start};
 pub use map::{Mapping, MappingMut};
 use rustix::fs::{MemfdFlags, SealFlags};
 pub use rustix::io::Errno;

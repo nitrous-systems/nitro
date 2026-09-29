@@ -250,6 +250,35 @@ impl Connection {
         self.send(&ClientMsg::PresentSurface(frame))
     }
 
+    /// Queue a frame with an explicit acquire fence (needs `caps::DMABUF`
+    /// and `caps::SURFACE` listed; #3918). The server latches it only
+    /// once `fence` is readable (signalled). Sent at once.
+    ///
+    /// # Errors
+    /// As [`Connection::send`].
+    pub fn present_surface_fenced(
+        &mut self,
+        frame: PresentSurface,
+        fence: std::os::fd::OwnedFd,
+    ) -> Result<(), Error> {
+        self.send(&ClientMsg::PresentSurfaceFenced(
+            crate::msg::PresentSurfaceFenced { frame, fence },
+        ))
+    }
+
+    /// Register a client-allocated dma-buf (needs `caps::DMABUF` and
+    /// `caps::SURFACE` listed; #3918). Sent at once: it acts at receipt,
+    /// like `CreateSurfaceBuffer`.
+    ///
+    /// # Errors
+    /// As [`Connection::send`]; [`Error::RemoteNoFds`] on a remote link.
+    pub fn create_dmabuf_buffer(
+        &mut self,
+        buffer: crate::msg::CreateDmabufBuffer,
+    ) -> Result<(), Error> {
+        self.send(&ClientMsg::CreateDmabufBuffer(buffer))
+    }
+
     /// Export surface node `id` for another connection (needs
     /// `caps::SHARE`). Sent at once; the answer is a `SurfaceExported`
     /// carrying the token.

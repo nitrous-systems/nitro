@@ -489,9 +489,10 @@ impl From<&PlaneAssignment<'_>> for PlaneConfig {
 /// [`Backend::export_buffer`](crate::Backend::export_buffer).
 ///
 /// Index 1 of `offsets`/`pitches` is the `CbCr` plane for `NV12` and 0
-/// otherwise. The [`BufferId`] space is shared with a future
-/// `import_buffer` (dma-buf import, #3900), whose buffers will report
-/// their own layout here.
+/// otherwise. The [`BufferId`] space is shared with
+/// [`Backend::import_buffer`](crate::Backend::import_buffer), whose
+/// buffers report their own layout here (the first two planes of the
+/// [`ImportDesc`], and `size` 0: an import is not ours to map).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScanoutBufferInfo {
     /// Pixel format.
@@ -502,12 +503,63 @@ pub struct ScanoutBufferInfo {
     pub height: u32,
     /// Format modifier ([`MOD_LINEAR`] for everything `alloc_buffer` makes).
     pub modifier: u64,
-    /// Bytes to map (the whole buffer, all planes).
+    /// Bytes to map (the whole buffer, all planes); 0 for an imported
+    /// buffer, which is the client's to map.
     pub size: u64,
     /// Byte offset of each plane.
     pub offsets: [u32; 2],
     /// Row stride of each plane in bytes.
     pub pitches: [u32; 2],
+}
+
+/// The layout of a client dma-buf to import as a framebuffer, through
+/// [`Backend::import_buffer`](crate::Backend::import_buffer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImportDesc {
+    /// Pixel format.
+    pub format: Fourcc,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// Format modifier, the same for every plane.
+    pub modifier: u64,
+    /// Number of planes, 1..=4; equals the fd count passed to `import_buffer`.
+    pub planes: u8,
+    /// Byte offset of each plane within its fd.
+    pub offsets: [u32; 4],
+    /// Row stride of each plane in bytes.
+    pub pitches: [u32; 4],
+}
+
+impl ImportDesc {
+    /// Check the shape against the fds: `planes` in 1..=4 and equal to
+    /// `fds`, a non-empty size.
+    pub(crate) fn validate(&self, fds: usize) -> Result<(), crate::Error> {
+        if !(1..=4).contains(&self.planes) || usize::from(self.planes) != fds {
+            return Err(crate::Error::Unsupported(
+                "dma-buf import with a plane count other than 1..=4 fds",
+            ));
+        }
+        if self.width == 0 || self.height == 0 {
+            return Err(crate::Error::Unsupported("empty dma-buf imports"));
+        }
+        Ok(())
+    }
+
+    /// What [`Backend::buffer_info`](crate::Backend::buffer_info) reports
+    /// for the import: the first two planes, `size` 0.
+    pub(crate) fn info(&self) -> ScanoutBufferInfo {
+        ScanoutBufferInfo {
+            format: self.format,
+            width: self.width,
+            height: self.height,
+            modifier: self.modifier,
+            size: 0,
+            offsets: [self.offsets[0], self.offsets[1]],
+            pitches: [self.pitches[0], self.pitches[1]],
+        }
+    }
 }
 
 /// Per-output plane bookkeeping shared by both backends: the staged

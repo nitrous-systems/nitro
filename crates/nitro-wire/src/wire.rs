@@ -13,8 +13,9 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 use crate::error::DecodeError;
 use crate::types::{
     Align, AllocRefusal, AxisSource, BufferId, ButtonState, ColorMatrix, ColorRange, CursorPos,
-    CursorShape, DataSource, DragAction, Edge, ErrorCode, KeymapFormat, Layer, NodeId, NodeKind,
-    OverviewRequest, PopupAnchor, PopupGravity, ShareToken, TouchPhase, WindowRef, WindowState,
+    CursorShape, DataSource, DmabufFormat, DragAction, Edge, ErrorCode, KeymapFormat, Layer,
+    NodeId, NodeKind, OverviewRequest, PopupAnchor, PopupGravity, ShareToken, TouchPhase,
+    WindowRef, WindowState,
 };
 
 /// A type with a fixed-size, little-endian wire representation.
@@ -222,6 +223,19 @@ pub struct WireCursorPos {
     pub x: F32,
 }
 
+/// Wire twin of [`DmabufFormat`]: `u32` fourcc, `u64` modifier, `u32`
+/// flags (16 bytes).
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+pub struct WireDmabufFormat {
+    /// DRM fourcc.
+    pub format: U32,
+    /// Modifier.
+    pub modifier: U64,
+    /// Flags.
+    pub flags: U32,
+}
+
 /// Wire twin of [`Transform`]: `a, b, c, d, e, f` as `f32`.
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 #[repr(C)]
@@ -324,6 +338,24 @@ impl Plain for CursorPos {
     }
 }
 
+impl Plain for DmabufFormat {
+    type Wire = WireDmabufFormat;
+    fn to_wire(self) -> WireDmabufFormat {
+        WireDmabufFormat {
+            format: U32::new(self.format),
+            modifier: U64::new(self.modifier),
+            flags: U32::new(self.flags),
+        }
+    }
+    fn from_wire(w: WireDmabufFormat) -> Result<Self, DecodeError> {
+        Ok(Self {
+            format: w.format.get(),
+            modifier: w.modifier.get(),
+            flags: w.flags.get(),
+        })
+    }
+}
+
 impl Plain for Transform {
     type Wire = WireTransform;
     fn to_wire(self) -> WireTransform {
@@ -361,6 +393,7 @@ mod tests {
         assert_eq!(size_of::<WireColor>(), 4);
         assert_eq!(size_of::<WireTransform>(), 24);
         assert_eq!(size_of::<WireCursorPos>(), 8);
+        assert_eq!(size_of::<WireDmabufFormat>(), 16);
     }
 
     #[test]

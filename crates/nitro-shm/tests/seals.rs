@@ -384,11 +384,11 @@ fn the_required_seals_are_exactly_the_three() {
 fn the_unsafe_surface_is_exactly_what_the_docs_claim() {
     const BLOCKS: usize = 4;
     const WORD: &str = "four";
-    // `dmabuf.rs` (#3914): its count is quoted as "two `unsafe` ioctl
-    // blocks" — the word `ioctl` inside the walk is what tells the two
+    // `dmabuf.rs` (#3914, #3918): its count is quoted as "five `unsafe`
+    // ioctl blocks" — the word `ioctl` inside the walk is what tells the two
     // counts apart.
-    const IOCTL_BLOCKS: usize = 2;
-    const IOCTL_WORD: &str = "two";
+    const IOCTL_BLOCKS: usize = 5;
+    const IOCTL_WORD: &str = "five";
     /// The number words a doc might use, so a stale one is caught rather
     /// than merely "not found".
     const NUMBER_WORDS: [&str; 6] = ["one", "two", "three", "four", "five", "six"];
@@ -587,9 +587,9 @@ fn the_doc_count_guard_catches_drift_in_every_phrasing() {
         assert!(
             found
                 .iter()
-                .all(|(q, ioctl)| q == if *ioctl { "two" } else { "four" }),
+                .all(|(q, ioctl)| q == if *ioctl { "five" } else { "four" }),
             "{path} on clean text yields {found:?}, expected \"four\" \
-             (map.rs) and \"two\" (dmabuf.rs's ioctl blocks)"
+             (map.rs) and \"five\" (dmabuf.rs's ioctl blocks)"
         );
     }
 
@@ -603,15 +603,15 @@ fn the_doc_count_guard_catches_drift_in_every_phrasing() {
             .replace("four `unsafe` blocks", "three `unsafe` blocks")
             .replace("four\nblocks", "three\nblocks")
             .replace("four `unsafe`\nblocks", "three `unsafe`\nblocks")
-            .replace("two `unsafe` ioctl blocks", "three `unsafe` ioctl blocks")
-            .replace("two `unsafe` ioctl\nblocks", "three `unsafe` ioctl\nblocks")
-            .replace("two `unsafe`\nioctl blocks", "three `unsafe`\nioctl blocks")
-            .replace("two\n`unsafe` ioctl blocks", "three\n`unsafe` ioctl blocks");
+            .replace("five `unsafe` ioctl blocks", "six `unsafe` ioctl blocks")
+            .replace("five `unsafe` ioctl\nblocks", "six `unsafe` ioctl\nblocks")
+            .replace("five `unsafe`\nioctl blocks", "six `unsafe`\nioctl blocks")
+            .replace("five\n`unsafe` ioctl blocks", "six\n`unsafe` ioctl blocks");
         assert_ne!(drifted, src, "{path}: the drift rewrite matched nothing");
         let found = quantifiers(&drifted);
         assert!(
-            found.iter().any(|(q, _)| q == "three"),
-            "{path}: drifting the count to \"three\" was NOT caught — the \
+            found.iter().any(|(q, _)| q == "three" || q == "six"),
+            "{path}: drifting the count (to \"three\" or \"six\") was NOT caught — the \
              matcher reported {found:?}. The guard is blind to this \
              file's phrasing, which is how the last version shipped."
         );

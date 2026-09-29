@@ -18,7 +18,7 @@ another process controls is the one thing in this tree that needs `unsafe`.
 |---|---|---|
 | `src/lib.rs` | no | `create_sealed`, `memfd_with`, `check_seals`, `sealed_len`, the error types |
 | `src/map.rs` | **yes**, scoped | `Mapping` (read-only), `MappingMut` (read/write), and the four `unsafe` blocks with their proofs |
-| `src/dmabuf.rs` | **yes**, scoped (#3914) | `DmaBufMapping` (a `RawMap` wrapper, no `unsafe` of its own), `sync_start`/`sync_end`, and the two `unsafe` ioctl blocks for `DMA_BUF_IOCTL_SYNC` |
+| `src/dmabuf.rs` | **yes**, scoped (#3914) | `DmaBufMapping` (a `RawMap` wrapper, no `unsafe` of its own), `sync_start`/`sync_end`, `export_sync_file` (#3918), and the five `unsafe` ioctl blocks for `DMA_BUF_IOCTL_SYNC` and `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` |
 
 The workspace lint is `unsafe_code = "deny"`; `src/map.rs` and
 `src/dmabuf.rs` carry `#![allow(unsafe_code)]` and nothing else in the
@@ -27,7 +27,7 @@ anywhere else in it fails the build. (`Cargo.toml` must keep
 `[lints] workspace = true`, or the `deny` never applies and the `allow`
 allows nothing.) There are exactly four `unsafe` blocks in `map.rs`
 (`mmap`, `slice::from_raw_parts`, `slice::from_raw_parts_mut`, `munmap`),
-two `unsafe` ioctl blocks in `dmabuf.rs`, and exactly one `mmap` and one
+five `unsafe` ioctl blocks in `dmabuf.rs`, and exactly one `mmap` and one
 `munmap` in the whole tree.
 
 ## The seals, and what each one is for
@@ -129,10 +129,23 @@ business moving it.
 
 **The sync bracket.** `sync_start(fd, access)` / `sync_end(fd, access)`
 issue `DMA_BUF_IOCTL_SYNC` (`_IOW('b', 0, u64)`, flags `START`=0,
-`END`=4, `READ`=1, `WRITE`=2) — the crate's two `unsafe` ioctl blocks,
+`END`=4, `READ`=1, `WRITE`=2) — two of the crate's five `unsafe` ioctl blocks,
 with their argument in `dmabuf.rs`. `ENOTTY` (a memfd, a socket) returns
 `Ok(false)`, "no sync needed"; `EINTR`/`EAGAIN` are retried. It is a
 cache-coherency hint to the exporter, not a lock.
+
+**The implicit-sync fence** (#3918). `export_sync_file(fd, access)`
+issues `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` (`_IOWR('b', 2, {u32 flags; i32
+fd})`, Linux 6.0+) — the other three `unsafe` sites (`Updater::new`,
+`ioctl`, and `OwnedFd::from_raw_fd` for the fd the kernel returns). A
+client that presents a dma-buf without an explicit acquire fence relies on
+implicit sync; the server snapshots the buffer's fences as a sync_file and
+polls it in its event loop, so it never blocks and never reads a
+half-rendered frame. `Read` waits for writers only, `Write`/`ReadWrite`
+for all fences. A non-dma-buf (checked with `is_dmabuf` first, so it is
+never confused with an old kernel) returns `Ok(None)`; on a dma-buf,
+`ENOTTY`/`EINVAL` mean the kernel lacks the ioctl and are returned as
+errors, so the caller can fall back to polling the dma-buf fd itself.
 
 **The residual.** The same as (1) above, from the other side: a client
 that writes outside the bracket, or after `PresentSurface` and before

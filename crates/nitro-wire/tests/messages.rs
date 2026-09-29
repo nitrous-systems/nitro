@@ -9,6 +9,7 @@ use nitro_core::{Color, IRect, Palette, Point, Rect, Role, Size, Transform};
 use nitro_wire::codec::{FdQueue, Writer};
 use nitro_wire::msg::{
     AcceptDrop, AllocSurfaceBuffers, AllocSurfaceBuffersFailed, BindKey, BufferDamage,
+    CreateDmabufBuffer, DmabufFeedback, DmabufPlane, PresentSurfaceFenced,
     BufferReleased, ClientCaps, ClientMsg, CloseWindow, Closed, Commit, Configure, CreateBuffer,
     CreateNode, CreatePopup, CreateSurfaceBuffer, CreateWindow, DestroyBuffer, DestroyNode,
     DragDrop, DragEnter, DragFinished, DragLeave, DragMotion, Error as ErrorMsg, ExportSurface,
@@ -26,7 +27,7 @@ use nitro_wire::msg::{
     WindowList, WindowListEnd, WindowState,
 };
 use nitro_wire::types::{
-    Align, AllocRefusal, AxisSource, BufferId, ButtonState, ColorMatrix, ColorRange, CursorPos,
+    Align, AllocRefusal, AxisSource, DmabufFormat, dmabuf_flags, modifier, BufferId, ButtonState, ColorMatrix, ColorRange, CursorPos,
     CursorShape, DataSource, DragAction, Edge, ErrorCode, KeymapFormat, Layer, NodeId, NodeKind,
     OverviewRequest, PopupAnchor, PopupGravity, ShareToken, TouchPhase, WindowRef,
     WindowState as WindowStateValue, anchor, caps, constraint_adjust, drag_actions, format,
@@ -552,6 +553,52 @@ fn client_messages() -> Vec<ClientMsg> {
             height: 0,
         }
         .into(),
+        CreateDmabufBuffer {
+            id: BufferId(88),
+            width: 1920,
+            height: 1080,
+            format: format::NV12,
+            modifier: modifier::I915_Y_TILED,
+            planes: vec![
+                DmabufPlane {
+                    fd: memfd("dmabuf-y", 4096),
+                    offset: 0,
+                    stride: 2048,
+                },
+                DmabufPlane {
+                    fd: memfd("dmabuf-uv", 4096),
+                    offset: 2048 * 1088,
+                    stride: 2048,
+                },
+            ],
+        }
+        .into(),
+        CreateDmabufBuffer {
+            id: BufferId(89),
+            width: 1,
+            height: 1,
+            format: format::XR24,
+            modifier: modifier::LINEAR,
+            planes: vec![DmabufPlane {
+                fd: memfd("dmabuf-rgb", 4096),
+                offset: 0,
+                stride: 64,
+            }],
+        }
+        .into(),
+        PresentSurfaceFenced {
+            frame: PresentSurface {
+                id: NodeId(90),
+                buffer: BufferId(88),
+                serial: 91,
+                src: IRect::new(0, 0, 1920, 1080),
+                matrix: ColorMatrix::Bt709,
+                range: ColorRange::Limited,
+                damage: vec![IRect::new(1, 2, 3, 4)],
+            },
+            fence: memfd("fence", 1),
+        }
+        .into(),
     ]
 }
 
@@ -863,6 +910,33 @@ fn server_messages() -> Vec<ServerMsg> {
             node: NodeId(88),
             first_id: BufferId(89),
             reason: AllocRefusal::Limit,
+        }
+        .into(),
+        DmabufFeedback {
+            id: NodeId(0),
+            main_device: 0xe200,
+            max_width: 1920,
+            max_height: 1080,
+            formats: vec![
+                DmabufFormat {
+                    format: format::NV12,
+                    modifier: modifier::LINEAR,
+                    flags: dmabuf_flags::CPU | dmabuf_flags::IMPORT | dmabuf_flags::SCANOUT,
+                },
+                DmabufFormat {
+                    format: format::NV12,
+                    modifier: modifier::I915_Y_TILED,
+                    flags: dmabuf_flags::IMPORT | dmabuf_flags::SCANOUT,
+                },
+            ],
+        }
+        .into(),
+        DmabufFeedback {
+            id: NodeId(92),
+            main_device: 0,
+            max_width: 0,
+            max_height: 0,
+            formats: vec![],
         }
         .into(),
         OutputWorkArea {
@@ -1634,6 +1708,58 @@ fn the_m5_payload_layouts_are_frozen() {
         &[0x09, 0, 0, 0, 0x0a, 0x83, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 4]
     );
 
+    // #3918: `CreateDmabufBuffer` is a 57-byte head plus one fd per plane,
+    // `DmabufFeedback` 20 bytes plus a `vec` of 16-byte entries.
+    let mut w = Writer::new();
+    ClientMsg::from(CreateDmabufBuffer {
+        id: BufferId(1),
+        width: 2,
+        height: 3,
+        format: format::NV12,
+        modifier: modifier::I915_Y_TILED,
+        planes: vec![
+            DmabufPlane {
+                fd: memfd("golden-y", 16),
+                offset: 0,
+                stride: 64,
+            },
+            DmabufPlane {
+                fd: memfd("golden-uv", 16),
+                offset: 256,
+                stride: 64,
+            },
+        ],
+    })
+    .encode(&mut w)
+    .unwrap();
+    assert_eq!(&w.bytes()[..8], &[57, 0, 0, 0, 0x13, 0x03, 2, 0]);
+    assert_eq!(
+        &w.bytes()[8 + 16..8 + 57],
+        &[
+            2, 0, 0, 0, 0, 0, 0, 1, // modifier (Y_TILED)
+            2, // planes
+            0, 0, 0, 0, 64, 0, 0, 0, // plane 0
+            0, 1, 0, 0, 64, 0, 0, 0, // plane 1
+            0, 0, 0, 0, 0, 0, 0, 0, // plane 2 (unused)
+            0, 0, 0, 0, 0, 0, 0, 0, // plane 3 (unused)
+        ]
+    );
+    let mut w = Writer::new();
+    ServerMsg::from(DmabufFeedback {
+        id: NodeId(0),
+        main_device: 1,
+        max_width: 2,
+        max_height: 3,
+        formats: vec![DmabufFormat {
+            format: format::XR24,
+            modifier: 0,
+            flags: 7,
+        }],
+    })
+    .encode(&mut w)
+    .unwrap();
+    assert_eq!(&w.bytes()[..8], &[40, 0, 0, 0, 0x0b, 0x83, 0, 0]);
+
     let mut w = Writer::new();
     ClientMsg::from(RepositionPopup {
         id: NodeId(0x0102_0304),
@@ -2223,6 +2349,8 @@ fn the_m5_ops_are_where_the_doc_says() {
         (ExportSurface::OP, 0x0300),
         (ImportSurface::OP, 0x0300),
         (AllocSurfaceBuffers::OP, 0x0300),
+        (CreateDmabufBuffer::OP, 0x0300),
+        (PresentSurfaceFenced::OP, 0x0300),
     ] {
         assert_eq!(op & 0xff00, block, "client M5 op {op:#06x}");
         assert!(ClientMsg::is_op(op), "client M5 op {op:#06x}");
@@ -2239,6 +2367,7 @@ fn the_m5_ops_are_where_the_doc_says() {
         (SurfaceRevoked::OP, 0x8300),
         (SurfaceBufferAllocated::OP, 0x8300),
         (AllocSurfaceBuffersFailed::OP, 0x8300),
+        (DmabufFeedback::OP, 0x8300),
         (OutputWorkArea::OP, 0x8400),
         (SelectionOffer::OP, 0x8500),
         (SelectionData::OP, 0x8500),
@@ -2275,6 +2404,9 @@ fn the_m5_ops_are_where_the_doc_says() {
     assert_eq!(AllocSurfaceBuffers::OP, 0x0312);
     assert_eq!(SurfaceBufferAllocated::OP, 0x8309);
     assert_eq!(AllocSurfaceBuffersFailed::OP, 0x830a);
+    assert_eq!(CreateDmabufBuffer::OP, 0x0313);
+    assert_eq!(PresentSurfaceFenced::OP, 0x0314);
+    assert_eq!(DmabufFeedback::OP, 0x830b);
     assert_eq!(OutputWorkArea::OP, 0x8408);
     assert_eq!(DragFinished::OP, 0x8508);
     // 0x8304 is deliberately unused.

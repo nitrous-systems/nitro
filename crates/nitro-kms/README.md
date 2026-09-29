@@ -213,11 +213,17 @@ forbid; that failure is non-fatal and reported by `hotplug_error()`.
   `scanout_alpha_sets(id)` counts the successful calls.
 - `alloc_buffer` / `free_buffer` only record `(format, w, h)`
   (`buffer(id)` reads it back). Odd NV12 sizes are refused.
+- `import_buffer(desc, fds)` accepts a format+modifier that some plane of
+  some output lists (`PlaneInfo::supports`), or any LINEAR one, else
+  `Error::Unsupported`; each fd must `fstat` (else `Error::Io`). It records
+  the layout only: `buffer_info` reports it with `size` 0 and
+  `export_buffer` is `Error::Unsupported`. `device_id()` is `None`.
 - `test_layout` follows the DRM contract (`Paused`, `NotLit` before the
   first commit, `NoSuchObject` for a foreign plane or an unknown buffer).
   The verdict comes from a rule-based acceptor, which says `EINVAL` for:
   - a duplicate plane
-  - a format that is not listed with LINEAR
+  - a format that is not listed with the buffer's modifier (LINEAR for
+    `OutputFront` and `alloc_buffer` buffers)
   - `src` outside the buffer, or `dst` off the output
   - scaling on a non-scaling plane, or outside its `scale_limits`
   - zpos outside its range, an immutable zpos being moved, or two planes
@@ -579,8 +585,20 @@ The server decides, the backend executes. Per output:
 - **`buffer_info(id)`** gives format, size, modifier (`LINEAR`), byte
   size, and per-plane offsets/pitches (index 1 is NV12's CbCr).
   **`export_buffer(id)`** is a PRIME fd (`DRM_CLOEXEC | DRM_RDWR`), so a
-  client can map it for writing; every export shares the memory. Buffer
-  ids leave room for dma-buf import (#3900).
+  client can map it for writing; every export shares the memory.
+- **`import_buffer(&ImportDesc, fds)`** imports a client dma-buf (one fd
+  per plane, `desc.planes` in 1..=4 and equal to `fds.len()`; fds may be
+  dups of one buffer; the caller keeps them). Each fd is PRIME-imported,
+  then `AddFB2` with `DRM_MODE_FB_MODIFIERS` unless the modifier is
+  LINEAR (or INVALID: implicit), then the GEM handles are closed (once
+  each; the framebuffer holds its own reference). The id shares the
+  `alloc_buffer` space: `free_buffer` (deferred while on screen, then
+  `RMFB` only), `take_released_buffers` and layouts work the same;
+  `buffer_info` reports the first two planes of the descriptor with
+  `size` 0; `export_buffer` is `Unsupported`. A bad shape is
+  `Unsupported`, a kernel refusal (PRIME import, `AddFB2`) `Io`.
+- **`device_id()`** is the card fd's `st_rdev`, for dmabuf feedback's
+  `main_device` (`None` on the fake).
 
 ### Measured (`planes_probe --flip`), 2026-09-29
 

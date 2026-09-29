@@ -8,8 +8,8 @@
 use std::os::fd::{AsFd, OwnedFd};
 
 use nitro_shm::{
-    DmaBufMapping, MapError, Mapping, SealError, SyncAccess, create_sealed, is_dmabuf, sync_end,
-    sync_start,
+    DmaBufMapping, MapError, Mapping, SealError, SyncAccess, create_sealed, export_sync_file,
+    is_dmabuf, sync_end, sync_start,
 };
 use rustix::fs::{MemfdFlags, SealFlags};
 
@@ -125,4 +125,19 @@ fn only_a_dmabuf_skips_the_seals() {
         DmaBufMapping::map(r.as_fd(), 4096),
         Err(MapError::Seals(SealError::Unsealable(_)))
     ));
+}
+
+/// `export_sync_file` on a non-dma-buf is "nothing to wait for" (#3918),
+/// decided by `is_dmabuf` before any ioctl. A real dma-buf needs a DRM or
+/// udmabuf exporter, neither reachable here without new `unsafe`, so that
+/// half runs on hardware.
+#[test]
+fn export_sync_file_on_a_non_dmabuf_is_none() {
+    let fd = create_sealed("t", 4096).unwrap();
+    for access in [SyncAccess::Read, SyncAccess::Write, SyncAccess::ReadWrite] {
+        assert!(export_sync_file(&fd, access).unwrap().is_none());
+    }
+    let (r, w) = std::io::pipe().unwrap();
+    assert!(export_sync_file(&r, SyncAccess::Read).unwrap().is_none());
+    assert!(export_sync_file(&w, SyncAccess::Write).unwrap().is_none());
 }

@@ -16,13 +16,13 @@ use ::drm::control::dumbbuffer::DumbBuffer;
 use ::drm::control::{
     Device as ControlDevice, FbCmd2Flags, ResourceHandles, crtc, framebuffer, plane, property,
 };
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
 use super::{Card, PlaneProps, PropMap};
 use crate::Error;
 use crate::planes::{
-    Fourcc, MOD_LINEAR, PlaneAssignment, PlaneId, PlaneInfo, PlaneKind, ScanoutBufferInfo, Zpos,
-    rotation,
+    Fourcc, ImportDesc, MOD_INVALID, MOD_LINEAR, PlaneAssignment, PlaneId, PlaneInfo, PlaneKind,
+    ScanoutBufferInfo, Zpos, rotation,
 };
 use ::drm::control::atomic::AtomicModeReq;
 
@@ -341,12 +341,50 @@ pub(crate) fn parse_in_formats(b: &[u8]) -> Result<Vec<(Fourcc, Vec<u64>)>, &'st
 // scanout buffers
 // ---------------------------------------------------------------------------
 
-/// A linear scanout buffer for plane layouts: one dumb buffer, possibly
-/// holding several planes (NV12: Y then `CbCr`).
+/// A scanout buffer for plane layouts: either ours, one linear dumb
+/// buffer possibly holding several planes (NV12: Y then `CbCr`), or an
+/// imported client dma-buf (`db` is `None`; the framebuffer holds the
+/// only references to its GEM objects).
 pub(super) struct ScanoutBuf {
-    pub db: DumbBuffer,
+    pub db: Option<DumbBuffer>,
     pub fb: framebuffer::Handle,
     pub info: ScanoutBufferInfo,
+}
+
+/// Whether `AddFB2` gets `modifier` explicitly (`DRM_MODE_FB_MODIFIERS`):
+/// not for LINEAR (plain `AddFB2` means linear) and not for INVALID (the
+/// client's implicit modifier, which the driver derives from the buffer).
+fn explicit_modifier(modifier: u64) -> bool {
+    modifier != MOD_LINEAR && modifier != MOD_INVALID
+}
+
+/// The `AddFB2` description of an imported dma-buf: one GEM handle per
+/// plane.
+struct ImportPlanar {
+    desc: ImportDesc,
+    format: DrmFourcc,
+    handles: [Option<::drm::buffer::Handle>; 4],
+}
+
+impl PlanarBuffer for ImportPlanar {
+    fn size(&self) -> (u32, u32) {
+        (self.desc.width, self.desc.height)
+    }
+    fn format(&self) -> DrmFourcc {
+        self.format
+    }
+    fn modifier(&self) -> Option<DrmModifier> {
+        explicit_modifier(self.desc.modifier).then(|| DrmModifier::from(self.desc.modifier))
+    }
+    fn pitches(&self) -> [u32; 4] {
+        self.desc.pitches
+    }
+    fn handles(&self) -> [Option<::drm::buffer::Handle>; 4] {
+        self.handles
+    }
+    fn offsets(&self) -> [u32; 4] {
+        self.desc.offsets
+    }
 }
 
 /// The `AddFB2` description of a dumb buffer holding `planes` planes at
@@ -430,7 +468,11 @@ impl ScanoutBuf {
             pitches: [pitch, if planes == 2 { pitch } else { 0 }],
         };
         match card.add_planar_framebuffer(&desc, FbCmd2Flags::empty()) {
-            Ok(fb) => Ok(Self { db, fb, info }),
+            Ok(fb) => Ok(Self {
+                db: Some(db),
+                fb,
+                info,
+            }),
             Err(e) => {
                 let _ = card.destroy_dumb_buffer(db);
                 Err(Error::Io {
@@ -441,11 +483,72 @@ impl ScanoutBuf {
         }
     }
 
+    /// Import a client dma-buf: PRIME-import each plane's fd, `AddFB2`
+    /// (with the modifier unless it is LINEAR or INVALID), then close the GEM
+    /// handles, which the framebuffer keeps referenced.
+    pub fn import(
+        card: &Card<'_>,
+        desc: &ImportDesc,
+        fds: &[BorrowedFd<'_>],
+    ) -> Result<Self, Error> {
+        desc.validate(fds.len())?;
+        let format = DrmFourcc::try_from(desc.format.0)
+            .map_err(|_| Error::Unsupported("that pixel format"))?;
+        let mut handles = [None; 4];
+        // Distinct handles, each closed exactly once: dups of one
+        // buffer import to the same handle.
+        let mut owned: Vec<::drm::buffer::Handle> = Vec::new();
+        let close = |owned: &[::drm::buffer::Handle]| {
+            for h in owned {
+                let _ = card.close_buffer(*h);
+            }
+        };
+        for (slot, fd) in handles.iter_mut().zip(fds) {
+            match card.prime_fd_to_buffer(*fd) {
+                Ok(h) => {
+                    *slot = Some(h);
+                    if !owned.contains(&h) {
+                        owned.push(h);
+                    }
+                }
+                Err(e) => {
+                    close(&owned);
+                    return Err(Error::Io {
+                        op: "import PRIME fd",
+                        source: e,
+                    });
+                }
+            }
+        }
+        let planar = ImportPlanar {
+            desc: *desc,
+            format,
+            handles,
+        };
+        let flags = if explicit_modifier(desc.modifier) {
+            FbCmd2Flags::MODIFIERS
+        } else {
+            FbCmd2Flags::empty()
+        };
+        let fb = card.add_planar_framebuffer(&planar, flags);
+        close(&owned);
+        let fb = fb.map_err(Error::io("add framebuffer"))?;
+        Ok(Self {
+            db: None,
+            fb,
+            info: desc.info(),
+        })
+    }
+
     /// A PRIME dma-buf fd for the buffer, `O_RDWR | O_CLOEXEC`, so the
     /// receiver can map it for writing.
     pub fn export(&self, card: &Card<'_>) -> Result<OwnedFd, Error> {
+        let db = self
+            .db
+            .as_ref()
+            .ok_or(Error::Unsupported("export of an imported buffer"))?;
         card.buffer_to_prime_fd(
-            ::drm::buffer::Buffer::handle(&self.db),
+            ::drm::buffer::Buffer::handle(db),
             ::drm::CLOEXEC | ::drm::RDWR,
         )
         .map_err(Error::io("export PRIME fd"))
@@ -453,7 +556,9 @@ impl ScanoutBuf {
 
     pub fn destroy(self, card: &Card<'_>) {
         let _ = card.destroy_framebuffer(self.fb);
-        let _ = card.destroy_dumb_buffer(self.db);
+        if let Some(db) = self.db {
+            let _ = card.destroy_dumb_buffer(db);
+        }
     }
 }
 
