@@ -150,9 +150,39 @@ committed layout reads is held (`plane_releases_held`) until
 A modeset (resume, rescan, `set_modes`, another output lighting) resets
 every decision.
 
-**IN_FENCE_FD** is not used yet. Every placed frame latched after its
-fence signalled, and server-allocated buffers are CPU-written. The hook
-point is in `Server::apply_decision`.
+**IN_FENCE_FD** (#3938). A frame whose acquire fence is still pending
+**latches early** when its node is placed on a plane that has
+`IN_FENCE_FD` and lists the buffer's format and modifier
+(`Server::early_latch_nodes`; `Latch::latch_ready` then takes the newest
+queued frame, fenced or not). The fence leaves the epoll set
+(`FenceSet::take`) and is kept per output by node; just before either
+commit (`paint` → `commit`, `flip_planes` → `commit_planes`)
+`stage_plane_fences` hands it to `Backend::set_plane_fence` for the plane
+the current decision gives that node. The kernel waits on it, the server
+never does. An early-latched buffer gets no `DMA_BUF_IOCTL_SYNC` read
+bracket (it would block on the fence), and no matching end. Stats:
+`plane_fence_latches` (frames latched early), `plane_fences` (fences
+handed over).
+
+Residual: if the planner un-places the node between the latch and the
+commit, the fence is dropped and the frame is composited. A linear,
+CPU-readable buffer could then be read before its writer finishes, which
+tears that one frame. A tiled one shows the placeholder anyway.
+
+On testhost2, VA-API frames do not take this path: the export's
+`vaSyncSurface` completes each frame before `PresentSurface`, so the
+implicit fence has already signalled at receipt (`fence_waits` 0,
+`plane_fences` 0). The path is for producers that present unfinished
+work, such as a GPU client with `PresentSurfaceFenced`, and is covered on
+the fake backend (`tests/dmabuf.rs`).
+
+**Client dma-bufs on planes** (#3938). Every dma-buf is imported as a KMS
+framebuffer when it is registered (AddFB2 with the modifier; VA's Y-tiled
+NV12 passes on KBL). The framebuffer is cached in `HeldBuffer.scanout`
+for the buffer's life and is a plane candidate like a server-allocated
+buffer. The planner pre-filters on each plane's `IN_FORMATS`. A dma-buf
+the planner cannot place and the CPU cannot read keeps the grey
+placeholder until the GPU helper (#3922) composites it.
 
 **SurfaceHint** reports YUYV where a plane lists YUYV but none lists
 NV12 (HSW), and NV12 otherwise. `AllocSurfaceBuffers` with format 0
@@ -161,7 +191,8 @@ takes `planes::alloc_format`: NV12, else YUYV, else XR24.
 Stats: `planes_mode` (max over outputs), `planes_in_use`,
 `planes_candidates`, `planes_obscured`, `planes_tests`,
 `planes_cache_hits`, `planes_fallbacks`, `planes_switches`,
-`plane_flips`, `plane_releases_held`. Numbers:
+`plane_flips`, `plane_releases_held`, `plane_fences`,
+`plane_fence_latches`. Numbers:
 [`budget.md`](budget.md) "Planes (#3899)".
 
 ## Fallback chain for one Surface
@@ -281,15 +312,15 @@ side: `crates/nitro-server/src/dmabuf.rs`.
   planes), `CPU` (linear CPU formats), `IMPORT`. It also carries
   `main_device` (`Backend::device_id`) and the output size as
   `max_width`/`max_height`, meaning "render at display size or smaller".
-- **Hooks for the planes module (#3899).** #3899 builds on these:
-  - `HeldBuffer.scanout` holds the imported KMS framebuffer.
-  - `surface::Queued::fence` is reachable, so a plane-placed frame can
-    latch early and hand its fence to `Backend::set_plane_fence` as
-    `IN_FENCE_FD` instead of waiting.
-  - `dmabuf::direct_scanout()` is `false`, and so is the `DIRECT_SCANOUT`
-    cap. #3899 turns both on.
-  - The feedback's `SCANOUT` flags drive the placement.
-  - Releases after the replacing flip already flow through
+- **On planes (#3899, #3938).**
+  - `HeldBuffer.scanout` holds the imported KMS framebuffer, and it is a
+    plane candidate.
+  - A placed frame latches early and hands its fence to
+    `Backend::set_plane_fence` as `IN_FENCE_FD` (§Planes above).
+  - `dmabuf::direct_scanout(planes)` is true when some non-cursor plane
+    lists a real format/modifier pair: exactly the pairs the feedback
+    flags `SCANOUT`. It sets the `DIRECT_SCANOUT` cap.
+  - Releases happen after the replacing flip, through
     `take_released_buffers`.
 - **Not in v1.** `SetSurface` with a dma-buf is refused, because readiness
   is defined only at the latch. The server does not check that a fence

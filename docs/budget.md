@@ -1815,6 +1815,21 @@ frames 50 → 280) is not used by `auto`. Binary +36 KB (845 KB), no crate
 added. Details and the box1 table: `crates/nitro-video/README.md`
 §Hardware decode.
 
+**On planes (#3938).** With VA's Y-tiled NV12 scanned out on KBL planes,
+`auto` picks `vaapi-dmabuf` on testhost2 and the picture is real. The
+server's share of a fullscreen video falls from 31 % (placeholder paint)
+to **2.3–2.7 %** of a core at 1080p and 1440p: plane-only flips, no
+raster, so there is no `paint_us`. Player: 3.5–4.5 %, 56–61 MB RSS, GEM
+28 MB (1080p) and 55 MB (1440p). Server RSS 26.7 MB throughout. On box1
+(HSW), Y-tiled NV12 is not importable: software (`auto`) or download
+(`dmabuf`), never a placeholder. Footprint: `nitro-server` +10.2 KB
+stripped (3 326 904 → 3 337 088 B), over the +8 KB planned (the early
+latch, fence staging and tests' seams). The new state is one fd Vec per
+output and one `HashSet` of buffer keys, both empty without placed
+fenced frames. Idle `nitro-server` on box1: 18.8 MB RSS, 10.4 MB anon,
+0 % CPU. `nitro-video` byte-identical (835 512 B); no crate added. Table:
+`crates/nitro-video/README.md` §Measurements (#3923).
+
 ## Dependency count
 
 `cargo tree -e normal --prefix none | sort -u | wc -l` = **74** at M4-A

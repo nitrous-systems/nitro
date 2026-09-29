@@ -964,11 +964,13 @@ looking for.
 | `scanout_buffer_bytes`   | Bytes of those buffers the server maps (the whole export each). Dumb-buffer memory: **not** in the server's `RssAnon`, but counted against the per-client buffer caps like a memfd. |
 | `dmabuf_buffers`         | Client-allocated dma-bufs (`CreateDmabufBuffer`, #3918) held right now. |
 | `dmabuf_cpu_mapped`      | Of those, the ones the CPU path maps (linear, CPU format, one buffer). The rest paint as a placeholder. |
-| `dmabuf_kms_imported`    | Of those, the ones imported as KMS framebuffers (`Backend::import_buffer`; only when the output has planes). The hook the planes module (#3899) reads. |
+| `dmabuf_kms_imported`    | Of those, the ones imported as KMS framebuffers (`Backend::import_buffer`; only when the output has planes). Plane candidates (#3899, #3938). |
 | `dmabuf_kms_refused`     | KMS imports refused, cumulative. Not an error: the buffer stays on the CPU path or placeholder. |
 | `dmabuf_placeholder_paints` | Surface paints that showed the grey placeholder because the buffer is not CPU-readable (tiled/compressed), cumulative. |
 | `fences_pending`         | Acquire fences waiting in the epoll set right now. |
 | `fence_waits`            | Acquire fences that were not yet signalled at receipt and had to be waited for, cumulative. |
+| `plane_fence_latches`    | Frames latched onto a plane before their acquire fence signalled (#3938), cumulative. Their fence goes to the display. |
+| `plane_fences`           | Acquire fences handed to the display as a plane's `IN_FENCE_FD` (#3938), cumulative. |
 | `implicit_fence_fallbacks` | Implicit fences taken by polling the dma-buf because `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` is missing (kernel < 6.0), cumulative. |
 | `decorated`              | Windows carrying a server-drawn frame. `windows - decorated` is how many opted out with `UNDECORATED`. |
 | `minimized`              | Windows hidden by `Minimized`. They are still in `windows` and still in the `Alt+Tab` order. |

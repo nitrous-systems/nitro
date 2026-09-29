@@ -98,16 +98,32 @@ check the feedback before sending `CreateDmabufBuffer`, since an unlisted
 pair is a fatal `BadBuffer`, and download otherwise. The player waits up
 to 200 ms for the feedback.
 
-**What the server does with a tiled VA buffer until the planes module
-(#3899).** VA on Intel decodes into Y-tiled NV12
-(`I915_FORMAT_MOD_Y_TILED`), which the server imports and KMS-imports
-(`dmabuf_kms_imported`) but cannot convert on the CPU, so it paints a grey
-placeholder (`dmabuf_placeholder_paints`). `DIRECT_SCANOUT` is off, so
-`auto` decodes in software on both boxes today and switches to VA dma-bufs
-with no player change once #3899 turns the bit on. That switch needs a
-re-check on testhost2 once #3899 lands (VA's Y-tiled NV12 passes AddFB2
-there, #3903). `--hwdec dmabuf` shows the
-placeholder path now, for verification.
+**What the server does with a tiled VA buffer (#3938).** VA on Intel
+decodes into Y-tiled NV12 (`I915_FORMAT_MOD_Y_TILED`), which the CPU
+cannot convert. Where a plane lists that pair, the server advertises
+`DIRECT_SCANOUT`, KMS-imports every VA surface once (AddFB2 with the
+modifier) and **scans it out on a plane**:
+
+- **testhost2 (KBL):** `auto` picks `vaapi-dmabuf` and shows the real
+  picture. The CRTC CRC changes frame to frame, and
+  `i915_display_info` shows the NV12 Y-tiled framebuffer on the plane.
+  - Fullscreen: direct scanout on the primary (`planes_mode 3`, primary
+    `NV12 0x100000000000002 1920x1080 → 2560x1440`).
+  - Fullscreen with the pointer or controls over it: underlay by primary
+    swap (video on the primary, the UI as AR24 on the overlay,
+    `planes_mode 1`).
+  - Windowed 720p (1600×900 device px at scale 1.25): overlay above the
+    UI (`planes_mode 1`).
+  - Limit: a **1080p clip in its default window** is downscaled to
+    1600×900 (0.83×). That is under KBL's 0.94× floor, so it cannot go
+    on a plane and shows the grey placeholder
+    (`dmabuf_placeholder_paints` grows) until the GPU helper (#3922).
+    Resize the window or go fullscreen.
+- **box1 (HSW, i965):** no plane lists NV12, so the server does not
+  import Y-tiled NV12 at all. `auto` decodes in software (`fallback="the
+  server does not import NV12 with modifier 0x100000000000002"`), and
+  `--hwdec dmabuf` falls back to `vaapi-download` for the same reason.
+  Neither case shows a placeholder.
 
 **Buffer pool.** FFmpeg's VA pool is dynamic (VA-API ≥ 1), so it grows
 to the decoder's references plus what is in flight; `extra_hw_frames = 4`
@@ -147,6 +163,25 @@ is forced (`--hwdec dmabuf`) and paints the grey **placeholder**, so its
 The dma-buf runs registered 7 buffers (`dmabuf_buffers 7`, all
 `dmabuf_kms_imported`), `buffers=7` in `--stats`: the VA pool as FFmpeg
 grew it for x264 (refs + 4 in flight), well under the 24 cap.
+
+**testhost2 with planes (#3938)**: temporary `nitro-dev` unit on this
+branch (eDP 2560×1440, scale 1.25), `--hwdec auto` → `vaapi-dmabuf`, a
+**real picture**, 450 frames. CPU is over 6 s in steady state. Every
+frame is a plane-only flip (`plane_flips` +438…441 of 450), and the
+server rasterizes nothing, so `paint_us` does not apply (no paints
+after the first frames). The table is 0 dropped, 0 late:
+
+| run | layout | player CPU | player RSS | player GEM | server CPU | server RSS |
+|---|---|---|---|---|---|---|
+| 1080p fullscreen | direct (primary, scaled) / underlay with the pointer | 3.5–3.7 % | 56.7–60.7 MB | 28.2–29.0 MB | **2.3–2.5 %** | 26.7 MB |
+| 1440p fullscreen | underlay (primary swap) | 4.3–4.5 % | 56.1–57.2 MB | 54.3–55.9 MB | **2.7 %** | 26.7 MB |
+| 720p windowed | overlay above | 3.2 % | 55.5 MB | 17.4 MB | 2.7 % | 26.7 MB |
+| 1080p in a 1600×900 window | composite (0.83× downscale): **placeholder** | 3.8 % | 60.4 MB | 28.2 MB | 27 % | 26.7 MB |
+
+Against the placeholder runs below, the server drops from 31 % to 2.5 %
+of a core: it no longer touches the frame. `plane_fences` stays 0
+because VA frames arrive complete (the export's `vaSyncSurface`), so no
+fence is pending at receipt (`fence_waits` 0).
 
 **box1** (Pentium G3240, i965 2.4.1: **H.264 only**, FFmpeg 8), the live
 `nitro-dev` session, HDMI 1080p. i965 exports Y-tiled NV12 too, which a

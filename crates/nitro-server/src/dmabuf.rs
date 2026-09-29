@@ -14,7 +14,7 @@
 //!   counted in `dmabuf_placeholder_paints`) unless the planes module
 //!   (#3899) scans it out. When the output backend has planes, every
 //!   dma-buf is also imported as a KMS framebuffer at commit
-//!   (`Backend::import_buffer`, AddFB2 with the modifier), kept in
+//!   (`Backend::import_buffer`, `AddFB2` with the modifier), kept in
 //!   `HeldBuffer::scanout` for the buffer's life, and is a plane
 //!   candidate like a server-allocated one; the planner pre-filters on
 //!   each plane's `IN_FORMATS`. [`direct_scanout`] says whether any plane

@@ -7451,7 +7451,6 @@ impl Server {
     /// (`dmabuf::direct_scanout`, #3938); the per-node feedback says which
     /// format/modifier pairs. A zero bit is the protocol's way of saying
     /// "do not use this".
-
     ///
     /// `SHELL` is set for, and only for, a connection accepted on the shell
     /// socket — which is what `shell` says. It is reported rather than

@@ -315,8 +315,12 @@ Although it is below bit 8, it is an **explicit opt-in exception** like
 listed `DMABUF` in `ClientCaps`, and `CreateDmabufBuffer` /
 `PresentSurfaceFenced` from a client that did not list it — or did not
 list `SURFACE`, or is on a remote link — is `Error { Protocol }` (rule 3).
-`DIRECT_SCANOUT` (bit 0) stays **unset**: nothing scans a client buffer
-out until the planes module (#3899) places them; it turns the bit on.
+`DIRECT_SCANOUT` (bit 0) is set on a local link when some output has a
+non-cursor plane that lists a format/modifier pair (#3938): the planes
+module can then scan a client dma-buf out. The per-node `DmabufFeedback`
+says which pairs (`SCANOUT`). Whether a given frame goes on a plane is
+decided per frame, and one that cannot be placed or read by the CPU shows
+a placeholder.
 
 `SHARE` (bit 17, #3904) has `SURFACE`'s shape: it is advertised on every
 **local** link and never on a remote one, because the token is a bearer
