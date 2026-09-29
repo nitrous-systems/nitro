@@ -53,6 +53,7 @@ pub mod keyboard;
 pub mod lock;
 pub mod logging;
 pub mod overview;
+pub mod planes;
 pub mod popup;
 pub mod protocol;
 pub mod remote;
