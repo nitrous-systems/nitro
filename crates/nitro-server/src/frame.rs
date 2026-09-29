@@ -2118,7 +2118,11 @@ mod tests {
         assert!(took);
         // The lie is at image (20, 15) = device (27, 20).
         let o = (20 * 64 + 27) * 4;
-        assert_eq!(&fast[o..o + 4], &[100, 105, 44, 255], "copied, alpha forced opaque");
+        assert_eq!(
+            &fast[o..o + 4],
+            &[100, 105, 44, 255],
+            "copied, alpha forced opaque"
+        );
         assert_ne!(&plain[o..o + 3], &fast[o..o + 3], "the blend skipped it");
         // Everywhere else (the honest pixels) they agree.
         let mut f = fast.clone();

@@ -34,7 +34,9 @@ impl World {
         let mut scene = Scene::new();
         scene.add_output(OUT, IRect::new(0, 0, W.cast_signed(), H.cast_signed()), 1.0);
         let win = scene.create_window(CLIENT, "w", Size::new(100.0, 60.0), Layer::Normal);
-        scene.place_window(win, Some(OUT), Point::new(10.0, 10.0)).unwrap();
+        scene
+            .place_window(win, Some(OUT), Point::new(10.0, 10.0))
+            .unwrap();
         let root = scene.window_info(win).unwrap().root();
         Self { scene, root }
     }
@@ -45,7 +47,9 @@ impl World {
             .create_node(CLIENT, NodeKind::Rect, self.root, None)
             .unwrap();
         self.scene.set_bounds(CLIENT, key, bounds).unwrap();
-        self.scene.set_fill(CLIENT, key, Fill::Solid(color)).unwrap();
+        self.scene
+            .set_fill(CLIENT, key, Fill::Solid(color))
+            .unwrap();
         key
     }
 
@@ -61,7 +65,8 @@ impl World {
 
     fn update(&mut self) {
         let mut d = Damage::new();
-        self.scene.update(&mut DamageSink::new(&mut [(OUT, &mut d)]));
+        self.scene
+            .update(&mut DamageSink::new(&mut [(OUT, &mut d)]));
     }
 
     /// Paint the whole output into a fresh buffer, cursor optional.
@@ -127,10 +132,17 @@ fn translucent_content_and_the_cursor_over_a_hole_are_premultiplied() {
     let mut world = World::new();
     world.surface(Rect::new(20.0, 15.0, 40.0, 30.0));
     // 50 % white over the hole's left half.
-    world.rect(Rect::new(20.0, 15.0, 20.0, 30.0), Color::rgba(255, 255, 255, 128));
+    world.rect(
+        Rect::new(20.0, 15.0, 20.0, 30.0),
+        Color::rgba(255, 255, 255, 128),
+    );
     let data = world.paint(Some((55, 30)));
     let p = px(&data, 32, 40);
-    assert_eq!(p, [128, 128, 128, 128], "50 % white on a hole, premultiplied");
+    assert_eq!(
+        p,
+        [128, 128, 128, 128],
+        "50 % white on a hole, premultiplied"
+    );
     // The arrow's tip is opaque black: an opaque pixel inside the hole.
     assert_eq!(px(&data, 55, 30), [0, 0, 0, 255]);
     // Every pixel is a valid premultiplied value.
@@ -154,7 +166,10 @@ fn fill_holes_makes_a_shot_opaque_with_the_placeholder() {
     let mut world = World::new();
     world.rect(Rect::new(0.0, 0.0, 100.0, 60.0), Color::rgb(200, 10, 10));
     world.surface(Rect::new(20.0, 15.0, 40.0, 30.0));
-    world.rect(Rect::new(20.0, 15.0, 20.0, 30.0), Color::rgba(255, 255, 255, 128));
+    world.rect(
+        Rect::new(20.0, 15.0, 20.0, 30.0),
+        Color::rgba(255, 255, 255, 128),
+    );
     let data = world.paint(None);
     let mut img = Image {
         width: W,
@@ -169,16 +184,19 @@ fn fill_holes_makes_a_shot_opaque_with_the_placeholder() {
     // 128 + 0x80 * 127 / 255 = 192.
     assert_eq!(img.pixel(32, 40), 0x00c0_c0c0);
     // Opaque pixels are untouched.
-    assert_eq!(&img.data[..], &{
-        let mut d = data;
-        for (o, n) in d.chunks_exact_mut(4).zip(img.data.chunks_exact(4)) {
-            if o[3] == 255 {
-                assert_eq!(o, n);
+    assert_eq!(
+        &img.data[..],
+        &{
+            let mut d = data;
+            for (o, n) in d.chunks_exact_mut(4).zip(img.data.chunks_exact(4)) {
+                if o[3] == 255 {
+                    assert_eq!(o, n);
+                }
+                o.copy_from_slice(n);
             }
-            o.copy_from_slice(n);
-        }
-        d
-    }[..]);
+            d
+        }[..]
+    );
 }
 
 #[test]
@@ -201,8 +219,7 @@ fn without_holes_every_pixel_is_opaque_and_fill_holes_is_a_no_op() {
 #[test]
 fn scanout_alpha_follows_holes_and_capability() {
     for capable in [true, false] {
-        let mut backend =
-            FakeBackend::new(&[FakeOutputSpec::new(W, H).alpha(capable)]).unwrap();
+        let mut backend = FakeBackend::new(&[FakeOutputSpec::new(W, H).alpha(capable)]).unwrap();
         let id = backend.outputs()[0].id;
         let mut out = OutputState::new(id, OUT, W, H, 60_000, true);
         for holes in [false, false, true, true, false, false, true] {
