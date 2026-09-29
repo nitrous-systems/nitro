@@ -525,7 +525,10 @@ const DOCS_QUOTING_THE_COUNT: [(&str, &str); 5] = [
     ("crates/nitro-shm/README.md", include_str!("../README.md")),
     ("crates/nitro-shm/src/map.rs", include_str!("../src/map.rs")),
     ("crates/nitro-shm/src/lib.rs", include_str!("../src/lib.rs")),
-    ("crates/nitro-shm/src/dmabuf.rs", include_str!("../src/dmabuf.rs")),
+    (
+        "crates/nitro-shm/src/dmabuf.rs",
+        include_str!("../src/dmabuf.rs"),
+    ),
 ];
 
 /// The guard above, tested against **every phrasing the real files use**.

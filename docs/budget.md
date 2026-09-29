@@ -1383,6 +1383,43 @@ shown layouts, fences, refs) until a layout is staged. A staged layout
 is a handful of 64-byte `PlaneConfig`s. The default frame path still
 clones the same template request and allocates nothing more.
 
+## Server-allocated scanout buffers (#3914)
+
+`just footprint` (release, stripped), base main `76d438e` → task-3914:
+
+| binary | before | after | Δ | budget |
+|---|---|---|---|---|
+| nitro-server | 3 176 280 | 3 191 160 | **+14 880** | ≤ +15 KB |
+| nitro-demo | 566 808 | 575 608 | **+8 800** | ≤ +15 KB |
+
+No new crate; 37 external names, 89 `cargo tree` lines, unchanged.
+
+**Memory.** The pool is dumb-buffer memory owned by the kernel. It is
+**not** in the server's `RssAnon`, and it is counted against the
+per-client buffer caps and reported by `stats scanout_buffer_bytes`. At
+the kernel's padded pitch, a 3-buffer pool measured on box1 is:
+720p YUYV **5.5 MB** (`scanout_buffer_bytes` 5 529 600) and 1080p YUYV
+**12.4 MB** (12 441 600). 1080p NV12 would be ~9.3 MB. The server's own
+cost is a read-only mapping (page tables) and one `HeldBuffer` per
+buffer.
+
+**Paint cost, box1 (HSW, 1920×1080, 60 fps).** `samples paint` over 8 s,
+first 30 paints dropped. The CPU path reads the same frame from the
+client's memfd and from the server's mapping of the dumb-buffer export:
+
+| run | memfd `paint_us` mean / p95 | scanout `paint_us` mean / p95 |
+|---|---|---|
+| 1280×720 YUYV windowed | 716 / 736 | 719 / 743 |
+| 1920×1080 YUYV fullscreen | 1 491 / 1 537 | 1 475 / 1 500 |
+
+**No measurable penalty** for reading a write-combined dumb buffer.
+The fused 4:2:2 converter is compute-bound, not load-bound, at these
+rates. The default format on box1 came out `YUYV`, because HSW's sprite
+lists no NV12. An explicit `--format nv12` request is refused by the
+kernel (`AllocSurfaceBuffersFailed { Failed }`: i915 on Gen7 rejects an
+NV12 framebuffer at `AddFB2`), and the demo fell back to memfds as
+designed.
+
 ## Dependency count
 
 `cargo tree -e normal --prefix none | sort -u | wc -l` = **74** at M4-A

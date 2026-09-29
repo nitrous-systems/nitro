@@ -14,7 +14,8 @@ use nitro_shm::{
 use rustix::fs::{MemfdFlags, SealFlags};
 
 fn unsealed(len: u64) -> OwnedFd {
-    let fd = rustix::fs::memfd_create("t", MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING).unwrap();
+    let fd =
+        rustix::fs::memfd_create("t", MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING).unwrap();
     rustix::fs::ftruncate(&fd, len).unwrap();
     fd
 }

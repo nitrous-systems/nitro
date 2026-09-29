@@ -24,7 +24,8 @@ use nitro_server::{BackendKind, Config, run};
 use nitro_shm::MappingMut;
 use nitro_wire::client::Connection;
 use nitro_wire::msg::{
-    AllocSurfaceBuffers, ClientMsg, SurfaceBufferAllocated, Configure, CreateSurfaceBuffer, PresentSurface, ServerMsg, SetBounds,
+    AllocSurfaceBuffers, ClientMsg, Configure, CreateSurfaceBuffer, PresentSurface, ServerMsg,
+    SetBounds, SurfaceBufferAllocated,
 };
 use nitro_wire::types::{
     AllocRefusal, BufferId, ColorMatrix, ColorRange, ErrorCode, Layer, NodeId, caps, format,
@@ -828,12 +829,17 @@ fn server_allocated_buffers_are_written_presented_and_freed() {
     // The id is free again for the client's own use.
     alloc(&mut conn, 10, 1, format::YUYV, SIDE, SIDE);
     let y = allocated(&mut conn, &mut seen, 10, 1);
-    assert_eq!((y[0].format, y[0].stride0, y[0].offset1), (format::YUYV, 64, 0));
+    assert_eq!(
+        (y[0].format, y[0].stride0, y[0].offset1),
+        (format::YUYV, 64, 0)
+    );
     assert_eq!(h.stat("scanout_buffers"), 3);
 
     // Disconnect cleanup.
     drop(conn);
-    wait_for("the scanout buffers to go", || h.stat("scanout_buffers") == 0);
+    wait_for("the scanout buffers to go", || {
+        h.stat("scanout_buffers") == 0
+    });
     assert_eq!(h.stat("scanout_buffer_bytes"), 0);
     h.quit();
 }
@@ -872,7 +878,12 @@ fn refusals_are_not_fatal() {
 
 fn fatal(h: &Harness, name: &str, req: impl FnOnce(&mut Connection)) -> ErrorCode {
     let (mut conn, mut seen) = surface_client(h, name);
-    window(&mut conn, &mut seen, &[&Buf::new(7, format::NV12, 1)], (16.0, 16.0));
+    window(
+        &mut conn,
+        &mut seen,
+        &[&Buf::new(7, format::NV12, 1)],
+        (16.0, 16.0),
+    );
     req(&mut conn);
     let _ = conn.flush();
     expect(&mut conn, &mut seen, "Error", |m| match m {
@@ -942,7 +953,10 @@ fn defaults_come_from_the_planes_and_the_hint() {
     window(&mut conn, &mut seen, &[], (30.0, 21.0));
     alloc(&mut conn, 10, 1, 0, 0, 0);
     let a = allocated(&mut conn, &mut seen, 10, 1);
-    assert_eq!((a[0].format, a[0].width, a[0].height), (format::XR24, 30, 21));
+    assert_eq!(
+        (a[0].format, a[0].width, a[0].height),
+        (format::XR24, 30, 21)
+    );
     h.quit();
 
     // A YUYV overlay (HSW's shape): YUYV, width rounded up to even.
@@ -955,7 +969,10 @@ fn defaults_come_from_the_planes_and_the_hint() {
     window(&mut conn, &mut seen, &[], (31.0, 21.0));
     alloc(&mut conn, 10, 1, 0, 0, 0);
     let a = allocated(&mut conn, &mut seen, 10, 1);
-    assert_eq!((a[0].format, a[0].width, a[0].height), (format::YUYV, 32, 21));
+    assert_eq!(
+        (a[0].format, a[0].width, a[0].height),
+        (format::YUYV, 32, 21)
+    );
     h.quit();
 
     // NV12 listed: NV12 wins, both dimensions rounded up to even.
@@ -968,6 +985,9 @@ fn defaults_come_from_the_planes_and_the_hint() {
     window(&mut conn, &mut seen, &[], (31.0, 21.0));
     alloc(&mut conn, 10, 1, 0, 40, 0);
     let a = allocated(&mut conn, &mut seen, 10, 1);
-    assert_eq!((a[0].format, a[0].width, a[0].height), (format::NV12, 40, 22));
+    assert_eq!(
+        (a[0].format, a[0].width, a[0].height),
+        (format::NV12, 40, 22)
+    );
     h.quit();
 }

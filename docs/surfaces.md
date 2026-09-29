@@ -175,11 +175,15 @@ sends the fd in a `SurfaceBufferAllocated`. The client maps it
   frame — a torn picture, the same class as a client writing while
   presenting, and never more than its own window. The plane path does not
   read the pixels on the CPU at all.
-- **Reading cost.** Dumb-buffer mappings are write-combined, so CPU
-  **reads** from them are uncached: the CPU path pays more per pixel than
-  with a memfd. On box1 that is the number in `docs/budget.md` §
-  "Server-allocated scanout buffers (#3914)"; it is a reason for #3899 to
-  put these buffers on a plane rather than composite them.
+- **Reading cost: measured, none.** Dumb-buffer mappings are
+  write-combined, so CPU reads from them were expected to be slow. On box1
+  (HSW) the CPU path's `paint_us` is the same within noise for the same
+  YUYV frame from a memfd and from a dumb buffer: 716 vs 719 µs at 720p,
+  1 491 vs 1 475 µs at 1080p fullscreen (`docs/budget.md` §
+  "Server-allocated scanout buffers (#3914)"). The converter is
+  compute-bound. So #3899 can composite these buffers without a
+  penalty whenever a plane is refused. On HSW an NV12 allocation is
+  refused by the kernel, and the server's default format there is YUYV.
 - **Client.** `nitro-demo --video --scanout [--format nv12|yuyv|xr24]`
   allocates its ring this way (falling back to memfds on
   `AllocSurfaceBuffersFailed`) and draws NV12, YUYV (HSW's only
