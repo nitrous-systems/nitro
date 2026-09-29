@@ -9,7 +9,13 @@ do not appear.
 
 ## Goal
 
-First-class external pixel content:
+Top-level goals, as set by the human, in order:
+
+1. GPU-accelerated Chromium;
+2. a GPU-accelerated video player;
+3. small binaries and minimal memory.
+
+What that needs is first-class external pixel content:
 
 - video players — fullscreen with a controls overlay, and windowed;
 - Chromium / Wayland clients rendering into GPU buffers;
@@ -151,7 +157,8 @@ the GPU**. Planes still take whatever fits; the helper only handles the
 remainder.
 
 - API: Vulkan via `ash` with `libvulkan` dlopen'd, preferred over
-  GLES/EGL/GBM. `wgpu` is rejected on dependency count.
+  GLES/EGL/GBM. `wgpu` is rejected on dependency count. Whether Vulkan
+  is good enough on Haswell (the test box) is open until #3903.
 - The CPU rasterizer remains **the only renderer of nitro content**. The
   GPU only combines finished buffers.
 - It is needed mainly for overlapping GPU windows from different clients
@@ -234,3 +241,12 @@ In order; tasks carry the `surface` tag on the task board.
    #3900.
 7. Overview thumbnail atlas — #3902.
 8. `nitro-gpu` helper, always-on by default — #3901 (held; design first).
+
+Alongside, and feeding into the items above:
+
+- Test-box GPU/media capability spike: settles Vulkan vs GLES on Haswell
+  and the decode API — #3903.
+- Cross-client Surface sharing for Chromium's out-of-process GPU — #3904.
+- Chromium Ozone GPU rendering — #3905.
+- `nitro-video` player — #3906.
+- `just footprint` budget gate — #3907.
