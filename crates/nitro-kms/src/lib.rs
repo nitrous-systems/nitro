@@ -14,8 +14,11 @@
 //! fds it wants watched ([`Backend::poll_fds`]) and the caller invokes
 //! [`Backend::dispatch`] when any of them is readable.
 //!
-//! Pixel format is always `XRGB8888` (little-endian `u32` per pixel:
-//! `0x00RRGGBB`), stride in bytes and not necessarily `width * 4`.
+//! Pixel format is `XRGB8888` or `ARGB8888` — the same bytes either way
+//! (little-endian `u32` per pixel: `0xAARRGGBB`); byte 3 is ignored for
+//! `XRGB8888` and is premultiplied alpha when the output scans out
+//! `ARGB8888` ([`Backend::set_scanout_alpha`]). Stride is in bytes and
+//! not necessarily `width * 4`.
 //!
 //! See `README.md` for the contract in prose: back-buffer borrow rules,
 //! `flip_pending`, pause/resume, and the exact commit sequence.
@@ -39,7 +42,7 @@ use std::io;
 use std::os::fd::BorrowedFd;
 use std::time::Duration;
 
-/// Bytes per pixel of the only format this crate speaks (`XRGB8888`).
+/// Bytes per pixel of the output formats (`XRGB8888` / `ARGB8888`).
 pub const BYTES_PER_PIXEL: u32 = 4;
 
 /// Identifies one output (a connector driven by a CRTC) for the lifetime
@@ -125,8 +128,11 @@ impl Rect {
     }
 }
 
-/// A CPU-readable copy of a front buffer: `XRGB8888`, tightly packed
-/// (`stride == width * 4`).
+/// A CPU-readable copy of a front buffer: `XRGB8888`/`ARGB8888` bytes,
+/// tightly packed (`stride == width * 4`). Byte 3 is copied verbatim;
+/// it is premultiplied alpha when the output scans out `ARGB8888` (see
+/// [`Image::alpha`]) and meaningless otherwise, which is why
+/// [`Image::pixel`] masks it off.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Image {
     /// Width in pixels.
@@ -140,23 +146,33 @@ pub struct Image {
 }
 
 impl Image {
-    /// Pixel at `(x, y)` as `0x00RRGGBB`.
+    /// Pixel at `(x, y)` as `0x00RRGGBB`: byte 3 (alpha) is masked off,
+    /// see [`Image::alpha`] for it.
     ///
     /// # Panics
     /// If `(x, y)` is outside the image.
     #[must_use]
     pub fn pixel(&self, x: u32, y: u32) -> u32 {
-        assert!(x < self.width && y < self.height, "pixel out of bounds");
-        let o = (y * self.stride + x * BYTES_PER_PIXEL) as usize;
-        u32::from_le_bytes([
-            self.data[o],
-            self.data[o + 1],
-            self.data[o + 2],
-            self.data[o + 3],
-        ])
+        let o = self.offset(x, y);
+        u32::from_le_bytes([self.data[o], self.data[o + 1], self.data[o + 2], 0])
     }
 
-    /// Write the image as a binary PPM (`P6`), dropping the unused byte.
+    /// Byte 3 of the pixel at `(x, y)`: premultiplied alpha when the
+    /// output scans out `ARGB8888`, whatever was written otherwise.
+    ///
+    /// # Panics
+    /// If `(x, y)` is outside the image.
+    #[must_use]
+    pub fn alpha(&self, x: u32, y: u32) -> u8 {
+        self.data[self.offset(x, y) + 3]
+    }
+
+    fn offset(&self, x: u32, y: u32) -> usize {
+        assert!(x < self.width && y < self.height, "pixel out of bounds");
+        (y * self.stride + x * BYTES_PER_PIXEL) as usize
+    }
+
+    /// Write the image as a binary PPM (`P6`), dropping byte 3 (alpha).
     ///
     /// # Errors
     /// Any I/O error while writing.
@@ -189,12 +205,15 @@ pub struct BufferMut<'a> {
     pub height: u32,
     /// Row stride in bytes.
     pub stride: u32,
-    /// `height * stride` bytes of `XRGB8888`.
+    /// `height * stride` bytes of `XRGB8888`/`ARGB8888` (same layout; byte
+    /// 3 is premultiplied alpha when the output scans out `ARGB8888`,
+    /// ignored otherwise — write 255 there unless punching a hole).
     pub data: &'a mut [u8],
 }
 
 impl BufferMut<'_> {
-    /// Fill a rectangle (clipped to the buffer) with one `0x00RRGGBB` colour.
+    /// Fill a rectangle (clipped to the buffer) with one `0xAARRGGBB`
+    /// colour, written verbatim (byte 3 included).
     pub fn fill_rect(&mut self, rect: Rect, color: u32) {
         let Some(r) = rect.clipped_to(self.width, self.height) else {
             return;
@@ -512,6 +531,33 @@ pub trait Backend {
     ) -> Result<Verdict, Error> {
         Err(Error::Unsupported("plane layouts"))
     }
+
+    /// Whether `output`'s primary plane can scan out `ARGB8888`, i.e.
+    /// whether [`Backend::set_scanout_alpha`]`(output, true)` can succeed.
+    /// `false` for an unknown id. Default `false`.
+    fn scanout_alpha(&self, _output: OutputId) -> bool {
+        false
+    }
+
+    /// Scan `output`'s buffers out as `ARGB8888` (premultiplied alpha in
+    /// byte 3, so a plane below the primary shows through where it is
+    /// below 255) instead of `XRGB8888`. Same buffers, same bytes; only
+    /// the framebuffer format changes. Takes effect at the next
+    /// [`Backend::commit`] (or modeset). Turning it off is always
+    /// allowed.
+    ///
+    /// # Errors
+    /// [`Error::Unsupported`] when turning it on and
+    /// [`Backend::scanout_alpha`] is false, [`Error::NoSuchOutput`] for a
+    /// stale id, [`Error::Io`] if the kernel refuses the `ARGB8888`
+    /// framebuffer.
+    fn set_scanout_alpha(&mut self, _output: OutputId, on: bool) -> Result<(), Error> {
+        if on {
+            Err(Error::Unsupported("ARGB8888 scanout"))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -558,6 +604,32 @@ mod tests {
         assert_eq!(img.pixel(1, 2), 0);
         // padding bytes untouched
         assert_eq!(&img.data[16 + 8..32], &[0u8; 8]);
+    }
+
+    #[test]
+    fn image_pixel_masks_alpha_and_alpha_reads_it() {
+        let img = Image {
+            width: 2,
+            height: 1,
+            stride: 8,
+            data: vec![0x33, 0x22, 0x11, 0xFF, 0x66, 0x55, 0x44, 0x00],
+        };
+        assert_eq!(img.pixel(0, 0), 0x0011_2233);
+        assert_eq!(img.pixel(1, 0), 0x0044_5566);
+        assert_eq!(img.alpha(0, 0), 0xFF);
+        assert_eq!(img.alpha(1, 0), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "pixel out of bounds")]
+    fn image_alpha_out_of_bounds_panics() {
+        let img = Image {
+            width: 1,
+            height: 1,
+            stride: 4,
+            data: vec![0; 4],
+        };
+        let _ = img.alpha(1, 0);
     }
 
     #[test]

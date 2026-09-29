@@ -228,13 +228,13 @@ impl Coeffs {
         [v * self.crv, -(u * self.cgu + v * self.cgv), u * self.cbu]
     }
 
-    /// One XRGB pixel as a little-endian `u32` (`[B, G, R, 0]`).
+    /// One opaque pixel as a little-endian `u32` (`[B, G, R, 255]`).
     #[inline]
     fn pack(&self, l: i32, c: [i32; 3]) -> u32 {
         let r = ((l + c[0]) >> self.shift).clamp(0, 255) as u32;
         let g = ((l + c[1]) >> self.shift).clamp(0, 255) as u32;
         let b = ((l + c[2]) >> self.shift).clamp(0, 255) as u32;
-        b | (g << 8) | (r << 16)
+        b | (g << 8) | (r << 16) | 0xFF00_0000
     }
 }
 
@@ -373,7 +373,7 @@ impl Canvas<'_> {
 impl Canvas<'_> {
     /// Scale (a crop of) an opaque [`PixelFormat::Xrgb8888`] image into the
     /// integer rect `dst`: a *store*, bilinear (nearest when `dst` and the
-    /// crop have the same size), byte 3 written as 0.
+    /// crop have the same size), byte 3 (alpha) written as 255.
     ///
     /// The same row machinery as [`Canvas::blit_nv12`] — separable bilinear,
     /// source positions affine in the absolute destination pixel, so it is
@@ -421,7 +421,7 @@ impl Canvas<'_> {
                 let sx = (sr.x + (lo - dst.x)) as usize;
                 let srow = &src.data[sy * pitch + sx * BYTES_PER_PIXEL..][..drow.len()];
                 for (d, p) in drow.chunks_exact_mut(4).zip(srow.chunks_exact(4)) {
-                    d.copy_from_slice(&[p[0], p[1], p[2], 0]);
+                    d.copy_from_slice(&[p[0], p[1], p[2], 255]);
                 }
                 continue;
             }
@@ -481,7 +481,7 @@ fn xrgb_run_inner(row: &mut [u8], s: &XrgbRow<'_>, base: i64) {
             let p = &vb[o..o + 8];
             let h =
                 |i: usize| ((u32::from(p[i]) * (256 - tx) + u32::from(p[i + 4]) * tx) >> 16) as u8;
-            d.copy_from_slice(&[h(0), h(1), h(2), 0]);
+            d.copy_from_slice(&[h(0), h(1), h(2), 255]);
         }
     }
 }
@@ -497,7 +497,7 @@ fn xrgb_run_edge(row: &mut [u8], s: &XrgbRow<'_>, base: i64, range: (i32, i32)) 
         let h = |i: usize| {
             (bilerp(s.r0[a + i], s.r0[b + i], s.r1[a + i], s.r1[b + i], tx, s.ty) >> 8) as u8
         };
-        d.copy_from_slice(&[h(0), h(1), h(2), 0]);
+        d.copy_from_slice(&[h(0), h(1), h(2), 255]);
     }
 }
 

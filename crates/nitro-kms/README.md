@@ -19,8 +19,11 @@ it wants watched (`poll_fds()`); when one is readable the caller invokes
 `dispatch(&mut events)`, which never blocks and appends `Event`s to the
 caller's vector (caller-provided so the frame path does not allocate).
 
-Pixels are always `XRGB8888`: one little-endian `u32` per pixel,
-`0x00RRGGBB`. Buffers have a `stride` in bytes that is *not* necessarily
+Pixels are `XRGB8888` or `ARGB8888`, which are the same bytes: one
+little-endian `u32` per pixel, `0xAARRGGBB`. Byte 3 is premultiplied
+alpha when the output scans out ARGB (see "ARGB scanout (#3898)"
+below) and is ignored otherwise. `Image::pixel` masks it off, and
+`Image::alpha` reads it. Buffers have a `stride` in bytes that is *not* necessarily
 `width * 4` (the fake pads to 64 bytes on purpose so stride bugs show up).
 
 ### Back-buffer borrow rules
@@ -203,6 +206,11 @@ forbid; that failure is non-fatal and reported by `hotplug_error()`.
   inventory. Without it the output gets one primary plane with linear
   XRGB8888 + ARGB8888 and no scaling. Plane ids are unique per backend.
   Each output is its own CRTC (`crtc_mask` bit `(id - 1) % 32`).
+- ARGB scanout: `FakeOutputSpec::alpha` (default `true`; builder
+  `.alpha(false)`) sets `scanout_alpha`. `set_scanout_alpha(id, true)` on
+  a non-alpha output is `Error::Unsupported`; off is always `Ok`.
+  `scanout_alpha_on(id)` reads the state back and
+  `scanout_alpha_sets(id)` counts the successful calls.
 - `alloc_buffer` / `free_buffer` only record `(format, w, h)`
   (`buffer(id)` reads it back). Odd NV12 sizes are refused.
 - `test_layout` follows the DRM contract (`Paused`, `NotLit` before the
@@ -377,3 +385,26 @@ What this means for the `planes` module (#3899) on this box:
 - No plane has `FB_DAMAGE_CLIPS` on this kernel. Every plane has
   `IN_FENCE_FD` and `rotate-0|rotate-180`. There is no `alpha` and no
   `pixel blend mode`.
+
+## ARGB scanout (#3898)
+
+`Backend::scanout_alpha(output)` says whether the primary plane can scan
+out `ARGB8888`. `Backend::set_scanout_alpha(output, on)` switches it,
+starting with the next commit or modeset. The bytes are the same either
+way: byte 3 of every pixel is premultiplied alpha. The server writes 255
+everywhere except in "holes", where it writes 0 so that a plane *below*
+the primary (an underlay) shows through. On DRM the capability is "the
+primary's formats list linear AR24". Enabling it `AddFB2`s a second
+framebuffer, `ARGB8888`, on each of the output's two dumb buffers. It
+uses the same handles, so nothing is reallocated or copied. The flip,
+the modesets and `PlaneSource::OutputFront` all use that framebuffer
+while alpha is on. When the primary has `pixel blend mode`, it is set to
+`Pre-multiplied`, which is the kernel default anyway. A resize replaces
+the output, which turns alpha off again.
+
+**Verdict for the test box** (see the inventory above): the HSW GT1
+primary lists C8, RGB565, XR24, XB24, XR30, XB30 and XB4H. That means
+no ARGB8888 and no `pixel blend mode`. zpos is immutable: primary 0,
+sprite 1, cursor 2. So underlays are impossible there, `scanout_alpha`
+is false, and the server stays on XR24. The AR24 path has been verified
+on `FakeBackend` only.

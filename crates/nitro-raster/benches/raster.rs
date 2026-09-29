@@ -494,7 +494,7 @@ fn make_xrgb_1080() -> Vec<u8> {
 /// where the figure means nothing (mixed work, overdraw).
 fn scene_pixels(letter: char) -> Option<u64> {
     match letter {
-        'l' | 'n' => Some(1920 * 1080),
+        'l' | 'n' | 'r' => Some(1920 * 1080),
         'm' | 'o' | 'p' | 'q' => Some(1280 * 720),
         _ => None,
     }
@@ -510,7 +510,7 @@ struct SceneSpec {
     default_iters: u32,
 }
 
-const SCENES: [SceneSpec; 17] = [
+const SCENES: [SceneSpec; 18] = [
     SceneSpec {
         letter: 'a',
         name: "solid_fill",
@@ -595,6 +595,11 @@ const SCENES: [SceneSpec; 17] = [
         letter: 'q',
         name: "xrgb_fast_1080_720",
         default_iters: 300,
+    },
+    SceneSpec {
+        letter: 'r',
+        name: "clear_1080",
+        default_iters: 1000,
     },
 ];
 
@@ -700,6 +705,7 @@ fn main() {
                         &xrgb,
                         &IRect::new(0, 0, 1920, 1080),
                     ),
+                    'r' => c.clear_irect(&full_clip(), &full_clip()),
                     'i' => {
                         scene_gradient(&mut c);
                         scene_scrim(&mut c);

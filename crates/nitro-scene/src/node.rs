@@ -11,9 +11,11 @@ define_key!(
 
 /// What a node is.
 ///
-/// `Surface` is reserved: the scene stores the kind and the common properties,
-/// produces no paint item and no damage for it, and grows a payload when the
-/// Wayland adapter needs one.
+/// `Surface` is an externally-provided surface. Its payload is a
+/// [`SurfaceData`]; today the only thing it carries is whether the server
+/// has put it on an underlay hardware plane, in which case it paints as a
+/// [`PaintKind::Hole`](crate::PaintKind::Hole). A Surface that is not on a
+/// plane paints nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NodeKind {
     /// A container: transform, clip and opacity for its children.
@@ -27,8 +29,23 @@ pub enum NodeKind {
     /// A symbolic icon, named by an [`IconRef`] and rasterised by whoever
     /// owns the icon set.
     Icon,
-    /// Reserved: an externally-provided surface (dma-buf).
+    /// An externally-provided surface (dma-buf); see [`SurfaceData`].
     Surface,
+}
+
+/// Payload of a [`NodeKind::Surface`] node.
+///
+/// Small on purpose: buffer fields join it when the scanout path needs them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct SurfaceData {
+    /// Whether the surface is scanned out on an underlay hardware plane.
+    /// Such a surface paints as a [`PaintKind::Hole`](crate::PaintKind::Hole):
+    /// the server clears its bounds to transparent so the plane shows
+    /// through, and nitro content above it paints normally over the hole.
+    ///
+    /// Set by the server only, via
+    /// [`Scene::set_surface_on_plane`](crate::Scene::set_surface_on_plane).
+    pub on_plane: bool,
 }
 
 /// How a [`NodeKind::Rect`] is filled.
@@ -223,7 +240,7 @@ pub(crate) enum NodeData {
     Image(Option<ImageRef>),
     Text(Option<TextRef>),
     Icon(Option<IconRef>),
-    Surface,
+    Surface(SurfaceData),
 }
 
 impl NodeData {
@@ -234,7 +251,7 @@ impl NodeData {
             Self::Image(_) => NodeKind::Image,
             Self::Text(_) => NodeKind::Text,
             Self::Icon(_) => NodeKind::Icon,
-            Self::Surface => NodeKind::Surface,
+            Self::Surface(_) => NodeKind::Surface,
         }
     }
 
@@ -245,7 +262,7 @@ impl NodeData {
             NodeKind::Image => Self::Image(None),
             NodeKind::Text => Self::Text(None),
             NodeKind::Icon => Self::Icon(None),
-            NodeKind::Surface => Self::Surface,
+            NodeKind::Surface => Self::Surface(SurfaceData::default()),
         }
     }
 }
@@ -508,6 +525,14 @@ impl Node {
         }
     }
 
+    /// Surface payload; `None` unless this is a `Surface` node.
+    pub fn surface(&self) -> Option<SurfaceData> {
+        match self.data {
+            NodeData::Surface(s) => Some(s),
+            _ => None,
+        }
+    }
+
     /// Transform from the node's local space (origin at its top-left corner)
     /// to device pixels. Cached; valid after `update`.
     pub fn world_transform(&self) -> Transform {
@@ -571,8 +596,9 @@ impl Node {
             NodeData::Image(i) => i.is_some(),
             NodeData::Text(t) => t.is_some_and(TextRef::is_visible),
             NodeData::Icon(i) => i.is_some_and(IconRef::is_visible),
-            // The reserved kind stores nothing, so it paints nothing.
-            NodeData::Group | NodeData::Surface => false,
+            // A surface paints (as a hole) only while it is on a plane.
+            NodeData::Surface(s) => s.on_plane,
+            NodeData::Group => false,
         }
     }
 }

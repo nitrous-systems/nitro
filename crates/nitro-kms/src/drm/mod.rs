@@ -207,16 +207,18 @@ impl PlaneProps {
 // buffers and outputs
 // ---------------------------------------------------------------------------
 
-/// `AddFB2` wants a planar description; a dumb `XRGB8888` buffer is one
-/// plane with a linear modifier.
-struct SinglePlane(DumbBuffer);
+/// `AddFB2` wants a planar description; a dumb 32-bpp buffer is one
+/// plane with a linear modifier. The format is carried separately so
+/// the same dumb buffer can get both an `XRGB8888` and an `ARGB8888`
+/// framebuffer.
+struct SinglePlane(DumbBuffer, DrmFourcc);
 
 impl PlanarBuffer for SinglePlane {
     fn size(&self) -> (u32, u32) {
         self.0.size()
     }
     fn format(&self) -> DrmFourcc {
-        self.0.format()
+        self.1
     }
     fn modifier(&self) -> Option<DrmModifier> {
         None
@@ -236,6 +238,9 @@ impl PlanarBuffer for SinglePlane {
 struct FrameBuf {
     db: DumbBuffer,
     fb: framebuffer::Handle,
+    /// A second, `ARGB8888`, framebuffer on the same dumb buffer, made
+    /// the first time the output's scanout alpha is turned on.
+    fb_argb: Option<framebuffer::Handle>,
     map: DumbMapping<'static>,
 }
 
@@ -244,7 +249,9 @@ impl FrameBuf {
         let db = card
             .create_dumb_buffer((width, height), DrmFourcc::Xrgb8888, 32)
             .map_err(Error::io("create dumb buffer"))?;
-        let fb = match card.add_planar_framebuffer(&SinglePlane(db), FbCmd2Flags::empty()) {
+        let fb = match card
+            .add_planar_framebuffer(&SinglePlane(db, DrmFourcc::Xrgb8888), FbCmd2Flags::empty())
+        {
             Ok(fb) => fb,
             Err(e) => {
                 let _ = card.destroy_dumb_buffer(db);
@@ -271,12 +278,50 @@ impl FrameBuf {
                 });
             }
         };
-        Ok(Self { db, fb, map })
+        Ok(Self {
+            db,
+            fb,
+            fb_argb: None,
+            map,
+        })
+    }
+
+    /// Make the `ARGB8888` framebuffer if there is none yet: `AddFB2` on
+    /// the same dumb buffer handle, so no memory is allocated or copied.
+    fn ensure_argb(&mut self, card: &Card<'_>) -> Result<framebuffer::Handle, Error> {
+        if let Some(fb) = self.fb_argb {
+            return Ok(fb);
+        }
+        let fb = card
+            .add_planar_framebuffer(
+                &SinglePlane(self.db, DrmFourcc::Argb8888),
+                FbCmd2Flags::empty(),
+            )
+            .map_err(Error::io("add ARGB8888 framebuffer"))?;
+        self.fb_argb = Some(fb);
+        Ok(fb)
+    }
+
+    /// The framebuffer to scan out: the `ARGB8888` one when `alpha` and
+    /// it exists.
+    fn scanout_fb(&self, alpha: bool) -> framebuffer::Handle {
+        match self.fb_argb {
+            Some(fb) if alpha => fb,
+            _ => self.fb,
+        }
     }
 
     fn destroy(self, card: &Card<'_>) {
-        let FrameBuf { db, fb, map } = self;
+        let FrameBuf {
+            db,
+            fb,
+            fb_argb,
+            map,
+        } = self;
         drop(map);
+        if let Some(fb) = fb_argb {
+            let _ = card.destroy_framebuffer(fb);
+        }
         let _ = card.destroy_framebuffer(fb);
         let _ = card.destroy_dumb_buffer(db);
     }
@@ -302,8 +347,12 @@ struct Output {
     /// [`Backend::commit`] lights it, with the frame it was given. See
     /// "The first picture is a finished frame" in `README.md`.
     lit: bool,
-    /// Template request for `commit`: plane `FB_ID` (+ damage), nothing
-    /// else. Cloned per commit because `atomic_commit` takes it by value.
+    /// Scan out the `ARGB8888` framebuffers (set by
+    /// [`Backend::set_scanout_alpha`], which made them).
+    alpha: bool,
+    /// Template request for `commit`: plane `FB_ID` (+ damage, + blend
+    /// mode when `alpha`), nothing else. Cloned per commit because
+    /// `atomic_commit` takes it by value.
     flip_req: AtomicModeReq,
 }
 
@@ -839,6 +888,7 @@ impl<'fd> DrmBackend<'fd> {
             front: 0,
             pending: false,
             lit: false,
+            alpha: false,
             flip_req,
         })
     }
@@ -1019,8 +1069,13 @@ impl<'fd> DrmBackend<'fd> {
             }
             if let Some(o) = out {
                 let (w, h) = (u64::from(o.info.width), u64::from(o.info.height));
-                let fb = o.bufs[o.front].fb;
+                let fb = o.bufs[o.front].scanout_fb(o.alpha);
                 req.add_property(p, pp.fb_id, property::Value::Framebuffer(Some(fb)));
+                if o.alpha
+                    && let Some((h, v)) = self.premultiplied(p.into())
+                {
+                    req.add_property(p, h, property::Value::Unknown(v));
+                }
                 req.add_property(p, pp.crtc_id, property::Value::CRTC(Some(o.crtc)));
                 req.add_property(p, pp.src_x, property::Value::UnsignedRange(0));
                 req.add_property(p, pp.src_y, property::Value::UnsignedRange(0));
@@ -1080,7 +1135,7 @@ impl<'fd> DrmBackend<'fd> {
         o.flip_req.add_property(
             o.plane,
             pp.fb_id,
-            property::Value::Framebuffer(Some(o.bufs[target].fb)),
+            property::Value::Framebuffer(Some(o.bufs[target].scanout_fb(o.alpha))),
         );
         let mut blob = None;
         if let Some(clips) = pp.fb_damage_clips {
@@ -1123,6 +1178,22 @@ impl<'fd> DrmBackend<'fd> {
             .iter_mut()
             .find(|o| o.id == id)
             .ok_or(Error::NoSuchOutput(id))
+    }
+
+    /// Whether output `o`'s primary plane lists linear `ARGB8888`.
+    fn primary_argb(&self, o: &Output) -> bool {
+        self.discovered
+            .get(&o.plane.into())
+            .is_some_and(|d| d.info.supports(Fourcc::ARGB8888, crate::planes::MOD_LINEAR))
+    }
+
+    /// Plane `raw`'s `pixel blend mode` property and its `Pre-multiplied`
+    /// value, when it has both. Best-effort: it is the kernel's default
+    /// anyway, so a plane without the property still blends
+    /// premultiplied.
+    fn premultiplied(&self, raw: u32) -> Option<(property::Handle, u64)> {
+        let (h, m) = self.discovered.get(&raw)?.props.blend_mode.as_ref()?;
+        Some((*h, *m.get("Pre-multiplied")?))
     }
 
     fn output(&self, id: OutputId) -> Option<&Output> {
@@ -1440,7 +1511,7 @@ impl Backend for DrmBackend<'_> {
                     .ok_or(Error::NoSuchObject("plane", a.plane.0))?,
             );
             let fb = match a.source {
-                PlaneSource::OutputFront => out.bufs[out.front].fb,
+                PlaneSource::OutputFront => out.bufs[out.front].scanout_fb(out.alpha),
 
                 PlaneSource::Buffer(id) => {
                     self.buffers
@@ -1493,6 +1564,43 @@ impl Backend for DrmBackend<'_> {
                 }),
             },
         }
+    }
+
+    fn scanout_alpha(&self, output: OutputId) -> bool {
+        self.output(output).is_some_and(|o| self.primary_argb(o))
+    }
+
+    /// Lazily adds an `ARGB8888` framebuffer on each of the output's two
+    /// dumb buffers (same handle, same memory) and switches the frame
+    /// path to them. The atomic frame path also sets the primary's
+    /// `pixel blend mode` to `Pre-multiplied` when the plane has that
+    /// property (it is the kernel default, so this is belt and braces).
+    /// A resize replaces the output and so turns alpha off again; the
+    /// caller re-enables it after a rescan that changed the outputs.
+    fn set_scanout_alpha(&mut self, output: OutputId, on: bool) -> Result<(), Error> {
+        let idx = self
+            .outputs
+            .iter()
+            .position(|o| o.id == output)
+            .ok_or(Error::NoSuchOutput(output))?;
+        if on {
+            if !self.primary_argb(&self.outputs[idx]) {
+                return Err(Error::Unsupported("ARGB8888 scanout"));
+            }
+            let blend = self.premultiplied(self.outputs[idx].plane.into());
+            let o = &mut self.outputs[idx];
+            for b in &mut o.bufs {
+                b.ensure_argb(&self.card)?;
+            }
+            if let Some((h, v)) = blend {
+                o.flip_req
+                    .add_property(o.plane, h, property::Value::Unknown(v));
+            }
+        }
+        // Off leaves any blend-mode entry in `flip_req`: premultiplied is
+        // the default and means nothing for an `XRGB8888` framebuffer.
+        self.outputs[idx].alpha = on;
+        Ok(())
     }
 
     fn read_front(&mut self, output: OutputId) -> Result<Image, Error> {

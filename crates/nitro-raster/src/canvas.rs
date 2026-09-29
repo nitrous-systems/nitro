@@ -461,6 +461,24 @@ impl<'a> Canvas<'a> {
         }
     }
 
+    /// Clear an integer rect to fully transparent — every byte 0, alpha 0.
+    ///
+    /// A *store*, not a blend: this is how the server punches a hole for a
+    /// Surface scanned out on an underlay plane (#3898). Anything painted
+    /// afterwards composites source-over onto the hole and yields a correct
+    /// premultiplied translucent pixel. Nothing outside `clip ∩ rect ∩
+    /// surface` is touched.
+    pub fn clear_irect(&mut self, clip: &IRect, rect: &IRect) {
+        let r = self.clip_to_surface(clip).intersect(rect);
+        if r.is_empty() {
+            return;
+        }
+        let (x0, x1) = (r.x, r.right());
+        for y in r.y..r.bottom() {
+            self.row(y, x0, x1).fill(0);
+        }
+    }
+
     /// Fill a rounded rect with anti-aliased edges.
     ///
     /// `corner_radius` is clamped to half the shorter side; 0 gives a sharp
@@ -823,7 +841,7 @@ impl<'a> Canvas<'a> {
                         mix(p[0], d[0], p[3]),
                         mix(p[1], d[1], p[3]),
                         mix(p[2], d[2], p[3]),
-                        0,
+                        mix(255 * (255 - p[3]) + 128, d[3], p[3]),
                     ];
                     d.copy_from_slice(&out);
                 }
@@ -1074,22 +1092,22 @@ impl<'a> Canvas<'a> {
                 // Widening to a `u64` reaches memcpy speed with no SIMD, no
                 // intrinsics and no `unsafe`.
                 //
-                // The mask is not optional: it zeroes both X bytes, which is
-                // the crate-wide contract that byte 3 of a stored pixel is 0.
-                // A plain row `copy_from_slice` would propagate the client's
-                // byte 3 and is a behaviour change, not an optimisation.
-                const KEEP: u64 = 0x00FF_FFFF_00FF_FFFF;
+                // The mask is not optional: it sets both alpha bytes to 255,
+                // the crate-wide contract that an opaque store leaves alpha
+                // 255. A plain row `copy_from_slice` would propagate the
+                // client's byte 3 (garbage in XRGB) and punch holes.
+                const A_MASK: u64 = 0xFF00_0000_FF00_0000;
                 let pairs = drow.len() & !7;
                 let (dhead, dtail) = drow.split_at_mut(pairs);
                 let (shead, stail) = srow.split_at(pairs);
                 for (d, s) in dhead.chunks_exact_mut(8).zip(shead.chunks_exact(8)) {
-                    let v = u64::from_le_bytes(s.try_into().unwrap_or([0; 8])) & KEEP;
+                    let v = u64::from_le_bytes(s.try_into().unwrap_or([0; 8])) | A_MASK;
                     d.copy_from_slice(&v.to_le_bytes());
                 }
                 // `drow.len()` is always a multiple of 4, so the tail is one
                 // pixel at most.
                 for (d, s) in dtail.chunks_exact_mut(4).zip(stail.chunks_exact(4)) {
-                    d.copy_from_slice(&[s[0], s[1], s[2], 0]);
+                    d.copy_from_slice(&[s[0], s[1], s[2], 255]);
                 }
             } else {
                 blend_straight_row(drow, srow, src.format.is_opaque(), opacity);
@@ -1434,20 +1452,14 @@ fn blend_texel(d: &mut [u8], t: &Texel, extra: u32) {
 /// `extra >= 128` (see [`blit_run_inner`]), or because `extra` has already
 /// been zeroed. Everywhere else, use [`blend_texel`].
 ///
-/// # The X byte (issue #553)
+/// # Byte 3 (issue #553, #3898)
 ///
-/// This run stores `0` into byte 3 for **every** destination pixel it touches,
+/// This run writes byte 3 for **every** destination pixel it touches,
 /// including fully transparent texels. The pre-split general loop `continue`d
-/// on `t.a == 0` and so left the pixel — X byte included — entirely alone.
-/// The store is the deliberate behaviour and the `continue` was the anomaly:
-/// the crate's contract is that every write path stores 0 in the X byte of
-/// XRGB8888 (`fill_irect`, `blit_1to1`, the stroke band loop and the mask
-/// paths all do), the byte is never read by anything in the tree or by the
-/// scanout hardware, and a destination painted by this crate therefore already
-/// holds 0 there before a blit runs. Output is identical for every in-tree
-/// caller. Preserving byte 3 instead would be a crate-wide decision about the
-/// pixel-format contract, not a blit detail — do not "fix" the two runs into
-/// agreement in that direction.
+/// on `t.a == 0` and so left the pixel entirely alone. Since #3898 byte 3 is
+/// premultiplied destination alpha, composited as `alpha + d_a * (255 -
+/// alpha) / 255`, so the unguarded store with `alpha == 0` (and an all-zero
+/// `t`) rewrites every byte unchanged: the two runs agree bit for bit.
 #[inline]
 fn blend_texel_unguarded(d: &mut [u8], t: &Texel, extra: u32) {
     let alpha = div255(t.a * extra);
@@ -1455,7 +1467,7 @@ fn blend_texel_unguarded(d: &mut [u8], t: &Texel, extra: u32) {
         over_premul(div255(t.b * extra), u32::from(d[0]), alpha),
         over_premul(div255(t.g * extra), u32::from(d[1]), alpha),
         over_premul(div255(t.r * extra), u32::from(d[2]), alpha),
-        0,
+        over_premul(alpha, u32::from(d[3]), alpha),
     ];
     d.copy_from_slice(&out);
 }

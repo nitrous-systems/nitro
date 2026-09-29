@@ -803,3 +803,201 @@ fn hiding_the_top_layer_is_per_output() {
     s.add_output(OUT, IRect::new(0, 0, 800, 600), 1.0);
     assert!(s.top_layer_hidden(OUT));
 }
+
+// ------------------------------------------------------------ surface holes
+
+/// An on-plane Surface child of `parent` with the given local bounds.
+fn surface(s: &mut Scene, parent: NodeKey, bounds: Rect) -> NodeKey {
+    let key = s
+        .create_node(CLIENT, NodeKind::Surface, parent, None)
+        .unwrap();
+    s.set_bounds(CLIENT, key, bounds).unwrap();
+    s.set_surface_on_plane(key, true).unwrap();
+    key
+}
+
+#[test]
+fn an_on_plane_surface_paints_a_hole_under_later_nodes() {
+    let mut s = scene();
+    let (_, root) = window_at(&mut s, Point::new(10.0, 20.0), Size::new(400.0, 300.0));
+    let below = rect(&mut s, root, Rect::new(0.0, 0.0, 400.0, 300.0));
+    let hole = surface(&mut s, root, Rect::new(50.0, 50.0, 200.0, 100.0));
+    let above = rect(&mut s, root, Rect::new(60.0, 60.0, 10.0, 10.0));
+    settle(&mut s);
+
+    let items = paint(&s, ALL);
+    assert_eq!(
+        items.iter().map(|i| i.node).collect::<Vec<_>>(),
+        vec![below, hole, above]
+    );
+    let item = items[1];
+    assert_eq!(
+        item.kind,
+        PaintKind::Hole {
+            size: (200.0, 100.0)
+        }
+    );
+    assert_eq!(item.bounds, IRect::new(60, 70, 200, 100));
+    assert_eq!(item.opaque_cover(), Some(item.bounds));
+    assert!(item.shift_exact());
+    assert!(s.node(hole).unwrap().surface().unwrap().on_plane);
+}
+
+#[test]
+fn a_surface_off_plane_paints_nothing_and_toggling_damages_its_bounds() {
+    let mut s = scene();
+    let (_, root) = window(&mut s);
+    let key = s
+        .create_node(CLIENT, NodeKind::Surface, root, None)
+        .unwrap();
+    s.set_bounds(CLIENT, key, Rect::new(5.0, 5.0, 30.0, 40.0))
+        .unwrap();
+    settle(&mut s);
+    assert!(paint(&s, ALL).is_empty());
+    assert!(!s.has_holes(OUT));
+
+    s.set_surface_on_plane(key, true).unwrap();
+    assert_eq!(damage_bounds(&mut s), IRect::new(5, 5, 30, 40));
+    assert_eq!(painted_nodes(&s, ALL), vec![key]);
+
+    // Same value: no-op.
+    s.set_surface_on_plane(key, true).unwrap();
+    assert!(damage_bounds(&mut s).is_empty());
+
+    s.set_surface_on_plane(key, false).unwrap();
+    assert_eq!(damage_bounds(&mut s), IRect::new(5, 5, 30, 40));
+    assert!(paint(&s, ALL).is_empty());
+    assert!(!s.has_holes(OUT));
+}
+
+#[test]
+fn set_surface_on_plane_refuses_other_kinds_and_dead_keys() {
+    let mut s = scene();
+    let (_, root) = window(&mut s);
+    let r = rect(&mut s, root, Rect::new(0.0, 0.0, 10.0, 10.0));
+    assert_eq!(
+        s.set_surface_on_plane(r, true),
+        Err(nitro_scene::Error::WrongKind)
+    );
+    assert_eq!(s.node(r).unwrap().surface(), None);
+    let hole = surface(&mut s, root, Rect::new(0.0, 0.0, 10.0, 10.0));
+    s.destroy_node(CLIENT, hole).unwrap();
+    assert_eq!(
+        s.set_surface_on_plane(hole, false),
+        Err(nitro_scene::Error::StaleKey)
+    );
+}
+
+#[test]
+fn a_hole_occludes_a_window_below_like_an_opaque_rect() {
+    let mut s = scene();
+    let (_, low_root) = window_at(&mut s, Point::new(100.0, 100.0), Size::new(50.0, 50.0));
+    let low = rect(&mut s, low_root, Rect::new(0.0, 0.0, 50.0, 50.0));
+    let (_, root) = window_at(&mut s, Point::ZERO, Size::new(400.0, 300.0));
+    let hole = surface(&mut s, root, Rect::new(0.0, 0.0, 400.0, 300.0));
+    settle(&mut s);
+
+    let items = paint(&s, ALL);
+    let low_item = items.iter().find(|i| i.node == low).unwrap();
+    let hole_item = items.iter().find(|i| i.node == hole).unwrap();
+    let cover = hole_item.opaque_cover().unwrap();
+    assert!(cover.contains_rect(&low_item.bounds));
+
+    // The occlusion idiom a painter uses: the last item covering the clip
+    // is where drawing starts, so the window below is skipped.
+    let clip = IRect::new(100, 100, 50, 50);
+    let items = paint(&s, clip);
+    let first = items
+        .iter()
+        .rposition(|i| i.opaque_cover().is_some_and(|c| c.contains_rect(&clip)))
+        .unwrap();
+    assert_eq!(items[first].node, hole);
+    assert!(items[first..].iter().all(|i| i.node != low));
+}
+
+#[test]
+fn a_hole_ignores_opacity_and_covers_its_outward_rounded_bounds() {
+    let mut s = scene();
+    let (_, root) = window(&mut s);
+    let g = group(&mut s, root, Rect::new(0.0, 0.0, 400.0, 300.0));
+    s.set_opacity(CLIENT, g, 0.5).unwrap();
+    let hole = s.create_node(CLIENT, NodeKind::Surface, g, None).unwrap();
+    s.set_bounds(CLIENT, hole, Rect::new(10.5, 10.25, 20.0, 20.0))
+        .unwrap();
+    s.set_surface_on_plane(hole, true).unwrap();
+    settle(&mut s);
+
+    let item = paint(&s, ALL)[0];
+    assert_eq!(item.bounds, IRect::new(10, 10, 21, 21));
+    assert_eq!(item.opaque_cover(), Some(item.bounds));
+
+    // Clipped: the cover is the clipped bounds.
+    let clip = IRect::new(0, 0, 20, 20);
+    let item = paint(&s, clip)[0];
+    assert_eq!(item.opaque_cover(), Some(IRect::new(10, 10, 10, 10)));
+
+    // Rotated: no cover.
+    let k = std::f32::consts::FRAC_1_SQRT_2;
+    let rotation = Transform {
+        a: k,
+        b: k,
+        c: -k,
+        d: k,
+        e: 0.0,
+        f: 0.0,
+    };
+    s.set_transform(CLIENT, g, rotation).unwrap();
+    settle(&mut s);
+    assert_eq!(paint(&s, ALL)[0].opaque_cover(), None);
+}
+
+#[test]
+fn has_holes_tracks_visibility_output_and_destruction() {
+    let mut s = scene();
+    s.add_output(OUT2, IRect::new(800, 0, 800, 600), 1.0);
+    let (win, root) = window(&mut s);
+    rect(&mut s, root, Rect::new(0.0, 0.0, 10.0, 10.0));
+    settle(&mut s);
+    assert!(!s.has_holes(OUT));
+
+    let hole = surface(&mut s, root, Rect::new(0.0, 0.0, 50.0, 50.0));
+    settle(&mut s);
+    assert!(s.has_holes(OUT));
+    assert!(!s.has_holes(OUT2));
+    assert!(!s.has_holes(nitro_scene::OutputId(99)));
+
+    s.set_visible(CLIENT, hole, false).unwrap();
+    settle(&mut s);
+    assert!(!s.has_holes(OUT));
+    s.set_visible(CLIENT, hole, true).unwrap();
+    settle(&mut s);
+    assert!(s.has_holes(OUT));
+
+    // Moved to the other output.
+    s.place_window(win, Some(OUT2), Point::ZERO).unwrap();
+    settle(&mut s);
+    assert!(!s.has_holes(OUT));
+    assert!(s.has_holes(OUT2));
+
+    // Unplaced.
+    s.place_window(win, None, Point::ZERO).unwrap();
+    settle(&mut s);
+    assert!(!s.has_holes(OUT2));
+    s.place_window(win, Some(OUT), Point::ZERO).unwrap();
+    settle(&mut s);
+    assert!(s.has_holes(OUT));
+
+    // Destroying the node drops it from the count.
+    s.destroy_node(CLIENT, hole).unwrap();
+    settle(&mut s);
+    assert!(!s.has_holes(OUT));
+
+    // So does tearing down the window.
+    let parent = group(&mut s, root, Rect::new(0.0, 0.0, 100.0, 100.0));
+    surface(&mut s, parent, Rect::new(0.0, 0.0, 50.0, 50.0));
+    settle(&mut s);
+    assert!(s.has_holes(OUT));
+    s.destroy_window(CLIENT, win).unwrap();
+    settle(&mut s);
+    assert!(!s.has_holes(OUT));
+}

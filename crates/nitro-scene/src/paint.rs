@@ -84,6 +84,24 @@ pub enum PaintKind {
         /// Palette role index to tint with.
         role: u8,
     },
+    /// A hole: a Surface on an underlay hardware plane
+    /// ([`SurfaceData::on_plane`](crate::SurfaceData::on_plane)).
+    ///
+    /// **The painter must set every pixel of the item's `bounds` to fully
+    /// transparent (alpha 0), replacing — not blending with — whatever is
+    /// below**, so the plane under the framebuffer shows through. Items
+    /// after it in the list paint normally over the hole. `bounds` is the
+    /// node's device rect rounded *outward* and already narrowed by the
+    /// item's `clip`, so it is exactly the rect to clear; there is no
+    /// anti-aliased edge.
+    ///
+    /// The item's `opacity` is ignored: a Surface is treated as opaque.
+    /// A translucent Surface must therefore never be flagged on-plane —
+    /// the server's job, since it is the only one who sets the flag.
+    Hole {
+        /// The surface's local size; the transform places it.
+        size: (f32, f32),
+    },
 }
 
 /// One drawing operation, already ordered, clipped and composed.
@@ -124,6 +142,14 @@ impl PaintItem {
     ///   ([`BufferDesc::is_opaque`](crate::BufferDesc::is_opaque)), drawn
     ///   axis-aligned, pixel-aligned and 1:1 with its source rect.
     ///
+    /// - a [`Hole`](PaintKind::Hole) drawn axis-aligned: the painter clears
+    ///   exactly `bounds` (outward-rounded, already clipped), *replacing*
+    ///   what was below, so nothing below can show there — even through a
+    ///   fractional edge, whose pixels are cleared whole rather than
+    ///   blended. Opacity is ignored for it, as for its painting. A rotated
+    ///   hole reports `None`: its `bounds` is only a bounding box, and a
+    ///   painter is free to clear less.
+    ///
     /// Anything else — rounded corners, a translucent fill or border,
     /// accumulated opacity below 1.0, rotation, a fractional edge, a scaled
     /// or alpha-carrying image, text, an icon — reports `None`.
@@ -134,6 +160,9 @@ impl PaintItem {
     /// than of the rect, and the sound answer is to say nothing.
     #[must_use]
     pub fn opaque_cover(&self) -> Option<IRect> {
+        if let PaintKind::Hole { .. } = self.kind {
+            return self.transform.is_axis_aligned().then_some(self.bounds);
+        }
         if self.opacity < 1.0 {
             return None;
         }
@@ -206,7 +235,9 @@ impl PaintItem {
     ///   if visible, is a whole number of device pixels wide — every edge
     ///   the rasterizer computes coverage from is then an integer, and
     ///   stays one when shifted;
-    /// - an image drawn 1:1, axis-aligned, onto exact pixel boundaries.
+    /// - an image drawn 1:1, axis-aligned, onto exact pixel boundaries;
+    /// - a [`Hole`](PaintKind::Hole): its pixels are a constant (transparent)
+    ///   over an integer rect, so shifting it is exact.
     ///
     /// Everything else says `false`: a gradient's ramp and a resampled
     /// image are evaluated per pixel in floating point; text and icons are
@@ -244,6 +275,7 @@ impl PaintItem {
                 let device = device_rect(&self.transform, Rect::new(0.0, 0.0, size.0, size.1));
                 aligned(size) && device.w == src.w && device.h == src.h
             }
+            PaintKind::Hole { .. } => true,
             PaintKind::Text { .. } | PaintKind::Icon { .. } => false,
         }
     }
@@ -426,6 +458,9 @@ impl Scene {
                         size: icon.size(),
                         role: icon.role,
                     }),
+                    NodeData::Surface(surface) if surface.on_plane => {
+                        Some(PaintKind::Hole { size })
+                    }
                     _ => None,
                 };
                 if let Some(kind) = kind {

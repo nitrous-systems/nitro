@@ -1,9 +1,9 @@
 //! `nitro-raster` — the CPU 2-D rasterizer the nitro server paints damaged
 //! rects with.
 //!
-//! One type does the work: [`Canvas`], a mutable borrow of an XRGB8888 back
-//! buffer (`[B, G, R, X]` per pixel, exactly what `nitro-kms` dumb buffers
-//! want). Every call takes a `clip: &IRect` — the damage rect — and **never**
+//! One type does the work: [`Canvas`], a mutable borrow of a premultiplied
+//! ARGB8888 back buffer (`[B, G, R, A]` per pixel, exactly what `nitro-kms`
+//! dumb buffers want, scanned out as XRGB8888 or ARGB8888 — same bytes). Every call takes a `clip: &IRect` — the damage rect — and **never**
 //! writes a byte outside it.
 //!
 //! ```
@@ -49,6 +49,15 @@
 //!   `t = x + 128`, which equals `round(x / 255)` for every value we produce.
 //!   A float reference implementation is in the test module; the two agree to
 //!   within ±1 on random input.
+//! - **Destination alpha (#3898).** Byte 3 of the canvas is *premultiplied*
+//!   alpha. Every write treats it as a fourth channel whose source value is
+//!   255: `out_a = round((255 * a + dst_a * (255 - a)) / 255)`. Over an
+//!   opaque destination that is exactly 255 and the colour bytes are what
+//!   they were when byte 3 was an unused X byte; over a hole (all zero, made
+//!   by [`Canvas::clear_irect`]) it gives the correct premultiplied pixel, so
+//!   translucent content over an underlay plane blends right. Opaque stores
+//!   write 255. Nothing but `clear_irect` ever lowers alpha on an opaque
+//!   canvas.
 //! - **Colour space.** sRGB *bytes are blended as-is*, with no linearization.
 //!   This is a deliberate M1 simplification: it is what every toolkit of the
 //!   90s and most of today's do, it costs nothing, and it keeps the inner

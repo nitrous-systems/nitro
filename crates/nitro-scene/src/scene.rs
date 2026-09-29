@@ -62,6 +62,12 @@ pub struct Scene {
     /// `SetImage` naming it in the same commit. A superset of what one
     /// commit sent is harmless: it only repaints a little more.
     pub(crate) recent: HashMap<BufferKey, Damage>,
+    /// Surface nodes flagged on-plane, so [`has_holes`](Scene::has_holes)
+    /// is O(1) when there are none. Kept exact: entries leave on
+    /// [`set_surface_on_plane`](Scene::set_surface_on_plane)`(false)` and
+    /// when the node is destroyed (`destroy_subtree`, the one path that
+    /// removes nodes).
+    on_plane: Vec<NodeKey>,
 
     /// Window roots carrying dirt, deduplicated by `Node::queued`.
     pub(crate) dirty_roots: Vec<NodeKey>,
@@ -99,6 +105,7 @@ impl Scene {
             unreferenced: Vec::new(),
             partial: HashMap::new(),
             recent: HashMap::new(),
+            on_plane: Vec::new(),
 
             dirty_roots: Vec::new(),
             pending: Vec::new(),
@@ -1388,6 +1395,70 @@ impl Scene {
         Ok(())
     }
 
+    /// Flag a Surface node as scanned out on an underlay hardware plane (or
+    /// not). An on-plane Surface paints as a
+    /// [`PaintKind::Hole`](crate::PaintKind::Hole); one that is not paints
+    /// nothing. Toggling damages the node's bounds; setting the current
+    /// value is a no-op.
+    ///
+    /// Server-side only: there is no client ownership check and no wire
+    /// message. The Surface is treated as opaque, so the server must not
+    /// flag a translucent one.
+    ///
+    /// # Errors
+    /// [`Error::StaleKey`], [`Error::WrongKind`] on anything but a Surface.
+    pub fn set_surface_on_plane(&mut self, key: NodeKey, on: bool) -> Result<(), Error> {
+        let node = self.nodes.get_mut(key).ok_or(Error::StaleKey)?;
+        let NodeData::Surface(data) = &mut node.data else {
+            return Err(Error::WrongKind);
+        };
+        if data.on_plane == on {
+            return Ok(());
+        }
+        data.on_plane = on;
+        if on {
+            self.on_plane.push(key);
+        } else {
+            self.on_plane.retain(|n| *n != key);
+        }
+        self.mark(key, Dirty::PAINT);
+        Ok(())
+    }
+
+    /// Whether `output`'s paint list contains any
+    /// [`PaintKind::Hole`](crate::PaintKind::Hole): an on-plane Surface that
+    /// painted on `output` at the last [`update`](Scene::update), in a
+    /// window [`paint_list`](Scene::paint_list) does not leave out.
+    ///
+    /// O(1) `false` when no Surface is on a plane; otherwise O(on-plane
+    /// Surfaces). Reads the cached world state, so call after `update`.
+    #[must_use]
+    pub fn has_holes(&self, output: OutputId) -> bool {
+        if self.on_plane.is_empty() {
+            return false;
+        }
+        let Some(index) = self.output_index(output) else {
+            return false;
+        };
+        let out = self.output_at(index);
+        self.on_plane.iter().any(|key| {
+            let Some(node) = self.nodes.get(*key) else {
+                return false;
+            };
+            let Some(window) = self.windows.get(node.window) else {
+                return false;
+            };
+            node.painted
+                && node.world_visible
+                && node.world_opacity > 0.0
+                && node.last_output == Some(output)
+                && window.output == Some(output)
+                && self.admit.admits(window.client)
+                && !(out.top_hidden && window.layer == Layer::Top)
+                && node.world_bounds.intersects(&out.rect)
+        })
+    }
+
     /// Point a text node at a shaped run, or clear it with `None`.
     ///
     /// The scene does not shape anything: `text.key` is an opaque handle into
@@ -1892,6 +1963,11 @@ impl Scene {
                 if users.is_empty() {
                     self.unreferenced.push(image.buffer);
                 }
+            }
+            if let NodeData::Surface(surface) = node.data
+                && surface.on_plane
+            {
+                self.on_plane.retain(|n| *n != k);
             }
             self.partial.remove(&k);
             self.nodes.remove(k);

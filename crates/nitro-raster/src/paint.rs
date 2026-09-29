@@ -1,7 +1,10 @@
 //! Row-level painting — the innermost loops.
 //!
-//! Everything here works on one contiguous slice of an XRGB8888 row that has
-//! already been clipped, so there is no per-pixel bounds check and the loops
+//! Everything here works on one contiguous slice of a row that has already
+//! been clipped. The destination is premultiplied ARGB8888: byte 3 is alpha
+//! and is composited like a colour channel whose source value is 255, so it
+//! stays 255 over an opaque destination and a hole (all zero) becomes a
+//! correct premultiplied translucent pixel. The rest of the row is so there is no per-pixel bounds check and the loops
 //! are shaped for autovectorization (`chunks_exact_mut(4)`, one 4-byte store
 //! per pixel).
 
@@ -82,7 +85,7 @@ pub(crate) fn lerp_color(a: Color, b: Color, t: f32) -> Color {
 /// remainder is at most one pixel.
 #[inline]
 pub(crate) fn store_solid(row: &mut [u8], c: Color) {
-    let px = u32::from_le_bytes([c.b, c.g, c.r, 0]);
+    let px = u32::from_le_bytes([c.b, c.g, c.r, 255]);
     let pair = (u64::from(px) | (u64::from(px) << 32)).to_le_bytes();
     let split = row.len() & !7;
     let (head, tail) = row.split_at_mut(split);
@@ -109,7 +112,7 @@ pub(crate) fn mix(premul: u32, dst: u8, inv: u32) -> u8 {
 ///
 /// `src * a` is loop-invariant, so it is hoisted, and the loop does **two
 /// pixels per `u64`** (SWAR): the eight bytes are split into their even
-/// (`B`, `R`) and odd (`G`, `X`) bytes, each widened into four 16-bit
+/// (`B`, `R`) and odd (`G`, `A`) bytes, each widened into four 16-bit
 /// lanes, and one scalar multiply-add then does four channels at once.
 /// The per-pixel form this replaced did not vectorize and cost about eight
 /// cycles a pixel, which made a full-screen translucent fill — the
@@ -118,14 +121,13 @@ pub(crate) fn mix(premul: u32, dst: u8, inv: u32) -> u8 {
 ///
 /// Bit-identical to [`mix`], lane by lane: `premul + dst * inv <=
 /// 255 * (a + inv) + 128 = 65153`, and the rounding step adds at most 255,
-/// so no lane ever carries into its neighbour. The `X` byte is cleared, as
-/// before.
+/// so no lane ever carries into its neighbour. The `A` byte is composited
+/// with a source value of 255 (`255 * a + d_a * inv`), which is 255 again
+/// over an opaque destination.
 #[inline]
 pub(crate) fn blend_solid(row: &mut [u8], c: Color, alpha: u8) {
     /// The low byte of every 16-bit lane.
     const LANES: u64 = 0x00ff_00ff_00ff_00ff;
-    /// Everything but the two `X` bytes.
-    const KEEP: u64 = 0x00ff_ffff_00ff_ffff;
     let a = u32::from(alpha);
     let inv = 255 - a;
     // Premultiplied source, plus the `+128` of the rounding step folded in.
@@ -134,7 +136,9 @@ pub(crate) fn blend_solid(row: &mut [u8], c: Color, alpha: u8) {
     let pr = u32::from(c.r) * a + 128;
     let even = u64::from(pb) | u64::from(pr) << 16;
     let even = even | even << 32;
-    let odd = u64::from(pg) | u64::from(pg) << 32;
+    let pa = 255 * a + 128;
+    let odd = u64::from(pg) | u64::from(pa) << 16;
+    let odd = odd | odd << 32;
     let inv64 = u64::from(inv);
     let round = |t: u64| ((t + ((t >> 8) & LANES)) >> 8) & LANES;
     let mut pairs = row.chunks_exact_mut(8);
@@ -144,14 +148,14 @@ pub(crate) fn blend_solid(row: &mut [u8], c: Color, alpha: u8) {
         let src = u64::from_le_bytes(bytes);
         let lo = round(even + (src & LANES) * inv64);
         let hi = round(odd + ((src >> 8) & LANES) * inv64);
-        d.copy_from_slice(&((lo | hi << 8) & KEEP).to_le_bytes());
+        d.copy_from_slice(&(lo | hi << 8).to_le_bytes());
     }
     for d in pairs.into_remainder().chunks_exact_mut(4) {
         let out = [
             mix(pb, d[0], inv),
             mix(pg, d[1], inv),
             mix(pr, d[2], inv),
-            0,
+            mix(pa, d[3], inv),
         ];
         d.copy_from_slice(&out);
     }
@@ -167,10 +171,10 @@ pub(crate) fn blend_solid(row: &mut [u8], c: Color, alpha: u8) {
 /// dominate real client content (Chromium's AR24 window is opaque apart from
 /// its rounded corners and shadow):
 ///
-/// - both alphas 255: the masked opaque copy (`s & KEEP`);
+/// - both alphas 255: the opaque copy with alpha forced (`s | A_MASK`);
 /// - both alphas 0: nothing to do.
 ///
-/// Otherwise the even (`B`, `R`) and odd (`G`, `X`) bytes are widened into
+/// Otherwise the even (`B`, `R`) and odd (`G`, `A`) bytes are widened into
 /// 16-bit lanes. The two pixels' alphas differ, so a scalar multiply cannot
 /// cover all four lanes at once; masking the lanes of each pixel apart and
 /// multiplying each half by its own alpha can, because every lane product is
@@ -178,10 +182,10 @@ pub(crate) fn blend_solid(row: &mut [u8], c: Color, alpha: u8) {
 /// is at most 65153 and the rounding step adds at most 255, so no lane
 /// carries: the result is bit-identical to `over_straight` per channel.
 ///
-/// The one difference from the per-pixel loop it replaced: a zero-alpha
-/// pixel paired with a visible one is rewritten with its own colour and
-/// byte 3 cleared. Byte 3 of a stored pixel is 0 by the crate-wide contract,
-/// so this changes nothing on a well-formed canvas.
+/// The source's alpha *channel* is taken as 255 (`sv | A_MASK`) before
+/// widening, so the destination alpha is composited exactly as
+/// [`blend_pixel`] does it: `255 * a + d_a * (255 - a)`. A zero-alpha pixel
+/// paired with a visible one is therefore rewritten unchanged.
 pub(crate) fn blend_straight_row(drow: &mut [u8], srow: &[u8], src_opaque: bool, opacity: u8) {
     /// The low byte of every 16-bit lane.
     const LANES: u64 = 0x00ff_00ff_00ff_00ff;
@@ -190,8 +194,8 @@ pub(crate) fn blend_straight_row(drow: &mut [u8], srow: &[u8], src_opaque: bool,
     const HI: u64 = 0x00ff_00ff_0000_0000;
     /// The `+128` of the rounding step, per lane.
     const HALF: u64 = 0x0080_0080_0080_0080;
-    /// Everything but the two `X` bytes.
-    const KEEP: u64 = 0x00ff_ffff_00ff_ffff;
+    /// Byte 3 of both pixels.
+    const A_MASK: u64 = 0xff00_0000_ff00_0000;
     let alpha = |sa: u64| -> u64 {
         if src_opaque {
             u64::from(opacity)
@@ -210,8 +214,9 @@ pub(crate) fn blend_straight_row(drow: &mut [u8], srow: &[u8], src_opaque: bool,
         let sv = u64::from_le_bytes(s.try_into().unwrap_or([0; 8]));
         let a0 = alpha(sv >> 24);
         let a1 = alpha(sv >> 56);
+        let sw = sv | A_MASK;
         if a0 & a1 == 255 {
-            d.copy_from_slice(&(sv & KEEP).to_le_bytes());
+            d.copy_from_slice(&sw.to_le_bytes());
             continue;
         }
         if a0 | a1 == 0 {
@@ -220,9 +225,9 @@ pub(crate) fn blend_straight_row(drow: &mut [u8], srow: &[u8], src_opaque: bool,
         let dv = u64::from_le_bytes((&*d).try_into().unwrap_or([0; 8]));
         let (i0, i1) = (255 - a0, 255 - a1);
         let lanes = |v: u64, a0: u64, a1: u64| (v & LO) * a0 + (v & HI) * a1;
-        let even = lanes(sv, a0, a1) + lanes(dv, i0, i1) + HALF;
-        let odd = lanes(sv >> 8, a0, a1) + lanes(dv >> 8, i0, i1) + HALF;
-        d.copy_from_slice(&((round(even) | round(odd) << 8) & KEEP).to_le_bytes());
+        let even = lanes(sw, a0, a1) + lanes(dv, i0, i1) + HALF;
+        let odd = lanes(sw >> 8, a0, a1) + lanes(dv >> 8, i0, i1) + HALF;
+        d.copy_from_slice(&(round(even) | round(odd) << 8).to_le_bytes());
     }
     // `len` is a multiple of 4, so the tail is one pixel at most.
     for (d, s) in dtail.chunks_exact_mut(4).zip(stail.chunks_exact(4)) {
@@ -234,7 +239,7 @@ pub(crate) fn blend_straight_row(drow: &mut [u8], srow: &[u8], src_opaque: bool,
             over_straight(u32::from(s[0]), u32::from(d[0]), a),
             over_straight(u32::from(s[1]), u32::from(d[1]), a),
             over_straight(u32::from(s[2]), u32::from(d[2]), a),
-            0,
+            over_straight(255, u32::from(d[3]), a),
         ];
         d.copy_from_slice(&out);
     }
@@ -259,7 +264,7 @@ pub(crate) fn paint_full(row: &mut [u8], x0: i32, paint: &RowPaint, opacity: u8)
             for (x, d) in (x0..).zip(row.chunks_exact_mut(4)) {
                 let c = paint.color_at(x);
                 if opaque {
-                    d.copy_from_slice(&[c.b, c.g, c.r, 0]);
+                    d.copy_from_slice(&[c.b, c.g, c.r, 255]);
                 } else {
                     blend_pixel(d, c, effective_alpha(c.a, 255, opacity));
                 }
@@ -279,14 +284,14 @@ pub(crate) fn blend_pixel(d: &mut [u8], c: Color, alpha: u8) {
         over_straight(u32::from(c.b), u32::from(d[0]), a),
         over_straight(u32::from(c.g), u32::from(d[1]), a),
         over_straight(u32::from(c.r), u32::from(d[2]), a),
-        0,
+        over_straight(255, u32::from(d[3]), a),
     ];
     d.copy_from_slice(&out);
 }
 
 /// Source-over one straight-alpha colour through a run of A8 coverage.
 ///
-/// `row` is a clipped XRGB8888 run and `cov` holds one coverage byte per
+/// `row` is a clipped ARGB8888 run and `cov` holds one coverage byte per
 /// pixel of it (the caller guarantees `cov.len() * 4 == row.len()`); `ca` is
 /// `color.a * opacity` in `0..=65_025`, hoisted out of the loop because a
 /// glyph run shares both. Coverage 0 leaves the pixel alone.
@@ -311,7 +316,7 @@ pub(crate) fn blend_mask_row(row: &mut [u8], cov: &[u8], c: Color, ca: u32) {
 /// scene `f`), so this loop stayed.
 #[inline]
 pub(crate) fn blend_mask_row_opaque(row: &mut [u8], cov: &[u8], c: Color) {
-    let px = [c.b, c.g, c.r, 0];
+    let px = [c.b, c.g, c.r, 255];
     for (d, &m) in row.chunks_exact_mut(4).zip(cov) {
         if m == 255 {
             d.copy_from_slice(&px);
@@ -367,7 +372,7 @@ mod tests {
                 over_straight(u32::from(s[0]), u32::from(d[0]), au),
                 over_straight(u32::from(s[1]), u32::from(d[1]), au),
                 over_straight(u32::from(s[2]), u32::from(d[2]), au),
-                0,
+                over_straight(255, u32::from(d[3]), au),
             ];
             d.copy_from_slice(&out);
         }
@@ -375,8 +380,8 @@ mod tests {
 
     /// Exhaustive over (alpha of pixel 0, alpha of pixel 1) for several
     /// colour patterns and opacities, both source formats, and row lengths
-    /// that exercise the one-pixel tail. Destinations follow the contract
-    /// (byte 3 is 0); byte 3 of the output must be 0 too.
+    /// that exercise the one-pixel tail. Destination alpha is opaque, a
+    /// hole, or a sweep of partial values.
     #[test]
     fn blend_straight_row_matches_reference_exactly() {
         let pats: [fn(usize) -> u8; 3] = [|i| (i * 37 + 11) as u8, |_| 0, |_| 255];
@@ -394,8 +399,12 @@ mod tests {
                                     px[3] = if k % 2 == 0 { a0 } else { a1 };
                                 }
                                 let mut dst: Vec<u8> = (0..len * 4).map(|i| dp(i + 5)).collect();
-                                for px in dst.chunks_mut(4) {
-                                    px[3] = 0;
+                                for (k, px) in dst.chunks_mut(4).enumerate() {
+                                    px[3] = match pi {
+                                        0 => 255,
+                                        1 => 0,
+                                        _ => (k * 97 + usize::from(a0)) as u8,
+                                    };
                                 }
                                 let mut want = dst.clone();
                                 straight_ref(&mut want, &src, src_opaque, opacity);
@@ -430,14 +439,14 @@ mod tests {
                 })
                 .collect();
             let base: Vec<u8> = (0..len * 4)
-                .map(|i| if i % 4 == 3 { 0 } else { (i * 29) as u8 })
+                .map(|i| if i % 4 == 3 { 255 } else { (i * 29) as u8 })
                 .collect();
             let mut want = base.clone();
             straight_ref(&mut want, &src, false, 255);
             let mut got = base.clone();
             blend_straight_row(&mut got, &src, false, 255);
             assert_eq!(got, want, "len {len}");
-            assert!(got.chunks(4).all(|p| p[3] == 0));
+            assert!(got.chunks(4).all(|p| p[3] == 255));
         }
     }
     use nitro_core::Color;
@@ -464,7 +473,7 @@ mod tests {
                             mix(u32::from(c.b) * a + 128, dst[0], inv),
                             mix(u32::from(c.g) * a + 128, dst[1], inv),
                             mix(u32::from(c.r) * a + 128, dst[2], inv),
-                            0,
+                            mix(255 * a + 128, dst[3], inv),
                         ];
                         assert_eq!(got, want, "alpha {alpha} px {px} dst {dst:?}");
                     }

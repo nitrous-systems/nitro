@@ -33,6 +33,8 @@ pub(super) struct ExtraProps {
     pub rotation: Option<property::Handle>,
     pub color_encoding: Option<(property::Handle, HashMap<String, u64>)>,
     pub color_range: Option<(property::Handle, HashMap<String, u64>)>,
+    /// `pixel blend mode`, for the frame path's ARGB scanout.
+    pub blend_mode: Option<(property::Handle, HashMap<String, u64>)>,
     pub in_fence_fd: Option<property::Handle>,
 }
 
@@ -157,8 +159,11 @@ pub(super) fn discover(
 
     props.color_encoding = enum_prop(card, map, "COLOR_ENCODING");
     props.color_range = enum_prop(card, map, "COLOR_RANGE");
-    let blend_modes = enum_prop(card, map, "pixel blend mode")
-        .map(|(_, m)| sorted_names(&m))
+    props.blend_mode = enum_prop(card, map, "pixel blend mode");
+    let blend_modes = props
+        .blend_mode
+        .as_ref()
+        .map(|(_, m)| sorted_names(m))
         .unwrap_or_default();
     props.in_fence_fd = map.get("IN_FENCE_FD").map(|(h, _)| *h);
 

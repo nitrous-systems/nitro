@@ -23,6 +23,9 @@
 //!   primary). `test_layout` is a rule-based acceptor (the rules are
 //!   listed on `FakeBackend::check_layout`), overridable with
 //!   `set_test_hook`, and every question is recorded in `test_log()`.
+//! - ARGB scanout: [`FakeOutputSpec::alpha`] (default `true`) is the
+//!   capability; `scanout_alpha_on()` / `scanout_alpha_sets()` expose the
+//!   state and the call count.
 
 use std::collections::HashMap;
 use std::io;
@@ -240,6 +243,9 @@ pub struct FakeOutputSpec {
     /// The planes this output's CRTC has. Empty means the default: one
     /// [`FakePlaneSpec::default_primary`].
     pub planes: Vec<FakePlaneSpec>,
+    /// Whether the primary can scan out `ARGB8888`
+    /// ([`Backend::scanout_alpha`]). Default `true`.
+    pub alpha: bool,
 }
 
 impl FakeOutputSpec {
@@ -254,7 +260,15 @@ impl FakeOutputSpec {
             phys_mm: (width * 254 / 960, height * 254 / 960),
             modes: Vec::new(),
             planes: Vec::new(),
+            alpha: true,
         }
+    }
+
+    /// Set whether the primary can scan out `ARGB8888`.
+    #[must_use]
+    pub fn alpha(mut self, capable: bool) -> Self {
+        self.alpha = capable;
+        self
     }
 
     /// Set the plane inventory (replacing the default single primary).
@@ -333,6 +347,13 @@ struct FakeOutput {
     /// Committed at least once (the DRM backend's "lit").
     lit: bool,
     planes: Vec<(PlaneId, FakePlaneSpec)>,
+    /// `ARGB8888` scanout is possible.
+    alpha_capable: bool,
+    /// What the primary scans out from the next commit: `XRGB8888`, or
+    /// `ARGB8888` once `set_scanout_alpha(true)`.
+    scanout_format: Fourcc,
+    /// Successful `set_scanout_alpha` calls.
+    alpha_sets: usize,
 }
 
 impl FakeOutput {
@@ -362,6 +383,9 @@ impl FakeOutput {
             sequence: 0,
             lit: false,
             planes,
+            alpha_capable: spec.alpha,
+            scanout_format: Fourcc::XRGB8888,
+            alpha_sets: 0,
         }
     }
 }
@@ -699,6 +723,25 @@ impl FakeBackend {
         self.buffers.get(&id.0).copied()
     }
 
+    /// Whether `output` is set to scan out `ARGB8888` (`false` for an
+    /// unknown id).
+    #[must_use]
+    pub fn scanout_alpha_on(&self, output: OutputId) -> bool {
+        self.outputs
+            .iter()
+            .any(|o| o.info.id == output && o.scanout_format == Fourcc::ARGB8888)
+    }
+
+    /// How many `set_scanout_alpha` calls on `output` succeeded, including
+    /// ones that did not change the state (`0` for an unknown id).
+    #[must_use]
+    pub fn scanout_alpha_sets(&self, output: OutputId) -> usize {
+        self.outputs
+            .iter()
+            .find(|o| o.info.id == output)
+            .map_or(0, |o| o.alpha_sets)
+    }
+
     /// The rules of the fake's `TEST_ONLY`. `EINVAL` when:
     ///
     /// - a plane appears twice;
@@ -1013,6 +1056,26 @@ impl Backend for FakeBackend {
             verdict,
         });
         Ok(verdict)
+    }
+
+    fn scanout_alpha(&self, output: OutputId) -> bool {
+        self.outputs
+            .iter()
+            .any(|o| o.info.id == output && o.alpha_capable)
+    }
+
+    fn set_scanout_alpha(&mut self, output: OutputId, on: bool) -> Result<(), Error> {
+        let o = self.output_mut(output)?;
+        if on && !o.alpha_capable {
+            return Err(Error::Unsupported("ARGB8888 scanout"));
+        }
+        o.scanout_format = if on {
+            Fourcc::ARGB8888
+        } else {
+            Fourcc::XRGB8888
+        };
+        o.alpha_sets += 1;
+        Ok(())
     }
 
     fn pause(&mut self) {
@@ -1592,6 +1655,60 @@ mod tests {
                 .unwrap()
                 .accepted()
         );
+    }
+
+    #[test]
+    fn scanout_alpha_defaults_capable_and_off() {
+        let (b, id) = fake();
+        assert!(b.scanout_alpha(id));
+        assert!(!b.scanout_alpha_on(id));
+        assert_eq!(b.scanout_alpha_sets(id), 0);
+        assert!(!b.scanout_alpha(OutputId(99)));
+    }
+
+    #[test]
+    fn scanout_alpha_toggles_and_counts() {
+        let (mut b, id) = fake();
+        b.set_scanout_alpha(id, true).unwrap();
+        assert!(b.scanout_alpha_on(id));
+        b.set_scanout_alpha(id, true).unwrap();
+        b.set_scanout_alpha(id, false).unwrap();
+        assert!(!b.scanout_alpha_on(id));
+        assert_eq!(b.scanout_alpha_sets(id), 3);
+        assert!(matches!(
+            b.set_scanout_alpha(OutputId(99), true),
+            Err(Error::NoSuchOutput(_))
+        ));
+    }
+
+    #[test]
+    fn scanout_alpha_unsupported_on_a_non_alpha_output() {
+        let mut b = FakeBackend::new(&[FakeOutputSpec::new(8, 4).alpha(false)]).unwrap();
+        let id = b.outputs()[0].id;
+        assert!(!b.scanout_alpha(id));
+        assert!(matches!(
+            b.set_scanout_alpha(id, true),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(!b.scanout_alpha_on(id));
+        b.set_scanout_alpha(id, false).unwrap();
+        assert_eq!(b.scanout_alpha_sets(id), 1);
+    }
+
+    #[test]
+    fn read_front_keeps_alpha_byte() {
+        let (mut b, id) = fake();
+        b.set_scanout_alpha(id, true).unwrap();
+        {
+            let mut buf = b.back_buffer(id).unwrap();
+            buf.fill_rect(Rect::new(0, 0, 8, 4), 0xFF11_2233);
+            buf.fill_rect(Rect::new(1, 1, 1, 1), 0);
+        }
+        b.commit(id, &[]).unwrap();
+        let img = b.read_front(id).unwrap();
+        assert_eq!(img.pixel(0, 0), 0x0011_2233);
+        assert_eq!(img.alpha(0, 0), 0xFF);
+        assert_eq!(img.alpha(1, 1), 0);
     }
 
     #[test]

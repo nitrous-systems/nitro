@@ -868,9 +868,9 @@ fn blit_one_to_one_handles_odd_widths_and_offsets() {
                         (data[o], data[o + 1], data[o + 2]),
                         "w={w} ox={ox} ({x},{y})"
                     );
-                    // Byte 3 is always stored as 0, whatever the source held.
+                    // Byte 3 is always stored as 255, whatever the source held.
                     let d = (y as usize + 2) * s.stride as usize + (ox + x) as usize * 4 + 3;
-                    assert_eq!(s.data[d], 0, "w={w} ox={ox} x byte at ({x},{y})");
+                    assert_eq!(s.data[d], 255, "w={w} ox={ox} alpha at ({x},{y})");
                 }
             }
             // The pixel just past the run is untouched.
@@ -880,13 +880,13 @@ fn blit_one_to_one_handles_odd_widths_and_offsets() {
 }
 
 #[test]
-fn blit_one_to_one_zeroes_the_x_byte_of_an_xrgb_source() {
+fn blit_one_to_one_forces_alpha_255_for_an_xrgb_source() {
     // An XRGB source whose byte 3 is garbage must not leak it into the
-    // canvas: every write path in the crate stores 0 there.
+    // canvas: an opaque store writes alpha 255 (#3898).
     let stride = 64_u32;
     let mut data = vec![0u8; (stride * 4) as usize];
     for (i, px) in data.chunks_exact_mut(4).enumerate() {
-        px.copy_from_slice(&[i as u8, 0x40, 0x80, 0xFF]);
+        px.copy_from_slice(&[i as u8, 0x40, 0x80, (i * 7) as u8]);
     }
     let img = Image {
         data: &data,
@@ -910,7 +910,7 @@ fn blit_one_to_one_zeroes_the_x_byte_of_an_xrgb_source() {
             let d = y * s.stride as usize + x * 4;
             assert_eq!(
                 &s.data[d..d + 4],
-                &[data[o], data[o + 1], data[o + 2], 0],
+                &[data[o], data[o + 1], data[o + 2], 255],
                 "({x},{y})"
             );
         }
@@ -1800,8 +1800,18 @@ fn blit_sweep_hash() -> (u32, u64) {
                                 &src_rect,
                                 opacity,
                             );
-                            for b in &s.data {
-                                hash ^= u64::from(*b);
+                            // Byte 3 is alpha since #3898 and must be 255
+                            // over the opaque background; it is hashed as
+                            // the 0 it used to be, so the pre-split hash
+                            // still pins the colour bytes.
+                            for (i, b) in s.data.iter().enumerate() {
+                                let b = if i % 4 == 3 {
+                                    assert_eq!(*b, 255, "alpha at byte {i}");
+                                    0
+                                } else {
+                                    *b
+                                };
+                                hash ^= u64::from(b);
                                 hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
                             }
                             cases += 1;
@@ -2105,7 +2115,7 @@ mod nv12 {
                 for dx in 0..iw(BAR_W) {
                     let x = 3 + iw(BAR_W) * i + dx;
                     assert_near(rgb_at(&s, x, 4), bar, 1, &format!("{enc:?} bar {i}"));
-                    assert_eq!(x_byte(&s, x, 4), 0);
+                    assert_eq!(x_byte(&s, x, 4), 255);
                 }
             }
             s.assert_untouched_outside(&dst);
@@ -2206,7 +2216,7 @@ mod nv12 {
             for y in dst.y..dst.bottom() {
                 for x in dst.x..dst.right() {
                     assert_eq!(rgb_at(&s, x, y), want, "{w}x{h} at ({x}, {y})");
-                    assert_eq!(x_byte(&s, x, y), 0);
+                    assert_eq!(x_byte(&s, x, y), 255);
                 }
             }
             s.assert_untouched_outside(&dst);
@@ -2242,7 +2252,7 @@ mod nv12 {
                     for y in inside.y..inside.bottom() {
                         for x in inside.x..inside.right() {
                             assert_ne!(s.px(x, y), SENTINEL, "({x}, {y}) not painted");
-                            assert_eq!(x_byte(&s, x, y), 0);
+                            assert_eq!(x_byte(&s, x, y), 255);
                         }
                     }
                 }
@@ -2491,7 +2501,7 @@ mod nv12 {
         let far = IRect::new(1_000_000_000, 5, 1_000_000_000, 4);
         s.canvas()
             .blit_nv12(&all, &far, &big.nv12(), &big.nv12().bounds(), enc);
-        assert_eq!(x_byte(&s, 3, 3), 0);
+        assert_eq!(x_byte(&s, 3, 3), 255);
     }
 }
 
@@ -2557,7 +2567,7 @@ mod xrgb_scaled {
                     );
                     assert_eq!(
                         a.data[y as usize * a.stride as usize + x as usize * 4 + 3],
-                        0
+                        255
                     );
                 }
             }
@@ -2614,5 +2624,321 @@ mod xrgb_scaled {
             .blit_xrgb_scaled(&all, &huge, &src, &src.bounds());
         s.canvas()
             .blit_xrgb_scaled(&all, &IRect::new(2, 2, 1, 1), &src, &src.bounds());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Destination alpha (#3898)
+// ---------------------------------------------------------------------------
+
+mod dest_alpha {
+    use super::{Surface, iw};
+    use crate::{Canvas, Fill, Image, Mask, Nv12, PixelFormat, YuvEncoding};
+    use nitro_core::{Color, IRect, Point, Rect};
+
+    /// Every painting op the crate has, each run over the whole surface.
+    fn ops() -> Vec<(&'static str, Box<dyn Fn(&mut Canvas<'_>)>)> {
+        let all = IRect::new(0, 0, 40, 24);
+        let half = Color::rgba(200, 100, 40, 128);
+        let mut v: Vec<(&'static str, Box<dyn Fn(&mut Canvas<'_>)>)> = Vec::new();
+        v.push((
+            "fill_irect opaque",
+            Box::new(move |c| c.fill_irect(&all, &IRect::new(2, 2, 11, 9), Color::rgb(1, 2, 3))),
+        ));
+        v.push((
+            "fill_irect translucent",
+            Box::new(move |c| c.fill_irect(&all, &IRect::new(3, 1, 30, 20), half)),
+        ));
+        v.push((
+            "fill_rect aa rounded",
+            Box::new(move |c| {
+                c.fill_rect(
+                    &all,
+                    &Rect::new(1.3, 2.6, 30.2, 17.1),
+                    &Fill::Solid(half),
+                    5.0,
+                    0.8,
+                );
+            }),
+        ));
+        v.push((
+            "fill_rect opaque aa",
+            Box::new(move |c| {
+                c.fill_rect(
+                    &all,
+                    &Rect::new(4.5, 3.5, 20.0, 10.0),
+                    &Fill::Solid(Color::rgb(9, 200, 90)),
+                    3.0,
+                    1.0,
+                );
+            }),
+        ));
+        v.push((
+            "fill_rect linear",
+            Box::new(move |c| {
+                c.fill_rect(
+                    &all,
+                    &Rect::new(0.0, 0.0, 40.0, 24.0),
+                    &Fill::Linear {
+                        start: Point::new(0.0, 0.0),
+                        end: Point::new(40.0, 0.0),
+                        c0: Color::rgba(255, 0, 0, 30),
+                        c1: Color::rgba(0, 0, 255, 250),
+                    },
+                    0.0,
+                    1.0,
+                );
+            }),
+        ));
+        v.push((
+            "fill_rect linear opaque",
+            Box::new(move |c| {
+                c.fill_rect(
+                    &all,
+                    &Rect::new(0.0, 0.0, 40.0, 24.0),
+                    &Fill::Linear {
+                        start: Point::new(0.0, 0.0),
+                        end: Point::new(0.0, 24.0),
+                        c0: Color::rgb(255, 0, 0),
+                        c1: Color::rgb(0, 0, 255),
+                    },
+                    0.0,
+                    1.0,
+                );
+            }),
+        ));
+        v.push((
+            "stroke",
+            Box::new(move |c| {
+                c.stroke_rect_inside(
+                    &all,
+                    &Rect::new(2.25, 1.75, 33.5, 19.0),
+                    1.5,
+                    Color::rgba(10, 250, 60, 200),
+                    0.0,
+                    1.0,
+                );
+            }),
+        ));
+        v.push((
+            "stroke rounded",
+            Box::new(move |c| {
+                c.stroke_rect_inside(
+                    &all,
+                    &Rect::new(2.25, 1.75, 33.5, 19.0),
+                    2.0,
+                    Color::rgb(10, 250, 60),
+                    6.0,
+                    0.7,
+                );
+            }),
+        ));
+        v.push((
+            "blend_pixel_at",
+            Box::new(move |c| c.blend_pixel_at(&all, 5, 5, half, 1.0)),
+        ));
+        v.push((
+            "mask",
+            Box::new(move |c| {
+                let cov: Vec<u8> = (0..16 * 8).map(|i| (i * 29 % 256) as u8).collect();
+                let m = Mask {
+                    data: &cov,
+                    w: 16,
+                    h: 8,
+                    stride: 16,
+                };
+                c.blit_mask(&all, 3, 4, &m, Color::rgb(250, 250, 250), 1.0);
+                c.blit_mask(&all, 20, 10, &m, half, 1.0);
+            }),
+        ));
+        for (name, format, scale, opacity) in [
+            ("blit argb 1:1", PixelFormat::Argb8888, 1.0, 1.0),
+            ("blit argb 1:1 faded", PixelFormat::Argb8888, 1.0, 0.6),
+            ("blit argb scaled", PixelFormat::Argb8888, 1.7, 1.0),
+            ("blit xrgb 1:1", PixelFormat::Xrgb8888, 1.0, 1.0),
+            ("blit xrgb faded", PixelFormat::Xrgb8888, 1.0, 0.5),
+            ("blit xrgb scaled", PixelFormat::Xrgb8888, 1.3, 1.0),
+        ] {
+            v.push((
+                name,
+                Box::new(move |c| {
+                    let data = source(12, 9);
+                    let img = Image {
+                        data: &data,
+                        width: 12,
+                        height: 9,
+                        stride: 48,
+                        format,
+                    };
+                    c.blit(
+                        &all,
+                        &Rect::new(3.0, 2.0, 12.0 * scale, 9.0 * scale),
+                        &img,
+                        &img.bounds(),
+                        opacity,
+                    );
+                }),
+            ));
+        }
+        v.push((
+            "xrgb scaled store",
+            Box::new(move |c| {
+                let data = source(12, 9);
+                let img = Image {
+                    data: &data,
+                    width: 12,
+                    height: 9,
+                    stride: 48,
+                    format: PixelFormat::Xrgb8888,
+                };
+                c.blit_xrgb_scaled(&all, &IRect::new(5, 5, 20, 13), &img, &img.bounds());
+            }),
+        ));
+        v.push((
+            "nv12",
+            Box::new(move |c| {
+                let y = vec![120u8; 16 * 8];
+                let uv = vec![90u8; 16 * 4];
+                let f = Nv12 {
+                    y: &y,
+                    y_stride: 16,
+                    uv: &uv,
+                    uv_stride: 16,
+                    width: 16,
+                    height: 8,
+                };
+                c.blit_nv12(
+                    &all,
+                    &IRect::new(1, 1, 24, 12),
+                    &f,
+                    &f.bounds(),
+                    YuvEncoding::default(),
+                );
+            }),
+        ));
+        v
+    }
+
+    /// A 12x9-ish straight-alpha source with every kind of alpha and
+    /// garbage-free colour.
+    fn source(w: usize, h: usize) -> Vec<u8> {
+        let mut d = vec![0u8; w * h * 4];
+        for (i, p) in d.chunks_exact_mut(4).enumerate() {
+            let a = match i % 5 {
+                0 => 255,
+                1 => 0,
+                k => (k * 60) as u8,
+            };
+            p.copy_from_slice(&[(i * 31) as u8, (i * 17) as u8, (i * 7) as u8, a]);
+        }
+        d
+    }
+
+    fn surface_filled(px: [u8; 4]) -> Surface {
+        let mut s = Surface::new(40, 24);
+        for d in s.data.chunks_exact_mut(4) {
+            d.copy_from_slice(&px);
+        }
+        s
+    }
+
+    #[test]
+    fn every_op_over_an_opaque_canvas_leaves_alpha_255() {
+        for (name, op) in ops() {
+            let mut s = surface_filled([0x30, 0x60, 0x90, 255]);
+            op(&mut s.canvas());
+            for y in 0..iw(s.h) {
+                for x in 0..iw(s.w) {
+                    let o = y as usize * s.stride as usize + x as usize * 4;
+                    assert_eq!(s.data[o + 3], 255, "{name} ({x},{y})");
+                }
+            }
+        }
+    }
+
+    /// Over a hole the colour bytes are exactly what the op produces over
+    /// opaque black (the colour formulas do not read destination alpha), and
+    /// the alpha is the op's effective coverage: a valid premultiplied pixel
+    /// (`c <= a`, within rounding).
+    #[test]
+    fn every_op_over_a_hole_is_premultiplied() {
+        for (name, op) in ops() {
+            let mut hole = surface_filled([0, 0, 0, 0]);
+            let mut black = surface_filled([0, 0, 0, 255]);
+            op(&mut hole.canvas());
+            op(&mut black.canvas());
+            for y in 0..iw(hole.h) {
+                for x in 0..iw(hole.w) {
+                    let o = y as usize * hole.stride as usize + x as usize * 4;
+                    let (h, b) = (&hole.data[o..o + 4], &black.data[o..o + 4]);
+                    assert_eq!(&h[..3], &b[..3], "{name} colour ({x},{y})");
+                    let a = h[3];
+                    assert!(
+                        h[..3].iter().all(|&c| c <= a.saturating_add(1)),
+                        "{name} ({x},{y}) not premultiplied: {h:?}"
+                    );
+                    assert_eq!(b[3], 255, "{name} ({x},{y})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn translucent_fill_over_a_hole_matches_the_premultiplied_reference() {
+        let mut s = surface_filled([0, 0, 0, 0]);
+        let all = s.canvas().bounds();
+        let c = Color::rgba(200, 100, 40, 128);
+        s.canvas().fill_irect(&all, &all, c);
+        let want = |v: u8| (f64::from(v) * 128.0 / 255.0).round() as i32;
+        for p in s.data.chunks_exact(4).take(40) {
+            assert_eq!(p[3], 128);
+            for (got, v) in [(p[0], c.b), (p[1], c.g), (p[2], c.r)] {
+                assert!((i32::from(got) - want(v)).abs() <= 1, "{p:?}");
+            }
+        }
+        // A second 50 % layer: premultiplied source-over, float reference.
+        s.canvas().fill_irect(&all, &all, c);
+        let a2 = 128.0 + 128.0 * (1.0 - 128.0 / 255.0);
+        let p = &s.data[0..4];
+        assert!((f64::from(p[3]) - a2).abs() <= 1.0, "{p:?}");
+        let c2 = f64::from(want(c.r)) * (2.0 - 128.0 / 255.0);
+        assert!((f64::from(p[2]) - c2).abs() <= 1.5, "{p:?}");
+    }
+
+    #[test]
+    fn clear_zeroes_only_inside_clip_and_rect() {
+        let mut s = Surface::new(30, 20);
+        s.canvas().fill_irect(
+            &IRect::new(0, 0, 30, 20),
+            &IRect::new(0, 0, 30, 20),
+            Color::rgb(1, 2, 3),
+        );
+        let clip = IRect::new(4, 3, 12, 10);
+        s.canvas().clear_irect(&clip, &IRect::new(-5, 6, 100, 100));
+        let cleared = clip.intersect(&IRect::new(-5, 6, 100, 100));
+        for y in 0..20 {
+            for x in 0..30 {
+                let o = y as usize * s.stride as usize + x as usize * 4;
+                let p = &s.data[o..o + 4];
+                if cleared.contains(x, y) {
+                    assert_eq!(p, &[0, 0, 0, 0], "({x},{y})");
+                } else {
+                    assert_eq!(p, &[3, 2, 1, 255], "({x},{y})");
+                }
+            }
+        }
+        // Off-surface and empty rects are no-ops.
+        let before = s.data.clone();
+        s.canvas().clear_irect(&clip, &IRect::new(100, 100, 5, 5));
+        s.canvas().clear_irect(&IRect::new(-10, -10, 5, 5), &clip);
+        assert_eq!(s.data, before);
+    }
+
+    #[test]
+    fn clear_never_writes_outside_clip_on_a_sentinel_canvas() {
+        let mut s = Surface::new(33, 17);
+        let clip = IRect::new(5, 2, 9, 7);
+        s.canvas().clear_irect(&clip, &IRect::new(0, 0, 33, 17));
+        s.assert_untouched_outside(&clip);
     }
 }

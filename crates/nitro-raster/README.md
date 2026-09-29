@@ -696,7 +696,7 @@ right thing all along wherever it had the instructions to do it with.
 The fix is to widen the store, not to reach for intrinsics:
 
 ```rust
-const KEEP: u64 = 0x00FF_FFFF_00FF_FFFF; // zero both X bytes
+const KEEP: u64 = 0x00FF_FFFF_00FF_FFFF; // zero both X bytes (since #3898: `| A_MASK`, alpha 255)
 ```
 
 Two pixels per `u64`, masked, plus a ≤1-pixel 4-byte tail (`drow.len()` is
@@ -705,7 +705,10 @@ always a multiple of 4, so `& !7` leaves 0 or 4 bytes). Output is
 zeroed X byte — so no golden hash moves, which is the check that it is a
 re-spelling and not a behaviour change.
 
-**The mask is not optional.** It is what keeps the crate-wide contract that
+**The mask is not optional.** (Since #3898 it is an OR with
+`0xFF00_0000_FF00_0000`: byte 3 is now premultiplied alpha and opaque stores
+write 255 — see [ARGB destination](#argb-destination-3898). The argument below
+is unchanged with 255 for 0.) It is what keeps the crate-wide contract that
 every write path stores 0 in byte 3 (see [the blit row
 split](#the-blit-row-split), which is where that contract is argued). A plain
 `copy_from_slice` of the whole row benched ~2 % faster still and is *wrong*:
@@ -758,7 +761,8 @@ everything. That was the lesson of the *first* attempt at this split, which
 kept them and was slower.
 
 **One observable difference comes out of that, and it is deliberate**
-(issue #553). The old loop's `continue` on a transparent texel left the
+(issue #553; superseded by #3898, where byte 3 became alpha and both runs
+composite it, so they agree bit for bit). The old loop's `continue` on a transparent texel left the
 destination pixel *entirely* untouched, including byte 3 — the unused X byte
 of XRGB8888. The interior run has no early-out and always stores `0` there.
 That is the crate's contract, not a regression: **every** write path in
@@ -1094,3 +1098,22 @@ targets](#against-the-targets).
   `blit_scaled` at all. Everything else is `blit_1to1`, fills, strokes and
   glyph masks. Scene (d) is a stress test of a path the compositor barely
   uses — worth keeping honest, not worth contorting the code for.
+
+## ARGB destination (#3898)
+
+Byte 3 of the canvas used to be an unused X byte that every write path set to
+0. It is now **premultiplied destination alpha**, so the server can punch a
+hole (`Canvas::clear_irect`, all bytes 0) for a Surface on an underlay plane
+and still draw nitro content over it.
+
+Every write composites byte 3 like a fourth colour channel with source value
+255: `out_a = round((255·a + d_a·(255−a))/255)`. Over an opaque destination
+that is exactly 255 and the colour bytes are bit-identical to before; over a
+hole it yields the premultiplied translucent pixel an ARGB plane blender
+expects. Opaque stores (`store_solid`, the 1:1 opaque blit, the YUV/XRGB
+scaled stores, mask runs at full coverage) write 255 — the SWAR loops swap an
+AND with `KEEP` for an OR with `A_MASK`, and `blend_solid`'s odd lanes carry
+`(G, A)` instead of `(G, X)`, so the lane count and the per-pair work are
+unchanged. Tests pin: every op over an opaque canvas leaves alpha 255, every
+op over a hole gives the premultiplied result within ±1, and `clear_irect`
+writes nothing outside its clip.
