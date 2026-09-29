@@ -11,11 +11,12 @@ define_key!(
 
 /// What a node is.
 ///
-/// `Surface` is an externally-provided surface. Its payload is a
-/// [`SurfaceData`]; today the only thing it carries is whether the server
-/// has put it on an underlay hardware plane, in which case it paints as a
-/// [`PaintKind::Hole`](crate::PaintKind::Hole). A Surface that is not on a
-/// plane paints nothing.
+/// `Surface` is a video/external surface. Its payload is a
+/// [`SurfaceData`]: the buffer region it shows with its colour metadata
+/// ([`SurfaceRef`], painted as a [`PaintKind::Surface`](crate::PaintKind::Surface)),
+/// and whether the server has put it on an underlay hardware plane, in
+/// which case it paints as a [`PaintKind::Hole`](crate::PaintKind::Hole)
+/// instead. A Surface with neither paints nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NodeKind {
     /// A container: transform, clip and opacity for its children.
@@ -29,15 +30,69 @@ pub enum NodeKind {
     /// A symbolic icon, named by an [`IconRef`] and rasterised by whoever
     /// owns the icon set.
     Icon,
-    /// An externally-provided surface (dma-buf); see [`SurfaceData`].
+    /// A video/external surface (shm today, dma-buf later); see
+    /// [`SurfaceData`].
     Surface,
 }
 
+/// The YUV → RGB matrix of a surface's buffer. Scene-local on purpose:
+/// the scene depends on neither the wire nor the rasterizer; it only
+/// carries the value from one to the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ColorMatrix {
+    /// ITU-R BT.601.
+    Bt601,
+    /// ITU-R BT.709.
+    #[default]
+    Bt709,
+    /// ITU-R BT.2020 non-constant luminance.
+    Bt2020,
+}
+
+/// The quantisation range of a surface's YUV buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ColorRange {
+    /// Y 16..=235, chroma 16..=240.
+    #[default]
+    Limited,
+    /// Every component 0..=255.
+    Full,
+}
+
+/// A surface buffer's colour metadata. Ignored for RGB formats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct SurfaceColor {
+    /// The matrix.
+    pub matrix: ColorMatrix,
+    /// The range.
+    pub range: ColorRange,
+}
+
+/// What a [`NodeKind::Surface`] node shows: a region of a buffer and how
+/// to interpret its colours.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SurfaceRef {
+    /// The buffer sampled.
+    pub buffer: BufferKey,
+    /// Source rectangle in buffer pixels, stretched onto the node's bounds.
+    pub src: IRect,
+    /// Colour metadata.
+    pub color: SurfaceColor,
+}
+
+impl SurfaceRef {
+    /// Construct a surface reference.
+    pub const fn new(buffer: BufferKey, src: IRect, color: SurfaceColor) -> Self {
+        Self { buffer, src, color }
+    }
+}
+
 /// Payload of a [`NodeKind::Surface`] node.
-///
-/// Small on purpose: buffer fields join it when the scanout path needs them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct SurfaceData {
+    /// The attached buffer region, if any (set with
+    /// [`Scene::set_surface`](crate::Scene::set_surface)).
+    pub content: Option<SurfaceRef>,
     /// Whether the surface is scanned out on an underlay hardware plane.
     /// Such a surface paints as a [`PaintKind::Hole`](crate::PaintKind::Hole):
     /// the server clears its bounds to transparent so the plane shows
@@ -264,6 +319,24 @@ impl NodeData {
             NodeKind::Icon => Self::Icon(None),
             NodeKind::Surface => Self::Surface(SurfaceData::default()),
         }
+    }
+
+    /// The buffer and source rect this node samples, for Image and Surface
+    /// nodes alike: the buffer bookkeeping (users, damage, release) does
+    /// not care which of the two it is.
+    pub(crate) fn buffer_ref(self) -> Option<(BufferKey, IRect)> {
+        match self {
+            Self::Image(Some(i)) => Some((i.buffer, i.src)),
+            Self::Surface(SurfaceData {
+                content: Some(s), ..
+            }) => Some((s.buffer, s.src)),
+            _ => None,
+        }
+    }
+
+    /// The buffer this node samples, if any.
+    pub(crate) fn buffer(self) -> Option<BufferKey> {
+        self.buffer_ref().map(|(b, _)| b)
     }
 }
 
@@ -596,8 +669,9 @@ impl Node {
             NodeData::Image(i) => i.is_some(),
             NodeData::Text(t) => t.is_some_and(TextRef::is_visible),
             NodeData::Icon(i) => i.is_some_and(IconRef::is_visible),
-            // A surface paints (as a hole) only while it is on a plane.
-            NodeData::Surface(s) => s.on_plane,
+            // A surface paints as a hole while it is on a plane, and its
+            // buffer otherwise.
+            NodeData::Surface(s) => s.on_plane || s.content.is_some(),
             NodeData::Group => false,
         }
     }

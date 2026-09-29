@@ -14,7 +14,7 @@ use nitro_core::{Damage, IRect, Rect, Transform};
 
 use crate::{
     Configure, NodeKey, OutputId, Scene, UpdateStats,
-    node::{DESCEND, Dirty, NodeData},
+    node::{DESCEND, Dirty},
 };
 
 /// A **hint** that one output's change in an [`update`](Scene::update)
@@ -490,10 +490,7 @@ impl Scene {
         // map to one device rect each — or, where the mapping is not
         // a plain translate or integer scale, the whole node.
         let node = self.node_ref(key);
-        let src = match node.data {
-            NodeData::Image(Some(image)) => Some(image.src),
-            _ => None,
-        };
+        let src = node.data.buffer_ref().map(|(_, src)| src);
         let size = (node.bounds.w, node.bounds.h);
         // All or nothing: one rect needing the fallback makes the
         // whole node the damage, which covers the rest anyway.

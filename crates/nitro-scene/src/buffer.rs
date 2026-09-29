@@ -27,6 +27,11 @@ pub struct BufferDesc {
     pub stride: u32,
     /// Pixel format as a fourcc code.
     pub format: u32,
+    /// Byte offset of the first (or only) plane; 0 for a plain buffer.
+    pub offset0: u32,
+    /// A second plane, as `(offset, stride, rows)` in bytes/rows: NV12's
+    /// chroma. Geometry only; the scene does not know what is in it.
+    pub plane1: Option<(u32, u32, u32)>,
     /// Whether every pixel of this format is fully opaque.
     ///
     /// Private and defaulting to `false`, because the default has to be the
@@ -44,8 +49,20 @@ impl BufferDesc {
             h,
             stride,
             format,
+            offset0: 0,
+            plane1: None,
             opaque: false,
         }
+    }
+
+    /// Set the planes of a multi-planar (or offset) buffer: plane 0 starts
+    /// at `offset0` with the description's `stride` and `h` rows; `plane1`
+    /// is `(offset, stride, rows)`.
+    #[must_use]
+    pub const fn with_planes(mut self, offset0: u32, plane1: Option<(u32, u32, u32)>) -> Self {
+        self.offset0 = offset0;
+        self.plane1 = plane1;
+        self
     }
 
     /// Declare whether the format's pixels are fully opaque.
@@ -66,9 +83,26 @@ impl BufferDesc {
         self.opaque
     }
 
-    /// The number of bytes the description implies.
+    /// The number of bytes the description implies: the end of the
+    /// furthest plane.
+    ///
+    /// A plain buffer is `stride * h`. One with planes
+    /// ([`with_planes`](Self::with_planes)) need not pad its last rows, so
+    /// each plane ends at `offset + stride * (rows - 1) + 1` — the loosest
+    /// bound the scene can check without knowing the format (the server
+    /// checks the exact one).
     pub const fn byte_len(&self) -> usize {
-        (self.stride as usize) * (self.h as usize)
+        if self.offset0 == 0 && self.plane1.is_none() {
+            return (self.stride as usize) * (self.h as usize);
+        }
+        let p0 = plane_end(self.offset0, self.stride, self.h);
+        match self.plane1 {
+            Some((off, stride, rows)) => {
+                let p1 = plane_end(off, stride, rows);
+                if p1 > p0 { p1 } else { p0 }
+            }
+            None => p0,
+        }
     }
 
     /// The whole buffer as a source rect.
@@ -93,6 +127,15 @@ impl BufferDesc {
             return Err(Error::BadBuffer);
         }
         Ok(())
+    }
+}
+
+/// One byte past the start of a plane's last row.
+const fn plane_end(off: u32, stride: u32, rows: u32) -> usize {
+    if rows == 0 {
+        off as usize
+    } else {
+        off as usize + (stride as usize) * (rows as usize - 1) + 1
     }
 }
 

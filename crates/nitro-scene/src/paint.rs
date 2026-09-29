@@ -7,7 +7,7 @@
 use nitro_core::{Color, IRect, Point, Rect, Region, Transform};
 
 use crate::{
-    BufferKey, Fill, Layer, NodeKey, OutputId, Scene, WindowKey,
+    BufferKey, Fill, Layer, NodeKey, OutputId, Scene, SurfaceColor, SurfaceData, WindowKey,
     node::{Border, IconRef, NodeData, TextAlign, TextRef},
     update::device_rect,
 };
@@ -102,6 +102,26 @@ pub enum PaintKind {
         /// The surface's local size; the transform places it.
         size: (f32, f32),
     },
+    /// A Surface composited on the CPU: a buffer region, with its colour
+    /// metadata, stretched onto `size` local units.
+    ///
+    /// The painter places it on whole device pixels (the node's device
+    /// rect rounded) and converts the buffer's format (which only it
+    /// knows) to the framebuffer's. Opaque formats are *stored*, and the
+    /// item's `opacity` is ignored for them in v1 (translucent video is
+    /// later work, `docs/surfaces.md`); an alpha format blends.
+    Surface {
+        /// The destination's local size.
+        size: (f32, f32),
+        /// The buffer to sample.
+        buffer: BufferKey,
+        /// Source region in buffer pixels.
+        src: IRect,
+        /// Colour metadata.
+        color: SurfaceColor,
+        /// Whether the buffer's format was declared opaque.
+        opaque: bool,
+    },
 }
 
 /// One drawing operation, already ordered, clipped and composed.
@@ -195,6 +215,9 @@ impl PaintItem {
             }
             PaintKind::Image {
                 size, src, opaque, ..
+            }
+            | PaintKind::Surface {
+                size, src, opaque, ..
             } => {
                 if !(opaque && self.transform.is_axis_aligned()) {
                     return None;
@@ -271,7 +294,7 @@ impl PaintItem {
                     && border_ok
                     && aligned(size)
             }
-            PaintKind::Image { size, src, .. } => {
+            PaintKind::Image { size, src, .. } | PaintKind::Surface { size, src, .. } => {
                 let device = device_rect(&self.transform, Rect::new(0.0, 0.0, size.0, size.1));
                 aligned(size) && device.w == src.w && device.h == src.h
             }
@@ -461,6 +484,19 @@ impl Scene {
                     NodeData::Surface(surface) if surface.on_plane => {
                         Some(PaintKind::Hole { size })
                     }
+                    NodeData::Surface(SurfaceData {
+                        content: Some(surface),
+                        ..
+                    }) => Some(PaintKind::Surface {
+                        size,
+                        buffer: surface.buffer,
+                        src: surface.src,
+                        color: surface.color,
+                        opaque: self
+                            .buffers
+                            .get(surface.buffer)
+                            .is_some_and(|b| b.desc.is_opaque()),
+                    }),
                     _ => None,
                 };
                 if let Some(kind) = kind {

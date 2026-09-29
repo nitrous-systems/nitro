@@ -6,8 +6,8 @@ use nitro_core::{Damage, IRect, Point, Rect, Size, Transform};
 
 use crate::{
     Admit, Border, Buffer, BufferDesc, BufferKey, ClientId, Configure, Error, Fill, IconRef,
-    ImageRef, Insets, Layer, Node, NodeKey, NodeKind, OutputId, PixelStore, TextRef, Window,
-    WindowFlags, WindowKey, WindowState,
+    ImageRef, Insets, Layer, Node, NodeKey, NodeKind, OutputId, PixelStore, SurfaceRef, TextRef,
+    Window, WindowFlags, WindowKey, WindowState,
     key::Arena,
     node::{ALL_DIRTY, Dirty, NodeData},
     window::Output,
@@ -1549,37 +1549,147 @@ impl Scene {
         }
         let old = slot.take();
         *slot = image;
-        let swap = self.same_size_swap(old, image);
-        if let Some(old) = old
-            && let Some(users) = self.buffer_users.get_mut(&old.buffer)
+        self.attach(
+            key,
+            old.map(|i| (i.buffer, i.src)),
+            image.map(|i| (i.buffer, i.src)),
+            None,
+        );
+        Ok(())
+    }
+
+    /// Point a surface node at a region of a buffer with its colour
+    /// metadata, or clear it with `None`. The buffer bookkeeping and the
+    /// swap/damage contract are exactly [`Scene::set_image`]'s; a colour
+    /// change repaints the whole node.
+    ///
+    /// # Errors
+    /// As [`Scene::set_image`], with [`Error::WrongKind`] on anything but a
+    /// Surface.
+    pub fn set_surface(
+        &mut self,
+        client: ClientId,
+        key: NodeKey,
+        surface: Option<SurfaceRef>,
+    ) -> Result<(), Error> {
+        self.set_surface_inner(client, key, surface, None)
+    }
+
+    /// The vblank-latch entry point: attach `surface` as
+    /// [`Scene::set_surface`] does, but take the damage from `rects`
+    /// (buffer pixels; empty means the whole `src`) rather than from the
+    /// buffer's recent `buffer_damaged` calls.
+    ///
+    /// Under the swap rule — same shape and format, same `src` and colour,
+    /// the new buffer shown before, or the *same* buffer re-presented —
+    /// only `rects` repaint; otherwise the whole node.
+    ///
+    /// # Errors
+    /// As [`Scene::set_surface`].
+    pub fn set_surface_with_damage(
+        &mut self,
+        client: ClientId,
+        key: NodeKey,
+        surface: SurfaceRef,
+        rects: &[IRect],
+    ) -> Result<(), Error> {
+        self.set_surface_inner(client, key, Some(surface), Some(rects))
+    }
+
+    fn set_surface_inner(
+        &mut self,
+        client: ClientId,
+        key: NodeKey,
+        surface: Option<SurfaceRef>,
+        rects: Option<&[IRect]>,
+    ) -> Result<(), Error> {
+        if let Some(surface) = surface {
+            let buffer = self.buffers.get(surface.buffer).ok_or(Error::StaleKey)?;
+            if !client.may_touch(buffer.client) {
+                return Err(Error::NotOwner);
+            }
+            if surface.src.is_empty() || !buffer.desc.full_rect().contains_rect(&surface.src) {
+                return Err(Error::BadBuffer);
+            }
+        }
+        let node = self.check_mut(client, key)?;
+        let NodeData::Surface(data) = &mut node.data else {
+            return Err(Error::WrongKind);
+        };
+        let old = data.content;
+        if old == surface {
+            // Re-presenting the current buffer: the client rewrote it in
+            // place (it may, once released... or it tears; its problem).
+            if let (Some(s), Some(rects)) = (surface, rects) {
+                if rects.is_empty() {
+                    self.mark(key, Dirty::PAINT);
+                } else {
+                    self.mark_partial(key, s.src, rects);
+                }
+            }
+            return Ok(());
+        }
+        data.content = surface;
+        let color_changed = matches!((old, surface), (Some(a), Some(b)) if a.color != b.color);
+        self.attach(
+            key,
+            old.map(|s| (s.buffer, s.src)),
+            surface.map(|s| (s.buffer, s.src)),
+            rects,
+        );
+        if color_changed {
+            self.mark(key, Dirty::PAINT);
+        }
+        Ok(())
+    }
+
+    /// The buffer bookkeeping shared by [`Scene::set_image`] and
+    /// [`Scene::set_surface`]: move the node from `old`'s users to `new`'s,
+    /// queue `old` for release if nothing else uses it, and mark the
+    /// node — partially under the swap rule, wholly otherwise. `damage`
+    /// overrides the buffer's recent damage (the latch path); an empty
+    /// override means the whole node.
+    fn attach(
+        &mut self,
+        key: NodeKey,
+        old: Option<(BufferKey, IRect)>,
+        new: Option<(BufferKey, IRect)>,
+        damage: Option<&[IRect]>,
+    ) {
+        let swap = self.same_size_swap(old, new);
+        if let Some((old, _)) = old
+            && let Some(users) = self.buffer_users.get_mut(&old)
         {
             users.retain(|n| *n != key);
             if users.is_empty() {
-                self.unreferenced.push(old.buffer);
+                self.unreferenced.push(old);
             }
         }
-        if let Some(image) = image {
-            self.buffer_users.entry(image.buffer).or_default().push(key);
-            if let Some(buffer) = self.buffers.get_mut(image.buffer) {
+        if let Some((buffer, _)) = new {
+            self.buffer_users.entry(buffer).or_default().push(key);
+            if let Some(buffer) = self.buffers.get_mut(buffer) {
                 buffer.shown = true;
             }
         }
-        if swap {
+        if swap && let Some((buffer, src)) = new {
             // The client promises the new buffer matches the old one outside
             // the rects it damages in this commit (`docs/wire.md`), so only
             // those need repainting — whether they arrived before this call
             // (`recent`) or arrive after it (`buffer_damaged` finds the node
             // on its new buffer).
-            if let Some(image) = image
-                && let Some(recent) = self.recent.get(&image.buffer)
-            {
-                let rects: Vec<IRect> = recent.rects().to_vec();
-                self.mark_partial(key, image.src, &rects);
+            match damage {
+                Some([]) => self.mark(key, Dirty::PAINT),
+                Some(rects) => self.mark_partial(key, src, rects),
+                None => {
+                    if let Some(recent) = self.recent.get(&buffer) {
+                        let rects: Vec<IRect> = recent.rects().to_vec();
+                        self.mark_partial(key, src, &rects);
+                    }
+                }
             }
         } else {
             self.mark(key, Dirty::PAINT);
         }
-        Ok(())
     }
 
     /// Declare which pixels of an image node's buffer are fully opaque, in
@@ -1619,15 +1729,18 @@ impl Scene {
     /// Anything else (a size, format or `src` change, `None` ↔ `Some`, a
     /// buffer never shown yet) has no previous frame to be relative to and
     /// repaints the whole node.
-    fn same_size_swap(&self, old: Option<ImageRef>, new: Option<ImageRef>) -> bool {
-        let (Some(old), Some(new)) = (old, new) else {
+    fn same_size_swap(
+        &self,
+        old: Option<(BufferKey, IRect)>,
+        new: Option<(BufferKey, IRect)>,
+    ) -> bool {
+        let (Some((old_buf, old_src)), Some((new_buf, new_src))) = (old, new) else {
             return false;
         };
-        if old.buffer == new.buffer || old.src != new.src {
+        if old_buf == new_buf || old_src != new_src {
             return false;
         }
-        let (Some(a), Some(b)) = (self.buffers.get(old.buffer), self.buffers.get(new.buffer))
-        else {
+        let (Some(a), Some(b)) = (self.buffers.get(old_buf), self.buffers.get(new_buf)) else {
             return false;
         };
         let (da, db) = (a.desc, b.desc);
@@ -1715,13 +1828,13 @@ impl Scene {
             let Some(node) = self.nodes.get(node_key) else {
                 continue;
             };
-            let NodeData::Image(Some(image)) = node.data else {
+            let Some((buffer, src)) = node.data.buffer_ref() else {
                 continue;
             };
-            if image.buffer != key {
+            if buffer != key {
                 continue;
             }
-            self.mark_partial(node_key, image.src, rects);
+            self.mark_partial(node_key, src, rects);
         }
         self.scratch = scratch;
         self.prune_buffer_users(key);
@@ -1742,13 +1855,16 @@ impl Scene {
                 let Some(node) = self.nodes.get_mut(node_key) else {
                     continue;
                 };
-                let NodeData::Image(slot) = &mut node.data else {
-                    continue;
-                };
-                if slot.is_some_and(|i| i.buffer == key) {
-                    *slot = None;
-                    self.mark(node_key, Dirty::PAINT);
+                match &mut node.data {
+                    NodeData::Image(slot) if slot.is_some_and(|i| i.buffer == key) => {
+                        *slot = None;
+                    }
+                    NodeData::Surface(data) if data.content.is_some_and(|s| s.buffer == key) => {
+                        data.content = None;
+                    }
+                    _ => continue,
                 }
+                self.mark(node_key, Dirty::PAINT);
             }
         }
         self.buffers.remove(key);
@@ -1775,9 +1891,9 @@ impl Scene {
             let nodes = &self.nodes;
             let used = self.buffer_users.get(&key).is_some_and(|users| {
                 users.iter().any(|n| {
-                    nodes.get(*n).is_some_and(
-                        |node| matches!(node.data, NodeData::Image(Some(i)) if i.buffer == key),
-                    )
+                    nodes
+                        .get(*n)
+                        .is_some_and(|node| node.data.buffer() == Some(key))
                 })
             });
             if !used {
@@ -1792,9 +1908,8 @@ impl Scene {
         if let Some(users) = self.buffer_users.get_mut(&key) {
             let before = users.len();
             users.retain(|n| {
-                live.get(*n).is_some_and(
-                    |node| matches!(node.data, NodeData::Image(Some(i)) if i.buffer == key),
-                )
+                live.get(*n)
+                    .is_some_and(|node| node.data.buffer() == Some(key))
             });
             if before > 0 && users.is_empty() {
                 self.unreferenced.push(key);
@@ -1956,12 +2071,12 @@ impl Scene {
                 continue;
             };
             scratch.extend(node.children.iter().copied());
-            if let NodeData::Image(Some(image)) = node.data
-                && let Some(users) = self.buffer_users.get_mut(&image.buffer)
+            if let Some(buffer) = node.data.buffer()
+                && let Some(users) = self.buffer_users.get_mut(&buffer)
             {
                 users.retain(|n| *n != k);
                 if users.is_empty() {
-                    self.unreferenced.push(image.buffer);
+                    self.unreferenced.push(buffer);
                 }
             }
             if let NodeData::Surface(surface) = node.data

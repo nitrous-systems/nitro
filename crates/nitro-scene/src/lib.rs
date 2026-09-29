@@ -107,8 +107,8 @@ mod window;
 pub use buffer::{Buffer, BufferDesc, BufferKey, PixelStore};
 pub use error::Error;
 pub use node::{
-    Border, Dirty, Fill, IconRef, ImageRef, Node, NodeKey, NodeKind, RectData, SurfaceData,
-    TextAlign, TextRef,
+    Border, ColorMatrix, ColorRange, Dirty, Fill, IconRef, ImageRef, Node, NodeKey, NodeKind,
+    RectData, SurfaceColor, SurfaceData, SurfaceRef, TextAlign, TextRef,
 };
 pub use paint::{Hit, PaintItem, PaintKind};
 pub use scene::{MAX_DEPTH, Scene, UpdateStats};
