@@ -16,7 +16,7 @@ use nitro_server::{BackendKind, Config, run};
 use nitro_wire::client::Connection;
 use nitro_wire::msg::{Configure, CreateBuffer, Fill, PresentSurface, ServerMsg};
 use nitro_wire::types::{
-    BufferId, ColorMatrix, ColorRange, ErrorCode, Layer, NodeId, caps, format,
+    BufferId, ColorMatrix, ColorRange, ErrorCode, Layer, NodeId, caps, format, window_flags,
 };
 
 const OUT: (u32, u32) = (200, 150);
@@ -42,6 +42,11 @@ struct Harness {
 
 impl Harness {
     fn start(name: &str) -> Self {
+        Self::start_scaled(name, None)
+    }
+
+    /// As [`Harness::start`], with the output at `scale` if given.
+    fn start_scaled(name: &str, scale: Option<&str>) -> Self {
         let dir = std::env::temp_dir().join(format!("nitro-opq-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("nitro").join("control.sock");
@@ -50,6 +55,9 @@ impl Harness {
             width: OUT.0,
             height: OUT.1,
         };
+        if let Some(scale) = scale {
+            config.scales = nitro_server::parse_scales(&format!("Virtual-1={scale}"));
+        }
         let wire_path = config.wire_path.clone();
         let thread = std::thread::spawn(move || run(config));
         let h = Self {
@@ -295,5 +303,91 @@ fn on_a_surface_node_the_region_skips_the_alpha_too() {
     });
     assert_eq!(pixel(&h, &c, 4, 4), [0, 0, 0xff], "copied, alpha ignored");
     assert_eq!(pixel(&h, &c, 12, 4), [0xff, 0xff, 0xff], "still blended");
+    h.quit();
+}
+
+/// #3940: at scale 1.25 a window whose buffer is its device size — bounds
+/// `px / 1.25` — is drawn 1:1, so its declared opaque region is copied. The
+/// window's root is snapped to a whole device pixel, wherever the WM put it.
+#[test]
+fn at_a_fractional_scale_a_device_sized_buffer_is_copied() {
+    let h = Harness::start_scaled("frac", Some("1.25"));
+    let mut conn = h.client("opq-frac");
+    conn.client_caps(caps::OPAQUE_REGION | caps::SURFACE)
+        .unwrap();
+    let (root, back, image, surf) = (NodeId(1), NodeId(2), NodeId(3), NodeId(4));
+    let stride = SIDE * 4;
+    let pixels: Vec<u8> = (0..stride * SIDE)
+        .map(|i| if i % 4 == 2 { 0xff } else { 0 })
+        .collect();
+    let fd = nitro_shm::memfd_with("nitro-opaque-frac", &pixels).unwrap();
+    let l = SIDE as f32 / 1.25;
+    conn.tx()
+        // Undecorated, as Chromium is: the content is the root.
+        .create_window_with(
+            root,
+            "opq",
+            Size::new(3.0 * l, l),
+            Layer::Normal,
+            window_flags::UNDECORATED,
+        )
+        .create_rect(back, root, Rect::new(0.0, 0.0, 3.0 * l, l))
+        .fill(back, Fill::Solid(Color::WHITE))
+        .create_buffer(CreateBuffer {
+            id: BufferId(1),
+            width: SIDE,
+            height: SIDE,
+            stride,
+            format: format::AR24,
+            size: stride * SIDE,
+            fd,
+        })
+        .create_image(image, root, Rect::new(0.0, 0.0, l, l))
+        .image(image, BufferId(1), IRect::new(0, 0, SIDE_I32, SIDE_I32))
+        .opaque_region(image, vec![IRect::new(0, 0, SIDE_I32, SIDE_I32)])
+        .create_surface(surf, root, Rect::new(2.0 * l, 0.0, l, l))
+        .opaque_region(surf, vec![IRect::new(0, 0, SIDE_I32, SIDE_I32)])
+        .commit(1)
+        .unwrap();
+    conn.flush().unwrap();
+    let c = expect(&mut conn, "Configure", |m| match m {
+        ServerMsg::Configure(c) if c.window == root => Some(*c),
+        _ => None,
+    });
+    expect(&mut conn, "Presented 1", |m| {
+        matches!(m, ServerMsg::Presented(p) if p.serial == 1).then_some(())
+    });
+    conn.present_surface(PresentSurface {
+        id: surf,
+        buffer: BufferId(1),
+        serial: 2,
+        src: IRect::new(0, 0, SIDE_I32, SIDE_I32),
+        matrix: ColorMatrix::Bt709,
+        range: ColorRange::Full,
+        damage: vec![],
+    })
+    .unwrap();
+    conn.flush().unwrap();
+    expect(&mut conn, "Presented 2", |m| {
+        matches!(m, ServerMsg::Presented(p) if p.serial == 2).then_some(())
+    });
+    assert!((c.scale - 1.25).abs() < 1e-6, "scale {}", c.scale);
+    let (stride, data) = h.shot();
+    let ox = (c.position.x * 1.25).round() as u32;
+    let oy = (c.position.y * 1.25).round() as u32;
+    let px = |x: u32, y: u32| {
+        let o = ((oy + y) * stride + (ox + x) * 4) as usize;
+        [data[o], data[o + 1], data[o + 2]]
+    };
+    // Every pixel of both, edges included: a scaled blend would show white
+    // (alpha 0) or a mix at the edges.
+    for y in 0..SIDE {
+        for x in 0..SIDE {
+            assert_eq!(px(x, y), [0, 0, 0xff], "image ({x},{y})");
+            assert_eq!(px(2 * SIDE + x, y), [0, 0, 0xff], "surface ({x},{y})");
+        }
+    }
+    // Between them, the white rect.
+    assert_eq!(px(SIDE + 4, 4), [0xff, 0xff, 0xff]);
     h.quit();
 }

@@ -89,7 +89,8 @@
 //! Everything cached and everything emitted — world bounds, clips, damage,
 //! hit-test input — is in *device pixels*: `i32`, global across all outputs.
 //! The conversion happens once, in the window root's transform, which is
-//! `output.rect.origin + window.position * output.scale` followed by a scale
+//! `round(output.rect.origin + window.position * output.scale)` (snapped to
+//! whole device pixels, #3940) followed by a scale
 //! of `output.scale`. A node's `world_transform` therefore already contains
 //! the output's scale, and the rasterizer never needs to know about it.
 

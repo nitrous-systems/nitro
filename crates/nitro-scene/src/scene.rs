@@ -387,7 +387,10 @@ impl Scene {
     }
 
     /// Where a window's root node sits in device pixels: the output's origin,
-    /// plus the window's logical position, scaled by the output's scale.
+    /// plus the window's logical position, scaled by the output's scale, and
+    /// rounded to whole device pixels (#3940). At a fractional scale this keeps a
+    /// window whose buffer is its device size on the pixel grid, so it is drawn
+    /// 1:1 (opaque copy, XR24 fast path) instead of resampled.
     ///
     /// Returns the output's index, that transform, and the output's rect (the
     /// root clip).
@@ -397,8 +400,8 @@ impl Scene {
         let output = &self.outputs[index];
         let s = output.scale;
         let t = Transform::translate(
-            output.rect.x as f32 + window.position.x * s,
-            output.rect.y as f32 + window.position.y * s,
+            (output.rect.x as f32 + window.position.x * s).round(),
+            (output.rect.y as f32 + window.position.y * s).round(),
         )
         .then(&Transform::scale(s, s));
         Some((index, t, output.rect))

@@ -1127,3 +1127,41 @@ fn partial_damage_on_an_unplaced_or_destroyed_node_goes_nowhere() {
     s.destroy_node(CLIENT, node).unwrap();
     assert_eq!(damage(&mut s).rects(), &[IRect::new(0, 0, 64, 64)]);
 }
+
+/// #3940: at a fractional scale, a window at a logical position that does not
+/// land on a whole device pixel is snapped to one, so an image whose bounds
+/// are `px / scale` is drawn 1:1 — an occluder, shift-exact, and its buffer
+/// damage maps to exactly the damaged device pixels.
+#[test]
+fn a_fractional_scale_image_of_device_size_is_one_to_one() {
+    let mut s = Scene::new();
+    s.add_output(OUT, IRect::new(0, 0, 1000, 750), 1.25);
+    // 13 * 1.25 = 16.25 and 7 * 1.25 = 8.75: snapped to (16, 9).
+    let (_, root) = common::window_at(
+        &mut s,
+        nitro_core::Point::new(13.0, 7.0),
+        Size::new(400.0, 300.0),
+    );
+    let d = opaque_desc();
+    let buffer = s.create_buffer(CLIENT, d, vec![0; d.byte_len()]).unwrap();
+    let px = d.full_rect();
+    image_node(
+        &mut s,
+        root,
+        buffer,
+        Rect::new(0.0, 0.0, px.w as f32 / 1.25, px.h as f32 / 1.25),
+        px,
+    );
+    settle(&mut s);
+
+    let mut items = Vec::new();
+    s.paint_list(OUT, &IRect::new(0, 0, 1000, 750), &mut items);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].bounds, IRect::new(16, 9, 64, 64));
+    assert_eq!(items[0].opaque_cover(), Some(IRect::new(16, 9, 64, 64)));
+    assert!(items[0].shift_exact());
+
+    s.buffer_damaged(CLIENT, buffer, &[IRect::new(5, 6, 3, 2)])
+        .unwrap();
+    assert_eq!(damage(&mut s).rects(), &[IRect::new(21, 15, 3, 2)]);
+}
