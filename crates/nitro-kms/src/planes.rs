@@ -18,7 +18,7 @@
 
 use std::fmt;
 use std::io;
-use std::os::fd::BorrowedFd;
+use std::os::fd::{BorrowedFd, OwnedFd};
 
 use crate::Rect;
 
@@ -335,8 +335,12 @@ impl SrcRect {
 /// What a plane scans out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PlaneSource {
-    /// The output's current front buffer (`XRGB8888`, output-sized): what
-    /// is on its primary plane now.
+    /// The output's own buffer, output-sized, `XRGB8888` (`ARGB8888` while
+    /// [`Backend::set_scanout_alpha`](crate::Backend::set_scanout_alpha)
+    /// is on). In a `test_layout` it is the current front buffer; in a
+    /// staged layout ([`Backend::set_plane_state`](crate::Backend::set_plane_state))
+    /// it is the buffer the commit flips to — so the shadow can sit on an
+    /// overlay, with holes, while a Surface buffer is on the primary.
     OutputFront,
     /// A buffer from [`Backend::alloc_buffer`](crate::Backend::alloc_buffer).
     Buffer(BufferId),
@@ -398,6 +402,226 @@ impl PlaneAssignment<'_> {
         u64::from(self.src.w) != u64::from(self.dst.w) << 16
             || u64::from(self.src.h) != u64::from(self.dst.h) << 16
     }
+}
+
+/// One plane's part in a staged layout: the owned counterpart of
+/// [`PlaneAssignment`], kept by the backend across commits
+/// ([`Backend::set_plane_state`](crate::Backend::set_plane_state)). The
+/// in-fence is not part of it: fences are one-shot
+/// ([`Backend::set_plane_fence`](crate::Backend::set_plane_fence)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlaneConfig {
+    /// Which plane.
+    pub plane: PlaneId,
+    /// What it shows.
+    pub source: PlaneSource,
+    /// Which part of the source (16.16).
+    pub src: SrcRect,
+    /// Where on the output (`CRTC_*`), in output pixels.
+    pub dst: Rect,
+    /// `zpos` to set. `None` leaves the plane's current value.
+    pub zpos: Option<u64>,
+    /// `rotation` bits to set. `None` leaves it.
+    pub rotation: Option<u32>,
+    /// `COLOR_ENCODING` to set (YCbCr sources).
+    pub color_encoding: Option<ColorEncoding>,
+    /// `COLOR_RANGE` to set (YCbCr sources).
+    pub color_range: Option<ColorRange>,
+}
+
+impl PlaneConfig {
+    /// `source`'s `src` shown at `dst` on `plane`, nothing else set.
+    #[must_use]
+    pub fn new(plane: PlaneId, source: PlaneSource, src: SrcRect, dst: Rect) -> Self {
+        Self {
+            plane,
+            source,
+            src,
+            dst,
+            zpos: None,
+            rotation: None,
+            color_encoding: None,
+            color_range: None,
+        }
+    }
+
+    /// Set `zpos`.
+    #[must_use]
+    pub fn with_zpos(mut self, z: u64) -> Self {
+        self.zpos = Some(z);
+        self
+    }
+
+    /// The same thing as a [`PlaneAssignment`], with `in_fence`.
+    #[must_use]
+    pub fn assignment<'a>(&self, in_fence: Option<BorrowedFd<'a>>) -> PlaneAssignment<'a> {
+        PlaneAssignment {
+            plane: self.plane,
+            source: self.source,
+            src: self.src,
+            dst: self.dst,
+            zpos: self.zpos,
+            rotation: self.rotation,
+            color_encoding: self.color_encoding,
+            color_range: self.color_range,
+            in_fence,
+        }
+    }
+}
+
+impl From<&PlaneAssignment<'_>> for PlaneConfig {
+    /// Everything but the in-fence.
+    fn from(a: &PlaneAssignment<'_>) -> Self {
+        Self {
+            plane: a.plane,
+            source: a.source,
+            src: a.src,
+            dst: a.dst,
+            zpos: a.zpos,
+            rotation: a.rotation,
+            color_encoding: a.color_encoding,
+            color_range: a.color_range,
+        }
+    }
+}
+
+/// The memory layout of a scanout buffer, for whoever fills it through
+/// [`Backend::export_buffer`](crate::Backend::export_buffer).
+///
+/// Index 1 of `offsets`/`pitches` is the `CbCr` plane for `NV12` and 0
+/// otherwise. The [`BufferId`] space is shared with a future
+/// `import_buffer` (dma-buf import, #3900), whose buffers will report
+/// their own layout here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanoutBufferInfo {
+    /// Pixel format.
+    pub format: Fourcc,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// Format modifier ([`MOD_LINEAR`] for everything `alloc_buffer` makes).
+    pub modifier: u64,
+    /// Bytes to map (the whole buffer, all planes).
+    pub size: u64,
+    /// Byte offset of each plane.
+    pub offsets: [u32; 2],
+    /// Row stride of each plane in bytes.
+    pub pitches: [u32; 2],
+}
+
+/// Per-output plane bookkeeping shared by both backends: the staged
+/// layout, the layout of the most recent commit, one-shot fences, and
+/// which buffers the screen (and the commit in flight) still reads.
+///
+/// An empty layout is the default: the output buffer full-screen on the
+/// primary.
+#[derive(Debug, Default)]
+pub(crate) struct PlaneTrack {
+    /// What the next commit shows.
+    pub(crate) staged: Vec<PlaneConfig>,
+    /// What the most recent successful commit showed, flipped or not.
+    pub(crate) shown: Vec<PlaneConfig>,
+    fences: Vec<(PlaneId, OwnedFd)>,
+    /// Buffers the last completed flip scans out.
+    screen_refs: Vec<BufferId>,
+    /// Buffers the commit in flight scans out, if one is.
+    pending_refs: Option<Vec<BufferId>>,
+}
+
+impl PlaneTrack {
+    /// Replace the staged layout.
+    pub(crate) fn stage(&mut self, layout: &[PlaneConfig]) {
+        self.staged.clear();
+        self.staged.extend_from_slice(layout);
+    }
+
+    /// Set `plane`'s fence for the next commit, replacing an earlier one.
+    pub(crate) fn set_fence(&mut self, plane: PlaneId, fd: OwnedFd) {
+        self.fences.retain(|(p, _)| *p != plane);
+        self.fences.push((plane, fd));
+    }
+
+    /// The fences, consumed: a commit takes them whether it succeeds or
+    /// not.
+    pub(crate) fn take_fences(&mut self) -> Vec<(PlaneId, OwnedFd)> {
+        std::mem::take(&mut self.fences)
+    }
+
+    /// Nothing staged, nothing but the default on screen, no fences:
+    /// the frame path's fast template applies.
+    pub(crate) fn is_default_path(&self) -> bool {
+        self.staged.is_empty() && self.shown.is_empty() && self.fences.is_empty()
+    }
+
+    /// A commit of the staged layout went through.
+    pub(crate) fn committed(&mut self) {
+        self.shown.clone_from(&self.staged);
+        self.pending_refs = Some(plane_refs(&self.staged));
+    }
+
+    /// The commit in flight completed: the buffers only the old screen
+    /// read. Nothing when no commit was in flight.
+    pub(crate) fn flipped(&mut self) -> Vec<BufferId> {
+        let Some(next) = self.pending_refs.take() else {
+            return Vec::new();
+        };
+        let old = std::mem::replace(&mut self.screen_refs, next);
+        old.into_iter()
+            .filter(|id| !self.screen_refs.contains(id))
+            .collect()
+    }
+
+    /// A modeset put the default back: every buffer referenced, and all
+    /// state dropped.
+    pub(crate) fn reset(&mut self) -> Vec<BufferId> {
+        let mut out = std::mem::take(&mut self.screen_refs);
+        for id in self.pending_refs.take().unwrap_or_default() {
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        self.staged.clear();
+        self.shown.clear();
+        self.fences.clear();
+        out
+    }
+
+    /// Whether the screen or the commit in flight reads `id`.
+    pub(crate) fn references(&self, id: BufferId) -> bool {
+        self.screen_refs.contains(&id) || self.pending_refs.as_ref().is_some_and(|p| p.contains(&id))
+    }
+}
+
+/// The buffers a layout reads, each once.
+pub(crate) fn plane_refs(layout: &[PlaneConfig]) -> Vec<BufferId> {
+    let mut v = Vec::new();
+    for c in layout {
+        if let PlaneSource::Buffer(id) = c.source
+            && !v.contains(&id)
+        {
+            v.push(id);
+        }
+    }
+    v
+}
+
+/// The planes that were on (`prev_on`) and are not in `next`.
+pub(crate) fn to_disable(prev_on: &[PlaneId], next: &[PlaneConfig]) -> Vec<PlaneId> {
+    prev_on
+        .iter()
+        .copied()
+        .filter(|p| !next.iter().any(|c| c.plane == *p))
+        .collect()
+}
+
+/// The plane that shows the output buffer, which is where the frame's
+/// damage belongs.
+pub(crate) fn damage_plane(layout: &[PlaneConfig]) -> Option<PlaneId> {
+    layout
+        .iter()
+        .find(|c| c.source == PlaneSource::OutputFront)
+        .map(|c| c.plane)
 }
 
 /// The kernel's answer to a `TEST_ONLY` layout.
@@ -499,6 +723,112 @@ mod tests {
             ..a
         };
         assert!(b.scales());
+    }
+
+    fn buf(plane: u32, id: u32) -> PlaneConfig {
+        PlaneConfig::new(
+            PlaneId(plane),
+            PlaneSource::Buffer(BufferId(id)),
+            SrcRect::whole(4, 4),
+            Rect::new(0, 0, 4, 4),
+        )
+    }
+
+    fn front(plane: u32) -> PlaneConfig {
+        PlaneConfig::new(
+            PlaneId(plane),
+            PlaneSource::OutputFront,
+            SrcRect::whole(4, 4),
+            Rect::new(0, 0, 4, 4),
+        )
+    }
+
+    #[test]
+    fn refs_are_deduplicated() {
+        assert_eq!(
+            plane_refs(&[buf(1, 7), front(2), buf(3, 7), buf(4, 8)]),
+            vec![BufferId(7), BufferId(8)]
+        );
+    }
+
+    #[test]
+    fn a_flip_releases_only_what_the_new_state_dropped() {
+        let mut t = PlaneTrack::default();
+        t.stage(&[front(1), buf(2, 7), buf(3, 8)]);
+        t.committed();
+        assert!(t.flipped().is_empty());
+        assert!(t.references(BufferId(7)));
+        t.stage(&[front(1), buf(2, 9), buf(3, 8)]);
+        t.committed();
+        // In flight: 7 is still on screen, 9 is in the pending commit.
+        assert!(t.references(BufferId(7)) && t.references(BufferId(9)));
+        assert_eq!(t.flipped(), vec![BufferId(7)]);
+        assert!(!t.references(BufferId(7)));
+        // No commit in flight: nothing to report.
+        assert!(t.flipped().is_empty());
+    }
+
+    #[test]
+    fn a_failed_commit_keeps_the_refs() {
+        let mut t = PlaneTrack::default();
+        t.stage(&[buf(2, 7)]);
+        t.committed();
+        let _ = t.flipped();
+        // Staged but never committed (the commit was refused).
+        t.stage(&[]);
+        assert!(t.references(BufferId(7)));
+        assert_eq!(t.shown, vec![buf(2, 7)]);
+        assert!(t.flipped().is_empty());
+        assert!(t.references(BufferId(7)));
+    }
+
+    #[test]
+    fn reset_releases_everything() {
+        let mut t = PlaneTrack::default();
+        t.stage(&[buf(2, 7)]);
+        t.committed();
+        let _ = t.flipped();
+        t.stage(&[buf(2, 8)]);
+        t.committed();
+        let mut r = t.reset();
+        r.sort();
+        assert_eq!(r, vec![BufferId(7), BufferId(8)]);
+        assert!(t.is_default_path());
+        assert!(!t.references(BufferId(7)));
+        assert!(t.flipped().is_empty(), "a stale flip event retires nothing");
+    }
+
+    #[test]
+    fn default_path_needs_no_fence() {
+        let mut t = PlaneTrack::default();
+        assert!(t.is_default_path());
+        let fd = rustix::fs::memfd_create("fence", rustix::fs::MemfdFlags::CLOEXEC).unwrap();
+        t.set_fence(PlaneId(1), fd);
+        assert!(!t.is_default_path());
+        assert_eq!(t.take_fences().len(), 1);
+        assert!(t.is_default_path());
+    }
+
+    #[test]
+    fn disable_and_damage_planes() {
+        // Default (primary 1) → overlay only: the primary goes off.
+        assert_eq!(to_disable(&[PlaneId(1)], &[buf(2, 7)]), vec![PlaneId(1)]);
+        assert!(to_disable(&[PlaneId(1), PlaneId(2)], &[front(1), buf(2, 7)]).is_empty());
+        assert_eq!(damage_plane(&[buf(1, 7), front(2)]), Some(PlaneId(2)));
+        assert_eq!(damage_plane(&[buf(1, 7)]), None);
+    }
+
+    #[test]
+    fn config_and_assignment_round_trip() {
+        let c = PlaneConfig {
+            color_encoding: Some(ColorEncoding::Bt709),
+            color_range: Some(ColorRange::Limited),
+            rotation: Some(rotation::ROTATE_180),
+            ..buf(2, 7).with_zpos(3)
+        };
+        let a = c.assignment(None);
+        assert!(a.in_fence.is_none());
+        assert_eq!(PlaneConfig::from(&a), c);
     }
 
     #[test]

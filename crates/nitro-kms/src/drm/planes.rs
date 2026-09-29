@@ -1,6 +1,7 @@
-//! Plane discovery, scanout buffers and `TEST_ONLY` layouts for the DRM
-//! backend. Read-only with respect to the frame path: nothing here is
-//! used by `commit`, `flip` or the modesets.
+//! Plane discovery, scanout buffers, `TEST_ONLY` layouts and the plane
+//! properties of a multi-plane flip for the DRM backend. The frame path
+//! uses [`add_config`] only for a non-default staged layout; the default
+//! flip and the modesets do not touch this module.
 //!
 //! Enum names for `rotation` (a BITMASK property), `COLOR_ENCODING`,
 //! `COLOR_RANGE` and `pixel blend mode` come from
@@ -13,14 +14,15 @@ use std::collections::HashMap;
 use ::drm::buffer::{DrmFourcc, DrmModifier, PlanarBuffer};
 use ::drm::control::dumbbuffer::DumbBuffer;
 use ::drm::control::{
-    Device as ControlDevice, FbCmd2Flags, ResourceHandles, framebuffer, plane, property,
+    Device as ControlDevice, FbCmd2Flags, ResourceHandles, crtc, framebuffer, plane, property,
 };
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 
-use super::{Card, PropMap};
+use super::{Card, PlaneProps, PropMap};
 use crate::Error;
 use crate::planes::{
-    Fourcc, MOD_LINEAR, PlaneAssignment, PlaneId, PlaneInfo, PlaneKind, Zpos, rotation,
+    Fourcc, MOD_LINEAR, PlaneAssignment, PlaneId, PlaneInfo, PlaneKind, ScanoutBufferInfo, Zpos,
+    rotation,
 };
 use ::drm::control::atomic::AtomicModeReq;
 
@@ -195,6 +197,33 @@ pub(super) fn discover(
     }
 }
 
+/// Put `a` on plane `p` of `crtc` with framebuffer `fb`: `FB_ID`,
+/// `CRTC_ID`, `SRC_*`, `CRTC_*`, then [`add_optional`]'s properties.
+/// `false` as for [`add_optional`].
+#[allow(clippy::too_many_arguments)]
+pub(super) fn add_config(
+    req: &mut AtomicModeReq,
+    p: plane::Handle,
+    pp: &PlaneProps,
+    disc: &Discovered,
+    crtc: crtc::Handle,
+    fb: framebuffer::Handle,
+    a: &PlaneAssignment<'_>,
+) -> bool {
+    use property::Value::{SignedRange as S, UnsignedRange as U};
+    req.add_property(p, pp.fb_id, property::Value::Framebuffer(Some(fb)));
+    req.add_property(p, pp.crtc_id, property::Value::CRTC(Some(crtc)));
+    req.add_property(p, pp.src_x, U(a.src.x.into()));
+    req.add_property(p, pp.src_y, U(a.src.y.into()));
+    req.add_property(p, pp.src_w, U(a.src.w.into()));
+    req.add_property(p, pp.src_h, U(a.src.h.into()));
+    req.add_property(p, pp.crtc_x, S(a.dst.x.into()));
+    req.add_property(p, pp.crtc_y, S(a.dst.y.into()));
+    req.add_property(p, pp.crtc_w, U(a.dst.w.into()));
+    req.add_property(p, pp.crtc_h, U(a.dst.h.into()));
+    add_optional(req, p, disc, a)
+}
+
 /// Add `a`'s optional properties (zpos, rotation, `COLOR_*`, in-fence)
 /// for plane `p` to `req`. `false` when the plane cannot take one of them
 /// (no such property, an unknown enum value, or an immutable zpos asked
@@ -312,11 +341,12 @@ pub(crate) fn parse_in_formats(b: &[u8]) -> Result<Vec<(Fourcc, Vec<u64>)>, &'st
 // scanout buffers
 // ---------------------------------------------------------------------------
 
-/// A linear scanout buffer for `TEST_ONLY` layouts: one dumb buffer,
-/// possibly holding several planes (NV12: Y then `CbCr`).
+/// A linear scanout buffer for plane layouts: one dumb buffer, possibly
+/// holding several planes (NV12: Y then `CbCr`).
 pub(super) struct ScanoutBuf {
     pub db: DumbBuffer,
     pub fb: framebuffer::Handle,
+    pub info: ScanoutBufferInfo,
 }
 
 /// The `AddFB2` description of a dumb buffer holding `planes` planes at
@@ -390,8 +420,17 @@ impl ScanoutBuf {
             planes,
             offsets,
         };
+        let info = ScanoutBufferInfo {
+            format,
+            width,
+            height,
+            modifier: MOD_LINEAR,
+            size: u64::from(pitch) * u64::from(dh),
+            offsets: [offsets[0], offsets[1]],
+            pitches: [pitch, if planes == 2 { pitch } else { 0 }],
+        };
         match card.add_planar_framebuffer(&desc, FbCmd2Flags::empty()) {
-            Ok(fb) => Ok(Self { db, fb }),
+            Ok(fb) => Ok(Self { db, fb, info }),
             Err(e) => {
                 let _ = card.destroy_dumb_buffer(db);
                 Err(Error::Io {
@@ -400,6 +439,16 @@ impl ScanoutBuf {
                 })
             }
         }
+    }
+
+    /// A PRIME dma-buf fd for the buffer, `O_RDWR | O_CLOEXEC`, so the
+    /// receiver can map it for writing.
+    pub fn export(&self, card: &Card<'_>) -> Result<OwnedFd, Error> {
+        card.buffer_to_prime_fd(
+            ::drm::buffer::Buffer::handle(&self.db),
+            ::drm::CLOEXEC | ::drm::RDWR,
+        )
+        .map_err(Error::io("export PRIME fd"))
     }
 
     pub fn destroy(self, card: &Card<'_>) {

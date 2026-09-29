@@ -5,8 +5,18 @@
 //! Nothing but that one frame reaches the screen.
 //!
 //! ```text
-//! sudo planes_probe /dev/dri/card1
+//! sudo planes_probe [--flip] /dev/dri/card1
 //! ```
+//!
+//! `--flip` then really *shows* three layouts for ~2 s each through the
+//! multi-plane frame path (`set_plane_state` + `commit_planes`): a YUYV
+//! window on the overlay above the primary, YUYV full-screen with the
+//! primary off, and NV12 on the primary with the output buffer as AR24
+//! on the overlay (a hole cut in it). The video buffers are left as
+//! allocated (zero), which is solid green in YCbCr: no `unsafe` mapping
+//! of the exported dma-buf is needed to see which plane is which. Each
+//! is exported (PRIME) and the fd's size checked against `buffer_info`,
+//! and the `Flipped` events and buffer releases are printed.
 //!
 //! The output is plain text meant to be pasted into `README.md`.
 
@@ -21,8 +31,9 @@ type BufSlot = ((Fourcc, u32, u32), Result<BufferId, String>);
 
 use nitro_kms::planes::{errno_name, modifier_name, rotation};
 use nitro_kms::{
-    Backend, BufferId, ColorEncoding, ColorRange, DrmBackend, DrmOptions, Error, Fourcc, OutputId,
-    OutputInfo, PlaneAssignment, PlaneId, PlaneInfo, PlaneKind, PlaneSource, Rect, SrcRect,
+    Backend, BufferId, ColorEncoding, ColorRange, DrmBackend, DrmOptions, Error, Event, Fourcc,
+    OutputId, OutputInfo, PlaneAssignment, PlaneConfig, PlaneId, PlaneInfo, PlaneKind, PlaneSource,
+    Rect, SrcRect,
 };
 
 fn open(path: &str) -> Result<DrmBackend<'static>, Error> {
@@ -447,9 +458,223 @@ fn probe_output(kms: &mut DrmBackend<'_>, out: &OutputInfo) {
     pr.free();
 }
 
+/// Dispatch until `id` flips (1 s at most); print the event and how long
+/// it took.
+fn wait_flip(kms: &mut DrmBackend<'_>, id: OutputId, what: &str, t0: Instant) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut events = Vec::new();
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+        if let Err(e) = kms.dispatch(&mut events) {
+            println!("    {what}: dispatch ERROR: {e}");
+            return false;
+        }
+        for ev in events.drain(..) {
+            if let Event::Flipped {
+                output, sequence, ..
+            } = ev
+                && output == id
+            {
+                println!(
+                    "    {what}: Flipped seq={sequence} after {:.1} ms",
+                    t0.elapsed().as_secs_f64() * 1e3
+                );
+                return true;
+            }
+        }
+    }
+    println!("    {what}: NO Flipped within 1 s");
+    false
+}
+
+/// Allocate, export and size-check a video buffer.
+#[allow(clippy::many_single_char_names)]
+fn video_buffer(kms: &mut DrmBackend<'_>, f: Fourcc, w: u32, h: u32) -> Result<BufferId, String> {
+    let id = kms
+        .alloc_buffer(f, w, h)
+        .map_err(|e| format!("alloc {f} {w}x{h}: {e}"))?;
+    let info = kms.buffer_info(id).ok_or("no buffer_info")?;
+    match kms.export_buffer(id) {
+        Ok(fd) => {
+            let len = rustix::fs::seek(&fd, rustix::fs::SeekFrom::End(0)).unwrap_or(0);
+            println!(
+                "    {f} {w}x{h}: pitches={:?} offsets={:?} size={} PRIME fd size={len}",
+                info.pitches, info.offsets, info.size
+            );
+        }
+        Err(e) => println!("    {f} {w}x{h}: export ERROR: {e}"),
+    }
+    Ok(id)
+}
+
+/// Test, show for 2 s, go back to the default, report the release.
+/// `free_early` frees the buffer while it is still on screen.
+fn show(
+    kms: &mut DrmBackend<'_>,
+    id: OutputId,
+    label: &str,
+    layout: &[PlaneConfig],
+    buf: BufferId,
+    free_early: bool,
+) {
+    println!("  {label}");
+    let assigns: Vec<PlaneAssignment<'_>> = layout.iter().map(|c| c.assignment(None)).collect();
+    match kms.test_layout(id, &assigns) {
+        Ok(v) if v.accepted() => {}
+        Ok(v) => {
+            println!("    SKIP: TEST_ONLY {v}");
+            kms.free_buffer(buf);
+            return;
+        }
+        Err(e) => {
+            println!("    SKIP: {e}");
+            kms.free_buffer(buf);
+            return;
+        }
+    }
+    let t0 = Instant::now();
+    if let Err(e) = kms
+        .set_plane_state(id, layout)
+        .and_then(|()| kms.commit_planes(id))
+    {
+        println!("    commit ERROR: {e}");
+        let _ = kms.set_plane_state(id, &[]);
+        kms.free_buffer(buf);
+        return;
+    }
+    wait_flip(kms, id, "on", t0);
+    std::thread::sleep(Duration::from_secs(2));
+    if free_early {
+        kms.free_buffer(buf);
+        println!("    freed while on screen (deferred)");
+    }
+    let t0 = Instant::now();
+    if let Err(e) = kms.set_plane_state(id, &[]).and_then(|()| kms.commit_planes(id)) {
+        println!("    back to default: ERROR: {e}");
+        return;
+    }
+    wait_flip(kms, id, "off", t0);
+    let rel = kms.take_released_buffers();
+    println!("    released: {rel:?} (buffer {buf})");
+    if !free_early {
+        kms.free_buffer(buf);
+    }
+}
+
+fn flip_output(kms: &mut DrmBackend<'_>, out: &OutputInfo) {
+    let planes = kms.planes(out.id);
+    let of = |k: PlaneKind| planes.iter().find(|p| p.kind == k).map(|p| p.id);
+    let (Some(primary), Some(ov)) = (of(PlaneKind::Primary), of(PlaneKind::Overlay)) else {
+        println!("{} {}: needs a primary and an overlay", out.id, out.name);
+        return;
+    };
+    let (w, h) = (out.width, out.height);
+    println!("{} {} {w}x{h}: multi-plane flips (--flip)", out.id, out.name);
+    let yuv = |c: PlaneConfig| PlaneConfig {
+        color_encoding: Some(ColorEncoding::Bt709),
+        color_range: Some(ColorRange::Limited),
+        ..c
+    };
+    let front = PlaneConfig::new(
+        primary,
+        PlaneSource::OutputFront,
+        SrcRect::whole(w, h),
+        Rect::new(0, 0, w, h),
+    );
+
+    // (a) a 1280x720 YUYV window on the overlay above the primary.
+    let (vw, vh) = (1280.min(w), 720.min(h));
+    match video_buffer(kms, Fourcc::YUYV, vw, vh) {
+        Ok(b) => {
+            let win = Rect::new(
+                (w - vw).cast_signed() / 2,
+                (h - vh).cast_signed() / 2,
+                vw,
+                vh,
+            );
+            let ovc = yuv(PlaneConfig::new(
+                ov,
+                PlaneSource::Buffer(b),
+                SrcRect::whole(vw, vh),
+                win,
+            ));
+            show(
+                kms,
+                out.id,
+                "(a) YUYV window above the primary",
+                &[front, ovc],
+                b,
+                false,
+            );
+        }
+        Err(e) => println!("  (a) SKIP: {e}"),
+    }
+
+    // (b2) YUYV full-screen on the overlay, primary off; freed while on
+    // screen, to see the deferred free go through.
+    match video_buffer(kms, Fourcc::YUYV, w, h) {
+        Ok(b) => {
+            let ovc = yuv(PlaneConfig::new(
+                ov,
+                PlaneSource::Buffer(b),
+                SrcRect::whole(w, h),
+                Rect::new(0, 0, w, h),
+            ));
+            show(
+                kms,
+                out.id,
+                "(b2) YUYV full-screen overlay, primary off",
+                &[ovc],
+                b,
+                true,
+            );
+        }
+        Err(e) => println!("  (b2) SKIP: {e}"),
+    }
+
+    // (c) NV12 on the primary, the output buffer as AR24 on the overlay
+    // with a transparent hole in the middle.
+    println!("  (c) NV12 on the primary, AR24 output buffer on the overlay");
+    if let Err(e) = kms.set_scanout_alpha(out.id, true) {
+        println!("    SKIP: {e}");
+        return;
+    }
+    let painted = kms.back_buffer(out.id).map(|mut buf| {
+        buf.fill_rect(Rect::new(0, 0, w, h), 0xFF40_4040);
+        buf.fill_rect(
+            Rect::new((w / 4).cast_signed(), (h / 4).cast_signed(), w / 2, h / 2),
+            0,
+        );
+    });
+    let t0 = Instant::now();
+    if let Err(e) = painted.and_then(|()| kms.commit(out.id, &[])) {
+        println!("    shadow commit ERROR: {e}");
+    } else {
+        wait_flip(kms, out.id, "shadow (primary, AR24)", t0);
+    }
+    match video_buffer(kms, Fourcc::NV12, w, h) {
+        Ok(b) => {
+            let pri = yuv(PlaneConfig::new(
+                primary,
+                PlaneSource::Buffer(b),
+                SrcRect::whole(w, h),
+                Rect::new(0, 0, w, h),
+            ));
+            let top = PlaneConfig { plane: ov, ..front };
+            show(kms, out.id, "    layout", &[pri, top], b, false);
+        }
+        Err(e) => println!("    SKIP: {e}"),
+    }
+    let _ = kms.set_scanout_alpha(out.id, false);
+}
+
 fn main() -> Result<(), Error> {
-    let path = std::env::args()
-        .nth(1)
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let flip = args.iter().any(|a| a == "--flip");
+    args.retain(|a| a != "--flip");
+    let path = args
+        .into_iter()
+        .next()
         .unwrap_or_else(|| "/dev/dri/card1".to_owned());
     let mut kms = open(&path)?;
     light_all(&mut kms)?;
@@ -458,7 +683,11 @@ fn main() -> Result<(), Error> {
         println!("no connected outputs");
     }
     for o in outs {
-        probe_output(&mut kms, &o);
+        if flip {
+            flip_output(&mut kms, &o);
+        } else {
+            probe_output(&mut kms, &o);
+        }
     }
     Ok(())
 }

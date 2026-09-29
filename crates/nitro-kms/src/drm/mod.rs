@@ -18,7 +18,10 @@
 //!    flip to the same buffer follows, for the page-flip event.
 //! 3. Every later `commit` on that output: `NONBLOCK | PAGE_FLIP_EVENT`
 //!    with the plane's `FB_ID` and, when the plane exposes it, an
-//!    `FB_DAMAGE_CLIPS` blob.
+//!    `FB_DAMAGE_CLIPS` blob. With a staged plane layout
+//!    (`Backend::set_plane_state`) the request instead lists every plane
+//!    of the layout in full and switches off the ones that were on and
+//!    no longer are.
 //! 4. `dispatch`: page-flip events off the DRM fd become
 //!    `Event::Flipped`; uevents off the netlink socket become
 //!    `Event::Hotplug`.
@@ -26,7 +29,7 @@
 mod planes;
 pub mod select;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
@@ -40,7 +43,8 @@ use ::drm::control::{
 use ::drm::{ClientCapability, Device as BasicDevice};
 
 use crate::planes::{
-    BufferId, Fourcc, PlaneAssignment, PlaneInfo, PlaneKind, PlaneSource, Verdict,
+    BufferId, Fourcc, PlaneAssignment, PlaneConfig, PlaneId, PlaneInfo, PlaneKind, PlaneSource,
+    PlaneTrack, ScanoutBufferInfo, SrcRect, Verdict, damage_plane, rotation, to_disable,
 };
 use crate::uevent::UeventSocket;
 use crate::{BYTES_PER_PIXEL, Backend, BufferMut, Error, Event, Image, OutputId, OutputInfo, Rect};
@@ -354,6 +358,8 @@ struct Output {
     /// mode when `alpha`), nothing else. Cloned per commit because
     /// `atomic_commit` takes it by value.
     flip_req: AtomicModeReq,
+    /// Staged and committed plane layouts, fences, buffer references.
+    track: PlaneTrack,
 }
 
 impl Output {
@@ -525,6 +531,13 @@ pub struct DrmBackend<'fd> {
     /// Scanout buffers from `alloc_buffer`, by [`BufferId`].
     buffers: HashMap<u32, planes::ScanoutBuf>,
     next_buffer: u32,
+    /// Freed by the caller while still scanned out: destroyed on release.
+    doomed: HashSet<u32>,
+    /// Released and not yet taken ([`Backend::take_released_buffers`]).
+    released: Vec<BufferId>,
+    /// Buffers a replaced or vanished output's planes may still scan
+    /// out, released by the next modeset (or when nothing is lit).
+    orphan_refs: Vec<BufferId>,
 }
 
 impl<'fd> DrmBackend<'fd> {
@@ -581,6 +594,9 @@ impl<'fd> DrmBackend<'fd> {
             discovered: HashMap::new(),
             buffers: HashMap::new(),
             next_buffer: 1,
+            doomed: HashSet::new(),
+            released: Vec::new(),
+            orphan_refs: Vec::new(),
         };
         this.rescan()?;
         Ok(this)
@@ -890,6 +906,7 @@ impl<'fd> DrmBackend<'fd> {
             lit: false,
             alpha: false,
             flip_req,
+            track: PlaneTrack::default(),
         })
     }
 
@@ -980,7 +997,9 @@ impl<'fd> DrmBackend<'fd> {
                     i += 1;
                 }
                 select::Reconcile::Replace => {
-                    let o = self.outputs.remove(i);
+                    let mut o = self.outputs.remove(i);
+                    let refs = o.track.reset();
+                    self.orphan_refs.extend(refs);
                     o.destroy(&self.card);
                     changed = true;
                 }
@@ -1092,7 +1111,46 @@ impl<'fd> DrmBackend<'fd> {
         }
         self.card
             .atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req)
-            .map_err(Error::io("atomic modeset"))
+            .map_err(Error::io("atomic modeset"))?;
+        // Every lit output is back to the default layout: the primary
+        // full-screen, every other plane off.
+        let mut ids = std::mem::take(&mut self.orphan_refs);
+        for o in self.outputs.iter_mut().filter(|o| o.lit) {
+            ids.extend(o.track.reset());
+        }
+        self.route(ids);
+        Ok(())
+    }
+
+    /// Buffers the screen stopped reading: destroy the doomed ones,
+    /// report the rest. One another output still reads is neither.
+    fn route(&mut self, ids: Vec<BufferId>) {
+        for id in ids {
+            if self.outputs.iter().any(|o| o.track.references(id)) || self.orphan_refs.contains(&id)
+            {
+                continue;
+            }
+            if self.doomed.remove(&id.0) {
+                if let Some(b) = self.buffers.remove(&id.0) {
+                    b.destroy(&self.card);
+                }
+            } else if !self.released.contains(&id) {
+                self.released.push(id);
+            }
+        }
+    }
+
+    /// A live (allocated, not freed) scanout buffer.
+    fn live(&self, id: BufferId) -> Option<&planes::ScanoutBuf> {
+        self.buffers.get(&id.0).filter(|_| !self.doomed.contains(&id.0))
+    }
+
+    /// Plane `raw`'s discovery record, when it can go on CRTC bit `bit`.
+    fn plane_on(&self, raw: u32, bit: u32) -> Result<&planes::Discovered, Error> {
+        self.discovered
+            .get(&raw)
+            .filter(|d| d.info.crtc_mask & bit != 0)
+            .ok_or(Error::NoSuchObject("plane on this output", raw))
     }
 
     /// The modeset that lights output `idx`, already marked lit.
@@ -1130,6 +1188,9 @@ impl<'fd> DrmBackend<'fd> {
     /// `damage` as its `FB_DAMAGE_CLIPS` when the plane has them. Leaves
     /// `front` and `pending` to the caller.
     fn flip(&mut self, idx: usize, target: usize, damage: &[Rect]) -> Result<(), Error> {
+        if !self.outputs[idx].track.is_default_path() {
+            return self.flip_layout(idx, target, damage);
+        }
         let o = &mut self.outputs[idx];
         let pp = &self.plane_props[&o.plane.into()];
         o.flip_req.add_property(
@@ -1139,24 +1200,14 @@ impl<'fd> DrmBackend<'fd> {
         );
         let mut blob = None;
         if let Some(clips) = pp.fb_damage_clips {
-            Self::build_damage(
+            let (value, b) = Self::damage_value(
+                &self.card,
                 &mut self.damage_scratch,
                 damage,
                 o.info.width,
                 o.info.height,
-            );
-            let value = if self.damage_scratch.is_empty() {
-                property::Value::Blob(0)
-            } else {
-                let v = self
-                    .card
-                    .create_property_blob(self.damage_scratch.as_slice())
-                    .map_err(Error::io("create damage blob"))?;
-                if let property::Value::Blob(id) = v {
-                    blob = Some(id);
-                }
-                v
-            };
+            )?;
+            blob = b;
             o.flip_req.add_property(o.plane, clips, value);
         }
         let result = self
@@ -1171,6 +1222,125 @@ impl<'fd> DrmBackend<'fd> {
             let _ = self.card.destroy_property_blob(id);
         }
         result
+    }
+
+    /// `FB_DAMAGE_CLIPS` for `damage`: the blob value and the blob to
+    /// destroy after the ioctl (none for "everything", blob 0).
+    fn damage_value(
+        card: &Card<'_>,
+        scratch: &mut Vec<i32>,
+        damage: &[Rect],
+        width: u32,
+        height: u32,
+    ) -> Result<(property::Value<'static>, Option<u64>), Error> {
+        Self::build_damage(scratch, damage, width, height);
+        if scratch.is_empty() {
+            return Ok((property::Value::Blob(0), None));
+        }
+        let v = card
+            .create_property_blob(scratch.as_slice())
+            .map_err(Error::io("create damage blob"))?;
+        let id = if let property::Value::Blob(id) = v {
+            Some(id)
+        } else {
+            None
+        };
+        Ok((v, id))
+    }
+
+    /// The flip of a non-default layout (or the one leaving it): every
+    /// plane of the staged layout in full, the planes that were on and
+    /// are not listed switched off, the damage on the plane showing the
+    /// output buffer. Fences are consumed either way; the bookkeeping
+    /// moves only on success.
+    fn flip_layout(&mut self, idx: usize, target: usize, damage: &[Rect]) -> Result<(), Error> {
+        let einval = || Error::Io {
+            op: "atomic page flip",
+            source: io::Error::from_raw_os_error(rustix::io::Errno::INVAL.raw_os_error()),
+        };
+        let fences = self.outputs[idx].track.take_fences();
+        let o = &self.outputs[idx];
+        let (w, h) = (o.info.width, o.info.height);
+        let primary = PlaneId(o.plane.into());
+        let layout = if o.track.staged.is_empty() {
+            // Back to the default; a rotation left by a Surface layout
+            // is undone too.
+            vec![PlaneConfig {
+                rotation: Some(rotation::ROTATE_0),
+                ..PlaneConfig::new(
+                    primary,
+                    PlaneSource::OutputFront,
+                    SrcRect::whole(w, h),
+                    Rect::new(0, 0, w, h),
+                )
+            }]
+        } else {
+            o.track.staged.clone()
+        };
+        let prev_on: Vec<PlaneId> = if o.track.shown.is_empty() {
+            vec![primary]
+        } else {
+            o.track.shown.iter().map(|c| c.plane).collect()
+        };
+        let bit = 1u32 << o.crtc_idx;
+        let mut req = AtomicModeReq::new();
+        for c in &layout {
+            let disc = self.plane_on(c.plane.0, bit)?;
+            let pp = &self.plane_props[&c.plane.0];
+            let p = plane_handle(c.plane.0)?;
+            let fb = match c.source {
+                PlaneSource::OutputFront => o.bufs[target].scanout_fb(o.alpha),
+                PlaneSource::Buffer(id) => {
+                    self.live(id)
+                        .ok_or(Error::NoSuchObject("buffer", id.0))?
+                        .fb
+                }
+            };
+            let fence = fences
+                .iter()
+                .find(|(pl, _)| *pl == c.plane)
+                .map(|(_, f)| f.as_fd());
+            if !planes::add_config(&mut req, p, pp, disc, o.crtc, fb, &c.assignment(fence)) {
+                return Err(einval());
+            }
+            if o.alpha
+                && c.source == PlaneSource::OutputFront
+                && let Some((h, v)) = self.premultiplied(c.plane.0)
+            {
+                req.add_property(p, h, property::Value::Unknown(v));
+            }
+        }
+        for pl in to_disable(&prev_on, &layout) {
+            let pp = &self.plane_props[&pl.0];
+            let p = plane_handle(pl.0)?;
+            req.add_property(p, pp.fb_id, property::Value::Framebuffer(None));
+            req.add_property(p, pp.crtc_id, property::Value::CRTC(None));
+        }
+        let clips = damage_plane(&layout).and_then(|dp| {
+            let clips = self.plane_props.get(&dp.0)?.fb_damage_clips?;
+            Some((plane_handle(dp.0).ok()?, clips))
+        });
+        let mut blob = None;
+        if let Some((p, clips)) = clips {
+            let (value, b) =
+                Self::damage_value(&self.card, &mut self.damage_scratch, damage, w, h)?;
+            blob = b;
+            req.add_property(p, clips, value);
+        }
+        let result = self
+            .card
+            .atomic_commit(
+                AtomicCommitFlags::NONBLOCK | AtomicCommitFlags::PAGE_FLIP_EVENT,
+                req,
+            )
+            .map_err(Error::io("atomic page flip"));
+        if let Some(id) = blob {
+            let _ = self.card.destroy_property_blob(id);
+        }
+        drop(fences);
+        result?;
+        self.outputs[idx].track.committed();
+        Ok(())
     }
 
     fn output_mut(&mut self, id: OutputId) -> Result<&mut Output, Error> {
@@ -1215,6 +1385,12 @@ impl<'fd> DrmBackend<'fd> {
             }
         }
     }
+}
+
+fn plane_handle(raw: u32) -> Result<plane::Handle, Error> {
+    ::drm::control::RawResourceHandle::new(raw)
+        .map(plane::Handle::from)
+        .ok_or(Error::NoSuchObject("plane", raw))
 }
 
 fn set_nonblocking(fd: BorrowedFd<'_>) -> io::Result<()> {
@@ -1326,12 +1502,14 @@ impl Backend for DrmBackend<'_> {
                 }
             };
             let mut any = false;
+            let mut released = Vec::new();
             for ev in batch {
                 any = true;
                 if let ::drm::control::Event::PageFlip(pf) = ev
                     && let Some(o) = self.outputs.iter_mut().find(|o| o.crtc == pf.crtc)
                 {
                     o.pending = false;
+                    released.extend(o.track.flipped());
                     events.push(Event::Flipped {
                         output: o.id,
                         sequence: u64::from(pf.frame),
@@ -1339,6 +1517,7 @@ impl Backend for DrmBackend<'_> {
                     });
                 }
             }
+            self.route(released);
             if !any {
                 break;
             }
@@ -1361,6 +1540,10 @@ impl Backend for DrmBackend<'_> {
         // With nothing lit at all there is nothing to commit.
         if changed && !self.paused && self.outputs.iter().any(|o| o.lit) {
             self.modeset_all()?;
+        } else if !self.outputs.iter().any(|o| o.lit) {
+            // Nothing of ours is lit, so nothing of ours scans out.
+            let ids = std::mem::take(&mut self.orphan_refs);
+            self.route(ids);
         }
         Ok(changed)
     }
@@ -1478,9 +1661,87 @@ impl Backend for DrmBackend<'_> {
     }
 
     fn free_buffer(&mut self, id: BufferId) {
-        if let Some(b) = self.buffers.remove(&id.0) {
+        let on_screen = self.outputs.iter().any(|o| o.track.references(id))
+            || self.orphan_refs.contains(&id);
+        if on_screen {
+            if self.buffers.contains_key(&id.0) {
+                self.doomed.insert(id.0);
+            }
+        } else if !self.doomed.contains(&id.0)
+            && let Some(b) = self.buffers.remove(&id.0)
+        {
             b.destroy(&self.card);
         }
+    }
+
+    fn buffer_info(&self, id: BufferId) -> Option<ScanoutBufferInfo> {
+        self.live(id).map(|b| b.info)
+    }
+
+    fn export_buffer(&mut self, id: BufferId) -> Result<OwnedFd, Error> {
+        self.live(id)
+            .ok_or(Error::NoSuchObject("buffer", id.0))?
+            .export(&self.card)
+    }
+
+    fn set_plane_state(&mut self, output: OutputId, layout: &[PlaneConfig]) -> Result<(), Error> {
+        if self.paused {
+            return Err(Error::Paused);
+        }
+        let o = self.output(output).ok_or(Error::NoSuchOutput(output))?;
+        if !o.lit {
+            return Err(Error::NotLit(output));
+        }
+        let bit = 1u32 << o.crtc_idx;
+        for c in layout {
+            self.plane_on(c.plane.0, bit)?;
+            if let PlaneSource::Buffer(b) = c.source
+                && self.live(b).is_none()
+            {
+                return Err(Error::NoSuchObject("buffer", b.0));
+            }
+        }
+        self.output_mut(output)?.track.stage(layout);
+        Ok(())
+    }
+
+    fn commit_planes(&mut self, output: OutputId) -> Result<(), Error> {
+        if self.paused {
+            return Err(Error::Paused);
+        }
+        let idx = self
+            .outputs
+            .iter()
+            .position(|o| o.id == output)
+            .ok_or(Error::NoSuchOutput(output))?;
+        let o = &self.outputs[idx];
+        if !o.lit {
+            return Err(Error::NotLit(output));
+        }
+        if o.pending {
+            return Err(Error::FlipPending(output));
+        }
+        self.flip(idx, o.front, &[])?;
+        self.outputs[idx].pending = true;
+        Ok(())
+    }
+
+    fn set_plane_fence(
+        &mut self,
+        output: OutputId,
+        plane: PlaneId,
+        fence: OwnedFd,
+    ) -> Result<(), Error> {
+        let o = self.output(output).ok_or(Error::NoSuchOutput(output))?;
+        if self.plane_on(plane.0, 1 << o.crtc_idx)?.props.in_fence_fd.is_none() {
+            return Err(Error::Unsupported("IN_FENCE_FD on this plane"));
+        }
+        self.output_mut(output)?.track.set_fence(plane, fence);
+        Ok(())
+    }
+
+    fn take_released_buffers(&mut self) -> Vec<BufferId> {
+        std::mem::take(&mut self.released)
     }
 
     fn test_layout(
@@ -1500,41 +1761,21 @@ impl Backend for DrmBackend<'_> {
 
         let mut req = AtomicModeReq::new();
         for a in layout {
-            let disc = self
-                .discovered
-                .get(&a.plane.0)
-                .filter(|d| d.info.crtc_mask & bit != 0)
-                .ok_or(Error::NoSuchObject("plane on this output", a.plane.0))?;
+            let disc = self.plane_on(a.plane.0, bit)?;
             let pp = &self.plane_props[&a.plane.0];
-            let p = plane::Handle::from(
-                ::drm::control::RawResourceHandle::new(a.plane.0)
-                    .ok_or(Error::NoSuchObject("plane", a.plane.0))?,
-            );
+            let p = plane_handle(a.plane.0)?;
             let fb = match a.source {
                 PlaneSource::OutputFront => out.bufs[out.front].scanout_fb(out.alpha),
-
                 PlaneSource::Buffer(id) => {
-                    self.buffers
-                        .get(&id.0)
+                    self.live(id)
                         .ok_or(Error::NoSuchObject("buffer", id.0))?
                         .fb
                 }
             };
-            req.add_property(p, pp.fb_id, property::Value::Framebuffer(Some(fb)));
-            req.add_property(p, pp.crtc_id, property::Value::CRTC(Some(out.crtc)));
-
-            req.add_property(p, pp.src_x, property::Value::UnsignedRange(a.src.x.into()));
-            req.add_property(p, pp.src_y, property::Value::UnsignedRange(a.src.y.into()));
-            req.add_property(p, pp.src_w, property::Value::UnsignedRange(a.src.w.into()));
-            req.add_property(p, pp.src_h, property::Value::UnsignedRange(a.src.h.into()));
-            req.add_property(p, pp.crtc_x, property::Value::SignedRange(a.dst.x.into()));
-            req.add_property(p, pp.crtc_y, property::Value::SignedRange(a.dst.y.into()));
-            req.add_property(p, pp.crtc_w, property::Value::UnsignedRange(a.dst.w.into()));
-            req.add_property(p, pp.crtc_h, property::Value::UnsignedRange(a.dst.h.into()));
             // The optional properties. Asking for one the plane lacks (or an
             // immutable zpos other than its own) is answered here with the
             // EINVAL the kernel would give, without a round trip.
-            if !planes::add_optional(&mut req, p, disc, a) {
+            if !planes::add_config(&mut req, p, pp, disc, out.crtc, fb, a) {
                 return Ok(Verdict::einval());
             }
         }

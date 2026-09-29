@@ -32,14 +32,14 @@ pub use crate::drm::select::ModeCandidate;
 pub use crate::drm::{DrmBackend, DrmFd, DrmOptions, ModeRequest, Modeline};
 pub use crate::fake::{FakeBackend, FakeOutputSpec, FakePlaneSpec, TestRecord};
 pub use crate::planes::{
-    BufferId, ColorEncoding, ColorRange, Fourcc, MOD_LINEAR, PlaneAssignment, PlaneId, PlaneInfo,
-    PlaneKind, PlaneSource, SrcRect, Verdict, Zpos,
+    BufferId, ColorEncoding, ColorRange, Fourcc, MOD_LINEAR, PlaneAssignment, PlaneConfig, PlaneId,
+    PlaneInfo, PlaneKind, PlaneSource, ScanoutBufferInfo, SrcRect, Verdict, Zpos,
 };
 
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
-use std::os::fd::BorrowedFd;
+use std::os::fd::{BorrowedFd, OwnedFd};
 use std::time::Duration;
 
 /// Bytes per pixel of the output formats (`XRGB8888` / `ARGB8888`).
@@ -343,6 +343,14 @@ pub trait Backend {
     /// slice means "everything"). Completes asynchronously with
     /// [`Event::Flipped`].
     ///
+    /// The planes show the layout staged with [`Backend::set_plane_state`]
+    /// (by default: this buffer full-screen on the primary), with any
+    /// fences from [`Backend::set_plane_fence`]. A rejected commit is
+    /// `Err` and changes nothing: the previous picture stays on screen,
+    /// the buffers keep their roles, the staged layout stays staged (the
+    /// caller changes it, typically back to the default) and the fences
+    /// are dropped.
+    ///
     /// # Errors
     /// [`Error::FlipPending`] if one is already in flight, [`Error::Paused`]
     /// while paused, [`Error::Io`] if the kernel rejects the commit.
@@ -366,7 +374,8 @@ pub trait Backend {
     /// vanished release their buffers. A new one is not modeset here: its
     /// first [`Backend::commit`] lights it, with that frame, as it does
     /// every output. Outputs already lit are modeset again unless paused,
-    /// in which case [`Backend::resume`] does it.
+    /// in which case [`Backend::resume`] does it. That modeset drops
+    /// every lit output's plane layout back to the default.
     ///
     /// # Errors
     /// [`Error::Io`] if enumeration fails.
@@ -385,6 +394,10 @@ pub trait Backend {
     /// that, buffers do). An output that has not been committed yet has
     /// nothing of its own to restore, and is left to its first
     /// [`Backend::commit`].
+    ///
+    /// the caller must repaint fully. The modeset also drops every
+    /// output's staged plane layout back to the default (see
+    /// [`Backend::set_plane_state`]).
     ///
     /// **Post-condition:** any flip in flight is abandoned, so
     /// [`Backend::flip_pending`] is false for every output afterwards and
@@ -504,9 +517,109 @@ pub trait Backend {
     }
 
     /// Free a buffer from [`Backend::alloc_buffer`]. Unknown ids are
-    /// ignored. A buffer must not be freed while a layout using it is on
-    /// screen; after a `TEST_ONLY` it can go at once.
+    /// ignored. A buffer that a committed layout still scans out (on
+    /// screen or in flight) is freed only once the flip that stops
+    /// using it completes; the id is unusable from this call on, and is
+    /// then not reported by [`Backend::take_released_buffers`].
     fn free_buffer(&mut self, _id: BufferId) {}
+
+    /// The memory layout of a scanout buffer; `None` for an unknown or
+    /// freed id.
+    fn buffer_info(&self, _id: BufferId) -> Option<ScanoutBufferInfo> {
+        None
+    }
+
+    /// A new fd for the buffer's memory, mappable read-write by whoever
+    /// fills it (a DRM PRIME dma-buf, `O_RDWR | O_CLOEXEC`; a sealed
+    /// memfd on the fake backend, where the `DMA_BUF_IOCTL_SYNC` ioctl
+    /// fails with `ENOTTY`). Every export shares the same memory. Layout:
+    /// [`Backend::buffer_info`].
+    ///
+    /// # Errors
+    /// [`Error::NoSuchObject`] for an unknown or freed id,
+    /// [`Error::Unsupported`] on a backend without scanout buffers,
+    /// [`Error::Io`] if the export fails.
+    fn export_buffer(&mut self, _id: BufferId) -> Result<OwnedFd, Error> {
+        Err(Error::Unsupported("buffer export"))
+    }
+
+    /// Stage the **whole CRTC layout** for `output`'s next
+    /// [`Backend::commit`] or [`Backend::commit_planes`]. Every plane on
+    /// the CRTC that is not listed is disabled, the primary included (a
+    /// layout without the primary turns it off). Empty is the default:
+    /// the output buffer full-screen on the primary.
+    /// [`PlaneSource::OutputFront`] is the output buffer the commit flips
+    /// to, scanned out as `ARGB8888` while scanout alpha is on.
+    ///
+    /// The layout persists across commits until changed, **or until a
+    /// modeset drops every lit output back to the default**: `resume`, a
+    /// `rescan` or `set_modes` that changed anything, and the first
+    /// commit of another output (which lights it with a modeset of every
+    /// lit output). The buffers such a reset stops using show up in
+    /// [`Backend::take_released_buffers`], which is how a caller notices;
+    /// it then re-decides and repaints fully.
+    ///
+    /// Nothing is checked against the display engine here: ask
+    /// [`Backend::test_layout`] first, and expect `commit` to fail if the
+    /// kernel refuses.
+    ///
+    /// # Errors
+    /// [`Error::NoSuchOutput`], [`Error::Paused`], [`Error::NotLit`]
+    /// before the output's first commit, [`Error::NoSuchObject`] for a
+    /// plane that is not this output's or an unknown/freed buffer,
+    /// [`Error::Unsupported`] on a backend without planes (a non-empty
+    /// layout).
+    fn set_plane_state(&mut self, _output: OutputId, layout: &[PlaneConfig]) -> Result<(), Error> {
+        if layout.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Unsupported("plane layouts"))
+        }
+    }
+
+    /// Commit the staged layout with the **current** front buffer: no
+    /// swap, no back-buffer rotation, full damage. What a video frame on
+    /// a plane uses, so it flips without the caller painting or copying
+    /// the output buffer. Delivers [`Event::Flipped`], and
+    /// `flip_pending`/[`Error::FlipPending`] behave as for
+    /// [`Backend::commit`]; so does a rejection.
+    ///
+    /// # Errors
+    /// As [`Backend::commit`], plus [`Error::NotLit`] before the output's
+    /// first commit and [`Error::Unsupported`] on a backend without
+    /// planes.
+    fn commit_planes(&mut self, _output: OutputId) -> Result<(), Error> {
+        Err(Error::Unsupported("plane commits"))
+    }
+
+    /// Give `plane` a `sync_file` to wait on (`IN_FENCE_FD`) in the next
+    /// commit, which consumes it whether it succeeds or not. Optional:
+    /// CPU-written buffers need none. A second fence for the same plane
+    /// replaces the first; a fence for a plane the commit does not show
+    /// is dropped.
+    ///
+    /// # Errors
+    /// [`Error::NoSuchOutput`], [`Error::NoSuchObject`] for a plane that
+    /// is not this output's, [`Error::Unsupported`] when the plane has no
+    /// `IN_FENCE_FD` (or the backend no planes).
+    fn set_plane_fence(
+        &mut self,
+        _output: OutputId,
+        _plane: PlaneId,
+        _fence: OwnedFd,
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported("IN_FENCE_FD"))
+    }
+
+    /// Buffers the screen stopped reading, each reported once: after the
+    /// [`Event::Flipped`] of the commit that stopped using it has been
+    /// dispatched, or after a modeset reset the layout. Call it after
+    /// [`Backend::dispatch`] (and after `resume`/`rescan`/`set_modes`/a
+    /// first commit). Buffers already passed to `free_buffer` are
+    /// destroyed then instead, and not reported.
+    fn take_released_buffers(&mut self) -> Vec<BufferId> {
+        Vec::new()
+    }
 
     /// Ask whether `layout` would work as `output`'s next commit, without
     /// touching the screen (`DRM_MODE_ATOMIC_TEST_ONLY`).

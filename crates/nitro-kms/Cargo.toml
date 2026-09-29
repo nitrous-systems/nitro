@@ -19,3 +19,7 @@ drm = "0.15"
 # struct. See DEPENDENCIES.md.
 drm-ffi = "0.9"
 rustix = { version = "1", features = ["event", "fs", "mm", "net", "time"] }
+# The fake backend's `export_buffer` hands out a sealed memfd, so server
+# and client tests run the same code path as a PRIME export. A leaf crate
+# (rustix only) that the server links anyway: no new external dependency.
+nitro-shm = { workspace = true }

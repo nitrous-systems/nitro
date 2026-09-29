@@ -27,7 +27,7 @@
 //!   capability; `scanout_alpha_on()` / `scanout_alpha_sets()` expose the
 //!   state and the call count.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::time::Duration;
@@ -39,8 +39,9 @@ use rustix::time::{
 
 use crate::drm::select::{ModeCandidate, ModeRequest, select_mode};
 use crate::planes::{
-    BufferId, ColorEncoding, ColorRange, Fourcc, MOD_LINEAR, PlaneAssignment, PlaneId, PlaneInfo,
-    PlaneKind, PlaneSource, Verdict, Zpos, rotation,
+    BufferId, ColorEncoding, ColorRange, Fourcc, MOD_LINEAR, PlaneAssignment, PlaneConfig, PlaneId,
+    PlaneInfo, PlaneKind, PlaneSource, PlaneTrack, ScanoutBufferInfo, SrcRect, Verdict, Zpos,
+    rotation,
 };
 use crate::{BYTES_PER_PIXEL, Backend, BufferMut, Error, Event, Image, OutputId, OutputInfo, Rect};
 
@@ -354,6 +355,49 @@ struct FakeOutput {
     scanout_format: Fourcc,
     /// Successful `set_scanout_alpha` calls.
     alpha_sets: usize,
+    /// Staged and committed plane layouts, fences, buffer references.
+    track: PlaneTrack,
+    /// Per successful commit with in-fences, the planes that had one.
+    fence_log: Vec<Vec<PlaneId>>,
+}
+
+/// One scanout buffer from `alloc_buffer`.
+struct FakeBuf {
+    info: ScanoutBufferInfo,
+    /// Made by the first `export_buffer`, shared by every later one.
+    memfd: Option<OwnedFd>,
+}
+
+impl FakeBuf {
+    /// The layout a linear buffer would have on the DRM backend, with
+    /// pitches padded to 64 bytes like the outputs' (so stride bugs
+    /// show). `NV12` is one allocation: Y, then `CbCr` at `pitch * h`.
+    fn new(format: Fourcc, width: u32, height: u32) -> Self {
+        let bpp = match format {
+            Fourcc::YUYV | Fourcc::UYVY => 2,
+            Fourcc::NV12 => 1,
+            _ => BYTES_PER_PIXEL,
+        };
+        let pitch = (width * bpp).div_ceil(64) * 64;
+        let plane = u64::from(pitch) * u64::from(height);
+        let (offsets, pitches, size) = if format == Fourcc::NV12 {
+            ([0, pitch * height], [pitch, pitch], plane * 3 / 2)
+        } else {
+            ([0, 0], [pitch, 0], plane)
+        };
+        Self {
+            info: ScanoutBufferInfo {
+                format,
+                width,
+                height,
+                modifier: MOD_LINEAR,
+                size,
+                offsets,
+                pitches,
+            },
+            memfd: None,
+        }
+    }
 }
 
 impl FakeOutput {
@@ -386,6 +430,8 @@ impl FakeOutput {
             alpha_capable: spec.alpha,
             scanout_format: Fourcc::XRGB8888,
             alpha_sets: 0,
+            track: PlaneTrack::default(),
+            fence_log: Vec::new(),
         }
     }
 }
@@ -410,8 +456,12 @@ pub struct FakeBackend {
     warnings: Vec<String>,
     next_plane: u32,
     next_buffer: u32,
-    /// `(format, width, height)` by buffer id.
-    buffers: HashMap<u32, (Fourcc, u32, u32)>,
+    /// Scanout buffers by id, freed ones still on screen included.
+    buffers: HashMap<u32, FakeBuf>,
+    /// Freed by the caller, still scanned out: destroyed on release.
+    doomed: HashSet<u32>,
+    /// Released and not yet taken.
+    released: Vec<BufferId>,
     max_active_planes: Option<usize>,
     test_hook: Option<TestHook>,
     test_log: Vec<TestRecord>,
@@ -445,6 +495,8 @@ impl FakeBackend {
             next_plane: 1,
             next_buffer: 1,
             buffers: HashMap::new(),
+            doomed: HashSet::new(),
+            released: Vec::new(),
             max_active_planes: None,
             test_hook: None,
             test_log: Vec::new(),
@@ -660,9 +712,11 @@ impl FakeBackend {
     pub fn tick(&mut self, events: &mut Vec<Event>) {
         let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
         let time = Duration::new(now.tv_sec as u64, now.tv_nsec as u32);
+        let mut released = Vec::new();
         for o in &mut self.outputs {
             if o.pending {
                 o.pending = false;
+                released.extend(o.track.flipped());
                 o.sequence += 1;
                 events.push(Event::Flipped {
                     output: o.info.id,
@@ -671,6 +725,7 @@ impl FakeBackend {
                 });
             }
         }
+        self.route(released);
         self.armed = false;
         if self.hotplug_queued {
             self.hotplug_queued = false;
@@ -719,8 +774,156 @@ impl FakeBackend {
 
     /// The `(format, width, height)` of each live scanout buffer.
     #[must_use]
+    ///
+    /// A freed buffer that is still on screen stays here until the flip
+    /// that stops using it, which is when the real backend destroys it.
     pub fn buffer(&self, id: BufferId) -> Option<(Fourcc, u32, u32)> {
-        self.buffers.get(&id.0).copied()
+        self.buffers
+            .get(&id.0)
+            .map(|b| (b.info.format, b.info.width, b.info.height))
+    }
+
+    /// The layout `output`'s most recent successful commit showed, flipped
+    /// or not: empty is the default (the output buffer on the primary),
+    /// `None` an unknown id.
+    #[must_use]
+    pub fn plane_state(&self, output: OutputId) -> Option<Vec<PlaneConfig>> {
+        self.outputs
+            .iter()
+            .find(|o| o.info.id == output)
+            .map(|o| o.track.shown.clone())
+    }
+
+    /// Per successful commit on `output` that carried in-fences, oldest
+    /// first, the planes that had one (empty for an unknown id).
+    #[must_use]
+    pub fn fence_log(&self, output: OutputId) -> Vec<Vec<PlaneId>> {
+        self.outputs
+            .iter()
+            .find(|o| o.info.id == output)
+            .map(|o| o.fence_log.clone())
+            .unwrap_or_default()
+    }
+
+    /// A live (allocated, not freed) buffer.
+    fn live(&self, id: BufferId) -> Option<&FakeBuf> {
+        self.buffers.get(&id.0).filter(|_| !self.doomed.contains(&id.0))
+    }
+
+    /// Buffers the screen stopped reading: destroy the doomed ones,
+    /// report the rest. One still read by another output (or another
+    /// plane) is neither.
+    fn route(&mut self, ids: Vec<BufferId>) {
+        for id in ids {
+            if self.outputs.iter().any(|o| o.track.references(id)) {
+                continue;
+            }
+            if self.doomed.remove(&id.0) {
+                self.buffers.remove(&id.0);
+            } else if !self.released.contains(&id) {
+                self.released.push(id);
+            }
+        }
+    }
+
+    /// What a modeset does to the plane state: every output back to the
+    /// default.
+    fn reset_planes(&mut self) {
+        let mut ids = Vec::new();
+        for o in &mut self.outputs {
+            ids.extend(o.track.reset());
+        }
+        self.route(ids);
+    }
+
+    /// Validate and commit output `idx`'s staged layout (fences consumed
+    /// either way). Leaves the buffers and `pending` to the caller.
+    fn commit_layout(&mut self, idx: usize) -> Result<(), Error> {
+        let Self {
+            outputs,
+            buffers,
+            doomed,
+            test_hook,
+            max_active_planes,
+            ..
+        } = self;
+        let o = &mut outputs[idx];
+        if o.track.is_default_path() {
+            return Ok(());
+        }
+        let fences = o.track.take_fences();
+        let layout = if o.track.staged.is_empty() {
+            let (w, h) = (o.info.width, o.info.height);
+            o.planes
+                .iter()
+                .find(|(_, s)| s.kind == PlaneKind::Primary)
+                .map(|(id, _)| {
+                    PlaneConfig::new(
+                        *id,
+                        PlaneSource::OutputFront,
+                        SrcRect::whole(w, h),
+                        Rect::new(0, 0, w, h),
+                    )
+                })
+                .into_iter()
+                .collect()
+        } else {
+            o.track.staged.clone()
+        };
+        for c in &layout {
+            if let PlaneSource::Buffer(b) = c.source
+                && (!buffers.contains_key(&b.0) || doomed.contains(&b.0))
+            {
+                return Err(Error::NoSuchObject("buffer", b.0));
+            }
+        }
+        let assigns: Vec<PlaneAssignment<'_>> = layout
+            .iter()
+            .map(|c| {
+                let fence = fences
+                    .iter()
+                    .find(|(p, _)| *p == c.plane)
+                    .map(|(_, f)| f.as_fd());
+                c.assignment(fence)
+            })
+            .collect();
+        if !o.track.staged.is_empty() {
+            let verdict = if let Some(hook) = test_hook.as_mut() {
+                hook(o.info.id, &assigns)
+            } else {
+                let pairs: Vec<_> = assigns
+                    .iter()
+                    .filter_map(|a| {
+                        let spec = o.planes.iter().find(|(id, _)| *id == a.plane)?;
+                        Some((&spec.1, a))
+                    })
+                    .collect();
+                Self::check_layout(o, buffers, *max_active_planes, &pairs)
+            };
+            if let Verdict::Rejected(errno) = verdict {
+                return Err(Error::Io {
+                    op: "atomic page flip",
+                    source: io::Error::from_raw_os_error(errno),
+                });
+            }
+        }
+        let with_fence: Vec<PlaneId> = assigns
+            .iter()
+            .filter(|a| a.in_fence.is_some())
+            .map(|a| a.plane)
+            .collect();
+        if !with_fence.is_empty() {
+            o.fence_log.push(with_fence);
+        }
+        o.track.committed();
+        Ok(())
+    }
+
+    fn position(&self, output: OutputId) -> Result<usize, Error> {
+        self.outputs
+            .iter()
+            .position(|o| o.info.id == output)
+            .ok_or(Error::NoSuchOutput(output))
     }
 
     /// Whether `output` is set to scan out `ARGB8888` (`false` for an
@@ -746,8 +949,8 @@ impl FakeBackend {
     ///
     /// - a plane appears twice;
     /// - the source's format is not in the plane's list with the linear
-    ///   modifier (the output front is linear `XRGB8888`, buffers are
-    ///   linear);
+    ///   modifier (the output buffer is linear `XRGB8888`, or `ARGB8888`
+    ///   while scanout alpha is on; buffers are linear);
     /// - `src` is empty or leaves the buffer, or `dst` is empty or misses
     ///   the output entirely;
     /// - the plane must scale and cannot, or the ratio is outside its
@@ -761,7 +964,7 @@ impl FakeBackend {
     /// [`FakeBackend::set_max_active_planes`] allows.
     fn check_layout(
         o: &FakeOutput,
-        buffers: &HashMap<u32, (Fourcc, u32, u32)>,
+        buffers: &HashMap<u32, FakeBuf>,
         max_active: Option<usize>,
         layout: &[(&FakePlaneSpec, &PlaneAssignment<'_>)],
     ) -> Verdict {
@@ -777,8 +980,11 @@ impl FakeBackend {
                 return no;
             }
             let (format, bw, bh) = match a.source {
-                PlaneSource::OutputFront => (Fourcc::XRGB8888, o.info.width, o.info.height),
-                PlaneSource::Buffer(id) => buffers[&id.0],
+                PlaneSource::OutputFront => (o.scanout_format, o.info.width, o.info.height),
+                PlaneSource::Buffer(id) => {
+                    let i = &buffers[&id.0].info;
+                    (i.format, i.width, i.height)
+                }
             };
             if !spec
                 .formats
@@ -892,15 +1098,121 @@ impl Backend for FakeBackend {
         if self.paused {
             return Err(Error::Paused);
         }
-        let o = self.output_mut(output)?;
+        let idx = self.position(output)?;
+        if self.outputs[idx].pending {
+            return Err(Error::FlipPending(output));
+        }
+        // A rejected layout changes nothing (fences are consumed).
+        self.commit_layout(idx)?;
+        let o = &mut self.outputs[idx];
+        o.front = 1 - o.front;
+        o.pending = true;
+        let lighting = !o.lit;
+        o.lit = true;
+        if lighting {
+            // The DRM backend lights an output with a modeset of every lit
+            // output, which puts their planes back to the default.
+            let mut ids = Vec::new();
+            for (i, o) in self.outputs.iter_mut().enumerate() {
+                if i != idx {
+                    ids.extend(o.track.reset());
+                }
+            }
+            self.route(ids);
+        }
+        self.damage_log.push((output, damage.to_vec()));
+        self.arm()
+    }
+
+    fn commit_planes(&mut self, output: OutputId) -> Result<(), Error> {
+        if self.paused {
+            return Err(Error::Paused);
+        }
+        let idx = self.position(output)?;
+        let o = &self.outputs[idx];
+        if !o.lit {
+            return Err(Error::NotLit(output));
+        }
         if o.pending {
             return Err(Error::FlipPending(output));
         }
-        o.front = 1 - o.front;
-        o.pending = true;
-        o.lit = true;
-        self.damage_log.push((output, damage.to_vec()));
+        self.commit_layout(idx)?;
+        self.outputs[idx].pending = true;
         self.arm()
+    }
+
+    fn set_plane_state(&mut self, output: OutputId, layout: &[PlaneConfig]) -> Result<(), Error> {
+        if self.paused {
+            return Err(Error::Paused);
+        }
+        let idx = self.position(output)?;
+        let o = &self.outputs[idx];
+        if !o.lit {
+            return Err(Error::NotLit(output));
+        }
+        for c in layout {
+            if !o.planes.iter().any(|(id, _)| *id == c.plane) {
+                return Err(Error::NoSuchObject("plane on this output", c.plane.0));
+            }
+            if let PlaneSource::Buffer(b) = c.source
+                && self.live(b).is_none()
+            {
+                return Err(Error::NoSuchObject("buffer", b.0));
+            }
+        }
+        self.outputs[idx].track.stage(layout);
+        Ok(())
+    }
+
+    fn set_plane_fence(
+        &mut self,
+        output: OutputId,
+        plane: PlaneId,
+        fence: OwnedFd,
+    ) -> Result<(), Error> {
+        let o = self.output_mut(output)?;
+        let (_, spec) = o
+            .planes
+            .iter()
+            .find(|(id, _)| *id == plane)
+            .ok_or(Error::NoSuchObject("plane on this output", plane.0))?;
+        if !spec.in_fence {
+            return Err(Error::Unsupported("IN_FENCE_FD on this plane"));
+        }
+        o.track.set_fence(plane, fence);
+        Ok(())
+    }
+
+    fn take_released_buffers(&mut self) -> Vec<BufferId> {
+        std::mem::take(&mut self.released)
+    }
+
+    fn buffer_info(&self, id: BufferId) -> Option<ScanoutBufferInfo> {
+        self.live(id).map(|b| b.info)
+    }
+
+    fn export_buffer(&mut self, id: BufferId) -> Result<OwnedFd, Error> {
+        if self.doomed.contains(&id.0) {
+            return Err(Error::NoSuchObject("buffer", id.0));
+        }
+        let b = self
+            .buffers
+            .get_mut(&id.0)
+            .ok_or(Error::NoSuchObject("buffer", id.0))?;
+        if b.memfd.is_none() {
+            let fd = nitro_shm::create_sealed("nitro-kms-fake-scanout", b.info.size).map_err(|e| {
+                Error::Io {
+                    op: "export fake scanout buffer",
+                    source: e.into(),
+                }
+            })?;
+            b.memfd = Some(fd);
+        }
+        b.memfd
+            .as_ref()
+            .map_or(Err(Error::NoSuchObject("buffer", id.0)), |fd| {
+                fd.try_clone().map_err(Error::io("export fake scanout buffer"))
+            })
     }
 
     fn flip_pending(&self, output: OutputId) -> bool {
@@ -936,9 +1248,10 @@ impl Backend for FakeBackend {
 
     fn rescan(&mut self) -> Result<bool, Error> {
         let mut changed = false;
+        let mut gone = Vec::new();
         for id in std::mem::take(&mut self.pending_removals) {
             if let Some(i) = self.outputs.iter().position(|o| o.info.id == id) {
-                self.outputs.remove(i);
+                gone.extend(self.outputs.remove(i).track.reset());
                 self.specs.remove(i);
                 changed = true;
             }
@@ -949,7 +1262,10 @@ impl Backend for FakeBackend {
         }
         if changed {
             self.infos = self.outputs.iter().map(|o| o.info.clone()).collect();
+            // The DRM backend modesets every lit output after a change.
+            self.reset_planes();
         }
+        self.route(gone);
         Ok(changed)
     }
 
@@ -964,6 +1280,7 @@ impl Backend for FakeBackend {
         }
         if changed {
             self.infos = self.outputs.iter().map(|o| o.info.clone()).collect();
+            self.reset_planes();
         }
         Ok(changed)
     }
@@ -1006,12 +1323,18 @@ impl Backend for FakeBackend {
         }
         let id = self.next_buffer;
         self.next_buffer += 1;
-        self.buffers.insert(id, (format, width, height));
+        self.buffers.insert(id, FakeBuf::new(format, width, height));
         Ok(BufferId(id))
     }
 
     fn free_buffer(&mut self, id: BufferId) {
-        self.buffers.remove(&id.0);
+        if self.outputs.iter().any(|o| o.track.references(id)) {
+            if self.buffers.contains_key(&id.0) {
+                self.doomed.insert(id.0);
+            }
+        } else if !self.doomed.contains(&id.0) {
+            self.buffers.remove(&id.0);
+        }
     }
 
     fn test_layout(
@@ -1039,7 +1362,7 @@ impl Backend for FakeBackend {
                 .map(|(_, s)| s)
                 .ok_or(Error::NoSuchObject("plane on this output", a.plane.0))?;
             if let PlaneSource::Buffer(b) = a.source
-                && !self.buffers.contains_key(&b.0)
+                && self.live(b).is_none()
             {
                 return Err(Error::NoSuchObject("buffer", b.0));
             }
@@ -1097,6 +1420,8 @@ impl Backend for FakeBackend {
         for o in &mut self.outputs {
             o.pending = false;
         }
+        // The modeset puts every plane back to the default.
+        self.reset_planes();
         // With nothing in flight there is no flip left to report, so the
         // timer must go too: an idle paused-then-resumed fake makes no
         // wakeups, as the module docs promise.
@@ -1709,6 +2034,331 @@ mod tests {
         assert_eq!(img.pixel(0, 0), 0x0011_2233);
         assert_eq!(img.alpha(0, 0), 0xFF);
         assert_eq!(img.alpha(1, 1), 0);
+    }
+
+    // -- multi-plane frame path (#3913) --------------------------------------
+
+    fn cfg(plane: PlaneId, src: PlaneSource, w: u32, h: u32) -> PlaneConfig {
+        PlaneConfig::new(plane, src, SrcRect::whole(w, h), Rect::new(0, 0, w, h))
+    }
+
+    /// `with_planes`, flipped, plus a 1920×1080 YUYV buffer.
+    fn video() -> (FakeBackend, OutputId, Vec<PlaneInfo>, BufferId) {
+        let (mut b, id, p) = with_planes();
+        b.tick(&mut Vec::new());
+        let v = b.alloc_buffer(Fourcc::YUYV, 1920, 1080).unwrap();
+        (b, id, p, v)
+    }
+
+    fn overlay_layout(p: &[PlaneInfo], v: BufferId) -> Vec<PlaneConfig> {
+        vec![
+            cfg(p[0].id, PlaneSource::OutputFront, 1920, 1080),
+            cfg(p[1].id, PlaneSource::Buffer(v), 1920, 1080),
+        ]
+    }
+
+    fn fence() -> OwnedFd {
+        rustix::fs::memfd_create("fence", rustix::fs::MemfdFlags::CLOEXEC).unwrap()
+    }
+
+    #[test]
+    fn a_staged_layout_persists_across_commits() {
+        let (mut b, id, p, v) = video();
+        let layout = overlay_layout(&p, v);
+        b.set_plane_state(id, &layout).unwrap();
+        assert_eq!(b.plane_state(id).unwrap(), vec![], "staged, not committed");
+        b.commit(id, &[]).unwrap();
+        assert_eq!(b.plane_state(id).unwrap(), layout);
+        b.tick(&mut Vec::new());
+        b.commit(id, &[]).unwrap();
+        assert_eq!(b.plane_state(id).unwrap(), layout);
+    }
+
+    #[test]
+    fn an_unlisted_plane_is_disabled_and_the_primary_can_go_off() {
+        let (mut b, id, p, v) = video();
+        b.set_plane_state(id, &overlay_layout(&p, v)).unwrap();
+        b.commit(id, &[]).unwrap();
+        b.tick(&mut Vec::new());
+        // Primary off: the video alone (HSW b2).
+        let alone = [cfg(p[1].id, PlaneSource::Buffer(v), 1920, 1080)];
+        b.set_plane_state(id, &alone).unwrap();
+        b.commit_planes(id).unwrap();
+        assert_eq!(b.plane_state(id).unwrap(), alone.to_vec());
+        b.tick(&mut Vec::new());
+        // Back to the default: the overlay is gone.
+        b.set_plane_state(id, &[]).unwrap();
+        b.commit(id, &[]).unwrap();
+        assert!(b.plane_state(id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_rejected_commit_changes_nothing() {
+        let (mut b, id, p, v) = video();
+        {
+            let mut buf = b.back_buffer(id).unwrap();
+            buf.fill_rect(Rect::new(0, 0, 4, 4), 0x00AB_CDEF);
+        }
+        b.commit(id, &[]).unwrap();
+        b.tick(&mut Vec::new());
+        b.clear_damage_log();
+        let before = b.read_front(id).unwrap();
+        // YUYV on the (XRGB-only) primary: check_layout says EINVAL.
+        b.set_plane_state(id, &[cfg(p[0].id, PlaneSource::Buffer(v), 1920, 1080)])
+            .unwrap();
+        b.set_plane_fence(id, p[0].id, fence()).unwrap();
+        let e = b.commit(id, &[]).unwrap_err();
+        assert!(matches!(e, Error::Io { op: "atomic page flip", .. }), "{e}");
+        assert!(!b.flip_pending(id));
+        assert_eq!(b.read_front(id).unwrap(), before);
+        assert!(b.plane_state(id).unwrap().is_empty());
+        assert!(b.damage_log().is_empty());
+        assert!(b.fence_log(id).is_empty(), "the fence was consumed, not logged");
+        assert!(b.commit_planes(id).is_err());
+        // The caller falls back to the default, which goes through.
+        b.set_plane_state(id, &[]).unwrap();
+        b.commit(id, &[]).unwrap();
+        assert!(b.flip_pending(id));
+    }
+
+    #[test]
+    fn commit_planes_flips_without_swapping() {
+        let (mut b, id, p, v) = video();
+        {
+            let mut buf = b.back_buffer(id).unwrap();
+            buf.fill_rect(Rect::new(0, 0, 1920, 1080), 0x0011_1111);
+        }
+        b.commit(id, &[]).unwrap();
+        b.tick(&mut Vec::new());
+        {
+            let mut buf = b.back_buffer(id).unwrap();
+            buf.fill_rect(Rect::new(0, 0, 1920, 1080), 0x0022_2222);
+        }
+        b.clear_damage_log();
+        b.set_plane_state(id, &overlay_layout(&p, v)).unwrap();
+        b.commit_planes(id).unwrap();
+        assert!(b.flip_pending(id));
+        assert!(matches!(b.commit_planes(id), Err(Error::FlipPending(_))));
+        assert!(matches!(b.back_buffer(id), Err(Error::FlipPending(_))));
+        assert_eq!(b.read_front(id).unwrap().pixel(5, 5), 0x0011_1111);
+        let mut ev = Vec::new();
+        b.tick(&mut ev);
+        assert!(matches!(ev.as_slice(), [Event::Flipped { output, .. }] if *output == id));
+        // Front and back kept their roles and contents.
+        assert_eq!(b.read_front(id).unwrap().pixel(5, 5), 0x0011_1111);
+        assert_eq!(
+            &b.back_buffer(id).unwrap().data[0..4],
+            &0x0022_2222u32.to_le_bytes()
+        );
+        assert!(b.damage_log().is_empty(), "commit_planes is not in the damage log");
+    }
+
+    #[test]
+    fn commit_planes_needs_a_lit_output() {
+        let (mut b, id) = fake();
+        assert!(matches!(b.commit_planes(id), Err(Error::NotLit(_))));
+        assert!(matches!(
+            b.set_plane_state(id, &[]),
+            Err(Error::NotLit(_))
+        ));
+        b.pause();
+        assert!(matches!(b.commit_planes(id), Err(Error::Paused)));
+    }
+
+    #[test]
+    fn a_buffer_is_released_after_the_replacing_flip_only() {
+        let (mut b, id, p, v) = video();
+        let w = b.alloc_buffer(Fourcc::YUYV, 1920, 1080).unwrap();
+        b.set_plane_state(id, &overlay_layout(&p, v)).unwrap();
+        b.commit_planes(id).unwrap();
+        b.tick(&mut Vec::new());
+        assert!(b.take_released_buffers().is_empty());
+        // The next video frame replaces v with w.
+        b.set_plane_state(id, &overlay_layout(&p, w)).unwrap();
+        b.commit_planes(id).unwrap();
+        assert!(b.take_released_buffers().is_empty(), "v is still on screen");
+        b.tick(&mut Vec::new());
+        assert_eq!(b.take_released_buffers(), vec![v]);
+        assert!(b.take_released_buffers().is_empty(), "reported once");
+        // Re-committing the same layout releases nothing.
+        b.commit_planes(id).unwrap();
+        b.tick(&mut Vec::new());
+        assert!(b.take_released_buffers().is_empty());
+    }
+
+    #[test]
+    fn freeing_an_on_screen_buffer_is_deferred_to_its_release() {
+        let (mut b, id, p, v) = video();
+        b.set_plane_state(id, &overlay_layout(&p, v)).unwrap();
+        b.commit_planes(id).unwrap();
+        b.tick(&mut Vec::new());
+        b.free_buffer(v);
+        assert!(b.buffer(v).is_some(), "still scanned out");
+        assert!(b.buffer_info(v).is_none(), "but unusable");
+        assert!(b.export_buffer(v).is_err());
+        assert!(matches!(
+            b.set_plane_state(id, &overlay_layout(&p, v)),
+            Err(Error::NoSuchObject("buffer", _))
+        ));
+        b.set_plane_state(id, &[]).unwrap();
+        b.commit_planes(id).unwrap();
+        assert!(b.buffer(v).is_some(), "the replacing flip has not happened");
+        b.tick(&mut Vec::new());
+        assert!(b.buffer(v).is_none());
+        assert!(b.take_released_buffers().is_empty(), "freed, so not reported");
+        // A buffer never shown goes at once.
+        let x = b.alloc_buffer(Fourcc::YUYV, 64, 64).unwrap();
+        b.free_buffer(x);
+        assert!(b.buffer(x).is_none());
+    }
+
+    #[test]
+    fn a_modeset_resets_the_layout() {
+        // resume
+        let (mut b, id, p, v) = video();
+        b.set_plane_state(id, &overlay_layout(&p, v)).unwrap();
+        b.commit_planes(id).unwrap();
+        b.pause();
+        b.resume().unwrap();
+        assert!(b.plane_state(id).unwrap().is_empty());
+        assert_eq!(b.take_released_buffers(), vec![v]);
+        b.commit(id, &[]).unwrap();
+        assert!(b.plane_state(id).unwrap().is_empty(), "the staged layout went too");
+
+        // a resize
+        let spec = FakeOutputSpec::new(1920, 1080)
+            .named("HDMI-A-1")
+            .modes(&[(1920, 1080, 60_000), (1280, 720, 60_000)])
+            .planes(vec![
+                FakePlaneSpec::default_primary(),
+                FakePlaneSpec::overlay().formats(&[Fourcc::YUYV]),
+            ]);
+        let mut b = FakeBackend::new(&[spec]).unwrap();
+        let id = b.outputs()[0].id;
+        b.commit(id, &[]).unwrap();
+        b.tick(&mut Vec::new());
+        let p = b.planes(id);
+        let v = b.alloc_buffer(Fourcc::YUYV, 640, 360).unwrap();
+        b.set_plane_state(id, &[cfg(p[1].id, PlaneSource::Buffer(v), 640, 360)])
+            .unwrap();
+        b.commit_planes(id).unwrap();
+        b.tick(&mut Vec::new());
+        assert!(b.set_modes(&want("HDMI-A-1", "1280x720")).unwrap());
+        assert!(b.plane_state(id).unwrap().is_empty());
+        assert_eq!(b.take_released_buffers(), vec![v]);
+
+        // another output's first commit (it lights with a modeset)
+        let (mut b, id, p, v) = video();
+        b.set_plane_state(id, &overlay_layout(&p, v)).unwrap();
+        b.commit_planes(id).unwrap();
+        b.tick(&mut Vec::new());
+        b.plug(FakeOutputSpec::new(64, 64).named("Virtual-2"));
+        b.rescan().unwrap();
+        assert!(b.plane_state(id).unwrap().is_empty(), "a hotplug modesets");
+        assert_eq!(b.take_released_buffers(), vec![v]);
+        b.set_plane_state(id, &overlay_layout(&p, v)).unwrap();
+        b.commit_planes(id).unwrap();
+        b.tick(&mut Vec::new());
+        let other = b.outputs()[1].id;
+        b.commit(other, &[]).unwrap();
+        assert!(b.plane_state(id).unwrap().is_empty());
+        assert_eq!(b.take_released_buffers(), vec![v]);
+    }
+
+    #[test]
+    fn fences_are_per_plane_and_one_shot() {
+        let spec = FakeOutputSpec::new(64, 64).planes(vec![
+            FakePlaneSpec::default_primary().in_fence(false),
+            FakePlaneSpec::overlay().formats(&[Fourcc::YUYV]),
+        ]);
+        let mut b = FakeBackend::new(&[spec]).unwrap();
+        let id = b.outputs()[0].id;
+        b.commit(id, &[]).unwrap();
+        b.tick(&mut Vec::new());
+        let p = b.planes(id);
+        assert!(matches!(
+            b.set_plane_fence(id, p[0].id, fence()),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            b.set_plane_fence(id, PlaneId(999), fence()),
+            Err(Error::NoSuchObject(..))
+        ));
+        let v = b.alloc_buffer(Fourcc::YUYV, 64, 64).unwrap();
+        b.set_plane_state(
+            id,
+            &[
+                cfg(p[0].id, PlaneSource::OutputFront, 64, 64),
+                cfg(p[1].id, PlaneSource::Buffer(v), 64, 64),
+            ],
+        )
+        .unwrap();
+        b.set_plane_fence(id, p[1].id, fence()).unwrap();
+        b.commit_planes(id).unwrap();
+        b.tick(&mut Vec::new());
+        b.commit_planes(id).unwrap();
+        assert_eq!(b.fence_log(id), vec![vec![p[1].id]], "consumed by one commit");
+    }
+
+    #[test]
+    fn buffer_info_describes_the_layout() {
+        let (mut b, _, _) = with_planes();
+        let nv12 = b.alloc_buffer(Fourcc::NV12, 100, 50).unwrap();
+        let i = b.buffer_info(nv12).unwrap();
+        assert_eq!((i.format, i.width, i.height, i.modifier), (Fourcc::NV12, 100, 50, MOD_LINEAR));
+        assert_eq!(i.pitches, [128, 128]);
+        assert_eq!(i.offsets, [0, 128 * 50]);
+        assert_eq!(i.size, 128 * 75);
+        let yuyv = b.alloc_buffer(Fourcc::YUYV, 100, 50).unwrap();
+        let i = b.buffer_info(yuyv).unwrap();
+        assert_eq!((i.pitches, i.offsets, i.size), ([256, 0], [0, 0], 256 * 50));
+        assert!(b.buffer_info(BufferId(999)).is_none());
+    }
+
+    #[test]
+    fn export_is_a_sealed_shared_writable_memfd() {
+        let (mut b, _, _) = with_planes();
+        let v = b.alloc_buffer(Fourcc::YUYV, 100, 50).unwrap();
+        let size = b.buffer_info(v).unwrap().size;
+        let first = b.export_buffer(v).unwrap();
+        let second = b.export_buffer(v).unwrap();
+        assert_eq!(nitro_shm::sealed_len(&first).unwrap(), size);
+        nitro_shm::check_seals(first.as_fd()).unwrap();
+        {
+            let mut map = nitro_shm::MappingMut::map_mut(first.as_fd(), size as usize).unwrap();
+            map.as_bytes_mut()[7] = 0x5a;
+        }
+        let map = nitro_shm::Mapping::map(second, size as usize).unwrap();
+        assert_eq!(map.as_bytes()[7], 0x5a, "every export is the same memory");
+        assert!(matches!(
+            b.export_buffer(BufferId(999)),
+            Err(Error::NoSuchObject("buffer", 999))
+        ));
+    }
+
+    #[test]
+    fn output_front_is_argb_while_alpha_is_on() {
+        // KBL (c): the video on the primary, the shadow as AR24 on the
+        // overlay above it.
+        let spec = FakeOutputSpec::new(64, 64).planes(vec![
+            FakePlaneSpec::default_primary().formats(&[Fourcc::NV12]),
+            FakePlaneSpec::overlay().formats(&[Fourcc::ARGB8888]),
+        ]);
+        let mut b = FakeBackend::new(&[spec]).unwrap();
+        let id = b.outputs()[0].id;
+        b.commit(id, &[]).unwrap();
+        b.tick(&mut Vec::new());
+        let p = b.planes(id);
+        let v = b.alloc_buffer(Fourcc::NV12, 64, 64).unwrap();
+        let layout = [
+            cfg(p[0].id, PlaneSource::Buffer(v), 64, 64),
+            cfg(p[1].id, PlaneSource::OutputFront, 64, 64),
+        ];
+        b.set_plane_state(id, &layout).unwrap();
+        assert!(b.commit(id, &[]).is_err(), "XR24 on an AR24-only overlay");
+        b.set_scanout_alpha(id, true).unwrap();
+        b.commit(id, &[]).unwrap();
+        assert_eq!(b.plane_state(id).unwrap(), layout.to_vec());
     }
 
     #[test]
