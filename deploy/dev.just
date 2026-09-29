@@ -40,7 +40,7 @@ size windows="1":
 # Binary sizes, dep count and box idle RSS: the docs/budget.md baseline.
 [group('dev')]
 footprint secs="10":
-    FOOTPRINT_BINS="{{box_bins}} nitro-gpu nitro-video" NITRO_BOX={{box}} NITRO_BOX_BINDIR='{{box_bindir}}' bash deploy/footprint.sh {{secs}}
+    FOOTPRINT_BINS="{{box_bins}} nitro-gpu" NITRO_BOX={{box}} NITRO_BOX_BINDIR='{{box_bindir}}' bash deploy/footprint.sh {{secs}}
 
 # ---------------------------------------------------------------------------
 # Test box (see docs/testbox.md)
@@ -72,7 +72,7 @@ box_bindir := env_var_or_default("NITRO_BOX_BINDIR", if box_profile == "gdm" { "
 # is why they are deployed together and in one rsync — a session that
 # started yesterday's bar next to today's server is the failure mode the
 # sibling lookup exists to prevent.
-box_bins := "nitro-server nitro-session nitro-shot nitro-demo nitro-bench nitro-calc nitro-amp nitro-term nitro-files nitro-bar nitro-launcher nitro-wallpaper nitro-settings hey"
+box_bins := "nitro-server nitro-session nitro-shot nitro-demo nitro-bench nitro-calc nitro-amp nitro-term nitro-files nitro-bar nitro-launcher nitro-wallpaper nitro-settings nitro-video hey"
 box_examples := "hello_client hello_dialog shell_probe"
 
 # Build release, rsync binaries to the box, restart the dev session

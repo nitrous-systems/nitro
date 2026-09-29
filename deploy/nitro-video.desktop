@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=nitro-video
+GenericName=Video Player
+Comment=A native video player on nitro-ui
+# See `deploy/nitro-calc.desktop` for why the file name, the app id and
+# `StartupWMClass` are all `nitro-video`. One file at a time: `%f`.
+Exec=nitro-video %f
+Icon=play-fill
+Terminal=false
+StartupWMClass=nitro-video
+Categories=AudioVideo;Video;Player;
+MimeType=video/mp4;video/x-matroska;video/webm;video/quicktime;
+Keywords=video;movie;player;mp4;

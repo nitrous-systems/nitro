@@ -260,7 +260,8 @@ remainder.
 ## Video decode belongs to clients
 
 Decoding lives in clients (a future `nitro-media` library), not in the
-server: software (dav1d, openh264) first, **VA-API on Intel**, V4L2 M2M
+server. `nitro-video` v1 (#3906) decodes in software through the system
+FFmpeg; VA-API through FFmpeg's hwaccel is next. In general: software (dav1d, openh264) first, **VA-API on Intel**, V4L2 M2M
 on phones, and Vulkan Video on newer desktops.
 
 VA-API is the Intel decode API because neither test box has Vulkan Video:
@@ -369,5 +370,8 @@ Alongside, and feeding into the items above:
   `wire.md` § Surface sharing; server side: `crates/nitro-server/src/share.rs`.
   Why B over C: [`chromium.md`](chromium.md#out-of-process-gpu-b-vs-c-3904).
 - Chromium Ozone GPU rendering — #3905.
-- `nitro-video` player — #3906.
+- `nitro-video` player — #3906, **built**: system FFmpeg (libavformat/
+  libavcodec, dynamic) on a decode thread → 4-buffer NV12 memfd ring →
+  `PresentSurface`, paced by frame callbacks; nitro-ui controls overlay
+  (`SurfaceView`), fullscreen. See `crates/nitro-video/README.md`.
 - `just footprint` budget gate — #3907.

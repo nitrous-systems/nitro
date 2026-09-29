@@ -18,8 +18,8 @@ nitro-core = { workspace = true }
 nitro-shm = { workspace = true }
 # The Surface message types (`CreateSurfaceBuffer`, `PresentSurface`).
 nitro-wire = { workspace = true }
-# `O_NONBLOCK` on the decoder pipe, `CLOCK_MONOTONIC`.
-rustix = { workspace = true, features = ["fs", "pipe", "time"] }
+# The decode thread's non-blocking wake pipe; `CLOCK_MONOTONIC` for pacing.
+rustix = { workspace = true, features = ["pipe", "time"] }
 
 [lib]
 name = "nitro_video"

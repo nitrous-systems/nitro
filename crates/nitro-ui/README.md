@@ -99,6 +99,26 @@ shape its string and waits, because the server owns the fonts. The result
 is cached by `(text, style, max_width)`, so a settled UI does no round
 trips. Reasoning and the async path in `docs/ui.md`.
 
+## Surfaces (video)
+
+A `SurfaceView` (`nitro_ui::surface`) is one `Surface` node filling its
+box, letterboxed to an aspect ratio, with **overlay children** pinned
+over it (a player's controls bar paints above the video). Its pixels do
+not go through the paint pass: the app registers NV12 buffers with
+`Ui::create_surface_buffer` and queues frames with `Ui::present_surface`
+(serial from `Ui::next_serial`, which shares the commit serial space),
+and the server latches the newest at vblank. `Presented`,
+`BufferReleased` and `SurfaceHint` come back through `Ui::on_surface`.
+Call `Ui::enable_surfaces` (or `App::surfaces`) before the window opens:
+it adds `SURFACE | RELEASE` to `ClientCaps`, and `Ui::has_surfaces` says
+whether the server granted them (never on a remote link).
+`Ui::set_window_state` / `on_window_state` drive the app's own
+fullscreen. `nitro-video` is the user; `tests/surface.rs` the contract.
+
+`Ui::request_frame` also marks the next flush to commit: the server
+applies `RequestFrame` at the next `Commit`, so an app whose tree is idle
+(it presents by `PresentSurface`) would otherwise never be answered.
+
 ## Introspection
 
 Every app opens `$XDG_RUNTIME_DIR/nitro/apps/<name>.<pid>.sock` and

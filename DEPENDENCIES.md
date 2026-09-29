@@ -552,6 +552,40 @@ kernel's 68-byte `drm_mode_modeinfo` and an `unsafe` transmute into
 dependency exists to avoid.
 
 
+`nitro-video` (#3906) is the one app that links a **C library on
+purpose**: the system **FFmpeg** — `libavformat`, `libavcodec`,
+`libavutil`, dynamically, from the distribution (`libav*-dev` at build
+time, the `.so.62`/`.so.60` runtime packages on the box). No crate is
+added. `crates/nitro-video/build.rs` asks the system `pkg-config` for
+flags and compiles `src/shim.c` with the system `cc`, so neither `cc`
+nor `pkg-config`/`bindgen`/`ffmpeg-sys` enters the lock file. The
+reasons, decided by the project's human over the `ffmpeg` child process
+that `nitro-amp` uses:
+
+- FFmpeg is the mature container and codec stack (MP4, MKV/WebM, H.264,
+  HEVC, VP9, AV1 where built), and a later **`nitro-media`** crate will
+  own media streams and graph handling on top of it. The backend lives in
+  `ffmpeg.rs` + `shim.c` behind the `Decoder` trait, with no FFmpeg type
+  outside those two files, so it moves there without touching the player.
+- Its VA-API hwaccel (`AV_HWDEVICE_TYPE_VAAPI` + DRM PRIME export) is the
+  route to the hardware-decode follow-up (#3903's recommendation).
+- **Rejected: `openh264`** (measured while planning): mis-decoded x264
+  Main/High B-frame streams (2 of 150 frames matched), needs a C++ build
+  and `nasm`, ~1 MB of binary. **Rejected: an `ffmpeg` child** (the first
+  plan, built and tested, then replaced): fine for audio, but it cannot
+  give the player hwaccel surfaces later.
+- **No `libswscale`/`libavfilter`**: the shim interleaves 4:2:0 chroma
+  into NV12 itself (a loop); other pixel formats are refused by name.
+  The distribution's `libavcodec` pulls `libswresample` in transitively;
+  nitro-video calls nothing in it.
+
+The C boundary is five functions returning integers, doubles and byte
+buffers (`nv_open`/`nv_info`/`nv_seek`/`nv_next`/`nv_close`), so the Rust
+side declares **no FFmpeg struct layout** — those change between majors.
+That is the tree's third `unsafe` exception, below. Footprint: stripped
+`nitro-video` and the mapped libav* size and RSS are in `docs/budget.md`
+§ "nitro-video (#3906)".
+
 ## `rustix` features by crate
 
 The feature set is per-crate, not workspace-wide, so each pays only for
@@ -571,11 +605,12 @@ the syscall families it uses.
 | `nitro-files` | `fs`, `event` | `inotify` for the live refresh of the directory on screen; `poll` in the integration tests |
 | `nitro-fs` | `fs`, `pipe`, `event` | `pipe` for the background scan's doorbell descriptor and `fcntl` to make it non-blocking; `poll` in the scan's own tests; `mknodat` for the fifo test |
 | `nitro-session` | `event`, `process` | `poll` over the pidfds, the session socket and the signal pipe; `pidfd_open` so a child's exit is a descriptor rather than a timer tick, `kill_process_group` for teardown, `getuid` for the `/tmp` fallback of the socket path |
+| `nitro-video` | `pipe`, `time` | `pipe2(O_NONBLOCK)` for the decode thread's wake descriptor; `clock_gettime` for frame pacing |
 | `nitro-term` | `pty`, `termios`, `process`, `fs`, `stdio` | `openpt`/`grantpt`/`unlockpt`/`ptsname` for the pseudoterminal; `tcsetwinsize` (`TIOCSWINSZ`) so a resize reaches the child as `SIGWINCH`; `kill_process_group`/`waitpid` to take the shell down with the window; `open` for the slave and `fcntl_setfl` to make the master non-blocking |
 
 ## `unsafe` exceptions
 
-Three.
+Four.
 
 **One, in `nitro-seat`**: `close_device_fd` reclaims a device descriptor with
 `OwnedFd::from_raw_fd` so the `OwnedFd`'s own `Drop` closes it. libseat
@@ -660,6 +695,18 @@ server's readers index by geometry only. Real-kernel tests are in
 needs a DRM or udmabuf exporter, so that half runs on hardware), and
 `tests/seals.rs` counts both files' `unsafe` blocks against every document
 that quotes them.
+
+**Four, in `nitro-video`** (#3906): `crates/nitro-video/src/ffmpeg.rs`
+carries `#![allow(unsafe_code)]` for the five `extern "C"` calls into
+`src/shim.c` and one `unsafe impl Send`. Each call site has a `SAFETY:`
+comment. The contract is deliberately narrow: the context pointer comes
+only from `nv_open` and is closed once in `Drop`; every buffer is passed
+with its length and the shim checks `dstlen >= w*h*3/2` before writing;
+no FFmpeg struct is declared on the Rust side. `Send` holds because the
+context is owned by one value and FFmpeg contexts have no thread affinity
+(moved, never shared). Hostile media files are FFmpeg's attack surface in
+the player's process — the cost of linking rather than piping, accepted
+for the reasons above.
 
 The FFI-binding crates above (`libseat-sys`, `drm-ffi`,
 `input-sys`, `xkbcommon`) contain their own, which is exactly why each is
