@@ -1904,6 +1904,12 @@ impl Server {
                 {
                     *shadow = frame::Shadow::new(info.width, info.height);
                 }
+                // A mode change replaces the backend's buffers, which come
+                // back as XRGB8888; the next paint re-selects the format.
+                if existing.alpha && self.backend.set_scanout_alpha(info.id, false).is_err() {
+                    warn!("{}: could not reset the scanout format", info.id);
+                }
+                existing.alpha = false;
                 existing.invalidate();
                 continue;
             }
@@ -2181,6 +2187,7 @@ impl Server {
     ///
     /// Returns whether a commit went in, which
     /// [`Server::paint_all`] uses to tell "nothing to do" from "held".
+    #[allow(clippy::too_many_lines)] // One frame's steps in order; splitting it would scatter the age-2/shadow reasoning.
     fn paint(&mut self, id: KmsOutputId) -> bool {
         if !self.active || self.backend.flip_pending(id) {
             return false;
@@ -2269,6 +2276,7 @@ impl Server {
             .iter()
             .map(|r| KmsRect::new(r.x, r.y, r.w.cast_unsigned(), r.h.cast_unsigned()))
             .collect();
+        self.select_scanout_alpha(index);
         match self.backend.commit(id, &kms_damage) {
             Ok(()) => {
                 if self.first_frame_ms.is_none() {
@@ -2297,6 +2305,18 @@ impl Server {
                 false
             }
         }
+    }
+
+    /// Scan the output out as `ARGB8888` exactly while a hole is on it and
+    /// the plane can blend alpha, `XRGB8888` otherwise (#3898). The pixels
+    /// are the same bytes either way, so this only swaps the framebuffer
+    /// format for the coming commit. Without Surfaces on a plane,
+    /// [`nitro_scene::Scene::has_holes`] is an O(1) `false` and nothing
+    /// else happens.
+    fn select_scanout_alpha(&mut self, index: usize) {
+        let output = &mut self.outputs[index];
+        let holes = self.scene.has_holes(output.scene_id);
+        frame::select_scanout_alpha(self.backend.as_mut(), output, holes);
     }
 
     /// Where the cursor is on `output`, in that output's buffer space,
@@ -8394,19 +8414,31 @@ impl Server {
             .and_then(|o| o.shadow.as_ref())
             .filter(|s| s.is_complete())
         {
-            return protocol::shot_reply(&shadow.image());
+            return protocol::shot_reply(&Self::honest(shadow.image()));
         }
         match self.backend.read_front(id) {
-            Ok(img) => protocol::shot_reply(&img),
+            Ok(img) => protocol::shot_reply(&Self::honest(img)),
             Err(e) => protocol::err_reply(&e.to_string()),
         }
+    }
+
+    /// A screenshot as the user sees it: the screen's premultiplied ARGB
+    /// composited over whatever is behind its holes, alpha 255 everywhere.
+    fn honest(mut image: nitro_kms::Image) -> nitro_kms::Image {
+        // #3897: sample the Surface buffer here when CPU-readable; until
+        // Surfaces carry buffers, every hole shows the placeholder.
+        let underlay = |_x: u32, _y: u32| frame::HOLE_PLACEHOLDER;
+        frame::fill_holes(&mut image, underlay);
+        image
     }
 
     /// Answer a `shot-front`: the same pixels, read off the scanout buffer
     /// whatever the shadow says.
     ///
-    /// Test-only. It is the only way to check that the copy out of the
-    /// shadow put the right bytes in the buffer the display scans, which
+    /// Test-only, and raw: holes are *not* filled, so byte 3 is the
+    /// premultiplied alpha the scanout holds (#3898). It is the only way to
+    /// check that the copy out of the shadow put the right bytes in the
+    /// buffer the display scans, which
     /// an ordinary `shot` would answer out of the shadow and therefore
     /// could not fail.
     fn shot_front(&mut self, name: Option<&str>) -> Vec<u8> {

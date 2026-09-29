@@ -19,8 +19,8 @@ use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-/// A screenshot: `XRGB8888` pixels, as [`TestServer::shot`] returns
-/// them. Re-exported so a consumer needs no `nitro-kms` dependency of
+/// A screenshot: `ARGB8888` pixels with alpha 255 everywhere (holes
+/// filled, #3898), as [`TestServer::shot`] returns them. Re-exported so a consumer needs no `nitro-kms` dependency of
 /// its own.
 pub use nitro_kms::Image;
 

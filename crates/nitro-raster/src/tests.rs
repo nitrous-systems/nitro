@@ -2636,11 +2636,15 @@ mod dest_alpha {
     use crate::{Canvas, Fill, Image, Mask, Nv12, PixelFormat, YuvEncoding};
     use nitro_core::{Color, IRect, Point, Rect};
 
+    /// One named painting op.
+    type Op = (&'static str, Box<dyn Fn(&mut Canvas<'_>)>);
+
     /// Every painting op the crate has, each run over the whole surface.
-    fn ops() -> Vec<(&'static str, Box<dyn Fn(&mut Canvas<'_>)>)> {
+    #[allow(clippy::too_many_lines)] // a flat table of ops
+    fn ops() -> Vec<Op> {
         let all = IRect::new(0, 0, 40, 24);
         let half = Color::rgba(200, 100, 40, 128);
-        let mut v: Vec<(&'static str, Box<dyn Fn(&mut Canvas<'_>)>)> = Vec::new();
+        let mut v: Vec<Op> = Vec::new();
         v.push((
             "fill_irect opaque",
             Box::new(move |c| c.fill_irect(&all, &IRect::new(2, 2, 11, 9), Color::rgb(1, 2, 3))),

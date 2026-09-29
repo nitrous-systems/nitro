@@ -1,7 +1,7 @@
 //! `nitro-shot`: ask the running server for a screenshot and write a PNG.
 //!
 //! ```text
-//! nitro-shot [-o FILE] [--raw] [--output NAME]   screenshot (PNG, or raw XRGB8888 with --raw)
+//! nitro-shot [-o FILE] [--raw] [--output NAME]   screenshot (PNG, or raw ARGB8888, alpha 255, with --raw)
 //! nitro-shot --outputs                            list outputs
 //! nitro-shot --modes                              list every mode each connector offers
 //! nitro-shot --stats                              frame counters

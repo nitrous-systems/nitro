@@ -273,6 +273,19 @@ pub(crate) fn paint_full(row: &mut [u8], x0: i32, paint: &RowPaint, opacity: u8)
     }
 }
 
+/// Destination alpha after source-over with effective alpha `a`:
+/// `over_straight(255, d_a, a)`. An opaque destination — every pixel but a
+/// hole's — stays 255 without the multiply; the branch is all but perfectly
+/// predicted, and it keeps glyph blending at its pre-#3898 cost.
+#[inline]
+pub(crate) fn dst_alpha(d_a: u8, a: u32) -> u8 {
+    if d_a == 255 {
+        255
+    } else {
+        over_straight(255, u32::from(d_a), a)
+    }
+}
+
 /// Source-over one straight-alpha colour into one pixel.
 #[inline]
 pub(crate) fn blend_pixel(d: &mut [u8], c: Color, alpha: u8) {
@@ -284,7 +297,7 @@ pub(crate) fn blend_pixel(d: &mut [u8], c: Color, alpha: u8) {
         over_straight(u32::from(c.b), u32::from(d[0]), a),
         over_straight(u32::from(c.g), u32::from(d[1]), a),
         over_straight(u32::from(c.r), u32::from(d[2]), a),
-        over_straight(255, u32::from(d[3]), a),
+        dst_alpha(d[3], a),
     ];
     d.copy_from_slice(&out);
 }

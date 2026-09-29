@@ -4,10 +4,15 @@
 //! line each (`\n`-terminated, ASCII). Replies start with a status line —
 //! `ok ...\n` or `err <message>\n` — followed by a request-specific body:
 //!
+//! A `shot` is `ARGB8888` with alpha 255 everywhere: holes punched for
+//! Surfaces on an underlay plane (#3898) are filled from the Surface when
+//! it is CPU-readable, otherwise with `frame::HOLE_PLACEHOLDER` grey. A
+//! `shot-front` is the raw scanout bytes, premultiplied alpha included.
+//!
 //! | request              | reply                                                        |
 //! |----------------------|--------------------------------------------------------------|
-//! | `shot [output-name]` | `ok <w> <h> <stride>\n` + `stride*h` bytes `XRGB8888`         |
-//! | `shot-front [name]`  | the same, read off the **scanout** buffer; for tests          |
+//! | `shot [output-name]` | `ok <w> <h> <stride>\n` + `stride*h` bytes `ARGB8888`, a=255 |
+//! | `shot-front [name]`  | the same, read off the **scanout** buffer; raw, for tests     |
 //! | `outputs`            | `ok\n` + one [`OutputLine`] per output + `\n`                 |
 //! | `modes`              | `ok\n` + `<name> <mode>[ *][ =]\n` lines + `\n`             |
 //! | `stats`              | `ok\n` + `key value\n` lines + `\n`                           |

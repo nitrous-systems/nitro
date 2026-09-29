@@ -961,9 +961,9 @@ pub fn device_px(size: f32, scale: f32) -> u32 {
 ///
 /// **The resampling is written here rather than taken from
 /// `nitro-raster`,** and that is not duplication: `Canvas` is a *screen*,
-/// its pixels are `XRGB8888`, and its blitter writes a zero into the
-/// fourth byte of every pixel it touches because a framebuffer has no
-/// alpha to keep. Running an icon through it would produce a fully
+/// its pixels are premultiplied *screen* alpha (255 everywhere but
+/// underlay holes, #3898), and its blitter composites the fourth byte as
+/// destination coverage rather than keeping the source's alpha. Running an icon through it would produce a fully
 /// transparent tile — which is exactly what the first version of this
 /// function did, and what `an_application_icon_is_decoded_once_and_
 /// blitted_in_its_own_colours` now catches. An icon tile is not a screen:

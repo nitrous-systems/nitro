@@ -1404,7 +1404,8 @@ mod tests {
         };
         // The tip is one black source pixel, so at 2× it is the 2×2 block
         // at the hotspot — all four the same, and black.
-        let black = [0x00, 0x00, 0x00, 0x00];
+        // Opaque black: alpha 255 over the opaque sentinel (#3898).
+        let black = [0x00, 0x00, 0x00, 0xFF];
         for (x, y) in [(4, 4), (5, 4), (4, 5), (5, 5)] {
             assert_eq!(at(x, y), black, "({x}, {y}) is not the tip's block");
         }

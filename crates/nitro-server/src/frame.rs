@@ -3,7 +3,9 @@
 //! # The shadow buffer
 //!
 //! Every output owns a heap-resident [`Shadow`]: a full-size, tightly
-//! packed `XRGB8888` copy of what that output must show. The rasterizer
+//! packed premultiplied `ARGB8888` copy of what that output must show
+//! (alpha 255 everywhere except the holes punched for Surfaces on an
+//! underlay plane, see [`fill_holes`]). The rasterizer
 //! paints into *that*, and only the damaged rows are then streamed into
 //! the scanout buffer with sequential, write-only [`copy_from_slice`] row
 //! copies.
@@ -59,7 +61,10 @@
 //! is the scene's conservative promise about that, and it covers an opaque
 //! 1:1 image as well as a solid rect, which is what lets a maximised
 //! window skip the desktop and everything under it), then the scene's
-//! paint list clipped to the rect, then the software cursor last. The
+//! paint list clipped to the rect, then the software cursor last. A
+//! [`PaintKind::Hole`] is an ordinary item: it clears its rect to alpha 0
+//! (#3898), and every item above it — and the cursor — composites onto the
+//! hole as premultiplied ARGB, which is what an underlay shows through. The
 //! rasterizer never writes outside the clip it was given, so one rect
 //! cannot smear into another.
 //!
@@ -136,14 +141,16 @@ pub const FRAME_MARGIN_NS: u64 = 2_000_000;
 /// is the exact latency the deferral machinery exists to avoid.
 const FRAME_MARGIN_MAX_SHARE: u64 = 4;
 
-/// Bytes per pixel of the only format the frame path speaks (`XRGB8888`),
-/// the same one [`nitro_kms`] scans out.
+/// Bytes per pixel of the only layout the frame path speaks (premultiplied
+/// `ARGB8888`), scanned out by [`nitro_kms`] as `XRGB8888` or, while a hole
+/// is on screen and the plane supports it, `ARGB8888` — the same bytes.
 const BYTES_PER_PIXEL: u32 = 4;
 
 /// A heap-resident copy of one output's pixels: what the rasterizer paints
 /// into when the shadow is enabled.
 ///
-/// Same format as the scanout buffer (`XRGB8888`) and, once the first frame
+/// Same layout as the scanout buffer (premultiplied `ARGB8888`, alpha 255
+/// outside holes) and, once the first frame
 /// has seen the real back buffer, the same stride — which lets a full-frame
 /// copy be one `memcpy` instead of a row loop. Roughly 8 MB at 1080p, per
 /// output; see `docs/budget.md` for why that is worth paying.
@@ -401,6 +408,14 @@ pub struct OutputState {
     /// Allocated when the output is added, resized on a mode change and
     /// dropped with the output — the whole lifecycle is this field's.
     pub shadow: Option<Shadow>,
+    /// Whether this output's scanout is currently switched to `ARGB8888`
+    /// ([`nitro_kms::Backend::set_scanout_alpha`]): true only while a hole
+    /// is on it and the plane can blend alpha (#3898). The bytes are the
+    /// same either way, so flipping it never needs a repaint.
+    pub alpha: bool,
+    /// Holes were on this output while its plane cannot scan out alpha,
+    /// and that was logged once.
+    pub alpha_warned: std::cell::Cell<bool>,
 }
 
 impl OutputState {
@@ -439,6 +454,8 @@ impl OutputState {
             painting_input_ns: 0,
             scroll: None,
             shadow: shadow.then(|| Shadow::new(width, height)),
+            alpha: false,
+            alpha_warned: std::cell::Cell::new(false),
         }
     }
 
@@ -1020,6 +1037,12 @@ fn paint_item(
         return;
     }
     match item.kind {
+        PaintKind::Hole { .. } => {
+            // A store, not a blend: the scene's bounds are already the
+            // device rect it promised as `opaque_cover`, and opacity is
+            // ignored (Surfaces on a plane are opaque, #3898).
+            canvas.clear_irect(&clip, &item.bounds);
+        }
         PaintKind::Rect {
             size,
             fill,
@@ -1214,6 +1237,66 @@ fn pixel_format(fourcc: u32) -> Option<PixelFormat> {
         format::AR24 => Some(PixelFormat::Argb8888),
         _ => None,
     }
+}
+
+/// Switch `output`'s scanout to `ARGB8888` exactly while `holes` is true
+/// and the plane can blend alpha, back to `XRGB8888` otherwise (#3898).
+/// Calls the backend only when the answer changes; logs once when holes are
+/// on an output that cannot show them.
+pub fn select_scanout_alpha(
+    backend: &mut dyn nitro_kms::Backend,
+    output: &mut OutputState,
+    holes: bool,
+) {
+    let id = output.kms_id;
+    let want = holes && backend.scanout_alpha(id);
+    if holes && !want && !output.alpha_warned.get() {
+        crate::warn!("{id}: holes on screen but the primary plane cannot scan out ARGB8888");
+        output.alpha_warned.set(true);
+    }
+    if want == output.alpha {
+        return;
+    }
+    match backend.set_scanout_alpha(id, want) {
+        Ok(()) => output.alpha = want,
+        Err(e) => crate::warn!("{id}: scanout alpha {want}: {e}"),
+    }
+}
+
+/// What `shot` shows where the screen has a hole and the Surface behind it
+/// is not CPU-readable: opaque 50 % grey (`0x808080`). A screenshot always
+/// comes out opaque; a hole never reads as black-with-alpha-0.
+pub const HOLE_PLACEHOLDER: [u8; 3] = [0x80, 0x80, 0x80];
+
+/// Composite an image of the (premultiplied ARGB) screen over what is
+/// behind its holes, so a screenshot is honest and opaque: for every pixel
+/// with `a < 255`, `c += round(u * (255 - a) / 255)` and `a = 255`, where
+/// `u` is `underlay(x, y)` as `[b, g, r]`.
+///
+/// A screen with no holes is a pure scan that changes nothing. Returns
+/// whether any pixel was translucent.
+pub fn fill_holes(image: &mut Image, underlay: impl Fn(u32, u32) -> [u8; 3]) -> bool {
+    let mut any = false;
+    let (width, stride) = (image.width as usize, image.stride as usize);
+    for (y, row) in image.data.chunks_mut(stride).enumerate() {
+        for (x, p) in row[..width * 4].chunks_exact_mut(4).enumerate() {
+            let a = p[3];
+            if a == 255 {
+                continue;
+            }
+            any = true;
+            #[allow(clippy::cast_possible_truncation)] // image dimensions fit u32
+            let u = underlay(x as u32, y as u32);
+            let inv = 255 - u32::from(a);
+            for (c, u) in p[..3].iter_mut().zip(u) {
+                let t = u32::from(u) * inv + 128;
+                let v = u32::from(*c) + ((t + (t >> 8)) >> 8);
+                *c = v.min(255) as u8;
+            }
+            p[3] = 255;
+        }
+    }
+    any
 }
 
 /// Paint a solid rectangle of `color` — used by tests and by the "no
@@ -2035,7 +2118,7 @@ mod tests {
         assert!(took);
         // The lie is at image (20, 15) = device (27, 20).
         let o = (20 * 64 + 27) * 4;
-        assert_eq!(&fast[o..o + 4], &[100, 105, 44, 0], "copied, alpha ignored");
+        assert_eq!(&fast[o..o + 4], &[100, 105, 44, 255], "copied, alpha forced opaque");
         assert_ne!(&plain[o..o + 3], &fast[o..o + 3], "the blend skipped it");
         // Everywhere else (the honest pixels) they agree.
         let mut f = fast.clone();
