@@ -1733,6 +1733,28 @@ Not taken:
 Per-lever detail is in `crates/nitro-video/README.md` §Memory. The
 binary grows by 32 bytes (809 384 B); no crate added.
 
+### #3923: VA-API decode
+
+`nitro-video` decodes on VA-API through FFmpeg's hwaccel and presents
+the VA surfaces as dma-bufs when the server shows them, else in software.
+testhost2, real session, 1080p windowed (forced `--hwdec dmabuf`,
+placeholder paint until #3899):
+
+| 1080p | player CPU | RSS | GEM (`drm-total-system0`) | server CPU | dropped / late |
+|---|---|---|---|---|---|
+| software | 23 % | 70.9 MB | 0 | 47 % | 0 / 33 |
+| vaapi-download | 20 % | 61.9 MB | 22.8 MB | 50 % | 0 / 76 |
+| vaapi-dmabuf | **5 %** | **49.8 MB** | 22.8 MB | 31 % | 0 / 2 |
+
+1440p fullscreen: software 40 % / 136.7 MB, dma-buf 5 % / 54.8 MB RSS
++ 42 MB GEM. With dma-bufs the shm ring (12.2 MB at 1080p) and the
+software DPB leave RSS, but the VA pool (7 surfaces) lives in GEM system
+RAM, so the net memory at 1080p is ≈ 0; the win is CPU. Downloading
+(box1 1080p: player 37 → 23 %, but server `paint_us` 6 → 17 ms and late
+frames 50 → 280) is not used by `auto`. Binary +36 KB (845 KB), no crate
+added. Details and the box1 table: `crates/nitro-video/README.md`
+§Hardware decode.
+
 ## Dependency count
 
 `cargo tree -e normal --prefix none | sort -u | wc -l` = **74** at M4-A

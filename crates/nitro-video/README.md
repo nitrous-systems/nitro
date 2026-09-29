@@ -1,11 +1,13 @@
 # nitro-video
 
-A native video player (#3906): the system **FFmpeg** demuxes and decodes,
-a ring of NV12 shared-memory buffers carries the frames, and a `Surface`
-node shows them, with nitro-ui controls drawn over the video.
+A native video player (#3906): the system **FFmpeg** demuxes and decodes
+(on VA-API when the hardware takes the stream, #3923), NV12 frames reach a
+`Surface` node as shared-memory buffers or as the decoder's own dma-bufs,
+and nitro-ui controls are drawn over the video.
 
 ```
 nitro-video FILE [--fullscreen] [--frames N] [--stats]
+                 [--hwdec auto|dmabuf|download|off] [--vaapi-device PATH]
 nitro-video --synthetic ...        # generated 720p30 stream, no file
 ```
 
@@ -17,10 +19,10 @@ without pointer motion while playing.
 
 | file | role |
 |---|---|
-| `src/shim.c` | the only code that sees FFmpeg: `nv_open/info/seek/next/close` over libavformat + libavcodec, 4:2:0 → NV12 without swscale |
-| `src/ffmpeg.rs` | `LibavDecoder`, the five `extern "C"` calls (the crate's `unsafe` exception, see `DEPENDENCIES.md`) |
-| `src/decode.rs` | the `Decoder` trait, `StreamInfo`, `FrameBuf` (the seam for a VA-API `DmaBuf` variant), `SyntheticDecoder` |
-| `src/player.rs` | decode thread, 4-buffer NV12 ring, pacing against frame callbacks, `PresentSurface`, stats |
+| `src/shim.c` | the only code that sees FFmpeg: `nv_open/info/hw_info/seek/next/next_hw/release/close` over libavformat + libavcodec + libavutil's hwcontext, 4:2:0 → NV12 without swscale |
+| `src/ffmpeg.rs` | `LibavDecoder` and `open` (VA-API first, software fallback), the eight `extern "C"` calls (the crate's `unsafe` exception, see `DEPENDENCIES.md`) |
+| `src/decode.rs` | the `Decoder` trait, `StreamInfo`, `FrameBuf::{Shm, DmaBuf}`, the output policy `choose_output`, `SyntheticDecoder` (with an emulated VA pool for tests) |
+| `src/player.rs` | decode thread, NV12 shm ring or registered dma-bufs, pacing against frame callbacks, `PresentSurface`, stats |
 | `src/pacing.rs` | pure clock + frame picking |
 | `src/controls.rs` | the nitro-ui overlay (`SurfaceView` + play, seek slider, time, fullscreen) |
 | `build.rs` | `pkg-config` + `cc` + `ar` by command, no build crates |
@@ -49,11 +51,147 @@ updates once a second; video frames never touch the widget tree.
 **Colour.** The stream's matrix/range when it states them; otherwise
 BT.709 from 720 lines up, BT.601 below, limited range.
 
+## Hardware decode (#3923)
+
+**Backend.** `ffmpeg::open` tries VA-API first unless `--hwdec off`. The
+shim creates an `AV_HWDEVICE_TYPE_VAAPI` device on the render node
+(`--vaapi-device`, default `/dev/dri/renderD128`), lets libavcodec's
+hwaccel decode into VA surfaces on one thread, and **decodes the first
+frame in `nv_open`**, keeping it pending. Only a frame proves the driver
+takes the stream. It falls back to the software decoder (#3924's thread
+policy) with a reason on stderr and in `--stats` (`fallback="…"`) when:
+
+- there is no device, or it does not open;
+- FFmpeg has no VA hwaccel for the codec;
+- the driver refuses the profile (FFmpeg's `get_format` is then offered
+  no `vaapi` and falls back itself);
+- the surfaces are not NV12 (10-bit HEVC Main10 / VP9 profile 2 → P010).
+
+| box | driver | VA-API | software |
+|---|---|---|---|
+| box1 (Haswell) | i965 | H.264 | HEVC, VP8/9, AV1 |
+| testhost2 (Kaby Lake) | iHD 26.2 | H.264, HEVC Main, VP8, VP9 profile 0 | AV1; 10-bit (P010 is refused, not NV12) |
+
+**Two outputs**, chosen once the window is open (`decode::choose_output`,
+`decode=` in `--stats`):
+
+- `vaapi-dmabuf`: each VA surface is exported with `av_hwframe_map` →
+  DRM PRIME (FFmpeg's separate R8 + GR88 layers are composed into NV12
+  plane 0/1), registered once with `CreateDmabufBuffer`, and presented
+  with `PresentSurface`. There is no copy at all. The export's
+  `vaSyncSurface` makes a frame complete before it is presented, and the
+  server snapshots the buffer's implicit fences at `PresentSurface`, so
+  no `PresentSurfaceFenced` is needed. The frame's `AVFrame` ref is held
+  until `BufferReleased` and then goes back to the decoder's pool.
+- `vaapi-download`: `av_hwframe_transfer_data` into NV12 and then the
+  shm ring, as software does. Decode is off the CPU, the copy is not.
+
+`--hwdec auto` (default) picks dma-bufs only when the server **shows**
+them as they are: the default `DmabufFeedback` lists NV12 with the
+surfaces' modifier as `CPU` (linear), or as `SCANOUT` while the server
+advertises `caps::DIRECT_SCANOUT`. Otherwise it swaps the VA decoder for
+the **software** one before the first frame (the stream is re-opened; a
+seek made meanwhile is replayed), because downloading was measured to
+cost more than it saves (below). `--hwdec dmabuf` takes anything the
+feedback lists as `IMPORT`, and `--hwdec download` always downloads. Both
+check the feedback before sending `CreateDmabufBuffer`, since an unlisted
+pair is a fatal `BadBuffer`, and download otherwise. The player waits up
+to 200 ms for the feedback.
+
+**What the server does with a tiled VA buffer until the planes module
+(#3899).** VA on Intel decodes into Y-tiled NV12
+(`I915_FORMAT_MOD_Y_TILED`), which the server imports and KMS-imports
+(`dmabuf_kms_imported`) but cannot convert on the CPU, so it paints a grey
+placeholder (`dmabuf_placeholder_paints`). `DIRECT_SCANOUT` is off, so
+`auto` decodes in software on both boxes today and switches to VA dma-bufs
+with no player change once #3899 turns the bit on. That switch needs a
+re-check on testhost2 once #3899 lands (VA's Y-tiled NV12 passes AddFB2
+there, #3903). `--hwdec dmabuf` shows the
+placeholder path now, for verification.
+
+**Buffer pool.** FFmpeg's VA pool is dynamic (VA-API ≥ 1), so it grows
+to the decoder's references plus what is in flight; `extra_hw_frames = 4`
+sizes a fixed pool the same way. The decode thread keeps at most `RING`
+(4) surfaces out of the pool: on screen, latched, two ahead. The player
+registers at most 24 dma-bufs (the server allows 32 per client). If
+the decoder cycles through more surfaces than that, the least recently
+used idle one is destroyed and re-registered. Surface keys carry a
+frames-pool generation, so a mid-stream re-init (a VP9/HEVC resolution
+change) never reuses a stale registration; a size change is an error, as
+in software.
+
+### Measurements (#3923)
+
+x264 High / x265 30 fps `testsrc2` clips, `--frames 300 --stats`, CPU =
+(utime + stime) / wall over the first 7–10 s, RSS at 7–10 s.
+
+**testhost2** (i5-8250U, iHD 26.2, FFmpeg 9), real session: a temporary
+`nitro-dev` unit on the deployed server (`76d438e`-era main, eDP
+2560×1440, scale 1.25). `server` is the whole server's CPU; `vaapi-dmabuf`
+is forced (`--hwdec dmabuf`) and paints the grey **placeholder**, so its
+`paint_us` is the placeholder fill, not the picture:
+
+| run | decode | player CPU | RSS | server CPU | `paint_us` mean | presented / dropped / late |
+|---|---|---|---|---|---|---|
+| 720p windowed | software | 13 % | 52.1 MB | 46 % | 6.5 ms | 300 / 0 / 24 |
+| | vaapi-download | 13 % | 51.3 MB | 47 % | 6.6 ms | 300 / 0 / 35 |
+| | vaapi-dmabuf | **5 %** | **45.9 MB** | 31 % | 3.1 ms | 300 / 0 / 0 |
+| 1080p windowed | software | 23 % | 70.9 MB | 47 % | 6.8 ms | 300 / 0 / 33 |
+| | vaapi-download | 20 % | 61.9 MB | 50 % | 10.2 ms | 300 / 0 / 76 |
+| | vaapi-dmabuf | **5 %** | **49.8 MB** | 31 % | 3.2 ms | 300 / 0 / 2 |
+| 1440p fullscreen | software (4 threads) | 40 % | 136.7 MB | 48 % | 6.0 ms | 300 / 0 / 2 |
+| | vaapi-download | 26 % | 77.0 MB | 52 % | 10.2 ms | 300 / 0 / 132 |
+| | vaapi-dmabuf | **5 %** | **54.8 MB** | 31 % | 1.4 ms | 300 / 0 / 0 |
+| HEVC 1080p | auto → download (pre-swap build) | 20 % | 64.0 MB | 50 % | 8.4 ms | 300 / 0 / 68 |
+
+The dma-buf runs registered 7 buffers (`dmabuf_buffers 7`, all
+`dmabuf_kms_imported`), `buffers=7` in `--stats`: the VA pool as FFmpeg
+grew it for x264 (refs + 4 in flight), well under the 24 cap.
+
+**box1** (Pentium G3240, i965 2.4.1: **H.264 only**, FFmpeg 8), the live
+`nitro-dev` session, HDMI 1080p. i965 exports Y-tiled NV12 too, which a
+fake-backend server does not import, and the deployed live server
+predates #3918 (it did not grant `DMABUF`), so only software and download
+compare. The dma-buf path on box1 still needs a re-check after a deploy:
+
+| run | decode | player CPU | RSS | server CPU | `paint_us` mean | late (of 300) |
+|---|---|---|---|---|---|---|
+| 720p | software | 33 % | 56.1 MB | — | 5.6 ms | 1 |
+| | vaapi-download | **16 %** | 59.2 MB | — | 5.9 ms | 1–3 |
+| 1080p | software | 34–37 % | 75.4 MB | 39–41 % | 5.7–6.3 ms | 50–64 |
+| | vaapi-download | **23 %** | 75.0 MB | **56–58 %** | **16.3–17.8 ms** | **272–288** |
+| HEVC 720p | auto → software | 37 % | 65.4 MB | — | 8.2 ms | fallback: "the VA-API driver does not decode this hevc profile" |
+
+0 dropped in every run. **Why `auto` does not download:** the player's
+CPU halves, but the server's full-frame NV12 paint of a downloaded frame
+takes ~3× as long at 1080p on box1 (and ~1.5× on testhost2), with 4–5×
+the late frames. The server did the same work (`perf stat`: 8.3 G vs
+8.4 G instructions), so the extra time is memory stalls. The likeliest
+cause is the downloaded frames themselves: `av_hwframe_transfer_data`
+reads VA's tiled, uncached surface through a mapping, and the copy
+competes with the server's paint for the memory bus on both iGPUs. It is
+not isolated further here. Download is kept as `--hwdec download` for
+measurement.
+
+**Memory.** With dma-bufs the 4-slot NV12 shm ring (12.2 MB at 1080p,
+22 MB at 1440p) is never created, and the software decoder's DPB and
+pools (~24 MB at 1080p) move to VA surfaces: player RSS **−21 MB at
+1080p** (70.9 → 49.8 MB) and **−82 MB at 1440p fullscreen** (136.7 →
+54.8 MB, where software needs frame threads). The surfaces are GEM
+objects in system RAM on these iGPUs, outside RSS but not free: `drm-total-system0`
+in the player's `/proc/<pid>/fdinfo` is **22.8 MB at 1080p** and 42.0 MB at
+1440p. So the net memory saving at 1080p is ≈ 0, and the win is CPU:
+**5 % instead of 23 %** of a core at 1080p, 5 % instead of 40 % at 1440p.
+
+Binary: stripped `nitro-video` 845 KB (was 809 KB, +36 KB), no new crate.
+AV1 (`libdav1d`) has no VA hwaccel in FFmpeg and decodes in software on
+both boxes ("FFmpeg's libdav1d decoder has no VA-API hwaccel").
+
 ## Limitations (v1)
 
 - No audio, so no A/V sync.
 - 8-bit 4:2:0 only (`yuv420p`, `yuvj420p`, `nv12`); others are refused by name.
-- Software decode only; VA-API through FFmpeg's hwaccel is the follow-up.
+- VA-API output is 8-bit NV12 only; 10-bit streams decode in software and are then refused (8-bit 4:2:0 only).
 - Needs `libavformat`/`libavcodec`/`libavutil` (`.so.62`/`.so.60`) at runtime and their `-dev` packages to build.
 
 ## Measurements

@@ -20,7 +20,7 @@ const USAGE: &str = "usage: nitro-video FILE [--fullscreen] [--frames N] [--stat
   --synthetic    a generated 720p30 test stream instead of a file
   --hwdec MODE   VA-API decode: auto (default: VA-API when the hardware
                  takes the stream, dma-bufs when the server shows them
-                 as they are), dmabuf (always present VA surfaces, a
+                 as they are, else software), dmabuf (always present VA surfaces, a
                  tiled one is a placeholder until direct scanout),
                  download (copy frames into shm), off (software)
   --vaapi-device PATH  the render node (default /dev/dri/renderD128)
@@ -119,6 +119,12 @@ fn main() -> ExitCode {
     let player = match Player::new(dec, args.opts) {
         Ok(mut p) => {
             p.set_fallback(fallback);
+            if let Some(f) = args.file.clone().filter(|_| !args.synthetic) {
+                p.set_software(Box::new(move || {
+                    ffmpeg::LibavDecoder::open(&f, decode_threads())
+                        .map(|d| Box::new(d) as Box<dyn Decoder>)
+                }));
+            }
             p
         }
         Err(e) => {
@@ -155,10 +161,11 @@ fn main() -> ExitCode {
     let mut player = player;
     let socket = nitro_ui::introspect::Socket::bind("nitro-video").ok();
     let r = nitro_ui::app::event_loop_with(&mut ui, &mut player, socket);
-    if player.decode_mode() == "vaapi-download"
-        && let Some(why) = player.fallback()
+    if let Some(why) = player.fallback()
+        && player.decode_mode() != "vaapi-dmabuf"
+        && args.stats
     {
-        eprintln!("nitro-video: VA-API frames are downloaded: {why}");
+        eprintln!("nitro-video: {} decode: {why}", player.decode_mode());
     }
     if args.stats {
         eprintln!("{}", player.summary_line());

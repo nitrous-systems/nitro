@@ -82,11 +82,19 @@ mod keys {
     pub const F11: u32 = 87;
 }
 
+/// Opens the software decoder a VA-API one is swapped for; see
+/// [`Player::set_software`].
+pub type SoftwareFactory = Box<dyn FnOnce() -> Result<Box<dyn Decoder>, String> + Send>;
+
 /// Commands to the decode thread.
-#[derive(Debug)]
 enum Cmd {
     /// Start decoding into `output`; `fds` are the shm ring's memfds.
-    Start { output: Output, fds: Vec<OwnedFd> },
+    /// With `software`, first replace the decoder with what it opens.
+    Start {
+        output: Output,
+        fds: Vec<OwnedFd>,
+        software: Option<SoftwareFactory>,
+    },
     /// The buffer is free again.
     Free(FrameBuf),
     /// Restart from the keyframe before `secs`, drop frames before
@@ -183,6 +191,8 @@ pub struct Player {
     fallback: Option<String>,
     /// Waiting for the default `DmabufFeedback` to choose the output.
     awaiting_feedback: bool,
+    /// See [`Player::set_software`].
+    software: Option<SoftwareFactory>,
     /// Per buffer (index = "slot"): the frame buffer it is, its server
     /// id, where it is, and when it was last used (dma-buf eviction).
     keys: Vec<FrameBuf>,
@@ -255,10 +265,33 @@ fn decode_loop(
         dec.seek(secs)
     };
     // Idle until the player has chosen the output; seeks still apply.
+    let mut last_seek = None;
     let (output, fds) = loop {
         match rx.recv() {
-            Ok(Cmd::Start { output, fds }) => break (output, fds),
+            Ok(Cmd::Start {
+                output,
+                fds,
+                software,
+            }) => {
+                if let Some(open) = software {
+                    match open() {
+                        Ok(d) => dec = d,
+                        Err(e) => {
+                            send(Msg::Error(e));
+                            return;
+                        }
+                    }
+                    if let Some(secs) = last_seek
+                        && let Err(e) = dec.seek(secs)
+                    {
+                        send(Msg::Error(e));
+                        return;
+                    }
+                }
+                break (output, fds);
+            }
             Ok(Cmd::Seek { generation: g, secs }) => {
+                last_seek = Some(secs);
                 if let Err(e) = seek(&mut dec, g, secs, &mut generation, &mut skip_before) {
                     send(Msg::Error(e));
                     return;
@@ -390,6 +423,7 @@ impl Player {
             output: None,
             fallback: None,
             awaiting_feedback: false,
+            software: None,
             keys: Vec::new(),
             buffers: Vec::new(),
             slots: Vec::new(),
@@ -449,6 +483,15 @@ impl Player {
     /// the `--stats` line.
     pub fn set_fallback(&mut self, why: Option<String>) {
         self.fallback = why;
+    }
+
+    /// With `--hwdec auto`, a VA-API decoder that cannot present
+    /// dma-bufs the server shows as they are is swapped for what `open`
+    /// makes (software) rather than downloading. Downloading costs the
+    /// server more than it saves the player: measured on both boxes,
+    /// `paint_us` and late frames rose with it (see the README).
+    pub fn set_software(&mut self, open: SoftwareFactory) {
+        self.software = Some(open);
     }
 
     /// Why VA-API is not used, or not with dma-bufs.
@@ -557,6 +600,21 @@ impl Player {
         if why.is_some() {
             self.fallback = why;
         }
+        let software = if output == Output::Shm
+            && self.hw.is_some()
+            && self.opts.hwdec == HwDec::Auto
+            && self.fallback.is_some()
+        {
+            self.software.take()
+        } else {
+            None
+        };
+        if software.is_some() {
+            self.hw = None;
+            if let Some(c) = self.info.codec.strip_suffix(" (vaapi)") {
+                self.info.codec = c.to_owned();
+            }
+        }
         self.output = Some(output);
         let mut theirs = Vec::new();
         if output == Output::Shm {
@@ -600,6 +658,7 @@ impl Player {
         let _ = self.tx.send(Cmd::Start {
             output,
             fds: theirs,
+            software,
         });
     }
 

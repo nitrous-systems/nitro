@@ -249,9 +249,10 @@ fn a_big_pool_is_capped_at_the_registration_limit() {
 
 #[test]
 fn a_tiled_hw_decoder_downloads_while_the_server_cannot_show_it() {
-    // The fake server imports only linear NV12 (no planes): auto and a
-    // forced dmabuf both fall back to download with a reason, and never
-    // send a CreateDmabufBuffer the server would refuse.
+    // The fake server imports only linear NV12 (no planes): auto (with
+    // no software decoder to swap to) and a forced dmabuf both fall back
+    // to download with a reason, and never send a CreateDmabufBuffer the
+    // server would refuse.
     for pref in [HwDec::Auto, HwDec::DmaBuf] {
         let mut b = hw(6, modifier::I915_Y_TILED, pref);
         let h = &mut b.h;
@@ -264,6 +265,28 @@ fn a_tiled_hw_decoder_downloads_while_the_server_cannot_show_it() {
         assert!(why.contains("does not import"), "{why}");
         assert!(p.summary_line().contains("decode=vaapi-download"));
     }
+}
+
+#[test]
+fn auto_swaps_a_tiled_hw_decoder_for_software() {
+    let dec = SyntheticDecoder::with_dmabuf(64, 36, 30, 3000, 6, modifier::I915_Y_TILED)
+        .expect("synthetic hw");
+    let info = dec.info().clone();
+    let mut p = Player::new(Box::new(dec), Opts::default()).expect("player");
+    p.set_software(Box::new(|| {
+        Ok(Box::new(SyntheticDecoder::new(64, 36, 30, 3000)) as Box<dyn Decoder>)
+    }));
+    let wake = rustix::io::dup(p.wake_fd()).expect("dup");
+    let mut h = Harness::sized("nitro-video", p, Size::new(256.0, 144.0), move |ui| {
+        player::install(ui, &info, wake.as_fd())
+    });
+    h.auto_fds(true);
+    assert_eq!(wait_output(&mut h), Output::Shm);
+    wait_presented(&mut h, 5);
+    let p = h.state();
+    assert!(p.error.is_none(), "{:?}", p.error);
+    assert_eq!(p.decode_mode(), "software");
+    assert!(p.fallback().expect("why").contains("does not import"));
 }
 
 #[test]

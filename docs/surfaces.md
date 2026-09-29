@@ -325,7 +325,10 @@ remainder.
 
 Decoding lives in clients (a future `nitro-media` library), not in the
 server. `nitro-video` v1 (#3906) decodes in software through the system
-FFmpeg; VA-API through FFmpeg's hwaccel is next. In general: software (dav1d, openh264) first, **VA-API on Intel**, V4L2 M2M
+FFmpeg, and on VA-API through FFmpeg's hwaccel since #3923, the first
+client dma-buf producer: its VA surfaces are registered with
+`CreateDmabufBuffer` when the feedback says the server shows them, else it
+decodes in software. In general: software (dav1d, openh264) first, **VA-API on Intel**, V4L2 M2M
 on phones, and Vulkan Video on newer desktops.
 
 VA-API is the Intel decode API because neither test box has Vulkan Video:

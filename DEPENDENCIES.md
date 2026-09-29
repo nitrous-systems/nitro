@@ -581,9 +581,14 @@ that `nitro-amp` uses:
   The distribution's `libavcodec` pulls `libswresample` in transitively;
   nitro-video calls nothing in it.
 
-The C boundary is five functions returning integers, doubles and byte
-buffers (`nv_open`/`nv_info`/`nv_seek`/`nv_next`/`nv_close`), so the Rust
-side declares **no FFmpeg struct layout** — those change between majors.
+The C boundary is eight functions returning integers, doubles, byte
+buffers and fds (`nv_open`/`nv_info`/`nv_hw_info`/`nv_seek`/`nv_next`/
+`nv_next_hw`/`nv_release`/`nv_close`), so the Rust side declares **no
+FFmpeg struct layout** — those change between majors. VA-API decode
+(#3923) goes through libavutil's `hwcontext` (`AV_HWDEVICE_TYPE_VAAPI`,
+`av_hwframe_map` to DRM PRIME); `libva`/`libva-drm` come in only
+transitively through libavutil, the shim calls nothing in them, and the
+DRM fourccs it compares are spelled out, so no libdrm header either.
 That is the tree's third `unsafe` exception, below. Footprint: stripped
 `nitro-video` and the mapped libav* size and RSS are in `docs/budget.md`
 § "nitro-video (#3906)".
@@ -711,8 +716,10 @@ needs a DRM or udmabuf exporter, so that half runs on hardware), and
 that quotes them.
 
 **Four, in `nitro-video`** (#3906): `crates/nitro-video/src/ffmpeg.rs`
-carries `#![allow(unsafe_code)]` for the five `extern "C"` calls into
-`src/shim.c` and one `unsafe impl Send`. Each call site has a `SAFETY:`
+carries `#![allow(unsafe_code)]` for the eight `extern "C"` calls into
+`src/shim.c`, `OwnedFd::from_raw_fd` on the dma-buf fds `nv_next_hw`
+dups (`F_DUPFD_CLOEXEC`, owned by nothing else; #3923), and one
+`unsafe impl Send`. Each call site has a `SAFETY:`
 comment. The contract is deliberately narrow: the context pointer comes
 only from `nv_open` and is closed once in `Drop`; every buffer is passed
 with its length and the shim checks `dstlen >= w*h*3/2` before writing;
