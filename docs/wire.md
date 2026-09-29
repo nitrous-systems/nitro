@@ -267,8 +267,9 @@ containing the transaction reached the screen.
 | 13 | `RELEASE` | the server sends `BufferReleased` (M5-A) |
 | 14 | `DATA` | clipboard **and** drag-and-drop; see [Data transfer](#data-transfer-caps-data) (M5-A) |
 | 15 | `OPAQUE_REGION` | `SetOpaqueRegion` — a client may declare an image's opaque pixels (#3877) |
+| 16 | `SURFACE` | shm-backed `Surface` nodes: `CreateSurfaceBuffer`, `SetSurface`, `PresentSurface`, `SurfaceHint` (#3897); see [Surfaces](#surfaces-caps-surface) |
 
-Bits 8–15 together are `caps::CAPS_M5_MASK`, the range
+Bits 8–16 together are `caps::CAPS_M5_MASK`, the range
 [`ClientCaps`](#capability-opt-in-clientcaps) governs.
 
 `DATA` is **one** bit for two features because they are one mechanism: the
@@ -296,6 +297,13 @@ included (harmless there: a remote link has no images to mark). It
 carries no server→client message, but it sits inside `CAPS_M5_MASK` and
 follows rule 3 like `CURSOR`: a `SetOpaqueRegion` from a client that did
 not list it in `ClientCaps` is `Error { Protocol }`.
+
+`SURFACE` (bit 16, #3897) is advertised on every **local** link and
+never on a remote one: every Surface buffer is a descriptor. It follows
+rule 3: a Surface op from a client that did not list it in `ClientCaps`
+is `Error { Protocol }`, and `SurfaceHint` goes only to clients that
+listed it. `DMABUF` (bit 2) is still not advertised; it is the dma-buf
+import that comes later.
 
 `SHELL` is bit 5, not bit 3: bit 3 is `REMOTE` and was taken in M1. It is
 *reported*, never negotiated — a client cannot ask for it. See
@@ -422,7 +430,7 @@ an app because one of its widgets named an icon a newer set has.
 | type | values |
 |---|---|
 | `Layer` | `Background` 0, `Normal` 1, `Top` 2, `Overlay` 3 |
-| `NodeKind` | `Group` 1, `Rect` 2, `Image` 3, `Text` 4, `Surface` 5 *(reserved)*, `Icon` 6 |
+| `NodeKind` | `Group` 1, `Rect` 2, `Image` 3, `Text` 4, `Surface` 5, `Icon` 6 |
 | `ButtonState` | `Released` 0, `Pressed` 1 |
 | `AxisSource` | `Wheel` 0, `Finger` 1, `Continuous` 2, `WheelTilt` 3 |
 | `TouchPhase` | `Down` 0, `Move` 1, `Up` 2, `Cancel` 3 |
@@ -436,11 +444,14 @@ an app because one of its widgets named an icon a newer set has.
 | `KeymapFormat` | `XkbV1` 1 *(M5-A)* |
 | `DataSource` | `Clipboard` 0, `Drag` 1 *(M5-A)* |
 | `OverviewRequest` | `Watch` 0, `Leave` 1, `Enter` 2, `Toggle` 3 *(shell, #3789)*, `Search` 4, `Grid` 5 *(#3790)* |
+| `ColorMatrix` | `Bt601` 0, `Bt709` 1, `Bt2020` 2 *(#3897)* |
+| `ColorRange` | `Limited` 0, `Full` 1 *(#3897)* |
 | `CursorShape` (`u16`) | `None` 0, then `wp_cursor_shape_device_v1` 1–34 — see below *(M5-A)* |
 
 A value outside the list is a decode error, not a silently-ignored
-unknown. `Surface` decodes but is rejected by the server, which
-advertises no `DMABUF` capability. `Text` is **no longer reserved**: the
+unknown. `Surface` is **live since #3897**: the node kind is accepted,
+an empty one paints nothing, and giving it content (`SetSurface`,
+`PresentSurface`) needs `SURFACE`; see [Surfaces](#surfaces-caps-surface). `Text` is **no longer reserved**: the
 node kind is accepted unconditionally and `SetText` always applies. What
 the `TEXT` capability bit reports is whether the server found a font to
 draw with — a client that ignores the bit gets working, well-formed
@@ -578,6 +589,9 @@ Assigned in blocks of 0x100 so a block can grow without renumbering.
 | `0x030a` | `FinishDrag` | data transfer (see `DATA`) |
 | `0x030b` | `SetDragIconOffset` | data transfer (see `DATA`) |
 | `0x030c` | `SetOpaqueRegion` | buffers (needs `OPAQUE_REGION`) |
+| `0x030d` | `CreateSurfaceBuffer` | buffers (needs `SURFACE`) — **carries 1 fd** |
+| `0x030e` | `SetSurface` | buffers (needs `SURFACE`) |
+| `0x030f` | `PresentSurface` | buffers (needs `SURFACE`); **not buffered** |
 | `0x0401` | `SetLayer` | shell (see `SHELL`) |
 | `0x0402` | `SetExclusiveZone` | shell (see `SHELL`) |
 | `0x0403` | `SetAnchor` | shell (see `SHELL`) |
@@ -620,6 +634,7 @@ Assigned in blocks of 0x100 so a block can grow without renumbering.
 | `0x8302` | `TextMeasured` | replies about content |
 | `0x8303` | `IconRefused` | replies about content (see `ICONS`) |
 | `0x8305` | `BufferReleased` | replies about content (see `RELEASE`) |
+| `0x8306` | `SurfaceHint` | replies about content (see `SURFACE`) |
 | `0x8401` | `HotKey` | shell (see `SHELL`) |
 | `0x8402` | `WindowInfo` | shell (see `SHELL`) |
 | `0x8403` | `WindowListEnd` | shell (see `SHELL`) |
@@ -2000,7 +2015,7 @@ The server maps a client's pages and reads them at paint time, so a client
 that redraws into a buffer the server may still read tears.
 
 **The rule.** `BufferReleased` is sent **once** when a buffer stops being
-referenced by any `Image` node — through `SetImage` to another buffer or
+referenced by any `Image` or `Surface` node — through `SetImage` to another buffer or
 `NONE`, `DestroyNode`, or `DestroyWindow` — and is still unreferenced when
 the server has finished processing that wakeup. Painting always reads the
 *current* scene, so from then on the server never reads those pages
@@ -2023,6 +2038,139 @@ frame of latency.
 
 It does **not** release the id: that is still `DestroyBuffer`. It says
 only that the pixels may be overwritten.
+
+Surface frames add one case ([`PresentSurface`](#presentsurface--0x030f)):
+a queued frame that is superseded or cancelled before it was ever latched
+is released at once, in the same wakeup, unless a node shows that buffer.
+
+## Surfaces (caps `SURFACE`)
+
+A `Surface` node shows a video-like buffer: YUV or RGB, with colour
+metadata, updated either through transactions (`SetSurface`, exactly like
+`SetImage`) or through the **vblank latch** (`PresentSurface`), which
+shows the newest ready frame at the next paint opportunity without a
+transaction round trip. v1 (#3897) is the CPU path: the server converts
+and scales the buffer into its shadow with the rasterizer's NV12 / packed
+4:2:2 blits; hardware planes (#3899) and dma-bufs (`DMABUF`) come later
+under the same ops. The design record is `docs/surfaces.md`.
+
+All four ops need `SURFACE` listed in `ClientCaps` (`Error { Protocol }`
+otherwise). On a remote link they are buffer ops: refused non-fatally,
+like `SetImage` (a `SetSurface` naming `NONE` passes).
+
+### `CreateSurfaceBuffer` — 0x030d — **carries 1 fd**
+
+| field | type | meaning |
+|---|---|---|
+| `id` | `BufferId` | allocated by the client; shares the id space with `CreateBuffer` |
+| `width`, `height` | `u32` | pixels |
+| `format` | `u32` | fourcc: `NV12`, `YUYV`, `UYVY`, `XR24` or `AR24` |
+| `size` | `u32` | bytes of the fd the planes live in |
+| `offset0`, `stride0` | `u32` | plane 0: luma (NV12), packed pixels (YUYV/UYVY), RGB pixels |
+| `offset1`, `stride1` | `u32` | plane 1: NV12's interleaved `[u, v]` at half resolution; 0 otherwise |
+
+Fixed head **36 bytes**. The same sealed-memfd rule, the same 32-buffer
+cap and byte caps as `CreateBuffer` (`size` counts against the 128 MiB
+per-buffer cap; the mapped bytes against the per-client and global
+ones). Per format (`BadBuffer` otherwise), with `cw = ⌈w/2⌉`, `ch = ⌈h/2⌉`:
+
+* `NV12`: `stride0 ≥ w`, `stride1 ≥ 2·cw`,
+  `offset0 + stride0·(h−1) + w ≤ size`,
+  `offset1 + stride1·(ch−1) + 2·cw ≤ size`.
+* `YUYV` / `UYVY`: `w` even, `stride0 ≥ 2w`, plane 1 fields 0, plane 0 in `size`.
+  Chroma is co-sited with the even luma column.
+* `XR24` / `AR24`: `stride0 ≥ 4w`, plane 1 fields 0, plane 0 in `size`.
+
+An `XR24`/`AR24` buffer made with plain `CreateBuffer` may also be
+attached to a Surface. A YUV surface buffer given to `SetImage` is
+`BadBuffer` (the image path knows only RGB).
+
+### `SetSurface` — 0x030e
+
+| field | type | meaning |
+|---|---|---|
+| `id` | `NodeId` | the `Surface` node |
+| `buffer` | `BufferId` | `NONE` detaches |
+| `src` | `IRect` | source rectangle in buffer pixels |
+| `matrix` | `ColorMatrix` (`u8`) | YUV → RGB matrix; ignored for RGB |
+| `range` | `ColorRange` (`u8`) | quantisation range; ignored for RGB |
+
+Buffered to the commit, with exactly `SetImage`'s swap/damage contract
+(`BufferDamage` rects in the same commit); a colour change repaints the
+whole node. On a node that is not a Surface: `WrongKind`. It **cancels**
+any frame queued by `PresentSurface` on the node (rule 6 below).
+
+### `PresentSurface` — 0x030f
+
+| field | type | meaning |
+|---|---|---|
+| `id` | `NodeId` | a committed `Surface` node of the sender's |
+| `buffer` | `BufferId` | an existing buffer |
+| `serial` | `u32` | answered with `Presented{serial}`; shares the `Commit` serial space |
+| `src` | `IRect` | source rectangle in buffer pixels |
+| `matrix`, `range` | `u8`, `u8` | as `SetSurface` |
+| `damage` | `vec<IRect>` | changed rects in buffer pixels since this buffer was last shown; empty = all |
+
+**Not buffered**: acted on at receipt, against the committed scene. An
+unknown node is `UnknownNode`, a non-Surface `WrongKind`, an unknown
+buffer or a `src` outside it `BadBuffer` (all fatal, carrying `serial`).
+
+**The latch.** Precisely:
+
+1. **Queue.** The frame is queued on the node, outside the transaction
+   machinery. At most one frame is queued per node. A newer one
+   **supersedes** it: the superseded buffer gets `BufferReleased` at
+   once, in the same wakeup, unless it is the node's current buffer (or
+   the new frame's). A superseded frame never gets a `Presented`: it was
+   **dropped**.
+2. **Latch point.** A queued frame is latched — it becomes the node's
+   current buffer exactly as a committed `SetSurface` would — at the
+   first paint opportunity of its window's output, i.e. when that output
+   has no flip pending. In steady state that is the wakeup right after a
+   vblank (the flip-complete event); on an idle output it is immediate.
+   The newest ready frame wins. For shm, "ready" means "arrived"; with
+   acquire fences (#3900) it will mean the fence has signalled.
+3. **Damage.** The latched frame's damage is the union of the damage of
+   every frame queued since the last latch (an empty list in any of them
+   means the whole node). The swap rule is `SetImage`'s: if the new
+   buffer has the same size and format as the old one, the same `src`
+   and colour, and was shown before (or *is* the current buffer), only
+   those rects repaint; otherwise the whole node.
+4. **Release.** The previously current buffer is released under the
+   ordinary `BufferReleased` rule, once no node references it. It rides
+   the same write as the latch, which is before the new frame's
+   `Presented`.
+5. **Presented.** `Presented{serial}` is sent when the flip carrying the
+   latched frame completes — or at once if the latch painted nothing
+   (off-screen node, a window on no output), the same rule as a commit.
+6. **Transactions.** A committed `SetSurface` on the node cancels its
+   queued frame (the frame's buffer is released, it gets no `Presented`)
+   and wins. `DestroyNode`, `DestroyBuffer` of the queued buffer, or a
+   disconnect drops the queue silently: no release, no `Presented`.
+7. **Tearing contract.** Do not write a buffer between `PresentSurface`
+   and its `BufferReleased`. A ring of three buffers keeps one on
+   screen, one queued and one being drawn.
+
+v1 paints a Surface opaque for `NV12`/`YUYV`/`UYVY`/`XR24` and ignores
+node opacity below 1 for them (translucent video is later work); `AR24`
+blends like an image. The node's device rect is rounded outward to whole
+pixels, and only that rect (or its partial damage) is repainted.
+
+### `SurfaceHint` — 0x8306
+
+| field | type | meaning |
+|---|---|---|
+| `id` | `NodeId` | the `Surface` node |
+| `format` | `u32` | preferred fourcc |
+| `width`, `height` | `u32` | preferred buffer size, device pixels |
+
+Fixed head **16 bytes**. Sent only to clients that listed `SURFACE`: when
+the node first has a non-empty device rect, and again whenever that size
+or the preferred format changes (a `SetBounds`, a scale change, a
+fullscreen). **Advisory**: the server converts and scales whatever it is
+given. On the v1 CPU path the answer is `NV12` at the node's device size;
+the planes work (#3899) is where e.g. `YUYV` at display size on hardware
+that can only scan out packed 4:2:2 will come from.
 
 ## Shell (caps `SHELL`)
 

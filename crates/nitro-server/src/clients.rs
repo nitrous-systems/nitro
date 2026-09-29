@@ -905,7 +905,19 @@ fn apply_msg(
             let image = if m.buffer.is_none() {
                 None
             } else {
-                Some(ImageRef::new(buffer_key(client, m.buffer)?, m.src))
+                let key = buffer_key(client, m.buffer)?;
+                // The image path is RGB only; a YUV surface buffer is not
+                // an image (#3897).
+                if scene
+                    .buffer(key)
+                    .is_ok_and(|b| !matches!(b.desc().format, format::XR24 | format::AR24))
+                {
+                    return Err(ApplyError::new(
+                        ErrorCode::BadBuffer,
+                        "SetImage: a YUV surface buffer cannot back an Image",
+                    ));
+                }
+                Some(ImageRef::new(key, m.src))
             };
             scene
                 .set_image(client.id, key, image)
