@@ -56,3 +56,11 @@ spring-scales its windows, and every one of those is a GPU compositor
 effect nitro drops. The pattern generalises — what nitro copies from
 another desktop is its *arrangement*, and what it declines is whatever
 that desktop's compositor draws for free.
+
+**Hardware capability measurements**:
+
+* [`gpu-testbox.md`](gpu-testbox.md) — Vulkan (hasvk / anv), EGL/GLES,
+  VA-API, KMS plane formats and Chromium's GPU path on the two test boxes
+  (Haswell GT1, Kaby Lake R), measured in #3903, with the reference probe
+  sources in [`gpu-testbox/`](gpu-testbox/). Summarised in
+  `docs/surfaces.md`.

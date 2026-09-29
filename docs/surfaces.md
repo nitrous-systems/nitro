@@ -78,6 +78,14 @@ plane above it. On the Haswell test box that works only for RGB video: its
 primary lists no YUV format, so YUV Surfaces there can only be overlays
 *above* the UI (measured, #3895; see "Plane counts").
 
+The module is **driven by each plane's `IN_FORMATS`** (formats ×
+modifiers) and never by assumptions about the hardware. The two test boxes
+differ exactly where it matters (#3903): Kaby Lake scans out VA's Y-tiled
+NV12 on its primary and sprite planes, while Haswell's sprite takes only
+packed 4:2:2 (YUYV family) or XRGB, LINEAR/X_TILED, and refuses NV12 at
+AddFB2. On Haswell a video Surface therefore reaches a plane only as
+YUYV/UYVY or as helper-converted XRGB.
+
 - Candidate configurations are validated with **`TEST_ONLY` atomic
   commits** — advertised capability is not the truth, the kernel's answer
   is.
@@ -134,9 +142,13 @@ loaded at all; that is what makes (b) available on the same machines as
 
 A **separate process**, started with the session and **running by default**.
 The first Surface that needs compositing (say, opening a video window)
-must not pay process start plus Vulkan device creation, which costs
-~50–200 ms (**estimate**, not measured) and would show up as a visibly
-late first frame. **On-demand spawn with idle exit** is an optional config
+must not pay process start plus Vulkan device creation, which would show
+up as a visibly late first frame. Measured in #3903: with the vendor ICD
+only, instance + device + first submit take ~10–16 ms warm; cold with the
+default ICD set, instance creation alone takes 169 ms on the test box.
+Cold start with a restricted ICD set, pipeline creation and shader-cache
+misses together are **estimated** at 50–200 ms, which is not measured.
+**On-demand spawn with idle exit** is an optional config
 for memory-tight devices (phones, kiosks): they accept that first-frame
 delay to save the helper's steady memory (see [Budget](#budget)).
 
@@ -158,9 +170,26 @@ pass of textured quads** (YUV→RGB, scaling) and replies immediately with a
 the GPU**. Planes still take whatever fits; the helper only handles the
 remainder.
 
-- API: Vulkan via `ash` with `libvulkan` dlopen'd, preferred over
-  GLES/EGL/GBM. `wgpu` is rejected on dependency count. Whether Vulkan
-  is good enough on Haswell (the test box) is open until #3903.
+- API: **Vulkan** via `ash` with `libvulkan` dlopen'd. There is no
+  GLES/EGL backend, and `wgpu` is rejected on dependency count. Measured
+  in #3903 ([`research/gpu-testbox.md`](research/gpu-testbox.md)): the
+  helper minimum (dma-buf import with modifiers, SYNC_FD semaphore
+  export/import, NV12 sampling via `VkSamplerYcbcrConversion`, a render
+  pass into an exported scanout-capable image) is **met on both test
+  boxes**, Haswell `hasvk` and Kaby Lake `anv`. hasvk is non-conformant,
+  so the helper keeps to that verified narrow slice. KBL/anv is the
+  development target. Cost to first submit is **8–11 MB RSS / 7–8 MB
+  PSS** (9–12 MB PSS for the full NV12 chain), against 41–67 MB RSS /
+  38–65 MB PSS for EGL/GLES (crocus/iris). Instance + device take about
+  8 ms warm.
+- **ICD restriction is mandatory.** The helper picks the vendor ICD
+  from the render node's kernel driver (`VK_LOADER_DRIVERS_SELECT` /
+  `VK_DRIVER_FILES`, or dlopen the ICD). With default discovery,
+  llvmpipe maps libLLVM and the instance alone costs 59 MB PSS on the
+  test box (measured).
+- The render target's modifier list is the target plane's `IN_FORMATS`
+  modifiers (X_TILED/LINEAR on Haswell), so the output stays
+  scanout-capable.
 - The CPU rasterizer remains **the only renderer of nitro content**. The
   GPU only combines finished buffers.
 - It is needed mainly for overlapping GPU windows from different clients
@@ -170,8 +199,16 @@ remainder.
 ## Video decode belongs to clients
 
 Decoding lives in clients (a future `nitro-media` library), not in the
-server: software (dav1d, openh264) first, V4L2 M2M on phones, Vulkan Video
-on desktops.
+server: software (dav1d, openh264) first, **VA-API on Intel**, V4L2 M2M
+on phones, and Vulkan Video on newer desktops.
+
+VA-API is the Intel decode API because neither test box has Vulkan Video:
+anv has none on Gen9 and hasvk has none at all (measured, #3903). The
+test box (i965) decodes H.264, MPEG-2 and VC-1; KBL (iHD) adds VP8, VP9
+and HEVC. AV1 is software on both. A 1080p30 H.264 decode costs ≈5% of one
+core with VA-API, against ≈60% in software, on the test box. VA exports
+NV12 as a Y-tiled DRM_PRIME_2 dma-buf, which the helper imports directly.
+KBL's planes scan it out; Haswell's cannot (see "Per-output modes").
 
 Decode usually runs on fixed-function blocks, not the 3D engine. GPU
 compositing wakes the 3D engine and costs power — another reason planes
@@ -198,12 +235,13 @@ RSS) and is budgeted like dumb buffers.
 ## Budget
 
 Steady costs this design adds, to be carried into [`budget.md`](budget.md)
-once measured. Every figure below is an **estimate**; none is measured yet.
+once measured. Every figure below is an **estimate** unless marked
+**measured**.
 
 | item | when paid | cost |
 |---|---|---|
 | overview thumbnail atlas | always (allocated at startup) | ~8 MB at 1080p (1920 × 1080 × 4) |
-| `nitro-gpu` helper, process RSS | always, by default (on-demand config: only while compositing) | unmeasured; measure in #3901 |
+| `nitro-gpu` helper, process RSS | always, by default (on-demand config: only while compositing) | **measured** with the #3903 probe (no helper yet), vendor ICD only, start → first submit: +8.7 MB RSS / +6.6 MB PSS (HSW), +10.9 / +8.4 MB (KBL); the full NV12 chain adds +9.4 / +12.3 MB PSS. Confirm with the real helper in #3901 |
 | `nitro-gpu` helper, driver memory (Vulkan instance/device, command pools, pipelines; system RAM on iGPUs, not counted in RSS) | same | unmeasured; measure in #3901 |
 | server-allocated NV12 dumb buffers | per plane-placed Surface | 1.5 bytes/px × buffer count (~3 MB per 1080p buffer) |
 
@@ -221,6 +259,7 @@ results are in [`crates/nitro-kms/README.md`](../crates/nitro-kms/README.md#plan
 | hardware | planes per CRTC (measured) |
 |---|---|
 | Intel Haswell GT1 (test box) | primary + **1 overlay** + cursor, all fixed zpos (0/1/2). Overlay: packed YUV 4:2:2 (YUYV…) and XRGB, **no NV12** (refused at AddFB2), **no ARGB**, no scaling accepted with linear buffers. The primary must cover the CRTC and cannot scale. |
+| Intel Kaby Lake R, UHD 620 (testhost2, #3903) | 2 NV12-capable planes per pipe (primary + sprite): NV12, XYUV, YUYV family, AR24; pipe C has no NV12. VA's Y-tiled NV12 passes AddFB2. |
 
 For comparison, **from memory, unverified**:
 
@@ -243,8 +282,9 @@ In order; tasks carry the `surface` tag on the task board.
 3. Surface v1: shm `Surface` node, CPU path, vblank latch, colour
    metadata, test client — #3897.
 4. ARGB shadow buffer + hole primitive — #3898.
-5. `planes` module: underlay / overlay / direct scanout, with
-   server-allocated dumb NV12 buffers — #3899.
+5. `planes` module: underlay / overlay / direct scanout, driven by
+   `IN_FORMATS`, with server-allocated dumb buffers in a format the
+   plane accepts (NV12 on Gen9+, YUYV on Haswell) — #3899.
 6. Client dma-buf import + fences + format feedback (`DMABUF` cap) —
    #3900.
 7. Overview thumbnail atlas — #3902.
@@ -252,8 +292,10 @@ In order; tasks carry the `surface` tag on the task board.
 
 Alongside, and feeding into the items above:
 
-- Test-box GPU/media capability spike: settles Vulkan vs GLES on Haswell
-  and the decode API — #3903.
+- Test-box GPU/media capability spike — #3903, done. Outcome: the Vulkan
+  helper minimum is met on both boxes, ICD restriction is mandatory, and
+  VA-API is the Intel decode API
+  ([`research/gpu-testbox.md`](research/gpu-testbox.md)).
 - Cross-client Surface sharing for Chromium's out-of-process GPU — #3904.
 - Chromium Ozone GPU rendering — #3905.
 - `nitro-video` player — #3906.
