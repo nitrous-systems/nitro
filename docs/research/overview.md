@@ -495,6 +495,16 @@ than built speculatively.
 > only a 200 ms ease-out-quad fade-in of the unscaled badges, stepped from
 > `on_flip`. The scrim and the slots snap. See `docs/wm.md` §Overview mode.
 
+> **Update (task #3902).** The cache now exists. It is one output-sized
+> thumbnail atlas per output, allocated when the output appears, and a
+> thumbnail is re-rendered into it only when that window is damaged. The
+> render uses `Canvas::blit_xrgb_scaled` and measures 0.7–2.2 ms per
+> thumbnail, depending on slot size (release, FakeBackend 1920×1080). Every
+> overview frame then shows 1:1 image nodes. The entry's scrim fade, badge
+> fade and slide cost 3.3–4.0 ms per frame with 4–16 thumbnails, not ~17 ms.
+> The whole output repaints each frame, because the scrim fades. A scale
+> (zoom) animation stays out. See `docs/wm.md` §The thumbnail atlas.
+
 **Multi-output**: the overview is per-output, like the MRU list and the z-order
 (`docs/wm.md` §Multi-output), and the layout's `area` is the **work area** — the
 output rect with the bar's exclusive zone subtracted, via

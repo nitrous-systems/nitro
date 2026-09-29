@@ -955,51 +955,107 @@ nothing: a scale change damages old ∪ new once, and the next update
 produces empty damage. A settled 16-window overview with one animating
 client costs about 1 ms.
 
-So, **without a downscale cache, nothing over the grid animates.** The
-0.37 ms/frame figure (`docs/research/overview.md` §7.2) is the *cached*
-row: 16 thumbnails blitted 1:1 from a pre-scaled copy. Today a thumbnail
-is the live buffer under `scale(k)`, and a repaint of any part of it goes
-through the scaled path. Flooring the slots doesn't help, because
-`one_to_one` also needs the scale to be 1. A scrim fade damages the whole
-output every frame, and a position interpolation damages old ∪ new for
-every thumbnail every frame. Both are the ~17 ms case. The scale itself is
-set once, on enter and on leave, and so is the position. Entering and
-leaving **snap**.
+So a naive overview could not animate anything over the grid: the scrim
+fade damages the whole output every frame and a slide damages old ∪ new
+for every thumbnail, and each is the ~17 ms case. **The thumbnail atlas
+(#3902) is the downscale cache that removes the cliff.**
 
-What does animate is the **badges**. On entry each thumbnail's icon
-fades in from opacity 0 over 200 ms, with ease-out-quad
-(`overview::BADGE_FADE_NS`, `overview::badge_opacity`; GNOME's
-`WINDOW_OVERLAY_FADE_TIME`). The badges are unscaled, and an opacity change
-damages only their rects. The fade is **driven by vblank, not a timer**:
-`on_flip` calls `Server::step_overview_fade`, which damages the badges,
-which paints and flips, which steps again. The last step sets exactly 1.0
-and clears `Overview::fade_start_ns`, so the desktop then goes quiet with
-nothing left armed (`overview_fading` in `stats`). A relayout (a window
-mapping or closing) re-badges at full opacity rather than re-flashing
-every badge, and leaving is instant. An overview with no badges (no
-windows) starts no fade, since a step that changes nothing would flip
-nothing and never finish. With no flips (an inactive output, or
-the VT switched away) the fade waits, then snaps to 1.0 on the next flip.
+#### The thumbnail atlas
 
-Measured cost of one fade frame (release, FakeBackend, 1920x1080, 800x600
-windows): **0.26 ms** with 4 thumbnails and **0.73 ms** with 8. With 16 it
-was **3.7 ms** while overflow collapsed the region to a bounding box:
-sixteen badges were 32 damage rects (icon and caption pill, before the
-pill went in #3876), which overflows
-`Damage::MAX_RECTS` (16), and the whole region became one 1407x396 box
-over two rows of scaled thumbnails. Overflow now merges the pair whose
-union wastes the least area, so each badge's icon and pill pair up into
-16 rects (~126k px), and the frame costs about the 1.5 ms measured with a
-cap of 32. The cost holds for the ~12 frames of the fade and is well
-inside a 60 Hz frame.
+Each output owns one **atlas**: an opaque XR24 scene buffer the size of the
+output, in the output's own device coordinates (`overview::Atlas`). It is
+allocated, and pre-faulted by an explicit zero fill, **when the output
+appears** (and again on a mode change), and freed with the output.
+**Pressing Super allocates nothing** that scales with the window count
+(`tests/wm.rs::pressing_super_allocates_no_buffer`, which also covers a
+relayout). The atlas costs `w·h·4` bytes per output (8 294 400 at 1080p;
+`docs/budget.md` §Overview thumbnail atlas), and `stats` reports it as
+`overview_atlas` and `overview_atlas_bytes`.
 
-Anything that later wants the scrim fade, slot motion or a scale animation
-must first add a downscale cache in `nitro-raster`. It was measured at
-1.04 ms per thumbnail, paid on change, and turns the 17.3 ms per-frame
-cost into 0.37 ms. **This is the easiest regression in the tree to
-reintroduce by accident**, so overview mode carries a test asserting that
-a settled overview produces no damage, and another asserting that a
-badge fade damages only the badges and then goes quiet.
+A thumbnail's atlas pixels are its slot's device rect
+(`overview::slot_device_rect`). Slots never overlap and all lie inside the
+work area, so there is no packing. In atlas mode:
+
+* **The live windows are offscreen.** They are still scaled onto their
+  slots exactly as in the snap path (`apply_thumb`), but
+  `Scene::set_offscreen` takes them out of `paint_list` and `hit_test`.
+  The scene reports their damage per window
+  (`UpdateResult::offscreen`) instead of on the output. No translation
+  hint comes from inside them.
+* **Rendering is damage-driven.** `Server::update_scene` takes the
+  offscreen damage, intersects it with the slot, and re-renders just
+  that part into the atlas (`overview::render_thumb`). It draws the
+  background gradient and the scrim colour, then the window's
+  `Scene::paint_window` items through `frame::paint_items` with the fast
+  scaled path (`Canvas::blit_xrgb_scaled`, ~4 ns/px). One more scene pass
+  then carries the atlas images' damage to the output. Every thumbnail is
+  rendered once right after entry. After that, a client commit to one
+  thumbnail costs one render of its damaged part, and the flip that shows
+  it acknowledges the commit (`Presented`) as usual
+  (`tests/wm.rs::a_thumbnail_commit_re_renders_just_its_slot_and_is_presented`).
+  `stats`: `thumb_renders`, `thumb_render_us`.
+* **The output shows 1:1 copies.** Each thumbnail is an `Image` node in
+  the scrim sampling its slot of the atlas at device scale 1, so every
+  frame takes the rasterizer's copy path (~0.2 ns/px). **Every badge is
+  also in the scrim** in atlas mode, after the images so that it draws
+  on top of them. A badge hung off an offscreen frame root would not
+  paint.
+* **The entry animates.** One clock (`overview::enter_progress`, the
+  badges' ease-out-quad over `BADGE_FADE_NS`, 200 ms) drives three
+  things: the badges' fade, the scrim's fade (`set_scrim_opacity`), and
+  each image and badge sliding from where its window was
+  (the thumbnail centred on the pre-overview frame; a minimized window
+  starts on its slot) to its slot (`place_thumb_images`). Positions land
+  on whole device pixels, so each image stays a 1:1 copy at every step,
+  and no animation frame re-downscales anything. The step is vblank-driven
+  like the badge fade was (`Server::step_overview_fade`). The last step
+  sets exact final values and clears the stamp, so the desktop goes
+  quiet afterwards. A relayout does not animate, and leaving is instant.
+  There is no scale (zoom) animation: the size is the slot's throughout.
+* **Snap fallback.** With `NITRO_OVERVIEW_ATLAS=0`
+  (`Config::overview_atlas`), or when the allocation failed, the output
+  has no atlas. Overview then does exactly what it did before #3902: the
+  live windows are scaled in place, only the badges fade, and the scrim
+  and slots snap. `overview_atlas` reads 0.
+
+Known, accepted differences from the snap path:
+
+* The atlas backdrop is the server gradient plus the **settled** scrim.
+  The rounded frame corners, and anything a translucent window lets
+  through, therefore show that backdrop: not the wallpaper window, and
+  during the fade a scrim 1–2 px off at the corners for 200 ms. Sampling
+  the output's paint list for the backdrop would be circular, since the
+  atlas images are in it.
+* The fast scaled path rounds the destination to whole pixels. Inside a
+  slot, atlas and snap pixels agree within ±2 per channel, away from the
+  corner radius (`tests/wm.rs::atlas_thumbnails_match_the_snapped_ones`).
+* Surface windows need nothing extra. `render_thumb` paints through
+  `frame::paint_items`, the same `paint_item` as the output, so a CPU
+  Surface (#3897, `blit_nv12`/`blit_xrgb_scaled`) is rendered into the
+  atlas by the same code.
+
+Measured (release, FakeBackend, 1920x1080, 900x650 XR24 image windows):
+
+| thumbnails | render, per thumbnail | entry-animation frame `paint_us` |
+|---|---|---|
+| 4 | 2.2 ms (≈560x405 slots) | 3.3–3.8 ms |
+| 8 | 1.2 ms | 1.6–4.0 ms |
+| 16 | 0.70 ms | 3.8–4.0 ms |
+
+Each render includes the backdrop fill and the fast scaled blit of the
+whole slot, and it is paid once on entry and then only on a thumbnail's
+own damage. An animation frame repaints the whole output, because the
+scrim fades, but only through fills, 1:1 copies and the badges: about
+4 ms against the 17 ms of the scaled grid, and inside a 60 Hz frame.
+
+**The guards.** A scaled blit on the output is the easiest regression in
+the tree to reintroduce by accident, so overview mode carries several
+tests. `overview::scene_tests::
+in_atlas_mode_the_output_paints_no_scaled_image_at_any_step` asserts that
+no `Image` item on the output fails `shift_exact`, on entry and at every
+step of the animation. Other tests assert that a settled overview
+produces no damage, and that the snap path's badge fade damages only the
+badges and then goes quiet.
 
 ### Two hazards of the scaled transform
 
@@ -1138,8 +1194,9 @@ entering on another output leaves the first.
   un-hid set. A fresh enter always starts with the grid shown. Hiding
   touches neither focus nor `showing` (both look at the content node and
   state, not the root). It is **instant**, not GNOME's 250 ms
-  `EASE_OUT_QUAD` cross-fade: an opacity ramp over the scaled grid is the
-  ~17 ms/frame case above (see §What is deferred). `stats` reports
+  `EASE_OUT_QUAD` cross-fade (see §What is deferred). In atlas mode it
+  toggles each thumbnail's image and badge instead of the window roots,
+  which are offscreen anyway. `stats` reports
   `overview_grid_hidden`.
 
 The search UI stays in `nitro-launcher` as an `Overlay` client — the seam
@@ -1516,18 +1573,15 @@ and a drag-and-drop is not started during a window drag.
   second set to switch between. GNOME's overview carries a workspace strip
   and a rounded workspace-background card; nitro's has neither, and
   adding workspaces later would add a strip rather than rework the grid.
-* **Overview scrim fade and slot animation.** Only the badges fade in.
-  The scrim appears at once and the windows snap to their slots, on
-  measured grounds (§Overview mode): without a downscale cache in
-  `nitro-raster`, any per-frame damage over the scaled grid (a scrim fade,
-  position interpolation, a scale animation) costs ~17 ms a frame. The
-  lever is recorded with its numbers (1.04 ms per thumbnail on change;
-  17.3 → 0.37 ms/frame) so nobody re-measures it.
+* **Overview scale (zoom) and leave animations.** The thumbnail atlas
+  (#3902) animates the entry: the scrim fade, the badges and the slide.
+  A zoom needs a scaled blit per frame, so it waits for a GPU helper.
+  Leaving is instant.
 * **The search/grid cross-fade.** GNOME cross-fades the grid and the
   search results over 250 ms (`SIDE_CONTROLS_ANIMATION_TIME`,
-  `EASE_OUT_QUAD`). nitro's `Search`/`Grid` switch is instant, for the
-  same reason as the scrim fade: a thumbnail opacity ramp is per-frame
-  damage over the scaled grid. It comes with the downscale cache.
+  `EASE_OUT_QUAD`). nitro's `Search`/`Grid` switch is instant. With the
+  atlas this is now affordable: it is an opacity ramp over 1:1 image
+  nodes, the same cost as the entry fade. It is a follow-up.
 * **Cursor *themes*.** The shapes (six in M4, seventeen since M5-E) are
   compiled-in ASCII art (§Cursor shapes); loading an XCursor theme off
   the box — a file format, a search path and a fallback policy — is not

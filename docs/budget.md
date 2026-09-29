@@ -1043,7 +1043,7 @@ allocated a megabyte" from "we linked another library", and the biggest
 single term in it is a hardware constant. The replacement:
 
 > **Server: `RssAnon` ≤ 2.5 MB + 100 kB per decorated window, plus one
-> scanout-sized shadow buffer per output. `RssFile` ≤ 7.5 MB, and is not
+> scanout-sized shadow buffer and one thumbnail atlas per output. `RssFile` ≤ 7.5 MB, and is not
 > a per-window cost.**
 
 Measured against the box today (`NITRO_SHADOW=0`, glibc as it actually
@@ -1099,6 +1099,21 @@ GPU-owned dumb buffers outside RSS. `nitro-demo` on the fake backend draws
 no text, so no font file is ever loaded on this row — which is why the two
 machines no longer differ by what they happen to have installed. The box
 row is the one to quote; it is the one with a budget attached.
+
+## Overview thumbnail atlas (#3902)
+
+Each output owns one opaque XR24 buffer of its own device size, the
+overview's thumbnail atlas: `w × h × 4` bytes, **8 294 400** at 1080p. It
+is allocated when the output appears (and again on a mode change), and an
+explicit zero fill pre-faults it, so the RSS is paid at startup and never
+on a Super press. Nothing on the overview path allocates a buffer that
+scales with window count. The only per-thumbnail additions are two
+scene nodes (an image and a badge group), and only while in overview.
+`stats` reports it as `overview_atlas_bytes`.
+
+`NITRO_OVERVIEW_ATLAS=0` gives the memory back. Overview then snaps with
+a direct repaint, as it did before #3902. A failed allocation falls back
+the same way. Design: `docs/wm.md` §The thumbnail atlas.
 
 ## First frame on the wire
 

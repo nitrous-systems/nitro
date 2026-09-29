@@ -233,8 +233,8 @@ memcpy), so N feeds cost one plane. Later work.
 
 **Pressing Super must allocate nothing.** Thumbnails of all windows
 together fit on one output, so the thumbnail cache is **one fixed,
-output-sized atlas** — ~8 MB at 1080p (**estimate**: 1920 × 1080 × 4 bytes),
-allocated once at startup and counted in the budget
+output-sized atlas** — 8 294 400 bytes at 1080p (1920 × 1080 × 4; built in #3902),
+allocated once, when the output appears, and counted in the budget
 ([`budget.md`](budget.md)). If it is unavailable the overview snaps
 instead of animating.
 
@@ -251,7 +251,7 @@ once measured. Every figure below is an **estimate** unless marked
 
 | item | when paid | cost |
 |---|---|---|
-| overview thumbnail atlas | always (allocated at startup) | ~8 MB at 1080p (1920 × 1080 × 4) |
+| overview thumbnail atlas | always (allocated when the output appears, pre-faulted) | **measured** (#3902): exactly `w × h × 4` = 8 294 400 bytes at 1080p (`stats overview_atlas_bytes`) |
 | `nitro-gpu` helper, process RSS | always, by default (on-demand config: only while compositing) | **measured** with the #3903 probe (no helper yet), vendor ICD only, start → first submit: +8.7 MB RSS / +6.6 MB PSS (HSW), +10.9 / +8.4 MB (KBL); the full NV12 chain adds +9.4 / +12.3 MB PSS. Confirm with the real helper in #3901 |
 | `nitro-gpu` helper, driver memory (Vulkan instance/device, command pools, pipelines; system RAM on iGPUs, not counted in RSS) | same | unmeasured; measure in #3901 |
 | server-allocated NV12 dumb buffers | per plane-placed Surface | 1.5 bytes/px × buffer count (~3 MB per 1080p buffer) |
