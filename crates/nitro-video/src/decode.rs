@@ -181,7 +181,9 @@ impl HwDec {
             "dmabuf" | "vaapi-dmabuf" => Ok(Self::DmaBuf),
             "download" | "vaapi-download" => Ok(Self::Download),
             "off" | "software" | "no" => Ok(Self::Off),
-            _ => Err(format!("--hwdec: {s:?} is not auto, dmabuf, download or off")),
+            _ => Err(format!(
+                "--hwdec: {s:?} is not auto, dmabuf, download or off"
+            )),
         }
     }
 }
@@ -493,7 +495,11 @@ impl Decoder for SyntheticDecoder {
     }
 
     fn release(&mut self, key: u32) {
-        if let Some(h) = self.hw.as_mut().and_then(|hw| hw.held.get_mut(key as usize)) {
+        if let Some(h) = self
+            .hw
+            .as_mut()
+            .and_then(|hw| hw.held.get_mut(key as usize))
+        {
             *h = false;
         }
     }
@@ -534,7 +540,10 @@ mod tests {
         assert_eq!(a.desc.planes[1].offset, 8);
         assert_ne!(a.key, b.key);
         assert_eq!(d.held(), 2);
-        assert!(d.next_dmabuf().is_err(), "a third frame with both surfaces held");
+        assert!(
+            d.next_dmabuf().is_err(),
+            "a third frame with both surfaces held"
+        );
         d.release(a.key);
         let c = d.next_dmabuf().unwrap().unwrap();
         assert_eq!(c.key, a.key);
@@ -570,8 +579,14 @@ mod tests {
         assert_eq!(go(HwDec::Auto, Some(y), false, Some(&fb)), Output::Shm);
         assert_eq!(go(HwDec::Auto, Some(y), true, Some(&fb)), Output::DmaBuf);
         assert_eq!(go(HwDec::DmaBuf, Some(y), false, Some(&fb)), Output::DmaBuf);
-        assert_eq!(go(HwDec::DmaBuf, Some(y), false, Some(&fb[..1])), Output::Shm);
-        assert_eq!(go(HwDec::Download, Some(lin), false, Some(&fb)), Output::Shm);
+        assert_eq!(
+            go(HwDec::DmaBuf, Some(y), false, Some(&fb[..1])),
+            Output::Shm
+        );
+        assert_eq!(
+            go(HwDec::Download, Some(lin), false, Some(&fb)),
+            Output::Shm
+        );
         assert_eq!(go(HwDec::Auto, Some(lin), false, None), Output::Shm);
         let big = HwInfo { pool: 30, ..lin };
         assert_eq!(go(HwDec::Auto, Some(big), false, Some(&fb)), Output::Shm);

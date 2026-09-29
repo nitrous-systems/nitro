@@ -290,7 +290,10 @@ fn decode_loop(
                 }
                 break (output, fds);
             }
-            Ok(Cmd::Seek { generation: g, secs }) => {
+            Ok(Cmd::Seek {
+                generation: g,
+                secs,
+            }) => {
                 last_seek = Some(secs);
                 if let Err(e) = seek(&mut dec, g, secs, &mut generation, &mut skip_before) {
                     send(Msg::Error(e));
@@ -338,7 +341,10 @@ fn decode_loop(
                 held = held.saturating_sub(1);
             }
             Some(Cmd::Start { .. }) => {}
-            Some(Cmd::Seek { generation: g, secs }) => {
+            Some(Cmd::Seek {
+                generation: g,
+                secs,
+            }) => {
                 eof = false;
                 if let Err(e) = seek(&mut dec, g, secs, &mut generation, &mut skip_before) {
                     send(Msg::Error(e));
@@ -347,9 +353,8 @@ fn decode_loop(
             }
             None => {
                 let r = if dma {
-                    dec.next_dmabuf().map(|f| {
-                        f.map(|f| (f.pts_us, FrameBuf::DmaBuf(f.key), Some(f.desc)))
-                    })
+                    dec.next_dmabuf()
+                        .map(|f| f.map(|f| (f.pts_us, FrameBuf::DmaBuf(f.key), Some(f.desc))))
                 } else {
                     let slot = free[free.len() - 1];
                     dec.next_frame(maps[slot].as_bytes_mut(), layout)
@@ -568,7 +573,9 @@ impl Player {
             && ui.has_dmabuf();
         if may_dma && ui.dmabuf_feedback(NodeId::NONE).is_none() {
             self.awaiting_feedback = true;
-            ui.set_timer(FEEDBACK_WAIT_MS, |p: &mut Self, ui: &mut Ui<Self>| p.begin(ui));
+            ui.set_timer(FEEDBACK_WAIT_MS, |p: &mut Self, ui: &mut Ui<Self>| {
+                p.begin(ui)
+            });
         } else {
             self.begin(ui);
         }
@@ -713,7 +720,8 @@ impl Player {
         .map_err(|e| format!("registering a dma-buf: {e}"))?;
         // The destroy and the create land at this commit, before any
         // PresentSurface names the new id.
-        ui.flush().map_err(|e| format!("registering a dma-buf: {e}"))?;
+        ui.flush()
+            .map_err(|e| format!("registering a dma-buf: {e}"))?;
         self.buffers[slot] = id;
         Ok(slot)
     }

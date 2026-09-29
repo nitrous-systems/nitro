@@ -188,7 +188,11 @@ fn dmabuf_feedback_arrives_and_a_linear_dmabuf_presents() {
             .events
             .contains(&SurfaceEvent::Feedback { node: NodeId::NONE })
     });
-    let fb = h.ui().dmabuf_feedback(NodeId::NONE).expect("stored").clone();
+    let fb = h
+        .ui()
+        .dmabuf_feedback(NodeId::NONE)
+        .expect("stored")
+        .clone();
     let nv12 = fb
         .formats
         .iter()

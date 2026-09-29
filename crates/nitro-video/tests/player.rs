@@ -338,7 +338,9 @@ fn vaapi_decodes_the_clip_like_software_when_present() {
     let mut pts = Vec::new();
     // Download half, dma-buf the rest: both come out in pts order.
     while pts.len() < 15 {
-        let Some(p) = hw.next_frame(&mut buf, l).expect("download") else { break };
+        let Some(p) = hw.next_frame(&mut buf, l).expect("download") else {
+            break;
+        };
         pts.push(p);
     }
     while let Some(f) = hw.next_dmabuf().expect("dmabuf") {

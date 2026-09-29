@@ -216,7 +216,9 @@ impl LibavDecoder {
             .map(|d| CString::new(d).map_err(|_| HwError::Unsupported("bad device path".into())))
             .transpose()?;
         if !path.exists() {
-            return Err(HwError::Fatal(format!("{name}: cannot open: No such file or directory")));
+            return Err(HwError::Fatal(format!(
+                "{name}: cannot open: No such file or directory"
+            )));
         }
         let mut err = ErrBuf::new();
         let threads = c_int::try_from(threads).unwrap_or(0);
@@ -392,7 +394,12 @@ impl Decoder for LibavDecoder {
                 stride: pitches[i],
             })
             .collect();
-        if (w, h) != (self.info.width.cast_signed(), self.info.height.cast_signed()) {
+        if (w, h)
+            != (
+                self.info.width.cast_signed(),
+                self.info.height.cast_signed(),
+            )
+        {
             self.release(key);
             return Err(format!(
                 "the stream changed size ({}x{} → {w}x{h})",

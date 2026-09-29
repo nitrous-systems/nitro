@@ -91,24 +91,21 @@ fn main() -> ExitCode {
     };
     let mut fallback = None;
     let dec: Box<dyn Decoder> = match &args.file {
-        Some(f) if !args.synthetic => match ffmpeg::open(
-            f,
-            args.opts.hwdec,
-            &args.device,
-            decode_threads(),
-        ) {
-            Ok(o) => {
-                if let Some(why) = &o.fallback {
-                    eprintln!("nitro-video: software decode: {why}");
+        Some(f) if !args.synthetic => {
+            match ffmpeg::open(f, args.opts.hwdec, &args.device, decode_threads()) {
+                Ok(o) => {
+                    if let Some(why) = &o.fallback {
+                        eprintln!("nitro-video: software decode: {why}");
+                    }
+                    fallback = o.fallback;
+                    Box::new(o.decoder)
                 }
-                fallback = o.fallback;
-                Box::new(o.decoder)
+                Err(e) => {
+                    eprintln!("nitro-video: {e}");
+                    return ExitCode::FAILURE;
+                }
             }
-            Err(e) => {
-                eprintln!("nitro-video: {e}");
-                return ExitCode::FAILURE;
-            }
-        },
+        }
         _ => Box::new(SyntheticDecoder::new(1280, 720, 30, 30 * 60)),
     };
     let info = dec.info().clone();

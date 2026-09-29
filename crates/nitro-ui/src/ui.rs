@@ -4458,10 +4458,7 @@ impl<S: 'static> Ui<S> {
     pub fn has_dmabuf(&self) -> bool {
         self.dmabuf_wanted
             && self.has_surfaces()
-            && self
-                .wire
-                .conn()
-                .has_caps(nitro_wire::types::caps::DMABUF)
+            && self.wire.conn().has_caps(nitro_wire::types::caps::DMABUF)
     }
 
     /// Whether the server scans client buffers out directly
