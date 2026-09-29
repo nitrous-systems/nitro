@@ -578,6 +578,59 @@ fn the_other_buffer_ops_are_refused_on_the_same_terms() {
     h.quit();
 }
 
+/// The Surface ops (#3897) are buffer ops too: `SURFACE` is not
+/// advertised on a remote link, and `SetSurface`/`PresentSurface` naming a
+/// buffer are refused non-fatally, like `SetImage`. `DMABUF` is never
+/// advertised.
+#[test]
+fn surface_ops_are_refused_on_a_remote_link() {
+    let h = Harness::start("surfaceops", "remote.listen = 127.0.0.1:0\n");
+    let mut conn = h.remote_client("remote-surface");
+    assert!(!conn.has_caps(caps::SURFACE), "caps = {:#x}", conn.caps());
+    assert!(!conn.has_caps(caps::DMABUF));
+    let mut seen = Vec::new();
+    make_window(&mut conn, &mut seen, 1, 1);
+    h.settle();
+    conn.send(&ClientMsg::SetSurface(nitro_wire::msg::SetSurface {
+        id: NodeId(2),
+        buffer: BufferId(1),
+        src: nitro_core::IRect::new(0, 0, 32, 32),
+        matrix: nitro_wire::types::ColorMatrix::Bt709,
+        range: nitro_wire::types::ColorRange::Limited,
+    }))
+    .unwrap();
+    conn.send(&ClientMsg::PresentSurface(
+        nitro_wire::msg::PresentSurface {
+            id: NodeId(2),
+            buffer: BufferId(1),
+            serial: 9,
+            src: nitro_core::IRect::new(0, 0, 32, 32),
+            matrix: nitro_wire::types::ColorMatrix::Bt709,
+            range: nitro_wire::types::ColorRange::Limited,
+            damage: vec![],
+        },
+    ))
+    .unwrap();
+    conn.flush().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(Instant::now() < deadline, "got {seen:?}");
+        conn.flush().unwrap();
+        conn.poll(&mut seen).expect("the connection is still alive");
+        let n = seen
+            .iter()
+            .filter(|m| matches!(m, ServerMsg::Error(e) if e.msg.contains("not available on a remote link")))
+            .count();
+        if n >= 2 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    h.settle();
+    assert_eq!(h.stat("remote_clients"), 1, "the client survived both");
+    h.quit();
+}
+
 /// Clearing an image is **not** a buffer op: it names no buffer.
 ///
 /// The one member of the group a remote client may legitimately send,

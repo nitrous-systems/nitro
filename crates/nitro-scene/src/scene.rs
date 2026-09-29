@@ -1903,6 +1903,18 @@ impl Scene {
         self.unreferenced = pending;
     }
 
+    /// Whether any live Image or Surface node samples `key` right now.
+    #[must_use]
+    pub fn buffer_in_use(&self, key: BufferKey) -> bool {
+        self.buffer_users.get(&key).is_some_and(|users| {
+            users.iter().any(|n| {
+                self.nodes
+                    .get(*n)
+                    .is_some_and(|node| node.data.buffer() == Some(key))
+            })
+        })
+    }
+
     fn prune_buffer_users(&mut self, key: BufferKey) {
         let live = &self.nodes;
         if let Some(users) = self.buffer_users.get_mut(&key) {

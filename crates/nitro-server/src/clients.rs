@@ -29,13 +29,14 @@
 //! map, not a search of the scene.
 
 use std::collections::HashMap;
-use std::os::fd::BorrowedFd;
+use std::os::fd::{BorrowedFd, OwnedFd};
 
 use nitro_core::{Point, Rect, Role, Size};
 use nitro_scene::{
-    Border, BufferDesc, BufferKey, ClientId, Error as SceneError, Fill as SceneFill, IconRef,
-    ImageRef, NodeKey, NodeKind as SceneNodeKind, PixelStore, Scene, TextAlign, TextRef,
-    WindowFlags, WindowKey, WindowState,
+    Border, BufferDesc, BufferKey, ClientId, ColorMatrix as SceneColorMatrix,
+    ColorRange as SceneColorRange, Error as SceneError, Fill as SceneFill, IconRef, ImageRef,
+    NodeKey, NodeKind as SceneNodeKind, PixelStore, Scene, SurfaceColor, SurfaceRef, TextAlign,
+    TextRef, WindowFlags, WindowKey, WindowState,
 };
 use nitro_shm::{MapError, Mapping};
 use nitro_text::TextKey;
@@ -43,8 +44,8 @@ use nitro_wire::error::Error as WireError;
 use nitro_wire::msg::{self, ClientMsg, ServerMsg};
 use nitro_wire::server::{ClientStream, code_for};
 use nitro_wire::types::{
-    Align, BufferId, ErrorCode, Layer, NodeId, NodeKind, WindowState as WireWindowState, anchor,
-    constraint_adjust, format, popup_flags, window_flags,
+    Align, BufferId, ColorMatrix, ColorRange, ErrorCode, Layer, NodeId, NodeKind,
+    WindowState as WireWindowState, anchor, constraint_adjust, format, popup_flags, window_flags,
 };
 
 use crate::popup::{MAX_POPUP_DEPTH, PopupInfo};
@@ -296,7 +297,7 @@ impl WireClient {
     pub fn held_buffers(&self) -> BufferBudget {
         let committed = self.buffers.values().map(|h| h.bytes);
         let pending = self.pending.iter().filter_map(|p| match p {
-            Pending::Buffer(_, desc, _) => Some(desc.byte_len() as u64),
+            Pending::Buffer(_, _, data) => Some(data.bytes().len() as u64),
             Pending::Msg(_) => None,
         });
         let (buffers, bytes) = committed
@@ -354,7 +355,7 @@ pub struct ApplyError {
 }
 
 impl ApplyError {
-    fn new(code: ErrorCode, detail: impl Into<String>) -> Self {
+    pub(crate) fn new(code: ErrorCode, detail: impl Into<String>) -> Self {
         Self {
             code,
             detail: detail.into(),
@@ -464,6 +465,11 @@ pub struct ApplyOutcome {
     /// commit like `start_drags`, so a mid-drag change lands with the new
     /// icon image.
     pub drag_icon_offsets: Vec<(WindowKey, Point)>,
+    /// Surface nodes a committed `SetSurface` touched: any frame queued on
+    /// them by `PresentSurface` is cancelled and released (#3897).
+    pub surfaces_set: Vec<NodeKey>,
+    /// Surface nodes created, for the `SurfaceHint` tracker.
+    pub new_surfaces: Vec<(NodeId, NodeKey)>,
 }
 
 /// A validated `StartDrag`; see [`ApplyOutcome::start_drags`].
@@ -510,7 +516,7 @@ pub fn apply(
                         format!("buffer id {} is zero or already in use", id.raw()),
                     ));
                 }
-                let bytes = desc.byte_len() as u64;
+                let bytes = data.bytes().len() as u64;
                 let key = scene
                     .create_buffer(client.id, desc, data)
                     .map_err(|e| scene_err("CreateBuffer", e))?;
@@ -664,6 +670,9 @@ fn apply_msg(
                 .create_node(client.id, kind, parent, before)
                 .map_err(|e| scene_err("CreateNode", e))?;
             client.bind_node(m.id, key);
+            if m.kind == NodeKind::Surface {
+                outcome.new_surfaces.push((m.id, key));
+            }
             Ok(())
         }
         ClientMsg::DestroyNode(m) => {
@@ -862,6 +871,34 @@ fn apply_msg(
             scene
                 .set_opaque_region(client.id, key, &m.rects)
                 .map_err(|e| scene_err("SetOpaqueRegion", e))
+        }
+        ClientMsg::CreateSurfaceBuffer(_) => {
+            // Mapped on receipt into `Pending::Buffer`, like `CreateBuffer`.
+            Ok(())
+        }
+        ClientMsg::SetSurface(m) => {
+            // Gated on `SURFACE` at receipt (`Server::refuse_at_receipt`).
+            let key = node_key(client, m.id)?;
+            let surface = if m.buffer.is_none() {
+                None
+            } else {
+                let buffer = buffer_key(client, m.buffer)?;
+                Some(SurfaceRef::new(
+                    buffer,
+                    m.src,
+                    scene_color(m.matrix, m.range),
+                ))
+            };
+            scene
+                .set_surface(client.id, key, surface)
+                .map_err(|e| scene_err("SetSurface", e))?;
+            // A committed `SetSurface` wins over a queued latch frame.
+            outcome.surfaces_set.push(key);
+            Ok(())
+        }
+        ClientMsg::PresentSurface(_) => {
+            // Never buffered: handled at receipt (`Server::present_surface`).
+            Ok(())
         }
         ClientMsg::SetImage(m) => {
             let key = node_key(client, m.id)?;
@@ -1253,13 +1290,14 @@ fn icon_handle(icons: &mut IconEngine, role: u8, name: &str) -> Option<(u32, u8)
 /// The box an icon gets when the client asked for a nonsense size.
 const DEFAULT_ICON_PX: f32 = 16.0;
 
-/// The scene's node kind for a wire kind. `Surface` is reserved: the server
-/// advertises no `DMABUF` capability, so a client asking for one is using a
-/// feature it was told does not exist. `Text` is live from M2 and is **always
+/// The scene's node kind for a wire kind. `Surface` is live since #3897
+/// (shm buffers; `CreateSurfaceBuffer`/`SetSurface`/`PresentSurface`
+/// need `SURFACE` listed in `ClientCaps`). `Text` is live from M2 and is **always
 /// accepted** — the `TEXT` capability bit reports whether the text will be
 /// *visible* (i.e. whether the server found a font to draw with), not whether
 /// the node may be created. A server without it shapes to an empty run rather
 /// than refusing, which is why the match below takes `Text` unconditionally.
+#[allow(clippy::unnecessary_wraps)] // Every kind is live today; the `Result` is the shape a reserved one needs.
 fn scene_kind(kind: NodeKind) -> Result<SceneNodeKind, ApplyError> {
     match kind {
         NodeKind::Group => Ok(SceneNodeKind::Group),
@@ -1267,10 +1305,26 @@ fn scene_kind(kind: NodeKind) -> Result<SceneNodeKind, ApplyError> {
         NodeKind::Image => Ok(SceneNodeKind::Image),
         NodeKind::Text => Ok(SceneNodeKind::Text),
         NodeKind::Icon => Ok(SceneNodeKind::Icon),
-        NodeKind::Surface => Err(ApplyError::new(
-            ErrorCode::WrongKind,
-            "Surface nodes are M5; the server does not advertise the DMABUF capability",
-        )),
+        // Gated on `SURFACE` in `ClientCaps` by the ops that give it
+        // content; an empty Surface node paints nothing (#3897).
+        NodeKind::Surface => Ok(SceneNodeKind::Surface),
+    }
+}
+
+/// The scene's colour metadata for the wire's (two enums with the same
+/// shape: the scene must not depend on the protocol).
+#[must_use]
+pub fn scene_color(matrix: ColorMatrix, range: ColorRange) -> SurfaceColor {
+    SurfaceColor {
+        matrix: match matrix {
+            ColorMatrix::Bt601 => SceneColorMatrix::Bt601,
+            ColorMatrix::Bt709 => SceneColorMatrix::Bt709,
+            ColorMatrix::Bt2020 => SceneColorMatrix::Bt2020,
+        },
+        range: match range {
+            ColorRange::Limited => SceneColorRange::Limited,
+            ColorRange::Full => SceneColorRange::Full,
+        },
     }
 }
 
@@ -1352,7 +1406,35 @@ pub fn map_buffer(
     held: BufferBudget,
 ) -> Result<(BufferDesc, MappedPixels), ApplyError> {
     let desc = validate_buffer(&m)?;
-    let need = desc.byte_len() as u64;
+    let len = desc.byte_len();
+    map_checked(m.fd, m.size, desc, len, held)
+}
+
+/// Validate a `CreateSurfaceBuffer` (#3897) and map its memfd, under
+/// exactly [`map_buffer`]'s seal rule and caps: surface buffers share the
+/// id space and every limit with plain ones.
+///
+/// # Errors
+/// As [`map_buffer`], with [`validate_surface_buffer`]'s per-format rules.
+pub fn map_surface_buffer(
+    m: msg::CreateSurfaceBuffer,
+    held: BufferBudget,
+) -> Result<(BufferDesc, MappedPixels), ApplyError> {
+    let desc = validate_surface_buffer(&m)?;
+    let len = surface_map_len(&m);
+    map_checked(m.fd, m.size, desc, len, held)
+}
+
+/// The budget, seal and mapping half shared by [`map_buffer`] and
+/// [`map_surface_buffer`]; `desc` is already validated.
+fn map_checked(
+    fd: OwnedFd,
+    size: u32,
+    desc: BufferDesc,
+    map_len: usize,
+    held: BufferBudget,
+) -> Result<(BufferDesc, MappedPixels), ApplyError> {
+    let need = map_len as u64;
     if held.buffers >= MAX_BUFFERS_PER_CLIENT {
         return Err(ApplyError::new(
             ErrorCode::Limit,
@@ -1383,17 +1465,16 @@ pub fn map_buffer(
         ));
     }
     let bad = |detail: String| ApplyError::new(ErrorCode::BadBuffer, detail);
-    let file_len = nitro_shm::sealed_len(&m.fd).map_err(|e| match e {
+    let file_len = nitro_shm::sealed_len(&fd).map_err(|e| match e {
         MapError::Seals(s) => bad(format!("buffer {s}")),
         other => bad(other.to_string()),
     })?;
-    if file_len < u64::from(m.size) {
+    if file_len < u64::from(size) {
         return Err(bad(format!(
-            "buffer fd is {file_len} bytes, shorter than the declared size {}",
-            m.size
+            "buffer fd is {file_len} bytes, shorter than the declared size {size}"
         )));
     }
-    let mapping = Mapping::map(m.fd, desc.byte_len()).map_err(|e| match e {
+    let mapping = Mapping::map(fd, map_len).map_err(|e| match e {
         MapError::Seals(s) => bad(format!("buffer {s}")),
         MapError::TooShort { file, need } => bad(format!(
             "buffer fd is {file} bytes, shorter than the {need} the geometry needs"
@@ -1401,6 +1482,126 @@ pub fn map_buffer(
         MapError::Os(errno) => bad(format!("mapping the buffer fd: {errno}")),
     })?;
     Ok((desc, MappedPixels(mapping)))
+}
+
+/// The exact bytes a validated `CreateSurfaceBuffer`'s planes reach: the
+/// end of the furthest plane's last row *payload*, which is what the
+/// rasterizer reads (at most `size`, which validation checked). The
+/// scene's [`BufferDesc::byte_len`] is looser, since it does not know row
+/// widths.
+fn surface_map_len(m: &msg::CreateSurfaceBuffer) -> usize {
+    let (w, h) = (u64::from(m.width), u64::from(m.height));
+    let end = |off: u32, stride: u32, rows: u64, row: u64| {
+        u64::from(off) + u64::from(stride) * (rows - 1) + row
+    };
+    let len = match m.format {
+        format::NV12 => end(m.offset0, m.stride0, h, w).max(end(
+            m.offset1,
+            m.stride1,
+            h.div_ceil(2),
+            2 * w.div_ceil(2),
+        )),
+        format::YUYV | format::UYVY => end(m.offset0, m.stride0, h, 2 * w),
+        _ => end(m.offset0, m.stride0, h, 4 * w),
+    };
+    usize::try_from(len).unwrap_or(usize::MAX)
+}
+
+/// Check a `CreateSurfaceBuffer`'s geometry against its format (#3897,
+/// `docs/wire.md`).
+///
+/// - `NV12`: `stride0 >= w`, `stride1 >= 2·⌈w/2⌉`, both planes inside
+///   `size`;
+/// - `YUYV`/`UYVY`: even `w`, `stride0 >= 2w`, plane 1 all zero;
+/// - `XR24`/`AR24`: `stride0 >= 4w`, plane 1 all zero.
+///
+/// The mapping covers `size` bytes' worth of planes: the scene's
+/// [`BufferDesc::byte_len`] is the end of the furthest plane.
+///
+/// # Errors
+/// [`ErrorCode::BadBuffer`] for anything that does not add up;
+/// [`ErrorCode::Limit`] for a `size` past [`MAX_BUFFER_BYTES`].
+pub fn validate_surface_buffer(m: &msg::CreateSurfaceBuffer) -> Result<BufferDesc, ApplyError> {
+    fn bad<T>(detail: String) -> Result<T, ApplyError> {
+        Err(ApplyError::new(ErrorCode::BadBuffer, detail))
+    }
+    let (w, h) = (u64::from(m.width), u64::from(m.height));
+    if w == 0 || h == 0 || w > i32::MAX as u64 || h > i32::MAX as u64 {
+        return bad("surface buffer has no pixels".to_owned());
+    }
+    if u64::from(m.size) > MAX_BUFFER_BYTES {
+        return Err(ApplyError::new(
+            ErrorCode::Limit,
+            format!(
+                "buffer of {} bytes exceeds the {MAX_BUFFER_BYTES} byte cap",
+                m.size
+            ),
+        ));
+    }
+    let size = u64::from(m.size);
+    let (o0, s0, o1, s1) = (
+        u64::from(m.offset0),
+        u64::from(m.stride0),
+        u64::from(m.offset1),
+        u64::from(m.stride1),
+    );
+    // One plane of `rows` rows, `row` payload bytes each, must fit.
+    let fits = |off: u64, stride: u64, rows: u64, row: u64| off + stride * (rows - 1) + row <= size;
+    let single = |bpp: u64| -> Result<(), ApplyError> {
+        if o1 != 0 || s1 != 0 {
+            return bad(format!(
+                "format {:#010x} has one plane; offset1/stride1 must be 0",
+                m.format
+            ));
+        }
+        if s0 < bpp * w {
+            return bad(format!("stride0 {s0} is too small for width {w}"));
+        }
+        if !fits(o0, s0, h, bpp * w) {
+            return bad(format!("declared size {size} does not cover the pixels"));
+        }
+        Ok(())
+    };
+    let (desc, opaque) = match m.format {
+        format::NV12 => {
+            let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+            if s0 < w || s1 < 2 * cw {
+                return bad(format!(
+                    "NV12 strides {s0}/{s1} are too small for width {w}"
+                ));
+            }
+            if !fits(o0, s0, h, w) || !fits(o1, s1, ch, 2 * cw) {
+                return bad(format!(
+                    "declared size {size} does not cover both NV12 planes"
+                ));
+            }
+            #[allow(clippy::cast_possible_truncation)] // ch <= h, a u32.
+            let desc = BufferDesc::new(m.width, m.height, m.stride0, m.format)
+                .with_planes(m.offset0, Some((m.offset1, m.stride1, ch as u32)));
+            (desc, true)
+        }
+        format::YUYV | format::UYVY => {
+            if w % 2 != 0 {
+                return bad(format!("packed 4:2:2 width {w} is odd"));
+            }
+            single(2)?;
+            (
+                BufferDesc::new(m.width, m.height, m.stride0, m.format)
+                    .with_planes(m.offset0, None),
+                true,
+            )
+        }
+        format::XR24 | format::AR24 => {
+            single(4)?;
+            (
+                BufferDesc::new(m.width, m.height, m.stride0, m.format)
+                    .with_planes(m.offset0, None),
+                m.format == format::XR24,
+            )
+        }
+        other => return bad(format!("unsupported surface format {other:#010x}")),
+    };
+    Ok(desc.with_opaque(opaque))
 }
 
 /// Check a `CreateBuffer`'s geometry against the format and the caps.
@@ -1820,14 +2021,87 @@ mod tests {
     }
 
     #[test]
-    fn text_is_live_and_surface_is_still_reserved() {
+    fn every_kind_is_live_including_surface() {
         assert_eq!(scene_kind(NodeKind::Group).unwrap(), SceneNodeKind::Group);
         assert_eq!(scene_kind(NodeKind::Rect).unwrap(), SceneNodeKind::Rect);
         assert_eq!(scene_kind(NodeKind::Image).unwrap(), SceneNodeKind::Image);
         assert_eq!(scene_kind(NodeKind::Text).unwrap(), SceneNodeKind::Text);
         assert_eq!(
-            scene_kind(NodeKind::Surface).unwrap_err().code,
-            ErrorCode::WrongKind
+            scene_kind(NodeKind::Surface).unwrap(),
+            SceneNodeKind::Surface
+        );
+    }
+
+    fn surface_msg(format: u32, w: u32, h: u32) -> msg::CreateSurfaceBuffer {
+        let (s0, o1, s1, size) = match format {
+            format::NV12 => (w, w * h, w, w * h * 3 / 2),
+            format::YUYV | format::UYVY => (2 * w, 0, 0, 2 * w * h),
+            _ => (4 * w, 0, 0, 4 * w * h),
+        };
+        msg::CreateSurfaceBuffer {
+            id: BufferId(1),
+            width: w,
+            height: h,
+            format,
+            size,
+            offset0: 0,
+            stride0: s0,
+            offset1: o1,
+            stride1: s1,
+            fd: nitro_shm::create_sealed("t", 16).unwrap(),
+        }
+    }
+
+    #[test]
+    fn surface_buffers_are_validated_per_format() {
+        for f in [
+            format::NV12,
+            format::YUYV,
+            format::UYVY,
+            format::XR24,
+            format::AR24,
+        ] {
+            assert!(
+                validate_surface_buffer(&surface_msg(f, 16, 8)).is_ok(),
+                "{f:#x}"
+            );
+        }
+        let bad = |m: msg::CreateSurfaceBuffer| validate_surface_buffer(&m).unwrap_err().code;
+        // NV12 chroma past the end.
+        let mut m = surface_msg(format::NV12, 16, 8);
+        m.offset1 += 1;
+        assert_eq!(bad(m), ErrorCode::BadBuffer);
+        // NV12 chroma stride too small.
+        let mut m = surface_msg(format::NV12, 16, 8);
+        m.stride1 = 15;
+        assert_eq!(bad(m), ErrorCode::BadBuffer);
+        // Odd packed 4:2:2 width.
+        let mut m = surface_msg(format::YUYV, 16, 8);
+        m.width = 15;
+        assert_eq!(bad(m), ErrorCode::BadBuffer);
+        // A second plane on a single-plane format.
+        let mut m = surface_msg(format::XR24, 16, 8);
+        m.stride1 = 4;
+        assert_eq!(bad(m), ErrorCode::BadBuffer);
+        // Unknown format.
+        assert_eq!(
+            bad(surface_msg(format::fourcc(b"RG16"), 16, 8)),
+            ErrorCode::BadBuffer
+        );
+        // Past the byte cap.
+        let mut m = surface_msg(format::NV12, 16, 8);
+        m.size = u32::try_from(MAX_BUFFER_BYTES + 1).unwrap();
+        assert_eq!(bad(m), ErrorCode::Limit);
+        // Opaque: YUV and XR24 yes, AR24 no.
+        assert!(
+            validate_surface_buffer(&surface_msg(format::NV12, 16, 8))
+                .unwrap()
+                .is_opaque()
+        );
+        assert!(
+            !validate_surface_buffer(&surface_msg(format::AR24, 16, 8))
+                .unwrap()
+                .is_opaque()
         );
     }
 

@@ -111,8 +111,14 @@ use std::time::Duration;
 
 use nitro_core::{Color, Damage, IRect, Palette, Rect, Region};
 use nitro_kms::{BufferMut, Image, OutputId as KmsOutputId};
-use nitro_raster::{Canvas, Image as RasterImage, PixelFormat};
-use nitro_scene::{Fill as SceneFill, OutputId, PaintItem, PaintKind, Scene};
+use nitro_raster::{
+    Canvas, Image as RasterImage, Nv12, Packed422, Packed422Order, PixelFormat, YuvEncoding,
+    YuvMatrix, YuvRange,
+};
+use nitro_scene::{
+    ColorMatrix as SceneColorMatrix, ColorRange as SceneColorRange, Fill as SceneFill, OutputId,
+    PaintItem, PaintKind, Scene, SurfaceColor,
+};
 use nitro_wire::types::format;
 
 use crate::cursor::Cursor;
@@ -1023,6 +1029,7 @@ fn duration_us(d: Duration) -> u64 {
 }
 
 /// Draw one paint item, already clipped by the caller to a damage rect.
+#[allow(clippy::too_many_lines)] // One arm per kind.
 fn paint_item(
     canvas: &mut Canvas<'_>,
     clip: &IRect,
@@ -1094,6 +1101,13 @@ fn paint_item(
                 canvas.blit(&clip, &device, &image, &src, item.opacity);
             }
         }
+        PaintKind::Surface {
+            size,
+            buffer,
+            src,
+            color,
+            ..
+        } => paint_surface(canvas, &clip, item, scene, size, buffer, src, color),
         PaintKind::Text { key, origin, color } => {
             // The glyphs themselves live in the text engine's atlas; the
             // scene knows only the handle, the already-aligned origin and
@@ -1231,6 +1245,102 @@ fn blit_with_opaque_region(
 /// The rasterizer's layout for a client's fourcc, or `None` for a format
 /// the server does not accept (it rejected it at `CreateBuffer` time, so
 /// this is belt and braces).
+/// Draw a CPU-composited Surface (#3897): the node's device rect rounded
+/// to whole pixels, the buffer converted by its fourcc. YUV and XR24 are
+/// stores and ignore `item.opacity` in v1 (translucent video is later work,
+/// `docs/surfaces.md`); AR24 blends like an image.
+#[allow(clippy::too_many_arguments)]
+fn paint_surface(
+    canvas: &mut Canvas<'_>,
+    clip: &IRect,
+    item: &PaintItem,
+    scene: &Scene,
+    size: (f32, f32),
+    buffer: nitro_scene::BufferKey,
+    src: IRect,
+    color: SurfaceColor,
+) {
+    let Ok(buffer) = scene.buffer(buffer) else {
+        return;
+    };
+    let desc = buffer.desc();
+    let data = buffer.data();
+    let local = Rect::new(0.0, 0.0, size.0, size.1);
+    let exact = item.transform.apply_rect(&local);
+    // Outward, like the scene's `bounds`: a video surface lands on whole
+    // pixels, and the damage it was given is exactly that rect.
+    let dst = exact.round_out();
+    let enc = yuv_encoding(color);
+    let from = |off: u32| data.get(off as usize..).unwrap_or(&[]);
+    match desc.format {
+        format::NV12 => {
+            let Some((off1, stride1, _)) = desc.plane1 else {
+                return;
+            };
+            let frame = Nv12 {
+                y: from(desc.offset0),
+                y_stride: desc.stride,
+                uv: from(off1),
+                uv_stride: stride1,
+                width: desc.w,
+                height: desc.h,
+            };
+            canvas.blit_nv12(clip, &dst, &frame, &src, enc);
+        }
+        format::YUYV | format::UYVY => {
+            let frame = Packed422 {
+                data: from(desc.offset0),
+                stride: desc.stride,
+                width: desc.w,
+                height: desc.h,
+                order: if desc.format == format::YUYV {
+                    Packed422Order::Yuyv
+                } else {
+                    Packed422Order::Uyvy
+                },
+            };
+            canvas.blit_yuyv(clip, &dst, &frame, &src, enc);
+        }
+        format::XR24 | format::AR24 => {
+            let image = RasterImage {
+                data: from(desc.offset0),
+                width: desc.w,
+                height: desc.h,
+                stride: desc.stride,
+                format: if desc.format == format::XR24 {
+                    PixelFormat::Xrgb8888
+                } else {
+                    PixelFormat::Argb8888
+                },
+            };
+            let one_to_one = dst.w == src.w && dst.h == src.h;
+            if desc.format == format::AR24 {
+                canvas.blit(clip, &exact, &image, &src, item.opacity);
+            } else if one_to_one {
+                canvas.blit(clip, &dst.to_rect(), &image, &src, 1.0);
+            } else {
+                canvas.blit_xrgb_scaled(clip, &dst, &image, &src);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The rasterizer's YUV encoding for a surface's colour metadata.
+fn yuv_encoding(color: SurfaceColor) -> YuvEncoding {
+    YuvEncoding::new(
+        match color.matrix {
+            SceneColorMatrix::Bt601 => YuvMatrix::Bt601,
+            SceneColorMatrix::Bt709 => YuvMatrix::Bt709,
+            SceneColorMatrix::Bt2020 => YuvMatrix::Bt2020,
+        },
+        match color.range {
+            SceneColorRange::Limited => YuvRange::Limited,
+            SceneColorRange::Full => YuvRange::Full,
+        },
+    )
+}
+
 fn pixel_format(fourcc: u32) -> Option<PixelFormat> {
     match fourcc {
         format::XR24 => Some(PixelFormat::Xrgb8888),

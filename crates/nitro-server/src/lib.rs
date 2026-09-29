@@ -60,6 +60,7 @@ pub mod repeat;
 pub mod shell;
 pub mod signals;
 pub mod stats;
+pub mod surface;
 /// In-process server for another crate's tests; see the module docs.
 #[cfg(feature = "test-support")]
 pub mod test_support;
@@ -935,6 +936,11 @@ struct Server {
     /// Scratch for `send_buffer_releases`, kept to avoid an allocation per
     /// settle.
     released: Vec<(ClientId, BufferKey)>,
+    /// `PresentSurface` frames waiting for their output's next paint
+    /// opportunity (#3897); see [`surface::Latch`].
+    latch: surface::Latch,
+    /// The `SurfaceHint` last sent per Surface node (#3897).
+    surface_hints: surface::Hints,
     /// Which window each live touch point started on, and where it is in
     /// that window's coordinates.
     touch_targets: HashMap<i32, (WindowKey, Point)>,
@@ -1341,6 +1347,8 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         focus: None,
         pending_focus: None,
         released: Vec::new(),
+        latch: surface::Latch::default(),
+        surface_hints: surface::Hints::default(),
         touch_targets: HashMap::new(),
         unplaced: Vec::new(),
         popups: HashMap::new(),
@@ -2503,7 +2511,12 @@ impl Server {
         // Last thing before the update: every path that can change which
         // window is frontmost, its state or the focus has run by now.
         self.sync_fullscreen_cover();
+        // Queued Surface frames whose output can take a paint now: in
+        // steady state the flip is pending here and they wait for
+        // `on_flip`; on an idle output they latch at once.
+        self.latch_surfaces();
         self.update_scene();
+        self.send_surface_hints();
         // A window mapped, unmapped or moved under a stationary pointer
         // changed what the pointer is over; hit testing needs the update
         // above.
@@ -2891,8 +2904,19 @@ impl Server {
         // damage nothing, flip nothing — and stall the fade.
         // `paint` does not update the scene itself, so the step's damage
         // is folded into the outputs here.
-        if self.overview_output() == Some(scene_id) && self.step_overview_fade(monotonic_ns()) {
+        let faded =
+            self.overview_output() == Some(scene_id) && self.step_overview_fade(monotonic_ns());
+        // The latch point (#3897): this output has no flip pending any
+        // more, so the newest queued Surface frame on it becomes current
+        // and rides the paint below. The buffer it replaces is released
+        // in the same write, well before this frame's `Presented`.
+        let latched = self.latch_surfaces();
+        if faded || latched {
             self.update_scene();
+        }
+        if latched {
+            self.send_surface_hints();
+            self.send_buffer_releases();
         }
         self.paint_or_defer();
         // A commit stamped while this flip was in flight (#646) is in
@@ -6988,6 +7012,14 @@ impl Server {
             ClientMsg::AcceptDrop(m) => self.accept_drop(token, m.action, m.mime),
             ClientMsg::FinishDrag(_) => self.finish_drag(token),
             ClientMsg::CreateBuffer(buffer) => self.create_buffer(token, buffer),
+            ClientMsg::CreateSurfaceBuffer(buffer) => {
+                self.surface_allowed(token, "CreateSurfaceBuffer")
+                    && self.create_surface_buffer(token, buffer)
+            }
+            // Never buffered: the latch path is outside the transactions.
+            ClientMsg::PresentSurface(frame) => {
+                self.surface_allowed(token, "PresentSurface") && self.present_surface(token, &frame)
+            }
             other => {
                 // Refused **at receipt**, not at the commit; see
                 // `Server::refuse_at_receipt`.
@@ -7085,6 +7117,10 @@ impl Server {
     /// the session: a reload whose export fails keeps the previous file
     /// (`reload_config`), so a client re-listing the bit is never
     /// disconnected for naming one it was granted.
+    ///
+    /// `SURFACE` (#3897) has `RELEASE`'s shape: local links only, since
+    /// every Surface buffer is a descriptor. `DMABUF` stays unset until
+    /// dma-buf import exists.
     fn caps(&self, shell: bool, remote: bool) -> u32 {
         let mut caps = nitro_wire::types::caps::WM
             | nitro_wire::types::caps::THEME
@@ -7105,7 +7141,9 @@ impl Server {
         if remote {
             caps |= nitro_wire::types::caps::REMOTE;
         } else {
-            caps |= nitro_wire::types::caps::DATA | nitro_wire::types::caps::RELEASE;
+            caps |= nitro_wire::types::caps::DATA
+                | nitro_wire::types::caps::RELEASE
+                | nitro_wire::types::caps::SURFACE;
             if self.keymap_fd.is_some() {
                 caps |= nitro_wire::types::caps::KEYMAP;
             }
@@ -7151,6 +7189,7 @@ impl Server {
     fn refuse_remote_buffer_op(msg: &ClientMsg) -> bool {
         match msg {
             ClientMsg::SetImage(m) => !m.buffer.is_none(),
+            ClientMsg::SetSurface(m) => !m.buffer.is_none(),
             other => nitro_wire::server::is_buffer_op(other.op()),
         }
     }
@@ -8016,6 +8055,12 @@ impl Server {
             }
         }
         client.frame_requests.extend(outcome.frame_requests);
+        let surfaces_set = outcome.surfaces_set;
+        if client.client_caps & nitro_wire::types::caps::SURFACE != 0 {
+            for (id, key) in outcome.new_surfaces {
+                self.surface_hints.track(key, token, id);
+            }
+        }
         for win in outcome.closed_windows {
             self.forget_closed(win);
         }
@@ -8040,6 +8085,13 @@ impl Server {
         // of this function works through it.
         let has_states = !outcome.state_requests.is_empty();
         self.wire_clients.insert(token, client);
+        // A committed `SetSurface` wins over a queued frame: the frame is
+        // dropped and its buffer released now (unless something shows it).
+        for node in surfaces_set {
+            if let Some(buffer) = self.latch.cancel(node) {
+                self.release_now(token, buffer);
+            }
+        }
         // The shell ops go *before* the state requests and after everything
         // else, for the same reason `SetWindowState` is last: an anchor
         // decides a window's whole rectangle, so it has to win over the
@@ -8296,6 +8348,8 @@ impl Server {
         // freed, and a shell that restarts its clients would otherwise leak
         // a glyph vector per label per restart.
         self.text.release_owner(id.0);
+        self.latch.forget_client(token);
+        self.surface_hints.forget_client(token);
         for output in &mut self.outputs {
             output.painting.retain(|(c, _)| *c != id.0);
             output.in_flight.retain(|(c, _)| *c != id.0);
@@ -8805,6 +8859,7 @@ impl Server {
         // check it themselves.
         match msg {
             ClientMsg::SetOpaqueRegion(_) => !self.opaque_region_allowed(token),
+            ClientMsg::SetSurface(_) => !self.surface_allowed(token, "SetSurface"),
             ClientMsg::StartDrag(_) => !self.data_allowed(token, "StartDrag"),
             ClientMsg::SetDragIconOffset(_) => !self.data_allowed(token, "SetDragIconOffset"),
             _ => false,
@@ -8833,6 +8888,212 @@ impl Server {
                 false
             }
             None => false,
+        }
+    }
+
+    /// The Surface ops need `SURFACE` listed in `ClientCaps` (#3897,
+    /// `docs/wire.md` rule 3). Returns whether the client may send `name`;
+    /// if not, it has been disconnected.
+    fn surface_allowed(&mut self, token: u64, name: &str) -> bool {
+        let listed = self
+            .wire_clients
+            .get(&token)
+            .map(|c| c.client_caps & nitro_wire::types::caps::SURFACE != 0);
+        match listed {
+            Some(true) => true,
+            Some(false) => {
+                self.disconnect(
+                    token,
+                    Some((
+                        0,
+                        ErrorCode::Protocol,
+                        format!("{name} needs `SURFACE` listed in ClientCaps"),
+                    )),
+                );
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// `CreateSurfaceBuffer`: checked and mapped at receipt exactly like
+    /// [`Server::create_buffer`], sharing its caps and id space.
+    fn create_surface_buffer(
+        &mut self,
+        token: u64,
+        buffer: nitro_wire::msg::CreateSurfaceBuffer,
+    ) -> bool {
+        let id = buffer.id;
+        let Some(held) = self.buffer_budget(token) else {
+            return false;
+        };
+        let (desc, pixels) = match clients::map_surface_buffer(buffer, held) {
+            Ok(pair) => pair,
+            Err(e) => {
+                self.disconnect(token, Some((0, e.code, e.detail)));
+                return false;
+            }
+        };
+        let Some(client) = self.wire_clients.get_mut(&token) else {
+            return false;
+        };
+        client.pending.push(Pending::Buffer(id, desc, pixels));
+        true
+    }
+
+    /// `PresentSurface` (#3897): validate against the *committed* scene
+    /// and queue the frame for the latch. A superseded frame's buffer is
+    /// released at once unless something still shows it.
+    fn present_surface(&mut self, token: u64, frame: &msg::PresentSurface) -> bool {
+        let Some(client) = self.wire_clients.get(&token) else {
+            return false;
+        };
+        let checked = (|| {
+            let node = client.nodes.get(&frame.id).copied().ok_or_else(|| {
+                ApplyError::new(
+                    ErrorCode::UnknownNode,
+                    format!("PresentSurface: no node with id {}", frame.id.raw()),
+                )
+            })?;
+            if self.scene.node(node).map(nitro_scene::Node::kind)
+                != Ok(nitro_scene::NodeKind::Surface)
+            {
+                return Err(ApplyError::new(
+                    ErrorCode::WrongKind,
+                    format!("PresentSurface: node {} is not a Surface", frame.id.raw()),
+                ));
+            }
+            let buffer = client
+                .buffers
+                .get(&frame.buffer)
+                .map(|h| h.key)
+                .ok_or_else(|| {
+                    ApplyError::new(
+                        ErrorCode::BadBuffer,
+                        format!("PresentSurface: no buffer with id {}", frame.buffer.raw()),
+                    )
+                })?;
+            let fits = self.scene.buffer(buffer).is_ok_and(|b| {
+                !frame.src.is_empty() && b.desc().full_rect().contains_rect(&frame.src)
+            });
+            if !fits {
+                return Err(ApplyError::new(
+                    ErrorCode::BadBuffer,
+                    "PresentSurface: src is empty or leaves the buffer",
+                ));
+            }
+            Ok((node, buffer))
+        })();
+        let (node, buffer) = match checked {
+            Ok(pair) => pair,
+            Err(ApplyError { code, detail }) => {
+                self.disconnect(token, Some((frame.serial, code, detail)));
+                return false;
+            }
+        };
+        let queued = surface::Queued {
+            token,
+            client: client.id,
+            buffer,
+            serial: frame.serial,
+            src: frame.src,
+            color: clients::scene_color(frame.matrix, frame.range),
+            damage: Damage::new(),
+            whole: false,
+        };
+        if let Some(old) = self.latch.queue(node, queued, &frame.damage) {
+            self.release_now(token, old);
+        }
+        true
+    }
+
+    /// Send `BufferReleased` for a buffer that never reached the scene (a
+    /// superseded or cancelled latch frame), unless a node shows it.
+    fn release_now(&mut self, token: u64, key: BufferKey) {
+        if self.scene.buffer_in_use(key) {
+            return;
+        }
+        let Some(client) = self.wire_clients.get_mut(&token) else {
+            return;
+        };
+        if client.client_caps & nitro_wire::types::caps::RELEASE == 0 {
+            return;
+        }
+        if let Some(id) = client.buffer_id(key) {
+            client.send(&ServerMsg::BufferReleased(msg::BufferReleased { id }));
+        }
+    }
+
+    /// Latch every queued Surface frame whose output has no flip pending
+    /// (#3897). Each latched serial joins its output's `painting` list,
+    /// exactly as a commit's does, so `Presented` goes out from `on_flip`
+    /// when the frame carrying it completes — or from
+    /// `answer_idle_clients` if the latch painted nothing. Returns whether
+    /// anything latched.
+    fn latch_surfaces(&mut self) -> bool {
+        if self.latch.is_empty() {
+            return false;
+        }
+        let busy: Vec<SceneOutputId> = self
+            .outputs
+            .iter()
+            .filter(|o| self.backend.flip_pending(o.kms_id))
+            .map(|o| o.scene_id)
+            .collect();
+        let output_of = |scene: &Scene, node: nitro_scene::NodeKey| {
+            scene
+                .node(node)
+                .ok()
+                .and_then(|n| scene.window_info(n.window()).ok())
+                .and_then(nitro_scene::Window::output)
+        };
+        let mut latch = std::mem::take(&mut self.latch);
+        let latched = latch.latch_ready(&mut self.scene, |scene, node| {
+            output_of(scene, node).is_none_or(|o| !busy.contains(&o))
+        });
+        self.latch = latch;
+        for l in &latched {
+            let output = output_of(&self.scene, l.node);
+            let Some(client) = self.wire_clients.get_mut(&l.token) else {
+                continue;
+            };
+            if let Some(out) =
+                output.and_then(|id| self.outputs.iter_mut().find(|o| o.scene_id == id))
+            {
+                client.unpresented.push(l.serial);
+                out.painting.push((l.client.0, l.serial));
+            } else {
+                // Nowhere to appear: answer at once, the commit rule.
+                let (output, time_ns, seq) = self.outputs.first().map_or((0, 0, 0), |o| {
+                    (o.scene_id.0, o.last_vblank_ns, o.last_sequence)
+                });
+                client.send(&ServerMsg::Presented(msg::Presented {
+                    serial: l.serial,
+                    output,
+                    time_ns,
+                    seq,
+                }));
+            }
+        }
+        !latched.is_empty()
+    }
+
+    /// Send the `SurfaceHint`s whose size changed since the last one. v1's
+    /// CPU path always prefers NV12 at the node's device size; the planes
+    /// module (#3899) is where another answer will come from.
+    fn send_surface_hints(&mut self) {
+        let hints = self
+            .surface_hints
+            .changed(&self.scene, nitro_wire::types::format::NV12);
+        for (token, id, format, width, height) in hints {
+            if let Some(client) = self.wire_clients.get_mut(&token) {
+                client.send(&ServerMsg::SurfaceHint(msg::SurfaceHint {
+                    id,
+                    format,
+                    width,
+                    height,
+                }));
+            }
         }
     }
 
