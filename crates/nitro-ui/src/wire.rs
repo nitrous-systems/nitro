@@ -386,6 +386,18 @@ impl Wire {
         )
     }
 
+    /// Ask for a window state, as a queued mutation.
+    pub(crate) fn set_window_state(
+        &mut self,
+        id: NodeId,
+        state: nitro_wire::types::WindowState,
+    ) -> Result<(), Error> {
+        self.send(
+            &ClientMsg::SetWindowState(msg::SetWindowState { window: id, state }),
+            id,
+        )
+    }
+
     /// Set the window's min/max content size, as a queued mutation.
     pub(crate) fn set_window_limits(
         &mut self,
@@ -990,6 +1002,64 @@ impl Wire {
             &ClientMsg::DestroyBuffer(msg::DestroyBuffer { id }),
             NodeId::NONE,
         )
+    }
+
+    /// A never-used buffer id, from the counter image buffers use.
+    pub(crate) fn alloc_buffer_id(&mut self) -> BufferId {
+        let id = BufferId(self.next_buffer);
+        self.next_buffer += 1;
+        id
+    }
+
+    /// Take the next serial from the **commit** serial space.
+    ///
+    /// `PresentSurface` shares it with `Commit` (`docs/wire.md`): a
+    /// `Presented{serial}` has to name exactly one of the two, so a
+    /// present consumes a serial the next commit will not reuse.
+    pub(crate) fn next_serial(&mut self) -> u32 {
+        let serial = self.serial;
+        self.serial = self.serial.wrapping_add(1).max(1);
+        serial
+    }
+
+    /// Queue a `CreateSurfaceBuffer` into the current transaction.
+    /// Refused on a remote link, like [`Wire::create_buffer`].
+    pub(crate) fn create_surface_buffer(
+        &mut self,
+        buffer: msg::CreateSurfaceBuffer,
+    ) -> Result<(), Error> {
+        if self.conn.has_caps(caps::REMOTE) {
+            return Err(Error::Wire(nitro_wire::Error::RemoteNoFds));
+        }
+        self.send(&ClientMsg::CreateSurfaceBuffer(buffer), NodeId::NONE)
+    }
+
+    /// Send a `PresentSurface` now, outside any transaction.
+    pub(crate) fn present_surface(&mut self, frame: msg::PresentSurface) -> Result<(), Error> {
+        self.conn.present_surface(frame)?;
+        self.flush_all()
+    }
+
+    /// Emit a `Surface` slot and return its node; only the bounds are
+    /// ever sent after creation — the content arrives by
+    /// `PresentSurface`, not through the paint pass.
+    pub(crate) fn paint_surface(
+        &mut self,
+        slots: &mut Vec<PaintSlot>,
+        at: SlotAt,
+        rect: Rect,
+    ) -> Result<NodeId, Error> {
+        let index = at.index;
+        let fresh = self.ensure_slot(slots, at, NodeKind::Surface)?;
+        let slot = &mut slots[index];
+        slot.used = true;
+        let node = slot.node;
+        let changed_bounds = fresh || slot.bounds != rect;
+        slot.bounds = rect;
+        if changed_bounds {
+            self.set_bounds(node, rect)?;
+        }
+        Ok(node)
     }
 
     /// Emit an image slot, sending only what changed.

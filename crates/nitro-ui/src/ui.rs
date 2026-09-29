@@ -391,6 +391,15 @@ pub struct Ui<S> {
     /// Whether a `RequestFrame` is outstanding, so asking twice in one
     /// turn does not put two requests on the wire.
     frame_requested: bool,
+    /// Whether [`Ui::enable_surfaces`] asked for `SURFACE | RELEASE`.
+    surfaces_wanted: bool,
+    /// Surface-event handlers; see [`Ui::on_surface`]. `Option` for the
+    /// same reason the others are.
+    surface_handlers: Vec<Option<SurfaceHandler<S>>>,
+    /// The main window's state as the server last reported it.
+    window_state: nitro_wire::types::WindowState,
+    /// Window-state handlers; see [`Ui::on_window_state`].
+    window_state_handlers: Vec<Option<WindowStateHandler<S>>>,
     /// The system clipboard; see [`crate::clipboard`].
     pub(crate) clipboard: crate::clipboard::Clipboard<S>,
 }
@@ -400,6 +409,12 @@ type ShellHandler<S> = Box<dyn FnMut(&mut S, &mut Ui<S>, &crate::shell::ShellEve
 
 /// A frame-callback handler; see [`Ui::on_frame`].
 type FrameHandler<S> = Box<dyn FnMut(&mut S, &mut Ui<S>, Frame)>;
+
+/// A surface-event handler; see [`Ui::on_surface`].
+type SurfaceHandler<S> = Box<dyn FnMut(&mut S, &mut Ui<S>, &crate::surface::SurfaceEvent)>;
+
+/// A window-state handler; see [`Ui::on_window_state`].
+type WindowStateHandler<S> = Box<dyn FnMut(&mut S, &mut Ui<S>, nitro_wire::types::WindowState)>;
 
 /// A window-resize handler; see [`Ui::on_resize`].
 type ResizeHandler<S> = Box<dyn FnMut(&mut S, &mut Ui<S>, Size)>;
@@ -487,6 +502,10 @@ impl<S: 'static> Ui<S> {
             frame_handlers: Vec::new(),
             theme_handlers: Vec::new(),
             frame_requested: false,
+            surfaces_wanted: false,
+            surface_handlers: Vec::new(),
+            window_state: nitro_wire::types::WindowState::Normal,
+            window_state_handlers: Vec::new(),
             clipboard: crate::clipboard::Clipboard::new(),
         }
     }
@@ -1976,10 +1995,19 @@ impl<S: 'static> Ui<S> {
         // records `ClientCaps` on receipt, so even this window's first
         // refusals name their node. Masked to what the server advertised,
         // and not sent at all to a server that cannot know the op.
+        // `SURFACE | RELEASE` only for an app that asked
+        // (`enable_surfaces`): a server tracks and sends more to a
+        // client that lists them, and most apps never present a frame.
+        let surface_caps = if self.surfaces_wanted {
+            nitro_wire::types::caps::SURFACE | nitro_wire::types::caps::RELEASE
+        } else {
+            0
+        };
         self.wire.conn_mut().client_caps(
             nitro_wire::types::caps::ICONS
                 | nitro_wire::types::caps::POPUP
-                | nitro_wire::types::caps::DATA,
+                | nitro_wire::types::caps::DATA
+                | surface_caps,
         )?;
         // `client_caps` masks to what the server advertised: a remote
         // link or an old server has no `DATA`, and the clipboard stays
@@ -3185,11 +3213,48 @@ impl<S: 'static> Ui<S> {
             // the connection kept — so this is news, not a failure, and it
             // is the cue for `.fallback(…)`.
             ServerMsg::IconRefused(r) => self.icon_refused(r),
+            // The Surface path (`enable_surfaces`) and the window state:
+            // news for whoever is presenting, not input for a widget.
+            ServerMsg::Presented(_)
+            | ServerMsg::BufferReleased(_)
+            | ServerMsg::SurfaceHint(_)
+            | ServerMsg::WindowState(_) => self.dispatch_surface_msg(state, msg),
             ServerMsg::Error(e) => self.server_error(e),
             // The clipboard; see `crate::clipboard`.
             ServerMsg::SelectionOffer(o) => self.clipboard_offer(o),
             ServerMsg::SelectionRequest(r) => self.clipboard_serve(r),
             ServerMsg::SelectionData(d) => self.clipboard_data(d),
+            _ => {}
+        }
+    }
+
+    /// The Surface-path and window-state arms of [`Ui::dispatch`].
+    fn dispatch_surface_msg(&mut self, state: &mut S, msg: &ServerMsg) {
+        match msg {
+            ServerMsg::Presented(p) => self.dispatch_surface(
+                state,
+                &crate::surface::SurfaceEvent::Presented {
+                    serial: p.serial,
+                    time_ns: p.time_ns,
+                    seq: p.seq,
+                },
+            ),
+            ServerMsg::BufferReleased(r) => {
+                self.dispatch_surface(state, &crate::surface::SurfaceEvent::Released(r.id));
+            }
+            ServerMsg::SurfaceHint(h) => self.dispatch_surface(
+                state,
+                &crate::surface::SurfaceEvent::Hint {
+                    node: h.id,
+                    format: h.format,
+                    width: h.width,
+                    height: h.height,
+                },
+            ),
+            ServerMsg::WindowState(w) if w.window == WindowId::MAIN.0 => {
+                self.window_state = w.state;
+                self.dispatch_window_state(state, w.state);
+            }
             _ => {}
         }
     }
@@ -4325,6 +4390,135 @@ impl<S: 'static> Ui<S> {
             }
         }
         out
+    }
+
+    // -- surfaces -----------------------------------------------------
+
+    /// Ask for the Surface path: `caps::SURFACE | caps::RELEASE` go in
+    /// the `ClientCaps` [`Ui::open_window`] sends, masked to what the
+    /// server advertised. Call it **before** the window opens; see
+    /// [`Ui::has_surfaces`] for whether the server granted it.
+    pub fn enable_surfaces(&mut self) {
+        self.surfaces_wanted = true;
+    }
+
+    /// Whether surfaces were asked for and the server can do them: it
+    /// advertised `SURFACE` and `RELEASE`, and the link is not remote.
+    #[must_use]
+    pub fn has_surfaces(&self) -> bool {
+        use nitro_wire::types::caps;
+        let conn = self.wire.conn();
+        self.surfaces_wanted
+            && conn.has_caps(caps::SURFACE)
+            && conn.has_caps(caps::RELEASE)
+            && !conn.has_caps(caps::REMOTE)
+    }
+
+    /// A never-used buffer id, from the counter image buffers use, for a
+    /// [`Ui::create_surface_buffer`].
+    pub fn alloc_buffer_id(&mut self) -> nitro_wire::types::BufferId {
+        self.wire.alloc_buffer_id()
+    }
+
+    /// Register a surface buffer (its fd is passed). Buffered into the
+    /// next commit like any mutation, so a `PresentSurface` naming it
+    /// must wait for a [`Ui::flush`].
+    ///
+    /// # Errors
+    /// `RemoteNoFds` on a remote link; a wire failure otherwise.
+    pub fn create_surface_buffer(
+        &mut self,
+        buffer: nitro_wire::msg::CreateSurfaceBuffer,
+    ) -> Result<(), Error> {
+        self.wire.create_surface_buffer(buffer)
+    }
+
+    /// Release a surface buffer id at the next commit.
+    ///
+    /// # Errors
+    /// A wire failure.
+    pub fn destroy_surface_buffer(&mut self, id: nitro_wire::types::BufferId) -> Result<(), Error> {
+        self.wire.destroy_buffer(id)
+    }
+
+    /// A serial for a [`Ui::present_surface`], from the commit serial
+    /// space the two share (`docs/wire.md`).
+    pub fn next_serial(&mut self) -> u32 {
+        self.wire.next_serial()
+    }
+
+    /// Queue a frame on a `Surface` node, sent **now**, outside any
+    /// transaction: the server latches it at the next vblank and
+    /// answers `Presented{serial}` and, later, `BufferReleased`
+    /// ([`Ui::on_surface`]). Take `frame.serial` from
+    /// [`Ui::next_serial`].
+    ///
+    /// # Errors
+    /// A wire failure.
+    pub fn present_surface(&mut self, frame: nitro_wire::msg::PresentSurface) -> Result<(), Error> {
+        self.wire.present_surface(frame)
+    }
+
+    /// Register a handler for [`SurfaceEvent`](crate::surface::SurfaceEvent)s.
+    ///
+    /// Every `Presented` is offered, commits' too: a presenter matches
+    /// the serials it sent and ignores the rest.
+    pub fn on_surface(
+        &mut self,
+        handler: impl FnMut(&mut S, &mut Ui<S>, &crate::surface::SurfaceEvent) + 'static,
+    ) {
+        self.surface_handlers.push(Some(Box::new(handler)));
+    }
+
+    fn dispatch_surface(&mut self, state: &mut S, ev: &crate::surface::SurfaceEvent) {
+        for i in 0..self.surface_handlers.len() {
+            let Some(mut h) = self.surface_handlers.get_mut(i).and_then(Option::take) else {
+                continue;
+            };
+            h(state, self, ev);
+            if let Some(slot) = self.surface_handlers.get_mut(i) {
+                *slot = Some(h);
+            }
+        }
+    }
+
+    // -- own window state ---------------------------------------------
+
+    /// Ask the server to put the main window into `state` (fullscreen,
+    /// maximized, back to normal). The answer is a `WindowState` event
+    /// ([`Ui::on_window_state`]) and a `Configure`; a refusal sends
+    /// nothing. Buffered into the next commit.
+    ///
+    /// # Errors
+    /// A wire failure.
+    pub fn set_window_state(&mut self, state: nitro_wire::types::WindowState) -> Result<(), Error> {
+        self.wire.set_window_state(WindowId::MAIN.0, state)
+    }
+
+    /// The main window's state as the server last reported it.
+    #[must_use]
+    pub fn window_state(&self) -> nitro_wire::types::WindowState {
+        self.window_state
+    }
+
+    /// Register a handler run whenever the main window's state changes.
+    pub fn on_window_state(
+        &mut self,
+        handler: impl FnMut(&mut S, &mut Ui<S>, nitro_wire::types::WindowState) + 'static,
+    ) {
+        self.window_state_handlers.push(Some(Box::new(handler)));
+    }
+
+    fn dispatch_window_state(&mut self, state: &mut S, ws: nitro_wire::types::WindowState) {
+        for i in 0..self.window_state_handlers.len() {
+            let Some(mut h) = self.window_state_handlers.get_mut(i).and_then(Option::take) else {
+                continue;
+            };
+            h(state, self, ws);
+            if let Some(slot) = self.window_state_handlers.get_mut(i) {
+                *slot = Some(h);
+            }
+        }
     }
 
     // -- app-owned fds and timers -------------------------------------

@@ -95,6 +95,7 @@ pub mod quick;
 pub mod shell;
 pub mod shot;
 pub mod split;
+pub mod surface;
 pub mod theme;
 pub mod ui;
 pub mod widget;
@@ -157,6 +158,9 @@ pub use nitro_wire::msg::Fill;
 // reason: it depends on `nitro-ui` and nothing else.
 pub use nitro_wire::msg::Error as ServerError;
 pub use nitro_wire::types::ErrorCode;
+pub use surface::{
+    OverlayAlign, SurfaceEvent, SurfacePointer, SurfaceView, SurfaceViewBuilder, surface_view,
+};
 pub use shell::{Anchor, ShellEvent, Surface};
 pub use theme::{TextStyle, TextStyleOverride, Theme};
 pub use ui::{FdToken, Frame, Node, TimerId, Ui, WidgetMut, WindowId};

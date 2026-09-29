@@ -1,0 +1,35 @@
+[package]
+name = "nitro-video"
+description = "A native video player: MP4/H.264 demux, software decode through an ffmpeg child, NV12 frames into a Surface node, nitro-ui controls"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The toolkit: window, controls, and the Surface present path (#3906).
+nitro-ui = { workspace = true }
+# Geometry types (`IRect`) shared with the wire.
+nitro-core = { workspace = true }
+# Sealed memfds for the NV12 ring the server maps.
+nitro-shm = { workspace = true }
+# The Surface message types (`CreateSurfaceBuffer`, `PresentSurface`).
+nitro-wire = { workspace = true }
+# `O_NONBLOCK` on the decoder pipe, `CLOCK_MONOTONIC`.
+rustix = { workspace = true, features = ["fs", "pipe", "time"] }
+
+[lib]
+name = "nitro_video"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nitro-video"
+path = "src/main.rs"
+
+[dev-dependencies]
+# The in-process harness: a real server on the fake backend. Never
+# linked into the shipped binary.
+nitro-ui = { workspace = true, features = ["test-support"] }

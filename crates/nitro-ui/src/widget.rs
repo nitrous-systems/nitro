@@ -649,6 +649,29 @@ impl<S: 'static> PaintCx<'_, S> {
         self.note(r);
     }
 
+    /// Draw a **`Surface`** node in `slot`, sized to `rect`, and return
+    /// its node id: the target of [`Ui::present_surface`](crate::Ui::present_surface).
+    ///
+    /// Only the bounds go through the paint pass; the pixels arrive by
+    /// `PresentSurface`, latched at vblank, so a video never repaints
+    /// the tree. Needs [`Ui::enable_surfaces`](crate::Ui::enable_surfaces)
+    /// before the window opens. Returns [`NodeId::NONE`] if the slot
+    /// could not be created; the error is reported by the pass.
+    pub fn surface(&mut self, slot: Slot, rect: Rect) -> NodeId {
+        let at = self.slot_at(slot);
+        match self
+            .ui
+            .wire_mut()
+            .paint_surface(&mut self.slots, at, rect)
+        {
+            Ok(n) => n,
+            Err(e) => {
+                self.note(Err(e));
+                NodeId::NONE
+            }
+        }
+    }
+
     /// Draw a **group** in `slot`: a node of this widget's own that can
     /// clip and translate what is painted inside it, and whose node id
     /// is returned so later slots can be parented to it.

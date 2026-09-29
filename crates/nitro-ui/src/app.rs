@@ -40,6 +40,7 @@ pub struct App {
     introspect: bool,
     name: String,
     surface: Option<crate::shell::Surface>,
+    surfaces: bool,
 }
 
 impl App {
@@ -90,7 +91,16 @@ impl App {
             introspect: true,
             name: title.to_owned(),
             surface: None,
+            surfaces: false,
         }
+    }
+
+    /// Ask for the `Surface` path (`caps::SURFACE | caps::RELEASE`): see
+    /// [`Ui::enable_surfaces`] and [`crate::surface`].
+    #[must_use]
+    pub fn surfaces(mut self) -> Self {
+        self.surfaces = true;
+        self
     }
 
     /// Open the window as a shell surface — a bar, dock, launcher or
@@ -186,10 +196,14 @@ impl App {
             introspect: _,
             name,
             surface,
+            surfaces,
         } = self;
         let mut ui = Ui::new(conn, theme);
         ui.set_backdrop(backdrop);
         ui.set_app_id(&name);
+        if surfaces {
+            ui.enable_surfaces();
+        }
         if let Some(s) = surface {
             ui.set_surface(s);
         }
