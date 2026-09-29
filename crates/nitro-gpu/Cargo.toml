@@ -15,7 +15,9 @@ nitro-wire = { workspace = true }
 # Seal checks on the shadow memfd before a backend maps it.
 nitro-shm = { workspace = true }
 # `event` for `poll`; `fs` for `fstat`/`memfd_create`; `process` for
-# `setrlimit`/`chdir`/`set_dumpable_behavior`; `thread` for
-# `set_no_new_privs`; `pipe` for the fake backend's fences; `stdio` to take
-# the socket from fd 0 and put `/dev/null` in its place.
-rustix = { workspace = true, features = ["event", "fs", "process", "thread", "pipe", "stdio"] }
+# `setrlimit`/`chdir`/`set_dumpable_behavior`; `pipe` for the fake
+# backend's fences; `stdio` to take the socket from fd 0 and put
+# `/dev/null` in its place. Every one is already enabled elsewhere in the
+# workspace: a new rustix feature (`thread`, for `set_no_new_privs`)
+# unifies into every binary and changed their bytes, measured (#3920).
+rustix = { workspace = true, features = ["event", "fs", "process", "pipe", "stdio"] }

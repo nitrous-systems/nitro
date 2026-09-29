@@ -6,11 +6,12 @@
 //! forbidden descriptor inherited from a sloppy parent, and runs again
 //! after device creation to prove the driver opened only a render node.
 //!
-//! **seccomp is deferred.** rustix has no seccomp, and loading a BPF
-//! filter means `prctl(PR_SET_SECCOMP)` with a pointer — `unsafe` or
-//! libc. It is the next hardening step (see the crate README); the syscall
-//! set a Vulkan driver needs (ioctl on the render node, mmap, futex,
-//! memfd, poll, sendmsg/recvmsg) is small and stable enough to allowlist.
+//! **seccomp is deferred**, and `no_new_privs` with it. rustix has no
+//! seccomp, and loading a BPF filter means `prctl(PR_SET_SECCOMP)` with a
+//! pointer — `unsafe` or libc. `no_new_privs` guards only `execve` (which
+//! the helper never calls) and is seccomp's prerequisite; its rustix
+//! feature (`thread`) would unify into every other binary and change their
+//! bytes (measured). Both are the next hardening step (crate README).
 
 use std::os::fd::OwnedFd;
 
@@ -90,14 +91,13 @@ pub fn check_fds() -> Vec<(i32, String)> {
         .collect()
 }
 
-/// Drop privileges: `no_new_privs`, not dumpable (no ptrace from other
-/// same-uid processes, no core files), `RLIMIT_CORE = 0`, `RLIMIT_NOFILE`
+/// Drop privileges: not dumpable (no ptrace from other same-uid
+/// processes, no core files), `RLIMIT_CORE = 0`, `RLIMIT_NOFILE`
 /// capped at [`NOFILE`], and `chdir("/")`.
 ///
 /// # Errors
 /// The first failing syscall.
 pub fn apply() -> Result<(), rustix::io::Errno> {
-    rustix::thread::set_no_new_privs(true)?;
     rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)?;
     rustix::process::setrlimit(
         Resource::Core,

@@ -13,7 +13,7 @@ The helper:
 1. refuses to start if it inherited a DRM primary node or an input device
    (`sandbox::check_fds`);
 2. takes the socket off fd 0 and puts `/dev/null` there;
-3. drops privileges (`sandbox::apply`): `no_new_privs`, non-dumpable,
+3. drops privileges (`sandbox::apply`): non-dumpable,
    `RLIMIT_CORE = 0`, `RLIMIT_NOFILE ≤ 4096`, `chdir("/")`;
 4. opens the render node (backend), then checks the fds again: the
    driver may only have opened `renderD*`;
@@ -24,9 +24,13 @@ On-demand mode sets `idle_exit`: the helper exits once it holds no
 texture, has no frame in flight and has heard nothing for that long.
 (`NITRO_GPU_IDLE_EXIT=<secs>` in the binary.)
 
-**seccomp is deferred.** rustix has no seccomp, and installing a BPF
-filter needs `prctl(PR_SET_SECCOMP, …, ptr)`, i.e. `unsafe` or libc. It is
-the next hardening step. The allowlist is small: ioctl on the render node,
+**seccomp is deferred, and `no_new_privs` with it.** rustix has no
+seccomp, and installing a BPF filter needs `prctl(PR_SET_SECCOMP, …, ptr)`,
+i.e. `unsafe` or libc. `no_new_privs` only guards `execve`, which the
+helper never calls, and is seccomp's prerequisite; its rustix feature
+(`thread`) is new to the workspace and, through feature unification,
+changed every other binary's bytes (measured), so it waits for seccomp.
+Both are the next hardening step. The allowlist is small: ioctl on the render node,
 mmap/munmap, futex, memfd_create, poll, sendmsg/recvmsg, close, exit.
 
 ## Protocol

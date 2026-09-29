@@ -63,7 +63,7 @@ apps open. The idle window was 60 s.
 | `nitro-wallpaper` | 594 672 |
 | `nitro-settings` | 944 608 |
 | `hey` | 370 384 |
-| `nitro-gpu` | absent |
+| `nitro-gpu` | absent (see "GPU helper" below: the binary is `nitro-gpu-vulkan`) |
 | `nitro-video` | absent |
 | **sum** | **12 329 168** |
 
@@ -151,6 +151,41 @@ box1. `shape_us_mean` stays in the few-hundred-µs lifetime range of a
 cold start on this box (282 → 384 µs over ~50 layouts, mostly startup
 labels with font reads). The cost of a release is one feature-store
 rebuild on the next shape after idle.
+
+### GPU helper (#3920)
+
+`nitro-gpu` is a library (protocol, loop, sandbox); nothing shipped links
+it yet. The helper binary is `nitro-gpu-vulkan`: **582 624 bytes**
+stripped (budget stated up front: ≤ 1.0 MB). The 15 existing binaries
+are **byte-identical** to main `471a976` (compared with `cmp` on a
+`--bins --examples` release build of both trees). Dependencies:
+`cargo tree` **90 → 96** lines, external names **37 → 40** (`ash`,
+`libloading`, `cfg-if`). The helper is built but not installed on the
+boxes yet (server integration is a later task), so the box idle tables
+above are unchanged.
+
+Helper process, measured by the ignored `footprint` test in
+`crates/nitro-gpu-vulkan/tests/pixels.rs` (`just box-gpu-test`). RSS/PSS
+are the helper's own `/proc/self` (it is non-dumpable, so it reports
+them over `GetStats`); driver memory is DRM fdinfo `drm-total-*` /
+`drm-resident-*` summed per client. MiB:
+
+| stage | box1 HSW / hasvk: RSS | PSS | drm total | drm resident | testhost2 KBL / anv: RSS | PSS | drm total | drm resident |
+|---|---|---|---|---|---|---|---|---|
+| idle after init (spawn → `HelloReply`: 13 ms / 11 ms) | 10.8 | 7.1 | 1.0 | 0.1 | 12.6 | 7.2 | 8.1 | 4.4 |
+| + 3-slot 1080p XR24 ring | 10.9 | 7.1 | 24.9 | 0.1 | 12.8 | 7.4 | 31.8 | 4.5 |
+| + 1080p shadow (udmabuf) + first full frame | 11.4 | 7.5 | 32.8 | 16.5 | 13.2 | 7.6 | 41.8 | 41.8 |
+
+Target was ≤ 12 MB RSS / ≤ 10 MB PSS idle on KBL: PSS is met (7.2),
+RSS is 12.6 — 0.6 MB over, all of it shared file pages (libvulkan +
+the anv ICD; PSS is what the process costs). The ring is 3 × 7.9 MB of
+driver memory (1080p × 4 B, X-tiled), system RAM on these iGPUs and
+not in RSS; it becomes resident once rendered into. The udmabuf shadow
+costs no driver memory of its own (the pages are the server's memfd);
+the first frame's resident growth is the ring slot plus the pinned
+shadow pages. First frame submit 2.6 ms (HSW) / 6.8 ms (KBL, includes
+lazy pipeline creation), GPU done at 9 ms on both; a steady frame's
+`Composited` reply comes ~0.3 ms after the request.
 
 ### The rule
 

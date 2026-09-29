@@ -18,6 +18,7 @@ number we watch.
 | `xkbcommon` | server | Keycode → keysym → UTF-8 with the user's own layout, dead keys, levels and modifier semantics. The alternative is shipping a keymap format and a compose engine, which is a project, not a dependency. It reads `XKB_DEFAULT_*`, so it honours whatever the user already configured. | + `xkeysym`, `memmap2`. The FFI `unsafe` (and the `mmap` of the keymap file) lives **inside the `xkbcommon` crate**, not in ours — we write none of it here, and the three exceptions our own tree does take are listed under "`unsafe` exceptions" below. |
 | `vte` | term | The VT/ANSI escape-sequence **state machine** (Paul Williams' DEC parser), which is a table of transitions nobody should transcribe twice: C0, CSI with its parameters and intermediates, OSC with both terminators, DCS, and UTF-8 decode across buffer boundaries. Crucially it assigns **no meaning** — it hands back `print`/`execute`/`csi_dispatch`/`osc_dispatch` and every escape sequence's *effect* is ours, in `nitro-term`'s own `vt.rs`, where it is tested. No `serde`, no allocator tricks, `default-features = false`. | **+2 crates** (`arrayvec`, `memchr`); `memchr` was already in the tree via nothing else, so it is genuinely two. The alternative is roughly 600 lines of state table and the bugs that come with hand-rolling one — and the failure mode of a wrong transition is a terminal that garbles output on a rare sequence, months later. |
 | `swash` | text | OpenType shaping, scaling and hinted glyph rasterization in one pure-Rust crate. Text is the one part of a display server nobody should write twice: the shaper alone is the OpenType GSUB/GPOS state machines, script itemization and mark attachment. Clients never see any of it — the server shapes, so the wire carries strings. | **+7 net crates** (`swash`, `skrifa`, `read-fonts`, `font-types`, `yazi`, `zeno`, `once_cell`); the other five of its seventeen (`bytemuck`, `syn`, `proc-macro2`, `quote`, `unicode-ident`) are already in our tree. **The one place untrusted bytes are parsed by a dependency** — see below. |
+| `ash` (+ `libloading`, `cfg-if`) | gpu-vulkan | Vulkan bindings for the GPU helper (#3920), the only crate that talks to a GPU API. `default-features = false, features = ["loaded", "std"]`: libvulkan is **dlopen'd** (`libloading`), so nothing links against it and a box without Vulkan still builds and runs everything else; the `debug` feature (Debug impls on every Vulkan struct) is off for size. Rejected: `wgpu` (dozens of crates, its own shader translator), `vulkano` (proc-macros, much larger), GLES/EGL (41–67 MB RSS against 8–11 MB measured in #3903). | **+3 external names** (`ash`, `libloading`, `cfg-if`; `windows-link` is Windows-only and not built). `cargo tree` 90 → 96 lines, 37 → 40 names. Linked only into `nitro-gpu-vulkan` (582 928 bytes stripped); every other binary is byte-identical. The FFI `unsafe` is ours — see exception Five. |
 
 ### Why `vte`, and where the line is drawn
 
@@ -607,11 +608,13 @@ the syscall families it uses.
 | `nitro-fs` | `fs`, `pipe`, `event` | `pipe` for the background scan's doorbell descriptor and `fcntl` to make it non-blocking; `poll` in the scan's own tests; `mknodat` for the fifo test |
 | `nitro-session` | `event`, `process` | `poll` over the pidfds, the session socket and the signal pipe; `pidfd_open` so a child's exit is a descriptor rather than a timer tick, `kill_process_group` for teardown, `getuid` for the `/tmp` fallback of the socket path |
 | `nitro-video` | `pipe`, `time` | `pipe2(O_NONBLOCK)` for the decode thread's wake descriptor; `clock_gettime` for frame pacing |
+| `nitro-gpu` | `event`, `fs`, `process`, `pipe`, `stdio` | `poll` over the socket and in-flight sync_files; `memfd`/`fstat`/`open`; `setrlimit`, `chdir`, `set_dumpable_behavior` for the sandbox; `pipe` for the fake backend's fences; `dup2_stdin` to take the socket off fd 0. **No feature new to the workspace**, deliberately: `thread` (for `set_no_new_privs`) unified into every binary and changed their bytes (measured, #3920), so it waits for the seccomp step |
+| `nitro-gpu-vulkan` | `fs`, `param` | `open`/`stat`/`major`/`minor` for the render node and ICD lookup; `page_size` (udmabuf wants page-aligned sizes); `ioctl` (no feature flag) for `UDMABUF_CREATE` and `DMA_BUF_IOCTL_IMPORT_SYNC_FILE` |
 | `nitro-term` | `pty`, `termios`, `process`, `fs`, `stdio` | `openpt`/`grantpt`/`unlockpt`/`ptsname` for the pseudoterminal; `tcsetwinsize` (`TIOCSWINSZ`) so a resize reaches the child as `SIGWINCH`; `kill_process_group`/`waitpid` to take the shell down with the window; `open` for the slave and `fcntl_setfl` to make the master non-blocking |
 
 ## `unsafe` exceptions
 
-Four.
+Five.
 
 **One, in `nitro-seat`**: `close_device_fd` reclaims a device descriptor with
 `OwnedFd::from_raw_fd` so the `OwnedFd`'s own `Drop` closes it. libseat
@@ -718,6 +721,42 @@ context is owned by one value and FFmpeg contexts have no thread affinity
 (moved, never shared). Hostile media files are FFmpeg's attack surface in
 the player's process — the cost of linking rather than piping, accepted
 for the reasons above.
+
+**Five, in `nitro-gpu-vulkan`** (#3920): the GPU helper's Vulkan backend.
+It is the one crate with a **crate-wide** `#![allow(unsafe_code)]`,
+because nearly every line of a Vulkan backend is an FFI call; it is
+paired with `#![deny(clippy::undocumented_unsafe_blocks)]`, so every block
+carries a `// SAFETY:` comment. The scope is fenced by the crate split:
+the protocol, event loop, validation, texture lifetimes and sandbox live
+in `nitro-gpu`, which is `#![forbid(unsafe_code)]`, and the backend sees
+only requests that crate already validated. It runs in a **separate,
+sandboxed process** holding only a render node, so a driver crash or a
+bug here kills the helper, not the display. Inventory
+(`crates/nitro-gpu-vulkan/README.md` has the argument per item):
+
+- **Vulkan calls through `ash`** (`device.rs`, `pipeline.rs`,
+  `backend.rs`). Recurring invariants: create-infos outlive their calls;
+  an object is destroyed only after the last submit using it signalled
+  (textures are held by the event loop until the frame's sync_file is
+  POLLIN; slots are reused after their `VkFence`); fds passed to
+  `vkAllocateMemory`/`vkImportSemaphoreFdKHR` transfer on success and are
+  closed by us on failure; fds from `vkGetMemoryFdKHR`/
+  `vkGetSemaphoreFdKHR` are new and owned (`OwnedFd::from_raw_fd`).
+- **Our own mapped staging memory**: `slice::from_raw_parts_mut` over a
+  persistently mapped host-coherent buffer after waiting on its fence
+  (shadow upload), and `from_raw_parts` in the debug readback.
+- **Two ioctls** (`sys.rs`): `UDMABUF_CREATE` (memfd → dma-buf, the
+  zero-copy shadow; an `Ioctl` impl whose output is the new fd) and
+  `DMA_BUF_IOCTL_IMPORT_SYNC_FILE` (attach the frame's fence to the output
+  dma-buf for implicit-sync readers). Argument structs are size-asserted
+  against `<linux/udmabuf.h>`/`<linux/dma-buf.h>`.
+- **One `env::set_var("VK_DRIVER_FILES")`** in `main.rs`, `unsafe` in
+  edition 2024: it runs before any thread exists and before libvulkan is
+  loaded; it restricts the loader to the vendor ICD, which is what keeps
+  llvmpipe/libLLVM (32–63 MB) out of the process.
+
+Tested headless on both boxes by readback (`tests/pixels.rs`,
+`just box-gpu-test`).
 
 The FFI-binding crates above (`libseat-sys`, `drm-ffi`,
 `input-sys`, `xkbcommon`) contain their own, which is exactly why each is

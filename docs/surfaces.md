@@ -253,6 +253,18 @@ side: `crates/nitro-server/src/dmabuf.rs`.
 
 ## GPU helper: `nitro-gpu` (feature-gated)
 
+**As built (#3920), standalone:** `crates/nitro-gpu` (protocol, event
+loop, validation, lifetimes, buffer-age ring damage, sandbox, stats; no
+`unsafe`, no GPU API) and `crates/nitro-gpu-vulkan` (the helper binary,
+the only crate with `ash`). The backend trait has no Vulkan types, so a
+GLES backend can be added without touching the server. Tested headless
+by readback on both boxes (9/9 on hasvk and anv; `just box-gpu-test`).
+The shadow reaches the GPU by **memfd → udmabuf** (zero copy) when
+`/dev/udmabuf` opens, else by damage-rect copies through a staging
+buffer. seccomp (and `no_new_privs`) is deferred. Not yet wired into
+nitro-server; that is the integration task after the planes module.
+Measured footprint: [`budget.md`](budget.md) § GPU helper.
+
 A **separate process**, started with the session and **running by default**.
 The first Surface that needs compositing (say, opening a video window)
 must not pay process start plus Vulkan device creation, which would show
@@ -356,8 +368,8 @@ once measured. Every figure below is an **estimate** unless marked
 | item | when paid | cost |
 |---|---|---|
 | overview thumbnail atlas | only with `overview.animate = true` (default off, #3916); then allocated when the output appears or the setting turns on, pre-faulted | **measured** (#3902): exactly `w × h × 4` = 8 294 400 bytes at 1080p (`stats overview_atlas_bytes`) |
-| `nitro-gpu` helper, process RSS | always, by default (on-demand config: only while compositing) | **measured** with the #3903 probe (no helper yet), vendor ICD only, start → first submit: +8.7 MB RSS / +6.6 MB PSS (HSW), +10.9 / +8.4 MB (KBL); the full NV12 chain adds +9.4 / +12.3 MB PSS. Confirm with the real helper in #3901 |
-| `nitro-gpu` helper, driver memory (Vulkan instance/device, command pools, pipelines; system RAM on iGPUs, not counted in RSS) | same | unmeasured; measure in #3901 |
+| `nitro-gpu` helper, process RSS | always, by default (on-demand config: only while compositing) | **measured** with the #3903 probe (no helper yet), vendor ICD only, start → first submit: +8.7 MB RSS / +6.6 MB PSS (HSW), +10.9 / +8.4 MB (KBL); the full NV12 chain adds +9.4 / +12.3 MB PSS. **Real helper (#3920)**, idle after init: 10.8 MB RSS / 7.1 MB PSS (HSW), 12.6 / 7.2 (KBL); + 1080p ring + shadow + first frame: 11.4 / 7.5, 13.2 / 7.6 |
+| `nitro-gpu` helper, driver memory (Vulkan instance/device, command pools, pipelines; system RAM on iGPUs, not counted in RSS) | same | **measured (#3920)**, DRM fdinfo: 1.0 MB (HSW) / 8.1 MB (KBL) idle; + 3-slot 1080p ring 24.9 / 31.8 MB; + shadow + first frame 32.8 / 41.8 MB total |
 | server-allocated NV12 dumb buffers | per plane-placed Surface | 1.5 bytes/px × buffer count (~3 MB per 1080p buffer) |
 
 The helper's two rows are what the on-demand config buys back. They must
@@ -408,7 +420,7 @@ In order; tasks carry the `surface` tag on the task board.
    #3918 (refiled from #3900). **Built**; see "As built: client
    dma-bufs" above.
 7. Overview thumbnail atlas — #3902.
-8. `nitro-gpu` helper, always-on by default — #3901 (held; design first).
+8. `nitro-gpu` helper, always-on by default — #3901 → **#3920 built standalone** (crates + headless pixel tests); server integration follows the planes module.
 
 Alongside, and feeding into the items above:
 
