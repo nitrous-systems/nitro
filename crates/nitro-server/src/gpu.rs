@@ -42,11 +42,11 @@ pub const BACKOFF_MIN: Duration = Duration::from_millis(100);
 /// Longest restart delay.
 pub const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// Running this long resets the backoff.
-pub const HEALTHY: Duration = Duration::from_secs(60);
+pub const HEALTHY: Duration = Duration::from_mins(1);
 /// Crashes within [`GIVE_UP_WINDOW`] after which the server stops trying.
 pub const GIVE_UP_CRASHES: usize = 5;
 /// See [`GIVE_UP_CRASHES`].
-pub const GIVE_UP_WINDOW: Duration = Duration::from_secs(300);
+pub const GIVE_UP_WINDOW: Duration = Duration::from_mins(5);
 /// A helper that has not answered `Hello` by then is killed.
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 /// A `Composite` unanswered for this long means the helper hung.
@@ -566,10 +566,10 @@ impl Helper {
     /// `NITRO_GPU_HELPER` (already in `path`), else `nitro-gpu-vulkan`
     /// next to the server binary, else `$PATH`.
     fn helper_path(&self) -> PathBuf {
+        const NAME: &str = "nitro-gpu-vulkan";
         if let Some(p) = &self.path {
             return p.clone();
         }
-        const NAME: &str = "nitro-gpu-vulkan";
         if let Ok(exe) = std::env::current_exe()
             && let Some(dir) = exe.parent()
         {
@@ -588,8 +588,7 @@ impl Helper {
             return false;
         };
         match conn.send(msg, fds) {
-            Ok(()) => {}
-            Err(nitro_wire::Error::Io(rustix::io::Errno::AGAIN)) => {}
+            Ok(()) | Err(nitro_wire::Error::Io(rustix::io::Errno::AGAIN)) => {}
             Err(e) => {
                 debug!("gpu helper: send {}: {e}", msg.op());
                 return false;
@@ -624,8 +623,7 @@ impl Helper {
         }
         loop {
             match conn.read() {
-                Ok(()) => {}
-                Err(nitro_wire::Error::Io(rustix::io::Errno::AGAIN)) => {}
+                Ok(()) | Err(nitro_wire::Error::Io(rustix::io::Errno::AGAIN)) => {}
                 Err(nitro_wire::Error::Closed) => gone = true,
                 Err(e) => {
                     debug!("gpu helper: read: {e}");
@@ -691,7 +689,6 @@ impl Helper {
                 *state = State::Ready;
                 Some(Reply::Ready)
             }
-            FromHelper::Imported { .. } => None,
             FromHelper::Released { id } => {
                 texs.retain(|_, t| t.id != id);
                 None
@@ -743,7 +740,7 @@ impl Helper {
                 *last_stats = s;
                 None
             }
-            FromHelper::ReadBackReply { .. } => None,
+            FromHelper::Imported { .. } | FromHelper::ReadBackReply { .. } => None,
         }
     }
 
@@ -793,13 +790,12 @@ impl Helper {
             self.state = State::Off;
             return true;
         }
-        match self.backoff.crashed(Instant::now(), up_for) {
-            Some(d) => {
-                warn!("gpu helper died; restarting in {} ms", d.as_millis());
-                self.state = State::Backoff;
-                self.respawn_at = Some(Instant::now() + d);
-            }
-            None => {
+        if let Some(d) = self.backoff.crashed(Instant::now(), up_for) {
+            warn!("gpu helper died; restarting in {} ms", d.as_millis());
+            self.state = State::Backoff;
+            self.respawn_at = Some(Instant::now() + d);
+        } else {
+            {
                 warn!(
                     "gpu helper died {GIVE_UP_CRASHES} times in {} s; giving up until a VT switch or SIGHUP",
                     GIVE_UP_WINDOW.as_secs()

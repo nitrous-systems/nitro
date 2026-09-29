@@ -10376,7 +10376,7 @@ impl Server {
         let busy: Vec<SceneOutputId> = self
             .outputs
             .iter()
-            .filter(|o| self.backend.flip_pending(o.kms_id))
+            .filter(|o| self.backend.flip_pending(o.kms_id) || o.gpu_pending.is_some())
             .map(|o| o.scene_id)
             .collect();
         let output_of = |scene: &Scene, node: nitro_scene::NodeKey| {
@@ -12377,213 +12377,6 @@ fn scroll_blit_region(
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 60 Hz, the rate every interval below is measured against.
-    const HZ60: u32 = 16_666_667;
-
-    #[test]
-    fn flip_stats_track_intervals() {
-        let mut s = FlipStats::default();
-        s.record(Duration::from_millis(100), HZ60);
-        assert_eq!(s.mean_us(), 0);
-        s.record(Duration::from_millis(116), HZ60);
-        s.record(Duration::from_millis(134), HZ60);
-        assert_eq!(s.count, 2);
-        assert_eq!(s.min, Some(Duration::from_millis(16)));
-        assert_eq!(s.max, Duration::from_millis(18));
-        assert_eq!(s.mean_us(), 17_000);
-    }
-
-    #[test]
-    fn an_idle_gap_is_not_a_slow_frame() {
-        let mut s = FlipStats::default();
-        s.record(Duration::from_millis(100), HZ60);
-        s.record(Duration::from_millis(116), HZ60);
-        // The desktop sat still for a minute, then something moved. That
-        // minute is not a flip interval, and counting it would swamp every
-        // real sample.
-        s.record(Duration::from_mins(1), HZ60);
-        s.record(Duration::from_millis(60_016), HZ60);
-        assert_eq!(s.count, 2, "the idle gap was skipped");
-        assert_eq!(s.max, Duration::from_millis(16));
-        assert_eq!(s.mean_us(), 16_000);
-    }
-
-    #[test]
-    fn card_candidates_honour_override() {
-        assert_eq!(
-            card_candidates(Some(Path::new("/dev/dri/card9"))),
-            [PathBuf::from("/dev/dri/card9")]
-        );
-        let all = card_candidates(None);
-        assert!(all.windows(2).all(|w| w[0] <= w[1]), "sorted");
-    }
-
-    #[test]
-    fn error_display() {
-        let e = Error::NoDevice("nothing".into());
-        assert_eq!(e.to_string(), "no usable DRM device: nothing");
-        let e = Error::Io {
-            op: "accept",
-            source: io::Error::from(io::ErrorKind::Other),
-        };
-        assert!(e.to_string().starts_with("accept: "));
-    }
-
-    #[test]
-    fn the_fake_config_puts_all_three_sockets_in_one_directory() {
-        let c = Config::fake(320, 200, "/run/x/nitro/control.sock");
-        assert_eq!(c.control_path, PathBuf::from("/run/x/nitro/control.sock"));
-        assert_eq!(c.wire_path, PathBuf::from("/run/x/nitro/wire.sock"));
-        assert_eq!(c.shell_path, PathBuf::from("/run/x/nitro/shell.sock"));
-        assert!(!c.handle_signals);
-        assert!(c.input_dir.is_none());
-    }
-
-    #[test]
-    fn only_shell_tokens_are_privileged() {
-        // The token range *is* the capability check, so it is worth an
-        // assertion of its own: a wire token must never read as a shell one,
-        // however many clients have connected.
-        assert!(Server::is_shell(TOK_SHELL_BASE));
-        assert!(Server::is_shell(TOK_SHELL_BASE + 9_999));
-        assert!(!Server::is_shell(TOK_WIRE_BASE));
-        assert!(!Server::is_shell(TOK_WIRE_BASE + 9_999));
-        assert!(!Server::is_shell(TOK_CLIENT_BASE));
-        assert!(!Server::is_shell(TOK_WIRE_LISTENER));
-        assert!(!Server::is_shell(TOK_SHELL_LISTENER));
-        // A **remote** token sorts above the shell range, so `is_shell`
-        // is a window and not a threshold. Asserted rather than assumed:
-        // a remote client reading as privileged would hand `caps::SHELL`
-        // — layers, hotkeys, other clients' windows — to anything that
-        // can open a TCP port, which is the whole thing `docs/remote.md`
-        // promises cannot happen.
-        assert!(!Server::is_shell(TOK_REMOTE_BASE));
-        assert!(!Server::is_shell(TOK_REMOTE_BASE + 9_999));
-        assert!(!Server::is_shell(TOK_REMOTE_LISTENER));
-        assert!(Server::is_remote(TOK_REMOTE_BASE));
-        assert!(Server::is_remote(TOK_REMOTE_BASE + 9_999));
-        assert!(!Server::is_remote(TOK_SHELL_BASE));
-        assert!(!Server::is_remote(TOK_WIRE_BASE));
-        assert!(!Server::is_remote(TOK_CLIENT_BASE));
-    }
-
-    #[test]
-    fn every_shell_op_is_recognised_as_one() {
-        use nitro_wire::types::{Edge, Layer, WindowRef};
-        let shell: Vec<ClientMsg> = vec![
-            msg::SetLayer {
-                window: NodeId(1),
-                layer: Layer::Top,
-            }
-            .into(),
-            msg::SetExclusiveZone {
-                window: NodeId(1),
-                edge: Edge::Top,
-                px: 1,
-            }
-            .into(),
-            msg::SetAnchor {
-                window: NodeId(1),
-                edges: 0,
-                margin: 0,
-                output: 0,
-            }
-            .into(),
-            msg::BindKey {
-                id: 1,
-                mods: 0,
-                keysym: 1,
-            }
-            .into(),
-            msg::UnbindKey { id: 1 }.into(),
-            msg::GrabKeyboard {
-                window: NodeId(1),
-                on: true,
-            }
-            .into(),
-            msg::WindowList.into(),
-            msg::Outputs.into(),
-            msg::Lock.into(),
-            msg::Unlock.into(),
-            msg::SetOverview {
-                request: nitro_wire::types::OverviewRequest::Toggle,
-            }
-            .into(),
-            msg::FocusWindow {
-                window: WindowRef(1),
-            }
-            .into(),
-            msg::CloseWindow {
-                window: WindowRef(1),
-            }
-            .into(),
-            msg::SetWindowStateFor {
-                window: WindowRef(1),
-                state: nitro_wire::types::WindowState::Normal,
-            }
-            .into(),
-        ];
-        for m in &shell {
-            assert!(is_shell_op(m), "{} must need caps::SHELL", m.name());
-            assert_eq!(
-                m.op() & 0xff00,
-                0x0400,
-                "{} is in the shell op block",
-                m.name()
-            );
-        }
-        // And the ordinary ops are not: a false positive here would make the
-        // whole unprivileged protocol unusable on the wire socket.
-        for m in [
-            ClientMsg::from(msg::Commit { serial: 1 }),
-            msg::DestroyNode { id: NodeId(1) }.into(),
-            msg::SetWindowState {
-                window: NodeId(1),
-                state: nitro_wire::types::WindowState::Normal,
-            }
-            .into(),
-            msg::SetAppId {
-                window: NodeId(1),
-                app_id: String::new(),
-            }
-            .into(),
-            // The clipboard ops are open to every local client: routing
-            // them through `handle_shell_msg` would make paste a privilege.
-            msg::SetSelection { mimes: Vec::new() }.into(),
-            msg::RequestSelection {
-                request: 1,
-                source: nitro_wire::types::DataSource::Clipboard,
-                mime: "text/plain".to_owned(),
-            }
-            .into(),
-            // `ListOutputs` is answered in the shell block but is not a
-            // shell op: folding it into `handle_shell_msg` would make
-            // output enumeration a privilege again (M5-D).
-            msg::ListOutputs.into(),
-            // `SetCursor` (M5-E) is open to every client holding the
-            // pointer; see `Server::set_cursor_request`.
-            msg::SetCursor {
-                shape: nitro_wire::types::CursorShape::Text,
-            }
-            .into(),
-            // `StartMove` / `StartResize` (M5-F) are open to every client
-            // holding the pointer with a button down.
-            msg::StartMove { window: NodeId(1) }.into(),
-            msg::StartResize {
-                window: NodeId(1),
-                edges: 0,
-            }
-            .into(),
-        ] {
-            assert!(!is_shell_op(&m), "{} is not a shell op", m.name());
-        }
-    }
-}
-
 // ------------------------------------------------- the GPU helper (#3922)
 
 /// A client dma-buf's layout and fds as a helper texture source, when the
@@ -12692,7 +12485,7 @@ impl Server {
                 fourcc,
                 modifier,
                 slots,
-            } => self.gpu_import_ring(size, fourcc, modifier, slots),
+            } => self.gpu_import_ring(size, fourcc, modifier, &slots),
             gpu::Reply::RingFailed => warn!("gpu helper: no output ring; mode 2 off for this output"),
             gpu::Reply::ShadowRefused => {
                 warn!("gpu helper: shadow import refused; mode 2 off for this output");
@@ -12737,10 +12530,10 @@ impl Server {
             gpu::Reply::CompositeFailed { serial, code } => {
                 self.gpu.counters.refused_frames += 1;
                 self.gpu.borrows.done(serial);
-                if let Some(f) = self.gpu.ring.in_flight.take() {
-                    if let Some(s) = self.gpu.ring.slots.get_mut(f.slot) {
-                        s.state = gpu::SlotState::Free;
-                    }
+                if let Some(f) = self.gpu.ring.in_flight.take()
+                    && let Some(s) = self.gpu.ring.slots.get_mut(f.slot)
+                {
+                    s.state = gpu::SlotState::Free;
                 }
                 self.gpu.arm();
                 debug!("gpu frame {serial} refused: {code:?}");
@@ -12762,7 +12555,7 @@ impl Server {
         size: (u32, u32),
         fourcc: u32,
         modifier: u64,
-        slots: Vec<(nitro_gpu::proto::SlotLayout, OwnedFd)>,
+        slots: &[(nitro_gpu::proto::SlotLayout, OwnedFd)],
     ) {
         let Some(owner) = self.gpu.owner else {
             return;
@@ -12771,7 +12564,7 @@ impl Server {
             return;
         }
         let mut fbs = Vec::new();
-        for (layout, fd) in &slots {
+        for (layout, fd) in slots {
             let desc = nitro_kms::ImportDesc {
                 format: nitro_kms::Fourcc(fourcc),
                 width: size.0,
@@ -13196,6 +12989,7 @@ impl Server {
     /// A frame in mode 2: rasterize the damage into the shadow, and hand
     /// the helper `{slot, damage, layers}`. Never waits: the commit
     /// follows `Composited` (`gpu_commit`).
+    #[allow(clippy::too_many_lines)] // One frame's steps in order, like `paint`.
     fn paint_gpu(&mut self, index: usize) -> bool {
         if self.outputs[index].gpu_pending.is_some() {
             return false;
@@ -13280,6 +13074,22 @@ impl Server {
             }
         }
         let damage = gpu_rects(damage.rects(), bounds);
+        // Only an overlay's buffer changed: a plane-only flip over the
+        // slot already on screen, no composite.
+        if damage.is_empty()
+            && let Some(shown) = self.gpu.ring.shown
+            && let Some(fb) = self.gpu.ring.slots.get(shown).map(|s| s.fb)
+        {
+            let o = &mut self.outputs[index];
+            o.decision.layout[0].source = nitro_kms::PlaneSource::Buffer(fb);
+            let (id, layout) = (o.kms_id, o.decision.layout.clone());
+            if let Err(e) = self.backend.set_plane_state(id, &layout) {
+                warn!("{id}: staging planes: {e}");
+                self.planes_fallback(index);
+                return false;
+            }
+            return self.outputs[index].planes_dirty && self.flip_planes(index);
+        }
         let upload = gpu_rects(&rasterize, bounds);
         let layers_in: Vec<gpu::Layer> = o
             .gpu_layers
@@ -13497,3 +13307,211 @@ impl Server {
         pairs.push(("gpu_helper_drm_total", g.last_stats.drm_total));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 60 Hz, the rate every interval below is measured against.
+    const HZ60: u32 = 16_666_667;
+
+    #[test]
+    fn flip_stats_track_intervals() {
+        let mut s = FlipStats::default();
+        s.record(Duration::from_millis(100), HZ60);
+        assert_eq!(s.mean_us(), 0);
+        s.record(Duration::from_millis(116), HZ60);
+        s.record(Duration::from_millis(134), HZ60);
+        assert_eq!(s.count, 2);
+        assert_eq!(s.min, Some(Duration::from_millis(16)));
+        assert_eq!(s.max, Duration::from_millis(18));
+        assert_eq!(s.mean_us(), 17_000);
+    }
+
+    #[test]
+    fn an_idle_gap_is_not_a_slow_frame() {
+        let mut s = FlipStats::default();
+        s.record(Duration::from_millis(100), HZ60);
+        s.record(Duration::from_millis(116), HZ60);
+        // The desktop sat still for a minute, then something moved. That
+        // minute is not a flip interval, and counting it would swamp every
+        // real sample.
+        s.record(Duration::from_mins(1), HZ60);
+        s.record(Duration::from_millis(60_016), HZ60);
+        assert_eq!(s.count, 2, "the idle gap was skipped");
+        assert_eq!(s.max, Duration::from_millis(16));
+        assert_eq!(s.mean_us(), 16_000);
+    }
+
+    #[test]
+    fn card_candidates_honour_override() {
+        assert_eq!(
+            card_candidates(Some(Path::new("/dev/dri/card9"))),
+            [PathBuf::from("/dev/dri/card9")]
+        );
+        let all = card_candidates(None);
+        assert!(all.windows(2).all(|w| w[0] <= w[1]), "sorted");
+    }
+
+    #[test]
+    fn error_display() {
+        let e = Error::NoDevice("nothing".into());
+        assert_eq!(e.to_string(), "no usable DRM device: nothing");
+        let e = Error::Io {
+            op: "accept",
+            source: io::Error::from(io::ErrorKind::Other),
+        };
+        assert!(e.to_string().starts_with("accept: "));
+    }
+
+    #[test]
+    fn the_fake_config_puts_all_three_sockets_in_one_directory() {
+        let c = Config::fake(320, 200, "/run/x/nitro/control.sock");
+        assert_eq!(c.control_path, PathBuf::from("/run/x/nitro/control.sock"));
+        assert_eq!(c.wire_path, PathBuf::from("/run/x/nitro/wire.sock"));
+        assert_eq!(c.shell_path, PathBuf::from("/run/x/nitro/shell.sock"));
+        assert!(!c.handle_signals);
+        assert!(c.input_dir.is_none());
+    }
+
+    #[test]
+    fn only_shell_tokens_are_privileged() {
+        // The token range *is* the capability check, so it is worth an
+        // assertion of its own: a wire token must never read as a shell one,
+        // however many clients have connected.
+        assert!(Server::is_shell(TOK_SHELL_BASE));
+        assert!(Server::is_shell(TOK_SHELL_BASE + 9_999));
+        assert!(!Server::is_shell(TOK_WIRE_BASE));
+        assert!(!Server::is_shell(TOK_WIRE_BASE + 9_999));
+        assert!(!Server::is_shell(TOK_CLIENT_BASE));
+        assert!(!Server::is_shell(TOK_WIRE_LISTENER));
+        assert!(!Server::is_shell(TOK_SHELL_LISTENER));
+        // A **remote** token sorts above the shell range, so `is_shell`
+        // is a window and not a threshold. Asserted rather than assumed:
+        // a remote client reading as privileged would hand `caps::SHELL`
+        // — layers, hotkeys, other clients' windows — to anything that
+        // can open a TCP port, which is the whole thing `docs/remote.md`
+        // promises cannot happen.
+        assert!(!Server::is_shell(TOK_REMOTE_BASE));
+        assert!(!Server::is_shell(TOK_REMOTE_BASE + 9_999));
+        assert!(!Server::is_shell(TOK_REMOTE_LISTENER));
+        assert!(Server::is_remote(TOK_REMOTE_BASE));
+        assert!(Server::is_remote(TOK_REMOTE_BASE + 9_999));
+        assert!(!Server::is_remote(TOK_SHELL_BASE));
+        assert!(!Server::is_remote(TOK_WIRE_BASE));
+        assert!(!Server::is_remote(TOK_CLIENT_BASE));
+    }
+
+    #[test]
+    fn every_shell_op_is_recognised_as_one() {
+        use nitro_wire::types::{Edge, Layer, WindowRef};
+        let shell: Vec<ClientMsg> = vec![
+            msg::SetLayer {
+                window: NodeId(1),
+                layer: Layer::Top,
+            }
+            .into(),
+            msg::SetExclusiveZone {
+                window: NodeId(1),
+                edge: Edge::Top,
+                px: 1,
+            }
+            .into(),
+            msg::SetAnchor {
+                window: NodeId(1),
+                edges: 0,
+                margin: 0,
+                output: 0,
+            }
+            .into(),
+            msg::BindKey {
+                id: 1,
+                mods: 0,
+                keysym: 1,
+            }
+            .into(),
+            msg::UnbindKey { id: 1 }.into(),
+            msg::GrabKeyboard {
+                window: NodeId(1),
+                on: true,
+            }
+            .into(),
+            msg::WindowList.into(),
+            msg::Outputs.into(),
+            msg::Lock.into(),
+            msg::Unlock.into(),
+            msg::SetOverview {
+                request: nitro_wire::types::OverviewRequest::Toggle,
+            }
+            .into(),
+            msg::FocusWindow {
+                window: WindowRef(1),
+            }
+            .into(),
+            msg::CloseWindow {
+                window: WindowRef(1),
+            }
+            .into(),
+            msg::SetWindowStateFor {
+                window: WindowRef(1),
+                state: nitro_wire::types::WindowState::Normal,
+            }
+            .into(),
+        ];
+        for m in &shell {
+            assert!(is_shell_op(m), "{} must need caps::SHELL", m.name());
+            assert_eq!(
+                m.op() & 0xff00,
+                0x0400,
+                "{} is in the shell op block",
+                m.name()
+            );
+        }
+        // And the ordinary ops are not: a false positive here would make the
+        // whole unprivileged protocol unusable on the wire socket.
+        for m in [
+            ClientMsg::from(msg::Commit { serial: 1 }),
+            msg::DestroyNode { id: NodeId(1) }.into(),
+            msg::SetWindowState {
+                window: NodeId(1),
+                state: nitro_wire::types::WindowState::Normal,
+            }
+            .into(),
+            msg::SetAppId {
+                window: NodeId(1),
+                app_id: String::new(),
+            }
+            .into(),
+            // The clipboard ops are open to every local client: routing
+            // them through `handle_shell_msg` would make paste a privilege.
+            msg::SetSelection { mimes: Vec::new() }.into(),
+            msg::RequestSelection {
+                request: 1,
+                source: nitro_wire::types::DataSource::Clipboard,
+                mime: "text/plain".to_owned(),
+            }
+            .into(),
+            // `ListOutputs` is answered in the shell block but is not a
+            // shell op: folding it into `handle_shell_msg` would make
+            // output enumeration a privilege again (M5-D).
+            msg::ListOutputs.into(),
+            // `SetCursor` (M5-E) is open to every client holding the
+            // pointer; see `Server::set_cursor_request`.
+            msg::SetCursor {
+                shape: nitro_wire::types::CursorShape::Text,
+            }
+            .into(),
+            // `StartMove` / `StartResize` (M5-F) are open to every client
+            // holding the pointer with a button down.
+            msg::StartMove { window: NodeId(1) }.into(),
+            msg::StartResize {
+                window: NodeId(1),
+                edges: 0,
+            }
+            .into(),
+        ] {
+            assert!(!is_shell_op(&m), "{} is not a shell op", m.name());
+        }
+    }
+}
+

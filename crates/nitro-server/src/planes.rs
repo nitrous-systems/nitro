@@ -386,7 +386,6 @@ fn above(p: &PlaneInfo, primary: &PlaneInfo) -> bool {
     }
 }
 
-#[allow(clippy::too_many_lines, clippy::many_single_char_names)] // The strategies in order; splitting them would scatter the shared layout state.
 /// The search behind [`Planner::decide`]: the best layout the kernel
 /// accepts, with no cache and no hysteresis. `test` counts on its own.
 ///
@@ -398,19 +397,19 @@ pub fn search(inp: &Inputs<'_>, test: &mut dyn FnMut(&[PlaneConfig]) -> bool) ->
     if inp.helper.is_none() || inp.gpu.iter().all(|n| d.places(*n)) {
         return d;
     }
-    gpu_decision(inp, test, true).unwrap_or(d)
+    gpu_decision(inp, test, &|_| true).unwrap_or(d)
 }
 
 /// Mode 2: the primary shows the helper's ring, every helper-able Surface
-/// not on an overlay is composited by the helper. With `overlays`, an
-/// unobscured candidate (topmost first) may still take an overlay above
+/// not on an overlay is composited by the helper. An unobscured
+/// candidate `overlay_ok` admits (topmost first) may still take an overlay above
 /// the primary — never an underlay or direct scanout, which conflict with
 /// "the primary is the composite". `None` when there is nothing for the
 /// helper or the kernel refuses.
 pub fn gpu_decision(
     inp: &Inputs<'_>,
     test: &mut dyn FnMut(&[PlaneConfig]) -> bool,
-    overlays: bool,
+    overlay_ok: &dyn Fn(NodeKey) -> bool,
 ) -> Option<Decision> {
     let ring = inp.helper?;
     let primary = inp.planes.iter().find(|p| p.kind == PlaneKind::Primary)?;
@@ -426,14 +425,19 @@ pub fn gpu_decision(
         )],
         ..Decision::default()
     };
-    if overlays {
+    {
         let mut free: Vec<&PlaneInfo> = inp
             .planes
             .iter()
             .filter(|p| p.kind == PlaneKind::Overlay && above(p, primary))
             .collect();
         free.sort_by_key(|p| (zpos(p), p.id));
-        for c in inp.candidates.iter().rev().filter(|c| !c.obscured) {
+        for c in inp
+            .candidates
+            .iter()
+            .rev()
+            .filter(|c| !c.obscured && overlay_ok(c.node))
+        {
             let hit = free.iter().enumerate().find_map(|(i, p)| {
                 let cfg = config(c, p)?;
                 let mut l = d.layout.clone();
@@ -463,6 +467,7 @@ pub fn gpu_decision(
     Some(d)
 }
 
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)] // The strategies in order; see `search`.
 fn search_planes(inp: &Inputs<'_>, test: &mut dyn FnMut(&[PlaneConfig]) -> bool) -> Decision {
     let Some(primary) = inp.planes.iter().find(|p| p.kind == PlaneKind::Primary) else {
         return Decision::default();
@@ -705,8 +710,13 @@ impl Planner {
             d
         };
         want.rebind(inp.candidates, inp.helper);
+        // Leaving mode 2 for a plane layout is an upgrade too (#3922):
+        // each switch is a full repaint.
+        let leaves_gpu = self.current.mode == Mode::Gpu
+            && want.mode != Mode::Gpu
+            && !want.placed.is_empty();
         if std::mem::take(&mut self.immediate)
-            || want.placed.len() <= self.current.placed.len()
+            || (want.placed.len() <= self.current.placed.len() && !leaves_gpu)
             || self.current_sig == Some(sig)
         {
             self.pending = None;
@@ -728,7 +738,7 @@ impl Planner {
         // Only as the status quo: a mode 2 in force stays through the
         // wait, but a Surface never enters mode 2 just to wait for a plane.
         let meanwhile = if inp.helper.is_some() && self.current.mode == Mode::Gpu {
-            let overlays = !self.current.placed.is_empty();
+            let current = &self.current;
             let tests = &mut self.stats.tests;
             gpu_decision(
                 inp,
@@ -736,9 +746,9 @@ impl Planner {
                     *tests += 1;
                     let a: Vec<PlaneAssignment<'_>> =
                         l.iter().map(|c| c.assignment(None)).collect();
-                    test(&a).is_some_and(|v| v.accepted())
+                    test(&a).is_some_and(Verdict::accepted)
                 },
-                overlays,
+                &|n| current.places(n),
             )
         } else {
             None
@@ -1144,6 +1154,63 @@ mod tests {
             assert_eq!(r.decide(&[c]).mode, Mode::Composite);
         }
         assert_eq!(r.planner.stats.fallbacks, 1);
+    }
+
+    #[test]
+    fn a_second_video_on_kbl_goes_to_the_helper_and_leaving_waits() {
+        let other = IRect::new(200, 100, 160, 90);
+        let mut r = Rig::new(kbl());
+        let a = r.cand(1, Fourcc::NV12, (320, 180), window());
+        let b = r.cand(2, Fourcc::NV12, (160, 90), other);
+        // No helper: one plane (b), a on the CPU.
+        assert_eq!(r.search(&[a, b]).mode, Mode::Overlay);
+        // Helper ready: b on the overlay, a composited, the ring on the
+        // primary.
+        let ring = r.be.alloc_buffer(Fourcc::XRGB8888, W, H).unwrap();
+        r.gpu = vec![a.node, b.node];
+        r.helper = Some(ring);
+        let d = r.search(&[a, b]);
+        assert_eq!(d.mode, Mode::Gpu);
+        assert_eq!(d.placed, vec![(b.node, r.plane(1))]);
+        assert_eq!(d.gpu, vec![a.node]);
+        assert_eq!(d.layout[0].source, PlaneSource::Buffer(ring));
+        assert!(d.shows(a.node) && d.shows(b.node));
+        // Through the planner from composite: one more plane in use, so
+        // the upgrade rule applies (15 decisions and 250 ms).
+        let mut modes = Vec::new();
+        for _ in 0..UPGRADE_FRAMES + 2 {
+            modes.push(r.decide(&[a, b]).mode);
+        }
+        assert_eq!(
+            modes.iter().position(|m| *m == Mode::Gpu),
+            Some(UPGRADE_FRAMES as usize)
+        );
+        // Overlay (one plane) to Gpu (one plane, one more Surface off the
+        // CPU) is not an upgrade: at once.
+        let mut r2 = Rig::new(kbl());
+        let a2 = r2.cand(1, Fourcc::NV12, (320, 180), window());
+        let b2 = r2.cand(2, Fourcc::NV12, (160, 90), other);
+        for _ in 0..=UPGRADE_FRAMES {
+            r2.decide(&[a2, b2]);
+        }
+        assert_eq!(r2.decide(&[a2, b2]).mode, Mode::Overlay);
+        r2.gpu = vec![a2.node, b2.node];
+        r2.helper = Some(r2.be.alloc_buffer(Fourcc::XRGB8888, W, H).unwrap());
+        assert_eq!(r2.decide(&[a2, b2]).mode, Mode::Gpu);
+        // b goes away and a alone could take the overlay: an upgrade, so
+        // mode 2 stays for the hysteresis.
+        r.gpu = vec![a.node];
+        let mut modes = Vec::new();
+        for _ in 0..UPGRADE_FRAMES + 2 {
+            modes.push(r.decide(&[a]).mode);
+        }
+        assert_eq!(modes[0], Mode::Gpu);
+        let first = modes.iter().position(|m| *m == Mode::Overlay).unwrap();
+        assert_eq!(first, UPGRADE_FRAMES as usize);
+        // The helper lost: the next decision applies at once.
+        r.planner.helper_lost();
+        r.helper = None;
+        assert_eq!(r.decide(&[a]).mode, Mode::Overlay);
     }
 
     #[test]
