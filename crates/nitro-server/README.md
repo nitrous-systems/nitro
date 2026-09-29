@@ -488,6 +488,18 @@ hangs. A late `SendSelection` for a cancelled request is dropped quietly.
 `DATA` is advertised only on local links: every leg carries a descriptor,
 which TCP cannot. The drag half of `DATA` is refused until M5-I.
 
+### Surfaces (caps `SURFACE`, #3897)
+
+`SURFACE` is advertised on local links only and must be listed in
+`ClientCaps`. `CreateSurfaceBuffer` is mapped at receipt like
+`CreateBuffer` (same caps, same id space); `SetSurface` is buffered to the
+commit; `PresentSurface` is handled at receipt and queued in
+`surface::Latch` until the node's output has no flip pending (newest
+frame wins, superseded buffers released at once). `SurfaceHint` (NV12 at
+the node's device size in v1) is sent after each scene update whose size
+changed. The full contract is `docs/wire.md` § Surfaces; measurements are
+under "#3897" at the end of this file.
+
 ## Frame path
 
 One pass, for each output, every time an event could have changed
@@ -1347,3 +1359,26 @@ owns. It roughly doubles the server's resident set on this box, it is
 exactly `1920 × 1080 × 4` per output, and it does not move with the number
 of windows (the two-window delta is 2.6 MB either way). `docs/budget.md`
 argues the trade rather than hiding it.
+
+### #3897: Surface v1, the CPU video path
+
+`nitro-demo --video` against branch task-3897 on the box (NV12, BT.709
+limited, a ring of three sealed memfds, frames sent with `PresentSurface`
+and latched at vblank). Only the moving box and the counter are damaged
+per frame; `max` is the first full-frame paint.
+
+| run | `paint_us` per video frame (mean) | p95 | max | `damage_px` mean | presented / dropped in 8 s |
+|---|---|---|---|---|---|
+| 1280×720 windowed, 30 fps | ≈ 740 (all-paint mean 371: every other paint is an age-2 carry) | 740 | 2 225 | 51 422 | 239 / 0 |
+| 1280×720 windowed, 60 fps | 679 | 705 | 2 205 | 49 281 | 478 / 0 |
+| 1920×1080 fullscreen, 60 fps | 1 388 | 1 432 | 6 118 | 110 938 | 478 / 0 |
+
+**Surface paint path.** `PaintKind::Surface` is painted in
+`frame::paint_surface`: the node's device rect rounded outward, the
+buffer's fourcc dispatched to `blit_nv12`, `blit_yuyv` (YUYV/UYVY),
+`blit`/`blit_xrgb_scaled` (XR24) or a blended `blit` (AR24). YUV and XR24
+are stores and ignore node opacity in v1. The latch (`surface::Latch`)
+runs in `settle` and `on_flip` for outputs with no flip pending; latched
+serials join the output's `painting` list, so `Presented` goes out
+exactly like a commit's. `SURFACE` is advertised on local links only;
+`DMABUF` is not advertised.

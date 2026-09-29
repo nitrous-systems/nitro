@@ -1228,6 +1228,30 @@ recorded so a future milestone can re-open the decision on the same terms:
    import decide whether full-screen image blits go through the CPU rasterizer
    at all. If they do, the decision gets re-made against the real workload.
 
+## Surface CPU path (#3897)
+
+`nitro-demo --video` on box1 (Pentium G3240, HDMI 1920×1080), branch
+task-3897, `samples paint`/`samples damage` over an 8 s run with the first
+30 paints dropped. The client damages only what moved (the box, its old
+position, the frame counter), so these are **per-frame partial** costs;
+the first full-frame paint is the `max` column.
+
+| run | paints | `paint_us` p50 | mean | p95 | max (full frame) | `damage_px` mean | presented / dropped |
+|---|---|---|---|---|---|---|---|
+| 1280×720 windowed, 30 fps | 453 | — | 371 (≈ 740 per video frame) | 740 | 2 225 | 51 422 | 239 / 0 |
+| 1280×720 windowed, 60 fps | 452 | 676 | 679 | 705 | 2 205 | 49 281 | 478 / 0 |
+| 1920×1080 fullscreen, 60 fps | 453 | 1 364 | 1 388 | 1 432 | 6 118 | 110 938 | 478 / 0 |
+
+At 30 fps every video frame is followed by an age-2 carry frame that has
+nothing to rasterize (`paint_us` ≈ 1), so the mean over all paints is half
+the per-video-frame cost. A full 1080p NV12 frame through the fused
+converter is ~6 ms, inside a 60 Hz budget but not a 120 Hz one; the plane
+path (#3899) is what removes it.
+
+**Memory.** The client's ring is 3 NV12 buffers at 1.5 B/px: **4.1 MB** at
+720p, **9.3 MB** at 1080p, mapped read-only by the server (no copy) and
+counted against the per-client buffer caps.
+
 
 ## Dependency count
 
