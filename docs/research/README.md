@@ -25,6 +25,13 @@ split-view blueprint (`docs/ui.md`, "Split view blueprint",
   the **architecture decision** for nitro's own overview, with the
   measurements it rests on — the summary is `docs/wm.md` §Overview mode.
 
+**Media**:
+
+* [`media-kit.md`](media-kit.md) — the BeOS Media Kit (Be Book): the
+  file/track API, nodes as cross-process handles, shared-memory buffer
+  pools, time sources and run modes. It feeds `docs/media.md`, the
+  out-of-process `nitro-media` design.
+
 The screenshots and SCSS the analyses cite live in the gitignored
 `tmp/research/`; the numbers were read off them and are reproduced in
 the documents, so the PNGs are not needed in-tree.
