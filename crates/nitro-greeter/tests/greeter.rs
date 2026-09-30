@@ -6,9 +6,7 @@ use std::io;
 use std::os::fd::BorrowedFd;
 use std::rc::Rc;
 
-use nitro_greeter::{
-    Backend, Greeter, Remembered, SessionEntry, State, build, names, on_response,
-};
+use nitro_greeter::{Backend, Greeter, Remembered, SessionEntry, State, build, names, on_response};
 use nitro_login::{ErrorKind, MessageKind, Request, Response};
 use nitro_ui::event::key;
 use nitro_ui::introspect;
@@ -52,7 +50,7 @@ fn greeter(remembered: Remembered) -> (Harness<Greeter>, Scripted) {
     let b = Scripted::default();
     let mut h = Harness::shell(
         "nitro-greeter",
-        Greeter::greeter(Box::new(b.clone()), sessions(), remembered)
+        Greeter::login(Box::new(b.clone()), sessions(), remembered)
             .with_session_socket(std::env::temp_dir().join("nitro-greeter-test-no-such.sock")),
         nitro_greeter::surface(),
         Some(Size::new(480.0, 640.0)),
@@ -268,7 +266,12 @@ fn lock_mode_hides_the_greeter_controls() {
         build,
     );
     h.settle();
-    for n in [names::SESSION, names::SUSPEND, names::REBOOT, names::POWEROFF] {
+    for n in [
+        names::SESSION,
+        names::SUSPEND,
+        names::REBOOT,
+        names::POWEROFF,
+    ] {
         assert!(!shown(&mut h, n), "{n} is greeter-only");
     }
 }

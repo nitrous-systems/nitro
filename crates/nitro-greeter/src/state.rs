@@ -78,7 +78,10 @@ pub fn save(p: &std::path::Path, r: &Remembered) {
     let res = std::fs::write(&tmp, r.render()).and_then(|()| std::fs::rename(&tmp, p));
     if let Err(e) = res {
         let _ = std::fs::remove_file(&tmp);
-        eprintln!("nitro-greeter: remembering the login in {}: {e}", p.display());
+        eprintln!(
+            "nitro-greeter: remembering the login in {}: {e}",
+            p.display()
+        );
     }
 }
 

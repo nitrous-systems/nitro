@@ -171,7 +171,11 @@ mod tests {
         assert_eq!(got[0].cmd, ["/opt/nitro-session"], "ours, not the file's");
         assert_eq!(got[2].cmd, ["sway", "--unsupported-gpu"]);
         assert_eq!(got[2].desktop, "sway");
-        assert!(got[2].env().contains(&"XDG_SESSION_DESKTOP=sway".to_owned()));
+        assert!(
+            got[2]
+                .env()
+                .contains(&"XDG_SESSION_DESKTOP=sway".to_owned())
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 

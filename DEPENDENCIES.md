@@ -279,7 +279,18 @@ The lock screen's other two crates add **zero** external names.
 button's `session.sock`), `rustix`, and `nitro-bar` for its clock
 (`clock::{Zone, format_hm, ms_to_next_minute}`): reuse of a workspace
 crate, the files → launcher precedent, not a dependency in the sense this
-file counts.
+file counts. Since #3951 it also uses `nitro-launcher` (the `.desktop`
+reader, for `/usr/share/wayland-sessions`) on the same terms: 0 external
+names, `Cargo.lock` unchanged apart from that workspace edge.
+
+**greetd is a runtime requirement of the login path, not a crate.** The
+greeter (`nitro-greeter` in greeter mode, `nitro-session --greeter`)
+speaks greetd's socket protocol through `nitro-login`'s hand-rolled codec.
+greetd itself is a system package, like systemd and logind: nothing in
+this tree links it, and `greetd_ipc` (serde + serde_json) is not used
+(`docs/greeter.md`, decision 3). `just install-greetd` installs only a
+config file. The zero-install alternative (getty + profile) needs nothing
+at all.
 
 ## Vendored assets
 

@@ -100,8 +100,28 @@ overwrites an existing file, so an admin's edit survives a re-install.
 `nitro-session` needs a VT and DRM master. It is neither a Wayland nor an X
 compositor, so nothing is installed into `wayland-sessions/` or
 `xsessions/`: a display manager would start it as the wrong kind of
-session. Start it from tty1 (`exec nitro-session` in the login shell's
-profile) or from greetd. See [greeter.md](greeter.md).
+session. There are two ways in (the login design is in
+[greeter.md](greeter.md)):
+
+**A. getty + profile (zero install).** Log in on tty1 at the text
+console and put this in `~/.bash_profile`:
+
+```sh
+[ "$(tty)" = /dev/tty1 ] && [ -z "$NITRO_SOCKET" ] && exec nitro-session
+```
+
+`login` has already opened a logind session, so the compositor gets the
+seat as it would under any display manager. Logging out of nitro drops
+back to the getty.
+
+**B. greetd + `nitro-greeter` (a login screen).** Install greetd from
+your distribution (`pacman -S greetd`, `apt install greetd`), then
+`just install install-greetd`, and switch display managers with the two
+commands it prints. The greeter is a nitro-ui app running on its own
+nitro-server as the greeter user. It renders whatever PAM asks, offers
+nitro and the machine's `/usr/share/wayland-sessions` entries, and has
+suspend/restart/power-off buttons. See [greeter.md](greeter.md)
+and [deploy/greetd/README.md](../deploy/greetd/README.md).
 
 ## Chromium (optional)
 

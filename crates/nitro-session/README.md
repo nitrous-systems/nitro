@@ -28,6 +28,7 @@ starts the whole session locked (see "Locking" below).
 ```console
 $ nitro-session                              # the whole desktop
 $ nitro-session --locked                     # …behind the lock screen
+$ nitro-session --greeter                    # greetd's greeter: server + nitro-greeter
 $ NITRO_SESSION_PIECES= nitro-session        # the compositor alone
 $ NITRO_SESSION_PIECES=nitro-bar nitro-session   # …and just the bar
 $ printf 'status\n' | nc -U $XDG_RUNTIME_DIR/nitro/session.sock
@@ -202,6 +203,26 @@ The lock screen is a piece with its own rules (`Role::Lock`):
 
 Super+L is the bar's binding (`crates/nitro-bar`), which sends `lock`
 here. The server ignores shell bindings while locked.
+
+## The greeter profile
+
+`nitro-session --greeter` is what greetd runs as its greeter
+(`deploy/greetd/config.toml`, `docs/greeter.md` decision 2). The pieces
+are `[nitro-server, nitro-greeter]` (`pieces::GREETER_PIECES`): no shell
+and no lock slot. `NITRO_SESSION_PIECES` is ignored, with a warning,
+because it selects among the desktop's shell pieces. The greeter is the
+**primary** piece (`Role::Primary`):
+
+- **Exit 0 is the hand-off**: greetd accepted `start_session`. The
+  session tears down in reverse order and exits 0 (`session ended:
+  Stopped`). greetd then starts the user's session on the same VT.
+- **Anything else is a crash**, restarted with the shell backoff and
+  never given up: a greeter that cannot come back means nobody can log
+  in.
+- The server's exit ends the session as always, and greetd restarts the
+  greeter.
+
+`--locked` and `--greeter` together are a usage error.
 
 ## The protocol
 

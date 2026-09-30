@@ -326,7 +326,12 @@ box-greetd:
     greeter=$(ssh {{box}} 'getent passwd greeter >/dev/null && echo greeter || echo _greetd')
     bindir=$(ssh {{box}} 'echo {{box_bindir}}')
     mkdir -p tmp
-    sed -e "s|@BINDIR@|$bindir|g" -e "s|@GREETER_USER@|$greeter|g" deploy/greetd/config.toml > tmp/greetd-config.toml
+    # The greeter's server reads /etc/nitro/server.conf (seeded once from
+    # the box user's, so the greeter has the same keymap and scale).
+    ssh {{box}} 'test -e /etc/nitro/server.conf || { test -e ~/.config/nitro/server.conf && sudo install -Dm644 ~/.config/nitro/server.conf /etc/nitro/server.conf; } || true'
+    sed -e "s|@BINDIR@|$bindir|g" -e "s|@GREETER_USER@|$greeter|g" \
+        -e 's|^command = "env |command = "env NITRO_CONFIG=/etc/nitro/server.conf |' \
+        deploy/greetd/config.toml > tmp/greetd-config.toml
     ssh {{box}} 'mkdir -p ~/nitro-stage'
     rsync -az tmp/greetd-config.toml {{box}}:nitro-stage/greetd-config.toml
     ssh {{box}} "set -e

@@ -10,22 +10,23 @@ NITRO_BOX=testhost2 just footprint   # the same, from the environment
 ```
 
 The box's **profile** (`box_profile`) says how it runs nitro. It is
-guessed from the host name (`testhost2` / `192.168.1.193` → `gdm`,
+guessed from the host name (`testhost2` / `192.168.1.193` → `greetd`,
 anything else → `unit`), and `NITRO_BOX_PROFILE` forces it.
 `NITRO_BOX_BINDIR` overrides where the binaries live. Both boxes keep
 their clone at `~/src/ai/nitro`, and `just box-push` pushes `main` to it.
 
-| recipe | `unit` (box1) | `gdm` (testbox2) |
+| recipe | `unit` (box1) | `greetd` (testbox2) |
 |---|---|---|
 | `deploy-bins` | rsync → `~/nitro-bin`, entries → `~/.local/share/applications` | stage in `~/nitro-stage`, `sudo install` → `/usr/local/bin`, entries → `/usr/local/share/applications`; examples → `~/nitro-bin` |
 | `deploy` | + restart `nitro-dev` | install only (no autologin: a restart would leave the greeter) |
-| `box-restart` | restart `nitro-dev` | restart `gdm` (ends the session, greeter) |
-| `box-status` / `box-log` / `box-stop` | the `nitro-dev` unit | `loginctl` + `pgrep`, the journal by `_COMM`, stop `gdm` |
-| `box-install` | install the unit | make the clone pushable, check the GDM session entry |
+| `box-restart` | restart `nitro-dev` | restart `greetd` (ends the session, greeter) |
+| `box-status` / `box-log` / `box-stop` | the `nitro-dev` unit | `loginctl` + `pgrep`, the journal by `_COMM` (incl. `nitro-greeter`, `greetd`), stop `greetd` |
+| `box-install` | install the unit | make the clone pushable, check greetd is enabled |
 | `box-ps`, `footprint` | tree under the unit's MainPID | tree under the oldest `nitro-session` |
 | `shot`, `bench-bandwidth` | `~/nitro-bin/…` | `/usr/local/bin/…` |
 | `bench` | runs | **refuses** (no unit to restart between arms) |
 | `deploy-chromium` | apt + AppArmor profile | pacman `at-spi2-core`, no AppArmor step |
+| `box-greetd` / `box-greetd-rollback` | greetd on tty1 from `~/nitro-bin` (nitro-dev stays on tty2) | greetd as *the* display manager from `/usr/local/bin`, gdm disabled |
 
 ## box1: Pentium G3240 (Haswell)
 
@@ -43,6 +44,7 @@ snappy here, it is snappy.
 | Libs | libseat 0.9, libinput 1.31, libdrm 2.4.131, libxkbcommon 1.13 |
 | Tools | `perf`, `ydotool`, `chvt`, rustup (`~/.cargo/bin`) |
 | Repo | `~/src/ai/nitro` — push with `just box-push` (the `box` git remote is the same URL) |
+| Login | **greetd on tty1** (#3951): the nitro greeter as `_greetd`, from `~/nitro-bin`; getty@tty1 disabled. `nitro-dev` stays on tty2 as the measurement harness |
 
 ## Loop
 
@@ -95,7 +97,8 @@ supervises all four. So `pgrep nitro` shows five processes, a
 ## testbox2: i5-8250U (Kaby Lake R, Gen9), `testhost2`
 
 `ssh testhost2` (user kaspar, passwordless sudo, key access; host name
-`ng`, 192.168.1.193). A laptop on which GDM starts nitro from
+`ng`, 192.168.1.193). A laptop on which greetd (since #3951; GDM
+before) runs the nitro greeter, and the human logs in to nitro from
 `/usr/local/bin`. The human uses it now and then but has released it for
 measurements (#3917). It is here for what box1 cannot do:
 Gen9 display planes with NV12 and scalers, full anv Vulkan, and VA-API
@@ -109,7 +112,7 @@ on iHD.
 | Power | **suspend disabled** (#3917, at the human's request, after the box went to sleep at the greeter): `sleep`/`suspend`/`hibernate`/`hybrid-sleep`/`suspend-then-hibernate.target` masked, `/etc/systemd/logind.conf.d/nitro-no-sleep.conf` ignores lid and idle. cpufreq `intel_pstate` (active), governor `powersave`, EPP `balance_performance`, left as found for every measurement |
 | Outputs | eDP-1 2560×1440@60 (`2560x1440@59997`) connected (scale 1.25 in `~/.config/nitro/server.conf`, `de` keymap); DP-1, HDMI-A-1, DP-2 disconnected |
 | Planes | per pipe: primary + 1 overlay + cursor; 2 scalers on pipes A/B, 1 on C. Measured in [`crates/nitro-kms/README.md`](../crates/nitro-kms/README.md#testbox2-intel-uhd-620-kaby-lake-r-gen9-i915-kernel-722-25601440-edp--2026-09-29) |
-| Seat | GDM + logind (session on seat0/tty2); seatd 0.9.3 present |
+| Seat | greetd + logind (greeter and user session on seat0/tty1); gdm installed but **disabled**; seatd 0.9.3 present |
 | Libs | Mesa 26.2.3, vulkan-intel (anv) 26.2.3, intel-media-driver (iHD) 26.2.4 + libva-intel-driver, libva 2.24.1, libinput 1.32, libxkbcommon 1.13.2, libdrm 2.4.134 |
 | Tools | `perf`, `chvt`, `sqlite3`, `python3`, `vulkaninfo` (vulkan-tools), `vainfo` (libva-utils), rustc 1.95 |
 | Repo | `~/src/ai/nitro` (moved from `~/src/nitro` in #3911; `receive.denyCurrentBranch=updateInstead`) |
@@ -125,14 +128,14 @@ JPEG, VP8, HEVC Main/Main10. Plus VideoProc (scaling/CSC).
 Rules for this box:
 
 - **Free for measurements** (the human, 2026-09-29): stopping and
-  restarting GDM and nitro is fine. `just box=testhost2 deploy`
+  restarting greetd and nitro is fine. `just box=testhost2 deploy`
   installs into `/usr/local/bin` and does **not** restart anything; the
-  new build runs from the next login. GDM autologin is off, so
+  new build runs from the next login. There is no autologin, so
   `box-restart` / `box-stop` leave the greeter.
-- **Leave a working session behind**: `sudo systemctl start gdm` at the
-  end, with a build that runs, and say in `nitro-testbox` what is
+- **Leave a working session behind**: `sudo systemctl start greetd` at the
+  end (greetd is the display manager; do not re-enable gdm), with a build that runs, and say in `nitro-testbox` what is
   deployed.
-- There is no *permanent* `nitro-dev` unit (it would fight GDM for tty2),
+- There is no *permanent* `nitro-dev` unit (greetd does not use tty2, but a login there would be a second seat user),
   and `just bench` refuses on this box. For a measurement window, #3917
   installed box1's unit **temporarily** and ran the box1 scripts
   directly, which gives the same shape as box1 (a logind session on tty2,
@@ -141,15 +144,15 @@ Rules for this box:
   ```console
   $ sed 's#/home/kaspar/nitro-bin/nitro-session#/usr/local/bin/nitro-session#' \
       deploy/nitro-dev.service | ssh testhost2 'sudo tee /etc/systemd/system/nitro-dev.service >/dev/null &&
-      sudo systemctl daemon-reload && sudo systemctl stop gdm && sudo systemctl start nitro-dev'
+      sudo systemctl daemon-reload && sudo systemctl stop greetd && sudo systemctl start nitro-dev'
   $ ssh testhost2 'ln -sf /usr/local/bin/nitro-server /usr/local/bin/nitro-bench ~/nitro-bin/'  # bench.sh fingerprints ~/nitro-bin
   $ ssh testhost2 'NITRO_BENCH_SHA='$(git rev-parse --short HEAD)' bash -s' -- --seconds 6 < deploy/bench.sh
   $ just box=testhost2 footprint 60      # box-ps finds the tree under the oldest nitro-session
-  # afterwards: stop nitro-dev, rm the unit and the two symlinks, daemon-reload, start gdm
+  # afterwards: stop nitro-dev, rm the unit and the two symlinks, daemon-reload, start greetd
   ```
 
-  Remove the unit afterwards. A unit left enabled alongside GDM is the
-  tty2 fight.
+  Remove the unit afterwards, and start greetd again: stopped, the box
+  has no login screen.
 - The box has **no `ydotool`**. Input goes through the control socket's
   `input` request (`docs/latency.md` §7), which is the better instrument
   anyway.
@@ -245,7 +248,7 @@ To test on a box:
    PAM's reason, and the screen stays locked. **At most two in a row**:
    `pam_faillock` locks the account after a few.
 3. The right one (`hey nitro-greeter set window/answer value …`, then
-   `hey nitro-greeter do window/answer activate`, or typed with ydotool
+   `hey nitro-greeter do window/answer submit` (a text field's action is `submit`), or typed with ydotool
    on box1): the desktop comes back, and `box-session` shows
    `nitro-greeter -` (exit 0, not restarted).
 4. `kill -9` the greeter while locked: `just shot` still shows no
@@ -256,9 +259,120 @@ A `--locked` start, temporarily: on box1,
 `sudo systemctl edit nitro-dev` with
 `[Service]` / `ExecStart=` / `ExecStart=/home/kaspar/nitro-bin/nitro-session --locked`,
 restart, and remove the drop-in (`sudo systemctl revert nitro-dev`)
-afterwards. On testbox2, GDM's session entry runs
-`/usr/local/bin/nitro-session` with no flag; test `--locked` in a
-temporary copy of the entry, and delete it afterwards.
+afterwards. On testbox2, greetd starts the user's session as
+`/usr/local/bin/nitro-session` with no flag; test `--locked` with a
+temporary `[initial_session]` block in `/etc/greetd/config.toml`
+(`command = "/usr/local/bin/nitro-session --locked"`, `user = "kaspar"`),
+`systemctl restart greetd`, and remove the block afterwards.
+
+## Login (greetd)
+
+Since #3951 both boxes log in through greetd with `nitro-greeter` as
+the greeter (`docs/greeter.md`). Set up, idempotently, with:
+
+```console
+$ just box-greetd                   # box1: greetd on tty1, nitro-dev keeps tty2
+$ just box=testhost2 box-greetd     # testbox2: greetd replaces gdm
+$ just box=testhost2 box-greetd-rollback   # undo: greetd off, gdm (or getty@tty1) back
+```
+
+`box-greetd` installs the package (apt or pacman), renders
+`deploy/greetd/config.toml` with the box's bin dir and greeter user,
+backs up the package's config once as `/etc/greetd/config.toml.pre-nitro`,
+creates `/var/cache/nitro-greeter` (the remembered user), seeds
+`/etc/nitro/server.conf` from the box user's (the greeter's keymap and
+scale: testbox2's `de` and 1.25), and switches the display manager.
+Details that bit on the way:
+
+- **Greeter users differ**: `_greetd` (uid 110) on Ubuntu, `greeter`
+  (uid 912, home `/`) on Arch. The config sets `XDG_CACHE_HOME` for
+  Mesa's shader cache, which otherwise fails on `//.cache`.
+- **Ubuntu's `greetd.service` conflicts with `getty@tty7`**, its default
+  VT, not tty1. Our config uses VT 1, so on box1 getty@tty1 and greetd
+  fought over it (greetd lost at the first login and systemd restarted
+  it with a new PID). `box-greetd` adds the drop-in
+  `greetd.service.d/nitro-vt1.conf` (`Conflicts=getty@tty1`) and
+  disables getty@tty1; the rollback removes both.
+- **box1 runs `~/nitro-bin`**, and `/home/kaspar` is 0750: `box-greetd`
+  gives the greeter user an ACL `x` on it (`setfacl -m u:_greetd:x`,
+  installing `acl` if needed). Any other user logging in on box1 needs
+  the same to reach `nitro-session`.
+- **Logs**: greetd gives the session its VT as stdio, so the config runs
+  it under `systemd-cat`: the greeter's tree logs as
+  `nitro-greeter-session`, a user session (the built-in Nitro entry) as
+  `nitro-session`. `just box-log` follows both.
+- On box1 the idle greeter's compositor lives on VT 1 while `nitro-dev`
+  is on tty2: it adds its RSS (a server, the GPU helper, the greeter) to
+  the box's memory, but not to the `nitro-dev` tree that `box-ps` and
+  `footprint` measure. `chvt 1` shows it, and nitro-dev's
+  `ExecStopPost=chvt 1` now lands on it.
+
+**Driving the greeter** (as the greeter user, whose runtime dir holds
+the app's introspection socket; name the pid when a killed greeter left
+a stale socket):
+
+```console
+$ g() { sudo -u _greetd env XDG_RUNTIME_DIR=/run/user/110 ~/nitro-bin/hey nitro-greeter "$@"; }
+$ g set window/user value nitrotest; g do window/user submit
+$ g get window/prompt value          # Password:
+$ g set window/answer value …; g do window/answer submit
+$ g do window/session click          # next session in the picker
+```
+
+Do not put a password on a `sudo` command line: sudo logs it to the
+journal. `deploy/greetd/cycle.sh` reads it from a 0600 file instead.
+
+**The ten-cycle test.** A throwaway user `nitrotest` with a random
+password (generated locally in `./tmp`, never committed) was created on
+each box, and **deleted afterwards** (`userdel -r`, and its ACL entry on
+box1), so no test account stays on either box. `deploy/greetd/cycles.sh 10`
+(run on the box from `~/nitro-stage`, with `cycle.sh` beside it) logs in
+through the greeter with `hey`, checks the user session answers `status`
+on its `session.sock`, sends `logout`, waits for the greeter to be back,
+and prints one row per cycle from the journal. Handoff is greeter exit
+("handed off") → the user session's "server ready". 2026-09-30, build
+from task-3951:
+
+box1 (HSW, HDMI 1080p; nitro-dev running on tty2 throughout):
+
+| cycle | greetd pid | greeter `first_frame_ms` | user `first_frame_ms` | handoff ms | greeter session | DRM/libseat errors | user session |
+|---|---|---|---|---|---|---|---|
+| 1 | 572621 | 230 | 221 | 871 | Stopped | 0 | ok |
+| 2 | 572621 | 227 | 168 | 528 | Stopped | 0 | ok |
+| 3 | 572621 | 218 | 222 | 547 | Stopped | 0 | ok |
+| 4 | 572621 | 217 | 228 | 569 | Stopped | 0 | ok |
+| 5 | 572621 | 214 | 206 | 521 | Stopped | 0 | ok |
+| 6 | 572621 | 183 | 195 | 520 | Stopped | 0 | ok |
+| 7 | 572621 | 194 | 180 | 525 | Stopped | 0 | ok |
+| 8 | 572621 | 205 | 180 | 531 | Stopped | 0 | ok |
+| 9 | 572621 | 212 | 197 | 537 | Stopped | 0 | ok |
+| 10 | 572621 | 205 | 235 | 572 | Stopped | 0 | ok |
+
+testbox2 (KBL, eDP 2560×1440 at 1.25):
+
+| cycle | greetd pid | greeter `first_frame_ms` | user `first_frame_ms` | handoff ms | greeter session | DRM/libseat errors | user session |
+|---|---|---|---|---|---|---|---|
+| 1 | 460647 | 278 | 304 | 776 | Stopped | 0 | ok |
+| 2 | 460647 | 283 | 264 | 548 | Stopped | 0 | ok |
+| 3 | 460647 | 297 | 244 | 525 | Stopped | 0 | ok |
+| 4 | 460647 | 312 | 269 | 551 | Stopped | 0 | ok |
+| 5 | 460647 | 271 | 272 | 551 | Stopped | 0 | ok |
+| 6 | 460647 | 270 | 256 | 538 | Stopped | 0 | ok |
+| 7 | 460647 | 296 | 267 | 556 | Stopped | 0 | ok |
+| 8 | 460647 | 274 | 243 | 539 | Stopped | 0 | ok |
+| 9 | 460647 | 283 | 258 | 542 | Stopped | 0 | ok |
+| 10 | 460647 | 283 | 258 | 535 | Stopped | 0 | ok |
+
+The greetd PID never changed, and every greeter tree ended with
+`session ended: Stopped` (exit 0 after the hand-off). The second server
+always got DRM master; there was not one libseat or DRM-master error.
+The handoff (~530 ms, ~870 ms on the first, cold login) is greetd's PAM
+session setup plus the user's systemd manager starting; the user's
+`first_frame_ms` comes after it. Also checked on both: `kill -9` of
+nitro-greeter at the greeter is restarted after the 1 s backoff and the
+new one logs in; killed *mid-conversation*, its successor at first
+showed greetd's "a session is already being configured", which is why
+the greeter now sends `cancel_session` when it starts.
 
 ## Chromium (#3865)
 

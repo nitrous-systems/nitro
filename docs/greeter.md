@@ -1,6 +1,7 @@
 # Login: greetd + `nitro-greeter`
 
-Status: **in progress**. Steps 1–4 of the plan below are built (step 4 without the greetd config, which moves to step 5). The page
+Status: **implemented** (#3951). All six steps of the plan below are
+built, and both test boxes log in through greetd. The page
 argues where the line goes, what the new pieces are, and what each one
 costs, so each commit can be small.
 
@@ -481,13 +482,35 @@ In order. Each step can land on its own:
    before the machine sleeps; both need a D-Bus client
    (`crates/nitro-session/src/power.rs`). The greetd config moves to
    step 5.
-5. **The greeter**: `greetd.rs` (codec and tests), the same state
-   machine as the greetd backend, and `nitro-session --greeter` with
-   `Role::Primary`. Then `deploy/greetd/`, and a `docs/testbox.md`
-   section with ten login/logout cycles.
-6. **Docs**: README option A (getty + profile) as the zero-install path,
-   and a `DEPENDENCIES.md` note that greetd is a runtime requirement of
-   the login path, not a crate.
+5. **The greeter**: done (#3951). The codec stayed in `nitro-login`
+   (step 3); `nitro-greeter/src/greetd.rs` is only the transport, a
+   second `Backend` over `$GREETD_SOCK` (lazy connect, blocking writes,
+   `recv(DONTWAIT)` reads). `conv.rs` gained `Starting`/`Started` after
+   `success` (`start_session`; an error cancels the half-made session)
+   and `reset`, a `cancel_session` sent at start-up, because a greeter
+   killed mid-conversation leaves greetd "already configuring" a
+   session for its successor. The session picker is a cycling button
+   (`sessions.rs`: built-in Nitro, then `wayland-sessions` via
+   `nitro-launcher::desktop`); the remembered user and session are
+   `/var/cache/nitro-greeter/state` (`state.rs`); suspend/restart/power
+   off use the greeter session's `session.sock`. `nitro-session
+   --greeter` runs `[nitro-server, nitro-greeter]` with the greeter as
+   `Role::Primary` (exit 0: tear down, exit 0; else restart, never give
+   up). `deploy/greetd/` has the config and notes, `just install-greetd`
+   installs it (opt-in), `just box-greetd` sets up a test box.
+6. **Docs**: done (#3951). README and `docs/install.md` "Starting a
+   session": option A (getty + profile) as the zero-install path and
+   option B (greetd); `DEPENDENCIES.md`: greetd is a runtime
+   requirement, not a crate.
+
+Deviations from the sketch above: the greeter user is `greeter` only on
+Arch; Debian/Ubuntu's package creates **`_greetd`**, and every recipe
+detects which. The config wraps the command in `env` (Mesa's
+`XDG_CACHE_HOME`, since Arch's `greeter` has home `/`; `NITRO_CONFIG` for
+a keymap and scale) and `systemd-cat` (greetd hands the session its VT
+as stdio). On box1 greetd runs on tty1 **next to** the `nitro-dev`
+harness on tty2 rather than replacing it, and needs a drop-in because
+Ubuntu's unit only conflicts with `getty@tty7`.
 
 The crate count moves once, for the PAM binding in step 3: `cargo tree
 -e normal` 96 → 106 lines, 40 → 44 distinct external names (`nonstick`,
@@ -524,3 +547,27 @@ Lock warning and a show/hide toggle. A Caps Lock state that ydotool had
 left on in the compositor cost two failed attempts, with nothing on
 screen to say why. And logind's `Lock` signal plus a paint-before-sleep
 inhibitor are not built (`power.rs`).
+
+## Step 5 on the boxes
+
+Measured 2026-09-30 (full tables and procedure: `docs/testbox.md`,
+"Login (greetd)"). Ten login/logout cycles per box as a throwaway user,
+driven through the greeter with `hey`, each checked against the user
+session's `status` and ended with `logout`:
+
+| | box1 (HSW, 1080p, next to nitro-dev) | testbox2 (KBL, 1440p at 1.25) |
+|---|---|---|
+| cycles OK | 10/10 | 10/10 |
+| greetd PID changed | never | never |
+| DRM master / libseat errors | 0 | 0 |
+| greeter server `first_frame_ms` | 183–230 | 270–312 |
+| user server `first_frame_ms` | 168–235 | 243–304 |
+| greeter exit → user server ready | 520–572 ms (871 first) | 525–556 ms (776 first) |
+| greeter `kill -9` → restarted | 1.0 s | 1.0 s |
+
+The second compositor always got master, so the VT handoff is clean in
+the sense that matters (property M3); the visible gap is the four steps
+under decision 2, unchanged. Most of the ~0.5 s is greetd opening the
+user's PAM session and logind starting `user@.service`, before our
+server is even exec'd. testbox2 is left on greetd (gdm disabled) as the
+human asked.

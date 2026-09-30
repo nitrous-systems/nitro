@@ -176,7 +176,7 @@ impl Greeter {
     /// empty in practice: [`sessions::sessions`] puts nitro first), with
     /// the last login's user and session as defaults.
     #[must_use]
-    pub fn greeter(
+    pub fn login(
         backend: Box<dyn Backend>,
         sessions: Vec<SessionEntry>,
         remembered: Remembered,
@@ -321,7 +321,9 @@ pub fn build(ui: &mut Ui<Greeter>) -> WidgetId {
             .on_click(|s: &mut Greeter, ui: &mut Ui<Greeter>| next_session(s, ui)),
     );
     let suspend = ui.build(button("Suspend").name(names::SUSPEND).on_click(
-        |s: &mut Greeter, ui: &mut Ui<Greeter>| power(s, ui, nitro_system::session::Action::Suspend),
+        |s: &mut Greeter, ui: &mut Ui<Greeter>| {
+            power(s, ui, nitro_system::session::Action::Suspend);
+        },
     ));
     let reboot = ui.build(button("Restart").name(names::REBOOT).on_click(
         |s: &mut Greeter, ui: &mut Ui<Greeter>| power(s, ui, nitro_system::session::Action::Reboot),
@@ -734,7 +736,7 @@ pub fn run_lock() -> Result<(), Box<dyn std::error::Error>> {
 /// them.
 pub fn run_greeter() -> Result<(), Box<dyn std::error::Error>> {
     let backend = greetd::Greetd::from_env()?;
-    let greeter = Greeter::greeter(Box::new(backend), sessions::sessions(), state::load())
+    let greeter = Greeter::login(Box::new(backend), sessions::sessions(), state::load())
         .with_state_file(state::path());
     App::shell(APP_NAME)?
         .title("nitro-greeter")

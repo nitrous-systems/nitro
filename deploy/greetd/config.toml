@@ -14,15 +14,16 @@ vt = 1
 #
 # `systemd-cat` puts its log in the journal (identifier
 # `nitro-greeter-session`): greetd gives it the VT as stdio, which nobody
-# can read once the compositor has the screen.
+# can read once the compositor has the screen. XDG_CACHE_HOME gives
+# Mesa's shader cache a writable place (Arch's `greeter` has home `/`).
 #
 # A greeter's server has no ~/.config/nitro/server.conf. For a keymap or
 # scale, point it at a system file:
-#   command = "env NITRO_CONFIG=/etc/nitro/server.conf systemd-cat --identifier=nitro-greeter-session @BINDIR@/nitro-session --greeter"
+#   command = "env XDG_CACHE_HOME=/var/cache/nitro-greeter NITRO_CONFIG=/etc/nitro/server.conf systemd-cat --identifier=nitro-greeter-session @BINDIR@/nitro-session --greeter"
 #
 # Text fallback, for a box whose GPU or fonts are broken:
 #   command = "agreety --cmd @BINDIR@/nitro-session"
-command = "systemd-cat --identifier=nitro-greeter-session @BINDIR@/nitro-session --greeter"
+command = "env XDG_CACHE_HOME=/var/cache/nitro-greeter systemd-cat --identifier=nitro-greeter-session @BINDIR@/nitro-session --greeter"
 user = "@GREETER_USER@"
 
 # Decision 6: the owner boots straight into their own session, locked.

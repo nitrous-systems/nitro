@@ -149,10 +149,8 @@ mod tests {
     struct Dir(PathBuf);
     impl Dir {
         fn new(tag: &str) -> Self {
-            let d = std::env::temp_dir().join(format!(
-                "nitro-greeter-greetd-{tag}-{}",
-                std::process::id()
-            ));
+            let d = std::env::temp_dir()
+                .join(format!("nitro-greeter-greetd-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&d);
             std::fs::create_dir_all(&d).unwrap();
             Self(d)
@@ -183,10 +181,7 @@ mod tests {
     fn wait_read(g: &mut Greetd, want: usize) -> io::Result<Vec<Response>> {
         let mut got = Vec::new();
         for _ in 0..500 {
-            match g.read() {
-                Ok(v) => got.extend(v),
-                Err(e) => return Err(e),
-            }
+            got.extend(g.read()?);
             if got.len() >= want {
                 return Ok(got);
             }
@@ -215,10 +210,7 @@ mod tests {
             env: vec!["XDG_SESSION_DESKTOP=nitro".into()],
         })
         .unwrap();
-        assert!(matches!(
-            recv_request(&mut s),
-            Request::StartSession { .. }
-        ));
+        assert!(matches!(recv_request(&mut s), Request::StartSession { .. }));
     }
 
     #[test]

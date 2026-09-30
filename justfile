@@ -89,7 +89,8 @@ chromium_files := "chrome_crashpad_handler chrome_100_percent.pak chrome_200_per
 # There is no display-manager session entry (wayland-sessions/ or
 # xsessions/). nitro is neither a Wayland nor an X compositor, and it
 # needs a VT and DRM master. Start it from greetd or from tty1 with
-# `exec nitro-session` (docs/greeter.md, docs/install.md).
+# `exec nitro-session` (docs/greeter.md, docs/install.md); `just
+# install-greetd` sets up the greetd path.
 [doc("Install binaries and launcher entries (PREFIX, DESTDIR, BINDIR, DATADIR)")]
 install: install-bins install-desktop
 
@@ -220,6 +221,40 @@ install-apparmor:
         echo "install-apparmor: installed $dest; not loaded (run: apparmor_parser -r {{SYSCONFDIR}}/apparmor.d/chromium-nitro)"
     fi
 
+# greetd as the display manager, with nitro-greeter as its greeter
+# (docs/greeter.md, deploy/greetd/README.md). Opt-in, not part of
+# `install`, and run after it. greetd itself is a system package: install
+# it first (`pacman -S greetd`, `apt install greetd`). Renders
+# deploy/greetd/config.toml with $BINDIR and the greeter user the package
+# created (`greeter` on Arch, `_greetd` on Debian/Ubuntu), backs an
+# existing config up once as config.toml.pre-nitro, and creates
+# /var/cache/nitro-greeter for the remembered user. It does **not**
+# switch display managers; it prints the two commands that do.
+[doc("Install the greetd config that runs nitro-greeter (opt-in; after install)")]
+install-greetd:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{_asroot}}
+    greeter=$(getent passwd greeter >/dev/null && echo greeter || echo _greetd)
+    dest='{{DESTDIR}}{{SYSCONFDIR}}/greetd/config.toml'
+    mkdir -p target/greetd-stage
+    sed -e 's|@BINDIR@|{{BINDIR}}|g' -e "s|@GREETER_USER@|$greeter|g" deploy/greetd/config.toml > target/greetd-stage/config.toml
+    asroot_for "$dest"
+    if [[ -e $dest && ! -e $dest.pre-nitro ]]; then "${SU[@]}" cp -a "$dest" "$dest.pre-nitro"; fi
+    "${SU[@]}" install -Dm644 target/greetd-stage/config.toml "$dest"
+    cache='{{DESTDIR}}/var/cache/nitro-greeter'
+    asroot_for "$cache"
+    if [[ -z '{{DESTDIR}}' ]]; then
+        "${SU[@]}" install -d -o "$greeter" -m 755 "$cache"
+        dm=$(basename "$(readlink /etc/systemd/system/display-manager.service 2>/dev/null)" .service)
+        echo "install-greetd: installed $dest for greeter user $greeter. To switch:"
+        [[ -n $dm && $dm != greetd ]] && echo "  systemctl disable $dm"
+        echo "  systemctl enable greetd   # then reboot, or: systemctl restart greetd"
+    else
+        "${SU[@]}" install -d -m 755 "$cache"
+        echo "install-greetd: staged $dest; chown /var/cache/nitro-greeter to the greeter user in postinst"
+    fi
+
 # Remove what the install targets put down. The AppArmor profile stays;
 # remove {{SYSCONFDIR}}/apparmor.d/chromium-nitro by hand if you want it gone.
 [doc("Remove what the install recipes installed (except the AppArmor profile)")]
@@ -234,6 +269,9 @@ uninstall:
         "${su_bin[@]}" rm -f '{{DESTDIR}}{{BINDIR}}'"/$b"
     done
     asroot_for '{{DESTDIR}}{{SYSCONFDIR}}'; "${SU[@]}" rm -f '{{DESTDIR}}{{SYSCONFDIR}}/pam.d/nitro-lock'
+    # install-greetd's config: the pre-nitro one back, if we kept it.
+    g='{{DESTDIR}}{{SYSCONFDIR}}/greetd/config.toml'
+    if [[ -e $g.pre-nitro ]]; then "${SU[@]}" mv "$g.pre-nitro" "$g"; fi
     for f in deploy/*.desktop deploy/nitro-mimeapps.list deploy/chromium/chromium-nitro.desktop; do
         "${su_data[@]}" rm -f '{{DESTDIR}}{{DATADIR}}/applications/'"$(basename "$f")"
     done

@@ -1,6 +1,6 @@
 # nitro-greeter
 
-The lock screen, and later greetd's greeter: one nitro-ui app that renders
+The lock screen and greetd's greeter: one nitro-ui app that renders
 PAM's conversation (whatever it asks: password, one-time code, "touch your
 key") instead of a hard-coded password box. See `docs/greeter.md`,
 decisions 4 and 6.
@@ -14,8 +14,40 @@ decisions 4 and 6.
 │  Authentication failure      │  message  (notices and errors)
 │  Checking…                   │  status   (while waiting)
 │  [ Log out ]                 │  logout   (another user's name only)
+│  [ Nitro ]                   │  session  (greeter: click cycles)
+│ [Suspend][Restart][Power off]│  power    (greeter only)
 └──────────────────────────────┘
 ```
+
+## Greeter mode
+
+```console
+$ nitro-greeter          # under greetd, via `nitro-session --greeter`
+```
+
+The greeter piece (`Role::Primary`) of `nitro-session --greeter`, which
+greetd runs as its greeter user (`deploy/greetd/`). It speaks greetd's
+IPC on `$GREETD_SOCK` (`src/greetd.rs`; the codec is `nitro-login`'s).
+Without the variable it exits 1. Same window as lock mode
+(`Surface::lock()`), no `Lock`. On start it sends `cancel_session`, since
+a crashed predecessor may have left greetd mid-conversation. Then it
+prefills the remembered user and asks for them at once, or focuses the
+name field. After `success` it sends `start_session` with the chosen
+session's command and `XDG_SESSION_DESKTOP`/`XDG_CURRENT_DESKTOP`/
+`XDG_SESSION_TYPE`. greetd's `success` to that saves the user and
+session to `/var/cache/nitro-greeter/state` (`NITRO_GREETER_STATE`), and
+the greeter exits 0, which ends its session so greetd starts the user's.
+An error returns to the name field with the reason, and cancels. A wrong
+password asks again for the same name.
+
+- **Sessions** (`src/sessions.rs`): the built-in *Nitro* (`nitro-session`
+  next to this binary, under `systemd-cat` so its log reaches the
+  journal), then `/usr/share/wayland-sessions/*.desktop` read with
+  `nitro-launcher`'s parser. A `nitro.desktop` that runs nitro-session is
+  skipped as a duplicate. The `session` button shows the current session,
+  and a click moves to the next one.
+- **Power**: `suspend`, `reboot`, `poweroff` on the greeter session's own
+  `session.sock`. A failure shows on the message line.
 
 ## Lock mode
 
@@ -50,9 +82,12 @@ offers `Log out` (`session.sock`'s `logout`).
 - `src/backend.rs`: the `Backend` trait and `AuthHelper`, which spawns
   `nitro-auth` (`$NITRO_AUTH`, else next to this executable, else `PATH`)
   with piped stdio, reads it non-blocking through `ui.add_fd`, and
-  respawns it on the next attempt if it died. greetd (step 5) will be a
-  second `Backend` over `$GREETD_SOCK`, with the same codec
-  (`nitro-login`).
+  respawns it on the next attempt if it died.
+- `src/greetd.rs`: the greetd `Backend`: a `UnixStream` to `$GREETD_SOCK`,
+  connected lazily and again after a loss, blocking writes,
+  `recv(DONTWAIT)` reads.
+- `src/sessions.rs`, `src/state.rs`: the session list and the remembered
+  defaults.
 - `src/lib.rs`: the tree, and `on_response`, the single entry the fd hook
   and the tests use.
 
@@ -67,11 +102,13 @@ $ cargo build -p nitro-auth && cargo run -p nitro-greeter -- --lock
 
 `hey nitro-greeter get window/message value` reads the message line;
 `window/answer`'s value is always the mask. Names: `clock`, `user`,
-`prompt`, `answer`, `message`, `status`, `logout`.
+`prompt`, `answer`, `message`, `status`, `logout`, `session`, `suspend`,
+`reboot`, `poweroff`. A text field is driven with `set … value` and
+`do … submit`.
 
 ## Not yet
 
-greetd mode (no flag prints that and exits 2), a session list, power
-buttons, a user list, and multiple outputs: other outputs show only the
+A user list, a real session list widget (the picker is a cycling
+button), and multiple outputs: other outputs show only the
 background, because the server draws nothing but the lock owner's
 windows.
