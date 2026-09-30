@@ -1125,6 +1125,7 @@ fn apply_msg(
         | ClientMsg::Lock(_)
         | ClientMsg::Unlock(_)
         | ClientMsg::SetOverview(_)
+        | ClientMsg::CaptureAnswer(_)
         // `ListOutputs` (M5-D) is not a shell op, but is answered on
         // receipt for `Outputs`' reason, by `Server::list_outputs`.
         | ClientMsg::ListOutputs(_) => Ok(()),

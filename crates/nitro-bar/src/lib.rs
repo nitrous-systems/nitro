@@ -84,6 +84,7 @@
 
 pub mod clock;
 pub mod quick;
+pub mod rec;
 pub mod sensors;
 
 use nitro_ui::build::{ContainerBuilder as _, StyleBuilder as _};
@@ -325,6 +326,8 @@ pub struct Bar {
     last: Readings,
     /// The quick-settings menu. See [`quick`].
     quick: quick::Quick,
+    /// The recording indicator and prompt. See [`rec`].
+    rec: rec::Rec,
 }
 
 impl Bar {
@@ -347,6 +350,7 @@ impl Bar {
             source: Box::new(read_sensors),
             last: Readings::default(),
             quick: quick::Quick::new(),
+            rec: rec::Rec::default(),
         }
     }
 
@@ -464,6 +468,12 @@ impl Bar {
         self.launcher_presses
     }
 
+    /// The recording indicator and prompt state (#676 C).
+    #[must_use]
+    pub fn rec(&self) -> &rec::Rec {
+        &self.rec
+    }
+
     /// How many times the Super+L lock chord has fired.
     #[must_use]
     pub fn lock_presses(&self) -> u64 {
@@ -575,6 +585,8 @@ struct Ids {
     load: WidgetId,
     mem: WidgetId,
     volume_icon: WidgetId,
+    /// The REC indicator (#676 C).
+    rec: WidgetId,
 }
 
 /// The bar's height: `NITRO_BAR_HEIGHT`, else [`DEFAULT_HEIGHT`].
@@ -672,6 +684,7 @@ pub fn build(ui: &mut Ui<Bar>) -> WidgetId {
 
 /// Build one panel's tree: the same tree for the main window and for
 /// every other output's panel, so they cannot drift apart.
+#[allow(clippy::too_many_lines)] // One panel's tree, top to bottom.
 fn build_panel(ui: &mut Ui<Bar>) -> (WidgetId, Ids) {
     let h = height();
 
@@ -818,6 +831,8 @@ fn build_panel(ui: &mut Ui<Bar>) -> (WidgetId, Ids) {
     // One row, with a spacer on each side of the clock: that is what
     // keeps the clock centred *on the bar* rather than centred in
     // whatever the window list happens to leave over.
+    // The REC indicator (#676 C), collapsed until something records.
+    let rec_id = rec::indicator(ui, false);
     let root = ui.build(
         row()
             .gap(GAP)
@@ -829,7 +844,8 @@ fn build_panel(ui: &mut Ui<Bar>) -> (WidgetId, Ids) {
     let left_pad = ui.build(spacer().grow(1.0));
     let right_pad = ui.build(spacer().grow(1.0));
     for child in [
-        launcher, windows, left_pad, clock_id, right_pad, load_icon, load, mem_icon, mem, status,
+        launcher, windows, left_pad, clock_id, right_pad, load_icon, load, mem_icon, mem, rec_id,
+        status,
     ] {
         ui.attach(root, child).unwrap();
     }
@@ -843,6 +859,7 @@ fn build_panel(ui: &mut Ui<Bar>) -> (WidgetId, Ids) {
             load,
             mem,
             volume_icon,
+            rec: rec_id,
         },
     )
 }
@@ -899,6 +916,25 @@ fn install(ui: &mut Ui<Bar>, ids: Ids) {
                     eprintln!("nitro-bar: lock: {e}");
                 }
             }
+            // Screen recording (#676 C): the indicator follows the
+            // server's state, and a prompt asks the user.
+            ShellEvent::CaptureState {
+                active,
+                outputs_mask,
+            } => rec::state(s, ui, *active, *outputs_mask),
+            ShellEvent::CapturePrompt {
+                request,
+                output,
+                client_name,
+            } => rec::prompt(
+                s,
+                ui,
+                rec::Ask {
+                    request: *request,
+                    output: *output,
+                    client_name: client_name.clone(),
+                },
+            ),
             ShellEvent::WindowListEnd | ShellEvent::HotKey { .. } | ShellEvent::Overview { .. } => {
             }
         }
@@ -935,6 +971,8 @@ fn install(ui: &mut Ui<Bar>, ids: Ids) {
         if let Err(e) = ui.bind_key(HOTKEY_LOCK, nitro_ui::shell::mod_mask::SUPER, XK_L) {
             eprintln!("nitro-bar: bind Super+L: {e}");
         }
+        // Recording prompts and the REC indicator's state (#676 C).
+        rec::subscribe(ui);
     }
 
     tick_clock(ui, ids);
@@ -1040,6 +1078,9 @@ fn open_panel(s: &mut Bar, ui: &mut Ui<Bar>, output: u32) {
         && let Ok(mut i) = ui.widget_mut::<nitro_ui::widgets::Icon>(ids.volume_icon)
     {
         i.set_icon(s.quick.icon().to_owned());
+    }
+    if s.rec.active() {
+        ui.set_collapsed(ids.rec, false);
     }
     let idx = s.panels.len() - 1;
     for info in s.infos.clone() {

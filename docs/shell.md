@@ -496,6 +496,47 @@ instant; `docs/wm.md` §What is deferred says why there is no cross-fade.
 relayout and the lock; `nitro-launcher/tests/launcher.rs` covers the
 triggers and the ladder.
 
+## Screen recording: prompt and indicator
+
+Screen capture (#676, `docs/wire.md` § Screen capture) needs the user's
+consent and must never be silent. The server owns both; the shell only
+asks and shows.
+
+* **shell → server, `CaptureAnswer { request, answer }`** (`0x040f`).
+  `Watch` (any value, in fact) subscribes to the two messages below and
+  is answered with the current `CaptureState`. nitro-bar sends `Watch` at
+  start-up.
+* **server → shell, `CapturePrompt { request, output, client_name }`**
+  (`0x840a`). A program on `capture.allow` without a session grant wants
+  to record. Sent to the last subscriber. `client_name` is the
+  executable's file name the server read from `/proc/<pid>/exe` of the
+  connecting process (same uid only) — never a self-declared app id.
+  The answer is `Deny`, `AllowOnce` or `AllowSession` (the grant lasts,
+  by exe path, until the server exits: until logout). No subscriber, or
+  the asked shell going away before it answers, is a deny.
+* **server → shell, `CaptureState { active, outputs_mask }`** (`0x840b`),
+  pushed on every change, coalesced per wakeup.
+
+**The bar.** A red "● REC" label (`rec`, `ColorRole::Danger`) sits before
+the status pill on every panel, collapsed (taking no space) while
+`CaptureState.active` is false. A prompt is a popup under the clock with
+the question and three buttons (`capture_deny`, `capture_allow_once`,
+`capture_allow_session`); it does **not** take the pointer grab, so a
+stray click elsewhere cannot decide for the user, and a popup closed any
+other way answers `Deny`. Prompts that arrive while one is up queue
+behind it. The code is `crates/nitro-bar/src/rec.rs`.
+
+**The border.** Independently of any shell, the server draws a 2 px
+accent-coloured border inside every captured output while it is
+recorded (`docs/surfaces.md` § Capture), so a missing or crashed bar
+cannot hide a recording.
+
+**The lock** stops every capture and refuses prompts in flight
+(`Locked`); starts while locked are refused.
+
+`CaptureAnswer` is a shell op (`is_shell_op`): on the wire socket it is
+fatal like the others.
+
 ## Keyboard grabs
 
 A launcher is `NO_FOCUS` and `Overlay`: it must never take focus, because

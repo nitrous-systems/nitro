@@ -427,6 +427,23 @@ impl Connection {
         self.send(&ClientMsg::SetOverview(SetOverview { request }))
     }
 
+    /// Answer a capture prompt, or subscribe to prompts and the
+    /// recording state with `Watch` (needs `caps::SHELL`). See
+    /// [`CaptureAnswer`](crate::msg::CaptureAnswer).
+    ///
+    /// # Errors
+    /// As [`Connection::send`].
+    pub fn capture_answer(
+        &mut self,
+        request: u32,
+        answer: crate::types::CaptureAnswerKind,
+    ) -> Result<(), Error> {
+        self.send(&ClientMsg::CaptureAnswer(crate::msg::CaptureAnswer {
+            request,
+            answer,
+        }))
+    }
+
     /// Declare which server→client messages this client understands
     /// (M5-A).
     ///

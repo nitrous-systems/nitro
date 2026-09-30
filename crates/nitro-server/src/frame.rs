@@ -984,6 +984,35 @@ pub fn region_area(region: &[IRect]) -> u64 {
     region.iter().map(|r| r.area().cast_unsigned()).sum()
 }
 
+/// Width of the recording border (#676 C), device pixels.
+pub const CAPTURE_BORDER_PX: i32 = 2;
+
+/// The four strips of an output's recording border: top, bottom, left,
+/// right, inside `bounds`.
+#[must_use]
+pub fn capture_border_rects(bounds: IRect) -> [IRect; 4] {
+    let b = CAPTURE_BORDER_PX.min(bounds.w / 2).min(bounds.h / 2).max(0);
+    [
+        IRect::new(bounds.x, bounds.y, bounds.w, b),
+        IRect::new(bounds.x, bounds.bottom() - b, bounds.w, b),
+        IRect::new(bounds.x, bounds.y + b, b, bounds.h - 2 * b),
+        IRect::new(bounds.right() - b, bounds.y + b, b, bounds.h - 2 * b),
+    ]
+}
+
+/// Paint the recording border over whatever `region` just rasterized:
+/// a top layer drawn into the shadow after the scene and the cursor, so
+/// it is on screen *and* in the captured frames (the capture samples the
+/// shadow).
+pub fn paint_capture_border(canvas: &mut Canvas<'_>, region: &[IRect], color: Color) {
+    let strips = capture_border_rects(canvas.bounds());
+    for clip in region {
+        for s in &strips {
+            canvas.fill_irect(clip, s, color);
+        }
+    }
+}
+
 /// Where the cursor is, which shape it is showing, and whether to draw it.
 #[derive(Debug, Clone, Copy)]
 pub struct CursorState {

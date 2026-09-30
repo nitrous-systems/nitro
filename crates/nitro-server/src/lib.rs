@@ -1687,6 +1687,7 @@ fn is_shell_op(msg: &ClientMsg) -> bool {
             | ClientMsg::Lock(_)
             | ClientMsg::Unlock(_)
             | ClientMsg::SetOverview(_)
+            | ClientMsg::CaptureAnswer(_)
     )
 }
 
@@ -2663,6 +2664,13 @@ impl Server {
                 );
                 let paint_us = painted.paint_us;
                 split = (painted.raster_px, painted.moved_px, painted.blitted);
+                if self.captures.bordered(id) {
+                    frame::paint_capture_border(
+                        &mut shadow.canvas(),
+                        &rasterize,
+                        self.palette.get(nitro_core::Role::Accent),
+                    );
+                }
                 shadow.note_painted(&rasterize);
                 let copy_us = frame::copy_region(shadow, &mut buf, &region);
                 if !self.captures.is_empty() {
@@ -2685,6 +2693,13 @@ impl Server {
                     &self.palette,
                     fast_scaled,
                 );
+                if self.captures.bordered(id) {
+                    frame::paint_capture_border(
+                        &mut canvas,
+                        &region,
+                        self.palette.get(nitro_core::Role::Accent),
+                    );
+                }
                 (paint_us, 0)
             }
         };
@@ -2938,6 +2953,8 @@ impl Server {
         // is announced here, once. After every leave and enter of the
         // wakeup, so a relayout's leave + enter nets out to nothing.
         self.announce_overview(None);
+        // The recording indicator and border, likewise once (#676 C).
+        self.announce_capture(None);
         // The same deferral for `PopupDone`: dismissal can run with the
         // owning client out of the map. Drained before the update, so the
         // unmap is already recorded when the client hears (unmap, then
@@ -7968,6 +7985,9 @@ impl Server {
                 true
             }
             ClientMsg::Lock(_) => self.shell_lock(token),
+            // Subscribes, answers a prompt, and is answered with the
+            // recording state (#676 C).
+            ClientMsg::CaptureAnswer(m) => self.capture_answer(token, m),
             ClientMsg::Unlock(_) => self.shell_unlock(token),
             // Subscribes on receipt; applied (and answered) at `settle`,
             // see `pending_overview`.
@@ -8050,6 +8070,8 @@ impl Server {
         let was_locked = self.lock.is_locked();
         // The lock screen must not come up over a desktop of thumbnails.
         self.leave_overview(None);
+        // Nor be recorded: every capture ends, every prompt is refused.
+        self.captures_lock();
         match self.lock.claim(token) {
             Ok(how) => {
                 match how {
@@ -13466,6 +13488,13 @@ impl Server {
                 &rasterize,
                 scroll,
             );
+            if self.captures.bordered(output.kms_id) {
+                frame::paint_capture_border(
+                    &mut shadow.canvas(),
+                    &rasterize,
+                    self.palette.get(nitro_core::Role::Accent),
+                );
+            }
             shadow.note_painted(&rasterize);
             Some(p)
         };
@@ -13873,6 +13902,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // One list of every shell op.
     fn every_shell_op_is_recognised_as_one() {
         use nitro_wire::types::{Edge, Layer, WindowRef};
         let shell: Vec<ClientMsg> = vec![
@@ -13912,6 +13942,11 @@ mod tests {
             msg::Unlock.into(),
             msg::SetOverview {
                 request: nitro_wire::types::OverviewRequest::Toggle,
+            }
+            .into(),
+            msg::CaptureAnswer {
+                request: 1,
+                answer: nitro_wire::types::CaptureAnswerKind::Deny,
             }
             .into(),
             msg::FocusWindow {

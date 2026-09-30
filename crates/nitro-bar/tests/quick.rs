@@ -526,3 +526,87 @@ fn super_l_asks_the_session_to_lock() {
     assert!(h.state().quick().popup().is_none(), "no menu opened");
     h.quit();
 }
+
+// ------------------------------------------ screen recording (#676 C)
+
+fn shell_event(h: &mut Harness<Bar>, ev: &nitro_ui::shell::ShellEvent) {
+    let (ui, st) = h.parts();
+    ui.dispatch_shell(st, ev);
+    h.settle();
+}
+
+fn prompt_widget(h: &mut Harness<Bar>, name: &str) -> WidgetId {
+    let win = h.state().rec().popup().expect("the prompt is open");
+    let idx = h.ui().windows().iter().position(|w| *w == win).unwrap();
+    named(h, &format!("window[{idx}]/{name}"))
+}
+
+#[test]
+fn the_rec_indicator_follows_the_capture_state() {
+    let dir = scratch("rec");
+    let mut h = bar_with(&dir);
+    let rec = named(
+        &mut h,
+        &format!("window/{}", nitro_bar::rec::names::INDICATOR),
+    );
+    assert!(!h.ui().is_visible(rec), "hidden while nothing records");
+    shell_event(
+        &mut h,
+        &nitro_ui::shell::ShellEvent::CaptureState {
+            active: true,
+            outputs_mask: 2,
+        },
+    );
+    assert!(h.ui().is_visible(rec));
+    assert_eq!(h.widget::<Label>(rec).text(), "● REC");
+    assert!(h.state().rec().active());
+    shell_event(
+        &mut h,
+        &nitro_ui::shell::ShellEvent::CaptureState {
+            active: false,
+            outputs_mask: 0,
+        },
+    );
+    assert!(!h.ui().is_visible(rec));
+}
+
+#[test]
+fn the_capture_prompt_answers_with_the_button_pressed_and_queues() {
+    use nitro_bar::rec::names as r;
+    use nitro_ui::shell::{CaptureAnswerKind as A, ShellEvent};
+    let dir = scratch("prompt");
+    let mut h = bar_with(&dir);
+    for request in [5, 6, 7] {
+        shell_event(
+            &mut h,
+            &ShellEvent::CapturePrompt {
+                request,
+                output: 1,
+                client_name: "chrome".to_owned(),
+            },
+        );
+    }
+    assert_eq!(
+        h.state().rec().showing().unwrap().request,
+        5,
+        "one at a time"
+    );
+    let q = prompt_widget(&mut h, r::QUESTION);
+    assert!(h.widget::<Label>(q).text().starts_with("chrome wants"));
+    let b = prompt_widget(&mut h, r::DENY);
+    act(&mut h, b, "click", None);
+    assert_eq!(
+        h.state().rec().showing().unwrap().request,
+        6,
+        "the next one"
+    );
+    let b = prompt_widget(&mut h, r::ALLOW_ONCE);
+    act(&mut h, b, "click", None);
+    let b = prompt_widget(&mut h, r::ALLOW_SESSION);
+    act(&mut h, b, "click", None);
+    assert!(h.state().rec().popup().is_none());
+    assert_eq!(
+        h.state().rec().answers(),
+        &[(5, A::Deny), (6, A::AllowOnce), (7, A::AllowSession)]
+    );
+}

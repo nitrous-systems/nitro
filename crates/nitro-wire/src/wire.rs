@@ -12,10 +12,10 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use crate::error::DecodeError;
 use crate::types::{
-    Align, AllocRefusal, AxisSource, BufferId, ButtonState, CaptureKind, CaptureStopReason,
-    ColorMatrix, ColorRange, CursorPos, CursorShape, DataSource, DmabufFormat, DragAction, Edge,
-    ErrorCode, KeymapFormat, Layer, NodeId, NodeKind, OverviewRequest, PopupAnchor, PopupGravity,
-    ShareToken, TouchPhase, WindowRef, WindowState,
+    Align, AllocRefusal, AxisSource, BufferId, ButtonState, CaptureAnswerKind, CaptureKind,
+    CaptureStopReason, ColorMatrix, ColorRange, CursorPos, CursorShape, DataSource, DmabufFormat,
+    DragAction, Edge, ErrorCode, KeymapFormat, Layer, NodeId, NodeKind, OverviewRequest,
+    PopupAnchor, PopupGravity, ShareToken, TouchPhase, WindowRef, WindowState,
 };
 
 /// A type with a fixed-size, little-endian wire representation.
@@ -122,6 +122,7 @@ plain_tag!(ColorRange, u8, u8);
 plain_tag!(OverviewRequest, u8, u8);
 plain_tag!(CaptureKind, u8, u8);
 plain_tag!(CaptureStopReason, u8, u8);
+plain_tag!(CaptureAnswerKind, u8, u8);
 
 /// `impl Plain` for the id newtypes.
 macro_rules! plain_id {

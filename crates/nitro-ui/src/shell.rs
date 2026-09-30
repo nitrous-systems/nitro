@@ -45,7 +45,9 @@ pub use nitro_wire::types::mod_mask;
 /// The overview's reserved search band, shared with the server: see
 /// [`nitro_wire::types::overview`].
 pub use nitro_wire::types::overview;
-pub use nitro_wire::types::{Edge, Layer, OverviewRequest, WindowRef, WindowState};
+pub use nitro_wire::types::{
+    CaptureAnswerKind, Edge, Layer, OverviewRequest, WindowRef, WindowState,
+};
 
 /// Which edges a surface sticks to, and how far from them.
 ///
@@ -296,6 +298,25 @@ pub enum ShellEvent {
         active: bool,
         /// The output it is on (an [`OutputInfo`] id); 0 when not active.
         output: u32,
+    },
+    /// A program wants to record the screen and the user must decide
+    /// (#676 C). Answer with [`Ui::capture_answer`](crate::Ui::capture_answer);
+    /// sent only after this connection sent one (`Watch` subscribes).
+    CapturePrompt {
+        /// The server's id for the question, echoed in the answer.
+        request: u32,
+        /// The output to be recorded (an [`OutputInfo`] id).
+        output: u32,
+        /// The program's executable name, as the server read it.
+        client_name: String,
+    },
+    /// Whether the screen is being recorded, pushed on every change
+    /// (#676 C): what a recording indicator shows.
+    CaptureState {
+        /// Whether any capture is running.
+        active: bool,
+        /// Bit `id % 32` for every captured output id.
+        outputs_mask: u32,
     },
 }
 

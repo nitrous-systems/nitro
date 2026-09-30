@@ -634,10 +634,9 @@ adds capture rings **beside** the output ring. The server uses them for recordin
   time_ns, damage[], sync_file}` per frame; `CaptureRelease{slot}`,
   `CaptureStop`; `CaptureStopped{reason}` for every end and refusal. The
   `kind` byte reserves window capture.
-- **Permission (minimal).** `NITRO_CAPTURE_ALLOW=1` in the server's
-  environment allows every local client; otherwise `Denied`. One hook,
-  `Server::capture_permitted`, for the allow-list and prompt (#676 C).
-  Locked → `Locked`.
+- **Permission.** See the #676 C section below. `NITRO_CAPTURE_ALLOW=1`
+  in the server's environment still allows every local client without
+  asking (tests, harness). Locked → `Locked`.
 - **Who composites.** Always the helper, in every mode: a
   `CaptureComposite` into the capture ring with the output's shadow on top
   and, under it (or above, for a translucent rest), the Surfaces the
@@ -685,8 +684,49 @@ adds capture rings **beside** the output ring. The server uses them for recordin
 - **Test client.** `nitro-shot --record N [--output NAME] [--fps F] [-o
   FILE]`: maps LINEAR slots after the fence, prints fps, flip→fence
   latency, damage, ring size; `-o` writes the last frame as PNG.
-- **Not built.** NV12 target, window capture, the prompt/indicator/border
-  (#676 C), Chromium (#676 D).
+- **Not built.** NV12 target, window capture, Chromium (#676 D).
+
+### As built: permission, indicator, border, lock (#676 C)
+
+- **Who is asking.** The connecting process's executable, from
+  `SO_PEERCRED` → `/proc/<pid>/exe` (its file name; a ` (deleted)` suffix
+  after an in-place update is ignored), and only if it runs as the
+  server's uid. The app id is self-declared and never consulted.
+- **Allow-list.** `server.conf` `capture.allow = chrome, chromium,
+  nitro-shot` (the default; an empty value allows nobody). A client not
+  on it gets `CaptureStopped{Denied}` at once, with no prompt.
+- **Which Chromium process connects.** Desktop capture in Chromium on
+  Linux does not run in the video-capture *service* (a utility process,
+  used for cameras): `MediaStreamManager` builds a
+  `VideoCaptureProviderSwitcher` whose screen side is
+  `InProcessVideoCaptureProvider::CreateInstanceForScreenCapture`, i.e.
+  `DesktopCaptureDevice` on a thread of the **browser process**. So the
+  capture connection comes from the browser process, whose exe is
+  `chrome` (a distro build: `chromium`), same uid — both on the default
+  list. The renderer and GPU processes never capture.
+- **The prompt.** Listed but not granted → the shell is asked
+  (`CapturePrompt` → `CaptureAnswer`, `docs/shell.md` § Screen
+  recording); nitro-bar shows Deny / Allow once / Allow this session.
+  `AllowSession` is remembered by exe path until the server exits
+  (logout). No shell subscribed, or the shell leaving mid-prompt → deny.
+  The start waits without a ring while the user decides.
+- **Indicator.** `CaptureState{active, outputs_mask}` to every shell
+  subscriber on each change; nitro-bar shows a red "● REC".
+- **Border.** While an output is captured the server paints a 2 px
+  `accent`-coloured border inside its edges, into the shadow after the
+  scene and the cursor (`frame::paint_capture_border`; the direct
+  no-shadow path too). Because the capture samples the shadow, **the
+  border is inside the captured frame**: recordings show it. That is
+  deliberate (simplest, and a viewer can tell a shared screen); cropping
+  2 px is the consumer's choice. Starting and stopping damages only the
+  four strips.
+- **Lock.** `Lock` stops every capture and refuses every pending prompt
+  with `Locked`; `CaptureStart` while locked → `Locked`. The lock screen
+  is never captured.
+- **Tests.** `crates/nitro-server/tests/capture.rs` (not listed → denied
+  without a prompt, no shell → denied, deny / allow once / allow for the
+  session, shell gone mid-prompt, state pushed and border pixels, lock),
+  `crates/nitro-bar/tests/quick.rs` (indicator, prompt buttons and queue).
 
 ### Recording design (the plan; see above for what was built)
 

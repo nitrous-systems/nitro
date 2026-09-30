@@ -41,10 +41,10 @@ use crate::codec::{FdQueue, Reader, Writer};
 use crate::error::{DecodeError, EncodeError};
 use crate::types::WindowState as WindowStateValue;
 use crate::types::{
-    Align, AllocRefusal, AxisSource, BufferId, ButtonState, CaptureKind, CaptureSlot,
-    CaptureStopReason, ColorMatrix, ColorRange, CursorPos, CursorShape, DataSource, DmabufFormat,
-    DragAction, Edge, ErrorCode, KeymapFormat, Layer, NodeId, NodeKind, OverviewRequest,
-    PopupAnchor, PopupGravity, ShareToken, TouchPhase, WindowRef,
+    Align, AllocRefusal, AxisSource, BufferId, ButtonState, CaptureAnswerKind, CaptureKind,
+    CaptureSlot, CaptureStopReason, ColorMatrix, ColorRange, CursorPos, CursorShape, DataSource,
+    DmabufFormat, DragAction, Edge, ErrorCode, KeymapFormat, Layer, NodeId, NodeKind,
+    OverviewRequest, PopupAnchor, PopupGravity, ShareToken, TouchPhase, WindowRef,
 };
 use crate::wire::Plain;
 
@@ -2812,6 +2812,23 @@ fixed_msg! {
         /// What to do.
         request: OverviewRequest,
     }
+
+    /// Answer a [`CapturePrompt`], or subscribe to prompts (shell only;
+    /// needs [`caps::SHELL`](crate::types::caps::SHELL); #676 C).
+    ///
+    /// Sending it — `Watch` included — **subscribes** the connection to
+    /// [`CapturePrompt`] and [`CaptureState`], and is answered with the
+    /// current `CaptureState`, the way `SetOverview` subscribes to
+    /// `OverviewState`. A prompt goes to the subscriber that subscribed
+    /// last; the first answer to a `request` wins and later ones (or an
+    /// unknown `request`) are ignored. With no subscriber, a capture that
+    /// would need a prompt is denied.
+    CaptureAnswer {
+        /// The `request` of the [`CapturePrompt`]; ignored for `Watch`.
+        request: u32,
+        /// The user's choice.
+        answer: CaptureAnswerKind,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3187,6 +3204,9 @@ msg_enum! {
         /// Ask to enter or leave overview mode, and subscribe (needs
         /// `caps::SHELL`).
         SetOverview = 0x040e,
+        /// Answer a capture prompt, and subscribe to prompts and the
+        /// recording state (needs `caps::SHELL`).
+        CaptureAnswer = 0x040f,
     }
 }
 
@@ -3764,6 +3784,66 @@ fixed_msg! {
         /// `active` is false.
         output: u32,
     }
+
+    /// Whether the screen is being recorded (shell only; sent to
+    /// connections that have sent a [`CaptureAnswer`]; #676 C).
+    ///
+    /// Pushed whenever the set of captured outputs changes, and as the
+    /// answer to every `CaptureAnswer`. A shell shows its recording
+    /// indicator on this and nothing else.
+    CaptureState {
+        /// Whether any capture is running.
+        active: bool,
+        /// The captured outputs: bit `id % 32` for every captured
+        /// [`OutputInfo`] id. 0 when `active` is false.
+        outputs_mask: u32,
+    }
+}
+
+/// A client asks to record an output and the user must decide (shell
+/// only; sent to the last connection that sent a [`CaptureAnswer`];
+/// #676 C).
+///
+/// The shell shows a prompt and answers with
+/// `CaptureAnswer { request, … }`. The capture waits, receiving nothing,
+/// until then; it is denied if the shell goes away first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturePrompt {
+    /// The server's id for this question, echoed in the answer.
+    pub request: u32,
+    /// The output to be recorded (an [`OutputInfo`] id).
+    pub output: u32,
+    /// The recording program's name: its executable's file name
+    /// (`chrome`), which the server read from `/proc`, not what the
+    /// client says it is. Last on the wire, being variable-length.
+    pub client_name: String,
+}
+
+/// The fixed part of [`CapturePrompt`]: 8 bytes.
+#[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct CapturePromptFixed {
+    request: <u32 as Plain>::Wire,
+    output: <u32 as Plain>::Wire,
+}
+
+impl Body for CapturePrompt {
+    fn encode_body(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.put_struct(&CapturePromptFixed {
+            request: Plain::to_wire(self.request),
+            output: Plain::to_wire(self.output),
+        });
+        w.put_str(&self.client_name);
+        Ok(())
+    }
+    fn decode_body(r: &mut Reader<'_>, _fds: &mut FdQueue) -> Result<Self, DecodeError> {
+        let f = r.get_struct::<CapturePromptFixed>()?;
+        Ok(Self {
+            request: Plain::from_wire(f.request)?,
+            output: Plain::from_wire(f.output)?,
+            client_name: r.get_str()?,
+        })
+    }
 }
 
 msg_enum! {
@@ -3859,6 +3939,12 @@ msg_enum! {
         OutputWorkArea = 0x8408,
         /// Overview mode's state (needs `caps::SHELL`; subscribers only).
         OverviewState = 0x8409,
+        /// A client wants to record; ask the user (needs `caps::SHELL`;
+        /// subscribers only).
+        CapturePrompt = 0x840a,
+        /// Whether the screen is being recorded (needs `caps::SHELL`;
+        /// subscribers only).
+        CaptureState = 0x840b,
         /// A new clipboard selection exists (needs `caps::DATA`).
         SelectionOffer = 0x8501,
         /// Answer to a `RequestSelection` (needs `caps::DATA`; carries one

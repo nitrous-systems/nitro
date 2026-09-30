@@ -2,8 +2,8 @@
 //! helper's capture rings, pacing, and the wire ops.
 //!
 //! A client that listed `caps::CAPTURE` sends `CaptureStart{output,
-//! max_fps}`. If [`Server::capture_permitted`] lets it (the one hook the
-//! permission prompt of #676 C replaces), the server asks the helper for
+//! max_fps}`. If the permission check lets it (the allow-list, a session
+//! grant, or the shell's prompt: #676 C), the server asks the helper for
 //! a capture ring (`AllocCaptureRing`, 3 LINEAR-first XR24 slots of the
 //! output's size) and hands the slots to the client as `CaptureBuffers`.
 //! From then on, after a flip of that output (and on a release, a fence,
@@ -33,6 +33,7 @@
 //! footprint rule rules out.
 
 use std::os::fd::OwnedFd;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use nitro_core::{Damage, IRect};
@@ -114,6 +115,55 @@ pub struct Captures {
     orphans: Vec<u64>,
     /// Counters for `stats`.
     pub stats: crate::stats::CaptureStats,
+    /// Starts waiting for the user's answer (#676 C).
+    prompts: Vec<Prompt>,
+    /// The last `CapturePrompt.request` handed out.
+    next_request: u32,
+    /// Executables the user allowed for the session (`AllowSession`):
+    /// their later starts are not prompted until the server exits.
+    grants: Vec<PathBuf>,
+    /// Shell connections that sent a `CaptureAnswer`: they get
+    /// `CaptureState`, and the last one gets the prompts.
+    watchers: Vec<u64>,
+    /// The `CaptureState` last announced: `None` inactive, else the
+    /// outputs mask.
+    announced: Option<u32>,
+    /// Outputs that carry the recording border now (painted by
+    /// `Server::paint` into the shadow).
+    border_on: Vec<KmsOutputId>,
+}
+
+/// A `CaptureStart` the shell was asked about.
+#[derive(Debug)]
+struct Prompt {
+    request: u32,
+    /// The recording client.
+    token: u64,
+    start: msg::CaptureStart,
+    /// Its executable, what an `AllowSession` grant remembers.
+    exe: PathBuf,
+    /// The shell connection that was asked.
+    shell: u64,
+}
+
+/// What the permission check says before the output and helper checks.
+enum Permit {
+    /// Go ahead (`NITRO_CAPTURE_ALLOW=1`, or a session grant).
+    Yes,
+    /// On the allow list: ask the user.
+    Ask(PathBuf),
+}
+
+/// The file name of an executable path, without the ` (deleted)` the
+/// kernel appends to a binary replaced under a running process (an
+/// in-place browser update).
+fn exe_name(exe: &Path) -> String {
+    let name = exe
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    name.strip_suffix(" (deleted)")
+        .map_or(name.clone(), str::to_owned)
 }
 
 impl Captures {
@@ -127,6 +177,12 @@ impl Captures {
     #[must_use]
     pub fn ring_bytes(&self) -> u64 {
         self.list.iter().map(|c| c.bytes).sum()
+    }
+
+    /// Whether output `id` carries the recording border.
+    #[must_use]
+    pub fn bordered(&self, id: KmsOutputId) -> bool {
+        self.border_on.contains(&id)
     }
 }
 
@@ -151,17 +207,37 @@ impl Server {
         false
     }
 
-    /// The permission hook: may this client record? Minimal gate (#676 B):
-    /// `NITRO_CAPTURE_ALLOW=1` in the server's environment allows every
-    /// local client; otherwise nobody. #676 C replaces this with the
-    /// allow-list and the shell's prompt.
-    pub(crate) fn capture_permitted(&self, token: u64) -> Result<(), Reason> {
-        let _ = token;
-        if self.capture_allow {
-            Ok(())
-        } else {
-            Err(Reason::Denied)
+    /// The executable of the process behind `token`: `SO_PEERCRED`'s pid
+    /// (the process that connected, not what the client says it is), and
+    /// only when it runs as the server's own user.
+    fn capture_identity(&self, token: u64) -> Option<PathBuf> {
+        let client = self.wire_clients.get(&token)?;
+        let cred = rustix::net::sockopt::socket_peercred(client.as_fd()).ok()?;
+        if cred.uid != rustix::process::getuid() {
+            return None;
         }
+        std::fs::read_link(format!("/proc/{}/exe", cred.pid.as_raw_nonzero())).ok()
+    }
+
+    /// The permission check (#676 C). `NITRO_CAPTURE_ALLOW=1` in the
+    /// server's environment allows every local client (tests, harness).
+    /// Otherwise the client's executable must be on `capture.allow`
+    /// (else `Denied` at once), and then either hold a session grant or
+    /// be asked about.
+    fn capture_permit(&self, token: u64) -> Result<Permit, Reason> {
+        if self.capture_allow {
+            return Ok(Permit::Yes);
+        }
+        let exe = self.capture_identity(token).ok_or(Reason::Denied)?;
+        let name = exe_name(&exe);
+        if !self.settings.capture.allows(&name) {
+            info!("capture: {name:?} is not on capture.allow");
+            return Err(Reason::Denied);
+        }
+        if self.captures.grants.contains(&exe) {
+            return Ok(Permit::Yes);
+        }
+        Ok(Permit::Ask(exe))
     }
 
     fn capture_send_stopped(&mut self, token: u64, capture_id: u32, reason: Reason) {
@@ -174,8 +250,7 @@ impl Server {
         }
     }
 
-    fn capture_check(&self, token: u64, m: &msg::CaptureStart) -> Result<usize, Reason> {
-        self.capture_permitted(token)?;
+    fn capture_check(&self, m: &msg::CaptureStart) -> Result<usize, Reason> {
         if self.lock.is_locked() {
             return Err(Reason::Locked);
         }
@@ -202,6 +277,11 @@ impl Server {
             .list
             .iter()
             .any(|c| c.token == token && c.id == m.capture_id)
+            || self
+                .captures
+                .prompts
+                .iter()
+                .any(|p| p.token == token && p.start.capture_id == m.capture_id)
         {
             self.disconnect(
                 token,
@@ -213,13 +293,142 @@ impl Server {
             );
             return false;
         }
-        let index = match self.capture_check(token, m) {
-            Ok(i) => i,
+        let permit = self.capture_permit(token);
+        let index = match permit.and_then(|p| self.capture_check(m).map(|i| (p, i))) {
+            Ok((Permit::Yes, i)) => i,
+            Ok((Permit::Ask(exe), _)) => {
+                self.capture_prompt(token, *m, exe);
+                return true;
+            }
             Err(r) => {
                 self.capture_send_stopped(token, m.capture_id, r);
                 return true;
             }
         };
+        self.capture_begin(token, m, index);
+        true
+    }
+
+    /// Ask the shell about a start. No shell listening: denied.
+    fn capture_prompt(&mut self, token: u64, start: msg::CaptureStart, exe: PathBuf) {
+        let Some(&shell) = self.captures.watchers.last() else {
+            info!("capture: no shell to ask; denied");
+            self.capture_send_stopped(token, start.capture_id, Reason::Denied);
+            return;
+        };
+        self.captures.next_request = self.captures.next_request.wrapping_add(1).max(1);
+        let request = self.captures.next_request;
+        let client_name = exe_name(&exe);
+        info!("capture: asking the shell about {client_name:?} (request {request})");
+        if let Some(c) = self.wire_clients.get_mut(&shell) {
+            c.send(&ServerMsg::CapturePrompt(msg::CapturePrompt {
+                request,
+                output: start.output,
+                client_name,
+            }));
+        }
+        self.captures.prompts.push(Prompt {
+            request,
+            token,
+            start,
+            exe,
+            shell,
+        });
+    }
+
+    /// `CaptureAnswer` from a shell: subscribe it, apply the answer, and
+    /// tell it the state.
+    pub(crate) fn capture_answer(&mut self, token: u64, m: msg::CaptureAnswer) -> bool {
+        use nitro_wire::types::CaptureAnswerKind as A;
+        if !self.captures.watchers.contains(&token) {
+            self.captures.watchers.push(token);
+        }
+        if m.answer != A::Watch
+            && let Some(i) = self
+                .captures
+                .prompts
+                .iter()
+                .position(|p| p.request == m.request)
+        {
+            let p = self.captures.prompts.remove(i);
+            info!("capture: request {} answered {:?}", p.request, m.answer);
+            match m.answer {
+                A::Watch => {}
+                A::Deny => self.capture_send_stopped(p.token, p.start.capture_id, Reason::Denied),
+                A::AllowOnce | A::AllowSession => {
+                    if m.answer == A::AllowSession && !self.captures.grants.contains(&p.exe) {
+                        self.captures.grants.push(p.exe.clone());
+                    }
+                    // The world may have changed while the user decided.
+                    match self.capture_check(&p.start) {
+                        Ok(i) => self.capture_begin(p.token, &p.start, i),
+                        Err(r) => self.capture_send_stopped(p.token, p.start.capture_id, r),
+                    }
+                }
+            }
+        }
+        self.announce_capture(Some(token));
+        true
+    }
+
+    /// Tell the shell watchers whether and what is recorded, and move the
+    /// border. Every watcher hears a change; otherwise only `requester`
+    /// does (every `CaptureAnswer` is answered). Called at `settle`.
+    pub(crate) fn announce_capture(&mut self, requester: Option<u64>) {
+        let mut mask = 0u32;
+        let mut on = Vec::new();
+        for c in &self.captures.list {
+            if let Some(o) = self.outputs.iter().find(|o| o.kms_id == c.output) {
+                mask |= 1 << (o.scene_id.0 % 32);
+                if !on.contains(&c.output) {
+                    on.push(c.output);
+                }
+            }
+        }
+        // The border: repaint its strips on every output that gains or
+        // loses it.
+        let old = std::mem::take(&mut self.captures.border_on);
+        for o in &mut self.outputs {
+            if on.contains(&o.kms_id) != old.contains(&o.kms_id) {
+                for r in crate::frame::capture_border_rects(o.bounds()) {
+                    o.damage_content(r);
+                }
+            }
+        }
+        self.captures.border_on = on;
+        let now = (!self.captures.list.is_empty()).then_some(mask);
+        let to: Vec<u64> = if now == self.captures.announced {
+            requester
+                .filter(|t| self.captures.watchers.contains(t))
+                .into_iter()
+                .collect()
+        } else {
+            self.captures.announced = now;
+            self.captures.watchers.clone()
+        };
+        let state = ServerMsg::CaptureState(msg::CaptureState {
+            active: now.is_some(),
+            outputs_mask: now.unwrap_or(0),
+        });
+        for t in to {
+            if let Some(c) = self.wire_clients.get_mut(&t) {
+                c.send(&state);
+            }
+        }
+    }
+
+    /// The session locked: every capture ends, and every start waiting
+    /// for an answer is refused, as `Locked`. No lock-screen frame is
+    /// ever captured.
+    pub(crate) fn captures_lock(&mut self) {
+        for p in std::mem::take(&mut self.captures.prompts) {
+            self.capture_send_stopped(p.token, p.start.capture_id, Reason::Locked);
+        }
+        self.captures_stop_all(Reason::Locked);
+    }
+
+    /// Allocate a permitted capture of output `index`.
+    fn capture_begin(&mut self, token: u64, m: &msg::CaptureStart, index: usize) {
         let o = &self.outputs[index];
         let fps = if m.max_fps == 0 {
             1_000_000_000 / u64::from(o.refresh_ns.max(1))
@@ -261,7 +470,6 @@ impl Server {
                 self.capture_stop(i, Some(Reason::Unsupported));
             }
         }
-        true
     }
 
     /// `CaptureRelease`: the slot is free again.
@@ -289,6 +497,15 @@ impl Server {
             .position(|c| c.token == token && c.id == capture_id)
         {
             self.capture_stop(i, Some(Reason::Client));
+        } else if let Some(i) = self
+            .captures
+            .prompts
+            .iter()
+            .position(|p| p.token == token && p.start.capture_id == capture_id)
+        {
+            // Still waiting for the user: the prompt's answer is ignored.
+            self.captures.prompts.remove(i);
+            self.capture_send_stopped(token, capture_id, Reason::Client);
         }
         true
     }
@@ -359,6 +576,19 @@ impl Server {
     pub(crate) fn capture_client_gone(&mut self, token: u64) {
         while let Some(i) = self.captures.list.iter().position(|c| c.token == token) {
             self.capture_stop(i, None);
+        }
+        self.captures.prompts.retain(|p| p.token != token);
+        // A shell gone: what it was asked is denied, not left hanging.
+        if let Some(w) = self.captures.watchers.iter().position(|t| *t == token) {
+            self.captures.watchers.remove(w);
+            let (asked, rest) = std::mem::take(&mut self.captures.prompts)
+                .into_iter()
+                .partition(|p| p.shell == token);
+            self.captures.prompts = rest;
+            for p in asked {
+                let p: Prompt = p;
+                self.capture_send_stopped(p.token, p.start.capture_id, Reason::Denied);
+            }
         }
     }
 
@@ -885,6 +1115,9 @@ impl Server {
         let s = &self.captures.stats;
         pairs.push(("capture_active", self.captures.list.len() as u64));
         pairs.push(("capture_started", s.started));
+        pairs.push(("capture_prompts", self.captures.prompts.len() as u64));
+        pairs.push(("capture_grants", self.captures.grants.len() as u64));
+        pairs.push(("capture_watchers", self.captures.watchers.len() as u64));
         pairs.push(("capture_frames", s.frames));
         pairs.push(("capture_drops", s.drops));
         pairs.push(("capture_rings_bytes", self.captures.ring_bytes()));

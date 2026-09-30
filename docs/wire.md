@@ -651,6 +651,7 @@ Assigned in blocks of 0x100 so a block can grow without renumbering.
 | `0x040c` | `Lock` | shell (see `SHELL`) |
 | `0x040d` | `Unlock` | shell (see `SHELL`) |
 | `0x040e` | `SetOverview` | shell (see `SHELL`) |
+| `0x040f` | `CaptureAnswer` | shell (see `SHELL`) |
 
 ### Server → client
 
@@ -698,6 +699,8 @@ Assigned in blocks of 0x100 so a block can grow without renumbering.
 | `0x8407` | `OutputGone` | shell (see `SHELL` **or** `OUTPUTS`) |
 | `0x8408` | `OutputWorkArea` | shell (see `SHELL` **or** `OUTPUTS`) |
 | `0x8409` | `OverviewState` | shell (see `SHELL`; subscribers only) |
+| `0x840a` | `CapturePrompt` | shell (see `SHELL`; subscribers only) |
+| `0x840b` | `CaptureState` | shell (see `SHELL`; subscribers only) |
 | `0x8501` | `SelectionOffer` | data transfer (see `DATA`) |
 | `0x8502` | `SelectionData` | data transfer (see `DATA`) — **carries 1 fd** |
 | `0x8503` | `SelectionRequest` | data transfer (see `DATA`) |
@@ -2551,9 +2554,25 @@ With no free slot the frame is dropped, never waited for; its damage is
 kept, so `CaptureFrame.damage` is always the union since the client's
 previous frame (the first frame damages everything).
 
-**Permission.** The server decides per `CaptureStart`. #676 B allows it
-when the server runs with `NITRO_CAPTURE_ALLOW=1` and denies it
-otherwise; the allow-list and the shell's prompt replace that (#676 C).
+**Permission** (#676 C). The server decides per `CaptureStart`, from who
+the client *is*, not what it says: the executable of the connecting
+process (`SO_PEERCRED` pid → `/proc/<pid>/exe`, file name, a trailing
+` (deleted)` ignored), which must run as the server's uid.
+
+1. `NITRO_CAPTURE_ALLOW=1` in the server's environment allows every local
+   client without asking (tests, harness).
+2. Not on `server.conf` `capture.allow` (default `chrome, chromium,
+   nitro-shot`; empty = nobody) → `Denied` at once.
+3. Granted for the session earlier (`AllowSession`, remembered by exe
+   path until the server exits) → allowed.
+4. Otherwise the shell is asked: `CapturePrompt` to the last connection
+   that sent `CaptureAnswer`. The start waits (nothing is sent to the
+   client) until the answer: `Deny` → `Denied`; `AllowOnce` /
+   `AllowSession` → the start proceeds (re-checked: the lock, the output,
+   the helper may have changed). No shell subscribed, or the asked shell
+   disconnects first → `Denied`. A `CaptureStop` while waiting →
+   `Client`, and the late answer is ignored.
+
 Locked session → `Locked`; unknown output → `OutputGone`; no GPU helper
 (`gpu.helper = off`, given up, cannot start), a format other than `XR24`,
 or more than 4 captures → `Unsupported`. There is no CPU fallback.
@@ -2609,6 +2628,45 @@ The fd is the frame's completion `sync_file`.
 `capture_id: u32`, `reason: u8` — **5 bytes**. Reasons: `0` client, `1`
 denied, `2` locked, `3` output-gone, `4` helper-lost, `5` revoked, `6`
 unsupported.
+
+**The lock.** Locking the session (`Lock`) stops every capture and
+refuses every start waiting for an answer with `Locked`; a `CaptureStart`
+while locked is `Locked` too. No lock-screen frame is ever captured.
+
+### `CaptureAnswer` — 0x040f (shell)
+
+| field | type | meaning |
+|---|---|---|
+| `request` | `u32` | the `CapturePrompt.request`; ignored for `Watch` |
+| `answer` | `u8` (`CaptureAnswerKind`) | `0` watch, `1` deny, `2` allow once, `3` allow for the session |
+
+Fixed **5 bytes**. Needs `SHELL`. Sending it — `Watch` included —
+**subscribes** the connection to `CapturePrompt` and `CaptureState` (the
+`SetOverview` pattern: asking is what opts in, no capability bit), and it
+is always answered with a `CaptureState`. The first answer to a request
+wins; a late or unknown one is ignored. Anything past `3` is a decode
+error.
+
+### `CapturePrompt` — 0x840a (shell)
+
+| field | type | meaning |
+|---|---|---|
+| `request` | `u32` | the server's id for the question |
+| `output` | `u32` | the output to be recorded (`OutputInfo.id`) |
+| `client_name` | `str` | the program's executable file name (`chrome`), read by the server |
+
+An 8-byte head plus the string. Sent to the **last** subscriber only.
+
+### `CaptureState` — 0x840b (shell)
+
+| field | type | meaning |
+|---|---|---|
+| `active` | `bool` | whether any capture is running |
+| `outputs_mask` | `u32` | bit `id % 32` per captured `OutputInfo.id`; 0 when inactive |
+
+Fixed **5 bytes**. Pushed to every subscriber when it changes (coalesced
+per wakeup, at `settle`), and the answer to every `CaptureAnswer`. A shell
+shows its recording indicator on this and nothing else.
 
 ## Surface sharing (caps `SHARE`)
 

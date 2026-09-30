@@ -565,6 +565,36 @@ impl GpuSettings {
     }
 }
 
+/// What the `capture.*` keys say (#676 C).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CaptureSettings {
+    /// `capture.allow`: executable file names (`/proc/<pid>/exe`'s last
+    /// component) whose processes may *ask* to record the screen. `None`
+    /// is the default list; an empty value allows nobody.
+    pub allow: Option<Vec<String>>,
+}
+
+impl CaptureSettings {
+    /// The default `capture.allow`: Chromium under both of its binary
+    /// names, and `nitro-shot --record`.
+    pub const DEFAULT_ALLOW: [&'static str; 3] = ["chrome", "chromium", "nitro-shot"];
+
+    /// Whether the file says anything about capture.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.allow.is_none()
+    }
+
+    /// Whether a process whose executable is called `exe` may ask.
+    #[must_use]
+    pub fn allows(&self, exe: &str) -> bool {
+        match &self.allow {
+            Some(list) => list.iter().any(|a| a == exe),
+            None => Self::DEFAULT_ALLOW.contains(&exe),
+        }
+    }
+}
+
 /// A parsed `server.conf`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Settings {
@@ -582,6 +612,8 @@ pub struct Settings {
     pub overview: OverviewSettings,
     /// The GPU helper section.
     pub gpu: GpuSettings,
+    /// The screen-capture section.
+    pub capture: CaptureSettings,
     /// Every line that was skipped, and why. The caller logs these; they
     /// are not errors, because a configuration file cannot be allowed to
     /// stop a running compositor.
@@ -623,6 +655,7 @@ impl Settings {
             && self.remote.is_empty()
             && self.overview.is_empty()
             && self.gpu.is_empty()
+            && self.capture.is_empty()
             && self.outputs.values().all(OutputSettings::is_empty)
     }
 
@@ -918,6 +951,16 @@ pub fn parse(text: &str) -> Settings {
                     "line {number}: gpu.idle_exit {value:?} is not a positive number of seconds"
                 )),
             },
+            "capture.allow" => {
+                settings.capture.allow = Some(
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                        .collect(),
+                );
+            }
             other => settings
                 .warnings
                 .push(format!("line {number}: unknown key `{other}`")),
@@ -1556,6 +1599,26 @@ mod tests {
         let s = parse("gpu.helper = sometimes\ngpu.idle_exit = 0\ngpu.idle_exit = x\n");
         assert_eq!(s.warnings.len(), 3, "{:?}", s.warnings);
         assert!(s.gpu.is_empty());
+    }
+
+    #[test]
+    fn capture_allow_is_a_list_of_exe_names_with_a_default() {
+        let s = parse("");
+        assert!(s.capture.is_empty());
+        for exe in ["chrome", "chromium", "nitro-shot"] {
+            assert!(s.capture.allows(exe), "{exe}");
+        }
+        assert!(!s.capture.allows("obs"));
+        let s = parse("capture.allow = obs , chrome,\n");
+        assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+        assert!(!s.is_empty());
+        assert!(s.capture.allows("obs"));
+        assert!(s.capture.allows("chrome"));
+        assert!(!s.capture.allows("chromium"));
+        // Empty: nobody may ask.
+        let s = parse("capture.allow =\n");
+        assert!(!s.capture.allows("chrome"));
+        assert!(!s.capture.allows(""));
     }
 
     #[test]

@@ -9,31 +9,31 @@ use nitro_core::{Color, IRect, Palette, Point, Rect, Role, Size, Transform};
 use nitro_wire::codec::{FdQueue, Writer};
 use nitro_wire::msg::{
     AcceptDrop, AllocSurfaceBuffers, AllocSurfaceBuffersFailed, BindKey, BufferDamage,
-    BufferReleased, CaptureBuffers, CaptureFrame, CaptureRelease, CaptureStart, CaptureStop,
-    CaptureStopped, ClientCaps, ClientMsg, CloseWindow, Closed, Commit, Configure, CreateBuffer,
-    CreateDmabufBuffer, CreateNode, CreatePopup, CreateSurfaceBuffer, CreateWindow, DestroyBuffer,
-    DestroyNode, DmabufFeedback, DmabufPlane, DragDrop, DragEnter, DragFinished, DragLeave,
-    DragMotion, Error as ErrorMsg, ExportSurface, Fill, FinishDrag, Focus, FocusWindow, Frame,
-    GrabKeyboard, Hello, HotKey, IconRefused, ImportSurface, Key, Keymap, ListOutputs, Lock,
-    MeasureText, Modifiers, OutputGone, OutputInfo, OutputWorkArea, Outputs, OutputsEnd,
-    OverviewState, PointerAxis, PointerButton, PointerEnter, PointerLeave, PointerMotion,
-    PopupDone, PresentSurface, PresentSurfaceFenced, Presented, Reparent, RepositionPopup,
-    RequestFrame, RequestSelection, SelectionData, SelectionOffer, SelectionRequest, SendSelection,
-    ServerMsg, SetAnchor, SetAppId, SetBorder, SetBounds, SetClip, SetCorners, SetCursor,
-    SetDragIconOffset, SetExclusiveZone, SetFill, SetIcon, SetImage, SetLayer, SetOpacity,
-    SetOpaqueRegion, SetOverview, SetSelection, SetSurface, SetText, SetTransform, SetVisible,
-    SetWindowLimits, SetWindowState, SetWindowStateFor, SetWindowTitle, StartDrag, StartMove,
-    StartResize, SurfaceBufferAllocated, SurfaceExported, SurfaceHint, SurfacePlaneHint,
-    SurfaceRevoked, TextMeasured, TextMetrics, Theme, Touch, UnbindKey, Unlock, Welcome,
-    WindowGone, WindowInfo, WindowList, WindowListEnd, WindowState,
+    BufferReleased, CaptureAnswer, CaptureBuffers, CaptureFrame, CapturePrompt, CaptureRelease,
+    CaptureStart, CaptureState, CaptureStop, CaptureStopped, ClientCaps, ClientMsg, CloseWindow,
+    Closed, Commit, Configure, CreateBuffer, CreateDmabufBuffer, CreateNode, CreatePopup,
+    CreateSurfaceBuffer, CreateWindow, DestroyBuffer, DestroyNode, DmabufFeedback, DmabufPlane,
+    DragDrop, DragEnter, DragFinished, DragLeave, DragMotion, Error as ErrorMsg, ExportSurface,
+    Fill, FinishDrag, Focus, FocusWindow, Frame, GrabKeyboard, Hello, HotKey, IconRefused,
+    ImportSurface, Key, Keymap, ListOutputs, Lock, MeasureText, Modifiers, OutputGone, OutputInfo,
+    OutputWorkArea, Outputs, OutputsEnd, OverviewState, PointerAxis, PointerButton, PointerEnter,
+    PointerLeave, PointerMotion, PopupDone, PresentSurface, PresentSurfaceFenced, Presented,
+    Reparent, RepositionPopup, RequestFrame, RequestSelection, SelectionData, SelectionOffer,
+    SelectionRequest, SendSelection, ServerMsg, SetAnchor, SetAppId, SetBorder, SetBounds, SetClip,
+    SetCorners, SetCursor, SetDragIconOffset, SetExclusiveZone, SetFill, SetIcon, SetImage,
+    SetLayer, SetOpacity, SetOpaqueRegion, SetOverview, SetSelection, SetSurface, SetText,
+    SetTransform, SetVisible, SetWindowLimits, SetWindowState, SetWindowStateFor, SetWindowTitle,
+    StartDrag, StartMove, StartResize, SurfaceBufferAllocated, SurfaceExported, SurfaceHint,
+    SurfacePlaneHint, SurfaceRevoked, TextMeasured, TextMetrics, Theme, Touch, UnbindKey, Unlock,
+    Welcome, WindowGone, WindowInfo, WindowList, WindowListEnd, WindowState,
 };
 use nitro_wire::types::{
-    Align, AllocRefusal, AxisSource, BufferId, ButtonState, CaptureKind, CaptureSlot,
-    CaptureStopReason, ColorMatrix, ColorRange, CursorPos, CursorShape, DataSource, DmabufFormat,
-    DragAction, Edge, ErrorCode, KeymapFormat, Layer, NodeId, NodeKind, OverviewRequest,
-    PopupAnchor, PopupGravity, ShareToken, TouchPhase, WindowRef, WindowState as WindowStateValue,
-    anchor, caps, constraint_adjust, dmabuf_flags, drag_actions, format, mod_mask, modifier,
-    plane_hint_flags, popup_flags, resize_edges, window_flags,
+    Align, AllocRefusal, AxisSource, BufferId, ButtonState, CaptureAnswerKind, CaptureKind,
+    CaptureSlot, CaptureStopReason, ColorMatrix, ColorRange, CursorPos, CursorShape, DataSource,
+    DmabufFormat, DragAction, Edge, ErrorCode, KeymapFormat, Layer, NodeId, NodeKind,
+    OverviewRequest, PopupAnchor, PopupGravity, ShareToken, TouchPhase, WindowRef,
+    WindowState as WindowStateValue, anchor, caps, constraint_adjust, dmabuf_flags, drag_actions,
+    format, mod_mask, modifier, plane_hint_flags, popup_flags, resize_edges, window_flags,
 };
 use nitro_wire::{DecodeError, VERSION, header};
 
@@ -353,6 +353,11 @@ fn client_messages() -> Vec<ClientMsg> {
         .into(),
         SetOverview {
             request: OverviewRequest::Grid,
+        }
+        .into(),
+        CaptureAnswer {
+            request: 7,
+            answer: CaptureAnswerKind::AllowSession,
         }
         .into(),
         // M5-A (#3767).
@@ -809,6 +814,17 @@ fn server_messages() -> Vec<ServerMsg> {
         OverviewState {
             active: false,
             output: 0,
+        }
+        .into(),
+        CaptureState {
+            active: true,
+            outputs_mask: 0b110,
+        }
+        .into(),
+        CapturePrompt {
+            request: 3,
+            output: 2,
+            client_name: "chrome".to_owned(),
         }
         .into(),
         OutputInfo {
@@ -1552,6 +1568,60 @@ fn payload_layouts_are_frozen() {
             0x05, 0x00, 0x00, 0x00, 0x09, 0x84, 0x00, 0x00, //
             0x01, // active
             0x04, 0x03, 0x02, 0x01, // output
+        ]
+    );
+
+    // #676 C: the capture prompt and indicator ops.
+    let mut w = Writer::new();
+    ClientMsg::from(CaptureAnswer {
+        request: 0x0102_0304,
+        answer: CaptureAnswerKind::AllowOnce,
+    })
+    .encode(&mut w)
+    .unwrap();
+    assert_eq!(
+        w.bytes(),
+        &[
+            // header: len=5, op=0x040f, fds=0, flags=0
+            0x05, 0x00, 0x00, 0x00, 0x0f, 0x04, 0x00, 0x00, //
+            0x04, 0x03, 0x02, 0x01, // request
+            0x02, // answer AllowOnce
+        ]
+    );
+
+    let mut w = Writer::new();
+    ServerMsg::from(CapturePrompt {
+        request: 9,
+        output: 2,
+        client_name: "ab".to_owned(),
+    })
+    .encode(&mut w)
+    .unwrap();
+    assert_eq!(
+        w.bytes(),
+        &[
+            // header: len=14, op=0x840a, fds=0, flags=0
+            0x0e, 0x00, 0x00, 0x00, 0x0a, 0x84, 0x00, 0x00, //
+            0x09, 0x00, 0x00, 0x00, // request
+            0x02, 0x00, 0x00, 0x00, // output
+            0x02, 0x00, 0x00, 0x00, b'a', b'b', // client_name
+        ]
+    );
+
+    let mut w = Writer::new();
+    ServerMsg::from(CaptureState {
+        active: true,
+        outputs_mask: 0x0000_0006,
+    })
+    .encode(&mut w)
+    .unwrap();
+    assert_eq!(
+        w.bytes(),
+        &[
+            // header: len=5, op=0x840b, fds=0, flags=0
+            0x05, 0x00, 0x00, 0x00, 0x0b, 0x84, 0x00, 0x00, //
+            0x01, // active
+            0x06, 0x00, 0x00, 0x00, // outputs_mask
         ]
     );
 
@@ -2446,6 +2516,7 @@ fn the_shell_ops_live_in_their_own_block() {
         Lock::OP,
         Unlock::OP,
         SetOverview::OP,
+        CaptureAnswer::OP,
     ] {
         assert_eq!(op & 0xff00, 0x0400, "client shell op {op:#06x}");
         assert!(ClientMsg::is_op(op));
@@ -2461,11 +2532,33 @@ fn the_shell_ops_live_in_their_own_block() {
         OutputGone::OP,
         OutputWorkArea::OP,
         OverviewState::OP,
+        CapturePrompt::OP,
+        CaptureState::OP,
     ] {
         assert_eq!(op & 0xff00, 0x8400, "server shell op {op:#06x}");
         assert!(ServerMsg::is_op(op));
         assert!(!ClientMsg::is_op(op));
     }
+}
+
+#[test]
+fn the_capture_prompt_ops_are_where_the_doc_says() {
+    assert_eq!(CaptureAnswer::OP, 0x040f);
+    assert_eq!(CapturePrompt::OP, 0x840a);
+    assert_eq!(CaptureState::OP, 0x840b);
+    let mut q = FdQueue::new();
+    // An answer past `AllowSession` is a decode error.
+    assert_eq!(
+        ClientMsg::decode(CaptureAnswer::OP, &[1, 0, 0, 0, 4], &mut q),
+        Err(DecodeError::BadValue)
+    );
+    assert_eq!(
+        ClientMsg::decode(CaptureAnswer::OP, &[1, 0, 0, 0, 0], &mut q),
+        Ok(ClientMsg::CaptureAnswer(CaptureAnswer {
+            request: 1,
+            answer: CaptureAnswerKind::Watch
+        }))
+    );
 }
 
 #[test]

@@ -3239,6 +3239,9 @@ impl<S: 'static> Ui<S> {
                     },
                 );
             }
+            ServerMsg::CapturePrompt(_) | ServerMsg::CaptureState(_) => {
+                self.dispatch_capture_msg(state, msg);
+            }
             ServerMsg::HotKey(h) => {
                 self.dispatch_shell(
                     state,
@@ -3271,6 +3274,23 @@ impl<S: 'static> Ui<S> {
             // messages go to `crate::dnd`, which ignores everything else.
             _ => self.dnd_msg(state, msg),
         }
+    }
+
+    /// The screen-recording arms of [`Ui::dispatch`] (#676 C): shell news.
+    fn dispatch_capture_msg(&mut self, state: &mut S, msg: &ServerMsg) {
+        let ev = match msg {
+            ServerMsg::CapturePrompt(p) => crate::shell::ShellEvent::CapturePrompt {
+                request: p.request,
+                output: p.output,
+                client_name: p.client_name.clone(),
+            },
+            ServerMsg::CaptureState(c) => crate::shell::ShellEvent::CaptureState {
+                active: c.active,
+                outputs_mask: c.outputs_mask,
+            },
+            _ => return,
+        };
+        self.dispatch_shell(state, &ev);
     }
 
     /// The Surface-path and window-state arms of [`Ui::dispatch`].
@@ -4067,6 +4087,26 @@ impl<S: 'static> Ui<S> {
         self.wire.send_now(&nitro_wire::msg::ClientMsg::SetOverview(
             nitro_wire::msg::SetOverview { request },
         ))
+    }
+
+    /// Answer a capture prompt, or (with `Watch`) subscribe to prompts
+    /// and to the recording state (shell only; #676 C).
+    ///
+    /// Answered with a
+    /// [`ShellEvent::CaptureState`](crate::shell::ShellEvent::CaptureState).
+    /// Sent at once, without a commit.
+    ///
+    /// # Errors
+    /// As [`Ui::window_list`].
+    pub fn capture_answer(
+        &mut self,
+        request: u32,
+        answer: crate::shell::CaptureAnswerKind,
+    ) -> Result<(), Error> {
+        self.wire
+            .send_now(&nitro_wire::msg::ClientMsg::CaptureAnswer(
+                nitro_wire::msg::CaptureAnswer { request, answer },
+            ))
     }
 
     /// Lock the session, or take over a lock nobody holds (shell only).

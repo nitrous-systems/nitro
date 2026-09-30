@@ -301,6 +301,24 @@ tag_enum! {
     }
 }
 
+tag_enum! {
+    /// A shell's answer to a [`CapturePrompt`](crate::msg::CapturePrompt),
+    /// carried by [`CaptureAnswer`](crate::msg::CaptureAnswer) (#676 C).
+    CaptureAnswerKind: u8 {
+        /// No answer: subscribe to prompts and to
+        /// [`CaptureState`](crate::msg::CaptureState), and be told the
+        /// current state. `request` is ignored.
+        Watch = 0,
+        /// The user said no: the client hears `CaptureStopped { Denied }`.
+        Deny = 1,
+        /// Allow this one capture.
+        AllowOnce = 2,
+        /// Allow this program (by executable path) until the server
+        /// exits, i.e. until logout: later starts are not prompted.
+        AllowSession = 3,
+    }
+}
+
 /// One slot of a [`CaptureBuffers`](crate::msg::CaptureBuffers): where the
 /// image lives in that slot's dma-buf. The fd rides beside it.
 #[derive(Debug)]

@@ -17,8 +17,8 @@ use nitro_gpu::fake::{Call, FakeBackend as FakeGpu};
 use nitro_server::gpu::Spawner;
 use nitro_server::{BackendKind, Config, config::GpuHelper, run};
 use nitro_wire::client::Connection;
-use nitro_wire::msg::{CaptureBuffers, CaptureFrame, ServerMsg};
-use nitro_wire::types::{CaptureStopReason, ErrorCode, Layer, NodeId, caps};
+use nitro_wire::msg::{CaptureBuffers, CaptureFrame, CapturePrompt, ServerMsg};
+use nitro_wire::types::{CaptureAnswerKind, CaptureStopReason, ErrorCode, Layer, NodeId, caps};
 
 const OUT: (u32, u32) = (320, 240);
 const ROOT: NodeId = NodeId(1);
@@ -36,12 +36,18 @@ struct Harness {
     dir: PathBuf,
     path: PathBuf,
     wire_path: PathBuf,
+    shell_path: PathBuf,
     thread: Option<JoinHandle<Result<(), nitro_server::Error>>>,
     fake: FakeGpu,
 }
 
 impl Harness {
     fn start(name: &str, mode: GpuHelper, allow: bool) -> Self {
+        Self::start_conf(name, mode, allow, None)
+    }
+
+    /// A server whose `server.conf` holds `conf`.
+    fn start_conf(name: &str, mode: GpuHelper, allow: bool, conf: Option<&str>) -> Self {
         let dir = std::env::temp_dir().join(format!("nitro-cap-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("nitro").join("control.sock");
@@ -53,6 +59,12 @@ impl Harness {
         config.fake_modes = vec![(OUT.0, OUT.1, 60_000)];
         config.gpu = Some(mode);
         config.capture_allow = allow;
+        if let Some(text) = conf {
+            std::fs::create_dir_all(&dir).unwrap();
+            let p = dir.join("server.conf");
+            std::fs::write(&p, text).unwrap();
+            config.config_path = Some(p);
+        }
         let fake = FakeGpu::auto_signal();
         let f = fake.clone();
         let cfg = nitro_gpu::Config {
@@ -66,11 +78,13 @@ impl Harness {
             });
         })));
         let wire_path = config.wire_path.clone();
+        let shell_path = config.shell_path.clone();
         let thread = std::thread::spawn(move || run(config));
         let h = Self {
             dir,
             path,
             wire_path,
+            shell_path,
             thread: Some(thread),
             fake,
         };
@@ -316,6 +330,12 @@ fn frames_follow_flips_with_damage_and_the_ring_goes_at_stop() {
     let f = c.frame();
     assert_eq!(f.damage, vec![IRect::new(0, 0, 320, 240)]);
     c.conn.capture_release(7, f.slot).unwrap();
+    // The recording border appearing (#676 C) is a change of its own:
+    // its frame may come after the first one.
+    std::thread::sleep(Duration::from_millis(100));
+    for f in c.frames_now() {
+        c.conn.capture_release(7, f.slot).unwrap();
+    }
     // No change, no frame.
     std::thread::sleep(Duration::from_millis(100));
     assert!(c.frames_now().is_empty());
@@ -441,5 +461,249 @@ fn a_dead_helper_stops_the_capture_as_helper_lost() {
     assert_eq!(c.stopped(1), CaptureStopReason::HelperLost);
     h.fake.state().stall = false;
     assert_eq!(h.stat("capture_rings_bytes"), 0);
+    h.quit();
+}
+
+// ------------------------------------------------ permission (#676 C)
+
+/// This test binary's executable name: what the server matches against
+/// `capture.allow` (it reads `/proc/<pid>/exe` of the peer, which is us).
+fn own_exe() -> String {
+    std::env::current_exe()
+        .unwrap()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// A shell connection watching capture prompts and state.
+struct Shell {
+    conn: Connection,
+    seen: Vec<ServerMsg>,
+}
+
+impl Shell {
+    fn new(h: &Harness) -> Self {
+        let mut conn = Connection::connect(&h.shell_path, "bar").expect("shell connect");
+        conn.capture_answer(0, CaptureAnswerKind::Watch).unwrap();
+        conn.flush().unwrap();
+        let mut s = Self {
+            conn,
+            seen: Vec::new(),
+        };
+        assert_eq!(s.state(), (false, 0), "the answer to Watch");
+        s
+    }
+
+    fn expect<T>(&mut self, what: &str, f: impl Fn(&ServerMsg) -> Option<T>) -> T {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(i) = self.seen.iter().position(|m| f(m).is_some()) {
+                let m = self.seen.remove(i);
+                return f(&m).unwrap();
+            }
+            assert!(Instant::now() < deadline, "no {what}; got {:?}", self.seen);
+            let _ = self.conn.flush();
+            self.conn.poll(&mut self.seen).unwrap();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn prompt(&mut self) -> CapturePrompt {
+        self.expect("CapturePrompt", |m| match m {
+            ServerMsg::CapturePrompt(p) => Some(p.clone()),
+            _ => None,
+        })
+    }
+
+    fn state(&mut self) -> (bool, u32) {
+        self.expect("CaptureState", |m| match m {
+            ServerMsg::CaptureState(s) => Some((s.active, s.outputs_mask)),
+            _ => None,
+        })
+    }
+
+    fn answer(&mut self, request: u32, a: CaptureAnswerKind) {
+        self.conn.capture_answer(request, a).unwrap();
+        self.conn.flush().unwrap();
+    }
+}
+
+fn allow_me() -> String {
+    format!("capture.allow = {}\n", own_exe())
+}
+
+#[test]
+fn a_client_not_on_the_allow_list_is_denied_without_a_prompt() {
+    let h = Harness::start_conf(
+        "notlisted",
+        GpuHelper::On,
+        false,
+        Some("capture.allow = obs\n"),
+    );
+    let mut shell = Shell::new(&h);
+    let mut c = Client::new(&h, caps::CAPTURE);
+    let out = c.output;
+    c.conn.capture_start(1, out, 0).unwrap();
+    assert_eq!(c.stopped(1), CaptureStopReason::Denied);
+    let _ = shell.conn.poll(&mut shell.seen);
+    assert!(
+        !shell
+            .seen
+            .iter()
+            .any(|m| matches!(m, ServerMsg::CapturePrompt(_))),
+        "{:?}",
+        shell.seen
+    );
+    assert_eq!(h.stat("capture_prompts"), 0);
+    h.quit();
+}
+
+#[test]
+fn with_no_shell_listening_a_listed_client_is_denied() {
+    let h = Harness::start_conf("noshell", GpuHelper::On, false, Some(&allow_me()));
+    let mut c = Client::new(&h, caps::CAPTURE);
+    let out = c.output;
+    c.conn.capture_start(1, out, 0).unwrap();
+    assert_eq!(c.stopped(1), CaptureStopReason::Denied);
+    h.quit();
+}
+
+#[test]
+fn the_shell_prompt_denies_allows_once_and_allows_for_the_session() {
+    let h = Harness::start_conf("prompt", GpuHelper::On, false, Some(&allow_me()));
+    let mut shell = Shell::new(&h);
+    let mut c = Client::new(&h, caps::CAPTURE);
+    let out = c.output;
+
+    // Deny.
+    c.conn.capture_start(1, out, 0).unwrap();
+    c.conn.flush().unwrap();
+    let p = shell.prompt();
+    assert_eq!(p.output, out);
+    assert_eq!(p.client_name, own_exe(), "the exe, not the app id");
+    assert_eq!(h.stat("capture_prompts"), 1);
+    shell.answer(p.request, CaptureAnswerKind::Deny);
+    assert_eq!(c.stopped(1), CaptureStopReason::Denied);
+    assert_eq!(h.stat("capture_prompts"), 0);
+
+    // Allow once: frames flow; the next start is asked again.
+    c.conn.capture_start(2, out, 0).unwrap();
+    c.conn.flush().unwrap();
+    let p = shell.prompt();
+    shell.answer(p.request, CaptureAnswerKind::AllowOnce);
+    let _b = c.buffers();
+    let _f = c.frame();
+    c.conn.capture_stop(2).unwrap();
+    assert_eq!(c.stopped(2), CaptureStopReason::Client);
+    // A late answer to a settled request changes nothing.
+    shell.answer(p.request, CaptureAnswerKind::Deny);
+
+    // Allow for the session: asked once, then not again.
+    c.conn.capture_start(3, out, 0).unwrap();
+    c.conn.flush().unwrap();
+    let p = shell.prompt();
+    shell.answer(p.request, CaptureAnswerKind::AllowSession);
+    let _b = c.buffers();
+    c.conn.capture_stop(3).unwrap();
+    assert_eq!(c.stopped(3), CaptureStopReason::Client);
+    assert_eq!(h.stat("capture_grants"), 1);
+    c.conn.capture_start(4, out, 0).unwrap();
+    let _b = c.buffers();
+    let _ = shell.conn.poll(&mut shell.seen);
+    assert!(
+        !shell
+            .seen
+            .iter()
+            .any(|m| matches!(m, ServerMsg::CapturePrompt(_))),
+        "granted for the session: {:?}",
+        shell.seen
+    );
+    h.quit();
+}
+
+#[test]
+fn a_shell_that_goes_away_mid_prompt_denies() {
+    let h = Harness::start_conf("shellgone", GpuHelper::On, false, Some(&allow_me()));
+    let mut shell = Shell::new(&h);
+    let mut c = Client::new(&h, caps::CAPTURE);
+    let out = c.output;
+    c.conn.capture_start(1, out, 0).unwrap();
+    c.conn.flush().unwrap();
+    let _p = shell.prompt();
+    drop(shell);
+    assert_eq!(c.stopped(1), CaptureStopReason::Denied);
+    assert_eq!(h.stat("capture_prompts"), 0);
+    h.quit();
+}
+
+/// The pixel at `(x, y)` of a `shot` of the only output, as `0xAARRGGBB`.
+fn shot_pixel(h: &Harness, x: u32, y: u32) -> u32 {
+    use std::io::{BufRead as _, Read as _, Write as _};
+    let s = std::os::unix::net::UnixStream::connect(&h.path).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut r = std::io::BufReader::new(s);
+    r.get_mut().write_all(b"shot\n").unwrap();
+    let mut line = String::new();
+    r.read_line(&mut line).unwrap();
+    let f: Vec<u32> = line
+        .trim()
+        .strip_prefix("ok ")
+        .unwrap_or_else(|| panic!("shot: {line:?}"))
+        .split(' ')
+        .take(3)
+        .map(|v| v.parse().unwrap())
+        .collect();
+    let (height, stride) = (f[1], f[2]);
+    let mut data = vec![0u8; (stride * height) as usize];
+    r.read_exact(&mut data).unwrap();
+    let i = (y * stride + x * 4) as usize;
+    u32::from_le_bytes(data[i..i + 4].try_into().unwrap())
+}
+
+#[test]
+fn the_indicator_state_is_pushed_and_the_border_is_drawn() {
+    let h = Harness::start("state", GpuHelper::On, true);
+    let mut shell = Shell::new(&h);
+    let mut c = Client::new(&h, caps::CAPTURE);
+    let out = c.output;
+    let accent = nitro_core::Palette::default().get(nitro_core::Role::Accent);
+    let accent = u32::from_be_bytes([255, accent.r, accent.g, accent.b]);
+    let before = shot_pixel(&h, 0, 0);
+    assert_ne!(before, accent, "no border before");
+    c.conn.capture_start(1, out, 0).unwrap();
+    let _b = c.buffers();
+    assert_eq!(shell.state(), (true, 1 << (out % 32)));
+    let f = c.frame();
+    c.conn.capture_release(1, f.slot).unwrap();
+    // The 2 px border, top-left and bottom-right; the middle untouched.
+    wait_for("the border", || shot_pixel(&h, 0, 0) == accent);
+    assert_eq!(shot_pixel(&h, 1, 1), accent);
+    assert_eq!(shot_pixel(&h, OUT.0 - 1, OUT.1 - 1), accent);
+    assert_ne!(shot_pixel(&h, 2, 2), accent);
+    c.conn.capture_stop(1).unwrap();
+    assert_eq!(c.stopped(1), CaptureStopReason::Client);
+    assert_eq!(shell.state(), (false, 0));
+    wait_for("the border to go", || shot_pixel(&h, 0, 0) == before);
+    h.quit();
+}
+
+#[test]
+fn locking_stops_every_capture_and_refuses_new_ones() {
+    let h = Harness::start("lock", GpuHelper::On, true);
+    let mut shell = Shell::new(&h);
+    let mut c = Client::new(&h, caps::CAPTURE);
+    let out = c.output;
+    c.conn.capture_start(1, out, 0).unwrap();
+    let _b = c.buffers();
+    assert!(shell.state().0);
+    shell.conn.lock().unwrap();
+    shell.conn.flush().unwrap();
+    assert_eq!(c.stopped(1), CaptureStopReason::Locked);
+    assert_eq!(shell.state(), (false, 0));
+    assert_eq!(h.stat("capture_rings_bytes"), 0);
+    c.conn.capture_start(2, out, 0).unwrap();
+    assert_eq!(c.stopped(2), CaptureStopReason::Locked);
     h.quit();
 }
