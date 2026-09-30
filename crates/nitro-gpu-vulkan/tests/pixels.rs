@@ -663,21 +663,45 @@ fn case9_capture_draws_layers_into_a_temporary_target_and_frees_it() {
     // #3962: a shot's composite. No ring: the target is made and freed
     // inside the call.
     let Some(mut h) = helper(&[]) else { return };
-    let (w, ht) = (100, 70);
     let px = fill(40, 30, |_, _| bgra(20, 200, 40, 255));
     h.shadow(1, 40, 30, XR24, &px);
-    let before = match h.call(&ToHelper::GetStats, vec![]).0 {
-        FromHelper::Stats(s) => s.drm_total,
-        other => panic!("{other:?}"),
-    };
     let mut layers = vec![layer(1, 40, 30, IRect::new(0, 0, 50, 30), Blend::Opaque)];
     let nv12 = h.nv12(2, 64, 64, (128, 100, 160)).is_some();
     if nv12 {
         layers.push(layer(2, 64, 64, IRect::new(50, 20, 32, 32), Blend::Opaque));
     }
-    let img = match h.call(
+    // #3975: the first submit in the process makes a one-time step in
+    // drm_total (driver state/instruction pools, pipeline upload: +16 KiB
+    // on hasvk, ~4 MiB on anv) that does not grow with the target size.
+    // Warm up with one small capture, then sample.
+    capture(&mut h, 4, 100, 70, layers.clone());
+    let before = drm_total(&mut h);
+    let img = capture(&mut h, 5, 100, 70, layers.clone());
+    img.assert_near(0, 0, [20, 200, 40], 0);
+    img.assert_near(49, 29, [20, 200, 40], 0);
+    if nv12 {
+        img.assert_near(60, 30, NV12_RGB, 3);
+        img.assert_near(81, 51, NV12_RGB, 3);
+    }
+    // A 1080p XR24 target is ~8 MiB: a leaked one cannot hide.
+    let big = capture(&mut h, 6, 1920, 1080, layers);
+    big.assert_near(0, 0, [20, 200, 40], 0);
+    let after = drm_total(&mut h);
+    eprintln!("capture: drm_total {before} -> {after}");
+    assert!(after <= before, "the capture targets were freed");
+}
+
+fn drm_total(h: &mut Helper) -> u64 {
+    match h.call(&ToHelper::GetStats, vec![]).0 {
+        FromHelper::Stats(s) => s.drm_total,
+        other => panic!("{other:?}"),
+    }
+}
+
+fn capture(h: &mut Helper, serial: u64, w: u32, ht: u32, layers: Vec<Layer>) -> Image {
+    match h.call(
         &ToHelper::Capture {
-            serial: 5,
+            serial,
             w,
             h: ht,
             layers,
@@ -686,14 +710,14 @@ fn case9_capture_draws_layers_into_a_temporary_target_and_frees_it() {
     ) {
         (
             FromHelper::Captured {
-                serial: 5,
+                serial: s,
                 w: cw,
                 h: ch,
                 stride,
             },
             mut fds,
         ) => {
-            assert_eq!((cw, ch), (w, ht));
+            assert_eq!((s, cw, ch), (serial, w, ht));
             let len = stride as usize * ch as usize;
             let map = nitro_shm::Mapping::map(fds.pop().unwrap(), len).unwrap();
             Image {
@@ -703,19 +727,7 @@ fn case9_capture_draws_layers_into_a_temporary_target_and_frees_it() {
             }
         }
         other => panic!("capture: {other:?}"),
-    };
-    img.assert_near(0, 0, [20, 200, 40], 0);
-    img.assert_near(49, 29, [20, 200, 40], 0);
-    if nv12 {
-        img.assert_near(60, 30, NV12_RGB, 3);
-        img.assert_near(81, 51, NV12_RGB, 3);
     }
-    let after = match h.call(&ToHelper::GetStats, vec![]).0 {
-        FromHelper::Stats(s) => s.drm_total,
-        other => panic!("{other:?}"),
-    };
-    eprintln!("capture: drm_total {before} -> {after}");
-    assert!(after <= before, "the capture target was freed");
 }
 
 #[test]

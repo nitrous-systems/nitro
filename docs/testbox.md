@@ -64,6 +64,7 @@ just bench         # the throughput matrix; see docs/bench.md
 just bench-report  # that ledger as the markdown docs/bench.md carries
 just bench-bandwidth box   # the box's memcpy rate: copy 3.61 GB/s
 just box-chvt 1    # VT-switch survival test; `just box-chvt 2` to come back
+just box-gpu-test  # GPU helper pixel tests (+ footprint) on the box's render node, NITRO_GPU_TEST=require
 just box-stop
 ```
 
