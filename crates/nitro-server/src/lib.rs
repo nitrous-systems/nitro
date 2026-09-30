@@ -10886,8 +10886,18 @@ impl Server {
     /// Decide output `index`'s plane layout for the frame about to be
     /// painted, and stage it if it changed.
     fn plan_planes(&mut self, index: usize) {
-        let o = &self.outputs[index];
+        let o = &mut self.outputs[index];
         if o.plane_info.is_empty() || !o.lit || !self.active {
+            // Nothing is planned here, so nothing is off the planes for
+            // the scaling rule either: a set left from an earlier frame
+            // would keep `planes_scale_limited` and the hint flag stale.
+            // Defensive: no path reaches here with a non-empty set today
+            // (`paint` already skips an inactive session, and `lit` and
+            // `plane_info` do not go back once a set can exist).
+            if !o.scale_limited.is_empty() {
+                o.scale_limited.clear();
+                self.send_plane_hints();
+            }
             return;
         }
         let mut sc = std::mem::take(&mut self.plan);

@@ -273,7 +273,7 @@ containing the transaction reached the screen.
 | 17 | `SHARE` | cross-client Surface sharing: `ExportSurface`, `ImportSurface`, `SurfaceExported`, `SurfaceRevoked` (#3904); see [Surface sharing](#surface-sharing-caps-share) |
 | 18 | `PLANE_HINT` | `SurfacePlaneHint`: how far a display plane downscales, and whether a Surface is off the planes for it (#3956); see [`SurfacePlaneHint`](#surfaceplanehint--0x830c) |
 
-Bits 8–17 together are `caps::CAPS_M5_MASK`, the range
+Bits 8–18 together are `caps::CAPS_M5_MASK`, the range
 [`ClientCaps`](#capability-opt-in-clientcaps) governs.
 
 `DATA` is **one** bit for two features because they are one mechanism: the
