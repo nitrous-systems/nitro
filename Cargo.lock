@@ -467,6 +467,11 @@ dependencies = [
 [[package]]
 name = "nitro-shot"
 version = "0.0.1"
+dependencies = [
+ "nitro-shm",
+ "nitro-wire",
+ "rustix",
+]
 
 [[package]]
 name = "nitro-system"

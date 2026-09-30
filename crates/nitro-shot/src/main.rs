@@ -9,12 +9,16 @@
 //! nitro-shot --quit                               stop the server
 //! nitro-shot --input "ARGS"                       inject input: `input ARGS` (see nitro-server's protocol.rs)
 //! nitro-shot --samples i2p|flip|paint|damage      raw recent samples, oldest first (µs; pixels for damage)
+//! nitro-shot --record N [--output NAME] [--fps F] [-o FILE]
+//!                                                 record N frames over the wire (#676): fps, latency,
+//!                                                 damage; the last frame to FILE as PNG
 //! ```
 //!
 //! The control socket is `$NITRO_CONTROL`, else
 //! `$XDG_RUNTIME_DIR/nitro/control.sock`, else `/tmp/nitro-<uid>/control.sock`.
 
 mod png;
+mod record;
 
 use std::io::{self, BufRead as _, BufReader, Read as _, Write as _};
 use std::os::unix::fs::MetadataExt as _;
@@ -43,6 +47,13 @@ enum Mode {
     Input(String),
     /// `samples i2p|flip|paint|damage`.
     Samples(String),
+    /// Record `frames` frames of `output` at ≤`fps` (0: the output's
+    /// rate) over the wire's capture ops (#676).
+    Record {
+        frames: u32,
+        output: Option<String>,
+        fps: u32,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -51,7 +62,7 @@ struct Args {
     file: Option<PathBuf>,
 }
 
-const USAGE: &str = "usage: nitro-shot [-o FILE] [--raw] [--output NAME] [--no-cursor] [-v] | --outputs | --modes | --stats | --quit | --input ARGS | --samples i2p|flip|paint|damage";
+const USAGE: &str = "usage: nitro-shot [-o FILE] [--raw] [--output NAME] [--no-cursor] [-v] | --outputs | --modes | --stats | --quit | --input ARGS | --samples i2p|flip|paint|damage | --record N [--output NAME] [--fps F] [-o FILE]";
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
     let mut file = None;
@@ -60,6 +71,8 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
     let mut no_cursor = false;
     let mut verbose = false;
     let mut cmd: Option<Mode> = None;
+    let mut record: Option<u32> = None;
+    let mut fps = 0;
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -79,9 +92,30 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
                 }
                 _ => return Err("--samples needs i2p, flip, paint or damage".to_owned()),
             },
+            "--record" => {
+                record = Some(
+                    it.next()
+                        .and_then(|n| n.parse().ok())
+                        .filter(|n| *n > 0)
+                        .ok_or("--record needs a frame count")?,
+                );
+            }
+            "--fps" => {
+                fps = it
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .ok_or("--fps needs a number")?;
+            }
             "-h" | "--help" => return Err(USAGE.to_owned()),
             other => return Err(format!("unknown argument {other:?}\n{USAGE}")),
         }
+    }
+    if let Some(frames) = record {
+        cmd = Some(Mode::Record {
+            frames,
+            output: output.clone(),
+            fps,
+        });
     }
     let mode = cmd.unwrap_or(Mode::Shot {
         raw,
@@ -209,6 +243,14 @@ fn write_out(file: Option<&PathBuf>, bytes: &[u8]) -> io::Result<()> {
 }
 
 fn run(args: Args) -> io::Result<()> {
+    if let Mode::Record {
+        frames,
+        ref output,
+        fps,
+    } = args.mode
+    {
+        return record::run(frames, output.as_deref(), fps, args.file.as_deref());
+    }
     let mut conn = connect()?;
     match args.mode {
         Mode::Shot {
@@ -255,6 +297,7 @@ fn run(args: Args) -> io::Result<()> {
             let n = request(&mut conn, &format!("input {a}\n"))?;
             write_out(args.file.as_ref(), format!("{n}\n").as_bytes())
         }
+        Mode::Record { .. } => unreachable!("handled above"),
         Mode::Samples(ref k) => {
             let total = request(&mut conn, &format!("samples {k}\n"))?;
             let body = read_text_body(&mut conn)?;
@@ -337,6 +380,15 @@ mod tests {
             parse("--samples damage").unwrap().mode,
             Mode::Samples("damage".into())
         );
+        assert_eq!(
+            parse("--record 30 --output DP-1 --fps 15").unwrap().mode,
+            Mode::Record {
+                frames: 30,
+                output: Some("DP-1".into()),
+                fps: 15
+            }
+        );
+        assert!(parse("--record 0").is_err());
         assert!(parse("--samples frob").is_err());
         assert!(parse("--input").is_err());
         assert!(parse("-o").is_err());

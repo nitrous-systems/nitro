@@ -747,7 +747,7 @@ impl Helper {
         (out, gone)
     }
 
-    #[allow(clippy::too_many_arguments)] // disjoint borrows of self
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // disjoint borrows of self; one arm per reply
     fn decode(
         state: &mut State,
         info_slot: &mut Option<DeviceInfo>,

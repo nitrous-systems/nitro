@@ -272,8 +272,9 @@ containing the transaction reached the screen.
 | 16 | `SURFACE` | shm-backed `Surface` nodes: `CreateSurfaceBuffer`, `SetSurface`, `PresentSurface`, `SurfaceHint` (#3897), and server-allocated scanout buffers: `AllocSurfaceBuffers`, `SurfaceBufferAllocated`, `AllocSurfaceBuffersFailed` (#3914); see [Surfaces](#surfaces-caps-surface) |
 | 17 | `SHARE` | cross-client Surface sharing: `ExportSurface`, `ImportSurface`, `SurfaceExported`, `SurfaceRevoked` (#3904); see [Surface sharing](#surface-sharing-caps-share) |
 | 18 | `PLANE_HINT` | `SurfacePlaneHint`: how far a display plane downscales, and whether a Surface is off the planes for it (#3956); see [`SurfacePlaneHint`](#surfaceplanehint--0x830c) |
+| 19 | `CAPTURE` | screen capture: `CaptureStart`, `CaptureRelease`, `CaptureStop`, `CaptureBuffers`, `CaptureFrame`, `CaptureStopped` (#676); see [Screen capture](#screen-capture-caps-capture) |
 
-Bits 8–18 together are `caps::CAPS_M5_MASK`, the range
+Bits 8–19 together are `caps::CAPS_M5_MASK`, the range
 [`ClientCaps`](#capability-opt-in-clientcaps) governs.
 
 `DATA` is **one** bit for two features because they are one mechanism: the
@@ -333,6 +334,12 @@ follows rule 3: a sharing op from a client that did not list it in
 `PLANE_HINT` (bit 18, #3956) is advertised on local links like
 `SURFACE` and must be listed in `ClientCaps` (rule 3): `SurfacePlaneHint`
 goes only to clients that listed it. It carries no client op.
+
+`CAPTURE` (bit 19, #676) is advertised on local links only (every frame
+is a dma-buf) and must be listed in `ClientCaps` (rule 3): sending a
+capture op without it is `Error { Protocol }`. The bit says the server
+speaks capture, not that this client may record; a refusal is
+`CaptureStopped`, never an error.
 
 `SHELL` is bit 5, not bit 3: bit 3 is `REMOTE` and was taken in M1. It is
 *reported*, never negotiated — a client cannot ask for it. See
@@ -627,6 +634,9 @@ Assigned in blocks of 0x100 so a block can grow without renumbering.
 | `0x0312` | `AllocSurfaceBuffers` | buffers (needs `SURFACE`); **not buffered**, answered with `SurfaceBufferAllocated`s or `AllocSurfaceBuffersFailed` |
 | `0x0313` | `CreateDmabufBuffer` | buffers (needs `DMABUF` + `SURFACE`) — **carries 1 fd per plane** |
 | `0x0314` | `PresentSurfaceFenced` | buffers (needs `DMABUF` + `SURFACE`); **not buffered** — **carries 1 fd** |
+| `0x0315` | `CaptureStart` | buffers (needs `CAPTURE`); **not buffered** |
+| `0x0316` | `CaptureRelease` | buffers (needs `CAPTURE`); **not buffered** |
+| `0x0317` | `CaptureStop` | buffers (needs `CAPTURE`); **not buffered** |
 | `0x0401` | `SetLayer` | shell (see `SHELL`) |
 | `0x0402` | `SetExclusiveZone` | shell (see `SHELL`) |
 | `0x0403` | `SetAnchor` | shell (see `SHELL`) |
@@ -676,6 +686,9 @@ Assigned in blocks of 0x100 so a block can grow without renumbering.
 | `0x830a` | `AllocSurfaceBuffersFailed` | replies about content (see `SURFACE`) |
 | `0x830b` | `DmabufFeedback` | replies about content (see `DMABUF`) |
 | `0x830c` | `SurfacePlaneHint` | replies about content (see `PLANE_HINT`) |
+| `0x830d` | `CaptureBuffers` | replies about content (see `CAPTURE`) — **carries 1 fd per slot (≤ 4)** |
+| `0x830e` | `CaptureFrame` | replies about content (see `CAPTURE`) — **carries 1 fd** (`sync_file`) |
+| `0x830f` | `CaptureStopped` | replies about content (see `CAPTURE`) |
 | `0x8401` | `HotKey` | shell (see `SHELL`) |
 | `0x8402` | `WindowInfo` | shell (see `SHELL`) |
 | `0x8403` | `WindowListEnd` | shell (see `SHELL`) |
@@ -2511,6 +2524,91 @@ from the flag, so a buffer at the hinted size clearing the flag cannot
 flip the decision back (no feedback loop). The server logs each entry
 into and exit from the scale-limited state once per Surface and counts
 it (`plane_reject_scale`, gauge `planes_scale_limited` in `stats`).
+
+## Screen capture (caps `CAPTURE`)
+
+Continuous capture of an output for screen recording and screen sharing
+(#676). Design and cost: `docs/surfaces.md` § Capture. All six ops act
+at receipt; none is buffered to a `Commit`.
+
+**Flow.** `CaptureStart` → `CaptureBuffers` once (the ring: 3 dma-bufs of
+the output's size, `XR24`, LINEAR when the GPU helper can) → a
+`CaptureFrame` per captured frame. The slot named by a frame is the
+client's until it sends `CaptureRelease`; the pixels are complete once the
+frame's fence (a `sync_file`) polls readable. `CaptureStop` →
+`CaptureStopped { Client }`. The server may end a capture at any time with
+`CaptureStopped { reason }`; the id is then free again. The client closes
+its imports of the slots after a stop — until it does, the dma-bufs'
+memory stays alive. After a VT switch the helper restarts and the server
+sends a **new** `CaptureBuffers` for the same id; the client drops the old
+slots.
+
+**Pacing.** Frames follow the output's page flips: one after a flip that
+changed pixels (raster, or a Surface on a plane or under the helper
+changed or moved), at most `max_fps` per second (0 = the output's rate;
+a change held back by the rate is sent when the interval has passed).
+With no free slot the frame is dropped, never waited for; its damage is
+kept, so `CaptureFrame.damage` is always the union since the client's
+previous frame (the first frame damages everything).
+
+**Permission.** The server decides per `CaptureStart`. #676 B allows it
+when the server runs with `NITRO_CAPTURE_ALLOW=1` and denies it
+otherwise; the allow-list and the shell's prompt replace that (#676 C).
+Locked session → `Locked`; unknown output → `OutputGone`; no GPU helper
+(`gpu.helper = off`, given up, cannot start), a format other than `XR24`,
+or more than 4 captures → `Unsupported`. There is no CPU fallback.
+
+### `CaptureStart` — 0x0315
+
+| field | type | meaning |
+|---|---|---|
+| `capture_id` | `u32` | the client's id; a live one again is `Error { Protocol }` |
+| `kind` | `u8` | `0` output; other values are a decode error (reserved: `1` window) |
+| `output` | `u32` | `OutputInfo.id` |
+| `max_fps` | `u32` | frames per second at most; 0 = the output's refresh |
+| `format` | `u32` | DRM fourcc; 0 = server's choice (`XR24`, the only one) |
+
+Fixed **17 bytes**.
+
+### `CaptureRelease` — 0x0316
+
+`capture_id: u32`, `slot: u8` — **5 bytes**. A slot the client does not
+hold is ignored.
+
+### `CaptureStop` — 0x0317
+
+`capture_id: u32` — **4 bytes**. An unknown id is ignored (the server may
+have stopped it meanwhile).
+
+### `CaptureBuffers` — 0x830d — **carries 1 fd per slot**
+
+| field | type | meaning |
+|---|---|---|
+| `capture_id` | `u32` | |
+| `width`, `height` | `u32` | the output's size in device pixels |
+| `format` | `u32` | `XR24` |
+| `modifier` | `u64` | every slot's modifier (0 = LINEAR) |
+| `count` | `u8` | slots, 1..=4 (more is a decode error) |
+| `slots` | `count × {offset: u32, pitch: u32, size: u64}` | one per fd, in order |
+
+A **25-byte** head plus 16 bytes per slot; the fds follow in slot order.
+
+### `CaptureFrame` — 0x830e — **carries 1 fd**
+
+| field | type | meaning |
+|---|---|---|
+| `capture_id` | `u32` | |
+| `slot` | `u8` | the slot drawn into, now the client's |
+| `time_ns` | `u64` | `CLOCK_MONOTONIC` of the flip the frame follows |
+| `damage` | `vec<IRect>` | changed since the previous frame, output pixels |
+
+The fd is the frame's completion `sync_file`.
+
+### `CaptureStopped` — 0x830f
+
+`capture_id: u32`, `reason: u8` — **5 bytes**. Reasons: `0` client, `1`
+denied, `2` locked, `3` output-gone, `4` helper-lost, `5` revoked, `6`
+unsupported.
 
 ## Surface sharing (caps `SHARE`)
 

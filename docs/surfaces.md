@@ -586,7 +586,7 @@ Known residuals: a translucent tiled Surface is captured opaque (as mode
 ### As built: helper protocol v3 capture rings (#676 A)
 
 The helper side of recording. Protocol v3 (`crates/nitro-gpu/src/proto.rs`)
-adds capture rings **beside** the output ring. The server does not use them yet (#676 B).
+adds capture rings **beside** the output ring. The server uses them for recording (#676 B, below).
 
 - `AllocCaptureRing{ring_id, n, w, h, fourcc, modifiers[]}` →
   `CaptureRing{ring_id, w, h, fourcc, modifier, slots[{offset, pitch,
@@ -623,7 +623,72 @@ adds capture rings **beside** the output ring. The server does not use them yet 
 - **Follow-up.** An NV12 capture target (a colour-conversion pass for
   encoders that want YUV) is not built.
 
-### Recording design (not built)
+### As built: recording in the server (#676 B)
+
+`crates/nitro-server/src/capture.rs`; wire ops in `docs/wire.md`
+§ Screen capture; measurements in `docs/budget.md` § Screen recording.
+
+- **Ops.** `caps::CAPTURE` (bit 19, local links, listed in `ClientCaps`).
+  `CaptureStart{capture_id, kind, output, max_fps, format}` →
+  `CaptureBuffers` (3 slots, XR24, LINEAR first) → `CaptureFrame{slot,
+  time_ns, damage[], sync_file}` per frame; `CaptureRelease{slot}`,
+  `CaptureStop`; `CaptureStopped{reason}` for every end and refusal. The
+  `kind` byte reserves window capture.
+- **Permission (minimal).** `NITRO_CAPTURE_ALLOW=1` in the server's
+  environment allows every local client; otherwise `Denied`. One hook,
+  `Server::capture_permitted`, for the allow-list and prompt (#676 C).
+  Locked → `Locked`.
+- **Who composites.** Always the helper, in every mode: a
+  `CaptureComposite` into the capture ring with the output's shadow on top
+  and, under it (or above, for a translucent rest), the Surfaces the
+  shadow has holes for — those on a plane, and in mode 2 those the helper
+  draws for the screen (the same `gpu_layers` list; CPU-drawn Surfaces
+  are in the shadow already). So in mode 2 the capture frame is a second
+  composite of the scanout frame's layers; there is no copy of the
+  scanout slot.
+- **No shadow hazard: a snapshot.** The helper does not sample the live
+  shadow. Each capture keeps a sealed-memfd **snapshot** of the output's
+  shadow (imported like the mode-2 shadow, udmabuf or staging); at submit
+  the frame's damage rects are copied into it (write-only row copies), and
+  it is written again only after that frame's fence signalled. The plan's
+  first rule — hold the output's raster while a capture fence is pending —
+  was built and measured first: at 3840×2160@30 on box1 it cost display
+  frames (26.0–29.8 fps against 30.0 with a busy screen), so it was
+  replaced by the copy (the `UploadDamage`-copy alternative the plan named,
+  done on the server's side). Display fps with recording on is now equal
+  to off (budget.md). Cost: one output-sized memfd per capture (8.3 MB at
+  1080p) and ~2 ms of server CPU per full-screen frame at 1080p.
+- **Pacing.** After each flip of the output (after its paint), and on a
+  release, a fence or the rate timer: a frame is submitted when something
+  changed (raster damage, or a Surface layer that changed or moved), the
+  interval since the last frame is at least `1/max_fps` (with half a
+  refresh of slack at a flip, so 30 on 60 Hz is every other flip), and a
+  slot is free. Damage accumulates while skipped; a change held back by
+  the rate goes out when the interval passes (helper timerfd). One frame
+  per capture is in flight. A flip that wanted a frame with no free slot
+  is a drop (`capture_drops`).
+- **Cursor.** Software, in the shadow: always in the recording.
+- **Ends.** Client `CaptureStop` or disconnect (ring freed, no message
+  on disconnect); output unplugged or resized → `OutputGone`; helper dead
+  or hung → `HelperLost`; VT switch pauses (the helper stops; on resume a
+  new ring and a second `CaptureBuffers` for the same id; with
+  `gpu.helper = off` meanwhile → `Unsupported`).
+- **No CPU fallback.** `gpu.helper = off`, given up, or unable to start
+  → `Unsupported`. An on-demand helper is started for the capture as for
+  a shot, and does not idle-exit while a ring exists.
+- **Memory.** Ring (3 × w×h×4) and snapshot (w×h×4) exist only while
+  capturing; `capture_rings_bytes` / `capture_snapshot_bytes` in `stats`.
+  After stop the server holds nothing; the dma-bufs live on only while a
+  client keeps its imports (checked in `/sys/kernel/debug/dma_buf/bufinfo`
+  on box1: 4 objects / 33 MB while recording at 1080p, 0 after the client
+  closed).
+- **Test client.** `nitro-shot --record N [--output NAME] [--fps F] [-o
+  FILE]`: maps LINEAR slots after the fence, prints fps, flip→fence
+  latency, damage, ring size; `-o` writes the last frame as PNG.
+- **Not built.** NV12 target, window capture, the prompt/indicator/border
+  (#676 C), Chromium (#676 D).
+
+### Recording design (the plan; see above for what was built)
 
 Continuous capture for screen recording and video calls reuses the
 shot's parts; it is its own work item (issue #676).

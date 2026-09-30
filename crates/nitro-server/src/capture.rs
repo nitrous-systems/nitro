@@ -17,12 +17,15 @@
 //! **Never waits.** No free slot drops the frame (counted); its damage is
 //! kept for the next one. At most one frame per capture is in flight.
 //!
-//! **Shadow hazard.** The helper reads the shadow (memfd → udmabuf, or a
-//! staging copy): while a capture frame of an output has not signalled,
-//! that output is not rasterized ([`Server::capture_reading`]); the paint
-//! keeps its damage and comes back when the fence signals. Frames are
-//! submitted *after* the output's paint, so the next paint is a vblank
-//! away and the fence (≈1 ms) is long done by then.
+//! **No shadow hazard.** The helper does not read the shadow itself but a
+//! per-capture **snapshot** (a sealed memfd of the output's size, imported
+//! like the mode-2 shadow): at submit the frame's damage rects are copied
+//! from the shadow into it (write-only row copies, `Shadow::stream_to`),
+//! and it is only written again once that frame's fence signalled. Raster
+//! never waits for a recording. The first design delayed the output's
+//! raster while a capture frame read the shadow; measured on box1 at
+//! 3840×2160@30 it cut display fps (26.0–29.8 against 30.0), so it was
+//! replaced by this copy (`docs/budget.md` § Screen recording).
 //!
 //! **No CPU path.** Without the helper (`gpu.helper = off`, given up, or
 //! unable to start) a start is answered `CaptureStopped{Unsupported}`: a
@@ -87,9 +90,9 @@ struct Capture {
     slots: Vec<Slot>,
     /// The ring's bytes.
     bytes: u64,
-    /// The helper's import of the output's shadow: texture id and the
-    /// memfd's inode (a new inode means the shadow was reallocated).
-    shadow: Option<(u32, u64)>,
+    /// The snapshot of the output's shadow the helper samples, and its
+    /// texture id there.
+    snap: Option<(Snapshot, u32)>,
     /// Changed since the last frame, output pixels.
     damage: Damage,
     /// What the last frame's Surface layers showed.
@@ -239,7 +242,7 @@ impl Server {
             requested: false,
             slots: Vec::new(),
             bytes: 0,
-            shadow: None,
+            snap: None,
             damage: Damage::new(),
             last_layers: Vec::new(),
             last_ns: None,
@@ -303,7 +306,8 @@ impl Server {
                 Vec::new(),
             );
         }
-        if let Some((id, _)) = c.shadow {
+        if let Some((_, id)) = &c.snap {
+            let id = *id;
             self.gpu.send(
                 &poll,
                 TOK_GPU,
@@ -383,7 +387,7 @@ impl Server {
             c.requested = false;
             c.slots.clear();
             c.bytes = 0;
-            c.shadow = None;
+            c.snap = None;
             c.reading = None;
             c.last_layers.clear();
             c.last_ns = None;
@@ -592,17 +596,6 @@ impl Server {
         }
     }
 
-    /// Whether a capture frame of output `id` still reads its shadow: the
-    /// output must not be rasterized now (the shadow hazard).
-    pub(crate) fn capture_reading(&self, id: KmsOutputId) -> bool {
-        !self.captures.list.is_empty()
-            && self
-                .captures
-                .list
-                .iter()
-                .any(|c| c.output == id && c.reading.is_some())
-    }
-
     /// `rects` of output `id` were rasterized.
     pub(crate) fn capture_damage(&mut self, id: KmsOutputId, rects: &[IRect]) {
         for c in &mut self.captures.list {
@@ -653,8 +646,9 @@ impl Server {
         }
     }
 
-    #[allow(clippy::too_many_lines)] // One frame's steps in order.
-    fn capture_pump_one(&mut self, i: usize, now: u64, count_drop: bool) {
+    #[allow(clippy::too_many_lines, clippy::many_single_char_names)] // One frame's steps in order.
+    fn capture_pump_one(&mut self, i: usize, now: u64, on_flip: bool) {
+        let count_drop = on_flip;
         let c = &self.captures.list[i];
         if c.requested || c.slots.is_empty() || c.reading.is_some() {
             return;
@@ -677,11 +671,18 @@ impl Server {
         }
         // Rate: a frame at most every `interval`, with half a refresh of
         // slack so 30 fps on a 60 Hz output is every other flip.
+        // The slack applies at a flip only: the rate timer fires at the
+        // full interval, or it would add frames between flips.
         if let Some(last) = c.last_ns {
-            let due = (last + c.interval_ns).saturating_sub(u64::from(o.refresh_ns / 2));
+            let full = last + c.interval_ns;
+            let due = if on_flip {
+                full.saturating_sub(u64::from(o.refresh_ns / 2))
+            } else {
+                full
+            };
             if now < due {
                 if c.flipped || !c.damage.is_empty() {
-                    let at = Instant::now() + Duration::from_nanos(due - now);
+                    let at = Instant::now() + Duration::from_nanos(full.saturating_sub(now));
                     self.gpu.capture_due = Some(self.gpu.capture_due.map_or(at, |t| t.min(at)));
                     self.gpu.arm();
                 }
@@ -730,7 +731,8 @@ impl Server {
             }
             return;
         };
-        let Some(shadow_id) = self.capture_shadow(i, index) else {
+        let damage = gpu_rects(self.captures.list[i].damage.rects(), bounds);
+        let Some(shadow_id) = self.capture_snapshot(i, index, &damage) else {
             return;
         };
         let poll = EpollPoll(&self.epoll);
@@ -764,9 +766,8 @@ impl Server {
         });
         below.extend(above);
         let c = &mut self.captures.list[i];
-        let damage = gpu_rects(c.damage.rects(), bounds);
-        // A staging-path helper copies the changed shadow rects now; with
-        // udmabuf it is a no-op.
+        // A staging-path helper copies the changed snapshot rects now;
+        // with udmabuf it is a no-op.
         self.gpu.send(
             &poll,
             TOK_GPU,
@@ -814,57 +815,64 @@ impl Server {
         });
     }
 
-    /// The helper's texture for output `index`'s shadow, imported (again,
-    /// after a reallocation) as needed. The shadow moves into a sealed
-    /// memfd for it (the same bytes, counted as shmem).
-    fn capture_shadow(&mut self, i: usize, index: usize) -> Option<u32> {
-        let shadow = self.outputs[index].shadow.as_mut()?;
-        if let Err(e) = shadow.to_memfd() {
-            crate::warn!("capture: shadow memfd: {e}");
-            return None;
-        }
-        let fd = shadow.memfd()?;
-        let ino = rustix::fs::fstat(fd).ok()?.st_ino;
-        if let Some((id, have)) = self.captures.list[i].shadow
-            && have == ino
-        {
-            return Some(id);
-        }
-        let desc = proto::ShadowDesc {
-            id: 0,
-            w: shadow.width(),
-            h: shadow.height(),
-            stride: shadow.stride(),
-            fourcc: proto::AR24,
-        };
-        let fd = fd.try_clone_to_owned().ok()?;
-        let poll = EpollPoll(&self.epoll);
-        if let Some((old, _)) = self.captures.list[i].shadow.take() {
-            self.gpu.send(
+    /// The helper's texture for capture `i`'s snapshot of output
+    /// `index`, with `rects` copied in from the shadow first. A snapshot is
+    /// (re)made and imported when there is none or the shadow's geometry
+    /// changed; a new one is filled whole. Only called with no frame of
+    /// this capture out, so the helper is not reading it.
+    fn capture_snapshot(&mut self, i: usize, index: usize, rects: &[IRect]) -> Option<u32> {
+        let shadow = self.outputs[index].shadow.as_ref()?;
+        let geom = (shadow.width(), shadow.height(), shadow.stride());
+        let fresh = !matches!(&self.captures.list[i].snap, Some((s, _)) if s.geom == geom);
+        if fresh {
+            let snap = match Snapshot::new(geom) {
+                Ok(s) => s,
+                Err(e) => {
+                    crate::warn!("capture: snapshot: {e}");
+                    return None;
+                }
+            };
+            let fd = snap.fd.try_clone().ok()?;
+            let poll = EpollPoll(&self.epoll);
+            if let Some((_, old)) = self.captures.list[i].snap.take() {
+                self.gpu
+                    .send(&poll, TOK_GPU, &nitro_gpu::ToHelper::Release { id: old }, Vec::new());
+            }
+            let sid = self.gpu.tex_id();
+            let desc = proto::ShadowDesc {
+                id: sid,
+                w: geom.0,
+                h: geom.1,
+                stride: geom.2,
+                fourcc: proto::AR24,
+            };
+            if !self.gpu.send(
                 &poll,
                 TOK_GPU,
-                &nitro_gpu::ToHelper::Release { id: old },
-                Vec::new(),
-            );
+                &nitro_gpu::ToHelper::ImportShadow(desc),
+                vec![fd],
+            ) {
+                return None;
+            }
+            self.captures.list[i].snap = Some((snap, sid));
         }
-        let sid = self.gpu.tex_id();
-        if !self.gpu.send(
-            &poll,
-            TOK_GPU,
-            &nitro_gpu::ToHelper::ImportShadow(proto::ShadowDesc { id: sid, ..desc }),
-            vec![fd],
-        ) {
-            return None;
-        }
-        let c = &mut self.captures.list[i];
-        c.shadow = Some((sid, ino));
-        // Everything, so a staging import is filled whole.
-        c.damage.add(IRect::new(
-            0,
-            0,
-            c.size.0.cast_signed(),
-            c.size.1.cast_signed(),
-        ));
+        let shadow = self.outputs[index].shadow.as_ref()?;
+        let (snap, sid) = self.captures.list[i].snap.as_mut()?;
+        let all = [IRect::new(0, 0, geom.0.cast_signed(), geom.1.cast_signed())];
+        let copy = if fresh { &all[..] } else { rects };
+        let t = Instant::now();
+        let mut dst = nitro_kms::BufferMut {
+            width: geom.0,
+            height: geom.1,
+            stride: geom.2,
+            data: snap.map.as_bytes_mut(),
+        };
+        shadow.stream_to(&mut dst, copy);
+        let sid = *sid;
+        self.captures
+            .stats
+            .copy_us
+            .push(t.elapsed().as_micros() as u64);
         Some(sid)
     }
 
@@ -878,6 +886,43 @@ impl Server {
         pairs.push(("capture_rings_bytes", self.captures.ring_bytes()));
         pairs.push(("capture_gpu_us", s.gpu_us.mean()));
         pairs.push(("capture_gpu_us_max", s.gpu_us.max()));
-        pairs.push(("capture_raster_waits", s.raster_waits));
+        pairs.push(("capture_copy_us", s.copy_us.mean()));
+        pairs.push((
+            "capture_snapshot_bytes",
+            self.captures
+                .list
+                .iter()
+                .filter_map(|c| c.snap.as_ref())
+                .map(|(s, _)| s.len as u64)
+                .sum(),
+        ));
+    }
+}
+
+/// A sealed memfd copy of an output's shadow that one capture's frames
+/// sample: the shadow itself stays the rasterizer's alone.
+#[derive(Debug)]
+struct Snapshot {
+    fd: OwnedFd,
+    map: nitro_shm::MappingMut,
+    geom: (u32, u32, u32),
+    len: usize,
+}
+
+impl Snapshot {
+    fn new(geom: (u32, u32, u32)) -> Result<Self, String> {
+        const PAGE: usize = 4096;
+        let len = geom.2 as usize * geom.1 as usize;
+        let padded = len.max(1).div_ceil(PAGE) * PAGE;
+        let fd = nitro_shm::create_sealed("nitro-capture", padded as u64)
+            .map_err(|e| e.to_string())?;
+        let map = nitro_shm::MappingMut::map_mut(std::os::fd::AsFd::as_fd(&fd), padded)
+            .map_err(|e| e.to_string())?;
+        Ok(Self {
+            fd,
+            map,
+            geom,
+            len: padded,
+        })
     }
 }

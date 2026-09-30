@@ -10,3 +10,6 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+nitro-shm = { workspace = true }
+nitro-wire = { workspace = true }
+rustix = { workspace = true, features = ["event", "time"] }

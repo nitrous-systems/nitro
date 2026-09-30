@@ -2584,12 +2584,6 @@ impl Server {
         if !self.outputs[index].needs_paint() {
             return false;
         }
-        // The shadow hazard (#676): a recording frame still reads this
-        // output's shadow. Keep the damage; its fence brings the paint back.
-        if self.outputs[index].needs_raster() && self.capture_reading(id) {
-            self.captures.stats.raster_waits += 1;
-            return false;
-        }
         // Which Surfaces go on planes this frame (#3899), before anything
         // is rasterized: a switch invalidates the output.
         self.plan_planes(index);

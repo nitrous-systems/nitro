@@ -3,6 +3,8 @@
 //! frames paced by flips and `max_fps`, drops with no free slot, damage,
 //! and the ring's lifetime (client gone, helper dead).
 
+#![allow(clippy::many_single_char_names)]
+
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::sync::Arc;

@@ -481,8 +481,8 @@ pub struct CaptureStats {
     /// Submit-to-fence-signalled per frame, µs: the GPU time of a
     /// capture composite plus the queueing ahead of it.
     pub gpu_us: Window,
-    /// Paints held back because a capture frame still read the shadow.
-    pub raster_waits: u64,
+    /// Shadow → snapshot copy per frame, µs.
+    pub copy_us: Window,
 }
 
 impl Default for CaptureStats {
@@ -492,7 +492,7 @@ impl Default for CaptureStats {
             frames: 0,
             drops: 0,
             gpu_us: Window::new(PAINT_WINDOW),
-            raster_waits: 0,
+            copy_us: Window::new(PAINT_WINDOW),
         }
     }
 }

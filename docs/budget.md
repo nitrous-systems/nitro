@@ -1988,6 +1988,52 @@ imports were released. Binary sizes against `main` (release):
 333 352 → 337 976 (+4 624), `nitro-gpu-vulkan` 582 624 → 594 496
 (+11 872).
 
+## Screen recording (#676 B)
+
+**Idle cost: zero.** Nothing exists until a `CaptureStart` is granted;
+after stop the server holds no ring, no snapshot, no texture.
+
+While recording one output (w×h): the helper's ring, 3 × w×h×4
+(24.9 MB at 1080p, 44.2 MB at 1440p, 99.5 MB at 2160p), and the server's
+snapshot of the shadow, w×h×4 as a sealed memfd (8.3 / 14.7 / 33.2 MB,
+counted as RssShmem). The ring's pages are the helper's DRM allocation
+plus whatever the client maps.
+
+Measured on box1 (HSW/hasvk, HDMI, helper always-on, `nitro-dev` unit,
+`NITRO_CAPTURE_ALLOW=1` via a runtime drop-in), 2026-09-30, with
+`nitro-bench rects-move --fullscreen` (100 rects moved per frame, ~1.15 Mpx
+damage per frame) as the load and `nitro-shot --record` as the client.
+Server/helper CPU is `/proc/<pid>/stat` utime+stime over the 5.5 s run.
+
+| mode | recording | display fps | capture fps | flip→fence p50 | server CPU | helper CPU |
+|---|---|---|---|---|---|---|
+| 1920×1080@60 | off | 60.0 | — | — | 1.57 s | 0 |
+| 1920×1080@60 | 60 fps | 60.0–60.2 | 59.9 | 13.8 ms | 2.27–2.29 s | 0.13 s |
+| 1920×1080@60 | 30 fps | 60.0–60.2 | 30.1 | 13.6 ms | 1.92–1.95 s | 0.07 s |
+| 3840×2160@30 | off | 30.0 | — | — | — | — |
+| 3840×2160@30 | 30 fps | 30.0–30.2 | 29.9–30.1 | 13–36 ms | — | — |
+
+- GPU time per capture frame (submit → fence signalled, `capture_gpu_us`):
+  7.4 ms mean, 8.4 ms max at both 1080p and 2160p on hasvk — it is
+  dominated by the helper's submit/queue path on this box, not by pixels.
+- Shadow → snapshot copy (`capture_copy_us`): 2.0–2.1 ms per full-damage
+  frame at 1080p, which is the server CPU difference above (~0.7 s per
+  5 s at 60 fps). A damage-only frame copies only its rects.
+- **The shadow-hazard rule was measured and rejected.** Holding the
+  output's raster while a capture fence was pending gave 26.0, 29.8, 29.8
+  fps at 3840×2160@30 (against 30.0 off) and 59.6–59.8 at 1080p60;
+  the same server with the wait disabled held 30.0. The snapshot copy
+  replaced it (`docs/surfaces.md` § Recording).
+- Memory, 1080p: dma-buf bufinfo before 0 objects, while recording
+  4 objects / 33 177 600 bytes (3 ring slots + the snapshot's udmabuf),
+  after the client exited 0 objects. Server RssAnon 10 672 kB before,
+  during and after; RssShmem 0 → 8 100 kB → 0. `capture_rings_bytes`
+  24 883 200 while recording, 0 after.
+- **Not measured:** 2560×1440 — box1's monitor has no such mode and
+  testhost2 was held for manual use during this task; the 2160p run is the
+  stricter case for the display-fps question. testhost2 (anv) numbers and
+  the Chromium path belong to #676 D.
+
 ## Dependency count
 
 Latest: **106** lines and **44** distinct external names with the lock
