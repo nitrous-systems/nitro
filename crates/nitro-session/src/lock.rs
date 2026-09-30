@@ -75,7 +75,10 @@ fn exchange(path: &Path, timeout: Duration) -> Result<(), String> {
         if let Some(e) = first_error(&msgs) {
             return Err(e);
         }
-        if msgs.iter().any(|m| matches!(m, ServerMsg::WindowListEnd(_))) {
+        if msgs
+            .iter()
+            .any(|m| matches!(m, ServerMsg::WindowListEnd(_)))
+        {
             return Ok(());
         }
         msgs.clear();

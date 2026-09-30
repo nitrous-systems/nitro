@@ -80,7 +80,12 @@ fn config_from_env() -> Config {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let locked = match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+    let locked = match args
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
         [] => false,
         ["--locked"] => true,
         _ => {

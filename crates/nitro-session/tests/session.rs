@@ -878,7 +878,10 @@ fn a_locked_start_starts_the_lock_screen_first_and_the_server_locked() {
     // the table the loop spawned from puts the lock screen first.
     let server = starts(&env, "nitro-server")[0].1;
     for n in &order[1..] {
-        assert!(starts(&env, n)[0].1 >= server, "{n} started before the server");
+        assert!(
+            starts(&env, n)[0].1 >= server,
+            "{n} started before the server"
+        );
     }
     let names: Vec<String> = session.status().into_iter().map(|(n, _)| n).collect();
     assert_eq!(names, order, "spawn order is the table's");
@@ -936,7 +939,11 @@ fn lock_locks_the_server_then_starts_one_lock_screen() {
 
     assert_eq!(request(&mut session, "lock"), "ok\n");
     pump_for(&mut session, Duration::from_millis(200));
-    assert_eq!(starts(&env, "nitro-greeter").len(), 1, "no second lock screen");
+    assert_eq!(
+        starts(&env, "nitro-greeter").len(),
+        1,
+        "no second lock screen"
+    );
     assert_eq!(
         env.marks("nitro-server.marks")
             .iter()
@@ -983,11 +990,9 @@ fn a_lock_screen_that_exits_0_is_not_restarted() {
 #[test]
 fn a_crashed_lock_screen_is_restarted() {
     let env = Env::new("lock-crash");
-    let mut session = Session::start(env.config(full_args(
-        &env,
-        &["--exit-after", "50", "--exit-code", "1"],
-    )))
-    .expect("starts");
+    let mut session =
+        Session::start(env.config(full_args(&env, &["--exit-after", "50", "--exit-code", "1"])))
+            .expect("starts");
     pump(&mut session, Duration::from_secs(10), |_| {
         !starts(&env, "nitro-launcher").is_empty()
     });

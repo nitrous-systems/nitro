@@ -317,7 +317,10 @@ mod tests {
     #[test]
     fn pieces_for_a_subset_keeps_the_server_and_the_lock_slot() {
         let names = |v: Vec<Piece>| v.iter().map(|p| p.program).collect::<Vec<_>>();
-        assert_eq!(names(pieces_for(&[])), vec!["nitro-server", "nitro-greeter"]);
+        assert_eq!(
+            names(pieces_for(&[])),
+            vec!["nitro-server", "nitro-greeter"]
+        );
         assert_eq!(
             names(pieces_for(std::slice::from_ref(&PIECES[3]))),
             vec!["nitro-server", "nitro-greeter", "nitro-bar"]
