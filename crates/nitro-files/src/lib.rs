@@ -818,7 +818,7 @@ pub fn build(ui: &mut Ui<Files>) -> WidgetId {
                 // takes a `StartDrag` only while it is. The list is out
                 // of its slot, which is why it hands over the indices.
                 let paths: Vec<PathBuf> = selection.iter().filter_map(|i| s.path_at(*i)).collect();
-                start_file_drag(s, ui, paths);
+                start_file_drag(s, ui, &paths);
             }),
     );
 
@@ -1776,12 +1776,12 @@ pub fn drag_actions_for(s: &Files, paths: &[PathBuf]) -> u32 {
 /// Start dragging `paths` out of the window: offered exactly as a copy
 /// offers them, under an icon naming what is dragged. Nothing happens
 /// without the system data channel (a remote link).
-fn start_file_drag(s: &mut Files, ui: &mut Ui<Files>, paths: Vec<PathBuf>) {
+fn start_file_drag(s: &mut Files, ui: &mut Ui<Files>, paths: &[PathBuf]) {
     use nitro_ui::dnd::{DragIcon, DragSource};
     if paths.is_empty() || !ui.can_drag() {
         return;
     }
-    let (icon_name, text) = match paths.as_slice() {
+    let (icon_name, text) = match paths {
         [one] => {
             let icon = s
                 .entries
@@ -1805,8 +1805,8 @@ fn start_file_drag(s: &mut Files, ui: &mut Ui<Files>, paths: Vec<PathBuf>) {
         return;
     }
     let offer = DragSource {
-        items: path_items(&paths),
-        actions: drag_actions_for(s, &paths),
+        items: path_items(paths),
+        actions: drag_actions_for(s, paths),
         icon: Some(DragIcon {
             root: icon,
             size: None,
@@ -1814,7 +1814,7 @@ fn start_file_drag(s: &mut Files, ui: &mut Ui<Files>, paths: Vec<PathBuf>) {
         }),
     };
     let n = paths.len();
-    let dragged = paths.clone();
+    let dragged = paths.to_vec();
     match ui.start_drag(nitro_ui::WindowId::MAIN, offer, move |s: &mut Files, ui, o| {
         drag_finished(s, ui, &dragged, o);
     }) {

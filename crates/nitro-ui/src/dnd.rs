@@ -218,7 +218,8 @@ impl<S: 'static> Ui<S> {
         self.dnd.current.as_ref().and_then(|c| c.target)
     }
 
-    /// The `Drag*` arms of [`Ui::dispatch`].
+    /// The `Drag*` arms of [`Ui::dispatch`]: the drop-target side, and
+    /// `DragFinished` for a drag this app is the source of.
     pub(crate) fn dnd_msg(&mut self, state: &mut S, msg: &ServerMsg) {
         match msg {
             ServerMsg::DragEnter(e) => {
@@ -252,6 +253,7 @@ impl<S: 'static> Ui<S> {
             ServerMsg::DragMotion(m) if self.dnd_is(m.window) => self.dnd_motion(state, m.pos),
             ServerMsg::DragLeave(l) if self.dnd_is(l.window) => self.dnd_reset(state),
             ServerMsg::DragDrop(d) if self.dnd_is(d.window) => self.dnd_drop(state),
+            ServerMsg::DragFinished(f) => self.drag_source_finished(state, f.accepted, f.action),
             _ => {}
         }
     }

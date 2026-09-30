@@ -3249,14 +3249,9 @@ impl<S: 'static> Ui<S> {
             ServerMsg::SelectionOffer(o) => self.clipboard_offer(o),
             ServerMsg::SelectionRequest(r) => self.clipboard_serve(r),
             ServerMsg::SelectionData(d) => self.clipboard_data(d),
-            // Drag-and-drop, as a drop target; see `crate::dnd`.
-            ServerMsg::DragEnter(_)
-            | ServerMsg::DragMotion(_)
-            | ServerMsg::DragLeave(_)
-            | ServerMsg::DragDrop(_) => self.dnd_msg(state, msg),
-            // ... and as its source.
-            ServerMsg::DragFinished(f) => self.drag_source_finished(state, f.accepted, f.action),
-            _ => {}
+            // Drag-and-drop, as a drop target and as a source: the `Drag*`
+            // messages go to `crate::dnd`, which ignores everything else.
+            _ => self.dnd_msg(state, msg),
         }
     }
 
