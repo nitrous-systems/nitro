@@ -88,7 +88,10 @@ case $cmd in
         rm -rf "$out"; mkdir -p "$out"
         tag="nitro-dist-$distro"
         echo "dist: $distro: building image $tag from $image with $e"
-        "$e" build --pull=always -t "$tag" --build-arg "BASE=$image" "dist/$dir"
+        # The Dockerfiles COPY nothing, so there is no build context: the
+        # file comes on stdin. (That also avoids buildah's overlay over the
+        # context dir, which fails on some hosts' filesystems.)
+        "$e" build --pull=always -t "$tag" --build-arg "BASE=$image" - < "dist/$dir/Dockerfile"
         echo "dist: $distro: building nitro $src_version"
         "$e" run --rm \
             -v "$PWD/$src:/src/nitro.tar.gz:ro,z" \
