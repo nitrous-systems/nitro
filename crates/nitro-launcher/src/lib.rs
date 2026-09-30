@@ -548,6 +548,7 @@ pub const NATIVE_PROGRAMS: &[&str] = &[
     "nitro-settings",
     "nitro-files",
     "nitro-amp",
+    "nitro-video",
     "nitro-demo",
     "hello_dialog",
     // Chromium on nitro's own Ozone backend (#3865): a nitro-wire client,
