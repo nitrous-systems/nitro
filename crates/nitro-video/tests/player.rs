@@ -395,3 +395,71 @@ fn a_big_hw_stream_is_scaled_to_the_plane_hint() {
     // was in flight.
     assert!(p.buffer_count() <= 12, "{}", p.buffer_count());
 }
+
+#[test]
+fn r_toggles_repeat() {
+    use nitro_ui::widgets::Button;
+    use nitro_ui::{ColorRole, IconTint};
+    let mut b = harness(3000, Opts::default());
+    let h = &mut b.h;
+    wait_presented(h, 1);
+    let ids = h.state().ids().expect("ids");
+    assert!(!h.state().repeat());
+    let btn = h.ui().widget::<Button<Player>>(ids.repeat).expect("button");
+    assert_eq!(btn.text(), "Repeat off");
+    assert_eq!(btn.icon_tint(), None);
+    key(h, 19); // KEY_R
+    assert!(h.state().repeat());
+    let btn = h.ui().widget::<Button<Player>>(ids.repeat).expect("button");
+    assert_eq!(btn.text(), "Repeat on");
+    assert_eq!(btn.icon_tint(), Some(IconTint::Role(ColorRole::Accent)));
+    assert_eq!(btn.text_role(), Some(ColorRole::Accent));
+    key(h, 19);
+    assert!(!h.state().repeat());
+    let btn = h.ui().widget::<Button<Player>>(ids.repeat).expect("button");
+    assert_eq!(btn.text(), "Repeat off");
+    assert_eq!(btn.icon_tint(), None);
+    assert_eq!(h.state().state(), State::Playing);
+}
+
+#[test]
+fn repeat_loops_at_the_end() {
+    let mut b = harness(10, Opts::default());
+    let h = &mut b.h;
+    let (ui, p) = h.parts();
+    p.toggle_repeat(ui);
+    assert!(h.state().repeat());
+    h.wait_for("a second pass", |h| {
+        h.settle();
+        assert_ne!(h.state().state(), State::Ended, "repeat never ends");
+        h.state().stats.shown.iter().filter(|&&p| p == 0).count() >= 2
+            && h.state().stats.presented >= 15
+    });
+    assert_eq!(h.state().state(), State::Playing);
+    assert!(h.state().error.is_none(), "{:?}", h.state().error);
+    // The controls hide as in normal playback and stay hidden across a
+    // loop.
+    h.advance_timers(HIDE_MS + 10);
+    h.settle();
+    assert!(!h.state().controls_visible());
+    let n = h.state().stats.shown.iter().filter(|&&p| p == 0).count();
+    h.wait_for("another loop", |h| {
+        h.settle();
+        h.state().stats.shown.iter().filter(|&&p| p == 0).count() > n
+    });
+    assert!(!h.state().controls_visible());
+    assert_eq!(h.state().state(), State::Playing);
+}
+
+#[test]
+fn repeat_on_an_empty_stream_ends() {
+    let mut b = harness(0, Opts::default());
+    let h = &mut b.h;
+    let (ui, p) = h.parts();
+    p.toggle_repeat(ui);
+    h.wait_for("the end", |h| {
+        h.settle();
+        h.state().state() == State::Ended
+    });
+    assert_eq!(h.state().stats.presented, 0);
+}

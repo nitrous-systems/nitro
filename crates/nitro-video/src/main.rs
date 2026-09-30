@@ -26,8 +26,8 @@ const USAGE: &str = "usage: nitro-video FILE [--fullscreen] [--frames N] [--stat
   --vaapi-device PATH  the render node (default /dev/dri/renderD128)
   --no-scale     never scale VA frames to the server's plane hint (VPP)
 
-keys: Space play/pause, Left/Right seek 5 s, F fullscreen, Esc leave
-fullscreen, Q quit";
+keys: Space play/pause, Left/Right seek 5 s, R repeat on/off,
+F fullscreen, Esc leave fullscreen, Q quit";
 
 struct Args {
     file: Option<PathBuf>,

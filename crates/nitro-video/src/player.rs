@@ -51,7 +51,7 @@ use nitro_shm::MappingMut;
 use nitro_ui::event::{Handled, KeyEvent, key};
 use nitro_ui::surface::{SurfaceEvent, SurfacePointer, SurfaceView};
 use nitro_ui::widgets::{Button, Label, Slider};
-use nitro_ui::{Frame, TimerId, Ui, WidgetId};
+use nitro_ui::{ColorRole, Frame, IconTint, TimerId, Ui, WidgetId};
 use nitro_wire::msg::{CreateDmabufBuffer, CreateSurfaceBuffer, PresentSurface};
 use nitro_wire::types::{BufferId, ColorMatrix, ColorRange, NodeId, WindowState, format};
 
@@ -83,6 +83,7 @@ const LATE_NS: u64 = 20_000_000;
 mod keys {
     pub const F: u32 = 33;
     pub const F11: u32 = 87;
+    pub const R: u32 = 19;
 }
 
 /// Opens the software decoder a VA-API one is swapped for; see
@@ -192,7 +193,7 @@ pub struct Stats {
 }
 
 /// The whole app state: `S` for the nitro-ui tree.
-#[allow(clippy::struct_excessive_bools)] // Independent facts (eof, overlay shown, started, calibrate), not a state machine.
+#[allow(clippy::struct_excessive_bools)] // Independent facts (eof, overlay shown, started, calibrate, repeat, got_frame), not a state machine.
 pub struct Player {
     opts: Opts,
     info: StreamInfo,
@@ -229,6 +230,12 @@ pub struct Player {
     seek_in_flight: Option<u32>,
     seek_pending: Option<f64>,
     decoder_eof: bool,
+    /// Loop at the end instead of stopping.
+    repeat: bool,
+    /// A frame of the current generation arrived: a pass that yields
+    /// nothing (an empty stream) ends even with [`Player::repeat`] on,
+    /// rather than seeking back forever.
+    got_frame: bool,
     position_us: i64,
     ids: Option<Ids>,
     controls_visible: bool,
@@ -484,6 +491,8 @@ impl Player {
             seek_in_flight: None,
             seek_pending: None,
             decoder_eof: false,
+            repeat: false,
+            got_frame: false,
             position_us: 0,
             ids: None,
             controls_visible: true,
@@ -512,6 +521,12 @@ impl Player {
     #[must_use]
     pub fn state(&self) -> State {
         self.state
+    }
+
+    /// Whether playback loops at the end.
+    #[must_use]
+    pub fn repeat(&self) -> bool {
+        self.repeat
     }
 
     /// The pts of the frame last sent to the screen, seconds.
@@ -641,6 +656,7 @@ impl Player {
         }
         let _ = ui.flush();
         self.ids = Ids::resolve(ui);
+        self.set_repeat_style(ui);
         self.arm_hide(ui);
         self.tick(ui);
         let _ = ui.request_frame();
@@ -972,6 +988,7 @@ impl Player {
             self.free(slot);
             return;
         }
+        self.got_frame = true;
         self.slots[slot] = Slot::Ready;
         self.ready.push((slot, pts_us));
         let first_after_seek = self.seek_in_flight == Some(generation);
@@ -1009,6 +1026,14 @@ impl Player {
             && self.seek_in_flight.is_none()
             && self.state == State::Playing
         {
+            // Repeat: back to the start and keep playing, controls as
+            // they were. Only after a pass that showed something, so an
+            // empty stream ends instead of spinning seek → EOF.
+            if self.repeat && self.got_frame {
+                self.position_us = 0;
+                self.send_seek(ui, 0.0);
+                return;
+            }
             self.state = State::Ended;
             self.clock.stop();
             self.set_play_icon(ui);
@@ -1215,6 +1240,13 @@ impl Player {
         self.tick(ui);
     }
 
+    /// Repeat on ↔ off. Only a toggle: turning it on after the end does
+    /// not restart playback (play does).
+    pub fn toggle_repeat(&mut self, ui: &mut Ui<Self>) {
+        self.repeat = !self.repeat;
+        self.set_repeat_style(ui);
+    }
+
     /// Seek to `secs`. Drags coalesce: one restart is in flight at a
     /// time, and only the newest target waits behind it.
     pub fn request_seek(&mut self, ui: &mut Ui<Self>, secs: f64) {
@@ -1241,6 +1273,7 @@ impl Player {
             self.free(slot);
         }
         self.decoder_eof = false;
+        self.got_frame = false;
         self.clock.stop();
         self.seek_in_flight = Some(self.generation);
         let _ = self.tx.send(Cmd::Seek {
@@ -1292,6 +1325,7 @@ impl Player {
         match k.keycode {
             key::SPACE => self.toggle_play(ui),
             keys::F | keys::F11 => self.toggle_fullscreen(ui),
+            keys::R => self.toggle_repeat(ui),
             key::ESC if ui.window_state() == WindowState::Fullscreen => {
                 let _ = ui.set_window_state(WindowState::Normal);
             }
@@ -1346,6 +1380,23 @@ impl Player {
             if b.text() != text {
                 b.set_text(text);
             }
+        }
+    }
+
+    /// The repeat button's label and colour: accent while on.
+    fn set_repeat_style(&self, ui: &mut Ui<Self>) {
+        let Some(ids) = self.ids else { return };
+        let (text, role) = if self.repeat {
+            ("Repeat on", Some(ColorRole::Accent))
+        } else {
+            ("Repeat off", None)
+        };
+        if let Ok(mut b) = ui.widget_mut::<Button<Self>>(ids.repeat) {
+            if b.text() != text {
+                b.set_text(text);
+            }
+            b.set_text_role(role);
+            b.set_icon_tint(role.map(IconTint::Role));
         }
     }
 

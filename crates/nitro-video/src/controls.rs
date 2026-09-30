@@ -1,9 +1,12 @@
 //! The controls overlay: a bar of nitro-ui widgets over the video.
 //!
-//! Play/pause, a seek slider, the time and a fullscreen button, in one
-//! row pinned to the bottom of the [`SurfaceView`](nitro_ui::SurfaceView).
-//! The widgets are addressed by name (`play`, `seek`, `time`,
-//! `fullscreen`, `controls`, `video`), which is also what `hey` sees.
+//! Play/pause, a seek slider, the time, a repeat toggle and a
+//! fullscreen button, in one row pinned to the bottom of the
+//! [`SurfaceView`](nitro_ui::SurfaceView). The widgets are addressed by
+//! name (`play`, `seek`, `time`, `repeat`, `fullscreen`, `controls`,
+//! `video`), which is also what `hey` sees. The repeat button shows its
+//! state in its label (`Repeat on` / `Repeat off`) and, when on, in the
+//! accent colour.
 //! The bar repaints at most once a second (the time and the slider);
 //! video frames never touch the tree.
 
@@ -20,6 +23,8 @@ use crate::player::Player;
 pub const ICON_PAUSE: &str = "pause-fill";
 /// The icon the play button shows while paused or ended.
 pub const ICON_PLAY: &str = "play-fill";
+/// The repeat toggle's icon.
+pub const ICON_REPEAT: &str = "repeat";
 /// The fullscreen button's icon.
 pub const ICON_FULLSCREEN: &str = "arrows-angle-expand";
 
@@ -36,6 +41,8 @@ pub struct Ids {
     pub seek: WidgetId,
     /// `m:ss / m:ss`.
     pub time: WidgetId,
+    /// Repeat (loop) toggle.
+    pub repeat: WidgetId,
     /// Fullscreen toggle.
     pub fullscreen: WidgetId,
 }
@@ -51,6 +58,7 @@ impl Ids {
             play: f("play")?,
             seek: f("seek")?,
             time: f("time")?,
+            repeat: f("repeat")?,
             fullscreen: f("fullscreen")?,
         })
     }
@@ -86,6 +94,12 @@ pub fn build(ui: &mut Ui<Player>, aspect: f32, duration: f64) -> WidgetId {
                         .grow(1.0),
                 )
                 .child(label(time_text(0.0, duration)).name("time"))
+                .child(
+                    button("Repeat off")
+                        .name("repeat")
+                        .icon(ICON_REPEAT)
+                        .on_click(|p: &mut Player, ui: &mut Ui<Player>| p.toggle_repeat(ui)),
+                )
                 .child(
                     button("Fullscreen")
                         .name("fullscreen")

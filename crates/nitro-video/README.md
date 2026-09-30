@@ -11,7 +11,7 @@ nitro-video FILE [--fullscreen] [--frames N] [--stats]
 nitro-video --synthetic ...        # generated 720p30 stream, no file
 ```
 
-Keys: Space play/pause · Left/Right ±5 s · F / F11 / double-click
+Keys: Space play/pause · Left/Right ±5 s · R repeat on/off · F / F11 / double-click
 fullscreen · Esc leave fullscreen · Q quit. The controls hide after 3 s
 without pointer motion while playing.
 
@@ -24,7 +24,7 @@ without pointer motion while playing.
 | `src/decode.rs` | the `Decoder` trait, `StreamInfo`, `FrameBuf::{Shm, DmaBuf}`, the output policy `choose_output`, `SyntheticDecoder` (with an emulated VA pool for tests) |
 | `src/player.rs` | decode thread, NV12 shm ring or registered dma-bufs, pacing against frame callbacks, `PresentSurface`, stats |
 | `src/pacing.rs` | pure clock + frame picking |
-| `src/controls.rs` | the nitro-ui overlay (`SurfaceView` + play, seek slider, time, fullscreen) |
+| `src/controls.rs` | the nitro-ui overlay (`SurfaceView` + play, seek slider, time, repeat, fullscreen) |
 | `build.rs` | `pkg-config` + `cc` + `ar` by command, no build crates |
 
 **Threads.** A decode thread owns the decoder and maps the ring's memfds
