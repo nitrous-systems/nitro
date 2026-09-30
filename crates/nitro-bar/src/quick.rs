@@ -403,7 +403,7 @@ fn build_main(s: &mut Bar, ui: &mut Ui<Bar>) -> WidgetId {
     let lock = round_button("lock").name(names::LOCK).label(if lock_ok {
         "Lock"
     } else {
-        "Lock (not available yet)"
+        "Lock (not available)"
     });
     let lock = if lock_ok {
         lock.on_click(|s: &mut Bar, ui: &mut Ui<Bar>| run_session(s, ui, Action::Lock))
@@ -695,6 +695,16 @@ fn set_dark(s: &mut Bar, ui: &mut Ui<Bar>, on: bool) {
             s.quick.message = Some(format!("{}: {e}", path.display()));
             switch(ui, View::Main);
         }
+    }
+}
+
+/// Super+L: ask the session to lock, the same request as the Lock
+/// button, without opening or touching the menu. A failure is printed:
+/// there is no menu open to show it in.
+pub(crate) fn lock_from_hotkey(s: &mut Bar) -> Result<(), String> {
+    match &s.quick.session_socket {
+        Some(p) => session::request(p, Action::Lock),
+        None => Err("no session socket: is nitro-session running?".to_owned()),
     }
 }
 

@@ -299,8 +299,8 @@ fn the_power_view_logs_out_through_session_sock_and_shows_errors() {
     open(&mut h);
     let lock = in_menu(&mut h, q::LOCK);
     assert!(
-        !h.widget::<RoundButton<Bar>>(lock).is_enabled(),
-        "lock is not implemented yet"
+        h.widget::<RoundButton<Bar>>(lock).is_enabled(),
+        "lock is live"
     );
     let power = in_menu(&mut h, q::POWER);
     act(&mut h, power, "click", None);
@@ -485,4 +485,44 @@ fn write_crop(h: &mut Harness<Bar>, path: &Path) {
         data.extend_from_slice(&img.data[s..s + (w * 4) as usize]);
     }
     std::fs::write(path, png::encode_xrgb(w, hgt, w * 4, &data)).expect("write png");
+}
+
+#[test]
+fn the_lock_button_asks_the_session_to_lock_and_closes_the_menu() {
+    let dir = scratch("lock");
+    let (sock, rx) = fake_session(&dir, "ok");
+    let mut h = harness(Bar::new().with_audio_dirs(vec![]).with_session_socket(sock));
+    open(&mut h);
+    let lock = in_menu(&mut h, q::LOCK);
+    h.click(lock);
+    assert_eq!(
+        rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(),
+        "lock"
+    );
+    assert!(h.state().quick().popup().is_none(), "ok closes the menu");
+    h.quit();
+}
+
+/// Evdev keycodes for Super and `l`.
+const KEY_LEFTMETA: u32 = 125;
+const KEY_L: u32 = 38;
+
+#[test]
+fn super_l_asks_the_session_to_lock() {
+    let dir = scratch("super-l");
+    let (sock, rx) = fake_session(&dir, "ok");
+    let mut h = harness(Bar::new().with_audio_dirs(vec![]).with_session_socket(sock));
+    assert!(h.server().stat("hotkeys") >= 1, "Super+L is bound");
+    h.key_down(KEY_LEFTMETA);
+    h.key_down(KEY_L);
+    h.key_up(KEY_L);
+    h.key_up(KEY_LEFTMETA);
+    h.settle();
+    assert_eq!(
+        rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(),
+        "lock"
+    );
+    assert_eq!(h.state().lock_presses(), 1, "once, on the press");
+    assert!(h.state().quick().popup().is_none(), "no menu opened");
+    h.quit();
 }

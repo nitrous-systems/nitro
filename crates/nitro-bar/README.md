@@ -150,8 +150,9 @@ The status pill at the right end opens a **quick-settings menu**
 | ![](../../docs/quick-settings-outputs-light.png) | ![](../../docs/quick-settings-outputs-dark.png) |
 
 * **Main view.** The top row has the battery reading plus round
-  buttons for Settings (launches `nitro-settings`), Lock (disabled
-  until `nitro-session` implements `lock`) and Power. Below it is the
+  buttons for Settings (launches `nitro-settings`), Lock (asks
+  `nitro-session` to `lock`, which starts `nitro-greeter --lock`) and
+  Power. Below it is the
   **Sound** card: a mute toggle, a chunky volume slider, an output
   button, and the current device's name. Last comes a two-column tile
   grid, which holds only **Dark Style** for now. Wi-Fi, VPN and
@@ -191,12 +192,16 @@ $ hey nitro-bar do 'window[1]/volume' set_value 0.3
 $ hey nitro-bar do 'window[1]/dark' toggle
 ```
 
-There is no global hotkey by default, because it would fight the
-existing Super bindings. That is a follow-up.
+There is no global hotkey for the menu by default, because it would
+fight the existing Super bindings. That is a follow-up.
+
+**Super+L locks.** The bar binds it (`HOTKEY_LOCK`) when it is on the
+shell socket, and sends `lock` to the session on the press, the same
+request as the Lock button, without opening the menu. The server ignores
+shell bindings while locked, so it cannot fire over the lock screen.
 
 Follow-ups: a now-playing card (paired with nitro-amp); Wi-Fi, network,
-VPN and Bluetooth tiles; a hotkey; enabling Lock once `nitro-session`
-implements it; live volume via a `pw-mon` subscription, if ever wanted.
+VPN and Bluetooth tiles; a menu hotkey; live volume via a `pw-mon` subscription, if ever wanted.
 
 `tests/quick.rs` covers the menu with a fake `wpctl` (a shell script
 that keeps its state in files) and a fake `session.sock`. The

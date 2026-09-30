@@ -220,14 +220,45 @@ both is the cheapest confirmation that the prepend is live.
 $ just box-session            # status
 ok
 nitro-server 217261
+nitro-greeter -
 nitro-wallpaper 217278
 nitro-bar 217279
 nitro-launcher 217280
 
-$ just box-session lock       # M4; refused, honestly
-err lock is not implemented yet (M4: …)
-$ just box-session suspend    # systemctl suspend, via the session
+$ just box-session lock       # lock at the server, start nitro-greeter --lock
+ok
+$ just box-session suspend    # lock, then systemctl suspend
 ```
+
+## Lock screen
+
+`just deploy` (both profiles) also installs `/etc/pam.d/nitro-lock`, the
+lock screen's PAM service, **when it is absent** (never overwriting). It
+is part of the deployed set: "restore as found" leaves it in place.
+
+To test on a box:
+
+1. Lock: `hey nitro-bar do 'window[1]/lock' click` with the menu open,
+   `just box-session lock`, or Super+L. `just shot` shows only the lock
+   screen; `box-session` lists `nitro-greeter <pid>`.
+2. A wrong password: `hey nitro-greeter get window/message value` shows
+   PAM's reason, and the screen stays locked. **At most two in a row**:
+   `pam_faillock` locks the account after a few.
+3. The right one (`hey nitro-greeter set window/answer value …`, then
+   `hey nitro-greeter do window/answer activate`, or typed with ydotool
+   on box1): the desktop comes back, and `box-session` shows
+   `nitro-greeter -` (exit 0, not restarted).
+4. `kill -9` the greeter while locked: `just shot` still shows no
+   desktop, the journal says the session is restarting it, and the new
+   one takes the lock over (server log: "lock taken over").
+
+A `--locked` start, temporarily: on box1,
+`sudo systemctl edit nitro-dev` with
+`[Service]` / `ExecStart=` / `ExecStart=/home/kaspar/nitro-bin/nitro-session --locked`,
+restart, and remove the drop-in (`sudo systemctl revert nitro-dev`)
+afterwards. On testbox2, GDM's session entry runs
+`/usr/local/bin/nitro-session` with no flag; test `--locked` in a
+temporary copy of the entry, and delete it afterwards.
 
 ## Chromium (#3865)
 

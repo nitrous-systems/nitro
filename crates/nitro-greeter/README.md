@@ -23,8 +23,10 @@ decisions 4 and 6.
 $ nitro-greeter --lock
 ```
 
-What `nitro-session --locked` and the bar's Lock action are to run (next
-tasks). It connects to the **shell** socket, opens `Surface::lock()` (an
+What `nitro-session --locked` and the bar's Lock action (and Super+L)
+run: the session spawns it as its on-demand lock piece, after locking at
+the server itself, restarts it if it crashes and leaves it be when it
+exits 0. It connects to the **shell** socket, opens `Surface::lock()` (an
 undecorated, focusable overlay covering the output), sends `Lock`
 (`Ui::lock_session`), which takes over an ownerless lock, and starts a
 conversation for the session's owner, so the password prompt has the

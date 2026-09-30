@@ -11,6 +11,7 @@
 //!  poll( pidfd per child, session socket, connected clients, signal pipe )
 //!    │
 //!    ├─ a shell piece exited  ──▶ schedule a restart (backoff)
+//!    ├─ the lock screen exited ─▶ 0: unlocked, done; else restart it
 //!    ├─ the server exited     ──▶ tear down, exit with its code
 //!    ├─ a command arrived     ──▶ lock/suspend/poweroff/reboot/logout/status
 //!    ├─ a restart is due      ──▶ start the piece again
@@ -51,6 +52,23 @@
 //! The signalling is still strictly ordered, and the waiting is not: what
 //! matters is that the launcher is *asked* to stop before the server is,
 //! not that it has finished before the bar is asked.
+//!
+//! # The lock screen is a piece that is usually not running
+//!
+//! Its slot ([`Role::Lock`]) is always in the table, between the server
+//! and the shell, and is filled on demand: by a `lock` request
+//! ([`Session::lock`]), or at start by `nitro-session --locked`
+//! ([`Config::locked`]), which also starts the server with
+//! `NITRO_LOCKED=1` so not one frame of the desktop is drawn before the
+//! lock screen is up. Exit 0 is the lock screen saying "unlocked": the
+//! slot is cleared and nothing is restarted. Any other end is a crash,
+//! restarted with the same backoff as a shell piece. Meanwhile the
+//! server keeps the session locked with no owner, and the restarted lock
+//! screen's `Lock` takes it over. A lock screen that cannot start at all
+//! therefore leaves the session locked, which is the safe failure.
+//!
+//! Autostart does not exist yet. When it does, on a `--locked` start it
+//! waits for the lock screen's first exit 0.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -80,7 +98,8 @@ const REPLY_TIMEOUT: Duration = Duration::from_millis(200);
 /// `main.rs`, or by hand in a test.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// What to run, in start order. Normally [`crate::pieces::PIECES`].
+    /// What to run, in start order. Normally [`crate::pieces::PIECES`]:
+    /// the server, the lock screen's on-demand slot, the shell.
     pub pieces: Vec<Piece>,
     /// Directory searched for the binaries before `$PATH`.
     pub bin_dir: Option<PathBuf>,
@@ -99,10 +118,14 @@ pub struct Config {
     /// How long every piece together gets to answer `SIGTERM` before the
     /// session resorts to `SIGKILL`. Default [`TEARDOWN_TIMEOUT`].
     pub teardown_timeout: Duration,
+    /// Start locked (`nitro-session --locked`): the server gets
+    /// `NITRO_LOCKED=1`, and the lock screen is started right after the
+    /// server is ready, before the shell.
+    pub locked: bool,
 }
 
 impl Config {
-    /// The shipped configuration: the four pieces, binaries next to us,
+    /// The shipped configuration: the five pieces, binaries next to us,
     /// the runtime dir's sockets.
     #[must_use]
     pub fn new(wire_path: PathBuf, shell_path: PathBuf, session_path: PathBuf) -> Self {
@@ -116,15 +139,33 @@ impl Config {
             ready_timeout: crate::wait::DEFAULT_TIMEOUT,
             backoff: Backoff::default(),
             teardown_timeout: TEARDOWN_TIMEOUT,
+            locked: false,
         }
     }
 
-    fn args_for(&self, program: &str) -> Vec<String> {
-        self.args
-            .iter()
-            .find(|(p, _)| p == program)
-            .map(|(_, a)| a.clone())
-            .unwrap_or_default()
+    /// The arguments for `piece`: the configured ones if any (a test's
+    /// stub arguments), else the lock screen's `--lock`, else none.
+    fn args_for(&self, piece: &Piece) -> Vec<String> {
+        if let Some((_, a)) = self.args.iter().find(|(p, _)| p == piece.program) {
+            return a.clone();
+        }
+        if piece.role == Role::Lock {
+            return crate::pieces::LOCK_ARGS
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect();
+        }
+        Vec::new()
+    }
+
+    /// Extra environment for `piece`: `NITRO_LOCKED=1` for the server of
+    /// a locked start.
+    fn env_for(&self, piece: &Piece) -> &'static [(&'static str, &'static str)] {
+        if self.locked && piece.role == Role::Server {
+            &[("NITRO_LOCKED", "1")]
+        } else {
+            &[]
+        }
     }
 }
 
@@ -278,9 +319,12 @@ impl Session {
             }
         }
 
-        // Then the shell, in order.
+        // Then the shell, in order. The lock screen's slot comes first
+        // in that order and is filled only on a locked start, so the lock
+        // screen is the first client to ask for the lock.
         for slot in &mut slots {
-            if slot.piece.role == Role::Server {
+            if slot.piece.role == Role::Server || (slot.piece.role == Role::Lock && !config.locked)
+            {
                 continue;
             }
             if let Err(e) = spawn_slot(slot, &config) {
@@ -539,6 +583,17 @@ impl Session {
             return;
         }
 
+        if self.slots[idx].piece.role == Role::Lock && exit == Exit::Code(0) {
+            // The lock screen's way of saying "unlocked": done, not a
+            // crash. The backoff starts over for the next lock.
+            info!(
+                "{program} (pid {pid}) unlocked after {:.1}s",
+                uptime.as_secs_f32()
+            );
+            self.slots[idx].backoff = self.config.backoff;
+            return;
+        }
+
         let delay = self.slots[idx].backoff.after_exit(uptime);
         warn!(
             "{program} (pid {pid}) {exit} after {:.1}s; restarting in {:.0}s",
@@ -631,13 +686,29 @@ impl Session {
         match cmd {
             Command::Status => power::status_reply(&self.status()),
             Command::Logout => power::ok(),
-            Command::Lock => power::err(
-                "lock is not implemented yet (M4: nitro-lock and the logind inhibitor; see crates/nitro-session/README.md)",
-            ),
+            Command::Lock => match self.lock() {
+                Ok(()) => power::ok(),
+                Err(e) => {
+                    warn!("lock: {e}");
+                    power::err(&e)
+                }
+            },
             other => {
                 let Some(verb) = other.systemctl_verb() else {
                     return power::err("no action");
                 };
+                if other == Command::Suspend {
+                    // Lock before suspend, so the machine wakes up locked.
+                    // A lock that fails does not stop the suspend: that is
+                    // what suspend did before there was a lock, and a
+                    // suspend button that does nothing is worse. The lock
+                    // screen may not have painted when the machine goes
+                    // down; the server draws nothing while locked, so the
+                    // wake shows no desktop either way.
+                    if let Err(e) = self.lock() {
+                        warn!("lock before suspend: {e}");
+                    }
+                }
                 info!("session socket: systemctl {verb}");
                 match power::run_systemctl(verb) {
                     Ok(()) => power::ok(),
@@ -648,6 +719,43 @@ impl Session {
                 }
             }
         }
+    }
+
+    /// Lock the session: lock at the server, then start the lock screen.
+    ///
+    /// If a lock screen is already running, or its restart is pending,
+    /// the session is locked (or about to be) and this does nothing.
+    /// Starting a second one would be a bug: the server disconnects a
+    /// second `Lock` while the first owns it.
+    ///
+    /// Otherwise the lock is taken at the server first ([`crate::lock`]),
+    /// so the desktop is gone before this returns rather than when the
+    /// lock screen gets round to it. If the lock screen then fails to
+    /// start, the session is still locked with no owner: that is logged,
+    /// a restart is scheduled, and the answer is still `Ok`.
+    ///
+    /// # Errors
+    /// The server refused or did not answer the `Lock`. Nothing is
+    /// started then.
+    pub fn lock(&mut self) -> Result<(), String> {
+        let Some(idx) = self.slots.iter().position(|s| s.piece.role == Role::Lock) else {
+            // A configuration with no lock screen (a test's): the server
+            // lock alone.
+            return crate::lock::lock_at_server(&self.config.shell_path, crate::lock::LOCK_TIMEOUT);
+        };
+        let slot = &self.slots[idx];
+        if slot.child.is_some() || slot.restart_at.is_some() {
+            debug!("lock: {} is already up", slot.piece.program);
+            return Ok(());
+        }
+        crate::lock::lock_at_server(&self.config.shell_path, crate::lock::LOCK_TIMEOUT)?;
+        info!("session locked");
+        let slot = &mut self.slots[idx];
+        if let Err(e) = spawn_slot(slot, &self.config) {
+            warn!("{}: {e}; the session stays locked", slot.piece.program);
+            slot.restart_at = Some(Instant::now() + slot.backoff.after_exit(Duration::ZERO));
+        }
+        Ok(())
     }
 
     /// SIGTERM every piece in reverse start order, wait for all of them
@@ -761,13 +869,14 @@ impl Drop for Session {
 
 fn spawn_slot(slot: &mut Slot, config: &Config) -> Result<(), SpawnError> {
     let program = crate::pieces::resolve(slot.piece.program, config.bin_dir.as_deref());
-    let args = config.args_for(slot.piece.program);
-    let child = Child::spawn(
+    let args = config.args_for(&slot.piece);
+    let child = Child::spawn_with_env(
         slot.piece.program,
         slot.piece.role,
         &program,
         &args,
         config.bin_dir.as_deref(),
+        config.env_for(&slot.piece),
     )?;
     info!(
         "started {} (pid {}) from {}",

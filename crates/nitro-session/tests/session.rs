@@ -83,6 +83,7 @@ impl Env {
         std::fs::create_dir_all(&bin).unwrap();
         for name in [
             "nitro-server",
+            "nitro-greeter",
             "nitro-wallpaper",
             "nitro-bar",
             "nitro-launcher",
@@ -334,11 +335,17 @@ fn the_server_comes_up_first_and_then_the_shell_in_order() {
         status.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
         vec![
             "nitro-server",
+            "nitro-greeter",
             "nitro-wallpaper",
             "nitro-bar",
             "nitro-launcher"
         ],
         "status reports the pieces in start order"
+    );
+    assert_eq!(status[1].1, None, "the lock screen is not started unlocked");
+    assert!(
+        env.marks("nitro-greeter.marks").is_empty(),
+        "nor was it ever started"
     );
 
     // …and the server started before any of them. The stub writes its
@@ -456,7 +463,10 @@ fn teardown_stops_the_pieces_in_reverse_order() {
     ]);
     let mut session = Session::start(config).expect("the session starts");
     pump(&mut session, Duration::from_secs(10), |s| {
-        s.status().iter().all(|(_, pid)| pid.is_some())
+        s.status()
+            .iter()
+            .filter(|(n, _)| n != "nitro-greeter")
+            .all(|(_, pid)| pid.is_some())
     });
 
     session.teardown();
@@ -594,9 +604,10 @@ fn the_server_exiting_ends_the_session_with_its_code() {
     }
 }
 
-/// The session socket: `status` lists what is running, `lock` is honestly
-/// refused, an unknown verb is an error, and `logout` ends the session
-/// *after* answering.
+/// The session socket: `status` lists what is running, `lock` locks at
+/// the server (with no lock screen configured, that is all it does), an
+/// unknown verb is an error, and `logout` ends the session *after*
+/// answering.
 #[test]
 fn the_session_socket_answers_status_lock_and_logout() {
     let env = Env::new("socket");
@@ -634,11 +645,15 @@ fn the_session_socket_answers_status_lock_and_logout() {
     assert_eq!(Some(pid), session.status()[0].1);
     assert!(lines.next().unwrap().starts_with("nitro-bar "));
 
-    // `lock` is M4, and says so rather than pretending.
+    // `lock` reaches the server as a wire `Lock` before it is answered.
     let lock = request(&mut session, "lock");
-    assert!(lock.starts_with("err "), "{lock}");
-    assert!(lock.contains("not implemented"), "{lock}");
-    assert_eq!(lock.lines().count(), 1, "one line: {lock:?}");
+    assert_eq!(lock, "ok\n");
+    assert!(
+        env.marks("nitro-server.marks")
+            .iter()
+            .any(|(w, _, _)| w == "lock"),
+        "the server got the Lock before the ok"
+    );
 
     // An unknown verb is refused, and the connection is closed after the
     // error — the same rule the wire protocol uses.
@@ -792,5 +807,203 @@ fn a_client_that_half_closes_after_its_request_still_gets_the_reply() {
     assert!(got.starts_with("ok\n"), "{got:?}");
     assert!(got.contains("nitro-server "), "{got:?}");
 
+    session.teardown();
+}
+
+/// The pieces of a full session, with the stub arguments for each, and
+/// the server's start mark recording `NITRO_LOCKED`.
+fn full_args(env: &Env, greeter: &[&str]) -> Vec<(String, Vec<String>)> {
+    let mut server = server_args(env);
+    server.extend(["--mark-env".to_owned(), "NITRO_LOCKED".to_owned()]);
+    vec![
+        ("nitro-server".to_owned(), server),
+        (
+            "nitro-greeter".to_owned(),
+            shell_args(env, "nitro-greeter", greeter),
+        ),
+        (
+            "nitro-wallpaper".to_owned(),
+            shell_args(env, "nitro-wallpaper", &[]),
+        ),
+        ("nitro-bar".to_owned(), shell_args(env, "nitro-bar", &[])),
+        (
+            "nitro-launcher".to_owned(),
+            shell_args(env, "nitro-launcher", &[]),
+        ),
+    ]
+}
+
+/// The server's `NITRO_LOCKED`, as its stub recorded it at start.
+fn server_locked_env(env: &Env) -> String {
+    let text = std::fs::read_to_string(env.path("nitro-server.marks")).unwrap_or_default();
+    text.lines()
+        .find(|l| l.starts_with("start "))
+        .and_then(|l| l.split_whitespace().nth(3))
+        .unwrap_or("")
+        .to_owned()
+}
+
+fn starts(env: &Env, name: &str) -> Vec<(u64, u128)> {
+    env.marks(&format!("{name}.marks"))
+        .into_iter()
+        .filter(|(w, _, _)| w == "start")
+        .map(|(_, p, t)| (p, t))
+        .collect()
+}
+
+/// `--locked`: the server is started with `NITRO_LOCKED=1`, and the lock
+/// screen starts right after it, before the shell.
+#[test]
+fn a_locked_start_starts_the_lock_screen_first_and_the_server_locked() {
+    let env = Env::new("locked-start");
+    let mut config = env.config(full_args(&env, &[]));
+    config.locked = true;
+    let mut session = Session::start(config).expect("the session starts");
+    let order = [
+        "nitro-server",
+        "nitro-greeter",
+        "nitro-wallpaper",
+        "nitro-bar",
+        "nitro-launcher",
+    ];
+    pump(&mut session, Duration::from_secs(10), |_| {
+        order.iter().all(|n| !starts(&env, n).is_empty())
+    });
+    assert_eq!(server_locked_env(&env), "NITRO_LOCKED=1");
+    // Spawn order is start order; the stubs' own clocks can tie within
+    // a millisecond, so this is `<=` along the chain.
+    let times: Vec<u128> = order.iter().map(|n| starts(&env, n)[0].1).collect();
+    assert!(
+        times.windows(2).all(|w| w[0] <= w[1]),
+        "start order {order:?}: {times:?}"
+    );
+    session.teardown();
+}
+
+/// An ordinary start does not start the lock screen, and the server is
+/// not told to start locked.
+#[test]
+fn an_unlocked_start_does_not_start_the_lock_screen() {
+    let env = Env::new("unlocked-start");
+    let mut session = Session::start(env.config(full_args(&env, &[]))).expect("starts");
+    pump(&mut session, Duration::from_secs(10), |_| {
+        !starts(&env, "nitro-launcher").is_empty()
+    });
+    assert_eq!(server_locked_env(&env), "NITRO_LOCKED=-");
+    // Give a wrongly started greeter time to write its mark.
+    pump_for(&mut session, Duration::from_millis(200));
+    assert!(starts(&env, "nitro-greeter").is_empty());
+    session.teardown();
+}
+
+/// Step the loop for a fixed time.
+fn pump_for(session: &mut Session, d: Duration) {
+    let end = Instant::now() + d;
+    while Instant::now() < end {
+        session.poll_once_for(None, Some(Duration::from_millis(10)));
+    }
+}
+
+/// `lock` locks at the server *first*, then starts the lock screen; a
+/// second `lock` while it runs is `ok` and starts nothing.
+#[test]
+fn lock_locks_the_server_then_starts_one_lock_screen() {
+    let env = Env::new("lock");
+    let mut session = Session::start(env.config(full_args(&env, &[]))).expect("starts");
+    pump(&mut session, Duration::from_secs(10), |_| {
+        !starts(&env, "nitro-launcher").is_empty()
+    });
+
+    assert_eq!(request(&mut session, "lock"), "ok\n");
+    let lock_at = env
+        .marks("nitro-server.marks")
+        .iter()
+        .find(|(w, _, _)| w == "lock")
+        .map(|(_, _, t)| *t)
+        .expect("the server got a Lock");
+    pump(&mut session, Duration::from_secs(5), |_| {
+        !starts(&env, "nitro-greeter").is_empty()
+    });
+    assert!(
+        starts(&env, "nitro-greeter")[0].1 >= lock_at,
+        "the lock screen started after the server locked"
+    );
+
+    assert_eq!(request(&mut session, "lock"), "ok\n");
+    pump_for(&mut session, Duration::from_millis(200));
+    assert_eq!(starts(&env, "nitro-greeter").len(), 1, "no second lock screen");
+    assert_eq!(
+        env.marks("nitro-server.marks")
+            .iter()
+            .filter(|(w, _, _)| w == "lock")
+            .count(),
+        1,
+        "and no second server Lock"
+    );
+    session.teardown();
+}
+
+/// Exit 0 is "unlocked": the slot is cleared and nothing restarts.
+#[test]
+fn a_lock_screen_that_exits_0_is_not_restarted() {
+    let env = Env::new("unlock");
+    let mut session = Session::start(env.config(full_args(
+        &env,
+        &["--exit-after", "100", "--exit-code", "0"],
+    )))
+    .expect("starts");
+    pump(&mut session, Duration::from_secs(10), |_| {
+        !starts(&env, "nitro-launcher").is_empty()
+    });
+    assert_eq!(request(&mut session, "lock"), "ok\n");
+    pump(&mut session, Duration::from_secs(5), |s| {
+        !starts(&env, "nitro-greeter").is_empty() && s.status()[1].1.is_none()
+    });
+    // Longer than the 100 ms backoff a crash would cost.
+    pump_for(&mut session, Duration::from_millis(400));
+    assert_eq!(starts(&env, "nitro-greeter").len(), 1, "not restarted");
+    let status = request(&mut session, "status");
+    assert!(status.contains("nitro-greeter -\n"), "{status}");
+
+    // And the next `lock` starts a fresh one.
+    assert_eq!(request(&mut session, "lock"), "ok\n");
+    pump(&mut session, Duration::from_secs(5), |_| {
+        starts(&env, "nitro-greeter").len() == 2
+    });
+    session.teardown();
+}
+
+/// A crash (non-zero exit) is restarted with backoff: the session stays
+/// locked at the server meanwhile, and the new one takes it over.
+#[test]
+fn a_crashed_lock_screen_is_restarted() {
+    let env = Env::new("lock-crash");
+    let mut session = Session::start(env.config(full_args(
+        &env,
+        &["--exit-after", "50", "--exit-code", "1"],
+    )))
+    .expect("starts");
+    pump(&mut session, Duration::from_secs(10), |_| {
+        !starts(&env, "nitro-launcher").is_empty()
+    });
+    assert_eq!(request(&mut session, "lock"), "ok\n");
+    pump(&mut session, Duration::from_secs(10), |_| {
+        starts(&env, "nitro-greeter").len() >= 3
+    });
+    let s = starts(&env, "nitro-greeter");
+    assert!(
+        s[1].1 - s[0].1 >= 140,
+        "the restart waited for the backoff: {s:?}"
+    );
+    // While it restarts, `lock` does not start a second one.
+    assert_eq!(request(&mut session, "lock"), "ok\n");
+    assert_eq!(
+        env.marks("nitro-server.marks")
+            .iter()
+            .filter(|(w, _, _)| w == "lock")
+            .count(),
+        1,
+        "the restarts did not lock again from the session"
+    );
     session.teardown();
 }

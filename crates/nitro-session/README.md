@@ -6,22 +6,28 @@ the one that takes it away again. **M3-E, and M3's exit.**
 ```text
               nitro-session                 ← systemd runs this, on tty2
                     │
-      ┌─────────────┼──────────────┬──────────────┐
-      ▼             ▼              ▼              ▼
- nitro-server  nitro-wallpaper  nitro-bar   nitro-launcher
-   (the VT,      Background       Top layer    Overlay layer
-    DRM master)   layer           + zone       + Super hotkey
+      ┌─────────────┬───────┴──────┬──────────────┬──────────────┐
+      ▼             ▼              ▼              ▼              ▼
+ nitro-server  nitro-greeter  nitro-wallpaper  nitro-bar   nitro-launcher
+   (the VT,      --lock          Background     Top layer    Overlay layer
+    DRM master)  on demand       layer          + zone       + Super hotkey
+                                                + Super+L
 ```
 
 It starts them in that order, waits for the compositor to really be
 answering before starting anything that talks to it, restarts a shell
 piece that dies, ends the whole session when the *server* exits, and
 tears down in reverse order on `SIGTERM`. It also answers the power
-actions — `suspend`, `poweroff`, `reboot`, `logout`, and an M4 `lock` —
-on `$XDG_RUNTIME_DIR/nitro/session.sock`.
+actions — `lock`, `suspend`, `poweroff`, `reboot`, `logout` — on
+`$XDG_RUNTIME_DIR/nitro/session.sock`.
+
+The lock screen (`nitro-greeter --lock`) is a fifth piece that is
+usually not running: `lock` starts it, and `nitro-session --locked`
+starts the whole session locked (see "Locking" below).
 
 ```console
 $ nitro-session                              # the whole desktop
+$ nitro-session --locked                     # …behind the lock screen
 $ NITRO_SESSION_PIECES= nitro-session        # the compositor alone
 $ NITRO_SESSION_PIECES=nitro-bar nitro-session   # …and just the bar
 $ printf 'status\n' | nc -U $XDG_RUNTIME_DIR/nitro/session.sock
@@ -147,7 +153,8 @@ spent, not the requirement:
 3. **What D-Bus would buy is not wanted yet.** What a real client gets
    over `systemctl` is *events*: `PrepareForSleep`, `Lock`/`Unlock`,
    idle hints, and an inhibitor fd held across a suspend so a lock screen
-   can paint before the machine goes down. Every one of those is M4.
+   can paint before the machine goes down. Locking itself needs none
+   of them (see "Locking").
 
 The honest cost: a `systemctl suspend` is a fork, an exec and a D-Bus
 round trip inside someone else's process (~20 ms rather than ~2 ms), it
@@ -155,10 +162,46 @@ can fail for reasons we can only report as text, and the session cannot
 be told the machine is *about to* sleep.
 
 **When it gets revisited:** the first requirement `systemctl` genuinely
-cannot meet is a lock screen that must paint before suspend. That is the
-same milestone in which `lock` stops returning `err`, and that is not a
-coincidence — `lock` is the one action that needs the event, which is why
-it is the one action not implemented here.
+cannot meet is a lock screen that must *paint* before suspend (a delay
+inhibitor released once the lock screen has presented), and the logind
+`Lock` signal that `loginctl lock-session` sends. `lock` works without
+either — the session locks at the server itself, and `suspend` locks
+first — so those two are a follow-up, not a gap in the lock.
+
+## Locking
+
+The lock screen is a piece with its own rules (`Role::Lock`):
+
+- **On demand.** Its slot sits between the server and the shell and is
+  empty unless the session is locked. `status` shows `nitro-greeter -`.
+- **`lock` locks at the server first.** The session connects to the
+  shell socket, sends `Lock`, waits until the server has handled it
+  (a `WindowList` after it, answered on receipt, is the roundtrip),
+  and disconnects. That leaves the lock **ownerless**: nothing is drawn
+  and no input is routed. Only then is the lock screen spawned, and its
+  own `Lock` takes the lock over. So the desktop is gone by the time
+  the bar gets `ok`, not 100–300 ms later when the greeter is up. The
+  exchange is bounded (1 s) on a thread, like the readiness probe. A
+  refused or unanswered `Lock` is `err` and starts nothing.
+- **One at a time.** A `lock` while the lock screen runs, or while its
+  restart is pending, is `ok` and does nothing: a second lock screen
+  would be disconnected by the server.
+- **Exit 0 means unlocked.** The slot is cleared, nothing restarts, and
+  the backoff resets for the next lock.
+- **Anything else is a crash.** Restarted with the shell's backoff (1 s,
+  doubling). The server keeps the session locked with no owner in the
+  meantime, and the restarted lock screen takes over. A lock screen that
+  cannot start at all leaves the session locked: the safe failure.
+- **`--locked`** starts the server with `NITRO_LOCKED=1` (locked, no
+  owner, from its first frame) and spawns the lock screen right after
+  readiness, before the wallpaper, so it is the first client to ask for
+  the lock. Autostart does not exist yet; when it does, it waits for the
+  lock screen's first exit 0.
+- **`suspend` locks first**, then runs `systemctl suspend`. A failed lock
+  does not stop the suspend.
+
+Super+L is the bar's binding (`crates/nitro-bar`), which sends `lock`
+here. The server ignores shell bindings while locked.
 
 ## The protocol
 
@@ -175,8 +218,8 @@ not code — so a change to the replies here must be mirrored there.
 
 | request | effect |
 |---|---|
-| `lock` | M4. `err not implemented …` today. |
-| `suspend` | `systemctl suspend` |
+| `lock` | lock at the server, then start `nitro-greeter --lock`; `ok` once locked |
+| `suspend` | `lock`, then `systemctl suspend` |
 | `poweroff` | `systemctl poweroff` |
 | `reboot` | `systemctl reboot` |
 | `logout` | orderly teardown, exit 0 |
@@ -299,13 +342,19 @@ buffering.
 `tests/session.rs` runs a **real** `Session` — real fork/exec, real
 pidfds, the real poll loop, the real handshake probe — against
 `examples/stub_child`, a supervisable stand-in that marks when it starts
-and when it is asked to stop and crashes on request. Eight tests: start
+and when it is asked to stop and crashes on request. Fourteen tests: start
 order, restart with a growing delay, reverse teardown order, a piece that
 ignores `SIGTERM` being killed inside the deadline, the server's exit
 ending the session with its code, the socket's `status`/`lock`/`logout`
 answers, a server that never becomes ready failing the start with
-nothing left running, and a server that dies mid-startup being noticed
-at once instead of at the timeout.
+nothing left running, a server that dies mid-startup being noticed
+at once instead of at the timeout, a half-closing client, and the lock
+screen: a `--locked` start (server env `NITRO_LOCKED=1`, lock screen
+before the shell), an unlocked start not starting it, `lock` reaching the
+server before the lock screen spawns and a second `lock` starting
+nothing, exit 0 not being restarted, and a crash being restarted with
+backoff. The stub server marks a `Lock` it receives and answers
+`WindowList`, which is what the lock exchange waits for.
 
 One environment note recorded there: a **signal mask is inherited across
 fork and exec**, so in a sandbox that blocks `SIGTERM` the stubs are born

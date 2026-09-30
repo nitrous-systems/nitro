@@ -71,8 +71,8 @@ pub enum Action {
     Reboot,
     /// `systemctl poweroff`.
     Poweroff,
-    /// Lock the screen. Not implemented by `nitro-session` yet (M4); see
-    /// [`Action::available`].
+    /// Lock the screen: the session locks at the server and starts
+    /// `nitro-greeter --lock`.
     Lock,
 }
 
@@ -98,14 +98,13 @@ impl Action {
         }
     }
 
-    /// Whether the session implements it today.
-    ///
-    /// `lock` answers `err not implemented` until M4 brings a lock
-    /// screen, so a menu should show it disabled rather than offer a
-    /// button that can only fail. Flip this when `nitro-session` does.
+    /// Whether the session implements it. Every action is, since the
+    /// lock screen landed; kept so a menu can disable an action a future
+    /// session does not have, rather than offer a button that can only
+    /// fail.
     #[must_use]
     pub fn available(self) -> bool {
-        !matches!(self, Self::Lock)
+        true
     }
 }
 
@@ -199,16 +198,10 @@ mod tests {
     }
 
     #[test]
-    fn verbs_are_the_wire_words_and_lock_is_not_available() {
+    fn verbs_are_the_wire_words_and_every_action_is_available() {
         let verbs: Vec<_> = Action::ALL.iter().map(|a| a.verb()).collect();
         assert_eq!(verbs, ["lock", "suspend", "reboot", "poweroff", "logout"]);
-        assert!(!Action::Lock.available());
-        assert!(
-            Action::ALL
-                .iter()
-                .filter(|a| **a != Action::Lock)
-                .all(|a| a.available())
-        );
+        assert!(Action::ALL.iter().all(|a| a.available()));
     }
 
     #[test]

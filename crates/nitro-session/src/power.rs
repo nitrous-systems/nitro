@@ -23,10 +23,14 @@
 //!    client gets over `systemctl` is *events*: `PrepareForSleep`,
 //!    `Lock`/`Unlock` signals, idle hints, and an inhibitor fd held
 //!    across a suspend so a lock screen can paint before the machine goes
-//!    down. Every one of those is M4 work — and M4 is when
-//!    [`Command::Lock`] stops returning `err`. **When a lock screen needs
-//!    to paint before suspend, this decision gets revisited**, because
-//!    that is the first requirement `systemctl` genuinely cannot meet.
+//!    down. [`Command::Lock`] works without any of them: the session
+//!    locks at the server and starts the lock screen itself, and
+//!    `suspend` locks first. What is still missing is logind's side:
+//!    `loginctl lock-session` (the `Lock` signal) does not reach us, and
+//!    nothing holds a delay inhibitor so the lock screen is known to have
+//!    *painted* before the machine sleeps. **That is when this decision
+//!    gets revisited**, because it is the first requirement `systemctl`
+//!    genuinely cannot meet.
 //!
 //! The cost, recorded honestly: a `systemctl suspend` is a fork, an exec
 //! and a D-Bus round trip inside someone else's process (~20 ms rather
@@ -44,8 +48,8 @@
 //!
 //! | request | effect |
 //! |---|---|
-//! | `lock` | M4. Answers `err not implemented …` today. |
-//! | `suspend` | `systemctl suspend` |
+//! | `lock` | lock at the server, start `nitro-greeter --lock`; `ok` once locked |
+//! | `suspend` | `lock`, then `systemctl suspend` |
 //! | `poweroff` | `systemctl poweroff` |
 //! | `reboot` | `systemctl reboot` |
 //! | `logout` | orderly teardown of the session, exit 0 |
@@ -63,7 +67,8 @@ pub const MAX_LINE: usize = 4096;
 /// A parsed request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
-    /// Lock the session. M4; refused for now.
+    /// Lock the session: lock at the server, then start the lock screen.
+    /// `ok` once the server has locked; a lock screen already up is `ok`.
     Lock,
     /// Suspend the machine.
     Suspend,

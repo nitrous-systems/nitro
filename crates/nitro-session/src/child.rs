@@ -147,7 +147,25 @@ impl Child {
         args: &[String],
         bin_dir: Option<&Path>,
     ) -> Result<Self, SpawnError> {
+        Self::spawn_with_env(name, role, program, args, bin_dir, &[])
+    }
+
+    /// [`Child::spawn`], with `env` set in the child's environment on top
+    /// of what it inherits. The session uses it for `NITRO_LOCKED=1` on a
+    /// server started by `nitro-session --locked`.
+    ///
+    /// # Errors
+    /// As [`Child::spawn`].
+    pub fn spawn_with_env(
+        name: &str,
+        role: Role,
+        program: &Path,
+        args: &[String],
+        bin_dir: Option<&Path>,
+        env: &[(&str, &str)],
+    ) -> Result<Self, SpawnError> {
         let mut cmd = Command::new(program);
+        cmd.envs(env.iter().copied());
         cmd.args(args)
             // Inherited: one journal, one ordering, no pipe for the
             // session to have to drain (a supervisor that owned its

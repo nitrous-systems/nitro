@@ -1,5 +1,10 @@
 //! Turn the environment into a [`nitro_session::Config`] and run.
 //!
+//! `nitro-session [--locked]`. `--locked` starts the session locked: the
+//! server with `NITRO_LOCKED=1`, then the lock screen before the shell,
+//! so the desktop is never drawn before somebody has typed a password.
+//! Anything else on the command line is a usage error (exit 2).
+//!
 //! - `NITRO_SOCKET` / `NITRO_SHELL_SOCKET` name the sockets the session
 //!   waits for — the same variables the server binds and the clients
 //!   connect to, resolved by the same `nitro-wire` functions, so the
@@ -10,7 +15,8 @@
 //!   before `$PATH` (default: the directory `nitro-session` itself is
 //!   in).
 //! - `NITRO_SESSION_PIECES=a,b,c` overrides which shell pieces are
-//!   started. The server is always first and is not in the list. An
+//!   started. The server is always first and is not in the list, and
+//!   the lock screen's on-demand slot is always there. An
 //!   empty value starts the server alone, which is how you bisect "is
 //!   this the compositor or the bar?" on the box without editing the
 //!   unit.
@@ -32,7 +38,7 @@ fn pieces_from_env() -> Vec<Piece> {
     let Ok(list) = std::env::var("NITRO_SESSION_PIECES") else {
         return nitro_session::pieces::PIECES.to_vec();
     };
-    let mut out = vec![nitro_session::pieces::PIECES[0].clone()];
+    let mut out = Vec::new();
     for name in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         // Only the pieces this session knows how to supervise: the
         // variable is a *subset* selector, not a way to have the desktop
@@ -45,7 +51,7 @@ fn pieces_from_env() -> Vec<Piece> {
             None => warn!("NITRO_SESSION_PIECES: {name:?} is not a shell piece; ignored"),
         }
     }
-    out
+    nitro_session::pieces::pieces_for(&out)
 }
 
 fn config_from_env() -> Config {
@@ -73,8 +79,22 @@ fn config_from_env() -> Config {
 }
 
 fn main() -> ExitCode {
-    let config = config_from_env();
-    info!("nitro-session {} starting", env!("CARGO_PKG_VERSION"));
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let locked = match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+        [] => false,
+        ["--locked"] => true,
+        _ => {
+            eprintln!("usage: nitro-session [--locked]");
+            return ExitCode::from(2);
+        }
+    };
+    let mut config = config_from_env();
+    config.locked = locked;
+    info!(
+        "nitro-session {} starting{}",
+        env!("CARGO_PKG_VERSION"),
+        if locked { " locked" } else { "" }
+    );
     // Installed *before* the first child, so a SIGTERM during start-up
     // is queued rather than killing a supervisor that has a compositor
     // holding the VT.

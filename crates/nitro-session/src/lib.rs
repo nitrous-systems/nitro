@@ -8,8 +8,13 @@
 //! session, with the server's exit code. `SIGTERM` tears everything down
 //! in reverse order.
 //!
+//! The lock screen (`nitro-greeter --lock`) is a fifth, on-demand piece:
+//! a `lock` request, or `nitro-session --locked`, starts it; it exits 0
+//! when the user unlocks, and a crash is restarted while the server keeps
+//! the session locked ([`lock`]).
+//!
 //! It also owns the power actions — `suspend`, `poweroff`, `reboot`,
-//! `logout`, and an M4 `lock` — behind a line protocol on
+//! `logout`, and `lock` — behind a line protocol on
 //! `$XDG_RUNTIME_DIR/nitro/session.sock`. They are run through
 //! `systemctl` rather than D-Bus; [`power`] argues that at length.
 //!
@@ -22,6 +27,7 @@
 //! | [`backoff`] | when a piece that died may be restarted |
 //! | [`wait`] | when is the server *ready* (not: does the file exist) |
 //! | [`socket`] | the session socket and its clients |
+//! | [`lock`] | locking at the server before the lock screen is up |
 //! | [`power`] | the commands, and why `systemctl` and not `zbus` |
 //! | [`session`] | the loop that ties them together |
 //! | [`signals`] | SIGTERM → a descriptor |
@@ -46,6 +52,7 @@
 
 pub mod backoff;
 pub mod child;
+pub mod lock;
 pub mod logging;
 pub mod pieces;
 pub mod power;

@@ -2,7 +2,12 @@
 //!
 //! # The order is start order, and teardown is its reverse
 //!
-//! `[server, wallpaper, bar, launcher]`. The server first because nothing
+//! `[server, lock screen, wallpaper, bar, launcher]`. The lock screen is
+//! on demand ([`Role::Lock`]) and is not started with the desktop; its
+//! place in the order matters for `nitro-session --locked`, where it
+//! starts first after the server so it is the one that takes the lock,
+//! and for teardown, where it is the last piece stopped before the
+//! server. The server first because nothing
 //! else has anything to connect *to* — every shell piece opens
 //! `shell.sock` in its first hundred microseconds and exits if it is not
 //! there. Then the wallpaper, the bar, the launcher, which is
@@ -81,6 +86,13 @@ pub enum Role {
     Server,
     /// A shell client: wallpaper, bar, launcher. Restarted with backoff.
     Shell,
+    /// The lock screen (`nitro-greeter --lock`). **On demand**: not
+    /// started with the desktop, but by a `lock` request or by
+    /// `nitro-session --locked`. Exit 0 means "unlocked" and is not
+    /// restarted; any other end is a crash and is restarted with backoff,
+    /// while the server keeps the session locked with no owner and the
+    /// restarted lock screen takes it over.
+    Lock,
 }
 
 /// One thing the session runs.
@@ -92,12 +104,27 @@ pub struct Piece {
     pub role: Role,
 }
 
-/// The server, the wallpaper, the bar, the launcher — in start order.
+/// The compositor.
+pub const SERVER: Piece = Piece {
+    program: "nitro-server",
+    role: Role::Server,
+};
+
+/// The lock screen. Run as `nitro-greeter --lock` ([`LOCK_ARGS`]).
+pub const LOCK_SCREEN: Piece = Piece {
+    program: "nitro-greeter",
+    role: Role::Lock,
+};
+
+/// The lock screen's arguments.
+pub const LOCK_ARGS: &[&str] = &["--lock"];
+
+/// The server, the lock screen, the wallpaper, the bar, the launcher — in
+/// start order. The lock screen is on demand ([`Role::Lock`]): its slot
+/// is always there, and is filled only while the session is locked.
 pub const PIECES: &[Piece] = &[
-    Piece {
-        program: "nitro-server",
-        role: Role::Server,
-    },
+    SERVER,
+    LOCK_SCREEN,
     Piece {
         program: "nitro-wallpaper",
         role: Role::Shell,
@@ -111,6 +138,21 @@ pub const PIECES: &[Piece] = &[
         role: Role::Shell,
     },
 ];
+
+/// The server, the lock screen, then `shell`: the piece list for a
+/// session whose shell is a subset (`NITRO_SESSION_PIECES`).
+///
+/// The lock slot is always present, whatever the shell: it is what a
+/// `lock` request fills, and on a `--locked` start it is spawned right
+/// after the server is ready, before the shell, so the lock screen is the
+/// first client to ask for the lock. Teardown in reverse stops it just
+/// before the server.
+#[must_use]
+pub fn pieces_for(shell: &[Piece]) -> Vec<Piece> {
+    let mut v = vec![SERVER, LOCK_SCREEN];
+    v.extend(shell.iter().filter(|p| p.role == Role::Shell).cloned());
+    v
+}
 
 /// The directory the running executable is in, if it can be determined.
 #[must_use]
@@ -238,13 +280,15 @@ mod tests {
             names,
             vec![
                 "nitro-server",
+                "nitro-greeter",
                 "nitro-wallpaper",
                 "nitro-bar",
                 "nitro-launcher"
             ]
         );
         assert_eq!(PIECES[0].role, Role::Server);
-        assert!(PIECES[1..].iter().all(|p| p.role == Role::Shell));
+        assert_eq!(PIECES[1].role, Role::Lock);
+        assert!(PIECES[2..].iter().all(|p| p.role == Role::Shell));
         assert_eq!(
             PIECES.iter().filter(|p| p.role == Role::Server).count(),
             1,
@@ -262,8 +306,27 @@ mod tests {
                 "nitro-launcher",
                 "nitro-bar",
                 "nitro-wallpaper",
+                "nitro-greeter",
                 "nitro-server"
             ]
+        );
+    }
+
+    /// A shell subset still gets the server first and the lock slot
+    /// second; the lock slot cannot be selected away, nor duplicated.
+    #[test]
+    fn pieces_for_a_subset_keeps_the_server_and_the_lock_slot() {
+        let names = |v: Vec<Piece>| v.iter().map(|p| p.program).collect::<Vec<_>>();
+        assert_eq!(names(pieces_for(&[])), vec!["nitro-server", "nitro-greeter"]);
+        assert_eq!(
+            names(pieces_for(std::slice::from_ref(&PIECES[3]))),
+            vec!["nitro-server", "nitro-greeter", "nitro-bar"]
+        );
+        assert_eq!(pieces_for(&PIECES[2..]), PIECES.to_vec());
+        assert_eq!(
+            pieces_for(PIECES),
+            PIECES.to_vec(),
+            "non-shell pieces in the subset are ignored"
         );
     }
 

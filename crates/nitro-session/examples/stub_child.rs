@@ -10,10 +10,16 @@
 //! ```text
 //! stub_child --mark DIR/name [--serve wire.sock,shell.sock]
 //!            [--exit-after MS] [--exit-code N] [--ignore-term]
+//!            [--mark-env VAR]
 //! ```
 //!
 //! Each start appends a line to `DIR/name` — `start <pid> <millis>` — and
 //! a `SIGTERM` appends `term <pid> <millis>` before exiting 0. That file
+//! is the test's whole observation surface. With `--mark-env VAR` the
+//! start line is `start <pid> <millis> VAR=<value>` (`VAR=-` when unset).
+//! A served client's `Lock` appends `lock <pid> <millis>`, and its
+//! `WindowList` is answered with an empty list, which is what the
+//! session's lock exchange waits for. That file
 //! is the test's whole observation surface: restart counts, restart
 //! *delays* and teardown **order** are all read off the timestamps in it,
 //! which is why the mark is written by the child rather than inferred by
@@ -36,12 +42,16 @@ fn now_millis() -> u128 {
 }
 
 fn mark(path: &Path, what: &str) {
+    mark_with(path, what, "");
+}
+
+fn mark_with(path: &Path, what: &str, extra: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
     {
-        let _ = writeln!(f, "{what} {} {}", std::process::id(), now_millis());
+        let _ = writeln!(f, "{what} {} {}{extra}", std::process::id(), now_millis());
         let _ = f.flush();
     }
 }
@@ -52,6 +62,7 @@ struct Args {
     exit_after: Option<Duration>,
     exit_code: i32,
     ignore_term: bool,
+    mark_env: Option<String>,
 }
 
 fn parse() -> Args {
@@ -61,6 +72,7 @@ fn parse() -> Args {
         exit_after: None,
         exit_code: 0,
         ignore_term: false,
+        mark_env: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -83,6 +95,7 @@ fn parse() -> Args {
             }
             "--exit-code" => args.exit_code = it.next().and_then(|s| s.parse().ok()).unwrap_or(0),
             "--ignore-term" => args.ignore_term = true,
+            "--mark-env" => args.mark_env = it.next(),
             other => {
                 eprintln!("stub_child: unknown argument {other:?}");
                 std::process::exit(2);
@@ -95,7 +108,11 @@ fn parse() -> Args {
 fn main() {
     let args = parse();
     if let Some(m) = &args.mark {
-        mark(m, "start");
+        let extra = args.mark_env.as_ref().map_or_else(String::new, |var| {
+            let val = std::env::var(var).unwrap_or_else(|_| "-".to_owned());
+            format!(" {var}={val}")
+        });
+        mark_with(m, "start", &extra);
     }
 
     // SIGTERM → a readable fd, the same self-pipe the session uses. A
@@ -186,23 +203,39 @@ fn main() {
                 }
             }
         }
-        // Speak the real handshake to whoever connected: read until a
-        // `Hello`, answer `Welcome`, and drop clients that go away.
-        clients.retain_mut(|c| {
-            if c.read().is_err() {
-                return false;
-            }
-            loop {
-                match c.next_msg() {
-                    Ok(Some(nitro_wire::msg::ClientMsg::Hello(_))) => {
-                        let _ = c.welcome("stub_child", nitro_wire::types::caps::SHELL);
-                        let _ = c.flush();
-                    }
-                    Ok(Some(_)) => {}
-                    Ok(None) => return true,
-                    Err(_) => return false,
-                }
-            }
-        });
+        serve_clients(&mut clients, args.mark.as_deref());
     }
+}
+
+/// Speak the real handshake to whoever connected: read until a `Hello`,
+/// answer `Welcome`, mark a `Lock`, answer a `WindowList` with an empty
+/// list, and drop clients that go away.
+fn serve_clients(clients: &mut Vec<nitro_wire::server::ClientStream>, mark_path: Option<&Path>) {
+    clients.retain_mut(|c| {
+        if c.read().is_err() {
+            return false;
+        }
+        loop {
+            match c.next_msg() {
+                Ok(Some(nitro_wire::msg::ClientMsg::Hello(_))) => {
+                    let _ = c.welcome("stub_child", nitro_wire::types::caps::SHELL);
+                    let _ = c.flush();
+                }
+                Ok(Some(nitro_wire::msg::ClientMsg::Lock(_))) => {
+                    if let Some(m) = mark_path {
+                        mark(m, "lock");
+                    }
+                }
+                Ok(Some(nitro_wire::msg::ClientMsg::WindowList(_))) => {
+                    let _ = c.send(&nitro_wire::msg::ServerMsg::WindowListEnd(
+                        nitro_wire::msg::WindowListEnd,
+                    ));
+                    let _ = c.flush();
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => return true,
+                Err(_) => return false,
+            }
+        }
+    });
 }

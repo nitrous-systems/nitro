@@ -143,6 +143,12 @@ const MAX_BUTTON_W: f32 = 180.0;
 /// Longest window label, in characters, before it is elided with `…`.
 const MAX_LABEL_CHARS: usize = 22;
 
+/// The hotkey id of Super+L, the lock chord.
+pub const HOTKEY_LOCK: u32 = 1;
+
+/// X11 keysym for `l`, bound with Super for the lock chord.
+const XK_L: u32 = 0x6c;
+
 /// The `hey`-addressable names of the bar's six sections.
 pub mod names {
     /// The launcher button.
@@ -303,6 +309,8 @@ pub struct Bar {
     ticks: u64,
     /// How many times the launcher button has been pressed.
     launcher_presses: u64,
+    /// How many times Super+L has fired, for the tests.
+    lock_presses: u64,
     /// How many sensor polls have run, for the idle test.
     polls: u64,
     /// How long between sensor polls; [`POLL_MS`] outside the tests.
@@ -333,6 +341,7 @@ impl Bar {
             clock_text: String::new(),
             ticks: 0,
             launcher_presses: 0,
+            lock_presses: 0,
             polls: 0,
             poll_ms: POLL_MS,
             source: Box::new(read_sensors),
@@ -453,6 +462,12 @@ impl Bar {
     #[must_use]
     pub fn launcher_presses(&self) -> u64 {
         self.launcher_presses
+    }
+
+    /// How many times the Super+L lock chord has fired.
+    #[must_use]
+    pub fn lock_presses(&self) -> u64 {
+        self.lock_presses
     }
 
     /// How many windows the list currently holds.
@@ -871,6 +886,19 @@ fn install(ui: &mut Ui<Bar>, ids: Ids) {
             // window in it arrived as an ordinary `Window` and was
             // upserted. Keying on it would be a second code path that has
             // to agree with the first.
+            // Super+L. Handled on the press, and the handler does not
+            // commit: the server withholds keys from everyone else until
+            // this client's next commit or 50 ms (docs/shell.md, "A
+            // binding buys its client a turn"). Either is fine here, since
+            // the lock takes the keyboard for the lock screen anyway. The
+            // request blocks the bar for one socket round trip plus the
+            // session's lock exchange with the server (~ms).
+            ShellEvent::HotKey { id, pressed: true } if *id == HOTKEY_LOCK => {
+                s.lock_presses += 1;
+                if let Err(e) = quick::lock_from_hotkey(s) {
+                    eprintln!("nitro-bar: lock: {e}");
+                }
+            }
             ShellEvent::WindowListEnd | ShellEvent::HotKey { .. } | ShellEvent::Overview { .. } => {
             }
         }
@@ -900,6 +928,12 @@ fn install(ui: &mut Ui<Bar>, ids: Ids) {
         }
         if let Err(e) = ui.outputs() {
             eprintln!("nitro-bar: outputs: {e}");
+        }
+        // Super+L locks. Not fatal either: the menu's Lock button is the
+        // other way in. While locked the server ignores shell bindings,
+        // so this cannot fire over the lock screen.
+        if let Err(e) = ui.bind_key(HOTKEY_LOCK, nitro_ui::shell::mod_mask::SUPER, XK_L) {
+            eprintln!("nitro-bar: bind Super+L: {e}");
         }
     }
 

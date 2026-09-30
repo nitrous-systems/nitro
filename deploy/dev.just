@@ -158,8 +158,19 @@ _deploy-bins-unit:
     # applications (audio → nitro-amp, video → nitro-video), read by
     # nitro-files only under XDG_CURRENT_DESKTOP=nitro and below the
     # user's own ~/.config/mimeapps.list, which is never touched.
+    just box={{box}} _deploy-pam
     ssh {{box}} 'mkdir -p ~/.local/share/applications'
     rsync -az deploy/*.desktop deploy/nitro-mimeapps.list {{box}}:.local/share/applications/
+
+# The lock screen's PAM service. Installed only when absent, the same
+# never-overwrite rule as `just install`: a box whose admin edited
+# /etc/pam.d/nitro-lock keeps the edit. Without the file PAM falls back
+# to `other`, which on Debian/Ubuntu is deny-all, so the lock screen
+# could not unlock. Part of the deployed set (docs/testbox.md).
+_deploy-pam:
+    ssh {{box}} 'mkdir -p ~/nitro-stage'
+    rsync -az deploy/pam.d/nitro-lock {{box}}:nitro-stage/nitro-lock
+    ssh {{box}} 'test -e /etc/pam.d/nitro-lock && echo "keeping existing /etc/pam.d/nitro-lock" || sudo install -Dm644 ~/nitro-stage/nitro-lock /etc/pam.d/nitro-lock'
 
 # testhost2: the session runs from /usr/local/bin (root-owned), so the
 # binaries are staged in ~/nitro-stage and `sudo install`ed; the
@@ -171,6 +182,7 @@ _deploy-bins-gdm:
     cd target/release && rsync -az {{box_bins}} {{box}}:nitro-stage/
     cd target/release/examples && rsync -az {{box_examples}} planes_probe {{box}}:nitro-bin/
     ssh {{box}} 'cd ~/nitro-stage && sudo install -m 755 {{box_bins}} {{box_bindir}}/'
+    just box={{box}} _deploy-pam
     rsync -az deploy/*.desktop deploy/nitro-mimeapps.list {{box}}:nitro-stage/
     ssh {{box}} 'sudo install -d /usr/local/share/applications && sudo install -m 644 ~/nitro-stage/*.desktop ~/nitro-stage/nitro-mimeapps.list /usr/local/share/applications/'
 
