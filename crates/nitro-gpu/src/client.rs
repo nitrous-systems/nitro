@@ -61,12 +61,18 @@ impl Conn {
         self.sock.send_all(&mut self.w)
     }
 
-    /// One non-blocking read into the frame buffer.
+    /// One non-blocking read into the frame buffer. Returns the bytes
+    /// read, 0 when nothing was readable. Fewer than
+    /// [`nitro_wire::io::RECV_CHUNK`] means the socket is drained (or the
+    /// read stopped at a descriptor boundary; a level-triggered poll wakes
+    /// again for the rest).
     ///
     /// # Errors
     /// [`nitro_wire::Error::Closed`] when the helper is gone, or an errno.
-    pub fn read(&mut self) -> Result<(), nitro_wire::Error> {
-        self.sock.recv_into(&mut self.framer).map(|_| ())
+    pub fn read(&mut self) -> Result<usize, nitro_wire::Error> {
+        self.sock
+            .recv_into(&mut self.framer)
+            .map(|n| n.unwrap_or(0))
     }
 
     /// The next buffered reply, if a whole one has arrived.

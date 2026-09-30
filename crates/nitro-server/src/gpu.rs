@@ -368,6 +368,11 @@ pub struct Helper {
     pub info: Option<DeviceInfo>,
     backoff: Backoff,
     timer: OwnedFd,
+    /// The deadline the timer is set for, if any. [`Helper::arm`] only
+    /// moves it earlier (#3947): a later deadline is picked up when the
+    /// earlier one fires and `on_timer` re-arms, so a frame per vsync
+    /// costs no `timerfd_settime`.
+    armed: Option<Instant>,
     hello_at: Option<Instant>,
     respawn_at: Option<Instant>,
     /// The one output that may be in mode 2 (one ring).
@@ -446,6 +451,7 @@ impl Helper {
             info: None,
             backoff: Backoff::default(),
             timer,
+            armed: None,
             hello_at: None,
             respawn_at: None,
             owner: None,
@@ -620,8 +626,13 @@ impl Helper {
             gone = true;
         }
         loop {
+            // A short read drained the socket: decode and stop, rather
+            // than pay a `recvmsg` for the `EAGAIN` (#3947). Epoll is
+            // level-triggered, so anything left wakes the loop again.
+            let mut drained = true;
             match conn.read() {
-                Ok(()) | Err(nitro_wire::Error::Io(rustix::io::Errno::AGAIN)) => {}
+                Ok(n) => drained = n < nitro_wire::io::RECV_CHUNK,
+                Err(nitro_wire::Error::Io(rustix::io::Errno::AGAIN)) => {}
                 Err(nitro_wire::Error::Closed) => gone = true,
                 Err(e) => {
                     debug!("gpu helper: read: {e}");
@@ -654,7 +665,7 @@ impl Helper {
                     }
                 }
             }
-            if gone || !any {
+            if gone || !any || drained {
                 break;
             }
         }
@@ -862,6 +873,8 @@ impl Helper {
     pub fn on_timer(&mut self) -> (bool, bool) {
         let mut buf = [0u8; 8];
         let _ = rustix::io::read(&self.timer, &mut buf);
+        // It fired: nothing is set any more.
+        self.armed = None;
         let now = Instant::now();
         let respawn = self.respawn_at.is_some_and(|t| t <= now);
         if respawn {
@@ -879,16 +892,24 @@ impl Helper {
     }
 
     /// Arm the timer for the earliest deadline.
-    pub fn arm(&self) {
+    ///
+    /// Lazy (#3947): the timer is set only when the earliest deadline is
+    /// earlier than the one already set (see [`rearm`]). A timer left set
+    /// for a deadline that went away, or that moved later, fires early and
+    /// harmlessly: `on_timer` re-evaluates every deadline and re-arms.
+    pub fn arm(&mut self) {
         let hang = self.ring.in_flight.as_ref().map(|f| f.sent + HANG_TIMEOUT);
         let next = [self.hello_at, self.respawn_at, hang]
             .into_iter()
             .flatten()
             .min();
-        let value = next.map_or(Duration::ZERO, |t| {
-            t.saturating_duration_since(Instant::now())
-                .max(Duration::from_micros(1))
-        });
+        let Some(t) = rearm(self.armed, next) else {
+            return;
+        };
+        self.armed = Some(t);
+        let value = t
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_micros(1));
         let spec = rustix::time::Itimerspec {
             it_interval: rustix::time::Timespec {
                 tv_sec: 0,
@@ -905,6 +926,7 @@ impl Helper {
             &spec,
         ) {
             warn!("gpu helper timer: {e}");
+            self.armed = None;
         }
     }
 
@@ -1151,9 +1173,37 @@ pub fn inheritable_fds() -> Vec<(i32, String)> {
     out
 }
 
+/// The deadline to set the timer for, given the one it is set for
+/// (`armed`) and the earliest one wanted (`next`), or `None` to leave it.
+/// Only ever earlier: a later or vanished deadline leaves the timer to fire
+/// early, which `Helper::on_timer` treats as a re-evaluation.
+fn rearm(armed: Option<Instant>, next: Option<Instant>) -> Option<Instant> {
+    match (armed, next) {
+        (None, Some(t)) => Some(t),
+        (Some(a), Some(t)) if t < a => Some(t),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_timer_only_moves_earlier() {
+        let t0 = Instant::now();
+        let later = t0 + Duration::from_millis(250);
+        // Nothing set: set it.
+        assert_eq!(rearm(None, Some(t0)), Some(t0));
+        // Nothing wanted: leave it, whatever it is.
+        assert_eq!(rearm(None, None), None);
+        assert_eq!(rearm(Some(t0), None), None);
+        // A frame per vsync pushes the hang deadline later: no syscall.
+        assert_eq!(rearm(Some(t0), Some(later)), None);
+        assert_eq!(rearm(Some(t0), Some(t0)), None);
+        // A respawn or `Hello` deadline earlier than the hang one: set it.
+        assert_eq!(rearm(Some(later), Some(t0)), Some(t0));
+    }
 
     #[test]
     fn backoff_doubles_caps_and_gives_up() {

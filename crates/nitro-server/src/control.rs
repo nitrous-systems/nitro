@@ -103,6 +103,9 @@ pub struct Client {
     output: Vec<u8>,
     /// How much of `output` has been written.
     written: usize,
+    /// Whether the socket is registered for `OUT` as well as `IN`, so the
+    /// server modifies epoll only when that changes (#3947).
+    pub out_armed: bool,
 }
 
 impl Client {
@@ -117,6 +120,7 @@ impl Client {
             input: Vec::new(),
             output: Vec::new(),
             written: 0,
+            out_armed: false,
         })
     }
 

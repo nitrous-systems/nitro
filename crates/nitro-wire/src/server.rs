@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use crate::codec::{FdQueue, Writer};
 use crate::error::{DecodeError, Error};
 use crate::framing::Framer;
-use crate::io::{self, Socket};
+use crate::io::{self, RECV_CHUNK, Socket};
 use crate::msg::{self, ClientMsg, Hello, ServerMsg, Welcome};
 use crate::types::ErrorCode;
 use crate::{MAX_PENDING_FDS, VERSION};
@@ -268,6 +268,15 @@ impl ClientStream {
                 return Err(Error::Decode(DecodeError::UnexpectedFd));
             }
             match self.socket.recv_into(&mut self.framer) {
+                // A short read means the socket is drained (or stopped at
+                // an `SCM_RIGHTS` boundary): stop instead of paying one
+                // more `recvmsg` for the `EAGAIN` (#3947). The caller's
+                // epoll is level-triggered, so anything left, a hangup
+                // included, wakes it again.
+                Ok(Some(n)) if n < RECV_CHUNK => {
+                    total += n;
+                    break;
+                }
                 Ok(Some(n)) => total += n,
                 Ok(None) => break,
                 Err(Error::Closed) => self.closed = true,

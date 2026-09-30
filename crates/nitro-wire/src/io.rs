@@ -46,7 +46,7 @@ const _: () = assert!(MAX_FDS <= 16, "CMSG_SPACE must cover MAX_FDS");
 /// Bytes pulled off the socket in one `recvmsg`. Big enough that a typical
 /// burst of mutations arrives in one syscall, small enough to live in the
 /// connection struct.
-const RECV_CHUNK: usize = 64 * 1024;
+pub const RECV_CHUNK: usize = 64 * 1024;
 
 /// How long a TCP connection may sit idle before the kernel probes it.
 ///

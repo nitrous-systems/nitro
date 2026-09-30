@@ -250,6 +250,12 @@ pub struct WireClient {
     /// They share the node id space, so `CreateNode` may not reuse one;
     /// which of them are live is `share::Shares`' business.
     pub imports: HashSet<NodeId>,
+    /// Whether the socket is registered for `OUT` as well as `IN`. It is
+    /// added with `IN` alone at accept; `Server::arm_wire_client` calls
+    /// `epoll_ctl` only when this has to change (#3947), because every
+    /// settle arms every client and an unconditional modify was ~30
+    /// syscalls per frame.
+    pub out_armed: bool,
 }
 
 impl WireClient {
@@ -272,6 +278,7 @@ impl WireClient {
             last_mods: None,
             peer_uid: None,
             imports: HashSet::new(),
+            out_armed: false,
         }
     }
 

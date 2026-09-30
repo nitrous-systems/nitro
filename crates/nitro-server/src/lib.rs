@@ -1226,6 +1226,21 @@ struct Server {
     events: Vec<Event>,
     input_events: Vec<InputEvent>,
     paint_items: Vec<nitro_scene::PaintItem>,
+    /// Scratch for `plan_planes` and `paint_gpu`, kept so a plan per frame
+    /// does not allocate (#3947). Each is taken with `mem::take`, used
+    /// and put back empty-but-allocated.
+    plan: PlanScratch,
+}
+
+/// Reusable buffers for the per-frame plane plan and helper frame.
+#[derive(Default)]
+struct PlanScratch {
+    items: Vec<nitro_scene::PaintItem>,
+    cands: Vec<planes::Candidate>,
+    kms_of: HashMap<BufferKey, nitro_kms::BufferId>,
+    gpu_nodes: Vec<nitro_scene::NodeKey>,
+    gpu_last: Vec<(nitro_scene::NodeKey, BufferKey, nitro_core::IRect)>,
+    layers_in: Vec<gpu::Layer>,
 }
 
 /// Run the server until `quit`, SIGTERM or SIGINT.
@@ -1562,6 +1577,7 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         events: Vec::new(),
         input_events: Vec::new(),
         paint_items: Vec::new(),
+        plan: PlanScratch::default(),
     };
     server.register_backend()?;
     // The deferral timer stays in the epoll set for the whole run. It is
@@ -1662,6 +1678,32 @@ fn is_popup_op(msg: &ClientMsg) -> bool {
         msg,
         ClientMsg::CreatePopup(_) | ClientMsg::RepositionPopup(_)
     )
+}
+
+/// Register `OUT` interest on a wire client's socket exactly while it has
+/// queued bytes, calling `epoll_ctl` only when that changes (#3947).
+/// A failed modify leaves the flag as it was, so the next call retries.
+fn arm_wire(epoll: &OwnedFd, token: u64, client: &mut WireClient) {
+    let want = client.stream.has_pending_writes();
+    let Some(flags) = rearm_interest(client.out_armed, want) else {
+        return;
+    };
+    match epoll::modify(epoll, client.stream.as_fd(), EventData::new_u64(token), flags) {
+        Ok(()) => client.out_armed = want,
+        Err(e) => warn!("epoll_ctl mod wire client: {e}"),
+    }
+}
+
+/// The epoll flags to switch to when `OUT` interest should be `want` and
+/// currently is `armed`, or `None` when nothing has to change.
+fn rearm_interest(armed: bool, want: bool) -> Option<EventFlags> {
+    if armed == want {
+        None
+    } else if want {
+        Some(EventFlags::IN | EventFlags::OUT)
+    } else {
+        Some(EventFlags::IN)
+    }
 }
 
 fn add(epoll: &OwnedFd, fd: &impl AsFd, token: u64) -> Result<(), Error> {
@@ -6597,19 +6639,20 @@ impl Server {
             }
         }
         if keep {
-            let want = if client.has_pending_output() {
-                EventFlags::IN | EventFlags::OUT
-            } else {
-                EventFlags::IN
-            };
-            if let Err(e) = epoll::modify(
-                &self.epoll,
-                client.stream(),
-                EventData::new_u64(token),
-                want,
-            ) {
-                warn!("epoll_ctl mod client: {e}");
-                keep = false;
+            let want = client.has_pending_output();
+            if let Some(flags) = rearm_interest(client.out_armed, want) {
+                match epoll::modify(
+                    &self.epoll,
+                    client.stream(),
+                    EventData::new_u64(token),
+                    flags,
+                ) {
+                    Ok(()) => client.out_armed = want,
+                    Err(e) => {
+                        warn!("epoll_ctl mod client: {e}");
+                        keep = false;
+                    }
+                }
             }
         }
         if keep {
@@ -8855,13 +8898,23 @@ impl Server {
     /// Push queued bytes at every client, dropping the ones whose socket
     /// has gone.
     fn flush_wire_clients(&mut self) {
-        let tokens: Vec<u64> = self.wire_clients.keys().copied().collect();
-        for token in tokens {
-            if self.flush_wire_client(token) {
-                self.arm_wire_client(token);
+        let mut dead: Vec<u64> = Vec::new();
+        for (&token, client) in &mut self.wire_clients {
+            let ok = match client.stream.flush() {
+                Ok(_) => true,
+                Err(e) => {
+                    debug!("wire client {}: write: {e}", client.id.0);
+                    false
+                }
+            };
+            if ok {
+                arm_wire(&self.epoll, token, client);
             } else {
-                self.disconnect(token, None);
+                dead.push(token);
             }
+        }
+        for token in dead {
+            self.disconnect(token, None);
         }
     }
 
@@ -8882,21 +8935,8 @@ impl Server {
     /// Ask for `OUT` only while bytes are queued: an idle client that is
     /// merely connected must not make the loop spin.
     fn arm_wire_client(&mut self, token: u64) {
-        let Some(client) = self.wire_clients.get(&token) else {
-            return;
-        };
-        let want = if client.stream.has_pending_writes() {
-            EventFlags::IN | EventFlags::OUT
-        } else {
-            EventFlags::IN
-        };
-        if let Err(e) = epoll::modify(
-            &self.epoll,
-            client.stream.as_fd(),
-            EventData::new_u64(token),
-            want,
-        ) {
-            warn!("epoll_ctl mod wire client: {e}");
+        if let Some(client) = self.wire_clients.get_mut(&token) {
+            arm_wire(&self.epoll, token, client);
         }
     }
 
@@ -10691,23 +10731,27 @@ impl Server {
     /// imported dma-buf), opaque, axis-aligned, at full opacity. Each says
     /// whether anything painted above it — or the software cursor —
     /// touches its visible rect.
-    fn plane_candidates(&self, index: usize, out: &mut Vec<planes::Candidate>) {
+    fn plane_candidates(&self, index: usize, sc: &mut PlanScratch) {
         use nitro_scene::PaintKind;
         let o = &self.outputs[index];
         let Some((orect, _)) = self.scene.output_info(o.scene_id) else {
             return;
         };
-        let kms_of: HashMap<BufferKey, nitro_kms::BufferId> = self
-            .wire_clients
-            .values()
-            .flat_map(|c| c.buffers.values())
-            .filter_map(|h| Some((h.key, h.scanout?)))
-            .collect();
+        let kms_of = &mut sc.kms_of;
+        kms_of.clear();
+        kms_of.extend(
+            self.wire_clients
+                .values()
+                .flat_map(|c| c.buffers.values())
+                .filter_map(|h| Some((h.key, h.scanout?))),
+        );
         if kms_of.is_empty() {
             return;
         }
-        let mut items = Vec::new();
-        self.scene.paint_list(o.scene_id, &orect, &mut items);
+        let items = &mut sc.items;
+        items.clear();
+        self.scene.paint_list(o.scene_id, &orect, items);
+        let out = &mut sc.cands;
         let cs = self.cursor_state(o.scene_id);
         let cursor = cs.visible.then(|| {
             Cursor::rect_scaled(cs.x, cs.y, cs.shape, cs.scale).translate(orect.x, orect.y)
@@ -10772,25 +10816,29 @@ impl Server {
         if o.plane_info.is_empty() || !o.lit || !self.active {
             return;
         }
-        let mut cands = Vec::new();
-        self.plane_candidates(index, &mut cands);
-        let (gpu_nodes, helper) = self.gpu_inputs(index);
+        let mut sc = std::mem::take(&mut self.plan);
+        sc.cands.clear();
+        self.plane_candidates(index, &mut sc);
+        let helper = self.gpu_inputs(index, &mut sc);
+        let (cands, gpu_nodes) = (&sc.cands, &sc.gpu_nodes);
         let now = monotonic_ns();
         let o = &mut self.outputs[index];
         let id = o.kms_id;
         let inp = planes::Inputs {
-            candidates: &cands,
+            candidates: cands,
             planes: &o.plane_info,
             size: (o.width, o.height),
             alpha: self.backend.scanout_alpha(id),
-            gpu: &gpu_nodes,
+            gpu: gpu_nodes,
             helper,
         };
         let backend = &mut self.backend;
         let d = o
             .planner
             .decide(&inp, now, &mut |a| backend.test_layout(id, a).ok());
-        if !gpu_nodes.is_empty() || self.gpu.owner == Some(id) {
+        let want = !gpu_nodes.is_empty() || self.gpu.owner == Some(id);
+        self.plan = sc;
+        if want {
             self.gpu_want(index, &d);
         }
         self.apply_decision(index, d);
@@ -10926,8 +10974,7 @@ impl Server {
 
     /// Remember the framebuffers output `index`'s committed layout reads.
     fn note_on_kms(&mut self, index: usize) {
-        let ids: Vec<nitro_kms::BufferId> = self.outputs[index].decision.buffers().collect();
-        self.on_kms.extend(ids);
+        self.on_kms.extend(self.outputs[index].decision.buffers());
     }
 
     /// Framebuffers the display stopped reading: send the `BufferReleased`s
@@ -12891,6 +12938,19 @@ impl Server {
     /// Helper texture sources for server-allocated scanout buffers
     /// (`export_buffer`), made on first sight.
     fn gpu_export_scanouts(&mut self) {
+        // Every plan calls this; almost always nothing is new, and that
+        // answer needs no allocation.
+        let missing = |h: &clients::HeldBuffer| {
+            !h.dmabuf && h.scanout.is_some() && !self.gpu.sources.contains_key(&h.key)
+        };
+        if !self
+            .wire_clients
+            .values()
+            .flat_map(|c| c.buffers.values())
+            .any(missing)
+        {
+            return;
+        }
         let want: Vec<(BufferKey, nitro_kms::BufferId)> = self
             .wire_clients
             .values()
@@ -12945,7 +13005,12 @@ impl Server {
     /// Visible Surfaces on output `index` the helper could composite,
     /// bottom to top: a dma-buf (a client's, or an exported scanout
     /// buffer) the helper samples, opaque, axis-aligned, fully opaque.
-    fn gpu_layers(&self, index: usize, out: &mut Vec<gpu::Layer>) {
+    fn gpu_layers(
+        &self,
+        index: usize,
+        items: &mut Vec<nitro_scene::PaintItem>,
+        out: &mut Vec<gpu::Layer>,
+    ) {
         use nitro_scene::PaintKind;
         if self.gpu.sources.is_empty() {
             return;
@@ -12954,9 +13019,9 @@ impl Server {
         let Some((orect, _)) = self.scene.output_info(o.scene_id) else {
             return;
         };
-        let mut items = Vec::new();
-        self.scene.paint_list(o.scene_id, &orect, &mut items);
-        for item in &items {
+        items.clear();
+        self.scene.paint_list(o.scene_id, &orect, items);
+        for item in items.iter() {
             let (PaintKind::Surface { size, .. } | PaintKind::Hole { size }) = item.kind else {
                 continue;
             };
@@ -13082,12 +13147,14 @@ impl Server {
         // Damage: the raster, and every helper layer that changed or
         // moved (both where it is and where it was).
         let o = &self.outputs[index];
-        let now: Vec<(nitro_scene::NodeKey, BufferKey, nitro_core::IRect)> = o
-            .gpu_layers
-            .iter()
-            .filter(|l| o.decision.gpu.contains(&l.node))
-            .map(|l| (l.node, l.key, l.dst))
-            .collect();
+        let mut now = std::mem::take(&mut self.plan.gpu_last);
+        now.clear();
+        now.extend(
+            o.gpu_layers
+                .iter()
+                .filter(|l| o.decision.gpu.contains(&l.node))
+                .map(|l| (l.node, l.key, l.dst)),
+        );
         let mut damage = Damage::new();
         for r in &rasterize {
             damage.add(*r);
@@ -13109,6 +13176,7 @@ impl Server {
             && let Some(shown) = self.gpu.ring.shown
             && let Some(fb) = self.gpu.ring.slots.get(shown).map(|s| s.fb)
         {
+            self.plan.gpu_last = now;
             let o = &mut self.outputs[index];
             o.decision.layout[0].source = nitro_kms::PlaneSource::Buffer(fb);
             let (id, layout) = (o.kms_id, o.decision.layout.clone());
@@ -13120,12 +13188,14 @@ impl Server {
             return self.outputs[index].planes_dirty && self.flip_planes(index);
         }
         let upload = gpu_rects(&rasterize, bounds);
-        let layers_in: Vec<gpu::Layer> = o
-            .gpu_layers
-            .iter()
-            .filter(|l| o.decision.gpu.contains(&l.node))
-            .copied()
-            .collect();
+        let mut layers_in = std::mem::take(&mut self.plan.layers_in);
+        layers_in.clear();
+        layers_in.extend(
+            o.gpu_layers
+                .iter()
+                .filter(|l| o.decision.gpu.contains(&l.node))
+                .copied(),
+        );
         let poll = EpollPoll(&self.epoll);
         let mut layers = Vec::with_capacity(layers_in.len() + 1);
         let mut keys = Vec::with_capacity(layers_in.len());
@@ -13141,6 +13211,7 @@ impl Server {
             });
             keys.push(l.key);
         }
+        self.plan.layers_in = layers_in;
         layers.push(nitro_gpu::proto::Layer {
             tex: shadow_id,
             src: [0.0, 0.0, bounds.w as f32, bounds.h as f32],
@@ -13159,19 +13230,21 @@ impl Server {
             );
         }
         let serial = self.gpu.serial();
+        let damage_px = frame::region_area(&damage);
         let sent = self.gpu.send(
             &poll,
             TOK_GPU,
             &nitro_gpu::ToHelper::Composite(nitro_gpu::proto::Composite {
                 serial,
                 out_idx: slot as u32,
-                damage: damage.clone(),
+                damage,
                 layers,
                 fence_mask: 0,
             }),
             Vec::new(),
         );
         if !sent {
+            self.plan.gpu_last = now;
             return false;
         }
         self.gpu.borrows.add(serial, keys);
@@ -13185,7 +13258,8 @@ impl Server {
         });
         self.gpu.arm();
         let o = &mut self.outputs[index];
-        o.gpu_last = now;
+        // The old list becomes next frame's scratch.
+        self.plan.gpu_last = std::mem::replace(&mut o.gpu_last, now);
         o.gpu_submitted(serial);
         // The means are per-frame work: a composite that rasterized
         // nothing (steady video under the helper) counts as 0, so the
@@ -13205,7 +13279,6 @@ impl Server {
             self.stats.blit_px.push(0);
         }
 
-        let damage_px = frame::region_area(&damage);
         self.stats.damage_px.push(damage_px);
         self.stats.damage_log.push(damage_px);
         true
@@ -13267,17 +13340,15 @@ impl Server {
     /// Output `index`'s helper inputs for the planner, and whether it
     /// wants the helper at all. Starts it (on demand) or prepares the
     /// output's resources (first entry) as needed.
-    fn gpu_inputs(
-        &mut self,
-        index: usize,
-    ) -> (Vec<nitro_scene::NodeKey>, Option<nitro_kms::BufferId>) {
+    fn gpu_inputs(&mut self, index: usize, sc: &mut PlanScratch) -> Option<nitro_kms::BufferId> {
         let id = self.outputs[index].kms_id;
+        sc.gpu_nodes.clear();
         if !self.gpu.enabled()
             || self.outputs[index].shadow.is_none()
             || self.gpu.owner.is_some_and(|o| o != id)
         {
             self.outputs[index].gpu_layers.clear();
-            return (Vec::new(), None);
+            return None;
         }
         if self.gpu.owner == Some(id)
             && self.gpu.ring.size != (self.outputs[index].width, self.outputs[index].height)
@@ -13286,18 +13357,18 @@ impl Server {
             self.gpu_drop_owner(false, false);
         }
         self.gpu_export_scanouts();
-        let mut layers = Vec::new();
-        self.gpu_layers(index, &mut layers);
-        let nodes = layers.iter().map(|l| l.node).collect();
+        let mut layers = std::mem::take(&mut self.outputs[index].gpu_layers);
+        layers.clear();
+        self.gpu_layers(index, &mut sc.items, &mut layers);
+        sc.gpu_nodes.extend(layers.iter().map(|l| l.node));
         self.outputs[index].gpu_layers = layers;
         let in_fence = self.outputs[index]
             .plane_info
             .iter()
             .any(|p| p.kind == nitro_kms::PlaneKind::Primary && p.in_fence);
         let ring = &self.gpu.ring;
-        let helper = (in_fence && self.gpu.ready() && self.gpu.owner == Some(id) && ring.ready())
-            .then(|| ring.slots[ring.shown.unwrap_or(0)].fb);
-        (nodes, helper)
+        (in_fence && self.gpu.ready() && self.gpu.owner == Some(id) && ring.ready())
+            .then(|| ring.slots[ring.shown.unwrap_or(0)].fb)
     }
 
     /// After a decision without the helper: does output `index` want it?
@@ -13353,6 +13424,17 @@ mod tests {
 
     /// 60 Hz, the rate every interval below is measured against.
     const HZ60: u32 = 16_666_667;
+
+    #[test]
+    fn epoll_interest_changes_only_on_a_flip() {
+        assert_eq!(rearm_interest(false, false), None);
+        assert_eq!(rearm_interest(true, true), None);
+        assert_eq!(
+            rearm_interest(false, true),
+            Some(EventFlags::IN | EventFlags::OUT)
+        );
+        assert_eq!(rearm_interest(true, false), Some(EventFlags::IN));
+    }
 
     #[test]
     fn flip_stats_track_intervals() {
