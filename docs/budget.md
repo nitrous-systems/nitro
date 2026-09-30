@@ -1798,7 +1798,8 @@ byte-identical, other binaries byte-identical.
 - **Helper:** unchanged (it already had `PremulOver` and AR24 sampling).
 - **What it buys** (testhost2, Chromium CSD window, `chromium-bench
   dmabuf`): server paint 2.7–3.0 ms → **0 ms** (`planes_mode 2`), server
-  CPU over the scroll 24–33 % → **7 %** of a core; the window's buffers
+  CPU over the scroll 24–33 % → **7 %** of a core (box1: 2.1 ms → 0,
+  21 % → 6 %); the window's buffers
   are X-tiled AR24 instead of linear. See `docs/chromium.md`.
 
 ## Client dma-bufs (#3918)

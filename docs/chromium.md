@@ -550,6 +550,17 @@ server CPU over the scroll:
 | **dmabuf, helper on** (X-tiled AR24) | 61.0–61.4 | 19.6–20.8 ms | **0.00 ms** | **7 %** | **2** | 68–69 MB | 529–541 MB | 62–66 % |
 | dmabuf, `gpu.helper = off` (linear AR24, CPU blend) | 61.4–61.6 | 23.9–25.0 ms (p50 24.5–25.0) | 2.71–2.96 ms | 24–33 % | 0 | 71 MB | 532–533 MB | 62–87 % |
 
+**box1** (HSW GT1, hasvk), 1920×1080, scale 1, same bench:
+
+| arm | fps | server i2p mean | server paint mean | server CPU | planes_mode | GPU proc PSS | tree PSS | chrome CPU |
+|---|---|---|---|---|---|---|---|---|
+| **dmabuf, helper on** | 61.2–61.4 | 23.8–24.6 ms | **0.00 ms** | **6 %** | **2** | 101 MB | 542–544 MB | 59–60 % |
+| dmabuf, `gpu.helper = off` | 61.6 | 24.5–24.6 ms | 2.08–2.09 ms | 21 % | 0 | 100–102 MB | 544–545 MB | 56–57 % |
+
+On box1 the server CPU falls from 21 % to 6 % and server paint to 0. i2p
+does not move: the scroll is input-bound, and box1 had not been
+blend-bound. The HSW GT1 GPU keeps up at 61 fps.
+
 **Reading:**
 
 - **The window really is tiled.** The kernel's framebuffer list during
