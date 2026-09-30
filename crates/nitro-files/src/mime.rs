@@ -38,12 +38,15 @@ pub use nitro_fs::mime::{Glob, builtin_type, icon_for, load_globs2, parse_globs2
 /// binary.
 #[derive(Debug, Clone)]
 pub struct Assoc {
-    /// `mimeapps.list` files, most important first.
-    mimeapps: Vec<PathBuf>,
-    /// `mimeinfo.cache` files, most important first.
-    caches: Vec<PathBuf>,
-    /// Directories holding `.desktop` files, most important first.
+    /// Directories that may hold a `mimeapps.list`, most important
+    /// first: the config roots, then each data root's `applications`.
+    lists: Vec<PathBuf>,
+    /// Directories holding `.desktop` files (and a `mimeinfo.cache`),
+    /// most important first.
     apps: Vec<PathBuf>,
+    /// `$XDG_CURRENT_DESKTOP`, lowercased and split on `:`; each names a
+    /// `{desktop}-mimeapps.list` read before a directory's plain one.
+    desktops: Vec<String>,
 }
 
 impl Assoc {
@@ -72,6 +75,9 @@ impl Assoc {
             config_home.chain(config_dirs).collect(),
             data_home.chain(data_dirs).collect(),
         )
+        .with_desktops(desktops(
+            std::env::var("XDG_CURRENT_DESKTOP").ok().as_deref(),
+        ))
     }
 
     /// The association files under the given roots, most important
@@ -84,10 +90,6 @@ impl Assoc {
     /// `/usr/share/applications`.
     #[must_use]
     pub fn at(config_dirs: Vec<PathBuf>, data_dirs: Vec<PathBuf>) -> Assoc {
-        let mut mimeapps: Vec<PathBuf> = config_dirs
-            .into_iter()
-            .map(|d| d.join("mimeapps.list"))
-            .collect();
         let apps: Vec<PathBuf> = data_dirs
             .into_iter()
             .map(|d| d.join("applications"))
@@ -95,20 +97,55 @@ impl Assoc {
         // The data directories carry a `mimeapps.list` too, ranked below
         // every config one: it is where a distribution states its
         // defaults, and a user's `~/.config` must outrank it.
-        mimeapps.extend(apps.iter().map(|d| d.join("mimeapps.list")));
+        let mut lists = config_dirs;
+        lists.extend(apps.iter().cloned());
         Assoc {
-            mimeapps,
-            caches: apps.iter().map(|d| d.join("mimeinfo.cache")).collect(),
+            lists,
             apps,
+            desktops: Vec::new(),
         }
+    }
+
+    /// The same roots, with the desktop names whose
+    /// `{desktop}-mimeapps.list` files count (lowercase, most important
+    /// first — `$XDG_CURRENT_DESKTOP`'s order).
+    ///
+    /// Within each directory the spec reads every desktop-specific list
+    /// before the plain `mimeapps.list`. So `nitro-mimeapps.list`, which
+    /// `just install` puts in a *data* directory, states nitro's
+    /// defaults above the distribution's `mimeapps.list` beside it and
+    /// every package cache, yet below anything in the user's
+    /// `~/.config`.
+    #[must_use]
+    pub fn with_desktops(mut self, desktops: Vec<String>) -> Assoc {
+        self.desktops = desktops;
+        self
+    }
+
+    /// Every `mimeapps.list` path, most important first.
+    fn mimeapps(&self) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for dir in &self.lists {
+            for d in &self.desktops {
+                out.push(dir.join(format!("{d}-mimeapps.list")));
+            }
+            out.push(dir.join("mimeapps.list"));
+        }
+        out
     }
 
     /// The `.desktop` id registered for `mime`, in the spec's order.
     ///
     /// Every `mimeapps.list`'s `[Default Applications]` first — that is
-    /// the user's explicit choice, or the distribution's — then every
-    /// list's `[Added Associations]`, then the `mimeinfo.cache` files,
-    /// which are what a package's own `MimeType=` key ends up in. An id
+    /// the user's explicit choice, or the desktop's or distribution's —
+    /// then every list's `[Added Associations]`, then, per
+    /// `applications` directory in priority order, that directory's
+    /// `mimeinfo.cache` followed by the `MimeType=` keys of its
+    /// `.desktop` files. The cache is only ever what those keys said
+    /// when `update-desktop-database` last ran; reading the keys too
+    /// means a `.desktop` file copied into `~/.local/share/applications`
+    /// without regenerating the cache still outranks `/usr/share`, as
+    /// the directory order says it should. An id
     /// named in a `[Removed Associations]` group is skipped wherever it
     /// would otherwise have been found.
     ///
@@ -125,7 +162,7 @@ impl Assoc {
     /// resolves to a file that exists is [`Assoc::argv_for`]'s question.
     #[must_use]
     pub fn handler_for(&self, mime: &str) -> Option<String> {
-        let lists: Vec<Ini> = self.mimeapps.iter().map(|p| Ini::read(p)).collect();
+        let lists: Vec<Ini> = self.mimeapps().iter().map(|p| Ini::read(p)).collect();
         let removed: Vec<&str> = lists
             .iter()
             .flat_map(|l| l.values("Removed Associations", mime))
@@ -140,11 +177,15 @@ impl Assoc {
         pick("Default Applications")
             .or_else(|| pick("Added Associations"))
             .or_else(|| {
-                self.caches.iter().map(|p| Ini::read(p)).find_map(|cache| {
+                self.apps.iter().find_map(|dir| {
+                    let cache = Ini::read(&dir.join("mimeinfo.cache"));
                     cache
                         .values("MIME Cache", mime)
                         .find(|id| !removed.contains(id))
                         .map(str::to_owned)
+                        .or_else(|| {
+                            declared_in(dir, mime).find(|id| !removed.contains(&id.as_str()))
+                        })
                 })
             })
     }
@@ -266,6 +307,46 @@ pub fn editor_argv(term: &str, path: &Path, editor: Option<&str>) -> Vec<String>
         editor.to_owned(),
         path.to_string_lossy().into_owned(),
     ]
+}
+
+/// The ids of the `.desktop` files directly in `dir` whose
+/// `[Desktop Entry]` `MimeType=` lists `mime`, in file-name order.
+///
+/// What `update-desktop-database` would have written to the directory's
+/// `mimeinfo.cache`. Read on every open that gets this far, uncached,
+/// for the reason [`Assoc`] gives; an `applications` directory holds a
+/// few hundred small files at most. Subdirectories are not walked: the
+/// cache step covers the rare vendor-prefixed entry that lives in one.
+fn declared_in(dir: &Path, mime: &str) -> impl Iterator<Item = String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.ends_with(".desktop"))
+        .collect();
+    names.sort();
+    let mime = mime.to_owned();
+    let dir = dir.to_owned();
+    names.into_iter().filter(move |n| {
+        Ini::read(&dir.join(n))
+            .values("Desktop Entry", "MimeType")
+            .any(|m| m == mime)
+    })
+}
+
+/// `$XDG_CURRENT_DESKTOP` as the list [`Assoc::with_desktops`] takes:
+/// split on `:`, lowercased (the spec's file names are lowercase), empty
+/// parts dropped.
+#[must_use]
+pub fn desktops(value: Option<&str>) -> Vec<String> {
+    value
+        .unwrap_or_default()
+        .split(':')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
 }
 
 /// An environment variable as a path, if set and not empty.
@@ -629,5 +710,145 @@ mod tests {
         assert_eq!(ini.values("B", "k").collect::<Vec<_>>(), vec!["3"]);
         assert_eq!(ini.values("A", "empty").count(), 0);
         assert_eq!(ini.values("C", "k").count(), 0);
+    }
+
+    #[test]
+    fn a_desktop_files_mime_type_counts_with_no_cache() {
+        let dir = scratch("scan");
+        write(
+            &dir.join("data/applications/b-player.desktop"),
+            "[Desktop Entry]\nName=B\nExec=b\nMimeType=audio/ogg;audio/mpeg;\n",
+        );
+        write(
+            &dir.join("data/applications/a-player.desktop"),
+            "[Desktop Entry]\nName=A\nExec=a\nMimeType=audio/mpeg;\n\
+             [Desktop Action x]\nMimeType=audio/ogg;\n",
+        );
+        let assoc = assoc_fixture(&dir);
+        // Only `[Desktop Entry]`'s key counts, and file-name order breaks
+        // a tie.
+        assert_eq!(
+            assoc.handler_for("audio/ogg").as_deref(),
+            Some("b-player.desktop")
+        );
+        assert_eq!(
+            assoc.handler_for("audio/mpeg").as_deref(),
+            Some("a-player.desktop")
+        );
+        assert_eq!(assoc.handler_for("video/mp4"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_user_desktop_file_outranks_a_system_cache() {
+        let dir = scratch("scan-order");
+        write(
+            &dir.join("user/applications/nitro-amp.desktop"),
+            "[Desktop Entry]\nName=amp\nExec=nitro-amp %F\nMimeType=audio/ogg;\n",
+        );
+        write(
+            &dir.join("system/applications/mimeinfo.cache"),
+            "[MIME Cache]\naudio/ogg=totem.desktop;\n",
+        );
+        let assoc = Assoc::at(vec![], vec![dir.join("user"), dir.join("system")]);
+        assert_eq!(
+            assoc.handler_for("audio/ogg").as_deref(),
+            Some("nitro-amp.desktop")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn within_one_directory_the_cache_comes_before_the_scan() {
+        let dir = scratch("cache-first");
+        write(
+            &dir.join("data/applications/mimeinfo.cache"),
+            "[MIME Cache]\naudio/ogg=cached.desktop;\n",
+        );
+        write(
+            &dir.join("data/applications/aaa.desktop"),
+            "[Desktop Entry]\nName=A\nExec=a\nMimeType=audio/ogg;\n",
+        );
+        let assoc = assoc_fixture(&dir);
+        assert_eq!(
+            assoc.handler_for("audio/ogg").as_deref(),
+            Some("cached.desktop")
+        );
+        // A removed cache entry falls through to the scan.
+        write(
+            &dir.join("config/mimeapps.list"),
+            "[Removed Associations]\naudio/ogg=cached.desktop\n",
+        );
+        assert_eq!(
+            assoc.handler_for("audio/ogg").as_deref(),
+            Some("aaa.desktop")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_desktop_list_counts_only_on_that_desktop_and_below_the_users() {
+        let dir = scratch("desktop-list");
+        write(
+            &dir.join("data/applications/nitro-mimeapps.list"),
+            "[Default Applications]\naudio/ogg=nitro-amp.desktop\n",
+        );
+        write(
+            &dir.join("data/applications/mimeapps.list"),
+            "[Default Applications]\naudio/ogg=distro.desktop\n",
+        );
+        let plain = assoc_fixture(&dir);
+        assert_eq!(
+            plain.handler_for("audio/ogg").as_deref(),
+            Some("distro.desktop")
+        );
+        let nitro = assoc_fixture(&dir).with_desktops(desktops(Some("Nitro:GNOME")));
+        assert_eq!(
+            nitro.handler_for("audio/ogg").as_deref(),
+            Some("nitro-amp.desktop")
+        );
+        // The user's own list still wins.
+        write(
+            &dir.join("config/mimeapps.list"),
+            "[Default Applications]\naudio/ogg=mine.desktop\n",
+        );
+        assert_eq!(
+            nitro.handler_for("audio/ogg").as_deref(),
+            Some("mine.desktop")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn current_desktop_splits_and_lowercases() {
+        assert_eq!(desktops(Some("nitro:GNOME")), vec!["nitro", "gnome"]);
+        assert_eq!(desktops(Some(" : ")), Vec::<String>::new());
+        assert_eq!(desktops(None), Vec::<String>::new());
+    }
+
+    #[test]
+    fn an_ogg_opens_in_the_player_that_declares_audio_ogg() {
+        let dir = scratch("open-ogg");
+        write(
+            &dir.join("data/applications/nitro-amp.desktop"),
+            "[Desktop Entry]\nName=amp\nExec=nitro-amp %F\nMimeType=audio/ogg;\n",
+        );
+        write(
+            &dir.join("data/applications/nitro-video.desktop"),
+            "[Desktop Entry]\nName=video\nExec=nitro-video %f\nMimeType=video/x-theora+ogg;\n",
+        );
+        let globs = parse_globs2(
+            "50:audio/ogg:*.ogg\n50:video/ogg:*.ogg\n50:video/x-theora+ogg:*.ogg\n",
+        );
+        let file = dir.join("song.ogg");
+        write(&file, "");
+        assert_eq!(
+            open_with(&file, &globs, &assoc_fixture(&dir), "nitro-term"),
+            Open::Argv(vec![
+                "nitro-amp".to_owned(),
+                file.to_string_lossy().into_owned()
+            ])
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -558,12 +558,15 @@ behaviours:
   path
    └─ extension  ─► dir/mime: type_of
         ├─ /usr/share/mime/globs2       (system table; highest weight wins,
-        │                                ties broken by the longer suffix)
+        │                                then the longer suffix, then the
+        │                                rule first in the file)
         └─ builtin table                (only when globs2 has no rule)
    └─ MIME type ─► Assoc::handler_for
         ├─ every mimeapps.list [Default Applications]
         ├─ every mimeapps.list [Added Associations]
-        └─ every mimeinfo.cache [MIME Cache]
+        │    (per directory, $desktop-mimeapps.list before mimeapps.list)
+        └─ per applications dir, in priority order:
+             mimeinfo.cache [MIME Cache], then the dir's *.desktop MimeType=
            …skipping any id named in [Removed Associations]
    └─ .desktop id ─► Assoc::argv_for
         └─ nitro_launcher::desktop::parse  → argv, with the path appended
@@ -588,6 +591,10 @@ notes" and "does nothing". Within `globs2` the highest weight wins and a
 tie goes to the **longer** extension, so `.tar.gz` is compressed tar
 rather than plain gzip when both rules carry the default weight of 50
 (`the_system_table_outranks_the_builtin_one_and_the_longest_suffix_wins`).
+A tie in both goes to the rule **first in the file**, which is where
+shared-mime-info puts the canonical type: `*.ogg` is listed as
+`audio/ogg`, `video/ogg`, … `video/x-theora+ogg`, and a song must not
+open in the video player (`a_full_tie_goes_to_the_rule_first_in_the_file`).
 
 The `globs2` reader keeps only the `*.ext` shape of rule. `Makefile`,
 `*README*` and `core.[0-9]*` are skipped, because matching them means
@@ -608,7 +615,29 @@ Associations are searched most-important-first —
 `$XDG_DATA_HOME` and `$XDG_DATA_DIRS` — which is the opposite of the
 order `nitro_launcher::desktop::search_dirs` returns, for a reason: the
 launcher's scan overwrites as it walks and therefore wants the winner
-last, while this walks until it finds an answer and stops. One
+last, while this walks until it finds an answer and stops.
+
+Two additions make nitro's own players the default out of the box:
+
+* **The `.desktop` files' `MimeType=` is read directly**, per
+  `applications` directory, right after that directory's `mimeinfo.cache`
+  (in file-name order). The cache is only what `update-desktop-database`
+  last wrote, and nothing runs it when `just deploy` copies
+  `nitro-amp.desktop` into `~/.local/share/applications` — so without the
+  scan the entry was invisible and `/usr/share`'s cache (totem, vlc) won,
+  or nothing opened. With it, a user or `/usr/local` entry outranks the
+  distribution's cache as the directory order says it should.
+* **`$desktop-mimeapps.list`**, from the mime-apps spec: in each directory
+  the lists named after `$XDG_CURRENT_DESKTOP`'s entries (lowercased) are
+  read before the plain `mimeapps.list`. `nitro-session` gives every piece
+  `XDG_CURRENT_DESKTOP=nitro` (prepending `nitro:` to an inherited value),
+  and `deploy/nitro-mimeapps.list` — installed into the data
+  `applications` directory next to the entries — maps audio to
+  `nitro-amp.desktop` and video to `nitro-video.desktop`. Being in a data
+  directory it ranks below every config list, so a choice in the user's
+  `~/.config/mimeapps.list` still wins; that file is never written.
+
+One
 simplification is taken and stated: a `[Removed Associations]` entry is
 treated as **global**, where the spec scopes it to the files below the
 one that states it. The visible difference is only the case where two
@@ -1395,7 +1424,10 @@ integration tests (`event`). `DEPENDENCIES.md` carries the rows.
 * `src/mime.rs` unit-tests the handler resolution against fixture
   directories: `[Default Applications]` over
   `[Added Associations]` over `mimeinfo.cache`, a config list outranking
-  a system one, a removal skipped wherever it is offered, an id resolving
+  a system one, a `.desktop` file's `MimeType=` found with no cache, a user
+  entry outranking a system cache, the cache before the scan within one
+  directory, `nitro-mimeapps.list` honoured only under the `nitro` desktop
+  and below the user's list, an `.ogg` opening in the audio player, a removal skipped wherever it is offered, an id resolving
   to an argv with the path appended, an unlaunchable entry falling
   through, the `text/*` editor fallback with `$EDITOR` handed in, and a
   non-text file with no handler opening nothing.

@@ -1,0 +1,43 @@
+# nitro's default applications, per the freedesktop mime-apps spec.
+#
+# Installed next to the .desktop files (`~/.local/share/applications`
+# on box1, `/usr/local/share/applications` on testhost2 and for
+# `just install`). A file manager reads it only when XDG_CURRENT_DESKTOP
+# names `nitro`, which nitro-session sees to for every piece it starts.
+# It ranks below the user's own ~/.config/mimeapps.list, so a choice
+# made there still wins; this file never touches that one.
+#
+# Keep the keys in step with the MimeType= of deploy/nitro-amp.desktop
+# and deploy/nitro-video.desktop.
+[Default Applications]
+audio/mpeg=nitro-amp.desktop
+audio/flac=nitro-amp.desktop
+audio/x-flac=nitro-amp.desktop
+audio/ogg=nitro-amp.desktop
+audio/x-vorbis+ogg=nitro-amp.desktop
+audio/x-opus+ogg=nitro-amp.desktop
+audio/x-flac+ogg=nitro-amp.desktop
+audio/opus=nitro-amp.desktop
+audio/x-wav=nitro-amp.desktop
+audio/wav=nitro-amp.desktop
+audio/vnd.wave=nitro-amp.desktop
+audio/mp4=nitro-amp.desktop
+audio/x-m4a=nitro-amp.desktop
+audio/m4a=nitro-amp.desktop
+audio/aac=nitro-amp.desktop
+audio/x-aiff=nitro-amp.desktop
+audio/x-ms-wma=nitro-amp.desktop
+audio/x-mpegurl=nitro-amp.desktop
+audio/mpegurl=nitro-amp.desktop
+application/vnd.apple.mpegurl=nitro-amp.desktop
+audio/x-scpls=nitro-amp.desktop
+video/mp4=nitro-video.desktop
+video/x-m4v=nitro-video.desktop
+video/x-matroska=nitro-video.desktop
+video/webm=nitro-video.desktop
+video/quicktime=nitro-video.desktop
+video/ogg=nitro-video.desktop
+video/x-theora+ogg=nitro-video.desktop
+video/x-msvideo=nitro-video.desktop
+video/vnd.avi=nitro-video.desktop
+video/mpeg=nitro-video.desktop

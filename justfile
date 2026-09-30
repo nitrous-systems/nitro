@@ -114,13 +114,16 @@ install-bins:
 # binaries without entries are harmless. See the long comment in
 # `deploy-bins` (deploy/dev.just). The glob does not include
 # deploy/chromium/chromium-nitro.desktop; install-chromium installs that.
-[doc("Install deploy/*.desktop into $DESTDIR$DATADIR/applications (after install-bins)")]
+# deploy/nitro-mimeapps.list (audio → nitro-amp, video → nitro-video,
+# honoured under XDG_CURRENT_DESKTOP=nitro) goes next to the entries; a
+# user's ~/.config/mimeapps.list still outranks it and is never touched.
+[doc("Install deploy/*.desktop and nitro-mimeapps.list into $DESTDIR$DATADIR/applications (after install-bins)")]
 install-desktop:
     #!/usr/bin/env bash
     set -euo pipefail
     {{_asroot}}
     asroot_for '{{DESTDIR}}{{DATADIR}}'
-    for f in deploy/*.desktop; do
+    for f in deploy/*.desktop deploy/nitro-mimeapps.list; do
         "${SU[@]}" install -Dm644 "$f" '{{DESTDIR}}{{DATADIR}}/applications/'"$(basename "$f")"
     done
 
@@ -217,7 +220,7 @@ uninstall:
     for b in {{install_bins}} chromium-nitro; do
         "${su_bin[@]}" rm -f '{{DESTDIR}}{{BINDIR}}'"/$b"
     done
-    for f in deploy/*.desktop deploy/chromium/chromium-nitro.desktop; do
+    for f in deploy/*.desktop deploy/nitro-mimeapps.list deploy/chromium/chromium-nitro.desktop; do
         "${su_data[@]}" rm -f '{{DESTDIR}}{{DATADIR}}/applications/'"$(basename "$f")"
     done
     for n in 16 24 48 64 128 256; do

@@ -94,12 +94,18 @@ pub fn builtin_type(name: &str) -> Option<&'static str> {
         // Audio and video.
         "mp3" => "audio/mpeg",
         "flac" => "audio/flac",
-        "ogg" => "audio/ogg",
+        "ogg" | "oga" => "audio/ogg",
         "wav" => "audio/x-wav",
         "opus" => "audio/opus",
-        "mp4" => "video/mp4",
+        "m4a" => "audio/mp4",
+        "aac" => "audio/aac",
+        "m3u" | "m3u8" => "audio/x-mpegurl",
+        "pls" => "audio/x-scpls",
+        "mp4" | "m4v" => "video/mp4",
         "mkv" => "video/x-matroska",
         "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "avi" => "video/x-msvideo",
         _ => return None,
     };
     Some(mime)
@@ -224,6 +230,10 @@ fn ends_with_dot_ext(name: &str, ext: &str) -> bool {
 /// system table the highest weight wins, and a tie is broken by the
 /// **longer** extension, so a `.tar.gz` is gzip-compressed-tar rather
 /// than plain gzip when both rules carry the default weight of 50.
+/// A tie in both goes to the rule **first in the file**: shared-mime-info
+/// writes the canonical type first, so `*.ogg` is `audio/ogg` rather
+/// than the `video/x-theora+ogg` listed after it, and `*.m3u` is
+/// `audio/x-mpegurl` rather than `application/vnd.apple.mpegurl`.
 ///
 /// **This is called once per file per listing** (`dir::read_dir`), not
 /// once per file the user opens, which is what [`ends_with_dot_ext`] is
@@ -231,10 +241,15 @@ fn ends_with_dot_ext(name: &str, ext: &str) -> bool {
 #[must_use]
 pub fn type_of(path: &Path, globs: &[Glob]) -> Option<String> {
     let name = path.file_name()?.to_string_lossy().to_ascii_lowercase();
+    // Not `max_by_key`: that returns the *last* of equal maxima, and the
+    // first is the one shared-mime-info means.
     let best = globs
         .iter()
         .filter(|g| ends_with_dot_ext(&name, &g.ext))
-        .max_by_key(|g| (g.weight, g.ext.len()));
+        .fold(None::<&Glob>, |best, g| match best {
+            Some(b) if (b.weight, b.ext.len()) >= (g.weight, g.ext.len()) => Some(b),
+            _ => Some(g),
+        });
     if let Some(g) = best {
         return Some(g.mime.clone());
     }
@@ -530,6 +545,10 @@ mod tests {
         assert_eq!(builtin_type("book.pdf"), Some("application/pdf"));
         assert_eq!(builtin_type("song.flac"), Some("audio/flac"));
         assert_eq!(builtin_type("clip.mkv"), Some("video/x-matroska"));
+        assert_eq!(builtin_type("track.m4a"), Some("audio/mp4"));
+        assert_eq!(builtin_type("mix.m3u8"), Some("audio/x-mpegurl"));
+        assert_eq!(builtin_type("radio.pls"), Some("audio/x-scpls"));
+        assert_eq!(builtin_type("film.mov"), Some("video/quicktime"));
         // Case-insensitively: a camera writes `.JPG`.
         assert_eq!(builtin_type("DSC_0001.JPG"), Some("image/jpeg"));
         // The last extension is the one that counts.
@@ -602,6 +621,29 @@ mod tests {
         // a hidden file called `gz`, not a gzip archive.
         assert_eq!(type_of(Path::new("/a/.gz"), &table), None);
         assert_eq!(type_of(Path::new("/a/unknown.qqq"), &table), None);
+    }
+
+    #[test]
+    fn a_full_tie_goes_to_the_rule_first_in_the_file() {
+        // The real table's order: the canonical type first, the
+        // subclasses after it at the same weight.
+        let table = parse_globs2(
+            "50:audio/ogg:*.ogg\n\
+             50:video/ogg:*.ogg\n\
+             50:video/x-theora+ogg:*.ogg\n\
+             50:audio/x-mpegurl:*.m3u\n\
+             50:application/vnd.apple.mpegurl:*.m3u\n\
+             60:audio/x-nitro:*.m3u\n",
+        );
+        assert_eq!(
+            type_of(Path::new("/a/song.ogg"), &table).as_deref(),
+            Some("audio/ogg")
+        );
+        // A higher weight still beats file order.
+        assert_eq!(
+            type_of(Path::new("/a/mix.m3u"), &table).as_deref(),
+            Some("audio/x-nitro")
+        );
     }
 
     #[test]

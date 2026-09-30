@@ -153,8 +153,13 @@ _deploy-bins-unit:
     # together; installing the files from this recipe while an older
     # `nitro-session` is deployed is the one way to get the old failure
     # back.
+    #
+    # `deploy/nitro-mimeapps.list` rides along: nitro's default
+    # applications (audio → nitro-amp, video → nitro-video), read by
+    # nitro-files only under XDG_CURRENT_DESKTOP=nitro and below the
+    # user's own ~/.config/mimeapps.list, which is never touched.
     ssh {{box}} 'mkdir -p ~/.local/share/applications'
-    rsync -az deploy/*.desktop {{box}}:.local/share/applications/
+    rsync -az deploy/*.desktop deploy/nitro-mimeapps.list {{box}}:.local/share/applications/
 
 # testhost2: the session runs from /usr/local/bin (root-owned), so the
 # binaries are staged in ~/nitro-stage and `sudo install`ed; the
@@ -166,8 +171,8 @@ _deploy-bins-gdm:
     cd target/release && rsync -az {{box_bins}} {{box}}:nitro-stage/
     cd target/release/examples && rsync -az {{box_examples}} planes_probe {{box}}:nitro-bin/
     ssh {{box}} 'cd ~/nitro-stage && sudo install -m 755 {{box_bins}} {{box_bindir}}/'
-    rsync -az deploy/*.desktop {{box}}:nitro-stage/
-    ssh {{box}} 'sudo install -d /usr/local/share/applications && sudo install -m 644 ~/nitro-stage/*.desktop /usr/local/share/applications/'
+    rsync -az deploy/*.desktop deploy/nitro-mimeapps.list {{box}}:nitro-stage/
+    ssh {{box}} 'sudo install -d /usr/local/share/applications && sudo install -m 644 ~/nitro-stage/*.desktop ~/nitro-stage/nitro-mimeapps.list /usr/local/share/applications/'
 
 # Chromium on nitro (#3865). `chromium_out` and `chromium_files` are
 # defined in the root justfile, because `install-chromium` uses them too.

@@ -47,7 +47,7 @@ the shell does not expand `~`.
 |---|---|
 | `install` | `install-bins` then `install-desktop` |
 | `install-bins` | `cargo build --release`, then the shipped binaries into `$BINDIR` |
-| `install-desktop` | `deploy/*.desktop` into `$DATADIR/applications` |
+| `install-desktop` | `deploy/*.desktop` and `deploy/nitro-mimeapps.list` into `$DATADIR/applications` |
 | `install-chromium` | optional, see below |
 | `install-apparmor` | optional, see below |
 | `uninstall` | removes all of the above except the AppArmor profile |
@@ -66,6 +66,11 @@ say `Exec=nitro-term`, and why `install-desktop` runs after `install-bins`:
 an entry installed next to a `nitro-session` older than #3723 breaks
 launching from the launcher. The long comment on `deploy-bins`
 (`deploy/dev.just`) has the details.
+
+`nitro-mimeapps.list` makes nitro-amp and nitro-video the default audio
+and video handlers under `XDG_CURRENT_DESKTOP=nitro` (which nitro-session
+sets for its children). It ranks below a user's `~/.config/mimeapps.list`,
+which the install never touches (`docs/files.md`).
 
 ## Starting the session
 

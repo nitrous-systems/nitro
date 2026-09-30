@@ -580,8 +580,8 @@ client that speaks its four-message socket protocol, hosted by
     readable must be removed (`Ui::remove_fd`) or drained.
 
     Opening a file **reuses the launcher rather than copying it**:
-    extension → `globs2`/built-in table → `mimeapps.list` then
-    `mimeinfo.cache` → `.desktop` → `nitro_launcher::desktop::parse` →
+    extension → `globs2`/built-in table → `mimeapps.list` (with
+    `nitro-mimeapps.list`) then `mimeinfo.cache`/`MimeType=` → `.desktop` → `nitro_launcher::desktop::parse` →
     `nitro_launcher::spawn`. That path already detaches the child into
     its own process group, sends its stdio to `/dev/null`, **drops
     `NITRO_SHELL_SOCKET`** from its environment and reaps through a

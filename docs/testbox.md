@@ -165,7 +165,10 @@ state. A worker who restores the box "as found" must leave the four
 `.desktop` files in place: they are `deploy/nitro-{calc,files,settings,
 term}.desktop` from this repository, they are re-written by every
 `just deploy`, and deleting them is not tidying up — it is undeploying
-half the desktop's icons.
+half the desktop's icons. `nitro-mimeapps.list` sits beside them (on
+testhost2 in `/usr/local/share/applications`) and is part of the set too:
+it is what makes nitro-files open audio in nitro-amp and video in
+nitro-video.
 
 They matter because of #3715: the server resolves an `app_id` it cannot
 find in the icon theme through `<app_id>.desktop`'s `Icon=`, so

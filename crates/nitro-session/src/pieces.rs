@@ -185,6 +185,36 @@ pub fn path_with_bin_dir(dir: Option<&Path>, path: Option<&str>) -> Option<Strin
     Some(format!("{dir}:{path}"))
 }
 
+/// The `XDG_CURRENT_DESKTOP` every piece should see, given the one the
+/// session inherited; `None` when it already names `nitro`.
+///
+/// The mime-apps spec keys desktop defaults on this variable: a file
+/// manager reads `nitro-mimeapps.list` (which `just install` ships, and
+/// which maps audio to `nitro-amp` and video to `nitro-video`) only when
+/// `nitro` is in the list. Unset or empty becomes `nitro`; a value a
+/// display manager set from somebody else's session file (`GNOME`) gets
+/// `nitro` **prepended**, since this session is the desktop actually
+/// running and the other name is still worth honouring after it. The
+/// match is case-insensitive, as the spec's file names are lowercase.
+///
+/// A pure function so the rule is testable; the caller passes it to
+/// `Command::env` rather than `set_var`, which is unsafe in a threaded
+/// process.
+#[must_use]
+pub fn current_desktop(inherited: Option<&str>) -> Option<String> {
+    let inherited = inherited.map(str::trim).unwrap_or_default();
+    if inherited.is_empty() {
+        return Some("nitro".to_owned());
+    }
+    if inherited
+        .split(':')
+        .any(|d| d.trim().eq_ignore_ascii_case("nitro"))
+    {
+        return None;
+    }
+    Some(format!("nitro:{inherited}"))
+}
+
 /// Whether `path` is a regular file with an execute bit set.
 ///
 /// The check is deliberately "could this be executed" and not "does this
@@ -321,5 +351,17 @@ mod tests {
             path_with_bin_dir(Some(Path::new("/usr/bin")), Some("/bin:/usr/bin")).as_deref(),
             Some("/usr/bin:/bin:/usr/bin")
         );
+    }
+
+    #[test]
+    fn the_current_desktop_always_names_nitro_first_unless_it_already_does() {
+        assert_eq!(current_desktop(None).as_deref(), Some("nitro"));
+        assert_eq!(current_desktop(Some("")).as_deref(), Some("nitro"));
+        assert_eq!(
+            current_desktop(Some("GNOME")).as_deref(),
+            Some("nitro:GNOME")
+        );
+        assert_eq!(current_desktop(Some("nitro")), None);
+        assert_eq!(current_desktop(Some("GNOME:Nitro")), None);
     }
 }

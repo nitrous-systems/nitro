@@ -166,6 +166,14 @@ impl Child {
         {
             cmd.env("PATH", path);
         }
+        // Names this desktop for the mime-apps spec, so a file manager
+        // started under it honours `nitro-mimeapps.list`; see
+        // [`crate::pieces::current_desktop`].
+        if let Some(desktop) =
+            crate::pieces::current_desktop(std::env::var("XDG_CURRENT_DESKTOP").ok().as_deref())
+        {
+            cmd.env("XDG_CURRENT_DESKTOP", desktop);
+        }
         if role == Role::Server {
             // The compositor's tty; see the module docs.
             cmd.stdin(Stdio::inherit());

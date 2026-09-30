@@ -10,5 +10,5 @@ Icon=play-fill
 Terminal=false
 StartupWMClass=nitro-video
 Categories=AudioVideo;Video;Player;
-MimeType=video/mp4;video/x-matroska;video/webm;video/quicktime;
+MimeType=video/mp4;video/x-m4v;video/x-matroska;video/webm;video/quicktime;video/ogg;video/x-theora+ogg;video/x-msvideo;video/vnd.avi;video/mpeg;
 Keywords=video;movie;player;mp4;
