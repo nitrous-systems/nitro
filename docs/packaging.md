@@ -8,7 +8,7 @@
 | `just dist-deb-ubuntu` | `ubuntu:rolling` (`DIST_UBUNTU`) | `dist/out/ubuntu/nitro_<ver>_amd64.deb` |
 | `just dist-deb-debian` | `debian:stable` (`DIST_DEBIAN`) | `dist/out/debian/nitro_<ver>_amd64.deb` |
 | `just dist-arch` | `archlinux:latest` (`DIST_ARCH`) | `dist/out/arch/nitro-<ver>-1-x86_64.pkg.tar.zst` |
-| `just dist-alpine` | `alpine:latest` (`DIST_ALPINE`) | `dist/out/alpine/build/x86_64/nitro-<ver>-r0.apk` and the signing key `dist/out/alpine/*.rsa.pub` |
+| `just dist-alpine` | `alpine:latest` (`DIST_ALPINE`) | `dist/out/alpine/builder/x86_64/nitro-<ver>-r0.apk` and the signing key `dist/out/alpine/*.rsa.pub` |
 | `just dist-all` | | all of the above |
 | `just dist-test-<distro>`, `dist-test-all` | the same image, fresh | installs the package and smoke-tests it |
 | `just dist-src` | | `dist/out/src/nitro-<ver>.tar.gz` (git archive) |
