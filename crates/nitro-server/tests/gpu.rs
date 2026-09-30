@@ -28,7 +28,9 @@ use nitro_server::gpu::Spawner;
 use nitro_server::{BackendKind, Config, config::GpuHelper, run};
 use nitro_wire::client::Connection;
 use nitro_wire::msg::{CreateDmabufBuffer, DmabufPlane, PresentSurface, ServerMsg};
-use nitro_wire::types::{BufferId, ColorMatrix, ColorRange, Layer, NodeId, caps, format, modifier};
+use nitro_wire::types::{
+    BufferId, ColorMatrix, ColorRange, Layer, NodeId, caps, dmabuf_flags, format, modifier,
+};
 
 const OUT: (u32, u32) = (320, 240);
 const SIDE: u32 = 64;
@@ -80,6 +82,11 @@ struct Harness {
 
 impl Harness {
     fn start(name: &str, mode: GpuHelper, auto_signal: bool) -> Self {
+        Self::start_opts(name, mode, auto_signal, false)
+    }
+
+    /// `tiled_ar24`: the fake helper also samples an X-tiled AR24.
+    fn start_opts(name: &str, mode: GpuHelper, auto_signal: bool, tiled_ar24: bool) -> Self {
         let dir = std::env::temp_dir().join(format!("nitro-gpu-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("nitro").join("control.sock");
@@ -96,6 +103,7 @@ impl Harness {
         } else {
             FakeGpu::new()
         };
+        fake.state().sample_tiled_ar24 = tiled_ar24;
         let socks: Arc<Mutex<Vec<OwnedFd>>> = Arc::default();
         let (f, s) = (fake.clone(), Arc::clone(&socks));
         config.gpu_spawner = Some(Spawner(Arc::new(move |fd: OwnedFd| {
@@ -529,6 +537,15 @@ impl Scene {
         presented(&mut self.conn, &mut self.seen, s);
     }
 
+    /// `step_a` until `until`.
+    fn play_a(&mut self, what: &str, mut until: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !until() {
+            assert!(Instant::now() < deadline, "timed out playing until {what}");
+            self.step_a();
+        }
+    }
+
     fn released(&mut self, id: BufferId) -> bool {
         let _ = self.conn.poll(&mut self.seen);
         self.seen
@@ -680,5 +697,164 @@ fn leaving_mode_2_for_a_plane_waits_out_the_hysteresis_and_repaints_fully() {
         "a full repaint on leaving: {:?}",
         &v[v.len() - new..]
     );
+    h.quit();
+}
+
+// ------------------------------------------------ translucent Surfaces (#3952)
+
+/// A window holding one SIDE×SIDE AR24 dma-buf Surface at (8, 8) with
+/// `modifier`, its opaque region inset by 4 px (a CSD window's body; the
+/// ring is its rounded corners and shadow), presented once.
+fn translucent(h: &Harness, name: &str, m: u64) -> Scene {
+    let mut conn = Connection::connect(&h.wire_path, name).expect("wire connect");
+    conn.client_caps(caps::SURFACE | caps::RELEASE | caps::DMABUF | caps::OPAQUE_REGION)
+        .unwrap();
+    let mut seen = Vec::new();
+    let s = SIDE as f32;
+    let inner = SIDE.cast_signed() - 8;
+    conn.tx()
+        .create_window(ROOT, name, Size::new(160.0, 120.0), Layer::Normal)
+        .create_surface(A, ROOT, Rect::new(8.0, 8.0, s, s))
+        .opaque_region(A, vec![IRect::new(4, 4, inner, inner)])
+        .commit(1)
+        .unwrap();
+    conn.flush().unwrap();
+    presented(&mut conn, &mut seen, 1);
+    let a: Vec<Dma> = (0..3).map(|i| Dma::new(10 + i)).collect();
+    for d in &a {
+        let mut c = d.create();
+        c.format = format::AR24;
+        c.modifier = m;
+        conn.create_dmabuf_buffer(c).unwrap();
+    }
+    conn.commit(2).unwrap();
+    conn.flush().unwrap();
+    presented(&mut conn, &mut seen, 2);
+    Scene {
+        conn,
+        seen,
+        a,
+        b: Vec::new(),
+        serial: 3,
+    }
+}
+
+/// The last composite's layers: (opaque area, premul area) of the client
+/// layers under and over the shadow, and whether every opaque one is
+/// under it and every translucent one over it.
+fn split(h: &Harness) -> (i64, i64, bool) {
+    use nitro_gpu::proto::Blend;
+    let layers = h.fake.state().last_layers.clone();
+    let area = |l: &nitro_gpu::proto::Layer| i64::from(l.dst.w) * i64::from(l.dst.h);
+    let full = |l: &nitro_gpu::proto::Layer| {
+        (l.dst.w, l.dst.h) == (OUT.0.cast_signed(), OUT.1.cast_signed())
+    };
+    let Some(shadow) = layers.iter().position(full) else {
+        return (0, 0, false);
+    };
+    let (below, above) = (&layers[..shadow], &layers[shadow + 1..]);
+    let ordered = below.iter().all(|l| l.blend == Blend::Opaque)
+        && above.iter().all(|l| l.blend == Blend::PremulOver);
+    (
+        below.iter().map(area).sum(),
+        above.iter().map(area).sum(),
+        ordered,
+    )
+}
+
+#[test]
+fn a_translucent_surface_is_split_around_the_shadow() {
+    let h = Harness::start("translucent", GpuHelper::On, true);
+    wait_for("the helper", || h.stat("gpu_state") == 2);
+    let mut s = translucent(&h, "translucent", modifier::LINEAR);
+    s.play_a("mode 2", || h.stat("planes_mode") == 2);
+    for _ in 0..3 {
+        s.step_a();
+    }
+    let side = i64::from(SIDE);
+    let inner = side - 8;
+    wait_for("a split composite", || {
+        let (o, _, _) = split(&h);
+        o == inner * inner
+    });
+    let (o, t, ordered) = split(&h);
+    assert!(ordered, "{:?}", h.fake.state().last_layers);
+    assert_eq!(o, inner * inner, "the opaque region under the shadow");
+    assert_eq!(t, side * side - inner * inner, "the ring over it");
+
+    // An opaque menu over the ring's top-left corner: its pixels leave
+    // the ring (the shadow has the menu there).
+    s.conn
+        .tx()
+        .create_rect(MENU, ROOT, Rect::new(0.0, 0.0, 12.0, 12.0))
+        .fill_solid(MENU, Color::WHITE)
+        .commit(s.serial)
+        .unwrap();
+    s.conn.flush().unwrap();
+    presented(&mut s.conn, &mut s.seen, s.serial);
+    s.serial += 1;
+    // The menu covers (8..12)² of A: 16 px of ring, none of the body.
+    let want = side * side - inner * inner - 16;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while split(&h).1 != want {
+        assert!(Instant::now() < deadline, "{:?}", split(&h));
+        s.step_a();
+    }
+    assert_eq!(h.stat("planes_mode"), 2);
+    h.quit();
+}
+
+fn composite_flag(d: &nitro_wire::msg::DmabufFeedback, f: u32, m: u64) -> bool {
+    d.formats
+        .iter()
+        .any(|e| e.format == f && e.modifier == m && e.flags & dmabuf_flags::COMPOSITE != 0)
+}
+
+#[test]
+fn a_tiled_ar24_is_composited_while_the_helper_is_and_the_flag_goes_with_it() {
+    let h = Harness::start_opts("tiled-ar24", GpuHelper::On, true, true);
+    wait_for("the helper", || h.stat("gpu_state") == 2);
+    let x = nitro_gpu::proto::MOD_I915_X_TILED;
+    let mut s = translucent(&h, "tiled-ar24", x);
+    let d = expect(&mut s.conn, &mut s.seen, "COMPOSITE feedback", |m| match m {
+        ServerMsg::DmabufFeedback(d) if d.id == NodeId(0) => Some(d.clone()),
+        _ => None,
+    });
+    assert!(composite_flag(&d, format::AR24, x), "{d:?}");
+    assert!(composite_flag(&d, format::AR24, modifier::LINEAR), "{d:?}");
+    s.play_a("mode 2", || h.stat("planes_mode") == 2);
+    // Before mode 2 the tiled buffer is a placeholder; in it, never
+    // (the counter is process-wide, and only this test has a tiled one).
+    let placeholders = h.stat("dmabuf_placeholder_paints");
+    for _ in 0..5 {
+        s.step_a();
+    }
+    assert_eq!(h.stat("planes_mode"), 2);
+    assert_eq!(h.stat("dmabuf_placeholder_paints"), placeholders);
+
+    // It crashes until it is given up: the flag is withdrawn and the
+    // tiled buffer falls back (a placeholder until the client
+    // reallocates).
+    for n in 1..=5 {
+        wait_for("ready", || h.stat("gpu_state") == 2);
+        for fd in h.socks.lock().unwrap().drain(..) {
+            rustix::net::shutdown(&fd, rustix::net::Shutdown::Both).unwrap();
+        }
+        wait_for("the crash", || h.stat("gpu_crashes") == n);
+    }
+    assert_eq!(h.stat("gpu_state"), 4, "given up");
+    s.seen.clear();
+    let d = expect(&mut s.conn, &mut s.seen, "feedback without COMPOSITE", |m| match m {
+        ServerMsg::DmabufFeedback(d) if d.id == NodeId(0) => Some(d.clone()),
+        _ => None,
+    });
+    assert!(
+        d.formats
+            .iter()
+            .all(|e| e.flags & dmabuf_flags::COMPOSITE == 0),
+        "{d:?}"
+    );
+    s.step_a();
+    assert_ne!(h.stat("planes_mode"), 2);
     h.quit();
 }

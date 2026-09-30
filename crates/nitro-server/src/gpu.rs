@@ -144,6 +144,9 @@ pub struct Layer {
     pub encoding: proto::ColorEncoding,
     /// YUV range.
     pub range: proto::ColorRange,
+    /// `Opaque`: under the shadow, which has a hole there. `PremulOver`
+    /// (#3952): a translucent Surface's rest, blended above the shadow.
+    pub blend: proto::Blend,
 }
 
 /// What one ring slot is doing.
@@ -372,6 +375,9 @@ pub struct Counters {
     pub import_refused: u64,
     /// Sum over frames of fence signalled − submit, µs.
     pub busy_us: u64,
+    /// Layer builds where a translucent Surface's rest overlaps a later
+    /// item that is not opaque, and so is drawn over it (#3952).
+    pub translucent_approx: u64,
 }
 
 /// The server's side of the GPU helper.
@@ -389,6 +395,11 @@ pub struct Helper {
     started: Option<Instant>,
     /// The helper's device, once `Hello` was answered.
     pub info: Option<DeviceInfo>,
+    /// The XR24/AR24 pairs it samples, from the last `Hello` (#3952):
+    /// the dma-buf feedback's `COMPOSITE` bit. Kept across an idle exit,
+    /// a VT switch and a crash backoff; cleared on a give-up and with
+    /// `gpu.helper = off`.
+    pub composite: Vec<(u32, u64)>,
     backoff: Backoff,
     timer: OwnedFd,
     /// The deadline the timer is set for, if any. [`Helper::arm`] only
@@ -474,6 +485,7 @@ impl Helper {
             child: None,
             started: None,
             info: None,
+            composite: Vec::new(),
             backoff: Backoff::default(),
             timer,
             armed: None,
@@ -985,6 +997,32 @@ impl Helper {
         if let Some(conn) = self.conn.as_ref() {
             poll.remove(conn.as_fd());
         }
+    }
+
+    /// The pairs the dma-buf feedback should flag `COMPOSITE` now: those
+    /// of the last `Hello`, unless the helper is off or given up (#3952).
+    /// Returns whether that changed, having stored it.
+    pub fn refresh_composite(&mut self) -> bool {
+        let want: Vec<(u32, u64)> = if self.mode == Mode::Off || self.state == State::GaveUp {
+            Vec::new()
+        } else if let Some(i) = &self.info {
+            let mut v: Vec<(u32, u64)> = i
+                .sampleable
+                .iter()
+                .filter(|f| f.fourcc == proto::XR24 || f.fourcc == proto::AR24)
+                .map(|f| (f.fourcc, f.modifier))
+                .collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        } else {
+            return false;
+        };
+        if want == self.composite {
+            return false;
+        }
+        self.composite = want;
+        true
     }
 
     /// Whether the helper can sample `fourcc`/`modifier`.

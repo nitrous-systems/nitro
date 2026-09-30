@@ -96,11 +96,19 @@ pub enum PaintKind {
     /// anti-aliased edge.
     ///
     /// The item's `opacity` is ignored: a Surface is treated as opaque.
-    /// A translucent Surface must therefore never be flagged on-plane —
-    /// the server's job, since it is the only one who sets the flag.
+    ///
+    /// **`opaque_only`** (#3952): the Surface's buffer carries alpha. The
+    /// server flags such a Surface only when the GPU helper draws it: its
+    /// declared opaque region under the output buffer, the rest (rounded
+    /// corners, a shadow ring) blended above it. The painter then clears
+    /// only the node's opaque region mapped to device pixels — nothing
+    /// when the Surface is not drawn 1:1 on whole pixels — and paints
+    /// nothing else, so what lies below the translucent rest is kept.
     Hole {
         /// The surface's local size; the transform places it.
         size: (f32, f32),
+        /// Clear only the opaque region: the buffer is not opaque.
+        opaque_only: bool,
     },
     /// A Surface composited on the CPU: a buffer region, with its colour
     /// metadata, stretched onto `size` local units.
@@ -169,7 +177,8 @@ impl PaintItem {
     ///   fractional edge, whose pixels are cleared whole rather than
     ///   blended. Opacity is ignored for it, as for its painting. A rotated
     ///   hole reports `None`: its `bounds` is only a bounding box, and a
-    ///   painter is free to clear less.
+    ///   painter is free to clear less. So does an `opaque_only` hole,
+    ///   which clears only part of its bounds.
     ///
     /// Anything else — rounded corners, a translucent fill or border,
     /// accumulated opacity below 1.0, rotation, a fractional edge, a scaled
@@ -181,8 +190,8 @@ impl PaintItem {
     /// than of the rect, and the sound answer is to say nothing.
     #[must_use]
     pub fn opaque_cover(&self) -> Option<IRect> {
-        if let PaintKind::Hole { .. } = self.kind {
-            return self.transform.is_axis_aligned().then_some(self.bounds);
+        if let PaintKind::Hole { opaque_only, .. } = self.kind {
+            return (self.transform.is_axis_aligned() && !opaque_only).then_some(self.bounds);
         }
         if self.opacity < 1.0 {
             return None;
@@ -516,9 +525,14 @@ impl Scene {
                         size: icon.size(),
                         role: icon.role,
                     }),
-                    NodeData::Surface(surface) if surface.on_plane => {
-                        Some(PaintKind::Hole { size })
-                    }
+                    NodeData::Surface(surface) if surface.on_plane => Some(PaintKind::Hole {
+                        size,
+                        opaque_only: surface.content.is_some_and(|c| {
+                            self.buffers
+                                .get(c.buffer)
+                                .is_some_and(|b| !b.desc.is_opaque())
+                        }),
+                    }),
                     NodeData::Surface(SurfaceData {
                         content: Some(surface),
                         ..

@@ -1379,35 +1379,70 @@ fn fill_overlaid(
 /// An image item's declared opaque region mapped to device px and clipped
 /// to where the item paints — empty unless the item is an AR24 image drawn
 /// 1:1, pixel-aligned, at opacity 1 (the only mapping under which the
-/// region's pixels land on whole device pixels unblended).
-fn opaque_region_device(scene: &Scene, item: &PaintItem) -> Vec<IRect> {
-    let (PaintKind::Image {
-        size, buffer, src, ..
-    }
-    | PaintKind::Surface {
-        size, buffer, src, ..
-    }) = item.kind
-    else {
-        return Vec::new();
-    };
+/// region's pixels land on whole device pixels unblended). For an
+/// `opaque_only` hole (#3952) the rects it clears, which the GPU helper
+/// fills with the Surface's opaque texels.
+pub(crate) fn opaque_region_device(scene: &Scene, item: &PaintItem) -> Vec<IRect> {
     let Ok(node) = scene.node(item.node) else {
         return Vec::new();
     };
     let opaque = node.opaque_region();
-    if opaque.is_empty()
-        || item.opacity < 1.0
-        || !item.shift_exact()
-        || scene
-            .buffer(buffer)
-            .map_or(true, |b| b.desc().format != format::AR24)
+    if opaque.is_empty() || item.opacity < 1.0 {
+        return Vec::new();
+    }
+    let (size, buffer, src) = match item.kind {
+        PaintKind::Image {
+            size, buffer, src, ..
+        }
+        | PaintKind::Surface {
+            size, buffer, src, ..
+        } => (size, buffer, src),
+        PaintKind::Hole {
+            size,
+            opaque_only: true,
+        } => match node.surface().and_then(|s| s.content) {
+            Some(c) => return opaque_device_rects(item, size, c.src, opaque),
+            None => return Vec::new(),
+        },
+        _ => return Vec::new(),
+    };
+    if scene
+        .buffer(buffer)
+        .map_or(true, |b| b.desc().format != format::AR24)
     {
         return Vec::new();
     }
-    let device = item
-        .transform
-        .apply_rect(&Rect::new(0.0, 0.0, size.0, size.1));
-    // `shift_exact` guarantees integer device coordinates and a 1:1 size.
-    #[allow(clippy::cast_possible_truncation)]
+    opaque_device_rects(item, size, src, opaque)
+}
+
+/// `opaque` (buffer texels) of an item drawn from `src` onto `size` local
+/// units, mapped to device px and clipped to the item's clip and bounds:
+/// empty unless the item is drawn axis-aligned, 1:1 and on whole device
+/// pixels. The painter's `opaque_only` holes and the GPU helper's layers
+/// (#3952) both use it, so they agree on every pixel.
+#[must_use]
+pub fn opaque_device_rects(
+    item: &PaintItem,
+    size: (f32, f32),
+    src: IRect,
+    opaque: &[IRect],
+) -> Vec<IRect> {
+    let t = item.transform;
+    let device = t.apply_rect(&Rect::new(0.0, 0.0, size.0, size.1));
+    // Integer-valued floats, compared exactly on purpose.
+    #[allow(clippy::cast_precision_loss, clippy::float_cmp)]
+    let exact = t.is_axis_aligned()
+        && t.a > 0.0
+        && t.d > 0.0
+        && [device.x, device.y, device.w, device.h]
+            .iter()
+            .all(|v| v.fract() == 0.0)
+        && device.w == src.w as f32
+        && device.h == src.h as f32;
+    if opaque.is_empty() || !exact {
+        return Vec::new();
+    }
+    #[allow(clippy::cast_possible_truncation)] // integers, checked above
     let (dx, dy) = (device.x as i32 - src.x, device.y as i32 - src.y);
     let bound = item.clip.intersect(&item.bounds);
     opaque
@@ -1738,11 +1773,23 @@ fn paint_item_as(
         }
     }
     match item.kind {
-        PaintKind::Hole { .. } => {
+        PaintKind::Hole {
+            opaque_only: false, ..
+        } => {
             // A store, not a blend: the scene's bounds are already the
             // device rect it promised as `opaque_cover`, and opacity is
             // ignored (Surfaces on a plane are opaque, #3898).
             canvas.clear_irect(&clip, &item.bounds);
+        }
+        PaintKind::Hole {
+            opaque_only: true, ..
+        } => {
+            // A translucent Surface the GPU helper draws (#3952): its
+            // opaque region goes under the output buffer, the rest is
+            // blended above it, so only the opaque region is cleared.
+            for r in opaque_region_device(scene, item) {
+                canvas.clear_irect(&clip, &r);
+            }
         }
         PaintKind::Rect {
             size,
@@ -3329,4 +3376,46 @@ mod overlay_tests {
             None
         );
     }
+
+    /// An `opaque_only` hole (#3952) clears exactly the node's opaque
+    /// region, mapped to device px, and keeps what is below the rest.
+    #[test]
+    fn an_opaque_only_hole_clears_just_the_opaque_region() {
+        let mut s = world(Base::Solid, 0.0);
+        let win = s.create_window(C, "csd", Size::new(40.0, 30.0), Layer::Normal);
+        s.place_window(win, Some(OUT), Point::new(10.0, 10.0)).unwrap();
+        let root = s.window_info(win).unwrap().root();
+        let desc = BufferDesc::new(40, 30, 160, format::AR24);
+        let b = s.create_buffer(C, desc, pixels(40, 30, |_, _| 0)).unwrap();
+        let n = s.create_node(C, NodeKind::Surface, root, None).unwrap();
+        s.set_bounds(C, n, Rect::new(0.0, 0.0, 40.0, 30.0)).unwrap();
+        let color = nitro_scene::SurfaceColor {
+            matrix: nitro_scene::ColorMatrix::Bt709,
+            range: nitro_scene::ColorRange::Full,
+        };
+        s.set_surface(
+            C,
+            n,
+            Some(nitro_scene::SurfaceRef::new(b, IRect::new(0, 0, 40, 30), color)),
+        )
+        .unwrap();
+        s.set_opaque_region(C, n, &[IRect::new(4, 4, 32, 22)]).unwrap();
+        s.set_surface_on_plane(n, true).unwrap();
+        let mut d = Damage::new();
+        s.update(&mut DamageSink::new(&mut [(OUT, &mut d)]));
+        let full = [IRect::new(0, 0, W as i32, H as i32)];
+        let px = painted(&s, &full, false);
+        let alpha = |x: i32, y: i32| px[((y * W as i32 + x) * 4 + 3) as usize];
+        let hole = IRect::new(14, 14, 32, 22);
+        for y in 0..H as i32 {
+            for x in 0..W as i32 {
+                if hole.contains(x, y) {
+                    assert_eq!(alpha(x, y), 0, "({x},{y}) cleared");
+                } else {
+                    assert_eq!(alpha(x, y), 255, "({x},{y}) kept");
+                }
+            }
+        }
+    }
+
 }

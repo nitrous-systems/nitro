@@ -61,6 +61,10 @@ pub struct FakeState {
     /// (the fake samples nothing). All zero means the default
     /// [`CAPTURE_COLOR`].
     pub capture_color: [u8; 4],
+    /// The layers of the last composite, bottom to top.
+    pub last_layers: Vec<Layer>,
+    /// A tiled AR24 pair among the sampleable ones (#3952).
+    pub sample_tiled_ar24: bool,
 }
 
 /// The fake's capture colour unless [`FakeState::capture_color`] is set.
@@ -133,20 +137,29 @@ impl Backend for FakeBackend {
         DeviceInfo {
             device: "fake".into(),
             driver: "fake".into(),
-            sampleable: vec![
-                lin(XR24),
-                lin(AR24),
-                lin(NV12),
-                // What a VA-API decoder and Chromium hand over (#3962).
-                FormatMod {
-                    fourcc: NV12,
-                    modifier: MOD_I915_Y_TILED,
-                },
-                FormatMod {
-                    fourcc: XR24,
-                    modifier: MOD_I915_Y_TILED,
-                },
-            ],
+            sampleable: {
+                let mut v = vec![
+                    lin(XR24),
+                    lin(AR24),
+                    lin(NV12),
+                    // What a VA-API decoder and Chromium hand over (#3962).
+                    FormatMod {
+                        fourcc: NV12,
+                        modifier: MOD_I915_Y_TILED,
+                    },
+                    FormatMod {
+                        fourcc: XR24,
+                        modifier: MOD_I915_Y_TILED,
+                    },
+                ];
+                if self.state().sample_tiled_ar24 {
+                    v.push(FormatMod {
+                        fourcc: AR24,
+                        modifier: MOD_I915_X_TILED,
+                    });
+                }
+                v
+            },
             render: vec![
                 lin(XR24),
                 FormatMod {
@@ -211,6 +224,7 @@ impl Backend for FakeBackend {
         layers: &[(&u32, Layer)],
         acquire: Vec<OwnedFd>,
     ) -> Result<OwnedFd, BackendError> {
+        self.state().last_layers = layers.iter().map(|(_, l)| *l).collect();
         self.record(Call::Composite(
             out_idx,
             clip.to_vec(),

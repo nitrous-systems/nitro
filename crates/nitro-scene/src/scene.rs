@@ -1447,8 +1447,9 @@ impl Scene {
     /// value is a no-op.
     ///
     /// Server-side only: there is no client ownership check and no wire
-    /// message. The Surface is treated as opaque, so the server must not
-    /// flag a translucent one.
+    /// message. A Surface whose buffer carries alpha paints as an
+    /// `opaque_only` hole (#3952): the server flags one only when the GPU
+    /// helper draws the translucent rest above the output buffer.
     ///
     /// # Errors
     /// [`Error::StaleKey`], [`Error::WrongKind`] on anything but a Surface.
@@ -1721,6 +1722,15 @@ impl Scene {
         // (#3899): a new buffer there changes the plane, not a pixel of the
         // output buffer, so it damages nothing.
         let on_plane = self.surface_on_plane(key);
+        // …unless what the hole clears changed (#3952): an `opaque_only`
+        // hole clears the opaque region mapped through `src`, so a new
+        // `src` or a flip between an opaque and an alpha format repaints.
+        let reshaped = on_plane && {
+            let opaque = |b: Option<(BufferKey, IRect)>| {
+                b.map(|(k, src)| (src, self.buffers.get(k).is_some_and(|b| b.desc.is_opaque())))
+            };
+            opaque(old) != opaque(new)
+        };
         if let Some((old, _)) = old
             && let Some(users) = self.buffer_users.get_mut(&old)
         {
@@ -1735,7 +1745,9 @@ impl Scene {
                 buffer.shown = true;
             }
         }
-        if on_plane {
+        if reshaped {
+            self.mark(key, Dirty::PAINT);
+        } else if on_plane {
             // Nothing to repaint.
         } else if swap && let Some((buffer, src)) = new {
             // The client promises the new buffer matches the old one outside

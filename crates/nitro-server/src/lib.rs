@@ -2936,6 +2936,13 @@ impl Server {
         // `on_flip`; on an idle output they latch at once.
         self.latch_surfaces();
         self.update_scene();
+        // What the GPU helper composites changed (a `Hello`, a give-up,
+        // `gpu.helper = off`): the dma-buf feedback's `COMPOSITE` bits
+        // did too (#3952).
+        if self.gpu.refresh_composite() {
+            self.send_default_feedback(None);
+            self.feedback.invalidate();
+        }
         self.send_surface_hints();
         // A window mapped, unmapped or moved under a stationary pointer
         // changed what the pointer is over; hit testing needs the update
@@ -10186,9 +10193,10 @@ impl Server {
 
     /// The default feedback (#3918): the union over every output.
     fn default_feedback(&self) -> Vec<nitro_wire::types::DmabufFormat> {
-        let mut all = dmabuf::feedback(&[]);
+        let c = &self.gpu.composite;
+        let mut all = dmabuf::feedback(&[], c);
         for o in &self.outputs {
-            all.extend(dmabuf::feedback(&self.backend.planes(o.kms_id)));
+            all.extend(dmabuf::feedback(&self.backend.planes(o.kms_id), c));
         }
         dmabuf::merge(all)
     }
@@ -10231,7 +10239,7 @@ impl Server {
             Vec<nitro_wire::types::DmabufFormat>,
         )> = Vec::new();
         for o in &self.outputs {
-            let f = dmabuf::feedback(&self.backend.planes(o.kms_id));
+            let f = dmabuf::feedback(&self.backend.planes(o.kms_id), &self.gpu.composite);
             per_output.push((o.scene_id, o.width, o.height, f));
         }
         let main_device = self.backend.device_id().unwrap_or(0);
@@ -10834,7 +10842,7 @@ impl Server {
             Cursor::rect_scaled(cs.x, cs.y, cs.shape, cs.scale).translate(orect.x, orect.y)
         });
         for (i, item) in items.iter().enumerate() {
-            let (PaintKind::Surface { size, .. } | PaintKind::Hole { size }) = item.kind else {
+            let (PaintKind::Surface { size, .. } | PaintKind::Hole { size, .. }) = item.kind else {
                 continue;
             };
             let t = item.transform;
@@ -13191,13 +13199,29 @@ impl Server {
 
     /// Visible Surfaces on output `index` the helper could composite,
     /// bottom to top: a dma-buf (a client's, or an exported scanout
-    /// buffer) the helper samples, opaque, axis-aligned, fully opaque.
+    /// buffer) the helper samples, axis-aligned, at opacity 1.
+    ///
+    /// An opaque buffer is one `Opaque` layer under the shadow, which has
+    /// a hole there. A premultiplied AR24 one (#3952) is split: its
+    /// declared opaque region O, when drawn 1:1 on whole pixels, is
+    /// `Opaque` layers under the shadow (the painter's `opaque_only` hole
+    /// clears exactly O, [`frame::opaque_device_rects`]); the rest R is
+    /// `PremulOver` layers above the shadow, which keeps what lies below
+    /// there. R loses whatever later items cover opaquely; a later
+    /// translucent item (a menu's soft shadow, the cursor) over R is drawn
+    /// under it instead of over it, counted in `gpu_translucent_approx`.
+    ///
+    /// A Surface's layers are contiguous in `out`; when they do not all
+    /// fit in [`nitro_gpu::proto::MAX_LAYERS`], the bottom Surfaces are
+    /// left out whole (planes or the CPU show them).
+    #[allow(clippy::too_many_lines)] // One pass over the paint list.
     fn gpu_layers(
-        &self,
+        &mut self,
         index: usize,
         items: &mut Vec<nitro_scene::PaintItem>,
         out: &mut Vec<gpu::Layer>,
     ) {
+        use nitro_gpu::proto::Blend;
         use nitro_scene::PaintKind;
         if self.gpu.sources.is_empty() {
             return;
@@ -13208,33 +13232,35 @@ impl Server {
         };
         items.clear();
         self.scene.paint_list(o.scene_id, &orect, items);
-        for item in items.iter() {
-            let (PaintKind::Surface { size, .. } | PaintKind::Hole { size }) = item.kind else {
+        let cs = self.cursor_state(o.scene_id);
+        let cursor = cs.visible.then(|| {
+            Cursor::rect_scaled(cs.x, cs.y, cs.shape, cs.scale).translate(orect.x, orect.y)
+        });
+        for (i, item) in items.iter().enumerate() {
+            let (PaintKind::Surface { size, .. } | PaintKind::Hole { size, .. }) = item.kind else {
                 continue;
             };
             let t = item.transform;
             if !t.is_axis_aligned() || t.a <= 0.0 || t.d <= 0.0 || item.opacity < 1.0 {
                 continue;
             }
-            let Some(content) = self
-                .scene
-                .node(item.node)
-                .ok()
-                .and_then(nitro_scene::Node::surface)
-                .and_then(|s| s.content)
-            else {
+            let Ok(node) = self.scene.node(item.node) else {
+                continue;
+            };
+            let Some(content) = node.surface().and_then(|s| s.content) else {
                 continue;
             };
             let Some(src) = self.gpu.sources.get(&content.buffer) else {
                 continue;
             };
+            let Ok(buffer) = self.scene.buffer(content.buffer) else {
+                continue;
+            };
+            let opaque = buffer.desc().is_opaque();
             if self.gpu.refused(content.buffer)
                 || (self.gpu.info.is_some()
                     && !self.gpu.samples(src.desc.fourcc, src.desc.modifier))
-                || !self
-                    .scene
-                    .buffer(content.buffer)
-                    .is_ok_and(|b| b.desc().is_opaque())
+                || !(opaque || (buffer.desc().format == nitro_wire::types::format::AR24 && buffer.premultiplied()))
             {
                 continue;
             }
@@ -13247,26 +13273,66 @@ impl Server {
             }
             let fx = content.src.w as f32 / dst.w as f32;
             let fy = content.src.h as f32 / dst.h as f32;
-            let s = [
-                content.src.x as f32 + (visible.x - dst.x) as f32 * fx,
-                content.src.y as f32 + (visible.y - dst.y) as f32 * fy,
-                visible.w as f32 * fx,
-                visible.h as f32 * fy,
-            ];
-            out.push(gpu::Layer {
+            let layer = |r: nitro_core::IRect, blend: Blend| gpu::Layer {
                 node: item.node,
                 key: content.buffer,
-                dst: visible.translate(-orect.x, -orect.y),
-                src: s,
+                dst: r.translate(-orect.x, -orect.y),
+                src: [
+                    content.src.x as f32 + (r.x - dst.x) as f32 * fx,
+                    content.src.y as f32 + (r.y - dst.y) as f32 * fy,
+                    r.w as f32 * fx,
+                    r.h as f32 * fy,
+                ],
                 encoding: gpu_encoding(content.color.matrix),
                 range: gpu_range(content.color.range),
+                blend,
+            };
+            if opaque {
+                out.push(layer(visible, Blend::Opaque));
+                continue;
+            }
+            let o_rects: Vec<nitro_core::IRect> =
+                frame::opaque_device_rects(item, size, content.src, node.opaque_region())
+                    .into_iter()
+                    .map(|r| r.intersect(&visible))
+                    .filter(|r| !r.is_empty())
+                    .collect();
+            let o_region = nitro_core::Region::from_rects(&o_rects);
+            // What later items hide: their opaque covers, and the opaque
+            // regions they declare (a translucent helper Surface's O, or a
+            // CPU-painted AR24 window's).
+            let mut covers = Vec::new();
+            for l in &items[i + 1..] {
+                if !l.bounds.intersects(&visible) {
+                    continue;
+                }
+                covers.extend(l.opaque_cover());
+                covers.extend(frame::opaque_region_device(&self.scene, l));
+            }
+            let rest = nitro_core::Region::rect(visible)
+                .subtract(&o_region)
+                .subtract(&nitro_core::Region::from_rects(&covers));
+            if o_region.overflowed() || rest.overflowed() {
+                continue;
+            }
+            let approx = rest.rects().iter().any(|r| {
+                items[i + 1..].iter().any(|l| l.bounds.intersects(r))
+                    || cursor.is_some_and(|c| c.intersects(r))
             });
+            if approx {
+                self.gpu.counters.translucent_approx += 1;
+            }
+            out.extend(o_region.rects().into_iter().map(|r| layer(r, Blend::Opaque)));
+            out.extend(rest.rects().into_iter().map(|r| layer(r, Blend::PremulOver)));
         }
-        // One layer is the shadow.
+        // One layer is the shadow. Whole Surfaces go, bottom first.
         let max = nitro_gpu::proto::MAX_LAYERS - 1;
-        if out.len() > max {
-            out.drain(..out.len() - max);
+        let mut cut = 0;
+        while out.len() - cut > max {
+            let n = out[cut].node;
+            cut += out[cut..].iter().take_while(|l| l.node == n).count();
         }
+        out.drain(..cut);
     }
 
     /// A frame in mode 2: rasterize the damage into the shadow, and hand
@@ -13388,17 +13454,27 @@ impl Server {
         let poll = EpollPoll(&self.epoll);
         let mut layers = Vec::with_capacity(layers_in.len() + 1);
         let mut keys = Vec::with_capacity(layers_in.len());
+        // Bottom to top: the opaque layers under the shadow (it has holes
+        // there), the shadow, then translucent Surfaces' rests (#3952).
+        let mut above = Vec::new();
         for l in &layers_in {
             let Some(tex) = self.gpu.texture(&poll, TOK_GPU, l.key, l.encoding, l.range) else {
                 continue;
             };
-            layers.push(nitro_gpu::proto::Layer {
+            let layer = nitro_gpu::proto::Layer {
                 tex,
                 src: l.src,
                 dst: l.dst,
-                blend: nitro_gpu::proto::Blend::Opaque,
-            });
-            keys.push(l.key);
+                blend: l.blend,
+            };
+            if l.blend == nitro_gpu::proto::Blend::Opaque {
+                layers.push(layer);
+            } else {
+                above.push(layer);
+            }
+            if !keys.contains(&l.key) {
+                keys.push(l.key);
+            }
         }
         self.plan.layers_in = layers_in;
         layers.push(nitro_gpu::proto::Layer {
@@ -13407,6 +13483,7 @@ impl Server {
             dst: bounds,
             blend: nitro_gpu::proto::Blend::PremulOver,
         });
+        layers.extend(above);
         if !upload.is_empty() {
             self.gpu.send(
                 &poll,
@@ -13550,6 +13627,7 @@ impl Server {
         layers.clear();
         self.gpu_layers(index, &mut sc.items, &mut layers);
         sc.gpu_nodes.extend(layers.iter().map(|l| l.node));
+        sc.gpu_nodes.dedup();
         self.outputs[index].gpu_layers = layers;
         let in_fence = self.outputs[index]
             .plane_info
@@ -13598,6 +13676,7 @@ impl Server {
         pairs.push(("gpu_busy_us", c.busy_us));
         pairs.push(("gpu_textures", g.textures() as u64));
         pairs.push(("gpu_import_refused", c.import_refused));
+        pairs.push(("gpu_translucent_approx", c.translucent_approx));
         pairs.push(("gpu_releases_held", g.held.len() as u64));
         pairs.push(("gpu_fences_pending", g.fences_pending() as u64));
         pairs.push(("gpu_ring_slots", g.ring.slots.len() as u64));

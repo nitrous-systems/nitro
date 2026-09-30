@@ -12,7 +12,9 @@
 //!   validates and is kept, but its store is not CPU-readable and paints
 //!   as a documented placeholder (`frame::HOLE_PLACEHOLDER` grey,
 //!   counted in `dmabuf_placeholder_paints`) unless the planes module
-//!   (#3899) scans it out. When the output backend has planes, every
+//!   (#3899) scans it out or the GPU helper (#3922) composites it —
+//!   opaque XR24, or premultiplied AR24 with its alpha (#3952), the
+//!   pairs flagged `COMPOSITE`. When the output backend has planes, every
 //!   dma-buf is also imported as a KMS framebuffer at commit
 //!   (`Backend::import_buffer`, `AddFB2` with the modifier), kept in
 //!   `HeldBuffer::scanout` for the buffer's life, and is a plane
@@ -309,9 +311,10 @@ fn linear_plane(fourcc: u32, i: usize, w: u32, h: u32) -> (u64, u64) {
 
 /// Format/modifier feedback for one set of planes: every pair a
 /// non-cursor plane lists (`SCANOUT`), plus the CPU formats linear
-/// (`CPU`), all `IMPORT`. Sorted, one entry per pair.
+/// (`CPU`), plus the pairs the GPU helper composites (`COMPOSITE`,
+/// #3952), all `IMPORT`. Sorted, one entry per pair.
 #[must_use]
-pub fn feedback(planes: &[PlaneInfo]) -> Vec<DmabufFormat> {
+pub fn feedback(planes: &[PlaneInfo], composite: &[(u32, u64)]) -> Vec<DmabufFormat> {
     let mut out: Vec<DmabufFormat> = CPU_FORMATS
         .iter()
         .map(|&f| DmabufFormat {
@@ -320,6 +323,16 @@ pub fn feedback(planes: &[PlaneInfo]) -> Vec<DmabufFormat> {
             flags: dmabuf_flags::CPU | dmabuf_flags::IMPORT,
         })
         .collect();
+    out.extend(
+        composite
+            .iter()
+            .filter(|&&(_, m)| m != modifier::INVALID)
+            .map(|&(format, modifier)| DmabufFormat {
+                format,
+                modifier,
+                flags: dmabuf_flags::COMPOSITE | dmabuf_flags::IMPORT,
+            }),
+    );
     for p in planes.iter().filter(|p| p.kind != PlaneKind::Cursor) {
         for (f, mods) in &p.formats {
             for &m in mods.iter().filter(|&&m| m != modifier::INVALID) {
@@ -612,7 +625,7 @@ mod tests {
     #[test]
     fn feedback_merges_scanout_and_cpu() {
         use dmabuf_flags::{CPU, IMPORT, SCANOUT};
-        let f = feedback(&planes());
+        let f = feedback(&planes(), &[]);
         let get = |fmt: u32, m: u64| f.iter().find(|e| e.format == fmt && e.modifier == m);
         assert_eq!(get(format::NV12, 0).unwrap().flags, CPU | IMPORT | SCANOUT);
         assert_eq!(
@@ -636,7 +649,31 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         // No planes: the CPU formats alone.
-        assert_eq!(feedback(&[]).len(), CPU_FORMATS.len());
+        assert_eq!(feedback(&[], &[]).len(), CPU_FORMATS.len());
+    }
+
+    #[test]
+    fn composite_pairs_are_flagged_and_importable() {
+        use dmabuf_flags::{COMPOSITE, CPU, IMPORT, SCANOUT};
+        let y = modifier::I915_Y_TILED;
+        let f = feedback(
+            &planes(),
+            &[
+                (format::AR24, y),
+                (format::AR24, 0),
+                (format::XR24, modifier::I915_X_TILED),
+            ],
+        );
+        let get = |fmt: u32, m: u64| f.iter().find(|e| e.format == fmt && e.modifier == m);
+        assert_eq!(get(format::AR24, y).unwrap().flags, COMPOSITE | IMPORT);
+        assert_eq!(
+            get(format::AR24, 0).unwrap().flags & (COMPOSITE | CPU | IMPORT),
+            COMPOSITE | CPU | IMPORT
+        );
+        assert_eq!(
+            get(format::XR24, modifier::I915_X_TILED).unwrap().flags & (COMPOSITE | SCANOUT),
+            COMPOSITE | SCANOUT
+        );
     }
 
     fn msg(fmt: u32, m: u64, planes: Vec<(OwnedFd, u32, u32)>) -> CreateDmabufBuffer {
@@ -665,7 +702,7 @@ mod tests {
     fn a_linear_nv12_memfd_maps_for_the_cpu_path() {
         let fd = sealed(16 * 24);
         let m = msg(format::NV12, 0, vec![(dup(&fd), 0, 16), (fd, 256, 16)]);
-        let v = validate(m, &feedback(&planes()), BufferBudget::default()).unwrap();
+        let v = validate(m, &feedback(&planes(), &[]), BufferBudget::default()).unwrap();
         assert!(v.pixels.is_mapped());
         assert_eq!(v.import.fds.len(), 2);
         assert_eq!(v.desc.plane1, Some((256, 16, 8)));
@@ -679,14 +716,14 @@ mod tests {
             modifier::I915_Y_TILED,
             vec![(dup(&fd), 0, 128), (fd, 256, 128)],
         );
-        let v = validate(m, &feedback(&planes()), BufferBudget::default()).unwrap();
+        let v = validate(m, &feedback(&planes(), &[]), BufferBudget::default()).unwrap();
         assert!(!v.pixels.cpu_readable());
         assert!(v.pixels.fence_fd().is_some());
     }
 
     #[test]
     fn malformed_imports_are_bad_buffer() {
-        let fb = feedback(&planes());
+        let fb = feedback(&planes(), &[]);
         let refuse = |m: CreateDmabufBuffer| {
             let e = validate(m, &fb, BufferBudget::default()).unwrap_err();
             assert_eq!(e.code, ErrorCode::BadBuffer, "{}", e.detail);

@@ -858,7 +858,8 @@ fn an_on_plane_surface_paints_a_hole_under_later_nodes() {
     assert_eq!(
         item.kind,
         PaintKind::Hole {
-            size: (200.0, 100.0)
+            size: (200.0, 100.0),
+            opaque_only: false,
         }
     );
     assert_eq!(item.bounds, IRect::new(60, 70, 200, 100));

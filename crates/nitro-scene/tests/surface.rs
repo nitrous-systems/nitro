@@ -313,3 +313,44 @@ fn an_output_scale_of_1_25_keeps_surface_damage_partial() {
     .unwrap();
     assert_eq!(damage(&mut s).rects(), &[whole]);
 }
+
+/// A Surface on a plane (or under the GPU helper) whose buffer carries
+/// alpha paints as an `opaque_only` hole (#3952), which promises no cover.
+#[test]
+fn an_on_plane_translucent_surface_is_an_opaque_only_hole() {
+    let mut s = common::scene();
+    let n = surface(&mut s);
+    let desc = BufferDesc::new(64, 64, 256, u32::from_le_bytes(*b"AR24"));
+    let ar24 = s.create_buffer(CLIENT, desc, vec![0; desc.byte_len()]).unwrap();
+    s.set_surface(CLIENT, n, Some(SurfaceRef::new(ar24, full(), color())))
+        .unwrap();
+    s.set_surface_on_plane(n, true).unwrap();
+    settle(&mut s);
+    let mut items = Vec::new();
+    s.paint_list(OUT, &IRect::new(0, 0, 800, 600), &mut items);
+    let item = items.iter().find(|i| i.node == n).unwrap();
+    assert!(matches!(
+        item.kind,
+        PaintKind::Hole {
+            opaque_only: true,
+            ..
+        }
+    ));
+    assert_eq!(item.opaque_cover(), None);
+    // An opaque buffer: a whole hole, as before.
+    let yuv = nv12(&mut s);
+    s.set_surface(CLIENT, n, Some(SurfaceRef::new(yuv, full(), color())))
+        .unwrap();
+    settle(&mut s);
+    items.clear();
+    s.paint_list(OUT, &IRect::new(0, 0, 800, 600), &mut items);
+    let item = items.iter().find(|i| i.node == n).unwrap();
+    assert!(matches!(
+        item.kind,
+        PaintKind::Hole {
+            opaque_only: false,
+            ..
+        }
+    ));
+    assert!(item.opaque_cover().is_some());
+}

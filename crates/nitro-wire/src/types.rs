@@ -923,10 +923,15 @@ pub mod dmabuf_flags {
     /// Linear and convertible by the server's CPU path (`NV12`, `YUYV`,
     /// `UYVY`, `XR24`, `AR24`): shown correctly today, on any output.
     pub const CPU: u32 = 1 << 1;
-    /// Accepted by `CreateDmabufBuffer` at all: `SCANOUT | CPU`'s union.
-    /// A buffer that is only `IMPORT` (not `CPU`) is shown as a
-    /// placeholder until it is on a plane.
+    /// Accepted by `CreateDmabufBuffer` at all: `SCANOUT | CPU |
+    /// COMPOSITE`'s union. A buffer that is only `IMPORT` (not `CPU`) is
+    /// shown as a placeholder until it is on a plane or composited.
     pub const IMPORT: u32 = 1 << 2;
+    /// The server's GPU helper composites this pair, alpha included
+    /// (#3952): shown correctly while the flag is advertised, on the
+    /// output the helper serves. It can go away (the helper was switched
+    /// off or gave up); a client reallocates when a new feedback drops it.
+    pub const COMPOSITE: u32 = 1 << 3;
 }
 
 /// Bits of [`SurfacePlaneHint::flags`](crate::msg::SurfacePlaneHint) (#3956).

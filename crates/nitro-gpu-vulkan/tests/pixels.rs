@@ -272,6 +272,36 @@ impl Helper {
     }
 }
 
+impl Helper {
+    /// Premultiplied AR24 `w × h` from `px` as a LINEAR dma-buf via
+    /// udmabuf (#3952), or `None` with a note if this box cannot.
+    fn ar24(&mut self, id: u32, w: u32, h: u32, px: &[u8]) -> Option<()> {
+        let fd = memfd(px);
+        let buf = match nitro_gpu_vulkan::sys::udmabuf(&fd, 0, page_padded(px.len())) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("NOTE: /dev/udmabuf unavailable ({e}); AR24 part skipped");
+                return None;
+            }
+        };
+        let d = DmabufDesc {
+            id,
+            w,
+            h,
+            fourcc: AR24,
+            modifier: MOD_LINEAR,
+            planes: vec![PlaneDesc {
+                offset: 0,
+                pitch: w * 4,
+            }],
+            ..DmabufDesc::default()
+        };
+        let (r, _) = self.call(&ToHelper::ImportDmabuf(d), vec![buf]);
+        assert_eq!(r, FromHelper::Imported { id });
+        Some(())
+    }
+}
+
 struct Image {
     px: Vec<u8>,
     w: u32,
@@ -387,6 +417,64 @@ fn case2_hole_shows_nv12_under_the_shadow() {
     img.assert_near(64, 28, [60, 60, 60], 0); // NV12 layer covered by opaque shadow
     let blended = [128 + NV12_RGB[0] / 2, NV12_RGB[1] / 2, NV12_RGB[2] / 2];
     img.assert_near(40, 40, blended, 3);
+}
+
+/// A translucent client window (#3952): its opaque body under the
+/// shadow's hole, its premultiplied ring blended over the shadow.
+#[test]
+fn case2b_premultiplied_ar24_over_the_shadow() {
+    let Some(mut h) = helper(&[]) else { return };
+    let (w, ht) = (128, 96);
+    // Shadow: blue, a transparent hole where the body goes.
+    let body = IRect::new(40, 40, 48, 32);
+    let px = fill(w, ht, |x, y| {
+        if body.contains(x.cast_signed(), y.cast_signed()) {
+            [0, 0, 0, 0]
+        } else {
+            bgra(0, 0, 200, 255)
+        }
+    });
+    h.shadow(1, w, ht, AR24, &px);
+    h.ring(2, w, ht, vec![MOD_LINEAR]);
+    // The window, 64×48 at (32, 32): an opaque green body inset by 8,
+    // a 50 % premultiplied red ring.
+    let (cw, ch) = (64, 48);
+    let client = fill(cw, ch, |x, y| {
+        if (8..56).contains(&x) && (8..40).contains(&y) {
+            bgra(0, 180, 0, 255)
+        } else {
+            bgra(100, 0, 0, 128)
+        }
+    });
+    let Some(()) = h.ar24(2, cw, ch, &client) else {
+        return;
+    };
+    let at = |r: IRect| Layer {
+        tex: 2,
+        src: [(r.x - 32) as f32, (r.y - 32) as f32, r.w as f32, r.h as f32],
+        dst: r,
+        blend: Blend::Opaque,
+    };
+    let ring = IRect::new(32, 32, 64, 8); // the top band of the ring
+    let f = h.frame(
+        1,
+        0,
+        vec![full(w, ht)],
+        vec![
+            at(body),
+            layer(1, w, ht, full(w, ht), Blend::PremulOver),
+            Layer {
+                blend: Blend::PremulOver,
+                ..at(ring)
+            },
+        ],
+    );
+    assert!(fence_signalled(&f, T));
+    let img = h.readback(0);
+    img.assert_near(60, 50, [0, 180, 0], 0); // the body, stored
+    img.assert_near(5, 5, [0, 0, 200], 0); // the shadow elsewhere
+    // The ring: 100 + (1 - 128/255) × the shadow's blue.
+    img.assert_near(60, 34, [100, 0, 100], 2);
 }
 
 #[test]
