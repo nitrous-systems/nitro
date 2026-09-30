@@ -277,7 +277,7 @@ impl Pty {
     /// # Errors
     /// If the descriptor cannot be duplicated.
     pub fn dup_master(&self) -> std::io::Result<OwnedFd> {
-        Ok(rustix::io::dup(&self.master)?)
+        Ok(rustix::io::fcntl_dupfd_cloexec(&self.master, 0)?)
     }
 
     /// `TIOCSWINSZ`, so the child gets `SIGWINCH` and `$COLUMNS` is

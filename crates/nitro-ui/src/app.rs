@@ -7,7 +7,7 @@
 //! events it calls [`Ui::flush`], which sends a commit only if a pass
 //! produced a mutation.
 
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
 use nitro_core::Size;
 use nitro_wire::client::Connection;
@@ -304,7 +304,8 @@ pub fn event_loop_with<S: 'static>(
         data: EventData::new_u64(0),
     }; 16];
     while !ui.should_quit() {
-        sync_fds(&epfd, ui, &mut registered)?;
+        let retired = ui.take_retired_fds();
+        sync_fds(&epfd, &ui.hook_fds(), retired, &mut registered)?;
         // A connected introspection client is polled by the same loop,
         // so its readability has to be part of the wait. Registering
         // each client stream in the epoll set would mean tracking tokens
@@ -351,24 +352,100 @@ pub fn event_loop_with<S: 'static>(
 /// number, and that is load-bearing: a descriptor number is recycled the
 /// moment it is closed, so a hook removed and another added in the same
 /// turn would take the same number and this function would decide it was
-/// already in the set. It would not be — closing a descriptor removes it
-/// from every `epoll` set — and the new hook would never fire. See
-/// [`FdToken`](crate::FdToken) for the box run that found it.
-fn sync_fds<S: 'static>(
+/// already in the set. It would not be, and the new hook would never
+/// fire. See [`FdToken`](crate::FdToken) for the box run that found it.
+///
+/// `retired` are the descriptors of hooks removed since the last call,
+/// still **open**: each is deleted from the set explicitly and only then
+/// closed (dropped). Closing alone removes a registration only when it
+/// was the last reference to the open file description; with another
+/// one alive — the app's own copy, or one a spawned child inherited —
+/// the registration survives, a readable one (an exited child's pidfd)
+/// wakes every `epoll_wait` under a token nobody handles, and the loop
+/// spins. Deleting *after* the close is no fix either: the number may
+/// already name some other descriptor.
+fn sync_fds(
     epfd: &impl AsFd,
-    ui: &Ui<S>,
+    want: &[(u64, BorrowedFd<'_>)],
+    retired: Vec<(u64, OwnedFd)>,
     registered: &mut Vec<u64>,
 ) -> Result<(), Error> {
-    let want = ui.hook_fds();
-    for (id, borrowed) in &want {
+    for (id, fd) in retired {
+        if let Some(i) = registered.iter().position(|r| *r == id) {
+            registered.swap_remove(i);
+            match epoll::delete(epfd, &fd) {
+                Ok(()) | Err(rustix::io::Errno::NOENT | rustix::io::Errno::BADF) => {}
+                Err(e) => eprintln!("nitro-ui: epoll delete of fd hook {id}: {e}"),
+            }
+        }
+        drop(fd);
+    }
+    for (id, borrowed) in want {
         if !registered.contains(id) {
             epoll::add(epfd, *borrowed, EventData::new_u64(*id), EventFlags::IN)?;
             registered.push(*id);
         }
     }
-    // A hook that went away took its owned descriptor with it, and
-    // closing a descriptor removes it from every epoll set: there is
-    // nothing left to delete, only bookkeeping to drop.
+    // Safety net: a hook that vanished without being retired can no
+    // longer be deleted (its descriptor is gone), so only the
+    // bookkeeping is dropped. Every removal path retires, so this should
+    // find nothing.
     registered.retain(|id| want.iter().any(|(i, _)| i == id));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ready(epfd: &OwnedFd) -> Vec<u64> {
+        let mut events = [epoll::Event {
+            flags: EventFlags::empty(),
+            data: EventData::new_u64(0),
+        }; 4];
+        let zero = rustix::time::Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let n = epoll::wait(epfd, &mut events[..], Some(&zero)).expect("epoll_wait");
+        events[..n].iter().map(|e| e.data.u64()).collect()
+    }
+
+    /// A readable pipe whose read end stays open in `keep`, like an
+    /// exited child's pidfd a spawned grandchild inherited.
+    fn readable() -> (OwnedFd, OwnedFd) {
+        let (r, w) = rustix::pipe::pipe().expect("pipe");
+        rustix::io::write(&w, b"x").expect("write");
+        (r, w)
+    }
+
+    #[test]
+    fn a_retired_hook_stops_firing_while_another_reference_lives() {
+        let epfd = epoll::create(epoll::CreateFlags::CLOEXEC).expect("epoll");
+        let (keep, _w) = readable();
+        let dup = rustix::io::fcntl_dupfd_cloexec(&keep, 0).expect("dup");
+        let mut registered = Vec::new();
+        sync_fds(&epfd, &[(7, dup.as_fd())], Vec::new(), &mut registered).expect("sync");
+        assert_eq!(ready(&epfd), [7]);
+        sync_fds(&epfd, &[], vec![(7, dup)], &mut registered).expect("sync");
+        assert!(registered.is_empty());
+        // `keep` is still open and readable: without the explicit delete
+        // the registration survives the close and this is `[7]` forever.
+        assert_eq!(ready(&epfd), Vec::<u64>::new());
+        drop(keep);
+    }
+
+    #[test]
+    fn a_hook_retired_and_another_added_in_one_turn_both_take_effect() {
+        let epfd = epoll::create(epoll::CreateFlags::CLOEXEC).expect("epoll");
+        let (keep, _w1) = readable();
+        let old = rustix::io::fcntl_dupfd_cloexec(&keep, 0).expect("dup");
+        let mut registered = Vec::new();
+        sync_fds(&epfd, &[(1, old.as_fd())], Vec::new(), &mut registered).expect("sync");
+        let (new, _w2) = readable();
+        sync_fds(&epfd, &[(2, new.as_fd())], vec![(1, old)], &mut registered).expect("sync");
+        assert_eq!(registered, [2]);
+        assert_eq!(ready(&epfd), [2]);
+        drop(keep);
+    }
 }

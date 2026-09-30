@@ -352,6 +352,10 @@ pub struct Ui<S> {
     item_pool: Vec<Vec<FlexItem>>,
     rect_pool: Vec<Vec<Rect>>,
     fds: Vec<FdHook<S>>,
+    /// Descriptors of removed hooks (and finished clipboard reads), kept
+    /// open until the app loop has deleted them from its `epoll` set;
+    /// see [`Ui::remove_fd`].
+    retired_fds: Vec<(u64, std::os::fd::OwnedFd)>,
     /// Next never-used descriptor-hook id. Monotonic, because a
     /// descriptor *number* is recycled the moment it is closed; see
     /// [`FdToken`].
@@ -463,9 +467,11 @@ struct FdHook<S> {
     /// descriptor number recycled by the kernel cannot make a new hook
     /// look like an old one. See [`FdToken`].
     id: u64,
-    /// A `dup` of the descriptor the app handed us. Owning a duplicate
-    /// is what lets the loop re-borrow it for `epoll` without `unsafe`
-    /// and without the app promising anything about lifetimes.
+    /// A close-on-exec `dup` of the descriptor the app handed us. Owning
+    /// a duplicate is what lets the loop re-borrow it for `epoll` without
+    /// `unsafe` and without the app promising anything about lifetimes.
+    /// On removal it is *retired*, not dropped: the loop deletes it from
+    /// `epoll` first (see [`Ui::remove_fd`]).
     fd: std::os::fd::OwnedFd,
     callback: Option<Callback<S>>,
 }
@@ -500,6 +506,7 @@ impl<S: 'static> Ui<S> {
             item_pool: Vec::new(),
             rect_pool: Vec::new(),
             fds: Vec::new(),
+            retired_fds: Vec::new(),
             next_fd_token: 1,
             timers: Vec::new(),
             next_timer: 1,
@@ -4713,7 +4720,9 @@ impl<S: 'static> Ui<S> {
 
     /// Call `callback` whenever `fd` is readable.
     ///
-    /// The descriptor is `dup`ped, so the app may close its own copy;
+    /// The descriptor is `dup`ped — close-on-exec, so a child the app
+    /// spawns later never inherits our copy — and the app may close its
+    /// own copy;
     /// the returned [`FdToken`] is what names the hook afterwards, for
     /// [`Ui::run_fd`] and [`Ui::remove_fd`].
     ///
@@ -4724,7 +4733,7 @@ impl<S: 'static> Ui<S> {
         fd: BorrowedFd<'_>,
         callback: impl FnMut(&mut S, &mut Ui<S>) + 'static,
     ) -> Result<FdToken, Error> {
-        let owned = rustix::io::dup(fd)?;
+        let owned = rustix::io::fcntl_dupfd_cloexec(fd, 0)?;
         let id = self.alloc_fd_token();
         let token = FdToken(id);
         self.fds.push(FdHook {
@@ -4735,10 +4744,45 @@ impl<S: 'static> Ui<S> {
         Ok(token)
     }
 
-    /// Drop a descriptor hook. Closing our duplicate also removes it
-    /// from the app loop's `epoll` set.
+    /// Drop a descriptor hook.
+    ///
+    /// Our duplicate is not closed here but retired: the app loop deletes
+    /// it from its `epoll` set on its next turn and only then closes it.
+    /// Closing alone is **not** enough — an `epoll` registration lives as
+    /// long as the open file description, and that outlives our
+    /// descriptor whenever another reference exists (the app's own copy,
+    /// or one a spawned child inherited). A level-triggered readable
+    /// registration nobody listens to — an exited child's pidfd, say —
+    /// then wakes the loop forever: `nitro-files` spun a core on
+    /// testhost2 for as long as the `nitro-video` it had launched ran.
     pub fn remove_fd(&mut self, token: FdToken) {
-        self.fds.retain(|h| h.id != token.0);
+        if let Some(i) = self.fds.iter().position(|h| h.id == token.0) {
+            let h = self.fds.remove(i);
+            self.retire_fd(h.id, h.fd);
+        }
+    }
+
+    /// Hand `fd`, registered under `id`, to the loop for `EPOLL_CTL_DEL`
+    /// before it is closed. See [`Ui::remove_fd`].
+    pub(crate) fn retire_fd(&mut self, id: u64, fd: std::os::fd::OwnedFd) {
+        self.retired_fds.push((id, fd));
+    }
+
+    /// The descriptors retired since the last call, with their tokens.
+    /// The caller deletes each from its `epoll` set, then drops it.
+    #[doc(hidden)]
+    pub fn take_retired_fds(&mut self) -> Vec<(u64, std::os::fd::OwnedFd)> {
+        std::mem::take(&mut self.retired_fds)
+    }
+
+    /// The descriptor behind hook `token`, for tests.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn hook_fd(&self, token: FdToken) -> Option<BorrowedFd<'_>> {
+        self.fds
+            .iter()
+            .find(|h| h.id == token.0)
+            .map(|h| h.fd.as_fd())
     }
 
     /// Call `callback` once, `ms` milliseconds from now.

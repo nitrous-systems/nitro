@@ -469,6 +469,9 @@ impl<S: 'static> Harness<S> {
     /// # Panics
     /// On a wire failure.
     pub fn pump(&mut self) -> usize {
+        // There is no `epoll` set here to delete retired hook
+        // descriptors from; close them so the list does not grow.
+        drop(self.ui.take_retired_fds());
         let n = self.ui.pump(&mut self.state).expect("pump");
         if self.auto_fds {
             n + self.run_ready_fds()

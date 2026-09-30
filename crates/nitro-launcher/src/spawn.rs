@@ -228,6 +228,16 @@ impl Children {
     /// screen, which is exactly what the toolkit's "idle costs nothing"
     /// contract forbids.
     ///
+    /// Closing the descriptor would not be enough to stop that, which is
+    /// why [`Ui::remove_fd`] deletes the registration from `epoll`
+    /// explicitly before closing its copy: a registration lives as long
+    /// as the open file description, and a pidfd's can outlive every
+    /// descriptor of ours in a child that inherited it. `nitro-files`
+    /// spun a core on testhost2 that way, for as long as the
+    /// `nitro-video` it had launched (and that held its earlier child's
+    /// pidfd) ran. The toolkit's own `dup`s are close-on-exec for the
+    /// same reason.
+    ///
     /// A child whose `pidfd_open` failed has no descriptor to watch and
     /// is skipped here; [`Children::reap`] still collects it before the
     /// next spawn, which is what this module did before the pidfd

@@ -391,7 +391,7 @@ impl<S: 'static> Ui<S> {
             self.clipboard.requests.remove(i);
             return;
         }
-        let fd = rustix::io::dup(d.fd.as_fd()).and_then(|fd| {
+        let fd = rustix::io::fcntl_dupfd_cloexec(d.fd.as_fd(), 0).and_then(|fd| {
             let flags = rustix::fs::fcntl_getfl(&fd)?;
             rustix::fs::fcntl_setfl(&fd, flags | rustix::fs::OFlags::NONBLOCK)?;
             Ok(fd)
@@ -435,7 +435,10 @@ impl<S: 'static> Ui<S> {
                 Progress::Failed => done.push((self.clipboard.requests.remove(i), false)),
             }
         }
-        for (r, ok) in done {
+        for (mut r, ok) in done {
+            if let Some(fd) = r.fd.take() {
+                self.retire_fd(r.token, fd);
+            }
             if let Some(t) = r.timer {
                 self.cancel_timer(&t);
             }
@@ -456,7 +459,10 @@ impl<S: 'static> Ui<S> {
         let cb = r.cb.take();
         if r.fd.is_some() {
             // The server let go of the id when it answered.
-            self.clipboard.requests.remove(i);
+            let mut r = self.clipboard.requests.remove(i);
+            if let Some(fd) = r.fd.take() {
+                self.retire_fd(r.token, fd);
+            }
         }
         if let Some(cb) = cb {
             cb(state, self, None);

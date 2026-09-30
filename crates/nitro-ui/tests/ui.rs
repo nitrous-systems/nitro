@@ -1395,7 +1395,7 @@ fn a_re_armed_fd_hook_gets_a_fresh_token() {
     // token** — and the app loop, which keeps a list of what it has
     // already registered with `epoll` so it does not `epoll_ctl` every
     // wakeup, concluded the new hook was already in the set. It was not:
-    // closing a descriptor removes it from every epoll set. The hook
+    // the old registration was gone with its descriptor. The hook
     // existed, was never registered, and never fired.
     //
     // The symptom on the box was a file manager whose inotify watch
@@ -1442,6 +1442,48 @@ fn a_re_armed_fd_hook_gets_a_fresh_token() {
     // The retired token is dead rather than aliasing the live hook.
     h.ui().run_fd(&mut state, first);
     assert_eq!(state, 10, "the retired token names nothing");
+    h.quit();
+}
+
+#[test]
+fn fd_hooks_are_close_on_exec_and_retired_open_on_removal() {
+    // `add_fd` used a plain `dup`, so every child the app spawned
+    // afterwards inherited the hook descriptors, and `remove_fd` just
+    // closed ours. With a child still holding a copy the `epoll`
+    // registration outlived the close and, level-triggered readable (an
+    // exited child's pidfd), spun the loop: `nitro-files` at 100% for as
+    // long as the `nitro-video` it launched ran. The dup is close-on-exec
+    // now, and a removed hook's descriptor stays open until the loop has
+    // deleted it from `epoll`.
+    use std::os::fd::AsFd as _;
+
+    let mut h = Harness::sized(
+        "cloexec",
+        0u32,
+        Size::new(100.0, 50.0),
+        |ui: &mut Ui<u32>| ui.build(column()),
+    );
+    let (read, _write) = std::os::unix::net::UnixStream::pair().unwrap();
+    let token = h.ui().add_fd(read.as_fd(), |_: &mut u32, _| {}).unwrap();
+    let fd = h.ui().hook_fd(token).expect("the hook's descriptor");
+    assert!(
+        rustix::io::fcntl_getfd(fd)
+            .unwrap()
+            .contains(rustix::io::FdFlags::CLOEXEC),
+        "a spawned child must not inherit the hook's dup"
+    );
+
+    h.ui().remove_fd(token);
+    assert!(h.ui().hook_fd(token).is_none());
+    let retired = h.ui().take_retired_fds();
+    assert_eq!(
+        retired.len(),
+        1,
+        "the removed hook's fd is retired, not closed"
+    );
+    assert_eq!(retired[0].0, token.raw());
+    // Still a live descriptor the loop can `EPOLL_CTL_DEL`.
+    rustix::io::fcntl_getfd(&retired[0].1).expect("still open");
     h.quit();
 }
 
