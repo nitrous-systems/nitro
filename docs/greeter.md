@@ -1,6 +1,6 @@
 # Login: greetd + `nitro-greeter`
 
-Status: **in progress**. Steps 1–3 of the plan below are built. The page
+Status: **in progress**. Steps 1–4 of the plan below are built (step 4 without the greetd config, which moves to step 5). The page
 argues where the line goes, what the new pieces are, and what each one
 costs, so each commit can be small.
 
@@ -463,9 +463,24 @@ In order. Each step can land on its own:
    ownerless lock), `Ui::unlock_session` and exit 0 on success. Another
    user's name starts no conversation and offers logout. No
    `pam_setcred` yet (the binding lacks it).
-4. **`nitro-session --locked`** and the greetd config. On the box,
-   measure boot to the lock screen's first frame (`first_frame_ms`) and
-   unlock to desktop.
+4. **`nitro-session --locked`**: done (#3950). The lock screen is the
+   session's on-demand piece (`Role::Lock`, `nitro-greeter --lock`):
+   exit 0 is "unlocked" and is not restarted; a crash is restarted with
+   the shell backoff while the server holds the lock ownerless, and the
+   new one takes it over. `lock` on the session socket first **locks at
+   the server** itself (connect to the shell socket, `Lock`, a
+   `WindowList` roundtrip to know it was handled, disconnect → ownerless)
+   and only then spawns the lock screen, so the desktop is gone when the
+   bar gets `ok`, not when the greeter is up. `--locked` starts the
+   server with `NITRO_LOCKED=1` and the lock screen before the shell.
+   `suspend` locks first. The bar's Lock button is live, and the bar
+   binds Super+L. `just deploy` installs `/etc/pam.d/nitro-lock` when
+   absent. Measurements: see "Step 4 on the boxes" below.
+   Follow-up, not built: logind's `Lock` signal (`loginctl
+   lock-session`) and a delay inhibitor so the lock screen has *painted*
+   before the machine sleeps; both need a D-Bus client
+   (`crates/nitro-session/src/power.rs`). The greetd config moves to
+   step 5.
 5. **The greeter**: `greetd.rs` (codec and tests), the same state
    machine as the greetd backend, and `nitro-session --greeter` with
    `Role::Primary`. Then `deploy/greetd/`, and a `docs/testbox.md`
@@ -477,3 +492,7 @@ In order. Each step can land on its own:
 The crate count moves once, for the PAM binding in step 3: `cargo tree
 -e normal` 96 → 106 lines, 40 → 44 distinct external names (`nonstick`,
 `libpam-sys`, `libpam-sys-impls`, `libpam-sys-helpers`).
+
+## Step 4 on the boxes
+
+PENDING
