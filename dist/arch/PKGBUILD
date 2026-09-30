@@ -1,0 +1,33 @@
+# Maintainer: Kaspar Schleiser <kaspar@schleiser.de>
+#
+# Built by `just dist-arch` (docs/packaging.md). pkgver is filled in by
+# dist/arch/build.sh from Cargo.toml and git; the source is the tarball
+# dist/run.sh made from the checkout.
+pkgname=nitro
+pkgver=@PKGVER@
+pkgrel=1
+pkgdesc='Minimal, snappy desktop stack for Linux: KMS compositor, toolkit and shell apps'
+arch=(x86_64 aarch64)
+url='https://github.com/nitrous-systems/nitro'
+license=(Apache-2.0)
+depends=(glibc gcc-libs seatd libinput libxkbcommon pam ffmpeg)
+makedepends=(rust just pkgconf)
+optdepends=('greetd: login via nitro-greeter')
+backup=(etc/pam.d/nitro-lock)
+# The release profile strips (no debug package) and does its own fat LTO;
+# makepkg's -flto would also reach nitro-video's C shim.
+options=(!debug !lto)
+source=("nitro.tar.gz")
+sha256sums=(SKIP)
+
+build() {
+    cd nitro
+    cargo build --release --workspace --bins
+}
+
+package() {
+    cd nitro
+    # The file list is the justfile's (docs/install.md); cargo is a no-op
+    # here after build().
+    just PREFIX=/usr DESTDIR="$pkgdir" SUDO=none install
+}

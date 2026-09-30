@@ -1,0 +1,28 @@
+Source: nitro
+Section: x11
+Priority: optional
+Maintainer: Kaspar Schleiser <kaspar@schleiser.de>
+Build-Depends: debhelper-compat (= 13),
+               pkg-config,
+               libseat-dev,
+               libinput-dev,
+               libxkbcommon-dev,
+               libpam0g-dev,
+               libavformat-dev,
+               libavcodec-dev,
+               libavutil-dev
+Standards-Version: 4.7.0
+Homepage: https://github.com/nitrous-systems/nitro
+Rules-Requires-Root: no
+
+Package: nitro
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Suggests: greetd
+Description: minimal, snappy desktop stack for Linux
+ A KMS compositor with a retained scene graph, a small retained-mode
+ toolkit, and a handful of shell apps: session, bar, launcher,
+ wallpaper, terminal, file manager, settings, calculator, audio and
+ video players, and a greeter with lock screen.
+ .
+ Start it from tty1 with `exec nitro-session`, or from greetd.

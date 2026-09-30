@@ -6,6 +6,10 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 # this directory.
 import 'deploy/dev.just'
 
+# The distribution packages (dist-*: deb, Arch, Alpine, built in
+# containers) live in dist/dist.just; see docs/packaging.md.
+import 'dist/dist.just'
+
 # A bare `just` runs the checks (the recipes are at the end of this file).
 [doc("Run the standard checks: fmt, build, test, lint-colors")]
 [group('check')]

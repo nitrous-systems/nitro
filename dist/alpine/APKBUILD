@@ -1,0 +1,28 @@
+# Maintainer: Kaspar Schleiser <kaspar@schleiser.de>
+#
+# Built by `just dist-alpine` (docs/packaging.md). pkgver is filled in by
+# dist/alpine/build.sh from Cargo.toml and the commit date; Alpine allows
+# no hash in pkgver, so the git rev is in pkgdesc.
+pkgname=nitro
+pkgver=@PKGVER@
+pkgrel=0
+pkgdesc="Minimal, snappy desktop stack for Linux (git @REV@)"
+url="https://github.com/nitrous-systems/nitro"
+arch="x86_64 aarch64"
+license="Apache-2.0"
+# Runtime libraries are found by abuild's so: tracing.
+makedepends="cargo just pkgconf linux-headers libseat-dev libinput-dev libxkbcommon-dev linux-pam-dev ffmpeg-dev"
+# There is nothing for -doc/-dev/… to split off.
+subpackages=""
+options="!check net"
+source="nitro.tar.gz"
+builddir="$srcdir/nitro"
+
+build() {
+    cargo build --release --workspace --bins
+}
+
+package() {
+    # The file list is the justfile's (docs/install.md).
+    just PREFIX=/usr DESTDIR="$pkgdir" SUDO=none install
+}

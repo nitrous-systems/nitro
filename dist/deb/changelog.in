@@ -1,0 +1,5 @@
+nitro (@VERSION@) @DIST@; urgency=medium
+
+  * Snapshot of git @REV@, built by `just dist-deb-*`.
+
+ -- Kaspar Schleiser <kaspar@schleiser.de>  @DATE@

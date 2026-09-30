@@ -1,0 +1,27 @@
+#!/usr/bin/make -f
+# The build and the file list are the justfile's `install` recipe
+# (docs/install.md); nothing here duplicates it. rustup's cargo and just
+# are on PATH from the build container (dist/deb/Dockerfile).
+
+export DH_VERBOSE = 1
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+
+override_dh_auto_build:
+	just PREFIX=/usr DESTDIR=$(CURDIR)/debian/nitro SUDO=none install
+
+override_dh_auto_install:
+
+override_dh_auto_test:
+
+override_dh_auto_clean:
+
+# The release profile already strips (Cargo.toml: strip = true), so there
+# is no debug info for dwz or a -dbgsym package.
+override_dh_dwz:
+
+override_dh_strip:
+	dh_strip --no-automatic-dbgsym
