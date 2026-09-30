@@ -381,3 +381,72 @@ fn a_scripted_sequence_is_paced_server_side_and_feeds_i2p() {
     drop(conn);
     h.quit();
 }
+
+/// The per-stage timeline (#3974): off by default, and once on, a scroll
+/// answered by a commit is recorded with its stages in order.
+#[test]
+fn the_timeline_records_a_scroll_stage_by_stage() {
+    let h = Harness::start("timeline");
+    let mut conn = Connection::connect(&h.wire_path, "inject").expect("wire connect");
+    let mut seen = Vec::new();
+    let (win, c) = make_window(&mut conn, &mut seen);
+    h.input(&format!(
+        "motion {} {}",
+        c.position.x + 10.0,
+        c.position.y + 10.0
+    ));
+    let (status, _) = h.body("timeline\n");
+    assert_eq!(status, "ok 0 0");
+    assert_eq!(h.line("timeline on\n"), "ok");
+    assert_eq!(h.line("timeline clear\n"), "ok");
+
+    seen.clear();
+    assert_eq!(h.input("wheel 0 15 count=3 every=30"), "ok 3");
+    let mut serial = 2;
+    let mut axes = 0;
+    wait_for("three axis events", || {
+        conn.flush().unwrap();
+        let mut batch = Vec::new();
+        let _ = conn.poll(&mut batch);
+        for m in batch {
+            if let ServerMsg::PointerAxis(a) = &m
+                && a.window == win
+            {
+                axes += 1;
+                conn.tx()
+                    .fill_solid(NodeId(2), Color::rgb(0, (serial * 40) as u8, 0))
+                    .commit(serial)
+                    .unwrap();
+                serial += 1;
+            }
+        }
+        axes >= 3
+    });
+    collect(&mut conn, &mut seen, 200);
+    let rows = || {
+        let (status, lines) = h.body("timeline\n");
+        assert!(status.ends_with(" 1"), "{status}");
+        assert_eq!(lines[0], nitro_server::timeline::HEADER);
+        lines[1..]
+            .iter()
+            .map(|l| l.split(' ').map(|v| v.parse::<u64>().unwrap()).collect::<Vec<_>>())
+            .filter(|r| r[5] != 0)
+            .collect::<Vec<_>>()
+    };
+    wait_for("a recorded scroll frame", || !rows().is_empty());
+    for r in rows() {
+        // input <= rx <= sent <= present <= fence <= paint <= commit <= vblank
+        let (input, rx, sent, present, fence, paint, commit, vblank) =
+            (r[2], r[4], r[5], r[6], r[7], r[9], r[10], r[11]);
+        assert!(input > 0 && rx > 0 && present > 0 && commit > 0, "{r:?}");
+        assert!(input <= rx && rx <= sent && sent <= present, "{r:?}");
+        assert!(present <= fence && fence <= commit, "{r:?}");
+        assert!(paint == 0 || paint <= commit, "{r:?}");
+        assert!(commit <= vblank, "{r:?}");
+    }
+    assert_eq!(h.line("timeline off\n"), "ok");
+    assert_eq!(h.body("timeline\n").0, "ok 0 0");
+
+    drop(conn);
+    h.quit();
+}

@@ -71,6 +71,7 @@ pub mod surface;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 pub mod text;
+pub mod timeline;
 pub mod wm;
 
 use std::cell::RefCell;
@@ -1119,6 +1120,8 @@ struct Server {
     /// Newest input timestamp not yet consumed by a frame; see
     /// [`Server::note_input`].
     pending_input_ns: u64,
+    /// The per-stage latency timeline (#3974); off unless enabled.
+    timeline: timeline::Timeline,
     /// The clients whose answer a cursor-only flip is waiting for, and the
     /// timer that bounds the wait. See [`defer`].
     defer: DeferredFlip,
@@ -1550,6 +1553,7 @@ pub fn run(mut config: Config) -> Result<(), Error> {
         pending_popup_done: Vec::new(),
         popup_scratch: Vec::new(),
         pending_input_ns: 0,
+        timeline: timeline::Timeline::from_env(),
         defer: defer::DeferredFlip::new().map_err(errno("create the deferred-flip timer"))?,
         key_repeat: repeat::KeyRepeat::new().map_err(errno("create the key-repeat timer"))?,
         injector: inject::Injector::new().map_err(errno("create the input-injection timer"))?,
@@ -2585,6 +2589,7 @@ impl Server {
         if !self.outputs[index].needs_paint() {
             return false;
         }
+        self.timeline.paint(self.outputs[index].scene_id.0);
         // Which Surfaces go on planes this frame (#3899), before anything
         // is rasterized: a switch invalidates the output.
         self.plan_planes(index);
@@ -2736,6 +2741,7 @@ impl Server {
                 self.stats.paint_log.push(paint_us);
                 self.stats.damage_log.push(damage_px);
                 self.outputs[index].committed();
+                self.timeline.commit(self.outputs[index].scene_id.0);
                 true
             }
             Err(e) => {
@@ -2872,6 +2878,7 @@ impl Server {
                 .unwrap_or(now_ns);
             match self.defer.hold_until(deadline_ns) {
                 Ok(()) => {
+                    self.timeline.deferred();
                     debug!(
                         "cursor-only flip held {} us for a client's answer",
                         deadline_ns.saturating_sub(now_ns) / 1_000
@@ -3344,6 +3351,7 @@ impl Server {
         let scene_id = output.scene_id;
         let refresh_ns = output.refresh_ns;
         let deadline_ns = output.frame_deadline_ns(time_ns);
+        self.timeline.flip(scene_id.0, sequence, time_ns, input_ns);
 
         if prev_vblank_ns > 0 && time_ns > prev_vblank_ns {
             self.stats.flip_log.push((time_ns - prev_vblank_ns) / 1_000);
@@ -5150,6 +5158,7 @@ impl Server {
     /// as a multi-second latency by some unrelated frame later on.
     fn note_input(&mut self, time_ns: u64) {
         self.pending_input_ns = self.pending_input_ns.max(time_ns);
+        self.timeline.input(time_ns);
     }
 
     /// Hand the pending input timestamp to whichever outputs are about to
@@ -5164,6 +5173,7 @@ impl Server {
         let mut claimed = false;
         for output in &mut self.outputs {
             if output.needs_paint() {
+                self.timeline.claim(output.scene_id.0);
                 output.painting_input_ns = output.painting_input_ns.max(self.pending_input_ns);
                 claimed = true;
             }
@@ -5247,6 +5257,7 @@ impl Server {
     /// cursor movement over an empty desktop stays on the fast path.
     fn note_client_input(&mut self, token: Option<u64>) {
         if let Some(token) = token {
+            self.timeline.sent();
             self.defer.expect(token);
         }
     }
@@ -6811,6 +6822,25 @@ impl Server {
                 };
                 protocol::samples_reply(log.total, &log.values())
             }
+            Ok(Request::Timeline(op)) => match op {
+                None => {
+                    let (total, recs) = self.timeline.records();
+                    let rows: Vec<_> = recs.iter().map(timeline::FrameRecord::columns).collect();
+                    protocol::timeline_reply(self.timeline.enabled(), total, timeline::HEADER, &rows)
+                }
+                Some(protocol::TimelineOp::On) => {
+                    self.timeline.set_enabled(true);
+                    protocol::ok_reply()
+                }
+                Some(protocol::TimelineOp::Off) => {
+                    self.timeline.set_enabled(false);
+                    protocol::ok_reply()
+                }
+                Some(protocol::TimelineOp::Clear) => {
+                    self.timeline.clear();
+                    protocol::ok_reply()
+                }
+            },
             Ok(Request::Theme) => protocol::theme_reply(
                 self.settings.theme.scheme.unwrap_or_default(),
                 self.theme_serial,
@@ -8726,6 +8756,7 @@ impl Server {
         // spoken either way, and a transaction that turns out to be fatal
         // must not leave the cursor held hostage to a dead connection.
         self.defer.forget(token);
+        self.timeline.present(false, true);
         // And it is the turn a withheld key was waiting for: the shell has
         // answered its hotkey, so ordinary routing resumes from here
         // whether or not it took a grab. Cleared before the transaction is
@@ -10111,6 +10142,7 @@ impl Server {
                 return false;
             }
         };
+        self.timeline.present(true, fence.is_none());
         let queued = surface::Queued {
             token,
             client: client_id,
@@ -10189,6 +10221,7 @@ impl Server {
         };
         self.fences.remove(&self.epoll, key);
         self.latch.fence_signalled(key);
+        self.timeline.fence();
         self.settle();
     }
 
@@ -10614,6 +10647,7 @@ impl Server {
             {
                 client.unpresented.push(l.serial);
                 out.painting.push((l.client.0, l.serial));
+                self.timeline.latch(out.scene_id.0, client.unpresented.len());
             } else {
                 // Nowhere to appear: answer at once, the commit rule.
                 let (output, time_ns, seq) = self.outputs.first().map_or((0, 0, 0), |o| {
@@ -11125,6 +11159,7 @@ impl Server {
             Ok(()) => {
                 self.plane_flips += 1;
                 self.outputs[index].planes_committed();
+                self.timeline.commit(self.outputs[index].scene_id.0);
                 self.note_on_kms(index);
                 true
             }
@@ -13700,6 +13735,7 @@ impl Server {
                 }
                 self.gpu.ring.shown = Some(c.slot);
                 self.outputs[index].gpu_committed();
+                self.timeline.commit(self.outputs[index].scene_id.0);
                 self.note_on_kms(index);
             }
             Err(e) => {

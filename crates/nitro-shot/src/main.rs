@@ -12,6 +12,7 @@
 //! nitro-shot --record N [--output NAME] [--fps F] [-o FILE]
 //!                                                 record N frames over the wire (#676): fps, latency,
 //!                                                 damage; the last frame to FILE as PNG
+//! nitro-shot --timeline [on|off|clear]           per-stage latency timeline (#3974): dump, or switch it
 //! ```
 //!
 //! The control socket is `$NITRO_CONTROL`, else
@@ -54,6 +55,8 @@ enum Mode {
         output: Option<String>,
         fps: u32,
     },
+    /// `timeline [on|off|clear]`: the dump when `None`.
+    Timeline(Option<String>),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -62,7 +65,7 @@ struct Args {
     file: Option<PathBuf>,
 }
 
-const USAGE: &str = "usage: nitro-shot [-o FILE] [--raw] [--output NAME] [--no-cursor] [-v] | --outputs | --modes | --stats | --quit | --input ARGS | --samples i2p|flip|paint|damage | --record N [--output NAME] [--fps F] [-o FILE]";
+const USAGE: &str = "usage: nitro-shot [-o FILE] [--raw] [--output NAME] [--no-cursor] [-v] | --outputs | --modes | --stats | --quit | --input ARGS | --samples i2p|flip|paint|damage | --record N [--output NAME] [--fps F] [-o FILE] | --timeline [on|off|clear]";
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
     let mut file = None;
@@ -73,7 +76,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
     let mut cmd: Option<Mode> = None;
     let mut record: Option<u32> = None;
     let mut fps = 0;
-    let mut it = args.into_iter();
+    let mut it = args.into_iter().peekable();
     while let Some(a) = it.next() {
         match a.as_str() {
             "-o" | "--out" => file = Some(PathBuf::from(it.next().ok_or("-o needs a FILE")?)),
@@ -105,6 +108,10 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
                     .next()
                     .and_then(|n| n.parse().ok())
                     .ok_or("--fps needs a number")?;
+            }
+            "--timeline" => {
+                let op = it.next_if(|a| matches!(a.as_str(), "on" | "off" | "clear"));
+                cmd = Some(Mode::Timeline(op));
             }
             "-h" | "--help" => return Err(USAGE.to_owned()),
             other => return Err(format!("unknown argument {other:?}\n{USAGE}")),
@@ -304,6 +311,16 @@ fn run(args: Args) -> io::Result<()> {
             eprintln!("total {total}");
             write_out(args.file.as_ref(), body.as_bytes())
         }
+        Mode::Timeline(Some(ref op)) => {
+            request(&mut conn, &format!("timeline {op}\n"))?;
+            Ok(())
+        }
+        Mode::Timeline(None) => {
+            let status = request(&mut conn, "timeline\n")?;
+            let body = read_text_body(&mut conn)?;
+            eprintln!("total/on {status}");
+            write_out(args.file.as_ref(), body.as_bytes())
+        }
     }
 }
 
@@ -390,6 +407,11 @@ mod tests {
         );
         assert!(parse("--record 0").is_err());
         assert!(parse("--samples frob").is_err());
+        assert_eq!(parse("--timeline").unwrap().mode, Mode::Timeline(None));
+        assert_eq!(
+            parse("--timeline on").unwrap().mode,
+            Mode::Timeline(Some("on".to_owned()))
+        );
         assert!(parse("--input").is_err());
         assert!(parse("-o").is_err());
         assert!(parse("--frob").is_err());

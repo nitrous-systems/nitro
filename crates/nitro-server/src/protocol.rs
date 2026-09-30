@@ -33,6 +33,7 @@
 //! | `overview [on\|off] [name]` | `ok\n`; enters/leaves overview mode, for tests      |
 //! | `input <action> ...` | `ok <n>\n`; injects input into the real input path (below)  |
 //! | `samples i2p\|flip\|paint\|damage` | `ok <total>\n` + one value per line (µs; pixels for `damage`), oldest first, + `\n` |
+//! | `timeline [on\|off\|clear]` | `ok\n`; with no argument `ok <total> <on>\n` + a header line + one line per frame (`CLOCK_MONOTONIC` ns per stage, see `timeline.rs`), oldest first, + `\n` |
 //!
 //! # `input`: synthetic input, through the same path as hardware
 //!
@@ -156,6 +157,20 @@ pub enum Request {
     /// Raw recent samples of one statistic, for percentiles a `stats`
     /// min/mean/max cannot give.
     Samples(SampleKind),
+    /// The per-stage latency timeline (#3974): `None` dumps it,
+    /// `Some(op)` turns it on, off or clears it.
+    Timeline(Option<TimelineOp>),
+}
+
+/// What `timeline on|off|clear` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimelineOp {
+    /// Start recording (keeps what is recorded).
+    On,
+    /// Stop recording and free the ring.
+    Off,
+    /// Forget every record, keep recording.
+    Clear,
 }
 
 /// A `shot`'s options: `shot [NAME] [cursor=0|1] [meta=0|1]`, options in
@@ -408,6 +423,11 @@ pub fn parse(line: &str) -> Result<Request, String> {
         ("samples", Some("paint")) => Ok(Request::Samples(SampleKind::Paint)),
         ("samples", Some("damage")) => Ok(Request::Samples(SampleKind::Damage)),
         ("samples", _) => Err("`samples` wants `i2p`, `flip`, `paint` or `damage`".to_owned()),
+        ("timeline", None) => Ok(Request::Timeline(None)),
+        ("timeline", Some("on")) => Ok(Request::Timeline(Some(TimelineOp::On))),
+        ("timeline", Some("off")) => Ok(Request::Timeline(Some(TimelineOp::Off))),
+        ("timeline", Some("clear")) => Ok(Request::Timeline(Some(TimelineOp::Clear))),
+        ("timeline", _) => Err("`timeline` wants nothing, `on`, `off` or `clear`".to_owned()),
         (
             "outputs" | "stats" | "quit" | "reload" | "focus" | "unplug" | "theme" | "modes",
             Some(_),
@@ -775,6 +795,25 @@ pub fn samples_reply(total: u64, values: &[u64]) -> Vec<u8> {
     s.into_bytes()
 }
 
+/// The `timeline` dump: `ok <total> <on>\n`, the column header, one
+/// line of space-separated values per record (oldest first), blank line.
+pub fn timeline_reply(on: bool, total: u64, header: &str, rows: &[[u64; 15]]) -> Vec<u8> {
+    let mut s = format!("ok {total} {}\n{header}\n", u8::from(on));
+    for row in rows {
+        let mut first = true;
+        for v in row {
+            if !first {
+                s.push(' ');
+            }
+            first = false;
+            let _ = write!(s, "{v}");
+        }
+        s.push('\n');
+    }
+    s.push('\n');
+    s.into_bytes()
+}
+
 /// `ok\n`, one `key value` line per pair, blank line.
 pub fn stats_reply(pairs: &[(&str, u64)]) -> Vec<u8> {
     stats_reply_with(pairs, &[])
@@ -1084,6 +1123,31 @@ mod tests {
         assert!(parse("samples frob").is_err());
         assert_eq!(samples_reply(5, &[1, 2]), b"ok 5\n1\n2\n\n");
         assert_eq!(samples_reply(0, &[]), b"ok 0\n\n");
+    }
+
+    #[test]
+    fn parses_timeline() {
+        assert_eq!(parse("timeline"), Ok(Request::Timeline(None)));
+        assert_eq!(
+            parse("timeline on"),
+            Ok(Request::Timeline(Some(TimelineOp::On)))
+        );
+        assert_eq!(
+            parse("timeline off\n"),
+            Ok(Request::Timeline(Some(TimelineOp::Off)))
+        );
+        assert_eq!(
+            parse("timeline clear"),
+            Ok(Request::Timeline(Some(TimelineOp::Clear)))
+        );
+        assert!(parse("timeline frob").is_err());
+        let mut row = [0; 15];
+        row[0] = 1;
+        row[14] = 2;
+        assert_eq!(
+            timeline_reply(true, 7, "a b", &[row]),
+            b"ok 7 1\na b\n1 0 0 0 0 0 0 0 0 0 0 0 0 0 2\n\n"
+        );
     }
 
     #[test]
