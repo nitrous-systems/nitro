@@ -2,6 +2,8 @@
 # Runs inside the dist/deb container: unpack the source, add the debian/
 # directory, generate the changelog and build the binary package into /out.
 set -euo pipefail
+# Hand /out back to the invoking user even when the build fails.
+trap 'chown -R "$DIST_OUT_OWNER" /out' EXIT
 . /etc/os-release
 work=/build
 mkdir -p "$work"
@@ -16,4 +18,3 @@ sed -e "s|@VERSION@|$DIST_DEB_VERSION|" \
     /pkg/changelog.in > debian/changelog
 dpkg-buildpackage -b -us -uc
 cp ../*.deb ../*.buildinfo ../*.changes /out/
-chown -R "$DIST_OUT_OWNER" /out
