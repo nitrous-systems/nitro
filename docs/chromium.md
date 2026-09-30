@@ -682,7 +682,7 @@ server's capture ops (`docs/wire.md` § Screen capture, design in
   --synthetic` playing and the page's GPU canvas animating. It also measures
   display fps off vs recording, CPU, the server's capture counters and
   dma-buf memory. Needs a server that grants the capture
-  (`NITRO_CAPTURE_ALLOW=1` until #676 C's prompt). Measurements:
+  (`NITRO_CAPTURE_ALLOW=1` in its environment, or answer the #676 C prompt: `chrome` is on the default `capture.allow` list). Measurements:
   `docs/budget.md` § Chromium screen sharing.
 
 ## Other gotchas

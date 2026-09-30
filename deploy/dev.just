@@ -305,7 +305,7 @@ chromium-dnd:
 # check, display fps sharing off vs on, CPU, the server's capture counters
 # and dma-buf memory while recording and after (see the script). Needs
 # `deploy-chromium` and a session whose server grants capture
-# (NITRO_CAPTURE_ALLOW=1 until the prompt of #676 C). `just chromium-share
+# (NITRO_CAPTURE_ALLOW=1 in its environment, or answer the prompt). `just chromium-share
 # 30 60` shares for 30 s at 60 fps; KEEP=1 on the box keeps the logs.
 [doc("Chromium screen sharing (getDisplayMedia) end to end on the box: PASS/FAIL + measurements")]
 [group('dev')]
