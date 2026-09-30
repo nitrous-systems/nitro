@@ -98,6 +98,12 @@ impl PixelStore for DmabufPixels {
     fn fence_fd(&self) -> Option<BorrowedFd<'_>> {
         Some(self.fd.as_fd())
     }
+
+    /// A dma-buf's `AR24` is premultiplied, the Wayland/GPU convention
+    /// (#3921): Chromium's GPU process presents its render output as is.
+    fn premultiplied(&self) -> bool {
+        true
+    }
 }
 
 /// What the server imports into KMS at commit, when the output backend

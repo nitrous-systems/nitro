@@ -3425,3 +3425,80 @@ fn overlay_over_matches_fill_irect_blend_for_every_alpha() {
         }
     }
 }
+
+/// Premultiply a straight-alpha `[B, G, R, A]` buffer in place (round to
+/// nearest), the way a GPU producer would have written it.
+fn premultiply(data: &mut [u8]) {
+    for p in data.chunks_exact_mut(4) {
+        let a = u32::from(p[3]);
+        for c in &mut p[..3] {
+            *c = ((u32::from(*c) * a + 127) / 255) as u8;
+        }
+    }
+}
+
+#[test]
+fn premultiplied_argb_blends_like_its_straight_equivalent() {
+    // #3921: a client dma-buf's AR24 is premultiplied. The same picture in
+    // either convention must composite to within rounding of each other,
+    // 1:1 and scaled, at full and partial opacity.
+    let straight = noisy_argb(16, 16, 0x0123_4567_89AB_CDEF);
+    let mut premul = straight.clone();
+    premultiply(&mut premul);
+    let simg = image_of(&straight, 16, 16, PixelFormat::Argb8888);
+    let pimg = image_of(&premul, 16, 16, PixelFormat::Argb8888Premul);
+    for (dw, dh) in [(16.0_f32, 16.0_f32), (24.0, 21.0), (9.0, 11.0)] {
+        for opacity in [1.0_f32, 0.6] {
+            let mut a = Surface::new(32, 32);
+            let mut b = Surface::new(32, 32);
+            let all = IRect::new(0, 0, 32, 32);
+            let dst = Rect::new(2.0, 3.0, dw, dh);
+            for s in [&mut a, &mut b] {
+                s.canvas().fill_irect(&all, &all, Color::rgb(20, 90, 160));
+            }
+            a.canvas().blit(&all, &dst, &simg, &simg.bounds(), opacity);
+            b.canvas().blit(&all, &dst, &pimg, &pimg.bounds(), opacity);
+            for y in 0..32 {
+                for x in 0..32 {
+                    let (pa, pb) = (a.bgr(x, y), b.bgr(x, y));
+                    let d = [pa.0.abs_diff(pb.0), pa.1.abs_diff(pb.1), pa.2.abs_diff(pb.2)];
+                    assert!(
+                        d.iter().all(|v| *v <= 3),
+                        "({x},{y}) {dw}x{dh} o={opacity}: straight {pa:?} premul {pb:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn premultiplied_argb_is_not_multiplied_twice() {
+    // 50 % white, premultiplied (128,128,128,128), over black: 128 grey.
+    // Read as straight alpha it would come out at 64.
+    let mut data = vec![0u8; 64];
+    data[0..4].copy_from_slice(&[128, 128, 128, 128]);
+    let img = Image {
+        data: &data,
+        width: 1,
+        height: 1,
+        stride: 64,
+        format: PixelFormat::Argb8888Premul,
+    };
+    assert!(!PixelFormat::Argb8888Premul.is_opaque());
+    let mut s = Surface::new(4, 2);
+    let clip = s.canvas().bounds();
+    s.canvas().fill_irect(&clip, &clip, Color::BLACK);
+    s.canvas()
+        .blit(&clip, &Rect::new(0.0, 0.0, 1.0, 1.0), &img, &img.bounds(), 1.0);
+    let (b, g, r) = s.bgr(0, 0);
+    assert!(b.abs_diff(128) <= 1 && g.abs_diff(128) <= 1 && r.abs_diff(128) <= 1);
+    // Scaled too.
+    let mut s = Surface::new(4, 4);
+    let clip = s.canvas().bounds();
+    s.canvas().fill_irect(&clip, &clip, Color::BLACK);
+    s.canvas()
+        .blit(&clip, &Rect::new(0.0, 0.0, 3.0, 3.0), &img, &img.bounds(), 1.0);
+    let (_, _, r) = s.bgr(1, 1);
+    assert!(r.abs_diff(128) <= 1, "scaled: {r}");
+}

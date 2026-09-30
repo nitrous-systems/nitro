@@ -10,7 +10,7 @@
 
 use nitro_core::Color;
 
-use crate::blend::{effective_alpha, effective_alpha_cov, over_straight};
+use crate::blend::{div255, effective_alpha, effective_alpha_cov, over_premul, over_straight};
 
 /// A [`Fill`](crate::Fill) specialised for one device row.
 ///
@@ -240,6 +240,44 @@ pub(crate) fn blend_straight_row(drow: &mut [u8], srow: &[u8], src_opaque: bool,
             over_straight(u32::from(s[1]), u32::from(d[1]), a),
             over_straight(u32::from(s[2]), u32::from(d[2]), a),
             over_straight(255, u32::from(d[3]), a),
+        ];
+        d.copy_from_slice(&out);
+    }
+}
+
+/// Source-over a row of **premultiplied** `[B, G, R, A]` source pixels
+/// onto `drow`, scaled by `opacity`.
+///
+/// `dst = src * o + dst * (1 - a * o)` per channel, byte 3 included (the
+/// destination alpha is premultiplied too, #3898). A channel above its
+/// alpha (malformed input) saturates rather than wraps.
+pub(crate) fn blend_premul_row(drow: &mut [u8], srow: &[u8], opacity: u8) {
+    let o = u32::from(opacity);
+    for (d, s) in drow.chunks_exact_mut(4).zip(srow.chunks_exact(4)) {
+        let a = if o == 255 {
+            u32::from(s[3])
+        } else {
+            div255(u32::from(s[3]) * o)
+        };
+        let c = |v: u8| {
+            if o == 255 {
+                u32::from(v)
+            } else {
+                div255(u32::from(v) * o)
+            }
+        };
+        if a == 255 {
+            d.copy_from_slice(&[s[0], s[1], s[2], 255]);
+            continue;
+        }
+        if a == 0 && s[0] | s[1] | s[2] == 0 {
+            continue;
+        }
+        let out = [
+            over_premul(c(s[0]), u32::from(d[0]), a),
+            over_premul(c(s[1]), u32::from(d[1]), a),
+            over_premul(c(s[2]), u32::from(d[2]), a),
+            over_premul(a, u32::from(d[3]), a),
         ];
         d.copy_from_slice(&out);
     }

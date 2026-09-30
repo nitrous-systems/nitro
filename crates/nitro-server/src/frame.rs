@@ -1423,6 +1423,9 @@ struct ScaledTarget<'a> {
     opaque: Option<Vec<IRect>>,
     /// The exact (fractional) device rect, for the general blit.
     exact: Rect,
+    /// The alpha format outside the opaque region: premultiplied for a
+    /// client dma-buf (#3921), straight otherwise.
+    alpha_format: PixelFormat,
 }
 
 /// Whether [`paint_xrgb_scaled`] applies to `item`, and with what: an
@@ -1480,6 +1483,11 @@ fn scaled_target<'a>(scene: &'a Scene, item: &PaintItem) -> Option<ScaledTarget<
         image,
         opaque,
         exact,
+        alpha_format: if buffer.premultiplied() {
+            PixelFormat::Argb8888Premul
+        } else {
+            PixelFormat::Argb8888
+        },
     })
 }
 
@@ -1574,7 +1582,7 @@ fn paint_xrgb_scaled(
     let stored = Region::from_rects(&opaque).intersect(&Region::rect(clip));
     let rest = Region::rect(clip).subtract(&stored);
     let straight = RasterImage {
-        format: PixelFormat::Argb8888,
+        format: t.alpha_format,
         ..t.image
     };
     if stored.overflowed() || rest.overflowed() {
@@ -1645,7 +1653,8 @@ fn paint_item(
             let Ok(buffer) = scene.buffer(buffer) else {
                 return;
             };
-            let Some(pixel_format) = pixel_format(buffer.desc().format) else {
+            let Some(pixel_format) = pixel_format(buffer.desc().format, buffer.premultiplied())
+            else {
                 return;
             };
             let image = RasterImage {
@@ -1769,7 +1778,10 @@ fn blit_with_opaque_region(
     opaque: &[IRect],
 ) -> bool {
     if opaque.is_empty()
-        || image.format != PixelFormat::Argb8888
+        || !matches!(
+            image.format,
+            PixelFormat::Argb8888 | PixelFormat::Argb8888Premul
+        )
         || item.opacity < 1.0
         || !item.shift_exact()
     {
@@ -1877,6 +1889,9 @@ fn paint_surface(
                 stride: desc.stride,
                 format: if desc.format == format::XR24 {
                     PixelFormat::Xrgb8888
+                } else if buffer.premultiplied() {
+                    // A client dma-buf (#3921).
+                    PixelFormat::Argb8888Premul
                 } else {
                     PixelFormat::Argb8888
                 },
@@ -1917,9 +1932,12 @@ fn yuv_encoding(color: SurfaceColor) -> YuvEncoding {
 /// The rasterizer's layout for a client's fourcc, or `None` for a format
 /// the server does not accept (it rejected it at `CreateBuffer` time, so
 /// this is belt and braces).
-fn pixel_format(fourcc: u32) -> Option<PixelFormat> {
+/// `premultiplied` is [`nitro_scene::Buffer::premultiplied`]: a client
+/// dma-buf's `AR24` is premultiplied, a memfd's straight (#3921).
+fn pixel_format(fourcc: u32, premultiplied: bool) -> Option<PixelFormat> {
     match fourcc {
         format::XR24 => Some(PixelFormat::Xrgb8888),
+        format::AR24 if premultiplied => Some(PixelFormat::Argb8888Premul),
         format::AR24 => Some(PixelFormat::Argb8888),
         _ => None,
     }

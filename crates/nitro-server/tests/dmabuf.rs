@@ -1244,3 +1244,55 @@ fn direct_scanout_follows_the_planes() {
     );
     h.quit();
 }
+
+// ------------------------------------------------------------- alpha
+
+#[test]
+fn a_linear_ar24_dmabuf_blends_premultiplied() {
+    // #3921: a client dma-buf's AR24 is premultiplied (the GPU/Wayland
+    // convention), unlike a memfd's. 50 % red premultiplied is
+    // (B, G, R, A) = (0, 0, 128, 128); read as straight alpha it would
+    // come out half as red.
+    let h = Harness::start("ar24", 60_000);
+    let (mut conn, mut seen) = dma_client(&h, "ar24", 0);
+    let c = window(&mut conn, &mut seen);
+    h.settle();
+    let under = grab(&h, &c);
+
+    let len = SIDE * SIDE * 4;
+    let fd = nitro_shm::create_sealed("nitro-dmabuf-ar24", u64::from(len)).unwrap();
+    let mut map = MappingMut::map_mut(fd.as_fd(), len as usize).unwrap();
+    for p in map.as_bytes_mut().chunks_exact_mut(4) {
+        p.copy_from_slice(&[0, 0, 128, 128]);
+    }
+    let id = BufferId(20);
+    conn.create_dmabuf_buffer(CreateDmabufBuffer {
+        id,
+        width: SIDE,
+        height: SIDE,
+        format: format::AR24,
+        modifier: modifier::LINEAR,
+        planes: vec![plane(fd.try_clone().unwrap(), 0, SIDE * 4)],
+    })
+    .unwrap();
+    conn.commit(2).unwrap();
+    conn.flush().unwrap();
+    presented(&mut conn, &mut seen, 2);
+    assert_eq!(h.stat("dmabuf_cpu_mapped"), 1);
+
+    present(&mut conn, SURF, id, 3);
+    presented(&mut conn, &mut seen, 3);
+    h.settle();
+    let got = grab(&h, &c);
+    let keep = |d: u8| (u32::from(d) * 127 + 127) / 255;
+    for (i, (g, u)) in got.iter().zip(&under).enumerate() {
+        let want = [keep(u[0]), keep(u[1]), 128 + keep(u[2])];
+        for k in 0..3 {
+            assert!(
+                u32::from(g[k]).abs_diff(want[k].min(255)) <= 2,
+                "px {i}: under {u:?} got {g:?} want {want:?}"
+            );
+        }
+    }
+    h.quit();
+}

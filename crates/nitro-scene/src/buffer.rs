@@ -171,6 +171,13 @@ pub trait PixelStore: fmt::Debug {
     fn fence_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
         None
     }
+    /// Whether an `AR24` buffer's colour bytes are already multiplied by
+    /// its alpha. `false` (straight alpha) for memfd buffers; `true` for a
+    /// client dma-buf, whose producer is a GPU or a Wayland-style client
+    /// (#3921, `docs/wire.md` § Client dma-bufs). Other formats ignore it.
+    fn premultiplied(&self) -> bool {
+        false
+    }
 }
 
 impl PixelStore for Vec<u8> {
@@ -225,5 +232,10 @@ impl Buffer {
     /// [`PixelStore::fence_fd`].
     pub fn fence_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
         self.data.fence_fd()
+    }
+
+    /// [`PixelStore::premultiplied`].
+    pub fn premultiplied(&self) -> bool {
+        self.data.premultiplied()
     }
 }

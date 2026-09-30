@@ -4,7 +4,8 @@ use nitro_core::{Color, IRect, Point, Rect};
 
 use crate::blend::{div255, effective_alpha, over_premul, unit_u8};
 use crate::paint::{
-    RowPaint, blend_mask_row, blend_mask_row_opaque, blend_pixel, blend_solid, blend_straight_row,
+    RowPaint, blend_mask_row, blend_mask_row_opaque, blend_pixel, blend_premul_row, blend_solid,
+    blend_straight_row,
     lerp_color, mix, paint_cov, paint_full, store_solid,
 };
 use crate::shape::{RRect, RowSpans};
@@ -295,6 +296,10 @@ pub enum PixelFormat {
     Xrgb8888,
     /// `[B, G, R, A]` with **straight** (non-premultiplied) alpha.
     Argb8888,
+    /// `[B, G, R, A]` with **premultiplied** alpha: the colour bytes are
+    /// already scaled by `A` (the Wayland/GPU `ARGB8888` convention; a
+    /// client dma-buf's AR24, #3921).
+    Argb8888Premul,
 }
 
 impl PixelFormat {
@@ -302,6 +307,12 @@ impl PixelFormat {
     #[must_use]
     pub fn is_opaque(self) -> bool {
         matches!(self, Self::Xrgb8888)
+    }
+
+    /// Whether the colour bytes are already multiplied by the alpha.
+    #[must_use]
+    pub fn is_premultiplied(self) -> bool {
+        matches!(self, Self::Argb8888Premul)
     }
 }
 
@@ -350,7 +361,7 @@ impl Image<'_> {
         let px = &self.data[off..off + 4];
         let alpha = match self.format {
             PixelFormat::Xrgb8888 => 255,
-            PixelFormat::Argb8888 => u32::from(px[3]),
+            PixelFormat::Argb8888 | PixelFormat::Argb8888Premul => u32::from(px[3]),
         };
         Texel {
             b: u32::from(px[0]),
@@ -938,8 +949,9 @@ impl<'a> Canvas<'a> {
     /// Draw `src_rect` of `src` into `dst`.
     ///
     /// Nearest-neighbour when the mapping is 1:1 and integer-aligned,
-    /// bilinear otherwise. `Argb8888` sources are straight-alpha and are
-    /// composited source-over; `Xrgb8888` sources are opaque.
+    /// bilinear otherwise. `Argb8888` sources are straight-alpha and
+    /// `Argb8888Premul` ones premultiplied, both composited source-over;
+    /// `Xrgb8888` sources are opaque.
     pub fn blit(
         &mut self,
         clip: &IRect,
@@ -1060,7 +1072,13 @@ impl<'a> Canvas<'a> {
         // float and a `floor()` per pixel: two integer adds per pixel.
         let step = (scale_x * 65536.0) as i64;
         let (src_first, src_last) = (sr.x, sr.right() - 1);
-        let opaque_src = src.format.is_opaque();
+        let opaque_src = if src.format.is_opaque() {
+            Alpha::Opaque
+        } else if src.format.is_premultiplied() {
+            Alpha::Premul
+        } else {
+            Alpha::Straight
+        };
         let src_pitch = src.stride as usize;
         let full_extra = u32::from(effective_alpha(255, 255, opacity));
         let stride = self.stride as usize;
@@ -1194,6 +1212,8 @@ impl<'a> Canvas<'a> {
                 for (d, s) in dtail.chunks_exact_mut(4).zip(stail.chunks_exact(4)) {
                     d.copy_from_slice(&[s[0], s[1], s[2], 255]);
                 }
+            } else if src.format.is_premultiplied() {
+                blend_premul_row(drow, srow, opacity);
             } else {
                 blend_straight_row(drow, srow, src.format.is_opaque(), opacity);
             }
@@ -1326,8 +1346,19 @@ struct RowSampler<'a> {
     base: i64,
     /// Source x increment per destination column, 16.16.
     step: i64,
-    /// Whether the source format has no alpha channel to filter.
-    opaque: bool,
+    /// How the source's byte 3 is read.
+    opaque: Alpha,
+}
+
+/// How a scaled blit reads a source texel's byte 3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Alpha {
+    /// Ignored: the texel is opaque.
+    Opaque,
+    /// Straight alpha: the colour is multiplied by it while filtering.
+    Straight,
+    /// Premultiplied: the colour already is.
+    Premul,
 }
 
 impl RowSampler<'_> {
@@ -1588,12 +1619,12 @@ fn ch(row0: &[u8], row1: &[u8], i: usize, w: [u32; 4]) -> u32 {
 /// is a `>> 16` rather than a division; an opaque source needs no division
 /// at all.
 #[inline]
-fn bilinear(row0: &[u8], row1: &[u8], tx: u32, ty: u32, opaque: bool) -> Texel {
+fn bilinear(row0: &[u8], row1: &[u8], tx: u32, ty: u32, mode: Alpha) -> Texel {
     let (wx1, wx0) = (tx, 256 - tx);
     let (wy1, wy0) = (ty, 256 - ty);
     let w = [wx0 * wy0, wx1 * wy0, wx0 * wy1, wx1 * wy1];
 
-    if opaque {
+    if mode == Alpha::Opaque {
         return Texel {
             b: ch(row0, row1, 0, w),
             g: ch(row0, row1, 1, w),
@@ -1615,6 +1646,17 @@ fn bilinear(row0: &[u8], row1: &[u8], tx: u32, ty: u32, opaque: bool) -> Texel {
             g: 0,
             r: 0,
             a: 0,
+        };
+    }
+    if mode == Alpha::Premul {
+        // Already premultiplied: filter the channels as they are. A
+        // malformed texel (a channel above its alpha) is clamped so the
+        // blend's `c <= a` premise holds.
+        return Texel {
+            b: ch(row0, row1, 0, w).min(alpha),
+            g: ch(row0, row1, 1, w).min(alpha),
+            r: ch(row0, row1, 2, w).min(alpha),
+            a: alpha,
         };
     }
     // Fold each texel's alpha into its weight so the weighted sum comes out
@@ -1685,7 +1727,7 @@ mod blend_texel_tests {
                 &rows[1],
                 u32::from(next()),
                 u32::from(next()),
-                false,
+                super::Alpha::Straight,
             );
             assert_eq!((t.a, t.b, t.g, t.r), (0, 0, 0, 0));
         }
