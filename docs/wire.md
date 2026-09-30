@@ -2367,14 +2367,17 @@ layout.
   kept, imported as a KMS framebuffer when the output has planes, and
   painted as a **placeholder** (opaque 50 % grey, `stats`
   `dmabuf_placeholder_paints`) until the planes module (#3899) scans it
-  out. Never a crash, never a read of unmapped memory.
+  out or the GPU helper composites it (the `COMPOSITE` flag below).
+  Never a crash, never a read of unmapped memory.
 
 **Alpha.** `AR24` in a `CreateDmabufBuffer` is **premultiplied** (the
 Wayland `ARGB8888` convention, and what a GPU renders), on every path: the
-CPU painter blends it premultiplied. The GPU helper (#3922) composites
-only opaque client buffers (`XR24`, YUV) under its shadow, so an `AR24`
-dma-buf needs the `CPU` path (linear) to be seen; a tiled one shows the
-placeholder. An `AR24` memfd (`CreateBuffer`, `CreateSurfaceBuffer`)
+CPU painter blends it premultiplied, and the GPU helper (#3922, #3952)
+composites it premultiplied: an `AR24` pair flagged `COMPOSITE` (tiled
+included) is shown with its alpha while the flag is advertised; one
+flagged neither `CPU` nor `COMPOSITE` shows the placeholder. Declare the
+opaque part with `SetOpaqueRegion`: the helper stores it and blends only
+the rest. An `AR24` memfd (`CreateBuffer`, `CreateSurfaceBuffer`)
 stays straight alpha (#3921).
 
 **Render at display size or smaller.** Display planes upscale but barely
@@ -2462,6 +2465,14 @@ clients that listed `DMABUF`. The same data a Wayland adapter needs for
 | 0 | `SCANOUT` | a plane of the output lists this pair in `IN_FORMATS` (advertised is not usable: a `TEST_ONLY` commit decides) |
 | 1 | `CPU` | linear and convertible by the CPU path: shown correctly today |
 | 2 | `IMPORT` | accepted by `CreateDmabufBuffer` at all |
+| 3 | `COMPOSITE` | the server's GPU helper composites this pair, alpha included (#3952): shown correctly while advertised, on the output the helper serves |
+
+`COMPOSITE` comes and goes with the helper: set once it answers `Hello`,
+kept across an idle exit, a VT switch and a crash backoff, dropped when
+it gives up or `gpu.helper = off` (a new default and per-node feedback
+is sent either way). A client holding a pair that lost `COMPOSITE`
+(and has no `CPU`) reallocates; until then its buffer is a placeholder.
+Old clients ignore the bit.
 
 **When.** The default (the union over every output, `max_*` the largest
 output) when the client lists `DMABUF`, and again whenever the outputs

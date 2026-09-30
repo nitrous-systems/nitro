@@ -506,6 +506,37 @@ remainder.
   the helper. Entering mode 2 moves that output's shadow into a sealed
   memfd: the same 8 MB, counted as RssShmem instead of RssAnon.
 
+### As built: translucent Surfaces in mode 2 (#3952)
+
+A premultiplied `AR24` dma-buf (Chromium's CSD window) is composited by
+the helper too, split in two around the shadow:
+
+- **O, the opaque part** (the node's `SetOpaqueRegion`, mapped to device
+  pixels when the Surface is drawn 1:1 on whole pixels —
+  `frame::opaque_device_rects`, shared by painter and layer builder):
+  `Opaque` layers **under** the shadow. The Surface paints as an
+  `opaque_only` hole (`PaintKind::Hole { opaque_only: true }`), which
+  clears only O, so a menu over the page body is right, as for an
+  opaque Surface.
+- **R, the rest** (rounded corners, the shadow ring; the whole Surface
+  when it is scaled, e.g. an overview thumbnail): `PremulOver` layers
+  **above** the shadow, which keeps what is below the window there.
+  R loses whatever later items cover opaquely (`opaque_cover`, or a
+  later window's declared opaque region). A later *translucent* item
+  over R — a menu's soft shadow, the software cursor — ends up under
+  the ring instead of over it: a known, small approximation, counted
+  per layer build in `stats` `gpu_translucent_approx`.
+- A Surface's layers stay together within `MAX_LAYERS` (16, one of them
+  the shadow); when they do not fit, the bottom Surfaces go whole
+  (CPU if linear, placeholder if tiled). A CSD window takes ~2 opaque
+  and 4–6 ring layers.
+- **Feedback.** The helper's sampleable XR24/AR24 pairs are advertised
+  with `dmabuf_flags::COMPOSITE` (`docs/wire.md`), so Chromium allocates
+  a tiled AR24 while the helper runs and linear otherwise (it recreates
+  its buffers when the bit changes). The helper serves one output: a
+  tiled translucent window on another output shows the placeholder, the
+  same limit opaque tiled XR24 has. A single crash keeps `COMPOSITE`
+  (backoff restart); the tiled window is a placeholder for those frames.
 ## Capture: shots and screen recording
 
 ### As built: `shot` (#3962)
