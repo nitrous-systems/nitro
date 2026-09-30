@@ -200,6 +200,35 @@ page load), paint 26 µs. That matches the in-process 1.8 % / 4 frames/s.
 
 ### testhost2: i5-8250U, UHD 620 (KBL), eDP 2560×1440@60
 
+> **#3953: testhost2's ~31 fps was a bench artefact, not the box.** The
+> box's `server.conf` has `pointer.natural_scroll = true`, and the server
+> inverts injected wheel events too. So `scroll-bench.py`'s first 150
+> events (+15, meant as "down") scrolled *up* at the top of the page and
+> produced no frames. Only the second 150 scrolled. fps is frames / the
+> whole scroll's wall time (4.8 s), so it read half: 150 frames, every
+> interval 16.7 ms (hence p50 16.7 ms next to 31 fps), i2p `n` ≈ 140 of
+> 300. It was never the event rate, the panel (PSR1 is on but flips stay
+> a steady 16.7 ms; no DRRS) or scaling. In the testhost2 tables below,
+> the fps column (pre-#3953 bench) is **halved**. i2p, paint, memory and
+> CPU are valid. The bench now reads the server's `pointer_natural_scroll`
+> stat (or `server.conf` for an older server) and flips its sign. It warns
+> when frames < 0.8 × events. Same box, same session, 2026-09-30, 2 runs
+> each (1 for the old bench):
+>
+> | arm | scale | fps | frame p50/p95/max ms | i2p p50/p95/max ms (n of 300) | server paint mean |
+> |---|---|---|---|---|---|
+> | oop, old bench | 1.25 | 32.1 | 16.7/16.7/– | 25.0/32.4/34.9 (144) | 0.97 ms |
+> | **oop** | 1.25 | **61.8–62.3** | 16.7/16.7/16.7 | 24.7–25.2/32.4–32.5/33.1–33.9 (284–288) | 1.03–1.06 ms |
+> | **dmabuf** | 1.25 | **61.4–61.6** | 16.7/16.7/16.7 | 25.0–25.2/31.9–32.3/33.1 (287–288) | 1.05–1.08 ms |
+> | oop, old bench | 1 | 31.2 | 16.7/16.7/16.7 | 25.0/32.3/40.9 (138) | 1.02 ms |
+> | **oop** | 1 | **61.6–61.7** | 16.7/16.7/16.7 | 24.6–25.1/32.0–32.1/32.7–40.4 (283–287) | 0.99–1.04 ms |
+> | **dmabuf** | 1 | **61.7–61.9** | 16.7/16.7/16.7 | 24.6–25.1/31.9/32.6–33.1 (284–288) | 1.01–1.09 ms |
+>
+> box1 (natural scroll off, so unchanged): oop 62.1, dmabuf 61.6 fps, i2p
+> p50 24.9 / 25.4 ms. Both boxes scroll at 60 Hz, and the scale makes no
+> difference.
+
+
 **Scale 1.25 (the box's usual setting), #3940.** Before #3940, every arm
 was limited by the server rather than by Chromium. At a fractional
 scale, a window at a logical position that is not a multiple of 4 had a
@@ -225,8 +254,8 @@ unit, `NITRO_SCALE=eDP-1=1.25`, 2 runs each):
 (One oop run's frame max, 1.6 s, is the idle gap before the scroll.) Both
 parts are needed. The in-process path already sent exact `px/scale`
 bounds, so the server snap alone fixes it. The out-of-process path also
-needs the Chromium change. After the fix, 1.25 matches scale 1: ~31 fps,
-which is the event rate, as at scale 1 below. Memory and CPU are
+needs the Chromium change. After the fix, 1.25 matches scale 1: ~31 fps
+(which is really ~62, see #3953 above), as at scale 1 below. Memory and CPU are
 unchanged. At **scale 1** after #3940: inproc 31.4 fps, paint 1.22 ms,
 i2p p50 25.1; oop 31.5 fps, paint 1.02 ms, i2p p50 25.1. That is the
 same as the table below, so there is no regression. Text at 1.25 is
@@ -248,9 +277,10 @@ restored afterwards:
 | gpu (readback) | 29.2–30.4 | 16.7/16.7–33.3/33.3 | 17.2–19.0/30.4–32.7/35–41 | 1.62 ms | 134–149 / 283–301 MB | 81–82 / 182 MB | 556–574 MB | 57–63 % |
 
 At scale 1 the window is 1.63 Mpx of damage per frame, and every arm
-delivers ~31 fps on 60 Hz with 16.7 ms frame intervals. Chromium produces
-a frame every other vblank, so the event rate, not the present path, is
-what the fps column shows there. i2p is the same for inproc and oop.
+delivers ~31 fps on 60 Hz with 16.7 ms frame intervals. This was once read
+as "a frame every other vblank, the event rate". It is not: half the
+events were no-op scrolls past the top (natural scroll, #3953 above), and
+the real rate is ~62 fps. i2p is the same for inproc and oop.
 
 ### Reading
 
@@ -339,6 +369,7 @@ loaded Mesa driver; #3919's oop GPU process was 30–34 MB.
 `dmabuf_buffers 0`), which is the fallback working, and is listed as such.
 
 **testhost2** (KBL, anv), eDP 2560×1440@60 at **scale 1.25** (#3940 has
+landed; fps halved by the pre-#3953 bench, see §testhost2: really ~62),
 landed), window 1262×1376 px, 2026-09-30:
 
 | arm | fps | i2p p50/p95/max ms | server paint mean | browser PSS / RSS | GPU proc PSS / RSS | tree PSS | chrome CPU |
@@ -366,9 +397,9 @@ did not happen.
 **Reading:**
 
 - **It works on both boxes, and costs nothing in fps or i2p.** Every arm
-  is at the event rate (31 / 62 fps) with the same i2p, as in #3919:
-  this scroll is input-bound, so neither the readback's i2p gain nor a
-  loss shows.
+  scrolls at 60 Hz (62 fps; testhost2's 31 is the pre-#3953 bench halving
+  it) with the same i2p, as in #3919: this scroll is input-bound, so
+  neither the readback's i2p gain nor a loss shows.
 - **CPU:** on box1 (2 cores) the chrome tree drops from 73–77 % to 53–56 %
   over the scroll: raster moved to the GPU, no readback. On testhost2 it
   is noisy and not lower (62–73 % vs 41–80 %).

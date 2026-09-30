@@ -114,11 +114,19 @@ modifier) and **scans it out on a plane**:
     `planes_mode 1`).
   - Windowed 720p (1600×900 device px at scale 1.25): overlay above the
     UI (`planes_mode 1`).
-  - Limit: a **1080p clip in its default window** is downscaled to
-    1600×900 (0.83×). That is under KBL's 0.94× floor, so it cannot go
-    on a plane and shows the grey placeholder
-    (`dmabuf_placeholder_paints` grows) until the GPU helper (#3922).
-    Resize the window or go fullscreen.
+  - A **1080p clip in its default window** is downscaled to 1600×900
+    (0.83×). That is under KBL's 0.94× floor, so it cannot go on a
+    plane. Since #3922 the GPU helper composites it (`planes_mode 2`).
+    Measured in #3953 (temporary `nitro-dev` unit, 450 frames): a real
+    picture (the CRTC CRC changes 62 times in 2 s), 0 dropped, 1 late,
+    `gpu_frames` +456, `gpu_composite_us` avg 756 / max 992,
+    `gpu_fallbacks` 0, `dmabuf_placeholder_paints` +1 (the first frame
+    only, not +452 as before). Server CPU 3.0 % (was 27–31 % with the
+    placeholder), player 5.3 %, helper RSS 13.9 MB. `nitro-shot` still
+    shows grey there: it reads the server's shadow, where the video is a
+    hole that `shot` fills with the placeholder colour (#3897). A server started before the #3922 build was
+    installed (a GDM login from earlier) has no helper and still paints
+    the placeholder (`planes_mode 0`, 31 % CPU).
 - **box1 (HSW, i965):** no plane lists NV12, so the server does not
   import Y-tiled NV12 at all. `auto` decodes in software (`fallback="the
   server does not import NV12 with modifier 0x100000000000002"`), and

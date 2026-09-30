@@ -7047,6 +7047,15 @@ impl Server {
         // benchmark waits for the second to reach 0.
         pairs.push(("input_injected", self.injector.injected));
         pairs.push(("input_inject_pending", self.injector.pending() as u64));
+        // `pointer.natural_scroll` as 0/1: the server inverts every
+        // axis event, injected ones included, so a scroll benchmark
+        // reads this to know which sign scrolls content down (#3953:
+        // with it on, the bench's first phase hit the top of the page
+        // and produced no frames).
+        pairs.push((
+            "pointer_natural_scroll",
+            u64::from(self.settings.pointer.natural_scroll()),
+        ));
         // The remote listener's address, with the port the kernel chose
         // for a configured `:0`, or `off`. Text rather than a number
         // because an address is not a count; see

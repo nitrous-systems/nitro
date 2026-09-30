@@ -87,6 +87,23 @@ impl Harness {
         line.trim_end_matches('\n').to_owned()
     }
 
+    fn stat(&self, key: &str) -> u64 {
+        let s = UnixStream::connect(&self.path).expect("connect");
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut c = BufReader::new(s);
+        c.get_mut().write_all(b"stats\n").unwrap();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert!(c.read_line(&mut line).unwrap() > 0, "stat {key} missing");
+            let l = line.trim_end_matches('\n');
+            assert!(!l.is_empty(), "stat {key} missing");
+            if let Some(v) = l.strip_prefix(key).and_then(|r| r.strip_prefix(' ')) {
+                return v.parse().expect("numeric stat");
+            }
+        }
+    }
+
     fn rewrite_config(&self, conf: &str) {
         let tmp = self.config_dir.join("server.conf.tmp");
         std::fs::write(&tmp, conf).expect("write temp");
@@ -207,8 +224,11 @@ fn natural_scroll_inverts_every_axis_source_and_a_reload_reverts_it() {
         (3.0, 15.0),
         "traditional by default"
     );
+    // The stat a scroll benchmark reads to pick its sign (#3953).
+    assert_eq!(h.stat("pointer_natural_scroll"), 0);
 
     h.reload("pointer.natural_scroll = true\n");
+    assert_eq!(h.stat("pointer_natural_scroll"), 1);
     for source in [
         AxisSource::Wheel,
         AxisSource::Finger,
@@ -228,6 +248,7 @@ fn natural_scroll_inverts_every_axis_source_and_a_reload_reverts_it() {
         (3.0, 15.0),
         "back to traditional"
     );
+    assert_eq!(h.stat("pointer_natural_scroll"), 0);
     h.quit();
 }
 
