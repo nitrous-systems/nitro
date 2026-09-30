@@ -497,7 +497,9 @@ In order. Each step can land on its own:
    --greeter` runs `[nitro-server, nitro-greeter]` with the greeter as
    `Role::Primary` (exit 0: tear down, exit 0; else restart, never give
    up). `deploy/greetd/` has the config and notes, `just install-greetd`
-   installs it (opt-in), `just box-greetd` sets up a test box.
+   installs it (opt-in), `just box-greetd` sets up a test box. Later
+   (#3979): the session picker and the power actions are icon buttons
+   with popup menus (`nitro_ui::menu`).
 6. **Docs**: done (#3951). README and `docs/install.md` "Starting a
    session": option A (getty + profile) as the zero-install path and
    option B (greetd); `DEPENDENCIES.md`: greetd is a runtime

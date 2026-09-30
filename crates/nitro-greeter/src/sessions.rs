@@ -122,6 +122,29 @@ pub fn sessions() -> Vec<SessionEntry> {
     sessions_in(Path::new(WAYLAND_SESSIONS), builtin())
 }
 
+/// The session menu's item ids, one per entry: the entry's `desktop`
+/// (`nitro`, `sway`) when it is an addressable name
+/// ([`nitro_ui::introspect::addressable`]) used by no other entry,
+/// otherwise `session-{index}`. The ids name the menu's rows
+/// (`window[1]/sway`), so they are always unique.
+#[must_use]
+pub fn menu_ids(entries: &[SessionEntry]) -> Vec<String> {
+    entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let d = e.desktop.as_str();
+            let unique = entries.iter().filter(|o| o.desktop == d).count() == 1;
+            // `session-N` is the fallback's namespace: never a desktop's.
+            if unique && nitro_ui::introspect::addressable(d) && !d.starts_with("session-") {
+                d.to_owned()
+            } else {
+                format!("session-{i}")
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,6 +212,37 @@ mod tests {
                 "/usr/bin/systemd-cat",
                 "--identifier=nitro-session",
                 "/opt/nitro-session"
+            ]
+        );
+    }
+
+    #[test]
+    fn menu_ids_are_desktops_when_addressable_and_unique() {
+        let e = |d: &str| SessionEntry {
+            desktop: d.into(),
+            ..nitro()
+        };
+        let got = menu_ids(&[
+            e("nitro"),
+            e("sway"),
+            e("dup"),
+            e("dup"),
+            e("has space"),
+            e("a/b"),
+            e(""),
+            e("session-0"),
+        ]);
+        assert_eq!(
+            got,
+            [
+                "nitro",
+                "sway",
+                "session-2",
+                "session-3",
+                "session-4",
+                "session-5",
+                "session-6",
+                "session-7"
             ]
         );
     }

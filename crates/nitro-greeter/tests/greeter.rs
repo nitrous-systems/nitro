@@ -11,7 +11,7 @@ use nitro_login::{ErrorKind, MessageKind, Request, Response};
 use nitro_ui::event::key;
 use nitro_ui::introspect;
 use nitro_ui::test::Harness;
-use nitro_ui::{Size, WidgetId};
+use nitro_ui::{MenuButton, Size, WidgetId, WindowId};
 
 /// Records what the greeter sent; the test plays greetd.
 #[derive(Clone, Default)]
@@ -84,6 +84,40 @@ fn get(h: &mut Harness<Greeter>, n: &str) -> String {
     if v == "-" { String::new() } else { v }
 }
 
+/// Click the menu button `n` and return its open popup.
+fn open(h: &mut Harness<Greeter>, n: &str) -> WindowId {
+    let b = named(h, n);
+    h.click(b);
+    h.settle();
+    h.ui()
+        .widget::<MenuButton<Greeter>>(b)
+        .unwrap()
+        .popup()
+        .unwrap_or_else(|| panic!("{n}'s menu did not open"))
+}
+
+fn is_open(h: &mut Harness<Greeter>, n: &str) -> bool {
+    let b = named(h, n);
+    h.ui()
+        .widget::<MenuButton<Greeter>>(b)
+        .unwrap()
+        .popup()
+        .is_some()
+}
+
+/// A row of the open menu: its value (checked or not).
+fn row_value(h: &mut Harness<Greeter>, id: &str) -> String {
+    introspect::get_prop(h.ui(), &format!("window[1]/{id}"), "value")
+        .unwrap_or_else(|e| panic!("no menu row {id}: {e}"))
+}
+
+fn click_row(h: &mut Harness<Greeter>, id: &str) {
+    let r = introspect::resolve(h.ui(), &format!("window[1]/{id}"))
+        .unwrap_or_else(|| panic!("no menu row {id}"));
+    h.click(r);
+    h.settle();
+}
+
 fn type_name(h: &mut Harness<Greeter>, name: &str) {
     let path = format!("window/{}", names::USER);
     let (ui, s) = h.parts();
@@ -131,10 +165,31 @@ fn no_lock_is_taken_and_the_name_field_has_the_keyboard() {
     let user = named(&mut h, names::USER);
     assert_eq!(h.ui().focused(), Some(user));
     assert!(shown(&mut h, names::SESSION));
-    assert!(shown(&mut h, names::SUSPEND));
-    assert!(shown(&mut h, names::POWEROFF));
+    assert!(shown(&mut h, names::SESSION_NAME));
+    assert!(shown(&mut h, names::POWER));
     assert!(!shown(&mut h, names::LOGOUT));
-    assert_eq!(get(&mut h, names::SESSION), "Nitro");
+    assert_eq!(get(&mut h, names::SESSION_NAME), "Nitro");
+    assert_eq!(get(&mut h, names::SESSION), "closed");
+    // The bar sits under the card: session bottom-left, power
+    // bottom-right.
+    let (s, p, ans) = (
+        named(&mut h, names::SESSION),
+        named(&mut h, names::POWER),
+        named(&mut h, names::USER),
+    );
+    let (sb, pb, ub) = (
+        h.ui().window_bounds(s),
+        h.ui().window_bounds(p),
+        h.ui().window_bounds(ans),
+    );
+    assert!(
+        sb.x < ub.x && pb.right() > ub.right(),
+        "{sb:?} {pb:?} {ub:?}"
+    );
+    assert!(
+        sb.y > ub.bottom() && pb.y > ub.bottom(),
+        "{sb:?} {pb:?} {ub:?}"
+    );
 }
 
 #[test]
@@ -178,7 +233,10 @@ fn the_remembered_user_is_asked_for_at_once() {
     });
     assert_eq!(sent(&b), [Request::CancelSession, create("bob")]);
     assert_eq!(get(&mut h, names::USER), "bob");
-    assert_eq!(get(&mut h, names::SESSION), "Sway");
+    assert_eq!(get(&mut h, names::SESSION_NAME), "Sway");
+    open(&mut h, names::SESSION);
+    assert_eq!(row_value(&mut h, "sway"), "true");
+    assert_eq!(row_value(&mut h, "nitro"), "false");
 }
 
 #[test]
@@ -202,26 +260,68 @@ fn a_wrong_password_keeps_the_name_and_asks_again() {
 }
 
 #[test]
-fn the_session_button_cycles_and_the_chosen_command_is_sent() {
+fn the_session_menu_picks_and_the_chosen_command_is_sent() {
     let (mut h, b) = greeter(Remembered::default());
     recv(&mut h, Response::Success);
-    let pick = |h: &mut Harness<Greeter>| {
-        let path = format!("window/{}", names::SESSION);
-        let (ui, s) = h.parts();
-        introspect::invoke(ui, s, &path, "click", None).unwrap();
-        h.settle();
-    };
-    pick(&mut h);
-    assert_eq!(get(&mut h, names::SESSION), "Sway");
-    pick(&mut h);
-    assert_eq!(get(&mut h, names::SESSION), "Nitro", "round");
-    pick(&mut h);
+    let pop = open(&mut h, names::SESSION);
+    assert_eq!(get(&mut h, names::SESSION), "open");
+    assert_eq!(row_value(&mut h, "nitro"), "true");
+    click_row(&mut h, "sway");
+    assert!(!h.ui().has_window(pop), "picking closes the menu");
+    assert!(!is_open(&mut h, names::SESSION));
+    assert_eq!(get(&mut h, names::SESSION_NAME), "Sway");
+    // And back, and forth again: the mark follows the choice.
+    open(&mut h, names::SESSION);
+    assert_eq!(row_value(&mut h, "sway"), "true");
+    assert_eq!(row_value(&mut h, "nitro"), "false");
+    click_row(&mut h, "nitro");
+    assert_eq!(get(&mut h, names::SESSION_NAME), "Nitro");
+    open(&mut h, names::SESSION);
+    click_row(&mut h, "sway");
     type_name(&mut h, "alice");
     recv(&mut h, secret("Password: "));
     type_asdf(&mut h);
     sent(&b);
     recv(&mut h, Response::Success);
     assert_eq!(sent(&b), [start_of(&sessions()[1])]);
+    recv(&mut h, Response::Success);
+    assert_eq!(
+        h.state().remembered().session.as_deref(),
+        Some("Sway"),
+        "the picked session is remembered"
+    );
+}
+
+#[test]
+fn the_menus_are_reachable_with_tab_and_driven_by_keys() {
+    let (mut h, _b) = greeter(Remembered::default());
+    let user = named(&mut h, names::USER);
+    let session = named(&mut h, names::SESSION);
+    let power = named(&mut h, names::POWER);
+    assert_eq!(h.ui().focused(), Some(user));
+    let mut seen = Vec::new();
+    for _ in 0..8 {
+        h.key(key::TAB);
+        h.settle();
+        if let Some(f) = h.ui().focused() {
+            seen.push(f);
+        }
+    }
+    assert!(seen.contains(&session), "Tab reaches the session button");
+    assert!(seen.contains(&power), "Tab reaches the power button");
+    // Down opens with the chosen session highlighted; Down, Enter picks
+    // the next.
+    h.ui().focus(session);
+    h.settle();
+    h.key(key::DOWN);
+    h.settle();
+    assert!(is_open(&mut h, names::SESSION), "Down opens");
+    h.key(key::DOWN);
+    h.key(key::ENTER);
+    h.settle();
+    assert!(!is_open(&mut h, names::SESSION));
+    assert_eq!(get(&mut h, names::SESSION_NAME), "Sway");
+    assert_eq!(h.state().chosen_session().unwrap().name, "Sway");
 }
 
 #[test]
@@ -249,9 +349,15 @@ fn a_start_session_error_is_shown_and_cancelled() {
 #[test]
 fn a_power_button_without_a_session_shows_the_error() {
     let (mut h, _b) = greeter(Remembered::default());
-    let p = named(&mut h, names::SUSPEND);
-    h.click(p);
-    h.settle();
+    let pop = open(&mut h, names::POWER);
+    for id in [names::SUSPEND, names::REBOOT, names::POWEROFF] {
+        assert!(
+            introspect::resolve(h.ui(), &format!("window[1]/{id}")).is_some(),
+            "no {id} in the power menu"
+        );
+    }
+    click_row(&mut h, names::SUSPEND);
+    assert!(!h.ui().has_window(pop));
     assert!(get(&mut h, names::MESSAGE).contains("no session at"));
 }
 
@@ -266,12 +372,7 @@ fn lock_mode_hides_the_greeter_controls() {
         build,
     );
     h.settle();
-    for n in [
-        names::SESSION,
-        names::SUSPEND,
-        names::REBOOT,
-        names::POWEROFF,
-    ] {
+    for n in [names::SESSION, names::SESSION_NAME, names::POWER] {
         assert!(!shown(&mut h, n), "{n} is greeter-only");
     }
 }

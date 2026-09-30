@@ -6,21 +6,30 @@
 //! `nitro-auth` in lock mode, greetd ([`greetd::Greetd`]) in greeter mode.
 //!
 //! ```text
-//! ┌──────────────────────────────┐
-//! │            14:05             │  clock
-//! │  [ alice                  ]  │  user     (Enter submits)
-//! │  Password:                   │  prompt   (PAM's text)
-//! │  [ ••••••                 ]  │  answer   (masked for `secret`)
-//! │  Authentication failure      │  message  (notices and errors)
-//! │  Checking…                   │  status   (while waiting)
-//! │  [ Log out ]                 │  logout   (another user's name only)
-//! │  [ Nitro ]                   │  session  (greeter: click cycles)
-//! │  [Suspend][Restart][Power off]│  power   (greeter only)
-//! └──────────────────────────────┘
+//! ┌──────────────────────────────────────────┐
+//! │     ┌──────────────────────────────┐     │
+//! │     │            14:05             │     │  clock
+//! │     │  [ alice                  ]  │     │  user     (Enter submits)
+//! │     │  Password:                   │     │  prompt   (PAM's text)
+//! │     │  [ ••••••                 ]  │     │  answer   (masked for `secret`)
+//! │     │  Authentication failure      │     │  message  (notices and errors)
+//! │     │  Checking…                   │     │  status   (while waiting)
+//! │     │  [ Log out ]                 │     │  logout   (another user's name only)
+//! │     └──────────────────────────────┘     │
+//! │ (▭) Nitro                            (⏻) │  session · session-name · power
+//! └──────────────────────────────────────────┘
 //! ```
 //!
+//! The bottom bar is greeter-only. `session` (bottom-left) is an icon
+//! button opening a menu of the sessions, the chosen one marked;
+//! `session-name` shows the choice. `power` (bottom-right) opens a menu
+//! of Suspend / Restart / Power off. Both are reachable with Tab and
+//! their menus are keyboard-driven ([`nitro_ui::menu`]).
+//!
 //! Every widget is named, so `hey nitro-greeter get window/message value`
-//! works; `window/answer`'s `value` is the mask, never the text.
+//! works; `window/answer`'s `value` is the mask, never the text. An open
+//! menu is the popup window `window[1]`, its rows named by item id:
+//! `window[1]/sway`, `window[1]/poweroff`.
 //!
 //! **Lock mode** (`nitro-greeter --lock`, what `nitro-session --locked`
 //! and the bar's Lock action run): the window is [`Surface::lock`]. Right
@@ -52,9 +61,13 @@ use std::path::PathBuf;
 
 use nitro_bar::clock::{self, Zone};
 use nitro_login::{ErrorKind, MessageKind, Request};
+use nitro_system::session::Action;
 use nitro_ui::build::{ContainerBuilder as _, StyleBuilder as _};
-use nitro_ui::widgets::{Button, Label, TextField, button, column, label, panel, row, text_field};
-use nitro_ui::{App, ColorRole, CrossAlign, FdToken, MainAlign, Size, Surface, Ui, WidgetId};
+use nitro_ui::widgets::{Label, TextField, button, column, label, panel, row, spacer, text_field};
+use nitro_ui::{
+    App, ColorRole, CrossAlign, FdToken, MainAlign, MenuButton, MenuEntry, MenuItem, Size, Surface,
+    Ui, WidgetId, menu_button,
+};
 
 pub use backend::{AuthHelper, Backend};
 pub use conv::{Conversation, State};
@@ -80,14 +93,20 @@ pub mod names {
     pub const STATUS: &str = "status";
     /// Log out, offered when someone else's name was typed.
     pub const LOGOUT: &str = "logout";
-    /// The session picker (greeter): its label is the session, a click
-    /// picks the next one.
+    /// The session menu button (greeter). Its menu's rows are named by
+    /// [`sessions::menu_ids`](crate::sessions::menu_ids) (`window[1]/sway`),
+    /// their value is whether the session is the chosen one.
     pub const SESSION: &str = "session";
-    /// Suspend (greeter).
+    /// The chosen session's name, next to the session button (greeter).
+    pub const SESSION_NAME: &str = "session-name";
+    /// The power menu button (greeter).
+    pub const POWER: &str = "power";
+    /// Suspend: a power menu item, `window[1]/suspend` while it is open.
     pub const SUSPEND: &str = "suspend";
-    /// Reboot (greeter).
+    /// Reboot: a power menu item, `window[1]/reboot` while it is open.
     pub const REBOOT: &str = "reboot";
-    /// Power off (greeter).
+    /// Power off: a power menu item, `window[1]/poweroff` while it is
+    /// open.
     pub const POWEROFF: &str = "poweroff";
 }
 
@@ -116,7 +135,9 @@ struct Ids {
     status: WidgetId,
     logout: WidgetId,
     session: WidgetId,
+    session_name: WidgetId,
     power: WidgetId,
+    bar: WidgetId,
 }
 
 /// The app's state.
@@ -136,6 +157,8 @@ pub struct Greeter {
     unlocked: bool,
     /// Greeter: what can be started, and which is chosen.
     sessions: Vec<SessionEntry>,
+    /// The session menu's item ids, one per entry.
+    session_ids: Vec<String>,
     chosen: usize,
     remembered: Remembered,
     /// Greeter: greetd accepted the session; the app is quitting.
@@ -164,6 +187,7 @@ impl Greeter {
             session_socket: None,
             unlocked: false,
             sessions: Vec::new(),
+            session_ids: Vec::new(),
             chosen: 0,
             remembered: Remembered::default(),
             started: false,
@@ -188,6 +212,7 @@ impl Greeter {
             .unwrap_or(0);
         let mut g = Self::lock(String::new(), backend);
         g.mode = Mode::Greeter;
+        g.session_ids = sessions::menu_ids(&sessions);
         g.sessions = sessions;
         g.chosen = chosen;
         g.remembered = remembered;
@@ -270,7 +295,8 @@ fn now_ms() -> i64 {
 const TEXT: f32 = 15.0;
 const CARD_W: f32 = 320.0;
 
-/// Build the tree: a full-screen background with one centred card.
+/// Build the tree: a full-screen background with one centred card and,
+/// under it, the greeter's bar of session and power menus.
 ///
 /// Public so the tests build what the binary builds.
 ///
@@ -315,28 +341,7 @@ pub fn build(ui: &mut Ui<Greeter>) -> WidgetId {
             .name(names::LOGOUT)
             .on_click(|s: &mut Greeter, ui: &mut Ui<Greeter>| logout(s, ui)),
     );
-    let session = ui.build(
-        button("")
-            .name(names::SESSION)
-            .on_click(|s: &mut Greeter, ui: &mut Ui<Greeter>| next_session(s, ui)),
-    );
-    let suspend = ui.build(button("Suspend").name(names::SUSPEND).on_click(
-        |s: &mut Greeter, ui: &mut Ui<Greeter>| {
-            power(s, ui, nitro_system::session::Action::Suspend);
-        },
-    ));
-    let reboot = ui.build(button("Restart").name(names::REBOOT).on_click(
-        |s: &mut Greeter, ui: &mut Ui<Greeter>| power(s, ui, nitro_system::session::Action::Reboot),
-    ));
-    let poweroff = ui.build(button("Power off").name(names::POWEROFF).on_click(
-        |s: &mut Greeter, ui: &mut Ui<Greeter>| {
-            power(s, ui, nitro_system::session::Action::Poweroff);
-        },
-    ));
-    let power_row = ui.build(row().gap(8.0).main_align(MainAlign::Center));
-    for c in [suspend, reboot, poweroff] {
-        ui.attach(power_row, c).unwrap();
-    }
+    let (bar, session, session_name, power) = bottom_bar(ui);
     let card = ui.build(
         panel()
             .background_role(ColorRole::Surface)
@@ -346,9 +351,7 @@ pub fn build(ui: &mut Ui<Greeter>) -> WidgetId {
             .cross_align(CrossAlign::Center)
             .width(CARD_W),
     );
-    for c in [
-        clock, user, prompt, answer, message, status, logout, session, power_row,
-    ] {
+    for c in [clock, user, prompt, answer, message, status, logout] {
         ui.attach(card, c).unwrap();
     }
     let root = ui.build(
@@ -358,7 +361,11 @@ pub fn build(ui: &mut Ui<Greeter>) -> WidgetId {
             .width_percent(1.0)
             .height_percent(1.0),
     );
-    ui.attach(root, card).unwrap();
+    let above = ui.build(spacer().grow(1.0));
+    let below = ui.build(spacer().grow(1.0));
+    for c in [above, card, below, bar] {
+        ui.attach(root, c).unwrap();
+    }
     let ids = Ids {
         clock,
         user,
@@ -368,7 +375,9 @@ pub fn build(ui: &mut Ui<Greeter>) -> WidgetId {
         status,
         logout,
         session,
-        power: power_row,
+        session_name,
+        power,
+        bar,
     };
     // The state is not reachable from `build`; the loop runs a zero
     // timer on its first turn, before the first frame is presented.
@@ -377,6 +386,57 @@ pub fn build(ui: &mut Ui<Greeter>) -> WidgetId {
         start(s, ui);
     });
     root
+}
+
+/// The greeter's bar: the session menu and its name bottom-left, the
+/// power menu bottom-right. Returns the bar, session, session-name and
+/// power ids.
+fn bottom_bar(ui: &mut Ui<Greeter>) -> (WidgetId, WidgetId, WidgetId, WidgetId) {
+    let session = ui.build(
+        menu_button("display")
+            .name(names::SESSION)
+            .label("Session")
+            .on_select(|_s: &mut Greeter, ui: &mut Ui<Greeter>, id: &str| {
+                let id = id.to_owned();
+                ui.defer(move |s, ui| pick_session(s, ui, &id));
+            }),
+    );
+    let session_name = ui.build(
+        label("")
+            .name(names::SESSION_NAME)
+            .size(TEXT - 2.0)
+            .color_role(ColorRole::TextDim),
+    );
+    let power = ui.build(
+        menu_button("power")
+            .name(names::POWER)
+            .label("Power")
+            .align_right(true)
+            .item(MenuItem::new(names::SUSPEND, "Suspend").icon("moon"))
+            .item(MenuItem::new(names::REBOOT, "Restart").icon("bootstrap-reboot"))
+            .item(MenuItem::new(names::POWEROFF, "Power off").icon("power"))
+            .on_select(|_s: &mut Greeter, ui: &mut Ui<Greeter>, id: &str| {
+                let action = match id {
+                    names::SUSPEND => Action::Suspend,
+                    names::REBOOT => Action::Reboot,
+                    names::POWEROFF => Action::Poweroff,
+                    _ => return,
+                };
+                ui.defer(move |s, ui| power(s, ui, action));
+            }),
+    );
+    let bar = ui.build(
+        row()
+            .width_percent(1.0)
+            .padding(16.0)
+            .gap(8.0)
+            .cross_align(CrossAlign::Center),
+    );
+    let fill = ui.build(spacer().grow(1.0));
+    for c in [session, session_name, fill, power] {
+        ui.attach(bar, c).unwrap();
+    }
+    (bar, session, session_name, power)
 }
 
 /// Take the lock and ask for the owner's password.
@@ -405,6 +465,20 @@ fn start(s: &mut Greeter, ui: &mut Ui<Greeter>) {
                     f.set_text(user.clone().unwrap_or_default());
                 }
                 ui.set_collapsed(ids.logout, true);
+                let items: Vec<MenuEntry> = s
+                    .sessions
+                    .iter()
+                    .zip(&s.session_ids)
+                    .enumerate()
+                    .map(|(i, (e, id))| {
+                        MenuItem::new(id.clone(), e.name.clone())
+                            .radio(i == s.chosen)
+                            .into()
+                    })
+                    .collect();
+                if let Ok(mut b) = ui.widget_mut::<MenuButton<Greeter>>(ids.session) {
+                    b.set_items(items);
+                }
             }
             match user {
                 Some(u) => submit_user(s, ui, &u),
@@ -594,18 +668,16 @@ fn handed_off(s: &mut Greeter, ui: &mut Ui<Greeter>) {
     ui.quit();
 }
 
-/// The session picker: the next one, round.
-fn next_session(s: &mut Greeter, ui: &mut Ui<Greeter>) {
-    if !s.sessions.is_empty() {
-        s.chosen = (s.chosen + 1) % s.sessions.len();
+/// The session menu: `id` was picked.
+fn pick_session(s: &mut Greeter, ui: &mut Ui<Greeter>, id: &str) {
+    if let Some(i) = s.session_ids.iter().position(|x| x == id) {
+        s.chosen = i;
     }
-    // The button is out of its slot during its own callback: relabel it
-    // on the deferred step.
-    ui.defer(render);
+    render(s, ui);
 }
 
-/// A power button: ask our own `nitro-session`.
-fn power(s: &mut Greeter, ui: &mut Ui<Greeter>, action: nitro_system::session::Action) {
+/// The power menu: ask our own `nitro-session`.
+fn power(s: &mut Greeter, ui: &mut Ui<Greeter>, action: Action) {
     let path = s
         .session_socket
         .clone()
@@ -624,7 +696,7 @@ fn logout(s: &mut Greeter, ui: &mut Ui<Greeter>) {
         .clone()
         .or_else(nitro_system::session::default_socket_path);
     let res = match path {
-        Some(p) => nitro_system::session::request(&p, nitro_system::session::Action::Logout),
+        Some(p) => nitro_system::session::request(&p, Action::Logout),
         None => Err("no session socket".to_owned()),
     };
     s.logout_error = res.err().map(|e| format!("Could not log out: {e}"));
@@ -688,13 +760,19 @@ fn render(s: &mut Greeter, ui: &mut Ui<Greeter>) {
     ui.set_collapsed(ids.status, *s.conv.state() != State::Waiting);
     ui.set_collapsed(ids.logout, s.other_user.is_none());
     let greeter = s.mode == Mode::Greeter;
-    ui.set_collapsed(ids.session, !greeter);
-    ui.set_collapsed(ids.power, !greeter);
-    if greeter
-        && let Some(e) = s.sessions.get(s.chosen)
-        && let Ok(mut b) = ui.widget_mut::<Button<Greeter>>(ids.session)
-    {
-        b.set_text(e.name.clone());
+    for id in [ids.bar, ids.session, ids.session_name, ids.power] {
+        ui.set_collapsed(id, !greeter);
+    }
+    if greeter && let Some(e) = s.sessions.get(s.chosen) {
+        if let Ok(mut l) = ui.widget_mut::<Label>(ids.session_name) {
+            l.set_text(e.name.clone());
+        }
+        if let (Some(id), Ok(mut b)) = (
+            s.session_ids.get(s.chosen),
+            ui.widget_mut::<MenuButton<Greeter>>(ids.session),
+        ) {
+            b.set_checked(id, true);
+        }
     }
     if prompting.is_some() {
         ui.focus(ids.answer);

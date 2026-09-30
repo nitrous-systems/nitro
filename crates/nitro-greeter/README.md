@@ -6,17 +6,18 @@ key") instead of a hard-coded password box. See `docs/greeter.md`,
 decisions 4 and 6.
 
 ```text
-┌──────────────────────────────┐
-│            14:05             │  clock
-│  [ alice                  ]  │  user     (Enter submits)
-│  Password:                   │  prompt   (PAM's text)
-│  [ ••••••                 ]  │  answer   (masked for `secret`)
-│  Authentication failure      │  message  (notices and errors)
-│  Checking…                   │  status   (while waiting)
-│  [ Log out ]                 │  logout   (another user's name only)
-│  [ Nitro ]                   │  session  (greeter: click cycles)
-│ [Suspend][Restart][Power off]│  power    (greeter only)
-└──────────────────────────────┘
+┌──────────────────────────────────────────┐
+│     ┌──────────────────────────────┐     │
+│     │            14:05             │     │  clock
+│     │  [ alice                  ]  │     │  user     (Enter submits)
+│     │  Password:                   │     │  prompt   (PAM's text)
+│     │  [ ••••••                 ]  │     │  answer   (masked for `secret`)
+│     │  Authentication failure      │     │  message  (notices and errors)
+│     │  Checking…                   │     │  status   (while waiting)
+│     │  [ Log out ]                 │     │  logout   (another user's name only)
+│     └──────────────────────────────┘     │
+│ (▭) Nitro                            (⏻) │  session · session-name · power
+└──────────────────────────────────────────┘
 ```
 
 ## Greeter mode
@@ -44,10 +45,16 @@ password asks again for the same name.
   next to this binary, under `systemd-cat` so its log reaches the
   journal), then `/usr/share/wayland-sessions/*.desktop` read with
   `nitro-launcher`'s parser. A `nitro.desktop` that runs nitro-session is
-  skipped as a duplicate. The `session` button shows the current session,
-  and a click moves to the next one.
-- **Power**: `suspend`, `reboot`, `poweroff` on the greeter session's own
-  `session.sock`. A failure shows on the message line.
+  skipped as a duplicate. The `session` icon button (bottom-left)
+  opens a menu of the sessions with the current one marked; the
+  `session-name` label next to it shows the choice.
+- **Power**: one `power` icon button (bottom-right) opens a menu of
+  Suspend / Restart / Power off: `suspend`, `reboot`, `poweroff` on the
+  greeter session's own `session.sock`. A failure shows on the message
+  line.
+- Both buttons are reachable with Tab; their menus open with a click,
+  Enter, Space or Down and are driven with the arrow keys, Enter and
+  Escape.
 
 ## Lock mode
 
@@ -102,13 +109,15 @@ $ cargo build -p nitro-auth && cargo run -p nitro-greeter -- --lock
 
 `hey nitro-greeter get window/message value` reads the message line;
 `window/answer`'s value is always the mask. Names: `clock`, `user`,
-`prompt`, `answer`, `message`, `status`, `logout`, `session`, `suspend`,
-`reboot`, `poweroff`. A text field is driven with `set … value` and
-`do … submit`.
+`prompt`, `answer`, `message`, `status`, `logout`, `session`,
+`session-name`, `power`. A text field is driven with `set … value` and
+`do … submit`. An open menu is the popup `window[1]`, its rows named by
+item id: the power menu's `suspend`, `reboot`, `poweroff`, the session
+menu's `nitro`, `sway`, … (the session's desktop name, else
+`session-N`); a row's value is whether it is checked.
 
 ## Not yet
 
-A user list, a real session list widget (the picker is a cycling
-button), and multiple outputs: other outputs show only the
+A user list, a tooltip on the icon buttons, and multiple outputs: other outputs show only the
 background, because the server draws nothing but the lock owner's
 windows.

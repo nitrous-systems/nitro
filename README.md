@@ -40,5 +40,5 @@ your distribution (`pacman -S greetd`, `apt install greetd`), then
 commands it prints. The greeter is a nitro-ui app running on its own
 nitro-server as the greeter user. It renders whatever PAM asks, offers
 nitro and the machine's `/usr/share/wayland-sessions` entries, and has
-suspend/restart/power-off buttons. See [docs/greeter.md](docs/greeter.md)
+a power menu (suspend/restart/power off). See [docs/greeter.md](docs/greeter.md)
 and [deploy/greetd/README.md](deploy/greetd/README.md).

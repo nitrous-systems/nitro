@@ -355,7 +355,8 @@ $ g() { sudo -u _greetd env XDG_RUNTIME_DIR=/run/user/110 ~/nitro-bin/hey nitro-
 $ g set window/user value nitrotest; g do window/user submit
 $ g get window/prompt value          # Password:
 $ g set window/answer value …; g do window/answer submit
-$ g do window/session click          # next session in the picker
+$ g do window/session click; g do window[1]/sway click   # pick a session from the menu
+$ g get window/session-name value
 ```
 
 Do not put a password on a `sudo` command line: sudo logs it to the
