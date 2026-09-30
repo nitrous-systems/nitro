@@ -495,4 +495,32 @@ The crate count moves once, for the PAM binding in step 3: `cargo tree
 
 ## Step 4 on the boxes
 
-PENDING
+Measured 2026-09-30 on box1 (Haswell, `nitro-dev` unit, `--locked` via a
+temporary drop-in) and testbox2 (Kaby Lake laptop, a temporary
+`nitro-dev` unit with GDM stopped). Both boxes were restored afterwards:
+no drop-in or unit left, GDM running on testbox2. `/etc/pam.d/nitro-lock`
+stays, as part of the deployed set.
+
+| | box1 | testbox2 |
+|---|---|---|
+| `--locked`: server `first_frame_ms` (nothing drawn, locked) | 240 | 262 |
+| `--locked`: server ready → lock screen owns the lock | 4 ms | 6 ms |
+| `lock` (bar button) → lock screen owns the lock | 8 ms (`hey` click returned in 12 ms) | — |
+| greeter `kill -9` → replacement owns the lock | 1.0 s (the first backoff) | 1.0 s |
+| password accepted → `session unlocked` | < 5 ms after `pam_unix` returned | — |
+
+Checked on both: the bar's Lock button locks, and a screenshot shows only
+the lock screen. A wrong password shows PAM's "Authentication failure"
+and the screen stays locked. A killed greeter leaves the session locked
+(`the lock owner went away; the session stays locked`), and the restart
+takes the lock over. The right password unlocks, the greeter exits 0,
+and `status` shows `nitro-greeter -` (not restarted). Super+L locks
+(box1). A human unlocked both: no flash of the desktop, and "unlock was
+very fast". Unlock-to-desktop is one composite after `Unlock`, because
+the desktop's windows were never torn down, only hidden (`Admit`).
+
+Two findings, both follow-ups (issues): the password field needs a Caps
+Lock warning and a show/hide toggle. A Caps Lock state that ydotool had
+left on in the compositor cost two failed attempts, with nothing on
+screen to say why. And logind's `Lock` signal plus a paint-before-sleep
+inhibitor are not built (`power.rs`).
