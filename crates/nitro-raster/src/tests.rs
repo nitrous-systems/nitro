@@ -3461,7 +3461,11 @@ fn premultiplied_argb_blends_like_its_straight_equivalent() {
             for y in 0..32 {
                 for x in 0..32 {
                     let (pa, pb) = (a.bgr(x, y), b.bgr(x, y));
-                    let d = [pa.0.abs_diff(pb.0), pa.1.abs_diff(pb.1), pa.2.abs_diff(pb.2)];
+                    let d = [
+                        pa.0.abs_diff(pb.0),
+                        pa.1.abs_diff(pb.1),
+                        pa.2.abs_diff(pb.2),
+                    ];
                     assert!(
                         d.iter().all(|v| *v <= 3),
                         "({x},{y}) {dw}x{dh} o={opacity}: straight {pa:?} premul {pb:?}"
@@ -3489,16 +3493,26 @@ fn premultiplied_argb_is_not_multiplied_twice() {
     let mut s = Surface::new(4, 2);
     let clip = s.canvas().bounds();
     s.canvas().fill_irect(&clip, &clip, Color::BLACK);
-    s.canvas()
-        .blit(&clip, &Rect::new(0.0, 0.0, 1.0, 1.0), &img, &img.bounds(), 1.0);
+    s.canvas().blit(
+        &clip,
+        &Rect::new(0.0, 0.0, 1.0, 1.0),
+        &img,
+        &img.bounds(),
+        1.0,
+    );
     let (b, g, r) = s.bgr(0, 0);
     assert!(b.abs_diff(128) <= 1 && g.abs_diff(128) <= 1 && r.abs_diff(128) <= 1);
     // Scaled too.
     let mut s = Surface::new(4, 4);
     let clip = s.canvas().bounds();
     s.canvas().fill_irect(&clip, &clip, Color::BLACK);
-    s.canvas()
-        .blit(&clip, &Rect::new(0.0, 0.0, 3.0, 3.0), &img, &img.bounds(), 1.0);
+    s.canvas().blit(
+        &clip,
+        &Rect::new(0.0, 0.0, 3.0, 3.0),
+        &img,
+        &img.bounds(),
+        1.0,
+    );
     let (_, _, r) = s.bgr(1, 1);
     assert!(r.abs_diff(128) <= 1, "scaled: {r}");
 }

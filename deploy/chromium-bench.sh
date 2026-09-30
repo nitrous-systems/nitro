@@ -11,6 +11,12 @@
 #   gpu       NITRO_GPU_READBACK=1 --use-angle=vulkan
 #             --enable-features=Vulkan,DefaultANGLEVulkan,VulkanFromANGLE
 #             (GPU raster, glReadPixels into the shm canvas; measurement only)
+#   dmabuf    --use-angle=${NITRO_BENCH_ANGLE:-vulkan} (+ the Vulkan features
+#             when vulkan): GPU raster into GBM dma-bufs presented with
+#             explicit fences (#3921). NITRO_BENCH_ANGLE=gl for ANGLE-GL
+#             (box1's hasvk if VulkanFromANGLE import fails)
+#   shm       no flag, NITRO_NO_DMABUF=1: the fallback the dmabuf arm
+#             replaces, with GPU on (A/B)
 #
 # For each run: starts chrome (a fresh profile under /tmp) on a 1500-row
 # page, waits for it to settle, runs scroll-bench.py over the window
@@ -18,7 +24,7 @@
 # and prints PSS/RSS of the browser and GPU processes, idle, before the
 # scroll. Then closes chrome. Needs the session's control socket.
 set -euo pipefail
-mode=${1:?mode: inproc|oop|gpu}
+mode=${1:?mode: inproc|oop|gpu|dmabuf|shm}
 runs=${2:-2}
 here=$(cd "$(dirname "$0")" && pwd)
 chrome=${NITRO_CHROME:-$HOME/nitro-bin/chromium/chrome}
@@ -40,6 +46,10 @@ case $mode in
     oop) flags+=(--disable-gpu) ;;
     gpu) flags+=(--use-angle=vulkan --enable-features=Vulkan,DefaultANGLEVulkan,VulkanFromANGLE)
          envs+=(NITRO_GPU_READBACK=1) ;;
+    dmabuf) angle=${NITRO_BENCH_ANGLE:-vulkan}
+            flags+=(--use-angle="$angle")
+            [[ $angle == vulkan ]] && flags+=(--enable-features=Vulkan,DefaultANGLEVulkan,VulkanFromANGLE) ;;
+    shm) envs+=(NITRO_NO_DMABUF=1) ;;
     *) echo "unknown mode $mode" >&2; exit 2 ;;
 esac
 
@@ -67,13 +77,17 @@ for run in $(seq 1 "$runs"); do
     b_pss=$(pss $pid); b_rss=$(rss $pid)
     g_pss=0; g_rss=0
     [[ -n $gpu ]] && { g_pss=$(pss "$gpu"); g_rss=$(rss "$gpu"); }
+    # One server stat, through scroll-bench.py's control-socket client.
+    stat() { python3 -c "import importlib.machinery as m; b=m.SourceFileLoader('sb','$here/scroll-bench.py').load_module(); print(b.stats().get('$1','-'))" 2>/dev/null || echo -; }
+    s0="$(stat dmabuf_buffers) $(stat fence_waits) $(stat dmabuf_placeholder_paints)"
     j0=$(tree_jiffies); t0=$(date +%s.%N)
     row=$(python3 "$here/scroll-bench.py" --label "$mode #$run" 2>&1 | tail -3)
     j1=$(tree_jiffies); t1=$(date +%s.%N)
     cpu=$(python3 -c "print(round(($j1-$j0)/$(getconf CLK_TCK)/($t1-$t0)*100))")
     echo "$row"
+    echo "  server: dmabuf_buffers/fence_waits/placeholder_paints before $s0, after $(stat dmabuf_buffers) $(stat fence_waits) $(stat dmabuf_placeholder_paints); planes_mode $(stat planes_mode), gpu_frames $(stat gpu_frames)"
     echo "  mem idle: browser PSS $((b_pss/1024)) MB (RSS $((b_rss/1024))), gpu PSS $((g_pss/1024)) MB (RSS $((g_rss/1024))), tree PSS $((tree_pss/1024)) MB; chrome CPU over scroll ${cpu}% of one core"
-    grep -m4 -E "NITRO_GPU|the server lacks|FATAL|GPU process has crashed|GL_RENDERER|ANGLE" "$prof/log" | cut -c1-200 | sed 's/^/  log: /' || true
+    grep -m6 -E "NITRO_GPU|nitro: GBM|dma-buf|GPU raster|the server lacks|FATAL|GPU process has crashed|GL_RENDERER|ANGLE" "$prof/log" | cut -c1-200 | sed 's/^/  log: /' || true
     kill $pid 2>/dev/null || true
     wait $pid 2>/dev/null || true
     # The browser's children may still be writing the profile.

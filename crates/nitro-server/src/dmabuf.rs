@@ -236,7 +236,12 @@ pub fn validate(
             },
         };
         let desc = validate_surface_geometry(&geo)?;
-        (desc, surface_map_len(&geo))
+        // The scene's length check is `stride × rows` (`byte_len`), which
+        // with a padded pitch (GBM's, #3921) runs past the last row's
+        // payload: map that much when the buffer has it, as
+        // `AllocSurfaceBuffers` does with its export.
+        let size = usize::try_from(inodes[0].2).unwrap_or(usize::MAX);
+        (desc, surface_map_len(&geo).max(desc.byte_len().min(size)))
     } else {
         // Geometry only: nothing reads these bytes.
         let plane1 = (m.format == format::NV12)

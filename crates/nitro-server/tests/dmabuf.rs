@@ -1296,3 +1296,32 @@ fn a_linear_ar24_dmabuf_blends_premultiplied() {
     }
     h.quit();
 }
+
+#[test]
+fn a_linear_dmabuf_with_a_padded_pitch_takes_the_cpu_path() {
+    // #3921: GBM pads the pitch (1262 px → 5056 bytes, not 5048). The
+    // mapping must cover the scene's `stride × rows`, not just up to the
+    // last row's payload, or registering it is a fatal `BadBuffer`.
+    let h = Harness::start("pitch", 60_000);
+    let (mut conn, mut seen) = dma_client(&h, "pitch", 0);
+    let _c = window(&mut conn, &mut seen);
+    let stride = SIDE * 4 + 64;
+    let fd = nitro_shm::create_sealed("nitro-dmabuf-pitch", u64::from(stride * SIDE)).unwrap();
+    conn.create_dmabuf_buffer(CreateDmabufBuffer {
+        id: BufferId(30),
+        width: SIDE,
+        height: SIDE,
+        format: format::XR24,
+        modifier: modifier::LINEAR,
+        planes: vec![plane(fd, 0, stride)],
+    })
+    .unwrap();
+    conn.commit(2).unwrap();
+    conn.flush().unwrap();
+    presented(&mut conn, &mut seen, 2);
+    assert_eq!(h.stat("dmabuf_buffers"), 1);
+    assert_eq!(h.stat("dmabuf_cpu_mapped"), 1);
+    present(&mut conn, SURF, BufferId(30), 3);
+    presented(&mut conn, &mut seen, 3);
+    h.quit();
+}

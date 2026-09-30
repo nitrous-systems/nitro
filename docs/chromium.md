@@ -1,4 +1,4 @@
-# Chromium on nitro: the Ozone backend (#3778, #3865, #3919)
+# Chromium on nitro: the Ozone backend (#3778, #3865, #3919, #3921)
 
 The backend lives in the Chromium tree, not in this repo: `ui/ozone/platform/nitro/` on branch `nitro-ozone` of the Chromium checkout (`/home/kaspar/src/ai/chromium/src` by default). How to build it, and the `NITRO_CHROMIUM_OUT` override the justfile uses, is in [chromium-build.md](chromium-build.md). Its companion wire client is `wire/`, from #3777.
 
@@ -6,8 +6,12 @@ The backend lives in the Chromium tree, not in this repo: `ui/ozone/platform/nit
 - **GN args:** `out/Default/args.gn` has `ozone_platform_nitro = true`, with headless kept.
 - **Run:**
   ```
-  chrome --ozone-platform=nitro --disable-gpu
+  chrome --ozone-platform=nitro --use-angle=vulkan \
+    --enable-features=Vulkan,DefaultANGLEVulkan,VulkanFromANGLE
   ```
+  That is the GPU path (#3921): ANGLE-on-Vulkan raster into GBM dma-bufs.
+  `--disable-gpu` gives software raster into shm buffers, the path it falls
+  back to by itself (see [GPU rendering](#gpu-rendering-via-dma-buf-3921)).
   The GPU process runs out of process, as on every other Chromium (#3919).
   `--in-process-gpu` still works and brings back the #3778 path, in which the
   browser presents.
@@ -23,6 +27,7 @@ The backend lives in the Chromium tree, not in this repo: `ui/ozone/platform/nit
   - **Resize:** the browser resizes the root and Surface nodes when views changes the size (it no longer sees the frame that carries the new pixels). Until the GPU process's first frame at the new size, the latch scales the old buffer into the new rect, so a drag-resize shows one stretched frame at most. In-process, the resize rides the frame.
   - **Cost of the split:** `CreateBuffer` is registered at the next `Commit` while `PresentSurface` acts at receipt, so the GPU process commits once per new buffer (3 per window size), not per frame.
 - **`--in-process-gpu`** keeps the #3778 path: one connection, an **Image** node per window, and `NitroCanvas` on the in-process viz thread posts `CreateBuffer`/`SetImage`/`BufferDamage`/`Commit` to the UI thread. Both paths share `NitroCanvas`; it talks to a `NitroPresenter`, which is either `NitroConnectionHost` or `NitroGpuConnection`.
+- **GPU path (#3921):** out of process, when the server has `DMABUF` and a render node opens, viz renders into GBM pixmaps and `GbmSurfacelessNitro` presents them with `CreateDmabufBuffer` + `PresentSurfaceFenced`. See [GPU rendering via dma-buf](#gpu-rendering-via-dma-buf-3921).
 - **Server requirement:** `SURFACE` and `SHARE` (#3897, #3904). An older server makes the out-of-process path fail at startup with a message naming the missing caps; use `--in-process-gpu` against it.
 - **Canvas:**
   - 3 shm buffers (`UnsafeSharedMemoryRegion`), with Skia rastering straight into the mapping via `SkSurfaces::WrapPixels`.
@@ -75,7 +80,7 @@ All of this was verified on a fake-backend nitro server (1280x720@60), driven by
 
 ## What doesn't / is not verified
 
-- **GPU rendering** without a readback: the zero-copy dma-buf path is the follow-up task "Chromium Ozone nitro: GPU rendering via dma-buf". Until then GPU raster exists only as the `NITRO_GPU_READBACK=1` measurement knob (see [Out-of-process GPU measurements](#out-of-process-gpu-measurements-3919)).
+- **GPU rendering** is done (#3921, [below](#gpu-rendering-via-dma-buf-3921)). Not done: video overlays (VA-API decode output as its own Surface) are #3944; ANGLE's GL backend is not built for this platform, so ANGLE-Vulkan is the only GPU backend.
 - **Drag-resize** can show one stretched frame while the GPU process catches up (see Architecture).
 - **HiDPI:** nitro logical = DIP, buffers = physical px, scale from `OutputInfo`. Since #3940 every logical size Chromium sends (`CreateWindow.size`, `CreatePopup.size`, the root/Image/Surface `SetBounds`) is the exact float `px / scale`, divided rather than multiplied by `1/scale` and not ceiled. At 1.25, `f32(px/1.25)*1.25 == px` for every integer px below 4000, so the server maps the buffer back to exactly its own size. The server snaps window roots to whole device pixels, so the buffer is drawn 1:1 (opaque copy, no resampling) at a fractional scale; see §testhost2 (#3940).
 - **Popup types:** `kPopup`/`kBubble` windows are nitro popups too; there is no subsurface equivalent. They are placed by the server, and only `kMenu` grabs.
@@ -136,7 +141,7 @@ Fake backend, 60 Hz. The fake flip takes about 21 ms, which is the throughput ce
 ## nitro-side gaps the audit missed
 
 1. **No cross-client buffer or node sharing.** Ids are per-connection, so a GPU process could not present into a browser window, which forced `--in-process-gpu`. **Fixed by #3904** (`ExportSurface`/`ImportSurface`, caps `SHARE`, `wire.md` § Surface sharing) **and used since #3919**: the GPU process presents into the browser's windows, and `--in-process-gpu` is gone from the wrapper. The one server change the backend needed was `SetOpaqueRegion` on a `Surface` node (#3919), which keeps #3877's opaque copy for the translucent CSD window.
-2. **No premultiplied ARGB format.** `AR24` is straight alpha, while Skia (and most toolkits) produce premultiplied pixels. The workaround costs a CPU unpremultiply per translucent frame, and copying unpremultiplied pixels forward between buffers is a subtle blending hazard. Suggest adding a premultiplied fourcc or a per-buffer flag.
+2. **No premultiplied ARGB format.** `AR24` is straight alpha, while Skia (and most toolkits) produce premultiplied pixels. The workaround costs a CPU unpremultiply per translucent frame, and copying unpremultiplied pixels forward between buffers is a subtle blending hazard. **Fixed for dma-bufs by #3921**: an `AR24` `CreateDmabufBuffer` is premultiplied (`wire.md` § Client dma-bufs; `PixelFormat::Argb8888Premul`, `PixelStore::premultiplied`), so the GPU path sends viz's output as is. The shm canvas keeps its unpremultiply: memfd `AR24` stays straight.
 3. **`BufferDamage` was ignored on buffer swap.** `SetImage` with a new buffer marked the whole node dirty, so every frame repainted the full image (735k px per frame measured, even for a caret blink). **Fixed by #3833**: `BufferDamage` is honoured when a same-size buffer is swapped in (see the caret-blink idle number under Test box).
 4. **No input-injection command on the control socket.** `FakeInput` was test-only, so this work needed a custom harness. **Fixed by #3834**: the control socket has `input` (`nitro-shot --input "wheel 0 15 count=3"`) and `samples`.
 5. **`PointerAbsolute` is normalised 0..1, not pixels.** This isn't a bug, but it is undocumented at the injection level and cost a debugging cycle.
@@ -272,11 +277,118 @@ what the fps column shows there. i2p is the same for inproc and oop.
   removes. Expect it on testhost2 (KBL, full anv) far more than on box1,
   where hasvk is "incomplete" and the GPU is GT1.
 
+## GPU rendering via dma-buf (#3921)
+
+Chromium tree: `nitro-ozone` at `2a9d0b30b6` (four commits on top of
+`6bdd793e3c`).
+
+**Shape** (Wayland's `GbmSurfacelessWayland`, in the GPU process):
+
+- `NitroGpuConnection` lists `DMABUF` in `ClientCaps` when the server has
+  it, and `Create()` waits (≤ 2 s) for the default `DmabufFeedback`. It
+  keeps `main_device`, `max_width`/`max_height` and the format pairs as a
+  locked snapshot (`GetDmabufInfo()`).
+- `InitializeGPU`, before the sandbox, opens `NitroGbmDevice`: the render
+  node of `main_device` (`drmGetDeviceFromDevId`), else the first
+  `renderD*`. The GPU sandbox's broker also lists every `renderD*`
+  (`gpu_pre_sandbox_hook_linux.cc`), so nothing depends on opening it
+  first, but it is. Not under `--disable-gpu`.
+- With both, `GetAllowedGLImplementations` is ANGLE-Vulkan,
+  `supports_native_pixmaps` is true, and `CreateVulkanImplementation`
+  returns `VulkanImplementationNitro` (a copy of the DRM platform's
+  `VulkanImplementationGbm`: dma-buf import with modifiers, sync_file
+  fences), which is what `VulkanFromANGLE` needs.
+- `CreateNativePixmap` allocates with GBM (`gbm_bo_create_with_modifiers`)
+  restricted to the feedback's `IMPORT` modifiers for XR24 (the driver's
+  choice among them, so tiled on Intel). A **translucent** window gets only
+  `CPU` (linear) ones: the GPU helper composites only opaque client buffers
+  (#3922), so a tiled `AR24` would show nitro's placeholder. Linear is the
+  fallback if the list is refused.
+- `NitroScreen` sets the output format to BGRA_8888 (XR24/AR24 in memory);
+  Chromium's Linux default, RGBA, is not a nitro format.
+- `GbmSurfacelessNitro` takes the z-order-0 plane only (overlays are
+  #3944), registers each pixmap once (`CreateDmabufBuffer`, per-plane fds
+  dup'd), and presents it with the frame's GPU fence as the acquire fence
+  (`PresentSurfaceFenced`; a plain `PresentSurface`, implicit sync, when
+  there is none) and the plane's damage. Pacing is `NitroCanvas`'s: the
+  swap ack comes with the `BufferReleased` of the buffer the frame
+  replaced, the presentation feedback with `Presented`. A pixmap viz
+  drops is `DestroyBuffer`ed once nitro released it. A buffer larger than
+  the output (`max_*`) is logged once, not clamped.
+- `ClientNativePixmapFactory` is the real dma-buf one.
+
+**Fallbacks** (each ends at the shm canvas, as before): no `DMABUF` cap
+(an older or remote server), no render node or GBM failure,
+`--disable-gpu`, `NITRO_NO_DMABUF=1` (A/B knob), or a GPU process that
+cannot init ANGLE-Vulkan (Chromium falls back to software compositing).
+`NITRO_GPU_READBACK=1` still selects the #3919 readback.
+
+**Server side found on the box:** GBM pads the pitch (1262 px → 5056
+bytes), and a linear dma-buf was mapped only up to the last row's
+payload, so the scene's `stride × rows` check made `CreateDmabufBuffer`
+a fatal `BadBuffer`. The mapping now covers `stride × rows` when the
+buffer has it (test `a_linear_dmabuf_with_a_padded_pitch_takes_the_cpu_path`).
+
+### Measurements
+
+`just chromium-bench dmabuf` (plus `shm`: GPU on, `NITRO_NO_DMABUF=1`).
+The `oop` rows are this build's `--disable-gpu`, measured before the
+"no GBM under `--disable-gpu`" fix, so their GPU-process PSS includes a
+loaded Mesa driver; #3919's oop GPU process was 30–34 MB.
+`NITRO_BENCH_ANGLE=gl` fell back to shm on both boxes (no ANGLE-GL,
+`dmabuf_buffers 0`), which is the fallback working, and is listed as such.
+
+**testhost2** (KBL, anv), eDP 2560×1440@60 at **scale 1.25** (#3940 has
+landed), window 1262×1376 px, 2026-09-30:
+
+| arm | fps | i2p p50/p95/max ms | server paint mean | browser PSS / RSS | GPU proc PSS / RSS | tree PSS | chrome CPU |
+|---|---|---|---|---|---|---|---|
+| **dmabuf** (translucent CSD, linear AR24) | 31.2–31.4 | 24.4–24.7/32.0–32.3/33.3–40.3 | 2.71–2.96 ms | 137–139 / 272–275 MB | 64–65 / 143–147 MB | 532–536 MB | 62–73 % |
+| dmabuf, `NITRO_FORCE_OPAQUE=1` (tiled XR24) | 31.2 | 25.0 (server mean) | 0.80 ms, `planes_mode 1` | 137 / 274 MB | 65 / 146 MB | 532 MB | 57 % |
+| shm (GPU on, no dma-buf) | 31.4 | 25.3/32.0/33.9 | 1.06 ms | 143 / 279 MB | 32 / 113 MB | 510 MB | 47 % |
+| angle=gl → shm fallback | 31.2 | 24.7/32.0/33.2 | 1.01 ms | 143 / 278 MB | 60 / 144 MB | 540 MB | 42 % |
+| oop (`--disable-gpu`) | 31.5–31.9 | 24.7–25.0/32.0–32.3/32.6–37.6 | 0.94–0.96 ms | 142–144 / 278–279 MB | 59–61 / 142–145 MB | 535–539 MB | 41–80 % |
+
+**box1** (HSW GT1, hasvk), 1920×1080@60, scale 1:
+
+| arm | fps | i2p p50/p95/max ms | server paint mean | browser PSS / RSS | GPU proc PSS / RSS | tree PSS | chrome CPU |
+|---|---|---|---|---|---|---|---|
+| **dmabuf** | 61.6–61.8 | 24.7–25.3/32.1–32.6/33.3 | 2.09–2.32 ms | 125–139 / 264–277 MB | 95–99 / 179–181 MB | 536–552 MB | 53–56 % |
+| shm (GPU on, no dma-buf) | 61.8 | 25.3/32.6/33.3 | 1.46 ms | 126 / 267 MB | 29 / 108 MB | 480 MB | 77 % |
+| angle=gl → shm fallback | 61.6 | 25.4/32.6/33.2 | 1.50 ms | 127 / 266 MB | 84 / 169 MB | 532 MB | 67 % |
+| oop (`--disable-gpu`) | 62.1 | 25.1/32.4/33.1 | 1.45 ms | 127 / 268 MB | 84 / 168 MB | 532 MB | 73 % |
+
+`fence_waits` rose by one per frame (≈150/run on testhost2, ≈295 on box1)
+and `dmabuf_placeholder_paints` stayed 0 in the translucent runs.
+`VulkanFromANGLE` dma-buf import works on hasvk: the risk the plan named
+did not happen.
+
+**Reading:**
+
+- **It works on both boxes, and costs nothing in fps or i2p.** Every arm
+  is at the event rate (31 / 62 fps) with the same i2p, as in #3919:
+  this scroll is input-bound, so neither the readback's i2p gain nor a
+  loss shows.
+- **CPU:** on box1 (2 cores) the chrome tree drops from 73–77 % to 53–56 %
+  over the scroll: raster moved to the GPU, no readback. On testhost2 it
+  is noisy and not lower (62–73 % vs 41–80 %).
+- **Server paint is higher for the translucent window** (2.1–3.0 ms vs
+  1.0–1.5 ms): the server reads a linear GPU buffer (uncached for the CPU)
+  and blends premultiplied outside the opaque region. An **opaque** window
+  gets a tiled XR24 buffer that goes on a plane: 0.8 ms and
+  `planes_mode 1`. Making the CSD window's opaque part tiled (or the
+  helper compositing `AR24`, #3922) is the next lever.
+- **Memory:** the GPU process is +35 MB PSS on testhost2 and +65–70 MB on
+  box1 against shm, the Mesa/ANGLE-Vulkan driver state; the tree +20–70 MB.
+- **CPU during 1080p video** was not measured: Chromium's VA-API output as
+  a Surface is #3944, and without it video is just GPU-composited quads.
+
 ## Other gotchas
 
 - `headless_shell` forces `--ozone-platform=headless` (`headless_content_main_delegate.cc:272`). Use it as a compile check only, and run `chrome` for real tests.
 - `--enable-logging=stderr` is needed to see the `nitro-frame`/`nitro-trace` output. Out of process, `nitro-frame` lines come from the GPU process and carry no i2p (the input is the browser's); use the server's `samples i2p` or `scroll-bench.py`.
-- `NITRO_GPU_READBACK=1` is a measurement knob, not a feature: without it the platform offers no GL, and Chromium rasters in software whatever `--use-angle` says.
+- `NITRO_GPU_READBACK=1` is a measurement knob, not a feature. Since #3921 the platform offers ANGLE-Vulkan whenever the dma-buf path is up; `NITRO_NO_DMABUF=1` or `--disable-gpu` gives software raster.
+- `--use-angle=gl` does not work: ANGLE's GL backend is built only with the X11/Wayland/DRM platforms (`angle.gni`), so the GPU process fails to init and Chromium falls back to software.
 - The DBus, BlueZ and GCM errors in the log are environmental noise.
 
 ## Reproducing

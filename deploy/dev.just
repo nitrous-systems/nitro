@@ -245,14 +245,16 @@ deploy-chromium:
 
 # Chromium scroll/i2p/memory benchmark on the box (#3919), against the
 # running session: `just chromium-bench oop`, `just box=testhost2
-# chromium-bench inproc 3`. MODE is inproc | oop | gpu (see the script).
+# chromium-bench inproc 3`. MODE is inproc | oop | gpu | dmabuf | shm (see
+# the script; `dmabuf` is #3921's GPU path, `NITRO_BENCH_ANGLE=gl` on the box
+# switches its ANGLE backend).
 # Needs `deploy-chromium` first; leaves nothing behind but /tmp files.
-[doc("Chromium scroll/i2p/memory benchmark on the box (mode: inproc|oop|gpu)")]
+[doc("Chromium scroll/i2p/memory benchmark on the box (mode: inproc|oop|gpu|dmabuf|shm)")]
 [group('dev')]
 chromium-bench mode="oop" runs="2":
     ssh {{box}} 'mkdir -p ~/nitro-stage'
     rsync -az deploy/chromium-bench.sh deploy/scroll-bench.py {{box}}:nitro-stage/
-    ssh {{box}} 'bash ~/nitro-stage/chromium-bench.sh {{mode}} {{runs}}'
+    ssh {{box}} "NITRO_BENCH_ANGLE=${NITRO_BENCH_ANGLE:-vulkan} bash ~/nitro-stage/chromium-bench.sh {{mode}} {{runs}}"
 
 # Chromium clipboard end to end on the box (#3943): two browsers,
 # nitro-term and nitro-files copy and paste to each other through the DATA

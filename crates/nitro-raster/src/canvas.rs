@@ -5,8 +5,7 @@ use nitro_core::{Color, IRect, Point, Rect};
 use crate::blend::{div255, effective_alpha, over_premul, unit_u8};
 use crate::paint::{
     RowPaint, blend_mask_row, blend_mask_row_opaque, blend_pixel, blend_premul_row, blend_solid,
-    blend_straight_row,
-    lerp_color, mix, paint_cov, paint_full, store_solid,
+    blend_straight_row, lerp_color, mix, paint_cov, paint_full, store_solid,
 };
 use crate::shape::{RRect, RowSpans};
 

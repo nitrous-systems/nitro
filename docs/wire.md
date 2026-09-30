@@ -2363,6 +2363,14 @@ layout.
   `dmabuf_placeholder_paints`) until the planes module (#3899) scans it
   out. Never a crash, never a read of unmapped memory.
 
+**Alpha.** `AR24` in a `CreateDmabufBuffer` is **premultiplied** (the
+Wayland `ARGB8888` convention, and what a GPU renders), on every path: the
+CPU painter blends it premultiplied. The GPU helper (#3922) composites
+only opaque client buffers (`XR24`, YUV) under its shadow, so an `AR24`
+dma-buf needs the `CPU` path (linear) to be seen; a tiled one shows the
+placeholder. An `AR24` memfd (`CreateBuffer`, `CreateSurfaceBuffer`)
+stays straight alpha (#3921).
+
 **Render at display size or smaller.** Display planes upscale but barely
 downscale (Kaby Lake: 0.94× accepted, 0.75× rejected), so a buffer larger
 than the output cannot go on a plane. `DmabufFeedback` carries the

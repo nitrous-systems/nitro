@@ -570,7 +570,7 @@ Alongside, and feeding into the items above:
   whoever sent it; releases and `Presented` go to the presenter. Contract:
   `wire.md` § Surface sharing; server side: `crates/nitro-server/src/share.rs`.
   Why B over C: [`chromium.md`](chromium.md#out-of-process-gpu-b-vs-c-3904).
-- Chromium Ozone GPU rendering — #3905.
+- Chromium Ozone GPU rendering — #3921, **built**: Chromium's GPU process is a dma-buf producer. ANGLE-Vulkan renders into GBM buffers (nitro's `IMPORT` modifiers; linear for translucent windows) that it presents with `CreateDmabufBuffer` + `PresentSurfaceFenced` into the imported window Surface; `AR24` dma-bufs are premultiplied. See [`chromium.md`](chromium.md#gpu-rendering-via-dma-buf-3921). Video overlays: #3944.
 - `nitro-video` player — #3906, **built**: system FFmpeg (libavformat/
   libavcodec, dynamic) on a decode thread → 4-buffer NV12 memfd ring →
   `PresentSurface`, paced by frame callbacks; nitro-ui controls overlay

@@ -375,3 +375,15 @@ cd /home/kaspar/src/ai/chromium
 | deployed set | 429 MB: `chrome`, `chrome_crashpad_handler`, `chrome_{100,200}_percent.pak`, `resources.pak`, `icudtl.dat`, `v8_context_snapshot.bin`, `snapshot_blob.bin`, `libEGL.so`, `libGLESv2.so`, `libvk_swiftshader.so`, `vk_swiftshader_icd.json`, `libvulkan.so.1`, `locales/*.pak` (without the 70 MB of `*.info`), `resources/` |
 
 **Runtime system deps on a desktop-less box:** chrome `NEEDED`s `libatk-1.0`, `libatk-bridge-2.0` and `libatspi`, which the box lacked. `just deploy-chromium` apt-installs them. The alternative is rebuilding with `use_atk=false`.
+
+### GPU path (#3921): no new gn args
+
+The dma-buf path builds with `out/Nitro`'s args unchanged. GBM comes from
+the sysroot (`use_system_minigbm` defaults to true on Linux, and `chrome`
+already `NEEDED`s `libgbm.so.1`); libdrm is `//third_party/libdrm`. One
+build-file change outside `ui/ozone/platform/nitro/`:
+`ui/ozone/common/BUILD.gn` compiles `native_pixmap_egl_binding` for
+`ozone_platform_nitro` too. ANGLE's GL backend is not enabled for this
+platform (`third_party/angle/gni/angle.gni`), so the GPU path is
+ANGLE-Vulkan only. Incremental rebuild after the change: about 2 minutes
+at `-j 48`.

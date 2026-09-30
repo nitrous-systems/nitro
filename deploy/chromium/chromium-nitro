@@ -16,13 +16,15 @@
 #   --ozone-platform=nitro  the build's default already (ozone_platform =
 #                           "nitro"), spelled out so a stray flag in a
 #                           `chrome-flags.conf` cannot silently pick another
-#   --disable-gpu           software (Skia) raster into shm buffers. The
-#                           GPU process still runs out of process, as on any
-#                           Chromium: it opens its own nitro connection and
-#                           presents into each window through the Surface the
-#                           browser exports (#3919, docs/chromium.md). Add
-#                           `--in-process-gpu` to go back to the browser
-#                           presenting (the #3778 path)
+#   --use-angle=vulkan, --enable-features=Vulkan,DefaultANGLEVulkan,
+#   VulkanFromANGLE         GPU raster into GBM dma-bufs, presented with
+#                           explicit fences (#3921, docs/chromium.md). The
+#                           only ANGLE backend built for this platform is
+#                           Vulkan. The GPU process presents into each
+#                           window through the Surface the browser exports
+#                           (#3919). Without DMABUF on the server or a
+#                           render node it falls back to shm by itself; add
+#                           `--disable-gpu` to force software raster
 #   --class=chromium-nitro  the window's app id, which is what the bar and
 #                           the title bar look an icon up by; it must equal
 #                           the .desktop file's basename (see that file)
@@ -37,7 +39,8 @@ d="@CHROMIUM_DIR@"
 export CHROME_DESKTOP=chromium-nitro.desktop
 exec "$d/chrome" \
     --ozone-platform=nitro \
-    --disable-gpu \
+    --use-angle=vulkan \
+    --enable-features=Vulkan,DefaultANGLEVulkan,VulkanFromANGLE \
     --class=chromium-nitro \
     --user-data-dir="$HOME/.config/chromium-nitro" \
     "$@"
