@@ -113,6 +113,10 @@ pub enum Request {
     /// [`Request::Plug`]: output *removal* is where window migration
     /// lives, and on a real backend it means pulling a cable out.
     Unplug,
+    /// Simulate a VT switch away (`vt off`) or back (`vt on`) on the fake
+    /// backend: the seat's `Disable`/`Enable` paths without a seat.
+    /// Test-only, like [`Request::Plug`].
+    Vt(bool),
     /// Give keyboard focus to the topmost window.
     ///
     /// Test-only, and it exists because focus normally *follows the
@@ -279,6 +283,9 @@ pub fn parse(line: &str) -> Result<Request, String> {
         }
         ("plug", None) => Err("`plug` needs a WxH size".to_owned()),
         ("unplug", None) => Ok(Request::Unplug),
+        ("vt", Some("off")) => Ok(Request::Vt(false)),
+        ("vt", Some("on")) => Ok(Request::Vt(true)),
+        ("vt", _) => Err("`vt` wants `on` or `off`".to_owned()),
         ("outputs", None) => Ok(Request::Outputs),
         ("modes", None) => Ok(Request::Modes),
         ("stats", None) => Ok(Request::Stats),
@@ -726,6 +733,9 @@ mod tests {
         );
         assert_eq!(parse("plug 640x480"), Ok(Request::Plug(640, 480)));
         assert_eq!(parse("unplug\n"), Ok(Request::Unplug));
+        assert_eq!(parse("vt off"), Ok(Request::Vt(false)));
+        assert_eq!(parse("vt on"), Ok(Request::Vt(true)));
+        assert!(parse("vt").is_err());
         assert_eq!(
             parse("unplug all"),
             Err("`unplug` takes no argument".to_owned())

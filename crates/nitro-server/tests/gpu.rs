@@ -437,6 +437,10 @@ fn the_helper_dying_falls_back_and_comes_back() {
     h.quit();
 }
 
+/// `gpu.helper = off` keeps today's behaviour: no helper, no mode 2.
+/// Pixel-identity with a pre-#3922 server is not asserted here; every
+/// other test file runs with the helper off (`Config::fake`) and is
+/// unchanged.
 #[test]
 fn helper_off_never_spawns() {
     let h = Harness::start("off", GpuHelper::Off, true);
@@ -459,5 +463,202 @@ fn on_demand_spawns_when_an_output_first_wants_mode_2() {
     let mut s = two_surfaces(&h);
     s.play("mode 2", || h.stat("planes_mode") == 2);
     assert_eq!(h.stat("gpu_spawns"), 1);
+    h.quit();
+}
+
+impl Harness {
+    fn request(&self, req: &str) {
+        let s = UnixStream::connect(&self.path).expect("connect");
+        let mut c = BufReader::new(s);
+        c.get_mut().write_all(req.as_bytes()).unwrap();
+        let mut line = String::new();
+        c.read_line(&mut line).unwrap();
+        assert_eq!(line.trim_end(), "ok", "{req}");
+    }
+
+    fn composite_calls(&self) -> usize {
+        self.composites().len()
+    }
+
+    /// `samples damage`: (total ever, the retained values).
+    fn damage_samples(&self) -> (u64, Vec<u64>) {
+        let lines = self.request_text("samples damage\n");
+        let total = lines[0].strip_prefix("ok ").unwrap().parse().unwrap();
+        let v = lines[1..].iter().map(|l| l.parse().unwrap()).collect();
+        (total, v)
+    }
+}
+
+impl Scene {
+    /// Present a new frame on A without waiting for anything; returns its
+    /// buffer.
+    fn present_a(&mut self) -> BufferId {
+        let id = self.a[self.serial as usize % 3].id;
+        self.conn
+            .present_surface(frame(A, id, self.serial))
+            .unwrap();
+        self.conn.flush().unwrap();
+        self.serial += 1;
+        id
+    }
+
+    /// One frame on A only, and its `Presented`.
+    fn step_a(&mut self) {
+        let s = self.serial;
+        self.present_a();
+        presented(&mut self.conn, &mut self.seen, s);
+    }
+
+    fn released(&mut self, id: BufferId) -> bool {
+        let _ = self.conn.poll(&mut self.seen);
+        self.seen
+            .iter()
+            .any(|m| matches!(m, ServerMsg::BufferReleased(r) if r.id == id))
+    }
+}
+
+/// Mode 2 with a `Composite` the helper never answers (it stalls inside
+/// the frame): returns the buffer that frame samples.
+fn stall_a_frame(h: &Harness, s: &mut Scene) -> BufferId {
+    s.play("mode 2", || h.stat("planes_mode") == 2);
+    s.step();
+    let before = h.composite_calls();
+    h.fake.state().stall = true;
+    let x = s.present_a();
+    wait_for("the stalled composite", || h.composite_calls() > before);
+    s.seen.clear();
+    x
+}
+
+#[test]
+fn a_frame_outstanding_when_the_helper_dies_releases_its_buffers() {
+    let h = Harness::start("die-mid-frame", GpuHelper::On, true);
+    wait_for("the helper", || h.stat("gpu_state") == 2);
+    let mut s = two_surfaces(&h);
+    let x = stall_a_frame(&h, &mut s);
+    for fd in h.socks.lock().unwrap().drain(..) {
+        rustix::net::shutdown(&fd, rustix::net::Shutdown::Both).unwrap();
+    }
+    wait_for("the crash", || h.stat("gpu_crashes") == 1);
+    h.fake.state().stall = false;
+    // Replace X: its release must come, not be held for a frame that
+    // will never be answered.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !s.released(x) {
+        assert!(Instant::now() < deadline, "X never released: {:?}", s.seen);
+        s.step_a();
+    }
+    assert_eq!(h.stat("gpu_releases_held"), 0);
+    h.quit();
+}
+
+#[test]
+fn vt_pause_drops_the_helper_and_its_borrows_and_resume_respawns_it() {
+    let h = Harness::start("vt", GpuHelper::On, true);
+    wait_for("the helper", || h.stat("gpu_state") == 2);
+    let mut s = two_surfaces(&h);
+    let x = stall_a_frame(&h, &mut s);
+    h.request("vt off\n");
+    assert_eq!(h.stat("gpu_state"), 0, "stopped with the VT");
+    assert_eq!(h.stat("gpu_crashes"), 0, "a pause is not a crash");
+    assert_eq!(h.stat("gpu_fences_pending"), 0);
+    h.fake.state().stall = false;
+    h.request("vt on\n");
+    wait_for("the respawn", || h.stat("gpu_spawns") == 2);
+    wait_for("ready again", || h.stat("gpu_state") == 2);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !s.released(x) {
+        assert!(Instant::now() < deadline, "X never released: {:?}", s.seen);
+        s.step_a();
+    }
+    s.play("mode 2 after the resume", || h.stat("planes_mode") == 2);
+    assert_eq!(h.stat("gpu_crashes"), 0);
+    h.quit();
+}
+
+#[test]
+fn a_hung_helper_is_killed_and_the_output_falls_back() {
+    let h = Harness::start("hang", GpuHelper::On, true);
+    wait_for("the helper", || h.stat("gpu_state") == 2);
+    let mut s = two_surfaces(&h);
+    let _ = stall_a_frame(&h, &mut s);
+    let t0 = Instant::now();
+    wait_for("the hang kill", || h.stat("gpu_crashes") == 1);
+    assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+    assert_eq!(h.stat("gpu_fallbacks"), 1);
+    assert_ne!(h.stat("planes_mode"), 2);
+    h.fake.state().stall = false;
+    // Still presenting on the fallback path.
+    s.step_a();
+    h.quit();
+}
+
+#[test]
+fn no_free_slot_defers_without_blocking_and_a_refused_frame_repaints() {
+    let h = Harness::start("busy", GpuHelper::On, true);
+    wait_for("the helper", || h.stat("gpu_state") == 2);
+    let mut s = two_surfaces(&h);
+    s.play("mode 2", || h.stat("planes_mode") == 2);
+    // Fences pending from now on: after the ring's slots are used up,
+    // paints wait for a slot — the server keeps answering meanwhile.
+    h.fake.state().auto_signal = false;
+    for _ in 0..6 {
+        s.present_a();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    wait_for("a busy slot", || h.stat("gpu_busy_slots") > 0);
+    let frames = h.stat("gpu_frames");
+    // The last frame presented may be a buffer the helper showed before
+    // (three buffers, six frames): still new pixels, still composited.
+    h.fake.state().auto_signal = true;
+    while h.fake.signal() {}
+    wait_for("composites again", || h.stat("gpu_frames") > frames);
+    s.step_a();
+
+    // A frame the helper refuses: counted, and the output repaints.
+    h.fake.state().fail_next_composite = true;
+    s.step_a();
+    wait_for("the refusal", || h.stat("gpu_refused_frames") == 1);
+    s.step_a();
+    assert_eq!(h.stat("planes_mode"), 2);
+    assert_eq!(h.stat("gpu_crashes"), 0);
+    h.quit();
+}
+
+#[test]
+fn leaving_mode_2_for_a_plane_waits_out_the_hysteresis_and_repaints_fully() {
+    let h = Harness::start("leave", GpuHelper::On, true);
+    wait_for("the helper", || h.stat("gpu_state") == 2);
+    let mut s = two_surfaces(&h);
+    s.play("mode 2", || h.stat("planes_mode") == 2);
+    // B goes: A alone, unobscured, could take the overlay — an upgrade.
+    s.conn.tx().destroy_node(B).commit(s.serial).unwrap();
+    s.conn.flush().unwrap();
+    presented(&mut s.conn, &mut s.seen, s.serial);
+    s.serial += 1;
+    let (before, _) = h.damage_samples();
+    let t0 = Instant::now();
+    let mut frames = 0;
+    while h.stat("planes_mode") == 2 {
+        assert!(t0.elapsed() < Duration::from_secs(10), "never left mode 2");
+        s.step_a();
+        frames += 1;
+    }
+    assert!(frames >= 5, "left after {frames} frames");
+    assert!(
+        t0.elapsed() >= Duration::from_millis(250),
+        "{:?}",
+        t0.elapsed()
+    );
+    assert_eq!(h.stat("planes_mode"), 1);
+    s.step_a();
+    let (after, v) = h.damage_samples();
+    let new = usize::try_from(after - before).unwrap().min(v.len());
+    let full = u64::from(OUT.0 * OUT.1);
+    assert!(
+        v[v.len() - new..].contains(&full),
+        "a full repaint on leaving: {:?}",
+        &v[v.len() - new..]
+    );
     h.quit();
 }

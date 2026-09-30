@@ -246,8 +246,6 @@ pub struct InFlight {
     pub slot: usize,
     /// When it was sent.
     pub sent: Instant,
-    /// Client buffers it samples.
-    pub keys: Vec<BufferKey>,
 }
 
 /// A frame the helper submitted: waiting for the commit (a flip is

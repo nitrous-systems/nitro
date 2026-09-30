@@ -1963,7 +1963,7 @@ impl Server {
         if let Some(owner) = self.gpu.owner
             && !infos.iter().any(|i| i.id == owner)
         {
-            self.gpu_drop_owner(false);
+            self.gpu_drop_owner(false, false);
         }
         let mut lost = false;
         let mut gone: Vec<u32> = Vec::new();
@@ -3078,71 +3078,80 @@ impl Server {
         for ev in events {
             match ev {
                 SeatEvent::Disable => {
-                    info!("session inactive: pausing");
-                    // Input first: libinput must have let go of its device
-                    // fds before the ack, or the VT switch hangs.
-                    self.input.suspend();
-                    // The release of a held key will arrive on the other
-                    // VT, if anywhere: stop repeating it now.
-                    self.stop_key_repeat();
-                    // Scripted input stops with the real kind: the
-                    // rest of a sequence would land on the other VT's
-                    // return with stale timestamps.
-                    if let Err(e) = self.injector.clear() {
-                        warn!("input injection: disarm: {e}");
-                    }
-                    // A drag cannot survive the pointer going to another
-                    // session: the release will never arrive here.
-                    self.dnd_step(data::Dnd::cancel);
-                    // The helper goes with the VT (#3922): it is
-                    // respawned on the way back.
-                    self.gpu_pause();
-                    self.backend.pause();
-                    self.active = false;
+                    self.vt_pause();
                     if let Some(seat) = self.seat.as_ref() {
                         seat.borrow_mut().ack_disable()?;
                     }
                 }
-                SeatEvent::Enable => {
-                    info!("session active: resuming");
-                    let resumed = self.backend.resume();
-                    self.planes_reset(None);
-                    self.gpu.forgive();
-                    if self.gpu.mode == config::GpuHelper::On {
-                        self.gpu_spawn();
-                    }
-                    match resumed {
-                        Ok(()) => self.active = true,
-                        Err(e) => {
-                            error!("resume failed: {e}");
-                            continue;
-                        }
-                    }
-                    self.input.resume();
-                    // Key releases that happened on the other VT were never
-                    // seen, so the modifier state is a guess: drop it. The
-                    // shell's armed tap goes with it for the same reason —
-                    // the release that would complete it never arrived.
-                    if let Some(kb) = self.keyboard.as_mut() {
-                        kb.reset();
-                        self.stop_key_repeat();
-                    }
-                    self.sync_modifiers();
-                    self.hotkeys.reset();
-                    self.hotkey_pending = None;
-                    // Held buttons, for the keyboard's reason: a release on
-                    // the other VT was never seen, and a button believed
-                    // down for ever would let any client start a drag.
-                    self.pointer.buttons.clear();
-                    self.end_pointer_grab();
-                    for output in &mut self.outputs {
-                        output.invalidate();
-                    }
-                    self.paint_all();
-                }
+                SeatEvent::Enable => self.vt_resume(),
             }
         }
         Ok(())
+    }
+
+    /// The session went inactive (VT switch away): stop everything that
+    /// touches devices. The seat's ack follows.
+    fn vt_pause(&mut self) {
+        info!("session inactive: pausing");
+        // Input first: libinput must have let go of its device
+        // fds before the ack, or the VT switch hangs.
+        self.input.suspend();
+        // The release of a held key will arrive on the other
+        // VT, if anywhere: stop repeating it now.
+        self.stop_key_repeat();
+        // Scripted input stops with the real kind: the
+        // rest of a sequence would land on the other VT's
+        // return with stale timestamps.
+        if let Err(e) = self.injector.clear() {
+            warn!("input injection: disarm: {e}");
+        }
+        // A drag cannot survive the pointer going to another
+        // session: the release will never arrive here.
+        self.dnd_step(data::Dnd::cancel);
+        // The helper goes with the VT (#3922): it is
+        // respawned on the way back.
+        self.gpu_pause();
+        self.backend.pause();
+        self.active = false;
+    }
+
+    /// The session is active again.
+    fn vt_resume(&mut self) {
+        info!("session active: resuming");
+        let resumed = self.backend.resume();
+        self.planes_reset(None);
+        self.gpu.forgive();
+        if self.gpu.mode == config::GpuHelper::On {
+            self.gpu_spawn();
+        }
+        match resumed {
+            Ok(()) => self.active = true,
+            Err(e) => {
+                error!("resume failed: {e}");
+                return;
+            }
+        }
+        self.input.resume();
+        // Key releases that happened on the other VT were never
+        // seen, so the modifier state is a guess: drop it. The
+        // shell's armed tap goes with it for the same reason —
+        // the release that would complete it never arrived.
+        if let Some(kb) = self.keyboard.as_mut() {
+            kb.reset();
+            self.stop_key_repeat();
+        }
+        self.sync_modifiers();
+        self.hotkeys.reset();
+        self.hotkey_pending = None;
+        // Held buttons, for the keyboard's reason: a release on
+        // the other VT was never seen, and a button believed
+        // down for ever would let any client start a drag.
+        self.pointer.buttons.clear();
+        self.end_pointer_grab();
+        for output in &mut self.outputs {
+            output.invalidate();
+        }
+        self.paint_all();
     }
 
     fn on_backend(&mut self) -> Result<(), Error> {
@@ -3692,7 +3701,6 @@ impl Server {
             if self.gpu.running() {
                 self.gpu_pause();
             }
-            self.gpu.configure(gpu_mode, gpu_idle);
         }
         if gpu_mode == config::GpuHelper::On && !self.gpu.running() && self.active {
             self.gpu_spawn();
@@ -6638,6 +6646,18 @@ impl Server {
                 protocol::ok_reply()
             }
             Ok(Request::Unplug) => self.unplug(),
+            Ok(Request::Vt(on)) => {
+                if self.seat.is_some() {
+                    protocol::err_reply("`vt` is only available without a seat")
+                } else {
+                    if on {
+                        self.vt_resume();
+                    } else {
+                        self.vt_pause();
+                    }
+                    protocol::ok_reply()
+                }
+            }
             Ok(Request::Focus) => self.focus_topmost(),
             Ok(Request::Overview { on, output }) => self.overview_request(on, output.as_deref()),
             Ok(Request::Input(spec)) => self.input_request(&spec),
@@ -10437,6 +10457,10 @@ impl Server {
                 if o.decision.shows(l.node) {
                     o.planes_dirty = true;
                 }
+                // A new frame composited by the helper (#3922) is damage
+                // even in a buffer it showed before (a reused buffer
+                // holds new pixels): forget what that node last showed.
+                o.gpu_last.retain(|(n, _, _)| *n != l.node);
             }
             let Some(client) = self.wire_clients.get_mut(&l.token) else {
                 continue;
@@ -12662,10 +12686,7 @@ impl Server {
     /// schedule a restart.
     fn gpu_lost(&mut self) {
         let idle = self.gpu.idle();
-        self.gpu_drop_owner(true);
-        if let Some(f) = self.gpu.ring.in_flight.take() {
-            self.gpu.borrows.done(f.serial);
-        }
+        self.gpu_drop_owner(true, true);
         self.gpu.died(idle);
         // Borrows whose fence dup is registered go when it signals; with
         // the helper dead a Vulkan fence signals or errors on its own.
@@ -12676,18 +12697,21 @@ impl Server {
     /// backend defers the free while one is on screen) and, when the
     /// output is in mode 2, its decision — a full repaint on the CPU or
     /// planes follows. `fallback` counts it as a helper fallback.
-    fn gpu_drop_owner(&mut self, fallback: bool) {
+    ///
+    /// `dying`: the helper is going away (death, VT pause), so a frame
+    /// still out will never be answered — its borrows are returned now.
+    /// Otherwise its `Composited` still arrives and keeps the fence
+    /// (`on_gpu_reply`), and the borrows go when that signals.
+    fn gpu_drop_owner(&mut self, fallback: bool, dying: bool) {
+        let ring = std::mem::take(&mut self.gpu.ring);
+        if dying && let Some(f) = &ring.in_flight {
+            self.gpu.borrows.done(f.serial);
+        }
         let Some(owner) = self.gpu.owner.take() else {
             return;
         };
-        let ring = std::mem::take(&mut self.gpu.ring);
         for s in &ring.slots {
             self.backend.free_buffer(s.fb);
-        }
-        if let Some(f) = ring.in_flight
-            && !self.gpu.running()
-        {
-            self.gpu.borrows.done(f.serial);
         }
         self.gpu.arm();
         let Some(index) = self.outputs.iter().position(|o| o.kms_id == owner) else {
@@ -12716,8 +12740,9 @@ impl Server {
 
     /// VT switch away: stop the helper and drop what it held.
     fn gpu_pause(&mut self) {
-        self.gpu_drop_owner(false);
+        self.gpu_drop_owner(false, true);
         self.gpu.stop(&EpollPoll(&self.epoll), TOK_GPU);
+        self.send_gpu_releases();
     }
 
     /// Release the textures (and sources) of buffers that are gone.
@@ -12850,7 +12875,7 @@ impl Server {
     /// idle-exit.
     fn gpu_release_owner(&mut self) {
         let shadow = self.gpu.ring.shadow;
-        self.gpu_drop_owner(false);
+        self.gpu_drop_owner(false, false);
         let poll = EpollPoll(&self.epoll);
         if let Some(id) = shadow {
             self.gpu.send(
@@ -13000,7 +13025,6 @@ impl Server {
         if self.outputs[index].gpu_pending.is_some() {
             return false;
         }
-        let poll = EpollPoll(&self.epoll);
         let gpu = &self.gpu;
         let Some(slot) = gpu::pick_free(&gpu.ring.slots, |s| gpu.fence_pending(s)) else {
             // Keep the damage; a released slot or a signalled fence
@@ -13008,7 +13032,6 @@ impl Server {
             self.gpu.counters.busy_slots += 1;
             return false;
         };
-        let _ = &poll;
         let scene_id = self.outputs[index].scene_id;
         let cursor_state = self.cursor_state(scene_id);
         let scroll = self.outputs[index].take_scroll();
@@ -13044,7 +13067,7 @@ impl Server {
                     fast_scaled,
                 },
                 &rasterize,
-                scroll.filter(|_| true),
+                scroll,
             );
             shadow.note_painted(&rasterize);
             Some(p)
@@ -13159,7 +13182,6 @@ impl Server {
             serial,
             slot,
             sent: Instant::now(),
-            keys: Vec::new(),
         });
         self.gpu.arm();
         let o = &mut self.outputs[index];
@@ -13250,7 +13272,7 @@ impl Server {
             && self.gpu.ring.size != (self.outputs[index].width, self.outputs[index].height)
         {
             // A mode change: a new ring for the new size.
-            self.gpu_drop_owner(false);
+            self.gpu_drop_owner(false, false);
         }
         self.gpu_export_scanouts();
         let mut layers = Vec::new();

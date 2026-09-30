@@ -38,6 +38,7 @@ pub enum Call {
 
 /// Shared state; the test keeps a clone of the handle.
 #[derive(Debug, Default)]
+#[allow(clippy::struct_excessive_bools)] // independent test knobs
 pub struct FakeState {
     /// Every call, in order.
     pub calls: Vec<Call>,
@@ -47,6 +48,11 @@ pub struct FakeState {
     pub auto_signal: bool,
     /// Make the next import fail with a backend error.
     pub fail_next_import: bool,
+    /// Make the next composite fail with a backend error.
+    pub fail_next_composite: bool,
+    /// While set, `composite` does not return: the helper hangs mid-frame
+    /// (tests of the server's hang detection). Clear it to let go.
+    pub stall: bool,
 }
 
 /// The fake. Its textures are just their ids.
@@ -187,6 +193,12 @@ impl Backend for FakeBackend {
             layers.iter().map(|(t, _)| **t).collect(),
             acquire.len(),
         ));
+        if std::mem::take(&mut self.state().fail_next_composite) {
+            return Err(err("fake composite failure"));
+        }
+        while self.state().stall {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
         let (r, w) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)
             .map_err(|e| err(&e.to_string()))?;
         let mut s = self.state();
