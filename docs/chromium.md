@@ -50,7 +50,7 @@ The backend lives in the Chromium tree, not in this repo: `ui/ozone/platform/nit
   | `supports_server_side_window_decorations` | false |
   | `set_parent_for_non_top_level_windows` | true |
   | `supports_global_screen_coordinates` | false |
-  | `platform_shows_drag_image` | false |
+  | `platform_shows_drag_image` | true (the drag icon is a server-adopted nitro window, #3965) |
   | `IsWindowCompositingSupported()` | true |
 - **Capabilities:**
   - `ClientCaps = desired & Welcome.caps`, where desired is POPUP, CURSOR, DRAG, OUTPUTS, KEYMAP, RELEASE and DATA. Missing caps are logged.
@@ -78,6 +78,7 @@ All of this was verified on a fake-backend nitro server (1280x720@60), driven by
   - The `PointerLeave` sent at the start of a client drag is swallowed, so the drag isn't cancelled.
 - **Minimize** (titlebar button): the window unmaps, chrome stays alive, and the server's frame count stays flat, so there is no busy loop and no stall.
 - **Clipboard** (#3943): copy and paste both ways with native nitro clients, on testhost2. See [Clipboard](#clipboard-3943).
+- **Drag and drop** (#3965): Chromium ↔ Chromium over the DATA ops, with the drag image shown by the server; every cancel path ends both sides. See [Drag and drop](#drag-and-drop-3965).
 
 ## What doesn't / is not verified
 
@@ -85,7 +86,8 @@ All of this was verified on a fake-backend nitro server (1280x720@60), driven by
 - **Drag-resize** can show one stretched frame while the GPU process catches up (see Architecture).
 - **HiDPI:** nitro logical = DIP, buffers = physical px, scale from `OutputInfo`. Since #3940 every logical size Chromium sends (`CreateWindow.size`, `CreatePopup.size`, the root/Image/Surface `SetBounds`) is the exact float `px / scale`, divided rather than multiplied by `1/scale` and not ceiled. At 1.25, `f32(px/1.25)*1.25 == px` for every integer px below 4000, so the server maps the buffer back to exactly its own size. The server snaps window roots to whole device pixels, so the buffer is drawn 1:1 (opaque copy, no resampling) at a fractional scale; see §testhost2 (#3940).
 - **Popup types:** `kPopup`/`kBubble` windows are nitro popups too; there is no subsurface equivalent. They are placed by the server, and only `kMenu` grabs.
-- **Drag and drop:** not wired. `platform_shows_drag_image=false`, and DnD start is a no-op.
+- **Tab detach:** dragging a tab out of the strip does nothing. `NitroWindow` reports client-controlled window movement (the `PlatformWindow` default) but has no `WmMoveLoopHandler`, so the tab strip's move loop is cancelled at once. It is not a DnD path. Follow-up work.
+- **Drag and drop with native nitro apps:** nitro-ui does not do DnD yet. A drop on nitro-term is rejected cleanly. Follow-ups: #3966 (nitro-ui drop target, nitro-term) and #3967 (nitro-ui drag source, nitro-files).
 - **Real hardware:** not tested on a real (non-fake) backend. All numbers are fake-backend.
 - **Raster time:** not measured on the Chromium side. The server-side paint/copy cost is below.
 - **Restore after minimize:** not exercised by the harness, which has no way to un-minimize.
@@ -99,7 +101,7 @@ All of this was verified on a fake-backend nitro server (1280x720@60), driven by
 - **Paste:** `RequestSelection` for the mapped type (`text/plain` maps to the best offered alias, as on Wayland). The `SelectionData` fd is read on the thread pool, non-blocking, with a 5 s idle timeout and a 64 MiB cap.
 - **Ownership:** a `SelectionOffer` that isn't our expected echo means another client took the selection. The backend drops its data and fires the clipboard-changed callback, which drives Chromium's `ClipboardMonitor` observers.
 - **Primary selection:** the wire has none, so `IsSelectionBufferAvailable()` is false.
-- **Drag and drop:** not wired.
+- **Drag and drop:** [its own section](#drag-and-drop-3965); both share `nitro_data_util` (memfd serving, bounded reads).
 - **Server fix found on the box:** a `SetSelection` that raced a focus-out (seen when copying 8 MB) used to be a fatal `Error { Protocol }`, which killed the browser. It is now dropped, like `SetCursor` ([wire.md § SetSelection](wire.md#setselection--0x0305)). The backend treats echoes still pending at focus-out as maybe-lost and re-offers on the next focus.
 
 `just box=testhost2 chromium-clipboard` (`deploy/chromium-clipboard.sh`) runs two browsers, nitro-term and nitro-files in a live session, and prints PASS/FAIL. On testhost2, 2026-09-29, 3 runs, all 7 checks passed each time:
@@ -113,6 +115,35 @@ All of this was verified on a fake-backend nitro server (1280x720@60), driven by
 | file copied in nitro-files → page | `Files`, `files[0].name` = the file (via `text/uri-list`) |
 | 8 MB text, A → B | all 8 388 608 bytes. B's worst `requestAnimationFrame` gap during the paste was 33–65 ms |
 | owner SIGKILLed after copying, then paste in nitro-term | nitro-term stays alive, gets an empty paste |
+
+## Drag and drop (#3965)
+
+`NitroDataDrag` (`nitro_data_drag.{h,cc}`, Chromium `nitro-ozone`) runs the [drag-and-drop sequence](wire.md#the-drag-and-drop-sequence). There is one instance per connection, created only when DATA was granted. `NitroWindow` is the `WmDragHandler`; views sets the `WmDropHandler`.
+
+- **Source.** `StartDrag` turns the `OSExchangeData` into MIME types, most specific first: `text/uri-list` (files as `file://`, else the URL), `text/x-moz-url` (UTF-16), `text/html`, `text/plain;charset=utf-8`, `text/plain`, then `chromium/x-web-custom-data`, `chromium/x-window-drag` and bookmarks under their own names. A drag with no data offers `chromium/x-empty-drag-data`, as on Wayland. COPY/MOVE/LINK map to `drag_actions` 1/2/4. The icon image, `SetDragIconOffset` and `StartDrag` go out in one commit, then a nested `RunLoop` (kNestableTasksAllowed) waits for the outcome. `SelectionRequest { Drag }` is served with a sealed memfd built on the thread pool.
+- **Started / refused.** The server says nothing when it takes a drag; the source just loses pointer focus. That `PointerLeave` is the "started" signal, and during a drag it no longer synthesises a button release (aura would cancel the drag). The server silently ignores a `StartDrag` it refuses; the press's release then reaches us, and that ends the loop as cancelled. A 3 s timer is the backstop. A `StartDrag` with no button down is refused locally (a renderer drag that arrived after the release).
+- **End.** `DragFinished` leads to `FinishDrag`, `drag_finished_callback(action)`, and a synthetic release of the buttons aura still holds (the server swallowed the real one). `CancelDrag` sends `FinishDrag` while the drag still holds the pointer, which the server now treats as a cancel (below). Connection loss ends the loop.
+- **Drag image: `platform_shows_drag_image = true`.** The image is a separate `UNDECORATED | NO_FOCUS` window with one Image node (AR24, unpremultiplied), which the server adopts as the drag icon: on the overlay layer, never hit, following the pointer over every client and output. A Chromium `DragWidget` toplevel could not do that, because Chromium cannot place a nitro toplevel. One icon window per connection, reused. `UpdateDragImage` (a tab drag's late thumbnail) re-uploads it.
+- **Target.** `DragEnter` calls `OnDragEnter`. When the source is this browser, the target clones the source's provider with no round trip, as Wayland does. Otherwise it reads each useful type (uri-list, moz-url, html, web custom data, the best text alias) off-thread with the clipboard's bounds, assembles them as `WaylandExchangeDataProvider` does, and delivers `OnDragDataAvailable` once every read is in; a generation counter drops stale results. `AcceptDrop` follows `OnDragMotion`: copy > move > link within both masks, resent only on change, and sent only once the data is in, so a drop never lands before the page has the data. `DragDrop` waits for outstanding reads, then calls `OnDragDrop`, then sends `FinishDrag`.
+- **Request ids.** One client id space per connection, shared with the clipboard. Drag reads set the high bit, so the host routes `SelectionData` by id alone.
+- **Server changes found on the way** ([wire.md § FinishDrag](wire.md#finishdrag--0x030a), [§ The drag-and-drop sequence](wire.md#the-drag-and-drop-sequence)):
+  - A source `FinishDrag` during the drag used to be ignored, so `CancelDrag` (for example a tab closed mid-drag) could not end a live grab. It now cancels: the target gets `DragLeave`, the grab ends, and no `DragFinished` follows. Tests: `data.rs::the_source_finishing_mid_drag_cancels_it`, `tests/dnd.rs::the_source_finishing_mid_drag_cancels_it`.
+  - A drag `RequestSelection` racing a `DragLeave` already in flight was a fatal `Error { Protocol }`, which the target cannot avoid (the pointer crossing between windows quickly). From a client that has ever been sent a `DragEnter` it is now answered at EOF; from one that never was, it is still fatal. Test: `tests/dnd.rs::a_late_drag_read_ends_at_eof_and_a_strangers_is_fatal`.
+
+`just box=testhost2 chromium-dnd` (`deploy/chromium-dnd.sh`) tiles two browsers side by side, drives the drags through the control socket's `input` (press, motion steps, release), finds the pages by colour in a `shot`, and reads results back over DevTools. On testhost2 (2560×1440 at 1.25), 2026-09-30: after the last harness fix, 4 consecutive runs passed all 7 checks, and `chromium-clipboard` still passed 7/7.
+
+| check | result |
+|---|---|
+| text, browser A → B's drop zone | `text/plain,text/html,…` and the text arrive; A's `dragend` = copy |
+| link A → B | `text/uri-list` = the href, plus `text/plain` |
+| text within A (one client is source and target) | dropped; `dragend` = copy |
+| drop on the bar (a client without DATA: no target) | rejected, `dragend` = none, A clicks normally after |
+| drop on nitro-term (lists DATA, never accepts) | rejected, `dragend` = none; B untouched; nitro-term alive |
+| Escape mid-drag over B | cancelled, `dragend` = none; A and B both take a click after |
+| A SIGKILLed mid-drag over B | B gets `DragLeave`, the server's grab is gone (`dnd_grab 0`), B takes a click |
+| tab dragged out of A's strip (INFO) | no DnD and no detach: see "What doesn't" (move loop) |
+
+The bar check carries the drag down into the page first and then straight up to the bar. A straight diagonal from the text to the bar crossed A's tab strip. About one run in three, the page then logged neither `dragstart` nor `dragend`, although the backend saw StartDrag → DragFinished{false} and nothing hung. The cause is not pinned down: it is Chromium-internal, below the platform, and the platform side ended cleanly each time.
 
 ## Measurements
 

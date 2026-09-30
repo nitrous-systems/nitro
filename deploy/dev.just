@@ -287,6 +287,18 @@ chromium-clipboard:
     rsync -az deploy/chromium-clipboard.sh {{box}}:nitro-stage/
     ssh {{box}} 'bash ~/nitro-stage/chromium-clipboard.sh'
 
+# Chromium drag and drop end to end on the box (#3965): two tiled browsers
+# drag text and links to each other and to themselves; drops on nitro-term
+# and the bar, Escape and a source SIGKILLed mid-drag must end cleanly.
+# Prints PASS/FAIL per check (see the script). Needs `deploy-chromium` and a
+# logged-in session; `KEEP=1` on the box keeps the logs.
+[doc("Chromium drag-and-drop end-to-end check on the box (PASS/FAIL per check)")]
+[group('dev')]
+chromium-dnd:
+    ssh {{box}} 'mkdir -p ~/nitro-stage'
+    rsync -az deploy/chromium-dnd.sh {{box}}:nitro-stage/
+    ssh {{box}} 'bash ~/nitro-stage/chromium-dnd.sh'
+
 # Install/refresh the systemd unit on the box (needs sudo there). On a
 # `greetd` box there is no unit: this makes the clone pushable and
 # checks that greetd is the display manager (`box-greetd` sets it up).

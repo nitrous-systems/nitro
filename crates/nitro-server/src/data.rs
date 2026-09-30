@@ -488,9 +488,11 @@ impl Dnd {
                     action,
                 }
             }
-            Phase::Dragging | Phase::Dropped | Phase::Finished if token == self.source => Outcome::Released {
-                leave: self.target.take(),
-            },
+            Phase::Dragging | Phase::Dropped | Phase::Finished if token == self.source => {
+                Outcome::Released {
+                    leave: self.target.take(),
+                }
+            }
             _ => Outcome::Nothing,
         }
     }
