@@ -10,10 +10,11 @@ use std::time::Duration;
 use nitro_core::IRect;
 use nitro_gpu::fake::{Call, FakeBackend};
 use nitro_gpu::proto::{
-    Blend, ColorEncoding, ColorRange, Composite, DeviceInfo, DmabufDesc, ErrorCode, FormatMod,
-    Layer, NV12, PROTO_VERSION, PlaneDesc, ShadowDesc, ShadowPath, SlotLayout, Stats, XR24, op,
+    Blend, CaptureComposite, ColorEncoding, ColorRange, Composite, DeviceInfo, DmabufDesc,
+    ErrorCode, FormatMod, Layer, NV12, PROTO_VERSION, PlaneDesc, ShadowDesc, ShadowPath,
+    SlotLayout, Stats, XR24, op,
 };
-use nitro_gpu::{Config, Conn, Exit, FromHelper, Message, ToHelper};
+use nitro_gpu::{Config, Conn, Exit, FromHelper, Message, RingId, ToHelper};
 use nitro_wire::{Framer, Writer};
 
 const T: Duration = Duration::from_secs(5);
@@ -201,7 +202,7 @@ fn every_message_round_trips() {
             },
             0,
         ),
-        (ToHelper::Composite(comp), 1),
+        (ToHelper::Composite(comp.clone()), 1),
         (ToHelper::Release { id: 9 }, 0),
         (ToHelper::ReadBack { out_idx: 2 }, 0),
         (ToHelper::GetStats, 0),
@@ -215,6 +216,29 @@ fn every_message_round_trips() {
             },
             0,
         ),
+        (
+            ToHelper::AllocCaptureRing {
+                ring_id: 4,
+                n: 3,
+                w: 2560,
+                h: 1440,
+                fourcc: XR24,
+                modifiers: vec![0, 1 << 56 | 2],
+            },
+            0,
+        ),
+        (
+            ToHelper::CaptureComposite(CaptureComposite {
+                ring_id: 4,
+                frame: Composite {
+                    serial: 12,
+                    out_idx: 2,
+                    ..comp.clone()
+                },
+            }),
+            1,
+        ),
+        (ToHelper::FreeCaptureRing { ring_id: 4 }, 0),
     ];
     for (m, n) in &to {
         round_trip(m, *n);
@@ -266,6 +290,24 @@ fn every_message_round_trips() {
             2,
         ),
         (FromHelper::Composited { serial: 5 }, 1),
+        (
+            FromHelper::CaptureRing {
+                ring_id: 4,
+                w: 4,
+                h: 4,
+                fourcc: XR24,
+                modifier: 0,
+                slots: vec![
+                    SlotLayout {
+                        offset: 0,
+                        pitch: 16,
+                        size: 64
+                    };
+                    3
+                ],
+            },
+            3,
+        ),
         (FromHelper::Released { id: 3 }, 0),
         (
             FromHelper::Captured {
@@ -713,4 +755,243 @@ fn capture_draws_the_layers_into_a_memfd_and_refuses_bad_ones() {
     .unwrap();
     expect_error(&mut c, ErrorCode::Backend);
     shutdown(c, h);
+}
+
+fn capture_ring(c: &mut Conn, ring_id: u32, n: u32, w: u32, h: u32) -> Vec<OwnedFd> {
+    let msg = ToHelper::AllocCaptureRing {
+        ring_id,
+        n,
+        w,
+        h,
+        fourcc: XR24,
+        modifiers: vec![],
+    };
+    let (r, fds) = c.call(&msg, vec![], T).unwrap();
+    match r {
+        FromHelper::CaptureRing {
+            ring_id: id,
+            w: rw,
+            h: rh,
+            fourcc,
+            modifier,
+            slots,
+        } => {
+            assert_eq!((id, rw, rh, fourcc), (ring_id, w, h, XR24));
+            assert_eq!(modifier, 0, "LINEAR first");
+            assert_eq!(slots.len(), n as usize);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(fds.len(), n as usize);
+    fds
+}
+
+fn capture_frame(
+    serial: u64,
+    ring_id: u32,
+    slot: u32,
+    damage: Vec<IRect>,
+    layers: Vec<Layer>,
+) -> ToHelper {
+    ToHelper::CaptureComposite(CaptureComposite {
+        ring_id,
+        frame: Composite {
+            serial,
+            out_idx: slot,
+            damage,
+            layers,
+            fence_mask: 0,
+        },
+    })
+}
+
+#[test]
+fn capture_rings_alloc_composite_free_beside_the_output_ring() {
+    let fake = FakeBackend::new();
+    let (mut c, h) = start(fake.clone(), Config::default());
+    shadow(&mut c, 1, 8, 8);
+    let _out = ring(&mut c, 2, 8, 8);
+    let _cap = capture_ring(&mut c, 7, 3, 8, 8);
+    assert!(fake.calls().contains(&Call::CaptureRing(7, 3, 0)));
+
+    // A capture frame: Composited + fence, into the capture ring's slot.
+    c.send(
+        &capture_frame(1, 7, 0, vec![], vec![layer(1, 8, 8)]),
+        vec![],
+    )
+    .unwrap();
+    let cf = composited(&mut c, 1);
+    // The output ring's slot 0 is not busy because of it.
+    c.send(&frame(2, 0, vec![], vec![layer(1, 8, 8)]), vec![])
+        .unwrap();
+    let of = composited(&mut c, 2);
+    // The capture slot 0 is busy until its own fence signals.
+    c.send(
+        &capture_frame(3, 7, 0, vec![], vec![layer(1, 8, 8)]),
+        vec![],
+    )
+    .unwrap();
+    expect_error(&mut c, ErrorCode::Busy);
+    let calls = fake.calls();
+    assert!(calls.contains(&Call::CaptureComposite(
+        7,
+        0,
+        vec![IRect::new(0, 0, 8, 8)],
+        vec![1],
+        0
+    )));
+    assert!(calls.contains(&Call::Composite(
+        0,
+        vec![IRect::new(0, 0, 8, 8)],
+        vec![1],
+        0
+    )));
+
+    // Unknown ring, bad slot, bad rect (the ring's size), duplicate id,
+    // bad slot count / format: refused, the helper carries on.
+    c.send(
+        &capture_frame(4, 9, 0, vec![], vec![layer(1, 8, 8)]),
+        vec![],
+    )
+    .unwrap();
+    expect_error(&mut c, ErrorCode::BadRing);
+    c.send(
+        &capture_frame(5, 7, 3, vec![], vec![layer(1, 8, 8)]),
+        vec![],
+    )
+    .unwrap();
+    expect_error(&mut c, ErrorCode::NoRing);
+    let _small = capture_ring(&mut c, 8, 4, 4, 4);
+    c.send(
+        &capture_frame(6, 8, 0, vec![], vec![layer(1, 8, 8)]),
+        vec![],
+    )
+    .unwrap();
+    expect_error(&mut c, ErrorCode::BadRect);
+    let alloc = |ring_id, n, fourcc| ToHelper::AllocCaptureRing {
+        ring_id,
+        n,
+        w: 8,
+        h: 8,
+        fourcc,
+        modifiers: vec![],
+    };
+    c.send(&alloc(7, 3, XR24), vec![]).unwrap();
+    expect_error(&mut c, ErrorCode::DuplicateId);
+    c.send(&alloc(10, 2, XR24), vec![]).unwrap();
+    expect_error(&mut c, ErrorCode::TooMany);
+    c.send(&alloc(10, 3, NV12), vec![]).unwrap();
+    expect_error(&mut c, ErrorCode::BadFormat);
+    fake.state().fail_next_ring = true;
+    c.send(&alloc(10, 3, XR24), vec![]).unwrap();
+    expect_error(&mut c, ErrorCode::Backend);
+
+    // Free while a frame is in flight: the id dies at once, the slots
+    // wait for the fence.
+    c.send(&ToHelper::FreeCaptureRing { ring_id: 7 }, vec![])
+        .unwrap();
+    c.send(
+        &capture_frame(7, 7, 1, vec![], vec![layer(1, 8, 8)]),
+        vec![],
+    )
+    .unwrap();
+    expect_error(&mut c, ErrorCode::BadRing);
+    assert!(!fake.calls().contains(&Call::FreeRing(RingId::Capture(7))));
+    assert!(fake.signal()); // capture frame 1
+    assert!(nitro_gpu::client::fence_signalled(&cf, T));
+    let _ = c.call(&ToHelper::GetStats, vec![], T).unwrap();
+    assert!(fake.calls().contains(&Call::FreeRing(RingId::Capture(7))));
+    // Freeing it again: unknown.
+    c.send(&ToHelper::FreeCaptureRing { ring_id: 7 }, vec![])
+        .unwrap();
+    expect_error(&mut c, ErrorCode::BadRing);
+    // The id can be reused once freed.
+    let _again = capture_ring(&mut c, 7, 3, 8, 8);
+
+    // The output ring is unaffected.
+    assert!(fake.signal()); // output frame 2
+    assert!(nitro_gpu::client::fence_signalled(&of, T));
+    c.send(&frame(8, 0, vec![], vec![layer(1, 8, 8)]), vec![])
+        .unwrap();
+    let _ = composited(&mut c, 8);
+    assert!(!fake.calls().contains(&Call::FreeRing(RingId::Output)));
+
+    // Rings still alive at the end are freed by the teardown.
+    fake.signal();
+    shutdown(c, h);
+    let calls = fake.calls();
+    assert!(calls.contains(&Call::FreeRing(RingId::Capture(8))));
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|c| **c == Call::FreeRing(RingId::Capture(7)))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn capture_ring_damage_is_its_own() {
+    let fake = FakeBackend::auto_signal();
+    let (mut c, h) = start(fake.clone(), Config::default());
+    shadow(&mut c, 1, 100, 100);
+    let _out = ring(&mut c, 2, 100, 100);
+    let _cap = capture_ring(&mut c, 1, 3, 100, 100);
+    let d = IRect::new(10, 10, 5, 5);
+    let sync = |c: &mut Conn| {
+        let _ = c.call(&ToHelper::GetStats, vec![], T).unwrap();
+    };
+    // Capture slot 0 twice, output frames in between: the capture clip
+    // is only the capture ring's own damage.
+    c.send(
+        &capture_frame(1, 1, 0, vec![], vec![layer(1, 100, 100)]),
+        vec![],
+    )
+    .unwrap();
+    let _ = composited(&mut c, 1);
+    sync(&mut c);
+    c.send(
+        &frame(
+            2,
+            0,
+            vec![IRect::new(50, 50, 5, 5)],
+            vec![layer(1, 100, 100)],
+        ),
+        vec![],
+    )
+    .unwrap();
+    let _ = composited(&mut c, 2);
+    sync(&mut c);
+    c.send(
+        &capture_frame(3, 1, 0, vec![d], vec![layer(1, 100, 100)]),
+        vec![],
+    )
+    .unwrap();
+    let _ = composited(&mut c, 3);
+    let clips: Vec<Vec<IRect>> = fake
+        .calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            Call::CaptureComposite(1, 0, clip, _, _) => Some(clip),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(clips, vec![vec![IRect::new(0, 0, 100, 100)], vec![d]]);
+    shutdown(c, h);
+}
+
+#[test]
+fn idle_exit_waits_for_capture_rings() {
+    let cfg = Config {
+        idle_exit: Some(Duration::from_millis(200)),
+    };
+    let fake = FakeBackend::auto_signal();
+    let (mut c, h) = start(fake.clone(), cfg);
+    let _cap = capture_ring(&mut c, 3, 3, 4, 4);
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(!h.is_finished(), "a capture ring is held");
+    c.send(&ToHelper::FreeCaptureRing { ring_id: 3 }, vec![])
+        .unwrap();
+    assert_eq!(h.join().unwrap(), Exit::Idle);
+    assert!(fake.calls().contains(&Call::FreeRing(RingId::Capture(3))));
 }

@@ -24,7 +24,7 @@ use nitro_wire::{DecodeError, EncodeError, Frame, MAX_FDS, Reader, Writer};
 
 /// Protocol version; [`ToHelper::Hello`] and [`FromHelper::HelloReply`]
 /// carry it and a mismatch is refused.
-pub const PROTO_VERSION: u32 = 2;
+pub const PROTO_VERSION: u32 = 3;
 
 /// Most layers in one [`Composite`] or [`ToHelper::Capture`].
 pub const MAX_LAYERS: usize = 16;
@@ -32,6 +32,12 @@ pub const MAX_LAYERS: usize = 16;
 pub const MAX_RECTS: usize = 64;
 /// Most slots in an output ring.
 pub const MAX_RING: usize = 4;
+/// Fewest slots in a capture ring (v3): one with the consumer, one being
+/// drawn, one spare, so a slow consumer drops frames instead of stalling.
+pub const MIN_CAPTURE_RING: usize = 3;
+/// Most capture rings alive at once (v3). Bounds what a server bug can
+/// pin in GPU memory; one per recorded output is the expected use.
+pub const MAX_CAPTURE_RINGS: usize = 4;
 /// Most planes of an imported dma-buf.
 pub const MAX_PLANES: usize = 4;
 /// Most modifiers in a ring request.
@@ -214,6 +220,19 @@ impl Composite {
     }
 }
 
+/// One capture frame (v3): draw `frame.layers` into slot `frame.out_idx`
+/// of capture ring `ring_id`. Everything else is as for a [`Composite`]
+/// (the damage is since the previous frame **of this ring**; the helper
+/// adds buffer age per ring), and it is answered the same way:
+/// `Composited{serial}` + a `sync_file`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CaptureComposite {
+    /// Capture ring, from [`ToHelper::AllocCaptureRing`].
+    pub ring_id: u32,
+    /// The frame; `out_idx` is the capture ring slot.
+    pub frame: Composite,
+}
+
 /// What the device can do; the answer to [`ToHelper::Hello`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DeviceInfo {
@@ -298,6 +317,9 @@ pub enum ErrorCode {
     Backend = 11,
     /// A shadow memfd lacks the required seals or is too small.
     BadBuffer = 12,
+    /// Unknown capture ring id (v3); `what` is the ring id, or the serial
+    /// for a `CaptureComposite`.
+    BadRing = 13,
 }
 
 impl ErrorCode {
@@ -315,6 +337,7 @@ impl ErrorCode {
             10 => Self::Busy,
             11 => Self::Backend,
             12 => Self::BadBuffer,
+            13 => Self::BadRing,
             _ => return Err(DecodeError::BadValue),
         })
     }
@@ -387,6 +410,35 @@ pub enum ToHelper {
         h: u32,
         /// Layers, bottom first.
         layers: Vec<Layer>,
+    },
+    /// v3: allocate a capture ring for screen recording, beside (and
+    /// independent of) the output ring. Answered by `CaptureRing` (n
+    /// fds) or `Error{what: ring_id}`. The modifier is picked LINEAR
+    /// first (consumers mmap it or import it anywhere), then in the
+    /// request's order; an empty list means "anything the helper renders".
+    AllocCaptureRing {
+        /// Server-chosen id; must not be alive (or still being freed).
+        ring_id: u32,
+        /// Slot count, [`MIN_CAPTURE_RING`]..=[`MAX_RING`].
+        n: u32,
+        /// Width in pixels.
+        w: u32,
+        /// Height in pixels.
+        h: u32,
+        /// Fourcc: [`XR24`] only (NV12 is a follow-up).
+        fourcc: u32,
+        /// Acceptable modifiers; may be empty.
+        modifiers: Vec<u64>,
+    },
+    /// v3: draw a capture frame. Answered by `Composited` (+ `sync_file`),
+    /// like `Composite`; `Error.what` is the serial.
+    CaptureComposite(CaptureComposite),
+    /// v3: drop a capture ring. The id is dead at once (frames for it are
+    /// refused); its memory is freed once every submitted frame into it
+    /// has signalled. No reply unless the id is unknown.
+    FreeCaptureRing {
+        /// Ring id.
+        ring_id: u32,
     },
 }
 
@@ -465,6 +517,22 @@ pub enum FromHelper {
         /// Row stride in bytes.
         stride: u32,
     },
+    /// v3: answer to `AllocCaptureRing`; one dma-buf fd per slot rides
+    /// with it.
+    CaptureRing {
+        /// The request's ring id.
+        ring_id: u32,
+        /// Width in pixels.
+        w: u32,
+        /// Height in pixels.
+        h: u32,
+        /// Fourcc.
+        fourcc: u32,
+        /// The modifier every slot has.
+        modifier: u64,
+        /// Per-slot layout.
+        slots: Vec<SlotLayout>,
+    },
 }
 
 /// Op codes.
@@ -491,6 +559,12 @@ pub mod op {
     pub const SHUTDOWN: u16 = 0x0a;
     /// `Capture`.
     pub const CAPTURE: u16 = 0x0b;
+    /// `AllocCaptureRing` (v3).
+    pub const ALLOC_CAPTURE_RING: u16 = 0x0c;
+    /// `CaptureComposite` (v3).
+    pub const CAPTURE_COMPOSITE: u16 = 0x0d;
+    /// `FreeCaptureRing` (v3).
+    pub const FREE_CAPTURE_RING: u16 = 0x0e;
 
     /// `HelloReply`.
     pub const HELLO_REPLY: u16 = 0x81;
@@ -510,6 +584,8 @@ pub mod op {
     pub const STATS: u16 = 0x88;
     /// `Captured`.
     pub const CAPTURED: u16 = 0x89;
+    /// `CaptureRing` (v3).
+    pub const CAPTURE_RING: u16 = 0x8a;
 }
 
 /// A message of this protocol: encode with its fds, decode from a frame.
@@ -672,6 +748,69 @@ fn get_layers(r: &mut Reader<'_>) -> Result<Vec<Layer>, DecodeError> {
     Ok(layers)
 }
 
+fn composite_ok(c: &Composite) -> bool {
+    c.damage.len() <= MAX_RECTS
+        && c.layers.len() <= MAX_LAYERS
+        && c.fence_mask >> c.layers.len() == 0
+}
+
+/// `fence_mask`, damage, layers: the tail both frame messages share.
+fn put_frame_tail(w: &mut Writer, c: &Composite) {
+    w.put_u32(c.fence_mask);
+    put_rects(w, &c.damage);
+    put_layers(w, &c.layers);
+}
+
+fn get_frame_tail(r: &mut Reader<'_>, serial: u64, out_idx: u32) -> Result<Composite, DecodeError> {
+    let fence_mask = r.get_u32()?;
+    let damage = get_rects(r)?;
+    let layers = get_layers(r)?;
+    if fence_mask >> layers.len() != 0 {
+        return Err(DecodeError::BadValue);
+    }
+    Ok(Composite {
+        serial,
+        out_idx,
+        damage,
+        layers,
+        fence_mask,
+    })
+}
+
+fn put_modifiers(w: &mut Writer, modifiers: &[u64]) {
+    w.put_u32(modifiers.len() as u32);
+    for m in modifiers {
+        w.put_u64(*m);
+    }
+}
+
+fn get_modifiers(r: &mut Reader<'_>) -> Result<Vec<u64>, DecodeError> {
+    let count = get_count(r, MAX_MODIFIERS, 8)?;
+    (0..count).map(|_| r.get_u64()).collect()
+}
+
+fn put_slots(w: &mut Writer, slots: &[SlotLayout]) {
+    w.put_u32(slots.len() as u32);
+    for s in slots {
+        w.put_u32(s.offset);
+        w.put_u32(s.pitch);
+        w.put_u64(s.size);
+    }
+}
+
+fn get_slots(r: &mut Reader<'_>) -> Result<Vec<SlotLayout>, DecodeError> {
+    let n = get_count(r, MAX_RING, 16)?;
+    (0..n)
+        .map(|_| {
+            Ok(SlotLayout {
+                offset: r.get_u32()?,
+                pitch: r.get_u32()?,
+                size: r.get_u64()?,
+            })
+        })
+        .collect()
+}
+
 fn put_formats(w: &mut Writer, f: &[FormatMod]) {
     w.put_u32(f.len() as u32);
     for f in f {
@@ -764,6 +903,9 @@ impl Message for ToHelper {
             Self::GetStats => op::GET_STATS,
             Self::Shutdown => op::SHUTDOWN,
             Self::Capture { .. } => op::CAPTURE,
+            Self::AllocCaptureRing { .. } => op::ALLOC_CAPTURE_RING,
+            Self::CaptureComposite(_) => op::CAPTURE_COMPOSITE,
+            Self::FreeCaptureRing { .. } => op::FREE_CAPTURE_RING,
         }
     }
 
@@ -772,6 +914,7 @@ impl Message for ToHelper {
             Self::ImportDmabuf(d) => d.planes.len(),
             Self::ImportShadow(_) => 1,
             Self::Composite(c) => c.fence_count(),
+            Self::CaptureComposite(c) => c.frame.fence_count(),
             _ => 0,
         }
     }
@@ -780,12 +923,11 @@ impl Message for ToHelper {
         match self {
             Self::ImportDmabuf(d) => too_large(d.planes.len() <= MAX_PLANES),
             Self::UploadDamage { rects, .. } => too_large(rects.len() <= MAX_RECTS),
-            Self::AllocOutputRing { modifiers, .. } => too_large(modifiers.len() <= MAX_MODIFIERS),
-            Self::Composite(c) => too_large(
-                c.damage.len() <= MAX_RECTS
-                    && c.layers.len() <= MAX_LAYERS
-                    && c.fence_mask >> c.layers.len() == 0,
-            ),
+            Self::AllocOutputRing { modifiers, .. } | Self::AllocCaptureRing { modifiers, .. } => {
+                too_large(modifiers.len() <= MAX_MODIFIERS)
+            }
+            Self::Composite(c) => too_large(composite_ok(c)),
+            Self::CaptureComposite(c) => too_large(composite_ok(&c.frame)),
             Self::Capture { layers, .. } => too_large(layers.len() <= MAX_LAYERS),
             _ => Ok(()),
         }
@@ -830,18 +972,35 @@ impl Message for ToHelper {
                 w.put_u32(*width);
                 w.put_u32(*h);
                 w.put_u32(*fourcc);
-                w.put_u32(modifiers.len() as u32);
-                for m in modifiers {
-                    w.put_u64(*m);
-                }
+                put_modifiers(w, modifiers);
             }
             Self::Composite(c) => {
                 w.put_u64(c.serial);
                 w.put_u32(c.out_idx);
-                w.put_u32(c.fence_mask);
-                put_rects(w, &c.damage);
-                put_layers(w, &c.layers);
+                put_frame_tail(w, c);
             }
+            Self::AllocCaptureRing {
+                ring_id,
+                n,
+                w: width,
+                h,
+                fourcc,
+                modifiers,
+            } => {
+                w.put_u32(*ring_id);
+                w.put_u32(*n);
+                w.put_u32(*width);
+                w.put_u32(*h);
+                w.put_u32(*fourcc);
+                put_modifiers(w, modifiers);
+            }
+            Self::CaptureComposite(c) => {
+                w.put_u64(c.frame.serial);
+                w.put_u32(c.ring_id);
+                w.put_u32(c.frame.out_idx);
+                put_frame_tail(w, &c.frame);
+            }
+            Self::FreeCaptureRing { ring_id } => w.put_u32(*ring_id),
             Self::Release { id } => w.put_u32(*id),
             Self::ReadBack { out_idx } => w.put_u32(*out_idx),
             Self::GetStats | Self::Shutdown => {}
@@ -908,8 +1067,7 @@ impl Message for ToHelper {
                 let w = r.get_u32()?;
                 let h = r.get_u32()?;
                 let fourcc = r.get_u32()?;
-                let count = get_count(r, MAX_MODIFIERS, 8)?;
-                let modifiers = (0..count).map(|_| r.get_u64()).collect::<Result<_, _>>()?;
+                let modifiers = get_modifiers(r)?;
                 Self::AllocOutputRing {
                     n,
                     w,
@@ -921,20 +1079,28 @@ impl Message for ToHelper {
             op::COMPOSITE => {
                 let serial = r.get_u64()?;
                 let out_idx = r.get_u32()?;
-                let fence_mask = r.get_u32()?;
-                let damage = get_rects(r)?;
-                let layers = get_layers(r)?;
-                if fence_mask >> layers.len() != 0 {
-                    return Err(DecodeError::BadValue);
-                }
-                Self::Composite(Composite {
-                    serial,
-                    out_idx,
-                    damage,
-                    layers,
-                    fence_mask,
+                Self::Composite(get_frame_tail(r, serial, out_idx)?)
+            }
+            op::ALLOC_CAPTURE_RING => Self::AllocCaptureRing {
+                ring_id: r.get_u32()?,
+                n: r.get_u32()?,
+                w: r.get_u32()?,
+                h: r.get_u32()?,
+                fourcc: r.get_u32()?,
+                modifiers: get_modifiers(r)?,
+            },
+            op::CAPTURE_COMPOSITE => {
+                let serial = r.get_u64()?;
+                let ring_id = r.get_u32()?;
+                let slot = r.get_u32()?;
+                Self::CaptureComposite(CaptureComposite {
+                    ring_id,
+                    frame: get_frame_tail(r, serial, slot)?,
                 })
             }
+            op::FREE_CAPTURE_RING => Self::FreeCaptureRing {
+                ring_id: r.get_u32()?,
+            },
             op::RELEASE => Self::Release { id: r.get_u32()? },
             op::READ_BACK => Self::ReadBack {
                 out_idx: r.get_u32()?,
@@ -964,12 +1130,13 @@ impl Message for FromHelper {
             Self::ReadBackReply { .. } => op::READ_BACK_REPLY,
             Self::Stats(_) => op::STATS,
             Self::Captured { .. } => op::CAPTURED,
+            Self::CaptureRing { .. } => op::CAPTURE_RING,
         }
     }
 
     fn fd_count(&self) -> usize {
         match self {
-            Self::OutputRing { slots, .. } => slots.len(),
+            Self::OutputRing { slots, .. } | Self::CaptureRing { slots, .. } => slots.len(),
             Self::Composited { .. } | Self::ReadBackReply { .. } | Self::Captured { .. } => 1,
             _ => 0,
         }
@@ -980,7 +1147,9 @@ impl Message for FromHelper {
             Self::HelloReply { info, .. } => {
                 too_large(info.sampleable.len() <= MAX_FORMATS && info.render.len() <= MAX_FORMATS)
             }
-            Self::OutputRing { slots, .. } => too_large(slots.len() <= MAX_RING),
+            Self::OutputRing { slots, .. } | Self::CaptureRing { slots, .. } => {
+                too_large(slots.len() <= MAX_RING)
+            }
             _ => Ok(()),
         }
     }
@@ -1017,12 +1186,22 @@ impl Message for FromHelper {
                 w.put_u32(*h);
                 w.put_u32(*fourcc);
                 w.put_u64(*modifier);
-                w.put_u32(slots.len() as u32);
-                for s in slots {
-                    w.put_u32(s.offset);
-                    w.put_u32(s.pitch);
-                    w.put_u64(s.size);
-                }
+                put_slots(w, slots);
+            }
+            Self::CaptureRing {
+                ring_id,
+                w: width,
+                h,
+                fourcc,
+                modifier,
+                slots,
+            } => {
+                w.put_u32(*ring_id);
+                w.put_u32(*width);
+                w.put_u32(*h);
+                w.put_u32(*fourcc);
+                w.put_u64(*modifier);
+                put_slots(w, slots);
             }
             Self::Composited { serial } => w.put_u64(*serial),
             Self::ReadBackReply {
@@ -1088,16 +1267,7 @@ impl Message for FromHelper {
                 let h = r.get_u32()?;
                 let fourcc = r.get_u32()?;
                 let modifier = r.get_u64()?;
-                let n = get_count(r, MAX_RING, 16)?;
-                let slots = (0..n)
-                    .map(|_| {
-                        Ok(SlotLayout {
-                            offset: r.get_u32()?,
-                            pitch: r.get_u32()?,
-                            size: r.get_u64()?,
-                        })
-                    })
-                    .collect::<Result<_, DecodeError>>()?;
+                let slots = get_slots(r)?;
                 Self::OutputRing {
                     w,
                     h,
@@ -1120,6 +1290,14 @@ impl Message for FromHelper {
                 w: r.get_u32()?,
                 h: r.get_u32()?,
                 stride: r.get_u32()?,
+            },
+            op::CAPTURE_RING => Self::CaptureRing {
+                ring_id: r.get_u32()?,
+                w: r.get_u32()?,
+                h: r.get_u32()?,
+                fourcc: r.get_u32()?,
+                modifier: r.get_u64()?,
+                slots: get_slots(r)?,
             },
             op::STATS => Self::Stats(Stats {
                 frames: r.get_u64()?,

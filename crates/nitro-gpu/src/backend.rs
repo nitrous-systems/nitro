@@ -51,7 +51,17 @@ impl fmt::Display for BackendError {
 
 impl std::error::Error for BackendError {}
 
-/// An output-ring allocation request, validated.
+/// Which ring a backend call is about: the output (scanout) ring, of which
+/// there is at most one, or a capture ring (protocol v3) by the server's id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RingId {
+    /// The output ring (`AllocOutputRing` / `Composite`).
+    Output,
+    /// A capture ring (`AllocCaptureRing` / `CaptureComposite`).
+    Capture(u32),
+}
+
+/// A ring allocation request, validated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RingRequest {
     /// Slot count.
@@ -121,34 +131,44 @@ pub trait Backend {
     /// The copy could not be recorded.
     fn upload_damage(&mut self, t: &mut Self::Tex, rects: &[IRect]) -> Result<(), BackendError>;
 
-    /// (Re)allocate the output ring. A backend may wait for the GPU to go
-    /// idle here: a reallocation is a mode change, not a frame.
+    /// Allocate `ring`. [`RingId::Output`] replaces the output ring (a
+    /// backend may wait for the GPU to go idle there: a reallocation is a
+    /// mode change, not a frame). A [`RingId::Capture`] id is new (the
+    /// event loop checks); the modifier list is in preference order.
     ///
     /// # Errors
-    /// No modifier in the list works, or allocation/export failed.
-    fn alloc_output_ring(&mut self, req: &RingRequest) -> Result<Ring, BackendError>;
+    /// No modifier in the list works, or allocation/export failed. A
+    /// failed allocation leaves nothing allocated for `ring` (for the
+    /// output ring, the old ring may be gone too).
+    fn alloc_ring(&mut self, ring: RingId, req: &RingRequest) -> Result<Ring, BackendError>;
 
-    /// Draw `layers` (bottom first) into slot `out_idx`, restricted to
-    /// `clip` (non-empty rects inside the output; an empty `clip` draws
-    /// nothing but still submits). Wait for every `acquire` `sync_file`
-    /// before sampling. Return the completion `sync_file` **without
-    /// waiting** for the GPU. The event loop guarantees the slot's
-    /// previous frame has signalled.
+    /// Draw `layers` (bottom first) into slot `slot` of `ring`, restricted
+    /// to `clip` (non-empty rects inside the ring's size; an empty `clip`
+    /// draws nothing but still submits). Wait for every `acquire`
+    /// `sync_file` before sampling. Return the completion `sync_file`
+    /// **without waiting** for the GPU. The event loop guarantees the ring
+    /// exists and the slot's previous frame has signalled.
     ///
     /// # Errors
     /// Recording or submission failed.
     fn composite(
         &mut self,
-        out_idx: usize,
+        ring: RingId,
+        slot: usize,
         clip: &[IRect],
         layers: &[(&Self::Tex, Layer)],
         acquire: Vec<OwnedFd>,
     ) -> Result<OwnedFd, BackendError>;
 
+    /// Free `ring`'s slots. Every frame drawn into it has signalled. A
+    /// ring that does not exist is a no-op.
+    fn free_ring(&mut self, ring: RingId);
+
     /// Free a texture. Every frame that sampled it has signalled.
     fn release(&mut self, t: Self::Tex);
 
-    /// Debug/test: copy slot `out_idx` to linear BGRA. May block on the GPU.
+    /// Debug/test: copy output-ring slot `out_idx` to linear BGRA. May
+    /// block on the GPU.
     ///
     /// # Errors
     /// The copy failed.

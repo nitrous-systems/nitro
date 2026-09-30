@@ -23,7 +23,7 @@ use nitro_gpu::proto::{
     AR24, DeviceInfo, DmabufDesc, ErrorCode, Layer, MOD_LINEAR, NV12, ShadowDesc, ShadowPath,
     SlotLayout, XR24,
 };
-use nitro_gpu::{Backend, BackendError, Readback, Ring, RingRequest};
+use nitro_gpu::{Backend, BackendError, Readback, Ring, RingId, RingRequest};
 
 use crate::device::{Gpu, vk_format};
 use crate::pipeline::{FamilyKey, PUSH_SIZE, Pipelines, blend_index};
@@ -95,6 +95,13 @@ struct Slot {
     fresh: bool,
 }
 
+/// A capture ring's slots (protocol v3) and their size.
+struct CaptureSlots {
+    slots: Vec<Slot>,
+    w: u32,
+    h: u32,
+}
+
 /// The Vulkan backend.
 pub struct VkBackend {
     pipes: Pipelines,
@@ -102,6 +109,8 @@ pub struct VkBackend {
     slots: Vec<Slot>,
     out_w: u32,
     out_h: u32,
+    /// Capture rings by the server's id; nothing while none is allocated.
+    captures: std::collections::HashMap<u32, CaptureSlots>,
     shadow_path: ShadowPath,
     force_staging: bool,
     // Last: dropped after everything created from it.
@@ -152,6 +161,7 @@ impl VkBackend {
             slots: Vec::new(),
             out_w: 0,
             out_h: 0,
+            captures: std::collections::HashMap::new(),
             shadow_path: ShadowPath::Unknown,
             force_staging: std::env::var(SHADOW_ENV).is_ok_and(|v| v == "staging"),
             gpu,
@@ -567,6 +577,54 @@ impl VkBackend {
                 self.destroy_slot(s);
             }
         }
+    }
+
+    /// Free a capture ring's slots. The event loop only frees a ring once
+    /// every frame drawn into it has signalled; each slot's own fence is
+    /// still waited for (bounded) so a lying caller cannot free a busy
+    /// slot.
+    fn destroy_capture(&mut self, id: u32) {
+        let Some(c) = self.captures.remove(&id) else {
+            return;
+        };
+        for s in c.slots {
+            if self.wait(s.fence).is_err() {
+                // SAFETY: waiting for the device is always allowed.
+                let _ = unsafe { self.gpu.device.device_wait_idle() };
+            }
+            // SAFETY: the slot's frame finished (waited above).
+            unsafe { self.destroy_slot(s) };
+        }
+    }
+
+    /// `n` new slots for `req`, or none: a failure frees what was made.
+    fn new_slots(&self, req: &RingRequest) -> Result<(Vec<Slot>, Ring), BackendError> {
+        let mut slots = Vec::with_capacity(req.n);
+        let mut out = Vec::with_capacity(req.n);
+        let mut modifier = 0;
+        for _ in 0..req.n {
+            match self.new_slot(req) {
+                Ok((slot, layout, m, fd)) => {
+                    modifier = m;
+                    slots.push(slot);
+                    out.push((layout, fd));
+                }
+                Err(e) => {
+                    for s in slots {
+                        // SAFETY: nothing was submitted with these slots.
+                        unsafe { self.destroy_slot(s) };
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Ok((
+            slots,
+            Ring {
+                modifier,
+                slots: out,
+            },
+        ))
     }
 
     /// Free one slot's objects.
@@ -1152,39 +1210,70 @@ impl Backend for VkBackend {
         Ok(())
     }
 
-    fn alloc_output_ring(&mut self, req: &RingRequest) -> Result<Ring, BackendError> {
-        self.destroy_slots();
-        let mut out = Vec::with_capacity(req.n);
-        let mut modifier = 0;
-        for _ in 0..req.n {
-            match self.new_slot(req) {
-                Ok((slot, layout, m, fd)) => {
-                    modifier = m;
-                    self.slots.push(slot);
-                    out.push((layout, fd));
+    fn alloc_ring(&mut self, ring: RingId, req: &RingRequest) -> Result<Ring, BackendError> {
+        match ring {
+            RingId::Output => {
+                self.destroy_slots();
+                let (slots, r) = self.new_slots(req)?;
+                self.slots = slots;
+                self.out_w = req.w;
+                self.out_h = req.h;
+                Ok(r)
+            }
+            RingId::Capture(id) => {
+                // The modifier list is LINEAR first (validate): a
+                // capture slot is read by consumers that mmap it. A
+                // driver given a list picks what it likes best (anv/hasvk
+                // take X_TILED over LINEAR), so offer one at a time.
+                self.destroy_capture(id);
+                let mut last = BackendError::new("no modifier");
+                let mut made = None;
+                for m in &req.modifiers {
+                    let one = RingRequest {
+                        modifiers: vec![*m],
+                        ..req.clone()
+                    };
+                    match self.new_slots(&one) {
+                        Ok(v) => {
+                            made = Some(v);
+                            break;
+                        }
+                        Err(e) => last = e,
+                    }
                 }
-                Err(e) => {
-                    self.destroy_slots();
-                    return Err(e);
-                }
+                let (slots, r) = made.ok_or(last)?;
+                self.captures.insert(
+                    id,
+                    CaptureSlots {
+                        slots,
+                        w: req.w,
+                        h: req.h,
+                    },
+                );
+                Ok(r)
             }
         }
-        self.out_w = req.w;
-        self.out_h = req.h;
-        Ok(Ring {
-            modifier,
-            slots: out,
-        })
+    }
+
+    fn free_ring(&mut self, ring: RingId) {
+        match ring {
+            RingId::Output => self.destroy_slots(),
+            RingId::Capture(id) => self.destroy_capture(id),
+        }
     }
 
     fn composite(
         &mut self,
+        ring: RingId,
         out_idx: usize,
         clip: &[IRect],
         layers: &[(&Tex, Layer)],
         acquire: Vec<OwnedFd>,
     ) -> Result<OwnedFd, BackendError> {
-        let Some(slot) = self.slots.get(out_idx) else {
+        let Some((slots, size)) = self.ring_slots(ring) else {
+            return Err(BackendError::with_code(ErrorCode::NoRing, "ring"));
+        };
+        let Some(slot) = slots.get(out_idx) else {
             return Err(BackendError::with_code(ErrorCode::NoRing, "slot"));
         };
         self.wait(slot.fence)?;
@@ -1204,7 +1293,7 @@ impl Backend for VkBackend {
                 }
             }
         }
-        let slot = &self.slots[out_idx];
+        let slot = &slots[out_idx];
         // SAFETY: the slot's fence is signalled: its command buffer and
         // last frame's wait semaphores are no longer in use.
         unsafe {
@@ -1220,8 +1309,7 @@ impl Backend for VkBackend {
             )
             .map_err(be("vkBeginCommandBuffer"))?;
         }
-        self.record(slot, (self.out_w, self.out_h), clip, layers);
-        let slot = &self.slots[out_idx];
+        self.record(slot, size, clip, layers);
         let stages = vec![vk::PipelineStageFlags::ALL_COMMANDS; waits.len()];
         let cmds = [slot.cmd];
         let sig = [slot.done];
@@ -1256,9 +1344,17 @@ impl Backend for VkBackend {
         if let Some(buf) = &slot.dmabuf {
             let _ = sys::import_sync_file(buf.as_fd(), &sync);
         }
-        let slot = &mut self.slots[out_idx];
-        slot.waits = waits;
-        slot.fresh = false;
+        let slot = match ring {
+            RingId::Output => self.slots.get_mut(out_idx),
+            RingId::Capture(id) => self
+                .captures
+                .get_mut(&id)
+                .and_then(|c| c.slots.get_mut(out_idx)),
+        };
+        if let Some(slot) = slot {
+            slot.waits = waits;
+            slot.fresh = false;
+        }
         Ok(sync)
     }
 
@@ -1424,6 +1520,16 @@ impl Backend for VkBackend {
     }
 }
 
+impl VkBackend {
+    /// A ring's slots and their size.
+    fn ring_slots(&self, ring: RingId) -> Option<(&[Slot], (u32, u32))> {
+        match ring {
+            RingId::Output => Some((&self.slots, (self.out_w, self.out_h))),
+            RingId::Capture(id) => self.captures.get(&id).map(|c| (&c.slots[..], (c.w, c.h))),
+        }
+    }
+}
+
 fn crate_px(v: u32) -> i32 {
     i32::try_from(v).unwrap_or(i32::MAX)
 }
@@ -1534,6 +1640,12 @@ impl VkBackend {
 impl Drop for VkBackend {
     fn drop(&mut self) {
         self.destroy_slots();
+        for c in std::mem::take(&mut self.captures).into_values() {
+            for s in c.slots {
+                // SAFETY: `destroy_slots` waited for the device to go idle.
+                unsafe { self.destroy_slot(s) };
+            }
+        }
         // SAFETY: the device is idle (`destroy_slots` waited) and every
         // texture was released by the event loop's teardown.
         unsafe { self.gpu.device.destroy_command_pool(self.pool, None) };

@@ -9,11 +9,17 @@
 //! drop — which is what lets a deferred `Release` finish. No timers, no
 //! busy waiting.
 //!
+//! Capture rings (protocol v3) sit beside the output ring, keyed by the
+//! server's id, each with its own buffer-age damage. `FreeCaptureRing`
+//! kills the id at once; the backend frees the slots once the last frame
+//! drawn into them has signalled (or at teardown, after the drain).
+//!
 //! Every refused request is answered with an `Error` and the loop carries
 //! on. The loop ends on EOF (the server went away), `Shutdown`, an
 //! unrecoverable socket error, or — with [`Config::idle_exit`] — after the
 //! helper has held nothing and heard nothing for that long.
 
+use std::collections::HashMap;
 use std::os::fd::OwnedFd;
 
 use std::time::{Duration, Instant};
@@ -22,9 +28,12 @@ use nitro_core::IRect;
 use nitro_wire::{DecodeError, Framer, Socket, Writer};
 use rustix::event::{PollFd, PollFlags, Timespec};
 
-use crate::backend::{Backend, BackendError, Readback};
+use crate::backend::{Backend, BackendError, Readback, RingId};
 use crate::lifetime::TexTable;
-use crate::proto::{Composite, ErrorCode, FromHelper, Layer, Message, PROTO_VERSION, ToHelper};
+use crate::proto::{
+    CaptureComposite, Composite, ErrorCode, FromHelper, Layer, MAX_CAPTURE_RINGS, Message,
+    PROTO_VERSION, ToHelper, XR24,
+};
 use crate::ring::DamageRing;
 use crate::stats::Counters;
 use crate::validate::{self, OutInfo};
@@ -78,7 +87,9 @@ impl From<nitro_wire::Error> for LoopError {
 /// A submitted frame whose fence has not signalled yet.
 #[derive(Debug)]
 struct InFlight {
-    slot: usize,
+    /// The ring slot it draws into, while that slot counts as busy.
+    /// `None` once the output ring it drew into was reallocated.
+    slot: Option<(RingId, usize)>,
     texs: Vec<u32>,
     fence: OwnedFd,
 }
@@ -93,6 +104,10 @@ pub struct Helper<B: Backend> {
     backend: B,
     texs: TexTable<B::Tex>,
     out: Option<Output>,
+    /// Capture rings by id (v3).
+    capture_rings: HashMap<u32, Output>,
+    /// Freed capture rings whose slots wait for in-flight frames.
+    dying: Vec<u32>,
     in_flight: Vec<InFlight>,
     counters: Counters,
     w: Writer,
@@ -106,6 +121,8 @@ impl<B: Backend> Helper<B> {
             backend,
             texs: TexTable::new(),
             out: None,
+            capture_rings: HashMap::new(),
+            dying: Vec::new(),
             in_flight: Vec::new(),
             counters: Counters::default(),
             w: Writer::new(),
@@ -132,7 +149,11 @@ impl<B: Backend> Helper<B> {
                 break Ok(e);
             }
             let idle_left = cfg.idle_exit.and_then(|d| {
-                if self.texs.is_empty() && self.in_flight.is_empty() {
+                if self.texs.is_empty()
+                    && self.in_flight.is_empty()
+                    && self.capture_rings.is_empty()
+                    && self.dying.is_empty()
+                {
                     Some(d.saturating_sub(last_activity.elapsed()))
                 } else {
                     None
@@ -241,6 +262,22 @@ impl<B: Backend> Helper<B> {
             let freed = self.texs.finish(&f.texs);
             self.free(freed);
         }
+        self.free_dead_rings();
+    }
+
+    /// Free every dying capture ring no in-flight frame draws into.
+    fn free_dead_rings(&mut self) {
+        let in_flight = &self.in_flight;
+        let (dead, alive): (Vec<u32>, Vec<u32>) =
+            std::mem::take(&mut self.dying).into_iter().partition(|id| {
+                !in_flight
+                    .iter()
+                    .any(|f| matches!(f.slot, Some((RingId::Capture(r), _)) if r == *id))
+            });
+        self.dying = alive;
+        for id in dead {
+            self.backend.free_ring(RingId::Capture(id));
+        }
     }
 
     #[allow(clippy::too_many_lines)] // one arm per message; splitting hides the dispatch
@@ -314,8 +351,35 @@ impl<B: Backend> Helper<B> {
             } => self.alloc_ring(op, n, w, h, fourcc, &modifiers),
             ToHelper::Composite(c) => {
                 let serial = c.serial;
-                if let Err(e) = self.composite(&c, fds) {
+                if let Err(e) = self.composite(RingId::Output, &c, fds) {
                     self.refuse(op, serial, &e);
+                }
+            }
+            ToHelper::AllocCaptureRing {
+                ring_id,
+                n,
+                w,
+                h,
+                fourcc,
+                modifiers,
+            } => self.alloc_capture_ring(op, ring_id, (n, w, h), fourcc, &modifiers),
+            ToHelper::CaptureComposite(CaptureComposite { ring_id, frame }) => {
+                let serial = frame.serial;
+                if let Err(e) = self.composite(RingId::Capture(ring_id), &frame, fds) {
+                    self.refuse(op, serial, &e);
+                }
+            }
+            ToHelper::FreeCaptureRing { ring_id } => {
+                if self.capture_rings.remove(&ring_id).is_some() {
+                    self.dying.push(ring_id);
+                    self.reap();
+                    self.free_dead_rings();
+                } else {
+                    self.refuse(
+                        op,
+                        u64::from(ring_id),
+                        &BackendError::with_code(ErrorCode::BadRing, format!("ring {ring_id}")),
+                    );
                 }
             }
             ToHelper::Release { id } => match self.texs.release(id) {
@@ -420,13 +484,15 @@ impl<B: Backend> Helper<B> {
     #[allow(clippy::many_single_char_names)] // n, w, h: the protocol's names
     fn alloc_ring(&mut self, op: u16, n: u32, w: u32, h: u32, fourcc: u32, mods: &[u64]) {
         let r = validate::ring(n, w, h, fourcc, mods, &self.backend.info())
-            .and_then(|req| Ok((self.backend.alloc_output_ring(&req)?, req)));
+            .and_then(|req| Ok((self.backend.alloc_ring(RingId::Output, &req)?, req)));
         match r {
             Ok((ring, req)) => {
                 // The old slots are gone: their frames' fences still
                 // retire texture references, but no slot is busy.
                 for f in &mut self.in_flight {
-                    f.slot = usize::MAX;
+                    if matches!(f.slot, Some((RingId::Output, _))) {
+                        f.slot = None;
+                    }
                 }
                 self.out = Some(Output {
                     ring: DamageRing::new(req.n, w, h),
@@ -448,26 +514,102 @@ impl<B: Backend> Helper<B> {
         }
     }
 
-    fn composite(&mut self, c: &Composite, fds: Vec<OwnedFd>) -> Result<(), BackendError> {
+    /// A v3 capture ring: a new id, validated, allocated; answered with
+    /// `CaptureRing` + one dma-buf per slot.
+    #[allow(clippy::many_single_char_names)] // n, w, h: the protocol's names
+    fn alloc_capture_ring(
+        &mut self,
+        op: u16,
+        ring_id: u32,
+        (n, w, h): (u32, u32, u32),
+        fourcc: u32,
+        mods: &[u64],
+    ) {
+        let r = if self.capture_rings.contains_key(&ring_id) || self.dying.contains(&ring_id) {
+            Err(BackendError::with_code(
+                ErrorCode::DuplicateId,
+                format!("ring {ring_id} exists"),
+            ))
+        } else if self.capture_rings.len() >= MAX_CAPTURE_RINGS {
+            Err(BackendError::with_code(
+                ErrorCode::TooMany,
+                format!("{MAX_CAPTURE_RINGS} capture rings"),
+            ))
+        } else {
+            validate::capture_ring(n, w, h, fourcc, mods, &self.backend.info()).and_then(|req| {
+                Ok((
+                    self.backend.alloc_ring(RingId::Capture(ring_id), &req)?,
+                    req,
+                ))
+            })
+        };
+        match r {
+            Ok((ring, req)) => {
+                self.capture_rings.insert(
+                    ring_id,
+                    Output {
+                        ring: DamageRing::new(req.n, w, h),
+                        info: OutInfo { n: req.n, w, h },
+                    },
+                );
+                let (slots, fds): (Vec<_>, Vec<_>) = ring.slots.into_iter().unzip();
+                self.send(
+                    &FromHelper::CaptureRing {
+                        ring_id,
+                        w,
+                        h,
+                        fourcc: XR24,
+                        modifier: ring.modifier,
+                        slots,
+                    },
+                    fds,
+                );
+            }
+            Err(e) => self.refuse(op, u64::from(ring_id), &e),
+        }
+    }
+
+    fn ring_state(&self, ring: RingId) -> Option<&Output> {
+        match ring {
+            RingId::Output => self.out.as_ref(),
+            RingId::Capture(id) => self.capture_rings.get(&id),
+        }
+    }
+
+    fn composite(
+        &mut self,
+        ring: RingId,
+        c: &Composite,
+        fds: Vec<OwnedFd>,
+    ) -> Result<(), BackendError> {
+        if let RingId::Capture(id) = ring
+            && !self.capture_rings.contains_key(&id)
+        {
+            return Err(BackendError::with_code(
+                ErrorCode::BadRing,
+                format!("capture ring {id}"),
+            ));
+        }
         validate::composite(
             c,
             |id| self.texs.info(id),
-            self.out.as_ref().map(|o| o.info),
+            self.ring_state(ring).map(|o| o.info),
         )?;
         if fds.len() != c.fence_count() {
             return Err(BackendError::with_code(ErrorCode::Fences, "fence count"));
         }
         let slot = c.out_idx as usize;
-        if self.in_flight.iter().any(|f| f.slot == slot) {
+        let target = Some((ring, slot));
+        if self.in_flight.iter().any(|f| f.slot == target) {
             self.reap();
-            if self.in_flight.iter().any(|f| f.slot == slot) {
+            if self.in_flight.iter().any(|f| f.slot == target) {
                 return Err(BackendError::with_code(
                     ErrorCode::Busy,
                     format!("slot {slot} still in flight"),
                 ));
             }
         }
-        let Some(out) = self.out.as_ref() else {
+        let Some(out) = self.ring_state(ring) else {
             return Err(BackendError::with_code(ErrorCode::NoRing, "no ring"));
         };
         let damage: Vec<IRect> = c.damage.clone();
@@ -484,16 +626,20 @@ impl<B: Backend> Helper<B> {
             layers.push((t, *l));
         }
         let t0 = Instant::now();
-        let fence = self.backend.composite(slot, &clip, &layers, fds)?;
+        let fence = self.backend.composite(ring, slot, &clip, &layers, fds)?;
         self.counters.submit(t0.elapsed());
         let ids: Vec<u32> = c.layers.iter().map(|l| l.tex).collect();
-        if let Some(out) = self.out.as_mut() {
+        let state = match ring {
+            RingId::Output => self.out.as_mut(),
+            RingId::Capture(id) => self.capture_rings.get_mut(&id),
+        };
+        if let Some(out) = state {
             out.ring.commit(slot, &damage);
         }
         self.texs.acquire(&ids);
         if let Ok(mine) = rustix::io::fcntl_dupfd_cloexec(&fence, 0) {
             self.in_flight.push(InFlight {
-                slot,
+                slot: target,
                 texs: ids,
                 fence: mine,
             });
@@ -570,6 +716,15 @@ impl<B: Backend> Helper<B> {
                 }),
             );
             let _ = self.texs.finish(&f.texs);
+        }
+        let rings: Vec<u32> = self
+            .capture_rings
+            .drain()
+            .map(|(id, _)| id)
+            .chain(std::mem::take(&mut self.dying))
+            .collect();
+        for id in rings {
+            self.backend.free_ring(RingId::Capture(id));
         }
         let texs: Vec<B::Tex> = self.texs.drain().collect();
         for t in texs {

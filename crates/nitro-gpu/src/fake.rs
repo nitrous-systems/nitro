@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use nitro_core::IRect;
 
-use crate::backend::{Backend, BackendError, Readback, Ring, RingRequest};
+use crate::backend::{Backend, BackendError, Readback, Ring, RingId, RingRequest};
 use crate::proto::{
     AR24, DeviceInfo, DmabufDesc, FormatMod, Layer, MOD_I915_X_TILED, MOD_I915_Y_TILED, MOD_LINEAR,
     NV12, ShadowDesc, ShadowPath, SlotLayout, XR24,
@@ -26,10 +26,17 @@ pub enum Call {
     ImportShadow(u32),
     /// `upload_damage(id, rects)`.
     Upload(u32, Vec<IRect>),
-    /// `alloc_output_ring(n, modifier chosen)`.
+    /// `alloc_ring(Output, n, modifier chosen)`.
     Ring(usize, u64),
-    /// `composite(slot, clip, layers' texture ids, acquire fence count)`.
+    /// `composite(Output, slot, clip, layers' texture ids, acquire fence count)`.
     Composite(usize, Vec<IRect>, Vec<u32>, usize),
+    /// `alloc_ring(Capture(id), n, modifier chosen)` (v3).
+    CaptureRing(u32, usize, u64),
+    /// `composite(Capture(id), slot, clip, layers' texture ids, acquire
+    /// fence count)` (v3).
+    CaptureComposite(u32, usize, Vec<IRect>, Vec<u32>, usize),
+    /// `free_ring(ring)`.
+    FreeRing(RingId),
     /// `release(id)`.
     Release(u32),
     /// `readback(slot)`.
@@ -65,6 +72,8 @@ pub struct FakeState {
     pub last_layers: Vec<Layer>,
     /// A tiled AR24 pair among the sampleable ones (#3952).
     pub sample_tiled_ar24: bool,
+    /// Make the next ring allocation fail with a backend error.
+    pub fail_next_ring: bool,
 }
 
 /// The fake's capture colour unless [`FakeState::capture_color`] is set.
@@ -195,10 +204,18 @@ impl Backend for FakeBackend {
         Ok(())
     }
 
-    fn alloc_output_ring(&mut self, req: &RingRequest) -> Result<Ring, BackendError> {
+    fn alloc_ring(&mut self, ring: RingId, req: &RingRequest) -> Result<Ring, BackendError> {
         let modifier = req.modifiers[0];
-        self.record(Call::Ring(req.n, modifier));
-        self.ring = Some((req.w, req.h));
+        self.record(match ring {
+            RingId::Output => Call::Ring(req.n, modifier),
+            RingId::Capture(id) => Call::CaptureRing(id, req.n, modifier),
+        });
+        if std::mem::take(&mut self.state().fail_next_ring) {
+            return Err(err("fake ring failure"));
+        }
+        if ring == RingId::Output {
+            self.ring = Some((req.w, req.h));
+        }
         let pitch = req.w * 4;
         let size = u64::from(pitch) * u64::from(req.h);
         let mut slots = Vec::with_capacity(req.n);
@@ -219,18 +236,20 @@ impl Backend for FakeBackend {
 
     fn composite(
         &mut self,
-        out_idx: usize,
+        ring: RingId,
+        slot: usize,
         clip: &[IRect],
         layers: &[(&u32, Layer)],
         acquire: Vec<OwnedFd>,
     ) -> Result<OwnedFd, BackendError> {
         self.state().last_layers = layers.iter().map(|(_, l)| *l).collect();
-        self.record(Call::Composite(
-            out_idx,
-            clip.to_vec(),
-            layers.iter().map(|(t, _)| **t).collect(),
-            acquire.len(),
-        ));
+        let texs = layers.iter().map(|(t, _)| **t).collect();
+        self.record(match ring {
+            RingId::Output => Call::Composite(slot, clip.to_vec(), texs, acquire.len()),
+            RingId::Capture(id) => {
+                Call::CaptureComposite(id, slot, clip.to_vec(), texs, acquire.len())
+            }
+        });
         if std::mem::take(&mut self.state().fail_next_composite) {
             return Err(err("fake composite failure"));
         }
@@ -244,6 +263,13 @@ impl Backend for FakeBackend {
             s.pending.push(w);
         }
         Ok(r)
+    }
+
+    fn free_ring(&mut self, ring: RingId) {
+        self.record(Call::FreeRing(ring));
+        if ring == RingId::Output {
+            self.ring = None;
+        }
     }
 
     fn release(&mut self, t: u32) {

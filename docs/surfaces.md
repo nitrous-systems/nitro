@@ -501,7 +501,8 @@ remainder.
   helper; the resume restarts it. `gpu.helper = on-demand` spawns on the
   first mode-2 decision and releases everything when leaving mode 2, so
   the helper can idle-exit.
-- **Limits.** The protocol has one output ring, so only one output is in
+- **Limits.** The protocol has one output ring (capture rings, v3, are
+  separate and not scanned out), so only one output is in
   mode 2 at a time (the others use planes/CPU). The ring lives as long as
   the helper. Entering mode 2 moves that output's shadow into a sealed
   memfd: the same 8 MB, counted as RssShmem instead of RssAnon.
@@ -581,6 +582,46 @@ order):
 
 Known residuals: a translucent tiled Surface is captured opaque (as mode
 2 draws it); a rotated one is the placeholder (`unsupported`).
+
+### As built: helper protocol v3 capture rings (#676 A)
+
+The helper side of recording. Protocol v3 (`crates/nitro-gpu/src/proto.rs`)
+adds capture rings **beside** the output ring. The server does not use them yet (#676 B).
+
+- `AllocCaptureRing{ring_id, n, w, h, fourcc, modifiers[]}` →
+  `CaptureRing{ring_id, w, h, fourcc, modifier, slots[{offset, pitch,
+  size}]}` + one exported dma-buf fd per slot. `n` is 3..=4 (one slot
+  with the consumer, one being drawn, one spare). Only XR24 is allowed. The
+  modifier is chosen **LINEAR first**, because consumers mmap the slots or
+  import them into Chromium/VA-API. After that the request's order is used;
+  an empty list means every XR24 modifier the helper renders. The Vulkan
+  backend offers the modifiers one at a time, because a driver handed a
+  list picks its own favourite (hasvk/anv take X_TILED over LINEAR). At
+  most 4 capture rings are alive at once. A live id is refused as
+  `DuplicateId`.
+- `CaptureComposite{serial, ring_id, slot, fence_mask, damage[],
+  layers[]}` is a `Composite` into a capture slot. It has the same
+  validation (layer limits, rects inside the ring's size, fence count)
+  and the same answer, `Composited{serial}` + a `sync_file`. Buffer-age
+  damage is kept per ring, so a capture ring's clip covers its own frames
+  only. A slot whose previous frame has not signalled is `Busy`. An
+  unknown ring is the new code `BadRing` (13).
+- `FreeCaptureRing{ring_id}` has no reply unless the id is unknown
+  (`BadRing`). The id is dead at once, so later frames for it are refused.
+  The slots are freed once every frame drawn into them has signalled, and
+  at helper exit after the drain. A consumer's imports of the dma-bufs
+  keep that memory alive until it closes them.
+- In-flight frames are tracked as `(ring, slot)`, so completions free the
+  right slot. Reallocating the output ring does not touch capture rings,
+  and freeing a capture ring does not touch the output ring. An
+  on-demand helper does not idle-exit while a capture ring is allocated.
+- **Footprint.** There is no cost while no capture ring exists. A ring
+  costs `n × pitch × h` only while it is allocated. `pixels.rs` case10
+  checks on hasvk and anv that the pixels of a LINEAR slot, read by mmap,
+  match, and that `drm_total` falls back after the free. About 32 KiB of
+  driver bookkeeping stays, whatever the ring size.
+- **Follow-up.** An NV12 capture target (a colour-conversion pass for
+  encoders that want YUV) is not built.
 
 ### Recording design (not built)
 

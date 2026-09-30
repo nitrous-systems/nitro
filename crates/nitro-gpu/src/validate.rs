@@ -10,7 +10,7 @@ use nitro_core::IRect;
 use crate::backend::{BackendError, RingRequest};
 use crate::proto::{
     AR24, Composite, DeviceInfo, DmabufDesc, ErrorCode, Layer, MAX_EDGE, MAX_LAYERS, MAX_RING,
-    MOD_INVALID, ShadowDesc, XR24, plane_count,
+    MIN_CAPTURE_RING, MOD_INVALID, MOD_LINEAR, ShadowDesc, XR24, plane_count,
 };
 
 /// What kind of buffer a texture came from.
@@ -192,6 +192,48 @@ pub fn ring(
         fourcc,
         modifiers: usable,
     })
+}
+
+/// A capture-ring allocation (v3): 3..=4 slots, XR24 only. The modifiers
+/// the device renders are kept **LINEAR first** (consumers mmap the slots
+/// or import them into anything), then in the request's order; an empty
+/// request list stands for every XR24 modifier the device renders.
+///
+/// # Errors
+/// Bad slot count, size or format, or no usable modifier.
+pub fn capture_ring(
+    n: u32,
+    w: u32,
+    h: u32,
+    fourcc: u32,
+    modifiers: &[u64],
+    info: &DeviceInfo,
+) -> Result<RingRequest, BackendError> {
+    if (n as usize) < MIN_CAPTURE_RING || n as usize > MAX_RING {
+        return Err(err(ErrorCode::TooMany, format!("{n} capture slots")));
+    }
+    if fourcc != XR24 {
+        return Err(err(
+            ErrorCode::BadFormat,
+            format!("capture fourcc {fourcc:#010x}"),
+        ));
+    }
+    let all: Vec<u64>;
+    let wanted = if modifiers.is_empty() {
+        all = info
+            .render
+            .iter()
+            .filter(|f| f.fourcc == XR24)
+            .map(|f| f.modifier)
+            .collect();
+        &all[..]
+    } else {
+        modifiers
+    };
+    let mut req = ring(n, w, h, fourcc, wanted, info)?;
+    req.modifiers.sort_by_key(|m| *m != MOD_LINEAR);
+    req.modifiers.dedup();
+    Ok(req)
 }
 
 /// A frame. `tex` looks up a live texture id.
@@ -384,6 +426,31 @@ mod tests {
             ring(5, 100, 100, XR24, &[0], &info()).unwrap_err().code,
             ErrorCode::TooMany
         );
+    }
+
+    #[test]
+    fn capture_ring_prefers_linear() {
+        let mut i = info();
+        i.render.insert(
+            0,
+            FormatMod {
+                fourcc: XR24,
+                modifier: 5,
+            },
+        );
+        let r = capture_ring(3, 64, 64, XR24, &[5, 0], &i).unwrap();
+        assert_eq!(r.modifiers, vec![0, 5]);
+        let r = capture_ring(4, 64, 64, XR24, &[], &i).unwrap();
+        assert_eq!(r.modifiers, vec![0, 5]);
+        assert_eq!(r.n, 4);
+        let e = |n, w, f, m: &[u64]| capture_ring(n, w, 64, f, m, &i).unwrap_err().code;
+        assert_eq!(e(2, 64, XR24, &[0]), ErrorCode::TooMany);
+        assert_eq!(e(5, 64, XR24, &[0]), ErrorCode::TooMany);
+        assert_eq!(e(3, 0, XR24, &[0]), ErrorCode::BadRect);
+        assert_eq!(e(3, MAX_EDGE + 1, XR24, &[0]), ErrorCode::BadRect);
+        assert_eq!(e(3, 64, AR24, &[0]), ErrorCode::BadFormat);
+        assert_eq!(e(3, 64, NV12, &[0]), ErrorCode::BadFormat);
+        assert_eq!(e(3, 64, XR24, &[7]), ErrorCode::BadFormat);
     }
 
     #[test]

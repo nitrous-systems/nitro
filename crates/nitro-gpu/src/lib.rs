@@ -52,7 +52,7 @@ pub(crate) fn px(v: u32) -> i32 {
     i32::try_from(v).unwrap_or(i32::MAX)
 }
 
-pub use backend::{Backend, BackendError, Readback, Ring, RingRequest};
+pub use backend::{Backend, BackendError, Readback, Ring, RingId, RingRequest};
 pub use client::Conn;
 pub use event_loop::{Config, Exit, run};
 pub use proto::{FromHelper, Message, ToHelper};

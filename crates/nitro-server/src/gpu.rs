@@ -812,7 +812,10 @@ impl Helper {
                     memfd,
                 })
             }
-            FromHelper::Imported { .. } | FromHelper::ReadBackReply { .. } => None,
+            // Capture rings (v3) are not requested yet (#676 B).
+            FromHelper::Imported { .. }
+            | FromHelper::ReadBackReply { .. }
+            | FromHelper::CaptureRing { .. } => None,
         }
     }
 

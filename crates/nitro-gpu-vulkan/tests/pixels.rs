@@ -657,6 +657,132 @@ fn case7_errors_do_not_kill_the_helper() {
     h.readback(0).assert_near(3, 3, [9, 9, 9], 0);
 }
 
+#[test]
+fn case10_capture_ring_slots_are_linear_and_mmappable() {
+    // #676 (v3): a capture ring beside the output ring. A frame drawn into
+    // a LINEAR capture slot is read by mmapping the exported dma-buf, the
+    // way a recording consumer does; freeing the ring gives its memory
+    // back.
+    let Some(mut h) = helper(&[]) else { return };
+    let linear = h
+        .info
+        .render
+        .iter()
+        .any(|f| f.fourcc == XR24 && f.modifier == MOD_LINEAR);
+    if !linear {
+        eprintln!(
+            "NOTE: LINEAR XR24 not renderable on {}; capture-ring readback skipped",
+            h.info.driver
+        );
+        return;
+    }
+    // Big enough that one slot (192 KiB) dwarfs the driver's constant
+    // per-ring bookkeeping (~32 KiB on hasvk that stays after the free).
+    let (w, ht) = (256, 192);
+    let px = fill(w, ht, |x, _| {
+        if x < 128 {
+            bgra(200, 30, 10, 255)
+        } else {
+            bgra(10, 60, 220, 255)
+        }
+    });
+    h.shadow(1, w, ht, XR24, &px);
+    h.ring(2, w, ht, vec![MOD_LINEAR]);
+    let stats = |h: &mut Helper| match h.call(&ToHelper::GetStats, vec![]).0 {
+        FromHelper::Stats(s) => s.drm_total,
+        other => panic!("{other:?}"),
+    };
+    let before = stats(&mut h);
+    let (modifier, slots, mut fds) = match h.call(
+        &ToHelper::AllocCaptureRing {
+            ring_id: 5,
+            n: 3,
+            w,
+            h: ht,
+            fourcc: XR24,
+            // Tiled first on purpose: the helper still picks LINEAR.
+            modifiers: vec![MOD_I915_X_TILED, MOD_LINEAR],
+        },
+        vec![],
+    ) {
+        (
+            FromHelper::CaptureRing {
+                ring_id: 5,
+                modifier,
+                slots,
+                ..
+            },
+            fds,
+        ) => (modifier, slots, fds),
+        other => panic!("capture ring: {other:?}"),
+    };
+    assert_eq!(modifier, MOD_LINEAR);
+    assert_eq!((slots.len(), fds.len()), (3, 3));
+    let allocated = stats(&mut h);
+    eprintln!("capture ring: drm_total {before} -> {allocated}");
+
+    // Output frame and capture frame from the same layers.
+    let layers = vec![layer(1, w, ht, full(w, ht), Blend::Opaque)];
+    let of = h.frame(1, 0, vec![full(w, ht)], layers.clone());
+    let cf = match h.call(
+        &ToHelper::CaptureComposite(nitro_gpu::proto::CaptureComposite {
+            ring_id: 5,
+            frame: Composite {
+                serial: 2,
+                out_idx: 1,
+                damage: vec![full(w, ht)],
+                layers,
+                fence_mask: 0,
+            },
+        }),
+        vec![],
+    ) {
+        (FromHelper::Composited { serial: 2 }, mut fds) => fds.pop().unwrap(),
+        other => panic!("capture frame: {other:?}"),
+    };
+    assert!(fence_signalled(&of, T) && fence_signalled(&cf, T));
+
+    let slot = slots[1];
+    let fd = fds.swap_remove(1);
+    let len = (slot.offset + slot.pitch * ht) as usize;
+    let _ = nitro_shm::sync_start(&fd, nitro_shm::SyncAccess::Read);
+    let map = nitro_shm::DmaBufMapping::map(std::os::fd::AsFd::as_fd(&fd), len).unwrap();
+    let img = Image {
+        px: map.as_bytes()[slot.offset as usize..].to_vec(),
+        w,
+        stride: slot.pitch,
+    };
+    let _ = nitro_shm::sync_end(&fd, nitro_shm::SyncAccess::Read);
+    drop(map);
+    for (x, y) in [(0, 0), (127, 191), (10, 20)] {
+        img.assert_near(x, y, [200, 30, 10], 0);
+    }
+    for (x, y) in [(128, 0), (255, 191), (200, 10)] {
+        img.assert_near(x, y, [10, 60, 220], 0);
+    }
+    // The output ring drew the same thing and is untouched by the capture.
+    h.readback(0).assert_near(200, 40, [10, 60, 220], 0);
+
+    // Free: our fds are the only other references; drop them too.
+    drop(fds);
+    drop(fd);
+    // No reply unless refused; the stats call behind it orders the two.
+    h.conn
+        .send(&ToHelper::FreeCaptureRing { ring_id: 5 }, vec![])
+        .unwrap();
+    let after = stats(&mut h);
+    eprintln!("capture ring freed: drm_total {allocated} -> {after}");
+    // The ring's slots come back. Small driver-side growth (command
+    // pool pages: +32 KiB on hasvk whatever the ring size) is not the
+    // ring: allow less than one slot's worth.
+    let slot_bytes = u64::from(slots[0].pitch) * u64::from(ht);
+    assert!(allocated >= before + 3 * slot_bytes, "3 slots allocated");
+    assert!(
+        after < before + slot_bytes,
+        "the capture ring was freed: {before} -> {after}"
+    );
+}
+
 /// `cargo test -p nitro-gpu-vulkan -- --ignored --nocapture footprint`
 #[test]
 fn case9_capture_draws_layers_into_a_temporary_target_and_frees_it() {
