@@ -212,6 +212,34 @@ pub trait Widget<S: 'static>: 'static {
         Handled::No
     }
 
+    /// A drag is over this widget at `pos` (its own space): answer what
+    /// it would do with `offer`, or `None` to let an ancestor answer.
+    /// Asked on `DragEnter` and every `DragMotion`, deepest widget first;
+    /// see [`crate::dnd`]. A widget may paint a drop highlight here and
+    /// clear it in [`Widget::drag_leave`].
+    fn drag_over(
+        &mut self,
+        cx: &mut EventCx<'_, S>,
+        pos: Point,
+        offer: &crate::dnd::DragOffer,
+    ) -> Option<crate::dnd::Accept> {
+        let _ = (cx, pos, offer);
+        None
+    }
+
+    /// This widget accepted a drag in [`Widget::drag_over`] and is no
+    /// longer the target: the pointer moved on or left, the drag was
+    /// cancelled, or the drop was delivered.
+    fn drag_leave(&mut self, cx: &mut EventCx<'_, S>) {
+        let _ = cx;
+    }
+
+    /// A drop on this widget: `mime` is the type it accepted, `data` the
+    /// bytes, or `None` when the transfer failed, was empty or timed out.
+    fn dropped(&mut self, cx: &mut EventCx<'_, S>, mime: &str, data: Option<&[u8]>) {
+        let _ = (cx, mime, data);
+    }
+
     /// The accessibility record. The default derives it from the role.
     fn accessible(&self) -> Access {
         Access {

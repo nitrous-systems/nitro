@@ -240,6 +240,103 @@ pub fn paste(text: &str, bracketed: bool) -> Vec<u8> {
     out
 }
 
+/// The types a drop on the terminal accepts, most preferred first: a
+/// `text/uri-list` becomes shell-quoted paths, text is pasted as is.
+pub const DROP_MIMES: [&str; 3] = [
+    nitro_ui::clipboard::URI_LIST_MIME,
+    nitro_ui::clipboard::TEXT_MIME,
+    nitro_ui::clipboard::PLAIN_MIME,
+];
+
+/// What a drop of `bytes` in `mime` pastes: a `text/uri-list` goes
+/// through [`uri_list_text`], anything else is the text itself (invalid
+/// UTF-8 replaced).
+#[must_use]
+pub fn drop_text(mime: &str, bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    if mime == nitro_ui::clipboard::URI_LIST_MIME {
+        uri_list_text(&text)
+    } else {
+        text.into_owned()
+    }
+}
+
+/// A `text/uri-list` (RFC 2483) as a command-line fragment, the way
+/// gnome-terminal and xterm paste a dropped file.
+///
+/// Blank lines and `#` comments are skipped. A local `file:///p` or
+/// `file://localhost/p` becomes its percent-decoded path,
+/// [shell-quoted](shell_quote); any other URI is kept verbatim. The
+/// items are joined by spaces, with a trailing space when there was a
+/// file, so the next word typed or dropped does not glue onto the path.
+/// A path that is not UTF-8 is decoded lossily.
+#[must_use]
+pub fn uri_list_text(list: &str) -> String {
+    let mut items = Vec::new();
+    let mut any_file = false;
+    for line in list.lines() {
+        let line = line.trim_end_matches('\r').trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let path = line.strip_prefix("file://").and_then(|rest| {
+            if rest.starts_with('/') {
+                Some(rest)
+            } else {
+                rest.strip_prefix("localhost")
+                    .filter(|p| p.starts_with('/'))
+            }
+        });
+        if let Some(path) = path {
+            let decoded = percent_decode(path.as_bytes());
+            items.push(shell_quote(&String::from_utf8_lossy(&decoded)));
+            any_file = true;
+        } else {
+            items.push(line.to_owned());
+        }
+    }
+    let mut out = items.join(" ");
+    if any_file {
+        out.push(' ');
+    }
+    out
+}
+
+/// `s` as one shell word: bare when every character is harmless, else in
+/// single quotes with each `'` written `'\''`.
+#[must_use]
+pub fn shell_quote(s: &str) -> String {
+    let safe = |c: char| c.is_ascii_alphanumeric() || "_./-+,:@%=".contains(c);
+    if !s.is_empty() && s.chars().all(safe) {
+        return s.to_owned();
+    }
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Bytewise `%XX` decoding; a malformed escape is kept literally.
+fn percent_decode(s: &[u8]) -> Vec<u8> {
+    let hex = |b: u8| {
+        char::from(b)
+            .to_digit(16)
+            .and_then(|d| u8::try_from(d).ok())
+    };
+    let mut out = Vec::with_capacity(s.len());
+    let mut i = 0;
+    while i < s.len() {
+        if s[i] == b'%'
+            && i + 2 < s.len()
+            && let (Some(h), Some(l)) = (hex(s[i + 1]), hex(s[i + 2]))
+        {
+            out.push(h << 4 | l);
+            i += 3;
+            continue;
+        }
+        out.push(s[i]);
+        i += 1;
+    }
+    out
+}
+
 /// Whether this keycode is a modifier, which encodes to nothing on its
 /// own. Includes the locks, which are modifiers the keymap applies and
 /// the terminal never sees.
@@ -407,6 +504,51 @@ impl IntoBytesWith for String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_uri_list_becomes_shell_quoted_paths() {
+        use super::uri_list_text as u;
+        assert_eq!(u("file:///tmp/a\r\n"), "/tmp/a ");
+        assert_eq!(u("file:///tmp/a%20b\r\n"), "'/tmp/a b' ");
+        assert_eq!(u("file://localhost/etc/x"), "/etc/x ");
+        assert_eq!(u("file:///it%27s"), "'/it'\\''s' ");
+        assert_eq!(
+            u("# comment\r\n\r\nfile:///a\r\nfile:///b%20c\r\n"),
+            "/a '/b c' "
+        );
+        assert_eq!(
+            u("https://example.com/x?a=1&b=2\r\n"),
+            "https://example.com/x?a=1&b=2",
+            "a link is kept verbatim, with no trailing space"
+        );
+        assert_eq!(
+            u("file:///bad%zz%4"),
+            "/bad%zz%4 ",
+            "a malformed escape is kept"
+        );
+        assert_eq!(u("file://otherhost/x"), "file://otherhost/x");
+        assert_eq!(u("file:///%E2%9C%93"), "'/\u{2713}' ");
+        assert_eq!(u(""), "");
+    }
+
+    #[test]
+    fn shell_quote_leaves_plain_words_bare() {
+        use super::shell_quote as q;
+        assert_eq!(
+            q("/usr/lib/x-1.2_a+b,c:d@e%f=g"),
+            "/usr/lib/x-1.2_a+b,c:d@e%f=g"
+        );
+        assert_eq!(q("a b"), "'a b'");
+        assert_eq!(q("$HOME"), "'$HOME'");
+        assert_eq!(q(""), "''");
+    }
+
+    #[test]
+    fn drop_text_pastes_text_as_is() {
+        use super::drop_text;
+        assert_eq!(drop_text("text/plain", b"echo hi\n"), "echo hi\n");
+        assert_eq!(drop_text("text/uri-list", b"file:///a%20b\r\n"), "'/a b' ");
+    }
+
     #[test]
     fn an_escape_becomes_the_control_character_it_names() {
         use super::unescape;

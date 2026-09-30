@@ -264,6 +264,19 @@ impl<S: 'static> Ui<S> {
             self.defer(move |s, ui| cb(s, ui, got));
             return;
         }
+        self.read_selection(DataSource::Clipboard, mime, cb);
+    }
+
+    /// Send a `RequestSelection` for `source` in `mime` and track the
+    /// read: the same id allocation, cap, timeout and non-blocking
+    /// descriptor handling for the clipboard and a drop (`crate::dnd`).
+    /// `cb` is always called exactly once, never from inside this call.
+    pub(crate) fn read_selection(
+        &mut self,
+        source: DataSource,
+        mime: String,
+        cb: impl FnOnce(&mut S, &mut Ui<S>, Contents) + 'static,
+    ) {
         let waiting = self
             .clipboard
             .requests
@@ -288,11 +301,11 @@ impl<S: 'static> Ui<S> {
             .wire_mut()
             .send_now(&ClientMsg::RequestSelection(RequestSelection {
                 request: id,
-                source: DataSource::Clipboard,
+                source,
                 mime: mime.clone(),
             }))
         {
-            eprintln!("nitro-ui: clipboard request: {e}");
+            eprintln!("nitro-ui: selection request: {e}");
             self.defer(move |s, ui| cb(s, ui, None));
             return;
         }

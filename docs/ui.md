@@ -1271,6 +1271,50 @@ never touches a descriptor.
   `read_clipboard` reads them back, still asynchronously, so copy and
   paste within the app work unchanged.
 
+### Drag and drop (drop targets)
+
+`nitro_ui::dnd` handles the target side of the server's drag-and-drop
+(`caps::DATA`, `docs/wire.md` § The drag-and-drop sequence). The `Ui`
+routes `DragEnter`, `DragMotion`, `DragLeave` and `DragDrop` to three
+`Widget` hooks. All three have defaults, so a widget that is not a drop
+target changes nothing:
+
+| hook | when |
+|---|---|
+| `drag_over(cx, pos, &DragOffer) -> Option<Accept>` | on `DragEnter` and every `DragMotion`; `pos` is widget-local |
+| `drag_leave(cx)` | the accepting widget stops being the target: the pointer moved to another widget or left, the drag was cancelled, or the drop was delivered |
+| `dropped(cx, mime, Option<&[u8]>)` | after the drop, with the bytes of the accepted type (`None`: failed, empty or timed out) |
+
+* **Bubbling.** `drag_over` is asked of the deepest widget under the
+  pointer first, then of each ancestor, until one answers `Some`. That
+  widget is the target (`ui.drop_target()`).
+* **Validation.** An `Accept` whose action the source did not offer
+  (`DragOffer::allows`), or whose type is not in `DragOffer::mimes`,
+  counts as `None`. `DragOffer::first_of(&[…])` picks a type in the
+  widget's own order of preference.
+* **`AcceptDrop` is sent only when the answer changes**, and at once
+  (not held for the next commit). "Changes" includes the target changing
+  or the pointer moving off every target, which sends a reject
+  (`None`, empty type).
+* **The read** is a `RequestSelection { source: Drag }` for the accepted
+  type. It goes through the clipboard's machinery, so the same rules
+  apply: non-blocking, `MAX_CLIPBOARD_BYTES`, `READ_TIMEOUT_MS`, and at
+  most 16 outstanding.
+* **`FinishDrag` is always sent, exactly once per drop.** That holds when
+  the data arrived, when it was `None`, when the read timed out, when the
+  target widget was destroyed during the read (its `dropped` is skipped),
+  and when the drop raced a reject we had already sent (finished at
+  once). The source is waiting on it. A `DragEnter` that arrives while a
+  drop is still being read finishes the old drop first. The old read's
+  callback checks a drag generation, so it cannot clear the new drag.
+* **`DragLeave` resets everything**: the target gets `drag_leave`, and
+  the state is forgotten. After `DragDrop` the server sends no
+  `DragLeave`, so the end of the drop does the reset itself.
+
+There is no drag-source API yet: a widget cannot start a drag (#3967).
+`nitro-term` is the first target (`docs/term.md` § Limitations).
+
+
 ### Resizes, for an app whose content has its own units
 
 `ui.on_resize(|s, ui, size| ..)` is offered every `Configure` that

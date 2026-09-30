@@ -614,6 +614,21 @@ impl<S: 'static> Harness<S> {
         self.settle();
     }
 
+    /// Move the pointer to `pos` in **output** coordinates — onto another
+    /// client's window, say, whose position its `Configure` gave.
+    ///
+    /// # Panics
+    /// On a wire failure.
+    pub fn move_pointer_abs(&mut self, pos: Point) {
+        self.time_ns += 1_000_000;
+        self.server.push_input(InputEvent::PointerAbsolute {
+            x: f64::from(pos.x) / f64::from(self.output.0),
+            y: f64::from(pos.y) / f64::from(self.output.1),
+            time_ns: self.time_ns,
+        });
+        self.settle();
+    }
+
     /// Run the tree's passes and commit if anything is dirty, exactly as
     /// the app loop does at the end of every wakeup.
     ///
@@ -1083,6 +1098,9 @@ pub fn until(what: &str, f: impl FnMut() -> bool) {
     wait_for(what, f);
 }
 
+/// The size of [`ClipboardPeer::drag_window`].
+pub const DRAG_WINDOW: Size = Size::new(40.0, 30.0);
+
 /// A second client on a harness's server, speaking the clipboard
 /// protocol on the raw wire: the other side of a copy or a paste.
 pub struct ClipboardPeer {
@@ -1222,6 +1240,121 @@ impl ClipboardPeer {
     pub fn answer_bytes(&mut self, id: u32, bytes: &[u8]) {
         let fd = nitro_shm::memfd_sealed_readonly("peer", bytes).expect("memfd");
         self.answer(id, fd);
+    }
+
+    /// Open a small undecorated window to drag from; returns its node id
+    /// and the output position the server gave it. The window is
+    /// `DRAG_WINDOW` in size.
+    ///
+    /// # Panics
+    /// On a wire failure or a timeout.
+    pub fn drag_window<S: 'static>(
+        &mut self,
+        h: &mut Harness<S>,
+    ) -> (nitro_wire::types::NodeId, Rect) {
+        use nitro_wire::types::{Layer, NodeId, window_flags};
+        let root = NodeId(10);
+        let rect = NodeId(11);
+        self.serial += 1;
+        self.conn
+            .tx()
+            .create_window_with(
+                root,
+                "drag source",
+                DRAG_WINDOW,
+                Layer::Normal,
+                window_flags::UNDECORATED,
+            )
+            .create_rect(
+                rect,
+                root,
+                Rect::new(0.0, 0.0, DRAG_WINDOW.w, DRAG_WINDOW.h),
+            )
+            // lint-colors: allow — a test peer's window, painted only so it can be pressed on.
+            .fill_solid(rect, nitro_core::Color::rgb(0x40, 0x40, 0x40))
+            .commit(self.serial)
+            .expect("commit");
+        self.conn.flush().expect("flush");
+        let pos = self.take(
+            h,
+            "Configure",
+            |m| matches!(m, nitro_wire::msg::ServerMsg::Configure(c) if c.window == root),
+            |m| match m {
+                nitro_wire::msg::ServerMsg::Configure(c) => c.position,
+                _ => unreachable!(),
+            },
+        );
+        (root, Rect::new(pos.x, pos.y, DRAG_WINDOW.w, DRAG_WINDOW.h))
+    }
+
+    /// Start a drag from `window` offering `mimes` and `actions` (a
+    /// [`drag_actions`](nitro_wire::types::drag_actions) mask). The
+    /// harness must have pressed the button over `window` first
+    /// ([`Harness::move_pointer_abs`], [`Harness::press`]).
+    ///
+    /// # Panics
+    /// On a wire failure or a timeout.
+    pub fn start_drag<S: 'static>(
+        &mut self,
+        h: &mut Harness<S>,
+        window: nitro_wire::types::NodeId,
+        mimes: &[&str],
+        actions: u32,
+    ) {
+        use nitro_wire::types::ButtonState;
+        self.take(
+            h,
+            "the press",
+            |m| matches!(m, nitro_wire::msg::ServerMsg::PointerButton(b) if b.window == window && b.state == ButtonState::Pressed),
+            |_| (),
+        );
+        self.conn
+            .start_drag(nitro_wire::msg::StartDrag {
+                window,
+                icon: nitro_wire::types::NodeId::NONE,
+                actions,
+                mimes: mimes.iter().map(|m| (*m).to_owned()).collect(),
+            })
+            .expect("start drag");
+        self.serial += 1;
+        self.conn.commit(self.serial).expect("commit");
+        self.conn.flush().expect("flush");
+        h.settle();
+    }
+
+    /// The drag this peer started ended: wait for `DragFinished`, answer
+    /// it with `FinishDrag`, and return `(accepted, action)`.
+    ///
+    /// # Panics
+    /// On a wire failure or a timeout.
+    pub fn drag_finished<S: 'static>(
+        &mut self,
+        h: &mut Harness<S>,
+    ) -> (bool, nitro_wire::types::DragAction) {
+        let got = self.take(
+            h,
+            "DragFinished",
+            |m| matches!(m, nitro_wire::msg::ServerMsg::DragFinished(_)),
+            |m| match m {
+                nitro_wire::msg::ServerMsg::DragFinished(f) => (f.accepted, f.action),
+                _ => unreachable!(),
+            },
+        );
+        self.conn.finish_drag().expect("finish drag");
+        self.conn.flush().expect("flush");
+        got
+    }
+
+    /// Whether a `DragFinished` has arrived, without waiting for one.
+    ///
+    /// # Panics
+    /// On a wire failure.
+    pub fn saw_drag_finished(&mut self) -> bool {
+        self.conn.flush().expect("flush");
+        self.conn.poll(&mut self.seen).expect("poll");
+        self.seen
+            .iter()
+            .any(|m| matches!(m, nitro_wire::msg::ServerMsg::DragFinished(_)))
     }
 
     /// Read the selection in `mime`, to EOF. `request` must not be one

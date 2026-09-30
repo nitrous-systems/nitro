@@ -406,6 +406,8 @@ pub struct Ui<S> {
     window_state_handlers: Vec<Option<WindowStateHandler<S>>>,
     /// The system clipboard; see [`crate::clipboard`].
     pub(crate) clipboard: crate::clipboard::Clipboard<S>,
+    /// Drag-and-drop as a drop target; see [`crate::dnd`].
+    pub(crate) dnd: crate::dnd::Dnd,
 }
 
 /// A shell-event handler; see [`Ui::on_shell`].
@@ -513,6 +515,7 @@ impl<S: 'static> Ui<S> {
             window_state: nitro_wire::types::WindowState::Normal,
             window_state_handlers: Vec::new(),
             clipboard: crate::clipboard::Clipboard::new(),
+            dnd: crate::dnd::Dnd::default(),
         }
     }
 
@@ -725,7 +728,7 @@ impl<S: 'static> Ui<S> {
     }
 
     /// The window a server message names, if it is one of ours.
-    fn window_by_node(&self, node: NodeId) -> Option<WindowId> {
+    pub(crate) fn window_by_node(&self, node: NodeId) -> Option<WindowId> {
         self.windows.iter().find(|w| w.id.0 == node).map(|w| w.id)
     }
 
@@ -3243,6 +3246,11 @@ impl<S: 'static> Ui<S> {
             ServerMsg::SelectionOffer(o) => self.clipboard_offer(o),
             ServerMsg::SelectionRequest(r) => self.clipboard_serve(r),
             ServerMsg::SelectionData(d) => self.clipboard_data(d),
+            // Drag-and-drop, as a drop target; see `crate::dnd`.
+            ServerMsg::DragEnter(_)
+            | ServerMsg::DragMotion(_)
+            | ServerMsg::DragLeave(_)
+            | ServerMsg::DragDrop(_) => self.dnd_msg(state, msg),
             _ => {}
         }
     }
@@ -4082,6 +4090,36 @@ impl<S: 'static> Ui<S> {
         Handled::No
     }
 
+    /// Run `f` on widget `id`, taken out of the arena, with an
+    /// [`EventCx`] for it — the take-out dispatch `bubble_one` uses, for
+    /// hooks that are not an [`Event`]. `None` for a stale or busy id.
+    pub(crate) fn with_widget<R>(
+        &mut self,
+        state: &mut S,
+        id: WidgetId,
+        f: impl FnOnce(&mut dyn AnyWidget<S>, &mut EventCx<'_, S>) -> R,
+    ) -> Option<R> {
+        let bounds = self.arena.slot(id)?.state.bounds;
+        let mut widget = self.take(id).ok()?;
+        let out = {
+            let mut cx = EventCx {
+                ui: self,
+                state,
+                id,
+                bounds,
+            };
+            f(&mut *widget, &mut cx)
+        };
+        self.untake(id, widget);
+        Some(out)
+    }
+
+    /// Whether `id` names a living widget.
+    #[must_use]
+    pub fn is_live(&self, id: WidgetId) -> bool {
+        self.arena.is_live(id)
+    }
+
     fn bubble_one(&mut self, state: &mut S, id: WidgetId, ev: &Event) -> Handled {
         let Some(slot) = self.arena.slot(id) else {
             return Handled::No;
@@ -4124,7 +4162,7 @@ impl<S: 'static> Ui<S> {
     /// the group they hang under, so the point has to travel the same
     /// way the pixels did or a scrolled row is clickable where it used
     /// to be.
-    fn hit_chain(&self, win: WindowId, pos: Point, out: &mut Vec<(WidgetId, Point)>) {
+    pub(crate) fn hit_chain(&self, win: WindowId, pos: Point, out: &mut Vec<(WidgetId, Point)>) {
         out.clear();
         let Some(root) = self.root_of(win) else {
             return;

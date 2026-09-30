@@ -395,6 +395,23 @@ regrets.
     Other output does not, so the highlight can go stale when the
     program rewrites the rows under it. The copy then takes whatever
     those cells hold now.
+* **Drops are pasted** (#3966). The grid is a drop target
+  (`docs/ui.md` § Drag and drop). It takes, in this order of preference,
+  `text/uri-list`, `text/plain;charset=utf-8` and `text/plain`, as a
+  Copy, or as a Link when that is all the source offers. Other types and
+  actions are rejected. Text is pasted as it is. In a `text/uri-list`
+  each `file:///…` or `file://localhost/…` entry becomes its
+  percent-decoded path, shell-quoted: left bare if every character is in
+  `[A-Za-z0-9_./+,:@%=-]`, otherwise wrapped in single quotes. Any other
+  URI (a dragged link) is kept verbatim. Blank and `#` lines are skipped,
+  the items are joined by spaces, and a trailing space follows when a
+  file was among them, as gnome-terminal and xterm do. A path that is not
+  UTF-8 is decoded lossily. The result goes through `TermGrid::paste`,
+  the same path as `Ctrl+Shift+V`, so it is bracketed when the program
+  asked for it and never executed on its own. A browser's link drag
+  offers `text/uri-list` first, so a link pastes its URL. Dragging *out*
+  of the terminal is not supported.
+
 * **A paste is sanitised as xterm does it.** Line breaks are sent as `\r`
   (the Return key). When the program asked for bracketed paste
   (DECSET 2004) the text is wrapped in `ESC[200~` … `ESC[201~`, and

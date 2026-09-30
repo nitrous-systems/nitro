@@ -16,8 +16,9 @@
 #   text-a-to-b         selected text dragged from A into B's drop zone
 #   link-a-to-b         a link dragged A -> B arrives as text/uri-list
 #   text-within-a       text dragged into A's own drop zone (one client)
-#   drop-on-term        a drop on nitro-term (lists DATA, never accepts) is
-#                       rejected: A's dragend says none, A still clicks
+#   text-on-term        selected text dropped on nitro-term is pasted at
+#                       its prompt (dragend copy, text in the grid)
+#   link-on-term        a link dropped on nitro-term pastes its URL
 #   drop-on-bar         a drop on the bar (no DATA: no target) is rejected
 #   escape              Escape mid-drag cancels; A and B still respond
 #   source-killed       A SIGKILLed mid-drag: B gets DragLeave, the grab
@@ -241,22 +242,30 @@ e=$(L js 9501 'log.join()')
 [[ $e == *end:none,click ]] && ok=1 || ok=0
 check drop-on-bar $ok "A:$e"
 
-# 5. A drop on nitro-term: a DATA client that never accepts. It is tiled
-# over B's half for the check, and quit after it.
+# 5. Drops on nitro-term (#3966): text and a link are pasted at its
+# prompt. It is tiled over B's half for the checks, and quit after them.
 hey nitro-term quit >/dev/null 2>&1; sleep 0.5
 setsid nitro-term >/dev/null 2>&1 < /dev/null & term_started=1
 sleep 2; chord 105
 eval "$(L locate 2>/dev/null | grep '^term=')"
+grid() { hey nitro-term get grid value 2>/dev/null; }
 if [[ -n ${term:-} ]]; then
-    reset 9501; reset 9502; selA
+    hey nitro-term do grid send '\x15' >/dev/null 2>&1; sleep 0.3   # ^U: clear the line
+    reset 9501; selA
     drag "$a_src" "$term"
-    click "$a_dz"
-    e=$(L js 9501 'log.join()'); tb=$(L js 9502 document.title)
-    alive=0; pgrep -x nitro-term >/dev/null && alive=1
-    [[ $e == *end:none,click && $tb == b\|ready && $alive == 1 ]] && ok=1 || ok=0
-    check drop-on-term $ok "A:$e B:$tb term-alive=$alive"
+    e=$(L js 9501 'log.join()'); g=$(grid)
+    [[ $e == *end:copy* && $g == *dragtext-4711* ]] && ok=1 || ok=0
+    check text-on-term $ok "A:$e grid-has-text=$([[ $g == *dragtext-4711* ]] && echo 1 || echo 0)"
+    hey nitro-term do grid send '\x15' >/dev/null 2>&1; sleep 0.3
+    reset 9501
+    drag "$a_lnk" "$term"
+    g=$(grid); alive=0; pgrep -x nitro-term >/dev/null && alive=1
+    [[ $g == *https://example.com/nitro-link-9* && $alive == 1 ]] && ok=1 || ok=0
+    check link-on-term $ok "term-alive=$alive grid-has-link=$([[ $g == *nitro-link-9* ]] && echo 1 || echo 0)"
+    hey nitro-term do grid send '\x15' >/dev/null 2>&1
 else
-    check drop-on-term 0 "nitro-term not found on screen"
+    check text-on-term 0 "nitro-term not found on screen"
+    check link-on-term 0 "nitro-term not found on screen"
 fi
 hey nitro-term quit >/dev/null 2>&1; term_started=; sleep 1
 click "$a_dz"; click "$b_dz"

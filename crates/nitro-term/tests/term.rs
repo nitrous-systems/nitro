@@ -1000,7 +1000,7 @@ fn ctrl_shift_v_pastes_bracketed_and_ctrl_shift_c_sends_nothing() {
     let (mut h, grid) = harness_running(&[
         "/bin/sh",
         "-c",
-        "stty raw -echo; printf '\\033[?2004h'; printf ready; \
+        "stty raw -echo; printf '\\033[?2004h'; printf 'ready\\r\\n'; \
          dd bs=1 count=15 status=none | od -An -t u1",
     ]);
     pump_until(&mut h, "the byte dumper to be ready", |h| {
@@ -1025,5 +1025,100 @@ fn ctrl_shift_v_pastes_bracketed_and_ctrl_shift_c_sends_nothing() {
         !output.split_whitespace().any(|w| w == "3"),
         "Ctrl+Shift+C reached the pty as ^C: {output:?}"
     );
+    h.quit();
+}
+
+// ---------------------------------------------------------------------
+// drag and drop
+// ---------------------------------------------------------------------
+
+/// Drag `mimes` from a peer's window onto the grid, drop, and serve
+/// `bytes` for the type the terminal asked for; returns that type.
+fn drop_on_grid(h: &mut Harness<TermApp>, grid: WidgetId, mimes: &[&str], bytes: &[u8]) -> String {
+    use nitro_ui::dnd::drag_actions;
+    let mut peer = ClipboardPeer::new(h, "source");
+    let (node, src) = peer.drag_window(h);
+    h.move_pointer_abs(Point::new(src.x + src.w / 2.0, src.y + src.h / 2.0));
+    h.press(nitro_ui::event::button::LEFT);
+    peer.start_drag(h, node, mimes, drag_actions::COPY | drag_actions::LINK);
+    let origin = h.ui().window_position_of(nitro_ui::WindowId::MAIN);
+    let b = h.bounds(grid);
+    let p = Point::new(
+        origin.x.max(0.0) + b.x + 12.0,
+        origin.y.max(0.0) + b.y + 12.0,
+    );
+    assert!(!src.contains(p), "{p:?} is under the source window {src:?}");
+    h.move_pointer_abs(p);
+    h.move_pointer_abs(Point::new(p.x + 3.0, p.y + 3.0));
+    assert_eq!(h.ui().drop_target(), Some(grid), "the grid accepts");
+    h.release(nitro_ui::event::button::LEFT);
+    let (id, mime) = peer.asked(h);
+    peer.answer_bytes(id, bytes);
+    h.settle();
+    assert_eq!(
+        peer.drag_finished(h),
+        (true, nitro_ui::dnd::DragAction::Copy)
+    );
+    mime
+}
+
+/// Wait until `od -An -t u1` on the screen has printed `want`.
+fn wait_for_bytes(h: &mut Harness<TermApp>, grid: WidgetId, want: &[u8]) {
+    let want: Vec<String> = want.iter().map(u8::to_string).collect();
+    pump_until(h, "od to print the drop", |h| {
+        let output = screen(h, grid);
+        let got = output.split_whitespace().collect::<Vec<_>>();
+        got.windows(want.len()).any(|w| w == want)
+    });
+}
+
+#[test]
+fn dropped_text_is_pasted_bracketed() {
+    let (mut h, grid) = harness_running(&[
+        "/bin/sh",
+        "-c",
+        "stty raw -echo; printf '\\033[?2004h'; printf 'ready\\r\\n'; \
+         dd bs=1 count=19 status=none | od -An -w32 -t u1",
+    ]);
+    pump_until(&mut h, "the byte dumper to be ready", |h| {
+        screen(h, grid).contains("ready") && h.widget::<TermGrid>(grid).term().bracketed_paste()
+    });
+    let mime = drop_on_grid(
+        &mut h,
+        grid,
+        &[
+            "text/html",
+            nitro_ui::clipboard::TEXT_MIME,
+            nitro_ui::clipboard::PLAIN_MIME,
+        ],
+        b"echo hi",
+    );
+    assert_eq!(mime, nitro_ui::clipboard::TEXT_MIME);
+    wait_for_bytes(&mut h, grid, b"\x1b[200~echo hi\x1b[201~");
+    h.quit();
+}
+
+#[test]
+fn a_dropped_file_uri_becomes_a_shell_quoted_path() {
+    // `'/tmp/a b' ` is 11 bytes; not bracketed, the program did not ask.
+    let (mut h, grid) = harness_running(&[
+        "/bin/sh",
+        "-c",
+        "stty raw -echo; printf ready; dd bs=1 count=11 status=none | od -An -t u1",
+    ]);
+    pump_until(&mut h, "the byte dumper to be ready", |h| {
+        screen(h, grid).contains("ready")
+    });
+    let mime = drop_on_grid(
+        &mut h,
+        grid,
+        &[
+            nitro_ui::clipboard::URI_LIST_MIME,
+            nitro_ui::clipboard::PLAIN_MIME,
+        ],
+        b"file:///tmp/a%20b\r\n",
+    );
+    assert_eq!(mime, nitro_ui::clipboard::URI_LIST_MIME);
+    wait_for_bytes(&mut h, grid, b"'/tmp/a b' ");
     h.quit();
 }

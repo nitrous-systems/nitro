@@ -49,6 +49,7 @@
 use std::os::fd::{AsFd as _, OwnedFd};
 
 use nitro_ui::build::{IntoWidget, StyleBuilder};
+use nitro_ui::dnd::{Accept, DragAction, DragOffer};
 use nitro_ui::event::{Event, Handled, button, key, mods};
 use nitro_ui::widget::Slot;
 use nitro_ui::{
@@ -766,6 +767,33 @@ impl<S: 'static> Widget<S> for TermGrid {
             }
             _ => Handled::No,
         }
+    }
+
+    /// A drop: a `text/uri-list` (files become shell-quoted paths) or
+    /// text, as a copy — or a link when that is all the source offers.
+    fn drag_over(
+        &mut self,
+        _cx: &mut EventCx<'_, S>,
+        _pos: nitro_ui::Point,
+        offer: &DragOffer,
+    ) -> Option<Accept> {
+        let mime = offer.first_of(&crate::keys::DROP_MIMES)?;
+        let action = [DragAction::Copy, DragAction::Link]
+            .into_iter()
+            .find(|a| offer.allows(*a))?;
+        Some(Accept::new(action, mime))
+    }
+
+    /// The dropped text is pasted exactly as Ctrl+Shift+V pastes:
+    /// bracketed when the program asked for it.
+    fn dropped(&mut self, cx: &mut EventCx<'_, S>, mime: &str, data: Option<&[u8]>) {
+        let Some(bytes) = data else { return };
+        let text = crate::keys::drop_text(mime, bytes);
+        if text.is_empty() {
+            return;
+        }
+        self.paste(&text);
+        cx.request_paint();
     }
 
     fn role(&self) -> Role {
