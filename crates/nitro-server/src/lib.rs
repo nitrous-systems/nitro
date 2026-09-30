@@ -2265,6 +2265,8 @@ impl Server {
             windows.len()
         );
         for win in windows {
+            // The new scale snaps the frame insets differently (#4003).
+            self.snap_frame_insets(win);
             self.configure(win);
         }
     }
@@ -2323,6 +2325,7 @@ impl Server {
                 warn!("migrating a window: {e}");
                 continue;
             }
+            self.snap_frame_insets(win);
             self.pointer_refresh = true;
             // A maximized or fullscreen window's geometry is the old
             // output's; re-derive it for the new one.
@@ -5460,7 +5463,11 @@ impl Server {
     /// so adding or removing one later would move every node under it.
     /// Fullscreen hides the decorations instead (see
     /// [`Server::apply_state_geometry`]).
-    fn decorate(&mut self, win: WindowKey) {
+    ///
+    /// `scale` is the scale of the output it is about to be placed on: the
+    /// insets are snapped to whole device pixels there
+    /// ([`wm::frame_insets_for`]).
+    fn decorate(&mut self, win: WindowKey, scale: f32) {
         let Ok(info) = self.scene.window_info(win) else {
             return;
         };
@@ -5468,7 +5475,7 @@ impl Server {
             return;
         }
         let fixed = info.flags().fixed_size;
-        if let Err(e) = self.scene.frame_window(win, wm::frame_insets()) {
+        if let Err(e) = self.scene.frame_window(win, wm::frame_insets_for(scale)) {
             warn!("framing a window: {e}");
             return;
         }
@@ -5566,9 +5573,16 @@ impl Server {
         };
         let hint = self.resize_hint == Some(win);
         let hover = self.button_hover.filter(|(w, _)| *w == win).map(|(_, r)| r);
-        if let Err(e) =
-            wm::style_frame(&mut self.scene, &nodes, focused, hint, hover, &self.palette)
-        {
+        let border = wm::frame_border(&self.scene, win);
+        if let Err(e) = wm::style_frame(
+            &mut self.scene,
+            &nodes,
+            border,
+            focused,
+            hint,
+            hover,
+            &self.palette,
+        ) {
             warn!("styling a frame: {e}");
         }
         // A symbolic app-icon fallback is tinted like the title, so it
@@ -6229,6 +6243,9 @@ impl Server {
             warn!("moving a window: {e}");
             return;
         }
+        // Handed to another output: its scale may snap the insets
+        // differently.
+        self.snap_frame_insets(win);
         self.pointer_refresh = true;
         self.configure(win);
         self.reflow_popups(win);
@@ -6237,6 +6254,9 @@ impl Server {
     /// Set a window's **frame** rectangle: position and content size at
     /// once, with the content size clamped to the client's limits.
     fn set_frame_rect(&mut self, win: WindowKey, rect: Rect) {
+        // Before reading the inset: the content size below is the frame
+        // minus the *snapped* inset for the output the window is on.
+        self.snap_frame_insets(win);
         let Ok(info) = self.scene.window_info(win) else {
             return;
         };
@@ -6267,6 +6287,49 @@ impl Server {
         self.relayout_frame(win);
         self.configure(win);
         self.reflow_popups(win);
+    }
+
+    /// The frame insets a decorated window should have on the output it is
+    /// on (the primary's scale when it has none): [`wm::frame_insets_for`]
+    /// that output's scale, so its content sits on whole device pixels.
+    fn window_frame_insets(&self, win: WindowKey) -> nitro_scene::Insets {
+        let output = self
+            .scene
+            .window_info(win)
+            .ok()
+            .and_then(nitro_scene::Window::output)
+            .or_else(|| self.primary_output());
+        let scale = output
+            .and_then(|id| self.scene.output_info(id))
+            .map_or(1.0, |(_, s)| s);
+        wm::frame_insets_for(scale)
+    }
+
+    /// Re-snap a framed window's insets to its output's scale (gap G11,
+    /// #4003), re-laying and restyling the frame when they moved.
+    ///
+    /// Called wherever a window's output or that output's scale can
+    /// change, before the `Configure` that reports the new content
+    /// position. The content size is kept; the frame grows or shrinks by
+    /// the sub-pixel difference. A fullscreen window's insets are zero
+    /// on purpose and are left alone.
+    fn snap_frame_insets(&mut self, win: WindowKey) {
+        let Ok(info) = self.scene.window_info(win) else {
+            return;
+        };
+        if !info.is_framed() || info.state() == WindowState::Fullscreen {
+            return;
+        }
+        let want = self.window_frame_insets(win);
+        if info.inset() == want {
+            return;
+        }
+        if let Err(e) = self.scene.set_window_inset(win, want) {
+            warn!("snapping a frame's insets: {e}");
+            return;
+        }
+        self.relayout_frame(win);
+        self.style_only(win, self.focus == Some(win));
     }
 
     /// Re-lay a window's decorations for its current size.
@@ -6398,7 +6461,9 @@ impl Server {
             WindowState::Minimized => {}
             WindowState::Maximized => {
                 if framed {
-                    let _ = self.scene.set_window_inset(win, wm::frame_insets());
+                    let _ = self
+                        .scene
+                        .set_window_inset(win, self.window_frame_insets(win));
                     self.set_frame_visible(win, true);
                 }
                 self.set_frame_rect(win, area);
@@ -6415,10 +6480,12 @@ impl Server {
             }
             WindowState::Normal => {
                 if framed {
-                    let _ = self.scene.set_window_inset(win, wm::frame_insets());
+                    let _ = self
+                        .scene
+                        .set_window_inset(win, self.window_frame_insets(win));
                     self.set_frame_visible(win, true);
                 }
-                let inset = wm::frame_insets();
+                let inset = self.window_frame_insets(win);
                 let restore = self
                     .scene
                     .window_info(win)
@@ -8361,6 +8428,9 @@ impl Server {
             warn!("moving an anchored window to its output: {e}");
             return;
         }
+        if moved {
+            self.snap_frame_insets(win);
+        }
         let s = if scale > 0.0 { scale } else { 1.0 };
         let origin = self.desktop_origin(output);
         let full = Rect::new(origin.x, origin.y, rect.w as f32 / s, rect.h as f32 / s);
@@ -9028,9 +9098,9 @@ impl Server {
         // Decorate before placing: the frame changes the window's outer
         // size, and the placement has to know it to centre the thing the
         // user actually sees.
-        self.decorate(win);
-        let area = self.local_work_area(scene_id);
         let scale = self.scene.output_info(scene_id).map_or(1.0, |(_, s)| s);
+        self.decorate(win, scale);
+        let area = self.local_work_area(scene_id);
         let Ok(info) = self.scene.window_info(win) else {
             return;
         };

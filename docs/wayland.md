@@ -642,10 +642,10 @@ it and sends `done`.
 - For a window whose **content group is on whole device pixels** (an
   undecorated window at any scale, or any window at an integer scale), a
   device-sized buffer with bounds `px / scale` is a **1:1 blit** with
-  exact sub-rect damage (`wire.md` L1399ff, #3940). A **server-decorated**
-  window at a fractional scale is not 1:1, because the frame insets are
-  not whole device pixels, and gets resampled. Most of the apps that
-  choose SSD are Qt apps, so this matters. That is G11.
+  exact sub-rect damage (`wire.md` L1399ff, #3940). Since #4003 that
+  includes a **server-decorated** window at a fractional scale: the
+  frame insets are snapped to whole device pixels per output scale, so
+  SSD apps (mostly Qt) are 1:1 too. That was G11.
 
 ### 4.9 Clipboard, drag-and-drop, primary selection (W4)
 
@@ -804,6 +804,6 @@ blocks W1–W6: every row says what the adapter does without it.
 | G8 | `OutputInfo` has no physical size / make / model | `wl_output.geometry` reports 0 × 0 and "nitro" | cosmetic; not proposed |
 | G9 | no input margin outside an undecorated window | CSD resize-from-shadow is lost (tiled-state rule) | a "shadow inset" on `CreateWindow`, if users miss it |
 | G10 | no idle inhibit | no-op global | an inhibit op on the day nitro blanks idle outputs |
-| **G11** | server frame insets are not whole device pixels at fractional scales (`wire.md` L1399ff) | SSD Wayland windows (Qt, foot) at 1.25 are resampled | round the insets to whole device pixels. It helps native decorated apps too. **Worth filing** |
+| G11 | ~~server frame insets are not whole device pixels at fractional scales~~ **fixed (#4003)** | ~~SSD Wayland windows (Qt, foot) at 1.25 are resampled~~ | insets are snapped to whole device pixels per output scale (`wm::frame_insets_for`); native decorated apps benefit too |
 | G12 | (verify) keyboard to a grabbing popup | — | W3 test |
 | G13 | (verify) `Frame` for hidden/minimized windows | — | W1 test; record the behaviour |

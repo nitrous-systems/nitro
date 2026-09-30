@@ -391,3 +391,75 @@ fn at_a_fractional_scale_a_device_sized_buffer_is_copied() {
     assert_eq!(px(SIDE + 4, 4), [0xff, 0xff, 0xff]);
     h.quit();
 }
+
+/// Gap G11 (#4003): at scale 1.25 a **decorated** window's content is
+/// drawn 1:1 too. The frame insets are snapped to whole device pixels (the
+/// 1 px border is 0.8 logical px, one device pixel), so the content — not
+/// just the window root — lands on the device grid. Before the snap it sat
+/// at `x + 1.25` device px and every pixel of the buffer was resampled.
+#[test]
+fn a_decorated_windows_content_is_blitted_1to1_at_1_25() {
+    let h = Harness::start_scaled("frac-ssd", Some("1.25"));
+    let mut conn = h.client("opq-frac-ssd");
+    let (root, image) = (NodeId(1), NodeId(2));
+    let stride = SIDE * 4;
+    // A per-pixel distinct, opaque pattern: any resampling mixes
+    // neighbours and shows.
+    let mut pixels = vec![0u8; (stride * SIDE) as usize];
+    for y in 0..SIDE {
+        for x in 0..SIDE {
+            let o = (y * stride + x * 4) as usize;
+            pixels[o] = ((x ^ y) * 7) as u8;
+            pixels[o + 1] = (y * 17) as u8;
+            pixels[o + 2] = (x * 13) as u8;
+            pixels[o + 3] = 0xff;
+        }
+    }
+    let fd = nitro_shm::memfd_with("nitro-opaque-frac-ssd", &pixels).unwrap();
+    let l = SIDE as f32 / 1.25;
+    conn.tx()
+        // Decorated: the server draws a frame around it.
+        .create_window(root, "ssd", Size::new(4.0 * l, 4.0 * l), Layer::Normal)
+        .create_buffer(CreateBuffer {
+            id: BufferId(1),
+            width: SIDE,
+            height: SIDE,
+            stride,
+            format: format::AR24,
+            size: stride * SIDE,
+            fd,
+        })
+        .create_image(image, root, Rect::new(0.0, 0.0, l, l))
+        .image(image, BufferId(1), IRect::new(0, 0, SIDE_I32, SIDE_I32))
+        .commit(1)
+        .unwrap();
+    conn.flush().unwrap();
+    let c = expect(&mut conn, "Configure", |m| match m {
+        ServerMsg::Configure(c) if c.window == root => Some(*c),
+        _ => None,
+    });
+    expect(&mut conn, "Presented 1", |m| {
+        matches!(m, ServerMsg::Presented(p) if p.serial == 1).then_some(())
+    });
+    assert!((c.scale - 1.25).abs() < 1e-6, "scale {}", c.scale);
+    // The window root may sit at a fractional logical position; the scene
+    // snaps it to the device grid (`root_placement`). With whole-device
+    // insets the content's device origin is then `round(position * s)`
+    // exactly — without them it is a quarter pixel off that.
+    let (dev_x, dev_y) = (c.position.x * 1.25, c.position.y * 1.25);
+    let (stride_out, data) = h.shot();
+    let ox = dev_x.round() as u32;
+    let oy = dev_y.round() as u32;
+    for y in 0..SIDE {
+        for x in 0..SIDE {
+            let o = ((oy + y) * stride_out + (ox + x) * 4) as usize;
+            let src = (y * stride + x * 4) as usize;
+            assert_eq!(
+                [data[o], data[o + 1], data[o + 2]],
+                [pixels[src], pixels[src + 1], pixels[src + 2]],
+                "pixel ({x},{y})"
+            );
+        }
+    }
+    h.quit();
+}

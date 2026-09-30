@@ -191,7 +191,16 @@ it, so the frame would go away with its disc filled and an `Alt+Tab`
 restore — which moves no pointer — would bring it back lit under a
 pointer that is somewhere else.
 
-The insets are `(1, 28, 1, 1)`. `Window::size()` and every `Configure` are
+The insets are `(1, 28, 1, 1)` at an integer scale. At a fractional one
+each edge is snapped to a whole number of device pixels on the window's
+output (`wm::frame_insets_for`, #4003): at 1.25 the border is 0.8 logical
+px, one device pixel, and the title bar stays 28 (35 device px). That is
+what puts a decorated window's content on the device grid, so a
+device-sized client buffer is drawn 1:1 rather than resampled. The insets
+are re-snapped when a window changes output or its output is rescaled
+(the content size is kept; the frame grows or shrinks by the
+difference), and the border stroke follows the snapped side inset.
+`Window::size()` and every `Configure` are
 the **content's** size; `Window::frame_size()` adds the insets.
 `Configure.position` is the content's origin, so a client holding a
 screenshot of the whole output can still crop it to exactly itself.

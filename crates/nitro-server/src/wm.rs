@@ -89,10 +89,40 @@ pub const MIN_CONTENT: Size = Size::new(64.0, 32.0);
 /// click.
 pub const DOUBLE_CLICK_NS: u64 = 400_000_000;
 
-/// The frame's insets for a decorated window.
+/// The frame's insets for a decorated window, at an integer scale.
+///
+/// This is [`frame_insets_for`] at scale 1; the server uses the per-scale
+/// form, so the content of a decorated window lands on a whole device
+/// pixel on every output.
 #[must_use]
 pub fn frame_insets() -> Insets {
     Insets::new(BORDER, TITLE_H, BORDER, BORDER)
+}
+
+/// The frame's insets for a decorated window on an output of `scale`,
+/// each edge snapped to a **whole number of device pixels** (at least
+/// one).
+///
+/// # Why (gap G11, #4003)
+///
+/// The window root is already snapped to the device grid
+/// (`Scene::root_placement`), so the content's device origin is
+/// `root + inset * scale`. At 1.25 the 28 px title is 35 device pixels,
+/// but a 1 px border is 1.25 — the client's device-sized buffer would land
+/// a quarter pixel off and be resampled. Snapping the inset (the border
+/// becomes 0.8 logical px, exactly one device pixel) keeps a decorated
+/// window's content 1:1, as an undecorated one's already was.
+///
+/// A non-finite or non-positive scale is treated as 1.
+#[must_use]
+pub fn frame_insets_for(scale: f32) -> Insets {
+    let s = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    let snap = |v: f32| (v * s).round().max(1.0) / s;
+    Insets::new(snap(BORDER), snap(TITLE_H), snap(BORDER), snap(BORDER))
 }
 
 /// Non-colour constants of the frame's look.
@@ -952,7 +982,8 @@ pub fn build_frame(
         minimize,
     };
     layout_frame(scene, win, &nodes)?;
-    style_frame(scene, &nodes, false, false, None, palette)?;
+    let border = frame_border(scene, win);
+    style_frame(scene, &nodes, border, false, false, None, palette)?;
     Ok(nodes)
 }
 
@@ -1002,6 +1033,14 @@ pub fn layout_frame(
     let info = scene.window_info(win)?;
     let size = info.frame_size();
     let fixed = info.flags().fixed_size;
+    // The body's top edge is the content's top edge: the *snapped* top
+    // inset (`frame_insets_for`), so the seam sits on the content even at
+    // a fractional scale. A fullscreen window's inset is zero and its
+    // frame hidden; it keeps the unsnapped geometry.
+    let top = match info.inset().top {
+        t if t > 0.0 => t,
+        _ => TITLE_H,
+    };
     let s = ClientId::SERVER;
     // # The frame is one shape: see the module docs' anatomy, and
     // `docs/wm.md`.
@@ -1050,8 +1089,8 @@ pub fn layout_frame(
     // corners are whole-pixel geometry: the vertical and horizontal runs
     // are the same 1-px stroke of the same rect and *join*, with no
     // antialiasing at all.
-    let bar_box = Rect::new(0.0, 0.0, size.w, TITLE_H + CORNER_RADIUS);
-    let body = Rect::new(0.0, TITLE_H, size.w, (size.h - TITLE_H).max(0.0));
+    let bar_box = Rect::new(0.0, 0.0, size.w, top + CORNER_RADIUS);
+    let body = Rect::new(0.0, top, size.w, (size.h - top).max(0.0));
     scene.set_bounds(s, nodes.bar, bar_box)?;
     scene.set_bounds(s, nodes.background, body)?;
     // Where the leftmost button starts is what everything to its left has
@@ -1117,6 +1156,21 @@ pub fn layout_frame(
     Ok(())
 }
 
+/// The width of a frame's border stroke: the window's snapped side inset
+/// (`frame_insets_for`), so the stroke is exactly the band between the
+/// frame's edge and the content — one device pixel at any scale. Falls
+/// back to [`BORDER`] when the inset is zero (fullscreen: the frame is
+/// hidden) or the window is gone.
+#[must_use]
+pub fn frame_border(scene: &Scene, win: WindowKey) -> f32 {
+    scene
+        .window_info(win)
+        .map(|i| i.inset().left)
+        .ok()
+        .filter(|l| *l > 0.0)
+        .unwrap_or(BORDER)
+}
+
 /// Line height reserved for the title text: enough for the ascender and
 /// descender of the 13 px face without measuring it.
 pub const TITLE_SIZE_LINE: f32 = 18.0;
@@ -1154,6 +1208,7 @@ pub const TITLE_SIZE_LINE: f32 = 18.0;
 pub fn style_frame(
     scene: &mut Scene,
     nodes: &FrameNodes,
+    border_width: f32,
     focused: bool,
     hint: bool,
     hover: Option<Region>,
@@ -1170,7 +1225,7 @@ pub fn style_frame(
     scene.set_border(
         s,
         nodes.background,
-        Some(nitro_scene::Border::new(BORDER, border)),
+        Some(nitro_scene::Border::new(border_width, border)),
     )?;
     scene.set_fill(s, nodes.bar, nitro_scene::Fill::Solid(bar))?;
     // **The bar carries the same border as the body.** The two rects
@@ -1182,7 +1237,11 @@ pub fn style_frame(
     // straight past the bar's 6-px arc at the top and — being a stroke on
     // a rounded rect whose content was not rounded — left a gap at each
     // bottom corner. One border in two pieces rather than two borders.
-    scene.set_border(s, nodes.bar, Some(nitro_scene::Border::new(BORDER, border)))?;
+    scene.set_border(
+        s,
+        nodes.bar,
+        Some(nitro_scene::Border::new(border_width, border)),
+    )?;
     let text = title_role(focused);
     for region in [Region::Close, Region::Maximize, Region::Minimize] {
         let Some(button) = nodes.button(region) else {
@@ -1350,6 +1409,31 @@ pub fn title_role(focused: bool) -> Role {
 #[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_insets_are_whole_device_pixels_at_every_scale() {
+        for scale in [1.0_f32, 1.25, 1.5, 1.75, 2.0, 3.0] {
+            let i = frame_insets_for(scale);
+            for (name, v) in [
+                ("left", i.left),
+                ("top", i.top),
+                ("right", i.right),
+                ("bottom", i.bottom),
+            ] {
+                let d = v * scale;
+                assert!(
+                    (d - d.round()).abs() < 1e-4 && d.round() >= 1.0,
+                    "{name} at {scale}: {v} logical = {d} device px"
+                );
+            }
+        }
+        assert_eq!(frame_insets_for(1.0), frame_insets());
+        assert_eq!(frame_insets_for(2.0), frame_insets());
+        assert_eq!(frame_insets_for(0.0), frame_insets());
+        assert_eq!(frame_insets_for(f32::NAN), frame_insets());
+        assert!((frame_insets_for(1.25).top - 28.0).abs() < 1e-6);
+        assert!((frame_insets_for(1.25).left - 0.8).abs() < 1e-6);
+    }
 
     #[test]
     fn wire_edges_map_to_edges_and_refuse_what_a_drag_cannot_mean() {

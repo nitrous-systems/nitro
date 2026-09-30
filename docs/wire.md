@@ -1420,9 +1420,12 @@ translate. It gets exact sub-rect damage, the opaque copy of an `XR24`
 buffer or a declared opaque region, and no resampling. That is how a
 client renders at device resolution at 1.25 (Chromium does, see
 docs/chromium.md). A node *inside* a server frame is offset by the frame
-insets (a 1 px border and a 28 px title bar, logical), which are not
-whole device pixels at 1.25. A decorated window's content is therefore
-not 1:1 at a fractional scale; only undecorated windows are.
+insets, and those are snapped per output scale to a whole number of
+device pixels each (#4003): at 1.25 the 1 px border is 0.8 logical px
+(one device pixel) and the 28 px title bar is 35 device px. A decorated
+window's content is therefore 1:1 at a fractional scale too, exactly
+like an undecorated one's; `Configure.position` reports the snapped
+content origin.
 
 Damage names the buffer, not a frame: rects sent for a buffer apply to every
 node showing it, and — until the next frame is drawn — also to a
