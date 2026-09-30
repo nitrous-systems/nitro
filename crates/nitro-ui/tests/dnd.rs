@@ -339,7 +339,10 @@ impl SourceScene {
             self.target.y + self.target.h / 2.0,
         );
         let main = Rect::new(origin.x - 12.0, origin.y - 40.0, 64.0, 152.0);
-        assert!(!main.contains(p), "{p:?} is under the source window at {origin:?}");
+        assert!(
+            !main.contains(p),
+            "{p:?} is under the source window at {origin:?}"
+        );
         p
     }
 
@@ -365,7 +368,8 @@ fn a_dragged_row_is_read_by_the_target_and_the_source_hears_the_outcome() {
     let (mimes, actions) = s.peer.drag_entered(&mut s.h);
     assert_eq!(mimes, [URI_LIST_MIME, TEXT_MIME, PLAIN_MIME]);
     assert_eq!(actions, drag_actions::COPY | drag_actions::LINK);
-    s.peer.accept_drop(&mut s.h, DragAction::Copy, URI_LIST_MIME);
+    s.peer
+        .accept_drop(&mut s.h, DragAction::Copy, URI_LIST_MIME);
     s.h.release(button::LEFT);
     s.peer.dropped(&mut s.h);
     assert_eq!(s.peer.read_drag(&mut s.h, 1, URI_LIST_MIME), URIS);
@@ -381,7 +385,11 @@ fn a_dragged_row_is_read_by_the_target_and_the_source_hears_the_outcome() {
         }]
     );
     assert!(!s.h.ui().drag_in_flight());
-    assert_eq!(s.h.server().stat("dnd_active"), 0, "our FinishDrag released it");
+    assert_eq!(
+        s.h.server().stat("dnd_active"),
+        0,
+        "our FinishDrag released it"
+    );
     // A second drag starts: nothing was left behind.
     s.begin();
     assert_eq!(s.h.state().started, [true, true]);
@@ -478,11 +486,12 @@ fn a_start_the_server_ignores_still_finishes() {
         );
     }
     assert_eq!(s.h.state().started, [true]);
-    s.h.server().push_input(nitro_server::input::InputEvent::PointerButton {
-        button: button::LEFT,
-        state: nitro_wire::types::ButtonState::Released,
-        time_ns: 1,
-    });
+    s.h.server()
+        .push_input(nitro_server::input::InputEvent::PointerButton {
+            button: button::LEFT,
+            state: nitro_wire::types::ButtonState::Released,
+            time_ns: 1,
+        });
     // The server has the release before our (still unflushed) StartDrag.
     s.h.server().settle();
     s.h.settle();

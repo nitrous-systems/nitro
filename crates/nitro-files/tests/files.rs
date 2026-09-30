@@ -2451,7 +2451,11 @@ fn a_row_dragged_onto_a_target_offers_the_uri_list_ctrl_c_offers() {
         actions,
         drag_actions::COPY | drag_actions::MOVE | drag_actions::LINK
     );
-    assert!(status(&h, ids).contains("dragging 1 item"), "{}", status(&h, ids));
+    assert!(
+        status(&h, ids).contains("dragging 1 item"),
+        "{}",
+        status(&h, ids)
+    );
     peer.accept_drop(&mut h, DragAction::Copy, "text/uri-list");
     h.release(nitro_ui::event::button::LEFT);
     peer.dropped(&mut h);
@@ -2467,7 +2471,11 @@ fn a_row_dragged_onto_a_target_offers_the_uri_list_ctrl_c_offers() {
     );
     peer.finish_drop(&mut h);
     h.settle();
-    assert!(status(&h, ids).contains("dropped 1 item (copy)"), "{}", status(&h, ids));
+    assert!(
+        status(&h, ids).contains("dropped 1 item (copy)"),
+        "{}",
+        status(&h, ids)
+    );
     assert!(path.exists(), "the source deletes nothing");
     let _ = std::fs::remove_dir_all(&root);
     h.quit();
@@ -2495,7 +2503,11 @@ fn a_drag_of_several_rows_carries_every_path() {
     assert_eq!(h.widget::<List<Files>>(ids.list).selection(), [0, 1, 2]);
     drag_row(&mut h, ids, 1, mid(target));
     peer.drag_entered(&mut h);
-    assert!(status(&h, ids).contains("dragging 3 items"), "{}", status(&h, ids));
+    assert!(
+        status(&h, ids).contains("dragging 3 items"),
+        "{}",
+        status(&h, ids)
+    );
     peer.accept_drop(&mut h, DragAction::Copy, "text/plain;charset=utf-8");
     h.release(nitro_ui::event::button::LEFT);
     peer.dropped(&mut h);
@@ -2541,7 +2553,10 @@ fn move_is_offered_only_out_of_a_writable_directory() {
     std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
     let s = h.state();
     let rw = nitro_files::drag_actions_for(s, &[dir.join("g.txt")]);
-    assert_eq!(rw, drag_actions::COPY | drag_actions::MOVE | drag_actions::LINK);
+    assert_eq!(
+        rw,
+        drag_actions::COPY | drag_actions::MOVE | drag_actions::LINK
+    );
     // root can write anywhere: the rule is `access(W_OK)`, not the mode.
     let writable = rustix::fs::access(&ro, rustix::fs::Access::WRITE_OK).is_ok();
     let got = nitro_files::drag_actions_for(s, &[ro.join("f.txt")]);

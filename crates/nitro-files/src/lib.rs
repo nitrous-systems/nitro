@@ -1786,7 +1786,10 @@ fn start_file_drag(s: &mut Files, ui: &mut Ui<Files>, paths: &[PathBuf]) {
             let icon = s
                 .entries
                 .iter()
-                .find(|e| one.file_name().is_some_and(|n| n.to_string_lossy() == e.name))
+                .find(|e| {
+                    one.file_name()
+                        .is_some_and(|n| n.to_string_lossy() == e.name)
+                })
                 .map_or("file-earmark", |e| e.icon);
             (icon, short(one))
         }
@@ -1815,9 +1818,13 @@ fn start_file_drag(s: &mut Files, ui: &mut Ui<Files>, paths: &[PathBuf]) {
     };
     let n = paths.len();
     let dragged = paths.to_vec();
-    match ui.start_drag(nitro_ui::WindowId::MAIN, offer, move |s: &mut Files, ui, o| {
-        drag_finished(s, ui, &dragged, o);
-    }) {
+    match ui.start_drag(
+        nitro_ui::WindowId::MAIN,
+        offer,
+        move |s: &mut Files, ui, o| {
+            drag_finished(s, ui, &dragged, o);
+        },
+    ) {
         Ok(true) => {
             s.message = Some(if n == 1 {
                 "dragging 1 item".to_owned()

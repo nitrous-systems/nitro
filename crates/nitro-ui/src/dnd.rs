@@ -483,7 +483,12 @@ impl<S: 'static> Ui<S> {
     }
 
     /// `DragFinished`: release the offer with `FinishDrag`, then end.
-    pub(crate) fn drag_source_finished(&mut self, state: &mut S, accepted: bool, action: DragAction) {
+    pub(crate) fn drag_source_finished(
+        &mut self,
+        state: &mut S,
+        accepted: bool,
+        action: DragAction,
+    ) {
         // Always: the server keeps the drag (and its transfers) until the
         // source finishes, whatever this side remembers.
         if let Err(e) = self.wire_mut().send_now(&ClientMsg::FinishDrag(FinishDrag)) {

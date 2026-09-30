@@ -1371,7 +1371,12 @@ impl ClipboardPeer {
     ///
     /// # Panics
     /// On a wire failure or a timeout.
-    pub fn read_drag<S: 'static>(&mut self, h: &mut Harness<S>, request: u32, mime: &str) -> Vec<u8> {
+    pub fn read_drag<S: 'static>(
+        &mut self,
+        h: &mut Harness<S>,
+        request: u32,
+        mime: &str,
+    ) -> Vec<u8> {
         self.read_source(h, request, nitro_wire::types::DataSource::Drag, mime)
     }
 
