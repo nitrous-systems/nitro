@@ -1733,7 +1733,7 @@ byte-identical, other binaries byte-identical.
   |---|---|
   | `gpu_composite_us` (`Composite` → `Composited`) | avg 435 µs, max 1.0–1.7 ms |
   | `gpu_busy_us` over 10 s | 3.73 s for 601 frames (submit → fence seen in epoll, so it includes wakeup latency: an upper bound) |
-  | server CPU, 10 s | 66 ticks with the helper vs 44 with `gpu.helper = off` (same scene, mode 1 + CPU) |
+  | server CPU, 10 s | 66 ticks with the helper vs 44 with `gpu.helper = off` (same scene, mode 1 + CPU); 36–37 vs 39 since #3947, below |
   | helper idle | VmRSS 11 048 kB, RssAnon 1 260 kB, Pss 7 267 kB |
   | helper compositing | VmRSS 11 804 kB, Pss ~7.4 MB, `drm-total` ~1 MB |
   | server RssAnon, idle desktop | 10 464 kB (helper on) vs 10 468 kB (`off`): no change |
@@ -1755,7 +1755,35 @@ byte-identical, other binaries byte-identical.
   correct helper damage. Since #3945 a composite that rasterizes nothing
   counts as a 0 sample. Server CPU re-measured at 50 ticks/10 s (vs 44
   with `off`); perf puts the difference in syscall/epoll/allocation
-  churn, not raster. Follow-up: #3947.
+  churn, not raster. Fixed in #3947, next item.
+- **Per-frame syscalls (#3947).** Same scene on box1, `strace -c -f -p`
+  over 10 s (~600 frames), ticks from `/proc/PID/stat` utime+stime over
+  10 s **without** strace attached:
+
+  | | mode 2 before | mode 2 after | `off` before | `off` after |
+  |---|---|---|---|---|
+  | server ticks / 10 s | 48–49 | **36–37** | 41–44 | **39** |
+  | syscalls / 10 s | 34 738 | **12 692** | 21 517 | **7 372** |
+  | per frame | ~58 | **~21** | ~36 | **~12** |
+  | `epoll_ctl` | 20 434 | 1 201 | 13 206 | 0 |
+  | `recvmsg` (EAGAIN) | 3 606 (1 803) | 1 801 (0) | 2 402 (1 201) | 1 202 (0) |
+  | `timerfd_settime` | 1 202 | 39 | 0 | 0 |
+
+  What changed: every `settle` re-armed every wire client with an
+  unconditional `EPOLL_CTL_MOD`, so the modify now happens only when
+  `OUT` interest flips (wire and control clients); the helper timer is
+  re-set only when its deadline moves earlier (a spurious early fire is
+  a re-evaluation); a short `recvmsg` ends a read (epoll is
+  level-triggered), for wire clients and the helper socket; and
+  `plan_planes`/`gpu_inputs`/`paint_gpu` reuse scratch buffers instead of
+  allocating per plan. The epoll fix is not mode-2 specific, which is why
+  `off` improved too. Mode 2 is now at or below `off`.
+
+  Left on purpose, ~4 per frame: the fence dup (`fcntl`), its epoll
+  ADD/DEL and `close`. The release of a sampled buffer must wake when the
+  fence signals, and the `sync_file` itself goes to `IN_FENCE_FD`.
+  Also left: the DRM `read` until `EAGAIN` (inside the `drm` crate) and
+  the uevent `recvfrom` on each flip (1 each per frame).
 
 
 ## Client dma-bufs (#3918)
