@@ -478,7 +478,7 @@ fn mode_from_modeline(ml: &Modeline) -> Mode {
     // zero-initialised array above.
     let text = format!("{}x{}", ml.hdisplay, ml.vdisplay);
     for (dst, b) in raw.name.iter_mut().zip(text.bytes()).take(31) {
-        *dst = b.cast_signed();
+        *dst = core::ffi::c_char::from_ne_bytes([b]);
     }
     Mode::from(raw)
 }

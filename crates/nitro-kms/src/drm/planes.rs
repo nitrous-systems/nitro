@@ -65,7 +65,7 @@ fn raw_prop(card: &Card<'_>, id: property::Handle) -> Option<RawProp> {
             let bytes: Vec<u8> = e
                 .name
                 .iter()
-                .map(|&c| c.cast_unsigned())
+                .map(|&c| c.to_ne_bytes()[0])
                 .take_while(|&b| b != 0)
                 .collect();
             (e.value, String::from_utf8_lossy(&bytes).into_owned())
