@@ -71,7 +71,7 @@
 //! | [`picker`] | `FilePicker`: the file / folder dialog, a second window laid out like `nitro-files` |
 //! | [`split`] | the split-view blueprint: `SidebarRow`, `Card`, `CardRow`, `Pages`, `Switch`, `split_view` |
 //! | [`clipboard`] | the system clipboard: copy, serve, paste |
-//! | [`dnd`] | drag and drop: drop targets |
+//! | [`dnd`] | drag and drop: drop targets and drag sources |
 //! | [`build`] | the builder traits |
 //! | [`layout`] | the flex model, as pure functions |
 //! | [`event`] | [`Event`], [`Handled`] and the key/button codes |

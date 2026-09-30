@@ -1141,3 +1141,126 @@ fn a_shift_left_over_from_before_a_blur_does_not_extend() {
     h.key_up(key::LEFT_SHIFT);
     assert_eq!(sel(&h, id), vec![5]);
 }
+
+// -- dragging rows (`on_drag`) -------------------------------------------
+
+/// What a draggable list's callbacks saw.
+#[derive(Default)]
+struct DragLog {
+    activated: Vec<usize>,
+    drags: Vec<Vec<usize>>,
+}
+
+/// A draggable list of `n` rows filling a 240×300 window.
+fn drag_list(n: usize) -> (Harness<DragLog>, WidgetId) {
+    let mut h = Harness::sized(
+        "list-drag",
+        DragLog::default(),
+        Size::new(240.0, 300.0),
+        |ui: &mut Ui<DragLog>| {
+            ui.build(
+                list()
+                    .rows(rows(n))
+                    .on_activate(|s: &mut DragLog, _ui: &mut Ui<DragLog>, i: usize| {
+                        s.activated.push(i);
+                    })
+                    .on_drag(|s: &mut DragLog, _ui: &mut Ui<DragLog>, sel: &[usize]| {
+                        s.drags.push(sel.to_vec());
+                    })
+                    .grow(1.0)
+                    .width_percent(1.0)
+                    .height_percent(1.0),
+            )
+        },
+    );
+    h.settle();
+    let id = h.ui().root().unwrap();
+    (h, id)
+}
+
+/// The middle of row `row`, in window coordinates.
+fn row_point(h: &mut Harness<DragLog>, id: WidgetId, row: usize) -> nitro_core::Point {
+    let b = h.bounds(id);
+    let row_h = h.widget::<List<DragLog>>(id).row_height();
+    nitro_core::Point::new(b.x + 40.0, b.y + (row as f32 + 0.5) * row_h)
+}
+
+fn drag_sel(h: &Harness<DragLog>, id: WidgetId) -> Vec<usize> {
+    h.widget::<List<DragLog>>(id).selection()
+}
+
+#[test]
+fn a_press_dragged_past_the_threshold_calls_on_drag_with_the_selection() {
+    let (mut h, id) = drag_list(20);
+    let p = row_point(&mut h, id, 3);
+    h.move_pointer(p);
+    h.press(nitro_ui::event::button::LEFT);
+    assert_eq!(drag_sel(&h, id), vec![3], "the press selected the row");
+    // Under the threshold: nothing yet.
+    h.move_pointer(nitro_core::Point::new(p.x + 2.0, p.y + 2.0));
+    assert!(h.state().drags.is_empty());
+    // Past it, and further: once per press.
+    h.move_pointer(nitro_core::Point::new(p.x + 20.0, p.y + 30.0));
+    h.move_pointer(nitro_core::Point::new(p.x + 40.0, p.y + 60.0));
+    h.release(nitro_ui::event::button::LEFT);
+    assert_eq!(h.state().drags, vec![vec![3]]);
+    assert!(h.state().activated.is_empty());
+}
+
+#[test]
+fn a_whole_multi_selection_is_dragged_from_any_of_its_rows() {
+    let (mut h, id) = drag_list(20);
+    let (p2, p5) = (row_point(&mut h, id, 2), row_point(&mut h, id, 5));
+    h.click_at(p2);
+    h.key_down(key::LEFT_SHIFT);
+    h.click_at(p5);
+    h.key_up(key::LEFT_SHIFT);
+    assert_eq!(drag_sel(&h, id), vec![2, 3, 4, 5]);
+    let p4 = row_point(&mut h, id, 4);
+    h.move_pointer(p4);
+    h.press(nitro_ui::event::button::LEFT);
+    assert_eq!(drag_sel(&h, id), vec![2, 3, 4, 5], "the press kept it");
+    h.move_pointer(nitro_core::Point::new(p4.x + 30.0, p4.y));
+    h.release(nitro_ui::event::button::LEFT);
+    assert_eq!(h.state().drags, vec![vec![2, 3, 4, 5]]);
+    assert_eq!(
+        drag_sel(&h, id),
+        vec![2, 3, 4, 5],
+        "a drag does not collapse the selection"
+    );
+}
+
+#[test]
+fn a_click_on_a_row_of_a_multi_selection_still_collapses_it_on_release() {
+    let (mut h, id) = drag_list(20);
+    let (p2, p5) = (row_point(&mut h, id, 2), row_point(&mut h, id, 5));
+    h.click_at(p2);
+    h.key_down(key::LEFT_SHIFT);
+    h.click_at(p5);
+    h.key_up(key::LEFT_SHIFT);
+    let p3 = row_point(&mut h, id, 3);
+    h.move_pointer(p3);
+    h.press(nitro_ui::event::button::LEFT);
+    assert_eq!(drag_sel(&h, id), vec![2, 3, 4, 5]);
+    h.release(nitro_ui::event::button::LEFT);
+    assert_eq!(drag_sel(&h, id), vec![3]);
+    assert!(h.state().drags.is_empty());
+    assert!(h.state().activated.is_empty());
+    // And the double-click still activates.
+    h.click_at(p3);
+    assert_eq!(h.state().activated, vec![3]);
+}
+
+#[test]
+fn a_modified_press_never_starts_a_drag() {
+    let (mut h, id) = drag_list(20);
+    let p = row_point(&mut h, id, 1);
+    h.move_pointer(p);
+    h.key_down(key::LEFT_CTRL);
+    h.press(nitro_ui::event::button::LEFT);
+    h.move_pointer(nitro_core::Point::new(p.x + 40.0, p.y + 40.0));
+    h.release(nitro_ui::event::button::LEFT);
+    h.key_up(key::LEFT_CTRL);
+    assert!(h.state().drags.is_empty());
+    assert_eq!(drag_sel(&h, id), vec![1], "Ctrl-click toggled it on");
+}

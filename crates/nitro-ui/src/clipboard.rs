@@ -156,7 +156,7 @@ fn read_some(fd: &OwnedFd, buf: &mut Vec<u8>) -> Progress {
 
 /// Keep only MIME types the server accepts (non-empty, ASCII, short),
 /// first occurrence wins.
-fn clean_items(items: Vec<(String, Vec<u8>)>) -> Vec<(String, Vec<u8>)> {
+pub(crate) fn clean_items(items: Vec<(String, Vec<u8>)>) -> Vec<(String, Vec<u8>)> {
     let mut out: Vec<(String, Vec<u8>)> = Vec::with_capacity(items.len());
     for (mime, bytes) in items {
         let ok = !mime.is_empty() && mime.len() <= 255 && mime.is_ascii();
@@ -354,7 +354,9 @@ impl<S: 'static> Ui<S> {
                 .find(|(m, _)| *m == r.mime)
                 .map_or(&[], |(_, b)| b.as_slice())
         } else {
-            &[]
+            // A drop target reading our drag (`crate::dnd`); empty once
+            // it has finished.
+            self.drag_bytes(&r.mime)
         };
         // A zero-length memfd is at EOF: "cannot serve that".
         let fd = match nitro_shm::memfd_sealed_readonly("nitro-ui-clipboard", bytes) {

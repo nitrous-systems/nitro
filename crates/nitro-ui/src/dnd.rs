@@ -1,4 +1,4 @@
-//! Drag and drop, as a **drop target**.
+//! Drag and drop: as a **drop target**, and as a **drag source**.
 //!
 //! The server (M5-I, `caps::DATA`) routes a drag to the window under the
 //! pointer: `DragEnter`, `DragMotion`s, then `DragLeave` or `DragDrop`.
@@ -31,16 +31,98 @@
 //!
 //! `FinishDrag` is sent exactly once per drop, whatever happened — data,
 //! no data, a timeout, a target widget destroyed meanwhile — because the
-//! source waits on it. There is no source-side API yet.
+//! source waits on it.
+//!
+//! # As a source
+//!
+//! [`Ui::start_drag`] offers `(mime, bytes)` pairs, like
+//! [`Ui::set_clipboard`](crate::Ui::set_clipboard). Call it from a
+//! widget's `PointerMove` while it holds the pointer capture, once the
+//! pointer has travelled [`DRAG_THRESHOLD`] from the press (a [`List`]
+//! with [`on_drag`](crate::list::ListBuilder::on_drag) does all of that).
+//! The toolkit then:
+//!
+//! - queues `SetDragIconOffset` and `StartDrag` behind the icon window's
+//!   `CreateWindow` and first paint, so all of it lands in one commit;
+//! - serves `SelectionRequest { source: Drag }` from the offered bytes in
+//!   sealed memfds, exactly as the clipboard serves;
+//! - on `DragFinished`, answers `FinishDrag`, destroys the icon window,
+//!   forgets the bytes and runs the `on_finished` callback (deferred)
+//!   with the [`DragOutcome`].
+//!
+//! When the server takes the drag the source window gets a
+//! `PointerLeave` and **never the release**: the capture is dropped and
+//! the pressed widget sees `PointerLeave` with
+//! [`EventCx::is_captured`](crate::EventCx::is_captured) false. The server
+//! ignores a `StartDrag` silently (no button down any more, no pointer
+//! focus, another drag running); the toolkit notices from the release
+//! that does reach the window and finishes the drag as rejected, so an
+//! app is never left waiting.
+//!
+//! [`List`]: crate::List
 
-use nitro_core::Point;
-use nitro_wire::msg::{AcceptDrop, ClientMsg, FinishDrag, ServerMsg};
-use nitro_wire::types::{DataSource, NodeId};
+use nitro_core::{Point, Size};
+use nitro_wire::msg::{AcceptDrop, ClientMsg, FinishDrag, ServerMsg, StartDrag};
+use nitro_wire::types::{DataSource, Layer, NodeId, window_flags};
 
 pub use nitro_wire::types::{DragAction, drag_actions};
 
 use crate::arena::WidgetId;
+use crate::error::Error;
 use crate::ui::{Ui, WindowId};
+
+/// How far, in logical pixels, the pointer has to travel from a press
+/// before the press becomes a drag. Below it, it is a click.
+pub const DRAG_THRESHOLD: f32 = 6.0;
+
+/// What a drag started with [`Ui::start_drag`] offers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DragSource {
+    /// `(mime, bytes)` pairs, most preferred first. Cleaned as the
+    /// clipboard's are: empty, non-ASCII and repeated types are dropped.
+    pub items: Vec<(String, Vec<u8>)>,
+    /// Offered actions, a [`drag_actions`] bitmask.
+    pub actions: u32,
+    /// What to draw under the pointer, if anything.
+    pub icon: Option<DragIcon>,
+}
+
+/// A drag icon: a widget tree shown in its own undecorated, unfocusable
+/// window under the pointer for the length of the drag.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DragIcon {
+    /// The tree's root; built and not attached anywhere. The icon window
+    /// owns it and destroys it with itself when the drag ends.
+    pub root: WidgetId,
+    /// The window's size, or `None` for the root's measured size.
+    pub size: Option<Size>,
+    /// The icon's top-left relative to the pointer, usually negative.
+    pub offset: Point,
+}
+
+/// How a drag this app started ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DragOutcome {
+    /// Whether a target took the offer.
+    pub accepted: bool,
+    /// What the target did with it; [`DragAction::None`] when rejected,
+    /// cancelled or refused.
+    pub action: DragAction,
+}
+
+type FinishedFn<S> = Box<dyn FnOnce(&mut S, &mut Ui<S>, DragOutcome)>;
+
+/// A drag this app is the source of, from `start_drag` to `DragFinished`.
+pub(crate) struct Source<S> {
+    /// The window the drag starts from.
+    from: WindowId,
+    /// The server took it: `from` got its `PointerLeave`.
+    active: bool,
+    /// What `SelectionRequest { source: Drag }` is answered from.
+    served: Vec<(String, Vec<u8>)>,
+    icon: Option<WindowId>,
+    on_finished: Option<FinishedFn<S>>,
+}
 
 /// What a drag over one of our windows carries.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -288,6 +370,138 @@ impl<S: 'static> Ui<S> {
     fn dnd_finish(&mut self) {
         if let Err(e) = self.wire_mut().send_now(&ClientMsg::FinishDrag(FinishDrag)) {
             eprintln!("nitro-ui: finish drag: {e}");
+        }
+    }
+
+    // -- the source side ---------------------------------------------
+
+    /// Whether [`Ui::start_drag`] can start one now: the server has
+    /// `DATA` (not a remote link, not an old server) and no drag of this
+    /// app is in flight.
+    #[must_use]
+    pub fn can_drag(&self) -> bool {
+        self.has_clipboard() && self.drag_source.is_none()
+    }
+
+    /// Whether a drag this app started has yet to finish.
+    #[must_use]
+    pub fn drag_in_flight(&self) -> bool {
+        self.drag_source.is_some()
+    }
+
+    /// Start dragging `offer` out of window `from`; see the module docs.
+    ///
+    /// Answers `Ok(false)`, sending nothing, without `DATA`, while a drag
+    /// is in flight, with nothing offered, or when `from` holds no
+    /// pointer capture (no button is down on it, so the server would
+    /// ignore the request). Otherwise `on_finished` runs exactly once,
+    /// later, with how it ended — rejected too, when the server turned
+    /// the request down.
+    ///
+    /// # Errors
+    /// A wire failure, or [`Ui::add_window`]'s errors for the icon root.
+    pub fn start_drag(
+        &mut self,
+        from: WindowId,
+        offer: DragSource,
+        on_finished: impl FnOnce(&mut S, &mut Ui<S>, DragOutcome) + 'static,
+    ) -> Result<bool, Error> {
+        if !self.can_drag() || !self.window_captured(from) {
+            return Ok(false);
+        }
+        let items = crate::clipboard::clean_items(offer.items);
+        let actions = offer.actions & drag_actions::ALL;
+        if items.is_empty() || actions == 0 {
+            return Ok(false);
+        }
+        let mimes: Vec<String> = items.iter().map(|(m, _)| m.clone()).collect();
+        let icon = match offer.icon {
+            Some(i) => {
+                let surface = crate::shell::Surface {
+                    layer: Layer::Normal,
+                    flags: window_flags::UNDECORATED | window_flags::NO_FOCUS,
+                    anchor: None,
+                    zone: None,
+                };
+                let win = self.add_window_with("drag", i.size, i.root, Some(surface))?;
+                self.wire_mut().set_drag_icon_offset(win.raw(), i.offset)?;
+                Some(win)
+            }
+            None => None,
+        };
+        self.wire_mut().start_drag(StartDrag {
+            window: from.raw(),
+            icon: icon.map_or(NodeId::NONE, WindowId::raw),
+            actions,
+            mimes,
+        })?;
+        self.drag_source = Some(Source {
+            from,
+            active: false,
+            served: items,
+            icon,
+            on_finished: Some(Box::new(on_finished)),
+        });
+        Ok(true)
+    }
+
+    /// The bytes a drag of ours serves in `mime`; empty for none.
+    pub(crate) fn drag_bytes(&self, mime: &str) -> &[u8] {
+        self.drag_source
+            .as_ref()
+            .and_then(|d| d.served.iter().find(|(m, _)| m == mime))
+            .map_or(&[], |(_, b)| b.as_slice())
+    }
+
+    /// `win` lost the pointer: if our drag starts there, the server took it.
+    pub(crate) fn drag_source_left(&mut self, win: WindowId) {
+        if let Some(d) = self.drag_source.as_mut()
+            && d.from == win
+        {
+            d.active = true;
+        }
+    }
+
+    /// A release reached `win`. If our drag starts there and the server
+    /// never took it, it ignored the `StartDrag`: end it as rejected.
+    pub(crate) fn drag_source_released(&mut self, state: &mut S, win: WindowId) {
+        if self
+            .drag_source
+            .as_ref()
+            .is_some_and(|d| d.from == win && !d.active)
+        {
+            self.drag_source_end(
+                state,
+                DragOutcome {
+                    accepted: false,
+                    action: DragAction::None,
+                },
+            );
+        }
+    }
+
+    /// `DragFinished`: release the offer with `FinishDrag`, then end.
+    pub(crate) fn drag_source_finished(&mut self, state: &mut S, accepted: bool, action: DragAction) {
+        // Always: the server keeps the drag (and its transfers) until the
+        // source finishes, whatever this side remembers.
+        if let Err(e) = self.wire_mut().send_now(&ClientMsg::FinishDrag(FinishDrag)) {
+            eprintln!("nitro-ui: finish drag: {e}");
+        }
+        self.drag_source_end(state, DragOutcome { accepted, action });
+    }
+
+    fn drag_source_end(&mut self, state: &mut S, outcome: DragOutcome) {
+        let Some(mut d) = self.drag_source.take() else {
+            return;
+        };
+        if let Some(icon) = d.icon
+            && self.has_window(icon)
+            && let Err(e) = self.remove_window(state, icon)
+        {
+            eprintln!("nitro-ui: drag icon: {e}");
+        }
+        if let Some(cb) = d.on_finished.take() {
+            self.defer(move |s, ui| cb(s, ui, outcome));
         }
     }
 }

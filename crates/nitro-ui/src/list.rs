@@ -266,6 +266,18 @@ struct RowCache {
 }
 
 type IndexFn<S> = Box<dyn Fn(&mut S, &mut Ui<S>, usize)>;
+type DragFn<S> = Box<dyn Fn(&mut S, &mut Ui<S>, &[usize])>;
+
+/// A plain left press that may still become a drag (`on_drag`).
+#[derive(Debug, Clone, Copy)]
+struct Press {
+    /// Where it went down, in the list's own space.
+    at: nitro_core::Point,
+    /// A press on a row already in a multi-selection keeps the selection
+    /// so the whole of it can be dragged; this is the row the selection
+    /// collapses to if the press turns out to be a click.
+    collapse: Option<usize>,
+}
 
 /// A virtualised list of [`Row`]s.
 ///
@@ -343,6 +355,11 @@ pub struct List<S> {
     /// selection changes (Shift-extend, Ctrl-Space toggle, a click that
     /// collapses a multi-selection).
     on_select: Option<IndexFn<S>>,
+    /// Invoked with the selection when a press on a row is dragged past
+    /// [`DRAG_THRESHOLD`](crate::dnd::DRAG_THRESHOLD).
+    on_drag: Option<DragFn<S>>,
+    /// The press that may become a drag; only with `on_drag`.
+    press: Option<Press>,
 }
 
 impl<S> std::fmt::Debug for List<S> {
@@ -382,6 +399,8 @@ impl<S: 'static> Default for List<S> {
             painted_with: None,
             on_activate: None,
             on_select: None,
+            on_drag: None,
+            press: None,
         }
     }
 }
@@ -740,10 +759,49 @@ impl<S: 'static> List<S> {
                 .last_click
                 .is_some_and(|(r, at)| r == row && now.duration_since(at) < DOUBLE_CLICK);
         self.last_click = if plain { Some((row, now)) } else { None };
+        // With `on_drag`, a plain press may start a drag. On a row that
+        // is already part of a multi-selection the selection is kept so
+        // all of it can be dragged, and collapses on the release instead
+        // if it was a click after all.
+        let armed = plain && self.on_drag.is_some();
+        let keep = armed && !double && self.selected.len() > 1 && self.selected.contains(&row);
+        self.press = armed.then_some(Press {
+            at: pos,
+            collapse: keep.then_some(row),
+        });
+        if keep {
+            if self.cursor != row {
+                self.cursor = row;
+                cx.request_paint();
+            }
+            return Handled::Yes;
+        }
         self.pick(cx, row, how);
         if double {
             self.fire_activate(cx, row);
         }
+        Handled::Yes
+    }
+}
+
+impl<S: 'static> List<S> {
+    /// A captured move with a press armed: past the threshold it is a
+    /// drag, and `on_drag` gets the selection, once per press.
+    fn maybe_drag(&mut self, cx: &mut EventCx<'_, S>, pos: nitro_core::Point) -> Handled {
+        let Some(p) = self.press else {
+            return Handled::No;
+        };
+        let (dx, dy) = (pos.x - p.at.x, pos.y - p.at.y);
+        if dx.hypot(dy) < crate::dnd::DRAG_THRESHOLD {
+            return Handled::Yes;
+        }
+        self.press = None;
+        let Some(cb) = self.on_drag.take() else {
+            return Handled::Yes;
+        };
+        let selection = self.selection();
+        cb(cx.state, cx.ui, &selection);
+        self.on_drag = Some(cb);
         Handled::Yes
     }
 }
@@ -1044,6 +1102,26 @@ impl<S: 'static> Widget<S> for List<S> {
             Event::KeyDown(k) => self.key(cx, k),
             Event::Text { text } => Handled::from(self.type_ahead(cx, text)),
             Event::PointerDown { pos, button } if *button == button::LEFT => self.press(cx, *pos),
+            Event::PointerMove { pos } if self.press.is_some() && cx.is_captured() => {
+                self.maybe_drag(cx, *pos)
+            }
+            Event::PointerUp { button, .. } if *button == button::LEFT => {
+                if let Some(Press {
+                    collapse: Some(row),
+                    ..
+                }) = self.press.take()
+                {
+                    self.pick(cx, row, Pick::Replace);
+                }
+                Handled::No
+            }
+            // Mid-capture a leave is only the pointer going outside the
+            // list, which a drag does; without the capture the press is
+            // over (the server took the pointer, for a drag or anything).
+            Event::PointerLeave if !cx.is_captured() => {
+                self.press = None;
+                Handled::No
+            }
             Event::FocusChanged { .. } => {
                 // The selection is drawn the same focused or not — a
                 // list that lost its highlight when the window lost
@@ -1234,6 +1312,11 @@ impl<S: 'static> WidgetMut<'_, List<S>, S> {
         self.on_select = Some(Box::new(f));
     }
 
+    /// Replace the drag callback; see [`ListBuilder::on_drag`].
+    pub fn set_on_drag(&mut self, f: impl Fn(&mut S, &mut Ui<S>, &[usize]) + 'static) {
+        self.on_drag = Some(Box::new(f));
+    }
+
     /// How many rows one wheel notch scrolls.
     pub fn set_speed(&mut self, rows: f32) {
         self.speed = rows;
@@ -1273,6 +1356,22 @@ impl<S: 'static> ListBuilder<S> {
     #[must_use]
     pub fn on_select(mut self, f: impl Fn(&mut S, &mut Ui<S>, usize) + 'static) -> Self {
         self.list.on_select = Some(Box::new(f));
+        self
+    }
+
+    /// Make rows draggable: a plain press on a row moved past
+    /// [`DRAG_THRESHOLD`](crate::dnd::DRAG_THRESHOLD) while the button is
+    /// down calls `f` with the selected indices (ascending), once per
+    /// press. `f` starts the drag with [`Ui::start_drag`] — synchronously
+    /// or deferred, the button is still down either way.
+    ///
+    /// With it set, a plain press on a row already in a multi-selection
+    /// keeps the selection (so it can all be dragged) and collapses it to
+    /// that row on the release, if no drag started. Ctrl- and
+    /// Shift-clicks never start one.
+    #[must_use]
+    pub fn on_drag(mut self, f: impl Fn(&mut S, &mut Ui<S>, &[usize]) + 'static) -> Self {
+        self.list.on_drag = Some(Box::new(f));
         self
     }
 

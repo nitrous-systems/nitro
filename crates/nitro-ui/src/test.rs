@@ -1363,8 +1363,138 @@ impl ClipboardPeer {
     /// # Panics
     /// On a wire failure or a timeout.
     pub fn paste<S: 'static>(&mut self, h: &mut Harness<S>, request: u32, mime: &str) -> Vec<u8> {
+        self.read_source(h, request, nitro_wire::types::DataSource::Clipboard, mime)
+    }
+
+    /// Read the drag offer over this peer's target window in `mime`, to
+    /// EOF — as a drop target does after `DragDrop`.
+    ///
+    /// # Panics
+    /// On a wire failure or a timeout.
+    pub fn read_drag<S: 'static>(&mut self, h: &mut Harness<S>, request: u32, mime: &str) -> Vec<u8> {
+        self.read_source(h, request, nitro_wire::types::DataSource::Drag, mime)
+    }
+
+    /// Open a small undecorated window to drop on, at `DRAG_WINDOW`
+    /// size; returns its node id and where the server put it.
+    ///
+    /// # Panics
+    /// On a wire failure or a timeout.
+    pub fn target_window<S: 'static>(
+        &mut self,
+        h: &mut Harness<S>,
+    ) -> (nitro_wire::types::NodeId, Rect) {
+        use nitro_wire::types::{Layer, NodeId, window_flags};
+        let root = NodeId(20);
+        let rect = NodeId(21);
+        self.serial += 1;
         self.conn
-            .request_selection(request, nitro_wire::types::DataSource::Clipboard, mime)
+            .tx()
+            .create_window_with(
+                root,
+                "drop target",
+                DRAG_WINDOW,
+                Layer::Normal,
+                window_flags::UNDECORATED,
+            )
+            .create_rect(
+                rect,
+                root,
+                Rect::new(0.0, 0.0, DRAG_WINDOW.w, DRAG_WINDOW.h),
+            )
+            // lint-colors: allow — a test peer's window, painted only so a drag can be over it.
+            .fill_solid(rect, nitro_core::Color::rgb(0x40, 0x40, 0x40))
+            .commit(self.serial)
+            .expect("commit");
+        self.conn.flush().expect("flush");
+        let pos = self.take(
+            h,
+            "Configure",
+            |m| matches!(m, nitro_wire::msg::ServerMsg::Configure(c) if c.window == root),
+            |m| match m {
+                nitro_wire::msg::ServerMsg::Configure(c) => c.position,
+                _ => unreachable!(),
+            },
+        );
+        (root, Rect::new(pos.x, pos.y, DRAG_WINDOW.w, DRAG_WINDOW.h))
+    }
+
+    /// Wait for a `DragEnter` on this peer's window: `(mimes, actions)`.
+    ///
+    /// # Panics
+    /// On a timeout.
+    pub fn drag_entered<S: 'static>(&mut self, h: &mut Harness<S>) -> (Vec<String>, u32) {
+        self.take(
+            h,
+            "DragEnter",
+            |m| matches!(m, nitro_wire::msg::ServerMsg::DragEnter(_)),
+            |m| match m {
+                nitro_wire::msg::ServerMsg::DragEnter(e) => (e.mimes, e.actions),
+                _ => unreachable!(),
+            },
+        )
+    }
+
+    /// Say what this peer, as a drop target, would do with the offer.
+    ///
+    /// # Panics
+    /// On a wire failure.
+    pub fn accept_drop<S: 'static>(
+        &mut self,
+        h: &mut Harness<S>,
+        action: nitro_wire::types::DragAction,
+        mime: &str,
+    ) {
+        self.conn.accept_drop(action, mime).expect("accept drop");
+        self.conn.flush().expect("flush");
+        h.settle();
+    }
+
+    /// Wait for the `DragDrop` on this peer's window.
+    ///
+    /// # Panics
+    /// On a timeout.
+    pub fn dropped<S: 'static>(&mut self, h: &mut Harness<S>) {
+        self.take(
+            h,
+            "DragDrop",
+            |m| matches!(m, nitro_wire::msg::ServerMsg::DragDrop(_)),
+            |_| (),
+        );
+    }
+
+    /// Whether a `DragLeave` has arrived (waiting for it).
+    ///
+    /// # Panics
+    /// On a timeout.
+    pub fn drag_left<S: 'static>(&mut self, h: &mut Harness<S>) {
+        self.take(
+            h,
+            "DragLeave",
+            |m| matches!(m, nitro_wire::msg::ServerMsg::DragLeave(_)),
+            |_| (),
+        );
+    }
+
+    /// As a drop target, finish the drop with `FinishDrag`.
+    ///
+    /// # Panics
+    /// On a wire failure.
+    pub fn finish_drop<S: 'static>(&mut self, h: &mut Harness<S>) {
+        self.conn.finish_drag().expect("finish drag");
+        self.conn.flush().expect("flush");
+        h.settle();
+    }
+
+    fn read_source<S: 'static>(
+        &mut self,
+        h: &mut Harness<S>,
+        request: u32,
+        source: nitro_wire::types::DataSource,
+        mime: &str,
+    ) -> Vec<u8> {
+        self.conn
+            .request_selection(request, source, mime)
             .expect("request selection");
         self.conn.flush().expect("flush");
         let fd = self.take(

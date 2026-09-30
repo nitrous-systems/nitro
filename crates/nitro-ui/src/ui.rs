@@ -408,6 +408,8 @@ pub struct Ui<S> {
     pub(crate) clipboard: crate::clipboard::Clipboard<S>,
     /// Drag-and-drop as a drop target; see [`crate::dnd`].
     pub(crate) dnd: crate::dnd::Dnd,
+    /// The drag this app is the source of; see [`crate::dnd`].
+    pub(crate) drag_source: Option<crate::dnd::Source<S>>,
 }
 
 /// A shell-event handler; see [`Ui::on_shell`].
@@ -516,6 +518,7 @@ impl<S: 'static> Ui<S> {
             window_state_handlers: Vec::new(),
             clipboard: crate::clipboard::Clipboard::new(),
             dnd: crate::dnd::Dnd::default(),
+            drag_source: None,
         }
     }
 
@@ -895,7 +898,7 @@ impl<S: 'static> Ui<S> {
         Ok(id)
     }
 
-    fn add_window_with(
+    pub(crate) fn add_window_with(
         &mut self,
         title: &str,
         size: Option<Size>,
@@ -3251,6 +3254,8 @@ impl<S: 'static> Ui<S> {
             | ServerMsg::DragMotion(_)
             | ServerMsg::DragLeave(_)
             | ServerMsg::DragDrop(_) => self.dnd_msg(state, msg),
+            // ... and as its source.
+            ServerMsg::DragFinished(f) => self.drag_source_finished(state, f.accepted, f.action),
             _ => {}
         }
     }
@@ -3617,6 +3622,10 @@ impl<S: 'static> Ui<S> {
         w.capture = None;
         w.last_pos = None;
         w.chain.clear();
+        self.drag_source_left(win);
+        let Some(w) = self.win_mut(win) else {
+            return;
+        };
         let old = std::mem::take(&mut w.hover_chain);
         for id in old.iter().rev() {
             self.set_hovered(*id, false);
@@ -3639,6 +3648,10 @@ impl<S: 'static> Ui<S> {
     /// Route a button press or release to one window's captured chain,
     /// or to its hovered chain when nothing is captured.
     fn pointer_button_in(&mut self, state: &mut S, win: WindowId, button: u32, pressed: bool) {
+        if !pressed {
+            // A drag we asked for from here that the server never took.
+            self.drag_source_released(state, win);
+        }
         let Some(w) = self.win(win) else {
             return;
         };
@@ -4112,6 +4125,11 @@ impl<S: 'static> Ui<S> {
         };
         self.untake(id, widget);
         Some(out)
+    }
+
+    /// Whether a press in `win` holds the pointer capture.
+    pub(crate) fn window_captured(&self, win: WindowId) -> bool {
+        self.win(win).is_some_and(|w| w.capture.is_some())
     }
 
     /// Whether `id` names a living widget.

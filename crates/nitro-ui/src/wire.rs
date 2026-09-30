@@ -449,6 +449,26 @@ impl Wire {
         )
     }
 
+    /// Start a drag (needs `caps::DATA`). Buffered to the commit, so the
+    /// icon window created in the same batch exists when it applies.
+    pub(crate) fn start_drag(&mut self, drag: msg::StartDrag) -> Result<(), Error> {
+        let node = drag.window;
+        self.send(&ClientMsg::StartDrag(drag), node)
+    }
+
+    /// Where a drag icon sits relative to the pointer. Buffered to the
+    /// commit, as `start_drag` is.
+    pub(crate) fn set_drag_icon_offset(
+        &mut self,
+        icon: NodeId,
+        offset: nitro_core::Point,
+    ) -> Result<(), Error> {
+        self.send(
+            &ClientMsg::SetDragIconOffset(msg::SetDragIconOffset { icon, offset }),
+            icon,
+        )
+    }
+
     /// Reserve `px` logical pixels along `edge` of the window's output
     /// (needs `caps::SHELL`). Buffered to the commit, as `set_anchor` is.
     pub(crate) fn set_exclusive_zone(
