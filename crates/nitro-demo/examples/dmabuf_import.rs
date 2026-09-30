@@ -234,7 +234,14 @@ fn open_card() -> Res<(Card, String)> {
             .write(true)
             .open(&path)
         {
-            Ok(f) => return Ok((Card(f), path)),
+            Ok(f) => {
+                // Skip render-only cards (Pi 5: card0 is v3d, no dumb buffers).
+                let card = Card(f);
+                match drm::Device::get_driver_capability(&card, drm::DriverCapability::DumbBuffer) {
+                    Ok(v) if v != 0 => return Ok((card, path)),
+                    _ => last = Some(format!("{path}: no dumb buffers")),
+                }
+            }
             Err(e) => last = Some(format!("{path}: {e}")),
         }
     }

@@ -161,6 +161,44 @@ Rules for this box:
   and `box-session` work over ssh as the same user while he is logged in.
 - `/sys/kernel/debug` needs sudo: `sudo cat /sys/kernel/debug/dri/1/i915_display_info`.
 
+## testbox3: Raspberry Pi 500 (BCM2712), `testhost3`
+
+`ssh testhost3` (user kaspar, uid 1001, passwordless sudo; host name
+`max`). An ARM box with a render-only GPU and a separate display
+controller (#4000).
+
+| | |
+|---|---|
+| OS / kernel | Raspberry Pi OS bookworm, **armhf (32-bit) userland** on an aarch64 kernel 6.12.62+rpt-rpi-v8 (`getconf LONG_BIT` = 32) |
+| RAM | 8 GB |
+| GPU | V3D 7.1 (`v3d`): `card0` and `renderD128`. Vulkan: Mesa 24.2.8 v3dv, API 1.2.289, manifest `broadcom_icd.armv8l.json` |
+| Display | `card1` = `vc4-drm`; HDMI-A-2 connected 1920×1080@60 |
+| Seat | the `nitro-dev` unit on tty2 (profile `unit`, like box1); `/dev/udmabuf` is root:kvm 0660, so the GPU shadow uses staging |
+| Tools | `kmsprint`, `vulkaninfo`; no cargo |
+
+The binaries are cross-built on the dev machine. **`just deploy` builds
+x86, so do not use it here.**
+
+```console
+$ source tmp/xarm/env.sh     # clang + lld against tmp/pi-sysroot
+$ cargo build --release --target armv7-unknown-linux-gnueabihf --workspace --bins
+$ cd target/xarm/armv7-unknown-linux-gnueabihf/release && rsync -az nitro-server nitro-gpu-vulkan nitro-session nitro-shot nitro-bar nitro-launcher nitro-wallpaper testhost3:nitro-bin/
+$ just box=testhost3 box-restart; just box=testhost3 box-log; just box=testhost3 shot
+```
+
+`tmp/xarm` and `tmp/pi-sysroot` are untracked scratch. To recreate the
+sysroot, rsync `/usr/include`, `/usr/lib/arm-linux-gnueabihf`,
+`/usr/lib/gcc`, `/usr/lib/linux` and `/usr/share/pkgconfig` from the Pi,
+then make the absolute symlinks relative.
+
+GPU pixel tests: there is no cargo on the box. Run
+`cargo test --release --target armv7-unknown-linux-gnueabihf -p nitro-gpu-vulkan --no-run`,
+then copy the `pixels-*` binary over. Put `nitro-gpu-vulkan` at the same
+absolute path as on the dev machine
+(`…/target/xarm/armv7-unknown-linux-gnueabihf/release/`), because the
+test spawns `CARGO_BIN_EXE_nitro-gpu-vulkan`. Then run it with
+`NITRO_GPU_TEST=require … --include-ignored --test-threads=1`.
+
 ## The deployed set is two directories, not one
 
 `just deploy` writes **`~/nitro-bin/`** and

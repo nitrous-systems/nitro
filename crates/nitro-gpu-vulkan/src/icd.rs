@@ -5,7 +5,9 @@
 //! against 8.7–10.9 MB with the vendor ICD alone. So the helper finds the
 //! render node's kernel driver in sysfs, maps it to that vendor's ICD
 //! manifests, and points the loader at exactly one (`VK_DRIVER_FILES`)
-//! before loading it. llvmpipe (`lvp`) is never a candidate.
+//! before loading it. llvmpipe (`lvp`) is never a candidate. Debian
+//! installs multiarch-suffixed manifests (`broadcom_icd.armv8l.json`,
+//! `intel_icd.x86_64.json`); those match too, the helper's own arch first.
 
 use std::path::{Path, PathBuf};
 
@@ -53,14 +55,86 @@ pub fn search_dirs(xdg_data_dirs: Option<&str>) -> Vec<PathBuf> {
     v
 }
 
-/// Existing manifests for `kernel_driver` under `dirs`, best first, one
-/// per file name (the first directory wins, as with the loader).
+/// Debian multiarch suffixes (`<name>.<arch>.json`) for the helper's own
+/// build arch, best first. The userland arch matters, not the kernel's:
+/// a 32-bit armhf helper on an aarch64 kernel wants `armv8l`.
+#[must_use]
+pub fn arch_suffixes() -> &'static [&'static str] {
+    if cfg!(target_arch = "arm") {
+        &["armv8l", "armv7l", "armhf"]
+    } else if cfg!(target_arch = "aarch64") {
+        &["aarch64"]
+    } else if cfg!(target_arch = "x86_64") {
+        &["x86_64"]
+    } else if cfg!(target_arch = "x86") {
+        &["i686", "i386"]
+    } else if cfg!(target_arch = "riscv64") {
+        &["riscv64"]
+    } else {
+        &[]
+    }
+}
+
+/// How well `file_name` matches the manifest `base` (`foo_icd.json`):
+/// `0` for the exact name, `1 + i` for `foo_icd.<arches[i]>.json`,
+/// `1 + arches.len()` for any other `foo_icd.<suffix>.json`, `None` if it
+/// is a different manifest. The stem must match exactly, so
+/// `intel_hasvk_icd.x86_64.json` is not an `intel_icd.json`.
+#[must_use]
+pub fn match_rank(file_name: &str, base: &str, arches: &[&str]) -> Option<usize> {
+    if file_name == base {
+        return Some(0);
+    }
+    let stem = base.strip_suffix(".json")?;
+    let arch = file_name
+        .strip_prefix(stem)?
+        .strip_prefix('.')?
+        .strip_suffix(".json")?;
+    if arch.is_empty() || arch.contains('.') || arch.contains('/') {
+        return None;
+    }
+    Some(
+        1 + arches
+            .iter()
+            .position(|a| *a == arch)
+            .unwrap_or(arches.len()),
+    )
+}
+
+/// Existing manifests for `kernel_driver` under `dirs`, best first. For
+/// each manifest name the first directory holding the exact or a suffixed
+/// variant wins (as with the loader); within it the exact name comes
+/// first, then the running arch's suffix, then any other (sorted). A
+/// foreign-arch manifest just fails to load and the next is tried.
 #[must_use]
 pub fn candidates(kernel_driver: &str, dirs: &[PathBuf]) -> Vec<PathBuf> {
+    candidates_for_arch(kernel_driver, dirs, arch_suffixes())
+}
+
+/// [`candidates`] with explicit arch suffixes.
+#[must_use]
+pub fn candidates_for_arch(kernel_driver: &str, dirs: &[PathBuf], arches: &[&str]) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    for name in manifests_for(kernel_driver) {
-        if let Some(p) = dirs.iter().map(|d| d.join(name)).find(|p| p.is_file()) {
-            out.push(p);
+    for base in manifests_for(kernel_driver) {
+        for dir in dirs {
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            let mut found: Vec<(usize, String, PathBuf)> = rd
+                .flatten()
+                .filter_map(|e| {
+                    let name = e.file_name().into_string().ok()?;
+                    let rank = match_rank(&name, base, arches)?;
+                    let p = e.path();
+                    p.is_file().then_some((rank, name, p))
+                })
+                .collect();
+            if found.is_empty() {
+                continue;
+            }
+            found.sort();
+            out.extend(found.into_iter().map(|(_, _, p)| p));
+            break;
         }
     }
     out
@@ -147,6 +221,38 @@ mod tests {
     }
 
     #[test]
+    fn suffix_rank() {
+        let a = ["armv8l", "armv7l"];
+        assert_eq!(
+            match_rank("broadcom_icd.json", "broadcom_icd.json", &a),
+            Some(0)
+        );
+        assert_eq!(
+            match_rank("broadcom_icd.armv8l.json", "broadcom_icd.json", &a),
+            Some(1)
+        );
+        assert_eq!(
+            match_rank("broadcom_icd.armv7l.json", "broadcom_icd.json", &a),
+            Some(2)
+        );
+        assert_eq!(
+            match_rank("broadcom_icd.x86_64.json", "broadcom_icd.json", &a),
+            Some(3)
+        );
+        assert_eq!(
+            match_rank("lvp_icd.armv8l.json", "broadcom_icd.json", &a),
+            None
+        );
+        assert_eq!(
+            match_rank("intel_hasvk_icd.x86_64.json", "intel_icd.json", &a),
+            None
+        );
+        assert_eq!(match_rank("intel_icd..json", "intel_icd.json", &a), None);
+        assert_eq!(match_rank("intel_icd.a.b.json", "intel_icd.json", &a), None);
+        assert_eq!(match_rank("intel_icdx.json", "intel_icd.json", &a), None);
+    }
+
+    #[test]
     fn search_in_a_temp_tree() {
         let root = std::env::temp_dir().join(format!("nitro-icd-{}", std::process::id()));
         let a = root.join("a/vulkan/icd.d");
@@ -167,7 +273,56 @@ mod tests {
             c,
             vec![b.join("intel_icd.json"), a.join("intel_hasvk_icd.json")]
         );
-        assert!(candidates("amdgpu", &[a, b]).is_empty());
+        assert!(candidates("amdgpu", &[a.clone(), b.clone()]).is_empty());
+        // Debian multiarch-suffixed manifests (Pi OS armhf).
+        let c = root.join("c/vulkan/icd.d");
+        std::fs::create_dir_all(&c).unwrap();
+        for f in [
+            "broadcom_icd.aarch64.json",
+            "lvp_icd.armv8l.json",
+            "broadcom_icd.armv8l.json",
+            "intel_hasvk_icd.x86_64.json",
+        ] {
+            std::fs::write(c.join(f), "{}").unwrap();
+        }
+        let arm = ["armv8l", "armv7l", "armhf"];
+        assert_eq!(
+            candidates_for_arch("v3d", std::slice::from_ref(&c), &arm),
+            vec![
+                c.join("broadcom_icd.armv8l.json"),
+                c.join("broadcom_icd.aarch64.json")
+            ]
+        );
+        assert_eq!(
+            candidates_for_arch("v3d", std::slice::from_ref(&c), &["aarch64"]),
+            vec![
+                c.join("broadcom_icd.aarch64.json"),
+                c.join("broadcom_icd.armv8l.json")
+            ]
+        );
+        // intel_hasvk.x86_64 is not intel_icd; exact name beats suffixed.
+        std::fs::write(c.join("intel_icd.x86_64.json"), "{}").unwrap();
+        std::fs::write(c.join("intel_icd.json"), "{}").unwrap();
+        assert_eq!(
+            candidates_for_arch("i915", std::slice::from_ref(&c), &["x86_64"]),
+            vec![
+                c.join("intel_icd.json"),
+                c.join("intel_icd.x86_64.json"),
+                c.join("intel_hasvk_icd.x86_64.json"),
+            ]
+        );
+        for d in ["v3d", "i915", "amdgpu", "msm"] {
+            assert!(
+                candidates_for_arch(d, &[a.clone(), b.clone(), c.clone()], &arm)
+                    .iter()
+                    .all(|p| !p.to_string_lossy().contains("lvp"))
+            );
+        }
+        // First dir with any variant wins.
+        assert_eq!(
+            candidates_for_arch("i915", &[b.clone(), c.clone()], &["x86_64"]),
+            vec![b.join("intel_icd.json"), b.join("intel_hasvk_icd.json")]
+        );
         // sysfs lookup
         let sys = root.join("sys");
         let dev = sys.join("dev/char/226:128/device");

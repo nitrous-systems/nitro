@@ -673,8 +673,12 @@ fn case9_capture_draws_layers_into_a_temporary_target_and_frees_it() {
     // #3975: the first submit in the process makes a one-time step in
     // drm_total (driver state/instruction pools, pipeline upload: +16 KiB
     // on hasvk, ~4 MiB on anv) that does not grow with the target size.
-    // Warm up with one small capture, then sample.
+    // Warm up with one small capture, then sample. v3dv (Pi 5) also keeps
+    // freed BOs in a driver cache (`V3DV_MAX_BO_CACHE_SIZE`), which counts
+    // in drm_total: warm up at 1080p too, so a leaked ~8 MiB target still
+    // shows while the cache's steady state does not.
     capture(&mut h, 4, 100, 70, layers.clone());
+    capture(&mut h, 7, 1920, 1080, layers.clone());
     let before = drm_total(&mut h);
     let img = capture(&mut h, 5, 100, 70, layers.clone());
     img.assert_near(0, 0, [20, 200, 40], 0);

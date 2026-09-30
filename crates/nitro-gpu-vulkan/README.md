@@ -28,7 +28,9 @@ so at most six. Alpha is forced to 1 for XR24 and NV12. `PremulOver` is
   `IN_FENCE_FD`) waits for it as well.
 - Foreign images (client dma-bufs, the udmabuf shadow, ring slots) are
   acquired from `VK_QUEUE_FAMILY_FOREIGN_EXT` at the start of every frame
-  and released back to it at the end, in `GENERAL` layout.
+  and released back to it at the end, in `GENERAL` layout. A driver
+  without `VK_EXT_queue_family_foreign` (v3dv) uses
+  `VK_QUEUE_FAMILY_EXTERNAL` instead (`Gpu::foreign_family`).
 
 A slot that was never drawn is cleared to opaque black inside its first
 render pass. The first clip is the full output (buffer age), so nothing
@@ -62,6 +64,12 @@ and a helper started over ssh will use staging.
    panfrost; v3d → broadcom; asahi; virtio. **Never lvp.**
 4. Search `/etc/vulkan/icd.d`, `/usr/local/share/vulkan/icd.d`,
    `$XDG_DATA_DIRS/vulkan/icd.d` and `/usr/share/vulkan/icd.d`.
+   Debian installs multiarch-suffixed manifests
+   (`broadcom_icd.armv8l.json`, `intel_icd.x86_64.json`), so each name
+   also matches `<stem>.<arch>.json` with exactly that stem. The first
+   directory with any variant wins. In it the exact name comes first, then
+   the suffix of the helper's own build arch (`arch_suffixes`: armv8l,
+   armv7l, armhf for 32-bit arm), then the others, sorted.
    `NITRO_GPU_ICD=<json>` replaces the whole lookup.
 5. For each candidate, set `VK_DRIVER_FILES=<json>` (in `main`, before
    any thread exists) and open the device. If the candidate has no usable
@@ -72,6 +80,42 @@ The physical device is matched to the render node through
 `VK_EXT_physical_device_drm` when the driver has it. Otherwise it is the
 first device with the dma-buf/sync_fd extension set, which with a single
 vendor ICD is that vendor's device.
+
+## Broadcom V3D (Raspberry Pi 5 / 500, #4000)
+
+Measured on testhost3 (Pi 500, armhf userland on an aarch64 kernel, Mesa
+24.2.8 v3dv, V3D 7.1.10.2, Vulkan 1.2.289):
+
+- **Manifests are suffixed.** `/usr/share/vulkan/icd.d` only has
+  `*_icd.armv8l.json`. Before the suffix match the helper found no
+  candidate and exited ("no vendor Vulkan driver").
+- **No `VK_EXT_queue_family_foreign`.** v3dv has every other required
+  extension (dma_buf, drm_format_modifier, external_memory_fd,
+  external_semaphore_fd, and physical_device_drm, so the DRM-node match
+  works). The extension is optional now, and ownership transfers use
+  `VK_QUEUE_FAMILY_EXTERNAL`.
+- **Render-only GPU, separate display.** `renderD128` and `card0` are
+  `v3d`, and scanout is `card1` (`vc4-drm`). Ring slots are exported from
+  v3d and imported into vc4 as dma-bufs. The helper advertises 4 render
+  format/modifier pairs, and pixel test case 8 picks LINEAR
+  (`ring modifier 0x0`). A live ring into the vc4 primary was **not**
+  exercised: an idle desktop has no helper-able surface (`gpu_state 2`,
+  `gpu_ring_slots 0`), and a LINEAR client dma-buf went straight to a
+  plane. v3dv does not
+  sample LINEAR NV12, so NV12 surfaces are not given to the helper there
+  (they stay on the CPU/plane path).
+- **v3dv's BO cache** keeps freed BOs (`V3DV_MAX_BO_CACHE_SIZE`), and
+  they count in `drm_total`. Pixel test case 9 therefore warms up at
+  1080p before sampling.
+- `/dev/udmabuf` is `root:kvm 0660` there, so the shadow takes the
+  staging path.
+- Footprint: the helper starts in ~7 ms. Idle RSS is 7.5 MiB (PSS 3.6
+  MiB). With a 3-slot 1080p ring, the 1080p shadow and a first frame it is
+  15.5 MiB RSS and 41 MiB `drm_total`. The idle figure is within the
+  vendor-ICD-only budget of #3903 (8.7–10.9 MB).
+- All 11 pixel tests pass there with `NITRO_GPU_TEST=require`: cross-build
+  them with `cargo test --no-run`, and put the helper at its build-time
+  path on the box (`docs/testbox.md` §testbox3).
 
 ## `unsafe` inventory
 

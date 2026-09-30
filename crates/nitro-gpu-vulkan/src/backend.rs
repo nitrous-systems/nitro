@@ -11,7 +11,9 @@
 //! Ownership of foreign buffers (client dma-bufs, the udmabuf shadow, the
 //! output slots KMS scans out) moves to the helper's queue at the start of
 //! every frame and back to `VK_QUEUE_FAMILY_FOREIGN_EXT` at its end, in
-//! `GENERAL` layout.
+//! `GENERAL` layout. Drivers without `VK_EXT_queue_family_foreign` (v3dv)
+//! use `VK_QUEUE_FAMILY_EXTERNAL` instead, which the external-memory rules
+//! allow for memory shared with other drivers and devices.
 
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 
@@ -764,7 +766,7 @@ impl VkBackend {
     fn record(&self, slot: &Slot, size: (u32, u32), clip: &[IRect], layers: &[(&Tex, Layer)]) {
         let d = &self.gpu.device;
         let cmd = slot.cmd;
-        let foreign = vk::QUEUE_FAMILY_FOREIGN_EXT;
+        let foreign = self.gpu.foreign_family();
         let ignored = vk::QUEUE_FAMILY_IGNORED;
         let q = self.gpu.qfi;
         let mut seen: Vec<vk::Image> = Vec::new();
@@ -1438,7 +1440,7 @@ impl VkBackend {
         let d = &self.gpu.device;
         let cmd = self.cmd_buffer()?;
         let fence = self.fence(false)?;
-        let foreign = vk::QUEUE_FAMILY_FOREIGN_EXT;
+        let foreign = self.gpu.foreign_family();
         let q = self.gpu.qfi;
         let pre = barrier(
             image,

@@ -26,14 +26,16 @@ pub(crate) struct Gpu {
     pub nv12_linear: bool,
     /// Every advertised NV12 modifier supports midpoint chroma samples.
     pub nv12_midpoint: bool,
+    /// `VK_EXT_queue_family_foreign` is enabled. Without it (v3dv) the
+    /// dma-buf ownership transfers use `VK_QUEUE_FAMILY_EXTERNAL`.
+    pub foreign_qf: bool,
 }
 
-const REQUIRED: [&CStr; 5] = [
+const REQUIRED: [&CStr; 4] = [
     khr::external_memory_fd::NAME,
     ext::external_memory_dma_buf::NAME,
     ext::image_drm_format_modifier::NAME,
     khr::external_semaphore_fd::NAME,
-    ext::queue_family_foreign::NAME,
 ];
 
 /// The Vulkan format behind a DRM fourcc.
@@ -108,6 +110,11 @@ impl Gpu {
         if has_extension(instance, pd, ext::physical_device_drm::NAME) {
             exts.push(ext::physical_device_drm::NAME.as_ptr());
         }
+        // Optional: v3dv (Broadcom V3D, Pi 5) does not expose it.
+        let foreign_qf = has_extension(instance, pd, ext::queue_family_foreign::NAME);
+        if foreign_qf {
+            exts.push(ext::queue_family_foreign::NAME.as_ptr());
+        }
         let prio = [1.0f32];
         let qci = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(qfi)
@@ -145,7 +152,19 @@ impl Gpu {
             },
             nv12_linear: tables.nv12_linear,
             nv12_midpoint: tables.nv12_midpoint,
+            foreign_qf,
         })
+    }
+
+    /// The queue family foreign dma-bufs are released to / acquired from:
+    /// `FOREIGN_EXT` when enabled, else `EXTERNAL` (core since 1.1), valid
+    /// for external memory shared with another driver instance or device.
+    pub fn foreign_family(&self) -> u32 {
+        if self.foreign_qf {
+            vk::QUEUE_FAMILY_FOREIGN_EXT
+        } else {
+            vk::QUEUE_FAMILY_EXTERNAL
+        }
     }
 
     /// A memory type in `bits` with every flag of `want`.
