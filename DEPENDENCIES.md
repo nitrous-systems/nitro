@@ -399,7 +399,7 @@ reaching syn 3 in a stable release (0.9 is heading there), or `drm` making
 and no measurement needed — whichever lands first, the duplicate
 disappears on the next `cargo update`.
 
-Planned (M3+): nothing currently. `parley` sits behind swash as the
+Planned: `wayland-server` for `nitro-wayland` (proposed above, #3992). `parley` sits behind swash as the
 upgrade path if bidi, font fallback or rich text ever become requirements.
 Rejected: `serde` (hand-written wire), **`png`** — encoding *and* decoding,
 now measured rather than assumed; see "`png` versus our own decoder" below
@@ -621,6 +621,16 @@ spelled out, so no libdrm header either.
 That is the tree's third `unsafe` exception, below. Footprint: stripped
 `nitro-video` and the mapped libav* size and RSS are in `docs/budget.md`
 § "nitro-video (#3906)".
+
+## Proposed: `wayland-server` for `nitro-wayland` (#3992)
+
+**Proposed, not in `Cargo.toml`.** It goes in with W1 (#3993), which
+replaces the estimates below with measured tree and binary numbers. The
+argument is in `docs/wayland.md` § 1.
+
+| crate | used by | why | cost / notes |
+|---|---|---|---|
+| `wayland-server` (+ `wayland-backend`, `wayland-sys`, `wayland-scanner`, `wayland-protocols`, `quick-xml`, `downcast-rs`, `smallvec`) | wayland *(proposed)* | The server side of the Wayland protocol for the adapter process, which is the only binary that links it. The **pure-Rust `rs/` backend**, `default-features = false`: no libwayland, and `ldd` of a scratch binary shows only libc and libgcc_s. `wayland-protocols` (`server`, `staging`, `unstable`) covers xdg-shell, xdg-decoration, xdg-output, viewporter, fractional-scale, cursor-shape, primary-selection, linux-dmabuf, presentation-time and idle-inhibit. The codec is easy. What it buys is the object lifecycle: zombie objects, `delete_id` reuse, per-object versions, and fd batching across `sendmsg`. Rejected: `server_system` (libwayland-server would be a third deliberate C dependency, with ~200 FFI `unsafe` sites in `sys/`); a hand-rolled core (52 interfaces / 163 requests / 99 events in the subset, ~2 800 lines estimated, and it could only be tested against `wayland-client` anyway); `smithay` (still rejected: a compositor framework, when all we need is its bottom layer). | **+8 external names measured** (44 → 52), in a scratch crate against the current tree. `rustix`, `bitflags`, `linux-raw-sys`, `memchr`, `proc-macro2`, `quote` and `unicode-ident` are already present. **Build-only:** `cc` (+ `shlex`, `find-msvc-tools`), an unconditional build-dependency of `wayland-backend` that compiles nothing without its `log` feature. `quick-xml` and the scanner are compile-time only. **`unsafe` shipped:** 10 sites in `wayland-backend`'s `rs/` (mostly `BorrowedFd::borrow_raw` on received fds), 2 in `wayland-server`, 83 in `smallvec`, and none of ours: the adapter is `#![forbid(unsafe_code)]` because it `pread`s client pools instead of mapping them. Scratch binary with eight globals: 541 528 B stripped. **Dev-dependency:** `wayland-client` (+1 name) for `nitro-wayland`'s tests. |
 
 ## `rustix` features by crate
 

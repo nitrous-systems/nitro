@@ -179,8 +179,10 @@ client that speaks its four-message socket protocol, hosted by
   `nitro-view` client renders a remote scene locally. No pixels cross the
   link unless a node is an `Image`.
 - `nitro-wayland`: a separate process speaking Wayland to legacy clients
-  and forwarding each surface as a `Surface` node with its dma-buf. Keeps
-  Wayland's object model out of the server.
+  and forwarding each surface as a nitro node: an `Image` (with the
+  `wl_shm` pixels copied into a sealed memfd) or a `Surface` with its
+  dma-buf. Keeps Wayland's object model out of the server. Design record:
+  [`docs/wayland.md`](docs/wayland.md).
 
 ## Cross-cutting rules
 
