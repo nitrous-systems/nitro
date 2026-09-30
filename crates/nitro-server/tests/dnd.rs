@@ -1027,6 +1027,46 @@ fn escape_cancels_a_drag_and_swallows_what_it_consumed() {
 }
 
 #[test]
+fn the_source_finishing_mid_drag_cancels_it() {
+    let _fds = shared();
+    let mut h = Harness::start("srccancel");
+    let mut s = two(&mut h);
+    drag_onto_b(&mut h, &mut s, NodeId::NONE);
+    s.b.accept(DragAction::Copy, TEXT);
+    wait_for("the acceptance", || h.stat("dnd_accepted") == 1);
+    s.b.request(4);
+    // Chromium's CancelDrag: the source gives the drag up while it still
+    // holds the pointer.
+    s.a.finish();
+    s.b.drag_leave(s.wb);
+    assert!(
+        read_all(&s.b.data(4)).is_empty(),
+        "the parked read ends at EOF"
+    );
+    wait_for("the grab to go", || h.stat("dnd_grab") == 0);
+    assert_eq!(h.stat("dnd_active"), 0, "released outright");
+    assert_eq!(h.stat("dnd_cancels"), 1);
+    assert!(s.a.poll());
+    assert!(
+        !s.a.saw(|m| matches!(m, ServerMsg::DragFinished(_))),
+        "the source asked for it: no DragFinished"
+    );
+    // The button that carried the drag comes up unseen, and the pointer
+    // is ordinary again.
+    h.button(ButtonState::Released);
+    assert!(s.b.poll());
+    assert_eq!(s.b.released, 0);
+    h.button(ButtonState::Pressed);
+    h.button(ButtonState::Released);
+    let wb = s.wb;
+    s.b.take("a click", |m| {
+        matches!(m, ServerMsg::PointerButton(b) if b.window == wb && b.state == ButtonState::Released)
+    });
+    assert!(!s.b.saw(|m| matches!(m, ServerMsg::DragDrop(_))));
+    h.quit();
+}
+
+#[test]
 fn a_drag_read_from_a_non_target_is_fatal() {
     let _fds = shared();
     let mut h = Harness::start("nontarget");

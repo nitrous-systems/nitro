@@ -1587,6 +1587,13 @@ Sent by **both ends**, told apart by where the drag is:
   source that disconnects instead is equivalent. A source sending it
   before the target finished gives the drop up (the target gets
   `DragLeave`).
+* By the **source**, *during* the drag — while it still holds the
+  pointer: a cancel. The grab ends (the icon comes down, the button
+  still held is swallowed), the target gets `DragLeave`, parked reads
+  end at EOF, and the drag is released outright: no `DragFinished`
+  follows, the source asked for it. This is Chromium's
+  `WmDragHandler::CancelDrag` (a tab or renderer going away mid-drag),
+  Wayland's destroying the `wl_data_source`.
 
 The phase makes this unambiguous when source and target are one client.
 From anyone else it is a race and ignored. There is **no timeout**: a
@@ -3166,7 +3173,10 @@ source       →  FinishDrag                                     (0x030a)
 
 A rejected or cancelled drag (no acceptance at the release, Escape, a
 lock) skips the target's half: the target gets `DragLeave` and the source
-`DragFinished { accepted: false, action: None }` at once.
+`DragFinished { accepted: false, action: None }` at once. A source
+that gives up mid-drag sends `FinishDrag` while it still holds the
+pointer: the target gets `DragLeave` and the drag is released with no
+`DragFinished` ([`FinishDrag`](#finishdrag--0x030a)).
 
 **Who is a target:** the window under the pointer (the icon excluded),
 if its client listed `DATA` in `ClientCaps` and the session lock admits

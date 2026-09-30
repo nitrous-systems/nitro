@@ -472,8 +472,9 @@ impl Dnd {
     /// A `FinishDrag` from `token`. Disambiguated by phase, which is what
     /// makes it work when source and target are one client: in `Dropped`
     /// only the target's completes the drop, in `Finished` only the
-    /// source's releases the drag, and a source giving up in `Dropped`
-    /// releases it with the target told. Anything else is a race and
+    /// source's releases the drag, and a source giving up in `Dragging` or
+    /// `Dropped` releases it with the target told (a cancel: the grab
+    /// ends, and no `DragFinished` follows). Anything else is a race and
     /// ignored.
     pub fn finish(&mut self, token: u64) -> Outcome {
         match self.phase {
@@ -487,7 +488,7 @@ impl Dnd {
                     action,
                 }
             }
-            Phase::Dropped | Phase::Finished if token == self.source => Outcome::Released {
+            Phase::Dragging | Phase::Dropped | Phase::Finished if token == self.source => Outcome::Released {
                 leave: self.target.take(),
             },
             _ => Outcome::Nothing,
@@ -773,6 +774,32 @@ mod tests {
         assert!(!d.is_drop_target(B));
         assert_eq!(d.finish(B), Outcome::Nothing, "a stray target finish");
         assert_eq!(d.finish(A), Outcome::Released { leave: None });
+    }
+
+    #[test]
+    fn the_source_finishing_mid_drag_cancels_it() {
+        let mut d = drag();
+        d.retarget(Some(tgt(B, 2)));
+        d.accept(B, DragAction::Copy, "text/plain".into());
+        assert_eq!(d.finish(B), Outcome::Nothing, "the target cannot, mid-drag");
+        assert!(d.grabbing());
+        assert_eq!(
+            d.finish(A),
+            Outcome::Released {
+                leave: Some(tgt(B, 2))
+            }
+        );
+        assert_eq!(d.target(), None);
+
+        // Over its own window, the source's own window is told too.
+        let mut d = drag();
+        d.retarget(Some(tgt(A, 1)));
+        assert_eq!(
+            d.finish(A),
+            Outcome::Released {
+                leave: Some(tgt(A, 1))
+            }
+        );
     }
 
     #[test]
