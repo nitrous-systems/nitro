@@ -11,4 +11,5 @@ RUN apk add --no-cache \
 
 # abuild runs as a user in group abuild, with a signing key.
 RUN adduser -D builder && addgroup builder abuild \
-    && su builder -c 'abuild-keygen -a -n'
+    && su builder -c 'abuild-keygen -a -n' \
+    && cp /home/builder/.abuild/*.rsa.pub /etc/apk/keys/
