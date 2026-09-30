@@ -811,8 +811,8 @@ At 120 Hz box1 is already at 12.5 ms i2p p50. Fix 1 is worth ~2–3 ms there, an
 
 - **Off:** the timeline is a `None` in `Server`, 16 bytes with its clock pointer, 0 heap, and one branch per hook.
 - **On:** one 2048-row ring, ~240 KiB, freed by `timeline off`.
-- **Binary:** `nitro-server` release grew by about 5 KiB.
-- **box1 idle** after deploy (`just footprint 10`): nitro-server RssAnon 10 608 kB, the same as before (the timeline is off).
+- **Binary:** on testhost2 the release `nitro-server` went from 3 531 416 to 3 536 576 bytes (+5 KiB) against the build deployed before it. That build was a close but not identical main.
+- **box1 idle** after deploy (`just footprint 10`): nitro-server RssAnon 10 608 kB with the timeline off. There was no same-day before-sample; off costs no heap by construction.
 
 ## Other gotchas
 
