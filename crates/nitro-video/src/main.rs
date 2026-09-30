@@ -1,5 +1,5 @@
 //! `nitro-video FILE [--fullscreen] [--frames N] [--stats] [--hwdec MODE]
-//! [--vaapi-device PATH] [--synthetic]`.
+//! [--vaapi-device PATH] [--no-scale] [--synthetic]`.
 
 use std::os::fd::AsFd as _;
 use std::path::PathBuf;
@@ -24,6 +24,7 @@ const USAGE: &str = "usage: nitro-video FILE [--fullscreen] [--frames N] [--stat
                  tiled one off a plane is a placeholder),
                  download (copy frames into shm), off (software)
   --vaapi-device PATH  the render node (default /dev/dri/renderD128)
+  --no-scale     never scale VA frames to the server's plane hint (VPP)
 
 keys: Space play/pause, Left/Right seek 5 s, F fullscreen, Esc leave
 fullscreen, Q quit";
@@ -48,6 +49,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         match arg.as_str() {
             "--fullscreen" => a.opts.fullscreen = true,
             "--stats" => a.stats = true,
+            "--no-scale" => a.opts.no_scale = true,
             "--synthetic" => a.synthetic = true,
             "--hwdec" => {
                 let m = it.next().ok_or("--hwdec needs a mode")?;

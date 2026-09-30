@@ -164,6 +164,8 @@ pub struct Opts {
     pub fullscreen: bool,
     /// `--hwdec`: the output policy for a VA-API decoder.
     pub hwdec: HwDec,
+    /// `--no-scale`: ignore the plane hint (measurement, #3956).
+    pub no_scale: bool,
 }
 
 /// Counters for `--stats`.
@@ -826,7 +828,7 @@ impl Player {
     /// and ask the decoder for it once the hint has settled for
     /// [`SCALE_DEBOUNCE_MS`].
     fn consider_scale(&mut self, ui: &mut Ui<Self>) {
-        if self.output != Some(Output::DmaBuf) || self.scale_broken {
+        if self.output != Some(Output::DmaBuf) || self.scale_broken || self.opts.no_scale {
             return;
         }
         let Some((w, h, min)) = self.plane_hint else {

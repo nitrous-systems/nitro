@@ -271,6 +271,7 @@ containing the transaction reached the screen.
 | 15 | `OPAQUE_REGION` | `SetOpaqueRegion` — a client may declare an image's or surface's opaque pixels (#3877, Surfaces #3919) |
 | 16 | `SURFACE` | shm-backed `Surface` nodes: `CreateSurfaceBuffer`, `SetSurface`, `PresentSurface`, `SurfaceHint` (#3897), and server-allocated scanout buffers: `AllocSurfaceBuffers`, `SurfaceBufferAllocated`, `AllocSurfaceBuffersFailed` (#3914); see [Surfaces](#surfaces-caps-surface) |
 | 17 | `SHARE` | cross-client Surface sharing: `ExportSurface`, `ImportSurface`, `SurfaceExported`, `SurfaceRevoked` (#3904); see [Surface sharing](#surface-sharing-caps-share) |
+| 18 | `PLANE_HINT` | `SurfacePlaneHint`: how far a display plane downscales, and whether a Surface is off the planes for it (#3956); see [`SurfacePlaneHint`](#surfaceplanehint--0x830c) |
 
 Bits 8–17 together are `caps::CAPS_M5_MASK`, the range
 [`ClientCaps`](#capability-opt-in-clientcaps) governs.
@@ -328,6 +329,10 @@ secret whose only check is the peer uid, which TCP cannot prove. It
 follows rule 3: a sharing op from a client that did not list it in
 `ClientCaps` is `Error { Protocol }`, and so is one from a remote link.
 `SurfaceExported` and `SurfaceRevoked` go only to clients that listed it.
+
+`PLANE_HINT` (bit 18, #3956) is advertised on local links like
+`SURFACE` and must be listed in `ClientCaps` (rule 3): `SurfacePlaneHint`
+goes only to clients that listed it. It carries no client op.
 
 `SHELL` is bit 5, not bit 3: bit 3 is `REMOTE` and was taken in M1. It is
 *reported*, never negotiated — a client cannot ask for it. See
@@ -670,6 +675,7 @@ Assigned in blocks of 0x100 so a block can grow without renumbering.
 | `0x8309` | `SurfaceBufferAllocated` | replies about content (see `SURFACE`) — **carries 1 fd** |
 | `0x830a` | `AllocSurfaceBuffersFailed` | replies about content (see `SURFACE`) |
 | `0x830b` | `DmabufFeedback` | replies about content (see `DMABUF`) |
+| `0x830c` | `SurfacePlaneHint` | replies about content (see `PLANE_HINT`) |
 | `0x8401` | `HotKey` | shell (see `SHELL`) |
 | `0x8402` | `WindowInfo` | shell (see `SHELL`) |
 | `0x8403` | `WindowListEnd` | shell (see `SHELL`) |
@@ -2374,7 +2380,10 @@ stays straight alpha (#3921).
 **Render at display size or smaller.** Display planes upscale but barely
 downscale (Kaby Lake: 0.94× accepted, 0.75× rejected), so a buffer larger
 than the output cannot go on a plane. `DmabufFeedback` carries the
-output's size for this; `SurfaceHint` still carries the node's.
+output's size for this; `SurfaceHint` still carries the node's, and
+`SurfacePlaneHint` (#3956) adds the plane's downscale floor, so a
+producer can render at the node's size exactly when the plane could not
+take its source as it is.
 
 **`SetSurface` naming a dma-buf buffer is `BadBuffer`** (fatal). A
 committed attach would have to block the transaction on a fence or show
@@ -2459,6 +2468,31 @@ output) when the client lists `DMABUF`, and again whenever the outputs
 change (hotplug, mode change, rescan). Per Surface node — for the output
 the node's window is on — when it first lands on an output and whenever
 that output or its feedback changes.
+
+### `SurfacePlaneHint` — 0x830c
+
+| field | type | meaning |
+|---|---|---|
+| `id` | `NodeId` | the `Surface` node (own or import) |
+| `width`, `height` | `u32` | the node's size in device pixels (as `SurfaceHint`) |
+| `min_scale_pct` | `u8` | the smallest `dst / src` ratio, per axis, a plane of the node's output takes without the server compositing: 94 where a plane may scale, 100 where none does, 0 when the output has no planes (size then does not matter for scanout) |
+| `flags` | `u8` | bit 0 `SCALE_LIMITED`: the node's current buffer is off the planes **because of** that ratio |
+
+Fixed **14 bytes**. Sent only to clients that listed `PLANE_HINT` (#3956),
+when the node first has a device rect and whenever any field changes
+(resize, fullscreen, scale change, output move, the flag).
+
+**The producer's rule.** A producer whose source is larger than the node
+by more than the plane downscales (`src · min_scale_pct / 100 > width`
+on either axis, `min_scale_pct > 0`) should render at `width`×`height`,
+keeping its aspect ratio: the plane then takes the buffer 1:1 (or
+upscales it). Anything that fits already is left alone, and a producer
+never upscales for the hint. The flag is **informational**: it is for logs
+and statistics. A producer decides from the size and the ratio, never
+from the flag, so a buffer at the hinted size clearing the flag cannot
+flip the decision back (no feedback loop). The server logs each entry
+into and exit from the scale-limited state once per Surface and counts
+it (`plane_reject_scale`, gauge `planes_scale_limited` in `stats`).
 
 ## Surface sharing (caps `SHARE`)
 
@@ -3818,11 +3852,17 @@ to.
 * `ExportSurface` (`0x0310`), `ImportSurface` (`0x0311`),
   `SurfaceExported` (`0x8307`) and `SurfaceRevoked` (`0x8308`) join
   under a new bit, `SHARE` (bit 17), which also joins `CAPS_M5_MASK`
-  (now `0x3ff00`) (#3904). The new primitive `ShareToken` appears only in
+  (then `0x3ff00`) (#3904). The new primitive `ShareToken` appears only in
   them. An older server neither advertises the bit nor knows the ops,
   and the server sends the two new messages only to clients that listed
   the bit. `VERSION` stays **1**; `ImportSurface`'s golden bytes are in
   `payload_layouts_are_frozen`.
+* `SurfacePlaneHint` (`0x830c`) joins under a new bit, `PLANE_HINT`
+  (bit 18), which also joins `CAPS_M5_MASK` (now `0x7ff00`) (#3956). An
+  older server neither advertises the bit nor sends the op; the server
+  sends it only to clients that listed the bit, so an older client never
+  sees it. `VERSION` stays **1**; its golden bytes are in
+  `the_m5_payload_layouts_are_frozen`.
 * `AllocSurfaceBuffers` (`0x0312`), `SurfaceBufferAllocated` (`0x8309`,
   carries 1 fd) and `AllocSurfaceBuffersFailed` (`0x830a`) join behind
   the existing `SURFACE` bit (#3914), with a new enum `AllocRefusal`. An

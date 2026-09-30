@@ -10957,7 +10957,7 @@ impl Server {
                 .and_then(nitro_scene::Node::surface)
                 .and_then(|s| s.content)
                 .and_then(|ct| self.scene.buffer(ct.buffer).ok())
-                .is_some_and(|b| b.cpu_readable())
+                .is_some_and(nitro_scene::Buffer::cpu_readable)
             {
                 "CPU scaled blend"
             } else {
