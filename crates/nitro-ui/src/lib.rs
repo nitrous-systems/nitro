@@ -68,6 +68,7 @@
 //! | [`widget`] | the [`Widget`] trait and the pass contexts |
 //! | [`widgets`] | `Flex`, `Panel`, `Label`, `Button`, `TextField`, `Checkbox`, `Scroll`, `Slider`, `Separator`, `Image`, `Icon`, `Spacer` |
 //! | [`list`] | `List`: a **virtualised** list, `visible + 2` nodes for any model |
+//! | [`menu`] | `MenuButton`: an icon button that opens a menu of items in a popup |
 //! | [`picker`] | `FilePicker`: the file / folder dialog, a second window laid out like `nitro-files` |
 //! | [`split`] | the split-view blueprint: `SidebarRow`, `Card`, `CardRow`, `Pages`, `Switch`, `split_view` |
 //! | [`clipboard`] | the system clipboard: copy, serve, paste |
@@ -91,6 +92,7 @@ pub mod event;
 pub mod introspect;
 pub mod layout;
 pub mod list;
+pub mod menu;
 pub mod picker;
 pub mod popup;
 pub mod quick;
@@ -122,6 +124,7 @@ pub use layout::{
     ShrinkFloor,
 };
 pub use list::{List, ListModel, Row, list};
+pub use menu::{Mark, MenuButton, MenuEntry, MenuItem, menu_button};
 pub use nitro_core::{Color, Point, Rect, Size, Transform};
 pub use picker::{FilePicker, PickKind};
 pub use popup::PopupPlacement;

@@ -29,6 +29,10 @@
 //! Popups are fixed-size, so a view switch opens the new popup and
 //! removes the old one in the same turn, one commit.
 //!
+//! This is a multi-view panel (sliders, tiles, drill-downs), not a list
+//! of items, so it does not use `nitro_ui::menu`; a plain item menu
+//! behind an icon button should use `nitro_ui::menu::menu_button`.
+//!
 //! # Idle
 //!
 //! While the menu is closed this module schedules **nothing**: no timer,

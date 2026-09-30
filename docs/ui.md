@@ -1479,6 +1479,43 @@ drill-down that changes height adds the new popup and `remove_window`s
 the old one in the same turn: one commit, no empty frame
 (`tests/popup.rs::swapping_a_popup_for_a_taller_one_is_one_commit`).
 
+### Menus
+
+`nitro_ui::menu` is the item menu built on popups: `menu_button(icon)`
+is a round icon button (the `RoundButton` face; hover, pressed, focus
+ring, palette roles only) owning a list of `MenuEntry`s: items
+(`MenuItem::new(id, label)` with optional `.icon(..)`,
+`.checked(bool)` / `.radio(bool)` marks, `.disabled()`) and separators.
+`.on_select(|s, ui, id| ..)` gets the chosen item's id; `.label(..)` is
+the accessible name; `.align_right(true)` hangs the menu with right edges
+aligned (`PopupPlacement::below`) instead of left (`below_left`). Live
+setters: `set_items`, `set_checked(id, on)` (a radio item unchecks its
+siblings; an open menu updates at once), `set_enabled`, `set_icon`,
+`close`.
+
+- **Open**: click, Enter, Space or Down (the checked item, else the first
+  enabled one, is highlighted); Up opens on the last item.
+- **Navigate**: Up/Down wrap and skip separators and disabled items;
+  Home/End jump; Enter/Space activate; the pointer highlights on hover
+  and activates on click. Keys addressed to the parent window reach the
+  focused button, which forwards them to the open list; keys addressed to
+  the popup (the button takes `grab_keyboard_of` for a `NO_FOCUS` shell
+  parent such as a bar) go to the list directly.
+- **Close**: activation removes the popup and then runs `on_select` in
+  one deferred step, one commit. Escape and an outside press are the
+  server's (the popup grabs): dismissed, consumed, `PopupDone`. Every
+  close returns focus to the button.
+- **Placement**: the default constraint adjustment (`SLIDE_X | FLIP_Y |
+  RESIZE_Y`) flips the menu above a button at the bottom of the screen,
+  so a greeter's corner button works
+  (`tests/menu.rs::a_menu_in_a_screen_corner_flips_above_its_button`).
+- **Naming**: each row is named by its item id, `window[N]/<id>`, so ids
+  must be unique in a menu (a `debug_assert!`). A row's accessible value
+  is its checked state; the list's is the highlighted id.
+
+A hover tooltip for the button is future work; there is no tooltip
+facility yet.
+
 ### Quick settings widgets
 
 `nitro_ui::quick` is what a status menu is built from — GNOME's
