@@ -38,6 +38,11 @@ compositor that answers one pointer move in 9 ms may still be unable to
 repaint a full screen sixty times a second, which is exactly what
 `bench.md` finds.
 
+> **Chromium, per stage (#3974):** where a scroll's milliseconds go between
+> evdev and vblank (the server's `timeline` request, `NITRO_TIMELINE=1`,
+> and `scroll-bench.py --pattern even|random|burst`) is in
+> [chromium.md §Input latency](chromium.md#input-latency-3974).
+
 ## 1. What the numbers mean
 
 Two independent views of the same interval, deliberately, because a

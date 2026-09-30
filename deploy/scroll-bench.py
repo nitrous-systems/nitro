@@ -173,6 +173,7 @@ STAGES = [
     ("latch→commit", "latch", "commit"),
     ("commit→vblank", "commit", "vblank"),
     ("input→vblank (earliest)", "input", "vblank"),
+    ("input→vblank (newest)", "input_last", "vblank"),
 ]
 
 

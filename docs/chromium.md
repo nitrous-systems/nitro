@@ -685,6 +685,135 @@ server's capture ops (`docs/wire.md` § Screen capture, design in
   (`NITRO_CAPTURE_ALLOW=1` in its environment, or answer the #676 C prompt: `chrome` is on the default `capture.allow` list). Measurements:
   `docs/budget.md` § Chromium screen sharing.
 
+## Input latency (#3974)
+
+Measure only: nothing here changes frame timing. #3969 does the fixes and extends this section.
+
+### Method
+
+- **Server timeline.** `NITRO_TIMELINE=1`, or the control request `timeline on|off|clear`, records one row per frame that answered an input. A plain `timeline` dumps the rows; so does `nitro-shot --timeline`. Each row carries `CLOCK_MONOTONIC` ns stamps for these stages:
+  - `input`: the event time (evdev, or an injected event's due time). The earliest input the frame answers; `input_last` is the newest.
+  - `rx`: the server routed the event.
+  - `sent`: the input was written to the client.
+  - `present`: the first `PresentSurface(Fenced)`/`Commit` received after `sent`.
+  - `fence`: the acquire fence signalled.
+  - `latch`: the frame latched onto the output.
+  - `paint`, `commit`: the server painted and committed the frame.
+  - `vblank`: the flip completed.
+
+  Each row also records `deferred` and `unpresented`: the client's frames not yet `Presented` at the latch, i.e. the frames in flight. See `crates/nitro-server/src/timeline.rs`. Off, it is a `None` and one branch per hook. On, it is a 2048-row ring (~240 KiB). The attribution "this frame answered that input" is the first client frame after the send. That is exact with sparse input; with dense input, a frame answers every input since the previous frame.
+- **Input patterns.** `scroll-bench.py --pattern even|random|burst` (`NITRO_BENCH_PATTERN=all` in `just chromium-bench`). Every event is scheduled server-side with an absolute `t=`, so Python adds no jitter.
+  - `even`: 150 + 150 events, 16 ms apart (8 ms at 120 Hz).
+  - `random`: 300 events at intervals uniform on 4–25 ms, seed 3974.
+  - `burst`: flicks of 5–10 events 8 ms apart, with 100–300 ms idle gaps. The frames answering the first event after a gap get their own row.
+- **Columns.** The i2p column is the server's own `samples i2p`: from the *newest* input a frame carries to its vblank. The stage tables are p50 / p95 in ms. "earliest" is `input→vblank` for the oldest input the frame answers, which is the worst case a user feels.
+- **Builds.** Server: this branch (main + the timeline). Chromium: `out/Nitro` from `nitro-ozone` `296c8198b6`.
+- **No Chromium-side stamps were needed.** The server's `sent→present` is the whole client share, and the question it had to answer (the readback edge) was settled at that granularity. Splitting it into BeginFrame, raster and swap is left for #3969, together with its fixes.
+- **Arm notes.**
+  - box1's `dmabuf` arm (`NITRO_BENCH_ANGLE=gl`) delivered no dma-bufs (`dmabuf_buffers 0`), so on box1 it is the shm path. Only `oop` and `gpu` are listed there.
+  - testhost2's `dmabuf` arm runs with the GPU helper compositing (`planes_mode 2`).
+
+### Results
+
+**testhost2** (KBL, 2560×1440@60, scale 1.25), 2 runs per arm; ranges span the runs:
+
+| arm, pattern | i2p p50 / p95 / max | sent→present | fence→latch | latch→commit | commit→vblank | input→vblank earliest |
+|---|---|---|---|---|---|---|
+| dmabuf+helper, even | *n=1–3, see below* | 6.4–6.8 / 16.2 | 9.2–12.0 / 10–13 | 0.4–1.2 | 15.6–16.6 | 32.9–35.0 / 43–46 |
+| dmabuf+helper, random | *n=1–3* | 6.6–7.6 / 18–21 | 7.8–8.7 / 10.4 | 1.2 | 15.5–15.6 | 32.2–33.4 / 43–44 |
+| dmabuf+helper, burst | 14.6–16.7 / 26.5 / 39–78 | 11.2–11.4 / 16–18 | 0 / 9–10 | 1.0–1.1 | 9.2–9.4 | 24.4–25.3 / 36–41 |
+| dmabuf+helper, burst first after gap | | 9.7 / 17–18 | 0 / 0–10 | 1.0–1.1 | 9.1–9.2 | 24.3–24.8 / 33–36 |
+| shm, even | 25.1–25.5 / 32.2–32.4 / 33–34 | 5.9–6.3 / 15.4 | 7.5–8.7 / 9 | 1.9–2.1 | 14.9–15.1 | 30.8–31.7 / 40–41 |
+| shm, random | 23.6–24.1 / 31.8–32.5 / 34–40 | 7.1–7.2 / 16 | 6.1–7.2 / 7.8 | 2.1 | 14.8 | 31.1–31.4 / 39–40 |
+| shm, burst | 19.6–21.1 / 31.1–31.2 / 41–50 | 8.4–9.2 / 30–31 | 2.6–3.6 / 7.9 | 2.2–2.3 | 14.4–14.6 | 29.9–30.5 / 46–47 |
+| shm, burst first after gap | | 22.7–23.4 / 34 | 0 / 7.4 | 4.5–4.7 | 9.9–10.8 | 37.1–37.2 / 47–51 |
+| gpu (readback), even | 24.9–25.2 / 32.0–32.1 / 33 | 6.0–6.5 / 15.5–15.9 | 7.2–7.5 / 9 | 2.3–2.4 | 14.5–14.8 | 30.8–31.2 / 40 |
+| gpu (readback), random | 23.5–23.9 / 32.3 / 34–39 | 6.7–6.8 / 16 | 7.1–7.3 / 7.7 | 2.1 | 14.7 | 30.5–31.1 / 40 |
+| gpu (readback), burst | 19.4–19.5 / 32.0–32.3 / 50–81 | 8.4–8.8 / 30 | 1.9–4.8 / 8.5 | 2.4 | 14.4 | 30.1–30.3 / 42–43 |
+| gpu (readback), burst first after gap | | 22.1–23.3 / 32–34 | 0 / 7.7 | 4.5 | 6.4–6.7 | 33.5–33.6 / 43–47 |
+
+Two stages are the same across every arm, pattern and box, so they are left out of the tables: `input→sent` is 0.1 ms p50 (≤ 4 ms p95), and `present→fence` is 0 on shm and ~1 ms on dmabuf.
+
+**box1** (HSW GT1, 1920×1080), 2 runs per arm:
+
+| mode, arm, pattern | i2p p50 / p95 / max | sent→present | fence→latch | latch→commit | commit→vblank | input→vblank earliest |
+|---|---|---|---|---|---|---|
+| 60 Hz, oop, even | 25.5–25.8 / 32.5–32.6 / 33–36 | 6.9–7.1 / 16 | 5.1–5.2 / 6.8 | 2.8 | 14.4 | 29.5–29.8 / 38 |
+| 60 Hz, oop, random | 22.7–24.1 / 31.4–32.8 / 34 | 7.7–8.0 / 16 | 4.5–4.7 / 7 | 2.8 | 14.4 | 30.1–30.2 / 37–39 |
+| 60 Hz, oop, burst | 19.8–20.0 / 27.6–30.8 / 49 | 12.4–13.1 / 26–28 | 0 / 6 | 3.3 | 12.0–13.4 | 29.9–30.2 / 42–43 |
+| 60 Hz, oop, burst first after gap | | 19.4–19.5 / 30–31 | 0 / 5 | 3.4–3.5 | 11.2–11.3 | 34.1 / 44–46 |
+| 60 Hz, gpu, even | 24.9–25.1 / 32.3–32.5 / 33 | 6.3 / 15.4–15.8 | 6.0 / 7.7 | 3.1 | 14.1 | 29.6–30.4 / 39 |
+| 60 Hz, gpu, random | 22.9–23.4 / 32.4–33.0 / 34 | 7.5–8.1 / 16 | 4.5–5.0 / 7 | 2.8 | 14.4 | 30.5–30.7 / 38 |
+| 60 Hz, gpu, burst | 19.6–20.6 / 28.4–29.2 / 38–42 | 12.7–12.8 / 28 | 0–0.3 / 6 | 3.1–3.3 | 11.8–13.5 | 29.2–30.0 / 44 |
+| 60 Hz, gpu, burst first after gap | | 20.0–20.3 / 30–32 | 0 / 4–5 | 3.5–3.6 | 11.3–11.4 | 34.6–35.9 / 45 |
+| **120 Hz**, oop, even (8 ms) | 12.6–12.7 / 16.2–16.3 / 19–20 | 4.1–4.4 / 6.5 | 0.3–0.4 / 1.0 | 2.8 | 5.9 | 13.3 / 17 |
+| 120 Hz, oop, random | 12.9–13.4 / 16.9–17.0 / 22–25 | 4.8–4.9 / 12 | 0.5 / 1–2 | 2.8 | 5.9 | 14.4–14.7 / 22–26 |
+| 120 Hz, oop, burst | 11.6–12.6 / 17.9–18.4 / 34–41 | 6.0–6.4 / 17 | 0 / 6–7 | 2.9–3.0 | 4.9–5.1 | 15.7–16.0 / 30 |
+| 120 Hz, oop, burst first after gap | | 12.3–12.5 / 20–21 | 0 / 0.6 | 3.1–3.3 | 4.8–4.9 | 19.6–20.8 / 31 |
+| 120 Hz, gpu, even (8 ms) | 12.3–12.4 / 16.2 / 17 | 3.5–4.0 / 6.1–6.4 | 0.2–0.3 / 0.9 | 2.8 | 5.8–5.9 | 13.2 / 17 |
+| 120 Hz, gpu, random | 12.7–13.1 / 17.0–18.8 / 22–25 | 4.5–4.7 / 10–13 | 0.5 / 1–4 | 2.8 | 5.9 | 13.8–14.4 / 20–23 |
+| 120 Hz, gpu, burst | 12.1–12.8 / 18.7–19.7 / 31–41 | 6.1–6.2 / 16–17.5 | 0 / 7 | 2.9–3.0 | 5.2 | 15.7–16.3 / 30–31 |
+| 120 Hz, gpu, burst first after gap | | 10.5–11.3 / 21 | 0 / 4–5.5 | 3.2 | 5.4–5.6 | 18.4–19.8 / 30–31 |
+
+At 120 Hz, box1 ran HDMI-A-1 at **1920×1080@119.982**, its only 120 Hz mode (`output.HDMI-A-1.mode = 1920x1080@120`). The fps was 124 even, 114 random, 86 burst. The mode was restored to 1920×1080@60 afterwards and checked with `outputs`. Unpresented frames at the latch were **1.0 in every arm on both boxes**.
+
+**Pacing knobs** (testhost2, 1 run each, all three patterns):
+- `NITRO_ACK=present` on shm: i2p p50 25.1 / 24.3 / 19.7 ms, the same as release pacing.
+- `NITRO_ACK=present` on dmabuf: earliest 32.7 / 33.6 / 25.5 ms, the same.
+- `NITRO_MAX_PENDING=2` on shm: *worse*. `fence→latch` grows by 2 ms (9.6 vs 7.5 p50, p95 13.4) and earliest goes 31 → 33 ms; i2p p50 is unchanged.
+
+**testhost2 at scale 1** (#3919's condition, 1 run): oop i2p 24.6 / 22.8 / 20.8 ms, gpu 24.7 / 22.3 / 19.9 ms, both over even / random / burst.
+
+### Where the milliseconds go (60 Hz, steady scrolling)
+
+Take the earliest input of a frame, ~30 ms to vblank on box1 and ~31 ms on testhost2 shm:
+
+1. **Server input handling: 0.1 ms.** Nothing to win.
+2. **Chromium, input → frame received: 6–7 ms p50, 16 ms p95.** This is BeginFrame wait plus raster plus swap; the tail is inputs that just missed a BeginFrame.
+3. **Waiting for the flip in flight: 5–9 ms** (`fence→latch`). The frame arrives while the previous frame's flip is pending and latches only in `on_flip`.
+4. **Paint + commit: 2–3 ms** (0.4–1.2 ms with the helper).
+5. **Commit → vblank: 14–16 ms, the largest stage.** The commit goes in right after a vblank, so every frame queues for nearly a whole refresh before scan-out.
+
+Stages 3 + 5 are **20–24 ms of server-side queueing** for a frame that is ready 2–3 ms after it arrives. At 120 Hz the same structure costs 0.3 + 5.9 ms, which is why i2p halves (12.5 ms p50) rather than just losing 8 ms.
+
+**First frame after idle** (burst, first after gap) costs 34–37 ms earliest-input at 60 Hz, 4–6 ms more than steady state. The difference is almost all client time: `sent→present` is 19–23 ms against 7 ms steady. After a gap, Chromium restarts its BeginFrames and needs about one extra frame before it submits. The dmabuf arm on testhost2 is the exception (9.7 ms). The server side is *shorter* after idle (no flip pending, `fence→latch` 0 and `commit→vblank` ~11 ms), because the latch happens at once.
+
+**GPU helper path** (testhost2 dmabuf): `fence→latch` is 9–12 ms against 7.5 on shm, because the latch also waits for the helper's pending composite (`gpu_pending`). Steady-state earliest input is 33–35 ms, 2–4 ms worse than shm. Its server i2p recorded only n=1–3 samples per 300 events: the input stamp is claimed only in `settle`, for outputs whose `needs_paint()` holds, and on this path the answering frame paints from `on_flip` (issue #681). So #3952's "19.6–20.8 ms server i2p" for the helper arm was a few unrepresentative samples. The timeline's numbers are the real ones.
+
+### The readback arm's "6 ms edge": it no longer exists
+
+On current main the `gpu` (readback) arm is **within 0.5 ms of oop/shm** in every column, on both boxes, at 60 and 120 Hz, at scales 1 and 1.25, and for all three patterns. The stages rule out each mechanism proposed for it:
+
+- **Synchronous swap / earlier completion.** `sent→present` is the same (6.0–6.5 vs 5.9–6.3 ms on testhost2; 6.3 vs 7.0 on box1). The readback surface acking its own swap does not make the frame arrive earlier.
+- **Fewer buffers in flight.** Every arm has exactly 1.0 unpresented frames at the latch, so the depth of the pipeline is the same.
+- **Pacing on Presented vs BufferReleased.** `NITRO_ACK=present` changes nothing measurable; `NITRO_MAX_PENDING=2` only makes things worse.
+- **BeginFrame deadlines.** These are not separable from `sent→present` here, and that stage shows no difference.
+
+#3919's 17–19 ms (testhost2, scale 1) was measured before several later changes:
+- #3953 fixed the natural-scroll inversion. Before it, half the events scrolled past the top and produced no frame; the arms ran at ~31 fps and the i2p samples came from a different mix of frames.
+- #3940 changed the present path at fractional scale, and #3921 changed it again with dma-bufs.
+
+Re-run at scale 1 with the #3953 bench, the edge is gone: gpu 24.7 against oop 24.6 ms. It was an artefact of that setup, not a property of the readback path, so #3969 should not try to copy it.
+
+### Fixes, ranked by expected gain (handed to #3969)
+
+1. **Late latching / deadline commit in the server.** Hold a frame that arrives while a flip is pending, and commit it at `frame_deadline` (vblank − paint − margin) instead of immediately at `on_flip`. Also latch a frame arriving before the deadline into that very flip. This targets stages 3 + 5 (20–24 ms). Estimate: **−8 to −10 ms p50 at 60 Hz** (earliest ~30 → ~21 ms, i2p ~25 → ~16 ms), and −2 to −3 ms at 120 Hz. Paint is 2–3 ms (the helper's 1 ms), so a margin of ~4 ms is safe at 60 Hz.
+2. **First frame after idle (Chromium).** Keep BeginFrames armed briefly after an input, or feed viz a fresh vsync timebase on the first input after a gap, so the first frame submits on the next vblank. Estimate: **−8 to −12 ms on the first frame after a gap** (34–37 → ~25 ms). This is the case the burst pattern shows and the even pattern hides.
+3. **Align Chromium's BeginFrame deadline with the server's `frame_deadline`.** Once fix 1 is in, a frame that misses the deadline by a hair waits a whole refresh; sending the deadline in `Frame`/`Presented` lets viz aim for it. Estimate: −2 to −4 ms p50, and most of the `sent→present` p95 tail (16 ms).
+4. **GPU helper path.**
+   - Latch without waiting for the helper's pending composite where the plane layout allows it; estimate −2 to −4 ms, bringing it back to shm's `fence→latch`.
+   - Fix i2p accounting for it (#681); measurement only.
+5. **Ack policy / pending depth: no gain.** `NITRO_ACK=present` has no effect, and `NITRO_MAX_PENDING=2` costs +2 ms. Drop these.
+
+At 120 Hz box1 is already at 12.5 ms i2p p50. Fix 1 is worth ~2–3 ms there, and fix 2 is worth ~6 ms on the first frame after idle.
+
+### Footprint
+
+- **Off:** the timeline is a `None` in `Server`, 16 bytes with its clock pointer, 0 heap, and one branch per hook.
+- **On:** one 2048-row ring, ~240 KiB, freed by `timeline off`.
+- **Binary:** `nitro-server` release grew by about 5 KiB.
+- **box1 idle** after deploy (`just footprint 10`): nitro-server RssAnon 10 608 kB, the same as before (the timeline is off).
+
 ## Other gotchas
 
 - `headless_shell` forces `--ozone-platform=headless` (`headless_content_main_delegate.cc:272`). Use it as a compile check only, and run `chrome` for real tests.
@@ -698,7 +827,7 @@ server's capture ops (`docs/wire.md` § Screen capture, design in
 - **Build:** [chromium-build.md](chromium-build.md), `-j 48` via `cr-env.sh`; §11 is the shippable `out/Nitro` build.
 - **Deploy:** `just deploy-chromium` (box) or `just install-chromium` (local); see `docs/testbox.md` §Chromium.
 - **Input:** `nitro-shot --input ARGS` injects input server-side through the control socket (`wheel`, keys, pointer), so no harness is needed.
-- **Scroll benchmark:** `deploy/scroll-bench.py` injects the wheel test above against whatever client is under the pointer and prints a row in the format of the Measurements tables. `just chromium-bench inproc|oop|gpu [RUNS]` wraps it with a chrome launch and memory/CPU sampling (#3919).
+- **Scroll benchmark:** `deploy/scroll-bench.py` injects the wheel test above against whatever client is under the pointer and prints a row in the format of the Measurements tables. `just chromium-bench inproc|oop|gpu [RUNS]` wraps it with a chrome launch and memory/CPU sampling (#3919). Input patterns and per-stage latency (#3974): `NITRO_BENCH_PATTERN=all just chromium-bench oop` runs even/random/burst and prints the stage table from the server `timeline`; `nitro-shot --timeline [on|off|clear]` reads the raw rows (see §Input latency).
 
 ## Test box (#3865)
 
