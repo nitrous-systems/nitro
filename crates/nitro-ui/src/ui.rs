@@ -96,6 +96,11 @@ struct Window<S> {
     backdrop_sent: Option<(Size, nitro_core::Color)>,
     /// The widget keys go to when the server names this window.
     focused: Option<WidgetId>,
+    /// The widget a server-side focus loss took the focus from, given
+    /// back when the server focuses the window again. Any explicit focus
+    /// decision made while the window is inactive clears it, so that
+    /// decision wins over the restore.
+    restored_focus: Option<WidgetId>,
     hover_chain: Vec<WidgetId>,
     /// The last hit-test walk in this window, kept for `local_pos`; see
     /// [`Ui::pointer_move`].
@@ -148,6 +153,7 @@ impl<S> Window<S> {
             backdrop: None,
             backdrop_sent: None,
             focused: None,
+            restored_focus: None,
             hover_chain: Vec::new(),
             chain: Vec::new(),
             capture: None,
@@ -664,6 +670,11 @@ impl<S: 'static> Ui<S> {
                     if w.focused == Some(*d) {
                         w.focused = None;
                     }
+                }
+            }
+            for w in &mut self.windows {
+                if w.restored_focus == Some(*d) {
+                    w.restored_focus = None;
                 }
             }
             self.arena.remove(*d);
@@ -3322,12 +3333,44 @@ impl<S: 'static> Ui<S> {
         if f.focused {
             self.clipboard.focus = Some(f.window);
             self.active = win;
+            self.restore_focus(state, win);
         } else {
             if self.clipboard.focus == Some(f.window) {
                 self.clipboard.focus = None;
             }
             self.mods = 0;
+            // Remember where the keys went, so gaining the focus back
+            // (Alt+Tab from another app) puts them there again.
+            let prev = self.focused_in(win);
             self.blur_in(state, win);
+            if let Some(w) = self.win_mut(win) {
+                w.restored_focus = prev;
+            }
+        }
+    }
+
+    /// Give `win` back the widget a server-side focus loss took the focus
+    /// from, if nothing decided otherwise meanwhile and it can still take
+    /// it.
+    fn restore_focus(&mut self, state: &mut S, win: WindowId) {
+        let Some(id) = self.win_mut(win).and_then(|w| w.restored_focus.take()) else {
+            return;
+        };
+        if self.focused_in(win).is_some()
+            || self.window_of(id) != Some(win)
+            || !self.is_visible(id)
+            || !self.arena.slot(id).is_some_and(|s| s.state.focusable)
+        {
+            return;
+        }
+        self.focus(id);
+        self.deliver_focus_events(state);
+    }
+
+    /// Forget a pending focus restore: an explicit focus decision was made.
+    fn clear_restored_focus(&mut self, win: WindowId) {
+        if let Some(w) = self.win_mut(win) {
+            w.restored_focus = None;
         }
     }
 
@@ -4295,6 +4338,7 @@ impl<S: 'static> Ui<S> {
         let Some(w) = self.win_mut(win) else {
             return;
         };
+        w.restored_focus = None;
         if w.focused == Some(id) {
             return;
         }
@@ -4405,6 +4449,7 @@ impl<S: 'static> Ui<S> {
     /// [`Ui::deliver_focus_events`].
     pub fn unfocus(&mut self) {
         let win = self.active;
+        self.clear_restored_focus(win);
         if let Some(old) = self.win_mut(win).and_then(|w| w.focused.take()) {
             if let Some(slot) = self.arena.slot_mut(old) {
                 slot.state.focused = false;
@@ -4421,6 +4466,7 @@ impl<S: 'static> Ui<S> {
 
     /// Drop one window's focus entirely.
     pub fn blur_in(&mut self, state: &mut S, win: WindowId) {
+        self.clear_restored_focus(win);
         if let Some(old) = self.win_mut(win).and_then(|w| w.focused.take()) {
             if let Some(slot) = self.arena.slot_mut(old) {
                 slot.state.focused = false;
@@ -4439,6 +4485,7 @@ impl<S: 'static> Ui<S> {
     /// [`Ui::focus_next`] within one window: Tab never leaves the window
     /// the key was sent to.
     pub fn focus_next_in(&mut self, state: &mut S, win: WindowId, backwards: bool) {
+        self.clear_restored_focus(win);
         let order = self.focus_order_in(win);
         if order.is_empty() {
             return;

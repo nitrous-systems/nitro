@@ -1142,6 +1142,43 @@ fn a_shift_left_over_from_before_a_blur_does_not_extend() {
     assert_eq!(sel(&h, id), vec![5]);
 }
 
+#[test]
+fn the_focus_comes_back_to_the_list_when_the_window_is_focused_again() {
+    // Another app (a video player) takes the keyboard, then Alt+Tab
+    // comes back: the arrow keys must walk the list again.
+    let (mut h, id) = list_of(20, 300.0);
+    click_row(&mut h, id, 2);
+    assert_eq!(h.ui().focused(), Some(id));
+    h.server_focus(nitro_ui::WindowId::MAIN, false);
+    assert_eq!(h.ui().focused(), None, "a focus loss blurs the list");
+    h.server_focus(nitro_ui::WindowId::MAIN, true);
+    assert_eq!(h.ui().focused(), Some(id), "and a focus gain gives it back");
+    h.key(key::DOWN);
+    h.settle();
+    assert_eq!(h.widget::<List<Vec<usize>>>(id).cursor(), 3);
+}
+
+#[test]
+fn a_blur_while_the_window_is_inactive_wins_over_the_restore() {
+    let (mut h, id) = list_of(20, 300.0);
+    click_row(&mut h, id, 2);
+    h.server_focus(nitro_ui::WindowId::MAIN, false);
+    {
+        let (ui, s) = h.parts();
+        ui.blur(s);
+    }
+    h.server_focus(nitro_ui::WindowId::MAIN, true);
+    assert_eq!(h.ui().focused(), None, "the explicit blur is kept");
+
+    // And a focus given meanwhile is kept too, not overwritten.
+    click_row(&mut h, id, 2);
+    h.server_focus(nitro_ui::WindowId::MAIN, false);
+    let root = h.ui().root().unwrap();
+    h.parts().0.focus(root);
+    h.server_focus(nitro_ui::WindowId::MAIN, true);
+    assert_eq!(h.ui().focused(), Some(root));
+}
+
 // -- dragging rows (`on_drag`) -------------------------------------------
 
 /// What a draggable list's callbacks saw.

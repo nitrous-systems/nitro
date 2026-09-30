@@ -588,6 +588,18 @@ impl<S: 'static> Harness<S> {
         self.settle();
     }
 
+    /// Deliver a `Focus` for `win`, as the server sends when the window
+    /// gains or loses the keyboard (another app raised, Alt+Tab back),
+    /// and settle.
+    pub fn server_focus(&mut self, win: WindowId, focused: bool) {
+        let msg = nitro_wire::msg::ServerMsg::Focus(nitro_wire::msg::Focus {
+            window: win.raw(),
+            focused,
+        });
+        self.ui.dispatch(&mut self.state, &msg);
+        self.settle();
+    }
+
     // -- input --------------------------------------------------------
 
     /// Move the pointer to `pos`, in window coordinates.

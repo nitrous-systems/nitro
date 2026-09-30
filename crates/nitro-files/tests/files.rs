@@ -908,6 +908,46 @@ fn delete_asks_first_and_n_leaves_the_file_where_it_is() {
 }
 
 #[test]
+fn the_list_keeps_the_keyboard_across_another_app_taking_it() {
+    // Opening a video launches a player, which takes the keyboard; Alt+Tab
+    // back must leave the arrow keys walking the list, not the root.
+    let (root, dir) = fixture("focus-back");
+    write(&dir.join("a.txt"), "a");
+    write(&dir.join("b.txt"), "b");
+    write(&dir.join("c.txt"), "c");
+    let (mut h, ids) = app(&dir, &root.join("xdg"));
+    h.key(key::DOWN);
+    h.settle();
+    assert_eq!(h.widget::<List<Files>>(ids.list).cursor(), 1);
+    assert_eq!(h.ui().focused(), Some(ids.list));
+
+    h.server_focus(nitro_ui::WindowId::MAIN, false);
+    h.server_focus(nitro_ui::WindowId::MAIN, true);
+    assert_eq!(h.ui().focused(), Some(ids.list), "the focus came back");
+    assert_eq!(h.widget::<List<Files>>(ids.list).cursor(), 1);
+    h.key(key::DOWN);
+    h.settle();
+    assert_eq!(
+        h.widget::<List<Files>>(ids.list).cursor(),
+        2,
+        "the arrow keys walk the list again"
+    );
+
+    // A pending question keeps the keyboard across a loss and a gain:
+    // `n` still answers it rather than typing ahead in the list.
+    h.key(key::DELETE);
+    h.settle();
+    assert!(h.state().pending_confirm().is_some());
+    h.server_focus(nitro_ui::WindowId::MAIN, false);
+    h.server_focus(nitro_ui::WindowId::MAIN, true);
+    assert_eq!(h.ui().focused(), None);
+    h.key(key::N);
+    h.settle();
+    assert!(h.state().pending_confirm().is_none());
+    assert!(dir.join("c.txt").exists());
+}
+
+#[test]
 fn a_pending_confirm_swallows_the_ctrl_shortcuts() {
     // Issue #559, the other door into the room the confirm-blur closed.
     // `install()` registers the five `Ctrl+…` shortcuts *before*
