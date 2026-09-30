@@ -68,6 +68,7 @@ use nitro_core::{Color, Rect, Size};
 use nitro_wire::msg::Fill;
 
 use crate::ColorRole;
+use crate::WidgetId;
 use crate::build::{Built, IntoWidget, StyleBuilder};
 use crate::event::{Event, Handled, button, key};
 use crate::layout::Constraints;
@@ -77,7 +78,6 @@ use crate::theme::TextStyle;
 use crate::ui::{Ui, WidgetMut, WindowId};
 use crate::widget::{Access, EventCx, LayoutCx, MeasureCx, PaintCx, Role, TextRun, Widget};
 use crate::wire::TextMetrics;
-use crate::WidgetId;
 
 // ---------------------------------------------------------------------
 // The measurements, in one place
@@ -285,7 +285,11 @@ impl MenuNav {
         // nothing is highlighted yet.
         let mut i = from.unwrap_or(if forward { n - 1 } else { 0 });
         for _ in 0..n {
-            i = if forward { (i + 1) % n } else { (i + n - 1) % n };
+            i = if forward {
+                (i + 1) % n
+            } else {
+                (i + n - 1) % n
+            };
             if self.selectable[i] {
                 return Some(i);
             }
@@ -500,18 +504,19 @@ impl<S: 'static> MenuButton<S> {
         self.popup = Some(win);
         self.list = Some(root);
         let refocus = cx.ui.click_takes_focus();
-        cx.ui.on_window_closed(win, move |_s: &mut S, ui: &mut Ui<S>| {
-            if let Ok(mut b) = ui.widget_mut::<MenuButton<S>>(button)
-                && b.popup == Some(win)
-            {
-                b.popup = None;
-                b.list = None;
-                b.request_paint();
-            }
-            if refocus {
-                ui.focus(button);
-            }
-        });
+        cx.ui
+            .on_window_closed(win, move |_s: &mut S, ui: &mut Ui<S>| {
+                if let Ok(mut b) = ui.widget_mut::<MenuButton<S>>(button)
+                    && b.popup == Some(win)
+                {
+                    b.popup = None;
+                    b.list = None;
+                    b.request_paint();
+                }
+                if refocus {
+                    ui.focus(button);
+                }
+            });
         // A `NO_FOCUS` parent never gets keys; the popup reads them
         // through a grab instead (the server drops it with the popup).
         if cx.ui.is_shell() && !refocus {
@@ -608,7 +613,14 @@ impl<S: 'static> Widget<S> for MenuButton<S> {
     fn accessible(&self) -> Access {
         Access {
             name: Some(self.label.clone()),
-            value: Some(if self.popup.is_some() { "open" } else { "closed" }.to_owned()),
+            value: Some(
+                if self.popup.is_some() {
+                    "open"
+                } else {
+                    "closed"
+                }
+                .to_owned(),
+            ),
             actions: if self.enabled {
                 vec!["click", "activate", "focus", "open"]
             } else {
@@ -843,7 +855,10 @@ impl<S: 'static> MenuList<S> {
             key::HOME => self.nav.first(),
             key::END => self.nav.last(),
             key::ENTER | key::SPACE => {
-                return self.nav.activate().map_or(Outcome::Ignored, Outcome::Activate);
+                return self
+                    .nav
+                    .activate()
+                    .map_or(Outcome::Ignored, Outcome::Activate);
             }
             key::ESC => return Outcome::Close,
             _ => return Outcome::Ignored,
@@ -978,7 +993,10 @@ impl<S: 'static> Widget<S> for MenuList<S> {
         let (tops, _) = row_offsets(&seps);
         let w = (bounds.w - 2.0 * MENU_PAD).max(0.0);
         for (i, c) in cx.children().into_iter().enumerate() {
-            let (top, sep) = (tops.get(i).copied().unwrap_or(0.0), seps.get(i) == Some(&true));
+            let (top, sep) = (
+                tops.get(i).copied().unwrap_or(0.0),
+                seps.get(i) == Some(&true),
+            );
             let h = if sep { MENU_SEP_H } else { MENU_ROW_H };
             cx.place_child(c, Rect::new(MENU_PAD, MENU_PAD + top, w, h));
         }
@@ -1108,7 +1126,12 @@ impl<S: 'static> Widget<S> for MenuRow {
         let label = self.item.label.clone();
         cx.text(
             2,
-            Rect::new(x, ((b.h - h) / 2.0).max(0.0), (b.w - x - ROW_PAD).max(0.0), h),
+            Rect::new(
+                x,
+                ((b.h - h) / 2.0).max(0.0),
+                (b.w - x - ROW_PAD).max(0.0),
+                h,
+            ),
             &label,
             TextRun::new(&style, color),
         );
@@ -1190,7 +1213,12 @@ impl<S: 'static> Widget<S> for MenuSeparator {
         let line = cx.color(ColorRole::Track);
         cx.fill_rect(
             0,
-            Rect::new(ROW_PAD, (b.h / 2.0).floor(), (b.w - 2.0 * ROW_PAD).max(0.0), 1.0),
+            Rect::new(
+                ROW_PAD,
+                (b.h / 2.0).floor(),
+                (b.w - 2.0 * ROW_PAD).max(0.0),
+                1.0,
+            ),
             line,
         );
     }
@@ -1225,7 +1253,11 @@ mod tests {
         n.prev();
         assert_eq!(n.highlight, Some(3));
         n.prev();
-        assert_eq!(n.highlight, Some(0), "skips the disabled item and the separator");
+        assert_eq!(
+            n.highlight,
+            Some(0),
+            "skips the disabled item and the separator"
+        );
     }
 
     #[test]
@@ -1286,7 +1318,15 @@ mod tests {
     #[allow(clippy::float_cmp)] // exact sums of small constants
     fn offsets_account_for_separators() {
         let (tops, h) = row_offsets(&[false, true, false, false]);
-        assert_eq!(tops, vec![0.0, MENU_ROW_H, MENU_ROW_H + MENU_SEP_H, 2.0 * MENU_ROW_H + MENU_SEP_H]);
+        assert_eq!(
+            tops,
+            vec![
+                0.0,
+                MENU_ROW_H,
+                MENU_ROW_H + MENU_SEP_H,
+                2.0 * MENU_ROW_H + MENU_SEP_H
+            ]
+        );
         assert_eq!(h, 3.0 * MENU_ROW_H + MENU_SEP_H);
         assert_eq!(row_offsets(&[]), (Vec::new(), 0.0));
     }
@@ -1298,7 +1338,10 @@ mod tests {
             ids: vec![Some("a".into()), None, Some("b".into())],
             nav: nav(&[true, false, true]),
         };
-        assert!(matches!(l.key(key::ENTER), Outcome::Ignored), "nothing highlighted");
+        assert!(
+            matches!(l.key(key::ENTER), Outcome::Ignored),
+            "nothing highlighted"
+        );
         assert!(matches!(l.key(key::DOWN), Outcome::Moved));
         assert!(matches!(l.key(key::DOWN), Outcome::Moved));
         assert!(matches!(l.key(key::ENTER), Outcome::Activate(2)));

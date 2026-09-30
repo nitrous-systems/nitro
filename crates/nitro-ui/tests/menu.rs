@@ -70,7 +70,10 @@ fn a_click_opens_the_menu_under_the_button() {
         (p.y - (main.y + a.bottom()).ceil()).abs() <= 1.0,
         "top at the button's bottom: popup {p:?} button {a:?} main {main:?}"
     );
-    assert!((p.x - (main.x + a.x).floor()).abs() <= 1.0, "left edges aligned");
+    assert!(
+        (p.x - (main.x + a.x).floor()).abs() <= 1.0,
+        "left edges aligned"
+    );
     let size = h.ui().window_size_of(pop);
     assert!(size.w >= nitro_ui::menu::MENU_MIN_W, "{size:?}");
     assert_eq!(
@@ -105,7 +108,10 @@ fn keys_on_the_parent_navigate_and_activate() {
     h.key(key::UP);
     h.key(key::UP);
     h.key(key::SPACE);
-    assert_eq!(h.state().picked, vec!["reboot".to_owned(), "console".to_owned()]);
+    assert_eq!(
+        h.state().picked,
+        vec!["reboot".to_owned(), "console".to_owned()]
+    );
     h.quit();
 }
 
