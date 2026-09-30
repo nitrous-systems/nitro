@@ -68,6 +68,15 @@ for c in $(cat "/proc/$main/task/$main/children" 2>/dev/null); do
     # is listed for honesty but left out of the total.
     pids+=("$c")
 done
+# ... plus the server's own children: the GPU helper (#3922) is spawned
+# by nitro-server, not the session.
+for p in "${pids[@]}"; do
+    if [[ $(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | awk '{print $1}' | xargs -r basename) == nitro-server ]]; then
+        for c in $(cat "/proc/$p/task/$p/children" 2>/dev/null); do
+            pids+=("$c")
+        done
+    fi
+done
 
 name_of() { tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null | awk '{print $1}' | xargs -r basename; }
 field()   { awk -v k="$2:" '$1==k {print $2}' "/proc/$1/status" 2>/dev/null; }

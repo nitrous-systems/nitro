@@ -10,7 +10,7 @@
 #              `box_bins` in deploy/dev.just) so there is one source of
 #              truth; a name that is not built prints `absent` rather
 #              than failing. `nitro-gpu-vulkan` (#3920) is the GPU
-#              helper; it is built but not yet installed on the box.
+#              helper, installed and spawned by nitro-server (#3922).
 #   deps     — the two `cargo tree` numbers docs/budget.md's "Dependency
 #              count" section defines: sorted unique lines, and distinct
 #              external crate names.

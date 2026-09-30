@@ -1718,9 +1718,27 @@ byte-identical, other binaries byte-identical.
   numbers). The server reports the live figures as `gpu_helper_rss`,
   `gpu_helper_pss` and `gpu_helper_drm_total`. `gpu.helper = on-demand`
   pays this only while something is composited; `off` pays nothing.
-- **Not yet measured on testhost2**: composite latency
-  (`gpu_composite_us_*`), GPU-awake time (`gpu_busy_us`), and helper
-  RSS with two overlapping videos.
+- **Measured on box1** (Haswell, hasvk, 1920×1080@60, `just deploy` +
+  `just footprint` at d345146). Two `nitro-demo --video --scanout
+  --format xr24 --no-controls` windows overlap: one on the overlay, the
+  other composited by the helper (`planes_mode 2`):
+
+  | quantity | value |
+  |---|---|
+  | `gpu_composite_us` (`Composite` → `Composited`) | avg 435 µs, max 1.0–1.7 ms |
+  | `gpu_busy_us` over 10 s | 3.73 s for 601 frames (submit → fence seen in epoll, so it includes wakeup latency: an upper bound) |
+  | server CPU, 10 s | 66 ticks with the helper vs 44 with `gpu.helper = off` (same scene, mode 1 + CPU) |
+  | helper idle | VmRSS 11 048 kB, RssAnon 1 260 kB, Pss 7 267 kB |
+  | helper compositing | VmRSS 11 804 kB, Pss ~7.4 MB, `drm-total` ~1 MB |
+  | server RssAnon, idle desktop | 10 464 kB (helper on) vs 10 468 kB (`off`): no change |
+  | server RssAnon in mode 2 | 2 620 kB: the 8 MB shadow moved to RssShmem, as designed |
+  | idle desktop tree (`just footprint`) | 30 668 → 41 724 kB VmRSS, the difference being the helper process |
+
+  `kill -9` of the helper mid-video: `gpu_crashes 1`, `gpu_fallbacks 1`,
+  respawned (`gpu_spawns 2`) and back in mode 2 within a second. A VT
+  switch away (`chvt 1`) stopped it (`gpu_state 0`, `planes_mode 0`), and
+  switching back respawned it and returned to mode 2.
+- **Not measured on testhost2** (Kaby Lake/anv, the human's GDM session).
 
 ## Client dma-bufs (#3918)
 
