@@ -145,3 +145,13 @@ The workspace builds on musl with Alpine's rust, with no source changes.
 The places at risk were checked: rustix (linux_raw backend, no libc),
 nonstick (`-lpam` against linux-pam), libseat-sys and input-sys
 (pkg-config), and nitro-video's C shim against ffmpeg-dev.
+
+## Troubleshooting
+
+- **`mount overlay … no such device`** from rootless podman: the kernel's
+  overlay module cannot load, typically because the kernel was upgraded
+  and the host not yet rebooted. Reboot, or point podman at
+  fuse-overlayfs with a wrapper on PATH:
+  `exec /usr/bin/podman --storage-opt overlay.mount_program=/usr/bin/fuse-overlayfs "$@"`.
+- **Files in `dist/out` you cannot delete** after an interrupted rootless
+  build: `podman unshare rm -rf dist/out/<distro>`.
