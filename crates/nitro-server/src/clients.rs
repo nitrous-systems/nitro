@@ -239,6 +239,11 @@ pub struct WireClient {
     /// cannot be honoured retroactively by a server that threw the list
     /// away.
     pub client_caps: u32,
+    /// Whether this client has ever been sent a `DragEnter`. Such a client
+    /// may lose the race between its drag read and the `DragLeave` already
+    /// on its way, so a `RequestSelection { source: Drag }` from it outside
+    /// a drag is answered at EOF rather than refused.
+    pub dnd_entered: bool,
     /// The last `Modifiers` masks sent to this client, so an unchanged
     /// state is silence. `None` = never sent, or must be re-sent (it lost
     /// keyboard focus, and missed every change since).
@@ -275,6 +280,7 @@ impl WireClient {
             unpresented: Vec::new(),
             texts: HashMap::new(),
             client_caps: 0,
+            dnd_entered: false,
             last_mods: None,
             peer_uid: None,
             imports: HashSet::new(),

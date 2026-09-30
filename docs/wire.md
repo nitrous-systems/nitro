@@ -3197,7 +3197,10 @@ The destination reads the dragged bytes with an ordinary
 `RequestSelection` carrying `source: Drag`, answered by the same
 `SelectionRequest`/`SendSelection`/`SelectionData` machinery. That request
 is valid only between a `DragEnter` and the matching `DragLeave` or the
-end of the drop; outside that window it is `Error { Protocol }`.
+end of the drop. Outside that window it is answered at EOF from a client
+that has ever been sent a `DragEnter` — it may be racing a `DragLeave` or
+the drag's end it has not read yet, which a correct client cannot avoid —
+and is `Error { Protocol }` from one that never has.
 
 **The source learns the action only at `DragFinished`.** There is no
 mid-drag action message — Wayland's `wl_data_source.action` — and that is
@@ -3288,7 +3291,8 @@ Four decisions the sequence above leaves open, fixed by the M5-H server:
   an app started after the copy can paste without waiting for the next one.
 
 A `RequestSelection` with `source: Drag` from a client that is not the
-current drop target is `Error { Protocol }`. A new `SetSelection` cancels
+current drop target is answered at EOF if the client was ever sent a
+`DragEnter` (the race above), and `Error { Protocol }` otherwise. A new `SetSelection` cancels
 clipboard requests only, never a drop being read; the end of a drag
 cancels only drag ones.
 A `DATA` op from a client that did not list `DATA` in `ClientCaps`, or from

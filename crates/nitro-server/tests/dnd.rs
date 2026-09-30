@@ -584,13 +584,14 @@ fn a_rejecting_target_gives_the_source_accepted_false() {
     s.b.drag_leave(s.wb);
     assert_eq!(s.a.finished(), (false, DragAction::None));
     assert!(!s.b.saw(|m| matches!(m, ServerMsg::DragDrop(_))));
-    // The offer is gone for B: a drag read now is a protocol error.
+    // The offer is gone for B. B was a target, so a late drag read is the
+    // race with its DragLeave: answered at EOF, not fatal.
     assert_eq!(h.stat("dnd_active"), 1, "the source still owes FinishDrag");
     s.a.finish();
     wait_for("the release", || h.stat("dnd_active") == 0);
     assert_eq!(h.stat("dnd_cancels"), 1);
     s.b.request(1);
-    assert_eq!(s.b.error(), ErrorCode::Protocol);
+    assert!(read_all(&s.b.data(1)).is_empty(), "a late read ends at EOF");
     h.quit();
 }
 
@@ -1067,14 +1068,23 @@ fn the_source_finishing_mid_drag_cancels_it() {
 }
 
 #[test]
-fn a_drag_read_from_a_non_target_is_fatal() {
+fn a_late_drag_read_ends_at_eof_and_a_strangers_is_fatal() {
     let _fds = shared();
     let mut h = Harness::start("nontarget");
     let mut s = two(&mut h);
     drag_onto_b(&mut h, &mut s, NodeId::NONE);
-    // A is the source, not the target: it may not read its own offer.
+    // A was the target over its own window and has left it: its read is
+    // racing that DragLeave, and ends at EOF without asking the source.
     s.a.request(1);
-    assert_eq!(s.a.error(), ErrorCode::Protocol);
+    assert!(read_all(&s.a.data(1)).is_empty(), "a late read ends at EOF");
+    assert!(
+        !s.a.saw(|m| matches!(m, ServerMsg::SelectionRequest(_))),
+        "the source is not asked for a non-target's read"
+    );
+    // A client that was never a target has no race to lose: fatal.
+    let mut c = h.peer("c");
+    c.request(1);
+    assert_eq!(c.error(), ErrorCode::Protocol);
     h.quit();
 }
 

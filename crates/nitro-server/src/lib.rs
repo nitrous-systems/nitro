@@ -7364,9 +7364,13 @@ impl Server {
             return false;
         }
         let drag = m.source == nitro_wire::types::DataSource::Drag;
-        let fatal = if drag && !self.dnd.as_ref().is_some_and(|d| d.is_drop_target(token)) {
-            // Valid only while this client is the drop target: between a
-            // `DragEnter` and its `DragLeave`, or dropped on and reading.
+        let target = drag && self.dnd.as_ref().is_some_and(|d| d.is_drop_target(token));
+        // Valid only while this client is the drop target: between a
+        // `DragEnter` and its `DragLeave`, or dropped on and reading. A
+        // client that has been a target may be racing a `DragLeave` (or
+        // the drag's end) it has not read yet: answered at EOF below.
+        let entered = self.wire_clients.get(&token).is_some_and(|c| c.dnd_entered);
+        let fatal = if drag && !target && !entered {
             Some("RequestSelection { source: Drag } outside a drag")
         } else if self.data.has_reply_id(token, m.request) {
             Some("RequestSelection reuses an outstanding request id")
@@ -7383,7 +7387,7 @@ impl Server {
         let owner = if drag {
             self.dnd
                 .as_ref()
-                .filter(|d| d.mimes.contains(&m.mime))
+                .filter(|d| target && d.mimes.contains(&m.mime))
                 .map(|d| d.source)
         } else {
             self.data
@@ -11437,6 +11441,9 @@ impl Server {
                             mimes: mimes.clone(),
                         })
                     });
+                    if let Some(c) = sent_to.and_then(|t| self.wire_clients.get_mut(&t)) {
+                        c.dnd_entered = true;
+                    }
                     self.note_client_input(sent_to);
                 }
                 // A new target has accepted nothing yet.
