@@ -358,7 +358,7 @@ This is the directory `NITRO_CHROMIUM_OUT` points at by default.
 
 ```bash
 cd /home/kaspar/src/ai/chromium
-./cr-env.sh env PATH=/home/kaspar/depot_tools:/usr/local/bin:/usr/bin:/bin DEPOT_TOOLS_UPDATE=0 bash -c 'cd src && gn gen out/Nitro --args="is_debug=false is_component_build=false symbol_level=0 blink_symbol_level=0 use_ozone=true ozone_auto_platforms=false ozone_platform_nitro=true ozone_platform_headless=true ozone_platform=\"nitro\" use_remoteexec=false use_siso=false treat_warnings_as_errors=false dcheck_always_on=false is_official_build=false"'
+./cr-env.sh env PATH=/home/kaspar/depot_tools:/usr/local/bin:/usr/bin:/bin DEPOT_TOOLS_UPDATE=0 bash -c 'cd src && gn gen out/Nitro --args="is_debug=false is_component_build=false symbol_level=0 blink_symbol_level=0 use_ozone=true ozone_auto_platforms=false ozone_platform_nitro=true ozone_platform_headless=true ozone_platform=\"nitro\" use_remoteexec=false use_siso=false treat_warnings_as_errors=false dcheck_always_on=false is_official_build=false use_vaapi=true proprietary_codecs=true ffmpeg_branding=\"Chrome\""'
 ./cr-env.sh env PATH=/home/kaspar/depot_tools:/usr/local/bin:/usr/bin:/bin DEPOT_TOOLS_UPDATE=0 \
   autoninja -j 48 -C /home/kaspar/src/ai/chromium/src/out/Nitro chrome chrome_sandbox
 ```
@@ -375,6 +375,21 @@ cd /home/kaspar/src/ai/chromium
 | deployed set | 429 MB: `chrome`, `chrome_crashpad_handler`, `chrome_{100,200}_percent.pak`, `resources.pak`, `icudtl.dat`, `v8_context_snapshot.bin`, `snapshot_blob.bin`, `libEGL.so`, `libGLESv2.so`, `libvk_swiftshader.so`, `vk_swiftshader_icd.json`, `libvulkan.so.1`, `locales/*.pak` (without the 70 MB of `*.info`), `resources/` |
 
 **Runtime system deps on a desktop-less box:** chrome `NEEDED`s `libatk-1.0`, `libatk-bridge-2.0` and `libatspi`, which the box lacked. `just deploy-chromium` apt-installs them. The alternative is rebuilding with `use_atk=false`.
+
+### Video (#3944): `use_vaapi`, H.264
+
+Three args were added to `out/Nitro` for video overlays:
+
+| arg | why |
+|---|---|
+| `use_vaapi=true` | `media/gpu/args.gni` defaults it to true only with the X11 or Wayland platform, so without it there is no `VaapiVideoDecoder`. VA is opened through DRM (`vaGetDisplayDRM`), with no X11 dependency |
+| `proprietary_codecs=true`, `ffmpeg_branding="Chrome"` | without them Chromium cannot demux or decode H.264, which is what a 1080p test clip and most web video are |
+
+Incremental rebuild after adding them to an existing `out/Nitro`: 10 970
+steps, 1 211 s at `-j 48`. At runtime the GPU process `dlopen`s the
+system's libva driver (`iHD_drv_video.so` on testhost2, `i965_drv_video.so`
+on box1; `iHD` fails to initialise on Haswell and falls through, which is
+harmless). No new system package was needed on either box.
 
 ### GPU path (#3921): no new gn args
 

@@ -28,6 +28,7 @@ The backend lives in the Chromium tree, not in this repo: `ui/ozone/platform/nit
   - **Cost of the split:** `CreateBuffer` is registered at the next `Commit` while `PresentSurface` acts at receipt, so the GPU process commits once per new buffer (3 per window size), not per frame.
 - **`--in-process-gpu`** keeps the #3778 path: one connection, an **Image** node per window, and `NitroCanvas` on the in-process viz thread posts `CreateBuffer`/`SetImage`/`BufferDamage`/`Commit` to the UI thread. Both paths share `NitroCanvas`; it talks to a `NitroPresenter`, which is either `NitroConnectionHost` or `NitroGpuConnection`.
 - **GPU path (#3921):** out of process, when the server has `DMABUF` and a render node opens, viz renders into GBM pixmaps and `GbmSurfacelessNitro` presents them with `CreateDmabufBuffer` + `PresentSurfaceFenced`. See [GPU rendering via dma-buf](#gpu-rendering-via-dma-buf-3921).
+- **Video overlays (#3944):** a quad viz promotes (VA-API's NV12 decode output) becomes a Surface node of its own, a sibling of the window's primary Surface: stacked above it, or before it as an underlay. The GPU process asks the browser for it over a second mojom interface, `NitroGpuHost` (`RequestOverlaySurface`, `SetOverlayGeometry`, `ReleaseOverlaySurface`, bound by `NitroGpu.BindHost`). The browser creates, places and exports the node like the primary one and answers with `NitroGpu.SetOverlayToken`. Frames go straight from the GPU process to the import with `PresentSurfaceFenced`. See [Video overlays](#video-overlays-3944).
 - **Server requirement:** `SURFACE` and `SHARE` (#3897, #3904). An older server makes the out-of-process path fail at startup with a message naming the missing caps; use `--in-process-gpu` against it.
 - **Canvas:**
   - 3 shm buffers (`UnsafeSharedMemoryRegion`), with Skia rastering straight into the mapping via `SkSurfaces::WrapPixels`.
@@ -80,7 +81,7 @@ All of this was verified on a fake-backend nitro server (1280x720@60), driven by
 
 ## What doesn't / is not verified
 
-- **GPU rendering** is done (#3921, [below](#gpu-rendering-via-dma-buf-3921)). Not done: video overlays (VA-API decode output as its own Surface) are #3944; ANGLE's GL backend is not built for this platform, so ANGLE-Vulkan is the only GPU backend.
+- **GPU rendering** is done (#3921, [below](#gpu-rendering-via-dma-buf-3921)). Video overlays are done too (#3944, [below](#video-overlays-3944)). Not done: ANGLE's GL backend is not built for this platform, so ANGLE-Vulkan is the only GPU backend.
 - **Drag-resize** can show one stretched frame while the GPU process catches up (see Architecture).
 - **HiDPI:** nitro logical = DIP, buffers = physical px, scale from `OutputInfo`. Since #3940 every logical size Chromium sends (`CreateWindow.size`, `CreatePopup.size`, the root/Image/Surface `SetBounds`) is the exact float `px / scale`, divided rather than multiplied by `1/scale` and not ceiled. At 1.25, `f32(px/1.25)*1.25 == px` for every integer px below 4000, so the server maps the buffer back to exactly its own size. The server snaps window roots to whole device pixels, so the buffer is drawn 1:1 (opaque copy, no resampling) at a fractional scale; see §testhost2 (#3940).
 - **Popup types:** `kPopup`/`kBubble` windows are nitro popups too; there is no subsurface equivalent. They are placed by the server, and only `kMenu` grabs.
@@ -410,8 +411,118 @@ did not happen.
   helper compositing `AR24`, #3922) is the next lever.
 - **Memory:** the GPU process is +35 MB PSS on testhost2 and +65–70 MB on
   box1 against shm, the Mesa/ANGLE-Vulkan driver state; the tree +20–70 MB.
-- **CPU during 1080p video** was not measured: Chromium's VA-API output as
-  a Surface is #3944, and without it video is just GPU-composited quads.
+- **CPU during 1080p video:** see [Video overlays](#video-overlays-3944)
+  (#3944).
+
+## Video overlays (#3944)
+
+Chromium `nitro-ozone` at `558eb447d6` (on top of #3952's `b30a7ce0d0`).
+Build args: `use_vaapi=true proprietary_codecs=true
+ffmpeg_branding="Chrome"` ([chromium-build.md](chromium-build.md) §11).
+
+**What happens.** With the Vulkan features on (the wrapper's flags), Chrome
+picks `VaapiVideoDecoder` and decodes into NV12 dma-bufs (zero-copy). viz
+runs its overlay strategies (`kFullscreen`, `kSingleOnTop`, `kUnderlay`),
+because `supports_overlays` is true in both processes. The browser
+predicts it from the same inputs the GPU process uses: out-of-process,
+server `DMABUF`, no `--disable-gpu`, no `NITRO_NO_DMABUF`. It is therefore
+decided in `GetPlatformRuntimeProperties`, with no `--enable-hardware-overlays`
+flag. `NitroOverlayCandidates` accepts a candidate if all of these hold:
+
+- NV12 or BGRX/BGRA;
+- opaque, with no transform;
+- not downscaled below 94 % (the planes module's `MIN_SCALE_PCT`; a
+  smaller quad would go to the GPU helper, which costs more than viz
+  compositing it);
+- its pixmap's (fourcc, modifier) is flagged `SCANOUT` in the window's
+  per-node `DmabufFeedback`;
+- at most 4 per window;
+- underlays only under a translucent (AR24) primary.
+
+A clip is allowed: the presenter shrinks the node and the source rect to
+it. Everything else is composited by viz as before.
+
+**Three fixes outside the obvious path were needed:**
+
+1. **The NV12 shared image was not pixmap-backed.** `AngleVulkanImageBackingFactory` (VulkanFromANGLE) came first and took the decoder's NV12 pixmap, so viz found no `NativePixmap` for the candidate and blanked it. Upstream-side change: that factory now leaves SCANOUT `NATIVE_PIXMAP` images to `OzoneImageBacking` when the platform supports overlays.
+2. **`OzoneImageBacking` refused NV12.** It asks `CanCreateNativePixmapForFormat`, and Mesa's GBM does not allocate NV12. The nitro factory now says yes to NV12, which is only ever imported.
+3. **Empty primary damage.** With the video on its own plane, viz re-presents the primary with an empty damage rect every frame, meaning "nothing changed". On the wire an empty list means *everything*, so the server repainted the whole window at 60 Hz. The presenter now sends one pixel instead.
+
+Also: a `kFullScreen` candidate, or one viz blanked for lack of a pixmap, is z-order 0 too. It is no longer mistaken for viz's own primary; that mistake crashed box1's GPU process in the fullscreen strategy.
+
+**Stacking and geometry.** Overlay nodes are children of the window root
+next to the primary Surface: `before=NONE` (topmost) for z>0, and
+`before=<primary>` for an underlay. Placement is in window px, sent as
+`px/scale` (#3940). A geometry change is one browser transaction and is
+coalesced: while the video only plays, nothing crosses the mojo pipe.
+**Known limitation:** the overlay's position goes through the browser, so
+while scrolling it can lag the primary by one browser round trip. Video
+frames themselves never touch the browser. A slot not scheduled in a
+frame is hidden. After 60 frames unused, its node and buffers are
+released. Hiding or closing the window drops the nodes, and a GPU process
+restart destroys them; the GPU process asks again on its next promotion.
+
+**Knob:** `NITRO_NO_OVERLAYS=1` in chrome's environment turns overlays
+off in both processes, which is the "composited" arm.
+
+**Buffers:** the VA frame pool is 21 frames at 1080p. Peak `buffers` was
+**26** on testhost2 (the window's 3 plus 22–23 decoded frames), under the
+32-per-client cap, and back to 0 when chrome closed. No `Limit` was seen,
+so the cap is unchanged.
+
+### Measurements
+
+`just chromium-bench video` (`deploy/chromium-bench.sh video`). Each run:
+
+- a fresh profile;
+- 10 s settle;
+- 20 s sample;
+- a testsrc2 H.264 High clip at 60 fps, made on the box with ffmpeg.
+
+CPU is % of one core over the 20 s. "chrome" is the whole chrome tree,
+"server" is nitro-server. Two or three runs per row. Chrome's CPU is noisy
+run to run (±30 points on testhost2, where the CPU clocks move a lot);
+the server column is steady.
+
+**testhost2** (i5-8250U, UHD 620 KBL, eDP 2560×1440@60, scale 1.25; iHD
+VA):
+
+| arm | overlays | chrome CPU | server CPU | `planes_mode` | `plane_flips` /20 s | server damage px/frame |
+|---|---|---|---|---|---|---|
+| 1080p in a 1280×720 CSS box (1600×900 px, downscaled 0.83×) | on | 50–95 % | 16 % | 0 | 0 | 1 128 600 (rejected: downscale) |
+| same | off | 22–47 % | 16 % | 0 | 0 | 1 128 600 |
+| 720p in a 1024×576 CSS box (1:1) | on | 14–46 % | **1.5–2.0 %** | **1** (overlay above) | 0 (primary is CPU-composited, unchanged) | **1** |
+| same | off | 42–75 % | 13–14 % | 0 | 0 | 902 880 |
+| 1080p fullscreen (`--start-fullscreen`, video 2560×1440) | on | 13–43 % | **1.4–2.0 %** | **3** (direct scanout of the NV12 buffer) | 1 238–1 249 (= fps) | — |
+| same | off | 30–64 % | 36–46 % | 0 | 0 | 3 686 400 |
+
+The first 1080p row is still rejected even with overlays on: a 1600-px
+box on a 1920-px clip is a downscale that planes refuse.
+
+**box1** (Pentium G3240, HSW GT1, 1920×1080@60; i965 VA): **no overlays, as
+expected.** HSW has no NV12 scanout (the overlay plane lists no NV12 and
+`AddFB2` refuses it, [nitro-kms README](../crates/nitro-kms/README.md)), so
+no NV12 pair carries `SCANOUT` and every candidate is rejected. Video plays
+composited by viz with no errors, and the two arms match:
+
+| arm | overlays | chrome CPU | server CPU | `planes_mode` |
+|---|---|---|---|---|
+| 1080p, 1280×720 CSS | on / off | 88–92 % / 83–86 % | 14 % / 15 % | 0 |
+| 720p, 1280×720 CSS | on / off | 60 % / 56–57 % | 15 % / 15 % | 0 |
+| 1080p fullscreen | on / off | 112–114 % / 107–110 % | 44–45 % / 47–48 % | 0 |
+
+**Reading:**
+
+- **The saving is in the server.** When the video is on a plane, nitro
+  paints nothing per frame: 14–46 % of a core becomes 1.5–2 %.
+- **Chrome's own CPU** does not drop measurably at this noise level. viz
+  still wakes per video frame to schedule the overlay; it only skips the
+  composite, which the GPU did anyway.
+- **Screenshots do not show the video.** `nitro-shot` reads the server's
+  shadow, and a Surface on a plane is a hole there, filled with the grey
+  placeholder (`honest()` in the server). Correct placement was checked
+  from `planes_in_use`/`plane_flips` and the node geometry, not from a
+  shot.
 
 ## Other gotchas
 

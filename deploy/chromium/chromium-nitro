@@ -25,6 +25,15 @@
 #                           (#3919). Without DMABUF on the server or a
 #                           render node it falls back to shm by itself; add
 #                           `--disable-gpu` to force software raster
+#   AcceleratedVideoDecodeLinuxGL, AcceleratedVideoDecodeLinuxZeroCopyGL
+#                           VA-API decode into NV12 dma-bufs that viz can
+#                           promote to a nitro overlay Surface (#3944,
+#                           docs/chromium.md § Video overlays); needs a
+#                           build with use_vaapi=true (chromium-build.md
+#                           §11). Passed explicitly because the #3944
+#                           measurements were taken with them, not because
+#                           their default was shown wrong. NITRO_NO_OVERLAYS=1
+#                           turns overlays off
 #   --class=chromium-nitro  the window's app id, which is what the bar and
 #                           the title bar look an icon up by; it must equal
 #                           the .desktop file's basename (see that file)
@@ -40,7 +49,7 @@ export CHROME_DESKTOP=chromium-nitro.desktop
 exec "$d/chrome" \
     --ozone-platform=nitro \
     --use-angle=vulkan \
-    --enable-features=Vulkan,DefaultANGLEVulkan,VulkanFromANGLE \
+    --enable-features=Vulkan,DefaultANGLEVulkan,VulkanFromANGLE,AcceleratedVideoDecodeLinuxGL,AcceleratedVideoDecodeLinuxZeroCopyGL \
     --class=chromium-nitro \
     --user-data-dir="$HOME/.config/chromium-nitro" \
     "$@"
