@@ -1935,6 +1935,11 @@ pub struct TextField<S> {
     on_change: Option<ChangeFn<S>>,
     on_submit: Option<ChangeFn<S>>,
     metrics: crate::wire::TextMetrics,
+    /// The font's line (`"Xg"` measured in the field's style): what
+    /// every *vertical* decision in `paint` uses, so the text, caret and
+    /// selection sit in the same place whatever the field holds.
+    /// `metrics` is the shown string's, and only its width is used.
+    line: crate::wire::TextMetrics,
     /// Cursor x positions for the current string, from the server.
     cursors: Vec<(u32, f32)>,
     /// How far the visible window has scrolled right, in pixels.
@@ -2095,6 +2100,49 @@ impl<S> TextField<S> {
         grown.push_str(&self.text);
         wipe(&mut self.text);
         self.text = grown;
+    }
+
+    /// The line box inside the view group: its height (ascent plus
+    /// descent) and its top, in the view's coordinates.
+    ///
+    /// Centred *optically*: the span from cap height to the bottom of
+    /// the descenders' ink is centred in the whole field, `field_h` tall,
+    /// rather than the ascent+descent box in the padded rect. The ascent
+    /// carries the font's internal leading above the capitals, so
+    /// centring the box put the visible ink a few pixels low. nitro-text
+    /// does not report a cap height, so it is taken as 0.72 em, and the
+    /// descenders' ink as 0.2 em.
+    ///
+    /// If the line does not fit, the descenders win and the top of the
+    /// ascent (mostly empty leading) is what the clip takes. The top is
+    /// snapped to a whole device pixel, so the baseline does not land on
+    /// a half pixel and get rounded down into the clip.
+    fn line_box(&self, size_px: f32, field_h: f32, inner: Rect, scale: f32) -> (f32, f32) {
+        let (ascent, descent) = if self.line.ascent > 0.0 {
+            (self.line.ascent, self.line.descent.max(0.0))
+        } else {
+            // No measurement (no fonts, or not measured yet): the same
+            // proportions the toolkit's estimate uses.
+            (size_px * 0.8, size_px * 0.2)
+        };
+        let need = ascent + descent;
+        let cap = size_px * 0.72;
+        // The descenders' ink stops short of the font's descent (which
+        // has some of the line gap in it): about a fifth of an em.
+        let ink_descent = (size_px * 0.2).min(descent);
+        let baseline = (field_h + cap - ink_descent) / 2.0;
+        let mut top = baseline - ascent - inner.y;
+        let limit = inner.h - need;
+        top = top.min(limit);
+        if limit >= 0.0 {
+            top = top.max(0.0);
+        }
+        let scale = if scale > 0.0 { scale } else { 1.0 };
+        let mut snapped = (top * scale).round() / scale;
+        if snapped > limit {
+            snapped = (top * scale).floor() / scale;
+        }
+        (need, snapped)
     }
 
     /// The x of byte offset `at`, from the cursor table.
@@ -2387,11 +2435,8 @@ impl<S: 'static> Widget<S> for TextField<S> {
         // keystroke, which is exactly what a retained toolkit is for
         // avoiding. Its width comes from its style, or a sensible
         // default of twenty characters.
-        let line = cx
-            .measure_text("Xg", &style, 0.0)
-            .unwrap_or_default()
-            .height
-            .max(style.size_px);
+        self.line = cx.measure_text("Xg", &style, 0.0).unwrap_or_default();
+        let line = self.line.height.max(style.size_px);
         let shown = self.shown();
         let metrics = cx.measure_text(&shown, &style, 0.0).unwrap_or_default();
         let cursors = cx.cursor_positions(&shown, &style).unwrap_or_default();
@@ -2404,7 +2449,8 @@ impl<S: 'static> Widget<S> for TextField<S> {
 
     fn paint(&mut self, cx: &mut PaintCx<'_, S>) {
         let theme = cx.theme();
-        let (px, py) = theme.button_padding;
+        let (px, _) = theme.button_padding;
+        let vy = theme.border_width.max(1.0) + 1.0;
         let focused = cx.ui.is_focused(cx.id);
         let style = self.resolved_style(theme);
         let (field, text_color, place_color, caret_color, sel_color) = (
@@ -2440,12 +2486,18 @@ impl<S: 'static> Widget<S> for TextField<S> {
         // Everything that scrolls lives under one clipping group, so a
         // long line is cut at the field's edge and scrolling it costs
         // one `SetTransform`.
-        let line_h = self.metrics.height.max(style.size_px);
+        //
+        // Horizontally the group is inset by the padding; vertically only
+        // by the (focused, so widest) border. The vertical padding is
+        // what `measure` asks for, but a field squashed below that (a
+        // 13 px font in a 26 px settings row) must give up padding, not
+        // the bottom of its descenders, which is what clipping at `py`
+        // did.
         let inner = Rect::new(
             px,
-            py,
+            vy,
             (bounds.w - px * 2.0).max(0.0),
-            (bounds.h - py * 2.0).max(0.0),
+            (bounds.h - vy * 2.0).max(0.0),
         );
         self.view_width = inner.w;
         let view = cx.group(
@@ -2457,7 +2509,8 @@ impl<S: 'static> Widget<S> for TextField<S> {
         if view.is_none() {
             return;
         }
-        let top = ((inner.h - line_h) / 2.0).max(0.0);
+        let scale = cx.ui.window_of(cx.id).map_or(1.0, |w| cx.ui.scale_of(w));
+        let (line_h, top) = self.line_box(style.size_px, bounds.h, inner, scale);
 
         // A slot the paint does not emit has its node destroyed, which
         // is how the selection and the caret come and go without a
@@ -2483,7 +2536,17 @@ impl<S: 'static> Widget<S> for TextField<S> {
         cx.text_in(
             view,
             field_slot::TEXT,
-            Rect::new(0.0, top, self.metrics.width.max(inner.w), line_h),
+            // Down to the bottom of the view rather than `line_h`: the
+            // node's bounds are the painter's clip, and a box exactly one
+            // line tall loses the last descender row to the server
+            // rounding the pen. The origin is the top left, so a taller
+            // box does not move the glyphs.
+            Rect::new(
+                0.0,
+                top,
+                self.metrics.width.max(inner.w),
+                (inner.h - top).max(line_h),
+            ),
             &shown,
             TextRun::new(&style, color),
         );
@@ -2895,6 +2958,7 @@ pub fn text_field<S: 'static>(text: impl Into<String>) -> TextFieldBuilder<S> {
         on_change: None,
         on_submit: None,
         metrics: crate::wire::TextMetrics::default(),
+        line: crate::wire::TextMetrics::default(),
         cursors: Vec::new(),
         scroll: 0.0,
         view_width: 0.0,

@@ -1948,3 +1948,118 @@ fn releasing_over_another_widget_reconciles_hover_and_fires_nothing() {
     assert_eq!(*h.state(), (0, 1));
     h.quit();
 }
+
+/// The first and last rows (device pixels, from the field's top) holding
+/// ink inside `rect` (logical, window space) of an output shot, at
+/// `scale`. "Ink" is anything unlike the pixel at `bg` (device, window).
+fn ink_rows<S: 'static>(
+    h: &mut Harness<S>,
+    rect: Rect,
+    bg: (u32, u32),
+    scale: f32,
+) -> Option<(u32, u32)> {
+    let img = h.output_shot();
+    let o = h.ui().window_position();
+    let dev = |v: f32| (v * scale).round() as u32;
+    let (ox, oy) = (dev(o.x), dev(o.y));
+    let back = img.pixel(ox + bg.0, oy + bg.1) & 0x00ff_ffff;
+    let (x0, x1) = (dev(rect.x), dev(rect.right()));
+    let (y0, y1) = (dev(rect.y), dev(rect.bottom()));
+    let mut rows =
+        (y0..y1).filter(|&y| (x0..x1).any(|x| img.pixel(ox + x, oy + y) & 0x00ff_ffff != back));
+    let first = rows.next()?;
+    let last = rows.next_back().unwrap_or(first);
+    Some((first - y0, last - y0))
+}
+
+#[test]
+fn a_text_field_draws_its_whole_line_centred_inside_its_border() {
+    // Regression (#4002): a field squashed below its natural height (the
+    // settings app puts 13 px text in a 26 px row) clipped at its
+    // padding and cut the descenders off, and every field centred the
+    // ascent+descent box, which put the visible ink a few pixels low.
+    use nitro_ui::widgets::text_field;
+    let cases: [(f32, Option<f32>, f32, &str); 7] = [
+        (13.0, None, 1.0, "Xg"),
+        (13.0, Some(26.0), 1.0, "Xg"),
+        (16.0, Some(34.0), 1.0, "Xg"),
+        (20.0, None, 1.0, "Xg"),
+        (28.0, None, 1.0, "Xg"),
+        (13.0, Some(26.0), 2.0, "Xg"),
+        (15.0, None, 1.0, ""),
+    ];
+    for (size, height, scale, text) in cases {
+        let conf = if scale > 1.0 {
+            "output.Virtual-1.scale = 2\n"
+        } else {
+            ""
+        };
+        let mut h = Harness::configured(
+            "field-ink",
+            (),
+            // The output is 320x240 device pixels: at scale 2 the window
+            // has to fit in 160x120 logical.
+            if scale > 1.0 {
+                Size::new(150.0, 80.0)
+            } else {
+                Size::new(260.0, 160.0)
+            },
+            conf,
+            move |ui: &mut Ui<()>| {
+                let mut f = text_field(text).size(size).placeholder("Xg");
+                if let Some(hh) = height {
+                    f = f.height(hh);
+                }
+                let field = ui.build(f);
+                let l = ui.build(label("Xg").size(size));
+                let root = ui.build(
+                    panel()
+                        .background(nitro_core::Color::WHITE)
+                        .padding(8.0)
+                        .gap(12.0),
+                );
+                ui.attach(root, field).unwrap();
+                ui.attach(root, l).unwrap();
+                root
+            },
+        );
+        if !h.has_text() {
+            h.quit();
+            return;
+        }
+        let root = h.ui().root().unwrap();
+        let kids = h.ui().children(root);
+        let (f, l) = (h.bounds(kids[0]), h.bounds(kids[1]));
+        let what = format!("size {size} height {height:?} scale {scale} text {text:?}");
+        let d = |v: f32| (v * scale).round() as u32;
+        let (px, _) = h.ui().theme().button_padding;
+        // Skip the border and the rounded corners: three logical pixels.
+        let inset = Rect::new(f.x + px, f.y + 3.0, f.w - 2.0 * px, f.h - 6.0);
+        let bg = (d(f.x + 4.0), d(f.y + f.h / 2.0));
+        let (top, bottom) = ink_rows(&mut h, inset, bg, scale)
+            .unwrap_or_else(|| panic!("the field drew nothing: {what}"));
+        let lab = ink_rows(&mut h, l, (d(l.x), d(l.y)), scale)
+            .unwrap_or_else(|| panic!("the label drew nothing: {what}"));
+        // Nothing lost: the same line, unclipped, is exactly as tall.
+        assert_eq!(
+            bottom - top,
+            lab.1 - lab.0,
+            "the field's ink is as tall as the label's: {what}"
+        );
+        // Inside the content rect, clear of the border.
+        let rows = d(inset.h);
+        assert!(
+            top > 0 && bottom + 1 < rows,
+            "ink {top}..{bottom} within {rows}: {what}"
+        );
+        // Centred in the field: gaps measured from the field's edges.
+        let off = d(inset.y) - d(f.y);
+        let gap_top = (top + off) as f32 / scale;
+        let gap_bottom = (d(f.h) - (bottom + off + 1)) as f32 / scale;
+        assert!(
+            (gap_top - gap_bottom).abs() <= 1.5,
+            "centred: top gap {gap_top} bottom gap {gap_bottom}: {what}"
+        );
+        h.quit();
+    }
+}
